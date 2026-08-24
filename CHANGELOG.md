@@ -4,6 +4,22 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — phase exit: decode tick captured (CUDA graph) on sm90
+
+- **Exit + default flip.** The decode tick is now a captured kernel sequence
+  (design-engine.md invariant): `_DecodeGraph` captures `model.forward` once
+  per batch-size bucket (day-1 M=1) and replays per token — auto-on for CUDA,
+  eager the default elsewhere and the fallback on capture failure. Dispatch
+  drops from 899 ops x 20.4 us = 18.3 ms (full-model extrapolation) to
+  0.040 ms (36 us pinned async copies + 3 us replay) on the 2-GDN-layer
+  slice; the replay cost is op-count-independent. Two prerequisites landed
+  with it: a `write_tokens` sm90 scatter kernel (the pool's host loop had
+  per-token GPU->CPU syncs, uncapturable) and an on-device `_inv_freq` cache
+  (the CPU-cached tensor H2D-copied on every rope, illegal in capture).
+  Parity: eager vs captured token streams identical (tiny model, CUDA),
+  `test_ops_parity.py` 26/26 on CUDA. Entry:
+  `docs/experience/wins/2026-08-24-decode-graph-capture.md`.
+
 ## 2026-08-24 — verdict: bf16 IO + bitcast fast decode accepted on sm90
 
 - **Verdict.** The sm90 MMA kernels (3 gemms + `linear_fp4_mma` +
