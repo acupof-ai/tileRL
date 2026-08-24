@@ -123,13 +123,17 @@ def _linear_fp4_fp8_ref(x, wq, scale):
 
 def _quantize_fp8(w_master):
     """Per-128-block quant into the loader's native layout: w8 e4m3 [N,K],
-    wscale f32 [N//128, K//128] (128 N-rows share one scale — the ModelOpt
-    block format). N, K must be multiples of 128."""
+    wscale f32 [ceil(N/128), ceil(K/128)] (128 N-rows share one scale — the
+    ModelOpt block format; the last block is zero-padded)."""
     n, k = w_master.shape
-    blocks = w_master.float().reshape(n // 128, 128, k // 128, 128)
+    ns, ks = (n + 127) // 128, (k + 127) // 128
+    padded = w_master.float().new_zeros(ns * 128, ks * 128)
+    padded[:n, :k] = w_master.float()
+    blocks = padded.reshape(ns, 128, ks, 128)
     block_max = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp_min(1e-12)
-    scale = (block_max / 448.0).reshape(n // 128, k // 128).contiguous()
-    w8 = (blocks / (block_max / 448.0)).reshape(n, k).to(torch.float8_e4m3fn).contiguous()
+    scale = (block_max / 448.0).reshape(ns, ks).contiguous()
+    w8 = (blocks / (block_max / 448.0)).reshape(ns * 128, ks * 128)[:n, :k]
+    w8 = w8.to(torch.float8_e4m3fn).contiguous()
     return w8, scale
 
 
@@ -316,6 +320,26 @@ def test_linear_fp8_bwd():
     w_deq = reference.dequant_fp8(w8, wscale)
     _assert_close(gx, go @ w_deq, "linear_fp8_bwd gx")
     _assert_close(g_master, go.t() @ x, "linear_fp8_bwd g_master")
+
+
+def test_linear_fp8_gemv_parity(backend):
+    """M=1 decode path: the sm90 cell resolves to the fp8 GEMV kernel (the
+    bf16 master floor on CPU/metal). The GEMV uses bf16 X (no activation
+    quant, unlike the M>1 MMA path), so the gate is the f32 dequant reference
+    — the bf16 X rounding is the only error source."""
+    torch.manual_seed(28)
+    kset = _resolve(backend.precision, backend.arch)
+    for N, K in [(128, 256), (256, 128), (64, 512)]:
+        w_master = torch.randn(N, K) * 0.1
+        w8, wscale = _quantize_fp8(w_master)
+        master = reference.dequant_fp8(w8, wscale).to(torch.bfloat16)
+        x = torch.randn(1, K) * 0.5
+        out = backend.linear_fp8(x, w8, wscale, master=master)
+        assert out.shape == (1, N)
+        _assert_close(out, reference.linear_fp8(x, w8, wscale), f"linear_fp8_gemv N={N} K={K}")
+        # on CUDA the kernel path must actually be the one that ran
+        if backend.target.startswith("cuda"):
+            assert "linear_fp8_gemv" in kset
 
 
 # ---------------------------------------------------------------- silu mul

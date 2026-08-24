@@ -146,6 +146,7 @@ _SM90_KERNELS = {
     "linear_bf16_gemv": kernels_mma.make_linear_bf16_gemv,
     "linear_fp4_fp8": kernels_mma.make_linear_fp4_fp8_mma,
     "linear_fp8": kernels_mma.make_linear_fp8_mma,
+    "linear_fp8_gemv": kernels_mma.make_linear_fp8_gemv,
     "quant_fp8": kernels_mma.make_quant_fp8_e4m3,
     "write_tokens": kernels_mma.make_write_tokens,
     "gdn_decode_fused": kernels_mma.make_gdn_decode_fused,
@@ -473,6 +474,24 @@ class Backend:
         _kset = _resolve(self.precision, self.arch)
         lead = x.shape[:-1]
         M = x.numel() // x.shape[-1]
+        if self.target.startswith("cuda") and M == 1 and "linear_fp8_gemv" in _kset:
+            # Decode GEMV: stream e4m3 W once (1 byte/elem) + per-128-block
+            # scale, bf16 X. block_K = reduce_thread(32) * micro_size_k(16) =
+            # 512 = 4 scale blocks; the K-tail is killed by the zero-padded
+            # WScale.
+            K = x.shape[-1]
+            N = w8.shape[0]
+            Kp = _round_up(K, 512)
+            Np = _round_up(N, 4)
+            NS = -(-Np // 128)
+            y = self._kernel("linear_fp8_gemv")(
+                _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(1, K)), 1, Kp),
+                _pad2d(self._dev(w8, w8.dtype), Np, Kp),
+                _pad2d(self._f32(wscale), NS, Kp // 128),
+                32,
+                4,
+            )
+            return y[:1, :N].reshape(*lead, N)
         if self.target.startswith("cuda") and M > 1 and "linear_fp8" in _kset:
             BK = 128  # matches the checkpoint's 128-block scale
             N, K = w8.shape

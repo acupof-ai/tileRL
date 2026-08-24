@@ -25,6 +25,7 @@ __all__ = [
     "make_quant_fp8_e4m3",
     "make_linear_fp4_fp8_mma",
     "make_linear_fp8_mma",
+    "make_linear_fp8_gemv",
     "make_write_tokens",
     "make_gdn_decode_fused",
     "make_gdn_chunk_fused",
@@ -350,6 +351,69 @@ def make_linear_bf16_gemv(target: str):
         return Y
 
     return linear_bf16_gemv
+
+
+# ---------------------------------------------------------------- linear fp8 (GEMV)
+
+
+def make_linear_fp8_gemv(target: str):
+    """GEMV (sm90), the decode (M=1) path of linear_fp8: X[1,K] bf16 @ W8[N,K]
+    e4m3 with per-128-block scale -> Y[1,N] f32.
+
+    Same split-K + warp-reduce schedule as make_linear_bf16_gemv, but W is
+    e4m3 (micro_size_k=16, 128-bit/8-bit) and each thread's 16-elem slice
+    stays within one 128-block scale (block_K=512=4 scale blocks), so one
+    WScale lookup per chunk. Roofline = (N*K*1.03 + 2K) bytes / HBM BW.
+
+    # SOTA copy: examples/dequantize_gemm/example_dequant_gemv_fp16xint4.py
+    #   @ tilelang main (dequantize_gemv, split-K + tvm_thread_allreduce path)
+    # Adapted: e4m3 W streamed directly (1 byte/elem vs the bf16 GEMV's 2),
+    #   per-128-block f32 scale applied per chunk; M fixed at 1 (decode).
+    """
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def linear_fp8_gemv(X, W8, WScale, reduce_thread, n_partition):
+        N, K = T.const("N, K")
+        micro_size_k = 16  # 128-bit transaction / 8-bit e4m3
+        block_K = reduce_thread * micro_size_k  # 512 = 4 scale blocks of 128
+        X: T.Tensor((1, K), "bfloat16")
+        W8: T.Tensor((N, K), "float8_e4m3fn")
+        WScale: T.Tensor((T.ceildiv(N, 128), T.ceildiv(K, 128)), "float32")
+        Y = T.empty((1, N), "float32")
+        with T.Kernel(T.ceildiv(N, n_partition), threads=(reduce_thread, n_partition)) as bx:
+            kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
+            ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
+            n = bx * n_partition + ni
+            X_local = T.alloc_local((micro_size_k,), "bfloat16")
+            W_local = T.alloc_local((micro_size_k,), "float8_e4m3fn")
+            acc = T.alloc_local((1,), "float32")
+            reduced = T.alloc_local((1,), "float32")
+            acc[0] = 0.0
+            for ko in T.serial(T.ceildiv(K, block_K)):
+                base = ko * block_K + kr * micro_size_k
+                # the 16-elem slice [base, base+16) never crosses a 128-block
+                s = WScale[n // 128, base // 128]
+                for v in T.vectorized(micro_size_k):
+                    X_local[v] = X[0, base + v]
+                for v in T.vectorized(micro_size_k):
+                    W_local[v] = W8[n, base + v]
+                for ki in T.serial(micro_size_k):
+                    acc[0] += T.cast(X_local[ki], "float32") * T.cast(W_local[ki], "float32") * s
+            with T.attr(
+                T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
+                "reduce_scope",
+                T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(
+                    T.tvm_thread_allreduce(
+                        T.uint32(1), acc[0], True, reduced[0], kr, dtype="handle"
+                    )
+                )
+            if kr == 0:
+                Y[0, n] = reduced[0]
+        return Y
+
+    return linear_fp8_gemv
 
 
 # ---------------------------------------------------------------- quant fp8 (per-token)
