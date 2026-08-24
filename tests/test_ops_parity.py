@@ -105,17 +105,20 @@ def _quantize_fp4(w_master: torch.Tensor):
 
 
 def _linear_fp4_fp8_ref(x, wq, scale):
-    """Torch reference for the sm90 fp8 prefill path: same per-32-block e4m3
-    activation quant + exact e2m1fn weight dequant, f32 matmul. e4m3's ~2%
-    multiplicative quant error does not average down over K, so the fp8 kernel
-    is gated against this identical-quant reference (kernel correctness), not
-    the f32 linear_fp4 reference (quant precision)."""
+    """Torch reference for the sm90 fp8 prefill path: same per-token e4m3
+    activation quant + e2m1fn->e4m3 requant weight dequant, f32 matmul. e4m3's
+    ~2% multiplicative quant error does not average down over K, so the fp8
+    kernel is gated against this identical-quant reference (kernel
+    correctness), not the f32 linear_fp4 reference (quant precision)."""
     M, K = x.shape
-    xbf = x.to(torch.bfloat16).float().reshape(M, K // 32, 32)
-    blk_max = xbf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
-    ascale = (448.0 / blk_max).to(torch.float32)
+    xbf = x.to(torch.bfloat16).float()
+    row_max = xbf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)  # [M,1]
+    ascale = (448.0 / row_max).to(torch.float32)
     xq = (xbf * ascale).to(torch.float8_e4m3fn).float() / ascale
-    return xq.reshape(M, K) @ reference.dequant_fp4(wq, scale).t()
+    # weight: e2m1 grid * per-32-block scale, requanted to e4m3 (same as kernel)
+    w_deq = reference.dequant_fp4(wq, scale)  # f32 [N,K]
+    w_q8 = w_deq.to(torch.float8_e4m3fn).float()
+    return xq @ w_q8.t()
 
 
 # ---------------------------------------------------------------- rmsnorm
@@ -184,7 +187,11 @@ def test_linear_fp4_parity(backend):
     x = torch.randn(6, 32)
     # On CUDA M>1 dispatches to the fp8 path; gate it against the identical-
     # quant fp8 reference (the f32 reference carries the ~2% e4m3 quant error).
-    ref = _linear_fp4_fp8_ref(x, wq, scale) if backend.target.startswith("cuda") else reference.linear_fp4(x, wq, scale)
+    ref = (
+        _linear_fp4_fp8_ref(x, wq, scale)
+        if backend.target.startswith("cuda")
+        else reference.linear_fp4(x, wq, scale)
+    )
     _assert_close(backend.linear_fp4(x, wq, scale), ref, "linear_fp4")
 
 
@@ -221,7 +228,9 @@ def test_linear_fp4_fp8_parity(backend):
         out = backend.linear_fp4(x, wq, scale)
         if not backend.target.startswith("cuda"):
             # CPU/metal: bf16 floor, compare to the f32 reference.
-            _assert_close(out, reference.linear_fp4(x, wq, scale), f"linear_fp4_fp8 M={M} N={N} K={K}")
+            _assert_close(
+                out, reference.linear_fp4(x, wq, scale), f"linear_fp4_fp8 M={M} N={N} K={K}"
+            )
             continue
         # CUDA: fp8 path, identical-quant reference.
         _assert_close(out, _linear_fp4_fp8_ref(x, wq, scale), f"linear_fp4_fp8 M={M} N={N} K={K}")

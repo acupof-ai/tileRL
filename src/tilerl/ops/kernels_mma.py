@@ -290,49 +290,58 @@ def make_linear_fp4_gemv(target: str):
 
 
 def make_quant_fp8_e4m3(target: str):
-    """Per-32-block dynamic quant: X [M,K] bf16 -> XQ [M,K] e4m3 + AScale [M,K//32].
+    """Per-token dynamic quant: X [M,K] bf16 -> XQ [M,K] e4m3 + Scale [M] f32.
 
-    One block per (row, 32-group), 32 threads (one per element): reduce the
-    group absmax, ``AScale = FP8_MAX / absmax``, quantize. The per-32-block
-    scale (not per-token) is what keeps the e4m3 error unbiased: a per-token
-    scale stretches the row max to 448 and leaves the Gaussian bulk near 0
-    in the coarse subnormal range (a ~2.5% systematic under-estimation that
-    does not average down over K); per-32-block adapts the scale to local
-    magnitude. Group 32 matches the fp8 WGMMA K-tile and the weight's
-    per-32 scale, so the gemm epilogue applies one ``WScale/AScale`` pair
-    per K-tile.
+    ``Scale[m] = FP8_MAX / max(|X[m,:]|)``; ``XQ = (X * Scale).to(e4m3)``. One
+    block per row; threads reduce the row absmax via shared memory, then each
+    thread quantizes its strided K-slice. The activation dequant
+    (``Y = XQ @ W / Scale``) lives in the linear_fp4_fp8 epilogue.
 
-    # Original: the per-token-group W8A8 quant from vLLM/sglang
+    Per-token (not per-32-block) scale: the e4m3 multiplicative quant error
+    (~2% RMS) does not average down over K either way, and a per-token scale
+    lets the gemm epilogue be a single per-row divide (no per-K-tile temp
+    fragment, which breaks the WGMMA pipeline and costs ~2x).
+
+    # Original: the per-token W8A8 quant from vLLM/sglang
     #   (examples/cast/example_per_token_cast_to_fp8.py is the triton form),
-    #   with group 32 (MXFP8's block size) instead of per-token. e4m3fn
-    #   finite max is 448; the per-group scale maps each group's absmax there.
+    #   written as a tilelang block-per-row kernel with a shared-memory max
+    #   reduction (same idiom as the softmax/gdn kernels in this file). e4m3fn
+    #   finite max is 448; the per-token scale maps each row's absmax there.
     """
     FP8_MAX = 448.0  # e4m3fn finite max
-    GROUP = 32
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
-    def quant_fp8(X, XQ, AScale, threads):
+    def quant_fp8(X, XQ, Scale, threads):
         M, K = T.const("M, K")
         X: T.Tensor((M, K), "bfloat16")
         XQ: T.Tensor((M, K), "float8_e4m3fn")
-        AScale: T.Tensor((M, K // GROUP), "float32")
-        with T.Kernel(K // GROUP, M, threads=GROUP) as (bg, bm):
+        Scale: T.Tensor((M,), "float32")
+        with T.Kernel(M, threads=threads) as bx:
             tid = T.get_thread_binding(0)
-            red = T.alloc_shared((GROUP,), "float32")
-            v = T.cast(X[bm, bg * GROUP + tid], "float32")
-            red[tid] = T.max(v, 0.0 - v)
+            red = T.alloc_shared((threads,), "float32")
+            amax = T.alloc_fragment((1,), "float32")
+            amax[0] = 0.0
+            for k in T.serial(T.ceildiv(K, threads)):
+                idx = tid + k * threads
+                if idx < K:
+                    v = T.cast(X[bx, idx], "float32")
+                    amax[0] = T.max(amax[0], T.max(v, 0.0 - v))
+            red[tid] = amax[0]
             T.tvm_storage_sync("shared")
             if tid == 0:
-                mx = T.alloc_fragment((1,), "float32")
-                mx[0] = 0.0
-                for i in T.serial(GROUP):
-                    mx[0] = T.max(mx[0], red[i])
-                red[0] = FP8_MAX / T.max(mx[0], 1e-12)
+                m = T.alloc_fragment((1,), "float32")
+                m[0] = 0.0
+                for i in T.serial(threads):
+                    m[0] = T.max(m[0], red[i])
+                red[0] = FP8_MAX / T.max(m[0], 1e-12)
             T.tvm_storage_sync("shared")
             s = red[0]
-            XQ[bm, bg * GROUP + tid] = T.cast(v * s, "float8_e4m3fn")
+            for k in T.serial(T.ceildiv(K, threads)):
+                idx = tid + k * threads
+                if idx < K:
+                    XQ[bx, idx] = T.cast(T.cast(X[bx, idx], "float32") * s, "float8_e4m3fn")
             if tid == 0:
-                AScale[bm, bg] = s
+                Scale[bx] = s
 
     return quant_fp8
 
@@ -343,30 +352,31 @@ def make_quant_fp8_e4m3(target: str):
 def make_linear_fp4_fp8_mma(target: str):
     """Fused e2m1fn dequant-to-e4m3 + fp8 WGMMA (sm90 prefill path).
 
-    XQ [M,K] e4m3 (per-32-block quantized activation, from make_quant_fp8_e4m3),
+    XQ [M,K] e4m3 (per-token quantized activation, from make_quant_fp8_e4m3),
     WQ uint8 [N,K//2] (low nibble first), WScale [N,K//32] f32 (tileRL
-    pack_fp4 per-32 block scale), AScaleInv [M,K//32] f32 (reciprocal of the
-    per-32-block activation scale).
-    ``Y[m,n] = sum_k XQ[m,k] * e2m1fn(WQ) * WScale[n,k//32] * AScaleInv[m,k//32]``.
+    pack_fp4 per-32 block scale), AScale [M] f32 (per-token activation scale).
+    ``Y[m,n] = (sum_k XQ[m,k] * e2m1fn(WQ) * WScale[n,k//32]) / AScale[m]``.
 
     The e2m1fn grid ({±0.5,±0.75,±1,±1.5,±2,±3,±4,±6}) is an exact subset of
-    e4m3, so the weights need NO requant: each nibble casts to e4m3 exactly,
-    and the per-32 block scales (one per K-tile, since fp8 WGMMA K=32) are
-    applied to the MMA partial in f32. Both operands use per-32-block scales
-    (MXFP8-style) — this keeps the e4m3 error unbiased (a per-token activation
-    scale leaves the Gaussian bulk in the coarse subnormal range, a ~2.5%
-    systematic under-estimation that does not average down over K).
+    e4m3, so the dequant is: nibble -> fp32 grid (integer fast decode) ->
+    *WScale -> cast to e4m3. The cast is a requant (the dequant weight is not
+    exactly on the e4m3 grid), carrying ~1.7% error on top of the activation
+    quant's ~2% e4m3 floor — the standard W4A8 trade-off. The per-32-block
+    weight scale is applied inside the K-loop (one per tile, since fp8 WGMMA
+    K=32); the per-token activation scale is one divide in the epilogue — no
+    temp fragment, no per-tile epilogue (the exact-grid alternative needs
+    both and runs ~2x slower: the manual scale-accumulate breaks the WGMMA
+    pipeline).
 
     # SOTA copy: examples/gemm_fp8/example_tilelang_gemm_fp8.py @ tilelang main
     # Adapted: e4m3 operands (fp8 WGMMA, f32 accumulate), block_K=32 (the
     #   fp8 WGMMA K, 1 step); the B operand is dequantized on the fly from
     #   tileRL's e2m1fn packed format — the same fast integer decode as
-    #   make_linear_fp4_mma, cast straight to e4m3 (exact); per-32 block scales
-    #   on both operands applied to the MMA partial in f32 (temp fragment +
-    #   shared-memory scale prefetch). e2m1fn has no zero, so padded WQ bytes
+    #   make_linear_fp4_mma, requanted to e4m3; per-token activation dequant
+    #   (1/AScale[m]) in the epilogue. e2m1fn has no zero, so padded WQ bytes
     #   (0x00 -> 0.5) are killed by the zero-padded WScale.
     """
-    _BLOCK_K = 32  # fp8 WGMMA K=32, 1 step; 1 per-32 scale per tile
+    _BLOCK_K = 64  # fp8 WGMMA K=32, 2 steps; amortizes the e4m3 dequant cast
 
     @tilelang.jit(
         target=target,
@@ -375,27 +385,24 @@ def make_linear_fp4_fp8_mma(target: str):
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         },
     )
-    def linear_fp4_fp8(XQ, WQ, WScale, AScaleInv, block_M, block_N, threads):
+    def linear_fp4_fp8(XQ, WQ, WScale, AScale, block_M, block_N, threads):
         threads = 128 if block_M >= 32 else threads
         M, N, K = T.const("M, N, K")
         XQ: T.Tensor((M, K), "float8_e4m3fn")
         WQ: T.Tensor((N, K // 2), "uint8")
         WScale: T.Tensor((N, K // 32), "float32")
-        AScaleInv: T.Tensor((M, K // 32), "float32")
+        AScale: T.Tensor((M,), "float32")
         Y = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             X_shared = T.alloc_shared((block_M, _BLOCK_K), "float8_e4m3fn")
             WQ_shared = T.alloc_shared((block_N, _BLOCK_K // 2), "uint8")
             W_shared = T.alloc_shared((block_N, _BLOCK_K), "float8_e4m3fn")
-            ws_s = T.alloc_shared((block_N,), "float32")
-            as_s = T.alloc_shared((block_M,), "float32")
             C_local = T.alloc_fragment((block_M, block_N), "float32")
-            temp = T.alloc_fragment((block_M, block_N), "float32")
             T.clear(C_local)
-            for k in T.Pipelined(K // _BLOCK_K, num_stages=2):
+            for k in T.Pipelined(K // _BLOCK_K, num_stages=3):
                 T.copy(XQ[by * block_M, k * _BLOCK_K], X_shared)
                 T.copy(WQ[bx * block_N, k * _BLOCK_K // 2], WQ_shared)
-                # e2m1fn grid -> e4m3 (exact subset, no scale, no requant).
+                # e2m1fn grid -> fp32 (integer fast decode) -> *WScale -> e4m3.
                 for i, j in T.Parallel(block_N, _BLOCK_K):
                     byte = WQ_shared[i, j // 2]
                     nib = (byte >> ((j % 2) * 4)) & 15
@@ -404,16 +411,13 @@ def make_linear_fp4_fp8_mma(target: str):
                         ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
                     )
                     w = T.reinterpret(bits, "float32")
-                    W_shared[i, j] = T.cast(w, "float8_e4m3fn")
-                # per-32-block scales for this K-tile (prefetch to shared)
-                for i in T.Parallel(block_N):
-                    ws_s[i] = WScale[bx * block_N + i, k]
-                for i in T.Parallel(block_M):
-                    as_s[i] = AScaleInv[by * block_M + i, k]
-                T.clear(temp)
-                T.gemm(X_shared, W_shared, temp, transpose_B=True)
-                for i, j in T.Parallel(block_M, block_N):
-                    C_local[i, j] += temp[i, j] * ws_s[j] * as_s[i]
+                    W_shared[i, j] = T.cast(
+                        w * WScale[bx * block_N + i, (k * _BLOCK_K + j) // 32],
+                        "float8_e4m3fn",
+                    )
+                T.gemm(X_shared, W_shared, C_local, transpose_B=True)
+            for i, j in T.Parallel(block_M, block_N):
+                C_local[i, j] = C_local[i, j] / AScale[by * block_M + i]
             T.copy(C_local, Y[by * block_M, bx * block_N])
         return Y
 

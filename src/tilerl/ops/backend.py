@@ -408,22 +408,22 @@ class Backend:
             )
             return y[:1, :N].reshape(*lead, N)
         if self.target.startswith("cuda") and M > 1 and "linear_fp4_fp8" in _kset:
-            # Prefill fp8 path: per-32-block activation quant (e4m3) +
-            # fp4->e4m3 exact-grid dequant + fp8 WGMMA. block_K=32 (fp8 WGMMA
-            # K=32, 1 per-32 scale per tile on both operands). e2m1fn has no
+            # Prefill fp8 path: per-token activation quant (e4m3) +
+            # fp4->e4m3 requant dequant + fp8 WGMMA. block_K=64 (fp8 WGMMA
+            # K=32, 2 steps; amortizes the e4m3 dequant cast). e2m1fn has no
             # zero, so padded WQ bytes are killed by the zero-padded WScale.
-            BK = 32
-            bM, bN = _round_up(min(64, M), 16), _round_up(min(128, N), 16)
+            BK = 64
+            bM, bN = _round_up(min(128, M), 16), _round_up(min(128, N), 16)
             Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, BK)
             x2 = _pad2d(x2, Mp, Kp)
             xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
-            ascale = torch.empty((Mp, Kp // BK), dtype=torch.float32, device=self.device)
-            self._kernel("quant_fp8")(x2, xq, ascale, BK)
+            ascale = torch.empty((Mp,), dtype=torch.float32, device=self.device)
+            self._kernel("quant_fp8")(x2, xq, ascale, 256)
             y = self._kernel("linear_fp4_fp8")(
                 xq,
                 _pad2d(wq, Np, Kp // 2),
                 _pad2d(scale, Np, Kp // 32),
-                1.0 / ascale,
+                ascale,
                 bM,
                 bN,
                 _THREADS,
