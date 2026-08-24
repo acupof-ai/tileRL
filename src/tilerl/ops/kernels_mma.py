@@ -4,9 +4,10 @@ matrix (backend.py); kernels.py keeps the portable floor (CPU T.gemm + naive
 FMA) for cpu/metal. The MMA schedules do not lower on CPU (T.gemm -> WGMMA
 only on sm90), which is why they live here, not in kernels.py.
 
-All kernels are f32-IO (the backend casts bf16 at the boundary; eager JIT
-does not specialize on dtype) and lower to TF32 WGMMA on sm90.
-# ponytail: f32 IO day-1, bf16 IO day-2 (2x WGMMA throughput)
+All kernels are bf16-IO on sm90 (the backend casts f32 at the boundary on
+CPU/metal; eager JIT does not specialize on dtype) and lower to bf16 WGMMA
+with f32 accumulation. The fp4 kernels decode the e2m1fn grid with the
+lop3-style integer bit-pattern fast decode (no exp2 in the loop).
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ __all__ = [
 ]
 
 #: Reduction-tile size (K for gemm_nt/nn, M for gemm_tn, K for linear_fp4).
-#: WGMMA K on sm90 is 8 (TF32); 32 is 4 K-steps, divides every model K dim
+#: WGMMA K on sm90 is 16 (bf16); 32 is 2 K-steps, divides every model K dim
 #: (all are multiples of 32), and matches examples/gemm/example_gemm.py.
 #: The backend pads the reduction dim to a multiple of this on CUDA.
 _RED_TILE = 32
@@ -44,8 +45,9 @@ def make_gemm_nt_mma(target: str):
     """C = A @ B.T + Bias. A [M,K], B [N,K] -> C [M,N].
 
     # SOTA copy: examples/gemm/example_gemm.py @ tilelang main
-    # Adapted: f32 IO (TF32 WGMMA) instead of fp16; Bias fused into the
-    # epilogue; reduction tile fixed at _RED_TILE (backend pads K).
+    # Adapted: bf16 IO (bf16 WGMMA, f32 accumulate) instead of fp16; Bias
+    # fused into the epilogue; reduction tile fixed at _RED_TILE (backend
+    # pads K).
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
@@ -55,13 +57,13 @@ def make_gemm_nt_mma(target: str):
         # keep the caller's 64 (mma.sync per-warp, still tensor cores).
         threads = 128 if block_M >= 32 else threads
         M, N, K = T.const("M, N, K")
-        A: T.Tensor((M, K), "float32")
-        B: T.Tensor((N, K), "float32")
+        A: T.Tensor((M, K), "bfloat16")
+        B: T.Tensor((N, K), "bfloat16")
         Bias: T.Tensor((N,), "float32")
         C = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-            A_shared = T.alloc_shared((block_M, _RED_TILE), "float32")
-            B_shared = T.alloc_shared((block_N, _RED_TILE), "float32")
+            A_shared = T.alloc_shared((block_M, _RED_TILE), "bfloat16")
+            B_shared = T.alloc_shared((block_N, _RED_TILE), "bfloat16")
             C_local = T.alloc_fragment((block_M, block_N), "float32")
             T.clear(C_local)
             for k in T.Pipelined(K // _RED_TILE, num_stages=3):
@@ -80,20 +82,20 @@ def make_gemm_nn_mma(target: str):
     """C = A @ B. A [M,K], B [K,N] -> C [M,N].
 
     # SOTA copy: examples/gemm/example_gemm.py @ tilelang main
-    # Adapted: f32 IO (TF32 WGMMA); B is [K,N] (loaded as-is, no transpose);
-    # reduction tile fixed at _RED_TILE.
+    # Adapted: bf16 IO (bf16 WGMMA, f32 accumulate); B is [K,N] (loaded
+    # as-is, no transpose); reduction tile fixed at _RED_TILE.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def gemm_nn(A, B, block_M, block_N, threads):
         threads = 128 if block_M >= 32 else threads
         M, N, K = T.const("M, N, K")
-        A: T.Tensor((M, K), "float32")
-        B: T.Tensor((K, N), "float32")
+        A: T.Tensor((M, K), "bfloat16")
+        B: T.Tensor((K, N), "bfloat16")
         C = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-            A_shared = T.alloc_shared((block_M, _RED_TILE), "float32")
-            B_shared = T.alloc_shared((_RED_TILE, block_N), "float32")
+            A_shared = T.alloc_shared((block_M, _RED_TILE), "bfloat16")
+            B_shared = T.alloc_shared((_RED_TILE, block_N), "bfloat16")
             C_local = T.alloc_fragment((block_M, block_N), "float32")
             T.clear(C_local)
             for k in T.Pipelined(K // _RED_TILE, num_stages=3):
@@ -110,20 +112,21 @@ def make_gemm_tn_mma(target: str):
     """C = A.T @ B. A [M,N], B [M,K] -> C [N,K] (C_ij = sum_m A_mi B_mj).
 
     # SOTA copy: examples/gemm/example_gemm.py @ tilelang main
-    # Adapted: f32 IO; transpose_A=True with the reduction over M tiled at
-    # _RED_TILE; output tiles are (block_N, block_K) per the naive signature.
+    # Adapted: bf16 IO (bf16 WGMMA, f32 accumulate); transpose_A=True with
+    # the reduction over M tiled at _RED_TILE; output tiles are
+    # (block_N, block_K) per the naive signature.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def gemm_tn(A, B, block_N, block_K, threads):
         threads = 128 if block_N >= 32 else threads
         M, N, K = T.const("M, N, K")
-        A: T.Tensor((M, N), "float32")
-        B: T.Tensor((M, K), "float32")
+        A: T.Tensor((M, N), "bfloat16")
+        B: T.Tensor((M, K), "bfloat16")
         C = T.empty((N, K), "float32")
         with T.Kernel(T.ceildiv(K, block_K), T.ceildiv(N, block_N), threads=threads) as (bx, by):
-            A_shared = T.alloc_shared((_RED_TILE, block_N), "float32")
-            B_shared = T.alloc_shared((_RED_TILE, block_K), "float32")
+            A_shared = T.alloc_shared((_RED_TILE, block_N), "bfloat16")
+            B_shared = T.alloc_shared((_RED_TILE, block_K), "bfloat16")
             C_local = T.alloc_fragment((block_N, block_K), "float32")
             T.clear(C_local)
             for m in T.Pipelined(M // _RED_TILE, num_stages=3):
@@ -142,15 +145,18 @@ def make_gemm_tn_mma(target: str):
 def make_linear_fp4_mma(target: str):
     """Fused e2m1fn dequant + matmul (sm90 MMA).
 
-    X [M,K] f32, WQ uint8 [N,K//2] (low nibble first), Scale [N,K//16] f32.
+    X [M,K] bf16, WQ uint8 [N,K//2] (low nibble first), Scale [N,K//16] f32.
     Y[m,n] = sum_k X[m,k] * e2m1fn(WQ[n,k//2] nibble k%2) * Scale[n,k//16].
 
     # SOTA copy: examples/dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py
     #   @ tilelang main (simple_dequant path)
-    # Adapted: f32 IO instead of bf16; tileRL's float block scale (block_max/6
-    #   per 16 elems) applied as a multiply instead of the example's integer-
-    #   exponent scale; e2m1fn grid (matches pack_fp4 — no zero, so the
-    #   backend zero-pads Scale for K-tail tiles).
+    # Adapted: bf16 IO (bf16 WGMMA, f32 accumulate); tileRL's float block
+    #   scale (block_max/6 per 16 elems) applied as a multiply instead of the
+    #   example's integer-exponent scale; e2m1fn grid (matches pack_fp4 — no
+    #   zero, so the backend zero-pads Scale for K-tail tiles).
+    # Fast decode: the e2m1fn grid is a power-of-two grid, so each nibble's
+    #   fp32 bit pattern is pure integer math — sign<<31 | (126+e)<<23 |
+    #   m<<22 — reinterpreted as float (the lop3-style fast decode).
     """
 
     @tilelang.jit(
@@ -163,28 +169,32 @@ def make_linear_fp4_mma(target: str):
     def linear_fp4(X, WQ, Scale, block_M, block_N, threads):
         threads = 128 if block_M >= 32 else threads
         M, N, K = T.const("M, N, K")
-        X: T.Tensor((M, K), "float32")
+        X: T.Tensor((M, K), "bfloat16")
         WQ: T.Tensor((N, K // 2), "uint8")
         Scale: T.Tensor((N, K // 16), "float32")
         Y = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-            X_shared = T.alloc_shared((block_M, _RED_TILE), "float32")
+            X_shared = T.alloc_shared((block_M, _RED_TILE), "bfloat16")
             WQ_shared = T.alloc_shared((block_N, _RED_TILE // 2), "uint8")
-            W_shared = T.alloc_shared((block_N, _RED_TILE), "float32")
+            W_shared = T.alloc_shared((block_N, _RED_TILE), "bfloat16")
             C_local = T.alloc_fragment((block_M, block_N), "float32")
             T.clear(C_local)
             for k in T.Pipelined(K // _RED_TILE, num_stages=2):
                 T.copy(X[by * block_M, k * _RED_TILE], X_shared)
                 T.copy(WQ[bx * block_N, k * _RED_TILE // 2], WQ_shared)
-                # e2m1fn dequant: nibble -> f32, times the per-16 block scale.
+                # e2m1fn dequant: nibble -> fp32 bits (integer math) -> bf16,
+                # times the per-16 block scale.
                 for i, j in T.Parallel(block_N, _RED_TILE):
                     byte = WQ_shared[i, j // 2]
                     nib = (byte >> ((j % 2) * 4)) & 15
-                    sign = T.cast(1 - 2 * T.cast(nib >> 3, "int32"), "float32")
-                    e = T.cast((nib >> 1) & 3, "float32")
-                    m = T.cast(nib & 1, "float32")
-                    w = sign * (0.5 * T.exp2(e)) * (1.0 + 0.5 * m)
-                    W_shared[i, j] = w * Scale[bx * block_N + i, (k * _RED_TILE + j) // 16]
+                    ni32 = T.cast(nib, "int32")
+                    bits = (
+                        ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
+                    )
+                    w = T.reinterpret(bits, "float32")
+                    W_shared[i, j] = T.cast(
+                        w * Scale[bx * block_N + i, (k * _RED_TILE + j) // 16], "bfloat16"
+                    )
                 T.gemm(X_shared, W_shared, C_local, transpose_B=True)
             T.copy(C_local, Y[by * block_M, bx * block_N])
         return Y
@@ -198,38 +208,42 @@ def make_linear_fp4_mma(target: str):
 def make_linear_fp4_gemv(target: str):
     """Fused e2m1fn dequant + GEMV (sm90), the decode (M=1) path of linear_fp4.
 
-    X [1,K] f32, WQ uint8 [N,K//2] (low nibble first), Scale [N,K//16] f32.
+    X [1,K] bf16, WQ uint8 [N,K//2] (low nibble first), Scale [N,K//16] f32.
     Y[0,n] = sum_k X[0,k] * e2m1fn(WQ[n,k//2] nibble k%2) * Scale[n,k//16].
 
     Decode is memory-bound: one warp group per 4 output rows streams WQ+Scale
     once (0.75 bytes/elem), dequantizing on the fly. Each thread owns a
     K-slice of block_K = reduce_thread * micro_size_k elems (micro_size_k =
-    128-bit transaction / 32-bit f32 = 4); partials reduce across the warp.
-    Roofline = (N*K*0.75 + 4K) bytes / HBM BW.
+    128-bit transaction / 16-bit bf16 = 8); partials reduce across the warp.
+    Roofline = (N*K*0.75 + 2K) bytes / HBM BW.
 
     # SOTA copy: examples/dequantize_gemm/example_dequant_gemv_fp16xint4.py
     #   @ tilelang main (dequantize_gemv, split-K + tvm_thread_allreduce path)
-    # Adapted: f32 IO (micro_size_k = 128/32 = 4) instead of fp16; e2m1fn grid
-    #   decode (matches pack_fp4 — no zero, so the backend zero-pads Scale for
-    #   K-tail tiles) with tileRL's per-16 float block scale applied per
-    #   micro-tile, instead of the example's uint4->int4 convert; uint8
-    #   storage; M fixed at 1 (decode) so the grid has no M dim.
+    # Adapted: bf16 IO (micro_size_k = 128/16 = 8, f32 accumulate) instead of
+    #   fp16; e2m1fn grid (matches pack_fp4 — no zero, so the backend
+    #   zero-pads Scale for K-tail tiles) with tileRL's per-16 float block
+    #   scale applied per micro-tile; uint8 storage; M fixed at 1 (decode) so
+    #   the grid has no M dim.
+    # Fast decode: the e2m1fn grid is a power-of-two grid, so each nibble's
+    #   fp32 bit pattern is pure integer math — sign<<31 | (126+e)<<23 |
+    #   m<<22 — reinterpreted as float (the lop3-style fast decode; the LUT/
+    #   exp2 path is 2x slower, see docs/experience/wins/2026-08-24-*.md).
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def linear_fp4_gemv(X, WQ, Scale, reduce_thread, n_partition):
         N, K = T.const("N, K")
-        micro_size_k = 4  # 128-bit transaction / 32-bit f32
+        micro_size_k = 8  # 128-bit transaction / 16-bit bf16
         block_K = reduce_thread * micro_size_k
-        X: T.Tensor((1, K), "float32")
+        X: T.Tensor((1, K), "bfloat16")
         WQ: T.Tensor((N, K // 2), "uint8")
         Scale: T.Tensor((N, K // 16), "float32")
-        Y = T.empty((1, N), "float32")
+        Y = T.empty((1, N), "bfloat16")
         with T.Kernel(T.ceildiv(N, n_partition), threads=(reduce_thread, n_partition)) as bx:
             kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
             ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
             n = bx * n_partition + ni
-            X_local = T.alloc_local((micro_size_k,), "float32")
+            X_local = T.alloc_local((micro_size_k,), "bfloat16")
             WQ_local = T.alloc_local((micro_size_k // 2,), "uint8")
             acc = T.alloc_local((1,), "float32")
             reduced = T.alloc_local((1,), "float32")
@@ -240,16 +254,18 @@ def make_linear_fp4_gemv(target: str):
                     X_local[v] = X[0, base + v]
                 for v in T.vectorized(micro_size_k // 2):
                     WQ_local[v] = WQ[n, base // 2 + v]
-                # one scale per micro-tile: 4 elems never cross a 16-block
+                # one scale per micro-tile: 8 elems never cross a 16-block
                 s = Scale[n, base // 16]
                 for ki in T.serial(micro_size_k):
                     byte = WQ_local[ki // 2]
                     nib = (byte >> ((ki % 2) * 4)) & 15
-                    sign = T.cast(1 - 2 * T.cast(nib >> 3, "int32"), "float32")
-                    e = T.cast((nib >> 1) & 3, "float32")
-                    m = T.cast(nib & 1, "float32")
-                    w = sign * (0.5 * T.exp2(e)) * (1.0 + 0.5 * m)
-                    acc[0] += X_local[ki] * w * s
+                    # e2m1fn -> fp32 bits: sign<<31 | (126+e)<<23 | m<<22
+                    ni32 = T.cast(nib, "int32")
+                    bits = (
+                        ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
+                    )
+                    w = T.reinterpret(bits, "float32")
+                    acc[0] += T.cast(X_local[ki], "float32") * w * s
             with T.attr(
                 T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
                 "reduce_scope",
@@ -261,7 +277,7 @@ def make_linear_fp4_gemv(target: str):
                     )
                 )
             if kr == 0:
-                Y[0, n] = reduced[0]
+                Y[0, n] = T.cast(reduced[0], "bfloat16")
         return Y
 
     return linear_fp4_gemv

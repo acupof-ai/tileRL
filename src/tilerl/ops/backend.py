@@ -25,15 +25,16 @@ the torch-MPS adapter in tilelang's tvm_ffi runtime.
 CUDA target facts (tilelang 0.1.13, H20/sm90, 2026-08-24): the same source
 compiles for ``target="cuda"``; the sm90 cell uses the MMA (WGMMA) schedules
 in kernels_mma.py — shared-memory tiled T.gemm with pipelining, the SOTA
-pattern from examples/gemm/example_gemm.py. The MMA kernels require block
-M/N divisible by 16 and the reduction dim divisible by 32; the CUDA path of
-linear/linear_bwd/linear_fp4 zero-pads tails so the kernel always sees exact
-tiles (decode M=1 pads to 16; all model N/K dims are already multiples of
-32). ``Backend.device`` pins ``cuda:<current>`` — ``torch.device("cuda")``
+pattern from examples/gemm/example_gemm.py. The sm90 MMA kernels are bf16-IO
+(bf16 WGMMA, f32 accumulate); the CUDA path casts to bf16 once at the
+boundary, while CPU/metal keep the f32 kernels. The MMA kernels require
+block M/N divisible by 16 and the reduction dim divisible by 32; the CUDA
+path of linear/linear_bwd/linear_fp4 zero-pads tails so the kernel always
+sees exact tiles (decode M=1 pads to 16; all model N/K dims are already
+multiples of 32). ``Backend.device`` pins ``cuda:<current>`` — ``torch.device("cuda")``
 (index None) is not the device kernel outputs land on. Eager JIT invokes
 NVCC per (shape, dtype): first call per shape costs 30-120s+.
 # ponytail: shape cache / AOT before 27B serving
-``# ponytail: f32 compute day-1, bf16 IO/mixed precision day-2``
 """
 
 from __future__ import annotations
@@ -314,8 +315,11 @@ class Backend:
     # ------------------------------------------------------------ linear
 
     def linear(self, x, w, bias=None):
-        x = self._f32(x)
-        w = self._f32(w)
+        # sm90 kernels are bf16-IO; CPU/metal kernels are f32. Cast once at
+        # the boundary (the model is bf16-master — no bf16->f32->bf16 trip).
+        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
+        x = self._dev(x, io)
+        w = self._dev(w, io)
         lead = x.shape[:-1]
         x2 = self._c(x.reshape(-1, x.shape[-1]))
         M, K, N = x2.shape[0], x2.shape[1], w.shape[0]
@@ -334,9 +338,10 @@ class Backend:
         return y[:M, :N].reshape(*lead, N)
 
     def linear_bwd(self, grad, x, w):
-        grad = self._f32(grad)
-        x = self._f32(x)
-        w = self._f32(w)
+        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
+        grad = self._dev(grad, io)
+        x = self._dev(x, io)
+        w = self._dev(w, io)
         g2 = self._c(grad.reshape(-1, grad.shape[-1]))
         x2 = self._c(x.reshape(-1, x.shape[-1]))
         M, N, K = g2.shape[0], g2.shape[1], w.shape[1]
@@ -370,10 +375,11 @@ class Backend:
 
     def linear_fp4(self, x, wq, scale, master=None):
         # ``master`` is recording-only (the STE grad lands on it); the kernel
-        # uses wq/scale.
-        x = self._f32(x)
+        # uses wq/scale. sm90 kernels are bf16-IO; CPU/metal kernels are f32.
         wq = self._dev(wq, wq.dtype)  # uint8: device migration only
         scale = self._f32(scale)
+        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
+        x = self._dev(x, io)
         lead = x.shape[:-1]
         x2 = self._c(x.reshape(-1, x.shape[-1]))
         M, K, N = x2.shape[0], x2.shape[1], wq.shape[0]
@@ -383,10 +389,10 @@ class Backend:
             and "linear_fp4_gemv" in _resolve(self.precision, self.arch)
         ):
             # Decode GEMV: one activation row, stream+dequant WQ once. Block K
-            # is reduce_thread(32) * micro_size_k(4) = 128; e2m1fn has no zero,
-            # so the K-tail is killed by the zero-padded Scale (same trick as
-            # the MMA path).
-            Kp = _round_up(K, 128)
+            # is reduce_thread(32) * micro_size_k(8 bf16) = 256; e2m1fn has no
+            # zero, so the K-tail is killed by the zero-padded Scale (same
+            # trick as the MMA path).
+            Kp = _round_up(K, 256)
             Np = _round_up(N, 4)
             y = self._kernel("linear_fp4_gemv")(
                 _pad2d(x2, 1, Kp),
