@@ -129,6 +129,9 @@ class _DecodeGraph:
     # the day-1 scope (serving is serial, decode-first); B>1 runs eager.
     # ponytail: capture at engine build time day-2 — lazy on the first
     # decode tick today, so first token pays JIT + capture.
+    # ponytail: recapture after training day-2 — the graph bakes weight
+    # pointers (fine, optimizer updates in place) but also the f32 embed
+    # cast, which the optimizer's copy_ invalidates in eager only.
     """
 
     def __init__(self, model, backend, kv_pool, state_pool, batch_size):
@@ -139,6 +142,15 @@ class _DecodeGraph:
         self._bt = torch.zeros(B, kv_pool.num_blocks, dtype=torch.int32, device=device)
         self._sl = torch.empty(B, dtype=torch.int32, device=device)
         self._ss = torch.empty(B, dtype=torch.long, device=device)
+        # Pinned staging buffers: a plain copy_ from an unpinned CPU tensor is
+        # synchronous (it blocks until the copy engine drains), which under
+        # GPU contention costs ms per tick. Pinned + non_blocking makes the
+        # H2D copies async — stream ordering keeps replay after them.
+        self._ids_h = torch.empty(B, 1, dtype=torch.long, pin_memory=True)
+        self._pos_h = torch.empty(B, 1, dtype=torch.long, pin_memory=True)
+        self._bt_h = torch.zeros(B, kv_pool.num_blocks, dtype=torch.int32, pin_memory=True)
+        self._sl_h = torch.empty(B, dtype=torch.int32, pin_memory=True)
+        self._ss_h = torch.empty(B, dtype=torch.long, pin_memory=True)
         self._kv = BatchKv(
             block_table=self._bt,
             seq_len=self._sl,
@@ -167,14 +179,18 @@ class _DecodeGraph:
 
         Returns the static logits [B,1,V]; valid until the next replay.
         """
-        self._ids.copy_(torch.tensor([[r.output[-1]] for r in reqs], dtype=torch.long))
-        self._pos.copy_(torch.tensor([[r.seq_len - 1] for r in reqs], dtype=torch.long))
-        self._sl.copy_(torch.tensor([r.seq_len for r in reqs], dtype=torch.int32))
-        self._ss.copy_(torch.tensor([r.state_slot for r in reqs], dtype=torch.long))
         for i, r in enumerate(reqs):
+            self._ids_h[i, 0] = r.output[-1]
+            self._pos_h[i, 0] = r.seq_len - 1
+            self._sl_h[i] = r.seq_len
+            self._ss_h[i] = r.state_slot
             n = len(r.blocks)
-            if n:
-                self._bt[i, :n].copy_(torch.tensor(r.blocks, dtype=torch.int32))
+            self._bt_h[i, :n] = torch.tensor(r.blocks, dtype=torch.int32)
+        self._ids.copy_(self._ids_h, non_blocking=True)
+        self._pos.copy_(self._pos_h, non_blocking=True)
+        self._sl.copy_(self._sl_h, non_blocking=True)
+        self._ss.copy_(self._ss_h, non_blocking=True)
+        self._bt.copy_(self._bt_h, non_blocking=True)
         self._graph.replay()
         return self._logits
 
