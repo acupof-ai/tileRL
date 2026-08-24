@@ -4,6 +4,21 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: bf16 GEMV shipped, but it is NOT the 27B decode lever (premise correction)
+
+- **Verdict.** `make_linear_bf16_gemv` shipped (sm90, parity green local +
+  pod CUDA): the fp4 GEMV schedule minus the dequant, 42-116% of HBM roof on
+  the bf16 projection shapes vs 20-42% for the padded-M=16 WGMMA it replaces
+  (1.9-3.9x). But the SOTA-all-levers bench's claim that "GDN projections are
+  bf16, 73% of decode bytes" was wrong: on `cfg.fp4=True` `load_hf` packs
+  EVERY projection (GDN `in_proj_*`/`out_proj`, MLP, `lm_head`) to fp4, and
+  the decode per-op profile shows only `linear_fp4` (86% of GPU), zero bf16
+  `linear` ops. Slice decode before/after: 1.932 → 1.922 ms/tick (noise). The
+  bf16 GEMV serves non-fp4 models, not the 27B. The real 27B decode lever is
+  fp4 GEMV efficiency (24-33% roof — the dequant stage, since the bf16 GEMV
+  on the same schedule hits 42-116%). Entry:
+  `docs/experience/wins/2026-08-25-bf16-gemv-decode.md`.
+
 ## 2026-08-24 — phase exit: SOTA kernel round complete — 80/3800 not met, gap is kernel efficiency not physics
 
 - **Exit verdict.** Final bench on real NVFP4 slices after all levers (fp4
