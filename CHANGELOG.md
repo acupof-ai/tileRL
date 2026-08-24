@@ -4,6 +4,18 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — phase exit: GEMV + chunk-kernel round closed on sm90
+
+- **Exit.** Both kernels default-on, final slice numbers on H20: smoke
+  8-token average 48.85 -> 31.09 -> 5.46 ms/tok, decode-only 5.335 ms/tick
+  (187 tok/s), prefill-512 0.2226 ms/tok (4491 tok/s, 3800 slice target
+  met). Full-model extrapolation (lm_head corrected): ~102 ms/tok decode
+  (9.8 tok/s) and 6.95 ms/tok prefill (144 tok/s) vs 80/3800 targets —
+  8.2x / 26x gap. Next levers per the profile: launch count (899 ops/tick,
+  20 ms dispatch) and the single-block `silu_mul` grid (40% of prefill),
+  not new GEMM schedules. Entry:
+  `docs/experience/wins/2026-08-24-gemv-chunk-kernels.md`.
+
 ## 2026-08-24 — default flip: sm90 GDN prefill uses the fused chunk kernel
 
 - **Flip.** `linear_attn_chunk` on sm90 now dispatches prefill (T>1) to
