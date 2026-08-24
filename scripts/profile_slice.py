@@ -27,6 +27,7 @@ _OPS = (
     "rope",
     "linear",
     "linear_fp4",
+    "linear_fp8",
     "paged_attention",
     "attention",
     "linear_attn_chunk",

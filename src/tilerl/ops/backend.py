@@ -145,6 +145,7 @@ _SM90_KERNELS = {
     "linear_fp4_gemv": kernels_mma.make_linear_fp4_gemv,
     "linear_bf16_gemv": kernels_mma.make_linear_bf16_gemv,
     "linear_fp4_fp8": kernels_mma.make_linear_fp4_fp8_mma,
+    "linear_fp8": kernels_mma.make_linear_fp8_mma,
     "quant_fp8": kernels_mma.make_quant_fp8_e4m3,
     "write_tokens": kernels_mma.make_write_tokens,
     "gdn_decode_fused": kernels_mma.make_gdn_decode_fused,

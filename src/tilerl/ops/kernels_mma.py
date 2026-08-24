@@ -24,6 +24,7 @@ __all__ = [
     "make_linear_bf16_gemv",
     "make_quant_fp8_e4m3",
     "make_linear_fp4_fp8_mma",
+    "make_linear_fp8_mma",
     "make_write_tokens",
     "make_gdn_decode_fused",
     "make_gdn_chunk_fused",
@@ -487,6 +488,68 @@ def make_linear_fp4_fp8_mma(target: str):
         return Y
 
     return linear_fp4_fp8
+
+
+# ---------------------------------------------------------------- linear fp8 (native MMA)
+
+
+def make_linear_fp8_mma(target: str):
+    """Native fp8 WGMMA linear (sm90 prefill path): e4m3 weights + e4m3
+    activations, per-128-block weight scale, per-token activation scale.
+
+    XQ [M,K] e4m3 (per-token quantized, from make_quant_fp8_e4m3),
+    W8 [N,K] e4m3 (checkpoint-native, no dequant),
+    WScale [ceil(N/128), K//128] f32 (per-128-block weight scale),
+    AScale [M] f32 (per-token activation scale).
+    ``Y[m,n] = (sum_k XQ[m,k] * W8[n,k] * WScale[n//128, k//128]) / AScale[m]``.
+
+    The per-128-block weight scale is applied to the accumulator per K-chunk
+    (block_K=128 = the fp8 WGMMA K=32 x 4 steps): C_local holds the chunk's
+    unscaled MMA result, C_accum += C_local * WScale — the deepgemm 2xAcc
+    pattern. No K-loop dequant: the weight operand is native e4m3, so the
+    loop body is copy+copy+gemm+scale with no requant cast (the fp4 prefill
+    path's dequant-to-e4m3 is what held it at 16-22% of peak).
+
+    # SOTA copy: examples/deepseek_deepgemm/example_deepgemm_fp8_2xAcc.py
+    #   @ tilelang main (per-128-block scale, C_local_accum += C_local *
+    #   (scales_a * scales_b) per chunk, T.clear per chunk)
+    # Adapted: per-token activation scale (one divide in the epilogue) instead
+    #   of per-block scales_a; f32 output; e4m3 IO (fp8 WGMMA, f32 accumulate);
+    #   WScale in the checkpoint's native [N//128, K//128] layout (one scalar
+    #   per N-tile, broadcast over the fragment).
+    """
+    _BLOCK_K = 128  # matches the checkpoint's 128-block scale; fp8 WGMMA K=32 x 4
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def linear_fp8(XQ, W8, WScale, AScale, block_M, block_N, threads):
+        threads = 128 if block_M >= 32 else threads
+        M, N, K = T.const("M, N, K")
+        XQ: T.Tensor((M, K), "float8_e4m3fn")
+        W8: T.Tensor((N, K), "float8_e4m3fn")
+        WScale: T.Tensor((T.ceildiv(N, 128), K // 128), "float32")
+        AScale: T.Tensor((M,), "float32")
+        Y = T.empty((M, N), "float32")
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            X_shared = T.alloc_shared((block_M, _BLOCK_K), "float8_e4m3fn")
+            W_shared = T.alloc_shared((block_N, _BLOCK_K), "float8_e4m3fn")
+            C_local = T.alloc_fragment((block_M, block_N), "float32")
+            C_accum = T.alloc_fragment((block_M, block_N), "float32")
+            T.clear(C_accum)
+            T.clear(C_local)
+            for k in T.Pipelined(K // _BLOCK_K, num_stages=4):
+                T.copy(XQ[by * block_M, k * _BLOCK_K], X_shared)
+                T.copy(W8[bx * block_N, k * _BLOCK_K], W_shared)
+                scale_b = WScale[bx * block_N // 128, k]
+                T.gemm(X_shared, W_shared, C_local, transpose_B=True)
+                for i, j in T.Parallel(block_M, block_N):
+                    C_accum[i, j] += C_local[i, j] * scale_b
+                T.clear(C_local)
+            for i, j in T.Parallel(block_M, block_N):
+                C_accum[i, j] = C_accum[i, j] / AScale[by * block_M + i]
+            T.copy(C_accum, Y[by * block_M, bx * block_N])
+        return Y
+
+    return linear_fp8
 
 
 # ---------------------------------------------------------------- write tokens (paged scatter)
