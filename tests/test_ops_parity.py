@@ -160,6 +160,16 @@ def test_linear_parity(backend):
     _assert_close(backend.linear(x, w, bias), reference.linear(x, w, bias), "linear+bias")
 
 
+def test_linear_bf16_gemv_parity(backend):
+    """M=1 decode path: the sm90 cell resolves to the bf16 GEMV kernel (the
+    floor gemm on CPU/metal); same math as the WGMMA path."""
+    torch.manual_seed(25)
+    for N, K in [(24, 32), (16, 128), (18, 64)]:
+        w = torch.randn(N, K)
+        x = torch.randn(1, K)
+        _assert_close(backend.linear(x, w), reference.linear(x, w), f"linear_bf16_gemv N={N} K={K}")
+
+
 def test_linear_bwd(backend):
     torch.manual_seed(3)
     x = torch.randn(6, 8)

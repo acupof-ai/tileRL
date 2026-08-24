@@ -143,6 +143,7 @@ _SM90_KERNELS = {
     "gemm_tn": kernels_mma.make_gemm_tn_mma,
     "linear_fp4": kernels_mma.make_linear_fp4_mma,
     "linear_fp4_gemv": kernels_mma.make_linear_fp4_gemv,
+    "linear_bf16_gemv": kernels_mma.make_linear_bf16_gemv,
     "linear_fp4_fp8": kernels_mma.make_linear_fp4_fp8_mma,
     "quant_fp8": kernels_mma.make_quant_fp8_e4m3,
     "write_tokens": kernels_mma.make_write_tokens,
@@ -332,6 +333,20 @@ class Backend:
         lead = x.shape[:-1]
         x2 = self._c(x.reshape(-1, x.shape[-1]))
         M, K, N = x2.shape[0], x2.shape[1], w.shape[0]
+        if self.target.startswith("cuda") and M == 1:
+            _kset = _resolve(self.precision, self.arch)
+            if "linear_bf16_gemv" in _kset:
+                # Decode GEMV: one activation row, stream W once (2 bytes/elem)
+                # instead of padding M to 16 WGMMA rows. block_K =
+                # reduce_thread(32) * micro_size_k(8 bf16) = 256; the K-tail is
+                # zero-padded like the WGMMA path.
+                Kp = _round_up(K, 256)
+                Np = _round_up(N, 4)
+                y = self._kernel("linear_bf16_gemv")(_pad2d(x2, 1, Kp), _pad2d(w, Np, Kp), 32, 4)
+                y = y[:1, :N]
+                if bias is not None:
+                    y = y + self._f32(bias)
+                return y.reshape(*lead, N)
         bM, bN = min(64, M), min(64, N)
         if self.target.startswith("cuda"):
             # WGMMA tiles: block M/N %16, reduction K %32; pad tails so the
