@@ -4,6 +4,21 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: native FP8 weights shipped — GDN prefill 1.48x, decode 1.05x, but the 3800 target needs the MLP lever too
+
+- **Verdict.** `load_hf` now keeps the checkpoint's FP8 GDN projections native
+  (`<key>.w8` e4m3 + `<key>.wscale` per-128-block, bf16 master recording-only;
+  `cfg.fp4` packing skips them) instead of dequantizing to bf16 and re-packing
+  to fp4. sm90 dispatch: `make_linear_fp8_mma` (deepgemm 2xAcc, per-128-block
+  accumulator scaling, no K-loop dequant) for M>1 prefill, `make_linear_fp8_gemv`
+  for M=1 decode. Parity green (local 72, pod CUDA 31). Isolated GDN bench
+  (same-process back-to-back, contention-independent): fp4 5.657 ms (62.6
+  TFLOPS) → fp8 3.819 ms (92.8 TFLOPS), **1.48x prefill**; decode graph
+  2.799 → 2.672 ms/tick, **1.05x**. The 3800 tok/s target is not met by this
+  lever alone: the GDN is ~23% of prefill FLOPs, the MLP (NVFP4, unchanged fp4
+  path) is ~77% — its dequant efficiency is the remaining lever. Entry:
+  `docs/experience/wins/2026-08-25-native-fp8-weights.md`.
+
 ## 2026-08-25 — accept-or-reject: bf16 GEMV shipped, but it is NOT the 27B decode lever (premise correction)
 
 - **Verdict.** `make_linear_bf16_gemv` shipped (sm90, parity green local +
