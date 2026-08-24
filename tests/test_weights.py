@@ -271,3 +271,290 @@ def test_nvfp4_modelopt_load(tmp_path):
     assert set(loaded.params) == set(param_specs(cfg))
     for key, exp in expected.items():
         assert torch.equal(loaded.params[key], exp), f"param {key} dequant mismatch"
+
+
+def test_nvfp4_official_load(tmp_path):
+    """Official NVFP4 checkpoint (nvidia/Qwen3.6-27B-NVFP4 naming): MLP
+    linears load from u8 ``weight`` (e2m1 nibbles) + f8 ``weight_scale`` +
+    scalar ``weight_scale_2``; GDN and full-attn linears from f8 ``weight``
+    + scalar ``weight_scale`` (per-tensor FP8 — also the standalone-FP8
+    coverage); both dequantized to bf16 equal to a pure-torch reference
+    computed in the test. ``input_scale`` siblings are read-and-ignored."""
+    cfg = replace(
+        tiny(),
+        hidden_size=128,
+        intermediate_size=128,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+    )
+    model = build_random(cfg, seed=7)
+    gen = torch.Generator().manual_seed(11)
+
+    def e2m1_decode(nib):
+        # OCP/MX e2m1 in formula form (independent of reference._E2M1_LUT).
+        e = ((nib >> 1) & 3).float()
+        m = (nib & 1).float()
+        mag = torch.where(e == 0, 0.5 * m, torch.pow(2.0, e - 1.0) * (1.0 + 0.5 * m))
+        return (1.0 - 2.0 * (nib >> 3).float()) * mag
+
+    def ref_nvfp4(packed, scale, gscale):
+        n, k2 = packed.shape
+        vals = torch.stack([e2m1_decode(packed & 0xF), e2m1_decode(packed >> 4)], dim=-1)
+        vals = vals.reshape(n, k2 * 2)
+        s = scale.float().repeat_interleave(16, dim=-1)
+        return (vals * s * gscale.float()).to(torch.bfloat16)
+
+    tensors, expected = {}, {}
+    for key, t in model.params.items():
+        hf = _hf_name(key)
+        stem = hf.removesuffix(".weight")
+        if key.endswith((".gate_proj", ".up_proj", ".down_proj")):
+            n, k = t.shape
+            packed = torch.randint(0, 256, (n, k // 2), generator=gen, dtype=torch.uint8)
+            scale = (torch.rand(n, k // 16, generator=gen) * 0.1 + 0.05).to(torch.float8_e4m3fn)
+            gscale = torch.randn(1, generator=gen) * 0.1
+            tensors[hf] = packed
+            tensors[stem + ".weight_scale"] = scale
+            tensors[stem + ".weight_scale_2"] = gscale
+            # activation quant: present in the checkpoint, read-and-ignored
+            tensors[stem + ".input_scale"] = torch.randn(1, generator=gen) * 0.1
+            expected[key] = ref_nvfp4(packed, scale, gscale)
+        elif key.endswith(
+            (
+                ".in_proj_qkv",
+                ".in_proj_z",
+                ".out_proj",
+                ".q_proj",
+                ".k_proj",
+                ".v_proj",
+                ".o_proj",
+            )
+        ):
+            n, k = t.shape
+            w = (torch.randn(n, k, generator=gen) * 0.1).to(torch.float8_e4m3fn)
+            scale = torch.randn(1, generator=gen) * 0.1 + 0.5
+            tensors[hf] = w
+            tensors[stem + ".weight_scale"] = scale
+            tensors[stem + ".input_scale"] = torch.randn(1, generator=gen) * 0.1
+            expected[key] = (w.float() * scale.float()).to(torch.bfloat16)
+        else:
+            tensors[hf] = t
+            expected[key] = t
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    layer_types = [
+        "full_attention" if i in cfg.full_attn_layer_set else "linear_attention"
+        for i in range(cfg.num_layers)
+    ]
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_6",
+                "text_config": {
+                    "hidden_size": cfg.hidden_size,
+                    "intermediate_size": cfg.intermediate_size,
+                    "num_hidden_layers": cfg.num_layers,
+                    "num_attention_heads": cfg.num_attention_heads,
+                    "num_key_value_heads": cfg.num_kv_heads,
+                    "head_dim": cfg.head_dim,
+                    "vocab_size": cfg.vocab_size,
+                    "rms_norm_eps": cfg.rms_eps,
+                    "tie_word_embeddings": cfg.tie_word_embeddings,
+                    "attn_output_gate": cfg.full_attn_gated,
+                    "layer_types": layer_types,
+                },
+                "quantization_config": {"quant_method": "nvfp4", "weight_block_size": [1, 16]},
+            }
+        )
+    )
+    loaded = load_hf(cfg, str(tmp_path))
+    assert set(loaded.params) == set(param_specs(cfg))
+    for key, exp in expected.items():
+        assert torch.equal(loaded.params[key], exp), f"param {key} dequant mismatch"
+
+
+def test_awq_load(tmp_path):
+    """AWQ-int4 checkpoint (autoawq GEMM convention): linears load from
+    ``qweight`` (int32, 8 int4 per int32 for 8 consecutive output features)
+    + per-group ``scales`` + ``qzeros``, dequantized to bf16 equal to a
+    pure-torch reference computed in the test; group_size comes from
+    ``quantization_config``. in_proj_b/a stay bf16 (out_features=2 < 8)."""
+    # head_dim=32 so o_proj's in_features (hq*head_dim) is a multiple of the
+    # AWQ group 128; hidden/intermediate 128 for the same reason.
+    cfg = replace(
+        tiny(),
+        hidden_size=128,
+        intermediate_size=128,
+        head_dim=32,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+    )
+    model = build_random(cfg, seed=7)
+    gen = torch.Generator().manual_seed(11)
+    group_size = 128
+
+    def ref_awq(qweight, scales, qzeros):
+        k, n8 = qweight.shape
+        shifts = torch.arange(8, dtype=torch.int64) * 4
+        q = ((qweight.long().unsqueeze(-1) >> shifts) & 0xF).float().reshape(k, n8 * 8)
+        z = ((qzeros.long().unsqueeze(-1) >> shifts) & 0xF).float()
+        z = z.reshape(k // group_size, n8 * 8).repeat_interleave(group_size, dim=0)
+        return ((q - z) * scales.float()).t().to(torch.bfloat16)
+
+    tensors, expected = {}, {}
+    for key, t in model.params.items():
+        hf = _hf_name(key)
+        stem = hf.removesuffix(".weight")
+        if key.endswith(
+            (
+                ".q_proj",
+                ".k_proj",
+                ".v_proj",
+                ".o_proj",
+                ".in_proj_qkv",
+                ".in_proj_z",
+                ".out_proj",
+                ".gate_proj",
+                ".up_proj",
+                ".down_proj",
+            )
+        ):
+            out_f, in_f = t.shape
+            q = torch.randint(0, 16, (in_f, out_f), generator=gen, dtype=torch.int64)
+            z = torch.randint(0, 16, (in_f // group_size, out_f), generator=gen, dtype=torch.int64)
+            scales = (torch.rand(in_f // group_size, out_f, generator=gen) * 0.1 + 0.01).to(
+                torch.bfloat16
+            )
+            shifts = (torch.arange(out_f) % 8 * 4).to(torch.int64)
+            qweight = (
+                (q << shifts.view(1, -1)).reshape(in_f, out_f // 8, 8).sum(dim=-1).to(torch.int32)
+            )
+            qzeros = (
+                (z << shifts.view(1, -1))
+                .reshape(in_f // group_size, out_f // 8, 8)
+                .sum(dim=-1)
+                .to(torch.int32)
+            )
+            tensors[stem + ".qweight"] = qweight
+            tensors[stem + ".scales"] = scales
+            tensors[stem + ".qzeros"] = qzeros
+            expected[key] = ref_awq(qweight, scales, qzeros)
+        else:
+            tensors[hf] = t
+            expected[key] = t
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    layer_types = [
+        "full_attention" if i in cfg.full_attn_layer_set else "linear_attention"
+        for i in range(cfg.num_layers)
+    ]
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5_text",
+                "hidden_size": cfg.hidden_size,
+                "intermediate_size": cfg.intermediate_size,
+                "num_hidden_layers": cfg.num_layers,
+                "num_attention_heads": cfg.num_attention_heads,
+                "num_key_value_heads": cfg.num_kv_heads,
+                "head_dim": cfg.head_dim,
+                "vocab_size": cfg.vocab_size,
+                "rms_norm_eps": cfg.rms_eps,
+                "tie_word_embeddings": cfg.tie_word_embeddings,
+                "attn_output_gate": cfg.full_attn_gated,
+                "layer_types": layer_types,
+                "quantization_config": {"quant_method": "awq", "group_size": group_size, "bits": 4},
+            }
+        )
+    )
+    loaded = load_hf(cfg, str(tmp_path))
+    assert set(loaded.params) == set(param_specs(cfg))
+    for key, exp in expected.items():
+        assert torch.equal(loaded.params[key], exp), f"param {key} dequant mismatch"
+
+
+def test_mlx_affine_load(tmp_path):
+    """MLX affine-4bit checkpoint (``language_model.`` prefix, uint32-packed
+    int4 weights + bf16 scales/biases, group 64): linears dequantize to
+    bf16 equal to a pure-torch reference computed in the test; embed_tokens
+    and conv1d stay bf16 (MLX does not quantize them)."""
+    # linear_*_head_dim=64 so out_proj/in_proj_z in_features (64/128) are
+    # multiples of the MLX group 64 (tiny's default 32 is not).
+    cfg = replace(tiny(), linear_key_head_dim=64, linear_value_head_dim=64)
+    model = build_random(cfg, seed=7)
+    gen = torch.Generator().manual_seed(11)
+    group_size = 64
+
+    def ref_mlx(w, scales, biases):
+        out_f, k8 = w.shape
+        shifts = torch.arange(8, dtype=torch.int64) * 4
+        q = ((w.long().unsqueeze(-1) >> shifts) & 0xF).float().reshape(out_f, k8 * 8)
+        s = scales.float().repeat_interleave(group_size, dim=-1)
+        b = biases.float().repeat_interleave(group_size, dim=-1)
+        return (s * q + b).to(torch.bfloat16)
+
+    tensors, expected = {}, {}
+    for key, t in model.params.items():
+        hf = _hf_name(key).removeprefix("model.")  # -> language_model.*
+        base = hf.removesuffix(".weight")
+        if key.endswith(
+            (
+                ".q_proj",
+                ".k_proj",
+                ".v_proj",
+                ".o_proj",
+                ".in_proj_qkv",
+                ".in_proj_z",
+                ".in_proj_b",
+                ".in_proj_a",
+                ".out_proj",
+                ".gate_proj",
+                ".up_proj",
+                ".down_proj",
+            )
+        ):
+            out_f, in_f = t.shape
+            q = torch.randint(0, 16, (out_f, in_f), generator=gen, dtype=torch.int64)
+            scales = (torch.randn(out_f, in_f // group_size, generator=gen) * 0.1).to(
+                torch.bfloat16
+            )
+            biases = (torch.randn(out_f, in_f // group_size, generator=gen) * 0.01).to(
+                torch.bfloat16
+            )
+            shifts = (torch.arange(in_f) % 8 * 4).to(torch.int64)
+            packed = (
+                (q << shifts.view(1, -1)).reshape(out_f, in_f // 8, 8).sum(dim=-1).to(torch.uint32)
+            )
+            tensors[hf] = packed
+            tensors[base + ".scales"] = scales
+            tensors[base + ".biases"] = biases
+            expected[key] = ref_mlx(packed, scales, biases)
+        else:
+            tensors[hf] = t
+            expected[key] = t
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    layer_types = [
+        "full_attention" if i in cfg.full_attn_layer_set else "linear_attention"
+        for i in range(cfg.num_layers)
+    ]
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5_text",
+                "hidden_size": cfg.hidden_size,
+                "intermediate_size": cfg.intermediate_size,
+                "num_hidden_layers": cfg.num_layers,
+                "num_attention_heads": cfg.num_attention_heads,
+                "num_key_value_heads": cfg.num_kv_heads,
+                "head_dim": cfg.head_dim,
+                "vocab_size": cfg.vocab_size,
+                "rms_norm_eps": cfg.rms_eps,
+                "tie_word_embeddings": cfg.tie_word_embeddings,
+                "attn_output_gate": cfg.full_attn_gated,
+                "layer_types": layer_types,
+                "quantization": {"group_size": group_size, "bits": 4},
+            }
+        )
+    )
+    loaded = load_hf(cfg, str(tmp_path))
+    assert set(loaded.params) == set(param_specs(cfg))
+    for key, exp in expected.items():
+        assert torch.equal(loaded.params[key], exp), f"param {key} dequant mismatch"

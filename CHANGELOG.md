@@ -4,6 +4,24 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — format loaders: official NVFP4, per-tensor FP8, AWQ-int4; 23MB fixture retired
+
+- **Features.** `load_hf` gains three formats (all dequant to bf16 at load):
+  official NVIDIA NVFP4 naming (`weight` u8 nibbles + `weight_scale` f8 +
+  scalar `weight_scale_2`; reuses the ModelOpt e2m1 math), per-tensor FP8
+  (f8 `weight` + scalar `weight_scale` — the official-NVFP4 GDN/attn path and
+  standalone FP8), and AWQ-int4 (`qweight`/`scales`/`qzeros`, autoawq GEMM
+  packing, group size from `quantization_config`). `dequant_awq` added to
+  `ops/reference.py`. Five formats now covered: bf16 HF, MLX-4bit, ModelOpt
+  NVFP4/FP8-block, official NVFP4, FP8, AWQ-int4.
+- **Tests.** 64 passed, 1 skipped on CPU (was 62+1). New synthetic
+  per-format tests in `tests/test_weights.py` (KB-sized, formula-reference,
+  `torch.equal`): `test_nvfp4_official_load`, `test_awq_load`,
+  `test_mlx_affine_load`. Deleted: the 23MB `tests/fixtures/
+  qwen35-2layer-mlx4/`, `tests/test_real_weights.py`, `scripts/crop_fixture.py`,
+  and the orphaned `qwen35_08b` config. Entry:
+  `docs/experience/wins/2026-08-24-format-loaders.md`.
+
 ## 2026-08-24 — pretrain loop + save_hf; ruff format gate turned on
 
 - **Features.** `save_hf(model, path)` (model.py): HF safetensors + config.json

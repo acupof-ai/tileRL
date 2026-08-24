@@ -9,15 +9,16 @@ work; each exits on a named, verifiable event — no calendar dates.
 | Area | State |
 |---|---|
 | Backend | TileLang single backend; CPU target green in CI (ubuntu + macos), Metal green locally |
-| Model | Hybrid full-attn + GatedDeltaNet; HF + MLX-4bit loaders; fp4 pack/unpack; `num_layers` truncation |
+| Model | Hybrid full-attn + GatedDeltaNet; loaders: bf16 HF, MLX-4bit, ModelOpt + official NVFP4, per-tensor FP8, AWQ-int4; fp4 pack/unpack; `num_layers` truncation |
 | KV | Paged blocks + hash prefix cache + GDN recurrent state; engine-level prefix hits |
 | Engine | Continuous batching, submit/poll, one forward per tick |
 | Training | Hand-written tape + AdamW; OPD loop; JSONL pretraining with checkpoints |
-| Tests | 61 hermetic (e2e, parity, gradcheck, kv, server) + committed real-weight fixture (0.8B, 2 layers) |
+| Tests | 64 hermetic (e2e, parity, gradcheck, kv, server, per-format loader) |
 | Serving | OpenAI-compatible server + SSE + chat UI |
 
-Architecture risk for the 27B is retired: the 0.8B is the same hybrid family
-and its real weights load, generate, and train.
+Every checkpoint format the 27B family ships in has a hermetic loader test
+(bf16, MLX-4bit, NVFP4 ModelOpt + official, FP8, AWQ-int4); the remaining
+risk is the real 27B weights themselves, not the format handling.
 
 ## Phase 1 — 27B real-weight bring-up
 

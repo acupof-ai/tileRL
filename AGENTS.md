@@ -175,7 +175,6 @@ per-file only for `autograd.py` and `ops/reference.py` (known in-flight spots).
 
 **CI.** `.github/workflows/ci.yml` gates on `ubuntu-latest` + `macos-14`:
 `uv sync --dev` → `ruff check` → `TILERL_TARGET=cpu uv run pytest -v`.
-Determinism policy: only lint + hermetic CPU tests block; the real-weight test
-is `TILERL_TEST_REAL=1`-gated (absent on CI), GPU/Metal tests auto-skip, and no
-bench/perf steps exist. `ruff format --check` runs non-blocking until the tree
+Determinism policy: only lint + hermetic CPU tests block; GPU/Metal tests
+auto-skip, and no bench/perf steps exist. `ruff format --check` runs non-blocking until the tree
 is reformatted.

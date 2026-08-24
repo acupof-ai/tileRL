@@ -1,8 +1,7 @@
 # CI gate policy: only deterministic checks block the build.
 #   - ruff lint + format (rule set and day-1 ignores: pyproject.toml [tool.ruff])
-#   - hermetic CPU pytest: TILERL_TARGET=cpu, real-weight test is env-gated
-#     (TILERL_TEST_REAL=1, absent here) and GPU/Metal tests auto-skip, so plain
-#     `uv run pytest` on CI is exactly the deterministic set.
+#   - hermetic CPU pytest: TILERL_TARGET=cpu, GPU/Metal tests auto-skip, so
+#     plain `uv run pytest` on CI is exactly the deterministic set.
 # No bench/perf steps — non-deterministic, never gate on them.
 
 name: ci

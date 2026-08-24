@@ -53,21 +53,19 @@ a checkpoint demands it.
 
 ## Evidence
 
-- **cpu/bf16**: `uv run pytest` (58 hermetic tests) — kernel-vs-reference
+- **cpu/bf16**: `uv run pytest` (64 hermetic tests) — kernel-vs-reference
   parity on every op, tape gradcheck, end-to-end generation + training.
 - **cpu/fp4**: `test_fp4_on_load_and_forward` (pack-on-load + forward through
   the fp4 linear), `test_fp4_roundtrip` (wire format), STE backward covered by
   the production-model gradcheck.
-- **real weights**: `TILERL_TEST_REAL=1 uv run pytest tests/test_real_weights.py`
-  — Qwen3.5-0.8B-MLX-4bit forward + train_step; full 24-layer generation is
-  coherent ("The capital of France is Paris, and the capital of the United
-  States is Washington, D.C.").
-- **metal/bf16 + fp4**: `TILERL_TARGET=metal uv run pytest` — the same 58 tests
+- **checkpoint loaders**: `tests/test_weights.py` — one synthetic hermetic
+  test per format: bf16 HF roundtrip, ModelOpt NVFP4 + FP8-block, official
+  NVFP4 (MLP e2m1 + GDN/attn per-tensor FP8), AWQ-int4, MLX affine-4bit. Each
+  asserts dequantized bf16 against a pure-torch formula reference.
+- **metal/bf16 + fp4**: `TILERL_TARGET=metal uv run pytest` — the same 64 tests
   pass on Apple Silicon (tilelang 0.1.13 Metal JIT, torch MPS), plus
   `tests/test_metal_target.py` (target resolution, rmsnorm, the metal gemm
-  schedule). `TILERL_TARGET=metal TILERL_TEST_REAL=1 uv run pytest
-  tests/test_real_weights.py` passes (RefBackend path — validates device
-  wiring, not metal kernels). Metal facts:
+  schedule). Metal facts:
   - Same kernel source as CPU; the only registry fork is the three gemms
     (naive FMA schedules — Metal's `T.gemm` lowering rejects global operands).
   - `linear_attn_chunk` uses a per-column serial scan on BOTH targets: the

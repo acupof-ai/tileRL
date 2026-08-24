@@ -185,36 +185,6 @@ def qwen36_27b() -> ModelConfig:
     )
 
 
-def qwen35_08b() -> ModelConfig:
-    """Qwen3.5-0.8B (local MLX-4bit): 24 layers = 6 full-attn (idx 3,7,...,23)
-    + 18 GDN. Same hybrid family as the 27B, small enough to forward on CPU —
-    the architecture-retirement model. Values from the local MLX config.json.
-    """
-    return ModelConfig(
-        name="qwen35-08b",
-        hidden_size=1024,
-        intermediate_size=3584,
-        num_layers=24,
-        num_attention_heads=8,
-        num_kv_heads=2,
-        head_dim=256,
-        vocab_size=248320,
-        full_attn_layers=tuple(range(3, 24, 4)),
-        rope_theta=1e7,
-        max_position_embeddings=262144,
-        rms_eps=1e-6,
-        tie_word_embeddings=True,
-        fp4=False,
-        full_attn_gated=True,
-        rotary_dim=64,  # partial_rotary_factor 0.25 * head_dim 256
-        linear_num_key_heads=16,
-        linear_key_head_dim=128,
-        linear_num_value_heads=16,
-        linear_value_head_dim=128,
-        linear_conv_kernel_dim=4,
-    )
-
-
 def tiny() -> ModelConfig:
     """CPU smoke-test config: 2 layers (idx 0 full-attn, idx 1 gated-delta).
 

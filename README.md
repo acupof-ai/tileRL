@@ -51,9 +51,8 @@ uv run pytest                                   # same deterministic suite as CI
 
 CI (`.github/workflows/ci.yml`) runs on `ubuntu-latest` + `macos-14`:
 `uv sync --dev`, ruff lint, and the hermetic CPU suite (`TILERL_TARGET=cpu`).
-Only deterministic checks gate the build — the real-weight test is
-`TILERL_TEST_REAL=1`-gated and GPU/Metal tests auto-skip, so plain `uv run
-pytest` on CI is exactly the deterministic set.
+Only deterministic checks gate the build — GPU/Metal tests auto-skip, so
+plain `uv run pytest` on CI is exactly the deterministic set.
 
 ## Architecture
 
