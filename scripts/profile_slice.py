@@ -147,16 +147,25 @@ def report(cfg, dec, pre, args) -> None:
     wall = sum(dwalls) / ticks * 1000.0
     overhead = wall - gpu_sum
     calls_per_tick = sum(dc.values()) / ticks
-    per_op_overhead = overhead / calls_per_tick
+    per_op_overhead = overhead / calls_per_tick if calls_per_tick else 0.0
 
-    rows = sorted(((k, v / ticks) for k, v in dt.items()), key=lambda r: -r[1])
-    _table(f"DECODE per tick (avg of {ticks} ticks, {layers} layers)", rows, gpu_sum)
-    print(f"  {'GPU sum':<20} {gpu_sum:>10.3f}")
-    print(f"  {'wall':<20} {wall:>10.3f}")
-    print(
-        f"  {'dispatch overhead':<20} {overhead:>10.3f} "
-        f"({per_op_overhead * 1000:.1f} us/op, {calls_per_tick:.0f} ops/tick)"
-    )
+    if args.decode_graph:
+        # Captured decode: the per-op tracer sees nothing during a replay
+        # (the ops ran once at capture), so wall IS the tick — replay plus
+        # the small H2D input copies plus sampling.
+        print(f"\nDECODE (captured) per tick (avg of {ticks} ticks, {layers} layers)")
+        print(f"  {'wall (replay+copies+sample)':<20} {wall:>10.3f}")
+        print(f"  {'throughput':<20} {1000.0 / wall:>10.1f} tok/s")
+        print("  note: per-op GPU sum is empty — the forward is one graph replay")
+    else:
+        rows = sorted(((k, v / ticks) for k, v in dt.items()), key=lambda r: -r[1])
+        _table(f"DECODE per tick (avg of {ticks} ticks, {layers} layers)", rows, gpu_sum)
+        print(f"  {'GPU sum':<20} {gpu_sum:>10.3f}")
+        print(f"  {'wall':<20} {wall:>10.3f}")
+        print(
+            f"  {'dispatch overhead':<20} {overhead:>10.3f} "
+            f"({per_op_overhead * 1000:.1f} us/op, {calls_per_tick:.0f} ops/tick)"
+        )
 
     p_gpu = sum(pt.values())
     p_overhead = pwall * 1000.0 - p_gpu
@@ -170,29 +179,30 @@ def report(cfg, dec, pre, args) -> None:
     print(f"  {'dispatch overhead':<20} {p_overhead:>10.3f} ms")
 
     # --- extrapolation: slice (2 GDN layers) -> full 64-layer model ---------
-    fixed = sum(dt.get(k, 0.0) for k in _FIXED) / ticks
-    per_layer_gpu = (gpu_sum - fixed) / layers
     full_layers = 64
-    gpu_full = per_layer_gpu * full_layers + fixed
-    fixed_calls = sum(dc.get(k, 0) for k in _FIXED) / ticks
-    per_layer_calls = (calls_per_tick - fixed_calls) / layers
-    calls_full = per_layer_calls * full_layers + fixed_calls
-    overhead_full = per_op_overhead * calls_full
-    total_full = gpu_full + overhead_full
+    if not args.decode_graph:
+        fixed = sum(dt.get(k, 0.0) for k in _FIXED) / ticks
+        per_layer_gpu = (gpu_sum - fixed) / layers
+        gpu_full = per_layer_gpu * full_layers + fixed
+        fixed_calls = sum(dc.get(k, 0) for k in _FIXED) / ticks
+        per_layer_calls = (calls_per_tick - fixed_calls) / layers
+        calls_full = per_layer_calls * full_layers + fixed_calls
+        overhead_full = per_op_overhead * calls_full
+        total_full = gpu_full + overhead_full
 
-    print("\nEXTRAPOLATION (slice -> 64-layer 27B)")
-    print(f"  per-layer GPU sum:        {per_layer_gpu:.3f} ms/tok")
-    print(f"  fixed (embed+sample):     {fixed:.3f} ms/tok")
-    print(f"  full-model GPU sum:       {gpu_full:.3f} ms/tok")
-    print(f"  full-model dispatch:      {overhead_full:.3f} ms/tok ({calls_full:.0f} ops/tick)")
-    print(
-        f"  full-model decode:        {total_full:.3f} ms/tok "
-        f"({1000.0 / total_full:.1f} tok/s)  target 12.5 ms (80 tok/s)"
-    )
-    print(
-        "  caveat: slice has 2 GDN layers, 0 full-attn; the 16 full-attn "
-        "layers of the 27B are unmeasured (GDN per-layer used as the average)."
-    )
+        print("\nEXTRAPOLATION (slice -> 64-layer 27B)")
+        print(f"  per-layer GPU sum:        {per_layer_gpu:.3f} ms/tok")
+        print(f"  fixed (embed+sample):     {fixed:.3f} ms/tok")
+        print(f"  full-model GPU sum:       {gpu_full:.3f} ms/tok")
+        print(f"  full-model dispatch:      {overhead_full:.3f} ms/tok ({calls_full:.0f} ops/tick)")
+        print(
+            f"  full-model decode:        {total_full:.3f} ms/tok "
+            f"({1000.0 / total_full:.1f} tok/s)  target 12.5 ms (80 tok/s)"
+        )
+        print(
+            "  caveat: slice has 2 GDN layers, 0 full-attn; the 16 full-attn "
+            "layers of the 27B are unmeasured (GDN per-layer used as the average)."
+        )
 
     per_tok_prefill = (p_gpu + p_overhead) / args.prefill_len
     per_layer_prefill = (p_gpu - sum(pt.get(k, 0.0) for k in _FIXED)) / layers
@@ -216,6 +226,11 @@ def main() -> None:
     p.add_argument("--layers", type=int, default=2)
     p.add_argument("--decode-ticks", type=int, default=10)
     p.add_argument("--prefill-len", type=int, default=512)
+    p.add_argument(
+        "--decode-graph",
+        action="store_true",
+        help="capture the decode tick as a CUDA graph (replay per token)",
+    )
     args = p.parse_args()
 
     from tilerl.config import qwen36_27b
@@ -240,7 +255,9 @@ def main() -> None:
     # 128 blocks: the prefix store retains each published prompt (a 512-token
     # prompt holds 32 blocks for the process lifetime), and later requests
     # still need fresh blocks on top of those.
-    engine = build_engine(cfg, model, backend, num_blocks=128, num_slots=4)
+    engine = build_engine(
+        cfg, model, backend, num_blocks=128, num_slots=4, decode_graph=args.decode_graph
+    )
     tracer = Tracer(backend)  # wraps the singleton's ops; timing stays off until enabled
 
     # Warmup: compile EVERY (shape, dtype) the timed run touches. One

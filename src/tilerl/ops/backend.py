@@ -246,7 +246,12 @@ class Backend:
         key = (d, theta)
         inv = self._inv_freq_cache.get(key)
         if inv is None:
-            inv = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float32) / d))
+            # On the backend device: a CPU-cached tensor would H2D-copy on
+            # every rope call, and the copy is illegal inside a captured
+            # decode tick (CUDA graph capture rejects unpinned CPU->CUDA).
+            inv = 1.0 / (
+                theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=self.device) / d)
+            )
             self._inv_freq_cache[key] = inv
         return inv
 

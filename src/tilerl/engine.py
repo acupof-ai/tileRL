@@ -7,6 +7,11 @@ Tick semantics: ONE forward per tick, EITHER a decode batch (running requests,
 T=1 each, up to ``max_batch`` rows) OR a single prefill (one waiting request,
 its whole remaining prompt tail). Decode-first: a prefill is admitted only
 when no decode is pending, so requests are served serially day-1.
+The decode tick is a captured kernel sequence, not an interpreted one
+(design-engine.md): on CUDA, ``_step_decode`` replays a ``_DecodeGraph``
+(static input buffers + static pools, captured once per batch-size bucket)
+instead of dispatching ~900 kernels per token; the eager path stays the
+default on other targets and the fallback on capture failure.
 # ponytail: mixed prefill+decode batches day-2 — needs a ragged-row model
 # contract (per-row query lengths); the pinned model.forward is dense [B,T].
 # ponytail: chunked prefill day-2 — a prompt tail longer than
@@ -32,6 +37,7 @@ it speaks token ids only.
 from __future__ import annotations
 
 import threading
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -100,6 +106,79 @@ class BatchKv:
     state_pool: Any
 
 
+class _DecodeGraph:
+    """Captured decode forward for one batch-size bucket (day-1: B=1).
+
+    The decode tick is a static kernel sequence — same ops, same shapes,
+    every token (design-engine.md). Capture ``model.forward`` once and replay
+    per token: per-tick cost is one graph replay plus small H2D copies of the
+    per-tick inputs (token id, position, block table, seq_len, state slot).
+
+    Inside the graph: embedding, every layer op (norms, linears, RoPE, KV
+    scatter, paged attention / fused GDN, state gather-scatter, MLP), final
+    norm, lm_head. Outside (host work or syncing): block allocation, the
+    input copies, sampling, prefix publish.
+
+    The static KV/state pools are the engine's own — replay mutates them,
+    exactly like the eager path. The warmup forwards write dummy data into
+    block 0 / slot 0; real requests overwrite every pool position before it
+    is read (prefill writes [0, prompt_len), decodes append), and slots are
+    zeroed on alloc, so the dummy data is never observable.
+
+    # ponytail: batch-size buckets for continuous batching day-2 — M=1 is
+    # the day-1 scope (serving is serial, decode-first); B>1 runs eager.
+    # ponytail: capture at engine build time day-2 — lazy on the first
+    # decode tick today, so first token pays JIT + capture.
+    """
+
+    def __init__(self, model, backend, kv_pool, state_pool, batch_size):
+        device = backend.device
+        B = batch_size
+        self._ids = torch.empty(B, 1, dtype=torch.long, device=device)
+        self._pos = torch.empty(B, 1, dtype=torch.long, device=device)
+        self._bt = torch.zeros(B, kv_pool.num_blocks, dtype=torch.int32, device=device)
+        self._sl = torch.empty(B, dtype=torch.int32, device=device)
+        self._ss = torch.empty(B, dtype=torch.long, device=device)
+        self._kv = BatchKv(
+            block_table=self._bt,
+            seq_len=self._sl,
+            state_slot=self._ss,
+            kv_pool=kv_pool,
+            state_pool=state_pool,
+        )
+        # Warmup on a side stream: tilelang JIT-compiles per (shape, dtype),
+        # and JIT is host work — it must finish before capture starts.
+        self._ids.fill_(0)
+        self._pos.fill_(0)
+        self._sl.fill_(1)
+        self._ss.fill_(0)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                model.forward(self._ids, self._pos, self._kv, backend)
+        torch.cuda.current_stream().wait_stream(s)
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph):
+            self._logits = model.forward(self._ids, self._pos, self._kv, backend)
+
+    def run(self, reqs):
+        """Copy per-tick inputs into the static buffers and replay.
+
+        Returns the static logits [B,1,V]; valid until the next replay.
+        """
+        self._ids.copy_(torch.tensor([[r.output[-1]] for r in reqs], dtype=torch.long))
+        self._pos.copy_(torch.tensor([[r.seq_len - 1] for r in reqs], dtype=torch.long))
+        self._sl.copy_(torch.tensor([r.seq_len for r in reqs], dtype=torch.int32))
+        self._ss.copy_(torch.tensor([r.state_slot for r in reqs], dtype=torch.long))
+        for i, r in enumerate(reqs):
+            n = len(r.blocks)
+            if n:
+                self._bt[i, :n].copy_(torch.tensor(r.blocks, dtype=torch.int32))
+        self._graph.replay()
+        return self._logits
+
+
 class Engine:
     """submit/poll serving loop over one model forward per tick.
 
@@ -115,6 +194,7 @@ class Engine:
         state_pool: Any,
         prefix_store: Any,
         limits: StepLimits,
+        decode_graph: bool | None = None,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -122,6 +202,14 @@ class Engine:
         self._states = state_pool
         self._prefix = prefix_store
         self.limits = limits
+
+        # Captured decode (design-engine.md): the decode tick is replayed,
+        # not interpreted. Auto-on for CUDA; the eager path stays the
+        # default/fallback everywhere else and on capture failure.
+        if decode_graph is None:
+            decode_graph = backend.device.type == "cuda"
+        self._decode_graph_on = decode_graph
+        self._decode_graphs: dict[int, _DecodeGraph] = {}
 
         self._lock = threading.RLock()
         self._wake = threading.Event()
@@ -359,6 +447,25 @@ class Engine:
                 r.blocks.append(self._kv.alloc_block())
                 r.own_blocks += 1
                 self._blocks_used += 1
+        if self._decode_graph_on and len(reqs) == 1:
+            # Captured decode (day-1 bucket: M=1). Capture is lazy on the
+            # first decode tick; a capture failure degrades to eager loudly.
+            # ponytail: batch-size buckets day-2 — B>1 runs eager.
+            g = self._decode_graphs.get(1)
+            if g is None:
+                try:
+                    g = _DecodeGraph(self._model, self._backend, self._kv, self._states, 1)
+                except Exception as exc:
+                    warnings.warn(f"decode graph capture failed ({exc}); eager fallback")
+                    self._decode_graph_on = False
+                else:
+                    self._decode_graphs[1] = g
+            if g is not None:
+                logits = g.run(reqs)
+                self._decode_forwards += 1
+                for i, r in enumerate(reqs):
+                    self._after_forward(r, logits[i, -1], generated_idx=len(r.output))
+                return
         input_ids = np.asarray([[r.output[-1]] for r in reqs], dtype=np.int64)
         # The sampled token was appended to r.tokens at the previous forward;
         # its position is seq_len-1 (0-indexed, matching prefill positions).
@@ -446,12 +553,15 @@ def build_engine(
     max_batch: int = 8,
     max_total_tokens: int = 8192,
     prefix_store: Any = None,
+    decode_graph: bool | None = None,
 ) -> "Engine":
     """Wire a model + backend into a running Engine (pools + prefix store).
 
     ``cfg`` is a :class:`~tilerl.config.ModelConfig`; the factory derives the
     pool shapes from it. Pass ``prefix_store`` to inject a test double (e.g. a
-    never-match store for the miss path).
+    never-match store for the miss path). ``decode_graph`` auto-enables the
+    captured decode tick on CUDA (design-engine.md); pass False to force the
+    eager path.
     """
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
     if backend.device.type != "cpu":
@@ -483,4 +593,5 @@ def build_engine(
         state_pool,
         store,
         StepLimits(max_batch=max_batch, max_total_tokens=max_total_tokens),
+        decode_graph=decode_graph,
     )
