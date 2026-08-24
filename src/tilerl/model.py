@@ -70,6 +70,7 @@ import torch
 from . import autograd
 from .config import ModelConfig, tiny
 from .ops.reference import (
+    dequant_awq,
     dequant_fp8_block,
     dequant_nvfp4,
     pack_fp4,
@@ -469,8 +470,11 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
     MLX path is detected from the ``language_model.`` tensor-name prefix), as
     are ModelOpt NVFP4/FP8-block checkpoints (detected from the
     ``weight_packed`` / ``weight_scale_inv`` sibling tensors, dequantized to
-    bf16 before param mapping).
-    """
+    bf16 before param mapping), official-NVFP4 checkpoints (``weight_scale_2``
+    sibling: e2m1 nibbles * f8 block scale * global scale), per-tensor FP8
+    (f8 ``weight`` + scalar ``weight_scale``), and AWQ-int4 (``qweight`` /
+    ``scales`` / ``qzeros`` siblings, group size from
+    ``quantization_config.group_size``)."""
     if num_layers is not None and not 0 < num_layers <= cfg.num_layers:
         raise ValueError(f"num_layers={num_layers} out of range for {cfg.num_layers} layers")
     src = Path(source)
@@ -527,6 +531,7 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
 
     specs = param_specs(cfg)
     group_size = hf_cfg.get("quantization", {}).get("group_size", 64)
+    awq_group = (hf_cfg.get("quantization_config") or {}).get("group_size", 128)
     params: dict[str, torch.Tensor] = {}
     for shard in _shard_files(ckpt_dir, source_desc):
         tensors = load_file(str(shard))
@@ -554,17 +559,15 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
                         tensors[stem + ".weight_scale"],
                         tensors[stem + ".weight_global_scale"],
                     )
-            elif hf_name.endswith(
-                (
-                    ".weight_scale",
-                    ".weight_global_scale",
-                    ".input_global_scale",
-                    ".weight_scale_inv",
-                )
-            ):
-                # ModelOpt quant siblings consumed above; input_global_scale is
-                # activation quant — inference-engine business, ignored at load.
-                continue
+            elif hf_name.endswith(".qweight"):
+                # AWQ-int4 (autoawq GEMM): packed int4 weights + per-group
+                # scales/zeros siblings, dequantized to bf16.
+                stem = hf_name.removesuffix(".qweight")
+                key = _param_key_for(stem + ".weight")
+                if key is not None:
+                    tensor = dequant_awq(
+                        tensor, tensors[stem + ".scales"], tensors[stem + ".qzeros"], awq_group
+                    )
             elif (
                 hf_name.endswith(".weight")
                 and hf_name.removesuffix(".weight") + ".weight_scale_inv" in tensors
@@ -576,6 +579,47 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
                     tensor = dequant_fp8_block(
                         tensor, tensors[hf_name.removesuffix(".weight") + ".weight_scale_inv"]
                     )
+            elif (
+                hf_name.endswith(".weight")
+                and hf_name.removesuffix(".weight") + ".weight_scale_2" in tensors
+            ):
+                # Official NVFP4 (nvidia/Qwen3.6-27B-NVFP4 MLP linears): same
+                # e2m1*f8-block-scale*global-scale math as ModelOpt, official
+                # tensor names (weight / weight_scale / weight_scale_2).
+                stem = hf_name.removesuffix(".weight")
+                key = _param_key_for(hf_name)
+                if key is not None:
+                    tensor = dequant_nvfp4(
+                        tensor, tensors[stem + ".weight_scale"], tensors[stem + ".weight_scale_2"]
+                    )
+            elif (
+                hf_name.endswith(".weight")
+                and hf_name.removesuffix(".weight") + ".weight_scale" in tensors
+            ):
+                # Per-tensor FP8 (official NVFP4 GDN/attn linears, standalone
+                # FP8): f8 weight * scalar scale, dequantized to bf16.
+                stem = hf_name.removesuffix(".weight")
+                key = _param_key_for(hf_name)
+                if key is not None:
+                    tensor = (tensor.float() * tensors[stem + ".weight_scale"].float()).to(
+                        torch.bfloat16
+                    )
+            elif hf_name.endswith(
+                (
+                    ".weight_scale",
+                    ".weight_scale_2",
+                    ".weight_global_scale",
+                    ".input_global_scale",
+                    ".input_scale",
+                    ".weight_scale_inv",
+                    ".scales",
+                    ".qzeros",
+                )
+            ):
+                # Quant siblings consumed with their weight tensor above;
+                # input_*_scale is activation quant — inference-engine
+                # business, ignored at load.
+                continue
             else:
                 key = _param_key_for(hf_name)
             if key is None:

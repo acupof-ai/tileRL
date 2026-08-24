@@ -33,6 +33,7 @@ __all__ = [
     "unpack_fp4",
     "dequant_nvfp4",
     "dequant_fp8_block",
+    "dequant_awq",
     "dense_attention",
     "dense_attention_bwd",
     "linear_attn_chunk",
@@ -285,6 +286,22 @@ def dequant_fp8_block(
     Returns bf16 [N,K]: ``w = f8(weight) / scale_inv.repeat(block)``."""
     si = scale_inv.float().repeat_interleave(block, dim=-1).repeat_interleave(block, dim=-2)
     return (weight.float() / si).to(torch.bfloat16)
+
+
+def dequant_awq(
+    qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    """AutoAWQ GEMM dequant. qweight int32 [K,N//8] (8 int4 per int32, for 8
+    consecutive output features; int4 at bits (j%8)*4 of qweight[i,j//8]),
+    qzeros int32 [K//group,N//8] (same packing), scales bf16/fp16
+    [K//group,N]. Returns bf16 [N,K] (PyTorch Linear layout):
+    ``w[j,i] = (q - z) * s`` per group, transposed from the GEMM [K,N]."""
+    k, n8 = qweight.shape
+    shifts = torch.arange(8, dtype=torch.int64, device=qweight.device) * 4
+    q = ((qweight.long().unsqueeze(-1) >> shifts) & 0xF).float().reshape(k, n8 * 8)
+    z = ((qzeros.long().unsqueeze(-1) >> shifts) & 0xF).float()
+    z = z.reshape(k // group_size, n8 * 8).repeat_interleave(group_size, dim=0)
+    return ((q - z) * scales.float()).t().to(torch.bfloat16)
 
 
 # ---------------------------------------------------------------- full attention (training)
