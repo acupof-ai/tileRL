@@ -70,14 +70,16 @@ def main() -> None:
 
     rid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=args.gen, seed=0))
     t0 = time.perf_counter()
+    finished: dict[int, list[int]] = {}
     for _ in range(256 + args.gen * 4):
         engine.step()
-        if rid in engine.poll():
+        finished = engine.poll()  # poll clears — capture before the next tick
+        if rid in finished:
             break
     else:
         raise RuntimeError("generation did not finish")
     dt = time.perf_counter() - t0
-    out = engine.poll().get(rid, [])
+    out = finished[rid]
     print(
         f"generate: {len(out)} tokens in {dt * 1000:.1f} ms "
         f"({dt * 1000 / max(len(out), 1):.2f} ms/tok, JIT-free)"
