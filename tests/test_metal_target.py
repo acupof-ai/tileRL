@@ -19,6 +19,15 @@ import torch
 # test_e2e.test_gpu_targets.
 _MPS_BUILT = torch.backends.mps.is_built()
 _MPS_AVAILABLE = torch.backends.mps.is_available()
+# is_available() is True on CI macos runners, but the VM has no GPU
+# entitlement: even a 1-byte MPS allocation raises OOM. Probe allocation.
+_MPS_USABLE = False
+if _MPS_AVAILABLE:
+    try:
+        torch.empty(1, device="mps")
+        _MPS_USABLE = True
+    except RuntimeError:
+        pass
 
 # Metal JIT availability: tilelang 0.1.13 ships the metal pipeline on macOS
 # arm64 wheels; probe tilelang's own check rather than the platform alone, so
@@ -31,9 +40,9 @@ except Exception:  # noqa: BLE001 - any probe failure -> skip
     _METAL_JIT = False
 
 pytestmark = pytest.mark.skipif(
-    not (_MPS_AVAILABLE and _METAL_JIT),
+    not (_MPS_USABLE and _METAL_JIT),
     reason=f"Metal target unavailable (mps_built={_MPS_BUILT}, "
-    f"mps_available={_MPS_AVAILABLE}, metal_jit={_METAL_JIT})",
+    f"mps_available={_MPS_AVAILABLE}, mps_usable={_MPS_USABLE}, metal_jit={_METAL_JIT})",
 )
 
 
