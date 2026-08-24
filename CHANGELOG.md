@@ -4,6 +4,18 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — verdict: multi-block norm/activation accepted on sm90
+
+- **Verdict.** `silu_mul` gridded over M (1024-element chunks) and
+  `rmsnorm` split-K (per-chunk partial sums + apply, two launches) in the
+  portable floor — same source on CPU/CUDA/Metal, serial fragment-scalar
+  accumulators (the example `T.reduce_sum` idiom is not Metal-portable).
+  Slice prefill 512: silu_mul 46.1 -> 0.07 ms, tick 119.6 -> 73.7 ms
+  (4257 -> 6886 tok/s). Decode rmsnorm 0.445 -> 0.410 ms — now
+  launch-bound at 2 launches/call; next lever is fusion, not more blocks.
+  CUDA parity 25/25. Entry:
+  `docs/experience/wins/2026-08-24-multiblock-norm-act.md`.
+
 ## 2026-08-24 — phase exit: GEMV + chunk-kernel round closed on sm90
 
 - **Exit.** Both kernels default-on, final slice numbers on H20: smoke
