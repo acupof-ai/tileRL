@@ -174,9 +174,11 @@ def test_fp4_on_load_and_forward(tmp_path):
 
 def test_nvfp4_modelopt_load(tmp_path):
     """ModelOpt NVFP4/FP8-block checkpoint (Qwen3.6 format): MLP linears load
-    from weight_packed + f8 weight_scale + global scale, GDN linears from f8
-    weight + inverse scale_inv, both dequantized to bf16 equal to a pure-torch
-    reference computed in the test; model.visual.*/mtp.* tensors are ignored."""
+    from weight_packed + f8 weight_scale + global scale (the stored global is
+    its reciprocal, divided), GDN linears from f8 weight + per-128-block
+    scale_inv (multiplied, despite the name), both dequantized to bf16 equal
+    to a pure-torch reference computed in the test; model.visual.*/mtp.*
+    tensors are ignored."""
     # Dimensions must be multiples of the quant blocks: 16 (NVFP4) and 128
     # (FP8 block), so the tiny config is widened accordingly.
     cfg = replace(
@@ -198,15 +200,19 @@ def test_nvfp4_modelopt_load(tmp_path):
         return (1.0 - 2.0 * (nib >> 3).float()) * mag
 
     def ref_nvfp4(packed, scale, gscale):
+        # ModelOpt stores the global scale's reciprocal: divide by it
+        # (agent-infer quant_format.rs ScaleApply::Divide).
         n, k2 = packed.shape
         vals = torch.stack([e2m1_decode(packed & 0xF), e2m1_decode(packed >> 4)], dim=-1)
         vals = vals.reshape(n, k2 * 2)
         s = scale.float().repeat_interleave(16, dim=-1)
-        return (vals * s * gscale.float()).to(torch.bfloat16)
+        return (vals * s / gscale.float()).to(torch.bfloat16)
 
     def ref_fp8_block(w, si, block=128):
+        # The stored "scale_inv" is the per-block scale itself (multiplied,
+        # despite the name — agent-infer quant_format.rs ScaleApply::Multiply).
         s = si.float().repeat_interleave(block, -1).repeat_interleave(block, -2)
-        return (w.float() / s).to(torch.bfloat16)
+        return (w.float() * s).to(torch.bfloat16)
 
     tensors, expected = {}, {}
     for key, t in model.params.items():
@@ -215,7 +221,8 @@ def test_nvfp4_modelopt_load(tmp_path):
             n, k = t.shape
             packed = torch.randint(0, 256, (n, k // 2), generator=gen, dtype=torch.uint8)
             scale = (torch.rand(n, k // 16, generator=gen) * 0.1 + 0.05).to(torch.float8_e4m3fn)
-            gscale = torch.randn(1, generator=gen) * 0.1
+            # Stored global is the reciprocal: large and strictly positive.
+            gscale = torch.rand(1, generator=gen) * 1000 + 100
             stem = hf.removesuffix(".weight")
             tensors[stem + ".weight_packed"] = packed
             tensors[stem + ".weight_scale"] = scale
@@ -226,7 +233,7 @@ def test_nvfp4_modelopt_load(tmp_path):
         elif key.endswith((".in_proj_qkv", ".in_proj_z", ".out_proj")):
             n, k = t.shape
             w = (torch.randn(n, k, generator=gen) * 0.1).to(torch.float8_e4m3fn)
-            si = (torch.rand(n // 128, k // 128, generator=gen) + 0.5).to(torch.bfloat16)
+            si = (torch.rand(n // 128, k // 128, generator=gen) * 0.01 + 0.001).to(torch.bfloat16)
             tensors[hf] = w
             tensors[hf.removesuffix(".weight") + ".weight_scale_inv"] = si
             expected[key] = ref_fp8_block(w, si)

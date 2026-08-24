@@ -158,9 +158,10 @@ def qwen36_27b() -> ModelConfig:
     :func:`qwen38_27b` except GDN value heads: 48 (the checkpoint's A_log is
     [48]), not 32 — and the checkpoint is UNTIED (its config.json says
     tie_word_embeddings=false and ships lm_head.weight), unlike Qwen3.8.
-    MLP linears are NVFP4 (weight_packed + f8 weight_scale + global scale),
-    GDN in_proj_qkv/in_proj_z/out_proj are FP8 block-128 (weight + inverse
-    scale_inv); load_hf dequantizes both to bf16.
+    MLP linears are NVFP4 (weight_packed + f8 weight_scale + global scale,
+    the stored global being its reciprocal), GDN in_proj_qkv/in_proj_z/
+    out_proj are FP8 block-128 (weight + per-block scale_inv, multiplied);
+    load_hf dequantizes both to bf16.
     """
     return ModelConfig(
         name="qwen36-27b",

@@ -551,6 +551,8 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
             elif hf_name.endswith(".weight_packed"):
                 # ModelOpt NVFP4 (Qwen3.6 MLP linears): packed e2m1 nibbles +
                 # f8 block scale + global scale siblings, dequantized to bf16.
+                # The stored global scale is its reciprocal (divide, not
+                # multiply — agent-infer quant_format.rs ScaleApply::Divide).
                 stem = hf_name.removesuffix(".weight_packed")
                 key = _param_key_for(stem + ".weight")
                 if key is not None:
@@ -558,6 +560,7 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
                         tensor,
                         tensors[stem + ".weight_scale"],
                         tensors[stem + ".weight_global_scale"],
+                        global_divide=True,
                     )
             elif hf_name.endswith(".qweight"):
                 # AWQ-int4 (autoawq GEMM): packed int4 weights + per-group
@@ -572,8 +575,10 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
                 hf_name.endswith(".weight")
                 and hf_name.removesuffix(".weight") + ".weight_scale_inv" in tensors
             ):
-                # ModelOpt FP8 block (Qwen3.6 GDN linears): f8 weight + inverse
-                # per-128-block scales, dequantized to bf16.
+                # ModelOpt FP8 block (Qwen3.6 GDN linears): f8 weight +
+                # per-128-block scales, dequantized to bf16. The stored
+                # "scale_inv" is the scale itself (multiplied, despite the
+                # name — agent-infer quant_format.rs ScaleApply::Multiply).
                 key = _param_key_for(hf_name)
                 if key is not None:
                     tensor = dequant_fp8_block(

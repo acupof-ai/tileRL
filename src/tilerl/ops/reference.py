@@ -259,13 +259,19 @@ def dequant_nvfp4(
     weight_packed: torch.Tensor,
     weight_scale: torch.Tensor,
     weight_global_scale: torch.Tensor,
+    *,
+    global_divide: bool = False,
 ) -> torch.Tensor:
     """ModelOpt NVFP4 dequant (Qwen3.6 MLP linears). weight_packed uint8
     [N,K//2] (two OCP/MX e2m1 nibbles per byte, low nibble first),
     weight_scale f8_e4m3 [N,K//16] (block 1x16), weight_global_scale f32 [1].
-    Returns bf16 [N,K]: ``w = e2m1(packed) * f8(weight_scale).repeat(16) *
-    weight_global_scale``. The e2m1 grid is ``_E2M1_LUT`` ({0,.5,1,1.5,2,3,4,6}
-    + sign) — the OCP/MX grid, not the e2m1fn grid of :func:`dequant_fp4`."""
+    Returns bf16 [N,K]: ``w = e2m1(packed) * f8(weight_scale) * gs`` where
+    ``gs`` is ``1/weight_global_scale`` when ``global_divide`` (ModelOpt stores
+    the global scale's reciprocal — agent-infer quant_format.rs:225,
+    ScaleApply::Divide) and ``weight_global_scale`` directly otherwise
+    (official NVFP4's ``weight_scale_2`` is a plain multiplier). The e2m1
+    grid is ``_E2M1_LUT`` ({0,.5,1,1.5,2,3,4,6} + sign) — the OCP/MX grid,
+    not the e2m1fn grid of :func:`dequant_fp4`."""
     n, k2 = weight_packed.shape
     lo = (weight_packed & 0xF).long()
     hi = ((weight_packed >> 4) & 0xF).long()
@@ -275,17 +281,22 @@ def dequant_nvfp4(
         [1.0 - 2.0 * (lo >> 3).float(), 1.0 - 2.0 * (hi >> 3).float()], dim=-1
     ).reshape(n, k2 * 2)
     scale = weight_scale.float().repeat_interleave(16, dim=-1)
-    return (mag * sign * scale * weight_global_scale.float()).to(torch.bfloat16)
+    gs = weight_global_scale.float()
+    if global_divide:
+        gs = 1.0 / gs
+    return (mag * sign * scale * gs).to(torch.bfloat16)
 
 
 def dequant_fp8_block(
     weight: torch.Tensor, scale_inv: torch.Tensor, block: int = 128
 ) -> torch.Tensor:
     """ModelOpt FP8 block-quant dequant (Qwen3.6 GDN linears). weight f8_e4m3
-    [N,K], scale_inv bf16 [N//block,K//block] (INVERSE per-block scales).
-    Returns bf16 [N,K]: ``w = f8(weight) / scale_inv.repeat(block)``."""
+    [N,K], scale_inv bf16 [N//block,K//block]. Despite the name, the stored
+    tensor is the per-block SCALE (multiplied), not its inverse — agent-infer
+    quant_format.rs:165, ScaleApply::Multiply. Returns bf16 [N,K]:
+    ``w = f8(weight) * scale_inv.repeat(block)``."""
     si = scale_inv.float().repeat_interleave(block, dim=-1).repeat_interleave(block, dim=-2)
-    return (weight.float() / si).to(torch.bfloat16)
+    return (weight.float() * si).to(torch.bfloat16)
 
 
 def dequant_awq(
