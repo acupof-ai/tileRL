@@ -337,6 +337,33 @@ def test_paged_attention_vs_naive(backend):
     )
 
 
+# ---------------------------------------------------------------- write tokens
+
+
+def test_write_tokens_parity(backend):
+    """Paged KV scatter kernel vs the pool's torch-loop write (sm90-only
+    kernel; on other arches the backend op IS the loop, so the gate is the
+    kernel cell)."""
+    if backend.arch != "sm90":
+        pytest.skip("write_tokens kernel is sm90-only")
+    torch.manual_seed(24)
+    from tilerl.engine import BatchKv
+    from tilerl.kv_cache import PagedKvPool
+
+    b, t, hkv, d, nb = 2, 3, 2, 16, 6
+    k = torch.randn(b, t, hkv, d, device=backend.device).bfloat16()
+    v = torch.randn(b, t, hkv, d, device=backend.device).bfloat16()
+    block_table = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=backend.device)
+    seq_len = torch.tensor([30, 20], dtype=torch.int32, device=backend.device)
+    state_slot = torch.zeros(b, dtype=torch.long, device=backend.device)
+    ref = PagedKvPool(nb, hkv, d, num_layers=1, device=backend.device)
+    ref.write_tokens(k, v, BatchKv(block_table, seq_len, state_slot, ref, None), 0)
+    got = PagedKvPool(nb, hkv, d, num_layers=1, device=backend.device)
+    backend.write_tokens(k, v, BatchKv(block_table, seq_len, state_slot, got, None), 0)
+    _assert_close(got.k_pool, ref.k_pool, "write_tokens k")
+    _assert_close(got.v_pool, ref.v_pool, "write_tokens v")
+
+
 # ---------------------------------------------------------------- gated delta
 
 

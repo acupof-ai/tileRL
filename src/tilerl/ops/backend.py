@@ -143,6 +143,7 @@ _SM90_KERNELS = {
     "gemm_tn": kernels_mma.make_gemm_tn_mma,
     "linear_fp4": kernels_mma.make_linear_fp4_mma,
     "linear_fp4_gemv": kernels_mma.make_linear_fp4_gemv,
+    "write_tokens": kernels_mma.make_write_tokens,
     "gdn_decode_fused": kernels_mma.make_gdn_decode_fused,
     "gdn_chunk_fused": kernels_mma.make_gdn_chunk_fused,
 }
@@ -454,6 +455,31 @@ class Backend:
         if gate is not None:
             out = out * torch.sigmoid(self._f32(gate))
         return out
+
+    # ------------------------------------------------------------ write tokens
+
+    def write_tokens(self, k, v, kv, layer_idx):
+        """Scatter k/v [B,T,Hkv,D] into the paged pool at [seq_len-T, seq_len).
+
+        sm90: one capturable kernel — the host loop it replaces syncs GPU->CPU
+        per token (block table / seq_len are device tensors) and cannot sit
+        inside a captured decode tick. Other arches: the pool's torch-loop
+        fallback (the dev/parity path).
+        """
+        if "write_tokens" not in _resolve(self.precision, self.arch):
+            kv.kv_pool.write_tokens(k, v, kv, layer_idx)
+            return
+        pool = kv.kv_pool
+        self._kernel("write_tokens")(
+            self._dev(k, torch.bfloat16),
+            self._dev(v, torch.bfloat16),
+            pool.k_pool[layer_idx],
+            pool.v_pool[layer_idx],
+            self._i32(kv.block_table).contiguous(),
+            self._i32(kv.seq_len).contiguous(),
+            int(pool.k_pool.shape[-2]),
+            _THREADS,
+        )
 
     def attention_bwd(self, grad, q, k, v, scale):
         # ponytail: torch-eager backward, tilelang kernel when perf demands

@@ -35,10 +35,12 @@ math). Beyond the pinned op list, the architecture forces four extensions:
 
 BatchKv assumptions (Engine attaches the pools at submit): ``kv.kv_pool`` /
 ``kv.state_pool``; ``k_pool``/``v_pool`` are ``[num_layers, num_blocks,
-num_kv_heads, BLOCK_TOKENS, head_dim]``; ``write_tokens(k, v, kv, layer_idx)``
-writes ``k/v`` [B,T,Hkv,D] at ``[seq_len-T, seq_len)``; ``state_pool.states``
-is ``[num_slots, num_linear_layers, H, K, V]`` and ``state_pool.conv_windows``
-``[num_slots, num_linear_layers, K-1, qkv_dim]`` (None without GDN layers).
+num_kv_heads, BLOCK_TOKENS, head_dim]``; ``backend.write_tokens(k, v, kv,
+layer_idx)`` scatters ``k/v`` [B,T,Hkv,D] at ``[seq_len-T, seq_len)`` through
+the block table (one capturable kernel on sm90, the pool's torch loop on other
+arches); ``state_pool.states`` is ``[num_slots, num_linear_layers, H, K, V]``
+and ``state_pool.conv_windows`` ``[num_slots, num_linear_layers, K-1,
+qkv_dim]`` (None without GDN layers).
 
 Checkpoint loading: ``load_hf(cfg, source, ...)`` maps a Qwen3.5/3.6
 safetensors checkpoint into the param dict (``build_random`` draws the same
@@ -204,7 +206,7 @@ class Model:
             # Training: dense GQA attention (no paged pool indirection).
             out = backend.attention(q, k, v, 1.0 / math.sqrt(d), gate=gate)
         else:
-            kv.kv_pool.write_tokens(k, v, kv, layer_idx)
+            backend.write_tokens(k, v, kv, layer_idx)
             out = backend.paged_attention(
                 q,
                 kv.kv_pool.k_pool[layer_idx],

@@ -188,12 +188,15 @@ class PagedKvPool:
         )
 
     def write_tokens(self, k: torch.Tensor, v: torch.Tensor, kv, layer_idx: int) -> None:
-        """Model contract: write k/v [B,T,Hkv,D] at ``[seq_len-T, seq_len)``
-        per row, scattered through the batch's block table.
+        """Write k/v [B,T,Hkv,D] at ``[seq_len-T, seq_len)`` per row, scattered
+        through the batch's block table.
 
         The engine guarantees those positions land on blocks owned exclusively
         by the request (tail blocks on prefill, the fresh append block on
         decode), so shared prefix blocks are never written.
+        Torch-loop fallback for arches without the ``write_tokens`` scatter
+        kernel (the sm90 backend op replaces it — its per-token ``int()``
+        syncs make this loop uncapturable).
         # ponytail: per-token python loop, vectorized scatter day-2
         """
         b, t, _, _ = k.shape

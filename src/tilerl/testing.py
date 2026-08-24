@@ -2,10 +2,11 @@
 
 NOT framework code — the deterministic CPU backend for tests and selfchecks
 that want a backend without the TileLang JIT. Ops delegate to
-:mod:`tilerl.ops.reference` (the parity oracle) via ``__getattr__``; the four
-ops the reference lacks live here: gated dense attention, fp4 linear (drops
-the recording-only ``master`` kwarg), elementwise add, and gated paged
-attention (reference has no gated paged path).
+:mod:`tilerl.ops.reference` (the parity oracle) via ``__getattr__``; the ops
+the reference lacks live here: gated dense attention, fp4 linear (drops the
+recording-only ``master`` kwarg), elementwise add, gated paged attention
+(reference has no gated paged path), and the paged KV scatter (the pool's
+torch loop — the sm90 kernel's reference semantics).
 """
 
 from __future__ import annotations
@@ -66,6 +67,11 @@ class RefBackend:
 
     def add(self, a, b):
         return a + b
+
+    def write_tokens(self, k, v, kv, layer_idx):
+        # The pool's torch loop (the sm90 tilelang kernel has no reference
+        # counterpart — the pool loop IS the reference semantics).
+        kv.kv_pool.write_tokens(k, v, kv, layer_idx)
 
     def paged_attention(self, q, k_pool, v_pool, block_table, seq_lens, scale, gate=None):
         b, t, hq, d = q.shape
