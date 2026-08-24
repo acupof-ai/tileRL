@@ -4,6 +4,26 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: final 80/3800 bench — not met (35.5 decode / 992 prefill tok/s), gap is fp4 dequant efficiency, not physics
+
+- **Verdict.** Final measurement at HEAD c97f79c after the bf16 GEMV and
+  native FP8 levers, in a fully-idle H20 window (all 8 GPUs at 0%). Slice4
+  (3 GDN + 1 full-attn, the 27B's exact 3:1 mix), graph-captured:
+  2.662 ms/tick decode, 0.0654 ms/tok prefill-512. Extrapolated with lm_head
+  (0.890 ms, measured) and fixed cost counted once: decode 28.2 ms/tok
+  (35.5 tok/s) vs the 80 target (2.25x gap), prefill 1.008 ms/tok
+  (992 tok/s) vs 3800 (3.8x). The 2026-08-24 all-levers entry's 16.9 tok/s
+  decode was an extrapolation artifact (GDN-only per-layer x 64 overcounts
+  lm_head 32x); the corrected method on its own data gives 32.9 tok/s — the
+  kernel delta since is ~8% (fp8 GEMV decode). Roofline: decode 162-196
+  tok/s (20.4 GB at 3.3-4.0 TB/s), prefill 5898 tok/s (25.7 TFLOP at 296
+  TFLOPS) — both targets are 41-64% of roof, physics allows them. The gap
+  is code: the fp4 GEMV dequant stage caps decode at 24-32% of roof (the
+  bf16 GEMV on the same schedule hits 42-116%), and the fp4 MLP prefill
+  path runs at 21% of peak (62% of the tick). Eager per-op event spans
+  overcount the M=1 tick 3.6x — the graph wall is the metric. Entry:
+  `docs/experience/wins/2026-08-25-bf16-gemv-fp8-weights.md`.
+
 ## 2026-08-25 — accept-or-reject: native FP8 weights shipped — GDN prefill 1.48x, decode 1.05x, but the 3800 target needs the MLP lever too
 
 - **Verdict.** `load_hf` now keeps the checkpoint's FP8 GDN projections native
