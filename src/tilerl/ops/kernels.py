@@ -41,7 +41,8 @@ import tilelang
 import tilelang.language as T
 
 __all__ = [
-    "make_rmsnorm",
+    "make_rmsnorm_partial",
+    "make_rmsnorm_apply",
     "make_rmsnorm_rstd",
     "make_rmsnorm_bwd_x",
     "make_gemm_nt",
@@ -75,31 +76,61 @@ def _pass_configs(target: str) -> dict[str, object]:
 
 
 # ---------------------------------------------------------------- rmsnorm
+#
+# Split-K: the reduction dim is chunked across blocks (grid over chunks x
+# rows), so decode (M=1) is not one serial block. Phase 1 writes per-chunk
+# sums of squares; phase 2 reduces the few chunk sums and normalizes. The
+# tilelang example idiom (examples/norm/rms_norm.py, T.reduce_sum over a
+# whole-row fragment) is not portable: Metal does not cross-thread-reduce
+# fragments, so the per-chunk accumulator stays a serial fragment scalar.
 
 
-def make_rmsnorm(target: str):
-    """y[i, k] = x[i, k] * rsqrt(mean_k(x^2) + eps) * w[k]."""
+def make_rmsnorm_partial(target: str):
+    """Phase 1: P[row, chunk] = sum_k x[row, k]^2 over the chunk's block_N."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
-    def rmsnorm(X, W, eps: T.float32, threads):
+    def rmsnorm_partial(X, block_N, num_chunks, threads):
+        M, N = T.const("M, N")
+        X: T.Tensor((M, N), "float32")
+        P = T.empty((M, num_chunks), "float32")
+        with T.Kernel(T.ceildiv(N, block_N), M, threads=threads) as (bn, row):
+            var = T.alloc_fragment((1,), "float32")
+            var[0] = 0.0
+            for k in T.serial(block_N):
+                kk = bn * block_N + k
+                if kk < N:
+                    var[0] += X[row, kk] * X[row, kk]
+            P[row, bn] = var[0]
+        return P
+
+    return rmsnorm_partial
+
+
+def make_rmsnorm_apply(target: str):
+    """Phase 2: rstd from the chunk sums, then y = x * rstd * w. Each block
+    redundantly reduces the few chunk sums (cheap) and writes its own chunk,
+    so the normalize pass is parallel even at M=1."""
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    def rmsnorm_apply(X, W, P, eps: T.float32, block_N, num_chunks, threads):
         M, N = T.const("M, N")
         X: T.Tensor((M, N), "float32")
         W: T.Tensor((N,), "float32")
+        P: T.Tensor((M, num_chunks), "float32")
         Y = T.empty((M, N), "float32")
-        with T.Kernel(M, threads=threads) as row:
+        with T.Kernel(T.ceildiv(N, block_N), M, threads=threads) as (bn, row):
             var = T.alloc_fragment((1,), "float32")
             var[0] = 0.0
-            # Serial reduction: on CPU T.Parallel lowers to serial anyway, and
-            # GPU targets (metal) do not cross-thread-reduce fragment scalars.
-            for k in T.serial(N):
-                var[0] += X[row, k] * X[row, k]
-            var[0] = var[0] / N
-            rstd = T.rsqrt(var[0] + eps)
-            for k in T.Parallel(N):
-                Y[row, k] = X[row, k] * rstd * W[k]
+            for c in T.serial(num_chunks):
+                var[0] += P[row, c]
+            rstd = T.rsqrt(var[0] / N + eps)
+            for k in T.Parallel(block_N):
+                kk = bn * block_N + k
+                if kk < N:
+                    Y[row, kk] = X[row, kk] * rstd * W[kk]
         return Y
 
-    return rmsnorm
+    return rmsnorm_apply
 
 
 def make_rmsnorm_rstd(target: str):
@@ -316,18 +347,25 @@ def make_gemm_tn_naive(target: str):
 
 
 def make_silu_mul(target: str):
-    """y = gate * sigmoid(gate) * up, elementwise."""
+    """y = gate * sigmoid(gate) * up, elementwise.
+
+    Grid over M in block_M chunks: the single-block schedule (T.Kernel(1),
+    64 threads) left 8.9M elements on one block — 40% of the prefill tick on
+    sm90. The tail block guards its OOB lanes.
+    """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
-    def silu_mul(Gate, Up, threads):
+    def silu_mul(Gate, Up, block_M, threads):
         M = T.const("M")
         Gate: T.Tensor((M,), "float32")
         Up: T.Tensor((M,), "float32")
         Y = T.empty((M,), "float32")
-        with T.Kernel(1, threads=threads):
-            for i in T.Parallel(M):
-                s = T.sigmoid(Gate[i])
-                Y[i] = Gate[i] * s * Up[i]
+        with T.Kernel(T.ceildiv(M, block_M), threads=threads) as bx:
+            for i in T.Parallel(block_M):
+                idx = bx * block_M + i
+                if idx < M:
+                    s = T.sigmoid(Gate[idx])
+                    Y[idx] = Gate[idx] * s * Up[idx]
         return Y
 
     return silu_mul

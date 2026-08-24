@@ -99,7 +99,8 @@ def _resolve(precision: str, arch: str) -> dict[str, object]:
 
 
 _CPU_KERNELS = {  # bf16 on CPU: the f32 TileLang kernels (bf16 cast at the boundary)
-    "rmsnorm": kernels.make_rmsnorm,
+    "rmsnorm_partial": kernels.make_rmsnorm_partial,
+    "rmsnorm_apply": kernels.make_rmsnorm_apply,
     "rmsnorm_rstd": kernels.make_rmsnorm_rstd,
     "rmsnorm_bwd_x": kernels.make_rmsnorm_bwd_x,
     "gemm_nt": kernels.make_gemm_nt,
@@ -260,8 +261,14 @@ class Backend:
         w = self._f32(w)
         lead = x.shape[:-1]
         x2 = self._c(x.reshape(-1, x.shape[-1]))
-        k = self._kernel("rmsnorm")
-        y = k(x2, w, eps=float(eps), threads=_THREADS)
+        # Split-K: chunk the reduction dim across blocks (phase 1 partial
+        # sums, phase 2 reduce+normalize) so decode (M=1) is not one serial
+        # block. block_N=256 -> 20 blocks per row at the 5120 hidden size.
+        N = x2.shape[-1]
+        block_N = min(256, N)
+        num_chunks = (N + block_N - 1) // block_N
+        p = self._kernel("rmsnorm_partial")(x2, block_N, num_chunks, _THREADS)
+        y = self._kernel("rmsnorm_apply")(x2, w, p, float(eps), block_N, num_chunks, _THREADS)
         return y.reshape(*lead, w.shape[0])
 
     def rmsnorm_bwd(self, grad, x, w, eps):
@@ -560,8 +567,7 @@ class Backend:
         shape = gate.shape
         gate = self._f32(gate).reshape(-1)
         up = self._f32(up).reshape(-1)
-        k = self._kernel("silu_mul")
-        y = k(gate, up, threads=_THREADS)
+        y = self._kernel("silu_mul")(gate, up, 1024, _THREADS)
         return y.reshape(shape)
 
     def silu_mul_bwd(self, grad, gate, up):
