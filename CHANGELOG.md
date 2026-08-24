@@ -4,6 +4,19 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: fp4 GEMV vectorized dequant — slice4 decode 6.94 -> 1.89 ms/tick (3.67x), big projections 24-33% -> 30-54% roof
+
+- **Verdict.** The fp4 GEMV dequant (the gap named in the 80/3800 verdict
+  above) is vectorized: warp-shuffle LUT decode (1 op/elem vs 9 for the
+  bitcast) + partial-scale (`acc += s * sum(X*w)`, 1 FP op/elem vs the 2-mul
+  chain). The nodecode floor jumped 30% -> 57% roof; the shipped lutshfl
+  reaches 44% (78% of floor). Slice2 decode 1.922 -> 1.285 ms/tick (1.50x),
+  slice4 6.941 -> 1.893 (3.67x vs WGMMA). The big projections (17408x5120
+  class) are capped at ~30% roof by the backend dispatch overhead (~0.022
+  ms/call), not the kernel — the direct kernel is at 44%. lm_head (large N,
+  overhead amortized) hits 54%. Entry:
+  `docs/experience/wins/2026-08-25-fp4-gemv-vectorized-dequant.md`.
+
 ## 2026-08-25 — accept-or-reject: final 80/3800 bench — not met (35.5 decode / 992 prefill tok/s), gap is fp4 dequant efficiency, not physics
 
 - **Verdict.** Final measurement at HEAD c97f79c after the bf16 GEMV and
