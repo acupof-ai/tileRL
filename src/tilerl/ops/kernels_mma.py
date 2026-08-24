@@ -212,6 +212,18 @@ def make_linear_fp4_mma(target: str):
 # ---------------------------------------------------------------- linear fp4 (GEMV)
 
 
+def _e2m1fn_fp32(nib):
+    """e2m1fn nibble -> fp32 via IEEE bit-pattern synthesis. The grid is a
+    power-of-two grid ({±0.5,±0.75,±1,±1.5,±2,±3,±4,±6}), so each nibble's
+    fp32 bits are pure integer math — sign<<31 | (126+e)<<23 | m<<22 —
+    reinterpreted as float. No exp2, no LUT load (the lop3-style fast decode;
+    the LUT/exp2 path is 2x slower, see
+    docs/experience/wins/2026-08-24-fp4-gemv-bitcast-bf16.md)."""
+    ni32 = T.cast(nib, "int32")
+    bits = ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
+    return T.reinterpret(bits, "float32")
+
+
 def make_linear_fp4_gemv(target: str):
     """Fused e2m1fn dequant + GEMV (sm90), the decode (M=1) path of linear_fp4.
 
@@ -220,21 +232,32 @@ def make_linear_fp4_gemv(target: str):
 
     Decode is memory-bound: one warp group per 4 output rows streams WQ+Scale
     once (0.75 bytes/elem), dequantizing on the fly. Each thread owns a
-    K-slice of block_K = reduce_thread * micro_size_k elems (micro_size_k =
-    128-bit transaction / 16-bit bf16 = 8); partials reduce across the warp.
-    Roofline = (N*K*0.75 + 2K) bytes / HBM BW.
+    K-slice of block_K = reduce_thread * micro_size_k elems; partials reduce
+    across the warp. Roofline = (N*K*0.75 + 2K) bytes / HBM BW.
+
+    The dequant is structured to stay off the FMA critical path (the gap to
+    the bf16 GEMV's 42-116% roof — see
+    docs/experience/wins/2026-08-25-bf16-gemv-decode.md): the per-32 scale is
+    applied once per micro-tile to the partial sum (``acc += s * sum(X*w)``,
+    1 FP op/elem — not the 2-op X*w*s chain), and the e2m1fn grid is a
+    16-entry warp-shuffle LUT (1 shuffle/elem, built once per thread via the
+    integer bitcast). The kernel is issue-throughput-bound; the sweep
+    (scripts/_sweep_gemv.py) showed 2 accumulators and wider micro-tiles do
+    not help — the shuffle LUT at micro_size_k=8 is the floor.
 
     # SOTA copy: examples/dequantize_gemm/example_dequant_gemv_fp16xint4.py
     #   @ tilelang main (dequantize_gemv, split-K + tvm_thread_allreduce path)
-    # Adapted: bf16 IO (micro_size_k = 128/16 = 8, f32 accumulate) instead of
-    #   fp16; e2m1fn grid (matches pack_fp4 — no zero, so the backend
-    #   zero-pads Scale for K-tail tiles) with tileRL's per-16 float block
-    #   scale applied per micro-tile; uint8 storage; M fixed at 1 (decode) so
-    #   the grid has no M dim.
+    # Adapted: bf16 IO (f32 accumulate) instead of fp16; e2m1fn grid (matches
+    #   pack_fp4 — no zero, so the backend zero-pads Scale for K-tail tiles)
+    #   with tileRL's per-32 float block scale on the partial sum; uint8
+    #   storage; M fixed at 1 (decode) so the grid has no M dim.
     # Fast decode: the e2m1fn grid is a power-of-two grid, so each nibble's
     #   fp32 bit pattern is pure integer math — sign<<31 | (126+e)<<23 |
-    #   m<<22 — reinterpreted as float (the lop3-style fast decode; the LUT/
+    #   m<<22 — used to build the 16-entry warp LUT once per thread (the LUT/
     #   exp2 path is 2x slower, see docs/experience/wins/2026-08-24-*.md).
+    #   The SOTA's lop3 intrin only covers affine int4 grids, not e2m1fn.
+    # Constraint: reduce_thread must be <= 32 (the LUT is per-warp via
+    #   tvm_warp_shuffle); the backend hardcodes 32.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
@@ -253,7 +276,11 @@ def make_linear_fp4_gemv(target: str):
             X_local = T.alloc_local((micro_size_k,), "bfloat16")
             WQ_local = T.alloc_local((micro_size_k // 2,), "uint8")
             acc = T.alloc_local((1,), "float32")
+            partial = T.alloc_local((1,), "float32")
             reduced = T.alloc_local((1,), "float32")
+            # 16-entry warp LUT: lane kr holds LUT[kr&15], built once via the
+            # integer bitcast (no exp2). Each nibble is 1 shuffle.
+            lut = _e2m1fn_fp32(kr & 15)
             acc[0] = 0.0
             for ko in T.serial(T.ceildiv(K, block_K)):
                 base = ko * block_K + kr * micro_size_k
@@ -261,18 +288,14 @@ def make_linear_fp4_gemv(target: str):
                     X_local[v] = X[0, base + v]
                 for v in T.vectorized(micro_size_k // 2):
                     WQ_local[v] = WQ[n, base // 2 + v]
-                # one scale per micro-tile: 8 elems never cross a 32-block
-                s = Scale[n, base // 32]
+                partial[0] = 0.0
                 for ki in T.serial(micro_size_k):
                     byte = WQ_local[ki // 2]
                     nib = (byte >> ((ki % 2) * 4)) & 15
-                    # e2m1fn -> fp32 bits: sign<<31 | (126+e)<<23 | m<<22
-                    ni32 = T.cast(nib, "int32")
-                    bits = (
-                        ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
-                    )
-                    w = T.reinterpret(bits, "float32")
-                    acc[0] += T.cast(X_local[ki], "float32") * w * s
+                    w = T.tvm_warp_shuffle(0xFFFFFFFF, lut, T.cast(nib, "int32"), 32, 32)
+                    partial[0] += T.cast(X_local[ki], "float32") * w
+                # one scale per micro-tile: 8 elems never cross a 32-block
+                acc[0] += Scale[n, base // 32] * partial[0]
             with T.attr(
                 T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
                 "reduce_scope",
