@@ -161,7 +161,7 @@ def linear_bwd(
 
 def dequant_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequantize e2m1fn-packed weights. wq uint8 [N, K//2] (low nibble first),
-    scale f32 [N, K//16]. Returns w [N, K] f32.
+    scale f32 [N, K//32]. Returns w [N, K] f32.
 
     e2m1fn magnitudes: e=0 -> {0.5, 0.75}, e=1 -> {1, 1.5}, e=2 -> {2, 3},
     e=3 -> {4, 6}; sign bit is bit 3.
@@ -178,7 +178,7 @@ def dequant_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         m = (nib & 0x01).float()
         return sign * (0.5 * torch.pow(2.0, e)) * (1.0 + 0.5 * m)
 
-    s = scale.repeat_interleave(8, dim=1)  # [N, K//2]: one scale per byte (16 elems / 2)
+    s = scale.repeat_interleave(16, dim=1)  # [N, K//2]: one scale per byte (32 elems / 2)
     w = torch.stack([decode(lo) * s, decode(hi) * s], dim=-1).reshape(n, k2 * 2)
     return w
 
@@ -223,22 +223,24 @@ _E2M1_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.f
 
 
 def pack_fp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack a bf16/f32 weight [N,K] into e2m1fn nibbles + per-16-block scales.
+    """Pack a bf16/f32 weight [N,K] into e2m1fn nibbles + per-32-block scales.
 
-    Returns ``(wq [N,K//2] uint8 low-nibble-first, scale [N,K//16] f32)`` with
+    Returns ``(wq [N,K//2] uint8 low-nibble-first, scale [N,K//32] f32)`` with
     ``scale = block_max / 6`` and round-to-nearest against the e2m1fn LUT. The
     max representable magnitude is 6*scale, so the block max maps exactly.
+    Block 32 matches the fp8 WGMMA K-tile (sm90), so the fp8 prefill path can
+    apply one scale per MMA tile in f32 (no e4m3 weight requant).
     """
     assert w.dim() == 2, f"pack_fp4 expects a 2D weight, got {tuple(w.shape)}"
     n, k = w.shape
-    assert k % 16 == 0, f"fp4 block size 16 must divide K, got K={k}"
+    assert k % 32 == 0, f"fp4 block size 32 must divide K, got K={k}"
     wf = w.detach().float()
-    blocks = wf.reshape(n, k // 16, 16)
-    block_max = blocks.abs().amax(dim=-1, keepdim=True)  # [n, k//16, 1]
+    blocks = wf.reshape(n, k // 32, 32)
+    block_max = blocks.abs().amax(dim=-1, keepdim=True)  # [n, k//32, 1]
     scale = (block_max / 6.0).clamp_min(1e-12)
     x = (blocks / scale).clamp(-6.0, 6.0)
     lut = _E2M1FN_LUT.to(wf.device)
-    dist = (x.abs().unsqueeze(-1) - lut).abs()  # [n, k//16, 16, 8]
+    dist = (x.abs().unsqueeze(-1) - lut).abs()  # [n, k//32, 32, 8]
     idx = dist.argmin(dim=-1).to(torch.uint8)  # 0..7
     sign = (x < 0).to(torch.uint8)
     nibbles = (idx | (sign << 3)).reshape(n, k)
@@ -257,7 +259,7 @@ def unpack_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     mag = lut[nibbles & 0x7]
     sign = 1.0 - 2.0 * (nibbles >> 3).to(torch.float32)
     vals = mag * sign  # [n, k]
-    out = vals.reshape(n, k // 16, 16) * scale.unsqueeze(-1)
+    out = vals.reshape(n, k // 32, 32) * scale.unsqueeze(-1)
     return out.reshape(n, k).to(torch.bfloat16)
 
 

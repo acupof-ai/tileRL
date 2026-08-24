@@ -104,6 +104,20 @@ def _quantize_fp4(w_master: torch.Tensor):
     return pack_fp4(w_master)
 
 
+def _linear_fp4_fp8_ref(x, wq, scale):
+    """Torch reference for the sm90 fp8 prefill path: same per-32-block e4m3
+    activation quant + exact e2m1fn weight dequant, f32 matmul. e4m3's ~2%
+    multiplicative quant error does not average down over K, so the fp8 kernel
+    is gated against this identical-quant reference (kernel correctness), not
+    the f32 linear_fp4 reference (quant precision)."""
+    M, K = x.shape
+    xbf = x.to(torch.bfloat16).float().reshape(M, K // 32, 32)
+    blk_max = xbf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    ascale = (448.0 / blk_max).to(torch.float32)
+    xq = (xbf * ascale).to(torch.float8_e4m3fn).float() / ascale
+    return xq.reshape(M, K) @ reference.dequant_fp4(wq, scale).t()
+
+
 # ---------------------------------------------------------------- rmsnorm
 
 
@@ -168,9 +182,10 @@ def test_linear_fp4_parity(backend):
     w_master = torch.randn(24, 32)
     wq, scale = _quantize_fp4(w_master)
     x = torch.randn(6, 32)
-    _assert_close(
-        backend.linear_fp4(x, wq, scale), reference.linear_fp4(x, wq, scale), "linear_fp4"
-    )
+    # On CUDA M>1 dispatches to the fp8 path; gate it against the identical-
+    # quant fp8 reference (the f32 reference carries the ~2% e4m3 quant error).
+    ref = _linear_fp4_fp8_ref(x, wq, scale) if backend.target.startswith("cuda") else reference.linear_fp4(x, wq, scale)
+    _assert_close(backend.linear_fp4(x, wq, scale), ref, "linear_fp4")
 
 
 def test_linear_fp4_gemv_parity(backend):
@@ -186,6 +201,30 @@ def test_linear_fp4_gemv_parity(backend):
             reference.linear_fp4(x, wq, scale),
             f"linear_fp4_gemv N={N} K={K}",
         )
+
+
+def test_linear_fp4_fp8_parity(backend):
+    """Prefill (M>1) fp8 path: per-32-block e4m3 activation quant + fp4->e4m3
+    exact-grid dequant + fp8 WGMMA. On CPU the backend resolves to the bf16
+    floor (tautology); on CUDA the sm90 cell resolves to the fp8 kernel.
+
+    The reference does the SAME per-32-block e4m3 quant in torch (not the f32
+    linear_fp4 reference): e4m3's ~2% multiplicative quant error does not
+    average down over K, so the gate is kernel correctness vs an identical-quant
+    torch reference, not quant precision vs f32. The e2m1fn weight grid is an
+    exact subset of e4m3, so the weight side is error-free."""
+    torch.manual_seed(21)
+    for M, N, K in [(8, 64, 256), (4, 96, 128)]:
+        w_master = torch.randn(N, K) * 0.1
+        wq, scale = _quantize_fp4(w_master)
+        x = torch.randn(M, K) * 0.5
+        out = backend.linear_fp4(x, wq, scale)
+        if not backend.target.startswith("cuda"):
+            # CPU/metal: bf16 floor, compare to the f32 reference.
+            _assert_close(out, reference.linear_fp4(x, wq, scale), f"linear_fp4_fp8 M={M} N={N} K={K}")
+            continue
+        # CUDA: fp8 path, identical-quant reference.
+        _assert_close(out, _linear_fp4_fp8_ref(x, wq, scale), f"linear_fp4_fp8 M={M} N={N} K={K}")
 
 
 def test_linear_fp4_bwd():

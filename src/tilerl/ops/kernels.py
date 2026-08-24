@@ -459,8 +459,8 @@ def make_embedding(target: str):
 def make_linear_fp4(target: str):
     """Fused e2m1 dequant + matmul.
 
-    X [M, K] f32, WQ uint8 [N, K//2] (low nibble first), Scale [N, K//16] f32.
-    Y[m, n] = sum_k X[m, k] * e2m1(WQ[n, k//2] nibble k%2) * Scale[n, k//16].
+    X [M, K] f32, WQ uint8 [N, K//2] (low nibble first), Scale [N, K//32] f32.
+    Y[m, n] = sum_k X[m, k] * e2m1(WQ[n, k//2] nibble k%2) * Scale[n, k//32].
 
     # ponytail: dequant-in-kernel scalar decode, native fp4 tensor cores day-2
     """
@@ -470,7 +470,7 @@ def make_linear_fp4(target: str):
         M, N, K = T.const("M, N, K")
         X: T.Tensor((M, K), "float32")
         WQ: T.Tensor((N, K // 2), "uint8")
-        Scale: T.Tensor((N, K // 16), "float32")
+        Scale: T.Tensor((N, K // 32), "float32")
         Y = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             Cc = T.alloc_shared((block_M, block_N), "float32")
@@ -481,9 +481,9 @@ def make_linear_fp4(target: str):
             for i, j in T.Parallel(block_M, block_N):
                 acc = T.alloc_fragment((1,), "float32")
                 acc[0] = 0.0
-                for k0 in T.serial(K // 16):
-                    for kk in range(16):
-                        k = k0 * 16 + kk
+                for k0 in T.serial(K // 32):
+                    for kk in range(32):
+                        k = k0 * 32 + kk
                         byte = WQ[bx * block_N + j, k // 2]
                         nib = (byte >> ((k % 2) * 4)) & 15
                         sign = nib >> 3
