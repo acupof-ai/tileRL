@@ -15,6 +15,7 @@ comment density rather than a style rulebook.
 | The seam / tape / KV design being mirrored | `/Users/bytedance/code/agent-infer` (read-only reference) |
 | Kernel idioms and SOTA examples to copy | `/Users/bytedance/code/tilelang` (read-only reference) |
 | Kernel file layout, registry rules, SOTA iteration loop | [`docs/design-kernels.md`](docs/design-kernels.md) |
+| Engine layering and seams (frontend/schedule/storage) | [`docs/design-engine.md`](docs/design-engine.md) |
 
 `AGENTS.md` is canonical; `CLAUDE.md` is a symlink to it.
 
