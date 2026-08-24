@@ -140,6 +140,7 @@ _SM90_KERNELS = {
     "gemm_nn": kernels_mma.make_gemm_nn_mma,
     "gemm_tn": kernels_mma.make_gemm_tn_mma,
     "linear_fp4": kernels_mma.make_linear_fp4_mma,
+    "gdn_decode_fused": kernels_mma.make_gdn_decode_fused,
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)
@@ -199,6 +200,11 @@ class Backend:
         self.arch = _arch_for(target)
         self._kernels: dict[str, object] = {}
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
+        #: f32 cast of the embedding table, keyed by (data_ptr, _version).
+        #: The 27B table is 248320x5120 bf16 (~2.5GB); re-casting it every
+        #: tick costs ~6ms on H20. The optimizer's in-place copy_ bumps
+        #: _version, so a train step invalidates the entry.
+        self._embed_f32: dict[int, tuple[int, torch.Tensor]] = {}
 
     def _kernel(self, name: str):
         k = self._kernels.get(name)
@@ -423,8 +429,12 @@ class Backend:
 
     def linear_attn_chunk(self, q, k, v, g, beta, state, **kw):
         if kw.get("z") is not None or kw.get("conv1d_weight") is not None:
-            # Full-GDN layer core: torch-eager reference (the TileLang chunk
-            # kernel covers the plain 6-arg scan). Returns (out, state, window).
+            # Full-GDN layer core. sm90 decode (T=1) uses the fused kernel;
+            # prefill (T>1) and other arches use the torch-eager reference.
+            # ponytail: prefill uses the torch-eager reference (the
+            # chunkwise WY scan kernel is the perf upgrade path)
+            if "gdn_decode_fused" in _resolve(self.precision, self.arch) and q.shape[1] == 1:
+                return self._gdn_decode_fused(q, k, v, g, beta, state, **kw)
             return reference.gdn_forward(q, k, v, g, beta, state, **kw)
         ker = self._kernel("linear_attn_chunk")
         out, new_state = ker(
@@ -437,6 +447,38 @@ class Backend:
             threads=_THREADS,
         )
         return out, new_state, None
+
+    def _gdn_decode_fused(self, q, k, v, g, beta, state, **kw):
+        """Fused GDN decode (T=1): one launch for the whole layer core.
+
+        q/k/v/g/beta [B, 1, ...] are squeezed to [B, ...]. conv_window is
+        always a tensor (the model carries it; None means zero left-padding).
+        """
+        window = kw.get("conv_window")
+        if window is None:
+            window = torch.zeros(
+                q.shape[0],
+                kw["conv1d_weight"].shape[1] - 1,
+                q.shape[-1] + k.shape[-1] + v.shape[-1],
+                dtype=torch.float32,
+                device=self.device,
+            )
+        out, new_state, new_window = self._kernel("gdn_decode_fused")(
+            self._c(self._f32(q).squeeze(1)),
+            self._c(self._f32(k).squeeze(1)),
+            self._c(self._f32(v).squeeze(1)),
+            self._c(self._f32(kw["z"]).squeeze(1)),
+            self._c(self._f32(g).squeeze(1)),
+            self._c(self._f32(beta).squeeze(1)),
+            self._c(self._f32(kw["dt_bias"])),
+            self._c(self._f32(kw["a_log"])),
+            self._c(self._f32(kw["norm_weight"])),
+            self._c(self._f32(kw["conv1d_weight"])),
+            self._c(self._f32(window)),
+            self._c(self._f32(state)),
+            threads=state.shape[-1],
+        )
+        return out.unsqueeze(1), new_state, new_window
 
     def linear_attn_step(self, q, k, v, g, beta, state, **kw):
         out, new_state, new_window = self.linear_attn_chunk(
@@ -484,8 +526,23 @@ class Backend:
 
     # ------------------------------------------------------------ embedding
 
+    def _embed_table_f32(self, table):
+        """f32 cast of the embedding table, cached across ticks. The 27B
+        table is ~2.5GB bf16; casting it per tick costs ~6ms on H20. The
+        optimizer's in-place copy_ bumps _version, invalidating the entry.
+        # ponytail: the tied lm_head path (linear) re-casts the same table;
+        # route it through this cache when a tied model is served."""
+        key = table.data_ptr()
+        ver = table._version
+        hit = self._embed_f32.get(key)
+        if hit is not None and hit[0] == ver:
+            return hit[1]
+        t = self._f32(table)
+        self._embed_f32[key] = (ver, t)
+        return t
+
     def embedding(self, idx, table):
-        table = self._f32(table)
+        table = self._embed_table_f32(table)
         idx_flat = self._i32(idx).reshape(-1).contiguous()
         k = self._kernel("embedding")
         y = k(idx_flat, table, threads=_THREADS)

@@ -4,6 +4,17 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — default flip: sm90 GDN decode uses the fused megakernel
+
+- **Flip.** `linear_attn_chunk` on sm90 now dispatches decode (T=1) to
+  `make_gdn_decode_fused` (one launch per value head: conv1d + SiLU +
+  q/k-norm + decay-first delta recurrence + gated RMSNorm + z-gate, ported
+  from `examples/gdn/qwen36_gdr_decode_fused.py` @ tilelang branch
+  `feat/qwen36-gdn-megakernel`) instead of the torch-eager reference
+  (~384 tiny launches/layer/tick). Prefill (T>1) keeps the reference.
+  27B slice decode: 65.46 -> 47.16 ms/tok (28%) on H20, JIT-free.
+  Entry: `docs/experience/wins/2026-08-24-gdn-decode-fused.md`.
+
 ## 2026-08-24 — default flip: sm90 cell switches from naive FMA to MMA (WGMMA)
 
 - **Flip.** The sm90 cell now uses the MMA schedules in `kernels_mma.py`

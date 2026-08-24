@@ -400,6 +400,35 @@ def test_gdn_conv_window_makes_step_exact():
     _assert_close(chunk_state, s, "window step state")
 
 
+def test_gdn_decode_fused_parity(backend):
+    """Full-GDN decode (T=1): backend vs reference.gdn_forward. On CPU the
+    backend resolves to the reference (tautology); on CUDA the sm90 cell
+    resolves to the fused kernel — the real gate."""
+    torch.manual_seed(19)
+    b, nkh, nvh, kd, vd, ker = 2, 2, 4, 16, 16, 4
+    qkv = 2 * nkh * kd + nvh * vd
+    q = torch.randn(b, 1, nkh * kd) * 0.1
+    k = torch.randn(b, 1, nkh * kd) * 0.1
+    v = torch.randn(b, 1, nvh * vd) * 0.1
+    g = torch.randn(b, 1, nvh)
+    beta = torch.randn(b, 1, nvh)
+    z = torch.randn(b, 1, nvh * vd) * 0.1
+    state = torch.randn(b, nvh, kd, vd) * 0.01
+    window = torch.randn(b, ker - 1, qkv) * 0.1
+    kw = dict(
+        conv1d_weight=torch.randn(qkv, ker) * 0.1,
+        dt_bias=torch.randn(nvh),
+        a_log=torch.randn(nvh) * 0.1,
+        norm_weight=torch.ones(vd),
+        conv_window=window,
+    )
+    out, ns, nw = backend.linear_attn_chunk(q, k, v, g, beta, state, z=z, **kw)
+    rout, rns, rnw = reference.gdn_forward(q, k, v, g, beta, state, z=z, **kw)
+    _assert_close(out, rout, "gdn decode fused out")
+    _assert_close(ns, rns, "gdn decode fused state")
+    _assert_close(nw, rnw, "gdn decode fused window")
+
+
 def test_linear_attn_bwd():
     torch.manual_seed(16)
     b, c, h, d = 1, 3, 1, 4
