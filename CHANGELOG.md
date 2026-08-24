@@ -4,6 +4,24 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — verdict: sm90 CUDA target accepted; real 27B slice forwards + trains
+
+- **Verdict.** sm90 cell accepted: the 2-layer GDN slice of Qwen3.6-27B
+  NVFP4 forwards through the engine (8 tokens, 1180.19 ms/tok JIT-free) and
+  takes a training step (22.0 s/step, loss 11.2405 → 10.6960) on an H20,
+  with CPU/CUDA logits parity to 6 decimals. 60 passed on CUDA. Entry:
+  `docs/experience/wins/2026-08-24-sm90-real-slice.md`.
+- **Fixes.** ModelOpt NVFP4 global scale is stored reciprocal (divide, not
+  multiply); ModelOpt FP8-block `weight_scale_inv` is the scale itself
+  (multiply, not divide) — both confirmed against agent-infer
+  `quant_format.rs`, hermetic loader tests updated. `qwen36_27b()` is
+  untied (checkpoint ships `lm_head.weight`). Bench warmup uses the timed
+  `prompt_len` (JIT specializes per shape; a shorter warmup leaked NVCC
+  into the measurement). sm90 registered with the naive FMA gemms;
+  `Backend.device` pins `cuda:<current>`.
+- **Bench (H20, tiny).** prefill 0.507 ms/tok (1973.5 tok/s), decode
+  3.624 ms/tok (275.9 tok/s), prompt_len=128, gen=32, JIT-free.
+
 ## 2026-08-24 — format loaders: official NVFP4, per-tensor FP8, AWQ-int4; 23MB fixture retired
 
 - **Features.** `load_hf` gains three formats (all dequant to bf16 at load):
