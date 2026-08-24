@@ -4,6 +4,20 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — default flip: sm90 cell switches from naive FMA to MMA (WGMMA)
+
+- **Flip.** The sm90 cell now uses the MMA schedules in `kernels_mma.py`
+  (shared-memory tiled `T.gemm` + pipelined K-loop, ported from
+  `examples/gemm/example_gemm.py` and the Hopper dequant+gemm example) for
+  `gemm_{nt,nn,tn}` and `linear_fp4`. The naive FMA schedules stay in
+  `kernels.py` as the metal/other-arch fallback. 27B slice decode:
+  1180.19 -> 48.85 ms/tok (24x) on H20, JIT-free. Entry:
+  `docs/experience/wins/2026-08-24-sm90-mma-gemm.md`.
+- **Format.** `pack_fp4`/`unpack_fp4` switched from the OCP e2m1 LUT (with
+  zero) to e2m1fn (no zero) to match the kernel decode and the Hopper SOTA;
+  `dequant_nvfp4` keeps the OCP grid (checkpoint wire format is separate).
+  CUDA parity 21/21; CPU suite 64 passed, 1 skipped.
+
 ## 2026-08-24 — verdict: sm90 CUDA target accepted; real 27B slice forwards + trains
 
 - **Verdict.** sm90 cell accepted: the 2-layer GDN slice of Qwen3.6-27B
