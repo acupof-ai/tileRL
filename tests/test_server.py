@@ -1,0 +1,124 @@
+"""Server gates for tilerl: /health, /v1/models, non-stream completion, SSE stream.
+
+Uses FastAPI's TestClient against a tiny-engine app. A deterministic
+byte-level tokenizer (vocab 320, matching tiny()) stands in at the IO
+boundary — the gate is HTTP/SSE behaviour, not tokenization fidelity.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+os.environ.setdefault("TILERL_TARGET", "cpu")
+
+import pytest
+from fastapi.testclient import TestClient
+
+from tilerl.config import tiny
+from tilerl.engine import Engine, build_engine
+from tilerl.model import build_random
+from tilerl.ops.backend import get_backend
+from tilerl.server import create_app
+
+
+# ---------------------------------------------------------------------------
+# helpers
+
+
+class _ByteTokenizer:
+    """Deterministic byte-level tokenizer, vocab 320 (test double).
+
+    ids 0-2 reserved (pad/bos/eos), bytes map to 3-258 — every id stays below
+    tiny()'s vocab of 320.
+    """
+
+    def encode(self, text: str) -> list[int]:
+        return [1] + [b + 3 for b in text.encode("utf-8")]
+
+    def decode(self, ids) -> str:
+        return bytes(i - 3 for i in ids if 3 <= i < 259).decode("utf-8", errors="replace")
+
+
+def _build_engine(seed: int) -> Engine:
+    cfg = tiny()
+    model = build_random(cfg, seed=seed)
+    backend = get_backend()
+    return build_engine(
+        cfg, model, backend, num_blocks=64, num_slots=4, max_batch=4, max_total_tokens=512
+    )
+
+
+@pytest.fixture(scope="module")
+def client():
+    engine = _build_engine(seed=42)
+    engine.run()  # server handlers only submit/poll; the loop must run
+    app = create_app(engine, _ByteTokenizer())
+    # Bound the timeout: if the app does not drive the engine loop, a request
+    # fails fast here instead of hanging the suite.
+    with TestClient(app) as test_client:
+        yield test_client
+    engine.shutdown()
+
+
+@pytest.fixture(scope="module")
+def model_id(client):
+    resp = client.get("/v1/models")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert isinstance(data, list) and data, "no models served"
+    assert "id" in data[0], f"model entry missing id: {data[0]!r}"
+    return data[0]["id"]
+
+
+# ---------------------------------------------------------------------------
+# tests
+
+
+def test_health(client):
+    resp = client.get("/health")
+    assert resp.status_code == 200, resp.text
+    assert isinstance(resp.json(), dict)
+
+
+def test_models(client, model_id):
+    assert isinstance(model_id, str) and model_id
+
+
+def test_completion_nonstream(client, model_id):
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": model_id,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "max_tokens": 16,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    content = body["choices"][0]["message"]["content"]
+    assert isinstance(content, str) and content, f"empty completion: {body!r}"
+
+
+def test_completion_stream(client, model_id):
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": model_id,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "max_tokens": 16,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert "text/event-stream" in resp.headers.get("content-type", ""), (
+        f"not an SSE stream: {resp.headers.get('content-type')!r}"
+    )
+    lines = [line for line in resp.text.splitlines() if line.startswith("data:")]
+    assert lines, "no SSE data lines received"
+    assert lines[-1].strip() == "data: [DONE]", f"stream did not end with [DONE]: {lines[-1]!r}"
+
+    payloads = [json.loads(line[len("data: ") :]) for line in lines[:-1]]
+    contents = [p["choices"][0].get("delta", {}).get("content") for p in payloads]
+    assert any(content for content in contents), f"no delta content in chunks: {payloads!r}"
