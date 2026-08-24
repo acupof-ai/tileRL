@@ -21,6 +21,7 @@ __all__ = [
     "make_linear_fp4_mma",
     "make_linear_fp4_gemv",
     "make_gdn_decode_fused",
+    "make_gdn_chunk_fused",
 ]
 
 #: Reduction-tile size (K for gemm_nt/nn, M for gemm_tn, K for linear_fp4).
@@ -419,3 +420,181 @@ def make_gdn_decode_fused(target: str):
         return Out, NewState, NewWindow
 
     return gdn_decode_fused
+
+
+# ---------------------------------------------------------------- gated-delta chunk prefill (fused)
+
+
+def make_gdn_chunk_fused(target: str):
+    """Fused gated-delta chunk prefill core (sm90): the T>1 generalization of
+    make_gdn_decode_fused. One block per (value head, batch); thread tv owns
+    state column S[:, tv]; a serial scan over T tokens carries the state in
+    HBM (decay-first recurrence, matching reference.gdn_forward).
+
+    Replaces reference.gdn_forward's Python head loop on prefill (~150k tiny
+    kernel launches per 512-token prefill on the 27B slice: 48 value heads x
+    ~8 einsums x T). Same fused ops as decode: conv1d + SiLU + q/k L2-norm +
+    decay-first delta recurrence + gated RMSNorm + z-gate. The conv1d history
+    (carried Window ++ qkv) is read per tap from HBM like the decode kernel —
+    a per-thread sliding window cannot live in shared memory (each thread
+    owns a different channel; shared would race) and fragments forbid the
+    rq[i]=rq[i+1] shift (uniform-index constraint).
+
+    # Original: T-loop generalization of make_gdn_decode_fused (itself a SOTA
+    # copy of examples/gdn/qwen36_gdr_decode_fused.py @ tilelang branch
+    # feat/qwen36-gdn-megakernel). The branch's prefill path is chunkwise-WY
+    # (qwen36_prefill_wy.py + qwen36_prefill_scan_o.py); tileRL's decay-first
+    # recurrence is serial-within-block instead — within a chunk scan
+    # serially over T steps, across chunks carry the state (input State /
+    # output NewState are the carry). Not fla's chunk delta rule (that
+    # freezes chunk-start state — incompatible with decay-first).
+    # ponytail: state columns stream from HBM/L2 (2 passes per token, like
+    # decode); a shared-memory state tile (K*V*4 = 64KB) is the upgrade when
+    # the state traffic shows up on the profile.
+    """
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def gdn_chunk_fused(
+        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State, threads
+    ):
+        # TT (sequence length) is the const, not T: T is the tilelang.language
+        # module alias and rebinding it would break T.serial/T.Kernel below.
+        B, TT, QD, NVH, K, V, KER = T.const("B, TT, QD, NVH, K, V, KER")
+        VD = NVH * V
+        QKVD = 2 * QD + VD
+        scale = T.rsqrt(T.cast(K, "float32"))
+        Q: T.Tensor((B, TT, QD), "float32")
+        Key: T.Tensor((B, TT, QD), "float32")
+        Val: T.Tensor((B, TT, VD), "float32")
+        Z: T.Tensor((B, TT, VD), "float32")
+        GIn: T.Tensor((B, TT, NVH), "float32")
+        BIn: T.Tensor((B, TT, NVH), "float32")
+        DtBias: T.Tensor((NVH,), "float32")
+        ALog: T.Tensor((NVH,), "float32")
+        NormW: T.Tensor((V,), "float32")
+        ConvW: T.Tensor((QKVD, KER), "float32")
+        Window: T.Tensor((B, KER - 1, QKVD), "float32")
+        State: T.Tensor((B, NVH, K, V), "float32")
+        Out = T.empty((B, TT, VD), "float32")
+        NewState = T.empty((B, NVH, K, V), "float32")
+        NewWindow = T.empty((B, KER - 1, QKVD), "float32")
+        with T.Kernel(NVH, B, threads=threads) as (vh, bb):
+            tv = T.get_thread_binding(0)
+            kh = vh * (QD // K) // NVH
+            is_rep = (vh % (NVH // (QD // K))) == 0
+            qc = kh * K + tv  # Q tensor column == Window/ConvW q column
+            kc = QD + kh * K + tv  # Window/ConvW k column (K tensor column == qc)
+            vc = 2 * QD + vh * V + tv  # Window/ConvW v column (V tensor column = vh*V+tv)
+
+            q_s = T.alloc_shared((K,), "float32")
+            k_s = T.alloc_shared((K,), "float32")
+            v_s = T.alloc_shared((V,), "float32")
+            qn = T.alloc_shared((1,), "float32")
+            kn = T.alloc_shared((1,), "float32")
+            exp_g_s = T.alloc_shared((1,), "float32")
+            beta_s = T.alloc_shared((1,), "float32")
+            out_s = T.alloc_shared((V,), "float32")
+            rms_s = T.alloc_shared((1,), "float32")
+
+            # per-token fragments, hoisted out of the serial scan
+            cq = T.alloc_fragment((1,), "float32")
+            ck = T.alloc_fragment((1,), "float32")
+            cv = T.alloc_fragment((1,), "float32")
+            kv_mem = T.alloc_fragment((1,), "float32")
+            delta = T.alloc_fragment((1,), "float32")
+            acc_o = T.alloc_fragment((1,), "float32")
+            acc_q = T.alloc_fragment((1,), "float32")
+            acc_k = T.alloc_fragment((1,), "float32")
+            acc_sq = T.alloc_fragment((1,), "float32")
+
+            # seed the running state; token 0's decay pass reads it
+            for j in T.serial(K):
+                NewState[bb, vh, j, tv] = State[bb, vh, j, tv]
+
+            for t in T.serial(TT):
+                # conv1d (KER taps over Window ++ qkv) + SiLU on this head's
+                # q/k/v channels — same per-tap global reads as the decode
+                # kernel, generalized with the t offset.
+                cq[0] = 0.0
+                ck[0] = 0.0
+                cv[0] = 0.0
+                for tap in T.serial(KER):
+                    if t + tap < KER - 1:
+                        cq[0] += Window[bb, t + tap, qc] * ConvW[qc, tap]
+                        ck[0] += Window[bb, t + tap, kc] * ConvW[kc, tap]
+                        cv[0] += Window[bb, t + tap, vc] * ConvW[vc, tap]
+                    else:
+                        cq[0] += Q[bb, t + tap - (KER - 1), qc] * ConvW[qc, tap]
+                        ck[0] += Key[bb, t + tap - (KER - 1), qc] * ConvW[kc, tap]
+                        cv[0] += Val[bb, t + tap - (KER - 1), vh * V + tv] * ConvW[vc, tap]
+                q_s[tv] = cq[0] * T.sigmoid(cq[0])
+                k_s[tv] = ck[0] * T.sigmoid(ck[0])
+                v_s[tv] = cv[0] * T.sigmoid(cv[0])
+                T.tvm_storage_sync("shared")
+
+                # L2-norm + g/beta (thread 0 reduces, broadcasts via shared)
+                if tv == 0:
+                    T.clear(acc_q)
+                    T.clear(acc_k)
+                    for j in T.serial(K):
+                        acc_q[0] += q_s[j] * q_s[j]
+                        acc_k[0] += k_s[j] * k_s[j]
+                    qn[0] = T.rsqrt(acc_q[0] + 1e-12)
+                    kn[0] = T.rsqrt(acc_k[0] + 1e-12)
+                    x = GIn[bb, t, vh] + DtBias[vh]
+                    sp = T.if_then_else(x > 20.0, x, T.log(1.0 + T.exp(x)))
+                    exp_g_s[0] = T.exp(-T.exp(ALog[vh]) * sp)
+                    beta_s[0] = T.sigmoid(BIn[bb, t, vh])
+                T.tvm_storage_sync("shared")
+
+                q_s[tv] = q_s[tv] * qn[0] * scale
+                k_s[tv] = k_s[tv] * kn[0]
+                T.tvm_storage_sync("shared")
+
+                # recurrence: decay + kv_mem, then rank-1 update + out
+                T.clear(kv_mem)
+                for j in T.serial(K):
+                    sj = NewState[bb, vh, j, tv] * exp_g_s[0]
+                    NewState[bb, vh, j, tv] = sj
+                    kv_mem[0] += sj * k_s[j]
+                delta[0] = (v_s[tv] - kv_mem[0]) * beta_s[0]
+                T.clear(acc_o)
+                for j in T.serial(K):
+                    sj = NewState[bb, vh, j, tv] + delta[0] * k_s[j]
+                    NewState[bb, vh, j, tv] = sj
+                    acc_o[0] += sj * q_s[j]
+                out_s[tv] = acc_o[0]
+                T.tvm_storage_sync("shared")
+
+                # gated RMSNorm + z-gate
+                if tv == 0:
+                    T.clear(acc_sq)
+                    for j in T.serial(V):
+                        acc_sq[0] += out_s[j] * out_s[j]
+                    rms_s[0] = T.rsqrt(acc_sq[0] / T.cast(V, "float32") + 1e-6)
+                T.tvm_storage_sync("shared")
+                gate = Z[bb, t, vh * V + tv]
+                Out[bb, t, vh * V + tv] = (
+                    out_s[tv] * rms_s[0] * NormW[tv] * (gate * T.sigmoid(gate))
+                )
+
+            # new conv window: last KER-1 raw qkv tokens of (Window ++ qkv).
+            # q/k channels are shared across the GQA group — only the
+            # representative writes them.
+            for tap in T.serial(KER - 1):
+                if TT + tap < KER - 1:
+                    NewWindow[bb, tap, vc] = Window[bb, TT + tap, vc]
+                else:
+                    NewWindow[bb, tap, vc] = Val[bb, TT + tap - (KER - 1), vh * V + tv]
+            if is_rep:
+                for tap in T.serial(KER - 1):
+                    if TT + tap < KER - 1:
+                        NewWindow[bb, tap, qc] = Window[bb, TT + tap, qc]
+                        NewWindow[bb, tap, kc] = Window[bb, TT + tap, kc]
+                    else:
+                        NewWindow[bb, tap, qc] = Q[bb, TT + tap - (KER - 1), qc]
+                        NewWindow[bb, tap, kc] = Key[bb, TT + tap - (KER - 1), qc]
+
+        return Out, NewState, NewWindow
+
+    return gdn_chunk_fused

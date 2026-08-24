@@ -142,6 +142,7 @@ _SM90_KERNELS = {
     "linear_fp4": kernels_mma.make_linear_fp4_mma,
     "linear_fp4_gemv": kernels_mma.make_linear_fp4_gemv,
     "gdn_decode_fused": kernels_mma.make_gdn_decode_fused,
+    "gdn_chunk_fused": kernels_mma.make_gdn_chunk_fused,
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)
@@ -449,12 +450,14 @@ class Backend:
 
     def linear_attn_chunk(self, q, k, v, g, beta, state, **kw):
         if kw.get("z") is not None or kw.get("conv1d_weight") is not None:
-            # Full-GDN layer core. sm90 decode (T=1) uses the fused kernel;
-            # prefill (T>1) and other arches use the torch-eager reference.
-            # ponytail: prefill uses the torch-eager reference (the
-            # chunkwise WY scan kernel is the perf upgrade path)
-            if "gdn_decode_fused" in _resolve(self.precision, self.arch) and q.shape[1] == 1:
+            # Full-GDN layer core. sm90: T=1 uses the fused decode kernel,
+            # T>1 the fused chunk kernel; other arches use the torch-eager
+            # reference.
+            _kset = _resolve(self.precision, self.arch)
+            if q.shape[1] == 1 and "gdn_decode_fused" in _kset:
                 return self._gdn_decode_fused(q, k, v, g, beta, state, **kw)
+            if q.shape[1] > 1 and "gdn_chunk_fused" in _kset:
+                return self._gdn_chunk_fused(q, k, v, g, beta, state, **kw)
             return reference.gdn_forward(q, k, v, g, beta, state, **kw)
         ker = self._kernel("linear_attn_chunk")
         out, new_state = ker(
@@ -499,6 +502,40 @@ class Backend:
             threads=state.shape[-1],
         )
         return out.unsqueeze(1), new_state, new_window
+
+    def _gdn_chunk_fused(self, q, k, v, g, beta, state, **kw):
+        """Fused GDN chunk prefill (T>1): one launch for the whole layer core.
+
+        q/k/v/g/beta [B, T, ...] keep their T dim (the kernel scans it
+        serially per (value head, batch)). conv_window is always a tensor
+        (the model carries it; None means zero left-padding).
+        """
+        window = kw.get("conv_window")
+        has_window = window is not None
+        if not has_window:
+            window = torch.zeros(
+                q.shape[0],
+                kw["conv1d_weight"].shape[1] - 1,
+                q.shape[-1] + k.shape[-1] + v.shape[-1],
+                dtype=torch.float32,
+                device=self.device,
+            )
+        out, new_state, new_window = self._kernel("gdn_chunk_fused")(
+            self._c(self._f32(q)),
+            self._c(self._f32(k)),
+            self._c(self._f32(v)),
+            self._c(self._f32(kw["z"])),
+            self._c(self._f32(g)),
+            self._c(self._f32(beta)),
+            self._c(self._f32(kw["dt_bias"])),
+            self._c(self._f32(kw["a_log"])),
+            self._c(self._f32(kw["norm_weight"])),
+            self._c(self._f32(kw["conv1d_weight"])),
+            self._c(self._f32(window)),
+            self._c(self._f32(state)),
+            threads=state.shape[-1],
+        )
+        return out, new_state, (new_window if has_window else None)
 
     def linear_attn_step(self, q, k, v, g, beta, state, **kw):
         out, new_state, new_window = self.linear_attn_chunk(

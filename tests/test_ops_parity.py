@@ -444,6 +444,81 @@ def test_gdn_decode_fused_parity(backend):
     _assert_close(nw, rnw, "gdn decode fused window")
 
 
+def _gdn_inputs(b, t, nkh, nvh, kd, vd, ker, seed):
+    """Random full-GDN inputs (seeded): q/k/v/g/beta/z/state/window + kwargs."""
+    torch.manual_seed(seed)
+    qkv = 2 * nkh * kd + nvh * vd
+    q = torch.randn(b, t, nkh * kd) * 0.1
+    k = torch.randn(b, t, nkh * kd) * 0.1
+    v = torch.randn(b, t, nvh * vd) * 0.1
+    g = torch.randn(b, t, nvh)
+    beta = torch.randn(b, t, nvh)
+    z = torch.randn(b, t, nvh * vd) * 0.1
+    state = torch.randn(b, nvh, kd, vd) * 0.01
+    window = torch.randn(b, ker - 1, qkv) * 0.1
+    kw = dict(
+        conv1d_weight=torch.randn(qkv, ker) * 0.1,
+        dt_bias=torch.randn(nvh),
+        a_log=torch.randn(nvh) * 0.1,
+        norm_weight=torch.ones(vd),
+        conv_window=window,
+    )
+    return q, k, v, g, beta, z, state, kw
+
+
+def test_gdn_chunk_fused_parity(backend):
+    """Full-GDN prefill (T>1): backend vs reference.gdn_forward. On CPU the
+    backend resolves to the reference (tautology); on CUDA the sm90 cell
+    resolves to the fused chunk kernel — the real gate."""
+    q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 6, 2, 4, 16, 16, 4, 23)
+    out, ns, nw = backend.linear_attn_chunk(q, k, v, g, beta, state, z=z, **kw)
+    rout, rns, rnw = reference.gdn_forward(q, k, v, g, beta, state, z=z, **kw)
+    _assert_close(out, rout, "gdn chunk fused out")
+    _assert_close(ns, rns, "gdn chunk fused state")
+    _assert_close(nw, rnw, "gdn chunk fused window")
+
+
+def test_gdn_chunk_matches_decode(backend):
+    """The chunk kernel at T=1 equals the decode kernel (it is the T-loop
+    generalization of make_gdn_decode_fused — same fused ops, same order).
+    sm90-only: both kernels live in the sm90 cell."""
+    if backend.arch != "sm90":
+        pytest.skip("GDN fused kernels are sm90-only")
+    q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 1, 2, 4, 16, 16, 4, 29)
+    f32, c = backend._f32, backend._c
+    common = (
+        f32(kw["dt_bias"]),
+        f32(kw["a_log"]),
+        f32(kw["norm_weight"]),
+        f32(kw["conv1d_weight"]),
+        f32(kw["conv_window"]),
+        f32(state),
+    )
+    dout, dstate, dwin = backend._kernel("gdn_decode_fused")(
+        c(f32(q).squeeze(1)),
+        c(f32(k).squeeze(1)),
+        c(f32(v).squeeze(1)),
+        c(f32(z).squeeze(1)),
+        c(f32(g).squeeze(1)),
+        c(f32(beta).squeeze(1)),
+        *common,
+        threads=state.shape[-1],
+    )
+    cout, cstate, cwin = backend._kernel("gdn_chunk_fused")(
+        c(f32(q)),
+        c(f32(k)),
+        c(f32(v)),
+        c(f32(z)),
+        c(f32(g)),
+        c(f32(beta)),
+        *common,
+        threads=state.shape[-1],
+    )
+    _assert_close(cout.squeeze(1), dout, "chunk-vs-decode out")
+    _assert_close(cstate, dstate, "chunk-vs-decode state")
+    _assert_close(cwin, dwin, "chunk-vs-decode window")
+
+
 def test_linear_attn_bwd():
     torch.manual_seed(16)
     b, c, h, d = 1, 3, 1, 4

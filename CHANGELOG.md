@@ -4,6 +4,17 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — default flip: sm90 GDN prefill uses the fused chunk kernel
+
+- **Flip.** `linear_attn_chunk` on sm90 now dispatches prefill (T>1) to
+  `make_gdn_chunk_fused` (one launch per value head: conv1d + SiLU +
+  q/k-norm + decay-first delta recurrence + gated RMSNorm + z-gate, serial
+  scan over T) instead of the torch-eager reference (~150k tiny launches
+  per 512-token prefill). T=1 keeps the decode kernel. 27B slice prefill:
+  11.01 -> 0.2212 ms/tok (49.8x) on H20, JIT-free — the 3800 tok/s slice
+  target is met. CUDA parity 25/25. Entry:
+  `docs/experience/wins/2026-08-24-gdn-prefill-chunk.md`.
+
 ## 2026-08-24 — verdict: sm90 fp4 GEMV decode accepted (CUDA-verified)
 
 - **Verdict.** `make_linear_fp4_gemv` (733cbcd, SOTA copy of
