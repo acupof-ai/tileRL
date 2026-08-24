@@ -60,7 +60,9 @@ def main() -> None:
 
     # Warmup with the SAME shapes as the timed run: tilelang JITs per shape,
     # so a different prompt length would leak NVCC time into the measurement.
-    wid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=1, seed=0))
+    # gen=2 so both prefill [1,T] and decode [1,1] shapes are compiled —
+    # gen=1 finishes on the prefill tick and never warms up decode.
+    wid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
     for _ in range(256):
         engine.step()
         if wid in engine.poll():

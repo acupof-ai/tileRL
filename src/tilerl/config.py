@@ -156,9 +156,11 @@ def qwen36_27b() -> ModelConfig:
     """Qwen3.6-27B (ModelOpt NVFP4, checkpoint /host/tc27-nvfp4-slice2): 64
     layers = 16 full-attn (idx 3,7,...,63) + 48 GDN. Same shapes as
     :func:`qwen38_27b` except GDN value heads: 48 (the checkpoint's A_log is
-    [48]), not 32. MLP linears are NVFP4 (weight_packed + f8 weight_scale +
-    global scale), GDN in_proj_qkv/in_proj_z/out_proj are FP8 block-128
-    (weight + inverse scale_inv); load_hf dequantizes both to bf16.
+    [48]), not 32 — and the checkpoint is UNTIED (its config.json says
+    tie_word_embeddings=false and ships lm_head.weight), unlike Qwen3.8.
+    MLP linears are NVFP4 (weight_packed + f8 weight_scale + global scale),
+    GDN in_proj_qkv/in_proj_z/out_proj are FP8 block-128 (weight + inverse
+    scale_inv); load_hf dequantizes both to bf16.
     """
     return ModelConfig(
         name="qwen36-27b",
@@ -173,7 +175,7 @@ def qwen36_27b() -> ModelConfig:
         rope_theta=1e7,
         max_position_embeddings=262144,
         rms_eps=1e-6,
-        tie_word_embeddings=True,
+        tie_word_embeddings=False,
         fp4=True,
         full_attn_gated=True,
         rotary_dim=64,
