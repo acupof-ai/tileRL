@@ -72,8 +72,10 @@ def _time_calls(fn, iters: int) -> float:
 
 def bench_shapes(backend, model, cfg, bw_gbs: float) -> None:
     print(f"\n=== per-linear GEMV vs WGMMA-padded (BW {bw_gbs:.1f} GB/s) ===")
-    print(f"  {'shape (N,K)':<22} {'bytes MB':>9} {'roof ms':>8} {'GEMV ms':>9} "
-          f"{'WGMMA ms':>9} {'GEMV %roof':>10} {'speedup':>8}")
+    print(
+        f"  {'shape (N,K)':<22} {'bytes MB':>9} {'roof ms':>8} {'GEMV ms':>9} "
+        f"{'WGMMA ms':>9} {'GEMV %roof':>10} {'speedup':>8}"
+    )
     keys = sorted(k for k in fp4_param_keys(cfg) if k + ".wq" in model.params)
     for key in keys:
         wq = model.params[key + ".wq"]
@@ -105,8 +107,10 @@ def bench_shapes(backend, model, cfg, bw_gbs: float) -> None:
 
         bytes_ = N * K * 0.75 + 4 * K
         roof_ms = bytes_ / (bw_gbs * 1e9) * 1e3
-        print(f"  {f'{N},{K}':<22} {bytes_ / 2**20:>9.2f} {roof_ms:>8.4f} {gemv_ms:>9.4f} "
-              f"{mma_ms:>9.4f} {100 * roof_ms / gemv_ms:>9.1f}% {mma_ms / gemv_ms:>7.1f}x")
+        print(
+            f"  {f'{N},{K}':<22} {bytes_ / 2**20:>9.2f} {roof_ms:>8.4f} {gemv_ms:>9.4f} "
+            f"{mma_ms:>9.4f} {100 * roof_ms / gemv_ms:>9.1f}% {mma_ms / gemv_ms:>7.1f}x"
+        )
 
 
 def _decode_ticks(backend, model, cfg, ticks: int):
@@ -134,9 +138,11 @@ def bench_slice(backend, model, cfg, ticks: int) -> None:
         gpu = sum(totals.values()) / ticks
         wall = sum(walls) / ticks * 1e3
         lf = totals.get("linear_fp4", 0.0) / ticks
-        print(f"  {tag}: GPU {gpu:.3f} ms/tick, wall {wall:.3f} ms/tick "
-              f"({1000 / wall:.1f} tok/s), linear_fp4 {lf:.3f} ms "
-              f"({100 * lf / gpu:.0f}% of GPU)")
+        print(
+            f"  {tag}: GPU {gpu:.3f} ms/tick, wall {wall:.3f} ms/tick "
+            f"({1000 / wall:.1f} tok/s), linear_fp4 {lf:.3f} ms "
+            f"({100 * lf / gpu:.0f}% of GPU)"
+        )
 
 
 def main() -> None:

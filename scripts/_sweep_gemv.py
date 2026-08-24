@@ -101,4 +101,4 @@ for mode in ("full", "lut", "nodecode"):
     jit = time.perf_counter() - t0
     ms = time_call(lambda: ker(xp, wqp, sp, lut, 32, 4))
     roof = (N * K * 0.75 + 4 * K) / 3312e9 * 1e3
-    print(f"{mode:<9}: {ms:.4f} ms  ({100*roof/ms:.0f}% roof, jit {jit:.1f}s)", flush=True)
+    print(f"{mode:<9}: {ms:.4f} ms  ({100 * roof / ms:.0f}% roof, jit {jit:.1f}s)", flush=True)
