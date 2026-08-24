@@ -170,3 +170,104 @@ def test_fp4_on_load_and_forward(tmp_path):
             break
     assert rid in done, "fp4 model did not generate"
     engine.shutdown()
+
+
+def test_nvfp4_modelopt_load(tmp_path):
+    """ModelOpt NVFP4/FP8-block checkpoint (Qwen3.6 format): MLP linears load
+    from weight_packed + f8 weight_scale + global scale, GDN linears from f8
+    weight + inverse scale_inv, both dequantized to bf16 equal to a pure-torch
+    reference computed in the test; model.visual.*/mtp.* tensors are ignored."""
+    # Dimensions must be multiples of the quant blocks: 16 (NVFP4) and 128
+    # (FP8 block), so the tiny config is widened accordingly.
+    cfg = replace(
+        tiny(),
+        hidden_size=128,
+        intermediate_size=128,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+    )
+    model = build_random(cfg, seed=7)
+    gen = torch.Generator().manual_seed(11)
+
+    def e2m1_decode(nib):
+        # OCP/MX e2m1 in formula form (independent of reference._E2M1_LUT):
+        # e=0 -> {0, .5} subnormal; e>=1 -> 2^(e-1) * {1, 1.5}.
+        e = ((nib >> 1) & 3).float()
+        m = (nib & 1).float()
+        mag = torch.where(e == 0, 0.5 * m, torch.pow(2.0, e - 1.0) * (1.0 + 0.5 * m))
+        return (1.0 - 2.0 * (nib >> 3).float()) * mag
+
+    def ref_nvfp4(packed, scale, gscale):
+        n, k2 = packed.shape
+        vals = torch.stack([e2m1_decode(packed & 0xF), e2m1_decode(packed >> 4)], dim=-1)
+        vals = vals.reshape(n, k2 * 2)
+        s = scale.float().repeat_interleave(16, dim=-1)
+        return (vals * s * gscale.float()).to(torch.bfloat16)
+
+    def ref_fp8_block(w, si, block=128):
+        s = si.float().repeat_interleave(block, -1).repeat_interleave(block, -2)
+        return (w.float() / s).to(torch.bfloat16)
+
+    tensors, expected = {}, {}
+    for key, t in model.params.items():
+        hf = _hf_name(key)
+        if key.endswith((".gate_proj", ".up_proj", ".down_proj")):
+            n, k = t.shape
+            packed = torch.randint(0, 256, (n, k // 2), generator=gen, dtype=torch.uint8)
+            scale = (torch.rand(n, k // 16, generator=gen) * 0.1 + 0.05).to(torch.float8_e4m3fn)
+            gscale = torch.randn(1, generator=gen) * 0.1
+            stem = hf.removesuffix(".weight")
+            tensors[stem + ".weight_packed"] = packed
+            tensors[stem + ".weight_scale"] = scale
+            tensors[stem + ".weight_global_scale"] = gscale
+            # activation quant: present in the checkpoint, read-and-ignored
+            tensors[stem + ".input_global_scale"] = torch.randn(1, generator=gen) * 0.1
+            expected[key] = ref_nvfp4(packed, scale, gscale)
+        elif key.endswith((".in_proj_qkv", ".in_proj_z", ".out_proj")):
+            n, k = t.shape
+            w = (torch.randn(n, k, generator=gen) * 0.1).to(torch.float8_e4m3fn)
+            si = (torch.rand(n // 128, k // 128, generator=gen) + 0.5).to(torch.bfloat16)
+            tensors[hf] = w
+            tensors[hf.removesuffix(".weight") + ".weight_scale_inv"] = si
+            expected[key] = ref_fp8_block(w, si)
+        else:
+            tensors[hf] = t
+            expected[key] = t
+    # vision tower / MTP head: present in the checkpoint, ignored by load_hf
+    tensors["model.visual.vision_tower.patch_embed.weight"] = torch.randn(
+        4, 4, dtype=torch.bfloat16
+    )
+    tensors["mtp.layers.0.enorm.weight"] = torch.randn(128, dtype=torch.bfloat16)
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    layer_types = [
+        "full_attention" if i in cfg.full_attn_layer_set else "linear_attention"
+        for i in range(cfg.num_layers)
+    ]
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_6",
+                "text_config": {
+                    "hidden_size": cfg.hidden_size,
+                    "intermediate_size": cfg.intermediate_size,
+                    "num_hidden_layers": cfg.num_layers,
+                    "num_attention_heads": cfg.num_attention_heads,
+                    "num_key_value_heads": cfg.num_kv_heads,
+                    "head_dim": cfg.head_dim,
+                    "vocab_size": cfg.vocab_size,
+                    "rms_norm_eps": cfg.rms_eps,
+                    "tie_word_embeddings": cfg.tie_word_embeddings,
+                    "attn_output_gate": cfg.full_attn_gated,
+                    "layer_types": layer_types,
+                },
+                "quantization_config": {
+                    "quant_method": "nvfp4",
+                    "weight_block_size": [1, 16],
+                },
+            }
+        )
+    )
+    loaded = load_hf(cfg, str(tmp_path))
+    assert set(loaded.params) == set(param_specs(cfg))
+    for key, exp in expected.items():
+        assert torch.equal(loaded.params[key], exp), f"param {key} dequant mismatch"
