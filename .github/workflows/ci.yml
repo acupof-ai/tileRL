@@ -1,0 +1,42 @@
+# CI gate policy: only deterministic checks block the build.
+#   - ruff lint + format (rule set and day-1 ignores: pyproject.toml [tool.ruff])
+#   - hermetic CPU pytest: TILERL_TARGET=cpu, real-weight test is env-gated
+#     (TILERL_TEST_REAL=1, absent here) and GPU/Metal tests auto-skip, so plain
+#     `uv run pytest` on CI is exactly the deterministic set.
+# No bench/perf steps — non-deterministic, never gate on them.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        # tilelang 0.1.13 ships wheels for both — this is the cross-platform evidence.
+        runs-on: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install deps
+        run: uv sync --dev
+      - name: Ruff lint
+        run: uv run ruff check
+      - name: Ruff format
+        run: uv run ruff format --check
+      - name: CPU test suite
+        run: uv run pytest -v
+        env:
+          TILERL_TARGET: cpu

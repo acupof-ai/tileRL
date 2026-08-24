@@ -1,0 +1,61 @@
+[project]
+name = "tilerl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "cklxx", email = "q1293822641@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "huggingface-hub>=1.28.0",
+    "safetensors>=0.8.0",
+    "tilelang[fp4]>=0.1.13",
+    "tokenizers>=0.23.1",
+    "uvicorn>=0.52.4",
+]
+
+[project.scripts]
+tilerl = "tilerl.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.24,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.4",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "SIM"]
+# Day-1 baseline (2026-08-24): these categories are violated by in-flight code
+# in src/ and tests/, which another workflow owns. Re-enable them one by one as
+# the tree is cleaned — do not let the list grow.
+ignore = [
+    "E501",   # line-too-long
+    "E702",   # multiple-statements-on-one-line-semicolon
+    "E731",   # lambda-assignment
+    "E741",   # ambiguous-variable-name
+    "F401",   # unused-import
+    "F541",   # f-string-missing-placeholders
+    "I001",   # unsorted-imports
+    "SIM108", # if-else-block-instead-of-if-exp
+    "UP006",  # non-pep585-annotation
+    "UP035",  # deprecated-import
+    "UP037",  # quoted-annotation
+]
+
+[tool.ruff.lint.per-file-ignores]
+# F821 (undefined-name) stays enabled everywhere else. The two suppressions
+# cover known in-flight spots: selfcheck helpers in autograd.py and an `Any`
+# annotation under `from __future__ import annotations` in reference.py.
+"src/tilerl/autograd.py" = ["F821"]
+"src/tilerl/ops/reference.py" = ["F821"]

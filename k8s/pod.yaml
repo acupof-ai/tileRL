@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tilerl
+  labels:
+    app: tilerl
+spec:
+  restartPolicy: Never
+  containers:
+    - name: tilerl
+      # Loaded into the node by scripts/pod.sh load (kind/minikube); push to a
+      # registry and change this if deploying to a remote cluster.
+      image: tilerl:latest
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 8000
+      env:
+        - name: TILERL_TARGET
+          value: cuda
+        - name: HF_ENDPOINT
+          value: https://hf-mirror.com
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+      # The 27B checkpoint download + weight load takes minutes; allow up to
+      # ~6 minutes before the pod is marked unready.
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 60
+        periodSeconds: 10
+        failureThreshold: 30
