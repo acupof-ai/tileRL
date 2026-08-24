@@ -25,7 +25,7 @@ import profile_slice as ps  # noqa: E402
 
 from tilerl.config import qwen36_27b  # noqa: E402
 from tilerl.engine import SamplingParams, build_engine  # noqa: E402
-from tilerl.model import load_hf  # noqa: E402
+from tilerl.model import fp4_param_keys, load_hf  # noqa: E402
 from tilerl.ops import kernels_mma  # noqa: E402
 from tilerl.ops.backend import _REGISTRY, get_backend  # noqa: E402
 from tilerl.ops.reference import linear  # noqa: E402
@@ -70,23 +70,22 @@ def _time_calls(fn, iters: int) -> float:
     return s.elapsed_time(e) / iters
 
 
-def _bf16_linear_keys(model) -> list[str]:
-    """2D params without a .wq sibling (the bf16 projections), minus the
-    embedding table (a lookup, not a matmul)."""
-    return sorted(
-        k
-        for k, v in model.params.items()
-        if v.ndim == 2 and k != "embed_tokens" and k + ".wq" not in model.params
-    )
+def _bf16_linear_keys(model, cfg) -> list[str]:
+    """bf16 master weights of the fp4-packed projections — the bf16 GEMV's
+    target shapes. The packed .wq/.scale siblings are quant state, not
+    linears. (On the fp4 27B the engine reads the .wq via linear_fp4, so
+    these masters are the STE/ training copy — benching backend.linear on
+    them measures the bf16 GEMV kernel at the real projection shapes.)"""
+    return sorted(k for k in fp4_param_keys(cfg) if k in model.params)
 
 
-def bench_shapes(backend, model, bw_gbs: float) -> None:
+def bench_shapes(backend, model, cfg, bw_gbs: float) -> None:
     print(f"\n=== per-linear GEMV vs WGMMA-padded (BW {bw_gbs:.1f} GB/s) ===")
     print(
         f"  {'shape (N,K)':<22} {'bytes MB':>9} {'roof ms':>8} {'GEMV ms':>9} "
         f"{'WGMMA ms':>9} {'GEMV %roof':>10} {'speedup':>8}"
     )
-    for key in _bf16_linear_keys(model):
+    for key in _bf16_linear_keys(model, cfg):
         w = model.params[key]
         N, K = w.shape
         x = torch.randn(1, K, device=backend.device, dtype=torch.bfloat16)
@@ -175,7 +174,7 @@ def main() -> None:
     print(f"load: {time.perf_counter() - t0:.0f}s", flush=True)
 
     bw = _measure_bw_gbs()
-    bench_shapes(backend, model, bw)
+    bench_shapes(backend, model, cfg, bw)
     bench_slice(backend, model, cfg, args.ticks)
 
 
