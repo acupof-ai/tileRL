@@ -25,7 +25,7 @@ import pytest
 import torch
 
 from tilerl.ops import reference
-from tilerl.ops.backend import get_backend
+from tilerl.ops.backend import _resolve, get_backend
 from tilerl.ops.reference import pack_fp4
 
 RTOL = 1e-2
@@ -119,6 +119,31 @@ def _linear_fp4_fp8_ref(x, wq, scale):
     w_deq = reference.dequant_fp4(wq, scale)  # f32 [N,K]
     w_q8 = w_deq.to(torch.float8_e4m3fn).float()
     return xq @ w_q8.t()
+
+
+def _quantize_fp8(w_master):
+    """Per-128-block quant into the loader's native layout: w8 e4m3 [N,K],
+    wscale f32 [N//128, K//128] (128 N-rows share one scale — the ModelOpt
+    block format). N, K must be multiples of 128."""
+    n, k = w_master.shape
+    blocks = w_master.float().reshape(n // 128, 128, k // 128, 128)
+    block_max = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp_min(1e-12)
+    scale = (block_max / 448.0).reshape(n // 128, k // 128).contiguous()
+    w8 = (blocks / (block_max / 448.0)).reshape(n, k).to(torch.float8_e4m3fn).contiguous()
+    return w8, scale
+
+
+def _linear_fp8_ref(x, w8, wscale):
+    """Torch reference for the sm90 native-fp8 prefill path: same per-token
+    e4m3 activation quant, native e4m3 weight (no requant), per-128-block
+    weight scale, f32 matmul. The weight side is exact, so the gate is kernel
+    correctness vs an identical-quant reference (the activation e4m3 error
+    does not average down over K)."""
+    xbf = x.to(torch.bfloat16).float()
+    row_max = xbf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    ascale = 448.0 / row_max
+    xq = (xbf * ascale).to(torch.float8_e4m3fn).float() / ascale
+    return xq @ reference.dequant_fp8(w8, wscale).t()
 
 
 # ---------------------------------------------------------------- rmsnorm
@@ -257,6 +282,40 @@ def test_linear_fp4_bwd():
     w_deq = reference.dequant_fp4(wq, scale)
     _assert_close(gx, go @ w_deq, "linear_fp4_bwd gx")
     _assert_close(g_master, go.t() @ x, "linear_fp4_bwd g_master")
+
+
+# ---------------------------------------------------------------- linear fp8
+
+
+def test_linear_fp8_parity(backend):
+    """Native-fp8 linear: the sm90 cell's fp8 WGMMA kernel (M>1) is gated
+    against the identical-quant reference; every other path (CPU/metal floor,
+    sm90 M=1 decode via the bf16 master, or the kernel absent) is gated
+    against the f32 dequant reference."""
+    torch.manual_seed(26)
+    kset = _resolve(backend.precision, backend.arch)
+    for M, N, K in [(8, 128, 256), (4, 256, 128)]:
+        w_master = torch.randn(N, K) * 0.1
+        w8, wscale = _quantize_fp8(w_master)
+        master = reference.dequant_fp8(w8, wscale).to(torch.bfloat16)
+        x = torch.randn(M, K) * 0.5
+        out = backend.linear_fp8(x, w8, wscale, master=master)
+        kernel_path = backend.target.startswith("cuda") and M > 1 and "linear_fp8" in kset
+        ref = _linear_fp8_ref(x, w8, wscale) if kernel_path else reference.linear_fp8(x, w8, wscale)
+        _assert_close(out, ref, f"linear_fp8 M={M} N={N} K={K}")
+
+
+def test_linear_fp8_bwd():
+    torch.manual_seed(27)
+    w_master = torch.randn(128, 256) * 0.1
+    w8, wscale = _quantize_fp8(w_master)
+    x = torch.randn(6, 256)
+    go = torch.randn(6, 128)
+    gx, g_master = reference.linear_fp8_bwd(go, x, w8, wscale)
+    # STE: dequantized weight is constant w.r.t. master; g_master = grad @ x
+    w_deq = reference.dequant_fp8(w8, wscale)
+    _assert_close(gx, go @ w_deq, "linear_fp8_bwd gx")
+    _assert_close(g_master, go.t() @ x, "linear_fp8_bwd g_master")
 
 
 # ---------------------------------------------------------------- silu mul

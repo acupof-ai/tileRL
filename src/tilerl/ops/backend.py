@@ -461,6 +461,43 @@ class Backend:
         # ponytail: torch-eager backward, tilelang kernel when perf demands
         return reference.linear_fp4_bwd(grad, x, wq, scale)
 
+    # ------------------------------------------------------------ linear fp8
+
+    def linear_fp8(self, x, w8, wscale, master=None):
+        # ``master`` is recording-only (the STE grad lands on it); the kernel
+        # uses w8/wscale. sm90 M>1: per-token e4m3 activation quant + native
+        # fp8 WGMMA with per-128-block weight scale (no K-loop dequant). Every
+        # other path (CPU/metal, sm90 M=1 decode) goes through the bf16 master:
+        # the floor gemm on CPU/metal, the bf16 GEMV on decode.
+        _kset = _resolve(self.precision, self.arch)
+        lead = x.shape[:-1]
+        M = x.numel() // x.shape[-1]
+        if self.target.startswith("cuda") and M > 1 and "linear_fp8" in _kset:
+            BK = 128  # matches the checkpoint's 128-block scale
+            N, K = w8.shape
+            bM, bN = _round_up(min(128, M), 16), _round_up(min(128, N), 16)
+            Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, BK)
+            x2 = _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(M, K)), Mp, Kp)
+            xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
+            ascale = torch.empty((Mp,), dtype=torch.float32, device=self.device)
+            self._kernel("quant_fp8")(x2, xq, ascale, 256)
+            NS = -(-Np // 128)
+            y = self._kernel("linear_fp8")(
+                xq,
+                _pad2d(self._dev(w8, w8.dtype), Np, Kp),
+                _pad2d(self._f32(wscale), NS, Kp // BK),
+                ascale,
+                bM,
+                bN,
+                _THREADS,
+            )
+            return y[:M, :N].reshape(*lead, N)
+        return self.linear(x, master)
+
+    def linear_fp8_bwd(self, grad, x, w8, wscale, master=None):
+        # ponytail: torch-eager backward, tilelang kernel when perf demands
+        return reference.linear_fp8_bwd(grad, x, w8, wscale)
+
     # ------------------------------------------------------------ attention
 
     def paged_attention(self, q, k_cache, v_cache, block_table, seq_lens, scale, gate=None):

@@ -32,7 +32,9 @@ __all__ = [
     "pack_fp4",
     "unpack_fp4",
     "dequant_nvfp4",
-    "dequant_fp8_block",
+    "dequant_fp8",
+    "linear_fp8",
+    "linear_fp8_bwd",
     "dequant_awq",
     "dense_attention",
     "dense_attention_bwd",
@@ -298,16 +300,36 @@ def dequant_nvfp4(
     return (mag * sign * scale * gs).to(torch.bfloat16)
 
 
-def dequant_fp8_block(
-    weight: torch.Tensor, scale_inv: torch.Tensor, block: int = 128
-) -> torch.Tensor:
-    """ModelOpt FP8 block-quant dequant (Qwen3.6 GDN linears). weight f8_e4m3
-    [N,K], scale_inv bf16 [N//block,K//block]. Despite the name, the stored
-    tensor is the per-block SCALE (multiplied), not its inverse — agent-infer
-    quant_format.rs:165, ScaleApply::Multiply. Returns bf16 [N,K]:
-    ``w = f8(weight) * scale_inv.repeat(block)``."""
-    si = scale_inv.float().repeat_interleave(block, dim=-1).repeat_interleave(block, dim=-2)
-    return (weight.float() * si).to(torch.bfloat16)
+def dequant_fp8(w8: torch.Tensor, wscale: torch.Tensor, block: int = 128) -> torch.Tensor:
+    """FP8 block-quant dequant (Qwen3.6 GDN linears, kept native by load_hf).
+    w8 f8_e4m3 [N,K], wscale f32 [ceil(N/block), ceil(K/block)] (per-block
+    scale, multiplied — the checkpoint's "scale_inv" is the scale itself,
+    agent-infer quant_format.rs ScaleApply::Multiply). Returns f32 [N,K]:
+    ``w = f8(w8) * wscale.repeat(block)``. The same layout serves per-tensor
+    FP8 (the loader expands the scalar to a constant wscale) so one kernel
+    covers both."""
+    n, k = w8.shape
+    s = wscale.float().repeat_interleave(block, dim=-1)[:, :k]
+    s = s.repeat_interleave(block, dim=-2)[:n, :]
+    return w8.float() * s
+
+
+def linear_fp8(x: torch.Tensor, w8: torch.Tensor, wscale: torch.Tensor) -> torch.Tensor:
+    """y = x @ dequant_fp8(w8, wscale).T.  x [..., K]."""
+    return _f32(x) @ dequant_fp8(w8, wscale).t()
+
+
+def linear_fp8_bwd(
+    grad: torch.Tensor, x: torch.Tensor, w8: torch.Tensor, wscale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward of :func:`linear_fp8` (STE, same convention as linear_fp4_bwd:
+    gx w.r.t. x, g_master w.r.t. the bf16 master weight)."""
+    x = _f32(x)
+    grad = _f32(grad)
+    w = dequant_fp8(w8, wscale)
+    gx = grad @ w
+    g_master = grad.reshape(-1, grad.shape[-1]).t() @ x.reshape(-1, x.shape[-1])
+    return gx, g_master
 
 
 def dequant_awq(

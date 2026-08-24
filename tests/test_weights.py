@@ -176,9 +176,10 @@ def test_nvfp4_modelopt_load(tmp_path):
     """ModelOpt NVFP4/FP8-block checkpoint (Qwen3.6 format): MLP linears load
     from weight_packed + f8 weight_scale + global scale (the stored global is
     its reciprocal, divided), GDN linears from f8 weight + per-128-block
-    scale_inv (multiplied, despite the name), both dequantized to bf16 equal
-    to a pure-torch reference computed in the test; model.visual.*/mtp.*
-    tensors are ignored."""
+    scale_inv (multiplied, despite the name). The GDN linears are kept native:
+    the bf16 dequant is the recording-only master, .w8 the e4m3 weight and
+    .wscale the f32 per-128-block scale (equal to a pure-torch reference
+    computed in the test); model.visual.*/mtp.* tensors are ignored."""
     # Dimensions must be multiples of the quant blocks: 16 (NVFP4) and 128
     # (FP8 block), so the tiny config is widened accordingly.
     cfg = replace(
@@ -214,7 +215,7 @@ def test_nvfp4_modelopt_load(tmp_path):
         s = si.float().repeat_interleave(block, -1).repeat_interleave(block, -2)
         return (w.float() * s).to(torch.bfloat16)
 
-    tensors, expected = {}, {}
+    tensors, expected, expected_fp8 = {}, {}, {}
     for key, t in model.params.items():
         hf = _hf_name(key)
         if key.endswith((".gate_proj", ".up_proj", ".down_proj")):
@@ -237,6 +238,7 @@ def test_nvfp4_modelopt_load(tmp_path):
             tensors[hf] = w
             tensors[hf.removesuffix(".weight") + ".weight_scale_inv"] = si
             expected[key] = ref_fp8_block(w, si)
+            expected_fp8[key] = (w, si.float())
         else:
             tensors[hf] = t
             expected[key] = t
@@ -275,9 +277,15 @@ def test_nvfp4_modelopt_load(tmp_path):
         )
     )
     loaded = load_hf(cfg, str(tmp_path))
-    assert set(loaded.params) == set(param_specs(cfg))
+    assert set(param_specs(cfg)) <= set(loaded.params)
+    # the only extra params are the native-fp8 siblings
+    extras = {k for k in loaded.params if k not in param_specs(cfg)}
+    assert extras == {f"{k}.{s}" for k in expected_fp8 for s in ("w8", "wscale")}
     for key, exp in expected.items():
         assert torch.equal(loaded.params[key], exp), f"param {key} dequant mismatch"
+    for key, (w, ws) in expected_fp8.items():
+        assert torch.equal(loaded.params[key + ".w8"], w), f"param {key}.w8 mismatch"
+        assert torch.equal(loaded.params[key + ".wscale"], ws), f"param {key}.wscale mismatch"
 
 
 def test_nvfp4_official_load(tmp_path):
@@ -285,8 +293,11 @@ def test_nvfp4_official_load(tmp_path):
     linears load from u8 ``weight`` (e2m1 nibbles) + f8 ``weight_scale`` +
     scalar ``weight_scale_2``; GDN and full-attn linears from f8 ``weight``
     + scalar ``weight_scale`` (per-tensor FP8 — also the standalone-FP8
-    coverage); both dequantized to bf16 equal to a pure-torch reference
-    computed in the test. ``input_scale`` siblings are read-and-ignored."""
+    coverage). The FP8 linears are kept native: the bf16 dequant is the
+    recording-only master, .w8 the e4m3 weight and .wscale the per-128-block
+    scale (the scalar expanded to the same [ceil(N/128), ceil(K/128)]
+    layout), all equal to a pure-torch reference computed in the test.
+    ``input_scale`` siblings are read-and-ignored."""
     cfg = replace(
         tiny(),
         hidden_size=128,
@@ -311,7 +322,7 @@ def test_nvfp4_official_load(tmp_path):
         s = scale.float().repeat_interleave(16, dim=-1)
         return (vals * s * gscale.float()).to(torch.bfloat16)
 
-    tensors, expected = {}, {}
+    tensors, expected, expected_fp8 = {}, {}, {}
     for key, t in model.params.items():
         hf = _hf_name(key)
         stem = hf.removesuffix(".weight")
@@ -344,6 +355,11 @@ def test_nvfp4_official_load(tmp_path):
             tensors[stem + ".weight_scale"] = scale
             tensors[stem + ".input_scale"] = torch.randn(1, generator=gen) * 0.1
             expected[key] = (w.float() * scale.float()).to(torch.bfloat16)
+            ws = scale.float().reshape(1)
+            expected_fp8[key] = (
+                w,
+                ws.expand(((n + 127) // 128), ((k + 127) // 128)).contiguous(),
+            )
         else:
             tensors[hf] = t
             expected[key] = t
@@ -374,9 +390,14 @@ def test_nvfp4_official_load(tmp_path):
         )
     )
     loaded = load_hf(cfg, str(tmp_path))
-    assert set(loaded.params) == set(param_specs(cfg))
+    assert set(param_specs(cfg)) <= set(loaded.params)
+    extras = {k for k in loaded.params if k not in param_specs(cfg)}
+    assert extras == {f"{k}.{s}" for k in expected_fp8 for s in ("w8", "wscale")}
     for key, exp in expected.items():
         assert torch.equal(loaded.params[key], exp), f"param {key} dequant mismatch"
+    for key, (w, ws) in expected_fp8.items():
+        assert torch.equal(loaded.params[key + ".w8"], w), f"param {key}.w8 mismatch"
+        assert torch.equal(loaded.params[key + ".wscale"], ws), f"param {key}.wscale mismatch"
 
 
 def test_awq_load(tmp_path):

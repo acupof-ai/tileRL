@@ -73,7 +73,7 @@ from . import autograd
 from .config import ModelConfig, tiny
 from .ops.reference import (
     dequant_awq,
-    dequant_fp8_block,
+    dequant_fp8,
     dequant_nvfp4,
     pack_fp4,
     unpack_fp4,
@@ -155,19 +155,26 @@ def fp4_param_keys(cfg: ModelConfig) -> set[str]:
 class Model:
     """Qwen3.5/3.6 hybrid model. ``params`` maps :func:`param_specs` keys to
     bf16 tensors; fp4 linears also carry ``<key>.wq`` (uint8) and
-    ``<key>.scale`` (f32) alongside the bf16 master."""
+    ``<key>.scale`` (f32) alongside the bf16 master, and native-fp8 linears
+    carry ``<key>.w8`` (e4m3) and ``<key>.wscale`` (f32 per-128-block)."""
 
     def __init__(self, cfg: ModelConfig, params: dict[str, torch.Tensor]):
         self.cfg = cfg
         self.params = params
 
-    # -- linear dispatch (fp4-packed when present, plain bf16 otherwise) ----
+    # -- linear dispatch (fp4-packed / native-fp8 when present, plain bf16 otherwise) ----
     def _linear(self, backend: "Backend", x: torch.Tensor, key: str) -> torch.Tensor:
         wq = self.params.get(key + ".wq")
         if wq is not None:
             # ``master`` is recording-only: the STE grad lands on the bf16
             # master weight (see autograd._linear_fp4).
             return backend.linear_fp4(x, wq, self.params[key + ".scale"], master=self.params[key])
+        w8 = self.params.get(key + ".w8")
+        if w8 is not None:
+            # Native fp8: the sm90 prefill path computes with w8 directly;
+            # the bf16 master is recording-only (STE grad, see
+            # autograd._linear_fp8) and the decode (M=1) fallback.
+            return backend.linear_fp8(x, w8, self.params[key + ".wscale"], master=self.params[key])
         return backend.linear(x, self.params[key])
 
     # -- full attention layer ----------------------------------------------
@@ -471,12 +478,14 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
     HF safetensors and MLX 4-bit affine checkpoints are both accepted (the
     MLX path is detected from the ``language_model.`` tensor-name prefix), as
     are ModelOpt NVFP4/FP8-block checkpoints (detected from the
-    ``weight_packed`` / ``weight_scale_inv`` sibling tensors, dequantized to
-    bf16 before param mapping), official-NVFP4 checkpoints (``weight_scale_2``
-    sibling: e2m1 nibbles * f8 block scale * global scale), per-tensor FP8
-    (f8 ``weight`` + scalar ``weight_scale``), and AWQ-int4 (``qweight`` /
-    ``scales`` / ``qzeros`` siblings, group size from
-    ``quantization_config.group_size``)."""
+    ``weight_packed`` / ``weight_scale_inv`` sibling tensors), official-NVFP4
+    checkpoints (``weight_scale_2`` sibling: e2m1 nibbles * f8 block scale *
+    global scale), per-tensor FP8 (f8 ``weight`` + scalar ``weight_scale``),
+    and AWQ-int4 (``qweight`` / ``scales`` / ``qzeros`` siblings, group size
+    from ``quantization_config.group_size``). FP8 linears are kept native:
+    the e4m3 weight lands in ``<key>.w8`` and the per-128-block scale in
+    ``<key>.wscale`` (a per-tensor scalar is expanded to the same layout),
+    with the bf16 dequant kept as the recording-only master."""
     if num_layers is not None and not 0 < num_layers <= cfg.num_layers:
         raise ValueError(f"num_layers={num_layers} out of range for {cfg.num_layers} layers")
     src = Path(source)
@@ -535,6 +544,10 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
     group_size = hf_cfg.get("quantization", {}).get("group_size", 64)
     awq_group = (hf_cfg.get("quantization_config") or {}).get("group_size", 128)
     params: dict[str, torch.Tensor] = {}
+    #: Native-fp8 linears (key -> (e4m3 weight, f32 per-128-block scale)),
+    #: kept native instead of dequantized: the bf16 master below is recording-
+    #: only, the sm90 prefill path computes with the e4m3 weight directly.
+    fp8_native: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     for shard in _shard_files(ckpt_dir, source_desc):
         tensors = load_file(str(shard))
         mlx = next((n for n in tensors if n.startswith("language_model.")), None) is not None
@@ -578,14 +591,15 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
                 and hf_name.removesuffix(".weight") + ".weight_scale_inv" in tensors
             ):
                 # ModelOpt FP8 block (Qwen3.6 GDN linears): f8 weight +
-                # per-128-block scales, dequantized to bf16. The stored
-                # "scale_inv" is the scale itself (multiplied, despite the
-                # name — agent-infer quant_format.rs ScaleApply::Multiply).
+                # per-128-block scales, kept native (the bf16 dequant is the
+                # recording-only master). The stored "scale_inv" is the scale
+                # itself (multiplied, despite the name — agent-infer
+                # quant_format.rs ScaleApply::Multiply).
                 key = _param_key_for(hf_name)
                 if key is not None:
-                    tensor = dequant_fp8_block(
-                        tensor, tensors[hf_name.removesuffix(".weight") + ".weight_scale_inv"]
-                    )
+                    wscale = tensors[hf_name.removesuffix(".weight") + ".weight_scale_inv"].float()
+                    fp8_native[key] = (tensor, wscale)
+                    tensor = dequant_fp8(tensor, wscale).to(torch.bfloat16)
             elif (
                 hf_name.endswith(".weight")
                 and hf_name.removesuffix(".weight") + ".weight_scale_2" in tensors
@@ -604,13 +618,18 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
                 and hf_name.removesuffix(".weight") + ".weight_scale" in tensors
             ):
                 # Per-tensor FP8 (official NVFP4 GDN/attn linears, standalone
-                # FP8): f8 weight * scalar scale, dequantized to bf16.
+                # FP8): f8 weight * scalar scale, kept native like the block
+                # format above — the scalar is expanded to the same
+                # [ceil(N/128), ceil(K/128)] wscale layout so one kernel
+                # serves both.
                 stem = hf_name.removesuffix(".weight")
                 key = _param_key_for(hf_name)
                 if key is not None:
-                    tensor = (tensor.float() * tensors[stem + ".weight_scale"].float()).to(
-                        torch.bfloat16
-                    )
+                    ws = tensors[stem + ".weight_scale"].float().reshape(1)
+                    n, k = tensor.shape
+                    wscale = ws.expand(((n + 127) // 128), ((k + 127) // 128)).contiguous()
+                    fp8_native[key] = (tensor, wscale)
+                    tensor = dequant_fp8(tensor, wscale).to(torch.bfloat16)
             elif hf_name.endswith(
                 (
                     ".weight_scale",
@@ -642,9 +661,18 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
                 tensor = tensor.reshape(tensor.shape[0], -1)  # [C,1,K]/[C,K,1] -> [C,K]
             params[key] = tensor
 
+    # Native FP8 weights: keep the e4m3 weight + per-128-block scale alongside
+    # the bf16 master (the sm90 prefill path computes with .w8 directly; the
+    # master is recording-only, like the fp4 masters).
+    for key, (w8, wscale) in fp8_native.items():
+        params[f"{key}.w8"] = w8.contiguous()
+        params[f"{key}.wscale"] = wscale.contiguous()
+
     # Embedding/lm_head tying.
     if cfg.tie_word_embeddings:
         params.pop("lm_head", None)  # model reuses embed_tokens
+        params.pop("lm_head.w8", None)
+        params.pop("lm_head.wscale", None)
     elif "lm_head" not in params:
         raise RuntimeError(f"`{source_desc}`: untied model is missing lm_head.weight")
 
@@ -663,8 +691,13 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
             )
 
     # Quantize the fp4 linears on load (bf16 master kept for the STE backward).
+    # Native-fp8 linears are skipped: their checkpoint format is already the
+    # sm90 prefill compute format (re-packing to fp4 would lose the e4m3
+    # precision and force the K-loop dequant path).
     if cfg.fp4:
         for key in sorted(fp4_param_keys(cfg)):
+            if f"{key}.w8" in params:
+                continue
             master = params[key]
             if master.dtype != torch.bfloat16:
                 master = master.to(torch.bfloat16)
