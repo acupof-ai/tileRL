@@ -4,6 +4,16 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — verdict: sm90 fp4 GEMV decode accepted (CUDA-verified)
+
+- **Verdict.** `make_linear_fp4_gemv` (733cbcd, SOTA copy of
+  `example_dequant_gemv_fp16xint4.py`) accepted as the sm90 M=1 decode
+  path: CUDA parity 23/23, GEMV beats WGMMA-padded on every fp4 linear
+  (1.3–5.9x), slice decode 10.577 -> 5.452 ms/tick (94.5 -> 183.4 tok/s)
+  on H20. Roofline 12–14% on big shapes — headroom in decode ALU and
+  launch count, not weight streaming. Entry:
+  `docs/experience/wins/2026-08-24-fp4-gemv-decode.md`.
+
 ## 2026-08-24 — default flip: sm90 GDN decode uses the fused megakernel
 
 - **Flip.** `linear_attn_chunk` on sm90 now dispatches decode (T=1) to
