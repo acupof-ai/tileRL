@@ -427,11 +427,12 @@ class Backend:
             return y[:1, :N].reshape(*lead, N)
         if self.target.startswith("cuda") and M > 1 and "linear_fp4_fp8" in _kset:
             # Prefill fp8 path: per-token activation quant (e4m3) +
-            # fp4->e4m3 requant dequant + fp8 WGMMA. block_K=64 (fp8 WGMMA
-            # K=32, 2 steps; amortizes the e4m3 dequant cast). e2m1fn has no
-            # zero, so padded WQ bytes are killed by the zero-padded WScale.
+            # fp4->e4m3 vectorized dequant + fp8 WGMMA. block_K=64 (fp8 WGMMA
+            # K=32, 2 steps). e2m1fn has no zero, so padded WQ bytes are
+            # killed by the zero-padded WScale. bN % 32: the dequant macro
+            # divides the tile as block_N*64/threads/16 (threads=128).
             BK = 64
-            bM, bN = _round_up(min(128, M), 16), _round_up(min(128, N), 16)
+            bM, bN = _round_up(min(128, M), 16), _round_up(min(128, N), 32)
             Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, BK)
             x2 = _pad2d(x2, Mp, Kp)
             xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
@@ -449,10 +450,11 @@ class Backend:
             return y[:M, :N].reshape(*lead, N)
         bM, bN = min(64, M), min(64, N)
         if self.target.startswith("cuda"):
-            # WGMMA tiles %16, reduction K %32. e2m1fn has no zero, so padded
-            # WQ bytes (0x00 -> 0.5) are killed by the zero-padded Scale.
+            # WGMMA tiles %16, reduction K %64 (the fp4 dequant K-tile).
+            # e2m1fn has no zero, so padded WQ bytes (0x00 -> 0.5) are killed
+            # by the zero-padded Scale.
             bM, bN = _round_up(bM, 16), _round_up(bN, 16)
-            Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, 32)
+            Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, 64)
             x2 = _pad2d(x2, Mp, Kp)
             wq = _pad2d(wq, Np, Kp // 2)
             scale = _pad2d(scale, Np, Kp // 32)

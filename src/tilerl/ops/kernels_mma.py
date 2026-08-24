@@ -149,18 +149,77 @@ def make_gemm_tn_mma(target: str):
 # ---------------------------------------------------------------- linear fp4 (MMA)
 
 
+def _dequant_fp4_macro(out_dtype, local_size):
+    """Vectorized e2m1fn dequant: a packed WQ tile -> a dequantized W tile in
+    shared memory, 128-bit transactions (local_size elems out / local_size//2
+    packed bytes in per chunk), one per-32-block scale per chunk.
+
+    The chunk loop is T.Parallel (not T.serial): a serial chunk loop obstructs
+    the K-loop pipeliner on long K-loops (the dequant can't hide behind the
+    WGMMA), costing ~20% on K=17408. T.Parallel lets the software pipeliner
+    overlap dequant(k+1) with WGMMA(k).
+
+    # SOTA copy: examples/dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py
+    #   @ tilelang main (fast_dequant path's per-thread vectorized macro)
+    # Adapted: the e2m1fn integer bitcast decode replaces the SOTA's twiddling
+    #   extern (it only covers affine int4 grids, not e2m1fn's float grid);
+    #   tileRL's per-32 float block scale is staged to shared (Scale_shared)
+    #   and applied once per chunk (the chunk is aligned and never crosses a
+    #   32-block); the chunk loop is T.Parallel (the SOTA's T.serial obstructs
+    #   the K-loop pipeliner on long K). block_K must be a Python int (the
+    #   vectorizer needs the literal divisor, like the SOTA's Block_QK).
+    """
+    local_compress = local_size // 2  # 2 nibbles per byte
+
+    @T.macro
+    def dequant(WQ_shared, Scale_shared, W_shared, block_N, block_K):
+        for i in T.Parallel(block_N * block_K // local_size):
+            WQ_local = T.alloc_local((local_compress,), "uint8")
+            W_local = T.alloc_local((local_size,), out_dtype)
+            cbase = i * local_compress
+            nbase = i * local_size
+            for v in T.vectorized(local_compress):
+                WQ_local[v] = WQ_shared[(cbase + v) // (block_K // 2), (cbase + v) % (block_K // 2)]
+            s = Scale_shared[nbase // block_K, (nbase % block_K) // 32]
+            for v in T.serial(local_size):
+                byte = WQ_local[v // 2]
+                nib = (byte >> ((v % 2) * 4)) & 15
+                ni32 = T.cast(nib, "int32")
+                bits = ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
+                w = T.reinterpret(bits, "float32")
+                W_local[v] = T.cast(w * s, out_dtype)
+            for v in T.vectorized(local_size):
+                W_shared[(nbase + v) // block_K, (nbase + v) % block_K] = W_local[v]
+
+    return dequant
+
+
+#: K-tile for the fp4 MMA paths: bf16 WGMMA K=16 (4 steps), fp8 WGMMA K=32
+#: (2 steps). 64 amortizes the dequant over multiple WGMMA steps; the backend
+#: pads K to a multiple of this on CUDA.
+_FP4_BLOCK_K = 64
+
+
 def make_linear_fp4_mma(target: str):
-    """Fused e2m1fn dequant + matmul (sm90 MMA).
+    """Fused e2m1fn dequant + matmul (sm90 MMA), bf16-IO.
 
     X [M,K] bf16, WQ uint8 [N,K//2] (low nibble first), Scale [N,K//32] f32.
     Y[m,n] = sum_k X[m,k] * e2m1fn(WQ[n,k//2] nibble k%2) * Scale[n,k//32].
 
+    The dequant runs ahead of the WGMMA in the pipelined K-loop: each stage
+    copies the X/WQ/Scale tiles to shared, vectorizes the dequant into W_shared
+    (128-bit transactions, one scale per 8-elem chunk), then WGMMA reads
+    W_shared. With num_stages=3 the dequant of stage k+1 issues while the
+    WGMMA of stage k is in flight (the async WGMMA + double-buffered shared),
+    so the dequant hides behind the MMA.
+
     # SOTA copy: examples/dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py
-    #   @ tilelang main (simple_dequant path)
-    # Adapted: bf16 IO (bf16 WGMMA, f32 accumulate); tileRL's float block
-    #   scale (block_max/6 per 32 elems) applied as a multiply instead of the
-    #   example's integer-exponent scale; e2m1fn grid (matches pack_fp4 — no
-    #   zero, so the backend zero-pads Scale for K-tail tiles).
+    #   @ tilelang main (fast_dequant path: vectorized shared dequant before
+    #   the WGMMA, pipelined)
+    # Adapted: bf16 IO (bf16 WGMMA, f32 accumulate); tileRL's float per-32
+    #   block scale (block_max/6) staged to shared and applied per chunk
+    #   instead of the example's integer-exponent scale; e2m1fn grid (matches
+    #   pack_fp4 — no zero, so the backend zero-pads Scale for K-tail tiles).
     # Fast decode: the e2m1fn grid is a power-of-two grid, so each nibble's
     #   fp32 bit pattern is pure integer math — sign<<31 | (126+e)<<23 |
     #   m<<22 — reinterpreted as float (the lop3-style fast decode).
@@ -181,27 +240,19 @@ def make_linear_fp4_mma(target: str):
         Scale: T.Tensor((N, K // 32), "float32")
         Y = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-            X_shared = T.alloc_shared((block_M, _RED_TILE), "bfloat16")
-            WQ_shared = T.alloc_shared((block_N, _RED_TILE // 2), "uint8")
-            W_shared = T.alloc_shared((block_N, _RED_TILE), "bfloat16")
+            X_shared = T.alloc_shared((block_M, _FP4_BLOCK_K), "bfloat16")
+            WQ_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // 2), "uint8")
+            W_shared = T.alloc_shared((block_N, _FP4_BLOCK_K), "bfloat16")
+            Scale_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // 32), "float32")
             C_local = T.alloc_fragment((block_M, block_N), "float32")
             T.clear(C_local)
-            for k in T.Pipelined(K // _RED_TILE, num_stages=2):
-                T.copy(X[by * block_M, k * _RED_TILE], X_shared)
-                T.copy(WQ[bx * block_N, k * _RED_TILE // 2], WQ_shared)
-                # e2m1fn dequant: nibble -> fp32 bits (integer math) -> bf16,
-                # times the per-32 block scale.
-                for i, j in T.Parallel(block_N, _RED_TILE):
-                    byte = WQ_shared[i, j // 2]
-                    nib = (byte >> ((j % 2) * 4)) & 15
-                    ni32 = T.cast(nib, "int32")
-                    bits = (
-                        ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
-                    )
-                    w = T.reinterpret(bits, "float32")
-                    W_shared[i, j] = T.cast(
-                        w * Scale[bx * block_N + i, (k * _RED_TILE + j) // 32], "bfloat16"
-                    )
+            for k in T.Pipelined(K // _FP4_BLOCK_K, num_stages=3):
+                T.copy(X[by * block_M, k * _FP4_BLOCK_K], X_shared)
+                T.copy(WQ[bx * block_N, k * _FP4_BLOCK_K // 2], WQ_shared)
+                T.copy(Scale[bx * block_N, k * _FP4_BLOCK_K // 32], Scale_shared)
+                _dequant_fp4_macro("bfloat16", 8)(
+                    WQ_shared, Scale_shared, W_shared, block_N, _FP4_BLOCK_K
+                )
                 T.gemm(X_shared, W_shared, C_local, transpose_B=True)
             T.copy(C_local, Y[by * block_M, bx * block_N])
         return Y
@@ -510,26 +561,28 @@ def make_linear_fp4_fp8_mma(target: str):
     pack_fp4 per-32 block scale), AScale [M] f32 (per-token activation scale).
     ``Y[m,n] = (sum_k XQ[m,k] * e2m1fn(WQ) * WScale[n,k//32]) / AScale[m]``.
 
-    The e2m1fn grid ({±0.5,±0.75,±1,±1.5,±2,±3,±4,±6}) is an exact subset of
-    e4m3, so the dequant is: nibble -> fp32 grid (integer fast decode) ->
-    *WScale -> cast to e4m3. The cast is a requant (the dequant weight is not
-    exactly on the e4m3 grid), carrying ~1.7% error on top of the activation
-    quant's ~2% e4m3 floor — the standard W4A8 trade-off. The per-32-block
-    weight scale is applied inside the K-loop (one per tile, since fp8 WGMMA
-    K=32); the per-token activation scale is one divide in the epilogue — no
-    temp fragment, no per-tile epilogue (the exact-grid alternative needs
-    both and runs ~2x slower: the manual scale-accumulate breaks the WGMMA
-    pipeline).
+    Same dequant schedule as make_linear_fp4_mma (the vectorized shared-memory
+    macro, SOTA: examples/dequantize_gemm/..._bf16_fp4_hopper.py), with the
+    dequant target dtype e4m3 (16 elems per 128-bit transaction vs 8 for
+    bf16): the K-loop copies XQ/WQ/Scale tiles to shared, vectorizes the
+    dequant into W_shared (one scale per 16-elem chunk), then fp8 WGMMA reads
+    W_shared — with num_stages=3 the dequant of stage k+1 issues while the
+    WGMMA of stage k is in flight. The e2m1fn grid ({±0.5,±0.75,±1,±1.5,±2,±3,
+    ±4,±6}) is an exact subset of e4m3, so the dequant is: nibble -> fp32
+    grid (integer fast decode) -> *WScale -> cast to e4m3. The cast is a
+    requant (the dequant weight is not exactly on the e4m3 grid), carrying
+    ~1.7% error on top of the activation quant's ~2% e4m3 floor — the
+    standard W4A8 trade-off. The per-token activation scale is one divide in
+    the epilogue.
 
-    # SOTA copy: examples/gemm_fp8/example_tilelang_gemm_fp8.py @ tilelang main
-    # Adapted: e4m3 operands (fp8 WGMMA, f32 accumulate), block_K=32 (the
-    #   fp8 WGMMA K, 1 step); the B operand is dequantized on the fly from
-    #   tileRL's e2m1fn packed format — the same fast integer decode as
-    #   make_linear_fp4_mma, requanted to e4m3; per-token activation dequant
+    # SOTA copy: examples/dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py
+    #   @ tilelang main (fast_dequant path: vectorized shared dequant before
+    #   the WGMMA, pipelined)
+    # Adapted: e4m3 operands (fp8 WGMMA, f32 accumulate), the dequant target
+    #   dtype is e4m3 (requant) instead of bf16; per-token activation dequant
     #   (1/AScale[m]) in the epilogue. e2m1fn has no zero, so padded WQ bytes
     #   (0x00 -> 0.5) are killed by the zero-padded WScale.
     """
-    _BLOCK_K = 64  # fp8 WGMMA K=32, 2 steps; amortizes the e4m3 dequant cast
 
     @tilelang.jit(
         target=target,
@@ -547,27 +600,19 @@ def make_linear_fp4_fp8_mma(target: str):
         AScale: T.Tensor((M,), "float32")
         Y = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-            X_shared = T.alloc_shared((block_M, _BLOCK_K), "float8_e4m3fn")
-            WQ_shared = T.alloc_shared((block_N, _BLOCK_K // 2), "uint8")
-            W_shared = T.alloc_shared((block_N, _BLOCK_K), "float8_e4m3fn")
+            X_shared = T.alloc_shared((block_M, _FP4_BLOCK_K), "float8_e4m3fn")
+            WQ_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // 2), "uint8")
+            W_shared = T.alloc_shared((block_N, _FP4_BLOCK_K), "float8_e4m3fn")
+            Scale_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // 32), "float32")
             C_local = T.alloc_fragment((block_M, block_N), "float32")
             T.clear(C_local)
-            for k in T.Pipelined(K // _BLOCK_K, num_stages=3):
-                T.copy(XQ[by * block_M, k * _BLOCK_K], X_shared)
-                T.copy(WQ[bx * block_N, k * _BLOCK_K // 2], WQ_shared)
-                # e2m1fn grid -> fp32 (integer fast decode) -> *WScale -> e4m3.
-                for i, j in T.Parallel(block_N, _BLOCK_K):
-                    byte = WQ_shared[i, j // 2]
-                    nib = (byte >> ((j % 2) * 4)) & 15
-                    ni32 = T.cast(nib, "int32")
-                    bits = (
-                        ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
-                    )
-                    w = T.reinterpret(bits, "float32")
-                    W_shared[i, j] = T.cast(
-                        w * WScale[bx * block_N + i, (k * _BLOCK_K + j) // 32],
-                        "float8_e4m3fn",
-                    )
+            for k in T.Pipelined(K // _FP4_BLOCK_K, num_stages=3):
+                T.copy(XQ[by * block_M, k * _FP4_BLOCK_K], X_shared)
+                T.copy(WQ[bx * block_N, k * _FP4_BLOCK_K // 2], WQ_shared)
+                T.copy(WScale[bx * block_N, k * _FP4_BLOCK_K // 32], Scale_shared)
+                _dequant_fp4_macro("float8_e4m3fn", 16)(
+                    WQ_shared, Scale_shared, W_shared, block_N, _FP4_BLOCK_K
+                )
                 T.gemm(X_shared, W_shared, C_local, transpose_B=True)
             for i, j in T.Parallel(block_M, block_N):
                 C_local[i, j] = C_local[i, j] / AScale[by * block_M + i]
