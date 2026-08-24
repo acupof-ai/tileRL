@@ -148,6 +148,7 @@ _SM90_KERNELS = {
     "write_tokens": kernels_mma.make_write_tokens,
     "gdn_decode_fused": kernels_mma.make_gdn_decode_fused,
     "gdn_chunk_fused": kernels_mma.make_gdn_chunk_fused,
+    "paged_attention": kernels_mma.make_paged_attention_mma,
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)
@@ -448,27 +449,48 @@ class Backend:
     # ------------------------------------------------------------ attention
 
     def paged_attention(self, q, k_cache, v_cache, block_table, seq_lens, scale, gate=None):
-        q = self._f32(q)
-        k_cache = self._f32(k_cache)
-        v_cache = self._f32(v_cache)
-        if q.ndim == 3:
-            q = self._c(q.unsqueeze(1))  # [B, H, D] -> [B, 1, H, D]
-            squeeze = True
+        squeeze = q.ndim == 3
+        if squeeze:
+            q = q.unsqueeze(1)  # [B, H, D] -> [B, 1, H, D]
+        s = q.shape[1]
+        if self.arch == "sm90":
+            # MMA kernel is bf16-IO and tiles queries at block_M: pad S to a
+            # multiple (the kernel's history/mask use the true length s, so
+            # padding rows do not shift the causal window).
+            block_m = 64 if s >= 64 else 16
+            q = self._dev(self._c(q), torch.bfloat16)
+            pad = -s % block_m
+            if pad:
+                q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad))
+            out = self._kernel("paged_attention")(
+                q,
+                self._dev(k_cache, torch.bfloat16),
+                self._dev(v_cache, torch.bfloat16),
+                self._i32(block_table),
+                self._i32(seq_lens),
+                float(scale),
+                int(k_cache.shape[2]),
+                block_m,
+                s,
+                128,
+            )[:, :s]
         else:
-            squeeze = False
-        bt = self._i32(block_table).contiguous()
-        sl = self._i32(seq_lens).contiguous()
-        k = self._kernel("paged_attention")
-        out = k(
-            q,
-            k_cache,
-            v_cache,
-            bt,
-            sl,
-            float(scale),
-            block_size=int(k_cache.shape[2]),
-            threads=_THREADS,
-        )
+            q = self._f32(q)
+            k_cache = self._f32(k_cache)
+            v_cache = self._f32(v_cache)
+            bt = self._i32(block_table).contiguous()
+            sl = self._i32(seq_lens).contiguous()
+            k = self._kernel("paged_attention")
+            out = k(
+                q,
+                k_cache,
+                v_cache,
+                bt,
+                sl,
+                float(scale),
+                block_size=int(k_cache.shape[2]),
+                threads=_THREADS,
+            )
         out = out.squeeze(1) if squeeze else out
         if gate is not None:
             out = out * torch.sigmoid(self._f32(gate))
