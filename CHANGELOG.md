@@ -4,6 +4,18 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — verdict: bf16 IO + bitcast fast decode accepted on sm90
+
+- **Verdict.** The sm90 MMA kernels (3 gemms + `linear_fp4_mma` +
+  `linear_fp4_gemv`) switch from f32 to bf16 IO (bf16 WGMMA, f32 accumulate),
+  and the e2m1fn decode switches from 4x `exp2` to integer bit-pattern
+  synthesis (`sign<<31 | (126+e)<<23 | m<<22`, reinterpreted as float —
+  ties the warp-shuffle LUT, no warp-cooperation constraint). Big-shape
+  GEMV 1.8-2.1x faster (17408x5120: 0.138 -> 0.077 ms, 15% -> 27% of roof;
+  lm_head 1.85 -> 0.89 ms, 33% of roof); WGMMA path 1.5x; slice decode
+  4.55 -> 3.91 ms/tick. CUDA parity 25/25 at rtol=1e-2. Entry:
+  `docs/experience/wins/2026-08-24-fp4-gemv-bitcast-bf16.md`.
+
 ## 2026-08-24 — verdict: multi-block norm/activation accepted on sm90
 
 - **Verdict.** `silu_mul` gridded over M (1024-element chunks) and
