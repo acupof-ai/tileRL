@@ -173,6 +173,21 @@ def test_linear_fp4_parity(backend):
     )
 
 
+def test_linear_fp4_gemv_parity(backend):
+    """M=1 decode path: the sm90 cell resolves to the GEMV kernel (the floor
+    kernel on CPU/metal); same e2m1fn decode math as the MMA kernel."""
+    torch.manual_seed(20)
+    for N, K in [(24, 32), (16, 128), (18, 64)]:
+        w_master = torch.randn(N, K)
+        wq, scale = _quantize_fp4(w_master)
+        x = torch.randn(1, K)
+        _assert_close(
+            backend.linear_fp4(x, wq, scale),
+            reference.linear_fp4(x, wq, scale),
+            f"linear_fp4_gemv N={N} K={K}",
+        )
+
+
 def test_linear_fp4_bwd():
     torch.manual_seed(5)
     w_master = torch.randn(24, 32)

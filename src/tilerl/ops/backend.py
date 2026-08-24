@@ -140,6 +140,7 @@ _SM90_KERNELS = {
     "gemm_nn": kernels_mma.make_gemm_nn_mma,
     "gemm_tn": kernels_mma.make_gemm_tn_mma,
     "linear_fp4": kernels_mma.make_linear_fp4_mma,
+    "linear_fp4_gemv": kernels_mma.make_linear_fp4_gemv,
     "gdn_decode_fused": kernels_mma.make_gdn_decode_fused,
 }
 _register("bf16", "sm90", _SM90_KERNELS)
@@ -368,6 +369,25 @@ class Backend:
         lead = x.shape[:-1]
         x2 = self._c(x.reshape(-1, x.shape[-1]))
         M, K, N = x2.shape[0], x2.shape[1], wq.shape[0]
+        if (
+            self.target.startswith("cuda")
+            and M == 1
+            and "linear_fp4_gemv" in _resolve(self.precision, self.arch)
+        ):
+            # Decode GEMV: one activation row, stream+dequant WQ once. Block K
+            # is reduce_thread(32) * micro_size_k(4) = 128; e2m1fn has no zero,
+            # so the K-tail is killed by the zero-padded Scale (same trick as
+            # the MMA path).
+            Kp = _round_up(K, 128)
+            Np = _round_up(N, 4)
+            y = self._kernel("linear_fp4_gemv")(
+                _pad2d(x2, 1, Kp),
+                _pad2d(wq, Np, Kp // 2),
+                _pad2d(scale, Np, Kp // 16),
+                32,
+                4,
+            )
+            return y[:1, :N].reshape(*lead, N)
         bM, bN = min(64, M), min(64, N)
         if self.target.startswith("cuda"):
             # WGMMA tiles %16, reduction K %32. e2m1fn has no zero, so padded
