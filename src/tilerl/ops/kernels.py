@@ -17,7 +17,13 @@ cross-thread-reduce a fragment scalar the way CPU's serial lowering does, so
 ``T.Parallel`` reductions silently compute per-thread partials. Metal's
 ``T.gemm`` rejects global-scope operands, so the metal dispatch cell swaps in
 the naive FMA gemm schedules at the bottom of this file (same signatures,
-same block semantics). A serial ``j`` loop nested inside a parallel ``i``
+same block semantics).
+CUDA facts (tilelang 0.1.13, H20/sm90, 2026-08-24): the MMA lowering has the
+same global-operand rejection ("Unsupported gemm combination, A: global,
+B: global") and requires tile M/N divisible by 16, so the sm90 cell reuses
+the same naive FMA schedules; the per-thread fragment accumulator also
+false-positives the static data-race check (same as Metal/CPU), so the CUDA
+cell disables it too. A serial ``j`` loop nested inside a parallel ``i``
 loop miscompiles on Metal (output columns past the first few come back
 wrong); the portable shape is a 2D ``for i, j in T.Parallel(...)`` nest with
 the reduction serial inside — that is why ``linear_fp4`` is shaped like the
@@ -40,9 +46,9 @@ __all__ = [
     "make_gemm_nt",
     "make_gemm_nn",
     "make_gemm_tn",
-    "make_gemm_nt_metal",
-    "make_gemm_nn_metal",
-    "make_gemm_tn_metal",
+    "make_gemm_nt_naive",
+    "make_gemm_nn_naive",
+    "make_gemm_tn_naive",
     "make_silu_mul",
     "make_softmax",
     "make_rope",
@@ -59,7 +65,7 @@ def _pass_configs(target: str) -> dict[str, object]:
             "tirx.disable_vectorize": True,
             "tl.disable_data_race_check": True,
         }
-    if target == "metal":
+    if target == "metal" or target.startswith("cuda"):
         # The static race check false-positives on per-thread fragments
         # allocated inside a parallel loop (each thread owns its instance);
         # the CPU cell disables the check for the same pattern.
@@ -230,17 +236,18 @@ def make_gemm_tn(target: str):
     return gemm_tn
 
 
-# ---------------------------------------------------------------- gemm (metal schedule)
+# ---------------------------------------------------------------- gemm (naive FMA schedule)
 #
 # Metal's T.gemm lowering rejects global-scope operands ("Unsupported gemm
-# combination, A: global, B: global"), so the CPU kernels' scalar-fallback
-# T.gemm has no Metal path. The Metal cell of the dispatch matrix uses these
-# naive explicit-FMA schedules instead — same signatures and block semantics
-# as the CPU kernels, no T.gemm, no shared-memory tiling.
-# ponytail: naive FMA day-1, shared-memory tiled simdgroup T.gemm day-2
+# combination, A: global, B: global"), and CUDA's MMA lowering rejects them
+# too (plus the m16n8k16 MMA requires tile M/N divisible by 16). The CPU
+# kernels' scalar-fallback T.gemm therefore has no Metal or CUDA path; both
+# cells use these naive explicit-FMA schedules instead — same signatures and
+# block semantics as the CPU kernels, no T.gemm, no shared-memory tiling.
+# ponytail: naive FMA day-1, shared-memory tiled T.gemm day-2
 
 
-def make_gemm_nt_metal(target: str):
+def make_gemm_nt_naive(target: str):
     """C = A @ B.T + Bias.  A [M, K], B [N, K] -> C [M, N]."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
@@ -262,7 +269,7 @@ def make_gemm_nt_metal(target: str):
     return gemm_nt
 
 
-def make_gemm_nn_metal(target: str):
+def make_gemm_nn_naive(target: str):
     """C = A @ B.  A [M, K], B [K, N] -> C [M, N]."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
@@ -283,7 +290,7 @@ def make_gemm_nn_metal(target: str):
     return gemm_nn
 
 
-def make_gemm_tn_metal(target: str):
+def make_gemm_tn_naive(target: str):
     """C = A.T @ B.  A [M, N], B [M, K] -> C [N, K] (C_ij = sum_m A_mi B_mj)."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))

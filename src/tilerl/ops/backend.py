@@ -22,6 +22,13 @@ kernel source compiles for ``target="metal"`` with no per-target forks; the
 Metal cell of the dispatch matrix reuses ``_CPU_KERNELS``. Tensors must live
 on torch's ``"mps"`` device (``Backend.device``), and kernel I/O goes through
 the torch-MPS adapter in tilelang's tvm_ffi runtime.
+CUDA target facts (tilelang 0.1.13, H20/sm90, 2026-08-24): the same source
+compiles for ``target="cuda"``; the sm90 cell reuses ``_CPU_KERNELS`` with
+the naive FMA gemms (CUDA's MMA lowering rejects global operands and requires
+tile M/N divisible by 16). ``Backend.device`` pins ``cuda:<current>`` —
+``torch.device("cuda")`` (index None) is not the device kernel outputs land
+on. Eager JIT invokes NVCC per (shape, dtype): first call per shape costs
+30-120s+. # ponytail: shape cache / AOT before 27B serving
 ``# ponytail: f32 compute day-1, bf16 IO/mixed precision day-2``
 """
 
@@ -90,16 +97,27 @@ _register("bf16", "cpu", _CPU_KERNELS)
 _register("fp4", "cpu", _CPU_KERNELS)
 # metal: same target-neutral kernel source, except the three gemms — Metal's
 # T.gemm lowering rejects global operands, so the metal cell swaps in the
-# naive FMA schedules from kernels.py (see "gemm (metal schedule)").
+# naive FMA schedules from kernels.py (see "gemm (naive FMA schedule)").
 _METAL_KERNELS = {
     **_CPU_KERNELS,
-    "gemm_nt": kernels.make_gemm_nt_metal,
-    "gemm_nn": kernels.make_gemm_nn_metal,
-    "gemm_tn": kernels.make_gemm_tn_metal,
+    "gemm_nt": kernels.make_gemm_nt_naive,
+    "gemm_nn": kernels.make_gemm_nn_naive,
+    "gemm_tn": kernels.make_gemm_tn_naive,
 }
 _register("bf16", "metal", _METAL_KERNELS)
 _register("fp4", "metal", _METAL_KERNELS)
-for _arch in ("sm90", "sm100", "sm120", "rocm"):
+# sm90: CUDA's MMA lowering has the same global-operand rejection (and the
+# m16n8k16 tile-M/N%16 constraint), so the sm90 cell reuses the naive FMA
+# gemms too. Verified on H20 (pod, 2026-08-24): full suite green.
+_SM90_KERNELS = {
+    **_CPU_KERNELS,
+    "gemm_nt": kernels.make_gemm_nt_naive,
+    "gemm_nn": kernels.make_gemm_nn_naive,
+    "gemm_tn": kernels.make_gemm_tn_naive,
+}
+_register("bf16", "sm90", _SM90_KERNELS)
+_register("fp4", "sm90", _SM90_KERNELS)
+for _arch in ("sm100", "sm120", "rocm"):
     _register("bf16", _arch, {})  # pending-remote slot
 
 
@@ -142,9 +160,15 @@ class Backend:
 
     def __init__(self, target: str):
         self.target = target
-        self.device = torch.device(
-            "mps" if target == "metal" else "cuda" if target.startswith("cuda") else "cpu"
-        )
+        if target == "metal":
+            self.device = torch.device("mps")
+        elif target.startswith("cuda"):
+            # torch.device("cuda") (index None) is not the device kernel
+            # outputs land on (cuda:0) — pin the current device so the
+            # boundary migration targets the right one.
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            self.device = torch.device("cpu")
         self.precision = "bf16"
         self.arch = _arch_for(target)
         self._kernels: dict[str, object] = {}
