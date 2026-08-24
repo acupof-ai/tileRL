@@ -4,6 +4,19 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — default flip: fp8 prefill path on sm90 (e4m3 activations + fp4->e4m3 WGMMA)
+
+- **Default flip.** `linear_fp4` with M>1 on sm90 now runs fp8 WGMMA (e4m3
+  activations, e2m1fn→e4m3 weight dequant in the K-loop, f32 accumulate)
+  instead of bf16 WGMMA — 1.5x on the slice prefill tick (6021 → 7839 tok/s,
+  extrapolated 268 → 399 tok/s). pack_fp4's block scale moves per-16 → per-32
+  to match the fp8 WGMMA K-tile (one scale per tile, no temp-fragment
+  epilogue). e4m3's ~2% multiplicative quant error does not average down over
+  K, so the parity gate uses an identical-quant torch reference. 399 tok/s is
+  9.5x off the 3800 target — the kernel is dequant-bound (e4m3 cast in the
+  K-loop, ~20% of fp8 peak); production fp8 GEMMs precompute fp8 weights.
+  Entry: `docs/experience/wins/2026-08-24-fp8-prefill-wgmma.md`.
+
 ## 2026-08-24 — phase exit: decode tick captured (CUDA graph) on sm90
 
 - **Exit + default flip.** The decode tick is now a captured kernel sequence
