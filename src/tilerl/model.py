@@ -69,7 +69,12 @@ import torch
 
 from . import autograd
 from .config import ModelConfig, tiny
-from .ops.reference import pack_fp4, unpack_fp4  # re-exported for callers
+from .ops.reference import (
+    dequant_fp8_block,
+    dequant_nvfp4,
+    pack_fp4,
+    unpack_fp4,
+)  # re-exported for callers
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no tilelang import at runtime
     import numpy as np
@@ -461,7 +466,10 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
     Raises RuntimeError (never a silent fallback) on download failure, missing
     files, config mismatch, or missing/duplicate/shape-mismatched tensors.
     HF safetensors and MLX 4-bit affine checkpoints are both accepted (the
-    MLX path is detected from the ``language_model.`` tensor-name prefix).
+    MLX path is detected from the ``language_model.`` tensor-name prefix), as
+    are ModelOpt NVFP4/FP8-block checkpoints (detected from the
+    ``weight_packed`` / ``weight_scale_inv`` sibling tensors, dequantized to
+    bf16 before param mapping).
     """
     if num_layers is not None and not 0 < num_layers <= cfg.num_layers:
         raise ValueError(f"num_layers={num_layers} out of range for {cfg.num_layers} layers")
@@ -535,6 +543,39 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
                         tensor, tensors[base + ".scales"], tensors[base + ".biases"], group_size
                     )
                 key = _param_key_for(base)
+            elif hf_name.endswith(".weight_packed"):
+                # ModelOpt NVFP4 (Qwen3.6 MLP linears): packed e2m1 nibbles +
+                # f8 block scale + global scale siblings, dequantized to bf16.
+                stem = hf_name.removesuffix(".weight_packed")
+                key = _param_key_for(stem + ".weight")
+                if key is not None:
+                    tensor = dequant_nvfp4(
+                        tensor,
+                        tensors[stem + ".weight_scale"],
+                        tensors[stem + ".weight_global_scale"],
+                    )
+            elif hf_name.endswith(
+                (
+                    ".weight_scale",
+                    ".weight_global_scale",
+                    ".input_global_scale",
+                    ".weight_scale_inv",
+                )
+            ):
+                # ModelOpt quant siblings consumed above; input_global_scale is
+                # activation quant — inference-engine business, ignored at load.
+                continue
+            elif (
+                hf_name.endswith(".weight")
+                and hf_name.removesuffix(".weight") + ".weight_scale_inv" in tensors
+            ):
+                # ModelOpt FP8 block (Qwen3.6 GDN linears): f8 weight + inverse
+                # per-128-block scales, dequantized to bf16.
+                key = _param_key_for(hf_name)
+                if key is not None:
+                    tensor = dequant_fp8_block(
+                        tensor, tensors[hf_name.removesuffix(".weight") + ".weight_scale_inv"]
+                    )
             else:
                 key = _param_key_for(hf_name)
             if key is None:

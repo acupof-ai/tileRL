@@ -152,6 +152,39 @@ def qwen38_27b() -> ModelConfig:
     )
 
 
+def qwen36_27b() -> ModelConfig:
+    """Qwen3.6-27B (ModelOpt NVFP4, checkpoint /host/tc27-nvfp4-slice2): 64
+    layers = 16 full-attn (idx 3,7,...,63) + 48 GDN. Same shapes as
+    :func:`qwen38_27b` except GDN value heads: 48 (the checkpoint's A_log is
+    [48]), not 32. MLP linears are NVFP4 (weight_packed + f8 weight_scale +
+    global scale), GDN in_proj_qkv/in_proj_z/out_proj are FP8 block-128
+    (weight + inverse scale_inv); load_hf dequantizes both to bf16.
+    """
+    return ModelConfig(
+        name="qwen36-27b",
+        hidden_size=5120,
+        intermediate_size=17408,
+        num_layers=64,
+        num_attention_heads=24,
+        num_kv_heads=4,
+        head_dim=256,
+        vocab_size=248320,
+        full_attn_layers=tuple(range(3, 64, 4)),
+        rope_theta=1e7,
+        max_position_embeddings=262144,
+        rms_eps=1e-6,
+        tie_word_embeddings=True,
+        fp4=True,
+        full_attn_gated=True,
+        rotary_dim=64,
+        linear_num_key_heads=16,
+        linear_key_head_dim=128,
+        linear_num_value_heads=48,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
+
+
 def qwen35_08b() -> ModelConfig:
     """Qwen3.5-0.8B (local MLX-4bit): 24 layers = 6 full-attn (idx 3,7,...,23)
     + 18 GDN. Same hybrid family as the 27B, small enough to forward on CPU —

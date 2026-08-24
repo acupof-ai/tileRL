@@ -31,6 +31,8 @@ __all__ = [
     "linear_fp4_bwd",
     "pack_fp4",
     "unpack_fp4",
+    "dequant_nvfp4",
+    "dequant_fp8_block",
     "dense_attention",
     "dense_attention_bwd",
     "linear_attn_chunk",
@@ -247,6 +249,42 @@ def unpack_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     vals = mag * sign  # [n, k]
     out = vals.reshape(n, k // 16, 16) * scale.unsqueeze(-1)
     return out.reshape(n, k).to(torch.bfloat16)
+
+
+# ---------------------------------------------------------------- modelopt quantized checkpoints
+
+
+def dequant_nvfp4(
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+) -> torch.Tensor:
+    """ModelOpt NVFP4 dequant (Qwen3.6 MLP linears). weight_packed uint8
+    [N,K//2] (two OCP/MX e2m1 nibbles per byte, low nibble first),
+    weight_scale f8_e4m3 [N,K//16] (block 1x16), weight_global_scale f32 [1].
+    Returns bf16 [N,K]: ``w = e2m1(packed) * f8(weight_scale).repeat(16) *
+    weight_global_scale``. The e2m1 grid is ``_E2M1_LUT`` ({0,.5,1,1.5,2,3,4,6}
+    + sign) — the OCP/MX grid, not the e2m1fn grid of :func:`dequant_fp4`."""
+    n, k2 = weight_packed.shape
+    lo = (weight_packed & 0xF).long()
+    hi = ((weight_packed >> 4) & 0xF).long()
+    lut = _E2M1_LUT.to(weight_packed.device)
+    mag = torch.stack([lut[lo & 0x7], lut[hi & 0x7]], dim=-1).reshape(n, k2 * 2)
+    sign = torch.stack(
+        [1.0 - 2.0 * (lo >> 3).float(), 1.0 - 2.0 * (hi >> 3).float()], dim=-1
+    ).reshape(n, k2 * 2)
+    scale = weight_scale.float().repeat_interleave(16, dim=-1)
+    return (mag * sign * scale * weight_global_scale.float()).to(torch.bfloat16)
+
+
+def dequant_fp8_block(
+    weight: torch.Tensor, scale_inv: torch.Tensor, block: int = 128
+) -> torch.Tensor:
+    """ModelOpt FP8 block-quant dequant (Qwen3.6 GDN linears). weight f8_e4m3
+    [N,K], scale_inv bf16 [N//block,K//block] (INVERSE per-block scales).
+    Returns bf16 [N,K]: ``w = f8(weight) / scale_inv.repeat(block)``."""
+    si = scale_inv.float().repeat_interleave(block, dim=-1).repeat_interleave(block, dim=-2)
+    return (weight.float() / si).to(torch.bfloat16)
 
 
 # ---------------------------------------------------------------- full attention (training)
