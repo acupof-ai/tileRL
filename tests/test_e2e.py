@@ -210,10 +210,10 @@ def test_tape_gradcheck():
 
 
 def test_fp4_roundtrip():
-    """Pack/unpack of e2m1 fp4 weights: values already on the e2m1 grid must
-    survive the roundtrip with error < 1e-2. Skipped if no pack/unpack helper
-    is exposed — the contract pins the wire format (low-nibble-first e2m1,
-    scale [N, K//16]) but not the helper's location or signature."""
+    """Pack/unpack of e2m1fn fp4 weights: values already on the e2m1fn grid
+    must survive the roundtrip with error < 1e-2. Skipped if no pack/unpack
+    helper is exposed — the contract pins the wire format (low-nibble-first
+    e2m1fn, scale [N, K//16]) but not the helper's location or signature."""
     pack = unpack = None
     try:
         from tilerl.ops.reference import pack_fp4, unpack_fp4  # type: ignore
@@ -226,9 +226,9 @@ def test_fp4_roundtrip():
 
     gen = torch.Generator().manual_seed(0)
     n_rows, k_cols = 16, 32  # K multiple of 16 (scale block) and 2 (nibble pair)
-    grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    grid = torch.tensor([0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     # Small per-block scale: bf16 spacing at the resulting magnitudes is
-    # negligible, so the roundtrip error is dominated by e2m1 quantization.
+    # negligible, so the roundtrip error is dominated by e2m1fn quantization.
     scale = torch.rand(n_rows, k_cols // 16, generator=gen, dtype=torch.float32) * 0.05 + 0.01
     signs = torch.randint(0, 2, (n_rows, k_cols), generator=gen) * 2 - 1
     indices = torch.randint(0, 8, (n_rows, k_cols), generator=gen)

@@ -23,12 +23,16 @@ Metal cell of the dispatch matrix reuses ``_CPU_KERNELS``. Tensors must live
 on torch's ``"mps"`` device (``Backend.device``), and kernel I/O goes through
 the torch-MPS adapter in tilelang's tvm_ffi runtime.
 CUDA target facts (tilelang 0.1.13, H20/sm90, 2026-08-24): the same source
-compiles for ``target="cuda"``; the sm90 cell reuses ``_CPU_KERNELS`` with
-the naive FMA gemms (CUDA's MMA lowering rejects global operands and requires
-tile M/N divisible by 16). ``Backend.device`` pins ``cuda:<current>`` —
-``torch.device("cuda")`` (index None) is not the device kernel outputs land
-on. Eager JIT invokes NVCC per (shape, dtype): first call per shape costs
-30-120s+. # ponytail: shape cache / AOT before 27B serving
+compiles for ``target="cuda"``; the sm90 cell uses the MMA (WGMMA) schedules
+in kernels_mma.py — shared-memory tiled T.gemm with pipelining, the SOTA
+pattern from examples/gemm/example_gemm.py. The MMA kernels require block
+M/N divisible by 16 and the reduction dim divisible by 32; the CUDA path of
+linear/linear_bwd/linear_fp4 zero-pads tails so the kernel always sees exact
+tiles (decode M=1 pads to 16; all model N/K dims are already multiples of
+32). ``Backend.device`` pins ``cuda:<current>`` — ``torch.device("cuda")``
+(index None) is not the device kernel outputs land on. Eager JIT invokes
+NVCC per (shape, dtype): first call per shape costs 30-120s+.
+# ponytail: shape cache / AOT before 27B serving
 ``# ponytail: f32 compute day-1, bf16 IO/mixed precision day-2``
 """
 
@@ -39,11 +43,29 @@ import os
 import torch
 
 from . import kernels
+from . import kernels_mma
 from . import reference
 
 __all__ = ["Backend", "get_backend", "resolve_target"]
 
 _THREADS = 64
+
+
+def _round_up(x: int, m: int) -> int:
+    return ((x + m - 1) // m) * m
+
+
+def _pad2d(t: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Zero-pad a 2D tensor to [rows, cols] (bottom/right)."""
+    pr, pc = rows - t.shape[0], cols - t.shape[1]
+    if pr == 0 and pc == 0:
+        return t
+    return torch.nn.functional.pad(t, (0, pc, 0, pr))
+
+
+def _pad1d(t: torch.Tensor, n: int) -> torch.Tensor:
+    p = n - t.shape[0]
+    return t if p == 0 else torch.nn.functional.pad(t, (0, p))
 
 
 # ---------------------------------------------------------------------------
@@ -106,14 +128,18 @@ _METAL_KERNELS = {
 }
 _register("bf16", "metal", _METAL_KERNELS)
 _register("fp4", "metal", _METAL_KERNELS)
-# sm90: CUDA's MMA lowering has the same global-operand rejection (and the
-# m16n8k16 tile-M/N%16 constraint), so the sm90 cell reuses the naive FMA
-# gemms too. Verified on H20 (pod, 2026-08-24): full suite green.
+# sm90: the MMA (WGMMA) schedules from kernels_mma.py — shared-memory tiled
+# T.gemm with pipelining, the SOTA pattern from examples/gemm/example_gemm.py.
+# The naive FMA gemms stay in kernels.py as the metal/other-arch fallback.
+# The MMA kernels require block M/N divisible by 16 and the reduction dim
+# divisible by _RED_TILE (32); the CUDA path of linear/linear_bwd/linear_fp4
+# zero-pads tails so the kernel always sees exact tiles.
 _SM90_KERNELS = {
     **_CPU_KERNELS,
-    "gemm_nt": kernels.make_gemm_nt_naive,
-    "gemm_nn": kernels.make_gemm_nn_naive,
-    "gemm_tn": kernels.make_gemm_tn_naive,
+    "gemm_nt": kernels_mma.make_gemm_nt_mma,
+    "gemm_nn": kernels_mma.make_gemm_nn_mma,
+    "gemm_tn": kernels_mma.make_gemm_tn_mma,
+    "linear_fp4": kernels_mma.make_linear_fp4_mma,
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)
@@ -277,16 +303,20 @@ class Backend:
         w = self._f32(w)
         lead = x.shape[:-1]
         x2 = self._c(x.reshape(-1, x.shape[-1]))
-        bM = min(64, x2.shape[0])
-        bN = min(64, w.shape[0])
-        bias = (
-            self._f32(bias)
-            if bias is not None
-            else torch.zeros(w.shape[0], dtype=torch.float32, device=self.device)
-        )
-        k = self._kernel("gemm_nt")
-        y = k(x2, w, bias, bM, bN, _THREADS)
-        return y.reshape(*lead, w.shape[0])
+        M, K, N = x2.shape[0], x2.shape[1], w.shape[0]
+        bM, bN = min(64, M), min(64, N)
+        if self.target.startswith("cuda"):
+            # WGMMA tiles: block M/N %16, reduction K %32; pad tails so the
+            # MMA kernel sees exact tiles (no OOB loads).
+            bM, bN = _round_up(bM, 16), _round_up(bN, 16)
+            x2 = _pad2d(x2, _round_up(M, bM), _round_up(K, 32))
+            w = _pad2d(w, _round_up(N, bN), _round_up(K, 32))
+            if bias is not None:
+                bias = _pad1d(self._f32(bias), w.shape[0])
+        if bias is None:
+            bias = torch.zeros(w.shape[0], dtype=torch.float32, device=self.device)
+        y = self._kernel("gemm_nt")(x2, w, bias, bM, bN, _THREADS)
+        return y[:M, :N].reshape(*lead, N)
 
     def linear_bwd(self, grad, x, w):
         grad = self._f32(grad)
@@ -294,11 +324,32 @@ class Backend:
         w = self._f32(w)
         g2 = self._c(grad.reshape(-1, grad.shape[-1]))
         x2 = self._c(x.reshape(-1, x.shape[-1]))
-        bM = min(64, g2.shape[0])
-        bN = min(64, w.shape[-1])
-        gx = self._kernel("gemm_nn")(g2, w, bM, bN, _THREADS).reshape(*grad.shape[:-1], w.shape[-1])
-        gw = self._kernel("gemm_tn")(g2, x2, min(64, g2.shape[-1]), min(64, x2.shape[-1]), _THREADS)
-        return gx, gw
+        M, N, K = g2.shape[0], g2.shape[1], w.shape[1]
+        if self.target.startswith("cuda"):
+            # gx = g2 @ w (gemm_nn): reduction N, output [M, K]
+            bM, bK = _round_up(min(64, M), 16), _round_up(min(64, K), 16)
+            gx = self._kernel("gemm_nn")(
+                _pad2d(g2, _round_up(M, bM), _round_up(N, 32)),
+                _pad2d(w, _round_up(N, 32), _round_up(K, bK)),
+                bM,
+                bK,
+                _THREADS,
+            )[:M, :K]
+            # gw = g2.T @ x2 (gemm_tn): reduction M, output [N, K]
+            bN = _round_up(min(64, N), 16)
+            gw = self._kernel("gemm_tn")(
+                _pad2d(g2, _round_up(M, 32), _round_up(N, bN)),
+                _pad2d(x2, _round_up(M, 32), _round_up(K, bK)),
+                bN,
+                bK,
+                _THREADS,
+            )[:N, :K]
+        else:
+            bM = min(64, M)
+            bN = min(64, K)
+            gx = self._kernel("gemm_nn")(g2, w, bM, bN, _THREADS)
+            gw = self._kernel("gemm_tn")(g2, x2, min(64, N), min(64, K), _THREADS)
+        return gx.reshape(*grad.shape[:-1], K), gw
 
     # ------------------------------------------------------------ linear fp4
 
@@ -310,11 +361,18 @@ class Backend:
         scale = self._f32(scale)
         lead = x.shape[:-1]
         x2 = self._c(x.reshape(-1, x.shape[-1]))
-        bM = min(64, x2.shape[0])
-        bN = min(64, wq.shape[0])
-        k = self._kernel("linear_fp4")
-        y = k(x2, wq, scale, bM, bN, _THREADS)
-        return y.reshape(*lead, wq.shape[0])
+        M, K, N = x2.shape[0], x2.shape[1], wq.shape[0]
+        bM, bN = min(64, M), min(64, N)
+        if self.target.startswith("cuda"):
+            # WGMMA tiles %16, reduction K %32. e2m1fn has no zero, so padded
+            # WQ bytes (0x00 -> 0.5) are killed by the zero-padded Scale.
+            bM, bN = _round_up(bM, 16), _round_up(bN, 16)
+            Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, 32)
+            x2 = _pad2d(x2, Mp, Kp)
+            wq = _pad2d(wq, Np, Kp // 2)
+            scale = _pad2d(scale, Np, Kp // 16)
+        y = self._kernel("linear_fp4")(x2, wq, scale, bM, bN, _THREADS)
+        return y[:M, :N].reshape(*lead, N)
 
     def linear_fp4_bwd(self, grad, x, wq, scale, master=None):
         # ponytail: torch-eager backward, tilelang kernel when perf demands

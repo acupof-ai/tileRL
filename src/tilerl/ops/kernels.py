@@ -20,10 +20,11 @@ the naive FMA gemm schedules at the bottom of this file (same signatures,
 same block semantics).
 CUDA facts (tilelang 0.1.13, H20/sm90, 2026-08-24): the MMA lowering has the
 same global-operand rejection ("Unsupported gemm combination, A: global,
-B: global") and requires tile M/N divisible by 16, so the sm90 cell reuses
-the same naive FMA schedules; the per-thread fragment accumulator also
-false-positives the static data-race check (same as Metal/CPU), so the CUDA
-cell disables it too. A serial ``j`` loop nested inside a parallel ``i``
+B: global") and requires tile M/N divisible by 16, so the naive FMA schedules
+below are the fallback for arches without an MMA cell (metal today); the
+sm90 cell uses the WGMMA schedules in kernels_mma.py instead. The per-thread
+fragment accumulator also false-positives the static data-race check (same
+as Metal/CPU), so the CUDA cell disables it too. A serial ``j`` loop nested inside a parallel ``i``
 loop miscompiles on Metal (output columns past the first few come back
 wrong); the portable shape is a 2D ``for i, j in T.Parallel(...)`` nest with
 the reduction serial inside — that is why ``linear_fp4`` is shaped like the

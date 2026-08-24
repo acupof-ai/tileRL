@@ -209,15 +209,24 @@ def linear_fp4_bwd(
 
 # ---------------------------------------------------------------- fp4 packing
 
-#: e2m1fn (finite-number) magnitude LUT, low 3 bits of a nibble; bit 3 = sign.
+#: e2m1fn (finite-number, no zero) magnitude LUT, low 3 bits of a nibble;
+#: bit 3 = sign. tileRL's internal fp4 format: pack_fp4/unpack_fp4,
+#: dequant_fp4, and the linear_fp4 kernel all decode this grid. It matches
+#: the Hopper dequant+gemm SOTA kernel's decode (e=0 -> {0.5, 0.75}), so the
+#: MMA port in kernels_mma.py is a clean copy with no grid adaptation.
+_E2M1FN_LUT = torch.tensor([0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
+
+#: OCP/MX e2m1 magnitude LUT (with zero): the NVFP4 checkpoint wire format,
+#: used only by dequant_nvfp4. A different grid from _E2M1FN_LUT above —
+#: the checkpoint is OCP, tileRL's internal pack is e2m1fn.
 _E2M1_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 
 
 def pack_fp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack a bf16/f32 weight [N,K] into e2m1 nibbles + per-16-block scales.
+    """Pack a bf16/f32 weight [N,K] into e2m1fn nibbles + per-16-block scales.
 
     Returns ``(wq [N,K//2] uint8 low-nibble-first, scale [N,K//16] f32)`` with
-    ``scale = block_max / 6`` and round-to-nearest against the e2m1 LUT. The
+    ``scale = block_max / 6`` and round-to-nearest against the e2m1fn LUT. The
     max representable magnitude is 6*scale, so the block max maps exactly.
     """
     assert w.dim() == 2, f"pack_fp4 expects a 2D weight, got {tuple(w.shape)}"
@@ -228,7 +237,7 @@ def pack_fp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     block_max = blocks.abs().amax(dim=-1, keepdim=True)  # [n, k//16, 1]
     scale = (block_max / 6.0).clamp_min(1e-12)
     x = (blocks / scale).clamp(-6.0, 6.0)
-    lut = _E2M1_LUT.to(wf.device)
+    lut = _E2M1FN_LUT.to(wf.device)
     dist = (x.abs().unsqueeze(-1) - lut).abs()  # [n, k//16, 16, 8]
     idx = dist.argmin(dim=-1).to(torch.uint8)  # 0..7
     sign = (x < 0).to(torch.uint8)
@@ -244,7 +253,7 @@ def unpack_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     lo = (wq & 0xF).to(torch.uint8)
     hi = (wq >> 4).to(torch.uint8)
     nibbles = torch.stack([lo, hi], dim=-1).reshape(n, k).long()
-    lut = _E2M1_LUT.to(wq.device)
+    lut = _E2M1FN_LUT.to(wq.device)
     mag = lut[nibbles & 0x7]
     sign = 1.0 - 2.0 * (nibbles >> 3).to(torch.float32)
     vals = mag * sign  # [n, k]
