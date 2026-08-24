@@ -174,9 +174,12 @@ def cmd_bench(args: argparse.Namespace) -> None:
             if req_id in engine.poll():
                 return
 
-    # Warmup: first tilelang calls JIT-compile kernels; never time that.
+    # Warmup: first tilelang calls JIT-compile kernels; never time that. Use
+    # the same prompt_len as the timed run — JIT specializes per shape, so a
+    # shorter warmup prompt leaves the timed prefill's NVCC compile in the
+    # measurement. gen=2 compiles the decode [1,1] shapes too.
     warmup_id = engine.submit(
-        rand_ids(4),
+        rand_ids(args.prompt_len),
         engine_mod.SamplingParams(temperature=0.0, top_p=1.0, max_new_tokens=2, seed=0),
     )
     run_to_done(warmup_id, max_ticks=16)

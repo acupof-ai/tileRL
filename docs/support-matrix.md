@@ -21,27 +21,27 @@ its cell reuses the bf16 kernel set (`linear_fp4` dequantizes on the fly).
 
 | Op | cpu | sm90 | sm100 | rocm | metal |
 | --- | --- | --- | --- | --- | --- |
-| rmsnorm (fwd/bwd) | done | pending-remote | pending-remote | pending-remote | done |
-| linear (fwd/bwd) | done | pending-remote | pending-remote | pending-remote | done |
-| rope (fwd/bwd) | done | pending-remote | pending-remote | pending-remote | done |
-| attention (dense, fwd/bwd) | done | pending-remote | pending-remote | pending-remote | done |
-| paged_attention (fwd) | done | pending-remote | pending-remote | pending-remote | done |
-| linear_attn_chunk (plain scan) | done | pending-remote | pending-remote | pending-remote | done |
-| gdn_forward (full GDN layer) | done | pending-remote | pending-remote | pending-remote | done |
-| gdn_backward | done | pending-remote | pending-remote | pending-remote | done |
-| silu_mul (fwd/bwd) | done | pending-remote | pending-remote | pending-remote | done |
-| softmax | done | pending-remote | pending-remote | pending-remote | done |
-| embedding (fwd/bwd) | done | pending-remote | pending-remote | pending-remote | done |
-| sample | done | pending-remote | pending-remote | pending-remote | done |
-| add | done | pending-remote | pending-remote | pending-remote | done |
+| rmsnorm (fwd/bwd) | done | done | pending-remote | pending-remote | done |
+| linear (fwd/bwd) | done | done | pending-remote | pending-remote | done |
+| rope (fwd/bwd) | done | done | pending-remote | pending-remote | done |
+| attention (dense, fwd/bwd) | done | done | pending-remote | pending-remote | done |
+| paged_attention (fwd) | done | done | pending-remote | pending-remote | done |
+| linear_attn_chunk (plain scan) | done | done | pending-remote | pending-remote | done |
+| gdn_forward (full GDN layer) | done | done | pending-remote | pending-remote | done |
+| gdn_backward | done | done | pending-remote | pending-remote | done |
+| silu_mul (fwd/bwd) | done | done | pending-remote | pending-remote | done |
+| softmax | done | done | pending-remote | pending-remote | done |
+| embedding (fwd/bwd) | done | done | pending-remote | pending-remote | done |
+| sample | done | done | pending-remote | pending-remote | done |
+| add | done | done | pending-remote | pending-remote | done |
 
 ## fp4 (e2m1 weight format)
 
 | Op | cpu | sm90 | sm100 | rocm | metal |
 | --- | --- | --- | --- | --- | --- |
-| pack_fp4 / unpack_fp4 | done | pending-remote | pending-remote | pending-remote | done |
-| linear_fp4 (fwd) | done | pending-remote | pending-remote | pending-remote | done |
-| linear_fp4_bwd (STE) | done | pending-remote | pending-remote | pending-remote | done |
+| pack_fp4 / unpack_fp4 | done | done | pending-remote | pending-remote | done |
+| linear_fp4 (fwd) | done | done | pending-remote | pending-remote | done |
+| linear_fp4_bwd (STE) | done | done | pending-remote | pending-remote | done |
 
 The rest of the layer (attention, norms, activations) runs the bf16 path.
 
@@ -80,6 +80,16 @@ a checkpoint demands it.
     `# ponytail: per-op param migration, keep params on the backend device`
   - tilelang 0.1.13 Metal kernel-cache save is broken (`MetalKernelAdapter`
     has no `libpath`; non-fatal ERROR log) — kernels recompile per process.
-- **GPU arches (sm90/sm100/sm120/rocm)**: registry slots registered as empty
-  sets; `NotImplementedError` on use. Bring-up is pending-remote (no CUDA/ROCm
-  device in this env).
+- **sm90/bf16 + fp4**: `TILERL_TARGET=cuda uv run pytest` on an H20 (pod,
+  tilelang 0.1.13 CUDA JIT) — the same suite passes green (60 passed, 3
+  metal-only skips). The sm90 cell reuses the CPU kernel set with the naive
+  FMA gemms (CUDA's MMA lowering rejects global operands and requires tile
+  M/N divisible by 16, the same constraint Metal hit). `Backend.device`
+  pins `cuda:<current>` (`torch.device("cuda")` with no index is not the
+  device kernel outputs land on). First real-weight run: the 2-layer
+  Qwen3.6-27B NVFP4 slice forwards and trains on sm90, with CPU/CUDA
+  logits matching to 6 decimals (entry:
+  `docs/experience/wins/2026-08-24-sm90-real-slice.md`).
+- **sm100/sm120/rocm**: registry slots registered as empty sets;
+  `NotImplementedError` on use. Bring-up is pending-remote (no device in
+  this env).
