@@ -4,6 +4,21 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — default flip: paged_attention on sm90 is FlashAttention (was serial-scalar)
+
+- **Default flip.** `paged_attention` in the sm90 cell is now
+  `kernels_mma.make_paged_attention_mma` — the FlashAttention online-softmax
+  schedule ported to paged KV + GQA, bf16 IO, block_M 16 (decode) / 64
+  (prefill). The f32 serial-scalar kernel stays in kernels.py as the
+  cpu/metal floor. Kernel-level at the 27B full-attn shapes (H=24, Hkv=4,
+  D=256): decode M=1 KV=4096 37.84 → 0.456 ms (83x), prefill M=512 1056 →
+  0.062 ms (17100x). Prefill is 35% of the bf16-tensor roofline under a
+  99%-util co-tenant (within 2x idle); decode is still ~30x off the memory
+  roofline — tilelang 0.1.13 lowers the paged gather to synchronous loads
+  (ponytail: split-KV flash-decoding with pipelined gathers). Full-model
+  impact: 16 full-attn layers add ~7.3 ms/tick decode (contended), ~0.002
+  ms/tok prefill. Entry: `docs/experience/wins/2026-08-24-paged-attention-fa.md`.
+
 ## 2026-08-24 — default flip: fp8 prefill path on sm90 (e4m3 activations + fp4->e4m3 WGMMA)
 
 - **Default flip.** `linear_fp4` with M>1 on sm90 now runs fp8 WGMMA (e4m3
