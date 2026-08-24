@@ -4,6 +4,27 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-24 — phase exit: SOTA kernel round complete — 80/3800 not met, gap is kernel efficiency not physics
+
+- **Exit verdict.** Final bench on real NVFP4 slices after all levers (fp4
+  GEMV decode, fused GDN decode + chunk prefill, multi-block norm/act, graph
+  capture, fp8 prefill WGMMA, FlashAttention paged attn). Slice4 (3 GDN + 1
+  full-attn, the 27B's exact 3:1 layer mix) extrapolates to the full model
+  with no mix correction: decode 59.3 ms/tok (16.9 tok/s) vs 80 target,
+  prefill 1.02 ms/tok (976 tok/s) vs 3800 — 4.7x / 3.9x off under a 99%-util
+  co-tenant (high-contention phase: ~15 / ~487 tok/s). Roofline says the
+  targets are physics-allowed: decode roof 129 tok/s (30.9 GB at 4 TB/s,
+  target = 62% of BW roof), prefill roof 3835 tok/s mixed-dtype / 5317
+  fp8-everything — the 3800 target IS the mixed-dtype roofline at 100%
+  tensor utilization, unreachable while `load_hf` dequantizes the
+  checkpoint's FP8 GDN projections to bf16. The gap is code: bf16 M=1
+  projections at ~10-15% of BW roof (73% of decode bytes) need a bf16 GEMV
+  path; prefill needs fp8 weight retention plus in-engine fp8 GEMM efficiency
+  (16-22% of peak contended, 60-80% isolated). Contention finding: eager
+  dispatch is pathological on a shared GPU (784 us/op queue wait, 27.2 ms
+  wall vs 2.1 ms GPU sum) — graph capture is the only viable decode mode.
+  Entry: `docs/experience/wins/2026-08-24-sota-all-levers.md`.
+
 ## 2026-08-24 — default flip: paged_attention on sm90 is FlashAttention (was serial-scalar)
 
 - **Default flip.** `paged_attention` in the sm90 cell is now
