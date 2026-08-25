@@ -4,19 +4,34 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
-## 2026-08-25 — accept-or-reject: fp4 packed scales f32 -> e4m3 — ACCEPTED (native dtype, 4x less scale traffic, end-to-end neutral)
+## 2026-08-25 — phase exit: final 80/3800 bench — decode 49 / prefill 1172 tok/s, not met; gap is dequant issue throughput + GDN chunk, not physics
 
-- **Verdict.** The internal fp4 per-32-block scale changes from f32 to e4m3fn
-  bytes (uint8 view) — the checkpoint's native scale dtype. `pack_fp4` rounds
-  block_max/6 to e4m3; the three sm90 fp4 kernels + the CPU kernel decode the
-  bytes in-register (integer bit-trick, no exp2). CUDA parity 31/31 green.
-  Per-linear decode GEMV is 7-11% slower (issue-bound: the decode instructions
-  cost more than the 15% traffic savings), but slice4 decode is neutral
-  end-to-end (1.821 -> 1.841 ms/tick, Amdahl-masked — linear_fp4 is a small
-  fraction of the tick). Precision: e4m3 vs f32 scales blows rtol=1e-2 on a
-  tiny model forward (e4m3's inherent ~5% per-block precision; the real model
-  is trained with e4m3 natively). Entry:
-  `docs/experience/wins/2026-08-25-fp4-e4m3-block-scales.md`.
+- **Verdict.** Final measurement at HEAD ea8ba7f (f32 scales, grouped dequant)
+  in a fully-idle H20 window (all 8 GPUs at 0%, BW 3312). Slice4 (3 GDN + 1 FA,
+  the 27B's exact 3:1 mix), graph-captured: 1.828 ms/tick decode, 0.0557 ms/tok
+  prefill-512. Extrapolated with lm_head (0.5195 ms, 55.4% roof) and fixed cost
+  counted once: decode 20.41 ms/tok (49.0 tok/s) vs the 80 target (1.63x gap),
+  prefill 0.853 ms/tok (1172 tok/s) vs 3800 (3.2x). Rooflines: decode 162-196
+  tok/s (20.4 GB at 3.3-4.0 TB/s), prefill 5898 tok/s (25.7 TFLOP at 296
+  TFLOPS) — both targets are 41-64% of roof, physics allows them. The decode
+  gap is the fp4 GEMV dequant issue throughput (direct kernel 46% roof, lm_head
+  55% — the bf16 GEMV hits 42-116%, so the dequant is the cap); the prefill gap
+  is the GDN serial scan (27.4% of the tick, WY rejected 2.6x). Entry:
+  `docs/experience/wins/2026-08-25-gemv-instr-gdn-wy.md`.
+
+## 2026-08-25 — accept-or-reject: fp4 packed scales f32 -> e4m3 — REVERTED (5-11% decode regression, not neutral)
+
+- **Verdict.** The internal fp4 per-32-block scale changed from f32 to e4m3fn
+  bytes (uint8 view) — the checkpoint's native scale dtype, 4x less scale
+  traffic. `pack_fp4` rounds block_max/6 to e4m3; the sm90 fp4 kernels + CPU
+  kernel decode in-register (integer bit-trick, no exp2). CUDA parity 31/31
+  green. Per-linear decode GEMV is 7-11% slower (issue-bound: the decode
+  instructions cost more than the 29% traffic savings), and the regression
+  surfaces end-to-end: slice4 decode 1.828 -> 1.937 ms/tick (+6.1%, lm_head
+  alone is 28% of the wall at +11%). An earlier "neutral" measurement
+  (1.841 ms) was an anomaly, inconsistent with the per-linear data. Prefill
+  neutral (compute-bound). Reverted in ea8ba7f; the e4m3 work stays in git
+  history. Entry: `docs/experience/wins/2026-08-25-fp4-e4m3-block-scales.md`.
 
 ## 2026-08-25 — accept-or-reject: chunkwise-WY GDN prefill — REJECTED (2.6x slower than serial scan)
 

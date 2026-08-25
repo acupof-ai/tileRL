@@ -1,6 +1,6 @@
-# fp4 packed scales: f32 -> e4m3 — native dtype, 4x less scale traffic, end-to-end neutral — H20, 2026-08-25
+# fp4 packed scales: f32 -> e4m3 — native dtype, 4x less scale traffic, decode regression — REVERTED — H20, 2026-08-25
 
-> Status: Shipped
+> Status: Reverted (e4m3 is a 5-11% decode regression; f32 scales restored in ea8ba7f)
 
 ## Context
 
@@ -44,12 +44,16 @@ issue-bound decode GEMV more than the traffic savings help.
   (33%->22%, 55%->35%) partly because the roof itself is tighter (0.53125 vs
   0.625 bytes/elem).
 
-- **End-to-end is NEUTRAL (the per-linear regression is Amdahl-masked).**
-  Slice4 graph-captured decode (30-tick avg, idle pod): f32 1.821 ms/tick
-  (549 tok/s) vs e4m3 1.841 ms/tick (543 tok/s) — +1.1%, noise. Slice4
-  prefill-512: 0.0557 vs 0.0556 ms/tok. The fp4 linears are a small fraction
-  of the tick (GDN/attention dominate), so the 7-11% GEMV regression does not
-  surface end-to-end.
+- **End-to-end is a +6% decode regression, NOT neutral.** Slice4 graph-captured
+  decode (30-tick avg, fully-idle pod, all 8 GPUs at 0%, BW 3312): f32 1.828
+  ms/tick (547 tok/s) vs e4m3 1.937-1.945 ms/tick (514-516 tok/s) — +6.1%.
+  The lm_head alone (+11%, 0.5195 -> 0.5765 ms) is 28% of the slice4 wall and
+  contributes +3.1%; the per-layer GEMVs (+7-11% direct) contribute the rest.
+  The earlier "1.821 -> 1.841, neutral" measurement was an anomaly — it is
+  inconsistent with the per-linear regression above (lm_head +11% alone forces
+  >= +3% on the wall). Slice4 prefill-512: 0.0557 vs 0.0565 ms/tok (neutral,
+  prefill is compute-bound). Reverted in ea8ba7f; the e4m3 work stays in git
+  history if a memory-bound config appears.
 
 - **Precision (e4m3 vs the old f32 scales) BLOWS rtol=1e-2 on a tiny model
   forward** — reported, not silently loosened. Per-linear scale rel err
@@ -66,26 +70,27 @@ issue-bound decode GEMV more than the traffic savings help.
 
 e4m3 block scales are the checkpoint's native dtype and cut scale traffic 4x,
 but they trade issue for traffic: the in-register decode adds instructions
-that cost 7-11% on an issue-bound decode GEMV. Ship it when the kernel is
-memory-bound (prefill MMA) or when weight traffic/storage is the bottleneck;
-on an issue-bound decode GEMV the traffic savings don't repay the decode
-instructions, though the regression can be Amdahl-masked end-to-end. The
-bit-trick decode (integer reinterpret, no exp2) is mandatory — the exp2
-version is 2x worse. e4m3's ~5% per-block scale precision is inherent; don't
-compare against f32 scales as if they were the precision target (the
-checkpoint's native format is e4m3).
+that cost 7-11% on an issue-bound decode GEMV, and the regression surfaces
+end-to-end (+6% on slice4 decode — lm_head alone is 28% of the wall and forces
+>= +3%). Do NOT ship e4m3 scales on the decode GEMV while it is
+issue-throughput-bound; the f32 scale (one direct load per micro-tile) is
+faster. The bit-trick decode (integer reinterpret, no exp2) is mandatory if
+e4m3 is ever revisited — the exp2 version is 2x worse. e4m3's ~5% per-block
+scale precision is inherent; don't compare against f32 scales as if they were
+the precision target (the checkpoint's native format is e4m3).
 
 ## Results
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tick | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
-| 2026-08-25 | 306a8bf (f32 scales) | H20 | cuda/sm90 | 27B slice4 (3 GDN + 1 FA) | 0.0557 | 1.821 (wall) | 549 decode |
-| 2026-08-25 | 6548450 (e4m3 scales) | H20 | cuda/sm90 | 27B slice4 (3 GDN + 1 FA) | 0.0556 | 1.841 (wall) | 543 decode |
+| 2026-08-25 | 306a8bf (f32 scales) | H20 idle | cuda/sm90 | 27B slice4 (3 GDN + 1 FA) | 0.0557 | 1.828 (wall) | 547 decode |
+| 2026-08-25 | 6548450 (e4m3 scales) | H20 idle | cuda/sm90 | 27B slice4 (3 GDN + 1 FA) | 0.0565 | 1.937 (wall) | 516 decode |
 
 Decode ms/tick is the graph-captured per-tick wall (30-tick avg,
-`scripts/profile_slice.py --decode-graph`), both arms on the idle pod
-(BW 3308 GB/s). Per-linear GEMV numbers above are direct-kernel (no backend
-overhead) from `scripts/bench_fp4_gemv.py`.
+`scripts/profile_slice.py --decode-graph`), both arms in the same fully-idle
+window (all 8 GPUs at 0%, BW 3312 GB/s). Per-linear GEMV numbers above are
+direct-kernel (no backend overhead) from `scripts/bench_fp4_gemv.py`. The e4m3
+arm is +6.1% on decode (regression); reverted in ea8ba7f.
 
 Raw artifacts: pod `/work/gemv_roof_f32_clean.log` (f32 per-linear),
 `/work/gemv_roof_e4m3_bittrick.log` (e4m3 per-linear),
