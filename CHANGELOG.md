@@ -4,6 +4,20 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: fp4 packed scales f32 -> e4m3 — ACCEPTED (native dtype, 4x less scale traffic, end-to-end neutral)
+
+- **Verdict.** The internal fp4 per-32-block scale changes from f32 to e4m3fn
+  bytes (uint8 view) — the checkpoint's native scale dtype. `pack_fp4` rounds
+  block_max/6 to e4m3; the three sm90 fp4 kernels + the CPU kernel decode the
+  bytes in-register (integer bit-trick, no exp2). CUDA parity 31/31 green.
+  Per-linear decode GEMV is 7-11% slower (issue-bound: the decode instructions
+  cost more than the 15% traffic savings), but slice4 decode is neutral
+  end-to-end (1.821 -> 1.841 ms/tick, Amdahl-masked — linear_fp4 is a small
+  fraction of the tick). Precision: e4m3 vs f32 scales blows rtol=1e-2 on a
+  tiny model forward (e4m3's inherent ~5% per-block precision; the real model
+  is trained with e4m3 natively). Entry:
+  `docs/experience/wins/2026-08-25-fp4-e4m3-block-scales.md`.
+
 ## 2026-08-25 — accept-or-reject: chunkwise-WY GDN prefill — REJECTED (2.6x slower than serial scan)
 
 - **Verdict.** Ported the tilelang branch's chunkwise-WY prefill pair
