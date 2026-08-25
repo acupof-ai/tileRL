@@ -155,8 +155,9 @@ def fp4_param_keys(cfg: ModelConfig) -> set[str]:
 class Model:
     """Qwen3.5/3.6 hybrid model. ``params`` maps :func:`param_specs` keys to
     bf16 tensors; fp4 linears also carry ``<key>.wq`` (uint8) and
-    ``<key>.scale`` (f32) alongside the bf16 master, and native-fp8 linears
-    carry ``<key>.w8`` (e4m3) and ``<key>.wscale`` (f32 per-128-block)."""
+    ``<key>.scale`` (uint8 e4m3fn bytes, per-32-block) alongside the bf16
+    master, and native-fp8 linears carry ``<key>.w8`` (e4m3) and
+    ``<key>.wscale`` (f32 per-128-block)."""
 
     def __init__(self, cfg: ModelConfig, params: dict[str, torch.Tensor]):
         self.cfg = cfg
