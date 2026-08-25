@@ -33,8 +33,11 @@ path of linear/linear_bwd/linear_fp4 zero-pads tails so the kernel always
 sees exact tiles (decode M=1 pads to 16; all model N/K dims are already
 multiples of 32). ``Backend.device`` pins ``cuda:<current>`` — ``torch.device("cuda")``
 (index None) is not the device kernel outputs land on. Eager JIT invokes
-NVCC per (shape, dtype): first call per shape costs 30-120s+.
-# ponytail: shape cache / AOT before 27B serving
+NVCC per (shape, dtype): first call per shape costs 30-120s+, but tilelang
+caches the compiled artifact on disk (``~/.tilelang/cache``, override with
+``TILELANG_CACHE_DIR``) — a warm second-process call is ~0.2s (verified
+2026-08-25). On the pod, point the cache at a persistent path (/work) or
+every container restart re-pays the NVCC builds.
 """
 
 from __future__ import annotations
