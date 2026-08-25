@@ -105,7 +105,7 @@ def bench_shapes(backend, model, cfg, bw_gbs: float) -> None:
         mma_ms = _time_calls(lambda: backend.linear_fp4(x, wq, scale), 50)
         _set_gemv(True)
 
-        bytes_ = N * K * 0.5 + N * K // 32 + 2 * K  # WQ + e4m3 scale + bf16 X
+        bytes_ = N * K * 0.75 + 2 * K  # bf16 X
         roof_ms = bytes_ / (bw_gbs * 1e9) * 1e3
         print(
             f"  {f'{N},{K}':<22} {bytes_ / 2**20:>9.2f} {roof_ms:>8.4f} {gemv_ms:>9.4f} "

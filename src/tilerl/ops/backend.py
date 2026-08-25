@@ -403,10 +403,7 @@ class Backend:
         # ``master`` is recording-only (the STE grad lands on it); the kernel
         # uses wq/scale. sm90 kernels are bf16-IO; CPU/metal kernels are f32.
         wq = self._dev(wq, wq.dtype)  # uint8: device migration only
-        # scale is e4m3 bytes (uint8): migrate, never cast — the kernels
-        # decode the e4m3 bit pattern in-register (zero byte = 0.0, so the
-        # zero-padded K-tail still kills padded WQ bytes).
-        scale = self._dev(scale, scale.dtype)
+        scale = self._f32(scale)
         io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
         x = self._dev(x, io)
         lead = x.shape[:-1]
