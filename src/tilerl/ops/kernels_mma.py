@@ -199,6 +199,15 @@ def _dequant_fp4_macro(out_dtype, local_size):
 #: pads K to a multiple of this on CUDA.
 _FP4_BLOCK_K = 64
 
+#: N-tile for the fp4 fp8 prefill path. 64 (not the caller's 128): the 128
+#: tile left the small-N grids (down/out, N=5120 -> 40 N-tiles) under 1 wave,
+#: so the dequant and WGMMA phases aligned across resident blocks and the
+#: tensor cores idled. 64 doubles the N-tile count (2+ waves on every prefill
+#: shape) for +33% geo-mean TFLOP/s (sweep 2026-08-25,
+#: scripts/_sweep_fp8_prefill.py). The caller still pads N to a multiple of
+#: 128, which is a multiple of 64.
+_FP4_BLOCK_N = 64
+
 
 def make_linear_fp4_mma(target: str):
     """Fused e2m1fn dequant + matmul (sm90 MMA), bf16-IO.
@@ -624,6 +633,9 @@ def make_linear_fp4_fp8_mma(target: str):
     )
     def linear_fp4_fp8(XQ, WQ, WScale, AScale, block_M, block_N, threads):
         threads = 128 if block_M >= 32 else threads
+        block_N = _FP4_BLOCK_N  # 64-tile: doubles the N-grid vs the caller's
+        # 128, putting every prefill shape at 2+ waves (the dequant/WGMMA
+        # phases no longer align across resident blocks). See _FP4_BLOCK_N.
         M, N, K = T.const("M, N, K")
         XQ: T.Tensor((M, K), "float8_e4m3fn")
         WQ: T.Tensor((N, K // 2), "uint8")

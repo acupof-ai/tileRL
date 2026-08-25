@@ -4,6 +4,23 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: fp8 prefill GEMM N-tile sweep — v_n64 ACCEPTED (+33% geo-mean), v_int32/v_ws/v_sota/v_m64 REJECTED
+
+- **Verdict.** The fp4->e4m3 dequant + fp8 WGMMA prefill kernel
+  (`make_linear_fp4_fp8_mma`) was neutral vs bf16 at large K (down 1.03x,
+  out 1.01x) because the 128 N-tile left small-N grids under 1 wave, so the
+  dequant and WGMMA phases aligned across resident blocks and the tensor
+  cores idled. Sweep of 6 variants (`scripts/_sweep_fp8_prefill.py`, idle
+  H20): N-tile 128->64 doubles the grid (2+ waves on every shape) for +33%
+  geo-mean TFLOP/s with exact parity (rel-base 0.00). Shipped kernel via
+  `backend.linear_fp4`: gate/up 175.8->209.5, down 113.8->157.5, qkv
+  143.4->183.4, z 127.3->175.0, out 103.8->150.5 TFLOP/s; the down/out
+  shapes that were neutral vs bf16 are now 1.40-1.42x. Rejected: v_int32
+  (block_K=32 + accumulator scaling, 2x slower), v_ws (warp spec on,
+  slower), v_sota (256x128 tile, slower), v_m64 (block_M=64, neutral).
+  v_n64_split2 (+8% more, needs a zeroed-output wrapper) is the follow-up.
+  Entry: `docs/experience/wins/2026-08-25-fp8-prefill-n64-tile.md`.
+
 ## 2026-08-25 — phase exit: engine scheduler → SOTA continuous batching with chunked prefill (mixed prefill+decode forwards)
 
 - **Shipped.** Replaced the serial decode-first scheduler with vLLM/sglang
