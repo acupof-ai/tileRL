@@ -38,7 +38,7 @@ write is dead traffic — ~1.6 GB/layer at prefill-512 in this kernel.
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tick | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
-| 2026-08-25 | 7d750d7 | H20 pod | cuda/sm90 | Qwen3.6-27B NVFP4 slice4, GDN chunk kernel, T=512 | 1.699 (kernel) | — | — |
+| 2026-08-25 | 01bfa76 | H20 pod | cuda/sm90 | Qwen3.6-27B NVFP4 slice4, GDN chunk kernel, T=512 | 1.699 (kernel) | — | — |
 
 Raw artifacts: one-shot A/B `scripts/bench_gdn_writeback.py` (deleted after
 verdict; numbers above are the record).
