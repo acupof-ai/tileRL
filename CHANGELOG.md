@@ -4,6 +4,16 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: dual-format fp8 weights for prefill — REJECTED (fp8 MMA already wired)
+
+- **Verdict.** Proposed packing an e4m3 copy of every fp4 projection so
+  prefill could use fp8 tensor cores. Killed by one bench: `backend.py:431`
+  already routes `linear_fp4` through `make_linear_fp4_fp8_mma` on CUDA M>1 —
+  prefill already computes on fp8 (176 TFLOP/s on gate/up, 1.46x over the
+  bf16 fallback). The prefill gap is kernel efficiency, not format: the fp8
+  MMA sits at 59% of peak and goes neutral at large K (down/out ~1.03x).
+  Entry: `docs/experience/errors/2026-08-25-dual-format-fp8-rejected.md`.
+
 ## 2026-08-25 — default flip: serving fuses same-input fp4 projections (qkv/ab/gate_up) — decode +4.8%
 
 - **Flip.** `cmd_serve` now loads with `fuse_projections=True`: same-input
