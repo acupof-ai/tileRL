@@ -51,7 +51,10 @@ def main() -> None:
     )
 
     gen = torch.Generator().manual_seed(7)
-    print(f"\n=== decode throughput vs batch (slice {args.layers} layers, eager) ===")
+    print(
+        f"\n=== decode throughput vs batch "
+        f"(slice {args.layers} layers, {'graph' if args.decode_graph else 'eager'}) ==="
+    )
     print(f"  {'B':>3} {'ms/tick':>9} {'per-request tok/s':>18} {'aggregate tok/s':>17}")
     for B in (int(x) for x in args.batches.split(",")):
         prompts = [
