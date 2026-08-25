@@ -4,6 +4,17 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: fp4 GEMV grouped dequant — direct-call 42% -> 46% roof, slice4 decode 1.887 -> 1.837 ms/tick
+
+- **Verdict.** The dequant is grouped 4 micro-tiles at a time: load 4, decode
+  all 4 (32 shuffles), then FMA all 4 — hoisting every shuffle off the FMA
+  critical path so its latency hides behind the FMA dependency chain.
+  Direct-call roofline +9.5-10.9% on both shape orientations (42.0 -> 46.0%,
+  38.5 -> 42.7%); slice4 decode 1.887 -> 1.837 ms/tick (530 -> 545 tok/s).
+  Rejected: register double-buffer (spills, 22%), 6-op bitcast (32%), 256-entry
+  byte-LUT (26%, gather loads), no-X-buffer (19%), 2 accumulators (no help).
+  Entry: `docs/experience/wins/2026-08-25-fp4-gemv-grouped-dequant.md`.
+
 ## 2026-08-25 — accept-or-reject: fp4 GEMV vectorized dequant — slice4 decode 6.94 -> 1.89 ms/tick (3.67x), big projections 24-33% -> 30-54% roof
 
 - **Verdict.** The fp4 GEMV dequant (the gap named in the 80/3800 verdict

@@ -286,15 +286,18 @@ def make_linear_fp4_gemv(target: str):
     K-slice of block_K = reduce_thread * micro_size_k elems; partials reduce
     across the warp. Roofline = (N*K*0.75 + 2K) bytes / HBM BW.
 
-    The dequant is structured to stay off the FMA critical path (the gap to
-    the bf16 GEMV's 42-116% roof — see
-    docs/experience/wins/2026-08-25-bf16-gemv-decode.md): the per-32 scale is
-    applied once per micro-tile to the partial sum (``acc += s * sum(X*w)``,
-    1 FP op/elem — not the 2-op X*w*s chain), and the e2m1fn grid is a
+    The dequant is grouped 4 tiles at a time (GROUP=4): load 4 micro-tiles,
+    decode all 4 (32 shuffles), then FMA all 4. Issuing every shuffle before
+    its FMA hides the shuffle latency behind the FMA dependency chain — the
+    flat per-tile decode (shuffle->FMA back-to-back) stalled each FMA on its
+    shuffle. The grouped buffers are T.unroll(GROUP)-indexed (compile-time
+    constant -> registers; a runtime %2 ping-pong spills to local memory).
+    The per-32 scale is applied once per micro-tile to the partial sum
+    (``acc += s * sum(X*w)``, 1 FP op/elem), and the e2m1fn grid is a
     16-entry warp-shuffle LUT (1 shuffle/elem, built once per thread via the
-    integer bitcast). The kernel is issue-throughput-bound; the sweep
-    (scripts/_sweep_gemv.py) showed 2 accumulators and wider micro-tiles do
-    not help — the shuffle LUT at micro_size_k=8 is the floor.
+    integer bitcast). Sweeps (scripts/_sweep_gemv*.py): group4 = 45% roof vs
+    flat 42%; 2 accumulators, micro=16/32, shared-X/LUT, byte-LUT, 6-op
+    bitcast, and register double-buffer all tested worse.
 
     # SOTA copy: examples/dequantize_gemm/example_dequant_gemv_fp16xint4.py
     #   @ tilelang main (dequantize_gemv, split-K + tvm_thread_allreduce path)
@@ -310,12 +313,15 @@ def make_linear_fp4_gemv(target: str):
     # Constraint: reduce_thread must be <= 32 (the LUT is per-warp via
     #   tvm_warp_shuffle); the backend hardcodes 32.
     """
+    GROUP = 4  # micro-tiles per dequant group (shuffle latency hiding)
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def linear_fp4_gemv(X, WQ, Scale, reduce_thread, n_partition):
         N, K = T.const("N, K")
         micro_size_k = 8  # 128-bit transaction / 16-bit bf16
         block_K = reduce_thread * micro_size_k
+        num_ko = T.ceildiv(K, block_K)
+        num_g = num_ko // GROUP
         X: T.Tensor((1, K), "bfloat16")
         WQ: T.Tensor((N, K // 2), "uint8")
         Scale: T.Tensor((N, K // 32), "float32")
@@ -324,8 +330,9 @@ def make_linear_fp4_gemv(target: str):
             kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
             ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
             n = bx * n_partition + ni
-            X_local = T.alloc_local((micro_size_k,), "bfloat16")
-            WQ_local = T.alloc_local((micro_size_k // 2,), "uint8")
+            Xs = T.alloc_local((GROUP, micro_size_k), "bfloat16")
+            Ws = T.alloc_local((GROUP, micro_size_k // 2), "uint8")
+            ws = T.alloc_local((GROUP, micro_size_k), "float32")
             acc = T.alloc_local((1,), "float32")
             partial = T.alloc_local((1,), "float32")
             reduced = T.alloc_local((1,), "float32")
@@ -333,19 +340,43 @@ def make_linear_fp4_gemv(target: str):
             # integer bitcast (no exp2). Each nibble is 1 shuffle.
             lut = _e2m1fn_fp32(kr & 15)
             acc[0] = 0.0
-            for ko in T.serial(T.ceildiv(K, block_K)):
-                base = ko * block_K + kr * micro_size_k
+            for kg in T.serial(num_g):
+                for g in T.unroll(GROUP):
+                    base = (kg * GROUP + g) * block_K + kr * micro_size_k
+                    for v in T.vectorized(micro_size_k):
+                        Xs[g, v] = X[0, base + v]
+                    for v in T.vectorized(micro_size_k // 2):
+                        Ws[g, v] = WQ[n, base // 2 + v]
+                # decode all GROUP tiles before any FMA: the 32 shuffles
+                # issue back-to-back, hiding their latency behind the FMA
+                # dependency chain below.
+                for g in T.unroll(GROUP):
+                    for ki in T.unroll(micro_size_k):
+                        byte = Ws[g, ki // 2]
+                        nib = (byte >> ((ki % 2) * 4)) & 15
+                        ws[g, ki] = T.tvm_warp_shuffle(
+                            0xFFFFFFFF, lut, T.cast(nib, "int32"), 32, 32
+                        )
+                for g in T.unroll(GROUP):
+                    base = (kg * GROUP + g) * block_K + kr * micro_size_k
+                    partial[0] = 0.0
+                    for ki in T.unroll(micro_size_k):
+                        partial[0] += T.cast(Xs[g, ki], "float32") * ws[g, ki]
+                    # one scale per micro-tile: 8 elems never cross a 32-block
+                    acc[0] += Scale[n, base // 32] * partial[0]
+            # K-tail (num_ko % GROUP tiles), flat, reusing buffer slot 0
+            for kt in T.serial(num_ko - num_g * GROUP):
+                base = (num_g * GROUP + kt) * block_K + kr * micro_size_k
                 for v in T.vectorized(micro_size_k):
-                    X_local[v] = X[0, base + v]
+                    Xs[0, v] = X[0, base + v]
                 for v in T.vectorized(micro_size_k // 2):
-                    WQ_local[v] = WQ[n, base // 2 + v]
+                    Ws[0, v] = WQ[n, base // 2 + v]
                 partial[0] = 0.0
-                for ki in T.serial(micro_size_k):
-                    byte = WQ_local[ki // 2]
+                for ki in T.unroll(micro_size_k):
+                    byte = Ws[0, ki // 2]
                     nib = (byte >> ((ki % 2) * 4)) & 15
                     w = T.tvm_warp_shuffle(0xFFFFFFFF, lut, T.cast(nib, "int32"), 32, 32)
-                    partial[0] += T.cast(X_local[ki], "float32") * w
-                # one scale per micro-tile: 8 elems never cross a 32-block
+                    partial[0] += T.cast(Xs[0, ki], "float32") * w
                 acc[0] += Scale[n, base // 32] * partial[0]
             with T.attr(
                 T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
