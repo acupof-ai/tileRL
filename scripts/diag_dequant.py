@@ -52,7 +52,9 @@ def old_linear_fp4_fp8_mma(target: str):
                     byte = WQ_shared[i, j // 2]
                     nib = (byte >> ((j % 2) * 4)) & 15
                     ni32 = T.cast(nib, "int32")
-                    bits = ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
+                    bits = (
+                        ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
+                    )
                     w = T.reinterpret(bits, "float32")
                     W_shared[i, j] = T.cast(
                         w * WScale[bx * block_N + i, (k * _BLOCK_K + j) // 32],
