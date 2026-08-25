@@ -1058,12 +1058,13 @@ def make_gdn_chunk_fused(target: str):
                         cv[0] += T.cast(Window[bb, t + tap, vc], "float32") * ConvW[vc, tap]
                     else:
                         cq[0] += T.cast(Q[bb, t + tap - (KER - 1), qc], "float32") * ConvW[qc, tap]
-                        ck[0] += T.cast(
-                            Key[bb, t + tap - (KER - 1), qc], "float32"
-                        ) * ConvW[kc, tap]
-                        cv[0] += T.cast(
-                            Val[bb, t + tap - (KER - 1), vh * V + tv], "float32"
-                        ) * ConvW[vc, tap]
+                        ck[0] += (
+                            T.cast(Key[bb, t + tap - (KER - 1), qc], "float32") * ConvW[kc, tap]
+                        )
+                        cv[0] += (
+                            T.cast(Val[bb, t + tap - (KER - 1), vh * V + tv], "float32")
+                            * ConvW[vc, tap]
+                        )
                 q_s[tv] = cq[0] * T.sigmoid(cq[0])
                 k_s[tv] = ck[0] * T.sigmoid(ck[0])
                 v_s[tv] = cv[0] * T.sigmoid(cv[0])
