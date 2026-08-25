@@ -163,14 +163,15 @@ def linear_bwd(
 
 def dequant_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequantize e2m1fn-packed weights. wq uint8 [N, K//2] (low nibble first),
-    scale f32 [N, K//32]. Returns w [N, K] f32.
+    scale uint8 [N, K//32] (e4m3fn bytes, tileRL's packed scale format).
+    Returns w [N, K] f32.
 
     e2m1fn magnitudes: e=0 -> {0.5, 0.75}, e=1 -> {1, 1.5}, e=2 -> {2, 3},
     e=3 -> {4, 6}; sign bit is bit 3.
     """
     assert wq.dtype == torch.uint8
     n, k2 = wq.shape
-    scale = _f32(scale)
+    scale = _e4m3_f32(scale)
     lo = wq & 0x0F
     hi = (wq >> 4) & 0x0F
 
@@ -224,14 +225,23 @@ _E2M1FN_LUT = torch.tensor([0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torc
 _E2M1_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 
 
+def _e4m3_f32(scale: torch.Tensor) -> torch.Tensor:
+    """Decode tileRL's packed fp4 block scale: uint8 bytes holding e4m3fn
+    bits -> f32. The kernels decode the same bit pattern in-register
+    (kernels.py _e4m3_fp32); this is the torch-side mirror."""
+    return scale.view(torch.float8_e4m3fn).float()
+
+
 def pack_fp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack a bf16/f32 weight [N,K] into e2m1fn nibbles + per-32-block scales.
 
-    Returns ``(wq [N,K//2] uint8 low-nibble-first, scale [N,K//32] f32)`` with
-    ``scale = block_max / 6`` and round-to-nearest against the e2m1fn LUT. The
-    max representable magnitude is 6*scale, so the block max maps exactly.
-    Block 32 matches the fp8 WGMMA K-tile (sm90), so the fp8 prefill path can
-    apply one scale per MMA tile in f32 (no e4m3 weight requant).
+    Returns ``(wq [N,K//2] uint8 low-nibble-first, scale [N,K//32] uint8
+    e4m3fn bytes)`` with ``scale = block_max / 6`` (rounded to e4m3) and
+    round-to-nearest against the e2m1fn LUT. The max representable magnitude
+    is 6*scale, so the block max maps exactly. Block 32 matches the fp8 WGMMA
+    K-tile (sm90), so the fp8 prefill path can apply one scale per MMA tile
+    (no e4m3 weight requant). e4m3 scales are the checkpoint's native scale
+    dtype: 4x less scale traffic than f32 (~15% of decode weight traffic).
     """
     assert w.dim() == 2, f"pack_fp4 expects a 2D weight, got {tuple(w.shape)}"
     n, k = w.shape
@@ -247,7 +257,8 @@ def pack_fp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     sign = (x < 0).to(torch.uint8)
     nibbles = (idx | (sign << 3)).reshape(n, k)
     wq = nibbles[:, 0::2] | (nibbles[:, 1::2] << 4)
-    return wq.contiguous(), scale.squeeze(-1).contiguous()
+    scale_e4m3 = scale.squeeze(-1).to(torch.float8_e4m3fn).view(torch.uint8)
+    return wq.contiguous(), scale_e4m3.contiguous()
 
 
 def unpack_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -261,7 +272,7 @@ def unpack_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     mag = lut[nibbles & 0x7]
     sign = 1.0 - 2.0 * (nibbles >> 3).to(torch.float32)
     vals = mag * sign  # [n, k]
-    out = vals.reshape(n, k // 32, 32) * scale.unsqueeze(-1)
+    out = vals.reshape(n, k // 32, 32) * _e4m3_f32(scale).unsqueeze(-1)
     return out.reshape(n, k).to(torch.bfloat16)
 
 

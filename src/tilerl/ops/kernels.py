@@ -456,11 +456,25 @@ def make_embedding(target: str):
 # ---------------------------------------------------------------- linear fp4
 
 
+def _e4m3_fp32(b):
+    """e4m3fn byte -> fp32 via the standard bit pattern (sign|exp4|mant3,
+    bias 7): subnormal (e=0) m*2^-9, normal 2^(e-7)*(1+m/8). The in-kernel
+    mirror of reference._e4m3_f32 (uint8 scale bytes -> f32)."""
+    i = T.cast(b, "int32")
+    sign = 1.0 - 2.0 * T.cast((i >> 7) & 1, "float32")
+    e = (i >> 3) & 15
+    m = T.cast(i & 7, "float32")
+    sub = m / 512.0
+    nor = T.exp2(T.cast(e, "float32") - 7.0) * (1.0 + m * 0.125)
+    return sign * T.if_then_else(e == 0, sub, nor)
+
+
 def make_linear_fp4(target: str):
     """Fused e2m1 dequant + matmul.
 
-    X [M, K] f32, WQ uint8 [N, K//2] (low nibble first), Scale [N, K//32] f32.
-    Y[m, n] = sum_k X[m, k] * e2m1(WQ[n, k//2] nibble k%2) * Scale[n, k//32].
+    X [M, K] f32, WQ uint8 [N, K//2] (low nibble first), Scale uint8 [N, K//32]
+    (e4m3fn bytes). Y[m, n] = sum_k X[m, k] * e2m1(WQ[n, k//2] nibble k%2)
+    * e4m3(Scale[n, k//32]).
 
     # ponytail: dequant-in-kernel scalar decode, native fp4 tensor cores day-2
     """
@@ -470,7 +484,7 @@ def make_linear_fp4(target: str):
         M, N, K = T.const("M, N, K")
         X: T.Tensor((M, K), "float32")
         WQ: T.Tensor((N, K // 2), "uint8")
-        Scale: T.Tensor((N, K // 32), "float32")
+        Scale: T.Tensor((N, K // 32), "uint8")
         Y = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             Cc = T.alloc_shared((block_M, block_N), "float32")
@@ -482,6 +496,7 @@ def make_linear_fp4(target: str):
                 acc = T.alloc_fragment((1,), "float32")
                 acc[0] = 0.0
                 for k0 in T.serial(K // 32):
+                    s = _e4m3_fp32(Scale[bx * block_N + j, k0])
                     for kk in range(32):
                         k = k0 * 32 + kk
                         byte = WQ[bx * block_N + j, k // 2]
@@ -492,11 +507,7 @@ def make_linear_fp4(target: str):
                         mag = (
                             0.5 * T.exp2(T.cast(e, "float32")) * (1.0 + T.cast(m, "float32") * 0.5)
                         )
-                        w = (
-                            T.cast(1 - 2 * T.cast(sign, "int32"), "float32")
-                            * mag
-                            * Scale[bx * block_N + j, k0]
-                        )
+                        w = T.cast(1 - 2 * T.cast(sign, "int32"), "float32") * mag * s
                         acc[0] += X[by * block_M + i, k] * w
                 Cc[i, j] = acc[0]
             T.copy(
