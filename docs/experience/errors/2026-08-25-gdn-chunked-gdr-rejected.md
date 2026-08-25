@@ -62,16 +62,15 @@ Reverted the chunked pipeline as the default for both paths:
 - **6-arg scan**: removed the wiring in `linear_attn_chunk`. The portable
   serial kernel is the default for all shapes/arches.
 
-Kept:
-
-- The 6 GDR kernels (`make_gdr_*`) and `_gdr_chunk_scan` — verified SOTA
-  code (parity green at scale=0.1), registered in the sm90 kernel cell,
-  available for future shapes/models where the serial kernel is
-  memory-bound or parallelism-starved (few heads, state > L2).
-- `test_gdr_chunk_scan_parity` — calls `_gdr_chunk_scan` directly, keeping
-  the kernels verified.
-- The `a_inv.zero_()` fix, the `test_gdn_chunk_matches_decode` SeqQLens
-  fix, and the fla chunk-delta-rule docstring correction.
+Removed after rejection: the 6 GDR kernels, `_gdr_chunk_scan`, and their
+parity test. The keep condition above (state > L2 or few heads) is
+unreachable for Qwen3.8-27B (48 heads, 3MB state, any T), and at model
+scale the bf16 intermediates fail parity — the code could not be
+dispatched without an f32 rework first. Re-port from agent-infer's
+`crates/cuda-kernels/tools/tilelang/gated_delta_rule.py` if a model with
+state > L2 appears. Kept: the `a_inv.zero_()` insight (above), the
+`test_gdn_chunk_matches_decode` SeqQLens fix, and the fla chunk-delta-rule
+docstring correction.
 
 ## Rule
 

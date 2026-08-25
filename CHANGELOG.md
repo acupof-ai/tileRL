@@ -15,9 +15,10 @@ verdict**. Newest first.
   kernel is compute-bound with state in L2, so the chunked pipeline's extra
   FMAs cost more than the state-traffic savings; bf16 intermediates between
   pipeline stages lose precision at realistic input scales. Reverted both
-  wirings (serial is the default again); kept the GDR kernels (verified
-  SOTA, available for memory-bound/parallelism-starved shapes), the
-  `a_inv.zero_()` bug fix, and the test/docstring fixes. Entry:
+  wirings (serial is the default again); removed the GDR kernels after
+  rejection (keep condition — state > L2 or few heads — unreachable for
+  Qwen3.8; re-port from agent-infer if a state>L2 model appears); kept the
+  test/docstring fixes. Entry:
   `docs/experience/errors/2026-08-25-gdn-chunked-gdr-rejected.md`.
 
 ## 2026-08-25 — accept-or-reject: GDN chunk NewState write hoisted out of the token loop — ACCEPTED (14.8% kernel, 1.993 -> 1.699 ms)

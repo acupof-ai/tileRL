@@ -166,12 +166,6 @@ _SM90_KERNELS = {
     "write_tokens": kernels_mma.make_write_tokens,
     "gdn_decode_fused": kernels_mma.make_gdn_decode_fused,
     "gdn_chunk_fused": kernels_mma.make_gdn_chunk_fused,
-    "gdr_cumsum": kernels_mma.make_gdr_cumsum,
-    "gdr_kkt": kernels_mma.make_gdr_kkt,
-    "gdr_solve": kernels_mma.make_gdr_solve,
-    "gdr_recompute": kernels_mma.make_gdr_recompute,
-    "gdr_state": kernels_mma.make_gdr_state,
-    "gdr_o": kernels_mma.make_gdr_o,
     "paged_attention": kernels_mma.make_paged_attention_mma,
 }
 _register("bf16", "sm90", _SM90_KERNELS)
@@ -740,50 +734,6 @@ class Backend:
             threads=state.shape[-1],
         )
         return out, new_state, (self._f32(new_window) if has_window else None)
-
-    def _gdr_chunk_scan(self, q, k, v, g, beta, state):
-        """6-arg chunked GDR scan (sm90, K=V=128): the FlashQLA chunk-WY
-        pipeline (make_gdr_*) replacing the serial per-column scan.
-
-        q,k,v [B,T,H,D] (bf16 at the boundary), g/beta [B,T,H] f32 (g already
-        exponentiated), state [B,H,D,D] f32. The (B,H) heads flatten to BH —
-        each (b,h) is an independent scan. Returns (out [B,T,H,D] f32,
-        new_state [B,H,D,D] f32, None). Six caller-allocated stages chained:
-        cumsum -> kkt -> solve -> recompute -> state -> o."""
-        b, t, h, d = q.shape
-        bh = b * h
-        nc = (t + 63) // 64
-        dev = self.device
-        thr = 128
-        # [B,T,H,D] -> [T,BH,D]; [B,T,H] -> [T,BH]; [B,H,D,D] -> [BH,D,D]
-        qf = self._c(self._bf16(q)).transpose(0, 1).reshape(t, bh, d)
-        kf = self._c(self._bf16(k)).transpose(0, 1).reshape(t, bh, d)
-        vf = self._c(self._bf16(v)).transpose(0, 1).reshape(t, bh, d)
-        gf = self._c(self._f32(g)).transpose(0, 1).reshape(t, bh)
-        bf = self._c(self._f32(beta)).transpose(0, 1).reshape(t, bh)
-        s0 = self._c(self._f32(state)).reshape(bh, d, d)
-        gc = torch.empty(t, bh, dtype=torch.float32, device=dev)
-        a_tril = torch.empty(t, bh, 64, dtype=torch.float32, device=dev)
-        a_inv = torch.empty(t, bh, 64, dtype=torch.bfloat16, device=dev)
-        # gdr_solve writes only the 10 lower+diagonal blocks of the inverse;
-        # the 6 upper off-diagonal blocks are zero (inverse of lower-triangular
-        # is lower-triangular) but never written. Zero first so a reused buffer
-        # doesn't leak stale values into recompute's GEMM.
-        a_inv.zero_()
-        w = torch.empty(t, bh, d, dtype=torch.bfloat16, device=dev)
-        u = torch.empty(t, bh, d, dtype=torch.bfloat16, device=dev)
-        chunk_state = torch.empty(nc, bh, d, d, dtype=torch.float32, device=dev)
-        v_new = torch.empty(t, bh, d, dtype=torch.bfloat16, device=dev)
-        s_out = torch.empty(bh, d, d, dtype=torch.float32, device=dev)
-        out = torch.empty(t, bh, d, dtype=torch.bfloat16, device=dev)
-        self._kernel("gdr_cumsum")(gf, gc, thr)
-        self._kernel("gdr_kkt")(kf, gc, bf, a_tril, thr)
-        self._kernel("gdr_solve")(a_tril, a_inv, thr)
-        self._kernel("gdr_recompute")(kf, vf, bf, a_inv, gc, w, u, thr)
-        self._kernel("gdr_state")(kf, w, u, gc, s0, chunk_state, v_new, s_out, t, thr)
-        self._kernel("gdr_o")(qf, kf, v_new, chunk_state, gc, out, 1.0, thr)
-        out = out.float().reshape(t, b, h, d).transpose(0, 1).contiguous()
-        return out, s_out.reshape(b, h, d, d).contiguous(), None
 
     def linear_attn_step(self, q, k, v, g, beta, state, **kw):
         out, new_state, new_window = self.linear_attn_chunk(

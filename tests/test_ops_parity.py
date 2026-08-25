@@ -543,29 +543,6 @@ def test_linear_attn_chunk_vs_step(backend):
     _assert_close(ns, s, "chunk-vs-step state")
 
 
-def test_gdr_chunk_scan_parity(backend):
-    """6-arg chunked GDR scan (sm90, K=V=128): the FlashQLA chunk-WY pipeline
-    vs reference._gated_delta_scan. T=130 (partial last chunk) and B=2 (batch
-    flattening) exercise the boundary masks. Calls _gdr_chunk_scan directly —
-    the serial kernel is the default for the 6-arg form (the chunked pipeline
-    is slower at this shape, see errors/2026-08-25-gdn-chunked-gdr-rejected).
-    sm90-only: the GDR kernels live in the sm90 cell."""
-    if backend.arch != "sm90":
-        pytest.skip("chunked GDR scan is sm90-only")
-    torch.manual_seed(31)
-    b, t, h, d = 2, 130, 4, 128
-    q = torch.randn(b, t, h, d, device=backend.device) * 0.1
-    k = torch.randn(b, t, h, d, device=backend.device) * 0.1
-    v = torch.randn(b, t, h, d, device=backend.device) * 0.1
-    g = torch.sigmoid(torch.randn(b, t, h, device=backend.device)) * 0.5 + 0.4
-    beta = torch.sigmoid(torch.randn(b, t, h, device=backend.device))
-    state = torch.randn(b, h, d, d, device=backend.device) * 0.01
-    out, ns, _ = backend._gdr_chunk_scan(q, k, v, g, beta, state)
-    rout, rns = reference._gated_delta_scan(q, k, v, g, beta, state)
-    _assert_close(out, rout, "gdr chunk scan out")
-    _assert_close(ns, rns, "gdr chunk scan state")
-
-
 def test_gdn_conv_window_makes_step_exact():
     """The conv_window carry makes segmented decode (T=1 per forward) exactly
     equal to a one-shot chunk forward: threading the returned window through
