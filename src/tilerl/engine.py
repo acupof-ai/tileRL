@@ -151,6 +151,10 @@ class _DecodeGraph:
         self._bt = torch.zeros(B, kv_pool.num_blocks, dtype=torch.int32, device=device)
         self._sl = torch.empty(B, dtype=torch.int32, device=device)
         self._ss = torch.empty(B, dtype=torch.long, device=device)
+        # Decode rows always have exactly 1 query token; a static GPU buffer
+        # (not a per-tick CPU copy) keeps seq_q_lens out of the captured
+        # region — the kernels' CPU->GPU fallback breaks CUDA graph capture.
+        self._sql = torch.ones(B, dtype=torch.int32, device=device)
         # Pinned staging buffers: a plain copy_ from an unpinned CPU tensor is
         # synchronous (it blocks until the copy engine drains), which under
         # GPU contention costs ms per tick. Pinned + non_blocking makes the
@@ -166,6 +170,7 @@ class _DecodeGraph:
             state_slot=self._ss,
             kv_pool=kv_pool,
             state_pool=state_pool,
+            seq_q_lens=self._sql,
         )
         # Warmup on a side stream: tilelang JIT-compiles per (shape, dtype),
         # and JIT is host work — it must finish before capture starts.
