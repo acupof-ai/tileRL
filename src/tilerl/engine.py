@@ -12,14 +12,13 @@ continuous batching with chunked prefill, mirrored through agent-infer's
 ``build_forward_plan`` (waiting/running queues, per-tick token budget, decode
 rows first; no preemption/swap day-1 — admission is capped at ``max_batch``).
 The decode tick is a captured kernel sequence, not an interpreted one
-(design-engine.md): on CUDA, a pure-decode B=1 tick replays a ``_DecodeGraph``
-(static input buffers + static pools, captured once) instead of dispatching
-~900 kernels per token; the eager path stays the default on other targets and
-the fallback on capture failure. Mixed and B>1 ticks run eager.
+(design-engine.md): on CUDA, a pure-decode tick replays a per-batch-size
+``_DecodeGraph`` (static input buffers + static pools, captured lazily per
+bucket) instead of dispatching ~900 kernels per token; the eager path stays
+the default on other targets and the fallback on capture failure. Mixed
+ticks (decode rows + a prefill chunk) run eager.
 # ponytail: chunked prefill is bounded by ``max_num_batched_tokens``; a prompt
 # tail longer than ``max_total_tokens`` is still rejected at ``submit``.
-# ponytail: batch-size buckets for the decode graph day-2 — M=1 is the day-1
-# scope; B>1 decode runs eager.
 
 Prefix reuse: :class:`~tilerl.kv_cache.PrefixStore` may return hits of any
 length; the engine adopts only block-aligned prefixes (``BLOCK_TOKENS`` = 16):
@@ -116,7 +115,7 @@ class BatchKv:
 
 
 class _DecodeGraph:
-    """Captured decode forward for one batch-size bucket (day-1: B=1).
+    """Captured decode forward for one batch-size bucket.
 
     The decode tick is a static kernel sequence — same ops, same shapes,
     every token (design-engine.md). Capture ``model.forward`` once and replay
@@ -134,8 +133,6 @@ class _DecodeGraph:
     is read (prefill writes [0, prompt_len), decodes append), and slots are
     zeroed on alloc, so the dummy data is never observable.
 
-    # ponytail: batch-size buckets for continuous batching day-2 — M=1 is
-    # the day-1 scope; B>1 runs eager.
     # ponytail: capture at engine build time day-2 — lazy on the first
     # decode tick today, so first token pays JIT + capture.
     # ponytail: recapture after training day-2 — the graph bakes weight
@@ -498,9 +495,9 @@ class Engine:
                 self._blocks_used += 1
         if (
             prefill is None
-            and len(decodes) == 1
+            and decodes
             and self._decode_graph_on
-            and self._run_decode_graph(decodes[0])
+            and self._run_decode_graph(decodes)
         ):
             return
         rows = decodes + ([prefill] if prefill is not None else [])
@@ -544,21 +541,25 @@ class Engine:
         if decodes and prefill is not None:
             self._mixed_forwards += 1
 
-    def _run_decode_graph(self, req: _Req) -> bool:
-        """Captured decode for a pure-decode B=1 tick. Returns False (and
-        flips the flag off) when capture failed, so the caller runs eager."""
-        g = self._decode_graphs.get(1)
+    def _run_decode_graph(self, reqs: list[_Req]) -> bool:
+        """Captured decode for a pure-decode tick (one graph per batch-size
+        bucket, captured lazily on the first tick of that size). Returns
+        False (and flips the flag off) when capture failed, so the caller
+        runs eager."""
+        B = len(reqs)
+        g = self._decode_graphs.get(B)
         if g is None:
             try:
-                g = _DecodeGraph(self._model, self._backend, self._kv, self._states, 1)
+                g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B)
             except Exception as exc:
-                warnings.warn(f"decode graph capture failed ({exc}); eager fallback")
+                warnings.warn(f"decode graph capture failed for B={B} ({exc}); eager fallback")
                 self._decode_graph_on = False
                 return False
-            self._decode_graphs[1] = g
-        logits = g.run([req])
+            self._decode_graphs[B] = g
+        logits = g.run(reqs)
         self._decode_forwards += 1
-        self._after_forward(req, logits[0, -1], len(req.output))
+        for i, r in enumerate(reqs):
+            self._after_forward(r, logits[i, -1], len(r.output))
         return True
 
     def _after_forward(self, req: _Req, last_logits: torch.Tensor, generated_idx: int) -> None:

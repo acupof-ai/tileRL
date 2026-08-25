@@ -4,6 +4,15 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — phase exit: decode graph covers B>1 (per-batch-size bucket capture)
+
+- **Shipped.** `_DecodeGraph` now replays per batch-size bucket, captured
+  lazily on the first pure-decode tick of each size — B>1 no longer pays the
+  eager fallback's ~5ms/tick fixed launch tax (~900 Python dispatches). Mixed
+  ticks (decode + prefill chunk) still run eager. Entry:
+  `docs/experience/wins/2026-08-25-decode-graph-batch-buckets.md`
+  (pending-remote — pod bench in flight).
+
 ## 2026-08-25 — accept-or-reject: fp8 prefill GEMM N-tile sweep — v_n64 ACCEPTED (+33% geo-mean), v_int32/v_ws/v_sota/v_m64 REJECTED
 
 - **Verdict.** The fp4->e4m3 dequant + fp8 WGMMA prefill kernel

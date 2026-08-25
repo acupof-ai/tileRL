@@ -1,11 +1,9 @@
 """Decode throughput vs batch size on the NVFP4 slice (eager path).
 
 Submits B concurrent requests, warms past their prefills, then times ticks
-where all B are decoding. The decode graph is M=1-only (day-1), so every B
-runs the eager path here — the scaling with B is the point (weights are read
-once per tick regardless of B; the dequant issue bottleneck is an M=1 disease
-that amortizes over the batch), not the absolute B=1 number (graph capture
-gives 49 tok/s at B=1).
+where all B are decoding. Use --decode-graph to capture per-bucket decode
+graphs (pure-decode ticks replay instead of dispatching ~900 kernels);
+without it every B runs the eager path.
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src TILERL_TARGET=cuda \\
@@ -34,6 +32,10 @@ def main() -> None:
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--ticks", type=int, default=30)
     p.add_argument("--batches", type=str, default="1,2,4,8")
+    p.add_argument("--fuse", action="store_true", help="fuse same-input fp4 projections")
+    p.add_argument(
+        "--decode-graph", action="store_true", help="capture decode graphs per batch bucket"
+    )
     args = p.parse_args()
 
     backend = get_backend()
@@ -43,8 +45,10 @@ def main() -> None:
         num_layers=args.layers,
         full_attn_layers=tuple(i for i in qwen36_27b().full_attn_layers if i < args.layers),
     )
-    model = load_hf(cfg, args.source)
-    engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8, decode_graph=False)
+    model = load_hf(cfg, args.source, fuse_projections=args.fuse)
+    engine = build_engine(
+        cfg, model, backend, num_blocks=512, num_slots=8, decode_graph=args.decode_graph
+    )
 
     gen = torch.Generator().manual_seed(7)
     print(f"\n=== decode throughput vs batch (slice {args.layers} layers, eager) ===")
