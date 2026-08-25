@@ -3,19 +3,23 @@
 Mirrors agent-infer's infer-core ``Engine`` (submit/step/poll) and infer-seam
 ``StepLimits``, stripped to the day-1 contract.
 
-Tick semantics: ONE forward per tick, EITHER a decode batch (running requests,
-T=1 each, up to ``max_batch`` rows) OR a single prefill (one waiting request,
-its whole remaining prompt tail). Decode-first: a prefill is admitted only
-when no decode is pending, so requests are served serially day-1.
+Tick semantics: ONE forward per tick over a planned row set. A row is either
+a decode row (a running request, T=1) or ONE prefill chunk (the next slice of
+a waiting or chunking request's prompt, up to ``max_num_batched_tokens``
+minus the decode rows). A tick is therefore mixed (decode rows + the prefill
+chunk share one forward), decode-only, or prefill-only — vLLM/sglang
+continuous batching with chunked prefill, mirrored through agent-infer's
+``build_forward_plan`` (waiting/running queues, per-tick token budget, decode
+rows first; no preemption/swap day-1 — admission is capped at ``max_batch``).
 The decode tick is a captured kernel sequence, not an interpreted one
-(design-engine.md): on CUDA, ``_step_decode`` replays a ``_DecodeGraph``
-(static input buffers + static pools, captured once per batch-size bucket)
-instead of dispatching ~900 kernels per token; the eager path stays the
-default on other targets and the fallback on capture failure.
-# ponytail: mixed prefill+decode batches day-2 — needs a ragged-row model
-# contract (per-row query lengths); the pinned model.forward is dense [B,T].
-# ponytail: chunked prefill day-2 — a prompt tail longer than
-# ``max_total_tokens`` is rejected at ``submit`` today.
+(design-engine.md): on CUDA, a pure-decode B=1 tick replays a ``_DecodeGraph``
+(static input buffers + static pools, captured once) instead of dispatching
+~900 kernels per token; the eager path stays the default on other targets and
+the fallback on capture failure. Mixed and B>1 ticks run eager.
+# ponytail: chunked prefill is bounded by ``max_num_batched_tokens``; a prompt
+# tail longer than ``max_total_tokens`` is still rejected at ``submit``.
+# ponytail: batch-size buckets for the decode graph day-2 — M=1 is the day-1
+# scope; B>1 decode runs eager.
 
 Prefix reuse: :class:`~tilerl.kv_cache.PrefixStore` may return hits of any
 length; the engine adopts only block-aligned prefixes (``BLOCK_TOKENS`` = 16):
@@ -73,6 +77,7 @@ class SamplingParams:
 class StepLimits:
     max_batch: int = 8
     max_total_tokens: int = 512
+    max_num_batched_tokens: int = 512
 
 
 @dataclass
@@ -95,15 +100,19 @@ class BatchKv:
 
     The engine's wire object; the model reads these attributes duck-typed.
     ``seq_len`` is the logical length AFTER this forward per row (prefill row:
-    full prompt length; decode row: current length, the sampled token lands at
-    ``seq_len - 1``).
+    materialized length after its chunk; decode row: current length, the
+    sampled token lands at ``seq_len - 1``). ``seq_q_lens`` is the per-row
+    valid query count (decode row: 1, prefill row: the chunk length) — rows
+    are left-aligned and padded to a shared T; None means every row is valid
+    for the full T (training, captured decode).
     """
 
-    block_table: torch.Tensor  # [B, max_blocks] long, padded with 0
+    block_table: torch.Tensor  # [B, num_blocks] long, padded with 0
     seq_len: torch.Tensor  # [B] long
     state_slot: torch.Tensor  # [B] long
     kv_pool: Any
     state_pool: Any
+    seq_q_lens: torch.Tensor | None = None  # [B] valid query tokens per row
 
 
 class _DecodeGraph:
@@ -126,7 +135,7 @@ class _DecodeGraph:
     zeroed on alloc, so the dummy data is never observable.
 
     # ponytail: batch-size buckets for continuous batching day-2 — M=1 is
-    # the day-1 scope (serving is serial, decode-first); B>1 runs eager.
+    # the day-1 scope; B>1 runs eager.
     # ponytail: capture at engine build time day-2 — lazy on the first
     # decode tick today, so first token pays JIT + capture.
     # ponytail: recapture after training day-2 — the graph bakes weight
@@ -253,6 +262,7 @@ class Engine:
         self._prefix_published = 0
         self._prefill_forwards = 0
         self._decode_forwards = 0
+        self._mixed_forwards = 0
         self._tokens_generated = 0
 
     # ------------------------------------------------------------------ API
@@ -311,7 +321,7 @@ class Engine:
                 tokens=tokens,
                 blocks=blocks,
                 state_slot=slot,
-                seq_len=len(tokens),
+                seq_len=matched,  # materialized length (adopted prefix; 0 on a miss)
                 phase=_PHASE_PREFILL,
                 prefill_from=matched,
                 own_blocks=total_blocks - matched // BLOCK_TOKENS,
@@ -336,16 +346,34 @@ class Engine:
             return self._finished.pop(request_id, None)
 
     def step(self) -> None:
-        """Run one tick: one decode batch OR one prefill (decode-first)."""
+        """Run one tick: one forward over the planned rows (mixed
+        prefill+decode, decode-only, or prefill-only)."""
         with self._lock:
-            decodes = [r for r in self._running if r.phase == _PHASE_DECODE]
-            if decodes:
-                self._step_decode(decodes[: self.limits.max_batch])
+            decodes, prefill, chunk = self._build_plan()
+            if not decodes and prefill is None:
                 return
-            if self._waiting:
-                req = self._waiting.popleft()
-                self._running.append(req)
-                self._step_prefill(req)
+            self._run_forward(decodes, prefill, chunk)
+
+    def _build_plan(self) -> tuple[list[_Req], _Req | None, int]:
+        """Plan one tick, mirroring agent-infer's ``build_forward_plan``.
+
+        Admit one waiting request into running under ``max_batch``, then take
+        all running decodes as decode rows and at most one prefill row — the
+        next chunk of a prefilling request, sized by the per-tick token
+        budget (``max_num_batched_tokens`` minus the decode rows). A prompt
+        longer than the budget stays in PREFILL and is chunked across ticks.
+        """
+        if self._waiting and len(self._running) < self.limits.max_batch:
+            self._running.append(self._waiting.popleft())
+        decodes = [r for r in self._running if r.phase == _PHASE_DECODE]
+        prefill = next((r for r in self._running if r.phase == _PHASE_PREFILL), None)
+        chunk = 0
+        if prefill is not None:
+            remaining = len(prefill.tokens) - prefill.prefill_from
+            chunk = min(remaining, self.limits.max_num_batched_tokens - len(decodes))
+            if chunk <= 0:
+                prefill = None  # no token budget this tick; decode-only
+        return decodes, prefill, chunk
 
     def run(self) -> None:
         """Start the daemon loop (raises if already running)."""
@@ -387,6 +415,7 @@ class Engine:
                 "prefix_published": self._prefix_published,
                 "prefill_forwards": self._prefill_forwards,
                 "decode_forwards": self._decode_forwards,
+                "mixed_forwards": self._mixed_forwards,
                 "tokens_generated": self._tokens_generated,
             }
 
@@ -415,20 +444,31 @@ class Engine:
         """Collision-safe key for a prefix's boundary-state snapshot."""
         return tuple(tokens)
 
-    def _make_kv(self, reqs: list[_Req]) -> BatchKv:
-        max_blocks = max(len(r.blocks) for r in reqs)
-        bt = torch.zeros(len(reqs), max_blocks, dtype=torch.long)
+    def _make_kv(self, reqs: list[_Req], seq_q: list[int]) -> BatchKv:
+        # Fixed width = pool size: the kernels bake the table width into the
+        # compiled kernel (Mb is a compile const), so a per-tick max-blocks
+        # width recompiles on every block growth. Rows zero-pad; the kernels
+        # index by position bounded by seq_lens, so padding is never read.
+        bt = torch.zeros(len(reqs), self._kv.num_blocks, dtype=torch.long)
         sl = torch.empty(len(reqs), dtype=torch.long)
         ss = torch.empty(len(reqs), dtype=torch.long)
+        sql = torch.empty(len(reqs), dtype=torch.long)
         for i, r in enumerate(reqs):
             bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
             # Materialized length AFTER this forward: a prefill row completes
-            # the prompt; a decode row writes the sampled token at
-            # [seq_len-1, seq_len), so seq_len itself is the post-write length.
-            sl[i] = len(r.tokens) if r.phase == _PHASE_PREFILL else r.seq_len
+            # its chunk (prefill_from is the chunk start); a decode row writes
+            # the sampled token at [seq_len-1, seq_len), so seq_len itself is
+            # the post-write length.
+            sl[i] = r.prefill_from + seq_q[i] if r.phase == _PHASE_PREFILL else r.seq_len
             ss[i] = r.state_slot
+            sql[i] = seq_q[i]
         return BatchKv(
-            block_table=bt, seq_len=sl, state_slot=ss, kv_pool=self._kv, state_pool=self._states
+            block_table=bt,
+            seq_len=sl,
+            state_slot=ss,
+            kv_pool=self._kv,
+            state_pool=self._states,
+            seq_q_lens=sql,
         )
 
     def _sample(self, logits_row: torch.Tensor, req: _Req, generated_idx: int) -> int:
@@ -438,58 +478,83 @@ class Engine:
         )
         return int(torch.as_tensor(tok).flatten()[0])
 
-    def _step_prefill(self, req: _Req) -> None:
-        start = req.prefill_from
-        input_ids = np.asarray([req.tokens[start:]], dtype=np.int64)
-        positions = np.asarray([list(range(start, len(req.tokens)))], dtype=np.int64)
-        logits = self._model.forward(input_ids, positions, self._make_kv([req]), self._backend)
-        self._prefill_forwards += 1
-        self._after_forward(req, logits[0, -1], generated_idx=0)
-        # Publish the prompt prefix at a block boundary: the state slot still
-        # covers exactly the prompt tokens, so the snapshot is exact.
-        prompt_len = len(req.tokens) - len(req.output)
-        if req.phase != _PHASE_DONE and prompt_len % BLOCK_TOKENS == 0:
-            self._publish_prefix(req, prompt_len)
-        if req.phase != _PHASE_DONE:
-            if len(req.output) >= req.params.max_new_tokens:
-                self._finish(req)
-            else:
-                req.phase = _PHASE_DECODE
+    def _run_forward(self, decodes: list[_Req], prefill: _Req | None, chunk: int) -> None:
+        """Run one mixed/decode/prefill forward over the planned rows.
 
-    def _step_decode(self, reqs: list[_Req]) -> None:
-        for r in reqs:
+        Rows are left-aligned valid tokens padded to a shared T (decode rows:
+        1 token at t=0; the prefill row: its chunk), with per-row
+        ``seq_q_lens`` so the kernels touch only valid positions.
+        """
+        for r in decodes:
             # Blocks must cover the new token at position r.seq_len.
             while len(r.blocks) * BLOCK_TOKENS <= r.seq_len:
                 r.blocks.append(self._kv.alloc_block())
                 r.own_blocks += 1
                 self._blocks_used += 1
-        if self._decode_graph_on and len(reqs) == 1:
-            # Captured decode (day-1 bucket: M=1). Capture is lazy on the
-            # first decode tick; a capture failure degrades to eager loudly.
-            # ponytail: batch-size buckets day-2 — B>1 runs eager.
-            g = self._decode_graphs.get(1)
-            if g is None:
-                try:
-                    g = _DecodeGraph(self._model, self._backend, self._kv, self._states, 1)
-                except Exception as exc:
-                    warnings.warn(f"decode graph capture failed ({exc}); eager fallback")
-                    self._decode_graph_on = False
-                else:
-                    self._decode_graphs[1] = g
-            if g is not None:
-                logits = g.run(reqs)
-                self._decode_forwards += 1
-                for i, r in enumerate(reqs):
-                    self._after_forward(r, logits[i, -1], generated_idx=len(r.output))
-                return
-        input_ids = np.asarray([[r.output[-1]] for r in reqs], dtype=np.int64)
-        # The sampled token was appended to r.tokens at the previous forward;
-        # its position is seq_len-1 (0-indexed, matching prefill positions).
-        positions = np.asarray([[r.seq_len - 1] for r in reqs], dtype=np.int64)
-        logits = self._model.forward(input_ids, positions, self._make_kv(reqs), self._backend)
+        if (
+            prefill is None
+            and len(decodes) == 1
+            and self._decode_graph_on
+            and self._run_decode_graph(decodes[0])
+        ):
+            return
+        rows = decodes + ([prefill] if prefill is not None else [])
+        seq_q = [1] * len(decodes) + ([chunk] if prefill is not None else [])
+        width = max(seq_q)
+        input_ids = np.zeros((len(rows), width), dtype=np.int64)
+        positions = np.zeros((len(rows), width), dtype=np.int64)
+        for i, r in enumerate(decodes):
+            input_ids[i, 0] = r.output[-1]
+            positions[i, 0] = r.seq_len - 1
+        if prefill is not None:
+            j = len(decodes)
+            start = prefill.prefill_from
+            input_ids[j, :chunk] = prefill.tokens[start : start + chunk]
+            positions[j, :chunk] = np.arange(start, start + chunk)
+        logits = self._model.forward(
+            input_ids, positions, self._make_kv(rows, seq_q), self._backend
+        )
+        for i, r in enumerate(decodes):
+            self._after_forward(r, logits[i, 0], len(r.output))
+        if prefill is not None:
+            self._prefill_forwards += 1
+            j = len(decodes)
+            prefill.prefill_from += chunk
+            prefill.seq_len = prefill.prefill_from
+            if prefill.prefill_from >= len(prefill.tokens):
+                self._after_forward(prefill, logits[j, chunk - 1], generated_idx=0)
+                # Publish the prompt prefix at a block boundary: the state
+                # slot still covers exactly the prompt tokens, so the
+                # snapshot is exact.
+                prompt_len = len(prefill.tokens) - len(prefill.output)
+                if prefill.phase != _PHASE_DONE and prompt_len % BLOCK_TOKENS == 0:
+                    self._publish_prefix(prefill, prompt_len)
+                if prefill.phase != _PHASE_DONE:
+                    if len(prefill.output) >= prefill.params.max_new_tokens:
+                        self._finish(prefill)
+                    else:
+                        prefill.phase = _PHASE_DECODE
+        if decodes:
+            self._decode_forwards += 1
+        if decodes and prefill is not None:
+            self._mixed_forwards += 1
+
+    def _run_decode_graph(self, req: _Req) -> bool:
+        """Captured decode for a pure-decode B=1 tick. Returns False (and
+        flips the flag off) when capture failed, so the caller runs eager."""
+        g = self._decode_graphs.get(1)
+        if g is None:
+            try:
+                g = _DecodeGraph(self._model, self._backend, self._kv, self._states, 1)
+            except Exception as exc:
+                warnings.warn(f"decode graph capture failed ({exc}); eager fallback")
+                self._decode_graph_on = False
+                return False
+            self._decode_graphs[1] = g
+        logits = g.run([req])
         self._decode_forwards += 1
-        for i, r in enumerate(reqs):
-            self._after_forward(r, logits[i, -1], generated_idx=len(r.output))
+        self._after_forward(req, logits[0, -1], len(req.output))
+        return True
 
     def _after_forward(self, req: _Req, last_logits: torch.Tensor, generated_idx: int) -> None:
         tok = self._sample(last_logits, req, generated_idx)
@@ -568,6 +633,7 @@ def build_engine(
     num_slots: int = 8,
     max_batch: int = 8,
     max_total_tokens: int = 8192,
+    max_num_batched_tokens: int = 512,
     prefix_store: Any = None,
     decode_graph: bool | None = None,
 ) -> "Engine":
@@ -608,6 +674,10 @@ def build_engine(
         kv_pool,
         state_pool,
         store,
-        StepLimits(max_batch=max_batch, max_total_tokens=max_total_tokens),
+        StepLimits(
+            max_batch=max_batch,
+            max_total_tokens=max_total_tokens,
+            max_num_batched_tokens=max_num_batched_tokens,
+        ),
         decode_graph=decode_graph,
     )

@@ -727,6 +727,11 @@ def make_write_tokens(target: str):
     SeqLens read on device, the whole write is one launch — and a
     stream-capturable one, so the decode CUDA graph can own it.
 
+    Rows are left-aligned valid tokens: SeqQLens [B] is the per-row valid
+    count (decode row: 1, prefill row: the chunk length); the write covers
+    [seq_len-seq_q, seq_len) and padding positions are skipped. Mixed
+    batches pad every row to the shared S this way.
+
     # SOTA copy: vLLM reshape_and_cache (paged KV write, same indexing:
     #   blk = block_table[b, pos // block_size], off = pos % block_size)
     # Adapted: bf16 IO throughout (the pool is bf16; the backend casts the
@@ -735,7 +740,7 @@ def make_write_tokens(target: str):
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
-    def write_tokens(K, V, KPool, VPool, BlockTable, SeqLens, block_size, threads):
+    def write_tokens(K, V, KPool, VPool, BlockTable, SeqLens, SeqQLens, block_size, threads):
         B, S, H, D = T.const("B, S, H, D")
         NB = T.const("NB")
         Mb = T.const("Mb")
@@ -745,15 +750,17 @@ def make_write_tokens(target: str):
         VPool: T.Tensor((NB, H, block_size, D), "bfloat16")
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
+        SeqQLens: T.Tensor((B,), "int32")
         with T.Kernel(B * S, H, threads=threads) as (bt, h):
             b = bt // S
             t = bt % S
-            pos = SeqLens[b] - S + t
-            blk = BlockTable[b, pos // block_size]
-            off = pos % block_size
-            for d in T.Parallel(D):
-                KPool[blk, h, off, d] = K[b, t, h, d]
-                VPool[blk, h, off, d] = V[b, t, h, d]
+            if t < SeqQLens[b]:
+                pos = SeqLens[b] - SeqQLens[b] + t
+                blk = BlockTable[b, pos // block_size]
+                off = pos % block_size
+                for d in T.Parallel(D):
+                    KPool[blk, h, off, d] = K[b, t, h, d]
+                    VPool[blk, h, off, d] = V[b, t, h, d]
 
     return write_tokens
 
@@ -932,6 +939,11 @@ def make_gdn_chunk_fused(target: str):
     owns a different channel; shared would race) and fragments forbid the
     rq[i]=rq[i+1] shift (uniform-index constraint).
 
+    Rows are left-aligned valid tokens with a per-row bound SeqQLens [B]:
+    a decode row (seq_q=1, token at t=0) scans one token with the same
+    Window++qkv conv semantics as the decode kernel, so mixed batches
+    (decode rows + a prefill chunk) run this one kernel.
+
     # Original: T-loop generalization of make_gdn_decode_fused (itself a SOTA
     # copy of examples/gdn/qwen36_gdr_decode_fused.py @ tilelang branch
     # feat/qwen36-gdn-megakernel). The branch's prefill path is chunkwise-WY
@@ -957,7 +969,7 @@ def make_gdn_chunk_fused(target: str):
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def gdn_chunk_fused(
-        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State, threads
+        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State, SeqQLens, threads
     ):
         # TT (sequence length) is the const, not T: T is the tilelang.language
         # module alias and rebinding it would break T.serial/T.Kernel below.
@@ -977,6 +989,7 @@ def make_gdn_chunk_fused(target: str):
         ConvW: T.Tensor((QKVD, KER), "float32")
         Window: T.Tensor((B, KER - 1, QKVD), "bfloat16")
         State: T.Tensor((B, NVH, K, V), "float32")
+        SeqQLens: T.Tensor((B,), "int32")
         Out = T.empty((B, TT, VD), "float32")
         NewState = T.empty((B, NVH, K, V), "float32")
         NewWindow = T.empty((B, KER - 1, QKVD), "bfloat16")
@@ -1019,7 +1032,7 @@ def make_gdn_chunk_fused(target: str):
             for j in T.serial(K):
                 state_local[j] = State[bb, vh, j, tv]
 
-            for t in T.serial(TT):
+            for t in T.serial(SeqQLens[bb]):
                 # conv1d (KER taps over Window ++ qkv) + SiLU on this head's
                 # q/k/v channels — same per-tap global reads as the decode
                 # kernel, generalized with the t offset.
@@ -1104,18 +1117,18 @@ def make_gdn_chunk_fused(target: str):
             # q/k channels are shared across the GQA group — only the
             # representative writes them.
             for tap in T.serial(KER - 1):
-                if TT + tap < KER - 1:
-                    NewWindow[bb, tap, vc] = Window[bb, TT + tap, vc]
+                if SeqQLens[bb] + tap < KER - 1:
+                    NewWindow[bb, tap, vc] = Window[bb, SeqQLens[bb] + tap, vc]
                 else:
-                    NewWindow[bb, tap, vc] = Val[bb, TT + tap - (KER - 1), vh * V + tv]
+                    NewWindow[bb, tap, vc] = Val[bb, SeqQLens[bb] + tap - (KER - 1), vh * V + tv]
             if is_rep:
                 for tap in T.serial(KER - 1):
-                    if TT + tap < KER - 1:
-                        NewWindow[bb, tap, qc] = Window[bb, TT + tap, qc]
-                        NewWindow[bb, tap, kc] = Window[bb, TT + tap, kc]
+                    if SeqQLens[bb] + tap < KER - 1:
+                        NewWindow[bb, tap, qc] = Window[bb, SeqQLens[bb] + tap, qc]
+                        NewWindow[bb, tap, kc] = Window[bb, SeqQLens[bb] + tap, kc]
                     else:
-                        NewWindow[bb, tap, qc] = Q[bb, TT + tap - (KER - 1), qc]
-                        NewWindow[bb, tap, kc] = Key[bb, TT + tap - (KER - 1), qc]
+                        NewWindow[bb, tap, qc] = Q[bb, SeqQLens[bb] + tap - (KER - 1), qc]
+                        NewWindow[bb, tap, kc] = Key[bb, SeqQLens[bb] + tap - (KER - 1), qc]
 
         return Out, NewState, NewWindow
 
@@ -1131,16 +1144,19 @@ def make_paged_attention_mma(target: str):
     # SOTA copy: examples/flash_attention/example_mha_fwd_bshd.py @ tilelang main
     # Adapted: paged KV pool (block-table gather replaces the dense K/V
     #   T.copy), GQA (kv head = h * Hkv // H), bf16 IO with f32 accumulate,
-    #   the causal mask driven by the per-batch history (SeqLens - seq_q)
+    #   the causal mask driven by the per-row history (SeqLens - SeqQLens)
     #   instead of a dense tril, and block_M as a schedule arg: 16 for decode
     #   (M=1, padded at the boundary) — a 64-row tile would make decode
     #   compute-bound on 63 garbage rows — 64 for prefill. The 16-row tile's
     #   replicate-4 score fragment casts to bf16 through a shared-memory
     #   round-trip (the direct fragment copy conflicts on layout).
     # The backend pads Q's S dim to a multiple of block_M and passes the true
-    # query length (seq_q) so the decode padding rows do not shift the
+    # per-row query lengths (SeqQLens) so decode padding rows do not shift the
     # history; their gather positions clamp to the last block and are masked
-    # out of the score. D must be a multiple of 16 (WGMMA K).
+    # out of the score. Mixed batches (decode rows + a prefill chunk sharing
+    # one forward) pad every row to the chunk's T — padding query positions
+    # compute garbage the caller never reads, bounded by the same mask. D must
+    # be a multiple of 16 (WGMMA K).
     # ponytail: decode (M=1) is ~30x off the memory roofline — tilelang
     # 0.1.13 lowers the paged gather to synchronous loads (no cp_async for
     # elementwise copies), so the kernel is latency-bound. Split-KV
@@ -1157,10 +1173,10 @@ def make_paged_attention_mma(target: str):
         VCache,
         BlockTable,
         SeqLens,
+        SeqQLens,
         scale: T.float32,
         block_size,
         block_M,
-        seq_q,
         threads,
     ):
         B, S, H, D = T.const("B, S, H, D")
@@ -1172,6 +1188,7 @@ def make_paged_attention_mma(target: str):
         VCache: T.Tensor((NB, Hkv, block_size, D), "bfloat16")
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
+        SeqQLens: T.Tensor((B,), "int32")
         Out = T.empty((B, S, H, D), "float32")
         log2e = 1.4426950408889634
         policy = T.GemmWarpPolicy.FullRow if block_M >= 32 else T.GemmWarpPolicy.Square
@@ -1181,7 +1198,7 @@ def make_paged_attention_mma(target: str):
         threads = 128 if block_M >= 32 else 64
         with T.Kernel(T.ceildiv(S, block_M), H, B, threads=threads) as (bx, hh, bb):
             hkv = hh * Hkv // H
-            hist = SeqLens[bb] - seq_q
+            hist = SeqLens[bb] - SeqQLens[bb]
             Q_shared = T.alloc_shared((block_M, D), "bfloat16")
             K_shared = T.alloc_shared((block_N, D), "bfloat16")
             V_shared = T.alloc_shared((block_N, D), "bfloat16")

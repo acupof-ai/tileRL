@@ -530,6 +530,7 @@ def linear_attn_chunk(
     a_log: "torch.Tensor | None" = None,
     norm_weight: "torch.Tensor | None" = None,
     conv_window: "torch.Tensor | None" = None,
+    seq_q_lens: "torch.Tensor | None" = None,
 ) -> tuple[torch.Tensor, ...]:
     """Gated-delta linear attention. 6-arg form (``z``/``conv1d_weight``/...
     all None): the plain :func:`_gated_delta_scan` — the op the TileLang
@@ -556,6 +557,7 @@ def linear_attn_chunk(
         a_log=a_log,
         norm_weight=norm_weight,
         conv_window=conv_window,
+        seq_q_lens=seq_q_lens,
     )
 
 
@@ -636,6 +638,7 @@ def gdn_forward(
     a_log: torch.Tensor,
     norm_weight: torch.Tensor,
     conv_window: "torch.Tensor | None" = None,
+    seq_q_lens: "torch.Tensor | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
     """Full gated-delta layer core: the executable spec for the model's GDN
     layer, mirroring agent-infer's host reference equation by equation (the
@@ -643,7 +646,10 @@ def gdn_forward(
     ``v``/``z`` [B,T,nvh*V], ``g``/``beta`` [B,T,nvh], ``state`` [B,nvh,K,V].
     ``conv_window`` [B,K-1,qkv_dim] is the previous segment's last raw-qkv
     tokens, prepended so segmented decode (T=1 per forward) is exact; None =
-    one-shot prefill (zero left-padding) and the third return is None."""
+    one-shot prefill (zero left-padding) and the third return is None.
+    ``seq_q_lens`` [B] bounds the per-row scan: mixed batches pad rows to a
+    shared T and only the first ``seq_q_lens[b]`` positions are real (decode
+    rows: 1); None means every row is valid for all T."""
     # Activations arrive on the backend device; params/state may be CPU-resident
     # (day-1: params live on CPU, the backend boundary migrates activations).
     # Gather every input on the activation device.
@@ -664,13 +670,20 @@ def gdn_forward(
     nvh, key_dim, val_dim = state.shape[1], state.shape[2], state.shape[3]
     nkh = q.shape[-1] // key_dim
     kernel = conv1d_weight.shape[1]
+    if seq_q_lens is None:
+        seq_q_lens = torch.full((b,), t, dtype=torch.long)
+    else:
+        seq_q_lens = torch.as_tensor(seq_q_lens, dtype=torch.long, device=dev).reshape(b)
     qkv = torch.cat([q, k, v], dim=-1)
     new_window = None
     if conv_window is not None:
-        # Segmented decode: carry the last K-1 raw-qkv tokens. The new window
-        # is the last K-1 of (window + qkv); outputs are the last T positions.
+        # Segmented decode: carry the last K-1 raw-qkv tokens. Per row, the new
+        # window is the last K-1 of (window + that row's valid qkv) — mixed
+        # rows have different valid lengths, so build per row.
         qkv = torch.cat([_f32(conv_window).to(dev), qkv], dim=1)
-        new_window = qkv[:, -(kernel - 1) :, :].contiguous()
+        new_window = torch.stack(
+            [qkv[bi, : kernel - 1 + int(seq_q_lens[bi])][-(kernel - 1) :] for bi in range(b)]
+        ).contiguous()
     preact = torch.zeros_like(qkv)
     for tap in range(kernel):
         pad_left = kernel - 1 - tap
@@ -689,14 +702,18 @@ def gdn_forward(
     s_heads = [state[:, h].clone() for h in range(nvh)]
     core = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
     for step in range(t):
+        active = (seq_q_lens > step).reshape(b, 1, 1)
+        active_h = (seq_q_lens > step).reshape(b, 1)
         for h in range(nvh):
             kh = h * nkh // nvh
             s_h = s_heads[h] * exp_g[:, step, h].view(b, 1, 1)
             p = torch.einsum("bk,bkv->bv", kn[:, step, kh], s_h)
             d = (v_raw[:, step, h] - p) * bt[:, step, h].unsqueeze(-1)
             s_h = s_h + kn[:, step, kh].unsqueeze(-1) * d.unsqueeze(-2)
-            s_heads[h] = s_h
-            core[:, step, h] = torch.einsum("bk,bkv->bv", qn[:, step, kh], s_h)
+            s_heads[h] = torch.where(active, s_h, s_heads[h])
+            core[:, step, h] = torch.where(
+                active_h, torch.einsum("bk,bkv->bv", qn[:, step, kh], s_h), 0
+            )
     s = torch.stack(s_heads, dim=1)
     normed = core * torch.rsqrt(core.pow(2).mean(-1, keepdim=True) + 1e-6)
     normed = normed * norm_weight

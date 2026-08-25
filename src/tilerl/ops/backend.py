@@ -43,6 +43,8 @@ every container restart re-pays the NVCC builds.
 from __future__ import annotations
 
 import os
+import weakref
+from typing import Any
 
 import torch
 
@@ -57,6 +59,16 @@ _THREADS = 64
 
 def _round_up(x: int, m: int) -> int:
     return ((x + m - 1) // m) * m
+
+
+def _snap_mma_tile(m: int, cap: int) -> int:
+    """Snap an MMA tile M to a warp-partition-valid size.
+
+    WGMMA Square policy needs each warp's rows to land on a valid partition;
+    empirically 16/32/64/128 compile and 48/80/96/112 do not (tilelang
+    0.1.13). Mixed batches land on arbitrary M (rows x chunk), so snap up.
+    """
+    return min(cap, next((s for s in (16, 32, 64, 128) if s >= m), 128))
 
 
 def _pad2d(t: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
@@ -218,7 +230,7 @@ class Backend:
         #: The 27B table is 248320x5120 bf16 (~2.5GB); re-casting it every
         #: tick costs ~6ms on H20. The optimizer's in-place copy_ bumps
         #: _version, so a train step invalidates the entry.
-        self._embed_f32: dict[int, tuple[int, torch.Tensor]] = {}
+        self._embed_f32: dict[int, tuple[Any, int, torch.Tensor]] = {}
 
     def _kernel(self, name: str):
         k = self._kernels.get(name)
@@ -438,7 +450,7 @@ class Backend:
             # killed by the zero-padded WScale. bN % 32: the dequant macro
             # divides the tile as block_N*64/threads/16 (threads=128).
             BK = 64
-            bM, bN = _round_up(min(128, M), 16), _round_up(min(128, N), 32)
+            bM, bN = _snap_mma_tile(M, 128), _round_up(min(128, N), 32)
             Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, BK)
             x2 = _pad2d(x2, Mp, Kp)
             xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
@@ -458,8 +470,10 @@ class Backend:
         if self.target.startswith("cuda"):
             # WGMMA tiles %16, reduction K %64 (the fp4 dequant K-tile).
             # e2m1fn has no zero, so padded WQ bytes (0x00 -> 0.5) are killed
-            # by the zero-padded Scale.
-            bM, bN = _round_up(bM, 16), _round_up(bN, 16)
+            # by the zero-padded Scale. bM snaps to a warp-partition-valid
+            # size (48/80/96/112 do not compile under Square policy).
+            bM = _snap_mma_tile(M, 64)
+            bN = _round_up(bN, 16)
             Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, 64)
             x2 = _pad2d(x2, Mp, Kp)
             wq = _pad2d(wq, Np, Kp // 2)
@@ -503,7 +517,7 @@ class Backend:
         if self.target.startswith("cuda") and M > 1 and "linear_fp8" in _kset:
             BK = 128  # matches the checkpoint's 128-block scale
             N, K = w8.shape
-            bM, bN = _round_up(min(128, M), 16), _round_up(min(128, N), 16)
+            bM, bN = _snap_mma_tile(M, 128), _round_up(min(128, N), 16)
             Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, BK)
             x2 = _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(M, K)), Mp, Kp)
             xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
@@ -528,15 +542,19 @@ class Backend:
 
     # ------------------------------------------------------------ attention
 
-    def paged_attention(self, q, k_cache, v_cache, block_table, seq_lens, scale, gate=None):
+    def paged_attention(
+        self, q, k_cache, v_cache, block_table, seq_lens, scale, gate=None, seq_q_lens=None
+    ):
         squeeze = q.ndim == 3
         if squeeze:
             q = q.unsqueeze(1)  # [B, H, D] -> [B, 1, H, D]
-        s = q.shape[1]
+        b, s = q.shape[0], q.shape[1]
+        if seq_q_lens is None:
+            seq_q_lens = torch.full((b,), s, dtype=torch.int32)
         if self.arch == "sm90":
             # MMA kernel is bf16-IO and tiles queries at block_M: pad S to a
-            # multiple (the kernel's history/mask use the true length s, so
-            # padding rows do not shift the causal window).
+            # multiple (the kernel's history/mask use the true per-row lengths
+            # in seq_q_lens, so padding rows do not shift the causal window).
             block_m = 64 if s >= 64 else 16
             q = self._dev(self._c(q), torch.bfloat16)
             pad = -s % block_m
@@ -548,10 +566,10 @@ class Backend:
                 self._dev(v_cache, torch.bfloat16),
                 self._i32(block_table),
                 self._i32(seq_lens),
+                self._i32(seq_q_lens),
                 float(scale),
                 int(k_cache.shape[2]),
                 block_m,
-                s,
                 128,
             )[:, :s]
         else:
@@ -560,6 +578,7 @@ class Backend:
             v_cache = self._f32(v_cache)
             bt = self._i32(block_table).contiguous()
             sl = self._i32(seq_lens).contiguous()
+            sql = self._i32(seq_q_lens).contiguous()
             k = self._kernel("paged_attention")
             out = k(
                 q,
@@ -567,6 +586,7 @@ class Backend:
                 v_cache,
                 bt,
                 sl,
+                sql,
                 float(scale),
                 block_size=int(k_cache.shape[2]),
                 threads=_THREADS,
@@ -598,6 +618,10 @@ class Backend:
             kv.kv_pool.write_tokens(k, v, kv, layer_idx)
             return
         pool = kv.kv_pool
+        b, s = k.shape[0], k.shape[1]
+        sql = getattr(kv, "seq_q_lens", None)
+        if sql is None:
+            sql = torch.full((b,), s, dtype=torch.int32)
         self._kernel("write_tokens")(
             self._dev(k, torch.bfloat16),
             self._dev(v, torch.bfloat16),
@@ -605,6 +629,7 @@ class Backend:
             pool.v_pool[layer_idx],
             self._i32(kv.block_table).contiguous(),
             self._i32(kv.seq_len).contiguous(),
+            self._i32(sql).contiguous(),
             int(pool.k_pool.shape[-2]),
             _THREADS,
         )
@@ -675,7 +700,9 @@ class Backend:
 
         q/k/v/g/beta [B, T, ...] keep their T dim (the kernel scans it
         serially per (value head, batch)). conv_window is always a tensor
-        (the model carries it; None means zero left-padding).
+        (the model carries it; None means zero left-padding). ``seq_q_lens``
+        [B] (when present) bounds the per-row scan: mixed batches pad decode
+        rows to the chunk's T with a per-row bound of 1.
         """
         window = kw.get("conv_window")
         has_window = window is not None
@@ -687,6 +714,9 @@ class Backend:
                 dtype=torch.float32,
                 device=self.device,
             )
+        seq_q = kw.get("seq_q_lens")
+        if seq_q is None:
+            seq_q = torch.full((q.shape[0],), q.shape[1], dtype=torch.int32)
         out, new_state, new_window = self._kernel("gdn_chunk_fused")(
             self._c(self._bf16(q)),
             self._c(self._bf16(k)),
@@ -700,6 +730,7 @@ class Backend:
             self._c(self._f32(kw["conv1d_weight"])),
             self._c(self._bf16(window)),
             self._c(self._f32(state)),
+            self._c(self._i32(seq_q)),
             threads=state.shape[-1],
         )
         return out, new_state, (self._f32(new_window) if has_window else None)
@@ -719,6 +750,7 @@ class Backend:
     def linear_attn_bwd(self, grad, q, k, v, g, beta, state, **kw):
         # ponytail: torch-eager backward (gdn example_chunk_delta_bwd is the
         # CUDA-scheduled tilelang upgrade path), tilelang kernel when perf demands
+        kw.pop("seq_q_lens", None)  # serving-only; training batches are uniform T
         return reference.linear_attn_bwd(grad, q, k, v, g, beta, state, **kw)
 
     # ------------------------------------------------------------ silu mul
@@ -753,15 +785,20 @@ class Backend:
         """f32 cast of the embedding table, cached across ticks. The 27B
         table is ~2.5GB bf16; casting it per tick costs ~6ms on H20. The
         optimizer's in-place copy_ bumps _version, invalidating the entry.
+        Identity is checked via weakref: a fresh model can reuse a freed
+        table's address, and data_ptr alone would hand back the stale cast.
         # ponytail: the tied lm_head path (linear) re-casts the same table;
         # route it through this cache when a tied model is served."""
         key = table.data_ptr()
-        ver = table._version
         hit = self._embed_f32.get(key)
-        if hit is not None and hit[0] == ver:
-            return hit[1]
+        if hit is not None:
+            ref, ver, t = hit
+            if ref() is not table:
+                del self._embed_f32[key]  # address reused by a different table
+            elif ver == table._version:
+                return t
         t = self._f32(table)
-        self._embed_f32[key] = (ver, t)
+        self._embed_f32[key] = (weakref.ref(table), table._version, t)
         return t
 
     def embedding(self, idx, table):

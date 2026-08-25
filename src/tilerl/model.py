@@ -271,6 +271,7 @@ class Model:
                 kv.seq_len,
                 1.0 / math.sqrt(d),
                 gate=gate,
+                seq_q_lens=getattr(kv, "seq_q_lens", None),
             )
         out = self._linear(backend, autograd.reshape(out, b, t, hq * d), f"{p}.o_proj")
         return backend.add(x, out)
@@ -318,6 +319,7 @@ class Model:
             a_log=self.params[f"{p}.a_log"],
             norm_weight=self.params[f"{p}.gdn_norm"],
             conv_window=window,
+            seq_q_lens=getattr(kv, "seq_q_lens", None),
         )
         out, new_state, new_window = backend.linear_attn_chunk(
             q, k, v, a_proj, b_proj, state, **kwargs

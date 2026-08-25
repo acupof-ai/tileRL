@@ -20,7 +20,11 @@ through the hand-written tape (`autograd.py`), same backend ops. One runtime.
 
 - **The engine seam is the cost contract**: `submit`/`poll` + `StepLimits`.
   A new target implements the loop behind it; it does not bend the seam.
-- **One forward per tick.** Prefill and decode are scheduled, never nested.
+- **One forward per tick, mixed batch.** Continuous batching with chunked
+  prefill (vLLM/sglang pattern, mirrored through agent-infer's
+  `build_forward_plan`): waiting/running queues, a per-tick token budget
+  (`StepLimits.max_num_batched_tokens`), decode rows first plus at most one
+  prefill chunk sharing the forward. No preemption/swap day-1.
 - **The decode tick is a captured kernel sequence, not an interpreted one.**
   Decode is memory-bound and static: the same ops, the same shapes, every
   token, for the life of the process. A static sequence repeated 10⁴+ times is

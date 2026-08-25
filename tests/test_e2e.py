@@ -19,7 +19,7 @@ import torch
 
 from tilerl.autograd import AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
 from tilerl.config import tiny
-from tilerl.engine import Engine, SamplingParams, build_engine
+from tilerl.engine import _PHASE_DECODE, Engine, SamplingParams, build_engine
 from tilerl.model import build_random, param_specs
 from tilerl.ops.backend import get_backend
 from tilerl.train import opd_loop, train_step
@@ -375,6 +375,58 @@ def test_prefix_snapshot_includes_conv_window():
         assert windows.shape[-2] == cfg.linear_conv_kernel_dim - 1
     finally:
         engine.shutdown()
+
+
+def test_concurrent_prefills_not_starved():
+    """Mixed-batch scheduling: 3 concurrent requests all reach decode phase
+    within 3 ticks (tick i admits request i and mixes its prefill with the
+    earlier decodes), and all 3 produce output. Decode-first scheduling would
+    fully serve req 1 before req 2's prefill, so the three never decode
+    together."""
+    engine = _build_engine(seed=77)
+    try:
+        prompt = np.random.default_rng(0).integers(3, 320, size=8).astype(np.int64)
+        params = SamplingParams(temperature=1.0, top_p=0.95, max_new_tokens=8, seed=3)
+        ids = [engine.submit(prompt, params) for _ in range(3)]
+        for _ in range(16):
+            engine.step()
+            if sum(1 for r in engine._running if r.phase == _PHASE_DECODE) == 3:
+                break
+        assert sum(1 for r in engine._running if r.phase == _PHASE_DECODE) == 3
+        assert engine.stats()["mixed_forwards"] >= 2
+        out = _drain(engine, ids, max_new_tokens=8)
+    finally:
+        engine.shutdown()
+    assert all(1 <= len(out[i]) <= 8 for i in ids)
+
+
+def test_chunked_prefill_matches_one_shot():
+    """A prompt longer than the per-tick token budget is chunked across
+    ticks; the carried state must be exact, so chunked and one-shot engines
+    produce identical tokens for the same prompt and seed."""
+    prompt = np.random.default_rng(0).integers(3, 320, size=40).astype(np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=11)
+    outs = []
+    for budget in (512, 16):
+        cfg = tiny()
+        engine = build_engine(
+            cfg,
+            build_random(cfg, seed=5),
+            get_backend(),
+            num_blocks=8,
+            num_slots=4,
+            max_batch=4,
+            max_total_tokens=512,
+            max_num_batched_tokens=budget,
+        )
+        try:
+            rid = engine.submit(prompt, params)
+            out = _drain(engine, [rid], max_new_tokens=4)[rid]
+        finally:
+            engine.shutdown()
+        outs.append(out)
+    assert outs[0] == outs[1], f"chunked prefill diverged: {outs[0]} vs {outs[1]}"
+    assert 1 <= len(outs[1]) <= 4
 
 
 def test_engine_miss_path():

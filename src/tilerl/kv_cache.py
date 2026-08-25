@@ -188,7 +188,8 @@ class PagedKvPool:
         )
 
     def write_tokens(self, k: torch.Tensor, v: torch.Tensor, kv, layer_idx: int) -> None:
-        """Write k/v [B,T,Hkv,D] at ``[seq_len-T, seq_len)`` per row, scattered
+        """Write k/v [B,T,Hkv,D] at the per-row tail ``[seq_len-seq_q,
+        seq_len)`` (``seq_q`` = ``kv.seq_q_lens``, default T), scattered
         through the batch's block table.
 
         The engine guarantees those positions land on blocks owned exclusively
@@ -200,9 +201,11 @@ class PagedKvPool:
         # ponytail: per-token python loop, vectorized scatter day-2
         """
         b, t, _, _ = k.shape
+        sql = getattr(kv, "seq_q_lens", None)
         for bi in range(b):
-            base = int(kv.seq_len[bi]) - t
-            for ti in range(t):
+            sq = t if sql is None else int(sql[bi])
+            base = int(kv.seq_len[bi]) - sq
+            for ti in range(sq):
                 pos = base + ti
                 blk = int(kv.block_table[bi, pos // BLOCK_TOKENS])
                 self.k_pool[layer_idx, blk, :, pos % BLOCK_TOKENS, :] = k[bi, ti]

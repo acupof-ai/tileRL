@@ -73,13 +73,16 @@ class RefBackend:
         # counterpart — the pool loop IS the reference semantics).
         kv.kv_pool.write_tokens(k, v, kv, layer_idx)
 
-    def paged_attention(self, q, k_pool, v_pool, block_table, seq_lens, scale, gate=None):
+    def paged_attention(
+        self, q, k_pool, v_pool, block_table, seq_lens, scale, gate=None, seq_q_lens=None
+    ):
         b, t, hq, d = q.shape
         hkv = k_pool.shape[1]
         rep = hq // hkv
         out = torch.zeros(b, t, hq, d, dtype=q.dtype)
         for bi in range(b):
             s = int(seq_lens[bi])
+            sq = t if seq_q_lens is None else int(seq_q_lens[bi])
             nblk = (s + k_pool.shape[2] - 1) // k_pool.shape[2]
             blks = block_table[bi, :nblk].long()
             # [nblk,Hkv,BLOCK,D] -> [Hkv,s,D]
@@ -87,13 +90,13 @@ class RefBackend:
             v_seq = v_pool[blks].permute(1, 0, 2, 3).reshape(hkv, -1, d)[:, :s]
             k_seq = k_seq.unsqueeze(1).expand(hkv, rep, s, d).reshape(hq, s, d)
             v_seq = v_seq.unsqueeze(1).expand(hkv, rep, s, d).reshape(hq, s, d)
-            scores = torch.einsum("thd,hsd->ths", q[bi].float(), k_seq.float()) * scale
-            q_pos = torch.arange(s - t, s)
-            causal = torch.arange(s).unsqueeze(0) <= q_pos.unsqueeze(1)  # [t,s]
+            scores = torch.einsum("thd,hsd->ths", q[bi, :sq].float(), k_seq.float()) * scale
+            q_pos = torch.arange(s - sq, s)
+            causal = torch.arange(s).unsqueeze(0) <= q_pos.unsqueeze(1)  # [sq,s]
             scores = scores.masked_fill(~causal.unsqueeze(1), float("-inf"))
             attn = torch.softmax(scores, dim=-1)
             ob = torch.einsum("ths,hsd->thd", attn, v_seq.float())
             if gate is not None:
-                ob = ob * torch.sigmoid(gate[bi].float())
-            out[bi] = ob.to(q.dtype)
+                ob = ob * torch.sigmoid(gate[bi, :sq].float())
+            out[bi, :sq] = ob.to(q.dtype)
         return out

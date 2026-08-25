@@ -4,6 +4,23 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — phase exit: engine scheduler → SOTA continuous batching with chunked prefill (mixed prefill+decode forwards)
+
+- **Shipped.** Replaced the serial decode-first scheduler with vLLM/sglang
+  continuous batching mirrored through agent-infer's `build_forward_plan`:
+  waiting/running queues, per-tick token budget
+  (`StepLimits.max_num_batched_tokens`, default 512), decode rows first plus
+  at most one prefill chunk sharing one mixed forward (no preemption day-1).
+  Per-row `seq_q_lens` threads through paged_attention, write_tokens, and the
+  GDN chunk kernel so a mixed batch (decode rows + a prefill chunk) runs one
+  forward. Also fixed a per-tick tilelang recompile loop: `_make_kv` now
+  allocates the block_table at fixed width (pool `num_blocks`) instead of
+  `max(len(r.blocks))`, which baked a new `Mb` compile const on every block
+  growth (5 recompiles / 30 decode ticks before). Mixed batches exposed a
+  latent MMA warp-partition crash (bM=48/80/96/112 do not compile under
+  Square policy); the sm90 linear paths now snap bM to {16,32,64,128}.
+  Entry: `docs/experience/wins/2026-08-25-engine-scheduler-batch.md`.
+
 ## 2026-08-25 — accept-or-reject: GDN chunk kernel local state column + bf16 IO — ACCEPTED (21.6% faster, 2.32 -> 1.82 ms)
 
 - **Verdict.** The serial GDN chunk prefill kernel was load-latency-bound

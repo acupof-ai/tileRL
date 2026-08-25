@@ -515,12 +515,14 @@ def make_paged_attention(target: str):
 
     Q [B, T, H, D], K/V cache [num_blocks, Hkv, BLOCK, D], BlockTable [B, Mb]
     int32, SeqLens [B] int32 (total length after this forward; query t sees
-    keys [0, seq_lens - T + t)). GQA: kv head = h * Hkv // H.
+    keys [0, seq_lens - T + t)), SeqQLens [B] int32 (valid query tokens per
+    row — mixed batches pad rows to a shared T; padding positions are
+    unmasked garbage the caller never reads). GQA: kv head = h * Hkv // H.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def paged_attention(
-        Q, KCache, VCache, BlockTable, SeqLens, scale: T.float32, block_size, threads
+        Q, KCache, VCache, BlockTable, SeqLens, SeqQLens, scale: T.float32, block_size, threads
     ):
         B, S, H, D = T.const("B, S, H, D")
         Hkv = T.const("Hkv")
@@ -531,36 +533,38 @@ def make_paged_attention(target: str):
         VCache: T.Tensor((NB, Hkv, block_size, D), "float32")
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
+        SeqQLens: T.Tensor((B,), "int32")
         Out = T.empty((B, S, H, D), "float32")
         with T.Kernel(B, H, threads=threads) as (bb, hh):
             hkv = hh * Hkv // H
-            hist = SeqLens[bb] - S
+            hist = SeqLens[bb] - SeqQLens[bb]
             for t in T.serial(S):
-                m = T.alloc_fragment((1,), "float32")
-                m[0] = -1.0e30
-                l = T.alloc_fragment((1,), "float32")
-                l[0] = 0.0
-                acc = T.alloc_fragment((D,), "float32")
-                for d in T.Parallel(D):
-                    acc[d] = 0.0
-                upper = hist + t + 1
-                for pos in T.serial(upper):
-                    blk = BlockTable[bb, pos // block_size]
-                    off = pos % block_size
-                    s = T.alloc_fragment((1,), "float32")
-                    s[0] = 0.0
-                    for d in T.serial(D):
-                        s[0] += Q[bb, t, hh, d] * KCache[blk, hkv, off, d]
-                    s[0] = s[0] * scale
-                    m_new = T.max(m[0], s[0])
-                    corr = T.exp(m[0] - m_new)
-                    p = T.exp(s[0] - m_new)
-                    l[0] = l[0] * corr + p
+                if t < SeqQLens[bb]:
+                    m = T.alloc_fragment((1,), "float32")
+                    m[0] = -1.0e30
+                    l = T.alloc_fragment((1,), "float32")
+                    l[0] = 0.0
+                    acc = T.alloc_fragment((D,), "float32")
                     for d in T.Parallel(D):
-                        acc[d] = acc[d] * corr + p * VCache[blk, hkv, off, d]
-                    m[0] = m_new
-                for d in T.Parallel(D):
-                    Out[bb, t, hh, d] = acc[d] / l[0]
+                        acc[d] = 0.0
+                    upper = hist + t + 1
+                    for pos in T.serial(upper):
+                        blk = BlockTable[bb, pos // block_size]
+                        off = pos % block_size
+                        s = T.alloc_fragment((1,), "float32")
+                        s[0] = 0.0
+                        for d in T.serial(D):
+                            s[0] += Q[bb, t, hh, d] * KCache[blk, hkv, off, d]
+                        s[0] = s[0] * scale
+                        m_new = T.max(m[0], s[0])
+                        corr = T.exp(m[0] - m_new)
+                        p = T.exp(s[0] - m_new)
+                        l[0] = l[0] * corr + p
+                        for d in T.Parallel(D):
+                            acc[d] = acc[d] * corr + p * VCache[blk, hkv, off, d]
+                        m[0] = m_new
+                    for d in T.Parallel(D):
+                        Out[bb, t, hh, d] = acc[d] / l[0]
         return Out
 
     return paged_attention
