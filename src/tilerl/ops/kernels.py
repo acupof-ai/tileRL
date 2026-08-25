@@ -459,16 +459,14 @@ def make_embedding(target: str):
 def _e4m3_fp32(b):
     """e4m3fn byte -> fp32 via the standard bit pattern (sign|exp4|mant3,
     bias 7): subnormal (e=0) m*2^-9, normal 2^(e-7)*(1+m/8). The in-kernel
-    mirror of reference._e4m3_f32 (uint8 scale bytes -> f32). Scales are
-    positive magnitudes (pack_fp4 block_max/6), so the sign bit is not
-    decoded — the normal path is pure integer bit synthesis reinterpreted
-    as float (the e2m1fn fast-decode trick), no exp2 in the loop."""
+    mirror of reference._e4m3_f32 (uint8 scale bytes -> f32)."""
     i = T.cast(b, "int32")
+    sign = 1.0 - 2.0 * T.cast((i >> 7) & 1, "float32")
     e = (i >> 3) & 15
-    m = i & 7
-    nor = T.reinterpret(((e + 120) << 23) | (m << 20), "float32")
-    sub = T.cast(m, "float32") / 512.0
-    return T.if_then_else(e == 0, sub, nor)
+    m = T.cast(i & 7, "float32")
+    sub = m / 512.0
+    nor = T.exp2(T.cast(e, "float32") - 7.0) * (1.0 + m * 0.125)
+    return sign * T.if_then_else(e == 0, sub, nor)
 
 
 def make_linear_fp4(target: str):
