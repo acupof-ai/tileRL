@@ -33,6 +33,7 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = [".claude"]  # agent worktrees are separate checkouts with their own gates
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "SIM"]
