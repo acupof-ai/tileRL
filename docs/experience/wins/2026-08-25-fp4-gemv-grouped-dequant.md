@@ -83,7 +83,7 @@ loads) are both worse.
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tick | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
 | 2026-08-25 | 1190885 | H20 | cuda/sm90 | 27B slice (3 GDN + 1 FA) | — | 1.887 (wall) | 530 decode |
-| 2026-08-25 | ba1818e | H20 | cuda/sm90 | 27B slice (3 GDN + 1 FA) | — | 1.837 (wall) | 545 decode |
+| 2026-08-25 | 6b39e50 | H20 | cuda/sm90 | 27B slice (3 GDN + 1 FA) | — | 1.837 (wall) | 545 decode |
 
 Decode ms/tick is the graph-captured per-tick wall (10-tick avg,
 `scripts/bench_fp4_gemv.py` path); the profiler's GPU tracer no longer
