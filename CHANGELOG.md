@@ -4,6 +4,22 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: fp4 GEMV shared-memory dequant ping-pong — REJECTED (2.5-3.3x slower than register group4)
+
+- **Verdict.** Tried to move the fp4 GEMV dequant off the FMA critical path
+  via shared memory (the register double-buffer spilled in round 6): a
+  same-warp ping-pong (decode g+1 -> shared, FMA g from shared) and a
+  producer/consumer warp split (threadIdx.z role, RING=3 SPSC ring, producer
+  2 groups ahead, consumer issues zero shuffles). Both bit-exact vs the
+  shipped kernel (rel-err 2.74e-3), both 2.5-3.3x slower (14-17% roof vs
+  group4's 43%, contended H20): the STS+LDS round-trip and per-group
+  `bar.sync` cost more than the shuffle issue they remove, and the LDS
+  latency lands on the critical path. group8 ties (same issue/elem, more
+  regs). bf16 IO was already done in round 1. The register group4 stays; the
+  46%->57% gap to the nodecode floor needs fewer dequant instructions/elem,
+  not a different buffer. Entry:
+  `docs/experience/errors/2026-08-25-gemv-shared-pingpong-rejected.md`.
+
 ## 2026-08-25 — phase exit: final 80/3800 bench — decode 49 / prefill 1172 tok/s, not met; gap is dequant issue throughput + GDN chunk, not physics
 
 - **Verdict.** Final measurement at HEAD ea8ba7f (f32 scales, grouped dequant)
