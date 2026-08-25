@@ -1035,7 +1035,7 @@ def make_gdn_chunk_fused(target: str):
             acc_sq = T.alloc_fragment((1,), "float32")
 
             # per-thread state column: carried in a local array across all T
-            # tokens (loaded once at seed, stored once per token in pass 2)
+            # tokens (loaded once at seed, written once after the scan)
             # instead of streamed through global 4x per token. 4 accumulators
             # per pass break the 128-deep FMA chain into 4 x 32-deep and issue
             # 4 state loads per iteration (ILP hides the L1/register latency).
@@ -1090,8 +1090,9 @@ def make_gdn_chunk_fused(target: str):
                 T.tvm_storage_sync("shared")
 
                 # recurrence: decay + kv_mem, then rank-1 update + out.
-                # The state column lives in state_local (registers/L1); only
-                # pass 2 writes the final state to global (once per token).
+                # The state column lives in state_local (registers/L1); the
+                # caller only consumes the chunk-end state, so NewState is
+                # written once after the scan, not per token.
                 # 4 accumulators per pass (chain 128->32 deep, 4 loads/iter).
                 for a in T.serial(2 * 4):
                     accs[a] = 0.0
@@ -1108,7 +1109,6 @@ def make_gdn_chunk_fused(target: str):
                     for u in T.unroll(4):
                         sj = state_local[base + u] + delta[0] * k_s[base + u]
                         state_local[base + u] = sj
-                        NewState[bb, vh, base + u, tv] = sj
                         accs[4 + u] += sj * q_s[base + u]
                 acc_o[0] = accs[4] + accs[5] + accs[6] + accs[7]
                 out_s[tv] = acc_o[0]
@@ -1125,6 +1125,13 @@ def make_gdn_chunk_fused(target: str):
                 Out[bb, t, vh * V + tv] = (
                     out_s[tv] * rms_s[0] * NormW[tv] * (gate * T.sigmoid(gate))
                 )
+
+            # chunk-end state: the only NewState the caller consumes (the
+            # next chunk's State seed). Per-token writes were dead stores.
+            for j in T.serial(K // 4):
+                base = j * 4
+                for u in T.unroll(4):
+                    NewState[bb, vh, base + u, tv] = state_local[base + u]
 
             # new conv window: last KER-1 raw qkv tokens of (Window ++ qkv).
             # q/k channels are shared across the GQA group — only the

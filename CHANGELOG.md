@@ -4,6 +4,16 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: GDN chunk NewState write hoisted out of the token loop — ACCEPTED (14.8% kernel, 1.993 -> 1.699 ms)
+
+- **Verdict.** The fused GDN chunk-prefill kernel wrote the full 128-float
+  state column to global `NewState` every token, but the caller only consumes
+  the chunk-end state (next chunk's seed) — ~1.6 GB/layer of dead traffic at
+  T=512. Write once after the scan; the recurrence was already
+  register-resident. Same-process A/B on slice4 prefill-512 shapes: 1.993 ->
+  1.699 ms, out + new_state allclose. Decode rows (T=1) unchanged. Entry:
+  `docs/experience/wins/2026-08-25-gdn-chunk-state-writeback.md`.
+
 ## 2026-08-25 — phase exit: decode graph covers B>1 (per-batch-size bucket capture)
 
 - **Shipped.** `_DecodeGraph` now replays per batch-size bucket, captured
