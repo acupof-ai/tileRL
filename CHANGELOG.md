@@ -4,6 +4,22 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: chunked GDR scan for GDN prefill — REJECTED (0.90x, bf16 precision wall)
+
+- **Verdict.** The FlashQLA chunk-WY pipeline (6 kernels: cumsum, kkt, solve,
+  recompute, state, o) was ported from agent-infer and wired as the default
+  for the 6-arg scan and full-GDN prefill on sm90. A/B at slice4
+  prefill-512 shapes: serial mega-kernel 4.38ms vs chunked 4.88ms (0.90x),
+  and the chunked path has 26% output error at scale=1.0 inputs (serial is
+  exact). Root cause: WY is O(T·C·K) vs serial's O(T·K²) — the serial
+  kernel is compute-bound with state in L2, so the chunked pipeline's extra
+  FMAs cost more than the state-traffic savings; bf16 intermediates between
+  pipeline stages lose precision at realistic input scales. Reverted both
+  wirings (serial is the default again); kept the GDR kernels (verified
+  SOTA, available for memory-bound/parallelism-starved shapes), the
+  `a_inv.zero_()` bug fix, and the test/docstring fixes. Entry:
+  `docs/experience/errors/2026-08-25-gdn-chunked-gdr-rejected.md`.
+
 ## 2026-08-25 — accept-or-reject: GDN chunk NewState write hoisted out of the token loop — ACCEPTED (14.8% kernel, 1.993 -> 1.699 ms)
 
 - **Verdict.** The fused GDN chunk-prefill kernel wrote the full 128-float

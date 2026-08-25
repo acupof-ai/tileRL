@@ -546,9 +546,10 @@ def test_linear_attn_chunk_vs_step(backend):
 def test_gdr_chunk_scan_parity(backend):
     """6-arg chunked GDR scan (sm90, K=V=128): the FlashQLA chunk-WY pipeline
     vs reference._gated_delta_scan. T=130 (partial last chunk) and B=2 (batch
-    flattening) exercise the boundary masks. On non-sm90 the 6-arg path uses
-    the portable serial kernel (covered by test_linear_attn_chunk_parity), so
-    this gate is sm90-only."""
+    flattening) exercise the boundary masks. Calls _gdr_chunk_scan directly —
+    the serial kernel is the default for the 6-arg form (the chunked pipeline
+    is slower at this shape, see errors/2026-08-25-gdn-chunked-gdr-rejected).
+    sm90-only: the GDR kernels live in the sm90 cell."""
     if backend.arch != "sm90":
         pytest.skip("chunked GDR scan is sm90-only")
     torch.manual_seed(31)
@@ -559,27 +560,10 @@ def test_gdr_chunk_scan_parity(backend):
     g = torch.sigmoid(torch.randn(b, t, h, device=backend.device)) * 0.5 + 0.4
     beta = torch.sigmoid(torch.randn(b, t, h, device=backend.device))
     state = torch.randn(b, h, d, d, device=backend.device) * 0.01
-    out, ns, _ = backend.linear_attn_chunk(q, k, v, g, beta, state)
+    out, ns, _ = backend._gdr_chunk_scan(q, k, v, g, beta, state)
     rout, rns = reference._gated_delta_scan(q, k, v, g, beta, state)
     _assert_close(out, rout, "gdr chunk scan out")
     _assert_close(ns, rns, "gdr chunk scan state")
-
-
-def test_gdn_chunk_prefill_parity(backend):
-    """Full-GDN prefill via the chunked GDR pipeline (sm90, K=V=128):
-    conv1d+SiLU -> norm+gates -> chunked scan -> post-norm+z, vs
-    reference.gdn_forward. T=130 (partial last chunk). On non-sm90 the
-    full-GDN T>1 path uses the serial mega-kernel (covered by
-    test_gdn_chunk_fused_parity at K=V=16), so this gate is sm90-only."""
-    if backend.arch != "sm90":
-        pytest.skip("chunked GDR prefill is sm90-only")
-    q, k, v, g, beta, z, state, kw = _gdn_inputs(1, 130, 4, 8, 128, 128, 4, 37)
-    # Pure-prefill rows (no seq_q_lens): the chunked path's gate.
-    out, ns, nw = backend.linear_attn_chunk(q, k, v, g, beta, state, z=z, **kw)
-    rout, rns, rnw = reference.gdn_forward(q, k, v, g, beta, state, z=z, **kw)
-    _assert_close(out, rout, "gdn chunk prefill out")
-    _assert_close(ns, rns, "gdn chunk prefill state")
-    _assert_close(nw, rnw, "gdn chunk prefill window")
 
 
 def test_gdn_conv_window_makes_step_exact():
