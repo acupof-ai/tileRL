@@ -4,6 +4,22 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: chunkwise-WY GDN prefill — REJECTED (2.6x slower than serial scan)
+
+- **Verdict.** Ported the tilelang branch's chunkwise-WY prefill pair
+  (`qwen36_prefill_wy.py` + `qwen36_prefill_scan_o.py`, unmerged
+  `feat/qwen36-gdn-megakernel`) to replace the serial GDN prefill chunk kernel
+  (27.6% of the prefill-512 tick). Correctness green (parity vs
+  `reference.gdn_forward`, rtol=1e-2; T=1 cross-check vs decode kernel) but
+  **2.6x slower** on the H20 pod: serial 4.73 ms vs WY 12.38 ms (A=1.62 +
+  B=10.76). Root cause: WY is O(T*C*K) (C=64, 64x more FMAs) vs the serial
+  O(T*K), and the serial kernel is compute-bound (64KB state fits in L2, 48
+  heads saturate the SMs) — the WY's chunk-parallelism has nothing to repay
+  its extra compute and two-launch/24MB-intermediate overhead. Reverted to the
+  serial kernel. The WY solve math is sound (decay-first delta rule, verified
+  1e-17) and the port is in git history if a memory-bound or few-head config
+  appears. Entry: `docs/experience/errors/2026-08-25-gdn-prefill-wy-rejected.md`.
+
 ## 2026-08-25 — accept-or-reject: fp4 GEMV grouped dequant — direct-call 42% -> 46% roof, slice4 decode 1.887 -> 1.837 ms/tick
 
 - **Verdict.** The dequant is grouped 4 micro-tiles at a time: load 4, decode
