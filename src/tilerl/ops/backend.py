@@ -248,6 +248,9 @@ class Backend:
     def _f32(self, t: torch.Tensor) -> torch.Tensor:
         return self._dev(t, torch.float32)
 
+    def _bf16(self, t: torch.Tensor) -> torch.Tensor:
+        return self._dev(t, torch.bfloat16)
+
     def _i32(self, t: torch.Tensor) -> torch.Tensor:
         return self._dev(t, torch.int32)
 
@@ -685,21 +688,21 @@ class Backend:
                 device=self.device,
             )
         out, new_state, new_window = self._kernel("gdn_chunk_fused")(
-            self._c(self._f32(q)),
-            self._c(self._f32(k)),
-            self._c(self._f32(v)),
-            self._c(self._f32(kw["z"])),
+            self._c(self._bf16(q)),
+            self._c(self._bf16(k)),
+            self._c(self._bf16(v)),
+            self._c(self._bf16(kw["z"])),
             self._c(self._f32(g)),
             self._c(self._f32(beta)),
             self._c(self._f32(kw["dt_bias"])),
             self._c(self._f32(kw["a_log"])),
             self._c(self._f32(kw["norm_weight"])),
             self._c(self._f32(kw["conv1d_weight"])),
-            self._c(self._f32(window)),
+            self._c(self._bf16(window)),
             self._c(self._f32(state)),
             threads=state.shape[-1],
         )
-        return out, new_state, (new_window if has_window else None)
+        return out, new_state, (self._f32(new_window) if has_window else None)
 
     def linear_attn_step(self, q, k, v, g, beta, state, **kw):
         out, new_state, new_window = self.linear_attn_chunk(

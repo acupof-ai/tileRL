@@ -4,6 +4,17 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — accept-or-reject: GDN chunk kernel local state column + bf16 IO — ACCEPTED (21.6% faster, 2.32 -> 1.82 ms)
+
+- **Verdict.** The serial GDN chunk prefill kernel was load-latency-bound
+  (strided state column streamed through global 4x/token). Carrying the
+  128-float state column in a per-thread `T.alloc_local` array + 4-accumulator
+  unrolling (ILP hides L1 latency) + bf16 IO on Q/K/V/Z/Window halves the
+  load traffic: 2.32 -> 1.82 ms (21.6%) on the H20 quiet-window sweep.
+  8-acc and fused-dot reassociation tested worse. Parity green (4/4 GDN
+  tests, rel-err 2.7e-3). Entry:
+  `docs/experience/wins/2026-08-25-gdn-chunk-local-state-bf16.md`.
+
 ## 2026-08-25 — accept-or-reject: dual-format fp8 weights for prefill — REJECTED (fp8 MMA already wired)
 
 - **Verdict.** Proposed packing an e4m3 copy of every fp4 projection so

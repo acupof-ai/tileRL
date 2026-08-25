@@ -919,8 +919,9 @@ def make_gdn_decode_fused(target: str):
 def make_gdn_chunk_fused(target: str):
     """Fused gated-delta chunk prefill core (sm90): the T>1 generalization of
     make_gdn_decode_fused. One block per (value head, batch); thread tv owns
-    state column S[:, tv]; a serial scan over T tokens carries the state in
-    HBM (decay-first recurrence, matching reference.gdn_forward).
+    state column S[:, tv]; a serial scan over T tokens carries the state in a
+    per-thread local array (decay-first recurrence, matching
+    reference.gdn_forward).
 
     Replaces reference.gdn_forward's Python head loop on prefill (~150k tiny
     kernel launches per 512-token prefill on the 27B slice: 48 value heads x
@@ -939,9 +940,19 @@ def make_gdn_chunk_fused(target: str):
     # serially over T steps, across chunks carry the state (input State /
     # output NewState are the carry). Not fla's chunk delta rule (that
     # freezes chunk-start state — incompatible with decay-first).
-    # ponytail: state columns stream from HBM/L2 (2 passes per token, like
-    # decode); a shared-memory state tile (K*V*4 = 64KB) is the upgrade when
-    # the state traffic shows up on the profile.
+    # Local state column: the state column (K=128 floats) lives in a
+    # per-thread local array (registers/L1), loaded once at the seed and
+    # stored once per token in pass 2 — not streamed through global 4x per
+    # token (2 loads + 2 stores, strided). 4 accumulators per pass break the
+    # 128-deep FMA chain into 4 x 32-deep and issue 4 state loads per
+    # iteration (ILP hides the L1/register latency). bf16 IO halves the
+    # conv/projection load traffic (Q/Key/Val/Z/Window/NewWindow are bf16;
+    # state/out/weights stay f32). Sweep (scripts/_sweep_gdn_prefill2.py,
+    # H20 quiet): local+4acc+bf16 is the winner (21.6% faster than the
+    # global-state f32 baseline; 8acc and the fused-dot reassociation tested
+    # worse). The shared-memory state tile (64KB) was rejected earlier
+    # (1.7x slower — LDS bank conflicts, global hits L1 with better
+    # pipelining).
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
@@ -954,21 +965,21 @@ def make_gdn_chunk_fused(target: str):
         VD = NVH * V
         QKVD = 2 * QD + VD
         scale = T.rsqrt(T.cast(K, "float32"))
-        Q: T.Tensor((B, TT, QD), "float32")
-        Key: T.Tensor((B, TT, QD), "float32")
-        Val: T.Tensor((B, TT, VD), "float32")
-        Z: T.Tensor((B, TT, VD), "float32")
+        Q: T.Tensor((B, TT, QD), "bfloat16")
+        Key: T.Tensor((B, TT, QD), "bfloat16")
+        Val: T.Tensor((B, TT, VD), "bfloat16")
+        Z: T.Tensor((B, TT, VD), "bfloat16")
         GIn: T.Tensor((B, TT, NVH), "float32")
         BIn: T.Tensor((B, TT, NVH), "float32")
         DtBias: T.Tensor((NVH,), "float32")
         ALog: T.Tensor((NVH,), "float32")
         NormW: T.Tensor((V,), "float32")
         ConvW: T.Tensor((QKVD, KER), "float32")
-        Window: T.Tensor((B, KER - 1, QKVD), "float32")
+        Window: T.Tensor((B, KER - 1, QKVD), "bfloat16")
         State: T.Tensor((B, NVH, K, V), "float32")
         Out = T.empty((B, TT, VD), "float32")
         NewState = T.empty((B, NVH, K, V), "float32")
-        NewWindow = T.empty((B, KER - 1, QKVD), "float32")
+        NewWindow = T.empty((B, KER - 1, QKVD), "bfloat16")
         with T.Kernel(NVH, B, threads=threads) as (vh, bb):
             tv = T.get_thread_binding(0)
             kh = vh * (QD // K) // NVH
@@ -998,9 +1009,15 @@ def make_gdn_chunk_fused(target: str):
             acc_k = T.alloc_fragment((1,), "float32")
             acc_sq = T.alloc_fragment((1,), "float32")
 
-            # seed the running state; token 0's decay pass reads it
+            # per-thread state column: carried in a local array across all T
+            # tokens (loaded once at seed, stored once per token in pass 2)
+            # instead of streamed through global 4x per token. 4 accumulators
+            # per pass break the 128-deep FMA chain into 4 x 32-deep and issue
+            # 4 state loads per iteration (ILP hides the L1/register latency).
+            state_local = T.alloc_local((K,), "float32")
+            accs = T.alloc_local((2 * 4,), "float32")
             for j in T.serial(K):
-                NewState[bb, vh, j, tv] = State[bb, vh, j, tv]
+                state_local[j] = State[bb, vh, j, tv]
 
             for t in T.serial(TT):
                 # conv1d (KER taps over Window ++ qkv) + SiLU on this head's
@@ -1011,13 +1028,17 @@ def make_gdn_chunk_fused(target: str):
                 cv[0] = 0.0
                 for tap in T.serial(KER):
                     if t + tap < KER - 1:
-                        cq[0] += Window[bb, t + tap, qc] * ConvW[qc, tap]
-                        ck[0] += Window[bb, t + tap, kc] * ConvW[kc, tap]
-                        cv[0] += Window[bb, t + tap, vc] * ConvW[vc, tap]
+                        cq[0] += T.cast(Window[bb, t + tap, qc], "float32") * ConvW[qc, tap]
+                        ck[0] += T.cast(Window[bb, t + tap, kc], "float32") * ConvW[kc, tap]
+                        cv[0] += T.cast(Window[bb, t + tap, vc], "float32") * ConvW[vc, tap]
                     else:
-                        cq[0] += Q[bb, t + tap - (KER - 1), qc] * ConvW[qc, tap]
-                        ck[0] += Key[bb, t + tap - (KER - 1), qc] * ConvW[kc, tap]
-                        cv[0] += Val[bb, t + tap - (KER - 1), vh * V + tv] * ConvW[vc, tap]
+                        cq[0] += T.cast(Q[bb, t + tap - (KER - 1), qc], "float32") * ConvW[qc, tap]
+                        ck[0] += T.cast(
+                            Key[bb, t + tap - (KER - 1), qc], "float32"
+                        ) * ConvW[kc, tap]
+                        cv[0] += T.cast(
+                            Val[bb, t + tap - (KER - 1), vh * V + tv], "float32"
+                        ) * ConvW[vc, tap]
                 q_s[tv] = cq[0] * T.sigmoid(cq[0])
                 k_s[tv] = ck[0] * T.sigmoid(ck[0])
                 v_s[tv] = cv[0] * T.sigmoid(cv[0])
@@ -1042,18 +1063,28 @@ def make_gdn_chunk_fused(target: str):
                 k_s[tv] = k_s[tv] * kn[0]
                 T.tvm_storage_sync("shared")
 
-                # recurrence: decay + kv_mem, then rank-1 update + out
-                T.clear(kv_mem)
-                for j in T.serial(K):
-                    sj = NewState[bb, vh, j, tv] * exp_g_s[0]
-                    NewState[bb, vh, j, tv] = sj
-                    kv_mem[0] += sj * k_s[j]
+                # recurrence: decay + kv_mem, then rank-1 update + out.
+                # The state column lives in state_local (registers/L1); only
+                # pass 2 writes the final state to global (once per token).
+                # 4 accumulators per pass (chain 128->32 deep, 4 loads/iter).
+                for a in T.serial(2 * 4):
+                    accs[a] = 0.0
+                for j in T.serial(K // 4):
+                    base = j * 4
+                    for u in T.unroll(4):
+                        sj = state_local[base + u] * exp_g_s[0]
+                        state_local[base + u] = sj
+                        accs[u] += sj * k_s[base + u]
+                kv_mem[0] = accs[0] + accs[1] + accs[2] + accs[3]
                 delta[0] = (v_s[tv] - kv_mem[0]) * beta_s[0]
-                T.clear(acc_o)
-                for j in T.serial(K):
-                    sj = NewState[bb, vh, j, tv] + delta[0] * k_s[j]
-                    NewState[bb, vh, j, tv] = sj
-                    acc_o[0] += sj * q_s[j]
+                for j in T.serial(K // 4):
+                    base = j * 4
+                    for u in T.unroll(4):
+                        sj = state_local[base + u] + delta[0] * k_s[base + u]
+                        state_local[base + u] = sj
+                        NewState[bb, vh, base + u, tv] = sj
+                        accs[4 + u] += sj * q_s[base + u]
+                acc_o[0] = accs[4] + accs[5] + accs[6] + accs[7]
                 out_s[tv] = acc_o[0]
                 T.tvm_storage_sync("shared")
 
@@ -1064,7 +1095,7 @@ def make_gdn_chunk_fused(target: str):
                         acc_sq[0] += out_s[j] * out_s[j]
                     rms_s[0] = T.rsqrt(acc_sq[0] / T.cast(V, "float32") + 1e-6)
                 T.tvm_storage_sync("shared")
-                gate = Z[bb, t, vh * V + tv]
+                gate = T.cast(Z[bb, t, vh * V + tv], "float32")
                 Out[bb, t, vh * V + tv] = (
                     out_s[tv] * rms_s[0] * NormW[tv] * (gate * T.sigmoid(gate))
                 )

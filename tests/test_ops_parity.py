@@ -653,14 +653,12 @@ def test_gdn_chunk_matches_decode(backend):
     if backend.arch != "sm90":
         pytest.skip("GDN fused kernels are sm90-only")
     q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 1, 2, 4, 16, 16, 4, 29)
-    f32, c = backend._f32, backend._c
+    f32, bf16, c = backend._f32, backend._bf16, backend._c
     common = (
         f32(kw["dt_bias"]),
         f32(kw["a_log"]),
         f32(kw["norm_weight"]),
         f32(kw["conv1d_weight"]),
-        f32(kw["conv_window"]),
-        f32(state),
     )
     dout, dstate, dwin = backend._kernel("gdn_decode_fused")(
         c(f32(q).squeeze(1)),
@@ -670,16 +668,20 @@ def test_gdn_chunk_matches_decode(backend):
         c(f32(g).squeeze(1)),
         c(f32(beta).squeeze(1)),
         *common,
+        f32(kw["conv_window"]),
+        f32(state),
         threads=state.shape[-1],
     )
     cout, cstate, cwin = backend._kernel("gdn_chunk_fused")(
-        c(f32(q)),
-        c(f32(k)),
-        c(f32(v)),
-        c(f32(z)),
+        c(bf16(q)),
+        c(bf16(k)),
+        c(bf16(v)),
+        c(bf16(z)),
         c(f32(g)),
         c(f32(beta)),
         *common,
+        bf16(kw["conv_window"]),
+        f32(state),
         threads=state.shape[-1],
     )
     _assert_close(cout.squeeze(1), dout, "chunk-vs-decode out")
