@@ -20,15 +20,20 @@ __all__ = ["main"]
 _QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")
 
 
-def _build_model(model_name: str, seed: int):
-    """Build (cfg, model) for a named model. Lazy imports keep --help light."""
+def _build_model(model_name: str, seed: int, fuse_projections: bool = False):
+    """Build (cfg, model) for a named model. Lazy imports keep --help light.
+
+    ``fuse_projections`` concats same-input fp4 projections into one GEMV at
+    load (serving decode is launch-latency-bound on the small projections);
+    training keeps it off so the tape sees the unfused masters.
+    """
     from . import config as config_mod
     from . import model as model_mod
 
     if model_name == "qwen38-27b":
         cfg = config_mod.qwen38_27b()
         try:
-            model = model_mod.load_hf(cfg, _QWEN38_SOURCE)
+            model = model_mod.load_hf(cfg, _QWEN38_SOURCE, fuse_projections=fuse_projections)
         except Exception as exc:
             print(
                 f"error: could not load Qwen3-27B weights from {_QWEN38_SOURCE!r}: {exc}\n"
@@ -39,7 +44,7 @@ def _build_model(model_name: str, seed: int):
             sys.exit(1)
         return cfg, model
     cfg = config_mod.tiny()
-    return cfg, model_mod.build_random(cfg, seed=seed)
+    return cfg, model_mod.build_random(cfg, seed=seed, fuse_projections=fuse_projections)
 
 
 def _build_engine(cfg, model, backend):
@@ -69,7 +74,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     from .server import create_app, get_tokenizer
 
     backend = get_backend()
-    cfg, model = _build_model(args.model, seed=0)
+    cfg, model = _build_model(args.model, seed=0, fuse_projections=True)
     engine = _build_engine(cfg, model, backend)
     tokenizer = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
 

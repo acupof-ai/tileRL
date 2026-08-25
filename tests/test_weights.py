@@ -172,6 +172,33 @@ def test_fp4_on_load_and_forward(tmp_path):
     engine.shutdown()
 
 
+def test_fused_projections_parity(tmp_path):
+    """fuse_projections concats same-input fp4 projections into one GEMV; the
+    fused model's logits match the unfused model's (concat + slice is lossless)."""
+    import numpy as np
+
+    from tilerl.ops.backend import get_backend
+    from tilerl.testing import RefBackend
+    from tilerl.train import _training_kv
+
+    cfg = tiny()
+    model = build_random(cfg, seed=7)
+    _write_checkpoint(tmp_path, cfg, model.params)
+    unfused = load_hf(replace(cfg, fp4=True), str(tmp_path))
+    fused = load_hf(replace(cfg, fp4=True), str(tmp_path), fuse_projections=True)
+    assert "layers.0.gate_up.wq" in fused.params
+    batch = np.random.default_rng(3).integers(3, cfg.vocab_size, size=(2, 16)).astype(np.int64)
+    positions = np.arange(16, dtype=np.int64)
+    backend = RefBackend()
+    with torch.no_grad():
+        y0 = unfused.forward(batch, positions, _training_kv(unfused, 2, 16), backend)
+        y1 = fused.forward(batch, positions, _training_kv(fused, 2, 16), backend)
+        # AGENTS.md parity gate: fused path through the TileLang CPU kernels.
+        y2 = fused.forward(batch, positions, _training_kv(fused, 2, 16), get_backend())
+    assert torch.allclose(y0, y1, rtol=1e-2, atol=1e-2), (y0 - y1).abs().max()
+    assert torch.allclose(y0, y2, rtol=1e-2, atol=1e-2), (y0 - y2).abs().max()
+
+
 def test_nvfp4_modelopt_load(tmp_path):
     """ModelOpt NVFP4/FP8-block checkpoint (Qwen3.6 format): MLP linears load
     from weight_packed + f8 weight_scale + global scale (the stored global is

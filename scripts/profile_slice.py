@@ -232,6 +232,11 @@ def main() -> None:
         action="store_true",
         help="capture the decode tick as a CUDA graph (replay per token)",
     )
+    p.add_argument(
+        "--fuse",
+        action="store_true",
+        help="fuse same-input fp4 projections (qkv/ab/gate_up) into one GEMV each",
+    )
     args = p.parse_args()
 
     from tilerl.config import qwen36_27b
@@ -250,7 +255,7 @@ def main() -> None:
     )
 
     t0 = time.perf_counter()
-    model = load_hf(cfg, args.source)
+    model = load_hf(cfg, args.source, fuse_projections=args.fuse)
     print(f"load: {time.perf_counter() - t0:.1f}s", flush=True)
 
     # 128 blocks: the prefix store retains each published prompt (a 512-token

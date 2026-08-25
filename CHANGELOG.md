@@ -4,6 +4,18 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-25 — default flip: serving fuses same-input fp4 projections (qkv/ab/gate_up) — decode +4.8%
+
+- **Flip.** `cmd_serve` now loads with `fuse_projections=True`: same-input
+  fp4 projections concat losslessly along N at load (per-32-block scales are
+  per-row) and one GEMV replaces the group's launches. Training keeps the
+  unfused masters (the fused key has none — its tape backward would have
+  nowhere to land the STE grad). A/B on slice4, decode graph: 1.821 → 1.734
+  ms/tick (549 → 577 tok/s slice); prefill +1.3% (noise). The win is
+  per-kernel replay overhead, not Python dispatch (the graph already
+  amortizes that) — the eager B>1 path stands to gain more. Entry:
+  `docs/experience/wins/2026-08-25-projection-fusion-decode.md`.
+
 ## 2026-08-25 — accept-or-reject: fp4 GEMV shared-memory dequant ping-pong — REJECTED (2.5-3.3x slower than register group4)
 
 - **Verdict.** Tried to move the fp4 GEMV dequant off the FMA critical path

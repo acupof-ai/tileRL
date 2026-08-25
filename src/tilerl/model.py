@@ -151,6 +151,44 @@ def fp4_param_keys(cfg: ModelConfig) -> set[str]:
     return keys
 
 
+def _projection_groups(cfg: ModelConfig, layer_idx: int) -> list[tuple[str, list[str]]]:
+    """Same-input fp4 projection groups, fused at load for serving decode.
+
+    Each group reads the same post-norm hidden and is fp4-packed, so the
+    packed weights concat losslessly along N (per-32-block scales are
+    per-row) and one GEMV replaces the group's launches — the decode tick is
+    launch-latency-bound on the small projections (N=48/1024 at 0.1-3% roof),
+    so collapsing launches is the lever. Serving-only: training keeps the
+    unfused masters (the fused key has none, so its tape backward would have
+    nowhere to land the STE grad).
+    """
+    p = f"layers.{layer_idx}"
+    groups = [(f"{p}.gate_up", [f"{p}.gate_proj", f"{p}.up_proj"])]
+    if cfg.is_full_attn(layer_idx):
+        groups.append((f"{p}.qkv", [f"{p}.q_proj", f"{p}.k_proj", f"{p}.v_proj"]))
+    else:
+        groups.append((f"{p}.ab", [f"{p}.in_proj_a", f"{p}.in_proj_b"]))
+    return groups
+
+
+def _fuse_projections(cfg: ModelConfig, params: dict[str, torch.Tensor]) -> None:
+    """Concat each group's packed fp4 weights into a fused key (in-place)."""
+    for i in range(cfg.num_layers):
+        for fused_key, group in _projection_groups(cfg, i):
+            if f"{fused_key}.wq" in params:
+                continue
+            try:
+                wqs = [params[f"{k}.wq"] for k in group]
+                scales = [params[f"{k}.scale"] for k in group]
+            except KeyError:
+                continue  # group not fully fp4 (bf16 checkpoint) — skip
+            params[f"{fused_key}.wq"] = torch.cat(wqs, dim=0).contiguous()
+            params[f"{fused_key}.scale"] = torch.cat(scales, dim=0).contiguous()
+            for k in group:  # drop the dead copies (bf16 masters stay, recording-only)
+                del params[f"{k}.wq"]
+                del params[f"{k}.scale"]
+
+
 # --- Model ------------------------------------------------------------------
 class Model:
     """Qwen3.5/3.6 hybrid model. ``params`` maps :func:`param_specs` keys to
@@ -167,8 +205,11 @@ class Model:
         wq = self.params.get(key + ".wq")
         if wq is not None:
             # ``master`` is recording-only: the STE grad lands on the bf16
-            # master weight (see autograd._linear_fp4).
-            return backend.linear_fp4(x, wq, self.params[key + ".scale"], master=self.params[key])
+            # master weight (see autograd._linear_fp4). Fused projection keys
+            # (serving-only) have no master — the tape never sees them.
+            return backend.linear_fp4(
+                x, wq, self.params[key + ".scale"], master=self.params.get(key)
+            )
         w8 = self.params.get(key + ".w8")
         if w8 is not None:
             # Native fp8: the sm90 prefill path computes with w8 directly;
@@ -189,11 +230,19 @@ class Model:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps)
-        q = self._linear(backend, h, f"{p}.q_proj")
-        k = self._linear(backend, h, f"{p}.k_proj")
-        v = self._linear(backend, h, f"{p}.v_proj")
-        b, t, _ = q.shape
         hq, hkv, d = cfg.num_attention_heads, cfg.num_kv_heads, cfg.head_dim
+        qkv_key = f"{p}.qkv"
+        if f"{qkv_key}.wq" in self.params:  # fused q/k/v (serving)
+            qkv = self._linear(backend, h, qkv_key)
+            q_rows = hq * d * (2 if cfg.full_attn_gated else 1)
+            q = autograd.slice(qkv, ..., slice(0, q_rows))
+            k = autograd.slice(qkv, ..., slice(q_rows, q_rows + hkv * d))
+            v = autograd.slice(qkv, ..., slice(q_rows + hkv * d, None))
+        else:
+            q = self._linear(backend, h, f"{p}.q_proj")
+            k = self._linear(backend, h, f"{p}.k_proj")
+            v = self._linear(backend, h, f"{p}.v_proj")
+        b, t, _ = q.shape
         if cfg.full_attn_gated:
             # q_proj rows interleave [query(HD); gate(HD)] per head.
             q = autograd.reshape(q, b, t, hq, 2, d)
@@ -240,8 +289,15 @@ class Model:
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps)
         qkv = self._linear(backend, h, f"{p}.in_proj_qkv")
         z = self._linear(backend, h, f"{p}.in_proj_z")
-        b_proj = self._linear(backend, h, f"{p}.in_proj_b")
-        a_proj = self._linear(backend, h, f"{p}.in_proj_a")
+        ab_key = f"{p}.ab"
+        if f"{ab_key}.wq" in self.params:  # fused a/b (serving)
+            ab = self._linear(backend, h, ab_key)
+            nvh = cfg.linear_num_value_heads
+            a_proj = autograd.slice(ab, ..., slice(0, nvh))
+            b_proj = autograd.slice(ab, ..., slice(nvh, None))
+        else:
+            b_proj = self._linear(backend, h, f"{p}.in_proj_b")
+            a_proj = self._linear(backend, h, f"{p}.in_proj_a")
         qd, kd = cfg.linear_q_dim, cfg.linear_k_dim
         # Recorded slices of the fused projection: the tape must see the split
         # or the grad never reaches in_proj_qkv (views break the id() chain).
@@ -279,8 +335,14 @@ class Model:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.post_attn_norm"], cfg.rms_eps)
-        gate = self._linear(backend, h, f"{p}.gate_proj")
-        up = self._linear(backend, h, f"{p}.up_proj")
+        gu_key = f"{p}.gate_up"
+        if f"{gu_key}.wq" in self.params:  # fused gate/up (serving)
+            gu = self._linear(backend, h, gu_key)
+            gate = autograd.slice(gu, ..., slice(0, cfg.intermediate_size))
+            up = autograd.slice(gu, ..., slice(cfg.intermediate_size, None))
+        else:
+            gate = self._linear(backend, h, f"{p}.gate_proj")
+            up = self._linear(backend, h, f"{p}.up_proj")
         activated = backend.silu_mul(gate, up)
         down = self._linear(backend, activated, f"{p}.down_proj")
         return backend.add(x, down)
@@ -315,7 +377,7 @@ class Model:
 
 
 # --- Random initialization --------------------------------------------------
-def build_random(cfg: ModelConfig, seed: int) -> Model:
+def build_random(cfg: ModelConfig, seed: int, fuse_projections: bool = False) -> Model:
     """Deterministic random model: N(0, 0.02^2) matrices, ones for norms,
     zeros for dt_bias/a_log, all bf16 on CPU. fp4 linears are packed from
     their bf16 master (master kept for the STE backward)."""
@@ -342,6 +404,8 @@ def build_random(cfg: ModelConfig, seed: int) -> Model:
             params[f"{key}.scale"] = scale
         # ponytail: fp4 masters double the weight memory (54GB for 27B bf16);
         # inference-only runs could drop them, training needs them for the STE.
+    if fuse_projections:
+        _fuse_projections(cfg, params)
     return Model(cfg, params)
 
 
@@ -468,7 +532,9 @@ def _dequant_mlx(
     return (s * q + b).to(torch.bfloat16)
 
 
-def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Model:
+def load_hf(
+    cfg: ModelConfig, source: str, num_layers: int | None = None, fuse_projections: bool = False
+) -> Model:
     """Load ``source`` (HF repo id or local checkpoint directory) into a Model.
 
     ``num_layers`` truncates to the first N layers (embedding + N layers +
@@ -706,6 +772,8 @@ def load_hf(cfg: ModelConfig, source: str, num_layers: int | None = None) -> Mod
             params[f"{key}.wq"] = wq
             params[f"{key}.scale"] = scale
 
+    if fuse_projections:
+        _fuse_projections(cfg, params)
     return Model(cfg, params)
 
 
