@@ -543,6 +543,45 @@ def test_linear_attn_chunk_vs_step(backend):
     _assert_close(ns, s, "chunk-vs-step state")
 
 
+def test_gdr_chunk_scan_parity(backend):
+    """6-arg chunked GDR scan (sm90, K=V=128): the FlashQLA chunk-WY pipeline
+    vs reference._gated_delta_scan. T=130 (partial last chunk) and B=2 (batch
+    flattening) exercise the boundary masks. On non-sm90 the 6-arg path uses
+    the portable serial kernel (covered by test_linear_attn_chunk_parity), so
+    this gate is sm90-only."""
+    if backend.arch != "sm90":
+        pytest.skip("chunked GDR scan is sm90-only")
+    torch.manual_seed(31)
+    b, t, h, d = 2, 130, 4, 128
+    q = torch.randn(b, t, h, d, device=backend.device) * 0.1
+    k = torch.randn(b, t, h, d, device=backend.device) * 0.1
+    v = torch.randn(b, t, h, d, device=backend.device) * 0.1
+    g = torch.sigmoid(torch.randn(b, t, h, device=backend.device)) * 0.5 + 0.4
+    beta = torch.sigmoid(torch.randn(b, t, h, device=backend.device))
+    state = torch.randn(b, h, d, d, device=backend.device) * 0.01
+    out, ns, _ = backend.linear_attn_chunk(q, k, v, g, beta, state)
+    rout, rns = reference._gated_delta_scan(q, k, v, g, beta, state)
+    _assert_close(out, rout, "gdr chunk scan out")
+    _assert_close(ns, rns, "gdr chunk scan state")
+
+
+def test_gdn_chunk_prefill_parity(backend):
+    """Full-GDN prefill via the chunked GDR pipeline (sm90, K=V=128):
+    conv1d+SiLU -> norm+gates -> chunked scan -> post-norm+z, vs
+    reference.gdn_forward. T=130 (partial last chunk). On non-sm90 the
+    full-GDN T>1 path uses the serial mega-kernel (covered by
+    test_gdn_chunk_fused_parity at K=V=16), so this gate is sm90-only."""
+    if backend.arch != "sm90":
+        pytest.skip("chunked GDR prefill is sm90-only")
+    q, k, v, g, beta, z, state, kw = _gdn_inputs(1, 130, 4, 8, 128, 128, 4, 37)
+    # Pure-prefill rows (no seq_q_lens): the chunked path's gate.
+    out, ns, nw = backend.linear_attn_chunk(q, k, v, g, beta, state, z=z, **kw)
+    rout, rns, rnw = reference.gdn_forward(q, k, v, g, beta, state, z=z, **kw)
+    _assert_close(out, rout, "gdn chunk prefill out")
+    _assert_close(ns, rns, "gdn chunk prefill state")
+    _assert_close(nw, rnw, "gdn chunk prefill window")
+
+
 def test_gdn_conv_window_makes_step_exact():
     """The conv_window carry makes segmented decode (T=1 per forward) exactly
     equal to a one-shot chunk forward: threading the returned window through
@@ -654,12 +693,14 @@ def test_gdn_chunk_matches_decode(backend):
         pytest.skip("GDN fused kernels are sm90-only")
     q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 1, 2, 4, 16, 16, 4, 29)
     f32, bf16, c = backend._f32, backend._bf16, backend._c
+    i32 = backend._i32
     common = (
         f32(kw["dt_bias"]),
         f32(kw["a_log"]),
         f32(kw["norm_weight"]),
         f32(kw["conv1d_weight"]),
     )
+    seq_q = i32(torch.full((q.shape[0],), q.shape[1], dtype=torch.int32))
     dout, dstate, dwin = backend._kernel("gdn_decode_fused")(
         c(f32(q).squeeze(1)),
         c(f32(k).squeeze(1)),
@@ -682,6 +723,7 @@ def test_gdn_chunk_matches_decode(backend):
         *common,
         bf16(kw["conv_window"]),
         f32(state),
+        c(seq_q),
         threads=state.shape[-1],
     )
     _assert_close(cout.squeeze(1), dout, "chunk-vs-decode out")

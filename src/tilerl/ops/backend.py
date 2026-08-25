@@ -166,6 +166,15 @@ _SM90_KERNELS = {
     "write_tokens": kernels_mma.make_write_tokens,
     "gdn_decode_fused": kernels_mma.make_gdn_decode_fused,
     "gdn_chunk_fused": kernels_mma.make_gdn_chunk_fused,
+    "gdr_cumsum": kernels_mma.make_gdr_cumsum,
+    "gdr_kkt": kernels_mma.make_gdr_kkt,
+    "gdr_solve": kernels_mma.make_gdr_solve,
+    "gdr_recompute": kernels_mma.make_gdr_recompute,
+    "gdr_state": kernels_mma.make_gdr_state,
+    "gdr_o": kernels_mma.make_gdr_o,
+    "gdn_conv1d_silu": kernels_mma.make_gdn_conv1d_silu,
+    "gdn_norm_gates": kernels_mma.make_gdn_norm_gates,
+    "gdn_post_norm_z": kernels_mma.make_gdn_post_norm_z,
     "paged_attention": kernels_mma.make_paged_attention_mma,
 }
 _register("bf16", "sm90", _SM90_KERNELS)
@@ -649,8 +658,33 @@ class Backend:
             if q.shape[1] == 1 and "gdn_decode_fused" in _kset:
                 return self._gdn_decode_fused(q, k, v, g, beta, state, **kw)
             if q.shape[1] > 1 and "gdn_chunk_fused" in _kset:
+                # Pure-prefill rows (every row's seq_q_lens == T) at the model
+                # shape (K=V=128) use the chunked-WY pipeline; mixed batches
+                # (decode rows padded to T) and other shapes use the serial
+                # mega-kernel.
+                seq_q = kw.get("seq_q_lens")
+                pure_prefill = seq_q is None or bool((seq_q == q.shape[1]).all())
+                if (
+                    pure_prefill
+                    and state.shape[-2] == 128
+                    and state.shape[-1] == 128
+                    and "gdn_conv1d_silu" in _kset
+                ):
+                    return self._gdn_chunk_prefill(q, k, v, g, beta, state, **kw)
+                # ponytail: mixed batches (per-row seq_q_lens) use the serial
+                # mega-kernel; per-row chunked scheduling is the upgrade path.
                 return self._gdn_chunk_fused(q, k, v, g, beta, state, **kw)
             return reference.gdn_forward(q, k, v, g, beta, state, **kw)
+        # 6-arg form: the plain gated-delta scan. sm90 + model shape (K=V=128)
+        # + T>1 uses the chunked-WY pipeline (make_gdr_*); other shapes/arches
+        # use the portable per-column serial kernel.
+        if (
+            self.arch == "sm90"
+            and q.shape[1] > 1
+            and q.shape[-1] == 128
+            and "gdr_cumsum" in _resolve(self.precision, self.arch)
+        ):
+            return self._gdr_chunk_scan(q, k, v, g, beta, state)
         ker = self._kernel("linear_attn_chunk")
         out, new_state = ker(
             self._c(self._f32(q)),
@@ -734,6 +768,116 @@ class Backend:
             threads=state.shape[-1],
         )
         return out, new_state, (self._f32(new_window) if has_window else None)
+
+    def _gdr_chunk_scan(self, q, k, v, g, beta, state):
+        """6-arg chunked GDR scan (sm90, K=V=128): the FlashQLA chunk-WY
+        pipeline (make_gdr_*) replacing the serial per-column scan.
+
+        q,k,v [B,T,H,D] (bf16 at the boundary), g/beta [B,T,H] f32 (g already
+        exponentiated), state [B,H,D,D] f32. The (B,H) heads flatten to BH —
+        each (b,h) is an independent scan. Returns (out [B,T,H,D] f32,
+        new_state [B,H,D,D] f32, None). Six caller-allocated stages chained:
+        cumsum -> kkt -> solve -> recompute -> state -> o."""
+        b, t, h, d = q.shape
+        bh = b * h
+        nc = (t + 63) // 64
+        dev = self.device
+        thr = 128
+        # [B,T,H,D] -> [T,BH,D]; [B,T,H] -> [T,BH]; [B,H,D,D] -> [BH,D,D]
+        qf = self._c(self._bf16(q)).transpose(0, 1).reshape(t, bh, d)
+        kf = self._c(self._bf16(k)).transpose(0, 1).reshape(t, bh, d)
+        vf = self._c(self._bf16(v)).transpose(0, 1).reshape(t, bh, d)
+        gf = self._c(self._f32(g)).transpose(0, 1).reshape(t, bh)
+        bf = self._c(self._f32(beta)).transpose(0, 1).reshape(t, bh)
+        s0 = self._c(self._f32(state)).reshape(bh, d, d)
+        gc = torch.empty(t, bh, dtype=torch.float32, device=dev)
+        a_tril = torch.empty(t, bh, 64, dtype=torch.float32, device=dev)
+        a_inv = torch.empty(t, bh, 64, dtype=torch.bfloat16, device=dev)
+        # gdr_solve writes only the 10 lower+diagonal blocks of the inverse;
+        # the 6 upper off-diagonal blocks are zero (inverse of lower-triangular
+        # is lower-triangular) but never written. Zero first so a reused buffer
+        # doesn't leak stale values into recompute's GEMM.
+        a_inv.zero_()
+        w = torch.empty(t, bh, d, dtype=torch.bfloat16, device=dev)
+        u = torch.empty(t, bh, d, dtype=torch.bfloat16, device=dev)
+        chunk_state = torch.empty(nc, bh, d, d, dtype=torch.float32, device=dev)
+        v_new = torch.empty(t, bh, d, dtype=torch.bfloat16, device=dev)
+        s_out = torch.empty(bh, d, d, dtype=torch.float32, device=dev)
+        out = torch.empty(t, bh, d, dtype=torch.bfloat16, device=dev)
+        self._kernel("gdr_cumsum")(gf, gc, thr)
+        self._kernel("gdr_kkt")(kf, gc, bf, a_tril, thr)
+        self._kernel("gdr_solve")(a_tril, a_inv, thr)
+        self._kernel("gdr_recompute")(kf, vf, bf, a_inv, gc, w, u, thr)
+        self._kernel("gdr_state")(kf, w, u, gc, s0, chunk_state, v_new, s_out, t, thr)
+        self._kernel("gdr_o")(qf, kf, v_new, chunk_state, gc, out, 1.0, thr)
+        out = out.float().reshape(t, b, h, d).transpose(0, 1).contiguous()
+        return out, s_out.reshape(b, h, d, d).contiguous(), None
+
+    def _gdn_chunk_prefill(self, q, k, v, g, beta, state, **kw):
+        """Full-GDN prefill via the chunked GDR pipeline (sm90, K=V=128, T>1,
+        pure-prefill rows): conv1d+SiLU -> norm+gates -> chunked scan ->
+        post-norm+z-gate. The serial mega-kernel is the fallback for T=1 and
+        mixed batches (see linear_attn_chunk)."""
+        b, t, _ = q.shape
+        nvh, k_dim, v_dim = state.shape[1], state.shape[2], state.shape[3]
+        nkh = q.shape[-1] // k_dim
+        ker = kw["conv1d_weight"].shape[1]
+        window = kw.get("conv_window")
+        has_window = window is not None
+        if not has_window:
+            window = torch.zeros(
+                b,
+                ker - 1,
+                q.shape[-1] + k.shape[-1] + v.shape[-1],
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+        dev = self.device
+        qd = nkh * k_dim
+        vd = nvh * v_dim
+        # Stage 1: conv1d + SiLU -> catted [q|k|v] preact.
+        preact = torch.empty(b, t, 2 * qd + vd, dtype=torch.bfloat16, device=dev)
+        qkv = self._c(torch.cat([self._bf16(q), self._bf16(k), self._bf16(v)], dim=-1))
+        self._kernel("gdn_conv1d_silu")(
+            qkv,
+            self._c(self._f32(kw["conv1d_weight"])),
+            self._c(self._bf16(window)),
+            preact,
+            k_dim,
+        )
+        # Stage 2: q/k L2-norm (GQA-expanded to nvh) + g/beta gates.
+        qn = torch.empty(b, t, nvh, k_dim, dtype=torch.bfloat16, device=dev)
+        kn = torch.empty(b, t, nvh, k_dim, dtype=torch.bfloat16, device=dev)
+        exp_g = torch.empty(b, t, nvh, dtype=torch.float32, device=dev)
+        bt_g = torch.empty(b, t, nvh, dtype=torch.float32, device=dev)
+        self._kernel("gdn_norm_gates")(
+            preact,
+            self._c(self._f32(g)),
+            self._c(self._f32(beta)),
+            self._c(self._f32(kw["dt_bias"])),
+            self._c(self._f32(kw["a_log"])),
+            qn,
+            kn,
+            exp_g,
+            bt_g,
+            qd,
+            k_dim,
+        )
+        # Stage 3: chunked scan (6 kernels), flatten B*nvh.
+        v_raw = preact[..., 2 * qd :].reshape(b, t, nvh, v_dim)
+        out_core, new_state, _ = self._gdr_chunk_scan(qn, kn, v_raw, exp_g, bt_g, state)
+        # Stage 4: gated RMSNorm + z-gate.
+        out = torch.empty(b, t, vd, dtype=torch.float32, device=dev)
+        self._kernel("gdn_post_norm_z")(
+            self._c(out_core),
+            self._c(self._f32(kw["norm_weight"])),
+            self._c(self._bf16(kw["z"])),
+            out,
+            v_dim,
+        )
+        # New conv window: last KER-1 raw qkv of (window ++ qkv).
+        new_window = torch.cat([self._bf16(window), qkv], dim=1)[:, -(ker - 1) :, :].contiguous()
+        return out, new_state, (new_window if has_window else None)
 
     def linear_attn_step(self, q, k, v, g, beta, state, **kw):
         out, new_state, new_window = self.linear_attn_chunk(

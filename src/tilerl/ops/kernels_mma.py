@@ -29,6 +29,15 @@ __all__ = [
     "make_write_tokens",
     "make_gdn_decode_fused",
     "make_gdn_chunk_fused",
+    "make_gdr_cumsum",
+    "make_gdr_kkt",
+    "make_gdr_solve",
+    "make_gdr_recompute",
+    "make_gdr_state",
+    "make_gdr_o",
+    "make_gdn_conv1d_silu",
+    "make_gdn_norm_gates",
+    "make_gdn_post_norm_z",
     "make_paged_attention_mma",
 ]
 
@@ -962,8 +971,10 @@ def make_gdn_chunk_fused(target: str):
     # (qwen36_prefill_wy.py + qwen36_prefill_scan_o.py); tileRL's decay-first
     # recurrence is serial-within-block instead — within a chunk scan
     # serially over T steps, across chunks carry the state (input State /
-    # output NewState are the carry). Not fla's chunk delta rule (that
-    # freezes chunk-start state — incompatible with decay-first).
+    # output NewState are the carry). The chunked-WY reordering of this same
+    # recurrence (make_gdr_* below) is exact for an affine-in-S0 recurrence —
+    # the intra-chunk KKT triangular solve + inter-chunk state carry is the
+    # block form of this serial scan, not a different recurrence.
     # Local state column: the state column (K=128 floats) lives in a
     # per-thread local array (registers/L1), loaded once at the seed and
     # stored once per token in pass 2 — not streamed through global 4x per
@@ -1153,6 +1164,713 @@ def make_gdn_chunk_fused(target: str):
         return Out, NewState, NewWindow
 
     return gdn_chunk_fused
+
+
+# ---------------------------------------------------------------- chunked GDR scan (sm90)
+#
+# The FlashQLA chunk-wise gated-delta-rule pipeline — the block reordering of
+# the serial scan in make_gdn_chunk_fused (exact for an affine-in-S0
+# recurrence): intra-chunk WY (64x64 strict-lower triangular solve) +
+# inter-chunk state carry. Six stages, all caller-allocated buffers (the
+# backend chains them): cumsum (log-decay prefix), kkt (K K^T strict-lower),
+# solve (4x16 block inverse), recompute (w/u), state (chunk carry + v_new),
+# o (output). Model shape only (K=V=128, BT=64); the serial kernel is the
+# fallback for other shapes.
+#
+# SOTA copy: agent-infer crates/cuda-kernels/tools/tilelang/gated_delta_rule.py
+#   (the SM-portable 7-stage decomposition, itself from FLA + FlashQLA)
+# Adapted: tileRL JIT conventions (T.const, factory fns, _pass_configs); the
+#   (B, H) heads flattened to BH at the boundary (kernels see [T, BH, ...]);
+#   cumsum takes log(g) first (the 6-arg g is already exponentiated);
+#   bf16 IO for q/k/v/a_inv/w/u/v_new/out, f32 for g/beta/state (matches the
+#   mega-kernel); scale=1.0 (q arrives with 1/sqrt(K) baked).
+
+_GDR_BT = 64  # chunk size in tokens
+_GDR_K = 128  # key dim (model shape)
+_GDR_V = 128  # value dim
+_GDR_KB = 64  # key block (K split into 2 halves for the state sweep)
+_GDR_BV = 32  # value tile for the state/o sweeps
+_GDR_THREADS = 128
+
+
+def make_gdr_cumsum(target: str):
+    """Stage 1: chunk-local cumsum of log(g). The 6-arg g is already
+    exponentiated, so take log first — the chunked formulation consumes the
+    log-decay (g_cumsum differences give the inter-token decay)."""
+    BT = _GDR_BT
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def gdr_cumsum(G, GCum, threads):
+        TT, BH = T.const("TT, BH")
+        G: T.Tensor((TT, BH), "float32")
+        GCum: T.Tensor((TT, BH), "float32")
+        with T.Kernel(T.ceildiv(TT, BT), BH, threads=threads) as (c, h):
+            g = T.alloc_fragment((BT,), "float32")
+            base = c * BT
+            for t in T.Parallel(BT):
+                g[t] = T.if_then_else(base + t < TT, T.log(G[base + t, h]), 0.0)
+            T.cumsum(g, dim=0)
+            for t in T.Parallel(BT):
+                if base + t < TT:
+                    GCum[base + t, h] = g[t]
+
+    return gdr_cumsum
+
+
+def make_gdr_kkt(target: str):
+    """Stage 2: chunk-local strict-lower A = (K K^T) scaled by beta and the
+    decay difference exp(g[i] - g[j])."""
+    BT = _GDR_BT
+    K = _GDR_K
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def gdr_kkt(KIn, GCum, Beta, ATril, threads):
+        TT, BH = T.const("TT, BH")
+        KIn: T.Tensor((TT, BH, K), "bfloat16")
+        GCum: T.Tensor((TT, BH), "float32")
+        Beta: T.Tensor((TT, BH), "float32")
+        ATril: T.Tensor((TT, BH, BT), "float32")
+        with T.Kernel(T.ceildiv(TT, BT), BH, threads=threads) as (c, h):
+            k_tile = T.alloc_shared((BT, K), "bfloat16")
+            g_s = T.alloc_shared((BT,), "float32")
+            b_s = T.alloc_shared((BT,), "float32")
+            acc = T.alloc_fragment((BT, BT), "float32")
+            base = c * BT
+            for t, d in T.Parallel(BT, K):
+                k_tile[t, d] = T.if_then_else(
+                    base + t < TT, KIn[base + t, h, d], T.cast(0, "bfloat16")
+                )
+            T.clear(acc)
+            T.gemm(k_tile, k_tile, acc, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+            for t in T.Parallel(BT):
+                g_s[t] = T.if_then_else(base + t < TT, GCum[base + t, h], 0.0)
+                b_s[t] = T.if_then_else(base + t < TT, Beta[base + t, h], 0.0)
+            for i, j in T.Parallel(BT, BT):
+                in_r = base + i < TT
+                in_c = base + j < TT
+                acc[i, j] = T.if_then_else(
+                    (i > j) & in_r & in_c,
+                    acc[i, j] * b_s[i] * T.exp(g_s[i] - g_s[j]),
+                    0.0,
+                )
+            for i, j in T.Parallel(BT, BT):
+                if base + i < TT:
+                    ATril[base + i, h, j] = acc[i, j]
+
+    return gdr_kkt
+
+
+def make_gdr_solve(target: str):
+    """Stage 3: 64x64 strict-lower-triangular inverse via 4x16 block
+    decomposition — 4 diagonal 16x16 forward-substitutions + 6 off-diagonal
+    16x16 compositions (9 GEMMs as manual 16-deep reductions).
+
+    Writes only the 10 lower+diagonal blocks of AInv; the 6 upper
+    off-diagonal blocks are zero (the inverse is lower-triangular) but left
+    untouched. The caller must zero AInv before launch."""
+    BT = _GDR_BT
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def gdr_solve(ATril, AInv, threads):
+        TT, BH = T.const("TT, BH")
+        ATril: T.Tensor((TT, BH, BT), "float32")
+        AInv: T.Tensor((TT, BH, BT), "bfloat16")
+        with T.Kernel(T.ceildiv(TT, BT), BH, threads=threads) as (c, h):
+            a_full = T.alloc_shared((BT, BT), "float32")
+            base = c * BT
+            for i, j in T.Parallel(BT, BT):
+                a_full[i, j] = T.if_then_else(base + i < TT, ATril[base + i, h, j], 0.0)
+            # 4 diagonal blocks: -StrictLower(A) + I.
+            ai_diag = T.alloc_shared((4, 16, 16), "float32")
+            for blk, i, j in T.Parallel(4, 16, 16):
+                row = blk * 16 + i
+                col = blk * 16 + j
+                ai_diag[blk, i, j] = T.if_then_else(
+                    i > j,
+                    -a_full[row, col],
+                    T.if_then_else(i == j, 1.0, 0.0),
+                )
+            # Forward-substitution on each diagonal block: rows 2..15.
+            row_buf = T.alloc_shared((4, 16), "float32")
+            for i in T.serial(2, 16):
+                for blk, k_t in T.Parallel(4, 16):
+                    in_range = base + blk * 16 + i < TT
+                    row_buf[blk, k_t] = T.if_then_else(
+                        in_range & (k_t < i),
+                        -a_full[blk * 16 + i, blk * 16 + k_t],
+                        0.0,
+                    )
+                for blk, k_t in T.Parallel(4, 16):
+                    accum = T.alloc_fragment((1,), "float32")
+                    accum[0] = 0.0
+                    for r in T.serial(16):
+                        accum[0] += row_buf[blk, r] * ai_diag[blk, r, k_t]
+                    if k_t < i:
+                        ai_diag[blk, i, k_t] = row_buf[blk, k_t] + accum[0]
+            # 6 off-diagonal blocks of A: A21, A31, A32, A41, A42, A43.
+            a_off = T.alloc_shared((6, 16, 16), "float32")
+            for slot, i, j in T.Parallel(6, 16, 16):
+                row_block = T.if_then_else(
+                    slot == 0,
+                    1,
+                    T.if_then_else(
+                        slot == 1,
+                        2,
+                        T.if_then_else(
+                            slot == 2,
+                            2,
+                            T.if_then_else(slot == 3, 3, T.if_then_else(slot == 4, 3, 3)),
+                        ),
+                    ),
+                )
+                col_block = T.if_then_else(
+                    slot == 0,
+                    0,
+                    T.if_then_else(
+                        slot == 1,
+                        0,
+                        T.if_then_else(
+                            slot == 2,
+                            1,
+                            T.if_then_else(slot == 3, 0, T.if_then_else(slot == 4, 1, 2)),
+                        ),
+                    ),
+                )
+                a_off[slot, i, j] = a_full[row_block * 16 + i, col_block * 16 + j]
+            # Compose the off-diagonal pieces of the inverse.
+            ai_off = T.alloc_shared((6, 16, 16), "float32")
+            tmp_a = T.alloc_shared((16, 16), "float32")
+            tmp_b = T.alloc_shared((16, 16), "float32")
+            # ai_21 = -ai_22 @ A21 @ ai_11
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += ai_diag[1, i, r] * a_off[0, r, j]
+                tmp_a[i, j] = accum[0]
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += tmp_a[i, r] * ai_diag[0, r, j]
+                ai_off[0, i, j] = -accum[0]
+            # ai_32 = -ai_33 @ A32 @ ai_22
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += ai_diag[2, i, r] * a_off[2, r, j]
+                tmp_a[i, j] = accum[0]
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += tmp_a[i, r] * ai_diag[1, r, j]
+                ai_off[2, i, j] = -accum[0]
+            # ai_43 = -ai_44 @ A43 @ ai_33
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += ai_diag[3, i, r] * a_off[5, r, j]
+                tmp_a[i, j] = accum[0]
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += tmp_a[i, r] * ai_diag[2, r, j]
+                ai_off[5, i, j] = -accum[0]
+            # ai_31 = -ai_33 @ (A31 @ ai_11 + A32 @ ai_21)
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += a_off[1, i, r] * ai_diag[0, r, j]
+                tmp_a[i, j] = accum[0]
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += a_off[2, i, r] * ai_off[0, r, j]
+                tmp_b[i, j] = accum[0]
+            for i, j in T.Parallel(16, 16):
+                tmp_a[i, j] = tmp_a[i, j] + tmp_b[i, j]
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += ai_diag[2, i, r] * tmp_a[r, j]
+                ai_off[1, i, j] = -accum[0]
+            # ai_42 = -ai_44 @ (A42 @ ai_22 + A43 @ ai_32)
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += a_off[4, i, r] * ai_diag[1, r, j]
+                tmp_a[i, j] = accum[0]
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += a_off[5, i, r] * ai_off[2, r, j]
+                tmp_b[i, j] = accum[0]
+            for i, j in T.Parallel(16, 16):
+                tmp_a[i, j] = tmp_a[i, j] + tmp_b[i, j]
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += ai_diag[3, i, r] * tmp_a[r, j]
+                ai_off[4, i, j] = -accum[0]
+            # ai_41 = -ai_44 @ (A41 @ ai_11 + A42 @ ai_21 + A43 @ ai_31)
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += a_off[3, i, r] * ai_diag[0, r, j]
+                tmp_a[i, j] = accum[0]
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += a_off[4, i, r] * ai_off[0, r, j]
+                tmp_b[i, j] = accum[0]
+            for i, j in T.Parallel(16, 16):
+                tmp_a[i, j] = tmp_a[i, j] + tmp_b[i, j]
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += a_off[5, i, r] * ai_off[1, r, j]
+                tmp_b[i, j] = accum[0]
+            for i, j in T.Parallel(16, 16):
+                tmp_a[i, j] = tmp_a[i, j] + tmp_b[i, j]
+            for i, j in T.Parallel(16, 16):
+                accum = T.alloc_fragment((1,), "float32")
+                accum[0] = 0.0
+                for r in T.serial(16):
+                    accum[0] += ai_diag[3, i, r] * tmp_a[r, j]
+                ai_off[3, i, j] = -accum[0]
+            # Write the 4 diagonal + 6 off-diagonal blocks back.
+            for blk, i, j in T.Parallel(4, 16, 16):
+                row = base + blk * 16 + i
+                col = blk * 16 + j
+                if row < TT:
+                    AInv[row, h, col] = T.cast(ai_diag[blk, i, j], "bfloat16")
+            for slot, i, j in T.Parallel(6, 16, 16):
+                row_block = T.if_then_else(
+                    slot == 0,
+                    1,
+                    T.if_then_else(
+                        slot == 1,
+                        2,
+                        T.if_then_else(
+                            slot == 2,
+                            2,
+                            T.if_then_else(slot == 3, 3, T.if_then_else(slot == 4, 3, 3)),
+                        ),
+                    ),
+                )
+                col_block = T.if_then_else(
+                    slot == 0,
+                    0,
+                    T.if_then_else(
+                        slot == 1,
+                        0,
+                        T.if_then_else(
+                            slot == 2,
+                            1,
+                            T.if_then_else(slot == 3, 0, T.if_then_else(slot == 4, 1, 2)),
+                        ),
+                    ),
+                )
+                row = base + row_block * 16 + i
+                col = col_block * 16 + j
+                if row < TT:
+                    AInv[row, h, col] = T.cast(ai_off[slot, i, j], "bfloat16")
+
+    return gdr_solve
+
+
+def make_gdr_recompute(target: str):
+    """Stage 4: u = a_inv @ (v * beta), w = a_inv @ (k * beta * exp(g))."""
+    BT = _GDR_BT
+    K = _GDR_K
+    V = _GDR_V
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def gdr_recompute(KIn, VIn, Beta, AInv, GCum, W, U, threads):
+        TT, BH = T.const("TT, BH")
+        KIn: T.Tensor((TT, BH, K), "bfloat16")
+        VIn: T.Tensor((TT, BH, V), "bfloat16")
+        Beta: T.Tensor((TT, BH), "float32")
+        AInv: T.Tensor((TT, BH, BT), "bfloat16")
+        GCum: T.Tensor((TT, BH), "float32")
+        W: T.Tensor((TT, BH, K), "bfloat16")
+        U: T.Tensor((TT, BH, V), "bfloat16")
+        with T.Kernel(T.ceildiv(TT, BT), BH, threads=threads) as (c, h):
+            # No BT-sized fragments in shared-mem-write loops: @tilelang.jit
+            # parallelizes such loops onto 64 threads and inserts
+            # __syncthreads() inside, deadlocking the 128-thread block.
+            # Read Beta/GCum from global instead.
+            ai_tile = T.alloc_shared((BT, BT), "bfloat16")
+            v_tile = T.alloc_shared((BT, V), "bfloat16")
+            k_tile = T.alloc_shared((BT, K), "bfloat16")
+            u_acc = T.alloc_fragment((BT, V), "float32")
+            w_acc = T.alloc_fragment((BT, K), "float32")
+            base = c * BT
+            for t, j in T.Parallel(BT, BT):
+                ai_tile[t, j] = T.if_then_else(
+                    base + t < TT, AInv[base + t, h, j], T.cast(0, "bfloat16")
+                )
+            # u = a_inv @ (v * beta)
+            for t, d in T.Parallel(BT, V):
+                in_r = base + t < TT
+                bv = T.if_then_else(in_r, Beta[base + t, h], 0.0)
+                v_tile[t, d] = T.if_then_else(
+                    in_r,
+                    T.cast(T.cast(VIn[base + t, h, d], "float32") * bv, "bfloat16"),
+                    T.cast(0, "bfloat16"),
+                )
+            T.clear(u_acc)
+            T.gemm(ai_tile, v_tile, u_acc, policy=T.GemmWarpPolicy.FullRow)
+            for t, d in T.Parallel(BT, V):
+                if base + t < TT:
+                    U[base + t, h, d] = T.cast(u_acc[t, d], "bfloat16")
+            # w = a_inv @ (k * beta * exp(g))
+            for t, d in T.Parallel(BT, K):
+                in_r = base + t < TT
+                bv = T.if_then_else(in_r, Beta[base + t, h], 0.0)
+                gv = T.if_then_else(in_r, T.exp(GCum[base + t, h]), 0.0)
+                k_tile[t, d] = T.if_then_else(
+                    in_r,
+                    T.cast(T.cast(KIn[base + t, h, d], "float32") * bv * gv, "bfloat16"),
+                    T.cast(0, "bfloat16"),
+                )
+            T.clear(w_acc)
+            T.gemm(ai_tile, k_tile, w_acc, policy=T.GemmWarpPolicy.FullRow)
+            for t, d in T.Parallel(BT, K):
+                if base + t < TT:
+                    W[base + t, h, d] = T.cast(w_acc[t, d], "bfloat16")
+
+    return gdr_recompute
+
+
+def make_gdr_state(target: str):
+    """Stage 5: per-chunk recurrent state carry + v_new. One block per
+    (value-tile, head); serial over chunks, h in register fragments (h_lo /
+    h_hi over the two KB halves). Writes per-chunk snapshots (chunk_state),
+    per-token v_new, and the decode-compatible final state."""
+    BT = _GDR_BT
+    KB = _GDR_KB
+    BV = _GDR_BV
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def gdr_state(KIn, W, U, GCum, S0, ChunkState, VNew, SOut, SeqLen, threads):
+        # K, V are const vars (not closure): they appear only in annotations,
+        # and tilelang's nonlocal capture only sees body-referenced closures.
+        # SeqLen is a runtime arg: T.serial over a const bound makes TVM
+        # unroll the chunk loop, exploding the IR (compile hang).
+        TT, BH, K, V = T.const("TT, BH, K, V")
+        KIn: T.Tensor((TT, BH, K), "bfloat16")
+        W: T.Tensor((TT, BH, K), "bfloat16")
+        U: T.Tensor((TT, BH, V), "bfloat16")
+        GCum: T.Tensor((TT, BH), "float32")
+        S0: T.Tensor((BH, K, V), "float32")
+        ChunkState: T.Tensor((T.ceildiv(TT, BT), BH, K, V), "float32")
+        VNew: T.Tensor((TT, BH, V), "bfloat16")
+        SOut: T.Tensor((BH, K, V), "float32")
+        with T.Kernel(T.ceildiv(V, BV), BH, threads=threads) as (vt, h):
+            # h_lo/h_hi in shared (not fragment): tilelang's LayoutInference
+            # conflicts on persistent register fragments live across T.serial.
+            # v_new_tile is a fragment (not persistent — reinit each chunk).
+            # Shared-mem budget: sm90 default carveout is 48KB, so wk_lo/wk_hi
+            # are reused for w (then k) and u_tile doubles as the GEMM B operand.
+            # No BT-sized fragment in the decay loop: @tilelang.jit parallelizes
+            # such loops onto 64 threads and inserts __syncthreads() inside,
+            # deadlocking the 128-thread block. Read GCum from global instead.
+            h_lo = T.alloc_shared((KB, BV), "float32")
+            h_hi = T.alloc_shared((KB, BV), "float32")
+            wk_lo = T.alloc_shared((BT, KB), "bfloat16")
+            wk_hi = T.alloc_shared((BT, KB), "bfloat16")
+            u_tile = T.alloc_shared((BT, BV), "bfloat16")
+            v_new_tile = T.alloc_fragment((BT, BV), "float32")
+            wh_acc = T.alloc_fragment((BT, BV), "float32")
+            kh_lo_acc = T.alloc_fragment((KB, BV), "float32")
+            kh_hi_acc = T.alloc_fragment((KB, BV), "float32")
+            v_off = vt * BV
+            for r, c in T.Parallel(KB, BV):
+                h_lo[r, c] = S0[h, r, v_off + c]
+                h_hi[r, c] = S0[h, KB + r, v_off + c]
+            num_chunks = T.ceildiv(SeqLen, BT)
+            for chunk_idx in T.serial(num_chunks):
+                base = chunk_idx * BT
+                # Snapshot h at chunk start.
+                for r, c in T.Parallel(KB, BV):
+                    ChunkState[chunk_idx, h, r, v_off + c] = h_lo[r, c]
+                    ChunkState[chunk_idx, h, KB + r, v_off + c] = h_hi[r, c]
+                for t, c in T.Parallel(BT, KB):
+                    wk_lo[t, c] = T.if_then_else(
+                        base + t < SeqLen, W[base + t, h, c], T.cast(0, "bfloat16")
+                    )
+                    wk_hi[t, c] = T.if_then_else(
+                        base + t < SeqLen, W[base + t, h, KB + c], T.cast(0, "bfloat16")
+                    )
+                for t, c in T.Parallel(BT, BV):
+                    u_tile[t, c] = T.if_then_else(
+                        base + t < SeqLen, U[base + t, h, v_off + c], T.cast(0, "bfloat16")
+                    )
+                T.clear(v_new_tile)
+                for t, c in T.Parallel(BT, BV):
+                    v_new_tile[t, c] = T.cast(u_tile[t, c], "float32")
+                T.tvm_storage_sync("shared")
+                # v_new = u - w @ h (u_tile repurposed as the bf16 GEMM B).
+                for r, c in T.Parallel(KB, BV):
+                    u_tile[r, c] = T.cast(h_lo[r, c], "bfloat16")
+                T.clear(wh_acc)
+                T.gemm(wk_lo, u_tile, wh_acc, policy=T.GemmWarpPolicy.FullRow)
+                for r, c in T.Parallel(KB, BV):
+                    u_tile[r, c] = T.cast(h_hi[r, c], "bfloat16")
+                T.gemm(wk_hi, u_tile, wh_acc, policy=T.GemmWarpPolicy.FullRow)
+                for t, c in T.Parallel(BT, BV):
+                    v_new_tile[t, c] = v_new_tile[t, c] - wh_acc[t, c]
+                for t, c in T.Parallel(BT, BV):
+                    if base + t < SeqLen:
+                        VNew[base + t, h, v_off + c] = T.cast(v_new_tile[t, c], "bfloat16")
+                # Decay h by the chunk's total decay; gate v_new per token.
+                g_last_idx = T.if_then_else(base + BT <= SeqLen, base + BT - 1, SeqLen - 1)
+                g_last = GCum[g_last_idx, h]
+                decay = T.exp(g_last)
+                for r, c in T.Parallel(KB, BV):
+                    h_lo[r, c] = h_lo[r, c] * decay
+                    h_hi[r, c] = h_hi[r, c] * decay
+                for t, c in T.Parallel(BT, BV):
+                    in_r = base + t < SeqLen
+                    g_v = T.if_then_else(in_r, T.exp(g_last - GCum[base + t, h]), 0.0)
+                    v_new_tile[t, c] = v_new_tile[t, c] * g_v
+                    u_tile[t, c] = T.cast(v_new_tile[t, c], "bfloat16")
+                # h += k @ v_new (wk_* repurposed: load k transposed into them).
+                for r, t in T.Parallel(KB, BT):
+                    wk_lo[r, t] = T.if_then_else(
+                        base + t < SeqLen, KIn[base + t, h, r], T.cast(0, "bfloat16")
+                    )
+                    wk_hi[r, t] = T.if_then_else(
+                        base + t < SeqLen, KIn[base + t, h, KB + r], T.cast(0, "bfloat16")
+                    )
+                T.clear(kh_lo_acc)
+                T.clear(kh_hi_acc)
+                T.gemm(wk_lo, u_tile, kh_lo_acc, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(wk_hi, u_tile, kh_hi_acc, policy=T.GemmWarpPolicy.FullRow)
+                for r, c in T.Parallel(KB, BV):
+                    h_lo[r, c] = h_lo[r, c] + kh_lo_acc[r, c]
+                    h_hi[r, c] = h_hi[r, c] + kh_hi_acc[r, c]
+            for r, c in T.Parallel(KB, BV):
+                SOut[h, r, v_off + c] = h_lo[r, c]
+                SOut[h, KB + r, v_off + c] = h_hi[r, c]
+
+    return gdr_state
+
+
+def make_gdr_o(target: str):
+    """Stage 6: chunk output. out[t] = (q @ h_start * exp(g) +
+    (q @ k^T, causal-masked) @ v_new) * scale. h_start is the chunk-start
+    state snapshot (chunk_state); the intra-chunk term is the WY output."""
+    BT = _GDR_BT
+    K = _GDR_K
+    V = _GDR_V
+    BV = _GDR_BV
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def gdr_o(Q, KIn, VNew, ChunkState, GCum, Out, scale, threads):
+        TT, BH = T.const("TT, BH")
+        Q: T.Tensor((TT, BH, K), "bfloat16")
+        KIn: T.Tensor((TT, BH, K), "bfloat16")
+        VNew: T.Tensor((TT, BH, V), "bfloat16")
+        ChunkState: T.Tensor((T.ceildiv(TT, BT), BH, K, V), "float32")
+        GCum: T.Tensor((TT, BH), "float32")
+        Out: T.Tensor((TT, BH, V), "bfloat16")
+        with T.Kernel(T.ceildiv(V, BV), T.ceildiv(TT, BT), BH, threads=threads) as (vt, c, h):
+            q_tile = T.alloc_shared((BT, K), "bfloat16")
+            k_tile = T.alloc_shared((K, BT), "bfloat16")
+            h_tile = T.alloc_shared((K, BV), "bfloat16")
+            v_new_tile = T.alloc_shared((BT, BV), "bfloat16")
+            acc_o = T.alloc_fragment((BT, BV), "float32")
+            acc_a = T.alloc_fragment((BT, BT), "float32")
+            g_s = T.alloc_shared((BT,), "float32")
+            base = c * BT
+            v_off = vt * BV
+            for t, d in T.Parallel(BT, K):
+                q_tile[t, d] = T.if_then_else(
+                    base + t < TT, Q[base + t, h, d], T.cast(0, "bfloat16")
+                )
+            for d, t in T.Parallel(K, BT):
+                k_tile[d, t] = T.if_then_else(
+                    base + t < TT, KIn[base + t, h, d], T.cast(0, "bfloat16")
+                )
+            for d, cc in T.Parallel(K, BV):
+                h_tile[d, cc] = T.cast(ChunkState[c, h, d, v_off + cc], "bfloat16")
+            for t, cc in T.Parallel(BT, BV):
+                v_new_tile[t, cc] = T.if_then_else(
+                    base + t < TT, VNew[base + t, h, v_off + cc], T.cast(0, "bfloat16")
+                )
+            T.clear(acc_o)
+            T.clear(acc_a)
+            T.gemm(q_tile, h_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
+            T.gemm(q_tile, k_tile, acc_a, policy=T.GemmWarpPolicy.FullRow)
+            for t in T.Parallel(BT):
+                g_s[t] = T.if_then_else(base + t < TT, GCum[base + t, h], 0.0)
+            for t, cc in T.Parallel(BT, BV):
+                acc_o[t, cc] = acc_o[t, cc] * T.exp(g_s[t])
+            for i, j in T.Parallel(BT, BT):
+                in_r = base + i < TT
+                in_c = base + j < TT
+                acc_a[i, j] = T.if_then_else(
+                    (i >= j) & in_r & in_c,
+                    acc_a[i, j] * T.exp(g_s[i] - g_s[j]),
+                    0.0,
+                )
+            acc_a_bf = T.alloc_shared((BT, BT), "bfloat16")
+            for i, j in T.Parallel(BT, BT):
+                acc_a_bf[i, j] = T.cast(acc_a[i, j], "bfloat16")
+            T.gemm(acc_a_bf, v_new_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
+            for t, cc in T.Parallel(BT, BV):
+                if base + t < TT:
+                    Out[base + t, h, v_off + cc] = T.cast(acc_o[t, cc] * scale, "bfloat16")
+
+    return gdr_o
+
+
+# ---------------------------------------------------------------- GDN staging kernels (full-GDN prefill path)
+#
+# The conv1d+SiLU / norm+gates / post-norm+z stages that bracket the chunked
+# scan in the full-GDN prefill path (the model's form). The serial mega-kernel
+# (make_gdn_chunk_fused) fuses all stages per (value head, batch); the chunked
+# path splits them so the scan can run as the chunk-WY pipeline above. Stage
+# code mirrors the mega-kernel's.
+
+
+def make_gdn_conv1d_silu(target: str):
+    """Causal conv1d (KER taps over Window ++ qkv) + SiLU on the catted
+    [q|k|v] channels. One block per (b, t); each thread owns a strided slice
+    of the QKVD channels. The conv-window carry (Window) is the previous
+    segment's last KER-1 raw qkv tokens. QKV is the catted [q|k|v] tensor —
+    a single input avoids the T.if_then_else channel selection (which
+    evaluates all branches and reads OOB on the non-selected tensors)."""
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def gdn_conv1d_silu(QKV, ConvW, Window, Preact, threads):
+        B, TT, QKVD, KER = T.const("B, TT, QKVD, KER")
+        QKV: T.Tensor((B, TT, QKVD), "bfloat16")
+        ConvW: T.Tensor((QKVD, KER), "float32")
+        Window: T.Tensor((B, KER - 1, QKVD), "bfloat16")
+        Preact: T.Tensor((B, TT, QKVD), "bfloat16")
+        # 2D grid (TT, B) — a B*TT expression in the grid dim makes
+        # T.serial collapse to thread 0 only (tilelang 0.1.13 bug).
+        with T.Kernel(TT, B, threads=threads) as (t, b):
+            tid = T.get_thread_binding(0)
+            acc = T.alloc_fragment((1,), "float32")
+            for c in T.serial(T.ceildiv(QKVD, threads)):
+                ch = tid + c * threads
+                if ch < QKVD:
+                    acc[0] = 0.0
+                    for tap in T.serial(KER):
+                        idx = t + tap
+                        if idx < KER - 1:
+                            acc[0] += T.cast(Window[b, idx, ch], "float32") * ConvW[ch, tap]
+                        else:
+                            src = idx - (KER - 1)
+                            acc[0] += T.cast(QKV[b, src, ch], "float32") * ConvW[ch, tap]
+                    Preact[b, t, ch] = T.cast(acc[0] * T.sigmoid(acc[0]), "bfloat16")
+
+    return gdn_conv1d_silu
+
+
+def make_gdn_norm_gates(target: str):
+    """q/k L2-norm (q with 1/sqrt(K)) + g/beta gates. One block per
+    (b, t, value head); the GQA key head is kh = vh*NKH//NVH, so q/k are
+    GQA-expanded to NVH heads (the scan sees uniform BH = B*NVH heads).
+    Mirrors the mega-kernel's norm+gate stage."""
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def gdn_norm_gates(Preact, GIn, BIn, DtBias, ALog, QN, KN, ExpG, Beta, QD, threads):
+        # QKVD is a T.const (Preact's last dim, inferred). QD is a runtime
+        # scalar (varies by model config — can't be a constexpr or closure).
+        B, TT, NVH, K, QKVD = T.const("B, TT, NVH, K, QKVD")
+        Preact: T.Tensor((B, TT, QKVD), "bfloat16")
+        GIn: T.Tensor((B, TT, NVH), "float32")
+        BIn: T.Tensor((B, TT, NVH), "float32")
+        DtBias: T.Tensor((NVH,), "float32")
+        ALog: T.Tensor((NVH,), "float32")
+        QN: T.Tensor((B, TT, NVH, K), "bfloat16")
+        KN: T.Tensor((B, TT, NVH, K), "bfloat16")
+        ExpG: T.Tensor((B, TT, NVH), "float32")
+        Beta: T.Tensor((B, TT, NVH), "float32")
+        with T.Kernel(B * TT, NVH, threads=K) as (bt, vh):
+            b = bt // TT
+            t = bt % TT
+            tid = T.get_thread_binding(0)
+            nkh = QD // K
+            kh = vh * nkh // NVH
+            q_s = T.alloc_shared((K,), "float32")
+            k_s = T.alloc_shared((K,), "float32")
+            qn = T.alloc_shared((1,), "float32")
+            kn = T.alloc_shared((1,), "float32")
+            q_s[tid] = T.cast(Preact[b, t, kh * K + tid], "float32")
+            k_s[tid] = T.cast(Preact[b, t, QD + kh * K + tid], "float32")
+            T.tvm_storage_sync("shared")
+            if tid == 0:
+                acc_q = T.alloc_fragment((1,), "float32")
+                acc_k = T.alloc_fragment((1,), "float32")
+                T.clear(acc_q)
+                T.clear(acc_k)
+                for j in T.serial(K):
+                    acc_q[0] += q_s[j] * q_s[j]
+                    acc_k[0] += k_s[j] * k_s[j]
+                qn[0] = T.rsqrt(acc_q[0] + 1e-12)
+                kn[0] = T.rsqrt(acc_k[0] + 1e-12)
+                x = GIn[b, t, vh] + DtBias[vh]
+                sp = T.if_then_else(x > 20.0, x, T.log(1.0 + T.exp(x)))
+                ExpG[b, t, vh] = T.exp(-T.exp(ALog[vh]) * sp)
+                Beta[b, t, vh] = T.sigmoid(BIn[b, t, vh])
+            T.tvm_storage_sync("shared")
+            scale = T.rsqrt(T.cast(K, "float32"))
+            QN[b, t, vh, tid] = T.cast(q_s[tid] * qn[0] * scale, "bfloat16")
+            KN[b, t, vh, tid] = T.cast(k_s[tid] * kn[0], "bfloat16")
+
+    return gdn_norm_gates
+
+
+def make_gdn_post_norm_z(target: str):
+    """Gated RMSNorm + z-gate on the scan's per-token output. One block per
+    (b, t, value head); thread 0 reduces the sum-of-squares, broadcasts the
+    rsqrt via shared. Mirrors the mega-kernel's epilogue."""
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def gdn_post_norm_z(Core, NormW, Z, Out, threads):
+        B, TT, NVH, V = T.const("B, TT, NVH, V")
+        Core: T.Tensor((B, TT, NVH, V), "float32")
+        NormW: T.Tensor((V,), "float32")
+        Z: T.Tensor((B, TT, NVH * V), "bfloat16")
+        Out: T.Tensor((B, TT, NVH * V), "float32")
+        with T.Kernel(B * TT, NVH, threads=V) as (bt, vh):
+            b = bt // TT
+            t = bt % TT
+            tid = T.get_thread_binding(0)
+            c_s = T.alloc_shared((V,), "float32")
+            rms = T.alloc_shared((1,), "float32")
+            c_s[tid] = Core[b, t, vh, tid]
+            T.tvm_storage_sync("shared")
+            if tid == 0:
+                acc = T.alloc_fragment((1,), "float32")
+                T.clear(acc)
+                for j in T.serial(V):
+                    acc[0] += c_s[j] * c_s[j]
+                rms[0] = T.rsqrt(acc[0] / T.cast(V, "float32") + 1e-6)
+            T.tvm_storage_sync("shared")
+            gate = T.cast(Z[b, t, vh * V + tid], "float32")
+            Out[b, t, vh * V + tid] = c_s[tid] * rms[0] * NormW[tid] * (gate * T.sigmoid(gate))
+
+    return gdn_post_norm_z
 
 
 # ---------------------------------------------------------------- paged attention (MMA)
