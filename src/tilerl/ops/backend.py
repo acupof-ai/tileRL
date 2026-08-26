@@ -675,8 +675,8 @@ class Backend:
         optimizer's in-place copy_ bumps _version, invalidating the entry.
         Identity is checked via weakref: a fresh model can reuse a freed
         table's address, and data_ptr alone would hand back the stale cast.
-        # ponytail: the tied lm_head path (linear) re-casts the same table;
-        # route it through this cache when a tied model is served."""
+        The tied lm_head path needs no cache: linear()'s IO cast is a no-op
+        on the bf16-master serving path."""
         key = table.data_ptr()
         hit = self._embed_f32.get(key)
         if hit is not None:
