@@ -92,7 +92,7 @@ _SM90_KERNELS = {
     "linear_fp4": kernels_linear.make_linear_fp4_mma,
     "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv,
     "linear_bf16_gemv": kernels_linear.make_linear_bf16_gemv,
-    "linear_fp4_fp8": kernels_linear.make_linear_fp4_fp8_mma,
+    "linear_fp4_fp8": lambda target: kernels_linear.make_linear_fp4_fp8_mma(target, k_split=2),
     "linear_fp8": kernels_linear.make_linear_fp8_mma,
     "linear_fp8_gemv": kernels_linear.make_linear_fp8_gemv,
     "quant_fp8": kernels_linear.make_quant_fp8_e4m3,

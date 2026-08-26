@@ -339,16 +339,21 @@ class Backend:
             # divides the tile as block_N*64/threads/16 (threads=128).
             BK = 64
             bM, bN = _snap_mma_tile(M, 128), _round_up(min(128, N), 32)
-            Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, BK)
+            # K padded to 2*BK so the K-split=2 kernel (registry) sums an
+            # exact tile count per split.
+            Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, BK * 2)
             x2 = _pad2d(x2, Mp, Kp)
             xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
             ascale = torch.empty((Mp,), dtype=torch.float32, device=self.device)
             self._kernel("quant_fp8")(x2, xq, ascale, 256)
-            y = self._kernel("linear_fp4_fp8")(
+            # K-split: f32 atomic adds into a zeroed output.
+            y = torch.zeros((Mp, Np), dtype=torch.float32, device=self.device)
+            self._kernel("linear_fp4_fp8")(
                 xq,
                 _pad2d(wq, Np, Kp // 2),
                 _pad2d(scale, Np, Kp // 32),
                 ascale,
+                y,
                 bM,
                 bN,
                 _THREADS,

@@ -584,7 +584,7 @@ def make_quant_fp8_e4m3(target: str):
 # ---------------------------------------------------------------- linear fp4 (fp8 MMA)
 
 
-def make_linear_fp4_fp8_mma(target: str):
+def make_linear_fp4_fp8_mma(target: str, k_split: int = 1):
     """Fused e2m1fn dequant-to-e4m3 + fp8 WGMMA (sm90 prefill path).
 
     XQ [M,K] e4m3 (per-token quantized activation, from make_quant_fp8_e4m3),
@@ -606,6 +606,12 @@ def make_linear_fp4_fp8_mma(target: str):
     standard W4A8 trade-off. The per-token activation scale is one divide in
     the epilogue.
 
+    k_split > 1 adds a K-split grid dim: each (bx, by, bk) block sums
+    K/k_split K-tiles and f32 atomic-adds its partial into a caller-zeroed Y
+    (the AScale divide distributes over the split sum). The caller must zero
+    Y before launch and pad K to a multiple of _FP4_BLOCK_K * k_split.
+    k_split=1 is the shipped kernel below, unchanged.
+
     # SOTA copy: examples/dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py
     #   @ tilelang main (fast_dequant path: vectorized shared dequant before
     #   the WGMMA, pipelined)
@@ -613,6 +619,10 @@ def make_linear_fp4_fp8_mma(target: str):
     #   dtype is e4m3 (requant) instead of bf16; per-token activation dequant
     #   (1/AScale[m]) in the epilogue. e2m1fn has no zero, so padded WQ bytes
     #   (0x00 -> 0.5) are killed by the zero-padded WScale.
+    # SOTA copy (k_split > 1): examples/gemm_streamk/example_tilelang_gemm_streamk.py
+    #   @ tilelang main (split-K grid + atomic-add reduction family)
+    # Adapted: fixed 2-way equal K-split (not stream-K scheduling) on the
+    #   dequant+WGMMA body above; f32 atomic add into a zeroed output.
     """
 
     @tilelang.jit(
@@ -653,7 +663,53 @@ def make_linear_fp4_fp8_mma(target: str):
             T.copy(C_local, Y[by * block_M, bx * block_N])
         return Y
 
-    return linear_fp4_fp8
+    if k_split == 1:
+        return linear_fp4_fp8
+
+    @tilelang.jit(
+        target=target,
+        pass_configs={
+            "tl.disable_data_race_check": True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        },
+    )
+    def linear_fp4_fp8_split(XQ, WQ, WScale, AScale, Y, block_M, block_N, threads):
+        threads = 128 if block_M >= 32 else threads
+        block_N = _FP4_BLOCK_N
+        M, N, K = T.const("M, N, K")
+        XQ: T.Tensor((M, K), "float8_e4m3fn")
+        WQ: T.Tensor((N, K // 2), "uint8")
+        WScale: T.Tensor((N, K // 32), "float32")
+        AScale: T.Tensor((M,), "float32")
+        Y: T.Tensor((M, N), "float32")
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), k_split, threads=threads) as (
+            bx,
+            by,
+            bk,
+        ):
+            X_shared = T.alloc_shared((block_M, _FP4_BLOCK_K), "float8_e4m3fn")
+            WQ_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // 2), "uint8")
+            W_shared = T.alloc_shared((block_N, _FP4_BLOCK_K), "float8_e4m3fn")
+            Scale_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // 32), "float32")
+            C_local = T.alloc_fragment((block_M, block_N), "float32")
+            T.clear(C_local)
+            k0 = bk * (K // k_split // _FP4_BLOCK_K)
+            k1 = (bk + 1) * (K // k_split // _FP4_BLOCK_K)
+            for k in T.Pipelined(k1 - k0, num_stages=3):
+                kk = k0 + k
+                T.copy(XQ[by * block_M, kk * _FP4_BLOCK_K], X_shared)
+                T.copy(WQ[bx * block_N, kk * _FP4_BLOCK_K // 2], WQ_shared)
+                T.copy(WScale[bx * block_N, kk * _FP4_BLOCK_K // 32], Scale_shared)
+                _dequant_fp4_macro("float8_e4m3fn", 16)(
+                    WQ_shared, Scale_shared, W_shared, block_N, _FP4_BLOCK_K
+                )
+                T.gemm(X_shared, W_shared, C_local, transpose_B=True)
+            for i, j in T.Parallel(block_M, block_N):
+                C_local[i, j] = C_local[i, j] / AScale[by * block_M + i]
+            for i, j in T.Parallel(block_M, block_N):
+                T.atomic_add(Y[by * block_M + i, bx * block_N + j], C_local[i, j])
+
+    return linear_fp4_fp8_split
 
 
 # ---------------------------------------------------------------- linear fp8 (native MMA)
