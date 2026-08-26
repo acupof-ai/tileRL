@@ -526,9 +526,19 @@ def _param_key_for(name: str) -> str | None:
     return f"layers.{int(layer_str)}.{mapped}"
 
 
-def _validate_hf_config(cfg: ModelConfig, text_cfg: dict, source: str) -> None:
+def _is_lm_head(name: str) -> bool:
+    """True for the output-projection tensor in any checkpoint format (bf16
+    ``.weight``, NVFP4 ``.weight_packed``, fp8, AWQ ``.qweight``, MLX bare)."""
+    stem = name.removeprefix("model.language_model.").removeprefix("model.")
+    stem = stem.removeprefix("language_model.")
+    return stem == "lm_head" or stem.startswith("lm_head.")
+
+
+def _validate_hf_config(cfg: ModelConfig, hf_cfg: dict, source: str) -> None:
     """Cross-check the HF config.json against ``cfg``. Mismatches raise —
     loading a checkpoint into the wrong-shaped model must fail loudly."""
+    # Qwen3.5 wraps the text model in text_config; flat Qwen3 exports do not.
+    text_cfg = hf_cfg.get("text_config", hf_cfg)
     checks = {
         "hidden_size": cfg.hidden_size,
         "num_hidden_layers": cfg.num_layers,
@@ -559,6 +569,42 @@ def _validate_hf_config(cfg: ModelConfig, text_cfg: dict, source: str) -> None:
         raise RuntimeError(
             f"config mismatch for `{source}`: HF attn_output_gate="
             f"{text_cfg['attn_output_gate']} but cfg.full_attn_gated={cfg.full_attn_gated}"
+        )
+    # RoPE. Qwen3.5 nests the base and the rotary fraction under
+    # `rope_parameters`; flat Qwen3 exports keep them at the top level.
+    rope = text_cfg.get("rope_parameters") or {}
+    theta = rope.get("rope_theta", text_cfg.get("rope_theta"))
+    if theta is not None and float(theta) != float(cfg.rope_theta):
+        raise RuntimeError(
+            f"config mismatch for `{source}`: rope_theta={theta} in HF config.json "
+            f"but cfg expects {cfg.rope_theta}"
+        )
+    prf = rope.get("partial_rotary_factor", text_cfg.get("partial_rotary_factor"))
+    if prf is not None:
+        rd = float(prf) * cfg.head_dim  # rounded: rotary_dim is an even integer
+        if round(rd) != cfg.effective_rotary_dim:
+            raise RuntimeError(
+                f"config mismatch for `{source}`: partial_rotary_factor={prf} gives "
+                f"rotary_dim {rd} at head_dim {cfg.head_dim} but cfg expects "
+                f"{cfg.effective_rotary_dim}"
+            )
+    # tileRL implements unscaled RoPE only; serving a YaRN/linear checkpoint
+    # unscaled is wrong at every position, so refuse instead of ignoring it.
+    scaling = text_cfg.get("rope_scaling") or {}
+    rope_type = scaling.get("rope_type") or scaling.get("type") or rope.get("rope_type")
+    if rope_type not in (None, "default") or scaling.get("factor", 1.0) != 1.0:
+        raise RuntimeError(
+            f"`{source}`: checkpoint declares RoPE scaling (rope_scaling={scaling!r}, "
+            f"rope_parameters.rope_type={rope_type!r}) and tileRL implements none — "
+            f"it would be served as unscaled RoPE, silently wrong at every position"
+        )
+    # Multimodal configs carry tie_word_embeddings at the TOP level, where it
+    # overrides the text_config copy — a text_config-only lookup no-ops there.
+    tie = hf_cfg.get("tie_word_embeddings", text_cfg.get("tie_word_embeddings"))
+    if tie is not None and bool(tie) != cfg.tie_word_embeddings:
+        raise RuntimeError(
+            f"config mismatch for `{source}`: tie_word_embeddings={tie} in HF "
+            f"config.json but cfg expects {cfg.tie_word_embeddings}"
         )
 
 
@@ -657,9 +703,7 @@ def load_hf(
     if not config_path.exists():
         raise RuntimeError(f"`{source_desc}`: config.json not found at {config_path}")
     hf_cfg = json.loads(config_path.read_text())
-    # Qwen3.5 wraps the text model in text_config; flat Qwen3 exports do not.
-    text_cfg = hf_cfg.get("text_config", hf_cfg)
-    _validate_hf_config(cfg, text_cfg, source_desc)
+    _validate_hf_config(cfg, hf_cfg, source_desc)
     if num_layers is not None:
         # Truncate AFTER validation: the checkpoint is the full model; only
         # the loaded tensor set and the returned config are truncated.
@@ -692,8 +736,12 @@ def load_hf(
     #: Checkpoint-native fp4 linears (key -> (packed nibbles, block scale,
     #: per-row epilogue scale)) — the bytes are served verbatim.
     fp4_native: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    #: First output-projection tensor seen, in any format — the tie check below
+    #: is derived from the tensor set, not from what config.json claims.
+    lm_head_tensor: str | None = None
     for shard in _shard_files(ckpt_dir, source_desc):
         tensors = load_file(str(shard))
+        lm_head_tensor = lm_head_tensor or next((n for n in tensors if _is_lm_head(n)), None)
         mlx = next((n for n in tensors if n.startswith("language_model.")), None) is not None
         if mlx:
             tensors = {n[len("language_model.") :]: t for n, t in tensors.items()}
@@ -845,10 +893,16 @@ def load_hf(
         if keep_master:  # the STE master, regenerated from the served bytes
             params[key] = unpack_fp4(wq, scale, oscale)
 
-    # Embedding/lm_head tying.
+    # Embedding/lm_head tying. Tied cfg + a checkpoint that ships its own
+    # lm_head is the silent direction: dropping the tensor serves embed_tokens
+    # as the output projection at full speed (measured top-1 agreement 0/8).
     if cfg.tie_word_embeddings:
-        for suffix in ("", ".w8", ".wscale", ".wq", ".scale", ".oscale"):
-            params.pop("lm_head" + suffix, None)  # model reuses embed_tokens
+        if lm_head_tensor is not None:
+            raise RuntimeError(
+                f"`{source_desc}`: cfg.tie_word_embeddings=True but the checkpoint "
+                f"ships `{lm_head_tensor}` — set tie_word_embeddings=False, or the "
+                f"embedding is served as the output projection, silently wrong"
+            )
     elif "lm_head" not in params and not _quantized(params, "lm_head"):
         raise RuntimeError(f"`{source_desc}`: untied model is missing lm_head.weight")
 

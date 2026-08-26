@@ -1,6 +1,6 @@
 """Hermetic tests for checkpoint loading: HF roundtrip, num_layers truncation,
 fp4 on-load quantization, and the loud-failure paths (missing tensor,
-layer_types mismatch)."""
+layer_types mismatch, rope/tie fields the checkpoint contradicts)."""
 
 from __future__ import annotations
 
@@ -135,6 +135,44 @@ def test_layer_types_mismatch_raises(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(cfg_json))
     with pytest.raises(RuntimeError, match="layer_types"):
         load_hf(cfg, str(tmp_path))
+
+
+def test_rope_and_tie_guards_raise(tmp_path):
+    """Every rope/tie field the checkpoint can contradict must refuse to load.
+    Each case below is served silently wrong without the guard — the last one
+    is the 27B's own: config says tied, the checkpoint ships lm_head."""
+    cfg = tiny()  # rope_theta 1e7, rotary_dim 16 of head_dim 16, tied
+    model = build_random(cfg, seed=7)
+    _write_checkpoint(tmp_path, cfg, model.params)
+    base = json.loads((tmp_path / "config.json").read_text())
+    for patch, match in (
+        ({"rope_theta": 1e6}, "rope_theta"),
+        ({"rope_parameters": {"rope_theta": 1e6}}, "rope_theta"),  # Qwen3.5 spelling
+        ({"partial_rotary_factor": 0.5}, "partial_rotary_factor"),
+        ({"rope_parameters": {"partial_rotary_factor": 0.5}}, "partial_rotary_factor"),
+        ({"rope_scaling": {"rope_type": "yarn", "factor": 4.0}}, "rope_scaling"),
+        ({"rope_parameters": {"rope_type": "yarn", "factor": 4.0}}, "rope_scaling"),
+        ({"tie_word_embeddings": False}, "tie_word_embeddings"),
+    ):
+        (tmp_path / "config.json").write_text(json.dumps(base | patch))
+        with pytest.raises(RuntimeError, match=match):
+            load_hf(cfg, str(tmp_path))
+    # Multimodal layout: the top-level tie_word_embeddings wins over the
+    # text_config copy, so a text_config-only lookup would no-op here.
+    (tmp_path / "config.json").write_text(
+        json.dumps({"text_config": base, "tie_word_embeddings": False})
+    )
+    with pytest.raises(RuntimeError, match="tie_word_embeddings"):
+        load_hf(cfg, str(tmp_path))
+    # Derived: cfg AND config.json both say tied, the tensors disagree.
+    untied = replace(cfg, tie_word_embeddings=False)
+    ckpt = tmp_path / "untied"
+    ckpt.mkdir()
+    _write_checkpoint(ckpt, untied, build_random(untied, seed=7).params)
+    lying = json.loads((ckpt / "config.json").read_text()) | {"tie_word_embeddings": True}
+    (ckpt / "config.json").write_text(json.dumps(lying))
+    with pytest.raises(RuntimeError, match="lm_head"):
+        load_hf(cfg, str(ckpt))
 
 
 def test_fp4_on_load_and_forward(tmp_path):
