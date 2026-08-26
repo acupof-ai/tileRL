@@ -67,6 +67,63 @@ bandwidth/MMA balance differs from prefill.
    `TEMPLATE-bench.md`. No entry, not shipped.
 6. **COMMIT** — `feat(ops): ...`, no AI attribution.
 
+## Reading the emitted CUDA
+
+Load widths, register-array shapes and `#pragma unroll` coverage are all
+readable off the generated source, which is far cheaper than a pod round trip.
+
+**On the pod** — an ordinary build, then ptxas for the numbers the source
+cannot show:
+
+```bash
+python3 -c 'import torch; from tilerl.ops.kernels_linear import make_linear_fp4_gemv as m
+src = m("cuda", 8, 4).get_kernel_source(torch.zeros(1,17408,dtype=torch.bfloat16),
+    torch.zeros(5120,8704,dtype=torch.uint8), torch.zeros(5120,1088), 32, 4, 16)
+open("/work/k.cu","w").write(src)'
+nvcc -arch=sm_90a -Xptxas -v -cubin /work/k.cu -o /dev/null   # registers/thread, lmem bytes
+```
+
+**On this Mac** — no GPU and no nvcc, so `scripts/cuda_codegen.py` swaps the 14
+`tl.cuda.*` passes (absent from a `USE_CUDA=OFF` wheel) for identity and TVM's
+stock `target.build.cuda` for tilelang's codegen entry. `enable()`, then the
+same `get_kernel_source(...)`. Covers register-only kernels — the three GEMVs.
+Not `T.copy` / `T.gemm`: those need `src/cuda/op/{copy,gemm}.cc`, and
+`RegisterGemmImpl` takes raw C++ function pointers with no FFI, so unlike the
+passes it cannot be shimmed from Python. Probe an MMA data flow through the
+warp-level `mma_emitter` instead, which bypasses `tl.gemm` and does lower here.
+
+Widths are fixed by `VectorizeLoop` before codegen, so they are safe to read;
+the emitter is TVM's `CodeGenCUDA`, not tilelang's, so treat byte-exactness of
+the boilerplate as unproven. **Spills are invisible** — only ptxas or ncu sees
+them, and a register array that stays a register array here has already fallen
+to local memory once in this repo (`wins/2026-08-25-fp4-gemv-grouped-dequant.md`).
+
+## Register-resident dequantized B
+
+Marlin's core trick — packed nibbles in shared, the *dequantized* weight only
+ever in registers — is `T.gemm`'s SR variant (A shared, B fragment):
+`is_gemm_sr` at `tilelang/tileop/gemm/gemm_base.py:57`, lowered by `_gemm_srr`
+(`tilelang/cuda/op/gemm/gemm_mma.py:143`), which skips `ldmatrix_b` and feeds
+the user's fragment to `mma.sync` — the same instruction Marlin issues. The MMA
+B-fragment layout is *inferred* onto the fragment, so a plain `T.Parallel`
+dequant loop lands each value in the right lane; Marlin hand-computes that.
+The documented example is the mirror image — `example_dequant_gemm_w4a8.py:145`
+passes the dequantized fragment as the *first* operand (RS, transposed problem)
+— but the point carries: it allocates no shared dequant buffer at all. The two
+tilelang examples that do are both WGMMA, where shared B is a hardware
+requirement, and `make_linear_fp4_mma` copied one of them.
+
+Two costs. A fragment B makes `CheckWgmma` false (`src/cuda/op/gemm.cc:40`), so
+CUDA falls back to `mma.sync` — free at decode (WGMMA needs `m >= 64` anyway,
+`:95`) but a real drop for the prefill arm, which does hit WGMMA today. And
+Metal implements SS only (`tilelang/metal/op/gemm/gemm_metal.py:97`), so such a
+kernel needs a per-arch cell — which `_SM90_KERNELS` already is.
+
+Aim at the right kernel: `_CUDA_PLAN` covers all three `linear_fp4` regimes, so
+`make_linear_fp4_mma`'s 8 KiB `W_shared` never runs on CUDA. The live one is the
+e4m3 `W_shared` in `make_linear_fp4_fp8_mma` — 4 KiB against `WQ_shared`'s 2,
+`num_stages=3`, so 12 KiB/CTA spent on a format conversion.
+
 ## fp4 format reconciliation
 
 When a SOTA kernel expects a different fp4 layout/scale convention than

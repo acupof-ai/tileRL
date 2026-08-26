@@ -354,7 +354,7 @@ def main():
     shapes = [
         (248320, 5120, "lm_head"),
         (34816, 5120, "gate_up(fused)"),
-        (5120, 34816, "down_proj"),
+        (5120, 17408, "down_proj"),  # hidden x intermediate (config.py:169)
     ]
     idx = int(sys.argv[1]) if len(sys.argv) > 1 else 0
     run_matrix(*shapes[idx])

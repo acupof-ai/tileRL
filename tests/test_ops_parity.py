@@ -5,10 +5,9 @@ Covers every op in the pinned interface contract:
 * Forward: TileLang kernel (CPU target) vs torch-eager reference,
   allclose(rtol=1e-2, atol=1e-2) on random small inputs.
 * paged_attention vs a naive full-matrix attention.
-* gated-delta chunk-vs-step consistency (same recurrence, C=1 vs C=C).
 * Backward: every bwd op vs finite differences (torch gradcheck-style,
-  tiny shapes); attention_bwd and linear_attn_bwd additionally cross-checked
-  against torch.autograd (finite diff is too noisy on softmax/scan).
+  tiny shapes); attention_bwd is additionally cross-checked against
+  torch.autograd (finite diff is too noisy on softmax).
 
 Run: uv run pytest tests/test_ops_parity.py -v
 """
@@ -528,41 +527,6 @@ def test_write_tokens_parity(backend):
 # ---------------------------------------------------------------- gated delta
 
 
-def test_linear_attn_chunk_parity(backend):
-    torch.manual_seed(14)
-    b, c, h, d = 2, 6, 2, 16
-    q = torch.randn(b, c, h, d) * 0.1
-    k = torch.randn(b, c, h, d) * 0.1
-    v = torch.randn(b, c, h, d) * 0.1
-    g = torch.sigmoid(torch.randn(b, c, h)) * 0.5 + 0.4
-    beta = torch.sigmoid(torch.randn(b, c, h))
-    state = torch.randn(b, h, d, d) * 0.01
-    out, ns, _ = backend.linear_attn_chunk(q, k, v, g, beta, state)
-    rout, rns, _ = reference.linear_attn_chunk(q, k, v, g, beta, state)
-    _assert_close(out, rout, "linear_attn_chunk out")
-    _assert_close(ns, rns, "linear_attn_chunk state")
-
-
-def test_linear_attn_chunk_vs_step(backend):
-    torch.manual_seed(15)
-    b, c, h, d = 2, 6, 2, 16
-    q = torch.randn(b, c, h, d) * 0.1
-    k = torch.randn(b, c, h, d) * 0.1
-    v = torch.randn(b, c, h, d) * 0.1
-    g = torch.sigmoid(torch.randn(b, c, h)) * 0.5 + 0.4
-    beta = torch.sigmoid(torch.randn(b, c, h))
-    state = torch.randn(b, h, d, d) * 0.01
-    out, ns, _ = backend.linear_attn_chunk(q, k, v, g, beta, state)
-    s = state.clone()
-    step_outs = []
-    for t in range(c):
-        o, s, _ = backend.linear_attn_step(q[:, t], k[:, t], v[:, t], g[:, t], beta[:, t], s)
-        step_outs.append(o)
-    step_out = torch.stack(step_outs, dim=1)
-    _assert_close(out, step_out, "chunk-vs-step out")
-    _assert_close(ns, s, "chunk-vs-step state")
-
-
 def test_gdn_conv_window_makes_step_exact():
     """The conv_window carry makes segmented decode (T=1 per forward) exactly
     equal to a one-shot chunk forward: threading the returned window through
@@ -712,26 +676,27 @@ def test_gdn_chunk_matches_decode(backend):
     _assert_close(cwin, dwin, "chunk-vs-decode window")
 
 
-def test_linear_attn_bwd():
-    torch.manual_seed(16)
-    b, c, h, d = 1, 3, 1, 4
-    q = torch.randn(b, c, h, d) * 0.1
-    k = torch.randn(b, c, h, d) * 0.1
-    v = torch.randn(b, c, h, d) * 0.1
-    g = torch.sigmoid(torch.randn(b, c, h)) * 0.5 + 0.4
-    beta = torch.sigmoid(torch.randn(b, c, h))
-    # State at realistic magnitude: at 0.01 the S_prev-dependent error terms
-    # vanish below the threshold and the backward passes even when wrong.
-    state = torch.randn(b, h, d, d) * 0.5
-    # autograd cross-check (finite diff too noisy on the scan; f32 scan
-    # accumulation tolerates a slightly looser threshold)
-    _autograd_gradcheck(
-        "linear_attn_bwd",
-        lambda q, k, v, g, beta, state: reference.linear_attn_chunk(q, k, v, g, beta, state)[0],
-        reference.linear_attn_bwd,
-        [q, k, v, g, beta, state],
-        max_rel=2e-2,
-    )
+def test_gdn_bwd():
+    """gdn_backward vs torch.autograd on gdn_forward. The tape is hand-written
+    and this is the only direct gate on the gated-delta gradients; finite
+    differences are too noisy across the scan."""
+    q, k, v, g, beta, z, state, kw = _gdn_inputs(1, 3, 1, 1, 4, 4, 4, 24)
+    window = torch.zeros_like(kw["conv_window"])  # what a training forward carries
+    order = ("conv1d_weight", "dt_bias", "a_log", "norm_weight")
+
+    def fwd(*leaves):
+        qq, kk, vv, gg, bb, ss, zz = leaves[:7]
+        rest = dict(zip(order, leaves[7:]))
+        return reference.gdn_forward(qq, kk, vv, gg, bb, ss, z=zz, conv_window=window, **rest)[0]
+
+    def bwd(go, *args):
+        qq, kk, vv, gg, bb, ss, zz = args[:7]
+        rest = dict(zip(order, args[7:]))
+        return reference.gdn_backward(go, qq, kk, vv, gg, bb, ss, z=zz, conv_window=window, **rest)
+
+    _autograd_gradcheck("gdn_bwd", fwd, bwd, [q, k, v, g, beta, state, z] + [kw[n] for n in order])
+    with pytest.raises(NotImplementedError):  # only the zero window is exact
+        reference.gdn_backward(torch.zeros(1, 3, 4), q, k, v, g, beta, state, z=z, **kw)
 
 
 # ---------------------------------------------------------------- full attention bwd

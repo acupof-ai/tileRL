@@ -25,7 +25,7 @@ import bench_fp4_gemv as bg  # noqa: E402 — _measure_bw_gbs, _time_calls
 
 from tilerl.config import qwen36_27b  # noqa: E402
 from tilerl.model import fp4_param_keys, load_hf  # noqa: E402
-from tilerl.ops import kernels_mma  # noqa: E402
+from tilerl.ops import kernels_linear  # noqa: E402
 from tilerl.ops.backend import _round_up, get_backend  # noqa: E402
 from tilerl.ops.reference import linear_fp4  # noqa: E402
 
@@ -45,7 +45,7 @@ def main() -> None:
     )
     model = load_hf(cfg, args.source)
     model.params = {k: v.to(backend.device) for k, v in model.params.items()}
-    direct = kernels_mma.make_linear_fp4_gemv(backend.target)
+    direct = kernels_linear.make_linear_fp4_gemv(backend.target)
 
     bw = bg._measure_bw_gbs()
     print(f"\n=== fp4 GEMV: backend vs direct, same shapes (BW {bw:.1f} GB/s) ===")
@@ -58,15 +58,16 @@ def main() -> None:
         wq = model.params[key + ".wq"]
         scale = model.params[key + ".scale"]
         N, K = wq.shape[0], wq.shape[1] * 2
+        blk = K // scale.shape[1]  # scale block from the loaded weight (16 or 32)
         Kp, Np = _round_up(K, 256), _round_up(N, 4)
         x = torch.randn(1, K, device=backend.device, dtype=torch.bfloat16)
         # Identical args to what backend.linear_fp4 passes the kernel.
         xp = torch.nn.functional.pad(x, (0, Kp - K))
         wqp = torch.nn.functional.pad(wq, (0, Kp // 2 - wq.shape[1], 0, Np - N))
-        sp = torch.nn.functional.pad(scale, (0, Kp // 32 - scale.shape[1], 0, Np - N))
+        sp = torch.nn.functional.pad(scale, (0, Kp // blk - scale.shape[1], 0, Np - N))
 
         yb = backend.linear_fp4(x, wq, scale)
-        yd = direct(xp, wqp, sp, 32, 4)[:1, :N]
+        yd = direct(xp, wqp, sp, 32, 4, blk)[:1, :N]
         ref = linear_fp4(x.cpu(), wq.cpu(), scale.cpu())
         assert (yb.cpu() - ref).abs().max() < 1e-2 * ref.abs().max() + 1e-3, (
             f"{key}: backend parity"
@@ -75,11 +76,12 @@ def main() -> None:
 
         for _ in range(5):
             backend.linear_fp4(x, wq, scale)
-            direct(xp, wqp, sp, 32, 4)
+            direct(xp, wqp, sp, 32, 4, blk)
         backend_ms = bg._time_calls(lambda: backend.linear_fp4(x, wq, scale), 50)
-        direct_ms = bg._time_calls(lambda: direct(xp, wqp, sp, 32, 4), 50)
+        direct_ms = bg._time_calls(lambda: direct(xp, wqp, sp, 32, 4, blk), 50)
 
-        bytes_ = N * K * 0.75 + 2 * K
+        # Real tensor bytes: 0.75 B/elem holds only at block 16 f32 scales.
+        bytes_ = wq.numel() + scale.numel() * 4 + 2 * K
         roof_ms = bytes_ / (bw * 1e9) * 1e3
         print(
             f"  {f'{N},{K}':<22} {bytes_ / 2**20:>9.2f} {roof_ms:>8.4f} "

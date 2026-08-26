@@ -1,9 +1,15 @@
 # tileRL
 
 Cross-platform train + inference runtime for `Qwen3.8-27B` (NVFP4), in Python,
-on **one kernel source that targets CPU, CUDA, ROCm, and Metal** via
-[TileLang](https://github.com/tile-ai/tilelang). The CPU target is the portable
-default and the CI path; GPU targets compile from the same source.
+on one [TileLang](https://github.com/tile-ai/tilelang) kernel source. Three
+targets have executed it: CPU (the CI and dev path), Metal, and CUDA sm90 (on
+an H20 pod). ROCm shares the CPU kernel set and has never run.
+
+The source is not evenly shared. Of the 1,969 lines under
+`src/tilerl/ops/kernels*.py`, 1,406 (71%) are sm90-only schedules and 175 (9%)
+are the kernels every target executes; the rest is per-target gemm schedules
+and a shared header. Per-op status:
+[`docs/support-matrix.md`](docs/support-matrix.md).
 
 tileRL pairs an inference engine (continuous batching, paged KV, prefix cache)
 with **On-Policy Distillation (OPD)** training that shares the engine and
@@ -17,16 +23,19 @@ this design. tileRL ports its ideas to Python + TileLang:
 | | agent-infer | tileRL |
 |---|---|---|
 | Language | Rust | Python (uv package `tilerl`) |
-| Kernels | per-backend native (CUDA C / Metal C++) | **one TileLang source → cpu/cuda/rocm/metal** |
+| Kernels | per-backend native (CUDA C / Metal C++) | one TileLang source; 71% of it is sm90-only |
 | Engine seam | `BackendExecutor`: submit/poll + `StepLimits` | same seam, same cost contract |
 | KV | paged full-attn + recurrent state + prefix cache | same |
 | Training | OPD, shared engine/weights | OPD, shared engine/weights |
 | Autograd | hand-written `autograd` crate | hand-written reverse-mode tape mirroring it |
 
 The difference is the backend strategy: agent-infer writes and maintains a
-native kernel tree per target; tileRL writes each kernel once and lets
-TileLang lower it. torch is used only as the tensor container TileLang
-requires — no `torch.autograd`, no `torch.optim`.
+native kernel tree per target; tileRL writes each kernel in TileLang and lets
+it lower. Where a target needs a different schedule the registry swaps that one
+kernel — Metal takes naive FMA gemms, sm90 takes WGMMA schedules — so "one
+source" means one file tree and one op contract, not one schedule. torch is
+used only as the tensor container TileLang requires — no `torch.autograd`, no
+`torch.optim`.
 
 ## Quickstart
 
@@ -83,8 +92,9 @@ plain `uv run pytest` on CI is exactly the deterministic set.
                          │           └─────────────────────┘
                   ┌──────▼──────────────────────────────┐
                   │           ops (seam)                 │
-                  │  TileLang kernels, one source:       │
-                  │  cpu ✓ | cuda | rocm | metal         │
+                  │  TileLang kernels, one file tree:    │
+                  │  cpu ✓ | metal ✓ | sm90 ✓ (pod)      │
+                  │  rocm = the cpu set, never run       │
                   └──────────────────────────────────────┘
 ```
 
@@ -95,8 +105,11 @@ layer that touches TileLang or torch beyond the tensor container.
 
 | Component | Status |
 |---|---|
-| CPU target | ✓ working (CI/dev path) |
-| CUDA / ROCm / Metal targets | pending-host (same kernel source) |
+| CPU target | ✓ CI + local, every commit (97 passed, 4 skipped) |
+| Metal target | ✓ local (97 passed, 4 skipped) |
+| CUDA sm90 target | ✓ H20 pod 2026-08-24 (60 passed); not re-run since |
+| ROCm target | never executed — resolves to the CPU kernel set |
+| sm100 / sm120 | registered empty; `NotImplementedError` on use |
 | Tiny model end-to-end | ✓ |
 | Qwen3.8-27B NVFP4 weights | pending HF integration |
 | Paged KV + prefix cache | ✓ (tiny) |

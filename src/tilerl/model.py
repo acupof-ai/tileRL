@@ -19,7 +19,7 @@ math). Beyond the pinned op list, the architecture forces four extensions:
 * ``paged_attention(q, k_cache, v_cache, block_table, seq_lens, scale,
   gate=None)`` — with ``gate`` (the q_proj gate half, [B,T,Hq,D]) returns
   ``attn_out * sigmoid(gate)`` (full-attn output gate, BEFORE o_proj).
-* ``linear_attn_chunk`` / ``linear_attn_step(q, k, v, g, beta, state, *, z,
+* ``linear_attn_chunk(q, k, v, g, beta, state, *, z,
   conv1d_weight, dt_bias, a_log, norm_weight, conv_window=None)`` — the FULL
   gated-delta layer core, mirroring agent-infer's host reference
   ``linear_attention_forward`` (autograd/src/ops/linear_attention.rs:2385):

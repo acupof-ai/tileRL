@@ -29,10 +29,6 @@ loop miscompiles on Metal (output columns past the first few come back
 wrong); the portable shape is a 2D ``for i, j in T.Parallel(...)`` nest with
 the reduction serial inside — that is why ``linear_fp4`` is shaped like the
 metal gemms.
-
-The gated-delta chunk kernel is a target-neutral sequential-scan port of the
-math in ``tilelang/examples/gdn/example_chunk_delta_h.py`` (the CUDA-scheduled
-WY/chunkwise form there is the day-2 GPU upgrade path, not CPU-day-1 code).
 """
 
 from __future__ import annotations
@@ -57,7 +53,6 @@ __all__ = [
     "make_embedding",
     "make_linear_fp4",
     "make_paged_attention",
-    "make_linear_attn_chunk",
 ]
 
 
@@ -566,71 +561,3 @@ def make_paged_attention(target: str):
         return Out
 
     return paged_attention
-
-
-# ---------------------------------------------------------------- gated delta (linear attention)
-
-
-def make_linear_attn_chunk(target: str):
-    """Gated-delta chunk recurrence, target-neutral per-column serial scan.
-
-    Q, K, V [B, C, H, D] f32; G, Beta [B, C, H] f32; State [B, H, D, D] f32
-    (layout S[key, value], matching agent-infer linear_attention.rs).
-
-    One block per (b, h, value-column j), serial over t, the column living in
-    per-block fragments (no shared memory):
-        S_j *= g_t
-        p     = sum_i S_ij k_i
-        d_j   = beta_t * (v_j - p)
-        S_ij += k_i * d_j
-        out_j = sum_i S_ij q_i
-
-    The previous schedule (one block per (b,h), T.Parallel over columns with a
-    shared (D,D) state) is nondeterministic on Metal: tilelang 0.1.13's Metal
-    codegen races cross-loop shared-memory visibility (observed drift 2.4e-2
-    across identical runs). On CPU T.Parallel lowers to serial anyway, so the
-    per-column scan is the portable day-1 form; threads=1 because the scan is
-    fully serial per block. The CUDA-scheduled WY/chunkwise form
-    (tilelang/examples/gdn/) is the day-2 GPU upgrade path.
-    """
-
-    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
-    def linear_attn_chunk(Q, K, V, G, Beta, State, threads):
-        B, C, H, D = T.const("B, C, H, D")
-        Q: T.Tensor((B, C, H, D), "float32")
-        K: T.Tensor((B, C, H, D), "float32")
-        V: T.Tensor((B, C, H, D), "float32")
-        G: T.Tensor((B, C, H), "float32")
-        Beta: T.Tensor((B, C, H), "float32")
-        State: T.Tensor((B, H, D, D), "float32")
-        Out = T.empty((B, C, H, D), "float32")
-        NewState = T.empty((B, H, D, D), "float32")
-        with T.Kernel(B * H * D, threads=1) as bhd:
-            b = bhd // (H * D)
-            hd = bhd % (H * D)
-            h = hd // D
-            j = hd % D
-            S = T.alloc_fragment((D,), "float32")
-            for i in range(D):
-                S[i] = State[b, h, i, j]
-            for t in T.serial(C):
-                gt = G[b, t, h]
-                for i in range(D):
-                    S[i] *= gt
-                p = T.alloc_fragment((1,), "float32")
-                p[0] = 0.0
-                for i in range(D):
-                    p[0] += S[i] * K[b, t, h, i]
-                d = (V[b, t, h, j] - p[0]) * Beta[b, t, h]
-                for i in range(D):
-                    S[i] += K[b, t, h, i] * d
-                o = T.alloc_fragment((1,), "float32")
-                o[0] = 0.0
-                for i in range(D):
-                    o[0] += S[i] * Q[b, t, h, i]
-                Out[b, t, h, j] = o[0]
-            for i in range(D):
-                NewState[b, h, i, j] = S[i]
-        return Out, NewState
-
-    return linear_attn_chunk

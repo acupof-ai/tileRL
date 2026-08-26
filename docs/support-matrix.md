@@ -3,7 +3,29 @@
 Canonical support-status truth for the tileRL kernel layer. If a cell is not
 **done**, do not assume it works because it compiled — the dispatch registry
 (`src/tilerl/ops/registry.py`) is the source of truth, and this file mirrors it.
-State as of 2026-08-26.
+State as of 2026-08-27.
+
+## What "one kernel source" means
+
+Three targets have executed the source: **cpu**, **metal**, and **sm90**.
+`rocm` has never run. `_REGISTRY` holds 9 keys but only **3 distinct kernel
+sets** — `rocm` resolves to the same dict object as `cpu`.
+
+Line partition of `src/tilerl/ops/kernels*.py` (1,969 lines, by top-level
+function span; `python -c` over `ast` reproduces it):
+
+| lines | % | scope |
+| ---: | ---: | --- |
+| 1,406 | 71.4% | **sm90-only** — `kernels_attn.py`, `kernels_gdn.py`, `kernels_linear.py`, `kernels_mma.py`, four whole files reached only from `_SM90_KERNELS` |
+| 175 | 8.9% | shared and executed on all three targets — `rmsnorm` x4, `silu_mul`, `softmax`, `rope`, `embedding` |
+| 144 | 7.3% | `kernels.py` header: docstring, imports, `_pass_configs` |
+| 105 | 5.3% | cpu + metal, overridden on sm90 — `linear_fp4`, `paged_attention` |
+| 81 | 4.1% | cpu/rocm only — the three `T.gemm` gemms (metal and sm90 both override) |
+| 58 | 2.9% | metal only — the three naive FMA gemms |
+
+8 of `kernels.py`'s 16 makers execute on sm90. The cpu cell has 13 entries,
+metal 13 (3 overridden), sm90 23 (5 overridden, 10 added) — so sm90 shares
+exactly the 8 makers above with CPU and nothing else.
 
 ## Dispatch model
 
@@ -13,13 +35,17 @@ registered-but-empty set raises `NotImplementedError` (pending-remote bring-up).
 Adding fp8 or a new SM arch is ONE `_register()` call. Arch tags: `cpu`
 (target `"c"`), `sm90`/`sm100`/`sm120` (CUDA capability), `rocm`, `metal`.
 
+`Backend.precision` is the constant `"bf16"` (`ops/backend.py:130`), so every
+row below resolves through its arch's bf16 cell. The fp4 and fp8 tables are
+weight-format tables, not separate registry cells.
+
 `rocm` shares the CPU cell rather than sitting in an empty slot: the schedules
 are block-parallel and target-neutral, so the same source compiles for HIP. No
-HIP host exists in this env, so the cells below read **untested**, not done.
+HIP host exists in this env, so the cells below read **untested**, not done —
+nothing in them has ever executed.
 
 All CPU kernels are f32 compute with bf16 cast at the boundary (tilelang eager
-JIT does not specialize on dtype). fp4 is a weight format, not a compute dtype:
-its cell reuses the bf16 kernel set (`linear_fp4` dequantizes on the fly).
+JIT does not specialize on dtype). `linear_fp4` dequantizes on the fly.
 
 Within a cell, `Backend` picks the linear kernel from `_CUDA_PLAN` in
 `ops/backend.py` — a `(op, M-regime) -> (kernel, K pad, N cap, N tile)` table,
@@ -37,7 +63,6 @@ is no per-call fallback (see below).
 | rope (fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
 | attention (dense, fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
 | paged_attention (fwd) | done | done | pending-remote | untested (CPU cell) | done |
-| linear_attn_chunk (plain scan) | done | done | pending-remote | untested (CPU cell) | done |
 | gdn_forward (full GDN layer) | done | done | pending-remote | untested (CPU cell) | done |
 | gdn_backward | done | done | pending-remote | untested (CPU cell) | done |
 | silu_mul (fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
@@ -122,8 +147,8 @@ with neither (fused projections, native-fp8 serving) still raise.
 
 ## Evidence
 
-- **cpu/bf16 + fp4 + fp8**: `TILERL_TARGET=cpu uv run pytest` — 97 passed, 4
-  skipped. Kernel-vs-reference parity on every op with a TileLang CPU kernel,
+- **cpu/bf16 + fp4 + fp8**: `TILERL_TARGET=cpu uv run pytest` (2026-08-27) —
+  97 passed, 4 skipped. Kernel-vs-reference parity on every op with a TileLang CPU kernel,
   tape gradcheck, end-to-end generation + training. Exception: dense/paged
   attention's CPU forward is the torch-eager reference itself
   (`backend.attention`, ponytail — no TileLang CPU attention kernel yet), so
@@ -150,8 +175,8 @@ with neither (fused projections, native-fp8 serving) still raise.
 - **rocm**: `tests/test_ops_parity.py::test_rocm_cell_is_the_cpu_cell` — a
   dict lookup, so the matrix claim is gated on every host. Nothing has ever
   run on HIP.
-- **metal/bf16 + fp4**: `TILERL_TARGET=metal uv run pytest` — 97 passed, 4
-  skipped, 0 failed. The two long-standing failures were host-side device
+- **metal/bf16 + fp4**: `TILERL_TARGET=metal uv run pytest` (2026-08-27) — 97
+  passed, 4 skipped, 0 failed. The two long-standing failures were host-side device
   boundaries, not target-neutrality bugs: `linear` never moved a bias to the
   backend device (fixed at the `Backend.linear` boundary, same idiom as the
   weight), and `test_fused_projections_parity` built its training KV pool on
@@ -160,10 +185,6 @@ with neither (fused projections, native-fp8 serving) still raise.
   match the backend). Metal facts:
   - Same kernel source as CPU; the only registry fork is the three gemms
     (naive FMA schedules — Metal's `T.gemm` lowering rejects global operands).
-  - `linear_attn_chunk` uses a per-column serial scan on BOTH targets: the
-    shared-memory + `T.Parallel`-column schedule is nondeterministic on Metal
-    (tilelang 0.1.13 codegen races cross-loop shared visibility; observed
-    drift 2.4e-2 across identical runs). The serial scan is drift-free.
   - `tilerl bench` (tiny, steady state after shader-cache warmup): prefill
     191 tok/s, decode 116 tok/s on Metal vs 1202 / 705 tok/s on CPU — Metal is
     ~6x slower at this scale because every op migrates CPU-resident params to

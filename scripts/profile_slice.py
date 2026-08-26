@@ -31,7 +31,6 @@ _OPS = (
     "paged_attention",
     "attention",
     "linear_attn_chunk",
-    "linear_attn_step",
     "silu_mul",
     "softmax",
     "embedding",

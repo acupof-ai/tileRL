@@ -535,27 +535,14 @@ class Backend:
     # ------------------------------------------------------------ gated delta
 
     def linear_attn_chunk(self, q, k, v, g, beta, state, **kw):
-        if kw.get("z") is not None or kw.get("conv1d_weight") is not None:
-            # Full-GDN layer core. sm90: T=1 uses the fused decode kernel,
-            # T>1 the fused chunk kernel; other arches use the torch-eager
-            # reference.
-            _kset = _resolve(self.precision, self.arch)
-            if q.shape[1] == 1 and "gdn_decode_fused" in _kset:
-                return self._gdn_decode_fused(q, k, v, g, beta, state, **kw)
-            if q.shape[1] > 1 and "gdn_chunk_fused" in _kset:
-                return self._gdn_chunk_fused(q, k, v, g, beta, state, **kw)
-            return reference.gdn_forward(q, k, v, g, beta, state, **kw)
-        ker = self._kernel("linear_attn_chunk")
-        out, new_state = ker(
-            self._c(self._f32(q)),
-            self._c(self._f32(k)),
-            self._c(self._f32(v)),
-            self._c(self._f32(g)),
-            self._c(self._f32(beta)),
-            self._c(self._f32(state)),
-            threads=_THREADS,
-        )
-        return out, new_state, None
+        """Full-GDN layer core. sm90: T=1 uses the fused decode kernel, T>1 the
+        fused chunk kernel; other arches use the torch-eager reference."""
+        _kset = _resolve(self.precision, self.arch)
+        if q.shape[1] == 1 and "gdn_decode_fused" in _kset:
+            return self._gdn_decode_fused(q, k, v, g, beta, state, **kw)
+        if q.shape[1] > 1 and "gdn_chunk_fused" in _kset:
+            return self._gdn_chunk_fused(q, k, v, g, beta, state, **kw)
+        return reference.gdn_forward(q, k, v, g, beta, state, **kw)
 
     def _gdn_decode_fused(self, q, k, v, g, beta, state, **kw):
         """Fused GDN decode (T=1): one launch for the whole layer core.
@@ -628,18 +615,6 @@ class Backend:
             threads=state.shape[-1],
         )
         return out, new_state, (self._f32(new_window) if has_window else None)
-
-    def linear_attn_step(self, q, k, v, g, beta, state, **kw):
-        out, new_state, new_window = self.linear_attn_chunk(
-            self._c(q.unsqueeze(1)),
-            self._c(k.unsqueeze(1)),
-            self._c(v.unsqueeze(1)),
-            self._c(g.unsqueeze(1)),
-            self._c(beta.unsqueeze(1)),
-            state,
-            **kw,
-        )
-        return out.squeeze(1), new_state, new_window
 
     def linear_attn_bwd(self, grad, q, k, v, g, beta, state, **kw):
         # ponytail: torch-eager backward (gdn example_chunk_delta_bwd is the

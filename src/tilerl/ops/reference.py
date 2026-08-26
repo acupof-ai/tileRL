@@ -39,7 +39,6 @@ __all__ = [
     "dense_attention_bwd",
     "attention_gate_bwd",
     "linear_attn_chunk",
-    "linear_attn_step",
     "linear_attn_bwd",
     "gdn_forward",
     "gdn_backward",
@@ -369,181 +368,7 @@ def attention_gate_bwd(
     return grad * s, grad * _f32(attn_out) * s * (1.0 - s)
 
 
-# ---------------------------------------------------------------- gated delta (linear attention)
-
-
-def _gated_delta_scan(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    state: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Plain gated-delta recurrence (the 6-arg op the TileLang kernel mirrors).
-
-    q, k, v [B, C, H, D] f32; g [B, C, H] f32 (per-head decay, already
-    exponentiated); beta [B, C, H] f32 (per-head gate, already sigmoided);
-    state [B, H, D, D] f32 with layout S[key, value].
-
-    Per (b, h), serial over t (A_t = g_t * S):
-        p_t = A_t^T k_t;  d_t = beta_t * (v_t - p_t)
-        S = A_t + outer(k_t, d_t);  out_t = S^T q_t
-    """
-    q = _f32(q)
-    k = _f32(k)
-    v = _f32(v)
-    g = _f32(g)
-    beta = _f32(beta)
-    state = _f32(state)
-    b, c, h, d = q.shape
-    S = state.clone()
-    out = torch.empty(b, c, h, d, dtype=torch.float32, device=q.device)
-    for t in range(c):
-        S = S * g[:, t].view(b, h, 1, 1)
-        p = torch.einsum("bhij,bhi->bhj", S, k[:, t])  # [B,H,D]
-        dlt = beta[:, t].unsqueeze(-1) * (v[:, t] - p)
-        S = S + torch.einsum("bhi,bhj->bhij", k[:, t], dlt)
-        out[:, t] = torch.einsum("bhij,bhi->bhj", S, q[:, t])
-    return out, S
-
-
-def _gated_delta_bwd(
-    grad: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    state: torch.Tensor,
-) -> tuple[torch.Tensor, ...]:
-    """Backward of :func:`_gated_delta_scan`. Returns (gq,gk,gv,gg,gbeta,gstate).
-
-    Per (b, h), S_t the state after step t, S_{-1} = state input,
-    A_t = g_t S_{t-1} (the decayed state, with which the forward computes p):
-        p_t = A_t^T k_t;  d_t = beta_t (v_t - p_t)
-        S_t = A_t + outer(k_t, d_t);  o_t = S_t^T q_t
-    Reverse scan with dS = dL/dS_t, gd = dS^T k_t:
-        dS_  = dS - beta_t outer(k_t, gd)   (= dL/dA_t)
-        gg_t    = sum_ij dS_ij S_{t-1,ij}
-        gbeta_t = sum_j gd_j (v_t - p_t)_j
-        gv_t    = beta_t gd
-        gk_t    = dS d_t - beta_t A_t gd
-        dS      = g_t dS_
-    """
-    q = _f32(q)
-    k = _f32(k)
-    v = _f32(v)
-    g = _f32(g)
-    beta = _f32(beta)
-    state = _f32(state)
-    grad = _f32(grad)
-    b, c, h, d = q.shape
-
-    # Forward pass, saving p/d/states. Order must match _gated_delta_scan:
-    # decay first, then p = A^T k, then the delta and the outer-product update.
-    S = state.clone()
-    states = torch.empty(b, c + 1, h, d, d, dtype=torch.float32, device=q.device)
-    ps = torch.empty(b, c, h, d, dtype=torch.float32, device=q.device)
-    deltas = torch.empty(b, c, h, d, dtype=torch.float32, device=q.device)
-    states[:, 0] = S
-    for t in range(c):
-        S = S * g[:, t].view(b, h, 1, 1)
-        p = torch.einsum("bhij,bhi->bhj", S, k[:, t])
-        dlt = beta[:, t].unsqueeze(-1) * (v[:, t] - p)
-        S = S + torch.einsum("bhi,bhj->bhij", k[:, t], dlt)
-        states[:, t + 1] = S
-        ps[:, t] = p
-        deltas[:, t] = dlt
-
-    gq = torch.empty_like(q)
-    gk = torch.empty_like(k)
-    gv = torch.empty_like(v)
-    gg = torch.empty_like(g)
-    gbeta = torch.empty_like(beta)
-    dS = torch.zeros_like(state)
-    for t in reversed(range(c)):
-        S_prev = states[:, t]
-        dS = dS + torch.einsum("bhi,bhj->bhij", q[:, t], grad[:, t])
-        gd = torch.einsum("bhij,bhi->bhj", dS, k[:, t])  # [B,H,D]
-        gq[:, t] = torch.einsum("bhij,bhj->bhi", states[:, t + 1], grad[:, t])
-        A = g[:, t].view(b, h, 1, 1) * S_prev
-        dS_ = dS - beta[:, t].view(b, h, 1, 1) * torch.einsum("bhi,bhj->bhij", k[:, t], gd)
-        gg[:, t] = torch.einsum("bhij,bhij->bh", dS_, S_prev)
-        gbeta[:, t] = (gd * (v[:, t] - ps[:, t])).sum(-1)
-        gv[:, t] = beta[:, t].unsqueeze(-1) * gd
-        gk[:, t] = torch.einsum("bhij,bhj->bhi", dS, deltas[:, t]) - beta[:, t].unsqueeze(
-            -1
-        ) * torch.einsum("bhij,bhj->bhi", A, gd)
-        dS = g[:, t].view(b, h, 1, 1) * dS_
-    return gq, gk, gv, gg, gbeta, dS
-
-
-def linear_attn_chunk(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    state: torch.Tensor,
-    *,
-    z: "torch.Tensor | None" = None,
-    conv1d_weight: "torch.Tensor | None" = None,
-    dt_bias: "torch.Tensor | None" = None,
-    a_log: "torch.Tensor | None" = None,
-    norm_weight: "torch.Tensor | None" = None,
-    conv_window: "torch.Tensor | None" = None,
-    seq_q_lens: "torch.Tensor | None" = None,
-) -> tuple[torch.Tensor, ...]:
-    """Gated-delta linear attention. 6-arg form (``z``/``conv1d_weight``/...
-    all None): the plain :func:`_gated_delta_scan` — the op the TileLang
-    kernel mirrors and the parity/gradcheck tests exercise. Full-GDN form
-    (kwargs present): the complete layer core :func:`gdn_forward` — the form
-    :class:`tilerl.model.Model` calls; its backward is :func:`gdn_backward`.
-    Returns ``(out, new_state, new_window)`` (window is None in the 6-arg
-    form and for one-shot prefill).
-    # ponytail: full-GDN forward is torch-eager (the TileLang chunk kernel
-    # covers the plain scan); a fused GDN kernel is the perf upgrade path."""
-    if z is None and conv1d_weight is None:
-        out, new_state = _gated_delta_scan(q, k, v, g, beta, state)
-        return out, new_state, None
-    return gdn_forward(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        state,
-        z=z,
-        conv1d_weight=conv1d_weight,
-        dt_bias=dt_bias,
-        a_log=a_log,
-        norm_weight=norm_weight,
-        conv_window=conv_window,
-        seq_q_lens=seq_q_lens,
-    )
-
-
-def linear_attn_step(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    state: torch.Tensor,
-    **kw: Any,
-) -> tuple[torch.Tensor, ...]:
-    """Single-token :func:`linear_attn_chunk`. q, k, v [B, H, D], g/beta [B, H]."""
-    out, S, window = linear_attn_chunk(
-        q.unsqueeze(1),
-        k.unsqueeze(1),
-        v.unsqueeze(1),
-        g.unsqueeze(1),
-        beta.unsqueeze(1),
-        state,
-        **kw,
-    )
-    return out.squeeze(1), S, window
+# ---------------------------------------------------------------- gated delta (full GDN layer)
 
 
 def linear_attn_bwd(
@@ -554,40 +379,13 @@ def linear_attn_bwd(
     g: torch.Tensor,
     beta: torch.Tensor,
     state: torch.Tensor,
-    *,
-    z: "torch.Tensor | None" = None,
-    conv1d_weight: "torch.Tensor | None" = None,
-    dt_bias: "torch.Tensor | None" = None,
-    a_log: "torch.Tensor | None" = None,
-    norm_weight: "torch.Tensor | None" = None,
-    conv_window: "torch.Tensor | None" = None,
-    seq_q_lens: "torch.Tensor | None" = None,
+    **kw: Any,
 ) -> tuple[torch.Tensor, ...]:
-    """Backward of :func:`linear_attn_chunk`. 6-arg form:
-    :func:`_gated_delta_bwd` (6 grads). Full-GDN form: :func:`gdn_backward`
-    (11 grads: q,k,v,g,beta,state,z,conv1d,dt_bias,a_log,norm)."""
-    if seq_q_lens is not None:
+    """Backward of :func:`gdn_forward` — 11 grads: q,k,v,g,beta,state,z,
+    conv1d,dt_bias,a_log,norm."""
+    if kw.pop("seq_q_lens", None) is not None:
         raise NotImplementedError("linear_attn_bwd does not support padded mixed-length rows")
-    if z is None and conv1d_weight is None:
-        return _gated_delta_bwd(grad, q, k, v, g, beta, state)
-    return gdn_backward(
-        grad,
-        q,
-        k,
-        v,
-        g,
-        beta,
-        state,
-        z=z,
-        conv1d_weight=conv1d_weight,
-        dt_bias=dt_bias,
-        a_log=a_log,
-        norm_weight=norm_weight,
-        conv_window=conv_window,
-    )
-
-
-# ---------------------------------------------------------------- full GDN layer core
+    return gdn_backward(grad, q, k, v, g, beta, state, **kw)
 
 
 def gdn_forward(
@@ -687,6 +485,10 @@ def gdn_forward(
     return out.reshape(b, t, nvh * val_dim), s, new_window
 
 
+#: The op name the model/backend contract uses for :func:`gdn_forward`.
+linear_attn_chunk = gdn_forward
+
+
 def gdn_backward(
     grad: torch.Tensor,
     q: torch.Tensor,
@@ -707,8 +509,12 @@ def gdn_backward(
     gdt_bias,ga_log,gnorm_weight). Gradchecked against torch.autograd (worst
     rel ~3e-7); the recurrence derivation is documented inline.
     ``conv_window`` is accepted for tape-signature parity and ignored: training
-    forwards start from a zeroed window, so zero-padded recompute is exact.
+    forwards start from a zeroed window, so zero-padded recompute is exact. A
+    non-zero window raises — ignoring one silently costs every grad (measured
+    0.69-2.27 rel vs autograd), and only the zero case is exact.
     # ponytail: torch-eager backward, tilelang kernel when perf demands."""
+    if conv_window is not None and bool(conv_window.any()):
+        raise NotImplementedError("gdn_backward does not support a non-zero conv_window")
     # Same device gathering as gdn_forward: the tape replays raw saved args,
     # so params/state may be CPU-resident while grad/activations are on device.
     dev = q.device

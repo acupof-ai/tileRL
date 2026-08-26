@@ -272,7 +272,7 @@ def make_linear_fp4_mma(target: str):
 # ---------------------------------------------------------------- linear fp4 (GEMV)
 
 
-def make_linear_fp4_gemv(target: str):
+def make_linear_fp4_gemv(target: str, micro_size_k: int = 8, GROUP: int = 4):
     """Fused e2m1 dequant + GEMV (sm90), the decode (M=1) path of linear_fp4.
 
     X [1,K] bf16, WQ uint8 [N,K//2] (low nibble first), Scale [N,K//block] f32.
@@ -293,8 +293,21 @@ def make_linear_fp4_gemv(target: str):
     (``acc += s * sum(X*w)``, 1 FP op/elem), and the e2m1 grid is a
     16-entry warp-shuffle LUT (1 shuffle/elem, built once per thread via the
     integer bitcast). Sweeps (scripts/_sweep_gemv*.py): group4 = 45% roof vs
-    flat 42%; 2 accumulators, micro=16/32, shared-X/LUT, byte-LUT, 6-op
-    bitcast, and register double-buffer all tested worse.
+    flat 42%; 2 accumulators, shared-X/LUT, byte-LUT, 6-op bitcast, and
+    register double-buffer all tested worse.
+
+    ``micro_size_k`` x ``GROUP`` are sweep knobs — codegen/index gate in
+    scripts/_sweep_gemv_micro.py, pod timings in scripts/bench_gemv_micro.py;
+    the defaults are the shipped pair. micro_size_k sets the weight-stream load
+    width alone (micro/2 bytes/thread: 8 -> LDG.32, 16 -> .64, 32 -> .128 —
+    the bf16/fp8 siblings all issue .128), micro*GROUP sets the register
+    footprint. micro > 8 is CUDA/ROCm-only — TileLang's Metal backend rejects a
+    uint8 vector wider than 4 bytes, and this kernel is sm90-only anyway.
+    The old "micro=16/32 tested worse" note is stale: it was measured
+    on the flat pre-GROUP kernel, so it priced micro=32 only at GROUP=4, i.e. 4x
+    the register arrays. When micro_size_k > block the partial sum is segmented
+    one scale per block — a 32-elem micro-tile spans two block-16 scales, and a
+    single scale on it is silently wrong.
 
     # SOTA copy: examples/dequantize_gemm/example_dequant_gemv_fp16xint4.py
     #   @ tilelang main (dequantize_gemv, split-K + tvm_thread_allreduce path)
@@ -306,12 +319,15 @@ def make_linear_fp4_gemv(target: str):
     # Constraint: reduce_thread must be <= 32 (the LUT is per-warp via
     #   tvm_warp_shuffle); the backend hardcodes 32.
     """
-    GROUP = 4  # micro-tiles per dequant group (shuffle latency hiding)
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def linear_fp4_gemv(X, WQ, Scale, reduce_thread, n_partition, block):
         N, K = T.const("N, K")
-        micro_size_k = 8  # 128-bit transaction / 16-bit bf16
+        # scale segments per micro-tile: one when the tile fits a scale block
+        assert micro_size_k % block == 0 or block % micro_size_k == 0
+        nseg = max(1, micro_size_k // block)
+        seg = micro_size_k // nseg
+        xv = min(micro_size_k, 8)  # bf16 elems per 128-bit transaction
         block_K = reduce_thread * micro_size_k
         num_ko = T.ceildiv(K, block_K)
         num_g = num_ko // GROUP
@@ -336,8 +352,11 @@ def make_linear_fp4_gemv(target: str):
             for kg in T.serial(num_g):
                 for g in T.unroll(GROUP):
                     base = (kg * GROUP + g) * block_K + kr * micro_size_k
-                    for v in T.vectorized(micro_size_k):
-                        Xs[g, v] = X[0, base + v]
+                    # T.unroll, not the implicit serial split T.vectorized(>8)
+                    # emits: a runtime-indexed Xs falls to local memory.
+                    for c in T.unroll(micro_size_k // xv):
+                        for v in T.vectorized(xv):
+                            Xs[g, c * xv + v] = X[0, base + c * xv + v]
                     for v in T.vectorized(micro_size_k // 2):
                         Ws[g, v] = WQ[n, base // 2 + v]
                 # decode all GROUP tiles before any FMA: the 32 shuffles
@@ -352,25 +371,29 @@ def make_linear_fp4_gemv(target: str):
                         )
                 for g in T.unroll(GROUP):
                     base = (kg * GROUP + g) * block_K + kr * micro_size_k
-                    partial[0] = 0.0
-                    for ki in T.unroll(micro_size_k):
-                        partial[0] += T.cast(Xs[g, ki], "float32") * ws[g, ki]
-                    # one scale per micro-tile: 8 elems never cross a scale block
-                    acc[0] += Scale[n, base // block] * partial[0]
+                    for s in T.unroll(nseg):
+                        partial[0] = 0.0
+                        for ki in T.unroll(seg):
+                            partial[0] += (
+                                T.cast(Xs[g, s * seg + ki], "float32") * ws[g, s * seg + ki]
+                            )
+                        acc[0] += Scale[n, (base + s * seg) // block] * partial[0]
             # K-tail (num_ko % GROUP tiles), flat, reusing buffer slot 0
             for kt in T.serial(num_ko - num_g * GROUP):
                 base = (num_g * GROUP + kt) * block_K + kr * micro_size_k
-                for v in T.vectorized(micro_size_k):
-                    Xs[0, v] = X[0, base + v]
+                for c in T.unroll(micro_size_k // xv):
+                    for v in T.vectorized(xv):
+                        Xs[0, c * xv + v] = X[0, base + c * xv + v]
                 for v in T.vectorized(micro_size_k // 2):
                     Ws[0, v] = WQ[n, base // 2 + v]
-                partial[0] = 0.0
-                for ki in T.unroll(micro_size_k):
-                    byte = Ws[0, ki // 2]
-                    nib = (byte >> ((ki % 2) * 4)) & 15
-                    w = T.tvm_warp_shuffle(0xFFFFFFFF, lut, T.cast(nib, "int32"), 32, 32)
-                    partial[0] += T.cast(Xs[0, ki], "float32") * w
-                acc[0] += Scale[n, base // block] * partial[0]
+                for s in T.unroll(nseg):
+                    partial[0] = 0.0
+                    for ki in T.unroll(seg):
+                        byte = Ws[0, (s * seg + ki) // 2]
+                        nib = (byte >> (((s * seg + ki) % 2) * 4)) & 15
+                        w = T.tvm_warp_shuffle(0xFFFFFFFF, lut, T.cast(nib, "int32"), 32, 32)
+                        partial[0] += T.cast(Xs[0, s * seg + ki], "float32") * w
+                    acc[0] += Scale[n, (base + s * seg) // block] * partial[0]
             with T.attr(
                 T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
                 "reduce_scope",

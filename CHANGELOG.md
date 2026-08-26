@@ -4,6 +4,29 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-27 — verdict: the fp4 GEMV's load width is measurable, register-resident B is expressible
+
+- **Both answers are "yes, and here is the instrument" — neither is a perf
+  number, because neither can be one without a GPU.** `micro_size_k`/`GROUP` are
+  now call-time knobs on `make_linear_fp4_gemv`; at the defaults the emitted
+  CUDA is byte-identical to HEAD's, so the shipped path did not move. All 9
+  combinations lower and index exactly, the WQ load width tracks `micro_size_k`
+  alone (8 -> LDG.32, 32 -> LDG.128) and the register footprint tracks
+  `micro*GROUP` — making **(32,1) the shipped kernel with one variable moved**:
+  same 52 register slots, same 32-shuffle decode batch, same 16 B/thread in
+  flight, one LDG.128 where (8,4) issues four LDG.32. The sweep collapses to 6
+  arms (`scripts/bench_gemv_micro.py`, two gates, run order in
+  `scripts/POD-VERIFY.md`); the stale "micro=16/32 tested worse" note is struck,
+  it predates `GROUP` and priced micro=32 only at 4x the register footprint.
+  Two silent defects died first: a 32-elem micro-tile spans two block-16 scales
+  (57% relative error at full speed), and the obvious `for s in range(nseg)`
+  parses as `T.serial` and emits a runtime-indexed register array. Separately,
+  Marlin's register-resident dequantized B **is** expressible in TileLang —
+  `T.gemm`'s SR variant, lowered without `ldmatrix_b` to the same `mma.sync`
+  Marlin issues — priced at 12 KiB/CTA of shared memory on the live w4a8 arm,
+  not the 24 KiB of `make_linear_fp4_mma`, which `_CUDA_PLAN` makes unreachable.
+  Instrument and caveats: `docs/design-kernels.md`.
+
 ## 2026-08-27 — phase exit: adversarial defect audit of the 27B serving path
 
 - **Exit.** 30 findings raised, 1 refuted, 5 duplicates merged — **24 distinct

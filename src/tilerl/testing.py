@@ -25,7 +25,6 @@ _REF_OPS = frozenset(
         "linear",
         "linear_bwd",
         "linear_attn_chunk",
-        "linear_attn_step",
         "linear_attn_bwd",
         "attention_gate_bwd",
         "silu_mul",

@@ -60,7 +60,6 @@ _CPU_KERNELS = {  # bf16 on CPU: the f32 TileLang kernels (bf16 cast at the boun
     "embedding": kernels.make_embedding,
     "linear_fp4": kernels.make_linear_fp4,
     "paged_attention": kernels.make_paged_attention,
-    "linear_attn_chunk": kernels.make_linear_attn_chunk,
 }
 _register("bf16", "cpu", _CPU_KERNELS)
 # fp4 is a weight format, not a compute dtype: its cell reuses the bf16 set

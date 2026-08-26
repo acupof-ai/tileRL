@@ -1,9 +1,18 @@
 # H20 pod verification — native fp4 w4a8
 
-Run order for tomorrow. One script does all five checks
-(`scripts/verify_h20_fp4.py`); everything else here is setup and reading the
-output. Dev-only tooling — no bench entry for the harness itself, but the
-numbers it prints are what the wins entry gets updated with.
+Two lanes, and they are independent.
+
+- **Kernel lane** — the fp4 decode GEMV's `(micro_size_k, GROUP)` grid
+  (`scripts/bench_gemv_micro.py`). This is the day's actual decision. It needs
+  no checkpoint, no model load and no valid config, so it is immune to every
+  abort mode in the other lane.
+- **Model lane** — `scripts/verify_h20_fp4.py`'s five checks on the 27B. Worth
+  35 minutes, and it can die at second two on a config field.
+
+Run the two cheap go/no-go probes, launch the model lane detached, then run the
+kernel lane against its load window. Dev-only tooling — no bench entry for the
+harness itself, but the numbers it prints are what the wins entry gets updated
+with.
 
 **Non-negotiable:** GPUs 0-5 are the user's own training run, 100% util and
 ~94 GiB each. Only **6 and 7** are ours. The script refuses to start on
@@ -11,86 +20,85 @@ anything else and refuses a GPU that is busy — do not talk it out of that.
 
 ---
 
-## Before you start — four things, ~3 minutes, all before the 6-minute load
+## Before the pod (Mac, no GPU)
 
-1. **Read the checkpoint's own `config.json`.**
-
-   ```bash
-   ~/bin/pod 'cat /data00/Qwen3.8-27B-NVFP4/config.json'
-   ```
-
-   `_validate_hf_config` now hard-raises on `rope_theta != 1e7`, a
-   `partial_rotary_factor` that does not give rotary_dim 64, any `rope_scaling`
-   whose `rope_type` is outside `(None, "default")` or whose `factor != 1.0`,
-   and `tie_word_embeddings != false` — and it raises **after** ~360 s of CPU
-   dequant. A YaRN block at `max_position_embeddings=262144` is entirely
-   plausible on this checkpoint. Read those five, plus the four `linear_*`
-   fields and the NVFP4 block size (16, vs `pack_fp4`'s default 32), then
-   launch. The harness prints the five itself just before the load: **`None`
-   means the key is ABSENT**, and an absent key is validated by nothing — the
-   guards fire only on present-and-wrong.
-
-2. **Prove the tokenizer imports on the pod's interpreter.**
-
-   ```bash
-   ~/bin/pod 'cd /work/tilerl && PYTHONPATH=src python3 -c "from tilerl.server import get_tokenizer; print(get_tokenizer(\"/data00/Qwen3.8-27B-NVFP4\").encode(\"The capital of France is\"))"'
-   ```
-
-   `--selftest` skips the tokenizer entirely, so it does not cover this.
-   `check_logits` imports `tilerl.server`, which imports fastapi and pydantic
-   at module level; any ImportError is caught, check 2 silently falls back to
-   three **synthetic** id sequences, prints `texts ['','','']`, and still
-   records PASS. That is the exact shape of the defect that voided the
-   baseline's logits.
-
-3. **Commit before syncing.** `pod_sync.sh` tars the working tree
-   (`--exclude=.git`) while §2's launch line stamps the JSON with
-   `git rev-parse --short HEAD` — with anything uncommitted the report names a
-   commit that does not contain what ran. Commit, or pass
-   `BENCH_COMMIT=<sha>-dirty`.
-
-4. **Budget the window: `--skip 5` on the first pass.** Check 5 costs 10-30 min
-   to attribute a scale-traffic delta worth ~1.7 GiB of a 20.4 GB tick. The
-   first-order question — is linear time really ~14.3 ms, and what fraction of
-   3.3 TB/s does the fp4 GEMV reach — decides whether anything else in the
-   audit matters, and this harness does not answer it at all.
-   `scripts/profile_decode_tick.py` does, in ~20 min on the already-loaded
-   model, and has never been run on the 27B; `bench_fp4_gemv.py` answers the
-   block question in 30 s. `--skip 5` exits 1 by design.
-
-## 0. Claim a GPU and sync
+`pod_sync.sh` tars the working tree (`--exclude=.git`) while step 4's launch
+line stamps `BENCH_COMMIT` from the Mac's HEAD — anything uncommitted produces
+a report naming a commit that does not contain what ran. **Commit first**, then
+confirm the gates at the committed tree:
 
 ```bash
-# what's free right now
+TILERL_TARGET=cpu uv run pytest -q && TILERL_TARGET=metal uv run pytest -q
+uv run ruff check src/ tests/ scripts/ && uv run ruff format --check src/ tests/
+uv run python scripts/_sweep_gemv_micro.py     # codegen + index gate, no GPU
+```
+
+`_sweep_gemv_micro.py` settles everything the pod should not have to debug: all
+9 `(micro_size_k, GROUP)` combinations lower to CUDA C, the WQ load width tracks
+`micro_size_k` alone (8 -> `uint` 4 B, 16 -> `uint2`, 32 -> `uint4` 16 B), the
+index arithmetic is exact, and no combination emits a runtime-indexed local
+array. It also holds the shipped path still: at the defaults the emitted CUDA is
+byte-identical to what HEAD emits.
+
+## Run order
+
+### 1 — the checkpoint's own `config.json` (2 min, no GPU)
+
+```bash
+~/bin/pod 'cat /data00/Qwen3.8-27B-NVFP4/config.json'
+```
+
+The go/no-go for the whole model lane, for one command. Cross-check all twelve
+fields `_validate_hf_config` gates on: the 7 shape scalars, `layer_types`,
+`attn_output_gate`, `rope_theta` (must be 1e7), `partial_rotary_factor` (must
+give rotary_dim 64), `rope_scaling` (`rope_type` outside `(None, "default")` or
+`factor != 1.0` raises) and `tie_word_embeddings` (must be false). Read the four
+`linear_*` fields and the NVFP4 block size (16, vs `pack_fp4`'s default 32) in
+the same pass. **`None` means the key is ABSENT**, and an absent key is
+validated by nothing — the guards fire only on present-and-wrong.
+
+The guard runs at `model.py:706`, **before** the first `load_file` at `:743`, so
+a bad config aborts in about two seconds — not after the ~6-minute CPU dequant.
+The reason to read the file first is not the six minutes: a `rope_scaling` block
+voids the entire model lane for the day (tileRL implements no RoPE scaling and
+refuses rather than serving it wrong), and you want to know that before you
+claim a GPU. If it is present and non-default, step 4 is dead for the day,
+everything moves to the kernel lane, and that finding is the day's headline —
+not a failure.
+
+### 2 — prove the tokenizer imports on the pod's interpreter (3 min, no GPU)
+
+```bash
+~/bin/pod 'cd /work/tilerl && PYTHONPATH=src python3 -c "from tilerl.server import get_tokenizer; print(get_tokenizer(\"/data00/Qwen3.8-27B-NVFP4\").encode(\"The capital of France is\"))"'
+```
+
+`--selftest` skips the tokenizer entirely, so it does not cover this.
+`check_logits` imports `tilerl.server`, which imports fastapi and pydantic at
+module level; any ImportError is caught, check 2 silently falls back to three
+**synthetic** id sequences, prints `texts ['','','']`, and still records PASS.
+That is the exact shape of the defect that voided the baseline's logits.
+
+### 3 — claim GPUs 6 and 7, sync, smoke the harness (5 min)
+
+```bash
 ~/bin/pod 'nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv'
-```
-
-Pick 6 or 7 with util ~0 **and** memory ~0. Memory at 0% util still means
-occupied — a sibling holding memory has caused OOMs on this box before.
-
-```bash
-# ships this checkout to /work/tilerl (GitHub is unreachable from the pod)
-scripts/pod_sync.sh
-```
-
-## 1. Smoke the harness before spending GPU time (~1 min, no GPU)
-
-```bash
+scripts/pod_sync.sh   # ships this checkout to /work/tilerl (GitHub is unreachable from the pod)
 ~/bin/pod 'cd /work/tilerl && PYTHONPATH=src python3 -u scripts/verify_h20_fp4.py --selftest'
 ```
 
-Runs all five checks against a CPU tiny fp4 model at B=1 and B=2. Proves the
-harness imports, the checks execute, the re-block math runs and the summary
-prints **on the pod's interpreter**. Expect `INFO 1, PASS 4`; the numbers are
-meaningless (tiny model, no baseline). `--selftest` forces `TILERL_TARGET=cpu`
-itself — it has no GPU pin and no busy probe, so it must never reach a device.
-`python3 -u` everywhere: the log is block-buffered otherwise and `tail` lags.
+Claim **both** 6 and 7 — the two lanes run side by side. Util ~0 **and**
+memory ~0: memory at 0% util still means occupied, and a sibling holding memory
+has caused OOMs on this box before.
 
-**If this fails:** it is the harness or the pod's environment, not the
-refactor. Fix it here before touching the 27B — a failure after a 6-minute
-load costs 6 minutes.
+`--selftest` runs all five checks against a CPU tiny fp4 model at B=1 and B=2,
+proving the harness imports and the summary prints on the pod's interpreter.
+Expect `INFO 1, PASS 4`; the numbers are meaningless. It forces
+`TILERL_TARGET=cpu` itself — no GPU pin, no busy probe, so it must never reach a
+device. `python3 -u` everywhere: the log is block-buffered otherwise.
 
-## 2. The one command (~20-35 min; first run longer, NVCC)
+**If this fails:** it is the harness or the pod's environment, not the refactor.
+
+### 4 — model lane, detached on GPU 7 (~35 min)
 
 The 27B load is a silent ~6 min of CPU dequant, longer than `tn exec`'s 5-min
 no-output timeout, so launch it detached and tail the log:
@@ -101,29 +109,115 @@ no-output timeout, so launch it detached and tail the log:
 ~/bin/pod "cd /work/tilerl && setsid bash -c '
   BENCH_COMMIT=$(git -C /Users/bytedance/code/tileRL rev-parse --short HEAD) \
   PYTHONPATH=src TILERL_TARGET=cuda TILELANG_CACHE_DIR=/work/tilelang_cache \
-  python3 -u scripts/verify_h20_fp4.py /data00/Qwen3.8-27B-NVFP4 --gpu 7 \
+  python3 -u scripts/verify_h20_fp4.py /data00/Qwen3.8-27B-NVFP4 --gpu 7 --skip 5 \
     --json /work/verify_fp4.json > /work/verify_fp4.log 2>&1
   echo DONE > /work/verify_fp4.done' </dev/null >/dev/null 2>&1 &
   echo launched"
-```
-
-Then poll:
-
-```bash
 ~/bin/pod 'tail -40 /work/verify_fp4.log; ls /work/verify_fp4.done 2>/dev/null'
 ```
 
+`--skip 5` is the **default**, not the tight-on-time fallback: check 5 costs
+10-30 min to attribute a scale-traffic delta, and the kernel lane answers the
+same block question in seconds per arm with no model load. `--skip 5` exits 1 by
+design — a skipped claim must not print a success.
+
 `TILELANG_CACHE_DIR=/work/tilelang_cache` is the difference between a warm run
-and re-paying 30-120 s of NVCC per fresh kernel shape. The script sets it
-itself if `/work` exists, but set it explicitly anyway. `--gpu 7` is also
-what the script defaults to; pass `--gpu 6` if 7 is taken.
+and re-paying 30-120 s of NVCC per fresh kernel shape. Exit code is 0 only when
+checks 1-4 pass and nothing was skipped.
 
-Exit code is 0 only when checks 1-4 pass and nothing was skipped. Check 5 is
-recorded `INFO`, not `PASS`: it reports a delta, it asserts nothing. A `SKIP`
-exits 1 by design — `--skip 5` must not print a success for a claim that was
-never tested.
+### 5 — kernel lane: compile + correctness, GPU 6 (8 min, overlapping step 4)
 
-## 3. What each check proves, and what a failure means
+```bash
+~/bin/pod 'cd /work/tilerl && CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src TILERL_TARGET=cuda \
+  TILELANG_CACHE_DIR=/work/tilelang_cache python3 -u scripts/bench_gemv_micro.py --compile-only'
+```
+
+Twelve distinct kernel signatures at 30-120 s of NVCC each is the sweep's
+dominant cost, and it is CPU-bound — paying it against the 27B's six-minute
+dequant window makes it free.
+
+**HARD RULE: never two timing workloads at once.** Compiles may overlap a load;
+nothing may overlap a measurement, or step 4's check-4 headline and the sweep's
+microsecond-scale numbers contaminate each other.
+
+### 6 — kernel lane: timing, GPU 6, exclusive (5 min)
+
+Run after step 4's check 4 has printed, on the warm cache:
+
+```bash
+~/bin/pod 'cd /work/tilerl && CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src TILERL_TARGET=cuda \
+  TILELANG_CACHE_DIR=/work/tilelang_cache python3 -u scripts/bench_gemv_micro.py'
+```
+
+Both shapes, six arms, same process, back to back. The **ratio** against the
+shipped `(8,4)` arm is the number that decides; the absolute TB/s is the number
+that gets compared to Marlin — carefully, see the two gates below.
+
+### 7 — the register question, ptxas (10 min)
+
+The whole ladder rests on whether `micro=32` spills. `ncu` would settle it; so
+does `ptxas -v`, at a tenth the cost. Dump the source from an ordinary pod build
+and compile it yourself — the incantation is in
+[`docs/design-kernels.md`](../docs/design-kernels.md), "Reading the emitted
+CUDA". Record registers/thread and local-memory bytes for `(8,4)` and the
+winner.
+
+If the winner reports more registers/thread than `(8,4)` despite byte-identical
+array shapes, the result stands but the dominance argument does not, and all 9
+points have to be measured.
+
+### 8 — verdict and branch (15 min)
+
+- **Gate A passes** → next pod action is a same-process decode A/B through
+  `backend.linear_fp4`, the only evidence standard this repo has ever accepted
+  for a ship decision. It needs `_CUDA_PLAN`'s K pad moved 256 -> 1024 first
+  (`backend.py:100`): a thread block covers `reduce_thread * micro` =
+  256/512/1024 elements, so at micro=16/32 a K that is only 256-aligned reads
+  past the tensor. Harmless for step 6 — 17408 = 17x1024, 5120 = 5x1024, and
+  `bench_gemv_micro.py` asserts alignment rather than padding — but a hard
+  prerequisite before micro>8 enters the dispatch plan.
+- **Gate A fails on both shapes** → the memory-level-parallelism thesis is dead.
+  The next lever is the scale dtype: f32 block scales are 0.25 of tileRL's
+  0.75 B/elem, i.e. **a third of the whole fp4 weight stream**, and Marlin's own
+  byte definition is 0.5625. That comes before any vendoring decision.
+- **Check 2 failed in step 4** → stop the perf program. Every tok/s number is
+  denominated on a model whose logits are unvalidated, and that has already
+  destroyed one shipped measurement on this checkpoint.
+
+Total: ~75 min of pod wall time to verdicts on both lanes.
+
+## The kernel lane's two gates
+
+One number cannot carry both questions, so do not try.
+
+**Gate A — the thesis, and the only one the sweep can settle.** Does any arm
+beat the shipped `(8,4)` by >=5% on **both** shapes, same process, block-16
+weights, rel-err <= 1e-2? That is what the kernel's own docstring asks and what
+`bench_gemv_micro.py` prints.
+
+**Gate B — the ambition.** Does the best arm get down_proj under **38.9 us**?
+That is Marlin's measured wall time on `N=5120 K=17408` at M=1
+(`agent-infer/docs/experience/wins/2026-08-23-marlin-nvfp4-decode-bps-tiebreaker.md`).
+
+Use microseconds, not TB/s. Marlin's 1.29 TB/s is computed at 0.5625 B/elem
+because NVFP4 stores e4m3 group scales; tileRL stores f32 block scales at
+0.75 B/elem, so the same wall time reads **1.33x higher** in tileRL's units. A
+kernel that hits "1.30 TB/s in tileRL units" is 1.32x *slower* than the kernel
+that number was borrowed from. Matching Marlin's wall time needs 1.72 TB/s in
+tileRL units.
+
+Every older sweep in `scripts/` (`_sweep_gemv{,2,3}.py`, `_matrix_gemv.py`,
+`bench_gemv_gap.py` before this pass) declared block-**32** scales and still
+scored against 0.75 B/elem — a 1.2x overstatement that puts the *baseline* arm
+above a 1.30 TB/s bar before anything is tested. `bench_gemv_micro.py` builds
+block-16 weights and computes bytes from the tensors.
+
+Gate B will fail. It is knowable before the run: 0.1875 of the 0.75 B/elem is
+f32-scale overhead Marlin does not pay, and `micro_size_k` cannot touch a byte
+of it. **A pass on A with a fail on B is the expected and useful outcome** — it
+says widen the load *and* move the scale dtype, in that order.
+
+## What each check proves, and what a failure means
 
 ### 1 — native fp4, no bf16 masters
 
@@ -227,21 +321,18 @@ prefill chunked at 512, pools 1024 blocks / 16384 tokens. Baseline: decode B=1
 tok/s**. Also reports decode B=8 (no baseline exists for it) and the implied
 weight-stream bandwidth.
 
-**Read the ratio as a smoke test, not a verdict.** It is a cross-process,
-cross-day comparison against a table value, and this box has already produced a
-13% swing from a sibling holding memory at 0% util
+**Read the ratio as INFO, not a verdict.** It is a cross-process, cross-day
+comparison against a table value from a differently-shaped model, and this box
+has already produced a 13% swing from a sibling holding memory at 0% util
 (`docs/experience/wins/2026-08-26-batch-decode-h2.md`, note 3). Every
 accept/reject in this repo used a same-process A/B. A 0.90-0.95x here is not
 by itself something to revert. The old baseline was also partly fast *because*
 it was wrong: it re-quantized the per-channel FP8 weights down to 4 bits and
 served the wrong `lm_head`.
 
-- **FAIL "decode < 0.95x"** — **read this verdict as INFO.** The baseline is a
-  differently-shaped model (628c82d kept bf16 masters resident, requantized the
-  per-channel FP8 weights to 4 bits, and served `embed_tokens` as `lm_head`),
-  and the gate is a hard `>= 0.95` against a table value from another day.
-  0.90-0.95x is not a revert signal. Do not guess why: check 5 runs next and
-  attributes one of the four changes (see §7).
+- **FAIL "decode < 0.95x"** — the gate is a hard `>= 0.95` against that table
+  value; 0.90-0.95x is not a revert signal. Do not guess why — see "What the
+  verification run does NOT tell us" below.
 - **FAIL "decode graph OFF at B=1"** — the tick fell back to eager and the B=1
   numbers are not comparable to the baseline. Rerun. A capture failure at B=8
   alone prints a NOTE and leaves B=1 standing; the flag is snapshotted per
@@ -250,7 +341,7 @@ served the wrong `lm_head`.
   only). Prefill regression with clean decode points at the `.oscale` epilogue
   or the N-pad change in `_CUDA_PLAN`, not the scale block.
 
-### 5 — THE PERF RISK: block-16 vs block-32 scales
+### 5 — block-16 vs block-32 scales (skipped by default)
 
 The refactor moved the scale block from 32 to the checkpoint's native 16, both
 f32. That **doubles scale traffic**: expect ~1.74 → ~3.48 GiB of the weight
@@ -261,7 +352,7 @@ same weights.
 
 **It isolates the scale block and nothing else.** The b32 arm keeps the new
 nibble decode, the `.oscale` epilogue, the fp8 arm at 1 B/elem and the new
-`_CUDA_PLAN` N-pad. It does not answer "what did the refactor cost" — see §7.
+`_CUDA_PLAN` N-pad.
 
 Arm b16 is the shipped native path (already measured in check 4). Arm b32
 re-blocks every block-16 scale grid at load time and re-measures. The re-block
@@ -298,27 +389,23 @@ The script also prints the **added weight error** of the re-block (expect
 ~3% Frobenius). Arm b32 is a *diagnostic*, not a shippable config at that
 error — it exists to attribute the ms, not to propose a change.
 
-## 4. If you are short on GPU time
+Check 5 is destructive (it rewrites the params in place) and therefore always
+runs last — checks 1-4 are already recorded by then, so killing the run during
+check 5 loses only check 5.
+
+## If you are short on GPU time
 
 ```bash
---skip 5              # drop the A/B; exits 1, and check 5 shows SKIP in the summary
 --batches 1           # decode B=1 only (B=1 is always measured — it owns the baseline)
 --prefill 512,2048    # drop the 8192 prefill (~5 s per pass plus its own JIT)
 --decode-ticks 16     # noisier, half the decode time
 --sample 3            # fewer tensors in checks 3 and 5
 ```
 
-Budget check 5 generously: it pushes all 497 fp4 tensors through `pack_fp4`
-(~32 bytes allocated per weight element, row-chunked), then reloads and
-re-times. On its own that is plausibly 10-30 min. If the day is tight, run the
-first pass with `--skip 5` and get the block answer from `bench_fp4_gemv.py`
-instead — same question, 30 s of GPU, no model load.
+`bench_gemv_micro.py --iters 20` halves the timing pass. Do not cut the arm
+list: `(16,2)` is the control on the ladder argument, not filler.
 
-Check 5 is destructive (it rewrites the params in place) and therefore always
-runs last — checks 1-4 are already recorded by then, so killing the run during
-check 5 loses only check 5.
-
-## 5. Failure modes of the harness itself
+## Failure modes of the harness itself
 
 | symptom | meaning |
 |---|---|
@@ -328,8 +415,9 @@ check 5 loses only check 5.
 | `FATAL: torch sees N devices` | the `CUDA_VISIBLE_DEVICES` pin did not take (something initialized CUDA first). Refuses rather than risk an allocation on GPUs 0-5. |
 | `WARNING: TILELANG_CACHE_DIR unset` | the run works but re-pays NVCC per shape. Set it. |
 | a check prints `ERROR` | that check raised; the traceback is above it and the *other* checks still ran. The run is not wasted. |
+| `AssertionError: K=... not a multiple of ...` | `bench_gemv_micro.py` on a shape a wider micro cannot cover. Real, not a harness bug — see step 8. |
 
-## 6. After the run
+## After the run
 
 ```bash
 ~/bin/pod 'cat /work/verify_fp4.json' > /tmp/verify_fp4.json   # machine-readable
@@ -342,14 +430,14 @@ wins entry `docs/experience/wins/2026-08-26-native-fp4-w4a8.md` has three
 kernel error — and this run closes all three. It is a dated snapshot, so the
 numbers go in a **new** entry that links back to it, never over the old one.
 
-## 7. After verification passes — what the run does NOT tell us
+## What the verification run does NOT tell us
 
 Four things changed at once: the fp4 scale block (32 → 16), the per-channel FP8
 linears (fp4-packed → native e4m3, a **different kernel**), a new `.oscale`
 epilogue multiply per linear, and two extra integer ops per nibble in
-`_dequant_fp4_macro`. The run produces three decode facts (B=1, B=8, and check
-5's block A/B) and check 5 isolates only the first. If check 4 comes back at
-0.90x, nothing in the harness says which change did it.
+`_dequant_fp4_macro`. The run produces two decode facts (B=1 and B=8) and
+isolates neither. If check 4 comes back at 0.90x, nothing in the harness says
+which change did it.
 
 Close that in this order, cheapest first:
 
@@ -372,25 +460,18 @@ Close that in this order, cheapest first:
 **Do not re-run these — they are settled, with numbers.** fp4 GEMV dequant
 mechanism (PRMT 0.851x, MMA 0.504x, the shuffle LUT is within 3% of its own
 nodecode floor); register double-buffer, 6-op bitcast decode, byte-LUT, extra
-accumulators, noxbuf, micro=16/32 (all lost); small-M GEMV for B=2..8 (1.56-2.18x
-slower, rejected twice); k_split=1 on the WGMMA decode path (ks8 shipped at
-+7.5%); bf16-A at B=8 (-13.3% and a gate-failing 3.8% error); e4m3 block scales
-(-6 to -11%). A-precision at decode M=1 is settled by physics.
+accumulators, noxbuf (all lost); small-M GEMV for B=2..8 (1.56-2.18x slower,
+rejected twice); k_split=1 on the WGMMA decode path (ks8 shipped at +7.5%);
+bf16-A at B=8 (-13.3% and a gate-failing 3.8% error); e4m3 block scales (-6 to
+-11%). A-precision at decode M=1 is settled by physics.
 
-**Highest-EV next experiment** (kernel-level, no model load, ~15 min): in
-`kernels_linear.py:342` each thread's four W loads are 4 bytes each, 128 bytes
-apart. Re-partition K so a thread's GROUP micro-tiles are contiguous
-(`base = kg*GROUP*block_K + kr*GROUP*micro_size_k + g*micro_size_k`) and
-vectorize W across the group: one 16-byte load, identical DRAM traffic and warp
-coalescing, 4x fewer W-load instructions, and the per-micro-tile scale lookups
-drop from 4 to 2 at block 16. The mechanism is not a guess — `linear_fp8_gemv`
-loads W as a 128-bit vector and beats the fp4 GEMV while reading 1.65x the
-bytes. This is **not** the twice-rejected `micro=16/32`: `micro_size_k` and
-every register buffer stay the same size. Gate: >=5% at N=34816/K=5120 and
-N=5120/K=17408, fro-relerr <=1e-2, then a same-process decode A/B before
-shipping. Fallback cell in the same sweep: grid K-split (ks in 2/4/8, f32
-atomics into a zeroed Y) — never executed on this kernel, and the identical
-lever just won +7.5% on the sibling WGMMA path.
+`micro=16/32` used to sit in that list. **It does not belong there** and has
+been struck: git shows the rejection text was written for the flat pre-`GROUP`
+kernel (`b201ddd` documents `1190885`; `GROUP=4` landed later in `6b39e50`), it
+records no ms and no %roof, and the sweep table it points at contains no micro
+row at all. Before `GROUP` existed, micro=32 could only be tried at what is now
+the `GROUP=4` footprint — 208 register slots against the shipped 52. The
+footprint was rejected, never the load width. That is step 6.
 
 **The one correctness thing left.** Check 2 catches a dead `lm_head` and
 nothing finer, and `global_divide=True` for the NVFP4 MLP dequant has been an
