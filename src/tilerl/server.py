@@ -61,6 +61,11 @@ class _HfTokenizerAdapter:
 
     def __init__(self, tok: Any) -> None:
         self._tok = tok
+        self.stop_token_ids = tuple(
+            token_id
+            for token in ("<|im_end|>", "<|endoftext|>")
+            if (token_id := tok.token_to_id(token)) is not None
+        )
 
     def encode(self, text: str) -> list[int]:
         return self._tok.encode(text).ids
@@ -72,21 +77,17 @@ class _HfTokenizerAdapter:
 def get_tokenizer(source: str | None = None) -> Tokenizer:
     """Load a HF tokenizer from a hub id or local directory.
 
-    Falls back to :class:`ByteTokenizer` when ``source`` is None, the
-    ``tokenizers`` package is unavailable, or loading fails for any reason —
-    a random-weight tiny model needs no checkpoint at all.
+    A random-weight tiny model needs no checkpoint, so ``source=None`` uses
+    :class:`ByteTokenizer`. A configured checkpoint fails closed.
     """
     if source:
-        try:
-            from tokenizers import Tokenizer as HfTokenizer
+        from tokenizers import Tokenizer as HfTokenizer
 
-            if os.path.isdir(source):
-                tok = HfTokenizer.from_file(os.path.join(source, "tokenizer.json"))
-            else:
-                tok = HfTokenizer.from_pretrained(source)
-            return _HfTokenizerAdapter(tok)
-        except Exception:
-            pass
+        if os.path.isdir(source):
+            tok = HfTokenizer.from_file(os.path.join(source, "tokenizer.json"))
+        else:
+            tok = HfTokenizer.from_pretrained(source)
+        return _HfTokenizerAdapter(tok)
     return ByteTokenizer()
 
 
@@ -103,9 +104,9 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[ChatMessage]
-    max_tokens: int | None = Field(default=None, alias="max_completion_tokens")
-    temperature: float | None = None
-    top_p: float | None = None
+    max_tokens: int | None = Field(default=None, alias="max_completion_tokens", ge=1)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
     stream: bool | None = None
     seed: int | None = None
 
@@ -173,8 +174,9 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         params = SamplingParams(
             temperature=req.temperature if req.temperature is not None else 0.0,
             top_p=req.top_p if req.top_p is not None else 1.0,
-            max_new_tokens=req.max_tokens or 512,
-            seed=req.seed or 0,
+            max_new_tokens=req.max_tokens if req.max_tokens is not None else 512,
+            seed=req.seed if req.seed is not None else 0,
+            stop_token_ids=tuple(getattr(tokenizer, "stop_token_ids", ())),
         )
         return engine.submit(input_ids, params), len(input_ids), params.max_new_tokens
 
@@ -220,10 +222,15 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                 status_code=400,
                 content={"error": {"message": str(exc), "type": "invalid_request_error"}},
             )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": str(exc), "type": "api_error"}},
+            )
 
         if req.stream:
             return StreamingResponse(
-                _stream(request_id),
+                _stream(request_id, max_new),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -233,6 +240,11 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         except TimeoutError as exc:
             return JSONResponse(
                 status_code=504,
+                content={"error": {"message": str(exc), "type": "api_error"}},
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=500,
                 content={"error": {"message": str(exc), "type": "api_error"}},
             )
         text = tokenizer.decode(output_ids)
@@ -246,7 +258,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                 {
                     "index": 0,
                     "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "finish_reason": "length" if len(output_ids) >= max_new else "stop",
                 }
             ],
             "usage": {
@@ -257,7 +269,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             "system_fingerprint": SYSTEM_FINGERPRINT,
         }
 
-    def _stream(request_id: int):
+    def _stream(request_id: int, max_new: int):
         # ponytail: engine.poll reports COMPLETED sequences, so the completion
         # is emitted as one content delta + finish. Incremental token
         # streaming needs an engine event stream (day-2).
@@ -266,14 +278,15 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         yield _sse(_chat_chunk(chunk_id, created, model_name, {"role": "assistant"}))
         try:
             output_ids = _await_completion(request_id)
-        except TimeoutError as exc:
+        except (TimeoutError, RuntimeError) as exc:
             yield _sse({"error": {"message": str(exc), "type": "api_error"}})
             yield "data: [DONE]\n\n"
             return
         text = tokenizer.decode(output_ids)
         if text:
             yield _sse(_chat_chunk(chunk_id, created, model_name, {"content": text}))
-        yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish="stop"))
+        finish = "length" if len(output_ids) >= max_new else "stop"
+        yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=finish))
         yield "data: [DONE]\n\n"
 
     @app.get("/", response_class=HTMLResponse)

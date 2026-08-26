@@ -38,6 +38,7 @@ __all__ = [
     "dequant_awq",
     "dense_attention",
     "dense_attention_bwd",
+    "attention_gate_bwd",
     "linear_attn_chunk",
     "linear_attn_step",
     "linear_attn_bwd",
@@ -46,6 +47,9 @@ __all__ = [
     "silu_mul",
     "silu_mul_bwd",
     "softmax",
+    "cross_entropy_loss_grad",
+    "state_gather",
+    "state_scatter",
     "embedding",
     "embedding_bwd",
     "sample",
@@ -406,6 +410,15 @@ def dense_attention_bwd(
     return gq, gk, gv
 
 
+def attention_gate_bwd(
+    grad: torch.Tensor, attn_out: torch.Tensor, gate: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward of ``attn_out * sigmoid(gate)``."""
+    s = torch.sigmoid(_f32(gate))
+    grad = _f32(grad)
+    return grad * s, grad * _f32(attn_out) * s * (1.0 - s)
+
+
 # ---------------------------------------------------------------- gated delta (linear attention)
 
 
@@ -598,10 +611,13 @@ def linear_attn_bwd(
     a_log: "torch.Tensor | None" = None,
     norm_weight: "torch.Tensor | None" = None,
     conv_window: "torch.Tensor | None" = None,
+    seq_q_lens: "torch.Tensor | None" = None,
 ) -> tuple[torch.Tensor, ...]:
     """Backward of :func:`linear_attn_chunk`. 6-arg form:
     :func:`_gated_delta_bwd` (6 grads). Full-GDN form: :func:`gdn_backward`
     (11 grads: q,k,v,g,beta,state,z,conv1d,dt_bias,a_log,norm)."""
+    if seq_q_lens is not None:
+        raise NotImplementedError("linear_attn_bwd does not support padded mixed-length rows")
     if z is None and conv1d_weight is None:
         return _gated_delta_bwd(grad, q, k, v, g, beta, state)
     return gdn_backward(
@@ -916,6 +932,36 @@ def softmax(x: torch.Tensor, axis: int) -> torch.Tensor:
     """Numerically stable softmax along ``axis``."""
     x = _f32(x)
     return torch.softmax(x, dim=axis)
+
+
+def cross_entropy_loss_grad(logits: torch.Tensor, input_ids: object) -> tuple[float, torch.Tensor]:
+    """Stable shifted causal CE and its matching logit gradient."""
+    b, t, v = logits.shape
+    if t < 2:
+        raise ValueError("cross_entropy_loss_grad needs at least two tokens")
+    flat = _f32(logits[:, :-1]).reshape(-1, v)
+    labels = torch.as_tensor(input_ids, dtype=torch.long, device=flat.device)[:, 1:].reshape(-1)
+    loss = (torch.logsumexp(flat, dim=-1) - flat.gather(-1, labels[:, None]).squeeze(-1)).mean()
+    grad = torch.softmax(flat, dim=-1)
+    grad.scatter_add_(-1, labels[:, None], -torch.ones_like(labels[:, None], dtype=grad.dtype))
+    grad /= flat.shape[0]
+    out = torch.zeros(b, t, v, dtype=torch.float32, device=logits.device)
+    out[:, :-1] = grad.reshape(b, t - 1, v)
+    return float(loss), out
+
+
+def state_gather(states, windows, slots, layer_idx):
+    """Gather one recurrent-state layer for a batch of slots."""
+    slots = torch.as_tensor(slots, dtype=torch.long, device=states.device).reshape(-1)
+    return states[slots, layer_idx], None if windows is None else windows[slots, layer_idx]
+
+
+def state_scatter(states, windows, slots, layer_idx, new_state, new_window) -> None:
+    """Store one recurrent-state layer for a batch of slots."""
+    slots = torch.as_tensor(slots, dtype=torch.long, device=states.device).reshape(-1)
+    states[slots, layer_idx] = new_state.to(states.dtype)
+    if new_window is not None:
+        windows[slots, layer_idx] = new_window.to(windows.dtype)
 
 
 # ---------------------------------------------------------------- embedding

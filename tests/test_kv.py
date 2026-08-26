@@ -202,6 +202,20 @@ def test_prefix_eviction_releases_blocks():
     assert store.lookup(list(range(16))) is None  # evicted entry is gone
 
 
+def test_prefix_eviction_reacts_to_block_pressure():
+    pool = PagedKvPool(2, 1, 4)
+    store = PrefixStore(pool)
+    blocks = [pool.alloc_block() for _ in range(2)]
+    for i, block in enumerate(blocks):
+        store.insert(list(range(i * 16, (i + 1) * 16)), [block])
+        pool.free_block(block)
+
+    assert pool.free_blocks == 0
+    store.evict_until_free(1)
+    assert pool.free_blocks == 1
+    assert store.stats()["evictions"] == 1
+
+
 def test_prefix_duplicate_insert_is_noop():
     pool = PagedKvPool(4, 1, 4)
     store = PrefixStore(pool)

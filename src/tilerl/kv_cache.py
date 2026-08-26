@@ -396,15 +396,23 @@ class PrefixStore:
 
     def _evict_if_needed(self) -> None:
         while len(self._by_id) > self.capacity:
-            eid = self._fifo.popleft()
-            entry = self._by_id.pop(eid)
-            chain = self._entries[entry.h]
-            chain.remove(entry)
-            if not chain:
-                del self._entries[entry.h]
-            for b in entry.blocks:
-                self._pool.free_block(b)
-            self.evictions += 1
+            self._evict_one()
+
+    def evict_until_free(self, blocks: int) -> None:
+        """Evict oldest entries until the pool can satisfy an allocation."""
+        while self._pool.free_blocks < blocks and self._fifo:
+            self._evict_one()
+
+    def _evict_one(self) -> None:
+        eid = self._fifo.popleft()
+        entry = self._by_id.pop(eid)
+        chain = self._entries[entry.h]
+        chain.remove(entry)
+        if not chain:
+            del self._entries[entry.h]
+        for b in entry.blocks:
+            self._pool.free_block(b)
+        self.evictions += 1
 
     def stats(self) -> dict[str, int]:
         """Cache counters: entries, capacity, hits, misses, evictions."""

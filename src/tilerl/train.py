@@ -40,24 +40,8 @@ __all__ = ["train_step", "opd_loop", "pretrain", "JsonlDataset"]
 
 
 def _ce_loss_grad(logits: torch.Tensor, input_ids: Any, backend: Any) -> tuple[float, torch.Tensor]:
-    """Causal CE over shifted targets, plus ``dL/dlogits``.
-
-    ``logits`` [B,T,V], ``input_ids`` [B,T] (numpy or torch). The grad is zero
-    at the last position (no target there) and ``(softmax - onehot)/N``
-    elsewhere. fp32 regardless of the logits dtype.
-    """
-    b, t, v = logits.shape
-    flat = logits[:, :-1, :].reshape(-1, v).to(torch.float32)
-    labels = torch.as_tensor(
-        np.asarray(input_ids)[:, 1:].reshape(-1), dtype=torch.long, device=flat.device
-    )
-    probs = backend.softmax(flat, axis=-1)
-    onehot = torch.zeros_like(probs).scatter_(-1, labels.unsqueeze(-1), 1.0)
-    n = flat.shape[0]
-    loss = -(probs.clamp_min(1e-9).log() * onehot).sum() / n
-    grad_full = torch.zeros(b, t, v, dtype=torch.float32, device=logits.device)
-    grad_full[:, :-1, :] = (probs - onehot).reshape(b, t - 1, v) / n
-    return float(loss), grad_full
+    """Stable shifted causal CE and matching logit gradient via backend ops."""
+    return backend.cross_entropy_loss_grad(logits, input_ids)
 
 
 # ---------------------------------------------------------------------------

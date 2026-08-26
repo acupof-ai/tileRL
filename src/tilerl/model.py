@@ -338,12 +338,11 @@ class Model:
         q = autograd.slice(qkv, ..., slice(0, qd))
         k = autograd.slice(qkv, ..., slice(qd, qd + kd))
         v = autograd.slice(qkv, ..., slice(qd + kd, None))
-        slots = torch.as_tensor(kv.state_slot, dtype=torch.long).reshape(-1)
-        state = kv.state_pool.states[slots, linear_idx]  # [B,H,K,V]
-        window = (
-            kv.state_pool.conv_windows[slots, linear_idx]
-            if kv.state_pool.conv_windows is not None
-            else None
+        state, window = backend.state_gather(
+            kv.state_pool.states,
+            kv.state_pool.conv_windows,
+            kv.state_slot,
+            linear_idx,
         )
         kwargs = dict(
             z=z,
@@ -357,11 +356,14 @@ class Model:
         out, new_state, new_window = backend.linear_attn_chunk(
             q, k, v, a_proj, b_proj, state, **kwargs
         )
-        kv.state_pool.states[slots, linear_idx] = new_state.to(kv.state_pool.states.dtype)
-        if new_window is not None:
-            kv.state_pool.conv_windows[slots, linear_idx] = new_window.to(
-                kv.state_pool.conv_windows.dtype
-            )
+        backend.state_scatter(
+            kv.state_pool.states,
+            kv.state_pool.conv_windows,
+            kv.state_slot,
+            linear_idx,
+            new_state,
+            new_window,
+        )
         out = self._linear(backend, out, f"{p}.out_proj")
         return backend.add(x, out)
 
@@ -371,7 +373,7 @@ class Model:
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.post_attn_norm"], cfg.rms_eps)
         gu_key = f"{p}.gate_up"
-        if f"{gu_key}.wq" in self.params:  # fused gate/up (serving)
+        if f"{gu_key}.wq" in self.params or f"{gu_key}.w8" in self.params:
             gu = self._linear(backend, h, gu_key)
             gate = autograd.slice(gu, ..., slice(0, cfg.intermediate_size))
             up = autograd.slice(gu, ..., slice(cfg.intermediate_size, None))

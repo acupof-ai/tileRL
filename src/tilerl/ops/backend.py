@@ -531,6 +531,9 @@ class Backend:
         # ponytail: torch-eager backward, tilelang kernel when perf demands
         return reference.dense_attention_bwd(grad, q, k, v, float(scale))
 
+    def attention_gate_bwd(self, grad, attn_out, gate):
+        return reference.attention_gate_bwd(grad, attn_out, gate)
+
     # ------------------------------------------------------------ gated delta
 
     def linear_attn_chunk(self, q, k, v, g, beta, state, **kw):
@@ -646,6 +649,12 @@ class Backend:
         kw.pop("seq_q_lens", None)  # serving-only; training batches are uniform T
         return reference.linear_attn_bwd(grad, q, k, v, g, beta, state, **kw)
 
+    def state_gather(self, states, windows, slots, layer_idx):
+        return reference.state_gather(states, windows, slots, layer_idx)
+
+    def state_scatter(self, states, windows, slots, layer_idx, new_state, new_window):
+        reference.state_scatter(states, windows, slots, layer_idx, new_state, new_window)
+
     # ------------------------------------------------------------ silu mul
 
     def silu_mul(self, gate, up):
@@ -671,6 +680,10 @@ class Backend:
             return y.movedim(-1, axis)
         k = self._kernel("softmax")
         return k(x.reshape(-1, x.shape[-1]), threads=_THREADS).reshape(x.shape)
+
+    def cross_entropy_loss_grad(self, logits, input_ids):
+        # ponytail: torch-eager training loss, tilelang kernel when perf demands
+        return reference.cross_entropy_loss_grad(logits, input_ids)
 
     # ------------------------------------------------------------ embedding
 

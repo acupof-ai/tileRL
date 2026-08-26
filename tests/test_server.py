@@ -19,7 +19,7 @@ from tilerl.config import tiny
 from tilerl.engine import Engine, build_engine
 from tilerl.model import build_random
 from tilerl.ops.backend import get_backend
-from tilerl.server import create_app
+from tilerl.server import create_app, get_tokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +99,7 @@ def test_completion_nonstream(client, model_id):
     body = resp.json()
     content = body["choices"][0]["message"]["content"]
     assert isinstance(content, str) and content, f"empty completion: {body!r}"
+    assert body["choices"][0]["finish_reason"] == "length"
 
 
 def test_completion_stream(client, model_id):
@@ -122,3 +123,21 @@ def test_completion_stream(client, model_id):
     payloads = [json.loads(line[len("data: ") :]) for line in lines[:-1]]
     contents = [p["choices"][0].get("delta", {}).get("content") for p in payloads]
     assert any(content for content in contents), f"no delta content in chunks: {payloads!r}"
+    assert payloads[-1]["choices"][0]["finish_reason"] == "length"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("max_tokens", 0), ("temperature", -0.1), ("temperature", 2.1), ("top_p", 0.0)],
+)
+def test_sampling_bounds(client, field, value):
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], field: value},
+    )
+    assert resp.status_code == 422
+
+
+def test_configured_tokenizer_fails_closed(tmp_path):
+    with pytest.raises(Exception):
+        get_tokenizer(str(tmp_path))

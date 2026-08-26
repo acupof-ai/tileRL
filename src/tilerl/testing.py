@@ -25,12 +25,17 @@ _REF_OPS = frozenset(
         "linear",
         "linear_bwd",
         "linear_fp4_bwd",
+        "linear_fp8_bwd",
         "linear_attn_chunk",
         "linear_attn_step",
         "linear_attn_bwd",
+        "attention_gate_bwd",
         "silu_mul",
         "silu_mul_bwd",
         "softmax",
+        "cross_entropy_loss_grad",
+        "state_gather",
+        "state_scatter",
         "embedding",
         "embedding_bwd",
         "sample",
@@ -57,6 +62,11 @@ class RefBackend:
 
         return reference.linear_fp4(x, wq, scale)  # master is recording-only
 
+    def linear_fp8(self, x, w8, wscale, master=None):
+        from .ops import reference
+
+        return reference.linear_fp8(x, w8, wscale)  # master is recording-only
+
     def attention(self, q, k, v, scale, gate=None):
         from .ops import reference
 
@@ -64,6 +74,11 @@ class RefBackend:
         if gate is not None:
             out = out * torch.sigmoid(gate.float())
         return out
+
+    def attention_bwd(self, grad, q, k, v, scale):
+        from .ops import reference
+
+        return reference.dense_attention_bwd(grad, q, k, v, float(scale))
 
     def add(self, a, b):
         return a + b

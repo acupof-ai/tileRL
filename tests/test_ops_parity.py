@@ -322,6 +322,15 @@ def test_linear_fp8_bwd():
     _assert_close(g_master, go.t() @ x, "linear_fp8_bwd g_master")
 
 
+def test_ref_backend_fp8_surface():
+    from tilerl.testing import RefBackend
+
+    x = torch.randn(2, 128)
+    w8, wscale = _quantize_fp8(torch.randn(64, 128))
+    backend = RefBackend()
+    _assert_close(backend.linear_fp8(x, w8, wscale), reference.linear_fp8(x, w8, wscale), "ref fp8")
+
+
 def test_linear_fp8_gemv_parity(backend):
     """M=1 decode path: the sm90 cell resolves to the fp8 GEMV kernel (the
     bf16 master floor on CPU/metal). The GEMV uses bf16 X (no activation
@@ -753,3 +762,10 @@ def test_sample_deterministic():
 def test_backend_target_and_device(backend):
     assert backend.target in ("c", "cuda", "llvm", "metal")
     assert isinstance(backend.device, torch.device)
+
+
+def test_cross_entropy_is_stable_and_matches_gradient(backend):
+    logits = torch.tensor([[[0.0, -100.0], [0.0, 0.0]]])
+    loss, grad = backend.cross_entropy_loss_grad(logits, [[0, 1]])
+    assert loss == pytest.approx(100.0)
+    assert torch.equal(grad[0, 0], torch.tensor([1.0, -1.0]))

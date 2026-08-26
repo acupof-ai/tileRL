@@ -107,6 +107,16 @@ class RecordingBackend:
         self.device = getattr(backend, "device", torch.device("cpu"))
 
     def __getattr__(self, name: str) -> Any:
+        if name in ("linear_fp4", "linear_fp8"):
+
+            def master_linear(x: torch.Tensor, *args: Any, master=None, **kwargs: Any) -> Any:
+                if master is None:
+                    raise RuntimeError(f"{name} training requires a master weight")
+                out = self._backend.linear(x, master)
+                maybe_record("linear", out, x, master, _backend=self._backend)
+                return out
+
+            return master_linear
         attr = getattr(self._backend, name)
         if name not in _BWD:
             return attr
@@ -206,9 +216,7 @@ def _attention(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
     gate = kw.get("gate")
     if gate is not None:
         attn_out = backend.attention(q, k, v, scale)
-        s = torch.sigmoid(gate)
-        g_attn = g * s
-        g_gate = g * attn_out * s * (1.0 - s)
+        g_attn, g_gate = backend.attention_gate_bwd(g, attn_out, gate)
         gq, gk, gv = backend.attention_bwd(g_attn, q, k, v, scale)
         yield 0, gq
         yield 1, gk
@@ -296,12 +304,13 @@ class Tape:
     def __init__(self) -> None:
         self._entries: list[_Entry] = []
         self._token: Any = None
+        self._consumed = False
         #: Backend for the ``*_bwd`` calls; set by RecordingBackend while
         #: recording. Falls back to the TileLang singleton when unset.
         self.bwd_backend: Any = None
 
     def __enter__(self) -> "Tape":
-        if self._token is not None:
+        if self._token is not None or self._entries or self._consumed:
             raise RuntimeError("Tape is already active (nested/reused tape)")
         self._token = _current_tape.set(self)
         return self
@@ -346,9 +355,11 @@ class Tape:
         grads: dict[int, torch.Tensor] = {id(last.output): grad_output}
 
         # Backward ops must not record onto this tape.
+        entries = self._entries
+        produced = {id(e.output) for e in entries}
         token = _current_tape.set(None)
         try:
-            for entry in reversed(self._entries):
+            for entry in reversed(entries):
                 g_out = grads.get(id(entry.output))
                 if g_out is None:
                     continue  # dead branch: output feeds nothing differentiable
@@ -370,8 +381,8 @@ class Tape:
                         grads[tid] = g_in
         finally:
             _current_tape.reset(token)
-
-        produced = {id(e.output) for e in self._entries}
+            self._entries.clear()
+            self._consumed = True
         return {tid: g for tid, g in grads.items() if tid not in produced}
 
 

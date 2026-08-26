@@ -70,6 +70,7 @@ class SamplingParams:
     top_p: float = 1.0
     max_new_tokens: int = 16
     seed: int = 0
+    stop_token_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -246,6 +247,7 @@ class Engine:
         self._waiting: deque[_Req] = deque()
         self._running: list[_Req] = []
         self._finished: dict[int, list[int]] = {}
+        self._failed: dict[int, str] = {}
         self._finished_count = 0
 
         # Prefix-boundary state snapshots, keyed by the matched token tuple
@@ -281,6 +283,15 @@ class Engine:
         tokens = [int(t) for t in input_ids]
         if not tokens:
             raise ValueError("prompt must be non-empty")
+        if params.max_new_tokens > 0:
+            total = len(tokens) + params.max_new_tokens
+            if total > self.limits.max_total_tokens:
+                raise ValueError(
+                    f"request ({total} tokens) exceeds max_total_tokens "
+                    f"({self.limits.max_total_tokens})"
+                )
+            if self._kv.blocks_for_tokens(total) > self._kv.num_blocks:
+                raise ValueError(f"request ({total} tokens) exceeds KV pool capacity")
         with self._lock:
             rid = self._next_id
             self._next_id += 1
@@ -295,21 +306,29 @@ class Engine:
             else:
                 self._prefix_misses += 1
 
-            tail = len(tokens) - matched
-            if tail > self.limits.max_total_tokens:
-                raise ValueError(
-                    f"prompt tail ({tail} tokens) exceeds max_total_tokens "
-                    f"({self.limits.max_total_tokens}); chunked prefill is day-2"
-                )
-
-            blocks = hit_blocks
-            for b in blocks:
-                self._kv.retain(b)  # adopt the store's blocks
             total_blocks = (len(tokens) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
-            while len(blocks) < total_blocks:
-                blocks.append(self._kv.alloc_block())
-                self._blocks_used += 1
-            slot = self._states.alloc_slot()
+            blocks = list(hit_blocks)
+            slot = None
+            try:
+                slot = self._states.alloc_slot()
+                for b in blocks:
+                    self._kv.retain(b)  # adopt the store's blocks
+                needed = total_blocks - len(blocks)
+                evict = getattr(self._prefix, "evict_until_free", None)
+                if evict is not None:
+                    evict(needed)
+                if self._kv.free_blocks < needed:
+                    raise RuntimeError("insufficient KV blocks for request")
+                while len(blocks) < total_blocks:
+                    blocks.append(self._kv.alloc_block())
+            except Exception:
+                for b in blocks:
+                    self._kv.free_block(b)
+                if slot is not None:
+                    self._states.free_slot(slot)
+                raise
+            own_blocks = total_blocks - matched // BLOCK_TOKENS
+            self._blocks_used += own_blocks
             self._slots_used += 1
             if matched:
                 snap_states, snap_windows = self._prefix_state[self._snapshot_key(tokens[:matched])]
@@ -326,7 +345,7 @@ class Engine:
                 seq_len=matched,  # materialized length (adopted prefix; 0 on a miss)
                 phase=_PHASE_PREFILL,
                 prefill_from=matched,
-                own_blocks=total_blocks - matched // BLOCK_TOKENS,
+                own_blocks=own_blocks,
             )
             self._waiting.append(req)
             return rid
@@ -334,6 +353,9 @@ class Engine:
     def poll(self) -> dict[int, list[int]]:
         """Return and clear all requests finished since the last poll."""
         with self._lock:
+            if self._failed:
+                rid, message = self._failed.popitem()
+                raise RuntimeError(f"request {rid} failed: {message}")
             out = dict(self._finished)
             self._finished.clear()
             return out
@@ -345,6 +367,9 @@ class Engine:
         each caller only observes its own request.
         """
         with self._lock:
+            message = self._failed.pop(request_id, None)
+            if message is not None:
+                raise RuntimeError(f"request {request_id} failed: {message}")
             return self._finished.pop(request_id, None)
 
     def step(self) -> None:
@@ -354,7 +379,12 @@ class Engine:
             decodes, prefill, chunk = self._build_plan()
             if not decodes and prefill is None:
                 return
-            self._run_forward(decodes, prefill, chunk)
+            try:
+                self._run_forward(decodes, prefill, chunk)
+            except Exception as exc:
+                for req in list(self._running):
+                    self._finish(req, error=str(exc))
+                raise
 
     def _build_plan(self) -> tuple[list[_Req], _Req | None, int]:
         """Plan one tick, mirroring agent-infer's ``build_forward_plan``.
@@ -564,12 +594,16 @@ class Engine:
 
     def _after_forward(self, req: _Req, last_logits: torch.Tensor, generated_idx: int) -> None:
         tok = self._sample(last_logits, req, generated_idx)
+        if tok in req.params.stop_token_ids:
+            self._finish(req)
+            return
         req.output.append(tok)
         req.tokens.append(tok)
         req.seq_len += 1
         self._tokens_generated += 1
-        if req.phase == _PHASE_DECODE and req.seq_len % BLOCK_TOKENS == 0:
-            self._publish_prefix(req, req.seq_len)
+        materialized = req.seq_len - 1
+        if req.phase == _PHASE_DECODE and materialized % BLOCK_TOKENS == 0:
+            self._publish_prefix(req, materialized)
         if len(req.output) >= req.params.max_new_tokens:
             self._finish(req)
 
@@ -596,7 +630,7 @@ class Engine:
             )
             self._prefix_published += 1
 
-    def _finish(self, req: _Req) -> None:
+    def _finish(self, req: _Req, error: str | None = None) -> None:
         # Resources are freed at finish (not at poll) so pool capacity returns
         # immediately; poll only retrieves the output tokens.
         req.phase = _PHASE_DONE
@@ -605,7 +639,10 @@ class Engine:
         self._blocks_used -= req.own_blocks
         self._states.free_slot(req.state_slot)
         self._slots_used -= 1
-        self._finished[req.req_id] = req.output
+        if error is None:
+            self._finished[req.req_id] = req.output
+        else:
+            self._failed[req.req_id] = error
         self._finished_count += 1
         self._running.remove(req)
 

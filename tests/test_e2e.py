@@ -22,6 +22,8 @@ from tilerl.config import tiny
 from tilerl.engine import _PHASE_DECODE, Engine, SamplingParams, build_engine
 from tilerl.model import build_random, param_specs
 from tilerl.ops.backend import get_backend
+from tilerl.ops.reference import pack_fp4
+from tilerl.testing import RefBackend
 from tilerl.train import opd_loop, train_step
 
 
@@ -105,6 +107,60 @@ def test_prefix_cache():
 
     assert 1 <= len(out_1) <= 8 and 1 <= len(out_2) <= 8
     assert engine.stats()["prefix_hits"] == 1
+
+
+def test_generated_prefix_matches_cold_path():
+    cfg = tiny()
+    backend = get_backend()
+    prompt = np.random.default_rng(4).integers(3, 320, size=14).astype(np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=3, seed=0)
+    cached = build_engine(
+        cfg, build_random(cfg, seed=12), backend, num_blocks=8, max_total_tokens=512
+    )
+    cold = build_engine(
+        cfg, build_random(cfg, seed=12), backend, num_blocks=8, max_total_tokens=512
+    )
+    first = _drain(cached, [cached.submit(prompt, params)], 3)
+    generated = next(iter(first.values()))
+    followup = np.concatenate([prompt, generated[:2], np.array([7, 8], dtype=np.int64)])
+    next_params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=1)
+    cached_id = cached.submit(followup, next_params)
+    cold_id = cold.submit(followup, next_params)
+    assert _drain(cached, [cached_id], 2)[cached_id] == _drain(cold, [cold_id], 2)[cold_id]
+    assert cached.stats()["prefix_hits"] == 1
+
+
+def test_submit_rollback_and_terminal_failure():
+    cfg = tiny()
+    engine = build_engine(
+        cfg,
+        build_random(cfg, seed=3),
+        get_backend(),
+        num_blocks=2,
+        num_slots=1,
+        max_total_tokens=32,
+    )
+    engine.submit([1], SamplingParams(max_new_tokens=1))
+    free_blocks = engine._kv.free_blocks
+    with pytest.raises(RuntimeError, match="LinearStatePool exhausted"):
+        engine.submit([2], SamplingParams(max_new_tokens=1))
+    assert engine._kv.free_blocks == free_blocks
+
+    engine._model.forward = lambda *_: (_ for _ in ()).throw(RuntimeError("boom"))
+    with pytest.raises(RuntimeError, match="boom"):
+        engine.step()
+    with pytest.raises(RuntimeError, match="boom"):
+        engine.take(1)
+    assert engine.stats()["blocks_used"] == 0
+    assert engine.stats()["slots_used"] == 0
+
+
+def test_stop_token_is_not_returned():
+    engine = _build_engine(seed=6)
+    engine._sample = lambda *_: 7
+    rid = engine.submit([1, 2], SamplingParams(max_new_tokens=4, stop_token_ids=(7,)))
+    engine.step()
+    assert engine.take(rid) == []
 
 
 def test_train_loss_decreases():
@@ -207,6 +263,33 @@ def test_tape_gradcheck():
             f"{name}: tape grad mismatch, max abs diff "
             f"{(expected - numeric).abs().max().item():.2e}"
         )
+
+
+def test_recording_uses_master_weight_and_consumes_tape():
+    backend = RefBackend()
+    recording = RecordingBackend(backend)
+    x = torch.randn(2, 32)
+    master = torch.randn(8, 32)
+    wq, scale = pack_fp4(master)
+    tape = Tape()
+    with tape:
+        y = recording.linear_fp4(x, wq, scale, master=master)
+    assert torch.allclose(y, backend.linear(x, master))
+    grads = tape.backward(torch.ones_like(y))
+    assert id(master) in grads and not tape._entries
+    with pytest.raises(RuntimeError, match="reused"), tape:
+        pass
+
+
+def test_ref_backend_train_step():
+    model = build_random(tiny(), seed=4)
+    loss = train_step(
+        model,
+        np.arange(3, 11, dtype=np.int64)[None, :],
+        RefBackend(),
+        AdamW(lr=1e-3),
+    )
+    assert math.isfinite(loss)
 
 
 def test_fp4_roundtrip():
