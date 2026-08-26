@@ -4,6 +4,22 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-26 — accept-or-reject: batched-decode arms (shared-X small-M GEMV + k_split=1 WGMMA) — REJECTED (smallm 2.18x slower, ks1 -2.6%)
+
+- **Verdict.** Both B=2..8 decode levers lost the A/B (slice4 graph, B=8,
+  same process, 30-tick avg). (1) Shared-X small-M GEMV: 9.76 vs 4.48
+  ms/tick (2.18x slower) — the shared-X fix removed the 31x X-traffic
+  problem, but the kernel is FMA-issue-bound (8 scalar FMAs/W elem, 85
+  inst/micro-tile) vs the WGMMA path's tensor cores; the X reload was
+  never the binding constraint. Settles the previous arm's open question:
+  a shared-mem-X GEMV does not beat WGMMA at M=16. (2) k_split=1 WGMMA:
+  -9.4% all-N, -2.6% large-N-only — k_split=2's atomics are not pure cost;
+  the split doubles per-tile dequant parallelism (two SMs on the same
+  tile's K-range), load-bearing for the fp4 WGMMA path. Both correct
+  (ks1 bit-identical to shipped, fro-relerr 0.0, tokens identical); B=1
+  neutral. Reverted (no half-states); the B=8 lever is dead. Entry:
+  `docs/experience/errors/2026-08-26-batch-decode-arms-rejected.md`.
+
 ## 2026-08-26 — accept-or-reject: fp4 GEMV dequant issue throughput — REJECTED (PRMT 0.85x, MMA 0.50x; prmt.b32 compiler bug)
 
 - **Verdict.** Replacing the shipped shuffle-LUT dequant with `__byte_perm`
