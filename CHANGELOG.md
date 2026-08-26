@@ -4,6 +4,17 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-26 — accept-or-reject: 2-way K-split for fp8 prefill GEMM — ACCEPTED (+7.4% geo-mean, zeroing included)
+
+- **Verdict.** `make_linear_fp4_fp8_mma` gains a `k_split` param; k_split=2
+  (3D grid, f32 atomic add into a zeroed output) is the sm90 default. The
+  sweep's +8% geo-mean excluded the output zeroing; the A/B
+  (`scripts/bench_fp8_split2.py`, H20 pod GPU 6, mean of 20) includes it:
+  geo-mean 1.074x (down 1.181x, out 1.136x, z 1.049x, qkv 1.042x, gate/up
+  0.974x — already 4+ waves). Rel-err 4.0e-3..8.6e-3 vs the shipped kernel
+  (same fp8 math, split reduction order). `uv run pytest -q`: 75 passed,
+  4 skipped. Entry: `docs/experience/wins/2026-08-26-fp8-prefill-split2.md`.
+
 ## 2026-08-25 — accept-or-reject: chunked GDR scan for GDN prefill — REJECTED (0.90x, bf16 precision wall)
 
 - **Verdict.** The FlashQLA chunk-WY pipeline (6 kernels: cumsum, kkt, solve,
