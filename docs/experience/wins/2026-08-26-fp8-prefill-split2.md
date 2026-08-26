@@ -60,3 +60,10 @@ kernel. It is NOT free on already-saturated grids (gate/up, 4+ waves:
 TFLOP/s columns are gate/up, down, qkv, z, out (fp8 path, kernel only — the
 0.024ms per-token quant is outside this A/B). Raw artifacts:
 `scripts/bench_fp8_split2.py` output (pod, GPU 6, this run).
+
+## Iteration
+
+Hypothesis -> verdict in 12.6 min agent wall time (2 pod round-trips, 8
+edits) — one of two parallel A/Bs on GPUs 6/7 (workflow wall 14.1 min for
+both, 236k subagent tokens). The bench script + kernel port compiled and
+passed parity on the first pod run; the second sync was the A/B itself.

@@ -5,7 +5,7 @@
 ## Context
 
 Each GDN layer projects the same post-norm hidden twice: `in_proj_qkv`
-(h→10240 = qd+kd+vd) and `in_proj_z` (h→6144). In the Qwen3.6 checkpoint
+(h→10240 = qd+kd+vd) and `in_proj_z` (h→6144). In the Qwen3.8 checkpoint
 both ship native-fp8 (e4m3 `.w8` + f32 per-128-block `.wscale`), so the
 shipped GDN forward paid two `linear_fp8` launches — two activation quants
 and two GEMMs on identical input. Projection fusion already existed for fp4
@@ -61,3 +61,10 @@ one fewer activation quant), with bit-identical outputs.
 | 2026-08-26 | 30b040a | H20 pod | sm90 | microbench fused qkvz | 0.2204 (pair) | — | — |
 
 Raw artifacts: `scripts/bench_fp8_qkvz.py` (pod, GPU 7).
+
+## Iteration
+
+Hypothesis -> verdict in 14.1 min agent wall time (1 pod round-trip, 10
+edits) — one of two parallel A/Bs on GPUs 6/7 (workflow wall 14.1 min for
+both, 236k subagent tokens). Single pod round-trip: the fusion, CPU parity
+test, and bench script all passed on the first sync.
