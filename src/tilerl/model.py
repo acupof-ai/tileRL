@@ -310,6 +310,7 @@ class Model:
         x: torch.Tensor,
         kv: Any,
         backend: "Backend",
+        capture: list | None = None,
     ) -> torch.Tensor:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
@@ -353,6 +354,8 @@ class Model:
             conv_window=window,
             seq_q_lens=getattr(kv, "seq_q_lens", None),
         )
+        if capture is not None:
+            capture.append((layer_idx, linear_idx, q, k, v, a_proj, b_proj, z))
         out, new_state, new_window = backend.linear_attn_chunk(
             q, k, v, a_proj, b_proj, state, **kwargs
         )
@@ -391,10 +394,20 @@ class Model:
         positions: "np.ndarray | torch.Tensor",
         kv: Any,
         backend: "Backend",
+        *,
+        return_hidden: bool = False,
+        linear_capture: list | None = None,
     ) -> torch.Tensor:
         """Run the model. ``input_ids`` [B,T] int, ``positions`` [T] or [B,T]
         int (RoPE positions), ``kv`` a BatchKv with pools attached. Returns
-        logits [B,T,vocab_size] on the backend device."""
+        logits [B,T,vocab_size] on the backend device.
+
+        ``return_hidden``: also return the last-layer hidden [B,T,hidden]
+        (before final norm + lm_head) — the MTP draft seed.
+        ``linear_capture``: when a list, each GDN layer appends
+        ``(layer_idx, linear_idx, q, k, v, a, b, z)`` — the verify-rollback
+        replay inputs (see :meth:`replay_linear`).
+        """
         cfg = self.cfg
         device = backend.device
         ids = torch.as_tensor(input_ids, dtype=torch.long, device=device)
@@ -405,12 +418,70 @@ class Model:
             if cfg.is_full_attn(i):
                 x = self._full_attn(i, x, pos, kv, backend)
             else:
-                x = self._gdn(i, linear_idx, x, kv, backend)
+                x = self._gdn(i, linear_idx, x, kv, backend, capture=linear_capture)
                 linear_idx += 1
             x = self._mlp(i, x, backend)
+        hidden = x
         x = backend.rmsnorm(x, self.params["final_norm"], cfg.rms_eps)
         head_key = "embed_tokens" if cfg.tie_word_embeddings else "lm_head"
-        return self._linear(backend, x, head_key)
+        logits = self._linear(backend, x, head_key)
+        return (logits, hidden) if return_hidden else logits
+
+    # -- speculative-decode GDN rollback ------------------------------------
+    def replay_linear(
+        self,
+        backend: "Backend",
+        state_pool: Any,
+        capture: list,
+        rej_idx: "torch.Tensor",
+        slots: "torch.Tensor",
+        snap_states: "torch.Tensor",
+        snap_windows: "torch.Tensor | None",
+    ) -> None:
+        """Re-advance GDN state for rejected requests after a verify rollback.
+
+        Restores the pre-verify snapshot for the rejected slots, then re-runs
+        each GDN layer's recurrence at position 0 (the accepted prefix) from
+        the captured inputs. Skips full-attn/MLP/lm_head — only the recurrent
+        state needs re-advancing (the full-attn KV self-heals under the
+        seq_len rewind).
+        """
+        state_pool.states[slots] = snap_states[rej_idx]
+        if state_pool.conv_windows is not None and snap_windows is not None:
+            state_pool.conv_windows[slots] = snap_windows[rej_idx]
+        for layer_idx, linear_idx, q, k, v, a, b, z in capture:
+            p = f"layers.{layer_idx}"
+            q_r = q[rej_idx, 0:1]
+            k_r = k[rej_idx, 0:1]
+            v_r = v[rej_idx, 0:1]
+            a_r = a[rej_idx, 0:1]
+            b_r = b[rej_idx, 0:1]
+            z_r = z[rej_idx, 0:1]
+            state, window = backend.state_gather(
+                state_pool.states, state_pool.conv_windows, slots, linear_idx
+            )
+            _, new_state, new_window = backend.linear_attn_chunk(
+                q_r,
+                k_r,
+                v_r,
+                a_r,
+                b_r,
+                state,
+                z=z_r,
+                conv1d_weight=self.params[f"{p}.conv1d"],
+                dt_bias=self.params[f"{p}.dt_bias"],
+                a_log=self.params[f"{p}.a_log"],
+                norm_weight=self.params[f"{p}.gdn_norm"],
+                conv_window=window,
+            )
+            backend.state_scatter(
+                state_pool.states,
+                state_pool.conv_windows,
+                slots,
+                linear_idx,
+                new_state,
+                new_window,
+            )
 
 
 # --- Random initialization --------------------------------------------------
