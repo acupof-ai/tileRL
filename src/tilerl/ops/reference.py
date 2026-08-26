@@ -671,7 +671,7 @@ def gdn_forward(
     nkh = q.shape[-1] // key_dim
     kernel = conv1d_weight.shape[1]
     if seq_q_lens is None:
-        seq_q_lens = torch.full((b,), t, dtype=torch.long)
+        seq_q_lens = torch.full((b,), t, dtype=torch.long, device=dev)
     else:
         seq_q_lens = torch.as_tensor(seq_q_lens, dtype=torch.long, device=dev).reshape(b)
     qkv = torch.cat([q, k, v], dim=-1)
