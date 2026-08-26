@@ -77,6 +77,8 @@ model-level quality problem.
 | 2026-08-26 | 2e5921e | H20 pod GPU 7 | cuda/sm90 | A shipped e4m3+fp8 ksplit2 | 0.322 | 1.0x |
 | 2026-08-26 | 2e5921e | H20 pod GPU 7 | cuda/sm90 | B bf16 no-quant | 0.499 | 0.646x |
 
-Raw artifacts: bench output (pod run, this entry's table). Bench script:
-`scripts/bench_abf16_prefill.py` (dev-only — not shipped; the shipped
-kernel is unchanged).
+## Iteration
+
+Hypothesis -> verdict in 11.9 min agent wall time (3 pod round-trips) — one
+of two parallel arms of the A-precision sweep (workflow wall 12.0 min for
+both, 215k subagent tokens).

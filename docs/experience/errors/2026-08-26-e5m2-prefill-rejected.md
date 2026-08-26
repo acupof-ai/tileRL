@@ -14,8 +14,7 @@ reference (`reference.linear_fp4`) ≤ 1e-2; a speed tie rejects (keep shipped)
 ## Root Cause
 
 Two independent failures, measured on the H20 pod (GPU 6 idle, JIT-warm, mean
-of 20 iters per arm, same process — `scripts/bench_fp8_e5m2.py`, commit
-2e5921e):
+of 20 iters per arm, same process, commit 2e5921e):
 
 | shape (M,K,N) | A: e4m3 ms | B: e5m2 ms | B/A | A relerr vs bf16 | B relerr vs bf16 |
 |---|---:|---:|---:|---:|---:|
@@ -49,3 +48,15 @@ speed choice — same byte count, same instructions, so the timing ties
 structurally and e5m2's 2-mantissa-bit grid ~doubles the GEMM error. Don't
 A/B fp8 dtypes for speed; only for accuracy headroom, and e4m3 already sits
 at the ~4% floor.
+
+## Iteration
+
+Hypothesis -> verdict in 9.4 min agent wall time (2 pod round-trips) — one of
+two parallel arms of the A-precision sweep (workflow wall 12.0 min for both,
+215k subagent tokens). First pod run green.
+
+## Results
+
+| date | commit | machine | target | arm | geo-mean B/A |
+|---|---|---|---|---|---:|
+| 2026-08-26 | 2e5921e | H20 pod GPU 6 | cuda/sm90 | e5m2 vs shipped e4m3 | 0.999x (reject) |
