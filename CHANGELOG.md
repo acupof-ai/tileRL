@@ -4,6 +4,22 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-26 — accept-or-reject: small-M GEMV for B=2..8 decode — REJECTED (1.56-1.61x slower than the padded WGMMA path)
+
+- **Verdict.** Generalized the fp4/bf16/fp8 GEMV from M=1 to fixed M=8
+  (stream W once, M-way FMA) and routed 2<=M<=8 decode through it behind
+  `_SMALLM_GEMV`. H20 slice4 graph, same process: B=2/4/8 candidate
+  6.33/6.56/7.06 ms/tick vs shipped 3.93/4.11/4.52 — 1.56-1.61x slower.
+  Root cause: every warp reloads the full 8-row activation (19.9 GB X
+  traffic for lm_head vs the WGMMA path's 636 MB — 31x), plus 8 scalar
+  FMAs per W elem vs tensor cores. The kernel is correct (bit-identical
+  to the shipping M=1 GEMV row-by-row); the harness's f32-parity flags
+  are a gate artifact both shipping GEMVs trip at model-scale K. Kernel
+  reverted (impl at 26e6471); the A/B harness stays as dev tooling.
+  Shipped from the arm: the `write_tokens` packed-ABI fix (bf16 fused-qkv
+  views crashed at B>=2). Entry:
+  `docs/experience/errors/2026-08-26-smallm-gemv-decode-rejected.md`.
+
 ## 2026-08-26 — phase exit: Qwen3.8-27B full-model serving baseline (52.6 tok/s decode, 1773 tok/s prefill)
 
 - **Baseline.** First full-27B measurement on the real NVFP4 checkpoint
