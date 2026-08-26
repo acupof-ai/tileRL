@@ -106,11 +106,39 @@ def bench_shapes(backend, model, cfg, bw_gbs: float) -> None:
         mma_ms = _time_calls(lambda: backend.linear_fp4(x, wq, scale), 50)
         _set_gemv(True)
 
-        bytes_ = N * K * 0.75 + 2 * K  # bf16 X
+        # From the tensors, not a per-elem constant: the fp4 format is
+        # 0.625 B/elem at block-32 scales and 0.75 at the checkpoint's 16.
+        bytes_ = wq.numel() + scale.numel() * scale.element_size() + 2 * K  # bf16 X
         roof_ms = bytes_ / (bw_gbs * 1e9) * 1e3
         print(
             f"  {f'{N},{K}':<22} {bytes_ / 2**20:>9.2f} {roof_ms:>8.4f} {gemv_ms:>9.4f} "
             f"{mma_ms:>9.4f} {100 * roof_ms / gemv_ms:>9.1f}% {mma_ms / gemv_ms:>7.1f}x"
+        )
+
+
+def bench_fp8_shapes(backend, model, bw_gbs: float) -> None:
+    """The other half of the decode stream. Post-refactor the per-channel FP8
+    linears stay 8-bit (~47% of the 27B's weight bytes) and no roofline number
+    for that kernel exists anywhere. No WGMMA arm: linear_fp8 has no fallback."""
+    keys = sorted(k[:-3] for k in model.params if k.endswith(".w8"))
+    if not keys:
+        return
+    print(f"\n=== per-linear fp8 GEMV, M=1 (BW {bw_gbs:.1f} GB/s) ===")
+    print(f"  {'shape (N,K)':<22} {'bytes MB':>9} {'roof ms':>8} {'fp8 ms':>9} {'fp8 %roof':>10}")
+    for base in keys:
+        w8, ws = model.params[base + ".w8"], model.params[base + ".wscale"]
+        osc = model.params.get(base + ".oscale")
+        N, K = w8.shape
+        x = torch.randn(1, K, device=backend.device)
+        run = lambda: backend.linear_fp8(x, w8, ws, oscale=osc)  # noqa: B023
+        for _ in range(5):
+            run()
+        ms = _time_calls(run, 50)
+        bytes_ = w8.numel() + ws.numel() * ws.element_size() + 2 * K
+        roof_ms = bytes_ / (bw_gbs * 1e9) * 1e3
+        print(
+            f"  {f'{N},{K}':<22} {bytes_ / 2**20:>9.2f} {roof_ms:>8.4f} {ms:>9.4f} "
+            f"{100 * roof_ms / ms:>9.1f}%"
         )
 
 
@@ -170,6 +198,7 @@ def main() -> None:
 
     bw = _measure_bw_gbs()
     bench_shapes(backend, model, cfg, bw)
+    bench_fp8_shapes(backend, model, bw)
     bench_slice(backend, model, cfg, args.ticks)
 
 
