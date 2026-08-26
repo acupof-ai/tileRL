@@ -34,15 +34,20 @@ diffed:
 
 1. **FIND** — tilelang ecosystem: `examples/`, `tileop/`, `tilert/` in
    `/Users/bytedance/code/tilelang` (read-only).
-2. **COPY** — into `kernels_mma.py`, adapt to the `make_<op>(target)` factory
-   signature, add the provenance header.
-3. **WIRE** — one line in the arch cell in `backend.py`.
+2. **COPY** — into the family module (`kernels_linear.py` / `kernels_gdn.py` /
+   `kernels_attn.py`; shared helpers stay in `kernels_mma.py`), adapt to the
+   `make_<op>(target)` factory signature, add the provenance header.
+3. **WIRE** — one line in the arch cell in `registry.py`.
 4. **PARITY** — same `tests/test_ops_parity.py`, no new machinery: on CPU it
    tests the floor; on the pod it tests whatever the cell resolves. Gate:
    `allclose(rtol=1e-2)` vs torch-eager.
-   `scripts/pod_sync.sh 'CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src TILERL_TARGET=cuda python3 -m pytest tests/test_ops_parity.py -x'`
-5. **BENCH** — before/after on the pod → `docs/experience/wins/YYYY-MM-DD-<slug>.md`
-   per `TEMPLATE-bench.md`. No entry, not shipped.
+   `scripts/pod_sync.sh 'CUDA_VISIBLE_DEVICES=6,7 PYTHONPATH=src TILERL_TARGET=cuda python3 -m pytest tests/test_ops_parity.py -x'`
+5. **BENCH** — A/B the variant against the default in one process (the ratio
+   is contention-independent): a `scripts/bench_<family>.py` that builds
+   inputs at canonical shapes and calls `benchkit.ab(...)`, run via
+   `scripts/_pod_bench.sh` (syncs, quiet-gates GPUs 6,7, stamps the commit).
+   The report prints the entry draft → `docs/experience/wins|errors/` per
+   `TEMPLATE-bench.md`. No entry, not shipped.
 6. **COMMIT** — `feat(ops): ...`, no AI attribution.
 
 ## fp4 format reconciliation
