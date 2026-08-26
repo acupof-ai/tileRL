@@ -282,7 +282,7 @@ def run_matrix(N, K, name):
         xg = torch.nn.functional.pad(x, (0, Kp - K))
         wqg = torch.nn.functional.pad(wq, (0, 0, 0, Np - N))
         scg = torch.nn.functional.pad(scale, (0, 0, 0, Np - N))
-        return gemv, (xg, wqg, scg, 32, 4), lambda: gemv(xg, wqg, scg, 32, 4)[0, :N]
+        return gemv, (xg, wqg, scg, 32, 4, 32), lambda: gemv(xg, wqg, scg, 32, 4, 32)[0, :N]
     if "gemv_shuffle" in sel:
         cells.append(("gemv_shuffle", cell_gemv_shuffle))
 
@@ -302,7 +302,7 @@ def run_matrix(N, K, name):
     def cell_mma_bitcast_m16():
         xm, wqm, scm = pad_mma(16)
         mma = make_linear_fp4_mma("cuda")
-        return mma, (xm, wqm, scm, 16, 64, 64), lambda: mma(xm, wqm, scm, 16, 64, 64)[0, :N]
+        return mma, (xm, wqm, scm, 16, 64, 32, 64), lambda: mma(xm, wqm, scm, 16, 64, 32, 64)[0, :N]
     if "mma_bitcast_m16" in sel:
         cells.append(("mma_bitcast_m16", cell_mma_bitcast_m16))
 

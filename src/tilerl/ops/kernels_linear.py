@@ -6,7 +6,7 @@ CPU (T.gemm -> WGMMA only on sm90).
 
 All kernels are bf16-IO on sm90 (the backend casts f32 at the boundary on
 CPU/metal; eager JIT does not specialize on dtype) and lower to bf16 WGMMA
-with f32 accumulation. The fp4 kernels decode the e2m1fn grid with the
+with f32 accumulation. The fp4 kernels decode the OCP e2m1 grid with the
 lop3-style integer bit-pattern fast decode (no exp2 in the loop).
 """
 
@@ -140,10 +140,23 @@ def make_gemm_tn_mma(target: str):
 # ---------------------------------------------------------------- linear fp4 (MMA)
 
 
-def _dequant_fp4_macro(out_dtype, local_size):
-    """Vectorized e2m1fn dequant: a packed WQ tile -> a dequantized W tile in
+def _e2m1_fp32(nib):
+    """OCP e2m1 nibble -> fp32 by IEEE bit-pattern synthesis: the grid is
+    powers of two, so ``-min(e,1)`` drops the subnormals' mantissa ({0, 0.5})
+    and ``-min(e|m,1)`` zeroes nibble 0. No exp2, no LUT load — the lop3-style
+    fast decode, 2x the LUT/exp2 path (see
+    docs/experience/wins/2026-08-24-fp4-gemv-bitcast-bf16.md)."""
+    ni32 = T.cast(nib, "int32")
+    e, m = (ni32 >> 1) & 3, ni32 & 1
+    bits = (((ni32 & 8) << 28) | ((126 + e) << 23) | ((m << 22) & -T.min(e, 1))) & -T.min(e | m, 1)
+    return T.reinterpret(bits, "float32")
+
+
+def _dequant_fp4_macro(out_dtype, local_size, block):
+    """Vectorized e2m1 dequant: a packed WQ tile -> a dequantized W tile in
     shared memory, 128-bit transactions (local_size elems out / local_size//2
-    packed bytes in per chunk), one per-32-block scale per chunk.
+    packed bytes in per chunk), one per-``block`` scale per chunk (``block``
+    must be a multiple of local_size, so a chunk never crosses a scale block).
 
     The chunk loop is T.Parallel (not T.serial): a serial chunk loop obstructs
     the K-loop pipeliner on long K-loops (the dequant can't hide behind the
@@ -152,15 +165,16 @@ def _dequant_fp4_macro(out_dtype, local_size):
 
     # SOTA copy: examples/dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py
     #   @ tilelang main (fast_dequant path's per-thread vectorized macro)
-    # Adapted: the e2m1fn integer bitcast decode replaces the SOTA's twiddling
-    #   extern (it only covers affine int4 grids, not e2m1fn's float grid);
-    #   tileRL's per-32 float block scale is staged to shared (Scale_shared)
+    # Adapted: the e2m1 integer bitcast decode replaces the SOTA's twiddling
+    #   extern (it only covers affine int4 grids, not e2m1's float grid);
+    #   tileRL's float block scale is staged to shared (Scale_shared)
     #   and applied once per chunk (the chunk is aligned and never crosses a
-    #   32-block); the chunk loop is T.Parallel (the SOTA's T.serial obstructs
+    #   scale block); the chunk loop is T.Parallel (the SOTA's T.serial obstructs
     #   the K-loop pipeliner on long K). block_K must be a Python int (the
     #   vectorizer needs the literal divisor, like the SOTA's Block_QK).
     """
     local_compress = local_size // 2  # 2 nibbles per byte
+    assert block % local_size == 0, f"scale block {block} must be a multiple of {local_size}"
 
     @T.macro
     def dequant(WQ_shared, Scale_shared, W_shared, block_N, block_K):
@@ -171,13 +185,10 @@ def _dequant_fp4_macro(out_dtype, local_size):
             nbase = i * local_size
             for v in T.vectorized(local_compress):
                 WQ_local[v] = WQ_shared[(cbase + v) // (block_K // 2), (cbase + v) % (block_K // 2)]
-            s = Scale_shared[nbase // block_K, (nbase % block_K) // 32]
+            s = Scale_shared[nbase // block_K, (nbase % block_K) // block]
             for v in T.serial(local_size):
                 byte = WQ_local[v // 2]
-                nib = (byte >> ((v % 2) * 4)) & 15
-                ni32 = T.cast(nib, "int32")
-                bits = ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
-                w = T.reinterpret(bits, "float32")
+                w = _e2m1_fp32((byte >> ((v % 2) * 4)) & 15)
                 W_local[v] = T.cast(w * s, out_dtype)
             for v in T.vectorized(local_size):
                 W_shared[(nbase + v) // block_K, (nbase + v) % block_K] = W_local[v]
@@ -187,7 +198,8 @@ def _dequant_fp4_macro(out_dtype, local_size):
 
 #: K-tile for the fp4 MMA paths: bf16 WGMMA K=16 (4 steps), fp8 WGMMA K=32
 #: (2 steps). 64 amortizes the dequant over multiple WGMMA steps; the backend
-#: pads K to a multiple of this on CUDA.
+#: pads K to a multiple of this on CUDA. Not the scale block: the scale block
+#: (16 or 32) must divide this.
 _FP4_BLOCK_K = 64
 
 #: N-tile for the fp4 fp8 prefill path. 64 (not the caller's 128): the 128
@@ -201,10 +213,10 @@ _FP4_BLOCK_N = 64
 
 
 def make_linear_fp4_mma(target: str):
-    """Fused e2m1fn dequant + matmul (sm90 MMA), bf16-IO.
+    """Fused e2m1 dequant + matmul (sm90 MMA), bf16-IO.
 
-    X [M,K] bf16, WQ uint8 [N,K//2] (low nibble first), Scale [N,K//32] f32.
-    Y[m,n] = sum_k X[m,k] * e2m1fn(WQ[n,k//2] nibble k%2) * Scale[n,k//32].
+    X [M,K] bf16, WQ uint8 [N,K//2] (low nibble first), Scale [N,K//block] f32.
+    Y[m,n] = sum_k X[m,k] * e2m1(WQ[n,k//2] nibble k%2) * Scale[n,k//block].
 
     The dequant runs ahead of the WGMMA in the pipelined K-loop: each stage
     copies the X/WQ/Scale tiles to shared, vectorizes the dequant into W_shared
@@ -216,13 +228,10 @@ def make_linear_fp4_mma(target: str):
     # SOTA copy: examples/dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py
     #   @ tilelang main (fast_dequant path: vectorized shared dequant before
     #   the WGMMA, pipelined)
-    # Adapted: bf16 IO (bf16 WGMMA, f32 accumulate); tileRL's float per-32
-    #   block scale (block_max/6) staged to shared and applied per chunk
-    #   instead of the example's integer-exponent scale; e2m1fn grid (matches
-    #   pack_fp4 — no zero, so the backend zero-pads Scale for K-tail tiles).
-    # Fast decode: the e2m1fn grid is a power-of-two grid, so each nibble's
-    #   fp32 bit pattern is pure integer math — sign<<31 | (126+e)<<23 |
-    #   m<<22 — reinterpreted as float (the lop3-style fast decode).
+    # Adapted: bf16 IO (bf16 WGMMA, f32 accumulate); tileRL's float per-block
+    #   scale (block_max/6) staged to shared and applied per chunk
+    #   instead of the example's integer-exponent scale; OCP e2m1 grid
+    #   (matches pack_fp4; padded WQ bytes decode to 0.0, see _e2m1_fp32).
     """
 
     @tilelang.jit(
@@ -232,25 +241,25 @@ def make_linear_fp4_mma(target: str):
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         },
     )
-    def linear_fp4(X, WQ, Scale, block_M, block_N, threads):
+    def linear_fp4(X, WQ, Scale, block_M, block_N, block, threads):
         threads = 128 if block_M >= 32 else threads
         M, N, K = T.const("M, N, K")
         X: T.Tensor((M, K), "bfloat16")
         WQ: T.Tensor((N, K // 2), "uint8")
-        Scale: T.Tensor((N, K // 32), "float32")
+        Scale: T.Tensor((N, K // block), "float32")
         Y = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             X_shared = T.alloc_shared((block_M, _FP4_BLOCK_K), "bfloat16")
             WQ_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // 2), "uint8")
             W_shared = T.alloc_shared((block_N, _FP4_BLOCK_K), "bfloat16")
-            Scale_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // 32), "float32")
+            Scale_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // block), "float32")
             C_local = T.alloc_fragment((block_M, block_N), "float32")
             T.clear(C_local)
             for k in T.Pipelined(K // _FP4_BLOCK_K, num_stages=3):
                 T.copy(X[by * block_M, k * _FP4_BLOCK_K], X_shared)
                 T.copy(WQ[bx * block_N, k * _FP4_BLOCK_K // 2], WQ_shared)
-                T.copy(Scale[bx * block_N, k * _FP4_BLOCK_K // 32], Scale_shared)
-                _dequant_fp4_macro("bfloat16", 8)(
+                T.copy(Scale[bx * block_N, k * _FP4_BLOCK_K // block], Scale_shared)
+                _dequant_fp4_macro("bfloat16", 8, block)(
                     WQ_shared, Scale_shared, W_shared, block_N, _FP4_BLOCK_K
                 )
                 T.gemm(X_shared, W_shared, C_local, transpose_B=True)
@@ -263,23 +272,11 @@ def make_linear_fp4_mma(target: str):
 # ---------------------------------------------------------------- linear fp4 (GEMV)
 
 
-def _e2m1fn_fp32(nib):
-    """e2m1fn nibble -> fp32 via IEEE bit-pattern synthesis. The grid is a
-    power-of-two grid ({±0.5,±0.75,±1,±1.5,±2,±3,±4,±6}), so each nibble's
-    fp32 bits are pure integer math — sign<<31 | (126+e)<<23 | m<<22 —
-    reinterpreted as float. No exp2, no LUT load (the lop3-style fast decode;
-    the LUT/exp2 path is 2x slower, see
-    docs/experience/wins/2026-08-24-fp4-gemv-bitcast-bf16.md)."""
-    ni32 = T.cast(nib, "int32")
-    bits = ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
-    return T.reinterpret(bits, "float32")
-
-
 def make_linear_fp4_gemv(target: str):
-    """Fused e2m1fn dequant + GEMV (sm90), the decode (M=1) path of linear_fp4.
+    """Fused e2m1 dequant + GEMV (sm90), the decode (M=1) path of linear_fp4.
 
-    X [1,K] bf16, WQ uint8 [N,K//2] (low nibble first), Scale [N,K//32] f32.
-    Y[0,n] = sum_k X[0,k] * e2m1fn(WQ[n,k//2] nibble k%2) * Scale[n,k//32].
+    X [1,K] bf16, WQ uint8 [N,K//2] (low nibble first), Scale [N,K//block] f32.
+    Y[0,n] = sum_k X[0,k] * e2m1(WQ[n,k//2] nibble k%2) * Scale[n,k//block].
 
     Decode is memory-bound: one warp group per 4 output rows streams WQ+Scale
     once (0.75 bytes/elem), dequantizing on the fly. Each thread owns a
@@ -292,8 +289,8 @@ def make_linear_fp4_gemv(target: str):
     flat per-tile decode (shuffle->FMA back-to-back) stalled each FMA on its
     shuffle. The grouped buffers are T.unroll(GROUP)-indexed (compile-time
     constant -> registers; a runtime %2 ping-pong spills to local memory).
-    The per-32 scale is applied once per micro-tile to the partial sum
-    (``acc += s * sum(X*w)``, 1 FP op/elem), and the e2m1fn grid is a
+    The block scale is applied once per micro-tile to the partial sum
+    (``acc += s * sum(X*w)``, 1 FP op/elem), and the e2m1 grid is a
     16-entry warp-shuffle LUT (1 shuffle/elem, built once per thread via the
     integer bitcast). Sweeps (scripts/_sweep_gemv*.py): group4 = 45% roof vs
     flat 42%; 2 accumulators, micro=16/32, shared-X/LUT, byte-LUT, 6-op
@@ -301,22 +298,18 @@ def make_linear_fp4_gemv(target: str):
 
     # SOTA copy: examples/dequantize_gemm/example_dequant_gemv_fp16xint4.py
     #   @ tilelang main (dequantize_gemv, split-K + tvm_thread_allreduce path)
-    # Adapted: bf16 IO (f32 accumulate) instead of fp16; e2m1fn grid (matches
-    #   pack_fp4 — no zero, so the backend zero-pads Scale for K-tail tiles)
-    #   with tileRL's per-32 float block scale on the partial sum; uint8
-    #   storage; M fixed at 1 (decode) so the grid has no M dim.
-    # Fast decode: the e2m1fn grid is a power-of-two grid, so each nibble's
-    #   fp32 bit pattern is pure integer math — sign<<31 | (126+e)<<23 |
-    #   m<<22 — used to build the 16-entry warp LUT once per thread (the LUT/
-    #   exp2 path is 2x slower, see docs/experience/wins/2026-08-24-*.md).
-    #   The SOTA's lop3 intrin only covers affine int4 grids, not e2m1fn.
+    # Adapted: bf16 IO (f32 accumulate) instead of fp16; OCP e2m1 grid
+    #   (matches pack_fp4) with tileRL's float block scale on the
+    #   partial sum; uint8 storage; M fixed at 1 (decode), no M grid dim.
+    # Fast decode: _e2m1_fp32 builds the 16-entry warp LUT once per thread.
+    #   The SOTA's lop3 intrin only covers affine int4 grids, not e2m1.
     # Constraint: reduce_thread must be <= 32 (the LUT is per-warp via
     #   tvm_warp_shuffle); the backend hardcodes 32.
     """
     GROUP = 4  # micro-tiles per dequant group (shuffle latency hiding)
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
-    def linear_fp4_gemv(X, WQ, Scale, reduce_thread, n_partition):
+    def linear_fp4_gemv(X, WQ, Scale, reduce_thread, n_partition, block):
         N, K = T.const("N, K")
         micro_size_k = 8  # 128-bit transaction / 16-bit bf16
         block_K = reduce_thread * micro_size_k
@@ -324,7 +317,7 @@ def make_linear_fp4_gemv(target: str):
         num_g = num_ko // GROUP
         X: T.Tensor((1, K), "bfloat16")
         WQ: T.Tensor((N, K // 2), "uint8")
-        Scale: T.Tensor((N, K // 32), "float32")
+        Scale: T.Tensor((N, K // block), "float32")
         Y = T.empty((1, N), "bfloat16")
         with T.Kernel(T.ceildiv(N, n_partition), threads=(reduce_thread, n_partition)) as bx:
             kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
@@ -338,7 +331,7 @@ def make_linear_fp4_gemv(target: str):
             reduced = T.alloc_local((1,), "float32")
             # 16-entry warp LUT: lane kr holds LUT[kr&15], built once via the
             # integer bitcast (no exp2). Each nibble is 1 shuffle.
-            lut = _e2m1fn_fp32(kr & 15)
+            lut = _e2m1_fp32(kr & 15)
             acc[0] = 0.0
             for kg in T.serial(num_g):
                 for g in T.unroll(GROUP):
@@ -362,8 +355,8 @@ def make_linear_fp4_gemv(target: str):
                     partial[0] = 0.0
                     for ki in T.unroll(micro_size_k):
                         partial[0] += T.cast(Xs[g, ki], "float32") * ws[g, ki]
-                    # one scale per micro-tile: 8 elems never cross a 32-block
-                    acc[0] += Scale[n, base // 32] * partial[0]
+                    # one scale per micro-tile: 8 elems never cross a scale block
+                    acc[0] += Scale[n, base // block] * partial[0]
             # K-tail (num_ko % GROUP tiles), flat, reusing buffer slot 0
             for kt in T.serial(num_ko - num_g * GROUP):
                 base = (num_g * GROUP + kt) * block_K + kr * micro_size_k
@@ -377,7 +370,7 @@ def make_linear_fp4_gemv(target: str):
                     nib = (byte >> ((ki % 2) * 4)) & 15
                     w = T.tvm_warp_shuffle(0xFFFFFFFF, lut, T.cast(nib, "int32"), 32, 32)
                     partial[0] += T.cast(Xs[0, ki], "float32") * w
-                acc[0] += Scale[n, base // 32] * partial[0]
+                acc[0] += Scale[n, base // block] * partial[0]
             with T.attr(
                 T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
                 "reduce_scope",
@@ -585,12 +578,12 @@ def make_quant_fp8_e4m3(target: str):
 
 
 def make_linear_fp4_fp8_mma(target: str, k_split: int = 1):
-    """Fused e2m1fn dequant-to-e4m3 + fp8 WGMMA (sm90 prefill path).
+    """Fused e2m1 dequant-to-e4m3 + fp8 WGMMA (sm90 prefill path).
 
     XQ [M,K] e4m3 (per-token quantized activation, from make_quant_fp8_e4m3),
-    WQ uint8 [N,K//2] (low nibble first), WScale [N,K//32] f32 (tileRL
-    pack_fp4 per-32 block scale), AScale [M] f32 (per-token activation scale).
-    ``Y[m,n] = (sum_k XQ[m,k] * e2m1fn(WQ) * WScale[n,k//32]) / AScale[m]``.
+    WQ uint8 [N,K//2] (low nibble first), WScale [N,K//block] f32 (the
+    checkpoint's scale block, 16 or 32), AScale [M] f32 (per-token scale).
+    ``Y[m,n] = (sum_k XQ[m,k] * e2m1(WQ) * WScale[n,k//block]) / AScale[m]``.
 
     Same dequant schedule as make_linear_fp4_mma (the vectorized shared-memory
     macro, SOTA: examples/dequantize_gemm/..._bf16_fp4_hopper.py), with the
@@ -598,13 +591,13 @@ def make_linear_fp4_fp8_mma(target: str, k_split: int = 1):
     bf16): the K-loop copies XQ/WQ/Scale tiles to shared, vectorizes the
     dequant into W_shared (one scale per 16-elem chunk), then fp8 WGMMA reads
     W_shared — with num_stages=3 the dequant of stage k+1 issues while the
-    WGMMA of stage k is in flight. The e2m1fn grid ({±0.5,±0.75,±1,±1.5,±2,±3,
-    ±4,±6}) is an exact subset of e4m3, so the dequant is: nibble -> fp32
-    grid (integer fast decode) -> *WScale -> cast to e4m3. The cast is a
-    requant (the dequant weight is not exactly on the e4m3 grid), carrying
-    ~1.7% error on top of the activation quant's ~2% e4m3 floor — the
-    standard W4A8 trade-off. The per-token activation scale is one divide in
-    the epilogue.
+    WGMMA of stage k is in flight. The e2m1 grid ({0,±.5,±1,±1.5,±2,±3,±4,±6})
+    is an exact subset of e4m3, so the dequant is: nibble -> fp32 grid
+    (integer fast decode) -> *WScale -> cast to e4m3. The cast is a requant, so
+    WScale must arrive renormalized (`reference.renorm_fp4_scale`) with
+    ``6 * WScale`` inside e4m3's normal range: 2.3% weight error there, 50%
+    when checkpoint-native magnitudes saturate. The per-token activation scale
+    is one divide in the epilogue.
 
     k_split > 1 adds a K-split grid dim: each (bx, by, bk) block sums
     K/k_split K-tiles and f32 atomic-adds its partial into a caller-zeroed Y
@@ -617,8 +610,7 @@ def make_linear_fp4_fp8_mma(target: str, k_split: int = 1):
     #   the WGMMA, pipelined)
     # Adapted: e4m3 operands (fp8 WGMMA, f32 accumulate), the dequant target
     #   dtype is e4m3 (requant) instead of bf16; per-token activation dequant
-    #   (1/AScale[m]) in the epilogue. e2m1fn has no zero, so padded WQ bytes
-    #   (0x00 -> 0.5) are killed by the zero-padded WScale.
+    #   (1/AScale[m]) in the epilogue. Padded WQ bytes (0x00) decode to 0.0.
     # SOTA copy (k_split > 1): examples/gemm_streamk/example_tilelang_gemm_streamk.py
     #   @ tilelang main (split-K grid + atomic-add reduction family)
     # Adapted: fixed 2-way equal K-split (not stream-K scheduling) on the
@@ -632,7 +624,7 @@ def make_linear_fp4_fp8_mma(target: str, k_split: int = 1):
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         },
     )
-    def linear_fp4_fp8(XQ, WQ, WScale, AScale, block_M, block_N, threads):
+    def linear_fp4_fp8(XQ, WQ, WScale, AScale, block_M, block_N, block, threads):
         threads = 128 if block_M >= 32 else threads
         block_N = _FP4_BLOCK_N  # 64-tile: doubles the N-grid vs the caller's
         # 128, putting every prefill shape at 2+ waves (the dequant/WGMMA
@@ -640,21 +632,21 @@ def make_linear_fp4_fp8_mma(target: str, k_split: int = 1):
         M, N, K = T.const("M, N, K")
         XQ: T.Tensor((M, K), "float8_e4m3fn")
         WQ: T.Tensor((N, K // 2), "uint8")
-        WScale: T.Tensor((N, K // 32), "float32")
+        WScale: T.Tensor((N, K // block), "float32")
         AScale: T.Tensor((M,), "float32")
         Y = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             X_shared = T.alloc_shared((block_M, _FP4_BLOCK_K), "float8_e4m3fn")
             WQ_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // 2), "uint8")
             W_shared = T.alloc_shared((block_N, _FP4_BLOCK_K), "float8_e4m3fn")
-            Scale_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // 32), "float32")
+            Scale_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // block), "float32")
             C_local = T.alloc_fragment((block_M, block_N), "float32")
             T.clear(C_local)
             for k in T.Pipelined(K // _FP4_BLOCK_K, num_stages=3):
                 T.copy(XQ[by * block_M, k * _FP4_BLOCK_K], X_shared)
                 T.copy(WQ[bx * block_N, k * _FP4_BLOCK_K // 2], WQ_shared)
-                T.copy(WScale[bx * block_N, k * _FP4_BLOCK_K // 32], Scale_shared)
-                _dequant_fp4_macro("float8_e4m3fn", 16)(
+                T.copy(WScale[bx * block_N, k * _FP4_BLOCK_K // block], Scale_shared)
+                _dequant_fp4_macro("float8_e4m3fn", 16, block)(
                     WQ_shared, Scale_shared, W_shared, block_N, _FP4_BLOCK_K
                 )
                 T.gemm(X_shared, W_shared, C_local, transpose_B=True)
@@ -673,13 +665,13 @@ def make_linear_fp4_fp8_mma(target: str, k_split: int = 1):
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         },
     )
-    def linear_fp4_fp8_split(XQ, WQ, WScale, AScale, Y, block_M, block_N, threads):
+    def linear_fp4_fp8_split(XQ, WQ, WScale, AScale, Y, block_M, block_N, block, threads):
         threads = 128 if block_M >= 32 else threads
         block_N = _FP4_BLOCK_N
         M, N, K = T.const("M, N, K")
         XQ: T.Tensor((M, K), "float8_e4m3fn")
         WQ: T.Tensor((N, K // 2), "uint8")
-        WScale: T.Tensor((N, K // 32), "float32")
+        WScale: T.Tensor((N, K // block), "float32")
         AScale: T.Tensor((M,), "float32")
         Y: T.Tensor((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), k_split, threads=threads) as (
@@ -690,7 +682,7 @@ def make_linear_fp4_fp8_mma(target: str, k_split: int = 1):
             X_shared = T.alloc_shared((block_M, _FP4_BLOCK_K), "float8_e4m3fn")
             WQ_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // 2), "uint8")
             W_shared = T.alloc_shared((block_N, _FP4_BLOCK_K), "float8_e4m3fn")
-            Scale_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // 32), "float32")
+            Scale_shared = T.alloc_shared((block_N, _FP4_BLOCK_K // block), "float32")
             C_local = T.alloc_fragment((block_M, block_N), "float32")
             T.clear(C_local)
             k0 = bk * (K // k_split // _FP4_BLOCK_K)
@@ -699,8 +691,8 @@ def make_linear_fp4_fp8_mma(target: str, k_split: int = 1):
                 kk = k0 + k
                 T.copy(XQ[by * block_M, kk * _FP4_BLOCK_K], X_shared)
                 T.copy(WQ[bx * block_N, kk * _FP4_BLOCK_K // 2], WQ_shared)
-                T.copy(WScale[bx * block_N, kk * _FP4_BLOCK_K // 32], Scale_shared)
-                _dequant_fp4_macro("float8_e4m3fn", 16)(
+                T.copy(WScale[bx * block_N, kk * _FP4_BLOCK_K // block], Scale_shared)
+                _dequant_fp4_macro("float8_e4m3fn", 16, block)(
                     WQ_shared, Scale_shared, W_shared, block_N, _FP4_BLOCK_K
                 )
                 T.gemm(X_shared, W_shared, C_local, transpose_B=True)

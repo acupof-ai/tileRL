@@ -459,18 +459,19 @@ def make_embedding(target: str):
 def make_linear_fp4(target: str):
     """Fused e2m1 dequant + matmul.
 
-    X [M, K] f32, WQ uint8 [N, K//2] (low nibble first), Scale [N, K//32] f32.
-    Y[m, n] = sum_k X[m, k] * e2m1(WQ[n, k//2] nibble k%2) * Scale[n, k//32].
+    X [M, K] f32, WQ uint8 [N, K//2] (low nibble first), Scale [N, K//block]
+    f32 (block = the checkpoint's scale block, 16 or 32).
+    Y[m, n] = sum_k X[m, k] * e2m1(WQ[n, k//2] nibble k%2) * Scale[n, k//block].
 
     # ponytail: dequant-in-kernel scalar decode, native fp4 tensor cores day-2
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
-    def linear_fp4(X, WQ, Scale, block_M, block_N, threads):
+    def linear_fp4(X, WQ, Scale, block_M, block_N, block, threads):
         M, N, K = T.const("M, N, K")
         X: T.Tensor((M, K), "float32")
         WQ: T.Tensor((N, K // 2), "uint8")
-        Scale: T.Tensor((N, K // 32), "float32")
+        Scale: T.Tensor((N, K // block), "float32")
         Y = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             Cc = T.alloc_shared((block_M, block_N), "float32")
@@ -481,22 +482,19 @@ def make_linear_fp4(target: str):
             for i, j in T.Parallel(block_M, block_N):
                 acc = T.alloc_fragment((1,), "float32")
                 acc[0] = 0.0
-                for k0 in T.serial(K // 32):
-                    for kk in range(32):
-                        k = k0 * 32 + kk
+                for k0 in T.serial(K // block):
+                    for kk in range(block):
+                        k = k0 * block + kk
                         byte = WQ[bx * block_N + j, k // 2]
-                        nib = (byte >> ((k % 2) * 4)) & 15
-                        sign = nib >> 3
-                        e = (nib >> 1) & 3
-                        m = nib & 1
-                        mag = (
-                            0.5 * T.exp2(T.cast(e, "float32")) * (1.0 + T.cast(m, "float32") * 0.5)
-                        )
-                        w = (
-                            T.cast(1 - 2 * T.cast(sign, "int32"), "float32")
-                            * mag
-                            * Scale[bx * block_N + j, k0]
-                        )
+                        ni32 = T.cast((byte >> ((k % 2) * 4)) & 15, "int32")
+                        e = (ni32 >> 1) & 3
+                        m = ni32 & 1
+                        # branch-free OCP e2m1: -min(e,1) kills the subnormal
+                        # mantissa ({0, 0.5}), -min(e|m,1) zeros nibble 0.
+                        bits = (
+                            ((ni32 & 8) << 28) | ((126 + e) << 23) | ((m << 22) & -T.min(e, 1))
+                        ) & -T.min(e | m, 1)
+                        w = T.reinterpret(bits, "float32") * Scale[bx * block_N + j, k0]
                         acc[0] += X[by * block_M + i, k] * w
                 Cc[i, j] = acc[0]
             T.copy(

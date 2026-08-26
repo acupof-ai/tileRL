@@ -4,6 +4,34 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-26 — phase exit: native fp4 w4a8 load path
+
+- **Exit.** The NVFP4 checkpoint's bytes are now the serving format. OCP e2m1
+  is the one internal fp4 grid (the old `e2m1fn` grid had no zero and forced a
+  dequant + block-32 re-pack at load); block `B` is a call-time kernel
+  parameter (16 and 32 both live); `.oscale` is a real per-output-row epilogue
+  slot, so a per-channel FP8 `weight_scale` is served at 8 bits instead of
+  being fp4-packed. The e4m3 dequant target is renormalized by an exact power
+  of two — a pre-existing 3.8% weight error, and 50% had the native
+  magnitudes gone in unchanged, now 2.3% (e4m3's own requant floor).
+  `Backend.materialize` replaces the per-call master fallback with a
+  load-time conversion table, and the linear-family dispatch collapsed from 19
+  string checks to `_CUDA_PLAN` (175 -> 88 non-blank lines, 49.7%), fixing a
+  latent out-of-bounds N pad on the fp4->e4m3 arms. 27B weight memory 65.0 ->
+  20.3 GiB (pod confirmation pending-remote). Suite 90 -> 96 passed / 4
+  skipped.
+  Entry: `docs/experience/wins/2026-08-26-native-fp4-w4a8.md`.
+
+## 2026-08-26 — default flip: `load_hf` / `build_random` `keep_master=False`
+
+- **Flip.** The bf16 master is a training-only artifact. `tilerl train` /
+  `pretrain` pass `keep_master=True` and the master is regenerated from the
+  served quantized bytes (so the STE master matches the kernel exactly);
+  `tilerl serve` / `bench` take the default and ship no master to the device.
+  `save_hf` now raises without masters instead of writing a shard with no
+  linear weights. Entry:
+  `docs/experience/wins/2026-08-26-native-fp4-w4a8.md`.
+
 ## 2026-08-26 — accept-or-reject: 8-way K-split for small-M fp4 decode — ACCEPTED (+7.5% B=8 aggregate)
 
 - **Verdict.** The decode tick (M<=16) ran the prefill kernel's 2-way

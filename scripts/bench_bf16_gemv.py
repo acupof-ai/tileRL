@@ -167,7 +167,7 @@ def main() -> None:
         full_attn_layers=tuple(i for i in qwen36_27b().full_attn_layers if i < args.layers),
     )
     t0 = time.perf_counter()
-    model = load_hf(cfg, args.source)
+    model = load_hf(cfg, args.source, keep_master=True)  # benches the bf16 masters
     # Migrate params once (engine build does the same; bench_shapes runs
     # before any engine exists, so without this it would time per-call H2D
     # copies instead of the kernel).

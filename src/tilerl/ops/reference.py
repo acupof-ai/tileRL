@@ -28,13 +28,12 @@ __all__ = [
     "linear_bwd",
     "dequant_fp4",
     "linear_fp4",
-    "linear_fp4_bwd",
     "pack_fp4",
+    "renorm_fp4_scale",
     "unpack_fp4",
     "dequant_nvfp4",
     "dequant_fp8",
     "linear_fp8",
-    "linear_fp8_bwd",
     "dequant_awq",
     "dense_attention",
     "dense_attention_bwd",
@@ -166,87 +165,55 @@ def linear_bwd(
 
 
 def dequant_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Dequantize e2m1fn-packed weights. wq uint8 [N, K//2] (low nibble first),
-    scale f32 [N, K//32]. Returns w [N, K] f32.
+    """Dequantize OCP e2m1-packed weights. wq uint8 [N, K//2] (low nibble
+    first), scale f32 [N, K//B]. Returns w [N, K] f32. The block size B is
+    derived from the two shapes (16 for an NVFP4 checkpoint, 32 for pack_fp4).
 
-    e2m1fn magnitudes: e=0 -> {0.5, 0.75}, e=1 -> {1, 1.5}, e=2 -> {2, 3},
-    e=3 -> {4, 6}; sign bit is bit 3.
+    Magnitudes are ``_E2M1_LUT`` ({0,.5,1,1.5,2,3,4,6}); bit 3 is the sign.
     """
     assert wq.dtype == torch.uint8
     n, k2 = wq.shape
-    scale = _f32(scale)
-    lo = wq & 0x0F
-    hi = (wq >> 4) & 0x0F
-
-    def decode(nib: torch.Tensor) -> torch.Tensor:
-        sign = torch.where(nib & 0x08 == 0, 1.0, -1.0)
-        e = ((nib >> 1) & 0x03).float()
-        m = (nib & 0x01).float()
-        return sign * (0.5 * torch.pow(2.0, e)) * (1.0 + 0.5 * m)
-
-    s = scale.repeat_interleave(16, dim=1)  # [N, K//2]: one scale per byte (32 elems / 2)
-    w = torch.stack([decode(lo) * s, decode(hi) * s], dim=-1).reshape(n, k2 * 2)
-    return w
+    nib = torch.stack([wq & 0x0F, (wq >> 4) & 0x0F], dim=-1).reshape(n, k2 * 2).long()
+    mag = _E2M1_LUT.to(wq.device)[nib & 0x7]
+    block = k2 * 2 // scale.shape[1]
+    return mag * (1.0 - 2.0 * (nib >> 3).float()) * _f32(scale).repeat_interleave(block, dim=1)
 
 
-def linear_fp4(x: torch.Tensor, wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """y = x @ dequant(wq, scale).T.  x [..., K]."""
-    x = _f32(x)
-    w = dequant_fp4(wq, scale)
-    return x @ w.t()
-
-
-def linear_fp4_bwd(
-    grad: torch.Tensor, x: torch.Tensor, wq: torch.Tensor, scale: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Backward of :func:`linear_fp4`.
-
-    Returns (gx, g_master): gx w.r.t. x, and g_master w.r.t. the dequantized
-    (bf16-master) weight — a straight-through estimator through the e2m1
-    quantization, matching the model's master-weight convention.
-    """
-    x = _f32(x)
-    grad = _f32(grad)
-    w = dequant_fp4(wq, scale)
-    gx = grad @ w
-    g_master = grad.reshape(-1, grad.shape[-1]).t() @ x.reshape(-1, x.shape[-1])
-    return gx, g_master
+def linear_fp4(x, wq, scale, oscale=None) -> torch.Tensor:
+    """y = oscale * (x @ dequant(wq, scale).T).  x [..., K], oscale f32 [N]."""
+    y = _f32(x) @ dequant_fp4(wq, scale).t()
+    return y if oscale is None else y * _f32(oscale)
 
 
 # ---------------------------------------------------------------- fp4 packing
 
-#: e2m1fn (finite-number, no zero) magnitude LUT, low 3 bits of a nibble;
-#: bit 3 = sign. tileRL's internal fp4 format: pack_fp4/unpack_fp4,
-#: dequant_fp4, and the linear_fp4 kernel all decode this grid. It matches
-#: the Hopper dequant+gemm SOTA kernel's decode (e=0 -> {0.5, 0.75}), so the
-#: MMA port in kernels_linear.py is a clean copy with no grid adaptation.
-_E2M1FN_LUT = torch.tensor([0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
-
-#: OCP/MX e2m1 magnitude LUT (with zero): the NVFP4 checkpoint wire format,
-#: used only by dequant_nvfp4. A different grid from _E2M1FN_LUT above —
-#: the checkpoint is OCP, tileRL's internal pack is e2m1fn.
+#: OCP/MX e2m1 magnitude LUT, low 3 bits of a nibble; bit 3 = sign. The one
+#: fp4 grid in tileRL — pack_fp4/unpack_fp4, dequant_fp4, dequant_nvfp4 and
+#: every linear_fp4 kernel decode it, so an NVFP4 checkpoint's nibbles need no
+#: re-quantization to be served.
 _E2M1_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 
 
-def pack_fp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack a bf16/f32 weight [N,K] into e2m1fn nibbles + per-32-block scales.
+def pack_fp4(w: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack a bf16/f32 weight [N,K] into OCP e2m1 nibbles + per-block scales.
 
-    Returns ``(wq [N,K//2] uint8 low-nibble-first, scale [N,K//32] f32)`` with
-    ``scale = block_max / 6`` and round-to-nearest against the e2m1fn LUT. The
-    max representable magnitude is 6*scale, so the block max maps exactly.
+    Returns ``(wq [N,K//2] uint8 low-nibble-first, scale [N,K//block] f32)``
+    with ``scale = block_max / 6`` and round-to-nearest against ``_E2M1_LUT``.
+    The max representable magnitude is 6*scale, so the block max maps exactly.
     Block 32 matches the fp8 WGMMA K-tile (sm90), so the fp8 prefill path can
-    apply one scale per MMA tile in f32 (no e4m3 weight requant).
+    apply one scale per MMA tile in f32 (no e4m3 weight requant). Serving wants
+    :func:`renorm_fp4_scale` on the result.
     """
     assert w.dim() == 2, f"pack_fp4 expects a 2D weight, got {tuple(w.shape)}"
     n, k = w.shape
-    assert k % 32 == 0, f"fp4 block size 32 must divide K, got K={k}"
+    assert k % block == 0, f"fp4 block size {block} must divide K, got K={k}"
     wf = w.detach().float()
-    blocks = wf.reshape(n, k // 32, 32)
-    block_max = blocks.abs().amax(dim=-1, keepdim=True)  # [n, k//32, 1]
+    blocks = wf.reshape(n, k // block, block)
+    block_max = blocks.abs().amax(dim=-1, keepdim=True)  # [n, k//block, 1]
     scale = (block_max / 6.0).clamp_min(1e-12)
     x = (blocks / scale).clamp(-6.0, 6.0)
-    lut = _E2M1FN_LUT.to(wf.device)
-    dist = (x.abs().unsqueeze(-1) - lut).abs()  # [n, k//32, 32, 8]
+    lut = _E2M1_LUT.to(wf.device)
+    dist = (x.abs().unsqueeze(-1) - lut).abs()  # [n, k//block, block, 8]
     idx = dist.argmin(dim=-1).to(torch.uint8)  # 0..7
     sign = (x < 0).to(torch.uint8)
     nibbles = (idx | (sign << 3)).reshape(n, k)
@@ -254,19 +221,23 @@ def pack_fp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return wq.contiguous(), scale.squeeze(-1).contiguous()
 
 
-def unpack_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def renorm_fp4_scale(scale, oscale=None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Move a per-row power of two out of the fp4 block scale into the epilogue
+    scale: ``(scale * 2**-p, oscale * 2**p)``, ``p = floor(log2(row max))``, so
+    every row's ``6*scale`` lands in [6,12). The w4a8 kernel dequantizes into
+    e4m3 (max 448, subnormal below 2^-9), where raw checkpoint magnitudes
+    saturate and ``block_max/6`` weight units collapse; 2^p is exact, so the
+    split re-rounds nothing."""
+    scale = _f32(scale)
+    p = torch.exp2(torch.floor(torch.log2(scale.amax(dim=1, keepdim=True).clamp_min(1e-30))))
+    o = p.reshape(-1)
+    return (scale / p).contiguous(), (o if oscale is None else _f32(oscale) * o).contiguous()
+
+
+def unpack_fp4(wq: torch.Tensor, scale: torch.Tensor, oscale=None) -> torch.Tensor:
     """Inverse of :func:`pack_fp4`; returns a bf16 [N,K] weight."""
-    n, k2 = wq.shape
-    k = k2 * 2
-    lo = (wq & 0xF).to(torch.uint8)
-    hi = (wq >> 4).to(torch.uint8)
-    nibbles = torch.stack([lo, hi], dim=-1).reshape(n, k).long()
-    lut = _E2M1FN_LUT.to(wq.device)
-    mag = lut[nibbles & 0x7]
-    sign = 1.0 - 2.0 * (nibbles >> 3).to(torch.float32)
-    vals = mag * sign  # [n, k]
-    out = vals.reshape(n, k // 32, 32) * scale.unsqueeze(-1)
-    return out.reshape(n, k).to(torch.bfloat16)
+    w = dequant_fp4(wq, scale)
+    return (w if oscale is None else w * _f32(oscale).reshape(-1, 1)).to(torch.bfloat16)
 
 
 # ---------------------------------------------------------------- modelopt quantized checkpoints
@@ -287,21 +258,12 @@ def dequant_nvfp4(
     the global scale's reciprocal — agent-infer quant_format.rs:225,
     ScaleApply::Divide) and ``weight_global_scale`` directly otherwise
     (official NVFP4's ``weight_scale_2`` is a plain multiplier). The e2m1
-    grid is ``_E2M1_LUT`` ({0,.5,1,1.5,2,3,4,6} + sign) — the OCP/MX grid,
-    not the e2m1fn grid of :func:`dequant_fp4`."""
-    n, k2 = weight_packed.shape
-    lo = (weight_packed & 0xF).long()
-    hi = ((weight_packed >> 4) & 0xF).long()
-    lut = _E2M1_LUT.to(weight_packed.device)
-    mag = torch.stack([lut[lo & 0x7], lut[hi & 0x7]], dim=-1).reshape(n, k2 * 2)
-    sign = torch.stack(
-        [1.0 - 2.0 * (lo >> 3).float(), 1.0 - 2.0 * (hi >> 3).float()], dim=-1
-    ).reshape(n, k2 * 2)
-    scale = weight_scale.float().repeat_interleave(16, dim=-1)
+    grid is the one :func:`dequant_fp4` decodes, which derives the block (16)
+    from the scale shape — so this is that dequant plus the global scale."""
     gs = weight_global_scale.float()
     if global_divide:
         gs = 1.0 / gs
-    return (mag * sign * scale * gs).to(torch.bfloat16)
+    return (dequant_fp4(weight_packed, weight_scale) * gs).to(torch.bfloat16)
 
 
 def dequant_fp8(w8: torch.Tensor, wscale: torch.Tensor, block: int = 128) -> torch.Tensor:
@@ -318,22 +280,10 @@ def dequant_fp8(w8: torch.Tensor, wscale: torch.Tensor, block: int = 128) -> tor
     return w8.float() * s
 
 
-def linear_fp8(x: torch.Tensor, w8: torch.Tensor, wscale: torch.Tensor) -> torch.Tensor:
-    """y = x @ dequant_fp8(w8, wscale).T.  x [..., K]."""
-    return _f32(x) @ dequant_fp8(w8, wscale).t()
-
-
-def linear_fp8_bwd(
-    grad: torch.Tensor, x: torch.Tensor, w8: torch.Tensor, wscale: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Backward of :func:`linear_fp8` (STE, same convention as linear_fp4_bwd:
-    gx w.r.t. x, g_master w.r.t. the bf16 master weight)."""
-    x = _f32(x)
-    grad = _f32(grad)
-    w = dequant_fp8(w8, wscale)
-    gx = grad @ w
-    g_master = grad.reshape(-1, grad.shape[-1]).t() @ x.reshape(-1, x.shape[-1])
-    return gx, g_master
+def linear_fp8(x, w8, wscale, oscale=None) -> torch.Tensor:
+    """y = oscale * (x @ dequant_fp8(w8, wscale).T).  x [..., K], oscale [N]."""
+    y = _f32(x) @ dequant_fp8(w8, wscale).t()
+    return y if oscale is None else y * _f32(oscale)
 
 
 def dequant_awq(

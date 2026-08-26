@@ -1,10 +1,10 @@
 """Native-fp8 projection fusion parity (serving-only, fuse_projections=True).
 
 The fp4 case lives in test_weights.py::test_fused_projections_parity; this
-covers the native-fp8 qkvz group: _fuse_projections concats .w8/.wscale and
-the bf16 master along N, _gdn splits the fused output back at the qkv
-boundary. The concat is lossless, so the fused model's logits match the
-unfixed model's through the TileLang CPU kernels.
+covers the native-fp8 qkvz group: _fuse_projections concats .w8/.wscale along
+N, _gdn splits the fused output back at the qkv boundary. The CPU cell has no
+fp8 kernel, so Backend.materialize rebuilds a bf16 weight from the served
+bytes on both sides; the concat is lossless, so the logits match.
 """
 
 from dataclasses import replace
@@ -45,17 +45,20 @@ def test_fused_fp8_qkvz_parity():
     model = build_random(cfg, seed=7)
     gdn = "layers.1"
     for key in (f"{gdn}.in_proj_qkv", f"{gdn}.in_proj_z"):
-        w8, wscale = _quant_fp8_block(model.params[key])
+        w8, wscale = _quant_fp8_block(model.params.pop(key))  # serving keeps no master
         model.params[f"{key}.w8"] = w8
         model.params[f"{key}.wscale"] = wscale
     fused = Model(cfg, dict(model.params))
     _fuse_projections(cfg, fused.params)
-    assert f"{gdn}.qkvz.w8" in fused.params
-    assert f"{gdn}.qkvz" in fused.params  # bf16 master concat'd (CPU path)
+    assert f"{gdn}.qkvz.w8" in fused.params and f"{gdn}.qkvz" not in fused.params
 
     batch = np.random.default_rng(3).integers(3, cfg.vocab_size, size=(2, 16)).astype(np.int64)
     positions = np.arange(16, dtype=np.int64)
     backend = get_backend()
+    model.params = backend.materialize(model.params)
+    fused.params = backend.materialize(fused.params)
+    # the CPU cell serves no fp8: materialize left one bf16 weight per key
+    assert f"{gdn}.qkvz" in fused.params and f"{gdn}.qkvz.w8" not in fused.params
     with torch.no_grad():
         y0 = model.forward(batch, positions, _training_kv(model, 2, 16), backend)
         y1 = fused.forward(batch, positions, _training_kv(fused, 2, 16), backend)

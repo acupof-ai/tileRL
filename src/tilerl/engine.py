@@ -697,11 +697,7 @@ def build_engine(
     eager path.
     """
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
-    if backend.device.type != "cpu":
-        # Non-CPU targets (metal): params are built on CPU; migrate them to
-        # the backend device once, at wiring time, so kernels and the
-        # optimizer see consistent devices.
-        model.params = {k: v.to(backend.device) for k, v in model.params.items()}
+    model.params = backend.materialize(model.params)
     kv_pool = PagedKvPool(
         num_blocks,
         cfg.num_kv_heads,

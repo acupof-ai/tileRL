@@ -63,11 +63,11 @@ def main():
         scale_p[:N, : K // 32] = scale.to(dev)
 
         def arm_a():
-            return (ker_a(xq, wq_p, scale_p, ascale, 128, 128, 128)[:M, :N],)
+            return (ker_a(xq, wq_p, scale_p, ascale, 128, 128, 32, 128)[:M, :N],)
 
         def arm_b():
             y = torch.zeros((Mp, Np), dtype=torch.float32, device=dev)
-            ker_b(xq, wq_p, scale_p, ascale, y, 128, 128, 128)
+            ker_b(xq, wq_p, scale_p, ascale, y, 128, 128, 32, 128)
             return (y[:M, :N],)
 
         ref = arm_a()

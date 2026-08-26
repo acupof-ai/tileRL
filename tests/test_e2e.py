@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import replace
 
 # Hermetic CPU target: auto already maps to cpu on this Mac, but pin it so a
 # stray TILERL_TARGET in the environment can't hijack the suite.
@@ -20,7 +21,7 @@ import torch
 from tilerl.autograd import AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
 from tilerl.config import tiny
 from tilerl.engine import _PHASE_DECODE, Engine, SamplingParams, build_engine
-from tilerl.model import build_random, param_specs
+from tilerl.model import build_random, fp4_param_keys, param_specs
 from tilerl.ops.backend import get_backend
 from tilerl.ops.reference import pack_fp4
 from tilerl.testing import RefBackend
@@ -313,11 +314,24 @@ def test_ref_backend_train_step():
     assert math.isfinite(loss)
 
 
-def test_fp4_roundtrip():
-    """Pack/unpack of e2m1fn fp4 weights: values already on the e2m1fn grid
-    must survive the roundtrip with error < 1e-2. Skipped if no pack/unpack
+def test_fp4_train_step():
+    """Training a quantized model: every fp4 linear must still carry its bf16
+    master, or the tape's STE grad has nowhere to land. tiny() is fp4=False, so
+    no other training test puts a packed weight under the tape."""
+    cfg = replace(tiny(), fp4=True)
+    model = build_random(cfg, seed=4, keep_master=True)
+    assert fp4_param_keys(cfg) <= set(model.params)
+    ids = np.arange(3, 11, dtype=np.int64)[None, :]
+    assert math.isfinite(train_step(model, ids, RefBackend(), AdamW(lr=1e-3)))
+
+
+@pytest.mark.parametrize("block", [32, 16])
+def test_fp4_roundtrip(block):
+    """Pack/unpack of fp4 weights: values already on the OCP e2m1 grid must
+    survive the roundtrip with error < 1e-2, at both checkpoint block sizes
+    (16 is what the real 27B NVFP4 weights carry). Skipped if no pack/unpack
     helper is exposed — the contract pins the wire format (low-nibble-first
-    e2m1fn, scale [N, K//32]) but not the helper's location or signature."""
+    OCP e2m1, scale [N, K//B]) but not the helper's location or signature."""
     pack = unpack = None
     try:
         from tilerl.ops.reference import pack_fp4, unpack_fp4  # type: ignore
@@ -329,22 +343,22 @@ def test_fp4_roundtrip():
         pytest.skip("fp4 pack/unpack helpers not exposed")
 
     gen = torch.Generator().manual_seed(0)
-    n_rows, k_cols = 16, 32  # K multiple of 32 (scale block) and 2 (nibble pair)
-    grid = torch.tensor([0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    n_rows, k_cols = 16, 32  # K a multiple of the scale block and of 2 (nibble pair)
+    grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     # Small per-block scale: bf16 spacing at the resulting magnitudes is
-    # negligible, so the roundtrip error is dominated by e2m1fn quantization.
-    scale = torch.rand(n_rows, k_cols // 32, generator=gen, dtype=torch.float32) * 0.05 + 0.01
+    # negligible, so the roundtrip error is dominated by e2m1 quantization.
+    scale = torch.rand(n_rows, k_cols // block, generator=gen, dtype=torch.float32) * 0.05 + 0.01
     signs = torch.randint(0, 2, (n_rows, k_cols), generator=gen) * 2 - 1
     indices = torch.randint(0, 8, (n_rows, k_cols), generator=gen)
-    # Ensure each 32-block contains the max grid value (6) so the packer's
+    # Ensure each block contains the max grid value (6) so the packer's
     # block_max/6 scale convention reproduces the test's per-block scale.
-    indices[:, ::32] = 7
-    weights = (signs.float() * grid[indices] * scale.repeat_interleave(32, dim=1)).to(
+    indices[:, ::block] = 7
+    weights = (signs.float() * grid[indices] * scale.repeat_interleave(block, dim=1)).to(
         torch.bfloat16
     )
 
     try:
-        packed = pack(weights)
+        packed = pack(weights, block)
         if isinstance(packed, tuple) and len(packed) == 2:
             dequant = unpack(packed[0], packed[1])
         else:

@@ -48,7 +48,7 @@ def main() -> None:
         num_layers=args.layers,
         full_attn_layers=tuple(i for i in cfg.full_attn_layers if i < args.layers),
     )
-    model = load_hf(cfg, args.source)
+    model = load_hf(cfg, args.source, keep_master=True)  # fp4-repacks the masters
     keys = [
         f"layers.{i}.{k}"
         for i in range(args.layers)

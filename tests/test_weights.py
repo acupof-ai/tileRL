@@ -16,7 +16,8 @@ import torch
 from safetensors.torch import save_file
 
 from tilerl.config import tiny
-from tilerl.model import build_random, fp4_param_keys, load_hf, param_specs
+from tilerl.model import build_random, fp4_param_keys, load_hf, param_specs, save_hf
+from tilerl.ops import reference
 
 #: param suffix -> HF suffix (reverse of model._LAYER_SUFFIXES)
 _SIMPLE = {
@@ -137,8 +138,9 @@ def test_layer_types_mismatch_raises(tmp_path):
 
 
 def test_fp4_on_load_and_forward(tmp_path):
-    """fp4=True packs linears on load; the packed model forwards through the
-    fp4 linear path end to end."""
+    """fp4=True packs linears on load and (the default) keeps no bf16 master;
+    the packed model still forwards through the fp4 linear path end to end.
+    save_hf refuses such a model instead of writing an unloadable shard."""
     import numpy as np
 
     from tilerl.engine import SamplingParams, build_engine
@@ -150,6 +152,7 @@ def test_fp4_on_load_and_forward(tmp_path):
     loaded = load_hf(replace(cfg, fp4=True), str(tmp_path))
     for key in fp4_param_keys(loaded.cfg):
         assert f"{key}.wq" in loaded.params and f"{key}.scale" in loaded.params
+        assert key not in loaded.params, f"{key}: serving must ship no bf16 master"
     engine = build_engine(
         loaded.cfg,
         loaded,
@@ -170,6 +173,8 @@ def test_fp4_on_load_and_forward(tmp_path):
             break
     assert rid in done, "fp4 model did not generate"
     engine.shutdown()
+    with pytest.raises(RuntimeError, match="keep_master"):
+        save_hf(loaded, tmp_path / "resaved")
 
 
 def test_fused_projections_parity(tmp_path):
@@ -303,7 +308,7 @@ def test_nvfp4_modelopt_load(tmp_path):
             }
         )
     )
-    loaded = load_hf(cfg, str(tmp_path))
+    loaded = load_hf(cfg, str(tmp_path), keep_master=True)  # the dequants under test
     assert set(param_specs(cfg)) <= set(loaded.params)
     # the only extra params are the native-fp8 siblings
     extras = {k for k in loaded.params if k not in param_specs(cfg)}
@@ -315,16 +320,18 @@ def test_nvfp4_modelopt_load(tmp_path):
         assert torch.equal(loaded.params[key + ".wscale"], ws), f"param {key}.wscale mismatch"
 
 
-def test_nvfp4_official_load(tmp_path):
+@pytest.mark.parametrize("fp4", [False, True])
+def test_nvfp4_official_load(tmp_path, fp4):
     """Official NVFP4 checkpoint (nvidia/Qwen3.6-27B-NVFP4 naming): MLP
     linears load from u8 ``weight`` (e2m1 nibbles) + f8 ``weight_scale`` +
-    scalar ``weight_scale_2``; GDN and full-attn linears from f8 ``weight``
-    + scalar ``weight_scale`` (per-tensor FP8 — also the standalone-FP8
-    coverage). The FP8 linears are kept native: the bf16 dequant is the
-    recording-only master, .w8 the e4m3 weight and .wscale the per-128-block
-    scale (the scalar expanded to the same [ceil(N/128), ceil(K/128)]
-    layout), all equal to a pure-torch reference computed in the test.
-    ``input_scale`` siblings are read-and-ignored."""
+    scalar ``weight_scale_2``; GDN linears from f8 ``weight`` + scalar
+    ``weight_scale`` (per-tensor FP8) and full-attn linears from the same with
+    a per-channel [N,1] ``weight_scale``. Both FP8 forms stay 8-bit: .w8 the
+    e4m3 weight, .wscale a ones grid, .oscale the per-output-row scale, and the
+    bf16 master carries the full magnitude (oscale included). With ``fp4`` the
+    MLP linears are served as the checkpoint's own bytes — .wq byte-identical,
+    .scale at the checkpoint's block 16 — instead of being dequantized and
+    re-packed. ``input_scale`` siblings are read-and-ignored."""
     cfg = replace(
         tiny(),
         hidden_size=128,
@@ -349,7 +356,7 @@ def test_nvfp4_official_load(tmp_path):
         s = scale.float().repeat_interleave(16, dim=-1)
         return (vals * s * gscale.float()).to(torch.bfloat16)
 
-    tensors, expected, expected_fp8 = {}, {}, {}
+    tensors, expected, expected_fp8, packed_fp4 = {}, {}, {}, {}
     for key, t in model.params.items():
         hf = _hf_name(key)
         stem = hf.removesuffix(".weight")
@@ -364,6 +371,7 @@ def test_nvfp4_official_load(tmp_path):
             # activation quant: present in the checkpoint, read-and-ignored
             tensors[stem + ".input_scale"] = torch.randn(1, generator=gen) * 0.1
             expected[key] = ref_nvfp4(packed, scale, gscale)
+            packed_fp4[key] = packed
         elif key.endswith(
             (
                 ".in_proj_qkv",
@@ -377,16 +385,19 @@ def test_nvfp4_official_load(tmp_path):
         ):
             n, k = t.shape
             w = (torch.randn(n, k, generator=gen) * 0.1).to(torch.float8_e4m3fn)
-            scale = torch.randn(1, generator=gen) * 0.1 + 0.5
+            # full-attn linears carry a per-channel [N,1] scale, GDN a scalar
+            per_channel = key.endswith((".q_proj", ".k_proj", ".v_proj", ".o_proj"))
+            scale = (
+                torch.rand(n, 1, generator=gen) * 0.1 + 0.5
+                if per_channel
+                else (torch.randn(1, generator=gen) * 0.1 + 0.5)
+            )
             tensors[hf] = w
             tensors[stem + ".weight_scale"] = scale
             tensors[stem + ".input_scale"] = torch.randn(1, generator=gen) * 0.1
-            expected[key] = (w.float() * scale.float()).to(torch.bfloat16)
-            ws = scale.float().reshape(1)
-            expected_fp8[key] = (
-                w,
-                ws.expand(((n + 127) // 128), ((k + 127) // 128)).contiguous(),
-            )
+            oscale = scale.float().reshape(-1).expand(n).contiguous()
+            expected[key] = (w.float() * oscale.reshape(-1, 1)).to(torch.bfloat16)
+            expected_fp8[key] = (w, torch.ones(((n + 127) // 128), ((k + 127) // 128)), oscale)
         else:
             tensors[hf] = t
             expected[key] = t
@@ -416,15 +427,37 @@ def test_nvfp4_official_load(tmp_path):
             }
         )
     )
-    loaded = load_hf(cfg, str(tmp_path))
+    loaded = load_hf(replace(cfg, fp4=fp4), str(tmp_path), keep_master=True)
     assert set(param_specs(cfg)) <= set(loaded.params)
     extras = {k for k in loaded.params if k not in param_specs(cfg)}
-    assert extras == {f"{k}.{s}" for k in expected_fp8 for s in ("w8", "wscale")}
+    fp8_extras = {f"{k}.{s}" for k in expected_fp8 for s in ("w8", "wscale", "oscale")}
+    assert fp8_extras <= extras and (fp4 or extras == fp8_extras)
     for key, exp in expected.items():
-        assert torch.equal(loaded.params[key], exp), f"param {key} dequant mismatch"
-    for key, (w, ws) in expected_fp8.items():
+        got = loaded.params[key]
+        if fp4 and key in packed_fp4:  # master regenerated from the served bytes
+            assert torch.allclose(got.float(), exp.float(), rtol=1e-2, atol=1e-2), key
+        else:
+            assert torch.equal(got, exp), f"param {key} dequant mismatch"
+    for key, (w, ws, os_) in expected_fp8.items():
         assert torch.equal(loaded.params[key + ".w8"], w), f"param {key}.w8 mismatch"
         assert torch.equal(loaded.params[key + ".wscale"], ws), f"param {key}.wscale mismatch"
+        assert torch.equal(loaded.params[key + ".oscale"], os_), f"param {key}.oscale mismatch"
+        # the 8-bit served path and the bf16 master must agree (the tape only
+        # ever sees the master, the kernel only ever sees w8/wscale/oscale)
+        x = torch.randn(2, w.shape[1], generator=gen)
+        served = reference.linear_fp8(x, w, ws, os_)
+        assert torch.allclose(served, x @ loaded.params[key].float().t(), rtol=1e-2, atol=1e-2)
+    if not fp4:
+        return
+    for key, packed in packed_fp4.items():
+        n, k = param_specs(cfg)[key]
+        scale = loaded.params[key + ".scale"]
+        assert torch.equal(loaded.params[key + ".wq"], packed), f"{key}.wq is not the ckpt bytes"
+        assert scale.shape == (n, k // 16), f"{key}.scale lost the checkpoint block"
+        # the w4a8 kernel dequantizes into e4m3 (max 448): 6*scale must fit
+        assert 6 * scale.max() <= 448, f"{key}.scale saturates the e4m3 dequant"
+    lean = load_hf(replace(cfg, fp4=True), str(tmp_path))  # keep_master defaults off
+    assert not ((set(packed_fp4) | set(expected_fp8)) & set(lean.params))  # no masters
 
 
 def test_awq_load(tmp_path):

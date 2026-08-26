@@ -11,9 +11,17 @@ Run: TILERL_TARGET=metal uv run pytest tests/test_metal_target.py -v
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
+from dataclasses import replace
 
+import numpy as np
 import pytest
 import torch
+
+from tilerl.config import tiny
+from tilerl.engine import SamplingParams, build_engine
+from tilerl.model import build_random
+from tilerl.train import _training_kv
 
 # Skip conditions, evaluated at import time like the CUDA check in
 # test_e2e.test_gpu_targets.
@@ -46,24 +54,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _reset_backend():
-    """Force target re-resolution against TILERL_TARGET."""
+@contextmanager
+def _target(name: str):
+    """Yield a backend resolved against TILERL_TARGET=name, then restore — a
+    stale ``_BACKEND`` left behind by a failed assert poisons every test module
+    imported later (no conftest owns the singleton)."""
     from tilerl.ops import backend as backend_mod
 
-    backend_mod._BACKEND = None
-    return backend_mod
-
-
-def test_metal_target_resolves():
-    """TILERL_TARGET=metal resolves to the metal target on the mps device."""
     prev = os.environ.get("TILERL_TARGET")
-    os.environ["TILERL_TARGET"] = "metal"
-    backend_mod = _reset_backend()
+    os.environ["TILERL_TARGET"] = name
+    backend_mod._BACKEND = None
     try:
-        backend = backend_mod.get_backend()
-        assert backend.target == "metal"
-        assert backend.arch == "metal"
-        assert backend.device.type == "mps"
+        yield backend_mod.get_backend()
     finally:
         backend_mod._BACKEND = None
         if prev is None:
@@ -72,13 +74,17 @@ def test_metal_target_resolves():
             os.environ["TILERL_TARGET"] = prev
 
 
+def test_metal_target_resolves():
+    """TILERL_TARGET=metal resolves to the metal target on the mps device."""
+    with _target("metal") as backend:
+        assert backend.target == "metal"
+        assert backend.arch == "metal"
+        assert backend.device.type == "mps"
+
+
 def test_metal_rmsnorm():
     """A kernel compiles and runs on Metal with correct results."""
-    prev = os.environ.get("TILERL_TARGET")
-    os.environ["TILERL_TARGET"] = "metal"
-    backend_mod = _reset_backend()
-    try:
-        backend = backend_mod.get_backend()
+    with _target("metal") as backend:
         torch.manual_seed(0)
         x = torch.randn(4, 64, dtype=torch.float32, device=backend.device)
         w = torch.randn(64, dtype=torch.float32, device=backend.device)
@@ -86,30 +92,53 @@ def test_metal_rmsnorm():
         assert y.device.type == "mps"
         rstd = torch.rsqrt((x * x).mean(-1, keepdim=True) + 1e-6)
         assert torch.allclose(y, x * rstd * w, atol=1e-4, rtol=1e-4)
-    finally:
-        backend_mod._BACKEND = None
-        if prev is None:
-            os.environ.pop("TILERL_TARGET", None)
-        else:
-            os.environ["TILERL_TARGET"] = prev
 
 
 def test_metal_gemm():
     """The metal-specific gemm schedule (naive FMA) matches torch.matmul."""
-    prev = os.environ.get("TILERL_TARGET")
-    os.environ["TILERL_TARGET"] = "metal"
-    backend_mod = _reset_backend()
-    try:
-        backend = backend_mod.get_backend()
+    with _target("metal") as backend:
         torch.manual_seed(0)
         a = torch.randn(8, 16, dtype=torch.float32, device=backend.device)
         w = torch.randn(24, 16, dtype=torch.float32, device=backend.device)
         y = backend.linear(a, w)
         assert y.device.type == "mps"
         assert torch.allclose(y, a @ w.T, atol=1e-3, rtol=1e-3)
-    finally:
-        backend_mod._BACKEND = None
-        if prev is None:
-            os.environ.pop("TILERL_TARGET", None)
-        else:
-            os.environ["TILERL_TARGET"] = prev
+
+
+_HET_CFG = replace(tiny(), fp4=True)  # tiny() is fp4=False: nothing quantized to gate
+_PROMPT = list(range(1, 17))
+
+
+def _het_run(target: str):
+    """Prefill logits + 8 greedy tokens for the fp4 tiny model on one target."""
+    with _target(target) as backend:
+        model = build_random(_HET_CFG, seed=7)
+        ids = np.asarray(_PROMPT, dtype=np.int64)
+        kv = _training_kv(model, 1, ids.size, device=backend.device)
+        logits = model.forward(ids.reshape(1, -1), np.arange(ids.size), kv, backend)
+        engine = build_engine(_HET_CFG, model, backend, num_blocks=8, num_slots=2)
+        try:
+            rid = engine.submit(_PROMPT, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
+            done: dict = {}
+            for _ in range(128):
+                done.update(engine.poll())
+                if rid in done:
+                    break
+                engine.step()
+        finally:
+            engine.shutdown()
+        return logits.float().cpu(), done[rid]
+
+
+def test_cpu_metal_decode_parity():
+    """One fp4 model, two targets, same answer — the heterogeneity gate.
+
+    Greedy decode is the strict half (any per-op divergence past the argmax
+    margin flips a token); the logits allclose is the numeric half.
+    """
+    cpu_logits, cpu_ids = _het_run("cpu")
+    metal_logits, metal_ids = _het_run("metal")
+    assert cpu_ids == metal_ids, f"cpu {cpu_ids} != metal {metal_ids}"
+    assert torch.allclose(cpu_logits, metal_logits, rtol=1e-2, atol=1e-2), (
+        (cpu_logits - metal_logits).abs().max()
+    )

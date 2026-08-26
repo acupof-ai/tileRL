@@ -26,7 +26,7 @@ import torch
 
 from tilerl.ops import reference
 from tilerl.ops.backend import _resolve, get_backend
-from tilerl.ops.reference import pack_fp4
+from tilerl.ops.reference import pack_fp4, renorm_fp4_scale
 
 RTOL = 1e-2
 ATOL = 1e-2
@@ -106,7 +106,7 @@ def _quantize_fp4(w_master: torch.Tensor):
 
 def _linear_fp4_fp8_ref(x, wq, scale):
     """Torch reference for the sm90 fp8 prefill path: same per-token e4m3
-    activation quant + e2m1fn->e4m3 requant weight dequant, f32 matmul. e4m3's
+    activation quant + e2m1->e4m3 requant weight dequant, f32 matmul. e4m3's
     ~2% multiplicative quant error does not average down over K, so the fp8
     kernel is gated against this identical-quant reference (kernel
     correctness), not the f32 linear_fp4 reference (quant precision)."""
@@ -115,7 +115,7 @@ def _linear_fp4_fp8_ref(x, wq, scale):
     row_max = xbf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)  # [M,1]
     ascale = (448.0 / row_max).to(torch.float32)
     xq = (xbf * ascale).to(torch.float8_e4m3fn).float() / ascale
-    # weight: e2m1 grid * per-32-block scale, requanted to e4m3 (same as kernel)
+    # weight: e2m1 grid * block scale, requanted to e4m3 (same as the kernel)
     w_deq = reference.dequant_fp4(wq, scale)  # f32 [N,K]
     w_q8 = w_deq.to(torch.float8_e4m3fn).float()
     return xq @ w_q8.t()
@@ -219,6 +219,42 @@ def test_linear_bwd(backend):
 # ---------------------------------------------------------------- linear fp4
 
 
+@pytest.mark.parametrize("block", [32, 16])
+def test_linear_fp4_grid(backend, block):
+    """The kernel's nibble decode is OCP e2m1, gated against a literal table.
+    pack_fp4/dequant_fp4/the kernel share one grid constant, so every other fp4
+    parity test passes with a wrong grid; only a literal table catches it. Both
+    checkpoint block sizes run: 16 is what the real 27B NVFP4 weights carry."""
+    ocp = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    nib = torch.arange(16, dtype=torch.uint8).repeat(block // 16)  # K = block
+    idx = (nib & 7).long()
+    want = torch.where(nib >= 8, -ocp[idx], ocp[idx]) * 2.0
+    wq = (nib[0::2] | (nib[1::2] << 4)).reshape(1, block // 2)
+    got = backend.linear_fp4(torch.eye(block), wq, torch.ones(1, 1), oscale=torch.full((1,), 2.0))[
+        :, 0
+    ]
+    _assert_close(got, want, f"fp4 grid block={block}")
+
+
+def test_fp4_w4a8_e4m3_range():
+    """The w4a8 kernel dequantizes weights INTO e4m3, so ``6 * scale`` has to
+    land in e4m3's normal range: a checkpoint's own block scales saturate its
+    448 max (50% error here), and renorm_fp4_scale's power-of-two split brings
+    that back to e4m3's own 2.3% requant floor. No kernel test on a GPU-less
+    host can see it — the CPU dequant target is f32 — so it is gated in torch."""
+    torch.manual_seed(9)
+    wq, scale = pack_fp4(torch.randn(64, 256) * 0.02, 16)  # real 27B magnitudes
+    gs = scale.max() / 448.0  # NVFP4 stores block scales as e4m3
+    ckpt = (scale / gs).to(torch.float8_e4m3fn).float()
+    scale2, oscale = renorm_fp4_scale(ckpt, gs.reshape(1).expand(64))
+    assert 6 * scale2.max() <= 448
+    x = torch.randn(8, 256)
+    ref = reference.linear_fp4(x, wq, ckpt, gs.expand(64))  # f32 weight dequant
+    w8 = reference.dequant_fp4(wq, scale2).to(torch.float8_e4m3fn).float()
+    rel = (((x @ w8.t()) * oscale - ref).abs().max() / ref.abs().max()).item()
+    assert rel <= 0.03, f"w4a8 e4m3 weight dequant error {rel:.3f}"
+
+
 def test_linear_fp4_parity(backend):
     torch.manual_seed(4)
     w_master = torch.randn(24, 32)
@@ -236,7 +272,7 @@ def test_linear_fp4_parity(backend):
 
 def test_linear_fp4_gemv_parity(backend):
     """M=1 decode path: the sm90 cell resolves to the GEMV kernel (the floor
-    kernel on CPU/metal); same e2m1fn decode math as the MMA kernel."""
+    kernel on CPU/metal); same e2m1 decode math as the MMA kernel."""
     torch.manual_seed(20)
     for N, K in [(24, 32), (16, 128), (18, 64)]:
         w_master = torch.randn(N, K)
@@ -257,7 +293,7 @@ def test_linear_fp4_fp8_parity(backend):
     The reference does the SAME per-32-block e4m3 quant in torch (not the f32
     linear_fp4 reference): e4m3's ~2% multiplicative quant error does not
     average down over K, so the gate is kernel correctness vs an identical-quant
-    torch reference, not quant precision vs f32. The e2m1fn weight grid is an
+    torch reference, not quant precision vs f32. The e2m1 weight grid is an
     exact subset of e4m3, so the weight side is error-free."""
     torch.manual_seed(21)
     for M, N, K in [(8, 64, 256), (4, 96, 128)]:
@@ -275,51 +311,27 @@ def test_linear_fp4_fp8_parity(backend):
         _assert_close(out, _linear_fp4_fp8_ref(x, wq, scale), f"linear_fp4_fp8 M={M} N={N} K={K}")
 
 
-def test_linear_fp4_bwd():
-    torch.manual_seed(5)
-    w_master = torch.randn(24, 32)
-    wq, scale = _quantize_fp4(w_master)
-    x = torch.randn(6, 32)
-    go = torch.randn(6, 24)
-    gx, g_master = reference.linear_fp4_bwd(go, x, wq, scale)
-    # STE: dequantized weight is constant w.r.t. master; g_master = grad @ x
-    w_deq = reference.dequant_fp4(wq, scale)
-    _assert_close(gx, go @ w_deq, "linear_fp4_bwd gx")
-    _assert_close(g_master, go.t() @ x, "linear_fp4_bwd g_master")
-
-
 # ---------------------------------------------------------------- linear fp8
 
 
 def test_linear_fp8_parity(backend):
     """Native-fp8 linear: the sm90 cell's fp8 WGMMA kernel (M>1) is gated
-    against the identical-quant reference; every other path (CPU/metal floor,
-    sm90 M=1 decode via the bf16 master, or the kernel absent) is gated
-    against the f32 dequant reference."""
+    against the identical-quant reference. A cell with no fp8 kernel raises —
+    the weight is converted to bf16 by Backend.materialize at load, never
+    served through a per-call master fallback."""
     torch.manual_seed(26)
     kset = _resolve(backend.precision, backend.arch)
     for M, N, K in [(8, 128, 256), (4, 256, 128)]:
-        w_master = torch.randn(N, K) * 0.1
-        w8, wscale = _quantize_fp8(w_master)
-        master = reference.dequant_fp8(w8, wscale).to(torch.bfloat16)
+        w8, wscale = _quantize_fp8(torch.randn(N, K) * 0.1)
         x = torch.randn(M, K) * 0.5
-        out = backend.linear_fp8(x, w8, wscale, master=master)
-        kernel_path = backend.target.startswith("cuda") and M > 1 and "linear_fp8" in kset
+        if "linear_fp8" not in kset:
+            with pytest.raises(NotImplementedError, match="linear_fp8"):
+                backend.linear_fp8(x, w8, wscale)
+            continue
+        out = backend.linear_fp8(x, w8, wscale)
+        kernel_path = backend.target.startswith("cuda") and M > 1
         ref = _linear_fp8_ref(x, w8, wscale) if kernel_path else reference.linear_fp8(x, w8, wscale)
         _assert_close(out, ref, f"linear_fp8 M={M} N={N} K={K}")
-
-
-def test_linear_fp8_bwd():
-    torch.manual_seed(27)
-    w_master = torch.randn(128, 256) * 0.1
-    w8, wscale = _quantize_fp8(w_master)
-    x = torch.randn(6, 256)
-    go = torch.randn(6, 128)
-    gx, g_master = reference.linear_fp8_bwd(go, x, w8, wscale)
-    # STE: dequantized weight is constant w.r.t. master; g_master = grad @ x
-    w_deq = reference.dequant_fp8(w8, wscale)
-    _assert_close(gx, go @ w_deq, "linear_fp8_bwd gx")
-    _assert_close(g_master, go.t() @ x, "linear_fp8_bwd g_master")
 
 
 def test_ref_backend_fp8_surface():
@@ -332,23 +344,22 @@ def test_ref_backend_fp8_surface():
 
 
 def test_linear_fp8_gemv_parity(backend):
-    """M=1 decode path: the sm90 cell resolves to the fp8 GEMV kernel (the
-    bf16 master floor on CPU/metal). The GEMV uses bf16 X (no activation
-    quant, unlike the M>1 MMA path), so the gate is the f32 dequant reference
-    — the bf16 X rounding is the only error source."""
+    """M=1 decode path: the sm90 cell resolves to the fp8 GEMV kernel; a cell
+    without one raises. The GEMV uses bf16 X (no activation quant, unlike the
+    M>1 MMA path), so the gate is the f32 dequant reference — the bf16 X
+    rounding is the only error source."""
     torch.manual_seed(28)
     kset = _resolve(backend.precision, backend.arch)
     for N, K in [(128, 256), (256, 128), (64, 512)]:
-        w_master = torch.randn(N, K) * 0.1
-        w8, wscale = _quantize_fp8(w_master)
-        master = reference.dequant_fp8(w8, wscale).to(torch.bfloat16)
+        w8, wscale = _quantize_fp8(torch.randn(N, K) * 0.1)
         x = torch.randn(1, K) * 0.5
-        out = backend.linear_fp8(x, w8, wscale, master=master)
+        if "linear_fp8_gemv" not in kset:
+            with pytest.raises(NotImplementedError, match="linear_fp8"):
+                backend.linear_fp8(x, w8, wscale)
+            continue
+        out = backend.linear_fp8(x, w8, wscale)
         assert out.shape == (1, N)
         _assert_close(out, reference.linear_fp8(x, w8, wscale), f"linear_fp8_gemv N={N} K={K}")
-        # on CUDA the kernel path must actually be the one that ran
-        if backend.target.startswith("cuda"):
-            assert "linear_fp8_gemv" in kset
 
 
 # ---------------------------------------------------------------- silu mul
@@ -769,3 +780,11 @@ def test_cross_entropy_is_stable_and_matches_gradient(backend):
     loss, grad = backend.cross_entropy_loss_grad(logits, [[0, 1]])
     assert loss == pytest.approx(100.0)
     assert torch.equal(grad[0, 0], torch.tensor([1.0, -1.0]))
+
+
+def test_rocm_cell_is_the_cpu_cell():
+    """rocm gets the CPU kernel set, not the pending-remote empty slot — the
+    schedules are target-neutral, so they compile for HIP from one source."""
+    assert "linear_fp4" in _resolve("bf16", "rocm")
+    with pytest.raises(NotImplementedError):
+        _resolve("bf16", "sm100")

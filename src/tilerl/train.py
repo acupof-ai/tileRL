@@ -102,10 +102,7 @@ def train_step(
     input_ids = np.asarray(input_ids, dtype=np.int64)
     b, t = input_ids.shape
     positions = np.arange(t, dtype=np.int64)
-    if backend.device.type != "cpu":
-        # Match the engine wiring: params live on the backend device so the
-        # optimizer's moments (keyed by param id) and grads share a device.
-        model.params = {k: v.to(backend.device) for k, v in model.params.items()}
+    model.params = backend.materialize(model.params)
     kv = _training_kv(model, b, t, device=backend.device)
     if tape is None:
         tape = Tape()

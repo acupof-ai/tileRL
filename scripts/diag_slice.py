@@ -23,7 +23,7 @@ from tilerl.ops.reference import pack_fp4, unpack_fp4
 def main() -> None:
     source = sys.argv[1] if len(sys.argv) > 1 else "/host/tc27-nvfp4-slice2"
     cfg = replace(qwen36_27b(), num_layers=2, full_attn_layers=())
-    model = load_hf(cfg, source)
+    model = load_hf(cfg, source, keep_master=True)  # inspects the bf16 masters
 
     print("== weight stats (bf16 masters) ==")
     for key in ("layers.0.in_proj_qkv", "layers.0.gate_proj", "layers.1.out_proj", "lm_head"):

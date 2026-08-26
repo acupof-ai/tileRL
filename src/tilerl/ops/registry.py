@@ -110,7 +110,11 @@ _SM90_KERNELS = {
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)
-for _arch in ("sm100", "sm120", "rocm"):
+# rocm gets the CPU cell, not an empty slot: the schedules are block-parallel
+# and target-neutral, so they compile for HIP from the same source. Untested —
+# no HIP host in this env (docs/support-matrix.md).
+_register("bf16", "rocm", _CPU_KERNELS)
+for _arch in ("sm100", "sm120"):
     _register("bf16", _arch, {})  # pending-remote slot
 
 

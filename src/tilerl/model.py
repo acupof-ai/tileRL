@@ -76,6 +76,7 @@ from .ops.reference import (
     dequant_fp8,
     dequant_nvfp4,
     pack_fp4,
+    renorm_fp4_scale,
     unpack_fp4,
 )  # re-exported for callers
 
@@ -151,6 +152,11 @@ def fp4_param_keys(cfg: ModelConfig) -> set[str]:
     return keys
 
 
+def _quantized(params: dict[str, torch.Tensor], key: str) -> bool:
+    """``key`` is served from packed bytes (fp4 nibbles or e4m3), not a bf16 tensor."""
+    return f"{key}.wq" in params or f"{key}.w8" in params
+
+
 def _projection_groups(cfg: ModelConfig, layer_idx: int) -> list[tuple[str, list[str]]]:
     """Same-input projection groups, fused at load for serving decode/prefill.
 
@@ -161,8 +167,8 @@ def _projection_groups(cfg: ModelConfig, layer_idx: int) -> list[tuple[str, list
     the unfused masters (the fused key has none, so its tape backward would
     have nowhere to land the STE grad).
 
-    fp4 groups concat .wq/.scale (per-N-row scales, always lossless); native-
-    fp8 groups concat .w8/.wscale (per-128-block scales, lossless only when
+    fp4 groups concat .wq/.scale/.oscale (per-N-row scales, always lossless);
+    fp8 groups concat .w8/.wscale (+ .oscale, lossless only when
     every member but the last has N % 128 == 0 — _fuse_projections guards).
     """
     p = f"layers.{layer_idx}"
@@ -178,9 +184,10 @@ def _projection_groups(cfg: ModelConfig, layer_idx: int) -> list[tuple[str, list
 def _fuse_projections(cfg: ModelConfig, params: dict[str, torch.Tensor]) -> None:
     """Concat each group's packed weights into a fused key (in-place).
 
-    fp4 groups concat .wq/.scale; native-fp8 groups also concat the bf16
-    master (the CPU/decode path computes with it) and need every member but
-    the last 128-N-aligned or the per-128-block wscale grid doesn't line up.
+    fp4 groups concat .wq/.scale/.oscale; native-fp8 groups concat
+    .w8/.wscale/.oscale and need every member but the last 128-N-aligned or
+    the per-128-block wscale grid doesn't line up. No bf16 master is built:
+    cells with no fp8 kernel get one from ``Backend.materialize``.
     """
     for i in range(cfg.num_layers):
         for fused_key, group in _projection_groups(cfg, i):
@@ -194,9 +201,10 @@ def _fuse_projections(cfg: ModelConfig, params: dict[str, torch.Tensor]) -> None
             if wqs is not None:
                 params[f"{fused_key}.wq"] = torch.cat(wqs, dim=0).contiguous()
                 params[f"{fused_key}.scale"] = torch.cat(scales, dim=0).contiguous()
-                for k in group:  # drop the dead copies (bf16 masters stay, recording-only)
-                    del params[f"{k}.wq"]
-                    del params[f"{k}.scale"]
+                oscales = [params[f"{k}.oscale"] for k in group]  # KeyError names the gap
+                params[f"{fused_key}.oscale"] = torch.cat(oscales).contiguous()
+                for k in group:  # drop the dead copies (any bf16 master stays, recording-only)
+                    del params[f"{k}.wq"], params[f"{k}.scale"], params[f"{k}.oscale"]
                 continue
             try:
                 w8s = [params[f"{k}.w8"] for k in group]
@@ -207,39 +215,60 @@ def _fuse_projections(cfg: ModelConfig, params: dict[str, torch.Tensor]) -> None
                 continue  # per-128-block wscale grid wouldn't concat losslessly
             params[f"{fused_key}.w8"] = torch.cat(w8s, dim=0).contiguous()
             params[f"{fused_key}.wscale"] = torch.cat(wscales, dim=0).contiguous()
-            params[fused_key] = torch.cat([params[k] for k in group], dim=0).contiguous()
-            for k in group:  # dead copies (bf16 masters stay, recording-only)
-                del params[f"{k}.w8"]
-                del params[f"{k}.wscale"]
+            if f"{group[0]}.oscale" in params:
+                oscales = [params[f"{k}.oscale"] for k in group]
+                params[f"{fused_key}.oscale"] = torch.cat(oscales).contiguous()
+            for k in group:  # dead copies (any bf16 master stays, recording-only)
+                del params[f"{k}.w8"], params[f"{k}.wscale"]
+                params.pop(f"{k}.oscale", None)
+
+
+def _native_fp4(packed, weight_scale, gscale, *, divide: bool = False):
+    """An NVFP4 checkpoint's tensors -> the serving triple (wq, scale, oscale).
+
+    The nibbles ARE the serving format: no bf16 round-trip, no second
+    quantization, block B straight from the checkpoint. The per-tensor global
+    scale rides the epilogue slot beside renorm_fp4_scale's power of two."""
+    gs = gscale.float().reshape(1)
+    gs = 1.0 / gs if divide else gs  # ModelOpt stores the global scale's reciprocal
+    scale, oscale = renorm_fp4_scale(weight_scale.float(), gs.expand(packed.shape[0]))
+    return packed.contiguous(), scale, oscale
 
 
 # --- Model ------------------------------------------------------------------
 class Model:
     """Qwen3.5/3.6 hybrid model. ``params`` maps :func:`param_specs` keys to
-    bf16 tensors; fp4 linears also carry ``<key>.wq`` (uint8) and
-    ``<key>.scale`` (f32) alongside the bf16 master, and native-fp8 linears
-    carry ``<key>.w8`` (e4m3) and ``<key>.wscale`` (f32 per-128-block)."""
+    bf16 tensors; fp4 linears carry ``<key>.wq`` (uint8) + ``<key>.scale``
+    (f32, block B from the checkpoint) and native-fp8 linears ``<key>.w8``
+    (e4m3) + ``<key>.wscale`` (f32 per-128-block), either with an optional
+    per-output-row ``<key>.oscale`` epilogue scale. The bf16 master beside
+    them is training-only (``load_hf(keep_master=True)``): serving ships the
+    quantized bytes and nothing else."""
 
     def __init__(self, cfg: ModelConfig, params: dict[str, torch.Tensor]):
         self.cfg = cfg
         self.params = params
 
+    def _has(self, key: str) -> bool:
+        # A fused key arrives as packed bytes, or as the bf16 weight
+        # Backend.materialize built for a cell with no kernel for them.
+        return key in self.params or _quantized(self.params, key)
+
     # -- linear dispatch (fp4-packed / native-fp8 when present, plain bf16 otherwise) ----
     def _linear(self, backend: "Backend", x: torch.Tensor, key: str) -> torch.Tensor:
-        wq = self.params.get(key + ".wq")
+        wq, osc = self.params.get(key + ".wq"), self.params.get(key + ".oscale")
         if wq is not None:
-            # ``master`` is recording-only: the STE grad lands on the bf16
-            # master weight (see autograd._linear_fp4). Fused projection keys
-            # (serving-only) have no master — the tape never sees them.
-            return backend.linear_fp4(
-                x, wq, self.params[key + ".scale"], master=self.params.get(key)
-            )
+            # ``master`` is recording-only: the STE grad lands on it
+            # (autograd.RecordingBackend). Fused projection keys are
+            # serving-only and have none — the tape never sees them.
+            scale = self.params[key + ".scale"]
+            return backend.linear_fp4(x, wq, scale, master=self.params.get(key), oscale=osc)
         w8 = self.params.get(key + ".w8")
         if w8 is not None:
-            # Native fp8: the sm90 prefill path computes with w8 directly;
-            # the bf16 master is recording-only (STE grad, see
-            # autograd._linear_fp8) and the decode (M=1) fallback.
-            return backend.linear_fp8(x, w8, self.params[key + ".wscale"], master=self.params[key])
+            # Native fp8 (sm90 only — elsewhere Backend.materialize already
+            # turned these into a bf16 weight); master is recording-only.
+            wscale = self.params[key + ".wscale"]
+            return backend.linear_fp8(x, w8, wscale, master=self.params.get(key), oscale=osc)
         return backend.linear(x, self.params[key])
 
     # -- full attention layer ----------------------------------------------
@@ -256,9 +285,7 @@ class Model:
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps)
         hq, hkv, d = cfg.num_attention_heads, cfg.num_kv_heads, cfg.head_dim
         qkv_key = f"{p}.qkv"
-        if (
-            f"{qkv_key}.wq" in self.params or f"{qkv_key}.w8" in self.params
-        ):  # fused q/k/v (serving)
+        if self._has(qkv_key):  # fused q/k/v (serving)
             qkv = self._linear(backend, h, qkv_key)
             q_rows = hq * d * (2 if cfg.full_attn_gated else 1)
             q = autograd.slice(qkv, ..., slice(0, q_rows))
@@ -315,7 +342,7 @@ class Model:
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps)
         qkvz_key = f"{p}.qkvz"
-        if f"{qkvz_key}.w8" in self.params or f"{qkvz_key}.wq" in self.params:
+        if self._has(qkvz_key):
             # Fused qkv/z (serving): one GEMM, split back at the qkv boundary.
             qkvz = self._linear(backend, h, qkvz_key)
             qkv = autograd.slice(qkvz, ..., slice(0, cfg.linear_qkv_dim))
@@ -324,7 +351,7 @@ class Model:
             qkv = self._linear(backend, h, f"{p}.in_proj_qkv")
             z = self._linear(backend, h, f"{p}.in_proj_z")
         ab_key = f"{p}.ab"
-        if f"{ab_key}.wq" in self.params or f"{ab_key}.w8" in self.params:  # fused a/b (serving)
+        if self._has(ab_key):  # fused a/b (serving)
             ab = self._linear(backend, h, ab_key)
             nvh = cfg.linear_num_value_heads
             a_proj = autograd.slice(ab, ..., slice(0, nvh))
@@ -373,7 +400,7 @@ class Model:
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.post_attn_norm"], cfg.rms_eps)
         gu_key = f"{p}.gate_up"
-        if f"{gu_key}.wq" in self.params or f"{gu_key}.w8" in self.params:
+        if self._has(gu_key):
             gu = self._linear(backend, h, gu_key)
             gate = autograd.slice(gu, ..., slice(0, cfg.intermediate_size))
             up = autograd.slice(gu, ..., slice(cfg.intermediate_size, None))
@@ -414,10 +441,12 @@ class Model:
 
 
 # --- Random initialization --------------------------------------------------
-def build_random(cfg: ModelConfig, seed: int, fuse_projections: bool = False) -> Model:
+def build_random(
+    cfg: ModelConfig, seed: int, fuse_projections: bool = False, keep_master: bool = False
+) -> Model:
     """Deterministic random model: N(0, 0.02^2) matrices, ones for norms,
     zeros for dt_bias/a_log, all bf16 on CPU. fp4 linears are packed from
-    their bf16 master (master kept for the STE backward)."""
+    their bf16 master, which ``keep_master`` retains for the STE backward."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
     def randn(shape: tuple[int, ...]) -> torch.Tensor:
@@ -438,9 +467,9 @@ def build_random(cfg: ModelConfig, seed: int, fuse_projections: bool = False) ->
         for key in sorted(fp4_param_keys(cfg)):
             wq, scale = pack_fp4(params[key])
             params[f"{key}.wq"] = wq
-            params[f"{key}.scale"] = scale
-        # ponytail: fp4 masters double the weight memory (54GB for 27B bf16);
-        # inference-only runs could drop them, training needs them for the STE.
+            params[f"{key}.scale"], params[f"{key}.oscale"] = renorm_fp4_scale(scale)
+            if not keep_master:
+                del params[key]
     if fuse_projections:
         _fuse_projections(cfg, params)
     return Model(cfg, params)
@@ -570,7 +599,11 @@ def _dequant_mlx(
 
 
 def load_hf(
-    cfg: ModelConfig, source: str, num_layers: int | None = None, fuse_projections: bool = False
+    cfg: ModelConfig,
+    source: str,
+    num_layers: int | None = None,
+    fuse_projections: bool = False,
+    keep_master: bool = False,
 ) -> Model:
     """Load ``source`` (HF repo id or local checkpoint directory) into a Model.
 
@@ -587,8 +620,12 @@ def load_hf(
     and AWQ-int4 (``qweight`` / ``scales`` / ``qzeros`` siblings, group size
     from ``quantization_config.group_size``). FP8 linears are kept native:
     the e4m3 weight lands in ``<key>.w8`` and the per-128-block scale in
-    ``<key>.wscale`` (a per-tensor scalar is expanded to the same layout),
-    with the bf16 dequant kept as the recording-only master."""
+    ``<key>.wscale``; a per-tensor or per-channel scale rides ``<key>.oscale``
+    over a ones wscale instead of being re-quantized to 4 bits. An NVFP4
+    checkpoint is served as its own bytes (``.wq`` verbatim, ``.scale`` at the
+    checkpoint's block size, ``.oscale``). ``keep_master`` (training only)
+    regenerates the bf16 STE master from those served bytes; serving keeps
+    none, so nothing but the quantized bytes reaches the device."""
     if num_layers is not None and not 0 < num_layers <= cfg.num_layers:
         raise ValueError(f"num_layers={num_layers} out of range for {cfg.num_layers} layers")
     src = Path(source)
@@ -647,10 +684,13 @@ def load_hf(
     group_size = hf_cfg.get("quantization", {}).get("group_size", 64)
     awq_group = (hf_cfg.get("quantization_config") or {}).get("group_size", 128)
     params: dict[str, torch.Tensor] = {}
-    #: Native-fp8 linears (key -> (e4m3 weight, f32 per-128-block scale)),
-    #: kept native instead of dequantized: the bf16 master below is recording-
-    #: only, the sm90 prefill path computes with the e4m3 weight directly.
-    fp8_native: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    #: Native-fp8 linears (key -> (e4m3 weight, f32 per-128-block scale,
+    #: optional per-row epilogue scale)), kept native instead of dequantized:
+    #: the sm90 path computes with the e4m3 weight directly.
+    fp8_native: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
+    #: Checkpoint-native fp4 linears (key -> (packed nibbles, block scale,
+    #: per-row epilogue scale)) — the bytes are served verbatim.
+    fp4_native: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
     for shard in _shard_files(ckpt_dir, source_desc):
         tensors = load_file(str(shard))
         mlx = next((n for n in tensors if n.startswith("language_model.")), None) is not None
@@ -668,18 +708,18 @@ def load_hf(
                 key = _param_key_for(base)
             elif hf_name.endswith(".weight_packed"):
                 # ModelOpt NVFP4 (Qwen3.6 MLP linears): packed e2m1 nibbles +
-                # f8 block scale + global scale siblings, dequantized to bf16.
-                # The stored global scale is its reciprocal (divide, not
-                # multiply — agent-infer quant_format.rs ScaleApply::Divide).
+                # f8 block scale + global scale siblings. Kept packed when
+                # cfg.fp4 (the checkpoint IS the serving format); dequantized
+                # to bf16 otherwise.
                 stem = hf_name.removesuffix(".weight_packed")
                 key = _param_key_for(stem + ".weight")
                 if key is not None:
-                    tensor = dequant_nvfp4(
-                        tensor,
-                        tensors[stem + ".weight_scale"],
-                        tensors[stem + ".weight_global_scale"],
-                        global_divide=True,
-                    )
+                    sib = (tensors[stem + ".weight_scale"], tensors[stem + ".weight_global_scale"])
+                    if cfg.fp4:
+                        fp4_native[key] = _native_fp4(tensor, *sib, divide=True)
+                        key = None  # served packed: no bf16 tensor at params[key]
+                    else:
+                        tensor = dequant_nvfp4(tensor, *sib, global_divide=True)
             elif hf_name.endswith(".qweight"):
                 # AWQ-int4 (autoawq GEMM): packed int4 weights + per-group
                 # scales/zeros siblings, dequantized to bf16.
@@ -701,7 +741,7 @@ def load_hf(
                 key = _param_key_for(hf_name)
                 if key is not None:
                     wscale = tensors[hf_name.removesuffix(".weight") + ".weight_scale_inv"].float()
-                    fp8_native[key] = (tensor, wscale)
+                    fp8_native[key] = (tensor, wscale, None)
                     tensor = dequant_fp8(tensor, wscale).to(torch.bfloat16)
             elif (
                 hf_name.endswith(".weight")
@@ -713,34 +753,30 @@ def load_hf(
                 stem = hf_name.removesuffix(".weight")
                 key = _param_key_for(hf_name)
                 if key is not None:
-                    tensor = dequant_nvfp4(
-                        tensor, tensors[stem + ".weight_scale"], tensors[stem + ".weight_scale_2"]
-                    )
+                    sib = (tensors[stem + ".weight_scale"], tensors[stem + ".weight_scale_2"])
+                    if cfg.fp4:
+                        fp4_native[key] = _native_fp4(tensor, *sib)
+                        key = None
+                    else:
+                        tensor = dequant_nvfp4(tensor, *sib)
             elif (
                 hf_name.endswith(".weight")
                 and hf_name.removesuffix(".weight") + ".weight_scale" in tensors
             ):
-                # FP8 weight + scale sibling. Per-tensor scalar: kept native
-                # (the scalar expands to the [ceil(N/128), ceil(K/128)]
-                # per-block wscale layout so one kernel serves both).
-                # Per-channel [N,1] (Qwen3.8 NVFP4 checkpoint): the block
-                # wscale layout cannot express per-channel scales, so dequant
-                # to the bf16 master (repacked to fp4 below when cfg.fp4).
+                # FP8 weight + scale sibling, per-tensor scalar or per-channel
+                # [N,1] (Qwen3.8 NVFP4). Both are a per-output-row constant, so
+                # both ride the .oscale epilogue over a ones wscale and stay
+                # 8-bit — the per-128-block wscale layout can express neither.
                 stem = hf_name.removesuffix(".weight")
                 key = _param_key_for(hf_name)
                 if key is not None:
-                    ws = tensors[stem + ".weight_scale"].float()
                     n, k = tensor.shape
-                    if ws.numel() == 1:
-                        wscale = (
-                            ws.reshape(1)
-                            .expand(((n + 127) // 128), ((k + 127) // 128))
-                            .contiguous()
-                        )
-                        fp8_native[key] = (tensor, wscale)
-                        tensor = dequant_fp8(tensor, wscale).to(torch.bfloat16)
-                    else:
-                        tensor = (tensor.float() * ws.reshape(-1, 1)).to(torch.bfloat16)
+                    ws = tensors[stem + ".weight_scale"].float().reshape(-1)
+                    oscale = ws.expand(n).contiguous()
+                    wscale = torch.ones(((n + 127) // 128), ((k + 127) // 128))
+                    fp8_native[key] = (tensor, wscale, oscale)
+                    # the master carries the full magnitude, oscale included
+                    tensor = (tensor.float() * oscale.reshape(-1, 1)).to(torch.bfloat16)
             elif hf_name.endswith(
                 (
                     ".weight_scale",
@@ -772,23 +808,38 @@ def load_hf(
                 tensor = tensor.reshape(tensor.shape[0], -1)  # [C,1,K]/[C,K,1] -> [C,K]
             params[key] = tensor
 
-    # Native FP8 weights: keep the e4m3 weight + per-128-block scale alongside
-    # the bf16 master (the sm90 prefill path computes with .w8 directly; the
-    # master is recording-only, like the fp4 masters).
-    for key, (w8, wscale) in fp8_native.items():
+    # Native FP8 weights: the e4m3 weight + per-128-block scale (+ per-row
+    # epilogue scale) the sm90 path computes with directly.
+    for key, (w8, wscale, oscale) in fp8_native.items():
         params[f"{key}.w8"] = w8.contiguous()
         params[f"{key}.wscale"] = wscale.contiguous()
+        if oscale is not None:
+            params[f"{key}.oscale"] = oscale
+
+    # Checkpoint-native fp4 weights, validated against the schema (the shape
+    # check below only sees keys that carry a bf16 tensor).
+    for key, (wq, scale, oscale) in fp4_native.items():
+        if key not in specs:
+            continue  # truncated-away layer
+        n, k = specs[key]
+        if tuple(wq.shape) != (n, k // 2) or scale.shape[0] != n or k % scale.shape[1]:
+            raise RuntimeError(
+                f"`{source_desc}`: packed `{key}` is {tuple(wq.shape)} / "
+                f"{tuple(scale.shape)}, expected ({n}, {k // 2}) and ({n}, K/B)"
+            )
+        params[f"{key}.wq"], params[f"{key}.scale"], params[f"{key}.oscale"] = wq, scale, oscale
+        if keep_master:  # the STE master, regenerated from the served bytes
+            params[key] = unpack_fp4(wq, scale, oscale)
 
     # Embedding/lm_head tying.
     if cfg.tie_word_embeddings:
-        params.pop("lm_head", None)  # model reuses embed_tokens
-        params.pop("lm_head.w8", None)
-        params.pop("lm_head.wscale", None)
+        for suffix in ("", ".w8", ".wscale", ".wq", ".scale", ".oscale"):
+            params.pop("lm_head" + suffix, None)  # model reuses embed_tokens
     elif "lm_head" not in params:
         raise RuntimeError(f"`{source_desc}`: untied model is missing lm_head.weight")
 
     # Completeness + shape check against the canonical schema.
-    missing = sorted(set(specs) - set(params))
+    missing = sorted(k for k in specs if not (k in params or _quantized(params, k)))
     if missing:
         raise RuntimeError(
             f"`{source_desc}`: checkpoint is missing {len(missing)} expected "
@@ -801,13 +852,13 @@ def load_hf(
                 f"{tuple(tensor.shape)} vs cfg {specs[key]}"
             )
 
-    # Quantize the fp4 linears on load (bf16 master kept for the STE backward).
+    # Quantize the bf16 linears the checkpoint did not already ship packed.
     # Native-fp8 linears are skipped: their checkpoint format is already the
     # sm90 prefill compute format (re-packing to fp4 would lose the e4m3
     # precision and force the K-loop dequant path).
     if cfg.fp4:
         for key in sorted(fp4_param_keys(cfg)):
-            if f"{key}.w8" in params:
+            if f"{key}.w8" in params or f"{key}.wq" in params:
                 continue
             master = params[key]
             if master.dtype != torch.bfloat16:
@@ -815,7 +866,12 @@ def load_hf(
                 params[key] = master
             wq, scale = pack_fp4(master)
             params[f"{key}.wq"] = wq
-            params[f"{key}.scale"] = scale
+            params[f"{key}.scale"], params[f"{key}.oscale"] = renorm_fp4_scale(scale)
+
+    if not keep_master:  # serving: the quantized bytes ARE the weight
+        # embed_tokens is exempt — backend.embedding needs the plain table.
+        for key in [k for k in specs if k != "embed_tokens" and _quantized(params, k)]:
+            params.pop(key, None)  # the checkpoint-native path never made one
 
     if fuse_projections:
         _fuse_projections(cfg, params)
@@ -854,6 +910,12 @@ def save_hf(model: Model, path: str | Path) -> None:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     cfg = model.cfg
+    missing = [k for k in param_specs(cfg) if k not in model.params]
+    if missing:  # a master-free serving model would write an unloadable shard
+        raise RuntimeError(
+            f"save_hf needs the bf16 masters (load with keep_master=True); "
+            f"{len(missing)} absent, e.g. {missing[:3]}"
+        )
     tensors = {
         _hf_tensor_name(k): t.detach().cpu().contiguous()
         for k, t in model.params.items()

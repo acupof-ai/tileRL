@@ -20,12 +20,14 @@ __all__ = ["main"]
 _QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")
 
 
-def _build_model(model_name: str, seed: int, fuse_projections: bool = False):
+def _build_model(
+    model_name: str, seed: int, fuse_projections: bool = False, keep_master: bool = False
+):
     """Build (cfg, model) for a named model. Lazy imports keep --help light.
 
     ``fuse_projections`` concats same-input fp4 projections into one GEMV at
     load (serving decode is launch-latency-bound on the small projections);
-    training keeps it off so the tape sees the unfused masters.
+    training keeps it off and passes ``keep_master`` so the tape has masters.
     """
     from . import config as config_mod
     from . import model as model_mod
@@ -33,7 +35,9 @@ def _build_model(model_name: str, seed: int, fuse_projections: bool = False):
     if model_name == "qwen38-27b":
         cfg = config_mod.qwen38_27b()
         try:
-            model = model_mod.load_hf(cfg, _QWEN38_SOURCE, fuse_projections=fuse_projections)
+            model = model_mod.load_hf(
+                cfg, _QWEN38_SOURCE, fuse_projections=fuse_projections, keep_master=keep_master
+            )
         except Exception as exc:
             print(
                 f"error: could not load Qwen3-27B weights from {_QWEN38_SOURCE!r}: {exc}\n"
@@ -44,7 +48,9 @@ def _build_model(model_name: str, seed: int, fuse_projections: bool = False):
             sys.exit(1)
         return cfg, model
     cfg = config_mod.tiny()
-    return cfg, model_mod.build_random(cfg, seed=seed, fuse_projections=fuse_projections)
+    return cfg, model_mod.build_random(
+        cfg, seed=seed, fuse_projections=fuse_projections, keep_master=keep_master
+    )
 
 
 def _build_engine(cfg, model, backend):
@@ -101,7 +107,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     from .ops.backend import get_backend
 
     backend = get_backend()
-    cfg, model = _build_model(args.model, seed=args.seed)
+    cfg, model = _build_model(args.model, seed=args.seed, keep_master=True)
     optimizer = AdamW(lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
     gen = torch.Generator().manual_seed(args.seed)
 
@@ -132,7 +138,7 @@ def cmd_pretrain(args: argparse.Namespace) -> None:
     from .server import get_tokenizer
 
     backend = get_backend()
-    cfg, model = _build_model(args.model, seed=args.seed)
+    cfg, model = _build_model(args.model, seed=args.seed, keep_master=True)
     dataset = train_mod.JsonlDataset(args.data, get_tokenizer(None), args.seq_len)
     optimizer = AdamW(lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
 

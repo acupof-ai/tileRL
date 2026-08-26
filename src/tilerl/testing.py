@@ -24,8 +24,6 @@ _REF_OPS = frozenset(
         "rope_bwd",
         "linear",
         "linear_bwd",
-        "linear_fp4_bwd",
-        "linear_fp8_bwd",
         "linear_attn_chunk",
         "linear_attn_step",
         "linear_attn_bwd",
@@ -57,15 +55,18 @@ class RefBackend:
             return getattr(reference, name)
         raise AttributeError(name)
 
-    def linear_fp4(self, x, wq, scale, master=None):
+    def materialize(self, params):
+        return params  # torch serves every format on CPU: nothing to convert or move
+
+    def linear_fp4(self, x, wq, scale, master=None, oscale=None):
         from .ops import reference
 
-        return reference.linear_fp4(x, wq, scale)  # master is recording-only
+        return reference.linear_fp4(x, wq, scale, oscale)  # master is recording-only
 
-    def linear_fp8(self, x, w8, wscale, master=None):
+    def linear_fp8(self, x, w8, wscale, master=None, oscale=None):
         from .ops import reference
 
-        return reference.linear_fp8(x, w8, wscale)  # master is recording-only
+        return reference.linear_fp8(x, w8, wscale, oscale)  # master is recording-only
 
     def attention(self, q, k, v, scale, gate=None):
         from .ops import reference

@@ -89,6 +89,23 @@ def _pad1d(t: torch.Tensor, n: int) -> torch.Tensor:
     return t if p == 0 else torch.nn.functional.pad(t, (0, p))
 
 
+#: CUDA linear family as data: (op, M-regime) -> (kernel, K pad, N cap, N tile).
+#: The regimes are measured crossovers, not guesses — GEMV at M=1, 8-way
+#: K-split decode at M<=16, 2-way prefill above
+#: (docs/experience/wins/2026-08-26-batch-decode-h2.md). The fp4->e4m3 arms
+#: tile N at 64 because the kernel overrides block_N to _FP4_BLOCK_N=64 — a
+#: 32-tile pad lets its grid read past the padded WQ.
+_CUDA_PLAN = {
+    ("linear", "gemv"): ("linear_bf16_gemv", 256, 4, 4),
+    ("linear_fp4", "gemv"): ("linear_fp4_gemv", 256, 4, 4),
+    ("linear_fp8", "gemv"): ("linear_fp8_gemv", 512, 4, 4),
+    ("linear_fp4", "decode"): ("linear_fp4_fp8_decode", 512, 128, 64),
+    ("linear_fp4", "prefill"): ("linear_fp4_fp8", 128, 128, 64),
+    ("linear_fp8", "decode"): ("linear_fp8", 128, 128, 16),
+    ("linear_fp8", "prefill"): ("linear_fp8", 128, 128, 16),
+}
+
+
 class Backend:
     """Resolved tilelang target plus lazily-compiled kernels.
 
@@ -167,6 +184,31 @@ class Backend:
             self._inv_freq_cache[key] = inv
         return inv
 
+    def _rows(self, x: torch.Tensor):
+        # sm90 kernels are bf16-IO, CPU/metal f32; cast once at the boundary.
+        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
+        return x.shape[:-1], self._c(self._dev(x, io).reshape(-1, x.shape[-1]))
+
+    def _epilogue(self, y2, oscale, lead, n: int):
+        # ponytail: torch epilogue for the per-row scale, fold into the kernel
+        # accumulator if a sweep says it matters.
+        return (y2 if oscale is None else y2 * self._f32(oscale)).reshape(*lead, n)
+
+    def _plan(self, op: str, m: int, n: int, k: int):
+        """(kernel, Mp, Np, Kp, block_M, block_N), or None when this cell has no
+        specialized kernel — the caller falls through to its generic path."""
+        if not self.target.startswith("cuda"):
+            return None
+        hit = _CUDA_PLAN.get((op, "gemv" if m == 1 else "decode" if m <= 16 else "prefill"))
+        if hit is None:
+            return None
+        kernel, kpad, cap, tile = hit
+        if kernel not in _resolve(self.precision, self.arch):
+            return None
+        bM = 1 if m == 1 else _snap_mma_tile(m, 128)
+        bN = _round_up(min(cap, n), tile)
+        return kernel, _round_up(m, bM), _round_up(n, bN), _round_up(k, kpad), bM, bN
+
     # ------------------------------------------------------------ add
 
     def add(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -233,28 +275,16 @@ class Backend:
     # ------------------------------------------------------------ linear
 
     def linear(self, x, w, bias=None):
-        # sm90 kernels are bf16-IO; CPU/metal kernels are f32. Cast once at
-        # the boundary (the model is bf16-master — no bf16->f32->bf16 trip).
-        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
-        x = self._dev(x, io)
-        w = self._dev(w, io)
-        lead = x.shape[:-1]
-        x2 = self._c(x.reshape(-1, x.shape[-1]))
+        lead, x2 = self._rows(x)
+        w = self._dev(w, x2.dtype)
         M, K, N = x2.shape[0], x2.shape[1], w.shape[0]
-        if self.target.startswith("cuda") and M == 1:
-            _kset = _resolve(self.precision, self.arch)
-            if "linear_bf16_gemv" in _kset:
-                # Decode GEMV: one activation row, stream W once (2 bytes/elem)
-                # instead of padding M to 16 WGMMA rows. block_K =
-                # reduce_thread(32) * micro_size_k(8 bf16) = 256; the K-tail is
-                # zero-padded like the WGMMA path.
-                Kp = _round_up(K, 256)
-                Np = _round_up(N, 4)
-                y = self._kernel("linear_bf16_gemv")(_pad2d(x2, 1, Kp), _pad2d(w, Np, Kp), 32, 4)
-                y = y[:1, :N]
-                if bias is not None:
-                    y = y + self._f32(bias)
-                return y.reshape(*lead, N)
+        plan = self._plan("linear", M, N, K)
+        if plan is not None:
+            # Decode GEMV: stream W once (2 bytes/elem) instead of padding M
+            # to 16 WGMMA rows; the K-tail is zero-padded like the WGMMA path.
+            kernel, _, Np, Kp, _, bN = plan
+            y = self._kernel(kernel)(_pad2d(x2, 1, Kp), _pad2d(w, Np, Kp), 32, bN)[:1, :N]
+            return (y if bias is None else y + self._f32(bias)).reshape(*lead, N)
         bM, bN = min(64, M), min(64, N)
         if self.target.startswith("cuda"):
             # WGMMA tiles: block M/N %16, reduction K %32; pad tails so the
@@ -262,8 +292,7 @@ class Backend:
             bM, bN = _round_up(bM, 16), _round_up(bN, 16)
             x2 = _pad2d(x2, _round_up(M, bM), _round_up(K, 32))
             w = _pad2d(w, _round_up(N, bN), _round_up(K, 32))
-            if bias is not None:
-                bias = _pad1d(self._f32(bias), w.shape[0])
+            bias = bias if bias is None else _pad1d(self._f32(bias), w.shape[0])
         if bias is None:
             bias = torch.zeros(w.shape[0], dtype=torch.float32, device=self.device)
         y = self._kernel("gemm_nt")(x2, w, bias, bM, bN, _THREADS)
@@ -305,156 +334,94 @@ class Backend:
 
     # ------------------------------------------------------------ linear fp4
 
-    def linear_fp4(self, x, wq, scale, master=None):
+    def linear_fp4(self, x, wq, scale, master=None, oscale=None):
         # ``master`` is recording-only (the STE grad lands on it); the kernel
-        # uses wq/scale. sm90 kernels are bf16-IO; CPU/metal kernels are f32.
+        # uses wq/scale.
         wq = self._dev(wq, wq.dtype)  # uint8: device migration only
         scale = self._f32(scale)
-        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
-        x = self._dev(x, io)
-        lead = x.shape[:-1]
-        x2 = self._c(x.reshape(-1, x.shape[-1]))
+        lead, x2 = self._rows(x)
         M, K, N = x2.shape[0], x2.shape[1], wq.shape[0]
-        _kset = _resolve(self.precision, self.arch)
-        if self.target.startswith("cuda") and M == 1 and "linear_fp4_gemv" in _kset:
-            # Decode GEMV: one activation row, stream+dequant WQ once. Block K
-            # is reduce_thread(32) * micro_size_k(8 bf16) = 256; e2m1fn has no
-            # zero, so the K-tail is killed by the zero-padded Scale (same
-            # trick as the MMA path).
-            Kp = _round_up(K, 256)
-            Np = _round_up(N, 4)
-            y = self._kernel("linear_fp4_gemv")(
-                _pad2d(x2, 1, Kp),
-                _pad2d(wq, Np, Kp // 2),
-                _pad2d(scale, Np, Kp // 32),
-                32,
-                4,
-            )
-            return y[:1, :N].reshape(*lead, N)
-        if self.target.startswith("cuda") and M > 1 and "linear_fp4_fp8" in _kset:
-            # Prefill fp8 path: per-token activation quant (e4m3) +
-            # fp4->e4m3 vectorized dequant + fp8 WGMMA. block_K=64 (fp8 WGMMA
-            # K=32, 2 steps). e2m1fn has no zero, so padded WQ bytes are
-            # killed by the zero-padded WScale. bN % 32: the dequant macro
-            # divides the tile as block_N*64/threads/16 (threads=128).
-            BK = 64
-            bM, bN = _snap_mma_tile(M, 128), _round_up(min(128, N), 32)
-            if M <= 16:
-                # Decode (bM=16, 2 warps/block): 8-way K-split — the split's
-                # resident warps hide HBM latency, and the atomics cost less
-                # than the occupancy they buy (ks1 -10.8%, ks8 +7.5% at B=8,
-                # A/B 2026-08-26). K padded to 8*BK for an exact tile count
-                # per split.
-                Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, BK * 8)
+        blk = K // scale.shape[1]  # scale block from the loaded weight (16 or 32)
+        plan = self._plan("linear_fp4", M, N, K)
+        if plan is not None:
+            kernel, Mp, Np, Kp, bM, bN = plan
+            # K-tail: zero-padded X, and padded nibbles (0x00) decode to 0.0.
+            wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
+            if M == 1:
+                # Decode GEMV: one activation row, stream+dequant WQ once.
+                y2 = self._kernel(kernel)(_pad2d(x2, 1, Kp), wq, scale, 32, bN, blk)[:1, :N]
+            else:
+                # w4a8: per-token e4m3 activation quant + fp4->e4m3 dequant +
+                # fp8 WGMMA, K-split into f32 atomic adds on a zeroed output
+                # (the AScale divide distributes over it).
                 x2 = _pad2d(x2, Mp, Kp)
                 xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
                 ascale = torch.empty((Mp,), dtype=torch.float32, device=self.device)
                 self._kernel("quant_fp8")(x2, xq, ascale, 256)
-                y = torch.zeros((Mp, Np), dtype=torch.float32, device=self.device)
-                self._kernel("linear_fp4_fp8_decode")(
-                    xq,
-                    _pad2d(wq, Np, Kp // 2),
-                    _pad2d(scale, Np, Kp // 32),
-                    ascale,
-                    y,
-                    bM,
-                    bN,
-                    _THREADS,
-                )
-                return y[:M, :N].reshape(*lead, N)
-            # K padded to 2*BK so the K-split=2 kernel (registry) sums an
-            # exact tile count per split.
-            Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, BK * 2)
-            x2 = _pad2d(x2, Mp, Kp)
-            xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
-            ascale = torch.empty((Mp,), dtype=torch.float32, device=self.device)
-            self._kernel("quant_fp8")(x2, xq, ascale, 256)
-            # K-split: f32 atomic adds into a zeroed output.
-            y = torch.zeros((Mp, Np), dtype=torch.float32, device=self.device)
-            self._kernel("linear_fp4_fp8")(
-                xq,
-                _pad2d(wq, Np, Kp // 2),
-                _pad2d(scale, Np, Kp // 32),
-                ascale,
-                y,
-                bM,
-                bN,
-                _THREADS,
-            )
-            return y[:M, :N].reshape(*lead, N)
-        bM, bN = min(64, M), min(64, N)
-        if self.target.startswith("cuda"):
-            # WGMMA tiles %16, reduction K %64 (the fp4 dequant K-tile).
-            # e2m1fn has no zero, so padded WQ bytes (0x00 -> 0.5) are killed
-            # by the zero-padded Scale. bM snaps to a warp-partition-valid
-            # size (48/80/96/112 do not compile under Square policy).
-            bM = _snap_mma_tile(M, 64)
-            bN = _round_up(bN, 16)
-            Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, 64)
-            x2 = _pad2d(x2, Mp, Kp)
-            wq = _pad2d(wq, Np, Kp // 2)
-            scale = _pad2d(scale, Np, Kp // 32)
-        y = self._kernel("linear_fp4")(x2, wq, scale, bM, bN, _THREADS)
-        return y[:M, :N].reshape(*lead, N)
-
-    def linear_fp4_bwd(self, grad, x, wq, scale, master=None):
-        # ponytail: torch-eager backward, tilelang kernel when perf demands
-        return reference.linear_fp4_bwd(grad, x, wq, scale)
+                y2 = torch.zeros((Mp, Np), dtype=torch.float32, device=self.device)
+                self._kernel(kernel)(xq, wq, scale, ascale, y2, bM, bN, blk, _THREADS)
+                y2 = y2[:M, :N]
+        else:
+            bM, bN = min(64, M), min(64, N)
+            if self.target.startswith("cuda"):
+                # WGMMA tiles %16, reduction K %64 (the fp4 dequant K-tile);
+                # bM snaps to a warp-partition-valid size (48/80/96/112 fail
+                # under Square policy).
+                bM, bN = _snap_mma_tile(M, 64), _round_up(bN, 16)
+                Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, 64)
+                x2 = _pad2d(x2, Mp, Kp)
+                wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
+            y2 = self._kernel("linear_fp4")(x2, wq, scale, bM, bN, blk, _THREADS)[:M, :N]
+        return self._epilogue(y2, oscale, lead, N)
 
     # ------------------------------------------------------------ linear fp8
 
-    def linear_fp8(self, x, w8, wscale, master=None):
+    def linear_fp8(self, x, w8, wscale, master=None, oscale=None):
         # ``master`` is recording-only (the STE grad lands on it); the kernel
-        # uses w8/wscale. sm90 M>1: per-token e4m3 activation quant + native
-        # fp8 WGMMA with per-128-block weight scale (no K-loop dequant). Every
-        # other path (CPU/metal, sm90 M=1 decode) goes through the bf16 master:
-        # the floor gemm on CPU/metal, the bf16 GEMV on decode.
-        _kset = _resolve(self.precision, self.arch)
-        lead = x.shape[:-1]
-        M = x.numel() // x.shape[-1]
-        if self.target.startswith("cuda") and M == 1 and "linear_fp8_gemv" in _kset:
-            # Decode GEMV: stream e4m3 W once (1 byte/elem) + per-128-block
-            # scale, bf16 X. block_K = reduce_thread(32) * micro_size_k(16) =
-            # 512 = 4 scale blocks; the K-tail is killed by the zero-padded
-            # WScale.
-            K = x.shape[-1]
-            N = w8.shape[0]
-            Kp = _round_up(K, 512)
-            Np = _round_up(N, 4)
-            NS = -(-Np // 128)
-            y = self._kernel("linear_fp8_gemv")(
-                _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(1, K)), 1, Kp),
-                _pad2d(self._dev(w8, w8.dtype), Np, Kp),
-                _pad2d(self._f32(wscale), NS, Kp // 128),
-                32,
-                4,
+        # uses w8/wscale. Only sm90 has an fp8 kernel — elsewhere the weight is
+        # bf16 by now, see :meth:`materialize`.
+        lead, K, N = x.shape[:-1], x.shape[-1], w8.shape[0]
+        M = x.numel() // K
+        plan = self._plan("linear_fp8", M, N, K)
+        if plan is None:
+            raise NotImplementedError(
+                f"linear_fp8 has no kernel in the ({self.precision!r}, {self.arch!r}) cell — "
+                "run Backend.materialize on the params at load, it converts fp8 to bf16"
             )
-            return y[:1, :N].reshape(*lead, N)
-        if self.target.startswith("cuda") and M > 1 and "linear_fp8" in _kset:
-            BK = 128  # matches the checkpoint's 128-block scale
-            N, K = w8.shape
-            bM, bN = _snap_mma_tile(M, 128), _round_up(min(128, N), 16)
-            Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, BK)
-            x2 = _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(M, K)), Mp, Kp)
+        kernel, Mp, Np, Kp, bM, bN = plan
+        # Zero-padding the per-128-block wscale kills the K-tail.
+        x2 = _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(M, K)), Mp, Kp)
+        w8 = _pad2d(self._dev(w8, w8.dtype), Np, Kp)
+        wscale = _pad2d(self._f32(wscale), -(-Np // 128), Kp // 128)
+        if M == 1:
+            # Decode GEMV: stream e4m3 W once (1 byte/elem), bf16 X.
+            y2 = self._kernel(kernel)(x2, w8, wscale, 32, bN)[:1, :N]
+        else:
             xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
             ascale = torch.empty((Mp,), dtype=torch.float32, device=self.device)
             self._kernel("quant_fp8")(x2, xq, ascale, 256)
-            NS = -(-Np // 128)
-            y = self._kernel("linear_fp8")(
-                xq,
-                _pad2d(self._dev(w8, w8.dtype), Np, Kp),
-                _pad2d(self._f32(wscale), NS, Kp // BK),
-                ascale,
-                bM,
-                bN,
-                _THREADS,
-            )
-            return y[:M, :N].reshape(*lead, N)
-        return self.linear(x, master)
+            y2 = self._kernel(kernel)(xq, w8, wscale, ascale, bM, bN, _THREADS)[:M, :N]
+        return self._epilogue(y2, oscale, lead, N)
 
-    def linear_fp8_bwd(self, grad, x, w8, wscale, master=None):
-        # ponytail: torch-eager backward, tilelang kernel when perf demands
-        return reference.linear_fp8_bwd(grad, x, w8, wscale)
+    def materialize(self, params: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Convert quantized weights to what this cell serves, then migrate.
+
+        fp4 is native on every registered cell; fp8 only on sm90, so elsewhere
+        ``.w8/.wscale/.oscale`` collapse into a bf16 weight here — once, at
+        wiring time, never as a per-call fallback. It never rewrites a tensor
+        that exists: a train step calls this every tick and the optimizer's
+        moments are keyed by ``id(param)``.
+        """
+        out = dict(params)
+        if "linear_fp8" not in _resolve(self.precision, self.arch):
+            for base in sorted(k[:-3] for k in params if k.endswith(".w8")):
+                if base not in out:  # rebuild the weight from the served bytes
+                    w = reference.dequant_fp8(params[f"{base}.w8"], params[f"{base}.wscale"])
+                    osc = params.get(f"{base}.oscale", torch.ones(1)).float().reshape(-1, 1)
+                    out[base] = (w * osc).to(torch.bfloat16)
+                for suffix in (".w8", ".wscale", ".oscale"):
+                    out.pop(base + suffix, None)
+        return {k: v.to(self.device) for k, v in out.items()}
 
     # ------------------------------------------------------------ attention
 
@@ -720,7 +687,7 @@ class Backend:
         Identity is checked via weakref: a fresh model can reuse a freed
         table's address, and data_ptr alone would hand back the stale cast.
         The tied lm_head path needs no cache: linear()'s IO cast is a no-op
-        on the bf16-master serving path."""
+        on the bf16 embedding table."""
         key = table.data_ptr()
         hit = self._embed_f32.get(key)
         if hit is not None:

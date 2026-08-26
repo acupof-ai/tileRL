@@ -166,32 +166,6 @@ def _linear(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
     yield 1, gw
 
 
-def _linear_fp4(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
-    # ponytail: STE on quantize, QAT scaling day-2. The bf16 master weight
-    # must be passed as `master=` at the forward call so the grad can reach it.
-    if "master" not in kw:
-        raise NotImplementedError(
-            "linear_fp4 backward needs the bf16 master weight: pass master=... "
-            "to backend.linear_fp4 (recording-only kwarg)"
-        )
-    gx, g_master = backend.linear_fp4_bwd(g, *args, **kw)
-    yield 0, gx
-    yield ("kw", "master"), g_master
-
-
-def _linear_fp8(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
-    # Same STE convention as _linear_fp4: the bf16 master must be passed as
-    # `master=` at the forward call (recording-only; the kernel uses w8/wscale).
-    if "master" not in kw:
-        raise NotImplementedError(
-            "linear_fp8 backward needs the bf16 master weight: pass master=... "
-            "to backend.linear_fp8 (recording-only kwarg)"
-        )
-    gx, g_master = backend.linear_fp8_bwd(g, *args, **kw)
-    yield 0, gx
-    yield ("kw", "master"), g_master
-
-
 def _rope(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
     # rope_bwd(grad, positions, theta[, rotary_dim]) -> gx: x itself is not an input.
     positions = args[1]
@@ -275,8 +249,6 @@ _BWD: dict[str, _Handler] = {
     "rmsnorm": _default("rmsnorm"),
     "rope": _rope,
     "linear": _linear,
-    "linear_fp4": _linear_fp4,
-    "linear_fp8": _linear_fp8,
     "attention": _attention,
     "paged_attention": _paged_attention,
     "linear_attn_chunk": _linear_attn_chunk,
