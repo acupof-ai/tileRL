@@ -215,7 +215,7 @@ def linear_fp4_bwd(
 #: bit 3 = sign. tileRL's internal fp4 format: pack_fp4/unpack_fp4,
 #: dequant_fp4, and the linear_fp4 kernel all decode this grid. It matches
 #: the Hopper dequant+gemm SOTA kernel's decode (e=0 -> {0.5, 0.75}), so the
-#: MMA port in kernels_mma.py is a clean copy with no grid adaptation.
+#: MMA port in kernels_linear.py is a clean copy with no grid adaptation.
 _E2M1FN_LUT = torch.tensor([0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 
 #: OCP/MX e2m1 magnitude LUT (with zero): the NVFP4 checkpoint wire format,

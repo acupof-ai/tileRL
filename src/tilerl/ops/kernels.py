@@ -22,7 +22,7 @@ CUDA facts (tilelang 0.1.13, H20/sm90, 2026-08-24): the MMA lowering has the
 same global-operand rejection ("Unsupported gemm combination, A: global,
 B: global") and requires tile M/N divisible by 16, so the naive FMA schedules
 below are the fallback for arches without an MMA cell (metal today); the
-sm90 cell uses the WGMMA schedules in kernels_mma.py instead. The per-thread
+sm90 cell uses the WGMMA schedules in kernels_linear.py instead. The per-thread
 fragment accumulator also false-positives the static data-race check (same
 as Metal/CPU), so the CUDA cell disables it too. A serial ``j`` loop nested inside a parallel ``i``
 loop miscompiles on Metal (output columns past the first few come back

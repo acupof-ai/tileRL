@@ -24,7 +24,7 @@ on torch's ``"mps"`` device (``Backend.device``), and kernel I/O goes through
 the torch-MPS adapter in tilelang's tvm_ffi runtime.
 CUDA target facts (tilelang 0.1.13, H20/sm90, 2026-08-24): the same source
 compiles for ``target="cuda"``; the sm90 cell uses the MMA (WGMMA) schedules
-in kernels_mma.py — shared-memory tiled T.gemm with pipelining, the SOTA
+in kernels_linear.py — shared-memory tiled T.gemm with pipelining, the SOTA
 pattern from examples/gemm/example_gemm.py. The sm90 MMA kernels are bf16-IO
 (bf16 WGMMA, f32 accumulate); the CUDA path casts to bf16 once at the
 boundary, while CPU/metal keep the f32 kernels. The MMA kernels require
@@ -49,6 +49,9 @@ from typing import Any
 import torch
 
 from . import kernels
+from . import kernels_attn
+from . import kernels_gdn
+from . import kernels_linear
 from . import kernels_mma
 from . import reference
 
@@ -145,28 +148,29 @@ _METAL_KERNELS = {
 }
 _register("bf16", "metal", _METAL_KERNELS)
 _register("fp4", "metal", _METAL_KERNELS)
-# sm90: the MMA (WGMMA) schedules from kernels_mma.py — shared-memory tiled
-# T.gemm with pipelining, the SOTA pattern from examples/gemm/example_gemm.py.
+# sm90: the MMA (WGMMA) schedules from kernels_linear.py / kernels_gdn.py /
+# kernels_attn.py — shared-memory tiled T.gemm with pipelining, the SOTA
+# pattern from examples/gemm/example_gemm.py.
 # The naive FMA gemms stay in kernels.py as the metal/other-arch fallback.
 # The MMA kernels require block M/N divisible by 16 and the reduction dim
-# divisible by _RED_TILE (32); the CUDA path of linear/linear_bwd/linear_fp4
+# divisible by 32; the CUDA path of linear/linear_bwd/linear_fp4
 # zero-pads tails so the kernel always sees exact tiles.
 _SM90_KERNELS = {
     **_CPU_KERNELS,
-    "gemm_nt": kernels_mma.make_gemm_nt_mma,
-    "gemm_nn": kernels_mma.make_gemm_nn_mma,
-    "gemm_tn": kernels_mma.make_gemm_tn_mma,
-    "linear_fp4": kernels_mma.make_linear_fp4_mma,
-    "linear_fp4_gemv": kernels_mma.make_linear_fp4_gemv,
-    "linear_bf16_gemv": kernels_mma.make_linear_bf16_gemv,
-    "linear_fp4_fp8": kernels_mma.make_linear_fp4_fp8_mma,
-    "linear_fp8": kernels_mma.make_linear_fp8_mma,
-    "linear_fp8_gemv": kernels_mma.make_linear_fp8_gemv,
-    "quant_fp8": kernels_mma.make_quant_fp8_e4m3,
+    "gemm_nt": kernels_linear.make_gemm_nt_mma,
+    "gemm_nn": kernels_linear.make_gemm_nn_mma,
+    "gemm_tn": kernels_linear.make_gemm_tn_mma,
+    "linear_fp4": kernels_linear.make_linear_fp4_mma,
+    "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv,
+    "linear_bf16_gemv": kernels_linear.make_linear_bf16_gemv,
+    "linear_fp4_fp8": kernels_linear.make_linear_fp4_fp8_mma,
+    "linear_fp8": kernels_linear.make_linear_fp8_mma,
+    "linear_fp8_gemv": kernels_linear.make_linear_fp8_gemv,
+    "quant_fp8": kernels_linear.make_quant_fp8_e4m3,
     "write_tokens": kernels_mma.make_write_tokens,
-    "gdn_decode_fused": kernels_mma.make_gdn_decode_fused,
-    "gdn_chunk_fused": kernels_mma.make_gdn_chunk_fused,
-    "paged_attention": kernels_mma.make_paged_attention_mma,
+    "gdn_decode_fused": kernels_gdn.make_gdn_decode_fused,
+    "gdn_chunk_fused": kernels_gdn.make_gdn_chunk_fused,
+    "paged_attention": kernels_attn.make_paged_attention_mma,
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)
