@@ -27,6 +27,18 @@ verdict**. Newest first.
   4.0e-3..8.6e-3 vs shipped (reduction order only); ks=2 arms bit-identical.
   Dev-only bench script deleted; the entry's table is the tile-space record.
   Entry: `docs/experience/errors/2026-08-26-bm-sweep-rejected.md`.
+## 2026-08-26 — accept-or-reject: stream-K tile scheduling for fp4 prefill GEMM — REJECTED (0.549x geo-mean, occupancy wall)
+
+- **Verdict.** Stream-K port (`examples/gemm_streamk` on the dequant+fp8-WGMMA
+  body: 78 blocks partition the first tiles' K-iteration space, then full
+  tiles) vs shipped k_split=2, 5 prefill shapes, H20 pod GPU 6, mean of 20:
+  geo-mean 0.549x — ~1.8x slower at every shape (0.512x..0.582x), correctness
+  green (rel-err 4.0e-3..8.6e-3, split reduction order). The 1-wave grid is
+  1 block/SM = 128 resident threads/SM; the body is occupancy-bound, so the
+  pipeline stalls with nothing to switch to. Stream-K targets under-filled
+  grids (tiles ≤ SMs); these shapes are 4-14 waves, where k_split=2's extra
+  blocks are the right lever. Kernel + planner reverted; registry never
+  wired. Entry: `docs/experience/errors/2026-08-26-streamk-prefill-rejected.md`.
 
 ## 2026-08-26 — accept-or-reject: e5m2 activation precision for fp4 prefill GEMM — REJECTED (0.999x tie, relerr 7.6e-2 vs 1e-2 gate)
 
