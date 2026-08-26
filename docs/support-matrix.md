@@ -33,7 +33,7 @@ is no per-call fallback (see below).
 | Op | cpu | sm90 | sm100 | rocm | metal |
 | --- | --- | --- | --- | --- | --- |
 | rmsnorm (fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
-| linear (fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done¹ |
+| linear (fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
 | rope (fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
 | attention (dense, fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
 | paged_attention (fwd) | done | done | pending-remote | untested (CPU cell) | done |
@@ -45,10 +45,6 @@ is no per-call fallback (see below).
 | embedding (fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
 | sample | done | done | pending-remote | untested (CPU cell) | done |
 | add | done | done | pending-remote | untested (CPU cell) | done |
-
-¹ `linear(x, w, bias)` fails on metal: the bias is not migrated to the backend
-device, so `gemm_nt` rejects it (`device_type mismatch`). Pre-existing and
-boundary-only — the biasless path, which the model uses everywhere, is green.
 
 ## fp4 (OCP e2m1 weight format)
 
@@ -117,12 +113,16 @@ quantized bytes for the tape's STE gradient. Serving (`tilerl serve`,
 `tilerl bench`) takes the default `False` and ships no master to the device.
 For the 27B that is ~51 GB of bf16 that never leaves the loader.
 
-`save_hf` needs masters and raises without them, rather than writing a shard
-with no linear weights.
+`save_hf` needs neither: a master-free fp4 model is written as the bytes it
+serves (`.wq`/`.scale`/`.oscale` under the HF stem), so `load_hf(save_hf(m))`
+is bit-identical at whatever block size the model held — no dequant on save,
+no re-pack on load. Where a master IS present it is the live weight the
+optimizer moves, so it is saved alone and the stale bytes are dropped. Keys
+with neither (fused projections, native-fp8 serving) still raise.
 
 ## Evidence
 
-- **cpu/bf16 + fp4 + fp8**: `TILERL_TARGET=cpu uv run pytest` — 96 passed, 4
+- **cpu/bf16 + fp4 + fp8**: `TILERL_TARGET=cpu uv run pytest` — 97 passed, 4
   skipped. Kernel-vs-reference parity on every op with a TileLang CPU kernel,
   tape gradcheck, end-to-end generation + training. Exception: dense/paged
   attention's CPU forward is the torch-eager reference itself
@@ -150,13 +150,14 @@ with no linear weights.
 - **rocm**: `tests/test_ops_parity.py::test_rocm_cell_is_the_cpu_cell` — a
   dict lookup, so the matrix claim is gated on every host. Nothing has ever
   run on HIP.
-- **metal/bf16 + fp4**: `TILERL_TARGET=metal uv run pytest` — 94 passed, 4
-  skipped, 2 failed: `test_linear_parity` (the bias-migration bug above) and
-  `test_weights.py::test_fused_projections_parity` (the same class — the test
-  mixes CPU-resident and mps tensors in a reference call). Both are boundary
-  bugs in test/host code, not target-neutrality bugs, and both reproduce on
-  the pre-refactor tree. `tests/test_metal_target.py` itself is green (4
-  passed). Metal facts:
+- **metal/bf16 + fp4**: `TILERL_TARGET=metal uv run pytest` — 97 passed, 4
+  skipped, 0 failed. The two long-standing failures were host-side device
+  boundaries, not target-neutrality bugs: `linear` never moved a bias to the
+  backend device (fixed at the `Backend.linear` boundary, same idiom as the
+  weight), and `test_fused_projections_parity` built its training KV pool on
+  the default device instead of the backend's (fixed at the four
+  `_training_kv` call sites — `train.py` already documents that `device` must
+  match the backend). Metal facts:
   - Same kernel source as CPU; the only registry fork is the three gemms
     (naive FMA schedules — Metal's `T.gemm` lowering rejects global operands).
   - `linear_attn_chunk` uses a per-column serial scan on BOTH targets: the

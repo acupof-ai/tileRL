@@ -286,15 +286,19 @@ class Backend:
             y = self._kernel(kernel)(_pad2d(x2, 1, Kp), _pad2d(w, Np, Kp), 32, bN)[:1, :N]
             return (y if bias is None else y + self._f32(bias)).reshape(*lead, N)
         bM, bN = min(64, M), min(64, N)
+        # _f32 before the cuda branch: every target needs the bias on-device.
+        bias = (
+            torch.zeros(N, dtype=torch.float32, device=self.device)
+            if bias is None
+            else self._f32(bias)
+        )
         if self.target.startswith("cuda"):
             # WGMMA tiles: block M/N %16, reduction K %32; pad tails so the
             # MMA kernel sees exact tiles (no OOB loads).
             bM, bN = _round_up(bM, 16), _round_up(bN, 16)
             x2 = _pad2d(x2, _round_up(M, bM), _round_up(K, 32))
             w = _pad2d(w, _round_up(N, bN), _round_up(K, 32))
-            bias = bias if bias is None else _pad1d(self._f32(bias), w.shape[0])
-        if bias is None:
-            bias = torch.zeros(w.shape[0], dtype=torch.float32, device=self.device)
+            bias = _pad1d(bias, w.shape[0])
         y = self._kernel("gemm_nt")(x2, w, bias, bM, bN, _THREADS)
         return y[:M, :N].reshape(*lead, N)
 
@@ -417,7 +421,8 @@ class Backend:
             for base in sorted(k[:-3] for k in params if k.endswith(".w8")):
                 if base not in out:  # rebuild the weight from the served bytes
                     w = reference.dequant_fp8(params[f"{base}.w8"], params[f"{base}.wscale"])
-                    osc = params.get(f"{base}.oscale", torch.ones(1)).float().reshape(-1, 1)
+                    osc = params.get(f"{base}.oscale", torch.ones(1))
+                    osc = osc.to(w.device, torch.float32).reshape(-1, 1)
                     out[base] = (w * osc).to(torch.bfloat16)
                 for suffix in (".w8", ".wscale", ".oscale"):
                     out.pop(base + suffix, None)

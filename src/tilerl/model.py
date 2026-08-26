@@ -623,7 +623,8 @@ def load_hf(
     ``<key>.wscale``; a per-tensor or per-channel scale rides ``<key>.oscale``
     over a ones wscale instead of being re-quantized to 4 bits. An NVFP4
     checkpoint is served as its own bytes (``.wq`` verbatim, ``.scale`` at the
-    checkpoint's block size, ``.oscale``). ``keep_master`` (training only)
+    checkpoint's block size, ``.oscale``), as is :func:`save_hf`'s own output
+    (the same three under the HF stem). ``keep_master`` (training only)
     regenerates the bf16 STE master from those served bytes; serving keeps
     none, so nothing but the quantized bytes reaches the device."""
     if num_layers is not None and not 0 < num_layers <= cfg.num_layers:
@@ -720,6 +721,19 @@ def load_hf(
                         key = None  # served packed: no bf16 tensor at params[key]
                     else:
                         tensor = dequant_nvfp4(tensor, *sib, global_divide=True)
+            elif hf_name.endswith(".wq"):
+                # tilerl's own save_hf: the served bytes verbatim (.scale at
+                # whatever block the saved model had, .oscale the epilogue),
+                # so load(save(m)) re-quantizes nothing and is bit-identical.
+                stem = hf_name.removesuffix(".wq")
+                key = _param_key_for(stem + ".weight")
+                if key is not None:
+                    sib = (tensors[stem + ".scale"].float(), tensors[stem + ".oscale"].float())
+                    if cfg.fp4:
+                        fp4_native[key] = (tensor, *sib)
+                        key = None
+                    else:
+                        tensor = unpack_fp4(tensor, *sib)
             elif hf_name.endswith(".qweight"):
                 # AWQ-int4 (autoawq GEMM): packed int4 weights + per-group
                 # scales/zeros siblings, dequantized to bf16.
@@ -835,7 +849,7 @@ def load_hf(
     if cfg.tie_word_embeddings:
         for suffix in ("", ".w8", ".wscale", ".wq", ".scale", ".oscale"):
             params.pop("lm_head" + suffix, None)  # model reuses embed_tokens
-    elif "lm_head" not in params:
+    elif "lm_head" not in params and not _quantized(params, "lm_head"):
         raise RuntimeError(f"`{source_desc}`: untied model is missing lm_head.weight")
 
     # Completeness + shape check against the canonical schema.
@@ -899,9 +913,13 @@ def _hf_tensor_name(key: str) -> str:
 def save_hf(model: Model, path: str | Path) -> None:
     """Save params as HF safetensors + config.json (``load_hf`` reads it back).
 
-    fp4 masters are saved bf16 and re-packed on load when ``cfg.fp4``. The
-    optimizer state is not saved. # ponytail: training-state checkpoints are
-    day-2 (agent-infer's ``checkpoint.rs``).
+    A serving fp4 linear is saved as the bytes it serves — ``.wq``/``.scale``/
+    ``.oscale`` under the HF stem — so nothing is dequantized here or
+    re-packed on load and ``load_hf(save_hf(m))`` is bit-identical. A bf16
+    master (training, ``keep_master=True``) is the live weight the optimizer
+    moves, so it is saved instead and the stale bytes beside it are dropped.
+    The optimizer state is not saved. # ponytail: training-state checkpoints
+    are day-2 (agent-infer's ``checkpoint.rs``).
     """
     from dataclasses import asdict
 
@@ -910,18 +928,27 @@ def save_hf(model: Model, path: str | Path) -> None:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     cfg = model.cfg
-    missing = [k for k in param_specs(cfg) if k not in model.params]
-    if missing:  # a master-free serving model would write an unloadable shard
+    tensors: dict[str, torch.Tensor] = {}
+    missing: list[str] = []
+    for key in param_specs(cfg):
+        hf = _hf_tensor_name(key)
+        if key in model.params:
+            tensors[hf] = model.params[key]
+        elif f"{key}.wq" in model.params:
+            stem = hf.removesuffix(".weight")
+            for suffix in (".wq", ".scale", ".oscale"):
+                tensors[stem + suffix] = model.params[key + suffix]
+        else:
+            missing.append(key)
+    if missing:  # fused or native-fp8 serving keys: no per-key bytes to write
         raise RuntimeError(
-            f"save_hf needs the bf16 masters (load with keep_master=True); "
-            f"{len(missing)} absent, e.g. {missing[:3]}"
+            f"save_hf: {len(missing)} params carry neither a bf16 master nor fp4 "
+            f"bytes (fused-projection or native-fp8 serving model), e.g. {missing[:3]}"
         )
-    tensors = {
-        _hf_tensor_name(k): t.detach().cpu().contiguous()
-        for k, t in model.params.items()
-        if k in param_specs(cfg)
-    }
-    save_file(tensors, str(path / "model.safetensors"))
+    save_file(
+        {k: v.detach().cpu().contiguous() for k, v in tensors.items()},
+        str(path / "model.safetensors"),
+    )
     layer_types = [
         "full_attention" if i in cfg.full_attn_layer_set else "linear_attention"
         for i in range(cfg.num_layers)

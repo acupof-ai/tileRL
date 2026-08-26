@@ -139,8 +139,7 @@ def test_layer_types_mismatch_raises(tmp_path):
 
 def test_fp4_on_load_and_forward(tmp_path):
     """fp4=True packs linears on load and (the default) keeps no bf16 master;
-    the packed model still forwards through the fp4 linear path end to end.
-    save_hf refuses such a model instead of writing an unloadable shard."""
+    the packed model still forwards through the fp4 linear path end to end."""
     import numpy as np
 
     from tilerl.engine import SamplingParams, build_engine
@@ -173,8 +172,44 @@ def test_fp4_on_load_and_forward(tmp_path):
             break
     assert rid in done, "fp4 model did not generate"
     engine.shutdown()
-    with pytest.raises(RuntimeError, match="keep_master"):
-        save_hf(loaded, tmp_path / "resaved")
+
+
+def test_fp4_save_load_roundtrip(tmp_path):
+    """save_hf writes a master-free fp4 model as the bytes it serves, so
+    load_hf(save_hf(m)) re-quantizes nothing: .wq/.scale/.oscale come back
+    bit-identical and the reloaded model generates the same greedy tokens.
+    Untied, because an untied fp4 model serves lm_head packed too."""
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.testing import RefBackend
+
+    cfg = replace(tiny(), fp4=True, tie_word_embeddings=False)
+    model = build_random(cfg, seed=7)
+    save_hf(model, tmp_path / "ckpt")
+    loaded = load_hf(cfg, str(tmp_path / "ckpt"))
+
+    for key in sorted(fp4_param_keys(cfg)):
+        assert key not in loaded.params, f"{key}: reload must ship no bf16 master"
+        for suffix in (".wq", ".scale", ".oscale"):
+            a, b = model.params[key + suffix], loaded.params[key + suffix]
+            assert a.dtype == b.dtype and torch.equal(a, b), f"{key}{suffix} is not bit-identical"
+
+    def greedy(m) -> list[int]:
+        engine = build_engine(
+            m.cfg, m, RefBackend(), num_blocks=8, num_slots=4, max_batch=4, max_total_tokens=512
+        )
+        rid = engine.submit(
+            list(range(1, 17)), SamplingParams(temperature=0.0, max_new_tokens=4, seed=0)
+        )
+        done: dict = {}
+        for _ in range(64):
+            engine.step()
+            done.update(engine.poll())
+            if rid in done:
+                break
+        engine.shutdown()
+        return done[rid]
+
+    assert greedy(loaded) == greedy(model)
 
 
 def test_fused_projections_parity(tmp_path):
@@ -196,10 +231,14 @@ def test_fused_projections_parity(tmp_path):
     positions = np.arange(16, dtype=np.int64)
     backend = RefBackend()
     with torch.no_grad():
-        y0 = unfused.forward(batch, positions, _training_kv(unfused, 2, 16), backend)
-        y1 = fused.forward(batch, positions, _training_kv(fused, 2, 16), backend)
-        # AGENTS.md parity gate: fused path through the TileLang CPU kernels.
-        y2 = fused.forward(batch, positions, _training_kv(fused, 2, 16), get_backend())
+        kv = lambda m, be: _training_kv(m, 2, 16, device=be.device)
+        y0 = unfused.forward(batch, positions, kv(unfused, backend), backend)
+        y1 = fused.forward(batch, positions, kv(fused, backend), backend)
+        # AGENTS.md parity gate: fused path through the TileLang kernels. .cpu()
+        # because the tilelang backend returns device tensors (metal) and the
+        # reference stays on CPU — same idiom as test_ops_parity._assert_close.
+        tl = get_backend()
+        y2 = fused.forward(batch, positions, kv(fused, tl), tl).cpu()
     assert torch.allclose(y0, y1, rtol=1e-2, atol=1e-2), (y0 - y1).abs().max()
     assert torch.allclose(y0, y2, rtol=1e-2, atol=1e-2), (y0 - y2).abs().max()
 

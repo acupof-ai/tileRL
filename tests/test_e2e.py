@@ -418,7 +418,7 @@ def test_production_model_gradcheck():
     def loss_and_grads():
         from tilerl.train import _training_kv
 
-        kv = _training_kv(model, 2, 16)
+        kv = _training_kv(model, 2, 16, device=backend.device)
         tape = Tape()
         with torch.no_grad(), tape:
             logits = model.forward(batch, positions, kv, RecordingBackend(backend))

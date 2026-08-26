@@ -95,7 +95,7 @@ class RefBackend:
         b, t, hq, d = q.shape
         hkv = k_pool.shape[1]
         rep = hq // hkv
-        out = torch.zeros(b, t, hq, d, dtype=q.dtype)
+        out = torch.zeros(b, t, hq, d, dtype=q.dtype, device=q.device)
         for bi in range(b):
             s = int(seq_lens[bi])
             sq = t if seq_q_lens is None else int(seq_q_lens[bi])
@@ -107,8 +107,8 @@ class RefBackend:
             k_seq = k_seq.unsqueeze(1).expand(hkv, rep, s, d).reshape(hq, s, d)
             v_seq = v_seq.unsqueeze(1).expand(hkv, rep, s, d).reshape(hq, s, d)
             scores = torch.einsum("thd,hsd->ths", q[bi, :sq].float(), k_seq.float()) * scale
-            q_pos = torch.arange(s - sq, s)
-            causal = torch.arange(s).unsqueeze(0) <= q_pos.unsqueeze(1)  # [sq,s]
+            q_pos = torch.arange(s - sq, s, device=q.device)
+            causal = torch.arange(s, device=q.device).unsqueeze(0) <= q_pos.unsqueeze(1)
             scores = scores.masked_fill(~causal.unsqueeze(1), float("-inf"))
             attn = torch.softmax(scores, dim=-1)
             ob = torch.einsum("ths,hsd->thd", attn, v_seq.float())

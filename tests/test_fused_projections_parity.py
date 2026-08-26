@@ -55,11 +55,12 @@ def test_fused_fp8_qkvz_parity():
     batch = np.random.default_rng(3).integers(3, cfg.vocab_size, size=(2, 16)).astype(np.int64)
     positions = np.arange(16, dtype=np.int64)
     backend = get_backend()
+    d = backend.device
     model.params = backend.materialize(model.params)
     fused.params = backend.materialize(fused.params)
     # the CPU cell serves no fp8: materialize left one bf16 weight per key
     assert f"{gdn}.qkvz" in fused.params and f"{gdn}.qkvz.w8" not in fused.params
     with torch.no_grad():
-        y0 = model.forward(batch, positions, _training_kv(model, 2, 16), backend)
-        y1 = fused.forward(batch, positions, _training_kv(fused, 2, 16), backend)
+        y0 = model.forward(batch, positions, _training_kv(model, 2, 16, device=d), backend)
+        y1 = fused.forward(batch, positions, _training_kv(fused, 2, 16, device=d), backend)
     assert torch.allclose(y0, y1, rtol=1e-2, atol=1e-2), (y0 - y1).abs().max()
