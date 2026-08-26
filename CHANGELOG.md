@@ -4,6 +4,19 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-26 — phase exit: Qwen3.8-27B full-model serving baseline (52.6 tok/s decode, 1773 tok/s prefill)
+
+- **Baseline.** First full-27B measurement on the real NVFP4 checkpoint
+  (`/data00/Qwen3.8-27B-NVFP4`), serving build (fuse_projections, decode graph
+  on, sm90), H20: decode B=1 19.03 ms/tick (52.6 tok/s), prefill 1947/1847/1773
+  tok/s at 512/2048/8192 (chunked 512). Two load-path defects fixed to get
+  there: `qwen38_27b()` GDN value heads 32→48 (checkpoint's A_log is [48]),
+  and per-channel `[N,1]` FP8 weight_scale support in load_hf (dequant to
+  bf16, repack fp4 — the block-128 native-fp8 path can't express per-channel).
+  The loaded model is all-fp4; the native-fp8 path serves the separate
+  block-128-scale Qwen3.8-27B-FP8 checkpoint. Entry:
+  `docs/experience/wins/2026-08-26-qwen38-27b-baseline.md`.
+
 ## 2026-08-26 — fix: P1 audit batch (engine/KV/server correctness, quantized training, ops isolation)
 
 - **Fixes.** Prefix published at seq_len-1 (was one token ahead — a cache hit
