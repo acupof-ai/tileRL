@@ -121,7 +121,8 @@ def qwen38_27b() -> ModelConfig:
 
     Values verified against the /data00/Qwen3.8-27B-NVFP4 checkpoint: hidden
     5120, intermediate 17408, 24 attention heads / 4 KV heads / head_dim 256,
-    vocab 248320, rope_theta 1e7, rms_eps 1e-6, tied embeddings, partial RoPE
+    vocab 248320, rope_theta 1e7, rms_eps 1e-6, untied (ships lm_head.weight),
+    partial RoPE
     (rotary_dim 64), GDN 16 key heads / 48 value heads / key+value dim 128
     (A_log is [48]; same as the Qwen3.6 slices), conv kernel 4.
     The full-attn offset (i%4==3) follows the Qwen3.5 family convention
@@ -141,7 +142,7 @@ def qwen38_27b() -> ModelConfig:
         rope_theta=1e7,
         max_position_embeddings=262144,
         rms_eps=1e-6,
-        tie_word_embeddings=True,
+        tie_word_embeddings=False,
         fp4=True,
         full_attn_gated=True,
         rotary_dim=64,
@@ -155,9 +156,9 @@ def qwen38_27b() -> ModelConfig:
 
 def qwen36_27b() -> ModelConfig:
     """Qwen3.6-27B (ModelOpt NVFP4, checkpoint /host/tc27-nvfp4-slice2): 64
-    layers = 16 full-attn (idx 3,7,...,63) + 48 GDN. Same shapes as
-    :func:`qwen38_27b` except the checkpoint is UNTIED (its config.json says
-    tie_word_embeddings=false and ships lm_head.weight), unlike Qwen3.8.
+    layers = 16 full-attn (idx 3,7,...,63) + 48 GDN. Same shapes and
+    untied lm_head as :func:`qwen38_27b`; the checkpoint is ModelOpt NVFP4
+    (its config.json says tie_word_embeddings=false and ships lm_head.weight).
     MLP linears are NVFP4 (weight_packed + f8 weight_scale + global scale,
     the stored global being its reciprocal), GDN in_proj_qkv/in_proj_z/
     out_proj are FP8 block-128 (weight + per-block scale_inv, multiplied);

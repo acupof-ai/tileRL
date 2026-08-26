@@ -81,6 +81,14 @@ Config: `TILERL_TARGET=cuda`, fuse_projections=True, decode graph ON, GPU
 - **NVFP4 MLP dequant uses `global_divide=True`** (ModelOpt convention — same
   tensor naming as the validated Qwen3.6 slices). Assumed, not independently
   checked against a reference framework's logits.
+- **This run's logits are void: the config said tied, the checkpoint is
+  untied.** `qwen38_27b()` shipped `tie_word_embeddings=True`, so `load_hf`
+  silently popped the checkpoint's real `lm_head.weight` (model.py:784) and
+  served with `embed_tokens` as the output projection. Perf is unaffected
+  (identical shapes/kernels — the numbers above stand), but generated tokens
+  were computed with the wrong weights. Fixed in the same-day follow-up
+  commit (`tie_word_embeddings=False`); the next 27B run must re-validate
+  logits against a reference, not just throughput.
 - **No kernel fell back** to a slower path; decode graph captured and replayed
   (no eager fallback). JIT was fast (24 s warmup) — the persistent
   `/work/tilelang_cache` held most shapes from prior slice runs; only the
