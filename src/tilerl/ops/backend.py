@@ -339,6 +339,29 @@ class Backend:
             # divides the tile as block_N*64/threads/16 (threads=128).
             BK = 64
             bM, bN = _snap_mma_tile(M, 128), _round_up(min(128, N), 32)
+            if M <= 16:
+                # Decode (bM=16, 2 warps/block): 8-way K-split — the split's
+                # resident warps hide HBM latency, and the atomics cost less
+                # than the occupancy they buy (ks1 -10.8%, ks8 +7.5% at B=8,
+                # A/B 2026-08-26). K padded to 8*BK for an exact tile count
+                # per split.
+                Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, BK * 8)
+                x2 = _pad2d(x2, Mp, Kp)
+                xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
+                ascale = torch.empty((Mp,), dtype=torch.float32, device=self.device)
+                self._kernel("quant_fp8")(x2, xq, ascale, 256)
+                y = torch.zeros((Mp, Np), dtype=torch.float32, device=self.device)
+                self._kernel("linear_fp4_fp8_decode")(
+                    xq,
+                    _pad2d(wq, Np, Kp // 2),
+                    _pad2d(scale, Np, Kp // 32),
+                    ascale,
+                    y,
+                    bM,
+                    bN,
+                    _THREADS,
+                )
+                return y[:M, :N].reshape(*lead, N)
             # K padded to 2*BK so the K-split=2 kernel (registry) sums an
             # exact tile count per split.
             Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, BK * 2)

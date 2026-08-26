@@ -93,6 +93,13 @@ _SM90_KERNELS = {
     "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv,
     "linear_bf16_gemv": kernels_linear.make_linear_bf16_gemv,
     "linear_fp4_fp8": lambda target: kernels_linear.make_linear_fp4_fp8_mma(target, k_split=2),
+    # Decode (M<=16): 8-way K-split. At bM=16 a block is 2 warps, so the
+    # split buys resident warps for HBM latency hiding — +7.5% at B=8 vs the
+    # prefill kernel's 2-way (A/B 2026-08-26, docs/experience/wins/
+    # 2026-08-26-batch-decode-h2.md).
+    "linear_fp4_fp8_decode": lambda target: kernels_linear.make_linear_fp4_fp8_mma(
+        target, k_split=8
+    ),
     "linear_fp8": kernels_linear.make_linear_fp8_mma,
     "linear_fp8_gemv": kernels_linear.make_linear_fp8_gemv,
     "quant_fp8": kernels_linear.make_quant_fp8_e4m3,
