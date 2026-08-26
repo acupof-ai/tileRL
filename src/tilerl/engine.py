@@ -223,6 +223,8 @@ class Engine:
         prefix_store: Any,
         limits: StepLimits,
         decode_graph: bool | None = None,
+        mtp_head: Any = None,
+        spec_decode: bool = False,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -238,6 +240,18 @@ class Engine:
             decode_graph = backend.device.type == "cuda"
         self._decode_graph_on = decode_graph
         self._decode_graphs: dict[int, _DecodeGraph] = {}
+
+        # MTP speculative decode (eager, greedy, depth=1). The spec tick
+        # drafts one token per request with the MTP head, verifies with a
+        # batched M=2B trunk forward, and rolls back GDN state on reject.
+        # ponytail: decode-graph integration is day-2 (the graph is static
+        # and cannot branch on accept/reject); the spec path is eager-only.
+        self._mtp = mtp_head
+        self._spec_decode = spec_decode and mtp_head is not None
+        if self._spec_decode:
+            self._decode_graph_on = False  # spec path is eager-only
+        self._spec_accepts = 0
+        self._spec_rejects = 0
 
         self._lock = threading.RLock()
         self._wake = threading.Event()
@@ -380,7 +394,10 @@ class Engine:
             if not decodes and prefill is None:
                 return
             try:
-                self._run_forward(decodes, prefill, chunk)
+                if self._spec_decode and prefill is None and decodes:
+                    self._spec_step(decodes)
+                else:
+                    self._run_forward(decodes, prefill, chunk)
             except Exception as exc:
                 for req in list(self._running):
                     self._finish(req, error=str(exc))
@@ -433,7 +450,7 @@ class Engine:
             total_slots = getattr(self._states, "num_slots", None)
             if total_slots is None and hasattr(self._states, "states"):
                 total_slots = int(self._states.states.shape[0])
-            return {
+            stats = {
                 "waiting": len(self._waiting),
                 "running": len(self._running),
                 "finished": self._finished_count,
@@ -450,6 +467,12 @@ class Engine:
                 "mixed_forwards": self._mixed_forwards,
                 "tokens_generated": self._tokens_generated,
             }
+            if self._spec_decode:
+                total = self._spec_accepts + self._spec_rejects
+                stats["spec_accepts"] = self._spec_accepts
+                stats["spec_rejects"] = self._spec_rejects
+                stats["spec_alpha"] = self._spec_accepts / total if total else 0.0
+            return stats
 
     # -------------------------------------------------------------- internals
 
@@ -551,11 +574,21 @@ class Engine:
             start = prefill.prefill_from
             input_ids[j, :chunk] = prefill.tokens[start : start + chunk]
             positions[j, :chunk] = np.arange(start, start + chunk)
-        logits = self._model.forward(
-            input_ids, positions, self._make_kv(rows, seq_q), self._backend
-        )
+        if self._spec_decode:
+            logits, hiddens = self._model.forward(
+                input_ids, positions, self._make_kv(rows, seq_q), self._backend,
+                return_hidden=True,
+            )
+        else:
+            logits = self._model.forward(
+                input_ids, positions, self._make_kv(rows, seq_q), self._backend
+            )
+            hiddens = None
         for i, r in enumerate(decodes):
             self._after_forward(r, logits[i, 0], len(r.output))
+            if self._spec_decode and r.phase != _PHASE_DONE:
+                r._spec_hidden = hiddens[i, 0]
+                r._spec_pending = r.output[-1]
         if prefill is not None:
             self._prefill_forwards += 1
             j = len(decodes)
@@ -574,6 +607,9 @@ class Engine:
                         self._finish(prefill)
                     else:
                         prefill.phase = _PHASE_DECODE
+                        if self._spec_decode:
+                            prefill._spec_hidden = hiddens[j, chunk - 1]
+                            prefill._spec_pending = prefill.output[-1]
         if decodes:
             self._decode_forwards += 1
         if decodes and prefill is not None:
@@ -599,6 +635,126 @@ class Engine:
         for i, r in enumerate(reqs):
             self._after_forward(r, logits[i, -1], len(r.output))
         return True
+
+    # ---------------------------------------------------------- MTP spec decode
+    def _spec_step(self, decodes: list[_Req]) -> None:
+        """Batched MTP spec decode tick (depth=1, greedy, eager).
+
+        Requests still missing a hidden capture (e.g., just transitioned from
+        prefill during a mixed tick) take a normal decode tick; the rest
+        draft + verify in a batched tick. See :class:`MtpHead` and
+        ``model.replay_linear`` for the draft and rollback mechanics.
+        """
+        if any(getattr(r, "_spec_hidden", None) is None for r in decodes):
+            self._run_forward(decodes, None, 1)
+        else:
+            self._spec_draft_verify(decodes)
+
+    def _spec_draft_verify(self, decodes: list[_Req]) -> None:
+        """Draft one token per request, verify with a batched M=2B forward."""
+        model, backend = self._model, self._backend
+
+        # 1. Draft: batched MTP forward.
+        h = torch.stack([r._spec_hidden for r in decodes])
+        pend = torch.tensor([r._spec_pending for r in decodes], device=backend.device)
+        drafts = self._mtp.forward(backend, h, pend, model).argmax(dim=-1)
+
+        # 2. Allocate blocks for 2 new positions per request.
+        for r in decodes:
+            while len(r.blocks) * BLOCK_TOKENS <= r.seq_len + 1:
+                r.blocks.append(self._kv.alloc_block())
+                r.own_blocks += 1
+                self._blocks_used += 1
+
+        # 3. Snapshot GDN state (the verify forward mutates it).
+        slots = torch.tensor([r.state_slot for r in decodes], device=backend.device)
+        snap_states = self._states.states[slots].clone()
+        snap_windows = (
+            self._states.conv_windows[slots].clone()
+            if self._states.conv_windows is not None
+            else None
+        )
+
+        # 4. Verify: batched trunk forward over [pending, draft] x B (T=2).
+        input_ids = torch.stack([pend, drafts], dim=1)
+        positions = torch.tensor(
+            [[r.seq_len - 1, r.seq_len] for r in decodes], device=backend.device
+        )
+        capture: list = []
+        logits, hiddens = model.forward(
+            input_ids,
+            positions,
+            self._make_kv_spec(decodes),
+            backend,
+            return_hidden=True,
+            linear_capture=capture,
+        )
+
+        # 5. Accept/reject per request (one sync for the whole batch).
+        am = logits.argmax(dim=-1)  # [B, 2]
+        results = torch.stack([drafts, am[:, 0], am[:, 1]], dim=1).tolist()
+        rej: list[int] = []
+        for j, r in enumerate(decodes):
+            d, t0, t1 = results[j]
+            if d == t0:
+                r.output.append(d)
+                self._spec_accepts += 1
+                self._tokens_generated += 1
+                if len(r.output) < r.params.max_new_tokens:
+                    r.output.append(t1)
+                    r.seq_len += 2
+                    r._spec_hidden = hiddens[j, 1]
+                    r._spec_pending = t1
+                    self._tokens_generated += 1
+                else:
+                    r.seq_len += 1
+            else:
+                r.output.append(t0)
+                r.seq_len += 1
+                r._spec_hidden = hiddens[j, 0]
+                r._spec_pending = t0
+                rej.append(j)
+                self._spec_rejects += 1
+                self._tokens_generated += 1
+            if len(r.output) >= r.params.max_new_tokens:
+                self._finish(r)
+
+        # 6. GDN rollback for rejected requests that are still running.
+        rej_alive = [j for j in rej if decodes[j].phase != _PHASE_DONE]
+        if rej_alive:
+            rej_slots = torch.tensor(
+                [decodes[j].state_slot for j in rej_alive], device=backend.device
+            )
+            model.replay_linear(
+                backend,
+                self._states,
+                capture,
+                torch.tensor(rej_alive, device=backend.device),
+                rej_slots,
+                snap_states,
+                snap_windows,
+            )
+        self._decode_forwards += 1
+
+    def _make_kv_spec(self, reqs: list[_Req]) -> BatchKv:
+        """BatchKv for the spec verify forward (T=2, post-verify seq_len)."""
+        bt = torch.zeros(len(reqs), self._kv.num_blocks, dtype=torch.long)
+        sl = torch.empty(len(reqs), dtype=torch.long)
+        ss = torch.empty(len(reqs), dtype=torch.long)
+        sql = torch.empty(len(reqs), dtype=torch.long)
+        for i, r in enumerate(reqs):
+            bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
+            sl[i] = r.seq_len + 1
+            ss[i] = r.state_slot
+            sql[i] = 2
+        return BatchKv(
+            block_table=bt,
+            seq_len=sl,
+            state_slot=ss,
+            kv_pool=self._kv,
+            state_pool=self._states,
+            seq_q_lens=sql,
+        )
 
     def _after_forward(self, req: _Req, last_logits: torch.Tensor, generated_idx: int) -> None:
         tok = self._sample(last_logits, req, generated_idx)
@@ -687,6 +843,8 @@ def build_engine(
     max_num_batched_tokens: int = 512,
     prefix_store: Any = None,
     decode_graph: bool | None = None,
+    mtp_head: Any = None,
+    spec_decode: bool = False,
 ) -> "Engine":
     """Wire a model + backend into a running Engine (pools + prefix store).
 
@@ -694,7 +852,8 @@ def build_engine(
     pool shapes from it. Pass ``prefix_store`` to inject a test double (e.g. a
     never-match store for the miss path). ``decode_graph`` auto-enables the
     captured decode tick on CUDA (design-engine.md); pass False to force the
-    eager path.
+    eager path. ``mtp_head`` + ``spec_decode=True`` enable the MTP speculative
+    decode path (eager, greedy, depth=1).
     """
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
     if backend.device.type != "cpu":
@@ -702,6 +861,8 @@ def build_engine(
         # the backend device once, at wiring time, so kernels and the
         # optimizer see consistent devices.
         model.params = {k: v.to(backend.device) for k, v in model.params.items()}
+    if mtp_head is not None and backend.device.type != "cpu":
+        mtp_head.params = {k: v.to(backend.device) for k, v in mtp_head.params.items()}
     kv_pool = PagedKvPool(
         num_blocks,
         cfg.num_kv_heads,
@@ -731,4 +892,6 @@ def build_engine(
             max_num_batched_tokens=max_num_batched_tokens,
         ),
         decode_graph=decode_graph,
+        mtp_head=mtp_head,
+        spec_decode=spec_decode,
     )
