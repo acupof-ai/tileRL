@@ -8,3 +8,6 @@ dist/
 runs/
 weights/
 .claude/
+scripts/_portcheck_corpus/
+portcheck_results.md
+portcheck_errors.log
