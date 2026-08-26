@@ -74,6 +74,7 @@ unless a prefill shape appears whose tile count is at or below the SM count.
 
 ## Iteration
 
-Hypothesis -> verdict in ~12 min agent wall time (1 pod round-trip) — first
-pod run green (correctness OK, perf verdict immediate). Worktree fast-forwarded
-to main first (branch forked before the split2 merge).
+Hypothesis -> verdict in 22.3 min agent wall time (3 pod round-trips) — one of
+two parallel arms of the Phase 2 tile sweep (workflow wall 22.3 min for both,
+187k subagent tokens). Worktree fast-forwarded to main first (branch forked
+before the split2 merge).

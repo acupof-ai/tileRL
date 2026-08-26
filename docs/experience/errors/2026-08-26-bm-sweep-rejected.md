@@ -71,3 +71,10 @@ per shape), ~4 min pod wall including sync.
 | date | commit | machine | target | arm | geo-mean vs shipped |
 |---|---|---|---|---|---:|
 | 2026-08-26 | eb6600f | H20 pod GPU 7 | cuda/sm90 | best non-shipped (bM=128 ks=1) | 0.930x (reject) |
+
+## Iteration
+
+Hypothesis -> verdict in 14.8 min agent wall time (2 pod round-trips; the
+6-config x 5-shape sweep is 30 JIT compiles, ~4 min pod wall) — one of two
+parallel arms of the Phase 2 tile sweep (workflow wall 22.3 min for both,
+187k subagent tokens).
