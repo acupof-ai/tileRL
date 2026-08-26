@@ -14,6 +14,22 @@ verdict**. Newest first.
   0.974x — already 4+ waves). Rel-err 4.0e-3..8.6e-3 vs the shipped kernel
   (same fp8 math, split reduction order). `uv run pytest -q`: 75 passed,
   4 skipped. Entry: `docs/experience/wins/2026-08-26-fp8-prefill-split2.md`.
+## 2026-08-26 — accept-or-reject: native-fp8 in_proj_qkv+z fusion (qkvz) for prefill — ACCEPTED (1.17x, 0.2572 -> 0.2204 ms)
+
+- **Verdict.** Each GDN layer projects the same post-norm hidden with
+  `in_proj_qkv` (h→10240) and `in_proj_z` (h→6144), both native-fp8 in the
+  Qwen3.6 checkpoint — two `linear_fp8` launches (two activation quants,
+  two GEMMs) where one suffices. Extended the fp4 projection-fusion
+  mechanism to native-fp8: `_projection_groups` gains `qkvz`,
+  `_fuse_projections` concats `.w8`/`.wscale` along N (lossless: 10240 = 80
+  blocks, 6144 = 48) plus the bf16 master the CPU/decode path computes
+  with, and `_gdn` splits the fused output at `cfg.linear_qkv_dim`.
+  Same-process A/B at prefill shapes (M=512, K=2048, N=10240+6144) on the
+  H20 pod: 0.2572 → 0.2204 ms (1.17x), relerr 0.0 (bit-identical — same
+  per-output dot products, one launch + one activation quant). Serving-only
+  via `fuse_projections`; parity on CPU in
+  `tests/test_fused_projections_parity.py`. Entry:
+  `docs/experience/wins/2026-08-26-fp8-qkvz-fusion-prefill.md`.
 
 ## 2026-08-25 — accept-or-reject: chunked GDR scan for GDN prefill — REJECTED (0.90x, bf16 precision wall)
 

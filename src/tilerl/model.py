@@ -152,15 +152,18 @@ def fp4_param_keys(cfg: ModelConfig) -> set[str]:
 
 
 def _projection_groups(cfg: ModelConfig, layer_idx: int) -> list[tuple[str, list[str]]]:
-    """Same-input fp4 projection groups, fused at load for serving decode.
+    """Same-input projection groups, fused at load for serving decode/prefill.
 
-    Each group reads the same post-norm hidden and is fp4-packed, so the
-    packed weights concat losslessly along N (per-32-block scales are
-    per-row) and one GEMV replaces the group's launches — the decode tick is
-    launch-latency-bound on the small projections (N=48/1024 at 0.1-3% roof),
-    so collapsing launches is the lever. Serving-only: training keeps the
-    unfused masters (the fused key has none, so its tape backward would have
-    nowhere to land the STE grad).
+    Each group reads the same post-norm hidden, so the packed weights concat
+    losslessly along N and one GEMM replaces the group's launches — the tick
+    is launch-latency-bound on the small projections (N=48/1024 at 0.1-3%
+    roof), so collapsing launches is the lever. Serving-only: training keeps
+    the unfused masters (the fused key has none, so its tape backward would
+    have nowhere to land the STE grad).
+
+    fp4 groups concat .wq/.scale (per-N-row scales, always lossless); native-
+    fp8 groups concat .w8/.wscale (per-128-block scales, lossless only when
+    every member but the last has N % 128 == 0 — _fuse_projections guards).
     """
     p = f"layers.{layer_idx}"
     groups = [(f"{p}.gate_up", [f"{p}.gate_proj", f"{p}.up_proj"])]
@@ -168,25 +171,46 @@ def _projection_groups(cfg: ModelConfig, layer_idx: int) -> list[tuple[str, list
         groups.append((f"{p}.qkv", [f"{p}.q_proj", f"{p}.k_proj", f"{p}.v_proj"]))
     else:
         groups.append((f"{p}.ab", [f"{p}.in_proj_a", f"{p}.in_proj_b"]))
+        groups.append((f"{p}.qkvz", [f"{p}.in_proj_qkv", f"{p}.in_proj_z"]))
     return groups
 
 
 def _fuse_projections(cfg: ModelConfig, params: dict[str, torch.Tensor]) -> None:
-    """Concat each group's packed fp4 weights into a fused key (in-place)."""
+    """Concat each group's packed weights into a fused key (in-place).
+
+    fp4 groups concat .wq/.scale; native-fp8 groups also concat the bf16
+    master (the CPU/decode path computes with it) and need every member but
+    the last 128-N-aligned or the per-128-block wscale grid doesn't line up.
+    """
     for i in range(cfg.num_layers):
         for fused_key, group in _projection_groups(cfg, i):
-            if f"{fused_key}.wq" in params:
+            if f"{fused_key}.wq" in params or f"{fused_key}.w8" in params:
                 continue
             try:
                 wqs = [params[f"{k}.wq"] for k in group]
                 scales = [params[f"{k}.scale"] for k in group]
             except KeyError:
-                continue  # group not fully fp4 (bf16 checkpoint) — skip
-            params[f"{fused_key}.wq"] = torch.cat(wqs, dim=0).contiguous()
-            params[f"{fused_key}.scale"] = torch.cat(scales, dim=0).contiguous()
-            for k in group:  # drop the dead copies (bf16 masters stay, recording-only)
-                del params[f"{k}.wq"]
-                del params[f"{k}.scale"]
+                wqs = None
+            if wqs is not None:
+                params[f"{fused_key}.wq"] = torch.cat(wqs, dim=0).contiguous()
+                params[f"{fused_key}.scale"] = torch.cat(scales, dim=0).contiguous()
+                for k in group:  # drop the dead copies (bf16 masters stay, recording-only)
+                    del params[f"{k}.wq"]
+                    del params[f"{k}.scale"]
+                continue
+            try:
+                w8s = [params[f"{k}.w8"] for k in group]
+                wscales = [params[f"{k}.wscale"] for k in group]
+            except KeyError:
+                continue  # group not quantized (bf16 checkpoint) — skip
+            if any(w.shape[0] % 128 for w in w8s[:-1]):
+                continue  # per-128-block wscale grid wouldn't concat losslessly
+            params[f"{fused_key}.w8"] = torch.cat(w8s, dim=0).contiguous()
+            params[f"{fused_key}.wscale"] = torch.cat(wscales, dim=0).contiguous()
+            params[fused_key] = torch.cat([params[k] for k in group], dim=0).contiguous()
+            for k in group:  # dead copies (bf16 masters stay, recording-only)
+                del params[f"{k}.w8"]
+                del params[f"{k}.wscale"]
 
 
 # --- Model ------------------------------------------------------------------
@@ -232,7 +256,7 @@ class Model:
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps)
         hq, hkv, d = cfg.num_attention_heads, cfg.num_kv_heads, cfg.head_dim
         qkv_key = f"{p}.qkv"
-        if f"{qkv_key}.wq" in self.params:  # fused q/k/v (serving)
+        if f"{qkv_key}.wq" in self.params or f"{qkv_key}.w8" in self.params:  # fused q/k/v (serving)
             qkv = self._linear(backend, h, qkv_key)
             q_rows = hq * d * (2 if cfg.full_attn_gated else 1)
             q = autograd.slice(qkv, ..., slice(0, q_rows))
@@ -288,10 +312,17 @@ class Model:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps)
-        qkv = self._linear(backend, h, f"{p}.in_proj_qkv")
-        z = self._linear(backend, h, f"{p}.in_proj_z")
+        qkvz_key = f"{p}.qkvz"
+        if f"{qkvz_key}.w8" in self.params or f"{qkvz_key}.wq" in self.params:
+            # Fused qkv/z (serving): one GEMM, split back at the qkv boundary.
+            qkvz = self._linear(backend, h, qkvz_key)
+            qkv = autograd.slice(qkvz, ..., slice(0, cfg.linear_qkv_dim))
+            z = autograd.slice(qkvz, ..., slice(cfg.linear_qkv_dim, None))
+        else:
+            qkv = self._linear(backend, h, f"{p}.in_proj_qkv")
+            z = self._linear(backend, h, f"{p}.in_proj_z")
         ab_key = f"{p}.ab"
-        if f"{ab_key}.wq" in self.params:  # fused a/b (serving)
+        if f"{ab_key}.wq" in self.params or f"{ab_key}.w8" in self.params:  # fused a/b (serving)
             ab = self._linear(backend, h, ab_key)
             nvh = cfg.linear_num_value_heads
             a_proj = autograd.slice(ab, ..., slice(0, nvh))
