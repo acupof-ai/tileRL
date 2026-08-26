@@ -119,12 +119,13 @@ class ModelConfig:
 def qwen38_27b() -> ModelConfig:
     """Qwen3.8-27B (NVFP4): 64 layers = 16 full-attn (idx 3,7,...,63) + 48 GDN.
 
-    Values verified against agent-infer docs: hidden 5120, intermediate 17408,
-    24 attention heads / 4 KV heads / head_dim 256, vocab 248320, rope_theta
-    1e7, rms_eps 1e-6, tied embeddings, partial RoPE (rotary_dim 64), GDN
-    16 key heads / 32 value heads / key+value dim 128, conv kernel 4.
+    Values verified against the /data00/Qwen3.8-27B-NVFP4 checkpoint: hidden
+    5120, intermediate 17408, 24 attention heads / 4 KV heads / head_dim 256,
+    vocab 248320, rope_theta 1e7, rms_eps 1e-6, tied embeddings, partial RoPE
+    (rotary_dim 64), GDN 16 key heads / 48 value heads / key+value dim 128
+    (A_log is [48]; same as the Qwen3.6 slices), conv kernel 4.
     The full-attn offset (i%4==3) follows the Qwen3.5 family convention
-    (verified on the local 0.8B's layer_types); load_hf validates the real
+    (the checkpoint's layer_types agrees); load_hf validates the real
     checkpoint's layer_types against this tuple and raises on mismatch.
     """
     return ModelConfig(
@@ -146,7 +147,7 @@ def qwen38_27b() -> ModelConfig:
         rotary_dim=64,
         linear_num_key_heads=16,
         linear_key_head_dim=128,
-        linear_num_value_heads=32,
+        linear_num_value_heads=48,
         linear_value_head_dim=128,
         linear_conv_kernel_dim=4,
     )
@@ -155,8 +156,7 @@ def qwen38_27b() -> ModelConfig:
 def qwen36_27b() -> ModelConfig:
     """Qwen3.6-27B (ModelOpt NVFP4, checkpoint /host/tc27-nvfp4-slice2): 64
     layers = 16 full-attn (idx 3,7,...,63) + 48 GDN. Same shapes as
-    :func:`qwen38_27b` except GDN value heads: 48 (the checkpoint's A_log is
-    [48]), not 32 — and the checkpoint is UNTIED (its config.json says
+    :func:`qwen38_27b` except the checkpoint is UNTIED (its config.json says
     tie_word_embeddings=false and ships lm_head.weight), unlike Qwen3.8.
     MLP linears are NVFP4 (weight_packed + f8 weight_scale + global scale,
     the stored global being its reciprocal), GDN in_proj_qkv/in_proj_z/

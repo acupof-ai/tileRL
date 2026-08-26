@@ -720,19 +720,27 @@ def load_hf(
                 hf_name.endswith(".weight")
                 and hf_name.removesuffix(".weight") + ".weight_scale" in tensors
             ):
-                # Per-tensor FP8 (official NVFP4 GDN/attn linears, standalone
-                # FP8): f8 weight * scalar scale, kept native like the block
-                # format above — the scalar is expanded to the same
-                # [ceil(N/128), ceil(K/128)] wscale layout so one kernel
-                # serves both.
+                # FP8 weight + scale sibling. Per-tensor scalar: kept native
+                # (the scalar expands to the [ceil(N/128), ceil(K/128)]
+                # per-block wscale layout so one kernel serves both).
+                # Per-channel [N,1] (Qwen3.8 NVFP4 checkpoint): the block
+                # wscale layout cannot express per-channel scales, so dequant
+                # to the bf16 master (repacked to fp4 below when cfg.fp4).
                 stem = hf_name.removesuffix(".weight")
                 key = _param_key_for(hf_name)
                 if key is not None:
-                    ws = tensors[stem + ".weight_scale"].float().reshape(1)
+                    ws = tensors[stem + ".weight_scale"].float()
                     n, k = tensor.shape
-                    wscale = ws.expand(((n + 127) // 128), ((k + 127) // 128)).contiguous()
-                    fp8_native[key] = (tensor, wscale)
-                    tensor = dequant_fp8(tensor, wscale).to(torch.bfloat16)
+                    if ws.numel() == 1:
+                        wscale = (
+                            ws.reshape(1)
+                            .expand(((n + 127) // 128), ((k + 127) // 128))
+                            .contiguous()
+                        )
+                        fp8_native[key] = (tensor, wscale)
+                        tensor = dequant_fp8(tensor, wscale).to(torch.bfloat16)
+                    else:
+                        tensor = (tensor.float() * ws.reshape(-1, 1)).to(torch.bfloat16)
             elif hf_name.endswith(
                 (
                     ".weight_scale",
