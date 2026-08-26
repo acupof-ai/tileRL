@@ -256,7 +256,9 @@ class Model:
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps)
         hq, hkv, d = cfg.num_attention_heads, cfg.num_kv_heads, cfg.head_dim
         qkv_key = f"{p}.qkv"
-        if f"{qkv_key}.wq" in self.params or f"{qkv_key}.w8" in self.params:  # fused q/k/v (serving)
+        if (
+            f"{qkv_key}.wq" in self.params or f"{qkv_key}.w8" in self.params
+        ):  # fused q/k/v (serving)
             qkv = self._linear(backend, h, qkv_key)
             q_rows = hq * d * (2 if cfg.full_attn_gated else 1)
             q = autograd.slice(qkv, ..., slice(0, q_rows))

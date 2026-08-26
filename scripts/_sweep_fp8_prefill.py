@@ -72,9 +72,7 @@ def _dequant_fp4_macro(out_dtype, local_size):
             cbase = i * local_compress
             nbase = i * local_size
             for v in T.vectorized(local_compress):
-                WQ_local[v] = WQ_shared[
-                    (cbase + v) // (block_K // 2), (cbase + v) % (block_K // 2)
-                ]
+                WQ_local[v] = WQ_shared[(cbase + v) // (block_K // 2), (cbase + v) % (block_K // 2)]
             s = Scale_shared[nbase // block_K, (nbase % block_K) // 32]
             for v in T.serial(local_size):
                 byte = WQ_local[v // 2]
@@ -105,17 +103,11 @@ def _dequant_fp4_int_macro(block_N, block_K):
             cbase = i * local_compress
             nbase = i * local_size
             for v in T.vectorized(local_compress):
-                WQ_local[v] = WQ_shared[
-                    (cbase + v) // (block_K // 2), (cbase + v) % (block_K // 2)
-                ]
+                WQ_local[v] = WQ_shared[(cbase + v) // (block_K // 2), (cbase + v) % (block_K // 2)]
             for v in T.serial(local_size):
                 byte = WQ_local[v // 2]
                 nib = (byte >> ((v % 2) * 4)) & 15
-                b = (
-                    ((nib & 8) << 4)
-                    | ((((nib >> 1) & 3) + 6) << 3)
-                    | ((nib & 1) << 2)
-                )
+                b = ((nib & 8) << 4) | ((((nib >> 1) & 3) + 6) << 3) | ((nib & 1) << 2)
                 W_local[v] = T.reinterpret(T.cast(b, "uint8"), "float8_e4m3fn")
             for v in T.vectorized(local_size):
                 W_shared[(nbase + v) // block_K, (nbase + v) % block_K] = W_local[v]
@@ -235,9 +227,11 @@ def _make_split(target, split, block_N):
         WScale: T.Tensor((N, K // 32), "float32")
         AScale: T.Tensor((M,), "float32")
         Y: T.Tensor((M, N), "float32")
-        with T.Kernel(
-            T.ceildiv(N, block_N), T.ceildiv(M, block_M), split, threads=128
-        ) as (bx, by, bk):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), split, threads=128) as (
+            bx,
+            by,
+            bk,
+        ):
             X_shared = T.alloc_shared((block_M, BK), "float8_e4m3fn")
             WQ_shared = T.alloc_shared((block_N, BK // 2), "uint8")
             W_shared = T.alloc_shared((block_N, BK), "float8_e4m3fn")
@@ -399,9 +393,7 @@ def main():
                 continue
             ms, out, jit = res
             rel_ref = (out.float() - ref).abs().max().item() / ref.abs().max().item()
-            rel_base = (
-                (out.float() - b_out.float()).abs().max().item() / b_out.abs().max().item()
-            )
+            rel_base = (out.float() - b_out.float()).abs().max().item() / b_out.abs().max().item()
             # gate: same math as shipped (rel_base < 1e-2), or strictly more
             # accurate (v_int32: rel_ref below the shipped floor).
             ok = rel_base < 1e-2 or rel_ref < b_rel
