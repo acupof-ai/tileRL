@@ -155,6 +155,27 @@ def test_submit_rollback_and_terminal_failure():
     assert engine.stats()["slots_used"] == 0
 
 
+def test_decode_growth_evicts_finished_prefix():
+    cfg = tiny()
+    engine = build_engine(
+        cfg,
+        build_random(cfg, seed=9),
+        get_backend(),
+        num_blocks=2,
+        num_slots=4,
+        max_batch=4,
+        max_total_tokens=512,
+    )
+    # A decodes past a block boundary so its prefix stays pinned after finish.
+    rid_a = engine.submit([1, 2, 3], SamplingParams(max_new_tokens=20, seed=1))
+    assert len(_drain(engine, [rid_a], 20)[rid_a]) == 20
+    assert engine._kv.free_blocks == 1  # A's published block stays pinned
+    # B's prompt fits the last free block; its decode growth must evict A.
+    rid_b = engine.submit([4, 5, 6], SamplingParams(max_new_tokens=20, seed=2))
+    assert len(_drain(engine, [rid_b], 20)[rid_b]) == 20
+    assert engine._prefix.stats()["evictions"] >= 1
+
+
 def test_stop_token_is_not_returned():
     engine = _build_engine(seed=6)
     engine._sample = lambda *_: 7

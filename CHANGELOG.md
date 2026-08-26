@@ -4,6 +4,18 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-26 — fix: P1 audit batch (engine/KV/server correctness, quantized training, ops isolation)
+
+- **Fixes.** Prefix published at seq_len-1 (was one token ahead — a cache hit
+  silently skipped it); KV eviction under block pressure on submit and decode
+  growth; submit alloc rollback + request failures surfaced via poll/take; EOS
+  stop tokens + finish_reason by cause; tokenizer fails closed on a configured
+  source; quantized training computes with the bf16 master (AdamW updated the
+  master, the fp4/fp8 forward used stale weights); stable CE; Tape reuse guard;
+  torch math above ops/ moved behind backend calls. Deploy: devel image (JIT
+  needs nvcc), tiny default CMD, pod.yaml sets the 27B source. Bench scripts
+  fail closed on busy GPUs and clean the remote dir before sync. 90 passed.
+
 ## 2026-08-26 — accept-or-reject: e5m2 activation precision for fp4 prefill GEMM — REJECTED (0.999x tie, relerr 7.6e-2 vs 1e-2 gate)
 
 - **Verdict.** A=e5m2 arm (W dequant e2m1→e5m2 too — wgmma needs matching fp8

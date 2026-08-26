@@ -1,11 +1,12 @@
-# CUDA 13 runtime base. Why 13:
+# CUDA 13 devel base. Why devel: TileLang JITs CUDA at runtime and needs
+# nvcc + CUDA headers; the runtime image lacks them. Why 13:
 #   - torch 2.13.0 (pinned in uv.lock) is the PyPI CUDA build, which bundles
 #     CUDA 13 userspace libs via pip nvidia-* packages on linux.
 #   - tilelang 0.1.13's nvcc extra pins nvidia-cuda-nvcc>=13.0.48, i.e. the
 #     wheel ecosystem targets CUDA 13.
 # The NVIDIA driver (libcuda.so) is NOT in this image — it comes from the host
 # via the NVIDIA container toolkit at runtime.
-FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -40,4 +41,6 @@ RUN uv sync --frozen --no-dev
 
 EXPOSE 8000
 
-CMD ["/app/.venv/bin/tilerl", "serve", "--model", "qwen38-27b", "--host", "0.0.0.0"]
+# Default starts the tiny model (no checkpoint needed). Production overrides
+# the command: serve --model qwen38-27b with TILERL_QWEN38_SOURCE set.
+CMD ["/app/.venv/bin/tilerl", "serve", "--model", "tiny", "--host", "0.0.0.0"]

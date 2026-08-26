@@ -54,7 +54,11 @@ a checkpoint demands it.
 ## Evidence
 
 - **cpu/bf16**: `uv run pytest` (64 hermetic tests) — kernel-vs-reference
-  parity on every op, tape gradcheck, end-to-end generation + training.
+  parity on every op with a TileLang CPU kernel, tape gradcheck, end-to-end
+  generation + training. Exception: dense/paged attention's CPU forward is
+  the torch-eager reference itself (`backend.attention`, ponytail — no
+  TileLang CPU attention kernel yet), so attention has no independent CPU
+  parity until that kernel lands; sm90 attention parity runs on the pod.
 - **cpu/fp4**: `test_fp4_on_load_and_forward` (pack-on-load + forward through
   the fp4 linear), `test_fp4_roundtrip` (wire format), STE backward covered by
   the production-model gradcheck.

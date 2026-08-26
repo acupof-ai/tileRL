@@ -12,6 +12,7 @@ spec:
       # registry and change this if deploying to a remote cluster.
       image: tilerl:latest
       imagePullPolicy: IfNotPresent
+      args: ["serve", "--model", "qwen38-27b", "--host", "0.0.0.0"]
       ports:
         - containerPort: 8000
       env:
@@ -19,6 +20,10 @@ spec:
           value: cuda
         - name: HF_ENDPOINT
           value: https://hf-mirror.com
+        # 27B checkpoint source (hub id or local directory). Must point at a
+        # real source — the CLI fails fast on a missing one.
+        - name: TILERL_QWEN38_SOURCE
+          value: Qwen/Qwen3-27B
       resources:
         limits:
           nvidia.com/gpu: "1"

@@ -517,8 +517,16 @@ class Engine:
         1 token at t=0; the prefill row: its chunk), with per-row
         ``seq_q_lens`` so the kernels touch only valid positions.
         """
+        growth = sum(
+            max(0, (r.seq_len + BLOCK_TOKENS) // BLOCK_TOKENS - len(r.blocks)) for r in decodes
+        )
+        if growth:
+            evict = getattr(self._prefix, "evict_until_free", None)
+            if evict is not None:
+                evict(growth)
         for r in decodes:
             # Blocks must cover the new token at position r.seq_len.
+            # Exhaustion raises -> step() finishes the running requests.
             while len(r.blocks) * BLOCK_TOKENS <= r.seq_len:
                 r.blocks.append(self._kv.alloc_block())
                 r.own_blocks += 1
