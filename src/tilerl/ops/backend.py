@@ -515,9 +515,12 @@ class Backend:
         sql = getattr(kv, "seq_q_lens", None)
         if sql is None:
             sql = torch.full((b,), s, dtype=torch.int32)
+        # .contiguous(): the ABI is packed. A bf16 view (e.g. v sliced from
+        # the fused-qkv GEMV output) survives _dev's no-op cast and violates
+        # it at B>=2; the f32 WGMMA path's cast already copied.
         self._kernel("write_tokens")(
-            self._dev(k, torch.bfloat16),
-            self._dev(v, torch.bfloat16),
+            self._dev(k, torch.bfloat16).contiguous(),
+            self._dev(v, torch.bfloat16).contiguous(),
             pool.k_pool[layer_idx],
             pool.v_pool[layer_idx],
             self._i32(kv.block_table).contiguous(),
