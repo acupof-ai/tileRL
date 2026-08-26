@@ -4,6 +4,20 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-26 — accept-or-reject: 8-way K-split for small-M fp4 decode — ACCEPTED (+7.5% B=8 aggregate)
+
+- **Verdict.** The decode tick (M<=16) ran the prefill kernel's 2-way
+  K-split; at bM=16 a block is 2 warps, so the split's resident warps hide
+  HBM latency and the f32 atomics cost less than the occupancy they buy.
+  Same-process A/B on the slice4 decode graph (30-tick avg, control =
+  shipped ks2): B=2 +8.8%, B=4 +8.1%, B=8 +7.5%, B=1 neutral (M=1 path
+  untouched). fro-relerr vs shipped ~1e-7 (atomic reordering); greedy
+  tokens flip on near-ties at B=4/8, below the shipped path's own 2% e4m3
+  quant noise. Sweep: ks1 -10.8% (hypothesis backwards — the split is
+  occupancy, not atomics), ks4 +5.1%, ks8 +7.5%; bf16-A WGMMA rejected
+  (-13%, gate-fail). Entry:
+  `docs/experience/wins/2026-08-26-batch-decode-h2.md`.
+
 ## 2026-08-26 — accept-or-reject: batched-decode arms (shared-X small-M GEMV + k_split=1 WGMMA) — REJECTED (smallm 2.18x slower, ks1 -2.6%)
 
 - **Verdict.** Both B=2..8 decode levers lost the A/B (slice4 graph, B=8,
@@ -17,8 +31,9 @@ verdict**. Newest first.
   the split doubles per-tile dequant parallelism (two SMs on the same
   tile's K-range), load-bearing for the fp4 WGMMA path. Both correct
   (ks1 bit-identical to shipped, fro-relerr 0.0, tokens identical); B=1
-  neutral. Reverted (no half-states); the B=8 lever is dead. Entry:
-  `docs/experience/errors/2026-08-26-batch-decode-arms-rejected.md`.
+  neutral. Reverted (no half-states). The K-split lever itself was not
+  dead — the winning move was ks8, not ks1: see the ACCEPTED entry above.
+  Entry: `docs/experience/errors/2026-08-26-batch-decode-arms-rejected.md`.
 
 ## 2026-08-26 — accept-or-reject: fp4 GEMV dequant issue throughput — REJECTED (PRMT 0.85x, MMA 0.50x; prmt.b32 compiler bug)
 
