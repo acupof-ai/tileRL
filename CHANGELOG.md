@@ -4,6 +4,20 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-26 — accept-or-reject: fp4 GEMV dequant issue throughput — REJECTED (PRMT 0.85x, MMA 0.50x; prmt.b32 compiler bug)
+
+- **Verdict.** Replacing the shipped shuffle-LUT dequant with `__byte_perm`
+  (PRMT) or MMA (tensor-core) does not beat the shipped GEMV at M=1. Matrix
+  A/B on lm_head (N=248320, K=5120): PRMT scalar 0.6128 ms vs shipped 0.5215
+  (0.851x, 15% slower — 12 prmt/8 elems vs 8 shuffles/8 elems); MMA at
+  block_M=16 1.0353 ms (0.504x, 16x M-waste). The shuffle LUT is already at
+  1 op/elem (the floor) and overlaps with the FMA chain — the kernel is at
+  55.4% roof, within 3% of the 57% nodecode floor. Secondary finding:
+  `prmt.b32` on CUDA 12.9 / sm_90 silently truncates the 32-bit selector to
+  16 bits (standalone CUDA repro, no tilelang) — selectors with non-zero
+  upper 16 bits produce wrong results. Entry:
+  `docs/experience/errors/2026-08-26-fp4-gemv-dequant-issue-rejected.md`.
+
 ## 2026-08-26 — accept-or-reject: small-M GEMV for B=2..8 decode — REJECTED (1.56-1.61x slower than the padded WGMMA path)
 
 - **Verdict.** Generalized the fp4/bf16/fp8 GEMV from M=1 to fixed M=8
