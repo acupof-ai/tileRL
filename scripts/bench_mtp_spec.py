@@ -95,7 +95,10 @@ def main() -> None:
     for B in (1, 8):
         prompt = _rand_prompt(cfg.vocab_size, args.prompt_len, seed=11)
         sp = SamplingParams(temperature=0.0, max_new_tokens=args.n_decode, seed=42)
-        warmup = B + 4
+        # Warmup: B requests stagger into decode over ~2B ticks (each prefill
+        # spans a large chunk + a small remainder, one prefill per tick), then
+        # a few spec ticks cover the T=2 + MTP + rollback JIT.
+        warmup = 2 * B + 8
 
         # Warmup + losslessness.
         wids_off = [eng_off.submit(prompt, sp) for _ in range(B)]
