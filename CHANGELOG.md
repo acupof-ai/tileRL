@@ -4,6 +4,19 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-27 — phase exit: adversarial defect audit of the 27B serving path
+
+- **Exit.** 30 findings raised, 1 refuted, 5 duplicates merged — **24 distinct
+  defects**, ranked by how silently each fails. Landed same-day: the four
+  checkpoint cross-checks `_validate_hf_config` never had (rope_theta,
+  partial_rotary_factor, rope_scaling, tie_word_embeddings) plus a derived tie
+  check against the shard's own tensors — the class that already voided one
+  shipped measurement; and `_prefix_state` snapshots (74.81 MiB each at 27B)
+  now die with their `PrefixStore` entry instead of growing without bound.
+  Everything else needs the pod: the ceiling is the fp4 GEMVs at 33% of roof,
+  and the 24 fixes together are worth ~2.65 ms of the 19.03 ms tick.
+  Briefing: `docs/experience/2026-08-27-defect-audit.md`.
+
 ## 2026-08-26 — phase exit: native fp4 w4a8 load path
 
 - **Exit.** The NVFP4 checkpoint's bytes are now the serving format. OCP e2m1
@@ -18,8 +31,11 @@ verdict**. Newest first.
   load-time conversion table, and the linear-family dispatch collapsed from 19
   string checks to `_CUDA_PLAN` (175 -> 88 non-blank lines, 49.7%), fixing a
   latent out-of-bounds N pad on the fp4->e4m3 arms. 27B weight memory 65.0 ->
-  20.3 GiB (pod confirmation pending-remote). Suite 90 -> 96 passed / 4
-  skipped.
+  **20.3 GiB params-only / 25.04 GiB actually resident** — corrected
+  2026-08-27: the original 20.3 counted `model.params` and missed
+  `Backend._embed_table_f32`'s permanent 4.736 GiB f32 copy of the embedding
+  table (audit M2; fix is a bf16 `Table` in the sm90 kernel cell, not done).
+  Pod confirmation pending-remote. Suite 90 -> 96 passed / 4 skipped.
   Entry: `docs/experience/wins/2026-08-26-native-fp4-w4a8.md`.
 
 ## 2026-08-26 — default flip: `load_hf` / `build_random` `keep_master=False`

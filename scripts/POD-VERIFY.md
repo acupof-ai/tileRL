@@ -11,6 +11,53 @@ anything else and refuses a GPU that is busy — do not talk it out of that.
 
 ---
 
+## Before you start — four things, ~3 minutes, all before the 6-minute load
+
+1. **Read the checkpoint's own `config.json`.**
+
+   ```bash
+   ~/bin/pod 'cat /data00/Qwen3.8-27B-NVFP4/config.json'
+   ```
+
+   `_validate_hf_config` now hard-raises on `rope_theta != 1e7`, a
+   `partial_rotary_factor` that does not give rotary_dim 64, any `rope_scaling`
+   whose `rope_type` is outside `(None, "default")` or whose `factor != 1.0`,
+   and `tie_word_embeddings != false` — and it raises **after** ~360 s of CPU
+   dequant. A YaRN block at `max_position_embeddings=262144` is entirely
+   plausible on this checkpoint. Read those five, plus the four `linear_*`
+   fields and the NVFP4 block size (16, vs `pack_fp4`'s default 32), then
+   launch. The harness prints the five itself just before the load: **`None`
+   means the key is ABSENT**, and an absent key is validated by nothing — the
+   guards fire only on present-and-wrong.
+
+2. **Prove the tokenizer imports on the pod's interpreter.**
+
+   ```bash
+   ~/bin/pod 'cd /work/tilerl && PYTHONPATH=src python3 -c "from tilerl.server import get_tokenizer; print(get_tokenizer(\"/data00/Qwen3.8-27B-NVFP4\").encode(\"The capital of France is\"))"'
+   ```
+
+   `--selftest` skips the tokenizer entirely, so it does not cover this.
+   `check_logits` imports `tilerl.server`, which imports fastapi and pydantic
+   at module level; any ImportError is caught, check 2 silently falls back to
+   three **synthetic** id sequences, prints `texts ['','','']`, and still
+   records PASS. That is the exact shape of the defect that voided the
+   baseline's logits.
+
+3. **Commit before syncing.** `pod_sync.sh` tars the working tree
+   (`--exclude=.git`) while §2's launch line stamps the JSON with
+   `git rev-parse --short HEAD` — with anything uncommitted the report names a
+   commit that does not contain what ran. Commit, or pass
+   `BENCH_COMMIT=<sha>-dirty`.
+
+4. **Budget the window: `--skip 5` on the first pass.** Check 5 costs 10-30 min
+   to attribute a scale-traffic delta worth ~1.7 GiB of a 20.4 GB tick. The
+   first-order question — is linear time really ~14.3 ms, and what fraction of
+   3.3 TB/s does the fp4 GEMV reach — decides whether anything else in the
+   audit matters, and this harness does not answer it at all.
+   `scripts/profile_decode_tick.py` does, in ~20 min on the already-loaded
+   model, and has never been run on the 27B; `bench_fp4_gemv.py` answers the
+   block question in 30 s. `--skip 5` exits 1 by design.
+
 ## 0. Claim a GPU and sync
 
 ```bash
@@ -80,23 +127,46 @@ never tested.
 
 ### 1 — native fp4, no bf16 masters
 
-Prints measured weight bytes broken down by storage class (`.wq` / `.scale` /
-`.oscale` / `.w8` / `.wscale` / bare bf16), `torch.cuda.memory_allocated`,
-`memory_reserved`, and `nvidia-smi` resident, against the refactor's
-**computed** 20.3 GiB (pre-refactor computed 65.0; 628c82d **measured** 67.9
-GiB resident). A computed number is not a measurement — both are printed with
-their ratio.
+**Runs AFTER the warmup, on purpose.** `Backend._embed_table_f32` casts the
+whole embedding table to f32 on the *first embedding call* and holds it for
+process life, so a sample taken at load time misses 4.736 GiB. This check used
+to sample early and sum `model.params` only — it would have printed a
+comfortable PASS with that tonnage uncounted.
+
+Prints weight bytes by storage class (`.wq` / `.scale` / `.oscale` / `.w8` /
+`.wscale` / bare bf16), then resident bytes **by source** — packed, bare bf16,
+the f32 embedding cast, the KV pool, the GDN state pool, and the residual
+against `torch.cuda.memory_allocated` — plus `memory_reserved`, peak, and
+`nvidia-smi` resident, and the allocator delta across the warmup. Both weight
+figures are stated: params-only, and params + cast.
 
 - **FAIL "N bf16 masters still resident"** — `keep_master=False` did not take
   and the model is carrying the ~48 GiB it was supposed to delete. The
   refactor's core claim is false. Look at `model.py` `load_hf`'s tail.
 - **FAIL "bare tensors > 4.0 GiB"** — same failure seen from the other side
   (the embedding table alone is ~2.4 GiB, everything else should be quantized).
-- **Measured ≫ 20.3 GiB with no masters** — not a failure and not gated. The
-  20.3 is COMPUTED and it assumed every linear is fp4; the per-channel FP8
-  ones stay at 1 byte/elem (~47% of the stream). Expect ~22 GiB and correct
-  the entry's table to the measured breakdown. The gate is masters + bare
-  bytes, which is the thing that would actually be a regression.
+- **"f32 embedding cast" ≈ 4.7 GiB** — expected, not a failure and not gated.
+  It is known defect M2 (`docs/experience/2026-08-27-defect-audit.md`); the fix
+  is a bf16 `Table` in `_SM90_KERNELS`, which is follow-on structural work.
+  A **0** there means the fix landed — or that `Backend._embed_f32` was
+  renamed and the harness is reading an attribute that no longer exists. It
+  exists today, so a 0 tomorrow is real; check the name before believing it.
+- **"KV pool" over-reads by 4x.** The pool is shaped on all 64 layers
+  (`kv_cache.py:98`) and only the 16 full-attention planes are ever written
+  (audit M3), so at `--num-blocks 1024` the line prints 4.00 GiB where 1.00 is
+  reachable. Nothing gates on it and nothing OOMs; annotate the number when
+  transcribing it into the wins entry.
+- **The residual is not a cross-check.** "everything else" is defined as
+  `allocated − named subtotal`, so the breakdown sums to
+  `torch.cuda.memory_allocated()` by construction and a mis-measured source
+  just moves into the residual. The one independent signal is the
+  `torch allocated X -> Y GiB across the warmup` delta: read it against the
+  4.736 GiB cast row, and treat a large unexplained residual as a finding.
+- **Nothing is gated on a total.** The 20.3 GiB is COMPUTED, params-only, and
+  it assumed every linear is fp4 (the per-channel FP8 ones stay at 1 byte/elem,
+  ~47% of the stream). Expect ~22 GiB params, ~27 GiB resident. The gate is
+  masters + bare bytes, which is the thing that would actually be a regression;
+  the totals are reported so the entry's table can be corrected to measurement.
 
 ### 2 — the logits are not void
 
@@ -113,7 +183,9 @@ continuations.
   `lm_head.weight` actually landed.
 - **FAIL "degenerate"** — signal is dying somewhere in the stack. Next tool is
   `scripts/diag_slice.py`, which prints every rmsnorm output norm and the final
-  logits std.
+  logits std. Read the raw ids first: greedy decode now stops on the
+  tokenizer's `<|im_end|>`/`<|endoftext|>` set, but a healthy model that emits
+  one of them inside 8 tokens still trips the "only N tokens generated" arm.
 - **WARNING "no tokenizer"** — `tokenizer.json` is missing from the checkpoint
   dir. The gates still run on token ids, but read the ids yourself; do not
   claim the text is sane without seeing it.
@@ -164,8 +236,12 @@ by itself something to revert. The old baseline was also partly fast *because*
 it was wrong: it re-quantized the per-channel FP8 weights down to 4 bits and
 served the wrong `lm_head`.
 
-- **FAIL "decode < 0.95x"** — the refactor cost decode time. Do not guess why:
-  check 5 runs next and attributes one of the four changes (see §7).
+- **FAIL "decode < 0.95x"** — **read this verdict as INFO.** The baseline is a
+  differently-shaped model (628c82d kept bf16 masters resident, requantized the
+  per-channel FP8 weights to 4 bits, and served `embed_tokens` as `lm_head`),
+  and the gate is a hard `>= 0.95` against a table value from another day.
+  0.90-0.95x is not a revert signal. Do not guess why: check 5 runs next and
+  attributes one of the four changes (see §7).
 - **FAIL "decode graph OFF at B=1"** — the tick fell back to eager and the B=1
   numbers are not comparable to the baseline. Rerun. A capture failure at B=8
   alone prints a NOTE and leaves B=1 standing; the flag is snapshotted per

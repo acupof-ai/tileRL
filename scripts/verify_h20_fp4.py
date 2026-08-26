@@ -4,9 +4,15 @@ Five checks, one process, one summary table. Everything the 2026-08-26
 native-fp4 entry claims but could not measure on a GPU-less host:
 
   1  memory  — the 27B loads with the checkpoint's own nibbles and NO bf16
-               master. MEASURED weight bytes + torch allocator + nvidia-smi
+               master. Runs AFTER the warmup and breaks resident bytes down by
+               source (packed / bare bf16 / the f32 embedding cast / KV pool /
+               residual), because ``model.params`` is NOT the resident total:
+               the sm90 cell's f32 embedding ``Table`` forces a 4.7 GiB f32
+               copy of the table into existence on the first embedding call and
+               holds it for process life (audit M2). Reports the honest number
                against the refactor's COMPUTED 20.3 GiB (was 65.0, and the
-               628c82d baseline measured 67.9 GiB resident).
+               628c82d baseline measured 67.9 GiB resident); gates only on
+               "no bf16 master survived".
   2  logits  — greedy-decode real prompts and print the text. A loader that
                succeeds is not evidence: 628c82d served perfect throughput
                through the WRONG lm_head. Gates on non-degenerate output and
@@ -233,9 +239,27 @@ def _weight_bytes(params) -> dict[str, int]:
     return out
 
 
-def check_memory(model, backend, gpu: int | None):
+def _tensor_bytes(*ts) -> int:
+    return sum(t.numel() * t.element_size() for t in ts if t is not None)
+
+
+def _sz(b: float) -> str:
+    """GiB, but MiB below 1 GiB — the tiny selftest would print every source as
+    0.000 GiB, which is the reporting blind spot this check exists to remove."""
+    return f"{b / GIB:8.3f} GiB" if abs(b) >= GIB else f"{b / 2**20:8.1f} MiB"
+
+
+def check_memory(model, backend, engine, gpu: int | None, by: dict[str, int], pre_warm: float):
+    """Resident memory AFTER the warmup, attributed to named sources.
+
+    ``model.params`` is not the resident total. ``Backend._embed_table_f32``
+    holds an f32 copy of the embedding table (248320x5120 = 4.736 GiB at 27B)
+    for process life, solely because the sm90 kernel cell inherits the CPU
+    cell's f32 ``Table`` — audit M2. It does not exist until the first
+    embedding call, so sampling before the warmup (what this check used to do)
+    printed a comfortable PASS with that tonnage uncounted.
+    """
     params = model.params
-    by = _weight_bytes(params)
     total = sum(by.values())
     masters = sorted(k for k in params if f"{k}.wq" in params or f"{k}.w8" in params)
     bare = sum(v for c, v in by.items() if c.startswith("bare/"))
@@ -249,31 +273,57 @@ def check_memory(model, backend, gpu: int | None):
     print("  storage class            GiB")
     for cls, b in sorted(by.items(), key=lambda kv: -kv[1]):
         print(f"    {cls:<22} {b / GIB:8.3f}")
-    print(f"    {'TOTAL (weights)':<22} {total / GIB:8.3f}")
+    print(f"    {'TOTAL (model.params)':<22} {total / GIB:8.3f}")
     print(f"  quantized tensors: {quant_keys}   bf16-master keys beside them: {len(masters)}")
     print("  largest bare tensors: " + ", ".join(f"{k} {b / GIB:.2f}G" for b, k in big_bare))
 
-    alloc = res = smi_used = float("nan")
+    packed = sum(v for c, v in by.items() if c in suffixes)
+    # `t is ref()` means _dev found the table already f32 and returned it — no
+    # second allocation, and counting it would double-count a params tensor.
+    cast = _tensor_bytes(
+        *(t for r, _, t in getattr(backend, "_embed_f32", {}).values() if t is not r())
+    )
+    kv, st = engine._kv, engine._states
+    src = {
+        "packed fp4/fp8 weights": packed,
+        "non-quantized weights (bare)": total - packed,
+        "f32 embedding cast (DEFECT M2)": cast,
+        "KV pool": _tensor_bytes(kv.k_pool, kv.v_pool),
+        "GDN state pool": _tensor_bytes(st.states, st.conv_windows),
+    }
+    named_gib = sum(src.values()) / GIB
+
+    alloc = res = peak = smi_used = float("nan")
     if backend.device.type == "cuda":
         alloc = torch.cuda.memory_allocated() / GIB
         res = torch.cuda.memory_reserved() / GIB
         peak = torch.cuda.max_memory_allocated() / GIB
         rows = _smi("memory.used", gpu, fatal=False)
         smi_used = int(rows[0][0]) / 1024.0 if rows else float("nan")
+
+    print("\n  resident source (post-warmup)")
+    for name, b in src.items():
+        print(f"    {name:<35} {_sz(b)}")
+    print(f"    {'named subtotal':<35} {_sz(named_gib * GIB)}")
+    if backend.device.type == "cuda":
+        print(f"    {'everything else (residual)':<35} {_sz((alloc - named_gib) * GIB)}")
+        print(f"    {'torch allocated':<35} {_sz(alloc * GIB)}")
         print(
-            f"  torch allocated {alloc:.2f} GiB | reserved {res:.2f} GiB | "
-            f"peak-allocated {peak:.2f} GiB | nvidia-smi used {smi_used:.2f} GiB"
+            f"  torch allocated {pre_warm:.2f} -> {alloc:.2f} GiB across the warmup "
+            f"(+{alloc - pre_warm:.2f}) | reserved {res:.2f} | "
+            f"peak-allocated {peak:.2f} | nvidia-smi used {smi_used:.2f}"
         )
-    ratio = total / GIB / CLAIM_GIB["after"]
     print(
-        f"  MEASURED weights {total / GIB:.2f} GiB vs COMPUTED {CLAIM_GIB['after']} GiB "
-        f"= {ratio:.3f}x   (pre-refactor computed {CLAIM_GIB['before']} GiB, "
-        f"628c82d measured {BASE['resident_gib']} GiB resident)"
+        f"  HONEST resident weights {_sz(total + cast)} = params {_sz(total)} "
+        f"+ f32 embedding cast {_sz(cast)}   (the doc's COMPUTED "
+        f"{CLAIM_GIB['after']} GiB counts params only; pre-refactor computed "
+        f"{CLAIM_GIB['before']}, 628c82d measured {BASE['resident_gib']} resident)"
     )
 
-    # The ratio is reported, not gated: the 20.3 GiB is a COMPUTED number that
-    # assumed every linear is fp4, and the per-channel FP8 ones stay at 1 B/elem.
-    # Masters + bare bytes are the real gate on "no bf16 master survived".
+    # Gates on "no bf16 master survived", never on a total. The 20.3 GiB is a
+    # COMPUTED params-only number that assumed every linear is fp4 (the
+    # per-channel FP8 ones stay at 1 B/elem) and that the M2 cast already
+    # breaks — gating on it would either lie green or fail on a known defect.
     ok = not masters and bare / GIB <= 4.0 and quant_keys > 0
     why = []
     if masters:
@@ -286,19 +336,25 @@ def check_memory(model, backend, gpu: int | None):
         1,
         "native fp4, no bf16 masters",
         "PASS" if ok else "FAIL",
-        f"weights {total / GIB:.2f} GiB = {ratio:.2f}x the computed {CLAIM_GIB['after']}; "
-        f"smi {smi_used:.1f} GiB; {quant_keys} quantized tensors, {len(masters)} masters"
+        f"resident weights {_sz(total + cast).strip()} = params {_sz(total).strip()} "
+        f"+ f32 embedding cast {_sz(cast).strip()} (doc computes {CLAIM_GIB['after']} GiB, "
+        f"params only); torch allocated {alloc:.2f}, smi {smi_used:.1f} GiB; "
+        f"{quant_keys} quantized tensors, {len(masters)} masters"
         + ("" if ok else "  <-- " + "; ".join(why)),
-        measured_weight_gib=total / GIB,
+        params_gib=total / GIB,
+        embed_cast_gib=cast / GIB,
+        resident_weight_gib=(total + cast) / GIB,
         computed_claim_gib=CLAIM_GIB["after"],
-        ratio=ratio,
+        torch_allocated_pre_warmup_gib=_nn(pre_warm),
         torch_allocated_gib=_nn(alloc),
         torch_reserved_gib=_nn(res),
+        torch_peak_allocated_gib=_nn(peak),
         smi_used_gib=_nn(smi_used),
+        residual_gib=_nn(alloc - named_gib),
         by_class_gib={c: b / GIB for c, b in by.items()},
+        by_source_gib={c: b / GIB for c, b in src.items()},
         masters=masters[:8],
     )
-    return by
 
 
 # ------------------------------------------------------------------ check 2
@@ -336,7 +392,12 @@ def check_logits(engine, cfg, source: str, selftest: bool):
     outs, texts = [], []
     for i, prompt in enumerate(PROMPTS):
         ids = tok.encode(prompt) if tok else [(i * 97 + j * 13) % cfg.vocab_size for j in range(16)]
-        wid = engine.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=48, seed=0))
+        # Without the stop set, greedy decode runs 48 ticks past <|im_end|> and
+        # the repeated id trips _degenerate — a false FAIL on a healthy model.
+        stops = tuple(getattr(tok, "stop_token_ids", ()))
+        wid = engine.submit(
+            ids, SamplingParams(temperature=0.0, max_new_tokens=48, seed=0, stop_token_ids=stops)
+        )
         out = _drive(engine, wid, 512)
         outs.append(out)
         texts.append(tok.decode(out) if tok else "")
@@ -760,6 +821,28 @@ def _build(cfg, model, backend, args):
     )
 
 
+def _print_rope_tie(source: str) -> None:
+    """`_validate_hf_config`'s rope/tie guards raise only on a key that is
+    PRESENT and wrong, so an absent one is unchecked and invisible. Print the
+    raw five before the 6-minute load — `None` means nothing validated it."""
+    with open(os.path.join(source, "config.json")) as f:
+        hf = json.load(f)
+    txt = hf.get("text_config", hf)
+    rope = txt.get("rope_parameters") or {}
+    vals = {
+        "rope_theta": rope.get("rope_theta", txt.get("rope_theta")),
+        "partial_rotary_factor": rope.get(
+            "partial_rotary_factor", txt.get("partial_rotary_factor")
+        ),
+        "rope_scaling": txt.get("rope_scaling"),
+        "rope_parameters.rope_type": rope.get("rope_type"),
+        "tie_word_embeddings": hf.get("tie_word_embeddings", txt.get("tie_word_embeddings")),
+    }
+    print("  config.json rope/tie (None = ABSENT, hence unvalidated):", flush=True)
+    for k, v in vals.items():
+        print(f"    {k:<26} {v!r}", flush=True)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("source", nargs="?", default="/data00/Qwen3.8-27B-NVFP4")
@@ -810,22 +893,23 @@ def main() -> None:
         if "model.safetensors" not in shards:
             _die(f"{args.source} has no model.safetensors (found {sorted(shards)[:4]})")
         print(f"checkpoint: {args.source} ({sorted(shards)})", flush=True)
+        _print_rope_tie(args.source)
         cfg = qwen38_27b()
         t0 = time.perf_counter()
         model = load_hf(cfg, args.source, fuse_projections=True)
         print(f"load: {time.perf_counter() - t0:.1f}s", flush=True)
 
     engine = _build(cfg, model, backend, args)  # materialize() moves params to the device
+    pre_warm = torch.cuda.memory_allocated() / GIB if backend.device.type == "cuda" else float("nan")
     if backend.device.type == "cuda":
         free, total = torch.cuda.mem_get_info()
         print(
             f"gpu: {torch.cuda.get_device_name(0)} | after engine build "
-            f"{(total - free) / GIB:.1f}/{total / GIB:.1f} GiB",
+            f"{(total - free) / GIB:.1f}/{total / GIB:.1f} GiB | torch allocated {pre_warm:.2f} GiB",
             flush=True,
         )
 
-    by = run_check(1, "native fp4, no bf16 masters", lambda: check_memory(model, backend, PINNED_GPU), skip)
-    by = by or _weight_bytes(model.params)
+    by = _weight_bytes(model.params)
     # bytes the decode tick streams: every linear weight, every tick. The
     # embedding table is a single-row gather, not a stream.
     emb = sum(
@@ -836,6 +920,16 @@ def main() -> None:
 
     _warmup(engine, cfg)
     print(f"decode_graph_on: {engine._decode_graph_on}", flush=True)
+
+    # Check 1 runs AFTER the warmup on purpose: _embed_table_f32's f32 copy of
+    # the embedding table does not exist until the first embedding call, and
+    # sampling before it reported a comfortable PASS with 4.7 GiB uncounted.
+    run_check(
+        1,
+        "native fp4, no bf16 masters",
+        lambda: check_memory(model, backend, engine, PINNED_GPU, by, pre_warm),
+        skip,
+    )
 
     run_check(2, "logits are not void", lambda: check_logits(engine, cfg, args.source, args.selftest), skip)
     run_check(3, "w4a8 e4m3 range invariant", lambda: check_w4a8(model, backend, args.sample), skip)
