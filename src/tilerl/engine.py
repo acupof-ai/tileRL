@@ -252,12 +252,11 @@ class Engine:
 
         # Prefix-boundary state snapshots, keyed by the matched token tuple
         # (collision-safe: a hash-only key could restore the wrong GDN state on
-        # a hash collision). The engine is the sole publisher, so a hit always
-        # finds its entry. Entries may outlive store eviction; they are small
-        # and the snapshot is deterministic per (model, tokens), so a stale
-        # entry stays correct. # ponytail: prune on store eviction day-2.
+        # a hash collision). One snapshot is 74.81 MiB at 27B, so it lives and
+        # dies with its store entry: the store drops ours on eviction, and a
+        # key present here is exactly a key the store still holds.
         self._prefix_state: dict[tuple[int, ...], tuple[torch.Tensor, "torch.Tensor | None"]] = {}
-        self._published: set[tuple[int, ...]] = set()
+        prefix_store.on_evict = lambda tokens: self._prefix_state.pop(tokens, None)
 
         self._blocks_used = 0  # engine allocations outstanding (retains excluded)
         self._slots_used = 0
@@ -301,6 +300,9 @@ class Engine:
                 return rid
 
             matched, hit_blocks = self._match_prefix(tokens)
+            # Read the snapshot now: evict_until_free below can drop the very
+            # store entry we matched, and on_evict takes the snapshot with it.
+            snap = self._prefix_state[self._snapshot_key(tokens[:matched])] if matched else None
             if matched:
                 self._prefix_hits += 1
             else:
@@ -331,7 +333,7 @@ class Engine:
             self._blocks_used += own_blocks
             self._slots_used += 1
             if matched:
-                snap_states, snap_windows = self._prefix_state[self._snapshot_key(tokens[:matched])]
+                snap_states, snap_windows = snap
                 self._states.states[slot].copy_(snap_states)
                 if snap_windows is not None:
                     self._states.conv_windows[slot].copy_(snap_windows)
@@ -629,14 +631,13 @@ class Engine:
         tokens = req.tokens[:length]
         self._prefix.insert(tokens, req.blocks[: length // BLOCK_TOKENS])
         key = self._snapshot_key(tokens)
-        if key not in self._published:
-            self._published.add(key)
+        if key not in self._prefix_state:
             windows = self._states.conv_windows
             self._prefix_state[key] = (
                 self._states.states[req.state_slot].clone(),
                 windows[req.state_slot].clone() if windows is not None else None,
             )
-            self._prefix_published += 1
+            self._prefix_published += 1  # snapshots written; an evicted prefix republishes
 
     def _finish(self, req: _Req, error: str | None = None) -> None:
         # Resources are freed at finish (not at poll) so pool capacity returns

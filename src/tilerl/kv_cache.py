@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 import torch
 
@@ -321,7 +321,9 @@ class PrefixStore:
     Collision-safe: hash hits are verified against the stored token contents,
     so a colliding entry with different tokens is a miss. Insert retains
     every block in the pool; FIFO eviction at ``capacity`` releases them.
-    Blocks a live slot still holds stay allocated.
+    Blocks a live slot still holds stay allocated. ``on_evict`` (set by the
+    engine) is called with an evicted entry's tokens so side tables keyed by
+    the same tuple cannot outlive it.
     """
 
     def __init__(
@@ -331,6 +333,7 @@ class PrefixStore:
     ) -> None:
         self._pool = pool
         self.capacity = capacity
+        self.on_evict: Callable[[tuple[int, ...]], None] | None = None
         self._roll = _rolling_hash
         self._entries: dict[int, list[_Entry]] = {}
         self._by_id: dict[int, _Entry] = {}
@@ -412,6 +415,8 @@ class PrefixStore:
             del self._entries[entry.h]
         for b in entry.blocks:
             self._pool.free_block(b)
+        if self.on_evict is not None:
+            self.on_evict(entry.tokens)
         self.evictions += 1
 
     def stats(self) -> dict[str, int]:

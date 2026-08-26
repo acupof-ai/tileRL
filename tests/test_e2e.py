@@ -20,7 +20,7 @@ import torch
 
 from tilerl.autograd import AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
 from tilerl.config import tiny
-from tilerl.engine import _PHASE_DECODE, Engine, SamplingParams, build_engine
+from tilerl.engine import BLOCK_TOKENS, _PHASE_DECODE, Engine, SamplingParams, build_engine
 from tilerl.model import build_random, fp4_param_keys, param_specs
 from tilerl.ops.backend import get_backend
 from tilerl.ops.reference import pack_fp4
@@ -175,6 +175,49 @@ def test_decode_growth_evicts_finished_prefix():
     rid_b = engine.submit([4, 5, 6], SamplingParams(max_new_tokens=20, seed=2))
     assert len(_drain(engine, [rid_b], 20)[rid_b]) == 20
     assert engine._prefix.stats()["evictions"] >= 1
+
+
+def test_prefix_snapshots_die_with_their_store_entry():
+    """Boundary snapshots are 74.81 MiB each at 27B: an evicted store entry
+    must take its snapshot with it, or a long session OOMs the allocator."""
+    cfg = tiny()
+    engine = build_engine(
+        cfg,
+        build_random(cfg, seed=9),
+        get_backend(),
+        num_blocks=2,
+        num_slots=4,
+        max_batch=4,
+        max_total_tokens=512,
+    )
+    for i in range(4):
+        rid = engine.submit([i + 1, i + 2, i + 3], SamplingParams(max_new_tokens=20, seed=i))
+        assert len(_drain(engine, [rid], 20)[rid]) == 20
+    assert engine._prefix.stats()["evictions"] >= 1
+    assert len(engine._prefix_state) == engine._prefix.stats()["entries"]
+
+
+def test_prefix_hit_survives_evicting_its_own_entry():
+    """submit()'s own evict_until_free can evict the entry it just matched;
+    the snapshot must be read before that, not after."""
+    cfg = tiny()
+    engine = build_engine(cfg, build_random(cfg, seed=9), get_backend(), num_blocks=8, num_slots=4)
+
+    def publish(toks, n):
+        blocks = [engine._kv.alloc_block() for _ in range(n)]
+        engine._prefix.insert(list(toks), blocks)
+        for b in blocks:
+            engine._kv.free_block(b)  # the store keeps its own retain
+
+    tokens = list(range(1, 4 * BLOCK_TOKENS + 1))
+    key = tuple(tokens[: 2 * BLOCK_TOKENS])
+    publish(key, 2)  # the matched entry, at the FIFO head
+    engine._prefix_state[key] = (engine._states.states[0].clone(), None)
+    publish(range(9000, 9000 + 2 * BLOCK_TOKENS), 2)  # younger, unretained
+    [engine._kv.alloc_block() for _ in range(engine._kv.free_blocks - 1)]
+
+    rid = engine.submit(tokens, SamplingParams(max_new_tokens=4))
+    assert engine._prefix.stats()["evictions"] >= 1 and rid > 0
 
 
 def test_stop_token_is_not_returned():
