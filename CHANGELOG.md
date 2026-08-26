@@ -15,6 +15,18 @@ verdict**. Newest first.
   torch math above ops/ moved behind backend calls. Deploy: devel image (JIT
   needs nvcc), tiny default CMD, pod.yaml sets the 27B source. Bench scripts
   fail closed on busy GPUs and clean the remote dir before sync. 90 passed.
+## 2026-08-26 — accept-or-reject: block_M sweep under k_split for fp4 prefill GEMM — REJECTED (shipped bM=128 wins geo-mean)
+
+- **Verdict.** Swept block_M in {64,128,256} x k_split in {1,2} at the 5
+  prefill shapes (M=512), H20 pod GPU 7, mean of 20, zeroing inside the
+  timed region for ks=2 arms: shipped bM=128/k_split=2 wins the geo-mean —
+  next best bM=128 ks=1 at 0.930x. bM=128 is best at every shape under both
+  ks values (bM=64 0.74-0.76x: per-block K work halves; bM=256 0.75-0.87x:
+  occupancy starved). ks=1 wins only gate/up (1.023x, the saturated-shape
+  atomic cost) — ~0.5% geo-mean for a shape branch, not justified. Relerr
+  4.0e-3..8.6e-3 vs shipped (reduction order only); ks=2 arms bit-identical.
+  Dev-only bench script deleted; the entry's table is the tile-space record.
+  Entry: `docs/experience/errors/2026-08-26-bm-sweep-rejected.md`.
 
 ## 2026-08-26 — accept-or-reject: e5m2 activation precision for fp4 prefill GEMM — REJECTED (0.999x tie, relerr 7.6e-2 vs 1e-2 gate)
 
@@ -55,7 +67,7 @@ verdict**. Newest first.
 
 - **Verdict.** Each GDN layer projects the same post-norm hidden with
   `in_proj_qkv` (h→10240) and `in_proj_z` (h→6144), both native-fp8 in the
-  Qwen3.6 checkpoint — two `linear_fp8` launches (two activation quants,
+  Qwen3.8 checkpoint — two `linear_fp8` launches (two activation quants,
   two GEMMs) where one suffices. Extended the fp4 projection-fusion
   mechanism to native-fp8: `_projection_groups` gains `qkvz`,
   `_fuse_projections` concats `.w8`/`.wscale` along N (lossless: 10240 = 80
