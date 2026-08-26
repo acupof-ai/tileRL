@@ -30,6 +30,23 @@ diffed:
 # Adapted: make_* factory signature, tileRL thread-count convention
 ```
 
+## Precision selection order
+
+Perf campaigns settle precision before tiles — skipping it wastes tile work
+that a precision change invalidates:
+
+1. **W precision** — fixed by the checkpoint (NVFP4: e2m1 packed, per-block
+   scales). Not a knob.
+2. **A precision** — A/B the MMA input dtype at W fixed. On sm90 the hardware
+   options are e4m3 / e5m2 / bf16; Hopper wgmma needs both operands the same
+   fp8 dtype, so the W dequant target follows A. Gate: relerr vs the bf16
+   reference ≤ 1e-2 AND fastest.
+3. **Tile/kernel** — only under the settled (W, A): block_M/N/K, K-split,
+   wave count. A precision change re-opens this layer.
+
+Decode (GEMV) gets its own pass through the same ladder — its
+bandwidth/MMA balance differs from prefill.
+
 ## SOTA iteration loop
 
 1. **FIND** — tilelang ecosystem: `examples/`, `tileop/`, `tilert/` in
