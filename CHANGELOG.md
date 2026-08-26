@@ -4,6 +4,17 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-26 — accept-or-reject: e5m2 activation precision for fp4 prefill GEMM — REJECTED (0.999x tie, relerr 7.6e-2 vs 1e-2 gate)
+
+- **Verdict.** A=e5m2 arm (W dequant e2m1→e5m2 too — wgmma needs matching fp8
+  operands) vs shipped A=e4m3, 5 prefill shapes, H20 pod GPU 6, mean of 20:
+  geo-mean 0.999x (tie → reject) and relerr 7.44e-2..8.03e-2 vs the bf16
+  oracle (7.6x over the gate; e4m3 floor 3.77e-2..4.03e-2 — e5m2 ~doubles the
+  error). Same byte count, same WGMMA instructions → timing ties
+  structurally; e5m2's 2 mantissa bits buy nothing. Kernel variants reverted;
+  registry never wired. Entry:
+  `docs/experience/errors/2026-08-26-e5m2-prefill-rejected.md`.
+
 ## 2026-08-26 — accept-or-reject: 2-way K-split for fp8 prefill GEMM — ACCEPTED (+7.4% geo-mean, zeroing included)
 
 - **Verdict.** `make_linear_fp4_fp8_mma` gains a `k_split` param; k_split=2
