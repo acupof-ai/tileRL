@@ -4,6 +4,21 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-26 — accept-or-reject: A=bf16 prefill GEMM (no activation quant) — REJECTED (1.55x slower; W4 error only 1.7e-3)
+
+- **Verdict.** The bf16 arm (`make_linear_fp4_mma`: A stays bf16, W dequant
+  e2m1→bf16, bf16 WGMMA — the pre-fp8 prefill kernel, still the registered
+  `linear_fp4` fallback) A/B'd against shipped A=e4m3 + fp8 WGMMA k_split=2
+  at the 5 prefill shapes (M=512), H20 pod GPU 7, mean of 20, arm A timed
+  end-to-end (quant + zeroing + split kernel): geo-mean B/A 0.646x
+  (0.624-0.671 per shape) — 1.55x slower. H20 fp8 WGMMA has 2x bf16
+  throughput and the GEMM is compute-bound. Accuracy decomposition vs the
+  torch f32 oracle: bf16 arm 1.7e-3 (pure W4 error, 24x under gate), shipped
+  e4m3 ~4e-2 (A-quant + weight requant dominate) — the accuracy A=bf16 buys
+  is worthless, since W4 is not the bottleneck and the model tolerates the
+  e4m3 ~4%. Shipped path unchanged. Entry:
+  `docs/experience/errors/2026-08-26-abf16-prefill-rejected.md`.
+
 ## 2026-08-26 — accept-or-reject: 2-way K-split for fp8 prefill GEMM — ACCEPTED (+7.4% geo-mean, zeroing included)
 
 - **Verdict.** `make_linear_fp4_fp8_mma` gains a `k_split` param; k_split=2
