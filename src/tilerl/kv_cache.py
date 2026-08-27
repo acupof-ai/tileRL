@@ -69,9 +69,14 @@ class PagedKvPool:
 
     Storage layout, exposed as-is for ``paged_attention`` to gather by block
     id and for the model to index per layer: ``k_pool``/``v_pool`` are
-    ``[num_layers, num_blocks, num_kv_heads, BLOCK_TOKENS, head_dim]`` bf16.
+    ``[num_planes, num_blocks, num_kv_heads, BLOCK_TOKENS, head_dim]`` bf16.
     One allocator + refcount set is shared across layers: block id N names the
     same page in every layer, which is exactly what one block table indexes.
+
+    Only full-attn layers own a plane: ``layer_map`` gives the GLOBAL layer
+    index of each plane (dense storage — the 27B has 16 full-attn layers, not
+    64). All layer-indexed methods take a GLOBAL index and map it; a
+    non-full-attn layer raises KeyError — GDN layers must never touch the pool.
 
     Ownership: every block held by anyone (a live slot's block table, or the
     prefix store) carries a refcount. :meth:`alloc_block` hands out a block
@@ -89,17 +94,26 @@ class PagedKvPool:
         num_layers: int = 1,
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        layer_map: tuple[int, ...] | None = None,
     ) -> None:
+        # plane d -> global layer index; identity when no map is given.
+        self._layer_map = tuple(range(num_layers)) if layer_map is None else tuple(layer_map)
+        self._plane = {g: d for d, g in enumerate(self._layer_map)}
         self.num_blocks = num_blocks
-        self.num_layers = num_layers
+        self.num_layers = len(self._layer_map)
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.device = _default_device() if device is None else torch.device(device)
-        shape = (num_layers, num_blocks, num_kv_heads, BLOCK_TOKENS, head_dim)
+        shape = (self.num_layers, num_blocks, num_kv_heads, BLOCK_TOKENS, head_dim)
         self.k_pool = torch.zeros(shape, dtype=dtype, device=self.device)
         self.v_pool = torch.zeros(shape, dtype=dtype, device=self.device)
         self._free: list[int] = list(range(num_blocks))
         self.refcount: list[int] = [0] * num_blocks
+
+    def kv_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(k, v)`` plane for a GLOBAL layer index (dense-mapped)."""
+        p = self._plane[layer_idx]
+        return self.k_pool[p], self.v_pool[p]
 
     # ------------------------------------------------------------------ alloc
 
@@ -180,6 +194,7 @@ class PagedKvPool:
                 f"write_block: block {block} is shared (refcount {self.refcount[block]}); "
                 "call cow_for_append first"
             )
+        layer = self._plane[layer]
         self.k_pool[layer, block, :, offset : offset + n].copy_(
             k.to(self.device, self.k_pool.dtype)
         )
@@ -202,14 +217,15 @@ class PagedKvPool:
         """
         b, t, _, _ = k.shape
         sql = getattr(kv, "seq_q_lens", None)
+        plane = self._plane[layer_idx]
         for bi in range(b):
             sq = t if sql is None else int(sql[bi])
             base = int(kv.seq_len[bi]) - sq
             for ti in range(sq):
                 pos = base + ti
                 blk = int(kv.block_table[bi, pos // BLOCK_TOKENS])
-                self.k_pool[layer_idx, blk, :, pos % BLOCK_TOKENS, :] = k[bi, ti]
-                self.v_pool[layer_idx, blk, :, pos % BLOCK_TOKENS, :] = v[bi, ti]
+                self.k_pool[plane, blk, :, pos % BLOCK_TOKENS, :] = k[bi, ti]
+                self.v_pool[plane, blk, :, pos % BLOCK_TOKENS, :] = v[bi, ti]
 
     # ------------------------------------------------------ queries/admission
 

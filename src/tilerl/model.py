@@ -34,11 +34,12 @@ math). Beyond the pinned op list, the architecture forces four extensions:
   ``new_window`` is None).
 
 BatchKv assumptions (Engine attaches the pools at submit): ``kv.kv_pool`` /
-``kv.state_pool``; ``k_pool``/``v_pool`` are ``[num_layers, num_blocks,
-num_kv_heads, BLOCK_TOKENS, head_dim]``; ``backend.write_tokens(k, v, kv,
-layer_idx)`` scatters ``k/v`` [B,T,Hkv,D] at ``[seq_len-T, seq_len)`` through
-the block table (one capturable kernel on sm90, the pool's torch loop on other
-arches); ``state_pool.states`` is ``[num_slots, num_linear_layers, H, K, V]``
+``kv.state_pool``; ``k_pool``/``v_pool`` are dense over full-attn layers
+``[num_full_attn, num_blocks, num_kv_heads, BLOCK_TOKENS, head_dim]`` (the
+pool maps a GLOBAL ``layer_idx`` to its plane); ``backend.write_tokens(k, v,
+kv, layer_idx)`` scatters ``k/v`` [B,T,Hkv,D] at ``[seq_len-T, seq_len)``
+through the block table (one capturable kernel on sm90, the pool's torch loop
+on other arches); ``state_pool.states`` is ``[num_slots, num_linear_layers, H, K, V]``
 and ``state_pool.conv_windows`` ``[num_slots, num_linear_layers, K-1,
 qkv_dim]`` (None without GDN layers).
 
@@ -316,10 +317,11 @@ class Model:
             out = backend.attention(q, k, v, 1.0 / math.sqrt(d), gate=gate)
         else:
             backend.write_tokens(k, v, kv, layer_idx)
+            k_plane, v_plane = kv.kv_pool.kv_layer(layer_idx)
             out = backend.paged_attention(
                 q,
-                kv.kv_pool.k_pool[layer_idx],
-                kv.kv_pool.v_pool[layer_idx],
+                k_plane,
+                v_plane,
                 kv.block_table,
                 kv.seq_len,
                 1.0 / math.sqrt(d),

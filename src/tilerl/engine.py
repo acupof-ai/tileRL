@@ -708,8 +708,8 @@ def build_engine(
         num_blocks,
         cfg.num_kv_heads,
         cfg.head_dim,
-        num_layers=cfg.num_layers,
         device=backend.device,
+        layer_map=cfg.full_attn_layers,
     )
     state_pool = LinearStatePool(
         num_slots,

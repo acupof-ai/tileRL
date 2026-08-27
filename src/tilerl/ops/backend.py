@@ -506,6 +506,7 @@ class Backend:
             kv.kv_pool.write_tokens(k, v, kv, layer_idx)
             return
         pool = kv.kv_pool
+        k_plane, v_plane = pool.kv_layer(layer_idx)
         b, s = k.shape[0], k.shape[1]
         sql = getattr(kv, "seq_q_lens", None)
         if sql is None:
@@ -516,8 +517,8 @@ class Backend:
         self._kernel("write_tokens")(
             self._dev(k, torch.bfloat16).contiguous(),
             self._dev(v, torch.bfloat16).contiguous(),
-            pool.k_pool[layer_idx],
-            pool.v_pool[layer_idx],
+            k_plane,
+            v_plane,
             self._i32(kv.block_table).contiguous(),
             self._i32(kv.seq_len).contiguous(),
             self._i32(sql).contiguous(),

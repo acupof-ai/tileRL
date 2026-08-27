@@ -39,6 +39,29 @@ def test_pool_shapes_and_dtype():
     assert pool.used_blocks == 0
 
 
+def test_pool_layer_map_is_dense():
+    """``layer_map`` packs full-attn layers densely and maps a GLOBAL layer
+    index to its plane; a non-full-attn layer raises (regression: the pool
+    shaped on ``num_layers``, so 3/4 of the 27B pool was permanently zero)."""
+    pool = PagedKvPool(4, 1, 4, layer_map=(1, 3))
+    assert pool.k_pool.shape[0] == 2 and pool.num_layers == 2
+    b = pool.alloc_block()
+    k1, v1 = _kv(0, BLOCK_TOKENS)
+    k3, v3 = _kv(1, BLOCK_TOKENS)
+    pool.write_block(b, 0, k1, v1, layer=1)
+    pool.write_block(b, 0, k3, v3, layer=3)
+    kp1, vp1 = pool.kv_layer(1)
+    kp3, vp3 = pool.kv_layer(3)
+    assert torch.equal(kp1[b, :, :BLOCK_TOKENS], k1)
+    assert torch.equal(vp1[b, :, :BLOCK_TOKENS], v1)
+    assert torch.equal(kp3[b, :, :BLOCK_TOKENS], k3)
+    assert torch.equal(vp3[b, :, :BLOCK_TOKENS], v3)
+    with pytest.raises(KeyError):
+        pool.kv_layer(0)  # global 0 is not a full-attn plane here
+    with pytest.raises(KeyError):
+        pool.write_block(b, 0, k1, v1, layer=0)
+
+
 def test_write_read_roundtrip():
     pool = PagedKvPool(4, 2, 8)
     b = pool.alloc_block()
