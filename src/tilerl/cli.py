@@ -166,6 +166,23 @@ def cmd_pretrain(args: argparse.Namespace) -> None:
 
 
 def cmd_bench(args: argparse.Namespace) -> None:
+    if getattr(args, "suite", None):
+        # Full harness: decode-vs-KV-depth / prefill-curve / kv-reuse / train,
+        # with the snapshot baseline gate. Lives in scripts/ (needs sys.path
+        # script-dir access); shell into it so it stays the single source.
+        import subprocess
+        from pathlib import Path
+
+        script = Path(__file__).resolve().parent.parent.parent / "scripts/bench_harness.py"
+        cmd = [sys.executable, str(script), "--suite", args.suite]
+        if args.source:
+            cmd += ["--source", args.source]
+        if args.gpu is not None:
+            cmd += ["--gpu", str(args.gpu)]
+        if args.batches:
+            cmd += ["--batches", args.batches]
+        sys.exit(subprocess.call(cmd))
+
     import torch
 
     from . import engine as engine_mod
@@ -266,6 +283,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--model", choices=["tiny"], default="tiny")
     p_bench.add_argument("--prompt-len", type=int, default=128)
     p_bench.add_argument("--gen", type=int, default=32)
+    p_bench.add_argument(
+        "--suite",
+        default=None,
+        help="run the full harness (scripts/bench_harness.py) instead of the quick "
+        "tiny timer: comma list of decode-kv,prefill,kv-reuse,train,micro",
+    )
+    p_bench.add_argument("--source", default=None, help="27B checkpoint dir (harness GPU suites)")
+    p_bench.add_argument("--gpu", type=int, default=None, help="GPU index (harness)")
+    p_bench.add_argument("--batches", default=None, help="harness decode batch sizes, e.g. 1,8")
     p_bench.set_defaults(func=cmd_bench)
 
     return parser

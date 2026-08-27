@@ -1,0 +1,17 @@
+{
+  "kv-reuse/prefix-hits/cpu": {
+    "commit": "655e941",
+    "date": "2026-08-27",
+    "tok_s": 1.0
+  },
+  "train/tiny-b2t128/cpu": {
+    "commit": "655e941",
+    "date": "2026-08-27",
+    "tok_s": 1631.629389277413
+  },
+  "train/tiny-b2t512/cpu": {
+    "commit": "655e941",
+    "date": "2026-08-27",
+    "tok_s": 1552.206294801801
+  }
+}

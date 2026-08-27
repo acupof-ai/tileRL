@@ -66,3 +66,58 @@ def ab(name, arms, ref, iters=20, tol=1e-2):
         f"mean of {iters} iters per arm, same process (contention-independent ratio)."
     )
     return rows
+
+
+# --- engine timing helpers (CPU-safe; shared by bench_harness + verify) ------
+# Lifted here so bench_harness can reuse them WITHOUT importing verify_h20_fp4,
+# whose module-level GPU census hard-exits on a CPU host.
+
+
+def rand_prompt(vocab: int, n: int, seed: int) -> list[int]:
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randint(0, vocab, (n,), generator=gen).tolist()
+
+
+def sync(backend) -> None:
+    if backend.device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def drive(engine, wid: int, max_steps: int) -> list[int]:
+    """Step until request `wid` finishes; return its output tokens."""
+    for _ in range(max_steps):
+        engine.step()
+        done = engine.poll()
+        if wid in done:
+            return done[wid]
+    raise RuntimeError(f"request {wid} did not finish in {max_steps} steps")
+
+
+def settle_decode(engine, b: int, extra: int) -> bool:
+    """Step until `b` rows are all in pure decode. Returns False if it never
+    reaches that state within a bounded budget (caller skips the row)."""
+    from tilerl.engine import _PHASE_DECODE
+
+    for _ in range(4 * b + extra + 40):
+        engine.step()
+        run = engine._running
+        if len(run) == b and all(r.phase == _PHASE_DECODE for r in run):
+            return True
+    return False
+
+
+def time_prefill(engine, backend, cfg, length: int, decode_ms: float) -> tuple[float, float]:
+    """One request to completion; subtract one decode tick for prefill-only ms.
+    Same method as verify_h20_fp4.check_perf's prefill arm."""
+    from tilerl.engine import SamplingParams
+
+    wid = engine.submit(
+        rand_prompt(cfg.vocab_size, length, seed=length),
+        SamplingParams(temperature=0.0, max_new_tokens=1, seed=0),
+    )
+    sync(backend)
+    t0 = __import__("time").perf_counter()
+    drive(engine, wid, max(1024, length // 64))
+    sync(backend)
+    prefill_ms = (__import__("time").perf_counter() - t0) * 1e3 - decode_ms
+    return prefill_ms, 1000.0 * length / prefill_ms
