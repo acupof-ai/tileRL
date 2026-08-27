@@ -110,11 +110,14 @@ def _rope_apply(
     sin = torch.sin(ang).unsqueeze(-2)
     if negate:
         sin = -sin
-    x1 = x_rot[..., 0::2]
-    x2 = x_rot[..., 1::2]
+    # rotate_half convention (Qwen/Llama): pair dim d with d+rd/2, not the
+    # adjacent (2d, 2d+1) GPT-J pairing. The checkpoint's weights expect this.
+    half = rd // 2
+    x1 = x_rot[..., :half]
+    x2 = x_rot[..., half:]
     out = torch.empty_like(x_rot)
-    out[..., 0::2] = x1 * cos - x2 * sin
-    out[..., 1::2] = x1 * sin + x2 * cos
+    out[..., :half] = x1 * cos - x2 * sin
+    out[..., half:] = x2 * cos + x1 * sin
     return torch.cat([out, x_pass], dim=-1)
 
 

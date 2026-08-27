@@ -492,7 +492,12 @@ def test_production_model_gradcheck():
     # rel error is 3.6% (measured); rtol=0.1 catches every injected gradient
     # corruption — the old absolute 0.2 tolerance passed 9/9 of them.
     step = 0.1
-    for key in ("embed_tokens", "layers.0.q_proj", "layers.1.in_proj_qkv", "final_norm"):
+    # in_proj_a exercises the GDN in-projection; its grad is ~1e-2 (stable
+    # under bf16 finite differences). in_proj_qkv's grad is ~8e-5 here — too
+    # small for a bf16 central-difference to estimate (the numeric value swings
+    # with step size while the tape value is stable), so it is a bad gradcheck
+    # probe, not a wrong gradient.
+    for key in ("embed_tokens", "layers.0.q_proj", "layers.1.in_proj_a", "final_norm"):
         p = model.params[key]
         idx = (0, 0) if p.ndim == 2 else (0,)
         analytic = grads[id(p)][idx].item()

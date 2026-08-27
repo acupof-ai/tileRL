@@ -39,9 +39,42 @@ confirmed necessary and correct** — but it only un-masked check 2.
 ## The #1 blocker: check 2 (wrong logits) is a SEPARATE bug
 
 Degeneration to id 158949 happens on short prompts (no overflow), so it is not
-the grid. The 27B has **never had a reference-logits check** — this is the C1
-class the audit named ("no numerical ground truth anywhere in this project").
-Candidates, in order of suspicion, given the real config above:
+the grid. health_probe confirms the forward is **finite and non-degenerate**
+(embedding norm 3.8, logits norm 1991, 3.8M distinct logit values) — so it is
+**wrong math, not a NaN/blowup**: plausible logits that argmax to a junk token.
+The 27B has **never had a reference-logits check** (audit C1).
+
+### Two concrete, testable RoPE hypotheses (ranked) — 2026-08-27
+
+The config carries `rope_parameters = {mrope_interleaved: True, mrope_section:
+[11,11,10], partial_rotary_factor: 0.25, rope_theta: 1e7, rope_type: default}`.
+Two independent ways tileRL's plain `make_rope` can be wrong for this:
+
+**H1 — rotate_half vs adjacent-pair convention (most likely).** tileRL's
+`make_rope` (kernels.py) rotates ADJACENT pairs `(2d, 2d+1)` — the GPT-J /
+"interleaved" convention. Qwen/Llama use `rotate_half`: pair dim `d` with
+`d + rot/2` (the GPT-NeoX / "half-split" convention). If the checkpoint expects
+half-split and tileRL rotates adjacent pairs, EVERY attention layer rotates
+wrong → exactly this plausible-but-wrong-logits signature. **Test:** diff
+`backend.rope(q)` against a HF `apply_rotary_pos_emb` (rotate_half) on one
+[1,1,1,64] vector; if they differ, this is it. Fix: change the pairing in
+`make_rope` to `(d, d+rot/2)`, re-verify parity.
+
+**H2 — M-RoPE interleaved frequency layout.** For TEXT-ONLY, M-RoPE with
+T=H=W=arange is bit-identical to 1D RoPE ONLY if the sections slice the
+frequency spectrum the same way tileRL pairs it. `mrope_interleaved: True`
+means the 3 axes' frequencies are INTERLEAVED across the spectrum, which can
+reorder which freq multiplies which dim even at equal positions. Confirmed real
+trap: a sibling checkpoint ships `patch_mrope_text_fallback.py`
+(github.com/AEON-7/Qwen3.6-35B-A3B-heretic-NVFP4-DFlash). Less likely than H1
+because equal positions neutralize the *axis* difference, but the *interleave*
+may survive. **Test:** only after H1 is ruled out.
+
+`_validate_hf_config` passes this checkpoint because it treats `rope_type
+"default"` as fine and never inspects `mrope_interleaved` — add that check once
+the convention is settled.
+
+## OLD candidate list (superseded by H1/H2 above)
 
 1. **head_dim 256 with partial_rotary 0.25 (rotary_dim 64).** The old assumed
    config was head_dim 128; the RoPE / attention path may mis-handle

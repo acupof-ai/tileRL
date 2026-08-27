@@ -414,14 +414,17 @@ def make_rope(target: str):
             b = bt // S
             t = bt % S
             pos = Positions[b, t]
-            for d in T.Parallel(D // 2):
+            # rotate_half (Qwen/Llama): dim d pairs with d + D/2, both using
+            # frequency InvFreq[d]. NOT the adjacent (2d, 2d+1) GPT-J pairing.
+            half = D // 2
+            for d in T.Parallel(half):
                 ang = T.cast(pos, "float32") * InvFreq[d]
                 c = T.cos(ang)
                 s = T.sin(ang)
-                x0 = X[b, t, h, 2 * d]
-                x1 = X[b, t, h, 2 * d + 1]
-                Y[b, t, h, 2 * d] = x0 * c - x1 * s
-                Y[b, t, h, 2 * d + 1] = x0 * s + x1 * c
+                x0 = X[b, t, h, d]
+                x1 = X[b, t, h, d + half]
+                Y[b, t, h, d] = x0 * c - x1 * s
+                Y[b, t, h, d + half] = x1 * c + x0 * s
         return Y
 
     return rope
