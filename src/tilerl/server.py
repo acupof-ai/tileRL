@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import time
 from typing import Any, Protocol
 
@@ -175,7 +176,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             temperature=req.temperature if req.temperature is not None else 0.0,
             top_p=req.top_p if req.top_p is not None else 1.0,
             max_new_tokens=req.max_tokens if req.max_tokens is not None else 512,
-            seed=req.seed if req.seed is not None else 0,
+            seed=req.seed if req.seed is not None else secrets.randbits(31),
             stop_token_ids=tuple(getattr(tokenizer, "stop_token_ids", ())),
         )
         return engine.submit(input_ids, params), len(input_ids), params.max_new_tokens

@@ -102,6 +102,21 @@ def test_completion_nonstream(client, model_id):
     assert body["choices"][0]["finish_reason"] == "length"
 
 
+def test_seedless_requests_decorrelate(client, model_id):
+    """Two seedless requests with the same prompt must not share a sampling
+    stream (regression: every seedless request got seed=0, so concurrent
+    same-prompt requests returned byte-identical completions)."""
+    json_body = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.7,
+        "max_tokens": 8,
+    }
+    first = client.post("/v1/chat/completions", json=json_body).json()
+    second = client.post("/v1/chat/completions", json=json_body).json()
+    assert first["choices"][0]["message"]["content"] != second["choices"][0]["message"]["content"]
+
+
 def test_completion_stream(client, model_id):
     resp = client.post(
         "/v1/chat/completions",
