@@ -245,11 +245,10 @@ figures are stated: params-only, and params + cast.
   A **0** there means the fix landed — or that `Backend._embed_f32` was
   renamed and the harness is reading an attribute that no longer exists. It
   exists today, so a 0 tomorrow is real; check the name before believing it.
-- **"KV pool" over-reads by 4x.** The pool is shaped on all 64 layers
-  (`kv_cache.py:98`) and only the 16 full-attention planes are ever written
-  (audit M3), so at `--num-blocks 1024` the line prints 4.00 GiB where 1.00 is
-  reachable. Nothing gates on it and nothing OOMs; annotate the number when
-  transcribing it into the wins entry.
+- **"KV pool" should read ~1.00 GiB at `--num-blocks 1024`.** The pool is now
+  dense over the 16 full-attn layers (audit M3 fixed, `b328ad2`); the script
+  reads `kv.k_pool`/`v_pool` directly, so it prints the true number. A 4.00 GiB
+  print means the dense packing regressed — investigate before transcribing.
 - **The residual is not a cross-check.** "everything else" is defined as
   `allocated − named subtotal`, so the breakdown sums to
   `torch.cuda.memory_allocated()` by construction and a mis-measured source
