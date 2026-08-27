@@ -1,6 +1,9 @@
 # Is the 1.6x gap to Arle the price of TileLang? — evidence, 2026-08-27
 
 > Status: Answered — no. Three corrections to the premise, one lever identified.
+> Addendum 2026-08-27: the register-resident-B question this brief named as
+> decisive is settled — **CAN**, proven by emitted CUDA C. See "The
+> register-resident verdict" below.
 
 ## The answer
 
@@ -92,6 +95,49 @@ after `628c82d`, the baseline every number in this repo is denominated against.
 **Nobody has re-benched.** HEAD serves a different weight program than the
 measurement it is judged by.
 
+## The register-resident verdict: CAN, proven by codegen
+
+Can TileLang express Marlin's register-resident quantized B operand — the thing
+that makes Marlin's dequant free — or does the remaining 1.5–1.85x require
+vendoring `.cu`? Settled 2026-08-27 on this GPU-less Mac via the
+`scripts/cuda_codegen.py` shim: **CAN.**
+
+- The primitive is `T.gemm`'s SR variant: A in shared, **B in a fragment**
+  (`is_gemm_sr()`, `tilelang/tileop/gemm/gemm_base.py:57`; CUDA lowering at
+  `tilelang/cuda/op/gemm/gemm_mma.py:143-172` — no `ldmatrix_b`, the fragment
+  goes straight to the tensor core).
+- A tileRL-shaped fp4 decode kernel whose dequantized weight never touches
+  shared memory emitted 7,833 bytes of CUDA C. Its
+  `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` is
+  character-for-character Marlin's instruction (`marlin_template.h:91-95`), B
+  operand read from a register array in both.
+- **Correction to this brief's premise**: "every tilelang dequantize_gemm
+  example materializes `B_dequantize_shared`" is false. The canonical documented
+  pattern is register-resident (`examples/dequantize_gemm/README.md:33`,
+  `example_dequant_gemm_w4a8.py:145`). The two examples that materialize it are
+  both WGMMA kernels, where shared B is a hardware requirement — and tileRL
+  copied one of them by name (`kernels_linear.py:232`). The anti-pattern was
+  inherited from the wrong donor, not imposed by the language.
+- Hopper is not a blocker: a fragment B makes `CheckWgmma` fail, so instruction
+  selection falls through to `cuda.mma` — exactly what Marlin runs on H20.
+- The one real cost is target neutrality: **Metal does not implement SR**
+  (`gemm_metal.py:97-98`, SS only). A Marlin-shaped kernel is a per-arch sm90
+  cell, which `_SM90_KERNELS` already is.
+- Size of the prize from tileRL's own constants: the live decode kernel
+  (`make_linear_fp4_fp8_mma`, `_CUDA_PLAN`'s `linear_fp4_fp8_decode`) spends
+  **12 KiB/CTA** on `W_shared` (4 KiB e4m3 × 3 stages) against `WQ_shared`'s
+  2 KiB — shared memory buying nothing but a format conversion. (The
+  unreachable `make_linear_fp4_mma` spends 24 KiB in bf16.) Freeing it is an
+  occupancy lever; this repo measured +7.5% from one of those in `5d53d9b`.
+
+Instrument honesty: the high-level `T.gemm` SR path could not be lowered on
+this wheel — `RegisterGemmImpl` takes raw C++ function pointers with no FFI, so
+`tl.gemm` is unreachable for *any* operand scope here (a shared-B control
+failed with byte-identical text; the failure carries no information about
+operand scope). The warp-level route, which bypasses `tl.gemm`, is what
+lowered. The pod should confirm the high-level path emits the same operand
+structure.
+
 ## Recommendation
 
 Ordered, with the cheap disambiguating measurements first.
@@ -102,9 +148,11 @@ Ordered, with the cheap disambiguating measurements first.
 1. **bf16 block scales on the fp4 path** (0.5 day, ~5 lines). At block 16, f32
    scales are 0.25 B/elem — **a third of the entire fp4 weight stream**.
 2. **`micro_size_k` 8 -> 32, `GROUP=1`** (1 day + one pod session). The main event.
-3. Marlin-shaped RS-WGMMA decode kernel, gated on step 2's ncu — and copy
-   tilelang's `example_dequant_gemm_w4a8.py`, not the `_bf16_fp4_hopper` one
-   tileRL adapted.
+3. Marlin-shaped **SR (register-B) decode kernel** in TileLang — proven
+   expressible by the verdict above, gated on step 2's ncu. Copy
+   `example_dequant_gemm_w4a8.py` (register-resident), not the
+   `_bf16_fp4_hopper` WGMMA donor tileRL adapted. Lands as a per-arch sm90
+   cell; Metal keeps the SS kernel.
 4. sm90 bf16-IO kernel cell (`embedding`/`rmsnorm`/`rope`/`silu_mul` are still
    the CPU cell's f32 kernels on sm90). ~2.3 ms/tick and 4.7 GiB.
 5. Fold `.oscale` into the kernel accumulator.
@@ -121,8 +169,9 @@ on `gate_up` (34816x5120) and `down` (5120x17408) at M=1, direct kernel call,
 same process. **If the best configuration does not exceed 1.30 TB/s on
 down_proj** — Marlin's own measured rate on that exact shape
 (`agent-infer/docs/experience/wins/2026-08-23-marlin-nvfp4-decode-bps-tiebreaker.md`)
-— the memory-level-parallelism thesis is dead, step 2 is worth nothing, and the
-answer flips to vendoring a Marlin-class kernel behind the registry cell.
+— the memory-level-parallelism thesis is dead, step 2 is worth nothing, and
+the fallback is no longer "vendor Marlin": the register-resident verdict makes
+a TileLang-native SR kernel the fallback, behind the same sm90 registry cell.
 
 Pair it with one ncu run reporting registers/thread and blocks/SM: if micro=32
 spills to local memory, the repo has already seen that failure mode take a
@@ -135,4 +184,6 @@ source" first. The evidence lens ranked **vendoring Marlin** first, on the
 grounds that its payoff is arithmetic over four *measured* wall times while step
 2's payoff rests on one integer whose rejection nobody wrote a number down for.
 That disagreement is exactly what the kill criterion above resolves, for two
-hours of GPU.
+hours of GPU. The verdict above also cuts against the evidence lens's
+vendoring-first rank: its premise was that step 3's payoff was unproven, and
+step 3 is now proven reachable in-tree.
