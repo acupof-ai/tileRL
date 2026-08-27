@@ -149,11 +149,13 @@ class _DecodeGraph:
     def __init__(self, model, backend, kv_pool, state_pool, batch_size):
         device = backend.device
         B = batch_size
-        self._ids = torch.empty(B, 1, dtype=torch.long, device=device)
-        self._pos = torch.empty(B, 1, dtype=torch.long, device=device)
+        # int32 end to end: every consumer is a kernel taking int32, and a
+        # long buffer costs an int64->int32 cast launch per use inside the graph.
+        self._ids = torch.empty(B, 1, dtype=torch.int32, device=device)
+        self._pos = torch.empty(B, 1, dtype=torch.int32, device=device)
         self._bt = torch.zeros(B, kv_pool.num_blocks, dtype=torch.int32, device=device)
         self._sl = torch.empty(B, dtype=torch.int32, device=device)
-        self._ss = torch.empty(B, dtype=torch.long, device=device)
+        self._ss = torch.empty(B, dtype=torch.int32, device=device)
         # Decode rows always have exactly 1 query token; a static GPU buffer
         # (not a per-tick CPU copy) keeps seq_q_lens out of the captured
         # region — the kernels' CPU->GPU fallback breaks CUDA graph capture.
@@ -162,11 +164,11 @@ class _DecodeGraph:
         # synchronous (it blocks until the copy engine drains), which under
         # GPU contention costs ms per tick. Pinned + non_blocking makes the
         # H2D copies async — stream ordering keeps replay after them.
-        self._ids_h = torch.empty(B, 1, dtype=torch.long, pin_memory=True)
-        self._pos_h = torch.empty(B, 1, dtype=torch.long, pin_memory=True)
+        self._ids_h = torch.empty(B, 1, dtype=torch.int32, pin_memory=True)
+        self._pos_h = torch.empty(B, 1, dtype=torch.int32, pin_memory=True)
         self._bt_h = torch.zeros(B, kv_pool.num_blocks, dtype=torch.int32, pin_memory=True)
         self._sl_h = torch.empty(B, dtype=torch.int32, pin_memory=True)
-        self._ss_h = torch.empty(B, dtype=torch.long, pin_memory=True)
+        self._ss_h = torch.empty(B, dtype=torch.int32, pin_memory=True)
         self._kv = BatchKv(
             block_table=self._bt,
             seq_len=self._sl,

@@ -1,18 +1,18 @@
 {
   "decode-kv/d2048-b1/sm90": {
-    "commit": "3ee8eab",
+    "commit": "unknown",
     "date": "2026-08-27",
-    "tok_s": 74.56331770715028
+    "tok_s": 74.9273613563031
   },
   "decode-kv/d2048-b8/sm90": {
-    "commit": "5d19aee",
+    "commit": "unknown",
     "date": "2026-08-27",
-    "tok_s": 201.8214052257494
+    "tok_s": 202.24762503782247
   },
   "decode-kv/d32768-b1/sm90": {
-    "commit": "3ee8eab",
+    "commit": "unknown",
     "date": "2026-08-27",
-    "tok_s": 28.012990759115123
+    "tok_s": 28.02997942095029
   },
   "decode-kv/d512-b1/sm90": {
     "commit": "3ee8eab",
@@ -20,14 +20,14 @@
     "tok_s": 81.98530232662621
   },
   "decode-kv/d512-b8/sm90": {
-    "commit": "5d19aee",
+    "commit": "unknown",
     "date": "2026-08-27",
-    "tok_s": 212.62596892329606
+    "tok_s": 212.73189367224109
   },
   "decode-kv/d8192-b1/sm90": {
-    "commit": "3ee8eab",
+    "commit": "unknown",
     "date": "2026-08-27",
-    "tok_s": 55.86210553146918
+    "tok_s": 55.90070248897814
   },
   "decode-kv/d8192-b8/sm90": {
     "commit": "3ee8eab",

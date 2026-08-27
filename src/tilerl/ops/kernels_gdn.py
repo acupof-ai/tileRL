@@ -62,8 +62,10 @@ def make_gdn_decode_fused(target: str):
         Key: T.Tensor((B, QD), "float32")
         Val: T.Tensor((B, VD), "float32")
         Z: T.Tensor((B, VD), "float32")
-        GIn: T.Tensor((B, NVH), "float32")
-        BIn: T.Tensor((B, NVH), "float32")
+        # bf16 IO where the neighbours are bf16 GEMVs (a/b from the fused ab
+        # GEMV, Out into out_proj): no per-call casts around the launch.
+        GIn: T.Tensor((B, NVH), "bfloat16")
+        BIn: T.Tensor((B, NVH), "bfloat16")
         DtBias: T.Tensor((NVH,), "float32")
         ALog: T.Tensor((NVH,), "float32")
         NormW: T.Tensor((V,), "float32")
@@ -75,7 +77,7 @@ def make_gdn_decode_fused(target: str):
         S, L = T.const("S, L")
         States: T.Tensor((S, L, NVH, K, V), "float32")
         Slots: T.Tensor((B,), "int32")
-        Out = T.empty((B, VD), "float32")
+        Out = T.empty((B, VD), "bfloat16")
         NewWindow = T.empty((B, KER - 1, QKVD), "float32")
         with T.Kernel(NVH, B, threads=threads) as (vh, bb):
             tv = T.get_thread_binding(0)
@@ -123,10 +125,10 @@ def make_gdn_decode_fused(target: str):
                     acc_k[0] += k_s[j] * k_s[j]
                 qn[0] = T.rsqrt(acc_q[0] + 1e-12)
                 kn[0] = T.rsqrt(acc_k[0] + 1e-12)
-                x = GIn[bb, vh] + DtBias[vh]
+                x = T.cast(GIn[bb, vh], "float32") + DtBias[vh]
                 sp = T.if_then_else(x > 20.0, x, T.log(1.0 + T.exp(x)))
                 exp_g_s[0] = T.exp(-T.exp(ALog[vh]) * sp)
-                beta_s[0] = T.sigmoid(BIn[bb, vh])
+                beta_s[0] = T.sigmoid(T.cast(BIn[bb, vh], "float32"))
             T.tvm_storage_sync("shared")
 
             q_s[tv] = q_s[tv] * qn[0] * scale
@@ -163,7 +165,9 @@ def make_gdn_decode_fused(target: str):
                 rms_s[0] = T.rsqrt(acc_sq[0] / T.cast(V, "float32") + 1e-6)
             T.tvm_storage_sync("shared")
             gate = Z[bb, vh * V + tv]
-            Out[bb, vh * V + tv] = out_s[tv] * rms_s[0] * NormW[tv] * (gate * T.sigmoid(gate))
+            Out[bb, vh * V + tv] = T.cast(
+                out_s[tv] * rms_s[0] * NormW[tv] * (gate * T.sigmoid(gate)), "bfloat16"
+            )
 
             # new conv window: shift left, append current qkv. q/k channels
             # are shared across the GQA group — only the representative writes.
