@@ -477,7 +477,7 @@ def make_linear_bf16_gemv(target: str):
 # ---------------------------------------------------------------- linear fp8 (GEMV)
 
 
-def make_linear_fp8_gemv(target: str):
+def make_linear_fp8_gemv(target: str, GROUP: int = 4):
     """GEMV (sm90), the decode (M=1) path of linear_fp8: X[1,K] bf16 @ W8[N,K]
     e4m3 with per-128-block scale -> Y[1,N] f32.
 
@@ -485,6 +485,12 @@ def make_linear_fp8_gemv(target: str):
     e4m3 (micro_size_k=16, 128-bit/8-bit) and each thread's 16-elem slice
     stays within one 128-block scale (block_K=512=4 scale blocks), so one
     WScale lookup per chunk. Roofline = (N*K*1.03 + 2K) bytes / HBM BW.
+
+    GROUP chunks are loaded before any FMA (same as the fp4 GEMV's grouped
+    dequant): the flat loop kept ONE 128-bit load in flight per thread, so the
+    kernel was latency-bound at 13-26% roofline (graph profile 2026-08-27:
+    68 us/call, 40% of the B=1 tick). The scale multiplies the chunk partial
+    once, not every element.
 
     # SOTA copy: examples/dequantize_gemm/example_dequant_gemv_fp16xint4.py
     #   @ tilelang main (dequantize_gemv, split-K + tvm_thread_allreduce path)
@@ -497,6 +503,8 @@ def make_linear_fp8_gemv(target: str):
         N, K = T.const("N, K")
         micro_size_k = 16  # 128-bit transaction / 8-bit e4m3
         block_K = reduce_thread * micro_size_k  # 512 = 4 scale blocks of 128
+        num_ko = T.ceildiv(K, block_K)
+        num_g = num_ko // GROUP
         X: T.Tensor((1, K), "bfloat16")
         W8: T.Tensor((N, K), "float8_e4m3fn")
         WScale: T.Tensor((T.ceildiv(N, 128), T.ceildiv(K, 128)), "float32")
@@ -505,21 +513,38 @@ def make_linear_fp8_gemv(target: str):
             kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
             ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
             n = bx * n_partition + ni
-            X_local = T.alloc_local((micro_size_k,), "bfloat16")
-            W_local = T.alloc_local((micro_size_k,), "float8_e4m3fn")
+            Xs = T.alloc_local((GROUP, micro_size_k), "bfloat16")
+            Ws = T.alloc_local((GROUP, micro_size_k), "float8_e4m3fn")
             acc = T.alloc_local((1,), "float32")
+            partial = T.alloc_local((1,), "float32")
             reduced = T.alloc_local((1,), "float32")
             acc[0] = 0.0
-            for ko in T.serial(T.ceildiv(K, block_K)):
-                base = ko * block_K + kr * micro_size_k
-                # the 16-elem slice [base, base+16) never crosses a 128-block
-                s = WScale[n // 128, base // 128]
+            for kg in T.serial(num_g):
+                for g in T.unroll(GROUP):
+                    base = (kg * GROUP + g) * block_K + kr * micro_size_k
+                    for c in T.unroll(2):
+                        for v in T.vectorized(8):
+                            Xs[g, c * 8 + v] = X[0, base + c * 8 + v]
+                    for v in T.vectorized(micro_size_k):
+                        Ws[g, v] = W8[n, base + v]
+                for g in T.unroll(GROUP):
+                    base = (kg * GROUP + g) * block_K + kr * micro_size_k
+                    partial[0] = 0.0
+                    for ki in T.unroll(micro_size_k):
+                        partial[0] += T.cast(Xs[g, ki], "float32") * T.cast(Ws[g, ki], "float32")
+                    # the 16-elem slice [base, base+16) never crosses a 128-block
+                    acc[0] += WScale[n // 128, base // 128] * partial[0]
+            for kt in T.serial(num_ko - num_g * GROUP):  # K-tail, flat, slot 0
+                base = (num_g * GROUP + kt) * block_K + kr * micro_size_k
+                for c in T.unroll(2):
+                    for v in T.vectorized(8):
+                        Xs[0, c * 8 + v] = X[0, base + c * 8 + v]
                 for v in T.vectorized(micro_size_k):
-                    X_local[v] = X[0, base + v]
-                for v in T.vectorized(micro_size_k):
-                    W_local[v] = W8[n, base + v]
-                for ki in T.serial(micro_size_k):
-                    acc[0] += T.cast(X_local[ki], "float32") * T.cast(W_local[ki], "float32") * s
+                    Ws[0, v] = W8[n, base + v]
+                partial[0] = 0.0
+                for ki in T.unroll(micro_size_k):
+                    partial[0] += T.cast(Xs[0, ki], "float32") * T.cast(Ws[0, ki], "float32")
+                acc[0] += WScale[n // 128, base // 128] * partial[0]
             with T.attr(
                 T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
                 "reduce_scope",

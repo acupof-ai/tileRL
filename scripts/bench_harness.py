@@ -83,7 +83,7 @@ class Gate:
             self.baseline[key] = {"tok_s": tok_s, "commit": self.commit, "date": self.date}
             self.dirty = True
             verdict = "SEED"
-        elif tok_s >= prev["tok_s"]:
+        elif tok_s > prev["tok_s"]:
             print(f"  RAISED {key}: {prev['tok_s']:.1f} -> {tok_s:.1f} tok/s")
             self.baseline[key] = {"tok_s": tok_s, "commit": self.commit, "date": self.date}
             self.dirty = True
@@ -99,7 +99,7 @@ class Gate:
                 self.failed = True
         base = prev["tok_s"] if prev else tok_s
         self.rows.append(
-            {"key": key, "tok_s": tok_s, "baseline": base, "ratio": tok_s / base, "verdict": verdict}
+            {"key": key, "tok_s": tok_s, "baseline": base, "ratio": tok_s / base if base else 0.0, "verdict": verdict}
         )
         return verdict
 
@@ -150,20 +150,28 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
         if depth > cfg.max_position_embeddings:
             continue
         for b in batches:
-            need = -(-(depth + ticks + 40) * b // BLOCK_TOKENS) + b
+            if depth * b > 65536:
+                print(f"  {depth:>7} {b:>3}   (skipped: KV pool would exceed one H20)")
+                continue
+            # 2x headroom: the prefix store pins every finished prompt's blocks
+            # for reuse, so a run that just drained still holds ~depth*B blocks.
+            # outlive the batch's staggered prefill (chunks of 512/tick) or row 0 is
+            # DONE before the last row reaches decode and settle never sees B rows.
+            gen = ticks + 40 + b * (depth // 512 + 4)
+            need = 2 * (-(-(depth + gen) * b // BLOCK_TOKENS) + b)
             engine = build_engine(
                 cfg, model, backend,
                 num_blocks=max(256, need), num_slots=max(16, b),
-                max_batch=max(8, b), max_total_tokens=max(8192, depth + ticks + 64),
+                max_batch=max(8, b), max_total_tokens=max(8192, depth + gen + 64),
             )
             wids = [
                 engine.submit(
                     bk.rand_prompt(cfg.vocab_size, depth, seed=900 + depth + i),
-                    SamplingParams(temperature=0.0, max_new_tokens=8 + ticks + 4 * b + 32, seed=i),
+                    SamplingParams(temperature=0.0, max_new_tokens=gen, seed=i),
                 )
                 for i in range(b)
             ]
-            if not bk.settle_decode(engine, b, depth // 256):
+            if not bk.settle_decode(engine, b, depth * b // 128):
                 print(f"  {depth:>7} {b:>3}   (never reached pure decode — skipped)")
                 continue
             for _ in range(8):
@@ -181,26 +189,29 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
                 engine.step()
 
 
-def suite_prefill(gate, cfg, model, backend, engine, lengths):
+def suite_prefill(gate, cfg, model, backend, lengths):
     import benchkit as bk
+    from tilerl.engine import build_engine
 
+    cap = min(8192, cfg.max_position_embeddings)
+    engine = build_engine(cfg, model, backend, num_blocks=cap // 16 + 64, num_slots=16,
+                          max_batch=8, max_total_tokens=cap + 64)
     print("\n=== prefill-vs-length (tok/s) ===")
     print(f"  {'len':>7} {'ms/tok':>10} {'tok/s':>10}")
-    for length in lengths:
-        if length > cfg.max_position_embeddings or length > 8192:
-            continue  # serving-size pool caps max_total_tokens at 8192
+    for length in sorted({min(x, cap) for x in lengths}):
+        bk.time_prefill(engine, backend, cfg, length, 1.0)  # warm: JIT for this length
         ms, tps = bk.time_prefill(engine, backend, cfg, length, 1.0)
         print(f"  {length:>7} {ms / length:>10.4f} {tps:>10.1f}")
         gate.check("prefill", f"len{length}", tps)
 
 
-def suite_kv_reuse(gate, cfg, model, backend, engine):
+def suite_kv_reuse(gate, cfg, model, backend):
     """Prefix-cache: submit a shared long prefix, then requests reusing it.
     Measures hit-rate and warm-vs-cold prefill speedup."""
     import time as _t
 
     import benchkit as bk
-    from tilerl.engine import SamplingParams
+    from tilerl.engine import SamplingParams, build_engine
 
     print("\n=== kv-reuse / prefix-cache ===")
     # Prefix must be block-aligned (BLOCK_TOKENS=16) and leave suffix room under
@@ -210,6 +221,11 @@ def suite_kv_reuse(gate, cfg, model, backend, engine):
     cap = cfg.max_position_embeddings
     plen = min(2048, max(BLOCK_TOKENS, (cap - 128) // BLOCK_TOKENS * BLOCK_TOKENS))
     slen = 32
+    # Pool must hold the pinned prefix AND two live requests at once, or
+    # evict_until_free drops the store entry before the warm request (the
+    # serving-size 256-block pool did exactly that at plen=2048: hits 0).
+    engine = build_engine(cfg, model, backend, num_blocks=4 * (plen // BLOCK_TOKENS) + 64,
+                          num_slots=16, max_batch=8, max_total_tokens=plen + 256)
     prefix = bk.rand_prompt(cfg.vocab_size, plen, seed=42)
     # max_new_tokens>=2: publish happens only when the prefill completes with
     # phase != DONE, so a 1-token request finishes before it can publish.
@@ -258,10 +274,12 @@ def suite_train(gate, backend, source, gpu):
 
             torch.cuda.synchronize()
 
-    model_name = "qwen38-27b" if source else "tiny"
+    # 27B fp32 masters alone are 108 GB > one H20 (OOMs at 1x128): the GPU
+    # row covers the tape path on tiny. pending-remote: sharded/bf16 masters.
+    model_name = "tiny"
     cfg, mdl = _build_model(model_name, seed=0, keep_master=True)
     opt = AdamW(lr=1e-3)
-    shapes = [(2, 128), (2, 512)] if source is None else [(1, 512), (2, 512)]
+    shapes = [(2, 128), (2, 512)]
     print(f"\n=== training-step throughput ({model_name}) ===")
     print(f"  {'B x T':>10} {'ms/step':>10} {'tok/s':>12}")
     for b, t in shapes:
@@ -291,6 +309,7 @@ def main() -> int:
     ap.add_argument("--source", default=None, help="27B checkpoint dir (omit for tiny/CPU)")
     ap.add_argument("--gpu", type=int, default=None)
     ap.add_argument("--batches", default="1,8")
+    ap.add_argument("--depths", default=",".join(map(str, _KV_DEPTHS)))
     ap.add_argument("--ticks", type=int, default=20)
     ap.add_argument("--json", default=None)
     ap.add_argument("--reseed", action="store_true", help="record every row as the new baseline (no gate)")
@@ -308,6 +327,9 @@ def main() -> int:
 
     backend = get_backend()
     target = backend.arch
+    # Host load is the silent confounder: another tenant's nvcc/JIT on this
+    # host inflated B=8 ticks 60% in one run. Stamp it so a bad row is explainable.
+    print(f"host loadavg {os.getloadavg()[0]:.1f} / {os.cpu_count()} cpus, target {target}")
     gate = Gate(target, update_only=args.reseed)
     batches = [int(x) for x in args.batches.split(",")]
 
@@ -315,9 +337,9 @@ def main() -> int:
     default = ["train"] if args.source is None else ["decode-kv", "prefill", "kv-reuse", "train"]
     suites = [s for s in (args.suite.split(",") if args.suite else default) if s]
 
-    cfg = model = engine = None
+    cfg = model = None
     if any(s in gpu_suites or s == "micro" for s in suites):
-        from tilerl.cli import _build_engine, _build_model
+        from tilerl.cli import _build_model
         from tilerl.model import load_hf
         from tilerl.config import qwen38_27b
         if args.source:
@@ -326,15 +348,14 @@ def main() -> int:
             cfg = model.cfg
         else:
             cfg, model = _build_model("tiny", seed=0)
-        engine = _build_engine(cfg, model, backend)
 
     for s in suites:
         if s == "decode-kv":
-            suite_decode_kv(gate, cfg, model, backend, batches, _KV_DEPTHS, args.ticks)
+            suite_decode_kv(gate, cfg, model, backend, batches, [int(x) for x in args.depths.split(",")], args.ticks)
         elif s == "prefill":
-            suite_prefill(gate, cfg, model, backend, engine, _KV_DEPTHS)
+            suite_prefill(gate, cfg, model, backend, _KV_DEPTHS)
         elif s == "kv-reuse":
-            suite_kv_reuse(gate, cfg, model, backend, engine)
+            suite_kv_reuse(gate, cfg, model, backend)
         elif s == "train":
             suite_train(gate, backend, args.source, args.gpu)
         else:

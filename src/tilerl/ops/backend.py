@@ -526,6 +526,39 @@ class Backend:
             _THREADS,
         )
 
+    def attn_prep(self, qkv, wq, wk, positions, theta, rotary_dim, kv, layer_idx, hq, hkv, eps):
+        """Fused q/k norm + RoPE + K/V pool write off the fused-qkv output.
+        Returns normalized+rotated q [B,S,hq,D] (bf16). None if the arch has
+        no fused kernel — caller takes the unfused path."""
+        if "attn_prep" not in _resolve(self.precision, self.arch):
+            return None
+        pool = kv.kv_pool
+        k_plane, v_plane = pool.kv_layer(layer_idx)
+        b, s = qkv.shape[0], qkv.shape[1]
+        sql = getattr(kv, "seq_q_lens", None)
+        if sql is None:
+            sql = torch.full((b,), s, dtype=torch.int32)
+        pos = self._i32(positions)
+        if pos.ndim == 1:
+            pos = pos.unsqueeze(0).expand(b, -1)
+        return self._kernel("attn_prep")(
+            self._dev(qkv, torch.bfloat16).contiguous(),
+            self._f32(wq).contiguous(),
+            self._f32(wk).contiguous(),
+            pos.contiguous(),
+            self._inv_freq(int(rotary_dim), float(theta)).to(self.device),
+            k_plane,
+            v_plane,
+            self._i32(kv.block_table).contiguous(),
+            self._i32(kv.seq_len).contiguous(),
+            self._i32(sql).contiguous(),
+            float(eps),
+            int(hq),
+            int(hkv),
+            int(pool.k_pool.shape[-2]),
+            _THREADS,
+        )
+
     def attention_bwd(self, grad, q, k, v, scale):
         # ponytail: torch-eager backward, tilelang kernel when perf demands
         return reference.dense_attention_bwd(grad, q, k, v, float(scale))

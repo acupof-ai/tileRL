@@ -103,6 +103,7 @@ _SM90_KERNELS = {
     "linear_fp8_gemv": kernels_linear.make_linear_fp8_gemv,
     "quant_fp8": kernels_linear.make_quant_fp8_e4m3,
     "write_tokens": kernels_mma.make_write_tokens,
+    "attn_prep": kernels_mma.make_attn_prep,
     "gdn_decode_fused": kernels_gdn.make_gdn_decode_fused,
     "gdn_chunk_fused": kernels_gdn.make_gdn_chunk_fused,
     "paged_attention": kernels_attn.make_paged_attention_mma,

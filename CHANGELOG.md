@@ -4,6 +4,20 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-27 — phase exit: benchmark harness is the perf gate; verdict: decode is GEMV-bound, not launch-bound
+
+- **`tilerl bench --suite decode-kv,prefill,kv-reuse,train`** with a snapshot
+  baseline (≥0.97× passes, winners auto-raise). Decode-vs-KV-depth curve on
+  the 27B: 51.9/48.2/39.7/23.2 tok/s at 512/2k/8k/32k. Prefix cache confirmed
+  on GPU. 27B training on one H20 is pending-remote (fp32 masters = 108 GB).
+  Entry: `docs/experience/wins/2026-08-27-bench-harness.md`.
+- **Verdict reversed:** in-graph per-kernel profile shows GEMVs are 74% of the
+  B=1 tick (fp8 40%, fp4 34%), WGMMA 80% of B=8; launch count is a ~2% lever.
+  Entry: `docs/experience/errors/2026-08-27-kernel-count-verdict-refuted.md`.
+- **Shipped:** `attn_prep` fusion (+2%) and grouped fp8 GEMV (−8% on the big
+  shape): B=1 19.28 → 18.38 ms/tick, **54.4 tok/s** (Arle 84.5). Entry:
+  `docs/experience/wins/2026-08-27-attn-prep-fp8-gemv-grouped.md`.
+
 ## 2026-08-27 — phase exit: the 27B computes correct logits (zero-centered RMSNorm fixed)
 
 - **The 27B produces correct text for the first time.** Root cause of the

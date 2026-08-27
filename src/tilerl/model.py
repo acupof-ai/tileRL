@@ -289,6 +289,23 @@ class Model:
         if self._has(qkv_key):  # fused q/k/v (serving)
             qkv = self._linear(backend, h, qkv_key)
             q_rows = hq * d * (2 if cfg.full_attn_gated else 1)
+            b, t, _ = qkv.shape
+            qn = None
+            if cfg.full_attn_gated and not getattr(kv, "dense", False):
+                qn = backend.attn_prep(
+                    qkv, self.params[f"{p}.q_norm"], self.params[f"{p}.k_norm"], positions,
+                    cfg.rope_theta, cfg.effective_rotary_dim, kv, layer_idx, hq, hkv, cfg.rms_eps,
+                )
+            if qn is not None:  # sm90: norm+rope+kv-write done in one launch
+                gate = autograd.slice(autograd.reshape(
+                    autograd.slice(qkv, ..., slice(0, q_rows)), b, t, hq, 2, d), ..., 1, slice(None))
+                k_plane, v_plane = kv.kv_pool.kv_layer(layer_idx)
+                out = backend.paged_attention(
+                    qn, k_plane, v_plane, kv.block_table, kv.seq_len, 1.0 / math.sqrt(d),
+                    gate=gate, seq_q_lens=getattr(kv, "seq_q_lens", None),
+                )
+                out = self._linear(backend, autograd.reshape(out, b, t, hq * d), f"{p}.o_proj")
+                return backend.add(x, out)
             q = autograd.slice(qkv, ..., slice(0, q_rows))
             k = autograd.slice(qkv, ..., slice(q_rows, q_rows + hkv * d))
             v = autograd.slice(qkv, ..., slice(q_rows + hkv * d, None))
