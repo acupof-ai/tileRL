@@ -479,6 +479,10 @@ def build_random(
 
 # --- Checkpoint loading -----------------------------------------------------
 
+# Qwen3_5RMSNorm keys are zero-centered (y = x_normed * (1 + weight)); the GDN
+# gated norm is plain. Suffix-matched at load to fold the +1 into the weight.
+_ZERO_CENTERED_NORMS = ("input_norm", "post_attn_norm", "q_norm", "k_norm")
+
 #: HF suffix -> param key (layer index substituted by the caller).
 _LAYER_SUFFIXES: dict[str, str] = {
     "input_layernorm.weight": "input_norm",
@@ -870,6 +874,11 @@ def load_hf(
                 )
             if key.endswith(".conv1d") and tensor.ndim == 3:
                 tensor = tensor.reshape(tensor.shape[0], -1)  # [C,1,K]/[C,K,1] -> [C,K]
+            if key == "final_norm" or key.endswith(_ZERO_CENTERED_NORMS):
+                # Qwen3_5RMSNorm is zero-centered: y = x_normed * (1 + weight).
+                # Fold the +1 in at load so the kernel stays a plain RMSNorm.
+                # The GDN gated norm (gdn_norm) is NOT zero-centered — excluded.
+                tensor = (tensor.float() + 1.0).to(tensor.dtype)
             params[key] = tensor
 
     # Native FP8 weights: the e4m3 weight + per-128-block scale (+ per-row
@@ -989,7 +998,10 @@ def save_hf(model: Model, path: str | Path) -> None:
     for key in param_specs(cfg):
         hf = _hf_tensor_name(key)
         if key in model.params:
-            tensors[hf] = model.params[key]
+            t = model.params[key]
+            if key == "final_norm" or key.endswith(_ZERO_CENTERED_NORMS):
+                t = (t.float() - 1.0).to(t.dtype)  # undo load's zero-centered +1 fold
+            tensors[hf] = t
         elif f"{key}.wq" in model.params:
             stem = hf.removesuffix(".weight")
             for suffix in (".wq", ".scale", ".oscale"):

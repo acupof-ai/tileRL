@@ -1,9 +1,12 @@
 # Pod verification 2026-08-27 — where the 27B stands, and the #1 blocker
 
-> Read this first next session. Two GPU runs done (before and after the
-> rmsnorm grid fix). Verdict: **the model computes wrong logits — fix that
-> before any perf work.** Every throughput number is denominated on a model
-> that outputs garbage.
+> **RESOLVED 2026-08-27 evening: check 2 is GREEN.** The wrong-logits root cause
+> was zero-centered RMSNorm (`y = x_normed*(1+weight)`), not rope/mrope. Fixed
+> (fold +1 at load, -1 at save). Greedy decode now correct: "France"→" Paris…",
+> fib→correct code, "17+25"→"42". Full writeup:
+> `docs/experience/wins/2026-08-27-zero-centered-rmsnorm.md`. Perf work is now
+> unblocked and denominated on a correct model. History below kept for the
+> method (external-bisection beats cosine probes and internal parity).
 
 ## Checkpoint config (from /data00/Qwen3.8-27B-NVFP4/config.json)
 
@@ -43,6 +46,45 @@ the grid. health_probe confirms the forward is **finite and non-degenerate**
 (embedding norm 3.8, logits norm 1991, 3.8M distinct logit values) — so it is
 **wrong math, not a NaN/blowup**: plausible logits that argmax to a junk token.
 The 27B has **never had a reference-logits check** (audit C1).
+
+## UPDATE 2026-08-27 (evening): rope fixed but NOT sufficient; bug is wiring/weights
+
+The rotate_half fix (3c4d814) was a real bug but did NOT fix check 2 — pod
+re-run still collapses all 3 prompts to id 158949. So there is a SECOND bug.
+Systematic localization since:
+
+**Every op passes parity at REAL 27B dims** (`scripts/op_parity.py`, layer 0/3):
+- rmsnorm[hidden 5120] 5.4e-8, rmsnorm[head_dim 256] 1.2e-7
+- linear_fp8 2.6e-2 (= the e4m3 activation-quant tolerance, same as check 3)
+- silu_mul 4.4e-8, embedding 0.0
+- (linear_fp4 already verified by check 3: M=1 fro-relerr 0.0017)
+
+**Attention and GDN math match the HF source by inspection** (transformers
+5.6.0 `models/qwen3_5/modeling_qwen3_5.py`, on the pod):
+- attn q_proj gate split: HF `chunk(view(..., H, 2*head_dim), 2, -1)` = tileRL's
+  `reshape(b,t,hq,2,d)` per-head [query|gate]. ✓ Order q_norm→rope→attn→
+  ×sigmoid(gate)→o_proj matches (`attn_output_gate:True`, `output_gate_type:swish`
+  = sigmoid gate). ✓
+- GDN: conv→silu→split[k,k,v], q/k l2norm + scale `1/sqrt(key_dim)` on q only,
+  GQA `repeat_interleave(nvh//nkh)`, gated RMSNorm `norm(core)*w*silu(z)` — all
+  match tileRL's `gdn_forward`. ✓
+- **H2 (mrope interleaved) RULED OUT**: HF `apply_interleaved_mrope` picks freqs
+  per axis by `slice(offset,len,3)`, but for TEXT position_ids T=H=W are equal,
+  so every axis reads the same freq → collapses to plain 1D RoPE. Not the bug.
+
+The cross-prompt cosine probe (`health_probe.py`, rewritten) shows the residual
+stream's cross-prompt cosine climbing embed 0.001 → L6 0.99 → plateau 0.998, and
+per-sublayer added-delta cosine ~1.0 from L1 on. BUT this signal is **not proof**
+of a bug — real transformers have massive-activation shared directions with
+cos>0.99. It only says "prompts converge", consistent with either a bug or
+normal massive activations.
+
+**Conclusion: the bug is wiring or weight interpretation, not a kernel.** Next:
+`scripts/hf_reference.py` runs the checkpoint through HF transformers for the
+ground-truth first token + per-layer hidden norms, to bisect tileRL against a
+known-correct forward. Prime remaining suspects (all wiring, invisible to
+op-parity): fp8/fp4 layer-split routing, the fused-projection slice boundaries,
+q/k/v/gate slice order in the real (unfused) load path.
 
 ### Two concrete, testable RoPE hypotheses (ranked) — 2026-08-27
 

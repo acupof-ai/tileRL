@@ -44,6 +44,15 @@ _SIMPLE = {
 }
 
 
+#: Zero-centered norm keys: load_hf folds +1, so the loaded value is disk + 1.
+_ZC = ("input_norm", "post_attn_norm", "q_norm", "k_norm")
+
+
+def _load_norm(key, t):
+    """Expected loaded value for an unquantized disk tensor (folds the norm +1)."""
+    return (t.float() + 1.0).to(t.dtype) if (key == "final_norm" or key.endswith(_ZC)) else t
+
+
 def _hf_name(key: str) -> str:
     if key == "embed_tokens":
         return "model.language_model.embed_tokens.weight"
@@ -58,8 +67,17 @@ def _hf_name(key: str) -> str:
 def _write_checkpoint(d, cfg, params) -> None:
     """Write a tiny Qwen-format safetensors checkpoint + config.json."""
     n = cfg.num_layers
+    # On disk uses HF's zero-centered norm convention (load_hf folds +1 back in);
+    # in-memory params carry the folded value, so undo it for the norm keys.
+    zc = ("input_norm", "post_attn_norm", "q_norm", "k_norm")
+
+    def _disk(k, t):
+        return (t.float() - 1.0).to(t.dtype) if (k == "final_norm" or k.endswith(zc)) else t
+
     tensors = {
-        _hf_name(k): t.contiguous() for k, t in params.items() if not k.endswith((".wq", ".scale"))
+        _hf_name(k): _disk(k, t).contiguous()
+        for k, t in params.items()
+        if not k.endswith((".wq", ".scale"))
     }
     save_file(tensors, str(d / "model.safetensors"))
     layer_types = [
@@ -358,7 +376,7 @@ def test_nvfp4_modelopt_load(tmp_path):
             expected_fp8[key] = (w, si.float())
         else:
             tensors[hf] = t
-            expected[key] = t
+            expected[key] = _load_norm(key, t)
     # vision tower / MTP head: present in the checkpoint, ignored by load_hf
     tensors["model.visual.vision_tower.patch_embed.weight"] = torch.randn(
         4, 4, dtype=torch.bfloat16
@@ -485,7 +503,7 @@ def test_nvfp4_official_load(tmp_path, fp4):
             expected_fp8[key] = (w, torch.ones(((n + 127) // 128), ((k + 127) // 128)), oscale)
         else:
             tensors[hf] = t
-            expected[key] = t
+            expected[key] = _load_norm(key, t)
     save_file(tensors, str(tmp_path / "model.safetensors"))
     layer_types = [
         "full_attention" if i in cfg.full_attn_layer_set else "linear_attention"
@@ -613,7 +631,7 @@ def test_awq_load(tmp_path):
             expected[key] = ref_awq(qweight, scales, qzeros)
         else:
             tensors[hf] = t
-            expected[key] = t
+            expected[key] = _load_norm(key, t)
     save_file(tensors, str(tmp_path / "model.safetensors"))
     layer_types = [
         "full_attention" if i in cfg.full_attn_layer_set else "linear_attention"
@@ -702,7 +720,7 @@ def test_mlx_affine_load(tmp_path):
             expected[key] = ref_mlx(packed, scales, biases)
         else:
             tensors[hf] = t
-            expected[key] = t
+            expected[key] = _load_norm(key, t)
     save_file(tensors, str(tmp_path / "model.safetensors"))
     layer_types = [
         "full_attention" if i in cfg.full_attn_layer_set else "linear_attention"

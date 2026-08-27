@@ -1,19 +1,17 @@
-"""Full-chain health probe: run one prefill through the 27B and report, per
-layer, the output-norm and a finite-check — so a bug that poisons the forward
-(a grid overflow, a NaN, a degenerate op) is localized to the LAYER and the
-OP, not seen only as a garbage final logit.
+"""Localize check-2 (input-independent output) by tracking, layer by layer,
+the last-token residual COSINE between two DIFFERENT prompts. check 2 collapses
+every prompt to the same token, so the prompt signal dies somewhere in the
+stack. The first layer whose cross-prompt cosine jumps to ~1.0 is where the
+input stops mattering — inspect that op.
 
-This is the instrument that was missing when check 2 of verify_h20_fp4.py
-failed: it saw the output collapse to one token but could not say WHERE. A
-sticky CUDA launch error (e.g. rmsnorm grid.y > 65535 at large M) shows up
-here as the first layer whose norm goes non-finite or to zero.
+A norm/finite check can't see this: both streams stay finite and plausibly
+normed while silently converging. Cosine catches it.
 
   PYTHONPATH=src TILERL_TARGET=cuda python3 -u scripts/health_probe.py \
       /data00/Qwen3.8-27B-NVFP4 --gpu 7 [--tokens 256]
 
-Prints a per-layer table (norm, min/max, finite) and the first bad layer.
-Exit 0 if every layer is finite and non-degenerate, 1 otherwise. Dev tooling,
-no bench entry. CPU/metal work too (drop --gpu), for a tiny-model smoke.
+Exit 0 if cosine stays < 0.99 through the stack, 1 otherwise. Dev tooling, no
+bench entry. CPU/metal work too (drop --gpu) for a tiny-model smoke.
 """
 
 from __future__ import annotations
@@ -61,62 +59,75 @@ def main() -> int:
         args.tokens = min(args.tokens, 16)
 
     n = min(args.tokens, cfg.max_position_embeddings)
-    ids = np.arange(1, n + 1, dtype=np.int64).reshape(1, n) % cfg.vocab_size
+    # Two DISTINCT prompts. check 2 collapses all prompts to the same token, so
+    # the output is ~input-independent: the prompt signal dies somewhere. Track
+    # the last-token residual cosine BETWEEN the two prompts, layer by layer.
+    # The first layer whose cosine jumps to ~1.0 is where the input stops
+    # mattering — that op (or its predecessor) is the bug. A norm/finite check
+    # alone can't see this: both streams stay finite and plausibly-normed.
+    rng = np.random.default_rng(0)
+    ids_a = rng.integers(1, cfg.vocab_size, size=n, dtype=np.int64).reshape(1, n)
+    ids_b = rng.integers(1, cfg.vocab_size, size=n, dtype=np.int64).reshape(1, n)
     positions = np.arange(n, dtype=np.int64)
 
-    # Hook: capture each layer's residual-stream output norm by wrapping the
-    # model's per-layer forward. We probe the residual stream between layers —
-    # the one tensor every layer reads and writes — so a broken op inside any
-    # layer shows as that layer's output going non-finite or flat.
     from tilerl.train import _training_kv
 
-    kv = _training_kv(model, 1, n, device=backend.device)
+    def run(ids: np.ndarray):
+        # Manual per-layer forward mirroring Model.forward. For each SUBLAYER we
+        # capture the added residual delta (out - x), last token — not just the
+        # residual. A sublayer that washes out the input has an input-INDEPENDENT
+        # delta: its cross-prompt cosine → 1 even while its input still varied.
+        # That pins the culprit op, which the whole-residual cosine cannot (the
+        # residual is dominated by a large shared component in any real model).
+        kv = _training_kv(model, 1, n, device=backend.device)
+        pos = torch.as_tensor(positions, dtype=torch.long, device=backend.device)
+        x = backend.embedding(
+            torch.as_tensor(ids, dtype=torch.long, device=backend.device),
+            model.params["embed_tokens"],
+        )
+        caps = [("embed", x.detach()[0, -1].float().clone())]
+        linear_idx = 0
+        for i in range(cfg.num_layers):
+            x0 = x
+            if cfg.is_full_attn(i):
+                x = model._full_attn(i, x, pos, kv, backend)
+                tag = f"attn{i}"
+            else:
+                x = model._gdn(i, linear_idx, x, kv, backend)
+                linear_idx += 1
+                tag = f"gdn{i}"
+            caps.append((tag + "Δ", (x - x0).detach()[0, -1].float().clone()))
+            x1 = x
+            x = model._mlp(i, x, backend)
+            caps.append((f"mlp{i}Δ", (x - x1).detach()[0, -1].float().clone()))
+        x = backend.rmsnorm(x, model.params["final_norm"], cfg.rms_eps)
+        head = "embed_tokens" if cfg.tie_word_embeddings else "lm_head"
+        logits = model._linear(backend, x, head)
+        caps.append(("logits", logits.detach()[0, -1].float().clone()))
+        return caps
 
-    rows = []
-    bad = None
-
-    def probe(name: str, t: torch.Tensor):
-        nonlocal bad
-        tf = t.detach().float()
-        finite = bool(torch.isfinite(tf).all())
-        norm = float(tf.norm().item()) if finite else float("nan")
-        mn, mx = (float(tf.min()), float(tf.max())) if finite else (float("nan"), float("nan"))
-        distinct = int(tf.flatten().unique().numel())
-        row = (name, norm, mn, mx, finite, distinct)
-        rows.append(row)
-        if bad is None and (not finite or norm == 0.0 or distinct < 4):
-            bad = row
-
-    # Manual forward with per-layer probing. Uses the model's public forward
-    # building blocks; if the model exposes no per-layer seam we fall back to
-    # probing embedding -> full forward -> logits (coarse but still catches a
-    # global poison).
     try:
-        idx = backend._i32(torch.as_tensor(ids.reshape(-1)))
-        h = backend.embedding(idx, model.params["embed_tokens"])
-        probe("embedding", h)
-        logits = model.forward(ids, positions, kv, backend)
-        probe("logits", logits.reshape(-1, cfg.vocab_size))
-    except Exception as exc:  # a launch error surfaces here — report it as the bad point
+        ca, cb = run(ids_a), run(ids_b)
+    except Exception as exc:
         print(f"\nFORWARD RAISED: {type(exc).__name__}: {exc}")
-        if rows:
-            _print(rows)
-        print(f"\nfirst failure at/after: {rows[-1][0] if rows else 'embedding'}")
         return 1
 
-    _print(rows)
+    print(f"\n{'probe':<10} {'|a|':>11} {'|b|':>11} {'cos(a,b)':>10} {'finite':>7}")
+    print("-" * 54)
+    bad = None
+    for (na, va), (_, vb) in zip(ca, cb):
+        fin = bool(torch.isfinite(va).all() and torch.isfinite(vb).all())
+        cos = float(torch.nn.functional.cosine_similarity(va, vb, dim=0)) if fin else float("nan")
+        print(f"{na:<10} {va.norm():>11.3e} {vb.norm():>11.3e} {cos:>10.4f} {str(fin):>7}")
+        # A sublayer whose ADDED delta is ~input-independent (cos>0.99) is the
+        # op washing out the prompt. embed/logits rows are residuals, skip them.
+        if bad is None and na.endswith("Δ") and (not fin or cos > 0.99):
+            bad = (na, cos)
     if bad:
-        print(f"\nBAD LAYER: {bad[0]} (norm={bad[1]:.3e} finite={bad[4]} distinct={bad[5]})")
+        print(f"\nSIGNAL DIES AT: {bad[0]} (cos={bad[1]:.4f}) — inspect this layer's ops")
         return 1
-    print("\nall probes finite and non-degenerate")
+    print("\nprompt signal preserved through the stack (cos stays < 0.99)")
     return 0
-
-
-def _print(rows) -> None:
-    print(f"\n{'probe':<16} {'norm':>12} {'min':>12} {'max':>12} {'finite':>7} {'distinct':>9}")
-    print("-" * 72)
-    for name, norm, mn, mx, finite, distinct in rows:
-        print(f"{name:<16} {norm:>12.3e} {mn:>12.3e} {mx:>12.3e} {str(finite):>7} {distinct:>9}")
 
 
 if __name__ == "__main__":

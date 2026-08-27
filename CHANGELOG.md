@@ -4,6 +4,22 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-27 — phase exit: the 27B computes correct logits (zero-centered RMSNorm fixed)
+
+- **The 27B produces correct text for the first time.** Root cause of the
+  wrong-logits collapse (check 2, all prompts → junk id 158949): Qwen3.5 uses
+  **zero-centered RMSNorm `y = x_normed * (1 + weight)`** (HF weight init is
+  zeros), but tileRL applied plain `* weight` on all five non-gated norm sites
+  (input/post_attn/q/k/final) — a ~2× per-layer residual blowup. The GDN gated
+  norm was already correct (not zero-centered). Fix: fold `+1` at load, `-1` at
+  save; zero kernel/hot-path change, 3 lines. Now: "France" → " Paris…",
+  Fibonacci → correct code, "17+25" → "42". Checks 1/2/3 PASS; throughput
+  unchanged 0.97× — now on a CORRECT model. Found by external-ground-truth
+  bisection against HF transformers (`hf_reference.py`/`hf_bisect.py`), not by
+  cosine probes (inconclusive) or internal parity (kernel+reference shared the
+  bug). Entry: `docs/experience/wins/2026-08-27-zero-centered-rmsnorm.md`,
+  `docs/experience/2026-08-27-pod-verification.md`.
+
 ## 2026-08-27 — verdict: the fp4 GEMV's load width is measurable, register-resident B is expressible
 
 - **Both answers are "yes, and here is the instrument" — neither is a perf
