@@ -464,16 +464,6 @@ def test_production_model_gradcheck():
     batch = np.random.default_rng(3).integers(3, cfg.vocab_size, size=(2, 16)).astype(np.int64)
     positions = np.arange(16, dtype=np.int64)
 
-    def _ce(logits, ids):
-        log_probs = torch.log_softmax(logits.float(), dim=-1)
-        targets = torch.as_tensor(ids[:, 1:], dtype=torch.long, device=logits.device)
-        loss = -log_probs[:, :-1].gather(-1, targets.unsqueeze(-1)).mean()
-        d = torch.softmax(logits.float(), dim=-1)
-        d[:, :-1].scatter_add_(
-            -1, targets.unsqueeze(-1), -torch.ones_like(targets.unsqueeze(-1), dtype=torch.float32)
-        )
-        return float(loss), (d / (ids.shape[0] * (ids.shape[1] - 1))).to(logits.dtype)
-
     def loss_and_grads():
         from tilerl.train import _training_kv
 
@@ -481,7 +471,12 @@ def test_production_model_gradcheck():
         tape = Tape()
         with torch.no_grad(), tape:
             logits = model.forward(batch, positions, kv, RecordingBackend(backend))
-        loss, dlogits = _ce(logits, batch)
+        # The production CE, not a local re-derivation: the old local _ce
+        # left a spurious softmax on the final position, manufacturing a
+        # 16-106% analytic-vs-numeric disagreement that forced an absolute
+        # 0.2 tolerance — under which 9/9 injected gradient corruptions
+        # passed.
+        loss, dlogits = backend.cross_entropy_loss_grad(logits, batch)
         return loss, tape.backward(dlogits)
 
     loss, grads = loss_and_grads()
@@ -493,9 +488,9 @@ def test_production_model_gradcheck():
         assert torch.isfinite(g).all(), f"non-finite grad for {k}"
 
     # Numerical spot-check: one element each from embed, a full-attn weight,
-    # a GDN weight, and final_norm. The step must survive bf16 rounding
-    # (bf16 eps ~0.008 at magnitude 1), so the tolerance is loose — this gate
-    # catches silent gradient errors (a missing/wrong backward), not precision.
+    # a GDN weight, and final_norm. With the production CE the worst clean
+    # rel error is 3.6% (measured); rtol=0.1 catches every injected gradient
+    # corruption — the old absolute 0.2 tolerance passed 9/9 of them.
     step = 0.1
     for key in ("embed_tokens", "layers.0.q_proj", "layers.1.in_proj_qkv", "final_norm"):
         p = model.params[key]
@@ -508,7 +503,9 @@ def test_production_model_gradcheck():
         lm, _ = loss_and_grads()
         p[idx] = orig
         numeric = (lp - lm) / (2 * step)
-        assert abs(analytic - numeric) < 0.2, f"{key}: tape {analytic:.4e} vs numeric {numeric:.4e}"
+        assert abs(analytic - numeric) < 0.1 * abs(numeric), (
+            f"{key}: tape {analytic:.4e} vs numeric {numeric:.4e}"
+        )
 
 
 def test_opd_loop_smoke():

@@ -20,6 +20,12 @@ Measured sensitivity for the rope half: a 10x-wrong `rope_theta` moves attention
 Fix: 4 lines in the `checks` dict + a derived tie check (raise if a `lm_head.*` tensor exists while `cfg.tie_word_embeddings`). Caveat: `model.py:661` reads `text_config`; HF multimodal configs put `tie_word_embeddings` at the top level, so a `text_cfg`-only check silently no-ops.
 
 ### C2. The gradient gate is inert — 9 of 9 injected gradient corruptions pass
+**FIXED 2026-08-27.** The test now calls `backend.cross_entropy_loss_grad`
+(the production CE) instead of its local `_ce`, which left a spurious softmax
+on the final position and manufactured the 16–106% disagreement that forced
+the absolute `< 0.2` tolerance. Tolerance is now `rtol=0.1` (clean worst rel
+error 3.6%, measured). Verified: zeroing `gdn_backward`'s `g_q` now fails
+`test_production_model_gradcheck` — it passed before.
 `tests/test_e2e.py::test_production_model_gradcheck` passed under every poison injected (from outside the tree, via a pytest plugin): residual-branch gradient ×0.5, ×−1 (sign flip), ×0 (no gradient reaches any block), silu gate/up swapped, GDN grads halved, linear weight-grad negated, rmsnorm weight-grad zeroed. **5 of the 9 pass the entire 97-test suite unchanged.** Zeroing any of `gdn_backward`'s 11 grads, or either `attention_gate_bwd` grad, leaves the suite green — 97 passed, 4 skipped, byte-identical to baseline.
 
 Root cause is a live bug **in the gate itself**: its CE helper (`test_e2e.py:412-418`) scatters the −1 into `d[:, :-1]` but leaves a spurious gradient on the final position, so the "analytic" side is not the gradient of the loss it finite-differences — a manufactured 16–106% disagreement, which is what forced the absolute `< 0.2` tolerance at `test_e2e.py:452` against gradients of magnitude 2e-4 to 1e-1. Production is correct (`ops/reference.py:895-899`), so no shipped run has wrong gradients; both backwards measure 6.6e-7 against `torch.autograd`. What is broken is the only thing standing between the next fused/GPU backward and a silent wrong gradient. Fix: call `backend.cross_entropy_loss_grad` from the test, then `rtol=0.1` — with the CE fixed, clean worst rel error is 3.6% and every poison fires.
