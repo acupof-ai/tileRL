@@ -49,4 +49,4 @@ per-tick kernel — cache it or store the served dtype.
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
-| 2026-08-28 | see bench-baseline.json | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | 0.55 | 13.35 (B=1, d512) | **74.9** B=1 (+21% vs 61.7); B=8 agg **212.6** (+15%); 69.0 @2k, 52.5 @8k, 27.1 @32k |
+| 2026-08-28 | 5d19aee | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | 0.55 | 13.35 (B=1, d512) | **74.9** B=1 (+21% vs 61.7); B=8 agg **212.6** (+15%); 69.0 @2k, 52.5 @8k, 27.1 @32k |
