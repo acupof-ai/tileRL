@@ -4,6 +4,17 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — residual add in the GEMV epilogue — B=1 83.9 tok/s (99% of Arle's 84.5)
+
+- **B=1 82.0 → 83.9 tok/s (+2.4%)**, verify 1–3 PASS, B=8 flat, prefill −2%
+  (inside the 3% gate). The three residual GEMVs (o_proj, down, out_proj)
+  write `Res + y·oscale` in f32 on the serving path (`Model._add_via`); the
+  tape path keeps `backend.add`. n_partition sweep: 2 ≈ 4 > 8 > 16.
+  Entry: `docs/experience/wins/2026-08-28-decode-glue-casts.md`.
+- Day total: 52.6 → 83.9 tok/s B=1, 142.7 → 212.5 agg B=8, prefill 1566 →
+  1795 tok/s. Left on the table: the conv-window gather/scatter (needs a
+  double-buffered pool), GEMV occupancy (7 blocks/SM), and B=8's WGMMA path.
+
 ## 2026-08-28 — verdict: packed-math fp8 GEMV — B=1 82.0 tok/s (97% of Arle)
 
 - **B=1 74.9 → 82.0 tok/s (+9.5%)**, verify 1–3 PASS. ncu in the real model

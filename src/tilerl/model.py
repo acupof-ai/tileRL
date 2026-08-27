@@ -257,21 +257,31 @@ class Model:
         return key in self.params or _quantized(self.params, key)
 
     # -- linear dispatch (fp4-packed / native-fp8 when present, plain bf16 otherwise) ----
-    def _linear(self, backend: "Backend", x: torch.Tensor, key: str) -> torch.Tensor:
+    def _linear(self, backend: "Backend", x: torch.Tensor, key: str, residual=None) -> torch.Tensor:
+        """``residual``: the stream to add in the GEMV epilogue (serving only —
+        the caller passes it when the backend fuses it and no tape is watching)."""
+        kw = {} if residual is None else {"residual": residual}
         wq, osc = self.params.get(key + ".wq"), self.params.get(key + ".oscale")
         if wq is not None:
             # ``master`` is recording-only: the STE grad lands on it
             # (autograd.RecordingBackend). Fused projection keys are
             # serving-only and have none — the tape never sees them.
             scale = self.params[key + ".scale"]
-            return backend.linear_fp4(x, wq, scale, master=self.params.get(key), oscale=osc)
+            return backend.linear_fp4(x, wq, scale, master=self.params.get(key), oscale=osc, **kw)
         w8 = self.params.get(key + ".w8")
         if w8 is not None:
             # Native fp8 (sm90 only — elsewhere Backend.materialize already
             # turned these into a bf16 weight); master is recording-only.
             wscale = self.params[key + ".wscale"]
-            return backend.linear_fp8(x, w8, wscale, master=self.params.get(key), oscale=osc)
-        return backend.linear(x, self.params[key])
+            return backend.linear_fp8(x, w8, wscale, master=self.params.get(key), oscale=osc, **kw)
+        return backend.linear(x, self.params[key], **kw)
+
+    def _add_via(self, backend: "Backend", kv: Any, x: torch.Tensor, h: torch.Tensor, key: str):
+        """x + linear(h): fused into the GEMV epilogue on the serving path,
+        backend.add (tape-recorded) otherwise."""
+        if getattr(backend, "fuses_residual", False) and not getattr(kv, "dense", False):
+            return self._linear(backend, h, key, residual=x)
+        return backend.add(x, self._linear(backend, h, key))
 
     # -- full attention layer ----------------------------------------------
     def _full_attn(
@@ -305,8 +315,7 @@ class Model:
                     qn, k_plane, v_plane, kv.block_table, kv.seq_len, 1.0 / math.sqrt(d),
                     gate=gate, seq_q_lens=getattr(kv, "seq_q_lens", None),
                 )
-                out = self._linear(backend, autograd.reshape(out, b, t, hq * d), f"{p}.o_proj")
-                return backend.add(x, out)
+                return self._add_via(backend, kv, x, autograd.reshape(out, b, t, hq * d), f"{p}.o_proj")
             q = autograd.slice(qkv, ..., slice(0, q_rows))
             k = autograd.slice(qkv, ..., slice(q_rows, q_rows + hkv * d))
             v = autograd.slice(qkv, ..., slice(q_rows + hkv * d, None))
@@ -346,8 +355,7 @@ class Model:
                 gate=gate,
                 seq_q_lens=getattr(kv, "seq_q_lens", None),
             )
-        out = self._linear(backend, autograd.reshape(out, b, t, hq * d), f"{p}.o_proj")
-        return backend.add(x, out)
+        return self._add_via(backend, kv, x, autograd.reshape(out, b, t, hq * d), f"{p}.o_proj")
 
     # -- gated-delta (linear attention) layer -------------------------------
     def _gdn(
@@ -409,11 +417,10 @@ class Model:
                 kv.state_pool.states, kv.state_pool.conv_windows, kv.state_slot, linear_idx,
                 new_state, new_window,
             )
-        out = self._linear(backend, out, f"{p}.out_proj")
-        return backend.add(x, out)
+        return self._add_via(backend, kv, x, out, f"{p}.out_proj")
 
     # -- MLP ----------------------------------------------------------------
-    def _mlp(self, layer_idx: int, x: torch.Tensor, backend: "Backend") -> torch.Tensor:
+    def _mlp(self, layer_idx: int, x: torch.Tensor, kv: Any, backend: "Backend") -> torch.Tensor:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.post_attn_norm"], cfg.rms_eps)
@@ -426,8 +433,7 @@ class Model:
             gate = self._linear(backend, h, f"{p}.gate_proj")
             up = self._linear(backend, h, f"{p}.up_proj")
         activated = backend.silu_mul(gate, up)
-        down = self._linear(backend, activated, f"{p}.down_proj")
-        return backend.add(x, down)
+        return self._add_via(backend, kv, x, activated, f"{p}.down_proj")
 
     # -- full forward --------------------------------------------------------
     def forward(
@@ -452,7 +458,7 @@ class Model:
             else:
                 x = self._gdn(i, linear_idx, x, kv, backend)
                 linear_idx += 1
-            x = self._mlp(i, x, backend)
+            x = self._mlp(i, x, kv, backend)
         x = backend.rmsnorm(x, self.params["final_norm"], cfg.rms_eps)
         head_key = "embed_tokens" if cfg.tie_word_embeddings else "lm_head"
         return self._linear(backend, x, head_key)

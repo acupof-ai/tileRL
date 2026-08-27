@@ -430,7 +430,7 @@ def make_linear_fp4_gemv(target: str, GROUP: int = 4):
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
-    def linear_fp4_gemv(X, WQ, Scale, OScale, reduce_thread, n_partition, block):
+    def linear_fp4_gemv(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
         N, K = T.const("N, K")
         assert block % 16 == 0  # one scale per 16-elem tile (block 16) or per two (32)
         micro = 16
@@ -441,7 +441,8 @@ def make_linear_fp4_gemv(target: str, GROUP: int = 4):
         WQ: T.Tensor((N, K // 2), "uint8")
         Scale: T.Tensor((N, K // block), "float32")
         OScale: T.Tensor((N,), "float32")  # per-row epilogue scale, folded (was a torch mul)
-        Y = T.empty((1, N), "bfloat16")
+        Res: T.Tensor((1, N), "float32")  # residual stream (zeros when none): Y = Res + y
+        Y = T.empty((1, N), "float32")
         with T.Kernel(T.ceildiv(N, n_partition), threads=(reduce_thread, n_partition)) as bx:
             T.import_source(_FP4_TWIDDLE_SRC)
             kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
@@ -479,7 +480,7 @@ def make_linear_fp4_gemv(target: str, GROUP: int = 4):
                     )
                 )
             if kr == 0:
-                Y[0, n] = T.cast(reduced[0] * OScale[n], "bfloat16")
+                Y[0, n] = Res[0, n] + reduced[0] * OScale[n]
         return Y
 
     return linear_fp4_gemv
@@ -573,7 +574,7 @@ def make_linear_fp8_gemv(target: str, GROUP: int = 4):
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
-    def linear_fp8_gemv(X, W8, WScale, OScale, reduce_thread, n_partition):
+    def linear_fp8_gemv(X, W8, WScale, OScale, Res, reduce_thread, n_partition):
         N, K = T.const("N, K")
         micro_size_k = 16  # 128-bit transaction / 8-bit e4m3
         block_K = reduce_thread * micro_size_k  # 512 = 4 scale blocks of 128
@@ -583,6 +584,7 @@ def make_linear_fp8_gemv(target: str, GROUP: int = 4):
         W8: T.Tensor((N, K), "float8_e4m3fn")
         WScale: T.Tensor((T.ceildiv(N, 128), T.ceildiv(K, 128)), "float32")
         OScale: T.Tensor((N,), "float32")  # per-row epilogue scale, folded (was a torch mul)
+        Res: T.Tensor((1, N), "float32")  # residual stream (zeros when none): Y = Res + y
         Y = T.empty((1, N), "float32")
         with T.Kernel(T.ceildiv(N, n_partition), threads=(reduce_thread, n_partition)) as bx:
             T.import_source(_FP4_TWIDDLE_SRC)
@@ -622,7 +624,7 @@ def make_linear_fp8_gemv(target: str, GROUP: int = 4):
                     )
                 )
             if kr == 0:
-                Y[0, n] = reduced[0] * OScale[n]
+                Y[0, n] = Res[0, n] + reduced[0] * OScale[n]
         return Y
 
     return linear_fp8_gemv

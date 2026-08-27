@@ -37,6 +37,14 @@ B=1:
   `errors/2026-08-28-gdn-inplace-raw-serialized.md` for the ×8.7 first cut.
 - silu_mul bf16 in AND out on sm90.
 
+- Residual add folded into the GEMV epilogue (`Res[0, n] + y * OScale[n]`,
+  f32 out; `Model._add_via` uses it on the serving path only — the tape keeps
+  `backend.add`). The fp4 GEMV now writes f32, so attn_prep / silu / GDN a,b
+  read f32 straight from it. +2.4% (82.0 → 83.9 tok/s); prefill −2%
+  (attn_prep reads 2× bytes at S=512, inside the gate).
+- Also measured dead: n_partition 2/8/16 (4 stays), int32 graph buffers and
+  bf16 GDN a/b (tick-neutral, kept for fewer launches).
+
 Kernels per 8-layer tick 321 -> 192; GPU-busy 2.89 -> 2.10 ms (in-graph).
 
 ## Rule

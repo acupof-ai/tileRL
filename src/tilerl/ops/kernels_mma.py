@@ -94,7 +94,7 @@ def make_attn_prep(target: str):
         RD2 = T.const("RD2")
         NB = T.const("NB")
         Mb = T.const("Mb")
-        QKV: T.Tensor((B, S, NQKV), "bfloat16")
+        QKV: T.Tensor((B, S, NQKV), "float32")  # the fp4 GEMV writes f32
         Wq: T.Tensor((D,), "float32")
         Wk: T.Tensor((D,), "float32")
         Positions: T.Tensor((B, S), "int32")
@@ -142,7 +142,7 @@ def make_attn_prep(target: str):
                 rstdk = T.rsqrt(var[0] / D + eps)
                 for d in T.Parallel(D):
                     KPool[blk, h, off, d] = T.cast(T.cast(QKV[b, t, k0 + d], "float32") * rstdk * Wk[d], "bfloat16")
-                    VPool[blk, h, off, d] = QKV[b, t, v0 + d]
+                    VPool[blk, h, off, d] = T.cast(QKV[b, t, v0 + d], "bfloat16")
                 for d in T.Parallel(RD2):
                     ang = posf * InvFreq[d]
                     c = T.cos(ang)

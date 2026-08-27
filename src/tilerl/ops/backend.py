@@ -271,7 +271,11 @@ class Backend:
 
     # ------------------------------------------------------------ linear
 
-    def linear(self, x, w, bias=None):
+    #: linear_fp4/linear_fp8/linear accept ``residual=`` (serving-only: the tape
+    #: records backend.add instead, its backward needs the separate op).
+    fuses_residual = True
+
+    def linear(self, x, w, bias=None, residual=None):
         lead, x2 = self._rows(x)
         w = self._dev(w, x2.dtype)
         M, K, N = x2.shape[0], x2.shape[1], w.shape[0]
@@ -281,7 +285,8 @@ class Backend:
             # to 16 WGMMA rows; the K-tail is zero-padded like the WGMMA path.
             kernel, _, Np, Kp, _, bN = plan
             y = self._kernel(kernel)(_pad2d(x2, 1, Kp), _pad2d(w, Np, Kp), 32, bN)[:1, :N]
-            return (y if bias is None else y + self._f32(bias)).reshape(*lead, N)
+            y = (y if bias is None else y + self._f32(bias)).reshape(*lead, N)
+            return y if residual is None else y + residual
         bM, bN = min(64, M), min(64, N)
         # _f32 before the cuda branch: every target needs the bias on-device.
         bias = (
@@ -297,7 +302,8 @@ class Backend:
             w = _pad2d(w, _round_up(N, bN), _round_up(K, 32))
             bias = _pad1d(bias, w.shape[0])
         y = self._kernel("gemm_nt")(x2, w, bias, bM, bN, _THREADS)
-        return y[:M, :N].reshape(*lead, N)
+        y = y[:M, :N].reshape(*lead, N)
+        return y if residual is None else y + residual
 
     def linear_bwd(self, grad, x, w):
         io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
@@ -348,7 +354,7 @@ class Backend:
             wq._tl_twiddled = True
         return wq
 
-    def linear_fp4(self, x, wq, scale, master=None, oscale=None):
+    def linear_fp4(self, x, wq, scale, master=None, oscale=None, residual=None):
         # ``master`` is recording-only (the STE grad lands on it); the kernel
         # uses wq/scale.
         wq = self._served_fp4(wq)
@@ -365,8 +371,14 @@ class Backend:
                 # Decode GEMV: one activation row, stream+dequant WQ once; the
                 # per-row oscale is folded into the kernel epilogue.
                 osc = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
-                y2 = self._kernel(kernel)(_pad2d(x2, 1, Kp), wq, scale, osc, 32, bN, blk)[:1, :N]
-                return self._epilogue(y2, None, lead, N)
+                res = self._residual(residual, N, Np)
+                if res is not None:  # residual add fused into the epilogue
+                    y2 = self._kernel(kernel)(_pad2d(x2, 1, Kp), wq, scale, osc, res, 32, bN, blk)
+                    return y2[:1, :N].reshape(*lead, N)
+                y2 = self._kernel(kernel)(
+                    _pad2d(x2, 1, Kp), wq, scale, osc, self._residual(None, N, Np), 32, bN, blk
+                )[:1, :N]
+                return self._epilogue(y2, None, lead, N) + residual
             else:
                 # w4a8: per-token e4m3 activation quant + fp4->e4m3 dequant +
                 # fp8 WGMMA, K-split into f32 atomic adds on a zeroed output
@@ -389,11 +401,12 @@ class Backend:
                 x2 = _pad2d(x2, Mp, Kp)
                 wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
             y2 = self._kernel("linear_fp4")(x2, wq, scale, bM, bN, blk, _THREADS)[:M, :N]
-        return self._epilogue(y2, oscale, lead, N)
+        y = self._epilogue(y2, oscale, lead, N)
+        return y if residual is None else y + residual
 
     # ------------------------------------------------------------ linear fp8
 
-    def linear_fp8(self, x, w8, wscale, master=None, oscale=None):
+    def linear_fp8(self, x, w8, wscale, master=None, oscale=None, residual=None):
         # ``master`` is recording-only (the STE grad lands on it); the kernel
         # uses w8/wscale. Only sm90 has an fp8 kernel — elsewhere the weight is
         # bf16 by now, see :meth:`materialize`.
@@ -413,14 +426,18 @@ class Backend:
         if M == 1:
             # Decode GEMV: stream e4m3 W once (1 byte/elem), bf16 X; oscale folded.
             osc = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
-            y2 = self._kernel(kernel)(x2, w8, wscale, osc, 32, bN)[:1, :N]
-            return self._epilogue(y2, None, lead, N)
+            res = self._residual(residual, N, Np)
+            if res is not None:  # residual add fused into the epilogue
+                return self._kernel(kernel)(x2, w8, wscale, osc, res, 32, bN)[:1, :N].reshape(*lead, N)
+            y2 = self._kernel(kernel)(x2, w8, wscale, osc, self._residual(None, N, Np), 32, bN)[:1, :N]
+            return self._epilogue(y2, None, lead, N) + residual
         else:
             xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
             ascale = torch.empty((Mp,), dtype=torch.float32, device=self.device)
             self._kernel("quant_fp8")(x2, xq, ascale, 256)
             y2 = self._kernel(kernel)(xq, w8, wscale, ascale, bM, bN, _THREADS)[:M, :N]
-        return self._epilogue(y2, oscale, lead, N)
+        y = self._epilogue(y2, oscale, lead, N)
+        return y if residual is None else y + residual
 
     def materialize(self, params: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Convert quantized weights to what this cell serves, then migrate.
@@ -557,7 +574,7 @@ class Backend:
         if pos.ndim == 1:
             pos = pos.unsqueeze(0).expand(b, -1)
         return self._kernel("attn_prep")(
-            self._dev(qkv, torch.bfloat16).contiguous(),
+            self._f32(qkv).contiguous(),
             self._f32(wq).contiguous(),
             self._f32(wk).contiguous(),
             pos.contiguous(),
@@ -606,8 +623,8 @@ class Backend:
             self._c(self._f32(k).squeeze(1)),
             self._c(self._f32(v).squeeze(1)),
             self._c(self._f32(kw["z"]).squeeze(1)),
-            self._c(self._bf16(g).squeeze(1)),
-            self._c(self._bf16(beta).squeeze(1)),
+            self._c(self._f32(g).squeeze(1)),
+            self._c(self._f32(beta).squeeze(1)),
             self._c(self._const_f32(kw["dt_bias"])),
             self._c(self._const_f32(kw["a_log"])),
             self._c(self._const_f32(kw["norm_weight"])),
@@ -677,9 +694,8 @@ class Backend:
 
     def silu_mul(self, gate, up):
         shape = gate.shape
-        io = torch.bfloat16 if self.arch == "sm90" else torch.float32  # sm90 kernel is bf16-IO
-        gate = self._c(self._dev(gate, io).reshape(-1))
-        up = self._c(self._dev(up, io).reshape(-1))
+        gate = self._c(self._f32(gate).reshape(-1))
+        up = self._c(self._f32(up).reshape(-1))
         y = self._kernel("silu_mul")(gate, up, 1024, _THREADS)
         return y.reshape(shape)
 
@@ -735,6 +751,19 @@ class Backend:
         if t is None:
             t = self._ones_cache[n] = torch.ones(n, dtype=torch.float32, device=self.device)
         return t
+
+    def _residual(self, residual, n: int, np_: int):
+        """The GEMV epilogue's Res row: the caller's residual stream (f32, one
+        row) or a cached zero row. None if the padded width differs from the
+        real one — the caller adds in torch then."""
+        if residual is None:
+            t = self._ones_cache.get(("zeros", np_))
+            if t is None:
+                t = self._ones_cache[("zeros", np_)] = torch.zeros(1, np_, dtype=torch.float32, device=self.device)
+            return t
+        if residual.numel() != n or np_ != n:
+            return None
+        return self._f32(residual).reshape(1, n).contiguous()
 
     def embedding(self, idx, table):
         table = self._const_f32(table)

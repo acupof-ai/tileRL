@@ -393,20 +393,20 @@ def make_silu_mul(target: str):
 
 
 def make_silu_mul_bf16(target: str):
-    """make_silu_mul writing bf16 (sm90, bf16 in AND out: the gate_up GEMV writes bf16 and the down GEMV reads it)."""
+    """make_silu_mul writing bf16 (sm90: f32 in from the GEMV, bf16 out for the down GEMV)."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def silu_mul(Gate, Up, block_M, threads):
         M = T.const("M")
-        Gate: T.Tensor((M,), "bfloat16")
-        Up: T.Tensor((M,), "bfloat16")
+        Gate: T.Tensor((M,), "float32")
+        Up: T.Tensor((M,), "float32")
         Y = T.empty((M,), "bfloat16")
         with T.Kernel(T.ceildiv(M, block_M), threads=threads) as bx:
             for i in T.Parallel(block_M):
                 idx = bx * block_M + i
                 if idx < M:
-                    g = T.cast(Gate[idx], "float32")
-                    Y[idx] = T.cast(g * T.sigmoid(g) * T.cast(Up[idx], "float32"), "bfloat16")
+                    s = T.sigmoid(Gate[idx])
+                    Y[idx] = T.cast(Gate[idx] * s * Up[idx], "bfloat16")
         return Y
 
     return silu_mul
