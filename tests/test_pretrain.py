@@ -41,6 +41,37 @@ def test_jsonl_dataset_packs_and_pads(tmp_path):
     assert len(short) == 1 and short[0].shape == (64,)
 
 
+def test_pretrain_clips_params_only(tmp_path, monkeypatch):
+    """The GDN initial state is a tape leaf: tape.backward yields a grad for
+    it, and clip_grad_norm must never see it (regression: 27 params -> 28
+    grads, over-clip up to 6%/step)."""
+    p = tmp_path / "corpus.jsonl"
+    _write_jsonl(p, ["the quick brown fox jumps over the lazy dog"])
+    cfg = tiny()
+    model = build_random(cfg, seed=42)
+    backend = get_backend()
+    import tilerl.train as train_mod
+
+    seen: dict = {}
+    real = train_mod.clip_grad_norm
+
+    def spy(grads, max_norm):
+        seen.update(grads)
+        return real(grads, max_norm)
+
+    monkeypatch.setattr(train_mod, "clip_grad_norm", spy)
+    pretrain(
+        model,
+        JsonlDataset(p, ByteTokenizer(), seq_len=32, eos_token_id=0),
+        backend,
+        AdamW(lr=3e-3),
+        steps=1,
+        seed=0,
+    )
+    param_ids = {id(v) for v in model.params.values()}
+    assert seen and set(seen) <= param_ids
+
+
 def test_pretrain_step_checkpoint_roundtrip(tmp_path):
     p = tmp_path / "corpus.jsonl"
     _write_jsonl(
