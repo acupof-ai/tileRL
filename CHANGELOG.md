@@ -4,6 +4,17 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — verdict: packed-math fp8 GEMV — B=1 82.0 tok/s (97% of Arle)
+
+- **B=1 74.9 → 82.0 tok/s (+9.5%)**, verify 1–3 PASS. ncu in the real model
+  showed the fp8 GEMV at 7.3 instr/elem, SM 76–85% busy, DRAM 54%. e4m3→bf16x2
+  by bit placement (+2^120 rebias) and `fma.rn.bf16x2`, tiles loading from
+  global with program-ordered vector loads: in_proj 44.7 → 34.7 µs, out_proj
+  19.1 → 15.2 (ncu). Two dead ends on the way: tilelang locals passed to the
+  extern by pointer (local memory), and the eager A/B's ~40 µs CPU floor
+  hiding the whole effect. Entry:
+  `docs/experience/wins/2026-08-28-fp8-gemv-bf16x2.md`.
+
 ## 2026-08-28 — phase exit: decode glue removed — B=1 74.9 tok/s (89% of Arle's 84.5)
 
 - **B=1 61.7 → 74.9 tok/s (+21%), B=8 agg 184.7 → 212.6 (+15%)**, all rows
