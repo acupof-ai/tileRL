@@ -82,6 +82,14 @@ class ModelConfig:
             ):
                 if v <= 0:
                     raise ValueError(f"{name} must be positive when the model has linear layers")
+            if self.linear_key_head_dim != self.linear_value_head_dim:
+                # LinearStatePool shapes both recurrent state axes on the
+                # value dim (kv_cache.py); a kd!=vd checkpoint would run with
+                # a silently mis-shaped K axis.
+                raise ValueError(
+                    f"linear_key_head_dim ({self.linear_key_head_dim}) must equal "
+                    f"linear_value_head_dim ({self.linear_value_head_dim})"
+                )
 
     # --- derived quantities ----------------------------------------------
     @property

@@ -137,6 +137,14 @@ def test_layer_types_mismatch_raises(tmp_path):
         load_hf(cfg, str(tmp_path))
 
 
+def test_linear_head_dim_mismatch_raises():
+    """kd != vd would run with a silently mis-shaped GDN state K axis (the
+    pool shapes both trailing axes on the value dim). Every Qwen3.x ships
+    kd == vd; arle hard-gates it too."""
+    with pytest.raises(ValueError, match="linear_key_head_dim"):
+        replace(tiny(), linear_key_head_dim=32)  # tiny: vd=16
+
+
 def test_rope_and_tie_guards_raise(tmp_path):
     """Every rope/tie field the checkpoint can contradict must refuse to load.
     Each case below is served silently wrong without the guard — the last one
