@@ -60,8 +60,13 @@ _HASH_MASK = 0x7FFFFFFF
 
 
 def _step_seed(seed: int, generated: int) -> int:
-    """Deterministic per-(request, position) sampling seed."""
-    return ((int(seed) << 20) ^ (generated * 2_654_435_761)) & _HASH_MASK
+    """Deterministic per-(request, position) sampling seed.
+
+    Both terms are full-width multiplicative hashes: a shift-then-mask would
+    keep only the seed's low bits (the old ``seed << 20`` form collapsed seeds
+    1/2049/16385 to one stream — OPD replays byte-identical rollouts past
+    step 2048)."""
+    return ((int(seed) * 2_654_435_761) ^ (generated * 2_246_822_519)) & _HASH_MASK
 
 
 @dataclass(frozen=True)

@@ -20,7 +20,14 @@ import torch
 
 from tilerl.autograd import AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
 from tilerl.config import tiny
-from tilerl.engine import BLOCK_TOKENS, _PHASE_DECODE, Engine, SamplingParams, build_engine
+from tilerl.engine import (
+    BLOCK_TOKENS,
+    _PHASE_DECODE,
+    _step_seed,
+    Engine,
+    SamplingParams,
+    build_engine,
+)
 from tilerl.model import build_random, fp4_param_keys, param_specs
 from tilerl.ops.backend import get_backend
 from tilerl.ops.reference import pack_fp4
@@ -61,6 +68,15 @@ def _drain(engine, request_ids, max_new_tokens: int, max_ticks: int = 512):
 
 # ---------------------------------------------------------------------------
 # tests
+
+
+def test_step_seed_uses_all_seed_bits():
+    """Seeds differing only above bit 11 must not collide. The old shift-mask
+    form kept only the seed's low 11 bits — seeds 1/2049/16385 produced
+    identical streams, and OPD (seed=seed+step) replayed byte-identical
+    rollouts past step 2048."""
+    assert _step_seed(1, 0) != _step_seed(2049, 0)
+    assert len({_step_seed(s, 7) for s in range(10000)}) > 9990
 
 
 def test_generate():
