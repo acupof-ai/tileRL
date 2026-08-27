@@ -33,15 +33,25 @@ On the **default** serve path (`--model tiny`, what `Dockerfile:47` ships) `Byte
 `kv_cache.py:247` defaults `dtype=torch.bfloat16`; no caller ever overrides it (`engine.py:708-716`, `cli.py:60-68`). arle: `gdr_states: Vec<CudaSlice<f32>>` (`agent-infer/crates/infer-cuda/src/qwen35_state.rs:17`). Measured with the repo's own `reference.gdn_forward` at real 27B GDN dims: **2.4e-3 to 3.6e-3 relative perturbation per token on 48 of 64 layers**, flat in step count (does not compound). Nothing gates it — `tests/test_ops_parity.py:606-632` builds its own f32 state and never touches the pool. Nothing in `docs/` justifies or A/Bs the dtype; it is the constructor default. This is a wrong-format defect that runs at full speed, which is the class the audit was told to hunt.
 
 ### C5. `_step_seed` keeps only the seed's low 11 bits
+**FIXED 2026-08-27.** `_step_seed` now multiplies the seed by a full-width odd
+constant before the XOR/mask (`engine.py`); gate: `test_step_seed_uses_all_seed_bits`
+(seeds 1 vs 2049 differ; 10000 seeds give >9990 distinct streams).
 `engine.py:59-64`: `((seed << 20) ^ (generated * 2654435761)) & 0x7FFFFFFF` — masking distributes over XOR, so the seed contributes only `(seed & 0x7FF) << 20`. Measured: `len({_step_seed(s,7) for s in range(10000)}) == 2048`; seeds 1 / 2049 / 16385 produce **identical 8-token completions** end-to-end through `build_engine`. The sharp site is not the server (which defaults `temperature=0.0` → argmax, seed unused) but **OPD**: `train.py:161` uses `temperature=1.0, seed=seed+step`, so any run past 2048 steps replays byte-identical teacher rollouts against a prompt list that also cycles — the distillation data silently stops being fresh. The determinism gate compares seed 7 vs 8 and passes. One line.
 
-### C6. Seedless concurrent requests are rank-locked
-`server.py:178` gives every seedless request `seed=0`, and `_step_seed` mixes only `(seed, position)`. Measured: three concurrent requests, same prompt, `temperature=0.7`, no seed → **byte-identical 12-token completions**. Different prompts rank-agree 51–97% of positions. Best-of-n and any regenerate button are dead at every temperature. (Correction to the finding: arle is not better here — `sample.rs:203-208` also defaults to 0 — it only decorrelates `n>1` within one request, which tileRL's server does not expose.)
+### C6. Seedless concurrent requests are rank-locked`server.py:178` gives every seedless request `seed=0`, and `_step_seed` mixes only `(seed, position)`. Measured: three concurrent requests, same prompt, `temperature=0.7`, no seed → **byte-identical 12-token completions**. Different prompts rank-agree 51–97% of positions. Best-of-n and any regenerate button are dead at every temperature. (Correction to the finding: arle is not better here — `sample.rs:203-208` also defaults to 0 — it only decorrelates `n>1` within one request, which tileRL's server does not expose.)
 
 ### C7. `clip_grad_norm` clips over a non-parameter
+**FIXED 2026-08-27.** `train_step` filters `tape.backward`'s output to param
+ids before the clip (`train.py`); gate: `test_pretrain_clips_params_only`
+(spies on `clip_grad_norm`, asserts every grad key is a param — fails without
+the filter). The backward pass still computes the state grad; a ponytail
+marks the upgrade path (non-differentiable state input) if its allocation
+ever shows in a peak-memory profile.
 `state_gather` is absent from `_BWD`, so the GDN initial recurrent state is a tape leaf and `_linear_attn_chunk` yields a grad for it; `train.py:123` passes the whole dict with no param filter. Measured on tiny: 27 params → 28 grads, over-clip 0.001–6.09% per step, 30 steps diverge by 3.9e-2 relative. At 27B the norm inflation is ~0.1% (negligible) but the **memory** is not: 48 extra f32 tensors, **151 MB per sequence**, all held live through clip + step and each D2H'd to host f64. Also makes the finite-step gate at `train.py:124` depend on a non-parameter. One-line filter at `autograd.py:358`.
 
 ### C8. `linear_key_head_dim` is not shape-pinned; the state's K axis silently uses `linear_value_head_dim`
+**FIXED 2026-08-27.** `ModelConfig.__post_init__` raises on kd != vd
+(`config.py`); gate: `test_linear_head_dim_mismatch_raises`.
 `engine.py:708-716` passes one `head_dim` for both trailing axes of the state pool (`kv_cache.py:252-260`), and `reference.py:636-637` re-derives `nkh` from the state's K axis. Executed: `replace(tiny(), linear_key_head_dim=32)` with vd=16 allocates a K axis of 16, runs prefill+decode, and **emits tokens with no exception anywhere**. Latent — every Qwen3.x ships kd=vd=128, and the (nkh, kd) *factorization* is provably inert (a wrong split gives bit-identical output). Fires only on a kd≠vd checkpoint. arle hard-gates `kd == 128 && vd == 128` (`infer-cuda/src/qwen35.rs:289-294`). One-line `__post_init__` raise.
 
 **Umbrella for C1/C4/C8:** the baseline doc admits the NVFP4 dequant convention (`global_divide=True`) is *"assumed, not independently checked against a reference framework's logits."* There is no numerical ground truth for the 27B anywhere in this project. That absence is why every defect in this section is invisible.
