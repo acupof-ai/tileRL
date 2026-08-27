@@ -88,7 +88,7 @@ def make_rmsnorm_partial(target: str):
         M, N = T.const("M, N")
         X: T.Tensor((M, N), "float32")
         P = T.empty((M, num_chunks), "float32")
-        with T.Kernel(T.ceildiv(N, block_N), M, threads=threads) as (bn, row):
+        with T.Kernel(M, T.ceildiv(N, block_N), threads=threads) as (row, bn):
             var = T.alloc_fragment((1,), "float32")
             var[0] = 0.0
             for k in T.serial(block_N):
@@ -113,7 +113,7 @@ def make_rmsnorm_apply(target: str):
         W: T.Tensor((N,), "float32")
         P: T.Tensor((M, num_chunks), "float32")
         Y = T.empty((M, N), "float32")
-        with T.Kernel(T.ceildiv(N, block_N), M, threads=threads) as (bn, row):
+        with T.Kernel(M, T.ceildiv(N, block_N), threads=threads) as (row, bn):
             var = T.alloc_fragment((1,), "float32")
             var[0] = 0.0
             for c in T.serial(num_chunks):
