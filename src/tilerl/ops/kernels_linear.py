@@ -165,8 +165,8 @@ def _dequant_fp4_macro(out_dtype, local_size, block):
 
     # SOTA copy: examples/dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py
     #   @ tilelang main (fast_dequant path's per-thread vectorized macro)
-    # Adapted: the e2m1 integer bitcast decode replaces the SOTA's twiddling
-    #   extern (it only covers affine int4 grids, not e2m1's float grid);
+    # Adapted: the SOTA's twiddling extern decodes our twiddled e2m1 bytes to
+    #   bf16 (_FP4_TWIDDLE_SRC, natural order), then the float block scale;
     #   tileRL's float block scale is staged to shared (Scale_shared)
     #   and applied once per chunk (the chunk is aligned and never crosses a
     #   scale block); the chunk loop is T.Parallel (the SOTA's T.serial obstructs
@@ -174,10 +174,11 @@ def _dequant_fp4_macro(out_dtype, local_size, block):
     #   vectorizer needs the literal divisor, like the SOTA's Block_QK).
     """
     local_compress = local_size // 2  # 2 nibbles per byte
-    assert block % local_size == 0, f"scale block {block} must be a multiple of {local_size}"
+    assert local_size % 8 == 0 and block % local_size == 0, (local_size, block)
 
     @T.macro
     def dequant(WQ_shared, Scale_shared, W_shared, block_N, block_K):
+        T.import_source(_FP4_TWIDDLE_SRC)
         for i in T.Parallel(block_N * block_K // local_size):
             WQ_local = T.alloc_local((local_compress,), "uint8")
             W_local = T.alloc_local((local_size,), out_dtype)
@@ -186,10 +187,15 @@ def _dequant_fp4_macro(out_dtype, local_size, block):
             for v in T.vectorized(local_compress):
                 WQ_local[v] = WQ_shared[(cbase + v) // (block_K // 2), (cbase + v) % (block_K // 2)]
             s = Scale_shared[nbase // block_K, (nbase % block_K) // block]
-            for v in T.serial(local_size):
-                byte = WQ_local[v // 2]
-                w = _e2m1_fp32((byte >> ((v % 2) * 4)) & 15)
-                W_local[v] = T.cast(w * s, out_dtype)
+            # twiddle decode: 4 bytes -> 8 bf16 in natural order (2.25 ops/elem)
+            D_local = T.alloc_local((local_size,), "bfloat16")
+            for wi in T.unroll(local_compress // 4):
+                T.call_extern(
+                    "tl_fp4_decode8_p", T.access_ptr(WQ_local[4 * wi], "r"),
+                    T.access_ptr(D_local[8 * wi], "w"), dtype="void",
+                )
+            for v in T.unroll(local_size):
+                W_local[v] = T.cast(T.cast(D_local[v], "float32") * s, out_dtype)
             for v in T.vectorized(local_size):
                 W_shared[(nbase + v) // block_K, (nbase + v) % block_K] = W_local[v]
 
@@ -215,8 +221,8 @@ _FP4_BLOCK_N = 64
 def make_linear_fp4_mma(target: str):
     """Fused e2m1 dequant + matmul (sm90 MMA), bf16-IO.
 
-    X [M,K] bf16, WQ uint8 [N,K//2] (low nibble first), Scale [N,K//block] f32.
-    Y[m,n] = sum_k X[m,k] * e2m1(WQ[n,k//2] nibble k%2) * Scale[n,k//block].
+    X [M,K] bf16, WQ uint8 [N,K//2] twiddled (reference.twiddle_fp4), Scale
+    [N,K//block] f32. Y[m,n] = sum_k X[m,k] * w[n,k] * Scale[n,k//block].
 
     The dequant runs ahead of the WGMMA in the pipelined K-loop: each stage
     copies the X/WQ/Scale tiles to shared, vectorizes the dequant into W_shared
@@ -272,63 +278,94 @@ def make_linear_fp4_mma(target: str):
 # ---------------------------------------------------------------- linear fp4 (GEMV)
 
 
-def make_linear_fp4_gemv(target: str, micro_size_k: int = 8, GROUP: int = 4):
+#: e2m1 x8 -> 4 x bf16x2 in 18 PTX ops, from the twiddled byte layout
+#: (reference.twiddle_fp4). prmt selector 0x0123 keeps the upper 16 bits zero,
+#: which sidesteps the CUDA 12.9 prmt.b32 immediate-truncation bug
+#: (docs/experience/errors/2026-08-26-fp4-gemv-dequant-issue-rejected.md).
+_FP4_TWIDDLE_SRC = r"""
+// SOTA copy: tilelang examples/dequantize_gemm/quantize/mxfp.py
+//   decode_fp4_to_bf16_twiddling (the asm block) — e2m1 x8 -> 4 x bf16x2 in
+//   18 ops. Wrapped here as a 16-elem GEMV tile: decode 2 words, 8 packed
+//   bf16x2 FMAs against X, unpack the bf16x2 partial, scale, f32-accumulate.
+__device__ __forceinline__ void tl_fp4_decode8(unsigned w, unsigned *out) {
+  unsigned tmp, bias, d0, d1, d2, d3, d4, d5, d6;
+  asm volatile(
+      // To handle the endianness issue
+      "prmt.b32 %13, %4, 0, 0x0123;"
+      "mov.b32 %12, 0x7e807e80;"
+      "and.b32 %0, %13, 0b10000001110000001000000111000000;"
+      "mul.bf16x2 %0, %0, %12;"
+      "shl.b32 %1, %13, 3;"
+      "and.b32 %1, %1, 0b10000001110000001000000111000000;"
+      "mul.bf16x2 %1, %1, %12;"
+      "shl.b32 %2, %13, 6;"
+      "and.b32 %2, %2, 0b10000001110000001000000111000000;"
+      "mul.bf16x2 %2, %2, %12;"
+      "shl.b32 %5, %13, 1;"
+      "and.b32 %6, %5, 0b10000000000000001000000000000000;"
+      "shr.b32 %7, %13, 3;"
+      "and.b32 %8, %7, 0b00000001100000000000000110000000;"
+      "or.b32 %9, %6, %8;"
+      "shr.b32 %10, %13, 7;"
+      "and.b32 %11, %10, 0b00000000010000000000000001000000;"
+      "or.b32 %3, %9, %11;"
+      "mul.bf16x2 %3, %3, %12;"
+      :"=r"(out[0])
+      ,"=r"(out[1])
+      ,"=r"(out[2])
+      ,"=r"(out[3])
+      :"r"(w), "r"(d0), "r"(d1), "r"(d2), "r"(d3), "r"(d4), "r"(d5), "r"(d6), "r"(bias), "r"(tmp)
+    );
+}
+__device__ __forceinline__ void tl_fp4_decode8_p(const void *wq, void *out) {
+  tl_fp4_decode8(*(const unsigned *)wq, (unsigned *)out);
+}
+__device__ __forceinline__ void tl_fp4_gemv_tile16(const void *wq, const void *x, float scale, float *acc) {
+  unsigned w[8];
+  tl_fp4_decode8(*(const unsigned *)(wq), w);
+  tl_fp4_decode8(*((const unsigned *)(wq) + 1), w + 4);
+  const unsigned *xw = (const unsigned *)x;
+  unsigned a = 0u;
+#pragma unroll
+  for (int j = 0; j < 8; ++j)
+    asm volatile("fma.rn.bf16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(w[j]), "r"(xw[j]));
+  float lo = __uint_as_float(a << 16), hi = __uint_as_float(a & 0xffff0000u);
+  *acc = fmaf(scale, lo + hi, *acc);
+}
+"""
+
+
+def make_linear_fp4_gemv(target: str, GROUP: int = 2):
     """Fused e2m1 dequant + GEMV (sm90), the decode (M=1) path of linear_fp4.
 
-    X [1,K] bf16, WQ uint8 [N,K//2] (low nibble first), Scale [N,K//block] f32.
-    Y[0,n] = sum_k X[0,k] * e2m1(WQ[n,k//2] nibble k%2) * Scale[n,k//block].
+    X [1,K] bf16, WQ uint8 [N,K//2] TWIDDLED (reference.twiddle_fp4), Scale
+    [N,K//block] f32. Y[0,n] = sum_k X[0,k] * w[n,k] * Scale[n,k//block].
 
-    Decode is memory-bound: one warp group per 4 output rows streams WQ+Scale
-    once (0.75 bytes/elem), dequantizing on the fly. Each thread owns a
-    K-slice of block_K = reduce_thread * micro_size_k elems; partials reduce
-    across the warp. Roofline = (N*K*0.75 + 2K) bytes / HBM BW.
+    One warp group per 4 output rows streams WQ once; each thread owns a
+    16-elem slice per K-chunk and hands it to ``tl_fp4_gemv_tile16``: the
+    twiddle decode (2.25 ops/elem, packed bf16x2 out), 8 ``fma.rn.bf16x2``
+    against the natural X words, one f32 scale-accumulate per 16-elem scale
+    block (bf16 accumulation stays inside the block: relerr 4e-3 vs 2e-3 for
+    the all-f32 path, under the 1e-2 gate). ~3 instr/elem — the shuffle-LUT
+    GEMV it replaces issued 6.8/elem and sat at 82% issue-slot busy with DRAM
+    at 40% (ncu, 2026-08-27): gate_up 83.5 -> 56.8 us, qkv -41%, down -17%.
+    GROUP chunks are loaded before any decode.
 
-    The dequant is grouped 4 tiles at a time (GROUP=4): load 4 micro-tiles,
-    decode all 4 (32 shuffles), then FMA all 4. Issuing every shuffle before
-    its FMA hides the shuffle latency behind the FMA dependency chain — the
-    flat per-tile decode (shuffle->FMA back-to-back) stalled each FMA on its
-    shuffle. The grouped buffers are T.unroll(GROUP)-indexed (compile-time
-    constant -> registers; a runtime %2 ping-pong spills to local memory).
-    The block scale is applied once per micro-tile to the partial sum
-    (``acc += s * sum(X*w)``, 1 FP op/elem), and the e2m1 grid is a
-    16-entry warp-shuffle LUT (1 shuffle/elem, built once per thread via the
-    integer bitcast). Sweeps (scripts/_sweep_gemv*.py): group4 = 45% roof vs
-    flat 42%; 2 accumulators, shared-X/LUT, byte-LUT, 6-op bitcast, and
-    register double-buffer all tested worse.
-
-    ``micro_size_k`` x ``GROUP`` are sweep knobs — codegen/index gate in
-    scripts/_sweep_gemv_micro.py, pod timings in scripts/bench_gemv_micro.py;
-    the defaults are the shipped pair. micro_size_k sets the weight-stream load
-    width alone (micro/2 bytes/thread: 8 -> LDG.32, 16 -> .64, 32 -> .128 —
-    the bf16/fp8 siblings all issue .128), micro*GROUP sets the register
-    footprint. micro > 8 is CUDA/ROCm-only — TileLang's Metal backend rejects a
-    uint8 vector wider than 4 bytes, and this kernel is sm90-only anyway.
-    The old "micro=16/32 tested worse" note is stale: it was measured
-    on the flat pre-GROUP kernel, so it priced micro=32 only at GROUP=4, i.e. 4x
-    the register arrays. When micro_size_k > block the partial sum is segmented
-    one scale per block — a 32-elem micro-tile spans two block-16 scales, and a
-    single scale on it is silently wrong.
-
-    # SOTA copy: examples/dequantize_gemm/example_dequant_gemv_fp16xint4.py
-    #   @ tilelang main (dequantize_gemv, split-K + tvm_thread_allreduce path)
-    # Adapted: bf16 IO (f32 accumulate) instead of fp16; OCP e2m1 grid
-    #   (matches pack_fp4) with tileRL's float block scale on the
-    #   partial sum; uint8 storage; M fixed at 1 (decode), no M grid dim.
-    # Fast decode: _e2m1_fp32 builds the 16-entry warp LUT once per thread.
-    #   The SOTA's lop3 intrin only covers affine int4 grids, not e2m1.
-    # Constraint: reduce_thread must be <= 32 (the LUT is per-warp via
-    #   tvm_warp_shuffle); the backend hardcodes 32.
+    # SOTA copy: tilelang examples/dequantize_gemm/quantize/mxfp.py
+    #   decode_fp4_to_bf16_twiddling + example_dequant_gemv_fp16xint4.py
+    #   (split-K + tvm_thread_allreduce GEMV schedule)
+    # Adapted: OCP e2m1 grid with tileRL's float block scale on the tile
+    #   partial; bf16x2 FMA tile in C (T.call_extern); M fixed at 1.
+    # Constraint: block % 16 == 0 (a tile never straddles a scale); the backend pads
+    #   K to 256 so every tile is full.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def linear_fp4_gemv(X, WQ, Scale, reduce_thread, n_partition, block):
         N, K = T.const("N, K")
-        # scale segments per micro-tile: one when the tile fits a scale block
-        assert micro_size_k % block == 0 or block % micro_size_k == 0
-        nseg = max(1, micro_size_k // block)
-        seg = micro_size_k // nseg
-        xv = min(micro_size_k, 8)  # bf16 elems per 128-bit transaction
-        block_K = reduce_thread * micro_size_k
+        assert block % 16 == 0  # one scale per 16-elem tile (block 16) or per two (32)
+        micro = 16
+        block_K = reduce_thread * micro
         num_ko = T.ceildiv(K, block_K)
         num_g = num_ko // GROUP
         X: T.Tensor((1, K), "bfloat16")
@@ -336,64 +373,42 @@ def make_linear_fp4_gemv(target: str, micro_size_k: int = 8, GROUP: int = 4):
         Scale: T.Tensor((N, K // block), "float32")
         Y = T.empty((1, N), "bfloat16")
         with T.Kernel(T.ceildiv(N, n_partition), threads=(reduce_thread, n_partition)) as bx:
+            T.import_source(_FP4_TWIDDLE_SRC)
             kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
             ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
             n = bx * n_partition + ni
-            Xs = T.alloc_local((GROUP, micro_size_k), "bfloat16")
-            Ws = T.alloc_local((GROUP, micro_size_k // 2), "uint8")
-            ws = T.alloc_local((GROUP, micro_size_k), "float32")
+            Xs = T.alloc_local((GROUP, micro), "bfloat16")
+            Ws = T.alloc_local((GROUP, micro // 2), "uint8")
             acc = T.alloc_local((1,), "float32")
-            partial = T.alloc_local((1,), "float32")
             reduced = T.alloc_local((1,), "float32")
-            # 16-entry warp LUT: lane kr holds LUT[kr&15], built once via the
-            # integer bitcast (no exp2). Each nibble is 1 shuffle.
-            lut = _e2m1_fp32(kr & 15)
             acc[0] = 0.0
             for kg in T.serial(num_g):
                 for g in T.unroll(GROUP):
-                    base = (kg * GROUP + g) * block_K + kr * micro_size_k
-                    # T.unroll, not the implicit serial split T.vectorized(>8)
-                    # emits: a runtime-indexed Xs falls to local memory.
-                    for c in T.unroll(micro_size_k // xv):
-                        for v in T.vectorized(xv):
-                            Xs[g, c * xv + v] = X[0, base + c * xv + v]
-                    for v in T.vectorized(micro_size_k // 2):
+                    base = (kg * GROUP + g) * block_K + kr * micro
+                    for c in T.unroll(2):
+                        for v in T.vectorized(8):
+                            Xs[g, c * 8 + v] = X[0, base + c * 8 + v]
+                    for v in T.vectorized(8):
                         Ws[g, v] = WQ[n, base // 2 + v]
-                # decode all GROUP tiles before any FMA: the 32 shuffles
-                # issue back-to-back, hiding their latency behind the FMA
-                # dependency chain below.
                 for g in T.unroll(GROUP):
-                    for ki in T.unroll(micro_size_k):
-                        byte = Ws[g, ki // 2]
-                        nib = (byte >> ((ki % 2) * 4)) & 15
-                        ws[g, ki] = T.tvm_warp_shuffle(
-                            0xFFFFFFFF, lut, T.cast(nib, "int32"), 32, 32
-                        )
-                for g in T.unroll(GROUP):
-                    base = (kg * GROUP + g) * block_K + kr * micro_size_k
-                    for s in T.unroll(nseg):
-                        partial[0] = 0.0
-                        for ki in T.unroll(seg):
-                            partial[0] += (
-                                T.cast(Xs[g, s * seg + ki], "float32") * ws[g, s * seg + ki]
-                            )
-                        acc[0] += Scale[n, (base + s * seg) // block] * partial[0]
-            # K-tail (num_ko % GROUP tiles), flat, reusing buffer slot 0
-            for kt in T.serial(num_ko - num_g * GROUP):
-                base = (num_g * GROUP + kt) * block_K + kr * micro_size_k
-                for c in T.unroll(micro_size_k // xv):
-                    for v in T.vectorized(xv):
-                        Xs[0, c * xv + v] = X[0, base + c * xv + v]
-                for v in T.vectorized(micro_size_k // 2):
+                    base = (kg * GROUP + g) * block_K + kr * micro
+                    T.call_extern(
+                        "tl_fp4_gemv_tile16", T.access_ptr(Ws[g, 0], "r"),
+                        T.access_ptr(Xs[g, 0], "r"), Scale[n, base // block],
+                        T.access_ptr(acc, "rw"), dtype="void",
+                    )
+            for kt in T.serial(num_ko - num_g * GROUP):  # K-tail, flat, slot 0
+                base = (num_g * GROUP + kt) * block_K + kr * micro
+                for c in T.unroll(2):
+                    for v in T.vectorized(8):
+                        Xs[0, c * 8 + v] = X[0, base + c * 8 + v]
+                for v in T.vectorized(8):
                     Ws[0, v] = WQ[n, base // 2 + v]
-                for s in T.unroll(nseg):
-                    partial[0] = 0.0
-                    for ki in T.unroll(seg):
-                        byte = Ws[0, (s * seg + ki) // 2]
-                        nib = (byte >> (((s * seg + ki) % 2) * 4)) & 15
-                        w = T.tvm_warp_shuffle(0xFFFFFFFF, lut, T.cast(nib, "int32"), 32, 32)
-                        partial[0] += T.cast(Xs[0, s * seg + ki], "float32") * w
-                    acc[0] += Scale[n, (base + s * seg) // block] * partial[0]
+                T.call_extern(
+                    "tl_fp4_gemv_tile16", T.access_ptr(Ws[0, 0], "r"),
+                    T.access_ptr(Xs[0, 0], "r"), Scale[n, base // block],
+                    T.access_ptr(acc, "rw"), dtype="void",
+                )
             with T.attr(
                 T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
                 "reduce_scope",
@@ -629,7 +644,7 @@ def make_linear_fp4_fp8_mma(target: str, k_split: int = 1):
     """Fused e2m1 dequant-to-e4m3 + fp8 WGMMA (sm90 prefill path).
 
     XQ [M,K] e4m3 (per-token quantized activation, from make_quant_fp8_e4m3),
-    WQ uint8 [N,K//2] (low nibble first), WScale [N,K//block] f32 (the
+    WQ uint8 [N,K//2] twiddled (reference.twiddle_fp4), WScale [N,K//block] f32 (the
     checkpoint's scale block, 16 or 32), AScale [M] f32 (per-token scale).
     ``Y[m,n] = (sum_k XQ[m,k] * e2m1(WQ) * WScale[n,k//block]) / AScale[m]``.
 

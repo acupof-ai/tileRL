@@ -174,6 +174,8 @@ def dequant_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
     Magnitudes are ``_E2M1_LUT`` ({0,.5,1,1.5,2,3,4,6}); bit 3 is the sign.
     """
+    if getattr(wq, "_tl_twiddled", False):  # sm90 served bytes (Backend._served_fp4)
+        wq = untwiddle_fp4(wq)
     assert wq.dtype == torch.uint8
     n, k2 = wq.shape
     nib = torch.stack([wq & 0x0F, (wq >> 4) & 0x0F], dim=-1).reshape(n, k2 * 2).long()
@@ -195,6 +197,55 @@ def linear_fp4(x, wq, scale, oscale=None) -> torch.Tensor:
 #: every linear_fp4 kernel decode it, so an NVFP4 checkpoint's nibbles need no
 #: re-quantization to be served.
 _E2M1_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
+
+
+# sm90 serves fp4 in the "twiddled" byte layout tilelang's decode_fp4_to_bf16
+# intrinsic expands with 18 ops per 8 elems (kernels_linear._FP4_TWIDDLE_SRC):
+# per 32-bit word, element slot p of half-word h has its (s, e1, e0, m) bits at
+# _TW_POS[p]; slot j (j<4) holds elem 2j+1 and slot j+4 elem 2j so the decoded
+# bf16x2 pairs line up with natural bf16x2 X words.
+_TW_POS = ((15, 8, 7, 6), (12, 5, 4, 3), (9, 2, 1, 0), (14, 11, 10, 13))
+_TW_SLOT_ELEM = (1, 3, 5, 7, 0, 2, 4, 6)
+
+
+def _fp4_codes(wq: torch.Tensor) -> torch.Tensor:
+    """Packed [N, K//2] (low nibble first) -> codes [N, K] int32."""
+    return torch.stack([wq & 15, wq >> 4], dim=-1).reshape(wq.shape[0], -1).to(torch.int32)
+
+
+def twiddle_fp4(wq: torch.Tensor) -> torch.Tensor:
+    """Natural packed fp4 -> twiddled bytes (same shape, uint8)."""
+    N = wq.shape[0]
+    c = _fp4_codes(wq).reshape(N, -1, 8)[:, :, list(_TW_SLOT_ELEM)]
+    out = []
+    for h in (0, 1):
+        half = torch.zeros(c.shape[:2], dtype=torch.int32, device=wq.device)
+        for p, bits in enumerate(_TW_POS):
+            n = c[:, :, 4 * h + p]
+            for b, pos in enumerate(bits):  # bit 3-b of the nibble -> word bit pos
+                half |= ((n >> (3 - b)) & 1) << pos
+        out += [(half >> 8) & 255, half & 255]
+    return torch.stack(out, dim=-1).reshape(N, -1).to(torch.uint8).contiguous()
+
+
+def untwiddle_fp4(wq: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`twiddle_fp4`."""
+    N = wq.shape[0]
+    b = wq.reshape(N, -1, 4).to(torch.int32)
+    slots = []
+    for h in (0, 1):
+        half = (b[:, :, 2 * h] << 8) | b[:, :, 2 * h + 1]
+        for bits in _TW_POS:
+            nib = torch.zeros_like(half)
+            for k, pos in enumerate(bits):
+                nib |= ((half >> pos) & 1) << (3 - k)
+            slots.append(nib)
+    slots = torch.stack(slots, dim=-1)  # [N, K/8, slot]
+    codes = torch.empty_like(slots)
+    for slot, elem in enumerate(_TW_SLOT_ELEM):
+        codes[:, :, elem] = slots[:, :, slot]
+    codes = codes.reshape(N, -1)
+    return (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8).contiguous()
 
 
 def pack_fp4(w: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torch.Tensor]:

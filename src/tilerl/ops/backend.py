@@ -338,10 +338,23 @@ class Backend:
 
     # ------------------------------------------------------------ linear fp4
 
+    def _served_fp4(self, wq):
+        """The fp4 bytes this cell's kernels read. sm90 kernels decode the
+        twiddled layout; the served tensor is rewritten in place ONCE (flagged)
+        so graph capture, save_hf (which untwiddles by the flag) and CPU-resident
+        callers all see one truth. Other cells read the natural layout."""
+        wq = self._dev(wq, wq.dtype)  # uint8: device migration only
+        if "linear_fp4_gemv" in _resolve(self.precision, self.arch) and not getattr(
+            wq, "_tl_twiddled", False
+        ):
+            wq.copy_(reference.twiddle_fp4(wq))
+            wq._tl_twiddled = True
+        return wq
+
     def linear_fp4(self, x, wq, scale, master=None, oscale=None):
         # ``master`` is recording-only (the STE grad lands on it); the kernel
         # uses wq/scale.
-        wq = self._dev(wq, wq.dtype)  # uint8: device migration only
+        wq = self._served_fp4(wq)
         scale = self._f32(scale)
         lead, x2 = self._rows(x)
         M, K, N = x2.shape[0], x2.shape[1], wq.shape[0]

@@ -767,3 +767,15 @@ def test_rocm_cell_is_the_cpu_cell():
     assert "linear_fp4" in _resolve("bf16", "rocm")
     with pytest.raises(NotImplementedError):
         _resolve("bf16", "sm100")
+
+
+def test_fp4_twiddle_round_trip():
+    """sm90 serves fp4 in the twiddled byte layout; save_hf must undo it exactly."""
+    import torch
+
+    from tilerl.ops.reference import twiddle_fp4, untwiddle_fp4
+
+    wq = torch.randint(0, 256, (6, 32), dtype=torch.uint8, generator=torch.Generator().manual_seed(0))
+    tw = twiddle_fp4(wq)
+    assert tw.shape == wq.shape and not torch.equal(tw, wq)
+    assert torch.equal(untwiddle_fp4(tw), wq)

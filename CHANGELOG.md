@@ -4,6 +4,19 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — verdict: fp4 GEMV was issue-bound; twiddle decode + bf16x2 FMA shipped
+
+- **B=1 54.2 → 61.7 tok/s (+14%), B=8 agg 142.7 → 184.7 (+29%), prefill
+  +13%**, every baseline row raised, greedy text unchanged. ncu showed the
+  shuffle-LUT GEMV at 82% issue-busy / 40% DRAM (6.8 instr/elem); scale-dtype
+  and split-K were measured dead first. Fix: tilelang's twiddling decode
+  (packed bf16x2) + `fma.rn.bf16x2`; sm90 serves fp4 in the twiddled layout
+  (`reference.twiddle_fp4`, in-place + flag; `save_hf`/reference untwiddle).
+  Entries: `docs/experience/errors/2026-08-27-fp4-gemv-issue-bound-ncu.md`,
+  `docs/experience/wins/2026-08-27-fp4-gemv-twiddle-bf16x2.md`.
+- Arle gap: 61.7 vs 84.5 (73%). Next: the fp8 GEMV (40% of the B=1 tick)
+  with the same packed-math treatment; attention at depth (25 tok/s @32k).
+
 ## 2026-08-27 — phase exit: benchmark harness is the perf gate; verdict: decode is GEMV-bound, not launch-bound
 
 - **`tilerl bench --suite decode-kv,prefill,kv-reuse,train`** with a snapshot

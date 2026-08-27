@@ -448,6 +448,8 @@ def _fp4_keys(params, n: int) -> list[str]:
 def _deq_rows(wq, scale, oscale=None, rows: int = 512):
     """f32 dequant in row chunks. The whole lm_head [248320, 5120] at once is
     ~30 GiB of int64 intermediates inside ``reference.dequant_fp4``."""
+    if getattr(wq, "_tl_twiddled", False):  # slicing drops the flag; untwiddle whole
+        wq = reference.untwiddle_fp4(wq)
     for i in range(0, wq.shape[0], rows):
         w = reference.dequant_fp4(wq[i : i + rows], scale[i : i + rows]).float()
         yield w if oscale is None else w * oscale[i : i + rows].float().reshape(-1, 1)
@@ -693,6 +695,8 @@ def _repack32(wq, scale, rows: int = 512):
     allocates 32 bytes per weight element.
     """
     wqs, scales = [], []
+    if getattr(wq, "_tl_twiddled", False):
+        wq = reference.untwiddle_fp4(wq)
     for i in range(0, wq.shape[0], rows):
         w = reference.dequant_fp4(wq[i : i + rows], scale[i : i + rows])
         a, b = reference.pack_fp4(w, block=32)

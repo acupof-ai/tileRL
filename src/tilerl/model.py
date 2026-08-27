@@ -73,6 +73,7 @@ import torch
 from . import autograd
 from .config import ModelConfig, tiny
 from .ops.reference import (
+    untwiddle_fp4,
     dequant_awq,
     dequant_fp8,
     dequant_nvfp4,
@@ -1022,7 +1023,10 @@ def save_hf(model: Model, path: str | Path) -> None:
         elif f"{key}.wq" in model.params:
             stem = hf.removesuffix(".weight")
             for suffix in (".wq", ".scale", ".oscale"):
-                tensors[stem + suffix] = model.params[key + suffix]
+                t = model.params[key + suffix]
+                if getattr(t, "_tl_twiddled", False):  # sm90 serves twiddled bytes
+                    t = untwiddle_fp4(t)
+                tensors[stem + suffix] = t
         else:
             missing.append(key)
     if missing:  # fused or native-fp8 serving keys: no per-key bytes to write

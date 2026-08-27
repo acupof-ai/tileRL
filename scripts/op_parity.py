@@ -64,6 +64,18 @@ def main() -> int:
     wq = dev(P["layers.3.q_norm"])  # layer 3 = first full-attn
     print(f"{'rmsnorm[head_dim]':<28} {relerr(backend.rmsnorm(xh, wq, cfg.rms_eps), reference.rmsnorm(xh, wq, cfg.rms_eps)):>12.4e}")
 
+    # fp4 linear: decode GEMV (M=1) and the w4a8 MMA path (M=8, M=512) vs the
+    # f32 dequant reference (reference.dequant_fp4 untwiddles sm90's served bytes).
+    for key in ("layers.3.gate_proj", "layers.3.down_proj"):
+        wq, sc = dev(P[key + ".wq"]), dev(P[key + ".scale"])
+        osc = dev(P[key + ".oscale"]).reshape(-1)
+        w = reference.dequant_fp4(wq, sc).float() * osc[:, None]
+        for m in (1, 8, 512):
+            xm = torch.randn(1, m, w.shape[1], generator=g).to(backend.device)
+            k = backend.linear_fp4(xm, wq, sc, oscale=osc).float()
+            name = f"linear_fp4[{key.rsplit('.', 1)[-1]} M={m}]"
+            print(f"{name:<28} {relerr(k, xm.float() @ w.T):>12.4e}")
+
     # linear_fp8 (GDN in_proj_qkv is fp8 e4m3) at real dims.
     key = "layers.0.in_proj_qkv"  # layer 0 = GDN, fp8
     if P.get(key + ".w8") is not None:
