@@ -47,4 +47,4 @@ the same treatment (e4m3→bf16 needs a cvt, not a shift).
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
-| 2026-08-28 | see bench-baseline.json | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | 0.64 | 16.2 (B=1, d512) | **61.7** B=1 d512 (+14%); B=8 agg **184.7** (+29%); prefill 1792 (+14%); 57.7 @2k, 45.8 @8k, 25.2 @32k |
+| 2026-08-28 | 94a43eb | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | 0.64 | 16.2 (B=1, d512) | **61.7** B=1 d512 (+14%); B=8 agg **184.7** (+29%); prefill 1792 (+14%); 57.7 @2k, 45.8 @8k, 25.2 @32k |
