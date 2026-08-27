@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from dataclasses import replace
 
 import torch
 
@@ -183,13 +182,9 @@ def main() -> None:
 
     backend = get_backend()
     assert backend.device.type == "cuda", "needs TILERL_TARGET=cuda"
-    cfg = replace(
-        qwen36_27b(),
-        num_layers=args.layers,
-        full_attn_layers=tuple(i for i in qwen36_27b().full_attn_layers if i < args.layers),
-    )
     t0 = time.perf_counter()
-    model = load_hf(cfg, args.source)
+    model = load_hf(qwen36_27b(), args.source, num_layers=args.layers)
+    cfg = model.cfg
     # Migrate params once (engine build does the same; bench_shapes runs
     # before any engine exists, so without this it would time per-call H2D
     # copies instead of the kernel).

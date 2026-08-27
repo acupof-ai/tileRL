@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from dataclasses import replace
 
 import torch
 
@@ -38,12 +37,8 @@ def main() -> None:
 
     backend = get_backend()
     assert backend.device.type == "cuda", "needs TILERL_TARGET=cuda"
-    cfg = replace(
-        qwen36_27b(),
-        num_layers=args.layers,
-        full_attn_layers=tuple(i for i in qwen36_27b().full_attn_layers if i < args.layers),
-    )
-    model = load_hf(cfg, args.source)
+    model = load_hf(qwen36_27b(), args.source, num_layers=args.layers)
+    cfg = model.cfg
     model.params = {k: v.to(backend.device) for k, v in model.params.items()}
     direct = kernels_linear.make_linear_fp4_gemv(backend.target)
 

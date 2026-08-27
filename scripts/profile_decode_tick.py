@@ -21,8 +21,6 @@ import argparse
 import json
 import time
 from collections import defaultdict
-from dataclasses import replace
-
 import torch
 
 from tilerl.config import qwen36_27b
@@ -249,13 +247,11 @@ def main():
     if backend.device.type != "cuda":
         raise SystemExit("profiling needs the CUDA target (TILERL_TARGET=cuda)")
     base = qwen36_27b()
-    cfg = replace(
-        base,
-        num_layers=args.layers,
-        full_attn_layers=tuple(i for i in base.full_attn_layers if i < args.layers),
-    )
     t0 = time.perf_counter()
-    model = load_hf(cfg, args.source, fuse_projections=True)
+    # load_hf truncates to num_layers against the full-config validation (cfg
+    # stays 64 so the checkpoint's num_hidden_layers check passes).
+    model = load_hf(base, args.source, num_layers=args.layers, fuse_projections=True)
+    cfg = model.cfg
     print(f"load: {time.perf_counter() - t0:.1f}s", flush=True)
 
     batches = [int(x) for x in args.batches.split(",")]
