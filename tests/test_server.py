@@ -85,6 +85,26 @@ def test_models(client, model_id):
     assert isinstance(model_id, str) and model_id
 
 
+def test_render_chat_is_chatml():
+    """The render half must agree with the stop half: _HfTokenizerAdapter
+    stops on <|im_end|>, so the prompt must be ChatML (the old plain-text
+    'role: ...' render meant the model never saw the markers it is stopped
+    on)."""
+    from tilerl.server import ChatMessage, _render_chat
+
+    out = _render_chat(
+        [
+            ChatMessage(role="system", content="be terse"),
+            ChatMessage(role="user", content="hi"),
+        ]
+    )
+    assert out == (
+        "<|im_start|>system\nbe terse<|im_end|>\n"
+        "<|im_start|>user\nhi<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+
 def test_completion_nonstream(client, model_id):
     resp = client.post(
         "/v1/chat/completions",

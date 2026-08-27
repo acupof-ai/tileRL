@@ -125,11 +125,14 @@ def _message_text(message: ChatMessage) -> str:
 
 
 def _render_chat(messages: list[ChatMessage]) -> str:
-    # ponytail: plain-text role-prefixed rendering; a Jinja chat template
-    # belongs with the real tokenizer/checkpoint (day-2, zero-code onboarding).
-    lines = [f"{m.role}: {_message_text(m)}" for m in messages]
-    lines.append("assistant:")
-    return "\n".join(lines)
+    # ChatML — the format Qwen3.x was trained on, and what the stop set
+    # already assumes (_HfTokenizerAdapter.stop_token_ids). The old
+    # role-prefixed plain text contradicted it: the model never sees the
+    # markers it is stopped on. ponytail: a Jinja chat template belongs with
+    # the real tokenizer/checkpoint (day-2, zero-code onboarding); Qwen's
+    # template renders this same string.
+    rendered = "".join(f"<|im_start|>{m.role}\n{_message_text(m)}<|im_end|>\n" for m in messages)
+    return f"{rendered}<|im_start|>assistant\n"
 
 
 def _chat_chunk(
