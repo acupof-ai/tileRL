@@ -31,6 +31,12 @@ error 3.6%, measured). Verified: zeroing `gdn_backward`'s `g_q` now fails
 Root cause is a live bug **in the gate itself**: its CE helper (`test_e2e.py:412-418`) scatters the −1 into `d[:, :-1]` but leaves a spurious gradient on the final position, so the "analytic" side is not the gradient of the loss it finite-differences — a manufactured 16–106% disagreement, which is what forced the absolute `< 0.2` tolerance at `test_e2e.py:452` against gradients of magnitude 2e-4 to 1e-1. Production is correct (`ops/reference.py:895-899`), so no shipped run has wrong gradients; both backwards measure 6.6e-7 against `torch.autograd`. What is broken is the only thing standing between the next fused/GPU backward and a silent wrong gradient. Fix: call `backend.cross_entropy_loss_grad` from the test, then `rtol=0.1` — with the CE fixed, clean worst rel error is 3.6% and every poison fires.
 
 ### C3. Chat template vs. ChatML stop set — the two halves of `server.py` contradict each other
+**FIXED 2026-08-27.** `_render_chat` now renders ChatML (`<|im_start|>role\n…
+<|im_end|>\n…`), matching the stop set the whole time; gate:
+`test_render_chat_is_chatml`. The byte-fallback tokenizer has no eos by
+construction, so the tiny/dev path still runs to `max_tokens` — accepted
+dev-path behavior, not a serving defect (the real tokenizer carries
+`<|im_end|>`).
 `server.py:126-131` renders `system: …\nuser: …\nassistant:` plain text; `server.py:64-68` hardcodes `<|im_start|>`/`<|im_end|>` as the entire stop mechanism (`engine.py:605` is the only stop check in the codebase; no config carries an EOS id). No chat template exists in the tree and none is reachable — `tokenizers` has no `apply_chat_template`, and `pyproject.toml` ships no `transformers` and no Jinja engine. Manufactured by 359ce3a, not inherited.
 
 On the **default** serve path (`--model tiny`, what `Dockerfile:47` ships) `ByteTokenizer` has no `stop_token_ids`, so `getattr(..., ())` yields `()` — provably, mechanically, **every request runs all 512 ticks = 9.74 s**, no model behavior required. Zero effect on the 52.6 tok/s number (the bench calls `engine.submit` directly).
@@ -44,7 +50,10 @@ constant before the XOR/mask (`engine.py`); gate: `test_step_seed_uses_all_seed_
 (seeds 1 vs 2049 differ; 10000 seeds give >9990 distinct streams).
 `engine.py:59-64`: `((seed << 20) ^ (generated * 2654435761)) & 0x7FFFFFFF` — masking distributes over XOR, so the seed contributes only `(seed & 0x7FF) << 20`. Measured: `len({_step_seed(s,7) for s in range(10000)}) == 2048`; seeds 1 / 2049 / 16385 produce **identical 8-token completions** end-to-end through `build_engine`. The sharp site is not the server (which defaults `temperature=0.0` → argmax, seed unused) but **OPD**: `train.py:161` uses `temperature=1.0, seed=seed+step`, so any run past 2048 steps replays byte-identical teacher rollouts against a prompt list that also cycles — the distillation data silently stops being fresh. The determinism gate compares seed 7 vs 8 and passes. One line.
 
-### C6. Seedless concurrent requests are rank-locked`server.py:178` gives every seedless request `seed=0`, and `_step_seed` mixes only `(seed, position)`. Measured: three concurrent requests, same prompt, `temperature=0.7`, no seed → **byte-identical 12-token completions**. Different prompts rank-agree 51–97% of positions. Best-of-n and any regenerate button are dead at every temperature. (Correction to the finding: arle is not better here — `sample.rs:203-208` also defaults to 0 — it only decorrelates `n>1` within one request, which tileRL's server does not expose.)
+### C6. Seedless concurrent requests are rank-locked
+**FIXED 2026-08-27.** A seedless request now draws `secrets.randbits(31)`
+(`server.py`); gate: `test_seedless_requests_decorrelate` (fails with the old
+seed=0 default).`server.py:178` gives every seedless request `seed=0`, and `_step_seed` mixes only `(seed, position)`. Measured: three concurrent requests, same prompt, `temperature=0.7`, no seed → **byte-identical 12-token completions**. Different prompts rank-agree 51–97% of positions. Best-of-n and any regenerate button are dead at every temperature. (Correction to the finding: arle is not better here — `sample.rs:203-208` also defaults to 0 — it only decorrelates `n>1` within one request, which tileRL's server does not expose.)
 
 ### C7. `clip_grad_norm` clips over a non-parameter
 **FIXED 2026-08-27.** `train_step` filters `tape.backward`'s output to param
