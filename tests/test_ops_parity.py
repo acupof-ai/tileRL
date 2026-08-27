@@ -732,6 +732,20 @@ def test_sample_deterministic():
     assert (greedy == logits.argmax(-1)).float().mean() > 0.9
 
 
+def test_sample_batch_matches_per_row():
+    """The batched sampler must draw the same tokens as per-row sample with
+    the same seeds — it only fuses the sort/softmax, not the draws."""
+    torch.manual_seed(18)
+    logits = torch.randn(5, 100)
+    temps = torch.tensor([1.0, 0.0, 0.8, 0.0, 1.0])  # rows 1,3 greedy
+    top_ps = torch.tensor([0.9, 1.0, 0.5, 1.0, 0.95])
+    seeds = torch.tensor([42, 7, 99, 3, 42])
+    batched = reference.sample_batch(logits, temps, top_ps, seeds)
+    for i in range(5):
+        one = reference.sample(logits[i : i + 1], float(temps[i]), float(top_ps[i]), int(seeds[i]))
+        assert batched[i] == one[0], f"row {i}: batch {batched[i]} vs per-row {one[0]}"
+
+
 # ---------------------------------------------------------------- backend plumbing
 
 

@@ -698,6 +698,9 @@ class Backend:
         # ponytail: torch-eager sampling, tilelang sample kernel when perf demands
         return reference.sample(logits, temperature, top_p, seed)
 
+    def sample_batch(self, logits, temperatures, top_ps, seeds):
+        return reference.sample_batch(logits, temperatures, top_ps, seeds)
+
 
 _BACKEND: Backend | None = None
 

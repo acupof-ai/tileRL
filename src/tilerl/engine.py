@@ -561,8 +561,7 @@ class Engine:
         logits = self._model.forward(
             input_ids, positions, self._make_kv(rows, seq_q), self._backend
         )
-        for i, r in enumerate(decodes):
-            self._after_forward(r, logits[i, 0], len(r.output))
+        self._after_forward_batch([(r, logits[i, 0], len(r.output)) for i, r in enumerate(decodes)])
         if prefill is not None:
             self._prefill_forwards += 1
             j = len(decodes)
@@ -603,12 +602,29 @@ class Engine:
             self._decode_graphs[B] = g
         logits = g.run(reqs)
         self._decode_forwards += 1
-        for i, r in enumerate(reqs):
-            self._after_forward(r, logits[i, -1], len(r.output))
+        self._after_forward_batch([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
         return True
 
     def _after_forward(self, req: _Req, last_logits: torch.Tensor, generated_idx: int) -> None:
-        tok = self._sample(last_logits, req, generated_idx)
+        self._after_sample(req, self._sample(last_logits, req, generated_idx), generated_idx)
+
+    def _after_forward_batch(self, rows: list[tuple]) -> None:
+        """Batched sampling for a decode tick: one sort/softmax over all rows
+        instead of B per-row calls (8.2% of the B=8 slice tick was 8 separate
+        sorts + D2H syncs). Per-row seeds keep the draws identical to the
+        per-row path."""
+        if not rows:
+            return
+        logits = torch.stack([l for _, l, _ in rows])
+        dev = logits.device
+        temps = torch.tensor([r.params.temperature for r, _, _ in rows], device=dev)
+        top_ps = torch.tensor([r.params.top_p for r, _, _ in rows], device=dev)
+        seeds = torch.tensor([_step_seed(r.params.seed, g) for r, _, g in rows], device=dev)
+        toks = self._backend.sample_batch(logits, temps, top_ps, seeds)
+        for (req, _, generated_idx), tok in zip(rows, toks):
+            self._after_sample(req, int(tok), generated_idx)
+
+    def _after_sample(self, req: _Req, tok: int, generated_idx: int) -> None:
         if tok in req.params.stop_token_ids:
             self._finish(req)
             return

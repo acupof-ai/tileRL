@@ -36,6 +36,7 @@ _REF_OPS = frozenset(
         "embedding",
         "embedding_bwd",
         "sample",
+        "sample_batch",
     }
 )
 
