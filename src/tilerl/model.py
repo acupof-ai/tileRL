@@ -385,32 +385,30 @@ class Model:
         q = autograd.slice(qkv, ..., slice(0, qd))
         k = autograd.slice(qkv, ..., slice(qd, qd + kd))
         v = autograd.slice(qkv, ..., slice(qd + kd, None))
-        state, window = backend.state_gather(
-            kv.state_pool.states,
-            kv.state_pool.conv_windows,
-            kv.state_slot,
-            linear_idx,
-        )
         kwargs = dict(
             z=z,
             conv1d_weight=self.params[f"{p}.conv1d"],
             dt_bias=self.params[f"{p}.dt_bias"],
             a_log=self.params[f"{p}.a_log"],
             norm_weight=self.params[f"{p}.gdn_norm"],
-            conv_window=window,
             seq_q_lens=getattr(kv, "seq_q_lens", None),
         )
-        out, new_state, new_window = backend.linear_attn_chunk(
-            q, k, v, a_proj, b_proj, state, **kwargs
-        )
-        backend.state_scatter(
-            kv.state_pool.states,
-            kv.state_pool.conv_windows,
-            kv.state_slot,
-            linear_idx,
-            new_state,
-            new_window,
-        )
+        out = None
+        if q.shape[1] == 1 and not getattr(kv, "dense", False):
+            out = backend.gdn_decode(  # sm90: in-place pool state, one launch
+                q, k, v, a_proj, b_proj, kv.state_pool, kv.state_slot, linear_idx, **kwargs
+            )
+        if out is None:
+            state, window = backend.state_gather(
+                kv.state_pool.states, kv.state_pool.conv_windows, kv.state_slot, linear_idx
+            )
+            out, new_state, new_window = backend.linear_attn_chunk(
+                q, k, v, a_proj, b_proj, state, conv_window=window, **kwargs
+            )
+            backend.state_scatter(
+                kv.state_pool.states, kv.state_pool.conv_windows, kv.state_slot, linear_idx,
+                new_state, new_window,
+            )
         out = self._linear(backend, out, f"{p}.out_proj")
         return backend.add(x, out)
 

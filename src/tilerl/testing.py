@@ -58,6 +58,12 @@ class RefBackend:
     def materialize(self, params):
         return params  # torch serves every format on CPU: nothing to convert or move
 
+    def gdn_decode(self, *args, **kwargs):
+        return None  # no fused in-place decode here: the model takes the gather/scatter path
+
+    def attn_prep(self, *args, **kwargs):
+        return None
+
     def linear_fp4(self, x, wq, scale, master=None, oscale=None):
         from .ops import reference
 

@@ -128,6 +128,32 @@ def make_rmsnorm_apply(target: str):
     return rmsnorm_apply
 
 
+def make_rmsnorm_apply_bf16(target: str):
+    """make_rmsnorm_apply writing bf16 (sm90: the consumer GEMVs are bf16-IO,
+    so the f32 output only fed a per-call cast kernel — 23 launches/8 layers)."""
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    def rmsnorm_apply(X, W, P, eps: T.float32, block_N, num_chunks, threads):
+        M, N = T.const("M, N")
+        X: T.Tensor((M, N), "float32")
+        W: T.Tensor((N,), "float32")
+        P: T.Tensor((M, num_chunks), "float32")
+        Y = T.empty((M, N), "bfloat16")
+        with T.Kernel(M, T.ceildiv(N, block_N), threads=threads) as (row, bn):
+            var = T.alloc_fragment((1,), "float32")
+            var[0] = 0.0
+            for c in T.serial(num_chunks):
+                var[0] += P[row, c]
+            rstd = T.rsqrt(var[0] / N + eps)
+            for k in T.Parallel(block_N):
+                kk = bn * block_N + k
+                if kk < N:
+                    Y[row, kk] = T.cast(X[row, kk] * rstd * W[kk], "bfloat16")
+        return Y
+
+    return rmsnorm_apply
+
+
 def make_rmsnorm_rstd(target: str):
     """Per-row rsqrt(mean(x^2) + eps) -> Rstd [M]. Shared by the bwd kernels."""
 
@@ -361,6 +387,26 @@ def make_silu_mul(target: str):
                 if idx < M:
                     s = T.sigmoid(Gate[idx])
                     Y[idx] = Gate[idx] * s * Up[idx]
+        return Y
+
+    return silu_mul
+
+
+def make_silu_mul_bf16(target: str):
+    """make_silu_mul writing bf16 (sm90, bf16 in AND out: the gate_up GEMV writes bf16 and the down GEMV reads it)."""
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    def silu_mul(Gate, Up, block_M, threads):
+        M = T.const("M")
+        Gate: T.Tensor((M,), "bfloat16")
+        Up: T.Tensor((M,), "bfloat16")
+        Y = T.empty((M,), "bfloat16")
+        with T.Kernel(T.ceildiv(M, block_M), threads=threads) as bx:
+            for i in T.Parallel(block_M):
+                idx = bx * block_M + i
+                if idx < M:
+                    g = T.cast(Gate[idx], "float32")
+                    Y[idx] = T.cast(g * T.sigmoid(g) * T.cast(Up[idx], "float32"), "bfloat16")
         return Y
 
     return silu_mul

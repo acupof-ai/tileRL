@@ -41,5 +41,5 @@ for name, (N, K) in shapes.items():
     for g in (int(v) for v in args.groups.split(",")):
         k = kernels_linear.make_linear_fp8_gemv(backend.target, GROUP=g)
         for np_ in (int(v) for v in args.nparts.split(",")):
-            arms.append((f"G{g}-np{np_}", lambda k=k, np_=np_: (k(x, w8, ws, 32, np_),)))
+            arms.append((f"G{g}-np{np_}", lambda k=k, np_=np_: (k(x, w8, ws, torch.ones(N, device="cuda"), 32, np_),)))
     rows = bk.ab(f"fp8 gemv {name} N={N} K={K} (roof {1e3 * (N * K + 2 * K) / bw / 1e9:.4f} ms)", arms, ref)

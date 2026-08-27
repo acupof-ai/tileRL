@@ -646,7 +646,8 @@ def test_gdn_chunk_matches_decode(backend):
         f32(kw["conv1d_weight"]),
     )
     seq_q = i32(torch.full((q.shape[0],), q.shape[1], dtype=torch.int32))
-    dout, dstate, dwin = backend._kernel("gdn_decode_fused")(
+    states = f32(state).unsqueeze(1).contiguous()  # pool [B, 1 layer, ...], updated in place
+    dout, dwin = backend._kernel("gdn_decode_fused")(
         c(f32(q).squeeze(1)),
         c(f32(k).squeeze(1)),
         c(f32(v).squeeze(1)),
@@ -655,9 +656,12 @@ def test_gdn_chunk_matches_decode(backend):
         c(f32(beta).squeeze(1)),
         *common,
         f32(kw["conv_window"]),
-        f32(state),
+        states,
+        i32(torch.arange(q.shape[0], dtype=torch.int32)),
+        0,
         threads=state.shape[-1],
     )
+    dstate = states[:, 0]
     cout, cstate, cwin = backend._kernel("gdn_chunk_fused")(
         c(bf16(q)),
         c(bf16(k)),

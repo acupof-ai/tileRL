@@ -4,6 +4,21 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — phase exit: decode glue removed — B=1 74.9 tok/s (89% of Arle's 84.5)
+
+- **B=1 61.7 → 74.9 tok/s (+21%), B=8 agg 184.7 → 212.6 (+15%)**, all rows
+  raised, greedy text unchanged. Python-level attribution (`profile_glue.py`)
+  found ~900 per-tick launches of pure glue: parameters re-cast to f32 every
+  call, f32→bf16 casts between kernels, `oscale` as a torch mul, GDN state
+  bf16↔f32 round trips + gather/scatter. Fixes: cached parameter casts
+  (`_const_f32`), bf16-writing rmsnorm/silu on sm90, `oscale` folded into the
+  GEMV epilogues, f32 state pool updated in place by the fused GDN kernel.
+  Kernels per 8-layer tick 321 → 192. Entries:
+  `docs/experience/wins/2026-08-28-decode-glue-casts.md`,
+  `docs/experience/errors/2026-08-28-gdn-inplace-raw-serialized.md`.
+- Remaining B=1 tick (13.35 ms): fp8 GEMV ~48% and fp4 GEMV ~32% of GPU time,
+  both at 48–63% roofline; the rest is <20%.
+
 ## 2026-08-28 — verdict: fp4 GEMV was issue-bound; twiddle decode + bf16x2 FMA shipped
 
 - **B=1 54.2 → 61.7 tok/s (+14%), B=8 agg 142.7 → 184.7 (+29%), prefill

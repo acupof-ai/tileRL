@@ -46,7 +46,8 @@ def make_gdn_decode_fused(target: str):
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def gdn_decode_fused(
-        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State, threads
+        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, States, Slots,
+        layer: T.int32, threads,
     ):
         # QD (flat q/k dim) is the constexpr, not NKH: tilelang requires each
         # constexpr used directly in a buffer shape, and NKH appears only
@@ -68,12 +69,17 @@ def make_gdn_decode_fused(target: str):
         NormW: T.Tensor((V,), "float32")
         ConvW: T.Tensor((QKVD, KER), "float32")
         Window: T.Tensor((B, KER - 1, QKVD), "float32")
-        State: T.Tensor((B, NVH, K, V), "float32")
+        # The state is updated IN PLACE in the pool at [Slots[b], layer]: each
+        # thread owns its (j, tv) cells, so no gather/scatter kernels and no
+        # NewState buffer (was 2 index launches + 3 MB of traffic per layer).
+        S, L = T.const("S, L")
+        States: T.Tensor((S, L, NVH, K, V), "float32")
+        Slots: T.Tensor((B,), "int32")
         Out = T.empty((B, VD), "float32")
-        NewState = T.empty((B, NVH, K, V), "float32")
         NewWindow = T.empty((B, KER - 1, QKVD), "float32")
         with T.Kernel(NVH, B, threads=threads) as (vh, bb):
             tv = T.get_thread_binding(0)
+            slot = Slots[bb]
             kh = vh * (QD // K) // NVH
             is_rep = (vh % (NVH // (QD // K))) == 0
             qc = kh * K + tv  # Q tensor column == Window/ConvW q column
@@ -130,16 +136,20 @@ def make_gdn_decode_fused(target: str):
             # recurrence: decay + kv_mem, then rank-1 update + out
             kv_mem = T.alloc_fragment((1,), "float32")
             T.clear(kv_mem)
+            # The column is staged in registers between the two passes: an
+            # in-place read-after-write on the same global buffer serialized
+            # every j on the previous store (6.5 -> 57 us/call).
+            s_loc = T.alloc_local((K,), "float32")
             for j in T.serial(K):
-                sj = State[bb, vh, j, tv] * exp_g_s[0]
-                NewState[bb, vh, j, tv] = sj
+                sj = States[slot, layer, vh, j, tv] * exp_g_s[0]
+                s_loc[j] = sj
                 kv_mem[0] += sj * k_s[j]
             delta = (v_s[tv] - kv_mem[0]) * beta_s[0]
             acc_o = T.alloc_fragment((1,), "float32")
             T.clear(acc_o)
             for j in T.serial(K):
-                sj = NewState[bb, vh, j, tv] + delta * k_s[j]
-                NewState[bb, vh, j, tv] = sj
+                sj = s_loc[j] + delta * k_s[j]
+                States[slot, layer, vh, j, tv] = sj
                 acc_o[0] += sj * q_s[j]
             out_s[tv] = acc_o[0]
             T.tvm_storage_sync("shared")
@@ -167,7 +177,7 @@ def make_gdn_decode_fused(target: str):
                 NewWindow[bb, KER - 2, qc] = Q[bb, qc]
                 NewWindow[bb, KER - 2, kc] = Key[bb, qc]
 
-        return Out, NewState, NewWindow
+        return Out, NewWindow
 
     return gdn_decode_fused
 

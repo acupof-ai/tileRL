@@ -13,8 +13,8 @@ byte/occupancy levers were tried first, then ncu.
 
 | lever | result |
 |---|---|
-| Scale f32 → bf16 → e4m3 (`scripts/ab_fp4_scale_dtype.py`) | gate_up 83.2 / 84.0 / 83.0 µs — **zero effect** |
-| split-K ×2…×16 (`scripts/ab_fp4_ksplit.py`) | o_proj 40.9 → 41–42 µs at 1 280 → 10 240 blocks — **zero effect** |
+| Scale f32 → bf16 → e4m3 (`ab_fp4_scale_dtype`, deleted) | gate_up 83.2 / 84.0 / 83.0 µs — **zero effect** |
+| split-K ×2…×16 (`ab_fp4_ksplit`, deleted) | o_proj 40.9 → 41–42 µs at 1 280 → 10 240 blocks — **zero effect** |
 
 ncu on gate_up (34816×5120): **DRAM 40%, L1/TEX 87%, SM issue 82% busy,
 IPC 3.27**. 37.8M warp-instructions for 178M elements = **6.8 instr/elem**:

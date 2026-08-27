@@ -733,6 +733,9 @@ def build_engine(
         cfg.linear_num_value_heads,
         cfg.linear_value_head_dim,
         device=backend.device,
+        # sm90's fused GDN kernel is f32-IO: a bf16 pool cost two 1.5MB casts
+        # per layer per tick. +1.2 GiB at 16 slots on the 27B.
+        dtype=torch.float32 if backend.device.type == "cuda" else torch.bfloat16,
         conv_window=cfg.linear_conv_kernel_dim - 1,
         conv_dim=cfg.linear_qkv_dim,
     )

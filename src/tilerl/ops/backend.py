@@ -131,11 +131,8 @@ class Backend:
         self.arch = _arch_for(target)
         self._kernels: dict[str, object] = {}
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
-        #: f32 cast of the embedding table, keyed by (data_ptr, _version).
-        #: The 27B table is 248320x5120 bf16 (~2.5GB); re-casting it every
-        #: tick costs ~6ms on H20. The optimizer's in-place copy_ bumps
-        #: _version, so a train step invalidates the entry.
-        self._embed_f32: dict[int, tuple[Any, int, torch.Tensor]] = {}
+        self._const_f32_cache: dict[tuple[int, int | None], tuple[Any, int, torch.Tensor]] = {}
+        self._ones_cache: dict[int, torch.Tensor] = {}
 
     def _kernel(self, name: str):
         k = self._kernels.get(name)
@@ -192,7 +189,7 @@ class Backend:
     def _epilogue(self, y2, oscale, lead, n: int):
         # ponytail: torch epilogue for the per-row scale, fold into the kernel
         # accumulator if a sweep says it matters.
-        return (y2 if oscale is None else y2 * self._f32(oscale)).reshape(*lead, n)
+        return (y2 if oscale is None else y2 * self._const_f32(oscale)).reshape(*lead, n)
 
     def _plan(self, op: str, m: int, n: int, k: int):
         """(kernel, Mp, Np, Kp, block_M, block_N), or None when this cell has no
@@ -219,7 +216,7 @@ class Backend:
 
     def rmsnorm(self, x, w, eps):
         x = self._f32(x)
-        w = self._f32(w)
+        w = self._const_f32(w)
         lead = x.shape[:-1]
         x2 = self._c(x.reshape(-1, x.shape[-1]))
         # Split-K: chunk the reduction dim across blocks (phase 1 partial
@@ -365,8 +362,11 @@ class Backend:
             # K-tail: zero-padded X, and padded nibbles (0x00) decode to 0.0.
             wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
             if M == 1:
-                # Decode GEMV: one activation row, stream+dequant WQ once.
-                y2 = self._kernel(kernel)(_pad2d(x2, 1, Kp), wq, scale, 32, bN, blk)[:1, :N]
+                # Decode GEMV: one activation row, stream+dequant WQ once; the
+                # per-row oscale is folded into the kernel epilogue.
+                osc = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
+                y2 = self._kernel(kernel)(_pad2d(x2, 1, Kp), wq, scale, osc, 32, bN, blk)[:1, :N]
+                return self._epilogue(y2, None, lead, N)
             else:
                 # w4a8: per-token e4m3 activation quant + fp4->e4m3 dequant +
                 # fp8 WGMMA, K-split into f32 atomic adds on a zeroed output
@@ -409,10 +409,12 @@ class Backend:
         # Zero-padding the per-128-block wscale kills the K-tail.
         x2 = _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(M, K)), Mp, Kp)
         w8 = _pad2d(self._dev(w8, w8.dtype), Np, Kp)
-        wscale = _pad2d(self._f32(wscale), -(-Np // 128), Kp // 128)
+        wscale = _pad2d(self._const_f32(wscale), -(-Np // 128), Kp // 128)
         if M == 1:
-            # Decode GEMV: stream e4m3 W once (1 byte/elem), bf16 X.
-            y2 = self._kernel(kernel)(x2, w8, wscale, 32, bN)[:1, :N]
+            # Decode GEMV: stream e4m3 W once (1 byte/elem), bf16 X; oscale folded.
+            osc = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
+            y2 = self._kernel(kernel)(x2, w8, wscale, osc, 32, bN)[:1, :N]
+            return self._epilogue(y2, None, lead, N)
         else:
             xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
             ascale = torch.empty((Mp,), dtype=torch.float32, device=self.device)
@@ -494,7 +496,7 @@ class Backend:
             )
         out = out.squeeze(1) if squeeze else out
         if gate is not None:
-            out = out * torch.sigmoid(self._f32(gate))
+            out = out * torch.sigmoid(self._dev(gate, out.dtype))
         return out
 
     def attention(self, q, k, v, scale, gate=None):
@@ -585,43 +587,39 @@ class Backend:
         """Full-GDN layer core. sm90: T=1 uses the fused decode kernel, T>1 the
         fused chunk kernel; other arches use the torch-eager reference."""
         _kset = _resolve(self.precision, self.arch)
-        if q.shape[1] == 1 and "gdn_decode_fused" in _kset:
-            return self._gdn_decode_fused(q, k, v, g, beta, state, **kw)
         if q.shape[1] > 1 and "gdn_chunk_fused" in _kset:
             return self._gdn_chunk_fused(q, k, v, g, beta, state, **kw)
         return reference.gdn_forward(q, k, v, g, beta, state, **kw)
 
-    def _gdn_decode_fused(self, q, k, v, g, beta, state, **kw):
-        """Fused GDN decode (T=1): one launch for the whole layer core.
-
-        q/k/v/g/beta [B, 1, ...] are squeezed to [B, ...]. conv_window is
-        always a tensor (the model carries it; None means zero left-padding).
-        """
-        window = kw.get("conv_window")
-        if window is None:
-            window = torch.zeros(
-                q.shape[0],
-                kw["conv1d_weight"].shape[1] - 1,
-                q.shape[-1] + k.shape[-1] + v.shape[-1],
-                dtype=torch.float32,
-                device=self.device,
-            )
-        out, new_state, new_window = self._kernel("gdn_decode_fused")(
+    def gdn_decode(self, q, k, v, g, beta, pool, slots, layer, **kw):
+        """Serving decode (T=1) GDN core, one launch, state updated IN PLACE in
+        ``pool.states[slots, layer]`` (sm90 only — returns None elsewhere and the
+        caller takes the tape-recorded gather -> linear_attn_chunk -> scatter
+        path). The conv window is gathered/scattered (its q/k columns are
+        shared across blocks, so it cannot be shifted in place)."""
+        if "gdn_decode_fused" not in _resolve(self.precision, self.arch):
+            return None
+        slots_i = self._i32(slots).contiguous()
+        window = self._c(self._f32(pool.conv_windows[slots.long(), layer]))
+        out, new_window = self._kernel("gdn_decode_fused")(
             self._c(self._f32(q).squeeze(1)),
             self._c(self._f32(k).squeeze(1)),
             self._c(self._f32(v).squeeze(1)),
             self._c(self._f32(kw["z"]).squeeze(1)),
             self._c(self._f32(g).squeeze(1)),
             self._c(self._f32(beta).squeeze(1)),
-            self._c(self._f32(kw["dt_bias"])),
-            self._c(self._f32(kw["a_log"])),
-            self._c(self._f32(kw["norm_weight"])),
-            self._c(self._f32(kw["conv1d_weight"])),
-            self._c(self._f32(window)),
-            self._c(self._f32(state)),
-            threads=state.shape[-1],
+            self._c(self._const_f32(kw["dt_bias"])),
+            self._c(self._const_f32(kw["a_log"])),
+            self._c(self._const_f32(kw["norm_weight"])),
+            self._c(self._const_f32(kw["conv1d_weight"])),
+            window,
+            pool.states,
+            slots_i,
+            int(layer),
+            threads=pool.states.shape[-1],
         )
-        return out.unsqueeze(1), new_state, new_window
+        pool.conv_windows[slots.long(), layer] = new_window.to(pool.conv_windows.dtype)
+        return out.unsqueeze(1)
 
     def _gdn_chunk_fused(self, q, k, v, g, beta, state, **kw):
         """Fused GDN chunk prefill (T>1): one launch for the whole layer core.
@@ -652,10 +650,10 @@ class Backend:
             self._c(self._bf16(kw["z"])),
             self._c(self._f32(g)),
             self._c(self._f32(beta)),
-            self._c(self._f32(kw["dt_bias"])),
-            self._c(self._f32(kw["a_log"])),
-            self._c(self._f32(kw["norm_weight"])),
-            self._c(self._f32(kw["conv1d_weight"])),
+            self._c(self._const_f32(kw["dt_bias"])),
+            self._c(self._const_f32(kw["a_log"])),
+            self._c(self._const_f32(kw["norm_weight"])),
+            self._c(self._const_f32(kw["conv1d_weight"])),
             self._c(self._bf16(window)),
             self._c(self._f32(state)),
             self._c(self._i32(seq_q)),
@@ -679,8 +677,9 @@ class Backend:
 
     def silu_mul(self, gate, up):
         shape = gate.shape
-        gate = self._f32(gate).reshape(-1)
-        up = self._f32(up).reshape(-1)
+        io = torch.bfloat16 if self.arch == "sm90" else torch.float32  # sm90 kernel is bf16-IO
+        gate = self._c(self._dev(gate, io).reshape(-1))
+        up = self._c(self._dev(up, io).reshape(-1))
         y = self._kernel("silu_mul")(gate, up, 1024, _THREADS)
         return y.reshape(shape)
 
@@ -707,28 +706,38 @@ class Backend:
 
     # ------------------------------------------------------------ embedding
 
-    def _embed_table_f32(self, table):
-        """f32 cast of the embedding table, cached across ticks. The 27B
-        table is ~2.5GB bf16; casting it per tick costs ~6ms on H20. The
-        optimizer's in-place copy_ bumps _version, invalidating the entry.
-        Identity is checked via weakref: a fresh model can reuse a freed
-        table's address, and data_ptr alone would hand back the stale cast.
-        The tied lm_head path needs no cache: linear()'s IO cast is a no-op
-        on the bf16 embedding table."""
-        key = table.data_ptr()
-        hit = self._embed_f32.get(key)
+    def _const_f32(self, t, pad_to: int | None = None):
+        """f32 cast of a PARAMETER (norm weight, scale, GDN vector, embedding
+        table), cached across ticks; optionally zero-padded to ``pad_to`` rows.
+        Per-call casts were ~110 launches per 8 decode layers (the 27B embedding
+        alone ~6ms/tick). The optimizer's in-place copy_ bumps _version and
+        invalidates the entry. Identity is checked via weakref: a fresh model
+        can reuse a freed tensor's address, and data_ptr alone would hand back
+        the stale cast. Never call this on an activation."""
+        if t.dtype == torch.float32 and t.device == self.device and pad_to is None:
+            return t
+        key = (t.data_ptr(), pad_to)
+        hit = self._const_f32_cache.get(key)
         if hit is not None:
-            ref, ver, t = hit
-            if ref() is not table:
-                del self._embed_f32[key]  # address reused by a different table
-            elif ver == table._version:
-                return t
-        t = self._f32(table)
-        self._embed_f32[key] = (weakref.ref(table), table._version, t)
+            ref, ver, c = hit
+            if ref() is not t:
+                del self._const_f32_cache[key]  # address reused by a different tensor
+            elif ver == t._version:
+                return c
+        c = self._f32(t)
+        if pad_to is not None and pad_to != c.shape[0]:
+            c = torch.nn.functional.pad(c, (0, pad_to - c.shape[0]))
+        self._const_f32_cache[key] = (weakref.ref(t), t._version, c)
+        return c
+
+    def _ones(self, n: int):
+        t = self._ones_cache.get(n)
+        if t is None:
+            t = self._ones_cache[n] = torch.ones(n, dtype=torch.float32, device=self.device)
         return t
 
     def embedding(self, idx, table):
-        table = self._embed_table_f32(table)
+        table = self._const_f32(table)
         idx_flat = self._i32(idx).reshape(-1).contiguous()
         k = self._kernel("embedding")
         y = k(idx_flat, table, threads=_THREADS)
