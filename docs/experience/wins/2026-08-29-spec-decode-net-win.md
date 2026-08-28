@@ -1,7 +1,8 @@
 # Speculative decoding — REJECTED: measured against the eager path, not the shipped one
 
-> Status: Rejected. The engine keeps the code (it is correct and gated); the
-> feature does not pay until a speculative tick can be graph-captured.
+> Status: Rejected on throughput. The engine keeps the code (correct, gated,
+> and off unless a draft is passed). Graph capture of speculative ticks landed
+> and is worth 3x on the tick — still 0.61x of plain graph decode at B=1.
 
 ## Context
 
@@ -40,13 +41,34 @@ one replay); 1.87 tokens per forward does not buy that back.
 
 None of that is retracted. Only the throughput verdict is.
 
-## The Real Work
+## Capturing the spec tick: done, still not enough
 
-Capture a speculative tick: a graph family per `(B, 1+depth)`. `_DecodeGraph`
-today has static `[B,1]` id/position buffers, a static all-ones `seq_q_lens`
-deliberately outside the captured region, and the fused `gdn_decode` path. A
-spec tick needs `[B,1+depth]` buffers and the chunk GDN path — a different
-graph, not the same one reshaped.
+`_DecodeGraph` now takes a width — `[B,W]` id/position buffers, `seq_q_lens`
+statically W, `keep_steps=W` so the verify's per-step recurrent state writes
+land in the pool's static buffers and capture like any other kernel. Uniform W
+is the price: `verify_lens`' per-row trim cannot survive capture, so rows pad
+to the widest chain (any pad token is correct — a draft is accepted only when
+it equals what the trunk sampled).
+
+It works and it is worth 3x on the speculative tick: **106.2 ms -> 35.4 ms** at
+B=1 depth 2. It is still a loss:
+
+| B=1 | ms/tick | tok/tick | tok/s |
+|---|---:|---:|---:|
+| graph, no draft | **11.6** | 1.00 | **86.4** |
+| graph + spec depth 1 | 32.5 | 1.60 | 49.2 |
+| graph + spec depth 2 | 35.4 | 1.87 | 52.8 |
+
+The verify replay is ~13 ms; the two eager draft steps are the other ~22 ms,
+about 11 ms each for a ONE-layer head whose projections measure ~0.13 ms and
+whose lm_head measures 0.52 ms. That gap is not in the kernels and it is not
+the host syncs either — removing one of the two D2H copies per draft step moved
+52.7 to 52.8, i.e. nothing.
+
+Five hypotheses about this cost have now been measured and refuted (PCIe
+migration, weight dtype, weight format, the dict rebinding, the draft loop's
+syncs). Stopping here: the code is correct and gated, a draft is opt-in, and
+the remaining work is to find where ~10 ms per draft step actually goes.
 
 ## Rule
 
