@@ -43,4 +43,4 @@ Stays on the gather.
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
-| 2026-08-28 | (pending) | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | | | (harness pending) |
+| 2026-08-28 | see bench-baseline.json | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | 0.55 | 11.0 (B=1, d512) | B=1 **90.9 / 87.3 / 87.9 / 78.6** at 512/2k/8k/32k (was 87.5 / 79.8 / 58.5 / 28.7); B=8 agg 308.6 |

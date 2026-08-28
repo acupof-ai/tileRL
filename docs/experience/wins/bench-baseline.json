@@ -1,38 +1,38 @@
 {
   "decode-kv/d2048-b1/sm90": {
-    "commit": "f0dc914",
+    "commit": "unknown",
     "date": "2026-08-28",
-    "tok_s": 79.78581571531612
+    "tok_s": 87.33086560928957
   },
   "decode-kv/d2048-b8/sm90": {
-    "commit": "f0dc914",
+    "commit": "unknown",
     "date": "2026-08-28",
-    "tok_s": 254.70868896650018
+    "tok_s": 302.8433802306008
   },
   "decode-kv/d32768-b1/sm90": {
-    "commit": "2e66591",
+    "commit": "unknown",
     "date": "2026-08-28",
-    "tok_s": 28.723416212342357
+    "tok_s": 78.60968868587484
   },
   "decode-kv/d512-b1/sm90": {
-    "commit": "2e66591",
+    "commit": "unknown",
     "date": "2026-08-28",
-    "tok_s": 87.51330711094108
+    "tok_s": 90.85339454844048
   },
   "decode-kv/d512-b8/sm90": {
-    "commit": "f0dc914",
+    "commit": "unknown",
     "date": "2026-08-28",
-    "tok_s": 286.66763924159386
+    "tok_s": 308.60187794959484
   },
   "decode-kv/d8192-b1/sm90": {
-    "commit": "2e66591",
+    "commit": "unknown",
     "date": "2026-08-28",
-    "tok_s": 58.65805454069899
+    "tok_s": 87.93732886730602
   },
   "decode-kv/d8192-b8/sm90": {
-    "commit": "f0dc914",
+    "commit": "unknown",
     "date": "2026-08-28",
-    "tok_s": 202.1567402437748
+    "tok_s": 280.16624656766214
   },
   "kv-reuse/prefix-hits/cpu": {
     "commit": "655e941",

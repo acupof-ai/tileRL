@@ -4,6 +4,14 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — phase exit: decode nearly depth-flat — B=1 90.9 @512, 78.6 @32k; B=8 agg 308.6
+
+- Quiet-host gate over the f16 fp8 mma8 + split-KV attention + fused rmsnorm
+  tranche: B=1 d512 87.5 → **90.9**, d2k 79.8 → 87.3, d8k 58.5 → 87.9, d32k
+  28.7 → **78.6**; B=8 agg d512 286.7 → 308.6, d2k 302.8, d8k 280.2; prefill
+  unchanged; verify 1–3 PASS. Ledger:
+  `docs/experience/2026-08-28-decode-52-to-84.md`.
+
 ## 2026-08-28 — single-launch parallel rmsnorm on sm90 (2.1 µs vs 4.9 for the split-K pair)
 
 - One block per row, 256-thread strided partials, block-wide allreduce,
