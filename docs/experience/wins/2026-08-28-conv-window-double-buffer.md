@@ -47,4 +47,4 @@ parity so snapshots stay exact.
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
-| 2026-08-28 | see bench-baseline.json | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | 0.55 | 11.5 (B=1, d512) | **87.2** B=1; 215.1 agg B=8 |
+| 2026-08-28 | 2e66591 | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | 0.55 | 11.4 (B=1, d512) | **87.5** B=1; 219.4 agg B=8 |
