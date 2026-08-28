@@ -135,6 +135,11 @@ class Backend:
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
         self._const_f32_cache: dict[tuple[int, int | None], tuple[Any, int, torch.Tensor]] = {}
         self._ones_cache: dict[int, torch.Tensor] = {}
+        self._sms = (
+            torch.cuda.get_device_properties(self.device).multi_processor_count
+            if self.device.type == "cuda"
+            else 1
+        )
 
     def _kernel(self, name: str):
         k = self._kernels.get(name)
@@ -300,9 +305,11 @@ class Backend:
             else self._f32(bias)
         )
         if self.target.startswith("cuda"):
-            # WGMMA tiles: block M/N %16, reduction K %32; pad tails so the
-            # MMA kernel sees exact tiles (no OOB loads).
-            bM, bN = _round_up(bM, 16), _round_up(bN, 16)
+            # WGMMA tiles: the block M/N must be a warp-partition-valid size
+            # (16/32/64/128 — 48 is not, and a rank-16 LoRA or a 48-wide
+            # projection lands there), reduction K %32; pad tails so the MMA
+            # kernel sees exact tiles (no OOB loads).
+            bM, bN = _snap_mma_tile(bM, 64), _snap_mma_tile(bN, 64)
             x2 = _pad2d(x2, _round_up(M, bM), _round_up(K, 32))
             w = _pad2d(w, _round_up(N, bN), _round_up(K, 32))
             bias = _pad1d(bias, w.shape[0])
@@ -320,7 +327,7 @@ class Backend:
         M, N, K = g2.shape[0], g2.shape[1], w.shape[1]
         if self.target.startswith("cuda"):
             # gx = g2 @ w (gemm_nn): reduction N, output [M, K]
-            bM, bK = _round_up(min(64, M), 16), _round_up(min(64, K), 16)
+            bM, bK = _snap_mma_tile(min(64, M), 64), _snap_mma_tile(min(64, K), 64)
             gx = self._kernel("gemm_nn")(
                 _pad2d(g2, _round_up(M, bM), _round_up(N, 32)),
                 _pad2d(w, _round_up(N, 32), _round_up(K, bK)),
@@ -329,7 +336,7 @@ class Backend:
                 _THREADS,
             )[:M, :K]
             # gw = g2.T @ x2 (gemm_tn): reduction M, output [N, K]
-            bN = _round_up(min(64, N), 16)
+            bN = _snap_mma_tile(min(64, N), 64)
             gw = self._kernel("gemm_tn")(
                 _pad2d(g2, _round_up(M, 32), _round_up(N, bN)),
                 _pad2d(x2, _round_up(M, 32), _round_up(K, bK)),
@@ -553,9 +560,13 @@ class Backend:
         b, h, d = q.shape[0], q.shape[2], q.shape[3]
         hkv = k_cache.shape[1]
         # split count from the pool's reach (host-static, graph-safe): a
-        # block's serial scan stays <= 4K tokens at 256K
+        # block's serial scan stays <= 4K tokens at 256K. 16 splits at b=1 is
+        # (16, hkv, 1) = 64 blocks on 78 SMs — half the card idle, which is why
+        # d32768 measured slower than d131072; take 64 whenever the 16-grid
+        # under-fills and each split still gets a whole page.
         max_tokens = block_table.shape[1] * k_cache.shape[2]
-        ks, sfx = (64, "_64") if max_tokens > 65536 else (16, "")
+        wide = 16 * hkv * b < 2 * self._sms and max_tokens >= 64 * k_cache.shape[2]
+        ks, sfx = (64, "_64") if (max_tokens > 65536 or wide) else (16, "")
         key = ("attn_ws", b, hkv, d, ks)
         ws = self._ones_cache.get(key)
         if ws is None:  # static workspace: graph-capturable, one per batch bucket

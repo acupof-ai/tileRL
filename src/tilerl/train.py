@@ -148,6 +148,8 @@ def opd_loop(
     backend: Any,
     optimizer: AdamW | None = None,
     seed: int = 0,
+    trainable: dict[str, Any] | None = None,
+    ema_decay: float = 0.999,
 ) -> list[float]:
     """On-policy distillation: frozen teacher generates, student SFTs.
 
@@ -157,17 +159,23 @@ def opd_loop(
     only ``submit``/``poll``/``step`` are ever called on it, never
     ``train_step``.
 
-    EMA self-teacher (teacher weights = EMA of student) is day-2 — see
-    ``agent-infer/crates/train/src/ema_self_teacher.rs``.
+    ``trainable`` (the LoRA adapters) turns this into the self-teacher loop of
+    ``agent-infer/crates/train/src/ema_self_teacher.rs``: the teacher engine
+    drives the SAME model, generating with an EMA of those adapters instead of
+    a second copy of the weights. Only the adapters are duplicated, so the
+    self-teacher costs adapter-sized memory, not model-sized.
     """
     from .engine import SamplingParams
 
     if optimizer is None:
         optimizer = AdamW(lr=1e-3)
+    ema = {k: v.clone() for k, v in trainable.items()} if trainable is not None else None
     losses: list[float] = []
     for step in range(steps):
         prompt = np.asarray(prompts[step % len(prompts)], dtype=np.int64)
         params = SamplingParams(temperature=1.0, top_p=1.0, max_new_tokens=8, seed=seed + step)
+        if ema is not None:  # generate with the teacher weights, train the student
+            student_model.params.update(ema)
         rid = teacher_engine.submit(prompt, params)
         finished: dict[int, list[int]] = {}
         for _ in range(10000):  # one forward per tick; bounded guard
@@ -178,7 +186,13 @@ def opd_loop(
         else:  # pragma: no cover - engine bug, not a training path
             raise RuntimeError("opd_loop: teacher did not finish within 10000 ticks")
         seq = np.concatenate([prompt, np.asarray(finished[rid], dtype=np.int64)])
-        losses.append(train_step(student_model, seq[None, :], backend, optimizer))
+        if ema is not None:
+            student_model.params.update(trainable)
+        losses.append(train_step(student_model, seq[None, :], backend, optimizer,
+                                 trainable=trainable))
+        if ema is not None:
+            for k, e in ema.items():
+                e.mul_(ema_decay).add_(trainable[k], alpha=1.0 - ema_decay)
     return losses
 
 

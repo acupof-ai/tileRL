@@ -34,7 +34,18 @@ more than the dense attention at d512.
 `paged_attention_decode_64` (64 KV splits, selected when the pool reaches
 past 64K tokens — host-static, so graph-safe) keeps each block's serial scan
 ≤ 4K tokens. Kernel-level at 256K, B=1: dense 22.0 ms → **1.52 ms per layer
-(14.5×)**, relerr 2.6e-3. Harness rows d131072/d262144 at B=1 follow.
+(14.5×)**, relerr 2.6e-3.
+
+End-to-end harness rows, B=1, one H20 (KV alone is 17 / 34 GB, so one
+sequence per pool):
+
+| depth | ms/tick | tok/s |
+|---:|---:|---:|
+| 131072 | 16.36 | **61.1** |
+| 262144 | 20.81 | **48.1** |
+
+256K decode at 48 tok/s on a single card is what makes 128K–256K RL rollouts
+a budget question rather than an impossibility (docs/plan-training-rl.md).
 
 ## Rule
 
