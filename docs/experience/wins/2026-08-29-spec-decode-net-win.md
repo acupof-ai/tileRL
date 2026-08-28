@@ -1,57 +1,58 @@
-# Speculative decoding: 6.5x net LOSS -> 1.14-1.19x net win — H20, 2026-08-29
+# Speculative decoding — REJECTED: measured against the eager path, not the shipped one
 
-> Status: Shipped
+> Status: Rejected. The engine keeps the code (it is correct and gated); the
+> feature does not pay until a speculative tick can be graph-captured.
 
 ## Context
 
-The bundled NextN/MTP draft head (one full-attention layer, 425M params, 1% of
-the trunk) drafts into the engine's existing forward: a decode row becomes a
-`seq_q = 1+depth` row, so verification needed no second code path. Goodput was
-right immediately — 1.87 committed tokens per trunk forward — and throughput
-was still 6.5x WORSE than not speculating, because a single draft step cost
-more than the entire 64-layer trunk tick.
+Speculation landed in the engine: a decode row drafts off the trunk's last
+hidden and the same forward verifies it as a `seq_q = 1+depth` row. Goodput is
+real — **1.87 committed tokens per trunk forward at depth 2, 43-47% acceptance**
+— and this entry first reported it as a 1.14-1.19x win.
 
-## What Worked
+That was wrong. The comparison was against the EAGER decode path, and tileRL
+ships a CUDA-graph decode. `Engine.__init__` disables graph capture whenever a
+draft is present (`self._decode_graph_on = decode_graph and draft is None`),
+because a captured graph replays one T=1 step through the fused `gdn_decode`
+kernel, which does not exist at T>1.
 
-**Serving the draft head the way the trunk is served.** `Backend.linear`'s
-generic dense path runs at ~30 GB/s; the trunk never touches it because its
-weights are fp4/fp8 and dispatch to kernels. Measured, same shape:
+Measured, same script, same session (H20, GPU 7, 64 layers, 15 timed ticks):
 
-| path | ms/call |
-|---|---:|
-| `backend.linear`, bf16 dense | 9.7 |
-| `linear[fp8-gemv]` (trunk) | 0.13 |
-
-`reference.quant_fp8` inverts the existing `dequant_fp8`, `Model._linear` picks
-`.w8`/`.wscale` up on its own, and `fc` moved to the same seam instead of
-calling `backend.linear` directly.
-
-**Deleting a duplicated `materialize`.** `build_engine` re-bound
-`draft.params` to the dict `materialize` returns, which orphaned
-`DraftHead.layers` — the `Model` that actually runs the projections — on the
-original bf16 dict. The head was quantized correctly and the quantized tensors
-were never read. This one line made three consecutive real fixes look like
-no-ops.
-
-Measured (H20, GPU 7 idle, 64 layers, 15 timed ticks, `scripts/bench_batch_decode.py`):
-
-| arm | B=1 ms/tick | B=1 tok/s | B=8 ms/tick | B=8 aggregate tok/s |
+| arm | B=1 ms/tick | B=1 tok/s | B=8 ms/tick | B=8 aggregate |
 |---|---:|---:|---:|---:|
-| baseline | 64.4 | 15.5 | 96.9 | 82.6 |
-| depth 1 | 105.9 | 15.1 | 319.2 | 38.4 |
-| **depth 2** | 106.1 | **17.6 (1.14x)** | 151.8 | **91.8 (1.11x)** |
-| **depth 4** | 119.9 | 15.6 | 162.7 | **97.9 (1.19x)** |
+| eager, no draft | 91.6 | 10.9 | 138.1 | 57.9 |
+| **graph, no draft (shipped)** | **11.6** | **86.2** | **60.0** | **133.3** |
+| speculation, depth 2 (forced eager) | 106.2 | 17.6 | 151.0 | 92.3 |
 
-Acceptance is unchanged by the fp8 quantization (depth 2: 43.3% at B=1, 45.4%
-at B=8), so the head's quality survives it. tok/tick saturates at 1.87 (B=1)
-and 1.99 (B=8); `verify_lens` picks the depth per row from the draft's own
-softmax probability, since this checkpoint ships no confidence head.
+**Against what ships, speculation is 4.9x slower at B=1 and 1.44x slower at
+B=8.** The graph is worth 7.9x on its own at B=1 (785 launches collapsed into
+one replay); 1.87 tokens per forward does not buy that back.
 
-The B=8 depth-1 row (319 ms) is out of family with its neighbours and is not
-explained; treat it as unmeasured rather than as a result.
+## What Was Actually Established
+
+- The draft head works: teacher-forced top-1 agreement 84.4%, 43-47%
+  acceptance in the loop, 1.87 tok/tick at depth 2.
+- The verify path is correct — a mid-sequence multi-token forward matches T=1
+  greedy exactly, and the block loop reproduces greedy with an always-wrong and
+  an always-right draft.
+- Serving the head as fp8 is worth ~75x per projection against the generic
+  dense path (9.7 ms -> 0.13 ms for the same shape).
+
+None of that is retracted. Only the throughput verdict is.
+
+## The Real Work
+
+Capture a speculative tick: a graph family per `(B, 1+depth)`. `_DecodeGraph`
+today has static `[B,1]` id/position buffers, a static all-ones `seq_q_lens`
+deliberately outside the captured region, and the fused `gdn_decode` path. A
+spec tick needs `[B,1+depth]` buffers and the chunk GDN path — a different
+graph, not the same one reshaped.
 
 ## Rule
 
-A perf fix that measures as a no-op is a fix that did not run. Three in a row
-reading the same means something upstream is discarding them — check that the
-object you mutated is the object the hot path reads, before writing a fourth.
+Benchmark against the configuration that ships, not the one that is easy to
+instrument. The eager path was the convenient baseline because
+`bench_batch_decode` defaults to it; the number it produced was real and the
+conclusion drawn from it was false. Two rows in one baseline file, side by
+side, is what exposed it — which is the argument for one snapshot covering
+every path rather than a per-feature script.
