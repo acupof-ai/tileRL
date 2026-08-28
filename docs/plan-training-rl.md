@@ -101,6 +101,40 @@ round vs verl / OpenRLHF / slime (whichever load the 27B here). Recorded like
 `docs/experience/2026-08-28-vs-sglang-h20.md`; the numbers set the next
 round's targets.
 
+## What torchtitan does, and what of it transfers
+
+torchtitan (pytorch/torchtitan) composes FSDP2 (per-parameter sharding),
+TP (DTensor `ColwiseParallel`/`RowwiseParallel`/`SequenceParallel`, loss
+parallel, async TP micro-pipelining), PP (`pipeline_parallel.py`), CP
+(`distributed/context_parallel/api.py` wrapping
+`torch.distributed.tensor.experimental._context_parallel_shard`) and EP,
+in a fixed order — TP → activation checkpointing → compile → FSDP — over one
+device mesh (`ParallelDims`), with float8/MXFP8 training, a seed checkpoint
+loaded by FQN so any shard can initialize itself, and a `cudagraph.py` that
+captures the whole fwd+bwd step with static parameter buffers.
+
+Transfers directly (no torch autograd/DTensor needed):
+- **Mesh-first**: one `ParallelDims`-style object (dp, tp, cp, pp) that every
+  op reads its rank/coord from — agent-infer's `CpContext` is the same idea.
+- **Fixed application order** and "model forward is a loop over blocks":
+  our `Model.forward` already is; keep TP/CP decisions inside ops, never at
+  the top level.
+- **CP as sequence sharding of inputs/labels/positions with load balancing**
+  — their `_HeadTailLoadBalancer` gives each rank a head chunk and a tail
+  chunk so causal attention work is even; adopt it (a rank's shard =
+  `[i, N-1-i]` chunks), for both ring attention and the GDN scan.
+- **Seed checkpoint by name**: shards initialize from one checkpoint by
+  parameter name — our `load_hf` key map is that.
+- **fwd+bwd under one CUDA graph** with static weight buffers: our decode
+  graph does this for inference; the training step should too (P1 gate).
+- **float8 training**: our fp8 GEMM path (`linear_fp8`, WGMMA) is the
+  forward half; the backward GEMMs in fp8 are P5 material.
+
+Does not transfer: DTensor and `fully_shard` (they are torch.autograd
+machinery — our tape owns backward), `torch.compile`, and their ring
+attention (SDPA-specific); we write ring attention and the GDN scan as
+TileLang kernels on top of the comm seam.
+
 ## Order and why
 
 P0 → P1 first: they make the 27B trainable on the hardware we have with no
