@@ -121,8 +121,10 @@ def train_step(
     params = model.params if trainable is None else trainable
     param_ids = {id(p) for p in params.values()}
     assert param_ids & set(grads), (
-        "train_step: tape produced no parameter gradients — the recording "
-        "seam is missing (backend ops not recorded?)"
+        "train_step: tape produced no parameter gradients — either the "
+        "recording seam is missing (backend ops not recorded), or a trainable "
+        "tensor is not the one the forward read: materialize() rebuilds any "
+        "param whose device/dtype differs, and the new object has a new id()"
     )
     # The GDN initial state is a tape leaf: its grad is not a parameter and
     # must not enter the clip norm. ponytail: backward still computes and

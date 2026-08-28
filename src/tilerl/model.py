@@ -497,8 +497,13 @@ def add_lora(
         else:
             continue
         scale = (alpha / rank) / math.sqrt(kk)
-        new[base + ".lora_a"] = torch.randn(rank, kk, generator=g).to(torch.bfloat16) * scale
-        new[base + ".lora_b"] = torch.zeros(n, rank, dtype=torch.bfloat16)
+        # on the base weight's device: materialize() runs every train step and
+        # its .to(device) would rebuild a CPU adapter, changing the id() the
+        # optimizer and the tape key gradients by
+        dev = model.params[k].device
+        a = torch.randn(rank, kk, generator=g).to(torch.bfloat16) * scale
+        new[base + ".lora_a"] = a.to(dev)
+        new[base + ".lora_b"] = torch.zeros(n, rank, dtype=torch.bfloat16, device=dev)
     model.params.update(new)
     return new
 
