@@ -1,4 +1,4 @@
-# Prefill graph capture: implemented, blocked by a capture-hostile op in the GDN path
+# Prefill graph capture: unblocked, measured, and reverted at ~1%
 
 ## Context
 
@@ -31,13 +31,38 @@ Two failures, in order:
    "host sync on parity". The decode path avoids it entirely by using the
    fused, in-place `gdn_decode`.
 
-Not chased further today. The fallback is clean — a failed capture warns and
-runs eager, and prefill/accuracy/kv-reuse all read 0.998-1.000x — so this costs
-nothing except the win it does not yet collect.
+3. Found it: `Model.forward`'s own `int(seq_q_lens.min())`, added an hour
+   earlier to decide `last_only`. Reading a device tensor is a host sync and is
+   illegal inside a capture. The engine already holds the per-row lengths as
+   Python ints, so the caller decides now — a better shape regardless, since
+   that sync was also paid on every eager forward.
+
+## Then it captured, and it was not worth keeping
+
+With the sync gone, capture succeeds. It buys almost nothing:
+
+| row | eager | captured | |
+|---|---:|---:|---:|
+| prefill/len512 | 2109.7 | 2125.8 | 1.008x |
+| prefill/len2048 | 2090.5 | 2116.5 | 1.012x |
+| prefill/len8192 | 2025.8 | 1994.1 | **0.984x** |
+
+Two rows up ~1%, one down 1.6% — inside the noise, and the ~6% of host
+dispatch the change was aimed at does not appear. Prefill is GPU-bound enough
+that its dispatch already overlaps; decode is not, which is why the same
+capture is worth 7.9x there.
+
+**Reverted.** A code path plus four sets of static buffers, for a net zero, is
+not worth carrying. The host-sync fix stays — it is correct on its own.
 
 ## Rule
 
-A capture that fails must fall back, not fail the tick. Both failures here were
-caught by the same `try/except` around construction, which is why two broken
-attempts cost zero throughput and zero correctness. Build the fallback before
-the optimization.
+A capture that fails must fall back, not fail the tick. Three failures here
+were caught by one `try/except` around construction, so every broken attempt
+cost zero throughput and zero correctness.
+
+And: graph capture pays where dispatch is exposed, not where it is merely
+present. Decode is 785 launches against an 11.6 ms tick and capture is worth
+7.9x; prefill is ~720 launches against a 243 ms forward and capture is worth
+nothing. Count the launches against the GPU time they hide behind, not on their
+own.

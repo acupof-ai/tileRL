@@ -327,8 +327,6 @@ class Engine:
             decode_graph = backend.device.type == "cuda"
         self._decode_graph_on = decode_graph
         self._decode_graphs: dict = {}
-        self._prefill_graphs: dict = {}
-        self._prefill_graph_on = decode_graph
 
         # Speculation: the draft is one full-attn stack with its OWN kv plane
         # and no recurrent state — it must never reach the trunk's GDN slots.
@@ -692,15 +690,6 @@ class Engine:
             and self._run_decode_graph(decodes, chains)
         ):
             return
-        # A pure-prefill tick at a full bucketed chunk is one static shape too.
-        if (
-            not decodes
-            and prefill is not None
-            and self._prefill_graph_on
-            and chunk % _PREFILL_BUCKET == 0
-            and self._run_prefill_graph(prefill, chunk)
-        ):
-            return
         rows = decodes + ([prefill] if prefill is not None else [])
         seq_q = q_dec + ([chunk] if prefill is not None else [])
         # Bucket the forward width: tilelang kernels specialize on the shape,
@@ -766,28 +755,6 @@ class Engine:
                 self._finish(prefill)
             else:
                 prefill.phase = _PHASE_DECODE
-
-    def _run_prefill_graph(self, prefill: _Req, chunk: int) -> bool:
-        """Replay a captured prefill chunk. Only a FULL chunk at the bucketed
-        width — a prompt's short tail is a one-off shape not worth a graph, and
-        a mixed tick's width is set by the prefill row anyway."""
-        key = (0, chunk)
-        g = self._prefill_graphs.get(key)
-        if g is None:
-            if len(self._prefill_graphs) >= 4:
-                return False  # ponytail: 4 widths cached; prompts rarely need more
-            try:
-                g = _DecodeGraph(self._model, self._backend, self._kv, self._states, 1,
-                                 width=chunk, last_only=True)
-            except Exception as exc:
-                warnings.warn(f"prefill graph capture failed for W={chunk} ({exc}); eager")
-                self._prefill_graph_on = False
-                return False
-            self._prefill_graphs[key] = g
-        logits = g.run([prefill])
-        self._prefill_forwards += 1
-        self._finish_prefill(prefill, logits[0, -1], chunk)
-        return True
 
     def _run_decode_graph(self, reqs: list[_Req], chains=None) -> bool:
         """Captured decode for a pure-decode tick (one graph per batch-size
