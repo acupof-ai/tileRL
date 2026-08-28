@@ -51,13 +51,24 @@ to the widest chain (any pad token is correct — a draft is accepted only when
 it equals what the trunk sampled).
 
 It works and it is worth 3x on the speculative tick: **106.2 ms -> 35.4 ms** at
-B=1 depth 2. It is still a loss:
+B=1 depth 2. It is still a loss everywhere. Both arms below are measured by the
+same suite, settled the same way — the harness's spec suite now runs its own
+no-draft arm, because three earlier readings of this feature compared against a
+row from a different script (eager instead of graph, B=8 instead of B=1,
+un-settled instead of settled) and each time the mistake flattered speculation.
 
-| B=1 | ms/tick | tok/tick | tok/s |
-|---|---:|---:|---:|
-| graph, no draft | **11.6** | 1.00 | **86.4** |
-| graph + spec depth 1 | 32.5 | 1.60 | 49.2 |
-| graph + spec depth 2 | 35.4 | 1.87 | 52.8 |
+| B | depth | plain tok/s | spec tok/s | ratio | accept |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 92.3 | 39.5 | 0.43x | 71.8% |
+| 1 | 2 | 92.3 | 53.7 | 0.58x | 47.2% |
+| 1 | 4 | 92.0 | 56.9 | 0.62x | 29.6% |
+| 8 | 1 | 310.8 | 38.3 | 0.12x | 59.5% |
+| 8 | 2 | 311.6 | 149.5 | 0.48x | 42.9% |
+| 8 | 4 | 311.9 | **238.5** | **0.76x** | 26.2% |
+
+The ratio improves with both depth and batch and is best at B=8 depth 4, still
+0.76x. The B=8 depth-1 row (219.9 ms/tick) is out of family with its
+neighbours and is not explained.
 
 The verify replay is ~13 ms; the two eager draft steps are the other ~22 ms,
 about 11 ms each for a ONE-layer head whose projections measure ~0.13 ms and
