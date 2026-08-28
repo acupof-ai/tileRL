@@ -64,8 +64,13 @@ def main() -> None:
                              device=backend.device, layer_map=(0,))
     from tilerl.kv_cache import LinearStatePool
 
-    states = LinearStatePool(1, cfg.num_linear_layers, cfg.linear_num_value_heads,
-                             cfg.linear_value_head_dim, device=backend.device)
+    # conv_window must be allocated: re-absorbing a 1-token committed prefix
+    # takes the T=1 decode path, which reads the raw-qkv carry.
+    states = LinearStatePool(
+        1, cfg.num_linear_layers, cfg.linear_num_value_heads, cfg.linear_value_head_dim,
+        device=backend.device, conv_window=cfg.linear_conv_kernel_dim - 1,
+        conv_dim=cfg.linear_qkv_dim,
+    )
     bt = torch.arange(nblk, dtype=torch.int32, device=backend.device).reshape(1, nblk)
 
     def kv_for(pool, length, q):
