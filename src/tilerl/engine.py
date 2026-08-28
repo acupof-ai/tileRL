@@ -50,6 +50,8 @@ import torch
 
 from .kv_cache import BLOCK_TOKENS, LinearStatePool, PagedKvPool, PrefixStore
 
+_PREFILL_BUCKET = 64  # prefill widths are padded to this: bounded kernel shapes
+
 __all__ = ["Engine", "SamplingParams", "StepLimits", "BatchKv", "build_engine"]
 
 _PHASE_PREFILL = 1
@@ -549,7 +551,12 @@ class Engine:
             return
         rows = decodes + ([prefill] if prefill is not None else [])
         seq_q = [1] * len(decodes) + ([chunk] if prefill is not None else [])
-        width = max(seq_q)
+        # Bucket the forward width: tilelang kernels specialize on the shape,
+        # so a width equal to the prompt length compiles a kernel set per
+        # distinct prompt (MMLU: 662 variants in 20 min, GPU idle). Padding
+        # rows are masked by seq_q_lens everywhere; the true chunk indexes the
+        # logits below.
+        width = -(-max(seq_q) // _PREFILL_BUCKET) * _PREFILL_BUCKET if chunk > 1 else 1
         input_ids = np.zeros((len(rows), width), dtype=np.int64)
         positions = np.zeros((len(rows), width), dtype=np.int64)
         for i, r in enumerate(decodes):
