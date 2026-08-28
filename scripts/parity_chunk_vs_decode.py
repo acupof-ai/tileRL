@@ -1,9 +1,12 @@
-"""Does a mid-sequence multi-token forward agree with token-by-token decode?
+"""Does the speculative-decode verify path agree with plain greedy decode?
 
-Speculative decoding's verify step feeds depth+1 tokens at once from a state
-built by decode. If that path disagrees with T=1 decode, every acceptance
-number is noise and spec decode cannot be wired at all. No draft head here —
-this isolates the engine.
+Two checks, both with no draft head involved — the draft's quality is a
+separate question from whether the machinery around it is correct.
+
+  default: a mid-sequence multi-token forward vs token-by-token decode.
+  --loop:  the whole block loop (snapshot / verify / roll back / re-absorb)
+           driven by a draft that is always right or always wrong. Either way
+           the committed tokens are known in advance: plain greedy decode.
 
   python scripts/parity_chunk_vs_decode.py /data00/Qwen3.8-27B-NVFP4 --gpu 7
 """
@@ -23,7 +26,8 @@ def main() -> None:
     ap.add_argument("source")
     ap.add_argument("--gpu", type=int, default=None)
     ap.add_argument("--gen", type=int, default=16)
-    ap.add_argument("--chunk", type=int, default=5, help="tokens per multi-token forward")
+    ap.add_argument("--chunk", type=int, default=5, help="draft tokens per verify")
+    ap.add_argument("--loop", choices=("accept", "reject"), default=None)
     ap.add_argument("--text", default="Write a Python function that merges two sorted lists.")
     args = ap.parse_args()
     if args.gpu is not None:
@@ -49,7 +53,7 @@ def main() -> None:
         return np.asarray(x, dtype=np.int64)
 
     def fresh():
-        nblk = -(-(len(ids0) + args.gen + 64) // BLOCK_TOKENS) + 2
+        nblk = -(-(len(ids0) + args.gen + args.chunk + 64) // BLOCK_TOKENS) + 2
         pool = PagedKvPool(nblk, cfg.num_kv_heads, cfg.head_dim,
                            num_layers=len(cfg.full_attn_layers), device=backend.device,
                            layer_map=cfg.full_attn_layers)
@@ -66,10 +70,10 @@ def main() -> None:
                 seq_len=torch.tensor([length], dtype=torch.int32, device=backend.device),
                 state_slot=torch.zeros(1, dtype=torch.int32, device=backend.device),
                 seq_q_lens=torch.tensor([q], dtype=torch.int32, device=backend.device))
-        return kv
+        return kv, states
 
-    # (a) reference: pure T=1 greedy decode.
-    kv = fresh()
+    # Reference: pure T=1 greedy decode. Everything below must reproduce it.
+    kv, _ = fresh()
     lg = trunk.forward(arr([ids0]), arr(range(len(ids0))), kv(len(ids0), len(ids0)), backend)
     ref = [int(lg[0, -1].argmax())]
     pos = len(ids0)
@@ -78,8 +82,45 @@ def main() -> None:
         ref.append(int(lg[0, -1].argmax()))
         pos += 1
 
-    # (b) same tokens, fed back in chunks of --chunk from a decode-built state.
-    kv = fresh()
+    if args.loop:
+        kv, states = fresh()
+        trunk.forward(arr([ids0]), arr(range(len(ids0))), kv(len(ids0), len(ids0)), backend)
+        out = [ref[0]]
+        pos = len(ids0)
+        n_acc = 0
+        while len(out) < args.gen:
+            i = len(out) - 1
+            drafts = (ref[i + 1 : i + 1 + args.chunk] if args.loop == "accept"
+                      else [ids0[0]] * args.chunk)
+            chain = [out[-1]] + drafts
+            snap_state, snap_win = states.states.clone(), states.window_snapshot(0)
+            lg = trunk.forward(arr([chain]), arr(range(pos, pos + len(chain))),
+                               kv(pos + len(chain), len(chain)), backend)
+            n_ok = 0
+            for a, b in zip((int(x) for x in lg[0, :-1].argmax(-1)), chain[1:]):
+                if a != b:
+                    break
+                n_ok += 1
+            n_acc += n_ok
+            out.extend(chain[1 : n_ok + 1])
+            out.append(int(lg[0, n_ok].argmax()))
+            pos += n_ok + 1
+            states.states.copy_(snap_state)
+            if snap_win is not None:
+                states.window_restore(0, snap_win)
+            keep = chain[: n_ok + 1]
+            trunk.forward(arr([keep]), arr(range(pos - n_ok - 1, pos)),
+                          kv(pos, len(keep)), backend)
+        out = out[: args.gen]
+        bad = next((i for i, (a, b) in enumerate(zip(ref, out)) if a != b), None)
+        print(f"loop={args.loop} chunk={args.chunk}: accepted {n_acc}, "
+              f"first divergence from greedy at {bad} (None = clean)")
+        print("  greedy   :", ref)
+        print("  committed:", out)
+        assert bad is None, "the block loop does not reproduce greedy decode"
+        return
+
+    kv, _ = fresh()
     trunk.forward(arr([ids0]), arr(range(len(ids0))), kv(len(ids0), len(ids0)), backend)
     got: list[int] = []
     pos = len(ids0)
