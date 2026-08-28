@@ -42,4 +42,4 @@ flight per warp. Scalar batched GEMVs cannot fit MX rows of X in registers.
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
-| 2026-08-28 | see bench-baseline.json | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | 0.55 | 27.9 (B=8, d512) | B=8 agg **286.7** d512 / 254.7 d2k / 202.2 d8k; B=1 87.3 unchanged |
+| 2026-08-28 | f0dc914 | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | 0.55 | 27.9 (B=8, d512) | B=8 agg **286.7** d512 / 254.7 d2k / 202.2 d8k; B=1 87.3 unchanged |
