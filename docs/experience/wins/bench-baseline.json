@@ -70,19 +70,19 @@
     "tok_s": 1777.9952913179336
   },
   "train/27B-lora-b1t128/sm90": {
-    "commit": "unknown",
+    "commit": "26c4790",
     "date": "2026-08-28",
-    "tok_s": 0.8109317965987813
+    "tok_s": 32.61746932502321
   },
   "train/27B-lora-b1t256/sm90": {
-    "commit": "unknown",
+    "commit": "26c4790",
     "date": "2026-08-28",
-    "tok_s": 0.8183091628963295
+    "tok_s": 38.22927812638181
   },
   "train/27B-lora-b1t64/sm90": {
-    "commit": "unknown",
+    "commit": "26c4790",
     "date": "2026-08-28",
-    "tok_s": 0.7988524583703596
+    "tok_s": 26.489555534039393
   },
   "train/tiny-b2t128/cpu": {
     "commit": "2fdc85c",
