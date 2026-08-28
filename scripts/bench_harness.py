@@ -277,27 +277,46 @@ def suite_train(gate, backend, source, gpu):
 
             torch.cuda.synchronize()
 
-    # 27B fp32 masters alone are 108 GB > one H20 (OOMs at 1x128): the GPU
-    # row covers the tape path on tiny. pending-remote: sharded/bf16 masters.
-    model_name = "tiny"
-    cfg, mdl = _build_model(model_name, seed=0, keep_master=True)
+    # Full-parameter 27B needs 54 GB of bf16 masters + 216 GB of Adam moments
+    # and does not fit one H20 at any shape. The source row trains LoRA
+    # adapters on the frozen fp4 base instead (model.add_lora); tiny keeps the
+    # full-parameter tape covered on CPU.
+    trainable = None
+    if source:
+        from tilerl.config import qwen38_27b
+        from tilerl.model import add_lora, load_hf
+
+        model_name = "27B-lora"
+        cfg = qwen38_27b()
+        mdl = load_hf(cfg, source, fuse_projections=False)
+        mdl.params = backend.materialize(mdl.params)
+        trainable = add_lora(mdl, rank=16)
+        shapes = [(1, 512), (1, 2048)]
+    else:
+        model_name = "tiny"
+        cfg, mdl = _build_model(model_name, seed=0, keep_master=True)
+        shapes = [(2, 128), (2, 512)]
     opt = AdamW(lr=1e-3)
-    shapes = [(2, 128), (2, 512)]
     print(f"\n=== training-step throughput ({model_name}) ===")
     print(f"  {'B x T':>10} {'ms/step':>10} {'tok/s':>12}")
     for b, t in shapes:
         ids = np.arange(1, b * t + 1, dtype=np.int64).reshape(b, t) % cfg.vocab_size
-        train_step(mdl, ids, backend, opt)  # warm (JIT + tape shapes)
+        train_step(mdl, ids, backend, opt, trainable=trainable)  # warm (JIT + tape shapes)
         samples = []
         for _ in range(3):
             sync()
             s = time.perf_counter()
-            train_step(mdl, ids, backend, opt)
+            train_step(mdl, ids, backend, opt, trainable=trainable)
             sync()
             samples.append(time.perf_counter() - s)
         ms = statistics.median(samples) * 1e3
         tok_s = b * t / (ms / 1e3)
-        print(f"  {f'{b}x{t}':>10} {ms:>10.2f} {tok_s:>12.1f}")
+        peak = ""
+        if backend.device.type == "cuda":
+            import torch
+
+            peak = f"  peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB"
+        print(f"  {f'{b}x{t}':>10} {ms:>10.2f} {tok_s:>12.1f}{peak}")
         gate.check("train", f"{model_name}-b{b}t{t}", tok_s)
 
 
