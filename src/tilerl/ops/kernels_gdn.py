@@ -241,7 +241,8 @@ def make_gdn_chunk_fused(target: str):
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def gdn_chunk_fused(
-        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State, SeqQLens, threads
+        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State, SeqQLens, threads,
+        kdim,
     ):
         # TT (sequence length) is the const, not T: T is the tilelang.language
         # module alias and rebinding it would break T.serial/T.Kernel below.
@@ -282,6 +283,8 @@ def make_gdn_chunk_fused(target: str):
             beta_s = T.alloc_shared((1,), "float32")
             out_s = T.alloc_shared((V,), "float32")
             rms_s = T.alloc_shared((1,), "float32")
+            red_q = T.alloc_shared((K,), "float32")
+            red_k = T.alloc_shared((K,), "float32")
 
             # per-token fragments, hoisted out of the serial scan
             cq = T.alloc_fragment((1,), "float32")
@@ -290,8 +293,6 @@ def make_gdn_chunk_fused(target: str):
             kv_mem = T.alloc_fragment((1,), "float32")
             delta = T.alloc_fragment((1,), "float32")
             acc_o = T.alloc_fragment((1,), "float32")
-            acc_q = T.alloc_fragment((1,), "float32")
-            acc_k = T.alloc_fragment((1,), "float32")
             acc_sq = T.alloc_fragment((1,), "float32")
 
             # per-thread state column: carried in a local array across all T
@@ -330,15 +331,23 @@ def make_gdn_chunk_fused(target: str):
                 v_s[tv] = cv[0] * T.sigmoid(cv[0])
                 T.tvm_storage_sync("shared")
 
-                # L2-norm + g/beta (thread 0 reduces, broadcasts via shared)
+                # L2-norm: a tree reduce over the block's K threads. Thread 0
+                # alone summing K=128 twice is 256 dependent FMAs on the
+                # critical path of EVERY token — at T=512 that alone is
+                # ~0.5 ms per call while 127 threads idle.
+                red_q[tv] = q_s[tv] * q_s[tv]
+                red_k[tv] = k_s[tv] * k_s[tv]
+                T.tvm_storage_sync("shared")
+                step = kdim  # python int (K is symbolic): unrolls on the host
+                while step > 1:
+                    step //= 2
+                    if tv < step:
+                        red_q[tv] += red_q[tv + step]
+                        red_k[tv] += red_k[tv + step]
+                    T.tvm_storage_sync("shared")
                 if tv == 0:
-                    T.clear(acc_q)
-                    T.clear(acc_k)
-                    for j in T.serial(K):
-                        acc_q[0] += q_s[j] * q_s[j]
-                        acc_k[0] += k_s[j] * k_s[j]
-                    qn[0] = T.rsqrt(acc_q[0] + 1e-12)
-                    kn[0] = T.rsqrt(acc_k[0] + 1e-12)
+                    qn[0] = T.rsqrt(red_q[0] + 1e-12)
+                    kn[0] = T.rsqrt(red_k[0] + 1e-12)
                     x = GIn[bb, t, vh] + DtBias[vh]
                     sp = T.if_then_else(x > 20.0, x, T.log(1.0 + T.exp(x)))
                     exp_g_s[0] = T.exp(-T.exp(ALog[vh]) * sp)

@@ -783,6 +783,7 @@ class Backend:
             self._c(self._f32(state)),
             self._c(self._i32(seq_q)),
             threads=state.shape[-1],
+            kdim=int(state.shape[-2]),  # tree-reduce depth; K is symbolic in the kernel
         )
         return out, new_state, (self._f32(new_window) if has_window else None)
 
