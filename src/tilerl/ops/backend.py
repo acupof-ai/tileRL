@@ -95,6 +95,8 @@ def _pad1d(t: torch.Tensor, n: int) -> torch.Tensor:
 #: (docs/experience/wins/2026-08-26-batch-decode-h2.md). The fp4->e4m3 arms
 #: tile N at 64 because the kernel overrides block_N to _FP4_BLOCK_N=64 — a
 #: 32-tile pad lets its grid read past the padded WQ.
+_MX = 8  # batched decode GEMV: activation rows kept in registers per lane
+
 _CUDA_PLAN = {
     ("linear", "gemv"): ("linear_bf16_gemv", 256, 4, 4),
     ("linear_fp4", "gemv"): ("linear_fp4_gemv", 256, 4, 4),
@@ -367,6 +369,16 @@ class Backend:
             kernel, Mp, Np, Kp, bM, bN = plan
             # K-tail: zero-padded X, and padded nibbles (0x00) decode to 0.0.
             wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
+            if 2 <= M <= _MX and "linear_fp4_gemv_mx" in _resolve(self.precision, self.arch):
+                # Batched decode: the register-resident-X GEMV beats the padded
+                # WGMMA w4a8 path (weights read once, no A quant, no atomics).
+                osc = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
+                xm = _pad2d(x2, _MX, Kp)
+                res = None if residual is None else self._f32(residual).reshape(M, N)
+                r2 = self._zeros2(_MX, Np) if res is None or Np != N else _pad2d(res, _MX, N)
+                y2 = self._kernel("linear_fp4_gemv_mx")(xm, wq, scale, osc, r2, 32, blk)[:M, :N]
+                y = y2.reshape(*lead, N)
+                return y if res is None or r2.shape[1] == N else y + residual
             if M == 1:
                 # Decode GEMV: one activation row, stream+dequant WQ once; the
                 # per-row oscale is folded into the kernel epilogue.
@@ -423,6 +435,14 @@ class Backend:
         x2 = _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(M, K)), Mp, Kp)
         w8 = _pad2d(self._dev(w8, w8.dtype), Np, Kp)
         wscale = _pad2d(self._const_f32(wscale), -(-Np // 128), Kp // 128)
+        if 2 <= M <= _MX and "linear_fp8_gemv_mx" in _resolve(self.precision, self.arch):
+            osc = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
+            xm = _pad2d(x2, _MX, Kp)
+            res = None if residual is None else self._f32(residual).reshape(M, N)
+            r2 = self._zeros2(_MX, Np) if res is None or Np != N else _pad2d(res, _MX, N)
+            y2 = self._kernel("linear_fp8_gemv_mx")(xm, w8, wscale, osc, r2, 32)[:M, :N]
+            y = y2.reshape(*lead, N)
+            return y if res is None or r2.shape[1] == N else y + residual
         if M == 1:
             # Decode GEMV: stream e4m3 W once (1 byte/elem), bf16 X; oscale folded.
             osc = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
@@ -612,13 +632,13 @@ class Backend:
         """Serving decode (T=1) GDN core, one launch, state updated IN PLACE in
         ``pool.states[slots, layer]`` (sm90 only — returns None elsewhere and the
         caller takes the tape-recorded gather -> linear_attn_chunk -> scatter
-        path). The conv window is gathered/scattered (its q/k columns are
-        shared across blocks, so it cannot be shifted in place)."""
+        path). The conv window is double-buffered in the pool (plane
+        ``win_parity[slot]`` read, ``1 -`` it written): its q/k columns are
+        shared across blocks, so an in-place shift would race."""
         if "gdn_decode_fused" not in _resolve(self.precision, self.arch):
             return None
         slots_i = self._i32(slots).contiguous()
-        window = self._c(self._f32(pool.conv_windows[slots.long(), layer]))
-        out, new_window = self._kernel("gdn_decode_fused")(
+        out = self._kernel("gdn_decode_fused")(
             self._c(self._f32(q).squeeze(1)),
             self._c(self._f32(k).squeeze(1)),
             self._c(self._f32(v).squeeze(1)),
@@ -629,14 +649,19 @@ class Backend:
             self._c(self._const_f32(kw["a_log"])),
             self._c(self._const_f32(kw["norm_weight"])),
             self._c(self._const_f32(kw["conv1d_weight"])),
-            window,
+            pool.conv_windows,
+            pool.win_parity,
             pool.states,
             slots_i,
             int(layer),
             threads=pool.states.shape[-1],
         )
-        pool.conv_windows[slots.long(), layer] = new_window.to(pool.conv_windows.dtype)
         return out.unsqueeze(1)
+
+    def flip_window_parity(self, pool, slots) -> None:
+        """After a decode tick's last GDN layer: the written planes become live."""
+        idx = slots.long()
+        pool.win_parity[idx] = 1 - pool.win_parity[idx]
 
     def _gdn_chunk_fused(self, q, k, v, g, beta, state, **kw):
         """Fused GDN chunk prefill (T>1): one launch for the whole layer core.
@@ -684,11 +709,11 @@ class Backend:
         kw.pop("seq_q_lens", None)  # serving-only; training batches are uniform T
         return reference.linear_attn_bwd(grad, q, k, v, g, beta, state, **kw)
 
-    def state_gather(self, states, windows, slots, layer_idx):
-        return reference.state_gather(states, windows, slots, layer_idx)
+    def state_gather(self, states, windows, slots, layer_idx, parity=None):
+        return reference.state_gather(states, windows, slots, layer_idx, parity)
 
-    def state_scatter(self, states, windows, slots, layer_idx, new_state, new_window):
-        reference.state_scatter(states, windows, slots, layer_idx, new_state, new_window)
+    def state_scatter(self, states, windows, slots, layer_idx, new_state, new_window, parity=None):
+        reference.state_scatter(states, windows, slots, layer_idx, new_state, new_window, parity)
 
     # ------------------------------------------------------------ silu mul
 
@@ -750,6 +775,12 @@ class Backend:
         t = self._ones_cache.get(n)
         if t is None:
             t = self._ones_cache[n] = torch.ones(n, dtype=torch.float32, device=self.device)
+        return t
+
+    def _zeros2(self, m: int, n: int):
+        t = self._ones_cache.get(("zeros2", m, n))
+        if t is None:
+            t = self._ones_cache[("zeros2", m, n)] = torch.zeros(m, n, dtype=torch.float32, device=self.device)
         return t
 
     def _residual(self, residual, n: int, np_: int):

@@ -46,7 +46,7 @@ def make_gdn_decode_fused(target: str):
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def gdn_decode_fused(
-        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, States, Slots,
+        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Windows, Par, States, Slots,
         layer: T.int32, threads,
     ):
         # QD (flat q/k dim) is the constexpr, not NKH: tilelang requires each
@@ -68,18 +68,23 @@ def make_gdn_decode_fused(target: str):
         ALog: T.Tensor((NVH,), "float32")
         NormW: T.Tensor((V,), "float32")
         ConvW: T.Tensor((QKVD, KER), "float32")
-        Window: T.Tensor((B, KER - 1, QKVD), "float32")
+        # conv windows live in the pool, double-buffered: read plane Par[slot],
+        # write 1-Par[slot] (q/k columns are shared across the GQA group's
+        # blocks, so the shift cannot be done in place); the tick flips Par.
+        S, L = T.const("S, L")
+        Windows: T.Tensor((S, L, 2, KER - 1, QKVD), "float32")
+        Par: T.Tensor((S,), "int32")
         # The state is updated IN PLACE in the pool at [Slots[b], layer]: each
         # thread owns its (j, tv) cells, so no gather/scatter kernels and no
         # NewState buffer (was 2 index launches + 3 MB of traffic per layer).
-        S, L = T.const("S, L")
         States: T.Tensor((S, L, NVH, K, V), "float32")
         Slots: T.Tensor((B,), "int32")
         Out = T.empty((B, VD), "bfloat16")  # out_proj (fp8 GEMV) reads bf16
-        NewWindow = T.empty((B, KER - 1, QKVD), "float32")
         with T.Kernel(NVH, B, threads=threads) as (vh, bb):
             tv = T.get_thread_binding(0)
             slot = Slots[bb]
+            par = Par[slot]
+            nxt = 1 - par
             kh = vh * (QD // K) // NVH
             is_rep = (vh % (NVH // (QD // K))) == 0
             qc = kh * K + tv  # Q tensor column == Window/ConvW q column
@@ -104,9 +109,9 @@ def make_gdn_decode_fused(target: str):
             ck[0] = Key[bb, qc] * ConvW[kc, KER - 1]
             cv[0] = Val[bb, vh * V + tv] * ConvW[vc, KER - 1]
             for tap in T.serial(KER - 1):
-                cq[0] += Window[bb, tap, qc] * ConvW[qc, tap]
-                ck[0] += Window[bb, tap, kc] * ConvW[kc, tap]
-                cv[0] += Window[bb, tap, vc] * ConvW[vc, tap]
+                cq[0] += Windows[slot, layer, par, tap, qc] * ConvW[qc, tap]
+                ck[0] += Windows[slot, layer, par, tap, kc] * ConvW[kc, tap]
+                cv[0] += Windows[slot, layer, par, tap, vc] * ConvW[vc, tap]
             q_s[tv] = cq[0] * T.sigmoid(cq[0])
             k_s[tv] = ck[0] * T.sigmoid(ck[0])
             v_s[tv] = cv[0] * T.sigmoid(cv[0])
@@ -170,16 +175,16 @@ def make_gdn_decode_fused(target: str):
             # new conv window: shift left, append current qkv. q/k channels
             # are shared across the GQA group — only the representative writes.
             for tap in T.serial(KER - 2):
-                NewWindow[bb, tap, vc] = Window[bb, tap + 1, vc]
-            NewWindow[bb, KER - 2, vc] = Val[bb, vh * V + tv]
+                Windows[slot, layer, nxt, tap, vc] = Windows[slot, layer, par, tap + 1, vc]
+            Windows[slot, layer, nxt, KER - 2, vc] = Val[bb, vh * V + tv]
             if is_rep:
                 for tap in T.serial(KER - 2):
-                    NewWindow[bb, tap, qc] = Window[bb, tap + 1, qc]
-                    NewWindow[bb, tap, kc] = Window[bb, tap + 1, kc]
-                NewWindow[bb, KER - 2, qc] = Q[bb, qc]
-                NewWindow[bb, KER - 2, kc] = Key[bb, qc]
+                    Windows[slot, layer, nxt, tap, qc] = Windows[slot, layer, par, tap + 1, qc]
+                    Windows[slot, layer, nxt, tap, kc] = Windows[slot, layer, par, tap + 1, kc]
+                Windows[slot, layer, nxt, KER - 2, qc] = Q[bb, qc]
+                Windows[slot, layer, nxt, KER - 2, kc] = Key[bb, qc]
 
-        return Out, NewWindow
+        return Out
 
     return gdn_decode_fused
 

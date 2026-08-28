@@ -274,10 +274,15 @@ class LinearStatePool:
             dtype=dtype,
             device=self.device,
         )
+        # Two planes per slot, selected by win_parity[slot]: the sm90 fused
+        # decode kernel reads plane p and writes 1-p (its q/k columns are
+        # shared across blocks, so an in-place shift would race), then the tick
+        # flips the parity. Every other path indexes through the parity too.
         self.conv_windows = (
             torch.zeros(
                 num_slots,
                 num_linear_layers,
+                2,
                 conv_window,
                 conv_dim,
                 dtype=dtype,
@@ -286,7 +291,18 @@ class LinearStatePool:
             if num_linear_layers > 0 and conv_window > 0
             else None
         )
+        self.win_parity = torch.zeros(num_slots, dtype=torch.int32, device=self.device)
         self._free: list[int] = list(range(num_slots))
+
+    def window_snapshot(self, slot: int) -> torch.Tensor | None:
+        """[L, W, D] clone of the slot's live window plane (host sync on parity)."""
+        if self.conv_windows is None:
+            return None
+        return self.conv_windows[slot, :, int(self.win_parity[slot])].clone()
+
+    def window_restore(self, slot: int, snap: torch.Tensor) -> None:
+        self.conv_windows[slot, :, 0].copy_(snap)
+        self.win_parity[slot] = 0
 
     def alloc_slot(self) -> int:
         """Pop a free slot, zero its state, and return it."""

@@ -93,6 +93,7 @@ _SM90_KERNELS = {
     "gemm_tn": kernels_linear.make_gemm_tn_mma,
     "linear_fp4": kernels_linear.make_linear_fp4_mma,
     "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv,
+    "linear_fp4_gemv_mx": kernels_linear.make_linear_fp4_gemv_mx,
     "linear_bf16_gemv": kernels_linear.make_linear_bf16_gemv,
     "linear_fp4_fp8": lambda target: kernels_linear.make_linear_fp4_fp8_mma(target, k_split=2),
     # Decode (M<=16): 8-way K-split. At bM=16 a block is 2 warps, so the
@@ -104,6 +105,7 @@ _SM90_KERNELS = {
     ),
     "linear_fp8": kernels_linear.make_linear_fp8_mma,
     "linear_fp8_gemv": kernels_linear.make_linear_fp8_gemv,
+    "linear_fp8_gemv_mx": kernels_linear.make_linear_fp8_gemv_mx,
     "quant_fp8": kernels_linear.make_quant_fp8_e4m3,
     "write_tokens": kernels_mma.make_write_tokens,
     "attn_prep": kernels_mma.make_attn_prep,

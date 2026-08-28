@@ -647,7 +647,10 @@ def test_gdn_chunk_matches_decode(backend):
     )
     seq_q = i32(torch.full((q.shape[0],), q.shape[1], dtype=torch.int32))
     states = f32(state).unsqueeze(1).contiguous()  # pool [B, 1 layer, ...], updated in place
-    dout, dwin = backend._kernel("gdn_decode_fused")(
+    win = f32(kw["conv_window"]).unsqueeze(1)  # [B, W, D] -> planes [B, 1 layer, 2, W, D]
+    windows = torch.stack([win, torch.zeros_like(win)], dim=2).contiguous()
+    par = i32(torch.zeros(q.shape[0], dtype=torch.int32))
+    dout = backend._kernel("gdn_decode_fused")(
         c(f32(q).squeeze(1)),
         c(f32(k).squeeze(1)),
         c(f32(v).squeeze(1)),
@@ -655,13 +658,15 @@ def test_gdn_chunk_matches_decode(backend):
         c(f32(g).squeeze(1)),
         c(f32(beta).squeeze(1)),
         *common,
-        f32(kw["conv_window"]),
+        windows,
+        par,
         states,
         i32(torch.arange(q.shape[0], dtype=torch.int32)),
         0,
         threads=state.shape[-1],
     )
     dstate = states[:, 0]
+    dwin = windows[:, 0, 1]  # written to the other plane
     cout, cstate, cwin = backend._kernel("gdn_chunk_fused")(
         c(bf16(q)),
         c(bf16(k)),

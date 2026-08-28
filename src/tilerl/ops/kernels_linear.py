@@ -371,6 +371,108 @@ __device__ __forceinline__ void tl_fp8_gemv_tiles(const void *w8v, const void *x
 // GROUP fp4 tiles (16 elems = 8 twiddled bytes each), loaded straight from
 // global into registers first (same rationale as tl_fp8_gemv_tiles). Tiles
 // are block_K elements apart: W stride block_K/2 bytes, X stride 2*block_K.
+// Batched decode (MX <= 8 activation rows) x R weight rows per thread: the
+// MX X-rows for this K-slice stay in registers while the thread walks its R
+// weight rows, so X traffic is /R (the 2026-08-26 small-M GEMV reloaded X
+// per warp and was L1-bound at 3x the M=1 cost). W: 8 bytes per row-tile,
+// row stride w_stride bytes; X: 32 bytes per row-tile, row stride x_stride
+// elements; sc[r*G+g]; acc[r*MX+m].
+template <int G, int MX, int R>
+__device__ __forceinline__ void tl_fp4_gemv_mx(const void *wqv, int w_stride, const void *xv,
+                                               int x_stride, int block_K, const float *sc,
+                                               float *acc) {
+  const unsigned char *wq = (const unsigned char *)wqv;
+  const unsigned short *x = (const unsigned short *)xv;
+  uint4 x0[G][MX], x1[G][MX];
+  uint2 w[G][R];
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+#pragma unroll
+    for (int m = 0; m < MX; ++m) {
+      const unsigned short *xp = x + m * x_stride + g * block_K;
+      asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(x0[g][m].x), "=r"(x0[g][m].y), "=r"(x0[g][m].z), "=r"(x0[g][m].w) : "l"(xp));
+      asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(x1[g][m].x), "=r"(x1[g][m].y), "=r"(x1[g][m].z), "=r"(x1[g][m].w) : "l"(xp + 8));
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+      asm volatile("ld.global.nc.v2.u32 {%0,%1}, [%2];"
+                   : "=r"(w[g][r].x), "=r"(w[g][r].y) : "l"(wq + r * w_stride + g * (block_K / 2)));
+  }
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      unsigned d[8];
+      tl_fp4_decode8(w[g][r].x, d);
+      tl_fp4_decode8(w[g][r].y, d + 4);
+#pragma unroll
+      for (int m = 0; m < MX; ++m) {
+        const unsigned xw[8] = {x0[g][m].x, x0[g][m].y, x0[g][m].z, x0[g][m].w,
+                                x1[g][m].x, x1[g][m].y, x1[g][m].z, x1[g][m].w};
+        unsigned a = 0u;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          asm volatile("fma.rn.bf16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(d[j]), "r"(xw[j]));
+        float l = __uint_as_float(a << 16), h = __uint_as_float(a & 0xffff0000u);
+        acc[r * MX + m] = fmaf(sc[r * G + g], l + h, acc[r * MX + m]);
+      }
+    }
+  }
+}
+// fp8 counterpart of tl_fp4_gemv_mx: 16 e4m3 per row-tile (uint4).
+template <int G, int MX, int R>
+__device__ __forceinline__ void tl_fp8_gemv_mx(const void *w8v, int w_stride, const void *xv,
+                                               int x_stride, int block_K, const float *sc,
+                                               float *acc) {
+  const unsigned char *w8 = (const unsigned char *)w8v;
+  const unsigned short *x = (const unsigned short *)xv;
+  uint4 x0[G][MX], x1[G][MX], w[G][R];
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+#pragma unroll
+    for (int m = 0; m < MX; ++m) {
+      const unsigned short *xp = x + m * x_stride + g * block_K;
+      asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(x0[g][m].x), "=r"(x0[g][m].y), "=r"(x0[g][m].z), "=r"(x0[g][m].w) : "l"(xp));
+      asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(x1[g][m].x), "=r"(x1[g][m].y), "=r"(x1[g][m].z), "=r"(x1[g][m].w) : "l"(xp + 8));
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+      asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(w[g][r].x), "=r"(w[g][r].y), "=r"(w[g][r].z), "=r"(w[g][r].w)
+                   : "l"(w8 + r * w_stride + g * block_K));
+  }
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const unsigned ww[4] = {w[g][r].x, w[g][r].y, w[g][r].z, w[g][r].w};
+      unsigned d[8];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        unsigned lo, hi;
+        asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(lo) : "r"(ww[i]));
+        asm("prmt.b32 %0, %1, 0, 0x4342;" : "=r"(hi) : "r"(ww[i]));
+        d[2 * i] = tl_e4m3x2_to_bf16x2(lo);
+        d[2 * i + 1] = tl_e4m3x2_to_bf16x2(hi);
+      }
+#pragma unroll
+      for (int m = 0; m < MX; ++m) {
+        const unsigned xw[8] = {x0[g][m].x, x0[g][m].y, x0[g][m].z, x0[g][m].w,
+                                x1[g][m].x, x1[g][m].y, x1[g][m].z, x1[g][m].w};
+        unsigned a = 0u;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          asm volatile("fma.rn.bf16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(d[j]), "r"(xw[j]));
+        float l = __uint_as_float(a << 16), h = __uint_as_float(a & 0xffff0000u);
+        acc[r * MX + m] = fmaf(sc[r * G + g], l + h, acc[r * MX + m]);
+      }
+    }
+  }
+}
 template <int G>
 __device__ __forceinline__ void tl_fp4_gemv_tiles(const void *wqv, const void *xv, int block_K,
                                                   const float *sc, float *acc) {
@@ -484,6 +586,80 @@ def make_linear_fp4_gemv(target: str, GROUP: int = 4):
         return Y
 
     return linear_fp4_gemv
+
+
+def make_linear_fp4_gemv_mx(target: str, MX: int = 8, R: int = 4, GROUP: int = 2):
+    """Batched decode GEMV (2 <= M <= MX, sm90): X [MX, K] bf16 @ twiddled fp4
+    -> Y [MX, N] f32 (+ Res, * OScale). One warp per R output rows: each lane
+    owns a 16-elem K-slice, keeps the MX activation rows of that slice in
+    registers and walks its R weight rows (``tl_fp4_gemv_mx``), so the weight
+    stream is read once and X traffic is /R. Replaces the padded WGMMA w4a8
+    path for decode batches (B=8: 182 us/call on gate_up vs 57 for M=1).
+
+    # SOTA copy: the M=1 twiddle GEMV above, generalized over rows;
+    #   Marlin's "stream W once, reuse A from registers" for small M.
+    """
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def linear_fp4_gemv_mx(X, WQ, Scale, OScale, Res, reduce_thread, block):
+        N, K = T.const("N, K")
+        assert block % 16 == 0
+        micro = 16
+        block_K = reduce_thread * micro
+        num_ko = T.ceildiv(K, block_K)
+        num_g = num_ko // GROUP
+        X: T.Tensor((MX, K), "bfloat16")
+        WQ: T.Tensor((N, K // 2), "uint8")
+        Scale: T.Tensor((N, K // block), "float32")
+        OScale: T.Tensor((N,), "float32")
+        Res: T.Tensor((MX, N), "float32")
+        Y = T.empty((MX, N), "float32")
+        with T.Kernel(T.ceildiv(N, R), threads=reduce_thread) as bx:
+            T.import_source(_FP4_TWIDDLE_SRC)
+            kr = T.get_thread_binding(0)
+            n0 = bx * R
+            acc = T.alloc_local((R * MX,), "float32")
+            sc = T.alloc_local((R * GROUP,), "float32")
+            reduced = T.alloc_local((1,), "float32")
+            for i in T.unroll(R * MX):
+                acc[i] = 0.0
+            for kg in T.serial(num_g):
+                base = kg * GROUP * block_K + kr * micro
+                for r in T.unroll(R):
+                    for g in T.unroll(GROUP):
+                        sc[r * GROUP + g] = Scale[n0 + r, (base + g * block_K) // block]
+                T.call_extern(
+                    f"tl_fp4_gemv_mx<{GROUP}, {MX}, {R}>", T.access_ptr(WQ[n0, base // 2], "r"),
+                    K // 2, T.access_ptr(X[0, base], "r"), K, block_K, T.access_ptr(sc, "r"),
+                    T.access_ptr(acc, "rw"), dtype="void",
+                )
+            for kt in T.serial(num_ko - num_g * GROUP):
+                base = (num_g * GROUP + kt) * block_K + kr * micro
+                for r in T.unroll(R):
+                    sc[r] = Scale[n0 + r, base // block]
+                T.call_extern(
+                    f"tl_fp4_gemv_mx<1, {MX}, {R}>", T.access_ptr(WQ[n0, base // 2], "r"),
+                    K // 2, T.access_ptr(X[0, base], "r"), K, block_K, T.access_ptr(sc, "r"),
+                    T.access_ptr(acc, "rw"), dtype="void",
+                )
+            for i in T.unroll(R * MX):
+                with T.attr(
+                    T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
+                    "reduce_scope",
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                ):
+                    T.evaluate(
+                        T.tvm_thread_allreduce(
+                            T.uint32(1), acc[i], True, reduced[0], kr, dtype="handle"
+                        )
+                    )
+                if kr == 0:
+                    Y[i % MX, n0 + i // MX] = (
+                        Res[i % MX, n0 + i // MX] + reduced[0] * OScale[n0 + i // MX]
+                    )
+        return Y
+
+    return linear_fp4_gemv_mx
 
 
 # ---------------------------------------------------------------- linear bf16 (GEMV)
@@ -628,6 +804,73 @@ def make_linear_fp8_gemv(target: str, GROUP: int = 4):
         return Y
 
     return linear_fp8_gemv
+
+
+def make_linear_fp8_gemv_mx(target: str, MX: int = 8, R: int = 4, GROUP: int = 2):
+    """Batched decode GEMV (2 <= M <= MX, sm90) for e4m3 weights with the
+    per-128-block scale: the fp8 twin of make_linear_fp4_gemv_mx (X rows in
+    registers, R weight rows per lane, ``tl_fp8_gemv_mx``). Replaces the
+    padded fp8 WGMMA path for decode batches (143 us/call at B=8)."""
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def linear_fp8_gemv_mx(X, W8, WScale, OScale, Res, reduce_thread):
+        N, K = T.const("N, K")
+        micro = 16
+        block_K = reduce_thread * micro
+        num_ko = T.ceildiv(K, block_K)
+        num_g = num_ko // GROUP
+        X: T.Tensor((MX, K), "bfloat16")
+        W8: T.Tensor((N, K), "float8_e4m3fn")
+        WScale: T.Tensor((T.ceildiv(N, 128), T.ceildiv(K, 128)), "float32")
+        OScale: T.Tensor((N,), "float32")
+        Res: T.Tensor((MX, N), "float32")
+        Y = T.empty((MX, N), "float32")
+        with T.Kernel(T.ceildiv(N, R), threads=reduce_thread) as bx:
+            T.import_source(_FP4_TWIDDLE_SRC)
+            kr = T.get_thread_binding(0)
+            n0 = bx * R
+            acc = T.alloc_local((R * MX,), "float32")
+            sc = T.alloc_local((R * GROUP,), "float32")
+            reduced = T.alloc_local((1,), "float32")
+            for i in T.unroll(R * MX):
+                acc[i] = 0.0
+            for kg in T.serial(num_g):
+                base = kg * GROUP * block_K + kr * micro
+                for r in T.unroll(R):
+                    for g in T.unroll(GROUP):
+                        sc[r * GROUP + g] = WScale[(n0 + r) // 128, (base + g * block_K) // 128]
+                T.call_extern(
+                    f"tl_fp8_gemv_mx<{GROUP}, {MX}, {R}>", T.access_ptr(W8[n0, base], "r"), K,
+                    T.access_ptr(X[0, base], "r"), K, block_K, T.access_ptr(sc, "r"),
+                    T.access_ptr(acc, "rw"), dtype="void",
+                )
+            for kt in T.serial(num_ko - num_g * GROUP):
+                base = (num_g * GROUP + kt) * block_K + kr * micro
+                for r in T.unroll(R):
+                    sc[r] = WScale[(n0 + r) // 128, base // 128]
+                T.call_extern(
+                    f"tl_fp8_gemv_mx<1, {MX}, {R}>", T.access_ptr(W8[n0, base], "r"), K,
+                    T.access_ptr(X[0, base], "r"), K, block_K, T.access_ptr(sc, "r"),
+                    T.access_ptr(acc, "rw"), dtype="void",
+                )
+            for i in T.unroll(R * MX):
+                with T.attr(
+                    T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
+                    "reduce_scope",
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                ):
+                    T.evaluate(
+                        T.tvm_thread_allreduce(
+                            T.uint32(1), acc[i], True, reduced[0], kr, dtype="handle"
+                        )
+                    )
+                if kr == 0:
+                    Y[i % MX, n0 + i // MX] = (
+                        Res[i % MX, n0 + i // MX] + reduced[0] * OScale[n0 + i // MX]
+                    )
+        return Y
+
+    return linear_fp8_gemv_mx
 
 
 # ---------------------------------------------------------------- quant fp8 (per-token)

@@ -4,6 +4,16 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — phase exit: B=1 decode 87.2 tok/s, Arle's 84.5 passed
+
+- **B=1 83.9 → 87.2 tok/s (+3.9%)**, d2k/d8k +4%, verify 1–3 PASS. The conv
+  window is double-buffered in the state pool (parity plane, flipped once per
+  tick) and shifted inside the fused GDN kernel — the last per-layer
+  gather/scatter is gone. Same commit: batched M≤8 fp4/fp8 GEMVs (activation
+  rows in registers) replace the padded WGMMA decode paths — B=8 agg 215 → 219
+  (d512), 204 → 216 (d2k). Entry: `docs/experience/wins/2026-08-28-conv-window-double-buffer.md`;
+  ledger: `docs/experience/2026-08-28-decode-52-to-84.md`.
+
 ## 2026-08-28 — residual add in the GEMV epilogue — B=1 83.9 tok/s (99% of Arle's 84.5)
 
 - **B=1 82.0 → 83.9 tok/s (+2.4%)**, verify 1–3 PASS, B=8 flat, prefill −2%

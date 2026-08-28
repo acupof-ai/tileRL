@@ -761,18 +761,24 @@ def cross_entropy_loss_grad(logits: torch.Tensor, input_ids: object) -> tuple[fl
     return float(loss), out
 
 
-def state_gather(states, windows, slots, layer_idx):
-    """Gather one recurrent-state layer for a batch of slots."""
+def state_gather(states, windows, slots, layer_idx, parity=None):
+    """Gather one recurrent-state layer for a batch of slots. ``windows`` is
+    the double-buffered pool plane set [S, L, 2, W, D]; ``parity`` [S] picks
+    the live plane (all zeros off the sm90 decode path)."""
     slots = torch.as_tensor(slots, dtype=torch.long, device=states.device).reshape(-1)
-    return states[slots, layer_idx], None if windows is None else windows[slots, layer_idx]
+    if windows is None:
+        return states[slots, layer_idx], None
+    par = torch.zeros_like(slots) if parity is None else parity[slots].long()
+    return states[slots, layer_idx], windows[slots, layer_idx, par]
 
 
-def state_scatter(states, windows, slots, layer_idx, new_state, new_window) -> None:
-    """Store one recurrent-state layer for a batch of slots."""
+def state_scatter(states, windows, slots, layer_idx, new_state, new_window, parity=None) -> None:
+    """Store one recurrent-state layer for a batch of slots (same plane it was read from)."""
     slots = torch.as_tensor(slots, dtype=torch.long, device=states.device).reshape(-1)
     states[slots, layer_idx] = new_state.to(states.dtype)
     if new_window is not None:
-        windows[slots, layer_idx] = new_window.to(windows.dtype)
+        par = torch.zeros_like(slots) if parity is None else parity[slots].long()
+        windows[slots, layer_idx, par] = new_window.to(windows.dtype)
 
 
 # ---------------------------------------------------------------- embedding

@@ -40,7 +40,7 @@ pool maps a GLOBAL ``layer_idx`` to its plane); ``backend.write_tokens(k, v,
 kv, layer_idx)`` scatters ``k/v`` [B,T,Hkv,D] at ``[seq_len-T, seq_len)``
 through the block table (one capturable kernel on sm90, the pool's torch loop
 on other arches); ``state_pool.states`` is ``[num_slots, num_linear_layers, H, K, V]``
-and ``state_pool.conv_windows`` ``[num_slots, num_linear_layers, K-1,
+and ``state_pool.conv_windows`` ``[num_slots, num_linear_layers, 2 (parity), K-1,
 qkv_dim]`` (None without GDN layers).
 
 Checkpoint loading: ``load_hf(cfg, source, ...)`` maps a Qwen3.5/3.6
@@ -407,16 +407,20 @@ class Model:
                 q, k, v, a_proj, b_proj, kv.state_pool, kv.state_slot, linear_idx, **kwargs
             )
         if out is None:
+            pool = kv.state_pool
             state, window = backend.state_gather(
-                kv.state_pool.states, kv.state_pool.conv_windows, kv.state_slot, linear_idx
+                pool.states, pool.conv_windows, kv.state_slot, linear_idx, pool.win_parity
             )
             out, new_state, new_window = backend.linear_attn_chunk(
                 q, k, v, a_proj, b_proj, state, conv_window=window, **kwargs
             )
             backend.state_scatter(
-                kv.state_pool.states, kv.state_pool.conv_windows, kv.state_slot, linear_idx,
-                new_state, new_window,
+                pool.states, pool.conv_windows, kv.state_slot, linear_idx,
+                new_state, new_window, pool.win_parity,
             )
+        elif linear_idx == cfg.num_linear_layers - 1:
+            # every GDN layer of this tick read plane p and wrote 1-p: flip once
+            backend.flip_window_parity(kv.state_pool, kv.state_slot)
         return self._add_via(backend, kv, x, out, f"{p}.out_proj")
 
     # -- MLP ----------------------------------------------------------------

@@ -343,7 +343,7 @@ class Engine:
                 snap_states, snap_windows = snap
                 self._states.states[slot].copy_(snap_states)
                 if snap_windows is not None:
-                    self._states.conv_windows[slot].copy_(snap_windows)
+                    self._states.window_restore(slot, snap_windows)
 
             req = _Req(
                 req_id=rid,
@@ -655,10 +655,9 @@ class Engine:
         self._prefix.insert(tokens, req.blocks[: length // BLOCK_TOKENS])
         key = self._snapshot_key(tokens)
         if key not in self._prefix_state:
-            windows = self._states.conv_windows
             self._prefix_state[key] = (
                 self._states.states[req.state_slot].clone(),
-                windows[req.state_slot].clone() if windows is not None else None,
+                self._states.window_snapshot(req.state_slot),
             )
             self._prefix_published += 1  # snapshots written; an evicted prefix republishes
 
