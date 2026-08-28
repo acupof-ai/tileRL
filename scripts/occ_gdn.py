@@ -21,6 +21,7 @@ def main() -> None:
     ap.add_argument("--gpu", type=int, default=None)
     ap.add_argument("--t", type=int, default=512)
     ap.add_argument("--batches", default="1,2,3,4")
+    ap.add_argument("--lens", default="", help="sweep T instead of batch: per-step cost")
     args = ap.parse_args()
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -38,21 +39,31 @@ def main() -> None:
     qkv = 2 * nkh * kd + nvh * vd
     print(f"nvh={nvh} -> {nvh} blocks per batch row; H20 has 78 SMs")
     print(f"  {'B':>3} {'blocks':>7} {'ms/launch':>10} {'vs B=1':>8} {'ideal':>7}")
+    if args.lens:
+        print(f"  {'T':>6} {'ms':>9} {'us/step':>9}")
     base = None
-    for b in (int(x) for x in args.batches.split(",")):
-        t = args.t
-        g = torch.randn
+    pairs = ([(1, int(x)) for x in args.lens.split(",")] if args.lens
+             else [(int(x), args.t) for x in args.batches.split(",")])
+    for b, t in pairs:
+        # bf16 inputs: the kernel is bf16-IO, and an f32 call is 2.5x slower
+        # than what the engine actually issues (4.099 ms vs 1670 us at T=512).
+        def g(*shape):
+            return torch.randn(*shape, device=backend.device, dtype=torch.bfloat16)
+
         q, k = g(b, t, nkh * kd) * 0.1, g(b, t, nkh * kd) * 0.1
         v, z = g(b, t, nvh * vd) * 0.1, g(b, t, nvh * vd) * 0.1
+        f32 = lambda *sh: torch.randn(*sh, device=backend.device)  # noqa: E731
         kw = dict(
-            conv1d_weight=g(qkv, ker) * 0.1, dt_bias=g(nvh), a_log=g(nvh) * 0.1,
-            norm_weight=torch.ones(vd), conv_window=g(b, ker - 1, qkv) * 0.1,
+            conv1d_weight=f32(qkv, ker) * 0.1, dt_bias=f32(nvh), a_log=f32(nvh) * 0.1,
+            norm_weight=torch.ones(vd, device=backend.device),
+            conv_window=g(b, ker - 1, qkv) * 0.1,
             seq_q_lens=torch.full((b,), t, dtype=torch.int32, device=backend.device),
         )
-        st = g(b, nvh, kd, vd) * 0.01
+        st = f32(b, nvh, kd, vd) * 0.01
+        gates, beta = f32(b, t, nvh) * 0.0, f32(b, t, nvh)
 
         def run():
-            backend.linear_attn_chunk(q, k, v, g(b, t, nvh) * 0.0, g(b, t, nvh), st, z=z, **kw)
+            backend.linear_attn_chunk(q, k, v, gates, beta, st, z=z, **kw)
 
         for _ in range(3):
             run()
@@ -65,7 +76,10 @@ def main() -> None:
         torch.cuda.synchronize()
         ms = s.elapsed_time(e) / 10
         base = base or ms
-        print(f"  {b:>3} {nvh * b:>7} {ms:>10.3f} {ms / base:>8.2f}x {b:>6}x")
+        if args.lens:
+            print(f"  {t:>6} {ms:>9.3f} {1000 * ms / t:>9.2f}")
+        else:
+            print(f"  {b:>3} {nvh * b:>7} {ms:>10.3f} {ms / base:>8.2f}x {b:>6}x")
     print("  sub-linear => SMs were idle, a V split adds real parallelism")
 
 
