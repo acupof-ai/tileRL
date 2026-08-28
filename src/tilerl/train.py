@@ -92,6 +92,7 @@ def train_step(
     backend: Any,
     optimizer: AdamW,
     tape: Tape | None = None,
+    trainable: dict[str, Any] | None = None,
 ) -> float:
     """One SFT step: forward under a tape, causal CE, backward, clip, AdamW.
 
@@ -115,7 +116,10 @@ def train_step(
         return loss
 
     grads = tape.backward(grad_logits)
-    param_ids = {id(p) for p in model.params.values()}
+    #: ``trainable`` = the subset that gets gradients (LoRA adapters); the rest
+    #: is frozen, which is what keeps the 27B inside one card.
+    params = model.params if trainable is None else trainable
+    param_ids = {id(p) for p in params.values()}
     assert param_ids & set(grads), (
         "train_step: tape produced no parameter gradients — the recording "
         "seam is missing (backend ops not recorded?)"
@@ -127,7 +131,7 @@ def train_step(
     grads = {k: v for k, v in grads.items() if k in param_ids}
     norm = clip_grad_norm(grads, 1.0)
     if math.isfinite(norm):
-        optimizer.step(model.params.values(), grads)
+        optimizer.step(params.values(), grads)
     return loss
 
 

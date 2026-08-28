@@ -258,6 +258,13 @@ class Model:
 
     # -- linear dispatch (fp4-packed / native-fp8 when present, plain bf16 otherwise) ----
     def _linear(self, backend: "Backend", x: torch.Tensor, key: str, residual=None) -> torch.Tensor:
+        y = self._base_linear(backend, x, key, residual)
+        a = self.params.get(key + ".lora_a")
+        if a is None:
+            return y
+        return backend.add(y, backend.linear(backend.linear(x, a), self.params[key + ".lora_b"]))
+
+    def _base_linear(self, backend: "Backend", x: torch.Tensor, key: str, residual=None):
         """``residual``: the stream to add in the GEMV epilogue (serving only —
         the caller passes it when the backend fuses it and no tape is watching)."""
         kw = {} if residual is None else {"residual": residual}
@@ -469,6 +476,33 @@ class Model:
 
 
 # --- Random initialization --------------------------------------------------
+def add_lora(
+    model: "Model", rank: int = 16, alpha: float = 32.0, seed: int = 0
+) -> dict[str, torch.Tensor]:
+    """Attach LoRA adapters to every quantized linear; returns the new params.
+
+    The base stays quantized and frozen (no bf16 master), so the tape's
+    ``linear_fp4_frozen`` path gives dX only and the 27B trains inside one
+    card's memory. B starts at zero, so the adapted model is bit-identical to
+    the base on step 0; alpha/rank is folded into A's init.
+    """
+    g = torch.Generator().manual_seed(seed)
+    new: dict[str, torch.Tensor] = {}
+    for k in sorted(model.params):
+        base, _, suffix = k.rpartition(".")
+        if suffix == "wq":
+            n, kk = model.params[k].shape[0], model.params[k].shape[1] * 2
+        elif suffix == "w8":
+            n, kk = model.params[k].shape
+        else:
+            continue
+        scale = (alpha / rank) / math.sqrt(kk)
+        new[base + ".lora_a"] = torch.randn(rank, kk, generator=g).to(torch.bfloat16) * scale
+        new[base + ".lora_b"] = torch.zeros(n, rank, dtype=torch.bfloat16)
+    model.params.update(new)
+    return new
+
+
 def build_random(
     cfg: ModelConfig, seed: int, fuse_projections: bool = False, keep_master: bool = False
 ) -> Model:

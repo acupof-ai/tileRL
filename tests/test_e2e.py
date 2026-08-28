@@ -32,7 +32,7 @@ from tilerl.model import build_random, fp4_param_keys, param_specs
 from tilerl.ops.backend import get_backend
 from tilerl.ops.reference import dequant_fp4, pack_fp4
 from tilerl.testing import RefBackend
-from tilerl.train import opd_loop, train_step
+from tilerl.train import _training_kv, opd_loop, train_step
 
 
 # ---------------------------------------------------------------------------
@@ -663,3 +663,25 @@ def test_frozen_fp4_base_gives_dx_only():
     grads = tape.backward(g)
     assert set(grads) == {id(x)}
     assert torch.allclose(grads[id(x)], g @ dequant_fp4(wq, scale), atol=1e-4)
+
+
+def test_lora_train_step_on_frozen_fp4_base():
+    """LoRA-OPD shape: quantized base with no master, only the adapters train.
+    Step 0 must be identical to the base (B=0), and the step must move only
+    the adapter params."""
+    from tilerl.model import add_lora
+
+    cfg = replace(tiny(), fp4=True)
+    model = build_random(cfg, seed=4)  # no keep_master: the base is frozen
+    backend = RefBackend()
+    ids = np.arange(3, 11, dtype=np.int64)[None, :]
+    base_logits = model.forward(ids, np.arange(ids.shape[1]), _training_kv(model, 1, ids.shape[1]), backend)
+    new = add_lora(model, rank=4, seed=1)
+    assert new and all(k.endswith((".lora_a", ".lora_b")) for k in new)
+    after = model.forward(ids, np.arange(ids.shape[1]), _training_kv(model, 1, ids.shape[1]), backend)
+    assert torch.allclose(base_logits, after)  # B = 0
+
+    before = {k: v.clone() for k, v in model.params.items()}
+    assert math.isfinite(train_step(model, ids, backend, AdamW(lr=1e-2), trainable=new))
+    moved = {k for k in before if not torch.equal(model.params[k], before[k])}
+    assert moved and moved <= set(new)  # adapters move, the quantized base does not
