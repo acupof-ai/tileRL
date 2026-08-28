@@ -19,6 +19,73 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+LETTERS = "ABCD"
+
+
+def _questions(n: int, seed: int):
+    """The fixed 0-shot MMLU slice: (prompts, gold letters, subjects)."""
+
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
+    from datasets import load_dataset
+
+    ds = load_dataset("cais/mmlu", "all", split="test")
+    idx = sorted(random.Random(seed).sample(range(len(ds)), n) if n < len(ds) else range(len(ds)))
+
+    def prompt(r):
+        subj = r["subject"].replace("_", " ")
+        ch = "\n".join(f"{LETTERS[i]}. {c}" for i, c in enumerate(r["choices"]))
+        return (f"The following is a multiple choice question about {subj}.\n\n"
+                f"{r['question'].strip()}\n{ch}\nAnswer:")
+
+    return ([prompt(ds[i]) for i in idx], [LETTERS[ds[i]["answer"]] for i in idx],
+            [ds[i]["subject"] for i in idx])
+
+
+def score_tilerl(source: str, prompts: list[str]) -> list[str]:
+    """One greedy letter per prompt through tileRL's engine."""
+    from tilerl.config import qwen38_27b
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.model import load_hf
+    from tilerl.ops.backend import get_backend
+    from tilerl.server import get_tokenizer
+
+    backend = get_backend()
+    model = load_hf(qwen38_27b(), source, fuse_projections=True)
+    engine = build_engine(model.cfg, model, backend, num_blocks=2048, num_slots=64, max_batch=8,
+                          max_total_tokens=8192)
+    tok = get_tokenizer(source)
+    # multiple choice = argmax over the four letter tokens (with and without a
+    # leading space), the lm-eval convention; free-text greedy just explains
+    allowed = tuple(sorted({tok.encode(f" {c}")[-1] for c in LETTERS}
+                           | {tok.encode(c)[-1] for c in LETTERS}))
+    sp = SamplingParams(temperature=0.0, max_new_tokens=1, seed=0, allowed_ids=allowed)
+    texts: list = [None] * len(prompts)
+    pending, todo = {}, list(enumerate(prompts))
+    while pending or todo:
+        while todo and len(pending) < 32:  # submit allocates a state slot eagerly
+            i, p = todo.pop()
+            pending[engine.submit(tok.encode(p), sp)] = i
+        engine.step()
+        for wid, ids in engine.poll().items():
+            texts[pending.pop(wid)] = tok.decode(ids)
+    return texts
+
+
+def letter(t: str | None) -> str:
+    """First standalone A-D in the completion."""
+    import re
+
+    m = re.search(r"\b([ABCD])\b", t or "")
+    return m.group(1) if m else "?"
+
+
+def accuracy(source: str, n: int = 200, seed: int = 0) -> tuple[int, int]:
+    """MMLU 0-shot correct/total through tileRL — the harness's accuracy gate."""
+    prompts, golds, _ = _questions(n, seed)
+    preds = [letter(t) for t in score_tilerl(source, prompts)]
+    return sum(p == g for p, g in zip(preds, golds)), len(preds)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", choices=["tilerl", "sglang"], required=True)
@@ -29,54 +96,12 @@ def main() -> None:
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    os.environ["HF_DATASETS_OFFLINE"] = "1"
-
-    from datasets import load_dataset  # noqa: E402
-
-    ds = load_dataset("cais/mmlu", "all", split="test")
-    idx = list(range(len(ds)))
-    random.Random(args.seed).shuffle(idx)
-    idx = sorted(idx[: args.n])
-    LETTERS = "ABCD"
-
-
-    def prompt(r):
-        subj = r["subject"].replace("_", " ")
-        ch = "\n".join(f"{LETTERS[i]}. {c}" for i, c in enumerate(r["choices"]))
-        return f"The following is a multiple choice question about {subj}.\n\n{r['question'].strip()}\n{ch}\nAnswer:"
-
-
-    prompts = [prompt(ds[i]) for i in idx]
-    golds = [LETTERS[ds[i]["answer"]] for i in idx]
-    subjects = [ds[i]["subject"] for i in idx]
+    prompts, golds, subjects = _questions(args.n, args.seed)
     t0 = time.time()
 
     if args.engine == "tilerl":
         os.environ.setdefault("TILERL_TARGET", "cuda")
-        from tilerl.config import qwen38_27b
-        from tilerl.engine import SamplingParams, build_engine
-        from tilerl.model import load_hf
-        from tilerl.ops.backend import get_backend
-        from tilerl.server import get_tokenizer
-
-        backend = get_backend()
-        model = load_hf(qwen38_27b(), args.source, fuse_projections=True)
-        engine = build_engine(model.cfg, model, backend, num_blocks=2048, num_slots=64, max_batch=8,
-                              max_total_tokens=8192)
-        tok = get_tokenizer(args.source)
-        # multiple choice = argmax over the four letter tokens (with and without a
-        # leading space), the lm-eval convention; free-text greedy just explains
-        allowed = tuple(sorted({tok.encode(f" {c}")[-1] for c in LETTERS} | {tok.encode(c)[-1] for c in LETTERS}))
-        sp = SamplingParams(temperature=0.0, max_new_tokens=1, seed=0, allowed_ids=allowed)
-        texts = [None] * len(prompts)
-        pending, todo = {}, list(enumerate(prompts))
-        while pending or todo:
-            while todo and len(pending) < 32:  # submit allocates a state slot eagerly
-                i, p = todo.pop()
-                pending[engine.submit(tok.encode(p), sp)] = i
-            engine.step()
-            for wid, ids in engine.poll().items():
-                texts[pending.pop(wid)] = tok.decode(ids)
+        texts = score_tilerl(args.source, prompts)
     else:
         import sglang
 
@@ -88,7 +113,8 @@ def main() -> None:
         outs = llm.generate(prompts, {"temperature": 0, "max_new_tokens": 1},
                             return_logprob=True, top_logprobs_num=20)
         tok = get_tokenizer(args.source)
-        letters = {tok.encode(f" {c}")[-1]: c for c in LETTERS} | {tok.encode(c)[-1]: c for c in LETTERS}
+        letters = ({tok.encode(f" {c}")[-1]: c for c in LETTERS}
+                   | {tok.encode(c)[-1]: c for c in LETTERS})
         texts = []
         for o in outs:
             top = o["meta_info"]["output_top_logprobs"][0]
@@ -97,12 +123,6 @@ def main() -> None:
         llm.shutdown()
 
     elapsed = time.time() - t0
-    import re
-
-    def letter(t):  # first standalone A-D in the completion
-        m = re.search(r"\b([ABCD])\b", t or "")
-        return m.group(1) if m else "?"
-
     preds = [letter(t) for t in texts]
     correct = sum(p == g for p, g in zip(preds, golds))
     by = defaultdict(lambda: [0, 0])
@@ -114,7 +134,7 @@ def main() -> None:
     worst = sorted(by.items(), key=lambda kv: kv[1][0] / kv[1][1])[:5]
     print("  weakest:", ", ".join(f"{s} {c}/{n}" for s, (c, n) in worst))
     out = args.out or f"/work/mmlu_{args.engine}.json"
-    Path(out).write_text(json.dumps({"idx": idx, "pred": preds, "gold": golds, "acc": correct / len(preds),
+    Path(out).write_text(json.dumps({"pred": preds, "gold": golds, "acc": correct / len(preds),
                                      "engine": args.engine, "source": args.source, "n": len(preds),
                                      "raw": texts[:50]}))
 

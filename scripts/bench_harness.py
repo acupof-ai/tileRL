@@ -10,7 +10,9 @@ Fills the coverage holes the scattered bench_*.py scripts left open:
               PrefixStore was perf-untested).
   train       train_step fwd+bwd tok/s (tiny on CPU, 27B on the pod) — training
               had zero perf coverage.
-  micro       per-kernel roofline table (opt-in; folds in bench_fp4_gemv).
+  accuracy    MMLU 0-shot % on a fixed slice (27B only). Every other suite gates
+              speed; without this one an "optimization" that breaks the logits
+              passes the whole harness.
 
 Baseline: docs/experience/wins/bench-baseline.json, keyed (suite, shape, target)
 -> tok/s + commit + date. A row PASSES at >= 0.97x its baseline; a row that BEATS
@@ -86,7 +88,8 @@ class Gate:
         self.dirty = False
         self.seed_only = update_only  # first-seed run: record, never fail
 
-    def check(self, suite: str, shape: str, tok_s: float) -> str:
+    def check(self, suite: str, shape: str, tok_s: float, unit: str = "tok/s",
+              spread: float = 0.0) -> str:
         key = f"{suite}/{shape}/{self.target}"
         prev = self.baseline.get(key)
         verdict = "SEED"
@@ -94,13 +97,13 @@ class Gate:
             self.baseline[key] = {"tok_s": tok_s, "commit": self.commit, "date": self.date}
             self.dirty = True
             verdict = "SEED"
-        elif tok_s > prev["tok_s"] * _RAISE:
+        elif tok_s > prev["tok_s"] * _RAISE and spread <= _RAISE - 1.0:
             print(f"  RAISED {key}: {prev['tok_s']:.1f} -> {tok_s:.1f} tok/s")
             self.baseline[key] = {"tok_s": tok_s, "commit": self.commit, "date": self.date}
             self.dirty = True
             verdict = "RAISE"
         elif tok_s >= prev["tok_s"] * _GATE:
-            verdict = "PASS"
+            verdict = "PASS"  # includes a win too noisy to raise the baseline
         else:
             verdict = "FAIL"
             # CPU is thermally/scheduler-noisy (~4% run-to-run) — gate it as a
@@ -110,7 +113,8 @@ class Gate:
                 self.failed = True
         base = prev["tok_s"] if prev else tok_s
         self.rows.append(
-            {"key": key, "tok_s": tok_s, "baseline": base, "ratio": tok_s / base if base else 0.0, "verdict": verdict}
+            {"key": key, "tok_s": tok_s, "unit": unit, "baseline": base,
+             "ratio": tok_s / base if base else 0.0, "verdict": verdict}
         )
         return verdict
 
@@ -122,7 +126,7 @@ class Gate:
         for r in self.rows:
             soft = "  (report-only)" if r["verdict"] == "FAIL" and self.target == "cpu" else ""
             print(
-                f"  {r['verdict']:<5} {r['key']:<44} {r['tok_s']:>9.1f} tok/s"
+                f"  {r['verdict']:<5} {r['key']:<44} {r['tok_s']:>9.1f} {r['unit']:<5}"
                 f"  ({r['ratio']:.3f}x){soft}"
             )
         return 1 if self.failed else 0
@@ -204,7 +208,7 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
             agg = 1000.0 * b / ms
             print(f"  {depth:>7} {b:>3} {ms:>9.3f} {1000.0 / ms:>10.1f} {agg:>10.1f}"
                   f" {100 * LAST_SPREAD:>7.1f}%")
-            gate.check("decode-kv", f"d{depth}-b{b}", agg)
+            gate.check("decode-kv", f"d{depth}-b{b}", agg, spread=LAST_SPREAD)
             # drain so the next depth's blocks are free
             done: dict = {}
             for _ in range(ticks + 8 * b + 256):
@@ -222,12 +226,17 @@ def suite_prefill(gate, cfg, model, backend, lengths):
     engine = build_engine(cfg, model, backend, num_blocks=cap // 16 + 64, num_slots=16,
                           max_batch=8, max_total_tokens=cap + 64)
     print("\n=== prefill-vs-length (tok/s) ===")
-    print(f"  {'len':>7} {'ms/tok':>10} {'tok/s':>10}")
+    print(f"  {'len':>7} {'ms/tok':>10} {'tok/s':>10} {'spread':>8}")
     for length in sorted({min(x, cap) for x in lengths}):
         bk.time_prefill(engine, backend, cfg, length, 1.0)  # warm: JIT for this length
-        ms, tps = bk.time_prefill(engine, backend, cfg, length, 1.0)
-        print(f"  {length:>7} {ms / length:>10.4f} {tps:>10.1f}")
-        gate.check("prefill", f"len{length}", tps)
+        # Three readings, not one: prefill has no steady-state loop to hide
+        # run-to-run noise, and a single sample can neither be trusted nor
+        # allowed to ratchet the baseline.
+        runs = [bk.time_prefill(engine, backend, cfg, length, 1.0) for _ in range(3)]
+        ms, tps = sorted(runs, key=lambda r: r[1])[1]
+        spread = (max(r[1] for r in runs) - min(r[1] for r in runs)) / tps
+        print(f"  {length:>7} {ms / length:>10.4f} {tps:>10.1f} {100 * spread:>7.1f}%")
+        gate.check("prefill", f"len{length}", tps, spread=spread)
 
 
 def suite_kv_reuse(gate, cfg, model, backend):
@@ -280,9 +289,24 @@ def suite_kv_reuse(gate, cfg, model, backend):
     # Gate on HIT-RATE (deterministic): reuse must fire. Speedup is informational
     # (timing-noisy on a short suffix). A regression that breaks prefix reuse
     # drops hits to 0 and FAILs.
-    gate.check("kv-reuse", "prefix-hits", float(hits))
+    gate.check("kv-reuse", "prefix-hits", float(hits), unit="hits")
     # speedup is printed above but NOT gated — a short-suffix warm/cold ratio is
     # timing-noisy; hit-rate is the deterministic correctness-of-reuse signal.
+
+
+def suite_accuracy(gate, source, n):
+    """MMLU 0-shot on a fixed slice — the only gate here that is not a speed gate.
+
+    Greedy over a fixed question set, so the number is deterministic: any move
+    at all is a real change, not sampling noise.
+    """
+    from mmlu import accuracy
+
+    print("\n=== accuracy (MMLU 0-shot) ===")
+    correct, total = accuracy(source, n=n)
+    pct = 100.0 * correct / total
+    print(f"  {correct}/{total} = {pct:.1f}%")
+    gate.check("accuracy", f"mmlu-{total}", pct, unit="%")
 
 
 def suite_train(gate, backend, source, gpu):
@@ -352,13 +376,15 @@ def main() -> int:
     import argparse
 
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--suite", default="", help="comma list: decode-kv,prefill,kv-reuse,train,micro (default: all applicable)")
+    ap.add_argument("--suite", default="",
+                    help="comma list: decode-kv,prefill,kv-reuse,train,accuracy (default: all applicable)")
     ap.add_argument("--source", default=None, help="27B checkpoint dir (omit for tiny/CPU)")
     ap.add_argument("--gpu", type=int, default=None)
     ap.add_argument("--batches", default="1,8")
     ap.add_argument("--depths", default=",".join(map(str, _KV_DEPTHS)))
     ap.add_argument("--ticks", type=int, default=20)
     ap.add_argument("--json", default=None)
+    ap.add_argument("--mmlu-n", type=int, default=200, help="accuracy suite question count")
     ap.add_argument("--reseed", action="store_true", help="record every row as the new baseline (no gate)")
     args = ap.parse_args()
 
@@ -381,7 +407,8 @@ def main() -> int:
     batches = [int(x) for x in args.batches.split(",")]
 
     gpu_suites = {"decode-kv", "prefill", "kv-reuse"}
-    default = ["train"] if args.source is None else ["decode-kv", "prefill", "kv-reuse", "train"]
+    default = (["train"] if args.source is None
+               else ["decode-kv", "prefill", "kv-reuse", "train", "accuracy"])
     suites = [s for s in (args.suite.split(",") if args.suite else default) if s]
 
     cfg = model = None
@@ -405,6 +432,11 @@ def main() -> int:
             suite_kv_reuse(gate, cfg, model, backend)
         elif s == "train":
             suite_train(gate, backend, args.source, args.gpu)
+        elif s == "accuracy":
+            if args.source is None:
+                print("  (accuracy needs --source, skipped)")
+            else:
+                suite_accuracy(gate, args.source, args.mmlu_n)
         else:
             print(f"  (unknown suite {s!r}, skipped)")
 
