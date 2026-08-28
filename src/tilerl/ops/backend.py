@@ -96,6 +96,7 @@ def _pad1d(t: torch.Tensor, n: int) -> torch.Tensor:
 #: tile N at 64 because the kernel overrides block_N to _FP4_BLOCK_N=64 — a
 #: 32-tile pad lets its grid read past the padded WQ.
 _MX = 8  # batched decode GEMV: activation rows kept in registers per lane
+_MMA_RED = 32  # kernels_linear._RED_TILE: the K-loop reduction tile
 
 _CUDA_PLAN = {
     ("linear", "gemv"): ("linear_bf16_gemv", 256, 4, 4),
@@ -666,20 +667,26 @@ class Backend:
         temporaries per call and this runs 448 times a training step; the
         kernel does it in one pass, bf16 out, scales folded.
         """
-        if not fp8 and "dequant_fp4_bf16" in _resolve(self.precision, self.arch):
+        kset = _resolve(self.precision, self.arch)
+        # The kernel bakes the scale block into its dequant macro; 16 is every
+        # shipped checkpoint's, and pack_fp4's block-32 test weights take the
+        # reference. ponytail: register a second kernel if a 32 ever ships.
+        blk = wq.shape[1] * 2 // self._f32(scale).shape[1]
+        if not fp8 and blk == 16 and "linear_fp4_bwd" in kset:
             wq = self._served_fp4(wq)
             n, k = wq.shape[0], wq.shape[1] * 2
-            osc = self._ones(n) if oscale is None else self._const_f32(oscale, n)
-            w = self._kernel("dequant_fp4_bf16")(
-                wq, self._const_f32(scale), osc, k // self._f32(scale).shape[1]
-            )
-            g = self._c(self._bf16(grad).reshape(-1, grad.shape[-1]))
-            gx = self._kernel("gemm_nn")(
-                _pad2d(g, _round_up(g.shape[0], 64), _round_up(g.shape[1], 32)),
-                _pad2d(w, _round_up(n, 32), _round_up(k, 64)),
-                _snap_mma_tile(min(64, g.shape[0]), 64), _snap_mma_tile(min(64, k), 64),
-                _THREADS,
-            )[: g.shape[0], :k]
+            g = self._bf16(grad).reshape(-1, grad.shape[-1])
+            if oscale is not None:  # scales weight row n: fold into [M,N], not [N,K]
+                g = g * self._bf16(oscale).reshape(1, -1)
+            m = g.shape[0]
+            bM, bN = _snap_mma_tile(min(64, m), 64), 64
+            gx = self._kernel("linear_fp4_bwd")(
+                _pad2d(self._c(g), _round_up(m, bM), _round_up(n, _MMA_RED)),
+                _pad2d(wq, _round_up(n, _MMA_RED), _round_up(k, bN) // 2),
+                _pad2d(self._const_f32(scale), _round_up(n, _MMA_RED),
+                       _round_up(k, bN) // blk),
+                bM, bN, _THREADS,
+            )[:m, :k]
             return gx.reshape(*grad.shape[:-1], k)
         # ponytail: torch-eager backward, tilelang dequant only exists for fp4
         return reference.linear_frozen_bwd(grad, wq, scale, oscale=oscale, fp8=fp8)
