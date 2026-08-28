@@ -101,17 +101,37 @@ plain `uv run pytest` on CI is exactly the deterministic set.
 Everything above `src/tilerl/ops/` is backend-neutral; `ops/` is the only
 layer that touches TileLang or torch beyond the tensor container.
 
+## Performance (2026-08-28, one H20, Qwen3.8-27B-NVFP4)
+
+Decode is measured by `tilerl bench --suite decode-kv` (steady-state median of
+3×20 ticks, engine rebuilt per depth); every row is gated at ≥0.97× the committed
+snapshot in `docs/experience/wins/bench-baseline.json`.
+
+| | B=1 tok/s @512 / 2k / 8k / 32k | B=8 agg tok/s @512 | prefill tok/s @512 |
+|---|---|---:|---:|
+| **tileRL** (native NVFP4 + FP8, this repo) | **90.9 / 87.3 / 87.9 / 78.6** | 308.6 | 1836 |
+| Arle (agent-infer, same card) | 84.5 | — | — |
+| sglang bf16 (same card; no NVFP4 path on Hopper) | 54.2 | **387** | 2512 |
+| sglang online-fp8 | 39.9 | 266.6 | **4908** |
+
+Where it stands: fastest single-stream decode measured on this card and nearly
+depth-flat to 32k; sglang is ahead at B≥8 (tensor-core occupancy) and on prefill
+(untouched so far). How it got here, step by step, with the dead ends:
+[`docs/experience/2026-08-28-decode-52-to-84.md`](docs/experience/2026-08-28-decode-52-to-84.md);
+the sglang comparison and its caveats:
+[`docs/experience/2026-08-28-vs-sglang-h20.md`](docs/experience/2026-08-28-vs-sglang-h20.md).
+
 ## Status
 
 | Component | Status |
 |---|---|
 | CPU target | ✓ CI + local, every commit (97 passed, 4 skipped) |
 | Metal target | ✓ local (97 passed, 4 skipped) |
-| CUDA sm90 target | ✓ H20 pod 2026-08-24 (60 passed); not re-run since |
+| CUDA sm90 target | ✓ H20 pod, 27B decodes correctly (verify checks 1–3), perf gated by the snapshot harness |
 | ROCm target | never executed — resolves to the CPU kernel set |
 | sm100 / sm120 | registered empty; `NotImplementedError` on use |
 | Tiny model end-to-end | ✓ |
-| Qwen3.8-27B NVFP4 weights | pending HF integration |
+| Qwen3.8-27B NVFP4 weights | ✓ served natively (twiddled fp4 + fp8), 90.9 tok/s B=1 on H20 |
 | Paged KV + prefix cache | ✓ (tiny) |
 | Autograd tape + OPD | ✓ (tiny) |
 | OpenAI-compatible server | ✓ |
