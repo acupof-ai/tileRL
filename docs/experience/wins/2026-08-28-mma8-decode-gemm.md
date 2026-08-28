@@ -31,6 +31,16 @@ B=8 aggregate (quiet host): d512 219 → **286.7** (+31%), d2k 216 → 254.7
 on the scalar GEMV (15 of 16 tensor rows idle, same decode cost) — M=1 keeps
 the GEMV.
 
+## Where it stands (ncu, in the model)
+
+128 regs/lane → 4 blocks/SM, 21–25% achieved occupancy, DRAM 31–39%, 6.4
+instr/elem (the e4m3 bit placement per pair costs more than the fp4 twiddle);
+in_proj's 512-block grid is 1.6 waves. Sweep on the B=8 d512 row: **(KW=4,
+G=4, NG=4) 286.7** > KW=8 189.5 (reduction overhead, no extra warps — registers
+cap blocks/SM) > G=2 177.4; NG=8 needs N padded to 64 (illegal access as is).
+Next lever on this kernel is register count (scales in bf16 registers, fewer
+prefetch chunks with async copies), not launch shape.
+
 ## Rule
 
 For 2 ≤ M ≤ 8 the decode is the cost and the tensor cores are free: feed
