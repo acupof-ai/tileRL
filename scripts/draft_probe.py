@@ -68,7 +68,9 @@ def main() -> None:
     # takes the T=1 decode path, which reads the raw-qkv carry.
     states = LinearStatePool(
         1, cfg.num_linear_layers, cfg.linear_num_value_heads, cfg.linear_value_head_dim,
-        device=backend.device, conv_window=cfg.linear_conv_kernel_dim - 1,
+        device=backend.device,
+        dtype=torch.float32 if backend.device.type == "cuda" else torch.bfloat16,
+        conv_window=cfg.linear_conv_kernel_dim - 1,
         conv_dim=cfg.linear_qkv_dim,
     )
     bt = torch.arange(nblk, dtype=torch.int32, device=backend.device).reshape(1, nblk)
