@@ -1,4 +1,9 @@
 {
+  "decode-kv/d131072-b1/sm90": {
+    "commit": "cd54d55",
+    "date": "2026-08-28",
+    "tok_s": 61.1
+  },
   "decode-kv/d2048-b1/sm90": {
     "commit": "unknown",
     "date": "2026-08-28",
@@ -9,15 +14,20 @@
     "date": "2026-08-28",
     "tok_s": 302.8433802306008
   },
+  "decode-kv/d262144-b1/sm90": {
+    "commit": "cd54d55",
+    "date": "2026-08-28",
+    "tok_s": 48.1
+  },
   "decode-kv/d32768-b1/sm90": {
     "commit": "unknown",
     "date": "2026-08-28",
-    "tok_s": 78.60968868587484
+    "tok_s": 80.06812199220505
   },
   "decode-kv/d512-b1/sm90": {
     "commit": "unknown",
     "date": "2026-08-28",
-    "tok_s": 90.85339454844048
+    "tok_s": 92.38771599788666
   },
   "decode-kv/d512-b8/sm90": {
     "commit": "unknown",
@@ -27,7 +37,7 @@
   "decode-kv/d8192-b1/sm90": {
     "commit": "unknown",
     "date": "2026-08-28",
-    "tok_s": 87.93732886730602
+    "tok_s": 88.87364923310717
   },
   "decode-kv/d8192-b8/sm90": {
     "commit": "unknown",
@@ -59,10 +69,25 @@
     "date": "2026-08-27",
     "tok_s": 1777.9952913179336
   },
+  "train/27B-lora-b1t128/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 0.8109317965987813
+  },
+  "train/27B-lora-b1t256/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 0.8183091628963295
+  },
+  "train/27B-lora-b1t64/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 0.7988524583703596
+  },
   "train/tiny-b2t128/cpu": {
-    "commit": "655e941",
-    "date": "2026-08-27",
-    "tok_s": 1631.629389277413
+    "commit": "2fdc85c",
+    "date": "2026-08-28",
+    "tok_s": 1639.9078414889332
   },
   "train/tiny-b2t128/sm90": {
     "commit": "db05899",

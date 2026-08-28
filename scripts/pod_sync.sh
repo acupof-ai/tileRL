@@ -5,6 +5,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The remote checkout is wiped below, so any row the pod raised must come home
+# first — the committed snapshot is the source of truth for every later run.
+[ "${SKIP_BASELINE_PULL:-0}" = 1 ] || python3 "$ROOT/scripts/baseline.py" pull >/dev/null 2>&1 || true
+# The pod is not a git repo (it arrives as a tarball): stamp HEAD so bench rows
+# carry provenance instead of "unknown".
+git -C "$ROOT" rev-parse --short HEAD > "$ROOT/.synced_commit" 2>/dev/null || true
 REMOTE_DIR="${REMOTE_DIR:-/work/tilerl}"
 POD_NAME="${POD_NAME:-sglang-test}"
 

@@ -35,16 +35,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 _BASELINE = Path(__file__).resolve().parent.parent / "docs/experience/wins/bench-baseline.json"
 _GATE = 0.97  # a run must be within 3% of (or beat) the snapshot
+#: A win must clear the measured run-to-run spread before it raises the
+#: snapshot. Repeated d512-b1 readings on this pod land within ~1.7% of each
+#: other, so a baseline that raises on ANY overshoot ratchets up on noise until
+#: no run can meet it. Below this, a faster reading is a PASS, not a RAISE.
+_RAISE = 1.02
 _KV_DEPTHS = (512, 2048, 8192, 32768, 131072, 262144)  # 128K/256K: B=1 only (KV 17/34 GB)
+
+
+_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _git_commit() -> str:
     try:
         return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], text=True
+            ["git", "-C", str(_ROOT), "rev-parse", "--short", "HEAD"], text=True,
+            stderr=subprocess.DEVNULL,
         ).strip()
     except Exception:
-        return "unknown"
+        # The pod arrives as a tarball, not a clone; pod_sync stamps HEAD here.
+        stamp = _ROOT / ".synced_commit"
+        return stamp.read_text().strip() if stamp.exists() else "unknown"
 
 
 def _today() -> str:
@@ -83,7 +94,7 @@ class Gate:
             self.baseline[key] = {"tok_s": tok_s, "commit": self.commit, "date": self.date}
             self.dirty = True
             verdict = "SEED"
-        elif tok_s > prev["tok_s"]:
+        elif tok_s > prev["tok_s"] * _RAISE:
             print(f"  RAISED {key}: {prev['tok_s']:.1f} -> {tok_s:.1f} tok/s")
             self.baseline[key] = {"tok_s": tok_s, "commit": self.commit, "date": self.date}
             self.dirty = True
@@ -120,8 +131,15 @@ class Gate:
 # --- timing (median of windows, reusing verify's steady-state settle) --------
 
 
+#: Spread of the last _median_windows call: (max - min) / median. A row whose
+#: spread is wide is not evidence about a few-percent change, whatever its
+#: median says — printed beside every timing so a reader can judge the verdict.
+LAST_SPREAD = 0.0
+
+
 def _median_windows(step_fn, n_windows: int, ticks: int, sync) -> float:
     """Median ms/tick over n_windows of `ticks` steady-state steps each."""
+    global LAST_SPREAD
     samples = []
     for _ in range(n_windows):
         sync()
@@ -130,7 +148,9 @@ def _median_windows(step_fn, n_windows: int, ticks: int, sync) -> float:
             step_fn()
         sync()
         samples.append((time.perf_counter() - t0) / ticks * 1e3)
-    return statistics.median(samples)
+    med = statistics.median(samples)
+    LAST_SPREAD = (max(samples) - min(samples)) / med if med else 0.0
+    return med
 
 
 # --- suites ------------------------------------------------------------------
@@ -145,7 +165,8 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
     from tilerl.kv_cache import BLOCK_TOKENS
 
     print("\n=== decode-vs-KV-depth (tok/s, higher=better; should DROP with depth) ===")
-    print(f"  {'depth':>7} {'B':>3} {'ms/tick':>9} {'tok/s/req':>10} {'agg tok/s':>10}")
+    print(f"  {'depth':>7} {'B':>3} {'ms/tick':>9} {'tok/s/req':>10} {'agg tok/s':>10}"
+          f" {'spread':>8}")
     for depth in depths:
         if depth > cfg.max_position_embeddings:
             continue
@@ -181,7 +202,8 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
                 engine.step()
             ms = _median_windows(engine.step, 3, ticks, lambda: bk.sync(backend))
             agg = 1000.0 * b / ms
-            print(f"  {depth:>7} {b:>3} {ms:>9.3f} {1000.0 / ms:>10.1f} {agg:>10.1f}")
+            print(f"  {depth:>7} {b:>3} {ms:>9.3f} {1000.0 / ms:>10.1f} {agg:>10.1f}"
+                  f" {100 * LAST_SPREAD:>7.1f}%")
             gate.check("decode-kv", f"d{depth}-b{b}", agg)
             # drain so the next depth's blocks are free
             done: dict = {}
