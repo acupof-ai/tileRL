@@ -112,6 +112,18 @@ def main() -> None:
     print(f"  trunk argmax's rank in the draft's distribution: median "
           f"{rank.float().median().item():.0f} of {cfg.vocab_size}")
 
+    # Bisect the readout before blaming the head. (1) the trunk's own final
+    # norm + lm_head over the same hidden must reproduce the trunk's logits —
+    # if it does not, `hidden_out` is not the tensor this head is fed. (2) the
+    # same hidden through the HEAD's norm isolates whether the readout is sane.
+    ln = trunk._linear(backend, backend.rmsnorm(hid[-1], trunk.params["final_norm"],
+                                                cfg.rms_eps), "lm_head")
+    mn = trunk._linear(backend, backend.rmsnorm(hid[-1], draft.params["norm"],
+                                                cfg.rms_eps), "lm_head")
+    print(f"  readout: trunk final_norm reproduces trunk logits "
+          f"{100 * (ln[0].argmax(-1) == tl[0].argmax(-1)).float().mean():.1f}%; "
+          f"through the head's norm {100 * (mn[0].argmax(-1) == tl[0].argmax(-1)).float().mean():.1f}%")
+
     want = tl[0, 1:].argmax(-1)            # the trunk's own next-token argmax
     got = dl[0].argmax(-1)                 # the draft's guess at the same place
     agree = (want == got).float().mean().item()
