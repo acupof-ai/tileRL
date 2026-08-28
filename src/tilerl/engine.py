@@ -339,6 +339,7 @@ class Engine:
                 num_layers=draft.cfg.num_layers, device=backend.device,
             )
 
+        self._pin = backend.device.type == "cuda"
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -588,10 +589,10 @@ class Engine:
         # compiled kernel (Mb is a compile const), so a per-tick max-blocks
         # width recompiles on every block growth. Rows zero-pad; the kernels
         # index by position bounded by seq_lens, so padding is never read.
-        bt = torch.zeros(len(reqs), self._kv.num_blocks, dtype=torch.long)
-        sl = torch.empty(len(reqs), dtype=torch.long)
-        ss = torch.empty(len(reqs), dtype=torch.long)
-        sql = torch.empty(len(reqs), dtype=torch.long)
+        bt = torch.zeros(len(reqs), self._kv.num_blocks, dtype=torch.long, pin_memory=self._pin)
+        sl = torch.empty(len(reqs), dtype=torch.long, pin_memory=self._pin)
+        ss = torch.empty(len(reqs), dtype=torch.long, pin_memory=self._pin)
+        sql = torch.empty(len(reqs), dtype=torch.long, pin_memory=self._pin)
         for i, r in enumerate(reqs):
             bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
             # Materialized length AFTER this forward: a prefill row completes
@@ -605,6 +606,17 @@ class Engine:
             )
             ss[i] = r.state_slot
             sql[i] = seq_q[i]
+        if self._pin:
+            # Move once here, not once per layer inside every kernel's _dev:
+            # these four are built on the host and read by ~4 kernels per layer,
+            # and an unpinned H2D copy is SYNCHRONOUS. A 64-layer prefill issued
+            # 971 pageable copies, which is host stall the GPU-busy total cannot
+            # see (2058 tok/s GPU-bound against 1836 end to end).
+            dev = self._backend.device
+            bt = bt.to(dev, non_blocking=True)
+            sl = sl.to(dev, non_blocking=True)
+            ss = ss.to(dev, non_blocking=True)
+            sql = sql.to(dev, non_blocking=True)
         return BatchKv(
             block_table=bt,
             seq_len=sl,
