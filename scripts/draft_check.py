@@ -90,6 +90,28 @@ def main() -> None:
     dk.state_pool = None
     dl = draft.forward(hid[-1][:, : t - 1], arr([ids[1:]]), arr(range(1, t)), dk, backend)
 
+    # Per-stage scale: a head that is wired right produces a final hidden of
+    # roughly the trunk's magnitude. A blow-up or collapse localises the fault
+    # better than any guess about which tensor is misnamed.
+    import torch as _t
+
+    e = backend.embedding(_t.as_tensor(arr([ids[1:]]), device=backend.device),
+                          trunk.params["embed_tokens"])
+    en = backend.rmsnorm(e, draft.params["pre_fc_norm_embedding"], cfg.rms_eps)
+    hn = backend.rmsnorm(hid[-1][:, : t - 1], draft.params["pre_fc_norm_hidden"], cfg.rms_eps)
+    xf = backend.linear(_t.cat([en, hn], dim=-1), draft.params["fc"])
+    for nm, v in [("trunk hidden", hid[-1]), ("embed", e), ("norm(embed)", en),
+                  ("norm(hidden)", hn), ("fc out", xf)]:
+        print(f"  std {nm:<14} {v.float().std().item():>9.4f}  "
+              f"absmax {v.float().abs().max().item():>9.2f}")
+    print(f"  std {'trunk logits':<14} {tl.float().std().item():>9.4f}  "
+          f"absmax {tl.float().abs().max().item():>9.2f}")
+    print(f"  std {'draft logits':<14} {dl.float().std().item():>9.4f}  "
+          f"absmax {dl.float().abs().max().item():>9.2f}")
+    rank = (dl[0] > dl[0].gather(-1, tl[0, 1:].argmax(-1, keepdim=True))).sum(-1)
+    print(f"  trunk argmax's rank in the draft's distribution: median "
+          f"{rank.float().median().item():.0f} of {cfg.vocab_size}")
+
     want = tl[0, 1:].argmax(-1)            # the trunk's own next-token argmax
     got = dl[0].argmax(-1)                 # the draft's guess at the same place
     agree = (want == got).float().mean().item()
