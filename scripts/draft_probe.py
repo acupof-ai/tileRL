@@ -67,10 +67,15 @@ def main() -> None:
             seq_q_lens=torch.tensor([q], dtype=torch.int32, device=backend.device),
         )
 
+    import numpy as np
+
     ids = list(bk.rand_prompt(cfg.vocab_size, args.prompt_len, seed=0))
     hid: list = []
-    logits = trunk.forward([ids], list(range(len(ids))), kv_for(trunk_pool, len(ids), len(ids)),
-                           backend, hidden_out=hid)
+    def arr(x):  # backend ops want arrays, not python lists
+        return np.asarray(x, dtype=np.int64)
+
+    logits = trunk.forward(arr([ids]), arr(range(len(ids))),
+                           kv_for(trunk_pool, len(ids), len(ids)), backend, hidden_out=hid)
     accepted = total = 0
     for _ in range(args.blocks):
         nxt = int(logits[0, -1].argmax())
@@ -78,14 +83,14 @@ def main() -> None:
         chain, dpos = [nxt], len(ids)
         for j in range(args.depth):  # draft, one token at a time off its own hidden
             dh: list = []
-            dl = draft.forward(h, [[chain[-1]]], [dpos + j],
+            dl = draft.forward(h, arr([[chain[-1]]]), arr([dpos + j]),
                                kv_for(draft_pool, j + 1, 1), backend, hidden_out=dh)
             chain.append(int(dl[0, -1].argmax()))
             h = dh[-1] if dh else h
         # verify: the trunk sees [accepted_token, draft_1..draft_d] in one forward
         ids.extend(chain)
         hid.clear()
-        logits = trunk.forward([chain], list(range(dpos, dpos + len(chain))),
+        logits = trunk.forward(arr([chain]), arr(range(dpos, dpos + len(chain))),
                                kv_for(trunk_pool, dpos + len(chain), len(chain)), backend,
                                hidden_out=hid)
         want = [int(x) for x in logits[0, :-1].argmax(-1)]
