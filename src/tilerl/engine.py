@@ -78,6 +78,18 @@ class SamplingParams:
     max_new_tokens: int = 16
     seed: int = 0
     stop_token_ids: tuple[int, ...] = ()
+    #: restrict sampling to these ids (multiple-choice eval, constrained RL
+    #: actions); None = full vocabulary
+    allowed_ids: tuple[int, ...] | None = None
+
+
+def _restrict(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
+    if params.allowed_ids is None:
+        return logits
+    keep = torch.full_like(logits, float("-inf"))
+    idx = torch.tensor(params.allowed_ids, device=logits.device)
+    keep[..., idx] = logits[..., idx]
+    return keep
 
 
 @dataclass(frozen=True)
@@ -517,7 +529,8 @@ class Engine:
     def _sample(self, logits_row: torch.Tensor, req: _Req, generated_idx: int) -> int:
         seed = _step_seed(req.params.seed, generated_idx)
         tok = self._backend.sample(
-            logits_row.reshape(1, -1), req.params.temperature, req.params.top_p, seed
+            _restrict(logits_row.reshape(1, -1), req.params), req.params.temperature,
+            req.params.top_p, seed,
         )
         return int(torch.as_tensor(tok).flatten()[0])
 
@@ -624,7 +637,7 @@ class Engine:
         per-row path."""
         if not rows:
             return
-        logits = torch.stack([l for _, l, _ in rows])
+        logits = torch.stack([_restrict(l, r.params) for r, l, _ in rows])
         dev = logits.device
         temps = torch.tensor([r.params.temperature for r, _, _ in rows], device=dev)
         top_ps = torch.tensor([r.params.top_p for r, _, _ in rows], device=dev)

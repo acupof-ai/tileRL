@@ -29,6 +29,13 @@ serial split loop, then a `T.Parallel(D)` body with a fragment per
 iteration — ran at 40 and 66 µs per call and would have cost the B=1 tick
 more than the dense attention at d512.
 
+## 256K (later the same day)
+
+`paged_attention_decode_64` (64 KV splits, selected when the pool reaches
+past 64K tokens — host-static, so graph-safe) keeps each block's serial scan
+≤ 4K tokens. Kernel-level at 256K, B=1: dense 22.0 ms → **1.52 ms per layer
+(14.5×)**, relerr 2.6e-3. Harness rows d131072/d262144 at B=1 follow.
+
 ## Rule
 
 Decode attention needs parallelism along the KV length, not along query

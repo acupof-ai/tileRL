@@ -64,7 +64,10 @@ def main() -> None:
         engine = build_engine(model.cfg, model, backend, num_blocks=2048, num_slots=64, max_batch=8,
                               max_total_tokens=8192)
         tok = get_tokenizer(args.source)
-        sp = SamplingParams(temperature=0.0, max_new_tokens=1, seed=0)
+        # multiple choice = argmax over the four letter tokens (with and without a
+        # leading space), the lm-eval convention; free-text greedy just explains
+        allowed = tuple(sorted({tok.encode(f" {c}")[-1] for c in LETTERS} | {tok.encode(c)[-1] for c in LETTERS}))
+        sp = SamplingParams(temperature=0.0, max_new_tokens=1, seed=0, allowed_ids=allowed)
         texts = [None] * len(prompts)
         pending, todo = {}, list(enumerate(prompts))
         while pending or todo:
@@ -77,13 +80,30 @@ def main() -> None:
     else:
         import sglang
 
+        from tilerl.server import get_tokenizer
+
         llm = sglang.Engine(model_path=args.source, trust_remote_code=True, mem_fraction_static=0.85)
-        outs = llm.generate(prompts, {"temperature": 0, "max_new_tokens": 1})
-        texts = [o["text"] for o in outs]
+        # unconstrained + top-logprobs, then argmax over the letter tokens: sglang's
+        # regex FSM splits the first token and decodes garbage (2026-08-28)
+        outs = llm.generate(prompts, {"temperature": 0, "max_new_tokens": 1},
+                            return_logprob=True, top_logprobs_num=20)
+        tok = get_tokenizer(args.source)
+        letters = {tok.encode(f" {c}")[-1]: c for c in LETTERS} | {tok.encode(c)[-1]: c for c in LETTERS}
+        texts = []
+        for o in outs:
+            top = o["meta_info"]["output_top_logprobs"][0]
+            hits = [(lp, letters[tid]) for lp, tid, *_ in top if tid in letters]
+            texts.append(max(hits)[1] if hits else o["text"])
         llm.shutdown()
 
     elapsed = time.time() - t0
-    preds = [(t.strip()[:1].upper() if t and t.strip() else "?") for t in texts]
+    import re
+
+    def letter(t):  # first standalone A-D in the completion
+        m = re.search(r"\b([ABCD])\b", t or "")
+        return m.group(1) if m else "?"
+
+    preds = [letter(t) for t in texts]
     correct = sum(p == g for p, g in zip(preds, golds))
     by = defaultdict(lambda: [0, 0])
     for p, g, s in zip(preds, golds, subjects):
@@ -95,7 +115,8 @@ def main() -> None:
     print("  weakest:", ", ".join(f"{s} {c}/{n}" for s, (c, n) in worst))
     out = args.out or f"/work/mmlu_{args.engine}.json"
     Path(out).write_text(json.dumps({"idx": idx, "pred": preds, "gold": golds, "acc": correct / len(preds),
-                                     "engine": args.engine, "source": args.source, "n": len(preds)}))
+                                     "engine": args.engine, "source": args.source, "n": len(preds),
+                                     "raw": texts[:50]}))
 
 
 if __name__ == "__main__":  # sglang spawns its scheduler with multiprocessing: no top-level work
