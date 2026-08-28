@@ -725,7 +725,10 @@ class Engine:
         hid: list | None = [] if self._draft else None
         logits = self._model.forward(
             input_ids, positions, self._make_kv(rows, seq_q, width if chains else 0),
-            self._backend, hidden_out=hid, last_only=not chains,
+            # Only when every row spans the full width: a mixed tick's decode
+            # rows end earlier and a verify tick needs every chain position.
+            self._backend, hidden_out=hid,
+            last_only=not chains and min(seq_q) == width,
         )
         if hid is not None:
             for i, r in enumerate(rows):  # the draft's fc input next tick

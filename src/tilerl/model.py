@@ -485,11 +485,11 @@ class Model:
             hidden_out.append(x)
         # A prefill chunk needs the logits of its LAST token only, but lm_head
         # is [vocab=248320, hidden], so computing all T costs 4.7% of a 2048
-        # prefill's FLOPs and a 508 MB output to throw away. Only when every row
-        # is full-length: a mixed tick's decode rows end earlier, and a verify
-        # tick needs every chain position.
-        sql = getattr(kv, "seq_q_lens", None)
-        if last_only and x.shape[1] > 1 and (sql is None or int(sql.min()) == x.shape[1]):
+        # prefill's FLOPs and a 508 MB output to throw away. The CALLER decides:
+        # it knows the per-row lengths as Python ints, and asking the device
+        # instead would be a host sync — illegal inside a CUDA graph capture,
+        # which is what blocked capturing a prefill tick.
+        if last_only and x.shape[1] > 1:
             x = autograd.slice(x, ..., slice(x.shape[1] - 1, None), slice(None))
         x = backend.rmsnorm(x, self.params["final_norm"], cfg.rms_eps)
         head_key = "embed_tokens" if cfg.tie_word_embeddings else "lm_head"
