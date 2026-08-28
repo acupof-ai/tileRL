@@ -200,7 +200,7 @@ class _DecodeGraph:
     """
 
     def __init__(self, model, backend, kv_pool, state_pool, batch_size, width=1,
-                 last_only=False):
+                 last_only=False, keep=0):
         device = backend.device
         B, W = batch_size, width
         # int32 end to end: every consumer is a kernel taking int32, and a
@@ -233,10 +233,11 @@ class _DecodeGraph:
             kv_pool=kv_pool,
             state_pool=state_pool,
             seq_q_lens=self._sql,
-            # A verify tick keeps the recurrent state after every chain step so
-            # the accepted length can select one; the step buffers are static,
-            # so the write captures like any other kernel.
-            keep_steps=W if W > 1 else 0,
+            # Only a verify tick keeps the recurrent state after every chain
+            # step; the step buffers are static, so the write captures like any
+            # other kernel. A prefill chunk is also W>1 and must NOT ask for
+            # them — its pool has none, and the request dies mid-capture.
+            keep_steps=keep,
         )
         # Warmup on a side stream: tilelang JIT-compiles per (shape, dtype),
         # and JIT is host work — it must finish before capture starts.
@@ -794,7 +795,8 @@ class Engine:
         g = self._decode_graphs.get((B, W))
         if g is None:
             try:
-                g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B, width=W)
+                g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B,
+                                 width=W, keep=W if chains else 0)
             except Exception as exc:
                 warnings.warn(
                     f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback"
