@@ -154,6 +154,47 @@ def make_rmsnorm_apply_bf16(target: str):
     return rmsnorm_apply
 
 
+def make_rmsnorm_fused_bf16(target: str):
+    """One launch per rmsnorm (sm90): a block per row, 256 threads each own a
+    strided K-slice, block-wide allreduce of the squared sum, then normalize
+    and write bf16. Replaces the split-K partial+apply pair (2 launches,
+    3.2 + 1.7 us in-graph) with a parallel reduction — the earlier single-block
+    attempt that regressed 20% reduced N=5120 serially in one thread
+    (errors/2026-08-27-fused-rmsnorm-regression.md)."""
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    def rmsnorm_fused(X, W, eps: T.float32, threads):
+        M, N = T.const("M, N")
+        X: T.Tensor((M, N), "float32")
+        W: T.Tensor((N,), "float32")
+        Y = T.empty((M, N), "bfloat16")
+        with T.Kernel(M, threads=threads) as row:
+            tx = T.get_thread_binding(0)
+            part = T.alloc_local((1,), "float32")
+            tot = T.alloc_local((1,), "float32")
+            part[0] = 0.0
+            for i in T.serial(T.ceildiv(N, threads)):
+                kk = i * threads + tx
+                if kk < N:
+                    part[0] += X[row, kk] * X[row, kk]
+            with T.attr(
+                T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
+                "reduce_scope",
+                T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(
+                    T.tvm_thread_allreduce(T.uint32(1), part[0], True, tot[0], tx, dtype="handle")
+                )
+            rstd = T.rsqrt(tot[0] / N + eps)
+            for i in T.serial(T.ceildiv(N, threads)):
+                kk = i * threads + tx
+                if kk < N:
+                    Y[row, kk] = T.cast(X[row, kk] * rstd * W[kk], "bfloat16")
+        return Y
+
+    return rmsnorm_fused
+
+
 def make_rmsnorm_rstd(target: str):
     """Per-row rsqrt(mean(x^2) + eps) -> Rstd [M]. Shared by the bwd kernels."""
 

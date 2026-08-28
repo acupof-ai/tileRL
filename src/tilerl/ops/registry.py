@@ -87,6 +87,7 @@ _SM90_KERNELS = {
     **_CPU_KERNELS,
     # bf16 writers: the consumers are bf16-IO GEMVs; f32 outputs only fed casts.
     "rmsnorm_apply": kernels.make_rmsnorm_apply_bf16,
+    "rmsnorm_fused": kernels.make_rmsnorm_fused_bf16,
     "silu_mul": kernels.make_silu_mul_bf16,
     "gemm_nt": kernels_linear.make_gemm_nt_mma,
     "gemm_nn": kernels_linear.make_gemm_nn_mma,

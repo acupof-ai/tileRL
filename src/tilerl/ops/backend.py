@@ -225,6 +225,9 @@ class Backend:
         # sums, phase 2 reduce+normalize) so decode (M=1) is not one serial
         # block. block_N=256 -> 20 blocks per row at the 5120 hidden size.
         N = x2.shape[-1]
+        if "rmsnorm_fused" in _resolve(self.precision, self.arch):
+            y = self._kernel("rmsnorm_fused")(x2, w, float(eps), 256)
+            return y.reshape(*lead, w.shape[0])
         block_N = min(256, N)
         num_chunks = (N + block_N - 1) // block_N
         p = self._kernel("rmsnorm_partial")(x2, block_N, num_chunks, _THREADS)

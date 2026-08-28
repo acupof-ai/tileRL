@@ -4,6 +4,14 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — single-launch parallel rmsnorm on sm90 (2.1 µs vs 4.9 for the split-K pair)
+
+- One block per row, 256-thread strided partials, block-wide allreduce,
+  bf16 write. The 08-27 single-launch attempt lost 20% because it reduced
+  serially; this one keeps the parallelism. Kernels per 8-layer B=1 tick
+  142 → 125; verify 1–3 PASS. Note appended to
+  `docs/experience/errors/2026-08-27-fused-rmsnorm-regression.md`.
+
 ## 2026-08-28 — split-KV decode attention, GQA group as the M tile — 5.7× at 32k (kernel)
 
 - Pure-decode ticks use `paged_attention_decode` (grid KVSPLIT×Hkv×B, the 4

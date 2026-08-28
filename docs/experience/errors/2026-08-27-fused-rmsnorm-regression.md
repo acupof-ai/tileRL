@@ -37,3 +37,12 @@ reduce+scale there) so the normalize costs ~nothing extra AND the launch is
 gone — not a standalone 1-block norm. Next lever should be a true fusion
 (eliminates a launch with no new serial work), or attack `add` (128 elementwise,
 genuinely cheap to fold into an epilogue), not more standalone kernels.
+
+## Follow-up (2026-08-28)
+
+The fusion works when the reduction stays parallel: `make_rmsnorm_fused_bf16`
+— one block per row, 256 threads each summing a strided K-slice, a
+block-wide `tvm_thread_allreduce`, then normalize and write bf16. In-graph
+2.1 µs per call vs 3.2 + 1.7 for the split-K pair; parity 1.7e-3 (bf16 out);
+kernels per 8-layer B=1 tick 142 → 125. The rule stands: it was the serial
+reduction that lost, not the single launch.
