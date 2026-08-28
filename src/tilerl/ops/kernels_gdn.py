@@ -192,15 +192,6 @@ def make_gdn_decode_fused(target: str):
 # ---------------------------------------------------------------- gated-delta chunk prefill (fused)
 
 
-def _halvings(n: int) -> list[int]:
-    """[n/2, n/4, ..., 1] — the offsets of a shared-memory tree reduce."""
-    out = []
-    while n > 1:
-        n //= 2
-        out.append(n)
-    return out
-
-
 def make_gdn_chunk_fused(target: str):
     """Fused gated-delta chunk prefill core (sm90): the T>1 generalization of
     make_gdn_decode_fused. One block per (value head, batch); thread tv owns
@@ -250,8 +241,7 @@ def make_gdn_chunk_fused(target: str):
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def gdn_chunk_fused(
-        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State, SeqQLens, threads,
-        kdim,
+        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State, SeqQLens, threads
     ):
         # TT (sequence length) is the const, not T: T is the tilelang.language
         # module alias and rebinding it would break T.serial/T.Kernel below.
@@ -292,8 +282,10 @@ def make_gdn_chunk_fused(target: str):
             beta_s = T.alloc_shared((1,), "float32")
             out_s = T.alloc_shared((V,), "float32")
             rms_s = T.alloc_shared((1,), "float32")
-            red_q = T.alloc_shared((K,), "float32")
-            red_k = T.alloc_shared((K,), "float32")
+            pq = T.alloc_local((1,), "float32")
+            pk = T.alloc_local((1,), "float32")
+            sq = T.alloc_local((1,), "float32")
+            sk = T.alloc_local((1,), "float32")
 
             # per-token fragments, hoisted out of the serial scan
             cq = T.alloc_fragment((1,), "float32")
@@ -340,23 +332,31 @@ def make_gdn_chunk_fused(target: str):
                 v_s[tv] = cv[0] * T.sigmoid(cv[0])
                 T.tvm_storage_sync("shared")
 
-                # L2-norm: a tree reduce over the block's K threads. Thread 0
-                # alone summing K=128 twice is 256 dependent FMAs on the
-                # critical path of EVERY token — at T=512 that alone is
-                # ~0.5 ms per call while 127 threads idle.
-                red_q[tv] = q_s[tv] * q_s[tv]
-                red_k[tv] = k_s[tv] * k_s[tv]
-                T.tvm_storage_sync("shared")
-                # host-side unroll over python ints: a `while` here is caught
-                # by tilelang's eager builder as a symbolic loop
-                for step in _halvings(kdim):
-                    if tv < step:
-                        red_q[tv] += red_q[tv + step]
-                        red_k[tv] += red_k[tv + step]
-                    T.tvm_storage_sync("shared")
+                # L2-norm by block allreduce (the rmsnorm_fused idiom). Thread
+                # 0 alone summing K=128 twice is 256 dependent FMAs on the
+                # critical path of EVERY token — at T=512 roughly half this
+                # kernel, with the block's other 127 threads idle.
+                pq[0] = q_s[tv] * q_s[tv]
+                pk[0] = k_s[tv] * k_s[tv]
+                with T.attr(
+                    T.comm_reducer(lambda a, bb_: a + bb_, [T.cast(0, "float32")]),
+                    "reduce_scope",
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                ):
+                    T.evaluate(
+                        T.tvm_thread_allreduce(T.uint32(1), pq[0], True, sq[0], tv, dtype="handle")
+                    )
+                with T.attr(
+                    T.comm_reducer(lambda a, bb_: a + bb_, [T.cast(0, "float32")]),
+                    "reduce_scope",
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                ):
+                    T.evaluate(
+                        T.tvm_thread_allreduce(T.uint32(1), pk[0], True, sk[0], tv, dtype="handle")
+                    )
                 if tv == 0:
-                    qn[0] = T.rsqrt(red_q[0] + 1e-12)
-                    kn[0] = T.rsqrt(red_k[0] + 1e-12)
+                    qn[0] = T.rsqrt(sq[0] + 1e-12)
+                    kn[0] = T.rsqrt(sk[0] + 1e-12)
                     x = GIn[bb, t, vh] + DtBias[vh]
                     sp = T.if_then_else(x > 20.0, x, T.log(1.0 + T.exp(x)))
                     exp_g_s[0] = T.exp(-T.exp(ALog[vh]) * sp)
