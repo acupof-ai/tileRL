@@ -4,6 +4,11 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — plan: training / RL roadmap (LoRA-OPD → batch decode → TP → CP → full-param)
+
+- `docs/plan-training-rl.md`: physics of the 8×H20 pod for a 27B, six phases
+  with gates and effort, the one decision to take (NCCL via a `comm` seam).
+
 ## 2026-08-28 — verdict: vs sglang on the same H20 — B=1 1.68× faster, B=8 0.8×, prefill 0.4×
 
 - sglang (bf16, since it cannot run NVFP4 on Hopper) B=1 54.2 / B=8 387 /
