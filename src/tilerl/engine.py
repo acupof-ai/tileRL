@@ -702,10 +702,11 @@ class Engine:
         hid: list | None = [] if self._draft else None
         logits = self._model.forward(
             input_ids, positions, self._make_kv(rows, seq_q, width if chains else 0),
-            self._backend, hidden_out=hid,
+            self._backend, hidden_out=hid, last_only=not chains,
         )
         if hid is not None:
             for i, r in enumerate(rows):  # the draft's fc input next tick
+                # hidden_out is appended before last_only's slice: always full width
                 r.hidden = hid[-1][i : i + 1, seq_q[i] - 1 : seq_q[i]]
         if chains:
             self._verify(decodes, chains, logits, hid[-1])
@@ -717,7 +718,8 @@ class Engine:
             prefill.prefill_from += chunk
             prefill.seq_len = prefill.prefill_from
             if prefill.prefill_from >= len(prefill.tokens):
-                self._sample_commit([(prefill, logits[j, chunk - 1], 0)])
+                # last_only may have collapsed the T axis to the final token.
+                self._sample_commit([(prefill, logits[j, min(chunk, logits.shape[1]) - 1], 0)])
                 # Publish the prompt prefix at a block boundary: the state
                 # slot still covers exactly the prompt tokens, so the
                 # snapshot is exact.
