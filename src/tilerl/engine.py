@@ -292,10 +292,15 @@ class Engine:
         self._draft = draft
         self._spec_depth = spec_depth if draft is not None else 0
         if draft is not None:
-            # The head arrives straight off safetensors, on the host. Left there
-            # it re-crosses PCIe every draft step: 849 MB at ~20 GB/s made one
-            # draft step as expensive as the whole 64-layer trunk tick.
-            draft.params = backend.materialize(draft.params)
+            # The head's weights are plain bf16 while every activation inside it
+            # is f32 (rmsnorm's output), so Backend.linear re-cast all 849 MB on
+            # EVERY call — 9.7 ms per projection against the trunk's 0.13 ms.
+            # Casting once makes the boundary cast a no-op.
+            # ponytail: 1.7 GB f32; quantizing the head like the trunk halves it.
+            draft.params = {
+                k: v.to(backend.device, torch.float32)
+                for k, v in backend.materialize(draft.params).items()
+            }
             if not 0 < spec_depth < BLOCK_TOKENS:
                 raise ValueError(f"spec_depth must be in [1, {BLOCK_TOKENS}), got {spec_depth}")
             self._draft_kv = PagedKvPool(
