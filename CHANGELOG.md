@@ -4,6 +4,18 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — verdict: tensor-core decode GEMM for 2≤M≤8 — B=8 agg 286.7 tok/s (+31%)
+
+- `mma.sync.m16n8k16.bf16` fed straight by the twiddle decode (no re-packing:
+  a consistent virtual-k permutation on both operands), one block scale per
+  lane per k32 chunk on the B fragment, G=4 chunks of loads in flight per
+  warp; fp8 twin. Replaces the padded WGMMA w4a8/fp8 decode paths and the
+  scalar batched GEMV (register-bound at 204 regs/lane — measured, deleted).
+  B=8 agg d512 219 → 286.7, d2k 216 → 254.7, d8k 171 → 202.2; parity M=8
+  1.7e-3; verify 1–3 PASS; M=1 stays on the scalar GEMV (2.2× slower through
+  mma8). Entries: `docs/experience/wins/2026-08-28-mma8-decode-gemm.md`,
+  `docs/experience/errors/2026-08-28-batched-scalar-gemv-register-bound.md`.
+
 ## 2026-08-28 — phase exit: B=1 decode 87.2 tok/s, Arle's 84.5 passed
 
 - **B=1 83.9 → 87.2 tok/s (+3.9%)**, d2k/d8k +4%, verify 1–3 PASS. The conv

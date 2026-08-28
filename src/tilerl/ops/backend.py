@@ -369,8 +369,9 @@ class Backend:
             kernel, Mp, Np, Kp, bM, bN = plan
             # K-tail: zero-padded X, and padded nibbles (0x00) decode to 0.0.
             wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
-            lo = 1 if os.environ.get("TILERL_MMA8_M1") else 2  # ponytail: A/B knob for M=1
-            if lo <= M <= _MX and "linear_fp4_mma8" in _resolve(self.precision, self.arch):
+            # M=1 stays on the scalar GEMV: through mma8 it measured 2.2x slower
+            # (39.9 vs 87 tok/s) — 15 of 16 tensor rows idle, same decode cost.
+            if 2 <= M <= _MX and "linear_fp4_mma8" in _resolve(self.precision, self.arch):
                 # Batched decode on the tensor cores (Marlin-style); Np is a
                 # multiple of 32 here (the plan pads N to the 32-row block).
                 Np32 = _round_up(N, 32)
@@ -438,8 +439,7 @@ class Backend:
         x2 = _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(M, K)), Mp, Kp)
         w8 = _pad2d(self._dev(w8, w8.dtype), Np, Kp)
         wscale = _pad2d(self._const_f32(wscale), -(-Np // 128), Kp // 128)
-        lo = 1 if os.environ.get("TILERL_MMA8_M1") else 2  # ponytail: A/B knob for M=1
-        if lo <= M <= _MX and "linear_fp8_mma8" in _resolve(self.precision, self.arch):
+        if 2 <= M <= _MX and "linear_fp8_mma8" in _resolve(self.precision, self.arch):
             Np32 = _round_up(N, 32)
             w8 = _pad2d(w8, Np32, Kp)
             wscale = _pad2d(wscale, -(-Np32 // 128), Kp // 128)

@@ -26,7 +26,10 @@ pairs, which is the B-fragment format.
 
 Parity at 27B dims: fp4 M=8 **1.7e-3**, fp8 M=8 1.6e-3 (f32 accumulate on the
 tensor cores; the w4a8 path it replaces was 3.5e-2 with activation quant).
-B=8 aggregate (host loaded, lower bounds): d512 219 → **275**, d2k 216 → 254.
+B=8 aggregate (quiet host): d512 219 → **286.7** (+31%), d2k 216 → 254.7
+(+18%), d8k 171 → 202.2 (+18%). M=1 through this kernel: 39.9 tok/s vs 87
+on the scalar GEMV (15 of 16 tensor rows idle, same decode cost) — M=1 keeps
+the GEMV.
 
 ## Rule
 
@@ -39,4 +42,4 @@ flight per warp. Scalar batched GEMVs cannot fit MX rows of X in registers.
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
-| 2026-08-28 | (pending) | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | | | |
+| 2026-08-28 | see bench-baseline.json | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | 0.55 | 27.9 (B=8, d512) | B=8 agg **286.7** d512 / 254.7 d2k / 202.2 d8k; B=1 87.3 unchanged |
