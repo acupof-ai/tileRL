@@ -77,7 +77,9 @@ class Tracer:
             ("rope", backend.rope),
             ("paged_attention", backend.paged_attention),
             ("write_tokens", backend.write_tokens),
-            ("gdn_decode", backend.linear_attn_chunk),
+            ("linear_attn_chunk", backend.linear_attn_chunk),
+            ("gdn_decode", backend.gdn_decode),
+            ("linear", backend.linear),
             ("state_gather", backend.state_gather),
             ("state_scatter", backend.state_scatter),
             ("silu_mul", backend.silu_mul),
@@ -145,7 +147,7 @@ class Tracer:
                 cats["linears"] += v
             elif k.startswith("rmsnorm:"):
                 cats["rmsnorm"] += v
-            elif k in ("gdn_decode", "state_gather", "state_scatter"):
+            elif k in ("gdn_decode", "linear_attn_chunk", "state_gather", "state_scatter"):
                 cats["gdn-core"] += v
             elif k in ("paged_attention", "write_tokens", "rope"):
                 cats["attn"] += v
