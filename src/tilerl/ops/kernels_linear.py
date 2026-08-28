@@ -1184,9 +1184,12 @@ def make_dequant_fp4_bf16(target: str, THREADS: int = 256):
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def dequant_fp4_bf16(WQ, Scale, OScale, block):
-        N, K = T.const("N, K")
+        # K2, not K: a constexpr that appears only as K//2 in a tensor shape is
+        # not invertible, and tilelang refuses to infer it (tilelang 0.1.13).
+        N, K2 = T.const("N, K2")
+        K = K2 * 2
         assert block % 8 == 0  # a thread's 8 elements never cross a scale block
-        WQ: T.Tensor((N, K // 2), "uint8")
+        WQ: T.Tensor((N, K2), "uint8")
         Scale: T.Tensor((N, K // block), "float32")
         OScale: T.Tensor((N,), "float32")  # per-row epilogue scale, folded
         W = T.empty((N, K), "bfloat16")
