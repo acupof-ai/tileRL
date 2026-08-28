@@ -811,14 +811,6 @@ class Backend:
             step_windows,
             threads=state.shape[-1],
         )
-        # The kernel returns the raw recurrence output; the gated RMSNorm and
-        # z-gate are two launches here instead of a serial thread-0 reduce on
-        # the critical path of every one of T token steps inside it.
-        core = out.reshape(b, out.shape[1], nvh, vd)
-        out = self.silu_mul(
-            kw["z"].reshape(core.shape),
-            self.rmsnorm(core, self._const_f32(kw["norm_weight"]), 1e-6),
-        ).reshape(out.shape)
         if ks:
             return out, step_states, (self._f32(step_windows) if has_window else None)
         return out, new_state, (self._f32(new_window) if has_window else None)
