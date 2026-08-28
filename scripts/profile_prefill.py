@@ -64,26 +64,30 @@ def main() -> None:
 
     one_prefill()  # JIT + cache warm (every prefill shape compiles once)
     torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+    with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
         one_prefill()
         torch.cuda.synchronize()
+    # Key by (kernel, input shapes): one kernel name covers several GEMM shapes
+    # and only the per-shape cost says which one is slow.
     by = defaultdict(lambda: [0, 0.0])
     total = 0.0
     for e in prof.events():
         if e.device_type.name != "CUDA":
             continue
         us = e.time_range.elapsed_us()
-        by[e.name[:70]][0] += 1
-        by[e.name[:70]][1] += us
+        shapes = getattr(e, "input_shapes", None) or []
+        sig = ",".join(str(tuple(x)) for x in shapes if x)[:44]
+        key = f"{e.name[:34]} {sig}"
+        by[key][0] += 1
+        by[key][1] += us
         total += us
-    n = 1
     toks = args.len * b
     print(f"\n{args.layers} layers, B={b}, prompt {args.len}: GPU-busy "
           f"{total / 1e3:.1f} ms, {sum(c for c, _ in by.values())} kernels, "
           f"{toks / (total / 1e6):.0f} tok/s GPU-bound (this layer count)")
-    print(f"{'kernel':<70} {'count':>6} {'us each':>8} {'ms':>8} {'%':>5}")
+    print(f"{'kernel  (input shapes)':<80} {'count':>6} {'us each':>8} {'ms':>8} {'%':>5}")
     for name, (c, us) in sorted(by.items(), key=lambda kv: -kv[1][1])[: args.top]:
-        print(f"{name:<70} {c // n:>6} {us / c:>8.1f} {us / n / 1e3:>8.3f} {100 * us / total:>5.1f}")
+        print(f"{name:<80} {c:>6} {us / c:>8.1f} {us / 1e3:>8.3f} {100 * us / total:>5.1f}")
 
 
 if __name__ == "__main__":
