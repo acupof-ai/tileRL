@@ -199,26 +199,29 @@ class _DecodeGraph:
     # cast, which the optimizer's copy_ invalidates in eager only.
     """
 
-    def __init__(self, model, backend, kv_pool, state_pool, batch_size):
+    def __init__(self, model, backend, kv_pool, state_pool, batch_size, width=1):
         device = backend.device
-        B = batch_size
+        B, W = batch_size, width
         # int32 end to end: every consumer is a kernel taking int32, and a
         # long buffer costs an int64->int32 cast launch per use inside the graph.
-        self._ids = torch.empty(B, 1, dtype=torch.int32, device=device)
-        self._pos = torch.empty(B, 1, dtype=torch.int32, device=device)
+        self._w = W
+        self._ids = torch.empty(B, W, dtype=torch.int32, device=device)
+        self._pos = torch.empty(B, W, dtype=torch.int32, device=device)
         self._bt = torch.zeros(B, kv_pool.num_blocks, dtype=torch.int32, device=device)
         self._sl = torch.empty(B, dtype=torch.int32, device=device)
         self._ss = torch.empty(B, dtype=torch.int32, device=device)
-        # Decode rows always have exactly 1 query token; a static GPU buffer
-        # (not a per-tick CPU copy) keeps seq_q_lens out of the captured
-        # region — the kernels' CPU->GPU fallback breaks CUDA graph capture.
-        self._sql = torch.ones(B, dtype=torch.int32, device=device)
+        # Every row carries the same W query tokens — a plain decode tick, or a
+        # speculative verify of one fixed-length chain. A static GPU buffer (not
+        # a per-tick CPU copy) keeps seq_q_lens out of the captured region: the
+        # kernels' CPU->GPU fallback breaks CUDA graph capture. Uniform W is why
+        # a captured spec tick cannot use verify_lens' per-row trim.
+        self._sql = torch.full((B,), W, dtype=torch.int32, device=device)
         # Pinned staging buffers: a plain copy_ from an unpinned CPU tensor is
         # synchronous (it blocks until the copy engine drains), which under
         # GPU contention costs ms per tick. Pinned + non_blocking makes the
         # H2D copies async — stream ordering keeps replay after them.
-        self._ids_h = torch.empty(B, 1, dtype=torch.int32, pin_memory=True)
-        self._pos_h = torch.empty(B, 1, dtype=torch.int32, pin_memory=True)
+        self._ids_h = torch.empty(B, W, dtype=torch.int32, pin_memory=True)
+        self._pos_h = torch.empty(B, W, dtype=torch.int32, pin_memory=True)
         self._bt_h = torch.zeros(B, kv_pool.num_blocks, dtype=torch.int32, pin_memory=True)
         self._sl_h = torch.empty(B, dtype=torch.int32, pin_memory=True)
         self._ss_h = torch.empty(B, dtype=torch.int32, pin_memory=True)
@@ -229,12 +232,16 @@ class _DecodeGraph:
             kv_pool=kv_pool,
             state_pool=state_pool,
             seq_q_lens=self._sql,
+            # A verify tick keeps the recurrent state after every chain step so
+            # the accepted length can select one; the step buffers are static,
+            # so the write captures like any other kernel.
+            keep_steps=W if W > 1 else 0,
         )
         # Warmup on a side stream: tilelang JIT-compiles per (shape, dtype),
         # and JIT is host work — it must finish before capture starts.
         self._ids.fill_(0)
         self._pos.fill_(0)
-        self._sl.fill_(1)
+        self._sl.fill_(W)
         self._ss.fill_(0)
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -243,18 +250,26 @@ class _DecodeGraph:
                 model.forward(self._ids, self._pos, self._kv, backend)
         torch.cuda.current_stream().wait_stream(s)
         self._graph = torch.cuda.CUDAGraph()
+        hid: list = []
         with torch.cuda.graph(self._graph):
-            self._logits = model.forward(self._ids, self._pos, self._kv, backend)
+            self._logits = model.forward(self._ids, self._pos, self._kv, backend, hidden_out=hid)
+        # Captured, so this tensor is rewritten in place by every replay — the
+        # draft head reads the previous tick's hidden from it directly.
+        self.hidden = hid[-1] if hid else None
 
-    def run(self, reqs):
+    def run(self, reqs, chains=None):
         """Copy per-tick inputs into the static buffers and replay.
 
-        Returns the static logits [B,1,V]; valid until the next replay.
+        Returns the static logits [B,W,V]; valid until the next replay.
+        ``chains[i]`` is row i's ``[last committed token, drafts...]``, all of
+        length W.
         """
         for i, r in enumerate(reqs):
-            self._ids_h[i, 0] = r.output[-1]
-            self._pos_h[i, 0] = r.seq_len - 1
-            self._sl_h[i] = r.seq_len
+            chain = chains[i] if chains else (r.output[-1],)
+            for j, tok in enumerate(chain):
+                self._ids_h[i, j] = tok
+                self._pos_h[i, j] = r.seq_len - 1 + j
+            self._sl_h[i] = r.seq_len - 1 + self._w
             self._ss_h[i] = r.state_slot
             n = len(r.blocks)
             self._bt_h[i, :n] = torch.tensor(r.blocks, dtype=torch.int32)
@@ -298,9 +313,7 @@ class Engine:
         # default/fallback everywhere else and on capture failure.
         if decode_graph is None:
             decode_graph = backend.device.type == "cuda"
-        # A captured decode replays one T=1 step and yields no hidden state, so
-        # it can neither verify a chain nor feed the next tick's draft.
-        self._decode_graph_on = decode_graph and draft is None
+        self._decode_graph_on = decode_graph
         self._decode_graphs: dict[int, _DecodeGraph] = {}
 
         # Speculation: the draft is one full-attn stack with its OWN kv plane
@@ -619,6 +632,17 @@ class Engine:
         )
         if chains is not None and max(map(len, chains)) == 1:
             chains = None  # the policy kept nothing: a plain decode tick
+        elif chains is not None and self._decode_graph_on:
+            # One graph per (B, width): pad every row to the widest chain so the
+            # captured shape is fixed. verify_lens' per-row trim cannot survive
+            # capture, and the marginal cost of a wider row inside a replay is
+            # far below the 7.9x the graph itself is worth.
+            w = max(map(len, chains))
+            for c in chains:
+                # Any pad token is correct: a draft is only ever accepted when
+                # it equals what the trunk sampled there, so a repeat is simply
+                # a draft that gets rejected.
+                c.extend([c[-1]] * (w - len(c)))
         q_dec = [len(c) for c in chains] if chains else [1] * len(decodes)
         growth = sum(
             max(0, (r.seq_len + q - 1 + BLOCK_TOKENS) // BLOCK_TOKENS - len(r.blocks))
@@ -639,7 +663,7 @@ class Engine:
             prefill is None
             and decodes
             and self._decode_graph_on
-            and self._run_decode_graph(decodes)
+            and self._run_decode_graph(decodes, chains)
         ):
             return
         rows = decodes + ([prefill] if prefill is not None else [])
@@ -698,24 +722,34 @@ class Engine:
         if decodes and prefill is not None:
             self._mixed_forwards += 1
 
-    def _run_decode_graph(self, reqs: list[_Req]) -> bool:
+    def _run_decode_graph(self, reqs: list[_Req], chains=None) -> bool:
         """Captured decode for a pure-decode tick (one graph per batch-size
         bucket, captured lazily on the first tick of that size). Returns
         False (and flips the flag off) when capture failed, so the caller
         runs eager."""
-        B = len(reqs)
-        g = self._decode_graphs.get(B)
+        B, W = len(reqs), len(chains[0]) if chains else 1
+        g = self._decode_graphs.get((B, W))
         if g is None:
             try:
-                g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B)
+                g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B, width=W)
             except Exception as exc:
-                warnings.warn(f"decode graph capture failed for B={B} ({exc}); eager fallback")
+                warnings.warn(
+                    f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback"
+                )
                 self._decode_graph_on = False
                 return False
-            self._decode_graphs[B] = g
-        logits = g.run(reqs)
+            self._decode_graphs[(B, W)] = g
+        logits = g.run(reqs, chains)
         self._decode_forwards += 1
-        self._sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
+        if chains:
+            # No hidden from a replay: the next tick's draft reads it from the
+            # graph's own static buffer, which the model wrote during capture.
+            self._verify(reqs, chains, logits, g.hidden)
+        else:
+            if self._draft is not None and g.hidden is not None:
+                for i, r in enumerate(reqs):  # keep the draft's fc input current
+                    r.hidden = g.hidden[i : i + 1, -1:]
+            self._sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
         return True
 
     def _draft_chains(self, rows: list[_Req]) -> list[list[int]]:
