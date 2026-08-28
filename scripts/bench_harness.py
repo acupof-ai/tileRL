@@ -8,6 +8,7 @@ Fills the coverage holes the scattered bench_*.py scripts left open:
   prefill     prefill tok/s vs prompt length, as a curve not 3 points.
   kv-reuse    prefix-cache hit-rate + warm-vs-cold prefill speedup (the engine's
               PrefixStore was perf-untested).
+  spec        speculative decode goodput vs the draft head (27B only).
   train       train_step fwd+bwd tok/s (tiny on CPU, 27B on the pod) — training
               had zero perf coverage.
   accuracy    MMLU 0-shot % on a fixed slice (27B only). Every other suite gates
@@ -218,6 +219,44 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
                 engine.step()
 
 
+def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
+    """Speculative decode goodput. Gates the AGGREGATE tok/s, which is what
+    speculation is for; acceptance is printed because a drop there is the first
+    sign the draft head or its serving format regressed."""
+    import benchkit as bk
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.spec import load_draft
+
+    path = Path(source) / "model_mtp.safetensors"
+    if not path.exists():
+        print(f"\n  (no draft head at {path}, spec suite skipped)")
+        return
+    print(f"\n=== speculative decode (depth {depth}, tok/s) ===")
+    print(f"  {'B':>3} {'ms/tick':>9} {'tok/tick':>9} {'accept':>7} {'agg tok/s':>10}")
+    for b in batches:
+        engine = build_engine(
+            cfg, model, backend, num_blocks=512, num_slots=max(16, b), max_batch=max(8, b),
+            draft=load_draft(model, path), spec_depth=depth,
+        )
+        for i in range(b):
+            engine.submit(
+                bk.rand_prompt(cfg.vocab_size, 16, seed=700 + i),
+                SamplingParams(temperature=0.0, max_new_tokens=(ticks + 20) * (1 + depth), seed=i),
+            )
+        for _ in range(8):  # flush prefills; every row decoding afterwards
+            engine.step()
+        bk.sync(backend)
+        s0 = engine.stats()
+        ms = _median_windows(engine.step, 3, ticks, lambda: bk.sync(backend))
+        s1 = engine.stats()
+        per_tick = (s1["tokens_generated"] - s0["tokens_generated"]) / (3 * ticks) / b
+        drafted = s1["spec_drafted"] - s0["spec_drafted"]
+        acc = (s1["spec_accepted"] - s0["spec_accepted"]) / max(drafted, 1)
+        agg = 1000.0 * b * per_tick / ms
+        print(f"  {b:>3} {ms:>9.3f} {per_tick:>9.2f} {100 * acc:>6.1f}% {agg:>10.1f}")
+        gate.check("spec", f"d{depth}-b{b}", agg, spread=LAST_SPREAD)
+
+
 def suite_prefill(gate, cfg, model, backend, lengths):
     import benchkit as bk
     from tilerl.engine import build_engine
@@ -377,13 +416,15 @@ def main() -> int:
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--suite", default="",
-                    help="comma list: decode-kv,prefill,kv-reuse,train,accuracy (default: all applicable)")
+                    help="comma list: decode-kv,prefill,kv-reuse,spec,train,accuracy"
+                         " (default: all applicable)")
     ap.add_argument("--source", default=None, help="27B checkpoint dir (omit for tiny/CPU)")
     ap.add_argument("--gpu", type=int, default=None)
     ap.add_argument("--batches", default="1,8")
     ap.add_argument("--depths", default=",".join(map(str, _KV_DEPTHS)))
     ap.add_argument("--ticks", type=int, default=20)
     ap.add_argument("--json", default=None)
+    ap.add_argument("--spec-depth", type=int, default=2, help="drafts per row per tick")
     ap.add_argument("--mmlu-n", type=int, default=200, help="accuracy suite question count")
     ap.add_argument("--reseed", action="store_true", help="record every row as the new baseline (no gate)")
     args = ap.parse_args()
@@ -406,9 +447,9 @@ def main() -> int:
     gate = Gate(target, update_only=args.reseed)
     batches = [int(x) for x in args.batches.split(",")]
 
-    gpu_suites = {"decode-kv", "prefill", "kv-reuse"}
+    gpu_suites = {"decode-kv", "prefill", "kv-reuse", "spec"}
     default = (["train"] if args.source is None
-               else ["decode-kv", "prefill", "kv-reuse", "train", "accuracy"])
+               else ["decode-kv", "prefill", "kv-reuse", "spec", "train", "accuracy"])
     suites = [s for s in (args.suite.split(",") if args.suite else default) if s]
 
     cfg = model = None
@@ -430,6 +471,12 @@ def main() -> int:
             suite_prefill(gate, cfg, model, backend, _KV_DEPTHS)
         elif s == "kv-reuse":
             suite_kv_reuse(gate, cfg, model, backend)
+        elif s == "spec":
+            if args.source is None:
+                print("  (spec needs --source, skipped)")
+            else:
+                suite_spec(gate, cfg, model, backend, batches, args.source, args.ticks,
+                           args.spec_depth)
         elif s == "train":
             suite_train(gate, backend, args.source, args.gpu)
         elif s == "accuracy":
