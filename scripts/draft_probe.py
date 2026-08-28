@@ -107,7 +107,13 @@ def main() -> None:
                                kv_for(draft_pool, j + 1, 1), backend, hidden_out=dh)
             chain.append(int(dl[0, -1].argmax()))
             h = dh[-1] if dh else h
-        # verify: one trunk forward over [nxt, draft_1..draft_d]
+        # Snapshot the GDN recurrent state + conv window BEFORE verify. The
+        # verify forward absorbs all depth+1 chain tokens into the recurrence,
+        # including the ones about to be rejected, and unlike the paged KV
+        # (which the next forward overwrites) the recurrent state has no way to
+        # heal — it compounds, and the rollout degenerates within ~50 tokens.
+        snap_state = states.states.clone()
+        snap_win = states.window_snapshot(0)
         hid.clear()
         logits = trunk.forward(arr([chain]), arr(range(pos, pos + len(chain))),
                                kv_for(trunk_pool, pos + len(chain), len(chain)), backend,
@@ -136,6 +142,13 @@ def main() -> None:
         ids.append(nxt)
         h = hid[-1][:, n_ok : n_ok + 1, :]
         pos += n_ok + 1
+        # Roll the recurrence back and re-absorb only the committed tokens.
+        states.states.copy_(snap_state)
+        if snap_win is not None:
+            states.window_restore(0, snap_win)
+        keep = chain[: n_ok + 1]
+        trunk.forward(arr([keep]), arr(range(pos - n_ok - 1, pos)),
+                      kv_for(trunk_pool, pos, len(keep)), backend)
     bad = next(((i, w) for i, w in greedy if ids[i] != w), None)
     assert bad is None, (
         f"probe is not reproducing greedy decode: ids[{bad[0] if bad else 0}]="
