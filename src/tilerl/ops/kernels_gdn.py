@@ -290,15 +290,12 @@ def make_gdn_chunk_fused(target: str):
             kn = T.alloc_shared((1,), "float32")
             exp_g_s = T.alloc_shared((1,), "float32")
             beta_s = T.alloc_shared((1,), "float32")
+            out_s = T.alloc_shared((V,), "float32")
             rms_s = T.alloc_shared((1,), "float32")
             pq = T.alloc_local((1,), "float32")
             pk = T.alloc_local((1,), "float32")
             sq = T.alloc_local((1,), "float32")
             sk = T.alloc_local((1,), "float32")
-            # fragment, not local: it is assigned from acc_o, and mixing a
-            # local with a fragment in one statement fails layout inference.
-            po = T.alloc_fragment((1,), "float32")
-            so = T.alloc_local((1,), "float32")
 
             # per-token fragments, hoisted out of the serial scan
             cq = T.alloc_fragment((1,), "float32")
@@ -307,6 +304,7 @@ def make_gdn_chunk_fused(target: str):
             kv_mem = T.alloc_fragment((1,), "float32")
             delta = T.alloc_fragment((1,), "float32")
             acc_o = T.alloc_fragment((1,), "float32")
+            acc_sq = T.alloc_fragment((1,), "float32")
 
             # per-thread state column: carried in a local array across all T
             # tokens (loaded once at seed, written once after the scan)
@@ -404,26 +402,19 @@ def make_gdn_chunk_fused(target: str):
                 if t < KS:  # per-chain-step state for a speculative verify
                     for j in T.serial(K):
                         StepStates[bb, t, vh, j, tv] = state_local[j]
-                # gated RMSNorm by the same block allreduce as the q/k norms
-                # above — this one was still thread 0 summing V=128 serially per
-                # token, the other 127 threads idle between two syncs. Each
-                # thread already holds its own output element, so the shared
-                # staging buffer goes with it.
-                po[0] = acc_o[0] * acc_o[0]
-                with T.attr(
-                    T.comm_reducer(lambda a, bb_: a + bb_, [T.cast(0, "float32")]),
-                    "reduce_scope",
-                    T.reinterpret(T.uint64(0), dtype="handle"),
-                ):
-                    T.evaluate(
-                        T.tvm_thread_allreduce(T.uint32(1), po[0], True, so[0], tv, dtype="handle")
-                    )
+                out_s[tv] = acc_o[0]
+                T.tvm_storage_sync("shared")
+
+                # gated RMSNorm + z-gate
                 if tv == 0:
-                    rms_s[0] = T.rsqrt(so[0] / T.cast(V, "float32") + 1e-6)
+                    T.clear(acc_sq)
+                    for j in T.serial(V):
+                        acc_sq[0] += out_s[j] * out_s[j]
+                    rms_s[0] = T.rsqrt(acc_sq[0] / T.cast(V, "float32") + 1e-6)
                 T.tvm_storage_sync("shared")
                 gate = T.cast(Z[bb, t, vh * V + tv], "float32")
                 Out[bb, t, vh * V + tv] = (
-                    acc_o[0] * rms_s[0] * NormW[tv] * (gate * T.sigmoid(gate))
+                    out_s[tv] * rms_s[0] * NormW[tv] * (gate * T.sigmoid(gate))
                 )
 
             # chunk-end state: the only NewState the caller consumes (the
