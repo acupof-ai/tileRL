@@ -93,6 +93,7 @@ def main() -> None:
                            kv_for(trunk_pool, len(ids), len(ids)), backend, hidden_out=hid)
     accepted = total = blocks = 0
     per_pos = [0] * args.depth  # P(first j+1 drafts all accepted) — sets the depth
+    greedy: list[tuple[int, int]] = []  # (index, trunk argmax) for the self-check
     nxt = int(logits[0, -1].argmax())  # the trunk's own next token
     h = hid[-1][:, -1:, :]  # trunk hidden at the position that predicts nxt
     pos = len(ids)  # position of nxt (not yet in the KV)
@@ -112,6 +113,12 @@ def main() -> None:
                                kv_for(trunk_pool, pos + len(chain), len(chain)), backend,
                                hidden_out=hid)
         want = [int(x) for x in logits[0, :-1].argmax(-1)]
+        # Self-check: whatever the head drafts, the token committed right
+        # after `nxt` must be the trunk's own argmax there — i.e. exactly what
+        # plain greedy decode emits. Three earlier readings from this script
+        # were void because the loop silently kept rejected drafts, and nothing
+        # here would have noticed.
+        greedy.append((len(ids), want[0]))
         n_ok = 0
         for j, (a, b) in enumerate(zip(want, chain[1:])):
             total += 1
@@ -129,6 +136,12 @@ def main() -> None:
         ids.append(nxt)
         h = hid[-1][:, n_ok : n_ok + 1, :]
         pos += n_ok + 1
+    bad = next(((i, w) for i, w in greedy if ids[i] != w), None)
+    assert bad is None, (
+        f"probe is not reproducing greedy decode: ids[{bad[0] if bad else 0}]="
+        f"{ids[bad[0]] if bad else None} but the trunk's argmax there was "
+        f"{bad[1] if bad else None}"
+    )
     n = blocks
     if args.show:
         from tilerl.server import get_tokenizer
