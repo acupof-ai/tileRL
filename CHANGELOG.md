@@ -4,6 +4,32 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — eval: MMLU 0-shot 76.3% on the 27B NVFP4, and the first 128K/256K rows
+
+- `SamplingParams.allowed_ids` (logit mask over the answer-letter ids) turns a
+  chat-tuned model's prose into a scorable answer: 0.8% -> **76.3%**, 0 unparsed.
+  The sglang arm is invalid — its bf16 checkpoint emits garbage
+  ([errors/2026-08-28-sglang-bf16-checkpoint-garbage.md](docs/experience/errors/2026-08-28-sglang-bf16-checkpoint-garbage.md)),
+  so those numbers are throughput only.
+  [wins/2026-08-28-mmlu-letter-restricted.md](docs/experience/wins/2026-08-28-mmlu-letter-restricted.md)
+- Long-context decode, B=1, one card: **61.1 tok/s at 128K, 48.1 at 256K**
+  (64-split decode attention).
+  [wins/2026-08-28-split-kv-decode-attention.md](docs/experience/wins/2026-08-28-split-kv-decode-attention.md)
+
+## 2026-08-28 — phase exit: P1 shape — 27B trains on one card (frozen fp4 base + LoRA)
+
+- A tape recording of a quantized linear no longer needs a bf16 master: with no
+  master it runs the real fp4/fp8 kernel and yields dX only. That removes 54 GB
+  of masters + 216 GB of Adam moments and makes `add_lora` + `train_step(...,
+  trainable=...)` the shape P1 asked for; `opd_loop` gains the EMA self-teacher
+  (adapters only). Harness `train` suite now has a 27B row.
+
+## 2026-08-28 — feature: thinking effort
+
+- `reasoning_effort` (none/minimal/low/medium/high) maps to a thinking-token
+  budget; when it is spent the engine closes the reasoning block itself. The
+  end-of-think ids come from the caller, so the engine stays tokenizer-free.
+
 ## 2026-08-28 — plan: training / RL roadmap (LoRA-OPD → batch decode → TP → CP → full-param)
 
 - `docs/plan-training-rl.md`: physics of the 8×H20 pod for a 27B, six phases
