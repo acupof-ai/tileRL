@@ -28,9 +28,7 @@ def main() -> None:
                          "repetition regime and reads as a higher acceptance")
     ap.add_argument("--prompt-len", type=int, default=128)
     ap.add_argument("--text", default=None, help="real prompt (default: random ids)")
-    ap.add_argument("--temp", type=float, default=0.0,
-                    help="trunk sampling temperature: greedy continuations are the "
-                         "predictable case, and a flat survival curve is the tell")
+    ap.add_argument("--show", action="store_true", help="print the continuation")
     ap.add_argument("--embed-first", action="store_true", help="fc sees concat(embed, hidden)")
     args = ap.parse_args()
     if args.gpu is not None:
@@ -58,7 +56,7 @@ def main() -> None:
           f"{'hidden,embed' if draft.hidden_first else 'embed,hidden'}")
 
     # Two pools: the trunk's full-attn planes, and one plane for the draft layer.
-    nblk = -(-(args.prompt_len + args.gen + args.depth + 64) // BLOCK_TOKENS) + 2
+    nblk = -(-(args.prompt_len + 4 * args.gen + args.depth + 64) // BLOCK_TOKENS) + 4
     trunk_pool = PagedKvPool(nblk, cfg.num_kv_heads, cfg.head_dim,
                              num_layers=len(cfg.full_attn_layers), device=backend.device,
                              layer_map=cfg.full_attn_layers)
@@ -90,41 +88,52 @@ def main() -> None:
     def arr(x):  # backend ops want arrays, not python lists
         return np.asarray(x, dtype=np.int64)
 
+    prompt_len = len(ids)
     logits = trunk.forward(arr([ids]), arr(range(len(ids))),
                            kv_for(trunk_pool, len(ids), len(ids)), backend, hidden_out=hid)
-    gen = torch.Generator(device=logits.device).manual_seed(0)
-    accepted = total = 0
-    blocks = 0
-    per_pos = [0] * args.depth  # how often draft j survives — sets the useful depth
-    while len(ids) - args.prompt_len < args.gen:
+    accepted = total = blocks = 0
+    per_pos = [0] * args.depth  # P(first j+1 drafts all accepted) — sets the depth
+    nxt = int(logits[0, -1].argmax())  # the trunk's own next token
+    h = hid[-1][:, -1:, :]  # trunk hidden at the position that predicts nxt
+    pos = len(ids)  # position of nxt (not yet in the KV)
+    ids.append(nxt)
+    while len(ids) - prompt_len < args.gen:
         blocks += 1
-        if args.temp > 0:  # sampled trunk: the draft must track a real rollout
-            probs = torch.softmax(logits[0, -1].float() / args.temp, dim=-1)
-            nxt = int(torch.multinomial(probs, 1, generator=gen))
-        else:
-            nxt = int(logits[0, -1].argmax())
-        h = hid[-1][:, -1:, :]
-        chain, dpos = [nxt], len(ids)
-        for j in range(args.depth):  # draft, one token at a time off its own hidden
+        chain = [nxt]
+        for j in range(args.depth):  # draft off the head's own hidden
             dh: list = []
-            dl = draft.forward(h, arr([[chain[-1]]]), arr([dpos + j]),
+            dl = draft.forward(h, arr([[chain[-1]]]), arr([pos + j]),
                                kv_for(draft_pool, j + 1, 1), backend, hidden_out=dh)
             chain.append(int(dl[0, -1].argmax()))
             h = dh[-1] if dh else h
-        # verify: the trunk sees [accepted_token, draft_1..draft_d] in one forward
-        ids.extend(chain)
+        # verify: one trunk forward over [nxt, draft_1..draft_d]
         hid.clear()
-        logits = trunk.forward(arr([chain]), arr(range(dpos, dpos + len(chain))),
-                               kv_for(trunk_pool, dpos + len(chain), len(chain)), backend,
+        logits = trunk.forward(arr([chain]), arr(range(pos, pos + len(chain))),
+                               kv_for(trunk_pool, pos + len(chain), len(chain)), backend,
                                hidden_out=hid)
         want = [int(x) for x in logits[0, :-1].argmax(-1)]
+        n_ok = 0
         for j, (a, b) in enumerate(zip(want, chain[1:])):
             total += 1
             if a != b:
                 break
+            n_ok += 1
             accepted += 1
             per_pos[j] += 1
+        # Commit the accepted prefix plus the trunk's own next token, and
+        # DROP the rejected drafts — extending by the whole chain would score
+        # the draft against text it wrote itself (a flat survival curve near
+        # 0.8 that is not an acceptance rate).
+        ids.extend(chain[1 : n_ok + 1])
+        nxt = int(logits[0, n_ok].argmax())  # bonus token, from the last kept row
+        ids.append(nxt)
+        h = hid[-1][:, n_ok : n_ok + 1, :]
+        pos += n_ok + 1
     n = blocks
+    if args.show:
+        from tilerl.server import get_tokenizer
+
+        print("  continuation:", repr(get_tokenizer(args.source).decode(ids[prompt_len:])[:200]))
     print(f"depth {args.depth}, {args.gen} generated tokens ({n} blocks): "
           f"accepted {accepted}/{total} = {100 * accepted / max(total, 1):.1f}%")
     print("  survival by position:", " ".join(f"{c / n:.2f}" for c in per_pos))
