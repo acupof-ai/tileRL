@@ -28,6 +28,9 @@ def main() -> None:
                          "repetition regime and reads as a higher acceptance")
     ap.add_argument("--prompt-len", type=int, default=128)
     ap.add_argument("--text", default=None, help="real prompt (default: random ids)")
+    ap.add_argument("--temp", type=float, default=0.0,
+                    help="trunk sampling temperature: greedy continuations are the "
+                         "predictable case, and a flat survival curve is the tell")
     ap.add_argument("--embed-first", action="store_true", help="fc sees concat(embed, hidden)")
     args = ap.parse_args()
     if args.gpu is not None:
@@ -89,12 +92,17 @@ def main() -> None:
 
     logits = trunk.forward(arr([ids]), arr(range(len(ids))),
                            kv_for(trunk_pool, len(ids), len(ids)), backend, hidden_out=hid)
+    gen = torch.Generator(device=logits.device).manual_seed(0)
     accepted = total = 0
     blocks = 0
     per_pos = [0] * args.depth  # how often draft j survives — sets the useful depth
     while len(ids) - args.prompt_len < args.gen:
         blocks += 1
-        nxt = int(logits[0, -1].argmax())
+        if args.temp > 0:  # sampled trunk: the draft must track a real rollout
+            probs = torch.softmax(logits[0, -1].float() / args.temp, dim=-1)
+            nxt = int(torch.multinomial(probs, 1, generator=gen))
+        else:
+            nxt = int(logits[0, -1].argmax())
         h = hid[-1][:, -1:, :]
         chain, dpos = [nxt], len(ids)
         for j in range(args.depth):  # draft, one token at a time off its own hidden
