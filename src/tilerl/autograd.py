@@ -447,13 +447,18 @@ def clip_grad_norm(grads: dict[int, torch.Tensor], max_norm: float) -> float:
 
     A non-finite norm is returned as-is: the caller (train_step) rejects the
     step, matching ``finite_optimizer_step``. ``max_norm <= 0`` or non-finite
-    disables clipping. Accumulation is host fp64: MPS has no float64 kernel,
-    so grads are summed on CPU (a no-op move for CPU-resident grads)."""
-    total_sq = torch.zeros((), dtype=torch.float64)
+    disables clipping. Accumulation is fp64 on the grads' own device, then ONE
+    sync — the per-grad ``.to("cpu")`` it replaces cost 126 device-to-host
+    copies a step (7% of the 27B LoRA step). MPS has no float64 kernel, so
+    that target still sums on the host."""
+    dev = next(iter(grads.values())).device if grads else torch.device("cpu")
+    host = dev.type == "mps"
+    total_sq = torch.zeros((), dtype=torch.float64, device="cpu" if host else dev)
     for g in grads.values():
-        # Two-step move: ``.to("cpu", torch.float64)`` still hits MPS's
+        # Two-step move on MPS: ``.to("cpu", torch.float64)`` still hits its
         # missing float64 kernel (torch converts dtype on the source device).
-        total_sq += g.detach().to("cpu").to(torch.float64).pow(2).sum()
+        gd = g.detach()
+        total_sq += (gd.to("cpu") if host else gd).to(torch.float64).pow(2).sum()
     total = float(total_sq.sqrt().item())
     if not math.isfinite(total) or total == 0.0:
         return total
