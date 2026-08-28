@@ -110,8 +110,15 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
     stream: bool | None = None
     seed: int | None = None
+    #: OpenAI's knob, mapped to a thinking-token budget (see _THINK_BUDGET)
+    reasoning_effort: str | None = None
 
     model_config = {"populate_by_name": True}
+
+
+#: reasoning_effort -> tokens the model may spend inside <think> before the
+#: engine closes the block for it. "none" answers with no reasoning at all.
+_THINK_BUDGET = {"none": 0, "minimal": 128, "low": 512, "medium": 2048, "high": 8192}
 
 
 def _message_text(message: ChatMessage) -> str:
@@ -181,6 +188,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             max_new_tokens=req.max_tokens if req.max_tokens is not None else 512,
             seed=req.seed if req.seed is not None else secrets.randbits(31),
             stop_token_ids=tuple(getattr(tokenizer, "stop_token_ids", ())),
+            thinking_budget=_THINK_BUDGET.get((req.reasoning_effort or "").lower()),
+            end_think_ids=tuple(tokenizer.encode("</think>\n\n")),
         )
         return engine.submit(input_ids, params), len(input_ids), params.max_new_tokens
 

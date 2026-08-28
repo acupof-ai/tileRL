@@ -708,3 +708,28 @@ def test_opd_ema_self_teacher_shares_the_model():
     assert len(losses) == 2 and all(math.isfinite(x) for x in losses)
     moved = {k for k in before if not torch.equal(model.params[k], before[k])}
     assert moved and moved <= set(trainable)
+
+
+def test_thinking_budget_forces_the_block_closed():
+    """reasoning_effort: after the budget the engine emits end_think_ids
+    instead of sampling, and stops forcing once the block is closed."""
+    cfg = tiny()
+    engine = build_engine(cfg, build_random(cfg, seed=11), get_backend(), num_blocks=8,
+                          num_slots=4, max_batch=4, max_total_tokens=512)
+    end = (5, 6)
+    try:
+        wid = engine.submit(
+            [3, 4, 5],
+            SamplingParams(temperature=0.0, max_new_tokens=8, seed=0,
+                           thinking_budget=2, end_think_ids=end),
+        )
+        out = None
+        for _ in range(200):
+            engine.step()
+            if wid in (done := engine.poll()):
+                out = done[wid]
+                break
+    finally:
+        engine.shutdown()
+    assert out is not None and len(out) == 8
+    assert tuple(out[2:4]) == end  # forced at the budget, then sampling resumes

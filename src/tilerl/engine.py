@@ -81,6 +81,12 @@ class SamplingParams:
     #: restrict sampling to these ids (multiple-choice eval, constrained RL
     #: actions); None = full vocabulary
     allowed_ids: tuple[int, ...] | None = None
+    #: thinking effort: force ``end_think_ids`` after this many generated
+    #: tokens if the model has not closed its reasoning block itself. 0 = do
+    #: not think at all; None = unbounded. The ids are the caller's, so the
+    #: engine stays tokenizer-free.
+    thinking_budget: int | None = None
+    end_think_ids: tuple[int, ...] = ()
 
 
 def _restrict(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
@@ -111,6 +117,7 @@ class _Req:
     prefill_from: int  # prefix-reuse offset for the prefill forward
     own_blocks: int  # blocks the engine allocated (vs adopted from a hit)
     output: list[int] = field(default_factory=list)
+    thought_closed: bool = False  # the reasoning block ended (model's or forced)
 
 
 @dataclass
@@ -647,10 +654,21 @@ class Engine:
             self._after_sample(req, int(tok), generated_idx)
 
     def _after_sample(self, req: _Req, tok: int, generated_idx: int) -> None:
-        if tok in req.params.stop_token_ids:
+        p = req.params
+        if (
+            p.thinking_budget is not None
+            and p.end_think_ids
+            and not req.thought_closed
+            and len(req.output) >= p.thinking_budget
+        ):  # budget spent: close the reasoning block instead of sampling
+            tok = p.end_think_ids[len(req.output) - p.thinking_budget]
+        elif tok in req.params.stop_token_ids:
             self._finish(req)
             return
         req.output.append(tok)
+        n = len(p.end_think_ids)
+        if n and not req.thought_closed and tuple(req.output[-n:]) == p.end_think_ids:
+            req.thought_closed = True
         req.tokens.append(tok)
         req.seq_len += 1
         self._tokens_generated += 1
