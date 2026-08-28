@@ -4,6 +4,13 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — verdict: vs sglang on the same H20 — B=1 1.68× faster, B=8 0.8×, prefill 0.4×
+
+- sglang (bf16, since it cannot run NVFP4 on Hopper) B=1 54.2 / B=8 387 /
+  prefill 2512; sglang online-fp8 39.9 / 266.6 / 4022; tileRL 90.9 / 308.6 /
+  1836. Record with method and caveats:
+  `docs/experience/2026-08-28-vs-sglang-h20.md`.
+
 ## 2026-08-28 — phase exit: decode nearly depth-flat — B=1 90.9 @512, 78.6 @32k; B=8 agg 308.6
 
 - Quiet-host gate over the f16 fp8 mma8 + split-KV attention + fused rmsnorm
