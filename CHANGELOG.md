@@ -4,6 +4,30 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — phase exit: 27B LoRA training is 28-40x faster — the step was launch-bound
+
+- One train_step issued **671,123 kernel launches** (8 layers, 1x64); every
+  tileRL kernel was in the double digits and 668K were 1-3 us torch micro-ops
+  from `gdn_backward`'s Python loop over (time step, value head). Vectorizing
+  both scans over heads: **0.8 -> 26.5 / 32.6 / 38.2 tok/s** at 1x64/128/256,
+  20,753 kernels. Two earlier hypotheses (the fp4 dequant; GDN being expensive
+  to compute) were both wrong and are recorded as such.
+  [wins/2026-08-28-gdn-backward-launch-bound.md](docs/experience/wins/2026-08-28-gdn-backward-launch-bound.md)
+- The frozen-base backward is now one fused dequant+GEMM kernel (`gx = grad @ W`
+  contracts over the weight's ROW index, so a packed slab is already gemm_nn's
+  B tile — no transpose, no materialized weight). Worth 1.18x on its own.
+- Bundled NextN draft head loads and drafts: **64.5% greedy acceptance** at
+  depth 4 (agent-infer records 33% for this checkpoint). Small sample, random
+  prompt — re-measure before wiring the engine loop.
+
+## 2026-08-28 — verdict: mma8 bf16 block scales rejected (flat), KV split count by occupancy accepted
+
+- Splits by occupancy (B=1 grid was 64 blocks on 78 SMs): B=1 decode
+  **92.4 / 88.9 / 80.1** at 512/8k/32k, +1.1-1.9%.
+  [wins/2026-08-28-decode-split-by-occupancy.md](docs/experience/wins/2026-08-28-decode-split-by-occupancy.md)
+- bf16/f16 scales measured 0.998x / 0.991x at B=8 and were reverted.
+  [errors/2026-08-28-mma8-bf16-scale-no-gain.md](docs/experience/errors/2026-08-28-mma8-bf16-scale-no-gain.md)
+
 ## 2026-08-28 — eval: MMLU 0-shot 76.3% on the 27B NVFP4, and the first 128K/256K rows
 
 - `SamplingParams.allowed_ids` (logit mask over the answer-letter ids) turns a
