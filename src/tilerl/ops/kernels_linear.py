@@ -390,6 +390,19 @@ __device__ __forceinline__ void tl_fp8_gemv_tiles(const void *w8v, const void *x
 // lane's elements sit in one 16-block, so one scale per lane per chunk,
 // applied on the B fragment (bf16 mul, exact: block scales are e4m3 values).
 // acc[grp*4 + {0,1}] = C rows g, cols 8*grp + 2q + {0,1}; {2,3} are junk rows.
+// One twiddled u32 (8 consecutive k) -> 8 scaled bf16, written as one 16-byte
+// store. The frozen-base backward needs the whole weight in bf16; the reference
+// path builds it with an int64 nibble tensor and a repeat_interleave, ~1.5 GB of
+// temporaries per call and 448 calls per training step.
+__device__ __forceinline__ void tl_fp4_dequant8(const void *wqv, float s, void *outv) {
+  unsigned d[4];
+  tl_fp4_decode8(*(const unsigned *)wqv, d);
+  unsigned s2;
+  asm("cvt.rn.bf16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(s));
+#pragma unroll
+  for (int i = 0; i < 4; ++i) asm("mul.bf16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
+  *(uint4 *)outv = make_uint4(d[0], d[1], d[2], d[3]);
+}
 // GROUP fp4 tiles (16 elems = 8 twiddled bytes each), loaded straight from
 // global into registers first (same rationale as tl_fp8_gemv_tiles). Tiles
 // are block_K elements apart: W stride block_K/2 bytes, X stride 2*block_K.
@@ -1156,3 +1169,41 @@ def make_linear_fp8_mma(target: str):
         return Y
 
     return linear_fp8
+
+
+# ---------------------------------------------------------------- fp4 dequant
+
+
+def make_dequant_fp4_bf16(target: str, THREADS: int = 256):
+    """Served (twiddled) fp4 -> a bf16 weight [N, K], scales folded in.
+
+    Only the frozen-base backward needs a materialized weight (dX contracts
+    over N, which the packed layout cannot stream). One thread per 8 elements:
+    one 4-byte load, one decode, one 16-byte store.
+    """
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def dequant_fp4_bf16(WQ, Scale, OScale, block):
+        N, K = T.const("N, K")
+        assert block % 8 == 0  # a thread's 8 elements never cross a scale block
+        WQ: T.Tensor((N, K // 2), "uint8")
+        Scale: T.Tensor((N, K // block), "float32")
+        OScale: T.Tensor((N,), "float32")  # per-row epilogue scale, folded
+        W = T.empty((N, K), "bfloat16")
+        groups = K // 8
+        with T.Kernel(N, threads=THREADS) as bn:
+            T.import_source(_FP4_TWIDDLE_SRC)
+            tx = T.thread_binding(0, THREADS, thread="threadIdx.x")
+            for i in T.serial(T.ceildiv(groups, THREADS)):
+                g = i * THREADS + tx
+                if g < groups:
+                    T.call_extern(
+                        "tl_fp4_dequant8",
+                        T.access_ptr(WQ[bn, g * 4], "r"),
+                        Scale[bn, g * 8 // block] * OScale[bn],
+                        T.access_ptr(W[bn, g * 8], "w"),
+                        dtype="void",
+                    )
+        return W
+
+    return dequant_fp4_bf16

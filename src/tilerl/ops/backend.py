@@ -659,7 +659,29 @@ class Backend:
         )
 
     def linear_frozen_bwd(self, grad, wq, scale, oscale=None, fp8=False):
-        # ponytail: torch-eager backward, transposed fp4 GEMM when perf demands
+        """dX through a frozen quantized weight — no weight grad.
+
+        dX contracts over N, which the packed layout cannot stream, so the
+        weight is materialized. The reference dequant costs ~1.5 GB of int64
+        temporaries per call and this runs 448 times a training step; the
+        kernel does it in one pass, bf16 out, scales folded.
+        """
+        if not fp8 and "dequant_fp4_bf16" in _resolve(self.precision, self.arch):
+            wq = self._served_fp4(wq)
+            n, k = wq.shape[0], wq.shape[1] * 2
+            osc = self._ones(n) if oscale is None else self._const_f32(oscale, n)
+            w = self._kernel("dequant_fp4_bf16")(
+                wq, self._const_f32(scale), osc, k // self._f32(scale).shape[1]
+            )
+            g = self._c(self._bf16(grad).reshape(-1, grad.shape[-1]))
+            gx = self._kernel("gemm_nn")(
+                _pad2d(g, _round_up(g.shape[0], 64), _round_up(g.shape[1], 32)),
+                _pad2d(w, _round_up(n, 32), _round_up(k, 64)),
+                _snap_mma_tile(min(64, g.shape[0]), 64), _snap_mma_tile(min(64, k), 64),
+                _THREADS,
+            )[: g.shape[0], :k]
+            return gx.reshape(*grad.shape[:-1], k)
+        # ponytail: torch-eager backward, tilelang dequant only exists for fp4
         return reference.linear_frozen_bwd(grad, wq, scale, oscale=oscale, fp8=fp8)
 
     def attention_bwd(self, grad, q, k, v, scale):
