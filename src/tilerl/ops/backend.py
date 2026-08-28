@@ -369,14 +369,17 @@ class Backend:
             kernel, Mp, Np, Kp, bM, bN = plan
             # K-tail: zero-padded X, and padded nibbles (0x00) decode to 0.0.
             wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
-            if 2 <= M <= _MX and "linear_fp4_gemv_mx" in _resolve(self.precision, self.arch):
-                # Batched decode: the register-resident-X GEMV beats the padded
-                # WGMMA w4a8 path (weights read once, no A quant, no atomics).
-                osc = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
+            lo = 1 if os.environ.get("TILERL_MMA8_M1") else 2  # ponytail: A/B knob for M=1
+            if lo <= M <= _MX and "linear_fp4_mma8" in _resolve(self.precision, self.arch):
+                # Batched decode on the tensor cores (Marlin-style); Np is a
+                # multiple of 32 here (the plan pads N to the 32-row block).
+                Np32 = _round_up(N, 32)
+                wq, scale = _pad2d(wq, Np32, Kp // 2), _pad2d(scale, Np32, Kp // blk)
+                osc = self._ones(Np32) if oscale is None else self._const_f32(oscale, Np32)
                 xm = _pad2d(x2, _MX, Kp)
                 res = None if residual is None else self._f32(residual).reshape(M, N)
-                r2 = self._zeros2(_MX, Np) if res is None or Np != N else _pad2d(res, _MX, N)
-                y2 = self._kernel("linear_fp4_gemv_mx")(xm, wq, scale, osc, r2, 32, blk)[:M, :N]
+                r2 = self._zeros2(_MX, Np32) if res is None or Np32 != N else _pad2d(res, _MX, N)
+                y2 = self._kernel("linear_fp4_mma8")(xm, wq, scale, osc, r2, blk)[:M, :N]
                 y = y2.reshape(*lead, N)
                 return y if res is None or r2.shape[1] == N else y + residual
             if M == 1:
@@ -435,12 +438,16 @@ class Backend:
         x2 = _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(M, K)), Mp, Kp)
         w8 = _pad2d(self._dev(w8, w8.dtype), Np, Kp)
         wscale = _pad2d(self._const_f32(wscale), -(-Np // 128), Kp // 128)
-        if 2 <= M <= _MX and "linear_fp8_gemv_mx" in _resolve(self.precision, self.arch):
-            osc = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
+        lo = 1 if os.environ.get("TILERL_MMA8_M1") else 2  # ponytail: A/B knob for M=1
+        if lo <= M <= _MX and "linear_fp8_mma8" in _resolve(self.precision, self.arch):
+            Np32 = _round_up(N, 32)
+            w8 = _pad2d(w8, Np32, Kp)
+            wscale = _pad2d(wscale, -(-Np32 // 128), Kp // 128)
+            osc = self._ones(Np32) if oscale is None else self._const_f32(oscale, Np32)
             xm = _pad2d(x2, _MX, Kp)
             res = None if residual is None else self._f32(residual).reshape(M, N)
-            r2 = self._zeros2(_MX, Np) if res is None or Np != N else _pad2d(res, _MX, N)
-            y2 = self._kernel("linear_fp8_gemv_mx")(xm, w8, wscale, osc, r2, 32)[:M, :N]
+            r2 = self._zeros2(_MX, Np32) if res is None or Np32 != N else _pad2d(res, _MX, N)
+            y2 = self._kernel("linear_fp8_mma8")(xm, w8, wscale, osc, r2)[:M, :N]
             y = y2.reshape(*lead, N)
             return y if res is None or r2.shape[1] == N else y + residual
         if M == 1:
