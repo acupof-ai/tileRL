@@ -126,7 +126,9 @@ class DraftHead:
         # fc consumes concat(norm_embed(t), norm_hidden(h)) — embed first, per
         # agent-infer's qwen35_spec.rs:40-55; the other order looks like a head
         # that simply does not predict.
-        x = backend.linear(torch.cat([e, hidden], dim=-1), self.params["fc"])
+        # Through the Model seam, not backend.linear: fc is served in whatever
+        # format the head was quantized to, exactly like every other projection.
+        x = self.layers._linear(backend, torch.cat([e, hidden], dim=-1), "fc")
         for i in range(self.cfg.num_layers):
             x = self.layers._full_attn(i, x, positions, kv, backend)
             x = self.layers._mlp(i, x, kv, backend)

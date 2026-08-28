@@ -33,6 +33,7 @@ __all__ = [
     "unpack_fp4",
     "dequant_nvfp4",
     "dequant_fp8",
+    "quant_fp8",
     "linear_fp8",
     "dequant_awq",
     "dense_attention",
@@ -341,6 +342,31 @@ def dequant_fp8(w8: torch.Tensor, wscale: torch.Tensor, block: int = 128) -> tor
     s = wscale.float().repeat_interleave(block, dim=-1)[:, :k]
     s = s.repeat_interleave(block, dim=-2)[:n, :]
     return w8.float() * s
+
+
+def quant_fp8(w: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inverse of :func:`dequant_fp8`: bf16/f32 [N,K] -> (e4m3 [N,K], f32 scales
+    [ceil(N/block), ceil(K/block)]). One scale per 128x128 block, from its
+    absmax against e4m3's 448 range."""
+    n, k = w.shape
+    pn, pk = -n % block, -k % block
+    wp = torch.nn.functional.pad(_f32(w), (0, pk, 0, pn))
+    blocks = wp.reshape(wp.shape[0] // block, block, wp.shape[1] // block, block)
+    scale = blocks.abs().amax((1, 3)).clamp_min(1e-12) / 448.0
+    q = (blocks / scale[:, None, :, None]).reshape(wp.shape)
+    return q[:n, :k].to(torch.float8_e4m3fn).contiguous(), scale.contiguous()
+
+
+if __name__ == "__main__":  # runnable check: quant_fp8 inverts dequant_fp8
+    torch.manual_seed(0)
+    _w = torch.randn(300, 260, dtype=torch.bfloat16) * 0.02
+    _q, _s = quant_fp8(_w)
+    assert _q.shape == _w.shape and _s.shape == (3, 3), (_q.shape, _s.shape)
+    # e4m3 keeps 3 mantissa bits, so ~6% per element near a block's absmax; the
+    # gate that matters is the served model's accuracy, not this bound.
+    _rel = (dequant_fp8(_q, _s) - _w.float()).abs().max() / _w.float().abs().max()
+    assert _rel < 0.06, _rel
+    print("reference: quant_fp8 round-trip OK, rel", float(_rel))
 
 
 def linear_fp8(x, w8, wscale, oscale=None) -> torch.Tensor:

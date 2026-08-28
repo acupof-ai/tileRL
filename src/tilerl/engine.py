@@ -70,6 +70,23 @@ _PHASE_DONE = 3
 _HASH_MASK = 0x7FFFFFFF
 
 
+def _quantize_draft(params: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Re-serve a draft head's dense weights as block-quantized fp8.
+
+    Norms, embeddings and anything 1-D stay as they are; only the [N,K]
+    projections move, which is where all of the head's bulk and all of its time
+    is."""
+    from .ops import reference
+
+    out: dict[str, torch.Tensor] = {}
+    for k, v in params.items():
+        if v.ndim == 2 and v.shape[0] >= 128 and v.shape[1] >= 128:
+            out[f"{k}.w8"], out[f"{k}.wscale"] = reference.quant_fp8(v)
+        else:
+            out[k] = v
+    return out
+
+
 def _step_seed(seed: int, generated: int) -> int:
     """Deterministic per-(request, position) sampling seed.
 
@@ -292,15 +309,14 @@ class Engine:
         self._draft = draft
         self._spec_depth = spec_depth if draft is not None else 0
         if draft is not None:
-            # The head's weights are plain bf16 while every activation inside it
-            # is f32 (rmsnorm's output), so Backend.linear re-cast all 849 MB on
-            # EVERY call — 9.7 ms per projection against the trunk's 0.13 ms.
-            # Casting once makes the boundary cast a no-op.
-            # ponytail: 1.7 GB f32; quantizing the head like the trunk halves it.
-            draft.params = {
-                k: v.to(backend.device, torch.float32)
-                for k, v in backend.materialize(draft.params).items()
-            }
+            # The head ships dense bf16, which Backend.linear serves on its
+            # generic path at ~30 GB/s: 9.7 ms per projection against 0.13 ms
+            # for the same shape on the trunk's fp8 kernel, so one draft step
+            # cost more than the whole 64-layer trunk forward. Serve it the way
+            # the trunk is served — Model._linear picks .w8/.wscale up itself.
+            served = backend.materialize(_quantize_draft(draft.params))
+            draft.params.clear()  # in place: DraftHead.layers holds the same dict
+            draft.params.update(served)
             if not 0 < spec_depth < BLOCK_TOKENS:
                 raise ValueError(f"spec_depth must be in [1, {BLOCK_TOKENS}), got {spec_depth}")
             self._draft_kv = PagedKvPool(
