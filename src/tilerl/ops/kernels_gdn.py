@@ -192,6 +192,15 @@ def make_gdn_decode_fused(target: str):
 # ---------------------------------------------------------------- gated-delta chunk prefill (fused)
 
 
+def _halvings(n: int) -> list[int]:
+    """[n/2, n/4, ..., 1] — the offsets of a shared-memory tree reduce."""
+    out = []
+    while n > 1:
+        n //= 2
+        out.append(n)
+    return out
+
+
 def make_gdn_chunk_fused(target: str):
     """Fused gated-delta chunk prefill core (sm90): the T>1 generalization of
     make_gdn_decode_fused. One block per (value head, batch); thread tv owns
@@ -338,9 +347,9 @@ def make_gdn_chunk_fused(target: str):
                 red_q[tv] = q_s[tv] * q_s[tv]
                 red_k[tv] = k_s[tv] * k_s[tv]
                 T.tvm_storage_sync("shared")
-                step = kdim  # python int (K is symbolic): unrolls on the host
-                while step > 1:
-                    step //= 2
+                # host-side unroll over python ints: a `while` here is caught
+                # by tilelang's eager builder as a symbolic loop
+                for step in _halvings(kdim):
                     if tv < step:
                         red_q[tv] += red_q[tv + step]
                         red_k[tv] += red_k[tv + step]

@@ -22,7 +22,10 @@ def main() -> None:
     ap.add_argument("source")
     ap.add_argument("--gpu", type=int, default=None)
     ap.add_argument("--depth", type=int, default=4, help="draft tokens per block")
-    ap.add_argument("--blocks", type=int, default=16, help="draft blocks to score")
+    ap.add_argument("--gen", type=int, default=256,
+                    help="tokens of continuation to score over — FIXED across depths, or "
+                         "a deeper draft simply generates further into the model's "
+                         "repetition regime and reads as a higher acceptance")
     ap.add_argument("--prompt-len", type=int, default=128)
     ap.add_argument("--text", default=None, help="real prompt (default: random ids)")
     ap.add_argument("--embed-first", action="store_true", help="fc sees concat(embed, hidden)")
@@ -52,7 +55,7 @@ def main() -> None:
           f"{'hidden,embed' if draft.hidden_first else 'embed,hidden'}")
 
     # Two pools: the trunk's full-attn planes, and one plane for the draft layer.
-    nblk = -(-(args.prompt_len + args.blocks * (args.depth + 1) + 64) // BLOCK_TOKENS) + 2
+    nblk = -(-(args.prompt_len + args.gen + args.depth + 64) // BLOCK_TOKENS) + 2
     trunk_pool = PagedKvPool(nblk, cfg.num_kv_heads, cfg.head_dim,
                              num_layers=len(cfg.full_attn_layers), device=backend.device,
                              layer_map=cfg.full_attn_layers)
@@ -87,8 +90,10 @@ def main() -> None:
     logits = trunk.forward(arr([ids]), arr(range(len(ids))),
                            kv_for(trunk_pool, len(ids), len(ids)), backend, hidden_out=hid)
     accepted = total = 0
+    blocks = 0
     per_pos = [0] * args.depth  # how often draft j survives — sets the useful depth
-    for _ in range(args.blocks):
+    while len(ids) - args.prompt_len < args.gen:
+        blocks += 1
         nxt = int(logits[0, -1].argmax())
         h = hid[-1][:, -1:, :]
         chain, dpos = [nxt], len(ids)
@@ -111,9 +116,9 @@ def main() -> None:
                 break
             accepted += 1
             per_pos[j] += 1
-    n = args.blocks
-    print(f"depth {args.depth}, {n} blocks: accepted {accepted}/{total} "
-          f"= {100 * accepted / max(total, 1):.1f}%")
+    n = blocks
+    print(f"depth {args.depth}, {args.gen} generated tokens ({n} blocks): "
+          f"accepted {accepted}/{total} = {100 * accepted / max(total, 1):.1f}%")
     print("  survival by position:", " ".join(f"{c / n:.2f}" for c in per_pos))
     # tokens per trunk forward = 1 bonus + expected accepted drafts
     print(f"  tokens per verify: {1 + accepted / n:.2f}  (1.00 = no speculation)")
