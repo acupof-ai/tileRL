@@ -25,6 +25,7 @@ def main() -> None:
     ap.add_argument("--blocks", type=int, default=16, help="draft blocks to score")
     ap.add_argument("--prompt-len", type=int, default=128)
     ap.add_argument("--text", default=None, help="real prompt (default: random ids)")
+    ap.add_argument("--embed-first", action="store_true", help="fc sees concat(embed, hidden)")
     args = ap.parse_args()
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -43,9 +44,12 @@ def main() -> None:
     backend = get_backend()
     cfg = qwen38_27b()
     trunk = load_hf(cfg, args.source, fuse_projections=True)
-    draft = load_draft(trunk, Path(args.source) / "model_mtp.safetensors")
+    draft = load_draft(trunk, Path(args.source) / "model_mtp.safetensors",
+                       hidden_first=not args.embed_first)
     draft.params = backend.materialize(draft.params)
-    print(f"draft: {draft.cfg.num_layers} layer(s), confidence head: {draft.has_confidence}")
+    print(f"draft: {draft.cfg.num_layers} layer(s), confidence head: "
+          f"{draft.has_confidence}, fc order: "
+          f"{'hidden,embed' if draft.hidden_first else 'embed,hidden'}")
 
     # Two pools: the trunk's full-attn planes, and one plane for the draft layer.
     nblk = -(-(args.prompt_len + args.blocks * (args.depth + 1) + 64) // BLOCK_TOKENS) + 2

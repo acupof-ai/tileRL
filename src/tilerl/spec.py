@@ -97,7 +97,8 @@ class DraftHead:
     the draft's own softmax probability stands in.
     """
 
-    def __init__(self, trunk: Any, params: dict[str, torch.Tensor], num_layers: int = 1) -> None:
+    def __init__(self, trunk: Any, params: dict[str, torch.Tensor], num_layers: int = 1,
+                 hidden_first: bool = True) -> None:
         from .model import Model
 
         self.trunk = trunk
@@ -108,6 +109,10 @@ class DraftHead:
         self.cfg = cfg
         self.layers = Model(cfg, params)
         self.has_confidence = "confidence.weight" in params
+        #: fc consumes concat(hidden, embed) or concat(embed, hidden) — the
+        #: checkpoint does not say which, and the wrong order looks like a
+        #: head that simply does not predict (6% first-token acceptance).
+        self.hidden_first = hidden_first
 
     def forward(self, hidden, ids, positions, kv, backend, hidden_out=None) -> torch.Tensor:
         """hidden [B,T,H] (trunk's pre-final-norm state), ids [B,T] (the token
@@ -123,7 +128,8 @@ class DraftHead:
         if "pre_fc_norm_embedding" in self.params:  # Qwen NextN: both sides normed
             e = backend.rmsnorm(e, self.params["pre_fc_norm_embedding"], eps)
         hidden = backend.rmsnorm(hidden, self.params["pre_fc_norm_hidden"], eps)
-        x = backend.linear(torch.cat([e, hidden], dim=-1), self.params["fc"])
+        pair = [hidden, e] if self.hidden_first else [e, hidden]
+        x = backend.linear(torch.cat(pair, dim=-1), self.params["fc"])
         for i in range(self.cfg.num_layers):
             x = self.layers._full_attn(i, x, positions, kv, backend)
             x = self.layers._mlp(i, x, kv, backend)
@@ -154,7 +160,7 @@ _DRAFT_TOP = {
 }
 
 
-def load_draft(trunk: Any, path: str | Path) -> DraftHead:
+def load_draft(trunk: Any, path: str | Path, hidden_first: bool = True) -> DraftHead:
     """Load a draft head from one safetensors file beside the trunk."""
     from safetensors import safe_open
 
@@ -178,4 +184,4 @@ def load_draft(trunk: Any, path: str | Path) -> DraftHead:
     if missing:
         raise RuntimeError(f"draft head {path}: missing {sorted(missing)}")
     n = 1 + max((int(k.split(".")[1]) for k in params if k.startswith("layers.")), default=0)
-    return DraftHead(trunk, params, num_layers=n)
+    return DraftHead(trunk, params, num_layers=n, hidden_first=hidden_first)
