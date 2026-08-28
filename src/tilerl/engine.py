@@ -292,6 +292,10 @@ class Engine:
         self._draft = draft
         self._spec_depth = spec_depth if draft is not None else 0
         if draft is not None:
+            # The head arrives straight off safetensors, on the host. Left there
+            # it re-crosses PCIe every draft step: 849 MB at ~20 GB/s made one
+            # draft step as expensive as the whole 64-layer trunk tick.
+            draft.params = backend.materialize(draft.params)
             if not 0 < spec_depth < BLOCK_TOKENS:
                 raise ValueError(f"spec_depth must be in [1, {BLOCK_TOKENS}), got {spec_depth}")
             self._draft_kv = PagedKvPool(

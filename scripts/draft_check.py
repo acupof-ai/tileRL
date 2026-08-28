@@ -49,7 +49,6 @@ def main() -> None:
     cfg = qwen38_27b()
     trunk = load_hf(cfg, args.source, fuse_projections=True)
     draft = load_draft(trunk, Path(args.source) / "model_mtp.safetensors")
-    draft.params = backend.materialize(draft.params)
     if args.swap_fc:
         # The engine concatenates [embed, hidden]; swapping fc's two column
         # halves tests the other order without a flag in the engine.
