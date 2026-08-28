@@ -58,18 +58,30 @@ all-reduce per sublayer (64 layers × 2 ≈ 128 all-reduces/tick; at ~10 µs on
 NV18 that is ~1.3 ms — acceptable for decode, negligible for training).
 Attention TP = one KV head per card (8 heads / 8 cards) ⇒ the 32k KV
 problem is solved by the same cut. GDN TP = value heads split (48 / 8).
-- **Collectives, two layers behind one `tilerl/ops/comm.py` seam.** Training
-  traffic (grad all-reduce, ZeRO shards, CP ring: MB–GB) goes through
-  `torch.distributed` NCCL — the "torch is a container" rule bars autograd
-  and optim, not transport, and nothing else is as mature. Decode TP traffic
-  is 10 KB per all-reduce, 128 times per tick: NCCL's ~15 µs floor would be
-  ~2 ms of a ~3 ms TP-8 tick, so those go through a TileLang CUDA-IPC
-  one-shot all-reduce kernel (each card writes its slice into peers' mapped
-  buffers, one kernel reduces; ~3–5 µs, graph-capturable by construction,
-  later fusable into the GEMV epilogue — the vLLM / TensorRT-LLM design in
-  our one backend). Alternatives priced and declined: raw NCCL via ctypes
-  (same latency, re-implements rendezvous), NVSHMEM (only pays for MoE
-  all-to-all; this model has none).
+- **Collectives: both NCCL and CUDA-IPC, behind one `tilerl/ops/comm.py`
+  seam.** Direction: the seam exposes `all_reduce / all_gather /
+  reduce_scatter / send_recv(ring)`; two transports implement it and the
+  seam picks per call by message size and capture context.
+  - NCCL (`torch.distributed`): every message ≥ 256 KB — grad all-reduce,
+    ZeRO shards, CP ring K/V exchange, GDN scan states. The "torch is a
+    container" rule bars autograd/optim, not transport; nothing else is as
+    mature for large messages, and it is graph-capturable (NCCL ≥ 2.9).
+  - CUDA-IPC one-shot all-reduce as a TileLang kernel: messages < 256 KB —
+    decode TP's 10 KB per sublayer, 128 per tick. Each card writes its slice
+    into peers' mapped buffers, one kernel reduces (vLLM/TensorRT-LLM
+    design); graph-capturable by construction and fusable into the GEMV
+    epilogue later.
+  - Basis for the split: NCCL's small-message floor is ~15 µs → 128 × 15 µs
+    ≈ 2 ms of a ~3 ms TP-8 decode tick; a one-shot IPC kernel is ~3–5 µs.
+    Above ~256 KB NCCL's bandwidth wins and the floor is amortized. The
+    exact crossover is MEASURED, not assumed: a `scripts/ab_comm.py`
+    microbench sweeps 1 KB–64 MB on both transports and writes the threshold
+    into `comm.py` (bench entry).
+  - Fallback: IPC requires peer access on one node (NV18 here); the seam
+    falls back to NCCL when peers are not mappable, so a run never depends
+    on the fast path for correctness.
+  - Priced and declined: raw NCCL via ctypes (same latency, re-implements
+    rendezvous), NVSHMEM (pays only for MoE all-to-all; this model has none).
 - Gate: TP-8 decode tick vs TP-1 (expect ~1.4 ms + weights/8 ⇒ B=1 tick ≈
   3 ms, >300 tok/s single stream); loss bit-identical to TP-1 on tiny
   (deterministic reduce order); harness rows per TP degree.
@@ -134,6 +146,29 @@ Does not transfer: DTensor and `fully_shard` (they are torch.autograd
 machinery — our tape owns backward), `torch.compile`, and their ring
 attention (SDPA-specific); we write ring attention and the GDN scan as
 TileLang kernels on top of the comm seam.
+
+## Iteration basis — what decides each step
+
+The loop that produced 52.6 → 90.9 tok/s applies unchanged
+(`docs/experience/2026-08-28-decode-52-to-84.md`): a gated harness row per
+metric, an in-graph or ncu measurement before ranking levers, one change per
+A/B, every result recorded (wins/ or errors/) including the dead ones.
+
+| phase | the number that decides it | already measured | decision rule |
+|---|---|---|---|
+| P0 backward kernels | per-op backward parity at 27B dims; train tok/s | 5 backwards torch-eager; 27B masters OOM | ship when parity ≤ 1e-2 and train-suite tok/s ≥ 0.97× snapshot |
+| P1 LoRA-OPD | loss on a held set; MMLU 0-shot; rollout tok/s | MMLU runner exists; B=1 decode 90.9 | MMLU non-regression vs base is the gate, loss curves are not |
+| P2 batch decode B≥32 | harness B=32 row | B=8 agg 308.6; mma8 at 21% occupancy (128 regs) | ≥ 3× the B=8 aggregate; otherwise register control first |
+| P3 TP-8 | TP-8 tick vs TP-1; comm µs per sublayer | NCCL floor ~15 µs; NV18 mesh | IPC below the measured crossover, NCCL above; bit-identical loss on tiny |
+| P4 CP | 32k gradient vs single card; per-card activation bytes; tok/s vs 590/card ceiling | CP design in agent-infer (`CpContext`); GDN scan formula | tape gradcheck of the scan on tiny BEFORE any 27B run |
+| P5 full-param | memory/card at 32k; MFU; MMLU after re-quantization | 336 GB mixed-precision total | ≤ 60 GB/card, MFU ≥ 40%, MMLU flat |
+| P6 SOTA | rollout tok/s, train tok/s, s/round vs verl/OpenRLHF/slime | sglang comparison method | numbers set the next round's targets; no adjectives |
+
+Standing rules from today that apply to every phase: one timing job per
+host (other tenants' load moved rows 60%); price kernels in-graph or under
+ncu, never with the eager harness (~40 µs floor); every kernel shape comes
+from a bounded bucket (the MMLU run compiled 662 variants when the prefill
+width tracked prompt length).
 
 ## Order and why
 
