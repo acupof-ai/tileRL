@@ -90,12 +90,12 @@ def main() -> None:
         acc = (s1["spec_accepted"] - s0["spec_accepted"]) / max(drafted, 1)
         print(f"  {B:>3} {ms:>9.3f} {per_tick:>9.2f} {100 * acc:>6.1f}% "
               f"{1000 * per_tick / ms:>18.1f} {1000 * B * per_tick / ms:>17.1f}")
-        done = {}
-        for _ in range(WARMUP + args.ticks + 8):  # drain to completion
-            done.update(engine.poll())  # poll clears per call; accumulate
-            if all(w in done for w in wids):
-                break
+        # Drain to completion: a slot is freed at finish, and the next B reuses
+        # the same pool — an under-sized drain exhausts it on the following arm.
+        done: dict = {}
+        while not all(w in done for w in wids):
             engine.step()
+            done.update(engine.poll())  # poll clears per call; accumulate
 
 
 if __name__ == "__main__":
