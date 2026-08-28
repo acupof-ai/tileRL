@@ -181,6 +181,13 @@ def load_draft(trunk: Any, path: str | Path) -> DraftHead:
             mapped = _param_key_for(bare)
             if mapped is not None:
                 params[mapped] = f.get_tensor(name)
+    # Every norm in this head is a zero-centered Qwen3_5RMSNorm. load_hf folds
+    # the +1 in at load; reading the head's file directly skips that, and a head
+    # whose norms all scale by ~0.2 instead of ~1.2 emits logits ANTI-correlated
+    # with the trunk (its argmax ranked 248191/248320).
+    for k, v in params.items():
+        if k.endswith(("norm", "pre_fc_norm_hidden", "pre_fc_norm_embedding")):
+            params[k] = (v.float() + 1.0).to(v.dtype)
     missing = {"fc", "norm", "pre_fc_norm_hidden"} - set(params)
     if missing:
         raise RuntimeError(f"draft head {path}: missing {sorted(missing)}")
