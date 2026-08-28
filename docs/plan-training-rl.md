@@ -67,12 +67,48 @@ then the phases as gates. Everything textbook is left out.
    rows 60%); every kernel shape comes from a bounded bucket (the first
    varied-length workload compiled 662 variants with the GPU idle).
 
+## 128K–256K RL is a hard requirement — the budget
+
+Per token of context the 16 full-attention layers hold 16 × 8 heads × 256 ×
+2 B × (K+V) = 131 KB of KV; the 48 GDN layers hold a constant state (that is
+the only reason 256K is feasible at all). So:
+
+| | 32K | 128K | 256K |
+|---|---:|---:|---:|
+| KV per sequence | 4.3 GB | 17 GB | 34 GB |
+| one card (22.8 GB weights): concurrent rollouts | 16 | 4 | **1** (57 GB) |
+| TP-8 (one KV head per card): concurrent rollouts per pod | 128 | 32 | 16 |
+| decode KV read per token / card, TP-1 → TP-8 | 1.3 → 0.2 ms | 5.3 → 0.7 ms | 10.6 → 1.3 ms |
+| B=1 decode estimate (11 ms weights tick + KV at ~65%): TP-1 / TP-8 | 77 (measured) / — | ~50 / ~80 tok/s | ~40 / ~80 tok/s |
+| prefill: attention FLOPs 2·n²·d·H·L | 0.3 PF | 4.5 PF | 18 PF ⇒ ~3 min on one card at 100 TF, ~25 s on TP-8 |
+| training a 256K sample, CP-8 + per-layer activation checkpoint | | | ~20 GB/card activations, ~2 min fwd+bwd per pod |
+
+What this forces, beyond the phases below:
+- **Single-card 256K must work first** (P1.5): engine limits (`max_total_tokens`
+  262144, 16 384 blocks per sequence, split-KV with more than 16 splits at
+  depth), harness rows d131072/d262144 at B=1 — no pool headroom games at
+  that depth, weights + KV = 57 GB of 96. Gate: the rows exist and the
+  256K→512-token decode curve is explained by KV bytes alone.
+- **Prefix cache is not optional at 256K**: rollouts of one prompt share the
+  prompt; a 256K prefill is minutes, so the block-aligned prefix + GDN state
+  snapshot (already shipped) must hit across the rollout batch. Gate:
+  kv-reuse suite at 128K prefix, hit rate 1.0, warm ≪ cold.
+- **Prefill attention at 256K is compute** (18 PFLOP): the dense MMA prefill
+  kernel needs the FlashAttention-3-class schedule (TMA + warp-specialized
+  WGMMA) or TP-8 hides it — both are P3-adjacent; today's 1.8k tok/s at 8K
+  says nothing about 256K.
+- **TP-8 (P3) is the concurrency lever, not a latency nicety**: 1 → 16
+  concurrent 256K rollouts per pod.
+- **CP-8 + activation checkpointing (P4) is the only way a 256K sample
+  trains**: without recompute the activations are ~1.6 TB.
+
 ## Phases as gates
 
 | phase | delivers | gate (numbers only) | effort |
 |---|---|---|---|
 | P0 | the five torch-eager backwards as TileLang; fp4/fp8 STE backward | per-op backward parity at 27B dims ≤ 1e-2; train suite tok/s ≥ 0.97× snapshot | 1–2 d |
 | P1 | LoRA-OPD / self-OPD (EMA adapter teacher), {student, EMA, Adam} snapshot as one unit | loss falls on a held set; MMLU 0-shot ≥ base | 2–3 d |
+| P1.5 | single-card 256K: engine limits, deeper split-KV, harness d131072/d262144 B=1, kv-reuse at 128K | rows exist; decode curve = KV bytes; prefix hit 1.0 at 128K | 1–2 d |
 | P2 | decode GEMM MX=32/64 | harness B=32 row ≥ 3× B=8 aggregate | 2 d |
 | P3 | TP-8 (KV head per card), `comm.py` with NCCL + IPC | TP-8 B=1 tick ≈ 3 ms; loss bit-identical to TP-1 on tiny; IPC/NCCL crossover measured | 3–4 d |
 | P4 | CP: ring attention + GDN prefix scan, head/tail balanced | 256k fwd+bwd on 8 cards; 32k gradients = single card to 1e-3; scan gradchecked on tiny first | 4–5 d |
