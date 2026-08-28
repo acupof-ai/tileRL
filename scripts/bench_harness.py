@@ -232,13 +232,18 @@ def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
         print(f"\n  (no draft head at {path}, spec suite skipped)")
         return
     print(f"\n=== speculative decode (depth {depth}, tok/s) ===")
-    print(f"  {'B':>3} {'ms/tick':>9} {'tok/tick':>9} {'accept':>7} {'agg tok/s':>10}")
-    for b in batches:
+    print(f"  {'B':>3} {'arm':>6} {'ms/tick':>9} {'tok/tick':>9} {'accept':>7} {'agg tok/s':>10}")
+    # Both arms measured here, identically: comparing a spec row against a
+    # decode row from another script is what made a 4.9x LOSS read as a 1.14x
+    # win this morning (that one was eager-vs-graph; this one would be
+    # settled-vs-not).
+    base: dict[int, float] = {}
+    for b, spec in [(b, s) for b in batches for s in (False, True)]:
         engine = build_engine(
             cfg, model, backend, num_blocks=512, num_slots=max(16, b), max_batch=max(8, b),
-            draft=load_draft(model, path), spec_depth=depth,
+            draft=load_draft(model, path) if spec else None, spec_depth=depth,
         )
-        for i in range(b):
+        for i in range(b):  # noqa: B007 - both arms share the prompt set
             engine.submit(
                 bk.rand_prompt(cfg.vocab_size, 16, seed=700 + i),
                 SamplingParams(temperature=0.0, max_new_tokens=(ticks + 20) * (1 + depth), seed=i),
@@ -259,8 +264,13 @@ def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
         drafted = s1["spec_drafted"] - s0["spec_drafted"]
         acc = (s1["spec_accepted"] - s0["spec_accepted"]) / max(drafted, 1)
         agg = 1000.0 * b * per_tick / ms
-        print(f"  {b:>3} {ms:>9.3f} {per_tick:>9.2f} {100 * acc:>6.1f}% {agg:>10.1f}")
-        gate.check("spec", f"d{depth}-b{b}", agg, spread=LAST_SPREAD)
+        arm = f"d{depth}" if spec else "plain"
+        print(f"  {b:>3} {arm:>6} {ms:>9.3f} {per_tick:>9.2f} {100 * acc:>6.1f}% {agg:>10.1f}"
+              + (f"   {agg / base[b]:.2f}x vs plain" if spec and base.get(b) else ""))
+        if spec:
+            gate.check("spec", f"d{depth}-b{b}", agg, spread=LAST_SPREAD)
+        else:
+            base[b] = agg
 
 
 def suite_prefill(gate, cfg, model, backend, lengths):
