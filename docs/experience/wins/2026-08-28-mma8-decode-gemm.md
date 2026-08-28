@@ -41,6 +41,16 @@ cap blocks/SM) > G=2 177.4; NG=8 needs N padded to 64 (illegal access as is).
 Next lever on this kernel is register count (scales in bf16 registers, fewer
 prefetch chunks with async copies), not launch shape.
 
+## f16 path for e4m3 (same day, later)
+
+The e4m3→bf16x2 bit placement cost 7 ops per pair; sm90's
+`cvt.rn.f16x2.e4m3x2` decodes a pair in one. The fp8 mma8 kernel now converts X bf16→f16 per chunk and runs
+`mma…f16.f16.f32` (f32 accumulate). The M=1 GEMV tile could NOT follow:
+its scalar `fma.rn.f16x2` accumulate overflows on this model's activations
+(errors entry same date) — it stays on bf16x2. Range is safe: every fp8 GEMM input is post-norm (GDN in_proj,
+out_proj gate, lm_head). Parity unchanged (fp8 M=8 1.6e-3); B=8 agg d512
+286.7 → **298.2**, d2k 254.7 → 274.6 (host load 27; quiet-host gate below).
+
 ## Rule
 
 For 2 ≤ M ≤ 8 the decode is the cost and the tensor cores are free: feed

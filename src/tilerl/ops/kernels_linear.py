@@ -329,6 +329,17 @@ __device__ __forceinline__ unsigned tl_e4m3x2_to_bf16x2(unsigned t) {
   asm("mul.bf16x2 %0, %0, %1;" : "+r"(r) : "r"(0x7B807B80u));
   return r;
 }
+__device__ __forceinline__ unsigned tl_bf16x2_to_f16x2(unsigned v) {
+  float lo = __uint_as_float(v << 16), hi = __uint_as_float(v & 0xffff0000u);
+  unsigned r;
+  asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+  return r;
+}
+__device__ __forceinline__ unsigned tl_e4m3x2_to_f16x2(unsigned short p) {
+  unsigned r;
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(p));
+  return r;
+}
 // GROUP tiles, loaded straight from global (uint4) into registers first —
 // tilelang locals handed to an extern by pointer land in local memory.
 // Tiles are block_K elements apart: W stride = block_K bytes, X stride =
@@ -420,9 +431,11 @@ __device__ __forceinline__ void tl_fp4_mma_k32(const void *wqv, int w_grp_stride
     }
   }
 }
-// e4m3 twin of tl_fp4_mma_k32: lane loads 8 bytes = 8 consecutive k of its
-// row (same virtual-k map), 4 bf16x2 pairs via bit placement, one 128-block
-// scale per lane per chunk.
+// e4m3 twin of tl_fp4_mma_k32 on the f16 tensor path: cvt.rn.f16x2.e4m3x2
+// decodes a byte pair in ONE instruction (the bf16 bit placement was 7), X is
+// converted bf16 -> f16 once per chunk (amortized over NG groups) and the mma
+// runs f16 x f16 -> f32. f16 range is safe: every fp8 GEMM input is post-norm
+// (GDN in_proj, out_proj gate, lm_head); e4m3 values are f16-exact.
 template <int NG, int G>
 __device__ __forceinline__ void tl_fp8_mma_k32(const void *w8v, int w_grp_stride, const void *xv,
                                                const float *sc, float *acc) {
@@ -442,28 +455,27 @@ __device__ __forceinline__ void tl_fp8_mma_k32(const void *w8v, int w_grp_stride
   const unsigned zero = 0u;
 #pragma unroll
   for (int c = 0; c < G; ++c) {
+    const unsigned a0 = tl_bf16x2_to_f16x2(xa[c].x), a2 = tl_bf16x2_to_f16x2(xa[c].y);
+    const unsigned a0b = tl_bf16x2_to_f16x2(xa[c].z), a2b = tl_bf16x2_to_f16x2(xa[c].w);
 #pragma unroll
     for (int g = 0; g < NG; ++g) {
-      unsigned lo0, hi0, lo1, hi1;
-      asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(lo0) : "r"(w[c][g].x));
-      asm("prmt.b32 %0, %1, 0, 0x4342;" : "=r"(hi0) : "r"(w[c][g].x));
-      asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(lo1) : "r"(w[c][g].y));
-      asm("prmt.b32 %0, %1, 0, 0x4342;" : "=r"(hi1) : "r"(w[c][g].y));
-      unsigned d[4] = {tl_e4m3x2_to_bf16x2(lo0), tl_e4m3x2_to_bf16x2(hi0),
-                       tl_e4m3x2_to_bf16x2(lo1), tl_e4m3x2_to_bf16x2(hi1)};
+      unsigned d[4] = {tl_e4m3x2_to_f16x2((unsigned short)(w[c][g].x)),
+                       tl_e4m3x2_to_f16x2((unsigned short)(w[c][g].x >> 16)),
+                       tl_e4m3x2_to_f16x2((unsigned short)(w[c][g].y)),
+                       tl_e4m3x2_to_f16x2((unsigned short)(w[c][g].y >> 16))};
       unsigned s2;
-      asm("cvt.rn.bf16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(sc[c * NG + g]));
+      asm("cvt.rn.f16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(sc[c * NG + g]));
 #pragma unroll
-      for (int i = 0; i < 4; ++i) asm("mul.bf16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
+      for (int i = 0; i < 4; ++i) asm("mul.f16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
       float *cc = acc + g * 4;
-      asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                    : "+f"(cc[0]), "+f"(cc[1]), "+f"(cc[2]), "+f"(cc[3])
-                   : "r"(xa[c].x), "r"(zero), "r"(xa[c].y), "r"(zero), "r"(d[0]), "r"(d[1]));
-      asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                   : "r"(a0), "r"(zero), "r"(a2), "r"(zero), "r"(d[0]), "r"(d[1]));
+      asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                    : "+f"(cc[0]), "+f"(cc[1]), "+f"(cc[2]), "+f"(cc[3])
-                   : "r"(xa[c].z), "r"(zero), "r"(xa[c].w), "r"(zero), "r"(d[2]), "r"(d[3]));
+                   : "r"(a0b), "r"(zero), "r"(a2b), "r"(zero), "r"(d[2]), "r"(d[3]));
     }
   }
 }

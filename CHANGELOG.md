@@ -4,6 +4,16 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — fp8 on the f16 tensor path (hardware e4m3 cvt) — B=8 agg 298 tok/s
+
+- `cvt.rn.f16x2.e4m3x2` (1 op/pair, was 7) in the fp8 mma8 kernel: X
+  converted bf16→f16 per chunk, f16 mma, f32 accumulate. Parity unchanged;
+  B=8 agg d512 286.7 → 298.2, d2k 254.7 → 274.6 (host loaded); verify 1–3
+  PASS. The same path in the M=1 fp8 GEMV tile collapsed greedy decode
+  (f16x2 accumulate overflows on this model's post-norm activations) and is
+  reverted — `docs/experience/errors/2026-08-28-f16-tile-overflow-scale-order.md`.
+  Entry: `docs/experience/wins/2026-08-28-mma8-decode-gemm.md`.
+
 ## 2026-08-28 — verdict: tensor-core decode GEMM for 2≤M≤8 — B=8 agg 286.7 tok/s (+31%)
 
 - `mma.sync.m16n8k16.bf16` fed straight by the twiddle decode (no re-packing:
