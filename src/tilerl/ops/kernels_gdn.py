@@ -295,7 +295,9 @@ def make_gdn_chunk_fused(target: str):
             pk = T.alloc_local((1,), "float32")
             sq = T.alloc_local((1,), "float32")
             sk = T.alloc_local((1,), "float32")
-            po = T.alloc_local((1,), "float32")
+            # fragment, not local: it is assigned from acc_o, and mixing a
+            # local with a fragment in one statement fails layout inference.
+            po = T.alloc_fragment((1,), "float32")
             so = T.alloc_local((1,), "float32")
 
             # per-token fragments, hoisted out of the serial scan
