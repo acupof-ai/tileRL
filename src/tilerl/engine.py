@@ -315,7 +315,9 @@ class Engine:
             # cost more than the whole 64-layer trunk forward. Serve it the way
             # the trunk is served — Model._linear picks .w8/.wscale up itself.
             served = backend.materialize(_quantize_draft(draft.params))
-            draft.params.clear()  # in place: DraftHead.layers holds the same dict
+            # In place, never rebound: DraftHead.layers is a Model holding THIS
+            # dict, and a fresh one leaves it reading the original bf16 weights.
+            draft.params.clear()
             draft.params.update(served)
             if not 0 < spec_depth < BLOCK_TOKENS:
                 raise ValueError(f"spec_depth must be in [1, {BLOCK_TOKENS}), got {spec_depth}")
@@ -928,8 +930,6 @@ def build_engine(
     """
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
     model.params = backend.materialize(model.params)
-    if draft is not None:
-        draft.params = backend.materialize(draft.params)
     kv_pool = PagedKvPool(
         num_blocks,
         cfg.num_kv_heads,
