@@ -1,46 +1,53 @@
-# "Chunkwise-WY is incompatible with decay-first" — wrong, and it cost a 1.36x prefill win
+# I called a measured rejection "an argument" — because I only found the argument
 
 ## Context
 
-`docs/experience/wins/2026-08-24-gdn-prefill-chunk.md` shipped
-`make_gdn_chunk_fused`: one block per (value head, batch), a SERIAL scan over
-all T tokens carrying the state in HBM. It justified not porting the tilelang
-chunkwise-WY prefill path with:
+`docs/experience/wins/2026-08-24-gdn-prefill-chunk.md` contains a one-line
+aside dismissing fla's chunk delta rule as "incompatible with decay-first".
+That line is wrong on the mathematics: the intra-chunk term it says is dropped
+is carried by `wy_fast`'s `W`/`U`, and the chunked form is the same recurrence
+reassociated (proved to 3.7e-07 in `reference.gdn_chunk_core`).
 
-> Not fla's chunk delta rule (that freezes chunk-start state — incompatible
-> with decay-first).
-
-That closed the question. Four days later the kernel is 28% of prefill GPU time
-(24 launches x 1773.6 us on an 8-layer profile) at roughly 1% of both rooflines,
-because a scan over T=2048 is 2048 serial steps no matter how wide the block.
+On 2026-08-29 I wrote an entry here concluding that chunkwise-WY had therefore
+been "ruled out on an argument, not a parity run", and that a 1.36x prefill win
+had been closed off for four days.
 
 ## Root Cause
 
-The claim reads the `chunk_delta_h` kernel in isolation. It does freeze the
-state at chunk start — but the intra-chunk delta interactions are not dropped,
-they are carried by its `W`/`U` inputs, which `wy_fast` builds from the
-inverted triangular UT matrix `A`
-(`tilelang/examples/gdn/example_wy_fast.py:113-127`):
+That conclusion was false, and this file is its retraction. The tree already
+held TWO measured rejections that I did not look for:
 
-    U = A @ (V * beta)
-    W = A @ (K * beta * exp(g))
+- `2026-08-25-gdn-prefill-wy-rejected.md` — a 2-kernel WY port, 2.6x slower.
+- `2026-08-25-gdn-chunked-gdr-rejected.md` — the full 6-kernel FlashQLA
+  pipeline ported from agent-infer, A/B'd at the real prefill-512 shapes:
+  serial 4.380 ms vs chunked **4.882 ms**, and `max|d|` 8.51 on the output at
+  scale=1.0 inputs because bf16 intermediates flow between the six stages.
 
-and the per-token decay is folded in as `V_new *= exp(g_last - g_i)` with
-`S *= exp(g_last)` (`example_chunk_delta_h.py:198-211`) — decay-first, at chunk
-granularity. The chunked form is the same recurrence reassociated, not a
-different rule.
+I searched the wins entry that made the claim and stopped there. Both
+rejections are in the same directory, both dated four days earlier, both with
+A/B tables.
 
-## Fix
+## What Survives
 
-Port the five-kernel pipeline (cumsum -> scaled_dot_kkt -> wy_fast ->
-chunk_delta_h -> chunk_o, ~1179 lines upstream) and gate it on parity against
-`reference.gdn_forward`, which is the only thing that could ever have settled
-this.
+The mathematics stands, and so does the distinction the old A/B actually
+measured. What was rejected is **six kernels, bf16 intermediates between
+stages, and 8x the block count** — not the chunked recurrence itself. Its two
+named failure modes are specific and avoidable:
+
+- precision: fuse the stages so intermediates stay f32 in registers/shared.
+- parallelism: 48 value heads already saturate 78 SMs, so more blocks buy
+  nothing; keep one launch and the same block count.
+
+So the live question is narrow: does the chunked recurrence win **inside one
+kernel, at f32, with the block count unchanged**? That is a different arm from
+either rejection, and it has to clear a gate the old one failed — accuracy at
+scale=1.0 inputs, not the scale=0.1 of the parity fixtures.
 
 ## Rule
 
-An algorithm ruled out on an argument, with no parity run behind it, is not
-ruled out — it is untested. Write the objection down as a question ("does the
-chunked form drop the intra-chunk term?") and the answer is one file away;
-write it down as a conclusion and it survives unexamined for as long as nobody
-re-reads it.
+Before writing "this was never measured", grep the whole experience directory
+for the technique, not just the entry that dismissed it. A weak argument in one
+file is not evidence that no one ran the experiment; here two A/B tables sat
+one directory listing away. And when retracting someone's conclusion, state
+which arm they measured — "chunked is slower" and "these six kernels in bf16
+are slower" are different claims, and only the second was ever tested.
