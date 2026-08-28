@@ -385,7 +385,8 @@ class Backend:
                 # Batched decode on the tensor cores (Marlin-style); Np is a
                 # multiple of 32 here (the plan pads N to the 32-row block).
                 Np32 = _round_up(N, 32)
-                wq, scale = _pad2d(wq, Np32, Kp // 2), _pad2d(scale, Np32, Kp // blk)
+                wq = _pad2d(wq, Np32, Kp // 2)
+                scale = _pad2d(self._const_f32(scale, dtype=torch.bfloat16), Np32, Kp // blk)
                 osc = self._ones(Np32) if oscale is None else self._const_f32(oscale, Np32)
                 xm = _pad2d(x2, _MX, Kp)
                 res = None if residual is None else self._f32(residual).reshape(M, N)
@@ -452,7 +453,9 @@ class Backend:
         if 2 <= M <= _MX and "linear_fp8_mma8" in _resolve(self.precision, self.arch):
             Np32 = _round_up(N, 32)
             w8 = _pad2d(w8, Np32, Kp)
-            wscale = _pad2d(wscale, -(-Np32 // 128), Kp // 128)
+            wscale = _pad2d(
+                self._const_f32(wscale, dtype=torch.bfloat16), -(-Np32 // 128), Kp // 128
+            )
             osc = self._ones(Np32) if oscale is None else self._const_f32(oscale, Np32)
             xm = _pad2d(x2, _MX, Kp)
             res = None if residual is None else self._f32(residual).reshape(M, N)
@@ -798,7 +801,7 @@ class Backend:
 
     # ------------------------------------------------------------ embedding
 
-    def _const_f32(self, t, pad_to: int | None = None):
+    def _const_f32(self, t, pad_to: int | None = None, dtype=torch.float32):
         """f32 cast of a PARAMETER (norm weight, scale, GDN vector, embedding
         table), cached across ticks; optionally zero-padded to ``pad_to`` rows.
         Per-call casts were ~110 launches per 8 decode layers (the 27B embedding
@@ -806,9 +809,9 @@ class Backend:
         invalidates the entry. Identity is checked via weakref: a fresh model
         can reuse a freed tensor's address, and data_ptr alone would hand back
         the stale cast. Never call this on an activation."""
-        if t.dtype == torch.float32 and t.device == self.device and pad_to is None:
+        if t.dtype == dtype and t.device == self.device and pad_to is None:
             return t
-        key = (t.data_ptr(), pad_to)
+        key = (t.data_ptr(), pad_to, dtype)
         hit = self._const_f32_cache.get(key)
         if hit is not None:
             ref, ver, c = hit
@@ -816,7 +819,7 @@ class Backend:
                 del self._const_f32_cache[key]  # address reused by a different tensor
             elif ver == t._version:
                 return c
-        c = self._f32(t)
+        c = self._dev(t, dtype)
         if pad_to is not None and pad_to != c.shape[0]:
             c = torch.nn.functional.pad(c, (0, pad_to - c.shape[0]))
         self._const_f32_cache[key] = (weakref.ref(t), t._version, c)

@@ -390,95 +390,6 @@ __device__ __forceinline__ void tl_fp8_gemv_tiles(const void *w8v, const void *x
 // lane's elements sit in one 16-block, so one scale per lane per chunk,
 // applied on the B fragment (bf16 mul, exact: block scales are e4m3 values).
 // acc[grp*4 + {0,1}] = C rows g, cols 8*grp + 2q + {0,1}; {2,3} are junk rows.
-template <int NG, int G>
-__device__ __forceinline__ void tl_fp4_mma_k32(const void *wqv, int w_grp_stride, const void *xv,
-                                               const float *sc, float *acc) {
-  // G consecutive k32 chunks: all loads first (G*(1+NG) in flight per lane),
-  // then the math. Chunk c is 16 bytes further in W and 32 elems in X;
-  // sc[c*NG + g].
-  const unsigned char *wq = (const unsigned char *)wqv;
-  const unsigned short *x = (const unsigned short *)xv;
-  uint4 xa[G];
-  unsigned w[G][NG];
-#pragma unroll
-  for (int c = 0; c < G; ++c) {
-    asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(xa[c].x), "=r"(xa[c].y), "=r"(xa[c].z), "=r"(xa[c].w) : "l"(x + c * 32));
-#pragma unroll
-    for (int g = 0; g < NG; ++g)
-      asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(w[c][g]) : "l"(wq + g * w_grp_stride + c * 16));
-  }
-  const unsigned zero = 0u;
-#pragma unroll
-  for (int c = 0; c < G; ++c) {
-#pragma unroll
-    for (int g = 0; g < NG; ++g) {
-      unsigned d[4];
-      tl_fp4_decode8(w[c][g], d);
-      unsigned s2;
-      asm("cvt.rn.bf16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(sc[c * NG + g]));
-#pragma unroll
-      for (int i = 0; i < 4; ++i) asm("mul.bf16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
-      float *cc = acc + g * 4;
-      asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                   "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                   : "+f"(cc[0]), "+f"(cc[1]), "+f"(cc[2]), "+f"(cc[3])
-                   : "r"(xa[c].x), "r"(zero), "r"(xa[c].y), "r"(zero), "r"(d[0]), "r"(d[1]));
-      asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                   "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                   : "+f"(cc[0]), "+f"(cc[1]), "+f"(cc[2]), "+f"(cc[3])
-                   : "r"(xa[c].z), "r"(zero), "r"(xa[c].w), "r"(zero), "r"(d[2]), "r"(d[3]));
-    }
-  }
-}
-// e4m3 twin of tl_fp4_mma_k32 on the f16 tensor path: cvt.rn.f16x2.e4m3x2
-// decodes a byte pair in ONE instruction (the bf16 bit placement was 7), X is
-// converted bf16 -> f16 once per chunk (amortized over NG groups) and the mma
-// runs f16 x f16 -> f32. f16 range is safe: every fp8 GEMM input is post-norm
-// (GDN in_proj, out_proj gate, lm_head); e4m3 values are f16-exact.
-template <int NG, int G>
-__device__ __forceinline__ void tl_fp8_mma_k32(const void *w8v, int w_grp_stride, const void *xv,
-                                               const float *sc, float *acc) {
-  const unsigned char *w8 = (const unsigned char *)w8v;
-  const unsigned short *x = (const unsigned short *)xv;
-  uint4 xa[G];
-  uint2 w[G][NG];
-#pragma unroll
-  for (int c = 0; c < G; ++c) {
-    asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(xa[c].x), "=r"(xa[c].y), "=r"(xa[c].z), "=r"(xa[c].w) : "l"(x + c * 32));
-#pragma unroll
-    for (int g = 0; g < NG; ++g)
-      asm volatile("ld.global.nc.v2.u32 {%0,%1}, [%2];"
-                   : "=r"(w[c][g].x), "=r"(w[c][g].y) : "l"(w8 + g * w_grp_stride + c * 32));
-  }
-  const unsigned zero = 0u;
-#pragma unroll
-  for (int c = 0; c < G; ++c) {
-    const unsigned a0 = tl_bf16x2_to_f16x2(xa[c].x), a2 = tl_bf16x2_to_f16x2(xa[c].y);
-    const unsigned a0b = tl_bf16x2_to_f16x2(xa[c].z), a2b = tl_bf16x2_to_f16x2(xa[c].w);
-#pragma unroll
-    for (int g = 0; g < NG; ++g) {
-      unsigned d[4] = {tl_e4m3x2_to_f16x2((unsigned short)(w[c][g].x)),
-                       tl_e4m3x2_to_f16x2((unsigned short)(w[c][g].x >> 16)),
-                       tl_e4m3x2_to_f16x2((unsigned short)(w[c][g].y)),
-                       tl_e4m3x2_to_f16x2((unsigned short)(w[c][g].y >> 16))};
-      unsigned s2;
-      asm("cvt.rn.f16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(sc[c * NG + g]));
-#pragma unroll
-      for (int i = 0; i < 4; ++i) asm("mul.f16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
-      float *cc = acc + g * 4;
-      asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                   "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                   : "+f"(cc[0]), "+f"(cc[1]), "+f"(cc[2]), "+f"(cc[3])
-                   : "r"(a0), "r"(zero), "r"(a2), "r"(zero), "r"(d[0]), "r"(d[1]));
-      asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                   "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                   : "+f"(cc[0]), "+f"(cc[1]), "+f"(cc[2]), "+f"(cc[3])
-                   : "r"(a0b), "r"(zero), "r"(a2b), "r"(zero), "r"(d[2]), "r"(d[3]));
-    }
-  }
-}
 // GROUP fp4 tiles (16 elems = 8 twiddled bytes each), loaded straight from
 // global into registers first (same rationale as tl_fp8_gemv_tiles). Tiles
 // are block_K elements apart: W stride block_K/2 bytes, X stride 2*block_K.
@@ -490,8 +401,8 @@ __device__ __forceinline__ void tl_fp8_mma_k32(const void *w8v, int w_grp_stride
 // x + chunk*32 elements, scale = sc[row_off + chunk*32/block] per row.
 template <int NG, int G>
 __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_stride, const void *xv,
-                                                const float *sc, int sc_grp_stride, int sc_per_chunk,
-                                                int c0, int c1, float *out) {
+                                                const unsigned short *sc, int sc_grp_stride,
+                                                int sc_per_chunk, int c0, int c1, float *out) {
   const unsigned char *wq = (const unsigned char *)wqv;
   const unsigned short *x = (const unsigned short *)xv;
   float acc[NG * 4];
@@ -502,7 +413,7 @@ __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_strid
   for (; c + G <= c1; c += G) {
     uint4 xa[G];
     unsigned w[G][NG];
-    float s[G][NG];
+    unsigned short s[G][NG];
 #pragma unroll
     for (int k = 0; k < G; ++k) {
       asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
@@ -519,8 +430,7 @@ __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_strid
       for (int g = 0; g < NG; ++g) {
         unsigned d[4];
         tl_fp4_decode8(w[k][g], d);
-        unsigned s2;
-        asm("cvt.rn.bf16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(s[k][g]));
+        const unsigned s2 = ((unsigned)s[k][g] << 16) | s[k][g];
 #pragma unroll
         for (int i = 0; i < 4; ++i) asm("mul.bf16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -542,11 +452,10 @@ __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_strid
     for (int g = 0; g < NG; ++g) {
       unsigned w;
       asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(w) : "l"(wq + g * w_grp_stride + c * 16));
-      const float sg = __ldg(sc + g * sc_grp_stride + c * sc_per_chunk);
+      const unsigned short sg = __ldg(sc + g * sc_grp_stride + c * sc_per_chunk);
       unsigned d[4];
       tl_fp4_decode8(w, d);
-      unsigned s2;
-      asm("cvt.rn.bf16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(sg));
+      const unsigned s2 = ((unsigned)sg << 16) | sg;
 #pragma unroll
       for (int i = 0; i < 4; ++i) asm("mul.bf16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
       asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -564,8 +473,8 @@ __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_strid
 }
 template <int NG, int G>
 __device__ __forceinline__ void tl_fp8_mma_rows(const void *w8v, int w_grp_stride, const void *xv,
-                                                const float *sc, int sc_shift, int c0, int c1,
-                                                float *out) {
+                                                const unsigned short *sc, int sc_shift, int c0,
+                                                int c1, float *out) {
   // 128-block scale: all 32 rows of a block share one scale row, chunk c's
   // column is (c*32 + 8q) / 128 = c >> 2 for every lane.
   const unsigned char *w8 = (const unsigned char *)w8v;
@@ -578,7 +487,7 @@ __device__ __forceinline__ void tl_fp8_mma_rows(const void *w8v, int w_grp_strid
     const int n = (c1 - c < G) ? (c1 - c) : G;
     uint4 xa[G];
     uint2 w[G][NG];
-    float s[G][NG];
+    unsigned short s[G][NG];
 #pragma unroll
     for (int k = 0; k < G; ++k) {
       if (k < n) {
@@ -740,7 +649,7 @@ def make_linear_fp4_gemv(target: str, GROUP: int = 4):
 def make_linear_fp4_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4):
     """Decode GEMM for M <= 8 on the tensor cores (sm90): X [8, K] bf16 (rows
     >= M zero) @ twiddled fp4 -> Y [8, N] f32 (+ Res, * OScale). A block owns
-    NG*8 output rows; its KW warps split K in k32 chunks (``tl_fp4_mma_k32``)
+    NG*8 output rows; its KW warps split K in k32 chunks (``tl_fp4_mma_rows``)
     and reduce through shared memory. ~3 instr per weight element for ANY
     M <= 8 — the M=1 GEMV's cost at B=8 (the scalar batched GEMV was
     register-bound at 204 regs/lane, errors/2026-08-28-batched-scalar-gemv).
@@ -758,7 +667,9 @@ def make_linear_fp4_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4):
         per = T.ceildiv(nchunk, KW)
         X: T.Tensor((8, K), "bfloat16")
         WQ: T.Tensor((N, K // 2), "uint8")
-        Scale: T.Tensor((N, K // block), "float32")
+        # bf16 scale: block scales are e4m3 values, so bf16 is lossless — half
+        # the scale bytes in L1 and a bit-replication instead of a cvt per tile
+        Scale: T.Tensor((N, K // block), "bfloat16")
         OScale: T.Tensor((N,), "float32")
         Res: T.Tensor((8, N), "float32")
         Y = T.empty((8, N), "float32")
@@ -954,7 +865,7 @@ def make_linear_fp8_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4):
         per = T.ceildiv(nchunk, KW)
         X: T.Tensor((8, K), "bfloat16")
         W8: T.Tensor((N, K), "float8_e4m3fn")
-        WScale: T.Tensor((T.ceildiv(N, 128), T.ceildiv(K, 128)), "float32")
+        WScale: T.Tensor((T.ceildiv(N, 128), T.ceildiv(K, 128)), "bfloat16")
         OScale: T.Tensor((N,), "float32")
         Res: T.Tensor((8, N), "float32")
         Y = T.empty((8, N), "float32")
