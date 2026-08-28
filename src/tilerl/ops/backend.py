@@ -552,8 +552,11 @@ class Backend:
     def _paged_attention_decode(self, q, k_cache, v_cache, block_table, seq_lens, scale):
         b, h, d = q.shape[0], q.shape[2], q.shape[3]
         hkv = k_cache.shape[1]
-        ks = 16  # KVSPLIT of the registered kernels
-        key = ("attn_ws", b, hkv, d)
+        # split count from the pool's reach (host-static, graph-safe): a
+        # block's serial scan stays <= 4K tokens at 256K
+        max_tokens = block_table.shape[1] * k_cache.shape[2]
+        ks, sfx = (64, "_64") if max_tokens > 65536 else (16, "")
+        key = ("attn_ws", b, hkv, d, ks)
         ws = self._ones_cache.get(key)
         if ws is None:  # static workspace: graph-capturable, one per batch bucket
             ws = self._ones_cache[key] = (
@@ -562,12 +565,12 @@ class Backend:
                 torch.empty(b, hkv, ks, 16, dtype=torch.float32, device=self.device),
             )
         po, pm, pl = ws
-        self._kernel("paged_attention_decode")(
+        self._kernel("paged_attention_decode" + sfx)(
             self._dev(self._c(q.reshape(b, h, d)), torch.bfloat16), k_cache, v_cache,
             self._i32(block_table), self._i32(seq_lens), po, pm, pl, float(scale),
             int(k_cache.shape[2]),
         )
-        return self._kernel("paged_attention_combine")(po, pm, pl, h // hkv).reshape(b, 1, h, d)
+        return self._kernel("paged_attention_combine" + sfx)(po, pm, pl, h // hkv).reshape(b, 1, h, d)
 
     def attention(self, q, k, v, scale, gate=None):
         """Dense causal GQA attention (training path). q/k/v [B,T,H,D]."""

@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 _BASELINE = Path(__file__).resolve().parent.parent / "docs/experience/wins/bench-baseline.json"
 _GATE = 0.97  # a run must be within 3% of (or beat) the snapshot
-_KV_DEPTHS = (512, 2048, 8192, 32768)
+_KV_DEPTHS = (512, 2048, 8192, 32768, 131072, 262144)  # 128K/256K: B=1 only (KV 17/34 GB)
 
 
 def _git_commit() -> str:
@@ -158,7 +158,10 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
             # outlive the batch's staggered prefill (chunks of 512/tick) or row 0 is
             # DONE before the last row reaches decode and settle never sees B rows.
             gen = ticks + 40 + b * (depth // 512 + 4)
-            need = 2 * (-(-(depth + gen) * b // BLOCK_TOKENS) + b)
+            # 2x headroom (the prefix store pins finished prompts) up to 32K; at
+            # 128K/256K the KV alone is 17/34 GB, so 1.1x and one row per pool.
+            head = 2 if depth <= 32768 else 1.1
+            need = int(head * (-(-(depth + gen) * b // BLOCK_TOKENS) + b))
             engine = build_engine(
                 cfg, model, backend,
                 num_blocks=max(256, need), num_slots=max(16, b),

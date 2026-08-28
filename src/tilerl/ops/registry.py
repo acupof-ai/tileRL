@@ -115,6 +115,9 @@ _SM90_KERNELS = {
     "paged_attention": kernels_attn.make_paged_attention_mma,
     "paged_attention_decode": kernels_attn.make_paged_attention_decode,
     "paged_attention_combine": kernels_attn.make_paged_attention_combine,
+    # long context (>64K): 64 splits keep the per-block scan at <= 4K tokens
+    "paged_attention_decode_64": lambda t: kernels_attn.make_paged_attention_decode(t, KVSPLIT=64),
+    "paged_attention_combine_64": lambda t: kernels_attn.make_paged_attention_combine(t, KVSPLIT=64),
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)

@@ -38,7 +38,15 @@ instr/elem (the e4m3 bit placement per pair costs more than the fp4 twiddle);
 in_proj's 512-block grid is 1.6 waves. Sweep on the B=8 d512 row: **(KW=4,
 G=4, NG=4) 286.7** > KW=8 189.5 (reduction overhead, no extra warps — registers
 cap blocks/SM) > G=2 177.4; NG=8 needs N padded to 64 (illegal access as is).
-Next lever on this kernel is register count, not launch shape. Also measured
+Register count was then forced through a tilelang CUDA post-processing
+callback (`__launch_bounds__(128, MINB)`): 128 → 80 → 64 registers,
+occupancy 23 → 34 → 45%, duration 145 → 146 → 148 µs, DRAM 23% throughout.
+**Occupancy is not the bound either.** The tell is the earlier counter set:
+L1 traffic 2× DRAM — the accumulators (`acc`) and scales (`sc`) are TIR
+locals handed to the extern by pointer, so they live in local memory and
+every mma round-trips 16 accumulators through L1. Fix in flight: the warp's
+whole K loop inside the C function with register accumulators
+(`tl_fp4_mma_rows` / `tl_fp8_mma_rows`); the callback is deleted. Also measured
 (ncu, clock-locked): small-N (N=5120) fp4 mma8 runs 160 blocks × 4 warps =
 7.5% of the warp slots, 90 µs; KW=16 → 162 µs (512 threads × 128 regs = the
 whole register file, still 1 block/SM, DRAM 10%); NG=2 → 219 regs, 121 µs.

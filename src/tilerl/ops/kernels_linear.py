@@ -482,6 +482,146 @@ __device__ __forceinline__ void tl_fp8_mma_k32(const void *w8v, int w_grp_stride
 // GROUP fp4 tiles (16 elems = 8 twiddled bytes each), loaded straight from
 // global into registers first (same rationale as tl_fp8_gemv_tiles). Tiles
 // are block_K elements apart: W stride block_K/2 bytes, X stride 2*block_K.
+// The warp's whole K range in one call: accumulators and scales stay in
+// registers (a TIR local handed to the extern by pointer lives in local
+// memory — every mma then round-trips its 16 accumulators through L1; ncu
+// showed L1 traffic at 2x DRAM and no gain from 128 -> 64 registers).
+// chunk in [c0, c1): W at wq + chunk*16 bytes (fp4) / *32 (fp8), X at
+// x + chunk*32 elements, scale = sc[row_off + chunk*32/block] per row.
+template <int NG, int G>
+__device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_stride, const void *xv,
+                                                const float *sc, int sc_grp_stride, int sc_per_chunk,
+                                                int c0, int c1, float *out) {
+  const unsigned char *wq = (const unsigned char *)wqv;
+  const unsigned short *x = (const unsigned short *)xv;
+  float acc[NG * 4];
+#pragma unroll
+  for (int i = 0; i < NG * 4; ++i) acc[i] = 0.f;
+  const unsigned zero = 0u;
+  int c = c0;
+  for (; c + G <= c1; c += G) {
+    uint4 xa[G];
+    unsigned w[G][NG];
+    float s[G][NG];
+#pragma unroll
+    for (int k = 0; k < G; ++k) {
+      asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(xa[k].x), "=r"(xa[k].y), "=r"(xa[k].z), "=r"(xa[k].w) : "l"(x + (c + k) * 32));
+#pragma unroll
+      for (int g = 0; g < NG; ++g) {
+        asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(w[k][g]) : "l"(wq + g * w_grp_stride + (c + k) * 16));
+        s[k][g] = __ldg(sc + g * sc_grp_stride + (c + k) * sc_per_chunk);
+      }
+    }
+#pragma unroll
+    for (int k = 0; k < G; ++k) {
+#pragma unroll
+      for (int g = 0; g < NG; ++g) {
+        unsigned d[4];
+        tl_fp4_decode8(w[k][g], d);
+        unsigned s2;
+        asm("cvt.rn.bf16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(s[k][g]));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) asm("mul.bf16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                     : "+f"(acc[g * 4]), "+f"(acc[g * 4 + 1]), "+f"(acc[g * 4 + 2]), "+f"(acc[g * 4 + 3])
+                     : "r"(xa[k].x), "r"(zero), "r"(xa[k].y), "r"(zero), "r"(d[0]), "r"(d[1]));
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                     : "+f"(acc[g * 4]), "+f"(acc[g * 4 + 1]), "+f"(acc[g * 4 + 2]), "+f"(acc[g * 4 + 3])
+                     : "r"(xa[k].z), "r"(zero), "r"(xa[k].w), "r"(zero), "r"(d[2]), "r"(d[3]));
+      }
+    }
+  }
+  for (; c < c1; ++c) {  // tail chunks
+    uint4 xa;
+    asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(xa.x), "=r"(xa.y), "=r"(xa.z), "=r"(xa.w) : "l"(x + c * 32));
+#pragma unroll
+    for (int g = 0; g < NG; ++g) {
+      unsigned w;
+      asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(w) : "l"(wq + g * w_grp_stride + c * 16));
+      const float sg = __ldg(sc + g * sc_grp_stride + c * sc_per_chunk);
+      unsigned d[4];
+      tl_fp4_decode8(w, d);
+      unsigned s2;
+      asm("cvt.rn.bf16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(sg));
+#pragma unroll
+      for (int i = 0; i < 4; ++i) asm("mul.bf16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
+      asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                   "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                   : "+f"(acc[g * 4]), "+f"(acc[g * 4 + 1]), "+f"(acc[g * 4 + 2]), "+f"(acc[g * 4 + 3])
+                   : "r"(xa.x), "r"(zero), "r"(xa.y), "r"(zero), "r"(d[0]), "r"(d[1]));
+      asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                   "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                   : "+f"(acc[g * 4]), "+f"(acc[g * 4 + 1]), "+f"(acc[g * 4 + 2]), "+f"(acc[g * 4 + 3])
+                   : "r"(xa.z), "r"(zero), "r"(xa.w), "r"(zero), "r"(d[2]), "r"(d[3]));
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < NG * 4; ++i) out[i] = acc[i];
+}
+template <int NG, int G>
+__device__ __forceinline__ void tl_fp8_mma_rows(const void *w8v, int w_grp_stride, const void *xv,
+                                                const float *sc, int sc_shift, int c0, int c1,
+                                                float *out) {
+  // 128-block scale: all 32 rows of a block share one scale row, chunk c's
+  // column is (c*32 + 8q) / 128 = c >> 2 for every lane.
+  const unsigned char *w8 = (const unsigned char *)w8v;
+  const unsigned short *x = (const unsigned short *)xv;
+  float acc[NG * 4];
+#pragma unroll
+  for (int i = 0; i < NG * 4; ++i) acc[i] = 0.f;
+  const unsigned zero = 0u;
+  for (int c = c0; c < c1; c += G) {  // G chunks of loads in flight, then the math
+    const int n = (c1 - c < G) ? (c1 - c) : G;
+    uint4 xa[G];
+    uint2 w[G][NG];
+    float s[G][NG];
+#pragma unroll
+    for (int k = 0; k < G; ++k) {
+      if (k < n) {
+        asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(xa[k].x), "=r"(xa[k].y), "=r"(xa[k].z), "=r"(xa[k].w) : "l"(x + (c + k) * 32));
+#pragma unroll
+        for (int g = 0; g < NG; ++g) {
+          asm volatile("ld.global.nc.v2.u32 {%0,%1}, [%2];"
+                       : "=r"(w[k][g].x), "=r"(w[k][g].y) : "l"(w8 + g * w_grp_stride + (c + k) * 32));
+          s[k][g] = __ldg(sc + ((c + k) >> sc_shift));
+        }
+      }
+    }
+#pragma unroll
+    for (int k = 0; k < G; ++k) {
+      if (k < n) {
+        const unsigned a0 = tl_bf16x2_to_f16x2(xa[k].x), a2 = tl_bf16x2_to_f16x2(xa[k].y);
+        const unsigned a0b = tl_bf16x2_to_f16x2(xa[k].z), a2b = tl_bf16x2_to_f16x2(xa[k].w);
+#pragma unroll
+        for (int g = 0; g < NG; ++g) {
+          unsigned d[4] = {tl_e4m3x2_to_f16x2((unsigned short)(w[k][g].x)),
+                           tl_e4m3x2_to_f16x2((unsigned short)(w[k][g].x >> 16)),
+                           tl_e4m3x2_to_f16x2((unsigned short)(w[k][g].y)),
+                           tl_e4m3x2_to_f16x2((unsigned short)(w[k][g].y >> 16))};
+          unsigned s2;
+          asm("cvt.rn.f16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(s[k][g]));
+#pragma unroll
+          for (int i = 0; i < 4; ++i) asm("mul.f16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
+          asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                       : "+f"(acc[g * 4]), "+f"(acc[g * 4 + 1]), "+f"(acc[g * 4 + 2]), "+f"(acc[g * 4 + 3])
+                       : "r"(a0), "r"(zero), "r"(a2), "r"(zero), "r"(d[0]), "r"(d[1]));
+          asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                       : "+f"(acc[g * 4]), "+f"(acc[g * 4 + 1]), "+f"(acc[g * 4 + 2]), "+f"(acc[g * 4 + 3])
+                       : "r"(a0b), "r"(zero), "r"(a2b), "r"(zero), "r"(d[2]), "r"(d[3]));
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < NG * 4; ++i) out[i] = acc[i];
+}
 template <int G>
 __device__ __forceinline__ void tl_fp4_gemv_tiles(const void *wqv, const void *xv, int block_K,
                                                   const float *sc, float *acc) {
@@ -630,36 +770,18 @@ def make_linear_fp4_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4):
             g = lane // 4
             q = lane % 4
             acc = T.alloc_local((NG * 4,), "float32")
-            sc = T.alloc_local((G * NG,), "float32")
             red = T.alloc_shared((KW, 8, NB), "float32")
-            for i in T.unroll(NG * 4):
-                acc[i] = 0.0
-            # per-warp chunk range [kw*per, kw*per+per): G chunks per call so
-            # G*(1+NG) loads are in flight per lane (one chunk per call was
-            # latency-bound: 2x slower than the scalar GEMV at M=1)
-            for c in T.serial(per // G):
-                chunk = kw * per + c * G
-                if chunk + G <= nchunk:
-                    for cc in T.unroll(G):
-                        for grp in T.unroll(NG):
-                            sc[cc * NG + grp] = Scale[n0 + 8 * grp + g, ((chunk + cc) * 32 + 8 * q) // block]
-                    T.call_extern(
-                        f"tl_fp4_mma_k32<{NG}, {G}>",
-                        T.access_ptr(WQ[n0 + g, chunk * 16 + 4 * q], "r"), 8 * (K // 2),
-                        T.access_ptr(X[g, chunk * 32 + 8 * q], "r"), T.access_ptr(sc, "r"),
-                        T.access_ptr(acc, "rw"), dtype="void",
-                    )
-            for c in T.serial(per - (per // G) * G):  # tail chunks, one at a time
-                chunk = kw * per + (per // G) * G + c
-                if chunk < nchunk:
-                    for grp in T.unroll(NG):
-                        sc[grp] = Scale[n0 + 8 * grp + g, (chunk * 32 + 8 * q) // block]
-                    T.call_extern(
-                        f"tl_fp4_mma_k32<{NG}, 1>",
-                        T.access_ptr(WQ[n0 + g, chunk * 16 + 4 * q], "r"), 8 * (K // 2),
-                        T.access_ptr(X[g, chunk * 32 + 8 * q], "r"), T.access_ptr(sc, "r"),
-                        T.access_ptr(acc, "rw"), dtype="void",
-                    )
+            # whole per-warp K range in one extern call: accumulators live in
+            # registers there (see tl_fp4_mma_rows); the scale for chunk c of
+            # row n is Scale[n, (c*32 + 8q)//block] = row base + c*(32//block)
+            T.call_extern(
+                f"tl_fp4_mma_rows<{NG}, {G}>",
+                T.access_ptr(WQ[n0 + g, 4 * q], "r"), 8 * (K // 2),
+                T.access_ptr(X[g, 8 * q], "r"),
+                T.access_ptr(Scale[n0 + g, (8 * q) // block], "r"), 8 * (K // block), 32 // block,
+                kw * per, T.min(nchunk, (kw + 1) * per),
+                T.access_ptr(acc, "w"), dtype="void",
+            )
             for grp in T.unroll(NG):
                 red[kw, g, 8 * grp + 2 * q] = acc[4 * grp]
                 red[kw, g, 8 * grp + 2 * q + 1] = acc[4 * grp + 1]
@@ -844,36 +966,18 @@ def make_linear_fp8_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4):
             g = lane // 4
             q = lane % 4
             acc = T.alloc_local((NG * 4,), "float32")
-            sc = T.alloc_local((G * NG,), "float32")
             red = T.alloc_shared((KW, 8, NB), "float32")
-            for i in T.unroll(NG * 4):
-                acc[i] = 0.0
-            # per-warp chunk range [kw*per, kw*per+per): G chunks per call so
-            # G*(1+NG) loads are in flight per lane (one chunk per call was
-            # latency-bound: 2x slower than the scalar GEMV at M=1)
-            for c in T.serial(per // G):
-                chunk = kw * per + c * G
-                if chunk + G <= nchunk:
-                    for cc in T.unroll(G):
-                        for grp in T.unroll(NG):
-                            sc[cc * NG + grp] = WScale[(n0 + 8 * grp + g) // 128, ((chunk + cc) * 32 + 8 * q) // 128]
-                    T.call_extern(
-                        f"tl_fp8_mma_k32<{NG}, {G}>",
-                        T.access_ptr(W8[n0 + g, chunk * 32 + 8 * q], "r"), 8 * K,
-                        T.access_ptr(X[g, chunk * 32 + 8 * q], "r"), T.access_ptr(sc, "r"),
-                        T.access_ptr(acc, "rw"), dtype="void",
-                    )
-            for c in T.serial(per - (per // G) * G):  # tail chunks, one at a time
-                chunk = kw * per + (per // G) * G + c
-                if chunk < nchunk:
-                    for grp in T.unroll(NG):
-                        sc[grp] = WScale[(n0 + 8 * grp + g) // 128, (chunk * 32 + 8 * q) // 128]
-                    T.call_extern(
-                        f"tl_fp8_mma_k32<{NG}, 1>",
-                        T.access_ptr(W8[n0 + g, chunk * 32 + 8 * q], "r"), 8 * K,
-                        T.access_ptr(X[g, chunk * 32 + 8 * q], "r"), T.access_ptr(sc, "r"),
-                        T.access_ptr(acc, "rw"), dtype="void",
-                    )
+            # whole per-warp K range in one extern call (register accumulators).
+            # A 32-row block never crosses a 128-row scale block, so one scale
+            # row serves all NG groups; chunk c reads column c >> 2.
+            T.call_extern(
+                f"tl_fp8_mma_rows<{NG}, {G}>",
+                T.access_ptr(W8[n0 + g, 8 * q], "r"), 8 * K,
+                T.access_ptr(X[g, 8 * q], "r"),
+                T.access_ptr(WScale[(n0 + g) // 128, 0], "r"), 2,
+                kw * per, T.min(nchunk, (kw + 1) * per),
+                T.access_ptr(acc, "w"), dtype="void",
+            )
             for grp in T.unroll(NG):
                 red[kw, g, 8 * grp + 2 * q] = acc[4 * grp]
                 red[kw, g, 8 * grp + 2 * q + 1] = acc[4 * grp + 1]
