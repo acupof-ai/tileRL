@@ -115,8 +115,11 @@ class DraftHead:
         ``hidden_out`` receives the head's own hidden, which is what the NEXT
         draft position consumes."""
         eps = self.cfg.rms_eps
-        e = backend.embedding(torch.as_tensor(ids, dtype=torch.long, device=backend.device),
-                              self.trunk.params["embed_tokens"])
+        # Model.forward does this for its own inputs; the head is entered
+        # directly, so it converts its own.
+        ids = torch.as_tensor(ids, dtype=torch.long, device=backend.device)
+        positions = torch.as_tensor(positions, dtype=torch.long, device=backend.device)
+        e = backend.embedding(ids, self.trunk.params["embed_tokens"])
         if "pre_fc_norm_embedding" in self.params:  # Qwen NextN: both sides normed
             e = backend.rmsnorm(e, self.params["pre_fc_norm_embedding"], eps)
         hidden = backend.rmsnorm(hidden, self.params["pre_fc_norm_hidden"], eps)

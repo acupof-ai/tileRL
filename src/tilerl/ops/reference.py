@@ -618,24 +618,29 @@ def gdn_backward(
     sp_in = g + dt_bias
     gt = -torch.exp(a_log) * torch.nn.functional.softplus(sp_in)
     exp_g = torch.exp(gt)
-    s_heads = [state[:, h].clone() for h in range(nvh)]
+    # Vectorized over value heads: only the time step is sequential, and a
+    # per-head Python loop cost 48 launches per step per layer — 671K kernels
+    # in one 8-layer train step, which made the step CPU-launch-bound.
+    rep = nvh // nkh
+    assert nkh * rep == nvh, (nkh, nvh)  # h -> h // rep, contiguous groups
+    knv = kn.repeat_interleave(rep, dim=2)  # [b,t,nvh,key_dim]
+    qnv = qn.repeat_interleave(rep, dim=2)
     states = torch.empty(b, t + 1, nvh, key_dim, val_dim, dtype=torch.float32, device=q.device)
     ps = torch.empty(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
     deltas = torch.empty(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
     states[:, 0] = state
     core = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
+    s = state.clone()
     for step in range(t):
-        for h in range(nvh):
-            kh = h * nkh // nvh
-            s_h = s_heads[h] * exp_g[:, step, h].view(b, 1, 1)
-            p = torch.einsum("bk,bkv->bv", kn[:, step, kh], s_h)
-            d = (v_raw[:, step, h] - p) * bt[:, step, h].unsqueeze(-1)
-            s_h = s_h + kn[:, step, kh].unsqueeze(-1) * d.unsqueeze(-2)
-            s_heads[h] = s_h
-            core[:, step, h] = torch.einsum("bk,bkv->bv", qn[:, step, kh], s_h)
-            ps[:, step, h] = p
-            deltas[:, step, h] = d
-            states[:, step + 1, h] = s_h
+        s = s * exp_g[:, step].view(b, nvh, 1, 1)
+        kst = knv[:, step]
+        p = torch.einsum("bhk,bhkv->bhv", kst, s)
+        d = (v_raw[:, step] - p) * bt[:, step].unsqueeze(-1)
+        s = s + kst.unsqueeze(-1) * d.unsqueeze(-2)
+        core[:, step] = torch.einsum("bhk,bhkv->bhv", qnv[:, step], s)
+        ps[:, step] = p
+        deltas[:, step] = d
+        states[:, step + 1] = s
     rstd = torch.rsqrt(core.pow(2).mean(-1, keepdim=True) + 1e-6)
     normed = core * rstd * norm_weight
     z4 = z.view(b, t, nvh, val_dim)
@@ -657,31 +662,31 @@ def gdn_backward(
     #   gg   = sum dS_ * S_prev ;  gbeta = gd.(v-p) ;  gv = beta*gd
     #   gk   = dS_t d - beta*S_ gd ;  dS_prev = g * dS_
     dS = torch.zeros_like(state)
-    g_qn = torch.zeros(b, t, nkh, key_dim, dtype=torch.float32, device=q.device)
-    g_kn = torch.zeros(b, t, nkh, key_dim, dtype=torch.float32, device=q.device)
     g_v_raw = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
     g_bt = torch.zeros(b, t, nvh, dtype=torch.float32, device=q.device)
     g_exp_g = torch.zeros(b, t, nvh, dtype=torch.float32, device=q.device)
+    # Same vectorization as the forward scan; the value-head grads fold back
+    # onto the key heads at the end (h -> h // rep is contiguous, so a reshape
+    # and a sum is the scatter-add).
+    g_qnv = torch.zeros(b, t, nvh, key_dim, dtype=torch.float32, device=q.device)
+    g_knv = torch.zeros(b, t, nvh, key_dim, dtype=torch.float32, device=q.device)
     for step in reversed(range(t)):
-        for h in range(nvh):
-            kh = h * nkh // nvh
-            dS_t = dS[:, h] + torch.einsum("bk,bv->bkv", qn[:, step, kh], g_core[:, step, h])
-            gd = torch.einsum("bkv,bk->bv", dS_t, kn[:, step, kh])
-            g_qn[:, step, kh] += torch.einsum(
-                "bkv,bv->bk", states[:, step + 1, h], g_core[:, step, h]
-            )
-            dS_ = dS_t - bt[:, step, h].view(b, 1, 1) * torch.einsum(
-                "bk,bv->bkv", kn[:, step, kh], gd
-            )
-            g_exp_g[:, step, h] = (dS_ * states[:, step, h]).sum(dim=(1, 2))
-            g_bt[:, step, h] = (gd * (v_raw[:, step, h] - ps[:, step, h])).sum(dim=-1)
-            g_v_raw[:, step, h] = bt[:, step, h].unsqueeze(-1) * gd
-            g_kn[:, step, kh] += torch.einsum("bkv,bv->bk", dS_t, deltas[:, step, h]) - bt[
-                :, step, h
-            ].unsqueeze(-1) * torch.einsum(
-                "bkv,bv->bk", exp_g[:, step, h].view(b, 1, 1) * states[:, step, h], gd
-            )
-            dS[:, h] = exp_g[:, step, h].view(b, 1, 1) * dS_
+        kst, qst, gc = knv[:, step], qnv[:, step], g_core[:, step]
+        btv = bt[:, step].unsqueeze(-1)
+        eg = exp_g[:, step].view(b, nvh, 1, 1)
+        dS_t = dS + torch.einsum("bhk,bhv->bhkv", qst, gc)
+        gd = torch.einsum("bhkv,bhk->bhv", dS_t, kst)
+        g_qnv[:, step] = torch.einsum("bhkv,bhv->bhk", states[:, step + 1], gc)
+        dS_ = dS_t - btv.unsqueeze(-1) * torch.einsum("bhk,bhv->bhkv", kst, gd)
+        g_exp_g[:, step] = (dS_ * states[:, step]).sum(dim=(2, 3))
+        g_bt[:, step] = (gd * (v_raw[:, step] - ps[:, step])).sum(dim=-1)
+        g_v_raw[:, step] = btv * gd
+        g_knv[:, step] = torch.einsum("bhkv,bhv->bhk", dS_t, deltas[:, step]) - btv * torch.einsum(
+            "bhkv,bhv->bhk", eg * states[:, step], gd
+        )
+        dS = eg * dS_
+    g_qn = g_qnv.reshape(b, t, nkh, rep, key_dim).sum(3)
+    g_kn = g_knv.reshape(b, t, nkh, rep, key_dim).sum(3)
     g_gt = g_exp_g * exp_g
     g_a_log = (g_gt * gt).sum(dim=(0, 1))
     g_sp_in = g_gt * (-torch.exp(a_log)) * torch.sigmoid(sp_in)
