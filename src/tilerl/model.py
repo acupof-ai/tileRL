@@ -453,10 +453,13 @@ class Model:
         positions: "np.ndarray | torch.Tensor",
         kv: Any,
         backend: "Backend",
+        hidden_out: list | None = None,
     ) -> torch.Tensor:
         """Run the model. ``input_ids`` [B,T] int, ``positions`` [T] or [B,T]
         int (RoPE positions), ``kv`` a BatchKv with pools attached. Returns
-        logits [B,T,vocab_size] on the backend device."""
+        logits [B,T,vocab_size] on the backend device. ``hidden_out``, when
+        given, receives the pre-final-norm hidden state (the MTP draft head's
+        input) — a list so the seam costs nothing when spec-decode is off."""
         cfg = self.cfg
         device = backend.device
         ids = torch.as_tensor(input_ids, dtype=torch.long, device=device)
@@ -470,6 +473,8 @@ class Model:
                 x = self._gdn(i, linear_idx, x, kv, backend)
                 linear_idx += 1
             x = self._mlp(i, x, kv, backend)
+        if hidden_out is not None:  # spec-decode: the MTP head's fc input
+            hidden_out.append(x)
         x = backend.rmsnorm(x, self.params["final_norm"], cfg.rms_eps)
         head_key = "embed_tokens" if cfg.tie_word_embeddings else "lm_head"
         return self._linear(backend, x, head_key)
