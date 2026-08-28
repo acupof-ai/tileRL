@@ -291,7 +291,9 @@ def suite_train(gate, backend, source, gpu):
         mdl = load_hf(cfg, source, fuse_projections=False)
         mdl.params = backend.materialize(mdl.params)
         trainable = add_lora(mdl, rank=16)
-        shapes = [(1, 512), (1, 2048)]
+        # a slope, not one point: the tape keeps every activation in f32, so
+        # peak GB per token is the number that decides whether recompute is needed
+        shapes = [(1, 64), (1, 128), (1, 256)]
     else:
         model_name = "tiny"
         cfg, mdl = _build_model(model_name, seed=0, keep_master=True)
@@ -316,6 +318,7 @@ def suite_train(gate, backend, source, gpu):
             import torch
 
             peak = f"  peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB"
+            torch.cuda.reset_peak_memory_stats()
         print(f"  {f'{b}x{t}':>10} {ms:>10.2f} {tok_s:>12.1f}{peak}")
         gate.check("train", f"{model_name}-b{b}t{t}", tok_s)
 
