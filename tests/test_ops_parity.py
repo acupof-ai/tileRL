@@ -630,6 +630,22 @@ def test_gdn_chunk_fused_parity(backend):
     _assert_close(nw, rnw, "gdn chunk fused window")
 
 
+def test_gdn_chunkwise_matches_serial():
+    """The chunkwise-WY decomposition equals the serial decay-first scan over a
+    FULL layer — conv, norms, gates and z-gate included, not just the core.
+
+    This is the gate the five-kernel prefill port is written against: every
+    stage replaces one line of `gdn_chunk_core` with a kernel, and this is what
+    says the algebra it implements is the algebra we ship.
+    """
+    q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 96, 2, 6, 16, 16, 4, 31)
+    ref = reference.gdn_forward(q, k, v, g, beta, state, z=z, **kw)
+    for chunk in (16, 32, 64):
+        got = reference.gdn_forward(q, k, v, g, beta, state, z=z, chunkwise=chunk, **kw)
+        for a, b_, name in zip(got, ref, ("out", "state", "window")):
+            _assert_close(a, b_, f"gdn chunkwise({chunk}) {name}")
+
+
 def test_gdn_chunk_matches_decode(backend):
     """The chunk kernel at T=1 equals the decode kernel (it is the T-loop
     generalization of make_gdn_decode_fused — same fused ops, same order).

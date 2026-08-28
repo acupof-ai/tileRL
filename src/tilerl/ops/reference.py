@@ -502,7 +502,12 @@ def gdn_chunk_core(qn, kn, v, gt, bt, state, chunk: int = 64):
         # L is strictly lower triangular, so I+L is unit lower triangular and
         # its inverse exists for any input — no pivoting, no conditioning check.
         kk = torch.einsum("bihd,bjhd->bhij", kc, kc)
-        decay = torch.exp(gc.permute(0, 2, 1).unsqueeze(-1) - gc.permute(0, 2, 1).unsqueeze(-2))
+        # clamp before exp: gt <= 0 makes G non-increasing, so every entry the
+        # masks keep has a non-positive difference. The discarded upper triangle
+        # would otherwise overflow to inf and the mask turn it into NaN — the
+        # same reason the upstream kernels zero positive gate differences.
+        gp = gc.permute(0, 2, 1)
+        decay = torch.exp((gp.unsqueeze(-1) - gp.unsqueeze(-2)).clamp(max=0.0))
         low = torch.tril(torch.ones(n, n, device=v.device), -1)
         lmat = bc.permute(0, 2, 1).unsqueeze(-1) * kk * decay * low
         m = torch.linalg.solve_triangular(eye[:n, :n] + lmat, eye[:n, :n].expand_as(lmat),
@@ -517,7 +522,7 @@ def gdn_chunk_core(qn, kn, v, gt, bt, state, chunk: int = 64):
         core[:, c0:c1] = (first + qk @ d).permute(0, 2, 1, 3)
         glast = gc[:, -1]  # [B,HV]
         s = torch.exp(glast).unsqueeze(-1).unsqueeze(-1) * s + (
-            (torch.exp(glast.unsqueeze(1) - gc).permute(0, 2, 1).unsqueeze(-1)
+            (torch.exp((glast.unsqueeze(1) - gc).clamp(max=0.0)).permute(0, 2, 1).unsqueeze(-1)
              * kc.permute(0, 2, 1, 3)).transpose(-1, -2) @ d
         )
     return core, s
@@ -539,6 +544,7 @@ def gdn_forward(
     conv_window: "torch.Tensor | None" = None,
     seq_q_lens: "torch.Tensor | None" = None,
     keep_steps: int = 0,
+    chunkwise: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
     """Full gated-delta layer core: the executable spec for the model's GDN
     layer, mirroring agent-infer's host reference equation by equation (the
@@ -607,25 +613,30 @@ def gdn_forward(
     bt = torch.sigmoid(beta).view(b, t, nvh)
     gt = -torch.exp(a_log) * torch.nn.functional.softplus(g + dt_bias)
     exp_g = torch.exp(gt)
-    s_heads = [state[:, h].clone() for h in range(nvh)]
-    steps: list[torch.Tensor] = []
-    core = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
-    for step in range(t):
-        active = (seq_q_lens > step).reshape(b, 1, 1)
-        active_h = (seq_q_lens > step).reshape(b, 1)
-        for h in range(nvh):
-            kh = h * nkh // nvh
-            s_h = s_heads[h] * exp_g[:, step, h].view(b, 1, 1)
-            p = torch.einsum("bk,bkv->bv", kn[:, step, kh], s_h)
-            d = (v_raw[:, step, h] - p) * bt[:, step, h].unsqueeze(-1)
-            s_h = s_h + kn[:, step, kh].unsqueeze(-1) * d.unsqueeze(-2)
-            s_heads[h] = torch.where(active, s_h, s_heads[h])
-            core[:, step, h] = torch.where(
-                active_h, torch.einsum("bk,bkv->bv", qn[:, step, kh], s_h), 0
-            )
-        if step < keep_steps:
-            steps.append(torch.stack(s_heads, dim=1))
-    s = torch.stack(steps, dim=1) if keep_steps else torch.stack(s_heads, dim=1)
+    if chunkwise and not keep_steps and int(seq_q_lens.min()) == t:
+        # Every row full-length: the chunked form has no per-row valid mask, and
+        # a ragged batch would silently absorb padding into the recurrence.
+        core, s = gdn_chunk_core(qn, kn, v_raw, gt, bt, state, chunk=chunkwise)
+    else:
+        s_heads = [state[:, h].clone() for h in range(nvh)]
+        steps: list[torch.Tensor] = []
+        core = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
+        for step in range(t):
+            active = (seq_q_lens > step).reshape(b, 1, 1)
+            active_h = (seq_q_lens > step).reshape(b, 1)
+            for h in range(nvh):
+                kh = h * nkh // nvh
+                s_h = s_heads[h] * exp_g[:, step, h].view(b, 1, 1)
+                p = torch.einsum("bk,bkv->bv", kn[:, step, kh], s_h)
+                d = (v_raw[:, step, h] - p) * bt[:, step, h].unsqueeze(-1)
+                s_h = s_h + kn[:, step, kh].unsqueeze(-1) * d.unsqueeze(-2)
+                s_heads[h] = torch.where(active, s_h, s_heads[h])
+                core[:, step, h] = torch.where(
+                    active_h, torch.einsum("bk,bkv->bv", qn[:, step, kh], s_h), 0
+                )
+            if step < keep_steps:
+                steps.append(torch.stack(s_heads, dim=1))
+        s = torch.stack(steps, dim=1) if keep_steps else torch.stack(s_heads, dim=1)
     normed = core * torch.rsqrt(core.pow(2).mean(-1, keepdim=True) + 1e-6)
     normed = normed * norm_weight
     out = normed * silu(z.view(b, t, nvh, val_dim))
