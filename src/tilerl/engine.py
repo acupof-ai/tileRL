@@ -199,7 +199,8 @@ class _DecodeGraph:
     # cast, which the optimizer's copy_ invalidates in eager only.
     """
 
-    def __init__(self, model, backend, kv_pool, state_pool, batch_size, width=1):
+    def __init__(self, model, backend, kv_pool, state_pool, batch_size, width=1,
+                 last_only=False):
         device = backend.device
         B, W = batch_size, width
         # int32 end to end: every consumer is a kernel taking int32, and a
@@ -247,12 +248,13 @@ class _DecodeGraph:
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(2):
-                model.forward(self._ids, self._pos, self._kv, backend)
+                model.forward(self._ids, self._pos, self._kv, backend, last_only=last_only)
         torch.cuda.current_stream().wait_stream(s)
         self._graph = torch.cuda.CUDAGraph()
         hid: list = []
         with torch.cuda.graph(self._graph):
-            self._logits = model.forward(self._ids, self._pos, self._kv, backend, hidden_out=hid)
+            self._logits = model.forward(self._ids, self._pos, self._kv, backend,
+                                         hidden_out=hid, last_only=last_only)
         # Captured, so this tensor is rewritten in place by every replay — the
         # draft head reads the previous tick's hidden from it directly.
         self.hidden = hid[-1] if hid else None
@@ -265,11 +267,20 @@ class _DecodeGraph:
         length W.
         """
         for i, r in enumerate(reqs):
-            chain = chains[i] if chains else (r.output[-1],)
-            for j, tok in enumerate(chain):
-                self._ids_h[i, j] = tok
-                self._pos_h[i, j] = r.seq_len - 1 + j
-            self._sl_h[i] = r.seq_len - 1 + self._w
+            if r.phase == _PHASE_PREFILL:
+                # A prefill chunk is the same static shape as a decode chain —
+                # the engine buckets its width — so it captures the same way.
+                start = r.prefill_from
+                for j, tok in enumerate(r.tokens[start : start + self._w]):
+                    self._ids_h[i, j] = tok
+                    self._pos_h[i, j] = start + j
+                self._sl_h[i] = start + self._w
+            else:
+                chain = chains[i] if chains else (r.output[-1],)
+                for j, tok in enumerate(chain):
+                    self._ids_h[i, j] = tok
+                    self._pos_h[i, j] = r.seq_len - 1 + j
+                self._sl_h[i] = r.seq_len - 1 + self._w
             self._ss_h[i] = r.state_slot
             n = len(r.blocks)
             self._bt_h[i, :n] = torch.tensor(r.blocks, dtype=torch.int32)
@@ -314,7 +325,9 @@ class Engine:
         if decode_graph is None:
             decode_graph = backend.device.type == "cuda"
         self._decode_graph_on = decode_graph
-        self._decode_graphs: dict[int, _DecodeGraph] = {}
+        self._decode_graphs: dict = {}
+        self._prefill_graphs: dict = {}
+        self._prefill_graph_on = decode_graph
 
         # Speculation: the draft is one full-attn stack with its OWN kv plane
         # and no recurrent state — it must never reach the trunk's GDN slots.
@@ -678,6 +691,15 @@ class Engine:
             and self._run_decode_graph(decodes, chains)
         ):
             return
+        # A pure-prefill tick at a full bucketed chunk is one static shape too.
+        if (
+            not decodes
+            and prefill is not None
+            and self._prefill_graph_on
+            and chunk % _PREFILL_BUCKET == 0
+            and self._run_prefill_graph(prefill, chunk)
+        ):
+            return
         rows = decodes + ([prefill] if prefill is not None else [])
         seq_q = q_dec + ([chunk] if prefill is not None else [])
         # Bucket the forward width: tilelang kernels specialize on the shape,
@@ -715,26 +737,53 @@ class Engine:
         if prefill is not None:
             self._prefill_forwards += 1
             j = len(decodes)
-            prefill.prefill_from += chunk
-            prefill.seq_len = prefill.prefill_from
-            if prefill.prefill_from >= len(prefill.tokens):
-                # last_only may have collapsed the T axis to the final token.
-                self._sample_commit([(prefill, logits[j, min(chunk, logits.shape[1]) - 1], 0)])
-                # Publish the prompt prefix at a block boundary: the state
-                # slot still covers exactly the prompt tokens, so the
-                # snapshot is exact.
-                prompt_len = len(prefill.tokens) - len(prefill.output)
-                if prefill.phase != _PHASE_DONE and prompt_len % BLOCK_TOKENS == 0:
-                    self._publish_prefix(prefill, prompt_len)
-                if prefill.phase != _PHASE_DONE:
-                    if len(prefill.output) >= prefill.params.max_new_tokens:
-                        self._finish(prefill)
-                    else:
-                        prefill.phase = _PHASE_DECODE
+            # last_only may have collapsed the T axis to the final token.
+            self._finish_prefill(prefill, logits[j, min(chunk, logits.shape[1]) - 1], chunk)
         if decodes:
             self._decode_forwards += 1
         if decodes and prefill is not None:
             self._mixed_forwards += 1
+
+    def _finish_prefill(self, prefill: _Req, last_logits, chunk: int) -> None:
+        """Advance a prefill row by one chunk and, if that completed the
+        prompt, sample its first token and publish the prefix."""
+        prefill.prefill_from += chunk
+        prefill.seq_len = prefill.prefill_from
+        if prefill.prefill_from < len(prefill.tokens):
+            return
+        self._sample_commit([(prefill, last_logits, 0)])
+        # Publish the prompt prefix at a block boundary: the state slot still
+        # covers exactly the prompt tokens, so the snapshot is exact.
+        prompt_len = len(prefill.tokens) - len(prefill.output)
+        if prefill.phase != _PHASE_DONE and prompt_len % BLOCK_TOKENS == 0:
+            self._publish_prefix(prefill, prompt_len)
+        if prefill.phase != _PHASE_DONE:
+            if len(prefill.output) >= prefill.params.max_new_tokens:
+                self._finish(prefill)
+            else:
+                prefill.phase = _PHASE_DECODE
+
+    def _run_prefill_graph(self, prefill: _Req, chunk: int) -> bool:
+        """Replay a captured prefill chunk. Only a FULL chunk at the bucketed
+        width — a prompt's short tail is a one-off shape not worth a graph, and
+        a mixed tick's width is set by the prefill row anyway."""
+        key = (0, chunk)
+        g = self._prefill_graphs.get(key)
+        if g is None:
+            if len(self._prefill_graphs) >= 4:
+                return False  # ponytail: 4 widths cached; prompts rarely need more
+            try:
+                g = _DecodeGraph(self._model, self._backend, self._kv, self._states, 1,
+                                 width=chunk, last_only=True)
+            except Exception as exc:
+                warnings.warn(f"prefill graph capture failed for W={chunk} ({exc}); eager")
+                self._prefill_graph_on = False
+                return False
+            self._prefill_graphs[key] = g
+        logits = g.run([prefill])
+        self._prefill_forwards += 1
+        self._finish_prefill(prefill, logits[0, -1], chunk)
+        return True
 
     def _run_decode_graph(self, reqs: list[_Req], chains=None) -> bool:
         """Captured decode for a pure-decode tick (one graph per batch-size
