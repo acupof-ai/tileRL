@@ -514,6 +514,38 @@ def test_production_model_gradcheck():
         )
 
 
+def test_opd_lora_self_teacher():
+    """OPD with LoRA adapters: the engine rolls out, only the adapters move.
+
+    The base must be bit-identical afterwards — a self-teacher that drifts the
+    frozen weights is not a self-teacher — and every adapter must have been
+    stepped, which is what fails if add_lora attaches to nothing.
+    """
+    import torch
+
+    from tilerl.autograd import AdamW
+    from tilerl.cli import _build_model
+    from tilerl.engine import build_engine
+    from tilerl.model import add_lora
+    from tilerl.ops.backend import get_backend
+
+    backend = get_backend()
+    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    teacher = build_engine(cfg, model, backend, num_blocks=64, num_slots=4)
+    trainable = add_lora(model, rank=4)
+    assert trainable, "add_lora attached nothing: nothing for the tape to train"
+    base = {k: v.clone() for k, v in model.params.items() if k not in trainable}
+    before = {k: v.clone() for k, v in trainable.items()}
+    prompts = [list(range(8)), list(range(4, 12))]
+    losses = opd_loop(teacher, model, prompts, steps=2, backend=backend,
+                      optimizer=AdamW(lr=1e-2), seed=0, trainable=trainable)
+    assert len(losses) == 2 and all(l == l for l in losses), losses
+    for k, v in base.items():
+        assert torch.equal(model.params[k], v), f"frozen base moved: {k}"
+    moved = sum(not torch.equal(trainable[k], v) for k, v in before.items())
+    assert moved, "no adapter moved"
+
+
 def test_opd_loop_smoke():
     """One opd_loop step: the teacher engine generates, the student trains,
     the loss is finite."""

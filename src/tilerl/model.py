@@ -491,12 +491,16 @@ class Model:
 def add_lora(
     model: "Model", rank: int = 16, alpha: float = 32.0, seed: int = 0
 ) -> dict[str, torch.Tensor]:
-    """Attach LoRA adapters to every quantized linear; returns the new params.
+    """Attach LoRA adapters to every linear; returns the new params.
 
-    The base stays quantized and frozen (no bf16 master), so the tape's
+    The quantized base stays frozen (no bf16 master), so the tape's
     ``linear_fp4_frozen`` path gives dX only and the 27B trains inside one
     card's memory. B starts at zero, so the adapted model is bit-identical to
     the base on step 0; alpha/rank is folded into A's init.
+
+    A dense bf16 base (the tiny model, and therefore the CPU/CI path) gets
+    adapters too — otherwise this returns nothing there and the OPD loop has no
+    trainable tensors to hand the tape.
     """
     g = torch.Generator().manual_seed(seed)
     new: dict[str, torch.Tensor] = {}
@@ -506,6 +510,13 @@ def add_lora(
             n, kk = model.params[k].shape[0], model.params[k].shape[1] * 2
         elif suffix == "w8":
             n, kk = model.params[k].shape
+        elif (
+            model.params[k].ndim == 2
+            and not any(k.endswith(x) for x in (".lora_a", ".lora_b"))
+            and f"{k}.wq" not in model.params
+            and f"{k}.w8" not in model.params
+        ):  # dense base: the key IS the weight, so the adapter hangs off it
+            base, n, kk = k, *model.params[k].shape
         else:
             continue
         scale = (alpha / rank) / math.sqrt(kk)

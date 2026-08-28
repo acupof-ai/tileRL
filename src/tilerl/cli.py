@@ -115,6 +115,29 @@ def cmd_train(args: argparse.Namespace) -> None:
         f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
         f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}"
     )
+    if args.opd:
+        from .engine import build_engine
+        from .model import add_lora
+        from .spec import load_draft
+
+        # OPD: the teacher IS this model, generating through the engine with an
+        # EMA of the adapters. Speculation is a property of the teacher engine,
+        # so a draft head accelerates the rollout half without the loop knowing.
+        draft = load_draft(model, args.draft) if args.draft else None
+        # Engine first: build_engine materializes the params, and an adapter
+        # created before that points at an object the forward no longer reads.
+        teacher = build_engine(cfg, model, backend, num_blocks=512, num_slots=8,
+                               draft=draft, spec_depth=args.depth)
+        trainable = add_lora(model, rank=args.lora_rank)
+        prompts = [
+            torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist()
+            for _ in range(8)
+        ]
+        losses = train_mod.opd_loop(teacher, model, prompts, args.steps, backend,
+                                    optimizer, seed=args.seed, trainable=trainable)
+        for i, loss in enumerate(losses):
+            print(f"step {i + 1:4d}/{args.steps}  loss {loss:.4f}")
+        return
     for step in range(args.steps):
         # ponytail: fixed batch=2 seq=64 random-token batch; a real corpus
         # plugs in here without touching train_step.
@@ -265,6 +288,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--model", choices=["tiny"], default="tiny")
     p_train.add_argument("--steps", type=int, default=20)
     p_train.add_argument("--seed", type=int, default=0)
+    p_train.add_argument("--opd", action="store_true",
+                         help="on-policy distillation: the engine rolls out, LoRA adapters train")
+    p_train.add_argument("--lora-rank", type=int, default=16)
+    p_train.add_argument("--draft", help="draft head safetensors: speculative rollout (--opd)")
+    p_train.add_argument("--depth", type=int, default=2, help="drafts per row per tick")
     p_train.set_defaults(func=cmd_train)
 
     p_pretrain = sub.add_parser("pretrain", help="pretrain on a JSONL text corpus")
