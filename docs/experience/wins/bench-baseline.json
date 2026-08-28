@@ -1,4 +1,9 @@
 {
+  "accuracy/mmlu-200/sm90": {
+    "commit": "81e9789",
+    "date": "2026-08-28",
+    "tok_s": 81.0
+  },
   "decode-kv/d131072-b1/sm90": {
     "commit": "cd54d55",
     "date": "2026-08-28",
