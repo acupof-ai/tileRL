@@ -150,9 +150,6 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
         if depth > cfg.max_position_embeddings:
             continue
         for b in batches:
-            if depth * b > 65536:
-                print(f"  {depth:>7} {b:>3}   (skipped: KV pool would exceed one H20)")
-                continue
             # 2x headroom: the prefix store pins every finished prompt's blocks
             # for reuse, so a run that just drained still holds ~depth*B blocks.
             # outlive the batch's staggered prefill (chunks of 512/tick) or row 0 is
@@ -161,6 +158,9 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
             # 2x headroom (the prefix store pins finished prompts) up to 32K; at
             # 128K/256K the KV alone is 17/34 GB, so 1.1x and one row per pool.
             head = 2 if depth <= 32768 else 1.1
+            if depth * b * head > 294912:  # ~38 GB of KV + 23 GB weights on a 96 GB H20
+                print(f"  {depth:>7} {b:>3}   (skipped: KV pool would exceed one H20)")
+                continue
             need = int(head * (-(-(depth + gen) * b // BLOCK_TOKENS) + b))
             engine = build_engine(
                 cfg, model, backend,
