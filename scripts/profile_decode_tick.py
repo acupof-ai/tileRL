@@ -47,9 +47,9 @@ class Tracer:
         # carries its projection key and dispatch path.
         orig_linear = model._linear
 
-        def timed_linear(b, x, key):
+        def timed_linear(b, x, key, **kw):
             if not self.on:
-                return orig_linear(b, x, key)
+                return orig_linear(b, x, key, **kw)
             m = x.numel() // x.shape[-1]
             if f"{key}.wq" in model.params:
                 kind = "fp4"
@@ -59,7 +59,7 @@ class Tracer:
                 kind = "bf16"
             path = f"{kind}-{'gemv' if m == 1 else 'mma'}"
             self.linear_paths[key] = path
-            return self._rec(f"linear[{path}]:{key}", orig_linear, b, x, key)
+            return self._rec(f"linear[{path}]:{key}", orig_linear, b, x, key, **kw)
 
         model._linear = timed_linear
 
