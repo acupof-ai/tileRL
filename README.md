@@ -117,6 +117,10 @@ snapshot in `docs/experience/wins/bench-baseline.json`.
 Long context, B=1 (one sequence per card — the KV alone is 17 / 34 GB):
 **61.1 tok/s at 128K, 48.1 at 256K.**
 
+Training on the same card: LoRA on the frozen fp4 base (no bf16 master), **26.5
+/ 32.6 / 38.2 tok/s** at 1x64/128/256, peak 46.9-57.6 GB — full-parameter 27B
+does not fit at any batch size (54 GB of masters plus 216 GB of Adam moments).
+
 Accuracy: **MMLU 0-shot 76.3%** (763/1000, `scripts/mmlu.py`, sampling
 restricted to the answer-letter ids). The sglang rows are throughput only —
 the bf16 checkpoint it has to run on emits garbage text
