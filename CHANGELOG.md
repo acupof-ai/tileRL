@@ -31,6 +31,37 @@ verdict**. Newest first.
   Teacher-forced agreement 0.0% -> 84.4%.
   [errors/2026-08-29-draft-head-missing-zero-centered-fold.md](docs/experience/errors/2026-08-29-draft-head-missing-zero-centered-fold.md)
 
+## 2026-08-29 — phase exit: prefill 1.15x, and four false wins retired
+
+- **Prefill 1836 -> 2109.7 tok/s (1.15x)**, from two changes that the
+  per-kernel GPU table could not show: the tick's KV descriptors crossed to the
+  device 971 times per prefill, synchronously (+9%), and lm_head ran over all
+  512 positions of a chunk to use one (+3.1%). MMLU held at 81.0% throughout.
+  [wins/2026-08-29-pinned-kv-descriptors.md](docs/experience/wins/2026-08-29-pinned-kv-descriptors.md),
+  [wins/2026-08-29-prefill-lm-head-last-token.md](docs/experience/wins/2026-08-29-prefill-lm-head-last-token.md)
+- **Rejected on measurement:** speculation (0.43-0.76x of plain graph decode,
+  every batch and depth); the chunked GDN prefill (third attempt, broken and
+  7.1x slower); prefill graph capture (unblocked, ~1%, reverted — capture pays
+  where dispatch is exposed, and prefill's is not).
+- **Four claims retired as measurement errors, not results.** Speculation's
+  "1.14x" compared against the eager path when the shipped decode is
+  graph-captured; "wins at B=8" compared two scripts with different prompts and
+  warmups; the sglang prefill gap compared our B=1 against their B=8 (2.03x,
+  not 2.5x); and "chunkwise-WY was never measured" missed two A/B tables in the
+  same directory. Every number was real and every conclusion was wrong.
+- The harness now makes those four mistakes structurally hard: the spec suite
+  measures its own no-draft arm, prefill takes three readings, a baseline raise
+  requires the row's spread to clear the margin, and `--suite accuracy` gates
+  MMLU so a change that breaks the logits cannot pass on speed alone.
+- **GDN prefill is SM-limited, measured**: 2x the blocks in one launch costs
+  1.67x the time, so a V split is worth 1.20x on the kernel and 5.5-8.6%
+  overall. Not implemented — it needs the gated RMSNorm moved to a second
+  launch in a file where three rewrites have failed, and it does not reach the
+  1.91x that remains.
+  [errors/2026-08-29-gdn-48-blocks-78-sms.md](docs/experience/errors/2026-08-29-gdn-48-blocks-78-sms.md)
+- `tilerl train --opd` runs the EMA self-teacher loop; `add_lora` attached to
+  nothing on a dense base, so the OPD path could not run on CPU at all.
+
 ## 2026-08-29 — the harness gates accuracy, not only speed
 
 - Every gate in the bench harness measured tok/s, so a change that broke the
