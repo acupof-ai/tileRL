@@ -241,6 +241,8 @@ def main():
     p.add_argument("source")
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--batches", type=str, default="1,8")
+    p.add_argument("--draft", help="draft head safetensors: profile a speculative tick")
+    p.add_argument("--depth", type=int, default=4)
     args = p.parse_args()
 
     backend = get_backend()
@@ -259,7 +261,12 @@ def main():
 
     # Eager engine first: its warmup JITs every decode shape, so the graph
     # engine's capture hits warm tilelang artifacts (no NVCC in capture).
-    eager = build_engine(cfg, model, backend, num_blocks=512, num_slots=8, decode_graph=False)
+    from tilerl.spec import load_draft
+
+    eager = build_engine(
+        cfg, model, backend, num_blocks=512, num_slots=8, decode_graph=False,
+        draft=load_draft(model, args.draft) if args.draft else None, spec_depth=args.depth,
+    )
     tracer = Tracer(backend, model)
     tracer.install(eager)
     for b in batches:
