@@ -4,6 +4,28 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-29 — the harness gates accuracy, not only speed
+
+- Every gate in the bench harness measured tok/s, so a change that broke the
+  logits passed all of them. `--suite accuracy` seeds at **81.0%** (162/200,
+  0-shot MMLU, fixed greedy slice); `mmlu.py`'s scoring is now shared with it
+  rather than living in a script nobody ran on a green bench. Baseline raises
+  additionally require the row's spread to be under the raise margin.
+- The 27B LoRA train rows pass again after the backward-tile revert
+  (26.1 / 32.5 / 37.6 tok/s, 0.983-0.995x) — the earlier 0.962x FAIL was that
+  change, not a regression.
+- Speculative decoding: the engine's multi-token verify path is CORRECT
+  (matches T=1 greedy exactly at chunk widths 2/5/9, and the block loop
+  reproduces greedy with an always-wrong and an always-right draft). The draft
+  head is one full-attn layer, 1% of the trunk, so speculation costs about 10%
+  of a tick. `fc` consumes `concat(embed, hidden)`, not the reverse.
+  [errors/2026-08-29-draft-probe-parallel-implementation.md](docs/experience/errors/2026-08-29-draft-probe-parallel-implementation.md)
+- Chunkwise-WY GDN prefill was ruled out on 2026-08-24 by an argument, not a
+  parity run, and the argument is wrong — the intra-chunk term the objection
+  said was dropped is carried by `wy_fast`'s `W`/`U`. A 1.36x prefill win was
+  closed off for four days.
+  [errors/2026-08-29-chunkwise-wy-wrongly-ruled-out.md](docs/experience/errors/2026-08-29-chunkwise-wy-wrongly-ruled-out.md)
+
 ## 2026-08-28 — phase exit: 27B LoRA training is 28-40x faster — the step was launch-bound
 
 - One train_step issued **671,123 kernel launches** (8 layers, 1x64); every
@@ -16,9 +38,11 @@ verdict**. Newest first.
 - The frozen-base backward is now one fused dequant+GEMM kernel (`gx = grad @ W`
   contracts over the weight's ROW index, so a packed slab is already gemm_nn's
   B tile — no transpose, no materialized weight). Worth 1.18x on its own.
-- Bundled NextN draft head loads and drafts: **64.5% greedy acceptance** at
-  depth 4 (agent-infer records 33% for this checkpoint). Small sample, random
-  prompt — re-measure before wiring the engine loop.
+- Bundled NextN draft head loads and drafts. The acceptance rate quoted here
+  on 2026-08-28 was void, as were four later readings — the probe
+  re-implemented the engine's decode path and diverged from it five different
+  ways. No acceptance number stands yet.
+  [errors/2026-08-29-draft-probe-parallel-implementation.md](docs/experience/errors/2026-08-29-draft-probe-parallel-implementation.md)
 
 ## 2026-08-28 — verdict: mma8 bf16 block scales rejected (flat), KV split count by occupancy accepted
 
