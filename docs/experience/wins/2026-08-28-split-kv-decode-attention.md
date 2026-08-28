@@ -28,7 +28,10 @@ the dense kernel (bf16 output rounding), **1.451 → 0.256 ms (5.7×)**.
 Decode attention needs parallelism along the KV length, not along query
 heads; pack the GQA group into the M tile so the KV is read once. The
 gathers are still synchronous (tilelang 0.1.13, no cp.async for elementwise
-copies) — 16 splits hide that; per-block TMA copies are the next step.
+copies) — 16 splits hide that. Per-page `T.copy` (4 × 16-row copies per
+64-token tile, 2-stage pipeline) was measured: correct but 0.630 ms vs
+0.256 — the bulk-copy path costs more at page granularity than it hides.
+Stays on the gather.
 
 ## Results
 
