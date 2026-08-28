@@ -4,7 +4,7 @@
 
 `gdn_chunk_fused` scans T tokens serially and is **32.1% of a real 64-layer
 prefill** (192 launches x 1663.9 us = 319.5 ms of 995.1 ms; 2058 tok/s
-GPU-bound against sglang's 4908). The chunkwise-WY decomposition is all batched
+GPU-bound; sglang's B=1 fp8 prefill is 4022, and the 4908 quoted elsewhere is its B=8). The chunkwise-WY decomposition is all batched
 matmul plus a triangular solve, so the cheap hypothesis was that torch/cuBLAS
 already beats the serial kernel and no tilelang work is needed.
 

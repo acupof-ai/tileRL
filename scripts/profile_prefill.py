@@ -1,6 +1,6 @@
 """Per-kernel GPU time in a PREFILL forward — the twin of
 profile_graph_kernels.py, which only sees the captured decode graph. Prefill is
-the biggest measured gap against sglang (1836 vs 4908 tok/s), and nothing in the
+the biggest measured gap against sglang (B=1: 1836 vs 4022 tok/s), and nothing in the
 tree said where its time goes.
 
 Prefill is not graph-captured (shapes vary), so this profiles the real

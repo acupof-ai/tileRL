@@ -5,7 +5,7 @@
 ## Context
 
 Prefill was 1836 tok/s end to end against 2058 "GPU-bound" from the same
-profile, and 4908 for sglang. Every analysis of the gap had been driven off the
+profile, and 4022 for sglang at the same B=1 (the 4908 quoted around the tree is its B=8 row). Every analysis of the gap had been driven off the
 per-kernel GPU table, where the three big kernels account for 86.5% and nothing
 looks wrong. **A GPU-busy total cannot see host stall**, which is where the
 first 11% was.
