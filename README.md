@@ -109,7 +109,7 @@ snapshot in `docs/experience/wins/bench-baseline.json`.
 
 | | B=1 tok/s @512 / 2k / 8k / 32k | B=8 agg tok/s @512 | prefill tok/s @512 |
 |---|---|---:|---:|
-| **tileRL** (native NVFP4 + FP8, this repo) | **92.5 / 87.3 / 87.9 / 78.6** | 308.6 | 1836 |
+| **tileRL** (native NVFP4 + FP8, this repo) | **92.4 / 87.3 / 88.9 / 80.1** | 308.0 | 1836 |
 | Arle (agent-infer, same card) | 84.5 | — | — |
 | sglang bf16 (same card; no NVFP4 path on Hopper) | 54.2 | **387** | 2512 |
 | sglang online-fp8 | 39.9 | 266.6 | **4908** |
@@ -139,7 +139,7 @@ the sglang comparison and its caveats:
 | ROCm target | never executed — resolves to the CPU kernel set |
 | sm100 / sm120 | registered empty; `NotImplementedError` on use |
 | Tiny model end-to-end | ✓ |
-| Qwen3.8-27B NVFP4 weights | ✓ served natively (twiddled fp4 + fp8), 92.5 tok/s B=1 on H20, MMLU 76.3% |
+| Qwen3.8-27B NVFP4 weights | ✓ served natively (twiddled fp4 + fp8), 92.4 tok/s B=1 on H20, MMLU 76.3% |
 | Paged KV + prefix cache | ✓ (tiny) |
 | Autograd tape + OPD | ✓ (tiny) |
 | OpenAI-compatible server | ✓ |
