@@ -10,7 +10,8 @@ verdict**. Newest first.
   (inside the 3% gate). The three residual GEMVs (o_proj, down, out_proj)
   write `Res + y·oscale` in f32 on the serving path (`Model._add_via`); the
   tape path keeps `backend.add`. n_partition sweep: 2 ≈ 4 > 8 > 16.
-  Entry: `docs/experience/wins/2026-08-28-decode-glue-casts.md`.
+  Entry: `docs/experience/wins/2026-08-28-decode-glue-casts.md`. Method
+  record of the whole day: `docs/experience/2026-08-28-decode-52-to-84.md`.
 - Day total: 52.6 → 83.9 tok/s B=1, 142.7 → 212.5 agg B=8, prefill 1566 →
   1795 tok/s. Left on the table: the conv-window gather/scatter (needs a
   double-buffered pool), GEMV occupancy (7 blocks/SM), and B=8's WGMMA path.
