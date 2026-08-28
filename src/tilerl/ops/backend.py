@@ -708,6 +708,12 @@ class Backend:
         """Full-GDN layer core. sm90: T=1 uses the fused decode kernel, T>1 the
         fused chunk kernel; other arches use the torch-eager reference."""
         _kset = _resolve(self.precision, self.arch)
+        # A/B lever for the prefill port: the chunked form is all bmm plus a
+        # triangular solve, so cuBLAS may already beat the serial-scan kernel
+        # without a line of tilelang. Unset = the shipped kernel.
+        chunk = int(os.environ.get("TILERL_GDN_CHUNKWISE", "0"))
+        if chunk and q.shape[1] > 1 and not kw.get("keep_steps"):
+            return reference.gdn_forward(q, k, v, g, beta, state, chunkwise=chunk, **kw)
         if q.shape[1] > 1 and "gdn_chunk_fused" in _kset:
             return self._gdn_chunk_fused(q, k, v, g, beta, state, **kw)
         return reference.gdn_forward(q, k, v, g, beta, state, **kw)
