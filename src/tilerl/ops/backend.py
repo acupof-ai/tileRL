@@ -679,10 +679,10 @@ class Backend:
             if oscale is not None:  # scales weight row n: fold into [M,N], not [N,K]
                 g = g * self._bf16(oscale).reshape(1, -1)
             m = g.shape[0]
-            # block_N is the OUTPUT (weight-column) tile, and it sets how many
-            # packed bytes each row's load touches: 64 columns is 32 bytes out
-            # of a 8704-byte row stride, which measured 58 GB/s (3% of HBM).
-            bM, bN = _snap_mma_tile(min(64, m), 64), 128
+            # 128 output columns (2x the bytes per weight-row transaction) was
+            # measured and is not better: 1x256 read 0.962x. The kernel is not
+            # bound where the coalescing argument said it was.
+            bM, bN = _snap_mma_tile(min(64, m), 64), 64
             gx = self._kernel("linear_fp4_bwd")(
                 _pad2d(self._c(g), _round_up(m, bM), _round_up(n, _MMA_RED)),
                 _pad2d(wq, _round_up(n, _MMA_RED), _round_up(k, bN) // 2),
