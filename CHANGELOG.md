@@ -4,13 +4,19 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
-## 2026-08-29 — phase exit: speculative decoding ships, 1.14-1.19x
+## 2026-08-29 — verdict: speculative decoding REJECTED on throughput, kept on correctness
 
 - Speculation lives in the engine: a decode row drafts off the trunk's last
   hidden and the SAME forward verifies it as a `seq_q = 1+depth` row. The paged
   KV self-heals; the gated-delta state is kept after every chain step and the
   accepted length selects one — no snapshot, no second forward.
-  **B=1 15.5 -> 17.6 tok/s (depth 2), B=8 82.6 -> 97.9 aggregate (depth 4).**
+  Goodput is real: **1.87 committed tokens per trunk forward, 43-47%
+  acceptance**. Throughput is not. A draft disables graph capture, and the
+  shipped decode IS graph-captured: **B=1 86.2 tok/s graph vs 17.6 speculating**
+  — 4.9x slower than what ships. The first reading here compared against the
+  EAGER path (10.9 tok/s), which is not what runs. Retracted the same day;
+  speculation pays only once a spec tick can be captured, one graph per
+  `(B, 1+depth)`.
   [wins/2026-08-29-spec-decode-net-win.md](docs/experience/wins/2026-08-29-spec-decode-net-win.md)
 - It was a 6.5x net LOSS first. The head shipped dense bf16, which
   `Backend.linear` serves at ~30 GB/s — 9.7 ms per projection against the
