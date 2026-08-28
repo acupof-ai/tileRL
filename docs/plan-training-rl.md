@@ -58,10 +58,18 @@ all-reduce per sublayer (64 layers × 2 ≈ 128 all-reduces/tick; at ~10 µs on
 NV18 that is ~1.3 ms — acceptable for decode, negligible for training).
 Attention TP = one KV head per card (8 heads / 8 cards) ⇒ the 32k KV
 problem is solved by the same cut. GDN TP = value heads split (48 / 8).
-- **Decision needed:** collectives. The "torch is a container" rule bars
-  autograd/optim, not transport; proposal: `torch.distributed` (NCCL) as the
-  only allowed torch subsystem beyond the tensor type, wrapped in one
-  `tilerl/ops/comm.py` seam so a non-torch transport can replace it.
+- **Collectives, two layers behind one `tilerl/ops/comm.py` seam.** Training
+  traffic (grad all-reduce, ZeRO shards, CP ring: MB–GB) goes through
+  `torch.distributed` NCCL — the "torch is a container" rule bars autograd
+  and optim, not transport, and nothing else is as mature. Decode TP traffic
+  is 10 KB per all-reduce, 128 times per tick: NCCL's ~15 µs floor would be
+  ~2 ms of a ~3 ms TP-8 tick, so those go through a TileLang CUDA-IPC
+  one-shot all-reduce kernel (each card writes its slice into peers' mapped
+  buffers, one kernel reduces; ~3–5 µs, graph-capturable by construction,
+  later fusable into the GEMV epilogue — the vLLM / TensorRT-LLM design in
+  our one backend). Alternatives priced and declined: raw NCCL via ctypes
+  (same latency, re-implements rendezvous), NVSHMEM (only pays for MoE
+  all-to-all; this model has none).
 - Gate: TP-8 decode tick vs TP-1 (expect ~1.4 ms + weights/8 ⇒ B=1 tick ≈
   3 ms, >300 tok/s single stream); loss bit-identical to TP-1 on tiny
   (deterministic reduce order); harness rows per TP degree.
