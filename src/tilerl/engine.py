@@ -11,6 +11,14 @@ chunk share one forward), decode-only, or prefill-only — vLLM/sglang
 continuous batching with chunked prefill, mirrored through agent-infer's
 ``build_forward_plan`` (waiting/running queues, per-tick token budget, decode
 rows first; no preemption/swap day-1 — admission is capped at ``max_batch``).
+Speculation (optional, ``draft=``): a decode row drafts up to ``spec_depth``
+tokens off the trunk's last hidden, and the SAME forward verifies them as a
+seq_q = 1+depth row — no second code path. The trunk's paged KV needs no
+rollback (a rejected draft's slot is overwritten next tick), but the gated-delta
+recurrent state does: the verify forward keeps the state after every chain step
+(``BatchKv.keep_steps``) and the engine adopts the one at the accepted length.
+Spec ticks run eager; pure-decode ticks without a draft still replay the graph.
+
 The decode tick is a captured kernel sequence, not an interpreted one
 (design-engine.md): on CUDA, a pure-decode tick replays a per-batch-size
 ``_DecodeGraph`` (static input buffers + static pools, captured lazily per
@@ -49,6 +57,7 @@ import numpy as np
 import torch
 
 from .kv_cache import BLOCK_TOKENS, LinearStatePool, PagedKvPool, PrefixStore
+from .spec import survival, verify_lens
 
 _PREFILL_BUCKET = 64  # prefill widths are padded to this: bounded kernel shapes
 
@@ -118,6 +127,9 @@ class _Req:
     own_blocks: int  # blocks the engine allocated (vs adopted from a hit)
     output: list[int] = field(default_factory=list)
     thought_closed: bool = False  # the reasoning block ended (model's or forced)
+    #: trunk hidden [1,1,H] at the position that produced ``output[-1]`` — the
+    #: draft head's fc input; None until this row has run a forward.
+    hidden: torch.Tensor | None = None
 
 
 @dataclass
@@ -139,6 +151,9 @@ class BatchKv:
     kv_pool: Any
     state_pool: Any
     seq_q_lens: torch.Tensor | None = None  # [B] valid query tokens per row
+    #: speculative verify: keep the recurrent state after each of the first
+    #: ``keep_steps`` chain tokens, so the accepted length can select one.
+    keep_steps: int = 0
 
 
 class _DecodeGraph:
@@ -251,6 +266,8 @@ class Engine:
         prefix_store: Any,
         limits: StepLimits,
         decode_graph: bool | None = None,
+        draft: Any = None,
+        spec_depth: int = 4,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -264,8 +281,23 @@ class Engine:
         # default/fallback everywhere else and on capture failure.
         if decode_graph is None:
             decode_graph = backend.device.type == "cuda"
-        self._decode_graph_on = decode_graph
+        # A captured decode replays one T=1 step and yields no hidden state, so
+        # it can neither verify a chain nor feed the next tick's draft.
+        self._decode_graph_on = decode_graph and draft is None
         self._decode_graphs: dict[int, _DecodeGraph] = {}
+
+        # Speculation: the draft is one full-attn stack with its OWN kv plane
+        # and no recurrent state — it must never reach the trunk's GDN slots.
+        # One block per row holds a chain (depth+1 <= BLOCK_TOKENS tokens).
+        self._draft = draft
+        self._spec_depth = spec_depth if draft is not None else 0
+        if draft is not None:
+            if not 0 < spec_depth < BLOCK_TOKENS:
+                raise ValueError(f"spec_depth must be in [1, {BLOCK_TOKENS}), got {spec_depth}")
+            self._draft_kv = PagedKvPool(
+                limits.max_batch, draft.cfg.num_kv_heads, draft.cfg.head_dim,
+                num_layers=draft.cfg.num_layers, device=backend.device,
+            )
 
         self._lock = threading.RLock()
         self._wake = threading.Event()
@@ -295,6 +327,8 @@ class Engine:
         self._decode_forwards = 0
         self._mixed_forwards = 0
         self._tokens_generated = 0
+        self._spec_drafted = 0
+        self._spec_accepted = 0
 
     # ------------------------------------------------------------------ API
 
@@ -317,7 +351,8 @@ class Engine:
                     f"request ({total} tokens) exceeds max_total_tokens "
                     f"({self.limits.max_total_tokens})"
                 )
-            if self._kv.blocks_for_tokens(total) > self._kv.num_blocks:
+            # +depth: a verify tick materializes the drafts past the last token
+            if self._kv.blocks_for_tokens(total + self._spec_depth) > self._kv.num_blocks:
                 raise ValueError(f"request ({total} tokens) exceeds KV pool capacity")
         with self._lock:
             rid = self._next_id
@@ -479,6 +514,8 @@ class Engine:
                 "decode_forwards": self._decode_forwards,
                 "mixed_forwards": self._mixed_forwards,
                 "tokens_generated": self._tokens_generated,
+                "spec_drafted": self._spec_drafted,
+                "spec_accepted": self._spec_accepted,
             }
 
     # -------------------------------------------------------------- internals
@@ -506,7 +543,7 @@ class Engine:
         """Collision-safe key for a prefix's boundary-state snapshot."""
         return tuple(tokens)
 
-    def _make_kv(self, reqs: list[_Req], seq_q: list[int]) -> BatchKv:
+    def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0) -> BatchKv:
         # Fixed width = pool size: the kernels bake the table width into the
         # compiled kernel (Mb is a compile const), so a per-tick max-blocks
         # width recompiles on every block growth. Rows zero-pad; the kernels
@@ -519,9 +556,13 @@ class Engine:
             bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
             # Materialized length AFTER this forward: a prefill row completes
             # its chunk (prefill_from is the chunk start); a decode row writes
-            # the sampled token at [seq_len-1, seq_len), so seq_len itself is
-            # the post-write length.
-            sl[i] = r.prefill_from + seq_q[i] if r.phase == _PHASE_PREFILL else r.seq_len
+            # its chain at [seq_len-1, seq_len-1+seq_q), so the post-write
+            # length is seq_len-1+seq_q (== seq_len for a plain T=1 decode).
+            sl[i] = (
+                r.prefill_from + seq_q[i]
+                if r.phase == _PHASE_PREFILL
+                else r.seq_len - 1 + seq_q[i]
+            )
             ss[i] = r.state_slot
             sql[i] = seq_q[i]
         return BatchKv(
@@ -531,34 +572,39 @@ class Engine:
             kv_pool=self._kv,
             state_pool=self._states,
             seq_q_lens=sql,
+            keep_steps=keep_steps,
         )
-
-    def _sample(self, logits_row: torch.Tensor, req: _Req, generated_idx: int) -> int:
-        seed = _step_seed(req.params.seed, generated_idx)
-        tok = self._backend.sample(
-            _restrict(logits_row.reshape(1, -1), req.params), req.params.temperature,
-            req.params.top_p, seed,
-        )
-        return int(torch.as_tensor(tok).flatten()[0])
 
     def _run_forward(self, decodes: list[_Req], prefill: _Req | None, chunk: int) -> None:
         """Run one mixed/decode/prefill forward over the planned rows.
 
         Rows are left-aligned valid tokens padded to a shared T (decode rows:
-        1 token at t=0; the prefill row: its chunk), with per-row
-        ``seq_q_lens`` so the kernels touch only valid positions.
+        1 token, or a 1+depth draft chain on a verify tick; the prefill row:
+        its chunk), with per-row ``seq_q_lens`` so the kernels touch only valid
+        positions.
         """
+        # Speculate on pure-decode ticks only: a mixed tick's width is the
+        # bucketed prefill chunk, which the step-state buffers cannot cover.
+        chains = (
+            self._draft_chains(decodes)
+            if self._draft is not None and decodes and prefill is None
+            else None
+        )
+        if chains is not None and max(map(len, chains)) == 1:
+            chains = None  # the policy kept nothing: a plain decode tick
+        q_dec = [len(c) for c in chains] if chains else [1] * len(decodes)
         growth = sum(
-            max(0, (r.seq_len + BLOCK_TOKENS) // BLOCK_TOKENS - len(r.blocks)) for r in decodes
+            max(0, (r.seq_len + q - 1 + BLOCK_TOKENS) // BLOCK_TOKENS - len(r.blocks))
+            for r, q in zip(decodes, q_dec)
         )
         if growth:
             evict = getattr(self._prefix, "evict_until_free", None)
             if evict is not None:
                 evict(growth)
-        for r in decodes:
-            # Blocks must cover the new token at position r.seq_len.
+        for r, q in zip(decodes, q_dec):
+            # Blocks must cover the chain's last position, r.seq_len-1+q.
             # Exhaustion raises -> step() finishes the running requests.
-            while len(r.blocks) * BLOCK_TOKENS <= r.seq_len:
+            while len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 1 + q:
                 r.blocks.append(self._kv.alloc_block())
                 r.own_blocks += 1
                 self._blocks_used += 1
@@ -570,34 +616,45 @@ class Engine:
         ):
             return
         rows = decodes + ([prefill] if prefill is not None else [])
-        seq_q = [1] * len(decodes) + ([chunk] if prefill is not None else [])
+        seq_q = q_dec + ([chunk] if prefill is not None else [])
         # Bucket the forward width: tilelang kernels specialize on the shape,
         # so a width equal to the prompt length compiles a kernel set per
         # distinct prompt (MMLU: 662 variants in 20 min, GPU idle). Padding
         # rows are masked by seq_q_lens everywhere; the true chunk indexes the
         # logits below.
-        width = -(-max(seq_q) // _PREFILL_BUCKET) * _PREFILL_BUCKET if chunk > 1 else 1
+        # A verify width is exact (a handful of shapes, 1+depth at most); only
+        # a real prefill chunk is bucketed.
+        width = -(-max(seq_q) // _PREFILL_BUCKET) * _PREFILL_BUCKET if chunk > 1 else max(seq_q)
         input_ids = np.zeros((len(rows), width), dtype=np.int64)
         positions = np.zeros((len(rows), width), dtype=np.int64)
         for i, r in enumerate(decodes):
-            input_ids[i, 0] = r.output[-1]
-            positions[i, 0] = r.seq_len - 1
+            chain = chains[i] if chains else [r.output[-1]]
+            input_ids[i, : len(chain)] = chain
+            positions[i, : len(chain)] = np.arange(r.seq_len - 1, r.seq_len - 1 + len(chain))
         if prefill is not None:
             j = len(decodes)
             start = prefill.prefill_from
             input_ids[j, :chunk] = prefill.tokens[start : start + chunk]
             positions[j, :chunk] = np.arange(start, start + chunk)
+        hid: list | None = [] if self._draft else None
         logits = self._model.forward(
-            input_ids, positions, self._make_kv(rows, seq_q), self._backend
+            input_ids, positions, self._make_kv(rows, seq_q, width if chains else 0),
+            self._backend, hidden_out=hid,
         )
-        self._after_forward_batch([(r, logits[i, 0], len(r.output)) for i, r in enumerate(decodes)])
+        if hid is not None:
+            for i, r in enumerate(rows):  # the draft's fc input next tick
+                r.hidden = hid[-1][i : i + 1, seq_q[i] - 1 : seq_q[i]]
+        if chains:
+            self._verify(decodes, chains, logits, hid[-1])
+        else:
+            self._sample_commit([(r, logits[i, 0], len(r.output)) for i, r in enumerate(decodes)])
         if prefill is not None:
             self._prefill_forwards += 1
             j = len(decodes)
             prefill.prefill_from += chunk
             prefill.seq_len = prefill.prefill_from
             if prefill.prefill_from >= len(prefill.tokens):
-                self._after_forward(prefill, logits[j, chunk - 1], generated_idx=0)
+                self._sample_commit([(prefill, logits[j, chunk - 1], 0)])
                 # Publish the prompt prefix at a block boundary: the state
                 # slot still covers exactly the prompt tokens, so the
                 # snapshot is exact.
@@ -631,52 +688,135 @@ class Engine:
             self._decode_graphs[B] = g
         logits = g.run(reqs)
         self._decode_forwards += 1
-        self._after_forward_batch([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
+        self._sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
         return True
 
-    def _after_forward(self, req: _Req, last_logits: torch.Tensor, generated_idx: int) -> None:
-        self._after_sample(req, self._sample(last_logits, req, generated_idx), generated_idx)
+    def _draft_chains(self, rows: list[_Req]) -> list[list[int]]:
+        """Draft up to ``spec_depth`` tokens per row, then trim each row to the
+        length its confidence makes worth verifying (spec.verify_lens).
 
-    def _after_forward_batch(self, rows: list[tuple]) -> None:
+        Returns per row ``[last committed token, kept drafts...]`` — the chain
+        the verify forward consumes. Chain token j sits at absolute position
+        ``seq_len-1+j``; the draft's own KV is chain-local (block i, offset j)
+        and it never touches the trunk's recurrent state.
+        """
+        n, dev = len(rows), self._backend.device
+        chains = [[r.output[-1]] for r in rows]
+        confs: list[list[float]] = [[] for _ in rows]
+        h = torch.cat([r.hidden for r in rows], dim=0)
+        bt = torch.arange(n, dtype=torch.long, device=dev).reshape(n, 1)
+        ones = torch.ones(n, dtype=torch.long, device=dev)
+        for j in range(self._spec_depth):
+            kv = BatchKv(
+                block_table=bt, seq_len=ones * (j + 1), state_slot=torch.zeros_like(ones),
+                kv_pool=self._draft_kv, state_pool=None, seq_q_lens=ones,
+            )
+            dh: list = []
+            logits = self._draft.forward(
+                h,
+                np.array([[c[-1]] for c in chains], dtype=np.int64),
+                np.array([[r.seq_len - 1 + j] for r in rows], dtype=np.int64),
+                kv, self._backend, hidden_out=dh,
+            )
+            tok, prob = self._backend.greedy(logits)
+            conf = self._draft.confidence(dh[-1], prob, self._backend)
+            for i, (t, c) in enumerate(zip(tok[:, -1].tolist(), conf[:, -1].tolist())):
+                chains[i].append(int(t))
+                confs[i].append(float(c))
+            h = dh[-1]
+        keep = verify_lens([survival(c) for c in confs])
+        for i, r in enumerate(rows):
+            p = r.params
+            if p.thinking_budget is not None and p.end_think_ids and not r.thought_closed:
+                keep[i] = 0  # a forced end-think token is not the sampler's, so nothing to verify
+            del chains[i][1 + keep[i] :]
+        return chains
+
+    def _verify(self, rows, chains, logits, hidden) -> None:
+        """Accept the leading run of drafts the trunk agrees with, adopt the
+        recurrent state at that length, and commit the accepted prefix plus the
+        trunk's own bonus token.
+
+        Sampling is per (row, chain position) with the same per-generated-index
+        seed a T=1 rollout would use, so an accepted token is bit-identical to
+        the unspeculated one. Rejected drafts leave KV past the new length,
+        which the next tick overwrites."""
+        flat = [
+            (r, logits[i, j], len(r.output) + j)
+            for i, r in enumerate(rows)
+            for j in range(len(chains[i]))
+        ]
+        toks, at = self._sample_batch(flat), 0
+        for i, r in enumerate(rows):
+            got = toks[at : at + len(chains[i])]
+            at += len(chains[i])
+            n_ok = 0
+            while n_ok < len(got) - 1 and got[n_ok] == chains[i][n_ok + 1]:
+                n_ok += 1
+            self._spec_accepted += n_ok
+            self._spec_drafted += len(chains[i]) - 1
+            self._states.select_step(r.state_slot, n_ok)
+            r.hidden = hidden[i : i + 1, n_ok : n_ok + 1]
+            self._commit(r, got[: n_ok + 1])
+
+    def _sample_batch(self, rows: list[tuple]) -> list[int]:
         """Batched sampling for a decode tick: one sort/softmax over all rows
         instead of B per-row calls (8.2% of the B=8 slice tick was 8 separate
         sorts + D2H syncs). Per-row seeds keep the draws identical to the
-        per-row path."""
+        per-row path. Returns the sampled tokens; the caller commits them (a
+        verify tick samples every chain position and commits only the
+        accepted prefix)."""
         if not rows:
-            return
+            return []
         logits = torch.stack([_restrict(l, r.params) for r, l, _ in rows])
         dev = logits.device
         temps = torch.tensor([r.params.temperature for r, _, _ in rows], device=dev)
         top_ps = torch.tensor([r.params.top_p for r, _, _ in rows], device=dev)
         seeds = torch.tensor([_step_seed(r.params.seed, g) for r, _, g in rows], device=dev)
-        toks = self._backend.sample_batch(logits, temps, top_ps, seeds)
-        for (req, _, generated_idx), tok in zip(rows, toks):
-            self._after_sample(req, int(tok), generated_idx)
+        return [int(t) for t in self._backend.sample_batch(logits, temps, top_ps, seeds)]
 
-    def _after_sample(self, req: _Req, tok: int, generated_idx: int) -> None:
+    def _sample_commit(self, rows: list[tuple]) -> None:
+        """Sample one token per row and commit it (every non-verify path)."""
+        for (r, _, _), tok in zip(rows, self._sample_batch(rows)):
+            self._commit(r, [tok])
+
+    def _commit(self, req: _Req, toks: list[int]) -> None:
+        """Append sampled tokens in order, stopping at the first one the
+        request did not take verbatim (finished, or a forced end-think
+        rewrite).
+
+        Only the last token of a chain may publish its prefix: the snapshot
+        holds the recurrent state at the END of the commit, so a boundary
+        crossed earlier in the chain is skipped (a missed cache entry, never a
+        poisoned one)."""
         p = req.params
-        if (
-            p.thinking_budget is not None
-            and p.end_think_ids
-            and not req.thought_closed
-            and len(req.output) >= p.thinking_budget
-        ):  # budget spent: close the reasoning block instead of sampling
-            tok = p.end_think_ids[len(req.output) - p.thinking_budget]
-        elif tok in req.params.stop_token_ids:
-            self._finish(req)
-            return
-        req.output.append(tok)
-        n = len(p.end_think_ids)
-        if n and not req.thought_closed and tuple(req.output[-n:]) == p.end_think_ids:
-            req.thought_closed = True
-        req.tokens.append(tok)
-        req.seq_len += 1
-        self._tokens_generated += 1
-        materialized = req.seq_len - 1
-        if req.phase == _PHASE_DECODE and materialized % BLOCK_TOKENS == 0:
-            self._publish_prefix(req, materialized)
-        if len(req.output) >= req.params.max_new_tokens:
-            self._finish(req)
+        n, last = len(p.end_think_ids), len(toks) - 1
+        for i, raw in enumerate(toks):
+            tok = raw
+            if (
+                p.thinking_budget is not None
+                and n
+                and not req.thought_closed
+                and len(req.output) >= p.thinking_budget
+            ):  # budget spent: close the reasoning block instead of sampling
+                tok = p.end_think_ids[len(req.output) - p.thinking_budget]
+            elif tok in p.stop_token_ids:
+                self._finish(req)
+                return
+            req.output.append(tok)
+            if n and not req.thought_closed and tuple(req.output[-n:]) == p.end_think_ids:
+                req.thought_closed = True
+            req.tokens.append(tok)
+            req.seq_len += 1
+            self._tokens_generated += 1
+            materialized = req.seq_len - 1
+            if i == last and req.phase == _PHASE_DECODE and materialized % BLOCK_TOKENS == 0:
+                self._publish_prefix(req, materialized)
+            if len(req.output) >= p.max_new_tokens:
+                self._finish(req)
+                return
+            if tok != raw:  # a forced end-think token: the rest of the chain is stale
+                return
 
     def _publish_prefix(self, req: _Req, length: int) -> None:
         """Insert tokens[:length] into the store (it retains the blocks) and
@@ -748,6 +888,8 @@ def build_engine(
     max_num_batched_tokens: int = 512,
     prefix_store: Any = None,
     decode_graph: bool | None = None,
+    draft: Any = None,
+    spec_depth: int = 4,
 ) -> "Engine":
     """Wire a model + backend into a running Engine (pools + prefix store).
 
@@ -755,10 +897,14 @@ def build_engine(
     pool shapes from it. Pass ``prefix_store`` to inject a test double (e.g. a
     never-match store for the miss path). ``decode_graph`` auto-enables the
     captured decode tick on CUDA (design-engine.md); pass False to force the
-    eager path.
+    eager path. ``draft`` (a :class:`~tilerl.spec.DraftHead`) turns speculative
+    decoding on at ``spec_depth``, which sizes the state pool's per-chain-step
+    planes.
     """
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
     model.params = backend.materialize(model.params)
+    if draft is not None:
+        draft.params = backend.materialize(draft.params)
     kv_pool = PagedKvPool(
         num_blocks,
         cfg.num_kv_heads,
@@ -777,6 +923,7 @@ def build_engine(
         dtype=torch.float32 if backend.device.type == "cuda" else torch.bfloat16,
         conv_window=cfg.linear_conv_kernel_dim - 1,
         conv_dim=cfg.linear_qkv_dim,
+        spec_steps=1 + spec_depth if draft is not None else 0,
     )
     store = PrefixStore(kv_pool) if prefix_store is None else prefix_store
     return Engine(
@@ -791,4 +938,6 @@ def build_engine(
             max_num_batched_tokens=max_num_batched_tokens,
         ),
         decode_graph=decode_graph,
+        draft=draft,
+        spec_depth=spec_depth,
     )

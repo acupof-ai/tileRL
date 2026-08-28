@@ -97,8 +97,7 @@ class DraftHead:
     the draft's own softmax probability stands in.
     """
 
-    def __init__(self, trunk: Any, params: dict[str, torch.Tensor], num_layers: int = 1,
-                 hidden_first: bool = False) -> None:
+    def __init__(self, trunk: Any, params: dict[str, torch.Tensor], num_layers: int = 1) -> None:
         from .model import Model
 
         self.trunk = trunk
@@ -109,10 +108,6 @@ class DraftHead:
         self.cfg = cfg
         self.layers = Model(cfg, params)
         self.has_confidence = "confidence.weight" in params
-        #: fc consumes concat(norm_embed(t), norm_hidden(h)) — embed first, per
-        #: agent-infer's qwen35_spec.rs:40-55; the wrong order looks like a head
-        #: that simply does not predict.
-        self.hidden_first = hidden_first
 
     def forward(self, hidden, ids, positions, kv, backend, hidden_out=None) -> torch.Tensor:
         """hidden [B,T,H] (trunk's pre-final-norm state), ids [B,T] (the token
@@ -128,20 +123,26 @@ class DraftHead:
         if "pre_fc_norm_embedding" in self.params:  # Qwen NextN: both sides normed
             e = backend.rmsnorm(e, self.params["pre_fc_norm_embedding"], eps)
         hidden = backend.rmsnorm(hidden, self.params["pre_fc_norm_hidden"], eps)
-        pair = [hidden, e] if self.hidden_first else [e, hidden]
-        x = backend.linear(torch.cat(pair, dim=-1), self.params["fc"])
+        # fc consumes concat(norm_embed(t), norm_hidden(h)) — embed first, per
+        # agent-infer's qwen35_spec.rs:40-55; the other order looks like a head
+        # that simply does not predict.
+        x = backend.linear(torch.cat([e, hidden], dim=-1), self.params["fc"])
         for i in range(self.cfg.num_layers):
             x = self.layers._full_attn(i, x, positions, kv, backend)
             x = self.layers._mlp(i, x, kv, backend)
         if hidden_out is not None:
             hidden_out.append(x)
         x = backend.rmsnorm(x, self.params["norm"], eps)
-        return self.trunk._linear(backend, x, "lm_head")
+        head = "embed_tokens" if self.trunk.cfg.tie_word_embeddings else "lm_head"
+        return self.trunk._linear(backend, x, head)
 
-    def confidence(self, hidden, backend) -> torch.Tensor | None:
-        """Per-position P(this draft is accepted), or None without the head."""
+    def confidence(self, hidden, probs, backend) -> torch.Tensor:
+        """Per-position P(this draft is accepted), [B,T].
+
+        The checkpoint's own head when it has one; otherwise ``probs``, the
+        draft's own probability for the token it emitted (spec.py docstring)."""
         if not self.has_confidence:
-            return None
+            return probs
         y = backend.linear(hidden, self.params["confidence.weight"],
                            bias=self.params.get("confidence.bias"))
         return torch.sigmoid(y).reshape(y.shape[:-1])
@@ -160,7 +161,7 @@ _DRAFT_TOP = {
 }
 
 
-def load_draft(trunk: Any, path: str | Path, hidden_first: bool = False) -> DraftHead:
+def load_draft(trunk: Any, path: str | Path) -> DraftHead:
     """Load a draft head from one safetensors file beside the trunk."""
     from safetensors import safe_open
 
@@ -184,4 +185,4 @@ def load_draft(trunk: Any, path: str | Path, hidden_first: bool = False) -> Draf
     if missing:
         raise RuntimeError(f"draft head {path}: missing {sorted(missing)}")
     n = 1 + max((int(k.split(".")[1]) for k in params if k.startswith("layers.")), default=0)
-    return DraftHead(trunk, params, num_layers=n, hidden_first=hidden_first)
+    return DraftHead(trunk, params, num_layers=n)

@@ -418,12 +418,19 @@ class Model:
             state, window = backend.state_gather(
                 pool.states, pool.conv_windows, kv.state_slot, linear_idx, pool.win_parity
             )
+            # Speculative verify: keep the state after every chain step, in the
+            # pool's step buffers, so the engine can adopt the accepted one.
+            ks = getattr(kv, "keep_steps", 0)
+            if ks:  # the tape replays kwargs into gdn_backward, which has no such arg
+                kwargs["keep_steps"] = ks
             out, new_state, new_window = backend.linear_attn_chunk(
                 q, k, v, a_proj, b_proj, state, conv_window=window, **kwargs
             )
             backend.state_scatter(
-                pool.states, pool.conv_windows, kv.state_slot, linear_idx,
-                new_state, new_window, pool.win_parity,
+                pool.step_states if ks else pool.states,
+                pool.step_windows if ks else pool.conv_windows,
+                kv.state_slot, linear_idx, new_state, new_window,
+                None if ks else pool.win_parity, steps=bool(ks),
             )
         elif linear_idx == cfg.num_linear_layers - 1:
             # every GDN layer of this tick read plane p and wrote 1-p: flip once

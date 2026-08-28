@@ -263,6 +263,7 @@ class LinearStatePool:
         dtype: torch.dtype = torch.bfloat16,
         conv_window: int = 0,
         conv_dim: int = 0,
+        spec_steps: int = 0,
     ) -> None:
         self.device = _default_device() if device is None else torch.device(device)
         self.states = torch.zeros(
@@ -291,8 +292,30 @@ class LinearStatePool:
             if num_linear_layers > 0 and conv_window > 0
             else None
         )
+        # Speculative verify: the chunk op writes the state/window after every
+        # chain step here, and the accepted length picks one (select_step).
+        self.step_states = (
+            torch.zeros(num_slots, num_linear_layers, spec_steps, num_heads, head_dim, head_dim,
+                        dtype=dtype, device=self.device)
+            if spec_steps and num_linear_layers > 0
+            else None
+        )
+        self.step_windows = (
+            torch.zeros(num_slots, num_linear_layers, spec_steps, conv_window, conv_dim,
+                        dtype=dtype, device=self.device)
+            if self.step_states is not None and self.conv_windows is not None
+            else None
+        )
         self.win_parity = torch.zeros(num_slots, dtype=torch.int32, device=self.device)
         self._free: list[int] = list(range(num_slots))
+
+    def select_step(self, slot: int, step: int) -> None:
+        """Adopt the state the last verify forward left after chain token ``step``."""
+        if self.step_states is None:  # no recurrent layers: nothing to rewind
+            return
+        self.states[slot].copy_(self.step_states[slot, :, step])
+        if self.step_windows is not None:
+            self.window_restore(slot, self.step_windows[slot, :, step])
 
     def window_snapshot(self, slot: int) -> torch.Tensor | None:
         """[L, W, D] clone of the slot's live window plane (host sync on parity)."""

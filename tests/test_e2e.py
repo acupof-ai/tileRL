@@ -29,6 +29,7 @@ from tilerl.engine import (
     build_engine,
 )
 from tilerl.model import build_random, fp4_param_keys, param_specs
+from tilerl.spec import DraftHead
 from tilerl.ops.backend import get_backend
 from tilerl.ops.reference import dequant_fp4, pack_fp4
 from tilerl.testing import RefBackend
@@ -163,7 +164,7 @@ def test_submit_rollback_and_terminal_failure():
         engine.submit([2], SamplingParams(max_new_tokens=1))
     assert engine._kv.free_blocks == free_blocks
 
-    engine._model.forward = lambda *_: (_ for _ in ()).throw(RuntimeError("boom"))
+    engine._model.forward = lambda *_, **__: (_ for _ in ()).throw(RuntimeError("boom"))
     with pytest.raises(RuntimeError, match="boom"):
         engine.step()
     with pytest.raises(RuntimeError, match="boom"):
@@ -238,7 +239,7 @@ def test_prefix_hit_survives_evicting_its_own_entry():
 
 def test_stop_token_is_not_returned():
     engine = _build_engine(seed=6)
-    engine._sample = lambda *_: 7
+    engine._sample_batch = lambda rows: [7] * len(rows)
     rid = engine.submit([1, 2], SamplingParams(max_new_tokens=4, stop_token_ids=(7,)))
     engine.step()
     assert engine.take(rid) == []
@@ -733,3 +734,89 @@ def test_thinking_budget_forces_the_block_closed():
         engine.shutdown()
     assert out is not None and len(out) == 8
     assert tuple(out[2:4]) == end  # forced at the budget, then sampling resumes
+
+
+# ---------------------------------------------------------------------------
+# speculative decoding
+
+
+class _OracleDraft:
+    """A draft head that always proposes the trunk's own continuation.
+
+    Forces full acceptance every tick, so the verify path (chain KV, GDN state
+    selection at n_ok = depth, multi-token commit) is actually exercised — a
+    random head is rejected at position 0 and proves nothing about it.
+    """
+
+    def __init__(self, cfg, expected: dict[int, int]):
+        self.cfg = replace(cfg, num_layers=1, full_attn_layers=(0,))
+        self.params: dict = {}
+        self.expected = expected  # absolute position -> the token that lands there
+
+    def forward(self, hidden, ids, positions, kv, backend, hidden_out=None):
+        pos = np.asarray(positions).reshape(-1)
+        logits = torch.zeros(len(pos), 1, self.cfg.vocab_size)
+        for i, p in enumerate(pos):
+            logits[i, 0, self.expected.get(int(p) + 1, 0)] = 10.0
+        if hidden_out is not None:
+            hidden_out.append(torch.as_tensor(hidden))
+        return logits
+
+    def confidence(self, hidden, probs, backend):
+        return probs
+
+
+def _random_draft(cfg, seed: int, trunk):
+    dcfg = replace(cfg, num_layers=1, full_attn_layers=(0,), fp4=False)
+    params = {k: v for k, v in build_random(dcfg, seed=seed).params.items()
+              if k.startswith("layers.")}
+    h = cfg.hidden_size
+    gen = torch.Generator().manual_seed(seed)
+    params["fc"] = (torch.randn(h, 2 * h, generator=gen) * 0.02).to(torch.bfloat16)
+    params["norm"] = torch.ones(h, dtype=torch.bfloat16)
+    params["pre_fc_norm_hidden"] = torch.ones(h, dtype=torch.bfloat16)
+    return DraftHead(trunk, params, num_layers=1)
+
+
+def _spec_run(prompt, n, draft=None, depth=3):
+    cfg = tiny()
+    model = build_random(cfg, seed=7)
+    engine = build_engine(
+        cfg, model, get_backend(), num_blocks=16, num_slots=4, max_batch=4,
+        max_total_tokens=512, draft=None if draft is None else draft(cfg, model),
+        spec_depth=depth,
+    )
+    rid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=n, seed=0))
+    out = _drain(engine, [rid], n)[rid]
+    return out, engine.stats()
+
+
+def test_speculation_reproduces_greedy_decode():
+    """The whole correctness gate for spec decode: with a draft attached the
+    engine must emit token-for-token what it emits without one. Covers the
+    rejected case (random head) AND the fully-accepted case (oracle head),
+    which is the one that exercises the GDN state rewind."""
+    prompt, n = [3, 4, 5, 6], 24
+    base, _ = _spec_run(prompt, n)
+    assert len(base) == n
+
+    rand, rstats = _spec_run(prompt, n, draft=lambda cfg, m: _random_draft(cfg, 21, m))
+    assert rand == base, f"random draft changed the output: {rand} != {base}"
+    assert rstats["spec_drafted"] > 0
+
+    expected = {i: t for i, t in enumerate(prompt + base)}
+    spec, sstats = _spec_run(prompt, n, draft=lambda cfg, m: _OracleDraft(cfg, expected))
+    assert spec == base, f"oracle draft changed the output: {spec} != {base}"
+    # A perfect draft must actually be accepted, or the gate proves nothing.
+    assert sstats["spec_accepted"] > sstats["spec_drafted"] * 0.9, sstats
+
+    # Chains trimmed below spec_depth: the step planes the forward writes are
+    # narrower than the pool's, which used to be a shape crash, not a wrong token.
+    import tilerl.engine as eng
+
+    orig, eng.verify_lens = eng.verify_lens, lambda surv: [2] * len(surv)
+    try:
+        trimmed, _ = _spec_run(prompt, n, draft=lambda cfg, m: _OracleDraft(cfg, expected))
+    finally:
+        eng.verify_lens = orig
+    assert trimmed == base, f"trimmed chain changed the output: {trimmed} != {base}"

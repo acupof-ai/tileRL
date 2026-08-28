@@ -88,14 +88,14 @@ class Tracer:
 
     def install(self, engine):
         """Wrap one engine's sampling (argmax + the D2H result sync)."""
-        orig_sample = engine._sample
+        orig_sample = engine._sample_batch
 
-        def timed_sample(logits_row, req, idx):
+        def timed_sample(rows):
             if not self.on:
-                return orig_sample(logits_row, req, idx)
-            return self._rec("sample", orig_sample, logits_row, req, idx)
+                return orig_sample(rows)
+            return self._rec("sample", orig_sample, rows)
 
-        engine._sample = timed_sample
+        engine._sample_batch = timed_sample
 
     def wrap_method(self, obj, attr, label):
         """Time any method call (used for the captured graph's replay)."""

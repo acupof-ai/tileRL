@@ -467,6 +467,7 @@ def gdn_forward(
     norm_weight: torch.Tensor,
     conv_window: "torch.Tensor | None" = None,
     seq_q_lens: "torch.Tensor | None" = None,
+    keep_steps: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
     """Full gated-delta layer core: the executable spec for the model's GDN
     layer, mirroring agent-infer's host reference equation by equation (the
@@ -477,7 +478,11 @@ def gdn_forward(
     one-shot prefill (zero left-padding) and the third return is None.
     ``seq_q_lens`` [B] bounds the per-row scan: mixed batches pad rows to a
     shared T and only the first ``seq_q_lens[b]`` positions are real (decode
-    rows: 1); None means every row is valid for all T."""
+    rows: 1); None means every row is valid for all T.
+    ``keep_steps`` > 0 (speculative verify): the returned state and window
+    carry a leading chain-step axis — the state after EACH of the first
+    ``keep_steps`` tokens ([B,KS,nvh,K,V] / [B,KS,K-1,qkv_dim]) — so the engine
+    selects the accepted prefix's state without a second forward."""
     # Activations arrive on the backend device; params/state may be CPU-resident
     # (day-1: params live on CPU, the backend boundary migrates activations).
     # Gather every input on the activation device.
@@ -509,8 +514,12 @@ def gdn_forward(
         # window is the last K-1 of (window + that row's valid qkv) — mixed
         # rows have different valid lengths, so build per row.
         qkv = torch.cat([_f32(conv_window).to(dev), qkv], dim=1)
-        new_window = torch.stack(
-            [qkv[bi, : kernel - 1 + int(seq_q_lens[bi])][-(kernel - 1) :] for bi in range(b)]
+        new_window = (
+            torch.stack([qkv[:, s + 1 : kernel + s] for s in range(keep_steps)], dim=1)
+            if keep_steps
+            else torch.stack(
+                [qkv[bi, : kernel - 1 + int(seq_q_lens[bi])][-(kernel - 1) :] for bi in range(b)]
+            )
         ).contiguous()
     preact = torch.zeros_like(qkv)
     for tap in range(kernel):
@@ -528,6 +537,7 @@ def gdn_forward(
     gt = -torch.exp(a_log) * torch.nn.functional.softplus(g + dt_bias)
     exp_g = torch.exp(gt)
     s_heads = [state[:, h].clone() for h in range(nvh)]
+    steps: list[torch.Tensor] = []
     core = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
     for step in range(t):
         active = (seq_q_lens > step).reshape(b, 1, 1)
@@ -542,7 +552,9 @@ def gdn_forward(
             core[:, step, h] = torch.where(
                 active_h, torch.einsum("bk,bkv->bv", qn[:, step, kh], s_h), 0
             )
-    s = torch.stack(s_heads, dim=1)
+        if step < keep_steps:
+            steps.append(torch.stack(s_heads, dim=1))
+    s = torch.stack(steps, dim=1) if keep_steps else torch.stack(s_heads, dim=1)
     normed = core * torch.rsqrt(core.pow(2).mean(-1, keepdim=True) + 1e-6)
     normed = normed * norm_weight
     out = normed * silu(z.view(b, t, nvh, val_dim))
@@ -786,9 +798,20 @@ def state_gather(states, windows, slots, layer_idx, parity=None):
     return states[slots, layer_idx], windows[slots, layer_idx, par]
 
 
-def state_scatter(states, windows, slots, layer_idx, new_state, new_window, parity=None) -> None:
-    """Store one recurrent-state layer for a batch of slots (same plane it was read from)."""
+def state_scatter(
+    states, windows, slots, layer_idx, new_state, new_window, parity=None, steps=False
+) -> None:
+    """Store one recurrent-state layer for a batch of slots (same plane it was
+    read from). ``steps``: the tensors carry a chain-step axis (speculative
+    verify) and land in the leading planes of the pool's step buffers — the
+    tick's chain width, which is <= the pool's spec_steps."""
     slots = torch.as_tensor(slots, dtype=torch.long, device=states.device).reshape(-1)
+    if steps:
+        ks = new_state.shape[1]
+        states[slots, layer_idx, :ks] = new_state.to(states.dtype)
+        if new_window is not None:
+            windows[slots, layer_idx, :ks] = new_window.to(windows.dtype)
+        return
     states[slots, layer_idx] = new_state.to(states.dtype)
     if new_window is not None:
         par = torch.zeros_like(slots) if parity is None else parity[slots].long()
@@ -812,6 +835,12 @@ def embedding_bwd(grad: torch.Tensor, idx: torch.Tensor, num_rows: int) -> torch
 
 
 # ---------------------------------------------------------------- sampling
+
+
+def greedy(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Argmax token and its softmax probability. [..., V] -> ([...], [...])."""
+    prob, tok = torch.softmax(_f32(logits), dim=-1).max(-1)
+    return tok.to(torch.long), prob
 
 
 def sample(logits: torch.Tensor, temperature: float, top_p: float, seed: int) -> torch.Tensor:

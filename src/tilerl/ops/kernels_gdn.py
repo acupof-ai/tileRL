@@ -208,6 +208,12 @@ def make_gdn_chunk_fused(target: str):
     owns a different channel; shared would race) and fragments forbid the
     rq[i]=rq[i+1] shift (uniform-index constraint).
 
+    StepStates/StepWindows (caller-allocated, KS from their shape) receive the
+    state and conv window after EACH of the first KS tokens: a speculative
+    verify passes KS = chain length and adopts the accepted prefix's state
+    afterwards, instead of paying a second forward. Prefill passes KS=1 and
+    the guarded write fires once — one plane, off the unrolled inner loops.
+
     Rows are left-aligned valid tokens with a per-row bound SeqQLens [B]:
     a decode row (seq_q=1, token at t=0) scans one token with the same
     Window++qkv conv semantics as the decode kernel, so mixed batches
@@ -241,7 +247,8 @@ def make_gdn_chunk_fused(target: str):
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def gdn_chunk_fused(
-        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State, SeqQLens, threads
+        Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State, SeqQLens,
+        StepStates, StepWindows, threads,
     ):
         # TT (sequence length) is the const, not T: T is the tilelang.language
         # module alias and rebinding it would break T.serial/T.Kernel below.
@@ -262,6 +269,9 @@ def make_gdn_chunk_fused(target: str):
         Window: T.Tensor((B, KER - 1, QKVD), "bfloat16")
         State: T.Tensor((B, NVH, K, V), "float32")
         SeqQLens: T.Tensor((B,), "int32")
+        KS = T.const("KS")
+        StepStates: T.Tensor((B, KS, NVH, K, V), "float32")
+        StepWindows: T.Tensor((B, KS, KER - 1, QKVD), "bfloat16")
         Out = T.empty((B, TT, VD), "float32")
         NewState = T.empty((B, NVH, K, V), "float32")
         NewWindow = T.empty((B, KER - 1, QKVD), "bfloat16")
@@ -389,6 +399,9 @@ def make_gdn_chunk_fused(target: str):
                         state_local[base + u] = sj
                         accs[4 + u] += sj * q_s[base + u]
                 acc_o[0] = accs[4] + accs[5] + accs[6] + accs[7]
+                if t < KS:  # per-chain-step state for a speculative verify
+                    for j in T.serial(K):
+                        StepStates[bb, t, vh, j, tv] = state_local[j]
                 out_s[tv] = acc_o[0]
                 T.tvm_storage_sync("shared")
 
@@ -428,6 +441,22 @@ def make_gdn_chunk_fused(target: str):
                         NewWindow[bb, tap, qc] = Q[bb, SeqQLens[bb] + tap - (KER - 1), qc]
                         NewWindow[bb, tap, kc] = Key[bb, SeqQLens[bb] + tap - (KER - 1), qc]
 
-        return Out, NewState, NewWindow
+            # same window, but after each of the first KS tokens (s+1 consumed).
+            for s in T.serial(KS):
+                for tap in T.serial(KER - 1):
+                    if s + 1 + tap < KER - 1:
+                        StepWindows[bb, s, tap, vc] = Window[bb, s + 1 + tap, vc]
+                    else:
+                        StepWindows[bb, s, tap, vc] = Val[bb, s + 1 + tap - (KER - 1), vh * V + tv]
+                if is_rep:
+                    for tap in T.serial(KER - 1):
+                        if s + 1 + tap < KER - 1:
+                            StepWindows[bb, s, tap, qc] = Window[bb, s + 1 + tap, qc]
+                            StepWindows[bb, s, tap, kc] = Window[bb, s + 1 + tap, kc]
+                        else:
+                            StepWindows[bb, s, tap, qc] = Q[bb, s + 1 + tap - (KER - 1), qc]
+                            StepWindows[bb, s, tap, kc] = Key[bb, s + 1 + tap - (KER - 1), qc]
+
+        return Out, NewState, NewWindow  # StepStates/StepWindows are written in place
 
     return gdn_chunk_fused

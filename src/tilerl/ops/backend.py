@@ -136,6 +136,7 @@ class Backend:
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
         self._const_f32_cache: dict[tuple[int, int | None], tuple[Any, int, torch.Tensor]] = {}
         self._ones_cache: dict[int, torch.Tensor] = {}
+        self._step_scratch: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
         self._sms = (
             torch.cuda.get_device_properties(self.device).multi_processor_count
             if self.device.type == "cuda"
@@ -753,8 +754,11 @@ class Backend:
         serially per (value head, batch)). conv_window is always a tensor
         (the model carries it; None means zero left-padding). ``seq_q_lens``
         [B] (when present) bounds the per-row scan: mixed batches pad decode
-        rows to the chunk's T with a per-row bound of 1.
+        rows to the chunk's T with a per-row bound of 1. ``keep_steps`` > 0
+        (speculative verify) returns the per-chain-step state/window planes
+        instead of the chunk-end pair.
         """
+        ks = int(kw.get("keep_steps") or 0)
         window = kw.get("conv_window")
         has_window = window is not None
         if not has_window:
@@ -768,6 +772,21 @@ class Backend:
         seq_q = kw.get("seq_q_lens")
         if seq_q is None:
             seq_q = torch.full((q.shape[0],), q.shape[1], dtype=torch.int32)
+        b, nvh, kd, vd = state.shape
+        wshape = tuple(window.shape[1:])
+        if ks:
+            step_states = torch.empty((b, ks, nvh, kd, vd), dtype=torch.float32,
+                                      device=self.device)
+            step_windows = torch.empty((b, ks) + wshape, dtype=torch.bfloat16,
+                                       device=self.device)
+        else:  # the kernel needs the operands; nobody reads them, so reuse one KS=1 pair
+            key = (b, nvh, kd, vd) + wshape
+            if key not in self._step_scratch:
+                self._step_scratch[key] = (
+                    torch.empty((b, 1, nvh, kd, vd), dtype=torch.float32, device=self.device),
+                    torch.empty((b, 1) + wshape, dtype=torch.bfloat16, device=self.device),
+                )
+            step_states, step_windows = self._step_scratch[key]
         out, new_state, new_window = self._kernel("gdn_chunk_fused")(
             self._c(self._bf16(q)),
             self._c(self._bf16(k)),
@@ -782,8 +801,12 @@ class Backend:
             self._c(self._bf16(window)),
             self._c(self._f32(state)),
             self._c(self._i32(seq_q)),
+            step_states,
+            step_windows,
             threads=state.shape[-1],
         )
+        if ks:
+            return out, step_states, (self._f32(step_windows) if has_window else None)
         return out, new_state, (self._f32(new_window) if has_window else None)
 
     def linear_attn_bwd(self, grad, q, k, v, g, beta, state, **kw):
@@ -795,8 +818,11 @@ class Backend:
     def state_gather(self, states, windows, slots, layer_idx, parity=None):
         return reference.state_gather(states, windows, slots, layer_idx, parity)
 
-    def state_scatter(self, states, windows, slots, layer_idx, new_state, new_window, parity=None):
-        reference.state_scatter(states, windows, slots, layer_idx, new_state, new_window, parity)
+    def state_scatter(self, states, windows, slots, layer_idx, new_state, new_window,
+                      parity=None, steps=False):
+        reference.state_scatter(
+            states, windows, slots, layer_idx, new_state, new_window, parity, steps
+        )
 
     # ------------------------------------------------------------ silu mul
 
@@ -892,9 +918,9 @@ class Backend:
 
     # ------------------------------------------------------------ sampling
 
-    def sample(self, logits, temperature, top_p, seed):
-        # ponytail: torch-eager sampling, tilelang sample kernel when perf demands
-        return reference.sample(logits, temperature, top_p, seed)
+    def greedy(self, logits):
+        # ponytail: torch-eager, tilelang kernel when perf demands
+        return reference.greedy(logits)
 
     def sample_batch(self, logits, temperatures, top_ps, seeds):
         return reference.sample_batch(logits, temperatures, top_ps, seeds)
