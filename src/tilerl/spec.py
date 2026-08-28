@@ -98,7 +98,7 @@ class DraftHead:
     """
 
     def __init__(self, trunk: Any, params: dict[str, torch.Tensor], num_layers: int = 1,
-                 hidden_first: bool = True) -> None:
+                 hidden_first: bool = False) -> None:
         from .model import Model
 
         self.trunk = trunk
@@ -109,9 +109,9 @@ class DraftHead:
         self.cfg = cfg
         self.layers = Model(cfg, params)
         self.has_confidence = "confidence.weight" in params
-        #: fc consumes concat(hidden, embed) or concat(embed, hidden) — the
-        #: checkpoint does not say which, and the wrong order looks like a
-        #: head that simply does not predict (6% first-token acceptance).
+        #: fc consumes concat(norm_embed(t), norm_hidden(h)) — embed first, per
+        #: agent-infer's qwen35_spec.rs:40-55; the wrong order looks like a head
+        #: that simply does not predict.
         self.hidden_first = hidden_first
 
     def forward(self, hidden, ids, positions, kv, backend, hidden_out=None) -> torch.Tensor:
@@ -160,7 +160,7 @@ _DRAFT_TOP = {
 }
 
 
-def load_draft(trunk: Any, path: str | Path, hidden_first: bool = True) -> DraftHead:
+def load_draft(trunk: Any, path: str | Path, hidden_first: bool = False) -> DraftHead:
     """Load a draft head from one safetensors file beside the trunk."""
     from safetensors import safe_open
 
