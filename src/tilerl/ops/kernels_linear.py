@@ -401,8 +401,10 @@ __device__ __forceinline__ void tl_fp8_gemv_tiles(const void *w8v, const void *x
 // x + chunk*32 elements, scale = sc[row_off + chunk*32/block] per row.
 template <int NG, int G>
 __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_stride, const void *xv,
-                                                const unsigned short *sc, int sc_grp_stride,
+                                                const void *scv, int sc_grp_stride,
                                                 int sc_per_chunk, int c0, int c1, float *out) {
+  // bf16 arrives as tilelang's own type: take it as void* and read the bits
+  const unsigned short *sc = (const unsigned short *)scv;
   const unsigned char *wq = (const unsigned char *)wqv;
   const unsigned short *x = (const unsigned short *)xv;
   float acc[NG * 4];
@@ -473,10 +475,11 @@ __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_strid
 }
 template <int NG, int G>
 __device__ __forceinline__ void tl_fp8_mma_rows(const void *w8v, int w_grp_stride, const void *xv,
-                                                const unsigned short *sc, int sc_shift, int c0,
+                                                const void *scv, int sc_shift, int c0,
                                                 int c1, float *out) {
   // 128-block scale: all 32 rows of a block share one scale row, chunk c's
   // column is (c*32 + 8q) / 128 = c >> 2 for every lane.
+  const unsigned short *sc = (const unsigned short *)scv;
   const unsigned char *w8 = (const unsigned char *)w8v;
   const unsigned short *x = (const unsigned short *)xv;
   float acc[NG * 4];
