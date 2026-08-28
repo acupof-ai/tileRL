@@ -24,6 +24,7 @@ def main() -> None:
     ap.add_argument("--depth", type=int, default=4, help="draft tokens per block")
     ap.add_argument("--blocks", type=int, default=16, help="draft blocks to score")
     ap.add_argument("--prompt-len", type=int, default=128)
+    ap.add_argument("--text", default=None, help="real prompt (default: random ids)")
     args = ap.parse_args()
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -69,7 +70,12 @@ def main() -> None:
 
     import numpy as np
 
-    ids = list(bk.rand_prompt(cfg.vocab_size, args.prompt_len, seed=0))
+    if args.text:
+        from tilerl.server import get_tokenizer
+
+        ids = list(get_tokenizer(args.source).encode(args.text))
+    else:  # random ids have no structure to predict — a floor, not the real rate
+        ids = list(bk.rand_prompt(cfg.vocab_size, args.prompt_len, seed=0))
     hid: list = []
     def arr(x):  # backend ops want arrays, not python lists
         return np.asarray(x, dtype=np.int64)
@@ -77,6 +83,7 @@ def main() -> None:
     logits = trunk.forward(arr([ids]), arr(range(len(ids))),
                            kv_for(trunk_pool, len(ids), len(ids)), backend, hidden_out=hid)
     accepted = total = 0
+    per_pos = [0] * args.depth  # how often draft j survives — sets the useful depth
     for _ in range(args.blocks):
         nxt = int(logits[0, -1].argmax())
         h = hid[-1][:, -1:, :]
@@ -94,13 +101,18 @@ def main() -> None:
                                kv_for(trunk_pool, dpos + len(chain), len(chain)), backend,
                                hidden_out=hid)
         want = [int(x) for x in logits[0, :-1].argmax(-1)]
-        for a, b in zip(want, chain[1:]):
+        for j, (a, b) in enumerate(zip(want, chain[1:])):
             total += 1
             if a != b:
                 break
             accepted += 1
-    print(f"depth {args.depth}, {args.blocks} blocks: accepted {accepted}/{total} "
+            per_pos[j] += 1
+    n = args.blocks
+    print(f"depth {args.depth}, {n} blocks: accepted {accepted}/{total} "
           f"= {100 * accepted / max(total, 1):.1f}%")
+    print("  survival by position:", " ".join(f"{c / n:.2f}" for c in per_pos))
+    # tokens per trunk forward = 1 bonus + expected accepted drafts
+    print(f"  tokens per verify: {1 + accepted / n:.2f}  (1.00 = no speculation)")
 
 
 if __name__ == "__main__":
