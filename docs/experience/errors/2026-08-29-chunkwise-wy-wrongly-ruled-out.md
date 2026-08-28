@@ -51,3 +51,28 @@ file is not evidence that no one ran the experiment; here two A/B tables sat
 one directory listing away. And when retracting someone's conclusion, state
 which arm they measured — "chunked is slower" and "these six kernels in bf16
 are slower" are different claims, and only the second was ever tested.
+
+## Third attempt, 2026-08-29: also rejected
+
+The narrow arm above — chunked recurrence inside ONE kernel, f32, same block
+count — was written and measured. It fails both gates:
+
+| | serial (shipped) | chunked, one launch |
+|---|---:|---:|
+| CUDA parity | passes | **3 failures** (`tvm.error.InternalError`) |
+| us per launch | 1663.9 | **11839.4** |
+| prefill GPU-busy | 995.1 ms | 3362.4 ms |
+| tok/s | 2058 | 609 |
+
+The kernel does not compile correctly, so 7.1x is not a fair measurement of the
+approach — but it is the third attempt at chunked GDN prefill to lose, after a
+2-kernel port (2.6x slower) and a 6-kernel pipeline (10% slower, numerically
+wrong at scale). Reverted; the line of work stops here rather than taking a
+fourth run at it.
+
+What the 32.1% is actually made of remains open: the serial kernel runs at
+~1.6% of f32 peak, which is a dependency-chain limit, not a bandwidth or
+occupancy one. Whatever attacks it next has to shorten that chain without the
+six-stage split, the bf16 intermediates, or the block explosion that sank the
+first two — and without being slower than a kernel that has now beaten three
+challengers.
