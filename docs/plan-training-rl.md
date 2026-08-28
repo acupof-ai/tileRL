@@ -1,192 +1,93 @@
-# Training / RL roadmap to SOTA — TP, CP, long context, one runtime
+# Training / RL roadmap — only what changes the picture
 
-Status 2026-08-28. Serving is at 90.9 tok/s B=1 on one H20 (Arle 84.5);
-training exists only as the tape + `train_step` on the tiny model. This is the
-plan to make the SAME runtime train the 27B: on-policy distillation (OPD /
-self-OPD with an EMA teacher, as `agent-infer/crates/train`), full-parameter
-fine-tuning, and 32k–256k contexts across the 8-card pod. Numbers first.
+Status 2026-08-28: serving 90.9 tok/s B=1 on one H20; training is the tape +
+`train_step` on the tiny model; five backwards are still torch-eager and the
+27B cannot allocate fp32 masters. Below: the findings that decide the design,
+then the phases as gates. Everything textbook is left out.
 
-## The physics (8 × H20, NV18 all-to-all NVLink, 96 GB each, NCCL 2.28)
+## What is not obvious
 
-| quantity | value | consequence |
-|---|---|---|
-| bf16 weights (dequantized dump) | 42 GB | one card cannot hold weights + optimizer |
-| full-param mixed precision (bf16 w + fp32 master + 2 Adam + bf16 grad) | ~336 GB | needs ≥4-way sharding (ZeRO-1/TP); 8-way = 42 GB/card + activations |
-| LoRA on frozen fp4 base (r=64 on every linear) | ~0.5 GB adapter + 22.8 GB base | one card; adapters train, base stays the served bytes |
-| H20 bf16 tensor peak | ~148 TFLOPS | training is compute-bound here, not bandwidth-bound |
-| 6·N FLOP/token @ ~21B active | 126 GFLOP/token | 50% MFU ⇒ ~590 tok/s/card ⇒ ~4.7k tok/s on 8 cards; a 32k sample ≈ 7 s |
-| KV for one 32k sequence (16 full-attn layers, 8 KV heads, D=256, bf16) | 4.3 GB | 32 concurrent 32k rollouts = 137 GB ⇒ KV must shard (TP-8: one KV head per card) |
-| rollout decode today | 90 B=1 / 309 agg B=8 | a 32k rollout at B=1 = 6 min ⇒ RL time is rollout time ⇒ batch ≥32 decode is a training lever |
+1. **Inference and training are opposite bottlenecks on this card.** Decode is
+   bandwidth-bound (we read 22.8 GB per tick at ~64% of 3.25 TB/s). Training is
+   compute-bound: H20 has only ~148 TFLOPS bf16, so 6·N FLOP/token ≈ 126 GFLOP
+   ⇒ ~590 tok/s/card at 50% MFU, ~4.7k tok/s on 8 cards, a 32k sample ≈ 7 s.
+   Consequence: fp4 weights buy nothing for training throughput; the levers
+   are the backward kernels and MFU, not bytes.
 
-## Phases (each: files, gate, effort; a phase ships only with its gate green)
+2. **RL time is rollout time, and rollout time is a decode kernel.** A 32k
+   rollout at B=1 takes 6 min; the update step for that sample is 7 s. The
+   single biggest RL speedup is decode throughput at B≥32 — the tensor-core
+   decode GEMM extended from MX=8 to 32/64 — i.e. a serving kernel, not a
+   trainer feature.
 
-### P0 — the tape is complete on sm90 (1–2 agent-days)
-Today five backwards are torch-eager (`rope_bwd`, `attention_bwd`,
-`linear_attn_bwd`, `silu_mul_bwd`, `embedding_bwd`) and the 27B cannot even
-allocate fp32 masters. Deliver:
-- `linear_fp4` / `linear_fp8` backward = STE: grad-x through the dequant GEMM
-  (bf16 WGMMA, K-major transpose), grad-w only for trainable masters.
-- Dense attention fwd/bwd as TileLang (SOTA copy: tilelang
-  `examples/flash_attention/example_mha_bwd.py`), GDN chunk backward
-  (`example_chunk_delta_bwd`), fused rmsnorm/silu/rope backwards.
-- Gate: numerical gradcheck on tiny (exists) + per-op backward parity at 27B
-  dims (`op_parity.py` grows a `--bwd` arm); a `train` harness suite on sm90
-  with tok/s. Bench entry.
+3. **TP degree is chosen by KV memory, not by compute.** One 32k sequence
+   holds 4.3 GB of KV (16 full-attn layers × 8 KV heads × 256 × bf16 × K,V);
+   32 concurrent rollouts = 137 GB > one card. The model has 8 KV heads and
+   the pod has 8 cards: TP-8 with one KV head per card is the cut, and it also
+   shards the GDN value heads (48/8) and the weights (22.8/8 GB).
 
-### P1 — 27B trains on ONE card: LoRA-OPD (2–3 agent-days)
-Mirror `agent-infer/crates/train/{lora,loss,ema_self_teacher}.rs`:
-- LoRA adapters on every linear (rank/alpha from config), fp4 base frozen and
-  served as is; decode gains two small GEMVs per adapted linear (in-kernel
-  epilogue later). Serving and training share the weights by construction —
-  no weight sync, no second product line.
-- OPD loss (reverse-KL to teacher logits over the student's own samples);
-  self-OPD with the EMA adapter as teacher; snapshot/restore of {student
-  adapter, EMA adapter, AdamW moments} as ONE unit (their R2 lesson).
-- Gate: loss falls on a held prompt set; MMLU of the adapted model does not
-  drop vs base (the 0-shot runner `scripts/mmlu.py`); train tok/s and
-  rollout tok/s recorded.
+4. **torch.distributed is the wrong tool for decode TP and the right one for
+   everything else.** Decode TP is 10 KB per all-reduce, 128 times per tick;
+   NCCL's ~15 µs floor is ~2 ms of a ~3 ms TP-8 tick. A one-shot CUDA-IPC
+   all-reduce written as a TileLang kernel is ~3–5 µs, graph-capturable by
+   construction and later fusable into the GEMV epilogue. Training traffic
+   (grad all-reduce, ZeRO, CP ring, MB–GB) stays on NCCL. Both live behind one
+   `comm.py` seam; the crossover is measured by a microbench, not assumed;
+   IPC falls back to NCCL when peers are not mappable.
 
-### P2 — decode at B=32–64 for rollouts (2 agent-days)
-The RL loop is rollout-bound. Extend the tensor-core decode GEMM from MX=8 to
-MX=32/64 (A tile = 16 rows ⇒ 2–4 mma per k-tile, same B fragment), split
-attention already scales with B. Gate: harness `decode-kv` B=32 row ≥ 3× the
-B=8 aggregate; verify PASS.
+5. **CP for the linear-attention layers is a scan, not a hand-off.** The
+   gated-delta recurrence is linear in the state, `S_i = A_i S_{i-1} + B_i`,
+   so chunk states compose: each rank computes its local (A, B), one
+   all-gather fixes the incoming state, a second pass produces outputs — a
+   parallel prefix across cards, with the backward the same scan reversed.
+   Full-attention CP is ring attention, and its merge IS the split-KV combine
+   we already ship. Our own tape is what makes this possible: a custom scan
+   backward is a handler, not an autograd.Function fight.
 
-### P3 — TP across the pod (3–4 agent-days)
-Column-parallel qkv/gate_up/in_proj, row-parallel o/down/out_proj with one
-all-reduce per sublayer (64 layers × 2 ≈ 128 all-reduces/tick; at ~10 µs on
-NV18 that is ~1.3 ms — acceptable for decode, negligible for training).
-Attention TP = one KV head per card (8 heads / 8 cards) ⇒ the 32k KV
-problem is solved by the same cut. GDN TP = value heads split (48 / 8).
-- **Collectives: both NCCL and CUDA-IPC, behind one `tilerl/ops/comm.py`
-  seam.** Direction: the seam exposes `all_reduce / all_gather /
-  reduce_scatter / send_recv(ring)`; two transports implement it and the
-  seam picks per call by message size and capture context.
-  - NCCL (`torch.distributed`): every message ≥ 256 KB — grad all-reduce,
-    ZeRO shards, CP ring K/V exchange, GDN scan states. The "torch is a
-    container" rule bars autograd/optim, not transport; nothing else is as
-    mature for large messages, and it is graph-capturable (NCCL ≥ 2.9).
-  - CUDA-IPC one-shot all-reduce as a TileLang kernel: messages < 256 KB —
-    decode TP's 10 KB per sublayer, 128 per tick. Each card writes its slice
-    into peers' mapped buffers, one kernel reduces (vLLM/TensorRT-LLM
-    design); graph-capturable by construction and fusable into the GEMV
-    epilogue later.
-  - Basis for the split: NCCL's small-message floor is ~15 µs → 128 × 15 µs
-    ≈ 2 ms of a ~3 ms TP-8 decode tick; a one-shot IPC kernel is ~3–5 µs.
-    Above ~256 KB NCCL's bandwidth wins and the floor is amortized. The
-    exact crossover is MEASURED, not assumed: a `scripts/ab_comm.py`
-    microbench sweeps 1 KB–64 MB on both transports and writes the threshold
-    into `comm.py` (bench entry).
-  - Fallback: IPC requires peer access on one node (NV18 here); the seam
-    falls back to NCCL when peers are not mappable, so a run never depends
-    on the fast path for correctness.
-  - Priced and declined: raw NCCL via ctypes (same latency, re-implements
-    rendezvous), NVSHMEM (pays only for MoE all-to-all; this model has none).
-- Gate: TP-8 decode tick vs TP-1 (expect ~1.4 ms + weights/8 ⇒ B=1 tick ≈
-  3 ms, >300 tok/s single stream); loss bit-identical to TP-1 on tiny
-  (deterministic reduce order); harness rows per TP degree.
+6. **LoRA on the frozen fp4 base is what makes "one runtime" literally true.**
+   The served bytes never change during RL; the adapter is the only trainable
+   state, so there is no weight sync between trainer and engine — it is a
+   memory-format fact, not a synchronization protocol. Full-parameter
+   training (later) has to re-quantize into the twiddled fp4 blocks after
+   each step, and its gate is MMLU, not the loss curve: quantization noise
+   does not show in loss.
 
-### P4 — CP for long-context forward/backward (4–5 agent-days)
-Sequence sharded across ranks, weights replicated (DP-style grad all-reduce),
-`CpContext::single()` byte-identical single-card path (their design).
-- Full-attention layers: ring attention (pass K/V shards around the ring,
-  online-softmax merge — the split-KV combine we already have IS the merge).
-- GDN layers: the gated-delta recurrence is linear in the state,
-  `S_i = A_i S_{i-1} + B_i`, so chunk states compose: each rank computes its
-  local (A, B) over its shard, one all-gather/scan across ranks fixes the
-  incoming state, second pass computes outputs — a parallel prefix, not a
-  serial hand-off. Backward is the same scan reversed.
-- Gate: 256k-token forward+backward on 8 cards with per-card activation
-  O(seq/8); gradients match the single-card path on a 32k sample to 1e-3;
-  tok/s per card vs the compute ceiling above.
+7. **What transfers from torchtitan, and why the rest cannot.** Mesh-first
+   (`ParallelDims`: every op reads its coordinate, the top-level forward stays
+   a loop over blocks), head/tail sequence load-balancing for causal CP,
+   seed-checkpoint-by-name initialization, and capturing fwd+bwd in one CUDA
+   graph with static weight buffers. DTensor and `fully_shard` are
+   torch.autograd machinery and do not transfer; that constraint is also the
+   freedom in (5).
 
-### P5 — full-parameter training (2–3 agent-days)
-ZeRO-1 optimizer sharding (each rank owns 1/8 of the fp32 masters + Adam),
-bf16 params + grads everywhere, re-quantization of served fp4 blocks after
-each step (block scale + nibbles, the twiddled layout) so serving never
-sees a bf16 copy. Gate: memory per card ≤ 60 GB at 32k; MFU ≥ 40%; MMLU
-non-regression.
+8. **Measurement rules that cost a day each to learn** (the loop from
+   `docs/experience/2026-08-28-decode-52-to-84.md` applies unchanged): price
+   kernels in-graph or under ncu, never with an eager harness (~40 µs floor
+   hid a real −22%); one timing job per host (another tenant's CPU load moved
+   rows 60%); every kernel shape comes from a bounded bucket (the first
+   varied-length workload compiled 662 variants with the GPU idle).
 
-### P6 — SOTA comparison (1 agent-day, recurring)
-Same pod, same model, same task: rollout tok/s, train tok/s, time per RL
-round vs verl / OpenRLHF / slime (whichever load the 27B here). Recorded like
-`docs/experience/2026-08-28-vs-sglang-h20.md`; the numbers set the next
-round's targets.
+## Phases as gates
 
-## What torchtitan does, and what of it transfers
-
-torchtitan (pytorch/torchtitan) composes FSDP2 (per-parameter sharding),
-TP (DTensor `ColwiseParallel`/`RowwiseParallel`/`SequenceParallel`, loss
-parallel, async TP micro-pipelining), PP (`pipeline_parallel.py`), CP
-(`distributed/context_parallel/api.py` wrapping
-`torch.distributed.tensor.experimental._context_parallel_shard`) and EP,
-in a fixed order — TP → activation checkpointing → compile → FSDP — over one
-device mesh (`ParallelDims`), with float8/MXFP8 training, a seed checkpoint
-loaded by FQN so any shard can initialize itself, and a `cudagraph.py` that
-captures the whole fwd+bwd step with static parameter buffers.
-
-Transfers directly (no torch autograd/DTensor needed):
-- **Mesh-first**: one `ParallelDims`-style object (dp, tp, cp, pp) that every
-  op reads its rank/coord from — agent-infer's `CpContext` is the same idea.
-- **Fixed application order** and "model forward is a loop over blocks":
-  our `Model.forward` already is; keep TP/CP decisions inside ops, never at
-  the top level.
-- **CP as sequence sharding of inputs/labels/positions with load balancing**
-  — their `_HeadTailLoadBalancer` gives each rank a head chunk and a tail
-  chunk so causal attention work is even; adopt it (a rank's shard =
-  `[i, N-1-i]` chunks), for both ring attention and the GDN scan.
-- **Seed checkpoint by name**: shards initialize from one checkpoint by
-  parameter name — our `load_hf` key map is that.
-- **fwd+bwd under one CUDA graph** with static weight buffers: our decode
-  graph does this for inference; the training step should too (P1 gate).
-- **float8 training**: our fp8 GEMM path (`linear_fp8`, WGMMA) is the
-  forward half; the backward GEMMs in fp8 are P5 material.
-
-Does not transfer: DTensor and `fully_shard` (they are torch.autograd
-machinery — our tape owns backward), `torch.compile`, and their ring
-attention (SDPA-specific); we write ring attention and the GDN scan as
-TileLang kernels on top of the comm seam.
-
-## Iteration basis — what decides each step
-
-The loop that produced 52.6 → 90.9 tok/s applies unchanged
-(`docs/experience/2026-08-28-decode-52-to-84.md`): a gated harness row per
-metric, an in-graph or ncu measurement before ranking levers, one change per
-A/B, every result recorded (wins/ or errors/) including the dead ones.
-
-| phase | the number that decides it | already measured | decision rule |
+| phase | delivers | gate (numbers only) | effort |
 |---|---|---|---|
-| P0 backward kernels | per-op backward parity at 27B dims; train tok/s | 5 backwards torch-eager; 27B masters OOM | ship when parity ≤ 1e-2 and train-suite tok/s ≥ 0.97× snapshot |
-| P1 LoRA-OPD | loss on a held set; MMLU 0-shot; rollout tok/s | MMLU runner exists; B=1 decode 90.9 | MMLU non-regression vs base is the gate, loss curves are not |
-| P2 batch decode B≥32 | harness B=32 row | B=8 agg 308.6; mma8 at 21% occupancy (128 regs) | ≥ 3× the B=8 aggregate; otherwise register control first |
-| P3 TP-8 | TP-8 tick vs TP-1; comm µs per sublayer | NCCL floor ~15 µs; NV18 mesh | IPC below the measured crossover, NCCL above; bit-identical loss on tiny |
-| P4 CP | 32k gradient vs single card; per-card activation bytes; tok/s vs 590/card ceiling | CP design in agent-infer (`CpContext`); GDN scan formula | tape gradcheck of the scan on tiny BEFORE any 27B run |
-| P5 full-param | memory/card at 32k; MFU; MMLU after re-quantization | 336 GB mixed-precision total | ≤ 60 GB/card, MFU ≥ 40%, MMLU flat |
-| P6 SOTA | rollout tok/s, train tok/s, s/round vs verl/OpenRLHF/slime | sglang comparison method | numbers set the next round's targets; no adjectives |
+| P0 | the five torch-eager backwards as TileLang; fp4/fp8 STE backward | per-op backward parity at 27B dims ≤ 1e-2; train suite tok/s ≥ 0.97× snapshot | 1–2 d |
+| P1 | LoRA-OPD / self-OPD (EMA adapter teacher), {student, EMA, Adam} snapshot as one unit | loss falls on a held set; MMLU 0-shot ≥ base | 2–3 d |
+| P2 | decode GEMM MX=32/64 | harness B=32 row ≥ 3× B=8 aggregate | 2 d |
+| P3 | TP-8 (KV head per card), `comm.py` with NCCL + IPC | TP-8 B=1 tick ≈ 3 ms; loss bit-identical to TP-1 on tiny; IPC/NCCL crossover measured | 3–4 d |
+| P4 | CP: ring attention + GDN prefix scan, head/tail balanced | 256k fwd+bwd on 8 cards; 32k gradients = single card to 1e-3; scan gradchecked on tiny first | 4–5 d |
+| P5 | full-param: ZeRO-1 masters, re-quantize to twiddled fp4 each step | ≤ 60 GB/card at 32k; MFU ≥ 40%; MMLU flat | 2–3 d |
+| P6 | same-pod comparison vs verl / OpenRLHF / slime | recorded like the sglang comparison; sets next targets | 1 d, recurring |
 
-Standing rules from today that apply to every phase: one timing job per
-host (other tenants' load moved rows 60%); price kernels in-graph or under
-ncu, never with the eager harness (~40 µs floor); every kernel shape comes
-from a bounded bucket (the MMLU run compiled 662 variants when the prefill
-width tracked prompt length).
+Order: P0→P1 make the 27B trainable on the hardware we have and P1 is the
+product; P2 is the RL-time lever and pure kernel work; P3 before P4 because
+TP also fixes rollout KV memory and CP reuses its comm seam; P5 needs P3's
+sharding; P6 after each of P1/P3/P4.
 
-## Order and why
+## Risks that are specific, not generic
 
-P0 → P1 first: they make the 27B trainable on the hardware we have with no
-new parallelism, and P1 is the product (agent-OPD). P2 is the RL-time lever
-and is pure kernel work we already know how to do. P3 before P4: TP is the
-simpler cut, it also fixes rollout KV memory, and CP reuses TP's comm seam.
-P5 needs P3's sharding. P6 runs after each of P1/P3/P4 to keep the targets
-honest.
-
-## Risks named now
-
-- Collectives inside captured decode graphs (P3): NCCL calls capture into
-  CUDA graphs only with the right stream discipline; fallback is
-  graph-per-layer.
-- The e2m1 grid after full-param updates (P5): re-quantization noise per
-  step; gate it with MMLU, not loss curves.
-- CP for GDN (P4) is the novel piece; the scan formulation must be tape
-  gradient-checked on the tiny model before any 27B run.
-- Host contention on the pod (other tenants) — every perf gate is
-  loadavg-stamped and only counts on a quiet host.
+- NCCL inside captured decode graphs needs stream discipline; fallback is a
+  graph per layer.
+- Re-quantization noise per step (P5) is invisible in loss — MMLU-gated.
+- The GDN scan is the one novel kernel; it does not touch the 27B until the
+  tiny-model gradcheck passes.
