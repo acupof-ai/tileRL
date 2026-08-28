@@ -20,8 +20,14 @@ batch bucket, graph-capturable). `make_paged_attention_combine` merges the
 16 partials per (b, kv head, g) in the scaled-log2 domain (empty slices carry
 m = −inf, l = 0). Parallelism 32 → 2048 blocks at B=1... KV bytes /4.
 
-Kernel-level (B=2, 32k, `scripts/parity_attn_decode.py`): relerr 3.3e-3 vs
-the dense kernel (bf16 output rounding), **1.451 → 0.256 ms (5.7×)**.
+Kernel-level (B=2, 32k, `scripts/parity_attn_decode.py`): relerr 3.5e-3 vs
+the dense kernel (bf16 output rounding), **1.445 → 0.217 ms (6.7×)**.
+In-graph at d512, B=1: decode 5.6 µs + combine 3.6 µs per layer vs 30 µs for
+the dense kernel. The combine had to be a plain warp-per-row kernel
+(lanes over d, splits unrolled, scalar locals): the first two versions — a
+serial split loop, then a `T.Parallel(D)` body with a fragment per
+iteration — ran at 40 and 66 µs per call and would have cost the B=1 tick
+more than the dense attention at d512.
 
 ## Rule
 

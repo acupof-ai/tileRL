@@ -564,7 +564,7 @@ class Backend:
             self._i32(block_table), self._i32(seq_lens), po, pm, pl, float(scale),
             int(k_cache.shape[2]),
         )
-        return self._kernel("paged_attention_combine")(po, pm, pl, h // hkv, 128).reshape(b, 1, h, d)
+        return self._kernel("paged_attention_combine")(po, pm, pl, h // hkv).reshape(b, 1, h, d)
 
     def attention(self, q, k, v, scale, gate=None):
         """Dense causal GQA attention (training path). q/k/v [B,T,H,D]."""

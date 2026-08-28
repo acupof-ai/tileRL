@@ -257,30 +257,36 @@ def make_paged_attention_combine(target: str, KVSPLIT: int = 16):
     w_s = 2^(PM_s - max_s PM_s). Empty slices carry PM=-inf, PL=0."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
-    def paged_attention_combine(PO, PM, PL, G, threads):
+    def paged_attention_combine(PO, PM, PL, G):
         B, Hkv, D = T.const("B, Hkv, D")
         PO: T.Tensor((B, Hkv, KVSPLIT, 16, D), "float32")
         PM: T.Tensor((B, Hkv, KVSPLIT, 16), "float32")
         PL: T.Tensor((B, Hkv, KVSPLIT, 16), "float32")
         Out = T.empty((B, Hkv, G, D), "bfloat16")
-        with T.Kernel(B * Hkv * G, threads=threads) as row:
+        # one warp per output row, lanes over d, splits unrolled: plain scalar
+        # locals — a T.Parallel(D) body with a fragment per iteration ran at
+        # 40-66 us/call.
+        with T.Kernel(B * Hkv * G, threads=32) as row:
+            lane = T.get_thread_binding(0)
             bb = row // (Hkv * G)
             hkv = (row // G) % Hkv
             g = row % G
-            m = T.alloc_fragment((1,), "float32")
-            l = T.alloc_fragment((1,), "float32")
+            w = T.alloc_local((KVSPLIT,), "float32")
+            m = T.alloc_local((1,), "float32")
+            l = T.alloc_local((1,), "float32")
+            acc = T.alloc_local((1,), "float32")
             m[0] = -T.infinity("float32")
-            for sp in T.serial(KVSPLIT):
+            for sp in T.unroll(KVSPLIT):
                 m[0] = T.max(m[0], PM[bb, hkv, sp, g])
             l[0] = 0.0
-            for sp in T.serial(KVSPLIT):
-                l[0] += T.exp2(PM[bb, hkv, sp, g] - m[0]) * PL[bb, hkv, sp, g]
-            for d in T.Parallel(D):
-                acc = T.alloc_fragment((1,), "float32")
+            for sp in T.unroll(KVSPLIT):
+                w[sp] = T.exp2(PM[bb, hkv, sp, g] - m[0])
+                l[0] += w[sp] * PL[bb, hkv, sp, g]
+            for i in T.unroll(D // 32):
                 acc[0] = 0.0
-                for sp in T.serial(KVSPLIT):
-                    acc[0] += T.exp2(PM[bb, hkv, sp, g] - m[0]) * PO[bb, hkv, sp, g, d]
-                Out[bb, hkv, g, d] = T.cast(acc[0] / l[0], "bfloat16")
+                for sp in T.unroll(KVSPLIT):
+                    acc[0] += w[sp] * PO[bb, hkv, sp, g, i * 32 + lane]
+                Out[bb, hkv, g, i * 32 + lane] = T.cast(acc[0] / l[0], "bfloat16")
         return Out
 
     return paged_attention_combine
