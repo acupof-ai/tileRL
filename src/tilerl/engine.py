@@ -626,7 +626,7 @@ class Engine:
         # Speculate on pure-decode ticks only: a mixed tick's width is the
         # bucketed prefill chunk, which the step-state buffers cannot cover.
         chains = (
-            self._draft_chains(decodes)
+            self._draft_chains(decodes, trim=not self._decode_graph_on)
             if self._draft is not None and decodes and prefill is None
             else None
         )
@@ -752,7 +752,7 @@ class Engine:
             self._sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
         return True
 
-    def _draft_chains(self, rows: list[_Req]) -> list[list[int]]:
+    def _draft_chains(self, rows: list[_Req], trim: bool = True) -> list[list[int]]:
         """Draft up to ``spec_depth`` tokens per row, then trim each row to the
         length its confidence makes worth verifying (spec.verify_lens).
 
@@ -780,11 +780,17 @@ class Engine:
                 kv, self._backend, hidden_out=dh,
             )
             tok, prob = self._backend.greedy(logits)
-            conf = self._draft.confidence(dh[-1], prob, self._backend)
-            for i, (t, c) in enumerate(zip(tok[:, -1].tolist(), conf[:, -1].tolist())):
+            if trim:
+                conf = self._draft.confidence(dh[-1], prob, self._backend)
+                for i, c in enumerate(conf[:, -1].tolist()):
+                    confs[i].append(float(c))
+            # One D2H per step, not two: each sync drains the pipeline, and at
+            # depth 2 that was ~19 ms of a 35 ms captured tick.
+            for i, t in enumerate(tok[:, -1].tolist()):
                 chains[i].append(int(t))
-                confs[i].append(float(c))
             h = dh[-1]
+        if not trim:  # a captured tick pads to one width anyway
+            return chains
         keep = verify_lens([survival(c) for c in confs])
         for i, r in enumerate(rows):
             p = r.params
