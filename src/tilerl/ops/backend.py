@@ -385,8 +385,7 @@ class Backend:
                 # Batched decode on the tensor cores (Marlin-style); Np is a
                 # multiple of 32 here (the plan pads N to the 32-row block).
                 Np32 = _round_up(N, 32)
-                wq = _pad2d(wq, Np32, Kp // 2)
-                scale = _pad2d(self._const_f32(scale, dtype=torch.bfloat16), Np32, Kp // blk)
+                wq, scale = _pad2d(wq, Np32, Kp // 2), _pad2d(scale, Np32, Kp // blk)
                 osc = self._ones(Np32) if oscale is None else self._const_f32(oscale, Np32)
                 xm = _pad2d(x2, _MX, Kp)
                 res = None if residual is None else self._f32(residual).reshape(M, N)
@@ -453,9 +452,7 @@ class Backend:
         if 2 <= M <= _MX and "linear_fp8_mma8" in _resolve(self.precision, self.arch):
             Np32 = _round_up(N, 32)
             w8 = _pad2d(w8, Np32, Kp)
-            wscale = _pad2d(
-                self._const_f32(wscale, dtype=torch.float16), -(-Np32 // 128), Kp // 128
-            )
+            wscale = _pad2d(wscale, -(-Np32 // 128), Kp // 128)
             osc = self._ones(Np32) if oscale is None else self._const_f32(oscale, Np32)
             xm = _pad2d(x2, _MX, Kp)
             res = None if residual is None else self._f32(residual).reshape(M, N)

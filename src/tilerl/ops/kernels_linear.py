@@ -401,10 +401,8 @@ __device__ __forceinline__ void tl_fp8_gemv_tiles(const void *w8v, const void *x
 // x + chunk*32 elements, scale = sc[row_off + chunk*32/block] per row.
 template <int NG, int G>
 __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_stride, const void *xv,
-                                                const void *scv, int sc_grp_stride,
+                                                const float *sc, int sc_grp_stride,
                                                 int sc_per_chunk, int c0, int c1, float *out) {
-  // bf16 arrives as tilelang's own type: take it as void* and read the bits
-  const unsigned short *sc = (const unsigned short *)scv;
   const unsigned char *wq = (const unsigned char *)wqv;
   const unsigned short *x = (const unsigned short *)xv;
   float acc[NG * 4];
@@ -415,7 +413,7 @@ __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_strid
   for (; c + G <= c1; c += G) {
     uint4 xa[G];
     unsigned w[G][NG];
-    unsigned short s[G][NG];
+    float s[G][NG];
 #pragma unroll
     for (int k = 0; k < G; ++k) {
       asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
@@ -432,7 +430,8 @@ __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_strid
       for (int g = 0; g < NG; ++g) {
         unsigned d[4];
         tl_fp4_decode8(w[k][g], d);
-        const unsigned s2 = ((unsigned)s[k][g] << 16) | s[k][g];
+        unsigned s2;
+        asm("cvt.rn.bf16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(s[k][g]));
 #pragma unroll
         for (int i = 0; i < 4; ++i) asm("mul.bf16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -454,10 +453,11 @@ __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_strid
     for (int g = 0; g < NG; ++g) {
       unsigned w;
       asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(w) : "l"(wq + g * w_grp_stride + c * 16));
-      const unsigned short sg = __ldg(sc + g * sc_grp_stride + c * sc_per_chunk);
+      const float sg = __ldg(sc + g * sc_grp_stride + c * sc_per_chunk);
       unsigned d[4];
       tl_fp4_decode8(w, d);
-      const unsigned s2 = ((unsigned)sg << 16) | sg;
+      unsigned s2;
+      asm("cvt.rn.bf16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(sg));
 #pragma unroll
       for (int i = 0; i < 4; ++i) asm("mul.bf16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
       asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -475,11 +475,10 @@ __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_strid
 }
 template <int NG, int G>
 __device__ __forceinline__ void tl_fp8_mma_rows(const void *w8v, int w_grp_stride, const void *xv,
-                                                const void *scv, int sc_shift, int c0,
+                                                const float *sc, int sc_shift, int c0,
                                                 int c1, float *out) {
   // 128-block scale: all 32 rows of a block share one scale row, chunk c's
   // column is (c*32 + 8q) / 128 = c >> 2 for every lane.
-  const unsigned short *sc = (const unsigned short *)scv;
   const unsigned char *w8 = (const unsigned char *)w8v;
   const unsigned short *x = (const unsigned short *)xv;
   float acc[NG * 4];
@@ -490,7 +489,7 @@ __device__ __forceinline__ void tl_fp8_mma_rows(const void *w8v, int w_grp_strid
     const int n = (c1 - c < G) ? (c1 - c) : G;
     uint4 xa[G];
     uint2 w[G][NG];
-    unsigned short s[G][NG];
+    float s[G][NG];
 #pragma unroll
     for (int k = 0; k < G; ++k) {
       if (k < n) {
@@ -515,7 +514,8 @@ __device__ __forceinline__ void tl_fp8_mma_rows(const void *w8v, int w_grp_strid
                            tl_e4m3x2_to_f16x2((unsigned short)(w[k][g].x >> 16)),
                            tl_e4m3x2_to_f16x2((unsigned short)(w[k][g].y)),
                            tl_e4m3x2_to_f16x2((unsigned short)(w[k][g].y >> 16))};
-          const unsigned s2 = ((unsigned)s[k][g] << 16) | s[k][g];
+          unsigned s2;
+          asm("cvt.rn.f16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(s[k][g]));
 #pragma unroll
           for (int i = 0; i < 4; ++i) asm("mul.f16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
           asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -669,9 +669,7 @@ def make_linear_fp4_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4):
         per = T.ceildiv(nchunk, KW)
         X: T.Tensor((8, K), "bfloat16")
         WQ: T.Tensor((N, K // 2), "uint8")
-        # bf16 scale: block scales are e4m3 values, so bf16 is lossless — half
-        # the scale bytes in L1 and a bit-replication instead of a cvt per tile
-        Scale: T.Tensor((N, K // block), "bfloat16")
+        Scale: T.Tensor((N, K // block), "float32")
         OScale: T.Tensor((N,), "float32")
         Res: T.Tensor((8, N), "float32")
         Y = T.empty((8, N), "float32")
@@ -867,10 +865,7 @@ def make_linear_fp8_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4):
         per = T.ceildiv(nchunk, KW)
         X: T.Tensor((8, K), "bfloat16")
         W8: T.Tensor((N, K), "float8_e4m3fn")
-        # f16, not bf16: this kernel's mma runs the scale through f16x2, so
-        # f16 storage is what it already rounded to — and the scalar-to-pair
-        # widening becomes a bit replication
-        WScale: T.Tensor((T.ceildiv(N, 128), T.ceildiv(K, 128)), "float16")
+        WScale: T.Tensor((T.ceildiv(N, 128), T.ceildiv(K, 128)), "float32")
         OScale: T.Tensor((N,), "float32")
         Res: T.Tensor((8, N), "float32")
         Y = T.empty((8, N), "float32")
