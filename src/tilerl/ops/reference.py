@@ -42,6 +42,7 @@ __all__ = [
     "linear_attn_chunk",
     "linear_attn_bwd",
     "gdn_forward",
+    "gdn_chunk_core",
     "gdn_backward",
     "silu_mul",
     "silu_mul_bwd",
@@ -357,16 +358,6 @@ def quant_fp8(w: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, torch.Te
     return q[:n, :k].to(torch.float8_e4m3fn).contiguous(), scale.contiguous()
 
 
-if __name__ == "__main__":  # runnable check: quant_fp8 inverts dequant_fp8
-    torch.manual_seed(0)
-    _w = torch.randn(300, 260, dtype=torch.bfloat16) * 0.02
-    _q, _s = quant_fp8(_w)
-    assert _q.shape == _w.shape and _s.shape == (3, 3), (_q.shape, _s.shape)
-    # e4m3 keeps 3 mantissa bits, so ~6% per element near a block's absmax; the
-    # gate that matters is the served model's accuracy, not this bound.
-    _rel = (dequant_fp8(_q, _s) - _w.float()).abs().max() / _w.float().abs().max()
-    assert _rel < 0.06, _rel
-    print("reference: quant_fp8 round-trip OK, rel", float(_rel))
 
 
 def linear_fp8(x, w8, wscale, oscale=None) -> torch.Tensor:
@@ -476,6 +467,60 @@ def linear_attn_bwd(
     if kw.pop("seq_q_lens", None) is not None:
         raise NotImplementedError("linear_attn_bwd does not support padded mixed-length rows")
     return gdn_backward(grad, q, k, v, g, beta, state, **kw)
+
+
+def gdn_chunk_core(qn, kn, v, gt, bt, state, chunk: int = 64):
+    """The gated-delta core as a chunkwise-WY decomposition, not a serial scan.
+
+    Same recurrence as the loop in :func:`gdn_forward` — decay, delta, read out
+    — reassociated so a chunk's tokens are one matmul instead of C sequential
+    steps. The intra-chunk term the serial form carries in the state lives in
+    ``M = (I + L)^-1``; freezing the chunk-start state loses nothing.
+
+    ``qn``/``kn`` [B,T,HK,DK] (already L2-normed), ``v`` [B,T,HV,DV],
+    ``gt``/``bt`` [B,T,HV] (log-decay <= 0, and the delta rate), ``state``
+    [B,HV,DK,DV]. HV is a multiple of HK: value head h reads key head
+    ``h * HK // HV``. Returns (core [B,T,HV,DV], final state).
+
+    This is the executable spec for the five-kernel prefill pipeline
+    (cumsum / scaled-dot-kkt / solve-tril / wy / delta-h / chunk-o).
+    """
+    b, t, nvh, val_dim = v.shape
+    rep = nvh // kn.shape[2]
+    q = qn.repeat_interleave(rep, dim=2)
+    k = kn.repeat_interleave(rep, dim=2)
+    s = state.clone().float()
+    core = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=v.device)
+    eye = torch.eye(chunk, device=v.device)
+    for c0 in range(0, t, chunk):
+        c1 = min(c0 + chunk, t)
+        n = c1 - c0
+        qc, kc, vc = q[:, c0:c1], k[:, c0:c1], v[:, c0:c1]
+        bc = bt[:, c0:c1]
+        gc = gt[:, c0:c1].cumsum(1)  # chunk-local prefix sum, inclusive
+        eg = torch.exp(gc)  # [B,n,HV]
+        # L is strictly lower triangular, so I+L is unit lower triangular and
+        # its inverse exists for any input — no pivoting, no conditioning check.
+        kk = torch.einsum("bihd,bjhd->bhij", kc, kc)
+        decay = torch.exp(gc.permute(0, 2, 1).unsqueeze(-1) - gc.permute(0, 2, 1).unsqueeze(-2))
+        low = torch.tril(torch.ones(n, n, device=v.device), -1)
+        lmat = bc.permute(0, 2, 1).unsqueeze(-1) * kk * decay * low
+        m = torch.linalg.solve_triangular(eye[:n, :n] + lmat, eye[:n, :n].expand_as(lmat),
+                                          upper=False, unitriangular=True)
+        u = m @ (bc.permute(0, 2, 1).unsqueeze(-1) * vc.permute(0, 2, 1, 3))
+        w = m @ ((bc * eg).permute(0, 2, 1).unsqueeze(-1) * kc.permute(0, 2, 1, 3))
+        d = u - w @ s  # [B,HV,n,DV]
+        # out_i = e^{G_i} q_i S_c + sum_{j<=i} e^{G_i-G_j} <q_i,k_j> d_j
+        qk = torch.einsum("bihd,bjhd->bhij", qc, kc) * decay * torch.tril(
+            torch.ones(n, n, device=v.device))
+        first = (eg.permute(0, 2, 1).unsqueeze(-1) * qc.permute(0, 2, 1, 3)) @ s
+        core[:, c0:c1] = (first + qk @ d).permute(0, 2, 1, 3)
+        glast = gc[:, -1]  # [B,HV]
+        s = torch.exp(glast).unsqueeze(-1).unsqueeze(-1) * s + (
+            (torch.exp(glast.unsqueeze(1) - gc).permute(0, 2, 1).unsqueeze(-1)
+             * kc.permute(0, 2, 1, 3)).transpose(-1, -2) @ d
+        )
+    return core, s
 
 
 def gdn_forward(
@@ -926,3 +971,48 @@ def sample_batch(
             draw = torch.multinomial(probs[i], num_samples=1, generator=gen)
             out[idx[i]] = sorted_idx[i, draw].to(torch.long)
     return out
+
+
+def _check_chunk_core() -> None:
+    """chunkwise-WY must equal the serial decay-first scan it replaces.
+
+    A 3:1 key/value head ratio and a T that is not chunk-divisible, because
+    those are the two shapes the upstream kernels cannot express as-is.
+    """
+    torch.manual_seed(0)
+    b, t, hk, hv, dk, dv = 2, 70, 2, 6, 16, 16
+    qn = torch.randn(b, t, hk, dk)
+    qn = qn / qn.norm(dim=-1, keepdim=True) / math.sqrt(dk)
+    kn = torch.randn(b, t, hk, dk)
+    kn = kn / kn.norm(dim=-1, keepdim=True)
+    v, gt = torch.randn(b, t, hv, dv), -torch.rand(b, t, hv) * 0.3
+    bt, s0 = torch.rand(b, t, hv), torch.randn(b, hv, dk, dv) * 0.1
+    s, core = s0.clone(), torch.zeros(b, t, hv, dv)
+    for step in range(t):
+        for h in range(hv):
+            kh = h * hk // hv
+            sh = s[:, h] * torch.exp(gt[:, step, h]).view(b, 1, 1)
+            d = (v[:, step, h] - torch.einsum("bk,bkv->bv", kn[:, step, kh], sh)) * bt[
+                :, step, h
+            ].unsqueeze(-1)
+            s[:, h] = sh + kn[:, step, kh].unsqueeze(-1) * d.unsqueeze(-2)
+            core[:, step, h] = torch.einsum("bk,bkv->bv", qn[:, step, kh], s[:, h])
+    for chunk in (16, 32, 64):
+        c2, s2 = gdn_chunk_core(qn, kn, v, gt, bt, s0, chunk=chunk)
+        ec = ((c2 - core).abs().max() / core.abs().max()).item()
+        es = ((s2 - s).abs().max() / s.abs().max()).item()
+        assert ec < 1e-4 and es < 1e-4, (chunk, ec, es)
+    print("reference: chunkwise-WY == serial decay-first")
+
+
+if __name__ == "__main__":  # runnable check: quant_fp8 inverts dequant_fp8
+    torch.manual_seed(0)
+    _w = torch.randn(300, 260, dtype=torch.bfloat16) * 0.02
+    _q, _s = quant_fp8(_w)
+    assert _q.shape == _w.shape and _s.shape == (3, 3), (_q.shape, _s.shape)
+    # e4m3 keeps 3 mantissa bits, so ~6% per element near a block's absmax; the
+    # gate that matters is the served model's accuracy, not this bound.
+    _rel = (dequant_fp8(_q, _s) - _w.float()).abs().max() / _w.float().abs().max()
+    assert _rel < 0.06, _rel
+    print("reference: quant_fp8 round-trip OK, rel", float(_rel))
+    _check_chunk_core()
