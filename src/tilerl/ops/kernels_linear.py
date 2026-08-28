@@ -515,8 +515,7 @@ __device__ __forceinline__ void tl_fp8_mma_rows(const void *w8v, int w_grp_strid
                            tl_e4m3x2_to_f16x2((unsigned short)(w[k][g].x >> 16)),
                            tl_e4m3x2_to_f16x2((unsigned short)(w[k][g].y)),
                            tl_e4m3x2_to_f16x2((unsigned short)(w[k][g].y >> 16))};
-          unsigned s2;
-          asm("cvt.rn.f16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(s[k][g]));
+          const unsigned s2 = ((unsigned)s[k][g] << 16) | s[k][g];
 #pragma unroll
           for (int i = 0; i < 4; ++i) asm("mul.f16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
           asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -868,7 +867,10 @@ def make_linear_fp8_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4):
         per = T.ceildiv(nchunk, KW)
         X: T.Tensor((8, K), "bfloat16")
         W8: T.Tensor((N, K), "float8_e4m3fn")
-        WScale: T.Tensor((T.ceildiv(N, 128), T.ceildiv(K, 128)), "bfloat16")
+        # f16, not bf16: this kernel's mma runs the scale through f16x2, so
+        # f16 storage is what it already rounded to — and the scalar-to-pair
+        # widening becomes a bit replication
+        WScale: T.Tensor((T.ceildiv(N, 128), T.ceildiv(K, 128)), "float16")
         OScale: T.Tensor((N,), "float32")
         Res: T.Tensor((8, N), "float32")
         Y = T.empty((8, N), "float32")

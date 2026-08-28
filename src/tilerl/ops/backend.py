@@ -454,7 +454,7 @@ class Backend:
             Np32 = _round_up(N, 32)
             w8 = _pad2d(w8, Np32, Kp)
             wscale = _pad2d(
-                self._const_f32(wscale, dtype=torch.bfloat16), -(-Np32 // 128), Kp // 128
+                self._const_f32(wscale, dtype=torch.float16), -(-Np32 // 128), Kp // 128
             )
             osc = self._ones(Np32) if oscale is None else self._const_f32(oscale, Np32)
             xm = _pad2d(x2, _MX, Kp)
