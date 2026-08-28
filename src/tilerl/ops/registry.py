@@ -112,6 +112,8 @@ _SM90_KERNELS = {
     "gdn_decode_fused": kernels_gdn.make_gdn_decode_fused,
     "gdn_chunk_fused": kernels_gdn.make_gdn_chunk_fused,
     "paged_attention": kernels_attn.make_paged_attention_mma,
+    "paged_attention_decode": kernels_attn.make_paged_attention_decode,
+    "paged_attention_combine": kernels_attn.make_paged_attention_combine,
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)

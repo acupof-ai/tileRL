@@ -4,6 +4,14 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-28 — split-KV decode attention, GQA group as the M tile — 5.7× at 32k (kernel)
+
+- Pure-decode ticks use `paged_attention_decode` (grid KVSPLIT×Hkv×B, the 4
+  query heads of a group as tile rows, static partial workspace) +
+  `paged_attention_combine`. Kernel-level at 32k, B=2: 1.451 → 0.256 ms per
+  layer, relerr 3.3e-3 vs the dense kernel; verify 1–3 PASS. Harness rows
+  pending a quiet host. Entry: `docs/experience/wins/2026-08-28-split-kv-decode-attention.md`.
+
 ## 2026-08-28 — fp8 on the f16 tensor path (hardware e4m3 cvt) — B=8 agg 298 tok/s
 
 - `cvt.rn.f16x2.e4m3x2` (1 op/pair, was 7) in the fp8 mma8 kernel: X

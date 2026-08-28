@@ -12,6 +12,8 @@ import tilelang.language as T
 from .kernels_mma import _pass_configs
 
 __all__ = [
+    "make_paged_attention_decode",
+    "make_paged_attention_combine",
     "make_paged_attention_mma",
 ]
 
@@ -151,3 +153,134 @@ def make_paged_attention_mma(target: str):
         return Out
 
     return paged_attention
+
+
+def make_paged_attention_decode(target: str, KVSPLIT: int = 16):
+    """Decode (S=1) paged attention, split-KV flash-decoding (sm90).
+
+    Grid (KVSPLIT, Hkv, B): a block owns one KV head and one slice of the KV
+    length; the G = H/Hkv query heads of the group are the rows of the 16-row
+    tile (rows >= G masked), so the KV slice is read ONCE per group instead of
+    once per query head. Each block emits its online-softmax partial
+    (PO [B,Hkv,KVSPLIT,G,D], PM, PL); make_paged_attention_combine merges.
+    The dense kernel above launched H blocks of 64 threads per row that each
+    scanned the whole KV with synchronous gathers (~5% of bandwidth at 32k).
+
+    # SOTA copy: examples/flash_decoding/example_gqa_decode.py @ tilelang main
+    #   (split-KV partials + combine). Adapted: paged block-table gather, the
+    #   GQA group as the M tile, KVSPLIT fixed (empty slices emit m=-inf, l=0).
+    """
+    block_N = 64
+    block_M = 16
+    accum_dtype = T.float32
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def paged_attention_decode(Q, KCache, VCache, BlockTable, SeqLens, PO, PM, PL, scale: T.float32, block_size):
+        B, H, D = T.const("B, H, D")
+        Hkv = T.const("Hkv")
+        NB = T.const("NB")
+        Mb = T.const("Mb")
+        Q: T.Tensor((B, H, D), "bfloat16")
+        KCache: T.Tensor((NB, Hkv, block_size, D), "bfloat16")
+        VCache: T.Tensor((NB, Hkv, block_size, D), "bfloat16")
+        BlockTable: T.Tensor((B, Mb), "int32")
+        SeqLens: T.Tensor((B,), "int32")
+        PO: T.Tensor((B, Hkv, KVSPLIT, block_M, D), "float32")
+        PM: T.Tensor((B, Hkv, KVSPLIT, block_M), "float32")
+        PL: T.Tensor((B, Hkv, KVSPLIT, block_M), "float32")
+        G = H // Hkv
+        log2e = 1.4426950408889634
+        with T.Kernel(KVSPLIT, Hkv, B, threads=64) as (sp, hkv, bb):
+            n = SeqLens[bb]
+            tiles = T.ceildiv(n, block_N)
+            per = T.ceildiv(tiles, KVSPLIT)
+            t0 = sp * per
+            t1 = T.min(tiles, t0 + per)
+            Q_shared = T.alloc_shared((block_M, D), "bfloat16")
+            K_shared = T.alloc_shared((block_N, D), "bfloat16")
+            V_shared = T.alloc_shared((block_N, D), "bfloat16")
+            acc_s = T.alloc_fragment((block_M, block_N), accum_dtype)
+            acc_s_sh = T.alloc_shared((block_M, block_N), "float32")
+            acc_s_cast = T.alloc_fragment((block_M, block_N), "bfloat16")
+            acc_o = T.alloc_fragment((block_M, D), accum_dtype)
+            scores_max = T.alloc_fragment((block_M,), accum_dtype)
+            scores_max_prev = T.alloc_fragment((block_M,), accum_dtype)
+            scores_scale = T.alloc_fragment((block_M,), accum_dtype)
+            scores_sum = T.alloc_fragment((block_M,), accum_dtype)
+            logsum = T.alloc_fragment((block_M,), accum_dtype)
+            for i, d in T.Parallel(block_M, D):
+                Q_shared[i, d] = T.if_then_else(i < G, Q[bb, hkv * G + T.min(i, G - 1), d], T.cast(0, "bfloat16"))
+            T.fill(acc_o, 0)
+            T.fill(logsum, 0)
+            T.fill(scores_max, -T.infinity(accum_dtype))
+            for k in T.Pipelined(t1 - t0, num_stages=1):
+                for i, d in T.Parallel(block_N, D):
+                    p = (t0 + k) * block_N + i
+                    bidx = T.min(p // block_size, Mb - 1)
+                    K_shared[i, d] = KCache[BlockTable[bb, bidx], hkv, p % block_size, d]
+                for i, j in T.Parallel(block_M, block_N):
+                    acc_s[i, j] = T.if_then_else((t0 + k) * block_N + j < n, 0, -T.infinity(accum_dtype))
+                T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.Square)
+                T.copy(scores_max, scores_max_prev)
+                T.fill(scores_max, -T.infinity(accum_dtype))
+                T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                for i in T.Parallel(block_M):
+                    scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                for i in T.Parallel(block_M):
+                    scores_scale[i] = T.exp2((scores_max_prev[i] - scores_max[i]) * scale * log2e)
+                for i, j in T.Parallel(block_M, block_N):
+                    acc_s[i, j] = T.exp2(acc_s[i, j] * scale * log2e - scores_max[i] * scale * log2e)
+                T.reduce_sum(acc_s, scores_sum, dim=1)
+                for i in T.Parallel(block_M):
+                    logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+                T.copy(acc_s, acc_s_sh)
+                for i, j in T.Parallel(block_M, block_N):
+                    acc_s_cast[i, j] = acc_s_sh[i, j]
+                for i, j in T.Parallel(block_M, D):
+                    acc_o[i, j] *= scores_scale[i]
+                for i, d in T.Parallel(block_N, D):
+                    p = (t0 + k) * block_N + i
+                    bidx = T.min(p // block_size, Mb - 1)
+                    V_shared[i, d] = VCache[BlockTable[bb, bidx], hkv, p % block_size, d]
+                T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.Square)
+            # partials in the scaled-log2 domain: PM = max * scale*log2e, PL = sum
+            T.copy(acc_o, PO[bb, hkv, sp, :, :])
+            for i in T.Parallel(block_M):
+                PM[bb, hkv, sp, i] = scores_max[i] * scale * log2e
+                PL[bb, hkv, sp, i] = logsum[i]
+
+    return paged_attention_decode
+
+
+def make_paged_attention_combine(target: str, KVSPLIT: int = 16):
+    """Merge split-KV partials: Out[b,h,d] = sum_s w_s PO_s / sum_s w_s PL_s,
+    w_s = 2^(PM_s - max_s PM_s). Empty slices carry PM=-inf, PL=0."""
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def paged_attention_combine(PO, PM, PL, G, threads):
+        B, Hkv, D = T.const("B, Hkv, D")
+        PO: T.Tensor((B, Hkv, KVSPLIT, 16, D), "float32")
+        PM: T.Tensor((B, Hkv, KVSPLIT, 16), "float32")
+        PL: T.Tensor((B, Hkv, KVSPLIT, 16), "float32")
+        Out = T.empty((B, Hkv, G, D), "bfloat16")
+        with T.Kernel(B * Hkv * G, threads=threads) as row:
+            bb = row // (Hkv * G)
+            hkv = (row // G) % Hkv
+            g = row % G
+            m = T.alloc_fragment((1,), "float32")
+            l = T.alloc_fragment((1,), "float32")
+            m[0] = -T.infinity("float32")
+            for sp in T.serial(KVSPLIT):
+                m[0] = T.max(m[0], PM[bb, hkv, sp, g])
+            l[0] = 0.0
+            for sp in T.serial(KVSPLIT):
+                l[0] += T.exp2(PM[bb, hkv, sp, g] - m[0]) * PL[bb, hkv, sp, g]
+            for d in T.Parallel(D):
+                acc = T.alloc_fragment((1,), "float32")
+                acc[0] = 0.0
+                for sp in T.serial(KVSPLIT):
+                    acc[0] += T.exp2(PM[bb, hkv, sp, g] - m[0]) * PO[bb, hkv, sp, g, d]
+                Out[bb, hkv, g, d] = T.cast(acc[0] / l[0], "bfloat16")
+        return Out
+
+    return paged_attention_combine

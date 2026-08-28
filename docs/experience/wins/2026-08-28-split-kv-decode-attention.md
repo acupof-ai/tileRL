@@ -1,0 +1,37 @@
+# Split-KV decode attention with the GQA group as the M tile — cuda(H20), 2026-08-28
+
+> Status: Shipped (sm90, pure-decode ticks S=1; mixed ticks keep the dense kernel)
+
+## Context
+
+B=1 decode fell from 87.5 tok/s at d512 to 28.7 at 32k: ~24 ms of the 36 ms
+tick in 16 attention layers for ~4.3 GB of KV — 5% of bandwidth. The dense
+MMA kernel launched one 64-thread block per (query head, row): 32 blocks on
+132 SMs, each scanning the whole KV serially with synchronous gathers, and
+the 4 GQA query heads of a group each re-read the same KV head.
+
+## What Worked
+
+`make_paged_attention_decode`: grid (KVSPLIT=16, Hkv, B). A block owns one
+KV head and one slice of the KV length; the group's 4 query heads are rows of
+the 16-row tile (rows ≥ G masked) so the slice is read once per group; it
+emits its online-softmax partial (O, m, l) into a static workspace (one per
+batch bucket, graph-capturable). `make_paged_attention_combine` merges the
+16 partials per (b, kv head, g) in the scaled-log2 domain (empty slices carry
+m = −inf, l = 0). Parallelism 32 → 2048 blocks at B=1... KV bytes /4.
+
+Kernel-level (B=2, 32k, `scripts/parity_attn_decode.py`): relerr 3.3e-3 vs
+the dense kernel (bf16 output rounding), **1.451 → 0.256 ms (5.7×)**.
+
+## Rule
+
+Decode attention needs parallelism along the KV length, not along query
+heads; pack the GQA group into the M tile so the KV is read once. The
+gathers are still synchronous (tilelang 0.1.13, no cp.async for elementwise
+copies) — 16 splits hide that; per-block TMA copies are the next step.
+
+## Results
+
+| date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
+|---|---|---|---|---|---:|---:|---:|
+| 2026-08-28 | (pending) | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | | | (harness pending) |

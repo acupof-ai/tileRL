@@ -498,7 +498,10 @@ class Backend:
         b, s = q.shape[0], q.shape[1]
         if seq_q_lens is None:
             seq_q_lens = torch.full((b,), s, dtype=torch.int32)
-        if self.arch == "sm90":
+        if self.arch == "sm90" and s == 1 and "paged_attention_decode" in _resolve(self.precision, self.arch):
+            # Pure decode: split-KV flash-decoding, the GQA group as the M tile.
+            out = self._paged_attention_decode(q, k_cache, v_cache, block_table, seq_lens, scale)
+        elif self.arch == "sm90":
             # MMA kernel is bf16-IO and tiles queries at block_M: pad S to a
             # multiple (the kernel's history/mask use the true per-row lengths
             # in seq_q_lens, so padding rows do not shift the causal window).
@@ -542,6 +545,26 @@ class Backend:
         if gate is not None:
             out = out * torch.sigmoid(self._dev(gate, out.dtype))
         return out
+
+    def _paged_attention_decode(self, q, k_cache, v_cache, block_table, seq_lens, scale):
+        b, h, d = q.shape[0], q.shape[2], q.shape[3]
+        hkv = k_cache.shape[1]
+        ks = 16  # KVSPLIT of the registered kernels
+        key = ("attn_ws", b, hkv, d)
+        ws = self._ones_cache.get(key)
+        if ws is None:  # static workspace: graph-capturable, one per batch bucket
+            ws = self._ones_cache[key] = (
+                torch.empty(b, hkv, ks, 16, d, dtype=torch.float32, device=self.device),
+                torch.empty(b, hkv, ks, 16, dtype=torch.float32, device=self.device),
+                torch.empty(b, hkv, ks, 16, dtype=torch.float32, device=self.device),
+            )
+        po, pm, pl = ws
+        self._kernel("paged_attention_decode")(
+            self._dev(self._c(q.reshape(b, h, d)), torch.bfloat16), k_cache, v_cache,
+            self._i32(block_table), self._i32(seq_lens), po, pm, pl, float(scale),
+            int(k_cache.shape[2]),
+        )
+        return self._kernel("paged_attention_combine")(po, pm, pl, h // hkv, 128).reshape(b, 1, h, d)
 
     def attention(self, q, k, v, scale, gate=None):
         """Dense causal GQA attention (training path). q/k/v [B,T,H,D]."""
