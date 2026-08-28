@@ -4,6 +4,27 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-29 — phase exit: speculative decoding ships, 1.14-1.19x
+
+- Speculation lives in the engine: a decode row drafts off the trunk's last
+  hidden and the SAME forward verifies it as a `seq_q = 1+depth` row. The paged
+  KV self-heals; the gated-delta state is kept after every chain step and the
+  accepted length selects one — no snapshot, no second forward.
+  **B=1 15.5 -> 17.6 tok/s (depth 2), B=8 82.6 -> 97.9 aggregate (depth 4).**
+  [wins/2026-08-29-spec-decode-net-win.md](docs/experience/wins/2026-08-29-spec-decode-net-win.md)
+- It was a 6.5x net LOSS first. The head shipped dense bf16, which
+  `Backend.linear` serves at ~30 GB/s — 9.7 ms per projection against the
+  trunk's 0.13 ms — so one draft step cost more than the whole 64-layer tick.
+  Serving the head as fp8 fixed it, but only after deleting a duplicated
+  `materialize` in `build_engine` that re-bound `draft.params` and left the
+  head's own `Model` reading the original weights. That one line made three
+  consecutive real fixes measure as no-ops.
+- The head itself was broken until today: `load_draft` skipped the zero-centered
+  RMSNorm +1 fold that `load_hf` applies, and the head emitted logits
+  ANTI-correlated with the trunk (its argmax ranked 248191 of 248320).
+  Teacher-forced agreement 0.0% -> 84.4%.
+  [errors/2026-08-29-draft-head-missing-zero-centered-fold.md](docs/experience/errors/2026-08-29-draft-head-missing-zero-centered-fold.md)
+
 ## 2026-08-29 — the harness gates accuracy, not only speed
 
 - Every gate in the bench harness measured tok/s, so a change that broke the
