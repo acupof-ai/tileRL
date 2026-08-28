@@ -647,6 +647,10 @@ class Backend:
             _THREADS,
         )
 
+    def linear_frozen_bwd(self, grad, wq, scale, oscale=None, fp8=False):
+        # ponytail: torch-eager backward, transposed fp4 GEMM when perf demands
+        return reference.linear_frozen_bwd(grad, wq, scale, oscale=oscale, fp8=fp8)
+
     def attention_bwd(self, grad, q, k, v, scale):
         # ponytail: torch-eager backward, tilelang kernel when perf demands
         return reference.dense_attention_bwd(grad, q, k, v, float(scale))

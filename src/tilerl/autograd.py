@@ -110,8 +110,11 @@ class RecordingBackend:
         if name in ("linear_fp4", "linear_fp8"):
 
             def master_linear(x: torch.Tensor, *args: Any, master=None, **kwargs: Any) -> Any:
-                if master is None:
-                    raise RuntimeError(f"{name} training requires a master weight")
+                if master is None:  # frozen base (LoRA / OPD): quantized kernel, dX only
+                    out = getattr(self._backend, name)(x, *args, **kwargs)
+                    maybe_record(name + "_frozen", out, x, *args, _backend=self._backend,
+                                 **kwargs)
+                    return out
                 out = self._backend.linear(x, master)
                 maybe_record("linear", out, x, master, _backend=self._backend)
                 return out
@@ -245,7 +248,17 @@ def _add(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
     yield 1, g
 
 
+def _frozen(fp8: bool) -> _Handler:
+    # Frozen quantized base: the weight has no master, so only dX flows.
+    def handler(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
+        yield 0, backend.linear_frozen_bwd(g, args[1], args[2], oscale=kw.get("oscale"), fp8=fp8)
+
+    return handler
+
+
 _BWD: dict[str, _Handler] = {
+    "linear_fp4_frozen": _frozen(False),
+    "linear_fp8_frozen": _frozen(True),
     "rmsnorm": _default("rmsnorm"),
     "rope": _rope,
     "linear": _linear,

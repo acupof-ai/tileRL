@@ -167,6 +167,15 @@ def linear_bwd(
 # ---------------------------------------------------------------- linear fp4
 
 
+def linear_frozen_bwd(grad, wq, scale, oscale=None, fp8=False):
+    """dX through a frozen quantized weight (LoRA / OPD base): no weight grad,
+    so the base never needs a bf16 master — the only way the 27B fits one card."""
+    w = dequant_fp8(wq, scale) if fp8 else dequant_fp4(wq, scale)
+    if oscale is not None:
+        w = w * _f32(oscale).reshape(-1, 1)
+    return _f32(grad) @ w
+
+
 def dequant_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequantize OCP e2m1-packed weights. wq uint8 [N, K//2] (low nibble
     first), scale f32 [N, K//B]. Returns w [N, K] f32. The block size B is

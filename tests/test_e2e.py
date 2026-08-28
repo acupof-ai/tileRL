@@ -30,7 +30,7 @@ from tilerl.engine import (
 )
 from tilerl.model import build_random, fp4_param_keys, param_specs
 from tilerl.ops.backend import get_backend
-from tilerl.ops.reference import pack_fp4
+from tilerl.ops.reference import dequant_fp4, pack_fp4
 from tilerl.testing import RefBackend
 from tilerl.train import opd_loop, train_step
 
@@ -647,3 +647,19 @@ def test_gpu_targets():
             os.environ.pop("TILERL_TARGET", None)
         else:
             os.environ["TILERL_TARGET"] = prev
+
+
+def test_frozen_fp4_base_gives_dx_only():
+    """No master = frozen base (LoRA/OPD): the fp4 kernel runs and dX flows,
+    but the quantized weight gets no gradient."""
+    backend = RefBackend()
+    recording = RecordingBackend(backend)
+    x = torch.randn(2, 32)
+    w = torch.randn(8, 32)
+    wq, scale = pack_fp4(w)
+    with Tape() as tape:
+        y = recording.linear_fp4(x, wq, scale)
+    g = torch.randn_like(y)
+    grads = tape.backward(g)
+    assert set(grads) == {id(x)}
+    assert torch.allclose(grads[id(x)], g @ dequant_fp4(wq, scale), atol=1e-4)
