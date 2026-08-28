@@ -596,18 +596,19 @@ def test_gdn_decode_fused_parity(backend):
     _assert_close(nw, rnw, "gdn decode fused window")
 
 
-def _gdn_inputs(b, t, nkh, nvh, kd, vd, ker, seed):
+def _gdn_inputs(b, t, nkh, nvh, kd, vd, ker, seed, scale=1.0):
     """Random full-GDN inputs (seeded): q/k/v/g/beta/z/state/window + kwargs."""
     torch.manual_seed(seed)
+    sc = 0.1 * scale
     qkv = 2 * nkh * kd + nvh * vd
-    q = torch.randn(b, t, nkh * kd) * 0.1
-    k = torch.randn(b, t, nkh * kd) * 0.1
-    v = torch.randn(b, t, nvh * vd) * 0.1
+    q = torch.randn(b, t, nkh * kd) * sc
+    k = torch.randn(b, t, nkh * kd) * sc
+    v = torch.randn(b, t, nvh * vd) * sc
     g = torch.randn(b, t, nvh)
     beta = torch.randn(b, t, nvh)
-    z = torch.randn(b, t, nvh * vd) * 0.1
-    state = torch.randn(b, nvh, kd, vd) * 0.01
-    window = torch.randn(b, ker - 1, qkv) * 0.1
+    z = torch.randn(b, t, nvh * vd) * sc
+    state = torch.randn(b, nvh, kd, vd) * 0.1 * sc
+    window = torch.randn(b, ker - 1, qkv) * sc
     kw = dict(
         conv1d_weight=torch.randn(qkv, ker) * 0.1,
         dt_bias=torch.randn(nvh),
@@ -616,6 +617,22 @@ def _gdn_inputs(b, t, nkh, nvh, kd, vd, ker, seed):
         conv_window=window,
     )
     return q, k, v, g, beta, z, state, kw
+
+
+def test_gdn_chunk_fused_parity_full_scale(backend):
+    """Same gate at the model's real input magnitude, not the fixtures' 0.1.
+
+    The previously rejected chunked pipeline passed at scale 0.1 (0.8% error)
+    and was 26% wrong at scale 1.0, where post-conv1d SiLU activations actually
+    live — bf16 intermediates between stages. Any prefill kernel that keeps
+    intermediates below f32 fails here and nowhere else.
+    """
+    q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 96, 2, 6, 16, 16, 4, 37, scale=10.0)
+    out, ns, nw = backend.linear_attn_chunk(q, k, v, g, beta, state, z=z, **kw)
+    rout, rns, rnw = reference.gdn_forward(q, k, v, g, beta, state, z=z, **kw)
+    _assert_close(out, rout, "gdn full-scale out")
+    _assert_close(ns, rns, "gdn full-scale state")
+    _assert_close(nw, rnw, "gdn full-scale window")
 
 
 def test_gdn_chunk_fused_parity(backend):
