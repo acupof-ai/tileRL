@@ -28,8 +28,9 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--len", type=int, default=2048)
     ap.add_argument("--top", type=int, default=30)
-    ap.add_argument("--chunk", type=int, default=0,
-                    help="prefill chunk width (0 = the whole prompt in one forward)")
+    ap.add_argument("--chunk", type=int, default=512,
+                    help="prefill chunk width; 512 is the engine default, so that is "
+                         "what this profiles unless you ask for another")
     args = ap.parse_args()
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -49,7 +50,7 @@ def main() -> None:
     cfg = model.cfg
     engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=16, max_batch=8,
                           max_total_tokens=8192,
-                          max_num_batched_tokens=args.chunk or args.len)
+                          max_num_batched_tokens=args.chunk)
     b = args.batch
 
     def one_prefill():
