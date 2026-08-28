@@ -243,7 +243,13 @@ def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
                 bk.rand_prompt(cfg.vocab_size, 16, seed=700 + i),
                 SamplingParams(temperature=0.0, max_new_tokens=(ticks + 20) * (1 + depth), seed=i),
             )
-        for _ in range(8):  # flush prefills; every row decoding afterwards
+        # One waiting request is admitted per tick, so B rows need at least B
+        # ticks before any of them decodes: a fixed warmup times prefill ticks
+        # as if they were decode (B=8 read 51.8 tok/s against 91.8 settled).
+        if not bk.settle_decode(engine, b, 64 + 8 * b):
+            print(f"  {b:>3}   (never reached pure decode — skipped)")
+            continue
+        for _ in range(8):
             engine.step()
         bk.sync(backend)
         s0 = engine.stats()
