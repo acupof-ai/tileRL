@@ -188,35 +188,46 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
                 print(f"  {depth:>7} {b:>3}   (skipped: KV pool would exceed one H20)")
                 continue
             need = int(head * (-(-(depth + gen) * b // BLOCK_TOKENS) + b))
-            engine = build_engine(
-                cfg, model, backend,
-                num_blocks=max(256, need), num_slots=max(16, b),
-                max_batch=max(8, b), max_total_tokens=max(8192, depth + gen + 64),
-            )
-            wids = [
-                engine.submit(
-                    bk.rand_prompt(cfg.vocab_size, depth, seed=900 + depth + i),
-                    SamplingParams(temperature=0.0, max_new_tokens=gen, seed=i),
+            # The block-count guard above sizes the POOL; it cannot see the
+            # activations, logits and prefill buffers the run then needs, so a
+            # cell that passes it can still OOM — 32768x4 did, and took the
+            # accuracy suite queued behind it down with the process. An OOM is
+            # where one card stops: a row of the result, not the end of the run.
+            try:
+                engine = build_engine(
+                    cfg, model, backend,
+                    num_blocks=max(256, need), num_slots=max(16, b),
+                    max_batch=max(8, b), max_total_tokens=max(8192, depth + gen + 64),
                 )
-                for i in range(b)
-            ]
-            if not bk.settle_decode(engine, b, depth * b // 128):
-                print(f"  {depth:>7} {b:>3}   (never reached pure decode — skipped)")
-                continue
-            for _ in range(8):
-                engine.step()
-            ms = _median_windows(engine.step, 3, ticks, lambda: bk.sync(backend))
-            agg = 1000.0 * b / ms
-            print(f"  {depth:>7} {b:>3} {ms:>9.3f} {1000.0 / ms:>10.1f} {agg:>10.1f}"
-                  f" {100 * LAST_SPREAD:>7.1f}%")
-            gate.check("decode-kv", f"d{depth}-b{b}", agg, spread=LAST_SPREAD)
-            # drain so the next depth's blocks are free
-            done: dict = {}
-            for _ in range(ticks + 8 * b + 256):
-                done.update(engine.poll())
-                if all(w in done for w in wids):
-                    break
-                engine.step()
+                wids = [
+                    engine.submit(
+                        bk.rand_prompt(cfg.vocab_size, depth, seed=900 + depth + i),
+                        SamplingParams(temperature=0.0, max_new_tokens=gen, seed=i),
+                    )
+                    for i in range(b)
+                ]
+                if not bk.settle_decode(engine, b, depth * b // 128):
+                    print(f"  {depth:>7} {b:>3}   (never reached pure decode — skipped)")
+                    continue
+                for _ in range(8):
+                    engine.step()
+                ms = _median_windows(engine.step, 3, ticks, lambda: bk.sync(backend))
+                agg = 1000.0 * b / ms
+                print(f"  {depth:>7} {b:>3} {ms:>9.3f} {1000.0 / ms:>10.1f} {agg:>10.1f}"
+                      f" {100 * LAST_SPREAD:>7.1f}%")
+                gate.check("decode-kv", f"d{depth}-b{b}", agg, spread=LAST_SPREAD)
+                # drain so the next depth's blocks are free
+                done: dict = {}
+                for _ in range(ticks + 8 * b + 256):
+                    done.update(engine.poll())
+                    if all(w in done for w in wids):
+                        break
+                    engine.step()
+            except torch_oom() as exc:
+                print(f"  {depth:>7} {b:>3} {'OOM':>9}  {str(exc).split('.')[0]}")
+            finally:
+                engine = wids = None
+                _free(backend)
 
 
 def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):

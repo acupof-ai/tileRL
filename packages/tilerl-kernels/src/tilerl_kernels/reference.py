@@ -16,6 +16,7 @@ matmul dims.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from typing import Any
@@ -44,6 +45,7 @@ __all__ = [
     "linear_attn_bwd",
     "gdn_forward",
     "gdn_chunk_core",
+    "gdn_chunk_core_fla",
     "gdn_backward",
     "silu_mul",
     "silu_mul_bwd",
@@ -582,6 +584,35 @@ def _gdn_chunk_bwd(dout, dS_next, qc, kc, vc, bc, c):
             dbeta.permute(0, 2, 1), dgt, dS)
 
 
+def gdn_chunk_core_fla(qn, kn, v, gt, bt, state, chunk: int = 64):
+    """:func:`gdn_chunk_core` through flash-linear-attention — a MEASUREMENT
+    path, not a shipped one.
+
+    fla is Triton and CUDA-only, so it cannot be the backend (AGENTS.md: one
+    TileLang source for cpu/cuda/rocm/metal). It is here to answer one question
+    with a number instead of an estimate: fla runs our GDN shapes in 6.8 ms
+    where our scalar-scan kernel takes 63, and this says how much of that 9.3x
+    survives the layer's own glue.
+
+    Same signature as the reference so the two are interchangeable at the call
+    site. ``chunk`` is fla's chunk_size. fla wants [B,T,H,D] with the KEY heads
+    already broadcast to value heads, which is what the serial form does too.
+    """
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+    rep = v.shape[2] // kn.shape[2]
+    q = qn.repeat_interleave(rep, dim=2)
+    k = kn.repeat_interleave(rep, dim=2)
+    # qn already carries the 1/sqrt(key_dim) factor the serial form folds in, so
+    # fla's own scale must be 1.
+    o, s = chunk_gated_delta_rule(
+        q=q.bfloat16(), k=k.bfloat16(), v=v.bfloat16(), g=gt.float(),
+        beta=bt.bfloat16(), scale=1.0, initial_state=state.float(),
+        output_final_state=True, use_qk_l2norm_in_kernel=False,
+    )
+    return o.float(), s.float()
+
+
 def gdn_chunk_core(qn, kn, v, gt, bt, state, chunk: int = 64):
     """The gated-delta core as a chunkwise-WY decomposition, not a serial scan.
 
@@ -699,7 +730,8 @@ def gdn_forward(
     if chunkwise and not keep_steps and int(seq_q_lens.min()) == t:
         # Every row full-length: the chunked form has no per-row valid mask, and
         # a ragged batch would silently absorb padding into the recurrence.
-        core, s = gdn_chunk_core(qn, kn, v_raw, gt, bt, state, chunk=chunkwise)
+        impl = gdn_chunk_core_fla if os.environ.get("TILERL_GDN_FLA") else gdn_chunk_core
+        core, s = impl(qn, kn, v_raw, gt, bt, state, chunk=chunkwise)
     else:
         s_heads = [state[:, h].clone() for h in range(nvh)]
         steps: list[torch.Tensor] = []
