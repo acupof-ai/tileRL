@@ -473,6 +473,61 @@ __device__ __forceinline__ void tl_fp4_mma_rows(const void *wqv, int w_grp_strid
 #pragma unroll
   for (int i = 0; i < NG * 4; ++i) out[i] = acc[i];
 }
+// Wide-load fp4 twin of tl_fp4_mma_rows: the lane loads v2.u32 (8 bytes = 16
+// fp4) where the narrow one loads u32 (4 bytes = 8), halving the WEIGHT load
+// instructions. mma8 issues 1.93x the GEMV's load requests for identical DRAM
+// traffic (errors/2026-08-29-mma8-is-register-bound.md), and the fp8 twin
+// below already loads v2.u32 — its mma8/gemv ratio is 2.07x against fp4's 2.64x.
+//
+// The lane -> k map widens with it: lane q owns k in [64*cp + 16q, +16) of a
+// 64-k chunk PAIR, and X is read at the same element offset, which is what
+// keeps the mma's virtual-k permutation consistent between the A and B
+// fragments. One scale still covers a lane's 16 values: 16q is aligned to both
+// the 16- and 32-element scale blocks.
+template <int NG, int G>
+__device__ __forceinline__ void tl_fp4_mma_rows_w8(const void *wqv, int w_grp_stride,
+                                                   const void *xv, const float *sc,
+                                                   int sc_grp_stride, int sc_per_pair,
+                                                   int p0, int p1, float *out) {
+  const unsigned char *wq = (const unsigned char *)wqv;
+  const unsigned short *x = (const unsigned short *)xv;
+  float acc[NG * 4];
+#pragma unroll
+  for (int i = 0; i < NG * 4; ++i) acc[i] = 0.f;
+  const unsigned zero = 0u;
+  for (int p = p0; p < p1; ++p) {
+    uint4 xa0, xa1;
+    asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(xa0.x), "=r"(xa0.y), "=r"(xa0.z), "=r"(xa0.w) : "l"(x + p * 64));
+    asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(xa1.x), "=r"(xa1.y), "=r"(xa1.z), "=r"(xa1.w) : "l"(x + p * 64 + 8));
+#pragma unroll
+    for (int g = 0; g < NG; ++g) {
+      uint2 w;
+      asm volatile("ld.global.nc.v2.u32 {%0,%1}, [%2];"
+                   : "=r"(w.x), "=r"(w.y) : "l"(wq + g * w_grp_stride + p * 32));
+      const float sg = __ldg(sc + g * sc_grp_stride + p * sc_per_pair);
+      unsigned d[8];
+      tl_fp4_decode8(w.x, d);
+      tl_fp4_decode8(w.y, d + 4);
+      unsigned s2;
+      asm("cvt.rn.bf16x2.f32 %0, %1, %1;" : "=r"(s2) : "f"(sg));
+#pragma unroll
+      for (int i = 0; i < 8; ++i) asm("mul.bf16x2 %0, %0, %1;" : "+r"(d[i]) : "r"(s2));
+      const unsigned xw[8] = {xa0.x, xa0.y, xa0.z, xa0.w, xa1.x, xa1.y, xa1.z, xa1.w};
+#pragma unroll
+      for (int t = 0; t < 4; ++t)
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                     : "+f"(acc[g * 4]), "+f"(acc[g * 4 + 1]), "+f"(acc[g * 4 + 2]),
+                       "+f"(acc[g * 4 + 3])
+                     : "r"(xw[2 * t]), "r"(zero), "r"(xw[2 * t + 1]), "r"(zero),
+                       "r"(d[2 * t]), "r"(d[2 * t + 1]));
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < NG * 4; ++i) out[i] = acc[i];
+}
 template <int NG, int G>
 __device__ __forceinline__ void tl_fp8_mma_rows(const void *w8v, int w_grp_stride, const void *xv,
                                                 const float *sc, int sc_shift, int c0,
@@ -730,7 +785,7 @@ def make_linear_fp4_gemv(target: str, M: int = 1, GROUP: int = 4):
     return linear_fp4_gemv
 
 
-def make_linear_fp4_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4):
+def make_linear_fp4_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4, W8: int = 1):
     """Decode GEMM for M <= 8 on the tensor cores (sm90): X [8, K] bf16 (rows
     >= M zero) @ twiddled fp4 -> Y [8, N] f32 (+ Res, * OScale). A block owns
     NG*8 output rows; its KW warps split K in k32 chunks (``tl_fp4_mma_rows``)
@@ -767,14 +822,28 @@ def make_linear_fp4_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4):
             # whole per-warp K range in one extern call: accumulators live in
             # registers there (see tl_fp4_mma_rows); the scale for chunk c of
             # row n is Scale[n, (c*32 + 8q)//block] = row base + c*(32//block)
-            T.call_extern(
-                f"tl_fp4_mma_rows<{NG}, {G}>",
-                T.access_ptr(WQ[n0 + g, 4 * q], "r"), 8 * (K // 2),
-                T.access_ptr(X[g, 8 * q], "r"),
-                T.access_ptr(Scale[n0 + g, (8 * q) // block], "r"), 8 * (K // block), 32 // block,
-                kw * per, T.min(nchunk, (kw + 1) * per),
-                T.access_ptr(acc, "w"), dtype="void",
-            )
+            if W8:
+                # Chunk PAIRS (64 k): the lane owns 16 fp4 at byte 8q of the
+                # pair, and X at element 16q, which is the same k range.
+                npair = nchunk // 2
+                pper = T.ceildiv(npair, KW)
+                T.call_extern(
+                    f"tl_fp4_mma_rows_w8<{NG}, {G}>",
+                    T.access_ptr(WQ[n0 + g, 8 * q], "r"), 8 * (K // 2),
+                    T.access_ptr(X[g, 16 * q], "r"),
+                    T.access_ptr(Scale[n0 + g, (16 * q) // block], "r"), 8 * (K // block),
+                    64 // block, kw * pper, T.min(npair, (kw + 1) * pper),
+                    T.access_ptr(acc, "w"), dtype="void",
+                )
+            else:
+                T.call_extern(
+                    f"tl_fp4_mma_rows<{NG}, {G}>",
+                    T.access_ptr(WQ[n0 + g, 4 * q], "r"), 8 * (K // 2),
+                    T.access_ptr(X[g, 8 * q], "r"),
+                    T.access_ptr(Scale[n0 + g, (8 * q) // block], "r"), 8 * (K // block),
+                    32 // block, kw * per, T.min(nchunk, (kw + 1) * per),
+                    T.access_ptr(acc, "w"), dtype="void",
+                )
             for grp in T.unroll(NG):
                 red[kw, g, 8 * grp + 2 * q] = acc[4 * grp]
                 red[kw, g, 8 * grp + 2 * q + 1] = acc[4 * grp + 1]

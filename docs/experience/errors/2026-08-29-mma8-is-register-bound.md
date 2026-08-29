@@ -206,6 +206,37 @@ B=8 decode 311 -> ~400 tok/s (1.3x), and speculation's per-width cost 8.9 ->
 ~6.5 ms — **still above the 6.0 ms break-even**. A real win, not a
 goal-flipping one.
 
+## The fix, and how little of it reaches the tick
+
+Widening fp4's weight load to `v2.u32` — the lane owns 16 fp4 over a 64-k chunk
+PAIR, X is read at the same element offset so the mma's virtual-k permutation
+stays consistent — works on the fifth attempt at this kernel:
+
+| | us | GB/s | rel |
+|---|---:|---:|---|
+| narrow (`u32`) | 69.5 | 802 | 2.55e-03 |
+| **wide (`v2.u32`)** | **59.1** | **943** | **2.55e-03** |
+
+**1.18x, bit-identical output**, and the same 4 pre-existing GPU test failures
+with W8 forced off (89.4 s) as on (91.3 s).
+
+End to end it is much less, and the honest number is the second one:
+
+| B | W8=0 | W8=1 | |
+|---:|---:|---:|---:|
+| 4 | 141.8 | 147.1 | **1.037x** (paired, one process) |
+| 8 | ~37.9 ms/tick | ~37.8 | **~1.00x** (across runs — see below) |
+
+Because only half the linears benefit: the fp8 mma already loaded `v2.u32`, so
+just fp4's 13.5 ms of a 37.8 ms tick is in scope, and 1.18x of that is ~2 ms.
+**Amdahl, not a bad kernel.**
+
+The B=8 pair is NOT usable: rebuilding engines and clearing the kernel cache
+between arms in one process gave the W8=0 arm 565 ms/tick, 15x its standalone
+value — the decode graph or the pools did not survive the rebuild. So B=8 rests
+on two separate runs, which is weaker evidence than B=4's, and is recorded as
+such rather than quietly averaged in.
+
 ## Rule
 
 A correlation is not a diagnosis, and the counter that settles it is usually

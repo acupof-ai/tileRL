@@ -24,7 +24,8 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=17408)
     ap.add_argument("--k", type=int, default=5120)
     ap.add_argument("--iters", type=int, default=50)
-    ap.add_argument("--combos", default="4x4x4,2x4x4,1x4x4,2x4x2,1x4x2,2x2x4,4x4x2")
+    # NGxKWxGxW8 — W8=1 loads 8 bytes of weight per lane instead of 4
+    ap.add_argument("--combos", default="4x4x4x0,4x4x4x1,4x2x4x1,2x4x4x1,4x4x2x1")
     args = ap.parse_args()
     b = get_backend()
     assert b.device.type == "cuda", "needs TILERL_TARGET=cuda"
@@ -52,22 +53,22 @@ def main() -> None:
 
     print(f"N={args.n} K={args.k}  {mb:.1f} MB, M=8")
     for combo in args.combos.split(","):
-        ng, kw, g = (int(v) for v in combo.split("x"))
+        ng, kw, g, w8 = (int(v) for v in combo.split("x"))
         nb = ng * 8
         np_ = _round_up(args.n, nb)
         w2, s2 = _pad2d(wq, np_, args.k // 2), _pad2d(sc, np_, sc.shape[1])
         osc = torch.ones(np_, dtype=torch.float32, device=b.device)
         res = torch.zeros(8, np_, dtype=torch.float32, device=b.device)
         try:
-            k = kernels_linear.make_linear_fp4_mma8(b.target, NG=ng, KW=kw, G=g)
+            k = kernels_linear.make_linear_fp4_mma8(b.target, NG=ng, KW=kw, G=g, W8=w8)
             us = timed(lambda: k(x, w2, s2, osc, res, blk))
         except Exception as exc:  # a combo the schedule cannot express
-            print(f"  NG={ng} KW={kw} G={g}: {type(exc).__name__}: {str(exc)[:90]}")
+            print(f"  NG={ng} KW={kw} G={g} W8={w8}: {type(exc).__name__}: {str(exc)[:90]}")
             continue
         ref = reference.linear_fp4(x.float().cpu(), wq_nat, sc.cpu())
         got = k(x, w2, s2, osc, res, blk)[:, :args.n].float().cpu()
         rel = (got - ref).abs().max().item() / max(ref.abs().max().item(), 1e-6)
-        print(f"  NG={ng} KW={kw} G={g}: {us:7.1f} us  {mb / us * 1e3:7.0f} GB/s  "
+        print(f"  NG={ng} KW={kw} G={g} W8={w8}: {us:7.1f} us  {mb / us * 1e3:7.0f} GB/s  "
               f"{np_ // nb:>5} blocks  rel {rel:.2e}")
 
 
