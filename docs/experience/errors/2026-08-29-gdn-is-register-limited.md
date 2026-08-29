@@ -143,3 +143,46 @@ local array large enough to spill is a memory access with a register's syntax.
 When an optimisation's mechanism is residency, verify it with the spill
 counters — not with the A/B against whatever it replaced, which only proves it
 beat that.
+
+## Removing the spill made it 2.5x SLOWER
+
+The state column moved to a `[K, V]` shared tile — thread `tv` owns column
+`tv`, so for a fixed row the block reads consecutive addresses, one per bank.
+I expected this to beat the earlier "shared state tile is 1.7x slower, LDS bank
+conflicts" rejection, on the theory that it had used the transposed `[V, K]`
+layout where every thread hits the same bank.
+
+| | local (shipped) | shared [K,V] |
+|---|---:|---:|
+| parity | passes | **passes** |
+| local-load sectors | 4,535,040 | **0** |
+| achieved occupancy | 6.25% | **6.25%** |
+| us/step | **3.05** | 7.49 |
+
+The spill is gone and the kernel is **2.5x slower**. Occupancy does not move
+either: 64 KB of shared per block simply replaces registers as the binding
+resource.
+
+So the old note was right and my layout theory was wrong. L1-cached local
+memory really does beat a shared tile here — "global hits L1 with better
+pipelining", as it said. Reverted.
+
+**This is the second time today I doubted a measured rejection on a plausible
+mechanism and lost.** The first was claiming chunkwise-WY had never been
+measured when two A/B tables sat in this directory. A mechanism that explains
+why someone else's result should have been different is a hypothesis; their
+number is data.
+
+## Where GDN actually stands
+
+- The cost is **not** arithmetic (SM 11.57%), **not** DRAM (0.28%), and not
+  removable by eliminating the spill.
+- Occupancy is 6.25% and every cheap way to raise it just moves which resource
+  binds: registers -> shared, or nothing at all.
+- The one path left is reducing state PER THREAD — splitting the column across
+  4 threads gives 32 floats each, which fits without spilling and without a
+  large shared tile, at the cost of a 4-thread reduction in `k·S` and `q·S`.
+  Barriers measured free here (two extra per token made it 8.5% *faster*), so
+  the usual objection to that does not apply.
+- Untried, and every hypothesis I formed today about this kernel has been
+  refuted by measurement, so it is a candidate rather than a plan.
