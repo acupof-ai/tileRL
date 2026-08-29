@@ -4,6 +4,28 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-29 — phase exit: reinforcement learning exists
+
+- The tree had SFT (`train_step`), corpus SFT (`pretrain`) and distillation
+  (`opd_loop`) and called it RL training. No reward, no advantage, no policy
+  gradient anywhere — `SamplingParams.logprobs` shipped with the comment "what
+  a policy gradient needs" and nothing consumed it.
+- GRPO lands as `train.grpo_loop` / `rl_step` / `group_advantages`, exposed as
+  `tilerl train --rl`. No critic (the group mean is the baseline), so rollout
+  and update share one model and one set of weights. It is not a second
+  training path: `_step` carries the tape, the frozen-base filter, the
+  finite-step rejection and the optimizer, and SFT and RL differ ONLY in the
+  logit-gradient function — the policy gradient is the causal-CE gradient
+  scaled per row by the advantage.
+- Gated algebraically, not just end to end: A=1 must equal an SFT step
+  parameter-for-parameter, A=0 must be an exact no-op. Reward on the tiny model
+  goes 0.17 -> 1.00 in seven steps through the real engine.
+  [wins/2026-08-29-grpo.md](docs/experience/wins/2026-08-29-grpo.md)
+- Training THROUGHPUT is unchanged and its root cause is recorded separately:
+  491K kernels a step, 62% of them micro-ops from `gdn_backward`'s
+  per-time-step Python loop.
+  [errors/2026-08-29-train-step-is-the-gdn-per-step-loop.md](docs/experience/errors/2026-08-29-train-step-is-the-gdn-per-step-loop.md)
+
 ## 2026-08-29 — default flip: M-row GEMV for 2 <= M <= 3 decode rows
 
 - `linear_*_mma8` pads M to 8 rows, so a decode of TWO requests cost the same
