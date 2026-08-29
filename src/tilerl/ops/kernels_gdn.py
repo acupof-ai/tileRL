@@ -9,7 +9,22 @@ from __future__ import annotations
 import tilelang
 import tilelang.language as T
 
-from .kernels_mma import _pass_configs
+from .kernels_mma import _pass_configs as _mma_pass_configs
+
+#: ptxas register-usage aggressiveness, 0-10. ncu measures this kernel at 255
+#: registers/thread — the hardware cap — which limits it to 2 blocks per SM and
+#: 6.25% occupancy while DRAM sits at 0.28% and the SMs at 11.57%. Nothing
+#: constrains ptxas, so it spends the maximum to avoid spilling; halving the
+#: per-thread state column did NOT move the limit, so the cap is the compiler's
+#: choice rather than one array's size. None = leave it to ptxas.
+_GDN_REG_LEVEL: int | None = None
+
+
+def _pass_configs() -> dict[str, object]:
+    cfg = dict(_mma_pass_configs())
+    if _GDN_REG_LEVEL is not None:
+        cfg["tl.ptxas_register_usage_level"] = _GDN_REG_LEVEL
+    return cfg
 
 __all__ = [
     "make_gdn_decode_fused",
