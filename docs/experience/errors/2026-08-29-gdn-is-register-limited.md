@@ -60,3 +60,37 @@ mechanism is "keep it in registers", read the occupancy afterwards.
 And: one `ncu` run cost less than any of the four variants written against
 guesses, and it is the only thing all day that explained the number instead of
 moving it.
+
+## Three probes, all negative — what the cheap paths cannot do
+
+Before writing a K split against the register hypothesis, three experiments
+tested it. All cost minutes; the K split would have cost an hour.
+
+| probe | result |
+|---|---|
+| halve `state_local` (K=128 -> 64 floats, wrong math, real registers) | Block Limit Registers **still 2**, occupancy **still 6.25%** |
+| `tl.ptxas_register_usage_level` = 0, 2, 5, 8 | occupancy **6.25%** at every level; us/step 3.00-3.07 |
+| the same half-state probe's speed | 3.05 -> 2.52 us/step, **-17%** |
+
+The first two kill the cheap fixes: the 255 registers are not one array's size,
+and they are not ptxas being permissive. Whatever holds them there is not
+reachable by shrinking a buffer or turning a knob.
+
+The third is the useful one, and it argues against the diagnosis being complete:
+if the kernel were purely occupancy-bound, removing half the arithmetic would
+buy nothing, and it bought 17%. So the cost is **split** between the 4-warp
+residency and the per-token dependency chain, and fixing either alone caps out
+well below ncu's 87.5% estimate.
+
+A K split — the state column across two threads — remains untested, but its
+premise is now weaker than it looked: halving that array did not move the
+register limit, so splitting it across threads may not either.
+
+## Rule, second half
+
+Three cheap probes against one hypothesis beat one expensive implementation of
+it. Two of these were negative in the useful way — they deleted a candidate —
+and the third quietly refuted the framing by showing arithmetic still matters.
+None of that would have surfaced from writing the K split and measuring the
+result, which would have said only "slower" and left the reason open, exactly
+as the three chunkwise rewrites did.
