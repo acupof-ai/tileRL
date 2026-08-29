@@ -436,7 +436,10 @@ def main() -> int:
                          " (default: all applicable)")
     ap.add_argument("--source", default=None, help="27B checkpoint dir (omit for tiny/CPU)")
     ap.add_argument("--gpu", type=int, default=None)
-    ap.add_argument("--batches", default="1,8")
+    # 2 and 4 are not decoration: mma8 pads M to 8, so B=2 cost the same tick as
+    # B=8 and was SLOWER in aggregate than B=1 — invisible to a 1,8 sweep
+    # (errors/2026-08-29-spec-cost-was-the-linear-not-the-draft.md).
+    ap.add_argument("--batches", default="1,2,4,8")
     ap.add_argument("--depths", default=",".join(map(str, _KV_DEPTHS)))
     ap.add_argument("--ticks", type=int, default=20)
     ap.add_argument("--json", default=None)

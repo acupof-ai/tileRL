@@ -273,15 +273,18 @@ def test_linear_fp4_gemv_parity(backend):
     """M=1 decode path: the sm90 cell resolves to the GEMV kernel (the floor
     kernel on CPU/metal); same e2m1 decode math as the MMA kernel."""
     torch.manual_seed(20)
+    # M > 1 exercises the M-row GEMV, which decodes W once and reuses it across
+    # rows: a row-indexing bug there is invisible at M=1.
     for N, K in [(24, 32), (16, 128), (18, 64)]:
         w_master = torch.randn(N, K)
         wq, scale = _quantize_fp4(w_master)
-        x = torch.randn(1, K)
-        _assert_close(
-            backend.linear_fp4(x, wq, scale),
-            reference.linear_fp4(x, wq, scale),
-            f"linear_fp4_gemv N={N} K={K}",
-        )
+        for M in (1, 2, 3, 4):
+            x = torch.randn(M, K)
+            _assert_close(
+                backend.linear_fp4(x, wq, scale),
+                reference.linear_fp4(x, wq, scale),
+                f"linear_fp4_gemv M={M} N={N} K={K}",
+            )
 
 
 def test_linear_fp4_fp8_parity(backend):
@@ -351,14 +354,16 @@ def test_linear_fp8_gemv_parity(backend):
     kset = _resolve(backend.precision, backend.arch)
     for N, K in [(128, 256), (256, 128), (64, 512)]:
         w8, wscale = _quantize_fp8(torch.randn(N, K) * 0.1)
-        x = torch.randn(1, K) * 0.5
-        if "linear_fp8_gemv" not in kset:
-            with pytest.raises(NotImplementedError, match="linear_fp8"):
-                backend.linear_fp8(x, w8, wscale)
-            continue
-        out = backend.linear_fp8(x, w8, wscale)
-        assert out.shape == (1, N)
-        _assert_close(out, reference.linear_fp8(x, w8, wscale), f"linear_fp8_gemv N={N} K={K}")
+        for M in (1, 2, 3, 4):  # M > 1 is the M-row GEMV (see the fp4 twin)
+            x = torch.randn(M, K) * 0.5
+            if "linear_fp8_gemv" not in kset:
+                with pytest.raises(NotImplementedError, match="linear_fp8"):
+                    backend.linear_fp8(x, w8, wscale)
+                continue
+            out = backend.linear_fp8(x, w8, wscale)
+            assert out.shape == (M, N)
+            _assert_close(out, reference.linear_fp8(x, w8, wscale),
+                          f"linear_fp8_gemv M={M} N={N} K={K}")
 
 
 # ---------------------------------------------------------------- silu mul

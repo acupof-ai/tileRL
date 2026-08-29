@@ -96,6 +96,14 @@ def _pad1d(t: torch.Tensor, n: int) -> torch.Tensor:
 #: tile N at 64 because the kernel overrides block_N to _FP4_BLOCK_N=64 — a
 #: 32-tile pad lets its grid read past the padded WQ.
 _MX = 8  # batched decode GEMV: activation rows kept in registers per lane
+#: Rows up to which the M-row GEMV beats mma8. mma8 pads M to 8, so it costs
+#: the same at M=2 as at M=8; the GEMV costs 6.6 + 13.8*M us (fp4) because two
+#: thirds of it is per-row FMA. Measured decode replay, 27B, H20 (ms):
+#:   M    1     2     3     4     8
+#:   gemv 11.2  17.5  27.1  30.1  55.8
+#:   mma8  -    27.2  29.7  27.6  27.1
+#: A/B per arch: TILERL_MGEMV=0 disables the path.
+_MGEMV = int(os.environ.get("TILERL_MGEMV", "3"))
 _MMA_RED = 32  # kernels_linear._RED_TILE: the K-loop reduction tile
 
 _CUDA_PLAN = {
@@ -143,11 +151,13 @@ class Backend:
             else 1
         )
 
-    def _kernel(self, name: str):
-        k = self._kernels.get(name)
+    def _kernel(self, name: str, *args):
+        """``args`` are FACTORY arguments (a compile-time kernel variant, e.g.
+        the GEMV's row count), not call arguments — they key the cache."""
+        k = self._kernels.get((name, args))
         if k is None:
-            k = _resolve(self.precision, self.arch)[name](self.target)
-            self._kernels[name] = k
+            k = _resolve(self.precision, self.arch)[name](self.target, *args)
+            self._kernels[(name, args)] = k
         return k
 
     # ------------------------------------------------------------ helpers
@@ -376,6 +386,23 @@ class Backend:
         lead, x2 = self._rows(x)
         M, K, N = x2.shape[0], x2.shape[1], wq.shape[0]
         blk = K // scale.shape[1]  # scale block from the loaded weight (16 or 32)
+        # M-row GEMV: mma8 costs the same at M=2 and M=8 (it pads M to 8), so a
+        # 2-row decode measured the same 27 ms tick as an 8-row one. The GEMV
+        # streams W once for M rows, so it wins until the M-fold FMA work
+        # catches up. Uses the M=1 plan — the decode plan's n_partition is 128,
+        # which as a GEMV thread block is 4096 threads.
+        if 2 <= M <= _MGEMV and (gp := self._plan("linear_fp4", 1, N, K)) is not None:
+            gk, _, gNp, gKp, _, gbN = gp
+            gwq, gsc = _pad2d(wq, gNp, gKp // 2), _pad2d(scale, gNp, gKp // blk)
+            osc = self._ones(gNp) if oscale is None else self._const_f32(oscale, gNp)
+            res = self._residual(residual, N, gNp, rows=M)
+            y2 = self._kernel(gk, M)(
+                _pad2d(x2, M, gKp), gwq, gsc, osc,
+                res if res is not None else self._residual(None, N, gNp, rows=M),
+                32, gbN, blk,
+            )[:M, :N]
+            y = y2.reshape(*lead, N)
+            return y if res is not None else y + residual
         plan = self._plan("linear_fp4", M, N, K)
         if plan is not None:
             kernel, Mp, Np, Kp, bM, bN = plan
@@ -446,6 +473,18 @@ class Backend:
                 f"linear_fp8 has no kernel in the ({self.precision!r}, {self.arch!r}) cell — "
                 "run Backend.materialize on the params at load, it converts fp8 to bf16"
             )
+        if 2 <= M <= _MGEMV and (gp := self._plan("linear_fp8", 1, N, K)) is not None:
+            gk, _, gNp, gKp, _, gbN = gp  # see linear_fp4 for why the M=1 plan
+            osc = self._ones(gNp) if oscale is None else self._const_f32(oscale, gNp)
+            res = self._residual(residual, N, gNp, rows=M)
+            y2 = self._kernel(gk, M)(
+                _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(M, K)), M, gKp),
+                _pad2d(self._dev(w8, w8.dtype), gNp, gKp),
+                _pad2d(self._const_f32(wscale), -(-gNp // 128), gKp // 128), osc,
+                res if res is not None else self._residual(None, N, gNp, rows=M), 32, gbN,
+            )[:M, :N]
+            y = y2.reshape(*lead, N)
+            return y if res is not None else y + residual
         kernel, Mp, Np, Kp, bM, bN = plan
         # Zero-padding the per-128-block wscale kills the K-tail.
         x2 = _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(M, K)), Mp, Kp)
@@ -908,18 +947,20 @@ class Backend:
             t = self._ones_cache[("zeros2", m, n)] = torch.zeros(m, n, dtype=torch.float32, device=self.device)
         return t
 
-    def _residual(self, residual, n: int, np_: int):
-        """The GEMV epilogue's Res row: the caller's residual stream (f32, one
-        row) or a cached zero row. None if the padded width differs from the
-        real one — the caller adds in torch then."""
+    def _residual(self, residual, n: int, np_: int, rows: int = 1):
+        """The GEMV epilogue's Res rows: the caller's residual stream (f32) or a
+        cached zero block. None if the padded width differs from the real one —
+        the caller adds in torch then."""
         if residual is None:
-            t = self._ones_cache.get(("zeros", np_))
+            t = self._ones_cache.get(("zeros", rows, np_))
             if t is None:
-                t = self._ones_cache[("zeros", np_)] = torch.zeros(1, np_, dtype=torch.float32, device=self.device)
+                t = self._ones_cache[("zeros", rows, np_)] = torch.zeros(
+                    rows, np_, dtype=torch.float32, device=self.device
+                )
             return t
-        if residual.numel() != n or np_ != n:
+        if residual.numel() != n * rows or np_ != n:
             return None
-        return self._f32(residual).reshape(1, n).contiguous()
+        return self._f32(residual).reshape(rows, n).contiguous()
 
     def embedding(self, idx, table):
         table = self._const_f32(table)

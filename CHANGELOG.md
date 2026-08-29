@@ -4,6 +4,24 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-29 — default flip: M-row GEMV for 2 <= M <= 3 decode rows
+
+- `linear_*_mma8` pads M to 8 rows, so a decode of TWO requests cost the same
+  tick as eight and was **slower in aggregate than serving one** (71.9 vs 86.6
+  tok/s). The GEMV now takes a compile-time row count and reuses each decoded
+  weight tile across M rows. Paired A/B in one process, aggregate tok/s:
+  **B=2 71.9 -> 111.4 (1.55x)**, B=3 108.2 -> 119.7 (1.11x), B=1/4/8 unchanged.
+  The crossover is measured, not assumed: M=4 loses (30.1 vs 27.6 ms replay).
+  [wins/2026-08-29-m-row-gemv.md](docs/experience/wins/2026-08-29-m-row-gemv.md)
+- Root cause of the speculative tick's unexplained cost, which was attributed
+  by subtraction and blamed on the draft head: a draft step is **2.06 ms, not
+  ~11**, and the verify replay's +19 ms over plain decode is entirely these two
+  linear kernels (GDN contributes +0.08 ms). Five A/B experiments had gone
+  looking for a draft-head defect that was never there.
+  [errors/2026-08-29-spec-cost-was-the-linear-not-the-draft.md](docs/experience/errors/2026-08-29-spec-cost-was-the-linear-not-the-draft.md)
+- Bench harness sweeps `--batches 1,2,4,8`: the loss region sat between the two
+  endpoints the old `1,8` sweep measured.
+
 ## 2026-08-29 — verdict: speculative decoding REJECTED on throughput, kept on correctness
 
 - Speculation lives in the engine: a decode row drafts off the trunk's last
