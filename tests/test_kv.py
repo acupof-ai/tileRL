@@ -348,3 +348,65 @@ def test_shared_prefix_fork_cow():
     pool.free_block(a0)
     assert pool.refcount[a0] == 1 and pool.refcount[a1] == 1  # store only
     assert pool.free_blocks == 6  # 8 total - 2 store-held
+
+
+# ------------------------------------------------------------- SSD tier (offload)
+
+
+def test_tier_spill_reload_roundtrip(tmp_path):
+    """A prefix evicted to the SSD tier reloads bit-identical KV into fresh
+    blocks — the offload path a repeated long prefix rides instead of prefill.
+    """
+    from tilerl.kv_cache import KvTier
+
+    pool = PagedKvPool(8, 1, 4)
+    tier = KvTier(str(tmp_path / "kvt"))
+    # tier_min_tokens=0 so any prefix spills; tier_capacity high enough to keep it.
+    store = PrefixStore(pool, capacity=1, tier=tier, tier_min_tokens=0, tier_capacity=8)
+
+    # Prefix A: two blocks of known KV.
+    a = [pool.alloc_block() for _ in range(2)]
+    for i, b in enumerate(a):
+        pool.k_pool[:, b] = torch.randn_like(pool.k_pool[:, b])
+        pool.v_pool[:, b] = torch.randn_like(pool.v_pool[:, b])
+    ka = [pool.k_pool[:, b].clone() for b in a]
+    va = [pool.v_pool[:, b].clone() for b in a]
+    toks = list(range(32))
+    store.insert(toks, a)
+    for b in a:
+        pool.free_block(b)  # request done; only the store now holds A's blocks
+
+    # Insert a second prefix — capacity=1 forces A's eviction → spill to tier.
+    bblk = [pool.alloc_block()]
+    store.insert(list(range(100, 116)), bblk)
+    assert tier.has(store._hash_all(toks)), "A did not spill to the tier"
+    # A's blocks were freed back to the pool (store released its last owner).
+    for b in a:
+        assert pool.refcount[b] == 0
+
+    # A cold lookup returns reload_key, empty blocks.
+    hit = store.lookup(toks)
+    assert hit is not None and hit.reload_key is not None and hit.blocks == ()
+
+    # Reload into fresh blocks and check bit-identity.
+    fresh = [pool.alloc_block() for _ in range(2)]
+    tier.load_kv(hit.reload_key, fresh, pool)
+    for i, b in enumerate(fresh):
+        assert torch.equal(pool.k_pool[:, b], ka[i])
+        assert torch.equal(pool.v_pool[:, b], va[i])
+
+
+def test_tier_min_tokens_gates_spill(tmp_path):
+    """Below tier_min_tokens an evicted prefix is dropped, not spilled (SSD
+    churn floor)."""
+    from tilerl.kv_cache import KvTier
+
+    pool = PagedKvPool(8, 1, 4)
+    tier = KvTier(str(tmp_path / "kvt"))
+    store = PrefixStore(pool, capacity=1, tier=tier, tier_min_tokens=999, tier_capacity=8)
+    a = [pool.alloc_block()]
+    store.insert(list(range(16)), a)
+    store.insert(list(range(100, 116)), [pool.alloc_block()])
+    # Sub-floor: dropped, not spilled.
+    assert not tier.has(store._hash_all(list(range(16))))
+    assert store.lookup(list(range(16))) is None

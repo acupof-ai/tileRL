@@ -420,7 +420,13 @@ class Engine:
         # dies with its store entry: the store drops ours on eviction, and a
         # key present here is exactly a key the store still holds.
         self._prefix_state: dict[tuple[int, ...], tuple[torch.Tensor, "torch.Tensor | None"]] = {}
-        prefix_store.on_evict = lambda tokens: self._prefix_state.pop(tokens, None)
+        prefix_store.on_evict = lambda tokens, key: self._prefix_state.pop(tokens, None)
+        # on_demote: an entry spilled to the SSD tier — move its GDN snapshot
+        # to the tier too (keyed by the store hash), keeping the invariant that
+        # a snapshot present resident-side is exactly a resident store entry.
+        self._tier = getattr(prefix_store, "_tier", None)
+        if self._tier is not None:
+            prefix_store.on_demote = self._demote_snapshot
 
         self._blocks_used = 0  # engine allocations outstanding (retains excluded)
         self._slots_used = 0
@@ -468,22 +474,30 @@ class Engine:
                 self._finished_count += 1
                 return rid
 
-            matched, hit_blocks = self._match_prefix(tokens)
+            matched, hit_blocks, reload_key = self._match_prefix(tokens)
             # Read the snapshot now: evict_until_free below can drop the very
             # store entry we matched, and on_evict takes the snapshot with it.
-            snap = self._prefix_state[self._snapshot_key(tokens[:matched])] if matched else None
+            # A cold hit's snapshot comes from the tier, keyed by the hash.
+            if not matched:
+                snap = None
+            elif reload_key is not None:
+                snap = self._tier.load_state(reload_key)
+            else:
+                snap = self._prefix_state[self._snapshot_key(tokens[:matched])]
             if matched:
                 self._prefix_hits += 1
             else:
                 self._prefix_misses += 1
 
             total_blocks = (len(tokens) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
-            blocks = list(hit_blocks)
+            # Resident hit adopts the store's blocks (retain); a cold hit owns
+            # freshly-allocated blocks that the tier fills, so nothing to adopt.
+            blocks = [] if reload_key is not None else list(hit_blocks)
             slot = None
             try:
                 slot = self._states.alloc_slot()
                 for b in blocks:
-                    self._kv.retain(b)  # adopt the store's blocks
+                    self._kv.retain(b)  # adopt the store's blocks (resident hit only)
                 needed = total_blocks - len(blocks)
                 evict = getattr(self._prefix, "evict_until_free", None)
                 if evict is not None:
@@ -492,13 +506,19 @@ class Engine:
                     raise RuntimeError("insufficient KV blocks for request")
                 while len(blocks) < total_blocks:
                     blocks.append(self._kv.alloc_block())
+                if reload_key is not None:
+                    # Fill the matched-prefix blocks from the SSD tier — this is
+                    # the prefill the cold hit skips.
+                    self._tier.load_kv(reload_key, blocks[: matched // BLOCK_TOKENS], self._kv)
             except Exception:
                 for b in blocks:
                     self._kv.free_block(b)
                 if slot is not None:
                     self._states.free_slot(slot)
                 raise
-            own_blocks = total_blocks - matched // BLOCK_TOKENS
+            # A cold hit owns every block (the tier's copy is separate); a
+            # resident hit owns only the fresh tail.
+            own_blocks = total_blocks if reload_key is not None else total_blocks - matched // BLOCK_TOKENS
             self._blocks_used += own_blocks
             self._slots_used += 1
             if matched:
@@ -662,28 +682,40 @@ class Engine:
 
     # -------------------------------------------------------------- internals
 
-    def _match_prefix(self, tokens: list[int]) -> tuple[int, list[int]]:
-        """Longest block-aligned prefix hit, or (0, []).
+    def _match_prefix(self, tokens: list[int]) -> tuple[int, list[int], int | None]:
+        """Longest block-aligned prefix hit, or (0, [], None).
 
         Full-length hits are treated as misses day-1 (no read-only last-token
         forward yet). A hit whose boundary snapshot is missing also degrades
         to a miss — the engine is the sole publisher, so this only guards
-        against bookkeeping drift.
+        against bookkeeping drift. A cold hit (spilled to the SSD tier) returns
+        empty blocks and a ``reload_key``; its snapshot lives on the tier.
         """
         hit = self._prefix.lookup(tokens)
         if hit is None:
-            return 0, []
+            return 0, [], None
         matched = (hit.length // BLOCK_TOKENS) * BLOCK_TOKENS
         if matched == 0 or matched >= len(tokens):
-            return 0, []
+            return 0, [], None
+        if hit.reload_key is not None:
+            if self._tier is None or not self._tier.has(hit.reload_key):
+                return 0, [], None
+            return matched, [], hit.reload_key
         if self._snapshot_key(tokens[:matched]) not in self._prefix_state:
-            return 0, []
-        return matched, list(hit.blocks[: matched // BLOCK_TOKENS])
+            return 0, [], None
+        return matched, list(hit.blocks[: matched // BLOCK_TOKENS]), None
 
     @staticmethod
     def _snapshot_key(tokens: list[int]) -> tuple[int, ...]:
         """Collision-safe key for a prefix's boundary-state snapshot."""
         return tuple(tokens)
+
+    def _demote_snapshot(self, tokens: tuple[int, ...], key: int) -> None:
+        """Move a demoted prefix's GDN snapshot from resident memory to the
+        SSD tier (keyed by the store hash), so a cold hit can reload it."""
+        snap = self._prefix_state.pop(self._snapshot_key(list(tokens)), None)
+        if snap is not None:
+            self._tier.spill_state(key, snap[0], snap[1])
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0) -> BatchKv:
         # Fixed width = pool size: the kernels bake the table width into the

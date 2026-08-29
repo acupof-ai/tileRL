@@ -18,6 +18,7 @@ pressure admission: the engine fails loudly on pool exhaustion
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Sequence
@@ -31,6 +32,7 @@ __all__ = [
     "PrefixStore",
     "NoPrefixStore",
     "PrefixHit",
+    "KvTier",
 ]
 
 #: Tokens per physical KV block (paged-attention page size).
@@ -361,11 +363,74 @@ class LinearStatePool:
 @dataclass(frozen=True)
 class PrefixHit:
     """Result of a prefix lookup: matched token count and the blocks covering
-    ``[0, length)`` (already retained by the store — the caller adopts them
-    with :meth:`PagedKvPool.retain`)."""
+    ``[0, length)``. A resident hit's blocks are already retained (the caller
+    adopts them with :meth:`PagedKvPool.retain`); a cold hit has empty
+    ``blocks`` and a ``reload_key`` — the caller allocs fresh blocks and asks
+    the tier to fill them (see :class:`KvTier`)."""
 
     length: int
     blocks: tuple[int, ...]
+    reload_key: int | None = None
+
+
+class KvTier:
+    """SSD byte-store below the HBM pool: spilled prefix KV + GDN snapshots.
+
+    On a 32 GB V100 the host DRAM is not a residency tier (nearly all in
+    buff/cache), and L2 (6 MB) is hardware-managed, so the only real capacity
+    tier is the SSD. A prefix evicted from the pool spills here instead of
+    being dropped, and a later lookup that hits it reloads into fresh blocks —
+    skipping the whole prefill recompute. Dumb bytes: torch.save of a `.cpu()`
+    tensor (the transient pageable copy IS the only host-memory touch). One
+    process owns the dir; a dead process's files are orphans, so wipe on init.
+
+    # ponytail: sync reload (torch.load), pinned-ring async prefetch when hit
+    #   latency bites; raw bf16 spill, fp8 tier-quant is 2x capacity if SSD fills
+    """
+
+    def __init__(self, path: str) -> None:
+        import shutil
+
+        self._dir = os.fspath(path)
+        shutil.rmtree(self._dir, ignore_errors=True)
+        os.makedirs(self._dir, exist_ok=True)
+
+    def _kv(self, key: int) -> str:
+        return os.path.join(self._dir, f"{key & _MASK64:016x}.kv")
+
+    def _st(self, key: int) -> str:
+        return os.path.join(self._dir, f"{key & _MASK64:016x}.st")
+
+    def spill_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> None:
+        # Block is a strided slice pool.k_pool[:, b] of shape [planes,heads,BT,hd];
+        # stack the span and move to CPU once (same copy template as cow_for_append).
+        k = torch.stack([pool.k_pool[:, b] for b in blocks]).contiguous().cpu()
+        v = torch.stack([pool.v_pool[:, b] for b in blocks]).contiguous().cpu()
+        torch.save({"k": k, "v": v}, self._kv(key))
+
+    def load_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> None:
+        d = torch.load(self._kv(key), map_location="cpu")
+        for i, b in enumerate(blocks):
+            pool.k_pool[:, b].copy_(d["k"][i].to(pool.device))
+            pool.v_pool[:, b].copy_(d["v"][i].to(pool.device))
+
+    def spill_state(self, key: int, states, windows) -> None:
+        blob = {"states": states.cpu(), "windows": None if windows is None else windows.cpu()}
+        torch.save(blob, self._st(key))
+
+    def load_state(self, key: int):
+        d = torch.load(self._st(key), map_location="cpu")
+        return d["states"], d["windows"]
+
+    def has(self, key: int) -> bool:
+        return os.path.exists(self._kv(key))
+
+    def drop(self, key: int) -> None:
+        for p in (self._kv(key), self._st(key)):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
 
 
 class _Entry:
@@ -414,14 +479,26 @@ class PrefixStore:
         self,
         pool: PagedKvPool,
         capacity: int = 4096,
+        tier: "KvTier | None" = None,
+        tier_min_tokens: int = 2048,
+        tier_capacity: int = 256,
     ) -> None:
         self._pool = pool
         self.capacity = capacity
-        self.on_evict: Callable[[tuple[int, ...]], None] | None = None
+        # on_evict: an entry left the store entirely (side tables must drop it).
+        # on_demote: an entry spilled to the tier (its GDN snapshot spills too).
+        self.on_evict: Callable[[tuple[int, ...], int], None] | None = None
+        self.on_demote: Callable[[tuple[int, ...], int], None] | None = None
         self._roll = _rolling_hash
         self._entries: dict[int, list[_Entry]] = {}
         self._by_id: dict[int, _Entry] = {}
         self._fifo: deque[int] = deque()
+        # SSD tier + its cold index (blocks freed, bytes on disk keyed by e.h).
+        self._tier = tier
+        self.tier_min_tokens = tier_min_tokens
+        self.tier_capacity = tier_capacity
+        self._cold: dict[int, list[_Entry]] = {}
+        self._cold_fifo: deque[int] = deque()
         self._next_id = 0
         self.hits = 0
         self.misses = 0
@@ -465,8 +542,11 @@ class PrefixStore:
         """Longest stored prefix of ``tokens``, or ``None``.
 
         Every hash hit is verified against the stored token contents, so a
-        collision on different tokens is a miss.
-        """
+        collision on different tokens is a miss. A resident hit returns the
+        pool blocks; a cold hit (spilled to the tier) returns empty blocks and
+        ``reload_key`` — the caller allocs fresh blocks and reloads. Both hot
+        and cold hits touch their FIFO to MRU (LRU, so a startup system prompt
+        is not the first victim)."""
         tokens = tuple(int(t) for t in tokens)
         h = 0
         prefix_hashes: list[int] = []
@@ -474,15 +554,32 @@ class PrefixStore:
             h = self._roll(h, t)
             prefix_hashes.append(h)
         for i in range(len(tokens), 0, -1):
-            for e in self._entries.get(prefix_hashes[i - 1], ()):
+            key = prefix_hashes[i - 1]
+            for e in self._entries.get(key, ()):
                 if e.tokens == tokens[:i]:
                     self.hits += 1
+                    self._touch(self._fifo, e.eid)
                     return PrefixHit(i, e.blocks)
+            for e in self._cold.get(key, ()):
+                if e.tokens == tokens[:i]:
+                    self.hits += 1
+                    self._touch(self._cold_fifo, e.eid)
+                    return PrefixHit(i, (), reload_key=e.h)
         self.misses += 1
         return None
 
+    @staticmethod
+    def _touch(fifo: deque, eid: int) -> None:
+        try:
+            fifo.remove(eid)
+        except ValueError:
+            return
+        fifo.append(eid)
+
     def _evict_if_needed(self) -> None:
-        while len(self._by_id) > self.capacity:
+        # capacity bounds RESIDENT entries; cold (spilled) entries are bounded
+        # separately by tier_capacity. _fifo holds exactly the resident ids.
+        while len(self._fifo) > self.capacity:
             self._evict_one()
 
     def evict_until_free(self, blocks: int) -> None:
@@ -492,16 +589,43 @@ class PrefixStore:
 
     def _evict_one(self) -> None:
         eid = self._fifo.popleft()
-        entry = self._by_id.pop(eid)
+        entry = self._by_id[eid]
         chain = self._entries[entry.h]
         chain.remove(entry)
         if not chain:
             del self._entries[entry.h]
-        for b in entry.blocks:
-            self._pool.free_block(b)
-        if self.on_evict is not None:
-            self.on_evict(entry.tokens)
+        # Spill to the tier when it's wired and the prefix is big enough to be
+        # worth the SSD write; else drop it entirely (today's path).
+        if self._tier is not None and len(entry.tokens) >= self.tier_min_tokens:
+            self._tier.spill_kv(entry.h, entry.blocks, self._pool)
+            for b in entry.blocks:
+                self._pool.free_block(b)
+            if self.on_demote is not None:
+                self.on_demote(entry.tokens, entry.h)  # engine spills the GDN snapshot
+            entry.blocks = ()
+            self._cold.setdefault(entry.h, []).append(entry)
+            self._cold_fifo.append(eid)
+            self._evict_cold_if_needed()
+        else:
+            self._by_id.pop(eid)
+            for b in entry.blocks:
+                self._pool.free_block(b)
+            if self.on_evict is not None:
+                self.on_evict(entry.tokens, entry.h)
         self.evictions += 1
+
+    def _evict_cold_if_needed(self) -> None:
+        while len(self._cold_fifo) > self.tier_capacity:
+            eid = self._cold_fifo.popleft()
+            entry = self._by_id.pop(eid)
+            chain = self._cold[entry.h]
+            chain.remove(entry)
+            if not chain:
+                del self._cold[entry.h]
+            if self._tier is not None:
+                self._tier.drop(entry.h)
+            if self.on_evict is not None:
+                self.on_evict(entry.tokens, entry.h)
 
     def stats(self) -> dict[str, int]:
         """Cache counters: entries, capacity, hits, misses, evictions."""
