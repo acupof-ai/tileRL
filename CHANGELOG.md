@@ -4,6 +4,21 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-29 — reject: the fp8 dX kernel (correct, but an 80-block grid)
+
+- Written to remove the last dequantized-weight materialization; it does, the
+  op peaks **2.054 -> 0.060 GiB**. But it tiles the OUTPUT [M, K], so on
+  lm_head's K=5120 the grid is **80 blocks** on a 132-SM card while the
+  contraction runs 7760 serial iterations over N=248320. Measured 0.618x /
+  0.549x at 1x64 / 1x128, and only noise-level wins once the grid fills.
+- The kernel is correct: norm-relative error **0.0034** at every size, of which
+  0.0021-0.0024 is the bf16 casts it inherits. Its parity test failed because
+  an elementwise relative gate is wrong for a cancelling output like dX — as
+  was my first error metric, which reported 11001 for a 0.3%-accurate result.
+- Reverted. Reopen path: a split-N variant, the trick
+  `linear_fp4_fp8_decode` already uses.
+  [errors/2026-08-29-fp8-bwd-kernel-grid-too-small.md](docs/experience/errors/2026-08-29-fp8-bwd-kernel-grid-too-small.md)
+
 ## 2026-08-29 — phase exit: the frozen-weight backward stops materializing lm_head
 
 - Attributing the backward peak per op named a single culprit: one
