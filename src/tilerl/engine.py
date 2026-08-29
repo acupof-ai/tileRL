@@ -525,13 +525,18 @@ class Engine:
     def _build_plan(self) -> tuple[list[_Req], _Req | None, int]:
         """Plan one tick, mirroring agent-infer's ``build_forward_plan``.
 
-        Admit one waiting request into running under ``max_batch``, then take
+        Admit as many waiting requests as ``max_batch`` allows, then take
         all running decodes as decode rows and at most one prefill row — the
         next chunk of a prefilling request, sized by the per-tick token
         budget (``max_num_batched_tokens`` minus the decode rows). A prompt
         longer than the budget stays in PREFILL and is chunked across ticks.
+
+        Admission is a whole pass, not one request per tick: a burst of B
+        submissions used to need B ticks just to reach the running queue, so
+        every tick of the ramp ran a batch smaller than the one that was
+        asked for. vLLM/sglang schedule the whole waiting queue each pass.
         """
-        if self._waiting and len(self._running) < self.limits.max_batch:
+        while self._waiting and len(self._running) < self.limits.max_batch:
             self._running.append(self._waiting.popleft())
         decodes = [r for r in self._running if r.phase == _PHASE_DECODE]
         prefill = next((r for r in self._running if r.phase == _PHASE_PREFILL), None)
