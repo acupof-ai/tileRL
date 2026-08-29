@@ -514,6 +514,46 @@ def test_production_model_gradcheck():
         )
 
 
+def test_logprobs_are_returned_and_deterministic():
+    """Every returned token carries log p under the distribution it was drawn
+    from — what a policy gradient needs, and what a second forward would get
+    wrong once the sampler or the weights move.
+
+    Checked without recomputing the softmax: a probability's log is never
+    positive, there is exactly one per emitted token, and the same seed must
+    reproduce both the tokens and their scores.
+    """
+    from tilerl.cli import _build_model
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.ops.backend import get_backend
+
+    backend = get_backend()
+    cfg, model = _build_model("tiny", seed=0)
+    engine = build_engine(cfg, model, backend, num_blocks=64, num_slots=8)
+    sp = SamplingParams(temperature=0.7, max_new_tokens=4, seed=3, logprobs=True)
+
+    def run():
+        rid = engine.submit(list(range(8)), sp)
+        for _ in range(200):
+            engine.step()
+            done = engine.poll()  # poll drains, so read the tokens from it
+            if rid in done:
+                return done[rid], engine.logprobs(rid)
+        raise AssertionError("request never finished")
+
+    out, lps = run()
+    assert lps is not None and len(lps) == len(out) == 4, (out, lps)
+    assert all(x <= 1e-5 for x in lps), lps
+    assert (out, lps) == run(), "same seed, different scores"
+    # a request that did not ask gets nothing, not zeros
+    rid = engine.submit(list(range(8)), SamplingParams(max_new_tokens=2, seed=3))
+    for _ in range(200):
+        engine.step()
+        if rid in engine.poll():
+            break
+    assert engine.logprobs(rid) is None
+
+
 def test_opd_lora_self_teacher():
     """OPD with LoRA adapters: the engine rolls out, only the adapters move.
 

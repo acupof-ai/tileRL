@@ -113,6 +113,10 @@ class SamplingParams:
     #: engine stays tokenizer-free.
     thinking_budget: int | None = None
     end_think_ids: tuple[int, ...] = ()
+    #: also return log p of each sampled token under the temperature-scaled
+    #: distribution it was drawn from — what a policy gradient needs, and what
+    #: an eval needs to score a completion without a second forward.
+    logprobs: bool = False
 
 
 def _restrict(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
@@ -143,6 +147,7 @@ class _Req:
     prefill_from: int  # prefix-reuse offset for the prefill forward
     own_blocks: int  # blocks the engine allocated (vs adopted from a hit)
     output: list[int] = field(default_factory=list)
+    logprobs: list[float] = field(default_factory=list)
     thought_closed: bool = False  # the reasoning block ended (model's or forced)
     #: trunk hidden [1,1,H] at the position that produced ``output[-1]`` — the
     #: draft head's fc input; None until this row has run a forward.
@@ -382,6 +387,8 @@ class Engine:
         self._tokens_generated = 0
         self._spec_drafted = 0
         self._spec_accepted = 0
+        self._finished_logprobs: dict[int, list[float]] = {}
+        self._last_logprobs: list[float] | None = None
 
     # ------------------------------------------------------------------ API
 
@@ -477,6 +484,11 @@ class Engine:
             out = dict(self._finished)
             self._finished.clear()
             return out
+
+    def logprobs(self, request_id: int) -> list[float] | None:
+        """log p of each returned token, or None unless the request asked."""
+        with self._lock:
+            return self._finished_logprobs.get(request_id)
 
     def take(self, request_id: int) -> list[int] | None:
         """Pop one finished request's output, or None if not finished yet.
@@ -849,6 +861,7 @@ class Engine:
             for j in range(len(chains[i]))
         ]
         toks, at = self._sample_batch(flat), 0
+        lps = self._last_logprobs
         for i, r in enumerate(rows):
             got = toks[at : at + len(chains[i])]
             at += len(chains[i])
@@ -859,7 +872,8 @@ class Engine:
             self._spec_drafted += len(chains[i]) - 1
             self._states.select_step(r.state_slot, n_ok)
             r.hidden = hidden[i : i + 1, n_ok : n_ok + 1]
-            self._commit(r, got[: n_ok + 1])
+            self._commit(r, got[: n_ok + 1],
+                         None if lps is None else lps[at - len(chains[i]) : at][: n_ok + 1])
 
     def _sample_batch(self, rows: list[tuple]) -> list[int]:
         """Batched sampling for a decode tick: one sort/softmax over all rows
@@ -875,14 +889,28 @@ class Engine:
         temps = torch.tensor([r.params.temperature for r, _, _ in rows], device=dev)
         top_ps = torch.tensor([r.params.top_p for r, _, _ in rows], device=dev)
         seeds = torch.tensor([_step_seed(r.params.seed, g) for r, _, g in rows], device=dev)
-        return [int(t) for t in self._backend.sample_batch(logits, temps, top_ps, seeds)]
+        toks = [int(t) for t in self._backend.sample_batch(logits, temps, top_ps, seeds)]
+        if any(r.params.logprobs for r, _, _ in rows):
+            # From the SAME logits the draw used, scaled by the same
+            # temperature: a second forward would be a different distribution
+            # once the tape or the sampler moves. Greedy rows use temperature 0,
+            # where the scaled softmax is a point mass, so score them raw.
+            t = temps.clamp_min(1e-6).reshape(-1, 1)
+            lp = torch.log_softmax(logits.float() / t, dim=-1)
+            idx = torch.tensor(toks, device=dev).reshape(-1, 1)
+            self._last_logprobs = lp.gather(1, idx).reshape(-1).tolist()
+        else:
+            self._last_logprobs = None
+        return toks
 
     def _sample_commit(self, rows: list[tuple]) -> None:
         """Sample one token per row and commit it (every non-verify path)."""
-        for (r, _, _), tok in zip(rows, self._sample_batch(rows)):
-            self._commit(r, [tok])
+        toks = self._sample_batch(rows)
+        lps = self._last_logprobs
+        for i, ((r, _, _), tok) in enumerate(zip(rows, toks)):
+            self._commit(r, [tok], None if lps is None else [lps[i]])
 
-    def _commit(self, req: _Req, toks: list[int]) -> None:
+    def _commit(self, req: _Req, toks: list[int], lps: list[float] | None = None) -> None:
         """Append sampled tokens in order, stopping at the first one the
         request did not take verbatim (finished, or a forced end-think
         rewrite).
@@ -906,6 +934,9 @@ class Engine:
                 self._finish(req)
                 return
             req.output.append(tok)
+            if lps is not None and i < len(lps):
+                # a forced end-think token was not drawn, so it has no logprob
+                req.logprobs.append(float("nan") if tok != raw else lps[i])
             if n and not req.thought_closed and tuple(req.output[-n:]) == p.end_think_ids:
                 req.thought_closed = True
             req.tokens.append(tok)
@@ -952,6 +983,8 @@ class Engine:
         self._slots_used -= 1
         if error is None:
             self._finished[req.req_id] = req.output
+            if req.params.logprobs:
+                self._finished_logprobs[req.req_id] = req.logprobs
         else:
             self._failed[req.req_id] = error
         self._finished_count += 1

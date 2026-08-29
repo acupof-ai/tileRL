@@ -85,6 +85,15 @@ class DataParallelEngine:
                 out[i + self._n * rid] = toks
         return out
 
+    def logprobs(self, request_id: int) -> list[float] | None:
+        """Demux to the replica that served this id."""
+        i = request_id % self._n
+        return self._engines[i].logprobs(request_id // self._n)
+
+    def take(self, request_id: int) -> list[int] | None:
+        i = request_id % self._n
+        return self._engines[i].take(request_id // self._n)
+
     def stats(self) -> dict[str, Any]:
         """Summed counters, plus the per-replica running counts."""
         per = [e.stats() for e in self._engines]
