@@ -1,6 +1,8 @@
-# mma8's bandwidth deficit is registers, not the load pattern — 2026-08-29
+# mma8 moves bytes at 40% of the GEMV's rate; three levers closed, cause NOT established — 2026-08-29
 
-> Status: root cause measured. Shared-memory staging built, refuted, reverted.
+> Status: the levers are closed. The cause named in this entry's original title
+> ("register-bound") was inferred from a correlation and a later NG sweep
+> **refutes it** — see "The diagnosis does not survive" at the end. Retitled.
 
 ## Context
 
@@ -104,13 +106,42 @@ pushing past it loses. Three independent levers are now closed:
 2. **Shared-memory weight staging** — 69.2 vs 69.6, nothing.
 3. **The register cap** — saturated, and worse when forced past.
 
-What is left is a different kernel, not a different setting: a Marlin-style
-pipeline (cp.async into shared, `ldmatrix` fragments, double-buffered) so the
-live set is not `acc + w + s + xa` in registers at once. That is a new kernel,
-and it is the ONE lever that would move both batched decode and speculation —
+A Marlin-style pipeline (cp.async into shared, `ldmatrix` fragments,
+double-buffered) is the obvious next thing to try, but note that its rationale
+— shrinking the register live set — is exactly the premise the NG sweep below
+refutes, so it should be attempted only after the real cause is found. It would
+be the ONE lever that moves both batched decode and speculation —
 speculation's break-even needs the per-width cost under 6.0 ms against 8.9
 today, and a decode GEMM flat in M is exactly what would deliver it
 ([wins/2026-08-29-spec-decode-net-win.md](../wins/2026-08-29-spec-decode-net-win.md)).
+
+## The diagnosis does not survive
+
+I named "register pressure -> occupancy -> bandwidth" from the correlation in
+the table above (128 vs 64 registers, 21.8% vs 45.2% occupancy, 18.5% vs 44.7%
+of DRAM peak). Sweeping NG with ncu breaks it:
+
+| NG | grid | regs/thread | occupancy | DRAM | us |
+|---:|---:|---:|---:|---:|---:|
+| **4** (shipped) | 544 | 128 | 22.0% | 18.4% | **69.5** |
+| 2 | 1088 | **200** | 12.2% | 13.6% | 96.1 |
+| 1 | 2176 | 118 | 23.9% | 15.3% | 84.6 |
+
+Two things break:
+
+- **Shrinking the tile does not shrink the register count.** By the live set I
+  counted (`acc[NG*4] + w[G][NG] + s[G][NG] + xa[G]`), NG=1 should need ~28
+  registers. It uses 118, and NG=2 uses *more* than NG=4. So the 128 registers
+  are not the arrays I attributed them to, and the whole "cut the live set"
+  premise rests on a mis-reading.
+- **At equal occupancy the big tile still wins.** NG=1 sits at 23.9% occupancy
+  — slightly HIGHER than the shipped kernel's 22.0% — and is 22% slower. If
+  occupancy were the binding resource that could not happen.
+
+Together with the launch-bounds result (forcing higher occupancy is neutral to
+worse), occupancy is not what separates mma8's 800 GB/s from the GEMV's 1950.
+What does is unknown; three plausible mechanisms have now been measured and
+none of them is it.
 
 ## Rule
 
