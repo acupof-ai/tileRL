@@ -4,6 +4,20 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-30 — accept: Adafactor stops syncing to the host once per parameter
+
+- `Adafactor.step_one` called `float(tensor)` twice per parameter (update RMS,
+  parameter RMS). 27B = 851 parameter tensors = **1702 host syncs a step**, each
+  draining the pipeline mid-backward because `streams=True` interleaves the
+  optimizer with the backward pass.
+- Both RMS values now stay on device; the non-finite-gradient early return
+  becomes a zero scale. Parameters match the old formula to 1.2e-07 over 5 steps.
+- Host syncs a step: **55 -> 1** on the tiny model (the loss finite-check).
+  Step time on the 27B is `pending-remote` — this host has no GPU and the win is
+  a sync/overlap effect a CPU run cannot show.
+- Gate: `tests/test_e2e.py::test_train_step_does_not_sync_per_parameter`.
+  [wins/2026-08-30-adafactor-host-sync-per-parameter.md](docs/experience/wins/2026-08-30-adafactor-host-sync-per-parameter.md)
+
 ## 2026-08-30 — verdict: TP works, and a capturable all-reduce is its entry ticket
 
 - First successful TP=4 run on the 27B, eager both sides: **1.44x at B=1**

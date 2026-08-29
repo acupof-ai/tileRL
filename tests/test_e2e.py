@@ -289,6 +289,35 @@ def test_adafactor_streaming_matches_collecting():
         assert torch.equal(streamed[k], v), f"{k} diverged"
 
 
+def test_train_step_does_not_sync_per_parameter():
+    """One host sync per STEP, not per parameter.
+
+    ``Adafactor.step_one`` runs interleaved with backward, so every
+    ``float(tensor)`` inside it drains the pipeline mid-step. It used to take
+    two — update RMS and parameter RMS — for each of the ~640 parameters of the
+    27B. The only sync left is the loss value, which the step's own
+    finite-check needs.
+    """
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class CountSyncs(TorchDispatchMode):
+        n = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if str(func) == "aten._local_scalar_dense.default":
+                CountSyncs.n += 1
+            return func(*args, **(kwargs or {}))
+
+    backend = get_backend()
+    model = build_random(tiny(), seed=11)
+    opt = Adafactor(lr=1e-3)
+    ids = [[1, 2, 3, 4, 5, 6, 7, 8]]
+    train_step(model, ids, backend, opt)  # warm: first step allocates state
+    with CountSyncs():
+        train_step(model, ids, backend, opt)
+    assert CountSyncs.n <= 2, f"{CountSyncs.n} host syncs per step (expected the loss only)"
+
+
 def test_adafactor_trains_with_factored_state():
     """Same 20-step gate as AdamW, plus the property that is the whole reason
     Adafactor exists: a 2D param's second moment is O(rows+cols), not O(n).
