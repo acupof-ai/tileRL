@@ -108,11 +108,11 @@ def _step(
     if not math.isfinite(loss):
         return loss
 
-    grads = tape.backward(grad_logits)
     #: ``trainable`` = the subset that gets gradients (LoRA adapters); the rest
     #: is frozen, which is what keeps the 27B inside one card.
     params = model.params if trainable is None else trainable
     param_ids = {id(p) for p in params.values()}
+    grads = tape.backward(grad_logits, needs=param_ids)
     assert param_ids & set(grads), (
         "train_step: tape produced no parameter gradients — either the "
         "recording seam is missing (backend ops not recorded), or a trainable "

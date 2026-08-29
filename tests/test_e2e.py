@@ -18,7 +18,8 @@ import numpy as np
 import pytest
 import torch
 
-from tilerl.autograd import AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
+from tilerl.autograd import (Adafactor, AdamW, RecordingBackend, Tape, clip_grad_norm,
+                             cosine_warmup)
 from tilerl.config import tiny
 from tilerl.engine import (
     BLOCK_TOKENS,
@@ -243,6 +244,30 @@ def test_stop_token_is_not_returned():
     rid = engine.submit([1, 2], SamplingParams(max_new_tokens=4, stop_token_ids=(7,)))
     engine.step()
     assert engine.take(rid) == []
+
+
+def test_adafactor_trains_with_factored_state():
+    """Same 20-step gate as AdamW, plus the property that is the whole reason
+    Adafactor exists: a 2D param's second moment is O(rows+cols), not O(n).
+
+    Adam's m+v for the 27B is 200 GiB against 50 GiB of weights, which is why
+    full fine-tuning cannot use it on one card.
+    """
+    cfg = tiny()
+    model = build_random(cfg, seed=2026)
+    backend = get_backend()
+    optimizer = Adafactor(lr=1e-2)
+    batch = np.random.default_rng(7).integers(3, cfg.vocab_size, size=(2, 32)).astype(np.int64)
+
+    losses = [float(train_step(model, batch, backend, optimizer, Tape())) for _ in range(20)]
+    first5, last5 = sum(losses[:5]) / 5, sum(losses[-5:]) / 5
+    assert last5 < first5, f"loss did not decrease: {first5:.4f} -> {last5:.4f}"
+
+    for p, state in ((p, optimizer._state[id(p)]) for p in model.params.values()
+                     if id(p) in optimizer._state):
+        held = sum(t.numel() for t in state)
+        assert held == (sum(p.shape) if p.dim() == 2 else p.numel()), \
+            f"{tuple(p.shape)}: optimizer holds {held} elements"
 
 
 def test_train_loss_decreases():

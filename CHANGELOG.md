@@ -4,6 +4,20 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-29 — phase exit: the embedding table stops being resident three times
+
+- The gather kernel demanded an f32 table, so the 27B's bf16 [248320, 5120]
+  embedding lived as a cached 4.7 GiB f32 copy beside the 2.4 GiB original;
+  and the tape computed a dense 4.7 GiB f32 gradient for that table every step
+  even though LoRA freezes it. Both are memory AT the peak.
+- `make_embedding` gained a bf16 body (CUDA only — the C target cannot codegen
+  bfloat16), and `Tape.backward(needs=...)` lets a handler skip an expensive
+  gradient for a leaf nobody reads.
+- 27B LoRA, all four shapes better on both axes: 1x64 **50.3 -> 51.1 tok/s,
+  47.0 -> 42.3 GB**; 1x256 113.5 -> 115.2, 57.5 -> 52.9; 2x256 **178.2 ->
+  182.3, 76.5 -> 67.6**.
+  [wins/2026-08-29-embedding-f32-copies.md](docs/experience/wins/2026-08-29-embedding-f32-copies.md)
+
 ## 2026-08-29 — reject: streaming gradient release is not a memory win
 
 - `Tape.backward` can now hand each gradient to a callback the moment it is

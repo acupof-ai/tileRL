@@ -32,6 +32,7 @@ import torch
 __all__ = [
     "Tape",
     "AdamW",
+    "Adafactor",
     "cosine_warmup",
     "clip_grad_norm",
     "maybe_record",
@@ -177,11 +178,17 @@ def _rope(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
     yield 0, backend.rope_bwd(g, positions, theta, rotary_dim=rotary_dim)
 
 
-def _embedding(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
+def _embedding(backend: Any, g: torch.Tensor, args: tuple, kw: dict, wants: Any):
     # embedding_bwd(grad, idx, num_rows) -> gtable: num_rows comes from the
     # saved table's shape, the table itself is not an input to the kernel.
+    # The table gradient is DENSE [vocab, hidden] f32 — 4.7 GiB on the 27B —
+    # so a frozen embedding (LoRA, OPD) must not pay for one nobody reads.
     idx, table = args[0], args[1]
-    yield 1, backend.embedding_bwd(g, idx, table.shape[0])
+    if wants(table):
+        yield 1, backend.embedding_bwd(g, idx, table.shape[0])
+
+
+_embedding.wants = True  # takes the extra `wants` argument
 
 
 def _attention(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
@@ -333,10 +340,16 @@ class Tape:
         return first
 
     def backward(
-        self, grad_output: torch.Tensor, on_grad: Any = None
+        self, grad_output: torch.Tensor, on_grad: Any = None, needs: set[int] | None = None
     ) -> dict[int, torch.Tensor]:
         """Reverse replay. Returns ``{id(param): grad}`` for every leaf
         (consumed-but-never-produced tensor) that received gradient.
+
+        ``needs`` — when given, the ids of the leaves whose gradient the caller
+        will actually read. A handler that can skip an expensive gradient for
+        an unwanted leaf does so: the 27B's frozen embedding table gradient is
+        a dense [248320, 5120] f32, 4.7 GiB, computed and discarded on every
+        LoRA step without it.
 
         ``on_grad(tensor_id, grad) -> bool`` — when given, each gradient is
         offered as soon as it is final; returning True means the callback took
@@ -381,6 +394,12 @@ class Tape:
         produced_at = ({id(e.output): i for i, e in enumerate(self._entries)}
                        if on_grad is not None else {})
         taken: set[int] = set()
+
+        def wants(t: torch.Tensor) -> bool:
+            """``needs`` names the leaves the caller will read. An intermediate
+            is always wanted — dropping one severs the chain below it."""
+            return needs is None or id(t) in needs or id(t) in produced
+
         token = _current_tape.set(None)
         try:
             for i in range(len(entries) - 1, -1, -1):
@@ -397,7 +416,10 @@ class Tape:
                         f"no backward handler for recorded op {entry.op_name!r}; "
                         f"known ops: {sorted(_BWD)}"
                     )
-                for slot, g_in in handler(backend, g_out, entry.args, entry.kwargs):
+                call = ((backend, g_out, entry.args, entry.kwargs, wants)
+                        if getattr(handler, "wants", False)
+                        else (backend, g_out, entry.args, entry.kwargs))
+                for slot, g_in in handler(*call):
                     if isinstance(slot, int):
                         target = entry.args[slot]
                     else:
@@ -490,6 +512,91 @@ class AdamW:
             denom = v.div(bc2).sqrt_().add_(self.eps)
             p32.addcdiv_(m, denom, value=-self.lr / bc1)
             p.copy_(p32.to(p.dtype))
+
+
+class Adafactor:
+    """Adafactor: the second moment of a 2D param is stored as a row vector and
+    a column vector instead of the full matrix, and there is no first moment.
+
+    This is what makes full fine-tuning arithmetically possible on one card.
+    Adam's m+v for the 27B is 200.4 GiB of fp32 against 50.1 GiB of bf16
+    weights; the factored form is 0.03 GiB. Same ``step(params, grads)``
+    signature as :class:`AdamW`, so the training loop does not care which it
+    holds.
+
+    Follows Shazeer & Stern 2018 with the paper's defaults: relative step size
+    scaled by the parameter's own RMS (so ``lr`` is a multiplier, not an
+    absolute rate), update clipping at RMS 1.0, and beta2 growing as
+    ``1 - t^-0.8``. ``beta1 > 0`` restores momentum at the cost of one fp32
+    tensor per param — off by default, which is the whole point.
+    """
+
+    def __init__(
+        self,
+        lr: float = 1e-2,
+        beta1: float = 0.0,
+        eps: tuple[float, float] = (1e-30, 1e-3),
+        clip: float = 1.0,
+        decay_power: float = -0.8,
+        weight_decay: float = 0.0,
+    ) -> None:
+        self.lr = lr
+        self.beta1 = beta1
+        self.eps = eps
+        self.clip = clip
+        self.decay_power = decay_power
+        self.weight_decay = weight_decay
+        self._state: dict[int, Any] = {}
+        self._step = 0
+
+    @staticmethod
+    def _rms(t: torch.Tensor) -> float:
+        return float(t.norm() / math.sqrt(t.numel()))
+
+    def step(self, params: Any, grads: dict[int, torch.Tensor]) -> None:
+        self._step += 1
+        b2 = 1.0 - self._step**self.decay_power
+        for p in params:
+            g = grads.get(id(p))
+            if g is None:
+                continue
+            g = g.to(torch.float32)
+            u = g.mul(g).add_(self.eps[0])
+            st = self._state.get(id(p))
+            factored = g.dim() == 2
+            if st is None:
+                if factored:
+                    st = (
+                        torch.zeros(g.shape[0], dtype=torch.float32, device=g.device),
+                        torch.zeros(g.shape[1], dtype=torch.float32, device=g.device),
+                    )
+                else:
+                    st = (torch.zeros_like(g),)
+                if self.beta1 > 0.0:
+                    st = st + (torch.zeros_like(g),)
+                self._state[id(p)] = st
+            if factored:
+                r, c = st[0], st[1]
+                r.mul_(b2).add_(u.mean(dim=1), alpha=1.0 - b2)
+                c.mul_(b2).add_(u.mean(dim=0), alpha=1.0 - b2)
+                #: outer(r / mean(r), c) is the rank-1 reconstruction of v
+                upd = g * torch.rsqrt(r.div(r.mean()).unsqueeze(1) * c.unsqueeze(0))
+            else:
+                v = st[0]
+                v.mul_(b2).add_(u, alpha=1.0 - b2)
+                upd = g * torch.rsqrt(v)
+            upd.div_(max(1.0, self._rms(upd) / self.clip))
+            p32 = p.to(torch.float32)
+            #: relative step: the update is scaled by the parameter's own size,
+            #: so one lr works across tensors of very different magnitude.
+            step = self.lr * max(self.eps[1], self._rms(p32))
+            if self.weight_decay > 0.0:
+                p32.mul_(1.0 - step * self.weight_decay)
+            if self.beta1 > 0.0:
+                m = st[-1]
+                m.mul_(self.beta1).add_(upd, alpha=1.0 - self.beta1)
+                upd = m
+            p.copy_(p32.add_(upd, alpha=-step).to(p.dtype))
 
 
 def cosine_warmup(step: int, total: int, warmup: int, lr: float) -> float:

@@ -520,11 +520,21 @@ def make_rope(target: str):
 # ---------------------------------------------------------------- embedding
 
 
-def make_embedding(target: str):
-    """Gather: Out[i, d] = Table[Idx[i], d]. Idx int32 [M]."""
+def make_embedding(target: str, dtype: str = "float32"):
+    """Gather: Out[i, d] = Table[Idx[i], d]. Idx int32 [M], f32 out.
+
+    Two bodies, not one parametrized by ``dtype``: this module runs under
+    ``from __future__ import annotations``, so a ``T.Tensor`` annotation is a
+    string tilelang evaluates against module globals — a closure variable in it
+    raises NameError.
+
+    Reading the table in its own dtype matters because a gather does no
+    arithmetic, so bf16 in is exact, and the 27B's [248320, 5120] table is
+    either 2.4 GiB or a cached 4.7 GiB f32 copy beside it.
+    """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
-    def embedding(Idx, Table, threads):
+    def embedding_f32(Idx, Table, threads):
         M, D = T.const("M, D")
         V = T.const("V")
         Idx: T.Tensor((M,), "int32")
@@ -535,7 +545,19 @@ def make_embedding(target: str):
                 Y[i, d] = Table[Idx[i], d]
         return Y
 
-    return embedding
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    def embedding_bf16(Idx, Table, threads):
+        M, D = T.const("M, D")
+        V = T.const("V")
+        Idx: T.Tensor((M,), "int32")
+        Table: T.Tensor((V, D), "bfloat16")
+        Y = T.empty((M, D), "float32")
+        with T.Kernel(M, threads=threads) as i:
+            for d in T.Parallel(D):
+                Y[i, d] = T.cast(Table[Idx[i], d], "float32")
+        return Y
+
+    return {"float32": embedding_f32, "bfloat16": embedding_bf16}[dtype]
 
 
 # ---------------------------------------------------------------- linear fp4
