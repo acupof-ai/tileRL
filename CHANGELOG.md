@@ -19,6 +19,21 @@ verdict**. Newest first.
   `test_decode_tick_does_not_sync_in_the_sampler`.
   [wins/2026-08-30-sampler-host-syncs.md](docs/experience/wins/2026-08-30-sampler-host-syncs.md)
 
+## 2026-08-30 — accept: the KV scatter fallback stops syncing once per token
+
+- `PagedKvPool.write_tokens` looped per token with an
+  `int(kv.block_table[...])` inside, and is called once per full-attn layer:
+  `b * seq_q * layers` host syncs. **A 512-token prefill chunk of the 27B was
+  8192 of them a tick.** `r.blocks` is a Python list the engine already holds.
+- Indexed instead of looped. Prefill syncs 35 -> 1 on a 32-token chunk;
+  decode 4 -> 1. The remaining one is the eager `gdn_forward` fallback.
+- Counted with `aten._local_scalar_dense`, which does not see the two
+  batch-wide `tolist()` that replaced the per-row scalars — those still
+  transfer. Tick time is `pending-remote`.
+- This is the fallback path for arches without the `write_tokens` kernel: the
+  CPU target, and any partially-registered cell.
+  [wins/2026-08-30-kv-scatter-synced-once-per-token.md](docs/experience/wins/2026-08-30-kv-scatter-synced-once-per-token.md)
+
 ## 2026-08-30 — phase exit: the draft head now attends over the whole prefix
 
 - `_draft_chains` (a forward before each tick, against a one-block chain-local
