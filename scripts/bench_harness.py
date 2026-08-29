@@ -271,10 +271,17 @@ def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
             cfg, model, backend, num_blocks=512, num_slots=max(16, b), max_batch=max(8, b),
             draft=load_draft(model, path) if spec else None, spec_depth=depth,
         )
+        # The budget must not bind before the last timed tick: a request that
+        # finishes mid-window leaves the remaining ticks generating nothing and
+        # drags tok/tick down. (ticks + 20) * (1 + depth) did bind at depth 1 —
+        # 80 tokens against ~109 produced — which is why that row read 1.12
+        # tok/tick at 55.8% acceptance where 1 + p is 1.56, and why depth 2,
+        # whose budget happened to clear, read correctly.
+        budget = (bk.SETTLE_BUDGET(b) + 8 + 3 * ticks + 4) * (1 + depth)
         for i in range(b):  # noqa: B007 - both arms share the prompt set
             engine.submit(
                 bk.rand_prompt(cfg.vocab_size, 16, seed=700 + i),
-                SamplingParams(temperature=0.0, max_new_tokens=(ticks + 20) * (1 + depth), seed=i),
+                SamplingParams(temperature=0.0, max_new_tokens=budget, seed=i),
             )
         # One waiting request is admitted per tick, so B rows need at least B
         # ticks before any of them decodes: a fixed warmup times prefill ticks
@@ -288,6 +295,10 @@ def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
         s0 = engine.stats()
         ms = _median_windows(engine.step, 3, ticks, lambda: bk.sync(backend))
         s1 = engine.stats()
+        if len(engine._running) != b:
+            print(f"  {b:>3} {'d' + str(depth) if spec else 'plain':>6}   "
+                  f"(a request finished mid-window — budget too small, row void)")
+            continue
         per_tick = (s1["tokens_generated"] - s0["tokens_generated"]) / (3 * ticks) / b
         drafted = s1["spec_drafted"] - s0["spec_drafted"]
         acc = (s1["spec_accepted"] - s0["spec_accepted"]) / max(drafted, 1)

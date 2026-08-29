@@ -93,12 +93,19 @@ def drive(engine, wid: int, max_steps: int) -> list[int]:
     raise RuntimeError(f"request {wid} did not finish in {max_steps} steps")
 
 
+def SETTLE_BUDGET(b: int, extra: int | None = None) -> int:
+    """Upper bound on the ticks :func:`settle_decode` may consume. Callers size
+    a request's ``max_new_tokens`` from it — a budget that binds before the last
+    timed tick silently reports the empty ticks as slow ones."""
+    return 4 * b + (64 + 8 * b if extra is None else extra) + 40
+
+
 def settle_decode(engine, b: int, extra: int) -> bool:
     """Step until `b` rows are all in pure decode. Returns False if it never
     reaches that state within a bounded budget (caller skips the row)."""
     from tilerl.engine import _PHASE_DECODE
 
-    for _ in range(4 * b + extra + 40):
+    for _ in range(SETTLE_BUDGET(b, extra)):
         engine.step()
         run = engine._running
         if len(run) == b and all(r.phase == _PHASE_DECODE for r in run):

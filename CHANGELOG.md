@@ -4,6 +4,22 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-30 — phase exit: the spec suite's request budget bound mid-measurement
+
+- `suite_spec` gave each request `(ticks + 20) * (1 + depth)` tokens against the
+  ~70 ticks it actually runs. At B=1 depth 1 that is 80 against ~109 produced:
+  the request finished around tick 51 of 70 and the empty ticks still counted,
+  reporting **1.12 tok/tick where `1 + p` is 1.56**. Only the speculative arm
+  hit it.
+- Closes the open item in the speculation verdict, and explains its
+  depth-1-only shape: depth 2's budget happened to clear.
+- Corrected, B=1 depth 1 is 0.79x (was 0.57x) and B=8 depth 1 is 0.22x (was
+  0.15x). **Speculation still loses everywhere and the break-even is
+  unchanged** — it came from ms/tick and acceptance, which were sound.
+- Budget now derives from `benchkit.SETTLE_BUDGET(b)`, and a row whose running
+  set shrank during the window is voided rather than reported.
+  [errors/2026-08-30-spec-suite-budget-bound-mid-window.md](docs/experience/errors/2026-08-30-spec-suite-budget-bound-mid-window.md)
+
 ## 2026-08-30 — accept: Adafactor stops syncing to the host once per parameter
 
 - `Adafactor.step_one` called `float(tensor)` twice per parameter (update RMS,
