@@ -31,13 +31,15 @@ ENV PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /app
 
-# Dependency layer first: tilelang[fp4] is a main dependency (not a tilerl
-# extra), so plain `uv sync` is the equivalent of the requested `--extra gpu`.
+# Dependency layer first. The workspace member's manifest has to come along or
+# uv cannot resolve the tilerl-kernels source. The image serves, so it needs
+# the [server] extra that a plain install deliberately leaves out.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+COPY packages/tilerl-kernels/pyproject.toml packages/tilerl-kernels/
+RUN uv sync --frozen --no-dev --extra server --no-install-project
 
 COPY . .
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --extra server
 
 EXPOSE 8000
 

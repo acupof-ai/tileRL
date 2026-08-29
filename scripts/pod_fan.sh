@@ -23,7 +23,7 @@ pod_exec() {
 script="set -x"$'\n'
 i=0
 for cmd in "$@"; do
-  script+="export TILELANG_CACHE_DIR=/work/tilelang_cache PYTHONPATH=$REMOTE_DIR/src TILERL_TARGET=cuda"$'\n'
+  script+="export TILELANG_CACHE_DIR=/work/tilelang_cache PYTHONPATH=$REMOTE_DIR/src:$REMOTE_DIR/packages/tilerl-kernels/src TILERL_TARGET=cuda"$'\n'
   script+="cd $REMOTE_DIR && CUDA_VISIBLE_DEVICES=$i bash -c $(printf '%q' "$cmd") > /work/${NAME}_$i.log 2>&1 &"$'\n'
   i=$((i + 1))
 done

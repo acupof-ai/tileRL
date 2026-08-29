@@ -31,8 +31,8 @@ remote+="crictl exec -i \$cid bash -lc $(printf '%q' "$inner")"
 if [ "${1:-}" = run ]; then
   name="$2"; shift 2
   "$0" >/dev/null   # sync this checkout first; the job runs against it
-  script=$(printf 'set -x\ncd %s\nexport TILELANG_CACHE_DIR=/work/tilelang_cache PYTHONPATH=%s/src TILERL_TARGET=cuda\n%s\necho DONE_%s\n' \
-                  "$REMOTE_DIR" "$REMOTE_DIR" "$1" "$name" | base64 | tr -d '\n')
+  script=$(printf 'set -x\ncd %s\nexport TILELANG_CACHE_DIR=/work/tilelang_cache PYTHONPATH=%s/src:%s/packages/tilerl-kernels/src TILERL_TARGET=cuda\n%s\necho DONE_%s\n' \
+                  "$REMOTE_DIR" "$REMOTE_DIR" "$REMOTE_DIR" "$1" "$name" | base64 | tr -d '\n')
   pod_exec() {
     tn exec "cid=\$(crictl ps -q --name $POD_NAME --state Running | head -1); crictl exec \$cid bash -lc $(printf '%q' "$1")"
   }
