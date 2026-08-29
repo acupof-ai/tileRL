@@ -7,6 +7,12 @@ same rule the harness gate applies in-process.
 
   python scripts/baseline.py pull     # merge the pod's rows into the repo's
   python scripts/baseline.py show
+
+Merging is per key and higher-wins, so a row DELETED from the repo comes back
+on the next pull as long as the pod's copy still has it — six retired `spec/*`
+rows resurrected three times that way on 2026-08-29. The pod's checkout is
+overwritten by every sync, so the cure is one `SKIP_BASELINE_PULL=1
+scripts/pod_sync.sh` after the deletion; it does not need code.
 """
 
 from __future__ import annotations
