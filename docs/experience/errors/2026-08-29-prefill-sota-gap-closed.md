@@ -173,9 +173,22 @@ The glue is 2.35x the matmuls even perfectly batched, and the triangular solve
 alone exceeds them. A fused kernel makes the gates and permutes nearly free —
 they are elementwise and ride the matmul pipeline — but the solve is real work.
 
-Realistic: 9.9 ms of matmul + ~13 ms of solve = **~23 ms against 63, so 2.7x**,
-and prefill 229 -> 189 ms, **2237 -> ~2709 tok/s (1.21x)**. Still the largest
-single item in the tree; not the 6.4x I wrote an hour earlier.
+Realistic: 9.9 ms of matmul + ~13 ms of solve = ~23 ms against 63, so 2.7x —
+**and that is wrong too, in the other direction.** It takes torch's
+`solve_triangular` time as the solve's intrinsic cost. By arithmetic the
+forward substitution is `n^2/2 * (DK+DV)` = 64^2/2 * 256 = **524K MAC, 9% of
+the chunk's 5.7M**. Torch spends 33.4 us on that 9% against 25.7 us for the
+other 91%, i.e. ~14x worse per FLOP: overhead, not work.
+
+So the fused kernel lands somewhere in:
+
+| if the substitution... | GDN | vs 63 ms | prefill |
+|---|---:|---:|---:|
+| vectorises well (+9% arithmetic) | ~11 ms | 5.7x | ~2893 tok/s |
+| stays overhead-bound like torch's | ~23 ms | 2.7x | ~2709 tok/s |
+
+A 2x spread, and **which end it lands on is the thing that has to be written to
+be known**. Everything else about this project is now measured.
 
 ### And why the three previous rejections do not contradict this
 
@@ -186,10 +199,11 @@ per layer.
 
 So all three rejections measured the glue, not the math — but the breakdown
 above shows the glue is not merely launch overhead either. Perfectly batched it
-is still 2.35x the matmuls, and **the triangular solve is the crux**: it is the
-largest single piece and the only one with no in-kernel primitive (64 steps of
-forward substitution, or a blocked inversion in log steps). Whoever takes this
-should settle the solve first; the rest is mechanical.
+is still 2.35x the matmuls, and **the triangular solve is the crux** — not
+because it is much arithmetic (it is 9% of the chunk) but because it is the
+only piece with no in-kernel primitive, and torch runs it 14x off its FLOP
+rate. Whoever takes this should settle the solve first, in isolation: it
+decides a 2x spread in the whole project's value, and the rest is mechanical.
 
 Still short of 4022 on its own — the GEMMs' 1.36x is the other half — but this
 is the single largest item in the tree, and the cause is structural: a serial
