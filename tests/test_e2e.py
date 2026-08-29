@@ -544,6 +544,16 @@ def test_logprobs_are_returned_and_deterministic():
     out, lps = run()
     assert lps is not None and len(lps) == len(out) == 4, (out, lps)
     assert all(x <= 1e-5 for x in lps), lps
+    # greedy must not report the point mass: scoring at the sampling
+    # temperature would make every logprob exactly 0, true and useless
+    g = SamplingParams(temperature=0.0, max_new_tokens=3, seed=1, logprobs=True)
+    rid = engine.submit(list(range(8)), g)
+    for _ in range(200):
+        engine.step()
+        if rid in engine.poll():
+            break
+    greedy_lps = engine.logprobs(rid)
+    assert greedy_lps and all(x < -1e-6 for x in greedy_lps), greedy_lps
     assert (out, lps) == run(), "same seed, different scores"
     # scores are drained with the request, like the tokens
     assert engine.logprobs(engine._next_id - 1) is None

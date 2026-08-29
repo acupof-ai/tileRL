@@ -897,11 +897,13 @@ class Engine:
         seeds = torch.tensor([_step_seed(r.params.seed, g) for r, _, g in rows], device=dev)
         toks = [int(t) for t in self._backend.sample_batch(logits, temps, top_ps, seeds)]
         if any(r.params.logprobs for r, _, _ in rows):
-            # From the SAME logits the draw used, scaled by the same
-            # temperature: a second forward would be a different distribution
-            # once the tape or the sampler moves. Greedy rows use temperature 0,
-            # where the scaled softmax is a point mass, so score them raw.
-            t = temps.clamp_min(1e-6).reshape(-1, 1)
+            # From the SAME logits the draw used. Temperature > 0 scores under
+            # the SAMPLING distribution, which is what a policy gradient needs.
+            # Temperature 0 scores under the model's own (t=1) distribution:
+            # the greedy point mass would report log p = 0 for every token,
+            # which is true and useless — and greedy is exactly the eval case
+            # that wants the model's real score.
+            t = torch.where(temps > 0, temps, torch.ones_like(temps)).reshape(-1, 1)
             lp = torch.log_softmax(logits.float() / t, dim=-1)
             idx = torch.tensor(toks, device=dev).reshape(-1, 1)
             self._last_logprobs = lp.gather(1, idx).reshape(-1).tolist()
