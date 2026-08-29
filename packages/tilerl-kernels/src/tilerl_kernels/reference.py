@@ -1084,27 +1084,38 @@ def sample_batch(
 
     The win is the sort: B argmax/sort-over-V calls become one batched op
     (8.2% of the B=8 slice tick was 8 separate sorts + 8 D2H syncs).
+
+    ``temperatures`` / ``top_ps`` / ``seeds`` are read on the HOST — the caller
+    has them as Python scalars. Taking them as device tensors and reading them
+    back to pick the greedy/sampled split cost two syncs a tick plus one per
+    sampled row, on every target.
     """
     logits = _f32(logits)
     b = logits.shape[0]
-    out = torch.empty(b, dtype=torch.long, device=logits.device)
-    sample_rows = temperatures > 0
-    if not bool(sample_rows.all()):
-        out[~sample_rows] = logits[~sample_rows].argmax(-1).to(torch.long)
-    if bool(sample_rows.any()):
-        idx = sample_rows.nonzero(as_tuple=True)[0]
-        sub = logits[idx] / temperatures[idx, None]
+    dev = logits.device
+    temps = [float(t) for t in temperatures]
+    out = torch.empty(b, dtype=torch.long, device=dev)
+    hot = [i for i, t in enumerate(temps) if t > 0]
+    cold = [i for i, t in enumerate(temps) if t <= 0]
+    if cold:
+        ci = torch.tensor(cold, device=dev)
+        out[ci] = logits[ci].argmax(-1).to(torch.long)
+    if hot:
+        idx = torch.tensor(hot, device=dev)
+        tt = torch.tensor([temps[i] for i in hot], dtype=torch.float32, device=dev)
+        tp = torch.tensor([float(top_ps[i]) for i in hot], dtype=torch.float32, device=dev)
+        sub = logits[idx] / tt[:, None]
         sorted_logits, sorted_idx = torch.sort(sub, dim=-1, descending=True)
         probs = torch.softmax(sorted_logits, dim=-1)
         cum = torch.cumsum(probs, dim=-1)
-        keep = cum - probs < top_ps[idx, None]
+        keep = cum - probs < tp[:, None]
         keep[:, 0] = True
         probs = probs * keep
         probs = probs / probs.sum(-1, keepdim=True)
-        for i in range(idx.shape[0]):
-            gen = torch.Generator(device=logits.device).manual_seed(int(seeds[idx[i]]))
-            draw = torch.multinomial(probs[i], num_samples=1, generator=gen)
-            out[idx[i]] = sorted_idx[i, draw].to(torch.long)
+        for k, i in enumerate(hot):
+            gen = torch.Generator(device=dev).manual_seed(int(seeds[i]))
+            draw = torch.multinomial(probs[k], num_samples=1, generator=gen)
+            out[i] = sorted_idx[k, draw].to(torch.long)
     return out
 
 
