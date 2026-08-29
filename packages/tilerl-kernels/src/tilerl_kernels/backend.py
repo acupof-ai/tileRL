@@ -177,8 +177,9 @@ class Backend:
             # sgemm / xmma_gemm_f32f32 in the profile. TF32 keeps 10 mantissa
             # bits, well inside the rtol=1e-2 parity gate on a model whose
             # weights are fp4.
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+            tf32 = os.environ.get("TILERL_TF32", "1") == "1"
+            torch.backends.cuda.matmul.allow_tf32 = tf32
+            torch.backends.cudnn.allow_tf32 = tf32
         else:
             self.device = torch.device("cpu")
         self.precision = "bf16"
