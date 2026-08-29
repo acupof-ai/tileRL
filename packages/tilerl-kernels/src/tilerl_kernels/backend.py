@@ -171,6 +171,14 @@ class Backend:
             # outputs land on (cuda:0) — pin the current device so the
             # boundary migration targets the right one.
             self.device = torch.device("cuda", torch.cuda.current_device())
+            # torch defaults allow_tf32 to False, which puts every fp32 matmul
+            # in the torch-eager backward on SIMT FP32 cores instead of the
+            # tensor cores - 23% of a train step showed up as cutlass_*_simt_
+            # sgemm / xmma_gemm_f32f32 in the profile. TF32 keeps 10 mantissa
+            # bits, well inside the rtol=1e-2 parity gate on a model whose
+            # weights are fp4.
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         else:
             self.device = torch.device("cpu")
         self.precision = "bf16"
