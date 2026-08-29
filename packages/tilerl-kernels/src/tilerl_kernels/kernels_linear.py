@@ -12,6 +12,8 @@ lop3-style integer bit-pattern fast decode (no exp2 in the loop).
 
 from __future__ import annotations
 
+import os
+
 import tilelang
 import tilelang.language as T
 
@@ -33,8 +35,14 @@ __all__ = [
 #: Reduction-tile size (K for gemm_nt/nn, M for gemm_tn, K for linear_fp4).
 #: WGMMA K on sm90 is 16 (bf16); 32 is 2 K-steps, divides every model K dim
 #: (all are multiples of 32), and matches examples/gemm/example_gemm.py.
-#: The backend pads the reduction dim to a multiple of this on CUDA.
-_RED_TILE = 32
+#: The backend pads the reduction dim to a multiple of this on CUDA and imports
+#: THIS name to do it — a second copy of the number would silently mis-pad.
+#: ``TILERL_RED_TILE`` A/Bs it in one run: 32 makes the fp4 backward's inner
+#: gemm [64,32] @ [32,64], which is WGMMA's minimum K, and that kernel measures
+#: 15% of peak (docs/experience/errors/2026-08-29-mma8-is-register-bound.md).
+_RED_TILE = int(os.environ.get("TILERL_RED_TILE", "32"))
+if _RED_TILE % 16 or _RED_TILE <= 0:
+    raise ValueError(f"TILERL_RED_TILE must be a positive multiple of 16, got {_RED_TILE}")
 
 # ---------------------------------------------------------------- gemm (MMA)
 

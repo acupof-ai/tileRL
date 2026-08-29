@@ -104,7 +104,7 @@ _MX = 8  # batched decode GEMV: activation rows kept in registers per lane
 #:   mma8  -    27.2  29.7  27.6  27.1
 #: A/B per arch: TILERL_MGEMV=0 disables the path.
 _MGEMV = int(os.environ.get("TILERL_MGEMV", "3"))
-_MMA_RED = 32  # kernels_linear._RED_TILE: the K-loop reduction tile
+_MMA_RED = kernels_linear._RED_TILE  # the K-loop reduction tile; one definition, not two
 
 _CUDA_PLAN = {
     ("linear", "gemv"): ("linear_bf16_gemv", 256, 4, 4),
