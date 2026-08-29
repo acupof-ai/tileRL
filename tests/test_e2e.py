@@ -1095,6 +1095,47 @@ def test_draft_head_attends_over_the_whole_prefix():
     )
 
 
+def test_decode_tick_does_not_sync_in_the_sampler():
+    """Sampling must not read anything back off the device.
+
+    ``temperature`` / ``top_p`` / ``seed`` are Python scalars on the request.
+    Shipping them to the device and reading them back to pick the greedy rows
+    cost two syncs a tick plus one per sampled row, on EVERY target — and a
+    sync inside a captured region is also what makes a decode graph
+    uncapturable, which is how this was found.
+
+    The syncs this asserts nothing about are the un-fused CPU fallbacks
+    (``PagedKvPool.write_tokens``, eager ``gdn_forward``); a target with those
+    kernels registered runs neither.
+    """
+    import traceback
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    sites: list[str] = []
+
+    class Trace(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if str(func) == "aten._local_scalar_dense.default":
+                frames = [f for f in traceback.extract_stack() if "/tilerl" in f.filename]
+                if frames:
+                    sites.append(f"{frames[-1].filename.split('/')[-1]}:{frames[-1].name}")
+            return func(*args, **(kwargs or {}))
+
+    cfg = tiny()
+    engine = build_engine(
+        cfg, build_random(cfg, seed=3), get_backend(),
+        num_blocks=16, num_slots=4, max_batch=4, max_total_tokens=512,
+    )
+    engine.submit([3, 4, 5, 6], SamplingParams(temperature=0.8, max_new_tokens=32, seed=0))
+    for _ in range(4):  # settle past prefill into pure decode
+        engine.step()
+    with Trace():
+        engine.step()
+    bad = [s for s in sites if "sample" in s.lower()]
+    assert not bad, f"sampler synced to the host: {bad}"
+
+
 def test_speculation_reproduces_greedy_decode():
     """The whole correctness gate for spec decode: with a draft attached the
     engine must emit token-for-token what it emits without one. Covers the

@@ -4,6 +4,21 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-30 — accept: the sampler stops shipping its arguments to the device to read them back
+
+- `temperature` / `top_p` / `seed` are Python scalars on `SamplingParams`. The
+  engine put them on the device and `sample_batch` read them back to split the
+  greedy rows from the sampled ones — 2 syncs a tick plus one per sampled row,
+  on **every** target.
+- Found by counting `aten._local_scalar_dense` in one decode tick on CPU, which
+  takes the same fallbacks a partially-ported GPU target takes.
+- Host syncs a decode tick: **7 -> 4** greedy, **15 -> 4** at B=8 with
+  temperature > 0; of those, the ones that run on a target with the fused
+  kernels go **3 -> 0**. Tick time is `pending-remote`.
+- Draws unchanged (`test_sample_batch_matches_per_row`). Gate:
+  `test_decode_tick_does_not_sync_in_the_sampler`.
+  [wins/2026-08-30-sampler-host-syncs.md](docs/experience/wins/2026-08-30-sampler-host-syncs.md)
+
 ## 2026-08-30 — audit: verify_lens is dead on the shipped path and mis-modelled
 
 - `trim=not self._decode_graph_on` and graph capture is on by default, so

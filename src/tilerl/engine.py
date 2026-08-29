@@ -976,10 +976,12 @@ class Engine:
             return []
         logits = torch.stack([_restrict(l, r.params) for r, l, _ in rows])
         dev = logits.device
-        temps = torch.tensor([r.params.temperature for r, _, _ in rows], device=dev)
-        top_ps = torch.tensor([r.params.top_p for r, _, _ in rows], device=dev)
-        seeds = torch.tensor([_step_seed(r.params.seed, g) for r, _, g in rows], device=dev)
-        toks = [int(t) for t in self._backend.sample_batch(logits, temps, top_ps, seeds)]
+        # Host-side: sample_batch branches on them, and shipping them to the
+        # device only to read them back was 2 syncs a tick plus one per row.
+        temps = [r.params.temperature for r, _, _ in rows]
+        top_ps = [r.params.top_p for r, _, _ in rows]
+        seeds = [_step_seed(r.params.seed, g) for r, _, g in rows]
+        toks = self._backend.sample_batch(logits, temps, top_ps, seeds).tolist()
         if any(r.params.logprobs for r, _, _ in rows):
             # From the SAME logits the draw used. Temperature > 0 scores under
             # the SAMPLING distribution, which is what a policy gradient needs.
@@ -987,7 +989,7 @@ class Engine:
             # the greedy point mass would report log p = 0 for every token,
             # which is true and useless — and greedy is exactly the eval case
             # that wants the model's real score.
-            t = torch.where(temps > 0, temps, torch.ones_like(temps)).reshape(-1, 1)
+            t = torch.tensor([x if x > 0 else 1.0 for x in temps], device=dev).reshape(-1, 1)
             lp = torch.log_softmax(logits.float() / t, dim=-1)
             idx = torch.tensor(toks, device=dev).reshape(-1, 1)
             self._last_logprobs = lp.gather(1, idx).reshape(-1).tolist()
