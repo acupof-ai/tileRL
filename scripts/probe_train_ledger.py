@@ -61,6 +61,28 @@ def live_tensors(top: int = 12, named: dict | None = None) -> None:
         print(f"     {sz:7.3f} GiB  {dt:9s} {str(shape):20s} {who}")
 
 
+def tape_bytes(tape, top: int = 8) -> None:
+    """Bytes the tape holds, by op. Activations are the term that grows with
+    sequence length, so this is the list a recompute scheme would shorten."""
+    per: dict[str, list] = {}
+    seen = set()
+    for e in tape._entries:
+        acc = per.setdefault(e.op_name, [0, 0.0])
+        acc[0] += 1
+        for t in list(e.args) + list(e.kwargs.values()) + [e.output]:
+            if not torch.is_tensor(t) or not t.is_cuda:
+                continue
+            st = t.untyped_storage()
+            if st.data_ptr() in seen:
+                continue
+            seen.add(st.data_ptr())
+            acc[1] += st.nbytes() / G
+    rows = sorted(per.items(), key=lambda kv: -kv[1][1])
+    print(f"  {'-- tape holds':28s} total {sum(v[1] for _, v in rows):7.2f} GiB")
+    for name, (n, gb) in rows[:top]:
+        print(f"     {gb:7.3f} GiB  {n:5d} entries  {name}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("source")
@@ -95,6 +117,7 @@ def main() -> None:
     with torch.no_grad(), tape:
         logits = model.forward(ids, positions, kv, RecordingBackend(b))
     p = mark(f"forward (tape {len(tape._entries)})", p)
+    tape_bytes(tape)
     live_tensors(named=model.params)
 
     grad_logits = torch.ones_like(logits) / logits.numel()

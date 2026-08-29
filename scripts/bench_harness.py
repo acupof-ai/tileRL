@@ -9,8 +9,10 @@ Fills the coverage holes the scattered bench_*.py scripts left open:
   kv-reuse    prefix-cache hit-rate + warm-vs-cold prefill speedup (the engine's
               PrefixStore was perf-untested).
   spec        speculative decode goodput vs the draft head (27B only).
-  train       train_step fwd+bwd tok/s (tiny on CPU, 27B on the pod) — training
-              had zero perf coverage.
+  train       train_step fwd+bwd tok/s (tiny on CPU, 27B LoRA on the pod).
+  train-full  the same, full-parameter: bf16 masters, Adafactor, gradients
+              consumed inside backward. Its own process — masters and a frozen
+              fp4 base do not share a card.
   accuracy    MMLU 0-shot % on a fixed slice (27B only). Every other suite gates
               speed; without this one an "optimization" that breaks the logits
               passes the whole harness.
@@ -405,11 +407,17 @@ def _free(backend) -> None:
         torch.cuda.empty_cache()
 
 
-def suite_train(gate, backend, source, gpu):
-    """train_step fwd+bwd tok/s. Tiny on CPU; 27B when a source is given."""
+def suite_train(gate, backend, source, gpu, full=False):
+    """train_step fwd+bwd tok/s. Tiny on CPU; 27B when a source is given.
+
+    ``full`` swaps LoRA for full-parameter training: bf16 masters, Adafactor,
+    and gradients consumed inside backward. Separate invocation, not another
+    shape, because the two cannot share a process — 50.1 GiB of masters plus a
+    frozen fp4 base does not fit one card.
+    """
     import numpy as np
 
-    from tilerl.autograd import AdamW
+    from tilerl.autograd import Adafactor, AdamW
     from tilerl.cli import _build_model
     from tilerl.train import train_step
 
@@ -419,20 +427,23 @@ def suite_train(gate, backend, source, gpu):
 
             torch.cuda.synchronize()
 
-    # Full-parameter 27B needs 54 GB of bf16 masters + 216 GB of Adam moments
-    # and does not fit one H20 at any shape. The source row trains LoRA
-    # adapters on the frozen fp4 base instead (model.add_lora); tiny keeps the
-    # full-parameter tape covered on CPU.
+    # Full-parameter 27B fits at 73.2 of 95 GiB: bf16 masters only (the served
+    # bytes are dead once a master exists), Adafactor's factored second moment
+    # instead of Adam's 200.4 GiB of m+v, and every gradient consumed and freed
+    # inside backward instead of coexisting.
     trainable = None
     if source:
         from tilerl.config import qwen38_27b
-        from tilerl.model import add_lora, load_hf
+        from tilerl.model import add_lora, drop_quantized, load_hf
 
-        model_name = "27B-lora"
         cfg = qwen38_27b()
-        mdl = load_hf(cfg, source, fuse_projections=False)
+        model_name = "27B-full" if full else "27B-lora"
+        mdl = load_hf(cfg, source, fuse_projections=False, keep_master=full)
+        if full:
+            drop_quantized(mdl)
         mdl.params = backend.materialize(mdl.params)
-        trainable = add_lora(mdl, rank=16)
+        if not full:
+            trainable = add_lora(mdl, rank=16)
         # a slope, not one point: the tape keeps every activation in f32, so
         # peak GB per token is the number that decides whether recompute is needed
         # A slope in T (the tape keeps every activation in f32, so peak GB per
@@ -445,7 +456,7 @@ def suite_train(gate, backend, source, gpu):
         model_name = "tiny"
         cfg, mdl = _build_model(model_name, seed=0, keep_master=True)
         shapes = [(2, 128), (2, 512)]
-    opt = AdamW(lr=1e-3)
+    opt = Adafactor(lr=1e-2) if full else AdamW(lr=1e-3)
     print(f"\n=== training-step throughput ({model_name}) ===")
     print(f"  {'B x T':>10} {'ms/step':>10} {'tok/s':>12}")
     for b, t in shapes:
@@ -485,7 +496,8 @@ def main() -> int:
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--suite", default="",
-                    help="comma list: decode-kv,prefill,kv-reuse,spec,train,accuracy"
+                    help="comma list: decode-kv,prefill,kv-reuse,spec,train,train-full,"
+                         "accuracy"
                          " (default: all applicable)")
     ap.add_argument("--source", default=None, help="27B checkpoint dir (omit for tiny/CPU)")
     ap.add_argument("--gpu", type=int, default=None)
@@ -551,6 +563,11 @@ def main() -> int:
                            args.spec_depth)
         elif s == "train":
             suite_train(gate, backend, args.source, args.gpu)
+        elif s == "train-full":
+            # Its own suite name, not a shape of `train`: 50.1 GiB of bf16
+            # masters and a frozen fp4 base cannot share one card, so the two
+            # arms have to be separate processes.
+            suite_train(gate, backend, args.source, args.gpu, full=True)
         elif s == "accuracy":
             if args.source is None:
                 print("  (accuracy needs --source, skipped)")
