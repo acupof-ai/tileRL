@@ -4,6 +4,73 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-30 — verdict: TP works, and a capturable all-reduce is its entry ticket
+
+- First successful TP=4 run on the 27B, eager both sides: **1.44x at B=1**
+  (10.9 -> 15.7 tok/s) and **1.60x at B=8** (57.9 -> 92.6). Not 4x, because
+  128 all-reduces per tick cost ~2.8 ms at a measured 21.5 us small-message
+  floor that does not amortise over batch.
+- Against what SHIPS, on the same four cards, DP=4 with graph capture is
+  373.6 / 1323.6 tok/s — **TP is 14x behind**, all of it the forfeited graph.
+  `torch.distributed` collectives cannot be captured (SGLang's capture table
+  lists it as the one backend that cannot), so `Backend.all_reduce` needs a
+  pynccl-style path before TP can win anything. Not an optimisation: a
+  prerequisite.
+- Capacity is still why TP=4 x DP=2 beats TP=8 on this model — 4 KV heads
+  means TP=8 stores the cache twice, and at depth 8192 concurrent requests
+  are DP=8 826, TP=8 605, TP=4 x DP=2 1042.
+
+## 2026-08-30 — phase exit: lm_head stopped running over every position of every row
+
+- `last_only` was one bool, so it could only say "every row ends at the same
+  position". A mixed tick's decode rows end at 1 while the prefill row spans
+  the width, so it fell to False and lm_head — [248320, 5120], the largest
+  projection in the model — ran over all rows at full width.
+- Live tensors at B=32 opened with three `(3072, 248320)` f32 logits at
+  **8.53 GiB** together, for six rows of which five needed one position each.
+  Per-row lengths now. B=64 peaks at **39 GiB** where it used to OOM on 95.
+  [wins/2026-08-30-lm-head-full-width-on-mixed-ticks.md](docs/experience/wins/2026-08-30-lm-head-full-width-on-mixed-ticks.md)
+- Two more memory fixes behind it, neither yet measured on GPU: decode graphs
+  capture on a size ladder instead of per exact batch (a draining batch
+  captured up to 32 graphs), and all buckets now share ONE graph memory pool.
+
+## 2026-08-30 — phase exit: offline batch generation, one process per device
+
+- `tilerl generate` fans a prompt corpus across devices, a process each. Not
+  `DataParallelEngine`: that runs N CUDA contexts in one interpreter and
+  serialises every tick's Python half on the GIL, while 8 independent
+  processes are what measured 7.54x.
+- Prompts go in a sliding window, not all at once — `Engine.submit` allocates
+  the recurrent state slot THERE, not at admission, so the state pool bounds
+  how many may be in flight. A corpus of thousands exhausts it on line one.
+
+## 2026-08-30 — accept: TF32 for the backward's fp32 matmuls, -10.8%
+
+- `torch.backends.cuda.matmul.allow_tf32` defaults to False and the string
+  appeared nowhere in this tree, so every `@` in the eager backward ran on
+  SIMT FP32 cores: **308 of 1332 ms**, 23% of a train step, as
+  `cutlass_*_simt_sgemm` and `sm80_xmma_gemm_f32f32`.
+- Two lines. GPU-busy **1332.4 -> 1189.0 ms**. The estimate beforehand was
+  -20%; the measurement is -10.8%, and the measurement is the number.
+  [wins/2026-08-29-tf32-train-matmuls.md](docs/experience/wins/2026-08-29-tf32-train-matmuls.md)
+
+## 2026-08-30 — phase exit: the quantization parity gates were modelling kernels nothing runs
+
+- Three gates had been red on CUDA for a while: `linear_fp4`, `linear_fp4_fp8`
+  and `linear_fp8` parity. All three picked their reference with `M > 1` when
+  the dispatch boundary is `M > _MX` and `_MX` is 8, so each compared a kernel
+  against a reference for a DIFFERENT numeric path and the mismatch read as a
+  2-4% kernel error. Every kernel was at its floor against the reference it
+  actually computes.
+- A useful side finding: `linear_fp8` keeps the activation in bf16 through
+  M=8, exact to 3e-04. Only above it does the ~2.6% e4m3 activation quant
+  apply — the B=1..8 decode range is more accurate than the tests assumed.
+  [errors/2026-08-29-parity-gates-modelled-the-wrong-kernel.md](docs/experience/errors/2026-08-29-parity-gates-modelled-the-wrong-kernel.md)
+- Same shape in two more places: `test_paged_attention_vs_naive` built its KV
+  cache in f32 while the pool is bf16, and the tape gradcheck's bf16 central
+  difference disagreed with ITSELF by 128% across step sizes while the tape
+  value held to 0.4% across targets. CUDA failures 12 -> 8.
+
 ## 2026-08-29 — reject: the fp8 dX kernel (correct, but an 80-block grid)
 
 - Written to remove the last dequantized-weight materialization; it does, the
