@@ -125,7 +125,12 @@ def cmd_train(args: argparse.Namespace) -> None:
     from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
-    cfg, model = _build_model(args.model, seed=args.seed, keep_master=True)
+    # The bf16 masters are for full-parameter quantized training (the STE grad
+    # lands on them). --rl and --opd train LoRA on a FROZEN base, whose backward
+    # reads the quantized weight directly, so a master is ~27 GB the 27B never
+    # touches — and enough to fill the card on its own.
+    adapters_only = args.rl or args.opd
+    cfg, model = _build_model(args.model, seed=args.seed, keep_master=not adapters_only)
     optimizer = AdamW(lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
     gen = torch.Generator().manual_seed(args.seed)
 
