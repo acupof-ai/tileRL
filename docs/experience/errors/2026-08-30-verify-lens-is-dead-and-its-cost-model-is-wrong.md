@@ -14,21 +14,39 @@ which invites the question of why the policy did not switch it off.
 
 ## Two independent reasons it did not
 
-**1. It does not run.** `engine.py:728` calls
+**1. It did not run.** `engine.py:728` called
 `_draft_chains(decodes, trim=not self._decode_graph_on)`, and
 `_decode_graph_on = decode_graph` (`engine.py:357`), true by default on CUDA.
-`_draft_chains` then returns at `if not trim: return chains` before reaching
-`verify_lens`. Every captured tick drafts the full depth for every row,
-regardless of confidence. The policy exists, is tested, and executes only when
-graph capture is OFF — CPU, or after a capture failure.
+`_draft_chains` then returned at `if not trim: return chains` before reaching
+`verify_lens`. Every captured tick drafted the full depth for every row,
+regardless of confidence. The policy existed, was tested, and executed only
+when graph capture was OFF — CPU, or after a capture failure.
 
-That is not a bug on its own: a captured graph has one static width, so a
+That was not a bug on its own: a captured graph has one static width, so a
 per-row trim cannot survive capture, and the entry that added it says so. The
-consequence is what matters — **the arm that could have said "do not
-speculate" is the one the shipped path skips.**
+consequence is what mattered — **the arm that could have said "do not
+speculate" was the one the shipped path skipped.**
 
-**2. Its cost model does not describe these kernels.** The constants are
-imported, and labelled as such:
+> **Update, same day.** The draft-context fix
+> ([2026-08-30-draft-attention-sees-one-token.md](2026-08-30-draft-attention-sees-one-token.md))
+> replaced `_draft_chains` with `_draft_step`, which calls `verify_lens`
+> whenever `spec_depth > 1` regardless of capture. So it runs now — and
+> reason 2 makes that a no-op, which is measured, not predicted:
+>
+> | spec_depth | drafts kept per tick |
+> |---:|---:|
+> | 1 | 1.00 of 1 |
+> | 2 | 2.00 of 2 |
+> | 4 | 4.00 of 4 |
+>
+> It keeps everything, exactly as the constants imply (below), so the change
+> altered no behaviour. A policy that runs and always returns its maximum is
+> not a safety net either.
+
+**2. Its cost model does not describe these kernels**, which is why it keeps
+everything. With `bias=211` and `row=0.53`, admitting one more draft raises
+`theta` whenever its survival clears `0.53 * R / 211` — 0.26% at one row. The
+constants are imported, and labelled as such:
 
 ```python
 #: The defaults are agent-infer's H20 numbers; re-measure per target.
