@@ -95,6 +95,41 @@ is async and does not need resident warps to feed the tensor pipe.
 tensor at ~0 with 19.2% issue and 6.25% occupancy is a kernel bound by the
 dependency chain of its serial scan, which earlier entries had inferred.
 
+## The one lever left, scoped rather than gestured at
+
+GDN is 27.6% of prefill and the counters now say WHY rather than suggest it:
+`gdn_chunk_fused` runs at **6.25% occupancy, 19.2% issue, ~0% DRAM and tensor**
+— bound by the dependency chain of the serial scan it runs inside the kernel.
+
+Two things are true today that were not before:
+
+- `reference._gdn_chunk_fwd` is a chunked formulation **proven equal to the
+  serial scan to 1e-15 in f64**, written for the training backward. It is an
+  executable spec for a chunked forward KERNEL.
+- All three previous rejections of chunkwise-WY were **torch-level** and all
+  three lost for the same reason — launch overhead (0.22x / 0.38x / 0.50x at
+  chunk 16 / 32 / 64, measured again today against the rewritten code). None of
+  them tested the chunked algebra INSIDE one TileLang kernel, which is a
+  different thing: matmul shapes with one launch.
+
+Reference to port: `tilelang/examples/gdn/example_chunk_delta_h.py`. Its
+interface matches ours more than expected — `(B, S, H, DK/DV)` with DK=DV=128,
+and `use_g` / `use_initial_state` / `store_final_state` are all there.
+
+Two mismatches to plan for, not discover:
+
+1. It covers only the **inter-chunk state pass**; `W` and `U` are its INPUTS.
+   The WY/UT transform that produces them (`M = (I+L)^-1`, `U = M(bV)`,
+   `W = M(beK)`) is upstream and not in that example.
+2. It assumes **one head count**, `(B,S,H,DK)`. We have 16 key heads to 48
+   value heads. `_gdn_chunk_fwd` broadcasts with `repeat_interleave`, so a
+   literal port reads K and W 3x. That is exactly the trap in
+   [v-split-duplicates-qk](2026-08-29-v-split-duplicates-qk.md).
+
+Even at best this is bounded: halving GDN's share takes prefill 2237 -> ~2650,
+and zeroing it entirely leaves 3160 against 4022. It is the largest single item
+and it does not on its own reach the target.
+
 ## Rule
 
 State a gap as arithmetic, not as a verdict — and name which measurement the
