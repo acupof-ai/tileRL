@@ -31,17 +31,8 @@ import torch
 
 from .autograd import AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
 
-__all__ = ["train_step", "opd_loop", "pretrain", "JsonlDataset"]
-
-
-# ---------------------------------------------------------------------------
-# Causal cross-entropy
-# ---------------------------------------------------------------------------
-
-
-def _ce_loss_grad(logits: torch.Tensor, input_ids: Any, backend: Any) -> tuple[float, torch.Tensor]:
-    """Stable shifted causal CE and matching logit gradient via backend ops."""
-    return backend.cross_entropy_loss_grad(logits, input_ids)
+__all__ = ["train_step", "rl_step", "group_advantages", "grpo_loop",
+           "opd_loop", "pretrain", "JsonlDataset"]
 
 
 # ---------------------------------------------------------------------------
@@ -86,19 +77,21 @@ def _training_kv(
 # ---------------------------------------------------------------------------
 
 
-def train_step(
+def _step(
     model: Any,
     input_ids: Any,
     backend: Any,
     optimizer: AdamW,
-    tape: Tape | None = None,
-    trainable: dict[str, Any] | None = None,
+    tape: Tape | None,
+    trainable: dict[str, Any] | None,
+    grad_fn: Any,
 ) -> float:
-    """One SFT step: forward under a tape, causal CE, backward, clip, AdamW.
+    """Forward under a tape, ``grad_fn`` for the logit gradient, backward, clip,
+    AdamW. SFT and RL differ ONLY in ``grad_fn``; everything else — the tape,
+    the frozen-base filter, the finite-step rejection — is shared.
 
-    Returns the scalar loss. The step is SKIPPED (params untouched) when the
-    loss or the pre-clip grad norm is non-finite — agent-infer's
-    ``finite_optimizer_step`` semantics.
+    The step is SKIPPED (params untouched) when the loss or the pre-clip grad
+    norm is non-finite (agent-infer's ``finite_optimizer_step``).
     """
     input_ids = np.asarray(input_ids, dtype=np.int64)
     b, t = input_ids.shape
@@ -111,7 +104,7 @@ def train_step(
     with torch.no_grad(), tape:
         logits = model.forward(input_ids, positions, kv, RecordingBackend(backend))
 
-    loss, grad_logits = _ce_loss_grad(logits, input_ids, backend)
+    loss, grad_logits = grad_fn(logits, input_ids)
     if not math.isfinite(loss):
         return loss
 
@@ -135,6 +128,163 @@ def train_step(
     if math.isfinite(norm):
         optimizer.step(params.values(), grads)
     return loss
+
+
+def train_step(
+    model: Any,
+    input_ids: Any,
+    backend: Any,
+    optimizer: AdamW,
+    tape: Tape | None = None,
+    trainable: dict[str, Any] | None = None,
+) -> float:
+    """One SFT step: causal cross-entropy on ``input_ids``. Returns the loss."""
+    return _step(model, input_ids, backend, optimizer, tape, trainable,
+                 lambda logits, ids: backend.cross_entropy_loss_grad(logits, ids))
+
+
+# ---------------------------------------------------------------------------
+# GRPO
+# ---------------------------------------------------------------------------
+
+
+def group_advantages(rewards: Any, group: int) -> "np.ndarray":
+    """Group-relative advantages: within each group of ``group`` consecutive
+    rollouts of the same prompt, ``(r - mean) / std``.
+
+    This is what lets GRPO drop the critic — the group's own mean is the
+    baseline, so there is no value network and no second set of weights.
+    A group whose rewards are all equal has no signal and yields zeros rather
+    than a division by ~0.
+    """
+    r = np.asarray(rewards, dtype=np.float64).reshape(-1, group)
+    std = r.std(axis=1, keepdims=True)
+    adv = (r - r.mean(axis=1, keepdims=True)) / np.where(std > 1e-8, std, 1.0)
+    return np.where(std > 1e-8, adv, 0.0).reshape(-1)
+
+
+def rl_step(
+    model: Any,
+    input_ids: Any,
+    advantages: Any,
+    prompt_lens: Any,
+    backend: Any,
+    optimizer: AdamW,
+    tape: Tape | None = None,
+    trainable: dict[str, Any] | None = None,
+    seq_lens: Any = None,
+) -> float:
+    """One policy-gradient step on sampled sequences.
+
+    The objective is ``-mean_t A_row * log p(a_t | a_<t)`` over COMPLETION
+    tokens only. Its logit gradient is the causal-CE gradient scaled per row by
+    the advantage and zeroed on prompt positions — so this is ``train_step``
+    with one elementwise multiply, not a second training path.
+
+    ``input_ids`` [B,T] is prompt+completion per row, right-padded to a common
+    T; ``advantages`` [B]; ``prompt_lens`` [B]; ``seq_lens`` [B] is the valid
+    length of each row (default T — pass it whenever rows are padded, or the
+    padding gets gradient).
+
+    Returns the batch cross-entropy: a DIAGNOSTIC (how likely the sampled
+    tokens were), not the objective — the objective is the advantage-weighted
+    one whose gradient this step applies.
+
+    Strictly on-policy: one update per rollout, so the importance ratio is 1
+    and there is no clipping term.
+    # ponytail: single-update REINFORCE-with-baseline; add the PPO ratio+clip
+    # when a rollout is reused for more than one step.
+    """
+    adv = torch.as_tensor(np.asarray(advantages, dtype=np.float32))
+    plen = np.asarray(prompt_lens, dtype=np.int64)
+    slen = None if seq_lens is None else np.asarray(seq_lens, dtype=np.int64)
+
+    def grad_fn(logits, ids):
+        b, t, _ = logits.shape
+        loss, grad = backend.cross_entropy_loss_grad(logits, ids)
+        dev = grad.device
+        # Position i predicts token i+1: scored iff that token is a real
+        # completion token, i.e. prompt_len <= i+1 < seq_len.
+        pos = torch.arange(t, device=dev).reshape(1, t)
+        keep = pos >= torch.as_tensor(plen, device=dev).reshape(b, 1) - 1
+        if slen is not None:
+            keep = keep & (pos < torch.as_tensor(slen, device=dev).reshape(b, 1) - 1)
+        w = keep.float() * adv.to(dev).reshape(b, 1)
+        # CE averages over b*(t-1) positions; rescale to the scored count so the
+        # step size does not depend on how much prompt or padding is in the batch.
+        n = float(keep[:, :-1].sum().item())
+        grad = grad * w.unsqueeze(-1) * (b * (t - 1) / max(n, 1.0))
+        return loss, grad
+
+    return _step(model, input_ids, backend, optimizer, tape, trainable, grad_fn)
+
+
+def grpo_loop(
+    engine: Any,
+    model: Any,
+    prompts: list[Any],
+    reward_fn: Any,
+    steps: int,
+    backend: Any,
+    optimizer: AdamW | None = None,
+    *,
+    group: int = 8,
+    max_new_tokens: int = 32,
+    temperature: float = 1.0,
+    seed: int = 0,
+    trainable: dict[str, Any] | None = None,
+) -> list[tuple[float, float]]:
+    """GRPO: sample ``group`` completions per prompt, score them, take one
+    policy-gradient step on the group-normalized advantages.
+
+    The engine that generates IS the model that trains — same weights, same
+    runtime (训练推理一体), so a rollout costs a serving batch and nothing is
+    duplicated. ``reward_fn(prompt_ids, completion_ids) -> float``.
+
+    Returns per step ``(mean reward, cross-entropy of the sampled tokens)``.
+    Rollouts within a step are one engine batch: the group is what continuous
+    batching is for.
+    """
+    from .engine import SamplingParams
+
+    if optimizer is None:
+        optimizer = AdamW(lr=1e-5)
+    out: list[tuple[float, float]] = []
+    for step in range(steps):
+        prompt = np.asarray(prompts[step % len(prompts)], dtype=np.int64)
+        # Distinct seeds, one batch: identical seeds would make the group a
+        # single sample repeated, and every advantage exactly zero.
+        ids = [
+            engine.submit(prompt.tolist(), SamplingParams(
+                temperature=temperature, max_new_tokens=max_new_tokens,
+                seed=seed + step * group + g))
+            for g in range(group)
+        ]
+        done: dict[int, list[int]] = {}
+        for _ in range(10000):  # one forward per tick; bounded guard
+            engine.step()
+            done.update(engine.poll())
+            if all(i in done for i in ids):
+                break
+        else:  # pragma: no cover - engine bug, not a training path
+            raise RuntimeError("grpo_loop: rollout did not finish within 10000 ticks")
+        comps = [done[i] for i in ids]
+        rewards = [float(reward_fn(prompt, c)) for c in comps]
+        adv = group_advantages(rewards, group)
+        # Right-pad to one rectangle: padding sits past every prompt_len, and
+        # the advantage mask is what keeps it out of the gradient.
+        width = max(len(c) for c in comps)
+        batch = np.stack([
+            np.concatenate([prompt, np.asarray(c, dtype=np.int64),
+                            np.zeros(width - len(c), dtype=np.int64)])
+            for c in comps
+        ])
+        plens = np.full(group, len(prompt), dtype=np.int64)
+        slens = np.array([len(prompt) + len(c) for c in comps], dtype=np.int64)
+        ce = rl_step(model, batch, adv, plens, backend, optimizer,
+                     trainable=trainable, seq_lens=slens)
+        out.append((float(np.mean(rewards)), ce))
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -133,6 +133,33 @@ def cmd_train(args: argparse.Namespace) -> None:
         f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
         f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}"
     )
+    if args.rl:
+        from .engine import build_engine
+        from .model import add_lora
+
+        # The engine that samples IS the model that trains — one runtime, one
+        # set of weights. LoRA keeps the trainable set small enough that a
+        # rollout and its update share a card.
+        engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8)
+        trainable = add_lora(model, rank=args.lora_rank)
+        half = cfg.vocab_size // 2
+        # Demo reward: dense, so an untrained policy's group has variance and
+        # GRPO has a gradient at step 0. A real task swaps this callable out.
+        def reward(prompt, completion):
+            return sum(1 for t in completion if t < half) / max(len(completion), 1)
+
+        prompts = [
+            torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist()
+            for _ in range(4)
+        ]
+        optimizer.lr = args.lr
+        hist = train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend,
+                                   optimizer, group=args.group,
+                                   max_new_tokens=args.max_new_tokens,
+                                   seed=args.seed, trainable=trainable)
+        for i, (r, ce) in enumerate(hist):
+            print(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}")
+        return
     if args.opd:
         from .engine import build_engine
         from .model import add_lora
@@ -305,11 +332,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_serve.set_defaults(func=cmd_serve)
 
     p_train = sub.add_parser("train", help="train a model on random-token batches")
-    p_train.add_argument("--model", choices=["tiny"], default="tiny")
+    # qwen38-27b loads from TILERL_QWEN38_SOURCE; --rl trains LoRA on the frozen
+    # fp4 base, which is what fits one card.
+    p_train.add_argument("--model", choices=["tiny", "qwen38-27b"], default="tiny")
     p_train.add_argument("--steps", type=int, default=20)
     p_train.add_argument("--seed", type=int, default=0)
     p_train.add_argument("--opd", action="store_true",
                          help="on-policy distillation: the engine rolls out, LoRA adapters train")
+    p_train.add_argument("--rl", action="store_true",
+                         help="GRPO: the engine samples a group per prompt, a reward scores "
+                              "them, the group mean is the baseline (no critic)")
+    p_train.add_argument("--group", type=int, default=8, help="rollouts per prompt (--rl)")
+    p_train.add_argument("--max-new-tokens", type=int, default=32, help="rollout length (--rl)")
+    p_train.add_argument("--lr", type=float, default=1e-3)
     p_train.add_argument("--lora-rank", type=int, default=16)
     p_train.add_argument("--draft", help="draft head safetensors: speculative rollout (--opd)")
     p_train.add_argument("--depth", type=int, default=2, help="drafts per row per tick")
