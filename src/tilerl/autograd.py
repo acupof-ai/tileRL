@@ -557,8 +557,12 @@ class Adafactor:
     streams = True
 
     @staticmethod
-    def _rms(t: torch.Tensor) -> float:
-        return float(t.norm() / math.sqrt(t.numel()))
+    def _rms(t: torch.Tensor) -> torch.Tensor:
+        """RMS as a DEVICE tensor. ``float()`` here would be a host sync per
+        parameter, and ``step_one`` runs interleaved with backward, so each one
+        drains the pipeline mid-step — the same cost clip_grad_norm's on-device
+        accumulation already removed."""
+        return t.norm() / math.sqrt(t.numel())
 
     def begin(self) -> None:
         """Advance the step counter once, before any :meth:`step_one`."""
@@ -600,21 +604,21 @@ class Adafactor:
             v = st[0]
             v.mul_(b2).add_(u, alpha=1.0 - b2)
             upd = g * torch.rsqrt(v)
-        rms = self._rms(upd)
-        if not math.isfinite(rms):
-            return  # a non-finite gradient skips this param, not the step
-        upd.div_(max(1.0, rms / self.clip))
+        #: clip to RMS <= self.clip. nan_to_num is what replaces the old early
+        #: return on a non-finite gradient: a nan or inf RMS makes the factor
+        #: nan or 0, and either way the update lands as zeros.
+        upd = torch.nan_to_num(upd.mul_(self.clip / self._rms(upd).clamp(min=self.clip)))
         p32 = p.to(torch.float32)
         #: relative step: the update is scaled by the parameter's own size,
         #: so one lr works across tensors of very different magnitude.
-        step = self.lr * max(self.eps[1], self._rms(p32))
+        step = self._rms(p32).clamp(min=self.eps[1]).mul(self.lr)
         if self.weight_decay > 0.0:
             p32.mul_(1.0 - step * self.weight_decay)
         if self.beta1 > 0.0:
             m = st[-1]
             m.mul_(self.beta1).add_(upd, alpha=1.0 - self.beta1)
             upd = m
-        p.copy_(p32.add_(upd, alpha=-step).to(p.dtype))
+        p.copy_(p32.sub_(upd.mul(step)).to(p.dtype))
 
 
 def cosine_warmup(step: int, total: int, warmup: int, lr: float) -> float:
