@@ -958,7 +958,7 @@ def make_linear_fp4_gemv_sm70(target: str):
         N, K = T.const("N, K")
         micro = 16  # 8 packed bytes = one 128-bit load; must divide `block`
         block_K = reduce_thread * micro
-        X: T.Tensor((1, K), "bfloat16")
+        X: T.Tensor((1, K), "float32")
         WQ: T.Tensor((N, K // 2), "uint8")
         Scale: T.Tensor((N, K // block), "float32")
         OScale: T.Tensor((N,), "float32")
@@ -968,7 +968,7 @@ def make_linear_fp4_gemv_sm70(target: str):
             kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
             ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
             n = bx * n_partition + ni
-            X_local = T.alloc_local((micro,), "bfloat16")
+            X_local = T.alloc_local((micro,), "float32")
             WQ_local = T.alloc_local((micro // 2,), "uint8")
             acc = T.alloc_local((1,), "float32")
             reduced = T.alloc_local((1,), "float32")

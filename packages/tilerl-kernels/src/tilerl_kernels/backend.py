@@ -203,6 +203,12 @@ class Backend:
             self.device = torch.device("cpu")
         self.precision = "bf16"
         self.arch = _arch_for(target)
+        # Kernel I/O dtype. bf16 tensor cores exist only on sm90 among our cells;
+        # sm70's MMA is fp16-only and the rest of its cell is the CPU f32 source,
+        # so a bf16-IO cast would hand bf16 to an f32 kernel (the class of bug
+        # that dropped tokens on the sm70 fallback). "CUDA" is not "has bf16":
+        # only sm90 takes bf16 IO; cpu/metal/sm70 take f32.
+        self.io = torch.bfloat16 if self.arch == "sm90" else torch.float32
         self._kernels: dict[str, object] = {}
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
         self._const_f32_cache: dict[tuple[int, int | None], tuple[Any, int, torch.Tensor]] = {}
@@ -264,9 +270,9 @@ class Backend:
         return inv
 
     def _rows(self, x: torch.Tensor):
-        # sm90 kernels are bf16-IO, CPU/metal f32; cast once at the boundary.
-        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
-        return x.shape[:-1], self._c(self._dev(x, io).reshape(-1, x.shape[-1]))
+        # sm90 kernels are bf16-IO; cpu/metal/sm70 are f32. self.io carries it
+        # (sm70 is cuda but has no bf16 tensor core — see Backend.__init__).
+        return x.shape[:-1], self._c(self._dev(x, self.io).reshape(-1, x.shape[-1]))
 
     def _epilogue(self, y2, oscale, lead, n: int):
         # ponytail: torch epilogue for the per-row scale, fold into the kernel
