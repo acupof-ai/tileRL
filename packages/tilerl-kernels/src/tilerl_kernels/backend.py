@@ -127,6 +127,41 @@ class Backend:
     #: Backend identity (mirrors testing.RefBackend.name; used for logging).
     name = "tilelang"
 
+    #: Tensor-parallel group size (1 = no TP). Set by :meth:`init_tp`.
+    tp_world = 1
+    tp_rank = 0
+
+    def init_tp(self, world: int, rank: int) -> None:
+        """Join the NCCL group this rank's shard all-reduces over.
+
+        Communication lives here, not above: the framework layers call
+        ``backend.all_reduce`` and never import torch.distributed themselves.
+        """
+        if world == 1:
+            return
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            # gloo is the CPU target's group: the TP parity gate runs here.
+            comm = "nccl" if self.device.type == "cuda" else "gloo"
+            dist.init_process_group(comm, world_size=world, rank=rank)
+        self.tp_world, self.tp_rank = world, rank
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        """Sum ``x`` across the TP group, in place. Identity when TP is off.
+
+        Row-parallel projections leave each rank with a partial sum; this is
+        where the shards become the real activation. Measured floor on 6 H20s
+        is 21.5 us per call and flat from 20 KB to 1.3 MB, so the cost is per
+        LAYER, not per byte - it does not amortize over batch.
+        """
+        if self.tp_world == 1:
+            return x
+        import torch.distributed as dist
+
+        dist.all_reduce(x)
+        return x
+
     def __init__(self, target: str):
         self.target = target
         if target == "metal":
