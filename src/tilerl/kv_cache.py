@@ -388,10 +388,14 @@ class KvTier:
     #   latency bites; raw bf16 spill, fp8 tier-quant is 2x capacity if SSD fills
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, min_tokens: int = 2048) -> None:
         import shutil
 
         self._dir = os.fspath(path)
+        # min_tokens is per-tier: an SSD tier wants a churn floor (small entries
+        # are not worth a disk write); a pinned-DRAM tier can set it near 0
+        # (reload beats recompute at any length). The store reads it off the tier.
+        self.min_tokens = min_tokens
         shutil.rmtree(self._dir, ignore_errors=True)
         os.makedirs(self._dir, exist_ok=True)
 
@@ -401,12 +405,17 @@ class KvTier:
     def _st(self, key: int) -> str:
         return os.path.join(self._dir, f"{key & _MASK64:016x}.st")
 
-    def spill_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> None:
+    def spill_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> bool:
+        # Returns True if this tier accepted the spill. A capacity-bounded tier
+        # (e.g. a pinned-DRAM L1) returns False when full so the store falls to
+        # the next tier or drops — refuse-and-pass-down, expressed in the
+        # contract rather than bolted on. The SSD tier here always accepts.
         # Block is a strided slice pool.k_pool[:, b] of shape [planes,heads,BT,hd];
         # stack the span and move to CPU once (same copy template as cow_for_append).
         k = torch.stack([pool.k_pool[:, b] for b in blocks]).contiguous().cpu()
         v = torch.stack([pool.v_pool[:, b] for b in blocks]).contiguous().cpu()
         torch.save({"k": k, "v": v}, self._kv(key))
+        return True
 
     def load_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> None:
         d = torch.load(self._kv(key), map_location="cpu")
@@ -480,7 +489,6 @@ class PrefixStore:
         pool: PagedKvPool,
         capacity: int = 4096,
         tier: "KvTier | None" = None,
-        tier_min_tokens: int = 2048,
         tier_capacity: int = 256,
     ) -> None:
         self._pool = pool
@@ -493,9 +501,9 @@ class PrefixStore:
         self._entries: dict[int, list[_Entry]] = {}
         self._by_id: dict[int, _Entry] = {}
         self._fifo: deque[int] = deque()
-        # SSD tier + its cold index (blocks freed, bytes on disk keyed by e.h).
+        # SSD tier + its cold index (blocks freed, bytes on disk keyed by e.h);
+        # the spill floor is the tier's own (tier.min_tokens), per-tier.
         self._tier = tier
-        self.tier_min_tokens = tier_min_tokens
         self.tier_capacity = tier_capacity
         self._cold: dict[int, list[_Entry]] = {}
         self._cold_fifo: deque[int] = deque()
@@ -594,12 +602,18 @@ class PrefixStore:
         chain.remove(entry)
         if not chain:
             del self._entries[entry.h]
-        # Spill to the tier when it's wired and the prefix is big enough to be
-        # worth the SSD write; else drop it entirely (today's path).
-        if self._tier is not None and len(entry.tokens) >= self.tier_min_tokens:
-            self._tier.spill_kv(entry.h, entry.blocks, self._pool)
-            for b in entry.blocks:
-                self._pool.free_block(b)
+        # Offer to the tier when wired and the prefix clears the tier's own
+        # churn floor; the tier may still refuse (a capacity-bounded L1 that is
+        # full), in which case we drop it as today. spill_kv reads the blocks,
+        # so it runs before free_block.
+        spilled = (
+            self._tier is not None
+            and len(entry.tokens) >= self._tier.min_tokens
+            and self._tier.spill_kv(entry.h, entry.blocks, self._pool)
+        )
+        for b in entry.blocks:
+            self._pool.free_block(b)
+        if spilled:
             if self.on_demote is not None:
                 self.on_demote(entry.tokens, entry.h)  # engine spills the GDN snapshot
             entry.blocks = ()
@@ -608,8 +622,6 @@ class PrefixStore:
             self._evict_cold_if_needed()
         else:
             self._by_id.pop(eid)
-            for b in entry.blocks:
-                self._pool.free_block(b)
             if self.on_evict is not None:
                 self.on_evict(entry.tokens, entry.h)
         self.evictions += 1

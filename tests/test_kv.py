@@ -360,9 +360,9 @@ def test_tier_spill_reload_roundtrip(tmp_path):
     from tilerl.kv_cache import KvTier
 
     pool = PagedKvPool(8, 1, 4)
-    tier = KvTier(str(tmp_path / "kvt"))
-    # tier_min_tokens=0 so any prefix spills; tier_capacity high enough to keep it.
-    store = PrefixStore(pool, capacity=1, tier=tier, tier_min_tokens=0, tier_capacity=8)
+    tier = KvTier(str(tmp_path / "kvt"), min_tokens=0)
+    # min_tokens=0 so any prefix spills; tier_capacity high enough to keep it.
+    store = PrefixStore(pool, capacity=1, tier=tier, tier_capacity=8)
 
     # Prefix A: two blocks of known KV.
     a = [pool.alloc_block() for _ in range(2)]
@@ -402,8 +402,8 @@ def test_tier_min_tokens_gates_spill(tmp_path):
     from tilerl.kv_cache import KvTier
 
     pool = PagedKvPool(8, 1, 4)
-    tier = KvTier(str(tmp_path / "kvt"))
-    store = PrefixStore(pool, capacity=1, tier=tier, tier_min_tokens=999, tier_capacity=8)
+    tier = KvTier(str(tmp_path / "kvt"), min_tokens=999)
+    store = PrefixStore(pool, capacity=1, tier=tier, tier_capacity=8)
     a = [pool.alloc_block()]
     store.insert(list(range(16)), a)
     store.insert(list(range(100, 116)), [pool.alloc_block()])
