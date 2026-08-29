@@ -211,22 +211,33 @@ class PagedKvPool:
         The engine guarantees those positions land on blocks owned exclusively
         by the request (tail blocks on prefill, the fresh append block on
         decode), so shared prefix blocks are never written.
-        Torch-loop fallback for arches without the ``write_tokens`` scatter
-        kernel (the sm90 backend op replaces it — its per-token ``int()``
-        syncs make this loop uncapturable).
-        # ponytail: per-token python loop, vectorized scatter day-2
+        Torch fallback for arches without the ``write_tokens`` scatter kernel —
+        the CPU target, and any cell that has not registered it yet.
+
+        Indexed, not looped: the per-token ``int(block_table[...])`` this
+        replaced was ``b * seq_q`` host syncs PER LAYER, so a 512-token prefill
+        chunk of the 27B cost 8192 of them a tick. The two remaining are one
+        ``tolist()`` each for the whole batch.
+        # ponytail: 2 syncs/layer, not 0 — dropping them needs a mask instead
+        # of a per-row length, which is the kernel's job on a cell that has one.
         """
         b, t, _, _ = k.shape
         sql = getattr(kv, "seq_q_lens", None)
         plane = self._plane[layer_idx]
+        dev = self.k_pool.device
+        lens = [t] * b if sql is None else sql.tolist()
+        ends = kv.seq_len.tolist()
         for bi in range(b):
-            sq = t if sql is None else int(sql[bi])
-            base = int(kv.seq_len[bi]) - sq
-            for ti in range(sq):
-                pos = base + ti
-                blk = int(kv.block_table[bi, pos // BLOCK_TOKENS])
-                self.k_pool[plane, blk, :, pos % BLOCK_TOKENS, :] = k[bi, ti]
-                self.v_pool[plane, blk, :, pos % BLOCK_TOKENS, :] = v[bi, ti]
+            sq = int(lens[bi])
+            # pos indexes the block table first, so it starts on ITS device;
+            # the pool may live on another (a CPU-resident table with an mps
+            # pool is the metal parity path).
+            pos = torch.arange(int(ends[bi]) - sq, int(ends[bi]),
+                               device=kv.block_table.device)
+            blk = kv.block_table[bi, pos // BLOCK_TOKENS].to(dev)
+            off = (pos % BLOCK_TOKENS).to(dev)
+            self.k_pool[plane, blk, :, off, :] = k[bi, :sq].to(self.k_pool.dtype)
+            self.v_pool[plane, blk, :, off, :] = v[bi, :sq].to(self.v_pool.dtype)
 
     # ------------------------------------------------------ queries/admission
 
