@@ -169,6 +169,43 @@ The fix therefore has to cut TOTAL load instructions, not widen them:
 across the warp — which is the Marlin design, but for this reason rather than
 the register one this entry originally gave.
 
+## The other fp4 decode GEMM already in the tree loses too
+
+`linear_fp4_fp8_decode` (fp4 -> e4m3 dequant into an fp8 WGMMA) is registered
+for the decode bucket but unreachable, because the mma8 branch takes
+`2 <= M <= _MX` first. Nobody had compared them at M=8. Setting `_MX = 7` makes
+M=8 fall through, which is the whole A/B:
+
+| N x K | mma8 | w4a8 | | rel mma8 | rel w4a8 |
+|---|---:|---:|---:|---:|---:|
+| 8192x5120 | 38.8 us | 49.6 | 1.28x slower | 2.8e-03 | 3.8e-02 |
+| 5120x6144 | 33.3 | 44.4 | 1.33x | 2.2e-03 | 3.5e-02 |
+| 17408x5120 | 67.0 | 88.9 | 1.33x | 2.2e-03 | 3.6e-02 |
+| 5120x17408 | 76.9 | 106.3 | 1.38x | 2.3e-03 | 4.2e-02 |
+| 10240x5120 | 46.6 | 60.1 | 1.29x | 2.3e-03 | 3.8e-02 |
+| 6144x5120 | 27.7 | 39.1 | 1.41x | 2.1e-03 | 3.5e-02 |
+
+Slower AND 16x less accurate (it quantizes the ACTIVATION to e4m3 as well).
+The shipped dispatch is right.
+
+## What is left, and what it is worth
+
+The fp8 twin `tl_fp8_mma_rows` already loads `v2.u32` — 8 bytes per lane —
+where the fp4 one loads `u32`. That is the same diagnosis from another angle:
+fp8's mma8/gemv ratio is 2.07x against fp4's 2.64x.
+
+So the remaining change is to widen fp4's weight load to 8 bytes, which needs
+the lane -> k map re-cut (a lane would own 16 fp4 values spanning two chunks,
+and the A fragment has to use the same permutation — the kernel already relies
+on a "virtual k" permutation, so this is legal, just fiddly).
+
+**Worth estimating before building, since three attempts on this kernel have
+already failed:** halving the weight loads takes requests from 1.41M toward
+~0.9M, so ~1.5x fewer, predicting the kernel at ~48 us against 69.5. That is
+B=8 decode 311 -> ~400 tok/s (1.3x), and speculation's per-width cost 8.9 ->
+~6.5 ms — **still above the 6.0 ms break-even**. A real win, not a
+goal-flipping one.
+
 ## Rule
 
 A correlation is not a diagnosis, and the counter that settles it is usually
