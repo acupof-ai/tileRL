@@ -4,6 +4,21 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-29 — phase exit: full fine-tuning of the 27B fits one card
+
+- Three arithmetic blockers, settled by adding up the ledger rather than
+  profiling: Adam's m+v is **200.4 GiB** against 50.1 GiB of bf16 weights;
+  every weight gradient coexisting is another **50.1 GiB**, forced by
+  `clip_grad_norm`'s global norm; and `keep_master` held the served bytes
+  beside the masters for **14.9 GiB** the forward never reads.
+- Adafactor (factored second moment, 0.03 GiB) clips each update itself, so no
+  global norm is needed and every gradient is consumed and freed inside
+  backward. `drop_quantized()` frees the dead bytes at the training entry
+  points — `load_hf` stays a bit-exact round trip.
+- Measured B=1 T=64: materialize 50.10, forward 51.80, **backward peak 73.20 of
+  95 GiB**, and backward returns to 50.37 — no gradient outlives its update.
+  [wins/2026-08-29-full-finetune-fits.md](docs/experience/wins/2026-08-29-full-finetune-fits.md)
+
 ## 2026-08-29 — phase exit: the embedding table stops being resident three times
 
 - The gather kernel demanded an f32 table, so the 27B's bf16 [248320, 5120]
