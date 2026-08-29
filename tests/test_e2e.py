@@ -1052,3 +1052,28 @@ def test_speculation_reproduces_greedy_decode():
     finally:
         eng.verify_lens = orig
     assert trimmed == base, f"trimmed chain changed the output: {trimmed} != {base}"
+
+
+def test_generate_fans_a_corpus_across_workers(tmp_path):
+    """Offline batch generation: every prompt comes back, exactly once, with
+    output. Runs the real subprocess path on one device - the stride, the
+    per-worker file and the merge are what break silently."""
+    import json
+
+    from tilerl.generate import generate
+
+    src = tmp_path / "prompts.jsonl"
+    with open(src, "w") as f:
+        for i in range(5):
+            f.write(json.dumps({"token_ids": [3 + i, 7, 11, 13]}) + "\n")
+    out = tmp_path / "out.jsonl"
+
+    stats = generate(str(src), str(out), devices=[0], source=None, max_new_tokens=3,
+                     max_batch=4)
+
+    assert stats["prompts"] == 5 and stats["rows"] == 5, stats
+    with open(out) as f:
+        rows = [json.loads(x) for x in f]
+    assert sorted(r["index"] for r in rows) == list(range(5)), "a prompt was lost or doubled"
+    assert all(r["finished"] and r["output_ids"] for r in rows), rows
+    assert not list(tmp_path.glob("*.part*")), "per-worker parts must be cleaned up"

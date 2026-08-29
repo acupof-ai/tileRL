@@ -25,7 +25,7 @@ import torch
 
 from tilerl.config import qwen36_27b
 from tilerl.engine import SamplingParams, build_engine
-from tilerl.model import load_hf
+from tilerl.model import _fuse_projections, load_hf
 from tilerl.tensor_parallel import shard_params, tp_config
 from tilerl_kernels.backend import Backend, resolve_target
 
@@ -72,10 +72,15 @@ def main() -> None:
     backend = Backend(resolve_target())
     backend.init_tp(world, rank)
 
-    model = load_hf(full, args.source, num_layers=args.layers, fuse_projections=True)
+    # Sharding runs on UNFUSED params: fusing the already-local q/k/v shards
+    # afterwards gives the layout the fused kernels want, and needs no
+    # segment bookkeeping. Fusing first would make every rank slice across
+    # the q|k|v boundary.
+    model = load_hf(full, args.source, num_layers=args.layers, fuse_projections=(world == 1))
+    cfg = tp_config(full, world)
     if world > 1:
         model.params = shard_params(model.params, full, rank, world)
-    cfg = tp_config(full, world)
+        _fuse_projections(cfg, model.params)
     if args.layers != full.num_layers:
         from dataclasses import replace
         cfg = replace(cfg, num_layers=args.layers,
