@@ -1052,6 +1052,49 @@ def _spec_run(prompt, n, draft=None, depth=3):
     return out, engine.stats()
 
 
+@pytest.mark.xfail(
+    reason="the draft attends over a 1-token chain-local KV; "
+           "docs/experience/errors/2026-08-30-draft-attention-sees-one-token.md",
+    strict=True,
+)
+def test_draft_head_attends_over_the_whole_prefix():
+    """The draft's KV must cover every position up to the one it drafts at.
+
+    This is the gate the feature never had. Every other spec test is a
+    CORRECTNESS gate, and a context-starved draft is correct — a draft is
+    accepted only when it equals what the trunk sampled, so a bad guess costs
+    throughput and never output. That is why `seq_len = 1` survived a day of
+    green tests while `scripts/draft_check.py`, which runs the head over the
+    whole sequence, reported 84.4% agreement against the loop's 55.8%.
+
+    A softmax over one position is 1.0, so with `seq_len = 1` the attention
+    output is v(self) and the layer's attention parameters do nothing.
+    """
+    cfg = tiny()
+    model = build_random(cfg, seed=7)
+    draft = _random_draft(cfg, 21, model)
+    engine = build_engine(
+        cfg, model, get_backend(), num_blocks=16, num_slots=4, max_batch=4,
+        max_total_tokens=512, draft=draft, spec_depth=1,
+    )
+    seen: list[tuple[int, int]] = []
+    inner = draft.forward
+
+    def spy(hidden, ids, positions, kv, backend, hidden_out=None):
+        seen.append((int(kv.seq_len[0]), int(positions[0][0])))
+        return inner(hidden, ids, positions, kv, backend, hidden_out=hidden_out)
+
+    draft.forward = spy
+    rid = engine.submit([3, 4, 5, 6], SamplingParams(temperature=0.0, max_new_tokens=6, seed=0))
+    _drain(engine, [rid], 6)
+    assert seen, "the draft never ran"
+    ctx, pos = seen[-1]
+    assert ctx == pos + 1, (
+        f"draft at absolute position {pos} attended over {ctx} token(s); "
+        "it must see the whole prefix"
+    )
+
+
 def test_speculation_reproduces_greedy_decode():
     """The whole correctness gate for spec decode: with a draft attached the
     engine must emit token-for-token what it emits without one. Covers the
