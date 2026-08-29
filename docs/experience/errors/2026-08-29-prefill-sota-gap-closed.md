@@ -1,7 +1,8 @@
-# Prefill: the last cheap lever is closed, and the gap is arithmetic — 2026-08-29
+# Prefill: the last cheap lever is closed; the gap is two kernel projects — 2026-08-29
 
-> Status: Closed. Prefill stays at 2237 tok/s against sglang's 4022 on the same
-> batch, and the remaining distance is not tuning.
+> Status: the cheap levers are closed. Prefill is 2237 tok/s. What that is
+> "behind" depends on which sglang row you pick, and the answer is not one
+> number — see "What the target actually is" below.
 
 ## Why this was re-measured
 
@@ -28,13 +29,41 @@ C=64 it is half the fused kernel. **The rejection holds for the rewritten code.*
 backward it replaced ran ~28 launches per TIME STEP, so chunking cut launches
 there; the forward it competes with is already one fused kernel per layer.)
 
+## What the target actually is
+
+`2026-08-28-vs-sglang-h20.md` is the source of the 4022, and reading it again
+changes the framing twice:
+
+| | prefill tok/s (len 512, B=1) |
+|---|---:|
+| tileRL, native NVFP4+FP8 | **2237** |
+| sglang bf16 | 2512 |
+| sglang online fp8 | 4022 |
+
+- **Against sglang's bf16 we are at 0.89x, not 0.56x.** I have been quoting the
+  fp8 row as "the" target without saying which row it is.
+- sglang **cannot run NVFP4 on Hopper at all** (`NotImplementedError: Current
+  platform does not support w4a4 nvfp4`), so both of its rows are a
+  dequantized-to-bf16 checkpoint — and that checkpoint **emits garbage**
+  (MMLU 0/1000, completions like `'束'`). That entry says so itself and asks
+  for the numbers to be re-confirmed once the conversion is fixed. Our 2237 is
+  on weights that score correctly.
+
+So it is a kernel-shape comparison, which is still worth having, but "we are
+1.80x off SOTA" overstates what was measured.
+
 ## The gap, as arithmetic
 
-- Prefill is 913.9 ms where sglang's rate implies 509 ms.
+Taking the fp8 row at face value anyway, since it is the fastest thing measured
+on this card:
+
+- Prefill is 913.9 ms where 4022 tok/s implies 509 ms.
 - GDN is 27.6% of it. **Delete the GDN kernel entirely — set it to zero — and
   prefill reaches 3160 tok/s, still short of 4022.**
-- So closing the gap needs a near-perfect linear-attention kernel AND about
-  1.36x more from the GEMMs, which already run at 59% of fp8 peak.
+- So closing it needs a near-perfect linear-attention kernel AND about 1.36x
+  more from the GEMMs, which run at 59% of fp8 peak. sglang's own fp8 prefill
+  is 1.6x its bf16 prefill on identical math, which is where to look: the gap
+  is concentrated in fp8 GEMM efficiency, not spread everywhere.
 
 Every cheap lever on the GDN kernel has now been measured and rejected:
 chunkwise-WY (three times, two implementations), the V split (duplicates the
@@ -47,7 +76,12 @@ cheap fix moves which resource binds without moving the time.
 
 ## Rule
 
-State a gap as arithmetic, not as a verdict. "Not SOTA" invites another round
-of tuning; "zeroing the single largest kernel still leaves you 21% short"
-names what would actually have to change — a different linear-attention
-algorithm, or different hardware — and stops the search honestly.
+State a gap as arithmetic, not as a verdict — and name which measurement the
+target came from. "Not SOTA" invites another round of tuning; "zeroing the
+single largest kernel still leaves you 21% short" names the size of what is
+left. But I also wrote that this needs "an algorithm or a machine, not tuning",
+and that was overreach: two hard kernel projects (a linear-attention kernel
+that is not register-limited, and fp8 GEMMs at 80% of peak instead of 59%)
+are hard, not impossible. A comparison whose baseline runs a checkpoint that
+emits garbage deserves the caveat carried with the number, every time it is
+quoted.
