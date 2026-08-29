@@ -905,3 +905,32 @@ def test_fp4_twiddle_round_trip():
     tw = twiddle_fp4(wq)
     assert tw.shape == wq.shape and not torch.equal(tw, wq)
     assert torch.equal(untwiddle_fp4(tw), wq)
+
+def test_frozen_bwd_chunking_matches_whole():
+    """Chunked dX must equal the one-shot result for both quant formats.
+
+    The chunking is what keeps lm_head's backward from peaking 14.2 GiB, and
+    an fp8 scale covers a 128-row block — a chunk boundary that splits a block
+    reads the wrong scale, which no throughput number would reveal.
+    """
+    from tilerl_kernels import reference as ref
+
+    torch.manual_seed(0)
+    n, k = 1024, 256
+    osc, g = torch.rand(n) + 0.5, torch.randn(3, 5, n)
+    cases = [
+        ((torch.randn(n, k) * 0.3).to(torch.float8_e4m3fn),
+         torch.rand(-(-n // 128), -(-k // 128)) + 0.5, True),
+        (torch.randint(0, 255, (n, k // 2), dtype=torch.uint8),
+         torch.rand(n, k // 16) + 0.5, False),
+    ]
+    for wq, scale, fp8 in cases:
+        big = ref._BWD_SLICE_BYTES
+        try:
+            ref._BWD_SLICE_BYTES = 1 << 30
+            whole = ref.linear_frozen_bwd(g, wq, scale, oscale=osc, fp8=fp8)
+            ref._BWD_SLICE_BYTES = 4096  # forces several chunks
+            part = ref.linear_frozen_bwd(g, wq, scale, oscale=osc, fp8=fp8)
+        finally:
+            ref._BWD_SLICE_BYTES = big
+        assert torch.allclose(whole, part, rtol=1e-4, atol=1e-4), f"fp8={fp8}"

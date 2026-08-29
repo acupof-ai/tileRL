@@ -4,6 +4,22 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-29 — phase exit: the frozen-weight backward stops materializing lm_head
+
+- Attributing the backward peak per op named a single culprit: one
+  `linear_fp8_frozen` call peaked **14.209 GiB** where every other op in the
+  model is under 0.12. Its fp8 branch has no tilelang kernel, so it eagerly
+  materialized the whole [248320, 5120] weight in f32 — twice, once more to
+  fold `oscale` in.
+- `oscale` now folds into the [M, N] gradient (where the fp4 kernel path
+  already puts it) and the weight is dequantized 512 MiB at a time. The chunk
+  step is a multiple of the scale's row granularity — an fp8 scale covers 128
+  rows, so a naive row slice silently reads the wrong scale.
+- Op peak **14.209 -> 2.054 GiB**, and every LoRA shape got FASTER as well:
+  1x64 **50.3 -> 57.7 tok/s, 47.0 -> 31.0 GB**; 2x256 **178.2 -> 194.7,
+  76.5 -> 67.7**.
+  [wins/2026-08-29-frozen-bwd-chunked.md](docs/experience/wins/2026-08-29-frozen-bwd-chunked.md)
+
 ## 2026-08-29 — phase exit: full fine-tuning of the 27B fits one card
 
 - Three arithmetic blockers, settled by adding up the ledger rather than

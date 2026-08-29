@@ -172,13 +172,39 @@ def linear_bwd(
 # ---------------------------------------------------------------- linear fp4
 
 
+#: Bytes of dequantized weight linear_frozen_bwd will materialize at once.
+#: The whole lm_head is [248320, 5120] f32 = 4.74 GiB, and materializing it
+#: (twice, with the oscale fold) made this one call peak 14.2 GiB — every other
+#: backward op in a 27B step peaks under 0.12.
+_BWD_SLICE_BYTES = 1 << 29
+
+
 def linear_frozen_bwd(grad, wq, scale, oscale=None, fp8=False):
     """dX through a frozen quantized weight (LoRA / OPD base): no weight grad,
-    so the base never needs a bf16 master — the only way the 27B fits one card."""
-    w = dequant_fp8(wq, scale) if fp8 else dequant_fp4(wq, scale)
+    so the base never needs a bf16 master — the only way the 27B fits one card.
+
+    dX contracts over N, so the weight is materialized — but a slice at a time.
+    ``oscale`` scales weight ROW n, so it folds into the [M, N] gradient rather
+    than the [N, K] weight, which is where the fp4 kernel path already puts it.
+    # ponytail: no tilelang fp8 dequant kernel yet (fp4 has one) — this is the
+    # eager path, chunked.
+    """
+    g = _f32(grad).reshape(-1, grad.shape[-1])
     if oscale is not None:
-        w = w * _f32(oscale).reshape(-1, 1)
-    return _f32(grad) @ w
+        g = g * _f32(oscale).reshape(1, -1)
+    n, k = wq.shape[0], wq.shape[1] * (1 if fp8 else 2)
+    # fp4 scales one weight row each; fp8 scales a 128-row block. Slice on the
+    # scale's own row granularity so a chunk boundary never splits a block.
+    rows = -(-n // scale.shape[0])
+    step = max(1, _BWD_SLICE_BYTES // (k * 4) // rows) * rows
+    out = None
+    for i in range(0, n, step):
+        end = min(i + step, n)
+        sc = scale[i // rows: -(-end // rows)]
+        w = dequant_fp8(wq[i:end], sc) if fp8 else dequant_fp4(wq[i:end], sc)
+        part = g[:, i:end] @ w
+        out = part if out is None else out.add_(part)
+    return out.reshape(*grad.shape[:-1], k)
 
 
 def dequant_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
