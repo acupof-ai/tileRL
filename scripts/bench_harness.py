@@ -179,6 +179,10 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.kv_cache import BLOCK_TOKENS
 
+    # 2 planes (K, V) x 16 full-attn layers x 4 kv heads x 256 dim x 2 bytes.
+    _KV_BYTES_PER_TOKEN = 2 * len(cfg.full_attn_layers) * cfg.num_kv_heads * cfg.head_dim * 2
+    _KV_BUDGET = 60 << 30  # 96 GiB card - 23 weights - working set
+
     print("\n=== decode-vs-KV-depth (tok/s, higher=better; should DROP with depth) ===")
     print(f"  {'depth':>7} {'B':>3} {'ms/tick':>9} {'tok/s/req':>10} {'agg tok/s':>10}"
           f" {'spread':>8}")
@@ -194,7 +198,10 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
             # 2x headroom (the prefix store pins finished prompts) up to 32K; at
             # 128K/256K the KV alone is 17/34 GB, so 1.1x and one row per pool.
             head = 2 if depth <= 32768 else 1.1
-            if depth * b * head > 294912:  # ~38 GB of KV + 23 GB weights on a 96 GB H20
+            # KV lives on the 16 full-attn layers only, not all 64: 64 KiB per
+            # token, not the 128 KiB this guard used to assume. The old cap
+            # called 32768x8 (32 GiB) too big for a 96 GiB card.
+            if depth * b * head * _KV_BYTES_PER_TOKEN > _KV_BUDGET:
                 print(f"  {depth:>7} {b:>3}   (skipped: KV pool would exceed one H20)")
                 continue
             need = int(head * (-(-(depth + gen) * b // BLOCK_TOKENS) + b))
