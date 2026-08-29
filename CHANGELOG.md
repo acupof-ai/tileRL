@@ -19,7 +19,12 @@ verdict**. Newest first.
   scaled per row by the advantage.
 - Gated algebraically, not just end to end: A=1 must equal an SFT step
   parameter-for-parameter, A=0 must be an exact no-op. Reward on the tiny model
-  goes 0.17 -> 1.00 in seven steps through the real engine.
+  goes 0.17 -> 1.00 in seven steps through the real engine, and on the **27B**
+  (LoRA rank 16, group 4, H20) **0.406 -> 1.000 in five**.
+- Two fixes were needed to make that run mean anything: the rollout was
+  sampling from an earlier policy (prefix cache + captured graph both cache
+  across an update), and adapter-only training carried ~27 GB of bf16 masters
+  it never reads, which OOM'd the card at 95.21 GiB (now 59.8).
   [wins/2026-08-29-grpo.md](docs/experience/wins/2026-08-29-grpo.md)
 - Training THROUGHPUT is unchanged and its root cause is recorded separately:
   491K kernels a step, 62% of them micro-ops from `gdn_backward`'s
