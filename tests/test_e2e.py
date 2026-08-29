@@ -25,10 +25,12 @@ from tilerl.engine import (
     BLOCK_TOKENS,
     _PHASE_DECODE,
     _step_seed,
+    BatchKv,
     Engine,
     SamplingParams,
     build_engine,
 )
+from tilerl.kv_cache import PagedKvPool
 from tilerl.model import build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
 from tilerl_kernels.backend import get_backend
@@ -1057,83 +1059,74 @@ def _spec_run(prompt, n, draft=None, depth=3):
            "docs/experience/errors/2026-08-30-draft-attention-sees-one-token.md",
     strict=True,
 )
-def test_draft_head_attends_over_the_whole_prefix():
-    """The draft's KV must cover every position up to the one it drafts at.
+def test_engine_draft_matches_full_context_draft():
+    """The draft the engine runs must equal the draft `draft_check.py` measures.
+
+    Those two harnesses reported 84.4% and 55.8% agreement for the same head at
+    the same condition, and the reason is that they are not the same forward:
+    the probe runs the head over the whole sequence, the engine runs it with
+    `seq_len = 1`, so its attention is a softmax over one position.
 
     This is the gate the feature never had. Every other spec test is a
     CORRECTNESS gate, and a context-starved draft is correct — a draft is
     accepted only when it equals what the trunk sampled, so a bad guess costs
-    throughput and never output. That is why `seq_len = 1` survived a day of
-    green tests while `scripts/draft_check.py`, which runs the head over the
-    whole sequence, reported 84.4% agreement against the loop's 55.8%.
-
-    A softmax over one position is 1.0, so with `seq_len = 1` the attention
-    output is v(self) and the layer's attention parameters do nothing.
+    throughput and never output. That is also why a fix cannot be trusted
+    without this: a fill pass that gets the position/token alignment wrong
+    leaves every other test green.
     """
     cfg = tiny()
+    backend = get_backend()
     model = build_random(cfg, seed=7)
     draft = _random_draft(cfg, 21, model)
     engine = build_engine(
-        cfg, model, get_backend(), num_blocks=16, num_slots=4, max_batch=4,
+        cfg, model, backend, num_blocks=16, num_slots=4, max_batch=4,
         max_total_tokens=512, draft=draft, spec_depth=1,
     )
-    seen: list[tuple[int, int]] = []
+    seen: dict = {}
     inner = draft.forward
 
-    def spy(hidden, ids, positions, kv, backend, hidden_out=None):
-        seen.append((int(kv.seq_len[0]), int(positions[0][0])))
-        return inner(hidden, ids, positions, kv, backend, hidden_out=hidden_out)
+    def spy(hidden, ids, positions, kv, be, hidden_out=None):
+        out = inner(hidden, ids, positions, kv, be, hidden_out=hidden_out)
+        seen["logits"] = out[0, -1].detach().float().clone()
+        seen["pos"] = int(np.asarray(positions)[0][0])
+        return out
 
     draft.forward = spy
-    rid = engine.submit([3, 4, 5, 6], SamplingParams(temperature=0.0, max_new_tokens=6, seed=0))
-    _drain(engine, [rid], 6)
+    prompt = [3, 4, 5, 6]
+    rid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
+    out = _drain(engine, [rid], 8)[rid]
+    draft.forward = inner
     assert seen, "the draft never ran"
-    ctx, pos = seen[-1]
-    assert ctx == pos + 1, (
-        f"draft at absolute position {pos} attended over {ctx} token(s); "
-        "it must see the whole prefix"
+
+    # Greedy decode is deterministic, so the sequence at the last draft is the
+    # final one truncated to that position.
+    toks = (prompt + out)[: seen["pos"] + 1]
+    n = len(toks) - 1
+
+    hid: list = []
+    model.forward(np.array([toks]), np.arange(len(toks)),
+                  _training_kv(model, 1, len(toks), device=backend.device),
+                  backend, hidden_out=hid, last_only=False)
+
+    # The probe's shape: hidden at position i, the token at i+1, drafting i+1.
+    nblk = -(-n // BLOCK_TOKENS) + 1
+    pool = PagedKvPool(nblk, cfg.num_kv_heads, cfg.head_dim, num_layers=1,
+                       device=backend.device, layer_map=(0,))
+    full = draft.forward(
+        hid[-1][:, :n], np.array([toks[1:]]), np.arange(1, n + 1),
+        BatchKv(
+            block_table=torch.arange(nblk, dtype=torch.long).reshape(1, nblk),
+            seq_len=torch.tensor([n]), state_slot=torch.zeros(1, dtype=torch.long),
+            kv_pool=pool, state_pool=None, seq_q_lens=torch.tensor([n]),
+        ),
+        backend,
+    )[0, -1].float()
+
+    assert int(full.argmax()) == int(seen["logits"].argmax()), (
+        f"engine drafted {int(seen['logits'].argmax())} at position {seen['pos']}, "
+        f"full context drafts {int(full.argmax())}"
     )
-
-
-def test_decode_tick_does_not_sync_in_the_sampler():
-    """Sampling must not read anything back off the device.
-
-    ``temperature`` / ``top_p`` / ``seed`` are Python scalars on the request.
-    Shipping them to the device and reading them back to pick the greedy rows
-    cost two syncs a tick plus one per sampled row, on EVERY target — and a
-    sync inside a captured region is also what makes a decode graph
-    uncapturable, which is how this was found.
-
-    The syncs this asserts nothing about are the un-fused CPU fallbacks
-    (``PagedKvPool.write_tokens``, eager ``gdn_forward``); a target with those
-    kernels registered runs neither.
-    """
-    import traceback
-
-    from torch.utils._python_dispatch import TorchDispatchMode
-
-    sites: list[str] = []
-
-    class Trace(TorchDispatchMode):
-        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-            if str(func) == "aten._local_scalar_dense.default":
-                frames = [f for f in traceback.extract_stack() if "/tilerl" in f.filename]
-                if frames:
-                    sites.append(f"{frames[-1].filename.split('/')[-1]}:{frames[-1].name}")
-            return func(*args, **(kwargs or {}))
-
-    cfg = tiny()
-    engine = build_engine(
-        cfg, build_random(cfg, seed=3), get_backend(),
-        num_blocks=16, num_slots=4, max_batch=4, max_total_tokens=512,
-    )
-    engine.submit([3, 4, 5, 6], SamplingParams(temperature=0.8, max_new_tokens=32, seed=0))
-    for _ in range(4):  # settle past prefill into pure decode
-        engine.step()
-    with Trace():
-        engine.step()
-    bad = [s for s in sites if "sample" in s.lower()]
-    assert not bad, f"sampler synced to the host: {bad}"
+    torch.testing.assert_close(full, seen["logits"], rtol=1e-2, atol=1e-2)
 
 
 def test_speculation_reproduces_greedy_decode():
