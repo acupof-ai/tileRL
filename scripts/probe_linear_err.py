@@ -55,6 +55,17 @@ def main() -> None:
         report(f"linear_fp4 M={M:<2} vs fp8ref", got, ref4)
         report(f"linear_fp4 M={M:<2} vs f32ref", got, ref_f32)
 
+    # native fp8: M=1 GEMV, 2.._MX mma8, above that the plan's tiled kernel.
+    from test_ops_parity import _linear_fp8_ref, _quantize_fp8
+
+    torch.manual_seed(26)
+    for M, N, K in ((1, 128, 256), (4, 128, 256), (8, 128, 256), (16, 128, 256),
+                    (8, 256, 128), (4, 256, 128)):
+        w8, wscale = _quantize_fp8(torch.randn(N, K) * 0.1)
+        xf = torch.randn(M, K) * 0.5
+        got = b.linear_fp8(xf, w8, wscale)
+        report(f"linear_fp8 M={M:<2} N={N} K={K}", got, _linear_fp8_ref(xf, w8, wscale))
+
     # What the kernel is allowed to lose: the same product in bf16 vs f32.
     for M, N, K in ((6, 24, 32), (8, 128, 256), (64, 512, 1024)):
         g = torch.Generator().manual_seed(0)

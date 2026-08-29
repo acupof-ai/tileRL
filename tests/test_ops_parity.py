@@ -328,7 +328,8 @@ def test_linear_fp8_parity(backend):
     served through a per-call master fallback."""
     torch.manual_seed(26)
     kset = _resolve(backend.precision, backend.arch)
-    for M, N, K in [(8, 128, 256), (4, 256, 128)]:
+    # Cover both regimes: the boundary is _MX, not M>1 (see below).
+    for M, N, K in [(8, 128, 256), (4, 256, 128), (_MX + 8, 128, 256)]:
         w8, wscale = _quantize_fp8(torch.randn(N, K) * 0.1)
         x = torch.randn(M, K) * 0.5
         if "linear_fp8" not in kset:
@@ -336,12 +337,22 @@ def test_linear_fp8_parity(backend):
                 backend.linear_fp8(x, w8, wscale)
             continue
         out = backend.linear_fp8(x, w8, wscale)
-        # M=1 is the GEMV; 2.._MX the mma8 kernel; above that the plan's
-        # tiled kernel. All three are fp8, so the identical-quant reference is
-        # right for every M>1 - unlike linear_fp4, where M>_MX changes the
-        # quantization itself.
-        kernel_path = backend.target.startswith("cuda") and M > 1
-        ref = _linear_fp8_ref(x, w8, wscale) if kernel_path else reference.linear_fp8(x, w8, wscale)
+        # The ACTIVATION precision changes at _MX, and that is what the
+        # reference has to follow. Measured (scripts/probe_fp8_quant.py):
+        #
+        #   M     vs w8a8    vs w8a16
+        #   1     2.53e-02   3.66e-03      <- bf16 activation
+        #   4     2.24e-02   2.96e-04
+        #   8     2.46e-02   3.19e-04
+        #   16    4.04e-03   2.57e-02      <- e4m3 activation
+        #   32    2.65e-03   2.63e-02
+        #
+        # M <= _MX keeps the activation in bf16 (w8a16) and is exact to 3e-04;
+        # only above it does the per-token e4m3 quant cost its ~2.6%. Gating
+        # M=4 and M=8 against the w8a8 reference charged them a quantization
+        # they never paid.
+        w8a8 = backend.target.startswith("cuda") and M > _MX
+        ref = _linear_fp8_ref(x, w8, wscale) if w8a8 else reference.linear_fp8(x, w8, wscale)
         _assert_close(out, ref, f"linear_fp8 M={M} N={N} K={K}")
 
 
