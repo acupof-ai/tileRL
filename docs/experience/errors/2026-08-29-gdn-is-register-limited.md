@@ -94,3 +94,52 @@ and the third quietly refuted the framing by showing arithmetic still matters.
 None of that would have surfaced from writing the K split and measuring the
 result, which would have said only "slower" and left the reason open, exactly
 as the three chunkwise rewrites did.
+
+## It is not register-limited. It is SPILLING.
+
+`ncu --metrics l1tex__t_sectors_pipe_lsu_mem_local_op_{ld,st}.sum` on one
+T=128 launch:
+
+| | sectors |
+|---|---:|
+| local loads | 4,535,040 |
+| local stores | 4,141,824 |
+| global loads | 5,441,472 |
+
+**Local-memory traffic exceeds global.** 8.7M sectors is ~278 MB of spill
+traffic for a single launch. The per-thread state column is not in registers at
+all — it is in local memory, which is global memory backed by L1.
+
+This is the whole story, and it makes every earlier observation fall out:
+
+- **The 11x against the FMA estimate**: each state access is a memory access,
+  not a register access. The arithmetic was never the cost.
+- **255 registers/thread**: ptxas spent the cap trying to hold it and still
+  spilled.
+- **Halving `state_local` changed nothing**: 64 floats spill as surely as 128
+  once everything else is resident.
+- **Why the shipped win still measured +21.6%**: local memory is L1-cached, so
+  it genuinely beat the explicit-global baseline it was compared against. The
+  comparison was to something worse, not to registers, and the name "local
+  state column (registers/L1)" then made the spill invisible for four days.
+
+## What Follows
+
+Two directions, both now motivated by a measurement rather than a guess:
+
+1. **Split the state column across threads** so each holds 32-64 floats and
+   actually fits. Needs a 2- or 4-thread reduction for `k·S` and `q·S` through
+   shared memory — warp primitives are off the table (AGENTS.md: block-parallel
+   only).
+2. **Put it in shared memory deliberately, with a padded layout.** A shared
+   state tile was tried once and was 1.7x slower "LDS bank conflicts" — that is
+   a layout problem, not a verdict on the approach, and 128 threads x 128 floats
+   is 64 KB, which fits.
+
+## Rule, third part
+
+"In registers" is a claim about the generated code, not about the source. A
+local array large enough to spill is a memory access with a register's syntax.
+When an optimisation's mechanism is residency, verify it with the spill
+counters — not with the A/B against whatever it replaced, which only proves it
+beat that.
