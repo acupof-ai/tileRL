@@ -1,8 +1,10 @@
 # Speculative decoding — REJECTED: measured against the eager path, not the shipped one
 
-> Status: Rejected on throughput. The engine keeps the code (correct, gated,
-> and off unless a draft is passed). Graph capture of speculative ticks landed
-> and is worth 3x on the tick — still 0.61x of plain graph decode at B=1.
+> Status: Rejected on throughput, twice, the second time after the M-row GEMV
+> made the verify cheaper. The engine keeps the code (correct, gated, and off
+> unless a draft is passed). The blocker is the width-2 verify tick, not the
+> draft: at B=1 it costs 1.97x a width-1 tick and returns 1.12 tokens, so a
+> free draft still loses.
 
 ## Context
 
@@ -80,6 +82,39 @@ Five hypotheses about this cost have now been measured and refuted (PCIe
 migration, weight dtype, weight format, the dict rebinding, the draft loop's
 syncs). Stopping here: the code is correct and gated, a draft is opt-in, and
 the remaining work is to find where ~10 ms per draft step actually goes.
+
+## Settled: even a free draft loses (2026-08-29, second pass)
+
+The M-row GEMV cut the verify's linear cost, which moved the earlier ratios up
+enough to be worth re-deriving. I predicted depth-1 at B=1 would turn positive
+(1.06x) from three measured pieces: a 17.54 ms W=2 verify replay, a draft step
+captured at 0.67 ms (2.59x off eager, bit-identical), and 71.8% acceptance.
+
+**Measured 0.57x.** The prediction was wrong the same way this entry's original
+claim was wrong: the 17.54 ms came from `profile_verify_replay`, which builds
+the graph with `keep=0`. A real verify tick uses `keep=W` — it writes the
+recurrent state after every chain step — and costs 21.17 ms at B=1, not 17.54.
+Adding numbers from two configurations is the exact error this file exists to
+record, and it produced a 1.9x optimistic estimate.
+
+Same process, both arms, `bench_harness --suite spec`:
+
+| B | depth | plain | spec | ratio | accept | tok/tick |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 92.9 | 52.7 | **0.57x** | 55.8% | 1.12 |
+| 8 | 1 | 311.6 | 46.1 | **0.15x** | 58.8% | 1.05 |
+
+The verdict no longer depends on the draft at all. At B=1 a chain of TWO costs
+21.17 ms against 10.76 for a chain of one — **1.97x the tick for 1.12 tokens**.
+Set the draft's cost to zero and it is still 0.63x. The captured draft step was
+reverted: it is a real 2.59x on the draft half, and the draft half is not what
+decides this.
+
+Open, and not chased: `tok/tick` is 1.12 at 55.8% acceptance where depth 1
+should give ~1.56. Either the acceptance counter or the commit disagrees with
+`tokens_generated`. It does not change the verdict (1.56 tokens in 21.17 ms is
+73.6 tok/s, still under 92.9) but it should be resolved before anyone trusts
+the acceptance column.
 
 ## Rule
 
