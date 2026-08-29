@@ -750,6 +750,58 @@ def test_gdn_chunk_matches_decode(backend):
     _assert_close(cwin, dwin, "chunk-vs-decode window")
 
 
+def test_gdn_chunk_adjoint_is_exact():
+    """The chunked backward is the EXACT adjoint of the chunked forward: in f64
+    it matches autograd to ~1e-15, so any f32 gap is reduction order and not
+    algebra. Guards the 25-term hand derivation term by term."""
+    torch.manual_seed(3)
+    b, n, h, dk, dv = 2, 6, 3, 5, 4
+    f64 = dict(dtype=torch.float64)
+    q = torch.randn(b, n, h, dk, **f64)
+    k = torch.nn.functional.normalize(torch.randn(b, n, h, dk, **f64), dim=-1)
+    v = torch.randn(b, n, h, dv, **f64)
+    gt = -torch.rand(b, n, h, **f64) * 0.5
+    bt = torch.rand(b, n, h, **f64)
+    st = torch.randn(b, h, dk, dv, **f64)
+    leaves = [x.clone().requires_grad_(True) for x in (q, k, v, bt, gt, st)]
+    out, nxt, _ = reference._gdn_chunk_fwd(*leaves)
+    dout, dnxt = torch.randn_like(out), torch.randn_like(nxt)
+    ((out * dout).sum() + (nxt * dnxt).sum()).backward()
+    _, _, cache = reference._gdn_chunk_fwd(q, k, v, bt, gt, st)
+    got = reference._gdn_chunk_bwd(dout, dnxt, q, k, v, bt, cache)
+    # _gdn_chunk_bwd returns (dq, dk, dv, dbeta, dgt, dS); leaves are in the
+    # forward's argument order (q, k, v, beta, gt, state).
+    for name, g, leaf in zip(["q", "k", "v", "beta", "gt", "state"], got, leaves):
+        rel = (g - leaf.grad).abs().max() / leaf.grad.abs().max().clamp_min(1e-30)
+        assert rel < 1e-12, f"chunk adjoint d{name}: rel {rel:.2e}"
+
+
+def test_gdn_bwd_spans_chunks():
+    """The shipped gradcheck runs at T=3, which never leaves the first chunk.
+    This one spans several, including a partial tail, and holds the error to the
+    level the serial scan it replaced achieved (~3-9e-7)."""
+    for t in (reference._GDN_CHUNK, 2 * reference._GDN_CHUNK + 5):
+        q, k, v, g, beta, z, state, kw = _gdn_inputs(1, t, 2, 2, 8, 8, 8, 24)
+        window = torch.zeros_like(kw["conv_window"])
+        order = ("conv1d_weight", "dt_bias", "a_log", "norm_weight")
+
+        def fwd(*leaves):
+            qq, kk, vv, gg, bb, ss, zz = leaves[:7]
+            return reference.gdn_forward(qq, kk, vv, gg, bb, ss, z=zz,
+                                         conv_window=window,
+                                         **dict(zip(order, leaves[7:])))[0]
+
+        def bwd(go, *args):
+            qq, kk, vv, gg, bb, ss, zz = args[:7]
+            return reference.gdn_backward(go, qq, kk, vv, gg, bb, ss, z=zz,
+                                          conv_window=window,
+                                          **dict(zip(order, args[7:])))
+
+        _autograd_gradcheck(f"gdn_bwd t={t}", fwd, bwd,
+                            [q, k, v, g, beta, state, z] + [kw[n] for n in order],
+                            max_rel=5e-5)
+
+
 def test_gdn_bwd():
     """gdn_backward vs torch.autograd on gdn_forward. The tape is hand-written
     and this is the only direct gate on the gated-delta gradients; finite

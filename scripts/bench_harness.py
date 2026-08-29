@@ -364,6 +364,23 @@ def suite_accuracy(gate, source, n):
     gate.check("accuracy", f"mmlu-{total}", pct, unit="%")
 
 
+def torch_oom():
+    """The OOM exception type, or a never-raised one off CUDA."""
+    import torch
+
+    return getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+
+
+def _free(backend) -> None:
+    import gc
+
+    import torch
+
+    gc.collect()
+    if backend.device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def suite_train(gate, backend, source, gpu):
     """train_step fwd+bwd tok/s. Tiny on CPU; 27B when a source is given."""
     import numpy as np
@@ -409,7 +426,14 @@ def suite_train(gate, backend, source, gpu):
     print(f"  {'B x T':>10} {'ms/step':>10} {'tok/s':>12}")
     for b, t in shapes:
         ids = np.arange(1, b * t + 1, dtype=np.int64).reshape(b, t) % cfg.vocab_size
-        train_step(mdl, ids, backend, opt, trainable=trainable)  # warm (JIT + tape shapes)
+        try:
+            train_step(mdl, ids, backend, opt, trainable=trainable)  # warm (JIT+tape shapes)
+        except torch_oom() as exc:
+            # The shape that does not fit is a RESULT — it is where training on
+            # one card stops — not a reason to lose the rows already measured.
+            print(f"  {f'{b}x{t}':>10} {'OOM':>10}  {str(exc).split('.')[0]}")
+            _free(backend)
+            continue
         samples = []
         for _ in range(3):
             sync()

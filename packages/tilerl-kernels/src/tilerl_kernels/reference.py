@@ -470,6 +470,118 @@ def linear_attn_bwd(
     return gdn_backward(grad, q, k, v, g, beta, state, **kw)
 
 
+#: Chunk length of the gated-delta scan: the sequential dimension becomes
+#: t/_GDN_CHUNK. 16, not the upstream 64, for PRECISION — the chunked form is
+#: the same algebra (equal to the serial scan to 1e-15 in f64) but a different
+#: f32 reduction order, and its worst relative error against autograd grows with
+#: the chunk. Measured over 3 shapes x 3 seeds vs the serial backward's 3-9e-7:
+#:   C=16 -> 4-12e-7 (1.3-2.2x)   C=32 -> 1.1-2.3e-6   C=64 -> 1.9-4.9e-6
+_GDN_CHUNK = 16
+
+
+def _gdn_chunk_fwd(qc, kc, vc, bc, gtc, s):
+    """One chunk of the gated-delta recurrence, plus every intermediate its
+    adjoint needs. ``qc``/``kc`` [B,n,HV,DK] (L2-normed, already broadcast to
+    value heads), ``vc`` [B,n,HV,DV], ``bc``/``gtc`` [B,n,HV], ``s`` [B,HV,DK,DV].
+
+    The chunk matrices are [B,HV,n,*]: G is the chunk-local inclusive cumsum of
+    the log decay, ``M = (I+L)^-1`` is the UT transform that carries the
+    intra-chunk term the serial form keeps in the state.
+    """
+    n = qc.shape[1]
+    gc = gtc.cumsum(1)
+    e = torch.exp(gc)
+    gp = gc.permute(0, 2, 1)
+    # clamp before exp: gt <= 0 makes G non-increasing, so every entry the masks
+    # keep has a non-positive difference; the discarded upper triangle would
+    # overflow to inf and the mask would turn it into NaN.
+    D = torch.exp((gp.unsqueeze(-1) - gp.unsqueeze(-2)).clamp(max=0.0))
+    dev, dt = qc.device, qc.dtype
+    low = torch.tril(torch.ones(n, n, dtype=dt, device=dev), -1)
+    tri = torch.tril(torch.ones(n, n, dtype=dt, device=dev))
+    KK = torch.einsum("bihd,bjhd->bhij", kc, kc)
+    bp = bc.permute(0, 2, 1).unsqueeze(-1)
+    eye = torch.eye(n, dtype=dt, device=dev)
+    # I+L is unit lower triangular for any input, so the solve needs no pivoting.
+    M = torch.linalg.solve_triangular(eye + bp * KK * D * low, eye.expand(KK.shape),
+                                      upper=False, unitriangular=True)
+    bV = bp * vc.permute(0, 2, 1, 3)
+    beK = (bc * e).permute(0, 2, 1).unsqueeze(-1) * kc.permute(0, 2, 1, 3)
+    U, W = M @ bV, M @ beK
+    d = U - W @ s
+    QK = torch.einsum("bihd,bjhd->bhij", qc, kc)
+    A = QK * D * tri
+    P = e.permute(0, 2, 1).unsqueeze(-1) * qc.permute(0, 2, 1, 3)
+    out = (P @ s + A @ d).permute(0, 2, 1, 3)
+    glast = gc[:, -1]
+    Rw = torch.exp((glast.unsqueeze(1) - gc).clamp(max=0.0))
+    R = Rw.permute(0, 2, 1).unsqueeze(-1) * kc.permute(0, 2, 1, 3)
+    s_next = torch.exp(glast).unsqueeze(-1).unsqueeze(-1) * s + R.transpose(-1, -2) @ d
+    return out, s_next, dict(e=e, D=D, low=low, tri=tri, KK=KK, bp=bp, M=M, bV=bV,
+                             beK=beK, W=W, d=d, QK=QK, A=A, P=P, Rw=Rw, R=R,
+                             glast=glast, s=s)
+
+
+def _gdn_chunk_bwd(dout, dS_next, qc, kc, vc, bc, c):
+    """Adjoint of :func:`_gdn_chunk_fwd`. Returns
+    (dq, dk, dv, dbeta, dgt, dS_start), all in the caller's [B,n,HV,*] layout.
+    Gradchecked term by term against autograd on the chunk forward."""
+    e, D, low, tri = c["e"], c["D"], c["low"], c["tri"]
+    KK, bp, M, W, d, QK, s = c["KK"], c["bp"], c["M"], c["W"], c["d"], c["QK"], c["s"]
+    dOc = dout.permute(0, 2, 1, 3)
+
+    # out = P s + A d
+    dP = dOc @ s.transpose(-1, -2)
+    dA = dOc @ d.transpose(-1, -2)
+    dS = c["P"].transpose(-1, -2) @ dOc
+    dd = c["A"].transpose(-1, -2) @ dOc
+    # s_next = e_n s + R^T d
+    en = torch.exp(c["glast"])
+    dS = dS + en.unsqueeze(-1).unsqueeze(-1) * dS_next
+    dR = d @ dS_next.transpose(-1, -2)
+    dd = dd + c["R"] @ dS_next
+    d_en = (s * dS_next).sum(dim=(-1, -2))
+    # d = U - W s
+    dW = -dd @ s.transpose(-1, -2)
+    dS = dS - W.transpose(-1, -2) @ dd
+    # U = M (b*V), W = M (b*e*K)
+    dM = dd @ c["bV"].transpose(-1, -2) + dW @ c["beK"].transpose(-1, -2)
+    dbV = M.transpose(-1, -2) @ dd
+    dbeK = M.transpose(-1, -2) @ dW
+    dv_ = bp * dbV
+    dbeta = (vc.permute(0, 2, 1, 3) * dbV).sum(-1)
+    dk_ = (bc * e).permute(0, 2, 1).unsqueeze(-1) * dbeK
+    kdbeK = (kc.permute(0, 2, 1, 3) * dbeK).sum(-1)
+    dbeta = dbeta + e.permute(0, 2, 1) * kdbeK
+    de = bc.permute(0, 2, 1) * kdbeK
+    # M = (I+L)^-1, L = tril(b_i <k_i,k_j> D_ij, -1)
+    dLm = (-M.transpose(-1, -2) @ dM @ M.transpose(-1, -2)) * low
+    dbeta = dbeta + (dLm * KK * D).sum(-1)
+    dKK = dLm * bp * D
+    dD = dLm * bp * KK
+    # A = tril(QK * D)
+    dAm = dA * tri
+    dQK = dAm * D
+    dD = dD + dAm * QK
+    dq = torch.einsum("bhij,bjhd->bihd", dQK, kc)
+    dk_ = dk_ + torch.einsum("bhij,bihd->bhjd", dQK, qc)
+    dk_ = dk_ + (dKK + dKK.transpose(-1, -2)) @ kc.permute(0, 2, 1, 3)
+    # P = e * q
+    dq = dq + (e.permute(0, 2, 1).unsqueeze(-1) * dP).permute(0, 2, 1, 3)
+    de = de + (qc.permute(0, 2, 1, 3) * dP).sum(-1)
+    # R = exp(G_n - G) * k
+    dk_ = dk_ + c["Rw"].permute(0, 2, 1).unsqueeze(-1) * dR
+    dRwm = (kc.permute(0, 2, 1, 3) * dR).sum(-1) * c["Rw"].permute(0, 2, 1)
+    # gates: D_ij = exp(G_i - G_j), e = exp(G), Rw = exp(G_n - G), e_n = exp(G_n)
+    dDm = dD * D
+    dG = dDm.sum(-1) - dDm.sum(-2) + de * e.permute(0, 2, 1) - dRwm
+    dG[..., -1] = dG[..., -1] + dRwm.sum(-1) + d_en * en
+    # G = cumsum(gt) over the chunk, so dgt is its reverse cumsum.
+    dgt = dG.flip(-1).cumsum(-1).flip(-1).permute(0, 2, 1)
+    return (dq, dk_.permute(0, 2, 1, 3), dv_.permute(0, 2, 1, 3),
+            dbeta.permute(0, 2, 1), dgt, dS)
+
+
 def gdn_chunk_core(qn, kn, v, gt, bt, state, chunk: int = 64):
     """The gated-delta core as a chunkwise-WY decomposition, not a serial scan.
 
@@ -492,40 +604,10 @@ def gdn_chunk_core(qn, kn, v, gt, bt, state, chunk: int = 64):
     k = kn.repeat_interleave(rep, dim=2)
     s = state.clone().float()
     core = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=v.device)
-    eye = torch.eye(chunk, device=v.device)
     for c0 in range(0, t, chunk):
-        c1 = min(c0 + chunk, t)
-        n = c1 - c0
-        qc, kc, vc = q[:, c0:c1], k[:, c0:c1], v[:, c0:c1]
-        bc = bt[:, c0:c1]
-        gc = gt[:, c0:c1].cumsum(1)  # chunk-local prefix sum, inclusive
-        eg = torch.exp(gc)  # [B,n,HV]
-        # L is strictly lower triangular, so I+L is unit lower triangular and
-        # its inverse exists for any input — no pivoting, no conditioning check.
-        kk = torch.einsum("bihd,bjhd->bhij", kc, kc)
-        # clamp before exp: gt <= 0 makes G non-increasing, so every entry the
-        # masks keep has a non-positive difference. The discarded upper triangle
-        # would otherwise overflow to inf and the mask turn it into NaN — the
-        # same reason the upstream kernels zero positive gate differences.
-        gp = gc.permute(0, 2, 1)
-        decay = torch.exp((gp.unsqueeze(-1) - gp.unsqueeze(-2)).clamp(max=0.0))
-        low = torch.tril(torch.ones(n, n, device=v.device), -1)
-        lmat = bc.permute(0, 2, 1).unsqueeze(-1) * kk * decay * low
-        m = torch.linalg.solve_triangular(eye[:n, :n] + lmat, eye[:n, :n].expand_as(lmat),
-                                          upper=False, unitriangular=True)
-        u = m @ (bc.permute(0, 2, 1).unsqueeze(-1) * vc.permute(0, 2, 1, 3))
-        w = m @ ((bc * eg).permute(0, 2, 1).unsqueeze(-1) * kc.permute(0, 2, 1, 3))
-        d = u - w @ s  # [B,HV,n,DV]
-        # out_i = e^{G_i} q_i S_c + sum_{j<=i} e^{G_i-G_j} <q_i,k_j> d_j
-        qk = torch.einsum("bihd,bjhd->bhij", qc, kc) * decay * torch.tril(
-            torch.ones(n, n, device=v.device))
-        first = (eg.permute(0, 2, 1).unsqueeze(-1) * qc.permute(0, 2, 1, 3)) @ s
-        core[:, c0:c1] = (first + qk @ d).permute(0, 2, 1, 3)
-        glast = gc[:, -1]  # [B,HV]
-        s = torch.exp(glast).unsqueeze(-1).unsqueeze(-1) * s + (
-            (torch.exp((glast.unsqueeze(1) - gc).clamp(max=0.0)).permute(0, 2, 1).unsqueeze(-1)
-             * kc.permute(0, 2, 1, 3)).transpose(-1, -2) @ d
-        )
+        sl = slice(c0, min(c0 + chunk, t))
+        core[:, sl], s, _ = _gdn_chunk_fwd(q[:, sl], k[:, sl], v[:, sl], bt[:, sl],
+                                           gt[:, sl], s)
     return core, s
 
 
@@ -712,30 +794,24 @@ def gdn_backward(
     bt = torch.sigmoid(beta).view(b, t, nvh)
     sp_in = g + dt_bias
     gt = -torch.exp(a_log) * torch.nn.functional.softplus(sp_in)
-    exp_g = torch.exp(gt)
-    # Vectorized over value heads: only the time step is sequential, and a
-    # per-head Python loop cost 48 launches per step per layer — 671K kernels
-    # in one 8-layer train step, which made the step CPU-launch-bound.
     rep = nvh // nkh
     assert nkh * rep == nvh, (nkh, nvh)  # h -> h // rep, contiguous groups
     knv = kn.repeat_interleave(rep, dim=2)  # [b,t,nvh,key_dim]
     qnv = qn.repeat_interleave(rep, dim=2)
-    states = torch.empty(b, t + 1, nvh, key_dim, val_dim, dtype=torch.float32, device=q.device)
-    ps = torch.empty(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
-    deltas = torch.empty(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
-    states[:, 0] = state
-    core = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
+    # Chunked, not a per-step scan: the sequential dimension is t/CHUNK, and
+    # only chunk-START states are kept (the interior is recomputed from one in
+    # the reverse pass). The per-step form cost ~28 launches per step per layer
+    # — 434K micro-ops in one 27B step, 62% of it
+    # (errors/2026-08-29-train-step-is-the-gdn-per-step-loop.md).
+    starts = list(range(0, t, _GDN_CHUNK))
+    chunk_states = []
     s = state.clone()
-    for step in range(t):
-        s = s * exp_g[:, step].view(b, nvh, 1, 1)
-        kst = knv[:, step]
-        p = torch.einsum("bhk,bhkv->bhv", kst, s)
-        d = (v_raw[:, step] - p) * bt[:, step].unsqueeze(-1)
-        s = s + kst.unsqueeze(-1) * d.unsqueeze(-2)
-        core[:, step] = torch.einsum("bhk,bhkv->bhv", qnv[:, step], s)
-        ps[:, step] = p
-        deltas[:, step] = d
-        states[:, step + 1] = s
+    core = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
+    for c0 in starts:
+        sl = slice(c0, min(c0 + _GDN_CHUNK, t))
+        chunk_states.append(s)
+        core[:, sl], s, _ = _gdn_chunk_fwd(qnv[:, sl], knv[:, sl], v_raw[:, sl],
+                                           bt[:, sl], gt[:, sl], s)
     rstd = torch.rsqrt(core.pow(2).mean(-1, keepdim=True) + 1e-6)
     normed = core * rstd * norm_weight
     z4 = z.view(b, t, nvh, val_dim)
@@ -750,39 +826,27 @@ def gdn_backward(
     g_norm_weight = (g_normed * xhat).sum(dim=(0, 1, 2))
     g_core = rstd * (g_y - xhat * (g_y * xhat).mean(-1, keepdim=True))
 
-    # Recurrence reverse scan. Per (b, h), with S_ = g*S_prev, p = S_^T k,
-    # d = beta*(v-p), S_t = S_ + outer(k,d), o = S_t^T q:
-    #   dS_t = dS + outer(q, go);  gd = dS_t^T k
-    #   dS_  = dS_t - beta*outer(k, gd)
-    #   gg   = sum dS_ * S_prev ;  gbeta = gd.(v-p) ;  gv = beta*gd
-    #   gk   = dS_t d - beta*S_ gd ;  dS_prev = g * dS_
+    # Recurrence reverse scan, chunked: walk the chunks backwards, recompute
+    # each one's interior from its stored start state, and thread dS through.
+    # _gdn_chunk_bwd is the adjoint of _gdn_chunk_fwd and gives dgt directly,
+    # so there is no d/d(exp_g) intermediate.
     dS = torch.zeros_like(state)
-    g_v_raw = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
-    g_bt = torch.zeros(b, t, nvh, dtype=torch.float32, device=q.device)
-    g_exp_g = torch.zeros(b, t, nvh, dtype=torch.float32, device=q.device)
-    # Same vectorization as the forward scan; the value-head grads fold back
-    # onto the key heads at the end (h -> h // rep is contiguous, so a reshape
-    # and a sum is the scatter-add).
     g_qnv = torch.zeros(b, t, nvh, key_dim, dtype=torch.float32, device=q.device)
     g_knv = torch.zeros(b, t, nvh, key_dim, dtype=torch.float32, device=q.device)
-    for step in reversed(range(t)):
-        kst, qst, gc = knv[:, step], qnv[:, step], g_core[:, step]
-        btv = bt[:, step].unsqueeze(-1)
-        eg = exp_g[:, step].view(b, nvh, 1, 1)
-        dS_t = dS + torch.einsum("bhk,bhv->bhkv", qst, gc)
-        gd = torch.einsum("bhkv,bhk->bhv", dS_t, kst)
-        g_qnv[:, step] = torch.einsum("bhkv,bhv->bhk", states[:, step + 1], gc)
-        dS_ = dS_t - btv.unsqueeze(-1) * torch.einsum("bhk,bhv->bhkv", kst, gd)
-        g_exp_g[:, step] = (dS_ * states[:, step]).sum(dim=(2, 3))
-        g_bt[:, step] = (gd * (v_raw[:, step] - ps[:, step])).sum(dim=-1)
-        g_v_raw[:, step] = btv * gd
-        g_knv[:, step] = torch.einsum("bhkv,bhv->bhk", dS_t, deltas[:, step]) - btv * torch.einsum(
-            "bhkv,bhv->bhk", eg * states[:, step], gd
-        )
-        dS = eg * dS_
+    g_v_raw = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
+    g_bt = torch.zeros(b, t, nvh, dtype=torch.float32, device=q.device)
+    g_gt = torch.zeros(b, t, nvh, dtype=torch.float32, device=q.device)
+    for i in reversed(range(len(starts))):
+        sl = slice(starts[i], min(starts[i] + _GDN_CHUNK, t))
+        _, _, cache = _gdn_chunk_fwd(qnv[:, sl], knv[:, sl], v_raw[:, sl], bt[:, sl],
+                                     gt[:, sl], chunk_states[i])
+        (g_qnv[:, sl], g_knv[:, sl], g_v_raw[:, sl], g_bt[:, sl], g_gt[:, sl],
+         dS) = _gdn_chunk_bwd(g_core[:, sl], dS, qnv[:, sl], knv[:, sl],
+                              v_raw[:, sl], bt[:, sl], cache)
+    # The value-head grads fold back onto the key heads (h -> h // rep is
+    # contiguous, so a reshape and a sum is the scatter-add).
     g_qn = g_qnv.reshape(b, t, nkh, rep, key_dim).sum(3)
     g_kn = g_knv.reshape(b, t, nkh, rep, key_dim).sum(3)
-    g_gt = g_exp_g * exp_g
     g_a_log = (g_gt * gt).sum(dim=(0, 1))
     g_sp_in = g_gt * (-torch.exp(a_log)) * torch.sigmoid(sp_in)
     g_g = g_sp_in.reshape(b, t, nvh)

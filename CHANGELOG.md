@@ -4,6 +4,23 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-29 — default flip: the gated-delta backward is chunked (CHUNK=16)
+
+- `reference.gdn_backward` looped over the time dimension twice in Python, ~28
+  launches per step per GDN layer: **491K kernels a step, 62% micro-ops**. The
+  adjoint of the chunkwise-WY form replaces both loops, so the sequential
+  dimension is `t/16` and `states`/`ps`/`deltas` are gone.
+- GPU-busy **2296 -> 1491 ms** (1.54x), kernels **491K -> 191K**. End to end on
+  the 27B: 1x256 **41.2 -> 92.0 tok/s (2.23x)**, and 2x256 now FITS at **149.5**
+  where it used to OOM — best throughput **3.63x**.
+- Chunk 16, not the upstream 64, and the reason is precision: same algebra,
+  different f32 reduction order. Gated both ways — the adjoint is exact in f64
+  (< 1e-12 vs autograd, term by term) and the f32 error is held at the serial
+  scan's level (1.3-2.2x of 3-9e-7, against 5-10x at chunk 64).
+  [wins/2026-08-29-chunked-gdn-backward.md](docs/experience/wins/2026-08-29-chunked-gdn-backward.md)
+- `gdn_chunk_core` collapsed 40 lines -> 8: forward and backward now share one
+  implementation of the algebra.
+
 ## 2026-08-29 — phase exit: reinforcement learning exists
 
 - The tree had SFT (`train_step`), corpus SFT (`pretrain`) and distillation
