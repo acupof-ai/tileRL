@@ -261,6 +261,38 @@ def cmd_pretrain(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _devices(spec: str) -> list[int]:
+    """``0-7`` or ``0,1,2`` or ``0-3,6``."""
+    out: list[int] = []
+    for part in spec.split(","):
+        if "-" in part:
+            lo, hi = part.split("-")
+            out.extend(range(int(lo), int(hi) + 1))
+        else:
+            out.append(int(part))
+    return out
+
+
+def cmd_generate(args: argparse.Namespace) -> None:
+    """Fan a prompt corpus across devices, one process each.
+
+    A process per device rather than one process with N contexts: the
+    in-process wrapper serialises every tick's Python half on the GIL, and
+    8 independent processes are what measured 7.54x on 8 H20s.
+    """
+    import json
+
+    from .generate import generate
+
+    stats = generate(
+        prompts=args.prompts, out=args.out, devices=_devices(args.devices),
+        source=args.source, max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature, top_p=args.top_p, seed=args.seed,
+        max_batch=args.max_batch,
+    )
+    print(json.dumps(stats))
+
+
 def cmd_bench(args: argparse.Namespace) -> None:
     if getattr(args, "suite", None):
         # Full harness: decode-vs-KV-depth / prefill-curve / kv-reuse / train,
@@ -404,6 +436,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--gpu", type=int, default=None, help="GPU index (harness)")
     p_bench.add_argument("--batches", default=None, help="harness decode batch sizes, e.g. 1,8")
     p_bench.set_defaults(func=cmd_bench)
+
+    p_gen = sub.add_parser(
+        "generate", help="offline batch generation, one process per device"
+    )
+    p_gen.add_argument("prompts", help="JSONL, one object per line with token_ids")
+    p_gen.add_argument("--out", required=True, help="JSONL to write")
+    p_gen.add_argument("--devices", default="0", help="CUDA indices, e.g. 0-7 or 0,1,2")
+    p_gen.add_argument("--source", default=None, help="27B checkpoint dir (omit for tiny)")
+    p_gen.add_argument("--max-new-tokens", type=int, default=128)
+    p_gen.add_argument("--temperature", type=float, default=0.0)
+    p_gen.add_argument("--top-p", type=float, default=1.0)
+    p_gen.add_argument("--seed", type=int, default=0)
+    p_gen.add_argument("--max-batch", type=int, default=32,
+                       help="concurrent requests per device")
+    p_gen.set_defaults(func=cmd_generate)
 
     return parser
 
