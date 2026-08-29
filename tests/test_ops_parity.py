@@ -258,15 +258,19 @@ def test_linear_fp4_parity(backend):
     torch.manual_seed(4)
     w_master = torch.randn(24, 32)
     wq, scale = _quantize_fp4(w_master)
-    x = torch.randn(6, 32)
-    # On CUDA M>1 dispatches to the fp8 path; gate it against the identical-
-    # quant fp8 reference (the f32 reference carries the ~2% e4m3 quant error).
-    ref = (
-        _linear_fp4_fp8_ref(x, wq, scale)
-        if backend.target.startswith("cuda")
-        else reference.linear_fp4(x, wq, scale)
-    )
-    _assert_close(backend.linear_fp4(x, wq, scale), ref, "linear_fp4")
+    # The reference has to follow the DISPATCH, not a guess at it. On CUDA the
+    # fp4 path holds through M=_MX (8) - scalar GEMV at 1, M-row GEMV to 3,
+    # mma8 to 8 - and only M>8 splits to fp8. Gating M=6 against the fp8
+    # reference compared two different quantizations and read as a 3.5e-2
+    # kernel error; against the right reference it is 3.1e-3, at the 2.1e-3
+    # floor a bf16-accumulating kernel cannot beat.
+    from tilerl_kernels.backend import _MX
+
+    for m in (6, _MX + 8):
+        x = torch.randn(m, 32)
+        fp8_path = backend.target.startswith("cuda") and m > _MX
+        ref = _linear_fp4_fp8_ref(x, wq, scale) if fp8_path else reference.linear_fp4(x, wq, scale)
+        _assert_close(backend.linear_fp4(x, wq, scale), ref, f"linear_fp4 M={m}")
 
 
 def test_linear_fp4_gemv_parity(backend):
