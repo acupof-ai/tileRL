@@ -77,6 +77,41 @@ The shipped configuration is the best of them. Relieving the register pressure
 needs a different schedule, not a different tile size — parked here, with the
 counters recorded so the next attempt starts from the binding resource.
 
+## Third refutation: the register cap is already saturated
+
+`__launch_bounds__(128, N)` injected into the generated source via tilelang's
+`register_cuda_postproc` (one process and one cache dir per arm — the postproc
+is not part of the JIT cache key, so a second arm in the same process silently
+reuses the first's binary):
+
+| blocks/SM forced | us | GB/s | rel |
+|---:|---:|---:|---|
+| as emitted | 69.5 | 802 | 2.55e-03 |
+| 2 | 69.5 | 802 | 2.55e-03 |
+| 3 | 69.5 | 802 | 2.55e-03 |
+| 4 | 69.7 | 799 | 2.55e-03 |
+| 6 | **80.4** | 693 | 2.55e-03 |
+
+2, 3 and 4 are identical because ptxas **already fits 4 blocks per SM**:
+128 threads x 128 registers = 16K of the SM's 64K, and 4 blocks x 4 warps = 16
+warps of 64 is the 21.8% ncu reported. The injection works — arm 6 proves it,
+by forcing registers under ~85 and paying 16% in spill.
+
+So the kernel sits exactly at its register-determined occupancy ceiling, and
+pushing past it loses. Three independent levers are now closed:
+
+1. **NG / G tile knobs** — every setting below the shipped one is slower.
+2. **Shared-memory weight staging** — 69.2 vs 69.6, nothing.
+3. **The register cap** — saturated, and worse when forced past.
+
+What is left is a different kernel, not a different setting: a Marlin-style
+pipeline (cp.async into shared, `ldmatrix` fragments, double-buffered) so the
+live set is not `acc + w + s + xa` in registers at once. That is a new kernel,
+and it is the ONE lever that would move both batched decode and speculation —
+speculation's break-even needs the per-width cost under 6.0 ms against 8.9
+today, and a decode GEMM flat in M is exactly what would deliver it
+([wins/2026-08-29-spec-decode-net-win.md](../wins/2026-08-29-spec-decode-net-win.md)).
+
 ## Rule
 
 A coalescing argument is a hypothesis, not a diagnosis. Two of this session's
