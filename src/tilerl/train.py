@@ -246,7 +246,10 @@ def grpo_loop(
     across steps — a stored prefix holds KV from an earlier policy, and a
     captured graph holds f32 casts of weights the optimizer updates in place —
     so either one samples from a policy that is not the current one, without
-    ever raising.
+    ever raising. The price is the eager decode path for rollouts, which is
+    ~8x slower than a replay at B=1.
+    # ponytail: recapture the graph and drop the prefix entries after each
+    # update instead of disabling both, once a rollout's decode cost matters.
 
     Returns per step ``(mean reward, cross-entropy of the sampled tokens)``.
     Rollouts within a step are one engine batch: the group is what continuous
