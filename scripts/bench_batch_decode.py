@@ -50,8 +50,11 @@ def main() -> None:
         full_attn_layers=tuple(i for i in qwen36_27b().full_attn_layers if i < args.layers),
     )
     model = load_hf(cfg, args.source, fuse_projections=args.fuse)
+    batches = [int(x) for x in args.batches.split(",")]
+    bmax = max(batches)
     engine = build_engine(
-        cfg, model, backend, num_blocks=512, num_slots=8, decode_graph=args.decode_graph,
+        cfg, model, backend, num_blocks=64 * bmax, num_slots=bmax, max_batch=bmax,
+        max_total_tokens=1024 * bmax, decode_graph=args.decode_graph,
         draft=load_draft(model, args.draft) if args.draft else None, spec_depth=args.depth,
     )
 
@@ -62,7 +65,7 @@ def main() -> None:
     )
     print(f"  {'B':>3} {'ms/tick':>9} {'tok/tick':>9} {'accept':>7} "
           f"{'per-request tok/s':>18} {'aggregate tok/s':>17}")
-    for B in (int(x) for x in args.batches.split(",")):
+    for B in batches:
         prompts = [
             torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist() for _ in range(B)
         ]

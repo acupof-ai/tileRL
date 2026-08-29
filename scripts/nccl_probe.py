@@ -23,17 +23,30 @@ def main() -> None:
     if rank == 0:
         print(f"world {world}")
         print(f"  {'bytes':>10} {'us/allreduce':>13} {'GB/s':>8} {'x64 layers ms':>14}")
-    for elems in (5120, 5120 * 8, 5120 * 64, 5120 * 512):
+    # NCCL sets up channels and protocol buffers on the first collective; a
+    # per-size warmup does not cover it, so the first size read 3x slow.
+    warm = torch.ones(5120 * 512, dtype=torch.float32, device="cuda")
+    for _ in range(20):
+        dist.all_reduce(warm)
+    torch.cuda.synchronize()
+    del warm
+    for elems in (5120 * 512, 5120 * 64, 5120 * 8, 5120):
         x = torch.ones(elems, dtype=torch.float32, device="cuda")
-        for _ in range(5):
+        for _ in range(20):
             dist.all_reduce(x)
-        torch.cuda.synchronize()
-        dist.barrier()
-        t0 = time.perf_counter()
-        for _ in range(50):
-            dist.all_reduce(x)
-        torch.cuda.synchronize()
-        us = (time.perf_counter() - t0) / 50 * 1e6
+        # Small-message rows jittered 3-5x run to run on a busy host; the
+        # floor across windows is the number TP actually gets, the jitter is
+        # other tenants.
+        wins = []
+        for _ in range(7):
+            torch.cuda.synchronize()
+            dist.barrier()
+            t0 = time.perf_counter()
+            for _ in range(50):
+                dist.all_reduce(x)
+            torch.cuda.synchronize()
+            wins.append((time.perf_counter() - t0) / 50 * 1e6)
+        us = min(wins)
         nbytes = elems * 4
         if rank == 0:
             # a tick is 2 per layer x 64 layers
