@@ -126,9 +126,27 @@ Two mismatches to plan for, not discover:
    literal port reads K and W 3x. That is exactly the trap in
    [v-split-duplicates-qk](2026-08-29-v-split-duplicates-qk.md).
 
-Even at best this is bounded: halving GDN's share takes prefill 2237 -> ~2650,
-and zeroing it entirely leaves 3160 against 4022. It is the largest single item
-and it does not on its own reach the target.
+### What it is worth, by FLOP count rather than by guess
+
+I first wrote "halving GDN's share takes prefill to ~2650", which was a guess.
+Counting the arithmetic says something stronger, and says WHY:
+
+- **Serial scan (today).** Per token per (b, value head): `p = S^T k`, the state
+  update, and `o = S^T q`, each 128x128 -> ~49K MAC. At T=512, 48 value heads,
+  48 layers that is ~115 GFLOP, and it takes 63 ms (27.6% of a 229 ms prefill)
+  = **1.8 TFLOP/s, about 1.2% of bf16 tensor peak**. Which is exactly what ncu
+  says: `sm__pipe_tensor_op_hmma` reads **0.13%** — the kernel does not use the
+  tensor cores at all. It expresses matrix products as a scalar scan.
+- **Chunked form.** `_gdn_chunk_fwd`'s nine matmuls at chunk 64 are ~11.4 MFLOP
+  per chunk per head, ~210 GFLOP for the model — **1.8x more arithmetic**, on
+  the tensor cores. At even 20% of the 148 TFLOP/s bf16 peak that is **7 ms
+  against 63**.
+
+So the GDN term is worth ~9x, not 2x: prefill 229 -> 173 ms, **2237 -> ~2960
+tok/s (1.32x)**. Still short of 4022 on its own — the GEMMs' 1.36x is the other
+half — but this is the single largest item in the tree by a wide margin, and
+the reason is not that the kernel is written badly. It is that a serial scan
+cannot reach the tensor cores, and the chunked algebra can.
 
 ## Rule
 
