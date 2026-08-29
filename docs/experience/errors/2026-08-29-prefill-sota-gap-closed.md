@@ -142,11 +142,37 @@ Counting the arithmetic says something stronger, and says WHY:
   the tensor cores. At even 20% of the 148 TFLOP/s bf16 peak that is **7 ms
   against 63**.
 
-So the GDN term is worth ~9x, not 2x: prefill 229 -> 173 ms, **2237 -> ~2960
-tok/s (1.32x)**. Still short of 4022 on its own — the GEMMs' 1.36x is the other
-half — but this is the single largest item in the tree by a wide margin, and
-the reason is not that the kernel is written badly. It is that a serial scan
-cannot reach the tensor cores, and the chunked algebra can.
+### Measured, not just counted
+
+`scripts/probe_gdn_chunk_roofline.py` times exactly those matmuls at our shapes
+(chunk 64, DK=DV=128, batched over 48 value heads) through cuBLAS `bmm` — an
+upper bound, since a hand-written kernel will not beat it on GEMM efficiency:
+
+| matmul | us | % of bf16 peak |
+|---|---:|---:|
+| KK^T, QK^T, M@bV, M@beK, A@d | 2.9-3.2 | 10.8-11.9% |
+| W@S, P@S, R^T@d | 3.6 | 18.8-19.1% |
+| **per chunk per layer** | **25.7** | **14.6%** |
+
+**T=512, 8 chunks x 48 layers: 9.9 ms against the serial kernel's 63 — 6.4x.**
+Prefill 229 -> 176 ms, **2237 -> ~2909 tok/s (1.30x)**.
+
+### And why the three previous rejections do not contradict this
+
+The torch chunkwise path measured **1123 tok/s** today at chunk 64, i.e. GDN
+costing ~290 ms. Its matmuls need 9.9. **The other ~280 ms is glue** — cumsum,
+exp, the masks, the triangular solve, the permutes, and 8 launches per chunk
+per layer.
+
+So all three rejections measured the glue, not the math. It also says exactly
+where the risk of the kernel project sits: the 6.4x is available ONLY with full
+fusion, and every bit of it has to come from putting the non-matmul work
+inside the kernel. The matmuls were never the problem and were never going to
+be the fix.
+
+Still short of 4022 on its own — the GEMMs' 1.36x is the other half — but this
+is the single largest item in the tree, and the cause is structural: a serial
+scan cannot reach the tensor cores, and the chunked algebra can.
 
 ## Rule
 
