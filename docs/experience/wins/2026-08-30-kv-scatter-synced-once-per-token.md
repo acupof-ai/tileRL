@@ -55,12 +55,21 @@ advanced-index assignment per row — no per-token scalar at all.
 The one that remains in both is the eager `gdn_forward` fallback, which a cell
 with `gdn_decode_fused` does not run.
 
-**Caveat on the count:** the probe counts `aten._local_scalar_dense` — scalar
-`int()` / `.item()`. The two `tolist()` calls that replaced the per-row
-`int(seq_q_lens[bi])` / `int(seq_len[bi])` are batch-wide D2H copies and do NOT
-appear in it. They stall too. So the honest claim is that the per-token scalar
-syncs are gone and two batch-wide transfers a layer remain, not that a layer
-now transfers nothing.
+**The scalar count is half the picture.** `aten._local_scalar_dense` sees
+`int()` / `.item()`, not `t.tolist()` — and the two `tolist()` calls that
+replaced the per-row `int(seq_q_lens[bi])` / `int(seq_len[bi])` are batch-wide
+transfers that stall just the same. `scripts/probe_syncs.py` (written for this)
+counts both, by wrapping the Tensor methods as well as watching the dispatch:
+
+| tick | scalar | bulk |
+|---|---:|---|
+| decode | 1 (eager `gdn_forward`) | 3 — `write_tokens` x2, the sampled tokens |
+| prefill | 1 | 2 — `write_tokens` |
+| train step | 1 (the loss finite-check) | 0 |
+
+So `write_tokens` still transfers **twice per full-attn layer** — 32 a tick on
+the 27B, against 8194 before, and none at all on a cell with the scatter
+kernel. Reporting "1 sync" without this table would have read as clean.
 
 Tick time: **pending-remote**. A sync costs nothing measurable on CPU.
 
