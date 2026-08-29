@@ -804,14 +804,17 @@ def gdn_backward(
     # — 434K micro-ops in one 27B step, 62% of it
     # (errors/2026-08-29-train-step-is-the-gdn-per-step-loop.md).
     starts = list(range(0, t, _GDN_CHUNK))
-    chunk_states = []
+    caches = []
     s = state.clone()
     core = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
     for c0 in starts:
         sl = slice(c0, min(c0 + _GDN_CHUNK, t))
-        chunk_states.append(s)
-        core[:, sl], s, _ = _gdn_chunk_fwd(qnv[:, sl], knv[:, sl], v_raw[:, sl],
-                                           bt[:, sl], gt[:, sl], s)
+        # Keep each chunk's intermediates instead of recomputing them in the
+        # reverse pass: one layer's worth is ~40 MB at CHUNK=16 and it is freed
+        # when this backward returns, against a second forward per chunk.
+        core[:, sl], s, cache = _gdn_chunk_fwd(qnv[:, sl], knv[:, sl], v_raw[:, sl],
+                                               bt[:, sl], gt[:, sl], s)
+        caches.append(cache)
     rstd = torch.rsqrt(core.pow(2).mean(-1, keepdim=True) + 1e-6)
     normed = core * rstd * norm_weight
     z4 = z.view(b, t, nvh, val_dim)
@@ -826,8 +829,8 @@ def gdn_backward(
     g_norm_weight = (g_normed * xhat).sum(dim=(0, 1, 2))
     g_core = rstd * (g_y - xhat * (g_y * xhat).mean(-1, keepdim=True))
 
-    # Recurrence reverse scan, chunked: walk the chunks backwards, recompute
-    # each one's interior from its stored start state, and thread dS through.
+    # Recurrence reverse scan, chunked: walk the chunks backwards over the
+    # intermediates the forward pass kept, threading dS through.
     # _gdn_chunk_bwd is the adjoint of _gdn_chunk_fwd and gives dgt directly,
     # so there is no d/d(exp_g) intermediate.
     dS = torch.zeros_like(state)
@@ -838,11 +841,9 @@ def gdn_backward(
     g_gt = torch.zeros(b, t, nvh, dtype=torch.float32, device=q.device)
     for i in reversed(range(len(starts))):
         sl = slice(starts[i], min(starts[i] + _GDN_CHUNK, t))
-        _, _, cache = _gdn_chunk_fwd(qnv[:, sl], knv[:, sl], v_raw[:, sl], bt[:, sl],
-                                     gt[:, sl], chunk_states[i])
         (g_qnv[:, sl], g_knv[:, sl], g_v_raw[:, sl], g_bt[:, sl], g_gt[:, sl],
          dS) = _gdn_chunk_bwd(g_core[:, sl], dS, qnv[:, sl], knv[:, sl],
-                              v_raw[:, sl], bt[:, sl], cache)
+                              v_raw[:, sl], bt[:, sl], caches[i])
     # The value-head grads fold back onto the key heads (h -> h // rep is
     # contiguous, so a reshape and a sum is the scatter-add).
     g_qn = g_qnv.reshape(b, t, nkh, rep, key_dim).sum(3)

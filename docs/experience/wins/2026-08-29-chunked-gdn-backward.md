@@ -23,9 +23,13 @@ Same script, 64 layers, 1x256, H20 GPU 7:
 
 | | before | after |
 |---|---:|---:|
-| GPU-busy | 2296.2 ms | **1491.3 ms** (1.54x) |
-| kernels | 491,113 | **191,449** (2.57x fewer) |
+| GPU-busy | 2296.2 ms | **1405.1 ms** (1.63x) |
+| kernels | 491,113 | **158,425** (3.10x fewer) |
 | `linear_fp4_bwd` share | 15.4% | **23.7%** |
+
+(1491.3 ms / 191,449 with the reverse pass recomputing each chunk's forward;
+keeping the intermediates the forward already produced — ~40 MB for one layer,
+freed when its backward returns — is the rest.)
 
 The real work is now the largest line in the profile, which it was not before.
 
@@ -35,13 +39,13 @@ launch count is the term that scaled with the sequence:
 
 | B x T | before | after | | peak |
 |---|---:|---:|---:|---:|
-| 1x64 | 26.5 | 43.2 | 1.63x | 47.0 GB |
-| 1x128 | 35.5 | 67.8 | 1.91x | 50.6 GB |
-| 1x256 | 41.2 | **92.0** | **2.23x** | 57.5 GB |
-| 2x256 | **OOM** | **149.5** | — | 76.5 GB |
+| 1x64 | 26.5 | 50.3 | 1.90x | 47.0 GB |
+| 1x128 | 35.5 | 80.5 | 2.27x | 50.6 GB |
+| 1x256 | 41.2 | **113.5** | **2.75x** | 57.5 GB |
+| 2x256 | **OOM** | **178.2** | — | 76.5 GB |
 | 4x256 | OOM | OOM | | |
 
-Best throughput 41.2 -> 149.5 tok/s, **3.63x**: 2x256 did not fit before,
+Best throughput 41.2 -> 178.2 tok/s, **4.32x**: 2x256 did not fit before,
 because the per-step scan's `states` tensor is 808 MB per layer at T=256 and
 chunking keeps t/16 of them.
 

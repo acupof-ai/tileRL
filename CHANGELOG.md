@@ -10,9 +10,9 @@ verdict**. Newest first.
   launches per step per GDN layer: **491K kernels a step, 62% micro-ops**. The
   adjoint of the chunkwise-WY form replaces both loops, so the sequential
   dimension is `t/16` and `states`/`ps`/`deltas` are gone.
-- GPU-busy **2296 -> 1491 ms** (1.54x), kernels **491K -> 191K**. End to end on
-  the 27B: 1x256 **41.2 -> 92.0 tok/s (2.23x)**, and 2x256 now FITS at **149.5**
-  where it used to OOM — best throughput **3.63x**.
+- GPU-busy **2296 -> 1405 ms** (1.63x), kernels **491K -> 158K** (3.1x fewer).
+  End to end on the 27B: 1x256 **41.2 -> 113.5 tok/s (2.75x)**, and 2x256 now
+  FITS at **178.2** where it used to OOM — best throughput **4.32x**.
 - Chunk 16, not the upstream 64, and the reason is precision: same algebra,
   different f32 reduction order. Gated both ways — the adjoint is exact in f64
   (< 1e-12 vs autograd, term by term) and the f32 error is held at the serial
