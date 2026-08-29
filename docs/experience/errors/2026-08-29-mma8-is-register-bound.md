@@ -1,8 +1,9 @@
-# mma8 moves bytes at 40% of the GEMV's rate; three levers closed, cause NOT established — 2026-08-29
+# mma8 moves bytes at 40% of the GEMV's rate — 1.93x the load instructions, not registers — 2026-08-29
 
-> Status: the levers are closed. The cause named in this entry's original title
-> ("register-bound") was inferred from a correlation and a later NG sweep
-> **refutes it** — see "The diagnosis does not survive" at the end. Retitled.
+> Status: cause established on the fourth attempt — mma8 issues **1.93x the
+> load instructions for identical DRAM traffic**. The "register-bound" title
+> this entry shipped with was inferred from a correlation and is retracted
+> below; three fixes built on it all failed, which is the point of the entry.
 
 ## Context
 
@@ -107,10 +108,10 @@ pushing past it loses. Three independent levers are now closed:
 3. **The register cap** — saturated, and worse when forced past.
 
 A Marlin-style pipeline (cp.async into shared, `ldmatrix` fragments,
-double-buffered) is the obvious next thing to try, but note that its rationale
-— shrinking the register live set — is exactly the premise the NG sweep below
-refutes, so it should be attempted only after the real cause is found. It would
-be the ONE lever that moves both batched decode and speculation —
+double-buffered) is the next thing to try — with the rationale in "What it
+actually is" below, cutting LSU requests, NOT the register story this entry
+originally gave, which the NG sweep refutes. It would be the ONE lever that
+moves both batched decode and speculation —
 speculation's break-even needs the per-width cost under 6.0 ms against 8.9
 today, and a decode GEMM flat in M is exactly what would deliver it
 ([wins/2026-08-29-spec-decode-net-win.md](../wins/2026-08-29-spec-decode-net-win.md)).
@@ -140,10 +141,41 @@ Two things break:
 
 Together with the launch-bounds result (forcing higher occupancy is neutral to
 worse), occupancy is not what separates mma8's 800 GB/s from the GEMV's 1950.
-What does is unknown; three plausible mechanisms have now been measured and
-none of them is it.
+
+## What it actually is: twice the load instructions
+
+The counters that name it, same shape, same run:
+
+| | gemv | mma8 |
+|---|---:|---:|
+| `dram__bytes_read.sum` | 55.86 MB | 56.46 MB |
+| `l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum` | **731,136** | **1,410,048** |
+
+**Identical DRAM traffic, 1.93x the load requests.** So nothing is re-fetched
+(L2 is fine, and the "it must be coalescing so it reads more" story is wrong in
+its second half) — mma8 simply issues twice the load INSTRUCTIONS for the same
+bytes, because the mma B fragment wants 4 bytes per lane where the GEMV's tile
+takes 8. It is LSU-request-bound, and 1.93x on requests against 2.44x on time
+is the right order.
+
+This also explains why the shared-memory staging measured neutral rather than
+refuting the access-pattern idea: it made the GLOBAL loads wide (16 B/lane) and
+then added shared-memory loads to get the fragments back out, so the total
+request count did not move. The implementation relocated the bottleneck instead
+of removing it.
+
+The fix therefore has to cut TOTAL load instructions, not widen them:
+`ldmatrix` loads a whole 16x16 fragment in ONE instruction and distributes it
+across the warp — which is the Marlin design, but for this reason rather than
+the register one this entry originally gave.
 
 ## Rule
+
+A correlation is not a diagnosis, and the counter that settles it is usually
+one metric away. Occupancy and register count correlated beautifully with the
+gap and were both wrong; `l1tex__t_requests` against `dram__bytes_read` — two
+numbers, one ncu run — says it in a line. Three fixes were built on the
+correlation before that run happened.
 
 A coalescing argument is a hypothesis, not a diagnosis. Two of this session's
 kernel hypotheses (GDN owns the verify cost; mma8's scattered loads) were
