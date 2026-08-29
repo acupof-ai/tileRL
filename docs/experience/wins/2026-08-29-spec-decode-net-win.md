@@ -116,12 +116,16 @@ Set the draft's cost to zero and it is still 0.63x. The captured draft step was
 reverted: it is a real 2.59x on the draft half, and the draft half is not what
 decides this.
 
-Open, and not chased: `tok/tick` is 1.12 at 55.8% acceptance where depth 1
-should give ~1.56, and the discrepancy is depth-1-only (depth 2 reads 1.77
-against ~1.89 implied, which is close). Either the acceptance counter or the
-commit disagrees with `tokens_generated` on short chains. It does not change
-the verdict (1.56 tokens in 21.17 ms is 73.6 tok/s, still under 92.9) but it
-should be resolved before anyone trusts the acceptance column.
+~~Open, and not chased:~~ **Resolved 2026-08-30** — `tok/tick` read 1.12 at
+55.8% acceptance where depth 1 must give `1 + p` = 1.56 because the suite's
+`max_new_tokens` was 80 against ~109 tokens produced: the request finished
+around tick 51 of 70 and the remaining timed ticks counted in the denominator
+while generating nothing. Only the speculative arm hit it, and depth 2 escaped
+only because its budget happened to clear — which is the whole "depth-1-only"
+shape. Corrected, B=1 depth 1 is **0.79x** and B=8 depth 1 is **0.22x**; the
+break-even (`p >= 66%` against 55.8%) came from ms/tick and acceptance and is
+unaffected. See
+[errors/2026-08-30-spec-suite-budget-bound-mid-window.md](../errors/2026-08-30-spec-suite-budget-bound-mid-window.md).
 
 The `spec/*` baseline rows are now meaningless — the harness PASSes them at
 0.15x of plain, because they were seeded when the arm was measured differently.
