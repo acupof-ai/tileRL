@@ -758,10 +758,12 @@ class Engine:
         hid: list | None = [] if self._draft else None
         logits = self._model.forward(
             input_ids, positions, self._make_kv(rows, seq_q, width if chains else 0),
-            # Only when every row spans the full width: a mixed tick's decode
-            # rows end earlier and a verify tick needs every chain position.
+            # Per-row valid lengths: a mixed tick's decode rows end at 1
+            # while the prefill row spans the width, and lm_head must not run
+            # over the padding. A verify tick needs every chain position, so
+            # it opts out entirely.
             self._backend, hidden_out=hid,
-            last_only=not chains and min(seq_q) == width,
+            last_only=False if chains else seq_q,
         )
         if hid is not None:
             for i, r in enumerate(rows):  # the draft's fc input next tick

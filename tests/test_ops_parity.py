@@ -500,8 +500,13 @@ def _naive_paged(q, k_cache, v_cache, block_table, seq_lens, scale):
 def test_paged_attention_vs_naive(backend):
     torch.manual_seed(13)
     b, h, hkv, d, block = 2, 4, 2, 16, 16
-    k_cache = torch.randn(8, hkv, block, d)
-    v_cache = torch.randn(8, hkv, block, d)
+    # The pool the engine actually passes is bf16 (PagedKvPool's dtype), and
+    # the sm90 kernel declares bf16. Building the cache with torch.randn's f32
+    # default made this gate test a configuration nothing runs: it passed on
+    # CPU, where the kernel takes f32, and raised a dtype mismatch on CUDA.
+    kv_dtype = torch.bfloat16
+    k_cache = torch.randn(8, hkv, block, d).to(kv_dtype)
+    v_cache = torch.randn(8, hkv, block, d).to(kv_dtype)
     block_table = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32)
     scale = 1.0 / (d**0.5)
     # decode (T=1)
