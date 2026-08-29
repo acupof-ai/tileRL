@@ -162,6 +162,25 @@ class Backend:
         dist.all_reduce(x)
         return x
 
+    def all_gather(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """Concatenate ``x`` from every rank along ``dim``. Identity when TP
+        is off.
+
+        This is what completes a vocab-parallel lm_head: each rank computes
+        logits over its slice of the vocabulary and the row is only whole once
+        gathered. vLLM, SGLang and TRT-LLM all pay this rather than keep the
+        logits sharded, because every sampler feature (penalties, structured
+        output, logprobs) is far simpler on a dense row.
+        """
+        if self.tp_world == 1:
+            return x
+        import torch.distributed as dist
+
+        x = x.contiguous()
+        parts = [torch.empty_like(x) for _ in range(self.tp_world)]
+        dist.all_gather(parts, x)
+        return torch.cat(parts, dim=dim)
+
     def __init__(self, target: str):
         self.target = target
         if target == "metal":

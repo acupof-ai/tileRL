@@ -509,7 +509,13 @@ class Model:
                 x = x[torch.arange(x.shape[0], device=device), idx].unsqueeze(1)
         x = backend.rmsnorm(x, self.params["final_norm"], cfg.rms_eps)
         head_key = "embed_tokens" if cfg.tie_word_embeddings else "lm_head"
-        return self._linear(backend, x, head_key)
+        logits = self._linear(backend, x, head_key)
+        if getattr(backend, "tp_world", 1) > 1 and not cfg.tie_word_embeddings:
+            # Vocab-parallel head: each rank owns a slice of the vocabulary,
+            # so the row is only whole once gathered. A tied head is the
+            # embedding table, which stays replicated and needs no gather.
+            logits = backend.all_gather(logits, dim=-1)[..., : cfg.vocab_size]
+        return logits
 
 
 # --- Random initialization --------------------------------------------------
