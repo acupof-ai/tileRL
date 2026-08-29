@@ -4,6 +4,20 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-30 — audit: verify_lens is dead on the shipped path and mis-modelled
+
+- `trim=not self._decode_graph_on` and graph capture is on by default, so
+  `_draft_chains` returns before reaching `verify_lens`. The arm that could say
+  "do not speculate" is the one the shipped path skips.
+- Its constants are agent-infer's (`BIAS_MS=211.0`, `ROW_MS=0.53`, marked
+  "re-measure per target"). Measured here, the marginal cost of a verify row
+  runs from +9.52 ms to **-0.11 ms** — mma8 pads M to 8, so rows 5-8 are free.
+  No constant makes a linear model fit; the optimum is "fill the tile", not a
+  survival threshold.
+- Recorded only. Retuning needs a GPU run, and mixing readings across
+  configurations is how this feature got a 1.9x optimistic estimate once.
+  [errors/2026-08-30-verify-lens-is-dead-and-its-cost-model-is-wrong.md](docs/experience/errors/2026-08-30-verify-lens-is-dead-and-its-cost-model-is-wrong.md)
+
 ## 2026-08-30 — reopened: the draft head's attention sees one token in the loop
 
 - `draft_check.py` measured 84.4% teacher-forced agreement by running the head
