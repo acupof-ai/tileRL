@@ -633,6 +633,7 @@ def test_gdn_chunk_fused_parity_full_scale(backend):
     q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 96, 2, 6, 16, 16, 4, 37, scale=10.0)
     out, _, _ = backend.linear_attn_chunk(q, k, v, g, beta, state, z=z, **kw)
     rout, _, _ = reference.gdn_forward(q, k, v, g, beta, state, z=z, **kw)
+    rout = rout.to(out.device)
     rel = (out - rout).abs().max().item() / rout.abs().max().item()
     assert rel < 0.05, f"gdn full-scale out: {100 * rel:.1f}% relative error"
 
@@ -713,8 +714,24 @@ def test_gdn_chunk_matches_decode(backend):
         bf16(kw["conv_window"]),
         f32(state),
         c(seq_q),
+        # KS=1 dummies, exactly as Backend._gdn_chunk_fused passes for a
+        # non-speculative call: they are inputs, and omitting them left the
+        # kernel's KS constexpr unbound.
+        torch.empty((*state.shape[:1], 1, *state.shape[1:]), dtype=torch.float32,
+                    device=backend.device),
+        torch.empty((state.shape[0], 1, *kw["conv_window"].shape[1:]), dtype=torch.bfloat16,
+                    device=backend.device),
         threads=state.shape[-1],
     )
+    # The chunk kernel returns the raw recurrence output now — its gated
+    # RMSNorm and z-gate live in Backend._gdn_chunk_fused, off the per-token
+    # critical path. Apply them here so the two kernels are comparable again.
+    nvh, vd = state.shape[1], state.shape[-1]
+    cout = backend.silu_mul(
+        backend._dev(z, torch.float32).reshape(cout.shape[0], cout.shape[1], nvh, vd),
+        backend.rmsnorm(cout.reshape(cout.shape[0], cout.shape[1], nvh, vd),
+                        backend._const_f32(kw["norm_weight"]), 1e-6),
+    ).reshape(cout.shape)
     _assert_close(cout.squeeze(1), dout, "chunk-vs-decode out")
     _assert_close(cstate, dstate, "chunk-vs-decode state")
     _assert_close(cwin, dwin, "chunk-vs-decode window")

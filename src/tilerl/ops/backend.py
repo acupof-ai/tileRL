@@ -816,7 +816,7 @@ class Backend:
         # the critical path of every one of T token steps inside it.
         core = out.reshape(b, out.shape[1], nvh, vd)
         out = self.silu_mul(
-            kw["z"].reshape(core.shape),
+            self._dev(kw["z"], torch.float32).reshape(core.shape),
             self.rmsnorm(core, self._const_f32(kw["norm_weight"]), 1e-6),
         ).reshape(out.shape)
         if ks:
