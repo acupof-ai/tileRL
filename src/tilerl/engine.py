@@ -508,8 +508,14 @@ class Engine:
                     blocks.append(self._kv.alloc_block())
                 if reload_key is not None:
                     # Fill the matched-prefix blocks from the SSD tier — this is
-                    # the prefill the cold hit skips.
-                    self._tier.load_kv(reload_key, blocks[: matched // BLOCK_TOKENS], self._kv)
+                    # the prefill the cold hit skips. submit runs under the
+                    # engine lock, so no concurrent eviction races us; a False
+                    # here means the tier file is actually gone/corrupt, which
+                    # is a hard error, not a silent miss.
+                    if not self._tier.load_kv(
+                        reload_key, blocks[: matched // BLOCK_TOKENS], self._kv
+                    ):
+                        raise RuntimeError(f"tier lost cold prefix {reload_key:016x}")
             except Exception:
                 for b in blocks:
                     self._kv.free_block(b)

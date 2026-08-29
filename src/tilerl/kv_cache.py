@@ -406,22 +406,30 @@ class KvTier:
         return os.path.join(self._dir, f"{key & _MASK64:016x}.st")
 
     def spill_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> bool:
-        # Returns True if this tier accepted the spill. A capacity-bounded tier
-        # (e.g. a pinned-DRAM L1) returns False when full so the store falls to
-        # the next tier or drops — refuse-and-pass-down, expressed in the
-        # contract rather than bolted on. The SSD tier here always accepts.
-        # Block is a strided slice pool.k_pool[:, b] of shape [planes,heads,BT,hd];
-        # stack the span and move to CPU once (same copy template as cow_for_append).
+        # Returns True if this tier accepted the spill. The tier owns BOTH the
+        # length rule and the capacity rule — the store never pre-gates, so a
+        # composite tier (a near-zero-floor DRAM L1 above a 2048-floor SSD L2)
+        # can apply a different floor per level. This SSD tier refuses entries
+        # below min_tokens (not worth a disk write) and accepts the rest. The
+        # prefix is block-aligned, so len(blocks)*BLOCK_TOKENS is its length.
+        if len(blocks) * BLOCK_TOKENS < self.min_tokens:
+            return False
         k = torch.stack([pool.k_pool[:, b] for b in blocks]).contiguous().cpu()
         v = torch.stack([pool.v_pool[:, b] for b in blocks]).contiguous().cpu()
         torch.save({"k": k, "v": v}, self._kv(key))
         return True
 
-    def load_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> None:
+    def load_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> bool:
+        # Returns False if the data is gone (a concurrent eviction dropped it
+        # between lookup and load) — the caller frees its blocks and treats the
+        # hit as a miss. Total with spill_kv, and closes the has()/load TOCTOU.
+        if not self.has(key):
+            return False
         d = torch.load(self._kv(key), map_location="cpu")
         for i, b in enumerate(blocks):
             pool.k_pool[:, b].copy_(d["k"][i].to(pool.device))
             pool.v_pool[:, b].copy_(d["v"][i].to(pool.device))
+        return True
 
     def spill_state(self, key: int, states, windows) -> None:
         blob = {"states": states.cpu(), "windows": None if windows is None else windows.cpu()}
@@ -602,14 +610,12 @@ class PrefixStore:
         chain.remove(entry)
         if not chain:
             del self._entries[entry.h]
-        # Offer to the tier when wired and the prefix clears the tier's own
-        # churn floor; the tier may still refuse (a capacity-bounded L1 that is
-        # full), in which case we drop it as today. spill_kv reads the blocks,
-        # so it runs before free_block.
-        spilled = (
-            self._tier is not None
-            and len(entry.tokens) >= self._tier.min_tokens
-            and self._tier.spill_kv(entry.h, entry.blocks, self._pool)
+        # Offer to the tier when wired; the tier owns the accept/reject call
+        # (both its length floor and its capacity), so the store never
+        # pre-gates. A refusal (too short, or a full L1) drops as today.
+        # spill_kv reads the blocks, so it runs before free_block.
+        spilled = self._tier is not None and self._tier.spill_kv(
+            entry.h, entry.blocks, self._pool
         )
         for b in entry.blocks:
             self._pool.free_block(b)
