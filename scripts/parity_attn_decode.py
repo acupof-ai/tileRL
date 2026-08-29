@@ -20,7 +20,7 @@ os.environ.setdefault("TILERL_TARGET", "cuda")
 import torch  # noqa: E402
 
 import benchkit as bk  # noqa: E402
-from tilerl.ops.backend import get_backend  # noqa: E402
+from tilerl_kernels.backend import get_backend  # noqa: E402
 
 backend = get_backend()
 B, H, HKV, D, BS = args.batch, 32, 8, 256, 16

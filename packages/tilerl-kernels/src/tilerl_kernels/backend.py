@@ -3,11 +3,11 @@
 This is the ONLY module in tilerl that talks to tilelang directly. Everything
 above ``tilerl.ops`` calls the :class:`Backend` methods, never tilelang or
 torch internals (torch is the tensor container only). The precision×arch
-dispatch matrix and target resolution live in :mod:`tilerl.ops.registry`.
+dispatch matrix and target resolution live in :mod:`tilerl_kernels.registry`.
 
-Forward ops compile and run the TileLang kernels in :mod:`tilerl.ops.kernels`
+Forward ops compile and run the TileLang kernels in :mod:`tilerl_kernels.kernels`
 (cached per shape/dtype by tilelang's eager JIT). Backward ops without a
-TileLang kernel run the torch-eager reference in :mod:`tilerl.ops.reference`
+TileLang kernel run the torch-eager reference in :mod:`tilerl_kernels.reference`
 — the parity oracle and day-1 training fallback.
 ``# ponytail: torch-eager backward, tilelang kernel when perf demands``
 

@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from tilerl.config import qwen38_27b  # noqa: E402
 from tilerl.engine import SamplingParams, build_engine  # noqa: E402
 from tilerl.model import load_hf  # noqa: E402
-from tilerl.ops.backend import get_backend  # noqa: E402
+from tilerl_kernels.backend import get_backend  # noqa: E402
 from tilerl.server import get_tokenizer  # noqa: E402
 
 src = sys.argv[1]

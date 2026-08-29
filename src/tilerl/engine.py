@@ -76,7 +76,7 @@ def _quantize_draft(params: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     Norms, embeddings and anything 1-D stay as they are; only the [N,K]
     projections move, which is where all of the head's bulk and all of its time
     is."""
-    from .ops import reference
+    from tilerl_kernels import reference
 
     out: dict[str, torch.Tensor] = {}
     for k, v in params.items():

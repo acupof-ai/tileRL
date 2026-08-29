@@ -1,6 +1,6 @@
 # Kernel layer design
 
-`src/tilerl/ops/` is the only layer that touches TileLang or torch beyond the
+`packages/tilerl-kernels/src/tilerl_kernels/` is the only layer that touches TileLang or torch beyond the
 tensor container. Everything above calls backend ops.
 
 ## Files

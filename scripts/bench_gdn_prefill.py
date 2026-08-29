@@ -21,7 +21,7 @@ from dataclasses import replace
 import torch
 
 from tilerl.engine import SamplingParams
-from tilerl.ops import reference
+from tilerl_kernels import reference
 
 
 def _drive(engine, wid, max_steps) -> None:
@@ -62,7 +62,7 @@ def main() -> None:
     from tilerl.config import qwen36_27b
     from tilerl.engine import build_engine
     from tilerl.model import load_hf
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     if backend.device.type != "cuda":

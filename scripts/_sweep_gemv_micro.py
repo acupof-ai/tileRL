@@ -21,7 +21,7 @@ import torch
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from cuda_codegen import TARGET, enable  # noqa: E402
 
-from tilerl.ops import reference  # noqa: E402
+from tilerl_kernels import reference  # noqa: E402
 
 MICRO = (8, 16, 32)
 GROUPS = (1, 2, 4)
@@ -59,7 +59,7 @@ def _runtime_indexed(src: str, names) -> list[str]:
 
 
 def probe(micro: int, group: int, n: int, k: int, block: int = 16) -> dict:
-    from tilerl.ops import kernels_linear as kl
+    from tilerl_kernels import kernels_linear as kl
 
     row: dict = {"micro": micro, "GROUP": group}
     try:

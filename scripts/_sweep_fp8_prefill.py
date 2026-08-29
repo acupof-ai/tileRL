@@ -37,8 +37,8 @@ import tilelang
 import tilelang.language as T
 
 sys.path.insert(0, "src")
-from tilerl.ops.kernels_mma import make_quant_fp8_e4m3
-from tilerl.ops.reference import linear_fp4, pack_fp4
+from tilerl_kernels.kernels_mma import make_quant_fp8_e4m3
+from tilerl_kernels.reference import linear_fp4, pack_fp4
 
 SHAPES = [
     (512, 5120, 17408),  # gate/up

@@ -39,3 +39,9 @@ jobs:
         run: uv run pytest -v
         env:
           TILERL_TARGET: cpu
+      - name: Both distributions build
+        # The workspace ships two wheels; a release that cannot build one of
+        # them is found at publish time otherwise.
+        run: |
+          uv build --package tilerl-kernels
+          uv build --package tilerl

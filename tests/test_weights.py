@@ -17,7 +17,7 @@ from safetensors.torch import save_file
 
 from tilerl.config import tiny
 from tilerl.model import build_random, fp4_param_keys, load_hf, param_specs, save_hf
-from tilerl.ops import reference
+from tilerl_kernels import reference
 
 #: param suffix -> HF suffix (reverse of model._LAYER_SUFFIXES)
 _SIMPLE = {
@@ -281,7 +281,7 @@ def test_fused_projections_parity(tmp_path):
     fused model's logits match the unfused model's (concat + slice is lossless)."""
     import numpy as np
 
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
     from tilerl.testing import RefBackend
     from tilerl.train import _training_kv
 

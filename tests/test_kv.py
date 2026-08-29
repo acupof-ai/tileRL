@@ -19,7 +19,7 @@ def _kv(seed: int, n: int, heads: int = 1, dim: int = 4) -> tuple[torch.Tensor, 
     # Match PagedKvPool's default device (the backend target device): the pool
     # lands on mps under TILERL_TARGET=metal, and write_block/readback compares
     # against these tensors directly.
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
 
     g = torch.Generator().manual_seed(seed)
     k = torch.randn(heads, n, dim, generator=g, dtype=torch.bfloat16).to(get_backend().device)

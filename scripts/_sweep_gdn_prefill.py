@@ -30,7 +30,7 @@ import tilelang
 import tilelang.language as T
 
 sys.path.insert(0, "src")
-from tilerl.ops.reference import gdn_forward
+from tilerl_kernels.reference import gdn_forward
 
 # slice4 shapes (27B GDN layer, prefill-512): nkh=16, nvh=48, K=V=128, KER=4
 B, TT, QD, NVH, K, V, KER = 1, 512, 2048, 48, 128, 128, 4

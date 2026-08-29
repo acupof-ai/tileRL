@@ -30,8 +30,8 @@ def main() -> int:
 
     from tilerl.config import qwen38_27b
     from tilerl.model import load_hf
-    from tilerl.ops import reference
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels import reference
+    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     cfg = qwen38_27b()

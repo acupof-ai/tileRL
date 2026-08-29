@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import torch
 
-from tilerl.ops.backend import get_backend
-from tilerl.ops.reference import pack_fp4
+from tilerl_kernels.backend import get_backend
+from tilerl_kernels.reference import pack_fp4
 
 
 def _bench(fn, warmup=5, rep=20):
@@ -46,7 +46,7 @@ def main() -> None:
         scale = backend._f32(scale)
 
         # bf16 path (pop the fp8 key so it falls through to bf16)
-        from tilerl.ops.registry import _REGISTRY, _resolve
+        from tilerl_kernels.registry import _REGISTRY, _resolve
 
         cell = _REGISTRY[("bf16", "sm90")]
         had_fp8 = "linear_fp4_fp8" in cell
@@ -56,7 +56,7 @@ def main() -> None:
             t_bf16 = _bench(lambda: backend.linear_fp4(x, wq, scale))
         finally:
             if had_fp8:
-                from tilerl.ops import kernels_mma
+                from tilerl_kernels import kernels_mma
 
                 cell["linear_fp4_fp8"] = kernels_mma.make_linear_fp4_fp8_mma
 

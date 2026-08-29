@@ -2,7 +2,7 @@
 
 NOT framework code — the deterministic CPU backend for tests and selfchecks
 that want a backend without the TileLang JIT. Ops delegate to
-:mod:`tilerl.ops.reference` (the parity oracle) via ``__getattr__``; the ops
+:mod:`tilerl_kernels.reference` (the parity oracle) via ``__getattr__``; the ops
 the reference lacks live here: gated dense attention, fp4 linear (drops the
 recording-only ``master`` kwarg), elementwise add, gated paged attention
 (reference has no gated paged path), and the paged KV scatter (the pool's
@@ -15,7 +15,7 @@ import torch
 
 __all__ = ["RefBackend"]
 
-#: Ops delegated verbatim to tilerl.ops.reference.
+#: Ops delegated verbatim to tilerl_kernels.reference.
 _REF_OPS = frozenset(
     {
         "rmsnorm",
@@ -51,7 +51,7 @@ class RefBackend:
 
     def __getattr__(self, name):
         if name in _REF_OPS:
-            from .ops import reference
+            from tilerl_kernels import reference
 
             return getattr(reference, name)
         raise AttributeError(name)
@@ -66,17 +66,17 @@ class RefBackend:
         return None
 
     def linear_fp4(self, x, wq, scale, master=None, oscale=None):
-        from .ops import reference
+        from tilerl_kernels import reference
 
         return reference.linear_fp4(x, wq, scale, oscale)  # master is recording-only
 
     def linear_fp8(self, x, w8, wscale, master=None, oscale=None):
-        from .ops import reference
+        from tilerl_kernels import reference
 
         return reference.linear_fp8(x, w8, wscale, oscale)  # master is recording-only
 
     def attention(self, q, k, v, scale, gate=None):
-        from .ops import reference
+        from tilerl_kernels import reference
 
         out = reference.dense_attention(q, k, v, scale)
         if gate is not None:
@@ -84,7 +84,7 @@ class RefBackend:
         return out
 
     def attention_bwd(self, grad, q, k, v, scale):
-        from .ops import reference
+        from tilerl_kernels import reference
 
         return reference.dense_attention_bwd(grad, q, k, v, float(scale))
 

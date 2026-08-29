@@ -50,7 +50,7 @@ inference** of `Qwen3.8-27B` (NVFP4). One kernel source, four targets.
   TileOPs, TileRT from the TileLang ecosystem.
 
 Non-obvious ownership:
-- `src/tilerl/ops/` is the ONLY layer that touches TileLang or torch beyond
+- `packages/tilerl-kernels/src/tilerl_kernels/` is the ONLY layer that touches TileLang or torch beyond
   the container type. Everything above it is backend-neutral.
 - Reference repos are read-only: never modify
   `/Users/bytedance/code/agent-infer` or `/Users/bytedance/code/tilelang`.
@@ -59,7 +59,7 @@ Non-obvious ownership:
 
 ## Hard gates
 
-**Backend isolation (CRITICAL).** Modules above `src/tilerl/ops/` never call
+**Backend isolation (CRITICAL).** Modules above `packages/tilerl-kernels/src/tilerl_kernels/` never call
 TileLang or torch directly — they call backend ops. `torch` may appear only as
 the tensor container (`torch.Tensor` type). No `torch.autograd`, no
 `torch.optim`, anywhere in framework code.

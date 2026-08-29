@@ -70,7 +70,7 @@ def _build_engine(cfg, model, backend, devices=None):
     import torch
 
     from .model import load_hf
-    from .ops.backend import Backend, resolve_target
+    from tilerl_kernels.backend import Backend, resolve_target
     from .parallel import DataParallelEngine
 
     def make(d, **kwargs):
@@ -94,7 +94,7 @@ def _build_engine(cfg, model, backend, devices=None):
 def cmd_serve(args: argparse.Namespace) -> None:
     import uvicorn
 
-    from .ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
     from .server import create_app, get_tokenizer
 
     backend = get_backend()
@@ -122,7 +122,7 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     from . import train as train_mod
     from .autograd import AdamW, Tape, cosine_warmup
-    from .ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     cfg, model = _build_model(args.model, seed=args.seed, keep_master=True)
@@ -175,7 +175,7 @@ def cmd_train(args: argparse.Namespace) -> None:
 def cmd_pretrain(args: argparse.Namespace) -> None:
     from . import train as train_mod
     from .autograd import AdamW
-    from .ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
     from .server import get_tokenizer
 
     backend = get_backend()
@@ -227,7 +227,7 @@ def cmd_bench(args: argparse.Namespace) -> None:
     import torch
 
     from . import engine as engine_mod
-    from .ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     cfg, model = _build_model(args.model, seed=0)

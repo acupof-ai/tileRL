@@ -22,8 +22,8 @@ sys.path.insert(0, "src")
 import torch
 
 import benchkit
-from tilerl.ops.kernels_linear import make_linear_fp4_fp8_mma, make_quant_fp8_e4m3
-from tilerl.ops.reference import pack_fp4
+from tilerl_kernels.kernels_linear import make_linear_fp4_fp8_mma, make_quant_fp8_e4m3
+from tilerl_kernels.reference import pack_fp4
 
 SHAPES = [
     (512, 5120, 17408),  # gate/up

@@ -21,7 +21,7 @@ import torch
 from tilerl.config import tiny
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.model import build_random
-from tilerl.ops.backend import get_backend
+from tilerl_kernels.backend import get_backend
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph decode is CUDA-only")

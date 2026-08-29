@@ -35,9 +35,9 @@ import torch
 from tilerl.config import qwen36_27b
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.model import load_hf
-from tilerl.ops import backend as backend_mod
-from tilerl.ops import reference
-from tilerl.ops.backend import get_backend
+from tilerl_kernels import backend as backend_mod
+from tilerl_kernels import reference
+from tilerl_kernels.backend import get_backend
 
 WARM = 12  # ticks: flushes B=8's 8 one-per-tick prefill admissions + 4 decodes
 TICKS = 30
@@ -117,7 +117,7 @@ def kernel_relerr(backend, arm):
     Returns fro-relerr vs shipped (the win-gate metric) and fro-relerr vs
     the f32 reference (the parity metric — the errors entry's rule: fro,
     not allclose, past K~1024)."""
-    from tilerl.ops.reference import pack_fp4
+    from tilerl_kernels.reference import pack_fp4
 
     torch.manual_seed(41)
     report = {}

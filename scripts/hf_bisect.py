@@ -29,7 +29,7 @@ def main() -> int:
 
     from tilerl.config import qwen38_27b
     from tilerl.model import load_hf
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
     from tilerl.train import _training_kv
 
     ref = torch.load(args.ref, map_location="cpu")

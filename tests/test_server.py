@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 from tilerl.config import tiny
 from tilerl.engine import Engine, build_engine
 from tilerl.model import build_random
-from tilerl.ops.backend import get_backend
+from tilerl_kernels.backend import get_backend
 from tilerl.server import create_app, get_tokenizer
 
 

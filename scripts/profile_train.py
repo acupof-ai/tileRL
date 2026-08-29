@@ -37,7 +37,7 @@ def main() -> None:
     from tilerl.autograd import AdamW
     from tilerl.config import qwen38_27b
     from tilerl.model import add_lora, load_hf
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
     from tilerl.train import train_step
 
     backend = get_backend()

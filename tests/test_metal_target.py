@@ -59,7 +59,7 @@ def _target(name: str):
     """Yield a backend resolved against TILERL_TARGET=name, then restore — a
     stale ``_BACKEND`` left behind by a failed assert poisons every test module
     imported later (no conftest owns the singleton)."""
-    from tilerl.ops import backend as backend_mod
+    from tilerl_kernels import backend as backend_mod
 
     prev = os.environ.get("TILERL_TARGET")
     os.environ["TILERL_TARGET"] = name

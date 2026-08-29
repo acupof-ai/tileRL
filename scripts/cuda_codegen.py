@@ -61,7 +61,7 @@ if __name__ == "__main__":
     import torch
 
     enable()
-    from tilerl.ops import kernels_linear as kl
+    from tilerl_kernels import kernels_linear as kl
 
     N, K = 5120, 17408  # down_proj
     src = kl.make_linear_fp4_gemv(TARGET).get_kernel_source(

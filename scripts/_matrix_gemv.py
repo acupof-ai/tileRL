@@ -23,8 +23,8 @@ import torch
 import tilelang
 import tilelang.language as T
 
-from tilerl.ops.kernels_linear import make_linear_fp4_gemv, make_linear_fp4_mma
-from tilerl.ops.reference import unpack_fp4
+from tilerl_kernels.kernels_linear import make_linear_fp4_gemv, make_linear_fp4_mma
+from tilerl_kernels.reference import unpack_fp4
 
 DEQUANT_SRC = """
 __device__ void dequant_e2m1fn_prmt(const unsigned char* __restrict__ packed,

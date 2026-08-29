@@ -41,7 +41,7 @@ def main() -> None:
     from tilerl.engine import BatchKv
     from tilerl.kv_cache import BLOCK_TOKENS, LinearStatePool, PagedKvPool
     from tilerl.model import load_hf
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
     from tilerl.server import get_tokenizer
     from tilerl.spec import load_draft
 

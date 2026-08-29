@@ -1,0 +1,26 @@
+[project]
+name = "tilerl-kernels"
+version = "0.1.0"
+description = "TileLang kernels and the backend seam for tileRL — one kernel source, four targets"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "cklxx", email = "q1293822641@gmail.com" }]
+keywords = ["tilelang", "cuda", "kernels", "inference", "gated-delta-net", "nvfp4"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "tilelang[fp4]>=0.1.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/cklxx/tileRL"
+Changelog = "https://github.com/cklxx/tileRL/blob/main/CHANGELOG.md"
+
+[build-system]
+requires = ["uv_build>=0.9.24,<0.10.0"]
+build-backend = "uv_build"

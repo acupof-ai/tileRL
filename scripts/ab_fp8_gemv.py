@@ -22,8 +22,8 @@ import torch  # noqa: E402
 
 import benchkit as bk  # noqa: E402
 from tilerl.config import qwen38_27b  # noqa: E402
-from tilerl.ops import kernels_linear  # noqa: E402
-from tilerl.ops.backend import get_backend  # noqa: E402
+from tilerl_kernels import kernels_linear  # noqa: E402
+from tilerl_kernels.backend import get_backend  # noqa: E402
 
 cfg = qwen38_27b()
 h = cfg.hidden_size

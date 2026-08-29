@@ -30,8 +30,8 @@ from tilerl.engine import (
 )
 from tilerl.model import build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
-from tilerl.ops.backend import get_backend
-from tilerl.ops.reference import dequant_fp4, pack_fp4
+from tilerl_kernels.backend import get_backend
+from tilerl_kernels.reference import dequant_fp4, pack_fp4
 from tilerl.testing import RefBackend
 from tilerl.train import _training_kv, opd_loop, train_step
 
@@ -394,7 +394,7 @@ def test_fp4_roundtrip(block):
     OCP e2m1, scale [N, K//B]) but not the helper's location or signature."""
     pack = unpack = None
     try:
-        from tilerl.ops.reference import pack_fp4, unpack_fp4  # type: ignore
+        from tilerl_kernels.reference import pack_fp4, unpack_fp4  # type: ignore
 
         pack, unpack = pack_fp4, unpack_fp4
     except ImportError:
@@ -525,7 +525,7 @@ def test_logprobs_are_returned_and_deterministic():
     """
     from tilerl.cli import _build_model
     from tilerl.engine import SamplingParams, build_engine
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     cfg, model = _build_model("tiny", seed=0)
@@ -579,7 +579,7 @@ def test_opd_lora_self_teacher():
     from tilerl.cli import _build_model
     from tilerl.engine import build_engine
     from tilerl.model import add_lora
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     cfg, model = _build_model("tiny", seed=0, keep_master=True)
@@ -716,7 +716,7 @@ def test_gpu_targets():
     target = "cuda"
     prev = os.environ.get("TILERL_TARGET")
     os.environ["TILERL_TARGET"] = target
-    from tilerl.ops import backend as backend_mod
+    from tilerl_kernels import backend as backend_mod
 
     backend_mod._BACKEND = None  # force re-resolution against the env var
     try:

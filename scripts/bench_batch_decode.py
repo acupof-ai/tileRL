@@ -22,7 +22,7 @@ import torch
 from tilerl.config import qwen36_27b
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.model import load_hf
-from tilerl.ops.backend import get_backend
+from tilerl_kernels.backend import get_backend
 from tilerl.spec import load_draft
 
 WARMUP = 8  # ticks: flushes every 16-token prompt's prefill, leaves decode headroom

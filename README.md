@@ -6,7 +6,7 @@ targets have executed it: CPU (the CI and dev path), Metal, and CUDA sm90 (on
 an H20 pod). ROCm shares the CPU kernel set and has never run.
 
 The source is not evenly shared. Of the 1,969 lines under
-`src/tilerl/ops/kernels*.py`, 1,406 (71%) are sm90-only schedules and 175 (9%)
+`packages/tilerl-kernels/src/tilerl_kernels/kernels*.py`, 1,406 (71%) are sm90-only schedules and 175 (9%)
 are the kernels every target executes; the rest is per-target gemm schedules
 and a shared header. Per-op status:
 [`docs/support-matrix.md`](docs/support-matrix.md).
@@ -37,26 +37,62 @@ source" means one file tree and one op contract, not one schedule. torch is
 used only as the tensor container TileLang requires — no `torch.autograd`, no
 `torch.optim`.
 
+## Install
+
+Two distributions, split along the only boundary the codebase already
+enforces: `tilerl_kernels` is the sole place that imports TileLang or calls
+torch beyond the tensor container, and everything above it is backend-neutral.
+
+| | install | what for |
+|---|---|---|
+| `tilerl` | `pip install tilerl` | engine, model loading, OPD training, CLI |
+| `tilerl[server]` | `pip install "tilerl[server]"` | + the OpenAI-compatible HTTP server |
+| `tilerl-kernels` | `pip install tilerl-kernels` | kernels and the backend seam alone |
+
+A kernel change rebuilds one of them; a serving change rebuilds the other.
+Requires Python 3.11+. Without a GPU, `TILERL_TARGET` resolves to `cpu`.
+
 ## Quickstart
+
+```bash
+pip install "tilerl[server]"
+tilerl serve                                     # OpenAI-compatible, :8000
+tilerl serve --devices 0,1,2,3                   # one engine replica per GPU
+```
+
+```python
+from tilerl.engine import SamplingParams, build_engine
+
+rid = engine.submit(tokens, SamplingParams(max_new_tokens=64, logprobs=True))
+while rid not in (done := engine.poll()):
+    engine.step()                                # one forward per tick
+tokens, scores = done[rid], engine.logprobs(rid)
+```
+
+From a checkout:
 
 ```bash
 uv sync                                          # never pip install
 uv run pytest                                    # correctness suite (CPU)
 TILERL_TARGET=cpu uv run tilerl serve            # OpenAI-compatible server
 TILERL_TARGET=cpu uv run tilerl bench            # benchmark → docs/experience/
-uv run tilerl train                              # OPD training
+uv run tilerl train --opd                        # OPD self-teacher training
 ```
-
-Requires Python 3.11+ and uv 0.9+. On machines without a GPU, `TILERL_TARGET`
-defaults to `cpu`.
 
 ## Development
 
+The checkout is a uv workspace: `uv sync` installs both packages editable plus
+everything the gates touch, so one command covers serving, training and kernel
+work.
+
 ```bash
+uv sync                                         # both packages, editable
 uv run ruff check                               # lint (rule set: pyproject.toml [tool.ruff])
-uv run ruff format --check                      # format check
 uv run pytest                                   # same deterministic suite as CI
+uv run python -m tilerl_kernels.reference       # ops self-checks, no GPU
 ```
+
+Contributing, and the gates a change has to clear: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 CI (`.github/workflows/ci.yml`) runs on `ubuntu-latest` + `macos-14`:
 `uv sync --dev`, ruff lint, and the hermetic CPU suite (`TILERL_TARGET=cpu`).

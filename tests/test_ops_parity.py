@@ -23,9 +23,9 @@ os.environ.setdefault("TILERL_TARGET", "cpu")
 import pytest
 import torch
 
-from tilerl.ops import reference
-from tilerl.ops.backend import _resolve, get_backend
-from tilerl.ops.reference import pack_fp4, renorm_fp4_scale
+from tilerl_kernels import reference
+from tilerl_kernels.backend import _resolve, get_backend
+from tilerl_kernels.reference import pack_fp4, renorm_fp4_scale
 
 RTOL = 1e-2
 ATOL = 1e-2
@@ -842,7 +842,7 @@ def test_fp4_twiddle_round_trip():
     """sm90 serves fp4 in the twiddled byte layout; save_hf must undo it exactly."""
     import torch
 
-    from tilerl.ops.reference import twiddle_fp4, untwiddle_fp4
+    from tilerl_kernels.reference import twiddle_fp4, untwiddle_fp4
 
     wq = torch.randint(0, 256, (6, 32), dtype=torch.uint8, generator=torch.Generator().manual_seed(0))
     tw = twiddle_fp4(wq)

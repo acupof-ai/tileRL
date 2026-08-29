@@ -46,7 +46,7 @@ def score_tilerl(source: str, prompts: list[str]) -> list[str]:
     from tilerl.config import qwen38_27b
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.model import load_hf
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
     from tilerl.server import get_tokenizer
 
     backend = get_backend()

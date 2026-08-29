@@ -25,10 +25,10 @@ import profile_slice as ps  # noqa: E402
 from tilerl.config import qwen36_27b  # noqa: E402
 from tilerl.engine import SamplingParams, build_engine  # noqa: E402
 from tilerl.model import fp4_param_keys, load_hf  # noqa: E402
-from tilerl.ops import kernels_linear  # noqa: E402
-from tilerl.ops.registry import _REGISTRY
-from tilerl.ops.backend import get_backend  # noqa: E402
-from tilerl.ops.reference import linear_fp4  # noqa: E402
+from tilerl_kernels import kernels_linear  # noqa: E402
+from tilerl_kernels.registry import _REGISTRY
+from tilerl_kernels.backend import get_backend  # noqa: E402
+from tilerl_kernels.reference import linear_fp4  # noqa: E402
 
 _SM90_KEY = ("bf16", "sm90")
 

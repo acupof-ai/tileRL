@@ -453,7 +453,7 @@ def main() -> int:
     else:
         os.environ.setdefault("TILERL_TARGET", "cpu")
 
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     target = backend.arch

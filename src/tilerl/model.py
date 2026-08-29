@@ -72,7 +72,7 @@ import torch
 
 from . import autograd
 from .config import ModelConfig, tiny
-from .ops.reference import (
+from tilerl_kernels.reference import (
     untwiddle_fp4,
     dequant_awq,
     dequant_fp8,
@@ -85,7 +85,7 @@ from .ops.reference import (
 if TYPE_CHECKING:  # pragma: no cover - typing only, no tilelang import at runtime
     import numpy as np
 
-    from .ops.backend import Backend
+    from tilerl_kernels.backend import Backend
 
 
 # --- Param schema -----------------------------------------------------------

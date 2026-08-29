@@ -334,7 +334,7 @@ class Tape:
         # level, so importing it here (not at module top) breaks the cycle.
         backend = self.bwd_backend
         if backend is None:
-            from .ops.backend import get_backend
+            from tilerl_kernels.backend import get_backend
 
             backend = get_backend()
         grads: dict[int, torch.Tensor] = {id(last.output): grad_output}

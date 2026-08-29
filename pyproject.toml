@@ -1,33 +1,63 @@
 [project]
 name = "tilerl"
 version = "0.1.0"
-description = "Add your description here"
+description = "Cross-platform training and inference for Qwen3.8-27B (NVFP4) on one TileLang kernel source"
 readme = "README.md"
 authors = [
     { name = "cklxx", email = "q1293822641@gmail.com" }
 ]
 requires-python = ">=3.11"
+license = "Apache-2.0"
+keywords = ["llm", "inference", "training", "tilelang", "nvfp4", "speculative-decoding"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
-    "fastapi>=0.141.1",
-    "httpx>=0.28.1",
+    "tilerl-kernels",
     "huggingface-hub>=1.28.0",
     "safetensors>=0.8.0",
-    "tilelang[fp4]>=0.1.13",
     "tokenizers>=0.23.1",
+]
+
+[project.optional-dependencies]
+# The OpenAI-compatible server. The engine, training loop and CLI benchmarks
+# work without it, so a training-only install does not pull a web stack.
+server = [
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
     "uvicorn>=0.52.4",
 ]
 
+[project.urls]
+Homepage = "https://github.com/cklxx/tileRL"
+Changelog = "https://github.com/cklxx/tileRL/blob/main/CHANGELOG.md"
+
 [project.scripts]
 tilerl = "tilerl.cli:main"
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+tilerl-kernels = { workspace = true }
 
 [build-system]
 requires = ["uv_build>=0.9.24,<0.10.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
+# Development installs everything a gate touches, so `uv sync && uv run pytest`
+# exercises the server too. Users pick: `pip install tilerl` for the engine and
+# training loop, `tilerl[server]` to also serve.
 dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.4",
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "uvicorn>=0.52.4",
 ]
 
 [tool.ruff]
@@ -55,8 +85,6 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# F821 (undefined-name) stays enabled everywhere else. The two suppressions
-# cover known in-flight spots: selfcheck helpers in autograd.py and an `Any`
-# annotation under `from __future__ import annotations` in reference.py.
+# F821 (undefined-name) stays enabled everywhere else. One suppression left:
+# selfcheck helpers in autograd.py. reference.py's was retired by importing Any.
 "src/tilerl/autograd.py" = ["F821"]
-"src/tilerl/ops/reference.py" = ["F821"]

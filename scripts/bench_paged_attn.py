@@ -15,7 +15,7 @@ import argparse
 
 import torch
 
-from tilerl.ops import kernels, kernels_mma
+from tilerl_kernels import kernels, kernels_mma
 
 #: 27B full-attn layer geometry (config.qwen36_27b).
 H, HKV, D, BLOCK = 24, 4, 256, 16

@@ -57,7 +57,7 @@ def _default_device() -> torch.device:
     target on this Mac.
     """
     try:
-        from .ops.backend import get_backend
+        from tilerl_kernels.backend import get_backend
 
         return get_backend().device
     except Exception:  # noqa: BLE001 - any scaffold gap -> CPU default

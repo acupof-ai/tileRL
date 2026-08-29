@@ -35,7 +35,7 @@ import torch
 sys.path.insert(0, "scripts")
 from benchkit import ab, relerr  # noqa: E402
 
-from tilerl.ops import kernels_linear, reference  # noqa: E402
+from tilerl_kernels import kernels_linear, reference  # noqa: E402
 
 ARMS = ((8, 4), (32, 1), (32, 2), (32, 4), (16, 1), (16, 2))
 SHAPES = (("down", 5120, 17408), ("gate_up", 34816, 5120))

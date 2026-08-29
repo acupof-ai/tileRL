@@ -1,6 +1,6 @@
 """Torch-eager reference implementations of every tilerl op (forward + backward).
 
-This module is the parity oracle for the TileLang kernels in :mod:`tilerl.ops.kernels`
+This module is the parity oracle for the TileLang kernels in :mod:`tilerl_kernels.kernels`
 and the day-1 backward fallback for ops without a TileLang backward kernel
 (``# ponytail: torch-eager backward, tilelang kernel when perf demands``).
 
@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 
 import torch
+from typing import Any
 
 __all__ = [
     "rmsnorm",

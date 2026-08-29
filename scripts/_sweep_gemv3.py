@@ -27,8 +27,8 @@ import tilelang
 import tilelang.language as T
 
 sys.path.insert(0, "src")
-from tilerl.ops.backend import get_backend
-from tilerl.ops.reference import linear_fp4, pack_fp4
+from tilerl_kernels.backend import get_backend
+from tilerl_kernels.reference import linear_fp4, pack_fp4
 
 b = get_backend()
 
@@ -325,7 +325,7 @@ for N, K in ((17408, 5120), (5120, 17408)):
     wqp = torch.nn.functional.pad(wq, (0, (Kp - K) // 2, 0, Np - N))
     sp = torch.nn.functional.pad(sc, (0, (Kp - K) // 32, 0, Np - N))
     ref = linear_fp4(x.cpu(), wq.cpu(), sc.cpu())
-    from tilerl.ops import kernels_linear
+    from tilerl_kernels import kernels_linear
 
     y_ship = kernels_linear.make_linear_fp4_gemv("cuda")(xp, wqp, sp, 32, 4, 32)[:, :N].float().cpu()
     e_ship = (y_ship - ref).abs().max().item() / ref.abs().max().item()

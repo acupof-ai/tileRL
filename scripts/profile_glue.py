@@ -31,7 +31,7 @@ def main() -> None:
     from tilerl.config import qwen38_27b
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.model import load_hf
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     model = load_hf(qwen38_27b(), args.source, fuse_projections=True, num_layers=args.layers)

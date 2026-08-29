@@ -16,8 +16,8 @@ import tilelang
 import tilelang.language as T
 
 sys.path.insert(0, "src")
-from tilerl.ops.backend import get_backend
-from tilerl.ops.reference import linear_fp4, pack_fp4
+from tilerl_kernels.backend import get_backend
+from tilerl_kernels.reference import linear_fp4, pack_fp4
 
 b = get_backend()
 

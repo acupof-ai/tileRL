@@ -12,6 +12,12 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform != 'darwin'",
 ]
 
+[manifest]
+members = [
+    "tilerl",
+    "tilerl-kernels",
+]
+
 [[package]]
 name = "annotated-doc"
 version = "0.0.5"
@@ -1150,37 +1156,59 @@ name = "tilerl"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "fastapi" },
-    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "safetensors" },
-    { name = "tilelang", extra = ["fp4"] },
+    { name = "tilerl-kernels" },
     { name = "tokenizers" },
+]
+
+[package.optional-dependencies]
+server = [
+    { name = "fastapi" },
+    { name = "httpx" },
     { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "fastapi" },
+    { name = "httpx" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "fastapi", specifier = ">=0.141.1" },
-    { name = "httpx", specifier = ">=0.28.1" },
+    { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.141.1" },
+    { name = "httpx", marker = "extra == 'server'", specifier = ">=0.28.1" },
     { name = "huggingface-hub", specifier = ">=1.28.0" },
     { name = "safetensors", specifier = ">=0.8.0" },
-    { name = "tilelang", extras = ["fp4"], specifier = ">=0.1.13" },
+    { name = "tilerl-kernels", editable = "packages/tilerl-kernels" },
     { name = "tokenizers", specifier = ">=0.23.1" },
-    { name = "uvicorn", specifier = ">=0.52.4" },
+    { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.52.4" },
 ]
+provides-extras = ["server"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "fastapi", specifier = ">=0.141.1" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.16.4" },
+    { name = "uvicorn", specifier = ">=0.52.4" },
 ]
+
+[[package]]
+name = "tilerl-kernels"
+version = "0.1.0"
+source = { editable = "packages/tilerl-kernels" }
+dependencies = [
+    { name = "tilelang", extra = ["fp4"] },
+]
+
+[package.metadata]
+requires-dist = [{ name = "tilelang", extras = ["fp4"], specifier = ">=0.1.13" }]
 
 [[package]]
 name = "tokenizers"

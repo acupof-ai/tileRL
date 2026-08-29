@@ -2,7 +2,7 @@
 
 Canonical support-status truth for the tileRL kernel layer. If a cell is not
 **done**, do not assume it works because it compiled — the dispatch registry
-(`src/tilerl/ops/registry.py`) is the source of truth, and this file mirrors it.
+(`packages/tilerl-kernels/src/tilerl_kernels/registry.py`) is the source of truth, and this file mirrors it.
 State as of 2026-08-27.
 
 ## What "one kernel source" means
@@ -11,7 +11,7 @@ Three targets have executed the source: **cpu**, **metal**, and **sm90**.
 `rocm` has never run. `_REGISTRY` holds 9 keys but only **3 distinct kernel
 sets** — `rocm` resolves to the same dict object as `cpu`.
 
-Line partition of `src/tilerl/ops/kernels*.py` (1,969 lines, by top-level
+Line partition of `packages/tilerl-kernels/src/tilerl_kernels/kernels*.py` (1,969 lines, by top-level
 function span; `python -c` over `ast` reproduces it):
 
 | lines | % | scope |

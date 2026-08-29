@@ -14,8 +14,8 @@ sys.path.insert(0, "src")
 import torch
 
 import benchkit
-from tilerl.ops.backend import get_backend
-from tilerl.ops.reference import gdn_forward
+from tilerl_kernels.backend import get_backend
+from tilerl_kernels.reference import gdn_forward
 
 B, TT, QD, NVH, K, V, KER = 1, 512, 2048, 48, 128, 128, 4
 VD = NVH * V

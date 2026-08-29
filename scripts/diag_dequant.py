@@ -14,9 +14,9 @@ import torch
 import tilelang
 import tilelang.language as T
 
-from tilerl.ops import kernels_mma
-from tilerl.ops.backend import _pad2d, _round_up, _THREADS, get_backend
-from tilerl.ops.reference import pack_fp4
+from tilerl_kernels import kernels_mma
+from tilerl_kernels.backend import _pad2d, _round_up, _THREADS, get_backend
+from tilerl_kernels.reference import pack_fp4
 
 
 def old_linear_fp4_fp8_mma(target: str):

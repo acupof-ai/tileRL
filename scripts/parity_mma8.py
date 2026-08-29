@@ -17,8 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch  # noqa: E402
 
-from tilerl.ops.backend import get_backend  # noqa: E402
-from tilerl.ops.reference import dequant_fp4, dequant_fp8, pack_fp4  # noqa: E402
+from tilerl_kernels.backend import get_backend  # noqa: E402
+from tilerl_kernels.reference import dequant_fp4, dequant_fp8, pack_fp4  # noqa: E402
 
 
 def quant_fp8(w):

@@ -14,7 +14,7 @@ from __future__ import annotations
 import torch
 
 import benchkit
-from tilerl.ops.backend import get_backend
+from tilerl_kernels.backend import get_backend
 
 
 def _quant_fp8_block(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

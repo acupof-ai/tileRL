@@ -30,7 +30,7 @@ def main() -> None:
     import torch
 
     from tilerl.config import qwen38_27b
-    from tilerl.ops.backend import get_backend
+    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     cfg = qwen38_27b()

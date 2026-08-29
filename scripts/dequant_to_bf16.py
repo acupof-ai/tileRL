@@ -20,7 +20,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from tilerl.ops.reference import dequant_fp8, dequant_nvfp4  # noqa: E402
+from tilerl_kernels.reference import dequant_fp8, dequant_nvfp4  # noqa: E402
 
 src, dst = Path(sys.argv[1]), Path(sys.argv[2])
 dst.mkdir(parents=True, exist_ok=True)
