@@ -154,9 +154,18 @@ class _Req:
     output: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     thought_closed: bool = False  # the reasoning block ended (model's or forced)
-    #: trunk hidden [1,1,H] at the position that produced ``output[-1]`` — the
-    #: draft head's fc input; None until this row has run a forward.
+    #: trunk hidden [1,w,H] for absolute positions
+    #: ``[hidden_from .. hidden_from+w-1]`` — the draft head's fc input. The
+    #: WHOLE forward, not its last position: the draft runs over every position
+    #: it has not covered yet, and one position of overlap is what lets a
+    #: chunked prefill's runs meet without a gap (``hidden_prev``).
     hidden: torch.Tensor | None = None
+    hidden_prev: torch.Tensor | None = None  # [1,1,H] at hidden_from-1
+    hidden_from: int = 0
+    #: highest absolute position whose draft KV belongs to a COMMITTED token.
+    #: A rejected chain writes past it; the next run overwrites those.
+    draft_pos: int = 0
+    drafts: list[int] = field(default_factory=list)  # next tick's chain, minus its first token
 
 
 @dataclass
@@ -367,7 +376,11 @@ class Engine:
 
         # Speculation: the draft is one full-attn stack with its OWN kv plane
         # and no recurrent state — it must never reach the trunk's GDN slots.
-        # One block per row holds a chain (depth+1 <= BLOCK_TOKENS tokens).
+        # The plane spans the trunk's whole block space and is indexed by the
+        # request's own block list, so the draft attends over the same prefix
+        # the trunk does. A chain-local block would leave its attention reading
+        # ONE token (softmax over one position is the identity on v), which is
+        # what made the loop's acceptance 55.8% against the probe's 84.4%.
         self._draft = draft
         self._spec_depth = spec_depth if draft is not None else 0
         if draft is not None:
@@ -384,8 +397,9 @@ class Engine:
             if not 0 < spec_depth < BLOCK_TOKENS:
                 raise ValueError(f"spec_depth must be in [1, {BLOCK_TOKENS}), got {spec_depth}")
             self._draft_kv = PagedKvPool(
-                limits.max_batch, draft.cfg.num_kv_heads, draft.cfg.head_dim,
+                kv_pool.num_blocks, draft.cfg.num_kv_heads, draft.cfg.head_dim,
                 num_layers=draft.cfg.num_layers, device=backend.device,
+                layer_map=tuple(range(draft.cfg.num_layers)),
             )
 
         self._pin = backend.device.type == "cuda"
@@ -725,7 +739,7 @@ class Engine:
         # Speculate on pure-decode ticks only: a mixed tick's width is the
         # bucketed prefill chunk, which the step-state buffers cannot cover.
         chains = (
-            self._draft_chains(decodes, trim=not self._decode_graph_on)
+            [[r.output[-1], *r.drafts] for r in decodes]
             if self._draft is not None and decodes and not prefills
             else None
         )
@@ -798,9 +812,11 @@ class Engine:
             last_only=False if chains else seq_q,
         )
         if hid is not None:
-            for i, r in enumerate(rows):  # the draft's fc input next tick
+            for i, r in enumerate(rows):  # the draft's fc input, whole width
                 # hidden_out is appended before last_only's slice: always full width
-                r.hidden = hid[-1][i : i + 1, seq_q[i] - 1 : seq_q[i]]
+                r.hidden_prev = None if r.hidden is None else r.hidden[:, -1:]
+                r.hidden = hid[-1][i : i + 1, : seq_q[i]]
+                r.hidden_from = int(positions[i, 0])
         if chains:
             self._verify(decodes, chains, logits, hid[-1])
         else:
@@ -813,6 +829,11 @@ class Engine:
             self._decode_forwards += 1
         if decodes and prefills:
             self._mixed_forwards += 1
+        if self._draft is not None:
+            # Every tick that materialized tokens, not just pure-decode ones: a
+            # chunked prefill would otherwise leave the chunks it did not draft
+            # over with no KV, and the draft's attention would read them.
+            self._draft_step(rows)
 
     def _finish_prefills(self, prefills: list[_Req], chunks: list[int], logits, base: int) -> None:
         """Advance every prefill row by its chunk and, for the ones that
@@ -885,56 +906,123 @@ class Engine:
         else:
             if self._draft is not None and g.hidden is not None:
                 for i, r in enumerate(reqs):  # keep the draft's fc input current
-                    r.hidden = g.hidden[i : i + 1, -1:]
+                    r.hidden_prev = None if r.hidden is None else r.hidden[:, -1:]
+                    r.hidden, r.hidden_from = g.hidden[i : i + 1], r.seq_len - 1
             self._sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
+        if self._draft is not None:
+            self._draft_step(reqs)
         return True
 
-    def _draft_chains(self, rows: list[_Req], trim: bool = True) -> list[list[int]]:
-        """Draft up to ``spec_depth`` tokens per row, then trim each row to the
-        length its confidence makes worth verifying (spec.verify_lens).
+    def _draft_step(self, rows: list[_Req]) -> None:
+        """Draft over every position a row materialized but has not drafted yet.
 
-        Returns per row ``[last committed token, kept drafts...]`` — the chain
-        the verify forward consumes. Chain token j sits at absolute position
-        ``seq_len-1+j``; the draft's own KV is chain-local (block i, offset j)
-        and it never touches the trunk's recurrent state.
+        Position q consumes the trunk hidden at q-1 and the token at q, so the
+        run spans ``[draft_pos+1 .. seq_len-1]`` and its LAST position is the
+        draft for the next token: the KV fill and the draft are ONE forward,
+        and the draft's attention never meets a gap. Runs at the END of a tick,
+        while the trunk's hiddens are still live; the chain it leaves in
+        ``r.drafts`` is what the next tick verifies.
         """
-        n, dev = len(rows), self._backend.device
-        chains = [[r.output[-1]] for r in rows]
-        confs: list[list[float]] = [[] for _ in rows]
-        h = torch.cat([r.hidden for r in rows], dim=0)
-        bt = torch.arange(n, dtype=torch.long, device=dev).reshape(n, 1)
-        ones = torch.ones(n, dtype=torch.long, device=dev)
-        for j in range(self._spec_depth):
+        dev = self._backend.device
+        plan = []
+        for r in rows:
+            if r.hidden is None or r.phase == _PHASE_DONE:
+                continue
+            lo, hi = max(1, r.draft_pos + 1), r.seq_len - 1
+            if hi < lo:
+                continue
+            plan.append((r, lo, hi))
+        if not plan:
+            return
+        w = max(hi - lo + 1 for _, lo, hi in plan)
+        nb = max(len(r.blocks) for r, _, _ in plan)
+        n = len(plan)
+        ids = np.zeros((n, w), dtype=np.int64)
+        pos = np.zeros((n, w), dtype=np.int64)
+        bt = torch.zeros(n, nb, dtype=torch.long)
+        hs, sl, sq = [], [], []
+        for i, (r, lo, hi) in enumerate(plan):
+            q = hi - lo + 1
+            ids[i, :q] = r.tokens[lo : hi + 1]
+            pos[i, :q] = np.arange(lo, hi + 1)
+            bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
+            sl.append(hi + 1)
+            sq.append(q)
+            # hidden at [lo-1 .. hi-1]; hidden_prev supplies the one position
+            # that belongs to the previous forward.
+            h, base = r.hidden, r.hidden_from
+            if r.hidden_prev is not None:
+                h, base = torch.cat([r.hidden_prev, r.hidden], dim=1), base - 1
+            off = (lo - 1) - base
+            hs.append(torch.nn.functional.pad(h[:, off : off + q], (0, 0, 0, w - q)))
+        kv = BatchKv(
+            block_table=bt.to(dev), seq_len=torch.tensor(sl, device=dev),
+            state_slot=torch.zeros(n, dtype=torch.long, device=dev),
+            kv_pool=self._draft_kv, state_pool=None,
+            seq_q_lens=torch.tensor(sq, device=dev),
+        )
+        dh: list = []
+        logits = self._draft.forward(torch.cat(hs, dim=0), ids, pos, kv, self._backend,
+                                     hidden_out=dh)
+        last = torch.tensor([q - 1 for q in sq], device=dev)
+        rng = torch.arange(n, device=dev)
+        tok, prob = self._backend.greedy(logits[rng, last].unsqueeze(1))
+        h = dh[-1][rng, last].unsqueeze(1)
+        confs: list[list[float]] = [[] for _ in plan]
+        if self._spec_depth > 1:
+            conf = self._draft.confidence(h, prob, self._backend)
+            for i, c in enumerate(conf[:, -1].tolist()):
+                confs[i].append(float(c))
+        chains = [[int(t)] for t in tok[:, -1].tolist()]
+        for i, (r, _, hi) in enumerate(plan):
+            if r.draft_pos == 0:
+                # Position 0 is never drafted (a draft at q reads the hidden at
+                # q-1), but attention over [0, seq_len) still reads its page —
+                # which a recycled block leaves holding another request's.
+                b = r.blocks[0]
+                self._draft_kv.k_pool[:, b, :, 0, :] = 0
+                self._draft_kv.v_pool[:, b, :, 0, :] = 0
+            r.draft_pos = hi
+
+        # Remaining chain steps, one position each. Bounded by the blocks the
+        # row already owns: this runs after the tick's allocation, and a write
+        # past them would land on another request's page.
+        # ponytail: clamps the chain instead of allocating; a row at a block
+        # boundary drafts shorter for one tick.
+        for j in range(1, self._spec_depth):
+            live = [i for i, (r, _, hi) in enumerate(plan)
+                    if hi + j < len(plan[i][0].blocks) * BLOCK_TOKENS]
+            if not live:
+                break
+            li = torch.tensor(live, device=dev)
             kv = BatchKv(
-                block_table=bt, seq_len=ones * (j + 1), state_slot=torch.zeros_like(ones),
-                kv_pool=self._draft_kv, state_pool=None, seq_q_lens=ones,
+                block_table=bt[live].to(dev),
+                seq_len=torch.tensor([plan[i][2] + 1 + j for i in live], device=dev),
+                state_slot=torch.zeros(len(live), dtype=torch.long, device=dev),
+                kv_pool=self._draft_kv, state_pool=None,
+                seq_q_lens=torch.ones(len(live), dtype=torch.long, device=dev),
             )
-            dh: list = []
+            dh = []
             logits = self._draft.forward(
-                h,
-                np.array([[c[-1]] for c in chains], dtype=np.int64),
-                np.array([[r.seq_len - 1 + j] for r in rows], dtype=np.int64),
+                h[li], np.array([[chains[i][-1]] for i in live], dtype=np.int64),
+                np.array([[plan[i][2] + j] for i in live], dtype=np.int64),
                 kv, self._backend, hidden_out=dh,
             )
             tok, prob = self._backend.greedy(logits)
-            if trim:
-                conf = self._draft.confidence(dh[-1], prob, self._backend)
-                for i, c in enumerate(conf[:, -1].tolist()):
-                    confs[i].append(float(c))
-            # One D2H per step, not two: each sync drains the pipeline, and at
-            # depth 2 that was ~19 ms of a 35 ms captured tick.
-            for i, t in enumerate(tok[:, -1].tolist()):
-                chains[i].append(int(t))
-            h = dh[-1]
-        if not trim:  # a captured tick pads to one width anyway
-            return chains
-        keep = verify_lens([survival(c) for c in confs])
-        for i, r in enumerate(rows):
+            conf = self._draft.confidence(dh[-1], prob, self._backend)
+            for k, c in enumerate(conf[:, -1].tolist()):
+                confs[live[k]].append(float(c))
+            for k, t in enumerate(tok[:, -1].tolist()):
+                chains[live[k]].append(int(t))
+            h = h.index_copy(0, li, dh[-1])
+
+        keep = verify_lens([survival(c) for c in confs]) if self._spec_depth > 1 \
+            else [1] * len(plan)
+        for i, (r, _, _) in enumerate(plan):
             p = r.params
             if p.thinking_budget is not None and p.end_think_ids and not r.thought_closed:
-                keep[i] = 0  # a forced end-think token is not the sampler's, so nothing to verify
-            del chains[i][1 + keep[i] :]
-        return chains
+                keep[i] = 0  # a forced end-think token is not the sampler's
+            r.drafts = chains[i][: keep[i]]
 
     def _verify(self, rows, chains, logits, hidden) -> None:
         """Accept the leading run of drafts the trunk agrees with, adopt the
@@ -961,7 +1049,8 @@ class Engine:
             self._spec_accepted += n_ok
             self._spec_drafted += len(chains[i]) - 1
             self._states.select_step(r.state_slot, n_ok)
-            r.hidden = hidden[i : i + 1, n_ok : n_ok + 1]
+            r.hidden_prev = None if r.hidden is None else r.hidden[:, -1:]
+            r.hidden, r.hidden_from = hidden[i : i + 1], r.seq_len - 1
             self._commit(r, got[: n_ok + 1],
                          None if lps is None else lps[at - len(chains[i]) : at][: n_ok + 1])
 
