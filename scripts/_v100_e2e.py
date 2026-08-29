@@ -46,9 +46,12 @@ def main():
     # (b) tokenizer (varied ids -> ""), (c) the commit rewrite (thinking_budget).
     params = SamplingParams(temperature=0.0, max_new_tokens=8)
     rid = eng.submit(ids, params)
-    while eng.take(rid) is None:
+    out = None
+    while out is None:
+        out = eng.take(rid)  # take() POPS the finished result — capture, don't recall
+        if out is not None:
+            break
         eng.step()
-    out = eng.take(rid) or []
     print("RAW OUT ids:", out, flush=True)
     print("PROMPT:", prompt)
     print("OUTPUT:", repr(tok.decode(out)[:300]), flush=True)
@@ -58,11 +61,14 @@ def main():
     rid = eng.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=128))
     t0 = time.time()
     n = 0
-    while eng.take(rid) is None:
+    out = None
+    while out is None:
+        out = eng.take(rid)
+        if out is not None:
+            break
         eng.step()
         n += 1
     dt = time.time() - t0
-    out = eng.take(rid) or []
     tps = len(out) / dt if dt > 0 else 0
     print(f"DECODE B=1: {len(out)} tokens in {dt:.2f}s = {tps:.1f} tok/s", flush=True)
     print("E2E OK")

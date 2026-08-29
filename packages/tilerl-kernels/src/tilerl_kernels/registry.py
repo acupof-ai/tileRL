@@ -134,6 +134,13 @@ _SM70_KERNELS = {
     # row and backend._served_fp4's twiddle gate both resolve without an
     # arch branch. The maker itself is the Volta (natural-layout, pure-TIR) one.
     "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv_sm70,  # M=1 decode
+    # GDN decode: the sm90 fused kernel is already pure block-parallel TIR (no
+    # WGMMA/cp.async/TMA), so it runs on Volta unchanged except its output
+    # dtype — sm70's out_proj GEMV reads f32, not bf16. This one kernel is both
+    # the launch fix (384 tiny kernels/layer -> 1) and the CUDA-graph fix (it
+    # removes the eager gdn_forward's int(seq_q_lens) host sync that breaks
+    # capture). Without it, all 48 GDN layers run eager and the graph is off.
+    "gdn_decode_fused": lambda t: kernels_gdn.make_gdn_decode_fused(t, out_dtype="float32"),
 }
 _register("bf16", "sm70", _SM70_KERNELS)
 _register("fp4", "sm70", _SM70_KERNELS)

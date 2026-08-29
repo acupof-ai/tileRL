@@ -139,7 +139,7 @@ def make_gdn_state_scan(target: str, block_DV: int = 32, threads: int = 128,
 # ---------------------------------------------------------------- gated-delta decode (fused)
 
 
-def make_gdn_decode_fused(target: str):
+def make_gdn_decode_fused(target: str, out_dtype: str = "bfloat16"):
     """Fused gated-delta decode core (sm90): conv1d + SiLU + q/k L2-norm +
     decay-first delta recurrence + gated RMSNorm + z-gate, one launch for
     T=1.
@@ -198,7 +198,7 @@ def make_gdn_decode_fused(target: str):
         # NewState buffer (was 2 index launches + 3 MB of traffic per layer).
         States: T.Tensor((S, L, NVH, K, V), "float32")
         Slots: T.Tensor((B,), "int32")
-        Out = T.empty((B, VD), "bfloat16")  # out_proj (fp8 GEMV) reads bf16
+        Out = T.empty((B, VD), out_dtype)  # out_proj GEMV reads this (bf16 sm90, f32 sm70)
         with T.Kernel(NVH, B, threads=threads) as (vh, bb):
             tv = T.get_thread_binding(0)
             slot = Slots[bb]
@@ -288,7 +288,7 @@ def make_gdn_decode_fused(target: str):
             T.tvm_storage_sync("shared")
             gate = Z[bb, vh * V + tv]
             Out[bb, vh * V + tv] = T.cast(
-                out_s[tv] * rms_s[0] * NormW[tv] * (gate * T.sigmoid(gate)), "bfloat16"
+                out_s[tv] * rms_s[0] * NormW[tv] * (gate * T.sigmoid(gate)), out_dtype
             )
 
             # new conv window: shift left, append current qkv. q/k channels
