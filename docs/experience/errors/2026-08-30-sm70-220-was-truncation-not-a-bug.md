@@ -50,3 +50,22 @@ confident wrong token (logprob ≫ uniform floor) is a shallow/mis-prompted
 model, NOT a collapsed one; a collapsed model sits near −log(vocab). Validate
 correctness on the FULL model or a config the reference also degenerates on —
 never on a truncation whose degeneration you have not first characterized.
+
+## Meta-rule: a green signal proves a narrower thing than it reads as
+
+This bug and three the peer hit the same week are one failure mode — reading a
+narrow guarantee as a broad one. Before trusting a green/zero signal, ask what
+it actually constrains:
+- **CUDA graph capture succeeds** ⟹ the *captured region* has no host sync. It
+  does NOT ⟹ the tick is sync-free: the sampler's token read-back runs after
+  replay, outside capture, and must (decode tick = 0 scalar + 1 bulk, not 0/0).
+- **`aten._local_scalar_dense` count == N** ⟹ N scalar `int()`/`.item()`. It
+  does NOT ⟹ N transfers: multi-element `.tolist()`/`.numpy()` are invisible to
+  a TorchDispatchMode counter (`scripts/probe_syncs.py` wraps both classes).
+- **A parity test is green** ⟹ the kernel faithfully implements *its reference's
+  algorithm*. It does NOT ⟹ the algorithm is accurate: an fp8-activation
+  reference and its kernel agree at 3.6e-2 while the project's 1e-2 gate is a
+  different bar (see the M=4..8 fp8-decode path).
+- **A truncated model degenerates** ⟹ it is shallow. It does NOT ⟹ a bug.
+When the signal is green, name the exact claim it licenses before building on it.
+
