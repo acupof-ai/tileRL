@@ -14,7 +14,126 @@ from .kernels_mma import _pass_configs
 __all__ = [
     "make_gdn_decode_fused",
     "make_gdn_chunk_fused",
+    "make_gdn_state_scan",
 ]
+
+
+def make_gdn_state_scan(target: str, block_DV: int = 32, threads: int = 128,
+                        num_stages: int = 1):
+    """Inter-chunk state scan of the chunkwise-WY gated-delta form.
+
+    ``S_next = e_last * S + K_c^T (U_c - W_c S)`` per chunk, carrying S across
+    chunks. This is the ONE piece the two 2026-08-25 WY ports lost on: their
+    chunk interior was already 2.9x faster than the serial mega-kernel (1.62 ms
+    vs 4.73) and this scan cost 10.76 ms on its own. fla's equivalent measures
+    **37.8 us** at the same shapes — 285x — and the reference makes the reason
+    a single decision:
+
+    **the state never leaves registers.** ``b_h`` is a fragment held across the
+    whole chunk loop; ``block_DV`` slices DK x DV into register-sized DK x 32
+    columns so it fits. A chunk is then two gemms and zero state round-trips,
+    where writing the 64 KB state back per chunk is what cost 285x.
+
+    Gates are applied in log2 (``exp2``) like the reference, and a positive
+    ``g_last - g_i`` is zeroed rather than exponentiated — the same overflow
+    guard reference.gdn_chunk_core states for its clamp.
+
+    Intermediates stay f32 in fragments: the 6-kernel port that staged them as
+    bf16 in global memory read 26% error at scale=1.0
+    (errors/2026-08-25-gdn-chunked-gdr-rejected).
+
+    UNFINISHED — not registered, not dispatched. Speed is there (34.5 us a
+    layer against fla's 34.0, 0.99x) and the arithmetic is not: the carried
+    state never reaches the accumulator, so `S_next` comes out as `K^T V_new`
+    with the `e_last * S` term missing (known-answer cases: state reads 0 where
+    1 is exact, 64 where 65 is). Bisected — disabling the decay multiply
+    entirely changes nothing, so it is neither the scalar nor the elementwise
+    pass, but `T.gemm` not accumulating into `h_fr`'s existing value despite
+    `clear_accum=False`.
+
+    Next: the reference keeps `T.copy(b_h_shared, h[...])` at the TOP of the
+    chunk loop (it exports the per-chunk state, which we do not need and which
+    I dropped). That read may be what makes tilelang treat `b_h_fragment` as
+    live across the gemm. Restore it, or write the state through shared each
+    iteration, and re-run `scripts/probe_scan_mini.py`.
+
+    # SOTA copy: tilelang examples/gdn/example_chunk_delta_h.py
+    #   (fla/ops/common/chunk_delta_h.py's chunk_gated_delta_rule_fwd_h).
+    # Adapted: our [B,T,HV,D] layout with the key heads already broadcast, no
+    #   varlen/cu_seqlens path, and V_new returned always (the chunk-o stage
+    #   consumes it).
+    """
+
+    # This tree runs tilelang in EAGER mode: outputs are declared with T.empty,
+    # and out_idx is a lazy-mode-only annotation.
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def gdn_state_scan(K, W, U, G, State, chunk):
+        B, S, H, DK = T.const("B, S, H, DK")
+        DV = T.const("DV")
+        K: T.Tensor((B, S, H, DK), "bfloat16")
+        W: T.Tensor((B, S, H, DK), "bfloat16")
+        U: T.Tensor((B, S, H, DV), "bfloat16")
+        G: T.Tensor((B, S, H), "float32")  # chunk-local inclusive cumsum
+        State: T.Tensor((B, H, DK, DV), "float32")
+        VNew = T.empty((B, S, H, DV), "bfloat16")
+        Out = T.empty((B, H, DK, DV), "float32")
+        with T.Kernel(T.ceildiv(DV, block_DV), B * H, threads=threads) as (bv, bbh):
+            bb, bh = bbh // H, bbh % H
+            v0 = bv * block_DV
+            h_sh = T.alloc_shared((DK, block_DV), "bfloat16")
+            h_fr = T.alloc_fragment((DK, block_DV), "float32")
+            u_sh = T.alloc_shared((chunk, block_DV), "bfloat16")
+            u_fr = T.alloc_fragment((chunk, block_DV), "float32")
+            w_sh = T.alloc_shared((chunk, DK), "bfloat16")
+            k_sh = T.alloc_shared((chunk, DK), "bfloat16")
+            vn_fr = T.alloc_fragment((chunk, block_DV), "float32")
+            vn_sh = T.alloc_shared((chunk, block_DV), "bfloat16")
+            g_sh = T.alloc_shared((chunk, block_DV), "float32")
+            g_fr = T.alloc_fragment((chunk, block_DV), "float32")
+            # Two vars, not one rebound: reassigning a T.alloc_var with a
+            # Python `=` swaps the device scalar for a host-side expression, and
+            # the state decay below then multiplies by the wrong thing — the
+            # exp2(G_last)*S term vanished entirely (state read 0 for every gate).
+            g_last = T.alloc_var(T.float32)
+            g_decay = T.alloc_var(T.float32)
+            T.annotate_layout({
+                u_sh: tilelang.layout.make_swizzled_layout(u_sh),
+                g_sh: tilelang.layout.make_swizzled_layout(g_sh),
+            })
+            T.copy(State[bb, bh, 0:DK, v0 : v0 + block_DV], h_sh)
+            T.copy(h_sh, h_fr)
+            for c in T.Pipelined(T.ceildiv(S, chunk), num_stages=num_stages):
+                # V_new = U - W @ S
+                T.copy(W[bb, c * chunk : (c + 1) * chunk, bh, 0:DK], w_sh)
+                T.gemm(w_sh, h_sh, vn_fr, clear_accum=True)
+                T.copy(U[bb, c * chunk : (c + 1) * chunk, bh, v0 : v0 + block_DV], u_sh)
+                T.copy(u_sh, u_fr)
+                for i, j in T.Parallel(chunk, block_DV):
+                    vn_fr[i, j] = u_fr[i, j] - vn_fr[i, j]
+                T.copy(vn_fr, vn_sh)
+                T.copy(vn_sh, VNew[bb, c * chunk : (c + 1) * chunk, bh, v0 : v0 + block_DV])
+                # decay to the chunk end, then S += K^T V_new
+                T.copy(K[bb, c * chunk : (c + 1) * chunk, bh, 0:DK], k_sh)
+                g_last = G[bb, (c + 1) * chunk - 1, bh]
+                for i, j in T.Parallel(chunk, block_DV):
+                    g_sh[i, j] = G[bb, c * chunk + i, bh]
+                T.copy(g_sh, g_fr)
+                for i, j in T.Parallel(chunk, block_DV):
+                    vn_fr[i, j] = (
+                        vn_fr[i, j] * T.exp2((g_last - g_fr[i, j]) * 1.4426950408889634)
+                        if g_last - g_fr[i, j] <= 0
+                        else 0
+                    )
+                g_decay = T.exp2(g_last * 1.4426950408889634)
+                for i, j in T.Parallel(DK, block_DV):
+                    h_fr[i, j] *= g_decay
+                T.copy(vn_fr, vn_sh)
+                T.gemm(k_sh, vn_sh, h_fr, transpose_A=True)
+                T.copy(h_fr, h_sh)
+            T.copy(h_fr, Out[bb, bh, 0:DK, v0 : v0 + block_DV])
+        return VNew, Out
+
+    return gdn_state_scan
 
 
 # ---------------------------------------------------------------- gated-delta decode (fused)
