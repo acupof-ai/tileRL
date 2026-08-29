@@ -61,6 +61,11 @@ from .spec import survival, verify_lens
 
 _PREFILL_BUCKET = 64  # prefill widths are padded to this: bounded kernel shapes
 
+#: Decode-graph size ladder. A tick rounds UP to the first entry >= its row
+#: count and pads; without it every distinct batch size captured its own graph
+#: and its own memory pool.
+_GRAPH_BUCKETS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)
+
 __all__ = ["Engine", "SamplingParams", "StepLimits", "BatchKv", "build_engine"]
 
 _PHASE_PREFILL = 1
@@ -210,6 +215,7 @@ class _DecodeGraph:
         B, W = batch_size, width
         # int32 end to end: every consumer is a kernel taking int32, and a
         # long buffer costs an int64->int32 cast launch per use inside the graph.
+        self._b = B
         self._w = W
         self._ids = torch.empty(B, W, dtype=torch.int32, device=device)
         self._pos = torch.empty(B, W, dtype=torch.int32, device=device)
@@ -265,12 +271,16 @@ class _DecodeGraph:
         # draft head reads the previous tick's hidden from it directly.
         self.hidden = hid[-1] if hid else None
 
-    def run(self, reqs, chains=None):
+    def run(self, reqs, chains=None, pad=None):
         """Copy per-tick inputs into the static buffers and replay.
 
         Returns the static logits [B,W,V]; valid until the next replay.
         ``chains[i]`` is row i's ``[last committed token, drafts...]``, all of
-        length W.
+        length W. ``pad`` is ``(state_slot, block)`` for the rows beyond
+        ``len(reqs)``: a captured graph runs its full width every replay, so
+        those rows still WRITE to the KV and recurrent pools. Leaving them on
+        a finished request's slot would let them overwrite whatever request
+        was given that slot next.
         """
         for i, r in enumerate(reqs):
             if r.phase == _PHASE_PREFILL:
@@ -290,6 +300,14 @@ class _DecodeGraph:
             self._ss_h[i] = r.state_slot
             n = len(r.blocks)
             self._bt_h[i, :n] = torch.tensor(r.blocks, dtype=torch.int32)
+        if pad is not None and len(reqs) < self._b:
+            pad_slot, pad_block = pad
+            for i in range(len(reqs), self._b):
+                self._ids_h[i, :] = 0
+                self._pos_h[i, :] = 0
+                self._sl_h[i] = self._w
+                self._ss_h[i] = pad_slot
+                self._bt_h[i, :] = pad_block
         self._ids.copy_(self._ids_h, non_blocking=True)
         self._pos.copy_(self._pos_h, non_blocking=True)
         self._sl.copy_(self._sl_h, non_blocking=True)
@@ -332,6 +350,13 @@ class Engine:
             decode_graph = backend.device.type == "cuda"
         self._decode_graph_on = decode_graph
         self._decode_graphs: dict = {}
+        # Reserved LAZILY, on the first tick that actually pads: a replay runs
+        # its full captured width and the padding rows still write to both
+        # pools, so they must not land on a slot a live request owns. Taking
+        # them at construction would shrink every engine's usable pool by one
+        # slot even when nothing ever pads.
+        self._pad_slot: int | None = None
+        self._pad_block: int | None = None
 
         # Speculation: the draft is one full-attn stack with its OWN kv plane
         # and no recurrent state — it must never reach the trunk's GDN slots.
@@ -808,11 +833,27 @@ class Engine:
                     pf.phase = _PHASE_DECODE
 
     def _run_decode_graph(self, reqs: list[_Req], chains=None) -> bool:
-        """Captured decode for a pure-decode tick (one graph per batch-size
-        bucket, captured lazily on the first tick of that size). Returns
-        False (and flips the flag off) when capture failed, so the caller
-        runs eager."""
-        B, W = len(reqs), len(chains[0]) if chains else 1
+        """Captured decode for a pure-decode tick, one graph per SIZE BUCKET.
+
+        Capturing per exact batch size meant a batch draining from 32 to 1
+        captured up to 32 graphs, each holding its own CUDA graph memory pool
+        - tens of GiB that never come back, and the reason B=64 hit OOM
+        during the drain while steady-state decode peaked at 39 GiB. vLLM and
+        sglang capture a fixed ladder and pad up to it; same here.
+
+        Returns False (and flips the flag off) when capture failed, so the
+        caller runs eager.
+        """
+        n, W = len(reqs), len(chains[0]) if chains else 1
+        B = next((c for c in _GRAPH_BUCKETS if c >= n), None)
+        if B is None or self.limits.max_batch < B:
+            B = n  # above the ladder: one exact-size graph rather than none
+        if n < B and self._pad_slot is None:
+            try:
+                self._pad_slot = self._states.alloc_slot()
+                self._pad_block = self._kv.alloc_block()
+            except RuntimeError:
+                B = n  # no spare capacity to park padding rows on: exact size
         g = self._decode_graphs.get((B, W))
         if g is None:
             try:
@@ -825,7 +866,8 @@ class Engine:
                 self._decode_graph_on = False
                 return False
             self._decode_graphs[(B, W)] = g
-        logits = g.run(reqs, chains)
+        pad = None if self._pad_slot is None else (self._pad_slot, self._pad_block)
+        logits = g.run(reqs, chains, pad=pad)
         self._decode_forwards += 1
         if chains:
             # No hidden from a replay: the next tick's draft reads it from the
