@@ -209,7 +209,7 @@ class _DecodeGraph:
     # cast, which the optimizer's copy_ invalidates in eager only.
     """
 
-    def __init__(self, model, backend, kv_pool, state_pool, batch_size, width=1,
+    def __init__(self, model, backend, kv_pool, state_pool, batch_size, width=1, pool=None,
                  last_only=False, keep=0):
         device = backend.device
         B, W = batch_size, width
@@ -264,7 +264,13 @@ class _DecodeGraph:
         torch.cuda.current_stream().wait_stream(s)
         self._graph = torch.cuda.CUDAGraph()
         hid: list = []
-        with torch.cuda.graph(self._graph):
+        # One memory pool shared by every bucket's graph. Without it each
+        # capture takes a private pool that is never returned, so the ladder's
+        # seven buckets cost seven copies of a decode tick's whole working
+        # set. Only one graph replays at a time and the logits contract is
+        # already "valid until the next replay", so sharing is safe - it is
+        # what vLLM and sglang do.
+        with torch.cuda.graph(self._graph, pool=pool):
             self._logits = model.forward(self._ids, self._pos, self._kv, backend,
                                          hidden_out=hid, last_only=last_only)
         # Captured, so this tensor is rewritten in place by every replay — the
@@ -357,6 +363,7 @@ class Engine:
         # slot even when nothing ever pads.
         self._pad_slot: int | None = None
         self._pad_block: int | None = None
+        self._graph_pool = None
 
         # Speculation: the draft is one full-attn stack with its OWN kv plane
         # and no recurrent state — it must never reach the trunk's GDN slots.
@@ -857,8 +864,10 @@ class Engine:
         g = self._decode_graphs.get((B, W))
         if g is None:
             try:
+                if self._graph_pool is None:
+                    self._graph_pool = torch.cuda.graph_pool_handle()
                 g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B,
-                                 width=W, keep=W if chains else 0)
+                                 width=W, pool=self._graph_pool, keep=W if chains else 0)
             except Exception as exc:
                 warnings.warn(
                     f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback"
