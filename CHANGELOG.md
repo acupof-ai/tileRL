@@ -4,6 +4,18 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-29 — reject: streaming gradient release is not a memory win
+
+- `Tape.backward` can now hand each gradient to a callback the moment it is
+  final, so anything the step does not keep is dropped instead of living until
+  backward returns. The mechanism is correct and equivalence-tested; wiring it
+  into `train._step` was reverted.
+- The 8.9-9.3 GiB it reclaims was measured **after backward returned**, not at
+  the peak, and peak is what OOMs. Three of four 27B LoRA shapes regressed
+  3-7% (1x128 80.5 -> 75.4, 1x256 113.5 -> 105.9) with peak GB unmoved; only
+  2x256 saved anything (76.5 -> 71.8 GB).
+  [errors/2026-08-29-streaming-grad-release-no-peak-win.md](docs/experience/errors/2026-08-29-streaming-grad-release-no-peak-win.md)
+
 ## 2026-08-29 — default flip: the gated-delta backward is chunked (CHUNK=16)
 
 - `reference.gdn_backward` looped over the time dimension twice in Python, ~28
