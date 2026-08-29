@@ -127,6 +127,44 @@ The `spec/*` baseline rows are now meaningless — the harness PASSes them at
 0.15x of plain, because they were seeded when the arm was measured differently.
 A row whose gate can pass while the feature loses 6.7x is worse than no row.
 
+## The break-even condition, measured (closes this)
+
+The real verify tick, profiled with `keep=W` (a draft-built pool), B=1 —
+W=1 -> W=2, per kernel:
+
+| | ms |
+|---|---:|
+| fp4 GEMV, M=1 -> 2 | **+3.385** |
+| fp8 GEMV, M=1 -> 2 | **+2.588** |
+| `index_elementwise` (the keep=W state scatter) | +1.358 |
+| other elementwise | +0.83 |
+| GDN (chunk replaces decode) | +0.135 |
+| **total** | **+8.9** (11.19 -> 20.05 ms) |
+
+**67% of the growth is the linears**, and that part is the GEMV's physics: it
+costs 13.8 us per extra row (fp4), because two thirds of the kernel is per-row
+FMA rather than the weight stream it shares
+([wins/2026-08-29-m-row-gemv.md](2026-08-29-m-row-gemv.md)). `keep=W` is only
+~2.2 ms of it.
+
+Grant both remaining levers — a free `keep` and the captured draft step (a real
+2.59x that was reverted) — and the tick is 17.9 ms against a 10.76 ms plain
+tick. Break-even then needs
+
+    1 + p >= 17.9 / 10.76  ->  p >= 66%
+
+against a **measured 55.8%**. And that 55.8% is not a random-prompt artifact:
+the suite runs `64 + 8B` settle ticks before timing, so the context at
+measurement is at least 64 tokens of the model's OWN output — in-distribution,
+which is the favourable case.
+
+So the gap is not engineering. It is that a width-2 verify costs ~1.6x a
+width-1 tick on this kernel set, and this draft head accepts 56% where 66% is
+needed. Closed for this (model, draft head) pair. It would reopen on a head
+with materially higher acceptance, or on a decode GEMM whose cost is flat in M
+— which is exactly what `mma8` is and why it is 2.4-3.0x too slow to use
+([errors/2026-08-29-mma8-is-register-bound.md](../errors/2026-08-29-mma8-is-register-bound.md)).
+
 ## Rule
 
 Benchmark against the configuration that ships, not the one that is easy to

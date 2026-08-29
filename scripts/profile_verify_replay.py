@@ -43,6 +43,7 @@ def main() -> None:
     ap.add_argument("--batches", default="1")
     ap.add_argument("--widths", default="1,2,3,5")
     ap.add_argument("--top", type=int, default=12)
+    ap.add_argument("--draft", help="build with a draft head so keep=W is exercised")
     args = ap.parse_args()
 
     from dataclasses import replace
@@ -53,7 +54,13 @@ def main() -> None:
     cfg = replace(base, num_layers=args.layers,
                   full_attn_layers=tuple(i for i in base.full_attn_layers if i < args.layers))
     model = load_hf(cfg, args.source)
-    engine = build_engine(cfg, model, backend, num_blocks=1024, num_slots=16, decode_graph=True)
+    draft = None
+    if args.draft:
+        from tilerl.spec import load_draft
+
+        draft = load_draft(model, args.draft)
+    engine = build_engine(cfg, model, backend, num_blocks=1024, num_slots=16,
+                          decode_graph=True, draft=draft, spec_depth=4)
 
     gen = torch.Generator().manual_seed(7)
     batches = [int(x) for x in args.batches.split(",")]
@@ -67,11 +74,13 @@ def main() -> None:
       rows = list(engine._running)[:B]
       for W in (int(x) for x in args.widths.split(",")):
           chains = [[r.output[-1]] * W for r in rows] if W > 1 else None
+          # keep=W is what a REAL verify tick uses: it writes the recurrent
+          # state after every chain step. Measuring with keep=0 is what made a
+          # 21.17 ms tick read as 17.54 and turned a 0.57x into a predicted
+          # 1.06x. Needs a draft-built pool (--draft) for the step planes.
+          keep = W if (chains and draft is not None) else 0
           g = _DecodeGraph(model, backend, engine._kv, engine._states, B,
-                           # keep=0: the step buffers only change WHICH plane the
-                           # scatter writes, not the kernel mix this measures, and
-                           # they exist only on a draft-built pool.
-                           width=W, keep=0)
+                           width=W, keep=keep)
           ms = timed(lambda: g.run(rows, chains))
           with profile(activities=[ProfilerActivity.CUDA]) as prof:
               for _ in range(5):
