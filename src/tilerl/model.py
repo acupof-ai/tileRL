@@ -465,7 +465,7 @@ class Model:
         kv: Any,
         backend: "Backend",
         hidden_out: list | None = None,
-        last_only: bool = False,
+        last_only: "bool | list[int]" = False,
     ) -> torch.Tensor:
         """Run the model. ``input_ids`` [B,T] int, ``positions`` [T] or [B,T]
         int (RoPE positions), ``kv`` a BatchKv with pools attached. Returns
@@ -493,8 +493,20 @@ class Model:
         # it knows the per-row lengths as Python ints, and asking the device
         # instead would be a host sync — illegal inside a CUDA graph capture,
         # which is what blocked capturing a prefill tick.
-        if last_only and x.shape[1] > 1:
-            x = autograd.slice(x, ..., slice(x.shape[1] - 1, None), slice(None))
+        #
+        # A LIST gives the per-row valid length. Rows in one tick do not share
+        # one: a mixed tick's decode rows end at position 1 while the prefill
+        # row runs the full width, so a single trailing slice cannot express
+        # it and the bool form simply gave up and ran lm_head over every
+        # position of every row — measured as a 3.05 GiB f32 logits tensor,
+        # three of them live, on a B=32 mixed tick. Serving only: the tape
+        # never passes a list (training wants every position's logits).
+        if last_only is not False and x.shape[1] > 1:
+            if last_only is True:
+                x = autograd.slice(x, ..., slice(x.shape[1] - 1, None), slice(None))
+            else:
+                idx = torch.as_tensor([n - 1 for n in last_only], device=device)
+                x = x[torch.arange(x.shape[0], device=device), idx].unsqueeze(1)
         x = backend.rmsnorm(x, self.params["final_norm"], cfg.rms_eps)
         head_key = "embed_tokens" if cfg.tie_word_embeddings else "lm_head"
         return self._linear(backend, x, head_key)
