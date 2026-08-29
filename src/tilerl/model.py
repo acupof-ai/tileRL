@@ -286,6 +286,10 @@ class Model:
     def _add_via(self, backend: "Backend", kv: Any, x: torch.Tensor, h: torch.Tensor, key: str):
         """x + linear(h): fused into the GEMV epilogue on the serving path,
         backend.add (tape-recorded) otherwise."""
+        if getattr(backend, "tp_world", 1) > 1:
+            # Row-parallel: this rank holds a PARTIAL sum, so the residual add
+            # cannot ride the GEMV epilogue - it has to follow the all-reduce.
+            return backend.add(x, backend.all_reduce(self._linear(backend, h, key)))
         if getattr(backend, "fuses_residual", False) and not getattr(kv, "dense", False):
             return self._linear(backend, h, key, residual=x)
         return backend.add(x, self._linear(backend, h, key))
