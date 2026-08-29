@@ -389,7 +389,9 @@ class KvTier:
     """
 
     def __init__(self, path: str, min_tokens: int = 2048) -> None:
+        import queue
         import shutil
+        import threading
 
         self._dir = os.fspath(path)
         # min_tokens is per-tier: an SSD tier wants a churn floor (small entries
@@ -398,6 +400,28 @@ class KvTier:
         self.min_tokens = min_tokens
         shutil.rmtree(self._dir, ignore_errors=True)
         os.makedirs(self._dir, exist_ok=True)
+        # Deferred write: spill_kv runs INSIDE a decode tick (_publish_prefix on
+        # the forward path), so the ~100ms torch.save cannot happen there — it
+        # would stall a 10ms tick 10x. spill_kv does only the GPU->CPU copy
+        # (~2ms PCIe) + enqueue; a daemon thread flushes to disk off-tick.
+        # `_pending`/`_pending_st` hold copies not yet on disk so has()/load see them.
+        self._pending: dict[int, dict] = {}
+        self._pending_st: dict[int, dict] = {}
+        self._lock = threading.Lock()
+        self._q: "queue.Queue" = queue.Queue()
+        self._writer = threading.Thread(target=self._flush_loop, daemon=True)
+        self._writer.start()
+
+    def _flush_loop(self) -> None:
+        while True:
+            tag, blob, dst = self._q.get()
+            torch.save(blob, dst)
+            with self._lock:
+                # tag is a bare int (KV) or ("st", key) (GDN snapshot).
+                if isinstance(tag, tuple):
+                    self._pending_st.pop(tag[1], None)
+                else:
+                    self._pending.pop(tag, None)  # now durable on disk
 
     def _kv(self, key: int) -> str:
         return os.path.join(self._dir, f"{key & _MASK64:016x}.kv")
@@ -414,35 +438,54 @@ class KvTier:
         # prefix is block-aligned, so len(blocks)*BLOCK_TOKENS is its length.
         if len(blocks) * BLOCK_TOKENS < self.min_tokens:
             return False
+        # GPU->CPU copy now (fast, on-tick); torch.save deferred to the writer.
         k = torch.stack([pool.k_pool[:, b] for b in blocks]).contiguous().cpu()
         v = torch.stack([pool.v_pool[:, b] for b in blocks]).contiguous().cpu()
-        torch.save({"k": k, "v": v}, self._kv(key))
+        blob = {"k": k, "v": v}
+        with self._lock:
+            self._pending[key] = blob
+        self._q.put((key, blob, self._kv(key)))
         return True
 
     def load_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> bool:
         # Returns False if the data is gone (a concurrent eviction dropped it
         # between lookup and load) — the caller frees its blocks and treats the
         # hit as a miss. Total with spill_kv, and closes the has()/load TOCTOU.
-        if not self.has(key):
-            return False
-        d = torch.load(self._kv(key), map_location="cpu")
+        # A still-pending (not yet flushed) blob is served from memory.
+        with self._lock:
+            blob = self._pending.get(key)
+        if blob is None:
+            if not os.path.exists(self._kv(key)):
+                return False
+            blob = torch.load(self._kv(key), map_location="cpu")
         for i, b in enumerate(blocks):
-            pool.k_pool[:, b].copy_(d["k"][i].to(pool.device))
-            pool.v_pool[:, b].copy_(d["v"][i].to(pool.device))
+            pool.k_pool[:, b].copy_(blob["k"][i].to(pool.device))
+            pool.v_pool[:, b].copy_(blob["v"][i].to(pool.device))
         return True
 
     def spill_state(self, key: int, states, windows) -> None:
         blob = {"states": states.cpu(), "windows": None if windows is None else windows.cpu()}
-        torch.save(blob, self._st(key))
+        with self._lock:
+            self._pending_st[key] = blob
+        self._q.put((("st", key), blob, self._st(key)))
 
     def load_state(self, key: int):
-        d = torch.load(self._st(key), map_location="cpu")
-        return d["states"], d["windows"]
+        with self._lock:
+            blob = self._pending_st.get(key)
+        if blob is None:
+            blob = torch.load(self._st(key), map_location="cpu")
+        return blob["states"], blob["windows"]
 
     def has(self, key: int) -> bool:
+        with self._lock:
+            if key in self._pending:
+                return True
         return os.path.exists(self._kv(key))
 
     def drop(self, key: int) -> None:
+        with self._lock:
+            self._pending.pop(key, None)
+            self._pending_st.pop(key, None)
         for p in (self._kv(key), self._st(key)):
             try:
                 os.remove(p)

@@ -410,3 +410,43 @@ def test_tier_min_tokens_gates_spill(tmp_path):
     # Sub-floor: dropped, not spilled.
     assert not tier.has(store._hash_all(list(range(16))))
     assert store.lookup(list(range(16))) is None
+
+
+def test_tier_deferred_flush_to_disk(tmp_path):
+    """spill_kv defers the torch.save off-tick: it returns immediately with the
+    blob in memory (has() True, served from _pending), then a daemon flushes it
+    to disk. After the flush the blob is gone from memory and reloads from the
+    file — bit-identical either way. This is what keeps a spill off the decode
+    tick's critical path."""
+    import os
+
+    from tilerl.kv_cache import KvTier
+
+    pool = PagedKvPool(8, 1, 4)
+    tier = KvTier(str(tmp_path / "kvt"), min_tokens=0)
+    b = pool.alloc_block()
+    pool.k_pool[:, b] = torch.randn_like(pool.k_pool[:, b])
+    pool.v_pool[:, b] = torch.randn_like(pool.v_pool[:, b])
+    kb = pool.k_pool[:, b].clone()
+    key = 0xABCD
+
+    assert tier.spill_kv(key, [b], pool) is True
+    assert tier.has(key)  # visible immediately, before the disk write
+    assert key in tier._pending  # served from memory on-tick
+
+    # Drain the writer: the daemon flushes and clears _pending.
+    import time
+
+    for _ in range(200):
+        if key not in tier._pending:
+            break
+        time.sleep(0.01)
+    assert key not in tier._pending, "writer never flushed"
+    assert os.path.exists(tier._kv(key)), "blob not on disk after flush"
+
+    # Reload from disk into a fresh block, bit-identical.
+    fresh = pool.alloc_block()
+    assert tier.load_kv(key, [fresh], pool) is True
+    assert torch.equal(pool.k_pool[:, fresh], kb)
+    # A missing key reloads False (total contract).
+    assert tier.load_kv(0xDEAD, [fresh], pool) is False
