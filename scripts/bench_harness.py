@@ -477,6 +477,11 @@ def suite_train(gate, backend, source, gpu, full=False):
             sync()
             samples.append(time.perf_counter() - s)
         ms = statistics.median(samples) * 1e3
+        # Spread gates the seed/raise, same as the decode suites. Without it a
+        # train row seeded from one reading became the permanent baseline: the
+        # 27B-full rows seeded at host loadavg 27.8 read ~3% high and then
+        # FAILed on an idle machine.
+        spread = (max(samples) - min(samples)) / statistics.median(samples)
         tok_s = b * t / (ms / 1e3)
         peak = ""
         if backend.device.type == "cuda":
@@ -484,8 +489,8 @@ def suite_train(gate, backend, source, gpu, full=False):
 
             peak = f"  peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GB"
             torch.cuda.reset_peak_memory_stats()
-        print(f"  {f'{b}x{t}':>10} {ms:>10.2f} {tok_s:>12.1f}{peak}")
-        gate.check("train", f"{model_name}-b{b}t{t}", tok_s)
+        print(f"  {f'{b}x{t}':>10} {ms:>10.2f} {tok_s:>12.1f}{peak}  +-{100 * spread:.1f}%")
+        gate.check("train", f"{model_name}-b{b}t{t}", tok_s, spread=spread)
 
 
 # --- runner ------------------------------------------------------------------
