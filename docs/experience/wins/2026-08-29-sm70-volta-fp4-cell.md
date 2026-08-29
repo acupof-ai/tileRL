@@ -62,10 +62,30 @@ not just the one its new kernel serves. "CUDA" is not a synonym for "has bf16":
 the seven `target.startswith("cuda")` I/O branches assume Ampere+, and the
 first pre-Ampere cell to reach any of them finds the latent dtype mismatch.
 
-## Pending-remote
+## Measured on the V100 (2026-08-30)
 
-Decode tok/s is not measured yet (the 27B fp4 checkpoint was still quantizing).
-The physics: dense 27B ≈ 14 GB/token, V100 HBM2 ~900 GB/s ⇒ ~64 tok/s ceiling.
-The GEMV is bandwidth-shaped (stream WQ at 0.5 B/elem, decode, f32 FMA), so it
-targets that ceiling, but dequant-on-the-critical-path at M=1 will sit below it.
-End-to-end B=1 tok/s and an MMLU parity check are the open bench rows.
+Full 64-layer 27B NVFP4 decodes correctly and confidently: "The capital of
+France is" → " Paris.\nThe capital of Germany is Berlin.\nThe capital of Italy
+is", logprobs −0.3 to −1.4. CUDA graph capture SUCCEEDS on sm70 once the two
+host-sync fallbacks are gone (register `gdn_decode_fused` f32-out and
+`write_tokens`) — steady-decode log shows zero "graph capture failed".
+
+**Steady-state B=1 decode = 19.9 tok/s** (48.0 ms/tick, graph replay, dead
+stable across ticks). The first timed tick is 540s — that is JIT + graph
+capture, which happens lazily on the first decode tick, NOT during warm-up
+(warm-up's 16 tokens ran, but capture landed on the timed request's first tick;
+measure steady with per-step timing, never total/count — the 548s-in-the-window
+trap).
+
+Gap to the 60 t/s target: 48 ms/tick ⇒ ~400 GB/s effective, only ~44% of the
+V100's 900 GB/s HBM2 roofline, so decode is NOT yet bandwidth-bound. Same shape
+as the H20 (fp4 GEMV issue-bound on dequant, ~33% MBU there). Closing 20→60
+needs either a faster fp4 GEMV (dequant off the issue-critical path) or
+speculative decoding (spec.py, amortizes the weight read) — profiling is the
+next step, this is a solid correct baseline.
+
+## Historical note (superseded by the measurement above)
+
+Decode tok/s was open while the 27B fp4 checkpoint was quantizing; the physics
+estimate was ~64 tok/s HBM ceiling. Measured 19.9 — issue-bound, not
+bandwidth-bound, matching the H20's MBU profile.
