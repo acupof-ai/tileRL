@@ -394,7 +394,12 @@ def suite_train(gate, backend, source, gpu):
         trainable = add_lora(mdl, rank=16)
         # a slope, not one point: the tape keeps every activation in f32, so
         # peak GB per token is the number that decides whether recompute is needed
-        shapes = [(1, 64), (1, 128), (1, 256)]
+        # A slope in T (the tape keeps every activation in f32, so peak GB per
+        # token decides whether recompute is needed) AND a slope in B: the step
+        # is launch-bound — 491K kernels, 62% of them micro-ops from the GDN
+        # backward's per-time-step loop — and that count does not depend on B,
+        # so B=1 is the worst shape training can be measured at.
+        shapes = [(1, 64), (1, 128), (1, 256), (2, 256), (4, 256)]
     else:
         model_name = "tiny"
         cfg, mdl = _build_model(model_name, seed=0, keep_master=True)
