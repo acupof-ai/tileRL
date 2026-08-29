@@ -172,9 +172,26 @@ the register one this entry originally gave.
 ## The other fp4 decode GEMM already in the tree loses too
 
 `linear_fp4_fp8_decode` (fp4 -> e4m3 dequant into an fp8 WGMMA) is registered
-for the decode bucket but unreachable, because the mma8 branch takes
-`2 <= M <= _MX` first. Nobody had compared them at M=8. Setting `_MX = 7` makes
-M=8 fall through, which is the whole A/B:
+for the decode bucket and is unreachable **on this arch**, because the mma8
+branch takes `2 <= M <= _MX` first. Nobody had compared them at M=8. Setting
+`_MX = 7` makes M=8 fall through, which is the whole A/B:
+
+> **Correction, 2026-08-30.** "Unreachable" is arch-specific and reads as
+> global. The mma8 branch is guarded by
+> `"linear_fp4_mma8" in _resolve(self.precision, self.arch)` (`backend.py:466`),
+> so a cell that registers `linear_fp4_fp8_decode` but NOT `linear_fp4_mma8`
+> runs batched decode (`2 <= M <= 8`) on this kernel as its normal path — where
+> it is not dead code, and where it quantizes the ACTIVATION to e4m3:
+> **rel ~3.6e-02 against mma8's ~2.2e-03**. The parity gate would not catch it:
+> `test_linear_fp4_fp8_parity` compares against `_linear_fp4_fp8_ref`, which
+> models the activation quant, so green means "faithful to the looser
+> algorithm", not "accurate enough".
+>
+> A cell registering NEITHER is safe, and that is the sm70 case: `_plan` has its
+> own guard (`backend.py:285`, `if kernel not in _resolve(...): return None`),
+> so the decode bucket falls through to the generic f32 path. Measured on a real
+> V100 by the sm70 bring-up: M=4/16/17 all rel 1.7e-03. The hazard is a PARTIAL
+> cell, not a sparse one — check both names, not one.
 
 | N x K | mma8 | w4a8 | | rel mma8 | rel w4a8 |
 |---|---:|---:|---:|---:|---:|
