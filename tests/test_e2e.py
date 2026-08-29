@@ -1017,10 +1017,13 @@ class _OracleDraft:
         self.expected = expected  # absolute position -> the token that lands there
 
     def forward(self, hidden, ids, positions, kv, backend, hidden_out=None):
-        pos = np.asarray(positions).reshape(-1)
-        logits = torch.zeros(len(pos), 1, self.cfg.vocab_size)
-        for i, p in enumerate(pos):
-            logits[i, 0, self.expected.get(int(p) + 1, 0)] = 10.0
+        # [B, T]: the engine's draft run is as wide as the positions it is
+        # filling KV for, not one per call.
+        pos = np.atleast_2d(np.asarray(positions))
+        logits = torch.zeros(*pos.shape, self.cfg.vocab_size)
+        for i in range(pos.shape[0]):
+            for j in range(pos.shape[1]):
+                logits[i, j, self.expected.get(int(pos[i, j]) + 1, 0)] = 10.0
         if hidden_out is not None:
             hidden_out.append(torch.as_tensor(hidden))
         return logits
@@ -1088,11 +1091,6 @@ def _full_context_draft(cfg, model, draft, backend, toks: list[int]) -> "torch.T
     ],
     ids=["single", "multirow", "chunked", "depth2"],
 )
-@pytest.mark.xfail(
-    reason="the draft attends over a 1-token chain-local KV; "
-           "docs/experience/errors/2026-08-30-draft-attention-sees-one-token.md",
-    strict=True,
-)
 def test_engine_draft_matches_full_context_draft(rows, plen, batched_tokens, depth):
     """The draft the engine runs must equal the draft `draft_check.py` measures.
 
@@ -1130,7 +1128,7 @@ def test_engine_draft_matches_full_context_draft(rows, plen, batched_tokens, dep
         if step["n"] % max(depth, 1) == 0 and out.shape[0] == rows:
             pos = np.asarray(positions)
             for i in range(rows):
-                seen[i] = (int(pos[i][0]), out[i, -1].detach().float().clone())
+                seen[i] = (int(pos[i][-1]), out[i, -1].detach().float().clone())
         step["n"] += 1
         return out
 
@@ -1154,7 +1152,13 @@ def test_engine_draft_matches_full_context_draft(rows, plen, batched_tokens, dep
             f"row {i}: engine drafted {int(got.argmax())} at position {pos}, "
             f"full context drafts {int(full.argmax())}"
         )
-        torch.testing.assert_close(full, got, rtol=1e-2, atol=1e-2)
+        # Not assert_close: the probe re-derives the trunk hidden with a dense
+        # forward while the engine's came from paged attention and the
+        # recurrent state, which differ by ~4e-03 on their own and the head
+        # amplifies that ~10x. A chain-local KV, by contrast, produces an
+        # unrelated vector — norm-relative ~1.4, 25x this bound.
+        rel = ((full - got).norm() / full.norm()).item()
+        assert rel < 0.1, f"row {i} at position {pos}: norm-relative {rel:.2e}"
 
 
 def test_speculation_reproduces_greedy_decode():

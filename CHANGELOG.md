@@ -19,6 +19,24 @@ verdict**. Newest first.
   `test_decode_tick_does_not_sync_in_the_sampler`.
   [wins/2026-08-30-sampler-host-syncs.md](docs/experience/wins/2026-08-30-sampler-host-syncs.md)
 
+## 2026-08-30 — phase exit: the draft head now attends over the whole prefix
+
+- `_draft_chains` (a forward before each tick, against a one-block chain-local
+  KV) became `_draft_step` (a forward at the END of each tick, over the
+  request's own blocks). The draft runs at `[draft_pos+1 .. seq_len-1]` and its
+  last position is the draft for the next token, so the KV fill and the draft
+  are one forward and there is never a gap for its attention to read.
+- Engine draft vs the probe's full-context draft, tiny model: **argmax matches
+  everywhere**, residual norm-relative 1.3e-02 to 5.4e-02 — explained by the
+  trunk hidden (paged/recurrent vs a dense re-derivation, 3.2e-03 to 4.1e-03,
+  amplified ~10x by the head). Before: unrelated vectors, argmax 46 vs 232.
+- Gate: `test_engine_draft_matches_full_context_draft` over four shapes
+  (single / multirow / chunked / depth2), mutation-checked — forcing the fill's
+  `seq_len` back to its own run length turns all four red.
+- **Acceptance rate is `pending-remote`.** Whether the loop now reaches the
+  probe's 84.4% and clears the 66% break-even needs a real model on a card.
+  [errors/2026-08-30-draft-attention-sees-one-token.md](docs/experience/errors/2026-08-30-draft-attention-sees-one-token.md)
+
 ## 2026-08-30 — audit: verify_lens is dead on the shipped path and mis-modelled
 
 - `trim=not self._decode_graph_on` and graph capture is on by default, so

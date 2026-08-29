@@ -1,7 +1,7 @@
 # The draft head's attention sees one token in the loop, the whole prefix in the probe — 2026-08-30
 
-> Status: found by reading, NOT yet fixed or measured. It reopens the
-> speculation verdict in
+> Status: **fixed 2026-08-30** (alignment CPU-verified, acceptance rate
+> `pending-remote`). It reopens the speculation verdict in
 > [wins/2026-08-29-spec-decode-net-win.md](../wins/2026-08-29-spec-decode-net-win.md),
 > whose break-even is `p >= 66%` against a measured 55.8%.
 
@@ -110,7 +110,26 @@ Three details found while scoping, each a place to be silently wrong:
   the engine must zero it too, or the two will not agree even when everything
   else is right.
 
-## The gate, before the fix
+## The fix
+
+`_draft_chains` (a forward before each tick, chain-local KV) became
+`_draft_step` (a forward at the END of each tick, over the request's own
+blocks). The draft now runs at `[draft_pos+1 .. seq_len-1]` and its LAST
+position is the draft for the next token, so the KV fill and the draft are one
+forward and the chain it leaves in `r.drafts` is what the next tick verifies.
+
+Measured on the tiny model, engine draft vs the probe's full-context draft at
+the same position: **argmax matches everywhere**, and the residual is
+norm-relative **1.3e-02 to 5.4e-02** — explained by the input, not by context.
+The engine's trunk hidden comes from paged attention and the recurrent state
+where the probe re-derives it with a dense forward; those differ by
+**3.2e-03 to 4.1e-03** on their own, and the head amplifies that ~10x. Before
+the fix the two drafts were unrelated vectors (argmax 46 against 232).
+
+Whether in-loop acceptance now reaches the probe's 84.4%, and whether that
+clears the 66% break-even, is `pending-remote`.
+
+## The gate
 
 `test_engine_draft_matches_full_context_draft` is parametrized over the four
 shapes where the details above bite, because their failure mode is the one this
@@ -124,14 +143,15 @@ else goes red:
 | `chunked` | a 24-token prompt on an 8-token budget, asserted to chunk |
 | `depth2` | a chain, so a rejected step leaves stale KV behind it |
 
-All four xfail today, each on the logit comparison rather than on setup — which
-had to be checked: the first draft of this test passed its `seen` assertion
-while silently never running the draft at all, and reported four identical
-failures for that reason. A gate that fails for the wrong reason is not a gate.
+Written before the fix on purpose — the implementation is otherwise
+unverifiable without a GPU, since alignment errors are invisible to every other
+test. Two gate bugs were caught by the gate failing wrong: the first version
+passed its own "the draft ran" assertion while the draft had never run (the
+settle loop drained the requests before the spy went on), and the `chunked`
+case used a 6-token prompt against an 8-token budget and never chunked.
 
-Written before the fix on purpose. The implementation is otherwise
-unverifiable without a GPU: alignment errors are invisible to every other test,
-and acceptance rate is the only other signal.
+Mutation-checked after it went green: forcing the fill's `seq_len` back to its
+own run length turns all four red, and reverting turns them green.
 
 ## Rule
 
