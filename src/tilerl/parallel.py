@@ -105,6 +105,17 @@ class DataParallelEngine:
     def is_idle(self) -> bool:
         return all(e.is_idle() for e in self._engines)
 
+    def run(self) -> None:
+        """One daemon thread per replica — each engine already has its own, and
+        they touch disjoint devices and pools."""
+        for i, e in enumerate(self._engines):
+            with _on(self._devices[i]):
+                e.run()
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        for e in self._engines:
+            e.shutdown(timeout)
+
 
 if __name__ == "__main__":  # runnable check: routing and id demux, no GPU needed
     class _Fake:

@@ -486,9 +486,15 @@ class Engine:
             return out
 
     def logprobs(self, request_id: int) -> list[float] | None:
-        """log p of each returned token, or None unless the request asked."""
+        """log p of each returned token, or None unless the request asked.
+
+        Pops: take() drains the tokens and this drains the scores, so a served
+        request leaves nothing behind.
+        # ponytail: a caller that asks for scores and never reads them holds
+        # them until the engine is dropped; a TTL sweep is the upgrade path.
+        """
         with self._lock:
-            return self._finished_logprobs.get(request_id)
+            return self._finished_logprobs.pop(request_id, None)
 
     def take(self, request_id: int) -> list[int] | None:
         """Pop one finished request's output, or None if not finished yet.

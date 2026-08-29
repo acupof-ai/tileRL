@@ -53,19 +53,37 @@ def _build_model(
     )
 
 
-def _build_engine(cfg, model, backend):
-    """Wire the engine with the serving-size pools (256 blocks / 16 slots)."""
+def _build_engine(cfg, model, backend, devices=None):
+    """Wire the engine with the serving-size pools (256 blocks / 16 slots).
+
+    ``devices``: replicate across these CUDA indices instead of one. The 27B in
+    NVFP4 is 23 GB against a 96 GB card, so a replica per device costs memory
+    the cards already have and measures 7.54x on 8 (wins/
+    2026-08-29-data-parallel-scales.md).
+    """
     from . import engine as engine_mod
 
-    return engine_mod.build_engine(
-        cfg,
-        model,
-        backend,
-        num_blocks=256,
-        num_slots=16,
-        max_batch=8,
-        max_total_tokens=8192,
-    )
+    kw = dict(num_blocks=256, num_slots=16, max_batch=8, max_total_tokens=8192)
+    if not devices:
+        return engine_mod.build_engine(cfg, model, backend, **kw)
+
+    import torch
+
+    from .model import load_hf
+    from .ops.backend import Backend, resolve_target
+    from .parallel import DataParallelEngine
+
+    def make(d, **kwargs):
+        # A Backend binds torch.cuda.current_device() at construction and the
+        # weights land on it, so each replica loads its own copy inside its
+        # own context. Sharing one model across devices would silently serve
+        # every replica from device 0's memory.
+        b = Backend(resolve_target())
+        m = load_hf(cfg, _QWEN38_SOURCE, fuse_projections=True) if model is None else model
+        return engine_mod.build_engine(cfg, m, b, **kwargs)
+
+    del torch  # only needed by DataParallelEngine.build
+    return DataParallelEngine.build(devices, make, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +99,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     backend = get_backend()
     cfg, model = _build_model(args.model, seed=0, fuse_projections=True)
-    engine = _build_engine(cfg, model, backend)
+    engine = _build_engine(cfg, model, backend, devices=args.devices)
     tokenizer = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
@@ -282,6 +300,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--model", choices=["tiny", "qwen38-27b"], default="tiny")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
+    p_serve.add_argument("--devices", default="", help="CUDA indices to replicate across, e.g. 0,1,2,3",
+                         type=lambda v: [int(x) for x in v.split(",")] if v else [])
     p_serve.set_defaults(func=cmd_serve)
 
     p_train = sub.add_parser("train", help="train a model on random-token batches")

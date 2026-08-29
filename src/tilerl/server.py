@@ -112,6 +112,9 @@ class ChatCompletionRequest(BaseModel):
     seed: int | None = None
     #: OpenAI's knob, mapped to a thinking-token budget (see _THINK_BUDGET)
     reasoning_effort: str | None = None
+    #: return log p of each sampled token (OpenAI's field name); the engine
+    #: scores from the logits the draw used, so no second forward
+    logprobs: bool | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -190,6 +193,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             stop_token_ids=tuple(getattr(tokenizer, "stop_token_ids", ())),
             thinking_budget=_THINK_BUDGET.get((req.reasoning_effort or "").lower()),
             end_think_ids=tuple(tokenizer.encode("</think>\n\n")),
+            logprobs=bool(req.logprobs),
         )
         return engine.submit(input_ids, params), len(input_ids), params.max_new_tokens
 
@@ -262,6 +266,14 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             )
         text = tokenizer.decode(output_ids)
         created = int(time.time())
+        # OpenAI's shape: one entry per emitted token, decoded alongside its
+        # score. A forced end-think token was never sampled and carries NaN,
+        # which is not JSON — report it as null rather than a made-up number.
+        scores = engine.logprobs(request_id) if req.logprobs else None
+        content = None if scores is None else [
+            {"token": tokenizer.decode([tid]), "logprob": None if lp != lp else lp}
+            for tid, lp in zip(output_ids, scores)
+        ]
         return {
             "id": f"chatcmpl-{request_id}",
             "object": "chat.completion",
@@ -271,6 +283,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                 {
                     "index": 0,
                     "message": {"role": "assistant", "content": text},
+                    "logprobs": None if content is None else {"content": content},
                     "finish_reason": "length" if len(output_ids) >= max_new else "stop",
                 }
             ],

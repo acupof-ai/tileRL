@@ -545,6 +545,8 @@ def test_logprobs_are_returned_and_deterministic():
     assert lps is not None and len(lps) == len(out) == 4, (out, lps)
     assert all(x <= 1e-5 for x in lps), lps
     assert (out, lps) == run(), "same seed, different scores"
+    # scores are drained with the request, like the tokens
+    assert engine.logprobs(engine._next_id - 1) is None
     # a request that did not ask gets nothing, not zeros
     rid = engine.submit(list(range(8)), SamplingParams(max_new_tokens=2, seed=3))
     for _ in range(200):
