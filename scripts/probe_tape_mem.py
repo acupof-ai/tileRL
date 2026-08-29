@@ -24,7 +24,6 @@ def main() -> None:
     import numpy as np
     import torch
 
-    from tilerl import autograd as AG
     from tilerl.autograd import AdamW, RecordingBackend, Tape
     from tilerl.train import _training_kv
     from tilerl_kernels.backend import get_backend
@@ -58,21 +57,12 @@ def main() -> None:
     # (a parameter, kept) or an intermediate (dead after its producer runs).
     entries = list(tape._entries)
     produced = {id(e.output) for e in entries}
-    seen: dict[int, int] = {}
-    orig = AG.Tape.backward
-
-    def counting_backward(self, grad_output):
-        out = orig(self, grad_output)
-        return out
-
-    AG.Tape.backward = counting_backward
     if backend.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
         base = torch.cuda.memory_allocated() / 2**30
     grads = tape.backward(gl)
     if backend.device.type == "cuda":
         peak = torch.cuda.max_memory_allocated() / 2**30
-    AG.Tape.backward = orig
 
     kept = sum(g.numel() * g.element_size() for g in grads.values()) / 2**30
     print(f"{'full' if trainable is None else 'lora'}  layers={args.layers} T={t}")
