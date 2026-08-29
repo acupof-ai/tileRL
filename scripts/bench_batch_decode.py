@@ -38,6 +38,7 @@ def main() -> None:
     p.add_argument(
         "--decode-graph", action="store_true", help="capture decode graphs per batch bucket"
     )
+    p.add_argument("--slots", type=int, help="state slots / max_batch (default: max batch swept)")
     p.add_argument("--draft", help="draft head safetensors: speculative decode")
     p.add_argument("--depth", type=int, default=4, help="drafts per row per tick")
     args = p.parse_args()
@@ -51,10 +52,12 @@ def main() -> None:
     )
     model = load_hf(cfg, args.source, fuse_projections=args.fuse)
     batches = [int(x) for x in args.batches.split(",")]
-    bmax = max(batches)
+    bmax = args.slots or max(batches)
     engine = build_engine(
-        cfg, model, backend, num_blocks=64 * bmax, num_slots=bmax, max_batch=bmax,
-        max_total_tokens=1024 * bmax, decode_graph=args.decode_graph,
+        # 16-token prompts generating ~170: 16 blocks/request covers it. Sizing
+        # off bmax alone filled the card and the allocator thrashed at 94 GiB.
+        cfg, model, backend, num_blocks=16 * bmax, num_slots=bmax, max_batch=bmax,
+        max_total_tokens=256 * bmax, decode_graph=args.decode_graph,
         draft=load_draft(model, args.draft) if args.draft else None, spec_depth=args.depth,
     )
 
