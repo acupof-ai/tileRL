@@ -1054,12 +1054,46 @@ def _spec_run(prompt, n, draft=None, depth=3):
     return out, engine.stats()
 
 
+def _full_context_draft(cfg, model, draft, backend, toks: list[int]) -> "torch.Tensor":
+    """`draft_check.py`'s shape: the head over the WHOLE sequence, teacher-forced.
+
+    Hidden at position i, the token at i+1, drafting i+1 — so the returned row
+    is the draft's logits at position ``len(toks) - 1``. The KV pool is fresh
+    and zeroed, which is what position 0 (never drafted) reads.
+    """
+    n = len(toks) - 1
+    hid: list = []
+    model.forward(np.array([toks]), np.arange(len(toks)),
+                  _training_kv(model, 1, len(toks), device=backend.device),
+                  backend, hidden_out=hid, last_only=False)
+    nblk = -(-n // BLOCK_TOKENS) + 1
+    kv = BatchKv(
+        block_table=torch.arange(nblk, dtype=torch.long).reshape(1, nblk),
+        seq_len=torch.tensor([n]), state_slot=torch.zeros(1, dtype=torch.long),
+        kv_pool=PagedKvPool(nblk, cfg.num_kv_heads, cfg.head_dim, num_layers=1,
+                            device=backend.device, layer_map=(0,)),
+        state_pool=None, seq_q_lens=torch.tensor([n]),
+    )
+    return draft.forward(hid[-1][:, :n], np.array([toks[1:]]),
+                         np.arange(1, n + 1), kv, backend)[0, -1].float()
+
+
+@pytest.mark.parametrize(
+    "rows,plen,batched_tokens,depth",
+    [
+        (1, 6, 512, 1),    # one row, prompt in one chunk, one draft
+        (3, 6, 512, 1),    # ragged widths: rows commit different counts after a reject
+        (1, 24, 8, 1),     # chunked prefill: the prompt spans several forwards
+        (1, 6, 512, 2),    # a chain, so a rejected step leaves stale KV behind it
+    ],
+    ids=["single", "multirow", "chunked", "depth2"],
+)
 @pytest.mark.xfail(
     reason="the draft attends over a 1-token chain-local KV; "
            "docs/experience/errors/2026-08-30-draft-attention-sees-one-token.md",
     strict=True,
 )
-def test_engine_draft_matches_full_context_draft():
+def test_engine_draft_matches_full_context_draft(rows, plen, batched_tokens, depth):
     """The draft the engine runs must equal the draft `draft_check.py` measures.
 
     Those two harnesses reported 84.4% and 55.8% agreement for the same head at
@@ -1067,66 +1101,60 @@ def test_engine_draft_matches_full_context_draft():
     the probe runs the head over the whole sequence, the engine runs it with
     `seq_len = 1`, so its attention is a softmax over one position.
 
-    This is the gate the feature never had. Every other spec test is a
-    CORRECTNESS gate, and a context-starved draft is correct — a draft is
-    accepted only when it equals what the trunk sampled, so a bad guess costs
-    throughput and never output. That is also why a fix cannot be trusted
-    without this: a fill pass that gets the position/token alignment wrong
-    leaves every other test green.
+    This is the gate the feature never had, and the parametrization is the
+    point. Every other spec test is a CORRECTNESS gate, and a context-starved
+    draft is correct — a draft is accepted only when it equals what the trunk
+    sampled, so a bad guess costs throughput and never output. A fill pass that
+    mishandles ragged batch widths, chunked prefill, or the stale KV a rejected
+    chain leaves behind would therefore leave every other test green.
     """
     cfg = tiny()
     backend = get_backend()
     model = build_random(cfg, seed=7)
     draft = _random_draft(cfg, 21, model)
     engine = build_engine(
-        cfg, model, backend, num_blocks=16, num_slots=4, max_batch=4,
-        max_total_tokens=512, draft=draft, spec_depth=1,
+        cfg, model, backend, num_blocks=64, num_slots=8, max_batch=8,
+        max_total_tokens=512, max_num_batched_tokens=batched_tokens,
+        draft=draft, spec_depth=depth,
     )
-    seen: dict = {}
+    seen: dict[int, tuple] = {}
+    step = {"n": 0}
     inner = draft.forward
 
     def spy(hidden, ids, positions, kv, be, hidden_out=None):
         out = inner(hidden, ids, positions, kv, be, hidden_out=hidden_out)
-        seen["logits"] = out[0, -1].detach().float().clone()
-        seen["pos"] = int(np.asarray(positions)[0][0])
+        # Chain step 0 only: later steps consume the draft's OWN hidden and its
+        # own drafted tokens, which the teacher-forced probe does not model.
+        # Full-batch ticks only, so batch index i is request i: rows are
+        # admitted in order and a partial batch would shift the mapping.
+        if step["n"] % max(depth, 1) == 0 and out.shape[0] == rows:
+            pos = np.asarray(positions)
+            for i in range(rows):
+                seen[i] = (int(pos[i][0]), out[i, -1].detach().float().clone())
+        step["n"] += 1
         return out
 
     draft.forward = spy
-    prompt = [3, 4, 5, 6]
-    rid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
-    out = _drain(engine, [rid], 8)[rid]
+    prompts = [[3 + (i + r) % 40 for i in range(plen + r)] for r in range(rows)]
+    ids = [engine.submit(p, SamplingParams(temperature=0.0, max_new_tokens=8, seed=r))
+           for r, p in enumerate(prompts)]
+    outs = _drain(engine, ids, 8)
     draft.forward = inner
-    assert seen, "the draft never ran"
+    assert len(seen) == rows, f"the draft never ran on a full {rows}-row tick"
+    # The parametrization has to actually reach the path it names.
+    if batched_tokens < plen:
+        assert engine.stats()["prefill_forwards"] > rows, "the prompt did not chunk"
 
-    # Greedy decode is deterministic, so the sequence at the last draft is the
-    # final one truncated to that position.
-    toks = (prompt + out)[: seen["pos"] + 1]
-    n = len(toks) - 1
-
-    hid: list = []
-    model.forward(np.array([toks]), np.arange(len(toks)),
-                  _training_kv(model, 1, len(toks), device=backend.device),
-                  backend, hidden_out=hid, last_only=False)
-
-    # The probe's shape: hidden at position i, the token at i+1, drafting i+1.
-    nblk = -(-n // BLOCK_TOKENS) + 1
-    pool = PagedKvPool(nblk, cfg.num_kv_heads, cfg.head_dim, num_layers=1,
-                       device=backend.device, layer_map=(0,))
-    full = draft.forward(
-        hid[-1][:, :n], np.array([toks[1:]]), np.arange(1, n + 1),
-        BatchKv(
-            block_table=torch.arange(nblk, dtype=torch.long).reshape(1, nblk),
-            seq_len=torch.tensor([n]), state_slot=torch.zeros(1, dtype=torch.long),
-            kv_pool=pool, state_pool=None, seq_q_lens=torch.tensor([n]),
-        ),
-        backend,
-    )[0, -1].float()
-
-    assert int(full.argmax()) == int(seen["logits"].argmax()), (
-        f"engine drafted {int(seen['logits'].argmax())} at position {seen['pos']}, "
-        f"full context drafts {int(full.argmax())}"
-    )
-    torch.testing.assert_close(full, seen["logits"], rtol=1e-2, atol=1e-2)
+    for i, (pos, got) in sorted(seen.items()):
+        # Greedy decode is deterministic: the row's sequence at that draft is
+        # its final one truncated to the drafted position.
+        row = prompts[i] + outs[ids[i]]
+        full = _full_context_draft(cfg, model, draft, backend, row[: pos + 1])
+        assert int(full.argmax()) == int(got.argmax()), (
+            f"row {i}: engine drafted {int(got.argmax())} at position {pos}, "
+            f"full context drafts {int(full.argmax())}"
+        )
+        torch.testing.assert_close(full, got, rtol=1e-2, atol=1e-2)
 
 
 def test_speculation_reproduces_greedy_decode():

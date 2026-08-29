@@ -110,15 +110,28 @@ Three details found while scoping, each a place to be silently wrong:
   the engine must zero it too, or the two will not agree even when everything
   else is right.
 
-## Why it is not implemented yet
+## The gate, before the fix
 
-`test_engine_draft_matches_full_context_draft` covers **one row, unchunked
-prompt, depth 1**. The cases it does not cover — multi-row ragged widths,
-chunked prefill, depth > 1, a rejected chain's stale KV — are exactly where
-the details above bite, and their failure mode is the one this whole entry is
-about: **a wrong draft is still a correct output**, so nothing goes red. The
-gate has to be extended to those four before the implementation can be trusted,
-or the fix ships with the same blind spot that hid the bug.
+`test_engine_draft_matches_full_context_draft` is parametrized over the four
+shapes where the details above bite, because their failure mode is the one this
+whole entry is about — **a wrong draft is still a correct output**, so nothing
+else goes red:
+
+| case | what it reaches |
+|---|---|
+| `single` | one row, one chunk, one draft — the baseline |
+| `multirow` | 3 rows committing different counts after a reject: ragged widths |
+| `chunked` | a 24-token prompt on an 8-token budget, asserted to chunk |
+| `depth2` | a chain, so a rejected step leaves stale KV behind it |
+
+All four xfail today, each on the logit comparison rather than on setup — which
+had to be checked: the first draft of this test passed its `seen` assertion
+while silently never running the draft at all, and reported four identical
+failures for that reason. A gate that fails for the wrong reason is not a gate.
+
+Written before the fix on purpose. The implementation is otherwise
+unverifiable without a GPU: alignment errors are invisible to every other test,
+and acceptance rate is the only other signal.
 
 ## Rule
 
