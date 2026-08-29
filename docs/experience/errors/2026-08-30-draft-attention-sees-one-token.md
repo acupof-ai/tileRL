@@ -78,17 +78,47 @@ each one:
 
 ## The change it implies
 
-Three pieces, all in `engine.py`:
+The invariant is: **the draft must hold KV at every position it will later
+attend over, and no gaps.** Everything below follows from it.
 
-1. `_draft_kv` sized like the trunk's pool, with per-request blocks, instead of
-   one block per row.
-2. `_draft_chains` passing the request's absolute position (`r.seq_len + j`)
-   and its own block table, not `j + 1` and a row-indexed one.
-3. A fill pass: the draft runs over the prompt at prefill (the trunk's prefill
-   hiddens are already produced) and over the accepted positions each tick (the
-   verify forward already produces those hiddens).
+1. `_draft_kv` sized by the trunk's block count, indexed by the request's own
+   `r.blocks`, instead of one block per row. Costs one full-attn layer's worth
+   of the trunk's KV — 1/16 of it on the 27B.
+2. `_draft_chains` passing the request's absolute position and its block table,
+   not `j + 1` and a row-indexed one.
+3. **Carry the whole forward's hidden, not its last position.** `r.hidden` is
+   `hid[-1][i, seq_q-1:seq_q]` in all four places it is set. Keeping the full
+   `[1, seq_q, H]` slice makes the fill and the draft ONE forward: the draft
+   runs at positions `[draft_pos+1 .. seq_len-1]`, and the last of those IS the
+   draft step. No separate fill pass — that is what the first version of this
+   entry got wrong.
 
-Piece 3 is the real work — chunked prefill means the fill runs per chunk.
+Three details found while scoping, each a place to be silently wrong:
+
+- **Chunked prefill breaks the no-gap invariant.** Drafting happens only on
+  pure-decode ticks (`chains` is None whenever `prefills` is non-empty), so a
+  prompt materialized over N chunks leaves N-1 chunks' worth of positions with
+  no draft KV, and only the last chunk's hiddens survive in `r.hidden`. The fill
+  therefore has to run on EVERY tick that materializes tokens, including mixed
+  and prefill ticks — a 1-layer forward against the trunk's 64, ~1.6% there.
+- **`draft_pos` must track committed positions, not drafted ones.** A rejected
+  chain leaves draft KV at `p+1..p+depth` for tokens that were never committed;
+  advancing the watermark only to `p` makes the next tick overwrite them.
+- **Position 0 is never drafted** (the draft at position q consumes hidden
+  `H[q-1]`), so its KV page is whatever the previous owner of that block left.
+  `draft_check.py` allocates a fresh zeroed pool and therefore reads zeros —
+  the engine must zero it too, or the two will not agree even when everything
+  else is right.
+
+## Why it is not implemented yet
+
+`test_engine_draft_matches_full_context_draft` covers **one row, unchunked
+prompt, depth 1**. The cases it does not cover — multi-row ragged widths,
+chunked prefill, depth > 1, a rejected chain's stale KV — are exactly where
+the details above bite, and their failure mode is the one this whole entry is
+about: **a wrong draft is still a correct output**, so nothing goes red. The
+gate has to be extended to those four before the implementation can be trusted,
+or the fix ships with the same blind spot that hid the bug.
 
 ## Rule
 
