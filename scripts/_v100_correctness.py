@@ -26,7 +26,8 @@ def main():
     src = os.environ["TILERL_QWEN38_SOURCE"]
     cfg = config_mod.qwen38_27b()
     t0 = time.time()
-    model = model_mod.load_hf(cfg, src, num_layers=n, fuse_projections=True)
+    model = model_mod.load_hf(cfg, src, num_layers=n,
+                              fuse_projections=os.environ.get("FUSE", "1") == "1")
     print(f"loaded {n} layers in {time.time() - t0:.1f}s", flush=True)
     backend = get_backend()
     print("device", torch.cuda.get_device_name(0), backend.arch, flush=True)
@@ -39,7 +40,7 @@ def main():
     print("PROMPT ids:", ids, flush=True)
 
     nnew = int(os.environ.get("PROBE_NEW", "8"))
-    rid = eng.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=nnew))
+    rid = eng.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=nnew, logprobs=True))
     t0 = time.time()
     steps = 0
     out = None
@@ -57,6 +58,9 @@ def main():
     print(f"RAW OUT ids ({len(out)} in {dt:.1f}s, {steps} steps):", out, flush=True)
     print("decoded:", repr(tok.decode(out)), flush=True)
     print("per-id:", [(i, repr(tok.decode([i]))) for i in out], flush=True)
+    lps = eng.logprobs(rid)
+    import math
+    print(f"logprobs: {lps}  (uniform floor = -log(vocab) = {-math.log(model.cfg.vocab_size):.2f})", flush=True)
     # Sanity: ids must vary (not all EOS/identical) and lie in-vocab.
     ok = len(out) > 0 and len(set(out)) > 1
     print("CORRECTNESS", "PLAUSIBLE" if ok else "DEGENERATE (all-same or empty)")

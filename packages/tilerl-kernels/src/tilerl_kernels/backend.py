@@ -1038,12 +1038,13 @@ class Backend:
         return self._f32(residual).reshape(rows, n).contiguous()
 
     def embedding(self, idx, table):
-        # A gather needs no arithmetic, so on CUDA the table is read in its own
-        # dtype: the 27B's bf16 [248320, 5120] table is 2.4 GiB against a
-        # cached 4.7 GiB f32 copy. The C target cannot codegen bfloat16
-        # ("Cannot convert type bfloat16 to C type"), so CPU/metal keep the
-        # f32 cast.
-        if table.dtype == torch.bfloat16 and self.target.startswith("cuda"):
+        # A gather needs no arithmetic, so where the downstream is bf16-IO (sm90)
+        # the table is read in its own dtype: the 27B's bf16 [248320, 5120] table
+        # is 2.4 GiB against a cached 4.7 GiB f32 copy. Everything else — cpu,
+        # metal, AND sm70 (f32 kernels, and the C target cannot even codegen
+        # bfloat16) — takes the f32 cast, or the gather would hand bf16 to an f32
+        # kernel and collapse the hidden state (the 27B decoded id 220 forever).
+        if table.dtype == torch.bfloat16 and self.io == torch.bfloat16:
             table, dt = self._c(table.to(self.device)), "bfloat16"
         else:
             table, dt = self._const_f32(table), "float32"
