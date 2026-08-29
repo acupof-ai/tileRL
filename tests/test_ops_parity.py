@@ -631,11 +631,19 @@ def test_gdn_chunk_fused_parity_full_scale(backend):
     on the SHIPPED kernel — an always-red gate catches nothing.
     """
     q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 96, 2, 6, 16, 16, 4, 37, scale=10.0)
-    out, _, _ = backend.linear_attn_chunk(q, k, v, g, beta, state, z=z, **kw)
-    rout, _, _ = reference.gdn_forward(q, k, v, g, beta, state, z=z, **kw)
-    rout = rout.to(out.device)
-    rel = (out - rout).abs().max().item() / rout.abs().max().item()
-    assert rel < 0.05, f"gdn full-scale out: {100 * rel:.1f}% relative error"
+    got = backend.linear_attn_chunk(q, k, v, g, beta, state, z=z, **kw)
+    ref = reference.gdn_forward(q, k, v, g, beta, state, z=z, **kw)
+    # All three, so a failure says WHERE: a wrong state is the recurrence, a
+    # right state with a wrong out is the readout or the epilogue.
+    bad = []
+    for a, b_, name in zip(got, ref, ("out", "state", "window")):
+        if a is None or b_ is None:
+            continue
+        b_ = b_.to(a.device)
+        rel = (a - b_).abs().max().item() / max(b_.abs().max().item(), 1e-9)
+        if rel >= 0.05:
+            bad.append(f"{name} {100 * rel:.1f}%")
+    assert not bad, "gdn full-scale relative error: " + ", ".join(bad)
 
 
 def test_gdn_chunk_fused_parity(backend):
