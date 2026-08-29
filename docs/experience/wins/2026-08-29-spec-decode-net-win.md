@@ -99,10 +99,16 @@ record, and it produced a 1.9x optimistic estimate.
 
 Same process, both arms, `bench_harness --suite spec`:
 
-| B | depth | plain | spec | ratio | accept | tok/tick |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 1 | 92.9 | 52.7 | **0.57x** | 55.8% | 1.12 |
-| 8 | 1 | 311.6 | 46.1 | **0.15x** | 58.8% | 1.05 |
+| B | depth | plain | spec | ratio | accept | tok/tick | ms/tick |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 92.9 | 52.7 | **0.57x** | 55.8% | 1.12 | 21.17 |
+| 1 | 2 | 92.7 | 59.9 | **0.65x** | 44.7% | 1.77 | 29.47 |
+| 8 | 1 | 311.6 | 46.1 | **0.15x** | 58.8% | 1.05 | 181.30 |
+| 8 | 2 | 311.1 | 69.9 | **0.22x** | 41.9% | 1.67 | 190.89 |
+
+Depth 2 beats depth 1 and both lose, which is the same shape as the first
+pass: the verify tick's growth with width outruns the tokens it buys. At B=1
+a width-3 tick is 29.47 ms for 1.77 tokens against 10.78 ms for 1.
 
 The verdict no longer depends on the draft at all. At B=1 a chain of TWO costs
 21.17 ms against 10.76 for a chain of one — **1.97x the tick for 1.12 tokens**.
@@ -111,10 +117,15 @@ reverted: it is a real 2.59x on the draft half, and the draft half is not what
 decides this.
 
 Open, and not chased: `tok/tick` is 1.12 at 55.8% acceptance where depth 1
-should give ~1.56. Either the acceptance counter or the commit disagrees with
-`tokens_generated`. It does not change the verdict (1.56 tokens in 21.17 ms is
-73.6 tok/s, still under 92.9) but it should be resolved before anyone trusts
-the acceptance column.
+should give ~1.56, and the discrepancy is depth-1-only (depth 2 reads 1.77
+against ~1.89 implied, which is close). Either the acceptance counter or the
+commit disagrees with `tokens_generated` on short chains. It does not change
+the verdict (1.56 tokens in 21.17 ms is 73.6 tok/s, still under 92.9) but it
+should be resolved before anyone trusts the acceptance column.
+
+The `spec/*` baseline rows are now meaningless — the harness PASSes them at
+0.15x of plain, because they were seeded when the arm was measured differently.
+A row whose gate can pass while the feature loses 6.7x is worse than no row.
 
 ## Rule
 
