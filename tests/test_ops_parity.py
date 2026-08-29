@@ -24,7 +24,7 @@ import pytest
 import torch
 
 from tilerl_kernels import reference
-from tilerl_kernels.backend import _resolve, get_backend
+from tilerl_kernels.backend import _MX, _resolve, get_backend
 from tilerl_kernels.reference import pack_fp4, renorm_fp4_scale
 
 RTOL = 1e-2
@@ -264,8 +264,6 @@ def test_linear_fp4_parity(backend):
     # reference compared two different quantizations and read as a 3.5e-2
     # kernel error; against the right reference it is 3.1e-3, at the 2.1e-3
     # floor a bf16-accumulating kernel cannot beat.
-    from tilerl_kernels.backend import _MX
-
     for m in (6, _MX + 8):
         x = torch.randn(m, 32)
         fp8_path = backend.target.startswith("cuda") and m > _MX
@@ -302,7 +300,10 @@ def test_linear_fp4_fp8_parity(backend):
     torch reference, not quant precision vs f32. The e2m1 weight grid is an
     exact subset of e4m3, so the weight side is error-free."""
     torch.manual_seed(21)
-    for M, N, K in [(8, 64, 256), (4, 96, 128)]:
+    # M must clear _MX (8) to reach the fp8 split at all: at M=4 and M=8 this
+    # test was measuring the fp4 mma8 kernel against an fp8 reference, which
+    # is the e4m3 re-quantization, not a kernel error. See test_linear_fp4_parity.
+    for M, N, K in [(_MX + 8, 64, 256), (_MX + 4, 96, 128)]:
         w_master = torch.randn(N, K) * 0.1
         wq, scale = _quantize_fp4(w_master)
         x = torch.randn(M, K) * 0.5
@@ -335,6 +336,10 @@ def test_linear_fp8_parity(backend):
                 backend.linear_fp8(x, w8, wscale)
             continue
         out = backend.linear_fp8(x, w8, wscale)
+        # M=1 is the GEMV; 2.._MX the mma8 kernel; above that the plan's
+        # tiled kernel. All three are fp8, so the identical-quant reference is
+        # right for every M>1 - unlike linear_fp4, where M>_MX changes the
+        # quantization itself.
         kernel_path = backend.target.startswith("cuda") and M > 1
         ref = _linear_fp8_ref(x, w8, wscale) if kernel_path else reference.linear_fp8(x, w8, wscale)
         _assert_close(out, ref, f"linear_fp8 M={M} N={N} K={K}")
