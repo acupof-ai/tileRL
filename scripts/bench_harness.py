@@ -220,9 +220,9 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
 
 
 def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
-    """Speculative decode goodput. Gates the AGGREGATE tok/s, which is what
-    speculation is for; acceptance is printed because a drop there is the first
-    sign the draft head or its serving format regressed."""
+    """Speculative decode goodput, gated as a RATIO against the plain arm
+    measured in the same process. Acceptance is printed because a drop there is
+    the first sign the draft head or its serving format regressed."""
     import benchkit as bk
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.spec import load_draft
@@ -268,7 +268,12 @@ def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
         print(f"  {b:>3} {arm:>6} {ms:>9.3f} {per_tick:>9.2f} {100 * acc:>6.1f}% {agg:>10.1f}"
               + (f"   {agg / base[b]:.2f}x vs plain" if spec and base.get(b) else ""))
         if spec:
-            gate.check("spec", f"d{depth}-b{b}", agg, spread=LAST_SPREAD)
+            # Gate the RATIO, not the absolute tok/s. Speculation's whole claim
+            # is "faster than not speculating", and an absolute row passed at
+            # 0.15x of the plain arm measured beside it, because it was seeded
+            # when the arm was measured a different way. A gate that can pass
+            # while the feature loses 6.7x is worse than no gate.
+            gate.check("spec", f"d{depth}-b{b}-ratio", agg / base[b], spread=LAST_SPREAD)
         else:
             base[b] = agg
 
