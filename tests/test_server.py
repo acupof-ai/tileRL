@@ -132,9 +132,16 @@ def test_seedless_requests_decorrelate(client, model_id):
         "temperature": 0.7,
         "max_tokens": 8,
     }
-    first = client.post("/v1/chat/completions", json=json_body).json()
-    second = client.post("/v1/chat/completions", json=json_body).json()
-    assert first["choices"][0]["message"]["content"] != second["choices"][0]["message"]["content"]
+    # Six draws, not two: on the tiny model's small vocabulary two 8-token
+    # samples collide often enough to fail a green build. The property is that
+    # the stream is not SHARED — one repeat is chance, six identical is a bug.
+    seen = {
+        client.post("/v1/chat/completions", json=json_body).json()["choices"][0]["message"][
+            "content"
+        ]
+        for _ in range(6)
+    }
+    assert len(seen) > 1, seen
 
 
 def test_completion_stream(client, model_id):
