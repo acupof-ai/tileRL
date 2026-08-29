@@ -186,3 +186,42 @@ number is data.
   the usual objection to that does not apply.
 - Untried, and every hypothesis I formed today about this kernel has been
   refuted by measurement, so it is a candidate rather than a plan.
+
+## The K split: three attempts, reverted — but its premise is now verified
+
+Splitting the state column across KSP threads (KSP/thread rows each, a
+KSP-way reduction through shared memory for `k·S` and `q·S`), behind a
+`_GDN_KSPLIT` constant so KSP=1 is the shipped math.
+
+KSP=1 came out wrong every time — out 125.9%, state 100.0% — through three
+fixes: `T.serial(KSP-1)` replaced by a trace-time `range` (a zero-trip
+`T.serial(0)` is not safe), and the `(2, KSP, V)` reduction buffer flattened to
+1-D since every other shared buffer here is. Neither moved the number.
+Reverted at the attempt limit.
+
+**What the failures did establish, and it is the expensive half:**
+
+- **The reduction path is free.** KSP=1 with the full shared-memory reduction
+  and two extra barriers per token measures **2.99 us/step against the shipped
+  3.05** — so the cost model that would kill this design does not hold. The
+  barrier probe said the same independently: two dummy barriers per token made
+  the kernel 8.5% FASTER.
+- So the open question is purely a correctness bug in the reduction wiring, not
+  whether the design can pay.
+
+## Four tilelang traps, one shape
+
+Everything that has silently produced wrong numbers in this kernel today is a
+Python-level value leaking into traced control flow:
+
+| written | what it did |
+|---|---|
+| `expr and vs == 0` | `bool()` on a symbolic operand is always true; collapsed to `vs == 0` |
+| `T.serial(K // VB)` | symbolic bound, so `q_s[ki*VB + tv]` became a dynamic shared index and broke the layout |
+| `T.serial(KSP - 1)` | zero-trip loop at KSP=1 |
+| `T.alloc_shared((2, KSP, V))` | 3-D shared buffer among 1-D ones |
+
+The rule that survives all four: **keep Python ints in Python** — `range()`,
+`if` on a constant, a flat buffer — and let symbolic values appear only as data
+indices. Where a refactor must be identity at the default setting, make it
+identity by CONSTRUCTION (emit nothing) rather than by argument.
