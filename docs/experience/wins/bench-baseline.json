@@ -1,157 +1,162 @@
 {
- "accuracy/mmlu-200/sm90": {
-  "commit": "81e9789",
-  "date": "2026-08-28",
-  "tok_s": 81.0
- },
- "decode-kv/d131072-b1/sm90": {
-  "commit": "cd54d55",
-  "date": "2026-08-28",
-  "tok_s": 61.1
- },
- "decode-kv/d131072-b2/sm90": {
-  "commit": "6e260b8",
-  "date": "2026-08-29",
-  "tok_s": 71.85266081308166
- },
- "decode-kv/d2048-b1/sm90": {
-  "commit": "unknown",
-  "date": "2026-08-28",
-  "tok_s": 87.33086560928957
- },
- "decode-kv/d2048-b2/sm90": {
-  "commit": "6e260b8",
-  "date": "2026-08-29",
-  "tok_s": 113.05345671406823
- },
- "decode-kv/d2048-b4/sm90": {
-  "commit": "6e260b8",
-  "date": "2026-08-29",
-  "tok_s": 164.71705734943475
- },
- "decode-kv/d2048-b8/sm90": {
-  "commit": "6e260b8",
-  "date": "2026-08-29",
-  "tok_s": 320.11480842917416
- },
- "decode-kv/d262144-b1/sm90": {
-  "commit": "cd54d55",
-  "date": "2026-08-28",
-  "tok_s": 48.1
- },
- "decode-kv/d32768-b1/sm90": {
-  "commit": "unknown",
-  "date": "2026-08-28",
-  "tok_s": 80.06812199220505
- },
- "decode-kv/d32768-b2/sm90": {
-  "commit": "6e260b8",
-  "date": "2026-08-29",
-  "tok_s": 98.98873972155587
- },
- "decode-kv/d32768-b4/sm90": {
-  "commit": "6e260b8",
-  "date": "2026-08-29",
-  "tok_s": 138.72857183414737
- },
- "decode-kv/d512-b1/sm90": {
-  "commit": "unknown",
-  "date": "2026-08-28",
-  "tok_s": 92.38771599788666
- },
- "decode-kv/d512-b4/sm90": {
-  "commit": "6e260b8",
-  "date": "2026-08-29",
-  "tok_s": 166.11597384518305
- },
- "decode-kv/d512-b8/sm90": {
-  "commit": "6e260b8",
-  "date": "2026-08-29",
-  "tok_s": 328.39408934193426
- },
- "decode-kv/d8192-b1/sm90": {
-  "commit": "unknown",
-  "date": "2026-08-28",
-  "tok_s": 88.87364923310717
- },
- "decode-kv/d8192-b2/sm90": {
-  "commit": "6e260b8",
-  "date": "2026-08-29",
-  "tok_s": 109.39989053279544
- },
- "decode-kv/d8192-b4/sm90": {
-  "commit": "6e260b8",
-  "date": "2026-08-29",
-  "tok_s": 157.48552710735785
- },
- "decode-kv/d8192-b8/sm90": {
-  "commit": "unknown",
-  "date": "2026-08-28",
-  "tok_s": 280.16624656766214
- },
- "kv-reuse/prefix-hits/cpu": {
-  "commit": "655e941",
-  "date": "2026-08-27",
-  "tok_s": 1.0
- },
- "kv-reuse/prefix-hits/sm90": {
-  "commit": "db05899",
-  "date": "2026-08-27",
-  "tok_s": 1.0
- },
- "prefill/len2048/sm90": {
-  "commit": "f001ed8",
-  "date": "2026-08-29",
-  "tok_s": 2218.4224174821225
- },
- "prefill/len512/sm90": {
-  "commit": "f001ed8",
-  "date": "2026-08-29",
-  "tok_s": 2237.8157770447538
- },
- "prefill/len8192/sm90": {
-  "commit": "f001ed8",
-  "date": "2026-08-29",
-  "tok_s": 2144.842547390656
- },
- "train/27B-lora-b1t128/sm90": {
-  "commit": "009e994",
-  "date": "2026-08-29",
-  "tok_s": 80.48032472934003
- },
- "train/27B-lora-b1t256/sm90": {
-  "commit": "009e994",
-  "date": "2026-08-29",
-  "tok_s": 113.45590448027781
- },
- "train/27B-lora-b1t64/sm90": {
-  "commit": "009e994",
-  "date": "2026-08-29",
-  "tok_s": 50.32449750444596
- },
- "train/27B-lora-b2t256/sm90": {
-  "commit": "009e994",
-  "date": "2026-08-29",
-  "tok_s": 178.23380195507897
- },
- "train/tiny-b2t128/cpu": {
-  "commit": "2fdc85c",
-  "date": "2026-08-28",
-  "tok_s": 1639.9078414889332
- },
- "train/tiny-b2t128/sm90": {
-  "commit": "db05899",
-  "date": "2026-08-27",
-  "tok_s": 1639.4553913170141
- },
- "train/tiny-b2t512/cpu": {
-  "commit": "655e941",
-  "date": "2026-08-27",
-  "tok_s": 1552.206294801801
- },
- "train/tiny-b2t512/sm90": {
-  "commit": "db05899",
-  "date": "2026-08-27",
-  "tok_s": 1729.4008056391763
- }
+  "accuracy/mmlu-200/sm90": {
+    "commit": "81e9789",
+    "date": "2026-08-28",
+    "tok_s": 81.0
+  },
+  "decode-kv/d131072-b1/sm90": {
+    "commit": "cd54d55",
+    "date": "2026-08-28",
+    "tok_s": 61.1
+  },
+  "decode-kv/d131072-b2/sm90": {
+    "commit": "6e260b8",
+    "date": "2026-08-29",
+    "tok_s": 71.85266081308166
+  },
+  "decode-kv/d2048-b1/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 87.33086560928957
+  },
+  "decode-kv/d2048-b2/sm90": {
+    "commit": "6e260b8",
+    "date": "2026-08-29",
+    "tok_s": 113.05345671406823
+  },
+  "decode-kv/d2048-b4/sm90": {
+    "commit": "6e260b8",
+    "date": "2026-08-29",
+    "tok_s": 164.71705734943475
+  },
+  "decode-kv/d2048-b8/sm90": {
+    "commit": "6e260b8",
+    "date": "2026-08-29",
+    "tok_s": 320.11480842917416
+  },
+  "decode-kv/d262144-b1/sm90": {
+    "commit": "cd54d55",
+    "date": "2026-08-28",
+    "tok_s": 48.1
+  },
+  "decode-kv/d32768-b1/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 80.06812199220505
+  },
+  "decode-kv/d32768-b2/sm90": {
+    "commit": "6e260b8",
+    "date": "2026-08-29",
+    "tok_s": 98.98873972155587
+  },
+  "decode-kv/d32768-b4/sm90": {
+    "commit": "6e260b8",
+    "date": "2026-08-29",
+    "tok_s": 138.72857183414737
+  },
+  "decode-kv/d512-b1/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 92.38771599788666
+  },
+  "decode-kv/d512-b2/sm90": {
+    "commit": "6e260b8",
+    "date": "2026-08-29",
+    "tok_s": 113.7602311436912
+  },
+  "decode-kv/d512-b4/sm90": {
+    "commit": "6e260b8",
+    "date": "2026-08-29",
+    "tok_s": 166.11597384518305
+  },
+  "decode-kv/d512-b8/sm90": {
+    "commit": "6e260b8",
+    "date": "2026-08-29",
+    "tok_s": 328.39408934193426
+  },
+  "decode-kv/d8192-b1/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 88.87364923310717
+  },
+  "decode-kv/d8192-b2/sm90": {
+    "commit": "6e260b8",
+    "date": "2026-08-29",
+    "tok_s": 109.39989053279544
+  },
+  "decode-kv/d8192-b4/sm90": {
+    "commit": "6e260b8",
+    "date": "2026-08-29",
+    "tok_s": 157.48552710735785
+  },
+  "decode-kv/d8192-b8/sm90": {
+    "commit": "unknown",
+    "date": "2026-08-28",
+    "tok_s": 280.16624656766214
+  },
+  "kv-reuse/prefix-hits/cpu": {
+    "commit": "655e941",
+    "date": "2026-08-27",
+    "tok_s": 1.0
+  },
+  "kv-reuse/prefix-hits/sm90": {
+    "commit": "db05899",
+    "date": "2026-08-27",
+    "tok_s": 1.0
+  },
+  "prefill/len2048/sm90": {
+    "commit": "f001ed8",
+    "date": "2026-08-29",
+    "tok_s": 2218.4224174821225
+  },
+  "prefill/len512/sm90": {
+    "commit": "f001ed8",
+    "date": "2026-08-29",
+    "tok_s": 2237.8157770447538
+  },
+  "prefill/len8192/sm90": {
+    "commit": "f001ed8",
+    "date": "2026-08-29",
+    "tok_s": 2144.842547390656
+  },
+  "train/27B-lora-b1t128/sm90": {
+    "commit": "009e994",
+    "date": "2026-08-29",
+    "tok_s": 80.48032472934003
+  },
+  "train/27B-lora-b1t256/sm90": {
+    "commit": "009e994",
+    "date": "2026-08-29",
+    "tok_s": 113.45590448027781
+  },
+  "train/27B-lora-b1t64/sm90": {
+    "commit": "009e994",
+    "date": "2026-08-29",
+    "tok_s": 50.32449750444596
+  },
+  "train/27B-lora-b2t256/sm90": {
+    "commit": "009e994",
+    "date": "2026-08-29",
+    "tok_s": 178.23380195507897
+  },
+  "train/tiny-b2t128/cpu": {
+    "commit": "2fdc85c",
+    "date": "2026-08-28",
+    "tok_s": 1639.9078414889332
+  },
+  "train/tiny-b2t128/sm90": {
+    "commit": "db05899",
+    "date": "2026-08-27",
+    "tok_s": 1639.4553913170141
+  },
+  "train/tiny-b2t512/cpu": {
+    "commit": "655e941",
+    "date": "2026-08-27",
+    "tok_s": 1552.206294801801
+  },
+  "train/tiny-b2t512/sm90": {
+    "commit": "db05899",
+    "date": "2026-08-27",
+    "tok_s": 1729.4008056391763
+  }
 }

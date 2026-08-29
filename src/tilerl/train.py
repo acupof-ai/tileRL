@@ -120,9 +120,7 @@ def _step(
         "param whose device/dtype differs, and the new object has a new id()"
     )
     # The GDN initial state is a tape leaf: its grad is not a parameter and
-    # must not enter the clip norm. ponytail: backward still computes and
-    # frees it mid-pass; mark the state input non-differentiable if its
-    # allocation ever shows up in a peak-memory profile.
+    # must not enter the clip norm.
     grads = {k: v for k, v in grads.items() if k in param_ids}
     norm = clip_grad_norm(grads, 1.0)
     if math.isfinite(norm):

@@ -264,6 +264,60 @@ def test_train_loss_decreases():
     assert last5 < first5, f"loss did not decrease: {first5:.4f} -> {last5:.4f}"
 
 
+def test_backward_streaming_matches_collecting():
+    """Streaming the gradients out must give exactly what collecting them gives.
+
+    This is the gate for full fine-tuning: the 27B OOMs holding every weight
+    gradient at once, so the optimizer has to consume each one as it is final
+    (errors/2026-08-29-full-finetune-blocker.md). Identical numbers or the
+    optimization is not one.
+    """
+    import numpy as np
+
+    from tilerl.autograd import RecordingBackend, Tape
+    from tilerl.cli import _build_model
+    from tilerl.testing import RefBackend
+    from tilerl.train import _training_kv
+
+    backend = RefBackend()
+    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    ids = np.arange(1, 33, dtype=np.int64).reshape(2, 16) % cfg.vocab_size
+    b, t = ids.shape
+    pos = np.arange(t, dtype=np.int64)
+
+    def run(stream):
+        kv = _training_kv(model, b, t, device=backend.device)
+        tape = Tape()
+        with torch.no_grad(), tape:
+            logits = model.forward(ids, pos, kv, RecordingBackend(backend))
+        _, gl = backend.cross_entropy_loss_grad(logits, ids)
+        if not stream:
+            return dict(tape.backward(gl))
+        out = {}
+
+        def take(tid, g):
+            out[tid] = g.clone()
+            return True
+
+        left = tape.backward(gl, on_grad=take)
+        assert not left, f"streaming left {len(left)} gradients behind"
+        return out
+
+    # Compare by parameter NAME, not id(): streaming frees tensors earlier, so
+    # CPython hands their addresses to later allocations and the two runs no
+    # longer agree on ids for anything but the params themselves.
+    by_id = {id(v): k for k, v in model.params.items()}
+    ref = {by_id[k]: v for k, v in run(False).items() if k in by_id}
+    got = {by_id[k]: v for k, v in run(True).items() if k in by_id}
+    assert set(ref) == set(got), (
+        f"streamed {len(got)} parameter gradients, collected {len(ref)}: "
+        f"{sorted(set(ref) ^ set(got))[:4]}"
+    )
+    assert len(ref) >= 20, f"expected the tiny model's params, got {len(ref)}"
+    worst = max((ref[k] - got[k]).abs().max().item() for k in ref)
+    assert worst == 0.0, f"streamed gradients differ by {worst:.3e}"
+
+
 def test_tape_gradcheck():
     """Tape backward vs central finite differences on rmsnorm+linear+CE.
 

@@ -315,9 +315,38 @@ class Tape:
         """Called by ``maybe_record``; appends one entry."""
         self._entries.append(_Entry(op_name, tuple(args), dict(kwargs), output))
 
-    def backward(self, grad_output: torch.Tensor) -> dict[int, torch.Tensor]:
+    def _first_use(self) -> dict[int, int]:
+        """``{id(tensor): lowest entry index that consumes it}``.
+
+        Walking the tape in reverse, a tensor's gradient is final once that
+        entry has run — no earlier entry can add to it. This is what lets a
+        gradient be handed out and dropped the moment it is done.
+        """
+        first: dict[int, int] = {}
+        for i, e in enumerate(self._entries):
+            for a in e.args:
+                if isinstance(a, torch.Tensor):
+                    first.setdefault(id(a), i)
+            for a in e.kwargs.values():
+                if isinstance(a, torch.Tensor):
+                    first.setdefault(id(a), i)
+        return first
+
+    def backward(
+        self, grad_output: torch.Tensor, on_grad: Any = None
+    ) -> dict[int, torch.Tensor]:
         """Reverse replay. Returns ``{id(param): grad}`` for every leaf
-        (consumed-but-never-produced tensor) that received gradient."""
+        (consumed-but-never-produced tensor) that received gradient.
+
+        ``on_grad(tensor_id, grad) -> bool`` — when given, each gradient is
+        offered as soon as it is final; returning True means the callback took
+        it and this dict DROPS it, so gradients never all coexist. That is what
+        full fine-tuning needs: with masters the 27B OOMs at 95.09 of 95.22 GiB
+        inside the backward's ``gemm_tn`` while holding every weight gradient
+        (errors/2026-08-29-full-finetune-blocker.md). It also releases the ~9
+        GiB of intermediate-activation gradients this dict otherwise keeps past
+        their last use, which LoRA pays as well.
+        """
         if not self._entries:
             raise RuntimeError(
                 "backward on an empty tape — no backend op recorded. The "
@@ -342,11 +371,25 @@ class Tape:
         # Backward ops must not record onto this tape.
         entries = self._entries
         produced = {id(e.output) for e in entries}
+        # Index i is where each tensor is FIRST consumed, so walking in reverse
+        # its gradient is final once entry i has run. Intermediates are dropped
+        # by their PRODUCER instead: an activation's gradient is consumed when
+        # the entry that produced it replays, and releasing it at its own
+        # first-use index deletes it before that — which severs the chain and
+        # leaves every downstream parameter without a gradient.
+        first_use = self._first_use() if on_grad is not None else {}
+        produced_at = ({id(e.output): i for i, e in enumerate(self._entries)}
+                       if on_grad is not None else {})
+        taken: set[int] = set()
         token = _current_tape.set(None)
         try:
-            for entry in reversed(entries):
+            for i in range(len(entries) - 1, -1, -1):
+                entry = entries[i]
                 g_out = grads.get(id(entry.output))
                 if g_out is None:
+                    # A dead branch still ends tensors' lifetimes at this index.
+                    if on_grad is not None:
+                        self._release(grads, first_use, produced_at, taken, i, on_grad)
                     continue  # dead branch: output feeds nothing differentiable
                 handler = _BWD.get(entry.op_name)
                 if handler is None:
@@ -364,11 +407,34 @@ class Tape:
                         grads[tid] = grads[tid] + g_in
                     else:
                         grads[tid] = g_in
+                # The entry that just ran was the last chance to add to any
+                # tensor first consumed here: those gradients are final.
+                if on_grad is not None:
+                    grads.pop(id(entry.output), None)  # this entry consumed it
+                    self._release(grads, first_use, produced_at, taken, i, on_grad)
         finally:
             _current_tape.reset(token)
             self._entries.clear()
             self._consumed = True
-        return {tid: g for tid, g in grads.items() if tid not in produced}
+        return {tid: g for tid, g in grads.items()
+                if tid not in produced and tid not in taken}
+
+    @staticmethod
+    def _release(grads, first_use, produced_at, taken, idx, on_grad) -> None:
+        """Offer every LEAF gradient that entry ``idx`` finalized, and drop the
+        ones the callback takes.
+
+        Only leaves: an intermediate is released by the caller when the entry
+        that produced it replays, because that is when its gradient stops being
+        needed. Keying an intermediate off its own first-use index deletes it
+        one step too early and breaks the chain.
+        """
+        for tid, g in list(grads.items()):
+            if first_use.get(tid) != idx or tid in produced_at:
+                continue
+            if on_grad(tid, g):
+                taken.add(tid)
+                del grads[tid]
 
 
 class AdamW:
