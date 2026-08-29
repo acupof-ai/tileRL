@@ -18,9 +18,9 @@ import gc
 import numpy as np
 import torch
 
-from tilerl.autograd import AdamW, RecordingBackend, Tape
+from tilerl.autograd import Adafactor, AdamW, RecordingBackend, Tape
 from tilerl.config import qwen38_27b
-from tilerl.model import add_lora, load_hf
+from tilerl.model import add_lora, drop_quantized, load_hf
 from tilerl.train import _training_kv
 from tilerl_kernels.backend import get_backend
 
@@ -67,19 +67,23 @@ def main() -> None:
     ap.add_argument("--layers", type=int, default=64)
     ap.add_argument("-b", type=int, default=1)
     ap.add_argument("-t", type=int, default=64)
+    ap.add_argument("--full", action="store_true", help="full fine-tuning (bf16 masters)")
     args = ap.parse_args()
 
     b = get_backend()
     cfg = qwen38_27b()
     p = 0.0
     p = mark("start", p)
-    model = load_hf(cfg, args.source, fuse_projections=False, num_layers=args.layers)
+    model = load_hf(cfg, args.source, fuse_projections=False, num_layers=args.layers,
+                    keep_master=args.full)
+    if args.full:
+        drop_quantized(model)
     p = mark("load_hf", p)
     model.params = b.materialize(model.params)
     p = mark("materialize", p)
-    trainable = add_lora(model, rank=16)
+    trainable = None if args.full else add_lora(model, rank=16)
     p = mark("add_lora", p)
-    opt = AdamW(lr=1e-3)
+    opt = Adafactor(lr=1e-2) if args.full else AdamW(lr=1e-3)
 
     ids = np.arange(1, args.t + 1, dtype=np.int64).reshape(args.b, args.t) % cfg.vocab_size
     positions = np.arange(args.t, dtype=np.int64)
@@ -93,15 +97,25 @@ def main() -> None:
     p = mark(f"forward (tape {len(tape._entries)})", p)
     live_tensors(named=model.params)
 
-    grad_logits = torch.zeros_like(logits)
-    grads = tape.backward(grad_logits)
+    grad_logits = torch.ones_like(logits) / logits.numel()
+    params = model.params if trainable is None else trainable
+    by_id = {id(x): x for x in params.values()}
+    if args.full:
+        # The path full fine-tuning actually runs: each gradient is consumed
+        # and freed inside backward, so they never coexist.
+        opt.begin()
+        tape.backward(grad_logits, needs=set(by_id),
+                      on_grad=lambda t, g: (t in by_id and opt.step_one(by_id[t], g)) or True)
+        p = mark("backward + streamed update", p)
+        live_tensors(named=model.params)
+        return
+    grads = tape.backward(grad_logits, needs=set(by_id))
     p = mark("backward", p)
     live_tensors(named=model.params)
 
-    param_ids = {id(x) for x in trainable.values()}
-    grads = {k: v for k, v in grads.items() if k in param_ids}
+    grads = {k: v for k, v in grads.items() if k in by_id}
     p = mark("grads filtered", p)
-    opt.step(trainable.values(), grads)
+    opt.step(params.values(), grads)
     mark("optimizer", p)
 
 

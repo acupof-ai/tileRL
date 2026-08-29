@@ -121,7 +121,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     import torch
 
     from . import train as train_mod
-    from .autograd import AdamW, Tape, cosine_warmup
+    from .autograd import Adafactor, AdamW, Tape, cosine_warmup
     from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
@@ -131,7 +131,19 @@ def cmd_train(args: argparse.Namespace) -> None:
     # touches — and enough to fill the card on its own.
     adapters_only = args.rl or args.opd
     cfg, model = _build_model(args.model, seed=args.seed, keep_master=not adapters_only)
-    optimizer = AdamW(lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
+    if not adapters_only:
+        from .model import drop_quantized
+
+        drop_quantized(model)
+    # Full fine-tuning cannot use Adam: m+v for the 27B is 200.4 GiB against
+    # 50.1 GiB of weights. Adafactor factors the second moment to 0.03 GiB and
+    # clips each update, so no global grad norm is needed — which is what lets
+    # train._step consume and free every gradient inside backward instead of
+    # holding all 50.1 GiB of them.
+    optimizer = (
+        AdamW(lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1) if adapters_only
+        else Adafactor(lr=1e-2, weight_decay=0.1)
+    )
     gen = torch.Generator().manual_seed(args.seed)
 
     print(
@@ -220,6 +232,9 @@ def cmd_pretrain(args: argparse.Namespace) -> None:
 
     backend = get_backend()
     cfg, model = _build_model(args.model, seed=args.seed, keep_master=True)
+    from .model import drop_quantized
+
+    drop_quantized(model)
     dataset = train_mod.JsonlDataset(args.data, get_tokenizer(None), args.seq_len)
     optimizer = AdamW(lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
 

@@ -1072,6 +1072,22 @@ def _hf_tensor_name(key: str) -> str:
     return f"model.language_model.layers.{layer}.{_HF_SUFFIXES[suffix]}"
 
 
+def drop_quantized(model: Model) -> Model:
+    """Free the served bytes of every linear that has a bf16 master.
+
+    Full fine-tuning routes each linear through its master
+    (``autograd.RecordingBackend.master_linear``), so the quantized bytes are
+    never read — 14.9 GiB of the 27B held for nothing. ``save_hf`` re-packs
+    from the master, so nothing is lost except the checkpoint's original bytes,
+    which is why this is a training-entry-point call and not part of
+    ``load_hf``: the loader stays a bit-exact round trip.
+    """
+    for key in [k for k in param_specs(model.cfg) if k in model.params]:
+        for suffix in (".wq", ".scale", ".oscale", ".w8", ".wscale"):
+            model.params.pop(key + suffix, None)
+    return model
+
+
 def save_hf(model: Model, path: str | Path) -> None:
     """Save params as HF safetensors + config.json (``load_hf`` reads it back).
 

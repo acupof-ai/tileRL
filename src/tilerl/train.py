@@ -77,6 +77,14 @@ def _training_kv(
 # ---------------------------------------------------------------------------
 
 
+_NO_GRAD = (
+    "train_step: tape produced no parameter gradients — either the recording "
+    "seam is missing (backend ops not recorded), or a trainable tensor is not "
+    "the one the forward read: materialize() rebuilds any param whose "
+    "device/dtype differs, and the new object has a new id()"
+)
+
+
 def _step(
     model: Any,
     input_ids: Any,
@@ -111,14 +119,33 @@ def _step(
     #: ``trainable`` = the subset that gets gradients (LoRA adapters); the rest
     #: is frozen, which is what keeps the 27B inside one card.
     params = model.params if trainable is None else trainable
-    param_ids = {id(p) for p in params.values()}
+    by_id = {id(p): p for p in params.values()}
+    param_ids = set(by_id)
+
+    if getattr(optimizer, "streams", False):
+        # Full fine-tuning: hold no gradient longer than its own update. Every
+        # weight gradient coexisting is 50.1 GiB of the 27B, which is what
+        # clip_grad_norm's global norm forces and what OOMs the step. This
+        # optimizer clips each update instead, so a parameter can be updated
+        # and its gradient dropped the moment backward finalizes it.
+        optimizer.begin()
+        seen = 0
+
+        def _apply(tid: int, g: torch.Tensor) -> bool:
+            nonlocal seen
+            p = by_id.get(tid)
+            if p is None:
+                return True  # unwanted gradient: drop it
+            optimizer.step_one(p, g)
+            seen += 1
+            return True
+
+        tape.backward(grad_logits, on_grad=_apply, needs=param_ids)
+        assert seen, _NO_GRAD
+        return loss
+
     grads = tape.backward(grad_logits, needs=param_ids)
-    assert param_ids & set(grads), (
-        "train_step: tape produced no parameter gradients — either the "
-        "recording seam is missing (backend ops not recorded), or a trainable "
-        "tensor is not the one the forward read: materialize() rebuilds any "
-        "param whose device/dtype differs, and the new object has a new id()"
-    )
+    assert param_ids & set(grads), _NO_GRAD
     # The GDN initial state is a tape leaf: its grad is not a parameter and
     # must not enter the clip norm.
     grads = {k: v for k, v in grads.items() if k in param_ids}

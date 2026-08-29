@@ -246,6 +246,49 @@ def test_stop_token_is_not_returned():
     assert engine.take(rid) == []
 
 
+def test_adafactor_streaming_matches_collecting():
+    """Updating each parameter inside backward must equal collecting first.
+
+    The streaming path is what makes full fine-tuning fit — it never holds two
+    weight gradients at once — so it has to be the same arithmetic, not an
+    approximation of it. Updates are independent per parameter, so replay order
+    does not matter; this asserts that.
+
+    Compared at the tape+optimizer level, not through ``train_step``: the
+    collecting path there also runs ``clip_grad_norm``, which the streaming
+    path deliberately drops (Adafactor clips each update instead, so no global
+    norm is needed and no gradient has to outlive its own update).
+    """
+    backend = get_backend()
+    ids = np.random.default_rng(7).integers(3, tiny().vocab_size, size=(2, 16)).astype(np.int64)
+
+    def run(streaming: bool) -> dict[str, torch.Tensor]:
+        model = build_random(tiny(), seed=2026)
+        opt = Adafactor(lr=1e-2)
+        for _ in range(3):
+            model.params = backend.materialize(model.params)
+            by_id = {id(p): p for p in model.params.values()}
+            kv = _training_kv(model, 2, 16, device=backend.device)
+            tape = Tape()
+            with torch.no_grad(), tape:
+                logits = model.forward(ids, np.arange(16), kv, RecordingBackend(backend))
+            g = torch.ones_like(logits) / logits.numel()
+            opt.begin()
+            if streaming:
+                tape.backward(g, needs=set(by_id),
+                              on_grad=lambda t, gr: (t in by_id
+                                                     and opt.step_one(by_id[t], gr)) or True)
+            else:
+                for tid, gr in tape.backward(g, needs=set(by_id)).items():
+                    if tid in by_id:
+                        opt.step_one(by_id[tid], gr)
+        return {k: v.clone() for k, v in model.params.items()}
+
+    streamed, collected = run(True), run(False)
+    for k, v in collected.items():
+        assert torch.equal(streamed[k], v), f"{k} diverged"
+
+
 def test_adafactor_trains_with_factored_state():
     """Same 20-step gate as AdamW, plus the property that is the whole reason
     Adafactor exists: a 2D param's second moment is O(rows+cols), not O(n).

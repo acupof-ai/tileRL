@@ -549,54 +549,72 @@ class Adafactor:
         self._state: dict[int, Any] = {}
         self._step = 0
 
+    #: This optimizer needs no global gradient norm — its own update clipping
+    #: bounds each step — so a parameter's gradient can be consumed and freed
+    #: the moment backward finalizes it. That is what lets full fine-tuning
+    #: run: holding all 26.9B gradients at once is 50.1 GiB of bf16 that
+    #: clip_grad_norm would otherwise force to coexist.
+    streams = True
+
     @staticmethod
     def _rms(t: torch.Tensor) -> float:
         return float(t.norm() / math.sqrt(t.numel()))
 
-    def step(self, params: Any, grads: dict[int, torch.Tensor]) -> None:
+    def begin(self) -> None:
+        """Advance the step counter once, before any :meth:`step_one`."""
         self._step += 1
-        b2 = 1.0 - self._step**self.decay_power
+
+    def step(self, params: Any, grads: dict[int, torch.Tensor]) -> None:
+        self.begin()
         for p in params:
             g = grads.get(id(p))
-            if g is None:
-                continue
-            g = g.to(torch.float32)
-            u = g.mul(g).add_(self.eps[0])
-            st = self._state.get(id(p))
-            factored = g.dim() == 2
-            if st is None:
-                if factored:
-                    st = (
-                        torch.zeros(g.shape[0], dtype=torch.float32, device=g.device),
-                        torch.zeros(g.shape[1], dtype=torch.float32, device=g.device),
-                    )
-                else:
-                    st = (torch.zeros_like(g),)
-                if self.beta1 > 0.0:
-                    st = st + (torch.zeros_like(g),)
-                self._state[id(p)] = st
+            if g is not None:
+                self.step_one(p, g)
+
+    def step_one(self, p: torch.Tensor, g: torch.Tensor) -> None:
+        """Update ONE parameter. Independent of every other parameter, which is
+        exactly why the gradient can be released straight after."""
+        b2 = 1.0 - self._step**self.decay_power
+        g = g.to(torch.float32)
+        u = g.mul(g).add_(self.eps[0])
+        st = self._state.get(id(p))
+        factored = g.dim() == 2
+        if st is None:
             if factored:
-                r, c = st[0], st[1]
-                r.mul_(b2).add_(u.mean(dim=1), alpha=1.0 - b2)
-                c.mul_(b2).add_(u.mean(dim=0), alpha=1.0 - b2)
-                #: outer(r / mean(r), c) is the rank-1 reconstruction of v
-                upd = g * torch.rsqrt(r.div(r.mean()).unsqueeze(1) * c.unsqueeze(0))
+                st = (
+                    torch.zeros(g.shape[0], dtype=torch.float32, device=g.device),
+                    torch.zeros(g.shape[1], dtype=torch.float32, device=g.device),
+                )
             else:
-                v = st[0]
-                v.mul_(b2).add_(u, alpha=1.0 - b2)
-                upd = g * torch.rsqrt(v)
-            upd.div_(max(1.0, self._rms(upd) / self.clip))
-            p32 = p.to(torch.float32)
-            #: relative step: the update is scaled by the parameter's own size,
-            #: so one lr works across tensors of very different magnitude.
-            step = self.lr * max(self.eps[1], self._rms(p32))
-            if self.weight_decay > 0.0:
-                p32.mul_(1.0 - step * self.weight_decay)
+                st = (torch.zeros_like(g),)
             if self.beta1 > 0.0:
-                m = st[-1]
-                m.mul_(self.beta1).add_(upd, alpha=1.0 - self.beta1)
-                upd = m
-            p.copy_(p32.add_(upd, alpha=-step).to(p.dtype))
+                st = st + (torch.zeros_like(g),)
+            self._state[id(p)] = st
+        if factored:
+            r, c = st[0], st[1]
+            r.mul_(b2).add_(u.mean(dim=1), alpha=1.0 - b2)
+            c.mul_(b2).add_(u.mean(dim=0), alpha=1.0 - b2)
+            #: outer(r / mean(r), c) is the rank-1 reconstruction of v
+            upd = g * torch.rsqrt(r.div(r.mean()).unsqueeze(1) * c.unsqueeze(0))
+        else:
+            v = st[0]
+            v.mul_(b2).add_(u, alpha=1.0 - b2)
+            upd = g * torch.rsqrt(v)
+        rms = self._rms(upd)
+        if not math.isfinite(rms):
+            return  # a non-finite gradient skips this param, not the step
+        upd.div_(max(1.0, rms / self.clip))
+        p32 = p.to(torch.float32)
+        #: relative step: the update is scaled by the parameter's own size,
+        #: so one lr works across tensors of very different magnitude.
+        step = self.lr * max(self.eps[1], self._rms(p32))
+        if self.weight_decay > 0.0:
+            p32.mul_(1.0 - step * self.weight_decay)
+        if self.beta1 > 0.0:
+            m = st[-1]
+            m.mul_(self.beta1).add_(upd, alpha=1.0 - self.beta1)
+            upd = m
+        p.copy_(p32.add_(upd, alpha=-step).to(p.dtype))
 
 
 def cosine_warmup(step: int, total: int, warmup: int, lr: float) -> float:
