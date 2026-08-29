@@ -512,24 +512,28 @@ class Engine:
         """Run one tick: one forward over the planned rows (mixed
         prefill+decode, decode-only, or prefill-only)."""
         with self._lock:
-            decodes, prefill, chunk = self._build_plan()
-            if not decodes and prefill is None:
+            decodes, prefills, chunks = self._build_plan()
+            if not decodes and not prefills:
                 return
             try:
-                self._run_forward(decodes, prefill, chunk)
+                self._run_forward(decodes, prefills, chunks)
             except Exception as exc:
                 for req in list(self._running):
                     self._finish(req, error=str(exc))
                 raise
 
-    def _build_plan(self) -> tuple[list[_Req], _Req | None, int]:
+    def _build_plan(self) -> tuple[list[_Req], list[_Req], list[int]]:
         """Plan one tick, mirroring agent-infer's ``build_forward_plan``.
 
         Admit as many waiting requests as ``max_batch`` allows, then take
-        all running decodes as decode rows and at most one prefill row — the
-        next chunk of a prefilling request, sized by the per-tick token
-        budget (``max_num_batched_tokens`` minus the decode rows). A prompt
-        longer than the budget stays in PREFILL and is chunked across ticks.
+        all running decodes as decode rows and as many prefill rows as the
+        per-tick token budget (``max_num_batched_tokens`` minus the decode
+        rows) and one width bucket allow. A prompt longer than the budget
+        stays in PREFILL and is chunked across ticks.
+
+        One prefill row per tick left the budget mostly idle: a 16-token
+        prompt used 16 of 512, so a burst of short prompts prefilled one per
+        forward. That is the shape a synthetic-data workload has.
 
         Admission is a whole pass, not one request per tick: a burst of B
         submissions used to need B ticks just to reach the running queue, so
@@ -539,14 +543,30 @@ class Engine:
         while self._waiting and len(self._running) < self.limits.max_batch:
             self._running.append(self._waiting.popleft())
         decodes = [r for r in self._running if r.phase == _PHASE_DECODE]
-        prefill = next((r for r in self._running if r.phase == _PHASE_PREFILL), None)
-        chunk = 0
-        if prefill is not None:
-            remaining = len(prefill.tokens) - prefill.prefill_from
-            chunk = min(remaining, self.limits.max_num_batched_tokens - len(decodes))
+        prefills: list[_Req] = []
+        chunks: list[int] = []
+        budget = self.limits.max_num_batched_tokens - len(decodes)
+        bucket = 0
+        for r in self._running:
+            if r.phase != _PHASE_PREFILL:
+                continue
+            if len(decodes) + len(prefills) >= self.limits.max_batch:
+                break
+            chunk = min(len(r.tokens) - r.prefill_from, budget)
             if chunk <= 0:
-                prefill = None  # no token budget this tick; decode-only
-        return decodes, prefill, chunk
+                break
+            # Rows are padded to a shared width, so packing a 16-token prompt
+            # beside a 512-token one would compute 512 wide for both. The
+            # width is bucketed anyway: pack only within one bucket and the
+            # padding costs nothing.
+            b = -(-chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
+            if prefills and b != bucket:
+                break
+            bucket = b
+            prefills.append(r)
+            chunks.append(chunk)
+            budget -= chunk
+        return decodes, prefills, chunks
 
     def run(self) -> None:
         """Start the daemon loop (raises if already running)."""
@@ -662,7 +682,7 @@ class Engine:
             keep_steps=keep_steps,
         )
 
-    def _run_forward(self, decodes: list[_Req], prefill: _Req | None, chunk: int) -> None:
+    def _run_forward(self, decodes: list[_Req], prefills: list[_Req], chunks: list[int]) -> None:
         """Run one mixed/decode/prefill forward over the planned rows.
 
         Rows are left-aligned valid tokens padded to a shared T (decode rows:
@@ -674,7 +694,7 @@ class Engine:
         # bucketed prefill chunk, which the step-state buffers cannot cover.
         chains = (
             self._draft_chains(decodes, trim=not self._decode_graph_on)
-            if self._draft is not None and decodes and prefill is None
+            if self._draft is not None and decodes and not prefills
             else None
         )
         if chains is not None and max(map(len, chains)) == 1:
@@ -707,14 +727,14 @@ class Engine:
                 r.own_blocks += 1
                 self._blocks_used += 1
         if (
-            prefill is None
+            not prefills
             and decodes
             and self._decode_graph_on
             and self._run_decode_graph(decodes, chains)
         ):
             return
-        rows = decodes + ([prefill] if prefill is not None else [])
-        seq_q = q_dec + ([chunk] if prefill is not None else [])
+        rows = decodes + prefills
+        seq_q = q_dec + chunks
         # Bucket the forward width: tilelang kernels specialize on the shape,
         # so a width equal to the prompt length compiles a kernel set per
         # distinct prompt (MMLU: 662 variants in 20 min, GPU idle). Padding
@@ -722,6 +742,7 @@ class Engine:
         # logits below.
         # A verify width is exact (a handful of shapes, 1+depth at most); only
         # a real prefill chunk is bucketed.
+        chunk = max(chunks, default=0)
         width = -(-max(seq_q) // _PREFILL_BUCKET) * _PREFILL_BUCKET if chunk > 1 else max(seq_q)
         input_ids = np.zeros((len(rows), width), dtype=np.int64)
         positions = np.zeros((len(rows), width), dtype=np.int64)
@@ -729,11 +750,11 @@ class Engine:
             chain = chains[i] if chains else [r.output[-1]]
             input_ids[i, : len(chain)] = chain
             positions[i, : len(chain)] = np.arange(r.seq_len - 1, r.seq_len - 1 + len(chain))
-        if prefill is not None:
-            j = len(decodes)
-            start = prefill.prefill_from
-            input_ids[j, :chunk] = prefill.tokens[start : start + chunk]
-            positions[j, :chunk] = np.arange(start, start + chunk)
+        for k, (pf, c) in enumerate(zip(prefills, chunks)):
+            j = len(decodes) + k
+            start = pf.prefill_from
+            input_ids[j, :c] = pf.tokens[start : start + c]
+            positions[j, :c] = np.arange(start, start + c)
         hid: list | None = [] if self._draft else None
         logits = self._model.forward(
             input_ids, positions, self._make_kv(rows, seq_q, width if chains else 0),
@@ -750,34 +771,39 @@ class Engine:
             self._verify(decodes, chains, logits, hid[-1])
         else:
             self._sample_commit([(r, logits[i, 0], len(r.output)) for i, r in enumerate(decodes)])
-        if prefill is not None:
+        if prefills:
             self._prefill_forwards += 1
-            j = len(decodes)
             # last_only may have collapsed the T axis to the final token.
-            self._finish_prefill(prefill, logits[j, min(chunk, logits.shape[1]) - 1], chunk)
+            self._finish_prefills(prefills, chunks, logits, len(decodes))
         if decodes:
             self._decode_forwards += 1
-        if decodes and prefill is not None:
+        if decodes and prefills:
             self._mixed_forwards += 1
 
-    def _finish_prefill(self, prefill: _Req, last_logits, chunk: int) -> None:
-        """Advance a prefill row by one chunk and, if that completed the
-        prompt, sample its first token and publish the prefix."""
-        prefill.prefill_from += chunk
-        prefill.seq_len = prefill.prefill_from
-        if prefill.prefill_from < len(prefill.tokens):
+    def _finish_prefills(self, prefills: list[_Req], chunks: list[int], logits, base: int) -> None:
+        """Advance every prefill row by its chunk and, for the ones that
+        completed their prompt, sample the first token in ONE batched call and
+        publish the prefix."""
+        done = []
+        for k, (pf, c) in enumerate(zip(prefills, chunks)):
+            pf.prefill_from += c
+            pf.seq_len = pf.prefill_from
+            if pf.prefill_from >= len(pf.tokens):
+                done.append((pf, logits[base + k, min(c, logits.shape[1]) - 1], 0))
+        if not done:
             return
-        self._sample_commit([(prefill, last_logits, 0)])
-        # Publish the prompt prefix at a block boundary: the state slot still
-        # covers exactly the prompt tokens, so the snapshot is exact.
-        prompt_len = len(prefill.tokens) - len(prefill.output)
-        if prefill.phase != _PHASE_DONE and prompt_len % BLOCK_TOKENS == 0:
-            self._publish_prefix(prefill, prompt_len)
-        if prefill.phase != _PHASE_DONE:
-            if len(prefill.output) >= prefill.params.max_new_tokens:
-                self._finish(prefill)
-            else:
-                prefill.phase = _PHASE_DECODE
+        self._sample_commit(done)
+        for pf, _, _ in done:
+            # Publish the prompt prefix at a block boundary: the state slot
+            # still covers exactly the prompt tokens, so the snapshot is exact.
+            prompt_len = len(pf.tokens) - len(pf.output)
+            if pf.phase != _PHASE_DONE and prompt_len % BLOCK_TOKENS == 0:
+                self._publish_prefix(pf, prompt_len)
+            if pf.phase != _PHASE_DONE:
+                if len(pf.output) >= pf.params.max_new_tokens:
+                    self._finish(pf)
+                else:
+                    pf.phase = _PHASE_DECODE
 
     def _run_decode_graph(self, reqs: list[_Req], chains=None) -> bool:
         """Captured decode for a pure-decode tick (one graph per batch-size

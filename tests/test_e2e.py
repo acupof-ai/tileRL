@@ -782,21 +782,30 @@ def test_prefix_snapshot_includes_conv_window():
 
 def test_concurrent_prefills_not_starved():
     """Mixed-batch scheduling: 3 concurrent requests all reach decode phase
-    within 3 ticks (tick i admits request i and mixes its prefill with the
-    earlier decodes), and all 3 produce output. Decode-first scheduling would
-    fully serve req 1 before req 2's prefill, so the three never decode
-    together."""
+    together and all 3 produce output. Decode-first scheduling would fully
+    serve req 1 before req 2's prefill, so the three would never decode
+    together.
+
+    The gate is the phase state, not a forward counter: prefills that share a
+    width bucket are now packed into ONE forward, so three 8-token prompts
+    reach decode in a single prefill-only tick and produce no mixed forward at
+    all. The old assertion (mixed_forwards >= 2) encoded the one-prefill-per-
+    tick schedule rather than the property being protected."""
     engine = _build_engine(seed=77)
     try:
         prompt = np.random.default_rng(0).integers(3, 320, size=8).astype(np.int64)
         params = SamplingParams(temperature=1.0, top_p=0.95, max_new_tokens=8, seed=3)
         ids = [engine.submit(prompt, params) for _ in range(3)]
+        ticks = 0
         for _ in range(16):
             engine.step()
+            ticks += 1
             if sum(1 for r in engine._running if r.phase == _PHASE_DECODE) == 3:
                 break
         assert sum(1 for r in engine._running if r.phase == _PHASE_DECODE) == 3
-        assert engine.stats()["mixed_forwards"] >= 2
+        # Packed into one bucket, so all three prefill in one forward - the
+        # serial schedule needed one tick per request.
+        assert ticks <= 2, f"three same-length prompts took {ticks} ticks to prefill"
         out = _drain(engine, ids, max_new_tokens=8)
     finally:
         engine.shutdown()
