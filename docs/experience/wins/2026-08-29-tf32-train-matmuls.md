@@ -51,10 +51,16 @@ Note the arithmetic does not close: those GEMMs gave back 192 ms but the step
 only dropped 143 ms. The estimate of "-20%" made before the run was wrong; the
 measured -10.8% is the number.
 
-TF32 keeps 10 mantissa bits. That is inside the rtol=1e-2 parity gate on a
-model whose weights are 4-bit, but it is a real precision change, so it ships
-with the CUDA gradcheck, not the CPU one — TF32 does not exist on the CPU
-target and the local suite cannot see it.
+TF32 keeps 10 mantissa bits, and the fp32 reference paths
+(`linear_fp4_ref`, `linear_fp8_ref`) are what the parity gate compares
+against — so a precision loss there could fail parity without any kernel
+changing. That was asserted here before it was measured. It has now been
+measured: the full CUDA suite is **bit-identically 12 failed / 114 passed
+with `TILERL_TF32=0` and `=1`**. TF32 changes no test outcome.
+
+The 12 are pre-existing CUDA failures (5 of them parity), unrelated to this
+change and tracked separately. `TILERL_TF32` stays an env switch so the A/B
+costs one run.
 
 ## What Is Left
 
