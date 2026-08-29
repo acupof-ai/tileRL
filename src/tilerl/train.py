@@ -241,6 +241,13 @@ def grpo_loop(
     runtime (训练推理一体), so a rollout costs a serving batch and nothing is
     duplicated. ``reward_fn(prompt_ids, completion_ids) -> float``.
 
+    ``engine`` must be built with the prefix cache and the captured decode graph
+    OFF (``prefix_store=NoPrefixStore(), decode_graph=False``). Both cache work
+    across steps — a stored prefix holds KV from an earlier policy, and a
+    captured graph holds f32 casts of weights the optimizer updates in place —
+    so either one samples from a policy that is not the current one, without
+    ever raising.
+
     Returns per step ``(mean reward, cross-entropy of the sampled tokens)``.
     Rollouts within a step are one engine batch: the group is what continuous
     batching is for.

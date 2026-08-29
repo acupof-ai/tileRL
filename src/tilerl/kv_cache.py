@@ -29,6 +29,7 @@ __all__ = [
     "PagedKvPool",
     "LinearStatePool",
     "PrefixStore",
+    "NoPrefixStore",
     "PrefixHit",
 ]
 
@@ -364,6 +365,23 @@ class _Entry:
         self.tokens = tokens
         self.blocks = blocks
         self.h = h
+
+
+class NoPrefixStore:
+    """Prefix store that never matches and never retains.
+
+    For a training rollout: a cached prefix serves KV computed under an EARLIER
+    policy, which silently makes an on-policy method off-policy. Also the
+    miss-path double for tests.
+    """
+
+    on_evict: "Callable[[tuple[int, ...]], None] | None" = None
+
+    def lookup(self, tokens: Sequence[int]) -> "PrefixHit | None":
+        return None
+
+    def insert(self, tokens: Sequence[int], blocks: Sequence[int]) -> None:
+        return None
 
 
 class PrefixStore:

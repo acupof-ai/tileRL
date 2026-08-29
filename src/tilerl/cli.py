@@ -140,7 +140,15 @@ def cmd_train(args: argparse.Namespace) -> None:
         # The engine that samples IS the model that trains — one runtime, one
         # set of weights. LoRA keeps the trainable set small enough that a
         # rollout and its update share a card.
-        engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8)
+        # Prefix cache and captured graph BOTH off, and both for correctness,
+        # not speed: a cached prefix serves KV computed under the policy of an
+        # earlier step, and a captured graph bakes the f32 casts of the weights,
+        # which the optimizer's in-place update only invalidates on the eager
+        # path. Either one makes the rollout off-policy without saying so.
+        from .kv_cache import NoPrefixStore
+
+        engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8,
+                              decode_graph=False, prefix_store=NoPrefixStore())
         trainable = add_lora(model, rank=args.lora_rank)
         half = cfg.vocab_size // 2
         # Demo reward: dense, so an untrained policy's group has variance and
