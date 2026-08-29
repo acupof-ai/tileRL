@@ -74,10 +74,32 @@ KSP>1 compile). The kernel is register-limited at 255 registers/thread with
 6.25% occupancy and 4.5M local-load sectors per launch — it spills, and every
 cheap fix moves which resource binds without moving the time.
 
+## One more probe, which opened nothing (and a counter trap)
+
+ncu on the prefill kernels themselves, len 512, the two that matter:
+
+| | DRAM | tensor (hmma) | occupancy | issue |
+|---|---:|---:|---:|---:|
+| `linear_fp8` | 18.1% | 17.3% | 11.4% | 11.0% |
+| `gdn_chunk_fused` | 0.23% | 0.13% | 6.25% | 19.2% |
+
+The 17.3% looks like 5x of headroom and is **not usable**:
+`sm__pipe_tensor_op_hmma_cycles_active` counts the fp16 HMMA pipe, and Hopper's
+fp8 GEMM issues wgmma/QGMMA, which it does not count. The 59% figure quoted
+throughout comes from measured throughput instead (176 of 296 TFLOP/s,
+[wins/2026-08-25-fp8-prefill-n64-tile.md](../wins/2026-08-25-fp8-prefill-n64-tile.md)),
+and a wgmma kernel at 59% of FLOP peak on 11% occupancy is unremarkable — wgmma
+is async and does not need resident warps to feed the tensor pipe.
+
+`gdn_chunk_fused` is the one thing this confirmed rather than assumed: DRAM and
+tensor at ~0 with 19.2% issue and 6.25% occupancy is a kernel bound by the
+dependency chain of its serial scan, which earlier entries had inferred.
+
 ## Rule
 
 State a gap as arithmetic, not as a verdict — and name which measurement the
-target came from. "Not SOTA" invites another round of tuning; "zeroing the
+target came from, including which counter. Reading fp8 utilisation off the HMMA
+pipe would have manufactured a 5x lever that does not exist. "Not SOTA" invites another round of tuning; "zeroing the
 single largest kernel still leaves you 21% short" names the size of what is
 left. But I also wrote that this needs "an algorithm or a machine, not tuning",
 and that was overreach: two hard kernel projects (a linear-attention kernel
