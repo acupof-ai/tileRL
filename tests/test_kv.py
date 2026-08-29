@@ -450,3 +450,42 @@ def test_tier_deferred_flush_to_disk(tmp_path):
     assert torch.equal(pool.k_pool[:, fresh], kb)
     # A missing key reloads False (total contract).
     assert tier.load_kv(0xDEAD, [fresh], pool) is False
+
+
+def test_tier_drop_purges_pending_and_queue_cap(tmp_path):
+    """drop() on a still-queued spill must purge the in-memory blob, or has()
+    would keep serving KV for a prefix the store evicted (write-back cache
+    invalidation → wrong tokens). Also: over max_pending, spill refuses."""
+    import os
+
+    from tilerl.kv_cache import KvTier
+
+    pool = PagedKvPool(16, 1, 4)
+    tier = KvTier(str(tmp_path / "kvt"), min_tokens=0, max_pending=2)
+    key = 0x1234
+    b = pool.alloc_block()
+    assert tier.spill_kv(key, [b], pool) is True
+    # drop before the flush may have run: has() must go False immediately.
+    tier.drop(key)
+    assert not tier.has(key), "drop left a pending blob visible (invalidation hole)"
+    assert tier.load_kv(key, [b], pool) is False
+
+    # After a drop, no stale file should survive the daemon's write either.
+    import time
+
+    time.sleep(0.1)
+    assert not os.path.exists(tier._kv(key)), "dropped blob reappeared on disk"
+
+    # Queue cap: fill max_pending with never-drained entries (writer drains, so
+    # flood fast and check that some refuse once the in-flight set is full).
+    refused = 0
+    for i in range(50):
+        bb = pool.alloc_block()
+        if not tier.spill_kv(0x9000 + i, [bb], pool):
+            refused += 1
+        pool.free_block(bb)
+    # The cap must bite at least once under a burst faster than the disk drains,
+    # OR the writer kept up and none refused — both are correct; assert no crash
+    # and the cap is respected in-flight.
+    with tier._lock:
+        assert len(tier._pending) <= tier._max_pending

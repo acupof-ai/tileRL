@@ -388,7 +388,7 @@ class KvTier:
     #   latency bites; raw bf16 spill, fp8 tier-quant is 2x capacity if SSD fills
     """
 
-    def __init__(self, path: str, min_tokens: int = 2048) -> None:
+    def __init__(self, path: str, min_tokens: int = 2048, max_pending: int = 32) -> None:
         import queue
         import shutil
         import threading
@@ -398,6 +398,14 @@ class KvTier:
         # are not worth a disk write); a pinned-DRAM tier can set it near 0
         # (reload beats recompute at any length). The store reads it off the tier.
         self.min_tokens = min_tokens
+        # Bound the in-flight write queue: eviction is bursty (evict_until_free
+        # frees many at once; bd851c1 publishes several per tick) and can enqueue
+        # faster than the disk drains. On a 31GB-RAM host an unbounded queue is a
+        # host OOM masquerading as a KV bug. Over the cap, spill_kv refuses —
+        # the graceful drop the store already handles. ~1MiB/block-token so 32
+        # entries of a few-block prefix is well under 1GB.
+        self._max_pending = max_pending
+        self._healthy = True  # daemon failure (disk full/perm) flips this to refuse
         shutil.rmtree(self._dir, ignore_errors=True)
         os.makedirs(self._dir, exist_ok=True)
         # Deferred write: spill_kv runs INSIDE a decode tick (_publish_prefix on
@@ -415,13 +423,32 @@ class KvTier:
     def _flush_loop(self) -> None:
         while True:
             tag, blob, dst = self._q.get()
-            torch.save(blob, dst)
+            # A drop() that raced us already removed the entry from _pending and
+            # deleted any file. If we wrote now, a stale blob would reappear on
+            # disk for a prefix the store believes evicted (write-back cache
+            # invalidation hole → wrong tokens). So write only while the entry
+            # is still pending, and pop under the same lock, atomically.
+            k = tag[1] if isinstance(tag, tuple) else tag
+            table = self._pending_st if isinstance(tag, tuple) else self._pending
             with self._lock:
-                # tag is a bare int (KV) or ("st", key) (GDN snapshot).
-                if isinstance(tag, tuple):
-                    self._pending_st.pop(tag[1], None)
-                else:
-                    self._pending.pop(tag, None)  # now durable on disk
+                if table.get(k) is not blob:
+                    continue  # dropped (or superseded) before we flushed
+            try:
+                torch.save(blob, dst)
+            except Exception:  # noqa: BLE001 - disk full / perm: stop trusting the tier
+                self._healthy = False  # spill_kv now refuses; store drops instead
+                continue
+            with self._lock:
+                if table.get(k) is blob:  # still ours after the write
+                    table.pop(k, None)  # now durable on disk
+                    continue
+            # A drop() landed while torch.save ran: it removed the entry and
+            # tried to unlink a file that did not exist yet. Undo our write so
+            # the evicted prefix does not reappear on disk.
+            try:
+                os.remove(dst)
+            except FileNotFoundError:
+                pass
 
     def _kv(self, key: int) -> str:
         return os.path.join(self._dir, f"{key & _MASK64:016x}.kv")
@@ -438,6 +465,13 @@ class KvTier:
         # prefix is block-aligned, so len(blocks)*BLOCK_TOKENS is its length.
         if len(blocks) * BLOCK_TOKENS < self.min_tokens:
             return False
+        # Refuse when the writer is behind or dead: an unbounded queue on a
+        # 31GB-RAM host is a host OOM, and a dead daemon (disk full/perm) would
+        # let the queue grow while the store believes everything durable. Both
+        # become the graceful drop the store already handles.
+        with self._lock:
+            if not self._healthy or len(self._pending) >= self._max_pending:
+                return False
         # GPU->CPU copy now (fast, on-tick); torch.save deferred to the writer.
         k = torch.stack([pool.k_pool[:, b] for b in blocks]).contiguous().cpu()
         v = torch.stack([pool.v_pool[:, b] for b in blocks]).contiguous().cpu()
