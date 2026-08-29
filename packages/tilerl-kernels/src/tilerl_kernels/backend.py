@@ -521,7 +521,10 @@ class Backend:
                 Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, 64)
                 x2 = _pad2d(x2, Mp, Kp)
                 wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
-            y2 = self._kernel("linear_fp4")(x2, wq, scale, bM, bN, blk, _THREADS)[:M, :N]
+            # The generic linear_fp4 is f32-IO (no tensor cores); on a bf16-IO
+            # cuda cell (sm70's M>1 fallback — sm90 never lands here, it has an
+            # MMA kernel) the _rows cast left x2 bf16, so restore f32.
+            y2 = self._kernel("linear_fp4")(self._f32(x2), wq, scale, bM, bN, blk, _THREADS)[:M, :N]
         y = self._epilogue(y2, oscale, lead, N)
         return y if residual is None else y + residual
 
