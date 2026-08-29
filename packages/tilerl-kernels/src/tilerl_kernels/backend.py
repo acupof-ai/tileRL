@@ -432,10 +432,13 @@ class Backend:
         """The fp4 bytes this cell's kernels read. sm90 kernels decode the
         twiddled layout; the served tensor is rewritten in place ONCE (flagged)
         so graph capture, save_hf (which untwiddles by the flag) and CPU-resident
-        callers all see one truth. Other cells read the natural layout."""
+        callers all see one truth. Other cells read the natural layout — sm70's
+        GEMV decodes natural nibbles in TIR, so it must NOT be twiddled."""
         wq = self._dev(wq, wq.dtype)  # uint8: device migration only
-        if "linear_fp4_gemv" in _resolve(self.precision, self.arch) and not getattr(
-            wq, "_tl_twiddled", False
+        if (
+            self.arch != "sm70"
+            and "linear_fp4_gemv" in _resolve(self.precision, self.arch)
+            and not getattr(wq, "_tl_twiddled", False)
         ):
             wq.copy_(reference.twiddle_fp4(wq))
             wq._tl_twiddled = True

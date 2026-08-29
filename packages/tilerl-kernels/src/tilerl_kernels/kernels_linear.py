@@ -932,6 +932,76 @@ def make_linear_bf16_gemv(target: str):
     return linear_bf16_gemv
 
 
+# ---------------------------------------------------------------- linear fp4 (GEMV, sm70/Volta)
+
+
+def make_linear_fp4_gemv_sm70(target: str):
+    """Fused e2m1 dequant + GEMV for Volta (sm70), the decode (M=1) path.
+
+    X[1,K] fp16/bf16, WQ uint8 [N,K//2] NATURAL (low nibble first, no twiddle),
+    Scale[N,K//block] f32. Y[0,n] = Res[0,n] + OScale[n] * sum_k X[0,k] *
+    e2m1(WQ nibble) * Scale[n,k//block].
+
+    sm70 has no packed bf16x2/e4m3 math (sm_80+) and no cp.async, so the sm90
+    ``tl_fp4_gemv_tiles`` extern is dead. This is pure TIR on the
+    make_linear_bf16_gemv skeleton: split-K, each thread owns a micro=16-elem
+    K-slice (8 packed bytes, one 128-bit load) inside one scale block, decodes
+    each nibble with the branch-free _e2m1_fp32 bit-synthesis, f32-accumulates
+    the products (exact — the GEMV never touches a tensor core, so X stays the
+    backend's bf16 IO dtype), then tvm_thread_allreduce across the warp. The
+    natural byte holds even elem in the low nibble, odd in the high.
+    Roofline = (N*K*0.5 + 2K) bytes / HBM BW — the ~14GB/token decode floor.
+    """
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def linear_fp4_gemv_sm70(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
+        N, K = T.const("N, K")
+        micro = 16  # 8 packed bytes = one 128-bit load; must divide `block`
+        block_K = reduce_thread * micro
+        X: T.Tensor((1, K), "bfloat16")
+        WQ: T.Tensor((N, K // 2), "uint8")
+        Scale: T.Tensor((N, K // block), "float32")
+        OScale: T.Tensor((N,), "float32")
+        Res: T.Tensor((1, N), "float32")
+        Y = T.empty((1, N), "float32")
+        with T.Kernel(T.ceildiv(N, n_partition), threads=(reduce_thread, n_partition)) as bx:
+            kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
+            ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
+            n = bx * n_partition + ni
+            X_local = T.alloc_local((micro,), "bfloat16")
+            WQ_local = T.alloc_local((micro // 2,), "uint8")
+            acc = T.alloc_local((1,), "float32")
+            reduced = T.alloc_local((1,), "float32")
+            acc[0] = 0.0
+            for ko in T.serial(T.ceildiv(K, block_K)):
+                base = ko * block_K + kr * micro
+                sc = Scale[n, base // block]
+                for v in T.vectorized(micro):
+                    X_local[v] = X[0, base + v]
+                for v in T.vectorized(micro // 2):
+                    WQ_local[v] = WQ[n, base // 2 + v]
+                for kk in T.serial(micro):
+                    byte = WQ_local[kk // 2]
+                    nib = (byte >> ((kk % 2) * 4)) & 15
+                    w = _e2m1_fp32(nib) * sc
+                    acc[0] += T.cast(X_local[kk], "float32") * w
+            with T.attr(
+                T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
+                "reduce_scope",
+                T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(
+                    T.tvm_thread_allreduce(
+                        T.uint32(1), acc[0], True, reduced[0], kr, dtype="handle"
+                    )
+                )
+            if kr == 0:
+                Y[0, n] = Res[0, n] + reduced[0] * OScale[n]
+        return Y
+
+    return linear_fp4_gemv_sm70
+
+
 # ---------------------------------------------------------------- linear fp8 (GEMV)
 
 

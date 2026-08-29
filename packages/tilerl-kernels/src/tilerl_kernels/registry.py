@@ -122,6 +122,21 @@ _SM90_KERNELS = {
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)
+# sm70 (Volta): tilelang lowers T.gemm to mma.sync.m8n8k4 but ONLY for fp16 —
+# no bf16/fp4/fp8 tensor cores, no cp.async/WGMMA/TMA. So the sm90 MMA family
+# is dead here. The cell is the CPU floor (block-parallel f32, compiles on
+# cuda) plus a pure-TIR fp4 decode GEMV for the M=1 decode hot path — the
+# ~14GB/token weight stream that sets the 60 t/s ceiling. fp8, mma8, and the
+# bf16-writer overrides are all sm_80+ and left out.
+_SM70_KERNELS = {
+    **_CPU_KERNELS,  # rmsnorm/silu/softmax/rope/embedding/paged_attention/gemm floor
+    # Registered under the standard name so _CUDA_PLAN's ("linear_fp4","gemv")
+    # row and backend._served_fp4's twiddle gate both resolve without an
+    # arch branch. The maker itself is the Volta (natural-layout, pure-TIR) one.
+    "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv_sm70,  # M=1 decode
+}
+_register("bf16", "sm70", _SM70_KERNELS)
+_register("fp4", "sm70", _SM70_KERNELS)
 # rocm gets the CPU cell, not an empty slot: the schedules are block-parallel
 # and target-neutral, so they compile for HIP from the same source. Untested —
 # no HIP host in this env (docs/support-matrix.md).
