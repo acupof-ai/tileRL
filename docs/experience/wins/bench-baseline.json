@@ -9,15 +9,30 @@
   "date": "2026-08-28",
   "tok_s": 61.1
  },
+ "decode-kv/d131072-b2/sm90": {
+  "commit": "6e260b8",
+  "date": "2026-08-29",
+  "tok_s": 71.85266081308166
+ },
  "decode-kv/d2048-b1/sm90": {
   "commit": "unknown",
   "date": "2026-08-28",
   "tok_s": 87.33086560928957
  },
+ "decode-kv/d2048-b2/sm90": {
+  "commit": "6e260b8",
+  "date": "2026-08-29",
+  "tok_s": 113.05345671406823
+ },
+ "decode-kv/d2048-b4/sm90": {
+  "commit": "6e260b8",
+  "date": "2026-08-29",
+  "tok_s": 164.71705734943475
+ },
  "decode-kv/d2048-b8/sm90": {
-  "commit": "unknown",
-  "date": "2026-08-28",
-  "tok_s": 302.8433802306008
+  "commit": "6e260b8",
+  "date": "2026-08-29",
+  "tok_s": 320.11480842917416
  },
  "decode-kv/d262144-b1/sm90": {
   "commit": "cd54d55",
@@ -29,20 +44,45 @@
   "date": "2026-08-28",
   "tok_s": 80.06812199220505
  },
+ "decode-kv/d32768-b2/sm90": {
+  "commit": "6e260b8",
+  "date": "2026-08-29",
+  "tok_s": 98.98873972155587
+ },
+ "decode-kv/d32768-b4/sm90": {
+  "commit": "6e260b8",
+  "date": "2026-08-29",
+  "tok_s": 138.72857183414737
+ },
  "decode-kv/d512-b1/sm90": {
   "commit": "unknown",
   "date": "2026-08-28",
   "tok_s": 92.38771599788666
  },
+ "decode-kv/d512-b4/sm90": {
+  "commit": "6e260b8",
+  "date": "2026-08-29",
+  "tok_s": 166.11597384518305
+ },
  "decode-kv/d512-b8/sm90": {
-  "commit": "unknown",
-  "date": "2026-08-28",
-  "tok_s": 308.60187794959484
+  "commit": "6e260b8",
+  "date": "2026-08-29",
+  "tok_s": 328.39408934193426
  },
  "decode-kv/d8192-b1/sm90": {
   "commit": "unknown",
   "date": "2026-08-28",
   "tok_s": 88.87364923310717
+ },
+ "decode-kv/d8192-b2/sm90": {
+  "commit": "6e260b8",
+  "date": "2026-08-29",
+  "tok_s": 109.39989053279544
+ },
+ "decode-kv/d8192-b4/sm90": {
+  "commit": "6e260b8",
+  "date": "2026-08-29",
+  "tok_s": 157.48552710735785
  },
  "decode-kv/d8192-b8/sm90": {
   "commit": "unknown",

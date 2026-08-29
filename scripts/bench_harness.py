@@ -95,6 +95,14 @@ class Gate:
         prev = self.baseline.get(key)
         verdict = "SEED"
         if prev is None or self.seed_only:
+            # A first measurement is held to the same noise bar as a raise. The
+            # raise branch already refused noisy wins; seeding did not, so a
+            # 36.5%-spread row became a permanent baseline (decode-kv/d512-b2,
+            # 2026-08-29) that every later run is then measured against.
+            if spread > _RAISE - 1.0:
+                print(f"  NOISY {key}: {tok_s:.1f} {unit} at {100 * spread:.1f}% spread "
+                      f"— not seeded")
+                return "NOISY"
             self.baseline[key] = {"tok_s": tok_s, "commit": self.commit, "date": self.date}
             self.dirty = True
             verdict = "SEED"
