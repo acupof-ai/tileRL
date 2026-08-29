@@ -4,6 +4,20 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-30 — reopened: the draft head's attention sees one token in the loop
+
+- `draft_check.py` measured 84.4% teacher-forced agreement by running the head
+  over the whole sequence; `Engine._draft_chains` runs it with `seq_len = 1`, so
+  its attention is a softmax over a single position and contributes nothing.
+  The two acceptance numbers (84.4% and 55.8%) were never the same experiment.
+- `_draft_kv` is one block per row, never filled with the prompt or with
+  accepted tokens — there is no path by which the draft could see context.
+- **This reopens the speculation verdict**: break-even is `p >= 66%`, the loop
+  measured 55.8%, the probe measured 84.4%. Not a claim that fixing it wins —
+  the fill pass has a cost and only a GPU run settles either number.
+- Found by reading; nothing changed yet. Design outlined in the entry.
+  [errors/2026-08-30-draft-attention-sees-one-token.md](docs/experience/errors/2026-08-30-draft-attention-sees-one-token.md)
+
 ## 2026-08-30 — phase exit: the spec suite's request budget bound mid-measurement
 
 - `suite_spec` gave each request `(ticks + 20) * (1 + depth)` tokens against the
