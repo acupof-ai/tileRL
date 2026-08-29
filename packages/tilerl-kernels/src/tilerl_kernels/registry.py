@@ -141,6 +141,12 @@ _SM70_KERNELS = {
     # removes the eager gdn_forward's int(seq_q_lens) host sync that breaks
     # capture). Without it, all 48 GDN layers run eager and the graph is off.
     "gdn_decode_fused": lambda t: kernels_gdn.make_gdn_decode_fused(t, out_dtype="float32"),
+    # KV-cache write: the second capture-breaker. Without it the full-attn
+    # layers fall to kv_pool.write_tokens' torch loop, whose per-token
+    # int(block_table)/int(seq_len) host syncs break graph capture. make_write_
+    # tokens is pure TIR (no WGMMA/cp.async) and bf16-IO — the KV pool is bf16
+    # on every arch (attention casts to f32 on read), so it registers unchanged.
+    "write_tokens": kernels_mma.make_write_tokens,
 }
 _register("bf16", "sm70", _SM70_KERNELS)
 _register("fp4", "sm70", _SM70_KERNELS)
