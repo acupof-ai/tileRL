@@ -154,8 +154,28 @@ upper bound, since a hand-written kernel will not beat it on GEMM efficiency:
 | W@S, P@S, R^T@d | 3.6 | 18.8-19.1% |
 | **per chunk per layer** | **25.7** | **14.6%** |
 
-**T=512, 8 chunks x 48 layers: 9.9 ms against the serial kernel's 63 — 6.4x.**
-Prefill 229 -> 176 ms, **2237 -> ~2909 tok/s (1.30x)**.
+**T=512, 8 chunks x 48 layers: 9.9 ms against the serial kernel's 63.**
+
+### 6.4x was wrong: I counted the matmuls and treated the glue as free
+
+Timing the non-matmul work at the same shapes, batched the way a fused kernel
+would do it (`scripts/probe_gdn_glue.py`):
+
+| part | us/chunk/layer | x matmuls |
+|---|---:|---:|
+| matmuls (roofline) | 25.7 | 1.00x |
+| gates (cumsum/exp/clamp) | 18.0 | 0.70x |
+| **triangular solve** | **33.4** | **1.30x** |
+| permutes + masks | 9.0 | 0.35x |
+| **glue total** | **60.5** | **2.35x** |
+
+The glue is 2.35x the matmuls even perfectly batched, and the triangular solve
+alone exceeds them. A fused kernel makes the gates and permutes nearly free —
+they are elementwise and ride the matmul pipeline — but the solve is real work.
+
+Realistic: 9.9 ms of matmul + ~13 ms of solve = **~23 ms against 63, so 2.7x**,
+and prefill 229 -> 189 ms, **2237 -> ~2709 tok/s (1.21x)**. Still the largest
+single item in the tree; not the 6.4x I wrote an hour earlier.
 
 ### And why the three previous rejections do not contradict this
 
@@ -164,11 +184,12 @@ costing ~290 ms. Its matmuls need 9.9. **The other ~280 ms is glue** — cumsum,
 exp, the masks, the triangular solve, the permutes, and 8 launches per chunk
 per layer.
 
-So all three rejections measured the glue, not the math. It also says exactly
-where the risk of the kernel project sits: the 6.4x is available ONLY with full
-fusion, and every bit of it has to come from putting the non-matmul work
-inside the kernel. The matmuls were never the problem and were never going to
-be the fix.
+So all three rejections measured the glue, not the math — but the breakdown
+above shows the glue is not merely launch overhead either. Perfectly batched it
+is still 2.35x the matmuls, and **the triangular solve is the crux**: it is the
+largest single piece and the only one with no in-kernel primitive (64 steps of
+forward substitution, or a blocked inversion in log steps). Whoever takes this
+should settle the solve first; the rest is mechanical.
 
 Still short of 4022 on its own — the GEMMs' 1.36x is the other half — but this
 is the single largest item in the tree, and the cause is structural: a serial
