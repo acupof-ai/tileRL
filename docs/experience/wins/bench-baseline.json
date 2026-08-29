@@ -120,24 +120,24 @@
     "tok_s": 2144.842547390656
   },
   "train/27B-full-b1t128/sm90": {
-    "commit": "ee6437e",
+    "commit": "7432e30",
     "date": "2026-08-29",
-    "tok_s": 58.92872444817074
+    "tok_s": 56.67
   },
   "train/27B-full-b1t256/sm90": {
-    "commit": "ee6437e",
+    "commit": "7432e30",
     "date": "2026-08-29",
-    "tok_s": 85.62700642979311
+    "tok_s": 82.56
   },
   "train/27B-full-b1t64/sm90": {
-    "commit": "ee6437e",
+    "commit": "7432e30",
     "date": "2026-08-29",
-    "tok_s": 34.469114365706126
+    "tok_s": 35.09
   },
   "train/27B-full-b2t256/sm90": {
-    "commit": "ee6437e",
+    "commit": "7432e30",
     "date": "2026-08-29",
-    "tok_s": 139.34183378835283
+    "tok_s": 136.21
   },
   "train/27B-lora-b1t128/sm90": {
     "commit": "3fb9c55",
