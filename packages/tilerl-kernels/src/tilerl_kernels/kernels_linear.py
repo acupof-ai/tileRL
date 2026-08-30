@@ -148,18 +148,6 @@ def make_gemm_tn_mma(target: str):
 # ---------------------------------------------------------------- linear fp4 (MMA)
 
 
-def _e2m1_fp32(nib):
-    """OCP e2m1 nibble -> fp32 by IEEE bit-pattern synthesis: the grid is
-    powers of two, so ``-min(e,1)`` drops the subnormals' mantissa ({0, 0.5})
-    and ``-min(e|m,1)`` zeroes nibble 0. No exp2, no LUT load — the lop3-style
-    fast decode, 2x the LUT/exp2 path (see
-    docs/experience/wins/2026-08-24-fp4-gemv-bitcast-bf16.md)."""
-    ni32 = T.cast(nib, "int32")
-    e, m = (ni32 >> 1) & 3, ni32 & 1
-    bits = (((ni32 & 8) << 28) | ((126 + e) << 23) | ((m << 22) & -T.min(e, 1))) & -T.min(e | m, 1)
-    return T.reinterpret(bits, "float32")
-
-
 def _dequant_fp4_macro(out_dtype, local_size, block):
     """Vectorized e2m1 dequant: a packed WQ tile -> a dequantized W tile in
     shared memory, 128-bit transactions (local_size elems out / local_size//2
@@ -245,7 +233,8 @@ def make_linear_fp4_mma(target: str):
     # Adapted: bf16 IO (bf16 WGMMA, f32 accumulate); tileRL's float per-block
     #   scale (block_max/6) staged to shared and applied per chunk
     #   instead of the example's integer-exponent scale; OCP e2m1 grid
-    #   (matches pack_fp4; padded WQ bytes decode to 0.0, see _e2m1_fp32).
+    #   (matches pack_fp4; a zero nibble is e2m1 0.0, so padded WQ bytes
+    #   decode to 0.0).
     """
 
     @tilelang.jit(
@@ -716,6 +705,90 @@ __device__ __forceinline__ void tl_fp4_gemv_tiles(const void *wqv, const void *x
 }
 """
 
+# sm70 (Volta) twin of the fp4 twiddle source. Kept separate: _FP4_TWIDDLE_SRC
+# carries sm80+/sm89+ instructions (mul.bf16x2, cvt.rn.f16x2.e4m3x2) that do
+# not assemble for sm70, and this cell's only fp4 kernel is the GEMV below.
+# Everything here is sm_53+ (prmt, mul.f16x2, fma.rn.f16x2, cvt.rn.f16x2.f32).
+_FP4_TWIDDLE_SRC_F16 = r"""
+#include <cuda_fp16.h>  // __half2 / __low2float for the f16x2 -> f32 horizontal sum
+// sm70 twin of tl_fp4_decode8 for the fp16-twiddled layout (reference.twiddle_fp4_f16):
+// e2m1 x8 -> 4 x f16x2. Same prmt + slot structure, but the nibble bits rest at
+// fp16 field positions (15/11/10/9) and the rebias is mul.f16x2 by 2^14 (0x7400).
+// Validated bit-exact against the e2m1 LUT (tests/test_fp4_twiddle.py).
+__device__ __forceinline__ void tl_fp4_decode8_f16(unsigned w, unsigned *out) {
+  unsigned t, a, b, c, d;
+  asm volatile("prmt.b32 %0, %1, 0, 0x0123;" : "=r"(t) : "r"(w));
+  asm("and.b32 %0, %1, 0x8E008E00;" : "=r"(a) : "r"(t));
+  asm("shl.b32 %0, %1, 7;" : "=r"(b) : "r"(t));
+  asm("and.b32 %0, %0, 0x8E008E00;" : "+r"(b));
+  unsigned cs, cf;
+  asm("shl.b32 %0, %1, 14;" : "=r"(cs) : "r"(t));
+  asm("and.b32 %0, %0, 0x80008000;" : "+r"(cs));
+  asm("shr.b32 %0, %1, 3;" : "=r"(cf) : "r"(t));
+  asm("and.b32 %0, %0, 0x0E000E00;" : "+r"(cf));
+  asm("or.b32 %0, %1, %2;" : "=r"(c) : "r"(cs), "r"(cf));
+  unsigned ds, df;
+  asm("shl.b32 %0, %1, 15;" : "=r"(ds) : "r"(t));
+  asm("and.b32 %0, %0, 0x80008000;" : "+r"(ds));
+  asm("shl.b32 %0, %1, 4;" : "=r"(df) : "r"(t));
+  asm("and.b32 %0, %0, 0x0E000E00;" : "+r"(df));
+  asm("or.b32 %0, %1, %2;" : "=r"(d) : "r"(ds), "r"(df));
+  const unsigned bias = 0x74007400u;  // 2^14 per fp16 lane: rebias e2m1 exp (bias 1 -> 15)
+  asm("mul.f16x2 %0, %0, %1;" : "+r"(a) : "r"(bias));
+  asm("mul.f16x2 %0, %0, %1;" : "+r"(b) : "r"(bias));
+  asm("mul.f16x2 %0, %0, %1;" : "+r"(c) : "r"(bias));
+  asm("mul.f16x2 %0, %0, %1;" : "+r"(d) : "r"(bias));
+  out[0] = a; out[1] = b; out[2] = c; out[3] = d;
+}
+// GROUP 16-elem fp4 tiles for the sm70 GEMV. WQ is fp16-twiddled, X is f32
+// (sm70 has no bf16 IO); loads go straight from global (tilelang locals handed
+// to an extern by pointer land in local memory). Per tile: decode 2 words ->
+// 8 f16x2, cvt X f32->f16x2, 8 fma.rn.f16x2 into one fp16x2 accumulator (fp16
+// accumulation stays inside the 16-elem scale block, like the sm90 bf16x2 GEMV),
+// one f32 scale-accumulate. Tiles are block_K elements apart.
+template <int G>
+__device__ __forceinline__ void tl_fp4_gemv_tiles_f16(const void *wqv, const void *xv,
+                                                      int block_K, const float *sc, float *acc) {
+  const unsigned char *wq = (const unsigned char *)wqv;
+  const float *x = (const float *)xv;
+  unsigned w[G][2];
+  float4 xb[G][4];
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    asm volatile("ld.global.nc.v2.u32 {%0,%1}, [%2];"
+                 : "=r"(w[g][0]), "=r"(w[g][1]) : "l"(wq + g * block_K / 2));
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3}, [%4];"
+                   : "=f"(xb[g][i].x), "=f"(xb[g][i].y), "=f"(xb[g][i].z), "=f"(xb[g][i].w)
+                   : "l"(x + g * block_K + 4 * i));
+  }
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    unsigned d0[4], d1[4];
+    tl_fp4_decode8_f16(w[g][0], d0);
+    tl_fp4_decode8_f16(w[g][1], d1);
+    unsigned xw[8];
+    const float *xf = (const float *)xb[g];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      // cvt.rn.f16x2.f32 is sm80+; sm70 converts scalar (cvt.rn.f16.f32, sm_53+)
+      unsigned lo = __half_as_ushort(__float2half_rn(xf[2 * i]));
+      unsigned hi = __half_as_ushort(__float2half_rn(xf[2 * i + 1]));
+      xw[i] = lo | (hi << 16);
+    }
+    unsigned a = 0u;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(xw[i]), "r"(d0[i]));
+      asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(xw[4 + i]), "r"(d1[i]));
+    }
+    __half2 ah = __halves2half2(__ushort_as_half(a & 0xffff), __ushort_as_half(a >> 16));
+    *acc = fmaf(sc[g], __low2float(ah) + __high2float(ah), *acc);
+  }
+}
+"""
+
 
 def make_linear_fp4_gemv(target: str, M: int = 1, GROUP: int = 4):
     """Fused e2m1 dequant + GEMV (sm90), the decode path of linear_fp4.
@@ -935,22 +1008,30 @@ def make_linear_bf16_gemv(target: str):
 # ---------------------------------------------------------------- linear fp4 (GEMV, sm70/Volta)
 
 
-def make_linear_fp4_gemv_sm70(target: str):
+def make_linear_fp4_gemv_sm70(target: str, GROUP: int = 4):
     """Fused e2m1 dequant + GEMV for Volta (sm70), the decode (M=1) path.
 
-    X[1,K] f32, WQ uint8 [N,K//2] natural layout, Scale[N,K//block] f32.
-    Y[0,n] = Res[0,n] + OScale[n] * sum_k X[0,k] * e2m1(WQ nibble) * Scale[n,k//block].
+    X[1,K] f32, WQ uint8 [N,K//2] fp16-TWIDDLED (reference.twiddle_fp4_f16),
+    Scale[N,K//block] f32. Y[0,n] = Res[0,n] + OScale[n] * sum_k X[0,k] *
+    e2m1(WQ nibble) * Scale[n,k//block].
 
-    Pure-TIR split-K: sm70 has no packed bf16x2 math (sm_80+), so the sm90
-    tl_fp4_gemv_tiles extern is unusable; each thread decodes its K-slice with
-    the branch-free _e2m1_fp32 bit-synthesis and f32-accumulates.
+    sm70 has no bf16x2 math (sm_80+), so the sm90 tl_fp4_decode8 is dead here;
+    the fp16 twin tl_fp4_decode8_f16 (prmt + shift/mask + mul.f16x2 2^14, all
+    sm_53+) decodes 8 elems in ~15 ops vs the branch-free bit-synth's ~10/elem
+    it replaces. Each thread's 16-elem slice stays in one scale block (block_K =
+    reduce_thread*16), so one Scale lookup per tile; fp16 accumulation stays
+    inside the block (peer to the sm90 bf16x2 GEMV), then one f32 add per tile.
+    Loads run in C straight from global — TIR locals handed to an extern by
+    pointer land in local memory.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def linear_fp4_gemv_sm70(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
         N, K = T.const("N, K")
-        micro = 16  # 8 packed bytes = one 128-bit load; must divide `block`
+        micro = 16  # one scale block (NVFP4 block=16); 8 twiddled bytes = 1 decode pair
         block_K = reduce_thread * micro
+        num_ko = T.ceildiv(K, block_K)
+        num_g = num_ko // GROUP
         X: T.Tensor((1, K), "float32")
         WQ: T.Tensor((N, K // 2), "uint8")
         Scale: T.Tensor((N, K // block), "float32")
@@ -958,26 +1039,39 @@ def make_linear_fp4_gemv_sm70(target: str):
         Res: T.Tensor((1, N), "float32")
         Y = T.empty((1, N), "float32")
         with T.Kernel(T.ceildiv(N, n_partition), threads=(reduce_thread, n_partition)) as bx:
+            T.import_source(_FP4_TWIDDLE_SRC_F16)
             kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
             ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
             n = bx * n_partition + ni
-            X_local = T.alloc_local((micro,), "float32")
-            WQ_local = T.alloc_local((micro // 2,), "uint8")
             acc = T.alloc_local((1,), "float32")
-            reduced = T.alloc_local((1,), "float32")
             acc[0] = 0.0
-            for ko in T.serial(T.ceildiv(K, block_K)):
-                base = ko * block_K + kr * micro
-                sc = Scale[n, base // block]
-                for v in T.vectorized(micro):
-                    X_local[v] = X[0, base + v]
-                for v in T.vectorized(micro // 2):
-                    WQ_local[v] = WQ[n, base // 2 + v]
-                for kk in T.serial(micro):
-                    byte = WQ_local[kk // 2]
-                    nib = (byte >> ((kk % 2) * 4)) & 15
-                    w = _e2m1_fp32(nib) * sc
-                    acc[0] += T.cast(X_local[kk], "float32") * w
+            sc = T.alloc_local((GROUP,), "float32")
+            for kg in T.serial(num_g):
+                base = kg * GROUP * block_K + kr * micro
+                for g in T.unroll(GROUP):
+                    sc[g] = Scale[n, (base + g * block_K) // block]
+                T.call_extern(
+                    f"tl_fp4_gemv_tiles_f16<{GROUP}>",
+                    T.access_ptr(WQ[n, base // 2], "r"),
+                    T.access_ptr(X[0, base], "r"),
+                    block_K,
+                    T.access_ptr(sc, "r"),
+                    T.access_ptr(acc, "rw"),
+                    dtype="void",
+                )
+            for kt in T.serial(num_ko - num_g * GROUP):  # K-tail, one tile at a time
+                base = (num_g * GROUP + kt) * block_K + kr * micro
+                sc[0] = Scale[n, base // block]
+                T.call_extern(
+                    "tl_fp4_gemv_tiles_f16<1>",
+                    T.access_ptr(WQ[n, base // 2], "r"),
+                    T.access_ptr(X[0, base], "r"),
+                    block_K,
+                    T.access_ptr(sc, "r"),
+                    T.access_ptr(acc, "rw"),
+                    dtype="void",
+                )
+            reduced = T.alloc_local((1,), "float32")
             with T.attr(
                 T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
                 "reduce_scope",

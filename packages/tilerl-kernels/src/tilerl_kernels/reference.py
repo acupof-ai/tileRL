@@ -214,7 +214,10 @@ def dequant_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
     Magnitudes are ``_E2M1_LUT`` ({0,.5,1,1.5,2,3,4,6}); bit 3 is the sign.
     """
-    if getattr(wq, "_tl_twiddled", False):  # sm90 served bytes (Backend._served_fp4)
+    lay = getattr(wq, "_tl_layout", "natural")
+    if lay == "tw-f16":
+        wq = untwiddle_fp4_f16(wq)
+    elif lay == "tw-bf16" or getattr(wq, "_tl_twiddled", False):
         wq = untwiddle_fp4(wq)
     assert wq.dtype == torch.uint8
     n, k2 = wq.shape
@@ -244,7 +247,11 @@ _E2M1_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.f
 # per 32-bit word, element slot p of half-word h has its (s, e1, e0, m) bits at
 # _TW_POS[p]; slot j (j<4) holds elem 2j+1 and slot j+4 elem 2j so the decoded
 # bf16x2 pairs line up with natural bf16x2 X words.
+# sm70 has no bf16x2 math, so its GEMV decodes an fp16 twin: the same slot/elem
+# map but bits placed at _TW_POS_F16 (fp16 field positions 15/11/10/9), expanded
+# by prmt + shift/mask + mul.f16x2 2^14 (kernels_linear.tl_fp4_decode8_f16).
 _TW_POS = ((15, 8, 7, 6), (12, 5, 4, 3), (9, 2, 1, 0), (14, 11, 10, 13))
+_TW_POS_F16 = ((15, 11, 10, 9), (8, 4, 3, 2), (1, 14, 13, 12), (0, 7, 6, 5))
 _TW_SLOT_ELEM = (1, 3, 5, 7, 0, 2, 4, 6)
 
 
@@ -253,32 +260,30 @@ def _fp4_codes(wq: torch.Tensor) -> torch.Tensor:
     return torch.stack([wq & 15, wq >> 4], dim=-1).reshape(wq.shape[0], -1).to(torch.int32)
 
 
-def twiddle_fp4(wq: torch.Tensor) -> torch.Tensor:
-    """Natural packed fp4 -> twiddled bytes (same shape, uint8)."""
+def _twiddle_fp4(wq: torch.Tensor, pos: tuple) -> torch.Tensor:
     N = wq.shape[0]
     c = _fp4_codes(wq).reshape(N, -1, 8)[:, :, list(_TW_SLOT_ELEM)]
     out = []
     for h in (0, 1):
         half = torch.zeros(c.shape[:2], dtype=torch.int32, device=wq.device)
-        for p, bits in enumerate(_TW_POS):
+        for p, bits in enumerate(pos):
             n = c[:, :, 4 * h + p]
-            for b, pos in enumerate(bits):  # bit 3-b of the nibble -> word bit pos
-                half |= ((n >> (3 - b)) & 1) << pos
+            for b, ppos in enumerate(bits):  # bit 3-b of the nibble -> word bit ppos
+                half |= ((n >> (3 - b)) & 1) << ppos
         out += [(half >> 8) & 255, half & 255]
     return torch.stack(out, dim=-1).reshape(N, -1).to(torch.uint8).contiguous()
 
 
-def untwiddle_fp4(wq: torch.Tensor) -> torch.Tensor:
-    """Inverse of :func:`twiddle_fp4`."""
+def _untwiddle_fp4(wq: torch.Tensor, pos: tuple) -> torch.Tensor:
     N = wq.shape[0]
     b = wq.reshape(N, -1, 4).to(torch.int32)
     slots = []
     for h in (0, 1):
         half = (b[:, :, 2 * h] << 8) | b[:, :, 2 * h + 1]
-        for bits in _TW_POS:
+        for bits in pos:
             nib = torch.zeros_like(half)
-            for k, pos in enumerate(bits):
-                nib |= ((half >> pos) & 1) << (3 - k)
+            for k, ppos in enumerate(bits):
+                nib |= ((half >> ppos) & 1) << (3 - k)
             slots.append(nib)
     slots = torch.stack(slots, dim=-1)  # [N, K/8, slot]
     codes = torch.empty_like(slots)
@@ -286,6 +291,26 @@ def untwiddle_fp4(wq: torch.Tensor) -> torch.Tensor:
         codes[:, :, elem] = slots[:, :, slot]
     codes = codes.reshape(N, -1)
     return (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8).contiguous()
+
+
+def twiddle_fp4(wq: torch.Tensor) -> torch.Tensor:
+    """Natural packed fp4 -> bf16-twiddled bytes (sm90 layout)."""
+    return _twiddle_fp4(wq, _TW_POS)
+
+
+def twiddle_fp4_f16(wq: torch.Tensor) -> torch.Tensor:
+    """Natural packed fp4 -> fp16-twiddled bytes (sm70 layout)."""
+    return _twiddle_fp4(wq, _TW_POS_F16)
+
+
+def untwiddle_fp4(wq: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`twiddle_fp4`."""
+    return _untwiddle_fp4(wq, _TW_POS)
+
+
+def untwiddle_fp4_f16(wq: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`twiddle_fp4_f16`."""
+    return _untwiddle_fp4(wq, _TW_POS_F16)
 
 
 def pack_fp4(w: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torch.Tensor]:

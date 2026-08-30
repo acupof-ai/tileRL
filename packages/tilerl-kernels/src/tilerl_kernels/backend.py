@@ -208,6 +208,10 @@ class Backend:
         self.arch = _arch_for(target)
         # Kernel I/O dtype: only sm90 has bf16 tensor cores; sm70's MMA is
         # fp16-only and its cell is the CPU f32 source, so it takes f32 IO.
+        # Invariant: f32-kernel call sites (e.g. gemm_nt) assume io is NOT
+        # bf16/fp16 and skip the _f32 wrap — flipping sm70 to bf16/fp16 here
+        # silently feeds those kernels the wrong dtype. sm70's fp16 GEMV does
+        # its f32->fp16 cvt inside the kernel, not via io.
         self.io = torch.bfloat16 if self.arch == "sm90" else torch.float32
         self._kernels: dict[str, object] = {}
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
@@ -439,19 +443,22 @@ class Backend:
     # ------------------------------------------------------------ linear fp4
 
     def _served_fp4(self, wq):
-        """The fp4 bytes this cell's kernels read. sm90 kernels decode the
-        twiddled layout; the served tensor is rewritten in place ONCE (flagged)
-        so graph capture, save_hf (which untwiddles by the flag) and CPU-resident
-        callers all see one truth. Other cells read the natural layout — sm70's
-        GEMV decodes natural nibbles in TIR, so it must NOT be twiddled."""
+        """The fp4 bytes this cell's kernels read, rewritten in place ONCE and
+        tagged in ``_tl_layout`` so graph capture, save_hf (untwiddles by the
+        tag) and CPU-resident callers all see one truth. sm90 decodes the
+        bf16-twiddled layout, sm70 the fp16-twiddled twin (its GEMV has no
+        bf16x2 math); other cells read the natural layout."""
         wq = self._dev(wq, wq.dtype)
-        if (
-            self.arch != "sm70"
-            and "linear_fp4_gemv" in _resolve(self.precision, self.arch)
-            and not getattr(wq, "_tl_twiddled", False)
-        ):
+        if getattr(wq, "_tl_layout", "natural") != "natural":
+            return wq
+        if "linear_fp4_gemv" not in _resolve(self.precision, self.arch):
+            return wq
+        if self.arch == "sm90":
             wq.copy_(reference.twiddle_fp4(wq))
-            wq._tl_twiddled = True
+            wq._tl_layout = "tw-bf16"
+        elif self.arch == "sm70":
+            wq.copy_(reference.twiddle_fp4_f16(wq))
+            wq._tl_layout = "tw-f16"
         return wq
 
     def linear_fp4(self, x, wq, scale, master=None, oscale=None, residual=None):
@@ -525,6 +532,26 @@ class Backend:
                 self._kernel(kernel)(xq, wq, scale, ascale, y2, bM, bN, blk, _THREADS)
                 y2 = y2[:M, :N]
         else:
+            # sm70 M>1: no twiddle-aware M>1 kernel, and the generic kernel
+            # decodes natural nibbles — but sm70's served bytes are fp16-twiddled.
+            # Loop the M=1 GEMV (twiddle-aware) over rows: correct, M launches
+            # (prefill only). ponytail: an sm70 M>1 twiddle kernel is the upgrade
+            # if prefill gets hot; an untwiddle copy OOMs here (the forward's GPU
+            # is full, the scratch that motivated eager materialize twiddle).
+            if self.arch == "sm70" and getattr(wq, "_tl_layout", "natural") != "natural":
+                k1, _, Np, Kp, _, bN = self._plan("linear_fp4", 1, N, K)
+                wq1, sc1 = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
+                osc1 = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
+                rows = [
+                    self._kernel(k1)(
+                        _pad2d(x2[m : m + 1], 1, Kp), wq1, sc1, osc1,
+                        self._residual(None, N, Np), 32, bN, blk,
+                    )[:1, :N]
+                    for m in range(M)
+                ]
+                y2 = torch.cat(rows, 0)
+                y = self._epilogue(y2, None, lead, N)
+                return y if residual is None else y + residual
             bM, bN = min(64, M), min(64, N)
             if self.target.startswith("cuda"):
                 # WGMMA tiles %16, reduction K %64 (the fp4 dequant K-tile);
@@ -617,7 +644,19 @@ class Backend:
                     out[base] = (w * osc).to(torch.bfloat16)
                 for suffix in (".w8", ".wscale", ".oscale"):
                     out.pop(base + suffix, None)
-        return {k: v.to(self.device) for k, v in out.items()}
+        moved = {k: v.to(self.device) for k, v in out.items()}
+        # fp4 twiddle here, not lazily in _served_fp4: the twiddle allocates a
+        # same-size scratch, and by the first forward the KV cache + activations
+        # have left no room for it on a 32GB card. At materialize only the
+        # weights are resident, so the scratch fits. Tagged so a train step's
+        # re-materialize (and _served_fp4) skip it.
+        _twiddle = {"sm90": reference.twiddle_fp4, "sm70": reference.twiddle_fp4_f16}.get(self.arch)
+        if _twiddle is not None and "linear_fp4_gemv" in _resolve(self.precision, self.arch):
+            for k in moved:
+                if k.endswith(".wq") and getattr(moved[k], "_tl_layout", "natural") == "natural":
+                    moved[k].copy_(_twiddle(moved[k]))
+                    moved[k]._tl_layout = "tw-bf16" if self.arch == "sm90" else "tw-f16"
+        return moved
 
     # ------------------------------------------------------------ attention
 
