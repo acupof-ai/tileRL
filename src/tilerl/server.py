@@ -121,10 +121,8 @@ class ChatCompletionRequest(BaseModel):
 
 class AgentRequest(BaseModel):
     message: str
-    root: str | None = None  # agent tool root (defaults to server CWD)
     max_steps: int | None = Field(default=None, ge=1, le=32)
     max_tokens: int | None = Field(default=None, ge=1)
-    timeout_s: float | None = Field(default=None, gt=0)
 
 
 #: reasoning_effort -> tokens the model may spend inside <think> before the
@@ -323,10 +321,25 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=finish))
         yield "data: [DONE]\n\n"
 
+    # The agent loop runs shell on the server, so it is OFF unless the operator
+    # opts in with TILERL_AGENT_TOOLS=1 and pins the tool root there. The root
+    # is never client-controlled (that would be unauthenticated RCE).
+    _agent_root = os.environ.get("TILERL_AGENT_TOOLS")
+
     @app.post("/v1/agent")
     async def agent_run(req: "AgentRequest"):
-        """Run the tool-calling agent loop and stream its events as SSE."""
+        """Run the tool-calling agent loop and stream its events as SSE.
+
+        Disabled unless TILERL_AGENT_TOOLS names the tool root; the tools run
+        real shell/file ops, so enabling this exposes the server host."""
         from .agent import Tools, run_agent
+
+        if not _agent_root:
+            return JSONResponse(
+                status_code=403,
+                content={"error": {"message": "agent tools disabled; set TILERL_AGENT_TOOLS "
+                                              "to the tool root to enable", "type": "forbidden"}},
+            )
 
         def generate(messages: list[dict]) -> str:
             prompt = _render_chat([ChatMessage(**m) for m in messages])
@@ -340,7 +353,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             rid = engine.submit(input_ids, params)
             return tokenizer.decode(_await_completion(rid))
 
-        tools = Tools(req.root or os.getcwd(), timeout_s=req.timeout_s or 20.0)
+        tools = Tools(_agent_root)
 
         def _events():
             try:

@@ -478,7 +478,7 @@ class Engine:
             if not matched:
                 snap = None
             elif reload_key is not None:
-                snap = self._tier.load_state(reload_key)
+                snap = self._tier.load_state(reload_key, tuple(tokens[:matched]))
             else:
                 snap = self._prefix_state[self._snapshot_key(tokens[:matched])]
             if matched:
@@ -503,12 +503,20 @@ class Engine:
                 while len(blocks) < total_blocks:
                     blocks.append(self._kv.alloc_block())
                 # Cold hit: fill the matched blocks from the tier (the prefill it
-                # skips). A False under the engine lock means the file is gone — a
-                # hard error; the except frees the blocks and re-raises.
-                if reload_key is not None and not self._tier.load_kv(
-                    reload_key, blocks[: matched // BLOCK_TOKENS], self._kv
-                ):
+                # skips), and restore the GDN snapshot — both inside the try so a
+                # failure frees the slot + blocks instead of leaking them. Under
+                # the engine lock and after _match_prefix's has() check, a False
+                # here means the file vanished — a hard error, not a silent miss.
+                if reload_key is not None and (snap is None or not self._tier.load_kv(
+                    reload_key, tuple(tokens[:matched]),
+                    blocks[: matched // BLOCK_TOKENS], self._kv
+                )):
                     raise RuntimeError(f"tier lost cold prefix {reload_key:016x}")
+                if matched:
+                    snap_states, snap_windows = snap
+                    self._states.states[slot].copy_(snap_states)
+                    if snap_windows is not None:
+                        self._states.window_restore(slot, snap_windows)
             except Exception:
                 for b in blocks:
                     self._kv.free_block(b)
@@ -519,11 +527,6 @@ class Engine:
             own_blocks = total_blocks if reload_key is not None else total_blocks - matched // BLOCK_TOKENS
             self._blocks_used += own_blocks
             self._slots_used += 1
-            if matched:
-                snap_states, snap_windows = snap
-                self._states.states[slot].copy_(snap_states)
-                if snap_windows is not None:
-                    self._states.window_restore(slot, snap_windows)
 
             req = _Req(
                 req_id=rid,
@@ -696,7 +699,9 @@ class Engine:
         if matched == 0 or matched >= len(tokens):
             return 0, [], None
         if hit.reload_key is not None:
-            if self._tier is None or not self._tier.has(hit.reload_key):
+            # has() verifies the tier still holds this exact prefix (both KV and
+            # state, tokens matching) — so submit's loads below cannot fail-miss.
+            if self._tier is None or not self._tier.has(hit.reload_key, tuple(tokens[:matched])):
                 return 0, [], None
             return matched, [], hit.reload_key
         if self._snapshot_key(tokens[:matched]) not in self._prefix_state:
@@ -713,7 +718,7 @@ class Engine:
         SSD tier (keyed by the store hash), so a cold hit can reload it."""
         snap = self._prefix_state.pop(self._snapshot_key(list(tokens)), None)
         if snap is not None:
-            self._tier.spill_state(key, snap[0], snap[1])
+            self._tier.spill_state(key, tokens, snap[0], snap[1])
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0) -> BatchKv:
         # Fixed width = pool size: the kernels bake the table width into the

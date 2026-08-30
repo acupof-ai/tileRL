@@ -391,16 +391,23 @@ class KvTier:
         import shutil
         import threading
 
-        self._dir = os.fspath(path)
-        # per-tier floor: a composite DRAM-over-SSD tier sets a different one per level
-        self.min_tokens = min_tokens
+        self.min_tokens = min_tokens  # per-tier floor (composite tier sets one per level)
         # bound in-flight writes: bursty eviction can enqueue faster than the
         # disk drains, and an unbounded queue OOMs a 31GB host. Over the cap,
         # spill_kv refuses — the graceful drop the store already handles.
         self._max_pending = max_pending
         self._healthy = True  # daemon failure (disk full/perm) flips this to refuse
-        shutil.rmtree(self._dir, ignore_errors=True)  # dead process's files are orphans
+        # Never rmtree the caller's path — it may be a shared dir. Own a fixed
+        # subdir marked by a sentinel file; only wipe a dir that carries the
+        # marker (a dead process's spill files are orphans, safe to clear).
+        self._dir = os.path.join(os.fspath(path), "tilerl_kvtier")
+        marker = os.path.join(self._dir, ".kvtier")
+        if os.path.isdir(self._dir) and os.path.exists(marker):
+            shutil.rmtree(self._dir, ignore_errors=True)
+        elif os.path.exists(self._dir):
+            raise RuntimeError(f"{self._dir} exists but is not a KvTier dir (no .kvtier marker)")
         os.makedirs(self._dir, exist_ok=True)
+        open(marker, "w").close()
         # Deferred write: spill_kv runs inside a decode tick, so it does only the
         # GPU->CPU copy + enqueue; a daemon flushes the ~100ms torch.save off-tick.
         # _pending/_pending_st serve blobs not yet on disk, so has()/load see them.
@@ -441,7 +448,8 @@ class KvTier:
     def _st(self, key: int) -> str:
         return os.path.join(self._dir, f"{key & _MASK64:016x}.st")
 
-    def spill_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> bool:
+    def spill_kv(self, key: int, tokens: tuple[int, ...], blocks: Sequence[int],
+                 pool: "PagedKvPool") -> bool:
         # True = accepted. The tier owns both the length floor and the capacity
         # refusal (the store never pre-gates), so a composite tier can vary them
         # per level. Refuse below min_tokens or when the writer is behind/dead.
@@ -452,44 +460,68 @@ class KvTier:
                 return False
         k = torch.stack([pool.k_pool[:, b] for b in blocks]).contiguous().cpu()
         v = torch.stack([pool.v_pool[:, b] for b in blocks]).contiguous().cpu()
-        blob = {"k": k, "v": v}
+        # Store tokens too: files are keyed by a 64-bit hash, so a collision would
+        # otherwise load a different prefix's KV. load_kv verifies before copying.
+        blob = {"k": k, "v": v, "tokens": tuple(tokens)}
         with self._lock:
             self._pending[key] = blob
         self._q.put((key, blob, self._kv(key)))
         return True
 
-    def load_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> bool:
-        # False = data gone (a raced eviction dropped it) — caller treats it as a
-        # miss. Serves a still-pending blob from memory, closing the has()/load TOCTOU.
+    def load_kv(self, key: int, tokens: tuple[int, ...], blocks: Sequence[int],
+                pool: "PagedKvPool") -> bool:
+        # False = data gone (a raced eviction dropped it) OR a hash collision
+        # stored a different prefix — caller treats either as a miss. Serves a
+        # still-pending blob from memory, closing the has()/load TOCTOU.
         with self._lock:
             blob = self._pending.get(key)
         if blob is None:
             if not os.path.exists(self._kv(key)):
                 return False
             blob = torch.load(self._kv(key), map_location="cpu")
+        if blob.get("tokens") != tuple(tokens):
+            return False  # hash collision: these bytes belong to a different prefix
         for i, b in enumerate(blocks):
             pool.k_pool[:, b].copy_(blob["k"][i].to(pool.device))
             pool.v_pool[:, b].copy_(blob["v"][i].to(pool.device))
         return True
 
-    def spill_state(self, key: int, states, windows) -> None:
-        blob = {"states": states.cpu(), "windows": None if windows is None else windows.cpu()}
+    def spill_state(self, key: int, tokens: tuple[int, ...], states, windows) -> None:
+        blob = {"states": states.cpu(), "windows": None if windows is None else windows.cpu(),
+                "tokens": tuple(tokens)}
         with self._lock:
             self._pending_st[key] = blob
         self._q.put((("st", key), blob, self._st(key)))
 
-    def load_state(self, key: int):
+    def load_state(self, key: int, tokens: tuple[int, ...]):
+        # None = gone or a hash-collision mismatch — caller degrades to a miss.
         with self._lock:
             blob = self._pending_st.get(key)
         if blob is None:
+            if not os.path.exists(self._st(key)):
+                return None
             blob = torch.load(self._st(key), map_location="cpu")
+        if blob.get("tokens") != tuple(tokens):
+            return None
         return blob["states"], blob["windows"]
 
-    def has(self, key: int) -> bool:
+    def has(self, key: int, tokens: tuple[int, ...]) -> bool:
+        # A cold hit is valid only if BOTH the KV and the state are present AND
+        # their stored tokens match (a 64-bit hash collision stores a different
+        # prefix). Checking here means submit's loads cannot then fail-mismatch.
         with self._lock:
-            if key in self._pending:
-                return True
-        return os.path.exists(self._kv(key))
+            kv = self._pending.get(key)
+            st = self._pending_st.get(key)
+        if kv is None:
+            if not os.path.exists(self._kv(key)):
+                return False
+            kv = torch.load(self._kv(key), map_location="cpu")
+        if st is None:
+            if not os.path.exists(self._st(key)):
+                return False
+            st = torch.load(self._st(key), map_location="cpu")
+        t = tuple(tokens)
+        return kv.get("tokens") == t and st.get("tokens") == t
 
     def drop(self, key: int) -> None:
         with self._lock:
@@ -518,7 +550,8 @@ class NoPrefixStore:
     miss-path double for tests.
     """
 
-    on_evict: "Callable[[tuple[int, ...]], None] | None" = None
+    on_evict: "Callable[[tuple[int, ...], int], None] | None" = None
+    on_demote: "Callable[[tuple[int, ...], int], None] | None" = None
 
     def lookup(self, tokens: Sequence[int]) -> "PrefixHit | None":
         return None
@@ -537,9 +570,10 @@ class PrefixStore:
     Collision-safe: hash hits are verified against the stored token contents,
     so a colliding entry with different tokens is a miss. Insert retains
     every block in the pool; FIFO eviction at ``capacity`` releases them.
-    Blocks a live slot still holds stay allocated. ``on_evict`` (set by the
-    engine) is called with an evicted entry's tokens so side tables keyed by
-    the same tuple cannot outlive it.
+    Blocks a live slot still holds stay allocated. With a ``tier``, an eviction
+    spills to it (cold index) instead of dropping; ``on_demote(tokens, key)``
+    moves the side snapshot with it and ``on_evict(tokens, key)`` fires only
+    when an entry leaves the store entirely.
     """
 
     def __init__(
@@ -593,6 +627,13 @@ class PrefixStore:
         for e in self._entries.get(h, ()):
             if e.tokens == tokens:
                 return  # already cached
+        # Retire a cold twin of the same prefix (reloaded, now re-published):
+        # it shares this hash, so leaving it lets its later eviction drop(h) and
+        # delete THIS resident entry's spilled file. Same-hash different-tokens
+        # cold entries stay — only the exact-token twin is stale.
+        for e in list(self._cold.get(h, ())):
+            if e.tokens == tokens:
+                self._drop_cold(e)
         entry = _Entry(self._next_id, tokens, blocks, h)
         self._next_id += 1
         self._entries.setdefault(h, []).append(entry)
@@ -661,7 +702,7 @@ class PrefixStore:
         # spill_kv reads the blocks (so it runs before free_block) and owns the
         # accept/reject; a refusal drops as before.
         spilled = self._tier is not None and self._tier.spill_kv(
-            entry.h, entry.blocks, self._pool
+            entry.h, entry.tokens, entry.blocks, self._pool
         )
         for b in entry.blocks:
             self._pool.free_block(b)
@@ -678,18 +719,27 @@ class PrefixStore:
                 self.on_evict(entry.tokens, entry.h)
         self.evictions += 1
 
-    def _evict_cold_if_needed(self) -> None:
-        while len(self._cold_fifo) > self.tier_capacity:
-            eid = self._cold_fifo.popleft()
-            entry = self._by_id.pop(eid)
-            chain = self._cold[entry.h]
+    def _drop_cold(self, entry: "_Entry") -> None:
+        """Remove one cold entry from the index; drop its tier file only when no
+        other cold entry shares the hash (files are hash-named, so a same-hash
+        twin still needs it)."""
+        self._by_id.pop(entry.eid, None)
+        with contextlib.suppress(ValueError):
+            self._cold_fifo.remove(entry.eid)
+        chain = self._cold.get(entry.h)
+        if chain and entry in chain:
             chain.remove(entry)
             if not chain:
                 del self._cold[entry.h]
-            if self._tier is not None:
-                self._tier.drop(entry.h)
-            if self.on_evict is not None:
-                self.on_evict(entry.tokens, entry.h)
+        if self._tier is not None and entry.h not in self._cold:
+            self._tier.drop(entry.h)
+        if self.on_evict is not None:
+            self.on_evict(entry.tokens, entry.h)
+
+    def _evict_cold_if_needed(self) -> None:
+        while len(self._cold_fifo) > self.tier_capacity:
+            eid = self._cold_fifo[0]
+            self._drop_cold(self._by_id[eid])
 
     def stats(self) -> dict[str, int]:
         """Cache counters: entries, capacity, hits, misses, evictions."""

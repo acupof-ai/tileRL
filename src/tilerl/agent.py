@@ -3,9 +3,14 @@
 The model runs a ReAct-ish loop: it emits ONE JSON action per turn — either a
 tool call ``{"tool": "...", "args": {...}}`` or a final answer
 ``{"answer": "..."}``. The server executes the tool, appends the result as a
-new turn, and re-prompts, up to ``max_steps``. Tools are backend shell/file
-ops behind a fixed root + timeout + a deny list — this is a real trust
-boundary, so it is guarded, not minimized away.
+new turn, and re-prompts, up to ``max_steps``.
+
+SECURITY: ``shell`` runs arbitrary commands on the server host. The deny list
+and CWD jail are speed bumps, NOT a sandbox — ``shell`` is trivially escapable
+(subshells, interpreters, symlinks). The real containment is that the endpoint
+is off unless the operator opts in (``TILERL_AGENT_TOOLS``) and that the root
+is server-pinned, never client-supplied. Do not expose this to untrusted
+callers; run it only where arbitrary code execution is already acceptable.
 
 The loop is generator-based: it yields ``(kind, payload)`` events
 (``thought`` / ``action`` / ``observation`` / ``answer`` / ``error``) so the
@@ -20,14 +25,15 @@ import subprocess
 from collections.abc import Callable, Iterator
 from typing import Any
 
-# Coarse deny list, not a sandbox — the real containment is the CWD jail +
-# timeout; this just stops the obvious foot-guns.
+# A deny list is a speed bump, not a sandbox — shell=True is escapable a dozen
+# ways. It only catches the obvious accidental foot-guns, not a hostile caller.
 _DENY = ("rm -rf", "mkfs", "dd if=", ":(){", "shutdown", "reboot", "> /dev", "curl", "wget")
 
 
 class Tools:
-    """Backend tools rooted at ``root``. Every path is resolved and must stay
-    inside the root; shell runs with a timeout and a deny list."""
+    """Backend tools rooted at ``root`` (server-pinned, never client-supplied).
+    read/write paths are jailed to the root; shell is time-boxed but NOT
+    sandboxed — see the module security note."""
 
     def __init__(self, root: str, timeout_s: float = 20.0) -> None:
         self.root = os.path.realpath(root)

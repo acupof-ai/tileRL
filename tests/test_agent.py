@@ -53,10 +53,11 @@ def _events(text):
     return out
 
 
-def test_agent_endpoint_streams_react_loop(tmp_path):
+def test_agent_endpoint_streams_react_loop(tmp_path, monkeypatch):
+    monkeypatch.setenv("TILERL_AGENT_TOOLS", str(tmp_path))  # opt in, server-pinned root
     app = create_app(_FakeEngine(), _ByteTok(), "tiny")
     client = TestClient(app)
-    r = client.post("/v1/agent", json={"message": "say hi", "root": str(tmp_path)})
+    r = client.post("/v1/agent", json={"message": "say hi"})
     assert r.status_code == 200
     kinds = [e["type"] for e in _events(r.text)]
     assert kinds == ["thought", "action", "observation", "answer"], kinds
@@ -64,6 +65,14 @@ def test_agent_endpoint_streams_react_loop(tmp_path):
     assert evs[1]["payload"]["tool"] == "shell"
     assert evs[2]["payload"] == "hi"  # the shell actually ran
     assert evs[3]["payload"] == "the shell said hi"
+
+
+def test_agent_endpoint_disabled_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("TILERL_AGENT_TOOLS", raising=False)  # not opted in
+    app = create_app(_FakeEngine(), _ByteTok(), "tiny")
+    client = TestClient(app)
+    r = client.post("/v1/agent", json={"message": "say hi"})
+    assert r.status_code == 403  # shell tools off unless the operator enables them
 
 
 def test_agent_tools_jail_and_deny(tmp_path):

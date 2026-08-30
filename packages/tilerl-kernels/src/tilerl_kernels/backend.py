@@ -108,7 +108,10 @@ _MMA_RED = kernels_linear._RED_TILE  # the K-loop reduction tile; one definition
 
 _CUDA_PLAN = {
     ("linear", "gemv"): ("linear_bf16_gemv", 256, 4, 4),
-    ("linear_fp4", "gemv"): ("linear_fp4_gemv", 256, 4, 4),
+    # kpad=512: the fp4 GEMV strides block_K=reduce_thread(32)*micro(16)=512 with
+    # no k<K guard, so K pads to 512 (was 256 — OOB when Kp%512!=0, e.g. a
+    # TP-sharded down_proj K=4352; 27B single-card dims all divide 512).
+    ("linear_fp4", "gemv"): ("linear_fp4_gemv", 512, 4, 4),
     ("linear_fp8", "gemv"): ("linear_fp8_gemv", 512, 4, 4),
     ("linear_fp4", "decode"): ("linear_fp4_fp8_decode", 512, 128, 64),
     ("linear_fp4", "prefill"): ("linear_fp4_fp8", 128, 128, 64),
@@ -287,7 +290,13 @@ class Backend:
             return None
         bM = 1 if m == 1 else _snap_mma_tile(m, 128)
         bN = _round_up(min(cap, n), tile)
-        return kernel, _round_up(m, bM), _round_up(n, bN), _round_up(k, kpad), bM, bN
+        Kp = _round_up(k, kpad)
+        # The fp4/fp8 GEMVs stride block_K = 32*16 = 512 with no k<K guard, so the
+        # padded K must be a 512 multiple — kpad guarantees it (guard the contract
+        # here rather than let a mismatched plan read OOB on the device).
+        if op in ("linear_fp4", "linear_fp8") and m == 1:
+            assert Kp % 512 == 0, f"gemv kpad={kpad} leaves Kp={Kp} not a 512 multiple"
+        return kernel, _round_up(m, bM), _round_up(n, bN), Kp, bM, bN
 
     # ------------------------------------------------------------ add
 
@@ -458,7 +467,10 @@ class Backend:
         # streams W once for M rows, so it wins until the M-fold FMA work
         # catches up. Uses the M=1 plan — the decode plan's n_partition is 128,
         # which as a GEMV thread block is 4096 threads.
-        if 2 <= M <= _MGEMV and (gp := self._plan("linear_fp4", 1, N, K)) is not None:
+        # M-row GEMV (sm90 only): its maker takes a compile-time M and packs M
+        # activation rows into one weight stream. sm70's GEMV is M=1-only (no
+        # packed-FMA), so it stays on the generic f32 fallback for M>1.
+        if self.arch == "sm90" and 2 <= M <= _MGEMV and (gp := self._plan("linear_fp4", 1, N, K)) is not None:
             gk, _, gNp, gKp, _, gbN = gp
             gwq, gsc = _pad2d(wq, gNp, gKp // 2), _pad2d(scale, gNp, gKp // blk)
             osc = self._ones(gNp) if oscale is None else self._const_f32(oscale, gNp)
