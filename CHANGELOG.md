@@ -4,6 +4,21 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-31 — phase exit: B=8 decode on sm70, 1.3 -> 31.8 tok/s
+
+- The M-row fp4 GEMV (`linear_fp4_gemv_sm70_m`) loads+decodes W once per tile
+  and reuses it across M=8 rows, replacing the per-row M=1 loop that OOMs at
+  B=8. Weight bytes — the decode bottleneck — no longer scale with batch.
+- First B=8 e2e measured 5.67 s/tick (1.3 t/s, 9% GPU): the kernel was fast
+  but the pod's `engine.py` was an old copy (admit one request/tick via `if`,
+  not `while`), producing mixed prefill+decode ticks that skip the decode-graph
+  path. Syncing the pod's code fixed it — the B=8 graph captures once, replays
+  at 263.8 ms/tick = 31.8 t/s aggregate, all 8 requests correct.
+- B=8 per-token cost 33.0 ms vs B=1's 37.9 ms — weight sharing makes B=8
+  cheaper per-token than B=1. Parity: M=1 AND M=8 on 12 real projections,
+  worst 6.17e-4 (gate 1e-2).
+  [wins/2026-08-30-sm70-fp16-twiddle-gemv.md](docs/experience/wins/2026-08-30-sm70-fp16-twiddle-gemv.md)
+
 ## 2026-08-30 — accept: the sampler stops shipping its arguments to the device to read them back
 
 - `temperature` / `top_p` / `seed` are Python scalars on `SamplingParams`. The
