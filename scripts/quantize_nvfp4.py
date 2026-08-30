@@ -20,7 +20,22 @@ from safetensors.torch import load_file, save_file
 
 from tilerl import config as cfgmod
 from tilerl.model import _param_key_for, fp4_param_keys
-from tilerl.ops.reference import pack_fp4, renorm_fp4_scale
+from tilerl_kernels.reference import pack_fp4, renorm_fp4_scale
+
+
+def _pack_chunked(w, rows=2048):
+    """pack_fp4 by row chunks: its argmin materializes [N,K//B,B,8] f32 at
+    once (40 GB for lm_head 248320x5120), so slice N to bound peak memory."""
+    w = w.to(torch.bfloat16)
+    n = w.shape[0]
+    if n <= rows:
+        return pack_fp4(w)
+    wqs, scs = [], []
+    for i in range(0, n, rows):
+        wq, sc = pack_fp4(w[i : i + rows])
+        wqs.append(wq)
+        scs.append(sc)
+    return torch.cat(wqs, 0), torch.cat(scs, 0)
 
 
 def main(src, dst, cfg_fn):
@@ -40,7 +55,7 @@ def main(src, dst, cfg_fn):
             key = _param_key_for(hf_name)
             if key is not None and key in fp4_keys and hf_name.endswith(".weight"):
                 stem = hf_name.removesuffix(".weight")
-                wq, scale = pack_fp4(t.to(torch.bfloat16))
+                wq, scale = _pack_chunked(t)
                 scale, oscale = renorm_fp4_scale(scale)
                 out[stem + ".wq"] = wq.contiguous()
                 out[stem + ".scale"] = scale.contiguous()

@@ -9,7 +9,7 @@ import sys
 sys.path.insert(0, "src")
 import torch
 
-from tilerl.ops import kernels_linear, reference
+from tilerl_kernels import kernels_linear, reference
 
 
 def _round_up(x, m):

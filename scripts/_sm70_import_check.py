@@ -1,6 +1,6 @@
 import sys
 sys.path.insert(0, "src")
-from tilerl.ops import registry, kernels_linear
+from tilerl_kernels import registry, kernels_linear
 
 assert ("fp4", "sm70") in registry._REGISTRY, "sm70 fp4 cell missing"
 cell = registry._REGISTRY[("fp4", "sm70")]
