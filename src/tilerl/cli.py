@@ -387,7 +387,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--model", choices=["tiny", "qwen38-27b"], default="tiny")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
-    p_serve.add_argument("--devices", default="", help="CUDA indices to replicate across, e.g. 0,1,2,3",
+    p_serve.add_argument("--devices", default="",
+                         help="replicate inside ONE process across these CUDA indices, e.g. 0,1,2,3. "
+                              "A CUDA fault in one replica is sticky for the whole process and takes "
+                              "the others down while HTTP keeps answering; for independent endpoints "
+                              "run one process per card under CUDA_VISIBLE_DEVICES instead.",
                          type=lambda v: [int(x) for x in v.split(",")] if v else [])
     p_serve.set_defaults(func=cmd_serve)
 
