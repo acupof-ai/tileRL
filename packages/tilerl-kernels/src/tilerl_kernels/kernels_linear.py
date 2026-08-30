@@ -938,19 +938,12 @@ def make_linear_bf16_gemv(target: str):
 def make_linear_fp4_gemv_sm70(target: str):
     """Fused e2m1 dequant + GEMV for Volta (sm70), the decode (M=1) path.
 
-    X[1,K] fp16/bf16, WQ uint8 [N,K//2] NATURAL (low nibble first, no twiddle),
-    Scale[N,K//block] f32. Y[0,n] = Res[0,n] + OScale[n] * sum_k X[0,k] *
-    e2m1(WQ nibble) * Scale[n,k//block].
+    X[1,K] f32, WQ uint8 [N,K//2] natural layout, Scale[N,K//block] f32.
+    Y[0,n] = Res[0,n] + OScale[n] * sum_k X[0,k] * e2m1(WQ nibble) * Scale[n,k//block].
 
-    sm70 has no packed bf16x2/e4m3 math (sm_80+) and no cp.async, so the sm90
-    ``tl_fp4_gemv_tiles`` extern is dead. This is pure TIR on the
-    make_linear_bf16_gemv skeleton: split-K, each thread owns a micro=16-elem
-    K-slice (8 packed bytes, one 128-bit load) inside one scale block, decodes
-    each nibble with the branch-free _e2m1_fp32 bit-synthesis, f32-accumulates
-    the products (exact — the GEMV never touches a tensor core, so X stays the
-    backend's bf16 IO dtype), then tvm_thread_allreduce across the warp. The
-    natural byte holds even elem in the low nibble, odd in the high.
-    Roofline = (N*K*0.5 + 2K) bytes / HBM BW — the ~14GB/token decode floor.
+    Pure-TIR split-K: sm70 has no packed bf16x2 math (sm_80+), so the sm90
+    tl_fp4_gemv_tiles extern is unusable; each thread decodes its K-slice with
+    the branch-free _e2m1_fp32 bit-synthesis and f32-accumulates.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())

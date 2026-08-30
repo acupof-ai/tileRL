@@ -18,6 +18,7 @@ pressure admission: the engine fails loudly on pool exhaustion
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections import deque
 from dataclasses import dataclass
@@ -376,13 +377,10 @@ class PrefixHit:
 class KvTier:
     """SSD byte-store below the HBM pool: spilled prefix KV + GDN snapshots.
 
-    On a 32 GB V100 the host DRAM is not a residency tier (nearly all in
-    buff/cache), and L2 (6 MB) is hardware-managed, so the only real capacity
-    tier is the SSD. A prefix evicted from the pool spills here instead of
-    being dropped, and a later lookup that hits it reloads into fresh blocks —
-    skipping the whole prefill recompute. Dumb bytes: torch.save of a `.cpu()`
-    tensor (the transient pageable copy IS the only host-memory touch). One
-    process owns the dir; a dead process's files are orphans, so wipe on init.
+    A prefix evicted from the pool spills here instead of being dropped; a later
+    lookup reloads it into fresh blocks, skipping the prefill recompute. On a
+    32 GB V100 with a full host there is no DRAM residency tier, so it is
+    HBM→SSD.
 
     # ponytail: sync reload (torch.load), pinned-ring async prefetch when hit
     #   latency bites; raw bf16 spill, fp8 tier-quant is 2x capacity if SSD fills
@@ -394,25 +392,18 @@ class KvTier:
         import threading
 
         self._dir = os.fspath(path)
-        # min_tokens is per-tier: an SSD tier wants a churn floor (small entries
-        # are not worth a disk write); a pinned-DRAM tier can set it near 0
-        # (reload beats recompute at any length). The store reads it off the tier.
+        # per-tier floor: a composite DRAM-over-SSD tier sets a different one per level
         self.min_tokens = min_tokens
-        # Bound the in-flight write queue: eviction is bursty (evict_until_free
-        # frees many at once; bd851c1 publishes several per tick) and can enqueue
-        # faster than the disk drains. On a 31GB-RAM host an unbounded queue is a
-        # host OOM masquerading as a KV bug. Over the cap, spill_kv refuses —
-        # the graceful drop the store already handles. ~1MiB/block-token so 32
-        # entries of a few-block prefix is well under 1GB.
+        # bound in-flight writes: bursty eviction can enqueue faster than the
+        # disk drains, and an unbounded queue OOMs a 31GB host. Over the cap,
+        # spill_kv refuses — the graceful drop the store already handles.
         self._max_pending = max_pending
         self._healthy = True  # daemon failure (disk full/perm) flips this to refuse
-        shutil.rmtree(self._dir, ignore_errors=True)
+        shutil.rmtree(self._dir, ignore_errors=True)  # dead process's files are orphans
         os.makedirs(self._dir, exist_ok=True)
-        # Deferred write: spill_kv runs INSIDE a decode tick (_publish_prefix on
-        # the forward path), so the ~100ms torch.save cannot happen there — it
-        # would stall a 10ms tick 10x. spill_kv does only the GPU->CPU copy
-        # (~2ms PCIe) + enqueue; a daemon thread flushes to disk off-tick.
-        # `_pending`/`_pending_st` hold copies not yet on disk so has()/load see them.
+        # Deferred write: spill_kv runs inside a decode tick, so it does only the
+        # GPU->CPU copy + enqueue; a daemon flushes the ~100ms torch.save off-tick.
+        # _pending/_pending_st serve blobs not yet on disk, so has()/load see them.
         self._pending: dict[int, dict] = {}
         self._pending_st: dict[int, dict] = {}
         self._lock = threading.Lock()
@@ -423,32 +414,26 @@ class KvTier:
     def _flush_loop(self) -> None:
         while True:
             tag, blob, dst = self._q.get()
-            # A drop() that raced us already removed the entry from _pending and
-            # deleted any file. If we wrote now, a stale blob would reappear on
-            # disk for a prefix the store believes evicted (write-back cache
-            # invalidation hole → wrong tokens). So write only while the entry
-            # is still pending, and pop under the same lock, atomically.
+            # Write only while the entry is still pending: a drop() that raced us
+            # already removed it, and writing now would resurrect an evicted
+            # prefix on disk (write-back invalidation → wrong tokens).
             k = tag[1] if isinstance(tag, tuple) else tag
             table = self._pending_st if isinstance(tag, tuple) else self._pending
             with self._lock:
                 if table.get(k) is not blob:
-                    continue  # dropped (or superseded) before we flushed
+                    continue
             try:
                 torch.save(blob, dst)
             except Exception:  # noqa: BLE001 - disk full / perm: stop trusting the tier
-                self._healthy = False  # spill_kv now refuses; store drops instead
+                self._healthy = False
                 continue
             with self._lock:
-                if table.get(k) is blob:  # still ours after the write
-                    table.pop(k, None)  # now durable on disk
+                if table.get(k) is blob:
+                    table.pop(k, None)
                     continue
-            # A drop() landed while torch.save ran: it removed the entry and
-            # tried to unlink a file that did not exist yet. Undo our write so
-            # the evicted prefix does not reappear on disk.
-            try:
+            # a drop() landed mid-save: undo the write so the evicted prefix stays gone
+            with contextlib.suppress(FileNotFoundError):
                 os.remove(dst)
-            except FileNotFoundError:
-                pass
 
     def _kv(self, key: int) -> str:
         return os.path.join(self._dir, f"{key & _MASK64:016x}.kv")
@@ -457,22 +442,14 @@ class KvTier:
         return os.path.join(self._dir, f"{key & _MASK64:016x}.st")
 
     def spill_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> bool:
-        # Returns True if this tier accepted the spill. The tier owns BOTH the
-        # length rule and the capacity rule — the store never pre-gates, so a
-        # composite tier (a near-zero-floor DRAM L1 above a 2048-floor SSD L2)
-        # can apply a different floor per level. This SSD tier refuses entries
-        # below min_tokens (not worth a disk write) and accepts the rest. The
-        # prefix is block-aligned, so len(blocks)*BLOCK_TOKENS is its length.
+        # True = accepted. The tier owns both the length floor and the capacity
+        # refusal (the store never pre-gates), so a composite tier can vary them
+        # per level. Refuse below min_tokens or when the writer is behind/dead.
         if len(blocks) * BLOCK_TOKENS < self.min_tokens:
             return False
-        # Refuse when the writer is behind or dead: an unbounded queue on a
-        # 31GB-RAM host is a host OOM, and a dead daemon (disk full/perm) would
-        # let the queue grow while the store believes everything durable. Both
-        # become the graceful drop the store already handles.
         with self._lock:
             if not self._healthy or len(self._pending) >= self._max_pending:
                 return False
-        # GPU->CPU copy now (fast, on-tick); torch.save deferred to the writer.
         k = torch.stack([pool.k_pool[:, b] for b in blocks]).contiguous().cpu()
         v = torch.stack([pool.v_pool[:, b] for b in blocks]).contiguous().cpu()
         blob = {"k": k, "v": v}
@@ -482,10 +459,8 @@ class KvTier:
         return True
 
     def load_kv(self, key: int, blocks: Sequence[int], pool: "PagedKvPool") -> bool:
-        # Returns False if the data is gone (a concurrent eviction dropped it
-        # between lookup and load) — the caller frees its blocks and treats the
-        # hit as a miss. Total with spill_kv, and closes the has()/load TOCTOU.
-        # A still-pending (not yet flushed) blob is served from memory.
+        # False = data gone (a raced eviction dropped it) — caller treats it as a
+        # miss. Serves a still-pending blob from memory, closing the has()/load TOCTOU.
         with self._lock:
             blob = self._pending.get(key)
         if blob is None:
@@ -521,10 +496,8 @@ class KvTier:
             self._pending.pop(key, None)
             self._pending_st.pop(key, None)
         for p in (self._kv(key), self._st(key)):
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.remove(p)
-            except FileNotFoundError:
-                pass
 
 
 class _Entry:
@@ -578,16 +551,14 @@ class PrefixStore:
     ) -> None:
         self._pool = pool
         self.capacity = capacity
-        # on_evict: an entry left the store entirely (side tables must drop it).
-        # on_demote: an entry spilled to the tier (its GDN snapshot spills too).
+        # on_evict: entry left the store entirely; on_demote: spilled to the tier
         self.on_evict: Callable[[tuple[int, ...], int], None] | None = None
         self.on_demote: Callable[[tuple[int, ...], int], None] | None = None
         self._roll = _rolling_hash
         self._entries: dict[int, list[_Entry]] = {}
         self._by_id: dict[int, _Entry] = {}
         self._fifo: deque[int] = deque()
-        # SSD tier + its cold index (blocks freed, bytes on disk keyed by e.h);
-        # the spill floor is the tier's own (tier.min_tokens), per-tier.
+        # SSD tier + its cold index (blocks freed, bytes on disk keyed by e.h)
         self._tier = tier
         self.tier_capacity = tier_capacity
         self._cold: dict[int, list[_Entry]] = {}
@@ -687,10 +658,8 @@ class PrefixStore:
         chain.remove(entry)
         if not chain:
             del self._entries[entry.h]
-        # Offer to the tier when wired; the tier owns the accept/reject call
-        # (both its length floor and its capacity), so the store never
-        # pre-gates. A refusal (too short, or a full L1) drops as today.
-        # spill_kv reads the blocks, so it runs before free_block.
+        # spill_kv reads the blocks (so it runs before free_block) and owns the
+        # accept/reject; a refusal drops as before.
         spilled = self._tier is not None and self._tier.spill_kv(
             entry.h, entry.blocks, self._pool
         )
@@ -698,7 +667,7 @@ class PrefixStore:
             self._pool.free_block(b)
         if spilled:
             if self.on_demote is not None:
-                self.on_demote(entry.tokens, entry.h)  # engine spills the GDN snapshot
+                self.on_demote(entry.tokens, entry.h)
             entry.blocks = ()
             self._cold.setdefault(entry.h, []).append(entry)
             self._cold_fifo.append(eid)

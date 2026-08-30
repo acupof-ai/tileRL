@@ -20,9 +20,8 @@ import subprocess
 from collections.abc import Callable, Iterator
 from typing import Any
 
-# A command is refused outright if any of these appears — a coarse floor, not a
-# sandbox. The real containment is CWD-jailing + timeout + no shell metachars
-# reaching a second command; this just stops the obvious foot-guns.
+# Coarse deny list, not a sandbox — the real containment is the CWD jail +
+# timeout; this just stops the obvious foot-guns.
 _DENY = ("rm -rf", "mkfs", "dd if=", ":(){", "shutdown", "reboot", "> /dev", "curl", "wget")
 
 

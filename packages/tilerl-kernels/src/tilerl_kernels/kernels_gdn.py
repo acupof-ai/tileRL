@@ -198,7 +198,7 @@ def make_gdn_decode_fused(target: str, out_dtype: str = "bfloat16"):
         # NewState buffer (was 2 index launches + 3 MB of traffic per layer).
         States: T.Tensor((S, L, NVH, K, V), "float32")
         Slots: T.Tensor((B,), "int32")
-        Out = T.empty((B, VD), out_dtype)  # out_proj GEMV reads this (bf16 sm90, f32 sm70)
+        Out = T.empty((B, VD), out_dtype)  # bf16 on sm90, f32 on sm70 (out_proj IO dtype)
         with T.Kernel(NVH, B, threads=threads) as (vh, bb):
             tv = T.get_thread_binding(0)
             slot = Slots[bb]

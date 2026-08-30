@@ -421,9 +421,7 @@ class Engine:
         # key present here is exactly a key the store still holds.
         self._prefix_state: dict[tuple[int, ...], tuple[torch.Tensor, "torch.Tensor | None"]] = {}
         prefix_store.on_evict = lambda tokens, key: self._prefix_state.pop(tokens, None)
-        # on_demote: an entry spilled to the SSD tier — move its GDN snapshot
-        # to the tier too (keyed by the store hash), keeping the invariant that
-        # a snapshot present resident-side is exactly a resident store entry.
+        # on_demote moves a spilled entry's GDN snapshot to the tier alongside it
         self._tier = getattr(prefix_store, "_tier", None)
         if self._tier is not None:
             prefix_store.on_demote = self._demote_snapshot
@@ -475,9 +473,8 @@ class Engine:
                 return rid
 
             matched, hit_blocks, reload_key = self._match_prefix(tokens)
-            # Read the snapshot now: evict_until_free below can drop the very
-            # store entry we matched, and on_evict takes the snapshot with it.
-            # A cold hit's snapshot comes from the tier, keyed by the hash.
+            # Read the snapshot before evict_until_free below can drop the entry
+            # (and its snapshot); a cold hit's comes from the tier.
             if not matched:
                 snap = None
             elif reload_key is not None:
@@ -490,14 +487,13 @@ class Engine:
                 self._prefix_misses += 1
 
             total_blocks = (len(tokens) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
-            # Resident hit adopts the store's blocks (retain); a cold hit owns
-            # freshly-allocated blocks that the tier fills, so nothing to adopt.
+            # a cold hit owns fresh blocks the tier fills; a resident hit adopts the store's
             blocks = [] if reload_key is not None else list(hit_blocks)
             slot = None
             try:
                 slot = self._states.alloc_slot()
                 for b in blocks:
-                    self._kv.retain(b)  # adopt the store's blocks (resident hit only)
+                    self._kv.retain(b)
                 needed = total_blocks - len(blocks)
                 evict = getattr(self._prefix, "evict_until_free", None)
                 if evict is not None:
@@ -506,24 +502,20 @@ class Engine:
                     raise RuntimeError("insufficient KV blocks for request")
                 while len(blocks) < total_blocks:
                     blocks.append(self._kv.alloc_block())
-                if reload_key is not None:
-                    # Fill the matched-prefix blocks from the SSD tier — this is
-                    # the prefill the cold hit skips. submit runs under the
-                    # engine lock, so no concurrent eviction races us; a False
-                    # here means the tier file is actually gone/corrupt, which
-                    # is a hard error, not a silent miss.
-                    if not self._tier.load_kv(
-                        reload_key, blocks[: matched // BLOCK_TOKENS], self._kv
-                    ):
-                        raise RuntimeError(f"tier lost cold prefix {reload_key:016x}")
+                # Cold hit: fill the matched blocks from the tier (the prefill it
+                # skips). A False under the engine lock means the file is gone — a
+                # hard error; the except frees the blocks and re-raises.
+                if reload_key is not None and not self._tier.load_kv(
+                    reload_key, blocks[: matched // BLOCK_TOKENS], self._kv
+                ):
+                    raise RuntimeError(f"tier lost cold prefix {reload_key:016x}")
             except Exception:
                 for b in blocks:
                     self._kv.free_block(b)
                 if slot is not None:
                     self._states.free_slot(slot)
                 raise
-            # A cold hit owns every block (the tier's copy is separate); a
-            # resident hit owns only the fresh tail.
+            # a cold hit owns every block; a resident hit owns only the fresh tail
             own_blocks = total_blocks if reload_key is not None else total_blocks - matched // BLOCK_TOKENS
             self._blocks_used += own_blocks
             self._slots_used += 1

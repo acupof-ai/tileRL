@@ -122,30 +122,15 @@ _SM90_KERNELS = {
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)
-# sm70 (Volta): tilelang lowers T.gemm to mma.sync.m8n8k4 but ONLY for fp16 —
-# no bf16/fp4/fp8 tensor cores, no cp.async/WGMMA/TMA. So the sm90 MMA family
-# is dead here. The cell is the CPU floor (block-parallel f32, compiles on
-# cuda) plus a pure-TIR fp4 decode GEMV for the M=1 decode hot path — the
-# ~14GB/token weight stream that sets the 60 t/s ceiling. fp8, mma8, and the
-# bf16-writer overrides are all sm_80+ and left out.
+# sm70 (Volta): T.gemm lowers to mma.sync.m8n8k4 but fp16-only, so the sm90 MMA
+# family is dead — the cell is the CPU f32 floor plus the three fused kernels
+# that also run on Volta (all pure block-parallel TIR, no WGMMA/cp.async/TMA).
 _SM70_KERNELS = {
-    **_CPU_KERNELS,  # rmsnorm/silu/softmax/rope/embedding/paged_attention/gemm floor
-    # Registered under the standard name so _CUDA_PLAN's ("linear_fp4","gemv")
-    # row and backend._served_fp4's twiddle gate both resolve without an
-    # arch branch. The maker itself is the Volta (natural-layout, pure-TIR) one.
-    "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv_sm70,  # M=1 decode
-    # GDN decode: the sm90 fused kernel is already pure block-parallel TIR (no
-    # WGMMA/cp.async/TMA), so it runs on Volta unchanged except its output
-    # dtype — sm70's out_proj GEMV reads f32, not bf16. This one kernel is both
-    # the launch fix (384 tiny kernels/layer -> 1) and the CUDA-graph fix (it
-    # removes the eager gdn_forward's int(seq_q_lens) host sync that breaks
-    # capture). Without it, all 48 GDN layers run eager and the graph is off.
+    **_CPU_KERNELS,
+    "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv_sm70,
+    # Both fix graph capture: gdn_decode_fused and write_tokens replace eager
+    # fallbacks whose per-token int(device_tensor) host syncs break it.
     "gdn_decode_fused": lambda t: kernels_gdn.make_gdn_decode_fused(t, out_dtype="float32"),
-    # KV-cache write: the second capture-breaker. Without it the full-attn
-    # layers fall to kv_pool.write_tokens' torch loop, whose per-token
-    # int(block_table)/int(seq_len) host syncs break graph capture. make_write_
-    # tokens is pure TIR (no WGMMA/cp.async) and bf16-IO — the KV pool is bf16
-    # on every arch (attention casts to f32 on read), so it registers unchanged.
     "write_tokens": kernels_mma.make_write_tokens,
 }
 _register("bf16", "sm70", _SM70_KERNELS)

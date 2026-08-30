@@ -203,11 +203,8 @@ class Backend:
             self.device = torch.device("cpu")
         self.precision = "bf16"
         self.arch = _arch_for(target)
-        # Kernel I/O dtype. bf16 tensor cores exist only on sm90 among our cells;
-        # sm70's MMA is fp16-only and the rest of its cell is the CPU f32 source,
-        # so a bf16-IO cast would hand bf16 to an f32 kernel (the class of bug
-        # that dropped tokens on the sm70 fallback). "CUDA" is not "has bf16":
-        # only sm90 takes bf16 IO; cpu/metal/sm70 take f32.
+        # Kernel I/O dtype: only sm90 has bf16 tensor cores; sm70's MMA is
+        # fp16-only and its cell is the CPU f32 source, so it takes f32 IO.
         self.io = torch.bfloat16 if self.arch == "sm90" else torch.float32
         self._kernels: dict[str, object] = {}
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
@@ -270,8 +267,6 @@ class Backend:
         return inv
 
     def _rows(self, x: torch.Tensor):
-        # sm90 kernels are bf16-IO; cpu/metal/sm70 are f32. self.io carries it
-        # (sm70 is cuda but has no bf16 tensor core — see Backend.__init__).
         return x.shape[:-1], self._c(self._dev(x, self.io).reshape(-1, x.shape[-1]))
 
     def _epilogue(self, y2, oscale, lead, n: int):
@@ -440,7 +435,7 @@ class Backend:
         so graph capture, save_hf (which untwiddles by the flag) and CPU-resident
         callers all see one truth. Other cells read the natural layout — sm70's
         GEMV decodes natural nibbles in TIR, so it must NOT be twiddled."""
-        wq = self._dev(wq, wq.dtype)  # uint8: device migration only
+        wq = self._dev(wq, wq.dtype)
         if (
             self.arch != "sm70"
             and "linear_fp4_gemv" in _resolve(self.precision, self.arch)
@@ -527,9 +522,8 @@ class Backend:
                 Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, 64)
                 x2 = _pad2d(x2, Mp, Kp)
                 wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
-            # The generic linear_fp4 is f32-IO (no tensor cores); on a bf16-IO
-            # cuda cell (sm70's M>1 fallback — sm90 never lands here, it has an
-            # MMA kernel) the _rows cast left x2 bf16, so restore f32.
+            # generic linear_fp4 is f32-IO; restore f32 for sm70's M>1 fallback
+            # (sm90 never lands here — it has an MMA kernel).
             y2 = self._kernel("linear_fp4")(self._f32(x2), wq, scale, bM, bN, blk, _THREADS)[:M, :N]
         y = self._epilogue(y2, oscale, lead, N)
         return y if residual is None else y + residual
@@ -1038,12 +1032,8 @@ class Backend:
         return self._f32(residual).reshape(rows, n).contiguous()
 
     def embedding(self, idx, table):
-        # A gather needs no arithmetic, so where the downstream is bf16-IO (sm90)
-        # the table is read in its own dtype: the 27B's bf16 [248320, 5120] table
-        # is 2.4 GiB against a cached 4.7 GiB f32 copy. Everything else — cpu,
-        # metal, AND sm70 (f32 kernels, and the C target cannot even codegen
-        # bfloat16) — takes the f32 cast, or the gather would hand bf16 to an f32
-        # kernel and collapse the hidden state (the 27B decoded id 220 forever).
+        # bf16-IO cells (sm90) gather the table in its own dtype (2.4 vs 4.7 GiB
+        # f32); f32 cells must cast, or a bf16 gather feeds an f32 kernel.
         if table.dtype == torch.bfloat16 and self.io == torch.bfloat16:
             table, dt = self._c(table.to(self.device)), "bfloat16"
         else:
