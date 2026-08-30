@@ -787,6 +787,65 @@ __device__ __forceinline__ void tl_fp4_gemv_tiles_f16(const void *wqv, const voi
     *acc = fmaf(sc[g], __low2float(ah) + __high2float(ah), *acc);
   }
 }
+// M-row warp reduce: each of the M accumulators gets a full warp reduction.
+// __shfl_down_sync is sm70+ (Volta) — fine, this cell is sm70-only.
+template <int M>
+__device__ __forceinline__ void tl_warp_reduce_m_f16(float *acc) {
+#pragma unroll
+  for (int m = 0; m < M; ++m) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc[m] += __shfl_down_sync(0xffffffffu, acc[m], o);
+  }
+}
+// M-row twin: WQ is loaded + decoded ONCE per tile and reused across all M
+// rows, so the weight bytes (the bottleneck — W is ~900x X for M=1) do not
+// scale with M. M is a compile-time template arg (the factory bakes it); the
+// backend pads M up and slices the output. Mirrors the sm90 fp8 GEMV's
+// tl_fp8_gemv_tiles_m<G,M> structure.
+template <int G, int M>
+__device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m(
+    const void *wqv, const void *xv, int K, int block_K,
+    const float *sc, float *acc) {
+  const unsigned char *wq = (const unsigned char *)wqv;
+  const float *x = (const float *)xv;
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    unsigned w0, w1;
+    asm volatile("ld.global.nc.v2.u32 {%0,%1}, [%2];"
+                 : "=r"(w0), "=r"(w1) : "l"(wq + g * block_K / 2));
+    unsigned d0[4], d1[4];
+    tl_fp4_decode8_f16(w0, d0);
+    tl_fp4_decode8_f16(w1, d1);
+    // No #pragma unroll on the M loop: unrolling 8 rows inside the G-unroll
+    // (4x) spills registers (32 bodies x ~25 regs >> 256/thread) and was
+    // 150x slower (5.7 ms/tick -> 5.7 s/tick). One row's xb live at a time.
+    for (int m = 0; m < M; ++m) {
+      float4 xb[4];
+      const float *xg = x + m * K + g * block_K;
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        asm volatile("ld.global.nc.v4.f32 {%0,%1,%2,%3}, [%4];"
+                     : "=f"(xb[i].x), "=f"(xb[i].y), "=f"(xb[i].z), "=f"(xb[i].w)
+                     : "l"(xg + 4 * i));
+      unsigned xw[8];
+      const float *xf = (const float *)xb;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        unsigned lo = __half_as_ushort(__float2half_rn(xf[2 * i]));
+        unsigned hi = __half_as_ushort(__float2half_rn(xf[2 * i + 1]));
+        xw[i] = lo | (hi << 16);
+      }
+      unsigned a = 0u;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(xw[i]), "r"(d0[i]));
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(xw[4 + i]), "r"(d1[i]));
+      }
+      __half2 ah = __halves2half2(__ushort_as_half(a & 0xffff), __ushort_as_half(a >> 16));
+      acc[m] = fmaf(sc[g], __low2float(ah) + __high2float(ah), acc[m]);
+    }
+  }
+}
 """
 
 
@@ -1087,6 +1146,75 @@ def make_linear_fp4_gemv_sm70(target: str, GROUP: int = 4):
         return Y
 
     return linear_fp4_gemv_sm70
+
+
+def make_linear_fp4_gemv_sm70_m(target: str, M: int = 8, GROUP: int = 4):
+    """M-row (decode-batch) twin of make_linear_fp4_gemv_sm70.
+
+    X[M,K] f32, WQ[N,K//2] fp16-TWIDDLED, Scale[N,K//block] f32, OScale[N] f32,
+    Res[M,N] f32 -> Y[M,N] f32. WQ is loaded + decoded ONCE per tile and reused
+    across all M rows (tl_fp4_gemv_tiles_f16_m), so the weight bytes — the
+    bottleneck — do not scale with M. This is the sm70 decode-batch path
+    (M=2..16), replacing the per-row GEMV loop (M launches/layer, OOM-prone).
+    M is a compile-time factory arg; the backend pads M up and slices.
+    """
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def linear_fp4_gemv_sm70_m(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
+        N, K = T.const("N, K")
+        micro = 16  # one scale block (NVFP4 block=16); 8 twiddled bytes = 1 decode pair
+        block_K = reduce_thread * micro
+        num_ko = T.ceildiv(K, block_K)
+        num_g = num_ko // GROUP
+        X: T.Tensor((M, K), "float32")
+        WQ: T.Tensor((N, K // 2), "uint8")
+        Scale: T.Tensor((N, K // block), "float32")
+        OScale: T.Tensor((N,), "float32")
+        Res: T.Tensor((M, N), "float32")
+        Y = T.empty((M, N), "float32")
+        with T.Kernel(T.ceildiv(N, n_partition), threads=(reduce_thread, n_partition)) as bx:
+            T.import_source(_FP4_TWIDDLE_SRC_F16)
+            kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
+            ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
+            n = bx * n_partition + ni
+            acc = T.alloc_local((M,), "float32")
+            for m in T.unroll(M):
+                acc[m] = 0.0
+            sc = T.alloc_local((GROUP,), "float32")
+            for kg in T.serial(num_g):
+                base = kg * GROUP * block_K + kr * micro
+                for g in T.unroll(GROUP):
+                    sc[g] = Scale[n, (base + g * block_K) // block]
+                T.call_extern(
+                    f"tl_fp4_gemv_tiles_f16_m<{GROUP},{M}>",
+                    T.access_ptr(WQ[n, base // 2], "r"),
+                    T.access_ptr(X[0, base], "r"),
+                    K,
+                    block_K,
+                    T.access_ptr(sc, "r"),
+                    T.access_ptr(acc, "rw"),
+                    dtype="void",
+                )
+            for kt in T.serial(num_ko - num_g * GROUP):  # K-tail, one tile at a time
+                base = (num_g * GROUP + kt) * block_K + kr * micro
+                sc[0] = Scale[n, base // block]
+                T.call_extern(
+                    f"tl_fp4_gemv_tiles_f16_m<1,{M}>",
+                    T.access_ptr(WQ[n, base // 2], "r"),
+                    T.access_ptr(X[0, base], "r"),
+                    K,
+                    block_K,
+                    T.access_ptr(sc, "r"),
+                    T.access_ptr(acc, "rw"),
+                    dtype="void",
+                )
+            T.call_extern(f"tl_warp_reduce_m_f16<{M}>", T.access_ptr(acc, "rw"), dtype="void")
+            if kr == 0:
+                for m in T.unroll(M):
+                    Y[m, n] = Res[m, n] + acc[m] * OScale[n]
+        return Y
+
+    return linear_fp4_gemv_sm70_m
 
 
 # ---------------------------------------------------------------- linear fp8 (GEMV)

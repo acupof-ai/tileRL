@@ -43,7 +43,7 @@ for (N, K) in [(4864, 4864), (4864, 13824), (13824, 4864), (4864, 32768)]:
         y = bk.linear_fp4(x_d, wq_d, sc_d)
     torch.cuda.synchronize()
     us = (time.perf_counter() - t0) / iters * 1e6
-    bytes_ = N * K * 0.5 + N * K * 4 + N * 4  # WQ + X(f32) + Y
+    bytes_ = N * K * 0.75 + K * 4 + N * 4  # WQ + scale(f32/16) + X(f32, once) + Y
     gbs = bytes_ / us / 1e3
     mbu = bytes_ / us / 1e3 / (HBM / 1e9) * 100
     print(f"{N:>6} {K:>6} {us:>10.1f} {mbu:>6.1f}% {gbs:>8.1f}")

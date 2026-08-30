@@ -128,6 +128,9 @@ _register("fp4", "sm90", _SM90_KERNELS)
 _SM70_KERNELS = {
     **_CPU_KERNELS,
     "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv_sm70,
+    # M-row decode-batch GEMV (M=8, padded): W loaded+decoded once, reused across
+    # rows — replaces the per-row GEMV loop (M launches/layer, OOM-prone at B=8).
+    "linear_fp4_gemv_sm70_m": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(t, M=8),
     # Both fix graph capture: gdn_decode_fused and write_tokens replace eager
     # fallbacks whose per-token int(device_tensor) host syncs break it.
     "gdn_decode_fused": lambda t: kernels_gdn.make_gdn_decode_fused(t, out_dtype="float32"),

@@ -532,16 +532,23 @@ class Backend:
                 self._kernel(kernel)(xq, wq, scale, ascale, y2, bM, bN, blk, _THREADS)
                 y2 = y2[:M, :N]
         else:
-            # sm70 M>1: no twiddle-aware M>1 kernel, and the generic kernel
-            # decodes natural nibbles — but sm70's served bytes are fp16-twiddled.
-            # Loop the M=1 GEMV (twiddle-aware) over rows: correct, M launches
-            # (prefill only). ponytail: an sm70 M>1 twiddle kernel is the upgrade
-            # if prefill gets hot; an untwiddle copy OOMs here (the forward's GPU
-            # is full, the scratch that motivated eager materialize twiddle).
+            # sm70 M>1: the generic kernel decodes natural nibbles, but sm70's
+            # served bytes are fp16-twiddled. M<=8 (decode batch) uses the M-row
+            # twiddle GEMV — one launch, W loaded+decoded once and reused across
+            # rows (the per-row loop it replaces OOMs at B=8 and is M launches/
+            # layer). M>8 (prefill) still loops the M=1 GEMV per row. An
+            # untwiddle copy OOMs here (the forward's GPU is full — the scratch
+            # that motivated eager materialize twiddle).
             if self.arch == "sm70" and getattr(wq, "_tl_layout", "natural") != "natural":
                 k1, _, Np, Kp, _, bN = self._plan("linear_fp4", 1, N, K)
                 wq1, sc1 = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
                 osc1 = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
+                if M <= 8:
+                    y2 = self._kernel("linear_fp4_gemv_sm70_m")(
+                        _pad2d(x2, 8, Kp), wq1, sc1, osc1, self._zeros2(8, Np), 32, bN, blk
+                    )[:M, :N]
+                    y = self._epilogue(y2, None, lead, N)
+                    return y if residual is None else y + residual
                 rows = [
                     self._kernel(k1)(
                         _pad2d(x2[m : m + 1], 1, Kp), wq1, sc1, osc1,
