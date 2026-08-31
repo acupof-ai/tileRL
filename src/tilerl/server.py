@@ -212,7 +212,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         )
         return engine.submit(input_ids, params), len(input_ids), params.max_new_tokens
 
-    def _await_completion(request_id: int, timeout_s: float = 600.0) -> list[int]:
+    def _await_completion(request_id: int, timeout_s: float = 1800.0) -> list[int]:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             # take() pops only this request: poll() would steal other
