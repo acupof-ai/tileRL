@@ -43,27 +43,30 @@ def main() -> None:
     B, H, Hkv, D, BLOCK = 1, 4, 2, 64, 16
     dev = backend.device
     # Lengths straddling BLOCK=16 and KVSPLIT=16 so empty and ragged slices,
-    # and slices shorter than one page, are all exercised.
+    # and slices shorter than one page, are all exercised. S>1 is a speculative
+    # verify width: each query gets its own causal window, which is the part a
+    # split can silently get wrong.
     for n in (1, 15, 16, 17, 37, 100, 129):
-        nb = (n + BLOCK - 1) // BLOCK
-        q = torch.randn(B, H, D, device=dev)
-        kc = torch.randn(nb, Hkv, BLOCK, D, device=dev)
-        vc = torch.randn(nb, Hkv, BLOCK, D, device=dev)
-        bt = torch.arange(nb, dtype=torch.int32, device=dev).unsqueeze(0)
-        sl = torch.tensor([n], dtype=torch.int32, device=dev)
-        sql = torch.tensor([1], dtype=torch.int32, device=dev)
-        scale = D**-0.5
+        for S in (1, 2, 4):
+            if n < S:
+                continue
+            nb = (n + BLOCK - 1) // BLOCK
+            q = torch.randn(B, S, H, D, device=dev)
+            kc = torch.randn(nb, Hkv, BLOCK, D, device=dev)
+            vc = torch.randn(nb, Hkv, BLOCK, D, device=dev)
+            bt = torch.arange(nb, dtype=torch.int32, device=dev).unsqueeze(0)
+            sl = torch.tensor([n], dtype=torch.int32, device=dev)
+            sql = torch.tensor([S], dtype=torch.int32, device=dev)
+            scale = D**-0.5
 
-        po, pm, pl = split(q, kc, vc, bt, sl, float(scale), BLOCK, 64)
-        got = combine(po, pm, pl, 64)
-        ref = generic(
-            q.unsqueeze(1), kc, vc, bt, sl, sql, float(scale), block_size=BLOCK, threads=64
-        ).squeeze(1)
+            po, pm, pl = split(q, kc, vc, bt, sl, sql, float(scale), BLOCK, 64)
+            got = combine(po, pm, pl, 64)
+            ref = generic(q, kc, vc, bt, sl, sql, float(scale), block_size=BLOCK, threads=64)
 
-        d = (got.float() - ref.float()).abs().max().item()
-        ok = torch.allclose(got.float(), ref.float(), rtol=1e-2, atol=1e-3)
-        print(f"n={n:4d}  max|split-generic|={d:.3e}  {'OK' if ok else 'FAIL'}")
-        assert ok, f"split-KV attention diverges from generic at n={n}: {d}"
+            d = (got.float() - ref.float()).abs().max().item()
+            ok = torch.allclose(got.float(), ref.float(), rtol=1e-2, atol=1e-3)
+            print(f"n={n:4d} S={S}  max|split-generic|={d:.3e}  {'OK' if ok else 'FAIL'}")
+            assert ok, f"split-KV diverges from generic at n={n} S={S}: {d}"
 
     print(f"parity OK ({tgt})")
 

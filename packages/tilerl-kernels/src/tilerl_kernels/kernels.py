@@ -694,34 +694,43 @@ def make_paged_attention(target: str):
 
 
 def make_paged_attention_split(target: str, KVSPLIT: int = 16):
-    """Phase 1 of split-KV decode: per-slice online-softmax partials.
+    """Phase 1 of split-KV attention: per-slice online-softmax partials.
 
-    Q [B, H, D], K/V cache [num_blocks, Hkv, BLOCK, D], BlockTable [B, Mb],
-    SeqLens [B] (history length including the decode token). Writes
-    PO [B, H, KVSPLIT, D] (unnormalized accumulator), PM/PL [B, H, KVSPLIT]
-    (running max and sum). An empty slice emits m=-inf, l=0 so the combine
-    weights it to zero.
+    Q [B, S, H, D], K/V cache [num_blocks, Hkv, BLOCK, D], BlockTable [B, Mb],
+    SeqLens [B] (total length after this forward), SeqQLens [B] (valid query
+    positions per row). Query s sees keys [0, seq_lens - S + s) — the same
+    causal rule as the dense kernel, so a speculative verify at S>1 is served
+    here too, not just S=1 decode. Writes PO [B, S, H, KVSPLIT, D] (unnormalized
+    accumulator), PM/PL [B, S, H, KVSPLIT] (running max and sum). An empty slice
+    emits m=-inf, l=0 so the combine weights it to zero.
+
+    S enters the GRID, so W verify positions run concurrently instead of the
+    dense kernel's serial ``for t in T.serial(S)``: at S=4 that kernel measured
+    1018 ms against 39 ms at S=1, because its cost is S*history in one thread.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
-    def paged_attention_split(Q, KCache, VCache, BlockTable, SeqLens, scale: T.float32,
-                              block_size, threads):
-        B, H, D = T.const("B, H, D")
+    def paged_attention_split(Q, KCache, VCache, BlockTable, SeqLens, SeqQLens,
+                              scale: T.float32, block_size, threads):
+        B, S, H, D = T.const("B, S, H, D")
         Hkv = T.const("Hkv")
         NB = T.const("NB")
         Mb = T.const("Mb")
-        Q: T.Tensor((B, H, D), "float32")
+        Q: T.Tensor((B, S, H, D), "float32")
         KCache: T.Tensor((NB, Hkv, block_size, D), "float32")
         VCache: T.Tensor((NB, Hkv, block_size, D), "float32")
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
-        PO = T.empty((B, H, KVSPLIT, D), "float32")
-        PM = T.empty((B, H, KVSPLIT), "float32")
-        PL = T.empty((B, H, KVSPLIT), "float32")
-        with T.Kernel(KVSPLIT, H, B, threads=threads) as (sp, hh, bb):
+        SeqQLens: T.Tensor((B,), "int32")
+        PO = T.empty((B, S, H, KVSPLIT, D), "float32")
+        PM = T.empty((B, S, H, KVSPLIT), "float32")
+        PL = T.empty((B, S, H, KVSPLIT), "float32")
+        with T.Kernel(KVSPLIT, S * H, B, threads=threads) as (sp, th, bb):
+            tt = th // H
+            hh = th % H
             hkv = hh * Hkv // H
-            n = SeqLens[bb]
-            # Ceil-divide the history into KVSPLIT contiguous slices.
+            # Causal bound for THIS query: the dense kernel's hist + t + 1.
+            n = SeqLens[bb] - SeqQLens[bb] + tt + 1
             per = T.ceildiv(n, KVSPLIT)
             p0 = sp * per
             p1 = T.min(n, p0 + per)
@@ -732,13 +741,15 @@ def make_paged_attention_split(target: str, KVSPLIT: int = 16):
             l[0] = 0.0
             for d in T.Parallel(D):
                 acc[d] = 0.0
+            # A padded query row (tt >= SeqQLens) still runs: its window is
+            # bounded by n above, and the caller never reads its output.
             for pos in T.serial(p1 - p0):
                 blk = BlockTable[bb, (p0 + pos) // block_size]
                 off = (p0 + pos) % block_size
                 s = T.alloc_fragment((1,), "float32")
                 s[0] = 0.0
                 for d in T.serial(D):
-                    s[0] += Q[bb, hh, d] * KCache[blk, hkv, off, d]
+                    s[0] += Q[bb, tt, hh, d] * KCache[blk, hkv, off, d]
                 s[0] = s[0] * scale
                 m_new = T.max(m[0], s[0])
                 corr = T.exp(m[0] - m_new)
@@ -748,9 +759,9 @@ def make_paged_attention_split(target: str, KVSPLIT: int = 16):
                     acc[d] = acc[d] * corr + p * VCache[blk, hkv, off, d]
                 m[0] = m_new
             for d in T.Parallel(D):
-                PO[bb, hh, sp, d] = acc[d]
-            PM[bb, hh, sp] = m[0]
-            PL[bb, hh, sp] = l[0]
+                PO[bb, tt, hh, sp, d] = acc[d]
+            PM[bb, tt, hh, sp] = m[0]
+            PL[bb, tt, hh, sp] = l[0]
         return PO, PM, PL
 
     return paged_attention_split
@@ -759,31 +770,33 @@ def make_paged_attention_split(target: str, KVSPLIT: int = 16):
 def make_paged_attention_split_combine(target: str, KVSPLIT: int = 16):
     """Phase 2: merge the slice partials.
 
-    Out[b,h,d] = sum_s w_s PO[s,d] / sum_s w_s PL[s], w_s = exp(PM_s - max PM).
+    Out[b,s,h,d] = sum_j w_j PO[j,d] / sum_j w_j PL[j], w_j = exp(PM_j - max PM).
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def paged_attention_split_combine(PO, PM, PL, threads):
-        B, H, D = T.const("B, H, D")
-        PO: T.Tensor((B, H, KVSPLIT, D), "float32")
-        PM: T.Tensor((B, H, KVSPLIT), "float32")
-        PL: T.Tensor((B, H, KVSPLIT), "float32")
-        Out = T.empty((B, H, D), "float32")
-        with T.Kernel(H, B, threads=threads) as (hh, bb):
+        B, S, H, D = T.const("B, S, H, D")
+        PO: T.Tensor((B, S, H, KVSPLIT, D), "float32")
+        PM: T.Tensor((B, S, H, KVSPLIT), "float32")
+        PL: T.Tensor((B, S, H, KVSPLIT), "float32")
+        Out = T.empty((B, S, H, D), "float32")
+        with T.Kernel(S * H, B, threads=threads) as (th, bb):
+            tt = th // H
+            hh = th % H
             m = T.alloc_fragment((1,), "float32")
             l = T.alloc_fragment((1,), "float32")
             m[0] = -1.0e30
             for sp in T.serial(KVSPLIT):
-                m[0] = T.max(m[0], PM[bb, hh, sp])
+                m[0] = T.max(m[0], PM[bb, tt, hh, sp])
             l[0] = 0.0
             for sp in T.serial(KVSPLIT):
-                l[0] += T.exp(PM[bb, hh, sp] - m[0]) * PL[bb, hh, sp]
+                l[0] += T.exp(PM[bb, tt, hh, sp] - m[0]) * PL[bb, tt, hh, sp]
             for d in T.Parallel(D):
                 o = T.alloc_fragment((1,), "float32")
                 o[0] = 0.0
                 for sp in T.serial(KVSPLIT):
-                    o[0] += T.exp(PM[bb, hh, sp] - m[0]) * PO[bb, hh, sp, d]
-                Out[bb, hh, d] = o[0] / l[0]
+                    o[0] += T.exp(PM[bb, tt, hh, sp] - m[0]) * PO[bb, tt, hh, sp, d]
+                Out[bb, tt, hh, d] = o[0] / l[0]
         return Out
 
     return paged_attention_split_combine
