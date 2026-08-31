@@ -41,7 +41,7 @@ def _questions(n: int, seed: int):
             [ds[i]["subject"] for i in idx])
 
 
-def score_tilerl(source: str, prompts: list[str]) -> list[str]:
+def score_tilerl(source: str, prompts: list[str], slots: int = 64, blocks: int = 2048) -> list[str]:
     """One greedy letter per prompt through tileRL's engine."""
     from tilerl.config import qwen38_27b
     from tilerl.engine import SamplingParams, build_engine
@@ -51,7 +51,7 @@ def score_tilerl(source: str, prompts: list[str]) -> list[str]:
 
     backend = get_backend()
     model = load_hf(qwen38_27b(), source, fuse_projections=True)
-    engine = build_engine(model.cfg, model, backend, num_blocks=2048, num_slots=64, max_batch=8,
+    engine = build_engine(model.cfg, model, backend, num_blocks=blocks, num_slots=slots, max_batch=8,
                           max_total_tokens=8192)
     tok = get_tokenizer(source)
     # multiple choice = argmax over the four letter tokens (with and without a
@@ -62,7 +62,7 @@ def score_tilerl(source: str, prompts: list[str]) -> list[str]:
     texts: list = [None] * len(prompts)
     pending, todo = {}, list(enumerate(prompts))
     while pending or todo:
-        while todo and len(pending) < 32:  # submit allocates a state slot eagerly
+        while todo and len(pending) < slots:  # submit allocates a state slot eagerly
             i, p = todo.pop()
             pending[engine.submit(tok.encode(p), sp)] = i
         engine.step()
@@ -79,10 +79,10 @@ def letter(t: str | None) -> str:
     return m.group(1) if m else "?"
 
 
-def accuracy(source: str, n: int = 200, seed: int = 0) -> tuple[int, int]:
+def accuracy(source: str, n: int = 200, seed: int = 0, slots: int = 64, blocks: int = 2048) -> tuple[int, int]:
     """MMLU 0-shot correct/total through tileRL — the harness's accuracy gate."""
     prompts, golds, _ = _questions(n, seed)
-    preds = [letter(t) for t in score_tilerl(source, prompts)]
+    preds = [letter(t) for t in score_tilerl(source, prompts, slots=slots, blocks=blocks)]
     return sum(p == g for p, g in zip(preds, golds)), len(preds)
 
 
@@ -93,6 +93,8 @@ def main() -> None:
     ap.add_argument("--gpu", type=int, default=7)
     ap.add_argument("--n", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--slots", type=int, default=64, help="GDN state slots (reduce on <40GB GPUs)")
+    ap.add_argument("--blocks", type=int, default=2048, help="KV pool blocks")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -101,7 +103,7 @@ def main() -> None:
 
     if args.engine == "tilerl":
         os.environ.setdefault("TILERL_TARGET", "cuda")
-        texts = score_tilerl(args.source, prompts)
+        texts = score_tilerl(args.source, prompts, slots=args.slots, blocks=args.blocks)
     else:
         import sglang
 
