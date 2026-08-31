@@ -115,6 +115,8 @@ class ChatCompletionRequest(BaseModel):
     #: return log p of each sampled token (OpenAI's field name); the engine
     #: scores from the logits the draw used, so no second forward
     logprobs: bool | None = None
+    #: vLLM/sglang-style template overrides, e.g. {"enable_thinking": false}
+    chat_template_kwargs: dict | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -140,7 +142,7 @@ def _message_text(message: ChatMessage) -> str:
     return "".join(part.get("text", "") for part in content if isinstance(part, dict))
 
 
-def _render_chat(messages: list[ChatMessage]) -> str:
+def _render_chat(messages: list[ChatMessage], enable_thinking: bool | None = None) -> str:
     # ChatML — the format Qwen3.x was trained on, and what the stop set
     # already assumes (_HfTokenizerAdapter.stop_token_ids). The old
     # role-prefixed plain text contradicted it: the model never sees the
@@ -148,7 +150,13 @@ def _render_chat(messages: list[ChatMessage]) -> str:
     # the real tokenizer/checkpoint (day-2, zero-code onboarding); Qwen's
     # template renders this same string.
     rendered = "".join(f"<|im_start|>{m.role}\n{_message_text(m)}<|im_end|>\n" for m in messages)
-    return f"{rendered}<|im_start|>assistant\n"
+    suffix = "<|im_start|>assistant\n"
+    # Qwen3's template: enable_thinking=False pre-fills an empty thinking
+    # block so the model answers directly; the default opens <think>\n and
+    # the model fills it. Without the prefix the model opens it on its own.
+    if enable_thinking is False:
+        suffix += "<think>\n\n</think>\n\n"
+    return f"{rendered}{suffix}"
 
 
 def _chat_chunk(
@@ -187,7 +195,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     app_started = int(time.time())
 
     def _submit(req: ChatCompletionRequest) -> tuple[int, int, int]:
-        prompt = _render_chat(req.messages)
+        et = req.chat_template_kwargs.get("enable_thinking") if req.chat_template_kwargs else None
+        prompt = _render_chat(req.messages, enable_thinking=et)
         input_ids = tokenizer.encode(prompt)
         if not input_ids:
             raise ValueError("empty prompt after tokenization")

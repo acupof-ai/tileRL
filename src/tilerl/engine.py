@@ -1211,8 +1211,15 @@ class Engine:
     def _loop(self) -> None:
         while not self._wake.is_set():
             with self._lock:
-                busy = bool(self._running or self._waiting)
-            if busy:
+                has_running = bool(self._running)
+                has_waiting = bool(self._waiting)
+            if has_running or has_waiting:
+                # Batch concurrent submissions: a burst of HTTP requests
+                # arrives over ~10ms. Without this window the first one
+                # starts a prefill alone and the rest land in eager mixed
+                # ticks (decode graph off, ~10x slower per tick).
+                if not has_running and has_waiting:
+                    self._wake.wait(0.01)
                 try:
                     self.step()
                 except Exception:

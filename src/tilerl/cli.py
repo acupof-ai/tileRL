@@ -54,7 +54,7 @@ def _build_model(
 
 
 def _build_engine(cfg, model, backend, devices=None):
-    """Wire the engine with the serving-size pools (256 blocks / 16 slots).
+    """Wire the engine with the serving-size pools (512 blocks / 16 slots).
 
     ``devices``: replicate across these CUDA indices instead of one. The 27B in
     NVFP4 is 23 GB against a 96 GB card, so a replica per device costs memory
@@ -63,7 +63,7 @@ def _build_engine(cfg, model, backend, devices=None):
     """
     from . import engine as engine_mod
 
-    kw = dict(num_blocks=256, num_slots=16, max_batch=8, max_total_tokens=8192)
+    kw = dict(num_blocks=512, num_slots=16, max_batch=8, max_total_tokens=8192)
     if not devices:
         return engine_mod.build_engine(cfg, model, backend, **kw)
 

@@ -4,6 +4,15 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-31 — phase exit: server B=8 2.8 → 12.9 tok/s (prefill batching + enable_thinking + 8K ctx)
+
+- Daemon ran `step()` between HTTP arrivals, splitting a concurrent burst into
+  eager mixed ticks (decode graph off). 10 ms batching window when idle +
+  waiting → 1 prefill for 8 requests (was 17 + 6 mixed).
+- `chat_template_kwargs.enable_thinking: false` now works (was silently
+  dropped); `num_blocks=256 → 512` for 8K context.
+  [wins/2026-08-31-server-prefill-batching.md](docs/experience/wins/2026-08-31-server-prefill-batching.md)
+
 ## 2026-08-31 — phase exit: sm70 prefill 64.9s → 15.1s (gdn_chunk_fused registered)
 
 - `gdn_chunk_fused` was only in `_SM90_KERNELS`; sm70 fell back to
