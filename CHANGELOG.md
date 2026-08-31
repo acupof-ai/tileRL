@@ -4,6 +4,19 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-31 — phase exit: sm70 prefill 64.9s → 15.1s (gdn_chunk_fused registered)
+
+- `gdn_chunk_fused` was only in `_SM90_KERNELS`; sm70 fell back to
+  `reference.gdn_forward` (Python serial scan, ~250k eager ops for 8×64
+  tokens, 62s of the 64s tick 1). One-line registry fix: the kernel is
+  target-neutral TileLang, compiles and runs on V100 unchanged.
+- Also shipped: `linear_fp4_gemv_sm70_m32` (M=32 prefill chunking, 32× fewer
+  launches than the per-row M=1 loop; parity PASS M=1/8/16/32, worst 6.17e-4)
+  and `build_engine(kv_tier_path=...)` (SSD KvTier wired, was tier=None).
+- Decode unchanged: 260ms/tick, 99.1% GPU, 0.9% Python. The decode tick is
+  not Python-bound; the prefill was (eager mode, no graph capture).
+  [wins/2026-08-31-sm70-gdn-chunk-fused.md](docs/experience/wins/2026-08-31-sm70-gdn-chunk-fused.md)
+
 ## 2026-08-31 — phase exit: B=8 decode on sm70, 1.3 -> 31.8 tok/s
 
 - The M-row fp4 GEMV (`linear_fp4_gemv_sm70_m`) loads+decodes W once per tile
