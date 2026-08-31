@@ -62,12 +62,11 @@ def main() -> None:
     model.params = backend.materialize(model.params)
     draft = load_draft(model, args.draft)
     if args.fp4 or args.fp8:
-        draft.params.update(
-            backend.materialize(_quantize_draft(draft.params, fp4=args.fp4))
-        )
-        for k in [k for k, v in list(draft.params.items())
-                  if v.ndim == 2 and v.shape[0] >= 128 and v.shape[1] >= 128]:
-            del draft.params[k]  # drop the dense twin so Model._linear takes the quantized path
+        # _quantize_draft renames the [N,K] projections (fc -> fc.wq etc), so the
+        # dense originals are already gone from its output; feeding it the head's
+        # own dict and taking the result wholesale is the whole swap.
+        draft.params = backend.materialize(_quantize_draft(draft.params, fp4=args.fp4))
+        draft.layers.params = draft.params
     else:
         draft.params.update(backend.materialize(draft.params))
     fmt = "fp4" if args.fp4 else "fp8" if args.fp8 else "bf16"

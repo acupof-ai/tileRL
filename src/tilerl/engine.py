@@ -75,18 +75,25 @@ _PHASE_DONE = 3
 _HASH_MASK = 0x7FFFFFFF
 
 
-def _quantize_draft(params: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Re-serve a draft head's dense weights as block-quantized fp8.
+def _quantize_draft(params: dict[str, torch.Tensor], fp4: bool = False) -> dict[str, torch.Tensor]:
+    """Re-serve a draft head's dense weights block-quantized: fp8 by default,
+    fp4 where that is the arch's only fused GEMV (sm70 has no ``linear_fp8``).
 
     Norms, embeddings and anything 1-D stay as they are; only the [N,K]
     projections move, which is where all of the head's bulk and all of its time
-    is."""
+    is. ``Backend.materialize`` twiddles the emitted ``.wq`` into the arch's
+    layout, so this only produces the natural packing."""
     from tilerl_kernels import reference
 
     out: dict[str, torch.Tensor] = {}
     for k, v in params.items():
         if v.ndim == 2 and v.shape[0] >= 128 and v.shape[1] >= 128:
-            out[f"{k}.w8"], out[f"{k}.wscale"] = reference.quant_fp8(v)
+            if fp4:
+                wq, scale = reference.pack_fp4(v)
+                scale, oscale = reference.renorm_fp4_scale(scale)
+                out[f"{k}.wq"], out[f"{k}.scale"], out[f"{k}.oscale"] = wq, scale, oscale
+            else:
+                out[f"{k}.w8"], out[f"{k}.wscale"] = reference.quant_fp8(v)
         else:
             out[k] = v
     return out
@@ -385,28 +392,20 @@ class Engine:
         self._spec_depth = spec_depth if draft is not None else 0
         if draft is not None:
             # The head ships dense bf16, which Backend.linear serves on its
-            # generic path at ~30 GB/s: 9.7 ms per projection against 0.13 ms
-            # for the same shape on the trunk's fp8 kernel, so one draft step
-            # cost more than the whole 64-layer trunk forward. Serve it the way
-            # the trunk is served — Model._linear picks .w8/.wscale up itself.
-            # Only where a kernel consumes the format: sm70 has no linear_fp8,
-            # and quantizing without one routes every projection to the torch
-            # fallback instead.
-            if backend.has_kernel("linear_fp8"):
-                served = backend.materialize(_quantize_draft(draft.params))
-                # In place, never rebound: DraftHead.layers is a Model holding
-                # THIS dict, and a fresh one leaves it reading the original
-                # bf16 weights.
-                draft.params.clear()
-                draft.params.update(served)
-            else:
-                draft.params.update(backend.materialize(draft.params))
-            # ponytail: the draft step runs OUTSIDE the captured graph, one
-            # autoregressive step at a time, so it pays eager launch cost —
-            # measured 121 ms/step on sm70 against a 0.25 ms bandwidth floor,
-            # which makes speculation a net loss at every depth (3.1 tok/s at
-            # depth 6 vs 25.8 dense). Capturing the draft step is what makes it
-            # pay: at its floor, depth 6 projects to 62.7 tok/s.
+            # generic path — measured 6-9 GB/s at these shapes on sm70 (Backend.io
+            # is f32 there, so every bf16 weight is converted before the GEMM),
+            # 120.91 ms per draft step against the trunk's whole 103.58 ms eager
+            # forward. Serve it the way the trunk is served: Model._linear picks
+            # .w8/.wq up itself. The FORMAT follows the kernel — fp8 has no sm70
+            # cell, and quantizing to a format with no kernel routes every
+            # projection back to that same generic path. fp4 measured 4.98
+            # ms/step, 24x the dense path.
+            fp4 = not backend.has_kernel("linear_fp8")
+            served = backend.materialize(_quantize_draft(draft.params, fp4=fp4))
+            # In place, never rebound: DraftHead.layers is a Model holding THIS
+            # dict, and a fresh one leaves it reading the original bf16 weights.
+            draft.params.clear()
+            draft.params.update(served)
             if not 0 < spec_depth < BLOCK_TOKENS:
                 raise ValueError(f"spec_depth must be in [1, {BLOCK_TOKENS}), got {spec_depth}")
             self._draft_kv = PagedKvPool(
