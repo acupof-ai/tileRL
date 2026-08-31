@@ -1,6 +1,8 @@
 # Speculation loses on sm70: the draft step is outside the graph — 2026-08-31
 
-> Status: Diagnosed, fix pending
+> Status: **Superseded.** The draft loop does run outside the graph, but that is
+> not the dominant cost. See
+> [2026-08-31-m8-gemv-no-reuse-at-27b-shapes.md](2026-08-31-m8-gemv-no-reuse-at-27b-shapes.md).
 
 ## Context
 

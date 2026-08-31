@@ -1,6 +1,11 @@
 # Speculation on sm70: measured to the bottom, blocked on the GDN state path — 2026-08-31
 
-> Status: Diagnosed, not fixed. Speculation stays OFF.
+> Status: **ROOT CAUSE SUPERSEDED.** The step is `linear_fp4_gemv_sm70_m`, not
+> the GDN state path — per-kernel profiling puts GDN at 1.9-2.9 ms/tick against
+> 252 ms of GEMV. See
+> [2026-08-31-m8-gemv-no-reuse-at-27b-shapes.md](2026-08-31-m8-gemv-no-reuse-at-27b-shapes.md).
+> The measurements below (replay flat in W, the MTP quality numbers, the wrong
+> turns) all stand; only the attribution to gather/scatter is wrong.
 
 ## What works
 

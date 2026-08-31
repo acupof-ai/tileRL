@@ -134,3 +134,40 @@ direct measurement. Two worth remembering: an op-timing wrapper that calls
 caused (it told me `linear_fp4` was 69% of the tick — it was not), and my fp4
 profiler deleted the dense keys including `fc`, silently reverting to dense, which
 made me reject fp4 as slower when it is 24x faster.
+
+**CORRECTION — the blocker is one GEMV kernel, not GDN.** `profile_verify_replay.py`
+(already in the tree) attributes the verify replay per kernel:
+
+| W | replay | GEMV µs/call | GEMV total |
+|---:|---:|---:|---:|
+| 1 | 40.9 ms | 64.5 (`..._sm70`) | 32.1 ms |
+| 2 | 271.0 ms | 507.9 (`..._sm70_m`) | 252.4 ms |
+| 8 | 271.6 ms | 507.5 | 252.2 ms |
+
+GDN was 1.9-2.9 ms, attention 1.7 ms. So my gather/scatter root cause was WRONG —
+the whole 230 ms step is `linear_fp4_gemv_sm70_m`, and it is flat in W (W=2 pays
+the full M=8 tile).
+
+`scripts/ab_m8_reuse.py`: the M-row kernel's tile reuse works at N=K=4864 (1.65x
+for 8 rows) and fails at every 27B projection (6.2-7.5x) — where M=8 is worse
+PER ROW than M=1. 4864 is exactly the shape
+`wins/2026-08-30-sm70-fp16-twiddle-gemv.md` benchmarked; the kernel was never
+timed at the production shapes. Fixed at 1.65x, W=8 verify would be ~73 ms and
+depth 3 would give 30.7 tok/s, past dense. Entry:
+`errors/2026-08-31-m8-gemv-no-reuse-at-27b-shapes.md`.
+
+Ruled out for the 6-7x: weight re-decode (the decode is outside the `for m`
+loop), occupancy (>1200 blocks everywhere), converts (1280/thread at both K),
+X re-reads (0.8 ms of the ~1.0 ms gap — a contributor, not the cause). Next is
+ncu, not more arithmetic.
+
+**Workflow scoping (3 lanes) landed two corrections worth keeping.** My "an extra
+verify row costs 0.021 ms" was activations only and ignores ARITHMETIC: no fp4
+tensor cores, so each row redoes 37.3 GFLOP = 2.38 ms at 15.7 TFLOPS. Verify goes
+compute-bound past M~6.5, so the optimum width is M=8-16 and "32 candidates for
+4% more" was wrong; 60 tok/s needs 3.08 accepted tokens/forward at M=8, not 2.34.
+And tree TOPOLOGY is not data-dependent — fixed at capture, the parent/mask
+tensors are constants, so my graph-capture worry was unfounded. A cheaper tree
+shape also exists: k independent chains sharing the committed root, laid out
+contiguously, makes `Parent[t]==t-1` hold everywhere except k chain heads (~8
+lines in GDN) and turns the ancestor mask into one int32 offset vector.

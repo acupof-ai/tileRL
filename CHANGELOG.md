@@ -4,6 +4,18 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-31 — accept-or-reject verdict: speculation blocked on `linear_fp4_gemv_sm70_m`, not GDN
+
+- Supersedes the two earlier verdicts today. Per-kernel profiling of the verify
+  replay: the M-row GEMV is 507.5 µs/call against the M=1 kernel's 64.5 µs, 252 of
+  the 271 ms tick. GDN was 1.9-2.9 ms and attention 1.7 ms — both earlier root
+  causes were wrong.
+- The M-row kernel's tile reuse works at N=K=4864 (1.65× for 8 rows, the shape its
+  own win entry benchmarked) and fails at every 27B projection (6.2-7.5×), where
+  M=8 is worse PER ROW than M=1. Fixed at 1.65×, depth 3 gives 30.7 tok/s — past
+  dense 25.8. Also gates B=2..8 batch decode.
+  [errors/2026-08-31-m8-gemv-no-reuse-at-27b-shapes.md](docs/experience/errors/2026-08-31-m8-gemv-no-reuse-at-27b-shapes.md)
+
 ## 2026-08-31 — accept-or-reject verdict: speculation REJECTED on sm70, blocked on the GDN state path
 
 - Corrects the earlier "draft outside the graph" verdict. Pure graph replay is
