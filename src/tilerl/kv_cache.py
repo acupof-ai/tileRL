@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
@@ -386,7 +386,8 @@ class KvTier:
     #   latency bites; raw bf16 spill, fp8 tier-quant is 2x capacity if SSD fills
     """
 
-    def __init__(self, path: str, min_tokens: int = 2048, max_pending: int = 32) -> None:
+    def __init__(self, path: str, min_tokens: int = 2048, max_pending: int = 32,
+                 max_bytes: int = 100 * 2**30) -> None:
         import queue
         import shutil
         import threading
@@ -397,6 +398,12 @@ class KvTier:
         # spill_kv refuses — the graceful drop the store already handles.
         self._max_pending = max_pending
         self._healthy = True  # daemon failure (disk full/perm) flips this to refuse
+        # Size-based LRU: total on-disk bytes capped at max_bytes; the daemon
+        # evicts the least-recently-accessed entry's files after each write.
+        # has()/load_kv()/load_state() touch an entry to MRU.
+        self._max_bytes = max_bytes
+        self._lru: "OrderedDict[int, int]" = OrderedDict()
+        self._total = 0
         # Never rmtree the caller's path — it may be a shared dir. Own a fixed
         # subdir marked by a sentinel file; only wipe a dir that carries the
         # marker (a dead process's spill files are orphans, safe to clear).
@@ -435,12 +442,44 @@ class KvTier:
                 self._healthy = False
                 continue
             with self._lock:
-                if table.get(k) is blob:
+                still_pending = table.get(k) is blob
+                if still_pending:
                     table.pop(k, None)
-                    continue
+            if still_pending:
+                self._track_written(k, dst)
+                continue
             # a drop() landed mid-save: undo the write so the evicted prefix stays gone
             with contextlib.suppress(FileNotFoundError):
                 os.remove(dst)
+
+    def _track_written(self, key: int, path: str) -> None:
+        """Register a spilled file's size and evict LRU entries while over
+        ``max_bytes``. Called by the flush daemon after a successful save."""
+        try:
+            sz = os.path.getsize(path)
+        except OSError:
+            return
+        with self._lock:
+            self._lru[key] = self._lru.get(key, 0) + sz
+            self._lru.move_to_end(key)
+            self._total += sz
+            while self._total > self._max_bytes and len(self._lru) > 1:
+                victim = next(
+                    (k for k in self._lru if k not in self._pending and k not in self._pending_st),
+                    None,
+                )
+                if victim is None:
+                    break  # every entry is still being written
+                vs = self._lru.pop(victim)
+                self._total -= vs
+                for p in (self._kv(victim), self._st(victim)):
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(p)
+
+    def _touch_lru(self, key: int) -> None:
+        with self._lock:
+            if key in self._lru:
+                self._lru.move_to_end(key)
 
     def _kv(self, key: int) -> str:
         return os.path.join(self._dir, f"{key & _MASK64:016x}.kv")
@@ -481,6 +520,7 @@ class KvTier:
             blob = torch.load(self._kv(key), map_location="cpu")
         if blob.get("tokens") != tuple(tokens):
             return False  # hash collision: these bytes belong to a different prefix
+        self._touch_lru(key)
         for i, b in enumerate(blocks):
             pool.k_pool[:, b].copy_(blob["k"][i].to(pool.device))
             pool.v_pool[:, b].copy_(blob["v"][i].to(pool.device))
@@ -503,6 +543,7 @@ class KvTier:
             blob = torch.load(self._st(key), map_location="cpu")
         if blob.get("tokens") != tuple(tokens):
             return None
+        self._touch_lru(key)
         return blob["states"], blob["windows"]
 
     def has(self, key: int, tokens: tuple[int, ...]) -> bool:
@@ -521,12 +562,16 @@ class KvTier:
                 return False
             st = torch.load(self._st(key), map_location="cpu")
         t = tuple(tokens)
-        return kv.get("tokens") == t and st.get("tokens") == t
+        if kv.get("tokens") == t and st.get("tokens") == t:
+            self._touch_lru(key)
+            return True
+        return False
 
     def drop(self, key: int) -> None:
         with self._lock:
             self._pending.pop(key, None)
             self._pending_st.pop(key, None)
+            self._total -= self._lru.pop(key, 0)
         for p in (self._kv(key), self._st(key)):
             with contextlib.suppress(FileNotFoundError):
                 os.remove(p)

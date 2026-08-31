@@ -535,3 +535,43 @@ def test_tier_insert_retires_cold_twin(tmp_path):
     store.insert(toks, a2)
     cold_a = [e for e in store._cold.get(h, ()) if e.tokens == tuple(toks)]
     assert not cold_a, "cold twin of the re-published prefix was not retired"
+
+
+def test_tier_lru_evicts_oldest_over_cap(tmp_path):
+    """max_bytes caps on-disk usage: after each write the daemon evicts LRU
+    entries until under cap; a load touches the entry to MRU so it survives."""
+    import os
+    import time
+
+    from tilerl.kv_cache import KvTier
+
+    pool = PagedKvPool(16, 1, 4)
+    tier = KvTier(str(tmp_path / "kvt"), min_tokens=0, max_bytes=10**9)
+
+    def spill_wait(key, toks):
+        b = pool.alloc_block()
+        assert tier.spill_kv(key, toks, [b], pool)
+        for _ in range(200):
+            if key not in tier._pending:
+                break
+            time.sleep(0.01)
+        time.sleep(0.05)  # let the daemon finish _track_written
+        pool.free_block(b)
+
+    spill_wait(0xA, (1,))
+    one = tier._total
+    assert one > 0
+    tier._max_bytes = 2 * one + 1  # holds 2, evicts on the 3rd
+
+    spill_wait(0xB, (2,))
+    assert os.path.exists(tier._kv(0xA))  # 2 entries, under cap
+
+    # Touch A → MRU; B is now LRU.
+    fresh = pool.alloc_block()
+    assert tier.load_kv(0xA, (1,), [fresh], pool)
+    pool.free_block(fresh)
+
+    spill_wait(0xC, (3,))
+    assert not os.path.exists(tier._kv(0xB)), "LRU evicted the touched entry, not the LRU one"
+    assert os.path.exists(tier._kv(0xA)), "touched entry was evicted"
+    assert os.path.exists(tier._kv(0xC))

@@ -503,15 +503,15 @@ class Engine:
                 while len(blocks) < total_blocks:
                     blocks.append(self._kv.alloc_block())
                 # Cold hit: fill the matched blocks from the tier (the prefill it
-                # skips), and restore the GDN snapshot — both inside the try so a
-                # failure frees the slot + blocks instead of leaking them. Under
-                # the engine lock and after _match_prefix's has() check, a False
-                # here means the file vanished — a hard error, not a silent miss.
-                if reload_key is not None and (snap is None or not self._tier.load_kv(
-                    reload_key, tuple(tokens[:matched]),
-                    blocks[: matched // BLOCK_TOKENS], self._kv
-                )):
-                    raise RuntimeError(f"tier lost cold prefix {reload_key:016x}")
+                # skips), and restore the GDN snapshot. A False here means the LRU
+                # evicted the file between _match_prefix's has() and now — degrade
+                # to a miss: the blocks are already allocated, the prefill fills them.
+                if reload_key is not None and (
+                    snap is None
+                    or not self._tier.load_kv(reload_key, tuple(tokens[:matched]),
+                                              blocks[: matched // BLOCK_TOKENS], self._kv)
+                ):
+                    matched, reload_key, snap = 0, None, None
                 if matched:
                     snap_states, snap_windows = snap
                     self._states.states[slot].copy_(snap_states)
