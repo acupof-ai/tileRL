@@ -416,9 +416,11 @@ class Engine:
 
         # Prefix-boundary state snapshots, keyed by the matched token tuple
         # (collision-safe: a hash-only key could restore the wrong GDN state on
-        # a hash collision). One snapshot is 74.81 MiB at 27B, so it lives and
-        # dies with its store entry: the store drops ours on eviction, and a
-        # key present here is exactly a key the store still holds.
+        # a hash collision). One snapshot is 144 MiB at 27B (f32 pool), so it
+        # lives and dies with its store entry: the store drops ours on
+        # eviction, and a key present here is exactly a key the store still
+        # holds — which is why the store's capacity is byte-derived in
+        # build_engine, not the 4096-entry default.
         self._prefix_state: dict[tuple[int, ...], tuple[torch.Tensor, "torch.Tensor | None"]] = {}
         prefix_store.on_evict = lambda tokens, key: self._prefix_state.pop(tokens, None)
         # on_demote moves a spilled entry's GDN snapshot to the tier alongside it
@@ -1284,12 +1286,24 @@ def build_engine(
         conv_dim=cfg.linear_qkv_dim,
         spec_steps=1 + spec_depth if draft is not None else 0,
     )
+    # Every resident store entry owns a GDN state snapshot in HBM (144 MiB at
+    # 27B f32) and a decode publishes one every BLOCK_TOKENS, so on GPU the
+    # store's ENTRY cap must come from a byte budget: the 4096 default is 576
+    # GiB of snapshots and OOMs at ~1K context. Spend a quarter of the HBM
+    # still free after weights + pools; the KvTier (when configured) absorbs
+    # evictions via on_demote, so a small cap costs hits, not correctness.
+    kw = {}
+    if backend.device.type == "cuda":
+        snap = state_pool.states[0].nbytes
+        if state_pool.conv_windows is not None:
+            snap += state_pool.conv_windows[0, :, 0].nbytes
+        kw["capacity"] = max(1, int(torch.cuda.mem_get_info()[0] // 4) // max(snap, 1))
     if prefix_store is not None:
         store = prefix_store
     elif kv_tier_path:
-        store = PrefixStore(kv_pool, tier=KvTier(kv_tier_path))
+        store = PrefixStore(kv_pool, tier=KvTier(kv_tier_path), **kw)
     else:
-        store = PrefixStore(kv_pool)
+        store = PrefixStore(kv_pool, **kw)
     return Engine(
         model,
         backend,

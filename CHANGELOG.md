@@ -4,6 +4,15 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-31 — phase exit: B=1 long-context decode unblocked (prefix-snapshot OOM fixed)
+
+- `PrefixStore.capacity` counts ENTRIES, but each resident entry owns a 149.6
+  MiB GDN state snapshot in HBM — the 4096 default is 576 GiB, so eviction
+  never fired and B=1 at 1K ctx OOM'd after 18 publishes. Cap is now derived
+  from `mem_get_info` at build time on CUDA (resolves to 3 on the V100).
+- B=1 decode, 256-token slope: 20.3 tok/s @ 31 ctx · 8.7 @ 1K · 5.3 @ 2K.
+  [errors/2026-08-31-prefix-snapshot-oom.md](docs/experience/errors/2026-08-31-prefix-snapshot-oom.md)
+
 ## 2026-08-31 — phase exit: server B=8 2.8 → 12.9 tok/s (prefill batching + enable_thinking + 8K ctx)
 
 - Daemon ran `step()` between HTTP arrivals, splitting a concurrent burst into
