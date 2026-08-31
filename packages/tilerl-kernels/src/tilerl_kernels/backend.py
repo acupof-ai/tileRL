@@ -683,6 +683,27 @@ class Backend:
         if self.arch == "sm90" and s == 1 and "paged_attention_decode" in _resolve(self.precision, self.arch):
             # Pure decode: split-KV flash-decoding, the GQA group as the M tile.
             out = self._paged_attention_decode(q, k_cache, v_cache, block_table, seq_lens, scale)
+        elif (
+            self.arch == "sm70"
+            and s == 1
+            and "paged_attention_split" in _resolve(self.precision, self.arch)
+        ):
+            # Same idea without T.gemm/bf16 (sm70 has neither): the position
+            # loop is split across the grid, so B=1 fills the card instead of
+            # running H blocks at one thread each. Decode only — a prefill's
+            # per-query causal window makes the slices ragged.
+            po, pm, pl = self._kernel("paged_attention_split")(
+                self._f32(q.squeeze(1)),
+                self._f32(k_cache),
+                self._f32(v_cache),
+                self._i32(block_table).contiguous(),
+                self._i32(seq_lens).contiguous(),
+                float(scale),
+                int(k_cache.shape[2]),
+                _THREADS,
+            )
+            out = self._kernel("paged_attention_split_combine")(po, pm, pl, _THREADS)
+            out = out.unsqueeze(1)  # [B, H, D] -> [B, 1, H, D]
         elif self.arch == "sm90":
             # MMA kernel is bf16-IO and tiles queries at block_M: pad S to a
             # multiple (the kernel's history/mask use the true per-row lengths

@@ -141,6 +141,16 @@ _SM70_KERNELS = {
     # (Python serial scan, ~250k eager ops for 8×64 — 62s of the 64s tick 1).
     "gdn_chunk_fused": kernels_gdn.make_gdn_chunk_fused,
     "write_tokens": kernels_mma.make_write_tokens,
+    # Split-KV decode attention (S==1). sm70 ONLY: the kernel source is
+    # target-neutral, but the win comes from filling 80 SMs, so it is a loss
+    # where T.Kernel lowers to a serial loop (cpu/rocm) and unproven on metal.
+    # The generic kernel grids over (B, H) — 24 blocks at B=1 on the 27B, one
+    # active thread each (its dot is a serial fragment reduction), measured
+    # 0.76 ns/scalar-FMA = the single-thread rate.
+    "paged_attention_split": lambda t: kernels.make_paged_attention_split(t, KVSPLIT=16),
+    "paged_attention_split_combine": lambda t: kernels.make_paged_attention_split_combine(
+        t, KVSPLIT=16
+    ),
 }
 _register("bf16", "sm70", _SM70_KERNELS)
 _register("fp4", "sm70", _SM70_KERNELS)

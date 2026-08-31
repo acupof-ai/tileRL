@@ -45,11 +45,17 @@ def main() -> None:
     args = ap.parse_args()
 
     prompt = (FILLER * max(1, args.ctx // 10) + "\n" + TASK) if args.ctx else TASK
+    # Warmup: JIT compile and graph capture must land OUTSIDE both timed points.
+    # Without it a first-call compile inflates tlo and the slope reports a rate
+    # above the weight-bandwidth ceiling (289 tok/s once, vs a 64 tok/s floor).
+    one(prompt, args.lo)
     pt, glo, tlo = one(prompt, args.lo)
     _, ghi, thi = one(prompt, args.hi)
     if ghi <= glo:
         raise SystemExit(f"EOS too early: {glo} -> {ghi} tokens; use a longer-output task")
-    rate = (ghi - glo) / max(thi - tlo, 1e-3)
+    if thi <= tlo:
+        raise SystemExit(f"hi ran faster than lo ({thi:.2f}s <= {tlo:.2f}s): unwarmed or noisy")
+    rate = (ghi - glo) / (thi - tlo)
     print(f"prompt_tok={pt}  {glo}tok={tlo:.2f}s  {ghi}tok={thi:.2f}s")
     print(f"decode={rate:.1f} tok/s  ({1000 / rate:.0f} ms/tok)  over {ghi - glo} tokens")
 

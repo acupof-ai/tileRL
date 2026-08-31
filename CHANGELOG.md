@@ -4,6 +4,17 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-31 — phase exit: sm70 decode 2K ctx 5.3 → 20.5 tok/s (split-KV attention)
+
+- Generic `paged_attention` grids over `(B, H)`: 24 blocks at B=1 on an 80-SM
+  card, and its `T.serial(D)` dot means one active thread per block. Measured
+  0.76 ns/scalar-FMA = 1.16 clocks, the single-thread rate. Split the position
+  loop across the grid instead — parallelism from the grid, not a fragment
+  reduction, so the Metal constraint holds and `T.serial(D)` stays.
+- 25.8 / 23.1 / 20.5 tok/s at 31 / 1K / 2K (was 20.3 / 8.7 / 5.3); falloff
+  3.8× → 20%. sm70 cell only, dispatch arch-gated.
+  [wins/2026-08-31-sm70-split-kv-decode-attention.md](docs/experience/wins/2026-08-31-sm70-split-kv-decode-attention.md)
+
 ## 2026-08-31 — phase exit: B=1 long-context decode unblocked (prefix-snapshot OOM fixed)
 
 - `PrefixStore.capacity` counts ENTRIES, but each resident entry owns a 149.6
