@@ -1,5 +1,5 @@
 """Long-context benchmark through the running server: TTFT + decode tok/s at
-1K/4K/8K/16K prompt tokens, B=1. Two requests per length: max_tokens=1 gives
+1K/2K/4K prompt tokens, B=1. Two requests per length: max_tokens=1 gives
 TTFT (prefill + 1 decode), max_tokens=33 gives decode rate from the delta.
 
   python3 scripts/bench_long_context.py
@@ -12,15 +12,13 @@ import urllib.request
 URL = "http://localhost:8000/v1/chat/completions"
 MODEL = "qwen38-27b"
 
-FILLER = (
-    "The quick brown fox jumps over the lazy dog. "
-    "Pack my box with five dozen liquor jugs. "
-    "How vexingly quick daft zebras jump. "
-)
+# One sentence ~10 tokens; repeat to hit the target. The server reports the
+# real prompt_tokens, so the target is approximate.
+FILLER = "The quick brown fox jumps over the lazy dog. "
 
 
 def make_prompt(target_tokens: int) -> str:
-    reps = max(1, target_tokens // 14)  # ~14 tokens per repetition
+    reps = max(1, target_tokens // 10)
     return FILLER * reps + "\nSummarize the above in one sentence."
 
 
@@ -43,7 +41,7 @@ def one(prompt: str, max_tokens: int) -> tuple[int, float]:
 
 def main() -> None:
     print(f"{'prompt_tok':>10} {'ttft_s':>8} {'decode_t/s':>11} {'wall_33_s':>10}")
-    for target in (1024, 4096, 8192, 16384):
+    for target in (1024, 2048, 4096):
         prompt = make_prompt(target)
         pt, t1 = one(prompt, 1)  # TTFT ≈ prefill + 1 decode
         _, t33 = one(prompt, 33)  # prefill + 33 decode
