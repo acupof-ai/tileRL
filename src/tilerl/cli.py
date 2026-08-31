@@ -53,17 +53,25 @@ def _build_model(
     )
 
 
-def _build_engine(cfg, model, backend, devices=None):
+def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2):
     """Wire the engine with the serving-size pools (512 blocks / 16 slots).
 
     ``devices``: replicate across these CUDA indices instead of one. The 27B in
     NVFP4 is 23 GB against a 96 GB card, so a replica per device costs memory
     the cards already have and measures 7.54x on 8 (wins/
     2026-08-29-data-parallel-scales.md).
+
+    ``draft``: an MTP/NextN head safetensors path (or the checkpoint shard that
+    carries the mtp.* keys) turning speculative decode on. On a
+    bandwidth-bound card the verify rows are nearly free — one trunk forward
+    reads 14 GB of weights regardless of how many candidate tokens it checks —
+    so the draft is what gets past the dense roofline.
     """
     from . import engine as engine_mod
 
     kw = dict(num_blocks=512, num_slots=16, max_batch=8, max_total_tokens=8192)
+    if draft is not None:
+        kw["draft"], kw["spec_depth"] = draft, depth
     if not devices:
         return engine_mod.build_engine(cfg, model, backend, **kw)
 
@@ -99,7 +107,13 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     backend = get_backend()
     cfg, model = _build_model(args.model, seed=0, fuse_projections=True)
-    engine = _build_engine(cfg, model, backend, devices=args.devices)
+    draft = None
+    if args.draft:
+        from .spec import load_draft
+
+        draft = load_draft(model, args.draft)
+    engine = _build_engine(cfg, model, backend, devices=args.devices,
+                           draft=draft, depth=args.depth)
     tokenizer = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
@@ -393,6 +407,10 @@ def _build_parser() -> argparse.ArgumentParser:
                               "the others down while HTTP keeps answering; for independent endpoints "
                               "run one process per card under CUDA_VISIBLE_DEVICES instead.",
                          type=lambda v: [int(x) for x in v.split(",")] if v else [])
+    p_serve.add_argument("--draft", help="MTP/NextN head safetensors: speculative decode. For "
+                                        "Qwen3.8-27B-NVFP4 the mtp.* keys all live in "
+                                        "model-00018-of-00018.safetensors, so pass that shard.")
+    p_serve.add_argument("--depth", type=int, default=2, help="drafts per row per tick")
     p_serve.set_defaults(func=cmd_serve)
 
     p_train = sub.add_parser("train", help="train a model on random-token batches")

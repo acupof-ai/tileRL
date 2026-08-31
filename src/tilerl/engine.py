@@ -389,11 +389,24 @@ class Engine:
             # for the same shape on the trunk's fp8 kernel, so one draft step
             # cost more than the whole 64-layer trunk forward. Serve it the way
             # the trunk is served — Model._linear picks .w8/.wscale up itself.
-            served = backend.materialize(_quantize_draft(draft.params))
-            # In place, never rebound: DraftHead.layers is a Model holding THIS
-            # dict, and a fresh one leaves it reading the original bf16 weights.
-            draft.params.clear()
-            draft.params.update(served)
+            # Only where a kernel consumes the format: sm70 has no linear_fp8,
+            # and quantizing without one routes every projection to the torch
+            # fallback instead.
+            if backend.has_kernel("linear_fp8"):
+                served = backend.materialize(_quantize_draft(draft.params))
+                # In place, never rebound: DraftHead.layers is a Model holding
+                # THIS dict, and a fresh one leaves it reading the original
+                # bf16 weights.
+                draft.params.clear()
+                draft.params.update(served)
+            else:
+                draft.params.update(backend.materialize(draft.params))
+            # ponytail: the draft step runs OUTSIDE the captured graph, one
+            # autoregressive step at a time, so it pays eager launch cost —
+            # measured 121 ms/step on sm70 against a 0.25 ms bandwidth floor,
+            # which makes speculation a net loss at every depth (3.1 tok/s at
+            # depth 6 vs 25.8 dense). Capturing the draft step is what makes it
+            # pay: at its floor, depth 6 projects to 62.7 tok/s.
             if not 0 < spec_depth < BLOCK_TOKENS:
                 raise ValueError(f"spec_depth must be in [1, {BLOCK_TOKENS}), got {spec_depth}")
             self._draft_kv = PagedKvPool(

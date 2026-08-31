@@ -224,6 +224,16 @@ class Backend:
             else 1
         )
 
+    def has_kernel(self, name: str) -> bool:
+        """Is ``name`` served by a real kernel in this (precision, arch) cell?
+
+        The public form of the registry probe, for callers above this package
+        that must not guess: a weight format is only worth producing when the
+        kernel that consumes it exists, or the op silently takes the torch
+        fallback instead.
+        """
+        return name in _resolve(self.precision, self.arch)
+
     def _kernel(self, name: str, *args):
         """``args`` are FACTORY arguments (a compile-time kernel variant, e.g.
         the GEMV's row count), not call arguments — they key the cache."""

@@ -4,6 +4,18 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-31 — accept-or-reject verdict: MTP speculation REJECTED for now (draft step is outside the graph)
+
+- The checkpoint's MTP head loads and is good — 62% top-1 agreement with the
+  trunk, 97-99% accept, 5.33 tokens committed per forward. But depth 6 measures
+  3.1 tok/s vs 25.8 dense.
+- `prof_draft_step.py`: a 1-layer 456 M head costs 120.91 ms/step eager, as much
+  as the whole 64-layer trunk (103.58 eager / 39 captured). Both are launch-bound
+  at M=1; the trunk hides it behind graph capture, `_draft_step` does not.
+  Capturing the draft step projects depth 6 at 62.7 tok/s.
+- `serve --draft/--depth` and `Backend.has_kernel` land; speculation stays OFF.
+  [errors/2026-08-31-draft-step-outside-graph.md](docs/experience/errors/2026-08-31-draft-step-outside-graph.md)
+
 ## 2026-08-31 — phase exit: sm70 decode 2K ctx 5.3 → 20.5 tok/s (split-KV attention)
 
 - Generic `paged_attention` grids over `(B, H)`: 24 blocks at B=1 on an 80-SM

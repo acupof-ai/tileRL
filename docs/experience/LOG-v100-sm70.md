@@ -73,10 +73,40 @@ The H20's 87.5 tok/s was against a 285 tok/s roofline — 60 was 21% there.
 Dense headroom left: maybe 35-40 tok/s. **60 requires speculation** — 2.34
 accepted tokens per forward at the current 39 ms.
 
-**MTP head is in the checkpoint**: `mtp.fc.weight` + `mtp.layers.0.*` (one
-full-attn layer, 2193 keys total). Jointly trained with the trunk, so no
-training needed and acceptance should beat a bolted-on draft. Speculation is
-also *cheaper* on V100 than on H20: decode is fully weight-bandwidth-bound
-here, and `linear_fp4_gemv_sm70_m` (M=8) already reads W once for 8 rows, so
-the extra draft rows are nearly free.
+**MTP head works; speculation still loses. Root cause: the draft step is
+outside the captured graph.**
+
+Checkpoint MTP head loaded via the existing `load_draft` — all 15 `mtp.*` keys
+map cleanly, and they all live in one shard (`model-00018-of-00018`). Quality is
+good: **62% top-1 agreement** with the trunk, median trunk-rank 0, 84% in
+top-5. Accept rate in serving 97-99%, **5.33 tokens committed per forward**.
+
+But measured 3.1 tok/s at depth 6 vs 25.8 dense. `prof_draft_step.py`:
+
+| | ms (M=1, eager) |
+|---|---:|
+| trunk forward | 103.58 |
+| draft step (1 layer, 456 M) | 120.91 |
+| draft bandwidth floor | 0.25 (fp4) / 1.01 (bf16) |
+
+The 1-layer head costs as much as the 64-layer trunk — both launch-bound at
+M=1. The trunk hides it behind graph capture (103.58 eager → 39 captured,
+2.66×); the draft loop runs outside, so it pays eager per step. Predicted 3.3
+at depth 6, measured 3.1.
+
+Capture the draft step and depth 6 projects to **62.7 tok/s**. Entry:
+`errors/2026-08-31-draft-step-outside-graph.md`.
+
+Two wrong turns worth remembering, both inferred from end-to-end throughput and
+both killed by one direct measurement: fp8 quantization has no sm70 kernel
+(real, 0.7 → 6.0 tok/s, still a loss) and then fp4 quantization (made it worse,
+3.1 — at M=1 nothing is bandwidth-bound so the format is irrelevant).
+
+Two capacity facts found on the way: `step_states` is sized by SLOT COUNT
+(`16 slots × 7 steps × 144 MiB = 15.75 GiB` OOM'd the card; 4 slots works), and
+tree verification is blocked because `kernels_gdn.py:500-520` evolves
+`state_local` across the `t` loop — node t builds on t−1, not on its parent. A
+linear chain tops out at `1 + p/(1−p) = 2.63` tokens = 67.5 tok/s at p=0.62, so
+no tree is needed for 60.
+
 
