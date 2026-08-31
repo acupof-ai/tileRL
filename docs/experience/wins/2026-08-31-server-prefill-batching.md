@@ -34,6 +34,18 @@ Three independent fixes, one short diff (23 lines):
 
 B=8 server: 2.8 → 12.9 tok/s (4.6×). Wall time 168.5 → 31.4 s.
 
+Long-context (B=1, chunked prefill, 1800s timeout):
+
+| prompt_tok | ttft_s | decode_t/s | wall_33_s |
+|---:|---:|---:|---:|
+| 1042 | 61.3 | 10.8 | 64.3 |
+| 2062 | 198.5 | 7.7 | 202.7 |
+| 4112 | 686.8 | 3.5 | 696.0 |
+
+TTFT scales ~O(T²) — the GDN serial scan dominates prefill (61→199→687s).
+Decode at 4K drops to 3.5 tok/s (vs 7.7 at 2K): longer context = more KV
+blocks to touch per decode tick, memory-bandwidth-bound on V100.
+
 ## Rule
 
 A daemon that runs `step()` with zero batching window turns every concurrent
@@ -48,4 +60,5 @@ worth ~10× per tick.
 | 2026-08-31 | pre-fix | V100 sm70 | cuda | Qwen3.8-27B-NVFP4 | — | — | 2.8 |
 | 2026-08-31 | post-fix | V100 sm70 | cuda | Qwen3.8-27B-NVFP4 | — | 264 | 12.9 |
 
-Raw artifacts: `scripts/eval_b8_server.py`, server `/health` stats.
+Raw artifacts: `scripts/eval_b8_server.py`, `scripts/bench_long_context.py`,
+server `/health` stats.
