@@ -73,8 +73,8 @@ The H20's 87.5 tok/s was against a 285 tok/s roofline — 60 was 21% there.
 Dense headroom left: maybe 35-40 tok/s. **60 requires speculation** — 2.34
 accepted tokens per forward at the current 39 ms.
 
-**MTP head works; speculation still loses. Root cause: the draft step is
-outside the captured graph.**
+**MTP head works; speculation still loses. First diagnosis (draft outside the
+graph) was real but minor — see the corrected root cause at the end.**
 
 Checkpoint MTP head loaded via the existing `load_draft` — all 15 `mtp.*` keys
 map cleanly, and they all live in one shard (`model-00018-of-00018`). Quality is
@@ -99,8 +99,9 @@ Capture the draft step and depth 6 projects to **62.7 tok/s**. Entry:
 
 Two wrong turns worth remembering, both inferred from end-to-end throughput and
 both killed by one direct measurement: fp8 quantization has no sm70 kernel
-(real, 0.7 → 6.0 tok/s, still a loss) and then fp4 quantization (made it worse,
-3.1 — at M=1 nothing is bandwidth-bound so the format is irrelevant).
+(real, 0.7 → 6.0 tok/s, still a loss) and then fp4 quantization (appeared to
+make it worse, 3.1 — **later shown to be my profiler's bug**, see below; fp4 is
+in fact 24× faster per draft step).
 
 Two capacity facts found on the way: `step_states` is sized by SLOT COUNT
 (`16 slots × 7 steps × 144 MiB = 15.75 GiB` OOM'd the card; 4 slots works), and
@@ -109,4 +110,27 @@ tree verification is blocked because `kernels_gdn.py:500-520` evolves
 linear chain tops out at `1 + p/(1−p) = 2.63` tokens = 67.5 tok/s at p=0.62, so
 no tree is needed for 60.
 
+**Speculation traced to the bottom: the GDN state gather/scatter, not anything I
+guessed first.** Pure graph replay (no observer effect): W=1 39 ms, W=3 266 ms,
+W=4 267 ms. **Flat in W** — so W>1 is a path switch, not a scaling term.
+`backend.py:917` routes any `q.shape[1] > 1` to `gdn_chunk_fused`, and on sm70
+`gdn_decode` is None (sm90-only), so `model.py:421-439` does
+`state_gather` -> kernel -> `state_scatter` per layer. `reference.state_gather`
+is `states[slots, layer_idx]` torch advanced indexing: 3 MiB out + 3 MiB back
+x 48 layers = 288 MiB of unfusable round trip, 4.73 ms/layer. W=1 pays it too,
+which is why 39 ms is already 2.5x the 15.6 ms roofline.
 
+Fix would be extending `gdn_decode_fused` to T>1 with in-place pool state — a
+kernel project. Speculation stays OFF. Entry:
+`errors/2026-08-31-spec-blocked-on-gdn-state-path.md`.
+
+Shipped on the way: split-KV attention now covers S>1 (9.5x at S=4/n=1024;
+attention turned out to be 2.7% of the tick), and the draft head is fp4-quantized
+on sm70 — 4.98 ms/step vs 120.91 dense (24x).
+
+Five wrong turns, all inferred from end-to-end throughput and all refuted by a
+direct measurement. Two worth remembering: an op-timing wrapper that calls
+`torch.cuda.synchronize()` breaks graph capture and then measures the fallback it
+caused (it told me `linear_fp4` was 69% of the tick — it was not), and my fp4
+profiler deleted the dense keys including `fc`, silently reverting to dense, which
+made me reject fp4 as slower when it is 24x faster.

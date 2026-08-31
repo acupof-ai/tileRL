@@ -4,6 +4,19 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-08-31 — accept-or-reject verdict: speculation REJECTED on sm70, blocked on the GDN state path
+
+- Corrects the earlier "draft outside the graph" verdict. Pure graph replay is
+  39 ms at W=1 but 266/267 ms at W=3/W=4 — **flat in W**, so W>1 is a path
+  switch, not a scaling term. `backend.py:917` routes `q.shape[1] > 1` to
+  `gdn_chunk_fused`, and `gdn_decode` is sm90-only, so all 48 GDN layers take
+  `state_gather` → kernel → `state_scatter`: 3 MiB out + 3 MiB back per layer of
+  torch advanced indexing, 4.73 ms/layer. W=1 pays it too, which is why 39 ms is
+  already 2.5× the 15.6 ms roofline.
+- Shipped on the way: split-KV attention covers S>1 (9.5× at S=4/n=1024), and the
+  draft head is fp4 on sm70 (4.98 ms/step vs 120.91 dense, 24×).
+  [errors/2026-08-31-spec-blocked-on-gdn-state-path.md](docs/experience/errors/2026-08-31-spec-blocked-on-gdn-state-path.md)
+
 ## 2026-08-31 — accept-or-reject verdict: MTP speculation REJECTED for now (draft step is outside the graph)
 
 - The checkpoint's MTP head loads and is good — 62% top-1 agreement with the
