@@ -64,12 +64,11 @@ for base in keys:
     with safe_open(fn, framework="pt") as st:
         wq = st.get_tensor(wk)
         sc = st.get_tensor(sk)
-        osc = st.get_tensor(ok) if ok in st else None
+        osc = st.get_tensor(ok) if ok in st.keys() else None  # noqa: SIM118 - pod safetensors lacks __contains__
     N, K2 = wq.shape
     K = K2 * 2
-    # M=1 (decode GEMV, twiddled) and M=8 (prefill, generic kernel on a
-    # twiddled tensor — the path that regressed: it must untwiddle a copy).
-    for M in (1, 8):
+    # M=1 (decode GEMV), M=8 (M-row kernel), M=16/32 (M=32 prefill chunking).
+    for M in (1, 8, 16, 32):
         x = torch.randn(M, K, generator=g, dtype=torch.float32)
         wq_d, sc_d, x_d = wq.to(bk.device), sc.to(bk.device), x.to(bk.device)
         osc_d = osc.to(bk.device) if osc is not None else None

@@ -535,8 +535,8 @@ class Backend:
             # sm70 M>1: the generic kernel decodes natural nibbles, but sm70's
             # served bytes are fp16-twiddled. M<=8 (decode batch) uses the M-row
             # twiddle GEMV — one launch, W loaded+decoded once and reused across
-            # rows (the per-row loop it replaces OOMs at B=8 and is M launches/
-            # layer). M>8 (prefill) still loops the M=1 GEMV per row. An
+            # rows. M>8 (prefill) chunks with the M=32 twin: 32 rows share one
+            # W stream, so M=512 is 16 launches/layer instead of 512. An
             # untwiddle copy OOMs here (the forward's GPU is full — the scratch
             # that motivated eager materialize twiddle).
             if self.arch == "sm70" and getattr(wq, "_tl_layout", "natural") != "natural":
@@ -549,14 +549,18 @@ class Backend:
                     )[:M, :N]
                     y = self._epilogue(y2, None, lead, N)
                     return y if residual is None else y + residual
-                rows = [
-                    self._kernel(k1)(
-                        _pad2d(x2[m : m + 1], 1, Kp), wq1, sc1, osc1,
-                        self._residual(None, N, Np), 32, bN, blk,
-                    )[:1, :N]
-                    for m in range(M)
+                # M>8 (prefill): chunk with the M=32 kernel — W loaded+decoded
+                # once per 32 rows, 32× fewer launches and weight bytes than the
+                # per-row M=1 loop it replaces.
+                MC = 32
+                chunks = [
+                    self._kernel("linear_fp4_gemv_sm70_m32")(
+                        _pad2d(x2[m : m + MC], MC, Kp), wq1, sc1, osc1,
+                        self._zeros2(MC, Np), 32, bN, blk,
+                    )[: min(MC, M - m), :N]
+                    for m in range(0, M, MC)
                 ]
-                y2 = torch.cat(rows, 0)
+                y2 = torch.cat(chunks, 0)
                 y = self._epilogue(y2, None, lead, N)
                 return y if residual is None else y + residual
             bM, bN = min(64, M), min(64, N)

@@ -131,9 +131,15 @@ _SM70_KERNELS = {
     # M-row decode-batch GEMV (M=8, padded): W loaded+decoded once, reused across
     # rows — replaces the per-row GEMV loop (M launches/layer, OOM-prone at B=8).
     "linear_fp4_gemv_sm70_m": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(t, M=8),
+    # M=32 twin for the prefill M>8 path: 32 rows share one W stream, so
+    # M=512 prefill is 16 launches/layer instead of 512.
+    "linear_fp4_gemv_sm70_m32": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(t, M=32),
     # Both fix graph capture: gdn_decode_fused and write_tokens replace eager
     # fallbacks whose per-token int(device_tensor) host syncs break it.
     "gdn_decode_fused": lambda t: kernels_gdn.make_gdn_decode_fused(t, out_dtype="float32"),
+    # GDN chunk prefill (T>1): without it the prefill falls to reference.gdn_forward
+    # (Python serial scan, ~250k eager ops for 8×64 — 62s of the 64s tick 1).
+    "gdn_chunk_fused": kernels_gdn.make_gdn_chunk_fused,
     "write_tokens": kernels_mma.make_write_tokens,
 }
 _register("bf16", "sm70", _SM70_KERNELS)

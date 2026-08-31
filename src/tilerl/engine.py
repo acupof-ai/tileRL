@@ -56,7 +56,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .kv_cache import BLOCK_TOKENS, LinearStatePool, PagedKvPool, PrefixStore
+from .kv_cache import BLOCK_TOKENS, KvTier, LinearStatePool, PagedKvPool, PrefixStore
 from .spec import survival, verify_lens
 
 _PREFILL_BUCKET = 64  # prefill widths are padded to this: bounded kernel shapes
@@ -1243,6 +1243,7 @@ def build_engine(
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int = 4,
+    kv_tier_path: str | None = None,
 ) -> "Engine":
     """Wire a model + backend into a running Engine (pools + prefix store).
 
@@ -1276,7 +1277,12 @@ def build_engine(
         conv_dim=cfg.linear_qkv_dim,
         spec_steps=1 + spec_depth if draft is not None else 0,
     )
-    store = PrefixStore(kv_pool) if prefix_store is None else prefix_store
+    if prefix_store is not None:
+        store = prefix_store
+    elif kv_tier_path:
+        store = PrefixStore(kv_pool, tier=KvTier(kv_tier_path))
+    else:
+        store = PrefixStore(kv_pool)
     return Engine(
         model,
         backend,
