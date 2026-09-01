@@ -412,7 +412,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--draft", help="MTP/NextN head safetensors: speculative decode. For "
                                         "Qwen3.8-27B-NVFP4 the mtp.* keys all live in "
                                         "model-00018-of-00018.safetensors, so pass that shard.")
-    p_serve.add_argument("--depth", type=int, default=2, help="drafts per row per tick")
+    p_serve.add_argument("--depth", type=int, default=3,
+                         help="drafts per row per tick; 3 fills the sm70 verify ladder's "
+                              "4-row rung exactly (spec.LADDER_WIDTHS) — 4 spills to the "
+                              "8-row rung and measured slower than no speculation")
     p_serve.add_argument("--slots", type=int, default=16,
                          help="GDN state slots; lower on <40GB GPUs (with --draft each slot "
                               "also owns the per-step verify states)")
@@ -434,7 +437,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--lr", type=float, default=1e-3)
     p_train.add_argument("--lora-rank", type=int, default=16)
     p_train.add_argument("--draft", help="draft head safetensors: speculative rollout (--opd)")
-    p_train.add_argument("--depth", type=int, default=2, help="drafts per row per tick")
+    p_train.add_argument("--depth", type=int, default=3, help="drafts per row per tick")
     p_train.set_defaults(func=cmd_train)
 
     p_pretrain = sub.add_parser("pretrain", help="pretrain on a JSONL text corpus")

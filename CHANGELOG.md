@@ -4,11 +4,35 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-01 — default flip: spec depth 2 -> 3; speculation wins on code, breaks even on chat
+
+- Realistic workloads against a dense baseline (`scripts/bench_workloads.py`),
+  the counting task kept only as a control: coding **32.6 -> 43.4 tok/s**
+  (1.33x), dialogue 31.9 -> 32.0, thinking 32.0 -> 30.2, counting 32.7 -> 52.7.
+  Speculation is a real win on code and a wash on conversation.
+- **The 100% acceptance reported this morning was an artifact.** `verify_lens`
+  truncates each chain on the draft's own confidence before the counter runs
+  (engine.py:1068 -> :1074), and zero-keep ticks vanish from both counters
+  (engine.py:795), so accepted/drafted scores the truncation policy, not the
+  head. The bench now reports tokens per trunk forward and no ratio.
+- **Depth is a staircase, not a line.** Verify width is 1+depth and the sm70
+  GEMV ladder serves 1/2/4/8 rows, rounding up: depth 4 buys 8 rows to use 5
+  and measured 31.5 tok/s on coding — worse than not speculating. Depth 3 is
+  the deepest that fills rung 4. `--depth` and `spec_depth` defaults moved onto
+  the ladder; `spec.LADDER_WIDTHS` plus an sm70 warning keeps them there.
+  [errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md](docs/experience/errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md)
+- Long-context rows in that table are NOT decode measurements: a 4K prompt runs
+  8 chunked-prefill ticks and speculation is off on every mixed tick, which a
+  lo=32 two-point slope cannot cancel. Long-context decode remains unmeasured.
+
 ## 2026-09-01 — accept-or-reject verdict: speculation ACCEPTED, 52.7 tok/s at 31 ctx
 
-- depth 3 vs dense B=1: **32.7 -> 52.7 tok/s** at 31 ctx (1.61x), **27.4 ->
-  35.4** at 1K (1.29x). 100% draft acceptance in serving (292/292), 2.95
-  tok/forward. 52.7 is 82% of the 64 tok/s weight roofline.
+- depth 3 vs dense B=1: **32.7 -> 52.7 tok/s** at 31 ctx (1.61x). 52.7 is 82%
+  of the 64 tok/s weight roofline. SUPERSEDED IN PART by the entry above: this
+  is the counting task, whose near-zero entropy makes it the best case, not a
+  representative one; and the "100% acceptance / 1.29x at 1K" claimed here were
+  both artifacts (a filtered denominator, and a slope contaminated by chunked
+  prefill).
 - Reverses this morning's rejection. The premise it failed on — a verify row
   costing more than a decoded token — was fixed by the packed-f16 GEMV below.
 - The "1.3 tok/s" that briefly said otherwise was a measurement artifact:

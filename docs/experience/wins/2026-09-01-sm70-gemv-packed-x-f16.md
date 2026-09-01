@@ -73,15 +73,19 @@ End-to-end dense B=1 through the server (two-point slope, 32 vs 288 tokens):
 
 With a verify row at 10.7 ms against a 30.9 ms token, depth 3 pays:
 
-| ctx | dense | spec depth 3 | |
-|---:|---:|---:|---:|
-| 31 | 32.7 | **52.7 tok/s** | 1.61x |
-| 1052 | 27.4 | **35.4 tok/s** | 1.29x |
+| workload | dense | spec depth 3 | |
+|---|---:|---:|---:|
+| counting (control) | 32.7 | **52.7 tok/s** | 1.61x |
+| coding | 32.6 | **43.4 tok/s** | 1.33x |
+| dialogue | 31.9 | 32.0 | 1.00x |
+| thinking | 32.0 | 30.2 | 0.94x |
 
-100% draft acceptance in serving (292/292), 2.95 tok/forward. 52.7 is 82% of
-the 64 tok/s weight roofline. A first reading of 1.3 tok/s was a warmup
-artifact in the bench, not the engine —
-`errors/2026-09-01-spec-warmup-one-width.md`.
+52.7 is 82% of the 64 tok/s weight roofline, but counting is near-zero-entropy
+under greedy decode — coding at 1.33x is the honest headline. A first reading
+of 1.3 tok/s was a warmup artifact in the bench, not the engine
+(`errors/2026-09-01-spec-warmup-one-width.md`), and the depth that gets this is
+exactly 3 — depth 4 spills the sm70 verify ladder and loses to dense
+(`errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md`).
 
 ## Rule
 

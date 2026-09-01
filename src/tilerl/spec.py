@@ -29,8 +29,18 @@ __all__ = ["verify_lens", "survival", "DraftHead", "load_draft"]
 
 #: Measured cost of one trunk verify forward: a fixed cost plus a per-row cost,
 #: in ms. The defaults are agent-infer's H20 numbers; re-measure per target.
+#: V100 sm70 is NOT well described by this two-term form — see
+#: errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md: the sm70 GEMV
+#: ladder rounds the verify width up to 1/2/4/8, so cost is a staircase in
+#: depth and a linear model mis-prices every width that is not a rung.
 BIAS_MS = 211.0
 ROW_MS = 0.53
+
+#: Verify widths the sm70 M-ladder serves without padding waste. A width
+#: between rungs pays the next rung's full price: depth 5 (W=6) costs the same
+#: 8-row launch as depth 7 (W=8), which measured 10% SLOWER than depth 3 on the
+#: one workload where every draft is accepted.
+LADDER_WIDTHS = (1, 2, 4, 8)
 
 
 def survival(confidences: list[float]) -> list[float]:

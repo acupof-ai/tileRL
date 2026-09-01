@@ -212,3 +212,34 @@ then captures three more widths inside the timed `lo` point — 2589/906/731 ms 
 ticks 1-3 — and the two-point slope inverts. Per-tick timing showed the engine
 was flat at ~78 ms/tick out to 317 tokens the whole time. Warm every width
 before timing anything speculative.
+
+**Realistic workloads: speculation wins on code, breaks even on chat.**
+The counting task was hiding everything — it is near-zero-entropy under greedy
+decode, so it accepts every draft. Against a dense baseline on the same prompts
+(`scripts/bench_workloads.py`):
+
+| workload | prompt | dense | spec d3 | |
+|---|---:|---:|---:|---:|
+| counting (control) | 29 | 32.7 | 52.7 | 1.61x |
+| coding | 89 | 32.6 | 43.4 | 1.33x |
+| dialogue | 178 | 31.9 | 32.0 | 1.00x |
+| thinking | 174 | 32.0 | 30.2 | 0.94x |
+
+**100% acceptance was an artifact.** `verify_lens` truncates the chain on the
+draft's own confidence BEFORE the counter runs (engine.py:1068 -> :1074), so
+accepted/drafted measures the truncation policy, not the head. Ticks where the
+policy keeps nothing vanish from both counters (engine.py:795). The honest
+metric is tokens per trunk decode forward; `bench_workloads.py` reports that and
+no longer prints a ratio as a headline.
+
+**Depth 3 is the ceiling, depth 4 is a cliff** — the verify width 1+depth rounds
+up the sm70 GEMV ladder (1/2/4/8), so depth 4 buys 8 rows to use 5 and measured
+31.5 tok/s on coding, below the 32.6 it gets with no speculation. Defaults moved
+onto the ladder. Entry:
+`errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md`.
+
+**Long-context numbers here are INVALID, mine included.** A 4K prompt takes 8
+chunked-prefill ticks at `max_num_batched_tokens=512`, and speculation is off on
+every mixed tick (engine.py:790). The two-point slope does not cancel that at
+lo=32, so 14.8/18.0 measure prefill, not decode. Long-context decode is
+unmeasured; the earlier "KVSPLIT=16 is the wall" claim was a guess, withdrawn.

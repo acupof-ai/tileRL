@@ -57,7 +57,7 @@ import numpy as np
 import torch
 
 from .kv_cache import BLOCK_TOKENS, KvTier, LinearStatePool, PagedKvPool, PrefixStore
-from .spec import survival, verify_lens
+from .spec import LADDER_WIDTHS, survival, verify_lens
 
 _PREFILL_BUCKET = 64  # prefill widths are padded to this: bounded kernel shapes
 
@@ -356,7 +356,7 @@ class Engine:
         limits: StepLimits,
         decode_graph: bool | None = None,
         draft: Any = None,
-        spec_depth: int = 4,
+        spec_depth: int = 3,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -408,6 +408,19 @@ class Engine:
             draft.params.update(served)
             if not 0 < spec_depth < BLOCK_TOKENS:
                 raise ValueError(f"spec_depth must be in [1, {BLOCK_TOKENS}), got {spec_depth}")
+            if backend.arch == "sm70" and 1 + spec_depth not in LADDER_WIDTHS:
+                # The verify width is 1+depth and the sm70 GEMV serves only
+                # 1/2/4/8 rows, rounding up: depth 4 (W=5) buys an 8-row launch
+                # and measured 31.5 tok/s on coding against 43.8 at depth 3 and
+                # 32.6 with no speculation at all. Warn rather than clamp — the
+                # ladder is one arch's shape, not a property of speculation.
+                warnings.warn(
+                    f"spec_depth={spec_depth} gives verify width {1 + spec_depth}, which sm70 "
+                    f"rounds up to {next(w for w in LADDER_WIDTHS if w >= 1 + spec_depth)} rows; "
+                    f"use depth {max(w for w in LADDER_WIDTHS if w <= 1 + spec_depth) - 1} or "
+                    f"{next(w for w in LADDER_WIDTHS if w > 1 + spec_depth) - 1}",
+                    stacklevel=2,
+                )
             self._draft_kv = PagedKvPool(
                 kv_pool.num_blocks, draft.cfg.num_kv_heads, draft.cfg.head_dim,
                 num_layers=draft.cfg.num_layers, device=backend.device,
@@ -1263,7 +1276,7 @@ def build_engine(
     prefix_store: Any = None,
     decode_graph: bool | None = None,
     draft: Any = None,
-    spec_depth: int = 4,
+    spec_depth: int = 3,
     kv_tier_path: str | None = None,
 ) -> "Engine":
     """Wire a model + backend into a running Engine (pools + prefix store).
