@@ -194,3 +194,21 @@ against a 41.6 ms W=2 replay. `prof_spec_tick.py`: `_draft_step` is 16.7 s of
 21.2 s (79%), 371 ms per depth step vs 4.98 ms in isolation; `decode_graph`
 636 ms/tick vs a 41.6 ms replay of the same graph. No capture-failure warning,
 so the graph replays — the cost is around it. Next target.
+
+**Speculation ACCEPTED — 52.7 tok/s at 31 ctx, 35.4 at 1K.**
+Once a verify row cost 10.7 ms against a 30.9 ms token, depth 3 pays:
+
+| ctx | dense | spec depth 3 | |
+|---:|---:|---:|---:|
+| 31 | 32.7 | **52.7** | 1.61x |
+| 1052 | 27.4 | **35.4** | 1.29x |
+
+100% draft acceptance in serving (292/292 on the counting task), 2.95
+tok/forward. 52.7 is 82% of the 64 tok/s weight roofline.
+
+The "1.3 tok/s" scare was a MEASUREMENT artifact: `bench_b1_decode.py` warms up
+with one `--lo` call, which captures only the width-1 graph. The first spec tick
+then captures three more widths inside the timed `lo` point — 2589/906/731 ms on
+ticks 1-3 — and the two-point slope inverts. Per-tick timing showed the engine
+was flat at ~78 ms/tick out to 317 tokens the whole time. Warm every width
+before timing anything speculative.

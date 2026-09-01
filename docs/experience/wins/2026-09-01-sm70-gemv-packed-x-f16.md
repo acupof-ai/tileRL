@@ -69,14 +69,19 @@ End-to-end dense B=1 through the server (two-point slope, 32 vs 288 tokens):
 | 31 | 25.8 | **32.7 tok/s** |
 | 1052 | 23.1 | **27.4 tok/s** |
 
-## Speculation is still not shipping
+## Speculation now ships
 
-Serving with `--draft --depth 3` measured **1.3 tok/s** — 25x slower than
-dense, against a 41.6 ms replay that predicts ~39. `prof_spec_tick.py` puts
-**79% of the wall in `_draft_step`: 371 ms per depth step against 4.98 ms
-measured in isolation.** The trunk is fixed; the draft head's own path is not,
-and that is the next target. The kernel economics are no longer the blocker —
-this is.
+With a verify row at 10.7 ms against a 30.9 ms token, depth 3 pays:
+
+| ctx | dense | spec depth 3 | |
+|---:|---:|---:|---:|
+| 31 | 32.7 | **52.7 tok/s** | 1.61x |
+| 1052 | 27.4 | **35.4 tok/s** | 1.29x |
+
+100% draft acceptance in serving (292/292), 2.95 tok/forward. 52.7 is 82% of
+the 64 tok/s weight roofline. A first reading of 1.3 tok/s was a warmup
+artifact in the bench, not the engine —
+`errors/2026-09-01-spec-warmup-one-width.md`.
 
 ## Rule
 

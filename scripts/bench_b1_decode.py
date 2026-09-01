@@ -48,7 +48,11 @@ def main() -> None:
     # Warmup: JIT compile and graph capture must land OUTSIDE both timed points.
     # Without it a first-call compile inflates tlo and the slope reports a rate
     # above the weight-bandwidth ceiling (289 tok/s once, vs a 64 tok/s floor).
-    one(prompt, args.lo)
+    # It must run to --hi, not --lo: with a draft, each accepted-chain WIDTH
+    # captures its own graph, and a short warmup only reaches width 1. The rest
+    # then captured inside the timed lo point (2589/906/731 ms on ticks 1-3) and
+    # the slope inverted — 52.7 tok/s read as 1.3.
+    one(prompt, args.hi)
     pt, glo, tlo = one(prompt, args.lo)
     _, ghi, thi = one(prompt, args.hi)
     if ghi <= glo:

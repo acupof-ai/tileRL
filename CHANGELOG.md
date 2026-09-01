@@ -4,6 +4,20 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-01 — accept-or-reject verdict: speculation ACCEPTED, 52.7 tok/s at 31 ctx
+
+- depth 3 vs dense B=1: **32.7 -> 52.7 tok/s** at 31 ctx (1.61x), **27.4 ->
+  35.4** at 1K (1.29x). 100% draft acceptance in serving (292/292), 2.95
+  tok/forward. 52.7 is 82% of the 64 tok/s weight roofline.
+- Reverses this morning's rejection. The premise it failed on — a verify row
+  costing more than a decoded token — was fixed by the packed-f16 GEMV below.
+- The "1.3 tok/s" that briefly said otherwise was a measurement artifact:
+  `bench_b1_decode.py` warmed up to `--lo`, which at depth 3 captures only the
+  width-1 graph; the other widths then captured inside the timed lo point
+  (2589/906/731 ms on ticks 1-3) and inverted the slope. Warmup now runs to
+  `--hi`. Per-tick timing was flat at ~78 ms out to 317 tokens throughout.
+  [errors/2026-09-01-spec-warmup-one-width.md](docs/experience/errors/2026-09-01-spec-warmup-one-width.md)
+
 ## 2026-09-01 — phase exit: packed-f16 X breaks the GEMV's per-row floor; dense B=1 25.8 -> 32.7 tok/s
 
 - The "127 us/row flat, issue-bound" ceiling was X, not the hardware. X is
