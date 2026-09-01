@@ -162,9 +162,9 @@ _SM70_KERNELS = {
     # The generic kernel grids over (B, H) — 24 blocks at B=1 on the 27B, one
     # active thread each (its dot is a serial fragment reduction), measured
     # 0.76 ns/scalar-FMA = the single-thread rate.
-    "paged_attention_split": lambda t: kernels.make_paged_attention_split(t, KVSPLIT=16),
+    "paged_attention_split": lambda t: kernels.make_paged_attention_split(t, KVSPLIT=32),
     "paged_attention_split_combine": lambda t: kernels.make_paged_attention_split_combine(
-        t, KVSPLIT=16
+        t, KVSPLIT=32
     ),
 }
 _register("bf16", "sm70", _SM70_KERNELS)

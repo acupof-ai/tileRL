@@ -687,13 +687,25 @@ def make_paged_attention(target: str):
 #
 # So split the position loop across the grid instead: (KVSPLIT, H, B) blocks,
 # each owning a contiguous slice of the history, then combine the partials in
-# the log domain. The parallelism comes from the GRID, not from a cross-thread
-# fragment reduction, so T.serial(D) survives untouched and the Metal
-# constraint at the top of this file still holds. Decode only (S == 1): a
-# prefill's per-query causal window makes the slices ragged.
+# the log domain.
+#
+# The grid alone is not enough. A first cut kept the per-position dot as
+# T.serial(D) and measured 948 us/call at 4K context — every thread in the
+# block ran the SAME D-step chain, each step waiting on its own global load.
+# The signature was cost RISING with thread count (4K ctx, split only: 32t
+# 780us, 64t 950, 128t 2165, 256t 4066), which is redundancy, not work.
+#
+# So the block stages block_N positions into fragments and reduces with
+# T.reduce_sum over a (block_N, D) product — thread-parallel, operands already
+# in registers. Sharing that K/V tile across the GQA group would cut cache
+# traffic 6x more, but a (gq, D) fragment fails LayoutInference
+# ("CanProveEqual(abs(source->scale), 1)") even padded to a power of two, so
+# the block stays per-QUERY-head.
+# ponytail: per-query-head reads the same K/V gq times, revisit if a
+# (gq, D) fragment layout lands upstream.
 
 
-def make_paged_attention_split(target: str, KVSPLIT: int = 16):
+def make_paged_attention_split(target: str, KVSPLIT: int = 32, block_N: int = 16):
     """Phase 1 of split-KV attention: per-slice online-softmax partials.
 
     Q [B, S, H, D], K/V cache [num_blocks, Hkv, BLOCK, D], BlockTable [B, Mb],
@@ -734,30 +746,52 @@ def make_paged_attention_split(target: str, KVSPLIT: int = 16):
             per = T.ceildiv(n, KVSPLIT)
             p0 = sp * per
             p1 = T.min(n, p0 + per)
-            m = T.alloc_fragment((1,), "float32")
-            l = T.alloc_fragment((1,), "float32")
+            Qf = T.alloc_fragment((D,), "float32")
+            Kf = T.alloc_fragment((block_N, D), "float32")
+            Vf = T.alloc_fragment((block_N, D), "float32")
+            pr = T.alloc_fragment((block_N, D), "float32")
             acc = T.alloc_fragment((D,), "float32")
+            s = T.alloc_fragment((block_N,), "float32")
+            m = T.alloc_fragment((1,), "float32")
+            mn = T.alloc_fragment((1,), "float32")
+            ssum = T.alloc_fragment((1,), "float32")
+            l = T.alloc_fragment((1,), "float32")
+            for d in T.Parallel(D):
+                Qf[d] = Q[bb, tt, hh, d]
+                acc[d] = 0.0
             m[0] = -1.0e30
             l[0] = 0.0
-            for d in T.Parallel(D):
-                acc[d] = 0.0
             # A padded query row (tt >= SeqQLens) still runs: its window is
             # bounded by n above, and the caller never reads its output.
-            for pos in T.serial(p1 - p0):
-                blk = BlockTable[bb, (p0 + pos) // block_size]
-                off = (p0 + pos) % block_size
-                s = T.alloc_fragment((1,), "float32")
-                s[0] = 0.0
-                for d in T.serial(D):
-                    s[0] += Q[bb, tt, hh, d] * KCache[blk, hkv, off, d]
-                s[0] = s[0] * scale
-                m_new = T.max(m[0], s[0])
-                corr = T.exp(m[0] - m_new)
-                p = T.exp(s[0] - m_new)
-                l[0] = l[0] * corr + p
+            for k in T.serial(T.ceildiv(p1 - p0, block_N)):
+                for j, d in T.Parallel(block_N, D):
+                    # Clamped so an out-of-range lane loads a live address; its
+                    # score is masked to -inf below, so the value never counts.
+                    p = T.min(p0 + k * block_N + j, p1 - 1)
+                    blk = BlockTable[bb, T.min(p // block_size, Mb - 1)]
+                    Kf[j, d] = KCache[blk, hkv, p % block_size, d]
+                    Vf[j, d] = VCache[blk, hkv, p % block_size, d]
+                    pr[j, d] = Qf[d] * Kf[j, d]
+                T.reduce_sum(pr, s, dim=1)
+                for j in T.Parallel(block_N):
+                    s[j] = T.if_then_else(
+                        p0 + k * block_N + j < p1, s[j] * scale, -1.0e30
+                    )
+                mn[0] = m[0]
+                T.reduce_max(s, mn, dim=0, clear=False)  # running max over tiles
+                corr = T.exp(m[0] - mn[0])
+                for j in T.Parallel(block_N):
+                    s[j] = T.exp(s[j] - mn[0])
+                T.reduce_sum(s, ssum, dim=0)
+                l[0] = l[0] * corr + ssum[0]
+                m[0] = mn[0]
+                for j, d in T.Parallel(block_N, D):
+                    pr[j, d] = s[j] * Vf[j, d]
                 for d in T.Parallel(D):
-                    acc[d] = acc[d] * corr + p * VCache[blk, hkv, off, d]
-                m[0] = m_new
+                    acc[d] = acc[d] * corr
+                for j in T.serial(block_N):
+                    for d in T.Parallel(D):
+                        acc[d] += pr[j, d]
             for d in T.Parallel(D):
                 PO[bb, tt, hh, sp, d] = acc[d]
             PM[bb, tt, hh, sp] = m[0]
@@ -767,10 +801,16 @@ def make_paged_attention_split(target: str, KVSPLIT: int = 16):
     return paged_attention_split
 
 
-def make_paged_attention_split_combine(target: str, KVSPLIT: int = 16):
+def make_paged_attention_split_combine(target: str, KVSPLIT: int = 32):
     """Phase 2: merge the slice partials.
 
     Out[b,s,h,d] = sum_j w_j PO[j,d] / sum_j w_j PL[j], w_j = exp(PM_j - max PM).
+
+    D is the parallel axis and KVSPLIT the serial one, with the accumulator
+    hoisted out of the loop: allocating a fragment INSIDE a T.Parallel(D) body
+    is the shape kernels_attn.py:267 measured at 40-66 us/call, and it cost
+    60-77 us here — flat in context, so it was pure overhead on every layer of
+    every token.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
@@ -785,18 +825,20 @@ def make_paged_attention_split_combine(target: str, KVSPLIT: int = 16):
             hh = th % H
             m = T.alloc_fragment((1,), "float32")
             l = T.alloc_fragment((1,), "float32")
+            o = T.alloc_fragment((D,), "float32")
             m[0] = -1.0e30
             for sp in T.serial(KVSPLIT):
                 m[0] = T.max(m[0], PM[bb, tt, hh, sp])
             l[0] = 0.0
-            for sp in T.serial(KVSPLIT):
-                l[0] += T.exp(PM[bb, tt, hh, sp] - m[0]) * PL[bb, tt, hh, sp]
             for d in T.Parallel(D):
-                o = T.alloc_fragment((1,), "float32")
-                o[0] = 0.0
-                for sp in T.serial(KVSPLIT):
-                    o[0] += T.exp(PM[bb, tt, hh, sp] - m[0]) * PO[bb, tt, hh, sp, d]
-                Out[bb, tt, hh, d] = o[0] / l[0]
+                o[d] = 0.0
+            for sp in T.serial(KVSPLIT):
+                w = T.exp(PM[bb, tt, hh, sp] - m[0])
+                l[0] += w * PL[bb, tt, hh, sp]
+                for d in T.Parallel(D):
+                    o[d] += w * PO[bb, tt, hh, sp, d]
+            for d in T.Parallel(D):
+                Out[bb, tt, hh, d] = o[d] / l[0]
         return Out
 
     return paged_attention_split_combine

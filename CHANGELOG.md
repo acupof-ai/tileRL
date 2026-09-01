@@ -4,6 +4,24 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-01 — phase exit: long-context decode fixed, 4096 ctx 17.4 -> 30.0 tok/s
+
+- Decode fit `ms/tok = 31.9 + 6.20*(ctx/1K)` against a 0.07 ms/1K roofline —
+  **83x off**. The slope was **thread redundancy**: `paged_attention_split`
+  computed its dot as `for d in T.serial(D)`, never distributed, so all 64
+  threads in a block ran the same dependent chain. Diagnostic signature is a
+  thread sweep where cost RISES with thread count (4K ctx: 32t 780us -> 256t
+  4066us); real work is flat or falling.
+- Fix stages `block_N=16` positions into fragments and reduces with
+  `T.reduce_sum`, KVSPLIT 16 -> 32. Kernel 6.3x faster at 4096 and, more to the
+  point, flat from 512 to 4096 (157 -> 163 us). Parity vs a torch reference
+  holds at relerr <= 5.3e-05, S=1 and S=4.
+- Dense decode **17.4 -> 30.0 tok/s at 4096 ctx (1.72x)**; slope 6.20 -> 0.59
+  ms/1K (10.5x); decay from 32 to 4096 ctx now 7%, was 44%.
+- The split-KV rewrite that introduced this shipped on end-to-end tok/s with no
+  per-kernel timing, and the defect survived three later measurements.
+  [wins/2026-09-01-sm70-attention-thread-redundancy.md](docs/experience/wins/2026-09-01-sm70-attention-thread-redundancy.md)
+
 ## 2026-09-01 — default flip: spec depth 2 -> 3; speculation wins on code, breaks even on chat
 
 - Realistic workloads against a dense baseline (`scripts/bench_workloads.py`),
