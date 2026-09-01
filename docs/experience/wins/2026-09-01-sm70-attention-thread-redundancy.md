@@ -75,6 +75,23 @@ End to end, dense decode, steady state with no prefill in the window:
 **1.72× at 4096.** The slope fell from 6.20 to 0.59 ms per 1K — **10.5×** — and
 decay from 32 to 4096 tokens of context went from 44% to 7%.
 
+Speculation gains more than dense does, because a verify forward multiplies the
+serial attention cost by the chain width:
+
+| ctx | spec d3 after | before | vs dense now |
+|---:|---:|---:|---:|
+| 32 | 32.9 | 31.8 | 1.02× |
+| 512 | 44.8 | 37.7 | 1.40× |
+| 1024 | **46.5** | 34.5 | 1.46× |
+| 2048 | 40.8 | 24.4 | 1.31× |
+| 4096 | 37.0 | 16.7 | 1.23× |
+
+**2.22× at 4096.** Speculation had been a net LOSS there (16.7 against 17.4
+dense); it is now a win at every context. tok/fwd holds at 2.9-3.3 across the
+whole range, so draft acceptance never degraded with context — attention was
+eating the gain the whole time. Peak throughput is **46.5 tok/s at 1024 ctx**,
+73% of the 64 tok/s weight-bandwidth roofline.
+
 Sharing the K/V tile across the GQA group would cut cache traffic another 6×,
 but a `(gq, D)` fragment fails LayoutInference
 (`CanProveEqual(abs(source->scale), 1)`) even padded from 6 to 8 — the 2D shape

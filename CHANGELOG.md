@@ -18,6 +18,13 @@ verdict**. Newest first.
   holds at relerr <= 5.3e-05, S=1 and S=4.
 - Dense decode **17.4 -> 30.0 tok/s at 4096 ctx (1.72x)**; slope 6.20 -> 0.59
   ms/1K (10.5x); decay from 32 to 4096 ctx now 7%, was 44%.
+- **Speculation gains more than dense does**: d3 at 4096 ctx **16.7 -> 37.0
+  tok/s (2.22x)**, 512 37.7 -> 44.8, 1024 34.5 -> 46.5, 2048 24.4 -> 40.8. It
+  had been a net LOSS at long context (16.7 against 17.4 dense) because a
+  verify forward multiplies the serial attention cost by the chain width; with
+  the redundancy gone it is a 1.23x win over dense at 4096. tok/fwd holds at
+  2.9-3.3 across the range, so acceptance never degraded — attention was eating
+  the gain. Peak is now **46.5 tok/s at 1024 ctx**.
 - The split-KV rewrite that introduced this shipped on end-to-end tok/s with no
   per-kernel timing, and the defect survived three later measurements.
   [wins/2026-09-01-sm70-attention-thread-redundancy.md](docs/experience/wins/2026-09-01-sm70-attention-thread-redundancy.md)
