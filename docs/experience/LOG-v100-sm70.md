@@ -154,7 +154,7 @@ PER ROW than M=1. 4864 is exactly the shape
 `wins/2026-08-30-sm70-fp16-twiddle-gemv.md` benchmarked; the kernel was never
 timed at the production shapes. Fixed at 1.65x, W=8 verify would be ~73 ms and
 depth 3 would give 30.7 tok/s, past dense. Entry:
-`errors/2026-08-31-m8-gemv-no-reuse-at-27b-shapes.md`.
+`errors/2026-08-31-m8-gemv-occupancy-not-reuse.md`.
 
 Ruled out for the 6-7x: weight re-decode (the decode is outside the `for m`
 loop), occupancy (>1200 blocks everywhere), converts (1280/thread at both K),

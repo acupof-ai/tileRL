@@ -1,6 +1,11 @@
 # The sm70 M-row fp4 GEMV only reuses its tile at one shape — 2026-08-31
 
-> Status: Found, not fixed. This is the speculation blocker.
+> Status: **Diagnosis corrected by ncu (2026-09-01).** The kernel does NOT
+> degrade with shape — per-block efficiency is identical at both. The 1.65x vs
+> 7.5x came from a bad baseline: the M=1 kernel is anomalously SLOW at 4864
+> (274.3 us for 3.8x fewer weight bytes than 17408x5120's 135.9 us), so the
+> "good" ratio was flattering, not the "bad" one broken. The real finding is
+> below under **ncu**: 255 registers/thread and 12.2% occupancy at every shape.
 
 ## Context
 
@@ -73,8 +78,53 @@ This one kernel is the entire speculation story on sm70:
 
 ## Rule
 
-Benchmark a kernel at the shapes it will actually be called with. A square
-validation shape hid a 6-7× regression at every real projection of the model,
-in a kernel whose entire purpose is the reuse that stops working there. When a
-cost is flat in the parameter that should drive it (W=2 costs what W=8 costs),
-the parameter is not what selects the work — find the switch.
+A ratio has two ends. "M=8 is 7.5x M=1 here but only 1.65x there" reads as a
+broken numerator, and it was a broken denominator: the M=1 kernel is slow at
+4864, so the flattering ratio was the anomaly. Before believing a
+shape-dependent regression, check the baseline against an absolute floor
+(us/row, or bytes/second) rather than against itself at another shape.
+
+When a cost is flat in the parameter that should drive it (W=2 costs what W=8
+costs), the parameter is not what selects the work — find the switch.
+
+
+## ncu (2026-09-01) — the actual defect
+
+Both shapes, `--kernel-name regex:linear_fp4_gemv_sm70_m`:
+
+| metric | 4864x4864 | 17408x5120 |
+|---|---:|---:|
+| grid | 1216 | 4352 |
+| instructions | 21.1 M | 75.7 M |
+| duration | 309 us | 1020 us |
+| sm throughput | 40.0% | 42.4% |
+| **dram throughput** | **6.3%** | **6.8%** |
+| **registers/thread** | **255** | **255** |
+| **warps active** | **12.05%** | **12.18%** |
+| l1tex hit rate | 88.8% | 88.5% |
+
+Duration tracks instructions tracks grid, 3.3-3.6x across the board. Per-block
+cost is the same at both shapes, so there is no shape-dependent regression to
+fix and the earlier "reuse fails at 27B shapes" reading is withdrawn.
+
+What ncu does show, at BOTH shapes:
+
+- **255 registers/thread** — the hard ceiling; the compiler is pinned against it.
+- **12.2% occupancy** — roughly one resident block per SM.
+- **6.8% DRAM, 42% SM** — neither bandwidth- nor compute-saturated. The kernel
+  is starved of parallelism, not of bytes.
+
+The source already warned about this: the `for m` loop carries `#pragma unroll`
+nowhere because unrolling "spills registers (32 bodies x ~25 regs >> 256/thread)
+and was 150x slower" (kernels_linear.py:820-822). Even un-unrolled it now sits
+at the cap.
+
+That is also why M=8 buys so little: at 63-127 us/row against the M=1 kernel's
+117-154 us for a whole single-row pass, reusing the decoded weight tile barely
+helps when the limiter is register-pressure-capped occupancy, not weight traffic
+(DRAM 6.8%).
+
+**Direction**: cut per-thread register live range to raise occupancy —
+`M=4` instead of 8 halves the live `acc[m]`/`xb[4]` set, and hoisting the
+per-row f32->f16 conversion out of the tile loop removes 16 converts x M per
+tile. 12% -> 50% occupancy is a 4x ceiling.

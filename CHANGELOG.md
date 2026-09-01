@@ -4,17 +4,17 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
-## 2026-08-31 — accept-or-reject verdict: speculation blocked on `linear_fp4_gemv_sm70_m`, not GDN
+## 2026-09-01 — accept-or-reject verdict: the GEMV is occupancy-bound at 255 regs, not shape-broken
 
-- Supersedes the two earlier verdicts today. Per-kernel profiling of the verify
-  replay: the M-row GEMV is 507.5 µs/call against the M=1 kernel's 64.5 µs, 252 of
-  the 271 ms tick. GDN was 1.9-2.9 ms and attention 1.7 ms — both earlier root
-  causes were wrong.
-- The M-row kernel's tile reuse works at N=K=4864 (1.65× for 8 rows, the shape its
-  own win entry benchmarked) and fails at every 27B projection (6.2-7.5×), where
-  M=8 is worse PER ROW than M=1. Fixed at 1.65×, depth 3 gives 30.7 tok/s — past
-  dense 25.8. Also gates B=2..8 batch decode.
-  [errors/2026-08-31-m8-gemv-no-reuse-at-27b-shapes.md](docs/experience/errors/2026-08-31-m8-gemv-no-reuse-at-27b-shapes.md)
+- Supersedes all three of 2026-08-31's verdicts. Per-kernel profiling put 252 of
+  the 271 ms verify tick in `linear_fp4_gemv_sm70_m` (507.5 µs/call vs the M=1
+  kernel's 64.5); GDN was 1.9-2.9 ms and attention 1.7 ms.
+- ncu then withdrew the "reuse fails at 27B shapes" reading: duration tracks
+  instructions tracks grid (3.3-3.6×) and per-block efficiency is identical at
+  both shapes. The 1.65× vs 7.5× ratio was a slow M=1 baseline at 4864, not a
+  broken M=8. The real limiter is **255 registers/thread and 12.2% occupancy at
+  every shape**, with DRAM at 6.8% — starved of parallelism, not bytes.
+  [errors/2026-08-31-m8-gemv-occupancy-not-reuse.md](docs/experience/errors/2026-08-31-m8-gemv-occupancy-not-reuse.md)
 
 ## 2026-08-31 — accept-or-reject verdict: speculation REJECTED on sm70, blocked on the GDN state path
 
