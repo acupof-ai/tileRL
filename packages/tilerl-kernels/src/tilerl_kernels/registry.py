@@ -128,9 +128,16 @@ _register("fp4", "sm90", _SM90_KERNELS)
 _SM70_KERNELS = {
     **_CPU_KERNELS,
     "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv_sm70,
-    # M-row decode-batch GEMV (M=8, padded): W loaded+decoded once, reused across
-    # rows — replaces the per-row GEMV loop (M launches/layer, OOM-prone at B=8).
+    # M-row decode-batch GEMV: one launch for M rows instead of M launches.
+    # It does NOT amortize the weight stream the way the name suggests —
+    # measured 127 us/row flat from M=1 to M=16 at 17408x5120 (ncu: 255
+    # regs/thread, 12.2% occupancy, DRAM 6.8%), so the limiter is issue
+    # bandwidth, not weight bytes. Cost is therefore exactly linear in the
+    # COMPILED M, and padding a 2-row verify up to 8 pays 4x for nothing —
+    # hence the ladder, picked by row count at the dispatch site.
     "linear_fp4_gemv_sm70_m": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(t, M=8),
+    "linear_fp4_gemv_sm70_m2": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(t, M=2),
+    "linear_fp4_gemv_sm70_m4": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(t, M=4),
     # M=32 twin for the prefill M>8 path: 32 rows share one W stream, so
     # M=512 prefill is 16 launches/layer instead of 512.
     "linear_fp4_gemv_sm70_m32": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(t, M=32),

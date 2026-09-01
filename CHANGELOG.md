@@ -4,6 +4,19 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-01 — phase exit: verify replay W=2 271 -> 78 ms (M ladder); speculation still rejected
+
+- `linear_fp4_gemv_sm70_m` has no weight reuse: 127 us/ROW flat from M=1 to
+  M=16. ncu shows why — 255 regs/thread, 12.2% occupancy, DRAM 6.8% at 42% SM.
+  The tile IS reused (88% l1 hit); the kernel was issue-bound all along.
+- Dispatch now rounds M up a ladder (M=2/4/8) instead of padding everything to
+  8: W=2 271 -> 78.4 ms (3.5x), W=4 271.7 -> 146.8 (1.85x). Helps B=2..4
+  serving too. Parity worst 1.40e-03 at the real projections.
+- Speculation stays OFF: one verify row costs ~63 ms against a 40.9 ms dense
+  tick, so verifying a token is dearer than decoding it. depth 1 = 19.4 tok/s
+  vs dense 24.4.
+  [wins/2026-09-01-sm70-gemv-m-ladder.md](docs/experience/wins/2026-09-01-sm70-gemv-m-ladder.md)
+
 ## 2026-09-01 — accept-or-reject verdict: the GEMV is occupancy-bound at 255 regs, not shape-broken
 
 - Supersedes all three of 2026-08-31's verdicts. Per-kernel profiling put 252 of

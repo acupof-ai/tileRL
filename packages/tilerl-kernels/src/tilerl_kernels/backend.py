@@ -554,8 +554,14 @@ class Backend:
                 wq1, sc1 = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
                 osc1 = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
                 if M <= 8:
-                    y2 = self._kernel("linear_fp4_gemv_sm70_m")(
-                        _pad2d(x2, 8, Kp), wq1, sc1, osc1, self._zeros2(8, Np), 32, bN, blk
+                    # Round M up the compiled ladder rather than always to 8:
+                    # the kernel costs 127 us/ROW flat (issue-bound, not weight
+                    # bound), so a 2-row verify padded to 8 pays 4x for rows
+                    # nobody reads.
+                    Mk = 2 if M <= 2 else 4 if M <= 4 else 8
+                    name = "linear_fp4_gemv_sm70_m" + ("" if Mk == 8 else str(Mk))
+                    y2 = self._kernel(name)(
+                        _pad2d(x2, Mk, Kp), wq1, sc1, osc1, self._zeros2(Mk, Np), 32, bN, blk
                     )[:M, :N]
                     y = self._epilogue(y2, None, lead, N)
                     return y if residual is None else y + residual
