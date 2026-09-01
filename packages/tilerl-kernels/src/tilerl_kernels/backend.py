@@ -499,6 +499,41 @@ class Backend:
             )[:M, :N]
             y = y2.reshape(*lead, N)
             return y if res is not None else y + residual
+        # sm70 serves fp16-twiddled bytes, which the generic kernels (natural
+        # nibbles) cannot read, so every M goes through the twiddle ladder.
+        # M<=8 (decode/verify batch): one launch for M rows, X pre-packed f16.
+        # M>8 (prefill) chunks with the M=32 twin: 32 rows share one W stream,
+        # so M=512 is 16 launches/layer instead of 512. An untwiddle copy OOMs
+        # here (the forward's GPU is full — the scratch that motivated eager
+        # materialize twiddle).
+        if self.arch == "sm70" and getattr(wq, "_tl_layout", "natural") != "natural":
+            _, _, Np, Kp, _, bN = self._plan("linear_fp4", 1, N, K)
+            wq1, sc1 = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
+            osc1 = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
+            if M <= 8:
+                # Round M up the compiled ladder rather than always to 8, and
+                # hand the kernel X pre-packed as f16: otherwise it re-reads X
+                # per block and converts it inside the tile loop (78% of the
+                # M=8 bytes, 32 of ~49 per-row instructions). Packing collapses
+                # 127 us/row flat to 24-45 us/row, bit-exact — both paths round
+                # to nearest f16. M=1 is on the ladder too: 1.1-1.45x over the
+                # scalar GEMV it replaced.
+                Mk = 1 if M == 1 else 2 if M <= 2 else 4 if M <= 4 else 8
+                y2 = self._kernel(f"linear_fp4_gemv_sm70_m{Mk}h")(
+                    _pad2d(x2, Mk, Kp).to(torch.float16),
+                    wq1, sc1, osc1, self._zeros2(Mk, Np), 32, bN, blk,
+                )[:M, :N]
+            else:
+                MC = 32
+                y2 = torch.cat([
+                    self._kernel("linear_fp4_gemv_sm70_m32")(
+                        _pad2d(x2[m : m + MC], MC, Kp), wq1, sc1, osc1,
+                        self._zeros2(MC, Np), 32, bN, blk,
+                    )[: min(MC, M - m), :N]
+                    for m in range(0, M, MC)
+                ], 0)
+            y = self._epilogue(y2, None, lead, N)
+            return y if residual is None else y + residual
         plan = self._plan("linear_fp4", M, N, K)
         if plan is not None:
             kernel, Mp, Np, Kp, bM, bN = plan
@@ -542,43 +577,6 @@ class Backend:
                 self._kernel(kernel)(xq, wq, scale, ascale, y2, bM, bN, blk, _THREADS)
                 y2 = y2[:M, :N]
         else:
-            # sm70 M>1: the generic kernel decodes natural nibbles, but sm70's
-            # served bytes are fp16-twiddled. M<=8 (decode batch) uses the M-row
-            # twiddle GEMV — one launch, W loaded+decoded once and reused across
-            # rows. M>8 (prefill) chunks with the M=32 twin: 32 rows share one
-            # W stream, so M=512 is 16 launches/layer instead of 512. An
-            # untwiddle copy OOMs here (the forward's GPU is full — the scratch
-            # that motivated eager materialize twiddle).
-            if self.arch == "sm70" and getattr(wq, "_tl_layout", "natural") != "natural":
-                k1, _, Np, Kp, _, bN = self._plan("linear_fp4", 1, N, K)
-                wq1, sc1 = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
-                osc1 = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
-                if M <= 8:
-                    # Round M up the compiled ladder rather than always to 8:
-                    # the kernel costs 127 us/ROW flat (issue-bound, not weight
-                    # bound), so a 2-row verify padded to 8 pays 4x for rows
-                    # nobody reads.
-                    Mk = 2 if M <= 2 else 4 if M <= 4 else 8
-                    name = "linear_fp4_gemv_sm70_m" + ("" if Mk == 8 else str(Mk))
-                    y2 = self._kernel(name)(
-                        _pad2d(x2, Mk, Kp), wq1, sc1, osc1, self._zeros2(Mk, Np), 32, bN, blk
-                    )[:M, :N]
-                    y = self._epilogue(y2, None, lead, N)
-                    return y if residual is None else y + residual
-                # M>8 (prefill): chunk with the M=32 kernel — W loaded+decoded
-                # once per 32 rows, 32× fewer launches and weight bytes than the
-                # per-row M=1 loop it replaces.
-                MC = 32
-                chunks = [
-                    self._kernel("linear_fp4_gemv_sm70_m32")(
-                        _pad2d(x2[m : m + MC], MC, Kp), wq1, sc1, osc1,
-                        self._zeros2(MC, Np), 32, bN, blk,
-                    )[: min(MC, M - m), :N]
-                    for m in range(0, M, MC)
-                ]
-                y2 = torch.cat(chunks, 0)
-                y = self._epilogue(y2, None, lead, N)
-                return y if residual is None else y + residual
             bM, bN = min(64, M), min(64, N)
             if self.target.startswith("cuda"):
                 # WGMMA tiles %16, reduction K %64 (the fp4 dequant K-tile);

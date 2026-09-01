@@ -4,6 +4,24 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-01 — phase exit: packed-f16 X breaks the GEMV's per-row floor; dense B=1 25.8 -> 32.7 tok/s
+
+- The "127 us/row flat, issue-bound" ceiling was X, not the hardware. X is
+  re-read by every block (0.71 GB = 78% of the M=8 time) and converted f32->f16
+  inside the tile loop (32 of ~49 per-row instructions). Packing X once at the
+  dispatch site removes both.
+- Per-row cost stops being flat: M=8 127.5 -> 34.0 us/row at 17408x5120, M=1
+  128.1 -> 88.2. **Bit-exact** (relerr 0) — same rounding, done once. Parity
+  through the dispatch at M=1..8: worst 4.93e-04.
+- **A verify row now costs 10.7 ms against a 30.9 ms dense token** (was 63 vs
+  40.9). Verification is cheaper than decoding for the first time on this card.
+- Dense B=1 through the server: 25.8 -> **32.7 tok/s** at 31 ctx, 23.1 ->
+  **27.4** at 1K. The f32 rungs have no caller left and are deleted.
+- Speculation still OFF, but the blocker moved: `--depth 3` serves 1.3 tok/s
+  and `prof_spec_tick` puts **79% of the wall in `_draft_step`** (371 ms/step
+  vs 4.98 in isolation). The kernel economics are fixed; the draft path is not.
+  [wins/2026-09-01-sm70-gemv-packed-x-f16.md](docs/experience/wins/2026-09-01-sm70-gemv-packed-x-f16.md)
+
 ## 2026-09-01 — phase exit: verify replay W=2 271 -> 78 ms (M ladder); speculation still rejected
 
 - `linear_fp4_gemv_sm70_m` has no weight reuse: 127 us/ROW flat from M=1 to

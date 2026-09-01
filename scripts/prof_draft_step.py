@@ -56,7 +56,7 @@ def main() -> None:
     print(f"arch={backend.arch} io={backend.io} "
           f"fp8_kernel={backend.has_kernel('linear_fp8')} "
           f"fp4_gemv={backend.has_kernel('linear_fp4_gemv')} "
-          f"fp4_gemv_m={backend.has_kernel('linear_fp4_gemv_sm70_m')}")
+          f"fp4_gemv_m={backend.has_kernel('linear_fp4_gemv_sm70_m1h')}")
 
     model = load_hf(cfg, args.source, fuse_projections=True)
     model.params = backend.materialize(model.params)

@@ -171,3 +171,26 @@ tensors are constants, so my graph-capture worry was unfounded. A cheaper tree
 shape also exists: k independent chains sharing the committed root, laid out
 contiguously, makes `Parent[t]==t-1` hold everywhere except k chain heads (~8
 lines in GDN) and turns the ancestor mask into one int32 offset vector.
+
+## 2026-09-01
+
+**Packed-f16 X — the GEMV's per-row floor was never the hardware.**
+127 us/row flat was X being re-read per block (78% of the M=8 bytes) and
+converted f32->f16 inside the tile loop (32 of ~49 per-row instructions).
+Pack once at the dispatch site: 34.0 us/row at M=8, 88.2 at M=1, bit-exact.
+
+| shape | M=1 | M=2 /row | M=4 /row | M=8 /row |
+|---|---:|---:|---:|---:|
+| 17408x5120 | 128.1 -> 88.2 | 120.2 -> 44.9 | 126.9 -> 33.8 | 127.5 -> 34.0 |
+| 12288x5120 | 92.5 -> 82.4 | 87.4 -> 33.6 | 90.8 -> 24.8 | 90.7 -> 24.2 |
+| 5120x17408 | 133.9 -> 93.4 | 129.1 -> 56.7 | 133.0 -> 37.1 | 122.9 -> 37.2 |
+
+Verify replay W=1 38.6 -> 30.9 ms; marginal verify row 63 -> 10.7 ms.
+Dense B=1 server: 32.7 tok/s @31 ctx, 27.4 @1K (was 25.8 / 23.1).
+Entry: `wins/2026-09-01-sm70-gemv-packed-x-f16.md`.
+
+**Speculation blocker moved to the draft head.** `--depth 3` serves 1.3 tok/s
+against a 41.6 ms W=2 replay. `prof_spec_tick.py`: `_draft_step` is 16.7 s of
+21.2 s (79%), 371 ms per depth step vs 4.98 ms in isolation; `decode_graph`
+636 ms/tick vs a 41.6 ms replay of the same graph. No capture-failure warning,
+so the graph replays — the cost is around it. Next target.

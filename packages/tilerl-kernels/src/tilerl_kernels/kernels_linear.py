@@ -797,6 +797,46 @@ __device__ __forceinline__ void tl_warp_reduce_m_f16(float *acc) {
     for (int o = 16; o > 0; o >>= 1) acc[m] += __shfl_down_sync(0xffffffffu, acc[m], o);
   }
 }
+// X-as-f16 twin of tl_fp4_gemv_tiles_f16_m. The f32 version spends 32 of its
+// ~49 per-row instructions turning X into f16 (16 __float2half_rn + 8 shift +
+// 8 or) and re-reads X in every block: at M=8, N=17408 that is 4352 blocks x
+// 8 rows x 5120 f32 = 0.71 GB, 78% of the kernel's measured time. Pre-packed
+// f16 X halves the traffic and drops the row body to ~17 instructions, which
+// is what makes an M-row verify cheaper than M separate decodes.
+template <int G, int M>
+__device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m_xh(
+    const void *wqv, const void *xv, int K, int block_K,
+    const float *sc, float *acc) {
+  const unsigned char *wq = (const unsigned char *)wqv;
+  const unsigned *x = (const unsigned *)xv;  // 2 halves per word
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    unsigned w0, w1;
+    asm volatile("ld.global.nc.v2.u32 {%0,%1}, [%2];"
+                 : "=r"(w0), "=r"(w1) : "l"(wq + g * block_K / 2));
+    unsigned d0[4], d1[4];
+    tl_fp4_decode8_f16(w0, d0);
+    tl_fp4_decode8_f16(w1, d1);
+    // Same no-unroll rule as the f32 twin: one row's xw live at a time.
+    for (int m = 0; m < M; ++m) {
+      unsigned xw[8];
+      // 16 halves = 8 words = two v4.u32 loads, already in fp16.
+      const unsigned *xg = x + (size_t)m * (K / 2) + g * block_K / 2;
+      asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(xw[0]), "=r"(xw[1]), "=r"(xw[2]), "=r"(xw[3]) : "l"(xg));
+      asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(xw[4]), "=r"(xw[5]), "=r"(xw[6]), "=r"(xw[7]) : "l"(xg + 4));
+      unsigned a = 0u;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(xw[i]), "r"(d0[i]));
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(xw[4 + i]), "r"(d1[i]));
+      }
+      __half2 ah = __halves2half2(__ushort_as_half(a & 0xffff), __ushort_as_half(a >> 16));
+      acc[m] = fmaf(sc[g], __low2float(ah) + __high2float(ah), acc[m]);
+    }
+  }
+}
 // M-row twin: WQ is loaded + decoded ONCE per tile and reused across all M
 // rows, so the weight bytes (the bottleneck — W is ~900x X for M=1) do not
 // scale with M. M is a compile-time template arg (the factory bakes it); the
@@ -1148,15 +1188,17 @@ def make_linear_fp4_gemv_sm70(target: str, GROUP: int = 4):
     return linear_fp4_gemv_sm70
 
 
-def make_linear_fp4_gemv_sm70_m(target: str, M: int = 8, GROUP: int = 4):
+def make_linear_fp4_gemv_sm70_m(target: str, M: int = 8, GROUP: int = 4, xh: bool = False):
     """M-row (decode-batch) twin of make_linear_fp4_gemv_sm70.
 
-    X[M,K] f32, WQ[N,K//2] fp16-TWIDDLED, Scale[N,K//block] f32, OScale[N] f32,
-    Res[M,N] f32 -> Y[M,N] f32. WQ is loaded + decoded ONCE per tile and reused
-    across all M rows (tl_fp4_gemv_tiles_f16_m), so the weight bytes — the
-    bottleneck — do not scale with M. This is the sm70 decode-batch path
-    (M=2..16), replacing the per-row GEMV loop (M launches/layer, OOM-prone).
-    M is a compile-time factory arg; the backend pads M up and slices.
+    X[M,K] f32 (f16 when ``xh``), WQ[N,K//2] fp16-TWIDDLED, Scale[N,K//block]
+    f32, OScale[N] f32, Res[M,N] f32 -> Y[M,N] f32. WQ is loaded + decoded ONCE
+    per tile and reused across all M rows, so the weight bytes do not scale with
+    M. This is the sm70 decode-batch path (M=2..16), replacing the per-row GEMV
+    loop (M launches/layer, OOM-prone). M is a compile-time factory arg; the
+    backend pads M up and slices. ``xh`` takes X pre-packed as f16: same
+    numerics (both round to nearest f16), half the X traffic, and 32 fewer
+    instructions per row than converting inside the tile loop.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
@@ -1166,7 +1208,8 @@ def make_linear_fp4_gemv_sm70_m(target: str, M: int = 8, GROUP: int = 4):
         block_K = reduce_thread * micro
         num_ko = T.ceildiv(K, block_K)
         num_g = num_ko // GROUP
-        X: T.Tensor((M, K), "float32")
+        tiles = "tl_fp4_gemv_tiles_f16_m_xh" if xh else "tl_fp4_gemv_tiles_f16_m"
+        X: T.Tensor((M, K), "float16" if xh else "float32")
         WQ: T.Tensor((N, K // 2), "uint8")
         Scale: T.Tensor((N, K // block), "float32")
         OScale: T.Tensor((N,), "float32")
@@ -1186,7 +1229,7 @@ def make_linear_fp4_gemv_sm70_m(target: str, M: int = 8, GROUP: int = 4):
                 for g in T.unroll(GROUP):
                     sc[g] = Scale[n, (base + g * block_K) // block]
                 T.call_extern(
-                    f"tl_fp4_gemv_tiles_f16_m<{GROUP},{M}>",
+                    f"{tiles}<{GROUP},{M}>",
                     T.access_ptr(WQ[n, base // 2], "r"),
                     T.access_ptr(X[0, base], "r"),
                     K,
@@ -1199,7 +1242,7 @@ def make_linear_fp4_gemv_sm70_m(target: str, M: int = 8, GROUP: int = 4):
                 base = (num_g * GROUP + kt) * block_K + kr * micro
                 sc[0] = Scale[n, base // block]
                 T.call_extern(
-                    f"tl_fp4_gemv_tiles_f16_m<1,{M}>",
+                    f"{tiles}<1,{M}>",
                     T.access_ptr(WQ[n, base // 2], "r"),
                     T.access_ptr(X[0, base], "r"),
                     K,

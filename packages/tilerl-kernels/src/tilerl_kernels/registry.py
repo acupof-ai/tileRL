@@ -128,16 +128,24 @@ _register("fp4", "sm90", _SM90_KERNELS)
 _SM70_KERNELS = {
     **_CPU_KERNELS,
     "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv_sm70,
-    # M-row decode-batch GEMV: one launch for M rows instead of M launches.
-    # It does NOT amortize the weight stream the way the name suggests —
-    # measured 127 us/row flat from M=1 to M=16 at 17408x5120 (ncu: 255
-    # regs/thread, 12.2% occupancy, DRAM 6.8%), so the limiter is issue
-    # bandwidth, not weight bytes. Cost is therefore exactly linear in the
-    # COMPILED M, and padding a 2-row verify up to 8 pays 4x for nothing —
-    # hence the ladder, picked by row count at the dispatch site.
-    "linear_fp4_gemv_sm70_m": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(t, M=8),
-    "linear_fp4_gemv_sm70_m2": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(t, M=2),
-    "linear_fp4_gemv_sm70_m4": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(t, M=4),
+    # M-row ladder for decode/verify (M<=8), X handed in pre-packed as f16.
+    # One launch for M rows; the rung is picked by row count at the dispatch
+    # site so a 2-row verify does not pay for 8. Rounding X to f16 once outside
+    # the kernel — instead of re-reading it f32 per block and converting inside
+    # the tile loop — took 127 us/row flat down to 24-45 us/row, which is what
+    # makes batched verification cheaper than the same rows decoded one by one.
+    "linear_fp4_gemv_sm70_m1h": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(
+        t, M=1, xh=True
+    ),
+    "linear_fp4_gemv_sm70_m2h": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(
+        t, M=2, xh=True
+    ),
+    "linear_fp4_gemv_sm70_m4h": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(
+        t, M=4, xh=True
+    ),
+    "linear_fp4_gemv_sm70_m8h": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(
+        t, M=8, xh=True
+    ),
     # M=32 twin for the prefill M>8 path: 32 rows share one W stream, so
     # M=512 prefill is 16 launches/layer instead of 512.
     "linear_fp4_gemv_sm70_m32": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(t, M=32),

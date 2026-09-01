@@ -53,7 +53,7 @@ def _build_model(
     )
 
 
-def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2):
+def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16):
     """Wire the engine with the serving-size pools (512 blocks / 16 slots).
 
     ``devices``: replicate across these CUDA indices instead of one. The 27B in
@@ -65,11 +65,13 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2):
     carries the mtp.* keys) turning speculative decode on. On a
     bandwidth-bound card the verify rows are nearly free — one trunk forward
     reads 14 GB of weights regardless of how many candidate tokens it checks —
-    so the draft is what gets past the dense roofline.
+    so the draft is what gets past the dense roofline. ``slots`` sizes the GDN
+    state pool; with a draft each slot also owns spec_steps of step-state, so a
+    32 GB card needs 4, not the 16 a 96 GB card affords.
     """
     from . import engine as engine_mod
 
-    kw = dict(num_blocks=512, num_slots=16, max_batch=8, max_total_tokens=8192)
+    kw = dict(num_blocks=512, num_slots=slots, max_batch=8, max_total_tokens=8192)
     if draft is not None:
         kw["draft"], kw["spec_depth"] = draft, depth
     if not devices:
@@ -113,7 +115,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
         draft = load_draft(model, args.draft)
     engine = _build_engine(cfg, model, backend, devices=args.devices,
-                           draft=draft, depth=args.depth)
+                           draft=draft, depth=args.depth, slots=args.slots)
     tokenizer = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
@@ -411,6 +413,9 @@ def _build_parser() -> argparse.ArgumentParser:
                                         "Qwen3.8-27B-NVFP4 the mtp.* keys all live in "
                                         "model-00018-of-00018.safetensors, so pass that shard.")
     p_serve.add_argument("--depth", type=int, default=2, help="drafts per row per tick")
+    p_serve.add_argument("--slots", type=int, default=16,
+                         help="GDN state slots; lower on <40GB GPUs (with --draft each slot "
+                              "also owns the per-step verify states)")
     p_serve.set_defaults(func=cmd_serve)
 
     p_train = sub.add_parser("train", help="train a model on random-token batches")
