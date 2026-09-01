@@ -17,7 +17,8 @@ seq_q = 1+depth row — no second code path. The trunk's paged KV needs no
 rollback (a rejected draft's slot is overwritten next tick), but the gated-delta
 recurrent state does: the verify forward keeps the state after every chain step
 (``BatchKv.keep_steps``) and the engine adopts the one at the accepted length.
-Spec ticks run eager; pure-decode ticks without a draft still replay the graph.
+A spec tick is captured too, one graph per (batch bucket, chain width) — which
+is why a width first seen inside a timed window puts its capture in the number.
 
 The decode tick is a captured kernel sequence, not an interpreted one
 (design-engine.md): on CUDA, a pure-decode tick replays a per-batch-size
@@ -425,6 +426,7 @@ class Engine:
                 kv_pool.num_blocks, draft.cfg.num_kv_heads, draft.cfg.head_dim,
                 num_layers=draft.cfg.num_layers, device=backend.device,
                 layer_map=tuple(range(draft.cfg.num_layers)),
+                dtype=kv_pool.k_pool.dtype,  # same attention kernel, same IO cast
             )
 
         self._pin = backend.device.type == "cuda"
@@ -991,6 +993,14 @@ class Engine:
             if r.hidden is None or r.phase == _PHASE_DONE:
                 continue
             lo, hi = max(1, r.draft_pos + 1), r.seq_len - 1
+            # A chunked prefill overwrites r.hidden per chunk, so the hiddens
+            # for everything before the LAST chunk are gone while draft_pos is
+            # still behind them: a 1024 prompt at 512/chunk asked for 1535
+            # positions and had 511. Start where the hidden actually begins.
+            # The skipped span's draft KV goes unwritten, and the draft's own
+            # attention is its only reader — it reads zeros there instead of a
+            # stale neighbour, because _draft_kv is zeroed for a fresh block.
+            lo = max(lo, r.hidden_from - (1 if r.hidden_prev is not None else 0) + 1)
             if hi < lo:
                 continue
             plan.append((r, lo, hi))
@@ -1016,7 +1026,13 @@ class Engine:
             if r.hidden_prev is not None:
                 h, base = torch.cat([r.hidden_prev, r.hidden], dim=1), base - 1
             off = (lo - 1) - base
-            hs.append(torch.nn.functional.pad(h[:, off : off + q], (0, 0, 0, w - q)))
+            span = h[:, off : off + q]
+            if span.shape[1] != q:
+                raise RuntimeError(
+                    f"_draft_step: hidden covers [{base}, {base + h.shape[1]}) but the draft "
+                    f"needs [{lo - 1}, {hi}) -> off={off} q={q} gave {span.shape[1]} rows"
+                )
+            hs.append(torch.nn.functional.pad(span, (0, 0, 0, w - q)))
         kv = BatchKv(
             block_table=bt.to(dev), seq_len=torch.tensor(sl, device=dev),
             state_slot=torch.zeros(n, dtype=torch.long, device=dev),
@@ -1297,6 +1313,12 @@ def build_engine(
         cfg.head_dim,
         device=backend.device,
         layer_map=cfg.full_attn_layers,
+        # Match the attention kernel's IO dtype. sm70's is f32, and a bf16 pool
+        # made every attention call cast the WHOLE plane (all num_blocks, not
+        # the live ones): 4.71 ms/token, 14% of a 4096-ctx token, independent of
+        # context. Same trade the state pool makes below. getattr: test doubles
+        # stand in for Backend without declaring an io dtype.
+        dtype=getattr(backend, "io", torch.bfloat16),
     )
     state_pool = LinearStatePool(
         num_slots,

@@ -155,13 +155,14 @@ _SM70_KERNELS = {
     # GDN chunk prefill (T>1): without it the prefill falls to reference.gdn_forward
     # (Python serial scan, ~250k eager ops for 8×64 — 62s of the 64s tick 1).
     "gdn_chunk_fused": kernels_gdn.make_gdn_chunk_fused,
-    "write_tokens": kernels_mma.make_write_tokens,
-    # Split-KV decode attention (S==1). sm70 ONLY: the kernel source is
-    # target-neutral, but the win comes from filling 80 SMs, so it is a loss
-    # where T.Kernel lowers to a serial loop (cpu/rocm) and unproven on metal.
-    # The generic kernel grids over (B, H) — 24 blocks at B=1 on the 27B, one
-    # active thread each (its dot is a serial fragment reduction), measured
-    # 0.76 ns/scalar-FMA = the single-thread rate.
+    # f32 pool on sm70: the attention kernel is f32-IO, and a bf16 pool made
+    # every call cast the whole plane (4.71 ms/token, 14% of a 4096-ctx token).
+    "write_tokens": kernels_mma.make_write_tokens_f32,
+    # Split-KV decode attention, S>=1 (a speculative verify is served here too).
+    # sm70 ONLY: the source is target-neutral, but the win comes from filling 80
+    # SMs, so it is a loss where T.Kernel lowers to a serial loop (cpu/rocm) and
+    # unproven on metal. Every sm70 attention call takes this path — the generic
+    # kernel above it is reachable only on the other targets.
     "paged_attention_split": lambda t: kernels.make_paged_attention_split(t, KVSPLIT=32),
     "paged_attention_split_combine": lambda t: kernels.make_paged_attention_split_combine(
         t, KVSPLIT=32

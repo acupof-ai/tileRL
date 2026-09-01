@@ -819,9 +819,12 @@ class Backend:
         # .contiguous(): the ABI is packed. A bf16 view (e.g. v sliced from
         # the fused-qkv GEMV output) survives _dev's no-op cast and violates
         # it at B>=2; the f32 WGMMA path's cast already copied.
+        # The pool's dtype is the kernel's: sm70 allocates f32 so attention
+        # does not cast the whole plane per call.
+        io = k_plane.dtype
         self._kernel("write_tokens")(
-            self._dev(k, torch.bfloat16).contiguous(),
-            self._dev(v, torch.bfloat16).contiguous(),
+            self._dev(k, io).contiguous(),
+            self._dev(v, io).contiguous(),
             k_plane,
             v_plane,
             self._i32(kv.block_table).contiguous(),

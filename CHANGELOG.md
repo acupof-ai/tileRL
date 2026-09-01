@@ -4,6 +4,30 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-02 — phase exit: KV pool dtype, dense +18%, spec peak 50.8 tok/s
+
+- A per-kernel profile of the decode window found **4.71 ms/token (14%) in 32
+  elementwise calls** — 2 per full-attn layer: the KV pool is bf16 and the sm70
+  attention kernel is f32, so every layer of every token cast the WHOLE plane
+  (all 1024 blocks, not the live ones — hence flat in context). Allocating the
+  pool at `backend.io` removes it; +1 GB device memory. The identical fix
+  already existed on `LinearStatePool` and the KV pool never got it.
+- Dense **30.0 -> 35.3 tok/s at 4096 ctx**, ~18% at every context. Elementwise
+  7.69 -> 2.75 ms/token. Spec d3 peaks at **50.8 tok/s at 1024 ctx**; 4096 ctx
+  is 40.3, **2.41x** the 16.7 it read at the start of the day.
+- **The roofline was wrong.** The checkpoint measures 20.35 GB (nibbles 12.81,
+  f32 block scales 3.22, norms/embed/lm_head 4.32), not the 14 GB cited
+  everywhere until now. The real bound is 44.2 tok/s, so dense 35.3 is **80% of
+  roofline**. Speculation above it is expected — one weight read, several
+  tokens.
+- **`_draft_step` was reading hidden it did not have.** A chunked prefill
+  overwrites `r.hidden` per chunk while `draft_pos` stays behind them: a 1024
+  prompt at 512/chunk asked for 1535 positions and held 511, and `F.pad` took
+  the truncation silently. Every speculative number measured before this fix —
+  including yesterday's 46.5 peak — used misaligned hidden. tok/fwd is
+  unchanged by the fix, so it cost correctness, not throughput.
+  [wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi.md](docs/experience/wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi.md)
+
 ## 2026-09-01 — phase exit: long-context decode fixed, 4096 ctx 17.4 -> 30.0 tok/s
 
 - Decode fit `ms/tok = 31.9 + 6.20*(ctx/1K)` against a 0.07 ms/1K roofline —
