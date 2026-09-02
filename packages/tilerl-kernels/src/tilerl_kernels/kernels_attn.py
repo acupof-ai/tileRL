@@ -236,11 +236,13 @@ def make_paged_attention_combine(target: str, KVSPLIT: int = 16):
             for sp in T.unroll(KVSPLIT):
                 w[sp] = T.exp2(PM[bb, hkv, sp, g] - m[0])
                 l[0] += w[sp] * PL[bb, hkv, sp, g]
-            for i in T.unroll(D // 32):
-                acc[0] = 0.0
-                for sp in T.unroll(KVSPLIT):
-                    acc[0] += w[sp] * PO[bb, hkv, sp, g, i * 32 + lane]
-                Out[bb, hkv, g, i * 32 + lane] = T.cast(acc[0] / l[0], "bfloat16")
+            # guarded, not D // 32: a head_dim under 32 left every Out row unwritten
+            for i in T.unroll(T.ceildiv(D, 32)):
+                if i * 32 + lane < D:
+                    acc[0] = 0.0
+                    for sp in T.unroll(KVSPLIT):
+                        acc[0] += w[sp] * PO[bb, hkv, sp, g, i * 32 + lane]
+                    Out[bb, hkv, g, i * 32 + lane] = T.cast(acc[0] / l[0], "bfloat16")
         return Out
 
     return paged_attention_combine

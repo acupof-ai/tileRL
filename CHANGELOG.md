@@ -3,6 +3,10 @@
 One line per event — phase exit, default flip, accept-or-reject verdict — with
 its `docs/experience/` entry. Newest first.
 
+## 2026-09-03
+
+- **accept** — `paged_attention_combine` wrote nothing at `head_dim < 32` (`for i in T.unroll(D // 32)` has extent 0 at 16), so every CUDA test decoding through the split-KV path read an uninitialised buffer: `tests/test_e2e.py -k "specul or draft"` was 5 failed on sm90 and is 5 passed. Serving is unaffected — the 27B is `head_dim=256`. [errors/2026-09-03-combine-loop-extent-zero-at-small-head-dim.md](docs/experience/errors/2026-09-03-combine-loop-extent-zero-at-small-head-dim.md)
+
 ## 2026-09-02
 
 - **phase exit** — Claude Code drives tileRL: `POST /v1/messages` shim logs every request's prompt ids, completion ids and logprobs under `x-tilerl-request-id` (re-tokenising a transcript is a silently wrong gradient); `rollout.py` serves tileRL and runs `claude -p` against it, episode tag via `ANTHROPIC_CUSTOM_HEADERS`, Claude Code's own sandbox with `failIfUnavailable`; tool calls speak the checkpoint's `<tool_call><function=…>` XML. Gates `tests/test_server.py`, `tests/test_rollout.py`. [messages_shim_stage1.md](docs/lessons/messages_shim_stage1.md), [rollout_launcher_stage2.md](docs/lessons/rollout_launcher_stage2.md)
