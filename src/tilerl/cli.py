@@ -10,10 +10,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
+import statistics
 import sys
 import time
 from pathlib import Path
+
+from .eval import answer_match, last_number  # noqa: F401  (tests import last_number from here)
 
 __all__ = ["main"]
 
@@ -21,17 +23,6 @@ __all__ = ["main"]
 #: with TILERL_QWEN38_SOURCE once the checkpoint is downloaded.
 # ponytail: placeholder hub id; pin the real Qwen3-27B repo when weights land.
 _QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")
-
-_NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
-
-
-def last_number(text: str | None) -> float | None:
-    """The last number in a completion — the GSM8K answer convention."""
-    found = _NUMBER.findall(text or "")
-    try:
-        return float(found[-1].replace(",", "")) if found else None
-    except ValueError:
-        return None
 
 
 def _build_model(
@@ -164,13 +155,16 @@ def cmd_train(args: argparse.Namespace) -> None:
 
         optimizer = ISO(optimizer)
     gen = torch.Generator().manual_seed(args.seed)
+    log = (lambda *a: None) if getattr(args, "json", False) else print
 
-    print(
+    log(
         f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
         f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}"
     )
     if adapters_only:
         from .engine import SamplingParams
+        from .eval import gsm8k_accuracy, mmlu_accuracy
+        from .ledger import commit, file_hash, new_manifest, read_manifest, runs_root
         from .tokenizer import get_tokenizer, render_chat
 
         tok = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
@@ -188,12 +182,39 @@ def cmd_train(args: argparse.Namespace) -> None:
             stop_token_ids=getattr(tok, "stop_token_ids", ()),
             thinking_budget=args.think_budget if end_think else None, end_think_ids=end_think)
 
-        def mmlu(engine):
-            if args.eval_mmlu:
-                from .eval import mmlu_accuracy
+        # The run id is the hash of these: same inputs = same run, a finished
+        # one is returned instead of retrained. Checkpoint path + code commit is
+        # the identity, not the 15 GB of weight bytes.
+        inputs = {"model": args.model,
+                  "source": _QWEN38_SOURCE if args.model == "qwen38-27b" else "tiny",
+                  "commit": commit(), "algo": "grpo" if args.rl else "opd",
+                  "data": file_hash(args.data) if args.data else None, "steps": args.steps,
+                  "group": args.group, "max_new_tokens": args.max_new_tokens,
+                  "temperature": args.temperature, "think_budget": args.think_budget,
+                  "lr": args.lr, "lora_rank": args.lora_rank, "seed": args.seed,
+                  "eval_mmlu": args.eval_mmlu,
+                  "eval_gsm8k": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
+                  "eval_n": args.eval_n}
+        manifest = new_manifest("train", inputs)
+        prev = read_manifest(runs_root(), manifest["id"])
+        if prev and prev["finished"] and not args.force:
+            log(f"run {prev['id']} already finished; --force reruns")
+            return _finish(prev, args.json)
+        manifest["metrics"] = dict.fromkeys(("reward_first", "reward_last", "ce_last",
+                                             "secs_per_step_median", "mmlu_before", "mmlu_after",
+                                             "gsm8k_before", "gsm8k_after"))
+        eval_rows = ([json.loads(ln) for ln in Path(args.eval_gsm8k).read_text().splitlines()
+                      if ln.strip()][: args.eval_n] if args.eval_gsm8k else [])
 
+        def evals(engine, tag):
+            if args.eval_mmlu:
                 c, n = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=8)
-                print(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}%")
+                manifest["metrics"][f"mmlu_{tag}"] = c / n
+                log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}%")
+            if eval_rows:
+                c, n = gsm8k_accuracy(engine, tok, eval_rows, sampling, concurrency=8)
+                manifest["metrics"][f"gsm8k_{tag}"] = c
+                log(f"gsm8k greedy {c}/{n} = {100 * c / n:.1f}%")
 
     if args.rl:
         from .engine import build_engine
@@ -213,12 +234,11 @@ def cmd_train(args: argparse.Namespace) -> None:
                               decode_graph=False, prefix_store=NoPrefixStore())
         trainable = add_lora(model, rank=args.lora_rank)
         if rows:
-            gold = {tuple(p): last_number(r["answer"]) for p, r in zip(prompts, rows)}
+            gold = {tuple(p): r["answer"] for p, r in zip(prompts, rows)}
 
             def reward(prompt, completion):
-                got = last_number(tok.decode([int(t) for t in completion]))
-                want = gold[tuple(int(t) for t in prompt)]
-                return float(got is not None and want is not None and abs(got - want) < 1e-6)
+                text = tok.decode([int(t) for t in completion])
+                return float(answer_match(text, gold[tuple(int(t) for t in prompt)]))
         else:
             half = cfg.vocab_size // 2
             # Demo reward: dense, so an untrained policy's group has variance
@@ -227,14 +247,17 @@ def cmd_train(args: argparse.Namespace) -> None:
                 return sum(1 for t in completion if t < half) / max(len(completion), 1)
 
         optimizer.lr = args.lr
-        mmlu(engine)  # LoRA B is zero at init, so this is the base model's score
+        evals(engine, "before")  # LoRA B is zero at init, so this is the base model's score
         hist = train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend,
                                    optimizer, group=args.group, sampling=sampling,
                                    seed=args.seed, trainable=trainable)
         for i, (r, ce, secs) in enumerate(hist):
-            print(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  {secs:.1f}s")
-        mmlu(engine)
-        return
+            log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  {secs:.1f}s")
+        evals(engine, "after")
+        manifest["metrics"].update(
+            reward_first=hist[0][0], reward_last=hist[-1][0], ce_last=hist[-1][1],
+            secs_per_step_median=statistics.median(s for *_, s in hist))
+        return _finish(manifest, args.json)
     if args.opd:
         from .engine import build_engine
         from .model import add_lora
@@ -249,13 +272,14 @@ def cmd_train(args: argparse.Namespace) -> None:
         teacher = build_engine(cfg, model, backend, num_blocks=512, num_slots=8,
                                draft=draft, spec_depth=args.depth)
         trainable = add_lora(model, rank=args.lora_rank)
-        mmlu(teacher)
+        evals(teacher, "before")
         losses = train_mod.opd_loop(teacher, model, prompts, args.steps, backend, optimizer,
                                     seed=args.seed, trainable=trainable, sampling=sampling)
         for i, loss in enumerate(losses):
-            print(f"step {i + 1:4d}/{args.steps}  loss {loss:.4f}")
-        mmlu(teacher)
-        return
+            log(f"step {i + 1:4d}/{args.steps}  loss {loss:.4f}")
+        evals(teacher, "after")
+        manifest["metrics"]["ce_last"] = losses[-1]
+        return _finish(manifest, args.json)
     for step in range(args.steps):
         # ponytail: fixed batch=2 seq=64 random-token batch; a real corpus
         # plugs in here without touching train_step.
@@ -265,6 +289,29 @@ def cmd_train(args: argparse.Namespace) -> None:
         # step's intermediates and replays all history on each backward).
         loss = train_mod.train_step(model, input_ids, backend, optimizer, Tape())
         print(f"step {step + 1:4d}/{args.steps}  loss {loss:.4f}")
+
+
+def _finish(m: dict, as_json: bool) -> None:
+    """Gate, write the manifest, print it, exit non-zero on a failed gate.
+    A gate whose metric was not evaluated passes vacuously (value null)."""
+    from .ledger import format_run, gates_pass, now, runs_root, write_manifest
+
+    if not m["finished"]:
+        g = m["metrics"]
+        mmlu_floor = None if g["mmlu_before"] is None else g["mmlu_before"] - 0.03
+        m["gates"] = [
+            {"name": n, "value": v, "threshold": t,
+             "passed": v is None or t is None or ok(v, t)}
+            for n, v, t, ok in (
+                ("reward_rises", g["reward_last"], g["reward_first"], lambda v, t: v > t),
+                ("mmlu_holds", g["mmlu_after"], mmlu_floor, lambda v, t: v >= t),
+                ("gsm8k_improves", g["gsm8k_after"], g["gsm8k_before"], lambda v, t: v > t),
+            )]
+        m["finished"] = now()
+        write_manifest(runs_root(), m)
+    print(json.dumps(m, indent=1) if as_json else format_run(m))
+    if not gates_pass(m):
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +484,13 @@ def cmd_merge(args: argparse.Namespace) -> None:
     print(f"merged {len(args.specialists)} specialists ({args.method}) -> {args.out}")
 
 
+def cmd_ledger(args: argparse.Namespace) -> None:
+    from .ledger import format_run, lineage, list_runs, runs_root
+
+    runs = lineage(runs_root(), args.lineage) if args.lineage else list_runs(runs_root())
+    print(json.dumps(runs, indent=1) if args.json else "\n".join(map(format_run, runs)))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tilerl",
@@ -476,6 +530,13 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="tokens the 27B may spend in <think> per rollout; 0 = none")
     p_train.add_argument("--eval-mmlu", type=int, default=0,
                          help="score N MMLU questions before and after (needs `datasets`)")
+    p_train.add_argument("--eval-gsm8k", help="JSONL {prompt, answer}: greedy exact-match "
+                         "accuracy before and after")
+    p_train.add_argument("--eval-n", type=int, default=100, help="rows of --eval-gsm8k to score")
+    p_train.add_argument("--force", action="store_true",
+                         help="retrain even if this run's manifest is already finished")
+    p_train.add_argument("--json", action="store_true",
+                         help="print the run manifest as JSON instead of step lines")
     p_train.add_argument("--lr", type=float, default=1e-3)
     p_train.add_argument("--optim", choices=["adafactor", "iso"], default="adafactor",
                          help="full-parameter SFT optimizer; --rl/--opd train LoRA and ignore it")
@@ -538,6 +599,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_merge.add_argument("--out", required=True, help="merged checkpoint dir")
     p_merge.add_argument("--method", choices=["iso", "average"], default="iso")
     p_merge.set_defaults(func=cmd_merge)
+
+    p_ledger = sub.add_parser("ledger", help="list runs ($TILERL_RUNS, default ./runs)")
+    p_ledger.add_argument("--lineage", metavar="ID", help="this run and what it descends from")
+    p_ledger.add_argument("--json", action="store_true")
+    p_ledger.set_defaults(func=cmd_ledger)
 
     return parser
 

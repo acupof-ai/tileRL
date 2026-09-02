@@ -4,6 +4,20 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-02 — phase exit: runs have a ledger — manifests, idempotent ids, gates as exit codes
+
+- `tilerl train --rl|--opd` writes `runs/<id>/manifest.json`: inputs, commit,
+  metrics, gates, artifacts, parents. `id = hash(inputs)` (checkpoint path +
+  commit, not weight bytes), so an identical rerun prints the finished
+  manifest and does not train; `--force` reruns, `--json` prints the manifest.
+- Gates: reward rises, MMLU holds within 3 pt, GSM8K improves — data in the
+  manifest, exit 1 in the CLI. `--eval-gsm8k <jsonl> --eval-n N` scores greedy
+  exact match before and after, next to `--eval-mmlu`.
+- `tilerl ledger [--lineage ID] [--json]` lists runs newest first.
+- Dev tooling and eval, no bench entry. Gate: `tests/test_ledger.py`.
+  Roadmap P4 exits; the rl → eval → merge → serve chain waits on `eval` and
+  `merge` commands ([docs/design-rl-stack.md](docs/design-rl-stack.md) §3).
+
 ## 2026-09-02 — accept: ISO-Merger lands as `tilerl merge`, gated on two tiny specialists
 
 - `src/tilerl/merge.py`: checkpoint-only merge of specialists sharing a base —

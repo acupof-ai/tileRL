@@ -117,19 +117,6 @@ def test_last_number():
     assert last_number("no digits") is None and last_number(None) is None
 
 
-def test_train_cli_real_task(tmp_path):
-    """`tilerl train --rl --data`: JSONL prompts through the tokenizer, ChatML,
-    the exact-match reward, one GRPO step, per-step seconds — the plumbing the
-    27B run uses, on the tiny model."""
-    from tilerl.cli import _build_parser, cmd_train
-
-    data = tmp_path / "d.jsonl"
-    data.write_text('{"prompt": "1+1?", "answer": "2"}\n{"prompt": "2+2?", "answer": "4"}\n')
-    cmd_train(_build_parser().parse_args(
-        ["train", "--rl", "--data", str(data), "--steps", "2", "--group", "2",
-         "--max-new-tokens", "4", "--lora-rank", "4"]))
-
-
 if __name__ == "__main__":  # runnable check
     test_group_advantages()
     test_rl_step_matches_sft_at_unit_advantage()
