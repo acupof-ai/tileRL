@@ -85,3 +85,34 @@ def test_layer_indices_must_be_zero_based(tmp_path):
     save_file({k.replace("layers.0.", "layers.7."): v for k, v in t.items()}, str(p))
     with pytest.raises(RuntimeError, match="indexed"):
         load_draft(trunk, p)
+
+
+def test_quantize_draft_is_idempotent():
+    """A second engine over the same draft must not re-pack packed weights.
+
+    `build_engine` writes `_quantize_draft`'s output back into `draft.params` IN
+    PLACE (DraftHead.layers is a Model holding that dict). Run twice, the second
+    pass saw `fc.wq` — 2-D and over the size threshold — and packed it again into
+    `fc.wq.wq`, after which the plain `fc` lookup raised `KeyError: 'fc'` from
+    inside the draft forward. Silent until then: nothing on the load path checks
+    whether the weights are already served.
+
+    One engine per process is the shipped path, so this gates the profiler and
+    train-loop cases that build several over one draft.
+    """
+    from tilerl.engine import _quantize_draft
+
+    raw = {
+        "fc": torch.randn(256, 512),
+        "norm": torch.ones(256),  # 1-D: never packed
+        "layers.0.q_proj": torch.randn(256, 256),
+        "small": torch.randn(4, 4),  # under the 128 threshold: never packed
+    }
+    once = _quantize_draft(raw, fp4=True)
+    assert "fc.wq" in once and "fc" not in once, "fc should be packed"
+    assert once["norm"].shape == (256,) and "small" in once
+
+    twice = _quantize_draft(once, fp4=True)
+    assert set(twice) == set(once), "a second pass must be a no-op, not a re-pack"
+    assert "fc.wq.wq" not in twice
+    assert torch.equal(twice["fc.wq"], once["fc.wq"])

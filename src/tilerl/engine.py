@@ -55,9 +55,18 @@ _HASH_MASK = 0x7FFFFFFF
 
 def _quantize_draft(params: dict[str, torch.Tensor], fp4: bool = False) -> dict[str, torch.Tensor]:
     """Re-serve a draft head's [N,K] projections block-quantized: fp8 by default,
-    fp4 where that is the arch's only fused GEMV (sm70 has no ``linear_fp8``)."""
+    fp4 where that is the arch's only fused GEMV (sm70 has no ``linear_fp8``).
+
+    Idempotent: `build_engine` writes the result back into `draft.params` in
+    place, so a second engine over the same draft would otherwise re-pack the
+    already-packed `fc.wq` into `fc.wq.wq` and the plain `fc` lookup would raise
+    `KeyError: 'fc'`. One engine per process is the shipped path, but a train loop
+    or a profiler comparing configurations builds several.
+    """
     from tilerl_kernels import reference
 
+    if any(k.endswith((".wq", ".w8")) for k in params):
+        return dict(params)  # already served
     out: dict[str, torch.Tensor] = {}
     for k, v in params.items():
         if v.ndim == 2 and v.shape[0] >= 128 and v.shape[1] >= 128:
