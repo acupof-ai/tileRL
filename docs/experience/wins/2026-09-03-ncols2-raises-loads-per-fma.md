@@ -86,8 +86,11 @@ rest of prefill without a profiler: a 1.82× kernel produces gain
 
 consistent with the ~85% used to price this, and the trend is the interesting part:
 the GEMV's share **falls** with context, so what grows is attention — the one part
-of prefill that is quadratic. At 4096 the non-GEMV 18% is now the ceiling on any
-further GEMV work.
+of prefill that is quadratic. **Both halves of that are now measured**, and the
+share figure below is corrected: post-fix the non-GEMV remainder at 4096 is **27.1%**,
+not 18%, and attention is the only class in prefill that is not flat per token
+(5.07× from 512 to 4096, everything else within 0.1%) — see
+[`wins/2026-09-03-prefill-attention-is-what-grows.md`](2026-09-03-prefill-attention-is-what-grows.md).
 
 **Text parity, `scripts/parity_ncols.py`**: greedy continuations are identical
 between arms for two real prompts, at 10-17 tokens (M=1) and 600 tokens (prefill

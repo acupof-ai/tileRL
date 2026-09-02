@@ -42,7 +42,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from tilerl import cli
 from tilerl.cli import _build_model
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine
 from tilerl_kernels.backend import get_backend
 
 #: Kernel-name substring -> op class. First match wins, so order matters.
@@ -69,6 +69,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True)
     ap.add_argument("--ctx", type=int, default=512, help="one chunk at the default budget")
+    ap.add_argument("--all", action="store_true",
+                    help="window every chunk, not just the first: required above the "
+                         "chunk budget, where step() #1 is only tokens 0..512")
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
     cli._QWEN38_SOURCE = args.source
@@ -92,11 +95,23 @@ def main() -> None:
     # chunk budget the prompt is one chunk, so step() #1 does the whole prefill
     # AND emits the token. Profiling a second step then windows on an empty
     # queue and reports 0 ms — which it did, before this was split up.
+    #
+    # Above the chunk budget, step() #1 is only chunk ONE (tokens 0..512), whose
+    # attention window is the same as a ctx=512 prompt's. To see how the mix moves
+    # with context, the window has to span EVERY chunk, so --all steps until the
+    # request reaches decode. Without it, two contexts profile the same tick and
+    # the table shows no context dependence because none was measured.
     rid = submit(500000)
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA], record_shapes=False) as prof:
         t0 = time.perf_counter()
         e.step()
+        if args.all:
+            while True:
+                req = next((r for r in e._running if r.req_id == rid), None)
+                if req is None or req.phase == _PHASE_DECODE:
+                    break
+                e.step()
         torch.cuda.synchronize()
         wall = (time.perf_counter() - t0) * 1000
     drain(rid)
@@ -117,22 +132,27 @@ def main() -> None:
     if not by_cls or total <= 1.0:
         raise SystemExit("no CUDA kernels in the window — the profiled step did no work")
 
-    print(f"\n# ONE prefill tick, {args.ctx} rows: {total / 1000:.0f} ms GPU / {wall:.0f} ms wall")
+    # Rows actually inside the window: the whole prompt with --all, otherwise one
+    # chunk. Dividing a one-chunk window by args.ctx is how a 4096 run would report
+    # an 8x-too-cheap per-token cost.
+    rows = args.ctx if args.all else min(args.ctx, e.limits.max_num_batched_tokens)
+    span = "whole prefill" if args.all else "ONE prefill tick"
+    print(f"\n# {span}, {rows} rows: {total / 1000:.0f} ms GPU / {wall:.0f} ms wall")
     # FLOP, not bytes: at M=512 the chunk re-reads the weights once and does 512
     # rows against them, so the byte roofline is off by a factor of M here.
-    tflop = 2 * 25.62e9 * args.ctx / 1e12
+    tflop = 2 * 25.62e9 * rows / 1e12
     floor = tflop / 31.4 * 1000
-    print(f"# {total / 1000 / args.ctx:.2f} ms GPU per prompt token "
+    print(f"# {total / 1000 / rows:.2f} ms GPU per prompt token "
           f"(decode is 26.6 ms/token at M=1, but that path is bandwidth-bound)")
-    print(f"# {tflop:.1f} TFLOP this tick / 31.4 TFLOPS fp16 scalar = {floor:.0f} ms floor "
+    print(f"# {tflop:.1f} TFLOP in this window / 31.4 TFLOPS fp16 scalar = {floor:.0f} ms floor "
           f"-> {total / 1000 / floor:.1f}x off")
     if total / 1000 > 2 * wall:
-        print(f"\n!! {total / 1000:.0f} ms GPU inside a {wall:.0f} ms tick — the window is wrong.")
-    print(f"\n{'class':>14} {'ms/tick':>9} {'% GPU':>7} {'ms/token':>9}")
+        print(f"\n!! {total / 1000:.0f} ms GPU inside a {wall:.0f} ms window — it is wrong.")
+    print(f"\n{'class':>14} {'ms':>9} {'% GPU':>7} {'ms/token':>9}")
     for cls, us in sorted(by_cls.items(), key=lambda kv: -kv[1]):
         print(f"{cls:>14} {us / 1000:>9.1f} {100 * us / total:>6.1f}% "
-              f"{us / 1000 / args.ctx:>9.3f}")
-    print(f"\n{'kernel':>52} {'ms/tick':>9} {'calls':>7}")
+              f"{us / 1000 / rows:>9.3f}")
+    print(f"\n{'kernel':>52} {'ms':>9} {'calls':>7}")
     for name, (us, cnt) in sorted(by_kernel.items(), key=lambda kv: -kv[1][0])[:15]:
         print(f"{name[-52:]:>52} {us / 1000:>9.1f} {cnt:>7}")
 
