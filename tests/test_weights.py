@@ -4,6 +4,7 @@ layer_types mismatch, rope/tie fields the checkpoint contradicts)."""
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 
@@ -274,6 +275,46 @@ def test_fp4_save_load_roundtrip(tmp_path):
         return done[rid]
 
     assert greedy(loaded) == greedy(model)
+
+
+def test_sm70_chunks_cover_every_row_exactly_once():
+    """The sm70 GEMV ladder chunks M into 1/2/4/8/32-row launches. A slicing bug
+    is invisible where it runs — only M that does not divide 32 exposes it, and the
+    sm70 branch never executes on the CPU target the parity tests use — so gate the
+    arithmetic directly: chunks must tile [0, M) with no gap, no overlap, and each
+    chunk's rung must be the smallest that holds its rows."""
+    from tilerl_kernels.backend import _sm70_chunks
+
+    for m in (1, 2, 3, 5, 8, 9, 16, 32, 33, 40, 64, 100, 512):
+        chunks = _sm70_chunks(m)
+        assert [o for o, _, _ in chunks] == list(
+            itertools.accumulate([r for _, r, _ in chunks][:-1], initial=0)
+        ), f"M={m}: offsets do not follow the row counts"
+        assert sum(r for _, r, _ in chunks) == m, f"M={m}: chunks do not cover M"
+        for _, r, rung in chunks:
+            assert rung >= r, f"M={m}: rung {rung} cannot hold {r} rows"
+            assert rung in (1, 2, 4, 8, 32), f"M={m}: {rung} is not a ladder rung"
+            smaller = [w for w in (1, 2, 4, 8, 32) if w >= r]
+            assert rung == min(smaller), f"M={m}: {r} rows took rung {rung}, not {min(smaller)}"
+    # The whole point of the per-chunk rung: 40 rows is 32+8, not 32+32.
+    assert [rung for _, _, rung in _sm70_chunks(40)] == [32, 8]
+
+
+def test_fp4_save_widens_f16_scale_plane(tmp_path):
+    """A backend may serve the block scales narrowed (sm70 does, at f16); the NVFP4
+    format's are f32, so save_hf must widen them or the written checkpoint is
+    unreadable by anything that trusts the format. The dtype is all save_hf reacts
+    to, so narrowing the planes directly keeps this hermetic."""
+    cfg = replace(tiny(), fp4=True, tie_word_embeddings=False)
+    model = build_random(cfg, seed=7)
+    for key in fp4_param_keys(cfg):
+        model.params[key + ".scale"] = model.params[key + ".scale"].to(torch.float16)
+    save_hf(model, tmp_path / "ckpt")
+    loaded = load_hf(cfg, str(tmp_path / "ckpt"))
+    for key in fp4_param_keys(cfg):
+        sc = loaded.params[key + ".scale"]
+        assert sc.dtype == torch.float32, f"{key}.scale saved as {sc.dtype}, not the format's f32"
+        assert torch.equal(sc, model.params[key + ".scale"].float())  # widening is exact
 
 
 def test_fused_projections_parity(tmp_path):

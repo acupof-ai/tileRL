@@ -17,7 +17,8 @@ seq_q = 1+depth row — no second code path. The trunk's paged KV needs no
 rollback (a rejected draft's slot is overwritten next tick), but the gated-delta
 recurrent state does: the verify forward keeps the state after every chain step
 (``BatchKv.keep_steps``) and the engine adopts the one at the accepted length.
-Spec ticks run eager; pure-decode ticks without a draft still replay the graph.
+A spec tick is captured too, one graph per (batch bucket, chain width) — which
+is why a width first seen inside a timed window puts its capture in the number.
 
 The decode tick is a captured kernel sequence, not an interpreted one
 (design-engine.md): on CUDA, a pure-decode tick replays a per-batch-size
@@ -56,8 +57,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from .kv_cache import BLOCK_TOKENS, LinearStatePool, PagedKvPool, PrefixStore
-from .spec import survival, verify_lens
+from .kv_cache import BLOCK_TOKENS, KvTier, LinearStatePool, PagedKvPool, PrefixStore
+from .spec import LADDER_WIDTHS, survival, verify_lens
 
 _PREFILL_BUCKET = 64  # prefill widths are padded to this: bounded kernel shapes
 
@@ -75,18 +76,25 @@ _PHASE_DONE = 3
 _HASH_MASK = 0x7FFFFFFF
 
 
-def _quantize_draft(params: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Re-serve a draft head's dense weights as block-quantized fp8.
+def _quantize_draft(params: dict[str, torch.Tensor], fp4: bool = False) -> dict[str, torch.Tensor]:
+    """Re-serve a draft head's dense weights block-quantized: fp8 by default,
+    fp4 where that is the arch's only fused GEMV (sm70 has no ``linear_fp8``).
 
     Norms, embeddings and anything 1-D stay as they are; only the [N,K]
     projections move, which is where all of the head's bulk and all of its time
-    is."""
+    is. ``Backend.materialize`` twiddles the emitted ``.wq`` into the arch's
+    layout, so this only produces the natural packing."""
     from tilerl_kernels import reference
 
     out: dict[str, torch.Tensor] = {}
     for k, v in params.items():
         if v.ndim == 2 and v.shape[0] >= 128 and v.shape[1] >= 128:
-            out[f"{k}.w8"], out[f"{k}.wscale"] = reference.quant_fp8(v)
+            if fp4:
+                wq, scale = reference.pack_fp4(v)
+                scale, oscale = reference.renorm_fp4_scale(scale)
+                out[f"{k}.wq"], out[f"{k}.scale"], out[f"{k}.oscale"] = wq, scale, oscale
+            else:
+                out[f"{k}.w8"], out[f"{k}.wscale"] = reference.quant_fp8(v)
         else:
             out[k] = v
     return out
@@ -349,7 +357,7 @@ class Engine:
         limits: StepLimits,
         decode_graph: bool | None = None,
         draft: Any = None,
-        spec_depth: int = 4,
+        spec_depth: int = 3,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -385,21 +393,52 @@ class Engine:
         self._spec_depth = spec_depth if draft is not None else 0
         if draft is not None:
             # The head ships dense bf16, which Backend.linear serves on its
-            # generic path at ~30 GB/s: 9.7 ms per projection against 0.13 ms
-            # for the same shape on the trunk's fp8 kernel, so one draft step
-            # cost more than the whole 64-layer trunk forward. Serve it the way
-            # the trunk is served — Model._linear picks .w8/.wscale up itself.
-            served = backend.materialize(_quantize_draft(draft.params))
+            # generic path — measured 6-9 GB/s at these shapes on sm70 (Backend.io
+            # is f32 there, so every bf16 weight is converted before the GEMM),
+            # 120.91 ms per draft step against the trunk's whole 103.58 ms eager
+            # forward. Serve it the way the trunk is served: Model._linear picks
+            # .w8/.wq up itself. The FORMAT follows the kernel — fp8 has no sm70
+            # cell, and quantizing to a format with no kernel routes every
+            # projection back to that same generic path. fp4 measured 4.98
+            # ms/step, 24x the dense path.
+            fp4 = not backend.has_kernel("linear_fp8")
+            served = backend.materialize(_quantize_draft(draft.params, fp4=fp4))
             # In place, never rebound: DraftHead.layers is a Model holding THIS
             # dict, and a fresh one leaves it reading the original bf16 weights.
             draft.params.clear()
             draft.params.update(served)
             if not 0 < spec_depth < BLOCK_TOKENS:
                 raise ValueError(f"spec_depth must be in [1, {BLOCK_TOKENS}), got {spec_depth}")
+            if backend.arch == "sm70" and 1 + spec_depth not in LADDER_WIDTHS:
+                # The verify width is 1+depth and the sm70 GEMV serves only
+                # 1/2/4/8 rows, rounding up: depth 4 (W=5) buys an 8-row launch
+                # and measured 31.5 tok/s on coding against 43.8 at depth 3 and
+                # 32.6 with no speculation at all. Warn rather than clamp — the
+                # ladder is one arch's shape, not a property of speculation.
+                warnings.warn(
+                    f"spec_depth={spec_depth} gives verify width {1 + spec_depth}, which sm70 "
+                    f"rounds up to {next(w for w in LADDER_WIDTHS if w >= 1 + spec_depth)} rows; "
+                    f"use depth {max(w for w in LADDER_WIDTHS if w <= 1 + spec_depth) - 1} or "
+                    f"{next(w for w in LADDER_WIDTHS if w > 1 + spec_depth) - 1}",
+                    stacklevel=2,
+                )
+            if backend.arch == "sm70" and limits.max_batch * (1 + spec_depth) > max(LADDER_WIDTHS):
+                # The rung is chosen on ROWS, and a verify tick submits B*W of
+                # them (backend.py M = x2.shape[0]), which the width check above
+                # cannot see. Past the top rung the dispatch chunks at 32, so a
+                # wide batch costs extra launches rather than extra per-row time.
+                warnings.warn(
+                    f"max_batch={limits.max_batch} x verify width {1 + spec_depth} = "
+                    f"{limits.max_batch * (1 + spec_depth)} rows exceeds the sm70 ladder's top "
+                    f"rung ({max(LADDER_WIDTHS)}); a full batch verifies in "
+                    f"{-(-limits.max_batch * (1 + spec_depth) // 32)} launches per layer",
+                    stacklevel=2,
+                )
             self._draft_kv = PagedKvPool(
                 kv_pool.num_blocks, draft.cfg.num_kv_heads, draft.cfg.head_dim,
                 num_layers=draft.cfg.num_layers, device=backend.device,
                 layer_map=tuple(range(draft.cfg.num_layers)),
+                dtype=kv_pool.k_pool.dtype,  # same attention kernel, same IO cast
             )
 
         self._pin = backend.device.type == "cuda"
@@ -416,11 +455,17 @@ class Engine:
 
         # Prefix-boundary state snapshots, keyed by the matched token tuple
         # (collision-safe: a hash-only key could restore the wrong GDN state on
-        # a hash collision). One snapshot is 74.81 MiB at 27B, so it lives and
-        # dies with its store entry: the store drops ours on eviction, and a
-        # key present here is exactly a key the store still holds.
+        # a hash collision). One snapshot is 144 MiB at 27B (f32 pool), so it
+        # lives and dies with its store entry: the store drops ours on
+        # eviction, and a key present here is exactly a key the store still
+        # holds — which is why the store's capacity is byte-derived in
+        # build_engine, not the 4096-entry default.
         self._prefix_state: dict[tuple[int, ...], tuple[torch.Tensor, "torch.Tensor | None"]] = {}
-        prefix_store.on_evict = lambda tokens: self._prefix_state.pop(tokens, None)
+        prefix_store.on_evict = lambda tokens, key: self._prefix_state.pop(tokens, None)
+        # on_demote moves a spilled entry's GDN snapshot to the tier alongside it
+        self._tier = getattr(prefix_store, "_tier", None)
+        if self._tier is not None:
+            prefix_store.on_demote = self._demote_snapshot
 
         self._blocks_used = 0  # engine allocations outstanding (retains excluded)
         self._slots_used = 0
@@ -433,6 +478,13 @@ class Engine:
         self._tokens_generated = 0
         self._spec_drafted = 0
         self._spec_accepted = 0
+        # Diagnostic only: set True to keep the last tick's draft and trunk
+        # logits so a probe can rank the trunk's pick inside the draft's
+        # ordering. A [rows, vocab] copy per tick, so never on in serving.
+        self._keep_draft_logits = False
+        self._draft_logits = None
+        self._trunk_logits = None
+        self._verify_chains = None
         self._finished_logprobs: dict[int, list[float]] = {}
         self._last_logprobs: list[float] | None = None
 
@@ -468,22 +520,28 @@ class Engine:
                 self._finished_count += 1
                 return rid
 
-            matched, hit_blocks = self._match_prefix(tokens)
-            # Read the snapshot now: evict_until_free below can drop the very
-            # store entry we matched, and on_evict takes the snapshot with it.
-            snap = self._prefix_state[self._snapshot_key(tokens[:matched])] if matched else None
+            matched, hit_blocks, reload_key = self._match_prefix(tokens)
+            # Read the snapshot before evict_until_free below can drop the entry
+            # (and its snapshot); a cold hit's comes from the tier.
+            if not matched:
+                snap = None
+            elif reload_key is not None:
+                snap = self._tier.load_state(reload_key, tuple(tokens[:matched]))
+            else:
+                snap = self._prefix_state[self._snapshot_key(tokens[:matched])]
             if matched:
                 self._prefix_hits += 1
             else:
                 self._prefix_misses += 1
 
             total_blocks = (len(tokens) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
-            blocks = list(hit_blocks)
+            # a cold hit owns fresh blocks the tier fills; a resident hit adopts the store's
+            blocks = [] if reload_key is not None else list(hit_blocks)
             slot = None
             try:
                 slot = self._states.alloc_slot()
                 for b in blocks:
-                    self._kv.retain(b)  # adopt the store's blocks
+                    self._kv.retain(b)
                 needed = total_blocks - len(blocks)
                 evict = getattr(self._prefix, "evict_until_free", None)
                 if evict is not None:
@@ -492,20 +550,31 @@ class Engine:
                     raise RuntimeError("insufficient KV blocks for request")
                 while len(blocks) < total_blocks:
                     blocks.append(self._kv.alloc_block())
+                # Cold hit: fill the matched blocks from the tier (the prefill it
+                # skips), and restore the GDN snapshot. A False here means the LRU
+                # evicted the file between _match_prefix's has() and now — degrade
+                # to a miss: the blocks are already allocated, the prefill fills them.
+                if reload_key is not None and (
+                    snap is None
+                    or not self._tier.load_kv(reload_key, tuple(tokens[:matched]),
+                                              blocks[: matched // BLOCK_TOKENS], self._kv)
+                ):
+                    matched, reload_key, snap = 0, None, None
+                if matched:
+                    snap_states, snap_windows = snap
+                    self._states.states[slot].copy_(snap_states)
+                    if snap_windows is not None:
+                        self._states.window_restore(slot, snap_windows)
             except Exception:
                 for b in blocks:
                     self._kv.free_block(b)
                 if slot is not None:
                     self._states.free_slot(slot)
                 raise
-            own_blocks = total_blocks - matched // BLOCK_TOKENS
+            # a cold hit owns every block; a resident hit owns only the fresh tail
+            own_blocks = total_blocks if reload_key is not None else total_blocks - matched // BLOCK_TOKENS
             self._blocks_used += own_blocks
             self._slots_used += 1
-            if matched:
-                snap_states, snap_windows = snap
-                self._states.states[slot].copy_(snap_states)
-                if snap_windows is not None:
-                    self._states.window_restore(slot, snap_windows)
 
             req = _Req(
                 req_id=rid,
@@ -662,28 +731,42 @@ class Engine:
 
     # -------------------------------------------------------------- internals
 
-    def _match_prefix(self, tokens: list[int]) -> tuple[int, list[int]]:
-        """Longest block-aligned prefix hit, or (0, []).
+    def _match_prefix(self, tokens: list[int]) -> tuple[int, list[int], int | None]:
+        """Longest block-aligned prefix hit, or (0, [], None).
 
         Full-length hits are treated as misses day-1 (no read-only last-token
         forward yet). A hit whose boundary snapshot is missing also degrades
         to a miss — the engine is the sole publisher, so this only guards
-        against bookkeeping drift.
+        against bookkeeping drift. A cold hit (spilled to the SSD tier) returns
+        empty blocks and a ``reload_key``; its snapshot lives on the tier.
         """
         hit = self._prefix.lookup(tokens)
         if hit is None:
-            return 0, []
+            return 0, [], None
         matched = (hit.length // BLOCK_TOKENS) * BLOCK_TOKENS
         if matched == 0 or matched >= len(tokens):
-            return 0, []
+            return 0, [], None
+        if hit.reload_key is not None:
+            # has() verifies the tier still holds this exact prefix (both KV and
+            # state, tokens matching) — so submit's loads below cannot fail-miss.
+            if self._tier is None or not self._tier.has(hit.reload_key, tuple(tokens[:matched])):
+                return 0, [], None
+            return matched, [], hit.reload_key
         if self._snapshot_key(tokens[:matched]) not in self._prefix_state:
-            return 0, []
-        return matched, list(hit.blocks[: matched // BLOCK_TOKENS])
+            return 0, [], None
+        return matched, list(hit.blocks[: matched // BLOCK_TOKENS]), None
 
     @staticmethod
     def _snapshot_key(tokens: list[int]) -> tuple[int, ...]:
         """Collision-safe key for a prefix's boundary-state snapshot."""
         return tuple(tokens)
+
+    def _demote_snapshot(self, tokens: tuple[int, ...], key: int) -> None:
+        """Move a demoted prefix's GDN snapshot from resident memory to the
+        SSD tier (keyed by the store hash), so a cold hit can reload it."""
+        snap = self._prefix_state.pop(self._snapshot_key(list(tokens)), None)
+        if snap is not None:
+            self._tier.spill_state(key, tokens, snap[0], snap[1])
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0) -> BatchKv:
         # Fixed width = pool size: the kernels bake the table width into the
@@ -929,6 +1012,14 @@ class Engine:
             if r.hidden is None or r.phase == _PHASE_DONE:
                 continue
             lo, hi = max(1, r.draft_pos + 1), r.seq_len - 1
+            # A chunked prefill overwrites r.hidden per chunk, so the hiddens
+            # for everything before the LAST chunk are gone while draft_pos is
+            # still behind them: a 1024 prompt at 512/chunk asked for 1535
+            # positions and had 511. Start where the hidden actually begins.
+            # The skipped span's draft KV goes unwritten, and the draft's own
+            # attention is its only reader — it reads zeros there instead of a
+            # stale neighbour, because _draft_kv is zeroed for a fresh block.
+            lo = max(lo, r.hidden_from - (1 if r.hidden_prev is not None else 0) + 1)
             if hi < lo:
                 continue
             plan.append((r, lo, hi))
@@ -954,7 +1045,13 @@ class Engine:
             if r.hidden_prev is not None:
                 h, base = torch.cat([r.hidden_prev, r.hidden], dim=1), base - 1
             off = (lo - 1) - base
-            hs.append(torch.nn.functional.pad(h[:, off : off + q], (0, 0, 0, w - q)))
+            span = h[:, off : off + q]
+            if span.shape[1] != q:
+                raise RuntimeError(
+                    f"_draft_step: hidden covers [{base}, {base + h.shape[1]}) but the draft "
+                    f"needs [{lo - 1}, {hi}) -> off={off} q={q} gave {span.shape[1]} rows"
+                )
+            hs.append(torch.nn.functional.pad(span, (0, 0, 0, w - q)))
         kv = BatchKv(
             block_table=bt.to(dev), seq_len=torch.tensor(sl, device=dev),
             state_slot=torch.zeros(n, dtype=torch.long, device=dev),
@@ -967,13 +1064,17 @@ class Engine:
         last = torch.tensor([q - 1 for q in sq], device=dev)
         rng = torch.arange(n, device=dev)
         tok, prob = self._backend.greedy(logits[rng, last].unsqueeze(1))
+        if self._keep_draft_logits:  # off by default: a [n, vocab] copy per tick
+            self._draft_logits = logits[rng, last].detach().clone()
         h = dh[-1][rng, last].unsqueeze(1)
-        confs: list[list[float]] = [[] for _ in plan]
-        if self._spec_depth > 1:
-            conf = self._draft.confidence(h, prob, self._backend)
-            for i, c in enumerate(conf[:, -1].tolist()):
-                confs[i].append(float(c))
-        chains = [[int(t)] for t in tok[:, -1].tolist()]
+        # Nothing is read back to the host until the whole chain is enqueued.
+        # A .tolist() per depth step is a device sync per step, and the draft is
+        # launch-bound (15.13 ms against a 0.25 ms bandwidth floor), so the syncs
+        # ARE the cost: they serialize D draft forwards that would otherwise queue
+        # back to back. steps[] holds device tensors; one drain follows the loop.
+        conf = self._draft.confidence(h, prob, self._backend) if self._spec_depth > 1 else None
+        steps = [(list(range(n)), tok[:, -1], None if conf is None else conf[:, -1])]
+        cur = tok[:, -1]  # the token each row drafted last, kept on device
         for i, (r, _, hi) in enumerate(plan):
             if r.draft_pos == 0:
                 # Position 0 is never drafted (a draft at q reads the hidden at
@@ -1004,17 +1105,27 @@ class Engine:
             )
             dh = []
             logits = self._draft.forward(
-                h[li], np.array([[chains[i][-1]] for i in live], dtype=np.int64),
+                h[li], cur[li].reshape(-1, 1),
                 np.array([[plan[i][2] + j] for i in live], dtype=np.int64),
                 kv, self._backend, hidden_out=dh,
             )
             tok, prob = self._backend.greedy(logits)
             conf = self._draft.confidence(dh[-1], prob, self._backend)
-            for k, c in enumerate(conf[:, -1].tolist()):
-                confs[live[k]].append(float(c))
-            for k, t in enumerate(tok[:, -1].tolist()):
-                chains[live[k]].append(int(t))
+            steps.append((live, tok[:, -1], conf[:, -1]))
+            cur = cur.index_copy(0, li, tok[:, -1].to(cur.dtype))
             h = h.index_copy(0, li, dh[-1])
+
+        # ONE sync for the whole chain: every step's tokens and confidences are
+        # already enqueued, so this drains them together instead of D times.
+        chains: list[list[int]] = [[] for _ in plan]
+        confs: list[list[float]] = [[] for _ in plan]
+        for live, tk, cf in steps:
+            tl = tk.tolist()
+            cl = None if cf is None else cf.tolist()
+            for k, i in enumerate(live):
+                chains[i].append(int(tl[k]))
+                if cl is not None:
+                    confs[i].append(float(cl[k]))
 
         keep = verify_lens([survival(c) for c in confs]) if self._spec_depth > 1 \
             else [1] * len(plan)
@@ -1033,6 +1144,9 @@ class Engine:
         seed a T=1 rollout would use, so an accepted token is bit-identical to
         the unspeculated one. Rejected drafts leave KV past the new length,
         which the next tick overwrites."""
+        if self._keep_draft_logits:  # rank of the trunk's pick in the draft's order
+            self._trunk_logits = logits.detach().clone()
+            self._verify_chains = [list(c) for c in chains]
         flat = [
             (r, logits[i, j], len(r.output) + j)
             for i, r in enumerate(rows)
@@ -1176,8 +1290,15 @@ class Engine:
     def _loop(self) -> None:
         while not self._wake.is_set():
             with self._lock:
-                busy = bool(self._running or self._waiting)
-            if busy:
+                has_running = bool(self._running)
+                has_waiting = bool(self._waiting)
+            if has_running or has_waiting:
+                # Batch concurrent submissions: a burst of HTTP requests
+                # arrives over ~10ms. Without this window the first one
+                # starts a prefill alone and the rest land in eager mixed
+                # ticks (decode graph off, ~10x slower per tick).
+                if not has_running and has_waiting:
+                    self._wake.wait(0.01)
                 try:
                     self.step()
                 except Exception:
@@ -1207,7 +1328,8 @@ def build_engine(
     prefix_store: Any = None,
     decode_graph: bool | None = None,
     draft: Any = None,
-    spec_depth: int = 4,
+    spec_depth: int = 3,
+    kv_tier_path: str | None = None,
 ) -> "Engine":
     """Wire a model + backend into a running Engine (pools + prefix store).
 
@@ -1227,6 +1349,12 @@ def build_engine(
         cfg.head_dim,
         device=backend.device,
         layer_map=cfg.full_attn_layers,
+        # Match the attention kernel's IO dtype. sm70's is f32, and a bf16 pool
+        # made every attention call cast the WHOLE plane (all num_blocks, not
+        # the live ones): 4.71 ms/token, 14% of a 4096-ctx token, independent of
+        # context. Same trade the state pool makes below. getattr: test doubles
+        # stand in for Backend without declaring an io dtype.
+        dtype=getattr(backend, "io", torch.bfloat16),
     )
     state_pool = LinearStatePool(
         num_slots,
@@ -1241,7 +1369,24 @@ def build_engine(
         conv_dim=cfg.linear_qkv_dim,
         spec_steps=1 + spec_depth if draft is not None else 0,
     )
-    store = PrefixStore(kv_pool) if prefix_store is None else prefix_store
+    # Every resident store entry owns a GDN state snapshot in HBM (144 MiB at
+    # 27B f32) and a decode publishes one every BLOCK_TOKENS, so on GPU the
+    # store's ENTRY cap must come from a byte budget: the 4096 default is 576
+    # GiB of snapshots and OOMs at ~1K context. Spend a quarter of the HBM
+    # still free after weights + pools; the KvTier (when configured) absorbs
+    # evictions via on_demote, so a small cap costs hits, not correctness.
+    kw = {}
+    if backend.device.type == "cuda":
+        snap = state_pool.states[0].nbytes
+        if state_pool.conv_windows is not None:
+            snap += state_pool.conv_windows[0, :, 0].nbytes
+        kw["capacity"] = max(1, int(torch.cuda.mem_get_info()[0] // 4) // max(snap, 1))
+    if prefix_store is not None:
+        store = prefix_store
+    elif kv_tier_path:
+        store = PrefixStore(kv_pool, tier=KvTier(kv_tier_path), **kw)
+    else:
+        store = PrefixStore(kv_pool, **kw)
     return Engine(
         model,
         backend,

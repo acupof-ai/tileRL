@@ -74,6 +74,7 @@ from . import autograd
 from .config import ModelConfig, tiny
 from tilerl_kernels.reference import (
     untwiddle_fp4,
+    untwiddle_fp4_f16,
     dequant_awq,
     dequant_fp8,
     dequant_nvfp4,
@@ -1141,8 +1142,13 @@ def save_hf(model: Model, path: str | Path) -> None:
             stem = hf.removesuffix(".weight")
             for suffix in (".wq", ".scale", ".oscale"):
                 t = model.params[key + suffix]
-                if getattr(t, "_tl_twiddled", False):  # sm90 serves twiddled bytes
+                layout = getattr(t, "_tl_layout", "natural")
+                if layout == "tw-bf16":  # sm90 serves bf16-twiddled bytes
                     t = untwiddle_fp4(t)
+                elif layout == "tw-f16":  # sm70 serves fp16-twiddled bytes
+                    t = untwiddle_fp4_f16(t)
+                if suffix == ".scale":
+                    t = t.float()  # the format's scale plane is f32, whatever was served
                 tensors[stem + suffix] = t
         else:
             missing.append(key)

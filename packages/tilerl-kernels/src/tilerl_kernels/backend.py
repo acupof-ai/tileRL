@@ -76,11 +76,35 @@ def _snap_mma_tile(m: int, cap: int) -> int:
     return min(cap, next((s for s in (16, 32, 64, 128) if s >= m), 128))
 
 
+def _sm70_chunks(rows: int, top: int = 32) -> list[tuple[int, int, int]]:
+    """(offset, real rows, compiled rung) per launch for the sm70 fp4 GEMV.
+
+    The ladder is 1/2/4/8/``top``: a chunk pays its rung's full row count, so the
+    LAST chunk of a non-multiple M drops to a smaller rung instead of padding to
+    ``top``. M=40 is 32 + 8, not two 32-row launches. Pure integer arithmetic,
+    split out because the interesting failure is invisible where it is exercised:
+    a slicing bug shows up only for M that does not divide ``top``, and the sm70
+    branch never runs on the CPU target where the parity tests live.
+    """
+    out, m = [], 0
+    while m < rows:
+        r = min(top, rows - m)
+        out.append((m, r, 1 if r == 1 else 2 if r <= 2 else 4 if r <= 4 else 8 if r <= 8 else top))
+        m += r
+    return out
+
+
 def _pad2d(t: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
     """Zero-pad a 2D tensor to [rows, cols] (bottom/right)."""
     pr, pc = rows - t.shape[0], cols - t.shape[1]
     if pr == 0 and pc == 0:
         return t
+    # F.pad CROPS on a negative pad rather than raising, so an oversized tensor
+    # here becomes well-formed garbage: a [5120, 12800] weight silently returns
+    # [5120, 5120]. Pads are non-negative by construction on the shipped path,
+    # so this only fires on a shape the caller got wrong.
+    if pr < 0 or pc < 0:
+        raise ValueError(f"_pad2d: {tuple(t.shape)} exceeds the target [{rows}, {cols}]")
     return torch.nn.functional.pad(t, (0, pc, 0, pr))
 
 
@@ -108,7 +132,10 @@ _MMA_RED = kernels_linear._RED_TILE  # the K-loop reduction tile; one definition
 
 _CUDA_PLAN = {
     ("linear", "gemv"): ("linear_bf16_gemv", 256, 4, 4),
-    ("linear_fp4", "gemv"): ("linear_fp4_gemv", 256, 4, 4),
+    # kpad=512: the fp4 GEMV strides block_K=reduce_thread(32)*micro(16)=512 with
+    # no k<K guard, so K pads to 512 (was 256 — OOB when Kp%512!=0, e.g. a
+    # TP-sharded down_proj K=4352; 27B single-card dims all divide 512).
+    ("linear_fp4", "gemv"): ("linear_fp4_gemv", 512, 4, 4),
     ("linear_fp8", "gemv"): ("linear_fp8_gemv", 512, 4, 4),
     ("linear_fp4", "decode"): ("linear_fp4_fp8_decode", 512, 128, 64),
     ("linear_fp4", "prefill"): ("linear_fp4_fp8", 128, 128, 64),
@@ -203,6 +230,16 @@ class Backend:
             self.device = torch.device("cpu")
         self.precision = "bf16"
         self.arch = _arch_for(target)
+        # Kernel I/O dtype: only sm90 has bf16 tensor cores; sm70's MMA is
+        # fp16-only and its cell is the CPU f32 source, so it takes f32 IO.
+        # Invariant: f32-kernel call sites (e.g. gemm_nt) assume io is NOT
+        # bf16/fp16 and skip the _f32 wrap — flipping sm70 to bf16/fp16 here
+        # silently feeds those kernels the wrong dtype. sm70's fp16 GEMV does
+        # its f32->fp16 cvt inside the kernel, not via io.
+        self.io = torch.bfloat16 if self.arch == "sm90" else torch.float32
+        # Declared beside io for the same reason: the store (materialize) and the
+        # kernel annotation must not drift (wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi).
+        self.scale_io = torch.float16 if self.arch == "sm70" else torch.float32
         self._kernels: dict[str, object] = {}
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
         self._const_f32_cache: dict[tuple[int, int | None], tuple[Any, int, torch.Tensor]] = {}
@@ -213,6 +250,16 @@ class Backend:
             if self.device.type == "cuda"
             else 1
         )
+
+    def has_kernel(self, name: str) -> bool:
+        """Is ``name`` served by a real kernel in this (precision, arch) cell?
+
+        The public form of the registry probe, for callers above this package
+        that must not guess: a weight format is only worth producing when the
+        kernel that consumes it exists, or the op silently takes the torch
+        fallback instead.
+        """
+        return name in _resolve(self.precision, self.arch)
 
     def _kernel(self, name: str, *args):
         """``args`` are FACTORY arguments (a compile-time kernel variant, e.g.
@@ -264,9 +311,7 @@ class Backend:
         return inv
 
     def _rows(self, x: torch.Tensor):
-        # sm90 kernels are bf16-IO, CPU/metal f32; cast once at the boundary.
-        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
-        return x.shape[:-1], self._c(self._dev(x, io).reshape(-1, x.shape[-1]))
+        return x.shape[:-1], self._c(self._dev(x, self.io).reshape(-1, x.shape[-1]))
 
     def _epilogue(self, y2, oscale, lead, n: int):
         # ponytail: torch epilogue for the per-row scale, fold into the kernel
@@ -286,7 +331,13 @@ class Backend:
             return None
         bM = 1 if m == 1 else _snap_mma_tile(m, 128)
         bN = _round_up(min(cap, n), tile)
-        return kernel, _round_up(m, bM), _round_up(n, bN), _round_up(k, kpad), bM, bN
+        Kp = _round_up(k, kpad)
+        # The fp4/fp8 GEMVs stride block_K = 32*16 = 512 with no k<K guard, so the
+        # padded K must be a 512 multiple — kpad guarantees it (guard the contract
+        # here rather than let a mismatched plan read OOB on the device).
+        if op in ("linear_fp4", "linear_fp8") and m == 1:
+            assert Kp % 512 == 0, f"gemv kpad={kpad} leaves Kp={Kp} not a 512 multiple"
+        return kernel, _round_up(m, bM), _round_up(n, bN), Kp, bM, bN
 
     # ------------------------------------------------------------ add
 
@@ -429,23 +480,33 @@ class Backend:
     # ------------------------------------------------------------ linear fp4
 
     def _served_fp4(self, wq):
-        """The fp4 bytes this cell's kernels read. sm90 kernels decode the
-        twiddled layout; the served tensor is rewritten in place ONCE (flagged)
-        so graph capture, save_hf (which untwiddles by the flag) and CPU-resident
-        callers all see one truth. Other cells read the natural layout."""
-        wq = self._dev(wq, wq.dtype)  # uint8: device migration only
-        if "linear_fp4_gemv" in _resolve(self.precision, self.arch) and not getattr(
-            wq, "_tl_twiddled", False
-        ):
+        """The fp4 bytes this cell's kernels read, rewritten in place ONCE and
+        tagged in ``_tl_layout`` so graph capture, save_hf (untwiddles by the
+        tag) and CPU-resident callers all see one truth. sm90 decodes the
+        bf16-twiddled layout, sm70 the fp16-twiddled twin (its GEMV has no
+        bf16x2 math); other cells read the natural layout."""
+        wq = self._dev(wq, wq.dtype)
+        if getattr(wq, "_tl_layout", "natural") != "natural":
+            return wq
+        if "linear_fp4_gemv" not in _resolve(self.precision, self.arch):
+            return wq
+        if self.arch == "sm90":
             wq.copy_(reference.twiddle_fp4(wq))
-            wq._tl_twiddled = True
+            wq._tl_layout = "tw-bf16"
+        elif self.arch == "sm70":
+            wq.copy_(reference.twiddle_fp4_f16(wq))
+            wq._tl_layout = "tw-f16"
         return wq
 
     def linear_fp4(self, x, wq, scale, master=None, oscale=None, residual=None):
         # ``master`` is recording-only (the STE grad lands on it); the kernel
         # uses wq/scale.
         wq = self._served_fp4(wq)
-        scale = self._f32(scale)
+        # An f16 plane belongs to the twiddled ladder below — the only consumer
+        # compiled for it. materialize applies both rewrites together, so the two
+        # always arrive together on the shipped path.
+        sh = scale.dtype == self.scale_io == torch.float16
+        scale = scale if sh else self._f32(scale)
         lead, x2 = self._rows(x)
         M, K, N = x2.shape[0], x2.shape[1], wq.shape[0]
         blk = K // scale.shape[1]  # scale block from the loaded weight (16 or 32)
@@ -454,7 +515,10 @@ class Backend:
         # streams W once for M rows, so it wins until the M-fold FMA work
         # catches up. Uses the M=1 plan — the decode plan's n_partition is 128,
         # which as a GEMV thread block is 4096 threads.
-        if 2 <= M <= _MGEMV and (gp := self._plan("linear_fp4", 1, N, K)) is not None:
+        # M-row GEMV (sm90 only): its maker takes a compile-time M and packs M
+        # activation rows into one weight stream. sm70's GEMV is M=1-only (no
+        # packed-FMA), so it stays on the generic f32 fallback for M>1.
+        if self.arch == "sm90" and 2 <= M <= _MGEMV and (gp := self._plan("linear_fp4", 1, N, K)) is not None:
             gk, _, gNp, gKp, _, gbN = gp
             gwq, gsc = _pad2d(wq, gNp, gKp // 2), _pad2d(scale, gNp, gKp // blk)
             osc = self._ones(gNp) if oscale is None else self._const_f32(oscale, gNp)
@@ -466,6 +530,33 @@ class Backend:
             )[:M, :N]
             y = y2.reshape(*lead, N)
             return y if res is not None else y + residual
+        # sm70 serves fp16-twiddled bytes, which the generic kernels (natural
+        # nibbles) cannot read, so every M goes through the twiddle ladder.
+        # M<=8 (decode/verify batch): one launch for M rows, X pre-packed f16.
+        # M>8 (prefill) chunks with the M=32 twin: 32 rows share one W stream,
+        # so M=512 is 16 launches/layer instead of 512. An untwiddle copy OOMs
+        # here (the forward's GPU is full — the scratch that motivated eager
+        # materialize twiddle).
+        if self.arch == "sm70" and getattr(wq, "_tl_layout", "natural") != "natural":
+            _, _, Np, Kp, _, bN = self._plan("linear_fp4", 1, N, K)
+            wq1, sc1 = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
+            osc1 = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
+            # Round M up the compiled ladder, and hand the kernel X pre-packed as
+            # f16: otherwise it re-reads X per block and converts inside the tile
+            # loop (78% of the M=8 bytes, 32 of ~49 per-row instructions). Packing
+            # is worth 4.2x at M=32 and 1.1-1.45x at M=1, bit-exact — both paths
+            # round to nearest f16. It used to be passed ONLY below M=8, which is
+            # what made M>8 look like a hardware cliff at 122-128 us/row: the
+            # extern is templated on M with no upper bound. 32 is the top rung, so
+            # prefill chunks (M=512 is 16 launches/layer, not 512).
+            for m, Mr, Mk in _sm70_chunks(M):
+                y = self._kernel("linear_fp4_gemv_sm70_m", Mk, 4, True, sh)(
+                    _pad2d(x2[m : m + Mr], Mk, Kp).to(torch.float16),
+                    wq1, sc1, osc1, self._zeros2(Mk, Np), 32, bN, blk,
+                )[:Mr, :N]
+                y2 = y if m == 0 else torch.cat([y2, y], 0)
+            y = self._epilogue(y2, None, lead, N)
+            return y if residual is None else y + residual
         plan = self._plan("linear_fp4", M, N, K)
         if plan is not None:
             kernel, Mp, Np, Kp, bM, bN = plan
@@ -518,7 +609,12 @@ class Backend:
                 Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, 64)
                 x2 = _pad2d(x2, Mp, Kp)
                 wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
-            y2 = self._kernel("linear_fp4")(x2, wq, scale, bM, bN, blk, _THREADS)[:M, :N]
+            # generic linear_fp4 is f32-IO; restore f32 for sm70's M>1 fallback
+            # (sm90 never lands here — it has an MMA kernel). The scale plane
+            # must be f32 too: sm70 serves f16 but reaches this only if its
+            # twiddled-layout branch above did not claim the call.
+            assert scale.dtype == torch.float32, "generic linear_fp4 wants an f32 scale plane"
+            y2 = self._kernel("linear_fp4")(self._f32(x2), wq, scale, bM, bN, blk, _THREADS)[:M, :N]
         y = self._epilogue(y2, oscale, lead, N)
         return y if residual is None else y + residual
 
@@ -599,7 +695,27 @@ class Backend:
                     out[base] = (w * osc).to(torch.bfloat16)
                 for suffix in (".w8", ".wscale", ".oscale"):
                     out.pop(base + suffix, None)
-        return {k: v.to(self.device) for k, v in out.items()}
+        # Both serving rewrites need a kernel that reads the bytes: narrow the
+        # scale plane (3.20 -> 1.60 GB on sm70, riding the device move so the f32
+        # plane never lands on the card) and twiddle the nibbles. The twiddle is
+        # here, not lazily in _served_fp4, because it allocates a same-size
+        # scratch and by the first forward the KV cache + activations have left no
+        # room on a 32GB card. Tagged so a train step's re-materialize skips it.
+        _twiddle = {"sm90": reference.twiddle_fp4, "sm70": reference.twiddle_fp4_f16}.get(self.arch)
+        served = _twiddle is not None and "linear_fp4_gemv" in _resolve(self.precision, self.arch)
+        narrow = served and self.scale_io != torch.float32
+        moved = {
+            k: v.to(self.device, self.scale_io)
+            if narrow and k.endswith(".scale")
+            else v.to(self.device)
+            for k, v in out.items()
+        }
+        if served:
+            for k in moved:
+                if k.endswith(".wq") and getattr(moved[k], "_tl_layout", "natural") == "natural":
+                    moved[k].copy_(_twiddle(moved[k]))
+                    moved[k]._tl_layout = "tw-bf16" if self.arch == "sm90" else "tw-f16"
+        return moved
 
     # ------------------------------------------------------------ attention
 
@@ -615,6 +731,26 @@ class Backend:
         if self.arch == "sm90" and s == 1 and "paged_attention_decode" in _resolve(self.precision, self.arch):
             # Pure decode: split-KV flash-decoding, the GQA group as the M tile.
             out = self._paged_attention_decode(q, k_cache, v_cache, block_table, seq_lens, scale)
+        elif self.arch == "sm70" and "paged_attention_split" in _resolve(
+            self.precision, self.arch
+        ):
+            # Same idea without T.gemm/bf16 (sm70 has neither): the history is
+            # split across the grid, so B=1 fills the card instead of running H
+            # blocks at one thread each. S is in the grid too, which is what
+            # makes a speculative verify affordable — the dense kernel is serial
+            # in S as well as in history (39 ms at S=1 -> 1018 ms at S=4).
+            po, pm, pl = self._kernel("paged_attention_split")(
+                self._f32(q),
+                self._f32(k_cache),
+                self._f32(v_cache),
+                self._i32(block_table).contiguous(),
+                self._i32(seq_lens).contiguous(),
+                self._i32(seq_q_lens).contiguous(),
+                float(scale),
+                int(k_cache.shape[2]),
+                _THREADS,
+            )
+            out = self._kernel("paged_attention_split_combine")(po, pm, pl, _THREADS)
         elif self.arch == "sm90":
             # MMA kernel is bf16-IO and tiles queries at block_M: pad S to a
             # multiple (the kernel's history/mask use the true per-row lengths
@@ -717,9 +853,12 @@ class Backend:
         # .contiguous(): the ABI is packed. A bf16 view (e.g. v sliced from
         # the fused-qkv GEMV output) survives _dev's no-op cast and violates
         # it at B>=2; the f32 WGMMA path's cast already copied.
+        # The pool's dtype is the kernel's: sm70 allocates f32 so attention
+        # does not cast the whole plane per call.
+        io = k_plane.dtype
         self._kernel("write_tokens")(
-            self._dev(k, torch.bfloat16).contiguous(),
-            self._dev(v, torch.bfloat16).contiguous(),
+            self._dev(k, io).contiguous(),
+            self._dev(v, io).contiguous(),
             k_plane,
             v_plane,
             self._i32(kv.block_table).contiguous(),
@@ -774,8 +913,13 @@ class Backend:
         # The kernel bakes the scale block into its dequant macro; 16 is every
         # shipped checkpoint's, and pack_fp4's block-32 test weights take the
         # reference. ponytail: register a second kernel if a 32 ever ships.
-        blk = wq.shape[1] * 2 // self._f32(scale).shape[1]
+        blk = wq.shape[1] * 2 // scale.shape[1]
+        # sm70 serves an f16 scale plane (materialize narrows it). This kernel is
+        # sm90-only today, so the guard below already excludes that — but its
+        # _const_f32(scale) would cache a PERMANENT f32 copy of the whole plane,
+        # so whoever registers linear_fp4_bwd for sm70 must widen at load, not here.
         if not fp8 and blk == 16 and "linear_fp4_bwd" in kset:
+            assert scale.dtype == torch.float32, "linear_fp4_bwd wants an f32 scale plane"
             wq = self._served_fp4(wq)
             n, k = wq.shape[0], wq.shape[1] * 2
             g = self._bf16(grad).reshape(-1, grad.shape[-1])
@@ -1026,12 +1170,9 @@ class Backend:
         return self._f32(residual).reshape(rows, n).contiguous()
 
     def embedding(self, idx, table):
-        # A gather needs no arithmetic, so on CUDA the table is read in its own
-        # dtype: the 27B's bf16 [248320, 5120] table is 2.4 GiB against a
-        # cached 4.7 GiB f32 copy. The C target cannot codegen bfloat16
-        # ("Cannot convert type bfloat16 to C type"), so CPU/metal keep the
-        # f32 cast.
-        if table.dtype == torch.bfloat16 and self.target.startswith("cuda"):
+        # bf16-IO cells (sm90) gather the table in its own dtype (2.4 vs 4.7 GiB
+        # f32); f32 cells must cast, or a bf16 gather feeds an f32 kernel.
+        if table.dtype == torch.bfloat16 and self.io == torch.bfloat16:
             table, dt = self._c(table.to(self.device)), "bfloat16"
         else:
             table, dt = self._const_f32(table), "float32"

@@ -240,6 +240,45 @@ def test_prefix_hit_survives_evicting_its_own_entry():
     assert engine._prefix.stats()["evictions"] >= 1 and rid > 0
 
 
+def test_engine_cold_hit_reloads_from_tier(tmp_path):
+    """A prefix evicted to the SSD tier is reloaded on a repeat submit and
+    produces the same tokens as a fresh engine (no tier)."""
+    cfg = tiny()
+    backend = get_backend()
+    # 48-token prompt: the first 32 (2 blocks) are a reloadable prefix; the
+    # engine prefills the last 16 on top of the reloaded KV. (A full-length
+    # hit is a miss day-1 — no read-only last-token forward.)
+    prompt = list(range(1, 49))
+    prefix = prompt[:32]
+    params = SamplingParams(temperature=0.0, max_new_tokens=3, seed=0)
+
+    # Reference: no tier, same model, same prompt.
+    ref = build_engine(cfg, build_random(cfg, seed=12), backend,
+                       num_blocks=8, num_slots=4, max_batch=4, max_total_tokens=512)
+    ref_id = ref.submit(prompt, params)
+    ref_out = _drain(ref, [ref_id], 3)
+
+    # Tier engine: publish the 32-token prefix, evict it to the tier, then
+    # submit the full 48-token prompt → cold hit on the 32-token prefix.
+    eng = build_engine(cfg, build_random(cfg, seed=12), backend,
+                       num_blocks=8, num_slots=4, max_batch=4, max_total_tokens=512,
+                       kv_tier_path=str(tmp_path))
+    eng._tier.min_tokens = 0  # white-box: allow short prefixes to spill
+
+    a_id = eng.submit(prefix, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+    _drain(eng, [a_id], 2)  # publishes the 32-token prefix + snapshot
+
+    eng._prefix._evict_one()  # evict → spill KV + snapshot to tier
+    hit = eng._prefix.lookup(prefix)
+    assert hit is not None and hit.reload_key is not None  # A is cold, not gone
+
+    cold_id = eng.submit(prompt, params)
+    cold_out = _drain(eng, [cold_id], 3)
+    assert cold_out[cold_id] == ref_out[ref_id], \
+        f"cold-hit mismatch: {cold_out[cold_id]} != {ref_out[ref_id]}"
+    assert eng.stats()["prefix_hits"] >= 1
+
+
 def test_stop_token_is_not_returned():
     engine = _build_engine(seed=6)
     engine._sample_batch = lambda rows: [7] * len(rows)
