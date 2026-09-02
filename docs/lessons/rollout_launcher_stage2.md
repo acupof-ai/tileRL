@@ -75,16 +75,23 @@ day. The 27B does **not** emit `{"tool": ..., "input": ...}`; it emits
 `<tool_call><function=NAME><parameter=P>…`, tool results come back as
 `<tool_response>` (not `<tool_result>`), and the generation prompt carries
 `<think>\n` rather than tileRL's bare `assistant\n`. All of that is real and all
-of it is wrong in the shim today.
+of it was wrong in the shim.
 
-It is not fixed in this entry because `tiny` uses `ByteTokenizer`, which has no
-`<tool_call>` token: hardcoding the 27B form would make both no-weights gates
-meaningless, and those are the only ones that run every day here. The plan is to
-dispatch on whether the tokenizer has the tool tokens — one predicate, not an
-abstraction layer. Pending e4's answer on whether that is worth it or whether
-tiny's gate should simply degrade.
+**FIXED the same day** (`72a4de0`), and the resolution is worth recording
+because my first instinct was wrong. I proposed dispatching on whether the
+tokenizer has the tool tokens, so tiny could keep the JSON form. e4's answer:
+`ByteTokenizer` renders `<tool_call>` as eleven bytes and round-trips it
+exactly like the 27B does — the only tokenizer-dependent fact is whether that
+string is one id or eleven, which the shim never sees. So one format
+everywhere, and the daily no-weights gates now exercise the parser the real
+model will hit. Two formats would have meant testing a parser nothing reaches.
 
-Also open: `SamplingParams` has no `top_k`, and the 27B's card expects
+The instruction block is copied verbatim from the template rather than
+paraphrased: it is what the model was trained to answer in, so a reworded
+version is a different distribution. It costs 817 bytes, which is why the test
+engine's budget went 512 → 4096 (one token per byte).
+
+`SamplingParams.top_k` landed in `c2c1ba6`; the 27B's card expects
 temperature 1.0 / top_k 20 / top_p 0.95.
 
 ## Rule
@@ -92,3 +99,12 @@ temperature 1.0 / top_k 20 / top_p 0.95.
 A guard is only a guard if you have watched it refuse. Every isolation or
 safety assertion ships with the negative control that would fail if the
 mechanism were absent — in the same test, not in a comment.
+
+It proved itself within the hour: the tool-format fix broke the escape script,
+and the control was what failed, saying so in one line. Without it the sandbox
+test would have gone green while testing nothing.
+
+A second rule from the format fix: **read the checkpoint's own template before
+writing a format.** The JSON tool-call shape was invented, plausible, and
+untestable on tiny — random weights emit noise in any format, so nothing here
+could ever have caught it. Only the real template could.
