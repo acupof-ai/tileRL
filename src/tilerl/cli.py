@@ -18,21 +18,30 @@ _QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")
 
 
 def _build_model(
-    model_name: str, seed: int, fuse_projections: bool = False, keep_master: bool = False
+    model_name: str, seed: int, fuse_projections: bool = False, keep_master: bool = False,
+    source: str | None = None,
 ):
-    """(cfg, model): serving fuses projections, training keeps the bf16 masters."""
+    """(cfg, model): serving fuses projections, training keeps the bf16 masters.
+
+    ``source`` overrides the checkpoint path for this call. Pass it from a script
+    that takes ``--source``: the module-level default is bound from the env at
+    IMPORT, so assigning ``cli._QWEN38_SOURCE`` after the import works but is easy
+    to forget — three scripts have, and the symptom is a hub fetch of the
+    placeholder repo id ("Invalid port: ':'"), not a message about the flag.
+    """
     from . import config as config_mod
     from . import model as model_mod
 
+    src = source or _QWEN38_SOURCE
     if model_name == "qwen38-27b":
         cfg = config_mod.qwen38_27b()
         try:
             model = model_mod.load_hf(
-                cfg, _QWEN38_SOURCE, fuse_projections=fuse_projections, keep_master=keep_master
+                cfg, src, fuse_projections=fuse_projections, keep_master=keep_master
             )
         except Exception as exc:
             print(
-                f"error: could not load Qwen3-27B weights from {_QWEN38_SOURCE!r}: {exc}\n"
+                f"error: could not load Qwen3-27B weights from {src!r}: {exc}\n"
                 "hint: download the checkpoint (or set TILERL_QWEN38_SOURCE to a\n"
                 "      local safetensors directory), or use --model tiny.",
                 file=sys.stderr,

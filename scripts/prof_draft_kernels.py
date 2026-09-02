@@ -1,7 +1,14 @@
 """Per-kernel profile of ONE draft step, in the engine, not in isolation.
 
-prof_spec_tick.py put 79% of a speculative tick in _draft_step at 371 ms/step
-against 4.98 ms measured standalone. This says which kernels those 371 ms are.
+A draft forward measures 5.53 ms (the depth-2/3 rung pair isolates it) against a
+1.06 ms floor for the 954 MB it streams — 5.2x, where fully-captured dense decode
+sits at 1.7x of its own floor. `_draft_step` runs after `_run_decode_graph`
+returns, so it is outside the captured graph. This says whether that 5.2x is host
+launch overhead (capture or fewer launches would take it) or GPU time (it would
+not): read `wall` against `GPU-busy` at the bottom.
+
+An earlier version of this docstring cited "371 ms/step against 4.98 standalone"
+from a state several fixes ago. Do not carry a number across runs — re-measure.
 
   scripts/v100.sh run pd 'CKPT=...; /usr/bin/python3 -u scripts/prof_draft_kernels.py \
       --source $CKPT --draft $CKPT/model-00018-of-00018.safetensors --depth 3'
@@ -18,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
+from tilerl import cli
 from tilerl.cli import _build_model
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.spec import load_draft
@@ -32,6 +40,10 @@ def main() -> None:
     ap.add_argument("--top", type=int, default=14)
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
+    # cli binds _QWEN38_SOURCE from the env at IMPORT, which already happened, so
+    # --source has to be written back onto the module or _build_model reaches for
+    # the HF hub and dies on "Invalid port: ':'".
+    cli._QWEN38_SOURCE = args.source
 
     backend = get_backend()
     cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)

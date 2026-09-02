@@ -110,13 +110,22 @@ The sync fix's own benefit remains **unmeasured**. It is still the right change
 quantifies it, and this entry no longer claims otherwise.
 
 The earlier recommendation — "check the cheaper lever first, the draft is
-launch-bound" — still stands, and is now sharper: `_draft_step` is called after
-`_run_decode_graph` returns, so all D draft forwards run OUTSIDE the captured
-graph. A draft forward streams 954 MB (a 425M-parameter head plus the trunk's
-1.27B lm_head, which is 75% of it), a 1.06 ms floor at 900 GB/s against 5.53 ms
-measured — **5.2×**, where fully-captured dense decode sits at 1.7× of its own
-floor. Capturing the trunk was worth 2.66×; the same factor here is 5.53 → 2.08 ms
-and 50.3 → 59.5 tok/s.
+launch-bound" — was **wrong, and is withdrawn**. It rested on `_draft_step` being
+called after `_run_decode_graph` returns, so all D draft forwards run outside the
+captured graph, plus a byte roofline: a draft forward streams 954 MB, 1.06 ms at
+900 GB/s, against 5.53 measured — "5.2×, where fully-captured dense decode sits at
+1.7× of its own floor. Capturing the trunk was worth 2.66×; the same factor gives
+5.53 → 2.08 ms and 50.3 → 59.5 tok/s."
+
+Per-kernel attribution refutes it. The depth-3 tick is **88% GPU-bound** (58.5 ms
+of GPU-busy against the real 66.46), 71% of that GPU time is the fp4 GEMV, and a
+draft forward's 9 GEMV launches are ~1.12 ms of GPU at 125 µs each — i.e. the
+byte floor was a factor of 5 below the real one, because the GEMV at M=1 is
+launch-shaped, not byte-shaped. There is no host overhead in that gap to reclaim.
+Capturing *every* launch caps at 1.14×.
+
+See `errors/2026-09-02-capturing-the-draft-is-rejected.md`. Where the tick
+actually is: one kernel, 41.49 ms, 125 µs per launch.
 
 ## Rule
 

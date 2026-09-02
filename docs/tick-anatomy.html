@@ -225,11 +225,11 @@
         </div>
       </div>
       <div class="gap">
-        <h3>Draft — 25% of the tick, 5.2× its floor</h3>
-        <div class="meta">954 MB at 900 GB/s = 1.06 ms · measured 5.53 ms · runs outside the captured graph</div>
+        <h3>Draft — 25% of the tick</h3>
+        <div class="meta">measured 5.53 ms · ~9 GEMV launches × 125 µs = 1.12 ms of GPU each · runs outside the captured graph</div>
         <div class="track">
           <div class="fill" style="width:100%;background:var(--draft)">5.53 ms</div>
-          <div class="fl" style="left:19.2%"><span>floor 1.06</span></div>
+          <div class="fl" style="left:19.2%"><span>bytes 1.06 — not the binding floor</span></div>
         </div>
       </div>
       <div class="gap">
@@ -243,8 +243,8 @@
     </div>
     <p style="margin-top:20px">Dense decode is the control, and it is the one that reconciles: 1.7× off its floor,
     running entirely inside a captured CUDA graph. Verify runs the same kernels over 4 rows
-    and is 3.1× off. Draft runs <em>outside</em> the graph and is 5.2× off. The ordering is
-    the finding.</p>
+    and is 3.1× off. Draft runs <em>outside</em> the graph, but that turned out not to be what
+    costs it: see the correction below.</p>
   </section>
 
   <section>
@@ -256,11 +256,12 @@
     <code>concat(norm_embed, norm_hidden)</code> in that order; the other order looks like a head
     that simply does not predict. Acceptance is 3.34 tokens per forward, and drafted-token rank
     inside the trunk's own ordering is top-1 96.8%.</p>
-    <p><b>Structurally, one thing is wrong and it is worth 1.18×.</b> <code>_draft_step</code> is
-    called after <code>_run_decode_graph</code> returns (<code>engine.py:996</code>), so all three
-    draft forwards pay eager launch cost that the trunk stopped paying when it was captured —
-    that change was worth 2.66× on the trunk (103.58 → 39 ms). Recovering the same factor on the
-    draft puts a forward at 2.08 ms and the tick at 56.11 ms: <b>50.3 → 59.5 tok/s</b>.</p>
+    <p><b>Structurally, the tick is 88% GPU-bound, so there is little for the host to give
+    back.</b> <code>_draft_step</code> does run outside the captured graph
+    (<code>engine.py:836</code>), but per-kernel attribution puts <b>58.5 ms of GPU-busy in a
+    66.46 ms tick</b> — capturing <em>every</em> remaining launch caps at 1.14×, and 71% of that
+    GPU time is a single kernel (<code>linear_fp4_gemv_sm70_m</code>, 332 launches × 125 µs =
+    41.49 ms) which a graph replays at the same speed. Rejected.</p>
     <div class="scroll" style="margin-top:20px">
       <table>
         <thead><tr><th>Depth</th><th class="mono">Verify width</th><th class="mono">Rung</th><th class="mono">ms/tick</th><th class="mono">tok/fwd</th><th class="mono">tok/s</th></tr></thead>
@@ -291,8 +292,8 @@
 
   <section>
     <h2>What the two gaps mean</h2>
-    <p>They are different problems and only one is speculation's. The draft's 5.2× is a launch
-    problem with a known remedy — capture it, as the trunk was. Verify's 3.1× is the same
+    <p>They turn out to be the same problem, and it is not speculation's. Both the draft and
+    verify spend their time in one kernel at 125 µs per launch. Verify's 3.1× is the
     schedule question that caps prefill: the sm70 fp4 GEMV reaches 83% of bandwidth peak at
     M=1 and roughly a quarter of packed-f16 FLOP peak at M=32, because X is reloaded from L2
     per row per tile. <code>X[32,5120]</code> in f16 is 328 KB — it fits the 6 MB L2 but not
@@ -303,6 +304,35 @@
     is the one remaining candidate with a mechanism behind it rather than an analogy — it
     removes the loads instead of reordering the math, which is precisely what those two
     measurements showed does not help.</p>
+  </section>
+
+  <section>
+    <h2>Where the tick actually is</h2>
+    <p>Per-kernel attribution of one depth-3 tick, which is what settled the question above.
+    GPU-busy sums to 58.5 ms against the 66.46 ms the tick really takes &mdash; 88% GPU-bound.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Kernel</th><th class="mono">launches</th><th class="mono">&micro;s each</th><th class="mono">ms</th><th class="mono">share of GPU</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">linear_fp4_gemv_sm70_m</td><td class="mono">332</td><td class="mono">125.0</td><td class="mono"><b>41.49</b></td><td class="mono"><b>71%</b></td></tr>
+          <tr><td class="mono">index_elementwise (torch)</td><td class="mono">252</td><td class="mono">15.8</td><td class="mono">3.97</td><td class="mono">7%</td></tr>
+          <tr><td class="mono">gdn_chunk_fused</td><td class="mono">48</td><td class="mono">52.4</td><td class="mono">2.51</td><td class="mono">4%</td></tr>
+          <tr><td class="mono">everything else (~1900)</td><td class="mono">&mdash;</td><td class="mono">&mdash;</td><td class="mono">10.53</td><td class="mono">18%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:18px">One kernel is 71% of the tick, at a per-launch cost that barely
+    moves with M. That is the whole optimisation surface, and it is a schedule question, not a
+    launch-overhead one. The 332 launches are ~305 for the trunk's verify plus ~9 per draft
+    forward &times; 3.</p>
+    <p class="fine">Second-largest is not model math: 252 launches of torch&rsquo;s
+    <code>index_elementwise</code>, the chain bookkeeping in <code>_draft_step</code> and
+    <code>_verify</code>. Smaller than the GEMV work but larger than the GDN scan, and removable
+    without restructuring anything.</p>
+    <p class="fine">The profiler that produced this table reads 121.5 ms/tick where the real tick
+    is 66.46 &mdash; <code>torch.profiler</code> serialises launches, so its wall clock and its
+    &ldquo;52% host&rdquo; line are instrument artifacts and are not used here. A sum of kernel
+    durations survives that distortion; a wall-clock ratio does not.</p>
   </section>
 
 </div>

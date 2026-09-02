@@ -901,16 +901,16 @@ class Engine:
         if self._keep_draft_logits:  # off by default: a [n, vocab] copy per tick
             self._draft_logits = logits[rng, last].detach().clone()
         h = dh[-1][rng, last].unsqueeze(1)
-        # Nothing is read back to the host until the whole chain is enqueued.
-        # A .tolist() per depth step is a device sync per step, and the draft is
-        # launch-bound, so the syncs serialize D draft forwards that would
-        # otherwise queue back to back. Its own benefit was never isolated: the
-        # depth sweeps before and after agree to 0.5%, so the 15.13 -> 5.53 ms
-        # once claimed here was a change of ANALYSIS (a slope through the verify
-        # staircase vs the rung-4 pair), not of cost. One draft forward is
-        # 5.53 ms against a 1.06 ms byte floor, and 5.2x of that is _draft_step
-        # running outside the captured graph. steps[] holds device tensors; one
-        # drain follows the loop.
+        # Nothing is read back to the host until the whole chain is enqueued: a
+        # .tolist() per depth step is a device sync per step. Its own benefit was
+        # never isolated (the depth sweeps before and after agree to 0.5%), and it
+        # is worth little — the tick is 88% GPU-bound, 58.5 of 66.46 ms, so host
+        # work is at most 12% however it is arranged. Keep it anyway: one drain
+        # after the loop is not more code than D drains.
+        # A draft forward's 9 GEMV launches are ~1.12 ms of GPU at 125 us each,
+        # against the 1.06 ms its bytes would take — the GEMV at M=1 is
+        # launch-shaped, not byte-shaped, so there is no host overhead hiding in
+        # the gap (errors/2026-09-02-capturing-the-draft-is-rejected.md).
         conf = self._draft.confidence(h, prob, self._backend) if self._spec_depth > 1 else None
         steps = [(list(range(n)), tok[:, -1], None if conf is None else conf[:, -1])]
         cur = tok[:, -1]  # the token each row drafted last, kept on device
