@@ -55,6 +55,7 @@ def sampling(tok: Any, thinking: bool | None, max_new_tokens: int, *,
     return SamplingParams(
         max_new_tokens=max_new_tokens, seed=secrets.randbits(31) if seed is None else seed,
         stop_token_ids=tuple(getattr(tok, "stop_token_ids", ())), logprobs=logprobs,
+        # With thinking off the prompt closes the block itself, so no cap applies.
         max_think_tokens=max_think_tokens if thinking else None,
         end_think_ids=tuple(tok.encode("</think>\n\n")) if thinking else (), **kw)
 
@@ -83,7 +84,7 @@ def blocks_to_text(content: Any) -> str:
             out.append(render_tool_call(b.get("name") or "", b.get("input") or {}))
         elif kind == "tool_result":
             out.append(f"<tool_response>\n{blocks_to_text(b.get('content'))}\n</tool_response>")
-        elif kind in ("image", "document"):
+        elif kind in ("image", "image_url", "document"):
             # Dropping these silently would send the model a turn that is
             # missing its subject; the 27B is text-only, so say so.
             raise ValueError(f"{kind} blocks are not supported by this model")
@@ -115,7 +116,8 @@ _EFFORT_INSTRUCTIONS = {
            "directly to the conclusion without unnecessary elaboration.",
 }
 
-_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.S)
+# A block cut off by max_tokens is still reasoning, not a reply.
+_THINK_RE = re.compile(r"<think>.*?(?:</think>\s*|\Z)", re.S)
 
 
 def strip_think(text: str) -> str:
