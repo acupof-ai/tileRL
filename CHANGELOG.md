@@ -4,6 +4,16 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-02 — accept: ISO-Merger lands as `tilerl merge`, gated on two tiny specialists
+
+- `src/tilerl/merge.py`: checkpoint-only merge of specialists sharing a base —
+  frame displacements in the Stiefel tangent space, base spectrum kept, one
+  ridge Gram solve for the coefficients (arXiv 2607.19331).
+- Two tiny SFT specialists (batch A, batch B): loss A/B base **22.34 / 21.99**,
+  average merge **18.46 / 17.55**, ISO **16.00 / 14.73**. K=1 returns the
+  specialist to 3.3e-3; spectrum kept to 8.9e-7.
+- 27B vs TIES/DARE: pending-remote.
+  [wins/2026-09-02-iso-merger.md](docs/experience/wins/2026-09-02-iso-merger.md)
 ## 2026-09-02 — phase exit: the ISO optimizer runs on the tape (tiny); 27B pending-remote
 
 - `tilerl.iso.ISO` wraps `Adafactor` / `AdamW`: every 2D weight trains as
