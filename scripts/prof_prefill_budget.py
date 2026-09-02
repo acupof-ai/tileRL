@@ -1,20 +1,26 @@
-"""Per-kernel budget of ONE prefill tick: where do the 15.9 s go?
+"""Per-kernel budget of ONE prefill tick: what is prefill's 8.4 ms/token?
 
-Prefill is 31 ms per prompt token against decode's 26.6 — a 512-row forward
-costs more per token than a 1-row one, which is backwards. The arithmetic says
-it behaves as if M=1: one prefill forward is 15.9 s, 512 rows decoded one at a
-time would be 13.6 s, and 16 chunked GEMV launches re-streaming 14.40 GB each
-should be 0.3 s. So something in the tick is linear in tokens with no batching
-benefit, and it is worth ~50x.
+Prefill is 8.35-9.37 ms per prompt token after the rung-32 flag fix
+(wins/2026-09-02-rung-8-cliff-was-a-missing-flag.md), down from 31. The question
+is no longer "why is it slower per token than decode" — it isn't — but how far
+the remainder is from what the card can do.
 
-prof_decode_budget.py answers the same question for decode; this windows on a
-PREFILL tick instead. Prefill runs eager (no graph capture), so torch.profiler
-sees the real kernels directly and there is no replay to see through.
+Use the FLOP roofline here, not the byte one. At M=512 a chunk re-reads the
+weights once and does 512 rows of work against them, so prefill is compute-bound
+where decode is bandwidth-bound: 51.2 GFLOP/row x 512 rows = 26.2 TFLOP per
+chunk, and V100's fp16 SCALAR peak is 31.4 TFLOPS (the fp4 extern is scalar FMA;
+mma.sync's 125 TFLOPS is unreachable from this path). That puts a 512-row chunk's
+floor near 836 ms against a measured 4277 — about 5x, not the ~50x a byte
+roofline suggests. A byte roofline at M=512 is the wrong denominator by a factor
+of M.
 
 The suspect is stated so the output can refute it: gdn_chunk_fused is 48 of 64
 layers and its own entry records "one block per batch x head, ~6% SM
 utilization", tuned for launch count rather than occupancy. A serial scan that
 does not scale with T yields exactly this signature.
+
+Prefill runs eager (no graph capture), so torch.profiler sees the real kernels
+directly and there is no replay to see through.
 
   scripts/v100.sh run pk 'CKPT=...; /usr/bin/python3 -u scripts/prof_prefill_budget.py \
       --source $CKPT --ctx 512'
@@ -72,30 +78,28 @@ def main() -> None:
     e = build_engine(cfg, model, be, num_blocks=1024, num_slots=4, max_batch=4,
                      max_total_tokens=8192)
 
-    def one_prefill_tick(base: int) -> tuple[int, float]:
-        """Submit, run exactly ONE tick, and report its wall ms."""
-        rid = e.submit(list(range(base, base + args.ctx)),
-                       SamplingParams(temperature=0.0, max_new_tokens=1, seed=0))
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        e.step()
-        torch.cuda.synchronize()
-        ms = (time.perf_counter() - t0) * 1000
-        return rid, ms
+    def submit(base: int) -> int:
+        return e.submit(list(range(base, base + args.ctx)),
+                        SamplingParams(temperature=0.0, max_new_tokens=1, seed=0))
 
-    rid, _ = one_prefill_tick(10)  # warm: JIT every prefill-shaped kernel
-    while e.poll().get(rid) is None:
-        e.step()
+    def drain(rid: int) -> None:
+        while e.poll().get(rid) is None:
+            e.step()
 
-    rid, wall = one_prefill_tick(500000)
+    drain(submit(10))  # warm: JIT every prefill-shaped kernel
+
+    # Profile the FIRST step after submitting, not a later one: at ctx == the
+    # chunk budget the prompt is one chunk, so step() #1 does the whole prefill
+    # AND emits the token. Profiling a second step then windows on an empty
+    # queue and reports 0 ms — which it did, before this was split up.
+    rid = submit(500000)
+    torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA], record_shapes=False) as prof:
-        torch.cuda.synchronize()
         t0 = time.perf_counter()
         e.step()
         torch.cuda.synchronize()
         wall = (time.perf_counter() - t0) * 1000
-    while e.poll().get(rid) is None:
-        e.step()
+    drain(rid)
 
     by_cls: dict[str, float] = defaultdict(float)
     by_kernel: dict[str, tuple[float, int]] = defaultdict(lambda: (0.0, 0))
@@ -107,10 +111,21 @@ def main() -> None:
         ms, cnt = by_kernel[ev.key]
         by_kernel[ev.key] = (ms + us, cnt + ev.count)
     total = sum(by_cls.values()) or 1.0
+    # An empty window is not a measurement. This read 0 ms once (the profiled
+    # step ran after the prefill had already happened) and printed a clean table
+    # of nothing, which is the failure mode that looks like a result.
+    if not by_cls or total <= 1.0:
+        raise SystemExit("no CUDA kernels in the window — the profiled step did no work")
 
     print(f"\n# ONE prefill tick, {args.ctx} rows: {total / 1000:.0f} ms GPU / {wall:.0f} ms wall")
+    # FLOP, not bytes: at M=512 the chunk re-reads the weights once and does 512
+    # rows against them, so the byte roofline is off by a factor of M here.
+    tflop = 2 * 25.62e9 * args.ctx / 1e12
+    floor = tflop / 31.4 * 1000
     print(f"# {total / 1000 / args.ctx:.2f} ms GPU per prompt token "
-          f"(decode is 26.6 ms/token at M=1; the weight roofline is 16.0 ms per PASS)")
+          f"(decode is 26.6 ms/token at M=1, but that path is bandwidth-bound)")
+    print(f"# {tflop:.1f} TFLOP this tick / 31.4 TFLOPS fp16 scalar = {floor:.0f} ms floor "
+          f"-> {total / 1000 / floor:.1f}x off")
     if total / 1000 > 2 * wall:
         print(f"\n!! {total / 1000:.0f} ms GPU inside a {wall:.0f} ms tick — the window is wrong.")
     print(f"\n{'class':>14} {'ms/tick':>9} {'% GPU':>7} {'ms/token':>9}")

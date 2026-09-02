@@ -549,12 +549,25 @@ class Backend:
             # what made M>8 look like a hardware cliff at 122-128 us/row: the
             # extern is templated on M with no upper bound. 32 is the top rung, so
             # prefill chunks (M=512 is 16 launches/layer, not 512).
-            for m, Mr, Mk in _sm70_chunks(M):
+            chunks = _sm70_chunks(M)
+            # Each chunk writes its own slice. `y2 = cat([y2, y])` rebuilt every
+            # row accumulated so far on each iteration, so a 512-row prefill
+            # copied 4352 rows where 512 would do — 269 ms of a 4269 ms tick
+            # (6.3%), and quadratic in the chunk count. Decode is one chunk and
+            # keeps the kernel's own buffer, so it still allocates nothing.
+            # NOT _zeros2: that hands back a shared cached block, and other
+            # callers read it as their residual while this one writes into it.
+            # kernel's Y is f32 (kernels_linear.py: Y = T.empty((M, N), "float32")).
+            y2 = torch.empty(M, N, dtype=torch.float32, device=self.device) if len(chunks) > 1 else None
+            for m, Mr, Mk in chunks:
                 y = self._kernel("linear_fp4_gemv_sm70_m", Mk, 4, True, sh)(
                     _pad2d(x2[m : m + Mr], Mk, Kp).to(torch.float16),
                     wq1, sc1, osc1, self._zeros2(Mk, Np), 32, bN, blk,
                 )[:Mr, :N]
-                y2 = y if m == 0 else torch.cat([y2, y], 0)
+                if y2 is None:
+                    y2 = y
+                else:
+                    y2[m : m + Mr] = y
             y = self._epilogue(y2, None, lead, N)
             return y if residual is None else y + residual
         plan = self._plan("linear_fp4", M, N, K)
