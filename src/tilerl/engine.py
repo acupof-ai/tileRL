@@ -78,8 +78,8 @@ class SamplingParams:
     seed: int = 0
     stop_token_ids: tuple[int, ...] = ()
     allowed_ids: tuple[int, ...] | None = None  # restrict sampling to these ids
-    #: force ``end_think_ids`` after this many generated tokens; 0 = no thinking, None = unbounded
-    thinking_budget: int | None = None
+    #: cap on <think>: ``end_think_ids`` are forced after this many tokens; None = unbounded
+    max_think_tokens: int | None = None
     end_think_ids: tuple[int, ...] = ()
     logprobs: bool = False  # log p of each token under the distribution it was drawn from
 
@@ -812,7 +812,7 @@ class Engine:
             else [1] * len(plan)
         for i, (r, _, _) in enumerate(plan):
             p = r.params
-            if p.thinking_budget is not None and p.end_think_ids and not r.thought_closed:
+            if p.max_think_tokens is not None and p.end_think_ids and not r.thought_closed:
                 keep[i] = 0  # a forced end-think token is not the sampler's
             r.drafts = chains[i][: keep[i]]
 
@@ -879,12 +879,12 @@ class Engine:
         for i, raw in enumerate(toks):
             tok = raw
             if (
-                p.thinking_budget is not None
+                p.max_think_tokens is not None
                 and n
                 and not req.thought_closed
-                and len(req.output) >= p.thinking_budget
+                and len(req.output) >= p.max_think_tokens
             ):  # budget spent: close the reasoning block instead of sampling
-                tok = p.end_think_ids[len(req.output) - p.thinking_budget]
+                tok = p.end_think_ids[len(req.output) - p.max_think_tokens]
             elif tok in p.stop_token_ids:
                 self._finish(req)
                 return

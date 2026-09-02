@@ -40,9 +40,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .tokenizer import SAMPLING, Tokenizer, render_chat
+from .prompt import blocks_to_text, render_prompt, render_tool_call, render_tools, sampling, strip_think
+from .tokenizer import Tokenizer
 
-__all__ = ["mount_messages", "MessagesRequest", "record_path"]
 
 #: One JSONL row per request. Overridable so a test does not write the real one.
 _RECORD_ENV = "TILERL_MESSAGES_RECORD"
@@ -71,103 +71,6 @@ class MessagesRequest(BaseModel):
     thinking: dict[str, Any] | None = None
     output_config: dict[str, Any] | None = None
     context_management: Any | None = None
-
-
-def _blocks_to_text(content: Any) -> str:
-    """Flatten Anthropic content to the text a ChatML turn carries.
-
-    tool_use renders as the checkpoint's own ``<tool_call>`` XML and tool_result
-    as ``<tool_response>``, so a replayed transcript is byte-identical to what
-    the model was trained on. Reasoning is stripped: the template re-inserts
-    ``<think>`` only for turns after the last real user query, so feeding old
-    reasoning back would be off-distribution.
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return _strip_think(content)
-    out: list[str] = []
-    for b in content if isinstance(content, list) else []:
-        if not isinstance(b, dict):
-            continue
-        kind = b.get("type")
-        if kind == "text":
-            out.append(_strip_think(b.get("text", "")))
-        elif kind == "tool_use":
-            out.append(render_tool_call(b.get("name") or "", b.get("input") or {}))
-        elif kind == "tool_result":
-            out.append(f"<tool_response>\n{_blocks_to_text(b.get('content'))}\n</tool_response>")
-        elif kind in ("image", "document"):
-            # Dropping these silently would send the model a turn that is
-            # missing its subject; the 27B is text-only, so say so.
-            raise ValueError(f"{kind} blocks are not supported by this model")
-    return "\n".join(x for x in out if x)
-
-
-#: Verbatim from the checkpoint's chat_template.jinja (read on the pod
-#: 2026-09-02). Copied rather than paraphrased: this text is what the model was
-#: trained to answer in, so a reworded version is a different distribution.
-_TOOL_INSTRUCTIONS = (
-    "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:"
-    "\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\n"
-    "value_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second "
-    "parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n"
-    "<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner "
-    "<function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
-    "- Required parameters MUST be specified\n- You may provide optional reasoning for your "
-    "function call in natural language BEFORE the function call, but NOT after\n- If there is no "
-    "function call available, answer the question like normal with your current knowledge and do "
-    "not tell the user about function calls\n</IMPORTANT>"
-)
-
-#: The template's own wording per reasoning_effort; "medium" renders nothing.
-_EFFORT_INSTRUCTIONS = {
-    "xhigh": "Reasoning effort is set to xhigh. Please think carefully through the task, "
-             "validate key assumptions, consider plausible alternatives, and prioritize "
-             "correctness, consistency, and clarity in the final answer.",
-    "low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving "
-           "directly to the conclusion without unnecessary elaboration.",
-}
-
-_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.S)
-
-
-def _strip_think(text: str) -> str:
-    """Drop a reasoning block from historical assistant text."""
-    return _THINK_RE.sub("", text)
-
-
-def render_tool_call(name: str, args: dict[str, Any]) -> str:
-    """One ``<tool_call>`` block, in the template's own shape.
-
-    Non-string values are JSON, strings are raw -- exactly what the template's
-    ``args_value | tojson`` branch does, so a replayed assistant turn matches
-    what apply_chat_template would have produced.
-    """
-    lines = [f"<tool_call>\n<function={name}>"]
-    for k, v in args.items():
-        val = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
-        lines.append(f"<parameter={k}>\n{val}\n</parameter>")
-    lines.append("</function>\n</tool_call>")
-    return "\n".join(lines)
-
-
-def _render_tools(tools: list[dict[str, Any]] | None, effort: str | None = None) -> str:
-    """The system turn's tool section, as the checkpoint's template builds it.
-
-    Whole tool defs as JSON, one per line, inside ``<tools>`` -- not a trimmed
-    summary. The 28 schemas Claude Code sends are most of the prompt, but the
-    model was trained on the full defs and inventing a shorter form would be a
-    format it has never seen.
-    """
-    head = _EFFORT_INSTRUCTIONS.get((effort or "").lower(), "")
-    if not tools:
-        return head
-    body = "# Tools\n\nYou have access to the following functions:\n\n<tools>"
-    for t in tools:
-        body += "\n" + json.dumps(t, ensure_ascii=False)
-    body += "\n</tools>" + _TOOL_INSTRUCTIONS
-    return (head + "\n\n" + body) if head else body
 
 
 _TOOL_CALL_RE = re.compile(
@@ -233,26 +136,13 @@ def _effort(req: MessagesRequest) -> str | None:
 
 def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: str) -> FastAPI:
     """Add POST /v1/messages to an existing app, sharing its engine."""
-    from .engine import SamplingParams
-
     # The engine refuses prompt+max_new_tokens over its budget; the real API
     # accepts any max_tokens and stops at the context edge, so the completion
     # is clamped to what is left rather than the request rejected.
     engine_limit = getattr(getattr(engine, "limits", None), "max_total_tokens", 0)
 
     def _render(req: MessagesRequest) -> str:
-        # The template merges leading system/developer turns and puts the
-        # reasoning-effort sentence FIRST, ahead of the tool block.
-        turns: list[tuple[str, str]] = []
-        sys_text = _blocks_to_text(req.system)
-        tools_text = _render_tools(req.tools, _effort(req))
-        if sys_text or tools_text:
-            turns.append(("system", "\n\n".join(x for x in (tools_text, sys_text) if x)))
-        for m in req.messages:
-            turns.append((str(m.get("role", "user")), _blocks_to_text(m.get("content"))))
-        # Thinking is switched in the PROMPT, not by forcing tokens at decode
-        # time: "assistant\n<think>\n" when on, a closed empty block when off.
-        return render_chat(turns, thinking=_thinking(req))
+        return render_prompt(req.messages, req.system, req.tools, _thinking(req), _effort(req))
 
     def _record(row: dict[str, Any]) -> None:
         path = record_path()
@@ -264,25 +154,11 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         input_ids = tokenizer.encode(_render(req))
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
-        thinking = _thinking(req)
-        # The model card's values per thinking mode, since Claude Code sends
-        # neither temperature nor top_p -- so this table IS the effective
-        # default, not a fallback. An explicit request value still wins.
-        # ponytail: the card also wants presence_penalty 1.5 non-thinking; the
-        # engine has no such knob, add it when a run shows repetition.
+        # The real API accepts any max_tokens and stops at the context edge;
+        # refusing would 400 every Claude Code turn, which always asks for 32000.
         budget = max(1, engine_limit - len(input_ids)) if engine_limit else req.max_tokens
-        params = SamplingParams(
-            **SAMPLING[thinking]
-            | {k: v for k in ("temperature", "top_p")
-               if (v := getattr(req, k, None)) is not None},
-            # The real API accepts any max_tokens and stops at the context
-            # edge; refusing the whole request would 400 every Claude Code
-            # turn, which always asks for 32000.
-            max_new_tokens=min(req.max_tokens, budget),
-            seed=secrets.randbits(31),
-            stop_token_ids=tuple(getattr(tokenizer, "stop_token_ids", ())),
-            logprobs=True,  # always: the record is the point of this route
-        )
+        params = sampling(tokenizer, _thinking(req), min(req.max_tokens, budget),
+                          temperature=req.temperature, top_p=req.top_p, logprobs=True)
         rid = engine.submit(input_ids, params)
         deadline = time.monotonic() + 600.0
         out: list[int] | None = None
@@ -294,7 +170,7 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         if out is None:
             raise TimeoutError(f"request {rid} did not finish within 600s")
         scores = engine.logprobs(rid)  # single reader; a second one raises
-        text = _strip_think(tokenizer.decode(out))
+        text = strip_think(tokenizer.decode(out))
         prose, calls = _parse_tool_calls(text, req.tools)
         content: list[dict[str, Any]] = []
         if prose or not calls:
@@ -412,11 +288,11 @@ if __name__ == "__main__":  # pragma: no cover - self-check
     # ...and with no schema at all it parses as a number, which is why the
     # schema is passed in rather than guessed from the text.
     assert _parse_tool_calls(s)[1] == [("Read", {"file_path": 123})]
-    assert _blocks_to_text([{"type": "text", "text": "hi"},
+    assert blocks_to_text([{"type": "text", "text": "hi"},
                             {"type": "tool_result", "content": "out"}]) == (
         "hi\n<tool_response>\nout\n</tool_response>")
-    assert _strip_think("<think>\nplanning\n</think>\n\nthe answer") == "the answer"
-    tools = _render_tools([{"name": "Bash", "description": "Run it",
+    assert strip_think("<think>\nplanning\n</think>\n\nthe answer") == "the answer"
+    tools = render_tools([{"name": "Bash", "description": "Run it",
                             "input_schema": {"properties": {"command": {}}}}], "low")
     assert tools.startswith("Reasoning effort is set to low.")
     assert '<tools>\n{"name": "Bash"' in tools and "</tools>" in tools

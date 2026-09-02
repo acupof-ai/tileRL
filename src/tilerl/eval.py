@@ -86,7 +86,7 @@ def gsm8k_accuracy(engine: Any, tok: Any, rows: list[dict], sampling: Any,
     training's own ``sampling`` (stop ids, length, no-think template)."""
     from dataclasses import replace
 
-    from .tokenizer import render_chat
+    from .prompt import render_chat
 
     prompts = [render_chat([("user", r["prompt"])], thinking) for r in rows]
     texts = generate(engine, tok, prompts, replace(sampling, temperature=0.0), concurrency)

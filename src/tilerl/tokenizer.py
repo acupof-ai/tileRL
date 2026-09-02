@@ -53,18 +53,3 @@ def get_tokenizer(source: str | None = None) -> Tokenizer:
             tok = HfTokenizer.from_pretrained(source)
         return _HfTokenizerAdapter(tok)
     return ByteTokenizer()
-
-
-# Qwen3.8-27B model card sampling per thinking mode (non-thinking also wants
-# presence_penalty 1.5, which the engine does not have).
-SAMPLING = {True: {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
-            False: {"temperature": 0.7, "top_p": 0.8, "top_k": 20}}
-
-
-def render_chat(messages: list[tuple[str, str]], thinking: bool | None = None) -> str:
-    """ChatML from ``(role, text)`` pairs with the assistant turn left open.
-    ``thinking`` follows the 27B template: True opens ``<think>``, False closes
-    an empty one in the prompt, None leaves the bare turn (tiny/dev path)."""
-    rendered = "".join(f"<|im_start|>{r}\n{t}<|im_end|>\n" for r, t in messages)
-    tail = {None: "", True: "<think>\n", False: "<think>\n\n</think>\n\n"}[thinking]
-    return f"{rendered}<|im_start|>assistant\n{tail}"

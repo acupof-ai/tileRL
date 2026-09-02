@@ -24,7 +24,8 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .tokenizer import SAMPLING, ByteTokenizer, Tokenizer, get_tokenizer, render_chat  # noqa: F401
+from .prompt import render_prompt, sampling
+from .tokenizer import ByteTokenizer, Tokenizer, get_tokenizer  # noqa: F401
 
 __all__ = ["ByteTokenizer", "get_tokenizer", "create_app"]
 
@@ -58,23 +59,12 @@ class ChatCompletionRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-#: reasoning_effort -> tokens the model may spend inside <think> before the
-#: engine closes the block for it. "none" answers with no reasoning at all.
-_THINK_BUDGET = {"none": 0, "minimal": 128, "low": 512, "medium": 2048, "high": 8192}
+#: reasoning_effort -> cap on <think> tokens; "none" switches thinking off in the prompt.
+_MAX_THINK = {"none": 0, "minimal": 128, "low": 512, "medium": 2048, "high": 8192}
 
 
-def _message_text(message: ChatMessage) -> str:
-    """Flatten OpenAI content (string or part list) to plain text."""
-    content = message.content
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    return "".join(part.get("text", "") for part in content if isinstance(part, dict))
-
-
-def _render_chat(messages: list[ChatMessage]) -> str:
-    return render_chat([(m.role, _message_text(m)) for m in messages])
+def _render_chat(messages: list[ChatMessage], thinking: bool | None = None) -> str:
+    return render_prompt([m.model_dump() for m in messages], thinking=thinking)
 
 
 def _chat_chunk(
@@ -107,31 +97,18 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     ``stats``. The engine loop is expected to run in its own thread (the CLI
     starts it); request handlers only submit and poll.
     """
-    from .engine import SamplingParams  # engine contract; imported lazily-ish
-
     app = FastAPI(title="tilerl", version="0.1.0")
     app_started = int(time.time())
 
     def _submit(req: ChatCompletionRequest) -> tuple[int, int, int]:
-        prompt = _render_chat(req.messages)
-        input_ids = tokenizer.encode(prompt)
+        cap = _MAX_THINK.get((req.reasoning_effort or "").lower())
+        thinking = cap != 0
+        input_ids = tokenizer.encode(_render_chat(req.messages, thinking))
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
-        # The card's values per thinking mode, not 0.0/1.0: a client that sends
-        # no temperature was getting greedy decoding, which is off-distribution
-        # for this checkpoint and makes a sampled group collapse to one draw.
-        thinking = _THINK_BUDGET.get((req.reasoning_effort or "").lower()) != 0
-        params = SamplingParams(
-            **SAMPLING[thinking]
-            | {k: v for k in ("temperature", "top_p")
-               if (v := getattr(req, k, None)) is not None},
-            max_new_tokens=req.max_tokens if req.max_tokens is not None else 512,
-            seed=req.seed if req.seed is not None else secrets.randbits(31),
-            stop_token_ids=tuple(getattr(tokenizer, "stop_token_ids", ())),
-            thinking_budget=_THINK_BUDGET.get((req.reasoning_effort or "").lower()),
-            end_think_ids=tuple(tokenizer.encode("</think>\n\n")),
-            logprobs=bool(req.logprobs),
-        )
+        params = sampling(tokenizer, thinking, req.max_tokens if req.max_tokens is not None else 512,
+                          temperature=req.temperature, top_p=req.top_p, max_think_tokens=cap,
+                          seed=req.seed, logprobs=bool(req.logprobs))
         return engine.submit(input_ids, params), len(input_ids), params.max_new_tokens
 
     def _await_completion(request_id: int, timeout_s: float = 600.0) -> list[int]:

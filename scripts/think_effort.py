@@ -27,7 +27,7 @@ prompt = tok.encode("<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>a
 print("end_think_ids:", end, "->", repr(tok.decode(list(end))))
 for label, budget in (("unset", None), ("none", 0), ("minimal", 32)):
     sp = SamplingParams(temperature=0.0, max_new_tokens=96, seed=0,
-                        thinking_budget=budget, end_think_ids=end)
+                        max_think_tokens=budget, end_think_ids=end)
     wid = engine.submit(prompt, sp)
     out = None
     while out is None:
