@@ -654,6 +654,61 @@ __device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m_xh(
     }
   }
 }
+// ABLATIONS (WRONG RESULTS BY CONSTRUCTION -- measurement only, never shipped).
+// ncu is denied on this pod (ERR_NVGPUCTRPERM) and five mechanisms for the M=32
+// gap are excluded by A/B, so the remaining instrument is ablation: keep the
+// instruction and load COUNT identical, remove one suspect's cost, read the
+// delta. Each is selected by a factory flag on make_linear_fp4_gemv_sm70_m and
+// each is guarded by that kernel refusing to be the shipped path.
+//
+// ABL=1 X_REUSE: every row reads row 0's X. Same 2 loads/row, same 8 FMA/row,
+//   but after the first row it is an L1 hit -> isolates X load latency/traffic.
+// ABL=2 NO_SCALE: drop the per-tile scale apply (HADD2 widening + FADD/FFMA,
+//   measured 837 of 2936 instructions = 28.5%) -> isolates the scale tail.
+// ABL=3 NO_DECODE: skip tl_fp4_decode8_f16, use the raw words as if decoded ->
+//   isolates the fp4 dequant (LOP3/SHF/PRMT) from the FMA stream.
+template <int G, int M, int ABL>
+__device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m_abl(
+    const void *wqv, const void *xv, int K, int block_K,
+    const float *sc, float *acc) {
+  const unsigned char *wq = (const unsigned char *)wqv;
+  const unsigned *x = (const unsigned *)xv;
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    unsigned w0, w1;
+    asm volatile("ld.global.nc.v2.u32 {%0,%1}, [%2];"
+                 : "=r"(w0), "=r"(w1) : "l"(wq + g * block_K / 2));
+    unsigned d0[4], d1[4];
+    if (ABL == 3) {  // raw words stand in for decoded halves: same registers
+#pragma unroll
+      for (int i = 0; i < 4; ++i) { d0[i] = w0; d1[i] = w1; }
+    } else {
+      tl_fp4_decode8_f16(w0, d0);
+      tl_fp4_decode8_f16(w1, d1);
+    }
+    for (int m = 0; m < M; ++m) {
+      unsigned xw[8];
+      // ABL==1 pins every row to row 0, so the address is loop-invariant in m.
+      const unsigned *xg = x + (size_t)(ABL == 1 ? 0 : m) * (K / 2) + g * block_K / 2;
+      asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(xw[0]), "=r"(xw[1]), "=r"(xw[2]), "=r"(xw[3]) : "l"(xg));
+      asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(xw[4]), "=r"(xw[5]), "=r"(xw[6]), "=r"(xw[7]) : "l"(xg + 4));
+      unsigned a = 0u;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(xw[i]), "r"(d0[i]));
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(xw[4 + i]), "r"(d1[i]));
+      }
+      if (ABL == 2) {  // keep the accumulator live, drop the widen+scale tail
+        acc[m] += (float)(a & 0xffff);
+      } else {
+        __half2 ah = __halves2half2(__ushort_as_half(a & 0xffff), __ushort_as_half(a >> 16));
+        acc[m] = fmaf(sc[g], __low2float(ah) + __high2float(ah), acc[m]);
+      }
+    }
+  }
+}
 // M-row twin: WQ is loaded + decoded ONCE per tile and reused across all M
 // rows, so the weight bytes (the bottleneck — W is ~900x X for M=1) do not
 // scale with M. M is a compile-time template arg (the factory bakes it); the
@@ -964,7 +1019,7 @@ def make_linear_fp4_gemv_sm70(target: str, GROUP: int = 4):
 
 def make_linear_fp4_gemv_sm70_m(
     target: str, M: int = 8, GROUP: int = 4, xh: bool = False, sh: bool = False,
-    min_blocks: int = 0,
+    min_blocks: int = 0, abl: int = 0,
 ):
     """M-row (decode-batch) twin of make_linear_fp4_gemv_sm70.
 
@@ -984,10 +1039,20 @@ def make_linear_fp4_gemv_sm70_m(
     ``min_blocks`` raises ``__launch_bounds__``'s minBlocksPerSM, which is the
     only handle on the register budget: tilelang defaults to 1, so ptxas takes
     all 255 registers and 128 threads x 255 leaves ONE block per SM — 4 of
-    Volta's 64 warps, 6.25% occupancy, which is what caps M=32 at 17.6% of peak
-    (the FMA, L1-bandwidth and issue ceilings are all 2.5x above it). 4 halves
-    registers to 128 (4 blocks/SM) at 180 bytes of spill; 0 keeps the default.
+    Volta's 64 warps, 6.25% occupancy. Measured and REJECTED as the M=32 cap
+    (min_blocks=4 gives 4x the warps and 1.00x the speed,
+    errors/2026-09-03-occupancy-is-not-the-gemv-cap.md); the flag stays so the
+    A/B is reproducible. 0 keeps tilelang's default.
+
+    ``abl`` selects an ABLATION and RETURNS WRONG NUMBERS — measurement only,
+    never a serving path. 1 = every row reads row 0's X (same loads, all L1 hits
+    after the first) isolates X load cost; 2 = drop the per-tile scale apply
+    (28.5% of instructions); 3 = skip the fp4 decode. Instruction and load counts
+    are unchanged in each, so the delta prices exactly one suspect. This is the
+    instrument left after ncu was denied on the pod.
     """
+    if abl and not xh:
+        raise ValueError("abl requires xh=True: the ablations mirror the f16-X extern only")
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def linear_fp4_gemv_sm70_m(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
@@ -997,6 +1062,13 @@ def make_linear_fp4_gemv_sm70_m(
         num_ko = T.ceildiv(K, block_K)
         num_g = num_ko // GROUP
         tiles = "tl_fp4_gemv_tiles_f16_m_xh" if xh else "tl_fp4_gemv_tiles_f16_m"
+        # The ablation extern carries ABL as a third template arg; `targs` is what
+        # both call sites below interpolate, so the shipped path is untouched.
+        targs = f"{{G}},{M},{abl}" if abl else f"{{G}},{M}"
+        if abl:
+            tiles = "tl_fp4_gemv_tiles_f16_m_abl"
+        main_targs = targs.replace("{G}", str(GROUP))
+        tail_targs = targs.replace("{G}", "1")
         # sh must be read in plain Python before the annotations, or tilelang's
         # builder cannot resolve it (errors/2026-09-02-tilelang-closure-must-be-
         # read-before-annotation.md).
@@ -1023,7 +1095,7 @@ def make_linear_fp4_gemv_sm70_m(
                 for g in T.unroll(GROUP):
                     sc[g] = Scale[n, (base + g * block_K) // block]
                 T.call_extern(
-                    f"{tiles}<{GROUP},{M}>",
+                    f"{tiles}<{main_targs}>",
                     T.access_ptr(WQ[n, base // 2], "r"),
                     T.access_ptr(X[0, base], "r"),
                     K,
@@ -1036,7 +1108,7 @@ def make_linear_fp4_gemv_sm70_m(
                 base = (num_g * GROUP + kt) * block_K + kr * micro
                 sc[0] = Scale[n, base // block]
                 T.call_extern(
-                    f"{tiles}<1,{M}>",
+                    f"{tiles}<{tail_targs}>",
                     T.access_ptr(WQ[n, base // 2], "r"),
                     T.access_ptr(X[0, base], "r"),
                     K,
