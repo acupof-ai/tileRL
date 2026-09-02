@@ -4,6 +4,39 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-02 — phase exit: Claude Code drives tileRL, and the tokens it sampled come back
+
+- **Stage 1, the Messages shim** (`src/tilerl/messages.py`): `POST /v1/messages`
+  on the same app and engine as the OpenAI route. Every request appends a JSONL
+  row — prompt ids, completion ids, per-token logprobs, stop_reason — and
+  returns the id in `x-tilerl-request-id`, so a transcript joins by identity
+  rather than by text. BPE is not concatenation-invariant, so re-encoding a
+  transcript is a silently wrong gradient.
+- The stage-1 exit condition was **rewritten, not merely missed**: "tiny
+  completes a tool call" is unreachable by construction, since a randomly
+  initialised 2-layer model emits noise to `max_tokens`. Replaced by a pipeline
+  invariant (met live against a served `tiny-agent`) and a semantic path driven
+  by a scripted engine.
+- **Stage 2, the launcher** (`src/tilerl/rollout.py`): one command serves
+  tileRL and runs `claude -p` against it. The episode tag rides
+  `ANTHROPIC_CUSTOM_HEADERS` — measured to reach the server verbatim — so an
+  episode's rows group without parsing transcripts, which is what GRPO's
+  per-episode advantage needs. No Docker: isolation is Claude Code's own
+  sandbox with `failIfUnavailable`, so a host that cannot sandbox refuses
+  rather than running the agent bare.
+- **Accept: the 27B's own tool format**, read off the checkpoint's
+  `chat_template.jinja`. The shim had invented a JSON tool-call shape the model
+  will never emit; it now speaks `<tool_call><function=…>` XML, returns results
+  as `<tool_response>`, quotes the template's instruction block verbatim, and
+  strips `<think>` from replayed turns. One format for tiny and the 27B both —
+  `ByteTokenizer` round-trips the XML fine, so the daily no-weights gates test
+  the parser the real model hits.
+- Gates: `tests/test_server.py`, `tests/test_rollout.py`. The sandbox test
+  carries its own negative control (same escape, sandboxed and not) and caught
+  a real break within the hour.
+  [docs/lessons/messages_shim_stage1.md](docs/lessons/messages_shim_stage1.md),
+  [docs/lessons/rollout_launcher_stage2.md](docs/lessons/rollout_launcher_stage2.md).
+
 ## 2026-09-02 — phase exit: runs have a ledger — manifests, idempotent ids, gates as exit codes
 
 - `tilerl train --rl|--opd` writes `runs/<id>/manifest.json`: inputs, commit,
