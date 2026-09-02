@@ -60,8 +60,18 @@ for m, Mr, Mk in chunks:
 ```
 
 `_sm70_chunks` compiles M=512 as sixteen 32-row chunks, so prefill keeps `ncols=2`
-everywhere it matters, while M=1 decode and a verify tick (M=B·W≤32, which takes the
-8 rung) get the 1-column kernel. One expression; the ladder already carried the rung.
+everywhere it matters, while M=1 decode gets the 1-column kernel. One expression; the
+ladder already carried the rung.
+
+> **Correction (same day).** This entry first added "and a verify tick (M=B·W≤32, which
+> takes the 8 rung)" to that sentence. **That is false.** The sm70 ladder is
+> `1/2/4/8/32` with **no rung between 8 and 32**, so any M in 9..32 rounds *up* to 32 —
+> and the engine's defaults (`max_batch=4`, `spec_depth=3` → W=4) submit **B·W = 16
+> rows**, which take the 32 rung and **keep `ncols=2`**. The gate turns it off for
+> dense decode only. Spec decode is a third path, measured separately in
+> [`2026-09-03-the-ncols-gate-left-spec-decode-on.md`](2026-09-03-the-ncols-gate-left-spec-decode-on.md);
+> the claim was written from the phrase "top rung = prefill" rather than from
+> `_sm70_chunks`, which prints the answer in one line.
 
 `tests/test_ncols_contract.py` grew a fifth assertion that walks `_sm70_chunks` for
 every rung decode and verify actually take and requires `ncols` off below 32 — plus

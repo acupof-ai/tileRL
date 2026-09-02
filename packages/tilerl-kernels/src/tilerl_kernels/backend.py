@@ -81,8 +81,9 @@ _MGEMV = int(os.environ.get("TILERL_MGEMV", "3"))
 _NCOLS = int(os.environ.get("TILERL_NCOLS", "2"))
 #: Lowest rung ncols=2 is used on. Below it the GEMV is bandwidth-bound, so halving
 #: the grid only starves it: dense decode measured 39.1 -> 37.2 tok/s at 4096 with
-#: ncols on at M=1 (errors/2026-09-03-ncols2-cost-5-percent-of-decode.md). 32 is the
-#: top rung, i.e. prefill only -- a verify tick is M=B*W<=32 and takes the 8 rung.
+#: ncols on at M=1 (errors/2026-09-03-ncols2-cost-5-percent-of-decode.md). The sm70
+#: ladder is 1/2/4/8/32, so this covers prefill AND a verify tick of 9..32 rows --
+#: B*W=16 at the default depth 3 rounds UP to the 32 rung and keeps ncols=2.
 _NCOLS_MIN_M = 32
 _MMA_RED = kernels_linear._RED_TILE
 

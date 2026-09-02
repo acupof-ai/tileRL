@@ -91,7 +91,7 @@ def test_the_padding_guard_is_what_rejects_a_padded_shape():
 
 
 def test_ncols_is_gated_to_the_top_rung():
-    """ncols=2 must reach only M>=32, or dense decode loses 4.9%.
+    """ncols=2 must not reach the M<=8 rungs, or dense decode loses 4.9%.
 
     The mechanism pays where the GEMV is compute-bound. At M=1 it is bandwidth-bound
     (83% of its byte roofline), so there is no arithmetic to win and only the halved
@@ -102,25 +102,38 @@ def test_ncols_is_gated_to_the_top_rung():
 
     This is a SILENT failure mode: the wrong rung costs throughput and nothing
     raises, which is why the flip shipped with prefill numbers only.
+
+    The gate keys on the COMPILED RUNG, not the row count, so it exempts M<=8 only:
+    the ladder is 1/2/4/8/32, and B*W in 9..31 rounds up to 32 and keeps ncols=2.
     """
     import inspect
 
     from tilerl_kernels.backend import _NCOLS_MIN_M, Backend, _sm70_chunks
 
-    assert _NCOLS_MIN_M == 32, "ncols belongs on the top rung only (prefill)"
+    assert _NCOLS_MIN_M == 32, "the top rung is where the GEMV turns compute-bound"
     src = inspect.getsource(Backend.linear_fp4)
     assert "nc = nc2 if Mk >= _NCOLS_MIN_M else 1" in src, (
         "the per-chunk rung must gate ncols: a decode chunk compiles at Mk=1 and "
         "must get the 1-column kernel"
     )
-    # The rungs decode and a verify tick actually take, from the ladder itself.
-    for rows in (1, 2, 4, 8, 32):
-        for _, _, mk in _sm70_chunks(rows):
-            gated = mk >= _NCOLS_MIN_M
-            assert gated == (rows == 32), (
-                f"M={rows} compiles rung {mk}: ncols {'on' if gated else 'off'}, "
-                f"but only the 32 rung (prefill) may have it on"
-            )
+    # Widths the engine actually submits, INCLUDING ones that are not ladder rungs:
+    # the sm70 ladder is 1/2/4/8/32 with no rung between 8 and 32, so B*W in 9..31
+    # rounds UP to 32 and keeps ncols=2. A first version of this loop probed only
+    # 1/2/4/8/32 -- every ladder-exact width -- and so could not have caught the
+    # entry's false claim that "a verify tick takes the 8 rung"
+    # (errors/2026-09-03-the-ncols-gate-left-spec-decode-on.md).
+    on = {rows: [mk >= _NCOLS_MIN_M for _, _, mk in _sm70_chunks(rows)] for rows in
+          (1, 2, 4, 8, 9, 12, 16, 24, 31, 32, 40, 512)}
+    for rows in (1, 2, 4, 8):
+        assert not any(on[rows]), f"M={rows} is below the top rung: ncols must be off"
+    for rows in (9, 12, 16, 24, 31, 32):
+        assert all(on[rows]), (
+            f"M={rows} rounds up to the 32 rung, so ncols is ON -- a verify tick at "
+            f"max_batch*(1+spec_depth) in this range is NOT exempt from the gate"
+        )
+    # A ragged M keeps ncols on its 32-row chunks and off on the tail rung.
+    assert on[40] == [True, False], f"M=40 is 32+8, got {on[40]}"
+    assert all(on[512]), "prefill is all 32-row chunks: ncols on for every one"
 
 
 def test_ncols_factory_rejects_what_it_cannot_serve():
