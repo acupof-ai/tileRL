@@ -48,12 +48,17 @@ SHAPES = [(34816, 5120, 64, "gate_up"), (5120, 17408, 64, "down"),
           (16384, 5120, 48, "qkvz"), (5120, 6144, 48, "gdn out"),
           (14336, 5120, 16, "qkv"), (5120, 6144, 16, "attn o")]
 MS = (1, 8, 32)
-ABLATIONS = [(1, "X_REUSE"), (2, "NO_SCALE"), (3, "NO_DECODE"), (4, "PIPELINE")]
-#: abl=4 is CORRECT (it only reorders), so it is both the discriminator and a
-#: candidate fix. THRESHOLD, committed before reading M=32: accept at >=1.15x with
-#: no M=1 regression, and relerr must be exactly 0 -- a reorder that changes the
-#: numbers is a bug, not a variant.
+ABLATIONS = [(1, "X_REUSE"), (2, "NO_SCALE"), (3, "NO_DECODE"), (4, "PIPELINE"), (5, "SMEM")]
+#: abl=4 and 5 are CORRECT (4 reorders, 5 moves X to shared memory), so they are
+#: both discriminators and candidate fixes; the harness checks their relerr.
+#: PIPELINE measured 0.99x at M=32 -- rejected, the cost is throughput not latency.
+#: SMEM THRESHOLD, committed before reading M=32: accept at >=1.30x with no M=1
+#: regression. The LDG ceiling is 2.92x assuming a free LDS read; below 1.30x
+#: means shared-memory reads ate the win and a new kernel is not worth it.
+#: relerr must be 0 for 4 and ~0 for 5 (same arithmetic, same order).
 PIPE_ACCEPT = 1.15
+SMEM_ACCEPT = 1.30
+CORRECT_ABL = (4, 5)
 BLK, NP = 32, 4
 FMA_PEAK = 31.3
 
@@ -80,14 +85,14 @@ def main() -> None:
             u0 = bk.timeit(lambda: base(x, wq, sc, osc, res, 32, NP, BLK))
             gains = []
             for a, _, k in cands:
-                # abl=4 is the only variant whose output should match: check it,
-                # because a reorder that changes numbers is a bug, not a variant.
-                if a == 4:
+                # abl=4 and 5 keep the arithmetic, so their output must match:
+                # check it, because a variant that changes numbers is a bug.
+                if a in CORRECT_ABL:
                     rel = bk.relerr(k(x, wq, sc, osc, res, 32, NP, BLK),
                                     base(x, wq, sc, osc, res, 32, NP, BLK))
                     if rel:
-                        print(f"  !! PIPELINE relerr {rel:.2e} at {label} M={M} "
-                              f"-- a reorder must be bit-exact")
+                        print(f"  !! abl={a} relerr {rel:.2e} at {label} M={M} "
+                              f"-- must keep the arithmetic")
                 u = bk.timeit(lambda k=k: k(x, wq, sc, osc, res, 32, NP, BLK))
                 gains.append(u0 / u)
                 tot[(M, a)] = tot.get((M, a), 0.0) + u * cnt
@@ -102,15 +107,16 @@ def main() -> None:
         print(f"  M={M:>2}: base {b:>7.1f}   {row}")
 
     pipe = tot[(32, 0)] / tot[(32, 4)]
+    smem = tot[(32, 0)] / tot[(32, 5)]
     reuse = tot[(32, 0)] / tot[(32, 1)]
-    print(f"\nPIPELINE recovers {100 * (pipe - 1) / (reuse - 1):.0f}% of X_REUSE's "
-          f"{reuse:.2f}x headroom at M=32.")
-    print("  most of it   -> the 8.75x is LATENCY; SMEM staging removes traffic and")
-    print("                  would not have helped. This reorder IS the fix.")
-    print("  little of it -> the cost is TRAFFIC; stage X in SMEM next.")
-    print(f"Accept threshold for PIPELINE (committed before this run): "
-          f"{PIPE_ACCEPT}x at M=32, no M=1 regression, relerr 0. "
-          f"Measured {pipe:.2f}x -> {'ACCEPT' if pipe >= PIPE_ACCEPT else 'reject'}.")
+    print(f"\nX_REUSE bounds X-related cost at {reuse:.2f}x (it also deletes 85% of the")
+    print("LDGs -- a loop-invariant address is hoistable -- so read it as a ceiling).")
+    for lbl, g, acc in (("PIPELINE", pipe, PIPE_ACCEPT), ("SMEM", smem, SMEM_ACCEPT)):
+        print(f"  {lbl:<9} {g:.2f}x, {100 * (g - 1) / (reuse - 1):>5.1f}% of that headroom"
+              f"   threshold {acc}x -> {'ACCEPT' if g >= acc else 'reject'}")
+    print("\nPIPELINE ~1.0x already showed the cost is throughput, not latency.")
+    print("SMEM removes loads instead: below 1.30x means shared-memory reads ate")
+    print("the win (same 128 B/cycle port) and the kernel is not worth its size.")
 
 
 if __name__ == "__main__":

@@ -762,6 +762,46 @@ __device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m_pipe(
     }
   }
 }
+// SMEM-staged X: the four n_partition column-groups in a block all read the
+// SAME X (the address `X[0, base]` has no `ni` in it), so a block issues 4x
+// redundant global X loads. One group stages the tile's X slice into shared
+// memory and everyone reads that. Removes loads instead of rescheduling them,
+// which is what the PIPELINE ablation showed is the only thing that can pay
+// (errors/2026-09-03-prefetching-x-buys-nothing.md).
+//
+// Called with G=1 -- one block_K slice at a time. Staging all GROUP slices is
+// M x GROUP*block_K halves = 128 KB at M=32 against Volta's 96 KB/SM, so the
+// g loop lives in tilelang here and only a 32 KB slice is live.
+// `row_words` is the staged buffer's row pitch in 32-bit words; each lane reads
+// its own 8 words at `xs + m*row_words`.
+// Ceiling from the LDG arithmetic: X is 98.5% of tile-body loads at M=32 and
+// staging keeps 1 group of 4, so at most 73.8% of loads go away -> 2.92x if
+// loads are 89% of the time AND an LDS read were free. It is not free (same
+// 128 B/cycle port), hence the 1.30x accept threshold rather than 2x.
+template <int M>
+__device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m_smem(
+    const void *wqv, const void *xsv, int row_words, int block_K,
+    const float *sc, float *acc) {
+  const unsigned char *wq = (const unsigned char *)wqv;
+  const unsigned *xs = (const unsigned *)xsv;
+  unsigned w0, w1;
+  asm volatile("ld.global.nc.v2.u32 {%0,%1}, [%2];"
+               : "=r"(w0), "=r"(w1) : "l"(wq));
+  unsigned d0[4], d1[4];
+  tl_fp4_decode8_f16(w0, d0);
+  tl_fp4_decode8_f16(w1, d1);
+  for (int m = 0; m < M; ++m) {
+    const unsigned *xg = xs + (size_t)m * row_words;
+    unsigned a = 0u;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(xg[i]), "r"(d0[i]));
+      asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(xg[4 + i]), "r"(d1[i]));
+    }
+    __half2 ah = __halves2half2(__ushort_as_half(a & 0xffff), __ushort_as_half(a >> 16));
+    acc[m] = fmaf(sc[0], __low2float(ah) + __high2float(ah), acc[m]);
+  }
+}
 // M-row twin: WQ is loaded + decoded ONCE per tile and reused across all M
 // rows, so the weight bytes (the bottleneck — W is ~900x X for M=1) do not
 // scale with M. M is a compile-time template arg (the factory bakes it); the
@@ -1110,9 +1150,15 @@ def make_linear_fp4_gemv_sm70_m(
 
     4 = a 2-deep software pipeline, and unlike 1-3 it is CORRECT: it only
     reorders, issuing row m+1's loads before row m's FMAs. Traffic is identical,
-    exposure is not, so it splits what abl=1 measured together — a large gain
-    means the 8.75x is latency (and SMEM staging, which only removes traffic, is
-    the wrong fix); ~1.0x means it is traffic. Costs +8 registers, no m-unroll.
+    exposure is not, so it splits what abl=1 measured together — measured 0.99×
+    at M=32, so the cost is throughput and not latency
+    (errors/2026-09-03-prefetching-x-buys-nothing.md).
+
+    5 = SMEM-staged X, also CORRECT: `X[0, base]` carries no `ni`, so all four
+    n_partition groups load the SAME X and a block issues 4× redundant global
+    reads. One group stages the tile into shared memory. Removing loads is the
+    only thing 4's rejection leaves. Ceiling 2.92× from the LDG arithmetic if an
+    LDS read were free, which it is not — same 128 B/cycle port.
     """
     if abl and not xh:
         raise ValueError("abl requires xh=True: the ablations mirror the f16-X extern only")
@@ -1130,6 +1176,8 @@ def make_linear_fp4_gemv_sm70_m(
         targs = f"{{G}},{M},{abl}" if abl else f"{{G}},{M}"
         if abl == 4:  # its own extern: the prefetch spans an iteration boundary
             tiles, targs = "tl_fp4_gemv_tiles_f16_m_pipe", f"{{G}},{M}"
+        elif abl == 5:  # SMEM-staged X, fed a shared pointer instead of global
+            tiles, targs = "tl_fp4_gemv_tiles_f16_m_smem", f"{{G}},{M}"
         elif abl:
             tiles = "tl_fp4_gemv_tiles_f16_m_abl"
         main_targs = targs.replace("{G}", str(GROUP))
@@ -1155,21 +1203,55 @@ def make_linear_fp4_gemv_sm70_m(
             for m in T.unroll(M):
                 acc[m] = 0.0
             sc = T.alloc_local((GROUP,), "float32")
-            for kg in T.serial(num_g):
-                base = kg * GROUP * block_K + kr * micro
-                for g in T.unroll(GROUP):
-                    sc[g] = Scale[n, (base + g * block_K) // block]
-                T.call_extern(
-                    f"{tiles}<{main_targs}>",
-                    T.access_ptr(WQ[n, base // 2], "r"),
-                    T.access_ptr(X[0, base], "r"),
-                    K,
-                    block_K,
-                    T.access_ptr(sc, "r"),
-                    T.access_ptr(acc, "rw"),
-                    dtype="void",
-                )
-            for kt in T.serial(num_ko - num_g * GROUP):  # K-tail, one tile at a time
+            if abl == 5:
+                # One block_K slice staged at a time: 32 KB at M=32, where all
+                # GROUP slices would be 128 KB against Volta's 96 KB/SM. The
+                # staging write is the ONLY global X read in the block; the other
+                # three n_partition groups read shared memory.
+                # f16 buffer, not uint32: the extern casts to words itself, and a
+                # per-element reinterpret would only carry one half of each pair.
+                # Rows are split ACROSS the n_partition groups, not loaded by
+                # ni==0 alone: same total traffic either way, but one group means
+                # M serial LDG per lane instead of M/n_partition, and with one
+                # block per SM (255 registers) there is nothing to overlap that
+                # with. Staging must shorten the load path, not just narrow it.
+                xs = T.alloc_shared((M, reduce_thread * micro), "float16")
+                for ko in T.serial(num_ko):
+                    base = ko * block_K + kr * micro
+                    for mi in T.serial(T.ceildiv(M, n_partition)):
+                        m = mi * n_partition + ni
+                        if m < M:
+                            for v in T.vectorized(micro):
+                                xs[m, kr * micro + v] = X[m, base + v]
+                    T.sync_threads()
+                    sc[0] = Scale[n, base // block]
+                    T.call_extern(
+                        f"tl_fp4_gemv_tiles_f16_m_smem<{M}>",
+                        T.access_ptr(WQ[n, base // 2], "r"),
+                        T.access_ptr(xs[0, kr * micro], "r"),
+                        reduce_thread * micro // 2,  # row pitch in 32-bit words
+                        block_K,
+                        T.access_ptr(sc, "r"),
+                        T.access_ptr(acc, "rw"),
+                        dtype="void",
+                    )
+                    T.sync_threads()
+            else:
+                for kg in T.serial(num_g):
+                    base = kg * GROUP * block_K + kr * micro
+                    for g in T.unroll(GROUP):
+                        sc[g] = Scale[n, (base + g * block_K) // block]
+                    T.call_extern(
+                        f"{tiles}<{main_targs}>",
+                        T.access_ptr(WQ[n, base // 2], "r"),
+                        T.access_ptr(X[0, base], "r"),
+                        K,
+                        block_K,
+                        T.access_ptr(sc, "r"),
+                        T.access_ptr(acc, "rw"),
+                        dtype="void",
+                    )
+            for kt in T.serial(0 if abl == 5 else num_ko - num_g * GROUP):
                 base = (num_g * GROUP + kt) * block_K + kr * micro
                 sc[0] = Scale[n, base // block]
                 T.call_extern(
