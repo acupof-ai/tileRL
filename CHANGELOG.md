@@ -18,6 +18,26 @@ verdict**. Newest first.
   Roadmap P4 exits; the rl → eval → merge → serve chain waits on `eval` and
   `merge` commands ([docs/design-rl-stack.md](docs/design-rl-stack.md) §3).
 
+## 2026-09-02 — accept: ISO frames leave the device, the merge streams, the harness is written down
+
+- `ISO(offload=None)`: fp32 frames stay on the host and one matrix is staged
+  per update — the streamed step already goes one parameter at a time, and
+  the base optimizer's state is keyed per matrix (`step_one(..., key=)`), so
+  the staging buffer can be fresh each time. Device footprint on the 27B
+  drops from ~200 GiB to one matrix's frames; the host holds the 200 GiB and
+  ~8 s of PCIe per step is the price, against a rollout measured in minutes.
+  Bit-identical to resident frames on the tiny model
+  (`test_offloaded_frames_match_resident`). fp8/bf16 frames stay out: a
+  trained variable's storage has to resolve a 1e-6 relative update.
+- `merge_checkpoints`: `tilerl merge` reads safetensors one tensor at a time
+  from every input and writes sharded output; peak memory is one tensor from
+  each checkpoint plus one shard, not K+1 checkpoints. fp4 byte checkpoints
+  are refused (merge needs bf16 masters). The merge writes a manifest.
+- Harness: AGENTS.md carries the build surface (`train --recipe`, `merge`,
+  `ledger`), the shared-checkout etiquette (announce pushes to peer sessions;
+  never touch others' files) and the on-policy-engine rule; `scripts/README.md`
+  separates the durable tools from the one-off probes.
+
 ## 2026-09-02 — default flip: dtypes are a policy, wrong training configs are refused, runs start from recipes
 
 - `precision.py` is the one place a dtype is chosen: optimizer state and ISO

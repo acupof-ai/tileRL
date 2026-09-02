@@ -131,6 +131,17 @@ handles >5-file plans. Independent tasks go out in one message, in parallel.
 Two failed subagent attempts → hand-write the diff or re-brief a fresh agent
 with what was tried.
 
+**Shared checkout.** Other Claude sessions work in this directory at the
+same time. Never stash, checkout, or commit files you did not change; do
+integration in a scratchpad worktree and fast-forward `main`. Before a push
+or a fast-forward pull, tell the peers `ListAgents` shows for this repo
+(`SendMessage`) which files you touch, and wait a few minutes for objections.
+
+**On-policy rollouts.** `grpo_loop` and self-OPD refuse an engine with the
+decode graph or the prefix store on — both sample from an earlier policy
+without raising. Training engines are built with `decode_graph=False,
+prefix_store=NoPrefixStore()` until recapture-after-update lands (roadmap P2.0).
+
 **Git.** Commitizen `<type>(<scope>): <subject>`, scopes `kv` `engine` `ops`
 `autograd` `train` `server` `docs`. Commit directly to `main` — no feature
 branches. Small tranches, each self-contained, simplify pass first. Commit
@@ -157,7 +168,9 @@ Fix / Rule; `wins/…` = Context / What Worked / Rule. Bench snapshots use
 ```bash
 uv sync                          # install deps into .venv (never pip install)
 uv run tilerl serve              # OpenAI-compatible server
-uv run tilerl train              # OPD training
+uv run tilerl train --recipe X   # SFT / --rl / --opd from a gated flag set; runs/<id>/manifest.json
+uv run tilerl merge --base B --specialists S1,S2 --out D   # ISO merge, one tensor at a time
+uv run tilerl ledger             # runs, gates, lineage (--json for agents)
 uv run tilerl bench              # benchmark (writes a bench entry)
 uv run pytest                    # test suite
 uv run ruff check                # lint
