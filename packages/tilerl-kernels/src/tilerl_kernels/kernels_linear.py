@@ -1188,30 +1188,40 @@ def make_linear_fp4_gemv_sm70(target: str, GROUP: int = 4):
     return linear_fp4_gemv_sm70
 
 
-def make_linear_fp4_gemv_sm70_m(target: str, M: int = 8, GROUP: int = 4, xh: bool = False):
+def make_linear_fp4_gemv_sm70_m(
+    target: str, M: int = 8, GROUP: int = 4, xh: bool = False, sh: bool = False
+):
     """M-row (decode-batch) twin of make_linear_fp4_gemv_sm70.
 
     X[M,K] f32 (f16 when ``xh``), WQ[N,K//2] fp16-TWIDDLED, Scale[N,K//block]
-    f32, OScale[N] f32, Res[M,N] f32 -> Y[M,N] f32. WQ is loaded + decoded ONCE
-    per tile and reused across all M rows, so the weight bytes do not scale with
-    M. This is the sm70 decode-batch path (M=2..16), replacing the per-row GEMV
-    loop (M launches/layer, OOM-prone). M is a compile-time factory arg; the
-    backend pads M up and slices. ``xh`` takes X pre-packed as f16: same
-    numerics (both round to nearest f16), half the X traffic, and 32 fewer
-    instructions per row than converting inside the tile loop.
+    f32 (f16 when ``sh``), OScale[N] f32, Res[M,N] f32 -> Y[M,N] f32. WQ is
+    loaded + decoded ONCE per tile and reused across all M rows, so the weight
+    bytes do not scale with M. This is the sm70 decode-batch path (M=2..16),
+    replacing the per-row GEMV loop (M launches/layer, OOM-prone). M is a
+    compile-time factory arg; the backend pads M up and slices. ``xh`` takes X
+    pre-packed as f16: same numerics (both round to nearest f16), half the X
+    traffic, and 32 fewer instructions per row than converting inside the tile
+    loop.
+
+    ``sh`` narrows the Scale plane to f16 in global memory only — the tile loop
+    still hands the extern f32, so the dequant math is untouched.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def linear_fp4_gemv_sm70_m(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
         N, K = T.const("N, K")
-        micro = 16  # one scale block (NVFP4 block=16); 8 twiddled bytes = 1 decode pair
+        micro = 16  # 8 twiddled bytes = 1 decode pair; block is 16 or 32 (>= micro)
         block_K = reduce_thread * micro
         num_ko = T.ceildiv(K, block_K)
         num_g = num_ko // GROUP
         tiles = "tl_fp4_gemv_tiles_f16_m_xh" if xh else "tl_fp4_gemv_tiles_f16_m"
+        # sh must be read in plain Python before the annotations, or tilelang's
+        # builder cannot resolve it (errors/2026-09-02-tilelang-closure-must-be-
+        # read-before-annotation.md).
+        s_dtype = "float16" if sh else "float32"
         X: T.Tensor((M, K), "float16" if xh else "float32")
         WQ: T.Tensor((N, K // 2), "uint8")
-        Scale: T.Tensor((N, K // block), "float32")
+        Scale: T.Tensor((N, K // block), s_dtype)
         OScale: T.Tensor((N,), "float32")
         Res: T.Tensor((M, N), "float32")
         Y = T.empty((M, N), "float32")

@@ -39,8 +39,8 @@ def timeit(k, args, n=20):
     return (time.perf_counter() - t0) / n * 1e6, y
 
 
-def run(name, x, wq, sc, osc, res, bN, blk, n=20):
-    return timeit(bk._kernel(name), (x, wq, sc, osc, res, 32, bN, blk), n)
+def run(name, x, wq, sc, osc, res, bN, blk, n=20, *fargs):
+    return timeit(bk._kernel(name, *fargs), (x, wq, sc, osc, res, 32, bN, blk), n)
 
 
 for N, K in SHAPES:
@@ -55,7 +55,8 @@ for N, K in SHAPES:
     x1 = _pad2d(torch.randn(1, K, generator=g).to(bk.device), 1, Kp)
     r1 = bk._zeros2(1, Np)
     t_g, y_g = run("linear_fp4_gemv", x1, wq1, sc1, osc1, r1, bN, 16)
-    t_1h, y_1h = run("linear_fp4_gemv_sm70_m1h", x1.half(), wq1, sc1, osc1, r1, bN, 16)
+    t_1h, y_1h = run("linear_fp4_gemv_sm70_m", x1.half(), wq1, sc1, osc1, r1, bN, 16,
+                     20, 1, 4, True)
     d = (y_g[:, :N] - y_1h[:, :N]).abs().max().item()
     print(
         f"  M=1  gemv {t_g:7.1f} us            m1h {t_1h:7.1f} us            "
@@ -66,7 +67,7 @@ for N, K in SHAPES:
         res = bk._zeros2(M, Np)
         t_f32, y_f32 = timeit(_F32[M], (x, wq1, sc1, osc1, res, 32, bN, 16))
         t_f16, y_f16 = run(
-            f"linear_fp4_gemv_sm70_m{M}h", x.half(), wq1, sc1, osc1, res, bN, 16
+            "linear_fp4_gemv_sm70_m", x.half(), wq1, sc1, osc1, res, bN, 16, 20, M, 4, True
         )
         d = (y_f32[:, :N] - y_f16[:, :N]).abs().max().item()
         s = y_f32[:, :N].abs().max().item()

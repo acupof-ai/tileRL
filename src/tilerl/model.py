@@ -1147,6 +1147,8 @@ def save_hf(model: Model, path: str | Path) -> None:
                     t = untwiddle_fp4(t)
                 elif layout == "tw-f16":  # sm70 serves fp16-twiddled bytes
                     t = untwiddle_fp4_f16(t)
+                if suffix == ".scale":
+                    t = t.float()  # sm70 serves an f16 plane; the format's is f32
                 tensors[stem + suffix] = t
         else:
             missing.append(key)

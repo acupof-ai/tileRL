@@ -128,27 +128,15 @@ _register("fp4", "sm90", _SM90_KERNELS)
 _SM70_KERNELS = {
     **_CPU_KERNELS,
     "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv_sm70,
-    # M-row ladder for decode/verify (M<=8), X handed in pre-packed as f16.
-    # One launch for M rows; the rung is picked by row count at the dispatch
-    # site so a 2-row verify does not pay for 8. Rounding X to f16 once outside
-    # the kernel — instead of re-reading it f32 per block and converting inside
-    # the tile loop — took 127 us/row flat down to 24-45 us/row, which is what
-    # makes batched verification cheaper than the same rows decoded one by one.
-    "linear_fp4_gemv_sm70_m1h": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(
-        t, M=1, xh=True
-    ),
-    "linear_fp4_gemv_sm70_m2h": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(
-        t, M=2, xh=True
-    ),
-    "linear_fp4_gemv_sm70_m4h": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(
-        t, M=4, xh=True
-    ),
-    "linear_fp4_gemv_sm70_m8h": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(
-        t, M=8, xh=True
-    ),
-    # M=32 twin for the prefill M>8 path: 32 rows share one W stream, so
-    # M=512 prefill is 16 launches/layer instead of 512.
-    "linear_fp4_gemv_sm70_m32": lambda t: kernels_linear.make_linear_fp4_gemv_sm70_m(t, M=32),
+    # M-row ladder for decode/verify (M<=8) and the M=32 prefill twin, as ONE
+    # entry: M / xh / sh are factory args and Backend._kernel keys the compile
+    # cache on them, the same way the sm90 GEMV's row count is passed. One
+    # launch for M rows; the rung is picked by row count at the dispatch site so
+    # a 2-row verify does not pay for 8. Rounding X to f16 once outside the
+    # kernel — instead of re-reading it f32 per block and converting inside the
+    # tile loop — took 127 us/row flat down to 24-45 us/row, which is what makes
+    # batched verification cheaper than the same rows decoded one by one.
+    "linear_fp4_gemv_sm70_m": kernels_linear.make_linear_fp4_gemv_sm70_m,
     # Both fix graph capture: gdn_decode_fused and write_tokens replace eager
     # fallbacks whose per-token int(device_tensor) host syncs break it.
     "gdn_decode_fused": lambda t: kernels_gdn.make_gdn_decode_fused(t, out_dtype="float32"),

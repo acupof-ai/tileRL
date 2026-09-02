@@ -481,7 +481,8 @@ class Backend:
         # ``master`` is recording-only (the STE grad lands on it); the kernel
         # uses wq/scale.
         wq = self._served_fp4(wq)
-        scale = self._f32(scale)
+        sh = scale.dtype == torch.float16  # sm70's narrowed plane; materialize did it
+        scale = scale if sh else self._f32(scale)
         lead, x2 = self._rows(x)
         M, K, N = x2.shape[0], x2.shape[1], wq.shape[0]
         blk = K // scale.shape[1]  # scale block from the loaded weight (16 or 32)
@@ -525,14 +526,14 @@ class Backend:
                 # to nearest f16. M=1 is on the ladder too: 1.1-1.45x over the
                 # scalar GEMV it replaced.
                 Mk = 1 if M == 1 else 2 if M <= 2 else 4 if M <= 4 else 8
-                y2 = self._kernel(f"linear_fp4_gemv_sm70_m{Mk}h")(
+                y2 = self._kernel("linear_fp4_gemv_sm70_m", Mk, 4, True, sh)(
                     _pad2d(x2, Mk, Kp).to(torch.float16),
                     wq1, sc1, osc1, self._zeros2(Mk, Np), 32, bN, blk,
                 )[:M, :N]
             else:
                 MC = 32
                 y2 = torch.cat([
-                    self._kernel("linear_fp4_gemv_sm70_m32")(
+                    self._kernel("linear_fp4_gemv_sm70_m", MC, 4, False, sh)(
                         _pad2d(x2[m : m + MC], MC, Kp), wq1, sc1, osc1,
                         self._zeros2(MC, Np), 32, bN, blk,
                     )[: min(MC, M - m), :N]
@@ -687,6 +688,11 @@ class Backend:
                 if k.endswith(".wq") and getattr(moved[k], "_tl_layout", "natural") == "natural":
                     moved[k].copy_(_twiddle(moved[k]))
                     moved[k]._tl_layout = "tw-bf16" if self.arch == "sm90" else "tw-f16"
+        # Halve the 3.20 GB scale plane on sm70. Here, not per call: a cast in
+        # linear_fp4 would reallocate the plane every token and stream both.
+        if self.arch == "sm70":
+            for k in [k for k in moved if k.endswith(".scale")]:
+                moved[k] = moved[k].to(torch.float16)
         return moved
 
     # ------------------------------------------------------------ attention
@@ -885,7 +891,7 @@ class Backend:
         # The kernel bakes the scale block into its dequant macro; 16 is every
         # shipped checkpoint's, and pack_fp4's block-32 test weights take the
         # reference. ponytail: register a second kernel if a 32 ever ships.
-        blk = wq.shape[1] * 2 // self._f32(scale).shape[1]
+        blk = wq.shape[1] * 2 // scale.shape[1]
         if not fp8 and blk == 16 and "linear_fp4_bwd" in kset:
             wq = self._served_fp4(wq)
             n, k = wq.shape[0], wq.shape[1] * 2

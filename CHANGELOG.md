@@ -4,6 +4,31 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-02 — default flip: f16 block scales, dense 35.3 -> 37.6 tok/s
+
+- The NVFP4 scale plane is one f32 per 32 weights — **3.20 GB of the 16.04 GB a
+  dense token streams**. Storing it f16 is the last structural cut available (the
+  weights are already 4-bit) and moves the roofline 56.1 -> 62.3 tok/s.
+- Dense decode **+6.5% to +7.5% at every context**: 4096 ctx 35.3 -> **37.6**,
+  1024 ctx 37.7 -> 40.5, 32 ctx 38.7 -> 41.6. Bytes predicted 1.111x, measured
+  1.065x — 60% of the saving converted, consistent with the GEMV at 84% of its own
+  byte roofline. Device memory 31.6 -> 29.0 GB confirms the plane actually shrank.
+- Representability measured on the real checkpoint first (252M values): worst
+  round-trip **3.24e-04** relative, 31x inside the 1e-2 gate. bf16 fits too and
+  buys nothing extra; **e4m3 is rejected** at 3.06e-01 despite halving the plane
+  again.
+- **This line was rejected once on a bad metric.** The earlier "relerr 2.0-21.3"
+  came from `clamp(min=1e-3)` in the denominator: it floors the divisor so a
+  near-zero output row fakes a huge ratio, and as a `max()` over N rows it grows
+  with N by construction (0.21 at N=1024, 21.8 at 248320). The real error is
+  1.88e-04, flat in N. `benchkit.relerr` had the correct form all along.
+  [wins/2026-09-02-f16-block-scales.md](docs/experience/wins/2026-09-02-f16-block-scales.md) ·
+  [errors/2026-09-02-clamped-relerr-scales-with-n.md](docs/experience/errors/2026-09-02-clamped-relerr-scales-with-n.md)
+- The sm70 GEMV ladder collapsed from 9 registry entries to **1**: M/xh/sh are
+  factory args and `Backend._kernel` already keys the compile cache on them, the
+  way the sm90 GEMV's row count is passed. Adding f16 scales as 5 more
+  name-mangled entries would have doubled the family again.
+
 ## 2026-09-02 — accept-or-reject verdict: top-k path search REJECTED, DSpark REJECTED
 
 - Measured the prize before pricing the work. `scripts/probe_draft_topk.py`
