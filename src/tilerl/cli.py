@@ -135,12 +135,6 @@ def cmd_serve(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _generation_defaults(source: str) -> dict:
-    """The checkpoint's generation_config.json, or {} when it is not a local dir."""
-    p = Path(source) / "generation_config.json"
-    return json.loads(p.read_text()) if p.is_file() else {}
-
-
 def cmd_train(args: argparse.Namespace) -> None:
     import torch
 
@@ -183,7 +177,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         from .engine import SamplingParams
         from .eval import gsm8k_accuracy, mmlu_accuracy
         from .ledger import commit, file_hash, new_manifest, read_manifest, runs_root
-        from .tokenizer import get_tokenizer, render_chat
+        from .tokenizer import SAMPLING, get_tokenizer, render_chat
 
         tok = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
         # --data: {"prompt", "answer"} per line, rendered as one ChatML user
@@ -199,12 +193,13 @@ def cmd_train(args: argparse.Namespace) -> None:
             torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist() for _ in range(8)
         ]
         end_think = tuple(tok.encode("</think>\n\n")) if thinking else ()
-        # Sampling defaults come from the checkpoint's generation_config.json
-        # (Qwen ships top_k 20 / top_p 0.95), not from flags.
-        gen_cfg = _generation_defaults(_QWEN38_SOURCE) if real else {}
+        # Sampling follows the model card per thinking mode unless --temperature
+        # overrides; the tiny model keeps plain temperature-1 sampling.
+        gen_cfg = dict(SAMPLING[thinking]) if real else {"temperature": 1.0}
+        if args.temperature is not None:
+            gen_cfg["temperature"] = args.temperature
         sampling = SamplingParams(
-            temperature=args.temperature, max_new_tokens=args.max_new_tokens,
-            top_k=int(gen_cfg.get("top_k", 0)), top_p=float(gen_cfg.get("top_p", 1.0)),
+            max_new_tokens=args.max_new_tokens, **gen_cfg,
             stop_token_ids=getattr(tok, "stop_token_ids", ()),
             thinking_budget=args.think_budget if thinking else None, end_think_ids=end_think)
 
@@ -216,7 +211,7 @@ def cmd_train(args: argparse.Namespace) -> None:
                   "commit": commit(), "algo": "grpo" if args.rl else "opd",
                   "data": file_hash(args.data) if args.data else None, "steps": args.steps,
                   "group": args.group, "max_new_tokens": args.max_new_tokens,
-                  "temperature": args.temperature, "think_budget": args.think_budget,
+                  "temperature": gen_cfg["temperature"], "think_budget": args.think_budget,
                   "lr": args.lr, "lora_rank": args.lora_rank, "seed": args.seed,
                   "eval_mmlu": args.eval_mmlu,
                   "eval_gsm8k": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
@@ -559,7 +554,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_train.add_argument("--max-new-tokens", type=int, default=32, help="rollout length")
     p_train.add_argument("--data", help="JSONL {prompt, answer}: real prompts, exact-match "
                          "reward on the last number (scripts/gsm8k_jsonl.py)")
-    p_train.add_argument("--temperature", type=float, default=1.0, help="rollout temperature")
+    p_train.add_argument("--temperature", type=float, default=None,
+                         help="rollout temperature (default: the model card's, per thinking mode)")
     p_train.add_argument("--think-budget", type=int, default=0,
                          help="tokens the 27B may spend in <think> per rollout; 0 = none")
     p_train.add_argument("--eval-mmlu", type=int, default=0,

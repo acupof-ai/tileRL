@@ -68,6 +68,13 @@ def get_tokenizer(source: str | None = None) -> Tokenizer:
     return ByteTokenizer()
 
 
+#: Qwen3.8-27B model card, 2026-09-02: the recommended sampling per thinking
+#: mode. generation_config.json ships only the thinking row. Non-thinking also
+#: wants presence_penalty 1.5, which the engine does not have.
+SAMPLING = {True: {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+            False: {"temperature": 0.7, "top_p": 0.8, "top_k": 20}}
+
+
 def render_chat(messages: list[tuple[str, str]], thinking: bool | None = None) -> str:
     """ChatML — the format Qwen3.x was trained on and what the stop set
     assumes. ``messages`` are ``(role, text)`` pairs; the assistant turn is
