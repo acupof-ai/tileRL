@@ -121,6 +121,29 @@ One caveat to record now: `Engine.logprobs` **pops**. If the shim reads it and
 something else expects it later, the second reader gets nothing. The shim must
 be the only reader per request.
 
+## The gate, as it ended up
+
+fb's ruling after the first run, and it changed the exit condition rather than
+the code. The original "tiny completes a tool call and a final answer" is not
+slow on random weights, it is **impossible**: a 2-layer randomly-initialised
+model emits noise until `max_tokens` and can never produce a well-formed tool
+call, so that gate would have stayed red forever. Two assertions replace it:
+
+1. **Pipeline invariant** — one `claude -p` produces one record row,
+   `len(logprobs) == len(completion_ids)`, a valid `stop_reason`, and the
+   response header's id equals the row's. **Met**, against a served
+   `tiny-agent`: 15,391 prompt ids, 32,000 completion ids, 32,000 logprobs,
+   `stop_reason: max_tokens`. This is the invariant stage 4's `torch.equal`
+   rests on, so it is the one worth gating.
+2. **Semantic path** — a scripted engine (same submit/poll/step duck type,
+   canned completions) drives the full shape: `tool_use` block out with
+   `stop_reason="tool_use"`, the client's `tool_result` rendered back into the
+   next prompt, final answer. **Met**,
+   `tests/test_server.py::test_messages_tool_use_round_trip`.
+
+The scripted engine is also what lets stage 2's launcher be gated on a machine
+with no weights, which is why it is worth having beyond this one test.
+
 ## State
 
 Built and gated: `src/tilerl/messages.py` mounted on the same app, tests
@@ -133,6 +156,7 @@ Verified live by curl against a served `tiny-agent`: a real Messages response,
 and a record row with 52 prompt ids, 8 completion ids, 8 logprobs — one score
 per token, which is the property the RL loop consumes.
 
-The end-to-end `claude -p` pass is **running, not yet passed**. CPU prefill of a
-21,676-token prompt through a freshly compiled kernel set is minutes, not
-seconds. Reporting it as in-flight rather than as a pass.
+The end-to-end `claude -p` run completed: the CLI reached the shim, the engine
+answered, the record was written, and Claude Code exited 0. It produced no
+usable answer — 32,000 tokens of noise to `max_tokens` — which is the model,
+not the shim, and is why the gate moved to the two assertions above.
