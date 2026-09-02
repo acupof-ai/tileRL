@@ -24,6 +24,7 @@ from .registry import _arch_for, _resolve, resolve_target
 __all__ = ["Backend", "get_backend", "resolve_target"]
 
 _THREADS = 64
+_WY_CHUNK = 64  # the chunkwise-WY kernels' chunk length
 
 
 def _round_up(x: int, m: int) -> int:
@@ -126,6 +127,7 @@ class Backend:
         self._const_f32_cache: dict[tuple[int, int | None], tuple[Any, int, torch.Tensor]] = {}
         self._ones_cache: dict[int, torch.Tensor] = {}
         self._step_scratch: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._full_rows_memo: tuple[Any, int, bool] | None = None
         self._sms = (
             torch.cuda.get_device_properties(self.device).multi_processor_count
             if self.device.type == "cuda"
@@ -651,15 +653,90 @@ class Backend:
     # ------------------------------------------------------------ gated delta
 
     def linear_attn_chunk(self, q, k, v, g, beta, state, **kw):
-        """Full-GDN layer core: the fused chunk kernel on sm90 for T>1, else the reference."""
-        _kset = _resolve(self.precision, self.arch)
-        # A/B lever: the chunkwise reference (all bmm + a triangular solve) vs the kernel
-        chunk = int(os.environ.get("TILERL_GDN_CHUNKWISE", "0"))
-        if chunk and q.shape[1] > 1 and not kw.get("keep_steps"):
-            return reference.gdn_forward(q, k, v, g, beta, state, chunkwise=chunk, **kw)
-        if q.shape[1] > 1 and "gdn_chunk_fused" in _kset:
+        """Full-GDN layer core: chunkwise-WY for full-length rows, else the
+        fused serial kernel on sm90, else the per-step reference."""
+        kset = _resolve(self.precision, self.arch)
+        t, chunkable = q.shape[1], q.shape[1] > 1 and not kw.get("keep_steps")
+        # A/B lever: the chunkwise reference, all bmm + a triangular solve (or fla)
+        ref_chunk = int(os.environ.get("TILERL_GDN_CHUNKWISE", "0"))
+        if ref_chunk and chunkable:
+            return reference.gdn_forward(q, k, v, g, beta, state, chunkwise=ref_chunk, **kw)
+        # sm90 flips to WY by default once the pod gate passes; the kernels want whole chunks
+        wy = "gdn_state_scan" not in kset or (
+            os.environ.get("TILERL_GDN_WY") and t % _WY_CHUNK == 0
+        )
+        if wy and chunkable and self._full_rows(kw.get("seq_q_lens"), t):
+            return self._gdn_chunk_wy(q, k, v, g, beta, state, **kw)
+        if t > 1 and "gdn_chunk_fused" in kset:
             return self._gdn_chunk_fused(q, k, v, g, beta, state, **kw)
         return reference.gdn_forward(q, k, v, g, beta, state, **kw)
+
+    def _full_rows(self, seq_q_lens, t: int) -> bool:
+        """Every row's query span is the whole T -- the chunkwise form has no
+        per-row mask. Memoized: one tensor object serves all 64 layers of a tick."""
+        if seq_q_lens is None:
+            return True
+        hit = self._full_rows_memo
+        if hit is not None and hit[0]() is seq_q_lens and hit[1] == t:
+            return hit[2]
+        full = int(seq_q_lens.min()) == t
+        self._full_rows_memo = (weakref.ref(seq_q_lens), t, full)
+        return full
+
+    def _gdn_chunk_wy(self, q, k, v, g, beta, state, **kw):
+        """Chunkwise-WY prefill: gdn_prep, the WY core, gdn_post. The layer's
+        conv / norm / gate glue is two launches here, sixty as torch ops."""
+        b, t = q.shape[0], q.shape[1]
+        nvh, kd, vd = state.shape[1], state.shape[2], state.shape[3]
+        hk = q.shape[-1] // kd
+        ker = kw["conv1d_weight"].shape[1]
+        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
+        window = kw.get("conv_window")
+        win = (
+            self._f32(window)
+            if window is not None
+            else torch.zeros(b, ker - 1, 2 * hk * kd + nvh * vd, device=self.device)
+        )
+        qn, kn, vn, gt, bt, new_window = self._kernel("gdn_prep")(
+            self._c(self._dev(q, io)).view(b, t, hk, kd),
+            self._c(self._dev(k, io)).view(b, t, hk, kd),
+            self._c(self._dev(v, io)).view(b, t, nvh, vd),
+            self._c(self._f32(g)),
+            self._c(self._f32(beta)),
+            self._const_f32(kw["dt_bias"]),
+            self._const_f32(kw["a_log"]),
+            self._const_f32(kw["conv1d_weight"]),
+            self._c(win),
+            threads=vd,
+        )
+        if "gdn_state_scan" in _resolve(self.precision, self.arch):
+            core, new_state = self._gdn_wy_core(qn, kn, vn, gt, bt, state)
+        else:  # no WY schedule in this cell: the chunkwise reference is the core
+            core, new_state = reference.gdn_chunk_core(
+                qn, kn, vn, gt, bt, self._f32(state), chunk=_WY_CHUNK
+            )
+        out = self._kernel("gdn_post")(
+            self._c(core).view(-1, vd),
+            self._c(self._dev(kw["z"], io)).view(-1, vd),
+            self._const_f32(kw["norm_weight"]),
+            1e-6,
+            vd,
+        )
+        return out.view(b, t, nvh * vd), new_state, (new_window if window is not None else None)
+
+    def _gdn_wy_core(self, q, k, v, g, beta, state, chunk: int = _WY_CHUNK):
+        """fla's chunk_gated_delta_rule_fwd stage for stage: cumsum, kkt,
+        solve_tril, w/u, the inter-chunk state scan, o. gdn_prep already put
+        1/sqrt(key_dim) in q, so the o scale is 1."""
+        kern = self._kernel
+        gc = kern("gdn_chunk_cumsum")(g, chunk)
+        a = kern("gdn_solve_tril")(kern("gdn_chunk_kkt")(k, beta, gc, chunk), chunk)
+        w, u = kern("gdn_chunk_wu")(k, v, beta, gc, a, chunk)
+        # the scan's gemm operand is bf16, so the state rounds on entry either way
+        h, new_state, v_new = kern("gdn_state_scan")(
+            k, w, u, gc, self._c(self._bf16(state)), chunk
+        )
+        return kern("gdn_chunk_o")(q, k, v_new, h, gc, chunk, 1.0), new_state
 
     def gdn_decode(self, q, k, v, g, beta, pool, slots, layer, **kw):
         """Decode (T=1) GDN core in one launch, state updated in place in
