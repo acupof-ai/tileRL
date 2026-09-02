@@ -70,6 +70,10 @@ prefill is host-bound, and the glue outweighs the kernel it wraps.
 | harness prefill 2048, tok/s | 2215.9 | — | pending-remote |
 | harness prefill 8192, tok/s | 2142.4 | — | pending-remote |
 
+The two totals and the 2928-kernel gap are measured (`scripts/profile_prefill.py`,
+2026-09-02); the per-layer rows are read off the code against that gap, and the
+predicted total follows from them.
+
 Per-kernel parity of the WY core against fla 0.5.2, measured 2026-09-02 on H20
 and unchanged by this entry: `solve_tril` 4.9e-4 max abs, `w` 2.4e-4, final
 state 4.7e-4, `o` 2.3e-4.
