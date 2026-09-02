@@ -9,6 +9,7 @@ is one of the arms. ``survival[j]`` = P(the first j+1 drafts all accept).
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -16,8 +17,24 @@ from typing import Any
 import torch
 
 #: One trunk verify forward = fixed + per-row cost, ms. agent-infer's H20 numbers.
+#: sm70 is a staircase, not a line: the GEMV ladder rounds verify width up to a
+#: rung, so at ctx 1024 verify costs w<=2 36.58, w<=4 49.87, w<=8 68.46 ms, one
+#: draft forward 5.53 (errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md,
+#: wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md). The trim only picks how
+#: many drafts to admit and a captured tick skips it (engine.py:246), so pricing
+#: sm70 with the H20 constants is mispriced-but-inert, not wrong output.
+#: ponytail: H20 two-term cost on sm70, swap in the rung table if the trim ever
+#: runs where its choice can matter.
 BIAS_MS = 211.0
 ROW_MS = 0.53
+
+#: Verify widths the sm70 M-ladder serves without padding waste. A width
+#: between rungs pays the next rung's full price: depth 5 (W=6) costs the same
+#: 8-row launch as depth 7 (W=8), which measured 10% SLOWER than depth 3 on the
+#: one workload where every draft is accepted. 32 is the top rung, and it is
+#: no longer a cliff — X is pre-packed f16 there too, 29-36 us/row against the
+#: 122-128 it cost when the flag stopped at 8.
+LADDER_WIDTHS = (1, 2, 4, 8, 32)
 
 
 def survival(confidences: list[float]) -> list[float]:
@@ -127,8 +144,14 @@ def load_draft(trunk: Any, path: str | Path) -> DraftHead:
     from .model import _param_key_for
 
     params: dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
     with safe_open(str(path), "pt", device="cpu") as f:
-        for name in list(f.keys()):
+        names = list(f.keys())
+        # The two formats differ in their RMSNorm convention, and the source name
+        # is what tells them apart: a DSpark head carries hidden_norm, a Qwen
+        # NextN head carries pre_fc_norm_hidden. See the fold below.
+        dspark = any(n.endswith("hidden_norm.weight") for n in names)
+        for name in names:
             bare = name.removeprefix("mtp.").removeprefix("model.")
             stem = bare.removesuffix(".weight").removesuffix(".bias")
             if stem in _DRAFT_TOP:
@@ -138,15 +161,35 @@ def load_draft(trunk: Any, path: str | Path) -> DraftHead:
                 params[key] = f.get_tensor(name)
                 continue
             mapped = _param_key_for(bare)
+            # forward reads the embedding and the readout off the TRUNK
+            # (:132, :148), so a head shipping its own would be dead weight —
+            # and engine.py's _quantize_draft packs anything 2D, which at
+            # 248320x5120 is 2.5 GB each on a card that has OOMed at 31.3.
+            if mapped in ("embed_tokens", "lm_head", "final_norm"):
+                skipped.append(bare)
+                continue
             if mapped is not None:
                 params[mapped] = f.get_tensor(name)
+    if skipped:
+        warnings.warn(
+            f"draft head {path}: ignoring {sorted(skipped)} — the trunk's are shared",
+            stacklevel=2,
+        )
     # Zero-centered Qwen3_5RMSNorm: load_hf folds the +1 in, this path must too
-    # (without it the head's argmax ranked 248191/248320).
-    for k, v in params.items():
-        if k.endswith(("norm", "pre_fc_norm_hidden", "pre_fc_norm_embedding")):
-            params[k] = (v.float() + 1.0).to(v.dtype)
+    # (without it the head's argmax ranked 248191/248320). A DSpark head's norms
+    # are plain w*x (dspark.rs:580,726) — folding there corrupts every scale
+    # silently, with none of the anti-correlation that made this bug findable.
+    if not dspark:
+        for k, v in params.items():
+            if k.endswith(("norm", "pre_fc_norm_hidden", "pre_fc_norm_embedding")):
+                params[k] = (v.float() + 1.0).to(v.dtype)
     missing = {"fc", "norm", "pre_fc_norm_hidden"} - set(params)
     if missing:
         raise RuntimeError(f"draft head {path}: missing {sorted(missing)}")
-    n = 1 + max((int(k.split(".")[1]) for k in params if k.startswith("layers.")), default=0)
-    return DraftHead(trunk, params, num_layers=n)
+    # Indices must be 0..n-1: an absolute-index convention (DeepSeek numbers its
+    # MTP layer by its position in the trunk) would otherwise infer a depth of
+    # index+1 and fail later on a missing layers.0, pointing at the wrong thing.
+    idx = sorted({int(k.split(".")[1]) for k in params if k.startswith("layers.")})
+    if idx and idx != list(range(len(idx))):
+        raise RuntimeError(f"draft head {path}: layers indexed {idx}, expected 0..{len(idx) - 1}")
+    return DraftHead(trunk, params, num_layers=len(idx) or 1)

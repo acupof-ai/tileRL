@@ -46,16 +46,26 @@ def _build_model(
     )
 
 
-def _build_engine(cfg, model, backend, devices=None):
-    """Serving-size engine; ``devices`` replicates it across those CUDA indices."""
+def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16):
+    """Serving-size engine; ``devices`` replicates it across those CUDA indices.
+
+    ``draft``: an MTP/NextN head safetensors path (or the checkpoint shard that
+    carries the mtp.* keys) turning speculative decode on — one trunk forward
+    reads 14 GB of weights however many candidates it verifies, so on a
+    bandwidth-bound card the verify rows are nearly free. ``slots`` sizes the
+    GDN state pool; with a draft each slot also owns spec_steps of step-state,
+    so a 32 GB card needs 4, not the 16 a 96 GB card affords.
+    """
     from . import engine as engine_mod
     from .kv_cache import BLOCK_TOKENS
 
     # Token budget follows the context; ByteTokenizer makes one token per byte.
     ctx = int(cfg.max_position_embeddings)
 
-    kw = dict(num_blocks=max(256, (ctx * 8) // BLOCK_TOKENS), num_slots=16,
+    kw = dict(num_blocks=max(256, (ctx * 8) // BLOCK_TOKENS), num_slots=slots,
               max_batch=8, max_total_tokens=ctx)
+    if draft is not None:
+        kw["draft"], kw["spec_depth"] = draft, depth
     if not devices:
         return engine_mod.build_engine(cfg, model, backend, **kw)
 
@@ -80,7 +90,13 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     backend = get_backend()
     cfg, model = _build_model(args.model, seed=0, fuse_projections=True)
-    engine = _build_engine(cfg, model, backend, devices=args.devices)
+    draft = None
+    if args.draft:
+        from .spec import load_draft
+
+        draft = load_draft(model, args.draft)
+    engine = _build_engine(cfg, model, backend, devices=args.devices,
+                           draft=draft, depth=args.depth, slots=args.slots)
     tokenizer = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
@@ -431,6 +447,16 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "the others down while HTTP keeps answering; for independent endpoints "
                               "run one process per card under CUDA_VISIBLE_DEVICES instead.",
                          type=lambda v: _devices(v) if v else [])
+    p_serve.add_argument("--draft", help="MTP/NextN head safetensors: speculative decode. For "
+                                        "Qwen3.8-27B-NVFP4 the mtp.* keys all live in "
+                                        "model-00018-of-00018.safetensors, so pass that shard.")
+    p_serve.add_argument("--depth", type=int, default=3,
+                         help="drafts per row per tick; 3 fills the sm70 verify ladder's "
+                              "4-row rung exactly (spec.LADDER_WIDTHS) — 4 spills to the "
+                              "8-row rung and measured slower than no speculation")
+    p_serve.add_argument("--slots", type=int, default=16,
+                         help="GDN state slots; lower on <40GB GPUs (with --draft each slot "
+                              "also owns the per-step verify states)")
     p_serve.set_defaults(func=cmd_serve)
 
     p_train = sub.add_parser("train", help="SFT, --rl (GRPO) or --opd; --recipe for a gated flag set")
@@ -464,7 +490,7 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="full-parameter SFT optimizer; --rl/--opd train LoRA and ignore it")
     p_train.add_argument("--lora-rank", type=int, default=16)
     p_train.add_argument("--draft", help="draft head safetensors: speculative rollout (--opd)")
-    p_train.add_argument("--depth", type=int, default=2, help="drafts per row per tick")
+    p_train.add_argument("--depth", type=int, default=3, help="drafts per row per tick")
     p_train.add_argument("--recipe", choices=sorted(RECIPES),
                          help="a flag set that passed a gate (recipes.py); flags override it")
     # The recipe is the subparser's defaults, so anything typed still wins.

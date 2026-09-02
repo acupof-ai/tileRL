@@ -58,11 +58,11 @@ bandwidth/MMA balance differs from prefill.
 4. **PARITY** — same `tests/test_ops_parity.py`, no new machinery: on CPU it
    tests the floor; on the pod it tests whatever the cell resolves. Gate:
    `allclose(rtol=1e-2)` vs torch-eager.
-   `scripts/pod_sync.sh 'CUDA_VISIBLE_DEVICES=6,7 PYTHONPATH=src TILERL_TARGET=cuda python3 -m pytest tests/test_ops_parity.py -x'`
+   `scripts/v100.sh 'PYTHONPATH=src TILERL_TARGET=cuda python3 -m pytest tests/test_ops_parity.py -x'`
 5. **BENCH** — A/B the variant against the default in one process (the ratio
    is contention-independent): a `scripts/bench_<family>.py` that builds
    inputs at canonical shapes and calls `benchkit.ab(...)`, run via
-   `scripts/_pod_bench.sh` (syncs, quiet-gates GPUs 6,7, stamps the commit).
+   `scripts/v100.sh run <name> '<cmd>'` (syncs, detaches, polls the log).
    The report prints the entry draft → `docs/experience/wins|errors/` per
    `TEMPLATE-bench.md`. No entry, not shipped.
 6. **COMMIT** — `feat(ops): ...`, no AI attribution.

@@ -101,3 +101,29 @@ what it decided.
 Corollary: a constant carrying a "re-measure per target" comment is an
 unpaid debt, not a default. This one was 400x off in ratio and nobody noticed,
 because the code holding it does not run.
+
+## Resolved 2026-09-01: inert is CORRECT here, for a reason this entry guessed
+
+The "tile-aware model" this entry proposed as future work turned out to be the
+whole answer, and it makes the policy's inertness a feature rather than a bug.
+
+On sm70 the verify width is `W = 1 + keep` and the GEMV ladder serves only
+1/2/4/8 rows, rounding up (`spec.LADDER_WIDTHS`). Cost is a STAIRCASE in keep,
+so the only non-wasteful keeps are 1, 3 and 7 — a keep of 2 buys the same 4-row
+launch as a keep of 3 and verifies one fewer token. Measured on coding, depth 4
+(W=5, rung 8) runs at 31.5 tok/s against 43.8 at depth 3 and 32.6 with no
+speculation at all: overshooting a rung costs more than speculation is worth.
+[errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md](2026-09-01-spec-depth-is-a-staircase-not-a-line.md)
+
+At the H20 constants `verify_lens` returns keep=3 for every workload measured
+(p = 0.62 to 0.999) — still inert, still not deciding anything, but now landing
+on the rung that is in fact optimal. The debt this entry recorded is real and
+still unpaid; what changed is that paying it naively would make things WORSE.
+A recalibrated linear model is what produced the failed 2026-09-01 experiment:
+correct constants (23.9/8.1 fitted on this card), a correct-looking marginal
+cut, and every workload slower, because a line through a staircase picks widths
+the hardware cannot serve.
+
+So: leave the constants. Any future policy here must be quantized to
+`LADDER_WIDTHS` first and calibrated second, and it must beat a fixed keep=3 on
+the realistic workloads (`scripts/bench_workloads.py`), not on the counting task.

@@ -93,6 +93,37 @@ _SM90_KERNELS = {  # WGMMA schedules; the backend pads M/N to 16 and K to 32
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)
+# Volta: T.gemm lowers to fp16-only mma.sync.m8n8k4, so the sm90 MMA family is
+# dead — the cell is the CPU f32 floor plus the kernels that also run on Volta.
+_SM70_KERNELS = {
+    **_CPU_KERNELS,
+    "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv_sm70,
+    # M-row ladder (decode/verify M<=8, prefill M=32) as ONE entry: M/xh/sh are
+    # factory args and Backend._kernel keys the compile cache on them, so a
+    # 2-row verify does not pay for 8. Rounding X to f16 once outside the kernel
+    # took 127 us/row flat down to 24-45 us/row.
+    "linear_fp4_gemv_sm70_m": kernels_linear.make_linear_fp4_gemv_sm70_m,
+    # gdn_decode_fused and write_tokens fix graph capture: their eager fallbacks
+    # host-sync on int(device_tensor) per token.
+    "gdn_decode_fused": lambda t: kernels_gdn.make_gdn_decode_fused(t, out_dtype="float32"),
+    # without it prefill (T>1) falls to reference.gdn_forward, a Python serial
+    # scan — ~250k eager ops for 8x64, 62s of the 64s tick 1
+    "gdn_chunk_fused": kernels_gdn.make_gdn_chunk_fused,
+    # f32 pool: the attention kernel is f32-IO, and a bf16 pool cast the whole
+    # plane per call (4.71 ms/token, 14% of a 4096-ctx token)
+    "write_tokens": kernels_mma.make_write_tokens_f32,
+    # split-KV decode attention, S>=1 (speculative verify too); every sm70
+    # attention call takes it, leaving the generic kernel to the other targets.
+    # sm70 only: the source is target-neutral but the win is filling 80 SMs, so
+    # it loses where T.Kernel lowers to a serial loop (cpu) and is unproven on
+    # metal.
+    "paged_attention_split": lambda t: kernels.make_paged_attention_split(t, KVSPLIT=32),
+    "paged_attention_split_combine": lambda t: kernels.make_paged_attention_split_combine(
+        t, KVSPLIT=32
+    ),
+}
+_register("bf16", "sm70", _SM70_KERNELS)
+_register("fp4", "sm70", _SM70_KERNELS)
 for _arch in ("sm100", "sm120"):
     _register("bf16", _arch, {})  # pending-remote slot
 

@@ -14,7 +14,8 @@ def _pass_configs() -> dict[str, object]:
 def make_write_tokens(target: str):
     """Scatter K/V [B,S,Hkv,D] into the paged pool at [seq_len-seq_q, seq_len)
     (vLLM reshape_and_cache indexing). One launch, graph-capturable; rows are
-    left-aligned valid tokens, SeqQLens bounds each row."""
+    left-aligned valid tokens, SeqQLens bounds each row. bf16 IO follows the
+    sm90 pool; sm70's f32 pool has its own twin below."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def write_tokens(K, V, KPool, VPool, BlockTable, SeqLens, SeqQLens, block_size, threads):
@@ -40,6 +41,42 @@ def make_write_tokens(target: str):
                     VPool[blk, h, off, d] = V[b, t, h, d]
 
     return write_tokens
+
+
+def make_write_tokens_f32(target: str):
+    """f32-pool twin of :func:`make_write_tokens` for sm70.
+
+    sm70's attention kernel is f32-IO, and a bf16 pool made every attention
+    call cast the WHOLE plane — 4.71 ms/token, 14% of a 4096-ctx token. The
+    body is duplicated rather than parameterized because the eager builder
+    re-executes it with only its own kwargs bound, so a closure dtype is not in
+    scope inside a T.Tensor annotation.
+    """
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def write_tokens_f32(K, V, KPool, VPool, BlockTable, SeqLens, SeqQLens, block_size, threads):
+        B, S, H, D = T.const("B, S, H, D")
+        NB = T.const("NB")
+        Mb = T.const("Mb")
+        K: T.Tensor((B, S, H, D), "float32")
+        V: T.Tensor((B, S, H, D), "float32")
+        KPool: T.Tensor((NB, H, block_size, D), "float32")
+        VPool: T.Tensor((NB, H, block_size, D), "float32")
+        BlockTable: T.Tensor((B, Mb), "int32")
+        SeqLens: T.Tensor((B,), "int32")
+        SeqQLens: T.Tensor((B,), "int32")
+        with T.Kernel(B * S, H, threads=threads) as (bt, h):
+            b = bt // S
+            t = bt % S
+            if t < SeqQLens[b]:
+                pos = SeqLens[b] - SeqQLens[b] + t
+                blk = BlockTable[b, pos // block_size]
+                off = pos % block_size
+                for d in T.Parallel(D):
+                    KPool[blk, h, off, d] = K[b, t, h, d]
+                    VPool[blk, h, off, d] = V[b, t, h, d]
+
+    return write_tokens_f32
 
 
 def make_attn_prep(target: str):
