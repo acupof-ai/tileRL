@@ -434,6 +434,10 @@ class Engine:
         self._spec_drafted = 0
         self._spec_accepted = 0
         self._finished_logprobs: dict[int, list[float]] = {}
+        #: ids whose scores a reader already took -- lets logprobs() tell "never
+        #: asked" (None) from "already consumed" (raise). Unbounded by design here:
+        #: an id is 8 bytes and a run is thousands, not millions.
+        self._taken_logprobs: set[int] = set()
         self._last_logprobs: list[float] | None = None
 
     # ------------------------------------------------------------------ API
@@ -536,11 +540,27 @@ class Engine:
 
         Pops: take() drains the tokens and this drains the scores, so a served
         request leaves nothing behind.
+
+        A SECOND read of the same id raises. Both "never asked for scores" and
+        "someone already took them" would otherwise return None, and the second
+        one is a bug that cannot be seen at the call site: the RL path compares
+        the shim's recorded token ids against the transcript's, and a silently
+        empty score list makes that comparison fail with nothing to point at.
+        Consumed ids are remembered rather than forgotten, which is what lets
+        the two cases be told apart.
         # ponytail: a caller that asks for scores and never reads them holds
         # them until the engine is dropped; a TTL sweep is the upgrade path.
         """
         with self._lock:
-            return self._finished_logprobs.pop(request_id, None)
+            if request_id in self._finished_logprobs:
+                self._taken_logprobs.add(request_id)
+                return self._finished_logprobs.pop(request_id)
+            if request_id in self._taken_logprobs:
+                raise KeyError(
+                    f"logprobs for request {request_id} were already taken -- they pop, so "
+                    "exactly one reader may have them. Record them once at that reader."
+                )
+            return None
 
     def take(self, request_id: int) -> list[int] | None:
         """Pop one finished request's output, or None if not finished yet.

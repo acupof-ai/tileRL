@@ -725,8 +725,13 @@ def test_logprobs_are_returned_and_deterministic():
     greedy_lps = engine.logprobs(rid)
     assert greedy_lps and all(x < -1e-6 for x in greedy_lps), greedy_lps
     assert (out, lps) == run(), "same seed, different scores"
-    # scores are drained with the request, like the tokens
-    assert engine.logprobs(engine._next_id - 1) is None
+    # scores are drained with the request, like the tokens -- and a SECOND read
+    # raises rather than returning None. Both cases would otherwise be None, and
+    # "someone already took them" is a bug the caller cannot see: the RL path
+    # compares recorded token ids against the transcript's, and an empty score
+    # list makes that comparison fail with nothing to point at.
+    with pytest.raises(KeyError, match="already taken"):
+        engine.logprobs(rid)
     # a request that did not ask gets nothing, not zeros
     rid = engine.submit(list(range(8)), SamplingParams(max_new_tokens=2, seed=3))
     for _ in range(200):

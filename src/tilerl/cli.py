@@ -61,7 +61,8 @@ def _build_model(
             )
             sys.exit(1)
         return cfg, model
-    cfg = config_mod.tiny()
+    # tiny-agent is tiny with room for one real agent turn; see config.tiny().
+    cfg = config_mod.tiny(8192) if model_name == "tiny-agent" else config_mod.tiny()
     return cfg, model_mod.build_random(
         cfg, seed=seed, fuse_projections=fuse_projections, keep_master=keep_master
     )
@@ -427,7 +428,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_serve = sub.add_parser("serve", help="start the OpenAI-compatible HTTP server")
-    p_serve.add_argument("--model", choices=["tiny", "qwen38-27b"], default="tiny")
+    p_serve.add_argument("--model", choices=["tiny", "tiny-agent", "qwen38-27b"], default="tiny")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--devices", default="",
@@ -441,7 +442,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train = sub.add_parser("train", help="train a model on random-token batches")
     # qwen38-27b loads from TILERL_QWEN38_SOURCE; --rl trains LoRA on the frozen
     # fp4 base, which is what fits one card.
-    p_train.add_argument("--model", choices=["tiny", "qwen38-27b"], default="tiny")
+    p_train.add_argument("--model", choices=["tiny", "tiny-agent", "qwen38-27b"], default="tiny")
     p_train.add_argument("--steps", type=int, default=20)
     p_train.add_argument("--seed", type=int, default=0)
     p_train.add_argument("--opd", action="store_true",
