@@ -76,6 +76,24 @@ def _snap_mma_tile(m: int, cap: int) -> int:
     return min(cap, next((s for s in (16, 32, 64, 128) if s >= m), 128))
 
 
+def _sm70_chunks(rows: int, top: int = 32) -> list[tuple[int, int, int]]:
+    """(offset, real rows, compiled rung) per launch for the sm70 fp4 GEMV.
+
+    The ladder is 1/2/4/8/``top``: a chunk pays its rung's full row count, so the
+    LAST chunk of a non-multiple M drops to a smaller rung instead of padding to
+    ``top``. M=40 is 32 + 8, not two 32-row launches. Pure integer arithmetic,
+    split out because the interesting failure is invisible where it is exercised:
+    a slicing bug shows up only for M that does not divide ``top``, and the sm70
+    branch never runs on the CPU target where the parity tests live.
+    """
+    out, m = [], 0
+    while m < rows:
+        r = min(top, rows - m)
+        out.append((m, r, 1 if r == 1 else 2 if r <= 2 else 4 if r <= 4 else 8 if r <= 8 else top))
+        m += r
+    return out
+
+
 def _pad2d(t: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
     """Zero-pad a 2D tensor to [rows, cols] (bottom/right)."""
     pr, pc = rows - t.shape[0], cols - t.shape[1]
@@ -523,28 +541,20 @@ class Backend:
             _, _, Np, Kp, _, bN = self._plan("linear_fp4", 1, N, K)
             wq1, sc1 = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
             osc1 = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
-            if M <= 8:
-                # Round M up the compiled ladder rather than always to 8, and
-                # hand the kernel X pre-packed as f16: otherwise it re-reads X
-                # per block and converts it inside the tile loop (78% of the
-                # M=8 bytes, 32 of ~49 per-row instructions). Packing collapses
-                # 127 us/row flat to 24-45 us/row, bit-exact — both paths round
-                # to nearest f16. M=1 is on the ladder too: 1.1-1.45x over the
-                # scalar GEMV it replaced.
-                Mk = 1 if M == 1 else 2 if M <= 2 else 4 if M <= 4 else 8
-                y2 = self._kernel("linear_fp4_gemv_sm70_m", Mk, 4, True, sh)(
-                    _pad2d(x2, Mk, Kp).to(torch.float16),
+            # Round M up the compiled ladder, and hand the kernel X pre-packed as
+            # f16: otherwise it re-reads X per block and converts inside the tile
+            # loop (78% of the M=8 bytes, 32 of ~49 per-row instructions). Packing
+            # is worth 4.2x at M=32 and 1.1-1.45x at M=1, bit-exact — both paths
+            # round to nearest f16. It used to be passed ONLY below M=8, which is
+            # what made M>8 look like a hardware cliff at 122-128 us/row: the
+            # extern is templated on M with no upper bound. 32 is the top rung, so
+            # prefill chunks (M=512 is 16 launches/layer, not 512).
+            for m, Mr, Mk in _sm70_chunks(M):
+                y = self._kernel("linear_fp4_gemv_sm70_m", Mk, 4, True, sh)(
+                    _pad2d(x2[m : m + Mr], Mk, Kp).to(torch.float16),
                     wq1, sc1, osc1, self._zeros2(Mk, Np), 32, bN, blk,
-                )[:M, :N]
-            else:
-                MC = 32
-                y2 = torch.cat([
-                    self._kernel("linear_fp4_gemv_sm70_m", MC, 4, False, sh)(
-                        _pad2d(x2[m : m + MC], MC, Kp), wq1, sc1, osc1,
-                        self._zeros2(MC, Np), 32, bN, blk,
-                    )[: min(MC, M - m), :N]
-                    for m in range(0, M, MC)
-                ], 0)
+                )[:Mr, :N]
+                y2 = y if m == 0 else torch.cat([y2, y], 0)
             y = self._epilogue(y2, None, lead, N)
             return y if residual is None else y + residual
         plan = self._plan("linear_fp4", M, N, K)

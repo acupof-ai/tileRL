@@ -424,15 +424,14 @@ class Engine:
                 )
             if backend.arch == "sm70" and limits.max_batch * (1 + spec_depth) > max(LADDER_WIDTHS):
                 # The rung is chosen on ROWS, and a verify tick submits B*W of
-                # them (backend.py:492 M = x2.shape[0]). Above 8 the dispatch
-                # leaves the ladder entirely for the M=32 kernel, which does not
-                # pre-pack X as f16: 127 us/row against 22. The width check above
-                # cannot see this because it has no batch term.
+                # them (backend.py M = x2.shape[0]), which the width check above
+                # cannot see. Past the top rung the dispatch chunks at 32, so a
+                # wide batch costs extra launches rather than extra per-row time.
                 warnings.warn(
                     f"max_batch={limits.max_batch} x verify width {1 + spec_depth} = "
-                    f"{limits.max_batch * (1 + spec_depth)} rows leaves the sm70 ladder "
-                    f"(max {max(LADDER_WIDTHS)}); a full batch verifies on the unpacked "
-                    f"M=32 kernel at ~127 us/row against 22",
+                    f"{limits.max_batch * (1 + spec_depth)} rows exceeds the sm70 ladder's top "
+                    f"rung ({max(LADDER_WIDTHS)}); a full batch verifies in "
+                    f"{-(-limits.max_batch * (1 + spec_depth) // 32)} launches per layer",
                     stacklevel=2,
                 )
             self._draft_kv = PagedKvPool(
