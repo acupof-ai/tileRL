@@ -71,6 +71,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from . import autograd
+from . import precision
 from .config import ModelConfig, tiny
 from tilerl_kernels.reference import (
     untwiddle_fp4,
@@ -555,9 +556,9 @@ def add_lora(
         # its .to(device) would rebuild a CPU adapter, changing the id() the
         # optimizer and the tape key gradients by
         dev = model.params[k].device
-        a = torch.randn(rank, kk, generator=g).to(torch.bfloat16) * scale
+        a = torch.randn(rank, kk, generator=g).to(precision.dtype("adapter")) * scale
         new[base + ".lora_a"] = a.to(dev)
-        new[base + ".lora_b"] = torch.zeros(n, rank, dtype=torch.bfloat16, device=dev)
+        new[base + ".lora_b"] = torch.zeros(n, rank, dtype=a.dtype, device=dev)
     model.params.update(new)
     return new
 
