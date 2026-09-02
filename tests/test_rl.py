@@ -117,6 +117,26 @@ def test_last_number():
     assert last_number("no digits") is None and last_number(None) is None
 
 
+def test_opd_keeps_adapter_tensor_identity():
+    """A captured decode graph holds the adapter tensor objects. The
+    teacher/student swap in opd_loop must copy into them, never rebind — a
+    rebind samples from the captured (stale) tensors on CUDA and never raises."""
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.kv_cache import NoPrefixStore
+    from tilerl.model import add_lora
+    from tilerl.train import opd_loop
+
+    cfg, model = _build_model("tiny", seed=0)
+    backend = RefBackend()
+    engine = build_engine(cfg, model, backend, num_blocks=64, num_slots=4,
+                          decode_graph=False, prefix_store=NoPrefixStore())
+    trainable = add_lora(model, rank=4)
+    ids = {k: id(model.params[k]) for k in trainable}
+    opd_loop(engine, model, [[1, 2, 3, 4]], 2, backend, AdamW(lr=1e-3),
+             trainable=trainable, sampling=SamplingParams(max_new_tokens=4))
+    assert {k: id(model.params[k]) for k in trainable} == ids
+
+
 if __name__ == "__main__":  # runnable check
     test_group_advantages()
     test_rl_step_matches_sft_at_unit_advantage()

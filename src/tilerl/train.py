@@ -258,7 +258,7 @@ def grpo_loop(
     sampling: Any = None,
     seed: int = 0,
     trainable: dict[str, Any] | None = None,
-) -> list[tuple[float, float, float]]:
+) -> list[tuple[float, float, float, float]]:
     """GRPO: sample ``group`` completions per prompt, score them, take one
     policy-gradient step on the group-normalized advantages.
 
@@ -280,8 +280,8 @@ def grpo_loop(
     # update instead of disabling both, once a rollout's decode cost matters.
 
     Returns per step ``(mean reward, cross-entropy of the sampled tokens,
-    seconds)`` — seconds is rollout + update, the number an RL step is priced
-    by. Rollouts within a step are one engine batch: the group is what
+    seconds, tied-group fraction)`` — seconds is rollout + update, the number
+    an RL step is priced by. Rollouts within a step are one engine batch: the group is what
     continuous batching is for.
     """
     from dataclasses import replace
@@ -292,7 +292,7 @@ def grpo_loop(
         optimizer = AdamW(lr=1e-5)
     if sampling is None:
         sampling = SamplingParams(max_new_tokens=32)
-    out: list[tuple[float, float, float]] = []
+    out: list[tuple[float, float, float, float]] = []
     for step in range(steps):
         t0 = time.perf_counter()
         prompt = np.asarray(prompts[step % len(prompts)], dtype=np.int64)
@@ -313,6 +313,9 @@ def grpo_loop(
         comps = [done[i] for i in ids]
         rewards = [float(reward_fn(prompt, c)) for c in comps]
         adv = group_advantages(rewards, group)
+        # A group whose rewards all tie has no gradient; a run that is mostly
+        # ties says nothing about learning, so the fraction is reported.
+        tied = float((adv.reshape(-1, group) == 0).all(axis=1).mean())
         # Right-pad to one rectangle: padding sits past every prompt_len, and
         # the advantage mask is what keeps it out of the gradient.
         width = max(len(c) for c in comps)
@@ -325,7 +328,7 @@ def grpo_loop(
         slens = np.array([len(prompt) + len(c) for c in comps], dtype=np.int64)
         ce = rl_step(model, batch, adv, plens, backend, optimizer,
                      trainable=trainable, seq_lens=slens)
-        out.append((float(np.mean(rewards)), ce, time.perf_counter() - t0))
+        out.append((float(np.mean(rewards)), ce, time.perf_counter() - t0, tied))
     return out
 
 
@@ -368,13 +371,18 @@ def opd_loop(
         optimizer = AdamW(lr=1e-3)
     if sampling is None:
         sampling = SamplingParams(max_new_tokens=8)
+    # The live adapter tensors are what the engine — and a captured decode
+    # graph — read. Teacher/student swaps copy INTO them and never rebind, or
+    # the graph keeps sampling from whichever tensors it captured.
     ema = {k: v.clone() for k, v in trainable.items()} if trainable is not None else None
+    student = {k: v.clone() for k, v in trainable.items()} if trainable is not None else None
     losses: list[float] = []
     for step in range(steps):
         prompt = np.asarray(prompts[step % len(prompts)], dtype=np.int64)
         params = replace(sampling, seed=seed + step)
         if ema is not None:  # generate with the teacher weights, train the student
-            student_model.params.update(ema)
+            for k, v in trainable.items():
+                v.copy_(ema[k])
         rid = teacher_engine.submit(prompt, params)
         finished: dict[int, list[int]] = {}
         for _ in range(10000):  # one forward per tick; bounded guard
@@ -386,11 +394,13 @@ def opd_loop(
             raise RuntimeError("opd_loop: teacher did not finish within 10000 ticks")
         seq = np.concatenate([prompt, np.asarray(finished[rid], dtype=np.int64)])
         if ema is not None:
-            student_model.params.update(trainable)
+            for k, v in trainable.items():
+                v.copy_(student[k])
         losses.append(train_step(student_model, seq[None, :], backend, optimizer,
                                  trainable=trainable))
         if ema is not None:
             for k, e in ema.items():
+                student[k].copy_(trainable[k])
                 e.mul_(ema_decay).add_(trainable[k], alpha=1.0 - ema_decay)
     return losses
 
