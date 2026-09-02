@@ -21,15 +21,15 @@ import torch
 #: rung, so at ctx 1024 verify costs w<=2 36.58, w<=4 49.87, w<=8 68.46 ms, one
 #: draft forward 5.53 (errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md,
 #: wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md).
-#: H20 constants, and on sm70 they change the trim's answer. Measured sm70 cost is
-#: 0.670 + 0.5265*W dense ticks = bias 15.9 ms, row 12.5 ms at ctx 1024 -- 13x and
-#: 24x off (wins/2026-09-03-verify-tick-cost-is-a-line-in-width.md). The trim reads
-#: the RATIO, and H20's makes a row 0.25% of the bias against sm70's 79%, so these
-#: over-admit: a low-acceptance batch keeps 2 drafts where the measured price keeps
-#: 0 (__main__ asserts both). Runs on every spec tick via _draft_chains -- capture
-#: replays the verify, the trim decides what enters it.
-#: ponytail: left in place until the reprice is A/B'd on the pod (task #38) -- a
-#: serving-behavior flip does not ship on a derivation.
+#: H20 constants, and repricing them for sm70 is NOT the fix -- the cost's SHAPE is
+#: wrong here, not its scale. engine.py pads every chain to max(len) and the ladder
+#: rounds B*W up, so at B=4 a trim from W=4 to W=3 launches the same 32 rows and
+#: saves nothing; only W<=2 is a cheaper rung. The measured price would cut W=4 at
+#: acceptance p~=0.92, just below the recorded 84.4%, exactly where the end-to-end
+#: numbers say W=4 earns 1.157-1.228x
+#: (errors/2026-09-03-repricing-verify-lens-was-the-wrong-fix.md).
+#: ponytail: H20 line on a staircase cost; replace with LADDER_WIDTHS priced by
+#: 0.670 + 0.5265*W when the trim is made rung-aware, not before.
 BIAS_MS = 211.0
 ROW_MS = 0.53
 
@@ -54,7 +54,12 @@ def verify_lens(
     survivals: list[list[float]], bias_ms: float = BIAS_MS, row_ms: float = ROW_MS
 ) -> list[int]:
     """Per-request draft-keep lengths maximizing verify goodput. ``survivals[r]``
-    is monotone decreasing, so one global cut yields a prefix per request."""
+    is monotone decreasing, so one global cut yields a prefix per request.
+
+    Prices a tick as ``bias_ms + row_ms * rows`` -- the H20 shape. sm70 instead pays
+    a staircase in the WIDEST chain, so the two disagree about the optimal cut; see
+    the module constants.
+    """
     eps = 1e-6
     r = len(survivals)
     flat = sorted((p for s in survivals for p in s if p >= eps), reverse=True)
@@ -80,14 +85,13 @@ if __name__ == "__main__":  # runnable check
     lens = verify_lens([[0.99, 0.9, 0.2], [0.3, 0.05, 0.01]], bias_ms=1.0, row_ms=0.1)
     assert lens[0] >= lens[1], lens
 
-    # The trim must REFUSE a chain that cannot pay for its own rows. With the
-    # measured sm70 price (a row is 79% of the bias, not H20's 0.25%) a low-
-    # acceptance batch keeps nothing; under BIAS_MS/ROW_MS it keeps 2, which is
-    # how the mispricing turns into speculating at a loss. Constants here are the
-    # measured ones, so this fails if spec.py is repriced without re-measuring.
-    sm70 = dict(bias_ms=0.670 * 23.7, row_ms=0.5265 * 23.7)
-    assert verify_lens([survival([0.5, 0.25, 0.1])] * 4, **sm70) == [0] * 4
-    assert verify_lens([survival([0.95, 0.90, 0.85])] * 4, **sm70) == [2] * 4
+    # A trim only pays on sm70 if it changes the RUNG, not the width: engine.py pads
+    # to max(len) and B*W rounds up, so at B=4 both W=3 and W=4 launch 32 rows. This
+    # is what makes repricing the constants the wrong fix -- it moves keep by one and
+    # buys nothing. Fails if LADDER_WIDTHS changes without revisiting the trim.
+    rung = {w: next(x for x in LADDER_WIDTHS if x >= 4 * w) for w in (1, 2, 3, 4)}
+    assert rung[3] == rung[4] == 32, f"W=3 and W=4 must cost the same at B=4: {rung}"
+    assert rung[2] == 8 and rung[1] == 4, f"only W<=2 is a cheaper rung: {rung}"
     print("spec: verify_lens OK", lens)
 
 

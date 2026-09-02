@@ -160,16 +160,19 @@ Third: **a cost model earns its keep by pricing what you did not run.** This one
 every depth on the ladder from two measurements, and retro-explains a four-month-old
 anomaly that was recorded as unexplained.
 
-Fourth: **the model found a live bug that no benchmark would have.** `spec.py` prices the
+Fourth: **the model found a live defect that no benchmark would have.** `spec.py` prices the
 verify trim with the *same affine form* this entry measures — `BIAS_MS + ROW_MS·r` — but
-with H20's constants (211.0 / 0.53). On sm70 the measured pair is 15.9 / 12.5 ms, and what
-`verify_lens` reads is the ratio: H20 makes a row 0.25% of the bias, sm70 makes it 79%. So
-the trim admits drafts that cannot pay for their rows — a low-acceptance batch keeps 2
-where the measured price keeps 0. A comment claimed this was "mispriced-but-inert" because
-"a captured tick skips it"; both clauses are false (`engine.py:974` calls it from
-`_draft_chains`, on every spec tick — capture replays the *verify*, while the trim decides
-what enters it). **Having a measured cost model turned a plausible-looking comment into a
-checkable claim**, and it failed. Task #38, and it does not ship on this derivation alone.
+with H20's constants (211.0 / 0.53). On sm70 the measured pair is 15.9 / 12.5 ms, and
+substituting it changes the trim's decision at every acceptance level. A comment claimed
+this was "mispriced-but-inert" because "a captured tick skips it"; that is false
+(`engine.py:974` calls it from `_draft_chains`, on every spec tick — capture replays the
+*verify*, while the trim decides what enters it). **Having a measured cost model turned a
+plausible-looking comment into a checkable claim**, and it failed. But **so did my fix**:
+the reprice is rejected the same day, because the tick pays for the widest chain rounded to
+a rung and W=3 launches the same 32 rows as W=4 —
+[`errors/2026-09-03-repricing-verify-lens-was-the-wrong-fix.md`](../errors/2026-09-03-repricing-verify-lens-was-the-wrong-fix.md).
+The line survives that rejection and picks the winning depth 5/5; what died is injecting it
+into a function whose cost is continuous in a different variable.
 
 Fifth, on the instrument: one row in the sweep printed `UNWARMED` and I dropped it.
 `bench_ctx_decode.py` flags a row when its third pass beats its second by >2×, i.e. the
@@ -186,18 +189,22 @@ a complete one only when it is complete.
 ## Gate
 
 No behavior changed. `engine.py:314` had a stale comment saying the ladder was 1/2/4/8
-after the 32 rung was added; `spec.py`'s H20 constants are annotated with the measured
-sm70 pair and the reason they are still there (task #38), and its `__main__` check now
-asserts the trim refuses a low-acceptance batch under the measured price and keeps 2 under
-a high-acceptance one — so a reprice without a re-measure fails a check. 187 tests pass,
-ruff clean.
+after the 32 rung was added; `spec.py`'s H20 constants are annotated with the shape
+mismatch that makes repricing them the wrong fix, and its `__main__` asserts that W=3 and
+W=4 land on the same rung at B=4 — the fact that kills the reprice, so it fails if
+`LADDER_WIDTHS` changes without revisiting the trim. 187 tests pass, ruff clean.
 
 ## Open
 
 1. **Depth 1 vs 3 is context-dependent** with a crossover between 32 and 512. A
    context-aware default is a one-line policy, but only short-prompt requests are in the
    loss region, so the serving mix decides whether it is worth the branch.
-2. **Task #38, the reprice** — the constants are measured, the A/B is not run.
+2. **A rung-aware trim** — `verify_lens` prices a line in total rows where sm70 pays a
+   staircase in the widest chain, and repricing its constants is rejected
+   ([`errors/2026-09-03-repricing-verify-lens-was-the-wrong-fix.md`](../errors/2026-09-03-repricing-verify-lens-was-the-wrong-fix.md)).
+   Enumerating `LADDER_WIDTHS` against this line is the real fix, and it needs the
+   acceptance distribution first: it only pays if the trim is reached near a rung boundary
+   often enough to matter.
 3. **Why W=8's cost is noisier (13% spread) than W=2's (0.4%) and W=4's (1.8%)** with no
    context trend behind it. A fourth width would say whether variance grows with W or is
    specific to the 32-row rung, where `ncols=2` also turns on.
@@ -214,4 +221,4 @@ ruff clean.
 | 2026-09-03 | 9f032ce | V100 | cuda sm70 | qwen38-27b | depth 1 @32 vs dense | 43.5 vs 43.1 (**1.009×**) |
 | 2026-09-03 | 9f032ce | V100 | cuda sm70 | qwen38-27b | depth 3 @32 vs dense | 38.0 vs 43.1 (**0.882×, a loss**) |
 | 2026-09-03 | 9f032ce | V100 | cuda sm70 | qwen38-27b | depth 7 @1024 vs dense | 49.1 vs 42.1 (1.166×, still < d3's 51.7) |
-| 2026-09-03 | 9f032ce | V100 | cuda sm70 | qwen38-27b | **verify_lens trim price, sm70 vs H20** | **15.9/12.5 vs 211.0/0.53 ms — reprice pending (#38)** |
+| 2026-09-03 | 9f032ce | V100 | cuda sm70 | qwen38-27b | **verify_lens trim price, sm70 vs H20** | **15.9/12.5 vs 211.0/0.53 ms — reprice rejected, wrong cost shape** |
