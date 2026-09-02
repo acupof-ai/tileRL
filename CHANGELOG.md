@@ -40,11 +40,13 @@ verdict**. Newest first.
 - Dense **30.0 -> 35.3 tok/s at 4096 ctx**, ~18% at every context. Elementwise
   7.69 -> 2.75 ms/token. Spec d3 peaks at **50.8 tok/s at 1024 ctx**; 4096 ctx
   is 40.3, **2.41x** the 16.7 it read at the start of the day.
-- **The roofline was wrong.** The checkpoint measures 20.35 GB (nibbles 12.81,
-  f32 block scales 3.22, norms/embed/lm_head 4.32), not the 14 GB cited
-  everywhere until now. The real bound is 44.2 tok/s, so dense 35.3 is **80% of
-  roofline**. Speculation above it is expected — one weight read, several
-  tokens.
+- **The roofline was wrong.** ~~The checkpoint measures 20.35 GB, not the 14 GB
+  cited everywhere until now; the real bound is 44.2 tok/s.~~ Superseded the same
+  day: 20.35 GB is the checkpoint, but a decode token streams **16.04 GB** (trunk
+  15.24 + lm_head 0.80 — `embed_tokens` 2.54 and the visual tower 0.92 are
+  resident, not streamed). The bound is **56.1 tok/s**, so dense 35.3 is **63% of
+  roofline**. Speculation above it is expected — one weight read, several tokens.
+  `errors/2026-09-02-roofline-is-the-streamed-subset.md`.
 - **`_draft_step` was reading hidden it did not have.** A chunked prefill
   overwrites `r.hidden` per chunk while `draft_pos` stays behind them: a 1024
   prompt at 512/chunk asked for 1535 positions and held 511, and `F.pad` took

@@ -2,9 +2,9 @@
 
 Attention is now ~2.6 ms of a 33 ms token at 4096 ctx (wins/2026-09-01-sm70-
 attention-thread-redundancy.md), so 30 ms is elsewhere and unattributed. The
-weight roofline says 15.6 ms of it is unavoidable — 14 GB of NVFP4 weights at
-900 GB/s. This attributes the rest to kernels by name, which is the step that
-turns "30 ms somewhere" into a target.
+weight roofline says 17.8 ms of it is unavoidable — the 16.04 GB a dense token
+streams (trunk + lm_head) at 900 GB/s. This attributes the rest to kernels by
+name, which is the step that turns "30 ms somewhere" into a target.
 
 torch.profiler rather than another hand-rolled timer: the decode path is CUDA
 -graph captured, and a graph replay shows up as its constituent kernels here
@@ -122,7 +122,9 @@ def main() -> None:
     gpu_ms = total / 1000 / max(n, 1)
     print(f"\n# {label}, ctx={args.ctx}, {n} tokens")
     print(f"# {gpu_ms:.2f} ms/token GPU vs {wall_ms:.2f} ms/token wall")
-    print("# roofline: 14 GB weights / 900 GB/s = 15.6 ms/token = 64 tok/s")
+    print("# roofline: 16.04 GB streamed / 900 GB/s = 17.8 ms/token = 56.1 tok/s")
+    print("#   (trunk 15.24 + lm_head 0.80; embed_tokens and the visual tower are")
+    print("#    resident but not streamed — errors/2026-09-02-roofline-is-the-streamed-subset)")
     # A profile that does not roughly reconcile with the clock is measuring the
     # wrong window — profiling across the prefill chunks once read 8217 ms/token
     # against a 33 ms token.

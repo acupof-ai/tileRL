@@ -92,7 +92,9 @@ single-threaded. Any decode kernel gets its parallelism from splitting the
 **history**, not from the batch/head dims.
 
 Second rule, on measurement: the first post-fix number was 289 tok/s, which is
-**above the 64 tok/s weight-bandwidth roofline** (14 GB / 900 GB/s = 15.6
-ms/tok) — JIT compile had landed inside the `lo` timing point and the slope
-subtracted it out. `bench_b1_decode.py` now warms up first. Always check a
-throughput claim against the roofline before believing it.
+**above the weight-bandwidth roofline** (16.04 GB streamed / 900 GB/s = 17.8
+ms/tok = 56.1 tok/s; this entry originally cited a remembered 14 GB / 64 tok/s
+— `errors/2026-09-02-roofline-is-the-streamed-subset.md`) — JIT compile had
+landed inside the `lo` timing point and the slope subtracted it out.
+`bench_b1_decode.py` now warms up first. Always check a throughput claim against
+the roofline before believing it.

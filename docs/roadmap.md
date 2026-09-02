@@ -27,7 +27,7 @@ The only thing between today and the target model is the checkpoint itself.
 - Download Qwen3.8-27B (NVFP4) via `HF_ENDPOINT=https://hf-mirror.com`;
   `TILERL_QWEN38_SOURCE` in config is the slot.
 - Load with `num_layers` truncation first (2–4 layers), then full 64 layers.
-  NVFP4 ≈ 14 GB — fits this Mac's unified memory; CPU forward is slow but
+  NVFP4 ≈ 20 GB on disk — fits this Mac's unified memory; CPU forward is slow but
   is the correctness path, Metal the perf path.
 - Exit: 27B generates coherent text on CPU and Metal; NVFP4 dequant has a
   parity check against the torch-eager reference; bench entry for

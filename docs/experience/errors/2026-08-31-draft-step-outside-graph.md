@@ -7,8 +7,11 @@
 ## Context
 
 Dense B=1 decode is 25.8 tok/s on the V100 and the weight-bandwidth roofline is
-64 tok/s (14 GB / 900 GB/s = 15.6 ms/token), so 60 tok/s is unreachable without
-speculation. The checkpoint ships an MTP head, so the head itself was free.
+56.1 tok/s (16.04 GB streamed / 900 GB/s = 17.8 ms/token; this entry originally
+cited a remembered 14 GB / 64 tok/s —
+`errors/2026-09-02-roofline-is-the-streamed-subset.md`), so 60 tok/s is
+unreachable without speculation. The checkpoint ships an MTP head, so the head
+itself was free.
 
 Measured MTP quality (`scripts/check_mtp_draft.py`): **62% top-1 agreement**
 with the trunk, median trunk-rank of the draft's pick = 0, 84% inside the

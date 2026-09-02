@@ -66,12 +66,16 @@ Registered for sm70 only + dispatch arch-gated — first draft had it in
 `_CPU_KERNELS`, which cpu/metal/rocm all inherit. Entry:
 `wins/2026-08-31-sm70-split-kv-decode-attention.md`.
 
-**Roofline ceiling, for the 60 tok/s question.** 27B NVFP4 weights ~14 GB per
-token / 900 GB/s = **15.6 ms/tok = 64 tok/s hard ceiling**. Now at 39 ms/tok
-(23.4 ms of non-weight overhead). 60 dense = 94% of roofline: not reachable.
-The H20's 87.5 tok/s was against a 285 tok/s roofline — 60 was 21% there.
-Dense headroom left: maybe 35-40 tok/s. **60 requires speculation** — 2.34
-accepted tokens per forward at the current 39 ms.
+**Roofline ceiling, for the 60 tok/s question.** *(Corrected 2026-09-02 — this
+entry originally cited a remembered ~14 GB; see
+`errors/2026-09-02-roofline-is-the-streamed-subset.md`.)* A dense token streams
+**16.04 GB** — trunk layers 15.24 + lm_head 0.80. `embed_tokens` (2.54) and the
+visual tower (0.92) are resident but not streamed, so the 20.35 GB checkpoint is
+not the denominator. 16.04 / 900 GB/s = **17.8 ms/tok = 56.1 tok/s hard
+ceiling**. Dense is now 35.3 tok/s at 4096 ctx = 63% of it. 60 dense is above
+the ceiling and unreachable; **60 requires speculation** — spec peaks at 50.8
+(1024 ctx) on 3.26 tok/forward.
+
 
 **MTP head works; speculation still loses. First diagnosis (draft outside the
 graph) was real but minor — see the corrected root cause at the end.**

@@ -43,12 +43,20 @@ pool simply never got it. Cost: +1 GB of device memory.
 
 Elementwise fell 7.69 → 2.75 ms/token; every context gained ~18%.
 
-**The roofline was wrong the whole time.** Measuring the checkpoint instead of
-citing a remembered number: 20.35 GB, not 14 — packed nibbles 12.81, f32 block
-scales 3.22, norms/embed/lm_head 4.32. The real bound is 900/20.35 = **44.2
-tok/s**, so dense 35.3 is **80% of roofline**, not 55%. Speculation exceeding
-it (50.8) is expected: a verify forward emits several tokens for one weight
-read.
+**The roofline was wrong the whole time.** *(And this correction was itself wrong
+— see the amendment below.)* Measuring the checkpoint instead of citing a
+remembered number: 20.35 GB, not 14 — packed nibbles 12.81, block scales 3.20,
+norms/embed/lm_head 4.32. The bound read 900/20.35 = 44.2 tok/s, so dense 35.3
+looked like 80% of roofline rather than 55%.
+
+**Amendment, 2026-09-02:** 20.35 GB is the checkpoint, not the decode stream. A
+dense token streams **16.04 GB** — trunk 15.24 + lm_head 0.80; `embed_tokens`
+(2.54, one row gathered) and the visual tower (0.92, never run on a text tick)
+are resident but not streamed. The real bound is 900/16.04 = **56.1 tok/s**, so
+dense 35.3 is **63%** of roofline. Full write-up:
+`errors/2026-09-02-roofline-is-the-streamed-subset.md`. Speculation exceeding a
+dense roofline (50.8) is still expected: a verify forward emits several tokens
+for one weight read.
 
 Two defects surfaced on the way, both invisible to any timing run:
 
