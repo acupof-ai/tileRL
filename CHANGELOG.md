@@ -4,6 +4,32 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-02 — phase exit: prefill 8.35 -> 7.89 ms/prompt token; the per-shape "occupancy gap" did not exist
+
+- **Prefill's chunk loop was quadratic in its own output.** `y2 = cat([y2, y])`
+  inside the sm70 GEMV chunk loop recopied every accumulated row each iteration,
+  so a 512-row prefill copied 4352 rows instead of 512 — 269 ms of a 4269 ms
+  tick (6.3%). Each chunk now writes its slice of one preallocated buffer:
+  **8.35 → 7.89 ms/prompt token at 512, 9.37 → 8.92 at 4096**, TTFT 38.4 → 36.5 s.
+  Decode never takes the multi-chunk branch, so it is unchanged by construction.
+  [wins/2026-09-02-prefill-chunk-loop-was-quadratic.md](docs/experience/wins/2026-09-02-prefill-chunk-loop-was-quadratic.md)
+- **Prefill's roofline was the wrong one, by a factor of M.** The "~50x off
+  roofline" framing divided prefill time by the weight byte stream, but at M=512
+  a chunk re-reads the weights once and does 512 rows against them. Against the
+  applicable floor — 26.2 TFLOP/chunk over V100's 31.3 TFLOPS packed-f16 peak,
+  since the extern issues `fma.rn.f16x2` — the gap is **4.1x, not 50x**. The
+  named suspect (`gdn_chunk_fused`, "~6% SM utilization") is refuted at 2.7%.
+- **Verdict: REJECT the sm70 small-N occupancy work.** "attn o runs at 5% of
+  peak, 144 launches/token below 33%" came from a shape table written for
+  UNFUSED projections, with two rows that are not the checkpoint's shapes at all
+  (`attn o` as 1024×5120 ×32 where `o_proj` is 5120×6144 ×16 — N=1024 is never
+  launched). In the captured graph the GEMV runs at **746 GB/s, 83% of peak**.
+  Both proposed levers targeted shapes that do not exist or are already fused.
+  The table's byte-total assert passed on the wrong table because the per-row
+  errors cancelled; it now gates the launch count (305), which the old table
+  fails at 401.
+  [errors/2026-09-02-per-shape-gap-was-a-wrong-shape-table.md](docs/experience/errors/2026-09-02-per-shape-gap-was-a-wrong-shape-table.md)
+
 ## 2026-09-02 — accept-or-reject verdict: block-parallel drafting is worth 1.58-1.83x, and it is REOPENED
 
 - **Drafting is 55-68% of a speculative tick**, measured by sweeping depth and
