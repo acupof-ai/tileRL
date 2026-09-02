@@ -120,7 +120,8 @@ TILERL_TARGET=cpu uv run tilerl serve            # OpenAI-compatible server
 TILERL_TARGET=cpu uv run tilerl bench            # benchmark → docs/experience/
 uv run tilerl train --opd                        # OPD self-teacher training
 python scripts/gsm8k_jsonl.py train gsm8k.jsonl  # then, on a card:
-tilerl train --model qwen38-27b --rl --data gsm8k.jsonl --group 8 --max-new-tokens 256 --eval-mmlu 200
+tilerl train --recipe grpo-gsm8k-27b --data gsm8k.jsonl --eval-gsm8k gsm8k_test.jsonl
+tilerl ledger                                    # every run: inputs, gates, lineage
 ```
 
 ## Development
