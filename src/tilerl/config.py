@@ -207,8 +207,12 @@ def tiny(max_position_embeddings: int = 512) -> ModelConfig:
     ``max_position_embeddings`` is a parameter because one real Claude Code
     turn does not fit in 512: measured 2026-09-02, a single Messages request
     carries ~5,310 tokens with 24 of its 28 tools disabled, nearly all of it
-    harness preamble rather than task. `tiny-agent` is this config at 8192 --
-    the cost is the KV pool, not parameters, since hidden is 64 and depth is 2.
+    harness preamble rather than task. `tiny-agent` is this config at 65536 --
+    65536 and not 8192 because the serving tokenizer for a checkpoint-less tiny
+    is ByteTokenizer, ONE TOKEN PER BYTE: a 21,676-byte request is 21,676
+    tokens, not the ~5,400 a BPE makes of it. Measuring characters and dividing
+    by four was wrong by 9x, and the engine caught it with a 400. The cost is
+    the KV pool, not parameters -- hidden is 64 and depth is 2.
     """
     return ModelConfig(
         name="tiny" if max_position_embeddings == 512 else "tiny-agent",

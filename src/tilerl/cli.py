@@ -53,7 +53,7 @@ def _build_model(
             sys.exit(1)
         return cfg, model
     # tiny-agent is tiny with room for one real agent turn; see config.tiny().
-    cfg = config_mod.tiny(8192) if model_name == "tiny-agent" else config_mod.tiny()
+    cfg = config_mod.tiny(65536) if model_name == "tiny-agent" else config_mod.tiny()
     return cfg, model_mod.build_random(
         cfg, seed=seed, fuse_projections=fuse_projections, keep_master=keep_master
     )
@@ -69,7 +69,16 @@ def _build_engine(cfg, model, backend, devices=None):
     """
     from . import engine as engine_mod
 
-    kw = dict(num_blocks=256, num_slots=16, max_batch=8, max_total_tokens=8192)
+    # The token budget follows the model's context, and the block pool follows
+    # the budget. A fixed 8192 refused a real Claude Code turn on tiny-agent:
+    # ByteTokenizer is one token per BYTE, so a 21,676-byte request is 21,676
+    # tokens, not the ~5,400 a BPE would make of it. The measurement that
+    # matters is tokens, not characters.
+    ctx = int(getattr(cfg, "max_position_embeddings", 8192))
+    from .kv_cache import BLOCK_TOKENS
+
+    kw = dict(num_blocks=max(256, (ctx * 8) // BLOCK_TOKENS), num_slots=16,
+              max_batch=8, max_total_tokens=ctx)
     if not devices:
         return engine_mod.build_engine(cfg, model, backend, **kw)
 

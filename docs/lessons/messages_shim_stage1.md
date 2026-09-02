@@ -60,20 +60,35 @@ So **stage 1's "done when" cannot be met by the stock CLI against `tiny`**.
 Three ways out, cheapest first:
 
 1. **Raise tiny's context.** It is a config integer and CPU RAM at 64 hidden /
-   2 layers is not the constraint. A `tiny-agent` config at 8192 positions
-   costs nothing to define. Cheapest, and it keeps the CLI unmodified — which
-   is the point of the exercise, since the harness preamble is part of what we
-   want the policy to learn to operate inside.
+   2 layers is not the constraint. Cheapest, and it keeps the CLI unmodified —
+   which is the point of the exercise, since the harness preamble is part of
+   what we want the policy to learn to operate inside.
+
+   **CORRECTED after running it: 8192 is not enough, 65536 is.** The
+   `~5,310 tokens` above is a chars/4 estimate and it is wrong by 9x for the
+   tokenizer that actually serves a checkpoint-less tiny. `ByteTokenizer` is
+   **one token per byte** (`tokenizer.py:19-24`), so the 21,676-byte trimmed
+   request is 21,676 tokens and the untrimmed one is 79,451. The engine
+   returned `400 request (79451 tokens) exceeds max_total_tokens (8192)` —
+   which is the check working, and the estimate that never should have been
+   made in characters. A real BPE would be ~4x denser; the 27B is unaffected
+   (262,144 positions).
+
+   Second thing the run exposed: `max_total_tokens` was hardcoded to 8192 at
+   `cli.py:72`, independent of the model's context, so raising the config alone
+   would still have refused. The budget and the block pool now follow
+   `max_position_embeddings`.
 2. **Shrink the request**: `--disallowed-tools` plus a minimal system prompt.
-   Gets to ~5.3k, still 10x over, and it changes the environment the policy
-   sees — the trimmed harness is not the one Claude Code actually runs.
+   Takes 79,451 tokens to 21,676 — still far over 512, and it changes the
+   environment the policy sees, since the trimmed harness is not the one Claude
+   Code actually runs.
 3. **Serve the 27B instead of tiny.** Correct context, needs the card, and the
    card is held by the pretrain.
 
-**Recommendation: (1) plus (2).** Define `tiny-agent` with 8192 positions, and
-keep the four-tool trim for the first loop so the pass is about the shim rather
-than about generation length. Then re-measure with the full 28 tools once it
-passes, because that is the real environment.
+**Recommendation: (1) plus (2).** `tiny-agent` at **65536** positions, with the
+four-tool trim for the first loop so the pass is about the shim rather than
+about generation length. Then re-measure with the full 28 tools (79,451 tokens
+byte-level), because that is the real environment.
 
 ## Where the shim goes
 
@@ -106,9 +121,18 @@ One caveat to record now: `Engine.logprobs` **pops**. If the shim reads it and
 something else expects it later, the second reader gets nothing. The shim must
 be the only reader per request.
 
-## Not yet done
+## State
 
-The `claude -p` pass against tiny on CPU. It is blocked on the context
-decision above, not on the shim: with 512 positions no shim can pass, and with
-`tiny-agent` at 8192 the shim is a day's work. Flagging rather than reporting a
-pass, because the transport half is proven and the model half is not.
+Built and gated: `src/tilerl/messages.py` mounted on the same app, tests
+asserting the wire shape and the record together (header id names the recorded
+row, one logprob per generated token, stop_reason agrees, SSE carries the event
+names the CLI parses). `Engine.logprobs` now raises on a second read instead of
+returning None.
+
+Verified live by curl against a served `tiny-agent`: a real Messages response,
+and a record row with 52 prompt ids, 8 completion ids, 8 logprobs — one score
+per token, which is the property the RL loop consumes.
+
+The end-to-end `claude -p` pass is **running, not yet passed**. CPU prefill of a
+21,676-token prompt through a freshly compiled kernel set is minutes, not
+seconds. Reporting it as in-flight rather than as a pass.
