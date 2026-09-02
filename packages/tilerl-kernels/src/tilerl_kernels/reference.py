@@ -615,7 +615,7 @@ def gdn_chunk_core_fla(qn, kn, v, gt, bt, state, chunk: int = 64):
     path, not a shipped one.
 
     fla is Triton and CUDA-only, so it cannot be the backend (AGENTS.md: one
-    TileLang source for cpu/cuda/rocm/metal). It is here to answer one question
+    TileLang source for cpu/cuda/metal). It is here to answer one question
     with a number instead of an estimate: fla runs our GDN shapes in 6.8 ms
     where our scalar-scan kernel takes 63, and this says how much of that 9.3x
     survives the layer's own glue.

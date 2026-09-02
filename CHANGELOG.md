@@ -4,6 +4,23 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-02 — default flip: the north star is the serve+RL runtime on Hopper; serve throughput and ROCm are parked
+
+- README, roadmap and AGENTS rewritten around what is measured and unoccupied:
+  native NVFP4+FP8 decode on H20, where sglang/vLLM fall back to Marlin W4A16
+  and recommend FP8, and an RL loop that samples from the served weights with
+  no weight sync. Cross-platform is a test-harness property (every kernel has
+  a CPU twin), not a product claim: ROCm's CPU-cell alias, its test and every
+  mention are removed until a HIP host runs the suite. B≥8 / prefill work vs
+  sglang is parked; rollout decode at B≥32 is the kernel that matters.
+- `tilerl train --rl/--opd` takes real prompts (`--data` JSONL through the
+  checkpoint tokenizer as ChatML), an exact-match GSM8K reward, `--eval-mmlu N`
+  before and after on the same engine, and reports seconds per step.
+  `scripts/rl_compare.sh` is the same-pod harness vs verl+sglang. The 27B
+  numbers are **pending-remote**: the pod's eight cards hold another job.
+  Gates: `test_train_cli_real_task`, `test_last_number`.
+  [wins/2026-09-02-rl-real-task.md](docs/experience/wins/2026-09-02-rl-real-task.md)
+
 ## 2026-08-30 — accept: the sampler stops shipping its arguments to the device to read them back
 
 - `temperature` / `top_p` / `seed` are Python scalars on `SamplingParams`. The

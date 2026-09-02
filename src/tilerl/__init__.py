@@ -1,4 +1,4 @@
-"""tileRL: TileLang inference + training (CPU/CUDA/ROCm/Metal).
+"""tileRL: TileLang inference + training (CPU/CUDA/Metal).
 
 One TileLang backend, torch as the tensor container only, a hand-written
 reverse-mode autograd tape. Import submodules directly::

@@ -1,19 +1,61 @@
 # tileRL
 
-Cross-platform train + inference runtime for `Qwen3.8-27B` (NVFP4), in Python,
-on one [TileLang](https://github.com/tile-ai/tilelang) kernel source. Three
-targets have executed it: CPU (the CI and dev path), Metal, and CUDA sm90 (on
-an H20 pod). ROCm shares the CPU kernel set and has never run.
+Serve and RL-train `Qwen3.8-27B` (NVFP4) on one Hopper card, in one process.
 
-The source is not evenly shared. Of the 1,969 lines under
-`packages/tilerl-kernels/src/tilerl_kernels/kernels*.py`, 1,406 (71%) are sm90-only schedules and 175 (9%)
-are the kernels every target executes; the rest is per-target gemm schedules
-and a shared header. Per-op status:
-[`docs/support-matrix.md`](docs/support-matrix.md).
+Two things nobody else ships together:
 
-tileRL pairs an inference engine (continuous batching, paged KV, prefix cache)
-with **On-Policy Distillation (OPD)** training that shares the engine and
-weights — one runtime, no second stack.
+- **Native NVFP4 + FP8 decode on H20.** On Hopper, sglang and vLLM fall back
+  to weight-only Marlin and recommend the FP8 checkpoint instead; sglang
+  refuses the NVFP4 checkpoint outright. tileRL's TileLang kernels run it as
+  fp4 weights × fp8 activations, and single-stream decode is the fastest
+  measured on this card.
+- **The engine that samples is the model that trains.** GRPO and self-teacher
+  on-policy distillation roll out through the same engine and the same weights,
+  LoRA on the frozen fp4 base. No weight sync between trainer and rollout —
+  not a protocol, a memory-format fact.
+
+## Where it stands (2026-08-28, one H20, Qwen3.8-27B-NVFP4)
+
+Decode is `tilerl bench --suite decode-kv` (steady-state median of 3×20 ticks);
+every row is gated at ≥0.97× the committed snapshot in
+`docs/experience/wins/bench-baseline.json`.
+
+| | B=1 tok/s @512 / 2k / 8k / 32k | B=8 agg tok/s @512 | prefill tok/s @512 |
+|---|---|---:|---:|
+| **tileRL** (native NVFP4 + FP8) | **92.4 / 87.3 / 88.9 / 80.1** | 308.0 | 1836 |
+| Arle (agent-infer, same card) | 84.5 | — | — |
+| sglang bf16 (same card; no NVFP4 path on Hopper) | 54.2 | **387** | 2512 |
+| sglang online-fp8 | 39.9 | 266.6 | **4908** |
+
+Long context, B=1: **61.1 tok/s at 128K, 48.1 at 256K** (the KV alone is
+17 / 34 GB). Accuracy: **MMLU 0-shot 76.3%** (763/1000, `scripts/mmlu.py`).
+The sglang rows are throughput only — the bf16 checkpoint it has to run emits
+garbage ([why](docs/experience/errors/2026-08-28-sglang-bf16-checkpoint-garbage.md)).
+
+Training on the same card: LoRA on the frozen fp4 base at **26.5 / 32.6 / 38.2
+tok/s** (1×64/128/256, peak 47–58 GB); Adafactor full fine-tuning of the 27B
+fits in 73 GB. GRPO on GSM8K with an MMLU before/after gate is wired
+(`tilerl train --rl --data`) and **pending-remote** — the 27B numbers land in
+[`docs/experience/wins/2026-09-02-rl-real-task.md`](docs/experience/wins/2026-09-02-rl-real-task.md).
+
+sglang is ahead at B≥8 and on prefill. Those are not targets: an RL runtime is
+priced by seconds per step, and rollout is decode at B≥32 — the next kernel
+([`docs/roadmap.md`](docs/roadmap.md)). How decode got from 52 to 92, with the
+dead ends: [`docs/experience/2026-08-28-decode-52-to-84.md`](docs/experience/2026-08-28-decode-52-to-84.md);
+the sglang comparison and its caveats:
+[`docs/experience/2026-08-28-vs-sglang-h20.md`](docs/experience/2026-08-28-vs-sglang-h20.md).
+
+## What is in the box
+
+- **Engine**: continuous batching, `submit`/`poll` + `StepLimits`, one forward
+  per tick; paged KV for the full-attention layers, recurrent state for the
+  gated-delta layers, hash prefix cache; OpenAI-compatible server with SSE.
+- **Trainer**: hand-written reverse-mode tape (no `torch.autograd`, no
+  `torch.optim`); GRPO, self-OPD, SFT; LoRA or Adafactor full-parameter.
+- **Kernels**: one TileLang file tree behind both. `cpu` is the CI and parity
+  harness — every kernel has a CPU-executable twin — `metal` runs locally, and
+  CUDA sm90 holds the fp4/fp8 tensor-core schedules (71% of the 1,969 kernel
+  lines). Per-op status: [`docs/support-matrix.md`](docs/support-matrix.md).
 
 ## Relationship to agent-infer
 
@@ -23,7 +65,7 @@ this design. tileRL ports its ideas to Python + TileLang:
 | | agent-infer | tileRL |
 |---|---|---|
 | Language | Rust | Python (uv package `tilerl`) |
-| Kernels | per-backend native (CUDA C / Metal C++) | one TileLang source; 71% of it is sm90-only |
+| Kernels | per-backend native (CUDA C / Metal C++) | one TileLang tree; 71% of it is sm90 schedules |
 | Engine seam | `BackendExecutor`: submit/poll + `StepLimits` | same seam, same cost contract |
 | KV | paged full-attn + recurrent state + prefix cache | same |
 | Training | OPD, shared engine/weights | OPD, shared engine/weights |
@@ -77,6 +119,8 @@ uv run pytest                                    # correctness suite (CPU)
 TILERL_TARGET=cpu uv run tilerl serve            # OpenAI-compatible server
 TILERL_TARGET=cpu uv run tilerl bench            # benchmark → docs/experience/
 uv run tilerl train --opd                        # OPD self-teacher training
+python scripts/gsm8k_jsonl.py train gsm8k.jsonl  # then, on a card:
+tilerl train --model qwen38-27b --rl --data gsm8k.jsonl --group 8 --max-new-tokens 256 --eval-mmlu 200
 ```
 
 ## Development
@@ -130,44 +174,11 @@ plain `uv run pytest` on CI is exactly the deterministic set.
                   │           ops (seam)                 │
                   │  TileLang kernels, one file tree:    │
                   │  cpu ✓ | metal ✓ | sm90 ✓ (pod)      │
-                  │  rocm = the cpu set, never run       │
                   └──────────────────────────────────────┘
 ```
 
-Everything above `src/tilerl/ops/` is backend-neutral; `ops/` is the only
-layer that touches TileLang or torch beyond the tensor container.
-
-## Performance (2026-08-28, one H20, Qwen3.8-27B-NVFP4)
-
-Decode is measured by `tilerl bench --suite decode-kv` (steady-state median of
-3×20 ticks, engine rebuilt per depth); every row is gated at ≥0.97× the committed
-snapshot in `docs/experience/wins/bench-baseline.json`.
-
-| | B=1 tok/s @512 / 2k / 8k / 32k | B=8 agg tok/s @512 | prefill tok/s @512 |
-|---|---|---:|---:|
-| **tileRL** (native NVFP4 + FP8, this repo) | **92.4 / 87.3 / 88.9 / 80.1** | 308.0 | 1836 |
-| Arle (agent-infer, same card) | 84.5 | — | — |
-| sglang bf16 (same card; no NVFP4 path on Hopper) | 54.2 | **387** | 2512 |
-| sglang online-fp8 | 39.9 | 266.6 | **4908** |
-
-Long context, B=1 (one sequence per card — the KV alone is 17 / 34 GB):
-**61.1 tok/s at 128K, 48.1 at 256K.**
-
-Training on the same card: LoRA on the frozen fp4 base (no bf16 master), **26.5
-/ 32.6 / 38.2 tok/s** at 1x64/128/256, peak 46.9-57.6 GB — full-parameter 27B
-does not fit at any batch size (54 GB of masters plus 216 GB of Adam moments).
-
-Accuracy: **MMLU 0-shot 76.3%** (763/1000, `scripts/mmlu.py`, sampling
-restricted to the answer-letter ids). The sglang rows are throughput only —
-the bf16 checkpoint it has to run on emits garbage text
-([why](docs/experience/errors/2026-08-28-sglang-bf16-checkpoint-garbage.md)).
-
-Where it stands: fastest single-stream decode measured on this card and nearly
-depth-flat to 32k; sglang is ahead at B≥8 (tensor-core occupancy) and on prefill
-(untouched so far). How it got here, step by step, with the dead ends:
-[`docs/experience/2026-08-28-decode-52-to-84.md`](docs/experience/2026-08-28-decode-52-to-84.md);
-the sglang comparison and its caveats:
-[`docs/experience/2026-08-28-vs-sglang-h20.md`](docs/experience/2026-08-28-vs-sglang-h20.md).
+Everything above `packages/tilerl-kernels/` is backend-neutral; that package
+is the only layer that touches TileLang or torch beyond the tensor container.
 
 ## Status
 
@@ -176,12 +187,11 @@ the sglang comparison and its caveats:
 | CPU target | ✓ CI + local, every commit (97 passed, 4 skipped) |
 | Metal target | ✓ local (97 passed, 4 skipped) |
 | CUDA sm90 target | ✓ H20 pod, 27B decodes correctly (verify checks 1–3), perf gated by the snapshot harness |
-| ROCm target | never executed — resolves to the CPU kernel set |
 | sm100 / sm120 | registered empty; `NotImplementedError` on use |
 | Tiny model end-to-end | ✓ |
 | Qwen3.8-27B NVFP4 weights | ✓ served natively (twiddled fp4 + fp8), 92.4 tok/s B=1 on H20, MMLU 76.3% |
 | Paged KV + prefix cache | ✓ (tiny) |
-| Autograd tape + OPD | ✓ (tiny) |
+| Autograd tape + GRPO + OPD | ✓ (tiny); 27B GSM8K + MMLU gate pending-remote |
 | OpenAI-compatible server | ✓ |
 
 Perf work is recorded under `docs/experience/wins/` (and `errors/` for

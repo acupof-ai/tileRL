@@ -910,16 +910,6 @@ def test_cross_entropy_is_stable_and_matches_gradient(backend):
     loss, grad = backend.cross_entropy_loss_grad(logits, [[0, 1]])
     assert loss == pytest.approx(100.0)
     assert torch.equal(grad[0, 0], torch.tensor([1.0, -1.0]))
-
-
-def test_rocm_cell_is_the_cpu_cell():
-    """rocm gets the CPU kernel set, not the pending-remote empty slot — the
-    schedules are target-neutral, so they compile for HIP from one source."""
-    assert "linear_fp4" in _resolve("bf16", "rocm")
-    with pytest.raises(NotImplementedError):
-        _resolve("bf16", "sm100")
-
-
 def test_fp4_twiddle_round_trip():
     """sm90 serves fp4 in the twiddled byte layout; save_hf must undo it exactly."""
     import torch

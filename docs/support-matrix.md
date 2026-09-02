@@ -8,8 +8,9 @@ State as of 2026-08-27.
 ## What "one kernel source" means
 
 Three targets have executed the source: **cpu**, **metal**, and **sm90**.
-`rocm` has never run. `_REGISTRY` holds 9 keys but only **3 distinct kernel
-sets** — `rocm` resolves to the same dict object as `cpu`.
+`_REGISTRY` holds 8 keys but only **3 distinct kernel sets**. ROCm has no cell:
+it was an alias of the CPU set that never ran, removed 2026-09-02 until a HIP
+host executes the suite.
 
 Line partition of `packages/tilerl-kernels/src/tilerl_kernels/kernels*.py` (1,969 lines, by top-level
 function span; `python -c` over `ast` reproduces it):
@@ -20,7 +21,7 @@ function span; `python -c` over `ast` reproduces it):
 | 175 | 8.9% | shared and executed on all three targets — `rmsnorm` x4, `silu_mul`, `softmax`, `rope`, `embedding` |
 | 144 | 7.3% | `kernels.py` header: docstring, imports, `_pass_configs` |
 | 105 | 5.3% | cpu + metal, overridden on sm90 — `linear_fp4`, `paged_attention` |
-| 81 | 4.1% | cpu/rocm only — the three `T.gemm` gemms (metal and sm90 both override) |
+| 81 | 4.1% | cpu only — the three `T.gemm` gemms (metal and sm90 both override) |
 | 58 | 2.9% | metal only — the three naive FMA gemms |
 
 8 of `kernels.py`'s 16 makers execute on sm90. The cpu cell has 13 entries,
@@ -33,16 +34,11 @@ Kernels are registered in a `(precision, arch) -> kernel set` dict. Resolution
 walks the fallback chain `exact -> (precision, "any") -> ("any", "any")`; a
 registered-but-empty set raises `NotImplementedError` (pending-remote bring-up).
 Adding fp8 or a new SM arch is ONE `_register()` call. Arch tags: `cpu`
-(target `"c"`), `sm90`/`sm100`/`sm120` (CUDA capability), `rocm`, `metal`.
+(target `"c"`), `sm90`/`sm100`/`sm120` (CUDA capability), `metal`.
 
 `Backend.precision` is the constant `"bf16"` (`ops/backend.py:130`), so every
 row below resolves through its arch's bf16 cell. The fp4 and fp8 tables are
 weight-format tables, not separate registry cells.
-
-`rocm` shares the CPU cell rather than sitting in an empty slot: the schedules
-are block-parallel and target-neutral, so the same source compiles for HIP. No
-HIP host exists in this env, so the cells below read **untested**, not done —
-nothing in them has ever executed.
 
 All CPU kernels are f32 compute with bf16 cast at the boundary (tilelang eager
 JIT does not specialize on dtype). `linear_fp4` dequantizes on the fly.
@@ -56,29 +52,29 @@ is no per-call fallback (see below).
 
 ## bf16
 
-| Op | cpu | sm90 | sm100 | rocm | metal |
-| --- | --- | --- | --- | --- | --- |
-| rmsnorm (fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
-| linear (fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
-| rope (fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
-| attention (dense, fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
-| paged_attention (fwd) | done | done | pending-remote | untested (CPU cell) | done |
-| gdn_forward (full GDN layer) | done | done | pending-remote | untested (CPU cell) | done |
-| gdn_backward | done | done | pending-remote | untested (CPU cell) | done |
-| silu_mul (fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
-| softmax | done | done | pending-remote | untested (CPU cell) | done |
-| embedding (fwd/bwd) | done | done | pending-remote | untested (CPU cell) | done |
-| sample | done | done | pending-remote | untested (CPU cell) | done |
-| add | done | done | pending-remote | untested (CPU cell) | done |
+| Op | cpu | sm90 | sm100 | metal |
+| --- | --- | --- | --- | --- |
+| rmsnorm (fwd/bwd) | done | done | pending-remote | done |
+| linear (fwd/bwd) | done | done | pending-remote | done |
+| rope (fwd/bwd) | done | done | pending-remote | done |
+| attention (dense, fwd/bwd) | done | done | pending-remote | done |
+| paged_attention (fwd) | done | done | pending-remote | done |
+| gdn_forward (full GDN layer) | done | done | pending-remote | done |
+| gdn_backward | done | done | pending-remote | done |
+| silu_mul (fwd/bwd) | done | done | pending-remote | done |
+| softmax | done | done | pending-remote | done |
+| embedding (fwd/bwd) | done | done | pending-remote | done |
+| sample | done | done | pending-remote | done |
+| add | done | done | pending-remote | done |
 
 ## fp4 (OCP e2m1 weight format)
 
-| Op | cpu | sm90 | sm100 | rocm | metal |
-| --- | --- | --- | --- | --- | --- |
-| pack_fp4 / unpack_fp4 | done | done | pending-remote | untested (CPU cell) | done |
-| linear_fp4 (fwd) | done | done | pending-remote | untested (CPU cell) | done |
-| linear_fp4_gemv (M=1) | — | done | pending-remote | — | — |
-| linear_fp4_fp8 (w4a8, M>1) | — | done | pending-remote | — | — |
+| Op | cpu | sm90 | sm100 | metal |
+| --- | --- | --- | --- | --- |
+| pack_fp4 / unpack_fp4 | done | done | pending-remote | done |
+| linear_fp4 (fwd) | done | done | pending-remote | done |
+| linear_fp4_gemv (M=1) | — | done | pending-remote | — |
+| linear_fp4_fp8 (w4a8, M>1) | — | done | pending-remote | — |
 
 No cell needs a packed-weight backward kernel: training runs
 `backend.linear(x, master)` on the bf16 master and its ordinary `linear_bwd`
@@ -88,11 +84,11 @@ The rest of the layer (attention, norms, activations) runs the bf16 path.
 
 ## fp8 (e4m3 weight format)
 
-| Op | cpu | sm90 | sm100 | rocm | metal |
-| --- | --- | --- | --- | --- | --- |
-| linear_fp8 (native WGMMA, M>1) | bf16 at load | done | pending-remote | bf16 at load | bf16 at load |
-| linear_fp8_gemv (M=1) | bf16 at load | done | pending-remote | bf16 at load | bf16 at load |
-| quant_fp8 (per-token e4m3 activation) | — | done | pending-remote | — | — |
+| Op | cpu | sm90 | sm100 | metal |
+| --- | --- | --- | --- | --- |
+| linear_fp8 (native WGMMA, M>1) | bf16 at load | done | pending-remote | bf16 at load |
+| linear_fp8_gemv (M=1) | bf16 at load | done | pending-remote | bf16 at load |
+| quant_fp8 (per-token e4m3 activation) | — | done | pending-remote | — |
 
 There is no `_register("fp8", ...)` cell: fp8 is a weight format inside the
 bf16/fp4 cells, exactly like fp4. **bf16 at load** means `Backend.materialize`
@@ -172,9 +168,6 @@ with neither (fused projections, native-fp8 serving) still raise.
   the engine: identical token ids and `allclose(rtol=1e-2)` prefill logits.
   This is the gate T6 asks for; it auto-skips where MPS is unusable (ubuntu
   CI, macos CI runners with no GPU entitlement).
-- **rocm**: `tests/test_ops_parity.py::test_rocm_cell_is_the_cpu_cell` — a
-  dict lookup, so the matrix claim is gated on every host. Nothing has ever
-  run on HIP.
 - **metal/bf16 + fp4**: `TILERL_TARGET=metal uv run pytest` (2026-08-27) — 97
   passed, 4 skipped, 0 failed. The two long-standing failures were host-side device
   boundaries, not target-neutrality bugs: `linear` never moved a bias to the

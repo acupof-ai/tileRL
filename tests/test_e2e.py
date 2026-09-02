@@ -888,8 +888,7 @@ def test_engine_miss_path():
 
 def test_gpu_targets():
     """GPU targets compile from the same kernel source; nothing to verify on a
-    GPU-less host. Skip unless a CUDA device is available (tilelang metal is
-    unsupported in this env — rocm/cuda share the HIP/LLVM path)."""
+    GPU-less host. Skip unless a CUDA device is available."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA device available on this host")
     target = "cuda"
