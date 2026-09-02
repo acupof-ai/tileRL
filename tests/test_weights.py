@@ -4,6 +4,7 @@ layer_types mismatch, rope/tie fields the checkpoint contradicts)."""
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 
@@ -274,6 +275,29 @@ def test_fp4_save_load_roundtrip(tmp_path):
         return done[rid]
 
     assert greedy(loaded) == greedy(model)
+
+
+def test_sm70_chunks_cover_every_row_exactly_once():
+    """The sm70 GEMV ladder chunks M into 1/2/4/8/32-row launches. A slicing bug
+    is invisible where it runs — only M that does not divide 32 exposes it, and the
+    sm70 branch never executes on the CPU target the parity tests use — so gate the
+    arithmetic directly: chunks must tile [0, M) with no gap, no overlap, and each
+    chunk's rung must be the smallest that holds its rows."""
+    from tilerl_kernels.backend import _sm70_chunks
+
+    for m in (1, 2, 3, 5, 8, 9, 16, 32, 33, 40, 64, 100, 512):
+        chunks = _sm70_chunks(m)
+        assert [o for o, _, _ in chunks] == list(
+            itertools.accumulate([r for _, r, _ in chunks][:-1], initial=0)
+        ), f"M={m}: offsets do not follow the row counts"
+        assert sum(r for _, r, _ in chunks) == m, f"M={m}: chunks do not cover M"
+        for _, r, rung in chunks:
+            assert rung >= r, f"M={m}: rung {rung} cannot hold {r} rows"
+            assert rung in (1, 2, 4, 8, 32), f"M={m}: {rung} is not a ladder rung"
+            smaller = [w for w in (1, 2, 4, 8, 32) if w >= r]
+            assert rung == min(smaller), f"M={m}: {r} rows took rung {rung}, not {min(smaller)}"
+    # The whole point of the per-chunk rung: 40 rows is 32+8, not 32+32.
+    assert [rung for _, _, rung in _sm70_chunks(40)] == [32, 8]
 
 
 def test_fp4_save_widens_f16_scale_plane(tmp_path):

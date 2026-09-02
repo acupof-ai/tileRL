@@ -40,8 +40,10 @@ ROW_MS = 0.53
 #: Verify widths the sm70 M-ladder serves without padding waste. A width
 #: between rungs pays the next rung's full price: depth 5 (W=6) costs the same
 #: 8-row launch as depth 7 (W=8), which measured 10% SLOWER than depth 3 on the
-#: one workload where every draft is accepted.
-LADDER_WIDTHS = (1, 2, 4, 8)
+#: one workload where every draft is accepted. 32 is the top rung, and it is
+#: no longer a cliff — X is pre-packed f16 there too, 29-36 us/row against the
+#: 122-128 it cost when the flag stopped at 8.
+LADDER_WIDTHS = (1, 2, 4, 8, 32)
 
 
 def survival(confidences: list[float]) -> list[float]:
