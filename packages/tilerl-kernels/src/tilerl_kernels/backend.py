@@ -673,7 +673,9 @@ class Backend:
 
     def _full_rows(self, seq_q_lens, t: int) -> bool:
         """Every row's query span is the whole T -- the chunkwise form has no
-        per-row mask. Memoized: one tensor object serves all 64 layers of a tick."""
+        per-row mask. The memo is not a micro-optimization: ``.min()`` is a host
+        sync, one tensor object reaches all 64 layers, and dropping it costs 64
+        pipeline drains a prefill tick -- the host cost this whole path removes."""
         if seq_q_lens is None:
             return True
         hit = self._full_rows_memo

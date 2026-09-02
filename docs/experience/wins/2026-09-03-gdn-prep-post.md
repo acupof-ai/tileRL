@@ -1,9 +1,9 @@
 # The GDN layer around the WY core is two kernels, not sixty torch ops — H20, 2026-09-03
 
-> Status: pending-remote (CPU/Metal parity measured here; every H20 number below
-> is unmeasured — no card was free, and a prefill number taken while five
-> neighbouring GPUs are saturated is not comparable to the baseline it is a
-> ratio against)
+> Status: pending-remote for the ship gate. sm90 compile and parity ARE measured
+> (H20 GPU 2, idle); throughput is not — six of eight cards on that host were
+> saturated by another tenant, and a prefill number taken beside them is not
+> comparable to the quiet-host baseline it would be a ratio against.
 
 ## Context
 
@@ -60,32 +60,52 @@ prefill is host-bound, and the glue outweighs the kernel it wraps.
 
 ## Results
 
-| metric | shipped serial | WY, torch glue | WY + prep/post |
+Every row says how it was obtained. A derived row read as measured is how a
+bound turns into a fake measurement.
+
+| metric | how | shipped serial | WY, torch glue | WY + prep/post |
+|---|---|---:|---:|---:|
+| WY core, us/layer (fla 145.5) | measured | ~1400 | 137.4 | 121.8 |
+| prefill GPU-busy, ms (64 layers, 512 tok) | measured | 233.9 | 189.9 | **pending-remote** |
+| kernels per prefill | measured | 3827 | 6755 | **pending-remote** |
+| GDN launches per layer | derived from the row above | 14 | 75 | 15 |
+| kernels per prefill | predicted from the row above | — | — | ~3875 |
+| harness prefill 512, tok/s | measured | 2238.6 | 2324.6 | **pending-remote** |
+| harness prefill 2048, tok/s | measured | 2215.9 | — | **pending-remote** |
+| harness prefill 8192, tok/s | measured | 2142.4 | — | **pending-remote** |
+
+The 137.4 → 121.8 us/layer is not a schedule change: `gdn_chunk_core_tl` cast
+q, k, v and beta to bf16 on every call, and `gdn_prep` now emits them already
+cast. Only the state cast is left inside the core, at 3.0 us. Taken on an idle
+GPU 2 while six neighbours were saturated, so treat it as a floor, not a
+headline.
+
+sm90 parity, `scripts/probe_gdn_wy.py` on H20 GPU 2, gate 1e-2 relative:
+
+| check | out | state | window |
 |---|---:|---:|---:|
-| WY core, us/layer (fla 145.9) | ~1400 | 137.4 | 137.4 |
-| prefill GPU-busy, ms (64 layers, 512 tok) | 233.9 | 189.9 | pending-remote |
-| kernels per prefill | 3827 | 6755 | ~3875 predicted |
-| GDN launches per layer | 14 | 75 | 15 |
-| harness prefill 512, tok/s | 2238.6 | 2324.6 | pending-remote |
-| harness prefill 2048, tok/s | 2215.9 | — | pending-remote |
-| harness prefill 8192, tok/s | 2142.4 | — | pending-remote |
+| (b2) `linear_attn_chunk` (WY) vs `reference.gdn_forward` | 5.9e-3 | 7.7e-3 | 0 |
+| (b) `_gdn_wy_core` vs `reference.gdn_chunk_core` | 6.6e-3 | 6.1e-3 | — |
+| (b) `_gdn_wy_core` vs fla `chunk_gated_delta_rule` | 3.5e-3 | 4.8e-3 | — |
 
-The two totals and the 2928-kernel gap are measured (`scripts/profile_prefill.py`,
-2026-09-02); the per-layer rows are read off the code against that gap, and the
-predicted total follows from them.
+(b2) is the gate for the two new cells — it is the only thing that runs
+`make_gdn_prep_bf16` and the bf16 `gdn_post` at all. Both compile. The bf16-IO
+error is three orders above the f32 cells and still inside 1e-2; the same shape
+appears in `test_gdn_chunk_fused_parity_full_scale`, where the bf16 kernel
+lands at 1.2% against a 5% tolerance.
 
-Per-kernel parity of the WY core against fla 0.5.2, measured 2026-09-02 on H20
-and unchanged by this entry: `solve_tril` 4.9e-4 max abs, `w` 2.4e-4, final
-state 4.7e-4, `o` 2.3e-4.
+Per-kernel parity of the WY core against fla 0.5.2, same run: `kkt` 4.6e-4 max
+abs, `solve_tril` 4.9e-4, `w` 2.4e-4, `u` 0, `h` 9.8e-4, `V_new` 9.8e-4, final
+state 4.7e-4, `o` 2.3e-4. The state-scan known-answer rows are exact
+(`e_last` at g=-0.25 gives 1.125e-07 against 1.125e-07).
 
-Parity measured here: `Backend.linear_attn_chunk` (WY path) vs
-`reference.gdn_forward`'s per-step scan, tiny model at full input scale,
-relative max-abs — cpu out 2.1e-6 / state 4.3e-7 / window 0, metal 7.5e-7 /
-4.9e-7 / 0. Gate is 1e-2. `TILERL_TARGET=cpu uv run pytest -q`: 170 passed.
+Parity on the GPU-less machine, `Backend.linear_attn_chunk` (WY path) vs
+`reference.gdn_forward`'s per-step scan, tiny model at full input scale:
+cpu out 2.1e-6 / state 4.3e-7 / window 0, metal 7.5e-7 / 4.9e-7 / 0.
+`TILERL_TARGET=cpu uv run pytest -q`: 170 passed.
 
-Ship gate, unrun: harness prefill at or above 1.15x of 2238.6 / 2215.9 / 2142.4
-tok/s at 512 / 2048 / 8192, `CUDA_VISIBLE_DEVICES=<free> python3
-scripts/bench_harness.py --suite prefill --source /work/Qwen3.8-27B-NVFP4`.
-Until it runs, sm90 keeps the serial kernel and the WY path stays behind
-`TILERL_GDN_WY=1`; `scripts/probe_gdn_wy.py` section (b2) is the sm90 parity
-check for the two new cells.
+Ship gate, unrun and waiting on a quiet host: harness prefill at or above 1.15x
+of 2238.6 / 2215.9 / 2142.4 tok/s at 512 / 2048 / 8192, plus
+`scripts/profile_prefill.py` for the real kernel count against the ~3875
+prediction. Until it runs, sm90 keeps the serial kernel and the WY path stays
+behind `TILERL_GDN_WY=1`.
