@@ -57,6 +57,10 @@ How it lands on the tape — optimizer-side only, no new backward:
   path holds exactly that master, `drop_quantized`). Budget: 35 (frames) + 15
   (served fp4) + one matrix in flight + activations ≈ 60–70 GB. Fits only
   under that streaming.
+- As built (`src/tilerl/iso.py`), frames default to fp32 (`frame_dtype`):
+  correct on the tiny model, ~200 GiB on the 27B. The 27B must pass bf16
+  frames, and whether Newton-Schulz holds ‖UᵀU − I‖ < 1e-4 in bf16 is an
+  open pod question — measure it before the SFT gate, not after.
 - ISO has no LoRA variant. LoRA + AdamW stays the day-1 adapter path; ISO is
   the full-parameter path. A low-rank frame rotation (`U⁺ = U₀ + A Bᵀ`
   retracted) is an experiment, not a commitment.
