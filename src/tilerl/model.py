@@ -297,18 +297,19 @@ class Model:
             norm_weight=self.params[f"{p}.gdn_norm"],
             seq_q_lens=getattr(kv, "seq_q_lens", None),
         )
+        # Speculative verify keeps the state after every chain step for the engine to adopt.
+        ks = getattr(kv, "keep_steps", 0)
         out = None
-        if q.shape[1] == 1 and not getattr(kv, "dense", False):
+        if not getattr(kv, "dense", False):
             out = backend.gdn_decode(  # sm90: in-place pool state, one launch
-                q, k, v, a_proj, b_proj, kv.state_pool, kv.state_slot, linear_idx, **kwargs
+                q, k, v, a_proj, b_proj, kv.state_pool, kv.state_slot, linear_idx,
+                keep_steps=ks, **kwargs
             )
         if out is None:
             pool = kv.state_pool
             state, window = backend.state_gather(
                 pool.states, pool.conv_windows, kv.state_slot, linear_idx, pool.win_parity
             )
-            # Speculative verify keeps the state after every chain step for the engine to adopt.
-            ks = getattr(kv, "keep_steps", 0)
             if ks:  # the tape replays kwargs into gdn_backward, which has no such arg
                 kwargs["keep_steps"] = ks
             out, new_state, new_window = backend.linear_attn_chunk(
