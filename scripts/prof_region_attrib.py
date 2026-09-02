@@ -67,7 +67,8 @@ def attribute(e, reps: int = 2, settle: int = 6) -> dict:
     for _ in range(settle):
         e.step()
     torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                 record_shapes=True) as prof:
         for _ in range(reps):
             e.step()
         torch.cuda.synchronize()
@@ -102,8 +103,11 @@ def attribute(e, reps: int = 2, settle: int = 6) -> dict:
                 out[r][3] += us
                 # x.name is the aten op that launched this kernel -- the profiler
                 # already carries the attribution `with_stack` could not give.
-                out[f"O:{r}/{x.name}"][2] += 1 / reps
-                out[f"O:{r}/{x.name}"][3] += us
+                # Input shapes separate two callers of one op (a state gather and
+                # a window gather are both aten::index).
+                shp = ";".join(str(list(s)) for s in (x.input_shapes or []) if s)[:60]
+                out[f"O:{r}/{x.name} {shp}"][2] += 1 / reps
+                out[f"O:{r}/{x.name} {shp}"][3] += us
     return out
 
 
@@ -138,10 +142,10 @@ def main() -> None:
     tot = [sum(v[i] for _, v in rows) for i in range(4)]
     print(f"{'TOTAL':<14} {tot[0]:>7.0f} {tot[1] / 1e3:>8.2f} {tot[2]:>8.0f} {tot[3] / 1e3:>9.2f}")
 
-    print(f"\n{'region / aten op that launched it':<52} {'n':>7} {'ms':>8}")
+    print(f"\n{'region / aten op / input shapes':<76} {'n':>7} {'ms':>8}")
     for k, v in sorted(got.items(), key=lambda kv: -kv[1][3])[:30]:
         if k.startswith("O:") and v[2]:
-            print(f"{k[2:]:<52} {v[2]:>7.0f} {v[3] / 1e3:>8.3f}")
+            print(f"{k[2:]:<76} {v[2]:>7.0f} {v[3] / 1e3:>8.3f}")
 
 
 if __name__ == "__main__":
