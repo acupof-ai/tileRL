@@ -159,6 +159,10 @@ def cmd_train(args: argparse.Namespace) -> None:
         AdamW(lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1) if adapters_only
         else Adafactor(lr=1e-2, weight_decay=0.1)
     )
+    if args.optim == "iso" and not adapters_only:
+        from .iso import ISO
+
+        optimizer = ISO(optimizer)
     gen = torch.Generator().manual_seed(args.seed)
 
     print(
@@ -460,6 +464,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--eval-mmlu", type=int, default=0,
                          help="score N MMLU questions before and after (needs `datasets`)")
     p_train.add_argument("--lr", type=float, default=1e-3)
+    p_train.add_argument("--optim", choices=["adafactor", "iso"], default="adafactor",
+                         help="full-parameter SFT optimizer; --rl/--opd train LoRA and ignore it")
     p_train.add_argument("--lora-rank", type=int, default=16)
     p_train.add_argument("--draft", help="draft head safetensors: speculative rollout (--opd)")
     p_train.add_argument("--depth", type=int, default=2, help="drafts per row per tick")
