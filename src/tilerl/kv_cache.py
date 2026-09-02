@@ -9,8 +9,9 @@ device, after agent-infer's ``host_paged_kv_pool.rs`` / ``prefix_store.rs``.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -270,12 +271,20 @@ class LinearStatePool:
         self._free.append(slot)
 
 
+def _nbytes(state: Any) -> int:
+    if isinstance(state, torch.Tensor):
+        return state.nbytes
+    return sum(_nbytes(s) for s in state) if isinstance(state, tuple) else 0
+
+
 @dataclass(frozen=True)
 class PrefixHit:
-    """Matched token count and the store-retained blocks covering ``[0, length)``."""
+    """Matched token count, the store-retained blocks covering ``[0, length)``
+    and the recurrent-state snapshot taken at that boundary."""
 
     length: int
     blocks: tuple[int, ...]
+    state: Any = None
 
 
 @dataclass(slots=True)
@@ -284,19 +293,19 @@ class _Entry:
     tokens: tuple[int, ...]
     blocks: tuple[int, ...]
     h: int
+    state: Any
+    nbytes: int
 
 
 class NoPrefixStore:
     """Never matches, never retains: a training rollout must not serve KV
     computed under an earlier policy. Also the miss-path double for tests."""
 
-    on_evict: Callable[[tuple[int, ...]], None] | None = None
-
     def lookup(self, tokens: Sequence[int]) -> PrefixHit | None:
         return None
 
-    def insert(self, tokens: Sequence[int], blocks: Sequence[int]) -> None:
-        return None
+    def insert(self, tokens: Sequence[int], blocks: Sequence[int], state: Any = None) -> bool:
+        return False
 
     def evict_until_free(self, blocks: int) -> None:
         return None
@@ -305,20 +314,22 @@ class NoPrefixStore:
 class PrefixStore:
     """Rolling-hash prefix cache over a :class:`PagedKvPool`.
 
-    An entry maps a prefix's full hash to (token tuple, physical blocks); every
-    hash hit is verified against the stored tokens. Insert retains every block;
-    FIFO eviction at ``capacity`` (or under block pressure) releases them and
-    calls ``on_evict(tokens)`` so side tables keyed by the same tuple follow.
+    An entry maps a prefix's full hash to (token tuple, physical blocks, state
+    snapshot); every hash hit is verified against the stored tokens. Insert
+    retains every block; FIFO eviction at ``capacity`` entries, ``state_bytes``
+    of snapshots, or under block pressure releases blocks and snapshot together.
     """
 
     def __init__(
         self,
         pool: PagedKvPool,
         capacity: int = 4096,
+        state_bytes: int = 8 << 30,
     ) -> None:
         self._pool = pool
         self.capacity = capacity
-        self.on_evict: Callable[[tuple[int, ...]], None] | None = None
+        self.state_bytes = state_bytes
+        self._state_used = 0
         self._roll = _rolling_hash
         self._entries: dict[int, list[_Entry]] = {}
         self._by_id: dict[int, _Entry] = {}
@@ -334,12 +345,13 @@ class PrefixStore:
             h = self._roll(h, int(t))
         return h
 
-    def insert(self, tokens: Sequence[int], blocks: Sequence[int]) -> None:
-        """Cache ``tokens`` (covered by ``blocks``) and retain the blocks; a duplicate is a no-op."""
+    def insert(self, tokens: Sequence[int], blocks: Sequence[int], state: Any = None) -> bool:
+        """Cache ``tokens`` (covered by ``blocks``) with its ``state`` snapshot and retain
+        the blocks; True when a new entry was retained, False for a duplicate."""
         tokens = tuple(int(t) for t in tokens)
         blocks = tuple(blocks)
         if not tokens:
-            return
+            return False
         expected = PagedKvPool.blocks_for_tokens(len(tokens))
         if len(blocks) != expected:
             raise ValueError(
@@ -348,16 +360,18 @@ class PrefixStore:
         h = self._hash_all(tokens)
         for e in self._entries.get(h, ()):
             if e.tokens == tokens:
-                return
-        entry = _Entry(self._next_id, tokens, blocks, h)
+                return False
+        entry = _Entry(self._next_id, tokens, blocks, h, state, _nbytes(state))
+        self._state_used += entry.nbytes
         self._next_id += 1
         self._entries.setdefault(h, []).append(entry)
         self._by_id[entry.eid] = entry
         self._fifo.append(entry.eid)
         for b in blocks:
             self._pool.retain(b)
-        while len(self._by_id) > self.capacity:
+        while len(self._by_id) > self.capacity or self._state_used > self.state_bytes:
             self._evict_one()
+        return True
 
     def lookup(self, tokens: Sequence[int]) -> PrefixHit | None:
         """Longest stored prefix of ``tokens``, or ``None``."""
@@ -371,7 +385,7 @@ class PrefixStore:
             for e in self._entries.get(prefix_hashes[i - 1], ()):
                 if e.tokens == tokens[:i]:
                     self.hits += 1
-                    return PrefixHit(i, e.blocks)
+                    return PrefixHit(i, e.blocks, e.state)
         self.misses += 1
         return None
 
@@ -388,14 +402,14 @@ class PrefixStore:
             del self._entries[entry.h]
         for b in entry.blocks:
             self._pool.free_block(b)
-        if self.on_evict is not None:
-            self.on_evict(entry.tokens)
+        self._state_used -= entry.nbytes
         self.evictions += 1
 
     def stats(self) -> dict[str, int]:
         return {
             "entries": len(self._by_id),
             "capacity": self.capacity,
+            "state_bytes": self._state_used,
             "hits": self.hits,
             "misses": self.misses,
             "evictions": self.evictions,

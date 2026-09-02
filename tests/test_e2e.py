@@ -185,7 +185,6 @@ def test_prefix_snapshots_die_with_their_store_entry():
         rid = engine.submit([i + 1, i + 2, i + 3], SamplingParams(max_new_tokens=20, seed=i))
         assert len(_drain(engine, [rid], 20)[rid]) == 20
     assert engine._prefix.stats()["evictions"] >= 1
-    assert len(engine._prefix_state) == engine._prefix.stats()["entries"]
 
 
 def test_prefix_hit_survives_evicting_its_own_entry():
@@ -194,16 +193,15 @@ def test_prefix_hit_survives_evicting_its_own_entry():
     cfg = tiny()
     engine = build_engine(cfg, build_random(cfg, seed=9), get_backend(), num_blocks=8, num_slots=4)
 
-    def publish(toks, n):
+    def publish(toks, n, state=None):
         blocks = [engine._kv.alloc_block() for _ in range(n)]
-        engine._prefix.insert(list(toks), blocks)
+        engine._prefix.insert(list(toks), blocks, state)
         for b in blocks:
             engine._kv.free_block(b)  # the store keeps its own retain
 
     tokens = list(range(1, 4 * BLOCK_TOKENS + 1))
     key = tuple(tokens[: 2 * BLOCK_TOKENS])
-    publish(key, 2)  # the matched entry, at the FIFO head
-    engine._prefix_state[key] = (engine._states.states[0].clone(), None)
+    publish(key, 2, (engine._states.states[0].clone(), None))  # matched entry, FIFO head
     publish(range(9000, 9000 + 2 * BLOCK_TOKENS), 2)  # younger, unretained
     [engine._kv.alloc_block() for _ in range(engine._kv.free_blocks - 1)]
 
@@ -595,10 +593,11 @@ def test_prefix_snapshot_includes_conv_window():
         engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
         for _ in range(32):
             engine.step()
-            if engine._prefix_state:
+            if engine.stats()["prefix_published"]:
                 break
-        assert engine._prefix_state, "no prefix snapshot published"
-        states, windows = next(iter(engine._prefix_state.values()))
+        hit = engine._prefix.lookup(list(prompt))
+        assert hit is not None, "no prefix snapshot published"
+        states, windows = hit.state
         assert windows is not None
         assert windows.shape[-2] == cfg.linear_conv_kernel_dim - 1
     finally:
@@ -933,3 +932,13 @@ def test_generate_fans_a_corpus_across_workers(tmp_path):
     assert sorted(r["index"] for r in rows) == list(range(5)), "a prompt was lost or doubled"
     assert all(r["finished"] and r["output_ids"] for r in rows), rows
     assert not list(tmp_path.glob("*.part*")), "per-worker parts must be cleaned up"
+
+
+def test_noprefix_store_retains_no_snapshot():
+    """Regression: training engines (NoPrefixStore) leaked one state clone per block boundary."""
+    cfg = tiny()
+    engine = build_engine(cfg, build_random(cfg, seed=3), get_backend(), num_blocks=8,
+                          max_total_tokens=512, decode_graph=False, prefix_store=NoPrefixStore())
+    prompt = np.random.default_rng(5).integers(3, 320, size=40).astype(np.int64)
+    _drain(engine, [engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=40, seed=0))], 40)
+    assert engine.stats()["prefix_published"] == 0

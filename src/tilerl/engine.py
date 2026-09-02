@@ -309,11 +309,6 @@ class Engine:
         self._failed: dict[int, str] = {}
         self._finished_count = 0
 
-        # Prefix-boundary state snapshots keyed by token tuple (74.81 MiB each at
-        # 27B), dropped with their store entry on eviction.
-        self._prefix_state: dict[tuple[int, ...], tuple[torch.Tensor, "torch.Tensor | None"]] = {}
-        prefix_store.on_evict = lambda tokens: self._prefix_state.pop(tokens, None)
-
         self._blocks_used = 0  # engine allocations outstanding (retains excluded)
         self._slots_used = 0
         self._prefix_hits = 0
@@ -357,9 +352,8 @@ class Engine:
                 self._finished_count += 1
                 return rid
 
-            matched, hit_blocks = self._match_prefix(tokens)
-            # Read the snapshot now: evict_until_free below can drop the matched entry.
-            snap = self._prefix_state[tuple(tokens[:matched])] if matched else None
+            # The hit carries its snapshot: evict_until_free below can drop the entry.
+            matched, hit_blocks, snap = self._match_prefix(tokens)
             if matched:
                 self._prefix_hits += 1
             else:
@@ -528,17 +522,16 @@ class Engine:
 
     # -------------------------------------------------------------- internals
 
-    def _match_prefix(self, tokens: list[int]) -> tuple[int, list[int]]:
-        """Longest block-aligned prefix hit with a snapshot, or (0, []); a full-length hit is a miss."""
+    def _match_prefix(self, tokens: list[int]) -> tuple[int, list[int], Any]:
+        """Longest block-aligned prefix hit as (length, blocks, snapshot), or (0, [], None);
+        a full-length hit is a miss."""
         hit = self._prefix.lookup(tokens)
         if hit is None:
-            return 0, []
+            return 0, [], None
         matched = (hit.length // BLOCK_TOKENS) * BLOCK_TOKENS
         if matched == 0 or matched >= len(tokens):
-            return 0, []
-        if tuple(tokens[:matched]) not in self._prefix_state:
-            return 0, []
-        return matched, list(hit.blocks[: matched // BLOCK_TOKENS])
+            return 0, [], None
+        return matched, list(hit.blocks[: matched // BLOCK_TOKENS]), hit.state
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0) -> BatchKv:
         # Table width = pool size: the kernels compile it in, so a per-tick width recompiles.
@@ -907,17 +900,15 @@ class Engine:
                 return
 
     def _publish_prefix(self, req: _Req, length: int) -> None:
-        """Insert tokens[:length] into the store (it retains the blocks) and
-        snapshot the request's linear state at that boundary."""
-        tokens = req.tokens[:length]
-        self._prefix.insert(tokens, req.blocks[: length // BLOCK_TOKENS])
-        key = tuple(tokens)
-        if key not in self._prefix_state:
-            self._prefix_state[key] = (
-                self._states.states[req.state_slot].clone(),
-                self._states.window_snapshot(req.state_slot),
-            )
-            self._prefix_published += 1
+        """Hand tokens[:length], its blocks and the linear-state snapshot at that
+        boundary to the store; the store owns and evicts all three together."""
+        snap = (
+            self._states.states[req.state_slot].clone(),
+            self._states.window_snapshot(req.state_slot),
+        )
+        self._prefix_published += self._prefix.insert(
+            req.tokens[:length], req.blocks[: length // BLOCK_TOKENS], snap
+        )
 
     def _finish(self, req: _Req, error: str | None = None) -> None:
         # Freed here, not at poll, so pool capacity returns immediately.

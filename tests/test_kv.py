@@ -348,3 +348,15 @@ def test_shared_prefix_fork_cow():
     pool.free_block(a0)
     assert pool.refcount[a0] == 1 and pool.refcount[a1] == 1  # store only
     assert pool.free_blocks == 6  # 8 total - 2 store-held
+
+
+def test_prefix_state_budget_evicts():
+    pool = PagedKvPool(4, 1, 4)
+    store = PrefixStore(pool, state_bytes=1000)
+    for i in range(3):
+        b = pool.alloc_block()
+        store.insert(list(range(16 * i, 16 * (i + 1))), [b], (torch.zeros(100), None))  # 400 B
+        pool.free_block(b)
+    assert store.stats()["entries"] == 2 and store.stats()["state_bytes"] == 800
+    assert store.lookup(list(range(16))) is None
+    assert store.lookup(list(range(16, 32))).state[0].shape == (100,)
