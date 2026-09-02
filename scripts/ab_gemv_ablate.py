@@ -48,17 +48,22 @@ SHAPES = [(34816, 5120, 64, "gate_up"), (5120, 17408, 64, "down"),
           (16384, 5120, 48, "qkvz"), (5120, 6144, 48, "gdn out"),
           (14336, 5120, 16, "qkv"), (5120, 6144, 16, "attn o")]
 MS = (1, 8, 32)
-ABLATIONS = [(1, "X_REUSE"), (2, "NO_SCALE"), (3, "NO_DECODE"), (4, "PIPELINE"), (5, "SMEM")]
-#: abl=4 and 5 are CORRECT (4 reorders, 5 moves X to shared memory), so they are
-#: both discriminators and candidate fixes; the harness checks their relerr.
-#: PIPELINE measured 0.99x at M=32 -- rejected, the cost is throughput not latency.
-#: SMEM THRESHOLD, committed before reading M=32: accept at >=1.30x with no M=1
-#: regression. The LDG ceiling is 2.92x assuming a free LDS read; below 1.30x
-#: means shared-memory reads ate the win and a new kernel is not worth it.
-#: relerr must be 0 for 4 and ~0 for 5 (same arithmetic, same order).
+ABLATIONS = [(1, "X_REUSE"), (2, "NO_SCALE"), (3, "NO_DECODE"), (4, "PIPELINE"),
+             (5, "SMEM"), (6, "NCOLS2")]
+#: 4, 5 and 6 are CORRECT variants, so they are both discriminators and candidate
+#: fixes; the harness checks their relerr. Measured so far: PIPELINE 0.99x (reorder
+#: -- the cost is throughput, not latency), SMEM 0.67x (swaps LDG for LDS and keeps
+#: the 1 load : 4 FMA ratio). NCOLS2 is the only variant that RAISES the ratio, to
+#: 1 : 16.
+#: NCOLS2 THRESHOLD, committed before reading M=32: accept at >=1.25x with no M=1
+#: regression. Below that, the loads-per-FMA family is closed -- this is its fourth
+#: attempt and a ratio change that does not pay leaves nothing else in it.
+#: Confirm from the cubin that HFMA2-per-load actually doubled before believing any
+#: timing: SMEM taught that a variant can do what it claims and still lose.
 PIPE_ACCEPT = 1.15
 SMEM_ACCEPT = 1.30
-CORRECT_ABL = (4, 5)
+NCOLS_ACCEPT = 1.25
+CORRECT_ABL = (4, 5, 6)
 BLK, NP = 32, 4
 FMA_PEAK = 31.3
 
@@ -108,15 +113,19 @@ def main() -> None:
 
     pipe = tot[(32, 0)] / tot[(32, 4)]
     smem = tot[(32, 0)] / tot[(32, 5)]
+    ncols = tot[(32, 0)] / tot[(32, 6)]
     reuse = tot[(32, 0)] / tot[(32, 1)]
     print(f"\nX_REUSE bounds X-related cost at {reuse:.2f}x (it also deletes 85% of the")
     print("LDGs -- a loop-invariant address is hoistable -- so read it as a ceiling).")
-    for lbl, g, acc in (("PIPELINE", pipe, PIPE_ACCEPT), ("SMEM", smem, SMEM_ACCEPT)):
+    for lbl, g, acc in (("PIPELINE", pipe, PIPE_ACCEPT), ("SMEM", smem, SMEM_ACCEPT),
+                        ("NCOLS2", ncols, NCOLS_ACCEPT)):
         print(f"  {lbl:<9} {g:.2f}x, {100 * (g - 1) / (reuse - 1):>5.1f}% of that headroom"
               f"   threshold {acc}x -> {'ACCEPT' if g >= acc else 'reject'}")
-    print("\nPIPELINE ~1.0x already showed the cost is throughput, not latency.")
-    print("SMEM removes loads instead: below 1.30x means shared-memory reads ate")
-    print("the win (same 128 B/cycle port) and the kernel is not worth its size.")
+    print("\nPIPELINE ~1.0x: the cost is throughput, not latency (reorder changes nothing).")
+    print("SMEM 0.67x: swapping LDG for LDS keeps 1 load : 4 FMA, and adds barriers.")
+    print("NCOLS2 is the only variant that raises the ratio (to 1 : 16). If it does")
+    print("not pay, the loads-per-FMA family is closed -- read HFMA2-per-load off the")
+    print("cubin first, because a variant can do what it claims and still lose.")
 
 
 if __name__ == "__main__":

@@ -802,6 +802,61 @@ __device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m_smem(
     acc[m] = fmaf(sc[0], __low2float(ah) + __high2float(ah), acc[m]);
   }
 }
+// ncols=2: one thread computes TWO output columns from one X load, so the
+// per-row ratio goes 2 loads : 8 FMA -> 2 loads : 16 FMA. That ratio is the only
+// thing measured to matter: reordering the loads (PIPELINE 0.99x), moving them to
+// shared memory (SMEM 0.67x), the block shape, the accumulator chain and the
+// register budget all preserved 1:4 and all failed, while the only variant that
+// beat the kernel deleted the loads outright
+// (errors/2026-09-03-smem-staging-is-slower-loads-per-fma-binds.md).
+//
+// X traffic halves; W traffic is unchanged (each column has its own n and its own
+// bytes, and half as many blocks run). Cost is a second decoded-weight set and a
+// second accumulator: ~+41 registers at M=32 against the shipped kernel's 255,
+// which is why this was held back until the staged kernel showed 127 was reachable.
+// The caller passes the two columns' WQ and scale pointers separately because they
+// are N-strided, not contiguous.
+template <int G, int M>
+__device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m_2col(
+    const void *wq0v, const void *wq1v, const void *xv, int K, int block_K,
+    const float *sc0, const float *sc1, float *acc0, float *acc1) {
+  const unsigned char *wq0 = (const unsigned char *)wq0v;
+  const unsigned char *wq1 = (const unsigned char *)wq1v;
+  const unsigned *x = (const unsigned *)xv;
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    unsigned a0, a1, b0, b1;
+    asm volatile("ld.global.nc.v2.u32 {%0,%1}, [%2];"
+                 : "=r"(a0), "=r"(a1) : "l"(wq0 + g * block_K / 2));
+    asm volatile("ld.global.nc.v2.u32 {%0,%1}, [%2];"
+                 : "=r"(b0), "=r"(b1) : "l"(wq1 + g * block_K / 2));
+    unsigned d0[4], d1[4], e0[4], e1[4];
+    tl_fp4_decode8_f16(a0, d0);
+    tl_fp4_decode8_f16(a1, d1);
+    tl_fp4_decode8_f16(b0, e0);
+    tl_fp4_decode8_f16(b1, e1);
+    for (int m = 0; m < M; ++m) {
+      unsigned xw[8];
+      const unsigned *xg = x + (size_t)m * (K / 2) + g * block_K / 2;
+      asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(xw[0]), "=r"(xw[1]), "=r"(xw[2]), "=r"(xw[3]) : "l"(xg));
+      asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(xw[4]), "=r"(xw[5]), "=r"(xw[6]), "=r"(xw[7]) : "l"(xg + 4));
+      unsigned p = 0u, q = 0u;  // the SAME xw feeds both columns
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(p) : "r"(xw[i]), "r"(d0[i]));
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(p) : "r"(xw[4 + i]), "r"(d1[i]));
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(q) : "r"(xw[i]), "r"(e0[i]));
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(q) : "r"(xw[4 + i]), "r"(e1[i]));
+      }
+      __half2 ph = __halves2half2(__ushort_as_half(p & 0xffff), __ushort_as_half(p >> 16));
+      __half2 qh = __halves2half2(__ushort_as_half(q & 0xffff), __ushort_as_half(q >> 16));
+      acc0[m] = fmaf(sc0[g], __low2float(ph) + __high2float(ph), acc0[m]);
+      acc1[m] = fmaf(sc1[g], __low2float(qh) + __high2float(qh), acc1[m]);
+    }
+  }
+}
 // M-row twin: WQ is loaded + decoded ONCE per tile and reused across all M
 // rows, so the weight bytes (the bottleneck — W is ~900x X for M=1) do not
 // scale with M. M is a compile-time template arg (the factory bakes it); the
@@ -1156,9 +1211,17 @@ def make_linear_fp4_gemv_sm70_m(
 
     5 = SMEM-staged X, also CORRECT: `X[0, base]` carries no `ni`, so all four
     n_partition groups load the SAME X and a block issues 4× redundant global
-    reads. One group stages the tile into shared memory. Removing loads is the
-    only thing 4's rejection leaves. Ceiling 2.92× from the LDG arithmetic if an
-    LDS read were free, which it is not — same 128 B/cycle port.
+    reads. One group stages the tile into shared memory. Measured **0.67×** —
+    ptxas vectorizes the staged words into `LDS.128`, so it swaps LDG for LDS
+    one-for-one and leaves the per-row ratio at 1 load : 4 FMA, then adds the
+    stage on top (errors/2026-09-03-smem-staging-is-slower-loads-per-fma-binds.md).
+
+    6 = ncols=2, CORRECT and the last member of this family: one thread computes
+    two output columns from one X load, taking the ratio to 1 load : 16 FMA. That
+    ratio is the only quantity measured to matter — eight mechanisms preserved it
+    and all failed. Halves the grid; costs a second decoded-weight set and a
+    second accumulator (~+41 registers at M=32), affordable because abl=5 showed
+    127 registers with no spills is reachable. Requires N even.
     """
     if abl and not xh:
         raise ValueError("abl requires xh=True: the ablations mirror the f16-X extern only")
@@ -1270,6 +1333,76 @@ def make_linear_fp4_gemv_sm70_m(
                     Y[m, n] = Res[m, n] + acc[m] * OScale[n]
         return Y
 
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def linear_fp4_gemv_sm70_m_2col(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
+        """abl=6: one thread over TWO output columns, so one X load feeds 16 FMAs
+        instead of 8. The grid halves; column pairs are (n, n + half) so each
+        thread's two W streams are far apart in N and neither is a partial tile."""
+        N, K = T.const("N, K")
+        micro = 16
+        block_K = reduce_thread * micro
+        num_ko = T.ceildiv(K, block_K)
+        num_g = num_ko // GROUP
+        s_dtype = "float16" if sh else "float32"
+        X: T.Tensor((M, K), "float16")
+        WQ: T.Tensor((N, K // 2), "uint8")
+        Scale: T.Tensor((N, K // block), s_dtype)
+        OScale: T.Tensor((N,), "float32")
+        Res: T.Tensor((M, N), "float32")
+        Y = T.empty((M, N), "float32")
+        half = N // 2
+        with T.Kernel(T.ceildiv(half, n_partition), threads=(reduce_thread, n_partition)) as bx:
+            T.import_source(_FP4_TWIDDLE_SRC_F16)
+            kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
+            ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
+            n0 = bx * n_partition + ni
+            n1 = n0 + half
+            a0 = T.alloc_local((M,), "float32")
+            a1 = T.alloc_local((M,), "float32")
+            for m in T.unroll(M):
+                a0[m] = 0.0
+                a1[m] = 0.0
+            s0 = T.alloc_local((GROUP,), "float32")
+            s1 = T.alloc_local((GROUP,), "float32")
+            for kg in T.serial(num_g):
+                base = kg * GROUP * block_K + kr * micro
+                for g in T.unroll(GROUP):
+                    s0[g] = Scale[n0, (base + g * block_K) // block]
+                    s1[g] = Scale[n1, (base + g * block_K) // block]
+                T.call_extern(
+                    f"tl_fp4_gemv_tiles_f16_m_2col<{GROUP},{M}>",
+                    T.access_ptr(WQ[n0, base // 2], "r"),
+                    T.access_ptr(WQ[n1, base // 2], "r"),
+                    T.access_ptr(X[0, base], "r"),
+                    K, block_K,
+                    T.access_ptr(s0, "r"), T.access_ptr(s1, "r"),
+                    T.access_ptr(a0, "rw"), T.access_ptr(a1, "rw"),
+                    dtype="void",
+                )
+            for kt in T.serial(num_ko - num_g * GROUP):
+                base = (num_g * GROUP + kt) * block_K + kr * micro
+                s0[0] = Scale[n0, base // block]
+                s1[0] = Scale[n1, base // block]
+                T.call_extern(
+                    f"tl_fp4_gemv_tiles_f16_m_2col<1,{M}>",
+                    T.access_ptr(WQ[n0, base // 2], "r"),
+                    T.access_ptr(WQ[n1, base // 2], "r"),
+                    T.access_ptr(X[0, base], "r"),
+                    K, block_K,
+                    T.access_ptr(s0, "r"), T.access_ptr(s1, "r"),
+                    T.access_ptr(a0, "rw"), T.access_ptr(a1, "rw"),
+                    dtype="void",
+                )
+            T.call_extern(f"tl_warp_reduce_m_f16<{M}>", T.access_ptr(a0, "rw"), dtype="void")
+            T.call_extern(f"tl_warp_reduce_m_f16<{M}>", T.access_ptr(a1, "rw"), dtype="void")
+            if kr == 0:
+                for m in T.unroll(M):
+                    Y[m, n0] = Res[m, n0] + a0[m] * OScale[n0]
+                    Y[m, n1] = Res[m, n1] + a1[m] * OScale[n1]
+        return Y
+
+    if abl == 6:
+        return linear_fp4_gemv_sm70_m_2col
     return linear_fp4_gemv_sm70_m
 
 
