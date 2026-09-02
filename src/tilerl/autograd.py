@@ -29,6 +29,8 @@ from typing import Any, Callable, Iterator
 
 import torch
 
+from . import precision
+
 __all__ = [
     "Tape",
     "AdamW",
@@ -503,7 +505,7 @@ class AdamW:
         pid = id(p)
         m = self._m.get(pid)
         if m is None:
-            m = torch.zeros(p.shape, dtype=torch.float32, device=p.device)
+            m = torch.zeros(p.shape, dtype=precision.dtype("optimizer_state"), device=p.device)
             v = torch.zeros_like(m)
             self._m[pid] = m
             self._v[pid] = v
@@ -591,8 +593,8 @@ class Adafactor:
         if st is None:
             if factored:
                 st = (
-                    torch.zeros(g.shape[0], dtype=torch.float32, device=g.device),
-                    torch.zeros(g.shape[1], dtype=torch.float32, device=g.device),
+                    torch.zeros(g.shape[0], dtype=precision.dtype("optimizer_state"), device=g.device),
+                    torch.zeros(g.shape[1], dtype=precision.dtype("optimizer_state"), device=g.device),
                 )
             else:
                 st = (torch.zeros_like(g),)

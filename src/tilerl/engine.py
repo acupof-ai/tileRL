@@ -56,6 +56,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from . import precision
 from .kv_cache import BLOCK_TOKENS, LinearStatePool, PagedKvPool, PrefixStore
 from .spec import survival, verify_lens
 
@@ -1254,9 +1255,7 @@ def build_engine(
         cfg.linear_num_value_heads,
         cfg.linear_value_head_dim,
         device=backend.device,
-        # sm90's fused GDN kernel is f32-IO: a bf16 pool cost two 1.5MB casts
-        # per layer per tick. +1.2 GiB at 16 slots on the 27B.
-        dtype=torch.float32 if backend.device.type == "cuda" else torch.bfloat16,
+        dtype=precision.dtype("recurrent_state", backend.device),
         conv_window=cfg.linear_conv_kernel_dim - 1,
         conv_dim=cfg.linear_qkv_dim,
         spec_steps=1 + spec_depth if draft is not None else 0,

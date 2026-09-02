@@ -31,6 +31,7 @@ import numpy as np
 import torch
 
 from .autograd import AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
+from .kv_cache import NoPrefixStore
 
 __all__ = ["train_step", "rl_step", "group_advantages", "grpo_loop",
            "opd_loop", "pretrain", "JsonlDataset"]
@@ -245,6 +246,15 @@ def rl_step(
     return _step(model, input_ids, backend, optimizer, tape, trainable, grad_fn)
 
 
+def _require_on_policy(engine: Any) -> None:
+    """A cached prefix or a captured decode graph samples from an earlier
+    policy without raising; refuse the engine instead of remembering."""
+    if engine._decode_graph_on is not False or not isinstance(engine._prefix, NoPrefixStore):
+        raise ValueError("on-policy rollouts need build_engine(decode_graph=False, "
+                         "prefix_store=NoPrefixStore()): a captured graph or a cached "
+                         "prefix samples from an earlier policy")
+
+
 def grpo_loop(
     engine: Any,
     model: Any,
@@ -288,6 +298,7 @@ def grpo_loop(
 
     from .engine import SamplingParams
 
+    _require_on_policy(engine)
     if optimizer is None:
         optimizer = AdamW(lr=1e-5)
     if sampling is None:
@@ -367,6 +378,8 @@ def opd_loop(
 
     from .engine import SamplingParams
 
+    if trainable is not None:  # a frozen teacher with no adapters cannot go stale
+        _require_on_policy(teacher_engine)
     if optimizer is None:
         optimizer = AdamW(lr=1e-3)
     if sampling is None:
