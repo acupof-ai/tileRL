@@ -48,7 +48,7 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
             "--group", "2", "--max-new-tokens", "4", "--lora-rank", "4"]
     code = _train(argv)
     (m,) = list_runs(tmp_path / "runs")
-    assert [g["name"] for g in m["gates"]] == ["reward_rises", "mmlu_holds", "gsm8k_improves"]
+    assert [g["name"] for g in m["gates"]] == ["reward_rises", "mmlu_holds", "gsm8k_improves", "groups_untied"]
     assert code == (0 if gates_pass(m) else 1)
     assert isinstance(m["metrics"]["gsm8k_before"], int)
     assert isinstance(m["metrics"]["gsm8k_after"], int)

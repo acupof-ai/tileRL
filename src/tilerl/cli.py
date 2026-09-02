@@ -201,7 +201,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             log(f"run {prev['id']} already finished; --force reruns")
             return _finish(prev, args.json)
         manifest["metrics"] = dict.fromkeys(("reward_first", "reward_last", "ce_last",
-                                             "secs_per_step_median", "mmlu_before", "mmlu_after",
+                                             "secs_per_step_median", "tied_group_fraction", "mmlu_before", "mmlu_after",
                                              "gsm8k_before", "gsm8k_after"))
         eval_rows = ([json.loads(ln) for ln in Path(args.eval_gsm8k).read_text().splitlines()
                       if ln.strip()][: args.eval_n] if args.eval_gsm8k else [])
@@ -251,12 +251,14 @@ def cmd_train(args: argparse.Namespace) -> None:
         hist = train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend,
                                    optimizer, group=args.group, sampling=sampling,
                                    seed=args.seed, trainable=trainable)
-        for i, (r, ce, secs) in enumerate(hist):
-            log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  {secs:.1f}s")
+        for i, (r, ce, secs, tied) in enumerate(hist):
+            log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
+                f"tied {tied:.2f}  {secs:.1f}s")
         evals(engine, "after")
         manifest["metrics"].update(
             reward_first=hist[0][0], reward_last=hist[-1][0], ce_last=hist[-1][1],
-            secs_per_step_median=statistics.median(s for *_, s in hist))
+            secs_per_step_median=statistics.median(h[2] for h in hist),
+            tied_group_fraction=statistics.mean(h[3] for h in hist))
         return _finish(manifest, args.json)
     if args.opd:
         from .engine import build_engine
@@ -269,8 +271,13 @@ def cmd_train(args: argparse.Namespace) -> None:
         draft = load_draft(model, args.draft) if args.draft else None
         # Engine first: build_engine materializes the params, and an adapter
         # created before that points at an object the forward no longer reads.
+        # Prefix cache and captured graph off, as for GRPO: both would sample
+        # from an earlier policy without raising.
+        from .kv_cache import NoPrefixStore
+
         teacher = build_engine(cfg, model, backend, num_blocks=512, num_slots=8,
-                               draft=draft, spec_depth=args.depth)
+                               draft=draft, spec_depth=args.depth,
+                               decode_graph=False, prefix_store=NoPrefixStore())
         trainable = add_lora(model, rank=args.lora_rank)
         evals(teacher, "before")
         losses = train_mod.opd_loop(teacher, model, prompts, args.steps, backend, optimizer,
@@ -306,6 +313,7 @@ def _finish(m: dict, as_json: bool) -> None:
                 ("reward_rises", g["reward_last"], g["reward_first"], lambda v, t: v > t),
                 ("mmlu_holds", g["mmlu_after"], mmlu_floor, lambda v, t: v >= t),
                 ("gsm8k_improves", g["gsm8k_after"], g["gsm8k_before"], lambda v, t: v > t),
+                ("groups_untied", g["tied_group_fraction"], 0.5, lambda v, t: v < t),
             )]
         m["finished"] = now()
         write_manifest(runs_root(), m)
