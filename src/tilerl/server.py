@@ -247,6 +247,12 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=finish))
         yield "data: [DONE]\n\n"
 
+    # Anthropic Messages: what Claude Code speaks. Same engine, same tokenizer;
+    # it records token ids per request, which the OpenAI route does not.
+    from .messages import mount_messages
+
+    mount_messages(app, engine, tokenizer, model_name)
+
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         return _CHAT_UI
