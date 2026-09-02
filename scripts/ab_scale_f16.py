@@ -10,11 +10,16 @@ Two questions in one run, because the pod takes one job at a time:
    the average says whether the GEMV's gap to its own byte roofline is a tail
    (one huge-N shape) or uniform (occupancy / issue rate).
 
-Shapes and counts are the real ones (counted off the safetensors), so the
-weighted total is the actual per-token GEMV cost, not a shape average. Note the
-absolute times carry an eager-launch floor (~60 us regardless of shape) that the
-graph-captured decode path does not pay — trust the ratio, and take tok/s from
-bench_ctx_decode.py.
+Shapes are DERIVED from param_specs + _projection_groups (see ``shapes``), not
+written down: serving fuses projections, and the hand-written table this replaced
+had three wrong rows while still reproducing the byte total.
+
+The absolute times carry an eager-launch floor (~60 us regardless of shape) that
+the graph-captured decode path does not pay, and that floor dominates the small-N
+rows — read the RATIO here and take per-shape cost from prof_decode_budget.py.
+In the captured graph the GEMV runs at 746 GB/s, 83% of peak; this harness read
+58% off the same kernel (errors/2026-09-02-per-shape-gap-was-a-wrong-shape-
+table.md).
 
   scripts/v100.sh run sc '/usr/bin/python3 -u scripts/ab_scale_f16.py'
 """
@@ -35,19 +40,42 @@ import benchkit as bk  # noqa: E402
 from tilerl_kernels import kernels_linear  # noqa: E402
 from tilerl_kernels.backend import get_backend  # noqa: E402
 
-#: (N, K, count, label) — every fp4 shape in the trunk + lm_head, with how many
-#: times a dense token streams it. Counted from the checkpoint, so sum(N*K/2*c)
-#: is the real 12.81 GB nibble stream.
-SHAPES = [
-    (17408, 5120, 128, "mlp gate/up"),
-    (5120, 17408, 64, "mlp down"),
-    (10240, 5120, 48, "gdn qkv"),
-    (5120, 6144, 64, "gdn out"),
-    (6144, 5120, 48, "gdn z"),
-    (248320, 5120, 1, "lm_head"),
-    (12288, 5120, 16, "attn qkv"),
-    (1024, 5120, 32, "attn o"),
-]
+
+def shapes() -> list[tuple[int, int, int, str]]:
+    """(N, K, launches/token, label) for every fp4 GEMV a dense token issues.
+
+    Derived from param_specs + _projection_groups rather than restated: serving
+    runs with fuse_projections, so a hand-written table is wrong the moment a
+    group changes. The hand-written one was wrong in three rows at once and
+    still passed a byte-total assert (errors/2026-09-02-per-shape-gap-was-a-
+    wrong-shape-table.md).
+    """
+    from collections import Counter
+
+    from tilerl.config import qwen38_27b
+    from tilerl.model import _projection_groups, param_specs
+
+    cfg = qwen38_27b()
+    specs = param_specs(cfg)
+    fused = {}  # member key -> its group's key, so members are counted once
+    for i in range(cfg.num_layers):
+        for key, group in _projection_groups(cfg, i):
+            rows = sum(specs[m][0] for m in group)
+            specs[key] = (rows, specs[group[0]][1])
+            fused.update(dict.fromkeys(group, key))
+
+    # Only 2D fp4 linears stream nibbles; norms/conv1d/embed are not GEMVs.
+    skip = ("norm", "conv1d", "dt_bias", "a_log", "embed_tokens")
+    hits = Counter()
+    for key, shape in specs.items():
+        if key in fused or len(shape) != 2 or key.endswith(skip):
+            continue
+        hits[(shape[0], shape[1], key.split(".")[-1])] += 1
+    return sorted(
+        ((n, k, c, lab) for (n, k, lab), c in hits.items()), key=lambda r: -r[0] * r[1] * r[2]
+    )
+
+
 BLK = 32  # the served checkpoint's scale block
 M = 1  # decode
 
@@ -59,9 +87,12 @@ def main() -> None:
     k16 = kernels_linear.make_linear_fp4_gemv_sm70_m(be.target, M=M, xh=True, sh=True)
 
     print(f"# sm70 fp4 GEMV, M={M}, block={BLK}: f32 vs f16 block scales")
-    print(f"{'shape':>22} {'x':>4} {'GB/tok':>7} {'f32 us':>8} {'f16 us':>8} "
-          f"{'gain':>6} {'GB/s':>6} {'roof%':>6} {'relerr':>9}")
+    print(
+        f"{'shape':>22} {'x':>4} {'GB/tok':>7} {'f32 us':>8} {'f16 us':>8} "
+        f"{'gain':>6} {'GB/s':>6} {'roof%':>6} {'relerr':>9}"
+    )
     t32 = t16 = b32 = b16 = nib_tot = 0.0
+    SHAPES = shapes()
     for N, K, cnt, label in SHAPES:
         g = torch.Generator(device="cpu").manual_seed(N * 131 + K)
         wq = torch.randint(0, 255, (N, K // 2), dtype=torch.uint8, generator=g).to(dev)
@@ -91,15 +122,23 @@ def main() -> None:
         b16 += by16 * cnt
         nib_tot += nib * cnt
         gbs = by16 / u16 / 1e6  # the f16 path is the candidate
-        print(f"{label + f' {N}x{K}':>22} {cnt:>4} {by32 * cnt / 1e9:>7.2f} "
-              f"{u32 * 1000:>8.1f} {u16 * 1000:>8.1f} {u32 / u16:>5.2f}x "
-              f"{gbs:>6.0f} {100 * gbs / 900:>5.0f}% {rel:>9.2e}")
+        print(
+            f"{label + f' {N}x{K}':>22} {cnt:>4} {by32 * cnt / 1e9:>7.2f} "
+            f"{u32 * 1000:>8.1f} {u16 * 1000:>8.1f} {u32 / u16:>5.2f}x "
+            f"{gbs:>6.0f} {100 * gbs / 900:>5.0f}% {rel:>9.2e}"
+        )
 
-    # The shape table must reproduce the checkpoint's nibble total, or the
-    # weighted per-token numbers below are weighting the wrong thing.
+    # Assert the DISTRIBUTION, not just the total: the per-shape rows are the
+    # output, and a table can reproduce 12.81 GB while getting three rows wrong
+    # (the errors cancelled — attn o 168 MB short, gdn out 252 MB long). The
+    # launch count is what caught it: 401 written vs 305 in the profiler.
+    launches = sum(c for _, _, c, _ in SHAPES)
     assert abs(nib_tot / 1e9 - 12.81) < 0.02, f"nibbles {nib_tot / 1e9:.2f} GB != 12.81"
-    print(f"\nper-token GEMV: {t32:.2f} -> {t16:.2f} ms ({t32 / t16:.2f}x), "
-          f"weights {b32 / 1e9:.2f} -> {b16 / 1e9:.2f} GB")
+    assert launches == 305, f"{launches} GEMV launches/token, profiler measures 305"
+    print(
+        f"\nper-token GEMV: {t32:.2f} -> {t16:.2f} ms ({t32 / t16:.2f}x), "
+        f"weights {b32 / 1e9:.2f} -> {b16 / 1e9:.2f} GB"
+    )
     print(f"  f32 {b32 / t32 / 1e6:.0f} GB/s, f16 {b16 / t16 / 1e6:.0f} GB/s of 900 peak")
 
 
