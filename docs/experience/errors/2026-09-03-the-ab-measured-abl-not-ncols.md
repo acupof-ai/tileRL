@@ -56,7 +56,13 @@ reading the call site, not explaining the number.
 
 The parity signal was in the same output and I nearly missed it: **first-token id
 was 0 in every arm at every context**. Greedy argmax over a 27B's real logits does
-not return id 0 three times. Two independent tells, one ignored.
+not return id 0 three times.
+
+Except it does, here — the corrected run read 0 as well, on kernels whose text is
+provably right. The prompts are synthetic (`range(base, base+ctx)`), so the ids were
+never a check at all: they read the same for a correct and an incorrect kernel. That
+is worse than a missed tell, and the fix is `scripts/parity_ncols.py`, which decodes
+real greedy continuations at M=1 and M>8 and compares them between arms.
 
 ## Root cause
 
@@ -91,6 +97,8 @@ it against its recorded number before reading the delta.** The comparison betwee
 the two arms was internally consistent and entirely fictional. One arm had a
 published value; checking it is what ended this.
 
-Third: **a wrong-number bug usually leaves a correctness tell in the same output.**
-The first-token ids were all 0 in a run whose purpose was timing. Look at the
-non-timing columns before believing the timing ones.
+Third: **a bench's correctness column is worth exactly what its input is.** The
+first-token ids looked like a free parity check sitting in the timing output, and
+they were noise — synthetic prompts, id 0 either way. A wrong-number bug does leave
+tells, but only in an output that could have differed; here that took a second
+script decoding real text.

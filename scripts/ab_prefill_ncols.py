@@ -11,9 +11,10 @@ Both variants are compiled and cached (the kernel cache keys on nc), and each ct
 is measured nc=2, nc=1, nc=2 so a monotone drift shows up as the two nc=2 readings
 disagreeing rather than as a fake gain.
 
-Also prints the first sampled token id per arm: ncols=2 pairs output column j with
-j + N/2, so a pairing bug is a wrong-number bug, and greedy ids diverging is the
-cheapest end-to-end signal for it on the real checkpoint.
+TIMING ONLY. The token ids this prints are NOT a correctness check: the prompts are
+synthetic (`range(base, base+ctx)`), and greedy over their logits returned id 0 in
+every arm at every context -- including the run whose kernels were deliberately
+wrong. Real text parity lives in scripts/parity_ncols.py; run it too.
 
   scripts/v100.sh run pfab2 'CKPT=...; /usr/bin/python3 -u scripts/ab_prefill_ncols.py \
       --source $CKPT'
@@ -41,8 +42,8 @@ CTXS = (512, 2048, 4096)
 ARMS = (2, 1, 2)
 
 
-def one(e, ctx: int, seq: int) -> tuple[float, int, int]:
-    """Time submit-to-first-token and return (ms, ticks, first token id)."""
+def one(e, ctx: int, seq: int) -> tuple[float, int]:
+    """Time submit-to-first-token and return (ms, prefill ticks)."""
     base = 10 + seq * 100000 + ctx  # distinct tokens: a repeat would hit the prefix cache
     rid = e.submit(list(range(base, base + ctx)),
                    SamplingParams(temperature=0.0, max_new_tokens=1, seed=0))
@@ -58,10 +59,10 @@ def one(e, ctx: int, seq: int) -> tuple[float, int, int]:
     ms = (time.perf_counter() - t0) * 1000
     ticks = e.stats()["prefill_forwards"] - s0["prefill_forwards"]
     out = None
-    while out is None:
+    while out is None:  # drain so the slot frees
         e.step()
         out = e.poll().get(rid)
-    return ms, ticks, (out[0] if out else -1)
+    return ms, ticks
 
 
 def main() -> None:
@@ -85,23 +86,21 @@ def main() -> None:
             seq += 1
 
     print(f"\n# in-process ncols A/B, {'ctx':>6} " +
-          " ".join(f"{'nc' + str(nc) + ' ms/tok':>13}" for nc in ARMS) + f" {'tok id':>18}")
+          " ".join(f"{'nc' + str(nc) + ' ms/tok':>13}" for nc in ARMS))
     for ctx in CTXS:
-        best, ids = [], []
+        best = []
         for nc in ARMS:
             bk_mod._NCOLS = nc
             b = None
             for _ in range(args.reps):
-                ms, ticks, tid = one(e, ctx, seq)
+                ms, ticks = one(e, ctx, seq)
                 seq += 1
                 b = ms if b is None or ms < b else b
             best.append(b / ctx)
-            ids.append(tid)
-        print(f"{'':>19} {ctx:>6} " + " ".join(f"{v:>13.2f}" for v in best) +
-              f"   {'/'.join(str(i) for i in ids):>15}")
+        print(f"{'':>19} {ctx:>6} " + " ".join(f"{v:>13.2f}" for v in best))
         print(f"{'':>26} ticks {ticks}, nc2 self-consistency "
-              f"{best[0] / best[2]:.3f}x, nc1/nc2 {best[1] / best[0]:.3f}x"
-              f"{'  !! IDS DIFFER' if len(set(ids)) > 1 else ''}")
+              f"{best[0] / best[2]:.3f}x, nc1/nc2 {best[1] / best[0]:.3f}x")
+    print("\nTiming only -- correctness is scripts/parity_ncols.py (real text, greedy).")
 
 
 if __name__ == "__main__":
