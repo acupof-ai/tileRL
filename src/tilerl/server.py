@@ -183,6 +183,10 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         # OpenAI's shape: one entry per emitted token, decoded alongside its
         # score. A forced end-think token was never sampled and carries NaN,
         # which is not JSON — report it as null rather than a made-up number.
+        # The scores cover every SAMPLED token, reasoning included, while
+        # message.content above is the stripped display text: the two are
+        # deliberately different lengths. Truncating this list to match the
+        # text would break the RL join, which scores what was sampled.
         scores = engine.logprobs(request_id) if req.logprobs else None
         content = None if scores is None else [
             {"token": tokenizer.decode([tid]), "logprob": None if lp != lp else lp}
