@@ -20,17 +20,21 @@ def _f32(x: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------- rmsnorm
 
 
-def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-    """y = x * rsqrt(mean(x^2, -1) + eps) * w.  x [..., N], w [N]."""
+def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float, narrow: bool = False) -> torch.Tensor:
+    """y = x * rsqrt(mean(x^2, -1) + eps) * w.  x [..., N], w [N].
+    ``narrow`` is the backend's output-dtype hint; the reference stays f32, which
+    is what makes it the parity target."""
     x = _f32(x)
     var = x.pow(2).mean(-1, keepdim=True)
     return x * torch.rsqrt(var + eps) * w
 
 
 def rmsnorm_bwd(
-    grad: torch.Tensor, x: torch.Tensor, w: torch.Tensor, eps: float
+    grad: torch.Tensor, x: torch.Tensor, w: torch.Tensor, eps: float, narrow: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Backward of :func:`rmsnorm`. Returns (gx, gw)."""
+    """Backward of :func:`rmsnorm`. Returns (gx, gw).
+    ``narrow`` is the forward's output-dtype hint, replayed by the tape verbatim
+    and irrelevant to the gradient."""
     x = _f32(x)
     grad = _f32(grad)
     rstd = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)

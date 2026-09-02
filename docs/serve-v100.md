@@ -68,20 +68,49 @@ passed `num_blocks` explicitly — so this was unexercised until now. 2048 block
 For 8K context: `--blocks 4096 --max-ctx 8192` (8.6 GB). Above that you are
 trading against the weights.
 
-## The memory budget, since it is tight
+## How long a context fits, and what buys more
 
-| what | GiB |
-|---|---:|
-| fp4 body (64 layers, nibbles + f16 scales) | 14.17 |
-| lm_head (fp4, 248320×5120) | 0.74 |
-| embedding table (f16 — f32 was 4.74) | 2.37 |
-| KV pool @ `--blocks 2048` | 4.20 |
-| **total before activations** | **21.48** |
+The limit is KV bytes, not the model. One 16-token block holds f32 K and V for 16
+full-attention layers × 4 KV heads × head_dim 256 = **2.00 MiB**, and the pool has
+to cover `max_batch` rows of the context you admit.
 
-Of 31.74 usable. The table is f16 on this card and not f32 because the f32 copy
-plus the bf16 original was 7.11 GiB for one tensor and OOMed on the first token —
-`--blocks` alone did not fix it. Raise `--blocks` against that headroom, not
-against 32.
+Headroom after weights, states and allocator slack is about **7.5 GiB**:
+
+| ctx | blocks @ max_batch 2 | f32 pool | fits |
+|---:|---:|---:|:--|
+| 4096 | 512 | 1.00 GiB | yes |
+| 8192 | 1024 | 2.00 GiB | yes |
+| 16384 | 2048 | 4.00 GiB | yes |
+| 32768 | 4096 | 8.00 GiB | no, just over |
+| 65536 | 8192 | 16.00 GiB | no |
+
+So **16K works today** with `--max-ctx 16384 --blocks 2048`, and 32K needs one of
+the levers below. Note `--max-batch` multiplies all of it: dropping 8 → 2 is what
+moved the ceiling from 4K to 16K, and `--max-batch 1` doubles it again.
+
+Three levers, cheapest first:
+
+1. **`--max-batch 1`** — halves the pool, so 32K fits. Free for one person; costs
+   concurrency you were not using.
+2. **An f16 KV pool** — halves the block to 1.00 MiB, so 32K costs 4 GiB and 64K
+   costs 8. This is the real fix and it is *not* free: the pool dtype IS the
+   attention kernel's ABI (`wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi.md` —
+   a bf16 pool against the f32 kernel cast the whole plane every call, 4.71
+   ms/token). It needs an f16 `paged_attention_split`, its own parity run, and a
+   check that f16 K/V does not degrade long-range attention. Not done.
+3. **`--kv-tier <dir>`** — spill cold blocks to disk (`KvTier`, wired to `serve`
+   here). Trades prefix hit rate for capacity, so it suits long documents that
+   get re-read rather than one long generation. The engine path is tested; the
+   capacity it buys on this card is unmeasured.
+
+The table above is arithmetic from the block size, not a measured sweep — 4K is
+the only row actually served end to end so far. Treat the rest as what to try,
+and expect the allocator to want more slack than the ideal number.
+
+Not a lever: the GDN layers. 48 of the 64 layers are gated-delta and carry a
+fixed-size recurrent state, so their cost does not grow with context at all —
+which is why this model's context is cheaper than a 64-layer full-attention model
+of the same size.
 
 ## 3. Open it
 

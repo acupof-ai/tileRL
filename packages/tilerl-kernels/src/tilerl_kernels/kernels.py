@@ -73,8 +73,10 @@ def make_rmsnorm_apply(target: str):
     return rmsnorm_apply
 
 
-def make_rmsnorm_apply_bf16(target: str):
-    """make_rmsnorm_apply writing bf16 (sm90: the consumer GEMVs are bf16-IO)."""
+def make_rmsnorm_apply_bf16(target: str, out_dtype: str = "bfloat16"):
+    """make_rmsnorm_apply narrowing its output to the consumer GEMV's IO dtype:
+    bfloat16 on sm90, float16 on sm70. Producing it here removes a separate cast
+    of the same bytes at the GEMV's dispatch (193 launches/token on the 27B)."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def rmsnorm_apply(X, W, P, eps: T.float32, block_N, num_chunks, threads):
@@ -82,7 +84,7 @@ def make_rmsnorm_apply_bf16(target: str):
         X: T.Tensor((M, N), "float32")
         W: T.Tensor((N,), "float32")
         P: T.Tensor((M, num_chunks), "float32")
-        Y = T.empty((M, N), "bfloat16")
+        Y = T.empty((M, N), out_dtype)
         with T.Kernel(M, T.ceildiv(N, block_N), threads=threads) as (row, bn):
             var = T.alloc_fragment((1,), "float32")
             var[0] = 0.0
@@ -92,7 +94,7 @@ def make_rmsnorm_apply_bf16(target: str):
             for k in T.Parallel(block_N):
                 kk = bn * block_N + k
                 if kk < N:
-                    Y[row, kk] = T.cast(X[row, kk] * rstd * W[kk], "bfloat16")
+                    Y[row, kk] = T.cast(X[row, kk] * rstd * W[kk], out_dtype)
         return Y
 
     return rmsnorm_apply
@@ -363,21 +365,22 @@ def make_silu_mul(target: str):
     return silu_mul
 
 
-def make_silu_mul_bf16(target: str):
-    """make_silu_mul writing bf16 (sm90: f32 in from the GEMV, bf16 out for the down GEMV)."""
+def make_silu_mul_bf16(target: str, out_dtype: str = "bfloat16"):
+    """make_silu_mul narrowing its output to the consumer GEMV's IO dtype: f32 in
+    from the up/gate GEMV, bfloat16 (sm90) or float16 (sm70) out for down."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def silu_mul(Gate, Up, block_M, threads):
         M = T.const("M")
         Gate: T.Tensor((M,), "float32")
         Up: T.Tensor((M,), "float32")
-        Y = T.empty((M,), "bfloat16")
+        Y = T.empty((M,), out_dtype)
         with T.Kernel(T.ceildiv(M, block_M), threads=threads) as bx:
             for i in T.Parallel(block_M):
                 idx = bx * block_M + i
                 if idx < M:
                     s = T.sigmoid(Gate[idx])
-                    Y[idx] = T.cast(Gate[idx] * s * Up[idx], "bfloat16")
+                    Y[idx] = T.cast(Gate[idx] * s * Up[idx], out_dtype)
         return Y
 
     return silu_mul

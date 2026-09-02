@@ -429,4 +429,7 @@ def test_serve_sizes_its_pools_from_the_flags_not_the_context():
     assert e.limits.max_batch == 2
 
     d = cli._build_engine(cfg, model, be)
-    assert d._kv.num_blocks == (4096 * 8) // BLOCK_TOKENS, "default still tracks the context"
+    assert d._kv.num_blocks == (4096 * d.limits.max_batch) // BLOCK_TOKENS, (
+        "the default pool must cover max_batch rows of the context — no more "
+        "(bytes are the long-context limit) and no less (a full batch must fit)"
+    )

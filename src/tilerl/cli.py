@@ -47,7 +47,7 @@ def _build_model(
 
 
 def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16,
-                  blocks=0, max_ctx=0, max_batch=2):
+                  blocks=0, max_ctx=0, max_batch=2, kv_tier=None):
     """Serving-size engine; ``devices`` replicates it across those CUDA indices.
 
     ``draft``: an MTP/NextN head safetensors path (or the checkpoint shard that
@@ -66,6 +66,11 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
     ``max_batch`` 2 suits a single-user endpoint: it bounds admitted rows, and a
     decode graph is captured per (bucket, chain width), so a smaller ceiling is
     fewer captures to warm and less to hold.
+
+    The block default follows max_batch, not a hardcoded 8 — the pool only has to
+    hold the rows that can be admitted at once. At max_batch 2 that halves the
+    footprint against the old formula and quarters it against a batch of 8, which
+    is the whole difference between serving 8K and 32K on this card.
     """
     from . import engine as engine_mod
     from .kv_cache import BLOCK_TOKENS
@@ -73,8 +78,10 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
     # Token budget follows the context; ByteTokenizer makes one token per byte.
     ctx = int(max_ctx or cfg.max_position_embeddings)
 
-    kw = dict(num_blocks=blocks or max(256, (ctx * 8) // BLOCK_TOKENS), num_slots=slots,
+    kw = dict(num_blocks=blocks or max(256, (ctx * max_batch) // BLOCK_TOKENS), num_slots=slots,
               max_batch=max_batch, max_total_tokens=ctx)
+    if kv_tier:
+        kw["kv_tier_path"] = kv_tier
     if draft is not None:
         kw["draft"], kw["spec_depth"] = draft, depth
     if not devices:
@@ -109,7 +116,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     engine = _build_engine(cfg, model, backend, devices=args.devices,
                            draft=draft, depth=args.depth, slots=args.slots,
                            blocks=args.blocks, max_ctx=args.max_ctx,
-                           max_batch=args.max_batch)
+                           max_batch=args.max_batch, kv_tier=args.kv_tier)
     tokenizer = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
@@ -482,6 +489,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.add_argument("--max-ctx", type=int, default=0,
                          help="cap served context (0 = the model's own limit); pairs with "
                               "--blocks so a request cannot outgrow the pool")
+    p_serve.add_argument("--kv-tier", default="",
+                         help="directory to spill cold KV blocks to; trades prefix hit rate for "
+                              "context capacity on a card whose pool is the limit")
     p_serve.add_argument("--max-batch", type=int, default=2,
                          help="concurrent rows; 2 suits a single-user endpoint (a decode "
                               "graph is captured per bucket x chain width, so a lower "

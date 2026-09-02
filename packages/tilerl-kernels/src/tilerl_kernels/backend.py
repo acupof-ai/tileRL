@@ -164,6 +164,10 @@ class Backend:
         self.embed_io = {"sm90": torch.bfloat16, "sm70": torch.float16}.get(
             self.arch, torch.float32
         )
+        # The dtype the fp4 GEMV reads X in. sm70's twiddled ladder is f16, so an
+        # elementwise op feeding a linear can write f16 and skip the dispatch's
+        # cast; everything else keeps io.
+        self.gemv_io = torch.float16 if self.arch == "sm70" else self.io
         self._kernels: dict[str, object] = {}
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
         self._const_f32_cache: dict[tuple[int, int | None], tuple[Any, int, torch.Tensor]] = {}
@@ -225,7 +229,16 @@ class Backend:
             self._inv_freq_cache[key] = inv
         return inv
 
-    def _rows(self, x: torch.Tensor):
+    def _rows(self, x: torch.Tensor, keep_f16: bool = False):
+        """(leading shape, 2-D contiguous rows at this cell's IO dtype).
+
+        ``keep_f16`` leaves an f16 input alone: the sm70 GEMV wants X in f16, so
+        widening it to io (f32) here only to narrow it again at the launch is two
+        passes over the same bytes — 305 of them per token on the 27B. The
+        elementwise kernels that produce X now emit f16 directly.
+        """
+        if keep_f16 and x.dtype == torch.float16 and x.device == self.device:
+            return x.shape[:-1], self._c(x.reshape(-1, x.shape[-1]))
         return x.shape[:-1], self._c(self._dev(x, self.io).reshape(-1, x.shape[-1]))
 
     def _epilogue(self, y2, oscale, lead, n: int):
@@ -260,7 +273,12 @@ class Backend:
 
     # ------------------------------------------------------------ rmsnorm
 
-    def rmsnorm(self, x, w, eps):
+    def rmsnorm(self, x, w, eps, narrow: bool = False):
+        """``narrow``: the caller feeds the result straight to a linear, so let
+        the kernel write the GEMV's own IO dtype instead of f32 that the dispatch
+        would narrow anyway. Off by default — q_norm/k_norm feed rope and
+        attention, which are f32, and round-tripping through f16 there would drop
+        13 mantissa bits for nothing."""
         x = self._f32(x)
         w = self._const_f32(w)
         lead = x.shape[:-1]
@@ -272,10 +290,13 @@ class Backend:
         block_N = min(256, N)
         num_chunks = (N + block_N - 1) // block_N
         p = self._kernel("rmsnorm_partial")(x2, block_N, num_chunks, _THREADS)
-        y = self._kernel("rmsnorm_apply")(x2, w, p, float(eps), block_N, num_chunks, _THREADS)
+        key = "rmsnorm_apply_narrow" if narrow and self.gemv_io != torch.float32 else "rmsnorm_apply"
+        y = self._kernel(key)(x2, w, p, float(eps), block_N, num_chunks, _THREADS)
         return y.reshape(*lead, w.shape[0])
 
-    def rmsnorm_bwd(self, grad, x, w, eps):
+    def rmsnorm_bwd(self, grad, x, w, eps, narrow: bool = False):
+        # narrow is a forward-only output-dtype choice; the tape replays the
+        # forward's kwargs verbatim, so it has to be accepted and ignored here.
         grad = self._f32(grad)
         x = self._f32(x)
         w = self._f32(w)
@@ -405,7 +426,9 @@ class Backend:
         # always arrive together on the shipped path.
         sh = scale.dtype == self.scale_io == torch.float16
         scale = scale if sh else self._f32(scale)
-        lead, x2 = self._rows(x)
+        # Keep an f16 X: the twiddled sm70 ladder below is the only consumer and
+        # it wants f16 anyway. Every other branch takes io (f32) as before.
+        lead, x2 = self._rows(x, keep_f16=self.arch == "sm70")
         M, K, N = x2.shape[0], x2.shape[1], wq.shape[0]
         blk = K // scale.shape[1]  # the checkpoint's scale block (16 or 32)
         # M-row GEMV on the M=1 plan (the decode plan's n_partition is a 4096-thread block).
@@ -468,6 +491,11 @@ class Backend:
             y = self._epilogue(y2, None, lead, N)
             return y if residual is None else y + residual
         plan = self._plan("linear_fp4", M, N, K)
+        # Past the twiddled ladder every kernel is f32-IO. keep_f16 above may have
+        # handed us f16 rows (sm70 with a narrow producer), so widen once here
+        # rather than at each of the four branches below.
+        if x2.dtype != self.io:
+            x2 = self._dev(x2, self.io)
         if plan is not None:
             kernel, Mp, Np, Kp, bM, bN = plan
             wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)

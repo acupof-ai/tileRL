@@ -97,6 +97,13 @@ _register("fp4", "sm90", _SM90_KERNELS)
 # dead — the cell is the CPU f32 floor plus the kernels that also run on Volta.
 _SM70_KERNELS = {
     **_CPU_KERNELS,
+    # Narrow variants for the elementwise ops whose output feeds a GEMV: the sm70
+    # GEMV wants X in f16 and used to cast it at dispatch — one cast per launch,
+    # over bytes rmsnorm/silu_mul had just written. Producing f16 at the source
+    # removes 193 of the 305 casts a dense token pays. Separate keys, not a
+    # replacement: q_norm/k_norm feed rope and attention, which are f32.
+    "rmsnorm_apply_narrow": lambda t: kernels.make_rmsnorm_apply_bf16(t, out_dtype="float16"),
+    "silu_mul": lambda t: kernels.make_silu_mul_bf16(t, out_dtype="float16"),
     "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv_sm70,
     # M-row ladder (decode/verify M<=8, prefill M=32) as ONE entry: M/xh/sh are
     # factory args and Backend._kernel keys the compile cache on them, so a
