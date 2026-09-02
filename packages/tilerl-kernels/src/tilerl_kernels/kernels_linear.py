@@ -963,7 +963,8 @@ def make_linear_fp4_gemv_sm70(target: str, GROUP: int = 4):
 
 
 def make_linear_fp4_gemv_sm70_m(
-    target: str, M: int = 8, GROUP: int = 4, xh: bool = False, sh: bool = False
+    target: str, M: int = 8, GROUP: int = 4, xh: bool = False, sh: bool = False,
+    min_blocks: int = 0,
 ):
     """M-row (decode-batch) twin of make_linear_fp4_gemv_sm70.
 
@@ -979,6 +980,13 @@ def make_linear_fp4_gemv_sm70_m(
 
     ``sh`` narrows the Scale plane to f16 in global memory only — the tile loop
     still hands the extern f32, so the dequant math is untouched.
+
+    ``min_blocks`` raises ``__launch_bounds__``'s minBlocksPerSM, which is the
+    only handle on the register budget: tilelang defaults to 1, so ptxas takes
+    all 255 registers and 128 threads x 255 leaves ONE block per SM — 4 of
+    Volta's 64 warps, 6.25% occupancy, which is what caps M=32 at 17.6% of peak
+    (the FMA, L1-bandwidth and issue ceilings are all 2.5x above it). 4 halves
+    registers to 128 (4 blocks/SM) at 180 bytes of spill; 0 keeps the default.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
@@ -1001,6 +1009,8 @@ def make_linear_fp4_gemv_sm70_m(
         Y = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, n_partition), threads=(reduce_thread, n_partition)) as bx:
             T.import_source(_FP4_TWIDDLE_SRC_F16)
+            if min_blocks:
+                T.annotate_min_blocks_per_sm(min_blocks)
             kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
             ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
             n = bx * n_partition + ni
