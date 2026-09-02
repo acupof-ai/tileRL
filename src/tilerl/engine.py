@@ -422,6 +422,19 @@ class Engine:
                     f"{next(w for w in LADDER_WIDTHS if w > 1 + spec_depth) - 1}",
                     stacklevel=2,
                 )
+            if backend.arch == "sm70" and limits.max_batch * (1 + spec_depth) > max(LADDER_WIDTHS):
+                # The rung is chosen on ROWS, and a verify tick submits B*W of
+                # them (backend.py:492 M = x2.shape[0]). Above 8 the dispatch
+                # leaves the ladder entirely for the M=32 kernel, which does not
+                # pre-pack X as f16: 127 us/row against 22. The width check above
+                # cannot see this because it has no batch term.
+                warnings.warn(
+                    f"max_batch={limits.max_batch} x verify width {1 + spec_depth} = "
+                    f"{limits.max_batch * (1 + spec_depth)} rows leaves the sm70 ladder "
+                    f"(max {max(LADDER_WIDTHS)}); a full batch verifies on the unpacked "
+                    f"M=32 kernel at ~127 us/row against 22",
+                    stacklevel=2,
+                )
             self._draft_kv = PagedKvPool(
                 kv_pool.num_blocks, draft.cfg.num_kv_heads, draft.cfg.head_dim,
                 num_layers=draft.cfg.num_layers, device=backend.device,
@@ -1055,12 +1068,14 @@ class Engine:
         if self._keep_draft_logits:  # off by default: a [n, vocab] copy per tick
             self._draft_logits = logits[rng, last].detach().clone()
         h = dh[-1][rng, last].unsqueeze(1)
-        confs: list[list[float]] = [[] for _ in plan]
-        if self._spec_depth > 1:
-            conf = self._draft.confidence(h, prob, self._backend)
-            for i, c in enumerate(conf[:, -1].tolist()):
-                confs[i].append(float(c))
-        chains = [[int(t)] for t in tok[:, -1].tolist()]
+        # Nothing is read back to the host until the whole chain is enqueued.
+        # A .tolist() per depth step is a device sync per step, and the draft is
+        # launch-bound (15.13 ms against a 0.25 ms bandwidth floor), so the syncs
+        # ARE the cost: they serialize D draft forwards that would otherwise queue
+        # back to back. steps[] holds device tensors; one drain follows the loop.
+        conf = self._draft.confidence(h, prob, self._backend) if self._spec_depth > 1 else None
+        steps = [(list(range(n)), tok[:, -1], None if conf is None else conf[:, -1])]
+        cur = tok[:, -1]  # the token each row drafted last, kept on device
         for i, (r, _, hi) in enumerate(plan):
             if r.draft_pos == 0:
                 # Position 0 is never drafted (a draft at q reads the hidden at
@@ -1091,17 +1106,27 @@ class Engine:
             )
             dh = []
             logits = self._draft.forward(
-                h[li], np.array([[chains[i][-1]] for i in live], dtype=np.int64),
+                h[li], cur[li].reshape(-1, 1),
                 np.array([[plan[i][2] + j] for i in live], dtype=np.int64),
                 kv, self._backend, hidden_out=dh,
             )
             tok, prob = self._backend.greedy(logits)
             conf = self._draft.confidence(dh[-1], prob, self._backend)
-            for k, c in enumerate(conf[:, -1].tolist()):
-                confs[live[k]].append(float(c))
-            for k, t in enumerate(tok[:, -1].tolist()):
-                chains[live[k]].append(int(t))
+            steps.append((live, tok[:, -1], conf[:, -1]))
+            cur = cur.index_copy(0, li, tok[:, -1].to(cur.dtype))
             h = h.index_copy(0, li, dh[-1])
+
+        # ONE sync for the whole chain: every step's tokens and confidences are
+        # already enqueued, so this drains them together instead of D times.
+        chains: list[list[int]] = [[] for _ in plan]
+        confs: list[list[float]] = [[] for _ in plan]
+        for live, tk, cf in steps:
+            tl = tk.tolist()
+            cl = None if cf is None else cf.tolist()
+            for k, i in enumerate(live):
+                chains[i].append(int(tl[k]))
+                if cl is not None:
+                    confs[i].append(float(cl[k]))
 
         keep = verify_lens([survival(c) for c in confs]) if self._spec_depth > 1 \
             else [1] * len(plan)

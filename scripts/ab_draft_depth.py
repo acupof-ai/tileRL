@@ -1,23 +1,32 @@
 """How much of a speculative tick is the DRAFT, without instrumenting the tick?
 
-The direct approach fails: prof_spec_tick.py wraps _run_forward with
-cuda.synchronize(), which breaks CUDA-graph replay — it read 0.4 tok/s against a
-real 48.4 and put 4972 ms in a 20 ms draft. Any probe inside a captured graph
-measures the probe.
+The direct approach fails: prof_spec_tick.py syncs around each wrapped method,
+which breaks CUDA-graph replay — it read 0.4 tok/s against a real 48.4 and put
+4972 ms in a 20 ms draft. Any probe inside a captured graph measures the probe.
 
-The indirect approach costs nothing and cannot lie. Depth D means D draft
-forwards plus 1 verify per tick, so ms/tick is affine in D:
+The indirect approach has ONE trap, and it is the reason this file was rewritten:
+depth changes TWO things at once. Depth D runs D draft forwards AND verifies a
+chain of width D+1, and a verify row costs 10.7-14.1 ms. Regressing ms/tick on
+depth across 1..4 therefore charges verify's growth to the draft — the same
+"line through a staircase" error recorded in
+errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md. A first version of
+this script did exactly that (68%), and its supposed fix — restricting to depths
+1 and 3 — compared rung 2 against rung 4 and was contaminated the same way (55%).
 
-    ms_tick(D) = verify + D * draft
+The clean comparison is depths 2 and 3: W=3 and W=4 BOTH dispatch rung 4
+(spec.py:44 LADDER_WIDTHS = 1,2,4,8), so verify cost is identical and the only
+difference is one draft forward. That single subtraction is the measurement.
 
-Run depth 1..4 at fixed context, regress, and the intercept is the verify and the
-slope is one draft forward. tok/s falls out of ms/tick divided by the measured
-tok/forward, which the engine already counts.
+    draft = ms_tick(3) - ms_tick(2)          # verify held constant at rung 4
+    share = 2 * draft / ms_tick(2)           # depth 2 runs 2 draft forwards
+
+Depths 1 and 4 are still run, as a cross-check the fit cannot fake: they must
+come out ABOVE the rung-4 line, because W=2 drops a rung (cheaper verify) and
+W=5 climbs to rung 8 (a cliff).
 
 That number is the ceiling on block-parallel drafting (DFlash/DSpark): a head
-emitting the whole block in ONE forward removes (D-1) * draft from every tick and
-nothing else. If draft is a tenth of the tick, the idea is capped at ~10% no
-matter how elegant.
+emitting the whole block in ONE forward removes (D-1) draft forwards and nothing
+else. If drafting is a tenth of the tick, the idea is capped at ~10%.
 
   scripts/v100.sh run ds 'CKPT=...; /usr/bin/python3 -u scripts/ab_draft_depth.py \
       --source $CKPT --draft $CKPT/model-00018-of-00018.safetensors'
@@ -37,7 +46,7 @@ import torch
 from tilerl import cli
 from tilerl.cli import _build_model
 from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine
-from tilerl.spec import load_draft
+from tilerl.spec import LADDER_WIDTHS, load_draft
 from tilerl_kernels.backend import get_backend
 
 DEPTHS = (1, 2, 3, 4)
@@ -82,9 +91,9 @@ def main() -> None:
     cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft)
 
-    print(f"# ctx={args.ctx}, depth sweep. ms/tick is affine in depth:")
-    print(f"# {'depth':>5} {'ms/tick':>8} {'tok/fwd':>8} {'tok/s':>7}")
-    rows = []
+    print(f"# ctx={args.ctx}. Verify width is depth+1; rungs are {LADDER_WIDTHS}.")
+    print(f"# {'depth':>5} {'W':>3} {'rung':>4} {'ms/tick':>8} {'tok/fwd':>8} {'tok/s':>7}")
+    rows = {}
     # ONE engine, depth varied in place. A fresh engine per depth OOMs: the KV
     # pool and captured graphs outlive shutdown() (which only joins the daemon
     # thread), and each build re-quantizes the draft into new tensors. The graph
@@ -96,37 +105,39 @@ def main() -> None:
         e._spec_depth = d
         measure(e, args.ctx, args.tokens)  # warm: JIT + this width's graph capture
         ms, tpf = measure(e, args.ctx, args.tokens)
-        rows.append((d, ms, tpf))
-        print(f"{d:>5} {ms:>8.2f} {tpf:>8.2f} {1000 * tpf / ms:>7.1f}")
+        rows[d] = (ms, tpf)
+        rung = next(w for w in LADDER_WIDTHS if w >= 1 + d)
+        print(f"{d:>5} {1 + d:>3} {rung:>4} {ms:>8.2f} {tpf:>8.2f} {1000 * tpf / ms:>7.1f}")
     e.shutdown()
 
-    # Least squares on ms = a + b*depth. b is one draft forward, a is everything
-    # else in the tick (the verify trunk forward + sampling + bookkeeping).
-    n = len(rows)
-    sx = sum(d for d, _, _ in rows)
-    sy = sum(ms for _, ms, _ in rows)
-    sxx = sum(d * d for d, _, _ in rows)
-    sxy = sum(d * ms for d, ms, _ in rows)
-    b = (n * sxy - sx * sy) / (n * sxx - sx * sx)
-    a = (sy - b * sx) / n
-    print(f"\nms/tick = {a:.2f} + {b:.2f} * depth")
-    print(f"  verify + overhead: {a:.2f} ms    one draft forward: {b:.2f} ms")
+    # Depths 2 and 3 (W=3, W=4) both dispatch rung 4, so verify is identical and
+    # the difference is exactly one draft forward. No regression, no staircase.
+    ms2, _ = rows[2]
+    ms3, tpf3 = rows[3]
+    draft = ms3 - ms2
+    verify = ms2 - 2 * draft
+    print(f"\nrung-4 pair: {ms3:.2f} - {ms2:.2f} = {draft:.2f} ms per draft forward")
+    print(f"  depth 3 tick = {verify:.2f} verify + 3 x {draft:.2f} draft")
+    print(f"  drafting is {100 * 3 * draft / ms3:.0f}% of a depth-3 tick")
+    # Cross-check the fit cannot fake: depth 1 drops to rung 2 (cheaper verify)
+    # and depth 4 climbs to rung 8 (a cliff), so both must sit ABOVE the line
+    # this pair implies. If either lands on it, the rungs are not what we think.
+    for d in (1, 4):
+        if d in rows:
+            pred = verify + d * draft
+            print(f"  depth {d}: {rows[d][0]:.2f} vs {pred:.2f} predicted "
+                  f"({'above — expected' if rows[d][0] > pred else 'ON the line — SUSPECT'})")
 
-    d3 = next((r for r in rows if r[0] == 3), rows[-1])
-    D, ms3, tpf3 = d3
-    draft_share = 100 * b * D / ms3
-    print(f"\nAt depth {D}: {b * D:.2f} of {ms3:.2f} ms is drafting = {draft_share:.0f}% of the tick.")
     # A block-parallel head emits the whole block in ONE forward, so it removes
     # (D-1) draft forwards and changes nothing else.
-    ideal = ms3 - b * (D - 1)
-    print(f"CEILING for a block-parallel draft head (one forward instead of {D}):")
+    ideal = ms3 - 2 * draft
+    print(f"\nCEILING for a block-parallel draft head (1 forward instead of 3):")
     print(f"  {ms3:.2f} -> {ideal:.2f} ms/tick, {1000 * tpf3 / ms3:.1f} -> "
           f"{1000 * tpf3 / ideal:.1f} tok/s at the SAME {tpf3:.2f} tok/forward "
           f"({ms3 / ideal:.2f}x)")
-    print("That is an upper bound: it assumes a parallel head drafts as well as")
-    print("the autoregressive one. Every point of accuracy it loses cuts tok/fwd.")
-    # Break-even: how much tok/forward a parallel head may lose before the
-    # cheaper draft stops paying for itself.
+    print("Upper bound: it assumes a parallel head drafts as well as the")
+    print("autoregressive one, and a parallel position cannot see what was")
+    print("sampled before it, so every point of accuracy lost cuts tok/fwd.")
     print(f"  break-even tok/forward: {tpf3 * ideal / ms3:.2f} "
           f"(below that, the current head wins)")
 
