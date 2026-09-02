@@ -40,7 +40,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .tokenizer import Tokenizer, render_chat
+from .tokenizer import SAMPLING, Tokenizer, render_chat
 
 __all__ = ["mount_messages", "MessagesRequest", "record_path"]
 
@@ -97,6 +97,10 @@ def _blocks_to_text(content: Any) -> str:
             out.append(render_tool_call(b.get("name") or "", b.get("input") or {}))
         elif kind == "tool_result":
             out.append(f"<tool_response>\n{_blocks_to_text(b.get('content'))}\n</tool_response>")
+        elif kind in ("image", "document"):
+            # Dropping these silently would send the model a turn that is
+            # missing its subject; the 27B is text-only, so say so.
+            raise ValueError(f"{kind} blocks are not supported by this model")
     return "\n".join(x for x in out if x)
 
 
@@ -187,25 +191,26 @@ def _coerce(value: str, schema: dict[str, Any] | None) -> Any:
         return value
 
 
-def _parse_tool_use(text: str,
-                    tools: list[dict[str, Any]] | None = None
-                    ) -> tuple[str, dict[str, Any]] | None:
-    """The first ``<tool_call>`` block in a completion, or None.
+def _parse_tool_calls(text: str,
+                      tools: list[dict[str, Any]] | None = None
+                      ) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
+    """``(leading prose, [(name, args), ...])`` from a completion.
 
-    Natural-language reasoning may precede a call and never follows it (the
-    template says so), so searching rather than matching from the start is
-    correct, not lenient.
+    Every ``<tool_call>`` block, not just the first: the template joins parallel
+    calls with a newline and Claude Code issues them, expecting one tool_use
+    block back per call. Reasoning may precede the calls and never follows
+    them, so the text before the first call is a real content block -- the API
+    keeps it, and dropping it loses the model's own explanation.
     """
-    m = _TOOL_CALL_RE.search(text)
-    if not m:
-        return None
-    name, body = m.group(1), m.group(2)
-    props: dict[str, Any] = {}
-    for t in tools or []:
-        if t.get("name") == name:
-            props = (t.get("input_schema") or {}).get("properties") or {}
-            break
-    return name, {k: _coerce(v, props.get(k)) for k, v in _PARAM_RE.findall(body)}
+    schemas = {t.get("name"): (t.get("input_schema") or {}).get("properties") or {}
+               for t in tools or []}
+    calls = []
+    for m in _TOOL_CALL_RE.finditer(text):
+        props = schemas.get(m.group(1)) or {}
+        calls.append((m.group(1),
+                      {k: _coerce(v, props.get(k)) for k, v in _PARAM_RE.findall(m.group(2))}))
+    first = _TOOL_CALL_RE.search(text)
+    return (text[:first.start()] if first else text).strip(), calls
 
 
 def _thinking(req: MessagesRequest) -> bool:
@@ -219,14 +224,21 @@ def _thinking(req: MessagesRequest) -> bool:
 
 
 def _effort(req: MessagesRequest) -> str | None:
-    """The template's reasoning_effort: from output_config, "high" aliased."""
+    """The template's reasoning_effort. It knows xhigh/medium/low only, and
+    aliases high; Claude Code's "max" has to be aliased too or it silently
+    renders as medium."""
     e = ((req.output_config or {}).get("effort") or "").lower()
-    return "xhigh" if e == "high" else (e or None)
+    return "xhigh" if e in ("high", "max") else (e or None)
 
 
 def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: str) -> FastAPI:
     """Add POST /v1/messages to an existing app, sharing its engine."""
     from .engine import SamplingParams
+
+    # The engine refuses prompt+max_new_tokens over its budget; the real API
+    # accepts any max_tokens and stops at the context edge, so the completion
+    # is clamped to what is left rather than the request rejected.
+    engine_limit = getattr(getattr(engine, "limits", None), "max_total_tokens", 0)
 
     def _render(req: MessagesRequest) -> str:
         # The template merges leading system/developer turns and puts the
@@ -252,10 +264,21 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         input_ids = tokenizer.encode(_render(req))
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
+        thinking = _thinking(req)
+        # The model card's values per thinking mode, since Claude Code sends
+        # neither temperature nor top_p -- so this table IS the effective
+        # default, not a fallback. An explicit request value still wins.
+        # ponytail: the card also wants presence_penalty 1.5 non-thinking; the
+        # engine has no such knob, add it when a run shows repetition.
+        budget = max(1, engine_limit - len(input_ids)) if engine_limit else req.max_tokens
         params = SamplingParams(
-            temperature=req.temperature if req.temperature is not None else 0.0,
-            top_p=req.top_p if req.top_p is not None else 1.0,
-            max_new_tokens=req.max_tokens,
+            **SAMPLING[thinking]
+            | {k: v for k in ("temperature", "top_p")
+               if (v := getattr(req, k, None)) is not None},
+            # The real API accepts any max_tokens and stops at the context
+            # edge; refusing the whole request would 400 every Claude Code
+            # turn, which always asks for 32000.
+            max_new_tokens=min(req.max_tokens, budget),
             seed=secrets.randbits(31),
             stop_token_ids=tuple(getattr(tokenizer, "stop_token_ids", ())),
             logprobs=True,  # always: the record is the point of this route
@@ -272,13 +295,17 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             raise TimeoutError(f"request {rid} did not finish within 600s")
         scores = engine.logprobs(rid)  # single reader; a second one raises
         text = _strip_think(tokenizer.decode(out))
-        call = _parse_tool_use(text, req.tools)
-        if call is not None:
-            name, tool_input = call
-            content = [{"type": "tool_use", "id": f"toolu_{rid}", "name": name, "input": tool_input}]
+        prose, calls = _parse_tool_calls(text, req.tools)
+        content: list[dict[str, Any]] = []
+        if prose or not calls:
+            content.append({"type": "text", "text": prose})
+        # One block per call, distinct ids: Claude Code runs them in parallel
+        # and returns one tool_result per id.
+        content += [{"type": "tool_use", "id": f"toolu_{rid}_{i}", "name": n, "input": a}
+                    for i, (n, a) in enumerate(calls)]
+        if calls:
             stop_reason = "tool_use"
         else:
-            content = [{"type": "text", "text": text}]
             stop_reason = "max_tokens" if len(out) >= params.max_new_tokens else "end_turn"
         _record({
             "request_id": rid,
@@ -296,8 +323,13 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             "model": req.model or model_name,
             "content": content,
             "stop_reason": stop_reason,
+            # stop_sequences is accepted and ignored, so the API's
+            # "stop_sequence" stop_reason never occurs here.
             "stop_sequence": None,
-            "usage": {"input_tokens": len(input_ids), "output_tokens": len(out)},
+            "usage": {"input_tokens": len(input_ids), "output_tokens": len(out),
+                      # Claude Code reads these for context accounting; we
+                      # cache nothing, and 0 is the shape it expects.
+                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         }, rid
 
     @app.post("/v1/messages")
@@ -324,38 +356,32 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             return JSONResponse(content=body, headers=headers)
 
         def sse():
-            # One whole-message delta, not per-token: the record carries the
-            # token sequence, so streaming granularity is a UI concern here.
+            # One whole-message delta per block, not per-token: the record
+            # carries the token sequence, so streaming granularity is a UI
+            # concern here.
             # ponytail: per-token deltas when a human watches this live.
-            blk = body["content"][0]
-            start = {"type": "message_start",
-                     "message": {**body, "content": [], "usage": body["usage"]}}
-            yield f"event: message_start\ndata: {json.dumps(start)}\n\n"
-            yield ("event: content_block_start\ndata: "
-                   + json.dumps({"type": "content_block_start", "index": 0,
-                                 "content_block": {**blk, "text": "", "input": {}}
-                                 if blk["type"] == "tool_use"
-                                 else {"type": "text", "text": ""}}) + "\n\n")
-            if blk["type"] == "text":
-                yield ("event: content_block_delta\ndata: "
-                       + json.dumps({"type": "content_block_delta", "index": 0,
-                                     "delta": {"type": "text_delta", "text": blk["text"]}})
-                       + "\n\n")
-            else:
-                yield ("event: content_block_delta\ndata: "
-                       + json.dumps({"type": "content_block_delta", "index": 0,
-                                     "delta": {"type": "input_json_delta",
-                                               "partial_json": json.dumps(blk["input"])}})
-                       + "\n\n")
-            yield ("event: content_block_stop\ndata: "
-                   + json.dumps({"type": "content_block_stop", "index": 0}) + "\n\n")
-            yield ("event: message_delta\ndata: "
-                   + json.dumps({"type": "message_delta",
-                                 "delta": {"stop_reason": body["stop_reason"],
-                                           "stop_sequence": None},
-                                 "usage": body["usage"]}) + "\n\n")
-            yield ("event: message_stop\ndata: "
-                   + json.dumps({"type": "message_stop"}) + "\n\n")
+            def ev(name: str, payload: dict[str, Any]) -> str:
+                return f"event: {name}\ndata: {json.dumps(payload)}\n\n"
+
+            yield ev("message_start", {"type": "message_start",
+                                       "message": {**body, "content": []}})
+            for i, blk in enumerate(body["content"]):
+                tool = blk["type"] == "tool_use"
+                opening = ({k: v for k, v in blk.items() if k != "input"} | {"input": {}}
+                           if tool else {"type": "text", "text": ""})
+                yield ev("content_block_start", {"type": "content_block_start",
+                                                 "index": i, "content_block": opening})
+                delta = ({"type": "input_json_delta",
+                          "partial_json": json.dumps(blk["input"])} if tool
+                         else {"type": "text_delta", "text": blk["text"]})
+                yield ev("content_block_delta",
+                         {"type": "content_block_delta", "index": i, "delta": delta})
+                yield ev("content_block_stop", {"type": "content_block_stop", "index": i})
+            yield ev("message_delta", {"type": "message_delta",
+                                       "delta": {"stop_reason": body["stop_reason"],
+                                                 "stop_sequence": None},
+                                       "usage": body["usage"]})
+            yield ev("message_stop", {"type": "message_stop"})
 
         return StreamingResponse(sse(), media_type="text/event-stream", headers=headers)
 
@@ -370,17 +396,22 @@ if __name__ == "__main__":  # pragma: no cover - self-check
     # completion, so a transcript and a live call cannot diverge.
     schema = [{"name": "Bash", "input_schema": {"properties": {
         "command": {"type": "string"}, "timeout": {"type": "integer"}}}}]
-    assert _parse_tool_use(call, schema) == ("Bash", {"command": "ls", "timeout": 30})
-    # Reasoning may PRECEDE a call and never follows it (the template says so).
-    assert _parse_tool_use("I should list them.\n" + call, schema)[0] == "Bash"
-    assert _parse_tool_use("no call here") is None
+    assert _parse_tool_calls(call, schema) == ("", [("Bash", {"command": "ls", "timeout": 30})])
+    # Reasoning may PRECEDE a call and never follows it (the template says so),
+    # and the API keeps that prose as its own text block.
+    assert _parse_tool_calls("I should list them.\n" + call, schema) == (
+        "I should list them.", [("Bash", {"command": "ls", "timeout": 30})])
+    # Parallel calls: the template joins them, Claude Code expects them all.
+    two = call + "\n" + render_tool_call("Bash", {"command": "pwd"})
+    assert [n for n, _ in _parse_tool_calls(two, schema)[1]] == ["Bash", "Bash"]
+    assert _parse_tool_calls("no call here")[1] == []
     # A string-typed parameter stays raw even when it looks like JSON.
     s = render_tool_call("Read", {"file_path": "123"})
-    assert _parse_tool_use(s, [{"name": "Read", "input_schema": {
-        "properties": {"file_path": {"type": "string"}}}}]) == ("Read", {"file_path": "123"})
+    assert _parse_tool_calls(s, [{"name": "Read", "input_schema": {
+        "properties": {"file_path": {"type": "string"}}}}])[1] == [("Read", {"file_path": "123"})]
     # ...and with no schema at all it parses as a number, which is why the
     # schema is passed in rather than guessed from the text.
-    assert _parse_tool_use(s) == ("Read", {"file_path": 123})
+    assert _parse_tool_calls(s)[1] == [("Read", {"file_path": 123})]
     assert _blocks_to_text([{"type": "text", "text": "hi"},
                             {"type": "tool_result", "content": "out"}]) == (
         "hi\n<tool_response>\nout\n</tool_response>")

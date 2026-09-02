@@ -348,3 +348,59 @@ def test_messages_tool_use_round_trip(tmp_path, monkeypatch):
     # render (211 vs 218 ids as written). Assert the content instead.
     assert "<tool_response>\na.py b.py c.py\n</tool_response>" in tok.decode(rows[1]["prompt_ids"])
     assert "<function=Bash>" in tok.decode(rows[1]["prompt_ids"])
+
+
+def test_parallel_tool_calls_become_separate_blocks(tmp_path, monkeypatch):
+    """Two <tool_call> blocks in one completion -> two tool_use blocks out.
+
+    Claude Code issues parallel calls and returns one tool_result per id, so
+    dropping all but the first would strand the rest of the turn. The leading
+    prose is its own text block, as the real API does.
+    """
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "p.jsonl"))
+    tok = _ByteTokenizer()
+    reply = ("Listing both.\n" + render_tool_call("Bash", {"command": "ls"})
+             + "\n" + render_tool_call("Bash", {"command": "pwd"}))
+    app = create_app(_ScriptedEngine(tok, [reply]), tok)
+    with TestClient(app) as c:
+        body = c.post("/v1/messages", json={
+            "max_tokens": 64,
+            "tools": [{"name": "Bash", "description": "Run a command",
+                       "input_schema": {"properties": {"command": {"type": "string"}}}}],
+            "messages": [{"role": "user", "content": "list and pwd"}],
+        }).json()
+    assert body["stop_reason"] == "tool_use"
+    kinds = [b["type"] for b in body["content"]]
+    assert kinds == ["text", "tool_use", "tool_use"], body["content"]
+    assert body["content"][0]["text"] == "Listing both."
+    ids = [b["id"] for b in body["content"] if b["type"] == "tool_use"]
+    assert len(set(ids)) == 2, f"tool_use ids must be distinct: {ids}"
+    assert [b["input"]["command"] for b in body["content"][1:]] == ["ls", "pwd"]
+
+
+def test_max_tokens_is_clamped_not_refused(client, tmp_path, monkeypatch):
+    """A huge max_tokens stops at the context edge instead of 400-ing.
+
+    Claude Code always asks for 32000; the real API accepts it and stops. The
+    engine refuses prompt+max_new_tokens over its budget, so the shim clamps.
+    """
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "c.jsonl"))
+    r = client.post("/v1/messages", json={
+        "max_tokens": 32000,  # far past the 4096-token test engine
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["stop_reason"] in ("end_turn", "max_tokens", "tool_use")
+
+
+def test_image_blocks_are_refused_not_dropped(client, tmp_path, monkeypatch):
+    """A text-only model must say so rather than answer a turn missing its subject."""
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "i.jsonl"))
+    r = client.post("/v1/messages", json={
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                         "data": "iVBOR"}}]}],
+    })
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["type"] == "invalid_request_error"
