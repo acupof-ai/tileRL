@@ -312,10 +312,13 @@ class Engine:
                 raise ValueError(f"spec_depth must be in [1, {BLOCK_TOKENS}), got {spec_depth}")
             if backend.arch == "sm70" and 1 + spec_depth not in LADDER_WIDTHS:
                 # The verify width is 1+depth and the sm70 GEMV serves only
-                # 1/2/4/8 rows, rounding up: depth 4 (W=5) buys an 8-row launch
+                # 1/2/4/8/32 rows, rounding up: depth 4 (W=5) buys an 8-row launch
                 # and measured 31.5 tok/s on coding against 43.8 at depth 3 and
                 # 32.6 with no speculation at all. Warn rather than clamp — the
                 # ladder is one arch's shape, not a property of speculation.
+                # A verify tick costs 0.67 + 0.53*W dense ticks (fitted W=2/W=4,
+                # confirmed at W=8 to 1.5% on its mean), so rounding W up is a
+                # real cost: W=5 must beat 4.88 tok/forward, not 3.31.
                 warnings.warn(
                     f"spec_depth={spec_depth} gives verify width {1 + spec_depth}, which sm70 "
                     f"rounds up to {next(w for w in LADDER_WIDTHS if w >= 1 + spec_depth)} rows; "

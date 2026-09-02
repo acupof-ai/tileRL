@@ -20,11 +20,16 @@ import torch
 #: sm70 is a staircase, not a line: the GEMV ladder rounds verify width up to a
 #: rung, so at ctx 1024 verify costs w<=2 36.58, w<=4 49.87, w<=8 68.46 ms, one
 #: draft forward 5.53 (errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md,
-#: wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md). The trim only picks how
-#: many drafts to admit and a captured tick skips it (engine.py:246), so pricing
-#: sm70 with the H20 constants is mispriced-but-inert, not wrong output.
-#: ponytail: H20 two-term cost on sm70, swap in the rung table if the trim ever
-#: runs where its choice can matter.
+#: wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md).
+#: H20 constants, and on sm70 they change the trim's answer. Measured sm70 cost is
+#: 0.670 + 0.5265*W dense ticks = bias 15.9 ms, row 12.5 ms at ctx 1024 -- 13x and
+#: 24x off (wins/2026-09-03-verify-tick-cost-is-a-line-in-width.md). The trim reads
+#: the RATIO, and H20's makes a row 0.25% of the bias against sm70's 79%, so these
+#: over-admit: a low-acceptance batch keeps 2 drafts where the measured price keeps
+#: 0 (__main__ asserts both). Runs on every spec tick via _draft_chains -- capture
+#: replays the verify, the trim decides what enters it.
+#: ponytail: left in place until the reprice is A/B'd on the pod (task #38) -- a
+#: serving-behavior flip does not ship on a derivation.
 BIAS_MS = 211.0
 ROW_MS = 0.53
 
@@ -74,6 +79,15 @@ if __name__ == "__main__":  # runnable check
     assert verify_lens([[1e-9, 1e-9]]) == [0]
     lens = verify_lens([[0.99, 0.9, 0.2], [0.3, 0.05, 0.01]], bias_ms=1.0, row_ms=0.1)
     assert lens[0] >= lens[1], lens
+
+    # The trim must REFUSE a chain that cannot pay for its own rows. With the
+    # measured sm70 price (a row is 79% of the bias, not H20's 0.25%) a low-
+    # acceptance batch keeps nothing; under BIAS_MS/ROW_MS it keeps 2, which is
+    # how the mispricing turns into speculating at a loss. Constants here are the
+    # measured ones, so this fails if spec.py is repriced without re-measuring.
+    sm70 = dict(bias_ms=0.670 * 23.7, row_ms=0.5265 * 23.7)
+    assert verify_lens([survival([0.5, 0.25, 0.1])] * 4, **sm70) == [0] * 4
+    assert verify_lens([survival([0.95, 0.90, 0.85])] * 4, **sm70) == [2] * 4
     print("spec: verify_lens OK", lens)
 
 
