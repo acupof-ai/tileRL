@@ -10,7 +10,7 @@ ordered by the risk each retires; each exits on a named, verifiable event.
 | Area | State |
 |---|---|
 | Serving | H20 B=1 decode 92.4 tok/s (sglang bf16 54.2, Arle 84.5); B=8 0.8× sglang; prefill 0.4×; MMLU 76.3% |
-| Training | LoRA and Adafactor full fine-tune run on one card; GRPO and self-OPD exist; `--data` real prompts + GSM8K reward + `--eval-mmlu` gate shipped **pending-remote** |
+| Training | LoRA and Adafactor full fine-tune run on one card; GRPO and self-OPD exist; `--data` real prompts + GSM8K reward + `--eval-mmlu` gate shipped **pending-remote**; ISO and the on-policy draft head are designed (`docs/design-rl-stack.md`), not built |
 | Kernels | one TileLang tree; cpu (CI/parity), metal, sm90 executed it; 71% of kernel lines are sm90 schedules |
 | Tests | hermetic CPU suite on ubuntu + macos, every commit |
 | Adoption | 1 star, not on PyPI |
@@ -24,31 +24,49 @@ The differentiating claim is unproven until a run moves a number.
   data). LoRA rank 16, no thinking, one H20.
 - Exit: GSM8K reward rises from its step-0 value and holds; MMLU after ≥ MMLU
   before within noise (200 questions ≈ ±3 pt); the curve in a wins entry.
-  Then self-OPD the same way, same gate.
 
-## P2 — same pod, same task, vs verl + sglang
+## P2 — the speculative tick is captured, and the head stays on-policy
 
-- `scripts/rl_compare.sh`: seconds per RL step (rollout + update) at group 8 ×
-  256 tokens, then at 32K context; MMLU before/after on both arms.
-- Exit: the table exists, recorded like the serving comparison
-  (`docs/experience/2026-08-28-vs-sglang-h20.md`).
-- Verdict rule, decided now: if tileRL is not faster per step, the engine
+`docs/design-rl-stack.md` §2. A draft disables graph capture today, so every
+head loses 4.9× to plain decode.
+
+- Capture draft + verify with the checkpoint's own MTP head. Exit: seconds per
+  RL step at group 8 ≥ 1.5× better than plain decode.
+- Vendor DFlash2 (`incoai/Qwen3.8-27B-DFlash2`, 3.43× at c=1 on sglang)
+  behind the same `DraftHead` seam; same table.
+- Co-train the head on the RL rollouts. Exit: acceptance length does not decay
+  over the run where the frozen head's does.
+
+## P3 — ISO on the tape: optimizer, then merger
+
+`docs/design-rl-stack.md` §1. Optimizer-side only; no new backward.
+
+- Frame gradients + Newton-Schulz polar + Adafactor + streamed updates +
+  per-step re-quantization. Exit: tiny-model gradcheck of the frame handler;
+  steps to the same GSM8K reward vs LoRA-AdamW (paper: 2.7× fewer); MMLU flat;
+  peak < 96 GB.
+- `tilerl merge --method iso` on two of our own specialists. Exit: beats TIES
+  and DARE on the same pair, MMLU flat.
+
+## P4 — the ledger CLI
+
+`docs/design-rl-stack.md` §3. Per-run manifest, gates as exit codes, `--json`,
+lineage. Cheap, no GPU, can run alongside P1–P3. Exit: an agent runs
+rl → eval → merge → serve from manifests alone.
+
+## P5 — same pod, same task, vs verl + sglang
+
+- `scripts/rl_compare.sh`: seconds to a target GSM8K reward (steps are not
+  equal once ISO and speculation are in), MMLU before/after, both arms.
+- Verdict rule, decided now: if tileRL is not faster to the target, the engine
   stops being the product and `tilerl-kernels` (w4a8 NVFP4 on Hopper) goes
   upstream as a quantization backend PR.
 
-## P3 — rollout decode at B≥32
+## P6 — rollout decode at B≥32, then TP-8 / CP
 
-RL time is rollout time, and rollout is a decode kernel at B≥32, not B=1.
-
-- Tensor-core decode GEMM from MX=8 to 32/64; recapture the decode graph and
-  drop prefix entries after each update instead of eager rollouts.
-- Exit: harness B=32 row ≥ 3× the B=8 aggregate; RL step time falls by the
-  rollout's share.
-
-## P4 — TP-8, then CP for 128K–256K
-
-`docs/plan-training-rl.md` P3–P4: one KV head per card, a capturable
-all-reduce, ring attention + the GDN prefix scan. Exit conditions there.
+Speculation and batch are substitutes; this is the other regime's lever.
+Tensor-core decode GEMM MX 8 → 32/64 (exit: harness B=32 row ≥ 3× the B=8
+aggregate), then `docs/plan-training-rl.md` P3–P4 for 128K–256K.
 
 ## Parked (trigger-based)
 

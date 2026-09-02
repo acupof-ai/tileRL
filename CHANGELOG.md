@@ -4,6 +4,21 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-02 — plan: the RL stack — ISO optimizer + merger, an on-policy DFlash2 head, a ledger CLI
+
+- `docs/design-rl-stack.md`. ISO (arXiv 2607.19331) lands optimizer-side on
+  the existing tape: frame gradients from the linear's `dW`, Newton-Schulz
+  polar, Adafactor (AdamW on the frames is ~140 GB and does not fit a card),
+  per-step re-quantization MMLU-gated. Its 2.7× fewer steps is 2.7× less
+  rollout. ISO-Merger is `tilerl merge`, gated against TIES/DARE.
+- The draft head: capture the speculative tick first (a draft disables graph
+  capture, 86.2 vs 17.6 tok/s), then vendor DFlash2, then co-train it on the
+  RL rollouts so it does not go stale. Speculation and batch are substitutes;
+  one lever per regime.
+- The ledger CLI is the agent's surface; the static page is last. Roadmap
+  phases reordered P1–P6 accordingly; the P5 verdict rule now prices seconds
+  to a target reward.
+
 ## 2026-09-02 — default flip: the north star is the serve+RL runtime on Hopper; serve throughput and ROCm are parked
 
 - README, roadmap and AGENTS rewritten around what is measured and unoccupied:
