@@ -486,32 +486,37 @@ class AdamW:
         """Apply one update. ``params`` is an iterable of param tensors;
         ``grads`` maps ``id(param)`` to its gradient. Params without a grad
         entry are skipped."""
+        self.begin()
+        for p in params:
+            g = grads.get(id(p))
+            if g is not None:
+                self.step_one(p, g)
+
+    def begin(self) -> None:
         self._step += 1
+
+    def step_one(self, p: torch.Tensor, g: torch.Tensor) -> None:
         b1, b2 = self.betas
         bc1 = 1.0 - b1**self._step
         bc2 = 1.0 - b2**self._step
-        for p in params:
-            g = grads.get(id(p))
-            if g is None:
-                continue
-            g = g.to(torch.float32)
-            pid = id(p)
-            m = self._m.get(pid)
-            if m is None:
-                m = torch.zeros(p.shape, dtype=torch.float32, device=p.device)
-                v = torch.zeros_like(m)
-                self._m[pid] = m
-                self._v[pid] = v
-            else:
-                v = self._v[pid]
-            m.mul_(b1).add_(g, alpha=1.0 - b1)
-            v.mul_(b2).addcmul_(g, g, value=1.0 - b2)
-            p32 = p.to(torch.float32)
-            if self.weight_decay > 0.0:
-                p32.mul_(1.0 - self.lr * self.weight_decay)
-            denom = v.div(bc2).sqrt_().add_(self.eps)
-            p32.addcdiv_(m, denom, value=-self.lr / bc1)
-            p.copy_(p32.to(p.dtype))
+        g = g.to(torch.float32)
+        pid = id(p)
+        m = self._m.get(pid)
+        if m is None:
+            m = torch.zeros(p.shape, dtype=torch.float32, device=p.device)
+            v = torch.zeros_like(m)
+            self._m[pid] = m
+            self._v[pid] = v
+        else:
+            v = self._v[pid]
+        m.mul_(b1).add_(g, alpha=1.0 - b1)
+        v.mul_(b2).addcmul_(g, g, value=1.0 - b2)
+        p32 = p.to(torch.float32)
+        if self.weight_decay > 0.0:
+            p32.mul_(1.0 - self.lr * self.weight_decay)
+        denom = v.div(bc2).sqrt_().add_(self.eps)
+        p32.addcdiv_(m, denom, value=-self.lr / bc1)
+        p.copy_(p32.to(p.dtype))
 
 
 class Adafactor:

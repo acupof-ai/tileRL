@@ -4,6 +4,19 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-02 — phase exit: the ISO optimizer runs on the tape (tiny); 27B pending-remote
+
+- `tilerl.iso.ISO` wraps `Adafactor` / `AdamW`: every 2D weight trains as
+  `U S V^T` with `S` frozen, frames retracted by Newton-Schulz after each
+  step. Same `streams` / `begin` / `step_one` contract, so `train._step` is
+  untouched. `tilerl train --optim iso` on the full-parameter SFT path.
+- Gates: frame gradient vs finite difference **1.4e-10**, orthonormality
+  **4.2e-7**, spectrum drift **5.9e-6** over 5 steps; loss curve matches
+  Adafactor on the tiny model at 11 vs 7 ms/step.
+- Not in `--rl` / `--opd` (LoRA, no ISO variant; full-parameter RL needs
+  per-step fp4 re-quantization that does not exist). 27B memory and step time
+  `pending-remote`.
+  [wins/2026-09-02-iso-optimizer.md](docs/experience/wins/2026-09-02-iso-optimizer.md)
 ## 2026-09-02 — plan: the RL stack — ISO optimizer + merger, an on-policy DFlash2 head, a ledger CLI
 
 - `docs/design-rl-stack.md`. ISO (arXiv 2607.19331) lands optimizer-side on
