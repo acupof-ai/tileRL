@@ -21,6 +21,7 @@ import shutil
 import pytest
 
 from tilerl import rollout as rollout_mod
+from tilerl.messages import render_tool_call
 from tilerl.server import create_app
 
 from test_server import _ByteTokenizer, _ScriptedEngine
@@ -89,8 +90,7 @@ def test_sandbox_confines_writes_to_the_rollout_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "rec.jsonl"))
     outside = tmp_path / "outside" / "ESCAPED.txt"
     outside.parent.mkdir()
-    escape = json.dumps({"tool": "Bash",
-                         "input": {"command": f"echo pwned > {outside} && echo wrote"}})
+    escape = render_tool_call("Bash", {"command": f"echo pwned > {outside} && echo wrote"})
 
     def attempt(sandbox: bool, tag: str) -> None:
         tok = _ByteTokenizer()

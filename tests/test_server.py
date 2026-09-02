@@ -19,6 +19,7 @@ from tilerl.config import tiny
 from tilerl.engine import Engine, build_engine
 from tilerl.model import build_random
 from tilerl_kernels.backend import get_backend
+from tilerl.messages import render_tool_call
 from tilerl.server import create_app, get_tokenizer
 
 
@@ -44,8 +45,12 @@ def _build_engine(seed: int) -> Engine:
     cfg = tiny()
     model = build_random(cfg, seed=seed)
     backend = get_backend()
+    # 4096, not 512: the tool block is the checkpoint's template verbatim (817
+    # bytes of instructions alone), and ByteTokenizer is one token per byte, so
+    # a one-tool request is ~1.1k tokens. Shrinking the prompt to fit would be
+    # measuring a format the 27B never sees.
     return build_engine(
-        cfg, model, backend, num_blocks=64, num_slots=4, max_batch=4, max_total_tokens=512
+        cfg, model, backend, num_blocks=256, num_slots=4, max_batch=4, max_total_tokens=4096
     )
 
 
@@ -297,7 +302,7 @@ def test_messages_tool_use_round_trip(tmp_path, monkeypatch):
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "rt.jsonl"))
     tok = _ByteTokenizer()
     engine = _ScriptedEngine(tok, [
-        '{"tool": "Bash", "input": {"command": "ls"}}',
+        render_tool_call("Bash", {"command": "ls"}),
         "there are 3 files",
     ])
     app = create_app(engine, tok)
@@ -341,5 +346,5 @@ def test_messages_tool_use_round_trip(tmp_path, monkeypatch):
     # The tool_result reached the prompt. Not "turn 2 is longer" -- turn 1
     # carries the tools block and turn 2 does not, so turn 2 is the SHORTER
     # render (211 vs 218 ids as written). Assert the content instead.
-    assert "<tool_result>a.py b.py c.py</tool_result>" in tok.decode(rows[1]["prompt_ids"])
-    assert '"tool": "Bash"' in tok.decode(rows[1]["prompt_ids"])
+    assert "<tool_response>\na.py b.py c.py\n</tool_response>" in tok.decode(rows[1]["prompt_ids"])
+    assert "<function=Bash>" in tok.decode(rows[1]["prompt_ids"])
