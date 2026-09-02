@@ -1,25 +1,20 @@
-"""Locate the torch elementwise launches by DIFFERENCING configurations.
+"""SUPERSEDED by prof_region_attrib.py -- this script's differences do not mean
+what they claim.
 
-One depth-3 tick spends 9.1 ms across ~1314 torch elementwise/index kernels —
-17% of GPU-busy, none of it TileLang work. `with_stack=True` returns no Python
-frames on this build (torch 2.5.1+cu121), so attribution has to come from
-differences between runs that isolate one part of the model each.
+It counted a `dense`, a `spec d1` and a `spec d3` tick and read `spec d1 - dense`
+as "one draft forward". Those two configurations differ in TWO things: the draft,
+and 48 GDN layers switching off `gdn_decode` (T=1, fused, in-place) onto
+gather -> chunk -> scatter, because a verify tick runs W>1 rows (model.py:302).
+Everything on the right of that plus sign landed in the column labelled "draft",
+which is how this script read 955 launches for a 1-layer head whose real share is
+8 launches / 0.02 ms.
 
-Three counts, each a steady tick:
+Region attribution replaces it: wrap the model's own methods in `record_function`
+and the profiler nests each CUDA event under the launching CPU range, whose name
+is the aten op. See errors/2026-09-02-differencing-attributed-the-trunk-to-the-draft.md.
 
-  dense          trunk only, one row              -> per-forward baseline
-  spec depth 1   + one draft forward              -> one draft forward's share
-  spec depth 3   + three                          -> linear in depth?
-
-spec(d1) - dense isolates one draft forward including its bookkeeping; spec(d3) -
-spec(d1) over 2 checks that the per-forward cost is constant, which is the test
-that the difference means what it claims. What is left in `dense` is the trunk's
-own, and that is the number that says whether the fix belongs in the draft path or
-in model.py/backend.py.
-
-Counts, not wall time: a launch count is exact and survives the profiler's
-distortion (it reads 121.5 ms/tick where the tick is 66.46), where a wall-clock
-ratio does not. GPU us per kernel is a sum of durations and also survives.
+Kept for the counting harness (launch counts survive the profiler's serialization
+where wall clock does not) and as the record of a wrong instrument.
 """
 
 from __future__ import annotations
@@ -42,11 +37,11 @@ TORCH_MARKS = ("elementwise_kernel", "index_elementwise", "unrolled_elementwise"
                "vectorized_elementwise", "reduce_kernel", "CatArrayBatched")
 
 
-def count(e, reps: int = 2) -> dict:
+def count(e, reps: int = 2, settle: int = 6) -> dict:
     """Launch counts and GPU us for one steady tick, split torch vs tilelang."""
     from torch.profiler import ProfilerActivity, profile
 
-    for _ in range(2):  # settle
+    for _ in range(settle):
         e.step()
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
@@ -70,6 +65,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True)
     ap.add_argument("--draft", required=True)
+    ap.add_argument("--ctx", type=int, nargs="+", default=[30, 300],
+                    help="prompt lengths: if the draft's launch count scales with "
+                         "this, the cost is per-position, not per-forward")
+    ap.add_argument("--settle", type=int, default=6,
+                    help="ticks before profiling: the FIRST _draft_step after prefill "
+                         "spans the whole prompt, so too few settles measure that "
+                         "one-off instead of the steady state")
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
 
