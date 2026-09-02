@@ -183,3 +183,54 @@ def test_sampling_bounds(client, field, value):
 def test_configured_tokenizer_fails_closed(tmp_path):
     with pytest.raises(Exception):
         get_tokenizer(str(tmp_path))
+
+
+def test_messages_route_records_token_ids(client, tmp_path, monkeypatch):
+    """The Messages shim answers Claude Code's shape and records the ids.
+
+    The record is the reason the route exists: BPE is not concatenation-
+    invariant, so a transcript's text cannot be re-encoded into a guaranteed-
+    identical id sequence, and GRPO on a mismatched sequence is a silently
+    wrong gradient. This asserts the ids come back on the wire, not that they
+    can be rebuilt.
+    """
+    rec = tmp_path / "messages.jsonl"
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(rec))
+    body = {
+        # the shape a real Claude Code request carries, measured 2026-09-02:
+        # system as a block list, tools as JSON Schema, content as blocks
+        "model": "tiny",
+        "max_tokens": 8,
+        "system": [{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}],
+        "tools": [{"name": "Bash", "description": "Run a command",
+                   "input_schema": {"properties": {"command": {"type": "string"}}}}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+    }
+    r = client.post("/v1/messages", json=body)
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["type"] == "message" and out["role"] == "assistant"
+    assert out["stop_reason"] in ("end_turn", "max_tokens", "tool_use")
+    assert out["content"] and out["content"][0]["type"] in ("text", "tool_use")
+    rid = r.headers["x-tilerl-request-id"]
+
+    row = json.loads(rec.read_text().splitlines()[-1])
+    assert str(row["request_id"]) == rid, "the header must name the recorded row"
+    assert row["prompt_ids"] and row["completion_ids"]
+    # one score per generated token: what a policy gradient consumes
+    assert len(row["logprobs"]) == len(row["completion_ids"])
+    assert row["stop_reason"] == out["stop_reason"]
+
+
+def test_messages_stream_is_anthropic_sse(client, tmp_path, monkeypatch):
+    """stream=true emits the event names Claude Code's parser expects."""
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "s.jsonl"))
+    r = client.post("/v1/messages", json={
+        "max_tokens": 4, "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 200, r.text
+    events = [ln[7:] for ln in r.text.splitlines() if ln.startswith("event: ")]
+    assert events[0] == "message_start" and events[-1] == "message_stop"
+    for needed in ("content_block_start", "content_block_delta", "content_block_stop"):
+        assert needed in events, f"{needed} missing from {events}"
