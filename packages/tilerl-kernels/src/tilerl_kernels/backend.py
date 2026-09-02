@@ -219,6 +219,9 @@ class Backend:
         # silently feeds those kernels the wrong dtype. sm70's fp16 GEMV does
         # its f32->fp16 cvt inside the kernel, not via io.
         self.io = torch.bfloat16 if self.arch == "sm90" else torch.float32
+        # Declared beside io for the same reason: the store (materialize) and the
+        # kernel annotation must not drift (wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi).
+        self.scale_io = torch.float16 if self.arch == "sm70" else torch.float32
         self._kernels: dict[str, object] = {}
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
         self._const_f32_cache: dict[tuple[int, int | None], tuple[Any, int, torch.Tensor]] = {}
@@ -481,7 +484,10 @@ class Backend:
         # ``master`` is recording-only (the STE grad lands on it); the kernel
         # uses wq/scale.
         wq = self._served_fp4(wq)
-        sh = scale.dtype == torch.float16  # sm70's narrowed plane; materialize did it
+        # An f16 plane belongs to the twiddled ladder below — the only consumer
+        # compiled for it. materialize applies both rewrites together, so the two
+        # always arrive together on the shipped path.
+        sh = scale.dtype == self.scale_io == torch.float16
         scale = scale if sh else self._f32(scale)
         lead, x2 = self._rows(x)
         M, K, N = x2.shape[0], x2.shape[1], wq.shape[0]
@@ -594,7 +600,10 @@ class Backend:
                 x2 = _pad2d(x2, Mp, Kp)
                 wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
             # generic linear_fp4 is f32-IO; restore f32 for sm70's M>1 fallback
-            # (sm90 never lands here — it has an MMA kernel).
+            # (sm90 never lands here — it has an MMA kernel). The scale plane
+            # must be f32 too: sm70 serves f16 but reaches this only if its
+            # twiddled-layout branch above did not claim the call.
+            assert scale.dtype == torch.float32, "generic linear_fp4 wants an f32 scale plane"
             y2 = self._kernel("linear_fp4")(self._f32(x2), wq, scale, bM, bN, blk, _THREADS)[:M, :N]
         y = self._epilogue(y2, oscale, lead, N)
         return y if residual is None else y + residual
@@ -676,23 +685,26 @@ class Backend:
                     out[base] = (w * osc).to(torch.bfloat16)
                 for suffix in (".w8", ".wscale", ".oscale"):
                     out.pop(base + suffix, None)
-        moved = {k: v.to(self.device) for k, v in out.items()}
-        # fp4 twiddle here, not lazily in _served_fp4: the twiddle allocates a
-        # same-size scratch, and by the first forward the KV cache + activations
-        # have left no room for it on a 32GB card. At materialize only the
-        # weights are resident, so the scratch fits. Tagged so a train step's
-        # re-materialize (and _served_fp4) skip it.
+        # Both serving rewrites need a kernel that reads the bytes: narrow the
+        # scale plane (3.20 -> 1.60 GB on sm70, riding the device move so the f32
+        # plane never lands on the card) and twiddle the nibbles. The twiddle is
+        # here, not lazily in _served_fp4, because it allocates a same-size
+        # scratch and by the first forward the KV cache + activations have left no
+        # room on a 32GB card. Tagged so a train step's re-materialize skips it.
         _twiddle = {"sm90": reference.twiddle_fp4, "sm70": reference.twiddle_fp4_f16}.get(self.arch)
-        if _twiddle is not None and "linear_fp4_gemv" in _resolve(self.precision, self.arch):
+        served = _twiddle is not None and "linear_fp4_gemv" in _resolve(self.precision, self.arch)
+        narrow = served and self.scale_io != torch.float32
+        moved = {
+            k: v.to(self.device, self.scale_io)
+            if narrow and k.endswith(".scale")
+            else v.to(self.device)
+            for k, v in out.items()
+        }
+        if served:
             for k in moved:
                 if k.endswith(".wq") and getattr(moved[k], "_tl_layout", "natural") == "natural":
                     moved[k].copy_(_twiddle(moved[k]))
                     moved[k]._tl_layout = "tw-bf16" if self.arch == "sm90" else "tw-f16"
-        # Halve the 3.20 GB scale plane on sm70. Here, not per call: a cast in
-        # linear_fp4 would reallocate the plane every token and stream both.
-        if self.arch == "sm70":
-            for k in [k for k in moved if k.endswith(".scale")]:
-                moved[k] = moved[k].to(torch.float16)
         return moved
 
     # ------------------------------------------------------------ attention
@@ -892,7 +904,12 @@ class Backend:
         # shipped checkpoint's, and pack_fp4's block-32 test weights take the
         # reference. ponytail: register a second kernel if a 32 ever ships.
         blk = wq.shape[1] * 2 // scale.shape[1]
+        # sm70 serves an f16 scale plane (materialize narrows it). This kernel is
+        # sm90-only today, so the guard below already excludes that — but its
+        # _const_f32(scale) would cache a PERMANENT f32 copy of the whole plane,
+        # so whoever registers linear_fp4_bwd for sm70 must widen at load, not here.
         if not fp8 and blk == 16 and "linear_fp4_bwd" in kset:
+            assert scale.dtype == torch.float32, "linear_fp4_bwd wants an f32 scale plane"
             wq = self._served_fp4(wq)
             n, k = wq.shape[0], wq.shape[1] * 2
             g = self._bf16(grad).reshape(-1, grad.shape[-1])
