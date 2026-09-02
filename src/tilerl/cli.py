@@ -15,6 +15,9 @@ import sys
 import time
 from pathlib import Path
 
+from . import recipes
+from .recipes import RECIPES
+
 from .eval import answer_match, last_number  # noqa: F401  (tests import last_number from here)
 
 __all__ = ["main"]
@@ -194,7 +197,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         # The run id is the hash of these: same inputs = same run, a finished
         # one is returned instead of retrained. Checkpoint path + code commit is
         # the identity, not the 15 GB of weight bytes.
-        inputs = {"model": args.model,
+        inputs = {"model": args.model, "recipe": args.recipe,
                   "source": _QWEN38_SOURCE if args.model == "qwen38-27b" else "tiny",
                   "commit": commit(), "algo": "grpo" if args.rl else "opd",
                   "data": file_hash(args.data) if args.data else None, "steps": args.steps,
@@ -508,7 +511,7 @@ def cmd_ledger(args: argparse.Namespace) -> None:
     print(json.dumps(runs, indent=1) if args.json else "\n".join(map(format_run, runs)))
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tilerl",
         description="tileRL: TileLang inference + training (CPU/CUDA/Metal).",
@@ -560,7 +563,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--lora-rank", type=int, default=16)
     p_train.add_argument("--draft", help="draft head safetensors: speculative rollout (--opd)")
     p_train.add_argument("--depth", type=int, default=2, help="drafts per row per tick")
-    p_train.set_defaults(func=cmd_train)
+    p_train.add_argument("--recipe", choices=sorted(RECIPES),
+                         help="a flag set that passed a gate (recipes.py); flags override it")
+    # The recipe is the subparser's defaults, so anything typed still wins.
+    p_train.set_defaults(func=cmd_train, **(recipes.flags(recipe) if recipe else {}))
 
     p_pretrain = sub.add_parser("pretrain", help="pretrain on a JSONL text corpus")
     p_pretrain.add_argument("--model", choices=["tiny"], default="tiny")
@@ -626,7 +632,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = _build_parser().parse_args()
+    recipe = getattr(_build_parser().parse_known_args()[0], "recipe", None)
+    if recipe:
+        print(f"recipe {recipe}: {RECIPES[recipe]['status']}")
+    args = _build_parser(recipe).parse_args()
     args.func(args)
 
 
