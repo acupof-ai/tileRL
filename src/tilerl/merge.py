@@ -8,6 +8,10 @@ space at ``(U₀, V₀)``. Offline, checkpoint-only; ``tilerl merge`` is the CLI
 
 from __future__ import annotations
 
+import json
+import shutil
+from pathlib import Path
+
 import torch
 from torch import Tensor
 
@@ -85,3 +89,68 @@ if __name__ == "__main__":  # runnable check: one specialist comes back, spectru
     s0, s = torch.linalg.svdvals(w0), torch.linalg.svdvals(m)
     assert torch.allclose(s, s0, rtol=1e-3), "merged weight lost the base spectrum"
     print("merge: K=1 and spectrum OK")
+
+
+def merge_checkpoints(
+    base: str | Path,
+    specialists: list[str | Path],
+    out: str | Path,
+    method: str = "iso",
+    shard_bytes: int = 2 << 30,
+    **kw,
+) -> int:
+    """Merge safetensors checkpoints one tensor at a time and write sharded
+    output: peak memory is one tensor from each input plus one output shard,
+    not K+1 checkpoints. Inputs must hold bf16 masters (what ``save_hf`` writes
+    for a trained model); fp4 byte checkpoints are refused. Returns the tensor
+    count."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    def index(d: str | Path) -> dict[str, Path]:
+        d = Path(d)
+        files = sorted(d.glob("model-*.safetensors")) or [d / "model.safetensors"]
+        # a safe_open handle is not a dict: .keys() is its only listing
+        return {k: f for f in files for k in safe_open(str(f), "pt").keys()}  # noqa: SIM118
+
+    srcs = [index(base)] + [index(s) for s in specialists]
+    keys = list(srcs[0])
+    if any(k.endswith(".wq") for k in keys):
+        raise ValueError("merge needs bf16 masters; this checkpoint holds fp4 bytes (.wq)")
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    shutil.copy(Path(base) / "config.json", out / "config.json")
+    handles: dict[Path, object] = {}
+
+    def get(src: dict[str, Path], k: str) -> Tensor:
+        f = src[k]
+        if f not in handles:
+            handles[f] = safe_open(str(f), "pt")
+        return handles[f].get_tensor(k)
+
+    shard: dict[str, Tensor] = {}
+    weight_map: dict[str, str] = {}
+    size = 0
+
+    def flush() -> None:
+        nonlocal shard, size
+        if shard:
+            name = f"model-{len(set(weight_map.values())):05d}.safetensors"
+            save_file(shard, str(out / name))
+            weight_map.update(dict.fromkeys(shard, name))
+            shard, size = {}, 0
+
+    for k in keys:
+        w0, ws = get(srcs[0], k), [get(s, k) for s in srcs[1:]]
+        if method == "iso" and w0.dim() == 2 and all(w.shape == w0.shape for w in ws):
+            m = iso_merge_weight(w0, ws, **kw)
+        else:
+            m = torch.stack([w.float() for w in ws]).mean(0).to(w0.dtype)
+        shard[k] = m.contiguous()
+        size += m.numel() * m.element_size()
+        if size >= shard_bytes:
+            flush()
+    flush()
+    (out / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": weight_map}))
+    return len(keys)

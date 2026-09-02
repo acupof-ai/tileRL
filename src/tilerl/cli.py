@@ -492,16 +492,15 @@ def cmd_bench(args: argparse.Namespace) -> None:
 
 
 def cmd_merge(args: argparse.Namespace) -> None:
-    from . import config as config_mod
-    from . import merge as merge_mod
-    from .model import Model, drop_quantized, load_hf, save_hf
+    from .ledger import commit, new_manifest, now, runs_root, write_manifest
+    from .merge import merge_checkpoints
 
-    cfg = (config_mod.qwen38_27b if args.model == "qwen38-27b" else config_mod.tiny)()
-    # ponytail: every checkpoint resident in RAM as bf16 masters; stream per shard for the 27B
-    load = lambda d: drop_quantized(load_hf(cfg, d, keep_master=True)).params
-    merge = merge_mod.iso_merge if args.method == "iso" else merge_mod.average_merge
-    save_hf(Model(cfg, merge(load(args.base), [load(d) for d in args.specialists])), args.out)
-    print(f"merged {len(args.specialists)} specialists ({args.method}) -> {args.out}")
+    n = merge_checkpoints(args.base, args.specialists, args.out, method=args.method)
+    m = new_manifest("merge", {"base": args.base, "specialists": list(args.specialists),
+                               "method": args.method, "commit": commit()})
+    m["metrics"], m["artifacts"], m["finished"] = {"tensors": n}, {"out": args.out}, now()
+    write_manifest(runs_root(), m)
+    print(f"merged {len(args.specialists)} specialists ({args.method}) -> {args.out}  run {m['id']}")
 
 
 def cmd_ledger(args: argparse.Namespace) -> None:
@@ -530,7 +529,7 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          type=lambda v: [int(x) for x in v.split(",")] if v else [])
     p_serve.set_defaults(func=cmd_serve)
 
-    p_train = sub.add_parser("train", help="train a model on random-token batches")
+    p_train = sub.add_parser("train", help="SFT, --rl (GRPO) or --opd; --recipe for a gated flag set")
     # qwen38-27b loads from TILERL_QWEN38_SOURCE; --rl trains LoRA on the frozen
     # fp4 base, which is what fits one card.
     p_train.add_argument("--model", choices=["tiny", "tiny-agent", "qwen38-27b"], default="tiny")
@@ -611,7 +610,6 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_gen.set_defaults(func=cmd_generate)
 
     p_merge = sub.add_parser("merge", help="merge specialist checkpoints that share a base")
-    p_merge.add_argument("--model", choices=["tiny", "qwen38-27b"], default="tiny")
     p_merge.add_argument("--base", required=True, help="base checkpoint dir")
     p_merge.add_argument(
         "--specialists",
