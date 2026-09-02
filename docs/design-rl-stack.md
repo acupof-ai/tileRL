@@ -1,9 +1,6 @@
 # The RL stack — ISO optimizer + merger, an on-policy draft head, a ledger CLI
 
-Status 2026-09-02: direction accepted, nothing below is built. This doc says
-what each piece is, how it lands on the tape and the engine we already have,
-what physics constrains it, and the gate each one exits on. Order is by
-dependency; `docs/roadmap.md` carries the phases.
+Order is by dependency; `docs/roadmap.md` carries the phases.
 
 The product, in one line: **one card, one process, one command — train a draft
 head, RL, evaluate, merge, serve.** The agent drives the CLI; a human reads a
@@ -34,7 +31,7 @@ the best data-free baseline by 1.6 pt on Qwen2.5-7B (3 experts) and 0.9 pt on
 R1-Distill-1.5B.
 
 Why it matters here more than in the paper: in tileRL's cost model RL time is
-rollout time (`plan-training-rl.md` §2). 2.7× fewer steps is 2.7× less rollout,
+rollout time (`roadmap.md` P6). 2.7× fewer steps is 2.7× less rollout,
 before any kernel work.
 
 How it lands on the tape — optimizer-side only, no new backward:
@@ -42,7 +39,7 @@ How it lands on the tape — optimizer-side only, no new backward:
 - The linear's `dW` is already produced. An `ISO` optimizer wrapper turns it
   into `(G_U, G_V)`, steps `U, V` with the base optimizer, retracts, rebuilds
   `W = U Σ₀ Vᵀ`, and hands the served copy to the existing re-quantize path
-  (`plan-training-rl.md` P5: twiddled fp4 per step, **MMLU-gated** because
+  (`roadmap.md` P3: twiddled fp4 per step, **MMLU-gated** because
   quantization noise does not show in loss).
 - Retraction is Newton-Schulz polar (matmuls only, what Muon uses), not SVD:
   graph-capturable and a TileLang kernel when it matters.

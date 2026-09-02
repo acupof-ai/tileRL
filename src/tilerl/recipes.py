@@ -1,10 +1,5 @@
-"""Recipes: one name per configuration that passed a gate.
-
-A recipe is the full flag set for ``tilerl train``; explicit flags override
-it, and the manifest records which recipe a run started from. ``status``
-names the gate it passed — a recipe that has not run on its target says
-``pending-remote`` and the CLI prints that before training.
-"""
+"""Recipes: named ``tilerl train`` flag sets; ``status`` is the gate each passed
+(``pending-remote`` until it has run on its target). Explicit flags override."""
 
 from __future__ import annotations
 

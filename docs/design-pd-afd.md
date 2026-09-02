@@ -1,7 +1,7 @@
 # PD Disaggregation & AFD — Design Note
 
-Status: design, not implemented. Both are deployment topologies over the existing
-seams — no engine or model surgery required.
+Design only. Both are deployment topologies over the existing seams — no
+engine or model surgery.
 
 Reference: Step-3 AFD (arXiv 2507.19427), SGLang PD disaggregation docs.
 

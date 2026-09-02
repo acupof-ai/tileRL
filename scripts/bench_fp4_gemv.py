@@ -1,14 +1,7 @@
-"""Bench the fp4 decode path on the H20 pod: GEMV vs WGMMA-padded per linear,
-roofline efficiency, and slice decode before/after (same process, same GPU).
+"""fp4 decode path on H20: GEMV vs WGMMA-padded (GEMV key popped from the sm90 cell) per linear
+with roofline %, the fp8 linears' roofline, then slice decode before/after in one process.
 
-The "before" path is the exact pre-GEMV decode path: the GEMV key is popped
-from the sm90 registry cell, so backend.linear_fp4(M=1) pads to 16 WGMMA
-rows. The "after" path dispatches to the GEMV. Both go through the same
-backend entry point, so the numbers include identical Python overhead.
-
-Usage:
-    CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src TILERL_TARGET=cuda \\
-        python3 scripts/bench_fp4_gemv.py /host/tc27-nvfp4-slice2 --layers 2
+Usage: CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src TILERL_TARGET=cuda python3 scripts/bench_fp4_gemv.py /host/tc27-nvfp4-slice2 --layers 2
 """
 
 from __future__ import annotations
@@ -105,8 +98,7 @@ def bench_shapes(backend, model, cfg, bw_gbs: float) -> None:
         mma_ms = _time_calls(lambda: backend.linear_fp4(x, wq, scale), 50)
         _set_gemv(True)
 
-        # From the tensors, not a per-elem constant: the fp4 format is
-        # 0.625 B/elem at block-32 scales and 0.75 at the checkpoint's 16.
+        # From the tensors: 0.625 B/elem at block-32 scales, 0.75 at the checkpoint's 16.
         bytes_ = wq.numel() + scale.numel() * scale.element_size() + 2 * K  # bf16 X
         roof_ms = bytes_ / (bw_gbs * 1e9) * 1e3
         print(
@@ -116,9 +108,7 @@ def bench_shapes(backend, model, cfg, bw_gbs: float) -> None:
 
 
 def bench_fp8_shapes(backend, model, bw_gbs: float) -> None:
-    """The other half of the decode stream. Post-refactor the per-channel FP8
-    linears stay 8-bit (~47% of the 27B's weight bytes) and no roofline number
-    for that kernel exists anywhere. No WGMMA arm: linear_fp8 has no fallback."""
+    """fp8 linears are ~47% of the 27B's weight bytes; no WGMMA arm because linear_fp8 has no fallback."""
     keys = sorted(k[:-3] for k in model.params if k.endswith(".w8"))
     if not keys:
         return
@@ -185,9 +175,7 @@ def main() -> None:
     t0 = time.perf_counter()
     model = load_hf(qwen36_27b(), args.source, num_layers=args.layers)
     cfg = model.cfg
-    # Migrate params once (engine build does the same; bench_shapes runs
-    # before any engine exists, so without this it would time per-call H2D
-    # copies instead of the kernel).
+    # bench_shapes runs before any engine exists; without this it times H2D copies.
     model.params = {k: v.to(backend.device) for k, v in model.params.items()}
     print(f"load: {time.perf_counter() - t0:.0f}s", flush=True)
 

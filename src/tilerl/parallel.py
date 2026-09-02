@@ -1,22 +1,13 @@
 """Data parallelism: one engine per device, requests routed to the shortest queue.
 
-The 27B in NVFP4 is ~23 GB against a 96 GB card, so the model fits on ONE
-device. That is why data parallelism comes first here and tensor/pipeline
-parallelism do not: sharding a model that fits buys latency and pays
-communication, while replicating it buys aggregate throughput and pays only
-memory the cards already have. Measured before this module existed — eight
-independent processes reach 7.54x on 8 H20s (docs/experience/wins/
-2026-08-29-data-parallel-scales.md), which is the ceiling any in-process
-wrapper can approach but not beat.
-
-The seam does not move: :class:`DataParallelEngine` offers the same
-``submit`` / ``step`` / ``poll`` an :class:`~tilerl.engine.Engine` does, so a
-server or an OPD loop cannot tell the difference.
+The 27B in NVFP4 is ~23 GB against a 96 GB card, so replicating buys aggregate
+throughput for memory the cards already have. Eight independent processes
+measured 7.54x on 8 H20s (docs/experience/wins/2026-08-29-data-parallel-scales.md),
+the ceiling an in-process wrapper approaches. Same submit/step/poll seam as
+:class:`~tilerl.engine.Engine`.
 
 # ponytail: one process, N CUDA contexts — the GIL serialises the Python half
-# of each tick. A captured decode tick is one replay, so that half is small;
-# if it stops being small, the upgrade path is a process per device with the
-# router in front, which is what the 7.54x measurement already used.
+# of each tick; the upgrade is a process per device with the router in front.
 """
 
 from __future__ import annotations
@@ -26,23 +17,16 @@ from typing import Any
 
 import torch
 
-__all__ = ["DataParallelEngine"]
-
 
 def _on(device) -> Any:
-    """Device context, or nothing on a non-CUDA target — the CPU path is the
-    project's default and torch.cuda.device(None) raises there."""
     if device is None or torch.device(device).type != "cuda":
-        return contextlib.nullcontext()
+        return contextlib.nullcontext()  # torch.cuda.device(None) raises on the CPU target
     return torch.cuda.device(device)
 
 
 class DataParallelEngine:
-    """N engines on N devices behind one submit/poll/step.
-
-    Request ids are ``rank + n_ranks * inner_id`` so :meth:`poll` can demux
-    without a side table.
-    """
+    """N engines on N devices behind one submit/poll/step. Request ids are
+    ``rank + n_ranks * inner_id`` so :meth:`poll` demuxes without a side table."""
 
     def __init__(self, engines: list[Any], devices: list[torch.device]):
         if not engines:
@@ -53,12 +37,8 @@ class DataParallelEngine:
 
     @classmethod
     def build(cls, devices: list[int], make_engine, **kw) -> "DataParallelEngine":
-        """``make_engine(device_index, **kw)`` runs under that device's context.
-
-        The Backend binds ``torch.cuda.current_device()`` when it is
-        constructed, so each replica must be built inside its own context —
-        one built outside would silently share device 0's pools.
-        """
+        # The Backend binds torch.cuda.current_device() on construction, so each
+        # replica is built inside its own context or it shares device 0's pools.
         engines, devs = [], []
         for d in devices:
             with _on(torch.device("cuda", d)):
@@ -67,7 +47,6 @@ class DataParallelEngine:
         return cls(engines, devs)
 
     def submit(self, input_ids: Any, params: Any = None) -> int:
-        """Admit to the shortest queue; returns a global request id."""
         i = min(range(self._n), key=lambda j: self._engines[j].stats()["running"])
         with _on(self._devices[i]):
             rid = self._engines[i].submit(input_ids, params)
@@ -86,7 +65,6 @@ class DataParallelEngine:
         return out
 
     def logprobs(self, request_id: int) -> list[float] | None:
-        """Demux to the replica that served this id."""
         i = request_id % self._n
         return self._engines[i].logprobs(request_id // self._n)
 
@@ -95,7 +73,6 @@ class DataParallelEngine:
         return self._engines[i].take(request_id // self._n)
 
     def stats(self) -> dict[str, Any]:
-        """Summed counters, plus the per-replica running counts."""
         per = [e.stats() for e in self._engines]
         total = {k: sum(s[k] for s in per) for k in per[0] if isinstance(per[0][k], int)}
         total["replicas"] = self._n
@@ -106,8 +83,6 @@ class DataParallelEngine:
         return all(e.is_idle() for e in self._engines)
 
     def run(self) -> None:
-        """One daemon thread per replica — each engine already has its own, and
-        they touch disjoint devices and pools."""
         for i, e in enumerate(self._engines):
             with _on(self._devices[i]):
                 e.run()
@@ -138,7 +113,6 @@ if __name__ == "__main__":  # runnable check: routing and id demux, no GPU neede
     ids = [dp.submit([7] * (i + 1)) for i in range(6)]
     assert ids == [0, 1, 2, 3, 4, 5], ids  # round-robin while queues are equal
     got = dp.poll()
-    # every global id demuxes back to the replica that served it
     for gid, (tag, _) in got.items():
         assert gid % 3 == tag, (gid, tag)
     assert len(got) == 6, got

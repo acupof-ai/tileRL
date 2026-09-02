@@ -1,23 +1,11 @@
-"""Parity gates for the tilerl operator layer (hermetic, CPU target).
-
-Covers every op in the pinned interface contract:
-
-* Forward: TileLang kernel (CPU target) vs torch-eager reference,
-  allclose(rtol=1e-2, atol=1e-2) on random small inputs.
-* paged_attention vs a naive full-matrix attention.
-* Backward: every bwd op vs finite differences (torch gradcheck-style,
-  tiny shapes); attention_bwd is additionally cross-checked against
-  torch.autograd (finite diff is too noisy on softmax).
-
-Run: uv run pytest tests/test_ops_parity.py -v
-"""
+"""Parity gates: every backend op vs the torch-eager reference at
+allclose(rtol=1e-2, atol=1e-2); every backward vs finite differences or
+torch.autograd."""
 
 from __future__ import annotations
 
 import os
 
-# Hermetic CPU target: auto already maps to cpu on this Mac, but pin it so a
-# stray TILERL_TARGET in the environment can't hijack the suite.
 os.environ.setdefault("TILERL_TARGET", "cpu")
 
 import pytest
@@ -25,7 +13,7 @@ import torch
 
 from tilerl_kernels import reference
 from tilerl_kernels.backend import _MX, _resolve, get_backend
-from tilerl_kernels.reference import pack_fp4, renorm_fp4_scale
+from tilerl_kernels.reference import pack_fp4, renorm_fp4_scale, twiddle_fp4, untwiddle_fp4
 
 RTOL = 1e-2
 ATOL = 1e-2
@@ -37,12 +25,7 @@ def backend():
     return get_backend()
 
 
-# ---------------------------------------------------------------- helpers
-
-
 def _assert_close(a, b, msg):
-    # Compare on CPU: the tilelang backend may return device tensors (metal)
-    # while the reference stays on CPU.
     a = a.detach().cpu()
     b = b.detach().cpu()
     assert a.shape == b.shape, f"{msg}: shape {a.shape} vs {b.shape}"
@@ -98,32 +81,21 @@ def _autograd_gradcheck(name, fwd_ref, bwd_ref, inputs, max_rel=1e-2):
         assert diff / scale < max_rel, f"{name} input {i}: autograd rel err {diff / scale:.3e}"
 
 
-def _quantize_fp4(w_master: torch.Tensor):
-    """Pack a master weight into (wq uint8, scale f32) via the production packer."""
-    return pack_fp4(w_master)
+_quantize_fp4 = pack_fp4  # scripts/probe_linear_err.py imports it
 
 
 def _linear_fp4_fp8_ref(x, wq, scale):
-    """Torch reference for the sm90 fp8 prefill path: same per-token e4m3
-    activation quant + e2m1->e4m3 requant weight dequant, f32 matmul. e4m3's
-    ~2% multiplicative quant error does not average down over K, so the fp8
-    kernel is gated against this identical-quant reference (kernel
-    correctness), not the f32 linear_fp4 reference (quant precision)."""
-    M, K = x.shape
+    """The w4a8 path's identical-quant reference: e4m3's ~2% quant error does
+    not average down over K, so the gate is kernel correctness, not precision."""
     xbf = x.to(torch.bfloat16).float()
-    row_max = xbf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)  # [M,1]
-    ascale = (448.0 / row_max).to(torch.float32)
+    ascale = 448.0 / xbf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
     xq = (xbf * ascale).to(torch.float8_e4m3fn).float() / ascale
-    # weight: e2m1 grid * block scale, requanted to e4m3 (same as the kernel)
-    w_deq = reference.dequant_fp4(wq, scale)  # f32 [N,K]
-    w_q8 = w_deq.to(torch.float8_e4m3fn).float()
+    w_q8 = reference.dequant_fp4(wq, scale).to(torch.float8_e4m3fn).float()
     return xq @ w_q8.t()
 
 
 def _quantize_fp8(w_master):
-    """Per-128-block quant into the loader's native layout: w8 e4m3 [N,K],
-    wscale f32 [ceil(N/128), ceil(K/128)] (128 N-rows share one scale — the
-    ModelOpt block format; the last block is zero-padded)."""
+    """Per-128-block e4m3 quant in the loader's layout: w8 [N,K], wscale [ceil(N/128), ceil(K/128)]."""
     n, k = w_master.shape
     ns, ks = (n + 127) // 128, (k + 127) // 128
     padded = w_master.float().new_zeros(ns * 128, ks * 128)
@@ -137,11 +109,7 @@ def _quantize_fp8(w_master):
 
 
 def _linear_fp8_ref(x, w8, wscale):
-    """Torch reference for the sm90 native-fp8 prefill path: same per-token
-    e4m3 activation quant, native e4m3 weight (no requant), per-128-block
-    weight scale, f32 matmul. The weight side is exact, so the gate is kernel
-    correctness vs an identical-quant reference (the activation e4m3 error
-    does not average down over K)."""
+    """The w8a8 path's identical-quant reference."""
     xbf = x.to(torch.bfloat16).float()
     row_max = xbf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
     ascale = 448.0 / row_max
@@ -189,8 +157,7 @@ def test_linear_parity(backend):
 
 
 def test_linear_bf16_gemv_parity(backend):
-    """M=1 decode path: the sm90 cell resolves to the bf16 GEMV kernel (the
-    floor gemm on CPU/metal); same math as the WGMMA path."""
+    """M=1: the sm90 cell resolves to the bf16 GEMV."""
     torch.manual_seed(25)
     for N, K in [(24, 32), (16, 128), (18, 64)]:
         w = torch.randn(N, K)
@@ -220,10 +187,8 @@ def test_linear_bwd(backend):
 
 @pytest.mark.parametrize("block", [32, 16])
 def test_linear_fp4_grid(backend, block):
-    """The kernel's nibble decode is OCP e2m1, gated against a literal table.
-    pack_fp4/dequant_fp4/the kernel share one grid constant, so every other fp4
-    parity test passes with a wrong grid; only a literal table catches it. Both
-    checkpoint block sizes run: 16 is what the real 27B NVFP4 weights carry."""
+    """The nibble decode against a literal e2m1 table: pack/dequant/kernel share
+    one grid constant, so every other fp4 test passes with a wrong grid."""
     ocp = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     nib = torch.arange(16, dtype=torch.uint8).repeat(block // 16)  # K = block
     idx = (nib & 7).long()
@@ -236,11 +201,9 @@ def test_linear_fp4_grid(backend, block):
 
 
 def test_fp4_w4a8_e4m3_range():
-    """The w4a8 kernel dequantizes weights INTO e4m3, so ``6 * scale`` has to
-    land in e4m3's normal range: a checkpoint's own block scales saturate its
-    448 max (50% error here), and renorm_fp4_scale's power-of-two split brings
-    that back to e4m3's own 2.3% requant floor. No kernel test on a GPU-less
-    host can see it — the CPU dequant target is f32 — so it is gated in torch."""
+    """renorm_fp4_scale keeps 6 * scale inside e4m3's range for the w4a8
+    requant (raw checkpoint scales saturate at 50% error); gated in torch since
+    the CPU dequant target is f32."""
     torch.manual_seed(9)
     wq, scale = pack_fp4(torch.randn(64, 256) * 0.02, 16)  # real 27B magnitudes
     gs = scale.max() / 448.0  # NVFP4 stores block scales as e4m3
@@ -256,14 +219,8 @@ def test_fp4_w4a8_e4m3_range():
 
 def test_linear_fp4_parity(backend):
     torch.manual_seed(4)
-    w_master = torch.randn(24, 32)
-    wq, scale = _quantize_fp4(w_master)
-    # The reference has to follow the DISPATCH, not a guess at it. On CUDA the
-    # fp4 path holds through M=_MX (8) - scalar GEMV at 1, M-row GEMV to 3,
-    # mma8 to 8 - and only M>8 splits to fp8. Gating M=6 against the fp8
-    # reference compared two different quantizations and read as a 3.5e-2
-    # kernel error; against the right reference it is 3.1e-3, at the 2.1e-3
-    # floor a bf16-accumulating kernel cannot beat.
+    wq, scale = pack_fp4(torch.randn(24, 32))
+    # the reference follows the dispatch: fp4 through M=_MX, w4a8 above
     for m in (6, _MX + 8):
         x = torch.randn(m, 32)
         fp8_path = backend.target.startswith("cuda") and m > _MX
@@ -272,14 +229,10 @@ def test_linear_fp4_parity(backend):
 
 
 def test_linear_fp4_gemv_parity(backend):
-    """M=1 decode path: the sm90 cell resolves to the GEMV kernel (the floor
-    kernel on CPU/metal); same e2m1 decode math as the MMA kernel."""
+    """M=1 GEMV and the M-row GEMV (a row-indexing bug there is invisible at M=1)."""
     torch.manual_seed(20)
-    # M > 1 exercises the M-row GEMV, which decodes W once and reuses it across
-    # rows: a row-indexing bug there is invisible at M=1.
     for N, K in [(24, 32), (16, 128), (18, 64)]:
-        w_master = torch.randn(N, K)
-        wq, scale = _quantize_fp4(w_master)
+        wq, scale = pack_fp4(torch.randn(N, K))
         for M in (1, 2, 3, 4):
             x = torch.randn(M, K)
             _assert_close(
@@ -290,45 +243,25 @@ def test_linear_fp4_gemv_parity(backend):
 
 
 def test_linear_fp4_fp8_parity(backend):
-    """Prefill (M>1) fp8 path: per-32-block e4m3 activation quant + fp4->e4m3
-    exact-grid dequant + fp8 WGMMA. On CPU the backend resolves to the bf16
-    floor (tautology); on CUDA the sm90 cell resolves to the fp8 kernel.
-
-    The reference does the SAME per-32-block e4m3 quant in torch (not the f32
-    linear_fp4 reference): e4m3's ~2% multiplicative quant error does not
-    average down over K, so the gate is kernel correctness vs an identical-quant
-    torch reference, not quant precision vs f32. The e2m1 weight grid is an
-    exact subset of e4m3, so the weight side is error-free."""
+    """Prefill w4a8 path (M > _MX) vs the identical-quant reference on CUDA;
+    the f32 reference on CPU/metal."""
     torch.manual_seed(21)
-    # M must clear _MX (8) to reach the fp8 split at all: at M=4 and M=8 this
-    # test was measuring the fp4 mma8 kernel against an fp8 reference, which
-    # is the e4m3 re-quantization, not a kernel error. See test_linear_fp4_parity.
     for M, N, K in [(_MX + 8, 64, 256), (_MX + 4, 96, 128)]:
-        w_master = torch.randn(N, K) * 0.1
-        wq, scale = _quantize_fp4(w_master)
+        wq, scale = pack_fp4(torch.randn(N, K) * 0.1)
         x = torch.randn(M, K) * 0.5
         out = backend.linear_fp4(x, wq, scale)
-        if not backend.target.startswith("cuda"):
-            # CPU/metal: bf16 floor, compare to the f32 reference.
-            _assert_close(
-                out, reference.linear_fp4(x, wq, scale), f"linear_fp4_fp8 M={M} N={N} K={K}"
-            )
-            continue
-        # CUDA: fp8 path, identical-quant reference.
-        _assert_close(out, _linear_fp4_fp8_ref(x, wq, scale), f"linear_fp4_fp8 M={M} N={N} K={K}")
+        ref = _linear_fp4_fp8_ref if backend.target.startswith("cuda") else reference.linear_fp4
+        _assert_close(out, ref(x, wq, scale), f"linear_fp4_fp8 M={M} N={N} K={K}")
 
 
 # ---------------------------------------------------------------- linear fp8
 
 
 def test_linear_fp8_parity(backend):
-    """Native-fp8 linear: the sm90 cell's fp8 WGMMA kernel (M>1) is gated
-    against the identical-quant reference. A cell with no fp8 kernel raises —
-    the weight is converted to bf16 by Backend.materialize at load, never
-    served through a per-call master fallback."""
+    """Native fp8 linear on sm90; a cell without the kernel raises (materialize
+    converts the weight to bf16 at load instead)."""
     torch.manual_seed(26)
     kset = _resolve(backend.precision, backend.arch)
-    # Cover both regimes: the boundary is _MX, not M>1 (see below).
     for M, N, K in [(8, 128, 256), (4, 256, 128), (_MX + 8, 128, 256)]:
         w8, wscale = _quantize_fp8(torch.randn(N, K) * 0.1)
         x = torch.randn(M, K) * 0.5
@@ -337,20 +270,7 @@ def test_linear_fp8_parity(backend):
                 backend.linear_fp8(x, w8, wscale)
             continue
         out = backend.linear_fp8(x, w8, wscale)
-        # The ACTIVATION precision changes at _MX, and that is what the
-        # reference has to follow. Measured (scripts/probe_fp8_quant.py):
-        #
-        #   M     vs w8a8    vs w8a16
-        #   1     2.53e-02   3.66e-03      <- bf16 activation
-        #   4     2.24e-02   2.96e-04
-        #   8     2.46e-02   3.19e-04
-        #   16    4.04e-03   2.57e-02      <- e4m3 activation
-        #   32    2.65e-03   2.63e-02
-        #
-        # M <= _MX keeps the activation in bf16 (w8a16) and is exact to 3e-04;
-        # only above it does the per-token e4m3 quant cost its ~2.6%. Gating
-        # M=4 and M=8 against the w8a8 reference charged them a quantization
-        # they never paid.
+        # the activation stays bf16 through M=_MX (exact to 3e-4); e4m3 above (~2.6%)
         w8a8 = backend.target.startswith("cuda") and M > _MX
         ref = _linear_fp8_ref(x, w8, wscale) if w8a8 else reference.linear_fp8(x, w8, wscale)
         _assert_close(out, ref, f"linear_fp8 M={M} N={N} K={K}")
@@ -366,15 +286,12 @@ def test_ref_backend_fp8_surface():
 
 
 def test_linear_fp8_gemv_parity(backend):
-    """M=1 decode path: the sm90 cell resolves to the fp8 GEMV kernel; a cell
-    without one raises. The GEMV uses bf16 X (no activation quant, unlike the
-    M>1 MMA path), so the gate is the f32 dequant reference — the bf16 X
-    rounding is the only error source."""
+    """fp8 GEMV (bf16 X, no activation quant) vs the f32 dequant reference."""
     torch.manual_seed(28)
     kset = _resolve(backend.precision, backend.arch)
     for N, K in [(128, 256), (256, 128), (64, 512)]:
         w8, wscale = _quantize_fp8(torch.randn(N, K) * 0.1)
-        for M in (1, 2, 3, 4):  # M > 1 is the M-row GEMV (see the fp4 twin)
+        for M in (1, 2, 3, 4):
             x = torch.randn(M, K) * 0.5
             if "linear_fp8_gemv" not in kset:
                 with pytest.raises(NotImplementedError, match="linear_fp8"):
@@ -452,7 +369,6 @@ def test_embedding_bwd():
     table = torch.randn(5, 8)
     go = torch.randn(4, 8)
     gt = reference.embedding_bwd(go, idx, 5)
-    # finite diff on the two rows that are used
     for row in [1, 3]:
         for d in range(8):
             old = table[row, d].item()
@@ -500,11 +416,7 @@ def _naive_paged(q, k_cache, v_cache, block_table, seq_lens, scale):
 def test_paged_attention_vs_naive(backend):
     torch.manual_seed(13)
     b, h, hkv, d, block = 2, 4, 2, 16, 16
-    # The pool the engine actually passes is bf16 (PagedKvPool's dtype), and
-    # the sm90 kernel declares bf16. Building the cache with torch.randn's f32
-    # default made this gate test a configuration nothing runs: it passed on
-    # CPU, where the kernel takes f32, and raised a dtype mismatch on CUDA.
-    kv_dtype = torch.bfloat16
+    kv_dtype = torch.bfloat16  # the pool's dtype; an f32 cache tested nothing on CUDA
     k_cache = torch.randn(8, hkv, block, d).to(kv_dtype)
     v_cache = torch.randn(8, hkv, block, d).to(kv_dtype)
     block_table = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32)
@@ -531,9 +443,7 @@ def test_paged_attention_vs_naive(backend):
 
 
 def test_write_tokens_parity(backend):
-    """Paged KV scatter kernel vs the pool's torch-loop write (sm90-only
-    kernel; on other arches the backend op IS the loop, so the gate is the
-    kernel cell)."""
+    """Paged KV scatter kernel vs the pool's torch-loop write (sm90 only)."""
     if backend.arch != "sm90":
         pytest.skip("write_tokens kernel is sm90-only")
     torch.manual_seed(24)
@@ -558,9 +468,7 @@ def test_write_tokens_parity(backend):
 
 
 def test_gdn_conv_window_makes_step_exact():
-    """The conv_window carry makes segmented decode (T=1 per forward) exactly
-    equal to a one-shot chunk forward: threading the returned window through
-    each step reproduces the chunk outputs and final state."""
+    """Segmented decode (T=1 per forward, window carried) equals a one-shot chunk forward."""
     torch.manual_seed(17)
     b, t, nkh, nvh, kd, vd, ker = 2, 6, 2, 2, 16, 16, 4
     q = torch.randn(b, t, nkh * kd) * 0.1
@@ -598,9 +506,7 @@ def test_gdn_conv_window_makes_step_exact():
 
 
 def test_gdn_decode_fused_parity(backend):
-    """Full-GDN decode (T=1): backend vs reference.gdn_forward. On CPU the
-    backend resolves to the reference (tautology); on CUDA the sm90 cell
-    resolves to the fused kernel — the real gate."""
+    """GDN decode (T=1): backend vs reference.gdn_forward (a tautology off sm90)."""
     torch.manual_seed(19)
     b, nkh, nvh, kd, vd, ker = 2, 2, 4, 16, 16, 4
     qkv = 2 * nkh * kd + nvh * vd
@@ -627,7 +533,6 @@ def test_gdn_decode_fused_parity(backend):
 
 
 def _gdn_inputs(b, t, nkh, nvh, kd, vd, ker, seed, scale=1.0):
-    """Random full-GDN inputs (seeded): q/k/v/g/beta/z/state/window + kwargs."""
     torch.manual_seed(seed)
     sc = 0.1 * scale
     qkv = 2 * nkh * kd + nvh * vd
@@ -650,21 +555,12 @@ def _gdn_inputs(b, t, nkh, nvh, kd, vd, ker, seed, scale=1.0):
 
 
 def test_gdn_chunk_fused_parity_full_scale(backend):
-    """Same gate at the model's real input magnitude, not the fixtures' 0.1.
-
-    The previously rejected chunked pipeline passed at scale 0.1 (0.8% error)
-    and was 26% wrong at scale 1.0, where post-conv1d SiLU activations actually
-    live — bf16 intermediates between stages. This gate is for that failure
-    mode, so its tolerance is 5%, not the suite's 1%: the shipped kernel is
-    bf16-IO and lands at 1.2% here against an f32 reference, which is the
-    format's own noise and not a defect. Written at 1% first, where it failed
-    on the SHIPPED kernel — an always-red gate catches nothing.
-    """
+    """The chunk gate at the model's real input magnitude: a rejected pipeline
+    passed at scale 0.1 and was 26% wrong at 1.0. Tolerance 5%, not 1%: the
+    bf16-IO kernel lands at 1.2% here, which is the format's own noise."""
     q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 96, 2, 6, 16, 16, 4, 37, scale=10.0)
     got = backend.linear_attn_chunk(q, k, v, g, beta, state, z=z, **kw)
     ref = reference.gdn_forward(q, k, v, g, beta, state, z=z, **kw)
-    # All three, so a failure says WHERE: a wrong state is the recurrence, a
-    # right state with a wrong out is the readout or the epilogue.
     bad = []
     for a, b_, name in zip(got, ref, ("out", "state", "window")):
         if a is None or b_ is None:
@@ -677,9 +573,7 @@ def test_gdn_chunk_fused_parity_full_scale(backend):
 
 
 def test_gdn_chunk_fused_parity(backend):
-    """Full-GDN prefill (T>1): backend vs reference.gdn_forward. On CPU the
-    backend resolves to the reference (tautology); on CUDA the sm90 cell
-    resolves to the fused chunk kernel — the real gate."""
+    """GDN prefill (T>1): backend vs reference.gdn_forward (a tautology off sm90)."""
     q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 6, 2, 4, 16, 16, 4, 23)
     out, ns, nw = backend.linear_attn_chunk(q, k, v, g, beta, state, z=z, **kw)
     rout, rns, rnw = reference.gdn_forward(q, k, v, g, beta, state, z=z, **kw)
@@ -689,13 +583,7 @@ def test_gdn_chunk_fused_parity(backend):
 
 
 def test_gdn_chunkwise_matches_serial():
-    """The chunkwise-WY decomposition equals the serial decay-first scan over a
-    FULL layer — conv, norms, gates and z-gate included, not just the core.
-
-    This is the gate the five-kernel prefill port is written against: every
-    stage replaces one line of `gdn_chunk_core` with a kernel, and this is what
-    says the algebra it implements is the algebra we ship.
-    """
+    """chunkwise-WY equals the serial scan over a full layer (conv, norms, gates included)."""
     q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 96, 2, 6, 16, 16, 4, 31)
     ref = reference.gdn_forward(q, k, v, g, beta, state, z=z, **kw)
     for chunk in (16, 32, 64):
@@ -705,9 +593,7 @@ def test_gdn_chunkwise_matches_serial():
 
 
 def test_gdn_chunk_matches_decode(backend):
-    """The chunk kernel at T=1 equals the decode kernel (it is the T-loop
-    generalization of make_gdn_decode_fused — same fused ops, same order).
-    sm90-only: both kernels live in the sm90 cell."""
+    """The chunk kernel at T=1 equals the decode kernel (sm90 only)."""
     if backend.arch != "sm90":
         pytest.skip("GDN fused kernels are sm90-only")
     q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 1, 2, 4, 16, 16, 4, 29)
@@ -752,18 +638,14 @@ def test_gdn_chunk_matches_decode(backend):
         bf16(kw["conv_window"]),
         f32(state),
         c(seq_q),
-        # KS=1 dummies, exactly as Backend._gdn_chunk_fused passes for a
-        # non-speculative call: they are inputs, and omitting them left the
-        # kernel's KS constexpr unbound.
+        # KS=1 dummies, as Backend._gdn_chunk_fused passes them
         torch.empty((*state.shape[:1], 1, *state.shape[1:]), dtype=torch.float32,
                     device=backend.device),
         torch.empty((state.shape[0], 1, *kw["conv_window"].shape[1:]), dtype=torch.bfloat16,
                     device=backend.device),
         threads=state.shape[-1],
     )
-    # The chunk kernel returns the raw recurrence output now — its gated
-    # RMSNorm and z-gate live in Backend._gdn_chunk_fused, off the per-token
-    # critical path. Apply them here so the two kernels are comparable again.
+    # the chunk kernel returns the raw recurrence output; apply the caller's norm + z-gate
     nvh, vd = state.shape[1], state.shape[-1]
     cout = backend.silu_mul(
         backend._dev(z, torch.float32).reshape(cout.shape[0], cout.shape[1], nvh, vd),
@@ -776,9 +658,7 @@ def test_gdn_chunk_matches_decode(backend):
 
 
 def test_gdn_chunk_adjoint_is_exact():
-    """The chunked backward is the EXACT adjoint of the chunked forward: in f64
-    it matches autograd to ~1e-15, so any f32 gap is reduction order and not
-    algebra. Guards the 25-term hand derivation term by term."""
+    """The chunked backward is the exact adjoint of the chunked forward (f64, ~1e-15 vs autograd)."""
     torch.manual_seed(3)
     b, n, h, dk, dv = 2, 6, 3, 5, 4
     f64 = dict(dtype=torch.float64)
@@ -794,17 +674,13 @@ def test_gdn_chunk_adjoint_is_exact():
     ((out * dout).sum() + (nxt * dnxt).sum()).backward()
     _, _, cache = reference._gdn_chunk_fwd(q, k, v, bt, gt, st)
     got = reference._gdn_chunk_bwd(dout, dnxt, q, k, v, bt, cache)
-    # _gdn_chunk_bwd returns (dq, dk, dv, dbeta, dgt, dS); leaves are in the
-    # forward's argument order (q, k, v, beta, gt, state).
     for name, g, leaf in zip(["q", "k", "v", "beta", "gt", "state"], got, leaves):
         rel = (g - leaf.grad).abs().max() / leaf.grad.abs().max().clamp_min(1e-30)
         assert rel < 1e-12, f"chunk adjoint d{name}: rel {rel:.2e}"
 
 
 def test_gdn_bwd_spans_chunks():
-    """The shipped gradcheck runs at T=3, which never leaves the first chunk.
-    This one spans several, including a partial tail, and holds the error to the
-    level the serial scan it replaced achieved (~3-9e-7)."""
+    """gdn_backward across several chunks with a partial tail (test_gdn_bwd's T=3 never leaves one)."""
     for t in (reference._GDN_CHUNK, 2 * reference._GDN_CHUNK + 5):
         q, k, v, g, beta, z, state, kw = _gdn_inputs(1, t, 2, 2, 8, 8, 8, 24)
         window = torch.zeros_like(kw["conv_window"])
@@ -828,11 +704,9 @@ def test_gdn_bwd_spans_chunks():
 
 
 def test_gdn_bwd():
-    """gdn_backward vs torch.autograd on gdn_forward. The tape is hand-written
-    and this is the only direct gate on the gated-delta gradients; finite
-    differences are too noisy across the scan."""
+    """gdn_backward vs torch.autograd (finite differences are too noisy across the scan)."""
     q, k, v, g, beta, z, state, kw = _gdn_inputs(1, 3, 1, 1, 4, 4, 4, 24)
-    window = torch.zeros_like(kw["conv_window"])  # what a training forward carries
+    window = torch.zeros_like(kw["conv_window"])
     order = ("conv1d_weight", "dt_bias", "a_log", "norm_weight")
 
     def fwd(*leaves):
@@ -878,14 +752,11 @@ def test_sample_deterministic():
     assert (t1 == t2).all(), "sample: same seed must give same tokens"
     assert (t1 != t3).any(), "sample: different seed should differ"
     assert ((t1 >= 0) & (t1 < 100)).all(), "sample: token ids out of range"
-    # low temperature + tiny top_p is near-greedy
     greedy = reference.sample(logits, 0.01, 0.01, 7)
     assert (greedy == logits.argmax(-1)).float().mean() > 0.9
 
 
 def test_sample_batch_matches_per_row():
-    """The batched sampler must draw the same tokens as per-row sample with
-    the same seeds — it only fuses the sort/softmax, not the draws."""
     torch.manual_seed(18)
     logits = torch.randn(5, 100)
     temps = torch.tensor([1.0, 0.0, 0.8, 0.0, 1.0])  # rows 1,3 greedy
@@ -897,12 +768,7 @@ def test_sample_batch_matches_per_row():
         assert batched[i] == one[0], f"row {i}: batch {batched[i]} vs per-row {one[0]}"
 
 
-# ---------------------------------------------------------------- backend plumbing
-
-
-def test_backend_target_and_device(backend):
-    assert backend.target in ("c", "cuda", "llvm", "metal")
-    assert isinstance(backend.device, torch.device)
+# ---------------------------------------------------------------- misc
 
 
 def test_cross_entropy_is_stable_and_matches_gradient(backend):
@@ -910,26 +776,20 @@ def test_cross_entropy_is_stable_and_matches_gradient(backend):
     loss, grad = backend.cross_entropy_loss_grad(logits, [[0, 1]])
     assert loss == pytest.approx(100.0)
     assert torch.equal(grad[0, 0], torch.tensor([1.0, -1.0]))
+
+
 def test_fp4_twiddle_round_trip():
-    """sm90 serves fp4 in the twiddled byte layout; save_hf must undo it exactly."""
-    import torch
-
-    from tilerl_kernels.reference import twiddle_fp4, untwiddle_fp4
-
+    """sm90 serves the twiddled byte layout; save_hf must undo it exactly."""
     wq = torch.randint(0, 256, (6, 32), dtype=torch.uint8, generator=torch.Generator().manual_seed(0))
     tw = twiddle_fp4(wq)
     assert tw.shape == wq.shape and not torch.equal(tw, wq)
     assert torch.equal(untwiddle_fp4(tw), wq)
 
+
 def test_frozen_bwd_chunking_matches_whole():
-    """Chunked dX must equal the one-shot result for both quant formats.
-
-    The chunking is what keeps lm_head's backward from peaking 14.2 GiB, and
-    an fp8 scale covers a 128-row block — a chunk boundary that splits a block
-    reads the wrong scale, which no throughput number would reveal.
-    """
-    from tilerl_kernels import reference as ref
-
+    """Chunked dX equals the one-shot result: a chunk boundary that splits an
+    fp8 128-row scale block reads the wrong scale."""
+    ref = reference
     torch.manual_seed(0)
     n, k = 1024, 256
     osc, g = torch.rand(n) + 0.5, torch.randn(3, 5, n)

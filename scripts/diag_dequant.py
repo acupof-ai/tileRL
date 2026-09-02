@@ -1,11 +1,6 @@
-"""Diag: old (per-element dequant) vs new (vectorized shared dequant) fp4
-prefill kernel, same process, back-to-back — the ratio is the dequant-schedule
-win, contention-independent. Builds the OLD kernel inline (git HEAD version)
-and the NEW kernel from kernels_mma, benches both at MLP prefill shapes.
-
-Usage:
-    TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=3 \\
-        PYTHONPATH=src python3 scripts/diag_dequant.py
+"""Old (per-element dequant, inlined below) vs new (kernels_mma) fp4 prefill
+kernel, same process, at MLP prefill shapes.
+    TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src python3 scripts/diag_dequant.py
 """
 
 from __future__ import annotations
@@ -20,8 +15,6 @@ from tilerl_kernels.reference import pack_fp4
 
 
 def old_linear_fp4_fp8_mma(target: str):
-    """git HEAD version: per-element T.Parallel dequant in the K-loop,
-    scale from global per element, block_K=64, num_stages=3."""
     _BLOCK_K = 64
 
     @tilelang.jit(

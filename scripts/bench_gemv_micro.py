@@ -1,28 +1,11 @@
-"""Time the fp4 decode GEMV's (micro_size_k, GROUP) grid. GPU, no model load.
+"""Time the fp4 decode GEMV's (micro_size_k, GROUP) grid on a GPU, no model load. micro sets the
+load width (8/16/32 -> LDG.32/.64/.128), micro*GROUP the register footprint; six arms because
+equal-footprint points form ladders, with (16,2) as the control on that argument. Block-16
+scales (the checkpoint's); bytes come from the tensors, never a constant.
 
-``micro_size_k`` alone sets the weight-stream load width (8 -> LDG.32, 16 -> .64,
-32 -> .128); ``micro_size_k * GROUP`` sets the register footprint.
-``scripts/_sweep_gemv_micro.py`` already proves all 9 combinations lower, index
-exactly and carry no runtime-indexed local array — this is the half that needs a
-GPU.
+    CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src TILERL_TARGET=cuda python3 -u scripts/bench_gemv_micro.py [--compile-only]
 
-Six arms, not nine. At equal register footprint the widest micro moves the same
-bytes in the same shuffle batch with strictly fewer load instructions, so
-{(8,4),(16,2),(32,1)} and {(16,4),(32,2)} are ladders, not independent points.
-(16,2) rides along as the control ON that dominance argument: same 52 register
-slots and same 16 B/thread as (32,1), differing only in load count. If it wins,
-the ladder is falsified and all 9 have to be measured.
-
-Weights are **block 16**, which is what the checkpoint ships. Every older sweep
-in ``scripts/`` declared block-32 scales and still scored against 0.75 B/elem —
-a 1.2x overstatement that puts the *baseline* arm above the kill bar before
-anything is tested. Bytes here come from the tensors, never from a constant.
-
-    CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src TILERL_TARGET=cuda \
-        python3 -u scripts/bench_gemv_micro.py [--compile-only]
-
-``--compile-only`` runs the JIT and the correctness gate and prints no timings —
-safe to overlap a model load on the other GPU. Never overlap the timing pass.
+--compile-only runs the JIT and correctness gate only; never overlap the timing pass with a load.
 """
 
 from __future__ import annotations
@@ -40,19 +23,11 @@ from tilerl_kernels import kernels_linear, reference  # noqa: E402
 ARMS = ((8, 4), (32, 1), (32, 2), (32, 4), (16, 1), (16, 2))
 SHAPES = (("down", 5120, 17408), ("gate_up", 34816, 5120))
 RT, NP, BLOCK = 32, 4, 16  # reduce_thread / n_partition / scale block
-#: Marlin's own wall time on down_proj at M=1, the ambition bar (gate B).
-#: Its 1.29 TB/s is 0.5625 B/elem (e4m3 group scales); tileRL stores f32 block
-#: scales = 0.75 B/elem, so the two TB/s figures are NOT comparable — the
-#: comparable quantity is microseconds.
-MARLIN_DOWN_US = 38.9
+MARLIN_DOWN_US = 38.9  # Marlin down_proj M=1 wall time; compare us, not TB/s (0.5625 vs 0.75 B/elem)
 
 
 def inputs(n: int, k: int):
-    """Random e2m1 nibbles + block-16 scales on device, plus the f32 reference.
-
-    Nibbles are generated directly rather than via ``pack_fp4``, whose ``dist``
-    tensor is 32 bytes per weight element (5.7 GB at gate_up).
-    """
+    # Nibbles drawn directly: pack_fp4's dist tensor is 32 B/elem (5.7 GB at gate_up).
     dev = "cuda"
     g = torch.Generator(device=dev).manual_seed(0)
     wq = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=dev, generator=g)
@@ -67,8 +42,7 @@ def inputs(n: int, k: int):
 
 def arm(micro: int, group: int, x, wq, scale):
     k = x.shape[1]
-    # _CUDA_PLAN pads this kernel's K to 256; a block covers RT*micro. Direct
-    # calls assert instead of padding — see POD-VERIFY, step 8.
+    # Direct calls skip _CUDA_PLAN's K padding; a block covers RT*micro.
     assert k % (RT * micro) == 0, f"K={k} not a multiple of {RT * micro} (micro={micro})"
     fn = kernels_linear.make_linear_fp4_gemv("cuda", micro, group)
     return lambda: (fn(x, wq, scale, RT, NP, BLOCK),)

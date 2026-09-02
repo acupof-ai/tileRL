@@ -1,11 +1,5 @@
-"""At M=8 the fp4 decode GEMM is `mma8`, which issues 1.93x the load
-instructions of the GEMV for identical DRAM traffic. The tree already holds a
-SECOND fp4 decode GEMM — `linear_fp4_fp8_decode`, fp4->e4m3 dequant into an fp8
-WGMMA — registered for the decode bucket but unreachable, because the mma8
-branch takes 2 <= M <= _MX first. Nobody has compared them at M=8.
-
-Both go through `Backend.linear_fp4`, so the A/B is `_MX`: at 7, M=8 falls
-through to the w4a8 path.
+"""mma8 vs the unreachable `linear_fp4_fp8_decode` (w4a8) at M=8. Both go through
+`Backend.linear_fp4`, so the A/B is `_MX`: at 7, M=8 falls through to the w4a8 path.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/probe_fp4_decode_paths.py

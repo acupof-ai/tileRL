@@ -99,11 +99,9 @@ def merge_checkpoints(
     shard_bytes: int = 2 << 30,
     **kw,
 ) -> int:
-    """Merge safetensors checkpoints one tensor at a time and write sharded
-    output: peak memory is one tensor from each input plus one output shard,
-    not K+1 checkpoints. Inputs must hold bf16 masters (what ``save_hf`` writes
-    for a trained model); fp4 byte checkpoints are refused. Returns the tensor
-    count."""
+    """Merge checkpoints one tensor at a time into sharded output (peak memory:
+    one tensor per input plus one shard). Inputs must hold bf16 masters. Returns
+    the tensor count."""
     from safetensors import safe_open
     from safetensors.torch import save_file
 

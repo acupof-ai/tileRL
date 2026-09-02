@@ -1,7 +1,7 @@
 # Engine design
 
-The serving stack is four layers, each with one seam. The seams held through
-CUDA bring-up and the 27B slice without changes — they are the contract.
+Four layers, one seam each. The seams held through CUDA bring-up and the 27B
+unchanged — they are the contract.
 
 ## Layers
 

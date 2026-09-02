@@ -35,13 +35,8 @@ def main() -> None:
     ids = list(range(8))
     backend = Backend(resolve_target())
 
-    # BOTH tie settings. The tiny model ties its head to the embedding, which
-    # stays replicated - so a tied-only gate cannot see the vocab-parallel
-    # lm_head path at all, and that is exactly how a missing all_gather
-    # shipped. The 27B is untied.
+    # untied is required: a tied head stays replicated and never exercises the vocab-parallel path.
     ok = True
-    # attn-only and gdn-only truncations first: they say WHICH layer kind
-    # diverges, which a whole-model error cannot.
     base = tiny()
     variants = [
         ("attn-only", replace(base, num_layers=1, full_attn_layers=(0,))),
@@ -51,11 +46,7 @@ def main() -> None:
     ]
     for tie, cfg in variants:
         full = build_random(cfg, seed=0)
-        # The reference must run with TP OFF. Joining the group first makes
-        # _add_via all-reduce the UNSHARDED output of every row-parallel
-        # projection, which doubles each layer's residual branch - the
-        # reference, not the shard, is then wrong. That mistake read as a
-        # 3e-2 sharding regression.
+        # reference with TP off, else _add_via all-reduces the unsharded residual branch.
         backend.tp_world = 1
         ref = _logits(cfg, dict(full.params), backend, ids)
         backend.init_tp(world, rank)

@@ -1,12 +1,6 @@
-"""Bench paged_attention on the H20 pod: prefill (M=512) and decode (M=1)
-at the 27B full-attn shapes (H=24, Hkv=4, D=256, block=16) vs roofline.
-
-Kernel-level: calls the kernel factory directly (naive f32 vs sm90 MMA),
-not the backend method, so the numbers are raw kernel time.
-
-Usage:
-    CUDA_VISIBLE_DEVICES=5 PYTHONPATH=src TILERL_TARGET=cuda \\
-        python3 scripts/bench_paged_attn.py [--kernel naive|mma]
+"""Raw kernel time of paged_attention (naive f32 vs sm90 MMA) at the 27B
+full-attn shapes, prefill M=512 and decode M=1, vs roofline.
+    CUDA_VISIBLE_DEVICES=5 PYTHONPATH=src TILERL_TARGET=cuda python3 scripts/bench_paged_attn.py [--kernel naive|mma]
 """
 
 from __future__ import annotations
@@ -24,7 +18,6 @@ BF16_TFLOPS = 148.0
 
 
 def measure_bw_gbs() -> float:
-    """Achievable HBM BW from a device-to-device copy (read+write = 2N bytes)."""
     n = 256 * 2**20 // 4
     src = torch.empty(n, dtype=torch.float32, device="cuda")
     dst = torch.empty_like(src)
@@ -96,7 +89,7 @@ def bench(kernel: str, bw_gbs: float) -> None:
         print(f"  {'decode M=1 KV=4096':<22} {ms:>10.4f} {roof:>10.4f} {roof / ms * 100:>7.1f}%")
     else:
         run = lambda: k(q, kc, vc, bt, sl, scale, block_size=BLOCK, threads=64)  # noqa: E731
-        run()  # JIT warmup (30-120s on first compile)
+        run()  # JIT warmup
         ms = time_calls(run, 50)
         bytes_kv = 2 * HKV * kv_len * D * 4
         roof = bytes_kv / (bw_gbs * 1e9) * 1e3

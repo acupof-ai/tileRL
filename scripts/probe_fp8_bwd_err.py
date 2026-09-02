@@ -1,10 +1,4 @@
-"""Where does the fp8 dX kernel's error come from — the weight cast or the
-gradient cast?
-
-The kernel dequantizes W8*scale into bf16 inside the K-loop, and the caller
-casts the gradient to bf16 for the WGMMA. Both round; only one is worth fixing.
-Compares against the f32 reference and against two f32 references that emulate
-one rounding each.
+"""Is the fp8 dX kernel's error from the weight cast or the gradient cast? Emulate each in f32.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/probe_fp8_bwd_err.py
@@ -19,9 +13,7 @@ from tilerl_kernels.backend import get_backend
 
 
 def rel(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Norm-relative error. NOT the elementwise max ratio: a dX output has
-    cancellation, so elements land near zero and that ratio reports thousands
-    for a result that is fine."""
+    # norm-relative: dX cancels, so an elementwise max ratio blows up near zero
     return float((a - b).norm() / b.norm())
 
 

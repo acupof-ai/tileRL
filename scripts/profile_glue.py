@@ -46,8 +46,7 @@ def main() -> None:
         engine.step()
     torch.cuda.synchronize()
 
-    # Python-level attribution: every torch op call with its innermost tilerl
-    # frame (profiler stacks come back empty for aten ops on this torch).
+    # profiler stacks come back empty for aten ops on this torch, so attribute in Python.
     import traceback
 
     from torch.overrides import TorchFunctionMode
@@ -75,11 +74,6 @@ def main() -> None:
     with Rec():
         engine.step()
     torch.cuda.synchronize()
-    _ = {k: v for k, v in counts.items() if k[0] in (
-        "copy_", "contiguous", "mul", "__mul__", "index", "__getitem__", "__setitem__", "index_put_",
-        "add", "__add__", "cat", "to", "float", "clone", "zeros", "full", "sigmoid", "nonzero", "sum",
-        "reshape", "view", "unsqueeze", "expand", "pad", "empty",
-    )}
     print(f"\n{args.layers} layers B={args.batch}: {sum(counts.values())} torch calls in one tick\n")
     print(f"{'op':<14} {'site':<70} {'n':>4}")
     for (op, site), n in sorted(counts.items(), key=lambda kv: -kv[1]):

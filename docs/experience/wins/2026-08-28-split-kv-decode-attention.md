@@ -45,7 +45,7 @@ sequence per pool):
 | 262144 | 20.81 | **48.1** |
 
 256K decode at 48 tok/s on a single card is what makes 128K–256K RL rollouts
-a budget question rather than an impossibility (docs/plan-training-rl.md).
+a budget question rather than an impossibility (docs/roadmap.md, P6).
 
 ## Rule
 

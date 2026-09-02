@@ -1,13 +1,6 @@
-"""Parity for the fused frozen-base backward (dequant + gemm_nn in one kernel).
-
-gx = grad @ W contracts over the weight's ROW index, so the packed slab is
-already gemm_nn's B tile — no transpose, and the bf16 weight is never
-materialized. The kernel decodes the SERVED (twiddled) bytes while the
-reference untwiddles first, so a wrong slot map shows up here immediately,
-which is the only cheap check on a bit permutation.
-
-Block 16, the shipped checkpoint's scale block (the kernel bakes it in).
-
+"""Parity for the fused frozen-base backward (dequant + gemm_nn, block 16).
+The kernel decodes the served (twiddled) bytes while the reference untwiddles
+first, so a wrong slot map shows up here.
   CUDA_VISIBLE_DEVICES=7 python scripts/parity_dequant_fp4.py
 """
 

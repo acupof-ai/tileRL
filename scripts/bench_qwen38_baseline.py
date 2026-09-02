@@ -1,18 +1,6 @@
-"""Qwen3.8-27B NVFP4 full-model serving baseline (H20 pod, dev tool).
-
-Loads the full 27B through the serving build (``qwen38_27b`` + ``load_hf``
-with ``fuse_projections=True``, decode graph on) and reports steady-state
-decode B=1 (ms/tick, tok/s) and prefill tok/s at 512 / 2048 / 8192 tokens.
-Prefill is chunked at ``max_num_batched_tokens=512`` like serving, so longer
-prompts are multiple M=512 ticks.
-
-Pool sizes are bumped from serving's 256 blocks / 8192 max_total_tokens to
-1024 / 16384 so an 8192-token prompt fits (256 blocks = 4096 tokens); the
-per-tick kernels are identical (block-table width is the only difference).
-
-Usage:
-    TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=7 \\
-        PYTHONPATH=src python3 scripts/bench_qwen38_baseline.py /data00/Qwen3.8-27B-NVFP4
+"""Qwen3.8-27B NVFP4 serving baseline: decode B=1 ms/tick and prefill tok/s
+at 512 / 2048 / 8192 tokens through the serving build (fused, decode graph on).
+    TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src python3 scripts/bench_qwen38_baseline.py /data00/Qwen3.8-27B-NVFP4
 """
 
 from __future__ import annotations
@@ -43,7 +31,6 @@ def _rand_prompt(vocab: int, n: int, seed: int) -> list[int]:
 
 
 def time_decode(engine, vocab: int, ticks: int) -> tuple[float, float]:
-    """Steady-state decode B=1: prefill untimed, then ``ticks`` timed ticks."""
     wid = engine.submit(
         _rand_prompt(vocab, 512, seed=11),
         SamplingParams(temperature=0.0, max_new_tokens=ticks + 4, seed=0),
@@ -62,8 +49,6 @@ def time_decode(engine, vocab: int, ticks: int) -> tuple[float, float]:
 
 
 def time_prefill(engine, vocab: int, length: int, decode_ms: float) -> tuple[float, float]:
-    """One request, timed from first step to completion (prefill chunks +
-    the 1-token decode finish). Prefill-only time subtracts that one tick."""
     wid = engine.submit(
         _rand_prompt(vocab, length, seed=length),
         SamplingParams(temperature=0.0, max_new_tokens=1, seed=0),
@@ -109,10 +94,7 @@ def main() -> None:
         flush=True,
     )
 
-    # Warmup: compile every (shape, dtype) the timed run touches. Prefill
-    # chunks are always M=512 (max_num_batched_tokens), so one 512-token
-    # prompt + decode covers all prefill and decode shapes; pass 2 confirms
-    # the numbers are JIT-free.
+    # Prefill chunks are always M=512, so one 512-token prompt + decode compiles every shape.
     for pass_no in (1, 2):
         t0 = time.perf_counter()
         wid = engine.submit(

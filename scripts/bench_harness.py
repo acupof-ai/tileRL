@@ -1,27 +1,15 @@
-"""tilerl bench harness: one runner, five suites, a snapshot baseline gate.
+"""tilerl bench harness: one runner, a snapshot baseline gate.
 
-Fills the coverage holes the scattered bench_*.py scripts left open:
+  decode-kv   decode tok/s vs KV depth at B=1..8
+  prefill     prefill tok/s vs prompt length
+  kv-reuse    prefix-cache hits + warm-vs-cold prefill
+  spec        speculative decode goodput vs plain, same process (27B only)
+  train       train_step fwd+bwd tok/s (tiny on CPU, 27B LoRA on the pod)
+  train-full  full-parameter: bf16 masters, Adafactor; its own process (masters + fp4 base don't fit one card)
+  accuracy    MMLU 0-shot % on a fixed slice (27B only) — the one non-speed gate
 
-  decode-kv   decode tok/s vs KV depth (512/2k/8k/32k) at B=1,8 — the serving
-              metric that DEGRADES with context (paged-attention KV read scales
-              with depth). The old verify check 4 timed one shallow ~512 depth.
-  prefill     prefill tok/s vs prompt length, as a curve not 3 points.
-  kv-reuse    prefix-cache hit-rate + warm-vs-cold prefill speedup (the engine's
-              PrefixStore was perf-untested).
-  spec        speculative decode goodput vs the draft head (27B only).
-  train       train_step fwd+bwd tok/s (tiny on CPU, 27B LoRA on the pod).
-  train-full  the same, full-parameter: bf16 masters, Adafactor, gradients
-              consumed inside backward. Its own process — masters and a frozen
-              fp4 base do not share a card.
-  accuracy    MMLU 0-shot % on a fixed slice (27B only). Every other suite gates
-              speed; without this one an "optimization" that breaks the logits
-              passes the whole harness.
-
-Baseline: docs/experience/wins/bench-baseline.json, keyed (suite, shape, target)
--> tok/s + commit + date. A row PASSES at >= 0.97x its baseline; a row that BEATS
-its baseline auto-raises the entry. Below 0.97x -> FAIL, exit 1. First run with
-no baseline seeds it. Timing reuses verify_h20_fp4's steady-state settle loop and
-median-of-windows for stability.
+Baseline docs/experience/wins/bench-baseline.json, keyed (suite, shape, target) -> tok/s + commit
++ date. PASS at >= 0.97x, auto-raise on a beat, FAIL (exit 1) below; a first run seeds it.
 
   uv run tilerl bench --suite train                       # CPU, tiny
   tilerl bench --source /data00/Qwen3.8-27B-NVFP4 --gpu 7  # pod, all GPU suites
@@ -39,12 +27,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 _BASELINE = Path(__file__).resolve().parent.parent / "docs/experience/wins/bench-baseline.json"
-_GATE = 0.97  # a run must be within 3% of (or beat) the snapshot
-#: A win must clear the measured run-to-run spread before it raises the
-#: snapshot. Repeated d512-b1 readings on this pod land within ~1.7% of each
-#: other, so a baseline that raises on ANY overshoot ratchets up on noise until
-#: no run can meet it. Below this, a faster reading is a PASS, not a RAISE.
-_RAISE = 1.02
+_GATE = 0.97
+_RAISE = 1.02  # run-to-run spread is ~1.7%; raising on any overshoot ratchets the baseline on noise
 _KV_DEPTHS = (512, 2048, 8192, 32768, 131072, 262144)  # 128K/256K: B=1 only (KV 17/34 GB)
 
 
@@ -57,14 +41,12 @@ def _git_commit() -> str:
             ["git", "-C", str(_ROOT), "rev-parse", "--short", "HEAD"], text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
-    except Exception:
-        # The pod arrives as a tarball, not a clone; pod_sync stamps HEAD here.
+    except Exception:  # the pod is a tarball, not a clone; pod_sync stamps HEAD here
         stamp = _ROOT / ".synced_commit"
         return stamp.read_text().strip() if stamp.exists() else "unknown"
 
 
 def _today() -> str:
-    # Date.now is fine here (a script, not a workflow); stamp the baseline row.
     return time.strftime("%Y-%m-%d")
 
 
@@ -79,8 +61,6 @@ def _save_baseline(b: dict) -> None:
 
 
 class Gate:
-    """Compares tok/s rows against the snapshot, auto-raises winners, tracks FAILs."""
-
     def __init__(self, target: str, update_only: bool = False):
         self.target = target
         self.baseline = _load_baseline()
@@ -97,10 +77,7 @@ class Gate:
         prev = self.baseline.get(key)
         verdict = "SEED"
         if prev is None or self.seed_only:
-            # A first measurement is held to the same noise bar as a raise. The
-            # raise branch already refused noisy wins; seeding did not, so a
-            # 36.5%-spread row became a permanent baseline (decode-kv/d512-b2,
-            # 2026-08-29) that every later run is then measured against.
+            # A seed is held to the raise's noise bar, or a noisy row becomes a permanent baseline.
             if spread > _RAISE - 1.0:
                 print(f"  NOISY {key}: {tok_s:.1f} {unit} at {100 * spread:.1f}% spread "
                       f"— not seeded")
@@ -114,13 +91,10 @@ class Gate:
             self.dirty = True
             verdict = "RAISE"
         elif tok_s >= prev["tok_s"] * _GATE:
-            verdict = "PASS"  # includes a win too noisy to raise the baseline
+            verdict = "PASS"
         else:
             verdict = "FAIL"
-            # CPU is thermally/scheduler-noisy (~4% run-to-run) — gate it as a
-            # report-only smoke, not a hard fail. The 3% gate is for the stable
-            # GPU baseline (matches CI: only lint + CPU-correctness block).
-            if self.target != "cpu":
+            if self.target != "cpu":  # CPU is ~4% noisy run-to-run: report-only
                 self.failed = True
         base = prev["tok_s"] if prev else tok_s
         self.rows.append(
@@ -143,17 +117,10 @@ class Gate:
         return 1 if self.failed else 0
 
 
-# --- timing (median of windows, reusing verify's steady-state settle) --------
-
-
-#: Spread of the last _median_windows call: (max - min) / median. A row whose
-#: spread is wide is not evidence about a few-percent change, whatever its
-#: median says — printed beside every timing so a reader can judge the verdict.
-LAST_SPREAD = 0.0
+LAST_SPREAD = 0.0  # (max - min) / median of the last _median_windows call
 
 
 def _median_windows(step_fn, n_windows: int, ticks: int, sync) -> float:
-    """Median ms/tick over n_windows of `ticks` steady-state steps each."""
     global LAST_SPREAD
     samples = []
     for _ in range(n_windows):
@@ -168,18 +135,12 @@ def _median_windows(step_fn, n_windows: int, ticks: int, sync) -> float:
     return med
 
 
-# --- suites ------------------------------------------------------------------
-
-
 def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
-    """Decode tok/s vs KV depth. Rebuilds the engine per depth so the pools are
-    sized for that KV (32k*B tokens needs many blocks) — settle_decode drives
-    every row to pure-decode before timing."""
+    """Engine rebuilt per row so the pools are sized for that depth."""
     import benchkit as bk
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.kv_cache import BLOCK_TOKENS
 
-    # 2 planes (K, V) x 16 full-attn layers x 4 kv heads x 256 dim x 2 bytes.
     _KV_BYTES_PER_TOKEN = 2 * len(cfg.full_attn_layers) * cfg.num_kv_heads * cfg.head_dim * 2
     _KV_BUDGET = 60 << 30  # 96 GiB card - 23 weights - working set
 
@@ -190,26 +151,15 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
         if depth > cfg.max_position_embeddings:
             continue
         for b in batches:
-            # 2x headroom: the prefix store pins every finished prompt's blocks
-            # for reuse, so a run that just drained still holds ~depth*B blocks.
-            # outlive the batch's staggered prefill (chunks of 512/tick) or row 0 is
-            # DONE before the last row reaches decode and settle never sees B rows.
+            # gen must outlive the staggered prefill (512/tick) or row 0 finishes before settle sees B rows.
             gen = ticks + 40 + b * (depth // 512 + 4)
-            # 2x headroom (the prefix store pins finished prompts) up to 32K; at
-            # 128K/256K the KV alone is 17/34 GB, so 1.1x and one row per pool.
+            # 2x headroom (the prefix store pins finished prompts); 1.1x at 128K/256K where KV alone is 17/34 GB.
             head = 2 if depth <= 32768 else 1.1
-            # KV lives on the 16 full-attn layers only, not all 64: 64 KiB per
-            # token, not the 128 KiB this guard used to assume. The old cap
-            # called 32768x8 (32 GiB) too big for a 96 GiB card.
             if depth * b * head * _KV_BYTES_PER_TOKEN > _KV_BUDGET:
                 print(f"  {depth:>7} {b:>3}   (skipped: KV pool would exceed one H20)")
                 continue
             need = int(head * (-(-(depth + gen) * b // BLOCK_TOKENS) + b))
-            # The block-count guard above sizes the POOL; it cannot see the
-            # activations, logits and prefill buffers the run then needs, so a
-            # cell that passes it can still OOM — 32768x4 did, and took the
-            # accuracy suite queued behind it down with the process. An OOM is
-            # where one card stops: a row of the result, not the end of the run.
+            # The guard sizes the pool only; activations can still OOM, and that is a row, not the end of the run.
             try:
                 engine = build_engine(
                     cfg, model, backend,
@@ -233,7 +183,6 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
                 print(f"  {depth:>7} {b:>3} {ms:>9.3f} {1000.0 / ms:>10.1f} {agg:>10.1f}"
                       f" {100 * LAST_SPREAD:>7.1f}%")
                 gate.check("decode-kv", f"d{depth}-b{b}", agg, spread=LAST_SPREAD)
-                # drain so the next depth's blocks are free
                 done: dict = {}
                 for _ in range(ticks + 8 * b + 256):
                     done.update(engine.poll())
@@ -248,9 +197,7 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
 
 
 def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
-    """Speculative decode goodput, gated as a RATIO against the plain arm
-    measured in the same process. Acceptance is printed because a drop there is
-    the first sign the draft head or its serving format regressed."""
+    """Gated as a ratio against the plain arm measured in the same process."""
     import benchkit as bk
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.spec import load_draft
@@ -261,31 +208,19 @@ def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
         return
     print(f"\n=== speculative decode (depth {depth}, tok/s) ===")
     print(f"  {'B':>3} {'arm':>6} {'ms/tick':>9} {'tok/tick':>9} {'accept':>7} {'agg tok/s':>10}")
-    # Both arms measured here, identically: comparing a spec row against a
-    # decode row from another script is what made a 4.9x LOSS read as a 1.14x
-    # win this morning (that one was eager-vs-graph; this one would be
-    # settled-vs-not).
     base: dict[int, float] = {}
     for b, spec in [(b, s) for b in batches for s in (False, True)]:
         engine = build_engine(
             cfg, model, backend, num_blocks=512, num_slots=max(16, b), max_batch=max(8, b),
             draft=load_draft(model, path) if spec else None, spec_depth=depth,
         )
-        # The budget must not bind before the last timed tick: a request that
-        # finishes mid-window leaves the remaining ticks generating nothing and
-        # drags tok/tick down. (ticks + 20) * (1 + depth) did bind at depth 1 —
-        # 80 tokens against ~109 produced — which is why that row read 1.12
-        # tok/tick at 55.8% acceptance where 1 + p is 1.56, and why depth 2,
-        # whose budget happened to clear, read correctly.
+        # A request finishing mid-window leaves ticks generating nothing and drags tok/tick down.
         budget = (bk.SETTLE_BUDGET(b) + 8 + 3 * ticks + 4) * (1 + depth)
-        for i in range(b):  # noqa: B007 - both arms share the prompt set
+        for i in range(b):
             engine.submit(
                 bk.rand_prompt(cfg.vocab_size, 16, seed=700 + i),
                 SamplingParams(temperature=0.0, max_new_tokens=budget, seed=i),
             )
-        # One waiting request is admitted per tick, so B rows need at least B
-        # ticks before any of them decodes: a fixed warmup times prefill ticks
-        # as if they were decode (B=8 read 51.8 tok/s against 91.8 settled).
         if not bk.settle_decode(engine, b, 64 + 8 * b):
             print(f"  {b:>3}   (never reached pure decode — skipped)")
             continue
@@ -307,11 +242,6 @@ def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
         print(f"  {b:>3} {arm:>6} {ms:>9.3f} {per_tick:>9.2f} {100 * acc:>6.1f}% {agg:>10.1f}"
               + (f"   {agg / base[b]:.2f}x vs plain" if spec and base.get(b) else ""))
         if spec:
-            # Gate the RATIO, not the absolute tok/s. Speculation's whole claim
-            # is "faster than not speculating", and an absolute row passed at
-            # 0.15x of the plain arm measured beside it, because it was seeded
-            # when the arm was measured a different way. A gate that can pass
-            # while the feature loses 6.7x is worse than no gate.
             gate.check("spec", f"d{depth}-b{b}-ratio", agg / base[b], spread=LAST_SPREAD)
         else:
             base[b] = agg
@@ -327,10 +257,7 @@ def suite_prefill(gate, cfg, model, backend, lengths):
     print("\n=== prefill-vs-length (tok/s) ===")
     print(f"  {'len':>7} {'ms/tok':>10} {'tok/s':>10} {'spread':>8}")
     for length in sorted({min(x, cap) for x in lengths}):
-        bk.time_prefill(engine, backend, cfg, length, 1.0)  # warm: JIT for this length
-        # Three readings, not one: prefill has no steady-state loop to hide
-        # run-to-run noise, and a single sample can neither be trusted nor
-        # allowed to ratchet the baseline.
+        bk.time_prefill(engine, backend, cfg, length, 1.0)  # JIT for this length
         runs = [bk.time_prefill(engine, backend, cfg, length, 1.0) for _ in range(3)]
         ms, tps = sorted(runs, key=lambda r: r[1])[1]
         spread = (max(r[1] for r in runs) - min(r[1] for r in runs)) / tps
@@ -339,66 +266,44 @@ def suite_prefill(gate, cfg, model, backend, lengths):
 
 
 def suite_kv_reuse(gate, cfg, model, backend):
-    """Prefix-cache: submit a shared long prefix, then requests reusing it.
-    Measures hit-rate and warm-vs-cold prefill speedup."""
-    import time as _t
-
     import benchkit as bk
     from tilerl.engine import SamplingParams, build_engine
-
-    print("\n=== kv-reuse / prefix-cache ===")
-    # Prefix must be block-aligned (BLOCK_TOKENS=16) and leave suffix room under
-    # max_position. Sized to the model so tiny (max_pos 512) and 27B both work.
     from tilerl.kv_cache import BLOCK_TOKENS
 
+    print("\n=== kv-reuse / prefix-cache ===")
     cap = cfg.max_position_embeddings
     plen = min(2048, max(BLOCK_TOKENS, (cap - 128) // BLOCK_TOKENS * BLOCK_TOKENS))
     slen = 32
-    # Pool must hold the pinned prefix AND two live requests at once, or
-    # evict_until_free drops the store entry before the warm request (the
-    # serving-size 256-block pool did exactly that at plen=2048: hits 0).
+    # Pool holds the pinned prefix plus two live requests, or eviction drops the entry before the warm request.
     engine = build_engine(cfg, model, backend, num_blocks=4 * (plen // BLOCK_TOKENS) + 64,
                           num_slots=16, max_batch=8, max_total_tokens=plen + 256)
     prefix = bk.rand_prompt(cfg.vocab_size, plen, seed=42)
-    # max_new_tokens>=2: publish happens only when the prefill completes with
-    # phase != DONE, so a 1-token request finishes before it can publish.
+    # max_new_tokens>=2: a 1-token request finishes before its prefill can publish.
     sp = SamplingParams(temperature=0.0, max_new_tokens=2, seed=0)
-    # Publish the prefix as its OWN full prompt: the engine publishes the full
-    # block-aligned prompt of a completed request, and a later request reuses it
-    # only up to a block boundary published by some request (a full-length hit is
-    # a day-1 miss). So request-1 IS the prefix; request-2 = prefix + suffix.
+    # The prefix is its own request: a later request reuses only up to a published block boundary.
     bk.drive(engine, engine.submit(prefix, sp), 4096)
-    # Warm both prefill shapes (reuse len and cold len) so JIT doesn't confound
-    # the timing — the reuse path recomputes only the suffix, cold recomputes all.
+    # Warm both prefill shapes (suffix-only and full) so JIT does not confound the timing.
     bk.drive(engine, engine.submit(prefix + bk.rand_prompt(cfg.vocab_size, slen, seed=8), sp), 4096)
     bk.drive(engine, engine.submit(bk.rand_prompt(cfg.vocab_size, plen + slen, seed=9), sp), 4096)
     h0, m0 = engine._prefix_hits, engine._prefix_misses
-    t0 = _t.perf_counter()
+    t0 = time.perf_counter()
     bk.drive(engine, engine.submit(prefix + bk.rand_prompt(cfg.vocab_size, slen, seed=1), sp), 4096)
     bk.sync(backend)
-    warm = (_t.perf_counter() - t0) * 1e3
-    t0 = _t.perf_counter()
+    warm = (time.perf_counter() - t0) * 1e3
+    t0 = time.perf_counter()
     bk.drive(engine, engine.submit(bk.rand_prompt(cfg.vocab_size, plen + slen, seed=777), sp), 4096)
     bk.sync(backend)
-    cold = (_t.perf_counter() - t0) * 1e3
+    cold = (time.perf_counter() - t0) * 1e3
     hits = engine._prefix_hits - h0
     speedup = cold / warm if warm else 0.0
     print(f"  prefix len {plen}, hits {hits}, misses {engine._prefix_misses - m0}")
     print(f"  cold {cold:.2f} ms (distinct)  warm {warm:.2f} ms (reused)  speedup {speedup:.2f}x")
-    # Gate on HIT-RATE (deterministic): reuse must fire. Speedup is informational
-    # (timing-noisy on a short suffix). A regression that breaks prefix reuse
-    # drops hits to 0 and FAILs.
+    # Hits are deterministic; the short-suffix speedup is timing-noisy and not gated.
     gate.check("kv-reuse", "prefix-hits", float(hits), unit="hits")
-    # speedup is printed above but NOT gated — a short-suffix warm/cold ratio is
-    # timing-noisy; hit-rate is the deterministic correctness-of-reuse signal.
 
 
 def suite_accuracy(gate, source, n):
-    """MMLU 0-shot on a fixed slice — the only gate here that is not a speed gate.
-
-    Greedy over a fixed question set, so the number is deterministic: any move
-    at all is a real change, not sampling noise.
-    """
+    """Greedy over a fixed slice, so any move at all is a real change."""
     from mmlu import accuracy
 
     print("\n=== accuracy (MMLU 0-shot) ===")
@@ -409,7 +314,6 @@ def suite_accuracy(gate, source, n):
 
 
 def torch_oom():
-    """The OOM exception type, or a never-raised one off CUDA."""
     import torch
 
     return getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
@@ -425,14 +329,7 @@ def _free(backend) -> None:
         torch.cuda.empty_cache()
 
 
-def suite_train(gate, backend, source, gpu, full=False):
-    """train_step fwd+bwd tok/s. Tiny on CPU; 27B when a source is given.
-
-    ``full`` swaps LoRA for full-parameter training: bf16 masters, Adafactor,
-    and gradients consumed inside backward. Separate invocation, not another
-    shape, because the two cannot share a process — 50.1 GiB of masters plus a
-    frozen fp4 base does not fit one card.
-    """
+def suite_train(gate, backend, source, full=False):
     import numpy as np
 
     from tilerl.autograd import Adafactor, AdamW
@@ -445,10 +342,7 @@ def suite_train(gate, backend, source, gpu, full=False):
 
             torch.cuda.synchronize()
 
-    # Full-parameter 27B fits at 73.2 of 95 GiB: bf16 masters only (the served
-    # bytes are dead once a master exists), Adafactor's factored second moment
-    # instead of Adam's 200.4 GiB of m+v, and every gradient consumed and freed
-    # inside backward instead of coexisting.
+    # Full-parameter 27B fits at 73.2 of 95 GiB: bf16 masters only, Adafactor (Adam's m+v is 200.4 GiB).
     trainable = None
     if source:
         from tilerl.config import qwen38_27b
@@ -462,13 +356,7 @@ def suite_train(gate, backend, source, gpu, full=False):
         mdl.params = backend.materialize(mdl.params)
         if not full:
             trainable = add_lora(mdl, rank=16)
-        # a slope, not one point: the tape keeps every activation in f32, so
-        # peak GB per token is the number that decides whether recompute is needed
-        # A slope in T (the tape keeps every activation in f32, so peak GB per
-        # token decides whether recompute is needed) AND a slope in B: the step
-        # is launch-bound — 491K kernels, 62% of them micro-ops from the GDN
-        # backward's per-time-step loop — and that count does not depend on B,
-        # so B=1 is the worst shape training can be measured at.
+        # A slope in T (peak GB/token decides recompute) and in B (the step is launch-bound, ~491K kernels).
         shapes = [(1, 64), (1, 128), (1, 256), (2, 256), (4, 256)]
     else:
         model_name = "tiny"
@@ -481,9 +369,7 @@ def suite_train(gate, backend, source, gpu, full=False):
         ids = np.arange(1, b * t + 1, dtype=np.int64).reshape(b, t) % cfg.vocab_size
         try:
             train_step(mdl, ids, backend, opt, trainable=trainable)  # warm (JIT+tape shapes)
-        except torch_oom() as exc:
-            # The shape that does not fit is a RESULT — it is where training on
-            # one card stops — not a reason to lose the rows already measured.
+        except torch_oom() as exc:  # the shape that does not fit is a row, not the end of the run
             print(f"  {f'{b}x{t}':>10} {'OOM':>10}  {str(exc).split('.')[0]}")
             _free(backend)
             continue
@@ -495,10 +381,6 @@ def suite_train(gate, backend, source, gpu, full=False):
             sync()
             samples.append(time.perf_counter() - s)
         ms = statistics.median(samples) * 1e3
-        # Spread gates the seed/raise, same as the decode suites. Without it a
-        # train row seeded from one reading became the permanent baseline: the
-        # 27B-full rows seeded at host loadavg 27.8 read ~3% high and then
-        # FAILed on an idle machine.
         spread = (max(samples) - min(samples)) / statistics.median(samples)
         tok_s = b * t / (ms / 1e3)
         peak = ""
@@ -511,9 +393,6 @@ def suite_train(gate, backend, source, gpu, full=False):
         gate.check("train", f"{model_name}-b{b}t{t}", tok_s, spread=spread)
 
 
-# --- runner ------------------------------------------------------------------
-
-
 def main() -> int:
     import argparse
 
@@ -524,10 +403,7 @@ def main() -> int:
                          " (default: all applicable)")
     ap.add_argument("--source", default=None, help="27B checkpoint dir (omit for tiny/CPU)")
     ap.add_argument("--gpu", type=int, default=None)
-    # 2 and 4 are not decoration: mma8 pads M to 8, so B=2 cost the same tick as
-    # B=8 and was SLOWER in aggregate than B=1 — invisible to a 1,8 sweep
-    # (errors/2026-08-29-spec-cost-was-the-linear-not-the-draft.md).
-    ap.add_argument("--batches", default="1,2,4,8")
+    ap.add_argument("--batches", default="1,2,4,8")  # B=2 once cost a B=8 tick; a 1,8 sweep cannot see that
     ap.add_argument("--depths", default=",".join(map(str, _KV_DEPTHS)))
     ap.add_argument("--ticks", type=int, default=20)
     ap.add_argument("--json", default=None)
@@ -548,8 +424,7 @@ def main() -> int:
 
     backend = get_backend()
     target = backend.arch
-    # Host load is the silent confounder: another tenant's nvcc/JIT on this
-    # host inflated B=8 ticks 60% in one run. Stamp it so a bad row is explainable.
+    # Host load stamped: another tenant's JIT once inflated B=8 ticks 60%.
     print(f"host loadavg {os.getloadavg()[0]:.1f} / {os.cpu_count()} cpus, target {target}")
     gate = Gate(target, update_only=args.reseed)
     batches = [int(x) for x in args.batches.split(",")]
@@ -560,7 +435,7 @@ def main() -> int:
     suites = [s for s in (args.suite.split(",") if args.suite else default) if s]
 
     cfg = model = None
-    if any(s in gpu_suites or s == "micro" for s in suites):
+    if any(s in gpu_suites for s in suites):
         from tilerl.cli import _build_model
         from tilerl.model import load_hf
         from tilerl.config import qwen38_27b
@@ -585,12 +460,9 @@ def main() -> int:
                 suite_spec(gate, cfg, model, backend, batches, args.source, args.ticks,
                            args.spec_depth)
         elif s == "train":
-            suite_train(gate, backend, args.source, args.gpu)
+            suite_train(gate, backend, args.source)
         elif s == "train-full":
-            # Its own suite name, not a shape of `train`: 50.1 GiB of bf16
-            # masters and a frozen fp4 base cannot share one card, so the two
-            # arms have to be separate processes.
-            suite_train(gate, backend, args.source, args.gpu, full=True)
+            suite_train(gate, backend, args.source, full=True)
         elif s == "accuracy":
             if args.source is None:
                 print("  (accuracy needs --source, skipped)")

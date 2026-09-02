@@ -69,8 +69,8 @@ bandwidth/MMA balance differs from prefill.
 
 ## Reading the emitted CUDA
 
-Load widths, register-array shapes and `#pragma unroll` coverage are all
-readable off the generated source, which is far cheaper than a pod round trip.
+Load widths, register-array shapes and `#pragma unroll` coverage are readable
+off the generated source without a pod round trip.
 
 **On the pod** — an ordinary build, then ptxas for the numbers the source
 cannot show:
@@ -93,36 +93,34 @@ passes it cannot be shimmed from Python. Probe an MMA data flow through the
 warp-level `mma_emitter` instead, which bypasses `tl.gemm` and does lower here.
 
 Widths are fixed by `VectorizeLoop` before codegen, so they are safe to read;
-the emitter is TVM's `CodeGenCUDA`, not tilelang's, so treat byte-exactness of
-the boilerplate as unproven. **Spills are invisible** — only ptxas or ncu sees
-them, and a register array that stays a register array here has already fallen
-to local memory once in this repo (`wins/2026-08-25-fp4-gemv-grouped-dequant.md`).
+the emitter is TVM's `CodeGenCUDA`, not tilelang's, so boilerplate is not
+byte-exact. **Spills are invisible** — only ptxas or ncu sees them, and a
+register array here has already fallen to local memory on the pod once
+(`wins/2026-08-25-fp4-gemv-grouped-dequant.md`).
 
 ## Register-resident dequantized B
 
-Marlin's core trick — packed nibbles in shared, the *dequantized* weight only
-ever in registers — is `T.gemm`'s SR variant (A shared, B fragment):
-`is_gemm_sr` at `tilelang/tileop/gemm/gemm_base.py:57`, lowered by `_gemm_srr`
+Marlin's trick — packed nibbles in shared, the dequantized weight only in
+registers — is `T.gemm`'s SR variant (A shared, B fragment): `is_gemm_sr` at
+`tilelang/tileop/gemm/gemm_base.py:57`, lowered by `_gemm_srr`
 (`tilelang/cuda/op/gemm/gemm_mma.py:143`), which skips `ldmatrix_b` and feeds
-the user's fragment to `mma.sync` — the same instruction Marlin issues. The MMA
-B-fragment layout is *inferred* onto the fragment, so a plain `T.Parallel`
-dequant loop lands each value in the right lane; Marlin hand-computes that.
-The documented example is the mirror image — `example_dequant_gemm_w4a8.py:145`
-passes the dequantized fragment as the *first* operand (RS, transposed problem)
-— but the point carries: it allocates no shared dequant buffer at all. The two
-tilelang examples that do are both WGMMA, where shared B is a hardware
-requirement, and `make_linear_fp4_mma` copied one of them.
+the fragment to `mma.sync`. The B-fragment layout is inferred onto the
+fragment, so a plain `T.Parallel` dequant loop lands each value in the right
+lane. `example_dequant_gemm_w4a8.py:145` is the mirror image (dequantized
+fragment as the first operand, RS) and allocates no shared dequant buffer; the
+two examples that do are WGMMA, where shared B is a hardware requirement, and
+`make_linear_fp4_mma` copied one of them.
 
-Two costs. A fragment B makes `CheckWgmma` false (`src/cuda/op/gemm.cc:40`), so
-CUDA falls back to `mma.sync` — free at decode (WGMMA needs `m >= 64` anyway,
-`:95`) but a real drop for the prefill arm, which does hit WGMMA today. And
-Metal implements SS only (`tilelang/metal/op/gemm/gemm_metal.py:97`), so such a
-kernel needs a per-arch cell — which `_SM90_KERNELS` already is.
+Costs: a fragment B makes `CheckWgmma` false (`src/cuda/op/gemm.cc:40`), so
+CUDA falls back to `mma.sync` — free at decode (WGMMA needs `m >= 64`, `:95`),
+a real drop for prefill, which hits WGMMA today. Metal implements SS only
+(`tilelang/metal/op/gemm/gemm_metal.py:97`), so the kernel needs a per-arch
+cell — `_SM90_KERNELS` already is one.
 
-Aim at the right kernel: `_CUDA_PLAN` covers all three `linear_fp4` regimes, so
-`make_linear_fp4_mma`'s 8 KiB `W_shared` never runs on CUDA. The live one is the
-e4m3 `W_shared` in `make_linear_fp4_fp8_mma` — 4 KiB against `WQ_shared`'s 2,
-`num_stages=3`, so 12 KiB/CTA spent on a format conversion.
+Aim at the live kernel: `_CUDA_PLAN` covers all three `linear_fp4` regimes, so
+`make_linear_fp4_mma`'s 8 KiB `W_shared` never runs on CUDA. The live one is
+the e4m3 `W_shared` in `make_linear_fp4_fp8_mma` — 4 KiB against `WQ_shared`'s
+2, `num_stages=3`: 12 KiB/CTA spent on a format conversion.
 
 ## fp4 format reconciliation
 

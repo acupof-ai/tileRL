@@ -1,64 +1,6 @@
-"""Qwen3.5/3.6 hybrid model: full-attention + gated-delta layers, plus
-checkpoint loading (HF safetensors and MLX 4-bit affine).
-
-Layer order and residuals follow agent-infer's qwen35 forward
-(``crates/infer-cuda/src/qwen35_forward.rs``)::
-
-    x = embed(input_ids)
-    for layer i:
-        x = x + attn(rmsnorm(input_norm, x))      # full-attn or gated-delta
-        x = x + mlp(rmsnorm(post_attn_norm, x))   # silu(gate) * up -> down
-    logits = lm_head(rmsnorm(final_norm, x))      # tied to embed when cfg says so
-
-Backend op contract (this module calls only backend ops, never tilelang/torch
-math). Beyond the pinned op list, the architecture forces four extensions:
-
-* ``add(a, b)`` — residual adds (the pinned list has no elementwise add).
-* ``rope(x, positions, theta, rotary_dim=None)`` — partial RoPE (Qwen3.8:
-  rotary_dim=64 of head_dim=256); defaults to head_dim.
-* ``paged_attention(q, k_cache, v_cache, block_table, seq_lens, scale,
-  gate=None)`` — with ``gate`` (the q_proj gate half, [B,T,Hq,D]) returns
-  ``attn_out * sigmoid(gate)`` (full-attn output gate, BEFORE o_proj).
-* ``linear_attn_chunk(q, k, v, g, beta, state, *, z,
-  conv1d_weight, dt_bias, a_log, norm_weight, conv_window=None)`` — the FULL
-  gated-delta layer core, mirroring agent-infer's host reference
-  ``linear_attention_forward`` (autograd/src/ops/linear_attention.rs:2385):
-  causal depthwise conv1d over the raw qkv -> SiLU -> q L2-norm /sqrt(K),
-  k L2-norm -> beta=sigmoid(b), g=-exp(A_log)*softplus(a+dt) -> delta-rule
-  recurrence over the f32 state [B,H,K,V] -> RMSNorm(norm_weight) -> *silu(z).
-  ``q/k/v`` are the raw in_proj_qkv slices (pre-conv), ``g``/``beta`` the raw
-  in_proj_a/in_proj_b outputs. Returns ``(out [B,T,v_dim], new_state,
-  new_window)`` (value heads flattened into the trailing dim).
-  ``conv_window`` [B,K-1,qkv_dim] carries the previous segment's raw qkv so
-  segmented decode is exact; None -> zero-padded one-shot prefill (then
-  ``new_window`` is None).
-
-BatchKv assumptions (Engine attaches the pools at submit): ``kv.kv_pool`` /
-``kv.state_pool``; ``k_pool``/``v_pool`` are dense over full-attn layers
-``[num_full_attn, num_blocks, num_kv_heads, BLOCK_TOKENS, head_dim]`` (the
-pool maps a GLOBAL ``layer_idx`` to its plane); ``backend.write_tokens(k, v,
-kv, layer_idx)`` scatters ``k/v`` [B,T,Hkv,D] at ``[seq_len-T, seq_len)``
-through the block table (one capturable kernel on sm90, the pool's torch loop
-on other arches); ``state_pool.states`` is ``[num_slots, num_linear_layers, H, K, V]``
-and ``state_pool.conv_windows`` ``[num_slots, num_linear_layers, 2 (parity), K-1,
-qkv_dim]`` (None without GDN layers).
-
-Checkpoint loading: ``load_hf(cfg, source, ...)`` maps a Qwen3.5/3.6
-safetensors checkpoint into the param dict (``build_random`` draws the same
-schema). Tensor names follow agent-infer's ``qwen35-spec``
-``layer_tensor_names`` (``crates/qwen35-spec/src/lib.rs``):
-``model.language_model.embed_tokens.weight``->``embed_tokens``,
-``...norm.weight``->``final_norm``, ``layers.{i}.input_layernorm.weight``->
-``input_norm``, ``...post_attention_layernorm.weight``->``post_attn_norm``;
-full-attn ``self_attn.{q,k,v,o}_proj.weight`` + ``q_norm/k_norm.weight``;
-gated-delta ``linear_attn.in_proj_{qkv,z,b,a}.weight``, ``conv1d.weight``,
-``dt_bias``, ``A_log``, ``norm.weight``, ``out_proj.weight``; MLP
-``mlp.{gate,up,down}_proj.weight``; ``lm_head.weight`` only when untied.
-``layer_types`` from HF ``config.json`` is read verbatim and validated against
-``cfg.full_attn_layers`` — indices are never hardcoded. fp4 linears are
-quantized on load when ``cfg.fp4``. Every failure raises with the exact source
-and files tried; this module never fakes success.
-"""
+"""Qwen3.5/3.6 hybrid model (full-attention + gated-delta layers) on backend
+ops only, plus HF/MLX/NVFP4/FP8/AWQ checkpoint loading and saving. Layer order
+and tensor names follow agent-infer's ``qwen35_forward.rs`` / ``qwen35-spec``."""
 
 from __future__ import annotations
 
@@ -81,7 +23,7 @@ from tilerl_kernels.reference import (
     pack_fp4,
     renorm_fp4_scale,
     unpack_fp4,
-)  # re-exported for callers
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no tilelang import at runtime
     import numpy as np
@@ -91,8 +33,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no tilelang import at runti
 
 # --- Param schema -----------------------------------------------------------
 def param_specs(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
-    """Canonical param keys + shapes for ``cfg`` (single source of truth:
-    ``build_random`` draws these, ``load_hf`` validates against them)."""
+    """Canonical param keys + shapes: ``build_random`` draws them, ``load_hf`` validates."""
     h, inter, v = cfg.hidden_size, cfg.intermediate_size, cfg.vocab_size
     hq, hkv, d = cfg.num_attention_heads, cfg.num_kv_heads, cfg.head_dim
     specs: dict[str, tuple[int, ...]] = {
@@ -132,10 +73,7 @@ def param_specs(cfg: ModelConfig) -> dict[str, tuple[int, ...]]:
 
 
 def fp4_param_keys(cfg: ModelConfig) -> set[str]:
-    """Keys of the 2D projection matrices that are fp4-packed when cfg.fp4.
-
-    Embeddings, norms, conv1d (K=4 < block 16), dt_bias and a_log stay bf16.
-    """
+    """The projection keys that are fp4-packed when cfg.fp4 (conv1d's K=4 < block 16 stays bf16)."""
     keys: set[str] = set()
     for i in range(cfg.num_layers):
         p = f"layers.{i}"
@@ -156,24 +94,12 @@ def fp4_param_keys(cfg: ModelConfig) -> set[str]:
 
 
 def _quantized(params: dict[str, torch.Tensor], key: str) -> bool:
-    """``key`` is served from packed bytes (fp4 nibbles or e4m3), not a bf16 tensor."""
     return f"{key}.wq" in params or f"{key}.w8" in params
 
 
 def _projection_groups(cfg: ModelConfig, layer_idx: int) -> list[tuple[str, list[str]]]:
-    """Same-input projection groups, fused at load for serving decode/prefill.
-
-    Each group reads the same post-norm hidden, so the packed weights concat
-    losslessly along N and one GEMM replaces the group's launches — the tick
-    is launch-latency-bound on the small projections (N=48/1024 at 0.1-3%
-    roof), so collapsing launches is the lever. Serving-only: training keeps
-    the unfused masters (the fused key has none, so its tape backward would
-    have nowhere to land the STE grad).
-
-    fp4 groups concat .wq/.scale/.oscale (per-N-row scales, always lossless);
-    fp8 groups concat .w8/.wscale (+ .oscale, lossless only when
-    every member but the last has N % 128 == 0 — _fuse_projections guards).
-    """
+    """Same-input projection groups: one GEMM per group replaces the launches
+    of the small projections the decode tick is latency-bound on. Serving only."""
     p = f"layers.{layer_idx}"
     groups = [(f"{p}.gate_up", [f"{p}.gate_proj", f"{p}.up_proj"])]
     if cfg.is_full_attn(layer_idx):
@@ -185,53 +111,33 @@ def _projection_groups(cfg: ModelConfig, layer_idx: int) -> list[tuple[str, list
 
 
 def _fuse_projections(cfg: ModelConfig, params: dict[str, torch.Tensor]) -> None:
-    """Concat each group's packed weights into a fused key (in-place).
-
-    fp4 groups concat .wq/.scale/.oscale; native-fp8 groups concat
-    .w8/.wscale/.oscale and need every member but the last 128-N-aligned or
-    the per-128-block wscale grid doesn't line up. No bf16 master is built:
-    cells with no fp8 kernel get one from ``Backend.materialize``.
-    """
+    """Concat each group's packed weights (fp4 .wq/.scale/.oscale, fp8
+    .w8/.wscale/.oscale) into a fused key in place; any bf16 master stays."""
     for i in range(cfg.num_layers):
         for fused_key, group in _projection_groups(cfg, i):
-            if f"{fused_key}.wq" in params or f"{fused_key}.w8" in params:
+            if _quantized(params, fused_key):
                 continue
-            try:
-                wqs = [params[f"{k}.wq"] for k in group]
-                scales = [params[f"{k}.scale"] for k in group]
-            except KeyError:
-                wqs = None
-            if wqs is not None:
-                params[f"{fused_key}.wq"] = torch.cat(wqs, dim=0).contiguous()
-                params[f"{fused_key}.scale"] = torch.cat(scales, dim=0).contiguous()
-                oscales = [params[f"{k}.oscale"] for k in group]  # KeyError names the gap
-                params[f"{fused_key}.oscale"] = torch.cat(oscales).contiguous()
-                for k in group:  # drop the dead copies (any bf16 master stays, recording-only)
-                    del params[f"{k}.wq"], params[f"{k}.scale"], params[f"{k}.oscale"]
+            if all(f"{k}.wq" in params for k in group):
+                for suffix in (".wq", ".scale", ".oscale"):
+                    params[fused_key + suffix] = torch.cat(
+                        [params.pop(k + suffix) for k in group]).contiguous()
                 continue
-            try:
-                w8s = [params[f"{k}.w8"] for k in group]
-                wscales = [params[f"{k}.wscale"] for k in group]
-            except KeyError:
-                continue  # group not quantized (bf16 checkpoint) — skip
-            if any(w.shape[0] % 128 for w in w8s[:-1]):
-                continue  # per-128-block wscale grid wouldn't concat losslessly
-            params[f"{fused_key}.w8"] = torch.cat(w8s, dim=0).contiguous()
-            params[f"{fused_key}.wscale"] = torch.cat(wscales, dim=0).contiguous()
+            if not all(f"{k}.w8" in params for k in group):
+                continue
+            if any(params[f"{k}.w8"].shape[0] % 128 for k in group[:-1]):
+                continue  # the per-128-block wscale grid would not concat losslessly
+            for suffix in (".w8", ".wscale"):
+                params[fused_key + suffix] = torch.cat(
+                    [params.pop(k + suffix) for k in group]).contiguous()
             if f"{group[0]}.oscale" in params:
-                oscales = [params[f"{k}.oscale"] for k in group]
-                params[f"{fused_key}.oscale"] = torch.cat(oscales).contiguous()
-            for k in group:  # dead copies (any bf16 master stays, recording-only)
-                del params[f"{k}.w8"], params[f"{k}.wscale"]
+                params[f"{fused_key}.oscale"] = torch.cat(
+                    [params[f"{k}.oscale"] for k in group]).contiguous()
+            for k in group:
                 params.pop(f"{k}.oscale", None)
 
 
 def _native_fp4(packed, weight_scale, gscale, *, divide: bool = False):
-    """An NVFP4 checkpoint's tensors -> the serving triple (wq, scale, oscale).
-
-    The nibbles ARE the serving format: no bf16 round-trip, no second
-    quantization, block B straight from the checkpoint. The per-tensor global
-    scale rides the epilogue slot beside renorm_fp4_scale's power of two."""
+    """NVFP4 checkpoint tensors -> (wq, scale, oscale), nibbles served verbatim."""
     gs = gscale.float().reshape(1)
     gs = 1.0 / gs if divide else gs  # ModelOpt stores the global scale's reciprocal
     scale, oscale = renorm_fp4_scale(weight_scale.float(), gs.expand(packed.shape[0]))
@@ -240,24 +146,17 @@ def _native_fp4(packed, weight_scale, gscale, *, divide: bool = False):
 
 # --- Model ------------------------------------------------------------------
 class Model:
-    """Qwen3.5/3.6 hybrid model. ``params`` maps :func:`param_specs` keys to
-    bf16 tensors; fp4 linears carry ``<key>.wq`` (uint8) + ``<key>.scale``
-    (f32, block B from the checkpoint) and native-fp8 linears ``<key>.w8``
-    (e4m3) + ``<key>.wscale`` (f32 per-128-block), either with an optional
-    per-output-row ``<key>.oscale`` epilogue scale. The bf16 master beside
-    them is training-only (``load_hf(keep_master=True)``): serving ships the
-    quantized bytes and nothing else."""
+    """``params`` maps :func:`param_specs` keys to bf16 tensors; quantized
+    linears carry ``<key>.wq/.scale`` (fp4) or ``<key>.w8/.wscale`` (fp8) plus an
+    optional per-row ``<key>.oscale``, with a bf16 master beside them only for training."""
 
     def __init__(self, cfg: ModelConfig, params: dict[str, torch.Tensor]):
         self.cfg = cfg
         self.params = params
 
     def _has(self, key: str) -> bool:
-        # A fused key arrives as packed bytes, or as the bf16 weight
-        # Backend.materialize built for a cell with no kernel for them.
         return key in self.params or _quantized(self.params, key)
 
-    # -- linear dispatch (fp4-packed / native-fp8 when present, plain bf16 otherwise) ----
     def _linear(self, backend: "Backend", x: torch.Tensor, key: str, residual=None) -> torch.Tensor:
         y = self._base_linear(backend, x, key, residual)
         a = self.params.get(key + ".lora_a")
@@ -266,36 +165,27 @@ class Model:
         return backend.add(y, backend.linear(backend.linear(x, a), self.params[key + ".lora_b"]))
 
     def _base_linear(self, backend: "Backend", x: torch.Tensor, key: str, residual=None):
-        """``residual``: the stream to add in the GEMV epilogue (serving only —
-        the caller passes it when the backend fuses it and no tape is watching)."""
+        # ``master`` is recording-only: the STE grad lands on it.
         kw = {} if residual is None else {"residual": residual}
         wq, osc = self.params.get(key + ".wq"), self.params.get(key + ".oscale")
         if wq is not None:
-            # ``master`` is recording-only: the STE grad lands on it
-            # (autograd.RecordingBackend). Fused projection keys are
-            # serving-only and have none — the tape never sees them.
             scale = self.params[key + ".scale"]
             return backend.linear_fp4(x, wq, scale, master=self.params.get(key), oscale=osc, **kw)
         w8 = self.params.get(key + ".w8")
         if w8 is not None:
-            # Native fp8 (sm90 only — elsewhere Backend.materialize already
-            # turned these into a bf16 weight); master is recording-only.
             wscale = self.params[key + ".wscale"]
             return backend.linear_fp8(x, w8, wscale, master=self.params.get(key), oscale=osc, **kw)
         return backend.linear(x, self.params[key], **kw)
 
     def _add_via(self, backend: "Backend", kv: Any, x: torch.Tensor, h: torch.Tensor, key: str):
-        """x + linear(h): fused into the GEMV epilogue on the serving path,
-        backend.add (tape-recorded) otherwise."""
+        """x + linear(h): in the GEMV epilogue when serving, backend.add otherwise."""
         if getattr(backend, "tp_world", 1) > 1:
-            # Row-parallel: this rank holds a PARTIAL sum, so the residual add
-            # cannot ride the GEMV epilogue - it has to follow the all-reduce.
+            # Row-parallel: the residual add has to follow the all-reduce.
             return backend.add(x, backend.all_reduce(self._linear(backend, h, key)))
         if getattr(backend, "fuses_residual", False) and not getattr(kv, "dense", False):
             return self._linear(backend, h, key, residual=x)
         return backend.add(x, self._linear(backend, h, key))
 
-    # -- full attention layer ----------------------------------------------
     def _full_attn(
         self,
         layer_idx: int,
@@ -309,7 +199,7 @@ class Model:
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps)
         hq, hkv, d = cfg.num_attention_heads, cfg.num_kv_heads, cfg.head_dim
         qkv_key = f"{p}.qkv"
-        if self._has(qkv_key):  # fused q/k/v (serving)
+        if self._has(qkv_key):
             qkv = self._linear(backend, h, qkv_key)
             q_rows = hq * d * (2 if cfg.full_attn_gated else 1)
             b, t, _ = qkv.shape
@@ -319,7 +209,7 @@ class Model:
                     qkv, self.params[f"{p}.q_norm"], self.params[f"{p}.k_norm"], positions,
                     cfg.rope_theta, cfg.effective_rotary_dim, kv, layer_idx, hq, hkv, cfg.rms_eps,
                 )
-            if qn is not None:  # sm90: norm+rope+kv-write done in one launch
+            if qn is not None:  # sm90: norm+rope+kv-write in one launch
                 gate = autograd.slice(autograd.reshape(
                     autograd.slice(qkv, ..., slice(0, q_rows)), b, t, hq, 2, d), ..., 1, slice(None))
                 k_plane, v_plane = kv.kv_pool.kv_layer(layer_idx)
@@ -346,13 +236,11 @@ class Model:
             q = autograd.reshape(q, b, t, hq, d)
         k = autograd.reshape(k, b, t, hkv, d)
         v = autograd.reshape(v, b, t, hkv, d)
-        # Per-head RMSNorm (weight [head_dim], broadcast over B,T,H).
         q = backend.rmsnorm(q, self.params[f"{p}.q_norm"], cfg.rms_eps)
         k = backend.rmsnorm(k, self.params[f"{p}.k_norm"], cfg.rms_eps)
         q = backend.rope(q, positions, cfg.rope_theta, rotary_dim=cfg.effective_rotary_dim)
         k = backend.rope(k, positions, cfg.rope_theta, rotary_dim=cfg.effective_rotary_dim)
         if getattr(kv, "dense", False):
-            # Training: dense GQA attention (no paged pool indirection).
             out = backend.attention(q, k, v, 1.0 / math.sqrt(d), gate=gate)
         else:
             backend.write_tokens(k, v, kv, layer_idx)
@@ -369,7 +257,6 @@ class Model:
             )
         return self._add_via(backend, kv, x, autograd.reshape(out, b, t, hq * d), f"{p}.o_proj")
 
-    # -- gated-delta (linear attention) layer -------------------------------
     def _gdn(
         self,
         layer_idx: int,
@@ -383,7 +270,6 @@ class Model:
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps)
         qkvz_key = f"{p}.qkvz"
         if self._has(qkvz_key):
-            # Fused qkv/z (serving): one GEMM, split back at the qkv boundary.
             qkvz = self._linear(backend, h, qkvz_key)
             qkv = autograd.slice(qkvz, ..., slice(0, cfg.linear_qkv_dim))
             z = autograd.slice(qkvz, ..., slice(cfg.linear_qkv_dim, None))
@@ -391,7 +277,7 @@ class Model:
             qkv = self._linear(backend, h, f"{p}.in_proj_qkv")
             z = self._linear(backend, h, f"{p}.in_proj_z")
         ab_key = f"{p}.ab"
-        if self._has(ab_key):  # fused a/b (serving)
+        if self._has(ab_key):
             ab = self._linear(backend, h, ab_key)
             nvh = cfg.linear_num_value_heads
             a_proj = autograd.slice(ab, ..., slice(0, nvh))
@@ -400,8 +286,6 @@ class Model:
             b_proj = self._linear(backend, h, f"{p}.in_proj_b")
             a_proj = self._linear(backend, h, f"{p}.in_proj_a")
         qd, kd = cfg.linear_q_dim, cfg.linear_k_dim
-        # Recorded slices of the fused projection: the tape must see the split
-        # or the grad never reaches in_proj_qkv (views break the id() chain).
         q = autograd.slice(qkv, ..., slice(0, qd))
         k = autograd.slice(qkv, ..., slice(qd, qd + kd))
         v = autograd.slice(qkv, ..., slice(qd + kd, None))
@@ -423,8 +307,7 @@ class Model:
             state, window = backend.state_gather(
                 pool.states, pool.conv_windows, kv.state_slot, linear_idx, pool.win_parity
             )
-            # Speculative verify: keep the state after every chain step, in the
-            # pool's step buffers, so the engine can adopt the accepted one.
+            # Speculative verify keeps the state after every chain step for the engine to adopt.
             ks = getattr(kv, "keep_steps", 0)
             if ks:  # the tape replays kwargs into gdn_backward, which has no such arg
                 kwargs["keep_steps"] = ks
@@ -442,7 +325,6 @@ class Model:
             backend.flip_window_parity(kv.state_pool, kv.state_slot)
         return self._add_via(backend, kv, x, out, f"{p}.out_proj")
 
-    # -- MLP ----------------------------------------------------------------
     def _mlp(self, layer_idx: int, x: torch.Tensor, kv: Any, backend: "Backend") -> torch.Tensor:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
@@ -458,7 +340,6 @@ class Model:
         activated = backend.silu_mul(gate, up)
         return self._add_via(backend, kv, x, activated, f"{p}.down_proj")
 
-    # -- full forward --------------------------------------------------------
     def forward(
         self,
         input_ids: "np.ndarray | torch.Tensor",
@@ -468,11 +349,9 @@ class Model:
         hidden_out: list | None = None,
         last_only: "bool | list[int]" = False,
     ) -> torch.Tensor:
-        """Run the model. ``input_ids`` [B,T] int, ``positions`` [T] or [B,T]
-        int (RoPE positions), ``kv`` a BatchKv with pools attached. Returns
-        logits [B,T,vocab_size] on the backend device. ``hidden_out``, when
-        given, receives the pre-final-norm hidden state (the MTP draft head's
-        input) — a list so the seam costs nothing when spec-decode is off."""
+        """``input_ids`` [B,T], ``positions`` [T] or [B,T], ``kv`` a BatchKv with
+        pools attached -> logits [B,T,vocab]. ``hidden_out`` receives the
+        pre-final-norm hidden state (the MTP draft head's input)."""
         cfg = self.cfg
         device = backend.device
         ids = torch.as_tensor(input_ids, dtype=torch.long, device=device)
@@ -486,22 +365,12 @@ class Model:
                 x = self._gdn(i, linear_idx, x, kv, backend)
                 linear_idx += 1
             x = self._mlp(i, x, kv, backend)
-        if hidden_out is not None:  # spec-decode: the MTP head's fc input
+        if hidden_out is not None:
             hidden_out.append(x)
-        # A prefill chunk needs the logits of its LAST token only, but lm_head
-        # is [vocab=248320, hidden], so computing all T costs 4.7% of a 2048
-        # prefill's FLOPs and a 508 MB output to throw away. The CALLER decides:
-        # it knows the per-row lengths as Python ints, and asking the device
-        # instead would be a host sync — illegal inside a CUDA graph capture,
-        # which is what blocked capturing a prefill tick.
-        #
-        # A LIST gives the per-row valid length. Rows in one tick do not share
-        # one: a mixed tick's decode rows end at position 1 while the prefill
-        # row runs the full width, so a single trailing slice cannot express
-        # it and the bool form simply gave up and ran lm_head over every
-        # position of every row — measured as a 3.05 GiB f32 logits tensor,
-        # three of them live, on a B=32 mixed tick. Serving only: the tape
-        # never passes a list (training wants every position's logits).
+        # lm_head over every prefill position is 4.7% of the FLOPs and a 508 MB
+        # output thrown away; the caller passes ``last_only`` (a list gives the
+        # per-row valid length of a mixed tick) because a device-side length
+        # lookup is a host sync, illegal inside a CUDA graph capture.
         if last_only is not False and x.shape[1] > 1:
             if last_only is True:
                 x = autograd.slice(x, ..., slice(x.shape[1] - 1, None), slice(None))
@@ -512,28 +381,17 @@ class Model:
         head_key = "embed_tokens" if cfg.tie_word_embeddings else "lm_head"
         logits = self._linear(backend, x, head_key)
         if getattr(backend, "tp_world", 1) > 1 and not cfg.tie_word_embeddings:
-            # Vocab-parallel head: each rank owns a slice of the vocabulary,
-            # so the row is only whole once gathered. A tied head is the
-            # embedding table, which stays replicated and needs no gather.
+            # Vocab-parallel head; a tied head is the replicated embedding table.
             logits = backend.all_gather(logits, dim=-1)[..., : cfg.vocab_size]
         return logits
 
 
-# --- Random initialization --------------------------------------------------
 def add_lora(
     model: "Model", rank: int = 16, alpha: float = 32.0, seed: int = 0
 ) -> dict[str, torch.Tensor]:
-    """Attach LoRA adapters to every linear; returns the new params.
-
-    The quantized base stays frozen (no bf16 master), so the tape's
-    ``linear_fp4_frozen`` path gives dX only and the 27B trains inside one
-    card's memory. B starts at zero, so the adapted model is bit-identical to
-    the base on step 0; alpha/rank is folded into A's init.
-
-    A dense bf16 base (the tiny model, and therefore the CPU/CI path) gets
-    adapters too — otherwise this returns nothing there and the OPD loop has no
-    trainable tensors to hand the tape.
-    """
+    """Attach LoRA adapters to every linear (quantized or dense bf16) and return
+    them. B starts at zero, so step 0 is bit-identical to the base; alpha/rank
+    is folded into A's init."""
     g = torch.Generator().manual_seed(seed)
     new: dict[str, torch.Tensor] = {}
     for k in sorted(model.params):
@@ -547,14 +405,12 @@ def add_lora(
             and not any(k.endswith(x) for x in (".lora_a", ".lora_b"))
             and f"{k}.wq" not in model.params
             and f"{k}.w8" not in model.params
-        ):  # dense base: the key IS the weight, so the adapter hangs off it
+        ):  # dense base: the key IS the weight
             base, n, kk = k, *model.params[k].shape
         else:
             continue
         scale = (alpha / rank) / math.sqrt(kk)
-        # on the base weight's device: materialize() runs every train step and
-        # its .to(device) would rebuild a CPU adapter, changing the id() the
-        # optimizer and the tape key gradients by
+        # On the base weight's device, or materialize() rebuilds the adapter with a new id().
         dev = model.params[k].device
         a = torch.randn(rank, kk, generator=g).to(precision.dtype("adapter")) * scale
         new[base + ".lora_a"] = a.to(dev)
@@ -566,9 +422,8 @@ def add_lora(
 def build_random(
     cfg: ModelConfig, seed: int, fuse_projections: bool = False, keep_master: bool = False
 ) -> Model:
-    """Deterministic random model: N(0, 0.02^2) matrices, ones for norms,
-    zeros for dt_bias/a_log, all bf16 on CPU. fp4 linears are packed from
-    their bf16 master, which ``keep_master`` retains for the STE backward."""
+    """Seeded random bf16 model on CPU; fp4 linears are packed from their master,
+    which ``keep_master`` retains for the STE backward."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
     def randn(shape: tuple[int, ...]) -> torch.Tensor:
@@ -597,13 +452,9 @@ def build_random(
     return Model(cfg, params)
 
 
-# --- Checkpoint loading -----------------------------------------------------
-
-# Qwen3_5RMSNorm keys are zero-centered (y = x_normed * (1 + weight)); the GDN
-# gated norm is plain. Suffix-matched at load to fold the +1 into the weight.
+# Qwen3_5RMSNorm is zero-centered (y = x_normed * (1 + weight)); the +1 is folded in at load.
 _ZERO_CENTERED_NORMS = ("input_norm", "post_attn_norm", "q_norm", "k_norm")
 
-#: HF suffix -> param key (layer index substituted by the caller).
 _LAYER_SUFFIXES: dict[str, str] = {
     "input_layernorm.weight": "input_norm",
     "post_attention_layernorm.weight": "post_attn_norm",
@@ -629,10 +480,8 @@ _LAYER_SUFFIXES: dict[str, str] = {
 
 
 def _param_key_for(name: str) -> str | None:
-    """Map one HF or MLX tensor name to a param key, or None for tensors we
-    ignore (vision/MTP/optimizer state). HF names keep ``model.language_model.``
-    and ``.weight``; MLX names arrive with both stripped (the suffix table
-    lookup tries the bare key and ``key + ".weight"``)."""
+    """HF or MLX (prefix and ``.weight`` stripped) tensor name -> param key, or
+    None for ignored tensors (vision/MTP/optimizer state)."""
     name = name.removeprefix("model.language_model.").removeprefix("model.")
     top = name.removesuffix(".weight")
     if top == "embed_tokens":
@@ -653,16 +502,12 @@ def _param_key_for(name: str) -> str | None:
 
 
 def _is_lm_head(name: str) -> bool:
-    """True for the output-projection tensor in any checkpoint format (bf16
-    ``.weight``, NVFP4 ``.weight_packed``, fp8, AWQ ``.qweight``, MLX bare)."""
     stem = name.removeprefix("model.language_model.").removeprefix("model.")
     stem = stem.removeprefix("language_model.")
     return stem == "lm_head" or stem.startswith("lm_head.")
 
 
 def _validate_hf_config(cfg: ModelConfig, hf_cfg: dict, source: str) -> None:
-    """Cross-check the HF config.json against ``cfg``. Mismatches raise —
-    loading a checkpoint into the wrong-shaped model must fail loudly."""
     # Qwen3.5 wraps the text model in text_config; flat Qwen3 exports do not.
     text_cfg = hf_cfg.get("text_config", hf_cfg)
     checks = {
@@ -681,7 +526,6 @@ def _validate_hf_config(cfg: ModelConfig, hf_cfg: dict, source: str) -> None:
                 f"config mismatch for `{source}`: {field}={actual} in HF config.json "
                 f"but cfg expects {expected}"
             )
-    # layer_types is the verbatim source of truth for the full/linear split.
     layer_types = text_cfg.get("layer_types")
     if layer_types is not None:
         full = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
@@ -690,14 +534,12 @@ def _validate_hf_config(cfg: ModelConfig, hf_cfg: dict, source: str) -> None:
                 f"config mismatch for `{source}`: HF layer_types has full-attention "
                 f"layers {full} but cfg.full_attn_layers is {tuple(cfg.full_attn_layers)}"
             )
-    # The gated q_proj changes q_proj's row count — catch it before loading.
     if "attn_output_gate" in text_cfg and text_cfg["attn_output_gate"] != cfg.full_attn_gated:
         raise RuntimeError(
             f"config mismatch for `{source}`: HF attn_output_gate="
             f"{text_cfg['attn_output_gate']} but cfg.full_attn_gated={cfg.full_attn_gated}"
         )
-    # RoPE. Qwen3.5 nests the base and the rotary fraction under
-    # `rope_parameters`; flat Qwen3 exports keep them at the top level.
+    # Qwen3.5 nests RoPE under `rope_parameters`; flat Qwen3 exports keep it top level.
     rope = text_cfg.get("rope_parameters") or {}
     theta = rope.get("rope_theta", text_cfg.get("rope_theta"))
     if theta is not None and float(theta) != float(cfg.rope_theta):
@@ -714,8 +556,7 @@ def _validate_hf_config(cfg: ModelConfig, hf_cfg: dict, source: str) -> None:
                 f"rotary_dim {rd} at head_dim {cfg.head_dim} but cfg expects "
                 f"{cfg.effective_rotary_dim}"
             )
-    # tileRL implements unscaled RoPE only; serving a YaRN/linear checkpoint
-    # unscaled is wrong at every position, so refuse instead of ignoring it.
+    # Only unscaled RoPE is implemented; serving YaRN/linear unscaled is wrong at every position.
     scaling = text_cfg.get("rope_scaling") or {}
     rope_type = scaling.get("rope_type") or scaling.get("type") or rope.get("rope_type")
     if rope_type not in (None, "default") or scaling.get("factor", 1.0) != 1.0:
@@ -724,8 +565,7 @@ def _validate_hf_config(cfg: ModelConfig, hf_cfg: dict, source: str) -> None:
             f"rope_parameters.rope_type={rope_type!r}) and tileRL implements none — "
             f"it would be served as unscaled RoPE, silently wrong at every position"
         )
-    # Multimodal configs carry tie_word_embeddings at the TOP level, where it
-    # overrides the text_config copy — a text_config-only lookup no-ops there.
+    # Multimodal configs carry tie_word_embeddings at the top level, overriding text_config.
     tie = hf_cfg.get("tie_word_embeddings", text_cfg.get("tie_word_embeddings"))
     if tie is not None and bool(tie) != cfg.tie_word_embeddings:
         raise RuntimeError(
@@ -747,7 +587,7 @@ def _shard_files(ckpt_dir: Path, source: str) -> list[Path]:
         shards = sorted(ckpt_dir.glob("model-*.safetensors"))
         files = shards if shards else [ckpt_dir / "model.safetensors"]
     missing = [f for f in files if not f.exists()]
-    if missing or not files:
+    if missing:
         tried = index if index.exists() else ckpt_dir
         raise RuntimeError(
             f"`{source}`: no safetensors shards found (looked for {files}; resolved via {tried})"
@@ -758,10 +598,7 @@ def _shard_files(ckpt_dir: Path, source: str) -> list[Path]:
 def _dequant_mlx(
     w: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor, group_size: int
 ) -> torch.Tensor:
-    """MLX affine 4-bit dequant. ``w`` uint32 [out, in//8] (8 nibbles/uint32,
-    low bits first), ``scales``/``biases`` [out, in//group]; ``w = s*q + b``
-    per group (the MLX quantized-matmul kernel convention — scales may be
-    negative). Returns bf16 [out, in]."""
+    """MLX affine 4-bit: ``w`` uint32 [out, in//8] low nibble first, ``w = s*q + b`` per group."""
     out, k8 = w.shape
     shifts = torch.arange(8, dtype=torch.int64) * 4
     q = ((w.long().unsqueeze(-1) >> shifts) & 0xF).float().reshape(out, k8 * 8)
@@ -777,28 +614,11 @@ def load_hf(
     fuse_projections: bool = False,
     keep_master: bool = False,
 ) -> Model:
-    """Load ``source`` (HF repo id or local checkpoint directory) into a Model.
-
-    ``num_layers`` truncates to the first N layers (embedding + N layers +
-    final norm + lm_head); tensors for the skipped layers are not required.
-    Raises RuntimeError (never a silent fallback) on download failure, missing
-    files, config mismatch, or missing/duplicate/shape-mismatched tensors.
-    HF safetensors and MLX 4-bit affine checkpoints are both accepted (the
-    MLX path is detected from the ``language_model.`` tensor-name prefix), as
-    are ModelOpt NVFP4/FP8-block checkpoints (detected from the
-    ``weight_packed`` / ``weight_scale_inv`` sibling tensors), official-NVFP4
-    checkpoints (``weight_scale_2`` sibling: e2m1 nibbles * f8 block scale *
-    global scale), per-tensor FP8 (f8 ``weight`` + scalar ``weight_scale``),
-    and AWQ-int4 (``qweight`` / ``scales`` / ``qzeros`` siblings, group size
-    from ``quantization_config.group_size``). FP8 linears are kept native:
-    the e4m3 weight lands in ``<key>.w8`` and the per-128-block scale in
-    ``<key>.wscale``; a per-tensor or per-channel scale rides ``<key>.oscale``
-    over a ones wscale instead of being re-quantized to 4 bits. An NVFP4
-    checkpoint is served as its own bytes (``.wq`` verbatim, ``.scale`` at the
-    checkpoint's block size, ``.oscale``), as is :func:`save_hf`'s own output
-    (the same three under the HF stem). ``keep_master`` (training only)
-    regenerates the bf16 STE master from those served bytes; serving keeps
-    none, so nothing but the quantized bytes reaches the device."""
+    """Load ``source`` (HF repo id or local directory) into a Model; every
+    failure raises RuntimeError. Accepts bf16, MLX 4-bit, ModelOpt/official
+    NVFP4 (served as its own bytes), FP8 block/per-tensor (kept native as
+    ``.w8/.wscale``), AWQ-int4 and :func:`save_hf` output. ``num_layers``
+    truncates; ``keep_master`` (training) regenerates the bf16 STE master."""
     if num_layers is not None and not 0 < num_layers <= cfg.num_layers:
         raise ValueError(f"num_layers={num_layers} out of range for {cfg.num_layers} layers")
     src = Path(source)
@@ -806,12 +626,8 @@ def load_hf(
         ckpt_dir = src
         source_desc = str(src)
     else:
-        try:
-            from huggingface_hub import snapshot_download
-        except ImportError as exc:  # pragma: no cover - dep is pinned
-            raise RuntimeError(
-                f"huggingface-hub is required to load `{source}` (pip install huggingface-hub)"
-            ) from exc
+        from huggingface_hub import snapshot_download
+
         try:
             ckpt_dir = Path(
                 snapshot_download(
@@ -830,9 +646,7 @@ def load_hf(
         raise RuntimeError(f"`{source_desc}`: config.json not found at {config_path}")
     hf_cfg = json.loads(config_path.read_text())
     _validate_hf_config(cfg, hf_cfg, source_desc)
-    if num_layers is not None:
-        # Truncate AFTER validation: the checkpoint is the full model; only
-        # the loaded tensor set and the returned config are truncated.
+    if num_layers is not None:  # after validation: the checkpoint is the full model
         cfg = replace(
             cfg,
             num_layers=num_layers,
@@ -844,26 +658,14 @@ def load_hf(
             + ("" if cfg.tie_word_embeddings else " + lm_head")
         )
 
-    try:
-        from safetensors.torch import load_file
-    except ImportError as exc:  # pragma: no cover - dep is pinned
-        raise RuntimeError(
-            f"safetensors is required to load `{source_desc}` (pip install safetensors)"
-        ) from exc
+    from safetensors.torch import load_file
 
     specs = param_specs(cfg)
     group_size = hf_cfg.get("quantization", {}).get("group_size", 64)
     awq_group = (hf_cfg.get("quantization_config") or {}).get("group_size", 128)
     params: dict[str, torch.Tensor] = {}
-    #: Native-fp8 linears (key -> (e4m3 weight, f32 per-128-block scale,
-    #: optional per-row epilogue scale)), kept native instead of dequantized:
-    #: the sm90 path computes with the e4m3 weight directly.
     fp8_native: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
-    #: Checkpoint-native fp4 linears (key -> (packed nibbles, block scale,
-    #: per-row epilogue scale)) — the bytes are served verbatim.
     fp4_native: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-    #: First output-projection tensor seen, in any format — the tie check below
-    #: is derived from the tensor set, not from what config.json claims.
     lm_head_tensor: str | None = None
     for shard in _shard_files(ckpt_dir, source_desc):
         tensors = load_file(str(shard))
@@ -881,24 +683,17 @@ def load_hf(
                         tensor, tensors[base + ".scales"], tensors[base + ".biases"], group_size
                     )
                 key = _param_key_for(base)
-            elif hf_name.endswith(".weight_packed"):
-                # ModelOpt NVFP4 (Qwen3.6 MLP linears): packed e2m1 nibbles +
-                # f8 block scale + global scale siblings. Kept packed when
-                # cfg.fp4 (the checkpoint IS the serving format); dequantized
-                # to bf16 otherwise.
+            elif hf_name.endswith(".weight_packed"):  # ModelOpt NVFP4
                 stem = hf_name.removesuffix(".weight_packed")
                 key = _param_key_for(stem + ".weight")
                 if key is not None:
                     sib = (tensors[stem + ".weight_scale"], tensors[stem + ".weight_global_scale"])
                     if cfg.fp4:
                         fp4_native[key] = _native_fp4(tensor, *sib, divide=True)
-                        key = None  # served packed: no bf16 tensor at params[key]
+                        key = None  # served packed
                     else:
                         tensor = dequant_nvfp4(tensor, *sib, global_divide=True)
-            elif hf_name.endswith(".wq"):
-                # tilerl's own save_hf: the served bytes verbatim (.scale at
-                # whatever block the saved model had, .oscale the epilogue),
-                # so load(save(m)) re-quantizes nothing and is bit-identical.
+            elif hf_name.endswith(".wq"):  # save_hf output: the served bytes verbatim
                 stem = hf_name.removesuffix(".wq")
                 key = _param_key_for(stem + ".weight")
                 if key is not None:
@@ -908,9 +703,7 @@ def load_hf(
                         key = None
                     else:
                         tensor = unpack_fp4(tensor, *sib)
-            elif hf_name.endswith(".qweight"):
-                # AWQ-int4 (autoawq GEMM): packed int4 weights + per-group
-                # scales/zeros siblings, dequantized to bf16.
+            elif hf_name.endswith(".qweight"):  # AWQ-int4
                 stem = hf_name.removesuffix(".qweight")
                 key = _param_key_for(stem + ".weight")
                 if key is not None:
@@ -921,11 +714,7 @@ def load_hf(
                 hf_name.endswith(".weight")
                 and hf_name.removesuffix(".weight") + ".weight_scale_inv" in tensors
             ):
-                # ModelOpt FP8 block (Qwen3.6 GDN linears): f8 weight +
-                # per-128-block scales, kept native (the bf16 dequant is the
-                # recording-only master). The stored "scale_inv" is the scale
-                # itself (multiplied, despite the name — agent-infer
-                # quant_format.rs ScaleApply::Multiply).
+                # ModelOpt FP8 block; "scale_inv" is multiplied despite the name.
                 key = _param_key_for(hf_name)
                 if key is not None:
                     wscale = tensors[hf_name.removesuffix(".weight") + ".weight_scale_inv"].float()
@@ -935,9 +724,7 @@ def load_hf(
                 hf_name.endswith(".weight")
                 and hf_name.removesuffix(".weight") + ".weight_scale_2" in tensors
             ):
-                # Official NVFP4 (nvidia/Qwen3.6-27B-NVFP4 MLP linears): same
-                # e2m1*f8-block-scale*global-scale math as ModelOpt, official
-                # tensor names (weight / weight_scale / weight_scale_2).
+                # Official NVFP4: ModelOpt's math under the official tensor names.
                 stem = hf_name.removesuffix(".weight")
                 key = _param_key_for(hf_name)
                 if key is not None:
@@ -951,10 +738,8 @@ def load_hf(
                 hf_name.endswith(".weight")
                 and hf_name.removesuffix(".weight") + ".weight_scale" in tensors
             ):
-                # FP8 weight + scale sibling, per-tensor scalar or per-channel
-                # [N,1] (Qwen3.8 NVFP4). Both are a per-output-row constant, so
-                # both ride the .oscale epilogue over a ones wscale and stay
-                # 8-bit — the per-128-block wscale layout can express neither.
+                # FP8 with a per-tensor or per-channel scale: both are per-row
+                # constants, so they ride .oscale over a ones wscale.
                 stem = hf_name.removesuffix(".weight")
                 key = _param_key_for(hf_name)
                 if key is not None:
@@ -977,16 +762,11 @@ def load_hf(
                     ".qzeros",
                 )
             ):
-                # Quant siblings consumed with their weight tensor above;
-                # input_*_scale is activation quant — inference-engine
-                # business, ignored at load.
-                continue
+                continue  # consumed with the weight above; input_* is activation quant
             else:
                 key = _param_key_for(hf_name)
-            if key is None:
-                continue  # vision tower, MTP head, optimizer state, ...
-            if num_layers is not None and key not in specs:
-                continue  # truncated-away layer: not required, not loaded
+            if key is None or (num_layers is not None and key not in specs):
+                continue
             if key in params:
                 raise RuntimeError(
                     f"`{source_desc}`: tensor for param `{key}` appears in multiple "
@@ -995,22 +775,16 @@ def load_hf(
             if key.endswith(".conv1d") and tensor.ndim == 3:
                 tensor = tensor.reshape(tensor.shape[0], -1)  # [C,1,K]/[C,K,1] -> [C,K]
             if key == "final_norm" or key.endswith(_ZERO_CENTERED_NORMS):
-                # Qwen3_5RMSNorm is zero-centered: y = x_normed * (1 + weight).
-                # Fold the +1 in at load so the kernel stays a plain RMSNorm.
-                # The GDN gated norm (gdn_norm) is NOT zero-centered — excluded.
                 tensor = (tensor.float() + 1.0).to(tensor.dtype)
             params[key] = tensor
 
-    # Native FP8 weights: the e4m3 weight + per-128-block scale (+ per-row
-    # epilogue scale) the sm90 path computes with directly.
     for key, (w8, wscale, oscale) in fp8_native.items():
         params[f"{key}.w8"] = w8.contiguous()
         params[f"{key}.wscale"] = wscale.contiguous()
         if oscale is not None:
             params[f"{key}.oscale"] = oscale
 
-    # Checkpoint-native fp4 weights, validated against the schema (the shape
-    # check below only sees keys that carry a bf16 tensor).
+    # Validated here: the shape check below only sees keys with a bf16 tensor.
     for key, (wq, scale, oscale) in fp4_native.items():
         if key not in specs:
             continue  # truncated-away layer
@@ -1021,12 +795,10 @@ def load_hf(
                 f"{tuple(scale.shape)}, expected ({n}, {k // 2}) and ({n}, K/B)"
             )
         params[f"{key}.wq"], params[f"{key}.scale"], params[f"{key}.oscale"] = wq, scale, oscale
-        if keep_master:  # the STE master, regenerated from the served bytes
+        if keep_master:
             params[key] = unpack_fp4(wq, scale, oscale)
 
-    # Embedding/lm_head tying. Tied cfg + a checkpoint that ships its own
-    # lm_head is the silent direction: dropping the tensor serves embed_tokens
-    # as the output projection at full speed (measured top-1 agreement 0/8).
+    # Tied cfg + a shipped lm_head would silently serve embed_tokens as the head.
     if cfg.tie_word_embeddings:
         if lm_head_tensor is not None:
             raise RuntimeError(
@@ -1037,7 +809,6 @@ def load_hf(
     elif "lm_head" not in params and not _quantized(params, "lm_head"):
         raise RuntimeError(f"`{source_desc}`: untied model is missing lm_head.weight")
 
-    # Completeness + shape check against the canonical schema.
     missing = sorted(k for k in specs if not (k in params or _quantized(params, k)))
     if missing:
         raise RuntimeError(
@@ -1051,13 +822,10 @@ def load_hf(
                 f"{tuple(tensor.shape)} vs cfg {specs[key]}"
             )
 
-    # Quantize the bf16 linears the checkpoint did not already ship packed.
-    # Native-fp8 linears are skipped: their checkpoint format is already the
-    # sm90 prefill compute format (re-packing to fp4 would lose the e4m3
-    # precision and force the K-loop dequant path).
+    # Pack the bf16 linears the checkpoint did not ship quantized.
     if cfg.fp4:
         for key in sorted(fp4_param_keys(cfg)):
-            if f"{key}.w8" in params or f"{key}.wq" in params:
+            if _quantized(params, key):
                 continue
             master = params[key]
             if master.dtype != torch.bfloat16:
@@ -1067,24 +835,19 @@ def load_hf(
             params[f"{key}.wq"] = wq
             params[f"{key}.scale"], params[f"{key}.oscale"] = renorm_fp4_scale(scale)
 
-    if not keep_master:  # serving: the quantized bytes ARE the weight
-        # embed_tokens is exempt — backend.embedding needs the plain table.
+    if not keep_master:  # serving: the quantized bytes ARE the weight (embedding needs its table)
         for key in [k for k in specs if k != "embed_tokens" and _quantized(params, k)]:
-            params.pop(key, None)  # the checkpoint-native path never made one
+            params.pop(key, None)
 
     if fuse_projections:
         _fuse_projections(cfg, params)
     return Model(cfg, params)
 
 
-# --- Checkpoint saving ------------------------------------------------------
-
-#: Param suffix -> HF suffix (reverse of ``_LAYER_SUFFIXES``).
 _HF_SUFFIXES = {v: k for k, v in _LAYER_SUFFIXES.items()}
 
 
 def _hf_tensor_name(key: str) -> str:
-    """Param key -> HF tensor name (reverse of :func:`_param_key_for`)."""
     if key == "embed_tokens":
         return "model.language_model.embed_tokens.weight"
     if key == "final_norm":
@@ -1096,15 +859,8 @@ def _hf_tensor_name(key: str) -> str:
 
 
 def drop_quantized(model: Model) -> Model:
-    """Free the served bytes of every linear that has a bf16 master.
-
-    Full fine-tuning routes each linear through its master
-    (``autograd.RecordingBackend.master_linear``), so the quantized bytes are
-    never read — 14.9 GiB of the 27B held for nothing. ``save_hf`` re-packs
-    from the master, so nothing is lost except the checkpoint's original bytes,
-    which is why this is a training-entry-point call and not part of
-    ``load_hf``: the loader stays a bit-exact round trip.
-    """
+    """Free the served bytes of every linear with a bf16 master: full fine-tuning
+    never reads them (14.9 GiB on the 27B) and ``save_hf`` re-packs from the master."""
     for key in [k for k in param_specs(model.cfg) if k in model.params]:
         for suffix in (".wq", ".scale", ".oscale", ".w8", ".wscale"):
             model.params.pop(key + suffix, None)
@@ -1112,16 +868,9 @@ def drop_quantized(model: Model) -> Model:
 
 
 def save_hf(model: Model, path: str | Path) -> None:
-    """Save params as HF safetensors + config.json (``load_hf`` reads it back).
-
-    A serving fp4 linear is saved as the bytes it serves — ``.wq``/``.scale``/
-    ``.oscale`` under the HF stem — so nothing is dequantized here or
-    re-packed on load and ``load_hf(save_hf(m))`` is bit-identical. A bf16
-    master (training, ``keep_master=True``) is the live weight the optimizer
-    moves, so it is saved instead and the stale bytes beside it are dropped.
-    The optimizer state is not saved. # ponytail: training-state checkpoints
-    are day-2 (agent-infer's ``checkpoint.rs``).
-    """
+    """HF safetensors + config.json: a bf16 master is saved as the weight, else
+    the served fp4 bytes verbatim, so ``load_hf(save_hf(m))`` is bit-identical.
+    # ponytail: no optimizer state; training-state checkpoints are day-2."""
     from dataclasses import asdict
 
     from safetensors.torch import save_file
@@ -1147,7 +896,7 @@ def save_hf(model: Model, path: str | Path) -> None:
                 tensors[stem + suffix] = t
         else:
             missing.append(key)
-    if missing:  # fused or native-fp8 serving keys: no per-key bytes to write
+    if missing:
         raise RuntimeError(
             f"save_hf: {len(missing)} params carry neither a bf16 master nor fp4 "
             f"bytes (fused-projection or native-fp8 serving model), e.g. {missing[:3]}"

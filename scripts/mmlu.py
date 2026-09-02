@@ -21,11 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from tilerl.eval import LETTERS, letter, mmlu_questions, mmlu_score  # noqa: E402
 from tilerl.tokenizer import get_tokenizer  # noqa: E402
 
-_questions = mmlu_questions
-
 
 def score_tilerl(source: str, prompts: list[str]) -> list[str]:
-    """One greedy letter per prompt through tileRL's engine."""
     from tilerl.config import qwen38_27b
     from tilerl.engine import build_engine
     from tilerl.model import load_hf
@@ -38,8 +35,8 @@ def score_tilerl(source: str, prompts: list[str]) -> list[str]:
 
 
 def accuracy(source: str, n: int = 200, seed: int = 0) -> tuple[int, int]:
-    """MMLU 0-shot correct/total through tileRL — the harness's accuracy gate."""
-    prompts, golds, _ = _questions(n, seed)
+    """bench_harness's accuracy gate."""
+    prompts, golds, _ = mmlu_questions(n, seed)
     preds = [letter(t) for t in score_tilerl(source, prompts)]
     return sum(p == g for p, g in zip(preds, golds)), len(preds)
 
@@ -54,7 +51,7 @@ def main() -> None:
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    prompts, golds, subjects = _questions(args.n, args.seed)
+    prompts, golds, subjects = mmlu_questions(args.n, args.seed)
     t0 = time.time()
 
     if args.engine == "tilerl":
@@ -64,8 +61,7 @@ def main() -> None:
         import sglang
 
         llm = sglang.Engine(model_path=args.source, trust_remote_code=True, mem_fraction_static=0.85)
-        # unconstrained + top-logprobs, then argmax over the letter tokens: sglang's
-        # regex FSM splits the first token and decodes garbage (2026-08-28)
+        # argmax over letter tokens' logprobs: sglang's regex FSM splits the first token
         outs = llm.generate(prompts, {"temperature": 0, "max_new_tokens": 1},
                             return_logprob=True, top_logprobs_num=20)
         tok = get_tokenizer(args.source)

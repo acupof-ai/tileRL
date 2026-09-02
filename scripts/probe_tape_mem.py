@@ -1,11 +1,5 @@
-"""How much of a train step's memory is intermediate gradients the tape holds
-past their last use?
-
-`Tape.backward` accumulates every gradient into one dict — parameter grads
-(needed at the end) and activation grads (dead the moment their producer
-consumes them) alike — and only filters the second kind out on return. This
-counts both, so the fix has a size before it has an implementation.
-"""
+"""How much of a train step's memory is intermediate gradients the tape holds past their last
+use? `Tape.backward` keeps activation grads in the same dict as param grads until return."""
 
 from __future__ import annotations
 
@@ -24,7 +18,7 @@ def main() -> None:
     import numpy as np
     import torch
 
-    from tilerl.autograd import AdamW, RecordingBackend, Tape
+    from tilerl.autograd import RecordingBackend, Tape
     from tilerl.train import _training_kv
     from tilerl_kernels.backend import get_backend
 
@@ -33,9 +27,7 @@ def main() -> None:
         from tilerl.config import qwen38_27b
         from tilerl.model import add_lora, load_hf
         cfg = qwen38_27b()
-        # keep_master builds the bf16 masters the STE path records onto; without
-        # it "full" only reaches the 402 non-quantized params (norms, conv1d,
-        # dt_bias, a_log) because the fp4 base is frozen and yields dX only.
+        # keep_master builds the bf16 masters the STE path records onto; the fp4 base is frozen
         model = load_hf(cfg, args.source, fuse_projections=False, num_layers=args.layers,
                         keep_master=args.full)
         model.params = backend.materialize(model.params)
@@ -53,8 +45,6 @@ def main() -> None:
         logits = model.forward(ids, np.arange(t, dtype=np.int64), kv, RecordingBackend(backend))
     _, gl = backend.cross_entropy_loss_grad(logits, ids)
 
-    # Instrument the accumulation: count bytes by whether the tensor is a leaf
-    # (a parameter, kept) or an intermediate (dead after its producer runs).
     entries = list(tape._entries)
     produced = {id(e.output) for e in entries}
     if backend.device.type == "cuda":

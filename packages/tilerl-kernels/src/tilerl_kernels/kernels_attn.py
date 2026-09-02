@@ -1,8 +1,5 @@
-"""Paged causal attention for sm90 — FlashAttention online-softmax schedule
-ported from the tilelang examples. Registered in the sm90 cell of the
-dispatch matrix (registry.py); kernels.py keeps the portable floor for
-cpu/metal.
-"""
+"""Paged causal attention for sm90: FlashAttention online softmax, ported from
+the tilelang flash_attention / flash_decoding examples."""
 
 from __future__ import annotations
 
@@ -11,40 +8,14 @@ import tilelang.language as T
 
 from .kernels_mma import _pass_configs
 
-__all__ = [
-    "make_paged_attention_decode",
-    "make_paged_attention_combine",
-    "make_paged_attention_mma",
-]
-
-
-# ---------------------------------------------------------------- paged attention (MMA)
-
 
 def make_paged_attention_mma(target: str):
-    """Paged causal attention, FlashAttention online-softmax schedule (sm90).
-
-    # SOTA copy: examples/flash_attention/example_mha_fwd_bshd.py @ tilelang main
-    # Adapted: paged KV pool (block-table gather replaces the dense K/V
-    #   T.copy), GQA (kv head = h * Hkv // H), bf16 IO with f32 accumulate,
-    #   the causal mask driven by the per-row history (SeqLens - SeqQLens)
-    #   instead of a dense tril, and block_M as a schedule arg: 16 for decode
-    #   (M=1, padded at the boundary) — a 64-row tile would make decode
-    #   compute-bound on 63 garbage rows — 64 for prefill. The 16-row tile's
-    #   replicate-4 score fragment casts to bf16 through a shared-memory
-    #   round-trip (the direct fragment copy conflicts on layout).
-    # The backend pads Q's S dim to a multiple of block_M and passes the true
-    # per-row query lengths (SeqQLens) so decode padding rows do not shift the
-    # history; their gather positions clamp to the last block and are masked
-    # out of the score. Mixed batches (decode rows + a prefill chunk sharing
-    # one forward) pad every row to the chunk's T — padding query positions
-    # compute garbage the caller never reads, bounded by the same mask. D must
-    # be a multiple of 16 (WGMMA K).
-    # ponytail: decode (M=1) is ~30x off the memory roofline — tilelang
-    # 0.1.13 lowers the paged gather to synchronous loads (no cp_async for
-    # elementwise copies), so the kernel is latency-bound. Split-KV
-    # flash-decoding with pipelined per-block T.copy gathers is the upgrade
-    # when decode shows up on the profile.
+    """Paged causal GQA attention (example_mha_fwd_bshd.py + block-table gather).
+    block_M 16 for decode, 64 for prefill; the backend pads S to block_M and
+    SeqQLens carries the true per-row query length so padding rows are masked.
+    D must be a multiple of 16 (WGMMA K).
+    # ponytail: the paged gather lowers to synchronous loads (latency-bound at
+    # M=1); pipelined per-block T.copy gathers when decode shows on the profile.
     """
     block_N = 64
     accum_dtype = T.float32
@@ -75,9 +46,7 @@ def make_paged_attention_mma(target: str):
         Out = T.empty((B, S, H, D), "float32")
         log2e = 1.4426950408889634
         policy = T.GemmWarpPolicy.FullRow if block_M >= 32 else T.GemmWarpPolicy.Square
-        # 16-row tiles (decode) with 4 warps cannot partition the PV gemm when
-        # D is small (each warp needs a multiple of 16 rows and 8 columns);
-        # 2 warps is the partition that always works (gemm_nt precedent).
+        # 16-row tiles cannot partition the PV gemm across 4 warps at small D
         threads = 128 if block_M >= 32 else 64
         with T.Kernel(T.ceildiv(S, block_M), H, B, threads=threads) as (bx, hh, bb):
             hkv = hh * Hkv // H
@@ -93,8 +62,7 @@ def make_paged_attention_mma(target: str):
             scores_scale = T.alloc_fragment((block_M,), accum_dtype)
             scores_sum = T.alloc_fragment((block_M,), accum_dtype)
             logsum = T.alloc_fragment((block_M,), accum_dtype)
-            # disable_tma: the decode Q tile is S-padded at the boundary, and
-            # TMA barriers misbehave on padded dims (flash_decoding example).
+            # TMA barriers misbehave on the S-padded decode Q tile
             T.copy(
                 Q[bb, bx * block_M : (bx + 1) * block_M, hh, :],
                 Q_shared,
@@ -133,9 +101,7 @@ def make_paged_attention_mma(target: str):
                 if block_M >= 32:
                     T.copy(acc_s, acc_s_cast)
                 else:
-                    # 16-row tiles with 128 threads: acc_s is replicate-4,
-                    # acc_s_cast replicate-1 — the direct copy conflicts.
-                    # Round-trip through shared (one writer per element).
+                    # replicate-4 -> replicate-1 fragment copy conflicts; go via shared
                     acc_s_sh = T.alloc_shared((block_M, block_N), "float32")
                     T.copy(acc_s, acc_s_sh)
                     for i, j in T.Parallel(block_M, block_N):
@@ -156,20 +122,10 @@ def make_paged_attention_mma(target: str):
 
 
 def make_paged_attention_decode(target: str, KVSPLIT: int = 16):
-    """Decode (S=1) paged attention, split-KV flash-decoding (sm90).
-
-    Grid (KVSPLIT, Hkv, B): a block owns one KV head and one slice of the KV
-    length; the G = H/Hkv query heads of the group are the rows of the 16-row
-    tile (rows >= G masked), so the KV slice is read ONCE per group instead of
-    once per query head. Each block emits its online-softmax partial
-    (PO [B,Hkv,KVSPLIT,G,D], PM, PL); make_paged_attention_combine merges.
-    The dense kernel above launched H blocks of 64 threads per row that each
-    scanned the whole KV with synchronous gathers (~5% of bandwidth at 32k).
-
-    # SOTA copy: examples/flash_decoding/example_gqa_decode.py @ tilelang main
-    #   (split-KV partials + combine). Adapted: paged block-table gather, the
-    #   GQA group as the M tile, KVSPLIT fixed (empty slices emit m=-inf, l=0).
-    """
+    """Decode (S=1) split-KV flash-decoding (example_gqa_decode.py + paged
+    gather). Grid (KVSPLIT, Hkv, B): the GQA group is the 16-row M tile so a KV
+    slice is read once per group; partials (PO, PM, PL) go to the combine
+    kernel. Empty slices emit m=-inf, l=0."""
     block_N = 64
     block_M = 16
     accum_dtype = T.float32
@@ -263,9 +219,7 @@ def make_paged_attention_combine(target: str, KVSPLIT: int = 16):
         PM: T.Tensor((B, Hkv, KVSPLIT, 16), "float32")
         PL: T.Tensor((B, Hkv, KVSPLIT, 16), "float32")
         Out = T.empty((B, Hkv, G, D), "bfloat16")
-        # one warp per output row, lanes over d, splits unrolled: plain scalar
-        # locals — a T.Parallel(D) body with a fragment per iteration ran at
-        # 40-66 us/call.
+        # one warp per row with scalar locals: a T.Parallel(D) body ran at 40-66 us/call
         with T.Kernel(B * Hkv * G, threads=32) as row:
             lane = T.get_thread_binding(0)
             bb = row // (Hkv * G)

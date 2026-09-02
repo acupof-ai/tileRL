@@ -1,14 +1,7 @@
-"""Bench the bf16 decode path on the H20 pod: GEMV vs WGMMA-padded per linear,
-roofline efficiency, and slice decode before/after (same process, same GPU).
+"""bf16 decode path on H20: GEMV vs WGMMA-padded (GEMV key popped from the sm90 cell) per linear
+with roofline %, then slice decode before/after in one process.
 
-The "before" path is the pre-GEMV decode path: the GEMV key is popped from the
-sm90 registry cell, so backend.linear(M=1) pads to 16 WGMMA rows. The "after"
-path dispatches to the GEMV. Both go through the same backend entry point, so
-the numbers include identical Python overhead.
-
-Usage:
-    CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src TILERL_TARGET=cuda \\
-        python3 scripts/bench_bf16_gemv.py /host/tc27-nvfp4-slice2 --layers 2
+Usage: CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src TILERL_TARGET=cuda python3 scripts/bench_bf16_gemv.py /host/tc27-nvfp4-slice2 --layers 2
 """
 
 from __future__ import annotations
@@ -72,11 +65,7 @@ def _time_calls(fn, iters: int) -> float:
 
 
 def _bf16_linear_keys(model, cfg) -> list[str]:
-    """bf16 master weights of the fp4-packed projections — the bf16 GEMV's
-    target shapes. The packed .wq/.scale siblings are quant state, not
-    linears. (On the fp4 27B the engine reads the .wq via linear_fp4, so
-    these masters are the STE/ training copy — benching backend.linear on
-    them measures the bf16 GEMV kernel at the real projection shapes.)"""
+    """bf16 masters of the fp4-packed projections: the real shapes, without the .wq/.scale quant state."""
     return sorted(k for k in fp4_param_keys(cfg) if k in model.params)
 
 
@@ -168,9 +157,7 @@ def main() -> None:
     )
     t0 = time.perf_counter()
     model = load_hf(cfg, args.source, keep_master=True)  # benches the bf16 masters
-    # Migrate params once (engine build does the same; bench_shapes runs
-    # before any engine exists, so without this it would time per-call H2D
-    # copies instead of the kernel).
+    # bench_shapes runs before any engine exists; without this it times H2D copies.
     model.params = {k: v.to(backend.device) for k, v in model.params.items()}
     print(f"load: {time.perf_counter() - t0:.0f}s", flush=True)
 

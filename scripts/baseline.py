@@ -1,25 +1,9 @@
-"""The bench snapshot is the repo's source of truth; the pod only raises rows.
+"""Merge the pod's bench-baseline.json into the repo's: per key the higher tok/s wins, unless
+the pod row's commit is a proper ancestor of the local row's (the repo corrected it later).
+A row deleted locally returns on the next pull while the pod still has it; make the deletion
+stick with `SKIP_BASELINE_PULL=1 scripts/pod_sync.sh`.
 
-``pod_sync.sh`` wipes the remote checkout on every sync, so a row raised on the
-pod is lost unless it comes home first. This pulls the pod's snapshot and
-merges it into the committed one — per key the HIGHER tok/s wins, which is the
-same rule the harness gate applies in-process.
-
-  python scripts/baseline.py pull       # merge the pod's rows into the repo's
-  python scripts/baseline.py show
-  python scripts/baseline.py selfcheck  # the hold rule, against real commits
-
-Higher-wins is overridden when the repo CORRECTED a row after the pod measured
-it: every row carries its commit, so a pod row whose commit is a proper
-ancestor of the local row's is stale and is held, however fast it reads. That
-is what makes a deliberate lowering stick — a row reseeded from a quiet host,
-or one belonging to a reverted kernel, each crawled back three times on
-2026-08-29 before this rule existed.
-
-Merging is still per key, so a row DELETED from the repo comes back on the next
-pull as long as the pod's copy still has it — six retired `spec/*` rows
-resurrected that way. The pod's checkout is overwritten by every sync, so the
-cure for a deletion is one `SKIP_BASELINE_PULL=1 scripts/pod_sync.sh`.
+  python scripts/baseline.py pull|show|selfcheck
 """
 
 from __future__ import annotations
@@ -38,12 +22,7 @@ def _load(p: Path) -> dict:
 
 
 def _local_is_newer(remote_commit: str | None, local_commit: str | None) -> bool:
-    """Was the repo's row committed strictly after the pod measured its own?
-
-    Every row carries the commit it was measured at, so this is answerable
-    exactly: the pod's row is stale when its commit is a proper ancestor of the
-    local row's. Unknown or unresolvable commits fall back to higher-wins.
-    """
+    """Pod row stale = its commit is a proper ancestor of the local row's; unknown -> higher-wins."""
     if not remote_commit or not local_commit or remote_commit == local_commit:
         return False
     if "unknown" in (remote_commit, local_commit):
@@ -66,9 +45,6 @@ def pull() -> int:
     for k, v in remote.items():
         cur = local.get(k)
         if cur is not None and _local_is_newer(v.get("commit"), cur.get("commit")):
-            # The repo corrected this row AFTER the pod measured it. Higher-wins
-            # would undo the correction, which is how a rejected kernel's number
-            # and a load-inflated seed each crawled back three times.
             if v["tok_s"] > cur["tok_s"]:
                 held.append(f"  {v['tok_s']:.1f} -> kept {cur['tok_s']:.1f}  {k}")
             continue
@@ -92,7 +68,6 @@ def show() -> int:
 
 
 def _selfcheck() -> int:
-    """The rule that keeps a correction from being undone, against real commits."""
     head, prev = (
         subprocess.check_output(["git", "rev-parse", "--short", r], cwd=LOCAL.parent,
                                 text=True).strip()

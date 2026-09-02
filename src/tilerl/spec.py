@@ -1,20 +1,10 @@
 """Speculative decoding: the draft head and the verify-length policy.
 
-Two pieces, separable:
-
-``verify_lens`` decides HOW MANY drafted tokens per request are worth verifying
-this tick — DSpark §3.2.2 (sglang's ``compute_verify_token_budget``). Verifying
-a draft costs a row in the trunk forward whether or not it is accepted, so the
-question is goodput, not acceptance rate: maximize
+``verify_lens`` decides how many drafted tokens per request are worth verifying
+this tick (DSpark §3.2.2, sglang's ``compute_verify_token_budget``): a draft
+costs a trunk row whether or not it is accepted, so maximize goodput
 ``(R + Σ top-B survival) / (bias + row·(R + B))`` over the admission cut. B=0
-is one of the arms, so the policy never chooses to speculate when speculating
-loses.
-
-``survival[j]`` is P(the first j+1 drafts all accept) — monotone decreasing, the
-cumulative product of per-position confidence. A checkpoint with a
-``confidence_head`` supplies that confidence directly; a DFlash-style head has
-none, and the draft's own softmax probability for the token it emitted is the
-fallback.
+is one of the arms. ``survival[j]`` = P(the first j+1 drafts all accept).
 """
 
 from __future__ import annotations
@@ -25,16 +15,12 @@ from typing import Any
 
 import torch
 
-__all__ = ["verify_lens", "survival", "DraftHead", "load_draft"]
-
-#: Measured cost of one trunk verify forward: a fixed cost plus a per-row cost,
-#: in ms. The defaults are agent-infer's H20 numbers; re-measure per target.
+#: One trunk verify forward = fixed + per-row cost, ms. agent-infer's H20 numbers.
 BIAS_MS = 211.0
 ROW_MS = 0.53
 
 
 def survival(confidences: list[float]) -> list[float]:
-    """Per-position confidence -> P(first j+1 drafts all accept)."""
     out, p = [], 1.0
     for c in confidences:
         p *= float(c)
@@ -45,12 +31,8 @@ def survival(confidences: list[float]) -> list[float]:
 def verify_lens(
     survivals: list[list[float]], bias_ms: float = BIAS_MS, row_ms: float = ROW_MS
 ) -> list[int]:
-    """Per-request draft-keep lengths maximizing verify goodput.
-
-    ``survivals[r]`` must be monotone decreasing (it is a cumulative product),
-    which is what makes a single global admission cut yield a PREFIX per
-    request rather than an arbitrary subset.
-    """
+    """Per-request draft-keep lengths maximizing verify goodput. ``survivals[r]``
+    is monotone decreasing, so one global cut yields a prefix per request."""
     eps = 1e-6
     r = len(survivals)
     flat = sorted((p for s in survivals for p in s if p >= eps), reverse=True)
@@ -71,31 +53,17 @@ def verify_lens(
 
 if __name__ == "__main__":  # runnable check
     assert survival([0.9, 0.8, 0.5]) == [0.9, 0.9 * 0.8, 0.9 * 0.8 * 0.5]
-    # A confident draft is worth verifying; a hopeless one is not.
     assert verify_lens([[0.99, 0.98, 0.97]], bias_ms=1.0, row_ms=0.1) == [3]
     assert verify_lens([[1e-9, 1e-9]]) == [0]
-    # Cheap rows -> keep more; the cut is global, the kept span is a prefix.
     lens = verify_lens([[0.99, 0.9, 0.2], [0.3, 0.05, 0.01]], bias_ms=1.0, row_ms=0.1)
     assert lens[0] >= lens[1], lens
     print("spec: verify_lens OK", lens)
 
 
-# --- draft head ---------------------------------------------------------------
-
-
 class DraftHead:
-    """A NextN / DSpark draft head: ``fc([norm(embed(t)), norm(h_trunk)])`` into
-    a short stack of full-attention layers, read out through the TRUNK's
-    lm_head (the draft never carries its own vocabulary projection).
-
-    Structurally a full-attn layer of the trunk, so the layers reuse
-    ``Model._full_attn`` / ``Model._mlp`` verbatim — the head is a Model with a
-    1-layer config, not a second implementation of a transformer block.
-
-    Optional heads, probed rather than assumed: ``confidence_head.proj`` gives
-    per-position confidence (DSpark); a DFlash-style checkpoint has none and
-    the draft's own softmax probability stands in.
-    """
+    """NextN / DSpark draft head: ``fc([norm(embed(t)), norm(h_trunk)])`` into a
+    short full-attention stack, read out through the trunk's lm_head. The layers
+    are a ``Model`` with a 1-layer config, not a second transformer block."""
 
     def __init__(self, trunk: Any, params: dict[str, torch.Tensor], num_layers: int = 1) -> None:
         from .model import Model
@@ -111,23 +79,16 @@ class DraftHead:
 
     def forward(self, hidden, ids, positions, kv, backend, hidden_out=None) -> torch.Tensor:
         """hidden [B,T,H] (trunk's pre-final-norm state), ids [B,T] (the token
-        each position predicts FROM). Returns draft logits [B,T,vocab];
-        ``hidden_out`` receives the head's own hidden, which is what the NEXT
-        draft position consumes."""
+        each position predicts FROM) -> draft logits [B,T,vocab]. ``hidden_out``
+        receives the head's own hidden, which the next draft position consumes."""
         eps = self.cfg.rms_eps
-        # Model.forward does this for its own inputs; the head is entered
-        # directly, so it converts its own.
         ids = torch.as_tensor(ids, dtype=torch.long, device=backend.device)
         positions = torch.as_tensor(positions, dtype=torch.long, device=backend.device)
         e = backend.embedding(ids, self.trunk.params["embed_tokens"])
         if "pre_fc_norm_embedding" in self.params:  # Qwen NextN: both sides normed
             e = backend.rmsnorm(e, self.params["pre_fc_norm_embedding"], eps)
         hidden = backend.rmsnorm(hidden, self.params["pre_fc_norm_hidden"], eps)
-        # fc consumes concat(norm_embed(t), norm_hidden(h)) — embed first, per
-        # agent-infer's qwen35_spec.rs:40-55; the other order looks like a head
-        # that simply does not predict.
-        # Through the Model seam, not backend.linear: fc is served in whatever
-        # format the head was quantized to, exactly like every other projection.
+        # embed first (agent-infer qwen35_spec.rs:40-55); the other order does not predict
         x = self.layers._linear(backend, torch.cat([e, hidden], dim=-1), "fc")
         for i in range(self.cfg.num_layers):
             x = self.layers._full_attn(i, x, positions, kv, backend)
@@ -139,10 +100,7 @@ class DraftHead:
         return self.trunk._linear(backend, x, head)
 
     def confidence(self, hidden, probs, backend) -> torch.Tensor:
-        """Per-position P(this draft is accepted), [B,T].
-
-        The checkpoint's own head when it has one; otherwise ``probs``, the
-        draft's own probability for the token it emitted (spec.py docstring)."""
+        """Per-position P(accept), [B,T]: the checkpoint's head, else ``probs``."""
         if not self.has_confidence:
             return probs
         y = backend.linear(hidden, self.params["confidence.weight"],
@@ -150,9 +108,8 @@ class DraftHead:
         return torch.sigmoid(y).reshape(y.shape[:-1])
 
 
-#: Draft tensor names -> our param keys. The Qwen NextN head prefixes
-#: everything with ``mtp.``; DSpark checkpoints drop the prefix and carry one
-#: ``hidden_norm`` instead of the two pre-fc norms.
+#: Draft tensor names -> param keys. Qwen NextN prefixes ``mtp.``; DSpark
+#: drops it and carries one ``hidden_norm`` instead of the two pre-fc norms.
 _DRAFT_TOP = {
     "fc": "fc",
     "norm": "norm",
@@ -183,10 +140,8 @@ def load_draft(trunk: Any, path: str | Path) -> DraftHead:
             mapped = _param_key_for(bare)
             if mapped is not None:
                 params[mapped] = f.get_tensor(name)
-    # Every norm in this head is a zero-centered Qwen3_5RMSNorm. load_hf folds
-    # the +1 in at load; reading the head's file directly skips that, and a head
-    # whose norms all scale by ~0.2 instead of ~1.2 emits logits ANTI-correlated
-    # with the trunk (its argmax ranked 248191/248320).
+    # Zero-centered Qwen3_5RMSNorm: load_hf folds the +1 in, this path must too
+    # (without it the head's argmax ranked 248191/248320).
     for k, v in params.items():
         if k.endswith(("norm", "pre_fc_norm_hidden", "pre_fc_norm_embedding")):
             params[k] = (v.float() + 1.0).to(v.dtype)

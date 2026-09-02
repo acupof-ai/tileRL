@@ -4,9 +4,6 @@
 # launches all of them detached and polls until every log is done.
 #
 #   scripts/pod_fan.sh 'cmd for gpu0' 'cmd for gpu1' ...
-#
-# Serialising A/Bs on one card was the iteration bottleneck: 3-5 minutes per
-# arm, and a sweep of four arms is four round trips.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

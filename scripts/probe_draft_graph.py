@@ -1,9 +1,4 @@
-"""Is a draft step's 2.06 ms compute, or eager dispatch?
-
-A ONE-layer head measures 0.917 ms in full_attn alone, where the trunk's
-SIXTEEN full-attn layers total 0.216 ms inside a captured graph. If that gap is
-dispatch, capturing the draft step collapses it and depth-1 speculation turns
-net-positive at B=1. Measure before building the engine seam.
+"""Is a draft step's 2.06 ms compute or eager dispatch? Capture it and compare.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/probe_draft_graph.py /data00/Qwen3.8-27B-NVFP4 \
@@ -15,7 +10,6 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 
-import numpy as np
 import torch
 
 from tilerl.config import qwen38_27b

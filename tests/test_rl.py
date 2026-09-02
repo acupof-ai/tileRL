@@ -12,7 +12,8 @@ import numpy as np
 import torch
 
 from tilerl.autograd import AdamW
-from tilerl.cli import _build_model, last_number
+from tilerl.cli import _build_model
+from tilerl.eval import last_number
 from tilerl.testing import RefBackend
 from tilerl.train import group_advantages, rl_step, train_step
 
@@ -89,17 +90,11 @@ def test_grpo_loop_raises_reward():
     torch.manual_seed(0)
     cfg, model = _build_model("tiny", seed=0, keep_master=True)
     backend = RefBackend()
-    # The configuration grpo_loop requires: a cached prefix or a captured graph
-    # would sample from an earlier policy. The tiny prompt is under BLOCK_TOKENS
-    # so nothing would publish anyway — which is exactly why the gate has to
-    # pin the setting rather than rely on it.
     engine = build_engine(cfg, model, backend, num_blocks=256, num_slots=8,
                           decode_graph=False, prefix_store=NoPrefixStore())
     half = cfg.vocab_size // 2
 
-    # Dense enough to have variance at init: an exact-token reward is 0 for
-    # every rollout of an untrained model, so every advantage is 0 and the loop
-    # has nothing to learn from.
+    # Dense reward: an untrained policy's group needs variance for a gradient at step 0.
     def reward(prompt, completion):
         return sum(1 for t in completion if t < half) / max(len(completion), 1)
 

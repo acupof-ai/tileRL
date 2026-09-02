@@ -1,15 +1,7 @@
-"""A/B the 2-way K-split fp8 prefill GEMM (v_n64_split2) against the shipped
-k_split=1 launch — the output-buffer zeroing the split needs is INSIDE arm B's
-timed region (the sweep that found +8% geo-mean excluded it).
+"""A/B fp8 prefill GEMM: shipped k_split=1 vs k_split=2 with the output zeroing inside the
+timed region (the sweep that found +8% geo-mean excluded it). Ref = arm A (relerr ~1e-3).
 
-Arm A: make_linear_fp4_fp8_mma(target, k_split=1) — the shipped kernel.
-Arm B: torch.zeros([M,N] f32) then k_split=2 — f32 atomic add into the zeroed
-       buffer (the zeroing cost the sweep excluded, now included).
-Ref: arm A's output (same fp8 math, split reduction order -> relerr ~1e-3).
-
-Usage (pod):
-    BENCH_GPUS=6 scripts/_pod_bench.sh \\
-        'PYTHONPATH=src python3 scripts/bench_fp8_split2.py'
+Usage (pod): BENCH_GPUS=6 scripts/_pod_bench.sh 'PYTHONPATH=src python3 scripts/bench_fp8_split2.py'
 """
 
 from __future__ import annotations
@@ -49,8 +41,7 @@ def main():
         w_master = torch.randn(N, K) * 0.1
         wq, scale = pack_fp4(w_master)
         x = torch.randn(M, K) * 0.5
-        # K padded to 128 = _FP4_BLOCK_K * k_split so each split sums an exact
-        # tile count; N padded to 128 (a multiple of the kernel's 64 N-tile).
+        # K padded to _FP4_BLOCK_K * k_split so each split sums whole tiles; N to the 64 N-tile.
         Mp, Np, Kp = _round_up(M, 64), _round_up(N, 128), _round_up(K, 128)
         x2 = torch.zeros(Mp, Kp, dtype=torch.bfloat16, device=dev)
         x2[:M, :K] = x.to(dev)

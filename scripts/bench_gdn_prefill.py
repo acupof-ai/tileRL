@@ -1,15 +1,7 @@
-"""A/B prefill bench: fused GDN chunk kernel vs torch-eager reference.
+"""A/B one prefill tick: fused GDN chunk kernel vs linear_attn_chunk pinned to the torch-eager
+reference, same engine and pools, JIT-free after warmup.
 
-Single process, same GPU, JIT-free: one warmup pass compiles every shape the
-timed ticks touch (including the chunk kernel at the prefill T), then two
-prefill ticks are timed with CUDA events — arm A through the normal dispatch
-(fused chunk kernel on sm90), arm B with linear_attn_chunk pinned to the
-torch-eager reference. Same engine, same pools, same tick code path; only the
-GDN implementation differs.
-
-Usage:
-    TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=1 \\
-        PYTHONPATH=src python3 scripts/bench_gdn_prefill.py /host/tc27-nvfp4-slice2 --layers 2
+Usage: TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python3 scripts/bench_gdn_prefill.py /host/tc27-nvfp4-slice2 --layers 2
 """
 
 from __future__ import annotations
@@ -33,7 +25,6 @@ def _drive(engine, wid, max_steps) -> None:
 
 
 def _time_prefill_tick(engine, vocab, length) -> float:
-    """Submit a length-token prompt and time its single prefill tick (ms)."""
     gen = torch.Generator().manual_seed(3)
     prompt = torch.randint(0, vocab, (length,), generator=gen).tolist()
     engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=1, seed=0))
@@ -41,10 +32,10 @@ def _time_prefill_tick(engine, vocab, length) -> float:
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    engine.step()  # prefill tick (no decodes pending on a fresh engine)
+    engine.step()
     end.record()
     torch.cuda.synchronize()
-    for _ in range(8):  # drain the 1-token decode finish
+    for _ in range(8):
         if engine.poll():
             break
         engine.step()
@@ -79,8 +70,6 @@ def main() -> None:
     print(f"load: {time.perf_counter() - t0:.1f}s", flush=True)
     engine = build_engine(cfg, model, backend, num_blocks=128, num_slots=4)
 
-    # Warmup: compile EVERY (shape, dtype) the timed ticks touch. Two passes
-    # (the second confirms JIT-free), same as profile_slice.py.
     print("warmup pass 1: prefill + decode (NVCC JIT, slow)...", flush=True)
     gen = torch.Generator().manual_seed(1)
     prompt = torch.randint(0, cfg.vocab_size, (args.prefill_len,), generator=gen).tolist()
@@ -94,8 +83,6 @@ def main() -> None:
     ms_a = _time_prefill_tick(engine, cfg.vocab_size, args.prefill_len)
     print(f"arm A (fused chunk kernel): {ms_a:.1f} ms tick, {ms_a / args.prefill_len:.4f} ms/tok")
 
-    # Arm B: pin the GDN op to the torch-eager reference (same signature),
-    # then time an identical prefill tick.
     ref = reference.gdn_forward
     backend.linear_attn_chunk = lambda q, k, v, g, beta, state, **kw: ref(
         q, k, v, g, beta, state, **kw

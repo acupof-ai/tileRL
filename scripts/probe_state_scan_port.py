@@ -1,10 +1,5 @@
-"""Our TileLang inter-chunk state scan against fla's, same inputs.
-
-fla's is 285x faster than the 2026-08-25 port this replaces, and is itself
-already checked against our serial core (7.3e-03, bf16 resolution). So fla is
-the oracle here: same maths, same shapes, and the port has to match it before
-any timing is worth reading.
-"""
+"""Our TileLang inter-chunk state scan against fla's, same inputs, then timing. fla is the
+oracle: already matched to our serial core at 7.3e-03 (bf16 resolution)."""
 
 from __future__ import annotations
 

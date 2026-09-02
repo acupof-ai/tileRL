@@ -1,9 +1,5 @@
-"""A speculative verify replay costs 30 ms where a plain decode replay costs 12.
-This says which kernels the extra 19 ms is in.
-
-Widths 1..5 of the SAME captured decode graph, timed and profiled per kernel.
-Nothing is committed — ``_DecodeGraph.run`` only stages inputs and replays, so
-it can be called in a loop without advancing any request.
+"""Per-kernel profile of the captured decode graph at verify widths 1..5.
+``_DecodeGraph.run`` only stages inputs and replays, so nothing is committed.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/profile_verify_replay.py \
@@ -74,10 +70,7 @@ def main() -> None:
       rows = list(engine._running)[:B]
       for W in (int(x) for x in args.widths.split(",")):
           chains = [[r.output[-1]] * W for r in rows] if W > 1 else None
-          # keep=W is what a REAL verify tick uses: it writes the recurrent
-          # state after every chain step. Measuring with keep=0 is what made a
-          # 21.17 ms tick read as 17.54 and turned a 0.57x into a predicted
-          # 1.06x. Needs a draft-built pool (--draft) for the step planes.
+          # keep=W as in a real verify tick (state written per chain step); needs --draft.
           keep = W if (chains and draft is not None) else 0
           g = _DecodeGraph(model, backend, engine._kv, engine._states, B,
                            width=W, keep=keep)
@@ -101,8 +94,7 @@ def main() -> None:
           for name, (c, us) in sorted(by.items(), key=lambda kv: -kv[1][1])[: args.top]:
               print(f"{name:<52} {c // 5:>6} {us / c * 5:>8.1f} {us / 1e3:>8.3f}")
           if W == 1:
-              # The tick is not the replay: at B=8 it measured 38.6 ms against a
-              # 27.1 ms replay. Split the rest out so the host half is visible.
+              # the tick is more than the replay; show the host half.
               step = timed(lambda: engine.step(), reps=5)
               print(f"  engine.step() {step:.3f} ms  -> {step - ms:.3f} ms outside the replay")
           if prev is not None:

@@ -1,19 +1,16 @@
 # tileRL Support Matrix
 
-Canonical support-status truth for the tileRL kernel layer. If a cell is not
-**done**, do not assume it works because it compiled — the dispatch registry
-(`packages/tilerl-kernels/src/tilerl_kernels/registry.py`) is the source of truth, and this file mirrors it.
-State as of 2026-08-27.
+Per-op status per target. A cell that is not **done** does not work because it
+compiled; `packages/tilerl-kernels/src/tilerl_kernels/registry.py` is the
+source of truth and this file mirrors it.
 
 ## What "one kernel source" means
 
-Three targets have executed the source: **cpu**, **metal**, and **sm90**.
-`_REGISTRY` holds 8 keys but only **3 distinct kernel sets**. ROCm has no cell:
-it was an alias of the CPU set that never ran, removed 2026-09-02 until a HIP
-host executes the suite.
+Three targets have executed the source: **cpu**, **metal**, **sm90**.
+`_REGISTRY` holds 8 keys but 3 distinct kernel sets. ROCm has no cell: it was
+an alias of the CPU set that never ran, removed until a HIP host runs the suite.
 
-Line partition of `packages/tilerl-kernels/src/tilerl_kernels/kernels*.py` (1,969 lines, by top-level
-function span; `python -c` over `ast` reproduces it):
+Line partition of `kernels*.py` (1,969 lines, by top-level function span):
 
 | lines | % | scope |
 | ---: | ---: | --- |
@@ -143,13 +140,11 @@ with neither (fused projections, native-fp8 serving) still raise.
 
 ## Evidence
 
-- **cpu/bf16 + fp4 + fp8**: `TILERL_TARGET=cpu uv run pytest` (2026-08-27) —
-  97 passed, 4 skipped. Kernel-vs-reference parity on every op with a TileLang CPU kernel,
-  tape gradcheck, end-to-end generation + training. Exception: dense/paged
-  attention's CPU forward is the torch-eager reference itself
-  (`backend.attention`, ponytail — no TileLang CPU attention kernel yet), so
-  attention has no independent CPU parity until that kernel lands; sm90
-  attention parity runs on the pod.
+- **cpu/bf16 + fp4 + fp8**: `TILERL_TARGET=cpu uv run pytest` — 97 passed,
+  4 skipped: kernel-vs-reference parity on every op with a CPU kernel, tape
+  gradcheck, end-to-end generation + training. Dense/paged attention's CPU
+  forward is the torch-eager reference itself (`backend.attention`, ponytail),
+  so attention parity runs only on sm90.
 - **fp4 grid**: `test_linear_fp4_grid` feeds the *kernel* a literal OCP table
   through `x = eye(K)`, so it shares no constant with `pack_fp4` /
   `dequant_fp4` — the only fp4 test in the suite that can catch a wrong grid.
@@ -164,36 +159,22 @@ with neither (fused projections, native-fp8 serving) still raise.
   affine-4bit. The NVFP4 test runs both `fp4=False` (dequant correctness) and
   `fp4=True` (`.wq` byte-identical to the checkpoint).
 - **heterogeneity**: `tests/test_metal_target.py::test_cpu_metal_decode_parity`
-  — one fp4 tiny model, greedy-decoded 8 tokens on cpu and on metal through
-  the engine: identical token ids and `allclose(rtol=1e-2)` prefill logits.
-  This is the gate T6 asks for; it auto-skips where MPS is unusable (ubuntu
-  CI, macos CI runners with no GPU entitlement).
-- **metal/bf16 + fp4**: `TILERL_TARGET=metal uv run pytest` (2026-08-27) — 97
-  passed, 4 skipped, 0 failed. The two long-standing failures were host-side device
-  boundaries, not target-neutrality bugs: `linear` never moved a bias to the
-  backend device (fixed at the `Backend.linear` boundary, same idiom as the
-  weight), and `test_fused_projections_parity` built its training KV pool on
-  the default device instead of the backend's (fixed at the four
-  `_training_kv` call sites — `train.py` already documents that `device` must
-  match the backend). Metal facts:
-  - Same kernel source as CPU; the only registry fork is the three gemms
-    (naive FMA schedules — Metal's `T.gemm` lowering rejects global operands).
-  - `tilerl bench` (tiny, steady state after shader-cache warmup): prefill
-    191 tok/s, decode 116 tok/s on Metal vs 1202 / 705 tok/s on CPU — Metal is
-    ~6x slower at this scale because every op migrates CPU-resident params to
-    MPS (day-1 boundary design). Metal's target is the 27B, which cannot run
-    on CPU; the tiny model is latency-bound on dispatch, not compute.
-    `# ponytail: per-op param migration, keep params on the backend device`
-  - tilelang 0.1.13 Metal kernel-cache save is broken (`MetalKernelAdapter`
-    has no `libpath`; non-fatal ERROR log) — kernels recompile per process.
-- **sm90/bf16 + fp4 + fp8**: `TILERL_TARGET=cuda uv run pytest` on an H20
-  (pod, tilelang 0.1.13 CUDA JIT) — the suite passes green (60 passed, 3
-  metal-only skips, as of 2026-08-24; not re-run since). `Backend.device`
-  pins `cuda:<current>` (`torch.device("cuda")` with no index is not the
-  device kernel outputs land on). First real-weight run: the 2-layer
-  Qwen3.6-27B NVFP4 slice forwards and trains on sm90, with CPU/CUDA
-  logits matching to 6 decimals (entry:
-  `docs/experience/wins/2026-08-24-sm90-real-slice.md`).
-- **sm100/sm120**: registry slots registered as empty sets;
-  `NotImplementedError` on use. Bring-up is pending-remote (no device in
-  this env).
+  — one fp4 tiny model, 8 greedy tokens on cpu and on metal through the
+  engine: identical token ids, `allclose(rtol=1e-2)` prefill logits.
+  Auto-skips where MPS is unusable (CI runners).
+- **metal/bf16 + fp4**: `TILERL_TARGET=metal uv run pytest` — 97 passed, 4
+  skipped. Same kernel source as CPU; the only registry fork is the three
+  gemms (naive FMA — Metal's `T.gemm` lowering rejects global operands).
+  `tilerl bench` tiny: prefill 191 tok/s, decode 116 on Metal vs 1202 / 705
+  on CPU — every op migrates CPU-resident params to MPS, and the tiny model is
+  dispatch-bound. `# ponytail: per-op param migration, keep params on the backend device`
+  tilelang 0.1.13 Metal kernel-cache save is broken (`MetalKernelAdapter` has
+  no `libpath`) — kernels recompile per process.
+- **sm90/bf16 + fp4 + fp8**: `TILERL_TARGET=cuda uv run pytest` on an H20 —
+  60 passed, 3 metal-only skips (2026-08-24, not re-run since).
+  `Backend.device` pins `cuda:<current>` (an index-less `torch.device("cuda")`
+  is not where kernel outputs land). The 2-layer Qwen3.6-27B NVFP4 slice
+  forwards and trains with CPU/CUDA logits matching to 6 decimals
+  (`docs/experience/wins/2026-08-24-sm90-real-slice.md`).
+- **sm100/sm120**: registered as empty sets, `NotImplementedError` on use;
+  bring-up pending-remote.

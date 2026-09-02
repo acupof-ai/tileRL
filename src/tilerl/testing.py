@@ -1,21 +1,11 @@
-"""Test/selfcheck utilities: the torch-eager reference backend.
-
-NOT framework code — the deterministic CPU backend for tests and selfchecks
-that want a backend without the TileLang JIT. Ops delegate to
-:mod:`tilerl_kernels.reference` (the parity oracle) via ``__getattr__``; the ops
-the reference lacks live here: gated dense attention, fp4 linear (drops the
-recording-only ``master`` kwarg), elementwise add, gated paged attention
-(reference has no gated paged path), and the paged KV scatter (the pool's
-torch loop — the sm90 kernel's reference semantics).
-"""
+"""The torch-eager reference backend for tests and selfchecks (no TileLang JIT).
+Ops delegate to :mod:`tilerl_kernels.reference` via ``__getattr__``; the ops the
+reference lacks live here."""
 
 from __future__ import annotations
 
 import torch
 
-__all__ = ["RefBackend"]
-
-#: Ops delegated verbatim to tilerl_kernels.reference.
 _REF_OPS = frozenset(
     {
         "rmsnorm",
@@ -43,8 +33,6 @@ _REF_OPS = frozenset(
 
 
 class RefBackend:
-    """Torch-eager reference backend implementing the model->backend contract."""
-
     name = "reference"
     target = "cpu"
     device = torch.device("cpu")
@@ -57,10 +45,10 @@ class RefBackend:
         raise AttributeError(name)
 
     def materialize(self, params):
-        return params  # torch serves every format on CPU: nothing to convert or move
+        return params
 
     def gdn_decode(self, *args, **kwargs):
-        return None  # no fused in-place decode here: the model takes the gather/scatter path
+        return None  # no fused in-place decode: the model takes the gather/scatter path
 
     def attn_prep(self, *args, **kwargs):
         return None
@@ -73,7 +61,7 @@ class RefBackend:
     def linear_fp8(self, x, w8, wscale, master=None, oscale=None):
         from tilerl_kernels import reference
 
-        return reference.linear_fp8(x, w8, wscale, oscale)  # master is recording-only
+        return reference.linear_fp8(x, w8, wscale, oscale)
 
     def attention(self, q, k, v, scale, gate=None):
         from tilerl_kernels import reference
@@ -92,9 +80,7 @@ class RefBackend:
         return a + b
 
     def write_tokens(self, k, v, kv, layer_idx):
-        # The pool's torch loop (the sm90 tilelang kernel has no reference
-        # counterpart — the pool loop IS the reference semantics).
-        kv.kv_pool.write_tokens(k, v, kv, layer_idx)
+        kv.kv_pool.write_tokens(k, v, kv, layer_idx)  # the pool loop is the reference semantics
 
     def paged_attention(
         self, q, k_pool, v_pool, block_table, seq_lens, scale, gate=None, seq_q_lens=None

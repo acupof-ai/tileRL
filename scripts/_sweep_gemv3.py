@@ -1,22 +1,7 @@
-"""Round-7 sweep: get the fp4 dequant off the FMA critical path.
-
-The grouped kernel (group4, shipped) issues 32 shuffles then 32 FMAs per
-group: the shuffle issue slots are serialized with the FMA issue slots
-(~64 cyc/group vs the nodecode floor's ~32). This round tests structures
-that move the shuffles off the consumer warp's issue path:
-
-- group4:     shipped baseline (registers, grouped decode).
-- shared_pp:  same-warp shared-memory ping-pong (decode g+1 -> shared, FMA g
-              from shared). Adds 32 LDS + 32 STS on the load pipe per group;
-              expected to tie group4 (load-pipe bound at ~64 cyc).
-- group8:     GROUP=8 register variant (same issue/elem, more regs).
-- producer:   producer/consumer warp split (threadIdx.z role). Producer warps
-              do 32 SHFL + 32 STS/group into a RING=3 SPSC shared ring,
-              running 2 groups ahead; consumer warps do 32 LDS + 32 FMA with
-              ZERO shuffles, the prefetch LDS dual-issuing with the FMA chain.
-              Target ~32-40 cyc/group.
-
-Diagnostic only — not shipped.
+"""Round-7 sweep: get the fp4 dequant off the FMA critical path. The grouped kernel issues 32 SHFL then
+32 FMA per group (~64 cyc vs the nodecode floor's ~32). Diagnostic only, not shipped.
+Variants: group4 (shipped), shared_pp (same-warp shared ping-pong, +32 LDS/STS, expected tie), group8
+(GROUP=8 registers), producer (threadIdx.z producer/consumer warps, RING=3 SPSC ring, zero consumer SHFL).
 """
 
 import sys
@@ -62,8 +47,6 @@ def _reduce_y(acc, red, kr, Y, n):
 
 
 def _make_group(target, group):
-    """group4 (shipped) / group8: grouped decode in registers."""
-
     @tilelang.jit(target=target, pass_configs={"tl.disable_data_race_check": True})
     def ker(X, WQ, Scale, reduce_thread, n_partition):
         N, K = T.const("N, K")
@@ -119,8 +102,7 @@ def _make_group(target, group):
 
 
 def _make_shared_pp(target):
-    """Same-warp shared ping-pong: decode g+1 into shared while FMA consumes
-    g from shared (LDS). RING=2."""
+    """Decode g+1 into shared while the FMA consumes g from shared (RING=2)."""
 
     @tilelang.jit(target=target, pass_configs={"tl.disable_data_race_check": True})
     def ker(X, WQ, Scale, reduce_thread, n_partition):
@@ -197,10 +179,7 @@ def _make_shared_pp(target):
 
 
 def _make_producer(target):
-    """Producer/consumer warp split. threadIdx.z=0 warps decode (SHFL+STS)
-    into a RING=3 SPSC shared ring, 2 groups ahead; threadIdx.z=1 warps FMA
-    (LDS+FMA, no shuffles). The consumer's prefetch LDS of group kg+1
-    dual-issues with the FMA chain of group kg."""
+    """threadIdx.z=0 warps decode into a RING=3 ring 2 groups ahead; z=1 warps do LDS+FMA only."""
 
     @tilelang.jit(target=target, pass_configs={"tl.disable_data_race_check": True})
     def ker(X, WQ, Scale, reduce_thread, n_partition):

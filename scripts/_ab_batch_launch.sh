@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Dev-only: launch the batched-decode A/B detached on the H20 pod (GPU 6).
-# The 3-arm A/B has silent JIT phases (two new kernels) longer than tn
-# exec's 5-min no-output timeout, so run detached and poll the done-stamp.
-# Quiet-gated on GPU 6 (10-min fail-closed). Logs to /work/ab_batch.log.
+# Dev-only: batched-decode A/B on the H20 pod, GPU 6, detached (silent JIT phases outlast
+# tn exec's 5-min no-output timeout). Quiet-gated 10 min. Logs to /work/ab_batch.log.
 set -e
 cd /work/tilerl_p2_batch
 

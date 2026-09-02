@@ -19,8 +19,7 @@ from .autograd import Adafactor
 
 
 def polar(x: torch.Tensor, iters: int = 5) -> torch.Tensor:
-    """Nearest matrix with orthonormal columns, by Newton-Schulz. Converges
-    quadratically from ``||X^T X - I|| < 1``, which a small step never leaves."""
+    """Nearest orthonormal-column matrix by Newton-Schulz (needs ``||XᵀX − I|| < 1``)."""
     # ponytail: torch matmul in the retraction; tilelang kernel when perf demands
     for _ in range(iters):
         x = 1.5 * x - 0.5 * x @ (x.T @ x)
@@ -33,14 +32,8 @@ def frame_grads(g: torch.Tensor, u: torch.Tensor, s: torch.Tensor, v: torch.Tens
 
 
 class ISO:
-    """Wrap a base optimizer (default :class:`Adafactor`, :class:`AdamW` also
-    works) so 2D params train in fixed-spectrum coordinates. Non-2D params go
-    straight to the base optimizer.
-
-    Cost: ``U``, ``S``, ``V`` in the policy's frame dtype per 2D weight — two
-    fp32 copies of the weight today (``precision.dtype("frame")``), plus the
-    base optimizer's state on each frame instead of on the weight.
-    """
+    """Wrap a base optimizer so 2D params train in fixed-spectrum coordinates;
+    non-2D params go straight to it. Costs two frame-dtype copies per 2D weight."""
 
     streams = True
 
@@ -53,9 +46,8 @@ class ISO:
         self.base = Adafactor() if base is None else base
         self.frame_dtype = precision.dtype("frame")
         self.polar_iters = polar_iters
-        # fp32 frames of the 27B are 200 GiB: they live on the host and one
-        # matrix is staged to the device per update — the streamed step already
-        # goes one parameter at a time. None = offload when the param is on cuda.
+        # fp32 frames of the 27B are 200 GiB: host-resident, staged one matrix per update.
+        # Trained variables stay fp32: storage must resolve a 1e-6 relative update.
         self.offload = offload
         self._frames: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
@@ -82,8 +74,7 @@ class ISO:
         if fr is None:
             # ponytail: torch.linalg.svd at init, Newton-Schulz when it matters
             u, s, vh = torch.linalg.svd(p.to(self.frame_dtype), full_matrices=False)
-            # Guard at the point of use: a frame dtype that cannot hold
-            # orthonormality would train silently on a drifting spectrum.
+            # A frame dtype that cannot hold orthonormality trains on a drifting spectrum.
             err = float((u.T @ u - torch.eye(u.shape[1], dtype=u.dtype)).abs().max())
             if err > 1e-3:
                 raise ValueError(f"ISO: frames in {self.frame_dtype} are not orthonormal "

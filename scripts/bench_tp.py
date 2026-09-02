@@ -1,17 +1,7 @@
-"""TP decode throughput on the 27B: tp=N ranks vs the same engine at tp=1.
-
-Each rank loads the checkpoint on CPU, keeps only its shard, and builds the
-engine from the sharded config, so no rank ever holds the whole model on the
-device.
-
+"""TP decode throughput on the 27B, tp=N vs tp=1, both eager (a graph tick
+would have to capture the NCCL collectives too).
   torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29540 \
       scripts/bench_tp.py /data00/Qwen3.8-27B-NVFP4 --batches 1,8,16
-
-CUDA-graph capture is OFF here on purpose: a captured tick would have to
-capture the NCCL collectives too, and graph capture already has an open
-failure on this pod. Both arms run eager so the comparison is like for like -
-comparing a TP eager tick against the shipped graph tick is what made the
-speculation entry wrong the first time.
 """
 
 from __future__ import annotations
@@ -72,10 +62,7 @@ def main() -> None:
     backend = Backend(resolve_target())
     backend.init_tp(world, rank)
 
-    # Sharding runs on UNFUSED params: fusing the already-local q/k/v shards
-    # afterwards gives the layout the fused kernels want, and needs no
-    # segment bookkeeping. Fusing first would make every rank slice across
-    # the q|k|v boundary.
+    # Shard unfused, then fuse: fusing first would make every rank slice across the q|k|v boundary.
     model = load_hf(full, args.source, num_layers=args.layers, fuse_projections=(world == 1))
     cfg = tp_config(full, world)
     if world > 1:

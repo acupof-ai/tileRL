@@ -24,13 +24,12 @@ comment density rather than a style rulebook.
 ## Project shape
 
 `tilerl` is a uv-managed Python package that **serves and RL-trains**
-`Qwen3.8-27B` (NVFP4) on one Hopper card in one process. One kernel file tree;
-the CPU target is the test harness, sm90 is the perf target.
+`Qwen3.8-27B` (NVFP4) on one Hopper card in one process.
 
 - **ONE backend: TileLang.** One kernel file tree; `cpu`, `metal` and CUDA
-  sm90 have executed it. The **CPU target is the test harness and the CI/dev
-  path** — every kernel has a CPU-executable twin so the parity gate runs on
-  this GPU-less machine. sm90 is the perf target and holds its own cells.
+  sm90 have executed it. The CPU target is the test harness and the CI/dev
+  path — every kernel has a CPU twin so the parity gate runs on this GPU-less
+  machine. sm90 is the perf target and holds its own cells.
 - **torch is the tensor container only** (TileLang hard-depends on it).
   NO `torch.autograd`, NO `torch.optim` in framework code — training runs on
   our own reverse-mode tape.
@@ -50,20 +49,17 @@ the CPU target is the test harness, sm90 is the perf target.
 - **SOTA kernels are copied, not reinvented**: gated-delta-net examples,
   TileOPs, TileRT from the TileLang ecosystem.
 
-Non-obvious ownership:
-- `packages/tilerl-kernels/src/tilerl_kernels/` is the ONLY layer that touches TileLang or torch beyond
-  the container type. Everything above it is backend-neutral.
-- Reference repos are read-only: never modify
-  `/Users/bytedance/code/agent-infer` or `/Users/bytedance/code/tilelang`.
+Reference repos are read-only: never modify `/Users/bytedance/code/agent-infer`
+or `/Users/bytedance/code/tilelang`.
 
 ---
 
 ## Hard gates
 
-**Backend isolation (CRITICAL).** Modules above `packages/tilerl-kernels/src/tilerl_kernels/` never call
-TileLang or torch directly — they call backend ops. `torch` may appear only as
-the tensor container (`torch.Tensor` type). No `torch.autograd`, no
-`torch.optim`, anywhere in framework code.
+**Backend isolation.** `packages/tilerl-kernels/src/tilerl_kernels/` is the
+only layer that touches TileLang or torch beyond the container type; modules
+above it call backend ops. No `torch.autograd`, no `torch.optim`, anywhere in
+framework code.
 
 **Every kernel has a CPU twin.** A new op lands in the CPU cell first, so the
 parity gate runs here; an sm90 schedule is a per-arch cell that overrides it,
@@ -82,25 +78,23 @@ op lands with this parity check.
 
 **Tape gradient check for any new backward.** Numerical gradcheck on the tiny
 model — the tape is hand-written, so silent gradient errors are the default
-failure mode, not an exotic one.
+failure mode.
 
 **No half-states.** Finish a refactor unit or revert it; never leave parallel
 old+new paths in the tree.
 
 **Extreme minimality.** Smallest line count that keeps function and
-performance — both are non-negotiable, LOC is the thing to cut. Delete before
-adding; merge before growing; a shorter diff that passes the same gates wins.
-Parallel agents write defensively; a consolidation pass that deletes their
-excess is part of finishing the work.
+performance. Delete before adding; merge before growing; a shorter diff that
+passes the same gates wins. Parallel agents write defensively; a consolidation
+pass that deletes their excess is part of finishing the work.
 
 **Plain language.** Say the finding in plain words first, numbers second. No
 dense jargon, no hedging, no restating the question. If a sentence needs a
 glossary, rewrite it.
 
 **Approach-first for >3 files or architectural decisions** — outline, then
-execute. Wait for the user ONLY when there is a real tradeoff to adjudicate
-(two viable paths with different costs). No tradeoff → nothing to decide →
-don't ask.
+execute. Wait for the user only when two viable paths have different costs;
+no tradeoff, don't ask.
 
 **Ponytail.** Laziest correct implementation; no speculative abstractions. A
 shortcut with a known ceiling gets one marker:
@@ -143,9 +137,9 @@ without raising. Training engines are built with `decode_graph=False,
 prefix_store=NoPrefixStore()` until recapture-after-update lands (roadmap P2.0).
 
 **Git.** Commitizen `<type>(<scope>): <subject>`, scopes `kv` `engine` `ops`
-`autograd` `train` `server` `docs`. Commit directly to `main` — no feature
-branches. Small tranches, each self-contained, simplify pass first. Commit
-only your own files by explicit path. Never touch the reference repos.
+`autograd` `train` `server` `docs`. Work on a named branch from a scratchpad
+worktree, push it, open a PR; ckl merges. Small tranches, each self-contained,
+simplify pass first. Commit only your own files by explicit path. Never touch the reference repos.
 **No AI attribution in commits** — no Claude/cc/co-authored-by mentions in
 messages or trailers; write them as if a human wrote them.
 
@@ -190,7 +184,6 @@ the tree is cleaned, never grow the list. F821 stays on globally, suppressed
 per-file only for `autograd.py` and `ops/reference.py` (known in-flight spots).
 
 **CI.** `.github/workflows/ci.yml` gates on `ubuntu-latest` + `macos-14`:
-`uv sync --dev` → `ruff check` → `TILERL_TARGET=cpu uv run pytest -v`.
-Determinism policy: only lint + hermetic CPU tests block; GPU/Metal tests
-auto-skip, and no bench/perf steps exist. `ruff format --check` runs non-blocking until the tree
-is reformatted.
+`uv sync --dev` → `ruff check` → `TILERL_TARGET=cpu uv run pytest -v`. Only
+lint + hermetic CPU tests block; GPU/Metal tests auto-skip; no bench steps.
+`ruff format --check` is non-blocking until the tree is reformatted.

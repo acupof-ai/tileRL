@@ -1,10 +1,5 @@
-"""Paired W8 off/on decode, ONE process.
-
-The wide-load fp4 mma is 1.18x on the kernel in isolation. Whether that reaches
-the tick is a different question, and comparing against a baseline from another
-run is the mistake this repo keeps making — so both arms are built and timed
-here, back to back, on the same weights.
-"""
+"""Paired W8 off/on decode in ONE process on the same weights. The wide-load fp4 mma is 1.18x
+in isolation; this says whether that reaches the tick."""
 
 from __future__ import annotations
 
@@ -42,8 +37,7 @@ def main() -> None:
     for b in (int(x) for x in args.batches.split(",")):
         agg = {}
         for w8 in (0, 1):
-            # The registry binds the factory BY REFERENCE at import, so patching
-            # the module attribute does nothing — the dict entry is what resolves.
+            # the registry binds the factory by reference at import; the dict entry is what resolves
             REG._SM90_KERNELS["linear_fp4_mma8"] = (
                 lambda t, _w=w8: KL.make_linear_fp4_mma8(t, W8=_w)
             )

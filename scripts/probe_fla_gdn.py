@@ -1,9 +1,4 @@
-"""What does fla's chunked gated-delta actually cost at OUR shapes?
-
-Our `gdn_chunk_fused` runs a T-long scalar scan in one kernel: 63 ms of a 229 ms
-prefill, 0.13% of the tensor pipe. fla (what sglang runs) does the same maths as
-four kernels with the chunk interior as matmuls. Every estimate of the gap so
-far has been mine; this is the number.
+"""Cost of fla's chunked gated-delta (four kernels, chunk interior as matmuls) at our shapes.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/probe_fla_gdn.py

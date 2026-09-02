@@ -1,8 +1,5 @@
-"""Diagnose where the signal dies in a real-slice forward.
-
-Weight stats + pack/unpack roundtrip (CPU side), then a short forward with
-every rmsnorm output norm printed (the activation stream between layers) and
-the final logits std. Target comes from TILERL_TARGET.
+"""Where does the signal die in a real-slice forward: weight stats, pack/unpack
+roundtrip, then a short forward printing every rmsnorm output norm and logits std.
 """
 
 from __future__ import annotations

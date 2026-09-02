@@ -67,18 +67,15 @@ def test_iso_merge_two_specialists():
     assert out["iso"][0] <= out["avg"][0] or out["iso"][1] <= out["avg"][1], out
 
 
-
 def test_merge_checkpoints_streams_shards_and_records(tmp_path, monkeypatch):
     """The file-level merge equals the dict-level one, writes shards load_hf
     reads back, and leaves a manifest."""
     import json
     import sys
 
-    from tilerl.cli import _build_model, main
-    from tilerl.merge import iso_merge, merge_checkpoints
+    from tilerl.cli import main
+    from tilerl.merge import merge_checkpoints
     from tilerl.model import load_hf, save_hf
-    from tilerl.testing import RefBackend
-    from tilerl.train import train_step
 
     backend = RefBackend()
     dirs, params = [], []

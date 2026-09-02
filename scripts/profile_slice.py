@@ -1,11 +1,6 @@
-"""Profile per-op GPU time of one decode/prefill tick on the NVFP4 slice.
+"""Per-op CUDA-event time of one decode/prefill tick on the NVFP4 slice, the wall-vs-GPU
+dispatch gap, and a naive full-model extrapolation.
 
-Dev tool for the H20 pod: loads the 2-layer slice, warms up every timed shape
-(tilelang eager JITs per (shape, dtype) — 30-120s NVCC each), then reports
-per-op CUDA-event time for decode (avg over N ticks) and prefill (ms per
-token), the wall-vs-GPU dispatch gap, and a naive full-model extrapolation.
-
-Usage:
     TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=1 \\
         PYTHONPATH=src python3 scripts/profile_slice.py /host/tc27-nvfp4-slice2 --layers 2
 """
@@ -20,7 +15,6 @@ import torch
 
 from tilerl.engine import SamplingParams
 
-#: Backend ops timed per tick (instance-method wrappers, no framework change).
 _OPS = (
     "add",
     "rmsnorm",
@@ -42,8 +36,6 @@ _FIXED = ("embedding", "sample")
 
 
 class Tracer:
-    """Per-op CUDA-event timing via instance-method wrappers."""
-
     def __init__(self, backend) -> None:
         self.on = False
         self.records: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
@@ -150,9 +142,7 @@ def report(cfg, dec, pre, args) -> None:
     per_op_overhead = overhead / calls_per_tick if calls_per_tick else 0.0
 
     if args.decode_graph:
-        # Captured decode: the per-op tracer sees nothing during a replay
-        # (the ops ran once at capture), so wall IS the tick — replay plus
-        # the small H2D input copies plus sampling.
+        # the tracer sees nothing inside a replay, so wall is the tick.
         print(f"\nDECODE (captured) per tick (avg of {ticks} ticks, {layers} layers)")
         print(f"  {'wall (replay+copies+sample)':<20} {wall:>10.3f}")
         print(f"  {'throughput':<20} {1000.0 / wall:>10.1f} tok/s")
@@ -178,7 +168,6 @@ def report(cfg, dec, pre, args) -> None:
     )
     print(f"  {'dispatch overhead':<20} {p_overhead:>10.3f} ms")
 
-    # --- extrapolation: slice (2 GDN layers) -> full 64-layer model ---------
     full_layers = 64
     if not args.decode_graph:
         fixed = sum(dt.get(k, 0.0) for k in _FIXED) / ticks
@@ -257,17 +246,13 @@ def main() -> None:
     model = load_hf(cfg, args.source, fuse_projections=args.fuse)
     print(f"load: {time.perf_counter() - t0:.1f}s", flush=True)
 
-    # 128 blocks: the prefix store retains each published prompt (a 512-token
-    # prompt holds 32 blocks for the process lifetime), and later requests
-    # still need fresh blocks on top of those.
+    # 128 blocks: the prefix store pins each 512-token prompt's 32 blocks for process life.
     engine = build_engine(
         cfg, model, backend, num_blocks=128, num_slots=4, decode_graph=args.decode_graph
     )
-    tracer = Tracer(backend)  # wraps the singleton's ops; timing stays off until enabled
+    tracer = Tracer(backend)
 
-    # Warmup: compile EVERY (shape, dtype) the timed run touches. One
-    # 512-token prefill + decode pair covers both M=512 and M=1 variants of
-    # every kernel; the second pass confirms the numbers are JIT-free.
+    # one prefill+decode pair JITs every M=512 and M=1 kernel; pass 2 proves it.
     print("warmup pass 1: 512-token prefill + decode (NVCC JIT, slow)...", flush=True)
     gen = torch.Generator().manual_seed(1)
     prompt = torch.randint(0, cfg.vocab_size, (args.prefill_len,), generator=gen).tolist()

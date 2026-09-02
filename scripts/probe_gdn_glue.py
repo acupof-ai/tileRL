@@ -1,10 +1,5 @@
-"""The chunked GDN's matmuls need 9.9 ms; the torch path spends ~290. Where?
-
-Splits `_gdn_chunk_fwd` into its three kinds of work at the real shapes, so the
-kernel project's difficulty is known before it starts: the matmuls have a
-roofline, the elementwise/cumsum glue is mechanical to fuse, and the triangular
-solve is the one piece with no in-kernel primitive.
-"""
+"""The chunked GDN's matmuls need 9.9 ms; the torch path spends ~290. Times the glue (gates,
+triangular solve, permutes) at real shapes."""
 
 from __future__ import annotations
 

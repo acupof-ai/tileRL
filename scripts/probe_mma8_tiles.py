@@ -1,8 +1,5 @@
-"""mma8 moves weight bytes at ~0.68 TB/s where the GEMV reaches ~1.95 TB/s.
-
-Is that latency (fixable by the existing NG/KW/G knobs) or the 4-byte scattered
-global load the fragment layout forces? Build the factory directly at several
-(NG, KW, G) and time the kernel, not the Python call.
+"""mma8 moves weight bytes at ~0.68 TB/s vs the GEMV's ~1.95. Sweep (NG, KW, G, W8) on the
+factory and time the kernel, not the Python call.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/probe_mma8_tiles.py

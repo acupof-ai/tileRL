@@ -10,7 +10,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import time
 from dataclasses import replace
 
 import torch
@@ -66,7 +65,6 @@ def main() -> None:
         n, k = master.shape
         wq, scale = pack_fp4(master)
         x = torch.randn(args.m, k, device=backend.device, dtype=torch.bfloat16) * 0.5
-        # migrate params
         w8 = w8.to(backend.device)
         wscale = wscale.to(backend.device)
         wq = wq.to(backend.device)

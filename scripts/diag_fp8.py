@@ -16,14 +16,12 @@ def main() -> None:
     backend = get_backend()
     torch.manual_seed(21)
 
-    # --- direct e4m3 cast check: tilelang kernel vs torch -------------------
-    # Quantize a known row via the kernel, dequant, compare to torch's e4m3.
+    # direct e4m3 cast check: tilelang kernel vs torch
     x = torch.randn(4, 128, dtype=torch.bfloat16) * 0.5
     x_dev = x.to(backend.device)
     xq = torch.empty((4, 128), dtype=torch.float8_e4m3fn, device=backend.device)
     ascale = torch.empty((4, 128 // 32), dtype=torch.float32, device=backend.device)
     backend._kernel("quant_fp8")(x_dev, xq, ascale, 32)
-    # torch reference: per-32-block quant
     xt = x.float()
     blk = xt.reshape(4, 4, 32)
     blk_max = blk.abs().amax(dim=-1, keepdim=True)  # [4,4,1]
@@ -32,7 +30,7 @@ def main() -> None:
     cast_diff = (xq.float().cpu() - xq_ref.float()).abs().max().item()
     print(f"e4m3 cast tilelang-vs-torch max diff: {cast_diff:.4e} (should be ~0)")
 
-    # --- per-32-block quant + exact w, f32 matmul, vs reference -------------
+    # per-32-block quant + exact w, f32 matmul, vs reference
     for M, N, K in [(8, 64, 256), (8, 64, 1024), (8, 64, 4096)]:
         w_master = torch.randn(N, K) * 0.1
         wq, scale = pack_fp4(w_master)

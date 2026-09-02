@@ -1,10 +1,5 @@
-"""Dequantize the NVFP4/FP8 checkpoint to a plain bf16 HF checkpoint so other
-engines (sglang on Hopper has no w4a4 NVFP4 path) can run the SAME model on the
-same card. NVFP4 linears: e2m1 * f8 block scale / global (ModelOpt reciprocal);
-FP8 block linears: f8 * scale_inv. Everything else copied; quant siblings and
-config.quantization_config dropped. CPU only, row-chunked (lm_head is 248320
-rows). ~54 GB out.
-
+"""Dequantize the NVFP4/FP8 checkpoint to a plain bf16 HF checkpoint (~54 GB)
+so sglang, which has no w4a4 NVFP4 path on Hopper, can run the same model.
   python scripts/dequant_to_bf16.py /data00/Qwen3.8-27B-NVFP4 /work/Qwen3.8-27B-bf16
 """
 

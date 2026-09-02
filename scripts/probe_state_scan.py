@@ -1,11 +1,5 @@
-"""The inter-chunk state scan is the only piece the two 2026-08-25 WY ports lost
-on (10.76 ms for one layer against the serial kernel's 4.73 for everything).
-fla's equivalent reads 1.70 ms across all 48 layers. That is a 300x claim on one
-component and it decides whether a port is worth writing, so it gets measured on
-its own rather than inferred from two profiles.
-
-Times fla's `chunk_gated_delta_rule_fwd_h` alone at our shapes.
-"""
+"""Times fla's `chunk_gated_delta_rule_fwd_h` alone at our shapes, against the 10.76 ms one
+layer of the 2026-08-25 port's state scan."""
 
 from __future__ import annotations
 

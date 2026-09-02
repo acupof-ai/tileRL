@@ -1,16 +1,5 @@
-"""Can the chunked GDN's matmuls reach the tensor cores at OUR shapes?
-
-The serial `gdn_chunk_fused` does ~115 GFLOP for the model and takes 63 ms —
-1.8 TFLOP/s, 1.2% of bf16 tensor peak, and ncu reads 0.13% on the tensor pipe:
-it expresses matrix products as a scalar scan. The chunked form is 1.8x MORE
-arithmetic but shaped as matmuls, so the whole case rests on what those matmuls
-actually achieve here.
-
-This times ONLY the dominant shapes of `_gdn_chunk_fwd` (chunk 64, DK=DV=128,
-batched over 48 value heads) through the tree's own gemm kernels. No
-correctness — this is a roofline question. If it cannot clear ~10% of peak the
-9x estimate collapses and the project dies here.
-"""
+"""Roofline for the chunked GDN's matmuls (chunk 64, DK=DV=128, batched over 48 value heads)
+via torch.bmm; no correctness. The serial kernel does 63 ms at 1.2% of bf16 tensor peak."""
 
 from __future__ import annotations
 

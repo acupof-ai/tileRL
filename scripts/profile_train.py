@@ -1,9 +1,5 @@
 """Per-kernel GPU time in one train_step (forward + tape backward).
 
-The 27B LoRA row measures 67 SECONDS per step at 1x64 tokens. Kernel-ing the
-frozen backward's dequant moved it only 1.18x, so the cost is somewhere else —
-and one wrong guess is enough. This says where.
-
   python scripts/profile_train.py /data00/Qwen3.8-27B-NVFP4 --gpu 7 --len 64
 """
 

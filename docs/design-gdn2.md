@@ -1,7 +1,6 @@
 # GDN2 — Adoption Assessment
 
-Status: assessed 2026-08-24, not implemented. No GDN2 model in scope
-(Qwen3.8-27B uses GDN1).
+Not implemented; no GDN2 model in scope (Qwen3.8-27B uses GDN1).
 
 Source: NVlabs/GatedDeltaNet-2 (arXiv:2605.22791), "Decoupling Erase and Write".
 

@@ -1,9 +1,4 @@
-"""Per-kernel GPU time of ONE prefill forward, with the GDN path selectable.
-
-fla's gated-delta is 9.3x faster than our serial kernel in isolation (6.8 ms vs
-63 across 48 layers) and yet the model is 5% SLOWER with it. Something else
-grows by ~56 ms and guessing which is how three estimates went wrong today.
-This profiles both arms in one process.
+"""Per-kernel GPU time of one prefill forward, serial GDN vs fla chunked GDN, in one process.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/profile_prefill.py /data00/Qwen3.8-27B-NVFP4
@@ -25,7 +20,6 @@ def main() -> None:
     ap.add_argument("--top", type=int, default=10)
     args = ap.parse_args()
 
-    import numpy as np
     import torch
     from torch.profiler import ProfilerActivity, profile
 

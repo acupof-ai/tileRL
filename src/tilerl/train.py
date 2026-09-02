@@ -1,65 +1,29 @@
-"""Training: train_step + opd_loop on top of the hand-written tape.
-
-Same model, same engine, same weights as serving (训练推理一体): the student is
-a ``tilerl.model.Model`` trained in place; the teacher is the same model class
-driven by a ``tilerl.engine.Engine`` — frozen, generating on-policy.
-
-``train_step`` runs the model forward under a :class:`~tilerl.autograd.Tape`
-(via a :class:`~tilerl.autograd.RecordingBackend` proxy so the backend stays
-tape-unaware), computes causal cross-entropy and its logit gradient outside
-the tape, replays the tape backward, clips grads to max-norm 1.0, and applies
-AdamW — skipping the step when the loss or the global grad norm is non-finite
-(agent-infer's ``finite_optimizer_step``). ``opd_loop`` is on-policy
-distillation: the frozen teacher generates a completion for a prompt, the
-student does one ``train_step`` on the full (prompt + completion) sequence.
-EMA self-teacher is day-2 — see ``agent-infer/crates/train/src/ema_self_teacher.rs``.
-
-CE is torch-eager glue (softmax through the backend op; one-hot/mean in torch
-— no backend cross_entropy op exists yet).
-# ponytail: fold CE into a backend cross_entropy op when perf demands.
-"""
+"""Training on the hand-written tape: SFT, GRPO, on-policy distillation and
+pretrain share ``_step``; serving and training share the model and weights.
+# ponytail: CE is torch-eager glue; fold into a backend cross_entropy op when perf demands."""
 
 from __future__ import annotations
 
 import json
 import math
 import time
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 import numpy as np
 import torch
 
 from .autograd import AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
-from .kv_cache import NoPrefixStore
-
-__all__ = ["train_step", "rl_step", "group_advantages", "grpo_loop",
-           "opd_loop", "pretrain", "JsonlDataset"]
-
-
-# ---------------------------------------------------------------------------
-# Training KV (dense, no paged pool)
-# ---------------------------------------------------------------------------
+from .engine import SamplingParams
+from .kv_cache import LinearStatePool, NoPrefixStore
+from .model import save_hf
 
 
-def _training_kv(
-    model: Any, batch_size: int, seq_len: int, device: "torch.device | str | None" = None
-):
-    """Dense-layout KV for a training forward.
-
-    The model's full-attn layers call ``backend.attention`` (dense GQA) when
-    ``kv.dense`` is set — no paged pool indirection, so the tape's id()-based
-    grad chain is unbroken. The GDN layers still need a LinearStatePool for
-    the recurrent state (one slot per sequence).
-
-    ``device`` must match the backend that will run the forward (the pool
-    stores states the kernel reads/writes); it defaults to the global backend
-    device for callers that do not thread one through.
-    """
-    from types import SimpleNamespace
-
-    from .kv_cache import LinearStatePool
-
+def _training_kv(model: Any, batch_size: int, seq_len: int, device: Any = None):
+    """Dense KV: full-attn layers skip the paged pool so the tape's id() chain
+    is unbroken; GDN layers still need a state slot per sequence."""
     cfg = model.cfg
     kv = SimpleNamespace()
     kv.dense = True
@@ -72,11 +36,6 @@ def _training_kv(
     )
     kv.state_slot = torch.arange(batch_size, dtype=torch.long)
     return kv
-
-
-# ---------------------------------------------------------------------------
-# train_step
-# ---------------------------------------------------------------------------
 
 
 _NO_GRAD = (
@@ -97,12 +56,7 @@ def _step(
     grad_fn: Any,
 ) -> float:
     """Forward under a tape, ``grad_fn`` for the logit gradient, backward, clip,
-    AdamW. SFT and RL differ ONLY in ``grad_fn``; everything else — the tape,
-    the frozen-base filter, the finite-step rejection — is shared.
-
-    The step is SKIPPED (params untouched) when the loss or the pre-clip grad
-    norm is non-finite (agent-infer's ``finite_optimizer_step``).
-    """
+    update. The step is skipped when the loss or grad norm is non-finite."""
     input_ids = np.asarray(input_ids, dtype=np.int64)
     b, t = input_ids.shape
     positions = np.arange(t, dtype=np.int64)
@@ -118,18 +72,14 @@ def _step(
     if not math.isfinite(loss):
         return loss
 
-    #: ``trainable`` = the subset that gets gradients (LoRA adapters); the rest
-    #: is frozen, which is what keeps the 27B inside one card.
     params = model.params if trainable is None else trainable
     by_id = {id(p): p for p in params.values()}
     param_ids = set(by_id)
 
     if getattr(optimizer, "streams", False):
-        # Full fine-tuning: hold no gradient longer than its own update. Every
-        # weight gradient coexisting is 50.1 GiB of the 27B, which is what
-        # clip_grad_norm's global norm forces and what OOMs the step. This
-        # optimizer clips each update instead, so a parameter can be updated
-        # and its gradient dropped the moment backward finalizes it.
+        # Every weight gradient coexisting is 50.1 GiB on the 27B: this
+        # optimizer clips per update, so each gradient is applied and dropped
+        # the moment backward finalizes it.
         optimizer.begin()
         seen = 0
 
@@ -137,7 +87,7 @@ def _step(
             nonlocal seen
             p = by_id.get(tid)
             if p is None:
-                return True  # unwanted gradient: drop it
+                return True
             optimizer.step_one(p, g)
             seen += 1
             return True
@@ -148,8 +98,7 @@ def _step(
 
     grads = tape.backward(grad_logits, needs=param_ids)
     assert param_ids & set(grads), _NO_GRAD
-    # The GDN initial state is a tape leaf: its grad is not a parameter and
-    # must not enter the clip norm.
+    # The GDN initial state is a tape leaf whose grad must not enter the clip norm.
     grads = {k: v for k, v in grads.items() if k in param_ids}
     norm = clip_grad_norm(grads, 1.0)
     if math.isfinite(norm):
@@ -170,20 +119,9 @@ def train_step(
                  lambda logits, ids: backend.cross_entropy_loss_grad(logits, ids))
 
 
-# ---------------------------------------------------------------------------
-# GRPO
-# ---------------------------------------------------------------------------
-
-
 def group_advantages(rewards: Any, group: int) -> "np.ndarray":
-    """Group-relative advantages: within each group of ``group`` consecutive
-    rollouts of the same prompt, ``(r - mean) / std``.
-
-    This is what lets GRPO drop the critic — the group's own mean is the
-    baseline, so there is no value network and no second set of weights.
-    A group whose rewards are all equal has no signal and yields zeros rather
-    than a division by ~0.
-    """
+    """``(r - mean) / std`` within each group of ``group`` consecutive rollouts;
+    a tied group yields zeros (no signal, no division by ~0)."""
     r = np.asarray(rewards, dtype=np.float64).reshape(-1, group)
     std = r.std(axis=1, keepdims=True)
     adv = (r - r.mean(axis=1, keepdims=True)) / np.where(std > 1e-8, std, 1.0)
@@ -201,27 +139,12 @@ def rl_step(
     trainable: dict[str, Any] | None = None,
     seq_lens: Any = None,
 ) -> float:
-    """One policy-gradient step on sampled sequences.
-
-    The objective is ``-mean_t A_row * log p(a_t | a_<t)`` over COMPLETION
-    tokens only. Its logit gradient is the causal-CE gradient scaled per row by
-    the advantage and zeroed on prompt positions — so this is ``train_step``
-    with one elementwise multiply, not a second training path.
-
-    ``input_ids`` [B,T] is prompt+completion per row, right-padded to a common
-    T; ``advantages`` [B]; ``prompt_lens`` [B]; ``seq_lens`` [B] is the valid
-    length of each row (default T — pass it whenever rows are padded, or the
-    padding gets gradient).
-
-    Returns the batch cross-entropy: a DIAGNOSTIC (how likely the sampled
-    tokens were), not the objective — the objective is the advantage-weighted
-    one whose gradient this step applies.
-
-    Strictly on-policy: one update per rollout, so the importance ratio is 1
-    and there is no clipping term.
+    """One policy-gradient step: the causal-CE gradient scaled per row by the
+    advantage and zeroed on prompt/padding positions. ``input_ids`` [B,T] is
+    prompt+completion right-padded; ``seq_lens`` [B] is each row's valid length
+    (default T). Returns the batch cross-entropy as a diagnostic.
     # ponytail: single-update REINFORCE-with-baseline; add the PPO ratio+clip
-    # when a rollout is reused for more than one step.
-    """
+    # when a rollout is reused for more than one step."""
     adv = torch.as_tensor(np.asarray(advantages, dtype=np.float32))
     plen = np.asarray(prompt_lens, dtype=np.int64)
     slen = None if seq_lens is None else np.asarray(seq_lens, dtype=np.int64)
@@ -230,8 +153,7 @@ def rl_step(
         b, t, _ = logits.shape
         loss, grad = backend.cross_entropy_loss_grad(logits, ids)
         dev = grad.device
-        # Position i predicts token i+1: scored iff that token is a real
-        # completion token, i.e. prompt_len <= i+1 < seq_len.
+        # Position i predicts token i+1: scored iff prompt_len <= i+1 < seq_len.
         pos = torch.arange(t, device=dev).reshape(1, t)
         keep = pos >= torch.as_tensor(plen, device=dev).reshape(b, 1) - 1
         if slen is not None:
@@ -247,8 +169,7 @@ def rl_step(
 
 
 def _require_on_policy(engine: Any) -> None:
-    """A cached prefix or a captured decode graph samples from an earlier
-    policy without raising; refuse the engine instead of remembering."""
+    # A cached prefix or a captured decode graph samples from an earlier policy without raising.
     if engine._decode_graph_on is not False or not isinstance(engine._prefix, NoPrefixStore):
         raise ValueError("on-policy rollouts need build_engine(decode_graph=False, "
                          "prefix_store=NoPrefixStore()): a captured graph or a cached "
@@ -269,35 +190,14 @@ def grpo_loop(
     seed: int = 0,
     trainable: dict[str, Any] | None = None,
 ) -> list[tuple[float, float, float, float]]:
-    """GRPO: sample ``group`` completions per prompt, score them, take one
-    policy-gradient step on the group-normalized advantages.
-
-    The engine that generates IS the model that trains — same weights, same
-    runtime (训练推理一体), so a rollout costs a serving batch and nothing is
-    duplicated. ``reward_fn(prompt_ids, completion_ids) -> float``.
-
-    ``sampling`` is the rollout's :class:`SamplingParams` (stop ids, length,
-    temperature, thinking budget); the loop only sets its seed.
-
-    ``engine`` must be built with the prefix cache and the captured decode graph
-    OFF (``prefix_store=NoPrefixStore(), decode_graph=False``). Both cache work
-    across steps — a stored prefix holds KV from an earlier policy, and a
-    captured graph holds f32 casts of weights the optimizer updates in place —
-    so either one samples from a policy that is not the current one, without
-    ever raising. The price is the eager decode path for rollouts, which is
-    ~8x slower than a replay at B=1.
+    """GRPO: sample ``group`` completions per prompt in one engine batch, score
+    them with ``reward_fn(prompt_ids, completion_ids) -> float``, take one
+    policy-gradient step on the group-normalized advantages. The engine that
+    generates IS the model that trains, so it must be built with the prefix
+    cache and decode graph off. Returns per step ``(mean reward, cross-entropy,
+    seconds, tied-group fraction)``.
     # ponytail: recapture the graph and drop the prefix entries after each
-    # update instead of disabling both, once a rollout's decode cost matters.
-
-    Returns per step ``(mean reward, cross-entropy of the sampled tokens,
-    seconds, tied-group fraction)`` — seconds is rollout + update, the number
-    an RL step is priced by. Rollouts within a step are one engine batch: the group is what
-    continuous batching is for.
-    """
-    from dataclasses import replace
-
-    from .engine import SamplingParams
-
+    # update instead of disabling both, once a rollout's decode cost matters."""
     _require_on_policy(engine)
     if optimizer is None:
         optimizer = AdamW(lr=1e-5)
@@ -307,14 +207,13 @@ def grpo_loop(
     for step in range(steps):
         t0 = time.perf_counter()
         prompt = np.asarray(prompts[step % len(prompts)], dtype=np.int64)
-        # Distinct seeds, one batch: identical seeds would make the group a
-        # single sample repeated, and every advantage exactly zero.
+        # Identical seeds would make the group one sample repeated, every advantage zero.
         ids = [
             engine.submit(prompt.tolist(), replace(sampling, seed=seed + step * group + g))
             for g in range(group)
         ]
         done: dict[int, list[int]] = {}
-        for _ in range(10000):  # one forward per tick; bounded guard
+        for _ in range(10000):
             engine.step()
             done.update(engine.poll())
             if all(i in done for i in ids):
@@ -324,11 +223,8 @@ def grpo_loop(
         comps = [done[i] for i in ids]
         rewards = [float(reward_fn(prompt, c)) for c in comps]
         adv = group_advantages(rewards, group)
-        # A group whose rewards all tie has no gradient; a run that is mostly
-        # ties says nothing about learning, so the fraction is reported.
         tied = float((adv.reshape(-1, group) == 0).all(axis=1).mean())
-        # Right-pad to one rectangle: padding sits past every prompt_len, and
-        # the advantage mask is what keeps it out of the gradient.
+        # Right-pad to one rectangle; the advantage mask keeps padding out of the gradient.
         width = max(len(c) for c in comps)
         batch = np.stack([
             np.concatenate([prompt, np.asarray(c, dtype=np.int64),
@@ -343,11 +239,6 @@ def grpo_loop(
     return out
 
 
-# ---------------------------------------------------------------------------
-# opd_loop
-# ---------------------------------------------------------------------------
-
-
 def opd_loop(
     teacher_engine: Any,
     student_model: Any,
@@ -360,45 +251,29 @@ def opd_loop(
     ema_decay: float = 0.999,
     sampling: Any = None,
 ) -> list[float]:
-    """On-policy distillation: frozen teacher generates, student SFTs.
-
-    Each step: the teacher generates ``max_new_tokens`` tokens for one prompt
-    (cycled), then the student does one :func:`train_step` on the full
-    (prompt + completion) sequence. The teacher is frozen by construction —
-    only ``submit``/``poll``/``step`` are ever called on it, never
-    ``train_step``.
-
-    ``trainable`` (the LoRA adapters) turns this into the self-teacher loop of
-    ``agent-infer/crates/train/src/ema_self_teacher.rs``: the teacher engine
-    drives the SAME model, generating with an EMA of those adapters instead of
-    a second copy of the weights. Only the adapters are duplicated, so the
-    self-teacher costs adapter-sized memory, not model-sized.
-    """
-    from dataclasses import replace
-
-    from .engine import SamplingParams
-
+    """On-policy distillation: the teacher engine generates a completion, the
+    student takes one :func:`train_step` on prompt + completion. With
+    ``trainable`` (LoRA adapters) the teacher is the same model generating
+    under an EMA of the adapters, so only adapter-sized memory is duplicated."""
     if trainable is not None:  # a frozen teacher with no adapters cannot go stale
         _require_on_policy(teacher_engine)
     if optimizer is None:
         optimizer = AdamW(lr=1e-3)
     if sampling is None:
         sampling = SamplingParams(max_new_tokens=8)
-    # The live adapter tensors are what the engine — and a captured decode
-    # graph — read. Teacher/student swaps copy INTO them and never rebind, or
-    # the graph keeps sampling from whichever tensors it captured.
+    # Swaps copy INTO the live adapter tensors and never rebind: the engine reads those objects.
     ema = {k: v.clone() for k, v in trainable.items()} if trainable is not None else None
     student = {k: v.clone() for k, v in trainable.items()} if trainable is not None else None
     losses: list[float] = []
     for step in range(steps):
         prompt = np.asarray(prompts[step % len(prompts)], dtype=np.int64)
         params = replace(sampling, seed=seed + step)
-        if ema is not None:  # generate with the teacher weights, train the student
+        if ema is not None:
             for k, v in trainable.items():
                 v.copy_(ema[k])
         rid = teacher_engine.submit(prompt, params)
         finished: dict[int, list[int]] = {}
-        for _ in range(10000):  # one forward per tick; bounded guard
+        for _ in range(10000):
             teacher_engine.step()
             finished = teacher_engine.poll()
             if rid in finished:
@@ -418,19 +293,9 @@ def opd_loop(
     return losses
 
 
-# ---------------------------------------------------------------------------
-# pretrain
-# ---------------------------------------------------------------------------
-
-
 class JsonlDataset:
-    """JSONL corpus -> packed fixed-length token sequences.
-
-    Each line must have a ``"text"`` field. Texts are tokenized and joined
-    with ``eos_token_id`` separators, then cut into ``seq_len`` chunks (the
-    last chunk is eos-padded). Iteration is file order; :func:`pretrain`
-    shuffles with its own seeded RNG.
-    """
+    """JSONL ``{"text"}`` lines -> eos-joined token stream cut into ``seq_len``
+    chunks (last chunk eos-padded), in file order."""
 
     def __init__(
         self, path: str | Path, tokenizer: Any, seq_len: int, eos_token_id: int = 0
@@ -469,15 +334,9 @@ def pretrain(
     ckpt_every: int = 0,
     seed: int = 0,
 ) -> list[float]:
-    """Pretrain ``model`` on ``dataset`` (iterable of [T] token-id arrays).
-
-    Causal-LM loss via :func:`train_step`; LR follows :func:`cosine_warmup`.
-    Checkpoints land in ``ckpt_dir`` every ``ckpt_every`` steps plus a final
-    ``final/`` save. Returns the per-step losses. Deterministic for a fixed
-    ``seed`` (epoch-wise shuffle of the dataset).
-    """
-    from .model import save_hf
-
+    """Causal-LM training over ``dataset`` (iterable of [T] token arrays) with a
+    seeded epoch-wise shuffle and :func:`cosine_warmup`; checkpoints every
+    ``ckpt_every`` steps plus ``final/``. Returns the per-step losses."""
     sequences = list(dataset)
     if not sequences:
         raise ValueError("pretrain: dataset yielded no sequences")

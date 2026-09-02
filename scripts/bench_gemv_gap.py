@@ -1,21 +1,13 @@
-"""Measure the fp4 GEMV gap: direct kernel vs through-backend, SAME shapes.
+"""fp4 GEMV: direct kernel vs through-backend on the same per-layer shapes, one process — is the
+31% vs 46% roof gap backend overhead or shape amortization?
 
-The final bench saw 31% roof through the backend on per-layer shapes vs 46%
-for the direct kernel — but on different shapes. This runs both on the same
-per-layer shapes in one process to decide whether the gap is backend fat
-(recoverable -> ~73 tok/s decode) or shape amortization (single-stream is
-capped ~55).
-
-Usage:
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src TILERL_TARGET=cuda \\
-        python3 scripts/bench_gemv_gap.py /host/tc27-nvfp4-slice4 --layers 4
+Usage: CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src TILERL_TARGET=cuda python3 scripts/bench_gemv_gap.py /host/tc27-nvfp4-slice4 --layers 4
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-import time
 
 import torch
 
@@ -56,7 +48,6 @@ def main() -> None:
         blk = K // scale.shape[1]  # scale block from the loaded weight (16 or 32)
         Kp, Np = _round_up(K, 256), _round_up(N, 4)
         x = torch.randn(1, K, device=backend.device, dtype=torch.bfloat16)
-        # Identical args to what backend.linear_fp4 passes the kernel.
         xp = torch.nn.functional.pad(x, (0, Kp - K))
         wqp = torch.nn.functional.pad(wq, (0, Kp // 2 - wq.shape[1], 0, Np - N))
         sp = torch.nn.functional.pad(scale, (0, Kp // blk - scale.shape[1], 0, Np - N))
@@ -75,7 +66,7 @@ def main() -> None:
         backend_ms = bg._time_calls(lambda: backend.linear_fp4(x, wq, scale), 50)
         direct_ms = bg._time_calls(lambda: direct(xp, wqp, sp, 32, 4, blk), 50)
 
-        # Real tensor bytes: 0.75 B/elem holds only at block 16 f32 scales.
+        # From the tensors: 0.75 B/elem holds only at block-16 f32 scales.
         bytes_ = wq.numel() + scale.numel() * 4 + 2 * K
         roof_ms = bytes_ / (bw * 1e9) * 1e3
         print(

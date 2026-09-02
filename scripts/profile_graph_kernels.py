@@ -1,6 +1,5 @@
-"""Per-kernel GPU time INSIDE the captured decode graph (torch.profiler over
-graph replays). The eager-event benches price launch+sync, not graph cost —
-this is the only view that says where a replayed tick actually goes.
+"""Per-kernel GPU time inside the captured decode graph (torch.profiler over replays);
+the eager-event benches price launch+sync, not graph cost.
 
   python scripts/profile_graph_kernels.py /data00/Qwen3.8-27B-NVFP4 --gpu 6 --layers 8
 """
