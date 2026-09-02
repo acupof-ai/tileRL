@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from tilerl.autograd import AdamW
-from tilerl.cli import _build_model
+from tilerl.cli import _build_model, last_number
 from tilerl.testing import RefBackend
 from tilerl.train import group_advantages, rl_step, train_step
 
@@ -82,7 +82,7 @@ def test_grpo_loop_raises_reward():
     """End to end on the tiny model: rollouts through the engine, a reward the
     policy can move, and reward must go up. The engine that samples is the model
     that trains — no second copy of the weights."""
-    from tilerl.engine import build_engine
+    from tilerl.engine import SamplingParams, build_engine
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.train import grpo_loop
 
@@ -105,10 +105,29 @@ def test_grpo_loop_raises_reward():
 
     prompts = [[1, 2, 3, 4]]
     hist = grpo_loop(engine, model, prompts, reward, 12, backend,
-                     AdamW(lr=0.05), group=6, max_new_tokens=6, seed=0)
-    first = np.mean([r for r, _ in hist[:3]])
-    last = np.mean([r for r, _ in hist[-3:]])
+                     AdamW(lr=0.05), group=6, sampling=SamplingParams(max_new_tokens=6), seed=0)
+    first = np.mean([r for r, *_ in hist[:3]])
+    last = np.mean([r for r, *_ in hist[-3:]])
     assert last > first, f"GRPO did not raise reward: {first:.3f} -> {last:.3f}"
+
+
+def test_last_number():
+    assert last_number("so the answer is 1,234.5 dollars") == 1234.5
+    assert last_number("#### -7") == -7.0
+    assert last_number("no digits") is None and last_number(None) is None
+
+
+def test_train_cli_real_task(tmp_path):
+    """`tilerl train --rl --data`: JSONL prompts through the tokenizer, ChatML,
+    the exact-match reward, one GRPO step, per-step seconds — the plumbing the
+    27B run uses, on the tiny model."""
+    from tilerl.cli import _build_parser, cmd_train
+
+    data = tmp_path / "d.jsonl"
+    data.write_text('{"prompt": "1+1?", "answer": "2"}\n{"prompt": "2+2?", "answer": "4"}\n')
+    cmd_train(_build_parser().parse_args(
+        ["train", "--rl", "--data", str(data), "--steps", "2", "--group", "2",
+         "--max-new-tokens", "4", "--lora-rank", "4"]))
 
 
 if __name__ == "__main__":  # runnable check

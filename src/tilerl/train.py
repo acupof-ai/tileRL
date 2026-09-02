@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -254,17 +255,19 @@ def grpo_loop(
     optimizer: AdamW | None = None,
     *,
     group: int = 8,
-    max_new_tokens: int = 32,
-    temperature: float = 1.0,
+    sampling: Any = None,
     seed: int = 0,
     trainable: dict[str, Any] | None = None,
-) -> list[tuple[float, float]]:
+) -> list[tuple[float, float, float]]:
     """GRPO: sample ``group`` completions per prompt, score them, take one
     policy-gradient step on the group-normalized advantages.
 
     The engine that generates IS the model that trains — same weights, same
     runtime (训练推理一体), so a rollout costs a serving batch and nothing is
     duplicated. ``reward_fn(prompt_ids, completion_ids) -> float``.
+
+    ``sampling`` is the rollout's :class:`SamplingParams` (stop ids, length,
+    temperature, thinking budget); the loop only sets its seed.
 
     ``engine`` must be built with the prefix cache and the captured decode graph
     OFF (``prefix_store=NoPrefixStore(), decode_graph=False``). Both cache work
@@ -276,23 +279,27 @@ def grpo_loop(
     # ponytail: recapture the graph and drop the prefix entries after each
     # update instead of disabling both, once a rollout's decode cost matters.
 
-    Returns per step ``(mean reward, cross-entropy of the sampled tokens)``.
-    Rollouts within a step are one engine batch: the group is what continuous
-    batching is for.
+    Returns per step ``(mean reward, cross-entropy of the sampled tokens,
+    seconds)`` — seconds is rollout + update, the number an RL step is priced
+    by. Rollouts within a step are one engine batch: the group is what
+    continuous batching is for.
     """
+    from dataclasses import replace
+
     from .engine import SamplingParams
 
     if optimizer is None:
         optimizer = AdamW(lr=1e-5)
-    out: list[tuple[float, float]] = []
+    if sampling is None:
+        sampling = SamplingParams(max_new_tokens=32)
+    out: list[tuple[float, float, float]] = []
     for step in range(steps):
+        t0 = time.perf_counter()
         prompt = np.asarray(prompts[step % len(prompts)], dtype=np.int64)
         # Distinct seeds, one batch: identical seeds would make the group a
         # single sample repeated, and every advantage exactly zero.
         ids = [
-            engine.submit(prompt.tolist(), SamplingParams(
-                temperature=temperature, max_new_tokens=max_new_tokens,
-                seed=seed + step * group + g))
+            engine.submit(prompt.tolist(), replace(sampling, seed=seed + step * group + g))
             for g in range(group)
         ]
         done: dict[int, list[int]] = {}
@@ -318,7 +325,7 @@ def grpo_loop(
         slens = np.array([len(prompt) + len(c) for c in comps], dtype=np.int64)
         ce = rl_step(model, batch, adv, plens, backend, optimizer,
                      trainable=trainable, seq_lens=slens)
-        out.append((float(np.mean(rewards)), ce))
+        out.append((float(np.mean(rewards)), ce, time.perf_counter() - t0))
     return out
 
 
@@ -337,6 +344,7 @@ def opd_loop(
     seed: int = 0,
     trainable: dict[str, Any] | None = None,
     ema_decay: float = 0.999,
+    sampling: Any = None,
 ) -> list[float]:
     """On-policy distillation: frozen teacher generates, student SFTs.
 
@@ -352,15 +360,19 @@ def opd_loop(
     a second copy of the weights. Only the adapters are duplicated, so the
     self-teacher costs adapter-sized memory, not model-sized.
     """
+    from dataclasses import replace
+
     from .engine import SamplingParams
 
     if optimizer is None:
         optimizer = AdamW(lr=1e-3)
+    if sampling is None:
+        sampling = SamplingParams(max_new_tokens=8)
     ema = {k: v.clone() for k, v in trainable.items()} if trainable is not None else None
     losses: list[float] = []
     for step in range(steps):
         prompt = np.asarray(prompts[step % len(prompts)], dtype=np.int64)
-        params = SamplingParams(temperature=1.0, top_p=1.0, max_new_tokens=8, seed=seed + step)
+        params = replace(sampling, seed=seed + step)
         if ema is not None:  # generate with the teacher weights, train the student
             student_model.params.update(ema)
         rid = teacher_engine.submit(prompt, params)

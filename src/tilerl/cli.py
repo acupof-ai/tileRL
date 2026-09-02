@@ -8,9 +8,12 @@ full runtime is wired up.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 import time
+from pathlib import Path
 
 __all__ = ["main"]
 
@@ -18,6 +21,17 @@ __all__ = ["main"]
 #: with TILERL_QWEN38_SOURCE once the checkpoint is downloaded.
 # ponytail: placeholder hub id; pin the real Qwen3-27B repo when weights land.
 _QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")
+
+_NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+
+def last_number(text: str | None) -> float | None:
+    """The last number in a completion — the GSM8K answer convention."""
+    found = _NUMBER.findall(text or "")
+    try:
+        return float(found[-1].replace(",", "")) if found else None
+    except ValueError:
+        return None
 
 
 def _build_model(
@@ -150,6 +164,32 @@ def cmd_train(args: argparse.Namespace) -> None:
         f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
         f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}"
     )
+    if adapters_only:
+        from .engine import SamplingParams
+        from .tokenizer import get_tokenizer, render_chat
+
+        tok = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
+        # --data: {"prompt", "answer"} per line, rendered as one ChatML user
+        # turn; the reward is exact match on the last number of the completion
+        # (GSM8K). Without it, random prompts and a demo reward.
+        rows = ([json.loads(ln) for ln in Path(args.data).read_text().splitlines() if ln.strip()]
+                if args.data else [])
+        prompts = [tok.encode(render_chat([("user", r["prompt"])])) for r in rows] or [
+            torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist() for _ in range(8)
+        ]
+        end_think = tuple(tok.encode("</think>\n\n")) if args.model == "qwen38-27b" else ()
+        sampling = SamplingParams(
+            temperature=args.temperature, max_new_tokens=args.max_new_tokens,
+            stop_token_ids=getattr(tok, "stop_token_ids", ()),
+            thinking_budget=args.think_budget if end_think else None, end_think_ids=end_think)
+
+        def mmlu(engine):
+            if args.eval_mmlu:
+                from .eval import mmlu_accuracy
+
+                c, n = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=8)
+                print(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}%")
+
     if args.rl:
         from .engine import build_engine
         from .model import add_lora
@@ -167,23 +207,28 @@ def cmd_train(args: argparse.Namespace) -> None:
         engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8,
                               decode_graph=False, prefix_store=NoPrefixStore())
         trainable = add_lora(model, rank=args.lora_rank)
-        half = cfg.vocab_size // 2
-        # Demo reward: dense, so an untrained policy's group has variance and
-        # GRPO has a gradient at step 0. A real task swaps this callable out.
-        def reward(prompt, completion):
-            return sum(1 for t in completion if t < half) / max(len(completion), 1)
+        if rows:
+            gold = {tuple(p): last_number(r["answer"]) for p, r in zip(prompts, rows)}
 
-        prompts = [
-            torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist()
-            for _ in range(4)
-        ]
+            def reward(prompt, completion):
+                got = last_number(tok.decode([int(t) for t in completion]))
+                want = gold[tuple(int(t) for t in prompt)]
+                return float(got is not None and want is not None and abs(got - want) < 1e-6)
+        else:
+            half = cfg.vocab_size // 2
+            # Demo reward: dense, so an untrained policy's group has variance
+            # and GRPO has a gradient at step 0.
+            def reward(prompt, completion):
+                return sum(1 for t in completion if t < half) / max(len(completion), 1)
+
         optimizer.lr = args.lr
+        mmlu(engine)  # LoRA B is zero at init, so this is the base model's score
         hist = train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend,
-                                   optimizer, group=args.group,
-                                   max_new_tokens=args.max_new_tokens,
+                                   optimizer, group=args.group, sampling=sampling,
                                    seed=args.seed, trainable=trainable)
-        for i, (r, ce) in enumerate(hist):
-            print(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}")
+        for i, (r, ce, secs) in enumerate(hist):
+            print(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  {secs:.1f}s")
+        mmlu(engine)
         return
     if args.opd:
         from .engine import build_engine
@@ -199,14 +244,12 @@ def cmd_train(args: argparse.Namespace) -> None:
         teacher = build_engine(cfg, model, backend, num_blocks=512, num_slots=8,
                                draft=draft, spec_depth=args.depth)
         trainable = add_lora(model, rank=args.lora_rank)
-        prompts = [
-            torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist()
-            for _ in range(8)
-        ]
-        losses = train_mod.opd_loop(teacher, model, prompts, args.steps, backend,
-                                    optimizer, seed=args.seed, trainable=trainable)
+        mmlu(teacher)
+        losses = train_mod.opd_loop(teacher, model, prompts, args.steps, backend, optimizer,
+                                    seed=args.seed, trainable=trainable, sampling=sampling)
         for i, loss in enumerate(losses):
             print(f"step {i + 1:4d}/{args.steps}  loss {loss:.4f}")
+        mmlu(teacher)
         return
     for step in range(args.steps):
         # ponytail: fixed batch=2 seq=64 random-token batch; a real corpus
@@ -379,7 +422,7 @@ def cmd_bench(args: argparse.Namespace) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tilerl",
-        description="tileRL: TileLang inference + training (CPU/CUDA/ROCm/Metal).",
+        description="tileRL: TileLang inference + training (CPU/CUDA/Metal).",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -407,7 +450,14 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="GRPO: the engine samples a group per prompt, a reward scores "
                               "them, the group mean is the baseline (no critic)")
     p_train.add_argument("--group", type=int, default=8, help="rollouts per prompt (--rl)")
-    p_train.add_argument("--max-new-tokens", type=int, default=32, help="rollout length (--rl)")
+    p_train.add_argument("--max-new-tokens", type=int, default=32, help="rollout length")
+    p_train.add_argument("--data", help="JSONL {prompt, answer}: real prompts, exact-match "
+                         "reward on the last number (scripts/gsm8k_jsonl.py)")
+    p_train.add_argument("--temperature", type=float, default=1.0, help="rollout temperature")
+    p_train.add_argument("--think-budget", type=int, default=0,
+                         help="tokens the 27B may spend in <think> per rollout; 0 = none")
+    p_train.add_argument("--eval-mmlu", type=int, default=0,
+                         help="score N MMLU questions before and after (needs `datasets`)")
     p_train.add_argument("--lr", type=float, default=1e-3)
     p_train.add_argument("--lora-rank", type=int, default=16)
     p_train.add_argument("--draft", help="draft head safetensors: speculative rollout (--opd)")
