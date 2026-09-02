@@ -85,20 +85,20 @@ def main() -> None:
     print(f"# ctx={args.ctx}, depth sweep. ms/tick is affine in depth:")
     print(f"# {'depth':>5} {'ms/tick':>8} {'tok/fwd':>8} {'tok/s':>7}")
     rows = []
+    # ONE engine, depth varied in place. A fresh engine per depth OOMs: the KV
+    # pool and captured graphs outlive shutdown() (which only joins the daemon
+    # thread), and each build re-quantizes the draft into new tensors. The graph
+    # is captured per (batch, chain width), so each depth is warmed before it is
+    # timed and the capture stays outside the window.
+    e = build_engine(cfg, model, be, num_blocks=1024, num_slots=4, max_batch=4,
+                     max_total_tokens=8192, draft=draft, spec_depth=max(DEPTHS))
     for d in DEPTHS:
-        # A fresh engine per depth: the decode graph is captured per (batch, chain
-        # width), so reusing one engine would time a capture inside the window.
-        # shutdown() only joins the daemon thread — drop the reference and empty
-        # the allocator too, or four 1024-block pools plus their graphs coexist.
-        e = build_engine(cfg, model, be, num_blocks=1024, num_slots=4, max_batch=4,
-                         max_total_tokens=8192, draft=draft, spec_depth=d)
-        measure(e, args.ctx, args.tokens)  # warm: JIT + graph capture
+        e._spec_depth = d
+        measure(e, args.ctx, args.tokens)  # warm: JIT + this width's graph capture
         ms, tpf = measure(e, args.ctx, args.tokens)
         rows.append((d, ms, tpf))
         print(f"{d:>5} {ms:>8.2f} {tpf:>8.2f} {1000 * tpf / ms:>7.1f}")
-        e.shutdown()
-        del e
-        torch.cuda.empty_cache()
+    e.shutdown()
 
     # Least squares on ms = a + b*depth. b is one draft forward, a is everything
     # else in the tick (the verify trunk forward + sampling + bookkeeping).
