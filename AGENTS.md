@@ -23,13 +23,14 @@ comment density rather than a style rulebook.
 
 ## Project shape
 
-`tilerl` is a uv-managed Python package for cross-platform **training and
-inference** of `Qwen3.8-27B` (NVFP4). One kernel source, four targets.
+`tilerl` is a uv-managed Python package that **serves and RL-trains**
+`Qwen3.8-27B` (NVFP4) on one Hopper card in one process. One kernel file tree;
+the CPU target is the test harness, sm90 is the perf target.
 
-- **ONE backend: TileLang.** One kernel source compiles for `cpu` / `cuda` /
-  `rocm` / `metal`. The **CPU target is the portable default and the CI/dev
-  path** — this machine has no GPU, so everything verified here runs on CPU.
-  GPU targets are pending-host bring-up.
+- **ONE backend: TileLang.** One kernel file tree; `cpu`, `metal` and CUDA
+  sm90 have executed it. The **CPU target is the test harness and the CI/dev
+  path** — every kernel has a CPU-executable twin so the parity gate runs on
+  this GPU-less machine. sm90 is the perf target and holds its own cells.
 - **torch is the tensor container only** (TileLang hard-depends on it).
   NO `torch.autograd`, NO `torch.optim` in framework code — training runs on
   our own reverse-mode tape.
@@ -64,9 +65,9 @@ TileLang or torch directly — they call backend ops. `torch` may appear only as
 the tensor container (`torch.Tensor` type). No `torch.autograd`, no
 `torch.optim`, anywhere in framework code.
 
-**Target-neutral kernels.** Block-parallel schedules only — no warp /
-warp-memory specifics — so every kernel compiles on CPU AND GPU from one
-source. GPU-tuned schedules are day-2 work; do not specialize early.
+**Every kernel has a CPU twin.** A new op lands in the CPU cell first, so the
+parity gate runs here; an sm90 schedule is a per-arch cell that overrides it,
+never the only implementation.
 
 **Every runtime change produces a bench entry.** A dated entry under
 `docs/experience/wins/` (or `errors/` on regression) — no entry, not shipped.
@@ -163,7 +164,7 @@ uv run ruff check                # lint
 uv run ruff format --check       # format check
 ```
 
-Target selection: `TILERL_TARGET=cpu|cuda|rocm|metal|auto` (default `auto`;
+Target selection: `TILERL_TARGET=cpu|cuda|metal|auto` (default `auto`;
 on this machine that resolves to `cpu`).
 
 Dependencies: `uv add <pkg>` / `uv add --dev <pkg>` — never `pip install`.

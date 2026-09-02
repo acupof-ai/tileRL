@@ -122,16 +122,12 @@ _SM90_KERNELS = {
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)
-# rocm gets the CPU cell, not an empty slot: the schedules are block-parallel
-# and target-neutral, so they compile for HIP from the same source. Untested —
-# no HIP host in this env (docs/support-matrix.md).
-_register("bf16", "rocm", _CPU_KERNELS)
 for _arch in ("sm100", "sm120"):
     _register("bf16", _arch, {})  # pending-remote slot
 
 
 def _arch_for(target: str) -> str:
-    """Arch tag for the matrix: cpu | sm90 | sm100 | ... | rocm | metal."""
+    """Arch tag for the matrix: cpu | sm90 | sm100 | ... | metal."""
     if target == "c":
         return "cpu"
     if target.startswith("cuda") and torch.cuda.is_available():
@@ -143,14 +139,14 @@ def _arch_for(target: str) -> str:
 def resolve_target() -> str:
     """Resolve the tilelang target string for this process.
 
-    ``TILERL_TARGET`` overrides; accepts the friendly names ``cpu|cuda|rocm|
-    metal|auto`` (cpu -> ``"c"``, the working CPU target; rocm -> ``"hip"``).
+    ``TILERL_TARGET`` overrides; accepts the friendly names ``cpu|cuda|metal|
+    auto`` (cpu -> ``"c"``, the working CPU target).
     ``auto`` (the default) maps to ``"cuda"`` when a CUDA device is visible and
     ``"c"`` otherwise — tilelang's own ``auto`` would pick metal on this Mac,
     which is not the dev/CI path.
     """
     target = os.environ.get("TILERL_TARGET", "auto").strip().lower()
-    aliases = {"cpu": "c", "rocm": "hip", "": "auto"}
+    aliases = {"cpu": "c", "": "auto"}
     target = aliases.get(target, target)
     if target == "auto":
         return "cuda" if torch.cuda.is_available() else "c"

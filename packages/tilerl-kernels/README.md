@@ -3,15 +3,15 @@
 The kernel layer of [tileRL](https://github.com/cklxx/tileRL): TileLang kernel
 sources plus the `Backend` seam that dispatches them.
 
-One kernel source compiles for `cpu` / `cuda` / `rocm` / `metal`. The CPU target
-is the portable default and the CI path; `Backend` resolves the target once and
-every kernel above it is written block-parallel, with no warp specifics, so the
-same source serves all four.
+One kernel file tree, three targets that have executed it: `cpu` (the CI and
+parity path — every kernel has a CPU-executable twin), `metal`, and CUDA sm90.
+`Backend` resolves the target once; a per-arch registry cell swaps the kernels a
+target needs its own schedule for (sm90 holds the fp4/fp8 tensor-core set).
 
 ```python
 from tilerl_kernels.backend import get_backend
 
-backend = get_backend()          # TILERL_TARGET=cpu|cuda|rocm|metal|auto
+backend = get_backend()          # TILERL_TARGET=cpu|cuda|metal|auto
 y = backend.linear(x, w)
 ```
 

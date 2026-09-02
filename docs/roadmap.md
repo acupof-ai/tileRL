@@ -1,78 +1,66 @@
 # Roadmap
 
-North star: one TileLang kernel source trains and serves Qwen3.8-27B (NVFP4)
-on cpu / cuda / rocm / metal. Phases are ordered by risk retired per unit
-work; each exits on a named, verifiable event — no calendar dates.
+North star: serve and RL-train Qwen3.x-27B (NVFP4) on one Hopper node in one
+process — the engine that samples is the model that trains, LoRA on the frozen
+fp4 base, so there is no weight sync between rollout and update. Phases are
+ordered by the risk each retires; each exits on a named, verifiable event.
 
-## Where we are (2026-08-24)
+## Where we are (2026-09-02)
 
 | Area | State |
 |---|---|
-| Backend | TileLang single backend; CPU target green in CI (ubuntu + macos), Metal green locally |
-| Model | Hybrid full-attn + GatedDeltaNet; loaders: bf16 HF, MLX-4bit, ModelOpt + official NVFP4, per-tensor FP8, AWQ-int4; fp4 pack/unpack; `num_layers` truncation |
-| KV | Paged blocks + hash prefix cache + GDN recurrent state; engine-level prefix hits |
-| Engine | Continuous batching, submit/poll, one forward per tick |
-| Training | Hand-written tape + AdamW; OPD loop; JSONL pretraining with checkpoints |
-| Tests | 64 hermetic (e2e, parity, gradcheck, kv, server, per-format loader) |
-| Serving | OpenAI-compatible server + SSE + chat UI |
+| Serving | H20 B=1 decode 92.4 tok/s (sglang bf16 54.2, Arle 84.5); B=8 0.8× sglang; prefill 0.4×; MMLU 76.3% |
+| Training | LoRA and Adafactor full fine-tune run on one card; GRPO and self-OPD exist; `--data` real prompts + GSM8K reward + `--eval-mmlu` gate shipped **pending-remote** |
+| Kernels | one TileLang tree; cpu (CI/parity), metal, sm90 executed it; 71% of kernel lines are sm90 schedules |
+| Tests | hermetic CPU suite on ubuntu + macos, every commit |
+| Adoption | 1 star, not on PyPI |
 
-Every checkpoint format the 27B family ships in has a hermetic loader test
-(bf16, MLX-4bit, NVFP4 ModelOpt + official, FP8, AWQ-int4); the remaining
-risk is the real 27B weights themselves, not the format handling.
+## P1 — training is real on the 27B
 
-## Phase 1 — 27B real-weight bring-up
+The differentiating claim is unproven until a run moves a number.
 
-The only thing between today and the target model is the checkpoint itself.
+- `tilerl train --model qwen38-27b --rl --data gsm8k.jsonl --group 8
+  --max-new-tokens 256 --eval-mmlu 200` (`scripts/gsm8k_jsonl.py` dumps the
+  data). LoRA rank 16, no thinking, one H20.
+- Exit: GSM8K reward rises from its step-0 value and holds; MMLU after ≥ MMLU
+  before within noise (200 questions ≈ ±3 pt); the curve in a wins entry.
+  Then self-OPD the same way, same gate.
 
-- Download Qwen3.8-27B (NVFP4) via `HF_ENDPOINT=https://hf-mirror.com`;
-  `TILERL_QWEN38_SOURCE` in config is the slot.
-- Load with `num_layers` truncation first (2–4 layers), then full 64 layers.
-  NVFP4 ≈ 14 GB — fits this Mac's unified memory; CPU forward is slow but
-  is the correctness path, Metal the perf path.
-- Exit: 27B generates coherent text on CPU and Metal; NVFP4 dequant has a
-  parity check against the torch-eager reference; bench entry for
-  prefill/decode on both targets.
+## P2 — same pod, same task, vs verl + sglang
 
-## Phase 2 — CUDA target on the pod
+- `scripts/rl_compare.sh`: seconds per RL step (rollout + update) at group 8 ×
+  256 tokens, then at 32K context; MMLU before/after on both arms.
+- Exit: the table exists, recorded like the serving comparison
+  (`docs/experience/2026-08-28-vs-sglang-h20.md`).
+- Verdict rule, decided now: if tileRL is not faster per step, the engine
+  stops being the product and `tilerl-kernels` (w4a8 NVFP4 on Hopper) goes
+  upstream as a quantization backend PR.
 
-- Needs a kubeconfig from the user (kubectl has no context today);
-  `Dockerfile` + `k8s/pod.yaml` + `scripts/pod.sh` are ready.
-- Run the full suite + bench under `TILERL_TARGET=cuda`. Same kernel source
-  as CPU — failures are tilelang bugs, fixed upstream via PR (authorized),
-  not worked around locally.
-- Exit: cuda suite green, bench numbers in a wins entry, support-matrix cuda
-  column filled with real results.
+## P3 — rollout decode at B≥32
 
-## Phase 3 — training on real weights
+RL time is rollout time, and rollout is a decode kernel at B≥32, not B=1.
 
-- OPD and pretrain currently run on tiny random weights. Run both on the
-  27B (few layers first): loss must decrease, tape gradcheck must pass on
-  the real architecture (every param gets a finite grad).
-- Replace torch-eager backwards with tilelang kernels where the bench says
-  it matters — each is tagged `# ponytail: torch-eager backward, tilelang
-  kernel when perf demands`; each replacement lands with the gradcheck gate.
-- Exit: one OPD run and one pretrain run on 27B weights with decreasing
-  loss; a bench entry for train step time.
+- Tensor-core decode GEMM from MX=8 to 32/64; recapture the decode graph and
+  drop prefix entries after each update instead of eager rollouts.
+- Exit: harness B=32 row ≥ 3× the B=8 aggregate; RL step time falls by the
+  rollout's share.
 
-## Phase 4 — serving scale (PD / AFD)
+## P4 — TP-8, then CP for 128K–256K
 
-Design only today (`docs/design-pd-afd.md`); the seams already exist (block
-tables, separate KV/GDN stores, layer-typed model).
+`docs/plan-training-rl.md` P3–P4: one KV head per card, a capturable
+all-reduce, ring attention + the GDN prefix scan. Exit conditions there.
 
-- PD disaggregation first: one KV+state handoff per request, engine seam is
-  role-agnostic. Missing: KV transport, router, D-side admission.
-- AFD after, only once a single engine is batch-limited: per-layer
-  activation transport + micro-batch pipelining.
-- Exit: a PD pair serves a request end to end; handoff cost benchmarked.
+## Parked (trigger-based)
 
-## Parked (trigger-based, not scheduled)
-
-- **GDN2** — clean-room implementable, license blocks copying. Trigger: a
-  GDN2 checkpoint appears in the target family. Assessment in
-  `docs/design-gdn2.md`.
-- **fp8 / sm100 / rocm cells** — registry slots exist; trigger: hardware in
-  hand.
-- **AFD** — trigger: single-engine batch saturation (Phase 4).
+- **Serve throughput at B≥8 and prefill vs sglang** — parked. That is
+  sglang's home turf and not what an RL runtime is priced on
+  (`docs/experience/2026-08-29-what-sota-would-require.md`).
+- **PD / AFD** — design only (`docs/design-pd-afd.md`); trigger: a single
+  engine is batch-limited.
+- **GDN2** — trigger: a GDN2 checkpoint in the target family
+  (`docs/design-gdn2.md`).
+- **fp8 / sm100 cells, ROCm** — trigger: hardware in hand. ROCm has no
+  registry cell until a HIP host runs the suite.
 
 ## Standing discipline
 
