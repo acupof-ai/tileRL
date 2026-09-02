@@ -197,15 +197,21 @@ def qwen36_27b() -> ModelConfig:
     )
 
 
-def tiny() -> ModelConfig:
+def tiny(max_position_embeddings: int = 512) -> ModelConfig:
     """CPU smoke-test config: 2 layers (idx 0 full-attn, idx 1 gated-delta).
 
     Small enough to forward on the CPU target in seconds; keeps every
     architectural feature of the 27B (gated q_proj, GDN conv1d, q/k-norm,
     partial-RoPE-capable) except fp4 (off by default).
+
+    ``max_position_embeddings`` is a parameter because one real Claude Code
+    turn does not fit in 512: measured 2026-09-02, a single Messages request
+    carries ~5,310 tokens with 24 of its 28 tools disabled, nearly all of it
+    harness preamble rather than task. `tiny-agent` is this config at 8192 --
+    the cost is the KV pool, not parameters, since hidden is 64 and depth is 2.
     """
     return ModelConfig(
-        name="tiny",
+        name="tiny" if max_position_embeddings == 512 else "tiny-agent",
         hidden_size=64,
         intermediate_size=128,
         num_layers=2,
@@ -215,7 +221,7 @@ def tiny() -> ModelConfig:
         vocab_size=320,
         full_attn_layers=(0,),
         rope_theta=1e7,
-        max_position_embeddings=512,
+        max_position_embeddings=max_position_embeddings,
         rms_eps=1e-6,
         tie_word_embeddings=True,
         fp4=False,
