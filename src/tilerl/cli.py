@@ -94,101 +94,116 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 
 def cmd_train(args: argparse.Namespace) -> None:
+    if args.rl or args.opd:
+        return _train_adapters(args)
+    _train_full(args)
+
+
+def _jsonl(path: str | None) -> list[dict]:
+    return [json.loads(ln) for ln in Path(path).read_text().splitlines() if ln.strip()] if path else []
+
+
+def _train_full(args: argparse.Namespace) -> None:
+    """Full-parameter SFT on random tokens: Adafactor or ISO, streamed updates."""
     import torch
 
     from . import train as train_mod
-    from .autograd import Adafactor, AdamW, Tape, cosine_warmup
+    from .autograd import Adafactor, Tape, cosine_warmup
+    from .model import drop_quantized
     from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
-    # LoRA on a frozen base needs no bf16 master (~27 GB on the 27B); full SFT does.
-    adapters_only = args.rl or args.opd
-    cfg, model = _build_model(args.model, seed=args.seed, keep_master=not adapters_only)
-    if not adapters_only:
-        from .model import drop_quantized
-
-        drop_quantized(model)
+    cfg, model = _build_model(args.model, seed=args.seed, keep_master=True)
+    drop_quantized(model)
     # Adam's m+v on the 27B is 200.4 GiB; Adafactor is 0.03 GiB and streams its updates.
-    optimizer = (
-        AdamW(lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1) if adapters_only
-        else Adafactor(lr=1e-2, weight_decay=0.1)
-    )
-    if args.optim == "iso" and not adapters_only:
+    optimizer = Adafactor(lr=1e-2, weight_decay=0.1)
+    if args.optim == "iso":
         from .iso import ISO
 
         optimizer = ISO(optimizer)
     gen = torch.Generator().manual_seed(args.seed)
+    print(f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
+          f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}")
+    for step in range(args.steps):
+        # ponytail: random-token batch; a real corpus plugs in here without touching train_step.
+        input_ids = torch.randint(0, cfg.vocab_size, (2, 64), generator=gen)
+        optimizer.lr = cosine_warmup(step, args.steps, 5, 1e-3)
+        loss = train_mod.train_step(model, input_ids, backend, optimizer, Tape())
+        print(f"step {step + 1:4d}/{args.steps}  loss {loss:.4f}")
+
+
+def _train_adapters(args: argparse.Namespace) -> None:
+    """GRPO or OPD: LoRA on the frozen base, the engine samples, the ledger gates."""
+    import torch
+
+    from . import train as train_mod
+    from .autograd import AdamW
+    from .engine import build_engine
+    from .eval import gsm8k_accuracy, mmlu_accuracy
+    from .kv_cache import NoPrefixStore
+    from .ledger import commit, file_hash, new_manifest, read_manifest, runs_root
+    from .model import add_lora
+    from .prompt import render_chat, sampling
+    from .tokenizer import get_tokenizer
+    from tilerl_kernels.backend import get_backend
+
+    real = args.model == "qwen38-27b"
     log = (lambda *a: None) if args.json else print
+    tok = get_tokenizer(_QWEN38_SOURCE if real else None)
+    rows, eval_rows = _jsonl(args.data), _jsonl(args.eval_gsm8k)[: args.eval_n]
+    thinking = (args.max_think_tokens > 0) if real else None
+    params = sampling(tok, thinking, args.max_new_tokens, temperature=args.temperature,
+                      max_think_tokens=args.max_think_tokens, seed=args.seed)
 
-    log(
-        f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
-        f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}"
-    )
-    if adapters_only:
-        from .engine import SamplingParams
-        from .eval import gsm8k_accuracy, mmlu_accuracy
-        from .ledger import commit, file_hash, new_manifest, read_manifest, runs_root
-        from .tokenizer import SAMPLING, get_tokenizer, render_chat
+    # Same inputs = same run: a finished one is returned instead of retrained.
+    manifest = new_manifest("train", {
+        "model": args.model, "recipe": args.recipe, "source": _QWEN38_SOURCE if real else "tiny",
+        "commit": commit(), "algo": "grpo" if args.rl else "opd",
+        "data": file_hash(args.data) if args.data else None, "steps": args.steps,
+        "group": args.group, "max_new_tokens": args.max_new_tokens,
+        "temperature": params.temperature, "max_think_tokens": args.max_think_tokens,
+        "lr": args.lr, "lora_rank": args.lora_rank, "seed": args.seed, "eval_mmlu": args.eval_mmlu,
+        "eval_gsm8k": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
+        "eval_n": args.eval_n})
+    prev = read_manifest(runs_root(), manifest["id"])
+    if prev and prev["finished"] and not args.force:
+        log(f"run {prev['id']} already finished; --force reruns")
+        return _finish(prev, args.json)
+    manifest["metrics"] = dict.fromkeys((
+        "reward_first", "reward_last", "ce_last", "secs_per_step_median", "tied_group_fraction",
+        "mmlu_before", "mmlu_after", "gsm8k_before", "gsm8k_after"))
 
-        tok = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
-        rows = ([json.loads(ln) for ln in Path(args.data).read_text().splitlines() if ln.strip()]
-                if args.data else [])
-        real = args.model == "qwen38-27b"
-        thinking = (args.think_budget > 0) if real else None
-        prompts = [tok.encode(render_chat([("user", r["prompt"])], thinking)) for r in rows] or [
-            torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist() for _ in range(8)
-        ]
-        end_think = tuple(tok.encode("</think>\n\n")) if thinking else ()
-        gen_cfg = dict(SAMPLING[thinking]) if real else {"temperature": 1.0}
-        if args.temperature is not None:
-            gen_cfg["temperature"] = args.temperature
-        sampling = SamplingParams(
-            max_new_tokens=args.max_new_tokens, **gen_cfg,
-            stop_token_ids=tok.stop_token_ids,
-            thinking_budget=args.think_budget if thinking else None, end_think_ids=end_think)
+    backend = get_backend()
+    # LoRA on a frozen base needs no bf16 master (~27 GB on the 27B).
+    cfg, model = _build_model(args.model, seed=args.seed, keep_master=False)
+    log(f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
+        f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}")
+    gen = torch.Generator().manual_seed(args.seed)
+    prompts = [tok.encode(render_chat([("user", r["prompt"])], thinking)) for r in rows] or [
+        torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist() for _ in range(8)]
+    draft = None
+    if args.opd and args.draft:
+        from .spec import load_draft
 
-        # Same inputs = same run: a finished one is returned instead of retrained.
-        inputs = {"model": args.model, "recipe": args.recipe,
-                  "source": _QWEN38_SOURCE if args.model == "qwen38-27b" else "tiny",
-                  "commit": commit(), "algo": "grpo" if args.rl else "opd",
-                  "data": file_hash(args.data) if args.data else None, "steps": args.steps,
-                  "group": args.group, "max_new_tokens": args.max_new_tokens,
-                  "temperature": gen_cfg["temperature"], "think_budget": args.think_budget,
-                  "lr": args.lr, "lora_rank": args.lora_rank, "seed": args.seed,
-                  "eval_mmlu": args.eval_mmlu,
-                  "eval_gsm8k": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
-                  "eval_n": args.eval_n}
-        manifest = new_manifest("train", inputs)
-        prev = read_manifest(runs_root(), manifest["id"])
-        if prev and prev["finished"] and not args.force:
-            log(f"run {prev['id']} already finished; --force reruns")
-            return _finish(prev, args.json)
-        manifest["metrics"] = dict.fromkeys(("reward_first", "reward_last", "ce_last",
-                                             "secs_per_step_median", "tied_group_fraction", "mmlu_before", "mmlu_after",
-                                             "gsm8k_before", "gsm8k_after"))
-        eval_rows = ([json.loads(ln) for ln in Path(args.eval_gsm8k).read_text().splitlines()
-                      if ln.strip()][: args.eval_n] if args.eval_gsm8k else [])
+        draft = load_draft(model, args.draft)
+    engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8, draft=draft,
+                          spec_depth=args.depth, decode_graph=False, prefix_store=NoPrefixStore())
+    # After build_engine: it materializes the params an adapter must point at.
+    trainable = add_lora(model, rank=args.lora_rank)
+    optimizer = AdamW(lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
 
-        def evals(engine, tag):
-            if args.eval_mmlu:
-                c, n = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=8)
-                manifest["metrics"][f"mmlu_{tag}"] = c / n
-                log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}%")
-            if eval_rows:
-                c, n = gsm8k_accuracy(engine, tok, eval_rows, sampling, concurrency=8,
-                                      thinking=thinking)
-                manifest["metrics"][f"gsm8k_{tag}"] = c
-                log(f"gsm8k greedy {c}/{n} = {100 * c / n:.1f}%")
+    def evals(tag):
+        if args.eval_mmlu:
+            c, n = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=8)
+            manifest["metrics"][f"mmlu_{tag}"] = c / n
+            log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}%")
+        if eval_rows:
+            c, n = gsm8k_accuracy(engine, tok, eval_rows, params, concurrency=8, thinking=thinking)
+            manifest["metrics"][f"gsm8k_{tag}"] = c
+            log(f"gsm8k greedy {c}/{n} = {100 * c / n:.1f}%")
 
+    evals("before")  # LoRA B is zero at init: the base model's score
     if args.rl:
-        from .engine import build_engine
-        from .model import add_lora
-
-        from .kv_cache import NoPrefixStore
-
-        engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8,
-                              decode_graph=False, prefix_store=NoPrefixStore())
-        trainable = add_lora(model, rank=args.lora_rank)
         if rows:
             gold = {tuple(p): r["answer"] for p, r in zip(prompts, rows)}
 
@@ -201,48 +216,24 @@ def cmd_train(args: argparse.Namespace) -> None:
             def reward(prompt, completion):
                 return sum(1 for t in completion if t < half) / max(len(completion), 1)
 
-        optimizer.lr = args.lr
-        evals(engine, "before")  # LoRA B is zero at init: the base model's score
-        hist = train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend,
-                                   optimizer, group=args.group, sampling=sampling,
-                                   seed=args.seed, trainable=trainable)
+        hist = train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
+                                   group=args.group, sampling=params, seed=args.seed,
+                                   trainable=trainable)
         for i, (r, ce, secs, tied) in enumerate(hist):
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
                 f"tied {tied:.2f}  {secs:.1f}s")
-        evals(engine, "after")
         manifest["metrics"].update(
             reward_first=hist[0][0], reward_last=hist[-1][0], ce_last=hist[-1][1],
             secs_per_step_median=statistics.median(h[2] for h in hist),
             tied_group_fraction=statistics.mean(h[3] for h in hist))
-        return _finish(manifest, args.json)
-    if args.opd:
-        from .engine import build_engine
-        from .model import add_lora
-        from .spec import load_draft
-
-        draft = load_draft(model, args.draft) if args.draft else None
-        # Engine first: build_engine materializes the params; an adapter added
-        # before that points at an object the forward no longer reads.
-        from .kv_cache import NoPrefixStore
-
-        teacher = build_engine(cfg, model, backend, num_blocks=512, num_slots=8,
-                               draft=draft, spec_depth=args.depth,
-                               decode_graph=False, prefix_store=NoPrefixStore())
-        trainable = add_lora(model, rank=args.lora_rank)
-        evals(teacher, "before")
-        losses = train_mod.opd_loop(teacher, model, prompts, args.steps, backend, optimizer,
-                                    seed=args.seed, trainable=trainable, sampling=sampling)
+    else:
+        losses = train_mod.opd_loop(engine, model, prompts, args.steps, backend, optimizer,
+                                    seed=args.seed, trainable=trainable, sampling=params)
         for i, loss in enumerate(losses):
             log(f"step {i + 1:4d}/{args.steps}  loss {loss:.4f}")
-        evals(teacher, "after")
         manifest["metrics"]["ce_last"] = losses[-1]
-        return _finish(manifest, args.json)
-    for step in range(args.steps):
-        # ponytail: random-token batch; a real corpus plugs in here without touching train_step.
-        input_ids = torch.randint(0, cfg.vocab_size, (2, 64), generator=gen)
-        optimizer.lr = cosine_warmup(step, args.steps, 5, 1e-3)
-        loss = train_mod.train_step(model, input_ids, backend, optimizer, Tape())
-        print(f"step {step + 1:4d}/{args.steps}  loss {loss:.4f}")
+    evals("after")
+    return _finish(manifest, args.json)
 
 
 def _finish(m: dict, as_json: bool) -> None:
@@ -448,8 +439,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          "reward on the last number (scripts/gsm8k_jsonl.py)")
     p_train.add_argument("--temperature", type=float, default=None,
                          help="rollout temperature (default: the model card's, per thinking mode)")
-    p_train.add_argument("--think-budget", type=int, default=0,
-                         help="tokens the 27B may spend in <think> per rollout; 0 = none")
+    p_train.add_argument("--max-think-tokens", type=int, default=0,
+                         help="cap on <think> per rollout, forced closed past it; 0 = thinking off")
     p_train.add_argument("--eval-mmlu", type=int, default=0,
                          help="score N MMLU questions before and after (needs `datasets`)")
     p_train.add_argument("--eval-gsm8k", help="JSONL {prompt, answer}: greedy exact-match "

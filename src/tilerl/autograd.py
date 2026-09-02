@@ -368,7 +368,6 @@ class AdamW:
         self._step += 1
 
     def step_one(self, p: torch.Tensor, g: torch.Tensor, key: Any = None) -> None:
-        # ``key``: state id when ``p`` is a staging buffer (ISO's offloaded frames).
         b1, b2 = self.betas
         bc1 = 1.0 - b1**self._step
         bc2 = 1.0 - b2**self._step

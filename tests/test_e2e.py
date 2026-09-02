@@ -730,7 +730,7 @@ def test_opd_ema_self_teacher_shares_the_model():
     assert moved and moved <= set(trainable)
 
 
-def test_thinking_budget_forces_the_block_closed():
+def test_max_think_tokens_forces_the_block_closed():
     """After the budget the engine emits end_think_ids, then sampling resumes."""
     cfg = tiny()
     engine = build_engine(cfg, build_random(cfg, seed=11), get_backend(), num_blocks=8,
@@ -740,7 +740,7 @@ def test_thinking_budget_forces_the_block_closed():
         wid = engine.submit(
             [3, 4, 5],
             SamplingParams(temperature=0.0, max_new_tokens=8, seed=0,
-                           thinking_budget=2, end_think_ids=end),
+                           max_think_tokens=2, end_think_ids=end),
         )
         out = None
         for _ in range(200):

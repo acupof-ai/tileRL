@@ -96,9 +96,8 @@ class ISO:
         staged = self._offloaded(p)
         uu, ss, vv = (t.to(p.device, copy=True) for t in (u, s, v)) if staged else (u, s, v)
         gu, gv = frame_grads(g.to(uu.dtype), uu, ss, vv)
-        # State is keyed per matrix, not per staging buffer.
-        self.base.step_one(uu, gu, key=(id(p), "u"))
-        self.base.step_one(vv, gv, key=(id(p), "v"))
+        self.base.step_one(uu, gu, key=id(u))  # state lives with the frame, not the staging copy
+        self.base.step_one(vv, gv, key=id(v))
         uu.copy_(polar(uu, self.polar_iters))
         vv.copy_(polar(vv, self.polar_iters))
         p.copy_(((uu * ss) @ vv.T).to(p.dtype))
