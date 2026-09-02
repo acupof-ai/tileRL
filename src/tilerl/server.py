@@ -24,7 +24,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .tokenizer import ByteTokenizer, Tokenizer, get_tokenizer, render_chat  # noqa: F401
+from .tokenizer import SAMPLING, ByteTokenizer, Tokenizer, get_tokenizer, render_chat  # noqa: F401
 
 __all__ = ["ByteTokenizer", "get_tokenizer", "create_app"]
 
@@ -117,9 +117,14 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         input_ids = tokenizer.encode(prompt)
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
+        # The card's values per thinking mode, not 0.0/1.0: a client that sends
+        # no temperature was getting greedy decoding, which is off-distribution
+        # for this checkpoint and makes a sampled group collapse to one draw.
+        thinking = _THINK_BUDGET.get((req.reasoning_effort or "").lower()) != 0
         params = SamplingParams(
-            temperature=req.temperature if req.temperature is not None else 0.0,
-            top_p=req.top_p if req.top_p is not None else 1.0,
+            **SAMPLING[thinking]
+            | {k: v for k in ("temperature", "top_p")
+               if (v := getattr(req, k, None)) is not None},
             max_new_tokens=req.max_tokens if req.max_tokens is not None else 512,
             seed=req.seed if req.seed is not None else secrets.randbits(31),
             stop_token_ids=tuple(getattr(tokenizer, "stop_token_ids", ())),
