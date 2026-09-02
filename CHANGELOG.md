@@ -4,6 +4,300 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-02 — accept-or-reject verdict: block-parallel drafting is worth 1.58-1.83x, and it is REOPENED
+
+- **Drafting is 55-68% of a speculative tick**, measured by sweeping depth and
+  taking the slope (`scripts/ab_draft_depth.py`) — ms/tick is affine in depth, so
+  no probe goes near the captured graph. At ctx 1024 depth 3: 66.76 ms/tick, of
+  which 45.4 is drafting. The range is honest, not sloppy: a single fit says 68%
+  but its residuals are structured, because verify width is ALSO a staircase
+  (width = depth+1, rungs {1,2,4,8}); restricting to depths that land on a rung
+  says 55%.
+- **This reopens the DSpark/DFlash question and retracts the reason it was
+  closed.** The earlier rejection said "its selling point is draft accuracy, which
+  96.8% top-1 says is not the bottleneck" — that answered the wrong question. The
+  head's property is that one forward emits the whole block; ours runs D
+  sequential forwards. Ceiling at the same 3.34 tok/forward: 50.1 -> **79-92
+  tok/s**. Break-even is 1.83 tok/forward, so a parallel head could lose nearly
+  half our acceptance and still pay.
+- **A cheaper lever attacks the same term first.** The draft is launch-bound —
+  15.13 ms against the head's 0.25 ms bandwidth floor, ~60x — and `_draft_step`
+  is still called after `_run_decode_graph` returns, so it pays the eager price D
+  times per tick where graph capture was worth 2.66x on the trunk. The blocker is
+  two `.tolist()` calls per depth step (`engine.py:1100`, `:1102`) whose result is
+  copied straight back to the device; everything else in the loop is already
+  device-resident.
+  [wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md](docs/experience/wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md)
+- Two instruments lied before this number came out, both recorded: a
+  `synchronize()` inside the captured graph read 0.4 tok/s where the config serves
+  48.4, and a fresh engine per depth OOMs because `shutdown()` only joins the
+  daemon thread.
+  [errors/2026-09-02-synchronize-inside-a-captured-graph.md](docs/experience/errors/2026-09-02-synchronize-inside-a-captured-graph.md)
+
+## 2026-09-02 — default flip: f16 block scales, dense 35.3 -> 37.6 tok/s
+
+- The NVFP4 scale plane is one f32 per 32 weights — **3.20 GB of the 16.04 GB a
+  dense token streams**. Storing it f16 is the last structural cut available (the
+  weights are already 4-bit) and moves the roofline 56.1 -> 62.3 tok/s.
+- Dense decode **+6.5% to +7.5% at every context**: 4096 ctx 35.3 -> **37.6**,
+  1024 ctx 37.7 -> 40.5, 32 ctx 38.7 -> 41.6. Bytes predicted 1.111x, measured
+  1.065x — 60% of the saving converted, consistent with the GEMV at 84% of its own
+  byte roofline. Device memory 31.6 -> 29.0 GB confirms the plane actually shrank.
+- Representability measured on the real checkpoint first (252M values): worst
+  round-trip **3.24e-04** relative, 31x inside the 1e-2 gate. bf16 fits too and
+  buys nothing extra; **e4m3 is rejected** at 3.06e-01 despite halving the plane
+  again.
+- **This line was rejected once on a bad metric.** The earlier "relerr 2.0-21.3"
+  came from `clamp(min=1e-3)` in the denominator: it floors the divisor so a
+  near-zero output row fakes a huge ratio, and as a `max()` over N rows it grows
+  with N by construction (0.21 at N=1024, 21.8 at 248320). The real error is
+  1.88e-04, flat in N. `benchkit.relerr` had the correct form all along.
+  [wins/2026-09-02-f16-block-scales.md](docs/experience/wins/2026-09-02-f16-block-scales.md) ·
+  [errors/2026-09-02-clamped-relerr-scales-with-n.md](docs/experience/errors/2026-09-02-clamped-relerr-scales-with-n.md)
+- The sm70 GEMV ladder collapsed from 9 registry entries to **1**: M/xh/sh are
+  factory args and `Backend._kernel` already keys the compile cache on them, the
+  way the sm90 GEMV's row count is passed. Adding f16 scales as 5 more
+  name-mangled entries would have doubled the family again.
+
+## 2026-09-02 — accept-or-reject verdict: top-k path search REJECTED, DSpark REJECTED
+
+- Measured the prize before pricing the work. `scripts/probe_draft_topk.py`
+  ranks each drafted token inside the trunk's own ordering: top-1 **96.8%**,
+  top-16 **97.1%** over 592 verified positions. A **0.3-point** gap is the whole
+  ceiling for any path search — the draft is either right or wrong past rank 16.
+- Top-k path search over a draft block is a real published mechanism (DDTree,
+  Ringel & Romano: optimal trees use top-K per depth, B nodes = B verify rows).
+  It dies on THIS trunk for three independent reasons: 48 of 64 layers are
+  gated-delta, and a recurrent scan has no attention matrix to mask (72 MiB of
+  state per tree node, against DDTree's 256-node budgets); our drafter is
+  autoregressive, so the free path space does not exist; and rung 8 is a hard
+  ceiling (M>8 falls to 127 us/row vs 22, so width 9 costs 14.5x width 8).
+  [errors/2026-09-02-topk-path-search-needs-a-non-recurrent-trunk.md](docs/experience/errors/2026-09-02-topk-path-search-needs-a-non-recurrent-trunk.md)
+- The RadixArk DSpark head (3.7 GB, 5 layers, WITH a confidence head) is a
+  different architecture, not a checkpoint swap: dual-source KV injection (q from
+  mask tokens, k/v from `[hidden_norm(fc(5 trunk taps)) ++ noise]`), 5
+  mid-network taps into a graph-captured static buffer, non-causal attention with
+  per-row visibility windows our hard-causal sm70 kernel cannot express. Its
+  selling point over our MTP head is draft accuracy, which the 96.8% above says
+  is not the bottleneck.
+- Fixed a real defect the review surfaced: `_pad2d` CROPPED on a negative pad
+  (`F.pad` accepts negatives), so a [5120, 12800] weight silently became
+  [5120, 5120]. Now raises.
+
+## 2026-09-02 — phase exit: KV pool dtype, dense +18%, spec peak 50.8 tok/s
+
+- A per-kernel profile of the decode window found **4.71 ms/token (14%) in 32
+  elementwise calls** — 2 per full-attn layer: the KV pool is bf16 and the sm70
+  attention kernel is f32, so every layer of every token cast the WHOLE plane
+  (all 1024 blocks, not the live ones — hence flat in context). Allocating the
+  pool at `backend.io` removes it; +1 GB device memory. The identical fix
+  already existed on `LinearStatePool` and the KV pool never got it.
+- Dense **30.0 -> 35.3 tok/s at 4096 ctx**, ~18% at every context. Elementwise
+  7.69 -> 2.75 ms/token. Spec d3 peaks at **50.8 tok/s at 1024 ctx**; 4096 ctx
+  is 40.3, **2.41x** the 16.7 it read at the start of the day.
+- **The roofline was wrong.** ~~The checkpoint measures 20.35 GB, not the 14 GB
+  cited everywhere until now; the real bound is 44.2 tok/s.~~ Superseded the same
+  day: 20.35 GB is the checkpoint, but a decode token streams **16.04 GB** (trunk
+  15.24 + lm_head 0.80 — `embed_tokens` 2.54 and the visual tower 0.92 are
+  resident, not streamed). The bound is **56.1 tok/s**, so dense 35.3 is **63% of
+  roofline**. Speculation above it is expected — one weight read, several tokens.
+  `errors/2026-09-02-roofline-is-the-streamed-subset.md`.
+- **`_draft_step` was reading hidden it did not have.** A chunked prefill
+  overwrites `r.hidden` per chunk while `draft_pos` stays behind them: a 1024
+  prompt at 512/chunk asked for 1535 positions and held 511, and `F.pad` took
+  the truncation silently. Every speculative number measured before this fix —
+  including yesterday's 46.5 peak — used misaligned hidden. tok/fwd is
+  unchanged by the fix, so it cost correctness, not throughput.
+  [wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi.md](docs/experience/wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi.md)
+
+## 2026-09-01 — phase exit: long-context decode fixed, 4096 ctx 17.4 -> 30.0 tok/s
+
+- Decode fit `ms/tok = 31.9 + 6.20*(ctx/1K)` against a 0.07 ms/1K roofline —
+  **83x off**. The slope was **thread redundancy**: `paged_attention_split`
+  computed its dot as `for d in T.serial(D)`, never distributed, so all 64
+  threads in a block ran the same dependent chain. Diagnostic signature is a
+  thread sweep where cost RISES with thread count (4K ctx: 32t 780us -> 256t
+  4066us); real work is flat or falling.
+- Fix stages `block_N=16` positions into fragments and reduces with
+  `T.reduce_sum`, KVSPLIT 16 -> 32. Kernel 6.3x faster at 4096 and, more to the
+  point, flat from 512 to 4096 (157 -> 163 us). Parity vs a torch reference
+  holds at relerr <= 5.3e-05, S=1 and S=4.
+- Dense decode **17.4 -> 30.0 tok/s at 4096 ctx (1.72x)**; slope 6.20 -> 0.59
+  ms/1K (10.5x); decay from 32 to 4096 ctx now 7%, was 44%.
+- **Speculation gains more than dense does**: d3 at 4096 ctx **16.7 -> 37.0
+  tok/s (2.22x)**, 512 37.7 -> 44.8, 1024 34.5 -> 46.5, 2048 24.4 -> 40.8. It
+  had been a net LOSS at long context (16.7 against 17.4 dense) because a
+  verify forward multiplies the serial attention cost by the chain width; with
+  the redundancy gone it is a 1.23x win over dense at 4096. tok/fwd holds at
+  2.9-3.3 across the range, so acceptance never degraded — attention was eating
+  the gain. Peak is now **46.5 tok/s at 1024 ctx**.
+- The split-KV rewrite that introduced this shipped on end-to-end tok/s with no
+  per-kernel timing, and the defect survived three later measurements.
+  [wins/2026-09-01-sm70-attention-thread-redundancy.md](docs/experience/wins/2026-09-01-sm70-attention-thread-redundancy.md)
+
+## 2026-09-01 — default flip: spec depth 2 -> 3; speculation wins on code, breaks even on chat
+
+- Realistic workloads against a dense baseline (`scripts/bench_workloads.py`),
+  the counting task kept only as a control: coding **32.6 -> 43.4 tok/s**
+  (1.33x), dialogue 31.9 -> 32.0, thinking 32.0 -> 30.2, counting 32.7 -> 52.7.
+  Speculation is a real win on code and a wash on conversation.
+- **The 100% acceptance reported this morning was an artifact.** `verify_lens`
+  truncates each chain on the draft's own confidence before the counter runs
+  (engine.py:1068 -> :1074), and zero-keep ticks vanish from both counters
+  (engine.py:795), so accepted/drafted scores the truncation policy, not the
+  head. The bench now reports tokens per trunk forward and no ratio.
+- **Depth is a staircase, not a line.** Verify width is 1+depth and the sm70
+  GEMV ladder serves 1/2/4/8 rows, rounding up: depth 4 buys 8 rows to use 5
+  and measured 31.5 tok/s on coding — worse than not speculating. Depth 3 is
+  the deepest that fills rung 4. `--depth` and `spec_depth` defaults moved onto
+  the ladder; `spec.LADDER_WIDTHS` plus an sm70 warning keeps them there.
+  [errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md](docs/experience/errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md)
+- Long-context rows in that table are NOT decode measurements: a 4K prompt runs
+  8 chunked-prefill ticks and speculation is off on every mixed tick, which a
+  lo=32 two-point slope cannot cancel. Long-context decode remains unmeasured.
+
+## 2026-09-01 — accept-or-reject verdict: speculation ACCEPTED, 52.7 tok/s at 31 ctx
+
+- depth 3 vs dense B=1: **32.7 -> 52.7 tok/s** at 31 ctx (1.61x). 52.7 is 82%
+  of the 64 tok/s weight roofline. SUPERSEDED IN PART by the entry above: this
+  is the counting task, whose near-zero entropy makes it the best case, not a
+  representative one; and the "100% acceptance / 1.29x at 1K" claimed here were
+  both artifacts (a filtered denominator, and a slope contaminated by chunked
+  prefill).
+- Reverses this morning's rejection. The premise it failed on — a verify row
+  costing more than a decoded token — was fixed by the packed-f16 GEMV below.
+- The "1.3 tok/s" that briefly said otherwise was a measurement artifact:
+  `bench_b1_decode.py` warmed up to `--lo`, which at depth 3 captures only the
+  width-1 graph; the other widths then captured inside the timed lo point
+  (2589/906/731 ms on ticks 1-3) and inverted the slope. Warmup now runs to
+  `--hi`. Per-tick timing was flat at ~78 ms out to 317 tokens throughout.
+  [errors/2026-09-01-spec-warmup-one-width.md](docs/experience/errors/2026-09-01-spec-warmup-one-width.md)
+
+## 2026-09-01 — phase exit: packed-f16 X breaks the GEMV's per-row floor; dense B=1 25.8 -> 32.7 tok/s
+
+- The "127 us/row flat, issue-bound" ceiling was X, not the hardware. X is
+  re-read by every block (0.71 GB = 78% of the M=8 time) and converted f32->f16
+  inside the tile loop (32 of ~49 per-row instructions). Packing X once at the
+  dispatch site removes both.
+- Per-row cost stops being flat: M=8 127.5 -> 34.0 us/row at 17408x5120, M=1
+  128.1 -> 88.2. **Bit-exact** (relerr 0) — same rounding, done once. Parity
+  through the dispatch at M=1..8: worst 4.93e-04.
+- **A verify row now costs 10.7 ms against a 30.9 ms dense token** (was 63 vs
+  40.9). Verification is cheaper than decoding for the first time on this card.
+- Dense B=1 through the server: 25.8 -> **32.7 tok/s** at 31 ctx, 23.1 ->
+  **27.4** at 1K. The f32 rungs have no caller left and are deleted.
+- Speculation still OFF, but the blocker moved: `--depth 3` serves 1.3 tok/s
+  and `prof_spec_tick` puts **79% of the wall in `_draft_step`** (371 ms/step
+  vs 4.98 in isolation). The kernel economics are fixed; the draft path is not.
+  [wins/2026-09-01-sm70-gemv-packed-x-f16.md](docs/experience/wins/2026-09-01-sm70-gemv-packed-x-f16.md)
+
+## 2026-09-01 — phase exit: verify replay W=2 271 -> 78 ms (M ladder); speculation still rejected
+
+- `linear_fp4_gemv_sm70_m` has no weight reuse: 127 us/ROW flat from M=1 to
+  M=16. ncu shows why — 255 regs/thread, 12.2% occupancy, DRAM 6.8% at 42% SM.
+  The tile IS reused (88% l1 hit); the kernel was issue-bound all along.
+- Dispatch now rounds M up a ladder (M=2/4/8) instead of padding everything to
+  8: W=2 271 -> 78.4 ms (3.5x), W=4 271.7 -> 146.8 (1.85x). Helps B=2..4
+  serving too. Parity worst 1.40e-03 at the real projections.
+- Speculation stays OFF: one verify row costs ~63 ms against a 40.9 ms dense
+  tick, so verifying a token is dearer than decoding it. depth 1 = 19.4 tok/s
+  vs dense 24.4.
+  [wins/2026-09-01-sm70-gemv-m-ladder.md](docs/experience/wins/2026-09-01-sm70-gemv-m-ladder.md)
+
+## 2026-09-01 — accept-or-reject verdict: the GEMV is occupancy-bound at 255 regs, not shape-broken
+
+- Supersedes all three of 2026-08-31's verdicts. Per-kernel profiling put 252 of
+  the 271 ms verify tick in `linear_fp4_gemv_sm70_m` (507.5 µs/call vs the M=1
+  kernel's 64.5); GDN was 1.9-2.9 ms and attention 1.7 ms.
+- ncu then withdrew the "reuse fails at 27B shapes" reading: duration tracks
+  instructions tracks grid (3.3-3.6×) and per-block efficiency is identical at
+  both shapes. The 1.65× vs 7.5× ratio was a slow M=1 baseline at 4864, not a
+  broken M=8. The real limiter is **255 registers/thread and 12.2% occupancy at
+  every shape**, with DRAM at 6.8% — starved of parallelism, not bytes.
+  [errors/2026-08-31-m8-gemv-occupancy-not-reuse.md](docs/experience/errors/2026-08-31-m8-gemv-occupancy-not-reuse.md)
+
+## 2026-08-31 — accept-or-reject verdict: speculation REJECTED on sm70, blocked on the GDN state path
+
+- Corrects the earlier "draft outside the graph" verdict. Pure graph replay is
+  39 ms at W=1 but 266/267 ms at W=3/W=4 — **flat in W**, so W>1 is a path
+  switch, not a scaling term. `backend.py:917` routes `q.shape[1] > 1` to
+  `gdn_chunk_fused`, and `gdn_decode` is sm90-only, so all 48 GDN layers take
+  `state_gather` → kernel → `state_scatter`: 3 MiB out + 3 MiB back per layer of
+  torch advanced indexing, 4.73 ms/layer. W=1 pays it too, which is why 39 ms is
+  already 2.5× the 15.6 ms roofline.
+- Shipped on the way: split-KV attention covers S>1 (9.5× at S=4/n=1024), and the
+  draft head is fp4 on sm70 (4.98 ms/step vs 120.91 dense, 24×).
+  [errors/2026-08-31-spec-blocked-on-gdn-state-path.md](docs/experience/errors/2026-08-31-spec-blocked-on-gdn-state-path.md)
+
+## 2026-08-31 — accept-or-reject verdict: MTP speculation REJECTED for now (draft step is outside the graph)
+
+- The checkpoint's MTP head loads and is good — 62% top-1 agreement with the
+  trunk, 97-99% accept, 5.33 tokens committed per forward. But depth 6 measures
+  3.1 tok/s vs 25.8 dense.
+- `prof_draft_step.py`: a 1-layer 456 M head costs 120.91 ms/step eager, as much
+  as the whole 64-layer trunk (103.58 eager / 39 captured). Both are launch-bound
+  at M=1; the trunk hides it behind graph capture, `_draft_step` does not.
+  Capturing the draft step projects depth 6 at 62.7 tok/s.
+- `serve --draft/--depth` and `Backend.has_kernel` land; speculation stays OFF.
+  [errors/2026-08-31-draft-step-outside-graph.md](docs/experience/errors/2026-08-31-draft-step-outside-graph.md)
+
+## 2026-08-31 — phase exit: sm70 decode 2K ctx 5.3 → 20.5 tok/s (split-KV attention)
+
+- Generic `paged_attention` grids over `(B, H)`: 24 blocks at B=1 on an 80-SM
+  card, and its `T.serial(D)` dot means one active thread per block. Measured
+  0.76 ns/scalar-FMA = 1.16 clocks, the single-thread rate. Split the position
+  loop across the grid instead — parallelism from the grid, not a fragment
+  reduction, so the Metal constraint holds and `T.serial(D)` stays.
+- 25.8 / 23.1 / 20.5 tok/s at 31 / 1K / 2K (was 20.3 / 8.7 / 5.3); falloff
+  3.8× → 20%. sm70 cell only, dispatch arch-gated.
+  [wins/2026-08-31-sm70-split-kv-decode-attention.md](docs/experience/wins/2026-08-31-sm70-split-kv-decode-attention.md)
+
+## 2026-08-31 — phase exit: B=1 long-context decode unblocked (prefix-snapshot OOM fixed)
+
+- `PrefixStore.capacity` counts ENTRIES, but each resident entry owns a 149.6
+  MiB GDN state snapshot in HBM — the 4096 default is 576 GiB, so eviction
+  never fired and B=1 at 1K ctx OOM'd after 18 publishes. Cap is now derived
+  from `mem_get_info` at build time on CUDA (resolves to 3 on the V100).
+- B=1 decode, 256-token slope: 20.3 tok/s @ 31 ctx · 8.7 @ 1K · 5.3 @ 2K.
+  [errors/2026-08-31-prefix-snapshot-oom.md](docs/experience/errors/2026-08-31-prefix-snapshot-oom.md)
+
+## 2026-08-31 — phase exit: server B=8 2.8 → 12.9 tok/s (prefill batching + enable_thinking + 8K ctx)
+
+- Daemon ran `step()` between HTTP arrivals, splitting a concurrent burst into
+  eager mixed ticks (decode graph off). 10 ms batching window when idle +
+  waiting → 1 prefill for 8 requests (was 17 + 6 mixed).
+- `chat_template_kwargs.enable_thinking: false` now works (was silently
+  dropped); `num_blocks=256 → 512` for 8K context.
+  [wins/2026-08-31-server-prefill-batching.md](docs/experience/wins/2026-08-31-server-prefill-batching.md)
+
+## 2026-08-31 — phase exit: sm70 prefill 64.9s → 15.1s (gdn_chunk_fused registered)
+
+- `gdn_chunk_fused` was only in `_SM90_KERNELS`; sm70 fell back to
+  `reference.gdn_forward` (Python serial scan, ~250k eager ops for 8×64
+  tokens, 62s of the 64s tick 1). One-line registry fix: the kernel is
+  target-neutral TileLang, compiles and runs on V100 unchanged.
+- Also shipped: `linear_fp4_gemv_sm70_m32` (M=32 prefill chunking, 32× fewer
+  launches than the per-row M=1 loop; parity PASS M=1/8/16/32, worst 6.17e-4)
+  and `build_engine(kv_tier_path=...)` (SSD KvTier wired, was tier=None).
+- Decode unchanged: 260ms/tick, 99.1% GPU, 0.9% Python. The decode tick is
+  not Python-bound; the prefill was (eager mode, no graph capture).
+  [wins/2026-08-31-sm70-gdn-chunk-fused.md](docs/experience/wins/2026-08-31-sm70-gdn-chunk-fused.md)
+
+## 2026-08-31 — phase exit: B=8 decode on sm70, 1.3 -> 31.8 tok/s
+
+- The M-row fp4 GEMV (`linear_fp4_gemv_sm70_m`) loads+decodes W once per tile
+  and reuses it across M=8 rows, replacing the per-row M=1 loop that OOMs at
+  B=8. Weight bytes — the decode bottleneck — no longer scale with batch.
+- First B=8 e2e measured 5.67 s/tick (1.3 t/s, 9% GPU): the kernel was fast
+  but the pod's `engine.py` was an old copy (admit one request/tick via `if`,
+  not `while`), producing mixed prefill+decode ticks that skip the decode-graph
+  path. Syncing the pod's code fixed it — the B=8 graph captures once, replays
+  at 263.8 ms/tick = 31.8 t/s aggregate, all 8 requests correct.
+- B=8 per-token cost 33.0 ms vs B=1's 37.9 ms — weight sharing makes B=8
+  cheaper per-token than B=1. Parity: M=1 AND M=8 on 12 real projections,
+  worst 6.17e-4 (gate 1e-2).
+  [wins/2026-08-30-sm70-fp16-twiddle-gemv.md](docs/experience/wins/2026-08-30-sm70-fp16-twiddle-gemv.md)
+
 ## 2026-08-30 — accept: the sampler stops shipping its arguments to the device to read them back
 
 - `temperature` / `top_p` / `seed` are Python scalars on `SamplingParams`. The

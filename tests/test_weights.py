@@ -276,6 +276,23 @@ def test_fp4_save_load_roundtrip(tmp_path):
     assert greedy(loaded) == greedy(model)
 
 
+def test_fp4_save_widens_f16_scale_plane(tmp_path):
+    """A backend may serve the block scales narrowed (sm70 does, at f16); the NVFP4
+    format's are f32, so save_hf must widen them or the written checkpoint is
+    unreadable by anything that trusts the format. The dtype is all save_hf reacts
+    to, so narrowing the planes directly keeps this hermetic."""
+    cfg = replace(tiny(), fp4=True, tie_word_embeddings=False)
+    model = build_random(cfg, seed=7)
+    for key in fp4_param_keys(cfg):
+        model.params[key + ".scale"] = model.params[key + ".scale"].to(torch.float16)
+    save_hf(model, tmp_path / "ckpt")
+    loaded = load_hf(cfg, str(tmp_path / "ckpt"))
+    for key in fp4_param_keys(cfg):
+        sc = loaded.params[key + ".scale"]
+        assert sc.dtype == torch.float32, f"{key}.scale saved as {sc.dtype}, not the format's f32"
+        assert torch.equal(sc, model.params[key + ".scale"].float())  # widening is exact
+
+
 def test_fused_projections_parity(tmp_path):
     """fuse_projections concats same-input fp4 projections into one GEMV; the
     fused model's logits match the unfused model's (concat + slice is lossless)."""

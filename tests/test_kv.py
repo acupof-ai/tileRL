@@ -348,3 +348,230 @@ def test_shared_prefix_fork_cow():
     pool.free_block(a0)
     assert pool.refcount[a0] == 1 and pool.refcount[a1] == 1  # store only
     assert pool.free_blocks == 6  # 8 total - 2 store-held
+
+
+# ------------------------------------------------------------- SSD tier (offload)
+
+
+def test_tier_spill_reload_roundtrip(tmp_path):
+    """A prefix evicted to the SSD tier reloads bit-identical KV into fresh
+    blocks — the offload path a repeated long prefix rides instead of prefill.
+    """
+    from tilerl.kv_cache import KvTier
+
+    pool = PagedKvPool(8, 1, 4)
+    tier = KvTier(str(tmp_path / "kvt"), min_tokens=0)
+    # min_tokens=0 so any prefix spills; tier_capacity high enough to keep it.
+    store = PrefixStore(pool, capacity=1, tier=tier, tier_capacity=8)
+
+    # Prefix A: two blocks of known KV.
+    a = [pool.alloc_block() for _ in range(2)]
+    for i, b in enumerate(a):
+        pool.k_pool[:, b] = torch.randn_like(pool.k_pool[:, b])
+        pool.v_pool[:, b] = torch.randn_like(pool.v_pool[:, b])
+    ka = [pool.k_pool[:, b].clone() for b in a]
+    va = [pool.v_pool[:, b].clone() for b in a]
+    toks = list(range(32))
+    store.insert(toks, a)
+    for b in a:
+        pool.free_block(b)  # request done; only the store now holds A's blocks
+
+    # Insert a second prefix — capacity=1 forces A's eviction → spill to tier.
+    bblk = [pool.alloc_block()]
+    store.insert(list(range(100, 116)), bblk)
+    # A's blocks were freed back to the pool (store released its last owner).
+    for b in a:
+        assert pool.refcount[b] == 0
+
+    # A cold lookup returns reload_key, empty blocks.
+    hit = store.lookup(toks)
+    assert hit is not None and hit.reload_key is not None and hit.blocks == ()
+
+    # Reload into fresh blocks; spilled KV is bit-identical.
+    fresh = [pool.alloc_block() for _ in range(2)]
+    assert tier.load_kv(hit.reload_key, tuple(toks), fresh, pool), "A did not spill"
+    for i, b in enumerate(fresh):
+        assert torch.equal(pool.k_pool[:, b], ka[i])
+        assert torch.equal(pool.v_pool[:, b], va[i])
+
+
+def test_tier_min_tokens_gates_spill(tmp_path):
+    """Below tier_min_tokens an evicted prefix is dropped, not spilled (SSD
+    churn floor)."""
+    from tilerl.kv_cache import KvTier
+
+    pool = PagedKvPool(8, 1, 4)
+    tier = KvTier(str(tmp_path / "kvt"), min_tokens=999)
+    store = PrefixStore(pool, capacity=1, tier=tier, tier_capacity=8)
+    a = [pool.alloc_block()]
+    store.insert(list(range(16)), a)
+    store.insert(list(range(100, 116)), [pool.alloc_block()])
+    # Sub-floor: dropped, not spilled.
+    assert tier.load_kv(store._hash_all(list(range(16))), tuple(range(16)),
+                        [pool.alloc_block()], pool) is False
+    assert store.lookup(list(range(16))) is None
+
+
+def test_tier_deferred_flush_to_disk(tmp_path):
+    """spill_kv defers the torch.save off-tick: returns immediately with the
+    blob in memory (served from _pending), then a daemon flushes it to disk;
+    reload is bit-identical either way. Keeps the spill off the decode tick."""
+    import os
+    import time
+
+    from tilerl.kv_cache import KvTier
+
+    pool = PagedKvPool(8, 1, 4)
+    tier = KvTier(str(tmp_path / "kvt"), min_tokens=0)
+    b = pool.alloc_block()
+    pool.k_pool[:, b] = torch.randn_like(pool.k_pool[:, b])
+    pool.v_pool[:, b] = torch.randn_like(pool.v_pool[:, b])
+    kb = pool.k_pool[:, b].clone()
+    key, toks = 0xABCD, (1, 2, 3)
+
+    assert tier.spill_kv(key, toks, [b], pool) is True
+    assert key in tier._pending  # served from memory on-tick
+
+    for _ in range(200):
+        if key not in tier._pending:
+            break
+        time.sleep(0.01)
+    assert key not in tier._pending, "writer never flushed"
+    assert os.path.exists(tier._kv(key)), "blob not on disk after flush"
+
+    fresh = pool.alloc_block()
+    assert tier.load_kv(key, toks, [fresh], pool) is True
+    assert torch.equal(pool.k_pool[:, fresh], kb)
+    assert tier.load_kv(0xDEAD, toks, [fresh], pool) is False  # missing key
+    # Hash collision: same key, different tokens -> refuse, do not return stale KV.
+    assert tier.load_kv(key, (9, 9, 9), [fresh], pool) is False
+
+
+def test_tier_drop_purges_pending_and_queue_cap(tmp_path):
+    """drop() on a still-queued spill must purge the in-memory blob, or has()
+    would keep serving KV for a prefix the store evicted (write-back cache
+    invalidation → wrong tokens). Also: over max_pending, spill refuses."""
+    import os
+
+    from tilerl.kv_cache import KvTier
+
+    pool = PagedKvPool(16, 1, 4)
+    tier = KvTier(str(tmp_path / "kvt"), min_tokens=0, max_pending=2)
+    key, toks = 0x1234, (5, 6)
+    b = pool.alloc_block()
+    assert tier.spill_kv(key, toks, [b], pool) is True
+    # drop before the flush may have run: load must go False immediately.
+    tier.drop(key)
+    assert tier.load_kv(key, toks, [b], pool) is False, "drop left a pending blob (invalidation hole)"
+
+    # After a drop, no stale file should survive the daemon's write either.
+    import time
+
+    time.sleep(0.1)
+    assert not os.path.exists(tier._kv(key)), "dropped blob reappeared on disk"
+
+    # Queue cap: flood faster than the disk drains; some spills must refuse.
+    refused = 0
+    for i in range(50):
+        bb = pool.alloc_block()
+        if not tier.spill_kv(0x9000 + i, (i,), [bb], pool):
+            refused += 1
+        pool.free_block(bb)
+    # The cap must bite at least once under a burst faster than the disk drains,
+    # OR the writer kept up and none refused — both are correct; assert no crash
+    # and the cap is respected in-flight.
+    with tier._lock:
+        assert len(tier._pending) <= tier._max_pending
+
+
+def test_tier_hash_collision_serves_no_wrong_kv(tmp_path):
+    """Two prefixes colliding on the same 64-bit hash must not cross KV in the
+    cold tier — the one path that would produce WRONG tokens, not a crash.
+    Forces the hash constant so both spill to the same file key."""
+    from tilerl.kv_cache import KvTier
+
+    pool = PagedKvPool(8, 1, 4)
+    tier = KvTier(str(tmp_path / "kvt"), min_tokens=0)
+    # A and B: distinct tokens, same hash key; distinct KV contents.
+    a_tok, b_tok = (1, 2, 3), (7, 8, 9)
+    ba, bb = pool.alloc_block(), pool.alloc_block()
+    pool.k_pool[:, ba] = 1.0
+    pool.k_pool[:, bb] = 2.0
+    key = 0xC0FFEE  # same key for both — the collision
+    assert tier.spill_kv(key, a_tok, [ba], pool)
+    # B spills to the same key AFTER A (later writer wins the file).
+    assert tier.spill_kv(key, b_tok, [bb], pool)
+    import time
+    time.sleep(0.1)  # drain writer
+
+    # Loading A's tokens against the (now B) file must REFUSE, not return B's KV.
+    probe = pool.alloc_block()
+    got_a = tier.load_kv(key, a_tok, [probe], pool)
+    got_b = tier.load_kv(key, b_tok, [probe], pool)
+    # At most one prefix's KV survives, and it is served ONLY to its own tokens.
+    assert not (got_a and got_b), "both tokens loaded from one file — cross-contamination"
+    if got_b:
+        assert torch.all(pool.k_pool[:, probe] == 2.0)  # B's content, B's tokens
+
+
+def test_tier_insert_retires_cold_twin(tmp_path):
+    """A reloaded prefix that re-publishes must retire its cold twin, or the
+    twin's later eviction drop()s the live entry's file (generational race)."""
+    from tilerl.kv_cache import KvTier
+
+    pool = PagedKvPool(16, 1, 4)
+    tier = KvTier(str(tmp_path / "kvt"), min_tokens=0)
+    store = PrefixStore(pool, capacity=1, tier=tier, tier_capacity=8)
+    toks = list(range(32))
+    a = [pool.alloc_block() for _ in range(2)]
+    store.insert(toks, a)
+    for b in a:
+        pool.free_block(b)
+    store.insert(list(range(100, 116)), [pool.alloc_block()])  # evict A -> cold
+    h = store._hash_all(toks)
+    assert h in store._cold  # A is cold
+    # Re-publish A (as if reloaded): must retire the cold twin, not leave two.
+    a2 = [pool.alloc_block() for _ in range(2)]
+    store.insert(toks, a2)
+    cold_a = [e for e in store._cold.get(h, ()) if e.tokens == tuple(toks)]
+    assert not cold_a, "cold twin of the re-published prefix was not retired"
+
+
+def test_tier_lru_evicts_oldest_over_cap(tmp_path):
+    """max_bytes caps on-disk usage: after each write the daemon evicts LRU
+    entries until under cap; a load touches the entry to MRU so it survives."""
+    import os
+    import time
+
+    from tilerl.kv_cache import KvTier
+
+    pool = PagedKvPool(16, 1, 4)
+    tier = KvTier(str(tmp_path / "kvt"), min_tokens=0, max_bytes=10**9)
+
+    def spill_wait(key, toks):
+        b = pool.alloc_block()
+        assert tier.spill_kv(key, toks, [b], pool)
+        for _ in range(200):
+            if key not in tier._pending:
+                break
+            time.sleep(0.01)
+        time.sleep(0.05)  # let the daemon finish _track_written
+        pool.free_block(b)
+
+    spill_wait(0xA, (1,))
+    one = tier._total
+    assert one > 0
+    tier._max_bytes = 2 * one + 1  # holds 2, evicts on the 3rd
+
+    spill_wait(0xB, (2,))
+    assert os.path.exists(tier._kv(0xA))  # 2 entries, under cap
+
+    # Touch A → MRU; B is now LRU.
+    fresh = pool.alloc_block()
+    assert tier.load_kv(0xA, (1,), [fresh], pool)
+    pool.free_block(fresh)
+
+    spill_wait(0xC, (3,))
+    assert not os.path.exists(tier._kv(0xB)), "LRU evicted the touched entry, not the LRU one"
+    assert os.path.exists(tier._kv(0xA)), "touched entry was evicted"
+    assert os.path.exists(tier._kv(0xC))

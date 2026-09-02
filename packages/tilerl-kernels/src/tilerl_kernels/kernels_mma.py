@@ -10,6 +10,7 @@ import tilelang.language as T
 
 __all__ = [
     "make_write_tokens",
+    "make_write_tokens_f32",
 ]
 
 
@@ -38,9 +39,10 @@ def make_write_tokens(target: str):
 
     # SOTA copy: vLLM reshape_and_cache (paged KV write, same indexing:
     #   blk = block_table[b, pos // block_size], off = pos % block_size)
-    # Adapted: bf16 IO throughout (the pool is bf16; the backend casts the
-    #   f32 rope outputs at the boundary), one block per (b*t, head) with a
-    #   parallel D loop — decode is B=T=1, prefill T up to 512.
+    # Adapted: IO dtype follows the pool (bf16 on sm90, f32 on sm70 whose
+    #   attention kernel is f32 — a bf16 pool there made every attention call
+    #   cast the whole plane), one block per (b*t, head) with a parallel D
+    #   loop — decode is B=T=1, prefill T up to 512.
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
@@ -67,6 +69,42 @@ def make_write_tokens(target: str):
                     VPool[blk, h, off, d] = V[b, t, h, d]
 
     return write_tokens
+
+
+def make_write_tokens_f32(target: str):
+    """f32-pool twin of :func:`make_write_tokens` for sm70.
+
+    sm70's attention kernel is f32-IO, and a bf16 pool made every attention
+    call cast the WHOLE plane — 4.71 ms/token, 14% of a 4096-ctx token. The
+    body is duplicated rather than parameterized because the eager builder
+    re-executes it with only its own kwargs bound, so a closure dtype is not in
+    scope inside a T.Tensor annotation.
+    """
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def write_tokens_f32(K, V, KPool, VPool, BlockTable, SeqLens, SeqQLens, block_size, threads):
+        B, S, H, D = T.const("B, S, H, D")
+        NB = T.const("NB")
+        Mb = T.const("Mb")
+        K: T.Tensor((B, S, H, D), "float32")
+        V: T.Tensor((B, S, H, D), "float32")
+        KPool: T.Tensor((NB, H, block_size, D), "float32")
+        VPool: T.Tensor((NB, H, block_size, D), "float32")
+        BlockTable: T.Tensor((B, Mb), "int32")
+        SeqLens: T.Tensor((B,), "int32")
+        SeqQLens: T.Tensor((B,), "int32")
+        with T.Kernel(B * S, H, threads=threads) as (bt, h):
+            b = bt // S
+            t = bt % S
+            if t < SeqQLens[b]:
+                pos = SeqLens[b] - SeqQLens[b] + t
+                blk = BlockTable[b, pos // block_size]
+                off = pos % block_size
+                for d in T.Parallel(D):
+                    KPool[blk, h, off, d] = K[b, t, h, d]
+                    VPool[blk, h, off, d] = V[b, t, h, d]
+
+    return write_tokens_f32
 
 
 def make_attn_prep(target: str):
