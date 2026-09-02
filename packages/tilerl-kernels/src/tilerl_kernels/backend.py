@@ -661,10 +661,8 @@ class Backend:
         ref_chunk = int(os.environ.get("TILERL_GDN_CHUNKWISE", "0"))
         if ref_chunk and chunkable:
             return reference.gdn_forward(q, k, v, g, beta, state, chunkwise=ref_chunk, **kw)
-        # sm90 flips to WY by default once the pod gate passes; the kernels want whole chunks
-        wy = "gdn_state_scan" not in kset or (
-            os.environ.get("TILERL_GDN_WY") and t % _WY_CHUNK == 0
-        )
+        # the WY kernels scan whole chunks; a ragged length keeps the serial kernel
+        wy = "gdn_state_scan" not in kset or t % _WY_CHUNK == 0
         if wy and chunkable and self._full_rows(kw.get("seq_q_lens"), t):
             return self._gdn_chunk_wy(q, k, v, g, beta, state, **kw)
         if t > 1 and "gdn_chunk_fused" in kset:

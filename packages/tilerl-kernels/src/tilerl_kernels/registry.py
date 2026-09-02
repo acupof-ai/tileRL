@@ -88,7 +88,7 @@ _SM90_KERNELS = {  # WGMMA schedules; the backend pads M/N to 16 and K to 32
     "gdn_chunk_fused": kernels_gdn.make_gdn_chunk_fused,
     "gdn_prep": kernels_gdn.make_gdn_prep_bf16,
     "gdn_post": lambda t: kernels.make_gdn_post(t, "bfloat16"),
-    # chunkwise-WY prefill behind TILERL_GDN_WY=1 until the pod gate flips the default
+    # chunkwise-WY prefill: the default for whole-chunk full-length rows
     "gdn_chunk_cumsum": kernels_gdn.make_gdn_chunk_cumsum,
     "gdn_chunk_kkt": kernels_gdn.make_gdn_chunk_kkt,
     "gdn_solve_tril": kernels_gdn.make_gdn_solve_tril,

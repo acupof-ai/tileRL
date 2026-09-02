@@ -8,7 +8,6 @@ end, at our shapes; then the known-answer rows for the state scan, then timing.
 from __future__ import annotations
 
 import argparse
-import os
 
 import torch
 from torch.profiler import ProfilerActivity, profile
@@ -140,7 +139,7 @@ def main() -> None:
 
     # (b2) the whole layer, gdn_prep and gdn_post included: the sm90 cells of both
     # only ever run here and on the pod harness, never under the CPU parity gate
-    print("(b2) backend.linear_attn_chunk (TILERL_GDN_WY=1) vs reference.gdn_forward")
+    print("(b2) backend.linear_attn_chunk vs reference.gdn_forward")
     qkvd = 2 * args.hk * args.dk + args.hv * args.dv
     raw = lambda n: torch.randn(b, t, n, device=dev, dtype=torch.bfloat16) * 0.5
     lw = dict(
@@ -153,7 +152,6 @@ def main() -> None:
     lq, lk, lv, lz = (raw(args.hk * args.dk), raw(args.hk * args.dk),
                       raw(args.hv * args.dv), raw(args.hv * args.dv))
     lg, lbeta = raw(args.hv), raw(args.hv)
-    os.environ["TILERL_GDN_WY"] = "1"
     got = bk.linear_attn_chunk(lq, lk, lv, lg, lbeta, st, z=lz, **lw)
     ref = R.gdn_forward(lq, lk, lv, lg, lbeta, st, z=lz, **lw)
     worst = max(err(n, a, r) for a, r, n in zip(got, ref, ("out", "state", "window")))
