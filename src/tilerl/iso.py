@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 
+from . import precision
 from .autograd import Adafactor
 
 
@@ -36,9 +37,9 @@ class ISO:
     works) so 2D params train in fixed-spectrum coordinates. Non-2D params go
     straight to the base optimizer.
 
-    Cost: ``U``, ``S``, ``V`` in ``frame_dtype`` per 2D weight — two fp32
-    copies of the weight at the default, plus the base optimizer's state on
-    each frame instead of on the weight.
+    Cost: ``U``, ``S``, ``V`` in the policy's frame dtype per 2D weight — two
+    fp32 copies of the weight today (``precision.dtype("frame")``), plus the
+    base optimizer's state on each frame instead of on the weight.
     """
 
     streams = True
@@ -46,11 +47,10 @@ class ISO:
     def __init__(
         self,
         base: Any | None = None,
-        frame_dtype: torch.dtype = torch.float32,
         polar_iters: int = 5,
     ) -> None:
         self.base = Adafactor() if base is None else base
-        self.frame_dtype = frame_dtype
+        self.frame_dtype = precision.dtype("frame")
         self.polar_iters = polar_iters
         self._frames: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
@@ -77,6 +77,12 @@ class ISO:
         if fr is None:
             # ponytail: torch.linalg.svd at init, Newton-Schulz when it matters
             u, s, vh = torch.linalg.svd(p.to(self.frame_dtype), full_matrices=False)
+            # Guard at the point of use: a frame dtype that cannot hold
+            # orthonormality would train silently on a drifting spectrum.
+            err = float((u.T @ u - torch.eye(u.shape[1], dtype=u.dtype)).abs().max())
+            if err > 1e-3:
+                raise ValueError(f"ISO: frames in {self.frame_dtype} are not orthonormal "
+                                 f"(max|UᵀU−I| = {err:.1e}); change precision.py, not this call")
             fr = self._frames[id(p)] = (u.contiguous(), s, vh.T.contiguous())
         return fr
 

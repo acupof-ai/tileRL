@@ -36,6 +36,7 @@ from tilerl.spec import DraftHead
 from tilerl_kernels.backend import get_backend
 from tilerl_kernels.reference import dequant_fp4, pack_fp4
 from tilerl.testing import RefBackend
+from tilerl.kv_cache import NoPrefixStore
 from tilerl.train import _training_kv, opd_loop, train_step
 
 
@@ -758,7 +759,7 @@ def test_opd_lora_self_teacher():
 
     backend = get_backend()
     cfg, model = _build_model("tiny", seed=0, keep_master=True)
-    teacher = build_engine(cfg, model, backend, num_blocks=64, num_slots=4)
+    teacher = build_engine(cfg, model, backend, num_blocks=64, num_slots=4, decode_graph=False, prefix_store=NoPrefixStore())
     trainable = add_lora(model, rank=4)
     assert trainable, "add_lora attached nothing: nothing for the tape to train"
     base = {k: v.clone() for k, v in model.params.items() if k not in trainable}
@@ -787,6 +788,8 @@ def test_opd_loop_smoke():
         num_slots=4,
         max_batch=4,
         max_total_tokens=512,
+        decode_graph=False,
+        prefix_store=NoPrefixStore(),
     )
     try:
         prompts = [np.random.default_rng(0).integers(3, cfg.vocab_size, size=8).astype(np.int64)]
@@ -965,7 +968,7 @@ def test_opd_ema_self_teacher_shares_the_model():
     backend = get_backend()
     trainable = add_lora(model, rank=4, seed=2)
     teacher = build_engine(cfg, model, backend, num_blocks=8, num_slots=4, max_batch=4,
-                           max_total_tokens=512)
+                           max_total_tokens=512, decode_graph=False, prefix_store=NoPrefixStore())
     before = {k: v.clone() for k, v in model.params.items()}
     try:
         prompts = [np.random.default_rng(0).integers(3, cfg.vocab_size, size=8).astype(np.int64)]
