@@ -4,6 +4,31 @@ Central progress record. Three event classes land a line the same day, linking
 the `docs/experience/` entry: **phase exit · default flip · accept-or-reject
 verdict**. Newest first.
 
+## 2026-09-02 — accept-or-reject verdict: top-k path search REJECTED, DSpark REJECTED
+
+- Measured the prize before pricing the work. `scripts/probe_draft_topk.py`
+  ranks each drafted token inside the trunk's own ordering: top-1 **96.8%**,
+  top-16 **97.1%** over 592 verified positions. A **0.3-point** gap is the whole
+  ceiling for any path search — the draft is either right or wrong past rank 16.
+- Top-k path search over a draft block is a real published mechanism (DDTree,
+  Ringel & Romano: optimal trees use top-K per depth, B nodes = B verify rows).
+  It dies on THIS trunk for three independent reasons: 48 of 64 layers are
+  gated-delta, and a recurrent scan has no attention matrix to mask (72 MiB of
+  state per tree node, against DDTree's 256-node budgets); our drafter is
+  autoregressive, so the free path space does not exist; and rung 8 is a hard
+  ceiling (M>8 falls to 127 us/row vs 22, so width 9 costs 14.5x width 8).
+  [errors/2026-09-02-topk-path-search-needs-a-non-recurrent-trunk.md](docs/experience/errors/2026-09-02-topk-path-search-needs-a-non-recurrent-trunk.md)
+- The RadixArk DSpark head (3.7 GB, 5 layers, WITH a confidence head) is a
+  different architecture, not a checkpoint swap: dual-source KV injection (q from
+  mask tokens, k/v from `[hidden_norm(fc(5 trunk taps)) ++ noise]`), 5
+  mid-network taps into a graph-captured static buffer, non-causal attention with
+  per-row visibility windows our hard-causal sm70 kernel cannot express. Its
+  selling point over our MTP head is draft accuracy, which the 96.8% above says
+  is not the bottleneck.
+- Fixed a real defect the review surfaced: `_pad2d` CROPPED on a negative pad
+  (`F.pad` accepts negatives), so a [5120, 12800] weight silently became
+  [5120, 5120]. Now raises.
+
 ## 2026-09-02 — phase exit: KV pool dtype, dense +18%, spec peak 50.8 tok/s
 
 - A per-kernel profile of the decode window found **4.71 ms/token (14%) in 32

@@ -81,6 +81,12 @@ def _pad2d(t: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
     pr, pc = rows - t.shape[0], cols - t.shape[1]
     if pr == 0 and pc == 0:
         return t
+    # F.pad CROPS on a negative pad rather than raising, so an oversized tensor
+    # here becomes well-formed garbage: a [5120, 12800] weight silently returns
+    # [5120, 5120]. Pads are non-negative by construction on the shipped path,
+    # so this only fires on a shape the caller got wrong.
+    if pr < 0 or pc < 0:
+        raise ValueError(f"_pad2d: {tuple(t.shape)} exceeds the target [{rows}, {cols}]")
     return torch.nn.functional.pad(t, (0, pc, 0, pr))
 
 

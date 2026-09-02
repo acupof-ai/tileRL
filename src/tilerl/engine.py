@@ -466,6 +466,13 @@ class Engine:
         self._tokens_generated = 0
         self._spec_drafted = 0
         self._spec_accepted = 0
+        # Diagnostic only: set True to keep the last tick's draft and trunk
+        # logits so a probe can rank the trunk's pick inside the draft's
+        # ordering. A [rows, vocab] copy per tick, so never on in serving.
+        self._keep_draft_logits = False
+        self._draft_logits = None
+        self._trunk_logits = None
+        self._verify_chains = None
         self._finished_logprobs: dict[int, list[float]] = {}
         self._last_logprobs: list[float] | None = None
 
@@ -1045,6 +1052,8 @@ class Engine:
         last = torch.tensor([q - 1 for q in sq], device=dev)
         rng = torch.arange(n, device=dev)
         tok, prob = self._backend.greedy(logits[rng, last].unsqueeze(1))
+        if self._keep_draft_logits:  # off by default: a [n, vocab] copy per tick
+            self._draft_logits = logits[rng, last].detach().clone()
         h = dh[-1][rng, last].unsqueeze(1)
         confs: list[list[float]] = [[] for _ in plan]
         if self._spec_depth > 1:
@@ -1111,6 +1120,9 @@ class Engine:
         seed a T=1 rollout would use, so an accepted token is bit-identical to
         the unspeculated one. Rejected drafts leave KV past the new length,
         which the next tick overwrites."""
+        if self._keep_draft_logits:  # rank of the trunk's pick in the draft's order
+            self._trunk_logits = logits.detach().clone()
+            self._verify_chains = [list(c) for c in chains]
         flat = [
             (r, logits[i, j], len(r.output) + j)
             for i, r in enumerate(rows)
