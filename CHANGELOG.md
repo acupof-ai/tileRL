@@ -30,7 +30,38 @@ verdict**. Newest first.
   fails at 401.
   [errors/2026-09-02-per-shape-gap-was-a-wrong-shape-table.md](docs/experience/errors/2026-09-02-per-shape-gap-was-a-wrong-shape-table.md)
 
+## 2026-09-02 — verdict CORRECTED: drafting is 25% of a tick, so block-parallel is 1.20x and REJECTED
+
+Supersedes the 1.58-1.83x verdict below, which was computed against a draft cost
+that was wrong twice and is now obsolete for a third reason.
+
+- **One draft forward is 5.53 ms, 25% of a depth-3 tick** — not the 15.13 ms /
+  55-68% a depth regression reported. Depth moves TWO terms (D draft forwards
+  AND a verify of width D+1, which the sm70 ladder rounds up), so a slope charges
+  verify's growth to the draft: 5.53 true draft + ~10.6 ms/depth verify growth
+  reconstructs the 15.13 slope exactly. Depths 2 and 3 (W=3, W=4) both land on
+  rung 4, so their difference isolates one draft forward with verify held fixed.
+- **The number is over-determined.** Feeding 5.53 back through all four depths
+  yields a clean verify staircase (36.58 / 49.87 / 49.87 / 68.46, rung ratios
+  1.363 and 1.373), and the two rung-4 depths return the identical 49.87 the pair
+  assumed.
+- **Block-parallel ceiling is 1.20x** (66.46 → 55.41 ms/tick, 50.3 → 60.3 tok/s),
+  break-even 2.79 tok/forward against our 3.34. **Verdict: reject** — a 1.20x
+  upper bound that also requires matching autoregressive accuracy with a 5-layer
+  /1.86B head where ours is 1 layer/456M, and which agent-infer measured at 13%
+  acceptance on Qwen3.8.
+- **Why the prize evaporated: we already took the cheaper lever.** The 15.13 ms
+  was real when measured — the draft loop synced to host every depth step. That
+  fix shipped, and it collapsed the term the architecture change was meant to
+  attack. The earlier entry recommended exactly this, so its advice was right
+  even though its number was not.
+  [wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md](docs/experience/wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md)
+
 ## 2026-09-02 — accept-or-reject verdict: block-parallel drafting is worth 1.58-1.83x, and it is REOPENED
+
+> SUPERSEDED by the corrected verdict above: the draft cost below (15.13 ms,
+> 55-68%) charges verify's staircase growth to the draft. Real figures are
+> 5.53 ms and 25%, ceiling 1.20x, and the change is rejected.
 
 - **Drafting is 55-68% of a speculative tick**, measured by sweeping depth and
   taking the slope (`scripts/ab_draft_depth.py`) — ms/tick is affine in depth, so

@@ -32,8 +32,16 @@ __all__ = ["verify_lens", "survival", "DraftHead", "load_draft"]
 #: in ms. The defaults are agent-infer's H20 numbers; re-measure per target.
 #: V100 sm70 is NOT well described by this two-term form — see
 #: errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md: the sm70 GEMV
-#: ladder rounds the verify width up to 1/2/4/8, so cost is a staircase in
-#: depth and a linear model mis-prices every width that is not a rung.
+#: ladder rounds the verify width up to a rung, so cost is a staircase in depth
+#: and a linear model mis-prices every width that is not a rung. Measured on
+#: sm70 at ctx 1024, verify by rung: w<=2 36.58, w<=4 49.87, w<=8 68.46 ms, and
+#: one draft forward 5.53 (wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md).
+#: verify_lens still prices with the H20 constants on every target, so on sm70 it
+#: trims against the wrong curve; it only chooses HOW MANY drafts to admit, and
+#: a captured tick cannot use its per-row trim anyway (engine.py:246), so this is
+#: mispriced-but-inert rather than wrong output.
+#: ponytail: H20 two-term cost on sm70, swap in the rung table if the trim ever
+#: runs on a non-captured path where its choice can matter.
 BIAS_MS = 211.0
 ROW_MS = 0.53
 

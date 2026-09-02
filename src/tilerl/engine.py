@@ -1069,9 +1069,10 @@ class Engine:
         h = dh[-1][rng, last].unsqueeze(1)
         # Nothing is read back to the host until the whole chain is enqueued.
         # A .tolist() per depth step is a device sync per step, and the draft is
-        # launch-bound (15.13 ms against a 0.25 ms bandwidth floor), so the syncs
-        # ARE the cost: they serialize D draft forwards that would otherwise queue
-        # back to back. steps[] holds device tensors; one drain follows the loop.
+        # launch-bound, so the syncs ARE the cost: they serialize D draft forwards
+        # that would otherwise queue back to back. Worth 15.13 -> 5.53 ms per
+        # draft forward against a 0.25 ms bandwidth floor. steps[] holds device
+        # tensors; one drain follows the loop.
         conf = self._draft.confidence(h, prob, self._backend) if self._spec_depth > 1 else None
         steps = [(list(range(n)), tok[:, -1], None if conf is None else conf[:, -1])]
         cur = tok[:, -1]  # the token each row drafted last, kept on device

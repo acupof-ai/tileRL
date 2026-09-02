@@ -119,14 +119,23 @@ def main() -> None:
     print(f"\nrung-4 pair: {ms3:.2f} - {ms2:.2f} = {draft:.2f} ms per draft forward")
     print(f"  depth 3 tick = {verify:.2f} verify + 3 x {draft:.2f} draft")
     print(f"  drafting is {100 * 3 * draft / ms3:.0f}% of a depth-3 tick")
-    # Cross-check the fit cannot fake: depth 1 drops to rung 2 (cheaper verify)
-    # and depth 4 climbs to rung 8 (a cliff), so both must sit ABOVE the line
-    # this pair implies. If either lands on it, the rungs are not what we think.
-    for d in (1, 4):
+    # Cross-check the pair against the depths it did NOT use, in the direction
+    # each rung implies: depth 1 drops to rung 2 (a CHEAPER verify, so it must
+    # land BELOW the rung-4 line) and depth 4 climbs to rung 8 (dearer, so
+    # ABOVE). A depth that lands ON the line means the rungs are not what we
+    # think — the point is that the two deviate in OPPOSITE directions, which a
+    # single slope through all four cannot represent.
+    for d, want in ((1, "below"), (4, "above")):
         if d in rows:
             pred = verify + d * draft
-            print(f"  depth {d}: {rows[d][0]:.2f} vs {pred:.2f} predicted "
-                  f"({'above — expected' if rows[d][0] > pred else 'ON the line — SUSPECT'})")
+            got = "above" if rows[d][0] > pred else "below"
+            print(f"  depth {d}: {rows[d][0]:.2f} vs {pred:.2f} rung-4 line — {got}"
+                  f"{', expected' if got == want else ', SUSPECT (wanted ' + want + ')'}")
+    # Verify cost per rung, derived from the ONE draft number: if 5.53 is right,
+    # these must be a clean staircase, and that is an independent check on it.
+    print(f"  verify by rung: " + ", ".join(
+        f"w{1 + d}->{next(w for w in LADDER_WIDTHS if w >= 1 + d)}: {rows[d][0] - d * draft:.2f}"
+        for d in sorted(rows)))
 
     # A block-parallel head emits the whole block in ONE forward, so it removes
     # (D-1) draft forwards and changes nothing else.
