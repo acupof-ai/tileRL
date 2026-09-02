@@ -135,6 +135,12 @@ def cmd_serve(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _generation_defaults(source: str) -> dict:
+    """The checkpoint's generation_config.json, or {} when it is not a local dir."""
+    p = Path(source) / "generation_config.json"
+    return json.loads(p.read_text()) if p.is_file() else {}
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     import torch
 
@@ -185,14 +191,22 @@ def cmd_train(args: argparse.Namespace) -> None:
         # (GSM8K). Without it, random prompts and a demo reward.
         rows = ([json.loads(ln) for ln in Path(args.data).read_text().splitlines() if ln.strip()]
                 if args.data else [])
-        prompts = [tok.encode(render_chat([("user", r["prompt"])])) for r in rows] or [
+        # The 27B switches thinking in the prompt, per its own chat template;
+        # a budget > 0 opens the block and caps it with the end tokens.
+        real = args.model == "qwen38-27b"
+        thinking = (args.think_budget > 0) if real else None
+        prompts = [tok.encode(render_chat([("user", r["prompt"])], thinking)) for r in rows] or [
             torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist() for _ in range(8)
         ]
-        end_think = tuple(tok.encode("</think>\n\n")) if args.model == "qwen38-27b" else ()
+        end_think = tuple(tok.encode("</think>\n\n")) if thinking else ()
+        # Sampling defaults come from the checkpoint's generation_config.json
+        # (Qwen ships top_k 20 / top_p 0.95), not from flags.
+        gen_cfg = _generation_defaults(_QWEN38_SOURCE) if real else {}
         sampling = SamplingParams(
             temperature=args.temperature, max_new_tokens=args.max_new_tokens,
+            top_k=int(gen_cfg.get("top_k", 0)), top_p=float(gen_cfg.get("top_p", 1.0)),
             stop_token_ids=getattr(tok, "stop_token_ids", ()),
-            thinking_budget=args.think_budget if end_think else None, end_think_ids=end_think)
+            thinking_budget=args.think_budget if thinking else None, end_think_ids=end_think)
 
         # The run id is the hash of these: same inputs = same run, a finished
         # one is returned instead of retrained. Checkpoint path + code commit is
@@ -224,7 +238,8 @@ def cmd_train(args: argparse.Namespace) -> None:
                 manifest["metrics"][f"mmlu_{tag}"] = c / n
                 log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}%")
             if eval_rows:
-                c, n = gsm8k_accuracy(engine, tok, eval_rows, sampling, concurrency=8)
+                c, n = gsm8k_accuracy(engine, tok, eval_rows, sampling, concurrency=8,
+                                      thinking=thinking)
                 manifest["metrics"][f"gsm8k_{tag}"] = c
                 log(f"gsm8k greedy {c}/{n} = {100 * c / n:.1f}%")
 

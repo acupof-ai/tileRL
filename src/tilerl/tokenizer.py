@@ -68,9 +68,16 @@ def get_tokenizer(source: str | None = None) -> Tokenizer:
     return ByteTokenizer()
 
 
-def render_chat(messages: list[tuple[str, str]]) -> str:
+def render_chat(messages: list[tuple[str, str]], thinking: bool | None = None) -> str:
     """ChatML — the format Qwen3.x was trained on and what the stop set
     assumes. ``messages`` are ``(role, text)`` pairs; the assistant turn is
-    left open for the model."""
+    left open for the model.
+
+    ``thinking`` follows the 27B checkpoint's own template: True opens the
+    reasoning block (``<think>\n``) for the model to fill, False closes an
+    empty one in the prompt (``<think>\n\n</think>\n\n``) — thinking is
+    switched in the prompt, not by forcing tokens at decode time. None leaves
+    the turn at ``assistant\n`` (the tiny/dev path)."""
     rendered = "".join(f"<|im_start|>{r}\n{t}<|im_end|>\n" for r, t in messages)
-    return f"{rendered}<|im_start|>assistant\n"
+    tail = {None: "", True: "<think>\n", False: "<think>\n\n</think>\n\n"}[thinking]
+    return f"{rendered}<|im_start|>assistant\n{tail}"

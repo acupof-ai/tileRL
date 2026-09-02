@@ -86,13 +86,13 @@ def mmlu_accuracy(engine: Any, tok: Any, n: int, seed: int = 0,
 
 
 def gsm8k_accuracy(engine: Any, tok: Any, rows: list[dict], sampling: Any,
-                   concurrency: int = 8) -> tuple[int, int]:
+                   concurrency: int = 8, thinking: bool | None = None) -> tuple[int, int]:
     """(correct, total) on ``rows`` ({prompt, answer}), greedy under the
     training's own ``sampling`` (stop ids, length, no-think template)."""
     from dataclasses import replace
 
     from .tokenizer import render_chat
 
-    prompts = [render_chat([("user", r["prompt"])]) for r in rows]
+    prompts = [render_chat([("user", r["prompt"])], thinking) for r in rows]
     texts = generate(engine, tok, prompts, replace(sampling, temperature=0.0), concurrency)
     return sum(answer_match(t, r["answer"]) for t, r in zip(texts, rows)), len(rows)
