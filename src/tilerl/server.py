@@ -24,7 +24,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .prompt import render_prompt, sampling
+from .prompt import render_prompt, sampling, strip_think
 from .tokenizer import ByteTokenizer, Tokenizer, get_tokenizer  # noqa: F401
 
 __all__ = ["ByteTokenizer", "get_tokenizer", "create_app"]
@@ -178,7 +178,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                 status_code=500,
                 content={"error": {"message": str(exc), "type": "api_error"}},
             )
-        text = tokenizer.decode(output_ids)
+        text = strip_think(tokenizer.decode(output_ids))  # reasoning is the model's, not the reply
         created = int(time.time())
         # OpenAI's shape: one entry per emitted token, decoded alongside its
         # score. A forced end-think token was never sampled and carries NaN,
@@ -222,7 +222,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             yield _sse({"error": {"message": str(exc), "type": "api_error"}})
             yield "data: [DONE]\n\n"
             return
-        text = tokenizer.decode(output_ids)
+        text = strip_think(tokenizer.decode(output_ids))  # reasoning is the model's, not the reply
         if text:
             yield _sse(_chat_chunk(chunk_id, created, model_name, {"content": text}))
         finish = "length" if len(output_ids) >= max_new else "stop"
