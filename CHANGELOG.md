@@ -18,6 +18,22 @@ verdict**. Newest first.
   Roadmap P4 exits; the rl → eval → merge → serve chain waits on `eval` and
   `merge` commands ([docs/design-rl-stack.md](docs/design-rl-stack.md) §3).
 
+## 2026-09-02 — default flip: dtypes are a policy, wrong training configs are refused, runs start from recipes
+
+- `precision.py` is the one place a dtype is chosen: optimizer state and ISO
+  frames fp32, adapters bf16, the GDN state pool f32 on cuda and bf16
+  elsewhere — the same values the call sites carried, now read from the
+  table. Narrowing one (bf16 frames for the 27B) lands there with its gate,
+  never at a call site. No numeric change, no bench.
+- Guards at the point of use: `grpo_loop` and self-OPD refuse an engine with
+  the decode graph or the prefix cache on (both sample from an earlier
+  policy without raising — `wins/2026-08-29-grpo.md`); ISO refuses a frame
+  dtype whose SVD is not orthonormal to 1e-3. `test_on_policy_guard_refuses_cached_engines`.
+- `tilerl train --recipe <name>`: a recipe is the flag set that passed a gate
+  (`recipes.py`, with its status — `grpo-tiny-smoke` cpu-gated, the three 27B
+  recipes pending-remote); typed flags override it; the manifest records the
+  name. 20 train flags stop being the interface for the common path.
+
 ## 2026-09-02 — accept: ISO-Merger lands as `tilerl merge`, gated on two tiny specialists
 
 - `src/tilerl/merge.py`: checkpoint-only merge of specialists sharing a base —
