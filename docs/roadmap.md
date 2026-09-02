@@ -40,10 +40,9 @@ Prerequisites, all code, all CPU-gated:
 - Log the fraction of tied groups (all-equal rewards give zero advantage,
   `train.py group_advantages`); a no-think 27B on GSM8K may tie most groups.
 
-Run: `tilerl train --model qwen38-27b --rl --data gsm8k_train.jsonl --steps
-100 --group 8 --max-new-tokens 256 --eval-mmlu 1000 --eval-gsm8k
-gsm8k_test.jsonl --eval-n 500`, LoRA rank 16, no thinking, one H20, seeds 0
-and 1.
+Run: `tilerl train --recipe grpo-gsm8k-27b --data gsm8k_train.jsonl
+--eval-gsm8k gsm8k_test.jsonl` (the recipe is 100 steps, group 8, 256 tokens,
+LoRA rank 16, no thinking, MMLU 1000, GSM8K 500), one H20, `--seed 0` and `1`.
 
 Exit, both seeds: GSM8K held-out (500 q) after − before ≥ +5 pt (SE ≈ 2 pt);
 MMLU (1000 q) after ≥ before − 2 pt; tied-group fraction < 50% (else the task
