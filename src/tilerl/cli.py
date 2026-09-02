@@ -1,4 +1,4 @@
-"""tilerl command-line interface: serve / train / pretrain / bench.
+"""tilerl command-line interface: serve / train / pretrain / bench / merge.
 
 Heavy imports (torch, tilelang, sibling modules) happen inside the subcommand
 handlers so that ``tilerl --help`` stays instant and works even before the
@@ -424,6 +424,19 @@ def cmd_bench(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+def cmd_merge(args: argparse.Namespace) -> None:
+    from . import config as config_mod
+    from . import merge as merge_mod
+    from .model import Model, drop_quantized, load_hf, save_hf
+
+    cfg = (config_mod.qwen38_27b if args.model == "qwen38-27b" else config_mod.tiny)()
+    # ponytail: every checkpoint resident in RAM as bf16 masters; stream per shard for the 27B
+    load = lambda d: drop_quantized(load_hf(cfg, d, keep_master=True)).params
+    merge = merge_mod.iso_merge if args.method == "iso" else merge_mod.average_merge
+    save_hf(Model(cfg, merge(load(args.base), [load(d) for d in args.specialists])), args.out)
+    print(f"merged {len(args.specialists)} specialists ({args.method}) -> {args.out}")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tilerl",
@@ -512,6 +525,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_gen.add_argument("--max-batch", type=int, default=32,
                        help="concurrent requests per device")
     p_gen.set_defaults(func=cmd_generate)
+
+    p_merge = sub.add_parser("merge", help="merge specialist checkpoints that share a base")
+    p_merge.add_argument("--model", choices=["tiny", "qwen38-27b"], default="tiny")
+    p_merge.add_argument("--base", required=True, help="base checkpoint dir")
+    p_merge.add_argument(
+        "--specialists",
+        required=True,
+        type=lambda v: v.split(","),
+        help="comma-separated specialist checkpoint dirs",
+    )
+    p_merge.add_argument("--out", required=True, help="merged checkpoint dir")
+    p_merge.add_argument("--method", choices=["iso", "average"], default="iso")
+    p_merge.set_defaults(func=cmd_merge)
 
     return parser
 
