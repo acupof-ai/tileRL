@@ -667,6 +667,14 @@ __device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m_xh(
 //   measured 837 of 2936 instructions = 28.5%) -> isolates the scale tail.
 // ABL=3 NO_DECODE: skip tl_fp4_decode8_f16, use the raw words as if decoded ->
 //   isolates the fp4 dequant (LOP3/SHF/PRMT) from the FMA stream.
+// ABL=4 PIPELINE: 2-deep software pipeline -- issue row m+1's two loads BEFORE
+//   row m's FMA block, so the loads overlap arithmetic. Traffic is IDENTICAL
+//   (same addresses, same count); only exposure changes, at +8 registers and no
+//   m-unroll. This is the one variant that SPLITS X_REUSE's 8.75x: X_REUSE
+//   removed traffic and latency together, so a large gain here means latency and
+//   SMEM staging (which only removes traffic) is the wrong fix; ~1.0x means the
+//   cost is traffic and staging is right. Correct numbers, unlike ABL=1..3 --
+//   it only reorders, so it doubles as the candidate fix if it wins.
 template <int G, int M, int ABL>
 __device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m_abl(
     const void *wqv, const void *xv, int K, int block_K,
@@ -706,6 +714,51 @@ __device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m_abl(
         __half2 ah = __halves2half2(__ushort_as_half(a & 0xffff), __ushort_as_half(a >> 16));
         acc[m] = fmaf(sc[g], __low2float(ah) + __high2float(ah), acc[m]);
       }
+    }
+  }
+}
+// 2-deep pipelined body for ABL=4: row m+1's loads are in flight across row m's
+// FMAs. Split out rather than branched inside the loop above, because the
+// prefetch has to live ACROSS an iteration boundary -- `nxt` is loaded before
+// the FMA block and consumed by the next iteration.
+template <int G, int M>
+__device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m_pipe(
+    const void *wqv, const void *xv, int K, int block_K,
+    const float *sc, float *acc) {
+  const unsigned char *wq = (const unsigned char *)wqv;
+  const unsigned *x = (const unsigned *)xv;
+#pragma unroll
+  for (int g = 0; g < G; ++g) {
+    unsigned w0, w1;
+    asm volatile("ld.global.nc.v2.u32 {%0,%1}, [%2];"
+                 : "=r"(w0), "=r"(w1) : "l"(wq + g * block_K / 2));
+    unsigned d0[4], d1[4];
+    tl_fp4_decode8_f16(w0, d0);
+    tl_fp4_decode8_f16(w1, d1);
+    unsigned cur[8], nxt[8];
+    const unsigned *x0 = x + g * block_K / 2;
+    asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(cur[0]), "=r"(cur[1]), "=r"(cur[2]), "=r"(cur[3]) : "l"(x0));
+    asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(cur[4]), "=r"(cur[5]), "=r"(cur[6]), "=r"(cur[7]) : "l"(x0 + 4));
+    for (int m = 0; m < M; ++m) {
+      if (m + 1 < M) {  // row m+1's loads issue here, retire after the FMAs
+        const unsigned *xn = x + (size_t)(m + 1) * (K / 2) + g * block_K / 2;
+        asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(nxt[0]), "=r"(nxt[1]), "=r"(nxt[2]), "=r"(nxt[3]) : "l"(xn));
+        asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(nxt[4]), "=r"(nxt[5]), "=r"(nxt[6]), "=r"(nxt[7]) : "l"(xn + 4));
+      }
+      unsigned a = 0u;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(cur[i]), "r"(d0[i]));
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %0;" : "+r"(a) : "r"(cur[4 + i]), "r"(d1[i]));
+      }
+      __half2 ah = __halves2half2(__ushort_as_half(a & 0xffff), __ushort_as_half(a >> 16));
+      acc[m] = fmaf(sc[g], __low2float(ah) + __high2float(ah), acc[m]);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) cur[i] = nxt[i];
     }
   }
 }
@@ -1044,12 +1097,22 @@ def make_linear_fp4_gemv_sm70_m(
     errors/2026-09-03-occupancy-is-not-the-gemv-cap.md); the flag stays so the
     A/B is reproducible. 0 keeps tilelang's default.
 
-    ``abl`` selects an ABLATION and RETURNS WRONG NUMBERS — measurement only,
+    ``abl`` selects an ABLATION. 1-3 RETURN WRONG NUMBERS — measurement only,
     never a serving path. 1 = every row reads row 0's X (same loads, all L1 hits
     after the first) isolates X load cost; 2 = drop the per-tile scale apply
     (28.5% of instructions); 3 = skip the fp4 decode. Instruction and load counts
     are unchanged in each, so the delta prices exactly one suspect. This is the
-    instrument left after ncu was denied on the pod.
+    instrument left after ncu was denied on the pod, and it found that X
+    dominates M=32 while the scale tail and decode are free. Read abl=1 as an
+    UPPER bound on X-related cost, not a load measurement: a loop-invariant
+    address is hoistable and its LDG count drops 363 -> 53
+    (wins/2026-09-03-x-dominates-the-gemv-at-m32.md).
+
+    4 = a 2-deep software pipeline, and unlike 1-3 it is CORRECT: it only
+    reorders, issuing row m+1's loads before row m's FMAs. Traffic is identical,
+    exposure is not, so it splits what abl=1 measured together — a large gain
+    means the 8.75x is latency (and SMEM staging, which only removes traffic, is
+    the wrong fix); ~1.0x means it is traffic. Costs +8 registers, no m-unroll.
     """
     if abl and not xh:
         raise ValueError("abl requires xh=True: the ablations mirror the f16-X extern only")
@@ -1065,7 +1128,9 @@ def make_linear_fp4_gemv_sm70_m(
         # The ablation extern carries ABL as a third template arg; `targs` is what
         # both call sites below interpolate, so the shipped path is untouched.
         targs = f"{{G}},{M},{abl}" if abl else f"{{G}},{M}"
-        if abl:
+        if abl == 4:  # its own extern: the prefetch spans an iteration boundary
+            tiles, targs = "tl_fp4_gemv_tiles_f16_m_pipe", f"{{G}},{M}"
+        elif abl:
             tiles = "tl_fp4_gemv_tiles_f16_m_abl"
         main_targs = targs.replace("{G}", str(GROUP))
         tail_targs = targs.replace("{G}", "1")

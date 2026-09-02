@@ -1,9 +1,16 @@
-# X's per-row loads are 89% of the sm70 GEMV at M=32 — V100, 2026-09-03
+# X dominates the sm70 GEMV at M=32 — V100, 2026-09-03
 
 > Status: located by ablation, after five A/Bs excluded everything else and two of
 > my own rejections turn out to have been wrong. `X_REUSE` is **8.75× at M=32**.
-> The mechanism that makes X's loads cost this much is **not established** — two
-> models are refuted below and I am not publishing a third.
+>
+> **Correction, same day, before acting on it:** that 8.75× is an **upper bound on
+> everything X-related**, not a measurement of X's loads alone. Making the address
+> loop-invariant let ptxas hoist the load out of the m loop — SASS shows **LDG 363 →
+> 53, so 85% of the loads were deleted, not cached**. The ablation therefore prices
+> X's traffic *plus* its latency *plus* 85% of the LDG issue slots together. The
+> conclusion "X is where the kernel's time goes" stands; "X's per-row loads are 89%"
+> was too strong for the instrument. `abl=4` (PIPELINE, same 363 LDG) is the honest
+> split and is running.
 
 ## Context
 
@@ -31,21 +38,28 @@ construction, which is what makes it a measurement rather than a candidate.
 
 Per shape at M=32: X_REUSE 8.93 / 10.63 / 8.68 / 5.60 / 8.41 / 5.67×.
 
-**X's per-row loads are ~89% of the M=32 kernel.** The scale tail — 28.5% of the
-instruction stream by SASS count — is *free*, and so is the fp4 decode: both are
-entirely hidden behind X. That also retires the "reduce instructions per flop"
-direction, which the previous entry derived as the only remaining lever.
+**X is where the M=32 kernel's time goes** — but see the correction above for how
+much this number can carry: `nvdisasm` on the ablation's own cubin shows **LDG 363 →
+53**, because a loop-invariant address is hoistable, so 8.75× includes 85% of the
+LDG issue slots being deleted along with the traffic and the latency. It is an
+upper bound on X-related cost, not a per-row load measurement.
 
-The M-dependence is the signature: 0.97× at M=1 (nothing to reuse), 3.05× at M=8,
-8.75× at M=32. Only a per-row cost can do that, and it is why M=1 sits at 83% of
-its bandwidth roofline while M=32 sits at 17.6% of its FLOP peak — those are two
-different kernels wearing one template.
+What *is* clean, because these variants keep their loads: the scale tail — 28.5% of
+the instruction stream by SASS count — is **free** at 0.92×, and so is the fp4
+decode at 0.98×. Both are entirely hidden behind whatever X is doing. That retires
+the "reduce instructions per flop" direction, which the previous entry derived as
+the only remaining lever.
+
+The M-dependence is the signature: 0.97× at M=1 (nothing to hoist or reuse), 3.05×
+at M=8, 8.75× at M=32. Only a per-row cost can do that, and it is why M=1 sits at
+83% of its bandwidth roofline while M=32 sits at 17.6% of its FLOP peak — those are
+two different kernels wearing one template.
 
 ## Two rejections this reverses
 
 **SMEM staging** (errors/2026-09-03-smem-staging-rejected-one-flop-per-x-byte.md)
 was rejected because a two-K sweep showed no L1-capacity knee. The ablation says X's
-loads *are* ~89% of the time, so staging them is back on the table — I rejected the
+loads dominate the time, so staging them is back on the table — I rejected the
 right target on a wrong prediction.
 
 **"L1 bandwidth is not binding"** rested on X reading at 5.51 TB/s = 35% of the
@@ -79,8 +93,7 @@ structural property of the access pattern puts it there is open.
 
 ## What this decides
 
-The lever is X's per-row loads and nothing else — 89% at M=32, and both other
-candidates measured free. The obvious form is staging the tile's X slice in SMEM so
+The lever is X and nothing else at M=32; both other candidates measured free. The obvious form is staging the tile's X slice in SMEM so
 the M row-reads hit it, which is what was rejected on model (a). **Before writing
 it**, the open question is why the loads cost what they do, because a fix aimed at
 the wrong mechanism is how the last two ticks were spent. Concretely: `abl=1`
@@ -92,13 +105,24 @@ registers before the FMA block would split those.
 
 **Ablate before modelling.** Five A/Bs and two derivations went into ranking
 candidates by plausibility; one ablation ranked them by cost, and the ranking was
-nothing like the guesses (the 28.5% instruction tail is free; the loads are 89%).
+nothing like the guesses (the 28.5% instruction tail is free; X dominates).
 An ablation that returns wrong numbers is cheap, needs no counters, and answers
 "how much does this part cost" without requiring a theory of why.
 
 Second: **a wrong prediction refutes the prediction, not the target.** "X spills L1"
 was falsifiable and false; "X's loads are the cost" was never tested and is true. I
 retired the second on the death of the first, and lost two ticks to it.
+
+Third, from the correction: **check that an ablation removed the cost and not the
+instructions.** `abl=1` made the address loop-invariant, and ptxas did the obvious
+thing — hoisted the load, LDG 363 → 53. The delta then prices the deleted issue
+slots too. Every ablation needs its instruction count read back off the cubin, which
+is one `nvdisasm | grep -c`, and I published the 89% figure without doing it.
+
+Fourth: **an ablation that changes what the compiler can prove is not a
+measurement of the hardware.** Loop-invariance is a compiler-visible property; the
+variant that keeps addresses per-row (`abl=4`) changes only scheduling, which is
+why it is the one that can actually split traffic from latency.
 
 ## Gate
 
@@ -114,3 +138,4 @@ The `abl` flag raises `ValueError` without `xh=True` and is never a serving path
 | 2026-09-03 | 852f319 | V100 | cuda sm70 | GEMV M=8 | X_REUSE ablation | 3.05× |
 | 2026-09-03 | 852f319 | V100 | cuda sm70 | GEMV M=1 | X_REUSE ablation | 0.97× |
 | 2026-09-03 | 852f319 | V100 | cuda sm70 | GEMV M=32 | NO_SCALE / NO_DECODE | 0.92× / 0.98× |
+| 2026-09-03 | 81c83ff | V100 | cuda sm70 | GEMV M=32 | LDG, base vs X_REUSE | **363 → 53** |

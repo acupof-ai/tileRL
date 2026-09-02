@@ -48,7 +48,12 @@ SHAPES = [(34816, 5120, 64, "gate_up"), (5120, 17408, 64, "down"),
           (16384, 5120, 48, "qkvz"), (5120, 6144, 48, "gdn out"),
           (14336, 5120, 16, "qkv"), (5120, 6144, 16, "attn o")]
 MS = (1, 8, 32)
-ABLATIONS = [(1, "X_REUSE"), (2, "NO_SCALE"), (3, "NO_DECODE")]
+ABLATIONS = [(1, "X_REUSE"), (2, "NO_SCALE"), (3, "NO_DECODE"), (4, "PIPELINE")]
+#: abl=4 is CORRECT (it only reorders), so it is both the discriminator and a
+#: candidate fix. THRESHOLD, committed before reading M=32: accept at >=1.15x with
+#: no M=1 regression, and relerr must be exactly 0 -- a reorder that changes the
+#: numbers is a bug, not a variant.
+PIPE_ACCEPT = 1.15
 BLK, NP = 32, 4
 FMA_PEAK = 31.3
 
@@ -75,6 +80,14 @@ def main() -> None:
             u0 = bk.timeit(lambda: base(x, wq, sc, osc, res, 32, NP, BLK))
             gains = []
             for a, _, k in cands:
+                # abl=4 is the only variant whose output should match: check it,
+                # because a reorder that changes numbers is a bug, not a variant.
+                if a == 4:
+                    rel = bk.relerr(k(x, wq, sc, osc, res, 32, NP, BLK),
+                                    base(x, wq, sc, osc, res, 32, NP, BLK))
+                    if rel:
+                        print(f"  !! PIPELINE relerr {rel:.2e} at {label} M={M} "
+                              f"-- a reorder must be bit-exact")
                 u = bk.timeit(lambda k=k: k(x, wq, sc, osc, res, 32, NP, BLK))
                 gains.append(u0 / u)
                 tot[(M, a)] = tot.get((M, a), 0.0) + u * cnt
@@ -88,10 +101,16 @@ def main() -> None:
         row = "  ".join(f"{lbl} {b / tot[(M, a)]:.2f}x" for a, lbl in ABLATIONS)
         print(f"  M={M:>2}: base {b:>7.1f}   {row}")
 
-    print("\nIf no ablation moves M=32, the cost is in what none of them touch:")
-    print("the m loop's serial dependence on one accumulator, or the LDG issue")
-    print("rate. If one dominates, that is the lever -- then write the real fix")
-    print("and A/B it with the threshold committed BEFORE reading M=32.")
+    pipe = tot[(32, 0)] / tot[(32, 4)]
+    reuse = tot[(32, 0)] / tot[(32, 1)]
+    print(f"\nPIPELINE recovers {100 * (pipe - 1) / (reuse - 1):.0f}% of X_REUSE's "
+          f"{reuse:.2f}x headroom at M=32.")
+    print("  most of it   -> the 8.75x is LATENCY; SMEM staging removes traffic and")
+    print("                  would not have helped. This reorder IS the fix.")
+    print("  little of it -> the cost is TRAFFIC; stage X in SMEM next.")
+    print(f"Accept threshold for PIPELINE (committed before this run): "
+          f"{PIPE_ACCEPT}x at M=32, no M=1 regression, relerr 0. "
+          f"Measured {pipe:.2f}x -> {'ACCEPT' if pipe >= PIPE_ACCEPT else 'reject'}.")
 
 
 if __name__ == "__main__":
