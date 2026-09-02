@@ -82,8 +82,14 @@ anything:
 Neither roofline binds at 0.75 TFLOPS, which points at the kernel's shape rather than
 its arithmetic: `paged_attention_split` grids `(KVSPLIT, S*H, B)` and each thread walks
 its slice with `block_N=16` **serially**, one query row per thread, f32 throughout on a
-card whose f32 has no packed-FMA path. That is the next lever, and it is a bigger one
-than anything left in the GEMV.
+card whose f32 has no packed-FMA path.
+
+> **The "next lever" clause that stood here is withdrawn.** The shape diagnosis is
+> confirmed — every query row re-reads the window, and batching 512 rows captures only
+> 1.56× of a possible ~512× — but attention at *infinite* speed is worth **1.243×** of
+> prefill, against 1.57× for a further 2× on the GEMV. Distance from peak is not prize
+> size. See
+> [`errors/2026-09-03-attention-ceiling-is-1.24x-priority-withdrawn.md`](../errors/2026-09-03-attention-ceiling-is-1.24x-priority-withdrawn.md).
 
 ## Rule
 

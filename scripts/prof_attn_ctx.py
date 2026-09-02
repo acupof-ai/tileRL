@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import torch
 
 os.environ.setdefault("TILERL_TARGET", "cuda")
+from tilerl_kernels import kernels  # noqa: E402
 from tilerl_kernels.backend import _THREADS, get_backend  # noqa: E402
 
 # Qwen3.8-27B full-attn shape (config.py:145-147): 24 query heads, 4 KV heads,
@@ -137,10 +138,27 @@ def main() -> None:
     print(f"  combine is flat in ctx, so it lands in the intercept, "
           f"not the slope ({per_tok[-1]:.2f} ms/tok at 8K includes it)")
 
-    print("\n# verify width S (4096 ctx, us) — speculation pays S rows here")
-    for S in (1, 2, 4, 8):
+    # PREFILL is where this kernel now costs 19.6% of the tick, and prefill runs
+    # S=512 (the chunk budget), not the S<=8 of a speculative verify. S is a GRID
+    # dim, so each query row is its own block and re-reads the whole K/V window:
+    # traffic should be proportional to S*n with NO sharing across rows.
+    #
+    # PREDICTION COMMITTED BEFORE THE RUN: if the re-read is what binds, us/row is
+    # FLAT in S (each row pays its own full window) and total is linear in S. If
+    # us/row FALLS with S, rows are already sharing K/V through L2 and Q-tiling
+    # buys only the arithmetic, not the traffic. Threshold to call it a re-read:
+    # us/row at S=512 within 1.25x of us/row at S=1.
+    print("\n# query width S at 4096 ctx (split only) — prefill runs S=512")
+    print(f"{'S':>5} {'us':>10} {'us/row':>10} {'vs S=1':>8}")
+    base_row = None
+    for S in (1, 8, 32, 128, 512):
         a = inputs(4096, S, dev)
-        print(f"  S={S}: {ms(lambda: run(a))*1000:>8.1f}")
+        t = ms(lambda: ksplit(*a, scale, BLK, _THREADS), iters=5) * 1000
+        row = t / S
+        base_row = base_row or row
+        print(f"{S:>5} {t:>10.1f} {row:>10.2f} {row / base_row:>7.2f}x")
+    print("  flat us/row  -> every row re-reads the window; Q-tiling is the fix")
+    print("  falling      -> L2 already shares it; the win would be arithmetic only")
 
     # Flat = the redundancy is gone. Rising = threads reran the same chain.
     # Expect a step at >64t from occupancy even when redundancy is fixed.
@@ -148,6 +166,17 @@ def main() -> None:
     a = inputs(4096, 1, dev)
     for th in (32, 64, 128, 256):
         print(f"  {th:>3}t: {ms(lambda: ksplit(*a, scale, BLK, th))*1000:>8.1f}")
+
+    # block_N and KVSPLIT are the two shape knobs already in the factory, so the
+    # cheapest next question is whether either is simply mistuned for S>1.
+    print("\n# block_N x KVSPLIT at 4096 ctx, S=32 (us) — factory knobs, no new kernel")
+    a = inputs(4096, 32, dev)
+    for ks in (16, 32, 64):
+        row = []
+        for bn in (16, 32, 64):
+            k = kernels.make_paged_attention_split(be.target, KVSPLIT=ks, block_N=bn)
+            row.append(f"{ms(lambda k=k: k(*a, scale, BLK, _THREADS), iters=5) * 1000:>9.1f}")
+        print(f"  KVSPLIT={ks:>3}: " + " ".join(row) + "   (block_N 16/32/64)")
 
 
 if __name__ == "__main__":
