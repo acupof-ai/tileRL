@@ -61,52 +61,86 @@ prefill is host-bound, and the glue outweighs the kernel it wraps.
 Every row says how it was obtained. A derived row read as measured is how a
 bound turns into a fake measurement.
 
-Host for the timing rows: H20, GPU 4, `scripts/profile_prefill.py` and
-`scripts/bench_harness.py`. GPUs 2, 3, 5, 6, 7 idle; GPU 0 (50977 MiB) and
-GPU 1 (15973 MiB) held single-card jobs by other tenants throughout, on their
-own cards. The shipped-serial arm was re-measured in the same window rather
-than quoted, and it reproduces the recorded quiet-host baseline to 0.2%
-(233.8 vs 233.9 ms, 3827 vs 3827 kernels, 2242.3 vs 2238.6 tok/s) — which is
-what licenses the ratio.
+The whole table comes from one uncontended window (H20, GPU 4, all eight cards
+0 MiB / 0% at the start). The shipped-serial arm is not quoted — it is clean
+`origin/main` (a702c9a) synced to its own directory and run in the same window,
+twice, bracketing the WY arm:
+
+| depth | serial (1st) | WY | serial (2nd) | WY / serial | vs recorded baseline |
+|---|---:|---:|---:|---:|---:|
+| 512 | 2238.1 | **2887.6** | 2243.2 | 1.287x | 1.290x |
+| 2048 | 2215.4 | **2852.5** | 2220.7 | 1.284x | 1.287x |
+| 8192 | 2135.3 | **2729.0** | 2146.8 | 1.271x | 1.274x |
+
+The serial bracket closes to 0.2-0.5% either side of the WY arm and lands
+within 0.3% of the recorded 2238.6 / 2215.9 / 2142.4, so nothing drifted across
+the window. The WY numbers reproduce an earlier session to 0.15% / 0.06% /
+0.14% (2891.7 / 2854.2 / 2732.8). Ship gate was 1.15x.
 
 | metric | how | shipped serial | WY, torch glue | WY + prep/post |
 |---|---|---:|---:|---:|
 | prefill GPU-busy, ms (64 layers, 512 tok) | measured | 233.8 | 189.9 | **176.4** |
 | kernels per prefill | measured | 3827 | 6755 | **3925** |
 | GDN launches per layer | derived from the row above | 14 | 75 | 16 |
-| harness prefill 512, tok/s | measured | 2242.3 | 2324.6 | **2891.7** |
-| harness prefill 2048, tok/s | measured | 2221.7 | — | **2854.2** |
-| harness prefill 8192, tok/s | measured | 2147.1 | — | **2732.8** |
 | WY core, us/layer (fla 145.5) | measured | ~1400 | 137.4 | 121.8 |
 
-Ship gate was 1.15x against the recorded 2238.6 / 2215.9 / 2142.4 tok/s:
+**The prediction landed, and where it missed.** The launch-count argument
+rested on ~3875. Actual 3925 — **+50, +1.3%**, or 16 launches a layer where 15
+was predicted: one call a layer unaccounted. The 1.77x launch inflation that
+made a 1.23x GPU-busy win read as 1.036x end to end is gone (3925/3827 =
+1.026x). `gdn_prep` costs 3.34 ms over 48 launches and `gdn_post` 5.35 ms over
+48 — 8.7 ms of GPU for what had been ~36 ms of torch glue; `rmsnorm_fused`
+drops 209 → off the top eight and `silu_mul` 112 → 64, both absorbed. The path
+also beats fla's own chunked route end to end: 176.4 ms and 3925 kernels
+against 193.4 ms and 6899.
 
-| depth | vs recorded baseline | vs same-session serial |
-|---|---:|---:|
-| 512 | 1.292x | 1.290x |
-| 2048 | 1.288x | 1.285x |
-| 8192 | 1.276x | 1.273x |
+### Correction: the 8192 spread was not the neighbouring tenant
 
-**The prediction landed, and where it missed.** The launch-count argument rested
-on ~3875. Actual 3925 — **+50, +1.3%**. Per layer that is 16 launches, not the
-15 predicted: one call a layer I did not account for. The direction and the
-magnitude hold, and the 1.77x launch inflation that made the fast core read as
-1.036x is gone (3925/3827 = 1.026x).
+An earlier revision of this entry marked 2729.0 approximate and blamed 27.0%
+spread on a tenant's job restarting mid-run. **That attribution was wrong**, and
+the quiet window disproved it: with the host empty at the start the same row
+came back at 50.4% spread, while the serial arm at the same depth in the same
+window read 0.0% and 1.2%. Host contention does not explain a spread that only
+one arm sees.
 
-`gdn_prep` costs 3.34 ms over 48 launches and `gdn_post` 5.35 ms over 48 —
-8.7 ms of GPU for what had been ~36 ms of torch glue. `rmsnorm_fused` drops
-209 → below the top 8 and `silu_mul` 112 → 64 launches, both absorbed by
-`gdn_post`. The WY path now also beats fla's own chunked route on this model
-end to end: 176.4 ms and 3925 kernels against 193.4 ms and 6899.
+Measuring the distribution instead of the summary settles it. `suite_prefill`
+reports a **median of three runs** and `(max-min)/median` as spread, on one
+engine reused across all three lengths. Timing eight consecutive runs at each
+depth directly:
 
-**Caveat on the 8192 row.** Its first measurement carried 27.0% spread where
-512 and 2048 carried 0.1%, so the absolute 2732.8 is soft. Re-running that
-depth alone caught the reason: the neighbouring tenant's five-GPU job restarted
-mid-run and took GPU 4, and both arms collapsed together — serial 964.8 and
-967.2 tok/s, WY 1240.5 and 1240.4. The absolute numbers from that pass are
-discarded. The *ratio* survived contention unchanged, which is the number the
-gate reads: **1.273x, 1.286x, 1.282x across three independent runs**, two of
-them on a shared card. Treat 2732.8 as approximate and 1.27-1.29x as solid.
+| arm | 8192, eight consecutive runs | spread |
+|---|---|---:|
+| WY | 1217 1215 1216 1216 1217 1217 1216 1215 | **0.16%** |
+| serial | 940 940 939 940 939 941 939 939 | 0.21% |
+
+(That pass ran under contention — GPUs 0 and 2 at 98% — so the absolutes are
+~2.2x low and only the shape is being read. The ratio there is 1.294x.)
+
+The WY path at 8192 is the *steadiest* series in the set, not a noisy one. The
+27% and 50% figures are an artifact of a three-run sample inside a suite that
+reuses one engine across three lengths; they are not a property of this change.
+The median they report is reproducible to 0.14% across two independent
+sessions. **2729.0 stands without qualification.** What remains unexplained is
+why the artifact lands on the WY arm and not the serial one — plausibly because
+WY's per-tick GPU time is lower, so a fixed host-side stall is a larger
+fraction of it, but that is a hypothesis I did not test.
+
+The 8192 ratio has now been measured five times across three sessions and two
+contention states: **1.273, 1.286, 1.282, 1.271, 1.294** — the claim that
+survived contention, and the one that survives the quiet host too.
+
+### Baseline file
+
+`docs/experience/wins/bench-baseline.json` is deliberately not hand-edited; it
+still holds the pre-flip 2237.8 / 2218.4 / 2144.8. From this run the harness's
+own raise would set **len512 → 2887.6** and **len2048 → 2852.5** (it emitted
+both `RAISED` lines). It declined to raise len8192 because that row's sampled
+spread exceeded its noise bar; on a quiet card that row should seed at ~2729.
+Until a post-merge `tilerl bench --suite prefill` runs, the prefill gate is
+loose — a regression to ~2300 tok/s would still pass against the stale
+baseline.
+
+## Correctness
 
 sm90 parity, `scripts/probe_gdn_wy.py` on H20, gate 1e-2 relative:
 
@@ -116,7 +150,7 @@ sm90 parity, `scripts/probe_gdn_wy.py` on H20, gate 1e-2 relative:
 | (b) `_gdn_wy_core` vs `reference.gdn_chunk_core` | 6.6e-3 | 6.1e-3 | — |
 | (b) `_gdn_wy_core` vs fla `chunk_gated_delta_rule` | 3.5e-3 | 4.8e-3 | — |
 
-(b2) is the gate for the two new cells — it is the only thing that runs
+(b2) is the gate for the two new cells — the only thing that runs
 `make_gdn_prep_bf16` and the bf16 `gdn_post` at all. The bf16-IO error is three
 orders above the f32 cells and still inside 1e-2; the same shape appears in
 `test_gdn_chunk_fused_parity_full_scale`, where the bf16 kernel lands at 1.2%
