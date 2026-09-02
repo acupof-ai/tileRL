@@ -156,9 +156,6 @@ class _DecodeGraph:
     H2D copies of the inputs plus one replay. Replay mutates the engine's own
     pools like the eager path; warmup writes to block 0 / slot 0 are overwritten
     before any real request reads them.
-    # ponytail: captured lazily on the first decode tick (first token pays JIT +
-    # capture); capture at engine build is the upgrade.
-    # ponytail: captured lazily on the first decode tick, so first token pays JIT + capture.
     # ponytail: no recapture after training — the graph bakes the f32 embed cast.
     """
 
@@ -758,34 +755,72 @@ class Engine:
                 else:
                     pf.phase = _PHASE_DECODE
 
+    def _graph_bucket(self, rows: int) -> int:
+        """The batch dimension a tick of ``rows`` decodes keys its graph on: the
+        next bucket up, or the exact size above the ladder. `precapture` walks
+        this over every admissible row count, so the two cannot disagree about
+        which graphs exist."""
+        b = next((c for c in _GRAPH_BUCKETS if c >= rows), None)
+        return rows if b is None or self.limits.max_batch < b else b
+
+    def _graph_for(self, B: int, W: int, keep: bool) -> "_DecodeGraph | None":
+        """The (B, W) graph, capturing it on first use. None (and graphs off) if
+        capture fails, so the caller runs eager."""
+        g = self._decode_graphs.get((B, W))
+        if g is not None:
+            return g
+        try:
+            if self._graph_pool is None:
+                self._graph_pool = torch.cuda.graph_pool_handle()
+            g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B,
+                             width=W, pool=self._graph_pool, keep=W if keep else 0)
+        except Exception as exc:
+            warnings.warn(f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback")
+            self._decode_graph_on = False
+            return None
+        self._decode_graphs[(B, W)] = g
+        return g
+
+    def graph_keys(self) -> set[tuple[int, int]]:
+        """Every (bucket, width) a decode tick can key on under these limits."""
+        widths = range(1, 2 + self._spec_depth) if self._draft is not None else (1,)
+        return {(self._graph_bucket(rows), w)
+                for rows in range(1, self.limits.max_batch + 1) for w in widths}
+
+    def precapture(self) -> int:
+        """Capture every graph a decode tick can ask for; return how many exist.
+
+        Capture costs ~14 s each and, until a graph exists, that tick IS the
+        capture rather than a replay — 1088 ms/token on a cold server against 26
+        warm. Waiting for real traffic to produce each width is a lottery: chain
+        width varies per tick because the draft's confidence truncates it, so a
+        warmup that merely generated tokens left two widths uncaptured and the
+        first two requests paid 14 s and 12 s. `graph_keys` enumerates instead.
+        """
+        if not self._decode_graph_on:
+            return 0
+        for B, W in sorted(self.graph_keys()):
+            # keep matches the tick that will use this graph: W>1 is a verify
+            # (chains present, keep=W), W==1 is a plain decode (chains None).
+            if self._graph_for(B, W, keep=W > 1) is None:
+                break  # capture failed: graphs are off now
+        return len(self._decode_graphs)
+
     def _run_decode_graph(self, reqs: list[_Req], chains=None) -> bool:
         """Captured decode for a pure-decode tick, one graph per size bucket (a
         graph per exact size OOMed B=64 on the drain). Returns False and flips
         the flag off when capture failed, so the caller runs eager."""
         n, W = len(reqs), len(chains[0]) if chains else 1
-        B = next((c for c in _GRAPH_BUCKETS if c >= n), None)
-        if B is None or self.limits.max_batch < B:
-            B = n  # above the ladder: one exact-size graph rather than none
+        B = self._graph_bucket(n)
         if n < B and self._pad_slot is None:
             try:
                 self._pad_slot = self._states.alloc_slot()
                 self._pad_block = self._kv.alloc_block()
             except RuntimeError:
                 B = n  # no spare capacity to park padding rows on: exact size
-        g = self._decode_graphs.get((B, W))
+        g = self._graph_for(B, W, keep=bool(chains))
         if g is None:
-            try:
-                if self._graph_pool is None:
-                    self._graph_pool = torch.cuda.graph_pool_handle()
-                g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B,
-                                 width=W, pool=self._graph_pool, keep=W if chains else 0)
-            except Exception as exc:
-                warnings.warn(
-                    f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback"
-                )
-                self._decode_graph_on = False
-                return False
-            self._decode_graphs[(B, W)] = g
+            return False
         pad = None if self._pad_slot is None else (self._pad_slot, self._pad_block)
         logits = g.run(reqs, chains, pad=pad)
         self._decode_forwards += 1

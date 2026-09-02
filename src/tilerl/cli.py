@@ -46,7 +46,8 @@ def _build_model(
     )
 
 
-def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16):
+def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16,
+                  blocks=0, max_ctx=0, max_batch=2):
     """Serving-size engine; ``devices`` replicates it across those CUDA indices.
 
     ``draft``: an MTP/NextN head safetensors path (or the checkpoint shard that
@@ -55,15 +56,25 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
     bandwidth-bound card the verify rows are nearly free. ``slots`` sizes the
     GDN state pool; with a draft each slot also owns spec_steps of step-state,
     so a 32 GB card needs 4, not the 16 a 96 GB card affords.
+
+    ``max_ctx`` caps the served context and ``blocks`` the KV pool. Both default
+    to the model's own limit, which for the 27B is 262144 tokens = 131072 blocks
+    = 275 GB of f32 KV — fine on the 96 GB card this was written for, an instant
+    OOM on a 32 GB V100. The bench scripts always passed num_blocks explicitly,
+    so ``serve`` was the one path that never saw the real number.
+
+    ``max_batch`` 2 suits a single-user endpoint: it bounds admitted rows, and a
+    decode graph is captured per (bucket, chain width), so a smaller ceiling is
+    fewer captures to warm and less to hold.
     """
     from . import engine as engine_mod
     from .kv_cache import BLOCK_TOKENS
 
     # Token budget follows the context; ByteTokenizer makes one token per byte.
-    ctx = int(cfg.max_position_embeddings)
+    ctx = int(max_ctx or cfg.max_position_embeddings)
 
-    kw = dict(num_blocks=max(256, (ctx * 8) // BLOCK_TOKENS), num_slots=slots,
-              max_batch=8, max_total_tokens=ctx)
+    kw = dict(num_blocks=blocks or max(256, (ctx * 8) // BLOCK_TOKENS), num_slots=slots,
+              max_batch=max_batch, max_total_tokens=ctx)
     if draft is not None:
         kw["draft"], kw["spec_depth"] = draft, depth
     if not devices:
@@ -96,12 +107,18 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
         draft = load_draft(model, args.draft)
     engine = _build_engine(cfg, model, backend, devices=args.devices,
-                           draft=draft, depth=args.depth, slots=args.slots)
+                           draft=draft, depth=args.depth, slots=args.slots,
+                           blocks=args.blocks, max_ctx=args.max_ctx,
+                           max_batch=args.max_batch)
     tokenizer = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
-    engine.run()
     print(f"tilerl serve: model={cfg.name} target={backend.target}")
+    if args.warmup:
+        t0 = time.perf_counter()
+        n = engine.precapture()
+        print(f"tilerl serve: {n} decode graphs in {time.perf_counter() - t0:.0f}s")
+    engine.run()
     print(f"tilerl serve: http://{args.host}:{args.port}  (Ctrl+C to stop)")
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
@@ -457,7 +474,23 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.add_argument("--slots", type=int, default=16,
                          help="GDN state slots; lower on <40GB GPUs (with --draft each slot "
                               "also owns the per-step verify states)")
-    p_serve.set_defaults(func=cmd_serve)
+    p_serve.add_argument("--blocks", type=int, default=0,
+                         help="KV blocks (16 tokens each); 0 = size from the model's context. "
+                              "The 27B's 262144-token context asks for 131072 blocks = 275 GB "
+                              "of f32 KV, so a 32GB card needs this set: 2048 serves 8 rows "
+                              "of 4K, 4096 serves 8K.")
+    p_serve.add_argument("--max-ctx", type=int, default=0,
+                         help="cap served context (0 = the model's own limit); pairs with "
+                              "--blocks so a request cannot outgrow the pool")
+    p_serve.add_argument("--max-batch", type=int, default=2,
+                         help="concurrent rows; 2 suits a single-user endpoint (a decode "
+                              "graph is captured per bucket x chain width, so a lower "
+                              "ceiling is fewer captures)")
+    p_serve.add_argument("--no-warmup", dest="warmup", action="store_false",
+                         help="skip the throwaway requests that pre-capture the decode graphs; "
+                              "the first real messages then pay for them (1088 ms/token falling "
+                              "to 26 over six requests on sm70)")
+    p_serve.set_defaults(func=cmd_serve, warmup=True)
 
     p_train = sub.add_parser("train", help="SFT, --rl (GRPO) or --opd; --recipe for a gated flag set")
     p_train.add_argument("--model", choices=["tiny", "tiny-agent", "qwen38-27b"], default="tiny")

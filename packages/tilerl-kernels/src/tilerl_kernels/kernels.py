@@ -474,7 +474,19 @@ def make_embedding(target: str, dtype: str = "float32"):
                 Y[i, d] = T.cast(Table[Idx[i], d], "float32")
         return Y
 
-    return {"float32": embedding_f32, "bfloat16": embedding_bf16}[dtype]
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    def embedding_f16(Idx, Table, threads):
+        M, D = T.const("M, D")
+        V = T.const("V")
+        Idx: T.Tensor((M,), "int32")
+        Table: T.Tensor((V, D), "float16")
+        Y = T.empty((M, D), "float32")
+        with T.Kernel(M, threads=threads) as i:
+            for d in T.Parallel(D):
+                Y[i, d] = T.cast(Table[Idx[i], d], "float32")
+        return Y
+
+    return {"float32": embedding_f32, "bfloat16": embedding_bf16, "float16": embedding_f16}[dtype]
 
 
 # ---------------------------------------------------------------- linear fp4

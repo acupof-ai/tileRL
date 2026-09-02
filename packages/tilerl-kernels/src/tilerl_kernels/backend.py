@@ -158,6 +158,12 @@ class Backend:
         # Declared beside io for the same reason: the store (materialize) and the
         # kernel annotation must not drift (wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi).
         self.scale_io = torch.float16 if self.arch == "sm70" else torch.float32
+        # Narrow dtype for the embedding gather only — NOT io, which the f32
+        # kernels depend on. Half the table's bytes on the card, and the gather
+        # widens to f32 on read.
+        self.embed_io = {"sm90": torch.bfloat16, "sm70": torch.float16}.get(
+            self.arch, torch.float32
+        )
         self._kernels: dict[str, object] = {}
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
         self._const_f32_cache: dict[tuple[int, int | None], tuple[Any, int, torch.Tensor]] = {}
@@ -588,9 +594,19 @@ class Backend:
         _twiddle = {"sm90": reference.twiddle_fp4, "sm70": reference.twiddle_fp4_f16}.get(self.arch)
         served = _twiddle is not None and "linear_fp4_gemv" in _resolve(self.precision, self.arch)
         narrow = served and self.scale_io != torch.float32
+        # The embedding table rides the same trick as the scale plane, and for a
+        # sharper reason: materialize puts the bf16 table on the card, then the
+        # gather's f32 cast made a SECOND copy — 2.37 + 4.74 = 7.11 GiB for the
+        # 27B's 248320x5120, which is what OOMed `serve` on a 32 GB card. Cast
+        # during the move and only the narrow one ever exists. Untied only: a
+        # tied table is ALSO the lm_head weight, and that linear wants f32 IO.
+        untied = any(k == "lm_head" or k.startswith("lm_head.") for k in out)
+        emb = "embed_tokens" if untied and self.embed_io != torch.float32 else None
         moved = {
             k: v.to(self.device, self.scale_io)
             if narrow and k.endswith(".scale")
+            else v.to(self.device, self.embed_io)
+            if k == emb
             else v.to(self.device)
             for k, v in out.items()
         }
@@ -1007,12 +1023,18 @@ class Backend:
         return self._f32(residual).reshape(rows, n).contiguous()
 
     def embedding(self, idx, table):
-        # bf16-IO cells (sm90) gather the table as-is (2.4 GiB vs a 4.7 GiB f32
-        # copy); f32 cells must cast, and the C target cannot codegen bf16
-        if table.dtype == torch.bfloat16 and self.io == torch.bfloat16:
-            table, dt = self._c(table.to(self.device)), "bfloat16"
-        else:
+        # Read the table in whatever narrow dtype materialize put on the card and
+        # widen on the gather; cast here only if it is still f32-or-wider. The
+        # 27B's table is 248320x5120 — bf16 in the checkpoint (2.37 GiB), f32
+        # 4.74 — and this used to cast unconditionally and cache the result, so
+        # BOTH lived on the card: 7.11 GiB for one tensor, which OOMed `serve` on
+        # its first token. Never narrow here: that would just be the same second
+        # copy one dtype smaller. materialize is the only place that decides.
+        dt = {torch.bfloat16: "bfloat16", torch.float16: "float16"}.get(table.dtype)
+        if dt is None or table.dtype != self.embed_io:
             table, dt = self._const_f32(table), "float32"
+        else:
+            table = self._c(table.to(self.device))
         idx_flat = self._i32(idx).reshape(-1).contiguous()
         k = self._kernel("embedding", dt)
         y = k(idx_flat, table, threads=_THREADS)

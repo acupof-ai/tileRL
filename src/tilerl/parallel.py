@@ -82,6 +82,13 @@ class DataParallelEngine:
     def is_idle(self) -> bool:
         return all(e.is_idle() for e in self._engines)
 
+    def precapture(self) -> int:
+        total = 0
+        for i, e in enumerate(self._engines):
+            with _on(self._devices[i]):
+                total += e.precapture()
+        return total
+
     def run(self) -> None:
         for i, e in enumerate(self._engines):
             with _on(self._devices[i]):

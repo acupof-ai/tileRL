@@ -404,3 +404,29 @@ def test_image_blocks_are_refused_not_dropped(client, tmp_path, monkeypatch):
     })
     assert r.status_code == 400, r.text
     assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_serve_sizes_its_pools_from_the_flags_not_the_context():
+    """`tilerl serve`'s own engine builder must honour --blocks / --max-ctx.
+
+    This is the one path no benchmark reaches: every bench script constructs the
+    engine itself and passes num_blocks, so `_build_engine`'s default went
+    unexercised until it asked for 275 GB of KV on a 32 GB card (131072 blocks
+    from the 27B's 262144-token context). The gate is that the flags win and
+    that the default is still derived from the context, which is what a
+    large-card target relies on.
+    """
+    from tilerl import cli
+    from tilerl.kv_cache import BLOCK_TOKENS
+
+    cfg = tiny(max_position_embeddings=4096)
+    model = build_random(cfg, seed=3)
+    be = get_backend()
+
+    e = cli._build_engine(cfg, model, be, blocks=64, max_ctx=256, max_batch=2)
+    assert e._kv.num_blocks == 64
+    assert e.limits.max_total_tokens == 256, "a request must not outgrow the pool"
+    assert e.limits.max_batch == 2
+
+    d = cli._build_engine(cfg, model, be)
+    assert d._kv.num_blocks == (4096 * 8) // BLOCK_TOKENS, "default still tracks the context"
