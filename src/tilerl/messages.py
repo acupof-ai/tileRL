@@ -36,7 +36,7 @@ import secrets
 import time
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -46,6 +46,9 @@ __all__ = ["mount_messages", "MessagesRequest", "record_path"]
 
 #: One JSONL row per request. Overridable so a test does not write the real one.
 _RECORD_ENV = "TILERL_MESSAGES_RECORD"
+
+#: The episode tag, set per rollout via ANTHROPIC_CUSTOM_HEADERS.
+_ROLLOUT_HEADER = "x-tilerl-rollout"
 
 
 def record_path() -> str:
@@ -155,7 +158,7 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def _run(req: MessagesRequest) -> tuple[dict[str, Any], int]:
+    def _run(req: MessagesRequest, rollout: str | None = None) -> tuple[dict[str, Any], int]:
         input_ids = tokenizer.encode(_render(req))
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
@@ -189,6 +192,7 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             stop_reason = "max_tokens" if len(out) >= params.max_new_tokens else "end_turn"
         _record({
             "request_id": rid,
+            "rollout": rollout,
             "model": req.model or model_name,
             "prompt_ids": [int(t) for t in input_ids],
             "completion_ids": [int(t) for t in out],
@@ -207,9 +211,14 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         }, rid
 
     @app.post("/v1/messages")
-    async def messages(req: MessagesRequest):  # noqa: D401 - route
+    async def messages(req: MessagesRequest, request: Request):  # noqa: D401 - route
+        # One rollout is many requests (Claude Code turns), and GRPO's advantage
+        # is per EPISODE, not per turn -- so every row needs the episode's tag.
+        # ANTHROPIC_CUSTOM_HEADERS carries it: measured 2026-09-02, the CLI
+        # passes it through verbatim, which metadata.user_id would not survive.
+        rollout = request.headers.get(_ROLLOUT_HEADER)
         try:
-            body, rid = _run(req)
+            body, rid = _run(req, rollout)
         except ValueError as exc:
             return JSONResponse(status_code=400,
                                 content={"type": "error",
