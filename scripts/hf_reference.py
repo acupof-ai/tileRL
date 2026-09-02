@@ -1,14 +1,6 @@
-"""External ground truth: run the checkpoint through HF transformers and dump
-per-layer hidden-state norms + the greedy first token, so tileRL's collapse
-(check 2) can be bisected against a reference that is known-correct. Every
-tileRL op passes parity at real dims and attention/GDN match the HF source by
-inspection, so the bug is wiring or weight interpretation — only an external
-forward can localize it.
-
+"""HF transformers ground truth: per-layer last-token hidden + logits for
+'The capital of France is', saved to /work/hf_ref.pt for hf_bisect.py.
   python3 -u scripts/hf_reference.py /data00/Qwen3.8-27B-NVFP4 --gpu 6
-
-Prints layer 0/1/2/3/last hidden norms and the argmax token for
-'The capital of France is'. Compare against tileRL's health_probe residuals.
 """
 
 from __future__ import annotations
@@ -56,9 +48,6 @@ def main() -> int:
     print(f"top5 ids: {top.indices.tolist()}")
     print(f"top5 decoded: {[tok.decode([t]) for t in top.indices.tolist()]}")
 
-    # Dump every layer's last-token hidden vector + the prompt ids + logits so
-    # tileRL can bisect element-wise: the first layer whose vector diverges
-    # (cosine << 1 or relerr >> quant tol) against tileRL's own is the bug site.
     torch.save(
         {
             "ids": ids.cpu(),

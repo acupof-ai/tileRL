@@ -1,8 +1,5 @@
-"""Where do the 90 GB of a 27B LoRA train step go?
-
-b=2 x t=256 OOMs on a 95 GB H20, which caps training at ~256 tokens per step.
-Peak allocation per (layer count, T), plus the size of the GDN backward's
-per-time-step state tensor, says whether that cap is the tape or one tensor.
+"""Peak train-step allocation per T for the 27B LoRA, plus the GDN backward's per-time-step
+state size. b=2 x t=256 OOMs on a 95 GB H20, capping training at ~256 tokens per step.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/probe_train_mem.py /data00/Qwen3.8-27B-NVFP4

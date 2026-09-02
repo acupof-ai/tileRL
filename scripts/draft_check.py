@@ -1,11 +1,5 @@
-"""Is the draft head wired correctly? One forward, no loop, no state.
-
-Teacher-forced: run the trunk over a real prompt, then run the draft head ONCE
-over every position with the true next token as its input. Top-1 agreement with
-the trunk's own argmax is the head's quality; mean max-probability says whether
-it is confident or emitting noise. Neither number depends on any rollout
-bookkeeping, which is where five earlier acceptance readings went wrong.
-
+"""Is the draft head wired correctly? Teacher-forced, one forward, no rollout
+bookkeeping: top-1 agreement with the trunk argmax plus mean max-probability.
   python scripts/draft_check.py /data00/Qwen3.8-27B-NVFP4 --gpu 7
 """
 
@@ -50,8 +44,7 @@ def main() -> None:
     trunk = load_hf(cfg, args.source, fuse_projections=True)
     draft = load_draft(trunk, Path(args.source) / "model_mtp.safetensors")
     if args.swap_fc:
-        # The engine concatenates [embed, hidden]; swapping fc's two column
-        # halves tests the other order without a flag in the engine.
+        # the engine concatenates [embed, hidden]; swap fc's column halves to test the other order
         w = draft.params["fc"]
         h = w.shape[-1] // 2
         draft.params["fc"] = torch.cat([w[..., h:], w[..., :h]], dim=-1).contiguous()
@@ -89,16 +82,12 @@ def main() -> None:
     dk.state_pool = None
     dl = draft.forward(hid[-1][:, : t - 1], arr([ids[1:]]), arr(range(1, t)), dk, backend)
 
-    # Per-stage scale: a head that is wired right produces a final hidden of
-    # roughly the trunk's magnitude. A blow-up or collapse localises the fault
-    # better than any guess about which tensor is misnamed.
-    import torch as _t
-
-    e = backend.embedding(_t.as_tensor(arr([ids[1:]]), device=backend.device),
+    # per-stage scale: a blow-up or collapse localises a miswired tensor
+    e = backend.embedding(torch.as_tensor(arr([ids[1:]]), device=backend.device),
                           trunk.params["embed_tokens"])
     en = backend.rmsnorm(e, draft.params["pre_fc_norm_embedding"], cfg.rms_eps)
     hn = backend.rmsnorm(hid[-1][:, : t - 1], draft.params["pre_fc_norm_hidden"], cfg.rms_eps)
-    xf = backend.linear(_t.cat([en, hn], dim=-1), draft.params["fc"])
+    xf = backend.linear(torch.cat([en, hn], dim=-1), draft.params["fc"])
     for nm, v in [("trunk hidden", hid[-1]), ("embed", e), ("norm(embed)", en),
                   ("norm(hidden)", hn), ("fc out", xf)]:
         print(f"  std {nm:<14} {v.float().std().item():>9.4f}  "
@@ -111,10 +100,7 @@ def main() -> None:
     print(f"  trunk argmax's rank in the draft's distribution: median "
           f"{rank.float().median().item():.0f} of {cfg.vocab_size}")
 
-    # Bisect the readout before blaming the head. (1) the trunk's own final
-    # norm + lm_head over the same hidden must reproduce the trunk's logits —
-    # if it does not, `hidden_out` is not the tensor this head is fed. (2) the
-    # same hidden through the HEAD's norm isolates whether the readout is sane.
+    # readout bisect: trunk final_norm + lm_head over hidden_out must reproduce the trunk logits
     ln = trunk._linear(backend, backend.rmsnorm(hid[-1], trunk.params["final_norm"],
                                                 cfg.rms_eps), "lm_head")
     mn = trunk._linear(backend, backend.rmsnorm(hid[-1], draft.params["norm"],
@@ -123,8 +109,8 @@ def main() -> None:
           f"{100 * (ln[0].argmax(-1) == tl[0].argmax(-1)).float().mean():.1f}%; "
           f"through the head's norm {100 * (mn[0].argmax(-1) == tl[0].argmax(-1)).float().mean():.1f}%")
 
-    want = tl[0, 1:].argmax(-1)            # the trunk's own next-token argmax
-    got = dl[0].argmax(-1)                 # the draft's guess at the same place
+    want = tl[0, 1:].argmax(-1)
+    got = dl[0].argmax(-1)
     agree = (want == got).float().mean().item()
     conf = torch.softmax(dl[0].float(), -1).max(-1).values
     print(f"{t} tokens, fc order {'hidden,embed' if args.swap_fc else 'embed,hidden'}")

@@ -1,34 +1,11 @@
-"""TileLang JIT kernels for tilerl, target-neutral (block-parallel, no warp
-specifics) so every kernel compiles on CPU (``target="c"``) and GPU.
+"""Target-neutral TileLang kernels: the CPU/metal floor, f32 compute.
 
-Verified CPU facts (tilelang 0.1.13, macOS arm64) baked in here: at most one
-``T.alloc_shared`` per kernel (prefer fragments/global); ``T.clear`` does not
-lower on shared memory for CPU (zero shared buffers with a parallel loop);
-``T.gemm`` has a CPU scalar fallback (global operands + a shared accumulator
-tile work; fragment accumulators fail layout inference); serial reductions
-use a ``T.alloc_fragment((1,))`` accumulator (a bare Python float leaks the
-loop var at ``MakePackedAPI``); eager ``@tilelang.jit`` does NOT specialize on
-dtype — kernels are f32, the backend wrapper casts bf16 inputs to f32.
-``# ponytail: f32 compute day-1, bf16 IO/mixed precision day-2``
-
-Metal facts (tilelang 0.1.13, Apple Silicon, 2026-08-24): fragment-scalar
-accumulations must use ``T.serial`` reduction loops — Metal does not
-cross-thread-reduce a fragment scalar the way CPU's serial lowering does, so
-``T.Parallel`` reductions silently compute per-thread partials. Metal's
-``T.gemm`` rejects global-scope operands, so the metal dispatch cell swaps in
-the naive FMA gemm schedules at the bottom of this file (same signatures,
-same block semantics).
-CUDA facts (tilelang 0.1.13, H20/sm90, 2026-08-24): the MMA lowering has the
-same global-operand rejection ("Unsupported gemm combination, A: global,
-B: global") and requires tile M/N divisible by 16, so the naive FMA schedules
-below are the fallback for arches without an MMA cell (metal today); the
-sm90 cell uses the WGMMA schedules in kernels_linear.py instead. The per-thread
-fragment accumulator also false-positives the static data-race check (same
-as Metal/CPU), so the CUDA cell disables it too. A serial ``j`` loop nested inside a parallel ``i``
-loop miscompiles on Metal (output columns past the first few come back
-wrong); the portable shape is a 2D ``for i, j in T.Parallel(...)`` nest with
-the reduction serial inside — that is why ``linear_fp4`` is shaped like the
-metal gemms.
+Portability rules baked in (tilelang 0.1.13): one T.alloc_shared per kernel;
+serial reductions into a T.alloc_fragment((1,)) scalar (Metal does not
+cross-thread-reduce a fragment, and a serial j loop inside a parallel i loop
+miscompiles there, so reductions sit inside a 2D T.Parallel nest); T.gemm
+rejects global operands on Metal/CUDA, so those cells use the naive FMA gemms.
+# ponytail: f32 compute day-1, bf16 IO/mixed precision day-2
 """
 
 from __future__ import annotations
@@ -36,48 +13,18 @@ from __future__ import annotations
 import tilelang
 import tilelang.language as T
 
-__all__ = [
-    "make_rmsnorm_partial",
-    "make_rmsnorm_apply",
-    "make_rmsnorm_rstd",
-    "make_rmsnorm_bwd_x",
-    "make_gemm_nt",
-    "make_gemm_nn",
-    "make_gemm_tn",
-    "make_gemm_nt_naive",
-    "make_gemm_nn_naive",
-    "make_gemm_tn_naive",
-    "make_silu_mul",
-    "make_softmax",
-    "make_rope",
-    "make_embedding",
-    "make_linear_fp4",
-    "make_paged_attention",
-]
-
 
 def _pass_configs(target: str) -> dict[str, object]:
+    # the static race check false-positives on per-thread fragments
     if target in ("c", "llvm"):
-        return {
-            "tirx.disable_vectorize": True,
-            "tl.disable_data_race_check": True,
-        }
+        return {"tirx.disable_vectorize": True, "tl.disable_data_race_check": True}
     if target == "metal" or target.startswith("cuda"):
-        # The static race check false-positives on per-thread fragments
-        # allocated inside a parallel loop (each thread owns its instance);
-        # the CPU cell disables the check for the same pattern.
         return {"tl.disable_data_race_check": True}
     return {}
 
 
 # ---------------------------------------------------------------- rmsnorm
-#
-# Split-K: the reduction dim is chunked across blocks (grid over chunks x
-# rows), so decode (M=1) is not one serial block. Phase 1 writes per-chunk
-# sums of squares; phase 2 reduces the few chunk sums and normalizes. The
-# tilelang example idiom (examples/norm/rms_norm.py, T.reduce_sum over a
-# whole-row fragment) is not portable: Metal does not cross-thread-reduce
-# fragments, so the per-chunk accumulator stays a serial fragment scalar.
+# split-K over the reduction dim so decode (M=1) is not one serial block
 
 
 def make_rmsnorm_partial(target: str):
@@ -102,9 +49,7 @@ def make_rmsnorm_partial(target: str):
 
 
 def make_rmsnorm_apply(target: str):
-    """Phase 2: rstd from the chunk sums, then y = x * rstd * w. Each block
-    redundantly reduces the few chunk sums (cheap) and writes its own chunk,
-    so the normalize pass is parallel even at M=1."""
+    """Phase 2: rstd from the chunk sums, then y = x * rstd * w per chunk."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def rmsnorm_apply(X, W, P, eps: T.float32, block_N, num_chunks, threads):
@@ -129,8 +74,7 @@ def make_rmsnorm_apply(target: str):
 
 
 def make_rmsnorm_apply_bf16(target: str):
-    """make_rmsnorm_apply writing bf16 (sm90: the consumer GEMVs are bf16-IO,
-    so the f32 output only fed a per-call cast kernel — 23 launches/8 layers)."""
+    """make_rmsnorm_apply writing bf16 (sm90: the consumer GEMVs are bf16-IO)."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def rmsnorm_apply(X, W, P, eps: T.float32, block_N, num_chunks, threads):
@@ -155,11 +99,8 @@ def make_rmsnorm_apply_bf16(target: str):
 
 
 def make_rmsnorm_fused_bf16(target: str):
-    """One launch per rmsnorm (sm90): a block per row, 256 threads each own a
-    strided K-slice, block-wide allreduce of the squared sum, then normalize
-    and write bf16. Replaces the split-K partial+apply pair (2 launches,
-    3.2 + 1.7 us in-graph) with a parallel reduction — the earlier single-block
-    attempt that regressed 20% reduced N=5120 serially in one thread
+    """One-launch rmsnorm (sm90): a block per row, block-wide allreduce of the
+    squared sum, bf16 out. A serial single-thread reduce regressed 20%
     (errors/2026-08-27-fused-rmsnorm-regression.md)."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
@@ -331,13 +272,7 @@ def make_gemm_tn(target: str):
 
 
 # ---------------------------------------------------------------- gemm (naive FMA schedule)
-#
-# Metal's T.gemm lowering rejects global-scope operands ("Unsupported gemm
-# combination, A: global, B: global"), and CUDA's MMA lowering rejects them
-# too (plus the m16n8k16 MMA requires tile M/N divisible by 16). The CPU
-# kernels' scalar-fallback T.gemm therefore has no Metal or CUDA path; both
-# cells use these naive explicit-FMA schedules instead — same signatures and
-# block semantics as the CPU kernels, no T.gemm, no shared-memory tiling.
+# Metal's T.gemm rejects global operands; same signatures as the CPU gemms.
 # ponytail: naive FMA day-1, shared-memory tiled T.gemm day-2
 
 
@@ -409,12 +344,7 @@ def make_gemm_tn_naive(target: str):
 
 
 def make_silu_mul(target: str):
-    """y = gate * sigmoid(gate) * up, elementwise.
-
-    Grid over M in block_M chunks: the single-block schedule (T.Kernel(1),
-    64 threads) left 8.9M elements on one block — 40% of the prefill tick on
-    sm90. The tail block guards its OOB lanes.
-    """
+    """y = gate * sigmoid(gate) * up, gridded over M (one block was 40% of a prefill tick)."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def silu_mul(Gate, Up, block_M, threads):
@@ -484,11 +414,7 @@ def make_softmax(target: str):
 
 
 def make_rope(target: str):
-    """Rotary embedding. X [B, T, H, D], Positions [B, T] int, InvFreq [D/2].
-
-    out[..., 2d]   = x0*cos - x1*sin
-    out[..., 2d+1] = x0*sin + x1*cos
-    """
+    """Rotary embedding. X [B, T, H, D], Positions [B, T] int, InvFreq [D/2]."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def rope(X, Positions, InvFreq, threads):
@@ -501,8 +427,7 @@ def make_rope(target: str):
             b = bt // S
             t = bt % S
             pos = Positions[b, t]
-            # rotate_half (Qwen/Llama): dim d pairs with d + D/2, both using
-            # frequency InvFreq[d]. NOT the adjacent (2d, 2d+1) GPT-J pairing.
+            # rotate_half (Qwen/Llama): d pairs with d + D/2, not GPT-J's (2d, 2d+1)
             half = D // 2
             for d in T.Parallel(half):
                 ang = T.cast(pos, "float32") * InvFreq[d]
@@ -521,17 +446,9 @@ def make_rope(target: str):
 
 
 def make_embedding(target: str, dtype: str = "float32"):
-    """Gather: Out[i, d] = Table[Idx[i], d]. Idx int32 [M], f32 out.
-
-    Two bodies, not one parametrized by ``dtype``: this module runs under
-    ``from __future__ import annotations``, so a ``T.Tensor`` annotation is a
-    string tilelang evaluates against module globals — a closure variable in it
-    raises NameError.
-
-    Reading the table in its own dtype matters because a gather does no
-    arithmetic, so bf16 in is exact, and the 27B's [248320, 5120] table is
-    either 2.4 GiB or a cached 4.7 GiB f32 copy beside it.
-    """
+    """Gather: Out[i, d] = Table[Idx[i], d], f32 out; the table is read in its
+    own dtype. Two bodies: a T.Tensor annotation is a string evaluated against
+    module globals, so it cannot close over ``dtype``."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def embedding_f32(Idx, Table, threads):
@@ -582,10 +499,6 @@ def make_linear_fp4(target: str):
         Y = T.empty((M, N), "float32")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             Cc = T.alloc_shared((block_M, block_N), "float32")
-            # 2D parallel nest + serial k reduction: the same schedule shape
-            # as the metal gemm kernels. (A serial j loop inside a parallel i
-            # loop miscompiles on Metal — columns past the first few come back
-            # wrong; on CPU T.Parallel lowers to serial either way.)
             for i, j in T.Parallel(block_M, block_N):
                 acc = T.alloc_fragment((1,), "float32")
                 acc[0] = 0.0
@@ -596,8 +509,7 @@ def make_linear_fp4(target: str):
                         ni32 = T.cast((byte >> ((k % 2) * 4)) & 15, "int32")
                         e = (ni32 >> 1) & 3
                         m = ni32 & 1
-                        # branch-free OCP e2m1: -min(e,1) kills the subnormal
-                        # mantissa ({0, 0.5}), -min(e|m,1) zeros nibble 0.
+                        # branch-free e2m1: -min(e,1) drops the subnormal mantissa, -min(e|m,1) zeros nibble 0
                         bits = (
                             ((ni32 & 8) << 28) | ((126 + e) << 23) | ((m << 22) & -T.min(e, 1))
                         ) & -T.min(e | m, 1)
@@ -616,14 +528,9 @@ def make_linear_fp4(target: str):
 
 
 def make_paged_attention(target: str):
-    """Paged causal attention, online softmax.
-
-    Q [B, T, H, D], K/V cache [num_blocks, Hkv, BLOCK, D], BlockTable [B, Mb]
-    int32, SeqLens [B] int32 (total length after this forward; query t sees
-    keys [0, seq_lens - T + t)), SeqQLens [B] int32 (valid query tokens per
-    row — mixed batches pad rows to a shared T; padding positions are
-    unmasked garbage the caller never reads). GQA: kv head = h * Hkv // H.
-    """
+    """Paged causal GQA attention, online softmax. SeqLens is the total length
+    after this forward (query t sees keys [0, seq_len - seq_q + t]); SeqQLens
+    bounds each row, padding rows are garbage the caller never reads."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def paged_attention(

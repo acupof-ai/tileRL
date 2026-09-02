@@ -1,10 +1,5 @@
-"""mma8 is register-bound: 128 regs/thread, 21.8% occupancy, 18.5% of DRAM peak,
-while issuing at only 44.6%. Neither bytes nor instructions bind it — resident
-warps do. Force ptxas to fit more blocks per SM and see whether the spill costs
-less than the occupancy buys.
-
-TileLang's `register_cuda_postproc` rewrites the generated source, which is how
-`__launch_bounds__` gets onto a kernel it emits.
+"""mma8 is register-bound (128 regs/thread, 21.8% occupancy). Force `__launch_bounds__` via
+TileLang's `register_cuda_postproc` and see whether the spill costs less than the occupancy buys.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/probe_mma8_regs.py
@@ -28,8 +23,7 @@ _want = [0]
 
 def _postproc(src: str, target) -> str:
     if _want[0] and KERNEL in src:
-        # Only this kernel: the callback is global, and the GEMV next door is
-        # already at 64 regs and 45% occupancy.
+        # only this kernel: the callback is global and the GEMV is already at 64 regs
         src = re.sub(
             r"(__global__\s+void\s+)(__launch_bounds__\(\s*\d+\s*(?:,\s*\d+\s*)?\)\s*)?"
             + KERNEL,
@@ -44,9 +38,8 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=17408)
     ap.add_argument("--k", type=int, default=5120)
     ap.add_argument("--iters", type=int, default=50)
-    # ONE value per process: tilelang caches compiled kernels by signature, and
-    # the postproc is not part of it, so a second arm in the same process (or
-    # against the same TILELANG_CACHE_DIR) silently reuses the first's binary.
+    # one value per process: the postproc is not in tilelang's cache key, so a second arm
+    # silently reuses the first's binary
     ap.add_argument("--blocks", type=int, default=0, help="minBlocksPerMultiprocessor; 0 = as-is")
     ap.add_argument("--dump", action="store_true", help="print the kernel's __global__ line")
     args = ap.parse_args()

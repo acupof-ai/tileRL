@@ -1,48 +1,10 @@
 #!/usr/bin/env python3
-"""Compile SOTA TileLang sources against our pinned tilelang — pre-port gate.
-
-Why: porting a SOTA kernel written for another tilelang version can burn hours
-hitting compile walls on our pin. This script compiles the corpus of upstream
-sources we copy from with OUR tilelang, on the target we ship, and reports
-per-file PASS/FAIL with the first error line. Compile gate only — a kernel that
-compiles but numerics-drift is out of scope.
-
-Compile semantics: tilelang JIT compiles lazily on first call. Every corpus
-kernel is lazy-mode (symbolic shape params), so calling the JIT object with
-those params IS the compile — no GPU tensors, no kernel execution. Autotune
-wrappers always run the tuner (GPU benchmarking), so they are bypassed via
-`.jit_impl.compile(...)`. PrimFunc factories (gated_delta_rule, qwen36 GDR) go
-through `tilelang.compile(prim_func, target=...)`.
-
-Usage (cuda pod):
-    CUDA_VISIBLE_DEVICES=7 TILELANG_DEFAULT_TARGET=cuda \\
-        python3 scripts/pod_portcheck.py --corpus-dir scripts/_portcheck_corpus
-
-First-run results — 2026-08-26, H20 pod, tilelang 0.1.13, target cuda (sm90):
-
-    corpus file                                                result  time
-    gemm/example_gemm.py                                       PASS    2.3s
-    dequantize_gemm/example_dequant_gemm_bf16_fp4_hopper.py    PASS    2.1s
-    dequantize_gemm/example_dequant_gemv_fp16xint4.py          PASS    1.2s
-    deepseek_deepgemm/example_deepgemm_fp8_2xAcc.py            PASS    2.1s
-    flash_attention/example_mha_fwd_bshd.py                    PASS    3.0s
-    cast/example_per_token_cast_to_fp8.py                      PASS    1.7s
-    gdn/qwen36_gdr_decode_fused.py :: gdr_decode_gated_norm    PASS    1.4s
-    gdn/qwen36_gdr_decode_fused.py :: gdr_decode_conv_gated_norm PASS  1.6s
-    agent-infer/gated_delta_rule.py :: gdr_chunk_prepare       PASS    4.8s
-    agent-infer/gated_delta_rule.py :: gdr_chunk_cumsum        PASS    2.2s
-    agent-infer/gated_delta_rule.py :: gdr_chunk_a             PASS    4.8s
-    agent-infer/gated_delta_rule.py :: gdr_chunk_solve         PASS   60.2s
-    agent-infer/gated_delta_rule.py :: gdr_chunk_recompute     PASS    5.5s
-    agent-infer/gated_delta_rule.py :: gdr_chunk_state         PASS    5.6s
-    agent-infer/gated_delta_rule.py :: gdr_chunk_o             PASS    6.7s
-
-15/15 PASS. Note gated_delta_rule.py ships 7 stages in KERNELS (not 8).
-gdr_chunk_solve is the outlier at 60s — the stage 0.1.9 could not lower on
-sm_89 compiles on 0.1.13/sm90, just slowly.
-
-Local plumbing check (no GPU): TILELANG_DEFAULT_TARGET=llvm — cuda-only
-intrinsics then FAIL at lowering, which still proves driver/import correctness.
+"""Pre-port compile gate: compile the upstream corpus we copy kernels from
+against our pinned tilelang, PASS/FAIL per file with the first error line.
+Lazy-mode kernels compile on the symbolic call (no GPU tensors); autotune
+wrappers go through .jit_impl.compile to skip the tuner. 15/15 PASS on
+tilelang 0.1.13/sm90 (gdr_chunk_solve 60s, the rest 1-7s).
+    CUDA_VISIBLE_DEVICES=7 TILELANG_DEFAULT_TARGET=cuda python3 scripts/pod_portcheck.py --corpus-dir scripts/_portcheck_corpus
 """
 
 import argparse
@@ -60,15 +22,11 @@ import tilelang.language as T
 TARGET = os.environ["TILELANG_DEFAULT_TARGET"]
 
 
-# --- drivers: one per corpus kernel, symbolic params only (compile, no run) ---
-
-
 def _d_gemm(m):
     m.matmul.compile(M=64, N=64, K=64, block_M=64, block_N=64, block_K=32)
 
 
 def _d_dequant_hopper(m):
-    # autotune wrapper bypassed: its __call__ always runs the GPU tuner
     m.matmul.jit_impl.compile(
         64,
         64,
@@ -163,7 +121,6 @@ _GDR_STAGES = [
     "gdr_chunk_o",
 ]
 
-# (label, corpus filename, driver). Labels mirror the upstream repo layout.
 MANIFEST = [
     ("gemm/example_gemm.py", "example_gemm.py", _d_gemm),
     (

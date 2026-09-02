@@ -1,30 +1,7 @@
-"""fp8 prefill GEMM sweep: dequant / tile / K-split variants of
-make_linear_fp4_fp8_mma.
-
-Diagnostic only — not shipped. Each variant is a standalone tilelang kernel;
-the winner lands in src/tilerl/ops/kernels_mma.py (make_linear_fp4_fp8_mma).
-
-Hypothesis: the shipped kernel's speedup vs bf16 is monotonic in N (grid
-blocks): 1.46x @ 544 blocks (2.3 waves) -> 1.01x @ 160 blocks (0.68 waves).
-Warp specialization is off, so dequant and WGMMA share threads; with <1 wave
-the SMs stall when resident blocks align in dequant. Variants attack the
-dequant cost (v_int32: integer-only e2m1->e4m3, scale on the accumulator),
-the hiding (v_ws), and the grid size (v_split2, v_m64).
-
-Variants:
-  baseline  shipped kernel (128x128, block_K=64, stages=3, 128 threads,
-            scale-in-dequant)
-  v_int32   block_K=32, integer e2m1fn->e4m3 dequant (exact subset, no FP,
-            no requant), per-N-row scale on the accumulator per K-tile
-            (deepgemm 2xAcc)
-  v_ws      baseline + warp specialization enabled
-  v_split2  baseline + 2-way K-split, f32 atomic add into a zeroed output
-  v_sota    SOTA example defaults: 256x128, block_K=128, stages=2, 256 threads
-  v_m64     baseline with block_M=64 (2x M-tiles -> 2x blocks)
-
-Usage (pod):
-    TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=N PYTHONPATH=src \\
-        python3 scripts/_sweep_fp8_prefill.py [baseline v_int32 ...]
+"""fp8 prefill GEMM sweep: dequant / tile / K-split variants of make_linear_fp4_fp8_mma (kernels_mma.py).
+Diagnostic only, not shipped. Shipped speedup vs bf16 is monotonic in grid blocks (1.46x @ 544 blocks ->
+1.01x @ 160, <1 wave): warp specialization is off, so dequant and WGMMA share threads.
+Usage (pod): TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=N PYTHONPATH=src python3 scripts/_sweep_fp8_prefill.py [baseline v_int32 ...]
 """
 
 from __future__ import annotations
@@ -60,8 +37,7 @@ def _pass_configs(ws_disabled: bool = True):
 
 
 def _dequant_fp4_macro(out_dtype, local_size):
-    """Shipped dequant: packed WQ tile -> dequant W tile in shared, one
-    per-32-block scale per chunk (copied verbatim from kernels_mma.py)."""
+    """Shipped dequant, copied verbatim from kernels_mma.py."""
     local_compress = local_size // 2
 
     @T.macro
@@ -88,10 +64,7 @@ def _dequant_fp4_macro(out_dtype, local_size):
 
 
 def _dequant_fp4_int_macro(block_N, block_K):
-    """Integer e2m1fn -> e4m3 dequant: the e2m1fn grid is an exact subset of
-    e4m3, so each nibble maps to an e4m3 byte by bit manipulation
-    (sign<<7 | (e2+6)<<3 | m<<2) — no FP, no requant rounding. The per-32
-    weight scale moves to the accumulator (per K-tile) in the kernel."""
+    # e2m1fn is an exact subset of e4m3: sign<<7 | (e2+6)<<3 | m<<2, no FP, no requant; scale on the accumulator
     local_size = 16  # e4m3: 16 elems per 128-bit transaction
     local_compress = local_size // 2
 
@@ -119,10 +92,6 @@ def _dequant_fp4_int_macro(block_N, block_K):
 
 
 def _make_scale_in_dequant(target, block_K, stages, threads, ws_off):
-    """Common scale-in-dequant kernel (baseline / v_ws / v_sota / v_m64).
-    block_M/block_N are launch-time specializations (Python ints from the
-    caller, like backend.linear_fp4)."""
-
     @tilelang.jit(target=target, pass_configs=_pass_configs(ws_off))
     def ker(XQ, WQ, WScale, AScale, block_M, block_N):
         M, N, K = T.const("M, N, K")
@@ -169,13 +138,8 @@ def make_v_sota(target):
     return _make_scale_in_dequant(target, 128, 2, 256, ws_off=True)
 
 
-def make_v_m64(target):
-    return _make_scale_in_dequant(target, 64, 3, 128, ws_off=True)
-
-
 def make_v_int32(target):
-    """block_K=32, integer dequant (no FP), per-N-row scale on the
-    accumulator per K-tile (deepgemm 2xAcc)."""
+    # per-N-row scale on the accumulator per K-tile (deepgemm 2xAcc)
     BK = 32
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
@@ -214,9 +178,7 @@ def make_v_int32(target):
 
 
 def _make_split(target, split, block_N):
-    """K-split kernel: each block sums K/split, then f32 atomic-adds its
-    partial into the zeroed output. The AScale divide distributes over the
-    split sum, so it stays per-partial."""
+    # AScale divide distributes over the split sum, so it stays per-partial
     BK = 64
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
@@ -265,10 +227,6 @@ def make_v_split4(target):
     return _make_split(target, 4, 128)
 
 
-def make_v_n64(target):
-    return _make_scale_in_dequant(target, 64, 3, 128, ws_off=True)
-
-
 def make_v_n64_split2(target):
     return _make_split(target, 2, 64)
 
@@ -281,8 +239,8 @@ VARIANTS = {
     "v_split2": (make_v_split2, 128, 128, 64, True),
     "v_split4": (make_v_split4, 128, 128, 64, True),
     "v_sota": (make_v_sota, 256, 128, 128, False),
-    "v_m64": (make_v_m64, 64, 128, 64, False),
-    "v_n64": (make_v_n64, 128, 64, 64, False),
+    "v_m64": (make_baseline, 64, 128, 64, False),
+    "v_n64": (make_baseline, 128, 64, 64, False),
     "v_n64_split2": (make_v_n64_split2, 128, 64, 64, True),
 }
 
@@ -301,8 +259,6 @@ def _round_up(x, m):
 
 
 def _make_inputs(dev, M, K, N, bK):
-    """Pack the weights and quantize the padded activation (same construction
-    as backend.linear_fp4's fp8 path). Padded to the variant's block_K."""
     torch.manual_seed(0)
     w_master = torch.randn(N, K) * 0.1
     wq, scale = pack_fp4(w_master)
@@ -337,7 +293,6 @@ def _time(fn, warmup=5, rep=20):
 
 
 def _run_variant(name, make, bM, bN, bK, takes_y, xq, wq, wscale, ascale, M, N):
-    """Compile + parity + time one variant. Returns (ms, rel_ref, rel_base, ok, jit)."""
     Kp = xq.shape[1]
     xq_v = xq[:, : _round_up(Kp, bK)]
     wq_v = wq[:, : _round_up(Kp, bK) // 2]
@@ -369,11 +324,7 @@ def main():
     for M, K, N in SHAPES:
         print(f"=== M={M} K={K} N={N} ===", flush=True)
         xq, wq, wscale, ascale, ref = _make_inputs(dev, M, K, N, 128)
-        # baseline first: it is the parity reference (the shipped kernel's
-        # math). The fp32 reference carries the fp8 quant floor (~4% rel-err:
-        # 2% activation + 1.7% weight requant), so variants gate against
-        # baseline, not against the fp32 reference. v_int32 drops the weight
-        # requant (exact e2m1->e4m3), so it is MORE accurate than baseline.
+        # fp32 ref carries the ~4% fp8 quant floor, so variants gate against baseline
         b_ms, b_out, b_jit = _run_variant(
             "baseline", *VARIANTS["baseline"], xq, wq, wscale, ascale, M, N
         )
@@ -394,8 +345,7 @@ def main():
             ms, out, jit = res
             rel_ref = (out.float() - ref).abs().max().item() / ref.abs().max().item()
             rel_base = (out.float() - b_out.float()).abs().max().item() / b_out.abs().max().item()
-            # gate: same math as shipped (rel_base < 1e-2), or strictly more
-            # accurate (v_int32: rel_ref below the shipped floor).
+            # same math as shipped, or strictly more accurate (v_int32 drops the weight requant)
             ok = rel_base < 1e-2 or rel_ref < b_rel
             print(
                 f"{name:<10}: {ms:7.3f} ms  {flops / ms / 1e9:6.1f} TFLOP/s  "

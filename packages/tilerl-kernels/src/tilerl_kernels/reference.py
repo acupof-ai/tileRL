@@ -1,16 +1,7 @@
-"""Torch-eager reference implementations of every tilerl op (forward + backward).
-
-This module is the parity oracle for the TileLang kernels in :mod:`tilerl_kernels.kernels`
-and the day-1 backward fallback for ops without a TileLang backward kernel
-(``# ponytail: torch-eager backward, tilelang kernel when perf demands``).
-
-Conventions: all compute is float32 (callers cast bf16/f16 to f32;
-``# ponytail: f32 compute day-1, bf16 mixed precision day-2``); deterministic
-(no randomness, no in-place mutation, no autograd — backward formulas are
-hand-derived and match the agent-infer Rust reference at
-``crates/autograd/src/ops/linear_attention.rs``). Shapes: ``B`` batch,
-``T``/``C`` sequence/chunk, ``H`` heads, ``D`` head dim, ``M``/``N``/``K``
-matmul dims.
+"""Torch-eager reference for every op: the parity oracle for the TileLang
+kernels and the day-1 backward. f32 compute, no autograd; backward formulas
+are hand-derived (agent-infer crates/autograd/src/ops/linear_attention.rs).
+# ponytail: torch-eager backward, tilelang kernel when perf demands
 """
 
 from __future__ import annotations
@@ -20,44 +11,6 @@ import os
 
 import torch
 from typing import Any
-
-__all__ = [
-    "rmsnorm",
-    "rmsnorm_bwd",
-    "rope",
-    "rope_bwd",
-    "linear",
-    "linear_bwd",
-    "dequant_fp4",
-    "linear_fp4",
-    "pack_fp4",
-    "renorm_fp4_scale",
-    "unpack_fp4",
-    "dequant_nvfp4",
-    "dequant_fp8",
-    "quant_fp8",
-    "linear_fp8",
-    "dequant_awq",
-    "dense_attention",
-    "dense_attention_bwd",
-    "attention_gate_bwd",
-    "linear_attn_chunk",
-    "linear_attn_bwd",
-    "gdn_forward",
-    "gdn_chunk_core",
-    "gdn_chunk_core_fla",
-    "gdn_backward",
-    "silu_mul",
-    "silu_mul_bwd",
-    "softmax",
-    "cross_entropy_loss_grad",
-    "state_gather",
-    "state_scatter",
-    "embedding",
-    "embedding_bwd",
-    "sample",
-    "sample_batch",
-]
 
 
 def _f32(x: torch.Tensor) -> torch.Tensor:
@@ -81,7 +34,6 @@ def rmsnorm_bwd(
     x = _f32(x)
     grad = _f32(grad)
     rstd = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-    # c = mean(grad * w * x) over the last dim
     c = (grad * w * x).mean(-1, keepdim=True)
     gx = rstd * (grad * w - (rstd * rstd) * x * c)
     gw = (grad * x * rstd).sum(dim=tuple(range(x.ndim - 1)))
@@ -115,8 +67,7 @@ def _rope_apply(
     sin = torch.sin(ang).unsqueeze(-2)
     if negate:
         sin = -sin
-    # rotate_half convention (Qwen/Llama): pair dim d with d+rd/2, not the
-    # adjacent (2d, 2d+1) GPT-J pairing. The checkpoint's weights expect this.
+    # rotate_half (Qwen/Llama): d pairs with d + rd/2, not GPT-J's (2d, 2d+1)
     half = rd // 2
     x1 = x_rot[..., :half]
     x2 = x_rot[..., half:]
@@ -129,11 +80,8 @@ def _rope_apply(
 def rope(
     x: torch.Tensor, positions: torch.Tensor, theta: float, rotary_dim: int | None = None
 ) -> torch.Tensor:
-    """Rotary embedding. x [B, T, H, D], positions [B, T] or [T].
-
-    ``rotary_dim`` rotates only the first ``rotary_dim`` features (Qwen3.8
-    partial RoPE); the rest pass through. Defaults to the full last dim.
-    """
+    """Rotary embedding on the first ``rotary_dim`` features (default: all).
+    x [B, T, H, D], positions [B, T] or [T]."""
     return _rope_apply(x, positions, theta, negate=False, rotary_dim=rotary_dim)
 
 
@@ -172,29 +120,22 @@ def linear_bwd(
 # ---------------------------------------------------------------- linear fp4
 
 
-#: Bytes of dequantized weight linear_frozen_bwd will materialize at once.
-#: The whole lm_head is [248320, 5120] f32 = 4.74 GiB, and materializing it
-#: (twice, with the oscale fold) made this one call peak 14.2 GiB — every other
-#: backward op in a 27B step peaks under 0.12.
+#: dequantized bytes linear_frozen_bwd materializes at once (the whole lm_head
+#: peaked 14.2 GiB; every other backward op in a 27B step is under 0.12)
 _BWD_SLICE_BYTES = 1 << 29
 
 
 def linear_frozen_bwd(grad, wq, scale, oscale=None, fp8=False):
-    """dX through a frozen quantized weight (LoRA / OPD base): no weight grad,
-    so the base never needs a bf16 master — the only way the 27B fits one card.
-
-    dX contracts over N, so the weight is materialized — but a slice at a time.
-    ``oscale`` scales weight ROW n, so it folds into the [M, N] gradient rather
-    than the [N, K] weight, which is where the fp4 kernel path already puts it.
-    # ponytail: no tilelang fp8 dequant kernel yet (fp4 has one) — this is the
-    # eager path, chunked.
+    """dX through a frozen quantized weight (LoRA / OPD base), a slice at a
+    time. ``oscale`` scales weight row n, so it folds into the [M, N] grad.
+    # ponytail: eager chunked dequant; no tilelang fp8 dequant kernel yet (fp4 has one).
+    # ponytail: eager path; the tilelang dequant kernel only exists for fp4
     """
     g = _f32(grad).reshape(-1, grad.shape[-1])
     if oscale is not None:
         g = g * _f32(oscale).reshape(1, -1)
     n, k = wq.shape[0], wq.shape[1] * (1 if fp8 else 2)
-    # fp4 scales one weight row each; fp8 scales a 128-row block. Slice on the
-    # scale's own row granularity so a chunk boundary never splits a block.
+    # slice on the scale's row granularity so a chunk never splits an fp8 128-row block
     rows = -(-n // scale.shape[0])
     step = max(1, _BWD_SLICE_BYTES // (k * 4) // rows) * rows
     out = None
@@ -208,13 +149,9 @@ def linear_frozen_bwd(grad, wq, scale, oscale=None, fp8=False):
 
 
 def dequant_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Dequantize OCP e2m1-packed weights. wq uint8 [N, K//2] (low nibble
-    first), scale f32 [N, K//B]. Returns w [N, K] f32. The block size B is
-    derived from the two shapes (16 for an NVFP4 checkpoint, 32 for pack_fp4).
-
-    Magnitudes are ``_E2M1_LUT`` ({0,.5,1,1.5,2,3,4,6}); bit 3 is the sign.
-    """
-    if getattr(wq, "_tl_twiddled", False):  # sm90 served bytes (Backend._served_fp4)
+    """Dequantize e2m1-packed weights: wq uint8 [N, K//2] (low nibble first),
+    scale f32 [N, K//B], B derived from the shapes. Returns [N, K] f32."""
+    if getattr(wq, "_tl_twiddled", False):  # sm90 served bytes
         wq = untwiddle_fp4(wq)
     assert wq.dtype == torch.uint8
     n, k2 = wq.shape
@@ -232,18 +169,14 @@ def linear_fp4(x, wq, scale, oscale=None) -> torch.Tensor:
 
 # ---------------------------------------------------------------- fp4 packing
 
-#: OCP/MX e2m1 magnitude LUT, low 3 bits of a nibble; bit 3 = sign. The one
-#: fp4 grid in tileRL — pack_fp4/unpack_fp4, dequant_fp4, dequant_nvfp4 and
-#: every linear_fp4 kernel decode it, so an NVFP4 checkpoint's nibbles need no
-#: re-quantization to be served.
+#: OCP/MX e2m1 magnitudes (low 3 bits of a nibble; bit 3 = sign): the one fp4
+#: grid, so NVFP4 checkpoint nibbles are served without re-quantization
 _E2M1_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 
 
-# sm90 serves fp4 in the "twiddled" byte layout tilelang's decode_fp4_to_bf16
-# intrinsic expands with 18 ops per 8 elems (kernels_linear._FP4_TWIDDLE_SRC):
-# per 32-bit word, element slot p of half-word h has its (s, e1, e0, m) bits at
-# _TW_POS[p]; slot j (j<4) holds elem 2j+1 and slot j+4 elem 2j so the decoded
-# bf16x2 pairs line up with natural bf16x2 X words.
+# sm90's twiddled byte layout (kernels_linear._FP4_TWIDDLE_SRC): per 32-bit
+# word, slot p of half-word h has its (s, e1, e0, m) bits at _TW_POS[p]; slot j
+# holds elem 2j+1 and slot j+4 elem 2j so decoded bf16x2 pairs match X words.
 _TW_POS = ((15, 8, 7, 6), (12, 5, 4, 3), (9, 2, 1, 0), (14, 11, 10, 13))
 _TW_SLOT_ELEM = (1, 3, 5, 7, 0, 2, 4, 6)
 
@@ -289,15 +222,8 @@ def untwiddle_fp4(wq: torch.Tensor) -> torch.Tensor:
 
 
 def pack_fp4(w: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack a bf16/f32 weight [N,K] into OCP e2m1 nibbles + per-block scales.
-
-    Returns ``(wq [N,K//2] uint8 low-nibble-first, scale [N,K//block] f32)``
-    with ``scale = block_max / 6`` and round-to-nearest against ``_E2M1_LUT``.
-    The max representable magnitude is 6*scale, so the block max maps exactly.
-    Block 32 matches the fp8 WGMMA K-tile (sm90), so the fp8 prefill path can
-    apply one scale per MMA tile in f32 (no e4m3 weight requant). Serving wants
-    :func:`renorm_fp4_scale` on the result.
-    """
+    """Pack a weight [N,K] into e2m1 nibbles + per-block scales
+    (block_max / 6, round-to-nearest). Serving wants renorm_fp4_scale on it."""
     assert w.dim() == 2, f"pack_fp4 expects a 2D weight, got {tuple(w.shape)}"
     n, k = w.shape
     assert k % block == 0, f"fp4 block size {block} must divide K, got K={k}"
@@ -316,12 +242,9 @@ def pack_fp4(w: torch.Tensor, block: int = 32) -> tuple[torch.Tensor, torch.Tens
 
 
 def renorm_fp4_scale(scale, oscale=None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Move a per-row power of two out of the fp4 block scale into the epilogue
-    scale: ``(scale * 2**-p, oscale * 2**p)``, ``p = floor(log2(row max))``, so
-    every row's ``6*scale`` lands in [6,12). The w4a8 kernel dequantizes into
-    e4m3 (max 448, subnormal below 2^-9), where raw checkpoint magnitudes
-    saturate and ``block_max/6`` weight units collapse; 2^p is exact, so the
-    split re-rounds nothing."""
+    """Move a per-row power of two from the block scale into the epilogue
+    scale so every row's 6*scale lands in [6,12): the w4a8 kernel requantizes
+    into e4m3, where raw checkpoint magnitudes saturate. 2^p re-rounds nothing."""
     scale = _f32(scale)
     p = torch.exp2(torch.floor(torch.log2(scale.amax(dim=1, keepdim=True).clamp_min(1e-30))))
     o = p.reshape(-1)
@@ -344,16 +267,10 @@ def dequant_nvfp4(
     *,
     global_divide: bool = False,
 ) -> torch.Tensor:
-    """ModelOpt NVFP4 dequant (Qwen3.6 MLP linears). weight_packed uint8
-    [N,K//2] (two OCP/MX e2m1 nibbles per byte, low nibble first),
-    weight_scale f8_e4m3 [N,K//16] (block 1x16), weight_global_scale f32 [1].
-    Returns bf16 [N,K]: ``w = e2m1(packed) * f8(weight_scale) * gs`` where
-    ``gs`` is ``1/weight_global_scale`` when ``global_divide`` (ModelOpt stores
-    the global scale's reciprocal — agent-infer quant_format.rs:225,
-    ScaleApply::Divide) and ``weight_global_scale`` directly otherwise
-    (official NVFP4's ``weight_scale_2`` is a plain multiplier). The e2m1
-    grid is the one :func:`dequant_fp4` decodes, which derives the block (16)
-    from the scale shape — so this is that dequant plus the global scale."""
+    """NVFP4 dequant: e2m1(packed) * f8(weight_scale) * gs -> bf16 [N,K].
+    ModelOpt stores the global scale's reciprocal (``global_divide``,
+    agent-infer quant_format.rs ScaleApply::Divide); official NVFP4's
+    weight_scale_2 is a plain multiplier."""
     gs = weight_global_scale.float()
     if global_divide:
         gs = 1.0 / gs
@@ -361,13 +278,9 @@ def dequant_nvfp4(
 
 
 def dequant_fp8(w8: torch.Tensor, wscale: torch.Tensor, block: int = 128) -> torch.Tensor:
-    """FP8 block-quant dequant (Qwen3.6 GDN linears, kept native by load_hf).
-    w8 f8_e4m3 [N,K], wscale f32 [ceil(N/block), ceil(K/block)] (per-block
-    scale, multiplied — the checkpoint's "scale_inv" is the scale itself,
-    agent-infer quant_format.rs ScaleApply::Multiply). Returns f32 [N,K]:
-    ``w = f8(w8) * wscale.repeat(block)``. The same layout serves per-tensor
-    FP8 (the loader expands the scalar to a constant wscale) so one kernel
-    covers both."""
+    """FP8 block dequant: w8 e4m3 [N,K] * wscale [ceil(N/block), ceil(K/block)]
+    -> f32. The checkpoint's "scale_inv" is the scale itself (multiplied,
+    agent-infer quant_format.rs ScaleApply::Multiply)."""
     n, k = w8.shape
     s = wscale.float().repeat_interleave(block, dim=-1)[:, :k]
     s = s.repeat_interleave(block, dim=-2)[:n, :]
@@ -375,9 +288,7 @@ def dequant_fp8(w8: torch.Tensor, wscale: torch.Tensor, block: int = 128) -> tor
 
 
 def quant_fp8(w: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
-    """Inverse of :func:`dequant_fp8`: bf16/f32 [N,K] -> (e4m3 [N,K], f32 scales
-    [ceil(N/block), ceil(K/block)]). One scale per 128x128 block, from its
-    absmax against e4m3's 448 range."""
+    """Inverse of :func:`dequant_fp8`: one absmax/448 scale per block x block."""
     n, k = w.shape
     pn, pk = -n % block, -k % block
     wp = torch.nn.functional.pad(_f32(w), (0, pk, 0, pn))
@@ -385,8 +296,6 @@ def quant_fp8(w: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, torch.Te
     scale = blocks.abs().amax((1, 3)).clamp_min(1e-12) / 448.0
     q = (blocks / scale[:, None, :, None]).reshape(wp.shape)
     return q[:n, :k].to(torch.float8_e4m3fn).contiguous(), scale.contiguous()
-
-
 
 
 def linear_fp8(x, w8, wscale, oscale=None) -> torch.Tensor:
@@ -398,11 +307,8 @@ def linear_fp8(x, w8, wscale, oscale=None) -> torch.Tensor:
 def dequant_awq(
     qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor, group_size: int
 ) -> torch.Tensor:
-    """AutoAWQ GEMM dequant. qweight int32 [K,N//8] (8 int4 per int32, for 8
-    consecutive output features; int4 at bits (j%8)*4 of qweight[i,j//8]),
-    qzeros int32 [K//group,N//8] (same packing), scales bf16/fp16
-    [K//group,N]. Returns bf16 [N,K] (PyTorch Linear layout):
-    ``w[j,i] = (q - z) * s`` per group, transposed from the GEMM [K,N]."""
+    """AutoAWQ GEMM dequant: qweight int32 [K,N//8] (int4 j at bits (j%8)*4 of
+    column j//8), qzeros [K//group,N//8], scales [K//group,N] -> bf16 [N,K]."""
     k, n8 = qweight.shape
     shifts = torch.arange(8, dtype=torch.int64, device=qweight.device) * 4
     q = ((qweight.long().unsqueeze(-1) >> shifts) & 0xF).float().reshape(k, n8 * 8)
@@ -417,11 +323,7 @@ def dequant_awq(
 def dense_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
 ) -> torch.Tensor:
-    """Causal GQA attention in model layout. q [B,T,Hq,D], k/v [B,T,Hkv,D].
-
-    Training-path op (the paged kernel serves decode). Hq must be a multiple
-    of Hkv; kv heads are repeated to match. Returns [B,T,Hq,D].
-    """
+    """Causal GQA attention (training path). q [B,T,Hq,D], k/v [B,T,Hkv,D] -> [B,T,Hq,D]."""
     q = _f32(q)
     k = _f32(k)
     v = _f32(v)
@@ -498,31 +400,20 @@ def linear_attn_bwd(
     return gdn_backward(grad, q, k, v, g, beta, state, **kw)
 
 
-#: Chunk length of the gated-delta scan: the sequential dimension becomes
-#: t/_GDN_CHUNK. 16, not the upstream 64, for PRECISION — the chunked form is
-#: the same algebra (equal to the serial scan to 1e-15 in f64) but a different
-#: f32 reduction order, and its worst relative error against autograd grows with
-#: the chunk. Measured over 3 shapes x 3 seeds vs the serial backward's 3-9e-7:
-#:   C=16 -> 4-12e-7 (1.3-2.2x)   C=32 -> 1.1-2.3e-6   C=64 -> 1.9-4.9e-6
+#: gated-delta backward chunk: 16, not upstream's 64, for precision (worst rel
+#: error vs autograd: C=16 4-12e-7, C=32 1.1-2.3e-6, C=64 1.9-4.9e-6)
 _GDN_CHUNK = 16
 
 
 def _gdn_chunk_fwd(qc, kc, vc, bc, gtc, s):
-    """One chunk of the gated-delta recurrence, plus every intermediate its
-    adjoint needs. ``qc``/``kc`` [B,n,HV,DK] (L2-normed, already broadcast to
-    value heads), ``vc`` [B,n,HV,DV], ``bc``/``gtc`` [B,n,HV], ``s`` [B,HV,DK,DV].
-
-    The chunk matrices are [B,HV,n,*]: G is the chunk-local inclusive cumsum of
-    the log decay, ``M = (I+L)^-1`` is the UT transform that carries the
-    intra-chunk term the serial form keeps in the state.
-    """
+    """One chunk of the recurrence plus every intermediate its adjoint needs.
+    qc/kc [B,n,HV,DK] (L2-normed, broadcast to value heads), vc [B,n,HV,DV],
+    bc/gtc [B,n,HV], s [B,HV,DK,DV]; M = (I+L)^-1 carries the intra-chunk term."""
     n = qc.shape[1]
     gc = gtc.cumsum(1)
     e = torch.exp(gc)
     gp = gc.permute(0, 2, 1)
-    # clamp before exp: gt <= 0 makes G non-increasing, so every entry the masks
-    # keep has a non-positive difference; the discarded upper triangle would
-    # overflow to inf and the mask would turn it into NaN.
+    # clamp before exp: the masked-out upper triangle would overflow to inf -> NaN
     D = torch.exp((gp.unsqueeze(-1) - gp.unsqueeze(-2)).clamp(max=0.0))
     dev, dt = qc.device, qc.dtype
     low = torch.tril(torch.ones(n, n, dtype=dt, device=dev), -1)
@@ -530,7 +421,6 @@ def _gdn_chunk_fwd(qc, kc, vc, bc, gtc, s):
     KK = torch.einsum("bihd,bjhd->bhij", kc, kc)
     bp = bc.permute(0, 2, 1).unsqueeze(-1)
     eye = torch.eye(n, dtype=dt, device=dev)
-    # I+L is unit lower triangular for any input, so the solve needs no pivoting.
     M = torch.linalg.solve_triangular(eye + bp * KK * D * low, eye.expand(KK.shape),
                                       upper=False, unitriangular=True)
     bV = bp * vc.permute(0, 2, 1, 3)
@@ -551,9 +441,7 @@ def _gdn_chunk_fwd(qc, kc, vc, bc, gtc, s):
 
 
 def _gdn_chunk_bwd(dout, dS_next, qc, kc, vc, bc, c):
-    """Adjoint of :func:`_gdn_chunk_fwd`. Returns
-    (dq, dk, dv, dbeta, dgt, dS_start), all in the caller's [B,n,HV,*] layout.
-    Gradchecked term by term against autograd on the chunk forward."""
+    """Adjoint of :func:`_gdn_chunk_fwd`: (dq, dk, dv, dbeta, dgt, dS_start) in [B,n,HV,*]."""
     e, D, low, tri = c["e"], c["D"], c["low"], c["tri"]
     KK, bp, M, W, d, QK, s = c["KK"], c["bp"], c["M"], c["W"], c["d"], c["QK"], c["s"]
     dOc = dout.permute(0, 2, 1, 3)
@@ -611,26 +499,14 @@ def _gdn_chunk_bwd(dout, dS_next, qc, kc, vc, bc, c):
 
 
 def gdn_chunk_core_fla(qn, kn, v, gt, bt, state, chunk: int = 64):
-    """:func:`gdn_chunk_core` through flash-linear-attention — a MEASUREMENT
-    path, not a shipped one.
-
-    fla is Triton and CUDA-only, so it cannot be the backend (AGENTS.md: one
-    TileLang source for cpu/cuda/metal). It is here to answer one question
-    with a number instead of an estimate: fla runs our GDN shapes in 6.8 ms
-    where our scalar-scan kernel takes 63, and this says how much of that 9.3x
-    survives the layer's own glue.
-
-    Same signature as the reference so the two are interchangeable at the call
-    site. ``chunk`` is fla's chunk_size. fla wants [B,T,H,D] with the KEY heads
-    already broadcast to value heads, which is what the serial form does too.
-    """
+    """:func:`gdn_chunk_core` through flash-linear-attention (Triton, CUDA-only):
+    a measurement path for how much of fla's 9.3x survives the layer's glue."""
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     rep = v.shape[2] // kn.shape[2]
     q = qn.repeat_interleave(rep, dim=2)
     k = kn.repeat_interleave(rep, dim=2)
-    # qn already carries the 1/sqrt(key_dim) factor the serial form folds in, so
-    # fla's own scale must be 1.
+    # qn already carries 1/sqrt(key_dim), so fla's scale is 1
     o, s = chunk_gated_delta_rule(
         q=q.bfloat16(), k=k.bfloat16(), v=v.bfloat16(), g=gt.float(),
         beta=bt.bfloat16(), scale=1.0, initial_state=state.float(),
@@ -640,21 +516,9 @@ def gdn_chunk_core_fla(qn, kn, v, gt, bt, state, chunk: int = 64):
 
 
 def gdn_chunk_core(qn, kn, v, gt, bt, state, chunk: int = 64):
-    """The gated-delta core as a chunkwise-WY decomposition, not a serial scan.
-
-    Same recurrence as the loop in :func:`gdn_forward` — decay, delta, read out
-    — reassociated so a chunk's tokens are one matmul instead of C sequential
-    steps. The intra-chunk term the serial form carries in the state lives in
-    ``M = (I + L)^-1``; freezing the chunk-start state loses nothing.
-
-    ``qn``/``kn`` [B,T,HK,DK] (already L2-normed), ``v`` [B,T,HV,DV],
-    ``gt``/``bt`` [B,T,HV] (log-decay <= 0, and the delta rate), ``state``
-    [B,HV,DK,DV]. HV is a multiple of HK: value head h reads key head
-    ``h * HK // HV``. Returns (core [B,T,HV,DV], final state).
-
-    This is the executable spec for the five-kernel prefill pipeline
-    (cumsum / scaled-dot-kkt / solve-tril / wy / delta-h / chunk-o).
-    """
+    """The gated-delta core as a chunkwise-WY decomposition of the serial scan
+    in :func:`gdn_forward`. qn/kn [B,T,HK,DK] (L2-normed), v [B,T,HV,DV],
+    gt/bt [B,T,HV], state [B,HV,DK,DV] -> (core [B,T,HV,DV], final state)."""
     b, t, nvh, val_dim = v.shape
     rep = nvh // kn.shape[2]
     q = qn.repeat_interleave(rep, dim=2)
@@ -686,23 +550,13 @@ def gdn_forward(
     keep_steps: int = 0,
     chunkwise: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
-    """Full gated-delta layer core: the executable spec for the model's GDN
-    layer, mirroring agent-infer's host reference equation by equation (the
-    op contract is documented in ``model.py``). ``q``/``k`` [B,T,nkh*K],
-    ``v``/``z`` [B,T,nvh*V], ``g``/``beta`` [B,T,nvh], ``state`` [B,nvh,K,V].
-    ``conv_window`` [B,K-1,qkv_dim] is the previous segment's last raw-qkv
-    tokens, prepended so segmented decode (T=1 per forward) is exact; None =
-    one-shot prefill (zero left-padding) and the third return is None.
-    ``seq_q_lens`` [B] bounds the per-row scan: mixed batches pad rows to a
-    shared T and only the first ``seq_q_lens[b]`` positions are real (decode
-    rows: 1); None means every row is valid for all T.
-    ``keep_steps`` > 0 (speculative verify): the returned state and window
-    carry a leading chain-step axis — the state after EACH of the first
-    ``keep_steps`` tokens ([B,KS,nvh,K,V] / [B,KS,K-1,qkv_dim]) — so the engine
-    selects the accepted prefix's state without a second forward."""
-    # Activations arrive on the backend device; params/state may be CPU-resident
-    # (day-1: params live on CPU, the backend boundary migrates activations).
-    # Gather every input on the activation device.
+    """Full GDN layer core, the executable spec (agent-infer's host reference
+    equation by equation). q/k [B,T,nkh*K], v/z [B,T,nvh*V], g/beta [B,T,nvh],
+    state [B,nvh,K,V]. ``conv_window`` [B,K-1,qkv_dim] is the previous
+    segment's last raw-qkv tokens (None: zero left-padding, third return
+    None). ``seq_q_lens`` [B] bounds each row's scan. ``keep_steps`` > 0
+    returns the state/window after each of the first keep_steps tokens with a
+    leading chain-step axis (speculative verify)."""
     # ponytail: per-call param migration, keep params on the backend device at load
     dev = q.device
     q = _f32(q)
@@ -727,9 +581,7 @@ def gdn_forward(
     qkv = torch.cat([q, k, v], dim=-1)
     new_window = None
     if conv_window is not None:
-        # Segmented decode: carry the last K-1 raw-qkv tokens. Per row, the new
-        # window is the last K-1 of (window + that row's valid qkv) — mixed
-        # rows have different valid lengths, so build per row.
+        # new window: last K-1 of (window ++ the row's valid qkv), per row
         qkv = torch.cat([_f32(conv_window).to(dev), qkv], dim=1)
         new_window = (
             torch.stack([qkv[:, s + 1 : kernel + s] for s in range(keep_steps)], dim=1)
@@ -754,8 +606,7 @@ def gdn_forward(
     gt = -torch.exp(a_log) * torch.nn.functional.softplus(g + dt_bias)
     exp_g = torch.exp(gt)
     if chunkwise and not keep_steps and int(seq_q_lens.min()) == t:
-        # Every row full-length: the chunked form has no per-row valid mask, and
-        # a ragged batch would silently absorb padding into the recurrence.
+        # the chunked form has no per-row mask: full-length rows only
         impl = gdn_chunk_core_fla if os.environ.get("TILERL_GDN_FLA") else gdn_chunk_core
         core, s = impl(qn, kn, v_raw, gt, bt, state, chunk=chunkwise)
     else:
@@ -784,8 +635,7 @@ def gdn_forward(
     return out.reshape(b, t, nvh * val_dim), s, new_window
 
 
-#: The op name the model/backend contract uses for :func:`gdn_forward`.
-linear_attn_chunk = gdn_forward
+linear_attn_chunk = gdn_forward  # the op name in the backend contract
 
 
 def gdn_backward(
@@ -805,17 +655,10 @@ def gdn_backward(
     conv_window: "torch.Tensor | None" = None,
 ) -> tuple[torch.Tensor, ...]:
     """Backward of :func:`gdn_forward`: (gq,gk,gv,gg,gbeta,gstate,gz,gconv1d,
-    gdt_bias,ga_log,gnorm_weight). Gradchecked against torch.autograd (worst
-    rel ~3e-7); the recurrence derivation is documented inline.
-    ``conv_window`` is accepted for tape-signature parity and ignored: training
-    forwards start from a zeroed window, so zero-padded recompute is exact. A
-    non-zero window raises — ignoring one silently costs every grad (measured
-    0.69-2.27 rel vs autograd), and only the zero case is exact.
-    # ponytail: torch-eager backward, tilelang kernel when perf demands."""
+    gdt_bias,ga_log,gnorm_weight). Only a zero ``conv_window`` is exact
+    (training forwards start from one); a non-zero window raises."""
     if conv_window is not None and bool(conv_window.any()):
         raise NotImplementedError("gdn_backward does not support a non-zero conv_window")
-    # Same device gathering as gdn_forward: the tape replays raw saved args,
-    # so params/state may be CPU-resident while grad/activations are on device.
     dev = q.device
     q = _f32(q)
     k = _f32(k)
@@ -853,23 +696,18 @@ def gdn_backward(
     sp_in = g + dt_bias
     gt = -torch.exp(a_log) * torch.nn.functional.softplus(sp_in)
     rep = nvh // nkh
-    assert nkh * rep == nvh, (nkh, nvh)  # h -> h // rep, contiguous groups
-    knv = kn.repeat_interleave(rep, dim=2)  # [b,t,nvh,key_dim]
+    assert nkh * rep == nvh, (nkh, nvh)
+    knv = kn.repeat_interleave(rep, dim=2)
     qnv = qn.repeat_interleave(rep, dim=2)
-    # Chunked, not a per-step scan: the sequential dimension is t/CHUNK, and
-    # only chunk-START states are kept (the interior is recomputed from one in
-    # the reverse pass). The per-step form cost ~28 launches per step per layer
-    # — 434K micro-ops in one 27B step, 62% of it
-    # (errors/2026-08-29-train-step-is-the-gdn-per-step-loop.md).
+    # chunked, not per-step: the per-step scan was 62% of a 27B train step
+    # (errors/2026-08-29-train-step-is-the-gdn-per-step-loop.md); chunk
+    # intermediates are kept (~40 MB a layer) rather than recomputed
     starts = list(range(0, t, _GDN_CHUNK))
     caches = []
     s = state.clone()
     core = torch.zeros(b, t, nvh, val_dim, dtype=torch.float32, device=q.device)
     for c0 in starts:
         sl = slice(c0, min(c0 + _GDN_CHUNK, t))
-        # Keep each chunk's intermediates instead of recomputing them in the
-        # reverse pass: one layer's worth is ~40 MB at CHUNK=16 and it is freed
-        # when this backward returns, against a second forward per chunk.
         core[:, sl], s, cache = _gdn_chunk_fwd(qnv[:, sl], knv[:, sl], v_raw[:, sl],
                                                bt[:, sl], gt[:, sl], s)
         caches.append(cache)
@@ -887,10 +725,6 @@ def gdn_backward(
     g_norm_weight = (g_normed * xhat).sum(dim=(0, 1, 2))
     g_core = rstd * (g_y - xhat * (g_y * xhat).mean(-1, keepdim=True))
 
-    # Recurrence reverse scan, chunked: walk the chunks backwards over the
-    # intermediates the forward pass kept, threading dS through.
-    # _gdn_chunk_bwd is the adjoint of _gdn_chunk_fwd and gives dgt directly,
-    # so there is no d/d(exp_g) intermediate.
     dS = torch.zeros_like(state)
     g_qnv = torch.zeros(b, t, nvh, key_dim, dtype=torch.float32, device=q.device)
     g_knv = torch.zeros(b, t, nvh, key_dim, dtype=torch.float32, device=q.device)
@@ -902,8 +736,7 @@ def gdn_backward(
         (g_qnv[:, sl], g_knv[:, sl], g_v_raw[:, sl], g_bt[:, sl], g_gt[:, sl],
          dS) = _gdn_chunk_bwd(g_core[:, sl], dS, qnv[:, sl], knv[:, sl],
                               v_raw[:, sl], bt[:, sl], caches[i])
-    # The value-head grads fold back onto the key heads (h -> h // rep is
-    # contiguous, so a reshape and a sum is the scatter-add).
+    # value-head grads fold back onto contiguous key-head groups
     g_qn = g_qnv.reshape(b, t, nkh, rep, key_dim).sum(3)
     g_kn = g_knv.reshape(b, t, nkh, rep, key_dim).sum(3)
     g_a_log = (g_gt * gt).sum(dim=(0, 1))
@@ -912,8 +745,7 @@ def gdn_backward(
     g_dt_bias = g_sp_in.sum(dim=(0, 1))
     g_beta = (g_bt * bt * (1.0 - bt)).reshape(b, t, nvh)
 
-    def _norm_bwd(g_in, x, r, s):
-        # y = x * r * s, r = rsqrt(sum(x^2)+eps)
+    def _norm_bwd(g_in, x, r, s):  # y = x * r * s, r = rsqrt(sum(x^2) + eps)
         return r * s * g_in - (r**3) * s * x * (g_in * x).sum(-1, keepdim=True)
 
     g_q_raw = _norm_bwd(g_qn, q_raw, rq, 1.0 / math.sqrt(key_dim))
@@ -994,9 +826,8 @@ def cross_entropy_loss_grad(logits: torch.Tensor, input_ids: object) -> tuple[fl
 
 
 def state_gather(states, windows, slots, layer_idx, parity=None):
-    """Gather one recurrent-state layer for a batch of slots. ``windows`` is
-    the double-buffered pool plane set [S, L, 2, W, D]; ``parity`` [S] picks
-    the live plane (all zeros off the sm90 decode path)."""
+    """Gather one recurrent-state layer for a batch of slots; ``parity`` [S]
+    picks the live conv-window plane of the double-buffered pool."""
     slots = torch.as_tensor(slots, dtype=torch.long, device=states.device).reshape(-1)
     if windows is None:
         return states[slots, layer_idx], None
@@ -1007,10 +838,8 @@ def state_gather(states, windows, slots, layer_idx, parity=None):
 def state_scatter(
     states, windows, slots, layer_idx, new_state, new_window, parity=None, steps=False
 ) -> None:
-    """Store one recurrent-state layer for a batch of slots (same plane it was
-    read from). ``steps``: the tensors carry a chain-step axis (speculative
-    verify) and land in the leading planes of the pool's step buffers — the
-    tick's chain width, which is <= the pool's spec_steps."""
+    """Store one recurrent-state layer for a batch of slots. ``steps``: the
+    tensors carry a chain-step axis and land in the pool's leading step planes."""
     slots = torch.as_tensor(slots, dtype=torch.long, device=states.device).reshape(-1)
     if steps:
         ks = new_state.shape[1]
@@ -1050,10 +879,7 @@ def greedy(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def sample(logits: torch.Tensor, temperature: float, top_p: float, seed: int) -> torch.Tensor:
-    """Top-p nucleus sampling. logits [B, V] -> long [B]. Deterministic per seed.
-
-    temperature <= 0 is greedy (argmax).
-    """
+    """Top-p sampling, deterministic per seed; temperature <= 0 is greedy."""
     logits = _f32(logits)
     if temperature <= 0:
         return logits.argmax(-1).to(torch.long)
@@ -1063,9 +889,8 @@ def sample(logits: torch.Tensor, temperature: float, top_p: float, seed: int) ->
     sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
     probs = torch.softmax(sorted_logits, dim=-1)
     cum = torch.cumsum(probs, dim=-1)
-    # keep the minimal prefix whose cumulative mass >= top_p
     keep = cum - probs < top_p
-    keep[..., 0] = True  # top_p <= 0 degenerates to greedy: always keep the argmax
+    keep[..., 0] = True
     probs = probs * keep
     probs = probs / probs.sum(-1, keepdim=True)
     sampled = torch.multinomial(probs, num_samples=1, generator=gen).squeeze(-1)
@@ -1078,18 +903,9 @@ def sample_batch(
     top_ps: torch.Tensor,
     seeds: torch.Tensor,
 ) -> torch.Tensor:
-    """Batched top-p: one sort/softmax over the whole batch, per-row
-    multinomial with a fresh per-row generator — identical draws to
-    :func:`sample` for the same (logits, temperature, top_p, seed) row.
-
-    The win is the sort: B argmax/sort-over-V calls become one batched op
-    (8.2% of the B=8 slice tick was 8 separate sorts + 8 D2H syncs).
-
-    ``temperatures`` / ``top_ps`` / ``seeds`` are read on the HOST — the caller
-    has them as Python scalars. Taking them as device tensors and reading them
-    back to pick the greedy/sampled split cost two syncs a tick plus one per
-    sampled row, on every target.
-    """
+    """Batched :func:`sample`: one sort/softmax for the batch, identical draws
+    per row. temperatures/top_ps/seeds are read on the host (device reads cost
+    two syncs a tick plus one per sampled row)."""
     logits = _f32(logits)
     b = logits.shape[0]
     dev = logits.device
@@ -1120,11 +936,7 @@ def sample_batch(
 
 
 def _check_chunk_core() -> None:
-    """chunkwise-WY must equal the serial decay-first scan it replaces.
-
-    A 3:1 key/value head ratio and a T that is not chunk-divisible, because
-    those are the two shapes the upstream kernels cannot express as-is.
-    """
+    """chunkwise-WY == the serial scan, at a 3:1 head ratio and a non-chunk-divisible T."""
     torch.manual_seed(0)
     b, t, hk, hv, dk, dv = 2, 70, 2, 6, 16, 16
     qn = torch.randn(b, t, hk, dk)
@@ -1156,8 +968,7 @@ if __name__ == "__main__":  # runnable check: quant_fp8 inverts dequant_fp8
     _w = torch.randn(300, 260, dtype=torch.bfloat16) * 0.02
     _q, _s = quant_fp8(_w)
     assert _q.shape == _w.shape and _s.shape == (3, 3), (_q.shape, _s.shape)
-    # e4m3 keeps 3 mantissa bits, so ~6% per element near a block's absmax; the
-    # gate that matters is the served model's accuracy, not this bound.
+    # e4m3 keeps 3 mantissa bits: ~6% per element near a block's absmax
     _rel = (dequant_fp8(_q, _s) - _w.float()).abs().max() / _w.float().abs().max()
     assert _rel < 0.06, _rel
     print("reference: quant_fp8 round-trip OK, rel", float(_rel))

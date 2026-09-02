@@ -1,10 +1,6 @@
-"""Where does a train step's memory actually sit? Phase-by-phase, plus the
-largest live tensors at the backward peak.
-
-Four LoRA peaks (47.0/50.5/57.6/71.8 GB at 1x64/128/256, 2x256) fit a line
-with slope 0.055 GiB/token and a ~28.6 GiB intercept. The intercept does not
-scale with T, so it is not activations, and it is bigger than anything the
-full-FT ledger can save. This finds it.
+"""Train-step memory phase by phase, plus the largest live tensors at the backward peak.
+LoRA peaks fit 0.055 GiB/token with a ~28.6 GiB intercept that does not scale with T; this
+finds it.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/probe_train_ledger.py /data00/Qwen3.8-27B-NVFP4
@@ -37,9 +33,7 @@ def mark(label: str, prev: float) -> float:
 
 
 def live_tensors(top: int = 12, named: dict | None = None) -> None:
-    """Largest live CUDA storages, labelled with the param key that owns them
-    when one does — an unattributed vocab-shaped tensor is the interesting
-    case, and shape alone cannot tell embed_tokens from lm_head."""
+    # labelled by owning param key: shape alone cannot tell embed_tokens from lm_head
     owner = {v.untyped_storage().data_ptr(): k for k, v in (named or {}).items()
              if torch.is_tensor(v) and v.is_cuda}
     seen, rows = set(), []
@@ -62,13 +56,8 @@ def live_tensors(top: int = 12, named: dict | None = None) -> None:
 
 
 def backward_peaks(tape, backend, g, needs, top: int = 8) -> None:
-    """Peak allocation each backward op adds, by op name.
-
-    The forward's stored activations are small (2.7 GiB at B=1 T=64); the
-    backward peaks 14.2 GiB above the forward's live total at that same size.
-    That gap is transient allocation inside the backward handlers, and this
-    says which handler makes it.
-    """
+    # the backward peaks 14.2 GiB above the forward's 2.7 GiB of activations at B=1 T=64;
+    # this says which handler's transient allocation makes that gap
     from tilerl.autograd import _BWD
 
     entries = list(tape._entries)
@@ -97,8 +86,7 @@ def backward_peaks(tape, backend, g, needs, top: int = 8) -> None:
 
 
 def tape_bytes(tape, top: int = 8) -> None:
-    """Bytes the tape holds, by op. The two frozen-linear rows are the
-    QUANTIZED WEIGHTS held as entry args — resident params, not activations."""
+    # the frozen-linear rows are quantized weights held as entry args, not activations
     per: dict[str, list] = {}
     seen = set()
     for e in tape._entries:
@@ -162,8 +150,7 @@ def main() -> None:
     params = model.params if trainable is None else trainable
     by_id = {id(x): x for x in params.values()}
     if args.full:
-        # The path full fine-tuning actually runs: each gradient is consumed
-        # and freed inside backward, so they never coexist.
+        # streamed update: each gradient is freed inside backward, so they never coexist
         opt.begin()
         tape.backward(grad_logits, needs=set(by_id),
                       on_grad=lambda t, g: (t in by_id and opt.step_one(by_id[t], g)) or True)

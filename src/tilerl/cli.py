@@ -1,9 +1,4 @@
-"""tilerl command-line interface: serve / train / pretrain / bench / merge.
-
-Heavy imports (torch, tilelang, sibling modules) happen inside the subcommand
-handlers so that ``tilerl --help`` stays instant and works even before the
-full runtime is wired up.
-"""
+"""tilerl CLI. Heavy imports live inside the handlers so ``--help`` stays instant."""
 
 from __future__ import annotations
 
@@ -15,15 +10,9 @@ import sys
 import time
 from pathlib import Path
 
-from . import recipes
-from .recipes import RECIPES
+from .eval import answer_match
+from .recipes import RECIPES, flags
 
-from .eval import answer_match, last_number  # noqa: F401  (tests import last_number from here)
-
-__all__ = ["main"]
-
-#: HF source for the 27B checkpoint (hub id or local directory). Override
-#: with TILERL_QWEN38_SOURCE once the checkpoint is downloaded.
 # ponytail: placeholder hub id; pin the real Qwen3-27B repo when weights land.
 _QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")
 
@@ -31,12 +20,7 @@ _QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")
 def _build_model(
     model_name: str, seed: int, fuse_projections: bool = False, keep_master: bool = False
 ):
-    """Build (cfg, model) for a named model. Lazy imports keep --help light.
-
-    ``fuse_projections`` concats same-input fp4 projections into one GEMV at
-    load (serving decode is launch-latency-bound on the small projections);
-    training keeps it off and passes ``keep_master`` so the tape has masters.
-    """
+    """(cfg, model): serving fuses projections, training keeps the bf16 masters."""
     from . import config as config_mod
     from . import model as model_mod
 
@@ -63,50 +47,29 @@ def _build_model(
 
 
 def _build_engine(cfg, model, backend, devices=None):
-    """Wire the engine with the serving-size pools (256 blocks / 16 slots).
-
-    ``devices``: replicate across these CUDA indices instead of one. The 27B in
-    NVFP4 is 23 GB against a 96 GB card, so a replica per device costs memory
-    the cards already have and measures 7.54x on 8 (wins/
-    2026-08-29-data-parallel-scales.md).
-    """
+    """Serving-size engine; ``devices`` replicates it across those CUDA indices."""
     from . import engine as engine_mod
-
-    # The token budget follows the model's context, and the block pool follows
-    # the budget. A fixed 8192 refused a real Claude Code turn on tiny-agent:
-    # ByteTokenizer is one token per BYTE, so a 21,676-byte request is 21,676
-    # tokens, not the ~5,400 a BPE would make of it. The measurement that
-    # matters is tokens, not characters.
-    ctx = int(getattr(cfg, "max_position_embeddings", 8192))
     from .kv_cache import BLOCK_TOKENS
+
+    # Token budget follows the context; ByteTokenizer makes one token per byte.
+    ctx = int(cfg.max_position_embeddings)
 
     kw = dict(num_blocks=max(256, (ctx * 8) // BLOCK_TOKENS), num_slots=16,
               max_batch=8, max_total_tokens=ctx)
     if not devices:
         return engine_mod.build_engine(cfg, model, backend, **kw)
 
-    import torch
-
     from .model import load_hf
     from tilerl_kernels.backend import Backend, resolve_target
     from .parallel import DataParallelEngine
 
     def make(d, **kwargs):
-        # A Backend binds torch.cuda.current_device() at construction and the
-        # weights land on it, so each replica loads its own copy inside its
-        # own context. Sharing one model across devices would silently serve
-        # every replica from device 0's memory.
+        # A Backend binds the current CUDA device: each replica loads its own copy there.
         b = Backend(resolve_target())
         m = load_hf(cfg, _QWEN38_SOURCE, fuse_projections=True) if model is None else model
         return engine_mod.build_engine(cfg, m, b, **kwargs)
 
-    del torch  # only needed by DataParallelEngine.build
     return DataParallelEngine.build(devices, make, **kw)
-
-
-# ---------------------------------------------------------------------------
-# serve
-# ---------------------------------------------------------------------------
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -121,18 +84,13 @@ def cmd_serve(args: argparse.Namespace) -> None:
     tokenizer = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
-    engine.run()  # starts the engine's own daemon thread
+    engine.run()
     print(f"tilerl serve: model={cfg.name} target={backend.target}")
     print(f"tilerl serve: http://{args.host}:{args.port}  (Ctrl+C to stop)")
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     finally:
         engine.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# train
-# ---------------------------------------------------------------------------
 
 
 def cmd_train(args: argparse.Namespace) -> None:
@@ -143,21 +101,14 @@ def cmd_train(args: argparse.Namespace) -> None:
     from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
-    # The bf16 masters are for full-parameter quantized training (the STE grad
-    # lands on them). --rl and --opd train LoRA on a FROZEN base, whose backward
-    # reads the quantized weight directly, so a master is ~27 GB the 27B never
-    # touches — and enough to fill the card on its own.
+    # LoRA on a frozen base needs no bf16 master (~27 GB on the 27B); full SFT does.
     adapters_only = args.rl or args.opd
     cfg, model = _build_model(args.model, seed=args.seed, keep_master=not adapters_only)
     if not adapters_only:
         from .model import drop_quantized
 
         drop_quantized(model)
-    # Full fine-tuning cannot use Adam: m+v for the 27B is 200.4 GiB against
-    # 50.1 GiB of weights. Adafactor factors the second moment to 0.03 GiB and
-    # clips each update, so no global grad norm is needed — which is what lets
-    # train._step consume and free every gradient inside backward instead of
-    # holding all 50.1 GiB of them.
+    # Adam's m+v on the 27B is 200.4 GiB; Adafactor is 0.03 GiB and streams its updates.
     optimizer = (
         AdamW(lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1) if adapters_only
         else Adafactor(lr=1e-2, weight_decay=0.1)
@@ -167,7 +118,7 @@ def cmd_train(args: argparse.Namespace) -> None:
 
         optimizer = ISO(optimizer)
     gen = torch.Generator().manual_seed(args.seed)
-    log = (lambda *a: None) if getattr(args, "json", False) else print
+    log = (lambda *a: None) if args.json else print
 
     log(
         f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
@@ -180,32 +131,23 @@ def cmd_train(args: argparse.Namespace) -> None:
         from .tokenizer import SAMPLING, get_tokenizer, render_chat
 
         tok = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
-        # --data: {"prompt", "answer"} per line, rendered as one ChatML user
-        # turn; the reward is exact match on the last number of the completion
-        # (GSM8K). Without it, random prompts and a demo reward.
         rows = ([json.loads(ln) for ln in Path(args.data).read_text().splitlines() if ln.strip()]
                 if args.data else [])
-        # The 27B switches thinking in the prompt, per its own chat template;
-        # a budget > 0 opens the block and caps it with the end tokens.
         real = args.model == "qwen38-27b"
         thinking = (args.think_budget > 0) if real else None
         prompts = [tok.encode(render_chat([("user", r["prompt"])], thinking)) for r in rows] or [
             torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist() for _ in range(8)
         ]
         end_think = tuple(tok.encode("</think>\n\n")) if thinking else ()
-        # Sampling follows the model card per thinking mode unless --temperature
-        # overrides; the tiny model keeps plain temperature-1 sampling.
         gen_cfg = dict(SAMPLING[thinking]) if real else {"temperature": 1.0}
         if args.temperature is not None:
             gen_cfg["temperature"] = args.temperature
         sampling = SamplingParams(
             max_new_tokens=args.max_new_tokens, **gen_cfg,
-            stop_token_ids=getattr(tok, "stop_token_ids", ()),
+            stop_token_ids=tok.stop_token_ids,
             thinking_budget=args.think_budget if thinking else None, end_think_ids=end_think)
 
-        # The run id is the hash of these: same inputs = same run, a finished
-        # one is returned instead of retrained. Checkpoint path + code commit is
-        # the identity, not the 15 GB of weight bytes.
+        # Same inputs = same run: a finished one is returned instead of retrained.
         inputs = {"model": args.model, "recipe": args.recipe,
                   "source": _QWEN38_SOURCE if args.model == "qwen38-27b" else "tiny",
                   "commit": commit(), "algo": "grpo" if args.rl else "opd",
@@ -242,14 +184,6 @@ def cmd_train(args: argparse.Namespace) -> None:
         from .engine import build_engine
         from .model import add_lora
 
-        # The engine that samples IS the model that trains — one runtime, one
-        # set of weights. LoRA keeps the trainable set small enough that a
-        # rollout and its update share a card.
-        # Prefix cache and captured graph BOTH off, and both for correctness,
-        # not speed: a cached prefix serves KV computed under the policy of an
-        # earlier step, and a captured graph bakes the f32 casts of the weights,
-        # which the optimizer's in-place update only invalidates on the eager
-        # path. Either one makes the rollout off-policy without saying so.
         from .kv_cache import NoPrefixStore
 
         engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8,
@@ -263,13 +197,12 @@ def cmd_train(args: argparse.Namespace) -> None:
                 return float(answer_match(text, gold[tuple(int(t) for t in prompt)]))
         else:
             half = cfg.vocab_size // 2
-            # Demo reward: dense, so an untrained policy's group has variance
-            # and GRPO has a gradient at step 0.
+
             def reward(prompt, completion):
                 return sum(1 for t in completion if t < half) / max(len(completion), 1)
 
         optimizer.lr = args.lr
-        evals(engine, "before")  # LoRA B is zero at init, so this is the base model's score
+        evals(engine, "before")  # LoRA B is zero at init: the base model's score
         hist = train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend,
                                    optimizer, group=args.group, sampling=sampling,
                                    seed=args.seed, trainable=trainable)
@@ -287,14 +220,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         from .model import add_lora
         from .spec import load_draft
 
-        # OPD: the teacher IS this model, generating through the engine with an
-        # EMA of the adapters. Speculation is a property of the teacher engine,
-        # so a draft head accelerates the rollout half without the loop knowing.
         draft = load_draft(model, args.draft) if args.draft else None
-        # Engine first: build_engine materializes the params, and an adapter
-        # created before that points at an object the forward no longer reads.
-        # Prefix cache and captured graph off, as for GRPO: both would sample
-        # from an earlier policy without raising.
+        # Engine first: build_engine materializes the params; an adapter added
+        # before that points at an object the forward no longer reads.
         from .kv_cache import NoPrefixStore
 
         teacher = build_engine(cfg, model, backend, num_blocks=512, num_slots=8,
@@ -310,12 +238,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         manifest["metrics"]["ce_last"] = losses[-1]
         return _finish(manifest, args.json)
     for step in range(args.steps):
-        # ponytail: fixed batch=2 seq=64 random-token batch; a real corpus
-        # plugs in here without touching train_step.
+        # ponytail: random-token batch; a real corpus plugs in here without touching train_step.
         input_ids = torch.randint(0, cfg.vocab_size, (2, 64), generator=gen)
         optimizer.lr = cosine_warmup(step, args.steps, 5, 1e-3)
-        # Fresh tape per step: one backward per tape (a reused tape leaks the
-        # step's intermediates and replays all history on each backward).
         loss = train_mod.train_step(model, input_ids, backend, optimizer, Tape())
         print(f"step {step + 1:4d}/{args.steps}  loss {loss:.4f}")
 
@@ -342,11 +267,6 @@ def _finish(m: dict, as_json: bool) -> None:
     print(json.dumps(m, indent=1) if as_json else format_run(m))
     if not gates_pass(m):
         sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# pretrain
-# ---------------------------------------------------------------------------
 
 
 def cmd_pretrain(args: argparse.Namespace) -> None:
@@ -381,11 +301,6 @@ def cmd_pretrain(args: argparse.Namespace) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# bench
-# ---------------------------------------------------------------------------
-
-
 def _devices(spec: str) -> list[int]:
     """``0-7`` or ``0,1,2`` or ``0-3,6``."""
     out: list[int] = []
@@ -399,14 +314,7 @@ def _devices(spec: str) -> list[int]:
 
 
 def cmd_generate(args: argparse.Namespace) -> None:
-    """Fan a prompt corpus across devices, one process each.
-
-    A process per device rather than one process with N contexts: the
-    in-process wrapper serialises every tick's Python half on the GIL, and
-    8 independent processes are what measured 7.54x on 8 H20s.
-    """
-    import json
-
+    # One process per device: an in-process wrapper serialises every tick on the GIL.
     from .generate import generate
 
     stats = generate(
@@ -419,12 +327,8 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 
 def cmd_bench(args: argparse.Namespace) -> None:
-    if getattr(args, "suite", None):
-        # Full harness: decode-vs-KV-depth / prefill-curve / kv-reuse / train,
-        # with the snapshot baseline gate. Lives in scripts/ (needs sys.path
-        # script-dir access); shell into it so it stays the single source.
+    if args.suite:
         import subprocess
-        from pathlib import Path
 
         script = Path(__file__).resolve().parent.parent.parent / "scripts/bench_harness.py"
         cmd = [sys.executable, str(script), "--suite", args.suite]
@@ -455,17 +359,13 @@ def cmd_bench(args: argparse.Namespace) -> None:
             if req_id in engine.poll():
                 return
 
-    # Warmup: first tilelang calls JIT-compile kernels; never time that. Use
-    # the same prompt_len as the timed run — JIT specializes per shape, so a
-    # shorter warmup prompt leaves the timed prefill's NVCC compile in the
-    # measurement. gen=2 compiles the decode [1,1] shapes too.
+    # Warmup at the timed prompt_len: the JIT specializes per shape; gen=2 compiles decode too.
     warmup_id = engine.submit(
         rand_ids(args.prompt_len),
         engine_mod.SamplingParams(temperature=0.0, top_p=1.0, max_new_tokens=2, seed=0),
     )
     run_to_done(warmup_id, max_ticks=16)
 
-    # Timed prefill: one tick = one forward over the whole prompt.
     req_id = engine.submit(
         rand_ids(args.prompt_len),
         engine_mod.SamplingParams(temperature=0.0, top_p=1.0, max_new_tokens=args.gen, seed=0),
@@ -474,7 +374,6 @@ def cmd_bench(args: argparse.Namespace) -> None:
     engine.step()
     prefill_ms = (time.perf_counter() - t0) * 1000.0
 
-    # Timed decode: one token per tick.
     decode_ms: list[float] = []
     for _ in range(args.gen):
         t0 = time.perf_counter()
@@ -494,11 +393,6 @@ def cmd_bench(args: argparse.Namespace) -> None:
     )
     print(f"{'decode':<10} {decode_avg:>12.3f} {1000.0 / decode_avg:>12.1f}")
     print(f"prefill total: {prefill_ms:.1f} ms | decode total: {sum(decode_ms):.1f} ms")
-
-
-# ---------------------------------------------------------------------------
-# argparse wiring
-# ---------------------------------------------------------------------------
 
 
 def cmd_merge(args: argparse.Namespace) -> None:
@@ -532,16 +426,14 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--devices", default="",
-                         help="replicate inside ONE process across these CUDA indices, e.g. 0,1,2,3. "
+                         help="replicate inside ONE process across these CUDA indices, e.g. 0,1,2,3 or 0-3. "
                               "A CUDA fault in one replica is sticky for the whole process and takes "
                               "the others down while HTTP keeps answering; for independent endpoints "
                               "run one process per card under CUDA_VISIBLE_DEVICES instead.",
-                         type=lambda v: [int(x) for x in v.split(",")] if v else [])
+                         type=lambda v: _devices(v) if v else [])
     p_serve.set_defaults(func=cmd_serve)
 
     p_train = sub.add_parser("train", help="SFT, --rl (GRPO) or --opd; --recipe for a gated flag set")
-    # qwen38-27b loads from TILERL_QWEN38_SOURCE; --rl trains LoRA on the frozen
-    # fp4 base, which is what fits one card.
     p_train.add_argument("--model", choices=["tiny", "tiny-agent", "qwen38-27b"], default="tiny")
     p_train.add_argument("--steps", type=int, default=20)
     p_train.add_argument("--seed", type=int, default=0)
@@ -576,7 +468,7 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_train.add_argument("--recipe", choices=sorted(RECIPES),
                          help="a flag set that passed a gate (recipes.py); flags override it")
     # The recipe is the subparser's defaults, so anything typed still wins.
-    p_train.set_defaults(func=cmd_train, **(recipes.flags(recipe) if recipe else {}))
+    p_train.set_defaults(func=cmd_train, **(flags(recipe) if recipe else {}))
 
     p_pretrain = sub.add_parser("pretrain", help="pretrain on a JSONL text corpus")
     p_pretrain.add_argument("--model", choices=["tiny"], default="tiny")

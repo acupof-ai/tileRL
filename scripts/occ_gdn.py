@@ -1,12 +1,6 @@
-"""Is the GDN prefill kernel SM-limited? Vary the block count in ONE launch.
-
-The kernel's grid is (num_value_heads, batch), so a batch of 2 doubles the
-blocks inside a single launch — which the engine never does, because it admits
-one prefill row per tick. If per-launch time grows much slower than the block
-count, the SMs were idle at B=1 (48 blocks, 78 SMs) and splitting the value
-dimension across more blocks is worth a kernel. If it grows linearly, the
-kernel is not SM-limited and that lever is dead.
-
+"""Is the GDN prefill kernel SM-limited? Grid is (num_value_heads, batch), so
+batch B multiplies blocks in one launch; sub-linear time means the 48 blocks
+left the 78 SMs idle at B=1 and a V split is worth a kernel.
   python scripts/occ_gdn.py --gpu 7
 """
 
@@ -45,8 +39,7 @@ def main() -> None:
     pairs = ([(1, int(x)) for x in args.lens.split(",")] if args.lens
              else [(int(x), args.t) for x in args.batches.split(",")])
     for b, t in pairs:
-        # bf16 inputs: the kernel is bf16-IO, and an f32 call is 2.5x slower
-        # than what the engine actually issues (4.099 ms vs 1670 us at T=512).
+        # bf16 inputs as the engine issues: an f32 call is 2.5x slower
         def g(*shape):
             return torch.randn(*shape, device=backend.device, dtype=torch.bfloat16)
 

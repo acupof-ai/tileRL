@@ -1,8 +1,4 @@
-"""End-to-end gates for tilerl (hermetic, CPU target, <60s).
-
-Coded against the concrete tilerl API: engines come from
-``tilerl.engine.build_engine``, prefix reuse is read from ``engine.stats()``.
-"""
+"""End-to-end gates: engine, prefix cache, training, tape, spec decode (hermetic, CPU)."""
 
 from __future__ import annotations
 
@@ -10,8 +6,6 @@ import math
 import os
 from dataclasses import replace
 
-# Hermetic CPU target: auto already maps to cpu on this Mac, but pin it so a
-# stray TILERL_TARGET in the environment can't hijack the suite.
 os.environ.setdefault("TILERL_TARGET", "cpu")
 
 import numpy as np
@@ -20,6 +14,7 @@ import torch
 
 from tilerl.autograd import (Adafactor, AdamW, RecordingBackend, Tape, clip_grad_norm,
                              cosine_warmup)
+from tilerl.cli import _build_model
 from tilerl.config import tiny
 from tilerl.engine import (
     BLOCK_TOKENS,
@@ -31,17 +26,13 @@ from tilerl.engine import (
     build_engine,
 )
 from tilerl.kv_cache import PagedKvPool
-from tilerl.model import build_random, fp4_param_keys, param_specs
+from tilerl.model import add_lora, build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
 from tilerl_kernels.backend import get_backend
-from tilerl_kernels.reference import dequant_fp4, pack_fp4
+from tilerl_kernels.reference import dequant_fp4, pack_fp4, unpack_fp4
 from tilerl.testing import RefBackend
 from tilerl.kv_cache import NoPrefixStore
 from tilerl.train import _training_kv, opd_loop, train_step
-
-
-# ---------------------------------------------------------------------------
-# fixtures / helpers
 
 
 def _build_engine(seed: int) -> Engine:
@@ -54,14 +45,7 @@ def _build_engine(seed: int) -> Engine:
 
 
 def _drain(engine, request_ids, max_new_tokens: int, max_ticks: int = 512):
-    """Step the engine until every request has produced its full length.
-
-    Uses step() rather than run(): the contract does not say whether run()
-    drains the queue or serves forever, and a serve-forever run() would hang
-    the suite. poll() is assumed to return completed requests only (the
-    agent-infer poll semantics); a partial-results scaffold fails here loudly.
-    Accumulates across polls (poll clears the finished dict each call).
-    """
+    """Step until every request has produced its full length (poll drains, so accumulate)."""
     done: dict = {}
     for _ in range(max_ticks):
         done.update(engine.poll())
@@ -71,22 +55,14 @@ def _drain(engine, request_ids, max_new_tokens: int, max_ticks: int = 512):
     raise TimeoutError(f"engine did not finish requests {request_ids} in {max_ticks} ticks")
 
 
-# ---------------------------------------------------------------------------
-# tests
-
-
 def test_step_seed_uses_all_seed_bits():
-    """Seeds differing only above bit 11 must not collide. The old shift-mask
-    form kept only the seed's low 11 bits — seeds 1/2049/16385 produced
-    identical streams, and OPD (seed=seed+step) replayed byte-identical
-    rollouts past step 2048."""
+    """Regression: a shift-mask kept only the low 11 bits, so OPD replayed rollouts past step 2048."""
     assert _step_seed(1, 0) != _step_seed(2049, 0)
     assert len({_step_seed(s, 7) for s in range(10000)}) > 9990
 
 
 def test_generate():
-    """16-token generation for two prompts: same seed -> identical tokens,
-    different seed -> different tokens."""
+    """Same seed -> identical tokens, different seed -> different tokens."""
     engine = _build_engine(seed=1234)
     try:
         prompt = np.random.default_rng(0).integers(3, 320, size=16).astype(np.int64)
@@ -101,19 +77,14 @@ def test_generate():
         engine.shutdown()
 
     toks_a, toks_b, toks_c = out[id_a], out[id_b], out[id_c]
-    # Deviation from a strict len==16: a randomly-initialised model samples
-    # eos with probability ~1/320 per step, so an exact-length assert would
-    # flake (~5%/request). The gates that matter are equality and seed
-    # sensitivity; eos truncation affects both sequences identically.
+    # a random model samples eos with p ~1/320 per step: no exact-length assert
     assert 1 <= len(toks_a) <= 16
     assert toks_a == toks_b, "same seed must produce identical tokens"
     assert toks_a != toks_c, "different seed must produce different tokens"
 
 
 def test_prefix_cache():
-    """A block-aligned prompt publishes its prefix at prefill; a second prompt
-    sharing that prefix plus a tail adopts the cached blocks (engine-level
-    prefix_hits, not just store lookups) and both requests complete."""
+    """A second prompt sharing a block-aligned prefix adopts the cached blocks."""
     engine = _build_engine(seed=99)
     try:
         rng = np.random.default_rng(1)
@@ -128,7 +99,7 @@ def test_prefix_cache():
         engine.shutdown()
 
     assert 1 <= len(out_1) <= 8 and 1 <= len(out_2) <= 8
-    assert engine.stats()["prefix_hits"] == 1
+    assert engine.stats()["prefix_hits"] == 1 and engine.stats()["prefix_misses"] == 1
 
 
 def test_generated_prefix_matches_cold_path():
@@ -199,8 +170,7 @@ def test_decode_growth_evicts_finished_prefix():
 
 
 def test_prefix_snapshots_die_with_their_store_entry():
-    """Boundary snapshots are 74.81 MiB each at 27B: an evicted store entry
-    must take its snapshot with it, or a long session OOMs the allocator."""
+    """Boundary snapshots are 74.81 MiB each at 27B: eviction must free them."""
     cfg = tiny()
     engine = build_engine(
         cfg,
@@ -250,18 +220,8 @@ def test_stop_token_is_not_returned():
 
 
 def test_adafactor_streaming_matches_collecting():
-    """Updating each parameter inside backward must equal collecting first.
-
-    The streaming path is what makes full fine-tuning fit — it never holds two
-    weight gradients at once — so it has to be the same arithmetic, not an
-    approximation of it. Updates are independent per parameter, so replay order
-    does not matter; this asserts that.
-
-    Compared at the tape+optimizer level, not through ``train_step``: the
-    collecting path there also runs ``clip_grad_norm``, which the streaming
-    path deliberately drops (Adafactor clips each update instead, so no global
-    norm is needed and no gradient has to outlive its own update).
-    """
+    """Updating each parameter inside backward equals collecting first. At the
+    tape+optimizer level: train_step's collecting path also clips the global norm."""
     backend = get_backend()
     ids = np.random.default_rng(7).integers(3, tiny().vocab_size, size=(2, 16)).astype(np.int64)
 
@@ -293,14 +253,7 @@ def test_adafactor_streaming_matches_collecting():
 
 
 def test_train_step_does_not_sync_per_parameter():
-    """One host sync per STEP, not per parameter.
-
-    ``Adafactor.step_one`` runs interleaved with backward, so every
-    ``float(tensor)`` inside it drains the pipeline mid-step. It used to take
-    two — update RMS and parameter RMS — for each of the ~640 parameters of the
-    27B. The only sync left is the loss value, which the step's own
-    finite-check needs.
-    """
+    """One host sync per step (the loss), not two per parameter inside Adafactor.step_one."""
     from torch.utils._python_dispatch import TorchDispatchMode
 
     class CountSyncs(TorchDispatchMode):
@@ -322,12 +275,7 @@ def test_train_step_does_not_sync_per_parameter():
 
 
 def test_adafactor_trains_with_factored_state():
-    """Same 20-step gate as AdamW, plus the property that is the whole reason
-    Adafactor exists: a 2D param's second moment is O(rows+cols), not O(n).
-
-    Adam's m+v for the 27B is 200 GiB against 50 GiB of weights, which is why
-    full fine-tuning cannot use it on one card.
-    """
+    """Loss falls over 20 steps and a 2D param's second moment is O(rows+cols)."""
     cfg = tiny()
     model = build_random(cfg, seed=2026)
     backend = get_backend()
@@ -353,32 +301,14 @@ def test_train_loss_decreases():
     optimizer = AdamW(lr=3e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
     batch = np.random.default_rng(7).integers(3, cfg.vocab_size, size=(2, 32)).astype(np.int64)
 
-    losses = []
-    for _ in range(20):
-        # fresh tape per step: no cross-step accumulation, no reliance on
-        # train_step resetting it.
-        losses.append(float(train_step(model, batch, backend, optimizer, Tape())))
-
-    first5 = sum(losses[:5]) / 5
-    last5 = sum(losses[-5:]) / 5
+    losses = [float(train_step(model, batch, backend, optimizer, Tape())) for _ in range(20)]
+    first5, last5 = sum(losses[:5]) / 5, sum(losses[-5:]) / 5
     assert last5 < first5, f"loss did not decrease: {first5:.4f} -> {last5:.4f}"
 
 
 def test_backward_streaming_matches_collecting():
-    """Streaming the gradients out must give exactly what collecting them gives.
-
-    This is the gate for full fine-tuning: the 27B OOMs holding every weight
-    gradient at once, so the optimizer has to consume each one as it is final
-    (errors/2026-08-29-full-finetune-blocker.md). Identical numbers or the
-    optimization is not one.
-    """
-    import numpy as np
-
-    from tilerl.autograd import RecordingBackend, Tape
-    from tilerl.cli import _build_model
-    from tilerl.testing import RefBackend
-    from tilerl.train import _training_kv
-
+    """Streaming gradients out of backward equals collecting them, bit for bit
+    (the 27B cannot hold every weight gradient at once)."""
     backend = RefBackend()
     cfg, model = _build_model("tiny", seed=0, keep_master=True)
     ids = np.arange(1, 33, dtype=np.int64).reshape(2, 16) % cfg.vocab_size
@@ -403,9 +333,7 @@ def test_backward_streaming_matches_collecting():
         assert not left, f"streaming left {len(left)} gradients behind"
         return out
 
-    # Compare by parameter NAME, not id(): streaming frees tensors earlier, so
-    # CPython hands their addresses to later allocations and the two runs no
-    # longer agree on ids for anything but the params themselves.
+    # by name, not id(): streaming frees tensors earlier and ids get reused
     by_id = {id(v): k for k, v in model.params.items()}
     ref = {by_id[k]: v for k, v in run(False).items() if k in by_id}
     got = {by_id[k]: v for k, v in run(True).items() if k in by_id}
@@ -419,11 +347,8 @@ def test_backward_streaming_matches_collecting():
 
 
 def test_tape_gradcheck():
-    """Tape backward vs central finite differences on rmsnorm+linear+CE.
-
-    Deviation: runs in float32, not the model's bf16 — bf16's ~3 decimal
-    digits swamp a 1e-3 finite-difference step. Shapes <= 16 per the gate.
-    """
+    """Tape backward vs central finite differences on rmsnorm+linear+CE, in f32
+    (bf16 swamps a 1e-3 step)."""
     backend = get_backend()
     gen = torch.Generator().manual_seed(0)
     batch, dim, vocab = 4, 8, 16
@@ -434,10 +359,7 @@ def test_tape_gradcheck():
     eps = 1e-6
 
     def forward(x_, wn_, wp_):
-        # CE has no backend op (no softmax_bwd in the contract), so the tape
-        # covers rmsnorm+linear only; loss and dL/dlogits are torch-eager.
-        # The RecordingBackend proxy is the recording seam: the raw backend
-        # does not record onto the tape.
+        # the tape covers rmsnorm+linear; CE and dL/dlogits are torch-eager
         rec = RecordingBackend(backend)
         with Tape() as tape:
             hidden = rec.rmsnorm(x_, wn_, eps)
@@ -455,24 +377,7 @@ def test_tape_gradcheck():
 
     tape, _ = forward(x, w_norm, w_proj)
     grads = tape.backward(dlogits)
-
-    def grad_for(tensor):
-        if id(tensor) in grads:
-            return grads[id(tensor)]
-        for key, value in grads.items():  # tolerate tensor-keyed dicts
-            if isinstance(key, torch.Tensor) and key is tensor:
-                return value
-        return None
-
-    analytic = {}
-    for name, tensor in (("w_norm", w_norm), ("w_proj", w_proj), ("x", x)):
-        g = grad_for(tensor)
-        if g is not None:
-            analytic[name] = g.float()
-    assert "w_norm" in analytic and "w_proj" in analytic, (
-        f"tape.backward did not return grads for both params; got keys {list(grads)}"
-    )
-
+    analytic = {name: grads[id(t)].float() for name, t in (("w_norm", w_norm), ("w_proj", w_proj))}
     step = 1e-3
 
     def numeric_grad(tensor):
@@ -490,11 +395,7 @@ def test_tape_gradcheck():
 
     for name, tensor in (("w_norm", w_norm), ("w_proj", w_proj)):
         numeric = numeric_grad(tensor)
-        # The tape grad lives on the backend device (mps under metal); the
-        # finite-difference reference mutates the CPU param — compare on CPU.
         expected = analytic[name].cpu()
-        # tilelang f32 kernels accumulate in a different order than the
-        # finite-difference reference; loosen atol/rtol to accommodate.
         assert torch.allclose(expected, numeric, rtol=5e-2, atol=5e-4), (
             f"{name}: tape grad mismatch, max abs diff "
             f"{(expected - numeric).abs().max().item():.2e}"
@@ -517,21 +418,8 @@ def test_recording_uses_master_weight_and_consumes_tape():
         pass
 
 
-def test_ref_backend_train_step():
-    model = build_random(tiny(), seed=4)
-    loss = train_step(
-        model,
-        np.arange(3, 11, dtype=np.int64)[None, :],
-        RefBackend(),
-        AdamW(lr=1e-3),
-    )
-    assert math.isfinite(loss)
-
-
 def test_fp4_train_step():
-    """Training a quantized model: every fp4 linear must still carry its bf16
-    master, or the tape's STE grad has nowhere to land. tiny() is fp4=False, so
-    no other training test puts a packed weight under the tape."""
+    """Every fp4 linear keeps its bf16 master under the tape (the STE grad lands on it)."""
     cfg = replace(tiny(), fp4=True)
     model = build_random(cfg, seed=4, keep_master=True)
     assert fp4_param_keys(cfg) <= set(model.params)
@@ -541,46 +429,18 @@ def test_fp4_train_step():
 
 @pytest.mark.parametrize("block", [32, 16])
 def test_fp4_roundtrip(block):
-    """Pack/unpack of fp4 weights: values already on the OCP e2m1 grid must
-    survive the roundtrip with error < 1e-2, at both checkpoint block sizes
-    (16 is what the real 27B NVFP4 weights carry). Skipped if no pack/unpack
-    helper is exposed — the contract pins the wire format (low-nibble-first
-    OCP e2m1, scale [N, K//B]) but not the helper's location or signature."""
-    pack = unpack = None
-    try:
-        from tilerl_kernels.reference import pack_fp4, unpack_fp4  # type: ignore
-
-        pack, unpack = pack_fp4, unpack_fp4
-    except ImportError:
-        pass
-    if pack is None:
-        pytest.skip("fp4 pack/unpack helpers not exposed")
-
+    """Values on the e2m1 grid survive pack/unpack at both checkpoint block sizes."""
     gen = torch.Generator().manual_seed(0)
-    n_rows, k_cols = 16, 32  # K a multiple of the scale block and of 2 (nibble pair)
+    n_rows, k_cols = 16, 32
     grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-    # Small per-block scale: bf16 spacing at the resulting magnitudes is
-    # negligible, so the roundtrip error is dominated by e2m1 quantization.
     scale = torch.rand(n_rows, k_cols // block, generator=gen, dtype=torch.float32) * 0.05 + 0.01
     signs = torch.randint(0, 2, (n_rows, k_cols), generator=gen) * 2 - 1
     indices = torch.randint(0, 8, (n_rows, k_cols), generator=gen)
-    # Ensure each block contains the max grid value (6) so the packer's
-    # block_max/6 scale convention reproduces the test's per-block scale.
-    indices[:, ::block] = 7
+    indices[:, ::block] = 7  # every block holds a 6 so block_max/6 reproduces the scale
     weights = (signs.float() * grid[indices] * scale.repeat_interleave(block, dim=1)).to(
         torch.bfloat16
     )
-
-    try:
-        packed = pack(weights, block)
-        if isinstance(packed, tuple) and len(packed) == 2:
-            dequant = unpack(packed[0], packed[1])
-        else:
-            # pack(w) -> wq only: unpack with the block-max/6 scale convention.
-            dequant = unpack(packed, scale)
-    except TypeError as exc:
-        pytest.skip(f"fp4 pack/unpack signature deviation: {exc}")
-
+    dequant = unpack_fp4(*pack_fp4(weights, block))
     assert dequant.shape == weights.shape, f"shape drift: {dequant.shape} vs {weights.shape}"
     max_err = (dequant.float() - weights).abs().max().item()
     assert max_err < 1e-2, f"fp4 roundtrip max error {max_err:.2e} >= 1e-2"
@@ -595,8 +455,6 @@ def test_cosine_warmup():
 
 
 def test_clip_grad_norm():
-    """Over-max grads are scaled to the max norm; under-max are untouched;
-    a non-finite norm passes through (the caller rejects the step)."""
     g = torch.ones(4)
     grads = {0: g.clone()}
     pre = clip_grad_norm(grads, 1.0)
@@ -610,9 +468,11 @@ def test_clip_grad_norm():
 
 
 def test_production_model_gradcheck():
-    """AGENTS.md gate: the full tiny model (full-attn + GDN layers) under a
-    tape returns a finite grad for EVERY param, and the tape grad matches
-    central finite differences on a few params from different layers."""
+    """The full tiny model under a tape: a finite grad for every param, and
+    central finite differences on params from different layers.
+    # A CUDA gradcheck read 8.1e-2 at step 0.1 and 2.6e-1 at 0.025 while the
+    # tape held 0.4%: the probe, not the tape, was wrong (errors/, 2026-08-28).
+    """
     cfg = tiny()
     model = build_random(cfg, seed=42)
     backend = get_backend()
@@ -620,17 +480,11 @@ def test_production_model_gradcheck():
     positions = np.arange(16, dtype=np.int64)
 
     def loss_and_grads():
-        from tilerl.train import _training_kv
-
         kv = _training_kv(model, 2, 16, device=backend.device)
         tape = Tape()
         with torch.no_grad(), tape:
             logits = model.forward(batch, positions, kv, RecordingBackend(backend))
-        # The production CE, not a local re-derivation: the old local _ce
-        # left a spurious softmax on the final position, manufacturing a
-        # 16-106% analytic-vs-numeric disagreement that forced an absolute
-        # 0.2 tolerance — under which 9/9 injected gradient corruptions
-        # passed.
+        # the production CE: a local re-derivation once hid 9/9 injected corruptions
         loss, dlogits = backend.cross_entropy_loss_grad(logits, batch)
         return loss, tape.backward(dlogits)
 
@@ -642,22 +496,11 @@ def test_production_model_gradcheck():
         assert g is not None, f"no grad for param {k}"
         assert torch.isfinite(g).all(), f"non-finite grad for {k}"
 
-    # Numerical spot-check: one element each from embed, a full-attn weight,
-    # a GDN weight, and final_norm. With the production CE the worst clean
-    # rel error is 3.6% (measured); rtol=0.1 catches every injected gradient
-    # corruption — the old absolute 0.2 tolerance passed 9/9 of them.
+    # one element each from embed, a full-attn weight, a GDN weight, final_norm;
+    # worst clean rel error is 3.6%, rtol=0.1 catches every injected corruption.
+    # A bf16 central difference whose slope moves with the step size cannot
+    # judge a gradient, so an inconsistent probe is skipped, not blamed on the tape.
     step = 0.1
-    # in_proj_a exercises the GDN in-projection; its grad is ~1e-2 (stable
-    # under bf16 finite differences). in_proj_qkv's grad is ~8e-5 here — too
-    # small for a bf16 central-difference to estimate (the numeric value swings
-    # with step size while the tape value is stable), so it is a bad gradcheck
-    # probe, not a wrong gradient.
-    # The probe is checked before it is trusted. A central difference on a
-    # bf16 loss of ~24 reads a perturbation of ~1e-3 through catastrophic
-    # cancellation; on the CUDA path that made the SAME point read 8.1e-2 at
-    # step 0.1 and 2.6e-1 at 0.025 while the tape value held to 0.4% of the
-    # CPU one. A slope that changes with the step size cannot judge a
-    # gradient, so an inconsistent probe is skipped, not blamed on the tape.
     checked = 0
     for key in ("embed_tokens", "layers.0.q_proj", "layers.1.in_proj_a", "final_norm"):
         p = model.params[key]
@@ -675,29 +518,18 @@ def test_production_model_gradcheck():
         mean = sum(nums) / len(nums)
         spread = (max(nums) - min(nums)) / max(abs(mean), 1e-12)
         if spread > 0.25:
-            continue  # probe disagrees with itself: it cannot judge anything
+            continue
         checked += 1
         numeric = min(nums, key=lambda n: abs(n - analytic))
         assert abs(analytic - numeric) < 0.1 * abs(numeric), (
             f"{key}: tape {analytic:.4e} vs numeric {numeric:.4e} (probe spread {spread:.1%})"
         )
-    # skipping every probe would turn this gate into a no-op
     assert checked, "no finite-difference probe was numerically sound"
 
 
 def test_logprobs_are_returned_and_deterministic():
-    """Every returned token carries log p under the distribution it was drawn
-    from — what a policy gradient needs, and what a second forward would get
-    wrong once the sampler or the weights move.
-
-    Checked without recomputing the softmax: a probability's log is never
-    positive, there is exactly one per emitted token, and the same seed must
-    reproduce both the tokens and their scores.
-    """
-    from tilerl.cli import _build_model
-    from tilerl.engine import SamplingParams, build_engine
-    from tilerl_kernels.backend import get_backend
-
+    """Every sampled token carries log p under the distribution it was drawn
+    from: one per token, never positive, reproduced by the same seed."""
     backend = get_backend()
     cfg, model = _build_model("tiny", seed=0)
     engine = build_engine(cfg, model, backend, num_blocks=64, num_slots=8)
@@ -715,8 +547,7 @@ def test_logprobs_are_returned_and_deterministic():
     out, lps = run()
     assert lps is not None and len(lps) == len(out) == 4, (out, lps)
     assert all(x <= 1e-5 for x in lps), lps
-    # greedy must not report the point mass: scoring at the sampling
-    # temperature would make every logprob exactly 0, true and useless
+    # greedy must not report the point mass (every logprob exactly 0)
     g = SamplingParams(temperature=0.0, max_new_tokens=3, seed=1, logprobs=True)
     rid = engine.submit(list(range(8)), g)
     for _ in range(200):
@@ -726,14 +557,9 @@ def test_logprobs_are_returned_and_deterministic():
     greedy_lps = engine.logprobs(rid)
     assert greedy_lps and all(x < -1e-6 for x in greedy_lps), greedy_lps
     assert (out, lps) == run(), "same seed, different scores"
-    # scores are drained with the request, like the tokens -- and a SECOND read
-    # raises rather than returning None. Both cases would otherwise be None, and
-    # "someone already took them" is a bug the caller cannot see: the RL path
-    # compares recorded token ids against the transcript's, and an empty score
-    # list makes that comparison fail with nothing to point at.
+    # a second read raises: None would be indistinguishable from "never asked"
     with pytest.raises(KeyError, match="already taken"):
         engine.logprobs(rid)
-    # a request that did not ask gets nothing, not zeros
     rid = engine.submit(list(range(8)), SamplingParams(max_new_tokens=2, seed=3))
     for _ in range(200):
         engine.step()
@@ -743,20 +569,7 @@ def test_logprobs_are_returned_and_deterministic():
 
 
 def test_opd_lora_self_teacher():
-    """OPD with LoRA adapters: the engine rolls out, only the adapters move.
-
-    The base must be bit-identical afterwards — a self-teacher that drifts the
-    frozen weights is not a self-teacher — and every adapter must have been
-    stepped, which is what fails if add_lora attaches to nothing.
-    """
-    import torch
-
-    from tilerl.autograd import AdamW
-    from tilerl.cli import _build_model
-    from tilerl.engine import build_engine
-    from tilerl.model import add_lora
-    from tilerl_kernels.backend import get_backend
-
+    """OPD with LoRA: the frozen base stays bit-identical and some adapter moves."""
     backend = get_backend()
     cfg, model = _build_model("tiny", seed=0, keep_master=True)
     teacher = build_engine(cfg, model, backend, num_blocks=64, num_slots=4, decode_graph=False, prefix_store=NoPrefixStore())
@@ -774,34 +587,7 @@ def test_opd_lora_self_teacher():
     assert moved, "no adapter moved"
 
 
-def test_opd_loop_smoke():
-    """One opd_loop step: the teacher engine generates, the student trains,
-    the loss is finite."""
-    cfg = tiny()
-    model = build_random(cfg, seed=7)
-    backend = get_backend()
-    teacher = build_engine(
-        cfg,
-        build_random(cfg, seed=8),
-        backend,
-        num_blocks=8,
-        num_slots=4,
-        max_batch=4,
-        max_total_tokens=512,
-        decode_graph=False,
-        prefix_store=NoPrefixStore(),
-    )
-    try:
-        prompts = [np.random.default_rng(0).integers(3, cfg.vocab_size, size=8).astype(np.int64)]
-        losses = opd_loop(teacher, model, prompts, steps=1, backend=backend, seed=0)
-    finally:
-        teacher.shutdown()
-    assert len(losses) == 1 and math.isfinite(losses[0])
-
-
 def test_prefix_snapshot_includes_conv_window():
-    """White-box: after a prefill, the published boundary snapshot is a
-    (states, conv_windows) tuple with a non-None window."""
     cfg = tiny()
     engine = _build_engine(seed=5)
     try:
@@ -820,16 +606,7 @@ def test_prefix_snapshot_includes_conv_window():
 
 
 def test_concurrent_prefills_not_starved():
-    """Mixed-batch scheduling: 3 concurrent requests all reach decode phase
-    together and all 3 produce output. Decode-first scheduling would fully
-    serve req 1 before req 2's prefill, so the three would never decode
-    together.
-
-    The gate is the phase state, not a forward counter: prefills that share a
-    width bucket are now packed into ONE forward, so three 8-token prompts
-    reach decode in a single prefill-only tick and produce no mixed forward at
-    all. The old assertion (mixed_forwards >= 2) encoded the one-prefill-per-
-    tick schedule rather than the property being protected."""
+    """Three concurrent requests reach decode together (same-width prefills pack into one forward)."""
     engine = _build_engine(seed=77)
     try:
         prompt = np.random.default_rng(0).integers(3, 320, size=8).astype(np.int64)
@@ -842,8 +619,6 @@ def test_concurrent_prefills_not_starved():
             if sum(1 for r in engine._running if r.phase == _PHASE_DECODE) == 3:
                 break
         assert sum(1 for r in engine._running if r.phase == _PHASE_DECODE) == 3
-        # Packed into one bucket, so all three prefill in one forward - the
-        # serial schedule needed one tick per request.
         assert ticks <= 2, f"three same-length prompts took {ticks} ticks to prefill"
         out = _drain(engine, ids, max_new_tokens=8)
     finally:
@@ -852,9 +627,7 @@ def test_concurrent_prefills_not_starved():
 
 
 def test_chunked_prefill_matches_one_shot():
-    """A prompt longer than the per-tick token budget is chunked across
-    ticks; the carried state must be exact, so chunked and one-shot engines
-    produce identical tokens for the same prompt and seed."""
+    """Chunked and one-shot prefill produce identical tokens."""
     prompt = np.random.default_rng(0).integers(3, 320, size=40).astype(np.int64)
     params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=11)
     outs = []
@@ -880,23 +653,7 @@ def test_chunked_prefill_matches_one_shot():
     assert 1 <= len(outs[1]) <= 4
 
 
-def test_engine_miss_path():
-    """A fresh engine's first request misses the prefix store and still
-    completes (miss path: no snapshot to restore, full prefill)."""
-    engine = _build_engine(seed=1)
-    try:
-        prompt = np.random.default_rng(0).integers(3, 320, size=16).astype(np.int64)
-        rid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
-        out = _drain(engine, [rid], max_new_tokens=2)
-    finally:
-        engine.shutdown()
-    assert engine.stats()["prefix_misses"] == 1
-    assert 1 <= len(out[rid]) <= 2
-
-
 def test_gpu_targets():
-    """GPU targets compile from the same kernel source; nothing to verify on a
-    GPU-less host. Skip unless a CUDA device is available."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA device available on this host")
     target = "cuda"
@@ -904,7 +661,7 @@ def test_gpu_targets():
     os.environ["TILERL_TARGET"] = target
     from tilerl_kernels import backend as backend_mod
 
-    backend_mod._BACKEND = None  # force re-resolution against the env var
+    backend_mod._BACKEND = None
     try:
         backend = backend_mod.get_backend()
         assert backend.target == target, f"resolved {backend.target!r}, want {target!r}"
@@ -921,8 +678,7 @@ def test_gpu_targets():
 
 
 def test_frozen_fp4_base_gives_dx_only():
-    """No master = frozen base (LoRA/OPD): the fp4 kernel runs and dX flows,
-    but the quantized weight gets no gradient."""
+    """No master = frozen base: dX flows, the quantized weight gets no gradient."""
     backend = RefBackend()
     recording = RecordingBackend(backend)
     x = torch.randn(2, 32)
@@ -937,11 +693,7 @@ def test_frozen_fp4_base_gives_dx_only():
 
 
 def test_lora_train_step_on_frozen_fp4_base():
-    """LoRA-OPD shape: quantized base with no master, only the adapters train.
-    Step 0 must be identical to the base (B=0), and the step must move only
-    the adapter params."""
-    from tilerl.model import add_lora
-
+    """Frozen fp4 base + LoRA: B=0 at step 0, then only the adapters move."""
     cfg = replace(tiny(), fp4=True)
     model = build_random(cfg, seed=4)  # no keep_master: the base is frozen
     backend = RefBackend()
@@ -959,10 +711,7 @@ def test_lora_train_step_on_frozen_fp4_base():
 
 
 def test_opd_ema_self_teacher_shares_the_model():
-    """Self-teacher OPD: one model, one engine, the teacher generating from an
-    EMA of the adapters. Only the adapters may move, and the EMA must lag."""
-    from tilerl.model import add_lora
-
+    """Self-teacher OPD: one model, one engine, the teacher on an EMA of the adapters."""
     cfg = replace(tiny(), fp4=True)
     model = build_random(cfg, seed=7)
     backend = get_backend()
@@ -982,8 +731,7 @@ def test_opd_ema_self_teacher_shares_the_model():
 
 
 def test_thinking_budget_forces_the_block_closed():
-    """reasoning_effort: after the budget the engine emits end_think_ids
-    instead of sampling, and stops forcing once the block is closed."""
+    """After the budget the engine emits end_think_ids, then sampling resumes."""
     cfg = tiny()
     engine = build_engine(cfg, build_random(cfg, seed=11), get_backend(), num_blocks=8,
                           num_slots=4, max_batch=4, max_total_tokens=512)
@@ -1006,26 +754,17 @@ def test_thinking_budget_forces_the_block_closed():
     assert tuple(out[2:4]) == end  # forced at the budget, then sampling resumes
 
 
-# ---------------------------------------------------------------------------
-# speculative decoding
-
-
 class _OracleDraft:
-    """A draft head that always proposes the trunk's own continuation.
-
-    Forces full acceptance every tick, so the verify path (chain KV, GDN state
-    selection at n_ok = depth, multi-token commit) is actually exercised — a
-    random head is rejected at position 0 and proves nothing about it.
-    """
+    """A draft head proposing the trunk's own continuation: full acceptance
+    every tick, so the verify path (chain KV, GDN state selection, multi-token
+    commit) is exercised; a random head is rejected at position 0."""
 
     def __init__(self, cfg, expected: dict[int, int]):
         self.cfg = replace(cfg, num_layers=1, full_attn_layers=(0,))
         self.params: dict = {}
-        self.expected = expected  # absolute position -> the token that lands there
+        self.expected = expected  # absolute position -> token
 
     def forward(self, hidden, ids, positions, kv, backend, hidden_out=None):
-        # [B, T]: the engine's draft run is as wide as the positions it is
-        # filling KV for, not one per call.
         pos = np.atleast_2d(np.asarray(positions))
         logits = torch.zeros(*pos.shape, self.cfg.vocab_size)
         for i in range(pos.shape[0]):
@@ -1065,12 +804,8 @@ def _spec_run(prompt, n, draft=None, depth=3):
 
 
 def _full_context_draft(cfg, model, draft, backend, toks: list[int]) -> "torch.Tensor":
-    """`draft_check.py`'s shape: the head over the WHOLE sequence, teacher-forced.
-
-    Hidden at position i, the token at i+1, drafting i+1 — so the returned row
-    is the draft's logits at position ``len(toks) - 1``. The KV pool is fresh
-    and zeroed, which is what position 0 (never drafted) reads.
-    """
+    """draft_check.py's shape: the head teacher-forced over the whole sequence;
+    returns its logits at position len(toks) - 1."""
     n = len(toks) - 1
     hid: list = []
     model.forward(np.array([toks]), np.arange(len(toks)),
@@ -1099,20 +834,10 @@ def _full_context_draft(cfg, model, draft, backend, toks: list[int]) -> "torch.T
     ids=["single", "multirow", "chunked", "depth2"],
 )
 def test_engine_draft_matches_full_context_draft(rows, plen, batched_tokens, depth):
-    """The draft the engine runs must equal the draft `draft_check.py` measures.
-
-    Those two harnesses reported 84.4% and 55.8% agreement for the same head at
-    the same condition, and the reason is that they are not the same forward:
-    the probe runs the head over the whole sequence, the engine runs it with
-    `seq_len = 1`, so its attention is a softmax over one position.
-
-    This is the gate the feature never had, and the parametrization is the
-    point. Every other spec test is a CORRECTNESS gate, and a context-starved
-    draft is correct — a draft is accepted only when it equals what the trunk
-    sampled, so a bad guess costs throughput and never output. A fill pass that
-    mishandles ragged batch widths, chunked prefill, or the stale KV a rejected
-    chain leaves behind would therefore leave every other test green.
-    """
+    """The draft the engine runs equals the draft draft_check.py measures. A
+    context-starved draft is still CORRECT (rejected drafts cost throughput,
+    never output), so no other spec test sees a broken KV fill; the
+    parametrization covers ragged widths, chunked prefill and stale chain KV."""
     cfg = tiny()
     backend = get_backend()
     model = build_random(cfg, seed=7)
@@ -1128,10 +853,8 @@ def test_engine_draft_matches_full_context_draft(rows, plen, batched_tokens, dep
 
     def spy(hidden, ids, positions, kv, be, hidden_out=None):
         out = inner(hidden, ids, positions, kv, be, hidden_out=hidden_out)
-        # Chain step 0 only: later steps consume the draft's OWN hidden and its
-        # own drafted tokens, which the teacher-forced probe does not model.
-        # Full-batch ticks only, so batch index i is request i: rows are
-        # admitted in order and a partial batch would shift the mapping.
+        # chain step 0 on full-batch ticks only: later steps consume the draft's
+        # own hidden, and a partial batch would shift row -> request
         if step["n"] % max(depth, 1) == 0 and out.shape[0] == rows:
             pos = np.asarray(positions)
             for i in range(rows):
@@ -1146,33 +869,25 @@ def test_engine_draft_matches_full_context_draft(rows, plen, batched_tokens, dep
     outs = _drain(engine, ids, 8)
     draft.forward = inner
     assert len(seen) == rows, f"the draft never ran on a full {rows}-row tick"
-    # The parametrization has to actually reach the path it names.
     if batched_tokens < plen:
         assert engine.stats()["prefill_forwards"] > rows, "the prompt did not chunk"
 
     for i, (pos, got) in sorted(seen.items()):
-        # Greedy decode is deterministic: the row's sequence at that draft is
-        # its final one truncated to the drafted position.
+        # greedy is deterministic: the final sequence truncated is the sequence at that draft
         row = prompts[i] + outs[ids[i]]
         full = _full_context_draft(cfg, model, draft, backend, row[: pos + 1])
         assert int(full.argmax()) == int(got.argmax()), (
             f"row {i}: engine drafted {int(got.argmax())} at position {pos}, "
             f"full context drafts {int(full.argmax())}"
         )
-        # Not assert_close: the probe re-derives the trunk hidden with a dense
-        # forward while the engine's came from paged attention and the
-        # recurrent state, which differ by ~4e-03 on their own and the head
-        # amplifies that ~10x. A chain-local KV, by contrast, produces an
-        # unrelated vector — norm-relative ~1.4, 25x this bound.
+        # dense vs paged hidden differ ~4e-3, x10 through the head; a chain-local KV reads ~1.4
         rel = ((full - got).norm() / full.norm()).item()
         assert rel < 0.1, f"row {i} at position {pos}: norm-relative {rel:.2e}"
 
 
 def test_speculation_reproduces_greedy_decode():
-    """The whole correctness gate for spec decode: with a draft attached the
-    engine must emit token-for-token what it emits without one. Covers the
-    rejected case (random head) AND the fully-accepted case (oracle head),
-    which is the one that exercises the GDN state rewind."""
+    """With a draft attached the engine emits exactly what it emits without
+    one: rejected (random head) and fully accepted (oracle head, GDN state rewind)."""
     prompt, n = [3, 4, 5, 6], 24
     base, _ = _spec_run(prompt, n)
     assert len(base) == n
@@ -1184,11 +899,9 @@ def test_speculation_reproduces_greedy_decode():
     expected = {i: t for i, t in enumerate(prompt + base)}
     spec, sstats = _spec_run(prompt, n, draft=lambda cfg, m: _OracleDraft(cfg, expected))
     assert spec == base, f"oracle draft changed the output: {spec} != {base}"
-    # A perfect draft must actually be accepted, or the gate proves nothing.
     assert sstats["spec_accepted"] > sstats["spec_drafted"] * 0.9, sstats
 
-    # Chains trimmed below spec_depth: the step planes the forward writes are
-    # narrower than the pool's, which used to be a shape crash, not a wrong token.
+    # chains trimmed below spec_depth write narrower step planes than the pool's
     import tilerl.engine as eng
 
     orig, eng.verify_lens = eng.verify_lens, lambda surv: [2] * len(surv)
@@ -1200,9 +913,7 @@ def test_speculation_reproduces_greedy_decode():
 
 
 def test_generate_fans_a_corpus_across_workers(tmp_path):
-    """Offline batch generation: every prompt comes back, exactly once, with
-    output. Runs the real subprocess path on one device - the stride, the
-    per-worker file and the merge are what break silently."""
+    """Offline batch generation through the real subprocess path: every prompt back exactly once."""
     import json
 
     from tilerl.generate import generate

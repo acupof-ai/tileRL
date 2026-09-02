@@ -15,12 +15,8 @@ _NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 
 
 def last_number(text: str | None) -> float | None:
-    """The last number in a completion — the GSM8K answer convention."""
     found = _NUMBER.findall(text or "")
-    try:
-        return float(found[-1].replace(",", "")) if found else None
-    except ValueError:
-        return None
+    return float(found[-1].replace(",", "")) if found else None
 
 
 def answer_match(text: str | None, answer: str) -> bool:
@@ -29,8 +25,7 @@ def answer_match(text: str | None, answer: str) -> bool:
 
 
 def generate(engine: Any, tok: Any, prompts: list[str], sp: Any, concurrency: int) -> list[str]:
-    """One decoded completion per prompt. ``concurrency`` <= the engine's
-    state slots: submit allocates one eagerly."""
+    """One decoded completion per prompt; ``concurrency`` <= the engine's state slots."""
     texts: list = [None] * len(prompts)
     pending, todo = {}, list(enumerate(prompts))
     while pending or todo:

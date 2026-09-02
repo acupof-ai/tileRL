@@ -1,23 +1,7 @@
-"""GDN prefill serial-scan sweep: parallel-reduce / conv-ring / bf16-io
-variants of make_gdn_chunk_fused.
-
-Diagnostic only — not shipped. Each variant is a standalone tilelang kernel;
-the winner lands in src/tilerl/ops/kernels_mma.py (make_gdn_chunk_fused).
-
-Findings (H20, contended, slice4 shapes B=1 T=512 nkh=16 nvh=48 K=V=128 KER=4):
-  baseline     4.82 ms  (shipped kernel, state in HBM/L2, thread-0 reduces)
-  shmem        8.15 ms  REJECTED — 64KB shared state tile is 1.7x slower
-               (global state hits L1/L2 with better pipelining than LDS)
-
-Variants:
-  par          baseline + block-wide warp-shuffle reduces (q/k norm, rms)
-  par_ring     par + conv1d sliding window in shared (channel-major ring,
-               per-thread channels, no cross-thread sharing, no barriers)
-  par_ring_bf16 par_ring + bf16 global IO (q/k/v/z/window), state stays f32
-
-Usage (pod):
-    TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=N PYTHONPATH=src \\
-        python3 scripts/_sweep_gdn_prefill.py [baseline par par_ring ...]
+"""GDN prefill serial-scan sweep: parallel-reduce / conv-ring / bf16-io / K-split variants of
+make_gdn_chunk_fused (kernels_mma.py). Diagnostic only, not shipped.
+H20 slice4 (B=1 T=512 nkh=16 nvh=48 K=V=128 KER=4): baseline 4.82 ms; 64KB shared state tile 8.15 ms, REJECTED.
+Usage (pod): TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=N PYTHONPATH=src python3 scripts/_sweep_gdn_prefill.py [baseline par ...]
 """
 
 from __future__ import annotations
@@ -32,22 +16,16 @@ import tilelang.language as T
 sys.path.insert(0, "src")
 from tilerl_kernels.reference import gdn_forward
 
-# slice4 shapes (27B GDN layer, prefill-512): nkh=16, nvh=48, K=V=128, KER=4
 B, TT, QD, NVH, K, V, KER = 1, 512, 2048, 48, 128, 128, 4
 VD = NVH * V
 QKVD = 2 * QD + VD
 
 
-def _pass_configs():
-    return {"tl.disable_data_race_check": True}
+_PASS = {"tl.disable_data_race_check": True}
 
 
 def _reduce_add(val, red, tv):
-    """Block-wide sum reduce into red[0] (broadcast to all threads).
-
-    red must be a FRESH alloc_local per call — the allreduce lowering remaps
-    the output buffer, and reusing one across calls crashes the pass
-    (load_remap_ conflict, tilelang 0.1.13)."""
+    # red must be a fresh alloc_local per call: reusing one crashes the allreduce lowering (tilelang 0.1.13)
     with T.attr(
         T.comm_reducer(lambda x, y: x + y, [T.cast(0, "float32")]),
         "reduce_scope",
@@ -60,7 +38,7 @@ def _reduce_add(val, red, tv):
 
 
 def make_baseline(target):
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_PASS)
     def ker(Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State):
         B, TT, QD, NVH, K, V, KER = T.const("B, TT, QD, NVH, K, V, KER")
         VD = NVH * V
@@ -195,11 +173,9 @@ def make_baseline(target):
 
 
 def make_par(target):
-    """Baseline + block-wide warp-shuffle reduces for q/k norm and rms
-    (replaces thread-0 serial 128-deep loops; all 128 threads participate).
-    State stays in HBM/L2 (the shared-state tile was 1.7x slower — rejected)."""
+    """Baseline + block-wide warp-shuffle reduces for q/k norm and rms; state stays in HBM/L2."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_PASS)
     def ker(Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State):
         B, TT, QD, NVH, K, V, KER = T.const("B, TT, QD, NVH, K, V, KER")
         VD = NVH * V
@@ -240,8 +216,6 @@ def make_par(target):
             kv_mem = T.alloc_fragment((1,), "float32")
             delta = T.alloc_fragment((1,), "float32")
             acc_o = T.alloc_fragment((1,), "float32")
-            # FRESH local per reduce (the allreduce lowering remaps the output
-            # buffer; reusing one across calls crashes tilelang 0.1.13).
             red_q = T.alloc_local((1,), "float32")
             red_k = T.alloc_local((1,), "float32")
             red_o = T.alloc_local((1,), "float32")
@@ -270,7 +244,6 @@ def make_par(target):
                 v_s[tv] = cv[0] * T.sigmoid(cv[0])
                 T.tvm_storage_sync("shared")
 
-                # parallel q/k norm: each thread squares element tv, block reduce
                 _reduce_add(q_s[tv] * q_s[tv], red_q, tv)
                 qn[0] = T.rsqrt(red_q[0] + 1e-12)
                 _reduce_add(k_s[tv] * k_s[tv], red_k, tv)
@@ -300,7 +273,6 @@ def make_par(target):
                 out_s[tv] = acc_o[0]
                 T.tvm_storage_sync("shared")
 
-                # parallel rms: each thread squares out_s[tv], block reduce
                 _reduce_add(out_s[tv] * out_s[tv], red_o, tv)
                 rms[0] = T.rsqrt(red_o[0] / T.cast(V, "float32") + 1e-6)
                 gate = Z[bb, t, vh * V + tv]
@@ -329,11 +301,9 @@ def make_par(target):
 
 
 def make_par_ring(target):
-    """par + conv1d sliding window in shared: a KER-row ring buffer,
-    channel-major (thread tv owns columns tv / V+tv / 2V+tv). Each thread
-    reads only its own channels -> no cross-thread sharing, no barriers."""
+    """par + conv1d window as a KER-row shared ring; thread tv owns its own channels, no barriers."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_PASS)
     def ker(Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State):
         B, TT, QD, NVH, K, V, KER = T.const("B, TT, QD, NVH, K, V, KER")
         VD = NVH * V
@@ -361,9 +331,7 @@ def make_par_ring(target):
             kc = QD + kh * K + tv
             vc = 2 * QD + vh * V + tv
 
-            # conv ring: KER rows x 3V channels. Window row w -> slot w+1
-            # (x_{w-(KER-1)} lives at slot (w+1)%KER); token t -> slot t%KER.
-            # conv tap i at token t reads slot (t+i+1)%KER.
+            # window row w -> slot w+1, token t -> slot t%KER, tap i at t reads slot (t+i+1)%KER
             ring = T.alloc_shared((KER, 3 * V), "float32")
             q_s = T.alloc_shared((K,), "float32")
             k_s = T.alloc_shared((K,), "float32")
@@ -463,10 +431,9 @@ def make_par_ring(target):
 
 
 def make_par_ring_bf16(target):
-    """par_ring + bf16 global IO (q/k/v/z/window). State stays f32; the conv
-    ring stays f32 (cast on store)."""
+    """par_ring + bf16 global IO for q/k/v/z/window; state and ring stay f32."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_PASS)
     def ker(Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State):
         B, TT, QD, NVH, K, V, KER = T.const("B, TT, QD, NVH, K, V, KER")
         VD = NVH * V
@@ -593,12 +560,9 @@ def make_par_ring_bf16(target):
 
 
 def make_par_ksplit(target):
-    """par + K-split: 256 threads (2 per V column), each handles K/2=64 rows
-    of the recurrence. Halves the serial K-chain (128 -> 64 deep); the two
-    partials combine via shared memory. Conv/norm/output use the 128 owner
-    threads (h=0); helpers (h=1) pass 0 into the block reduces."""
+    """par + K-split: 2 threads per V column, each K/2 rows; h=0 owners do conv/norm/output."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_PASS)
     def ker(Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State):
         B, TT, QD, NVH, K, V, KER = T.const("B, TT, QD, NVH, K, V, KER")
         VD = NVH * V
@@ -655,7 +619,6 @@ def make_par_ksplit(target):
                 NewState[bb, vh, j, tv] = State[bb, vh, j, tv]
 
             for t in T.serial(TT):
-                # conv: owners only (helpers idle — the conv is per-channel)
                 if h == 0:
                     cq[0] = 0.0
                     ck[0] = 0.0
@@ -674,7 +637,6 @@ def make_par_ksplit(target):
                     v_s[tv] = cv[0] * T.sigmoid(cv[0])
                 T.tvm_storage_sync("shared")
 
-                # parallel q/k norm (helpers pass 0)
                 pq = T.if_then_else(h == 0, q_s[tv] * q_s[tv], 0.0)
                 _reduce_add(pq, red_q, tid)
                 qn[0] = T.rsqrt(red_q[0] + 1e-12)
@@ -693,7 +655,6 @@ def make_par_ksplit(target):
                     k_s[tv] = k_s[tv] * kn[0]
                 T.tvm_storage_sync("shared")
 
-                # recurrence pass 1: decay + kv_mem (HK rows per thread)
                 T.clear(kv_p)
                 for j in T.serial(HK):
                     jj = h * HK + j
@@ -708,7 +669,6 @@ def make_par_ksplit(target):
                     delta_s[tv] = delta[0]
                 T.tvm_storage_sync("shared")
 
-                # recurrence pass 2: rank-1 update + out (HK rows per thread)
                 T.clear(out_p)
                 for j in T.serial(HK):
                     jj = h * HK + j
@@ -722,7 +682,6 @@ def make_par_ksplit(target):
                     out_s[tv] = out_p[0] + partial_s[tv]
                 T.tvm_storage_sync("shared")
 
-                # parallel rms (helpers pass 0) + z-gate (owners only)
                 po = T.if_then_else(h == 0, out_s[tv] * out_s[tv], 0.0)
                 _reduce_add(po, red_o, tid)
                 rms[0] = T.rsqrt(red_o[0] / T.cast(V, "float32") + 1e-6)

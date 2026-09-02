@@ -1,20 +1,9 @@
 """Every host transfer in one tick, attributed to its call site.
 
-Three of today's wins were found with an ad-hoc version of this: the sampler
-shipped its own arguments to the device to read them back, Adafactor synced
-twice per parameter, and the KV scatter fallback synced once per token per
-layer (8192 a prefill tick on the 27B).
-
-Counts BOTH kinds, because counting one is how the third was nearly missed:
-
-* **scalar** — ``aten._local_scalar_dense``: ``int(t)``, ``float(t)``,
-  ``t.item()``. Seen by a dispatch mode.
-* **bulk** — ``t.tolist()`` / ``t.numpy()``: a whole vector, invisible to that
-  dispatch. Caught by wrapping the Tensor methods instead. It still stalls, so
-  a probe that reports 0 scalars is not a probe that reports no transfer.
-
-The CPU target takes the same torch fallbacks a GPU without the fused kernels
-takes, so this enumerates THAT arch's transfers without one.
+Counts scalar syncs (``aten._local_scalar_dense``: ``.item()``/``int(t)``, seen by a
+dispatch mode) AND bulk ones (``.tolist()``/``.numpy()``, invisible to dispatch, caught by
+wrapping the Tensor methods). The CPU target takes the same torch fallbacks a GPU without
+the fused kernels takes, so this enumerates that arch's transfers without one.
 
     uv run python scripts/probe_syncs.py --phase decode|prefill|train
 """
@@ -25,7 +14,6 @@ import argparse
 import collections
 import traceback
 
-import numpy as np
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -38,8 +26,6 @@ def _site() -> str | None:
 
 
 class Probe(TorchDispatchMode):
-    """Scalar syncs by dispatch, bulk transfers by method wrap."""
-
     def __init__(self) -> None:
         self.scalar: collections.Counter = collections.Counter()
         self.bulk: collections.Counter = collections.Counter()

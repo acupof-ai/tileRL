@@ -1,12 +1,5 @@
-"""GPU-busy is the SUM of kernel durations; wall time also contains the gaps
-between them. The fla arm runs 6913 kernels against 3841 and is 42 ms cheaper
-in GPU-busy yet ~15 ms slower on the wall, at a ratio flat in sequence length —
-which is what a per-kernel gap looks like, not a per-call host cost (measured:
-fla's wrapper is CHEAPER than ours, 0.395 vs 2.867 ms a layer).
-
-Times one prefill both ways with wall clock alongside GPU-busy, so the gap
-total is a number rather than a subtraction of two other runs.
-"""
+"""Wall clock beside GPU-busy for one prefill, serial GDN vs fla, so inter-kernel gaps are a
+number rather than a subtraction of two runs."""
 
 from __future__ import annotations
 

@@ -1,37 +1,18 @@
 """Paged KV cache, linear-attention state pool, and prefix store.
 
-Day-1 flagship: the host-side KV subsystem. Storage is torch tensors on the
-backend's target device; all bookkeeping is plain Python ints/lists (the
-allocator runs on host, like agent-infer's ``HostPagedKvPool`` — device-side
-allocation is a day-2 optimization). Design mirrors the *ideas* of
-agent-infer/crates/infer-seam (read-only ref): ``host_paged_kv_pool.rs`` (free-
-list page allocator, per-page ownership counts, copy-on-write before writing a
-shared page) and ``prefix_store.rs`` (prefix retention over the same pool).
-
-Day-1 simplifications (ponytail): ONE refcount per block counts every owner
-(live slots + the prefix store); the reference splits retain vs attach counts
-to drive eviction policy, but FIFO eviction here only needs the total. No CP
-sequence sharding, no evict-drop/reinstate, no fixed-band pages. Reject-under-
-pressure admission: the engine fails loudly on pool exhaustion
-(``alloc_block`` raises). ``# ponytail: no preempt/swap, cpu-offload day-2``
+Host-side bookkeeping (plain ints/lists) over torch tensors on the target
+device, after agent-infer's ``host_paged_kv_pool.rs`` / ``prefix_store.rs``.
+# ponytail: one refcount per block counts every owner (slots + prefix store);
+# no preempt/swap, no cpu-offload — ``alloc_block`` raises on exhaustion.
 """
 
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Callable, Sequence
 
 import torch
-
-__all__ = [
-    "BLOCK_TOKENS",
-    "PagedKvPool",
-    "LinearStatePool",
-    "PrefixStore",
-    "NoPrefixStore",
-    "PrefixHit",
-]
 
 #: Tokens per physical KV block (paged-attention page size).
 BLOCK_TOKENS = 16
@@ -40,51 +21,30 @@ _MASK64 = (1 << 64) - 1
 
 
 def _rolling_hash(prev: int, token: int) -> int:
-    """One step of the prefix rolling hash: ``h' = (h * P) xor (token + 1)``.
-
-    ``+ 1`` so token 0 still perturbs the state. 64-bit masked; collisions are
-    expected at scale, which is why :class:`PrefixStore` verifies token
-    contents on every hit.
-    """
+    # +1 so token 0 still perturbs the state; collisions are verified by PrefixStore.
     return ((prev * 1000003) ^ (token + 1)) & _MASK64
 
 
 def _default_device() -> torch.device:
-    """Target device from the backend singleton, falling back to CPU.
-
-    Lazy import: this module must not import tilelang, and the backend is the
-    only place that resolves ``TILERL_TARGET``. Anything less than a fully
-    scaffolded backend degrades to CPU — the portable default and the CI/dev
-    target on this Mac.
-    """
+    # Lazy: this module must not import tilelang; a broken backend degrades to CPU.
     try:
         from tilerl_kernels.backend import get_backend
 
         return get_backend().device
-    except Exception:  # noqa: BLE001 - any scaffold gap -> CPU default
+    except Exception:  # noqa: BLE001
         return torch.device("cpu")
 
 
 class PagedKvPool:
     """Paged K/V storage with a free-list allocator and per-block refcount.
 
-    Storage layout, exposed as-is for ``paged_attention`` to gather by block
-    id and for the model to index per layer: ``k_pool``/``v_pool`` are
-    ``[num_planes, num_blocks, num_kv_heads, BLOCK_TOKENS, head_dim]`` bf16.
-    One allocator + refcount set is shared across layers: block id N names the
-    same page in every layer, which is exactly what one block table indexes.
+    ``k_pool``/``v_pool`` are ``[num_planes, num_blocks, num_kv_heads,
+    BLOCK_TOKENS, head_dim]``; block id N names the same page in every plane.
+    Only full-attn layers own a plane: ``layer_map`` gives each plane's GLOBAL
+    layer index, and every layer-indexed method takes a global index.
 
-    Only full-attn layers own a plane: ``layer_map`` gives the GLOBAL layer
-    index of each plane (dense storage — the 27B has 16 full-attn layers, not
-    64). All layer-indexed methods take a GLOBAL index and map it; a
-    non-full-attn layer raises KeyError — GDN layers must never touch the pool.
-
-    Ownership: every block held by anyone (a live slot's block table, or the
-    prefix store) carries a refcount. :meth:`alloc_block` hands out a block
-    with refcount 1; :meth:`retain` adds an owner; :meth:`free_block` removes
-    one and recycles the block only when the last owner is gone. A block with
-    refcount > 1 is *shared* — :meth:`cow_for_append` duplicates it before a
-    slot writes, so cached prefixes stay byte-stable.
+    A block with refcount > 1 is shared (a live slot plus the prefix store);
+    :meth:`cow_for_append` duplicates it before a slot writes.
     """
 
     def __init__(
@@ -97,7 +57,6 @@ class PagedKvPool:
         dtype: torch.dtype = torch.bfloat16,
         layer_map: tuple[int, ...] | None = None,
     ) -> None:
-        # plane d -> global layer index; identity when no map is given.
         self._layer_map = tuple(range(num_layers)) if layer_map is None else tuple(layer_map)
         self._plane = {g: d for d, g in enumerate(self._layer_map)}
         self.num_blocks = num_blocks
@@ -112,14 +71,10 @@ class PagedKvPool:
         self.refcount: list[int] = [0] * num_blocks
 
     def kv_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(k, v)`` plane for a GLOBAL layer index (dense-mapped)."""
         p = self._plane[layer_idx]
         return self.k_pool[p], self.v_pool[p]
 
-    # ------------------------------------------------------------------ alloc
-
     def alloc_block(self) -> int:
-        """Pop a free block and return it with refcount 1."""
         if not self._free:
             raise RuntimeError(f"PagedKvPool exhausted: all {self.num_blocks} blocks in use")
         block = self._free.pop()
@@ -127,17 +82,11 @@ class PagedKvPool:
         return block
 
     def retain(self, block: int) -> None:
-        """Add one owner (prefix-store pin or slot adoption)."""
         if self.refcount[block] == 0:
             raise RuntimeError(f"retain: block {block} is free (refcount 0)")
         self.refcount[block] += 1
 
     def free_block(self, block: int) -> None:
-        """Release one ownership of ``block``; recycle when the last owner goes.
-
-        Raises on double free (refcount already 0), which would corrupt the
-        free list.
-        """
         if self.refcount[block] <= 0:
             raise RuntimeError(f"free_block: block {block} already free (double free)")
         self.refcount[block] -= 1
@@ -145,17 +94,10 @@ class PagedKvPool:
             self._free.append(block)
 
     def is_shared(self, block: int) -> bool:
-        """True if more than one owner would observe a write to ``block``."""
         return self.refcount[block] > 1
 
     def cow_for_append(self, block: int) -> int:
-        """Return a writable block for a slot that owns one ref of ``block``.
-
-        If the block is shared, allocate a fresh block, copy the full K/V
-        contents of every layer, and transfer the slot's ownership to it
-        (every other owner keeps the old block). If exclusive, return
-        ``block`` unchanged.
-        """
+        """Writable block for a slot owning one ref of ``block``: a copy if shared."""
         if not self.is_shared(block):
             return block
         new = self.alloc_block()
@@ -163,8 +105,6 @@ class PagedKvPool:
         self.v_pool[:, new].copy_(self.v_pool[:, block])
         self.free_block(block)
         return new
-
-    # --------------------------------------------------------------- token IO
 
     def write_block(
         self,
@@ -174,10 +114,7 @@ class PagedKvPool:
         v: torch.Tensor,
         layer: int = 0,
     ) -> None:
-        """Write ``k``/``v`` ([num_kv_heads, n, head_dim]) at ``layer``/token
-        ``offset``. Writing a shared block is a hard error (would silently
-        mutate a cached prefix) — call :meth:`cow_for_append` first.
-        """
+        """Write ``k``/``v`` ([num_kv_heads, n, head_dim]) at ``layer``/token ``offset``."""
         if k.shape != v.shape:
             raise ValueError(f"write_block: k/v shape mismatch {k.shape} vs {v.shape}")
         if k.ndim != 3 or k.shape[0] != self.num_kv_heads or k.shape[2] != self.head_dim:
@@ -204,42 +141,28 @@ class PagedKvPool:
         )
 
     def write_tokens(self, k: torch.Tensor, v: torch.Tensor, kv, layer_idx: int) -> None:
-        """Write k/v [B,T,Hkv,D] at the per-row tail ``[seq_len-seq_q,
-        seq_len)`` (``seq_q`` = ``kv.seq_q_lens``, default T), scattered
-        through the batch's block table.
-
-        The engine guarantees those positions land on blocks owned exclusively
-        by the request (tail blocks on prefill, the fresh append block on
-        decode), so shared prefix blocks are never written.
-        Torch fallback for arches without the ``write_tokens`` scatter kernel —
-        the CPU target, and any cell that has not registered it yet.
-
-        Indexed, not looped: the per-token ``int(block_table[...])`` this
-        replaced was ``b * seq_q`` host syncs PER LAYER, so a 512-token prefill
-        chunk of the 27B cost 8192 of them a tick. The two remaining are one
-        ``tolist()`` each for the whole batch.
-        # ponytail: 2 syncs/layer, not 0 — dropping them needs a mask instead
-        # of a per-row length, which is the kernel's job on a cell that has one.
+        """Write k/v [B,T,Hkv,D] at each row's tail ``[seq_len-seq_q, seq_len)``
+        through the block table. Torch fallback for cells without the scatter
+        kernel; the engine guarantees those positions are exclusively owned.
+        # ponytail: 2 syncs/layer (the two tolist), not 0 — a mask instead of a
+        # per-row length is the kernel's job on a cell that has one.
         """
         b, t, _, _ = k.shape
-        sql = getattr(kv, "seq_q_lens", None)
+        sql = kv.seq_q_lens
         plane = self._plane[layer_idx]
         dev = self.k_pool.device
         lens = [t] * b if sql is None else sql.tolist()
         ends = kv.seq_len.tolist()
         for bi in range(b):
             sq = int(lens[bi])
-            # pos indexes the block table first, so it starts on ITS device;
-            # the pool may live on another (a CPU-resident table with an mps
-            # pool is the metal parity path).
+            # pos starts on the block table's device; the pool may live on
+            # another (CPU table + mps pool is the metal parity path).
             pos = torch.arange(int(ends[bi]) - sq, int(ends[bi]),
                                device=kv.block_table.device)
             blk = kv.block_table[bi, pos // BLOCK_TOKENS].to(dev)
             off = (pos % BLOCK_TOKENS).to(dev)
             self.k_pool[plane, blk, :, off, :] = k[bi, :sq].to(self.k_pool.dtype)
             self.v_pool[plane, blk, :, off, :] = v[bi, :sq].to(self.v_pool.dtype)
-
-    # ------------------------------------------------------ queries/admission
 
     @property
     def free_blocks(self) -> int:
@@ -251,18 +174,18 @@ class PagedKvPool:
 
     @staticmethod
     def blocks_for_tokens(tokens: int) -> int:
-        """Physical blocks needed to hold ``tokens`` tokens."""
         return (tokens + BLOCK_TOKENS - 1) // BLOCK_TOKENS
 
 
 class LinearStatePool:
-    """Per-slot state for the gated-delta linear-attention layers.
+    """Per-slot state for the gated-delta layers.
 
-    ``states``: [num_slots, num_linear_layers, num_heads, head_dim, head_dim]
-    bf16 on the target device. ``conv_windows``: [num_slots, num_linear_layers,
-    kernel-1, qkv_dim] — the raw-qkv carry that makes segmented decode exact
-    (absent when the model has no GDN layers). Both are zeroed on alloc so a
-    fresh sequence starts from the zero recurrent state / empty carry.
+    ``states``: [num_slots, num_linear_layers, num_heads, head_dim, head_dim].
+    ``conv_windows``: [num_slots, num_linear_layers, 2, kernel-1, qkv_dim] — two
+    planes selected by ``win_parity[slot]``: the sm90 fused decode kernel reads
+    plane p and writes 1-p (an in-place shift would race across blocks), then
+    the tick flips the parity. ``step_states``/``step_windows`` hold the state
+    after each chain step of a speculative verify (``select_step`` adopts one).
     """
 
     def __init__(
@@ -278,6 +201,7 @@ class LinearStatePool:
         spec_steps: int = 0,
     ) -> None:
         self.device = _default_device() if device is None else torch.device(device)
+        self.num_slots = num_slots
         self.states = torch.zeros(
             num_slots,
             num_linear_layers,
@@ -287,10 +211,6 @@ class LinearStatePool:
             dtype=dtype,
             device=self.device,
         )
-        # Two planes per slot, selected by win_parity[slot]: the sm90 fused
-        # decode kernel reads plane p and writes 1-p (its q/k columns are
-        # shared across blocks, so an in-place shift would race), then the tick
-        # flips the parity. Every other path indexes through the parity too.
         self.conv_windows = (
             torch.zeros(
                 num_slots,
@@ -304,8 +224,6 @@ class LinearStatePool:
             if num_linear_layers > 0 and conv_window > 0
             else None
         )
-        # Speculative verify: the chunk op writes the state/window after every
-        # chain step here, and the accepted length picks one (select_step).
         self.step_states = (
             torch.zeros(num_slots, num_linear_layers, spec_steps, num_heads, head_dim, head_dim,
                         dtype=dtype, device=self.device)
@@ -322,15 +240,13 @@ class LinearStatePool:
         self._free: list[int] = list(range(num_slots))
 
     def select_step(self, slot: int, step: int) -> None:
-        """Adopt the state the last verify forward left after chain token ``step``."""
-        if self.step_states is None:  # no recurrent layers: nothing to rewind
+        if self.step_states is None:
             return
         self.states[slot].copy_(self.step_states[slot, :, step])
         if self.step_windows is not None:
             self.window_restore(slot, self.step_windows[slot, :, step])
 
     def window_snapshot(self, slot: int) -> torch.Tensor | None:
-        """[L, W, D] clone of the slot's live window plane (host sync on parity)."""
         if self.conv_windows is None:
             return None
         return self.conv_windows[slot, :, int(self.win_parity[slot])].clone()
@@ -340,11 +256,8 @@ class LinearStatePool:
         self.win_parity[slot] = 0
 
     def alloc_slot(self) -> int:
-        """Pop a free slot, zero its state, and return it."""
         if not self._free:
-            raise RuntimeError(
-                f"LinearStatePool exhausted: all {self.states.shape[0]} slots in use"
-            )
+            raise RuntimeError(f"LinearStatePool exhausted: all {self.num_slots} slots in use")
         slot = self._free.pop()
         self.states[slot].zero_()
         if self.conv_windows is not None:
@@ -352,7 +265,6 @@ class LinearStatePool:
         return slot
 
     def free_slot(self, slot: int) -> None:
-        """Return ``slot`` to the free list. Raises on double free."""
         if slot in self._free:
             raise RuntimeError(f"free_slot: slot {slot} already free (double free)")
         self._free.append(slot)
@@ -360,54 +272,43 @@ class LinearStatePool:
 
 @dataclass(frozen=True)
 class PrefixHit:
-    """Result of a prefix lookup: matched token count and the blocks covering
-    ``[0, length)`` (already retained by the store — the caller adopts them
-    with :meth:`PagedKvPool.retain`)."""
+    """Matched token count and the store-retained blocks covering ``[0, length)``."""
 
     length: int
     blocks: tuple[int, ...]
 
 
+@dataclass(slots=True)
 class _Entry:
-    __slots__ = ("eid", "tokens", "blocks", "h")
-
-    def __init__(self, eid: int, tokens: tuple[int, ...], blocks: tuple[int, ...], h: int) -> None:
-        self.eid = eid
-        self.tokens = tokens
-        self.blocks = blocks
-        self.h = h
+    eid: int
+    tokens: tuple[int, ...]
+    blocks: tuple[int, ...]
+    h: int
 
 
 class NoPrefixStore:
-    """Prefix store that never matches and never retains.
+    """Never matches, never retains: a training rollout must not serve KV
+    computed under an earlier policy. Also the miss-path double for tests."""
 
-    For a training rollout: a cached prefix serves KV computed under an EARLIER
-    policy, which silently makes an on-policy method off-policy. Also the
-    miss-path double for tests.
-    """
+    on_evict: Callable[[tuple[int, ...]], None] | None = None
 
-    on_evict: "Callable[[tuple[int, ...]], None] | None" = None
-
-    def lookup(self, tokens: Sequence[int]) -> "PrefixHit | None":
+    def lookup(self, tokens: Sequence[int]) -> PrefixHit | None:
         return None
 
     def insert(self, tokens: Sequence[int], blocks: Sequence[int]) -> None:
+        return None
+
+    def evict_until_free(self, blocks: int) -> None:
         return None
 
 
 class PrefixStore:
     """Rolling-hash prefix cache over a :class:`PagedKvPool`.
 
-    Keys are per-token rolling hashes ``h_i = roll(h_{i-1}, token_i)``; an
-    entry maps a prefix's full hash to (token tuple, physical blocks). The
-    engine inserts each completed block span (full blocks plus the current
-    partial); lookup returns the LONGEST stored prefix of the query.
-    Collision-safe: hash hits are verified against the stored token contents,
-    so a colliding entry with different tokens is a miss. Insert retains
-    every block in the pool; FIFO eviction at ``capacity`` releases them.
-    Blocks a live slot still holds stay allocated. ``on_evict`` (set by the
-    engine) is called with an evicted entry's tokens so side tables keyed by
-    the same tuple cannot outlive it.
+    An entry maps a prefix's full hash to (token tuple, physical blocks); every
+    hash hit is verified against the stored tokens. Insert retains every block;
+    FIFO eviction at ``capacity`` (or under block pressure) releases them and
+    calls ``on_evict(tokens)`` so side tables keyed by the same tuple follow.
     """
 
     def __init__(
@@ -434,11 +335,7 @@ class PrefixStore:
         return h
 
     def insert(self, tokens: Sequence[int], blocks: Sequence[int]) -> None:
-        """Cache ``tokens`` (covered by ``blocks``) and retain the blocks.
-
-        ``len(blocks)`` must equal ``ceil(len(tokens) / BLOCK_TOKENS)``. A
-        duplicate insert (same tokens) is a no-op.
-        """
+        """Cache ``tokens`` (covered by ``blocks``) and retain the blocks; a duplicate is a no-op."""
         tokens = tuple(int(t) for t in tokens)
         blocks = tuple(blocks)
         if not tokens:
@@ -451,7 +348,7 @@ class PrefixStore:
         h = self._hash_all(tokens)
         for e in self._entries.get(h, ()):
             if e.tokens == tokens:
-                return  # already cached
+                return
         entry = _Entry(self._next_id, tokens, blocks, h)
         self._next_id += 1
         self._entries.setdefault(h, []).append(entry)
@@ -459,14 +356,11 @@ class PrefixStore:
         self._fifo.append(entry.eid)
         for b in blocks:
             self._pool.retain(b)
-        self._evict_if_needed()
+        while len(self._by_id) > self.capacity:
+            self._evict_one()
 
     def lookup(self, tokens: Sequence[int]) -> PrefixHit | None:
-        """Longest stored prefix of ``tokens``, or ``None``.
-
-        Every hash hit is verified against the stored token contents, so a
-        collision on different tokens is a miss.
-        """
+        """Longest stored prefix of ``tokens``, or ``None``."""
         tokens = tuple(int(t) for t in tokens)
         h = 0
         prefix_hashes: list[int] = []
@@ -481,12 +375,7 @@ class PrefixStore:
         self.misses += 1
         return None
 
-    def _evict_if_needed(self) -> None:
-        while len(self._by_id) > self.capacity:
-            self._evict_one()
-
     def evict_until_free(self, blocks: int) -> None:
-        """Evict oldest entries until the pool can satisfy an allocation."""
         while self._pool.free_blocks < blocks and self._fifo:
             self._evict_one()
 
@@ -504,7 +393,6 @@ class PrefixStore:
         self.evictions += 1
 
     def stats(self) -> dict[str, int]:
-        """Cache counters: entries, capacity, hits, misses, evictions."""
         return {
             "entries": len(self._by_id),
             "capacity": self.capacity,

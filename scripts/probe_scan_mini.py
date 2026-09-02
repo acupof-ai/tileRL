@@ -1,9 +1,5 @@
-"""Minimum known-answer cases for the ported state scan, to locate the NaN.
-
-The full-shape check returned NaN with the right timing (34.5 us against fla's
-34.0), so the kernel runs and the arithmetic is wrong. These cases have答案 by
-inspection: with W=0 the recurrence is S' = e_last*S and V_new = U.
-"""
+"""Known-answer cases for the ported state scan, to locate the NaN: with W=0 the recurrence
+is S' = e_last*S and V_new = U."""
 
 from __future__ import annotations
 
@@ -41,9 +37,7 @@ def main() -> None:
     vn, out = kern(k1, w, u1, g, st1, C)
     print(f"K=1          -> state[:4] {out[0, 0, 0, :4].tolist()}   (should be 65.0)")
 
-    # G must be the chunk-local INCLUSIVE CUMSUM — a constant g is not a legal
-    # input, and feeding one is what made the first version of this probe read
-    # 64 / 23.5 / 3.18 where 1 / 0.5 / 0.25 was expected.
+    # G must be the chunk-local INCLUSIVE CUMSUM; a constant g is not a legal input.
     # With K=U=0 the gemm contributes nothing, so state = exp2(G[last]) * S.
     for gv in (0.0, -0.25, -0.5):
         gg = torch.full((B, S, H), gv, device=dev).cumsum(1)  # legal: cumsum

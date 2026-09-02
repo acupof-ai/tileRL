@@ -1,10 +1,5 @@
 """Smoke-drive a real HF checkpoint through tileRL: load, generate, train_step.
 
-Bring-up tool for real-weight runs (the 2-layer NVFP4 slice today, the full
-64-layer model tomorrow). Prints timings, flagging which numbers include
-tilelang's per-shape NVCC JIT (first call per shape, 30-120s on CUDA).
-
-Usage:
     TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=5 \
         python3 scripts/real_ckpt_smoke.py /host/tc27-nvfp4-slice2 --layers 2
 """
@@ -41,9 +36,7 @@ def main() -> None:
     backend = get_backend()
     cfg = qwen36_27b()
     if args.layers is not None and args.layers < cfg.num_layers:
-        # A slice export's config.json carries the truncated layer count, so
-        # validate against the truncated cfg (the full checkpoint validates
-        # against the full cfg with --layers unset).
+        # a slice export's config.json carries the truncated layer count.
         cfg = replace(
             cfg,
             num_layers=args.layers,
@@ -58,10 +51,7 @@ def main() -> None:
     gen = torch.Generator().manual_seed(0)
     prompt = torch.randint(0, cfg.vocab_size, (args.prompt_len,), generator=gen).tolist()
 
-    # Warmup with the SAME shapes as the timed run: tilelang JITs per shape,
-    # so a different prompt length would leak NVCC time into the measurement.
-    # gen=2 so both prefill [1,T] and decode [1,1] shapes are compiled —
-    # gen=1 finishes on the prefill tick and never warms up decode.
+    # same shapes as the timed run; gen=2 so the decode shape is JIT-compiled too.
     wid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
     for _ in range(256):
         engine.step()

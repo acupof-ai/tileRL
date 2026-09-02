@@ -1,14 +1,6 @@
-"""Decode throughput vs batch size on the NVFP4 slice (eager path).
+"""Decode throughput vs batch size on the NVFP4 slice: B concurrent requests, timed once all decode.
 
-Submits B concurrent requests, warms past their prefills, then times ticks
-where all B are decoding. Use --decode-graph to capture per-bucket decode
-graphs (pure-decode ticks replay instead of dispatching ~900 kernels);
-without it every B runs the eager path. --draft turns on speculative decode
-and reports its acceptance and the tokens actually committed per tick.
-
-Usage:
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src TILERL_TARGET=cuda \\
-        python3 scripts/bench_batch_decode.py /host/tc27-nvfp4-slice4 --layers 4
+Usage: CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src TILERL_TARGET=cuda python3 scripts/bench_batch_decode.py /host/tc27-nvfp4-slice4 --layers 4
 """
 
 from __future__ import annotations
@@ -54,8 +46,7 @@ def main() -> None:
     batches = [int(x) for x in args.batches.split(",")]
     bmax = args.slots or max(batches)
     engine = build_engine(
-        # 16-token prompts generating ~170: 16 blocks/request covers it. Sizing
-        # off bmax alone filled the card and the allocator thrashed at 94 GiB.
+        # 16 blocks/request covers 16-token prompts generating ~170; sizing off bmax alone thrashed at 94 GiB.
         cfg, model, backend, num_blocks=16 * bmax, num_slots=bmax, max_batch=bmax,
         max_total_tokens=256 * bmax, decode_graph=args.decode_graph,
         draft=load_draft(model, args.draft) if args.draft else None, spec_depth=args.depth,
@@ -81,7 +72,7 @@ def main() -> None:
             )
             for i, p in enumerate(prompts)
         ]
-        for _ in range(WARMUP):  # flush prefills; all requests decoding afterwards
+        for _ in range(WARMUP):
             engine.step()
         torch.cuda.synchronize()
         s0 = engine.stats()
@@ -96,12 +87,11 @@ def main() -> None:
         acc = (s1["spec_accepted"] - s0["spec_accepted"]) / max(drafted, 1)
         print(f"  {B:>3} {ms:>9.3f} {per_tick:>9.2f} {100 * acc:>6.1f}% "
               f"{1000 * per_tick / ms:>18.1f} {1000 * B * per_tick / ms:>17.1f}")
-        # Drain to completion: a slot is freed at finish, and the next B reuses
-        # the same pool — an under-sized drain exhausts it on the following arm.
+        # Drain fully: the next B reuses the same slot pool.
         done: dict = {}
         while not all(w in done for w in wids):
             engine.step()
-            done.update(engine.poll())  # poll clears per call; accumulate
+            done.update(engine.poll())
 
 
 if __name__ == "__main__":

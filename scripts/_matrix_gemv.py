@@ -1,22 +1,13 @@
-"""Matrix A/B for the fp4 decode GEMV: one pod session, all structural cells.
-
-Cells (each: compile-or-log-error, then relerr + time vs the shipped GEMV):
-  gemv_shuffle      shipped scalar GEMV (warp-shuffle LUT) — control
-  gemv_prmt         PRMT extern scalar GEMV (replace shuffle LUT, no MMA)
-  mma_bitcast_m16   shipped integer-bitcast dequant + MMA @ block_M=16
-  mma_prmt_ext_m16  PRMT extern + MMA @ block_M=16 (target cell)
-  mma_prmt_ext_m32  PRMT extern + MMA @ block_M=32
-  mma_prmt_ext_m64  PRMT extern + MMA @ block_M=64 (known to compile)
-  mma_prmt_buf_m16  PRMT extern to separate shared buffer + copy + MMA @ m16
-
+"""Matrix A/B for the fp4 decode GEMV: every structural cell in one pod session, relerr + time vs shipped.
+Cells (CELLS=a,b selects): gemv_shuffle (control) gemv_prmt mma_bitcast_m16 mma_prmt_ext_m{16,32,64} mma_prmt_buf_m16.
 Usage: CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src python3 scripts/_matrix_gemv.py [shape_idx]
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import time
-import traceback
 
 import torch
 
@@ -271,10 +262,8 @@ def run_matrix(N, K, name):
         return xm, wqm, scm
 
     cells = []
-    import os
     sel = os.environ.get("CELLS", "gemv_shuffle,gemv_prmt,mma_bitcast_m16,mma_prmt_ext_m16,mma_prmt_ext_m32,mma_prmt_ext_m64,mma_prmt_buf_m16").split(",")
 
-    # 1. shipped scalar GEMV (control)
     def cell_gemv_shuffle():
         Kp = ((K + 255) // 256) * 256
         Np = ((N + 3) // 4) * 4
@@ -286,7 +275,6 @@ def run_matrix(N, K, name):
     if "gemv_shuffle" in sel:
         cells.append(("gemv_shuffle", cell_gemv_shuffle))
 
-    # 2. PRMT scalar GEMV
     def cell_gemv_prmt():
         Kp = ((K + 255) // 256) * 256
         Np = ((N + 3) // 4) * 4
@@ -298,7 +286,6 @@ def run_matrix(N, K, name):
     if "gemv_prmt" in sel:
         cells.append(("gemv_prmt", cell_gemv_prmt))
 
-    # 3. shipped bitcast MMA @ block_M=16
     def cell_mma_bitcast_m16():
         xm, wqm, scm = pad_mma(16)
         mma = make_linear_fp4_mma("cuda")
@@ -306,7 +293,6 @@ def run_matrix(N, K, name):
     if "mma_bitcast_m16" in sel:
         cells.append(("mma_bitcast_m16", cell_mma_bitcast_m16))
 
-    # 4-6. PRMT MMA at block_M = 16, 32, 64
     for bM in (16, 32, 64):
         def cell_mma_prmt(bM=bM):
             xm, wqm, scm = pad_mma(bM)
@@ -315,7 +301,6 @@ def run_matrix(N, K, name):
         if f"mma_prmt_ext_m{bM}" in sel:
             cells.append((f"mma_prmt_ext_m{bM}", cell_mma_prmt))
 
-    # 7. PRMT MMA with separate buffer @ block_M=16
     def cell_mma_prmt_buf_m16():
         xm, wqm, scm = pad_mma(16)
         kern = make_prmt_mma("cuda", block_M=16, use_buf=True)
@@ -328,7 +313,6 @@ def run_matrix(N, K, name):
         print(f"\n  --- {cname} ---", flush=True)
         try:
             kern, args, outfn = cfn()
-            # first call = JIT compile
             y = outfn()
             torch.cuda.synchronize()
             r = relerr(y)
@@ -354,7 +338,7 @@ def main():
     shapes = [
         (248320, 5120, "lm_head"),
         (34816, 5120, "gate_up(fused)"),
-        (5120, 17408, "down_proj"),  # hidden x intermediate (config.py:169)
+        (5120, 17408, "down_proj"),
     ]
     idx = int(sys.argv[1]) if len(sys.argv) > 1 else 0
     run_matrix(*shapes[idx])

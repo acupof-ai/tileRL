@@ -1,12 +1,6 @@
-"""Pre-pod sweep of the fp4 decode GEMV's (micro_size_k, GROUP) grid.
-
-No GPU and no nvcc here, so this settles everything the pod session should not
-have to debug: does each combination lower, what load width does the weight
-stream actually get, how big are the per-thread register arrays, and is the
-schedule's index arithmetic exact (full coverage + one scale per scale block).
-
-CUDA C comes out via scripts/cuda_codegen.enable(); the index/numeric half is
-pure python + torch and runs anywhere.
+"""Pre-pod sweep of the fp4 decode GEMV's (micro_size_k, GROUP) grid, without a GPU or nvcc:
+does each combination lower, what WQ load width it gets, register array sizes, and exact index
+arithmetic (full coverage, one scale per scale block). CUDA C via scripts/cuda_codegen.enable().
 
     uv run python scripts/_sweep_gemv_micro.py
 """
@@ -42,12 +36,7 @@ def _arrays(src: str) -> dict[str, tuple[str, int]]:
 
 
 def _runtime_indexed(src: str, names) -> list[str]:
-    """Local-array references indexed by anything but a fully-unrolled loop var.
-
-    A runtime-indexed register buffer falls to local memory; this repo has
-    already paid 22% of roof for one
-    (docs/experience/wins/2026-08-25-fp4-gemv-grouped-dequant.md).
-    """
+    # a runtime-indexed register array falls to local memory (cost 22% of roof once)
     unrolled = set(re.findall(r"#pragma unroll\n\s*for \(int (\w+)", src))
     runtime = (set(re.findall(r"for \(int (\w+)", src)) - unrolled) | {"threadIdx"}
     bad = []
@@ -95,8 +84,7 @@ def probe(micro: int, group: int, n: int, k: int, block: int = 16) -> dict:
 
 
 def segments(micro: int, group: int, k: int, block: int):
-    """Replay the kernel schedule in issue order: (k0, length, scale index) per
-    thread segment. Mirrors make_linear_fp4_gemv's main groups and K-tail."""
+    """Replay make_linear_fp4_gemv's schedule in issue order: (k0, length, scale index) per segment."""
     block_k = RT * micro
     num_ko = -(-k // block_k)
     num_g = num_ko // group
@@ -127,12 +115,7 @@ def check_index(micro: int, group: int, k: int, block: int) -> str:
 
 
 def check_numeric(micro: int, group: int, block: int, unsegmented: bool = False) -> float:
-    """Emulate the kernel's f32 accumulation order against reference.linear_fp4.
-
-    ``unsegmented=True`` replays the one-scale-per-micro-tile schedule instead:
-    it must FAIL for micro > block, which is what makes this a gate and not a
-    tautology.
-    """
+    """Kernel's f32 accumulation order vs reference.linear_fp4; unsegmented=True must FAIL for micro > block."""
     torch.manual_seed(7)
     n, k = 4, RT * micro * (2 * group + 1)  # the odd tile forces the K-tail loop
     w = torch.randn(n, k)
@@ -152,8 +135,7 @@ def check_numeric(micro: int, group: int, block: int, unsegmented: bool = False)
 
 
 def check_dequant_math() -> str:
-    """The kernel decodes with lut[nib], lut = _e2m1_fp32(lane). Check all 16
-    nibbles against the reference grid pack_fp4/dequant_fp4 share."""
+    """All 16 nibbles of the kernel's lut (_e2m1_fp32) vs reference.dequant_fp4."""
     got = []
     for nib in range(16):
         e, m = (nib >> 1) & 3, nib & 1

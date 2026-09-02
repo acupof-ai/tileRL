@@ -1,8 +1,5 @@
-"""Where does serving memory actually go? The arithmetic says 34 GiB at
-B=64 depth 512; the card fills at 94.
-
-Reports the allocation after each construction step, then the largest live
-tensors by shape, so the gap is attributed rather than guessed.
+"""Serving memory after each construction step, then the largest live tensors by shape.
+The arithmetic says 34 GiB at B=64 depth 512; the card fills at 94.
 
     CUDA_VISIBLE_DEVICES=6 python3 scripts/probe_serve_mem.py /data00/... --batches 32,64
 """
@@ -70,8 +67,7 @@ def main() -> None:
             engine.submit(toks, SamplingParams(temperature=0.0, seed=i, max_new_tokens=gen))
         for t in range(60):
             engine.step()
-            if all(r.phase.name.startswith("DEC") if hasattr(r.phase, "name") else True
-                   for r in engine._running) and t > 8:
+            if t > 8:
                 break
         torch.cuda.synchronize()
         print(f"B={b}  after {t + 1} ticks  {used():.2f} GiB  "

@@ -1,13 +1,7 @@
-"""Measure the CPU-side dispatch cost of one decode tick: eager vs captured.
+"""CPU-side dispatch cost of one decode tick, eager vs captured, timed without a sync so a
+co-tenant on the GPU cannot inflate it (GPU time is profile_slice.py's job).
 
-Times ``model.forward`` (eager) / ``_DecodeGraph.run`` (captured) WITHOUT
-syncing — the CPU-side launch cost only, robust to GPU contention (the
-co-tenant on a shared pod inflates wall-with-sync, not launch cost). The GPU
-execution time is measured separately by ``profile_slice.py`` (CUDA events).
-
-Usage:
-    TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=1 \\
-        PYTHONPATH=src python3 scripts/bench_decode_dispatch.py /host/tc27-nvfp4-slice2 --layers 2
+Usage: TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python3 scripts/bench_decode_dispatch.py /host/tc27-nvfp4-slice2 --layers 2
 """
 
 from __future__ import annotations
@@ -46,8 +40,7 @@ def main() -> None:
     print(f"load: {time.perf_counter() - t0:.1f}s", flush=True)
     engine = build_engine(cfg, model, backend, num_blocks=128, num_slots=4, decode_graph=False)
 
-    # Warmup: prefill + a few decodes (JIT every decode shape). Keep the
-    # request alive past warmup so _running[0] exists for the timed loop.
+    # Request outlives warmup so _running[0] exists for the timed loop.
     gen = torch.Generator().manual_seed(1)
     prompt = torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist()
     engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=args.ticks + 10, seed=0))
@@ -57,10 +50,7 @@ def main() -> None:
 
     req = engine._running[0]
 
-    # Eager: time N forwards with NO sync — pure CPU-side dispatch. Allocate
-    # the per-tick inputs inside the loop (the engine does too). Report the
-    # MIN: on a contended pod the GPU occasionally idles, and the minimum
-    # tick is the least-contaminated dispatch estimate.
+    # Min is reported: on a contended pod the minimum tick is the least-contaminated estimate.
     eager_samples = []
     for _ in range(args.ticks):
         ids = torch.tensor([[req.output[-1]]], dtype=torch.long, device=backend.device)
@@ -70,9 +60,6 @@ def main() -> None:
         model.forward(ids, pos, kv, backend)
         eager_samples.append((time.perf_counter() - t0) * 1000.0)
 
-    # Captured: build the graph (warmup forwards hit the JIT cache), then time
-    # N replays with NO sync — copies + one graph replay. Decompose the pinned
-    # copies (the g.run path) from the replay to locate the cost.
     g = _DecodeGraph(model, backend, engine._kv, engine._states, 1)
     captured_samples = []
     copy_samples = []

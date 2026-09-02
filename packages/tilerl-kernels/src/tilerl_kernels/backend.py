@@ -1,44 +1,12 @@
-"""TileLang backend: kernel dispatch and the op interface.
+"""TileLang backend: the op interface every layer above calls. Forward ops
+run the kernels the registry cell resolves; backward ops without a kernel run
+the torch-eager reference.
+# ponytail: torch-eager backward, tilelang kernel when perf demands
 
-This is the ONLY module in tilerl that talks to tilelang directly. Everything
-above ``tilerl.ops`` calls the :class:`Backend` methods, never tilelang or
-torch internals (torch is the tensor container only). The precision×arch
-dispatch matrix and target resolution live in :mod:`tilerl_kernels.registry`.
-
-Forward ops compile and run the TileLang kernels in :mod:`tilerl_kernels.kernels`
-(cached per shape/dtype by tilelang's eager JIT). Backward ops without a
-TileLang kernel run the torch-eager reference in :mod:`tilerl_kernels.reference`
-— the parity oracle and day-1 training fallback.
-``# ponytail: torch-eager backward, tilelang kernel when perf demands``
-
-CPU target facts (tilelang 0.1.13, macOS arm64, 2026-08-23): ``target="c"``
-is the working CPU target (``"llvm"`` has no LLVM codegen in the wheel).
-tilelang's own ``"auto"`` resolves to metal on Apple Silicon; tileRL's
-default is CPU, so :func:`resolve_target` maps ``auto`` to ``"cuda"`` when a
-CUDA device is visible and ``"c"`` otherwise. Kernels are f32-only: eager JIT
-does not specialize on dtype, so bf16/f16 inputs are cast to f32 at the
-boundary and outputs are f32.
-Metal target facts (tilelang 0.1.13, Apple Silicon, 2026-08-24): the same
-kernel source compiles for ``target="metal"`` with no per-target forks; the
-Metal cell of the dispatch matrix reuses ``_CPU_KERNELS``. Tensors must live
-on torch's ``"mps"`` device (``Backend.device``), and kernel I/O goes through
-the torch-MPS adapter in tilelang's tvm_ffi runtime.
-CUDA target facts (tilelang 0.1.13, H20/sm90, 2026-08-24): the same source
-compiles for ``target="cuda"``; the sm90 cell uses the MMA (WGMMA) schedules
-in kernels_linear.py — shared-memory tiled T.gemm with pipelining, the SOTA
-pattern from examples/gemm/example_gemm.py. The sm90 MMA kernels are bf16-IO
-(bf16 WGMMA, f32 accumulate); the CUDA path casts to bf16 once at the
-boundary, while CPU/metal keep the f32 kernels. The MMA kernels require
-block M/N divisible by 16 and the reduction dim divisible by 32; the CUDA
-path of linear/linear_bwd/linear_fp4 zero-pads tails so the kernel always
-sees exact tiles (decode M=1 pads to 16; all model N/K dims are already
-multiples of 32). ``Backend.device`` pins ``cuda:<current>`` — ``torch.device("cuda")``
-(index None) is not the device kernel outputs land on. Eager JIT invokes
-NVCC per (shape, dtype): first call per shape costs 30-120s+, but tilelang
-caches the compiled artifact on disk (``~/.tilelang/cache``, override with
-``TILELANG_CACHE_DIR``) — a warm second-process call is ~0.2s (verified
-2026-08-25). On the pod, point the cache at a persistent path (/work) or
-every container restart re-pays the NVCC builds.
+sm90 kernels are bf16-IO WGMMA tiles (M/N multiples of 16, K of 32); this
+module pads tails so a kernel always sees exact tiles. CPU/metal run the f32
+kernels. Eager JIT calls NVCC per shape (30-120s cold; ~0.2s from
+``TILELANG_CACHE_DIR``, point it at persistent storage on the pod).
 """
 
 from __future__ import annotations
@@ -49,11 +17,7 @@ from typing import Any
 
 import torch
 
-from . import kernels
-from . import kernels_attn
-from . import kernels_gdn
 from . import kernels_linear
-from . import kernels_mma
 from . import reference
 from .registry import _arch_for, _resolve, resolve_target
 
@@ -67,17 +31,11 @@ def _round_up(x: int, m: int) -> int:
 
 
 def _snap_mma_tile(m: int, cap: int) -> int:
-    """Snap an MMA tile M to a warp-partition-valid size.
-
-    WGMMA Square policy needs each warp's rows to land on a valid partition;
-    empirically 16/32/64/128 compile and 48/80/96/112 do not (tilelang
-    0.1.13). Mixed batches land on arbitrary M (rows x chunk), so snap up.
-    """
+    # WGMMA Square policy: 16/32/64/128 compile, 48/80/96/112 do not
     return min(cap, next((s for s in (16, 32, 64, 128) if s >= m), 128))
 
 
 def _pad2d(t: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
-    """Zero-pad a 2D tensor to [rows, cols] (bottom/right)."""
     pr, pc = rows - t.shape[0], cols - t.shape[1]
     if pr == 0 and pc == 0:
         return t
@@ -89,23 +47,15 @@ def _pad1d(t: torch.Tensor, n: int) -> torch.Tensor:
     return t if p == 0 else torch.nn.functional.pad(t, (0, p))
 
 
-#: CUDA linear family as data: (op, M-regime) -> (kernel, K pad, N cap, N tile).
-#: The regimes are measured crossovers, not guesses — GEMV at M=1, 8-way
-#: K-split decode at M<=16, 2-way prefill above
-#: (docs/experience/wins/2026-08-26-batch-decode-h2.md). The fp4->e4m3 arms
-#: tile N at 64 because the kernel overrides block_N to _FP4_BLOCK_N=64 — a
-#: 32-tile pad lets its grid read past the padded WQ.
-_MX = 8  # batched decode GEMV: activation rows kept in registers per lane
-#: Rows up to which the M-row GEMV beats mma8. mma8 pads M to 8, so it costs
-#: the same at M=2 as at M=8; the GEMV costs 6.6 + 13.8*M us (fp4) because two
-#: thirds of it is per-row FMA. Measured decode replay, 27B, H20 (ms):
-#:   M    1     2     3     4     8
-#:   gemv 11.2  17.5  27.1  30.1  55.8
-#:   mma8  -    27.2  29.7  27.6  27.1
-#: A/B per arch: TILERL_MGEMV=0 disables the path.
+_MX = 8  # mma8 row cap: decode rows on the tensor cores
+#: rows up to which the M-row GEMV beats mma8 (27B decode replay, H20, ms:
+#: gemv 11.2/17.5/27.1/30.1 at M=1..4, mma8 27 flat); TILERL_MGEMV=0 disables
 _MGEMV = int(os.environ.get("TILERL_MGEMV", "3"))
-_MMA_RED = kernels_linear._RED_TILE  # the K-loop reduction tile; one definition, not two
+_MMA_RED = kernels_linear._RED_TILE
 
+#: CUDA linear family: (op, M-regime) -> (kernel, K pad, N cap, N tile).
+#: Crossovers measured in wins/2026-08-26-batch-decode-h2.md. The fp4->e4m3
+#: arms tile N at 64 because the kernel overrides block_N to _FP4_BLOCK_N.
 _CUDA_PLAN = {
     ("linear", "gemv"): ("linear_bf16_gemv", 256, 4, 4),
     ("linear_fp4", "gemv"): ("linear_fp4_gemv", 256, 4, 4),
@@ -118,43 +68,26 @@ _CUDA_PLAN = {
 
 
 class Backend:
-    """Resolved tilelang target plus lazily-compiled kernels.
+    """Resolved tilelang target plus lazily-compiled kernels."""
 
-    Kernel factories are called once per process; tilelang's eager JIT caches
-    compiled code per (shape, dtype, kwargs) signature.
-    """
-
-    #: Backend identity (mirrors testing.RefBackend.name; used for logging).
     name = "tilelang"
-
-    #: Tensor-parallel group size (1 = no TP). Set by :meth:`init_tp`.
     tp_world = 1
     tp_rank = 0
 
     def init_tp(self, world: int, rank: int) -> None:
-        """Join the NCCL group this rank's shard all-reduces over.
-
-        Communication lives here, not above: the framework layers call
-        ``backend.all_reduce`` and never import torch.distributed themselves.
-        """
+        """Join the TP group; framework layers never import torch.distributed."""
         if world == 1:
             return
         import torch.distributed as dist
 
         if not dist.is_initialized():
-            # gloo is the CPU target's group: the TP parity gate runs here.
             comm = "nccl" if self.device.type == "cuda" else "gloo"
             dist.init_process_group(comm, world_size=world, rank=rank)
         self.tp_world, self.tp_rank = world, rank
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        """Sum ``x`` across the TP group, in place. Identity when TP is off.
-
-        Row-parallel projections leave each rank with a partial sum; this is
-        where the shards become the real activation. Measured floor on 6 H20s
-        is 21.5 us per call and flat from 20 KB to 1.3 MB, so the cost is per
-        LAYER, not per byte - it does not amortize over batch.
-        """
+        """Sum across the TP group in place. 21.5 us floor per call on 6 H20s,
+        flat from 20 KB to 1.3 MB: the cost is per layer, not per byte."""
         if self.tp_world == 1:
             return x
         import torch.distributed as dist
@@ -163,15 +96,7 @@ class Backend:
         return x
 
     def all_gather(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        """Concatenate ``x`` from every rank along ``dim``. Identity when TP
-        is off.
-
-        This is what completes a vocab-parallel lm_head: each rank computes
-        logits over its slice of the vocabulary and the row is only whole once
-        gathered. vLLM, SGLang and TRT-LLM all pay this rather than keep the
-        logits sharded, because every sampler feature (penalties, structured
-        output, logprobs) is far simpler on a dense row.
-        """
+        """Concatenate from every rank along ``dim`` (vocab-parallel lm_head)."""
         if self.tp_world == 1:
             return x
         import torch.distributed as dist
@@ -186,16 +111,9 @@ class Backend:
         if target == "metal":
             self.device = torch.device("mps")
         elif target.startswith("cuda"):
-            # torch.device("cuda") (index None) is not the device kernel
-            # outputs land on (cuda:0) — pin the current device so the
-            # boundary migration targets the right one.
+            # index None is not the device kernel outputs land on
             self.device = torch.device("cuda", torch.cuda.current_device())
-            # torch defaults allow_tf32 to False, which puts every fp32 matmul
-            # in the torch-eager backward on SIMT FP32 cores instead of the
-            # tensor cores - 23% of a train step showed up as cutlass_*_simt_
-            # sgemm / xmma_gemm_f32f32 in the profile. TF32 keeps 10 mantissa
-            # bits, well inside the rtol=1e-2 parity gate on a model whose
-            # weights are fp4.
+            # fp32 matmuls in the eager backward were 23% of a train step on SIMT cores
             tf32 = os.environ.get("TILERL_TF32", "1") == "1"
             torch.backends.cuda.matmul.allow_tf32 = tf32
             torch.backends.cudnn.allow_tf32 = tf32
@@ -215,8 +133,7 @@ class Backend:
         )
 
     def _kernel(self, name: str, *args):
-        """``args`` are FACTORY arguments (a compile-time kernel variant, e.g.
-        the GEMV's row count), not call arguments — they key the cache."""
+        """``args`` are factory (compile-time variant) arguments; they key the cache."""
         k = self._kernels.get((name, args))
         if k is None:
             k = _resolve(self.precision, self.arch)[name](self.target, *args)
@@ -227,16 +144,10 @@ class Backend:
 
     @staticmethod
     def _c(t: torch.Tensor) -> torch.Tensor:
-        """TileLang kernels check static strides — views must be contiguous."""
         return t if t.is_contiguous() else t.contiguous()
 
     def _dev(self, t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        """Cast dtype and move to the backend device at the tilelang boundary.
-
-        Kernels require inputs on the target device (mps for metal); CPU-side
-        callers (parity tests, CPU-resident params) pass CPU tensors, so the
-        boundary migrates them. No-op when dtype/device already match.
-        """
+        """Cast and migrate at the tilelang boundary (callers may pass CPU tensors)."""
         if t.dtype != dtype or t.device != self.device:
             return t.to(device=self.device, dtype=dtype)
         return t
@@ -254,9 +165,7 @@ class Backend:
         key = (d, theta)
         inv = self._inv_freq_cache.get(key)
         if inv is None:
-            # On the backend device: a CPU-cached tensor would H2D-copy on
-            # every rope call, and the copy is illegal inside a captured
-            # decode tick (CUDA graph capture rejects unpinned CPU->CUDA).
+            # on device: a CPU->CUDA copy is illegal inside a captured decode tick
             inv = 1.0 / (
                 theta ** (torch.arange(0, d, 2, dtype=torch.float32, device=self.device) / d)
             )
@@ -264,18 +173,16 @@ class Backend:
         return inv
 
     def _rows(self, x: torch.Tensor):
-        # sm90 kernels are bf16-IO, CPU/metal f32; cast once at the boundary.
         io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
         return x.shape[:-1], self._c(self._dev(x, io).reshape(-1, x.shape[-1]))
 
     def _epilogue(self, y2, oscale, lead, n: int):
-        # ponytail: torch epilogue for the per-row scale, fold into the kernel
-        # accumulator if a sweep says it matters.
+        # ponytail: torch epilogue for the per-row scale, fold into the kernel if a sweep says so
         return (y2 if oscale is None else y2 * self._const_f32(oscale)).reshape(*lead, n)
 
     def _plan(self, op: str, m: int, n: int, k: int):
         """(kernel, Mp, Np, Kp, block_M, block_N), or None when this cell has no
-        specialized kernel — the caller falls through to its generic path."""
+        specialized kernel."""
         if not self.target.startswith("cuda"):
             return None
         hit = _CUDA_PLAN.get((op, "gemv" if m == 1 else "decode" if m <= 16 else "prefill"))
@@ -291,7 +198,6 @@ class Backend:
     # ------------------------------------------------------------ add
 
     def add(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Elementwise add (residual stream). Recorded by the tape."""
         return a + b
 
     # ------------------------------------------------------------ rmsnorm
@@ -301,9 +207,6 @@ class Backend:
         w = self._const_f32(w)
         lead = x.shape[:-1]
         x2 = self._c(x.reshape(-1, x.shape[-1]))
-        # Split-K: chunk the reduction dim across blocks (phase 1 partial
-        # sums, phase 2 reduce+normalize) so decode (M=1) is not one serial
-        # block. block_N=256 -> 20 blocks per row at the 5120 hidden size.
         N = x2.shape[-1]
         if "rmsnorm_fused" in _resolve(self.precision, self.arch):
             y = self._kernel("rmsnorm_fused")(x2, w, float(eps), 256)
@@ -323,8 +226,6 @@ class Backend:
         g2 = self._c(grad.reshape(-1, grad.shape[-1]))
         rstd = self._kernel("rmsnorm_rstd")(x2, eps=float(eps), threads=_THREADS)
         gx = self._kernel("rmsnorm_bwd_x")(g2, x2, w, rstd, threads=_THREADS)
-        # gw: column-parallel reduction; reference is one einsum and faster
-        # than a second kernel launch on CPU day-1.
         # ponytail: torch-eager gw, tilelang bwd-w kernel when perf demands
         gw = (g2 * x2 * rstd.unsqueeze(-1)).sum(dim=0)
         return gx.reshape(*lead, w.shape[0]), gw
@@ -350,14 +251,12 @@ class Backend:
         return y
 
     def rope_bwd(self, grad, positions, theta, rotary_dim=None):
-        # Orthogonal rotation: gx = R(-angle) grad. Reference (one line).
         # ponytail: torch-eager backward, tilelang kernel when perf demands
         return reference.rope_bwd(grad, positions, theta, rotary_dim=rotary_dim)
 
     # ------------------------------------------------------------ linear
 
-    #: linear_fp4/linear_fp8/linear accept ``residual=`` (serving-only: the tape
-    #: records backend.add instead, its backward needs the separate op).
+    #: ``residual=`` is serving-only: the tape records backend.add instead
     fuses_residual = True
 
     def linear(self, x, w, bias=None, residual=None):
@@ -365,25 +264,18 @@ class Backend:
         w = self._dev(w, x2.dtype)
         M, K, N = x2.shape[0], x2.shape[1], w.shape[0]
         plan = self._plan("linear", M, N, K)
-        if plan is not None:
-            # Decode GEMV: stream W once (2 bytes/elem) instead of padding M
-            # to 16 WGMMA rows; the K-tail is zero-padded like the WGMMA path.
+        if plan is not None:  # decode GEMV
             kernel, _, Np, Kp, _, bN = plan
             y = self._kernel(kernel)(_pad2d(x2, 1, Kp), _pad2d(w, Np, Kp), 32, bN)[:1, :N]
             y = (y if bias is None else y + self._f32(bias)).reshape(*lead, N)
             return y if residual is None else y + residual
         bM, bN = min(64, M), min(64, N)
-        # _f32 before the cuda branch: every target needs the bias on-device.
         bias = (
             torch.zeros(N, dtype=torch.float32, device=self.device)
             if bias is None
             else self._f32(bias)
         )
         if self.target.startswith("cuda"):
-            # WGMMA tiles: the block M/N must be a warp-partition-valid size
-            # (16/32/64/128 — 48 is not, and a rank-16 LoRA or a 48-wide
-            # projection lands there), reduction K %32; pad tails so the MMA
-            # kernel sees exact tiles (no OOB loads).
             bM, bN = _snap_mma_tile(bM, 64), _snap_mma_tile(bN, 64)
             x2 = _pad2d(x2, _round_up(M, bM), _round_up(K, 32))
             w = _pad2d(w, _round_up(N, bN), _round_up(K, 32))
@@ -429,11 +321,9 @@ class Backend:
     # ------------------------------------------------------------ linear fp4
 
     def _served_fp4(self, wq):
-        """The fp4 bytes this cell's kernels read. sm90 kernels decode the
-        twiddled layout; the served tensor is rewritten in place ONCE (flagged)
-        so graph capture, save_hf (which untwiddles by the flag) and CPU-resident
-        callers all see one truth. Other cells read the natural layout."""
-        wq = self._dev(wq, wq.dtype)  # uint8: device migration only
+        """sm90 reads the twiddled layout: rewritten in place once and flagged,
+        so graph capture and save_hf (which untwiddles by the flag) see one truth."""
+        wq = self._dev(wq, wq.dtype)
         if "linear_fp4_gemv" in _resolve(self.precision, self.arch) and not getattr(
             wq, "_tl_twiddled", False
         ):
@@ -442,18 +332,13 @@ class Backend:
         return wq
 
     def linear_fp4(self, x, wq, scale, master=None, oscale=None, residual=None):
-        # ``master`` is recording-only (the STE grad lands on it); the kernel
-        # uses wq/scale.
+        # ``master`` is recording-only (the STE grad lands on it)
         wq = self._served_fp4(wq)
         scale = self._f32(scale)
         lead, x2 = self._rows(x)
         M, K, N = x2.shape[0], x2.shape[1], wq.shape[0]
-        blk = K // scale.shape[1]  # scale block from the loaded weight (16 or 32)
-        # M-row GEMV: mma8 costs the same at M=2 and M=8 (it pads M to 8), so a
-        # 2-row decode measured the same 27 ms tick as an 8-row one. The GEMV
-        # streams W once for M rows, so it wins until the M-fold FMA work
-        # catches up. Uses the M=1 plan — the decode plan's n_partition is 128,
-        # which as a GEMV thread block is 4096 threads.
+        blk = K // scale.shape[1]  # the checkpoint's scale block (16 or 32)
+        # M-row GEMV on the M=1 plan (the decode plan's n_partition is a 4096-thread block)
         if 2 <= M <= _MGEMV and (gp := self._plan("linear_fp4", 1, N, K)) is not None:
             gk, _, gNp, gKp, _, gbN = gp
             gwq, gsc = _pad2d(wq, gNp, gKp // 2), _pad2d(scale, gNp, gKp // blk)
@@ -469,13 +354,9 @@ class Backend:
         plan = self._plan("linear_fp4", M, N, K)
         if plan is not None:
             kernel, Mp, Np, Kp, bM, bN = plan
-            # K-tail: zero-padded X, and padded nibbles (0x00) decode to 0.0.
             wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
-            # M=1 stays on the scalar GEMV: through mma8 it measured 2.2x slower
-            # (39.9 vs 87 tok/s) — 15 of 16 tensor rows idle, same decode cost.
+            # M=1 stays on the GEMV: mma8 measured 2.2x slower there (39.9 vs 87 tok/s)
             if 2 <= M <= _MX and "linear_fp4_mma8" in _resolve(self.precision, self.arch):
-                # Batched decode on the tensor cores (Marlin-style); Np is a
-                # multiple of 32 here (the plan pads N to the 32-row block).
                 Np32 = _round_up(N, 32)
                 wq, scale = _pad2d(wq, Np32, Kp // 2), _pad2d(scale, Np32, Kp // blk)
                 osc = self._ones(Np32) if oscale is None else self._const_f32(oscale, Np32)
@@ -486,11 +367,9 @@ class Backend:
                 y = y2.reshape(*lead, N)
                 return y if res is None or r2.shape[1] == N else y + residual
             if M == 1:
-                # Decode GEMV: one activation row, stream+dequant WQ once; the
-                # per-row oscale is folded into the kernel epilogue.
                 osc = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
                 res = self._residual(residual, N, Np)
-                if res is not None:  # residual add fused into the epilogue
+                if res is not None:
                     y2 = self._kernel(kernel)(_pad2d(x2, 1, Kp), wq, scale, osc, res, 32, bN, blk)
                     return y2[:1, :N].reshape(*lead, N)
                 y2 = self._kernel(kernel)(
@@ -498,9 +377,7 @@ class Backend:
                 )[:1, :N]
                 return self._epilogue(y2, None, lead, N) + residual
             else:
-                # w4a8: per-token e4m3 activation quant + fp4->e4m3 dequant +
-                # fp8 WGMMA, K-split into f32 atomic adds on a zeroed output
-                # (the AScale divide distributes over it).
+                # w4a8: per-token e4m3 activation quant, K-split atomic adds on a zeroed Y
                 x2 = _pad2d(x2, Mp, Kp)
                 xq = torch.empty((Mp, Kp), dtype=torch.float8_e4m3fn, device=self.device)
                 ascale = torch.empty((Mp,), dtype=torch.float32, device=self.device)
@@ -510,10 +387,7 @@ class Backend:
                 y2 = y2[:M, :N]
         else:
             bM, bN = min(64, M), min(64, N)
-            if self.target.startswith("cuda"):
-                # WGMMA tiles %16, reduction K %64 (the fp4 dequant K-tile);
-                # bM snaps to a warp-partition-valid size (48/80/96/112 fail
-                # under Square policy).
+            if self.target.startswith("cuda"):  # K pads to the fp4 dequant K-tile
                 bM, bN = _snap_mma_tile(M, 64), _round_up(bN, 16)
                 Mp, Np, Kp = _round_up(M, bM), _round_up(N, bN), _round_up(K, 64)
                 x2 = _pad2d(x2, Mp, Kp)
@@ -525,9 +399,7 @@ class Backend:
     # ------------------------------------------------------------ linear fp8
 
     def linear_fp8(self, x, w8, wscale, master=None, oscale=None, residual=None):
-        # ``master`` is recording-only (the STE grad lands on it); the kernel
-        # uses w8/wscale. Only sm90 has an fp8 kernel — elsewhere the weight is
-        # bf16 by now, see :meth:`materialize`.
+        # only sm90 has an fp8 kernel; elsewhere materialize() made the weight bf16
         lead, K, N = x.shape[:-1], x.shape[-1], w8.shape[0]
         M = x.numel() // K
         plan = self._plan("linear_fp8", M, N, K)
@@ -537,7 +409,7 @@ class Backend:
                 "run Backend.materialize on the params at load, it converts fp8 to bf16"
             )
         if 2 <= M <= _MGEMV and (gp := self._plan("linear_fp8", 1, N, K)) is not None:
-            gk, _, gNp, gKp, _, gbN = gp  # see linear_fp4 for why the M=1 plan
+            gk, _, gNp, gKp, _, gbN = gp
             osc = self._ones(gNp) if oscale is None else self._const_f32(oscale, gNp)
             res = self._residual(residual, N, gNp, rows=M)
             y2 = self._kernel(gk, M)(
@@ -549,7 +421,6 @@ class Backend:
             y = y2.reshape(*lead, N)
             return y if res is not None else y + residual
         kernel, Mp, Np, Kp, bM, bN = plan
-        # Zero-padding the per-128-block wscale kills the K-tail.
         x2 = _pad2d(self._c(self._dev(x, torch.bfloat16).reshape(M, K)), Mp, Kp)
         w8 = _pad2d(self._dev(w8, w8.dtype), Np, Kp)
         wscale = _pad2d(self._const_f32(wscale), -(-Np // 128), Kp // 128)
@@ -565,10 +436,9 @@ class Backend:
             y = y2.reshape(*lead, N)
             return y if res is None or r2.shape[1] == N else y + residual
         if M == 1:
-            # Decode GEMV: stream e4m3 W once (1 byte/elem), bf16 X; oscale folded.
             osc = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
             res = self._residual(residual, N, Np)
-            if res is not None:  # residual add fused into the epilogue
+            if res is not None:
                 return self._kernel(kernel)(x2, w8, wscale, osc, res, 32, bN)[:1, :N].reshape(*lead, N)
             y2 = self._kernel(kernel)(x2, w8, wscale, osc, self._residual(None, N, Np), 32, bN)[:1, :N]
             return self._epilogue(y2, None, lead, N) + residual
@@ -581,18 +451,13 @@ class Backend:
         return y if residual is None else y + residual
 
     def materialize(self, params: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Convert quantized weights to what this cell serves, then migrate.
-
-        fp4 is native on every registered cell; fp8 only on sm90, so elsewhere
-        ``.w8/.wscale/.oscale`` collapse into a bf16 weight here — once, at
-        wiring time, never as a per-call fallback. It never rewrites a tensor
-        that exists: a train step calls this every tick and the optimizer's
-        moments are keyed by ``id(param)``.
-        """
+        """Convert quantized weights to what this cell serves, then migrate:
+        off sm90, .w8/.wscale/.oscale collapse into a bf16 weight once at wiring.
+        Never rewrites an existing tensor: optimizer moments are keyed by id(param)."""
         out = dict(params)
         if "linear_fp8" not in _resolve(self.precision, self.arch):
             for base in sorted(k[:-3] for k in params if k.endswith(".w8")):
-                if base not in out:  # rebuild the weight from the served bytes
+                if base not in out:
                     w = reference.dequant_fp8(params[f"{base}.w8"], params[f"{base}.wscale"])
                     osc = params.get(f"{base}.oscale", torch.ones(1))
                     osc = osc.to(w.device, torch.float32).reshape(-1, 1)
@@ -613,12 +478,9 @@ class Backend:
         if seq_q_lens is None:
             seq_q_lens = torch.full((b,), s, dtype=torch.int32)
         if self.arch == "sm90" and s == 1 and "paged_attention_decode" in _resolve(self.precision, self.arch):
-            # Pure decode: split-KV flash-decoding, the GQA group as the M tile.
             out = self._paged_attention_decode(q, k_cache, v_cache, block_table, seq_lens, scale)
         elif self.arch == "sm90":
-            # MMA kernel is bf16-IO and tiles queries at block_M: pad S to a
-            # multiple (the kernel's history/mask use the true per-row lengths
-            # in seq_q_lens, so padding rows do not shift the causal window).
+            # pad S to block_M; seq_q_lens keeps the causal window on the true lengths
             block_m = 64 if s >= 64 else 16
             q = self._dev(self._c(q), torch.bfloat16)
             pad = -s % block_m
@@ -663,17 +525,14 @@ class Backend:
     def _paged_attention_decode(self, q, k_cache, v_cache, block_table, seq_lens, scale):
         b, h, d = q.shape[0], q.shape[2], q.shape[3]
         hkv = k_cache.shape[1]
-        # split count from the pool's reach (host-static, graph-safe): a
-        # block's serial scan stays <= 4K tokens at 256K. 16 splits at b=1 is
-        # (16, hkv, 1) = 64 blocks on 78 SMs — half the card idle, which is why
-        # d32768 measured slower than d131072; take 64 whenever the 16-grid
-        # under-fills and each split still gets a whole page.
+        # split count from the pool's reach (host-static, graph-safe): 64 splits
+        # past 64K tokens or when the 16-grid under-fills the SMs
         max_tokens = block_table.shape[1] * k_cache.shape[2]
         wide = 16 * hkv * b < 2 * self._sms and max_tokens >= 64 * k_cache.shape[2]
         ks, sfx = (64, "_64") if (max_tokens > 65536 or wide) else (16, "")
         key = ("attn_ws", b, hkv, d, ks)
         ws = self._ones_cache.get(key)
-        if ws is None:  # static workspace: graph-capturable, one per batch bucket
+        if ws is None:  # static workspace: graph-capturable
             ws = self._ones_cache[key] = (
                 torch.empty(b, hkv, ks, 16, d, dtype=torch.float32, device=self.device),
                 torch.empty(b, hkv, ks, 16, dtype=torch.float32, device=self.device),
@@ -698,13 +557,8 @@ class Backend:
     # ------------------------------------------------------------ write tokens
 
     def write_tokens(self, k, v, kv, layer_idx):
-        """Scatter k/v [B,T,Hkv,D] into the paged pool at [seq_len-T, seq_len).
-
-        sm90: one capturable kernel — the host loop it replaces syncs GPU->CPU
-        per token (block table / seq_len are device tensors) and cannot sit
-        inside a captured decode tick. Other arches: the pool's torch-loop
-        fallback (the dev/parity path).
-        """
+        """Scatter k/v [B,T,Hkv,D] into the paged pool: one capturable kernel on
+        sm90, the pool's torch loop elsewhere."""
         if "write_tokens" not in _resolve(self.precision, self.arch):
             kv.kv_pool.write_tokens(k, v, kv, layer_idx)
             return
@@ -714,9 +568,7 @@ class Backend:
         sql = getattr(kv, "seq_q_lens", None)
         if sql is None:
             sql = torch.full((b,), s, dtype=torch.int32)
-        # .contiguous(): the ABI is packed. A bf16 view (e.g. v sliced from
-        # the fused-qkv GEMV output) survives _dev's no-op cast and violates
-        # it at B>=2; the f32 WGMMA path's cast already copied.
+        # .contiguous(): a bf16 view sliced from the fused-qkv output survives _dev's no-op cast
         self._kernel("write_tokens")(
             self._dev(k, torch.bfloat16).contiguous(),
             self._dev(v, torch.bfloat16).contiguous(),
@@ -730,9 +582,8 @@ class Backend:
         )
 
     def attn_prep(self, qkv, wq, wk, positions, theta, rotary_dim, kv, layer_idx, hq, hkv, eps):
-        """Fused q/k norm + RoPE + K/V pool write off the fused-qkv output.
-        Returns normalized+rotated q [B,S,hq,D] (bf16). None if the arch has
-        no fused kernel — caller takes the unfused path."""
+        """Fused q/k norm + RoPE + K/V pool write; returns q [B,S,hq,D] bf16,
+        or None when the arch has no fused kernel."""
         if "attn_prep" not in _resolve(self.precision, self.arch):
             return None
         pool = kv.kv_pool
@@ -763,17 +614,12 @@ class Backend:
         )
 
     def linear_frozen_bwd(self, grad, wq, scale, oscale=None, fp8=False):
-        """dX through a frozen quantized weight — no weight grad.
-
-        dX contracts over N, which the packed layout cannot stream, so the
-        weight is materialized. The reference dequant costs ~1.5 GB of int64
-        temporaries per call and this runs 448 times a training step; the
-        kernel does it in one pass, bf16 out, scales folded.
-        """
+        """dX through a frozen quantized weight, no weight grad. The kernel
+        dequantizes in one pass; the reference costs ~1.5 GB of temporaries
+        per call, 448 calls a step."""
         kset = _resolve(self.precision, self.arch)
-        # The kernel bakes the scale block into its dequant macro; 16 is every
-        # shipped checkpoint's, and pack_fp4's block-32 test weights take the
-        # reference. ponytail: register a second kernel if a 32 ever ships.
+        # ponytail: the kernel bakes scale block 16 (every shipped checkpoint);
+        # register a second kernel if a 32 ever ships
         blk = wq.shape[1] * 2 // self._f32(scale).shape[1]
         if not fp8 and blk == 16 and "linear_fp4_bwd" in kset:
             wq = self._served_fp4(wq)
@@ -782,10 +628,7 @@ class Backend:
             if oscale is not None:  # scales weight row n: fold into [M,N], not [N,K]
                 g = g * self._bf16(oscale).reshape(1, -1)
             m = g.shape[0]
-            # 128 output columns (2x the bytes per weight-row transaction) was
-            # measured and is not better: 1x256 read 0.962x. The kernel is not
-            # bound where the coalescing argument said it was.
-            bM, bN = _snap_mma_tile(min(64, m), 64), 64
+            bM, bN = _snap_mma_tile(min(64, m), 64), 64  # bN=128 measured 0.962x
             gx = self._kernel("linear_fp4_bwd")(
                 _pad2d(self._c(g), _round_up(m, bM), _round_up(n, _MMA_RED)),
                 _pad2d(wq, _round_up(n, _MMA_RED), _round_up(k, bN) // 2),
@@ -807,12 +650,9 @@ class Backend:
     # ------------------------------------------------------------ gated delta
 
     def linear_attn_chunk(self, q, k, v, g, beta, state, **kw):
-        """Full-GDN layer core. sm90: T=1 uses the fused decode kernel, T>1 the
-        fused chunk kernel; other arches use the torch-eager reference."""
+        """Full-GDN layer core: the fused chunk kernel on sm90 for T>1, else the reference."""
         _kset = _resolve(self.precision, self.arch)
-        # A/B lever for the prefill port: the chunked form is all bmm plus a
-        # triangular solve, so cuBLAS may already beat the serial-scan kernel
-        # without a line of tilelang. Unset = the shipped kernel.
+        # A/B lever: the chunkwise reference (all bmm + a triangular solve) vs the kernel
         chunk = int(os.environ.get("TILERL_GDN_CHUNKWISE", "0"))
         if chunk and q.shape[1] > 1 and not kw.get("keep_steps"):
             return reference.gdn_forward(q, k, v, g, beta, state, chunkwise=chunk, **kw)
@@ -821,12 +661,9 @@ class Backend:
         return reference.gdn_forward(q, k, v, g, beta, state, **kw)
 
     def gdn_decode(self, q, k, v, g, beta, pool, slots, layer, **kw):
-        """Serving decode (T=1) GDN core, one launch, state updated IN PLACE in
-        ``pool.states[slots, layer]`` (sm90 only — returns None elsewhere and the
-        caller takes the tape-recorded gather -> linear_attn_chunk -> scatter
-        path). The conv window is double-buffered in the pool (plane
-        ``win_parity[slot]`` read, ``1 -`` it written): its q/k columns are
-        shared across blocks, so an in-place shift would race."""
+        """Decode (T=1) GDN core in one launch, state updated in place in
+        ``pool.states[slots, layer]``; None off sm90 (caller takes the
+        gather -> linear_attn_chunk -> scatter path)."""
         if "gdn_decode_fused" not in _resolve(self.precision, self.arch):
             return None
         slots_i = self._i32(slots).contiguous()
@@ -856,16 +693,8 @@ class Backend:
         pool.win_parity[idx] = 1 - pool.win_parity[idx]
 
     def _gdn_chunk_fused(self, q, k, v, g, beta, state, **kw):
-        """Fused GDN chunk prefill (T>1): one launch for the whole layer core.
-
-        q/k/v/g/beta [B, T, ...] keep their T dim (the kernel scans it
-        serially per (value head, batch)). conv_window is always a tensor
-        (the model carries it; None means zero left-padding). ``seq_q_lens``
-        [B] (when present) bounds the per-row scan: mixed batches pad decode
-        rows to the chunk's T with a per-row bound of 1. ``keep_steps`` > 0
-        (speculative verify) returns the per-chain-step state/window planes
-        instead of the chunk-end pair.
-        """
+        """Fused GDN chunk prefill (T>1). ``keep_steps`` > 0 (speculative verify)
+        returns the per-chain-step state/window planes instead of the chunk-end pair."""
         ks = int(kw.get("keep_steps") or 0)
         window = kw.get("conv_window")
         has_window = window is not None
@@ -887,7 +716,7 @@ class Backend:
                                       device=self.device)
             step_windows = torch.empty((b, ks) + wshape, dtype=torch.bfloat16,
                                        device=self.device)
-        else:  # the kernel needs the operands; nobody reads them, so reuse one KS=1 pair
+        else:  # unread KS=1 operands, reused
             key = (b, nvh, kd, vd) + wshape
             if key not in self._step_scratch:
                 self._step_scratch[key] = (
@@ -913,13 +742,9 @@ class Backend:
             step_windows,
             threads=state.shape[-1],
         )
-        # The kernel returns the raw recurrence output; the gated RMSNorm and
-        # z-gate are two launches here instead of a serial thread-0 reduce on
-        # the critical path of every one of T token steps inside it.
+        # gated RMSNorm + z-gate here, off the kernel's per-token critical path
         core = out.reshape(b, out.shape[1], nvh, vd)
         out = self.silu_mul(
-            # device only, not dtype: silu_mul casts to f32 itself, so asking
-            # for f32 here casts [B,T,VD] twice
             self._dev(kw["z"], kw["z"].dtype).reshape(core.shape),
             self.rmsnorm(core, self._const_f32(kw["norm_weight"]), 1e-6),
         ).reshape(out.shape)
@@ -928,9 +753,8 @@ class Backend:
         return out, new_state, (self._f32(new_window) if has_window else None)
 
     def linear_attn_bwd(self, grad, q, k, v, g, beta, state, **kw):
-        # ponytail: torch-eager backward (gdn example_chunk_delta_bwd is the
-        # CUDA-scheduled tilelang upgrade path), tilelang kernel when perf demands
-        kw.pop("seq_q_lens", None)  # serving-only; training batches are uniform T
+        # ponytail: torch-eager backward, gdn example_chunk_delta_bwd when perf demands
+        kw.pop("seq_q_lens", None)  # serving-only
         return reference.linear_attn_bwd(grad, q, k, v, g, beta, state, **kw)
 
     def state_gather(self, states, windows, slots, layer_idx, parity=None):
@@ -975,13 +799,9 @@ class Backend:
     # ------------------------------------------------------------ embedding
 
     def _const_f32(self, t, pad_to: int | None = None, dtype=torch.float32):
-        """f32 cast of a PARAMETER (norm weight, scale, GDN vector, embedding
-        table), cached across ticks; optionally zero-padded to ``pad_to`` rows.
-        Per-call casts were ~110 launches per 8 decode layers (the 27B embedding
-        alone ~6ms/tick). The optimizer's in-place copy_ bumps _version and
-        invalidates the entry. Identity is checked via weakref: a fresh model
-        can reuse a freed tensor's address, and data_ptr alone would hand back
-        the stale cast. Never call this on an activation."""
+        """Cached cast of a PARAMETER (never an activation), invalidated by
+        _version (optimizer copy_) and by weakref identity (a freed address
+        can be reused by a fresh model)."""
         if t.dtype == dtype and t.device == self.device and pad_to is None:
             return t
         key = (t.data_ptr(), pad_to, dtype)
@@ -989,7 +809,7 @@ class Backend:
         if hit is not None:
             ref, ver, c = hit
             if ref() is not t:
-                del self._const_f32_cache[key]  # address reused by a different tensor
+                del self._const_f32_cache[key]
             elif ver == t._version:
                 return c
         c = self._dev(t, dtype)
@@ -1011,9 +831,8 @@ class Backend:
         return t
 
     def _residual(self, residual, n: int, np_: int, rows: int = 1):
-        """The GEMV epilogue's Res rows: the caller's residual stream (f32) or a
-        cached zero block. None if the padded width differs from the real one —
-        the caller adds in torch then."""
+        """GEMV epilogue Res rows: the residual (f32) or a cached zero block;
+        None when the padded width differs, the caller adds in torch."""
         if residual is None:
             t = self._ones_cache.get(("zeros", rows, np_))
             if t is None:
@@ -1026,11 +845,7 @@ class Backend:
         return self._f32(residual).reshape(rows, n).contiguous()
 
     def embedding(self, idx, table):
-        # A gather needs no arithmetic, so on CUDA the table is read in its own
-        # dtype: the 27B's bf16 [248320, 5120] table is 2.4 GiB against a
-        # cached 4.7 GiB f32 copy. The C target cannot codegen bfloat16
-        # ("Cannot convert type bfloat16 to C type"), so CPU/metal keep the
-        # f32 cast.
+        # CUDA reads the bf16 table as-is (2.4 GiB vs a 4.7 GiB f32 copy); the C target cannot codegen bf16
         if table.dtype == torch.bfloat16 and self.target.startswith("cuda"):
             table, dt = self._c(table.to(self.device)), "bfloat16"
         else:
@@ -1058,7 +873,6 @@ _BACKEND: Backend | None = None
 
 
 def get_backend() -> Backend:
-    """Process-wide backend singleton (target resolved once)."""
     global _BACKEND
     if _BACKEND is None:
         _BACKEND = Backend(resolve_target())

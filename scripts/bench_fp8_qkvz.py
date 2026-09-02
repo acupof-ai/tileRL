@@ -1,12 +1,7 @@
-"""A/B native-fp8 in_proj_qkv+z fusion at prefill shapes (H20, sm90).
+"""A/B fp8 in_proj_qkv+z at prefill shapes: two linear_fp8 launches vs one on the concat'd
+w8/wscale (lossless: 10240 = 80 blocks, 6144 = 48) plus a split.
 
-Arm A: two linear_fp8 launches (qkv then z, same input) — the shipped GDN
-forward. Arm B: one linear_fp8 on the concat'd w8/wscale + the split back at
-the qkv boundary. Same math (the per-128-block wscale concats losslessly:
-10240 = 80 blocks, 6144 = 48), so relerr ~1e-6; the question is launch count.
-
-    REMOTE_DIR=/work/tilerl_qkvz BENCH_GPUS=7 scripts/_pod_bench.sh \\
-        'PYTHONPATH=src python3 scripts/bench_fp8_qkvz.py'
+    REMOTE_DIR=/work/tilerl_qkvz BENCH_GPUS=7 scripts/_pod_bench.sh 'PYTHONPATH=src python3 scripts/bench_fp8_qkvz.py'
 """
 
 from __future__ import annotations
@@ -18,8 +13,7 @@ from tilerl_kernels.backend import get_backend
 
 
 def _quant_fp8_block(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-128-block e4m3 weight quant (the checkpoint format load_hf keeps
-    native): w8 [N,K] f8_e4m3, wscale [ceil(N/128), ceil(K/128)] f32."""
+    """Checkpoint-native per-128-block e4m3: w8 [N,K], wscale [ceil(N/128), ceil(K/128)] f32."""
     n, k = w.shape
     ns, ks = (n + 127) // 128, (k + 127) // 128
     wp = w.float().new_zeros((ns * 128, ks * 128))

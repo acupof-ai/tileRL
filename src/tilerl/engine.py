@@ -1,48 +1,27 @@
 """Serving engine: submit/poll loop with one model forward per tick.
 
-Mirrors agent-infer's infer-core ``Engine`` (submit/step/poll) and infer-seam
-``StepLimits``, stripped to the day-1 contract.
+A tick runs ONE forward over the planned rows: every running decode row (T=1,
+or a 1+depth draft chain on a verify tick) plus prefill chunks up to
+``max_num_batched_tokens`` — vLLM/sglang continuous batching with chunked
+prefill, after agent-infer's ``build_forward_plan``. ponytail: chunked prefill
+is bounded by ``max_num_batched_tokens``; a prompt over ``max_total_tokens`` is
+still rejected at ``submit``. On CUDA a pure-decode tick
+replays a captured ``_DecodeGraph`` per batch-size bucket; mixed ticks and every
+other target run eager.
 
-Tick semantics: ONE forward per tick over a planned row set. A row is either
-a decode row (a running request, T=1) or ONE prefill chunk (the next slice of
-a waiting or chunking request's prompt, up to ``max_num_batched_tokens``
-minus the decode rows). A tick is therefore mixed (decode rows + the prefill
-chunk share one forward), decode-only, or prefill-only — vLLM/sglang
-continuous batching with chunked prefill, mirrored through agent-infer's
-``build_forward_plan`` (waiting/running queues, per-tick token budget, decode
-rows first; no preemption/swap day-1 — admission is capped at ``max_batch``).
-Speculation (optional, ``draft=``): a decode row drafts up to ``spec_depth``
-tokens off the trunk's last hidden, and the SAME forward verifies them as a
-seq_q = 1+depth row — no second code path. The trunk's paged KV needs no
-rollback (a rejected draft's slot is overwritten next tick), but the gated-delta
-recurrent state does: the verify forward keeps the state after every chain step
-(``BatchKv.keep_steps``) and the engine adopts the one at the accepted length.
-Spec ticks run eager; pure-decode ticks without a draft still replay the graph.
+Speculation (``draft=``): a decode row drafts up to ``spec_depth`` tokens and the
+same forward verifies them. Paged KV needs no rollback (a rejected draft's slot
+is overwritten next tick); the gated-delta state does, so the verify forward
+keeps the state after every chain step (``BatchKv.keep_steps``).
 
-The decode tick is a captured kernel sequence, not an interpreted one
-(design-engine.md): on CUDA, a pure-decode tick replays a per-batch-size
-``_DecodeGraph`` (static input buffers + static pools, captured lazily per
-bucket) instead of dispatching ~900 kernels per token; the eager path stays
-the default on other targets and the fallback on capture failure. Mixed
-ticks (decode rows + a prefill chunk) run eager.
-# ponytail: chunked prefill is bounded by ``max_num_batched_tokens``; a prompt
-# tail longer than ``max_total_tokens`` is still rejected at ``submit``.
+Prefix reuse adopts only block-aligned hits: retain the matched blocks and
+restore the gated-delta snapshot at the boundary (state + conv1d window), keyed
+by the matched token tuple. The engine is the sole publisher, so an entry
+without a snapshot can never be adopted. Full-length hits are misses.
 
-Prefix reuse: :class:`~tilerl.kv_cache.PrefixStore` may return hits of any
-length; the engine adopts only block-aligned prefixes (``BLOCK_TOKENS`` = 16):
-retain the matched blocks and restore a snapshot of the gated-delta state at
-the match boundary — both the recurrent state and the conv1d carry window — so
-the prefill forward computes only the tail. The engine is the sole publisher:
-after a forward it inserts the block-aligned prefix into the store (which
-retains the blocks) and snapshots the request's state slot, keyed by the
-matched token tuple (collision-safe). Only published boundaries are inserted —
-an entry without a snapshot can never be adopted. Full-length hits are misses
-day-1 (a read-only last-token forward is day-2).
-
-Determinism: sampling is per request with a deterministic per-step seed from
-``(params.seed, generated_count)``; forwards run under the engine lock. Same
-seed + input => same output on the CPU target. The engine is tokenizer-free —
-it speaks token ids only.
+Sampling is seeded per (request, position), so same seed + input => same
+output. The engine is tokenizer-free.
+# ponytail: no preemption/swap — admission is capped at ``max_batch``.
 """
 
 from __future__ import annotations
@@ -62,12 +41,8 @@ from .spec import survival, verify_lens
 
 _PREFILL_BUCKET = 64  # prefill widths are padded to this: bounded kernel shapes
 
-#: Decode-graph size ladder. A tick rounds UP to the first entry >= its row
-#: count and pads; without it every distinct batch size captured its own graph
-#: and its own memory pool.
+#: Decode-graph size ladder: a tick pads up to the first bucket >= its row count.
 _GRAPH_BUCKETS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)
-
-__all__ = ["Engine", "SamplingParams", "StepLimits", "BatchKv", "build_engine"]
 
 _PHASE_PREFILL = 1
 _PHASE_DECODE = 2
@@ -77,11 +52,7 @@ _HASH_MASK = 0x7FFFFFFF
 
 
 def _quantize_draft(params: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Re-serve a draft head's dense weights as block-quantized fp8.
-
-    Norms, embeddings and anything 1-D stay as they are; only the [N,K]
-    projections move, which is where all of the head's bulk and all of its time
-    is."""
+    """Re-serve a draft head's [N,K] projections as block-quantized fp8."""
     from tilerl_kernels import reference
 
     out: dict[str, torch.Tensor] = {}
@@ -94,12 +65,7 @@ def _quantize_draft(params: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 
 def _step_seed(seed: int, generated: int) -> int:
-    """Deterministic per-(request, position) sampling seed.
-
-    Both terms are full-width multiplicative hashes: a shift-then-mask would
-    keep only the seed's low bits (the old ``seed << 20`` form collapsed seeds
-    1/2049/16385 to one stream — OPD replays byte-identical rollouts past
-    step 2048)."""
+    # Full-width hashes: a shift-then-mask collapsed seeds 1/2049/16385 to one stream.
     return ((int(seed) * 2_654_435_761) ^ (generated * 2_246_822_519)) & _HASH_MASK
 
 
@@ -107,25 +73,15 @@ def _step_seed(seed: int, generated: int) -> int:
 class SamplingParams:
     temperature: float = 1.0
     top_p: float = 1.0
-    #: keep the k most likely logits before top-p; 0 = off. Qwen's
-    #: generation_config ships top_k=20, so sampling without it is off-distribution.
-    top_k: int = 0
+    top_k: int = 0  # 0 = off; Qwen's generation_config ships top_k=20
     max_new_tokens: int = 16
     seed: int = 0
     stop_token_ids: tuple[int, ...] = ()
-    #: restrict sampling to these ids (multiple-choice eval, constrained RL
-    #: actions); None = full vocabulary
-    allowed_ids: tuple[int, ...] | None = None
-    #: thinking effort: force ``end_think_ids`` after this many generated
-    #: tokens if the model has not closed its reasoning block itself. 0 = do
-    #: not think at all; None = unbounded. The ids are the caller's, so the
-    #: engine stays tokenizer-free.
+    allowed_ids: tuple[int, ...] | None = None  # restrict sampling to these ids
+    #: force ``end_think_ids`` after this many generated tokens; 0 = no thinking, None = unbounded
     thinking_budget: int | None = None
     end_think_ids: tuple[int, ...] = ()
-    #: also return log p of each sampled token under the temperature-scaled
-    #: distribution it was drawn from — what a policy gradient needs, and what
-    #: an eval needs to score a completion without a second forward.
-    logprobs: bool = False
+    logprobs: bool = False  # log p of each token under the distribution it was drawn from
 
 
 def _restrict(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
@@ -161,31 +117,21 @@ class _Req:
     output: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     thought_closed: bool = False  # the reasoning block ended (model's or forced)
-    #: trunk hidden [1,w,H] for absolute positions
-    #: ``[hidden_from .. hidden_from+w-1]`` — the draft head's fc input. The
-    #: WHOLE forward, not its last position: the draft runs over every position
-    #: it has not covered yet, and one position of overlap is what lets a
-    #: chunked prefill's runs meet without a gap (``hidden_prev``).
+    #: trunk hidden [1,w,H] at positions [hidden_from, hidden_from+w): the draft's fc input
     hidden: torch.Tensor | None = None
     hidden_prev: torch.Tensor | None = None  # [1,1,H] at hidden_from-1
     hidden_from: int = 0
-    #: highest absolute position whose draft KV belongs to a COMMITTED token.
-    #: A rejected chain writes past it; the next run overwrites those.
-    draft_pos: int = 0
+    draft_pos: int = 0  # highest position whose draft KV belongs to a committed token
     drafts: list[int] = field(default_factory=list)  # next tick's chain, minus its first token
 
 
 @dataclass
 class BatchKv:
-    """Batch-level KV descriptor for one model forward.
+    """Batch-level KV descriptor for one model forward (the model reads it duck-typed).
 
-    The engine's wire object; the model reads these attributes duck-typed.
-    ``seq_len`` is the logical length AFTER this forward per row (prefill row:
-    materialized length after its chunk; decode row: current length, the
-    sampled token lands at ``seq_len - 1``). ``seq_q_lens`` is the per-row
-    valid query count (decode row: 1, prefill row: the chunk length) — rows
-    are left-aligned and padded to a shared T; None means every row is valid
-    for the full T (training, captured decode).
+    ``seq_len`` is each row's logical length AFTER this forward. ``seq_q_lens`` is
+    the per-row valid query count; rows are left-aligned and padded to a shared T,
+    and None means every row is valid for the full T.
     """
 
     block_table: torch.Tensor  # [B, num_blocks] long, padded with 0
@@ -194,43 +140,25 @@ class BatchKv:
     kv_pool: Any
     state_pool: Any
     seq_q_lens: torch.Tensor | None = None  # [B] valid query tokens per row
-    #: speculative verify: keep the recurrent state after each of the first
-    #: ``keep_steps`` chain tokens, so the accepted length can select one.
-    keep_steps: int = 0
+    keep_steps: int = 0  # verify: keep the recurrent state after each of the first N chain tokens
 
 
 class _DecodeGraph:
-    """Captured decode forward for one batch-size bucket.
-
-    The decode tick is a static kernel sequence — same ops, same shapes,
-    every token (design-engine.md). Capture ``model.forward`` once and replay
-    per token: per-tick cost is one graph replay plus small H2D copies of the
-    per-tick inputs (token id, position, block table, seq_len, state slot).
-
-    Inside the graph: embedding, every layer op (norms, linears, RoPE, KV
-    scatter, paged attention / fused GDN, state gather-scatter, MLP), final
-    norm, lm_head. Outside (host work or syncing): block allocation, the
-    input copies, sampling, prefix publish.
-
-    The static KV/state pools are the engine's own — replay mutates them,
-    exactly like the eager path. The warmup forwards write dummy data into
-    block 0 / slot 0; real requests overwrite every pool position before it
-    is read (prefill writes [0, prompt_len), decodes append), and slots are
-    zeroed on alloc, so the dummy data is never observable.
-
-    # ponytail: capture at engine build time day-2 — lazy on the first
-    # decode tick today, so first token pays JIT + capture.
-    # ponytail: recapture after training day-2 — the graph bakes weight
-    # pointers (fine, optimizer updates in place) but also the f32 embed
-    # cast, which the optimizer's copy_ invalidates in eager only.
+    """Captured ``model.forward`` for one (batch, width) bucket: per tick, small
+    H2D copies of the inputs plus one replay. Replay mutates the engine's own
+    pools like the eager path; warmup writes to block 0 / slot 0 are overwritten
+    before any real request reads them.
+    # ponytail: captured lazily on the first decode tick (first token pays JIT +
+    # capture); capture at engine build is the upgrade.
+    # ponytail: captured lazily on the first decode tick, so first token pays JIT + capture.
+    # ponytail: no recapture after training — the graph bakes the f32 embed cast.
     """
 
     def __init__(self, model, backend, kv_pool, state_pool, batch_size, width=1, pool=None,
                  last_only=False, keep=0):
         device = backend.device
         B, W = batch_size, width
-        # int32 end to end: every consumer is a kernel taking int32, and a
-        # long buffer costs an int64->int32 cast launch per use inside the graph.
+        # int32 end to end: a long buffer costs a cast launch per use inside the graph.
         self._b = B
         self._w = W
         self._ids = torch.empty(B, W, dtype=torch.int32, device=device)
@@ -238,16 +166,9 @@ class _DecodeGraph:
         self._bt = torch.zeros(B, kv_pool.num_blocks, dtype=torch.int32, device=device)
         self._sl = torch.empty(B, dtype=torch.int32, device=device)
         self._ss = torch.empty(B, dtype=torch.int32, device=device)
-        # Every row carries the same W query tokens — a plain decode tick, or a
-        # speculative verify of one fixed-length chain. A static GPU buffer (not
-        # a per-tick CPU copy) keeps seq_q_lens out of the captured region: the
-        # kernels' CPU->GPU fallback breaks CUDA graph capture. Uniform W is why
-        # a captured spec tick cannot use verify_lens' per-row trim.
+        # Uniform W per row, as a static device buffer: a CPU->GPU fallback breaks capture.
         self._sql = torch.full((B,), W, dtype=torch.int32, device=device)
-        # Pinned staging buffers: a plain copy_ from an unpinned CPU tensor is
-        # synchronous (it blocks until the copy engine drains), which under
-        # GPU contention costs ms per tick. Pinned + non_blocking makes the
-        # H2D copies async — stream ordering keeps replay after them.
+        # Pinned staging: an unpinned H2D copy_ is synchronous, ms per tick under contention.
         self._ids_h = torch.empty(B, W, dtype=torch.int32, pin_memory=True)
         self._pos_h = torch.empty(B, W, dtype=torch.int32, pin_memory=True)
         self._bt_h = torch.zeros(B, kv_pool.num_blocks, dtype=torch.int32, pin_memory=True)
@@ -260,14 +181,9 @@ class _DecodeGraph:
             kv_pool=kv_pool,
             state_pool=state_pool,
             seq_q_lens=self._sql,
-            # Only a verify tick keeps the recurrent state after every chain
-            # step; the step buffers are static, so the write captures like any
-            # other kernel. A prefill chunk is also W>1 and must NOT ask for
-            # them — its pool has none, and the request dies mid-capture.
-            keep_steps=keep,
+            keep_steps=keep,  # verify ticks only; a W>1 prefill chunk has no step buffers
         )
-        # Warmup on a side stream: tilelang JIT-compiles per (shape, dtype),
-        # and JIT is host work — it must finish before capture starts.
+        # Warmup on a side stream: tilelang JIT (host work) must finish before capture.
         self._ids.fill_(0)
         self._pos.fill_(0)
         self._sl.fill_(W)
@@ -280,34 +196,20 @@ class _DecodeGraph:
         torch.cuda.current_stream().wait_stream(s)
         self._graph = torch.cuda.CUDAGraph()
         hid: list = []
-        # One memory pool shared by every bucket's graph. Without it each
-        # capture takes a private pool that is never returned, so the ladder's
-        # seven buckets cost seven copies of a decode tick's whole working
-        # set. Only one graph replays at a time and the logits contract is
-        # already "valid until the next replay", so sharing is safe - it is
-        # what vLLM and sglang do.
+        # One memory pool across buckets: a private pool per graph is never returned.
         with torch.cuda.graph(self._graph, pool=pool):
             self._logits = model.forward(self._ids, self._pos, self._kv, backend,
                                          hidden_out=hid, last_only=last_only)
-        # Captured, so this tensor is rewritten in place by every replay — the
-        # draft head reads the previous tick's hidden from it directly.
-        self.hidden = hid[-1] if hid else None
+        self.hidden = hid[-1] if hid else None  # rewritten in place by every replay
 
     def run(self, reqs, chains=None, pad=None):
-        """Copy per-tick inputs into the static buffers and replay.
-
-        Returns the static logits [B,W,V]; valid until the next replay.
-        ``chains[i]`` is row i's ``[last committed token, drafts...]``, all of
-        length W. ``pad`` is ``(state_slot, block)`` for the rows beyond
-        ``len(reqs)``: a captured graph runs its full width every replay, so
-        those rows still WRITE to the KV and recurrent pools. Leaving them on
-        a finished request's slot would let them overwrite whatever request
-        was given that slot next.
-        """
+        """Copy per-tick inputs into the static buffers and replay; returns the
+        static logits [B,W,V], valid until the next replay. ``chains[i]`` is row
+        i's ``[last committed token, drafts...]``. ``pad`` is ``(state_slot,
+        block)`` for rows beyond ``len(reqs)``: padding rows still write to
+        the pools, so they must not land on a slot a live request owns."""
         for i, r in enumerate(reqs):
             if r.phase == _PHASE_PREFILL:
-                # A prefill chunk is the same static shape as a decode chain —
-                # the engine buckets its width — so it captures the same way.
                 start = r.prefill_from
                 for j, tok in enumerate(r.tokens[start : start + self._w]):
                     self._ids_h[i, j] = tok
@@ -365,40 +267,26 @@ class Engine:
         self._prefix = prefix_store
         self.limits = limits
 
-        # Captured decode (design-engine.md): the decode tick is replayed,
-        # not interpreted. Auto-on for CUDA; the eager path stays the
-        # default/fallback everywhere else and on capture failure.
         if decode_graph is None:
             decode_graph = backend.device.type == "cuda"
         self._decode_graph_on = decode_graph
         self._decode_graphs: dict = {}
-        # Reserved LAZILY, on the first tick that actually pads: a replay runs
-        # its full captured width and the padding rows still write to both
-        # pools, so they must not land on a slot a live request owns. Taking
-        # them at construction would shrink every engine's usable pool by one
-        # slot even when nothing ever pads.
+        # Padding rows of a replay still write to both pools; reserved lazily on
+        # the first tick that pads, so an engine that never pads keeps the slot.
         self._pad_slot: int | None = None
         self._pad_block: int | None = None
         self._graph_pool = None
 
-        # Speculation: the draft is one full-attn stack with its OWN kv plane
-        # and no recurrent state — it must never reach the trunk's GDN slots.
-        # The plane spans the trunk's whole block space and is indexed by the
-        # request's own block list, so the draft attends over the same prefix
-        # the trunk does. A chain-local block would leave its attention reading
-        # ONE token (softmax over one position is the identity on v), which is
-        # what made the loop's acceptance 55.8% against the probe's 84.4%.
+        # The draft has its own KV plane over the trunk's whole block space, so
+        # it attends over the same prefix the trunk does (a chain-local block
+        # dropped acceptance from 84.4% to 55.8%).
         self._draft = draft
         self._spec_depth = spec_depth if draft is not None else 0
         if draft is not None:
-            # The head ships dense bf16, which Backend.linear serves on its
-            # generic path at ~30 GB/s: 9.7 ms per projection against 0.13 ms
-            # for the same shape on the trunk's fp8 kernel, so one draft step
-            # cost more than the whole 64-layer trunk forward. Serve it the way
-            # the trunk is served — Model._linear picks .w8/.wscale up itself.
+            # Dense bf16 on Backend.linear's generic path was 9.7 ms per projection
+            # vs 0.13 ms on the fp8 kernel; serve it the way the trunk is served.
             served = backend.materialize(_quantize_draft(draft.params))
-            # In place, never rebound: DraftHead.layers is a Model holding THIS
-            # dict, and a fresh one leaves it reading the original bf16 weights.
+            # In place: DraftHead.layers is a Model holding THIS dict.
             draft.params.clear()
             draft.params.update(served)
             if not 0 < spec_depth < BLOCK_TOKENS:
@@ -421,11 +309,8 @@ class Engine:
         self._failed: dict[int, str] = {}
         self._finished_count = 0
 
-        # Prefix-boundary state snapshots, keyed by the matched token tuple
-        # (collision-safe: a hash-only key could restore the wrong GDN state on
-        # a hash collision). One snapshot is 74.81 MiB at 27B, so it lives and
-        # dies with its store entry: the store drops ours on eviction, and a
-        # key present here is exactly a key the store still holds.
+        # Prefix-boundary state snapshots keyed by token tuple (74.81 MiB each at
+        # 27B), dropped with their store entry on eviction.
         self._prefix_state: dict[tuple[int, ...], tuple[torch.Tensor, "torch.Tensor | None"]] = {}
         prefix_store.on_evict = lambda tokens: self._prefix_state.pop(tokens, None)
 
@@ -441,21 +326,14 @@ class Engine:
         self._spec_drafted = 0
         self._spec_accepted = 0
         self._finished_logprobs: dict[int, list[float]] = {}
-        #: ids whose scores a reader already took -- lets logprobs() tell "never
-        #: asked" (None) from "already consumed" (raise). Unbounded by design here:
-        #: an id is 8 bytes and a run is thousands, not millions.
         self._taken_logprobs: set[int] = set()
         self._last_logprobs: list[float] | None = None
 
     # ------------------------------------------------------------------ API
 
     def submit(self, input_ids: Any, params: SamplingParams | None = None) -> int:
-        """Queue a request; returns its opaque id.
-
-        Performs prefix lookup immediately: a block-aligned hit retains the
-        matched blocks and restores the boundary state, the tail gets fresh
-        blocks, and a linear state slot is allocated.
-        """
+        """Queue a request; returns its opaque id. Prefix lookup, block and
+        state-slot allocation happen here, not at admission."""
         if params is None:
             params = SamplingParams()
         tokens = [int(t) for t in input_ids]
@@ -480,9 +358,8 @@ class Engine:
                 return rid
 
             matched, hit_blocks = self._match_prefix(tokens)
-            # Read the snapshot now: evict_until_free below can drop the very
-            # store entry we matched, and on_evict takes the snapshot with it.
-            snap = self._prefix_state[self._snapshot_key(tokens[:matched])] if matched else None
+            # Read the snapshot now: evict_until_free below can drop the matched entry.
+            snap = self._prefix_state[tuple(tokens[:matched])] if matched else None
             if matched:
                 self._prefix_hits += 1
             else:
@@ -496,9 +373,7 @@ class Engine:
                 for b in blocks:
                     self._kv.retain(b)  # adopt the store's blocks
                 needed = total_blocks - len(blocks)
-                evict = getattr(self._prefix, "evict_until_free", None)
-                if evict is not None:
-                    evict(needed)
+                self._prefix.evict_until_free(needed)
                 if self._kv.free_blocks < needed:
                     raise RuntimeError("insufficient KV blocks for request")
                 while len(blocks) < total_blocks:
@@ -543,20 +418,10 @@ class Engine:
             return out
 
     def logprobs(self, request_id: int) -> list[float] | None:
-        """log p of each returned token, or None unless the request asked.
-
-        Pops: take() drains the tokens and this drains the scores, so a served
-        request leaves nothing behind.
-
-        A SECOND read of the same id raises. Both "never asked for scores" and
-        "someone already took them" would otherwise return None, and the second
-        one is a bug that cannot be seen at the call site: the RL path compares
-        the shim's recorded token ids against the transcript's, and a silently
-        empty score list makes that comparison fail with nothing to point at.
-        Consumed ids are remembered rather than forgotten, which is what lets
-        the two cases be told apart.
-        # ponytail: a caller that asks for scores and never reads them holds
-        # them until the engine is dropped; a TTL sweep is the upgrade path.
+        """log p of each returned token, or None unless the request asked. Pops;
+        a second read of the same id raises, so "never asked" and "already
+        taken" stay distinguishable at the RL call site.
+        # ponytail: scores nobody reads live until the engine is dropped; a TTL sweep is the upgrade.
         """
         with self._lock:
             if request_id in self._finished_logprobs:
@@ -570,11 +435,7 @@ class Engine:
             return None
 
     def take(self, request_id: int) -> list[int] | None:
-        """Pop one finished request's output, or None if not finished yet.
-
-        Unlike :meth:`poll`, this is safe for multiple concurrent consumers:
-        each caller only observes its own request.
-        """
+        """Pop one finished request's output, or None if not finished yet."""
         with self._lock:
             message = self._failed.pop(request_id, None)
             if message is not None:
@@ -582,8 +443,7 @@ class Engine:
             return self._finished.pop(request_id, None)
 
     def step(self) -> None:
-        """Run one tick: one forward over the planned rows (mixed
-        prefill+decode, decode-only, or prefill-only)."""
+        """Run one tick: one forward over the planned rows."""
         with self._lock:
             decodes, prefills, chunks = self._build_plan()
             if not decodes and not prefills:
@@ -596,23 +456,9 @@ class Engine:
                 raise
 
     def _build_plan(self) -> tuple[list[_Req], list[_Req], list[int]]:
-        """Plan one tick, mirroring agent-infer's ``build_forward_plan``.
-
-        Admit as many waiting requests as ``max_batch`` allows, then take
-        all running decodes as decode rows and as many prefill rows as the
-        per-tick token budget (``max_num_batched_tokens`` minus the decode
-        rows) and one width bucket allow. A prompt longer than the budget
-        stays in PREFILL and is chunked across ticks.
-
-        One prefill row per tick left the budget mostly idle: a 16-token
-        prompt used 16 of 512, so a burst of short prompts prefilled one per
-        forward. That is the shape a synthetic-data workload has.
-
-        Admission is a whole pass, not one request per tick: a burst of B
-        submissions used to need B ticks just to reach the running queue, so
-        every tick of the ramp ran a batch smaller than the one that was
-        asked for. vLLM/sglang schedule the whole waiting queue each pass.
-        """
+        """Admit the whole waiting queue up to ``max_batch``, then all running
+        decodes plus as many prefill rows as the token budget and one width
+        bucket allow; a longer prompt stays in PREFILL and chunks across ticks."""
         while self._waiting and len(self._running) < self.limits.max_batch:
             self._running.append(self._waiting.popleft())
         decodes = [r for r in self._running if r.phase == _PHASE_DECODE]
@@ -628,10 +474,7 @@ class Engine:
             chunk = min(len(r.tokens) - r.prefill_from, budget)
             if chunk <= 0:
                 break
-            # Rows are padded to a shared width, so packing a 16-token prompt
-            # beside a 512-token one would compute 512 wide for both. The
-            # width is bucketed anyway: pack only within one bucket and the
-            # padding costs nothing.
+            # Rows pad to a shared width: pack only within one bucket.
             b = -(-chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
             if prefills and b != bucket:
                 break
@@ -663,19 +506,15 @@ class Engine:
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
-            total_blocks = getattr(self._kv, "num_blocks", None)
-            total_slots = getattr(self._states, "num_slots", None)
-            if total_slots is None and hasattr(self._states, "states"):
-                total_slots = int(self._states.states.shape[0])
             return {
                 "waiting": len(self._waiting),
                 "running": len(self._running),
                 "finished": self._finished_count,
                 "blocks_used": self._blocks_used,
-                "blocks_total": total_blocks,
-                "pool_used_blocks": getattr(self._kv, "used_blocks", None),
+                "blocks_total": self._kv.num_blocks,
+                "pool_used_blocks": self._kv.used_blocks,
                 "slots_used": self._slots_used,
-                "slots_total": total_slots,
+                "slots_total": self._states.num_slots,
                 "prefix_hits": self._prefix_hits,
                 "prefix_misses": self._prefix_misses,
                 "prefix_published": self._prefix_published,
@@ -690,43 +529,26 @@ class Engine:
     # -------------------------------------------------------------- internals
 
     def _match_prefix(self, tokens: list[int]) -> tuple[int, list[int]]:
-        """Longest block-aligned prefix hit, or (0, []).
-
-        Full-length hits are treated as misses day-1 (no read-only last-token
-        forward yet). A hit whose boundary snapshot is missing also degrades
-        to a miss — the engine is the sole publisher, so this only guards
-        against bookkeeping drift.
-        """
+        """Longest block-aligned prefix hit with a snapshot, or (0, []); a full-length hit is a miss."""
         hit = self._prefix.lookup(tokens)
         if hit is None:
             return 0, []
         matched = (hit.length // BLOCK_TOKENS) * BLOCK_TOKENS
         if matched == 0 or matched >= len(tokens):
             return 0, []
-        if self._snapshot_key(tokens[:matched]) not in self._prefix_state:
+        if tuple(tokens[:matched]) not in self._prefix_state:
             return 0, []
         return matched, list(hit.blocks[: matched // BLOCK_TOKENS])
 
-    @staticmethod
-    def _snapshot_key(tokens: list[int]) -> tuple[int, ...]:
-        """Collision-safe key for a prefix's boundary-state snapshot."""
-        return tuple(tokens)
-
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0) -> BatchKv:
-        # Fixed width = pool size: the kernels bake the table width into the
-        # compiled kernel (Mb is a compile const), so a per-tick max-blocks
-        # width recompiles on every block growth. Rows zero-pad; the kernels
-        # index by position bounded by seq_lens, so padding is never read.
+        # Table width = pool size: the kernels compile it in, so a per-tick width recompiles.
         bt = torch.zeros(len(reqs), self._kv.num_blocks, dtype=torch.long, pin_memory=self._pin)
         sl = torch.empty(len(reqs), dtype=torch.long, pin_memory=self._pin)
         ss = torch.empty(len(reqs), dtype=torch.long, pin_memory=self._pin)
         sql = torch.empty(len(reqs), dtype=torch.long, pin_memory=self._pin)
         for i, r in enumerate(reqs):
             bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
-            # Materialized length AFTER this forward: a prefill row completes
-            # its chunk (prefill_from is the chunk start); a decode row writes
-            # its chain at [seq_len-1, seq_len-1+seq_q), so the post-write
-            # length is seq_len-1+seq_q (== seq_len for a plain T=1 decode).
+            # Length after this forward; a decode row's chain starts at seq_len-1.
             sl[i] = (
                 r.prefill_from + seq_q[i]
                 if r.phase == _PHASE_PREFILL
@@ -735,11 +557,7 @@ class Engine:
             ss[i] = r.state_slot
             sql[i] = seq_q[i]
         if self._pin:
-            # Move once here, not once per layer inside every kernel's _dev:
-            # these four are built on the host and read by ~4 kernels per layer,
-            # and an unpinned H2D copy is SYNCHRONOUS. A 64-layer prefill issued
-            # 971 pageable copies, which is host stall the GPU-busy total cannot
-            # see (2058 tok/s GPU-bound against 1836 end to end).
+            # Move once here, not per layer inside every kernel (971 pageable copies a prefill).
             dev = self._backend.device
             bt = bt.to(dev, non_blocking=True)
             sl = sl.to(dev, non_blocking=True)
@@ -756,15 +574,8 @@ class Engine:
         )
 
     def _run_forward(self, decodes: list[_Req], prefills: list[_Req], chunks: list[int]) -> None:
-        """Run one mixed/decode/prefill forward over the planned rows.
-
-        Rows are left-aligned valid tokens padded to a shared T (decode rows:
-        1 token, or a 1+depth draft chain on a verify tick; the prefill row:
-        its chunk), with per-row ``seq_q_lens`` so the kernels touch only valid
-        positions.
-        """
-        # Speculate on pure-decode ticks only: a mixed tick's width is the
-        # bucketed prefill chunk, which the step-state buffers cannot cover.
+        # Speculate on pure-decode ticks only: the step-state buffers cannot
+        # cover a bucketed prefill width.
         chains = (
             [[r.output[-1], *r.drafts] for r in decodes]
             if self._draft is not None and decodes and not prefills
@@ -773,15 +584,10 @@ class Engine:
         if chains is not None and max(map(len, chains)) == 1:
             chains = None  # the policy kept nothing: a plain decode tick
         elif chains is not None and self._decode_graph_on:
-            # One graph per (B, width): pad every row to the widest chain so the
-            # captured shape is fixed. verify_lens' per-row trim cannot survive
-            # capture, and the marginal cost of a wider row inside a replay is
-            # far below the 7.9x the graph itself is worth.
+            # One graph per (B, width): pad to the widest chain. A repeated pad
+            # token is just a draft that gets rejected.
             w = max(map(len, chains))
             for c in chains:
-                # Any pad token is correct: a draft is only ever accepted when
-                # it equals what the trunk sampled there, so a repeat is simply
-                # a draft that gets rejected.
                 c.extend([c[-1]] * (w - len(c)))
         q_dec = [len(c) for c in chains] if chains else [1] * len(decodes)
         growth = sum(
@@ -789,12 +595,9 @@ class Engine:
             for r, q in zip(decodes, q_dec)
         )
         if growth:
-            evict = getattr(self._prefix, "evict_until_free", None)
-            if evict is not None:
-                evict(growth)
+            self._prefix.evict_until_free(growth)
         for r, q in zip(decodes, q_dec):
-            # Blocks must cover the chain's last position, r.seq_len-1+q.
-            # Exhaustion raises -> step() finishes the running requests.
+            # Cover the chain's last position; exhaustion raises and step() fails the batch.
             while len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 1 + q:
                 r.blocks.append(self._kv.alloc_block())
                 r.own_blocks += 1
@@ -808,13 +611,8 @@ class Engine:
             return
         rows = decodes + prefills
         seq_q = q_dec + chunks
-        # Bucket the forward width: tilelang kernels specialize on the shape,
-        # so a width equal to the prompt length compiles a kernel set per
-        # distinct prompt (MMLU: 662 variants in 20 min, GPU idle). Padding
-        # rows are masked by seq_q_lens everywhere; the true chunk indexes the
-        # logits below.
-        # A verify width is exact (a handful of shapes, 1+depth at most); only
-        # a real prefill chunk is bucketed.
+        # Bucket a prefill width: kernels specialize per shape (MMLU compiled
+        # 662 variants). A verify width is exact, at most 1+depth.
         chunk = max(chunks, default=0)
         width = -(-max(seq_q) // _PREFILL_BUCKET) * _PREFILL_BUCKET if chunk > 1 else max(seq_q)
         input_ids = np.zeros((len(rows), width), dtype=np.int64)
@@ -831,16 +629,11 @@ class Engine:
         hid: list | None = [] if self._draft else None
         logits = self._model.forward(
             input_ids, positions, self._make_kv(rows, seq_q, width if chains else 0),
-            # Per-row valid lengths: a mixed tick's decode rows end at 1
-            # while the prefill row spans the width, and lm_head must not run
-            # over the padding. A verify tick needs every chain position, so
-            # it opts out entirely.
             self._backend, hidden_out=hid,
-            last_only=False if chains else seq_q,
+            last_only=False if chains else seq_q,  # a verify tick needs every chain position
         )
         if hid is not None:
-            for i, r in enumerate(rows):  # the draft's fc input, whole width
-                # hidden_out is appended before last_only's slice: always full width
+            for i, r in enumerate(rows):  # hidden_out is full width, appended before last_only
                 r.hidden_prev = None if r.hidden is None else r.hidden[:, -1:]
                 r.hidden = hid[-1][i : i + 1, : seq_q[i]]
                 r.hidden_from = int(positions[i, 0])
@@ -850,22 +643,15 @@ class Engine:
             self._sample_commit([(r, logits[i, 0], len(r.output)) for i, r in enumerate(decodes)])
         if prefills:
             self._prefill_forwards += 1
-            # last_only may have collapsed the T axis to the final token.
             self._finish_prefills(prefills, chunks, logits, len(decodes))
         if decodes:
             self._decode_forwards += 1
         if decodes and prefills:
             self._mixed_forwards += 1
         if self._draft is not None:
-            # Every tick that materialized tokens, not just pure-decode ones: a
-            # chunked prefill would otherwise leave the chunks it did not draft
-            # over with no KV, and the draft's attention would read them.
-            self._draft_step(rows)
+            self._draft_step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
 
     def _finish_prefills(self, prefills: list[_Req], chunks: list[int], logits, base: int) -> None:
-        """Advance every prefill row by its chunk and, for the ones that
-        completed their prompt, sample the first token in ONE batched call and
-        publish the prefix."""
         done = []
         for k, (pf, c) in enumerate(zip(prefills, chunks)):
             pf.prefill_from += c
@@ -876,8 +662,7 @@ class Engine:
             return
         self._sample_commit(done)
         for pf, _, _ in done:
-            # Publish the prompt prefix at a block boundary: the state slot
-            # still covers exactly the prompt tokens, so the snapshot is exact.
+            # The state slot still covers exactly the prompt, so the snapshot is exact.
             prompt_len = len(pf.tokens) - len(pf.output)
             if pf.phase != _PHASE_DONE and prompt_len % BLOCK_TOKENS == 0:
                 self._publish_prefix(pf, prompt_len)
@@ -888,17 +673,9 @@ class Engine:
                     pf.phase = _PHASE_DECODE
 
     def _run_decode_graph(self, reqs: list[_Req], chains=None) -> bool:
-        """Captured decode for a pure-decode tick, one graph per SIZE BUCKET.
-
-        Capturing per exact batch size meant a batch draining from 32 to 1
-        captured up to 32 graphs, each holding its own CUDA graph memory pool
-        - tens of GiB that never come back, and the reason B=64 hit OOM
-        during the drain while steady-state decode peaked at 39 GiB. vLLM and
-        sglang capture a fixed ladder and pad up to it; same here.
-
-        Returns False (and flips the flag off) when capture failed, so the
-        caller runs eager.
-        """
+        """Captured decode for a pure-decode tick, one graph per size bucket (a
+        graph per exact size OOMed B=64 on the drain). Returns False and flips
+        the flag off when capture failed, so the caller runs eager."""
         n, W = len(reqs), len(chains[0]) if chains else 1
         B = next((c for c in _GRAPH_BUCKETS if c >= n), None)
         if B is None or self.limits.max_batch < B:
@@ -927,8 +704,6 @@ class Engine:
         logits = g.run(reqs, chains, pad=pad)
         self._decode_forwards += 1
         if chains:
-            # No hidden from a replay: the next tick's draft reads it from the
-            # graph's own static buffer, which the model wrote during capture.
             self._verify(reqs, chains, logits, g.hidden)
         else:
             if self._draft is not None and g.hidden is not None:
@@ -941,15 +716,10 @@ class Engine:
         return True
 
     def _draft_step(self, rows: list[_Req]) -> None:
-        """Draft over every position a row materialized but has not drafted yet.
-
-        Position q consumes the trunk hidden at q-1 and the token at q, so the
-        run spans ``[draft_pos+1 .. seq_len-1]`` and its LAST position is the
-        draft for the next token: the KV fill and the draft are ONE forward,
-        and the draft's attention never meets a gap. Runs at the END of a tick,
-        while the trunk's hiddens are still live; the chain it leaves in
-        ``r.drafts`` is what the next tick verifies.
-        """
+        """Draft over every position a row materialized but has not drafted yet:
+        position q consumes the trunk hidden at q-1 and the token at q, so the
+        run spans ``[draft_pos+1 .. seq_len-1]`` and its last position drafts
+        the next token. Leaves next tick's chain in ``r.drafts``."""
         dev = self._backend.device
         plan = []
         for r in rows:
@@ -975,8 +745,7 @@ class Engine:
             bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
             sl.append(hi + 1)
             sq.append(q)
-            # hidden at [lo-1 .. hi-1]; hidden_prev supplies the one position
-            # that belongs to the previous forward.
+            # hidden at [lo-1 .. hi-1]; hidden_prev supplies the previous forward's position
             h, base = r.hidden, r.hidden_from
             if r.hidden_prev is not None:
                 h, base = torch.cat([r.hidden_prev, r.hidden], dim=1), base - 1
@@ -1003,19 +772,15 @@ class Engine:
         chains = [[int(t)] for t in tok[:, -1].tolist()]
         for i, (r, _, hi) in enumerate(plan):
             if r.draft_pos == 0:
-                # Position 0 is never drafted (a draft at q reads the hidden at
-                # q-1), but attention over [0, seq_len) still reads its page —
+                # Position 0 is never drafted but attention still reads its page,
                 # which a recycled block leaves holding another request's.
                 b = r.blocks[0]
                 self._draft_kv.k_pool[:, b, :, 0, :] = 0
                 self._draft_kv.v_pool[:, b, :, 0, :] = 0
             r.draft_pos = hi
 
-        # Remaining chain steps, one position each. Bounded by the blocks the
-        # row already owns: this runs after the tick's allocation, and a write
-        # past them would land on another request's page.
-        # ponytail: clamps the chain instead of allocating; a row at a block
-        # boundary drafts shorter for one tick.
+        # Remaining chain steps, one position each, bounded by the blocks the row owns.
+        # ponytail: clamps the chain instead of allocating; a row at a block boundary drafts shorter.
         for j in range(1, self._spec_depth):
             live = [i for i, (r, _, hi) in enumerate(plan)
                     if hi + j < len(plan[i][0].blocks) * BLOCK_TOKENS]
@@ -1053,13 +818,9 @@ class Engine:
 
     def _verify(self, rows, chains, logits, hidden) -> None:
         """Accept the leading run of drafts the trunk agrees with, adopt the
-        recurrent state at that length, and commit the accepted prefix plus the
-        trunk's own bonus token.
-
-        Sampling is per (row, chain position) with the same per-generated-index
-        seed a T=1 rollout would use, so an accepted token is bit-identical to
-        the unspeculated one. Rejected drafts leave KV past the new length,
-        which the next tick overwrites."""
+        recurrent state at that length, and commit the prefix plus the trunk's
+        bonus token. Seeds are per generated index, so an accepted token is
+        bit-identical to the unspeculated one."""
         flat = [
             (r, logits[i, j], len(r.output) + j)
             for i, r in enumerate(rows)
@@ -1082,29 +843,19 @@ class Engine:
                          None if lps is None else lps[at - len(chains[i]) : at][: n_ok + 1])
 
     def _sample_batch(self, rows: list[tuple]) -> list[int]:
-        """Batched sampling for a decode tick: one sort/softmax over all rows
-        instead of B per-row calls (8.2% of the B=8 slice tick was 8 separate
-        sorts + D2H syncs). Per-row seeds keep the draws identical to the
-        per-row path. Returns the sampled tokens; the caller commits them (a
-        verify tick samples every chain position and commits only the
-        accepted prefix)."""
+        """One batched sample over all rows (B per-row sorts were 8.2% of a B=8
+        tick); per-row seeds keep the draws identical. The caller commits."""
         if not rows:
             return []
         logits = torch.stack([_restrict(l, r.params) for r, l, _ in rows])
         dev = logits.device
-        # Host-side: sample_batch branches on them, and shipping them to the
-        # device only to read them back was 2 syncs a tick plus one per row.
         temps = [r.params.temperature for r, _, _ in rows]
         top_ps = [r.params.top_p for r, _, _ in rows]
         seeds = [_step_seed(r.params.seed, g) for r, _, g in rows]
         toks = self._backend.sample_batch(logits, temps, top_ps, seeds).tolist()
         if any(r.params.logprobs for r, _, _ in rows):
-            # From the SAME logits the draw used. Temperature > 0 scores under
-            # the SAMPLING distribution, which is what a policy gradient needs.
-            # Temperature 0 scores under the model's own (t=1) distribution:
-            # the greedy point mass would report log p = 0 for every token,
-            # which is true and useless — and greedy is exactly the eval case
-            # that wants the model's real score.
+            # Score under the sampling distribution; greedy (t=0) under t=1, since
+            # the point mass would report log p = 0 for every token.
             t = torch.tensor([x if x > 0 else 1.0 for x in temps], device=dev).reshape(-1, 1)
             lp = torch.log_softmax(logits.float() / t, dim=-1)
             idx = torch.tensor(toks, device=dev).reshape(-1, 1)
@@ -1114,21 +865,15 @@ class Engine:
         return toks
 
     def _sample_commit(self, rows: list[tuple]) -> None:
-        """Sample one token per row and commit it (every non-verify path)."""
         toks = self._sample_batch(rows)
         lps = self._last_logprobs
         for i, ((r, _, _), tok) in enumerate(zip(rows, toks)):
             self._commit(r, [tok], None if lps is None else [lps[i]])
 
     def _commit(self, req: _Req, toks: list[int], lps: list[float] | None = None) -> None:
-        """Append sampled tokens in order, stopping at the first one the
-        request did not take verbatim (finished, or a forced end-think
-        rewrite).
-
-        Only the last token of a chain may publish its prefix: the snapshot
-        holds the recurrent state at the END of the commit, so a boundary
-        crossed earlier in the chain is skipped (a missed cache entry, never a
-        poisoned one)."""
+        """Append sampled tokens in order, stopping at the first one the request
+        did not take verbatim. Only the chain's last token may publish a prefix:
+        the snapshot holds the state at the END of the commit."""
         p = req.params
         n, last = len(p.end_think_ids), len(toks) - 1
         for i, raw in enumerate(toks):
@@ -1163,28 +908,19 @@ class Engine:
 
     def _publish_prefix(self, req: _Req, length: int) -> None:
         """Insert tokens[:length] into the store (it retains the blocks) and
-        snapshot the request's linear state at that boundary.
-
-        Only the full-length entry is inserted: it is the only boundary whose
-        state is snapshotted here, so shorter intermediate spans could never
-        be adopted by :meth:`_match_prefix` (a hit without a boundary snapshot
-        degrades to a miss). A later query that shares this prefix up to a
-        smaller block boundary hits an entry published at THAT length by some
-        other request.
-        """
+        snapshot the request's linear state at that boundary."""
         tokens = req.tokens[:length]
         self._prefix.insert(tokens, req.blocks[: length // BLOCK_TOKENS])
-        key = self._snapshot_key(tokens)
+        key = tuple(tokens)
         if key not in self._prefix_state:
             self._prefix_state[key] = (
                 self._states.states[req.state_slot].clone(),
                 self._states.window_snapshot(req.state_slot),
             )
-            self._prefix_published += 1  # snapshots written; an evicted prefix republishes
+            self._prefix_published += 1
 
     def _finish(self, req: _Req, error: str | None = None) -> None:
-        # Resources are freed at finish (not at poll) so pool capacity returns
-        # immediately; poll only retrieves the output tokens.
+        # Freed here, not at poll, so pool capacity returns immediately.
         req.phase = _PHASE_DONE
         for b in req.blocks:
             self._kv.free_block(b)
@@ -1208,17 +944,12 @@ class Engine:
                 try:
                     self.step()
                 except Exception:
-                    # ponytail: log-and-continue; a crashed daemon thread
-                    # hangs the server silently. Proper backpressure (retry
-                    # after block free) is the day-2 upgrade path.
+                    # ponytail: log-and-continue (a crashed daemon hangs the server); backpressure is the upgrade.
                     import traceback
 
                     traceback.print_exc()
             else:
                 self._wake.wait(0.005)
-
-
-# --- Engine wiring: one factory for every caller (CLI, tests) ---------------
 
 
 def build_engine(
@@ -1236,16 +967,8 @@ def build_engine(
     draft: Any = None,
     spec_depth: int = 4,
 ) -> "Engine":
-    """Wire a model + backend into a running Engine (pools + prefix store).
-
-    ``cfg`` is a :class:`~tilerl.config.ModelConfig`; the factory derives the
-    pool shapes from it. Pass ``prefix_store`` to inject a test double (e.g. a
-    never-match store for the miss path). ``decode_graph`` auto-enables the
-    captured decode tick on CUDA (design-engine.md); pass False to force the
-    eager path. ``draft`` (a :class:`~tilerl.spec.DraftHead`) turns speculative
-    decoding on at ``spec_depth``, which sizes the state pool's per-chain-step
-    planes.
-    """
+    """Wire a model + backend into an Engine; pool shapes come from ``cfg``.
+    ``decode_graph`` None auto-enables the captured decode tick on CUDA."""
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
     model.params = backend.materialize(model.params)
     kv_pool = PagedKvPool(

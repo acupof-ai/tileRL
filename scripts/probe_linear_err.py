@@ -1,10 +1,5 @@
-"""Is a failing linear parity test a wrong kernel or a wrong error metric?
-
-The gate asserts max|a-b| <= atol + rtol*max|b|. A dot product over K
-cancels, so elements land near zero and that ratio blows up on a result
-that is fine. Reuses the test's OWN inputs and reference, and reports the
-norm-relative error beside it, plus the floor a bf16-accumulating kernel
-cannot go below whatever its schedule.
+"""Is a failing linear parity test a wrong kernel or a wrong metric? Reports the norm-relative
+error beside the gate's max|a-b|, plus the bf16-accumulation floor.
 
     CUDA_VISIBLE_DEVICES=7 python3 scripts/probe_linear_err.py
 """
@@ -41,15 +36,13 @@ def main() -> None:
     print(f"target {b.target}")
 
     # M=1 takes the scalar GEMV, 2..16 the mma8 path, >16 the prefill tile.
-    # Sweeping M across those boundaries says which kernel is wrong.
     torch.manual_seed(4)
     w = torch.randn(24, 32)
     wq, scale = _quantize_fp4(w)
     for M in (1, 2, 3, 6, 8, 16, 17, 32):
         x = torch.randn(M, 32)
         ref4 = _linear_fp4_fp8_ref(x, wq, scale) if cuda else reference.linear_fp4(x, wq, scale)
-        # also against the plain f32 fp4 reference: if the kernel tracks THAT
-        # and not the fp8 one, the fp8 re-quantization in the gate is the gap.
+        # if the kernel tracks the f32 reference, the gate's fp8 re-quantization is the gap
         ref_f32 = reference.linear_fp4(x, wq, scale)
         got = b.linear_fp4(x, wq, scale)
         report(f"linear_fp4 M={M:<2} vs fp8ref", got, ref4)

@@ -46,7 +46,7 @@ def main() -> None:
         scale = backend._f32(scale)
 
         # bf16 path (pop the fp8 key so it falls through to bf16)
-        from tilerl_kernels.registry import _REGISTRY, _resolve
+        from tilerl_kernels.registry import _REGISTRY
 
         cell = _REGISTRY[("bf16", "sm90")]
         had_fp8 = "linear_fp4_fp8" in cell

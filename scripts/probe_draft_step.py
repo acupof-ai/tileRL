@@ -1,11 +1,5 @@
-"""Where do the ~11 ms of a one-layer draft step go?
+"""Where do the ~11 ms of a one-layer draft step go? Times each stage of DraftHead.forward.
 
-The spec-decode rejection (docs/experience/wins/2026-08-29-spec-decode-net-win.md)
-left one number unexplained: a draft step whose projections measure 0.13 ms and
-whose lm_head measures 0.52 ms costs ~11 ms end to end. Five hypotheses about it
-were refuted by A/B; none of them timed the stages. This does.
-
-Usage:
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/probe_draft_step.py /data00/Qwen3.8-27B-NVFP4 \
         --draft /data00/Qwen3.8-27B-NVFP4/model_mtp.safetensors --batches 1,8
@@ -29,7 +23,6 @@ REPS = 20
 
 
 def timed(fn, reps=REPS):
-    """ms per call, median-free: events around a rep loop, one sync at the end."""
     for _ in range(3):
         fn()
     torch.cuda.synchronize()
@@ -124,8 +117,6 @@ def main() -> None:
         print(f"  {'sum of stages':>18} {tot:8.3f} ms")
         whole = timed(lambda: draft.forward(h, ids, pos, kv, backend, hidden_out=[]))
         print(f"  {'DraftHead.forward':>18} {whole:8.3f} ms")
-        # The tick's own decomposition: what the rejection entry inferred by
-        # subtraction, measured directly instead.
         for d in (1, 2, 4):
             engine._spec_depth = d
             ch = timed(lambda: engine._draft_chains(rows, trim=False), reps=5)

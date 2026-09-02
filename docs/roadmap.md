@@ -11,7 +11,7 @@ a ledger; a human reads a page rendered from that ledger.
 Phases exit on a named, measurable event, never on a date. A gate that needs
 a GPU not in hand ships its code with `pending-remote` in the wins entry and
 does not claim the number. Detail: `docs/design-rl-stack.md` (ISO, the draft
-head, the ledger), `docs/plan-training-rl.md` (TP, CP, 128K–256K budgets).
+head, the ledger); TP, CP and the 128K–256K budget are under P6 below.
 
 ## Where we are (2026-09-02)
 
@@ -125,6 +125,8 @@ gate is a non-zero exit; `--json` everywhere. Command names stay `train`,
 
 ## P5 — same pod, same task, vs verl + sglang — needs the pod, after P2.0
 
+Recurring (1 d) once P1 lands; OpenRLHF and slime are the next arms after verl.
+
 - `scripts/rl_compare.sh`: today it records median seconds per step and
   MMLU before/after; the target-accuracy timing needs P1's target. The verl
   arm is an unverified command, and sglang cannot load the NVFP4 checkpoint on
@@ -146,9 +148,65 @@ size the task needs.
 
 - Tensor-core decode GEMM MX 8 → 32/64. Exit: harness B=32 row at the
   rollout's shape (≤ 512-token context) ≥ 3× the B=8 aggregate.
-- TP-8 (one KV head per card, capturable all-reduce — CHANGELOG 2026-08-30),
-  then CP (ring attention + GDN prefix scan) for 128K–256K. Exits in
-  `docs/plan-training-rl.md`.
+- TP-8, one KV head per card. Exit: TP-8 B=1 tick ≈ 3 ms; loss bit-identical
+  to TP-1 on tiny; IPC/NCCL crossover measured.
+- CP-8: ring attention for full attention, prefix scan for GDN, head/tail
+  balanced. Exit: 256K fwd+bwd on 8 cards; 32K gradients match a single
+  card to 1e-3; the scan gradchecked on tiny first.
+- Full-parameter on the pod: ZeRO-1 masters, re-quantize to twiddled fp4
+  each step. Exit: ≤ 60 GB/card at 32K; MFU ≥ 40%; MMLU flat.
+
+Physics that fixes the design:
+
+- Decode is bandwidth-bound (22.8 GB per tick at ~64% of 3.25 TB/s);
+  training is compute-bound (H20 ~148 TFLOPS bf16, 6·N ≈ 126 GFLOP/token ⇒
+  ~590 tok/s/card at 50% MFU, ~4.7k tok/s on 8 cards, a 32K sample ≈ 7 s).
+  fp4 weights buy nothing for training; the levers are backward kernels and
+  MFU. A 32K rollout at B=1 is 6 min against a 7 s update — RL time is decode.
+- TP degree is chosen by KV memory: per token the 16 full-attention layers
+  hold 16 × 8 heads × 256 × 2 B × (K+V) = 131 KB (the 48 GDN layers hold a
+  constant state, which is why 256K is feasible at all). 8 KV heads, 8 cards
+  ⇒ TP-8 with one KV head per card; it also shards the GDN value heads (48/8)
+  and the weights (22.8/8 GB).
+- Decode TP is 10 KB per all-reduce, 128 times per tick; NCCL's ~15 µs floor
+  (21.5 µs measured, CHANGELOG 2026-08-30) is ~2 ms of a ~3 ms TP-8 tick. A
+  one-shot CUDA-IPC all-reduce as a TileLang kernel is ~3–5 µs and
+  graph-capturable; training traffic (grad all-reduce, ZeRO, CP ring) stays
+  on NCCL. One `comm.py` seam, crossover measured by microbench, IPC falls
+  back to NCCL when peers are not mappable.
+- CP for GDN is a scan, not a hand-off: `S_i = A_i S_{i-1} + B_i` composes,
+  so each rank computes local (A, B), one all-gather fixes the incoming
+  state, a second pass produces outputs; backward is the same scan reversed.
+  Full-attention CP is ring attention and its merge is the split-KV combine
+  already shipped. From torchtitan: mesh-first `ParallelDims`, head/tail
+  causal balancing, seed-by-name init, fwd+bwd in one CUDA graph; DTensor and
+  `fully_shard` are torch.autograd machinery and do not transfer.
+- Risks: NCCL inside captured decode graphs needs stream discipline (fallback
+  a graph per layer); re-quantization noise per step is invisible in loss,
+  MMLU-gated; the GDN scan is the one novel kernel and does not touch the 27B
+  until the tiny gradcheck passes.
+
+128K–256K budget:
+
+| | 32K | 128K | 256K |
+|---|---:|---:|---:|
+| KV per sequence | 4.3 GB | 17 GB | 34 GB |
+| one card (22.8 GB weights): concurrent rollouts | 16 | 4 | **1** (57 GB) |
+| TP-8: concurrent rollouts per pod | 128 | 32 | 16 |
+| decode KV read per token / card, TP-1 → TP-8 | 1.3 → 0.2 ms | 5.3 → 0.7 ms | 10.6 → 1.3 ms |
+| B=1 decode (11 ms weights tick + KV at ~65%): TP-1 / TP-8 | 77 (measured) / — | ~50 / ~80 tok/s | ~40 / ~80 tok/s |
+| prefill attention FLOPs 2·n²·d·H·L | 0.3 PF | 4.5 PF | 18 PF ⇒ ~3 min one card at 100 TF, ~25 s TP-8 |
+| training a 256K sample, CP-8 + per-layer activation checkpoint | | | ~20 GB/card activations, ~2 min fwd+bwd per pod |
+
+What the budget forces: single-card 256K first (`max_total_tokens` 262144,
+16 384 blocks per sequence, split-KV beyond 16 splits at depth, harness rows
+d131072/d262144 at B=1; gate: the 256K→512-token decode curve is explained by
+KV bytes alone); the prefix cache must hit across a rollout batch at 128K
+(gate: kv-reuse hit rate 1.0, warm ≪ cold); prefill attention at 256K is 18
+PFLOP, so the dense MMA prefill needs a FlashAttention-3-class schedule or
+TP-8 hides it — today's 1.8k tok/s at 8K says nothing about 256K; CP-8 +
+activation checkpointing is the only way a 256K sample trains (without
+recompute the activations are ~1.6 TB).
 
 ## Dependencies
 

@@ -1,9 +1,5 @@
-"""Split the fp8 linear's 2.5% into its two possible sources.
-
-The kernel and the reference agree on paper: bf16 input, per-token scale,
-FP8_MAX=448. So the gap is either the QUANT (rounding) or the GEMM (where
-the weight scale lands). Compare the quantized activation directly, then
-feed the reference's own xq through the kernel's weight path.
+"""Split the fp8 linear's 2.5% gap into its two sources: the quant rounding or the GEMM's
+weight-scale placement.
 
     CUDA_VISIBLE_DEVICES=7 python3 scripts/probe_fp8_quant.py
 """
@@ -61,8 +57,7 @@ def main() -> None:
           f"{rel(got, _linear_fp8_ref(x, w8, wscale)):.3e}")
     print(f"  full kernel vs f32 on ITS OWN xq       norm-rel "
           f"{rel(got, kern_x @ w.t()):.3e}")
-    # If the kernel tracks the UNQUANTIZED activation instead, this path is
-    # w8a16 and the w8a8 reference is modelling the wrong kernel.
+    # tracking the unquantized activation would mean the kernel is w8a16, not w8a8
     print(f"  full kernel vs bf16 activation (w8a16)  norm-rel "
           f"{rel(got, xbf @ w.t()):.3e}")
     for M2 in (1, 4, 8, 16, 32):

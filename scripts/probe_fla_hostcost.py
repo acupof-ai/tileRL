@@ -1,10 +1,5 @@
-"""fla's GDN is 42 ms cheaper on the GPU across a prefill and 6.7% slower end
-to end, at a ratio that does not move with sequence length. A constant per-call
-cost off the GPU is what that shape means; this measures it directly.
-
-Wall clock minus profiler GPU time, per call, for both paths at one layer's
-shapes.
-"""
+"""Per-call host cost of our GDN core vs fla's: wall clock minus profiler GPU time at one
+layer's shapes. fla is 42 ms cheaper on the GPU per prefill yet 6.7% slower end to end."""
 
 from __future__ import annotations
 

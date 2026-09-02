@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
-"""Pod-side matrix runner: N variants in one pod session, one sync.
-
-Spec (JSON file path, or '-' for stdin):
+"""Run N env-overlay variants of one command in a pod session; each appends
+exit/seconds/4 KB tail to results.jsonl, and matrix.done carries the status
+for a detached (setsid) run. Put the slowest-compiling variant first: the JIT
+cache is on disk. Spec (JSON path or '-'):
   {"command": "python3 scripts/_ab_gemv_direct.py 0",
-   "variants": [{"name": "prmt_bm16", "env": {"ARMS": "prmt", "BM": "16"}},
-                {"name": "shipped", "env": {"ARMS": "gemv"}}],
+   "variants": [{"name": "prmt_bm16", "env": {"ARMS": "prmt", "BM": "16"}}],
    "timeout": 1800}
-
-Each variant runs ``command`` as a subprocess with its env overlay on top of
-the runner's own environment. Per variant: exit code, wall seconds, and the
-last 4 KB of combined output append to ``results.jsonl`` next to the spec;
-a summary table prints at the end. On exit a ``matrix.done`` stamp carries
-the overall status, so a detached run (setsid + this script, see
-scripts/_pod_baseline_launch.sh) survives the launching agent's turn — poll
-the stamp, then read the JSONL.
-
-The JIT cache (/work/tilelang_cache) is on-disk, so variants in one session
-warm each other: put the slowest-compiling variant first.
 """
 
 from __future__ import annotations

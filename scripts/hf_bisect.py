@@ -1,10 +1,6 @@
-"""Bisect check-2 against HF ground truth: load /work/hf_ref.pt (per-layer
-last-token hidden + logits, dumped by hf_reference.py), run tileRL's own
-per-layer forward on the SAME real token ids, and print per-layer cosine +
-relerr against HF. The first layer that diverges (cos << 1) is the bug site —
-every tileRL op passes parity at real dims, so the bug is wiring/weights and
-only an element-wise comparison to a correct forward can localize it.
-
+"""Per-layer cosine + relerr of tileRL's forward against /work/hf_ref.pt
+(dumped by hf_reference.py) on the same token ids; the first layer with
+cos << 1 is the bug site.
   python3 -u scripts/hf_bisect.py /data00/Qwen3.8-27B-NVFP4 --gpu 7
 """
 

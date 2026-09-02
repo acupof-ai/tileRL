@@ -3,11 +3,9 @@
 # MMLU before/after, tileRL vs verl+sglang. Run from the synced checkout on the
 # pod (scripts/pod_sync.sh run rl_compare 'bash scripts/rl_compare.sh').
 #
-# Arm A is what this repo ships: one process, one set of weights, LoRA on the
-# frozen fp4 base, no weight sync. Arm B is verl's GRPO recipe on the same
-# prompts — pending-remote: verl is not installed on the pod, and sglang cannot
-# load the NVFP4 checkpoint on Hopper, so B runs the bf16 conversion
-# (docs/experience/errors/2026-08-28-sglang-bf16-checkpoint-garbage.md).
+# Arm A: tileRL, one process, LoRA on the frozen fp4 base. Arm B: verl GRPO, pending-remote —
+# verl is not installed on the pod, and sglang cannot load NVFP4 on Hopper, so B runs the
+# bf16 conversion (docs/experience/errors/2026-08-28-sglang-bf16-checkpoint-garbage.md).
 set -euo pipefail
 SRC=${TILERL_QWEN38_SOURCE:-/work/Qwen3.8-27B-NVFP4}
 GPU=${GPU:-7} STEPS=${STEPS:-20} GROUP=${GROUP:-8} LEN=${LEN:-256} MMLU=${MMLU:-200}

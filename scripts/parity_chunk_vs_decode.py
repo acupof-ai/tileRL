@@ -1,13 +1,7 @@
-"""Does the speculative-decode verify path agree with plain greedy decode?
-
-Two checks, both with no draft head involved — the draft's quality is a
-separate question from whether the machinery around it is correct.
-
+"""Does the speculative verify path reproduce plain greedy decode, no draft head?
   default: a mid-sequence multi-token forward vs token-by-token decode.
-  --loop:  the whole block loop (snapshot / verify / roll back / re-absorb)
-           driven by a draft that is always right or always wrong. Either way
-           the committed tokens are known in advance: plain greedy decode.
-
+  --loop:  the block loop (snapshot / verify / roll back / re-absorb) with an
+           always-right or always-wrong draft; committed tokens must equal greedy.
   python scripts/parity_chunk_vs_decode.py /data00/Qwen3.8-27B-NVFP4 --gpu 7
 """
 
@@ -72,7 +66,7 @@ def main() -> None:
                 seq_q_lens=torch.tensor([q], dtype=torch.int32, device=backend.device))
         return kv, states
 
-    # Reference: pure T=1 greedy decode. Everything below must reproduce it.
+    # reference: T=1 greedy decode
     kv, _ = fresh()
     lg = trunk.forward(arr([ids0]), arr(range(len(ids0))), kv(len(ids0), len(ids0)), backend)
     ref = [int(lg[0, -1].argmax())]

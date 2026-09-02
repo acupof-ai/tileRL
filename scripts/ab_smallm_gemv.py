@@ -1,18 +1,7 @@
-"""A/B: small-M GEMV for B=2..8 decode (Phase 2, hypothesis 2).
+"""A/B: shipped dispatch vs small-M GEMV (2<=M<=8) at B=1..8 on the slice4 decode graph.
 
-Control = shipped dispatch (M==1 GEMV; B=8 runs the fp8 WGMMA path with
-e4m3 A-quant + k_split=2 atomics). Candidate = the small-M GEMV
-(2<=M<=8 routes through the GEMV path: W streamed once, M-way FMA, no
-A-quant launch, no k_split). Same process, same model, same inputs;
-quiet-gated GPU.
-
-Measures: slice4 decode graph at B=1/2/4/8 (30-tick steady-state avg),
-kernel relerr vs shipped on identical inputs, candidate parity vs the
-f32 reference, and greedy token equality over the measured ticks.
-
-Usage:
-    CUDA_VISIBLE_DEVICES=7 TILERL_TARGET=cuda PYTHONPATH=src \\
-        python3 scripts/ab_smallm_gemv.py /host/tc27-nvfp4-slice4 --layers 4
+Reports ms/tick, kernel relerr vs shipped, parity vs the f32 reference, greedy token equality.
+Usage: CUDA_VISIBLE_DEVICES=7 TILERL_TARGET=cuda PYTHONPATH=src python3 scripts/ab_smallm_gemv.py /host/tc27-nvfp4-slice4 --layers 4
 """
 
 from __future__ import annotations
@@ -37,8 +26,7 @@ TICKS = 30
 
 
 def _quantize_fp8(w_master):
-    """Per-128-block quant into the loader's native layout (tests' helper,
-    inlined so the script needs no tests/ on PYTHONPATH)."""
+    """Per-128-block quant in the loader's layout; inlined so tests/ need not be on PYTHONPATH."""
     n, k = w_master.shape
     ns, ks = (n + 127) // 128, (k + 127) // 128
     padded = w_master.float().new_zeros(ns * 128, ks * 128)
@@ -56,7 +44,6 @@ def prompts_for(cfg, b):
 
 
 def run_arm(model, backend, cfg, batches, smallm):
-    """One engine at one flag setting: warmup + 30-tick graph timing per B."""
     backend_mod._SMALLM_GEMV = smallm
     engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8, decode_graph=True)
     out = {}
@@ -98,12 +85,6 @@ def run_arm(model, backend, cfg, batches, smallm):
 
 
 def kernel_relerr(backend):
-    """Candidate vs shipped on identical B=8 inputs, + candidate vs f32 ref.
-
-    fp4 shipped = the e4m3-A-quant WGMMA path (its own quant noise); the
-    candidate is bf16-A GEMV. Reports max-abs and Frobenius relerr vs
-    shipped, and allclose(rtol=1e-2) vs the f32 reference (kernel truth).
-    """
     from tilerl_kernels.reference import pack_fp4
 
     torch.manual_seed(41)

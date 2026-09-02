@@ -1,16 +1,7 @@
-"""Decode tick per-op profile at B=1 and B=8 on the NVFP4 slice (dev tool).
+"""Per-op CUDA-event profile of the eager decode tick at B=1 and B=8 on the NVFP4 slice,
+plus the shipped graph tick (replay vs sampling split) and a 64-layer extrapolation.
+Eager is instrumented because wrappers do not run inside a graph replay.
 
-CUDA-event breakdown of the eager decode tick — the exact kernel sequence the
-shipped decode graph replays — plus the shipped graph tick (replay vs sampling
-split) and a 64-layer extrapolation. Eager is instrumented because a captured
-graph cannot be per-op timed from Python: the wrappers do not run during a
-replay, so the graph run reports the total only.
-
-Linears are timed at the Model._linear seam, so every GEMV/MMA carries its
-projection name (qkvz / gate_up / lm_head / ...) and its dispatch path
-(fp4-gemv / fp8-mma / ...). RMSNorms are named by their weight tensor.
-
-Usage:
     CUDA_VISIBLE_DEVICES=6 TILERL_TARGET=cuda PYTHONPATH=src \\
         python3 scripts/profile_decode_tick.py /host/tc27-nvfp4-slice4 --layers 4
 """
@@ -43,8 +34,7 @@ class Tracer:
         self.linear_paths: dict[str, str] = {}
         id2name = {id(t): k for k, t in model.params.items()}
 
-        # Named linears: wrap the model seam (not the backend) so each call
-        # carries its projection key and dispatch path.
+        # Model seam, not the backend: each call carries its projection key and dispatch path.
         orig_linear = model._linear
 
         def timed_linear(b, x, key, **kw):
@@ -63,7 +53,6 @@ class Tracer:
 
         model._linear = timed_linear
 
-        # RMSNorm: name by weight identity (input_norm / q_norm / final_norm / ...).
         orig_rmsnorm = backend.rmsnorm
 
         def timed_rmsnorm(x, w, eps):
@@ -73,23 +62,13 @@ class Tracer:
 
         backend.rmsnorm = timed_rmsnorm
 
-        for name, orig in (
-            ("rope", backend.rope),
-            ("paged_attention", backend.paged_attention),
-            ("write_tokens", backend.write_tokens),
-            ("linear_attn_chunk", backend.linear_attn_chunk),
-            ("gdn_decode", backend.gdn_decode),
-            ("linear", backend.linear),
-            ("state_gather", backend.state_gather),
-            ("state_scatter", backend.state_scatter),
-            ("silu_mul", backend.silu_mul),
-            ("add", backend.add),
-            ("embedding", backend.embedding),
+        for name in (
+            "rope", "paged_attention", "write_tokens", "linear_attn_chunk", "gdn_decode",
+            "linear", "state_gather", "state_scatter", "silu_mul", "add", "embedding",
         ):
-            self._wrap_simple(backend, name, orig)
+            self.wrap_method(backend, name, name)
 
     def install(self, engine):
-        """Wrap one engine's sampling (argmax + the D2H result sync)."""
         orig_sample = engine._sample_batch
 
         def timed_sample(rows):
@@ -100,7 +79,6 @@ class Tracer:
         engine._sample_batch = timed_sample
 
     def wrap_method(self, obj, attr, label):
-        """Time any method call (used for the captured graph's replay)."""
         orig = getattr(obj, attr)
 
         def timed(*args, **kwargs):
@@ -109,14 +87,6 @@ class Tracer:
             return self._rec(label, orig, *args, **kwargs)
 
         setattr(obj, attr, timed)
-
-    def _wrap_simple(self, backend, name, orig):
-        def wrapper(*args, **kwargs):
-            if not self.on:
-                return orig(*args, **kwargs)
-            return self._rec(name, orig, *args, **kwargs)
-
-        setattr(backend, name, wrapper)
 
     def _rec(self, label, fn, *args, **kwargs):
         s = torch.cuda.Event(enable_timing=True)
@@ -177,7 +147,6 @@ def drain(engine, wids):
 
 
 def measure(engine, tracer, ticks):
-    """Steady-state ticks: per-op events + wall (ms/tick avg)."""
     walls = []
     for _ in range(ticks):
         tracer.on = True
@@ -231,9 +200,7 @@ def lm_head_ms(tracer, ticks):
 
 
 def extrapolate(replay_ms, lm_head, fixed_ms, slice_layers, full_layers=64):
-    # Final-bench method (2026-08-25-gemv-instr-gdn-wy): per-layer cost x
-    # (full/slice), lm_head + fixed counted once. embed/final_norm stay in
-    # the per-layer term (negligible: ~0.03 ms of a ~20 ms tick).
+    # per-layer cost x (full/slice); lm_head + fixed counted once (embed/final_norm ~0.03 ms).
     per_layer = (replay_ms - lm_head) / slice_layers
     return per_layer * full_layers + lm_head + fixed_ms
 
@@ -252,8 +219,7 @@ def main():
         raise SystemExit("profiling needs the CUDA target (TILERL_TARGET=cuda)")
     base = qwen36_27b()
     t0 = time.perf_counter()
-    # load_hf truncates to num_layers against the full-config validation (cfg
-    # stays 64 so the checkpoint's num_hidden_layers check passes).
+    # cfg stays 64 layers so the checkpoint's num_hidden_layers check passes.
     model = load_hf(base, args.source, num_layers=args.layers, fuse_projections=True)
     cfg = model.cfg
     print(f"load: {time.perf_counter() - t0:.1f}s", flush=True)
@@ -261,8 +227,7 @@ def main():
     batches = [int(x) for x in args.batches.split(",")]
     report = {"layers": args.layers, "batches": {}}
 
-    # Eager engine first: its warmup JITs every decode shape, so the graph
-    # engine's capture hits warm tilelang artifacts (no NVCC in capture).
+    # Eager first: its warmup JITs every decode shape, so graph capture never runs NVCC.
     from tilerl.spec import load_draft
 
     eager = build_engine(
@@ -291,8 +256,6 @@ def main():
         tracer.totals.clear()
         tracer.counts.clear()
 
-    # Graph engine (shipped): replay total + sampling split. Same backend and
-    # model, so the wrappers and the warm JIT carry over.
     graph = build_engine(cfg, model, backend, num_blocks=512, num_slots=8, decode_graph=True)
     tracer.install(graph)
     for b in batches:

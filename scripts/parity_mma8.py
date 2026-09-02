@@ -1,10 +1,5 @@
-"""Parity for both batched-decode tensor-core GEMMs (fp4 and fp8) against the
-dequantized reference. Covers every M the mma8 path claims (2..8).
-
-A compile-only defect (an asm constraint that no longer matches the scale's
-storage dtype) shows up here in seconds; through the harness it shows up as an
-empty RuntimeError twenty minutes in.
-
+"""Parity for the batched-decode tensor-core GEMMs (fp4, fp8) at M=2..8 vs the
+dequantized reference; a compile defect shows here in seconds, not 20 min into the harness.
   CUDA_VISIBLE_DEVICES=7 python scripts/parity_mma8.py
 """
 
@@ -21,8 +16,7 @@ from tilerl_kernels.backend import get_backend  # noqa: E402
 from tilerl_kernels.reference import dequant_fp4, dequant_fp8, pack_fp4  # noqa: E402
 
 
-def quant_fp8(w):
-    """Per-128-block quant into the loader's native layout."""
+def quant_fp8(w):  # per-128-block, the loader's native layout
     n, k = w.shape
     ns, ks = -(-n // 128), -(-k // 128)
     padded = w.float().new_zeros(ns * 128, ks * 128)

@@ -1,20 +1,8 @@
-"""Benchmark sgl-kernel's fp4/fp8 GEMM on tileRL's decode shapes, as an
-external SOTA baseline for the micro_size_k sweep (scripts/bench_gemv_micro.py).
-
-PENDING-REMOTE: sgl-kernel is CUDA-only (no macOS wheel), so this script has
-never run. First pod run prints the available entry points and the adapter
-below may need a one-line fix — the fp4 weight layout sgl-kernel expects is
-not tileRL's .wq/.scale serving format, so the fp4 arm builds its own packed
-weights from a random bf16 matrix (same convention as bench_gemv_micro.py).
-
-Install on the pod:  uv add --dev sgl-kernel
-Run:                 uv run python scripts/bench_sgl_kernel.py
-
-Comparison convention (same as the Marlin row in
-docs/experience/2026-08-27-tilelang-vs-native.md): each side is timed in its
-own byte convention. tileRL fp4 = 0.5625 B/elem (0.5 weights + f32 block-16
-scales); sgl-kernel fp4 = NVFP4 (e4m3 group scales, ~0.5625 B/elem); fp8 =
-1 B/elem. Print µs and both TB/s figures; never average the two.
+"""sgl-kernel fp4/fp8 GEMM on tileRL's decode shapes: external baseline for
+scripts/bench_gemv_micro.py. PENDING-REMOTE (CUDA-only wheel, never run here).
+Each side is timed in its own byte convention (tileRL fp4 0.5625 B/elem,
+sgl fp4 ~0.5625, fp8 1); never average the two.
+    uv add --dev sgl-kernel && uv run python scripts/bench_sgl_kernel.py
 """
 
 from __future__ import annotations
@@ -39,8 +27,7 @@ def _have_sgl_kernel():
         return False
 
 
-def _candidate_fp4_ops():
-    """sgl-kernel's fp4 entry point has moved across releases; probe."""
+def _candidate_fp4_ops():  # the fp4 entry point has moved across releases
     import sgl_kernel
 
     cands = []
@@ -59,7 +46,6 @@ def _candidate_fp4_ops():
 
 
 def bench_fp8():
-    """cutlass_scaled_mm is the stable fp8 entry point: C = (A*sa) @ (B*sb)."""
     import torch
 
     from sgl_kernel.ops import cutlass_scaled_mm
@@ -99,9 +85,7 @@ def bench_fp4():
     print("   NOTE: the weight layout below is a best-effort guess (packed uint8 +")
     print("   e4m3 scales). If the call signature differs, adapt this arm — the")
     print("   shapes and timing loop are the part that must not change.")
-    # TODO(pod): build NVFP4 weights the chosen entry point accepts and time
-    # it with the same event loop as bench_fp8. Left unwritten rather than
-    # guessed wrong: a broken fp4 arm is worse than a missing one.
+    # ponytail: fp4 arm unwritten, wire the chosen entry point with bench_fp8's event loop on the pod
     print("   fp4 arm not wired — see NOTE. The fp8 arm above is the stable baseline.")
 
 

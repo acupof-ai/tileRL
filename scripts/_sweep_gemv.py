@@ -1,13 +1,7 @@
-"""Isolate the fp4 GEMV dequant on the shipped schedule: micro_size_k=8,
-partial-scale (acc += s * sum(X*w), 1 FP op/elem), warp-shuffle LUT decode.
-
-Compares the decode variants against the nodecode floor. Diagnostic only —
-not shipped (see bench_fp4_gemv.py for the committed bench).
-
-Findings (H20, N=17408 K=5120, BW 3312): the kernel is issue-throughput-bound.
-The nodecode floor is ~57% roof; the warp-shuffle LUT (1 op/elem) reaches
-~44% (78% of floor); the bitcast (9 int ops/elem) ~30%. 2 accumulators,
-wider micro-tiles, shared-X, shared-LUT, 256-LUT, and f32-X all tested worse.
+"""Isolate the fp4 GEMV dequant on the shipped schedule (micro_size_k=8, partial-scale, warp-shuffle LUT).
+Diagnostic only; bench_fp4_gemv.py is the committed bench.
+H20 N=17408 K=5120: issue-bound. nodecode ~57% roof, lutshfl ~44%, bitcast ~30%; 2 acc / wider tiles /
+shared-X / shared-LUT / 256-LUT / f32-X all worse.
 """
 
 import sys
@@ -27,8 +21,7 @@ MICRO = 8
 
 
 def _e2m1fn_fp32(nib):
-    """e2m1fn nibble -> fp32 via IEEE bit-pattern synthesis (power-of-two
-    grid -> sign<<31 | (126+e)<<23 | m<<22, no exp2)."""
+    # e2m1fn grid is power-of-two: sign<<31 | (126+e)<<23 | m<<22, no exp2
     ni32 = T.cast(nib, "int32")
     bits = ((ni32 & 8) << 28) | ((126 + ((ni32 >> 1) & 3)) << 23) | ((ni32 & 1) << 22)
     return T.reinterpret(bits, "float32")

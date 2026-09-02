@@ -1,58 +1,17 @@
-"""One-command H20 verification of the native-fp4 w4a8 refactor (dev tool).
+"""One-command H20 verification of the native-fp4 w4a8 refactor (dev tool, pod only).
 
-Five checks, one process, one summary table. Everything the 2026-08-26
-native-fp4 entry claims but could not measure on a GPU-less host:
+  1  memory  — 27B loads with the checkpoint's own nibbles and no bf16 master; resident bytes
+               by source after warmup (the sm90 f32 embedding Table copy is 4.7 GiB, audit M2).
+  2  logits  — greedy-decode real prompts; non-degenerate, distinct across prompts.
+  3  w4a8    — e4m3 range invariant (max 6*scale) and kernel-vs-f32-dequant error at M=1/8/512.
+  4  perf    — decode + prefill vs the 628c82d baseline, same method.
+  5  block   — decode with native block-16 scales vs load-time re-blocked block-32; attributes
+               the delta to scale traffic. Destructive (rewrites params), runs last.
 
-  1  memory  — the 27B loads with the checkpoint's own nibbles and NO bf16
-               master. Runs AFTER the warmup and breaks resident bytes down by
-               source (packed / bare bf16 / the f32 embedding cast / KV pool /
-               residual), because ``model.params`` is NOT the resident total:
-               the sm90 cell's f32 embedding ``Table`` forces a 4.7 GiB f32
-               copy of the table into existence on the first embedding call and
-               holds it for process life (audit M2). Reports the honest number
-               against the refactor's COMPUTED 20.3 GiB (was 65.0, and the
-               628c82d baseline measured 67.9 GiB resident); gates only on
-               "no bf16 master survived".
-  2  logits  — greedy-decode real prompts and print the text. A loader that
-               succeeds is not evidence: 628c82d served perfect throughput
-               through the WRONG lm_head. Gates on non-degenerate output and
-               on different prompts producing different continuations.
-  3  w4a8    — the e4m3 range invariant on the REAL kernel: max(6*scale) per
-               sampled tensor, then kernel-vs-f32-dequant relative error at
-               M=1/8/512. M=1 is the weight path alone (that GEMV dequants in
-               f32); M=8/512 are END-TO-END — the sim's 2.3% weight requant
-               plus the per-token e4m3 activation quant on top of it.
-  4  perf    — decode + prefill vs the 628c82d baseline, same method
-               (graph replay, 32 steady-state ticks, prefill chunked at 512).
-  5  block   — THE PERF RISK. The refactor moved the scale block 32 -> the
-               checkpoint's native 16, both f32, which doubles scale traffic.
-               Decode is bandwidth-bound, so the memory win may be paid for
-               in ms/tick. Measures decode with the native block-16 scales AND
-               with load-time re-blocked block-32 scales, prints the added
-               quantization error and the bandwidth-predicted delta next to
-               the measured one, so the decode delta is attributed rather
-               than guessed. Destructive (rewrites the params) — runs last.
+GPUs 0-5 are the user's training run: the script pins one of 6/7 before torch initializes,
+refuses a busy GPU, and asserts torch sees one device. ``--selftest`` runs a CPU tiny model.
 
-Re-blocking rule: block-32 scale = ``pack_fp4``'s ``block_max/6`` over each
-pair of 16-blocks. That is the max of the pair whenever both 16-blocks reach
-their grid top, i.e. the tightest scale that clips NOTHING — only the nibbles
-re-round onto the e2m1 grid. The mean would put values above 6*scale and clip
-them, so it is not used. ``.oscale`` is untouched: the per-row max is the same
-value either way, so the e4m3 renormalization survives the re-block.
-
-GPU safety: GPUs 0-5 are the user's own training run. This script pins
-CUDA_VISIBLE_DEVICES to one of GPUs 6/7 BEFORE torch can initialize the
-driver, refuses to start if that GPU shows util or resident memory, and
-asserts torch sees exactly one device. ``--selftest`` skips all of that, so it
-forces TILERL_TARGET=cpu instead — otherwise the `auto` target would resolve
-to cuda:0, which is physical GPU 0.
-
-Usage (see scripts/POD-VERIFY.md for the full order):
     PYTHONPATH=src python3 scripts/verify_h20_fp4.py /data00/Qwen3.8-27B-NVFP4
-
-Dev-only tooling: no bench entry (AGENTS.md scopes that gate to src/ on the
-hot path). Runs on the pod only; ``--selftest`` exercises the harness itself
-on a CPU tiny model with no GPU and no checkpoint.
 """
 
 from __future__ import annotations
@@ -68,8 +27,6 @@ import traceback
 from collections import Counter
 from dataclasses import replace
 
-#: Physical GPU indices that are ours. 0-5 are the user's training run at
-#: 100% util / ~94 GiB each and must never be touched.
 OURS = (6, 7)
 
 #: 628c82d, same box, docs/experience/wins/2026-08-26-qwen38-27b-baseline.md.
@@ -80,10 +37,9 @@ BASE = {
     "prefill_tps": {512: 1947.0, 2048: 1847.0, 8192: 1773.0},
     "resident_gib": 67.9,
 }
-#: The refactor's computed (not measured) weight footprint, and what it replaced.
+#: computed, not measured
 CLAIM_GIB = {"after": 20.3, "before": 65.0}
-#: e4m3: max finite 448, smallest normal 2**-6. The w4a8 kernel casts w*scale
-#: into e4m3, so 6*scale above 448 saturates invisibly (no CPU kernel repros it).
+#: the w4a8 kernel casts w*scale into e4m3, so 6*scale above 448 saturates invisibly.
 E4M3_MAX, E4M3_MIN_NORMAL = 448.0, 2.0**-6
 
 
@@ -117,7 +73,6 @@ def _nn(x: float) -> float | None:
 
 
 def _argv_opt(name: str) -> str | None:
-    """Read one --opt VALUE / --opt=VALUE out of sys.argv before argparse runs."""
     for i, a in enumerate(sys.argv):
         if a == name and i + 1 < len(sys.argv):
             return sys.argv[i + 1]
@@ -127,15 +82,9 @@ def _argv_opt(name: str) -> str | None:
 
 
 def _pin() -> int | None:
-    """Pick our GPU, refuse anything else, refuse a busy one, and pin the env.
-
-    Runs before ``import torch``: CUDA_VISIBLE_DEVICES is read by the driver at
-    initialization, and ``torch.cuda.is_available()`` initializes it.
-    """
+    """Runs before ``import torch``: the driver reads CUDA_VISIBLE_DEVICES at initialization."""
     if "--selftest" in sys.argv or "-h" in sys.argv or "--help" in sys.argv:
-        # No pin, no busy probe on this branch, so force the CPU target: the
-        # registry maps `auto` to cuda whenever a device is visible, and that
-        # device would be physical GPU 0 — the user's training run.
+        # no pin here, and `auto` would resolve to cuda:0 = the user's GPU 0.
         os.environ["TILERL_TARGET"] = "cpu"
         return None
     cli, env = _argv_opt("--gpu"), (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
@@ -229,8 +178,7 @@ def run_check(n: int, name: str, fn, skip: set[int]):
 
 
 def _weight_bytes(params) -> dict[str, int]:
-    """Bytes per storage class. Bare keys are grouped by dtype so a resurrected
-    bf16 master shows up as tonnage, not as a missing suffix."""
+    """Bare keys grouped by dtype so a resurrected bf16 master shows up as tonnage."""
     out: dict[str, int] = {}
     for k, v in params.items():
         suf = k.rsplit(".", 1)[-1]
@@ -244,21 +192,12 @@ def _tensor_bytes(*ts) -> int:
 
 
 def _sz(b: float) -> str:
-    """GiB, but MiB below 1 GiB — the tiny selftest would print every source as
-    0.000 GiB, which is the reporting blind spot this check exists to remove."""
+    """MiB below 1 GiB so the tiny selftest does not print 0.000 everywhere."""
     return f"{b / GIB:8.3f} GiB" if abs(b) >= GIB else f"{b / 2**20:8.1f} MiB"
 
 
 def check_memory(model, backend, engine, gpu: int | None, by: dict[str, int], pre_warm: float):
-    """Resident memory AFTER the warmup, attributed to named sources.
-
-    ``model.params`` is not the resident total. ``Backend._embed_table_f32``
-    holds an f32 copy of the embedding table (248320x5120 = 4.736 GiB at 27B)
-    for process life, solely because the sm90 kernel cell inherits the CPU
-    cell's f32 ``Table`` — audit M2. It does not exist until the first
-    embedding call, so sampling before the warmup (what this check used to do)
-    printed a comfortable PASS with that tonnage uncounted.
-    """
+    """Post-warmup: the f32 embedding copy (4.736 GiB at 27B) only exists after the first call."""
     params = model.params
     total = sum(by.values())
     masters = sorted(k for k in params if f"{k}.wq" in params or f"{k}.w8" in params)
@@ -278,8 +217,7 @@ def check_memory(model, backend, engine, gpu: int | None, by: dict[str, int], pr
     print("  largest bare tensors: " + ", ".join(f"{k} {b / GIB:.2f}G" for b, k in big_bare))
 
     packed = sum(v for c, v in by.items() if c in suffixes)
-    # `t is ref()` means _dev found the table already f32 and returned it — no
-    # second allocation, and counting it would double-count a params tensor.
+    # `t is ref()`: the table was already f32, no second allocation to count.
     cast = _tensor_bytes(
         *(t for r, _, t in getattr(backend, "_embed_f32", {}).values() if t is not r())
     )
@@ -320,10 +258,7 @@ def check_memory(model, backend, engine, gpu: int | None, by: dict[str, int], pr
         f"{CLAIM_GIB['before']}, 628c82d measured {BASE['resident_gib']} resident)"
     )
 
-    # Gates on "no bf16 master survived", never on a total. The 20.3 GiB is a
-    # COMPUTED params-only number that assumed every linear is fp4 (the
-    # per-channel FP8 ones stay at 1 B/elem) and that the M2 cast already
-    # breaks — gating on it would either lie green or fail on a known defect.
+    # gate on "no bf16 master survived", never on the computed 20.3 GiB total.
     ok = not masters and bare / GIB <= 4.0 and quant_keys > 0
     why = []
     if masters:
@@ -392,8 +327,7 @@ def check_logits(engine, cfg, source: str, selftest: bool):
     outs, texts = [], []
     for i, prompt in enumerate(PROMPTS):
         ids = tok.encode(prompt) if tok else [(i * 97 + j * 13) % cfg.vocab_size for j in range(16)]
-        # Without the stop set, greedy decode runs 48 ticks past <|im_end|> and
-        # the repeated id trips _degenerate — a false FAIL on a healthy model.
+        # without stops, greedy repeats <|im_end|> for 48 ticks and trips _degenerate.
         stops = tuple(getattr(tok, "stop_token_ids", ()))
         wid = engine.submit(
             ids, SamplingParams(temperature=0.0, max_new_tokens=48, seed=0, stop_token_ids=stops)
@@ -446,8 +380,7 @@ def _fp4_keys(params, n: int) -> list[str]:
 
 
 def _deq_rows(wq, scale, oscale=None, rows: int = 512):
-    """f32 dequant in row chunks. The whole lm_head [248320, 5120] at once is
-    ~30 GiB of int64 intermediates inside ``reference.dequant_fp4``."""
+    """Row chunks: the whole lm_head at once is ~30 GiB of int64 intermediates."""
     if getattr(wq, "_tl_twiddled", False):  # slicing drops the flag; untwiddle whole
         wq = reference.untwiddle_fp4(wq)
     for i in range(0, wq.shape[0], rows):
@@ -541,10 +474,7 @@ def _drive(engine, wid: int, max_steps: int) -> list[int]:
 
 
 def _warmup(engine, cfg, passes: int = 2) -> None:
-    """Compile the prefill shapes (chunks are always M=512) and the B=1 decode.
-    Batched decode has its OWN shapes and its own lazy CUDA-graph capture, so
-    each batch size warms itself in :func:`time_decode`; the second pass
-    confirms the timed numbers are JIT-free."""
+    """Prefill (M=512 chunks) and B=1 decode; batched decode warms itself in time_decode."""
     for p in range(passes):
         t0 = time.perf_counter()
         wid = engine.submit(
@@ -556,15 +486,7 @@ def _warmup(engine, cfg, passes: int = 2) -> None:
 
 
 def time_decode(engine, backend, cfg, b: int, ticks: int, warm: int = 8) -> float:
-    """Steady-state decode at batch ``b``: settle + warm untimed, then ``ticks``
-    timed graph replays.
-
-    The engine admits ONE waiting request per tick and a 512-token prompt needs
-    two prefill ticks, so a fixed settle count leaves rows still prefilling and
-    puts mixed prefill+decode forwards inside the timed window. Settle on the
-    phases instead. The warm ticks then pay this batch size's JIT and its lazy
-    CUDA-graph capture, which happen on the FIRST pure-decode tick.
-    """
+    """Settle on row phases, not a tick count: admission is one request per tick."""
     wids = [
         engine.submit(
             _rand_prompt(cfg.vocab_size, 512, seed=200 + i),
@@ -599,8 +521,7 @@ def time_decode(engine, backend, cfg, b: int, ticks: int, warm: int = 8) -> floa
 
 
 def time_prefill(engine, backend, cfg, length: int, decode_ms: float) -> tuple[float, float]:
-    """One request timed to completion (prefill chunks + the 1-token decode
-    finish); prefill-only subtracts that one decode tick. Baseline method."""
+    """Timed to completion, minus the one decode tick that finishes it (baseline method)."""
     wid = engine.submit(
         _rand_prompt(cfg.vocab_size, length, seed=length),
         SamplingParams(temperature=0.0, max_new_tokens=1, seed=0),
@@ -617,8 +538,7 @@ def check_perf(engine, backend, cfg, batches, prefills, ticks, stream_gib: float
     dec = {}
     for b in batches:
         ms = time_decode(engine, backend, cfg, b, ticks)
-        # Snapshot per batch: a failed capture at B=8 sets the flag False
-        # process-wide and would otherwise retroactively invalidate B=1.
+        # per batch: a failed capture at B=8 flips the flag process-wide.
         dec[b] = {
             "ms_per_tick": ms,
             "per_req_tok_s": 1000.0 / ms,
@@ -646,8 +566,7 @@ def check_perf(engine, backend, cfg, batches, prefills, ticks, stream_gib: float
     base_tps = BASE["decode_b1_tps"]
     dec_ratio = dec[1]["per_req_tok_s"] / base_tps if base_tps else None
     pre_ratios = [v["ratio"] for v in pre.values() if v["ratio"] is not None]
-    # A silent eager fallback makes these numbers incomparable to the baseline,
-    # which was captured with the decode graph on. Only B=1 has a baseline.
+    # the baseline was captured with the decode graph on; only B=1 has one.
     graph = dec[1]["decode_graph_on"] or backend.device.type != "cuda"
     off = [b for b, v in dec.items() if not v["decode_graph_on"]]
     ok = (dec_ratio is None or dec_ratio >= 0.95) and all(r >= 0.95 for r in pre_ratios) and graph
@@ -686,14 +605,7 @@ def check_perf(engine, backend, cfg, batches, prefills, ticks, stream_gib: float
 
 
 def _repack32(wq, scale, rows: int = 512):
-    """Re-block a native block-16 scale grid to block 32.
-
-    ``pack_fp4``'s scale is ``block_max/6`` over the merged pair — the max of
-    the two 16-block scales whenever both blocks reach their grid top, and the
-    tightest scale that clips nothing otherwise. (A mean would push values past
-    6*scale and clamp them.) Row-chunked because pack_fp4's round-to-nearest
-    allocates 32 bytes per weight element.
-    """
+    """Block-16 -> block-32 via pack_fp4's block_max/6: the pair max clips nothing (a mean would)."""
     wqs, scales = [], []
     if getattr(wq, "_tl_twiddled", False):
         wq = reference.untwiddle_fp4(wq)
@@ -812,8 +724,7 @@ def check_block(model, backend, cfg, args, dec16, by16, stream16_gib: float):
 
 
 def _build(cfg, model, backend, args):
-    """Serving build with the baseline's pool sizes (256 blocks = 4096 tokens
-    is too small for an 8192-token prompt; per-tick kernels are identical)."""
+    """Baseline pool sizes; 256 blocks is too small for an 8192-token prompt."""
     return build_engine(
         cfg,
         model,
@@ -826,9 +737,7 @@ def _build(cfg, model, backend, args):
 
 
 def _print_rope_tie(source: str) -> None:
-    """`_validate_hf_config`'s rope/tie guards raise only on a key that is
-    PRESENT and wrong, so an absent one is unchecked and invisible. Print the
-    raw five before the 6-minute load — `None` means nothing validated it."""
+    """_validate_hf_config only checks keys that are present; None means unvalidated."""
     with open(os.path.join(source, "config.json")) as f:
         hf = json.load(f)
     txt = hf.get("text_config", hf)
@@ -925,9 +834,7 @@ def main() -> None:
     _warmup(engine, cfg)
     print(f"decode_graph_on: {engine._decode_graph_on}", flush=True)
 
-    # Check 1 runs AFTER the warmup on purpose: _embed_table_f32's f32 copy of
-    # the embedding table does not exist until the first embedding call, and
-    # sampling before it reported a comfortable PASS with 4.7 GiB uncounted.
+    # after the warmup: the 4.7 GiB f32 embedding copy exists only after the first call.
     run_check(
         1,
         "native fp4, no bf16 masters",
@@ -963,15 +870,14 @@ def main() -> None:
     for r in RESULTS:
         print(f"  {r['n']}  {r['result']:<6} {r['name']}")
         print(f"        {r['evidence']}")
-    # A SKIP is not green: --skip 5 must not exit 0 on a claim nothing tested.
-    # INFO is check 5's attribution arm, which reports rather than asserts.
+    # SKIP is not green; INFO (check 5) reports rather than asserts.
     bad = [r for r in RESULTS if r["result"] in ("FAIL", "ERROR", "SKIP")]
     tally = ", ".join(f"{k} {v}" for k, v in sorted(Counter(r["result"] for r in RESULTS).items()))
     print(
         f"\n  {tally}  in {(time.perf_counter() - t_start) / 60:.1f} min"
         + (f"; NOT GREEN: {[(r['n'], r['result']) for r in bad]}" if bad else "")
     )
-    # Written before the census: one transient nvidia-smi must not cost the run.
+    # before the census: a transient nvidia-smi failure must not cost the run.
     report = {"commit": os.environ.get("BENCH_COMMIT", "?"), "source": args.source, "checks": RESULTS}
     blob = json.dumps(report, sort_keys=True, default=str)
     print("\nJSON " + blob, flush=True)

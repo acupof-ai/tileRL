@@ -31,7 +31,7 @@ nvh, kd, vd = cfg.linear_num_value_heads, cfg.linear_num_key_heads * cfg.linear_
 qd = kd
 shapes = {"in_proj(fused)": (qd + kd + vd + vd + 2 * nvh, h), "out_proj": (h, vd)}
 backend = get_backend()
-bw = bk.__dict__.get("hbm_gbs", lambda: 3254.0)()
+bw = 3254.0  # H20 HBM GB/s
 for name, (N, K) in shapes.items():
     x = torch.randn(1, K, device="cuda", dtype=torch.bfloat16)
     w8 = (torch.randn(N, K, device="cuda") * 0.1).to(torch.float8_e4m3fn)

@@ -7,9 +7,6 @@ from __future__ import annotations
 import os
 from typing import Any, Protocol
 
-__all__ = ["ByteTokenizer", "Tokenizer", "get_tokenizer"]
-
-
 class Tokenizer(Protocol):
     def encode(self, text: str) -> list[int]: ...
 
@@ -17,11 +14,7 @@ class Tokenizer(Protocol):
 
 
 class ByteTokenizer:
-    """Fallback tokenizer: utf-8 bytes, 256 vocab. Lossless, no files.
-
-    Token ids are 0..255, so any model with ``vocab_size >= 256`` (tiny is
-    320) can be served with no checkpoint present.
-    """
+    """utf-8 bytes, vocab 256: serves any model with ``vocab_size >= 256`` without a checkpoint."""
 
     vocab_size = 256
     stop_token_ids: tuple[int, ...] = ()
@@ -34,8 +27,6 @@ class ByteTokenizer:
 
 
 class _HfTokenizerAdapter:
-    """Adapts a `tokenizers.Tokenizer` to the facade contract."""
-
     def __init__(self, tok: Any) -> None:
         self._tok = tok
         self.stop_token_ids = tuple(
@@ -52,11 +43,7 @@ class _HfTokenizerAdapter:
 
 
 def get_tokenizer(source: str | None = None) -> Tokenizer:
-    """Load a HF tokenizer from a hub id or local directory.
-
-    A random-weight tiny model needs no checkpoint, so ``source=None`` uses
-    :class:`ByteTokenizer`. A configured checkpoint fails closed.
-    """
+    """HF tokenizer from a hub id or local directory; ``None`` is the byte fallback."""
     if source:
         from tokenizers import Tokenizer as HfTokenizer
 
@@ -68,23 +55,16 @@ def get_tokenizer(source: str | None = None) -> Tokenizer:
     return ByteTokenizer()
 
 
-#: Qwen3.8-27B model card, 2026-09-02: the recommended sampling per thinking
-#: mode. generation_config.json ships only the thinking row. Non-thinking also
-#: wants presence_penalty 1.5, which the engine does not have.
+# Qwen3.8-27B model card sampling per thinking mode (non-thinking also wants
+# presence_penalty 1.5, which the engine does not have).
 SAMPLING = {True: {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
             False: {"temperature": 0.7, "top_p": 0.8, "top_k": 20}}
 
 
 def render_chat(messages: list[tuple[str, str]], thinking: bool | None = None) -> str:
-    """ChatML — the format Qwen3.x was trained on and what the stop set
-    assumes. ``messages`` are ``(role, text)`` pairs; the assistant turn is
-    left open for the model.
-
-    ``thinking`` follows the 27B checkpoint's own template: True opens the
-    reasoning block (``<think>\n``) for the model to fill, False closes an
-    empty one in the prompt (``<think>\n\n</think>\n\n``) — thinking is
-    switched in the prompt, not by forcing tokens at decode time. None leaves
-    the turn at ``assistant\n`` (the tiny/dev path)."""
+    """ChatML from ``(role, text)`` pairs with the assistant turn left open.
+    ``thinking`` follows the 27B template: True opens ``<think>``, False closes
+    an empty one in the prompt, None leaves the bare turn (tiny/dev path)."""
     rendered = "".join(f"<|im_start|>{r}\n{t}<|im_end|>\n" for r, t in messages)
     tail = {None: "", True: "<think>\n", False: "<think>\n\n</think>\n\n"}[thinking]
     return f"{rendered}<|im_start|>assistant\n{tail}"

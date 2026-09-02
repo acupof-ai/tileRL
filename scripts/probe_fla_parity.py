@@ -1,9 +1,5 @@
-"""fla's chunked core vs our serial one, same inputs.
-
-Speed is meaningless until the two compute the same thing. Ours is gradchecked
-and proven equal to the chunkwise-WY form to 1e-15 in f64; fla runs in bf16, so
-the bar is the bf16 rounding level, not exactness.
-"""
+"""fla's chunked core vs our serial one, same inputs. fla runs in bf16, so the bar is bf16
+rounding, not exactness."""
 
 from __future__ import annotations
 

@@ -1,30 +1,8 @@
-"""Emit CUDA C source for a tileRL kernel on a host with no GPU and no nvcc.
-
-The macOS tilelang wheel is built ``USE_CUDA=OFF`` (CMakeLists auto-selects
-Metal on APPLE), so ``libtilelang.dylib`` ships **zero** ``tl.cuda.*`` globals:
-all 14 CUDA passes and both ``target.build.tilelang_cuda*`` codegen entries are
-absent. Nothing about the target string or pass_configs can reach them.
-
-Two substitutions get a GEMV all the way to CUDA C anyway:
-
-1. The 14 CUDA passes become identity. They lower TMA / mbarrier / tcgen05 /
-   warp-specialization / persistent-CTA constructs, none of which a decode GEMV
-   contains, so dropping them is a no-op *for this kernel class* (see the
-   coverage note below).
-2. ``target.build.tilelang_cuda_without_compile`` becomes TVM's stock
-   ``target.build.cuda``, which is present. On a ``USE_CUDA=OFF`` build it
-   deliberately returns a ``CUDAFallbackModuleNode`` carrying the raw source
-   for later cross-compile -- exactly the no-nvcc path we want.
-
-Covered: ``linear_fp4_gemv`` / ``linear_bf16_gemv`` / ``linear_fp8_gemv`` --
-register-only kernels with no ``T.copy`` / ``T.gemm``. Not covered: every MMA
-kernel, which needs ``src/cuda/op/copy.cc`` + ``gemm.cc`` (compiled out of the
-wheel) and dies with "tl.copy requires a target-specific implementation".
-
-The emitter is TVM's ``CodeGenCUDA``, not tilelang's ``CodeGenTileLangCUDA``,
-so the text is for *inspection*, not a byte-exact preview of a pod build. The
-vector-load widths are safe to read off it regardless: they are fixed in the
-device TIR by VectorizeLoop, before any codegen runs.
+"""Emit CUDA C for a register-only GEMV kernel on a host with no GPU/nvcc.
+The macOS wheel is USE_CUDA=OFF, so the 14 CUDA passes become identity (a GEMV
+uses none of them) and TVM's stock target.build.cuda emits the source. MMA
+kernels are not covered (copy.cc/gemm.cc are compiled out). The emitter is
+TVM's CodeGenCUDA, so read vector-load widths off it, not byte-exact text.
 """
 
 import sys
@@ -72,8 +50,7 @@ if __name__ == "__main__":
         4,
         16,
     )
-    # micro_size_k=8 packs 4 uint8 per thread -> LDG.32 on the weight stream,
-    # against LDG.128 (uint4) on the activation. This is the whole lever.
+    # micro_size_k=8: LDG.32 on the weight stream, LDG.128 on the activation
     assert "*(uint*)(WQ" in src and "*(uint4*)(X " in src, "load widths moved"
     if len(sys.argv) > 1:
         with open(sys.argv[1], "w") as f:

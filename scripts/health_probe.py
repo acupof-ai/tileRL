@@ -1,17 +1,9 @@
-"""Localize check-2 (input-independent output) by tracking, layer by layer,
-the last-token residual COSINE between two DIFFERENT prompts. check 2 collapses
-every prompt to the same token, so the prompt signal dies somewhere in the
-stack. The first layer whose cross-prompt cosine jumps to ~1.0 is where the
-input stops mattering — inspect that op.
-
-A norm/finite check can't see this: both streams stay finite and plausibly
-normed while silently converging. Cosine catches it.
-
+"""Localize an input-independent output: per-sublayer cross-prompt cosine of
+the last-token residual delta between two prompts. The first sublayer whose
+delta cosine reaches ~1.0 is where the prompt stops mattering (a norm/finite
+check cannot see two streams silently converging). Exit 0 if cos < 0.99 throughout.
   PYTHONPATH=src TILERL_TARGET=cuda python3 -u scripts/health_probe.py \
-      /data00/Qwen3.8-27B-NVFP4 --gpu 7 [--tokens 256]
-
-Exit 0 if cosine stays < 0.99 through the stack, 1 otherwise. Dev tooling, no
-bench entry. CPU/metal work too (drop --gpu) for a tiny-model smoke.
+      /data00/Qwen3.8-27B-NVFP4 --gpu 7 [--tokens 256]   (no source = tiny smoke)
 """
 
 from __future__ import annotations
@@ -21,8 +13,7 @@ import os
 import sys
 
 
-def _pin_gpu(gpu: int | None) -> None:
-    # Pin before importing torch, same discipline as verify_h20_fp4.py.
+def _pin_gpu(gpu: int | None) -> None:  # before importing torch
     if gpu is not None:
         if gpu not in (6, 7):
             print(f"FATAL: GPU {gpu} is not ours (only 6,7)")
@@ -50,7 +41,7 @@ def main() -> int:
 
     backend = get_backend()
     if args.source:
-        cfg = qwen38_27b()  # same config path as verify_h20_fp4.py
+        cfg = qwen38_27b()
         model = load_hf(cfg, args.source, fuse_projections=True)
         cfg = model.cfg
     else:
@@ -59,12 +50,6 @@ def main() -> int:
         args.tokens = min(args.tokens, 16)
 
     n = min(args.tokens, cfg.max_position_embeddings)
-    # Two DISTINCT prompts. check 2 collapses all prompts to the same token, so
-    # the output is ~input-independent: the prompt signal dies somewhere. Track
-    # the last-token residual cosine BETWEEN the two prompts, layer by layer.
-    # The first layer whose cosine jumps to ~1.0 is where the input stops
-    # mattering — that op (or its predecessor) is the bug. A norm/finite check
-    # alone can't see this: both streams stay finite and plausibly-normed.
     rng = np.random.default_rng(0)
     ids_a = rng.integers(1, cfg.vocab_size, size=n, dtype=np.int64).reshape(1, n)
     ids_b = rng.integers(1, cfg.vocab_size, size=n, dtype=np.int64).reshape(1, n)
@@ -73,12 +58,8 @@ def main() -> int:
     from tilerl.train import _training_kv
 
     def run(ids: np.ndarray):
-        # Manual per-layer forward mirroring Model.forward. For each SUBLAYER we
-        # capture the added residual delta (out - x), last token — not just the
-        # residual. A sublayer that washes out the input has an input-INDEPENDENT
-        # delta: its cross-prompt cosine → 1 even while its input still varied.
-        # That pins the culprit op, which the whole-residual cosine cannot (the
-        # residual is dominated by a large shared component in any real model).
+        # mirrors Model.forward; captures each sublayer's delta, since the whole
+        # residual is dominated by a shared component and cannot pin the op
         kv = _training_kv(model, 1, n, device=backend.device)
         pos = torch.as_tensor(positions, dtype=torch.long, device=backend.device)
         x = backend.embedding(
@@ -119,8 +100,6 @@ def main() -> int:
         fin = bool(torch.isfinite(va).all() and torch.isfinite(vb).all())
         cos = float(torch.nn.functional.cosine_similarity(va, vb, dim=0)) if fin else float("nan")
         print(f"{na:<10} {va.norm():>11.3e} {vb.norm():>11.3e} {cos:>10.4f} {str(fin):>7}")
-        # A sublayer whose ADDED delta is ~input-independent (cos>0.99) is the
-        # op washing out the prompt. embed/logits rows are residuals, skip them.
         if bad is None and na.endswith("Δ") and (not fin or cos > 0.99):
             bad = (na, cos)
     if bad:

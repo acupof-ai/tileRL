@@ -1,7 +1,4 @@
-"""Smoke + usage example for benchkit: the shipped GDN chunk kernel vs the
-torch-eager reference at slice4 prefill-512 shapes.
-
-Usage (pod):
+"""benchkit smoke: shipped GDN chunk kernel vs torch-eager at slice4 prefill-512.
     scripts/_pod_bench.sh 'PYTHONPATH=src python3 scripts/bench_smoke.py'
 """
 

@@ -40,8 +40,7 @@ def main() -> None:
         p = model.params[key]
         idx = (0, 0) if p.ndim == 2 else (0,)
         analytic = grads[id(p)][idx].item()
-        # the same central difference the gradcheck uses, at three step sizes:
-        # a probe that is sound reports the same slope at all three.
+        # a sound central-difference probe reports the same slope at all three steps.
         nums = []
         for step in (0.1, 0.05, 0.025):
             orig = p[idx].item()

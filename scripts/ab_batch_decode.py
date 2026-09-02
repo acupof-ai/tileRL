@@ -1,25 +1,7 @@
-"""A/B: batched-decode arms for B=2..8 (the small-M GEMV follow-up).
+"""A/B: batched-decode arms (shipped / ks1 / smallm) at B=1..8 on the slice4 decode graph.
 
-Three arms, same process, same model, same inputs; quiet-gated GPU:
-  shipped — M==1 GEMV; B>=2 runs the fp8 WGMMA path (e4m3 A-quant +
-            k_split=2 atomics, M padded 8->16).
-  ks1     — k_split=1 WGMMA for 2<=M<=8 (no atomic adds; the N-grid is
-            already over-saturated on the large-N linears).
-  smallm  — shared-X small-M GEMV for 2<=M<=8 (W streamed once, M-way FMA,
-            XQ staged to shared per K-tile; e4m3 A so the output matches
-            shipped within summation noise).
-
-Measures: slice4 decode graph at B=1/2/4/8 (30-tick steady-state avg),
-kernel fro-relerr vs shipped AND vs the f32 reference on identical B=8
-inputs (the errors entry's rule: fro, not allclose, past K~1024), and
-greedy token equality over the measured ticks.
-
-Win gate (per arm): B=8 aggregate tok/s gain >= 3% AND max fro-relerr
-vs shipped <= 1e-2. B=1 must stay neutral (the M=1 path is settled).
-
-Usage:
-    CUDA_VISIBLE_DEVICES=6 TILERL_TARGET=cuda PYTHONPATH=src \\
-        python3 scripts/ab_batch_decode.py /host/tc27-nvfp4-slice4 --layers 4
+Win gate per arm: B=8 aggregate tok/s gain >= 3%, max fro-relerr vs shipped <= 1e-2, B=1 neutral.
+Usage: CUDA_VISIBLE_DEVICES=6 TILERL_TARGET=cuda PYTHONPATH=src python3 scripts/ab_batch_decode.py /host/tc27-nvfp4-slice4 --layers 4
 """
 
 from __future__ import annotations
@@ -50,8 +32,7 @@ ARMS = {
 
 
 def _quantize_fp8(w_master):
-    """Per-128-block quant into the loader's native layout (tests' helper,
-    inlined so the script needs no tests/ on PYTHONPATH)."""
+    """Per-128-block quant in the loader's layout; inlined so tests/ need not be on PYTHONPATH."""
     n, k = w_master.shape
     ns, ks = (n + 127) // 128, (k + 127) // 128
     padded = w_master.float().new_zeros(ns * 128, ks * 128)
@@ -69,7 +50,6 @@ def prompts_for(cfg, b):
 
 
 def run_arm(model, backend, cfg, batches, arm):
-    """One engine at one flag setting: warmup + 30-tick graph timing per B."""
     for flag, val in ARMS[arm].items():
         setattr(backend_mod, flag, val)
     engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8, decode_graph=True)
@@ -112,11 +92,7 @@ def run_arm(model, backend, cfg, batches, arm):
 
 
 def kernel_relerr(backend, arm):
-    """Candidate vs shipped AND vs f32 ref on identical B=8 inputs.
-
-    Returns fro-relerr vs shipped (the win-gate metric) and fro-relerr vs
-    the f32 reference (the parity metric — the errors entry's rule: fro,
-    not allclose, past K~1024)."""
+    # Frobenius, not allclose: past K~1024 elementwise tolerances flag summation-order noise.
     from tilerl_kernels.reference import pack_fp4
 
     torch.manual_seed(41)

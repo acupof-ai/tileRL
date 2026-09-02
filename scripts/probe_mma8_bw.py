@@ -1,7 +1,4 @@
-"""Why does mma8 move the same weight bytes at 38% of the GEMV's rate?
-
-One representative decode shape, the two kernels back to back, so ncu can
-attribute the difference. Run bare for the timing, or under
+"""GEMV vs mma8 on the same weight bytes, back to back. Bare for the timing, or under
 ``ncu --set full --kernel-name-base function`` for the memory counters.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
@@ -21,8 +18,7 @@ from tilerl_kernels.backend import get_backend
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    # The 27B's real decode shapes (hidden 5120): a single big one is not
-    # representative — the in-model gemv/mma8 gap averages over all of these.
+    # the 27B's decode shapes (hidden 5120); the in-model gap averages over all of them
     ap.add_argument("--shapes", default="8192x5120,5120x6144,17408x5120,5120x17408,"
                                         "10240x5120,6144x5120,248320x5120")
     ap.add_argument("--iters", type=int, default=50)
@@ -33,9 +29,7 @@ def main() -> None:
     torch.manual_seed(0)
 
     def timed(fn):
-        """KERNEL time, from the CUDA profiler. Wall time around the Python call
-        is ~50 us of dispatch/pad/serve on top of a ~20 us kernel, which made a
-        first pass of this probe measure Python and conclude the wrong thing."""
+        # kernel time from the profiler: wall adds ~50 us of dispatch on a ~20 us kernel
         for _ in range(5):
             fn()
         torch.cuda.synchronize()

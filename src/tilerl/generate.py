@@ -1,22 +1,13 @@
 """Offline batch generation across N devices, one PROCESS per device.
 
-Synthetic-data generation is a burst of many independent prompts, which is
-the shape data parallelism serves best: replicas share nothing, so nothing
-contends. Measured on 8 H20s, eight independent processes reach 7.54x
-(wins/2026-08-29-data-parallel-scales.md) and the per-card cost of full
-occupancy is ~5%.
-
 A process per device, not :class:`~tilerl.parallel.DataParallelEngine`: that
-wrapper runs N CUDA contexts in ONE interpreter, so the Python half of every
-tick serialises on the GIL. Its own docstring names a process per device as
-the upgrade path, and 7.54x is what that shape measured. Nothing here needs
-inter-process communication — each worker owns a disjoint slice of the
-prompts and writes its own output file, so there is no queue, no shared
-state, and no collective.
+wrapper runs N CUDA contexts in one interpreter and the Python half of every
+tick serialises on the GIL. Eight processes measured 7.54x on 8 H20s
+(wins/2026-08-29-data-parallel-scales.md). Each worker owns a disjoint slice
+of the prompts and writes its own file: no queue, no shared state.
 
-# ponytail: prompts are assigned by stride (rank i takes i::N). Uniform
-# lengths balance perfectly; a skewed corpus leaves cards idle at the tail,
-# and the upgrade is a shared work queue.
+# ponytail: prompts are assigned by stride (rank i takes i::N); a skewed corpus
+# leaves cards idle at the tail, and the upgrade is a shared work queue.
 """
 
 from __future__ import annotations
@@ -26,12 +17,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-__all__ = ["generate", "run_worker"]
-
 
 def _read_prompts(path: str | Path) -> list[dict]:
-    """JSONL rows. Each needs ``token_ids`` (list[int]) or ``prompt`` (str);
-    a str prompt requires a tokenizer, which the caller supplies."""
     with open(path) as f:
         return [json.loads(line) for line in f if line.strip()]
 
@@ -41,7 +28,6 @@ def run_worker(
     world: int,
     device: int,
     source: str | None,
-    model_name: str,
     prompts_path: str,
     out_path: str,
     max_new_tokens: int,
@@ -50,10 +36,8 @@ def run_worker(
     seed: int,
     max_batch: int,
 ) -> None:
-    """One device's share of the corpus. Runs in its own process."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
-    # Imported here, after CUDA_VISIBLE_DEVICES: the Backend binds the current
-    # device when it is constructed.
+    # Imported after CUDA_VISIBLE_DEVICES: the Backend binds the current device on construction.
     import torch
 
     from .engine import SamplingParams, build_engine
@@ -86,11 +70,7 @@ def run_worker(
         max_total_tokens=max(8192, longest + max_new_tokens + 64),
     )
 
-    # Submit in a sliding window, never all at once: Engine.submit allocates
-    # the request's recurrent state slot THERE, not when it is admitted, so
-    # the pool bounds how many may be in flight - not how many may run. A
-    # corpus of thousands would exhaust it on the first line.
-    done: dict[int, list[int]] = {}
+    # Sliding window: submit allocates the state slot, so the pool bounds in-flight requests.
     ids: dict[int, int] = {}
     nxt, wrote = 0, 0
     with open(out_path, "w") as f:
@@ -104,8 +84,7 @@ def run_worker(
                 ids[rid] = nxt
                 nxt += 1
             engine.step()
-            done = engine.poll()
-            for rid, out in done.items():
+            for rid, out in engine.poll().items():
                 i = ids.pop(rid)
                 f.write(json.dumps({
                     "index": i, "rank": rank,
@@ -123,7 +102,6 @@ def generate(
     out: str,
     devices: list[int],
     source: str | None = None,
-    model_name: str = "qwen38-27b",
     max_new_tokens: int = 128,
     temperature: float = 0.0,
     top_p: float = 1.0,
@@ -131,9 +109,7 @@ def generate(
     max_batch: int = 32,
 ) -> dict[str, Any]:
     """Fan the corpus across ``devices``, one process each, then merge.
-
-    Returns counters: prompts in, rows written, seconds, tokens/s.
-    """
+    Returns counters: prompts in, rows written, seconds, tokens/s."""
     import multiprocessing as mp
     import time
 
@@ -144,7 +120,7 @@ def generate(
     t0 = time.perf_counter()
     procs = [
         ctx.Process(target=run_worker, args=(
-            r, world, d, source, model_name, prompts, parts[r],
+            r, world, d, source, prompts, parts[r],
             max_new_tokens, temperature, top_p, seed, max_batch,
         ))
         for r, d in enumerate(devices)
