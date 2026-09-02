@@ -1,9 +1,12 @@
 # ncols=2 is 1.82× — raising loads-per-FMA is the lever, V100 sm70, 2026-09-03
 
-> Status: **SHIPPED.** 1.82× on the microbench at M=32 against a ≥1.25× threshold
-> committed before the run, and **1.59× on the 27B's prefill at 4096 (8.66 → 5.47
-> ms/token, TTFT 35.5 → 22.4 s)**. Greedy text is identical to `ncols=1` on real
-> prompts at both M=1 and M>8. Fourth attempt in this family and the first that pays.
+> Status: **SHIPPED, gated to the top rung.** 1.82× on the microbench at M=32, and
+> **1.52-1.60× on the 27B's prefill** (8.91 → 5.86 ms/token at 4096, TTFT 35.5 → 24.0 s).
+> Greedy text is identical to `ncols=1` on real prompts. Applied at M≥32 only: on the
+> M=1 decode path the same kernel *costs* 4.9%, because there the GEMV is
+> bandwidth-bound and halving the grid only starves it —
+> [`errors/2026-09-03-ncols2-cost-5-percent-of-decode.md`](../errors/2026-09-03-ncols2-cost-5-percent-of-decode.md).
+> Fourth attempt in this family and the first that pays.
 
 ## Context
 
@@ -150,8 +153,9 @@ gates `ncols=2` on `Np == N and N % 2 == 0`.
 | 2026-09-03 | e8e7c95 | V100 | cuda sm70 | GEMV M=32 | HFMA2 per LDG | 3.53 → **6.06** |
 | 2026-09-03 | e8e7c95 | V100 | cuda sm70 | GEMV M=32 | registers / spills | 254 / **0** (was 255 / 24 B) |
 | 2026-09-03 | 01fa731 | V100 | cuda sm70 | qwen38-27b | prefill ms/token @4096, HEAD control | 8.91 (recorded 8.92, 0.1%) |
-| 2026-09-03 | (this) | V100 | cuda sm70 | qwen38-27b | prefill ms/token @4096 | 8.66 → **5.47 (1.59×)** |
-| 2026-09-03 | (this) | V100 | cuda sm70 | qwen38-27b | prefill ms/token @2048 | 8.17 → **4.97 (1.64×)** |
-| 2026-09-03 | (this) | V100 | cuda sm70 | qwen38-27b | prefill ms/token @512 | 7.81 → **4.61 (1.69×)** |
-| 2026-09-03 | (this) | V100 | cuda sm70 | qwen38-27b | TTFT @4096 | 35.5 → **22.4 s** |
+| 2026-09-03 | f6d0805 | V100 | cuda sm70 | qwen38-27b | prefill ms/token @4096, ncols on all M | 8.66 → 5.47 (1.59×) |
+| 2026-09-03 | (gated) | V100 | cuda sm70 | qwen38-27b | **prefill ms/token @4096, gated M≥32** | 8.91 → **5.86 (1.52×)** |
+| 2026-09-03 | (gated) | V100 | cuda sm70 | qwen38-27b | prefill ms/token @512, gated | 7.88 → **4.91 (1.60×)** |
+| 2026-09-03 | (gated) | V100 | cuda sm70 | qwen38-27b | dense decode @4096, gated | **39.1 tok/s (no regression)** |
+| 2026-09-03 | f6d0805 | V100 | cuda sm70 | qwen38-27b | dense decode @4096, ncols at M=1 | 37.2 tok/s (**−4.9%, rejected**) |
 | 2026-09-03 | (this) | V100 | cuda sm70 | qwen38-27b | greedy text vs ncols=1 | identical, M=1 and M>8 |

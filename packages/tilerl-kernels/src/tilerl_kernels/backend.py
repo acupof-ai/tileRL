@@ -79,6 +79,11 @@ _MGEMV = int(os.environ.get("TILERL_MGEMV", "3"))
 #: columns (HFMA2 per LDG 3.53 -> 6.06, 1.82x at M=32), 1 is the A/B arm
 #: (wins/2026-09-03-ncols2-raises-loads-per-fma.md).
 _NCOLS = int(os.environ.get("TILERL_NCOLS", "2"))
+#: Lowest rung ncols=2 is used on. Below it the GEMV is bandwidth-bound, so halving
+#: the grid only starves it: dense decode measured 39.1 -> 37.2 tok/s at 4096 with
+#: ncols on at M=1 (errors/2026-09-03-ncols2-cost-5-percent-of-decode.md). 32 is the
+#: top rung, i.e. prefill only -- a verify tick is M=B*W<=32 and takes the 8 rung.
+_NCOLS_MIN_M = 32
 _MMA_RED = kernels_linear._RED_TILE
 
 #: CUDA linear family: (op, M-regime) -> (kernel, K pad, N cap, N tile).
@@ -489,12 +494,17 @@ class Backend:
             # callers read it as their residual while this one writes into it.
             # kernel's Y is f32 (kernels_linear.py: Y = T.empty((M, N), "float32")).
             y2 = torch.empty(M, N, dtype=torch.float32, device=self.device) if len(chunks) > 1 else None
-            # ncols=2 only when Np == N: a padded plane pairs a real column with a
-            # PAD column (the kernel derives half from its own N), and that garbage
-            # lands inside the [:Mr, :N] slice below. Np == N holds for every
-            # shipped shape, but that is the shapes' property, not the code's.
-            nc = _NCOLS if Np == N and N % 2 == 0 else 1
+            # ncols=2 only for the top rung. It pays where the GEMV is compute-bound
+            # (prefill, M=32: 1.82x) and COSTS 4.9% of dense decode, because at M=1
+            # the kernel is bandwidth-bound so there is no arithmetic to win, and
+            # halving the grid starves shapes already at 5-33% of peak
+            # (errors/2026-09-03-ncols2-cost-5-percent-of-decode.md).
+            # Also requires Np == N: a padded plane pairs a real column with a PAD
+            # column (the kernel derives half from its own N), and that garbage lands
+            # inside the [:Mr, :N] slice below.
+            nc2 = _NCOLS if Np == N and N % 2 == 0 else 1
             for m, Mr, Mk in chunks:
+                nc = nc2 if Mk >= _NCOLS_MIN_M else 1
                 # ncols by KEYWORD: positionally the 6th factory arg is `abl`, and
                 # passing nc there ran the X_REUSE / NO_SCALE ablations instead --
                 # both return wrong numbers, and X_REUSE's deleted loads read as a

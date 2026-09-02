@@ -67,7 +67,7 @@ def test_the_padding_guard_is_what_rejects_a_padded_shape():
     from tilerl_kernels.backend import Backend
 
     src = inspect.getsource(Backend.linear_fp4)
-    assert "nc = _NCOLS if Np == N and N % 2 == 0 else 1" in src, (
+    assert "nc2 = _NCOLS if Np == N and N % 2 == 0 else 1" in src, (
         "the sm70 dispatch must gate ncols on Np == N and even N: a padded plane "
         "pairs a real column with a PAD column, and that garbage lands inside the "
         "[:Mr, :N] slice the dispatch keeps"
@@ -88,6 +88,39 @@ def test_the_padding_guard_is_what_rejects_a_padded_shape():
         f"pad columns {sorted(pad_cols)} are pair partners; their garbage would "
         f"land in Y[:, {np_ // 2}:{n}] which the [:Mr, :N] slice keeps"
     )
+
+
+def test_ncols_is_gated_to_the_top_rung():
+    """ncols=2 must reach only M>=32, or dense decode loses 4.9%.
+
+    The mechanism pays where the GEMV is compute-bound. At M=1 it is bandwidth-bound
+    (83% of its byte roofline), so there is no arithmetic to win and only the halved
+    grid remains -- and the shipped decode shapes are already at 5-33% of peak.
+    Measured 39.1 -> 37.2 tok/s at 4096, uniform ~4.9% at every context, reproduced
+    by a second nc2 arm to the decimal
+    (errors/2026-09-03-ncols2-cost-5-percent-of-decode.md).
+
+    This is a SILENT failure mode: the wrong rung costs throughput and nothing
+    raises, which is why the flip shipped with prefill numbers only.
+    """
+    import inspect
+
+    from tilerl_kernels.backend import _NCOLS_MIN_M, Backend, _sm70_chunks
+
+    assert _NCOLS_MIN_M == 32, "ncols belongs on the top rung only (prefill)"
+    src = inspect.getsource(Backend.linear_fp4)
+    assert "nc = nc2 if Mk >= _NCOLS_MIN_M else 1" in src, (
+        "the per-chunk rung must gate ncols: a decode chunk compiles at Mk=1 and "
+        "must get the 1-column kernel"
+    )
+    # The rungs decode and a verify tick actually take, from the ladder itself.
+    for rows in (1, 2, 4, 8, 32):
+        for _, _, mk in _sm70_chunks(rows):
+            gated = mk >= _NCOLS_MIN_M
+            assert gated == (rows == 32), (
+                f"M={rows} compiles rung {mk}: ncols {'on' if gated else 'off'}, "
+                f"but only the 32 rung (prefill) may have it on"
+            )
 
 
 def test_ncols_factory_rejects_what_it_cannot_serve():
