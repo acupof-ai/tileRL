@@ -234,3 +234,112 @@ def test_messages_stream_is_anthropic_sse(client, tmp_path, monkeypatch):
     assert events[0] == "message_start" and events[-1] == "message_stop"
     for needed in ("content_block_start", "content_block_delta", "content_block_stop"):
         assert needed in events, f"{needed} missing from {events}"
+
+
+class _ScriptedEngine:
+    """An engine that returns canned completions, in submit order.
+
+    The semantic half of stage 1's gate cannot use a real tiny model: random
+    weights emit noise until max_tokens and can never produce a well-formed
+    tool call, so the tool_use path would be untestable until a checkpoint
+    exists. This satisfies the same duck type the real Engine does
+    (submit/poll/take/step/logprobs/stats) and lets the SHIM's rendering of
+    tool_use and stop_reason be gated on a machine with no weights at all --
+    which is also what stage 2's launcher needs.
+    """
+
+    def __init__(self, tokenizer, replies: list[str]):
+        self._tok = tokenizer
+        self._replies = list(replies)
+        self._next = 0
+        self._done: dict[int, list[int]] = {}
+        self._lp: dict[int, list[float]] = {}
+        self._taken: set[int] = set()
+
+    def submit(self, input_ids, params=None) -> int:
+        self._next += 1
+        text = self._replies.pop(0) if self._replies else ""
+        ids = self._tok.encode(text)
+        self._done[self._next] = ids
+        self._lp[self._next] = [-0.1] * len(ids)
+        return self._next
+
+    def take(self, request_id: int):
+        return self._done.pop(request_id, None)
+
+    def poll(self) -> dict:
+        out, self._done = dict(self._done), {}
+        return out
+
+    def step(self) -> None:
+        return None
+
+    def logprobs(self, request_id: int):
+        if request_id in self._lp:
+            self._taken.add(request_id)
+            return self._lp.pop(request_id)
+        if request_id in self._taken:  # same contract as the real engine
+            raise KeyError(f"logprobs for request {request_id} were already taken")
+        return None
+
+    def stats(self) -> dict:
+        return {"waiting": 0, "running": 0, "finished": len(self._taken)}
+
+
+def test_messages_tool_use_round_trip(tmp_path, monkeypatch):
+    """The full agent shape: tool_use out, tool_result back in, answer out.
+
+    Gates what a real Claude Code loop needs from the shim -- a structured
+    tool_use block with stop_reason="tool_use", and a follow-up request whose
+    tool_result content is rendered back into the prompt -- without needing a
+    model that can produce either.
+    """
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "rt.jsonl"))
+    tok = _ByteTokenizer()
+    engine = _ScriptedEngine(tok, [
+        '{"tool": "Bash", "input": {"command": "ls"}}',
+        "there are 3 files",
+    ])
+    app = create_app(engine, tok)
+    with TestClient(app) as c:
+        first = c.post("/v1/messages", json={
+            "max_tokens": 64,
+            "tools": [{"name": "Bash", "description": "Run a command",
+                       "input_schema": {"properties": {"command": {}}}}],
+            "messages": [{"role": "user", "content": "list the files"}],
+        })
+        assert first.status_code == 200, first.text
+        body = first.json()
+        assert body["stop_reason"] == "tool_use", body
+        block = body["content"][0]
+        assert block["type"] == "tool_use" and block["name"] == "Bash"
+        assert block["input"] == {"command": "ls"}
+        assert block["id"].startswith("toolu_")
+
+        # the client executes the tool and sends the result back, as Claude Code does
+        second = c.post("/v1/messages", json={
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "list the files"},
+                {"role": "assistant", "content": [block]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": block["id"], "content": "a.py b.py c.py"}
+                ]},
+            ],
+        })
+        assert second.status_code == 200, second.text
+        final = second.json()
+        assert final["stop_reason"] == "end_turn"
+        assert final["content"][0]["type"] == "text"
+        assert "3 files" in final["content"][0]["text"]
+
+    rows = [json.loads(x) for x in (tmp_path / "rt.jsonl").read_text().splitlines()]
+    assert len(rows) == 2
+    assert rows[0]["stop_reason"] == "tool_use" and rows[1]["stop_reason"] == "end_turn"
+    for r in rows:
+        assert len(r["logprobs"]) == len(r["completion_ids"])
+    # The tool_result reached the prompt. Not "turn 2 is longer" -- turn 1
+    # carries the tools block and turn 2 does not, so turn 2 is the SHORTER
+    # render (211 vs 218 ids as written). Assert the content instead.
+    assert "<tool_result>a.py b.py c.py</tool_result>" in tok.decode(rows[1]["prompt_ids"])
+    assert '"tool": "Bash"' in tok.decode(rows[1]["prompt_ids"])
