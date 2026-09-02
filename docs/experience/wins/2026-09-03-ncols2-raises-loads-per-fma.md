@@ -1,9 +1,10 @@
 # ncols=2 is 1.82× — raising loads-per-FMA is the lever, V100 sm70, 2026-09-03
 
 > Status: **ACCEPTED at the microbench level**, 1.82× at M=32 against a ≥1.25×
-> threshold committed before the run, numerically correct, zero spills. Not yet
-> wired into the shipped dispatch — that needs a padding gate and a full-model
-> bench, tracked separately. Fourth attempt in this family and the first that pays.
+> threshold committed before the run, numerically correct, zero spills. Wired into
+> the dispatch behind a padding gate; the full-model prefill number is
+> `pending-remote` after the first A/B turned out to be measuring `abl`, not
+> `ncols`. Fourth attempt in this family and the first that pays.
 
 ## Context
 
@@ -26,7 +27,7 @@ is reachable in this kernel, so ~+41 for a second weight set and accumulator fit
 
 ## Results
 
-`scripts/ab_gemv_ablate.py`, `abl=6`. No relerr warning fired.
+`scripts/ab_gemv_ablate.py`, the `NCOLS2` column. No relerr warning fired.
 
 | shape | M | X_REUSE | PIPELINE | SMEM | **NCOLS2** |
 |---|---:|---:|---:|---:|---:|
@@ -63,18 +64,22 @@ Prefill is 8.92 ms/token at 4096 and ~85% of it is this kernel, so 1.82× gives
 
     8.92 → 5.50 ms/token,  TTFT 36.5 → 22.5 s
 
-**A microbench win is not a model win**, and this is not wired into the dispatch
-yet. Two things gate that:
+**A microbench win is not a model win.** Two gates stand between this and shipping:
 
-1. **Padding.** The kernel derives `half = N // 2` from its own `N`, which is the
-   *padded* `Np` the backend hands it. Every shipped shape is even and unpadded
+1. **Padding — DONE.** The kernel derives `half = N // 2` from its own `N`, which is
+   the *padded* `Np` the backend hands it. Every shipped shape is even and unpadded
    (34816 / 5120 / 6144 / 17408), so pairing is safe today — but a padded `Np` would
    pair a real column with a pad column and write garbage into `Y[:, N/2:]`, which
-   the `[:Mr, :N]` slice **keeps**. That needs an explicit guard, not a coincidence.
+   the `[:Mr, :N] `slice **keeps**. The dispatch now gates on
+   `nc = _NCOLS if Np == N and N % 2 == 0 else 1`, and
+   `tests/test_ncols_contract.py` checks the guard's own source (both negative
+   controls verified).
 2. **A full-model bench** on the 27B prefill path, not six shapes in isolation.
-
-Until both are done the flag stays `abl=6`, off by default, and the shipped path is
-byte-for-byte unchanged.
+   The first attempt was invalid: `ncols` was passed positionally, landed on `abl`,
+   and both arms ran ablation kernels that return wrong numbers — see
+   [`errors/2026-09-03-the-ab-measured-abl-not-ncols.md`](../errors/2026-09-03-the-ab-measured-abl-not-ncols.md).
+   Re-running with the keyword fix. Until the number is in, the flag defaults on but
+   the entry claims nothing end to end.
 
 ## Rule
 
@@ -93,16 +98,18 @@ been some other effect wearing this fix's name.
 
 ## Gate
 
-`abl=6` is numerically correct (harness checks relerr on every shape) and defaults
-to 0; 182 tests pass. `ncols` requires even N — enforced when it ships, not now.
+Numerically correct (the harness checks relerr on every shape); 186 tests pass.
+`ncols`, `abl` and `min_blocks` are keyword-only on the factory, and the dispatch
+gates `ncols=2` on `Np == N and N % 2 == 0`.
 
 ## Results table
 
 | date | commit | machine | target | model | measurement | value |
 |---|---|---|---|---|---|---|
-| 2026-09-03 | e8e7c95 | V100 | cuda sm70 | GEMV M=32 | ncols=2 (abl=6) | **1.82× — accept** |
+| 2026-09-03 | e8e7c95 | V100 | cuda sm70 | GEMV M=32 | ncols=2 | **1.82× — accept** |
 | 2026-09-03 | e8e7c95 | V100 | cuda sm70 | GEMV M=8 | ncols=2 | 1.72× |
 | 2026-09-03 | e8e7c95 | V100 | cuda sm70 | GEMV M=1 | ncols=2 | 1.05× (noise floor ±4%) |
 | 2026-09-03 | e8e7c95 | V100 | cuda sm70 | GEMV M=32 | HFMA2 per LDG | 3.53 → **6.06** |
 | 2026-09-03 | e8e7c95 | V100 | cuda sm70 | GEMV M=32 | registers / spills | 254 / **0** (was 255 / 24 B) |
-| 2026-09-03 | pending | V100 | cuda sm70 | qwen38-27b | prefill ms/token | pending-remote |
+| 2026-09-03 | 01fa731 | V100 | cuda sm70 | qwen38-27b | prefill ms/token @4096, HEAD control | 8.91 (recorded 8.92, 0.1%) |
+| 2026-09-03 | pending | V100 | cuda sm70 | qwen38-27b | prefill ms/token @4096, ncols=2 | pending-remote |

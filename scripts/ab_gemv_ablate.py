@@ -48,8 +48,13 @@ SHAPES = [(34816, 5120, 64, "gate_up"), (5120, 17408, 64, "down"),
           (16384, 5120, 48, "qkvz"), (5120, 6144, 48, "gdn out"),
           (14336, 5120, 16, "qkv"), (5120, 6144, 16, "attn o")]
 MS = (1, 8, 32)
-ABLATIONS = [(1, "X_REUSE"), (2, "NO_SCALE"), (3, "NO_DECODE"), (4, "PIPELINE"),
-             (5, "SMEM"), (6, "NCOLS2")]
+#: (id, label, factory kwargs). NCOLS2 is not an `abl` value: it graduated into the
+#: shipping `ncols` parameter, so the harness reaches it the same way the dispatch
+#: does. Building it via a stale `abl=6` would have silently compiled the BASE
+#: kernel and reported 1.00x (errors/2026-09-03-the-ab-measured-abl-not-ncols.md).
+ABLATIONS = [(1, "X_REUSE", {"abl": 1}), (2, "NO_SCALE", {"abl": 2}),
+             (3, "NO_DECODE", {"abl": 3}), (4, "PIPELINE", {"abl": 4}),
+             (5, "SMEM", {"abl": 5}), (6, "NCOLS2", {"ncols": 2})]
 #: 4, 5 and 6 are CORRECT variants, so they are both discriminators and candidate
 #: fixes; the harness checks their relerr. Measured so far: PIPELINE 0.99x (reorder
 #: -- the cost is throughput, not latency), SMEM 0.67x (swaps LDG for LDS and keeps
@@ -63,7 +68,7 @@ ABLATIONS = [(1, "X_REUSE"), (2, "NO_SCALE"), (3, "NO_DECODE"), (4, "PIPELINE"),
 PIPE_ACCEPT = 1.15
 SMEM_ACCEPT = 1.30
 NCOLS_ACCEPT = 1.25
-CORRECT_ABL = (4, 5, 6)
+CORRECT_ABL = (4, 5, 6)  # variants that keep the arithmetic: their relerr is checked
 BLK, NP = 32, 4
 FMA_PEAK = 31.3
 
@@ -77,9 +82,9 @@ def main() -> None:
     for M in MS:
         base = kernels_linear.make_linear_fp4_gemv_sm70_m(be.target, M=M, xh=True, sh=True)
         cands = [(a, lbl, kernels_linear.make_linear_fp4_gemv_sm70_m(
-            be.target, M=M, xh=True, sh=True, abl=a)) for a, lbl in ABLATIONS]
+            be.target, M=M, xh=True, sh=True, **kw)) for a, lbl, kw in ABLATIONS]
         print(f"\n{'shape':>20} {'M':>3} {'base us':>9} " +
-              " ".join(f"{lbl:>10}" for _, lbl in ABLATIONS))
+              " ".join(f"{lbl:>10}" for _, lbl, _ in ABLATIONS))
         for N, K, cnt, label in SHAPES:
             g = torch.Generator(device="cpu").manual_seed(N * 131 + K)
             wq = torch.randint(0, 255, (N, K // 2), dtype=torch.uint8, generator=g).to(dev)
@@ -108,7 +113,7 @@ def main() -> None:
     print("\nper-pass total over these shapes (ms), weighted by launches/token:")
     for M in MS:
         b = tot[(M, 0)]
-        row = "  ".join(f"{lbl} {b / tot[(M, a)]:.2f}x" for a, lbl in ABLATIONS)
+        row = "  ".join(f"{lbl} {b / tot[(M, a)]:.2f}x" for a, lbl, _ in ABLATIONS)
         print(f"  M={M:>2}: base {b:>7.1f}   {row}")
 
     pipe = tot[(32, 0)] / tot[(32, 4)]

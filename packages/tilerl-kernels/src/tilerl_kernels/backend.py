@@ -75,6 +75,10 @@ _MX = 8  # mma8 row cap: decode rows on the tensor cores
 #: rows up to which the M-row GEMV beats mma8 (27B decode replay, H20, ms:
 #: gemv 11.2/17.5/27.1/30.1 at M=1..4, mma8 27 flat); TILERL_MGEMV=0 disables
 _MGEMV = int(os.environ.get("TILERL_MGEMV", "3"))
+#: Output columns per thread in the sm70 fp4 GEMV; 2 shares one X load across two
+#: columns (HFMA2 per LDG 3.53 -> 6.06, 1.82x at M=32), 1 is the A/B arm
+#: (wins/2026-09-03-ncols2-raises-loads-per-fma.md).
+_NCOLS = int(os.environ.get("TILERL_NCOLS", "2"))
 _MMA_RED = kernels_linear._RED_TILE
 
 #: CUDA linear family: (op, M-regime) -> (kernel, K pad, N cap, N tile).
@@ -189,12 +193,18 @@ class Backend:
         """
         return name in _resolve(self.precision, self.arch)
 
-    def _kernel(self, name: str, *args):
-        """``args`` are factory (compile-time variant) arguments; they key the cache."""
-        k = self._kernels.get((name, args))
+    def _kernel(self, name: str, *args, **kw):
+        """``args``/``kw`` are factory (compile-time variant) arguments; they key the cache.
+
+        Keywords are accepted so a caller can name a late factory parameter instead
+        of counting past the ones before it -- passing ncols positionally landed on
+        `abl` and silently ran an ablation kernel that returns wrong numbers.
+        """
+        key = (name, args, tuple(sorted(kw.items())))
+        k = self._kernels.get(key)
         if k is None:
-            k = _resolve(self.precision, self.arch)[name](self.target, *args)
-            self._kernels[(name, args)] = k
+            k = _resolve(self.precision, self.arch)[name](self.target, *args, **kw)
+            self._kernels[key] = k
         return k
 
     # ------------------------------------------------------------ helpers
@@ -479,8 +489,17 @@ class Backend:
             # callers read it as their residual while this one writes into it.
             # kernel's Y is f32 (kernels_linear.py: Y = T.empty((M, N), "float32")).
             y2 = torch.empty(M, N, dtype=torch.float32, device=self.device) if len(chunks) > 1 else None
+            # ncols=2 only when Np == N: a padded plane pairs a real column with a
+            # PAD column (the kernel derives half from its own N), and that garbage
+            # lands inside the [:Mr, :N] slice below. Np == N holds for every
+            # shipped shape, but that is the shapes' property, not the code's.
+            nc = _NCOLS if Np == N and N % 2 == 0 else 1
             for m, Mr, Mk in chunks:
-                y = self._kernel("linear_fp4_gemv_sm70_m", Mk, 4, True, sh)(
+                # ncols by KEYWORD: positionally the 6th factory arg is `abl`, and
+                # passing nc there ran the X_REUSE / NO_SCALE ablations instead --
+                # both return wrong numbers, and X_REUSE's deleted loads read as a
+                # 3.8x prefill "win" (errors/2026-09-03-the-ab-measured-abl-not-ncols.md).
+                y = self._kernel("linear_fp4_gemv_sm70_m", Mk, 4, True, sh, ncols=nc)(
                     _pad2d(x2[m : m + Mr], Mk, Kp).to(torch.float16),
                     wq1, sc1, osc1, self._zeros2(Mk, Np), 32, bN, blk,
                 )[:Mr, :N]

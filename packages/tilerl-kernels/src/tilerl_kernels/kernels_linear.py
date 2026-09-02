@@ -1167,7 +1167,7 @@ def make_linear_fp4_gemv_sm70(target: str, GROUP: int = 4):
 
 def make_linear_fp4_gemv_sm70_m(
     target: str, M: int = 8, GROUP: int = 4, xh: bool = False, sh: bool = False,
-    min_blocks: int = 0, abl: int = 0,
+    *, min_blocks: int = 0, abl: int = 0, ncols: int = 1,
 ):
     """M-row (decode-batch) twin of make_linear_fp4_gemv_sm70.
 
@@ -1216,15 +1216,27 @@ def make_linear_fp4_gemv_sm70_m(
     one-for-one and leaves the per-row ratio at 1 load : 4 FMA, then adds the
     stage on top (errors/2026-09-03-smem-staging-is-slower-loads-per-fma-binds.md).
 
-    6 = ncols=2, CORRECT and the last member of this family: one thread computes
-    two output columns from one X load, taking the ratio to 1 load : 16 FMA. That
-    ratio is the only quantity measured to matter — eight mechanisms preserved it
-    and all failed. Halves the grid; costs a second decoded-weight set and a
-    second accumulator (~+41 registers at M=32), affordable because abl=5 showed
-    127 registers with no spills is reachable. Requires N even.
+    ``ncols`` is not an ablation but the fix the ablations found: 2 makes one
+    thread compute two output columns from one X load, taking the ratio to
+    1 load : 16 FMA. That ratio is the only quantity measured to matter — eight
+    mechanisms preserved it and all failed. Measured **1.82x at M=32**, and the
+    cubin agrees the mechanism is the claimed one: HFMA2 per LDG 3.53 -> 6.06, a
+    1.72x ratio change against a measured 1.72x at M=8
+    (wins/2026-09-03-ncols2-raises-loads-per-fma.md). Requires an unpadded even N;
+    the dispatch checks `Np == N` because a pad column as a pair partner writes
+    garbage inside the kept `[:Mr, :N]` slice.
+
+    ``min_blocks``, ``abl`` and ``ncols`` are keyword-only: the dispatch once
+    passed ncols positionally, landed on `abl`, and served two ablation kernels
+    that return wrong numbers by design without anything raising
+    (errors/2026-09-03-the-ab-measured-abl-not-ncols.md).
     """
     if abl and not xh:
         raise ValueError("abl requires xh=True: the ablations mirror the f16-X extern only")
+    if ncols not in (1, 2):
+        raise ValueError(f"ncols must be 1 or 2, got {ncols}")
+    if ncols == 2 and not xh:
+        raise ValueError("ncols=2 requires xh=True (it shares one f16 X load across columns)")
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def linear_fp4_gemv_sm70_m(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
@@ -1335,7 +1347,7 @@ def make_linear_fp4_gemv_sm70_m(
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def linear_fp4_gemv_sm70_m_2col(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
-        """abl=6: one thread over TWO output columns, so one X load feeds 16 FMAs
+        """ncols=2: one thread over TWO output columns, so one X load feeds 16 FMAs
         instead of 8. The grid halves; column pairs are (n, n + half) so each
         thread's two W streams are far apart in N and neither is a partial tile."""
         N, K = T.const("N, K")
@@ -1351,6 +1363,12 @@ def make_linear_fp4_gemv_sm70_m(
         Res: T.Tensor((M, N), "float32")
         Y = T.empty((M, N), "float32")
         half = N // 2
+        # A pad column must never be a pair partner: the backend pads N up to a
+        # multiple of bN (4 for the gemv plan) and slices Y back to [:Mr, :N], so a
+        # padded Np would pair real column j with j + Np/2 -- possibly a pad column
+        # whose garbage lands INSIDE the kept slice. N here is a tilelang symbol, so
+        # the check lives at the dispatch site (Backend.linear_fp4) where the real
+        # integer is known; every shipped N is a multiple of 4, hence Np == N.
         with T.Kernel(T.ceildiv(half, n_partition), threads=(reduce_thread, n_partition)) as bx:
             T.import_source(_FP4_TWIDDLE_SRC_F16)
             kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
@@ -1401,7 +1419,7 @@ def make_linear_fp4_gemv_sm70_m(
                     Y[m, n1] = Res[m, n1] + a1[m] * OScale[n1]
         return Y
 
-    if abl == 6:
+    if ncols == 2:
         return linear_fp4_gemv_sm70_m_2col
     return linear_fp4_gemv_sm70_m
 
