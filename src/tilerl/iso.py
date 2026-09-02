@@ -48,10 +48,15 @@ class ISO:
         self,
         base: Any | None = None,
         polar_iters: int = 5,
+        offload: bool | None = None,
     ) -> None:
         self.base = Adafactor() if base is None else base
         self.frame_dtype = precision.dtype("frame")
         self.polar_iters = polar_iters
+        # fp32 frames of the 27B are 200 GiB: they live on the host and one
+        # matrix is staged to the device per update — the streamed step already
+        # goes one parameter at a time. None = offload when the param is on cuda.
+        self.offload = offload
         self._frames: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     @property
@@ -83,17 +88,29 @@ class ISO:
             if err > 1e-3:
                 raise ValueError(f"ISO: frames in {self.frame_dtype} are not orthonormal "
                                  f"(max|UᵀU−I| = {err:.1e}); change precision.py, not this call")
-            fr = self._frames[id(p)] = (u.contiguous(), s, vh.T.contiguous())
+            fr = (u.contiguous(), s, vh.T.contiguous())
+            if self._offloaded(p):
+                fr = tuple(t.cpu() for t in fr)
+            self._frames[id(p)] = fr
         return fr
+
+    def _offloaded(self, p: torch.Tensor) -> bool:
+        return p.device.type == "cuda" if self.offload is None else self.offload
 
     def step_one(self, p: torch.Tensor, g: torch.Tensor) -> None:
         if p.dim() != 2:
             self.base.step_one(p, g)
             return
         u, s, v = self.frames(p)
-        gu, gv = frame_grads(g.to(u.dtype), u, s, v)
-        self.base.step_one(u, gu)
-        self.base.step_one(v, gv)
-        u.copy_(polar(u, self.polar_iters))
-        v.copy_(polar(v, self.polar_iters))
-        p.copy_(((u * s) @ v.T).to(p.dtype))
+        staged = self._offloaded(p)
+        uu, ss, vv = (t.to(p.device, copy=True) for t in (u, s, v)) if staged else (u, s, v)
+        gu, gv = frame_grads(g.to(uu.dtype), uu, ss, vv)
+        # State is keyed per matrix, not per staging buffer.
+        self.base.step_one(uu, gu, key=(id(p), "u"))
+        self.base.step_one(vv, gv, key=(id(p), "v"))
+        uu.copy_(polar(uu, self.polar_iters))
+        vv.copy_(polar(vv, self.polar_iters))
+        p.copy_(((uu * ss) @ vv.T).to(p.dtype))
+        if staged:
+            u.copy_(uu)
+            v.copy_(vv)

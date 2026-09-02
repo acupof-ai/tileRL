@@ -497,12 +497,14 @@ class AdamW:
     def begin(self) -> None:
         self._step += 1
 
-    def step_one(self, p: torch.Tensor, g: torch.Tensor) -> None:
+    def step_one(self, p: torch.Tensor, g: torch.Tensor, key: Any = None) -> None:
+        """``key`` names the state when ``p`` is a staging buffer for a
+        parameter that lives elsewhere (ISO's offloaded frames)."""
         b1, b2 = self.betas
         bc1 = 1.0 - b1**self._step
         bc2 = 1.0 - b2**self._step
         g = g.to(torch.float32)
-        pid = id(p)
+        pid = id(p) if key is None else key
         m = self._m.get(pid)
         if m is None:
             m = torch.zeros(p.shape, dtype=precision.dtype("optimizer_state"), device=p.device)
@@ -582,13 +584,15 @@ class Adafactor:
             if g is not None:
                 self.step_one(p, g)
 
-    def step_one(self, p: torch.Tensor, g: torch.Tensor) -> None:
+    def step_one(self, p: torch.Tensor, g: torch.Tensor, key: Any = None) -> None:
         """Update ONE parameter. Independent of every other parameter, which is
-        exactly why the gradient can be released straight after."""
+        exactly why the gradient can be released straight after. ``key`` names
+        the state when ``p`` is a staging buffer (ISO's offloaded frames)."""
         b2 = 1.0 - self._step**self.decay_power
         g = g.to(torch.float32)
         u = g.mul(g).add_(self.eps[0])
-        st = self._state.get(id(p))
+        key = id(p) if key is None else key
+        st = self._state.get(key)
         factored = g.dim() == 2
         if st is None:
             if factored:
@@ -600,7 +604,7 @@ class Adafactor:
                 st = (torch.zeros_like(g),)
             if self.beta1 > 0.0:
                 st = st + (torch.zeros_like(g),)
-            self._state[id(p)] = st
+            self._state[key] = st
         if factored:
             r, c = st[0], st[1]
             r.mul_(b2).add_(u.mean(dim=1), alpha=1.0 - b2)

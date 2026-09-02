@@ -86,6 +86,27 @@ def test_iso_lowers_loss_on_tiny_model():
     return losses, dt
 
 
+
+def test_offloaded_frames_match_resident():
+    """Host-resident frames staged one matrix at a time must give the same
+    parameters as resident frames, bit for bit."""
+    from tilerl.autograd import Adafactor
+    from tilerl.cli import _build_model
+    from tilerl.iso import ISO
+    from tilerl.testing import RefBackend
+    from tilerl.train import train_step
+
+    ids = torch.arange(1, 2 * 16 + 1).reshape(2, 16).numpy()
+    outs = []
+    for offload in (False, True):
+        _, model = _build_model("tiny", seed=0, keep_master=True)
+        opt = ISO(Adafactor(lr=1e-2), offload=offload)
+        for _ in range(3):
+            train_step(model, ids, RefBackend(), opt)
+        outs.append({k: v.clone() for k, v in model.params.items()})
+    assert all(torch.equal(outs[0][k], outs[1][k]) for k in outs[0])
+
+
 if __name__ == "__main__":  # runnable check
     test_frame_gradient_matches_finite_difference()
     test_step_keeps_frames_orthonormal()

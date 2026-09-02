@@ -67,6 +67,45 @@ def test_iso_merge_two_specialists():
     assert out["iso"][0] <= out["avg"][0] or out["iso"][1] <= out["avg"][1], out
 
 
+
+def test_merge_checkpoints_streams_shards_and_records(tmp_path, monkeypatch):
+    """The file-level merge equals the dict-level one, writes shards load_hf
+    reads back, and leaves a manifest."""
+    import json
+    import sys
+
+    from tilerl.cli import _build_model, main
+    from tilerl.merge import iso_merge, merge_checkpoints
+    from tilerl.model import load_hf, save_hf
+    from tilerl.testing import RefBackend
+    from tilerl.train import train_step
+
+    backend = RefBackend()
+    dirs, params = [], []
+    for seed in (0, 1, 2):
+        cfg, model = _build_model("tiny", seed=0, keep_master=True)
+        if seed:
+            ids = torch.randint(1, cfg.vocab_size, (2, 16), generator=torch.Generator().manual_seed(seed))
+            for _ in range(3):
+                train_step(model, ids.numpy(), backend, AdamW(lr=1e-3))
+        save_hf(model, tmp_path / f"ck{seed}")
+        dirs.append(str(tmp_path / f"ck{seed}"))
+        params.append(dict(model.params))
+    n = merge_checkpoints(dirs[0], dirs[1:], tmp_path / "out", shard_bytes=1 << 14)
+    assert n and len(list((tmp_path / "out").glob("model-*.safetensors"))) > 1
+    got = load_hf(cfg, tmp_path / "out", keep_master=True).params
+    want = iso_merge(params[0], params[1:])
+    for k, w in want.items():
+        if w.dim() == 2:
+            assert torch.allclose(got[k].float(), w.float(), atol=2e-2, rtol=2e-2), k
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
+    monkeypatch.setattr(sys, "argv", ["tilerl", "merge", "--base", dirs[0], "--specialists",
+                                      ",".join(dirs[1:]), "--out", str(tmp_path / "out2")])
+    main()
+    m = json.loads(next((tmp_path / "runs").glob("*/manifest.json")).read_text())
+    assert m["command"] == "merge" and m["metrics"]["tensors"] == n
+
+
 if __name__ == "__main__":  # runnable check
     test_iso_merge_one_specialist_and_spectrum()
     test_iso_merge_two_specialists()
