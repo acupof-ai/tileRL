@@ -243,6 +243,17 @@ class DraftHead:
             if r.hidden is None or r.done:
                 continue
             lo, hi = max(1, r.draft_pos + 1), r.seq_len - 1
+            # Position q needs the trunk hidden at q-1, and the engine keeps only the
+            # LAST forward's hidden (engine.py:747) plus one previous position. A row
+            # that advanced several chunked-prefill ticks without drafting therefore has
+            # no hidden for its early positions: at ctx=2048 one reached seq_len 1536
+            # with draft_pos 0, asked for 1535 positions, and got the 512 it actually
+            # had -- `pad` then added w-q=0 and the fc concat died on 1535 vs 511, three
+            # frames from the cause. Drop the unbacked positions instead of slicing past
+            # the buffer: the last position is what leaves a chain in r.drafts, and it is
+            # always inside the newest hidden.
+            base = r.hidden_from - (r.hidden_prev is not None)
+            lo = max(lo, base + 1)
             if hi < lo:
                 continue
             plan.append((r, lo, hi))
@@ -267,7 +278,14 @@ class DraftHead:
             if r.hidden_prev is not None:
                 h, base = torch.cat([r.hidden_prev, r.hidden], dim=1), base - 1
             off = (lo - 1) - base
-            hs.append(torch.nn.functional.pad(h[:, off : off + q], (0, 0, 0, w - q)))
+            hq = h[:, off : off + q]
+            # The clamp above makes this exact; assert it rather than let a short slice
+            # reach the fc concat, where the shapes name neither the row nor the cause.
+            assert hq.shape[1] == q, (
+                f"draft hidden for [{lo},{hi}] is {hq.shape[1]} of {q} positions "
+                f"(hidden_from={r.hidden_from}, width={h.shape[1]}, off={off})"
+            )
+            hs.append(torch.nn.functional.pad(hq, (0, 0, 0, w - q)))
         kv = BatchKv(
             block_table=bt.to(dev), seq_len=torch.tensor(sl, device=dev),
             state_slot=torch.zeros(n, dtype=torch.long, device=dev),
