@@ -126,10 +126,12 @@ class DraftHead:
         self.layers = Model(cfg, params)
         self.has_confidence = "confidence.weight" in params
 
-    def forward(self, hidden, ids, positions, kv, backend, hidden_out=None) -> torch.Tensor:
+    def forward(self, hidden, ids, positions, kv, backend, hidden_out=None,
+                last_only=False) -> torch.Tensor:
         """hidden [B,T,H] (trunk's pre-final-norm state), ids [B,T] (the token
-        each position predicts FROM) -> draft logits [B,T,vocab]. ``hidden_out``
-        receives the head's own hidden, which the next draft position consumes."""
+        each position predicts FROM) -> draft logits [B,T,vocab], or [B,1,vocab]
+        when ``last_only`` selects one position per row. ``hidden_out`` receives
+        the head's own hidden at FULL width, appended before the reduction."""
         eps = self.cfg.rms_eps
         ids = torch.as_tensor(ids, dtype=torch.long, device=backend.device)
         positions = torch.as_tensor(positions, dtype=torch.long, device=backend.device)
@@ -144,6 +146,14 @@ class DraftHead:
             x = self.layers._mlp(i, x, kv, backend)
         if hidden_out is not None:
             hidden_out.append(x)
+        # Same trade the trunk makes (model.py:371): a vocab-wide readout over every
+        # prefill position is thrown away one line later. Here it OOMed a 32 GB card --
+        # 1.41 GiB at B=8 ctx=512, of which 8 rows (7.6 MiB) were read.
+        if last_only is not False and x.shape[1] > 1:
+            idx = (torch.full((x.shape[0],), x.shape[1] - 1, device=backend.device)
+                   if last_only is True
+                   else torch.as_tensor([n - 1 for n in last_only], device=backend.device))
+            x = x[torch.arange(x.shape[0], device=backend.device), idx].unsqueeze(1)
         x = backend.rmsnorm(x, self.params["norm"], eps)
         head = "embed_tokens" if self.trunk.cfg.tie_word_embeddings else "lm_head"
         return self.trunk._linear(backend, x, head)

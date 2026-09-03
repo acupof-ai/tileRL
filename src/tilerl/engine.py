@@ -922,13 +922,17 @@ class Engine:
             seq_q_lens=torch.tensor(sq, device=dev),
         )
         dh: list = []
+        # last_only=sq: the readout is [n, 1, vocab] instead of [sum(q), 1+depth, vocab].
+        # Only one row per request is read below, and the full-width version asked 1.41 GiB
+        # at B=8 ctx=512 and OOMed a 32 GB card. hidden_out is appended before the
+        # reduction, so dh keeps full width for the chain's own indexing.
         logits = self._draft.forward(torch.cat(hs, dim=0), ids, pos, kv, self._backend,
-                                     hidden_out=dh)
+                                     hidden_out=dh, last_only=sq)
         last = torch.tensor([q - 1 for q in sq], device=dev)
         rng = torch.arange(n, device=dev)
-        tok, prob = self._backend.greedy(logits[rng, last].unsqueeze(1))
+        tok, prob = self._backend.greedy(logits[:, :1])
         if self._keep_draft_logits:  # off by default: a [n, vocab] copy per tick
-            self._draft_logits = logits[rng, last].detach().clone()
+            self._draft_logits = logits[:, 0].detach().clone()
         h = dh[-1][rng, last].unsqueeze(1)
         # Nothing is read back to the host until the whole chain is enqueued: a
         # .tolist() per depth step is a device sync per step. Its own benefit was

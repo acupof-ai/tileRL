@@ -803,7 +803,7 @@ class _OracleDraft:
         self.params: dict = {}
         self.expected = expected  # absolute position -> token
 
-    def forward(self, hidden, ids, positions, kv, backend, hidden_out=None):
+    def forward(self, hidden, ids, positions, kv, backend, hidden_out=None, last_only=False):
         pos = np.atleast_2d(np.asarray(positions))
         logits = torch.zeros(*pos.shape, self.cfg.vocab_size)
         for i in range(pos.shape[0]):
@@ -811,6 +811,12 @@ class _OracleDraft:
                 logits[i, j, self.expected.get(int(pos[i, j]) + 1, 0)] = 10.0
         if hidden_out is not None:
             hidden_out.append(torch.as_tensor(hidden))
+        # Mirror DraftHead: reduce AFTER hidden_out, so the caller's [:, :1] read is
+        # the row it asked for and not position 0 of a full-width block.
+        if last_only is not False and logits.shape[1] > 1:
+            idx = ([logits.shape[1] - 1] * logits.shape[0] if last_only is True
+                   else [n - 1 for n in last_only])
+            logits = logits[torch.arange(logits.shape[0]), torch.tensor(idx)].unsqueeze(1)
         return logits
 
     def confidence(self, hidden, probs, backend):
@@ -890,13 +896,16 @@ def test_engine_draft_matches_full_context_draft(rows, plen, batched_tokens, dep
     step = {"n": 0}
     inner = draft.forward
 
-    def spy(hidden, ids, positions, kv, be, hidden_out=None):
-        out = inner(hidden, ids, positions, kv, be, hidden_out=hidden_out)
+    def spy(hidden, ids, positions, kv, be, hidden_out=None, last_only=False):
+        out = inner(hidden, ids, positions, kv, be, hidden_out=hidden_out,
+                    last_only=last_only)
         # chain step 0 on full-batch ticks only: later steps consume the draft's
         # own hidden, and a partial batch would shift row -> request
         if step["n"] % max(depth, 1) == 0 and out.shape[0] == rows:
             pos = np.asarray(positions)
             for i in range(rows):
+                # out[i, -1] is the last valid row either way: with last_only the
+                # readout is already reduced to it, without it T-1 is that position.
                 seen[i] = (int(pos[i][-1]), out[i, -1].detach().float().clone())
         step["n"] += 1
         return out
@@ -1061,6 +1070,54 @@ def test_a_batch_between_rungs_warns_about_its_padding():
             if fills:
                 assert (up // w) * w in LADDER_WIDTHS, f"depth={depth}: suggestion still pads"
     assert 'if rung % w == 0 else ""' in src, "the guard must withhold an impossible suggestion"
+
+
+def test_the_draft_readout_reduction_picks_the_last_valid_row():
+    """`last_only` cuts the draft readout from [rows, T, vocab] to [rows, 1, vocab] --
+    1.41 GiB down to 7.6 MiB at B=8 ctx=512, which is the difference between OOM and
+    running. It must select the LAST VALID position per row, and the existing parity
+    test cannot check that: its spy reads out[i, -1] AFTER the reduction, so a wrong
+    index inside the reduction is compared against whatever that index chose. Picking
+    row 0 passes all four parity cases.
+
+    This drives the real DraftHead.forward twice on identical input and asserts the
+    reduced readout equals the full-width one at the row it claims."""
+    cfg, model = _build_model("tiny", seed=0)
+    backend = get_backend()
+    draft = _random_draft(cfg, 21, model)
+
+    toks = [3, 4, 5, 6, 7, 8]
+    n = len(toks) - 1
+    hid: list = []
+    model.forward(np.array([toks]), np.arange(len(toks)),
+                  _training_kv(model, 1, len(toks), device=backend.device),
+                  backend, hidden_out=hid, last_only=False)
+    nblk = -(-n // BLOCK_TOKENS) + 1
+
+    def run(**kw):
+        kv = BatchKv(
+            block_table=torch.arange(nblk, dtype=torch.long).reshape(1, nblk),
+            seq_len=torch.tensor([n]), state_slot=torch.zeros(1, dtype=torch.long),
+            kv_pool=PagedKvPool(nblk, cfg.num_kv_heads, cfg.head_dim, num_layers=1,
+                                device=backend.device, layer_map=(0,)),
+            state_pool=None, seq_q_lens=torch.tensor([n]),
+        )
+        return draft.forward(hid[-1][:, :n], np.array([toks[1:]]),
+                             np.arange(1, n + 1), kv, backend, **kw)
+
+    full = run()
+    assert full.shape[:2] == (1, n), full.shape
+    # Positions must differ, or "picked the right row" is unfalsifiable.
+    assert not torch.allclose(full[:, 0], full[:, n - 1], atol=1e-4), \
+        "this head gives every position the same logits; the test proves nothing"
+
+    for want, kw in ((n - 1, {"last_only": True}), (n - 2, {"last_only": [n - 1]})):
+        got = run(**kw)
+        assert got.shape == (1, 1, full.shape[-1]), got.shape
+        assert torch.allclose(got[0, 0], full[0, want], atol=1e-3), (
+            f"{kw}: reduction returned argmax {int(got[0, 0].argmax())}, "
+            f"position {want} has {int(full[0, want].argmax())}"
+        )
 
 
 def test_generate_fans_a_corpus_across_workers(tmp_path):

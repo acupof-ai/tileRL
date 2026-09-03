@@ -60,6 +60,11 @@ def main() -> None:
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--tokens", type=int, default=40)
     ap.add_argument("--ctx", type=int, default=30)
+    ap.add_argument("--batch", type=int, default=8,
+                    help="concurrent requests. The default is 8 because the rung a verify "
+                         "tick compiles keys on B*(1+depth), and only B=8 at depth 3 fills "
+                         "the 32 rung serving uses (B=1 gives 4 rows -> the 4 rung, a "
+                         "different kernel: errors/2026-09-03-the-spec-ncols-ab-ran-at-b1.md)")
     ap.add_argument("--gpu", type=int, default=0)
     args = ap.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -69,8 +74,11 @@ def main() -> None:
     backend = get_backend()
     cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft) if args.depth else None
-    e = build_engine(cfg, model, backend, num_blocks=512, num_slots=4, max_batch=4,
-                     max_total_tokens=8192, draft=draft, spec_depth=max(args.depth, 1))
+    # slots > max_batch: a tick narrower than its graph bucket keeps one slot for the
+    # padding rows for good (engine.py:827) -- bench_ctx_decode.py died on this twice.
+    e = build_engine(cfg, model, backend, num_blocks=512, num_slots=args.batch + 2,
+                     max_batch=args.batch, max_total_tokens=8192, draft=draft,
+                     spec_depth=max(args.depth, 1))
 
     for meth, label in (("_run_forward", "run_forward"), ("_draft_step", "draft_step"),
                         ("_verify", "verify"), ("_run_decode_graph", "decode_graph"),
@@ -78,24 +86,39 @@ def main() -> None:
         if hasattr(e, meth):
             wrap(e, meth, label)
 
-    rid = e.submit(list(range(10, 10 + args.ctx)),
-                   SamplingParams(temperature=0.0, max_new_tokens=args.tokens, seed=0))
+    rids = [e.submit(list(range(10 + i * args.ctx, 10 + (i + 1) * args.ctx)),
+                     SamplingParams(temperature=0.0, max_new_tokens=args.tokens, seed=0))
+            for i in range(args.batch)]
     # Burn the prefill chunks BEFORE the clock: at ctx 1024+ they are most of the
     # wall time and would swamp the per-bucket percentages they do not belong to.
     from tilerl.engine import _PHASE_DECODE
-    req = None
-    while req is None or req.phase != _PHASE_DECODE:
+    # Bounded in WALL CLOCK, not just ticks: an empty tick costs nothing, so a tick cap
+    # cannot tell spinning from working -- that is how a stall once ran six minutes
+    # looking like a live job (errors/2026-09-03-the-spec-ncols-ab-ran-at-b1.md).
+    deadline = time.perf_counter() + 300.0
+    while True:
         e.step()
-        req = next((r for r in e._running if r.req_id == rid), None)
-        if req is None:
-            raise SystemExit(f"ctx={args.ctx}: finished during prefill")
+        reqs = [next((r for r in e._running if r.req_id == i), None) for i in rids]
+        if any(r is None for r in reqs):
+            raise SystemExit(f"ctx={args.ctx}: a request finished during prefill")
+        if all(r.phase == _PHASE_DECODE for r in reqs):
+            break
+        if time.perf_counter() > deadline:
+            raise SystemExit(f"ctx={args.ctx}: prefill stalled 300 s, "
+                             f"{sum(r.phase == _PHASE_DECODE for r in reqs)}/{args.batch} "
+                             f"in decode")
     BUCKETS.clear()
     s0 = e.stats()
     t0 = time.perf_counter()
-    done = None
-    while done is None:
+    # Close at the FIRST completion: past that the batch runs narrower and dilutes the
+    # per-bucket shares with ticks below the rung this profile is about.
+    done: dict = {}
+    deadline = time.perf_counter() + 600.0
+    while not any(rid in done for rid in rids):
         e.step()
-        done = e.poll().get(rid)
+        done.update(e.poll())  # poll() drains _finished for EVERY request; keep it all
+        if time.perf_counter() > deadline:
+            raise SystemExit(f"ctx={args.ctx}: decode stalled 600 s, {len(done)} finished")
     wall = (time.perf_counter() - t0) * 1000
     n = e.stats()["tokens_generated"] - s0["tokens_generated"]
     s = {k: v - s0.get(k, 0) if isinstance(v, int | float) else v
