@@ -92,6 +92,40 @@ def rope_bwd(
     return _rope_apply(grad, positions, theta, negate=True, rotary_dim=rotary_dim)
 
 
+def attn_prelude(x, w, positions, theta, eps: float, rotary_dim: int | None = None):
+    """norm+rope in f64, returned f32: the exact value both attention preludes
+    approximate. x [B,T,H,D], w [D].
+
+    The oracle for `attn_prep` against the discrete
+    `rmsnorm`/`rope`/`write_tokens` chain. Neither of those is ground truth for
+    the other -- both are approximations -- so ranking them needs a third value
+    computed wider than the difference being ranked. f64 puts the oracle's own
+    rounding ~2e-16, eleven orders below the ~1.3e-03 it separates.
+
+    Composes :func:`rmsnorm` and :func:`rope` rather than reimplementing them: a
+    second rotate-half in the tree drifts and then gets quoted as an independent
+    check. `_rope_apply` opens with `_f32`, which would narrow the f64 input, so
+    the rotation is inlined at f64 here from the same `_inv_freq` and the same
+    `d <-> d + rd/2` pairing -- checked against `rope` in the test, so the two
+    cannot drift apart silently."""
+    x64 = x.double()
+    y = rmsnorm(x64, w.to(x64.device).double(), eps)
+    d = y.shape[-1]
+    rd = d if rotary_dim is None else min(rotary_dim, d)
+    half = rd // 2
+    inv = _inv_freq(rd, theta, y.device, torch.float64)
+    pos = positions.to(y.device).double()
+    if pos.ndim == 1:
+        pos = pos.unsqueeze(0)
+    ang = pos.unsqueeze(-1) * inv
+    cos, sin = torch.cos(ang).unsqueeze(-2), torch.sin(ang).unsqueeze(-2)
+    out = y.clone()
+    x1, x2 = y[..., :half], y[..., half:rd]
+    out[..., :half] = x1 * cos - x2 * sin
+    out[..., half:rd] = x2 * cos + x1 * sin
+    return out.float()
+
+
 # ---------------------------------------------------------------- linear
 
 
