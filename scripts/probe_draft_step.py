@@ -89,7 +89,7 @@ def main() -> None:
         x1 = L._full_attn(0, x0, t_pos, kv, backend)
         x2 = L._mlp(0, x1, kv, backend)
         x3 = backend.rmsnorm(x2, draft.params["norm"], eps)
-        head = "embed_tokens" if cfg.tie_word_embeddings else "lm_head"
+        head = cfg.head_key
         lg = model._linear(backend, x3, head)
 
         stages = [

@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 RECIPES: dict[str, dict] = {
+    # The gate-passing settings, measured 4/4 seeds: at max_new_tokens 4 every
+    # group ties whatever the reward's shape (errors/2026-09-03-tied-groups-are-
+    # the-rewards-shape.md), and 2 steps of a per-step reward compares two draws
+    # rather than two policies. Same shape as tests/test_rl.py's passing loop.
     "grpo-tiny-smoke": dict(
-        model="tiny", rl=True, steps=2, group=2, max_new_tokens=4, lora_rank=4,
-        status="cpu: tests/test_recipes.py"),
+        model="tiny", rl=True, steps=12, group=6, max_new_tokens=8, lora_rank=4,
+        lr=0.05, status="cpu: tests/test_recipes.py"),
     # docs/roadmap.md P1. Pass --data gsm8k_train.jsonl --eval-gsm8k gsm8k_test.jsonl.
     # lr: the CLI default of 1e-3 flattens the reward from step 9 on; 1e-4 does not.
     "grpo-gsm8k-27b": dict(

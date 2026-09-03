@@ -389,7 +389,7 @@ class Model:
                 idx = torch.as_tensor([n - 1 for n in last_only], device=device)
                 x = x[torch.arange(x.shape[0], device=device), idx].unsqueeze(1)
         x = backend.rmsnorm(x, self.params["final_norm"], cfg.rms_eps)
-        head_key = "embed_tokens" if cfg.tie_word_embeddings else "lm_head"
+        head_key = cfg.head_key
         logits = self._linear(backend, x, head_key)
         if getattr(backend, "tp_world", 1) > 1 and not cfg.tie_word_embeddings:
             # Vocab-parallel head; a tied head is the replicated embedding table.

@@ -21,6 +21,20 @@ from .engine import SamplingParams
 from .kv_cache import LinearStatePool, NoPrefixStore
 from .model import save_hf
 
+_MAX_TICKS = 10000
+
+
+def _drain(engine: Any, ids: list[int], what: str) -> dict[int, list[int]]:
+    """Tick until every id has finished. Accumulates: poll() only returns the
+    requests that finished on that tick, so a single assignment loses the rest."""
+    done: dict[int, list[int]] = {}
+    for _ in range(_MAX_TICKS):
+        engine.step()
+        done.update(engine.poll())
+        if all(i in done for i in ids):
+            return done
+    raise RuntimeError(f"{what}: did not finish within {_MAX_TICKS} ticks")
+
 
 def _training_kv(model: Any, batch_size: int, seq_len: int, device: Any = None):
     """Dense KV: full-attn layers skip the paged pool so the tape's id() chain
@@ -254,23 +268,20 @@ def grpo_loop(
             engine.submit(prompt.tolist(), replace(sampling, seed=seed + step * group + g))
             for g in range(group)
         ]
-        done: dict[int, list[int]] = {}
-        for _ in range(10000):
-            engine.step()
-            done.update(engine.poll())
-            if all(i in done for i in ids):
-                break
-        else:  # pragma: no cover - engine bug, not a training path
-            raise RuntimeError("grpo_loop: rollout did not finish within 10000 ticks")
+        done = _drain(engine, ids, "grpo_loop rollout")
         comps = [done[i] for i in ids]
         rewards = [float(reward_fn(prompt, c)) for c in comps]
         adv = group_advantages(rewards, group)
         tied = float((adv.reshape(-1, group) == 0).all(axis=1).mean())
-        # Right-pad to one rectangle; the advantage mask keeps padding out of the gradient.
-        width = max(len(c) for c in comps)
+        # One rectangle of a FIXED width: TileLang specializes per shape, so a
+        # data-dependent width JITs a fresh kernel set per step (measured on tiny:
+        # 37.7 s for a new width against 71 ms for a repeat). prompt + max_new_tokens
+        # is known before the rollout; seq_lens carries the true lengths and the
+        # advantage mask keeps the padding out of the gradient.
+        gen = max(int(sampling.max_new_tokens), max(len(c) for c in comps))
         batch = np.stack([
             np.concatenate([prompt, np.asarray(c, dtype=np.int64),
-                            np.zeros(width - len(c), dtype=np.int64)])
+                            np.zeros(gen - len(c), dtype=np.int64)])
             for c in comps
         ])
         plens = np.full(group, len(prompt), dtype=np.int64)
@@ -313,14 +324,7 @@ def opd_loop(
             for k, v in trainable.items():
                 v.copy_(ema[k])
         rid = teacher_engine.submit(prompt, params)
-        finished: dict[int, list[int]] = {}
-        for _ in range(10000):
-            teacher_engine.step()
-            finished = teacher_engine.poll()
-            if rid in finished:
-                break
-        else:  # pragma: no cover - engine bug, not a training path
-            raise RuntimeError("opd_loop: teacher did not finish within 10000 ticks")
+        finished = _drain(teacher_engine, [rid], "opd_loop teacher")
         seq = np.concatenate([prompt, np.asarray(finished[rid], dtype=np.int64)])
         if ema is not None:
             for k, v in trainable.items():

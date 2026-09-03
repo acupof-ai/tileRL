@@ -5,7 +5,7 @@ HF ``layer_types`` against ``full_attn_layers``."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -102,6 +102,11 @@ class ModelConfig:
     def linear_qkv_dim(self) -> int:
         return self.linear_q_dim + self.linear_k_dim + self.linear_v_dim
 
+    @property
+    def head_key(self) -> str:
+        """The param the output head reads: a tied model has no ``lm_head``."""
+        return "embed_tokens" if self.tie_word_embeddings else "lm_head"
+
     def is_full_attn(self, layer_idx: int) -> bool:
         return layer_idx in self.full_attn_layers
 
@@ -136,33 +141,13 @@ def qwen38_27b() -> ModelConfig:
 
 
 def qwen36_27b() -> ModelConfig:
-    """Qwen3.6-27B (ModelOpt NVFP4, checkpoint /host/tc27-nvfp4-slice2): same
-    shapes and untied lm_head as :func:`qwen38_27b`. MLP linears are NVFP4
+    """Qwen3.6-27B (ModelOpt NVFP4, checkpoint /host/tc27-nvfp4-slice2): every
+    shape identical to :func:`qwen38_27b`, so it IS that config renamed. The
+    checkpoints differ only in how they store the weights -- MLP linears NVFP4
     (weight_packed + f8 weight_scale + reciprocal global scale), GDN
-    in_proj_qkv/in_proj_z/out_proj are FP8 block-128; load_hf dequantizes both."""
-    return ModelConfig(
-        name="qwen36-27b",
-        hidden_size=5120,
-        intermediate_size=17408,
-        num_layers=64,
-        num_attention_heads=24,
-        num_kv_heads=4,
-        head_dim=256,
-        vocab_size=248320,
-        full_attn_layers=tuple(range(3, 64, 4)),
-        rope_theta=1e7,
-        max_position_embeddings=262144,
-        rms_eps=1e-6,
-        tie_word_embeddings=False,
-        fp4=True,
-        full_attn_gated=True,
-        rotary_dim=64,
-        linear_num_key_heads=16,
-        linear_key_head_dim=128,
-        linear_num_value_heads=48,
-        linear_value_head_dim=128,
-        linear_conv_kernel_dim=4,
-    )
+    in_proj_qkv/in_proj_z/out_proj FP8 block-128 -- which load_hf reads off the
+    file, not off the config."""
+    return replace(qwen38_27b(), name="qwen36-27b")
 
 
 def tiny(max_position_embeddings: int = 512) -> ModelConfig:

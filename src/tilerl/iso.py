@@ -15,7 +15,7 @@ from typing import Any
 import torch
 
 from . import precision
-from .autograd import Adafactor
+from .autograd import Adafactor, _Optimizer
 
 
 def polar(x: torch.Tensor, iters: int = 5) -> torch.Tensor:
@@ -31,7 +31,7 @@ def frame_grads(g: torch.Tensor, u: torch.Tensor, s: torch.Tensor, v: torch.Tens
     return g @ v * s, g.T @ u * s
 
 
-class ISO:
+class ISO(_Optimizer):
     """Wrap a base optimizer so 2D params train in fixed-spectrum coordinates;
     non-2D params go straight to it. Costs two frame-dtype copies per 2D weight."""
 
@@ -61,13 +61,6 @@ class ISO:
 
     def begin(self) -> None:
         self.base.begin()
-
-    def step(self, params: Any, grads: dict[int, torch.Tensor]) -> None:
-        self.begin()
-        for p in params:
-            g = grads.get(id(p))
-            if g is not None:
-                self.step_one(p, g)
 
     def frames(self, p: torch.Tensor):
         fr = self._frames.get(id(p))
