@@ -63,14 +63,20 @@ by run 1 were cache **hits** in run 2, which my probe still labelled `novel`:
 |---|---|---|
 | n=3 | 7.32 s (ratio 1.3x) | one of three "novel" widths was a hit (T=383, 23.3 s) |
 | n=6 | **0.60 s (ratio 1.0x)** | three of six were hits; the median is mostly hits |
-| clean cache | cold warm-up alone is **170.9 s** vs 24.2 s warm | — |
+| clean cache, n=5 | **11.05 s (ratio 1.5x)** | the number that stands |
 
 The n=6 run's `ratio 1.0x` reads as "the effect does not exist on the 27B",
-which is the conclusion a shared cache manufactures. Only the two uncontaminated
-points (T=380, T=379: 32.3 / 32.5 s against a 23.1 s repeat) carry a number, and
-it is **~9.3 s on a 23.1 s step, about 1.4x** — not the 530x the same mechanism
-produces on tiny, where the step's real compute is 71 ms and compile time is
-therefore the whole measurement.
+which is the conclusion a shared cache manufactures.
+
+With a private `TILELANG_CACHE_DIR` every novel width pays, and the spread is
+tight enough to read: novel 34.7 / 33.3 / 33.8 / 31.2 / 31.0 s against repeats of
+22.1 / 22.0 / 22.4 / 23.0 / 22.2 s, so **11.05 s of compile on a 22.23 s step,
+1.5x**. The cold warm-up alone is **170.9 s** against 24.2 s on a warm cache.
+
+That is not the 530x the same mechanism produces on tiny, where the step's real
+compute is 71 ms and compile time is therefore the whole measurement. The
+mechanism transfers; the constant does not, and the interim 9.3 s I reported from
+two points was low.
 
 ## Rule
 
