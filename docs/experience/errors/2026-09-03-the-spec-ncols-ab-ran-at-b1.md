@@ -79,13 +79,32 @@ also turns on". At B=1, W=8 is **8 rows on the 8 rung**, and `ncols` was off the
 
 `--batch N` on `bench_ctx_decode.py`, submitting N concurrent requests, with the reason in
 the docstring so the next reader does not have to rediscover that `max_batch` is a ceiling.
-Getting it to actually run took three more fixes, each found before it produced a number:
-`num_slots` had to exceed `max_batch` because a padded tick permanently keeps one state slot
-([`2026-09-03-num-slots-equals-max-batch-is-one-short.md`](2026-09-03-num-slots-equals-max-batch-is-one-short.md)),
-`precapture()` had to be called because B=4 needs **12** decode graphs (102 s) against B=1's
-4, and `--max-ctx` had to exist because B=4 **OOMs from ctx≥512** on this 32 GB card. The
-corrected A/B therefore runs at ctx=32 — which is where the question is sharpest anyway,
-since dense decode is fastest there and depth 3 already measured a 12% loss.
+Getting it to actually run took **four** more fixes, and the bring-up cost more than the
+measurement will:
+
+| # | failure | fix |
+|---|---|---|
+| 1 | `LinearStatePool exhausted` on the 2nd window | `num_slots > max_batch` — a padded tick keeps one slot for good ([entry](2026-09-03-num-slots-equals-max-batch-is-one-short.md)) |
+| 2 | first row flagged `UNWARMED` | call `precapture()` — B=4 needs **12** graphs (98-102 s measured) against B=1's 4 |
+| 3 | OOM at ctx=512 | `--max-ctx` — B=4 wanted 1.50 GiB with 0.69 free on a 32 GB card |
+| 4 | **six-minute hang, GPU at 0%** | wall-clock deadlines on every engine-stepping loop |
+
+Number 4 is the one worth keeping. The process sat in state R with the GPU idle and the log
+unchanged for 3.5 minutes, having printed the precapture line and header minutes before. **An
+empty tick costs nothing, so a tick cap cannot tell spinning from working** — 4096 of them
+look exactly like a live run from outside. My loops satisfied the rule that every
+cursor-driven loop carries an iteration cap, and missed its purpose. They now carry a
+deadline too and report what they were waiting on: requests admitted, outputs collected,
+requests still running.
+
+A real defect turned up while looking: `poll()` drains `_finished` for *every* request, and
+the prefill loop called it inside a truth test (`and e.poll()`), discarding the result —
+which can throw away an output the window loop is waiting for. Fixed by accumulating every
+poll into one dict. **But neither the old nor the new logic hangs on the tiny model**, so
+that defect is real and *not* established as the cause. Third time today this box hid a
+CUDA-only failure (the others: an unconditional `torch.cuda.synchronize()`, and the CPU
+target never capturing a graph). What makes the next attempt worth running is not a fourth
+guess but that a stall will now name its own state.
 
 The guard is a test, because this failure is silent by construction — a too-narrow tick
 produces plausible numbers rather than an error.
@@ -111,6 +130,20 @@ Third: **fixing a bug class at the right depth does not immunize the next instan
 Keyword-only flags killed positional-argument A/B failures for good and did nothing here,
 because this instance routes through data shape rather than argument order.
 
+Fourth, from the bring-up: **an iteration cap on a cheap loop is not a timeout.** The rule I
+was following says every cursor-driven loop carries an iteration cap, and mine did — 4096
+ticks. An empty tick costs nothing, so that cap let a stall run for six minutes looking
+exactly like a live job. A bound has to be in the units of the thing that goes wrong, and
+for "did this stop making progress" that unit is wall clock, not iterations.
+
+Fifth: **a repro that passes both ways is not a repro** — and this box cannot repro
+CUDA-path failures at all. Three of the four bring-up failures were invisible locally: an
+unconditional `torch.cuda.synchronize()` blocked the harness outright, the CPU target never
+captures a decode graph (so the pad-slot path is unreachable), and the hang does not
+reproduce with either the old or the new poll logic. When the local check cannot fail,
+reading the code beats running the check: the pad-slot cause came from 12 lines of
+`_graph_bucket`, not from a run.
+
 ## Gate
 
 188 tests pass (the new row-count test included), ruff clean. The B=4 re-run of the
@@ -130,3 +163,5 @@ this entry will carry its numbers.
 | 2026-09-03 | ae268d0 | V100 | cuda sm70 | qwen38-27b | B=4 tok/forward @ctx32 vs B=1 | 9.84 vs 2.44 = **2.46 vs 2.44 per request** (batching only) |
 | 2026-09-03 | ae268d0 | V100 | cuda sm70 | qwen38-27b | decode graphs to capture, B=4 vs B=1 | **12 (102 s) vs 4** — why the first row read UNWARMED |
 | 2026-09-03 | ae268d0 | V100 | cuda sm70 | qwen38-27b | B=4 memory ceiling on 32 GB | **OOMs from ctx≥512**; 1.50 GiB wanted, 0.69 free |
+| 2026-09-03 | 1bf06bb | V100 | cuda sm70 | qwen38-27b | **bring-up failures before one usable row** | **4: pool, precapture, OOM, hang** |
+| 2026-09-03 | 1bf06bb | V100 | cuda sm70 | qwen38-27b | hang signature | state R, **GPU 0%**, 4096-tick cap useless |
