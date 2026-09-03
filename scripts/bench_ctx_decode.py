@@ -69,12 +69,24 @@ def measure(e, ctx: int, tokens: int, batch: int = 1, width: int = 1) -> tuple[f
     rids = [e.submit(list(range(10 + i * ctx, 10 + (i + 1) * ctx)),
                      SamplingParams(temperature=0.0, max_new_tokens=tokens, seed=0))
             for i in range(batch)]
+    # poll() DRAINS _finished for every request, so anything it returns must be kept:
+    # discarding it here (the old `and e.poll()` truth test) threw away an output the
+    # window below was waiting for, and that loop then spun its whole tick budget with
+    # the GPU at 0% -- six minutes of a live-looking run. Every loop below is bounded in
+    # WALL CLOCK as well as ticks, because an empty tick costs nothing and a tick cap
+    # cannot tell "spinning" from "working".
+    done: dict = {}
+    deadline = time.perf_counter() + 300.0
     for _ in range(4096):  # burn the prefill chunks for every request
+        done.update(e.poll())
+        if any(rid in done for rid in rids):
+            raise SystemExit(f"ctx={ctx}: a request finished during prefill; lower --tokens")
         reqs = [next((r for r in e._running if r.req_id == rid), None) for rid in rids]
         if all(r is not None and r.phase == _PHASE_DECODE for r in reqs):
             break
-        if any(r is None for r in reqs) and e.poll():
-            raise SystemExit(f"ctx={ctx}: a request finished during prefill")
+        if time.perf_counter() > deadline:
+            raise SystemExit(f"ctx={ctx}: prefill stalled 300 s with "
+                             f"{sum(r is not None for r in reqs)}/{batch} admitted")
         e.step()
     else:
         raise SystemExit(f"ctx={ctx}: prefill did not finish in 4096 ticks")
@@ -83,14 +95,16 @@ def measure(e, ctx: int, tokens: int, batch: int = 1, width: int = 1) -> tuple[f
     # Close the window at the FIRST completion: speculation accepts different numbers
     # of drafts per request, so past that point ticks run at B-1, B-2, ... and dilute
     # the measurement with the narrow ticks this batch flag exists to avoid.
-    done: dict = {}
     type(e)._run_forward = spy
     try:
+        deadline = time.perf_counter() + 600.0
         for _ in range(8 * tokens + 64):
-            if done:
-                break
             e.step()
-            done.update({k: v for k, v in e.poll().items() if k in rids})
+            done.update(e.poll())
+            if any(rid in done for rid in rids):
+                break
+            if time.perf_counter() > deadline:
+                raise SystemExit(f"ctx={ctx}: window stalled 600 s, {len(done)} finished")
         else:
             raise SystemExit(f"ctx={ctx}: no request completed in the tick budget")
         _sync()
@@ -101,11 +115,14 @@ def measure(e, ctx: int, tokens: int, batch: int = 1, width: int = 1) -> tuple[f
     # only _finish returns it, so a request left in EITHER queue holds one and the next
     # call raises "LinearStatePool exhausted". _running alone is not the idle condition
     # (engine.py checks _waiting too) -- draining only it is why the first fix still died.
+    deadline = time.perf_counter() + 600.0
     for _ in range(16 * tokens + 256):
         if not e._running and not e._waiting:
             break
         e.step()
         e.poll()
+        if time.perf_counter() > deadline:
+            raise SystemExit(f"ctx={ctx}: drain stalled 600 s with {len(e._running)} running")
     else:
         raise SystemExit(f"ctx={ctx}: {len(e._running)} running + {len(e._waiting)} "
                          f"waiting would not retire")
