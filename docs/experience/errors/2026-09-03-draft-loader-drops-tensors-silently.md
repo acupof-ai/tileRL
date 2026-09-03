@@ -38,6 +38,12 @@ The 11 are exactly the three families in the bug report:
 and, per layer, `attention_conv.{base_kernel,kernel_projection}` and
 `mlp_conv.{base_kernel,kernel_projection}`.
 
+The published 5-layer checkpoint at `/work/Qwen3.8-27B-DFlash2` gives the same
+answer at its real size — **81 of 81 through `_DFLASH2_TOP`, 0 unknown**, and 23
+of 81 unknown through `_DRAFT_TOP`. The count scales with layer depth (4 conv
+tensors per layer plus the 3 selector ones); 11 above is the 2-layer figure. The
+raise therefore cannot fire on the path this checkpoint actually takes.
+
 So the report's "`attention_conv`, `mlp_conv` and `candidate_selector` map to
 `None` and are silently dropped" is accurate — **for a DFlash2 checkpoint read
 through the NextN map.** `load_draft` sniffs `candidate_selector.` and routes to
