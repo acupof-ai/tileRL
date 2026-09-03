@@ -802,6 +802,25 @@ def test_cross_entropy_is_stable_and_matches_gradient(backend):
     assert torch.equal(grad[0, 0], torch.tensor([1.0, -1.0]))
 
 
+def test_reduction_pads_are_the_reduction_tile():
+    """Every MMA kernel loops `X // _RED_TILE` and floor-divides, so a reduction
+    dim padded to anything else drops its tail with no error: at `TILERL_RED_TILE=64`
+    the six literal-32 pads made `32 // 64 == 0` and 15 of the tiny model's 27
+    param grads came back exactly zero (measured on sm90).
+    """
+    import inspect
+
+    from tilerl_kernels import backend as bk
+
+    src = inspect.getsource(bk.Backend.linear) + inspect.getsource(bk.Backend.linear_bwd)
+    for dim in "MNK":
+        assert f"_round_up({dim}, 32)" not in src, (
+            f"the {dim} reduction pad is a literal again; it must be _MMA_RED")
+    # the plan's K pads are constants, so the tile has to divide them
+    for key, (_, kpad, _, _) in bk._CUDA_PLAN.items():
+        assert kpad % bk._MMA_RED == 0, f"{key}: K pad {kpad} is not a multiple of {bk._MMA_RED}"
+
+
 def test_fp4_twiddle_round_trip():
     """sm90 serves the twiddled byte layout; save_hf must undo it exactly."""
     wq = torch.randint(0, 256, (6, 32), dtype=torch.uint8, generator=torch.Generator().manual_seed(0))
