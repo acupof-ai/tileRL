@@ -15,13 +15,17 @@ from . import kernels_mma
 
 _REGISTRY: dict[tuple[str, str], dict[str, object]] = {}
 
-# sm70 split counts, chosen per tick by query width (backend.py). 32 splits are
-# 1.20x faster at S=1 where PO is 3 MiB; at S>=_SM70_WIDE_S they are within 0.5%
-# of 16 while PO reaches 1.5 GiB, so a wide tick halves it for free. Exported so
-# the parity gate builds what ships -- it used to pin 16 against a shipped 32.
+# sm70 split counts, chosen per tick by query width. 32 splits are 1.20x faster
+# at S=1 where PO is 3 MiB; by S=8 they are within 0.5% of 16 while PO reaches
+# 1.5 GiB, so a wide tick halves it for free. The threshold clears the widest
+# verify the ladder submits (depth 7 is S=8). Exported so the parity gate and the
+# guard test read the shipped rule instead of restating it.
 SM70_KVSPLIT = 32
 SM70_KVSPLIT_WIDE = 16
-_SM70_WIDE_S = 8  # measured: 32 wins at S=1, a wash by S=4, PO grows linearly
+
+
+def sm70_kvsplit(s: int) -> int:
+    return SM70_KVSPLIT if s < 8 else SM70_KVSPLIT_WIDE
 
 
 def _register(precision: str, arch: str, kernels: dict[str, object]) -> None:

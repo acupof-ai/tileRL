@@ -1082,10 +1082,10 @@ def test_the_sm70_split_count_follows_the_query_width():
     from pathlib import Path
 
     from tilerl_kernels.registry import (
-        _SM70_WIDE_S,
+        _SM70_KERNELS,
         SM70_KVSPLIT,
         SM70_KVSPLIT_WIDE,
-        _SM70_KERNELS,
+        sm70_kvsplit,
     )
 
     assert SM70_KVSPLIT_WIDE < SM70_KVSPLIT, "the wide tick must be the one that saves bytes"
@@ -1093,15 +1093,15 @@ def test_the_sm70_split_count_follows_the_query_width():
     def po_gib(s, ks):  # 8 rows, 24 heads, D=256, f16 -- the shape that OOMed
         return 8 * s * 24 * ks * 256 * 2 / 1024**3
 
-    pick = lambda s: SM70_KVSPLIT if s < _SM70_WIDE_S else SM70_KVSPLIT_WIDE  # noqa: E731
-    assert pick(1) == SM70_KVSPLIT, "decode must keep the faster split count"
-    assert pick(4) == SM70_KVSPLIT, "a depth-3 verify is still narrow"
-    assert pick(512) == SM70_KVSPLIT_WIDE, "a prefill-width tick must halve PO"
+    # Call the shipped rule, don't restate it: a copy here would pass while backend drifts.
+    assert sm70_kvsplit(1) == SM70_KVSPLIT, "decode must keep the faster split count"
+    assert sm70_kvsplit(4) == SM70_KVSPLIT, "a depth-3 verify is still narrow"
+    assert sm70_kvsplit(512) == SM70_KVSPLIT_WIDE, "a prefill-width tick must halve PO"
     # The threshold has to clear every verify width the ladder can submit, or a spec
-    # tick silently takes the slower kernel.
-    assert _SM70_WIDE_S > 1 + 3, "depth 3 (S=4) must stay on the narrow count"
+    # tick silently takes the slower kernel. Depth 7 is the widest, S=8.
+    assert sm70_kvsplit(1 + 3) == SM70_KVSPLIT, "depth 3 (S=4) must stay on the narrow count"
     # And it must actually fix the failing case, not merely differ from it.
-    assert po_gib(512, pick(512)) == 0.75, f"wide PO is {po_gib(512, pick(512))} GiB"
+    assert po_gib(512, sm70_kvsplit(512)) == 0.75, f"wide PO is {po_gib(512, sm70_kvsplit(512))}"
     assert po_gib(512, SM70_KVSPLIT) == 1.5, "the shipped narrow count is what OOMed"
 
     # The registry must hand over bare factories: a closure that pins KVSPLIT swallows

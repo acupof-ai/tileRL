@@ -19,14 +19,7 @@ import torch
 
 from . import kernels_linear
 from . import reference
-from .registry import (
-    _SM70_WIDE_S,
-    SM70_KVSPLIT,
-    SM70_KVSPLIT_WIDE,
-    _arch_for,
-    _resolve,
-    resolve_target,
-)
+from .registry import _arch_for, _resolve, resolve_target, sm70_kvsplit
 
 __all__ = ["Backend", "get_backend", "resolve_target"]
 
@@ -712,7 +705,7 @@ class Backend:
             # sit at different widths: at S=1 32 splits beat 16 by 1.20x while PO
             # is 3 MiB, and at prefill width they are 1.005x apart while PO is
             # 1.5 GiB and OOMs a 32 GB card. So spend splits where they are free.
-            ks = SM70_KVSPLIT if s < _SM70_WIDE_S else SM70_KVSPLIT_WIDE
+            ks = sm70_kvsplit(s)
             po, pm, pl = self._kernel("paged_attention_split", KVSPLIT=ks)(
                 self._f32(q),
                 self._f32(k_cache),
