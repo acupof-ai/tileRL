@@ -139,3 +139,33 @@ Second: when a mechanism's advantage is "X becomes cheap", check what X costs on
 the target before pricing the advantage. Here X is verify width, the sm70 ladder
 prices it in steps of 1.37x, and the suffix decays faster than the step — so the
 advantage is worth less than zero, which no amount of draft-side saving fixes.
+
+## 2026-09-03, later: the margin was thinner than stated, and the verdict holds
+
+The `p = 0.881` above was inverted from `tok/forward = 3.34`, measured on a prompt
+that was `range(10, 10+ctx)` — consecutive low token ids, which the draft finds
+unusually easy. On a prompt drawn from the whole vocabulary the same config reads
+**2.03 tok/forward** at ctx=1024 (`wins/2026-09-03-long-context-decode-is-all-tick-cost.md`),
+which inverts to **p = 0.554**.
+
+Re-running this entry's own arithmetic on that:
+
+| acceptance source | tok/fwd | p | block-parallel yield | vs 2.784 break-even |
+|---|---:|---:|---:|---:|
+| confounded prompt (above) | 3.34 | 0.881 | 2.831 | **1.017x** |
+| random-vocabulary prompt | 2.03 | 0.554 | 1.880 | **0.675x** |
+
+So the REJECT stands and its margin widens from 1.7% to 32%. That matters for how
+much scrutiny the verdict needs, not for its direction: at 1.016x against a 1.16%
+noise floor this was one careful re-measurement away from flipping, and it is now
+outside any noise question.
+
+The draft-share half of the measurement is unaffected. `share = 2 × (ms_tick(3) −
+ms_tick(2)) / ms_tick(2)` is a cost subtraction at a fixed rung, and tick cost does
+not depend on which tokens are in the prompt.
+
+Neither prompt is the serving distribution — random vocabulary is the pessimistic
+end and consecutive low ids the optimistic one. **The depth default is therefore
+still unsettled**, and settling it needs real text; this entry's verdict does not
+depend on which end is right, because the parallel head loses at both.
+

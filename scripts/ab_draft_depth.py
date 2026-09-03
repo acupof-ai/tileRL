@@ -53,9 +53,21 @@ from tilerl.spec import LADDER_WIDTHS, load_draft
 DEPTHS = (1, 2, 3, 4)
 
 
-def measure(e, ctx: int, tokens: int) -> tuple[float, float]:
-    """(ms per decode tick, tokens per forward) over DECODE ticks only."""
-    rid = e.submit(list(range(10, 10 + ctx)),
+def measure(e, ctx: int, tokens: int, vocab: int) -> tuple[float, float]:
+    """(ms per decode tick, tokens per forward) over DECODE ticks only.
+
+    The prompt is drawn from the whole vocabulary, not `range(10, 10+ctx)`. That
+    old prompt makes tok/forward a function of ctx -- it reads a different slice of
+    the vocab at every length -- and at ctx=1024 it inflated acceptance from 2.03
+    to 2.86, which is 1.409x and straddles the 2.776 break-even at W=4.
+    errors/2026-09-03-the-context-sweep-changed-the-prompt.md
+
+    Only the SECOND return value is affected. ms/tick is a cost, measured at a
+    fixed rung, and does not depend on which tokens are in the prompt -- so the
+    draft-share subtraction this script exists for stands either way.
+    """
+    rid = e.submit(torch.randint(0, vocab, (ctx,),
+                                 generator=torch.Generator().manual_seed(1000)).tolist(),
                    SamplingParams(temperature=0.0, max_new_tokens=tokens, seed=0))
     req = None
     while req is None or req.phase != _PHASE_DECODE:
@@ -104,8 +116,8 @@ def main() -> None:
                      max_total_tokens=8192, draft=draft, spec_depth=max(DEPTHS))
     for d in DEPTHS:
         e._spec_depth = d
-        measure(e, args.ctx, args.tokens)  # warm: JIT + this width's graph capture
-        ms, tpf = measure(e, args.ctx, args.tokens)
+        measure(e, args.ctx, args.tokens, cfg.vocab_size)  # warm: JIT + graph capture
+        ms, tpf = measure(e, args.ctx, args.tokens, cfg.vocab_size)
         rows[d] = (ms, tpf)
         rung = next(w for w in LADDER_WIDTHS if w >= 1 + d)
         print(f"{d:>5} {1 + d:>3} {rung:>4} {ms:>8.2f} {tpf:>8.2f} {1000 * tpf / ms:>7.1f}")

@@ -116,7 +116,15 @@ if __name__ == "__main__":  # runnable check
     # arithmetic over this ladder plus the staircase above -- so it belongs next to
     # them and breaks if either moves. A block head pays ONE draft forward at any k,
     # which is the whole mechanism; the suffix decays 0.79 per position (DSpark's own
-    # measured [72,57,45]) off our p=0.881 (inverted from the measured 3.34 tok/fwd).
+    # measured [72,57,45]) off p=0.881.
+    #
+    # p=0.881 is inverted from 3.34 tok/fwd, measured on a `range(10, 10+ctx)` prompt --
+    # consecutive low ids, which the draft finds unusually easy. A random-vocabulary
+    # prompt reads 2.03 at the same config, inverting to p=0.554, and the verdict is
+    # 0.675x there against 1.017x here. The OPTIMISTIC p is kept on purpose: it is the
+    # arm where the mechanism comes closest to winning, so an assertion that holds at
+    # p=0.881 holds for any prompt the server actually sees. Raising p can only help
+    # block-parallel; if these ever trip, re-derive rather than retune.
     # k=3 is the optimum at 1.016x, and k=7 -- the width block-parallel makes cheap --
     # falls to 0.818x, because rung 4 -> 8 costs 18.59 ms for +0.213 tok/forward.
     # Negative control run: price rung 8 at rung 4's 49.87 ms (the "wider is free" world
@@ -139,6 +147,10 @@ if __name__ == "__main__":  # runnable check
     assert rates[7] < rates[3], (
         f"the go-wider gift must stay negative: k=7 {rates[7]:.1f} vs k=3 {rates[3]:.1f} tok/s"
     )
+    # 50.3 tok/s is what depth 3 measured on the SAME optimistic prompt, so this
+    # compares like with like: the block head's ceiling must not clear the head we
+    # ship by more than the 1.16% harness noise floor. On a random-vocabulary prompt
+    # the same comparison is 0.675x, i.e. this bound is the tight one.
     assert rates[3] / 50.3 < 1.03, (
         f"block-parallel's margin must stay inside the 1.16% noise floor: "
         f"{rates[3] / 50.3:.3f}x of the measured 50.3 tok/s"
