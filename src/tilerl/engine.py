@@ -309,9 +309,6 @@ class Engine:
         self._failed: dict[int, str] = {}
         self._finished_count = 0
 
-        # Prefix-boundary state snapshots keyed by token tuple (74.81 MiB each at
-        # 27B), dropped with their store entry on eviction.
-
         self._blocks_used = 0  # engine allocations outstanding (retains excluded)
         self._slots_used = 0
         self._prefix_hits = 0
