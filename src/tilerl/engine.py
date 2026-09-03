@@ -46,6 +46,13 @@ from .kv_cache import (
 )
 from .spec import survival, verify_lens
 
+def _graph_on(backend, decode_graph: bool | None) -> bool:
+    """The captured decode tick is on by default on CUDA only. One definition:
+    ``build_engine`` sizes the pools for the pad row from the same answer the
+    engine reserves it on."""
+    return backend.device.type == "cuda" if decode_graph is None else decode_graph
+
+
 _PREFILL_BUCKET = 64  # prefill widths are padded to this: bounded kernel shapes
 
 #: Decode-graph size ladder: a tick pads up to the first bucket >= its row count.
@@ -283,14 +290,21 @@ class Engine:
         self._prefix = prefix_store
         self.limits = limits
 
-        if decode_graph is None:
-            decode_graph = backend.device.type == "cuda"
-        self._decode_graph_on = decode_graph
+        self._decode_graph_on = _graph_on(backend, decode_graph)
         self._decode_graphs: dict = {}
-        # Padding rows of a replay still write to both pools; reserved lazily on
-        # the first tick that pads, so an engine that never pads keeps the slot.
+        # A replay's padding rows write to both pools, so they need a slot and a
+        # block of their own. Reserved here, not on the first tick that pads:
+        # ``build_engine`` sized the pools for this row, and taking it up front
+        # keeps the capacity the caller asked for whole instead of removing one
+        # request's worth of it partway through a run.
         self._pad_slot: int | None = None
         self._pad_block: int | None = None
+        if self._decode_graph_on:
+            try:
+                self._pad_slot = state_pool.alloc_slot()
+                self._pad_block = kv_pool.alloc_block()
+            except RuntimeError:
+                pass  # pools sized without the spare: fall back to exact-size graphs
         self._graph_pool = None
 
         self._draft = draft
@@ -361,6 +375,18 @@ class Engine:
 
     # ------------------------------------------------------------------ API
 
+    @property
+    def usable_blocks(self) -> int:
+        """KV blocks a request may have. The pools are sized one larger than the
+        caller asked for when the captured tick is on, and that row is the
+        engine's — every capacity answer is net of it, or a request sized to the
+        whole pool passes the guard and fails on the allocation behind it."""
+        return self._kv.num_blocks - (self._pad_block is not None)
+
+    @property
+    def usable_slots(self) -> int:
+        return self._states.num_slots - (self._pad_slot is not None)
+
     def submit(self, input_ids: Any, params: SamplingParams | None = None) -> int:
         """Queue a request; returns its opaque id. Prefix lookup, block and
         state-slot allocation happen here, not at admission."""
@@ -377,7 +403,7 @@ class Engine:
                     f"({self.limits.max_total_tokens})"
                 )
             # +depth: a verify tick materializes the drafts past the last token
-            if self._kv.blocks_for_tokens(total + self._width - 1) > self._kv.num_blocks:
+            if self._kv.blocks_for_tokens(total + self._width - 1) > self.usable_blocks:
                 raise ValueError(f"request ({total} tokens) exceeds KV pool capacity")
         with self._lock:
             rid = self._next_id
@@ -541,10 +567,10 @@ class Engine:
                 "running": len(self._running),
                 "finished": self._finished_count,
                 "blocks_used": self._blocks_used,
-                "blocks_total": self._kv.num_blocks,
+                "blocks_total": self.usable_blocks,
                 "pool_used_blocks": self._kv.used_blocks,
                 "slots_used": self._slots_used,
-                "slots_total": self._states.num_slots,
+                "slots_total": self.usable_slots,
                 "prefix_hits": self._prefix_hits,
                 "prefix_misses": self._prefix_misses,
                 "prefix_published": self._prefix_published,
@@ -714,11 +740,7 @@ class Engine:
         if B is None or self.limits.max_batch < B:
             B = n  # above the ladder: one exact-size graph rather than none
         if n < B and self._pad_slot is None:
-            try:
-                self._pad_slot = self._states.alloc_slot()
-                self._pad_block = self._kv.alloc_block()
-            except RuntimeError:
-                B = n  # no spare capacity to park padding rows on: exact size
+            B = n  # nothing reserved to park padding rows on: exact size
         g = self._decode_graphs.get((B, W))
         if g is None:
             try:
@@ -902,15 +924,16 @@ def build_engine(
     if draft is not None:
         draft.set_depth(spec_depth)  # the state pool is sized by the width it settles on
     model.params = backend.materialize(model.params)
+    pad = _graph_on(backend, decode_graph)  # the replay's padding row owns a slot and a block
     kv_pool = PagedKvPool(
-        num_blocks,
+        num_blocks + pad,
         cfg.num_kv_heads,
         cfg.head_dim,
         device=backend.device,
         layer_map=cfg.full_attn_layers,
     )
     state_pool = LinearStatePool(
-        num_slots,
+        num_slots + pad,
         n_linear,
         cfg.linear_num_value_heads,
         cfg.linear_value_head_dim,
