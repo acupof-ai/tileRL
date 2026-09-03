@@ -990,6 +990,32 @@ def test_a_verify_tick_submits_batch_times_width_rows():
     assert max(seen) <= 16, f"tick exceeded max_batch*(1+depth): {max(seen)}"
 
 
+def test_a_padded_decode_tick_needs_a_spare_state_slot():
+    """A tick with fewer rows than its graph bucket permanently reserves one state slot
+    for the padding rows (engine.py:827) out of the same pool, and never returns it. So
+    num_slots == max_batch leaves max_batch-1 for requests and the next submit() raises
+    "LinearStatePool exhausted" — which killed two 10-minute pod runs, because the engine
+    swallows its own failure (`except RuntimeError: B = n`) and only the caller sees it.
+    Pure bookkeeping, so it runs on the CPU target where no graph is ever captured."""
+    from pathlib import Path
+
+    from tilerl.engine import _GRAPH_BUCKETS
+    def bucket(rows: int, max_batch: int) -> int:
+        b = next((c for c in _GRAPH_BUCKETS if c >= rows), None)
+        return rows if b is None or max_batch < b else b
+
+    # A batch draining one request at a time hits n = max_batch-1, which pads at 4.
+    pads = {n: n < bucket(n, 4) for n in (1, 2, 3, 4)}
+    assert pads[3], f"n=3 must pad into the 4 bucket, else this test guards nothing: {pads}"
+    assert not pads[4], f"a full batch must not pad: {pads}"
+
+    # So any harness sizing num_slots == max_batch is one slot short. bench_ctx_decode.py
+    # is the one that was, twice; assert its sizing keeps room for the pad row.
+    src = (Path(__file__).resolve().parent.parent / "scripts/bench_ctx_decode.py").read_text()
+    assert "slots = b + 2" in src, "bench_ctx_decode must size num_slots above max_batch"
+    assert "num_slots=slots, max_batch=b" in src, "bench_ctx_decode must pass them apart"
+
+
 def test_generate_fans_a_corpus_across_workers(tmp_path):
     """Offline batch generation through the real subprocess path: every prompt back exactly once."""
     import json

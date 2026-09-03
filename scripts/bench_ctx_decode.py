@@ -97,15 +97,18 @@ def measure(e, ctx: int, tokens: int, batch: int = 1, width: int = 1) -> tuple[f
         wall, s1 = time.perf_counter() - t0, e.stats()
     finally:
         type(e)._run_forward = orig
-    # Retire the rest before returning: a slot frees at _finish, so a request left in
-    # _running makes the next measure() raise "LinearStatePool exhausted".
-    for _ in range(8 * tokens + 64):
-        if not e._running:
+    # Retire everything before returning: submit() takes a state slot at admission and
+    # only _finish returns it, so a request left in EITHER queue holds one and the next
+    # call raises "LinearStatePool exhausted". _running alone is not the idle condition
+    # (engine.py checks _waiting too) -- draining only it is why the first fix still died.
+    for _ in range(16 * tokens + 256):
+        if not e._running and not e._waiting:
             break
         e.step()
         e.poll()
     else:
-        raise SystemExit(f"ctx={ctx}: {len(e._running)} requests would not retire")
+        raise SystemExit(f"ctx={ctx}: {len(e._running)} running + {len(e._waiting)} "
+                         f"waiting would not retire")
     n = s1["tokens_generated"] - s0["tokens_generated"]
     fwd = s1["decode_forwards"] - s0["decode_forwards"]
     mixed = s1["mixed_forwards"] - s0["mixed_forwards"]
@@ -155,11 +158,17 @@ def main() -> None:
     cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft) if args.draft else None
     b = max(4, args.batch)
+    # num_slots > max_batch on purpose: a tick with fewer rows than its graph bucket
+    # permanently reserves one slot for padding rows (engine.py:827), taken from this
+    # same pool and never returned. With num_slots == max_batch that leaves b-1 for
+    # requests and the next submit() raises "LinearStatePool exhausted" -- which it did,
+    # twice, and the engine hides it by falling back to an exact-size graph.
+    slots = b + 2
     # Blocks for every concurrent request's longest context plus its generation, with
     # headroom: batch=4 at ctx 4096 needs ~1056 and the old fixed 1024 would have died
     # on the last context after twenty minutes of measuring.
-    blocks = b * (-(-(max(CTXS) + args.tokens + 2 * (1 + args.depth)) // BLOCK_TOKENS)) + 64
-    e = build_engine(cfg, model, backend, num_blocks=blocks, num_slots=b, max_batch=b,
+    blocks = slots * (-(-(max(CTXS) + args.tokens + 2 * (1 + args.depth)) // BLOCK_TOKENS)) + 64
+    e = build_engine(cfg, model, backend, num_blocks=blocks, num_slots=slots, max_batch=b,
                      max_total_tokens=8192, draft=draft,
                      spec_depth=args.depth if draft else 1)
     label = f"spec d{args.depth}" if draft else "dense"
