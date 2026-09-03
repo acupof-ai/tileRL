@@ -147,6 +147,33 @@ completions differ from the base arm's, which W>1 has never promised not to do
 is 3 questions against a 2.5-point binomial sd at n=200 — it does not support a
 regression claim either way.
 
+### MMLU: the wiring changes nothing it should not
+
+Same two arms, 1000 MMLU questions, seed 0, graph on, B=8.
+
+| | score | differing completions |
+|---|---:|---:|
+| base | 742/1000 = 74.2% | — |
+| spec-w8 | 742/1000 = 74.2% | **0 of 1000** |
+
+Not "close" — identical, byte for byte. `mmlu_score` samples one token
+(`max_new_tokens=1`), so every answer comes off the prefill and speculation
+never fires: `decode fwd 0`, `drafted 0` on both arms. That makes MMLU useless
+as a throughput number here and exactly right as a correctness invariant —
+a head that is wired into the tick, taps five trunk layers and re-serves the
+draft params fp8 must leave the unspeculated path untouched, and 0 of 1000 is
+that stated without slack.
+
+Two numbers in this table that are not what they look like. The spec arm's
+108.3 s against the base arm's 135.9 s is kernel cache warmth on the second
+arm, not speculation — `drafted 0` says there was none. And 74.2% here against
+the 74.6% recorded on clean main earlier the same day is 4 questions, most
+likely the concurrency (8 here, 32 in `scripts/mmlu.py`) changing batch shapes
+and so reduction order, the same float non-associativity behind the W=8
+divergences. Both arms here ran at the same concurrency, which is what makes
+the 0-of-1000 comparison sound; the 742-against-746 question belongs to eval
+reproducibility and is not opened by this entry.
+
 ### Where the tick goes
 
 `py-spy record`, 40s of the spec arm at 100 Hz, 3998 samples, attributed to the
