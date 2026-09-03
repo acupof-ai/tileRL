@@ -176,6 +176,18 @@ def _require_on_policy(engine: Any) -> None:
                          "prefix samples from an earlier policy")
 
 
+def untruncated(sampling: Any) -> Any:
+    """The sampler the policy gradient is actually taken under. ``rl_step`` scores
+    with the full softmax, so a truncated or tempered rollout draws from one
+    distribution and is differentiated as another, and nothing reweights them.
+    Sampling untruncated makes the sampler the policy by construction.
+    # ponytail: waypoint. The destination is to carry the rollout's kept set into
+    # the gradient (DeepSeek-V3.2 §3.1 "Keep Sampling Mask"); recomputing the mask
+    # at train time instead drops the sampled token at 0.156% of positions, which
+    # is 96% of steps at 256 new tokens -- errors/2026-09-03-recomputed-mask-loses-the-step.md."""
+    return replace(sampling, temperature=1.0, top_p=1.0, top_k=0)
+
+
 def grpo_loop(
     engine: Any,
     model: Any,
@@ -194,15 +206,16 @@ def grpo_loop(
     them with ``reward_fn(prompt_ids, completion_ids) -> float``, take one
     policy-gradient step on the group-normalized advantages. The engine that
     generates IS the model that trains, so it must be built with the prefix
-    cache and decode graph off. Returns per step ``(mean reward, cross-entropy,
-    seconds, tied-group fraction)``.
+    cache and decode graph off, and rollouts are drawn untruncated so the
+    sampler is the policy the step differentiates. Returns per step
+    ``(mean reward, cross-entropy, seconds, tied-group fraction)``.
     # ponytail: recapture the graph and drop the prefix entries after each
     # update instead of disabling both, once a rollout's decode cost matters."""
     _require_on_policy(engine)
     if optimizer is None:
         optimizer = AdamW(lr=1e-5)
-    if sampling is None:
-        sampling = SamplingParams(max_new_tokens=32)
+    sampling = untruncated(sampling if sampling is not None
+                           else SamplingParams(max_new_tokens=32))
     out: list[tuple[float, float, float, float]] = []
     for step in range(steps):
         t0 = time.perf_counter()
