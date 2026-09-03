@@ -1,6 +1,6 @@
 # The GRPO batch width is a JIT cache key — cpu, 2026-09-03
 
-> Status: Shipped (cpu); pending-remote (sm90)
+> Status: Shipped (cpu and sm90)
 
 ## Context
 
@@ -61,11 +61,28 @@ once hides a 500× tail.
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
 | 2026-09-03 | pending | Mac (M-series, no GPU) | cpu | tiny | n/a | n/a | n/a |
+| 2026-09-03 | pending | H20 card 6 | cuda sm90 | qwen38-27b | n/a | n/a | n/a |
+
+**sm90 constant, measured (n=5, private cache, LoRA r16, group 8, T≈384):** a
+novel width costs **11.05 s on a 22.23 s `rl_step`, ratio 1.5x** -- novel
+34.7/33.3/33.8/31.2/31.0 s against repeats 22.1/22.0/22.4/23.0/22.2 s. Cold
+warm-up alone is 170.9 s. So the mechanism transfers and the constant does not:
+tiny's 530x is an artifact of a 71 ms step, where compile time is the whole
+measurement. Two earlier runs of the same probe reported 1.3x and 1.0x from a
+shared `TILELANG_CACHE_DIR` that labelled cache hits `novel`
+(errors/2026-09-03-probe-rebuilt-the-setup-in-the-wrong-order.md).
+
+This also bounds what the fix is worth against the P1 entry's
+`secs_per_step_median = 60.45` at gen 256: `rl_step` is ~22 s of that, leaving
+~38 s of rollout, and compile can add 11 s only to the steps that hit a new
+width. **The median step carried no surcharge**, so the recorded 60.45 describes
+the step rather than the harness -- the opposite of what the tiny number
+suggested.
 
 Training-step timings, not serving throughput — the serving columns do not apply
-to this entry. sm90 is `pending-remote`: the mechanism is TileLang shape
-specialization, which is target-independent, but the constant is not measured
-there.
+to this entry. The sm90 constant is now measured (table above); it is 1.5x, not
+tiny's 530x, because the 27B step has 22 s of real compute for the compile to be
+a surcharge on.
 
 Raw artifacts: measured inline in this session; reproduce with
 `TILERL_TARGET=cpu uv run tilerl train --recipe grpo-tiny-smoke --force` (12
