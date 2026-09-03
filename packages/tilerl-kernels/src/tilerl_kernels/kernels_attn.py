@@ -240,7 +240,11 @@ def make_paged_attention_combine(target: str, KVSPLIT: int = 16):
     """Merge split-KV partials into [B, W, Hkv*G, D]:
     Out = sum_s w_s PO_s / sum_s w_s PL_s, w_s = 2^(PM_s - max_s PM_s).
     Partial row g*W+w is head g at chain position w. Empty slices carry
-    PM=-inf, PL=0."""
+    PM=-inf, PL=0. An all-empty row (every PM -inf, so exp2(-inf - -inf) is NaN
+    and l is 0) needs n >= 1 to be unreachable: tiles >= 1 gives per >= 1, so
+    split 0 spans tile 0, which holds key 0, which every chain row may attend.
+    Guarded rather than asserted -- seq_lens lives on the device and this path
+    must stay graph-capturable, so the host cannot read it to check."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def paged_attention_combine(PO, PM, PL, G, W):
@@ -265,7 +269,12 @@ def make_paged_attention_combine(target: str, KVSPLIT: int = 16):
                 m[0] = T.max(m[0], PM[bb, hkv, sp, m0])
             l[0] = 0.0
             for sp in T.unroll(KVSPLIT):
-                w[sp] = T.exp2(PM[bb, hkv, sp, m0] - m[0])
+                # an all-empty row would make this exp2(-inf - -inf) = NaN
+                w[sp] = T.if_then_else(
+                    m[0] == -T.infinity("float32"),
+                    0.0,
+                    T.exp2(PM[bb, hkv, sp, m0] - m[0]),
+                )
                 l[0] += w[sp] * PL[bb, hkv, sp, m0]
             # guarded, not D // 32: a head_dim under 32 left Out unwritten
             for i in T.unroll(T.ceildiv(D, 32)):
@@ -274,7 +283,7 @@ def make_paged_attention_combine(target: str, KVSPLIT: int = 16):
                     for sp in T.unroll(KVSPLIT):
                         acc[0] += w[sp] * PO[bb, hkv, sp, m0, i * 32 + lane]
                     Out[bb, m0 % W, hkv * G + m0 // W, i * 32 + lane] = T.cast(
-                        acc[0] / l[0], "bfloat16"
+                        T.if_then_else(l[0] == 0.0, 0.0, acc[0] / l[0]), "bfloat16"
                     )
         return Out
 
