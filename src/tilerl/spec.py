@@ -401,11 +401,15 @@ class DraftHead:
             seq_q_lens=torch.tensor(sq, device=dev),
         )
         dh: list = []
+        # last_only, or the vocab readout runs over every position of a prefill chunk and
+        # one row is read: 512 x 248320 f32 = 485 MiB, which is the allocation that OOMed
+        # ctx=8192 at a 4146-block pool. hidden_out is appended at full width, so `last`
+        # still indexes dh.
         logits = self.forward(torch.cat(hs, dim=0), ids, pos, kv, backend,
-                                     hidden_out=dh)
+                              hidden_out=dh, last_only=sq)
         last = torch.tensor([q - 1 for q in sq], device=dev)
         rng = torch.arange(n, device=dev)
-        tok, prob = backend.greedy(logits[rng, last].unsqueeze(1))
+        tok, prob = backend.greedy(logits)
         h = dh[-1][rng, last].unsqueeze(1)
         confs: list[list[float]] = [[] for _ in plan]
         if (self.width - 1) > 1:

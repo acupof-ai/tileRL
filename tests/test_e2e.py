@@ -1118,6 +1118,13 @@ def test_engine_draft_matches_full_context_draft(rows, plen, batched_tokens, dep
     def spy(hidden, ids, positions, kv, be, hidden_out=None, last_only=False):
         out = inner(hidden, ids, positions, kv, be, hidden_out=hidden_out,
                     last_only=last_only)
+        # The readout must be reduced whenever the tick is wider than one position: a
+        # 512-position prefill chunk reads ONE row out of a [512, vocab] f32 readout,
+        # which is 485 MiB and OOMed ctx=8192 on a 32 GB card. Correctness cannot see
+        # this -- the unreduced path returns the same token.
+        assert out.shape[1] == 1 or np.asarray(ids).shape[1] == 1, (
+            f"draft readout is {out.shape[1]} positions wide for a "
+            f"{np.asarray(ids).shape[1]}-position tick: pass last_only")
         # chain step 0 on full-batch ticks only: later steps consume the draft's
         # own hidden, and a partial batch would shift row -> request
         if step["n"] % max(depth, 1) == 0 and out.shape[0] == rows:
