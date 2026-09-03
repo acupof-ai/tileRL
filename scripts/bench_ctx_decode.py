@@ -206,7 +206,12 @@ def main() -> None:
     backend = get_backend()
     cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft) if args.draft else None
-    b = max(4, args.batch)
+    # max_batch tracks the submissions. It used to be floored at 4, which quadrupled a
+    # B=1 run's block pool and its graph count for rows that could never be admitted --
+    # noise in exactly the single-stream config a serve default has to be chosen from.
+    # Floored at 2 only because num_slots = b + 2 needs headroom for the padding slot
+    # engine.py:827 reserves.
+    b = max(2, args.batch)
     # num_slots > max_batch on purpose: a tick with fewer rows than its graph bucket
     # permanently reserves one slot for padding rows (engine.py:827), taken from this
     # same pool and never returned. With num_slots == max_batch that leaves b-1 for
