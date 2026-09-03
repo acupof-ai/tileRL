@@ -23,6 +23,7 @@ from typing import Any
 import torch
 
 from .config import ModelConfig
+from .model import Model
 from .spec import read_head_params
 
 
@@ -81,15 +82,24 @@ class DFlash2Head:
     """``params`` holds the head's own weights only: the embedding and the
     readout are the trunk's, and the block's K/V never outlives one draft."""
 
+    #: codebooks the selector GATHERS rows from, not linears: block-quantizing
+    #: them would replace [248320,256] with a .w8 the walk cannot index.
+    no_quant = ("selector.pred", "selector.succ")
+
     def __init__(self, trunk: Any, params: dict[str, torch.Tensor], cfg, dcfg) -> None:
         self.trunk, self.params, self.cfg, self.dcfg = trunk, params, cfg, dcfg
         self.groups = cfg.hidden_size // dcfg.group_size
+        #: the engine re-serves the head fp8; a Model gives the head the same
+        #: .w8/.wscale dispatch the trunk has, over THIS params dict.
+        self.layers = Model(cfg, params)
+        #: the block is fixed by the checkpoint: anchor + block_size-1 drafts
+        self.spec_depth = dcfg.block_size - 1
 
     def context_kv(self, aux_hidden, positions, backend) -> list[tuple]:
         """Per-layer (k, v) for the context, straight off the trunk's stacked taps."""
         cfg = self.cfg
         h = backend.rmsnorm(
-            backend.linear(aux_hidden, self.params["fc"]), self.params["hidden_norm"], cfg.rms_eps
+            self._lin(backend, aux_hidden, "fc"), self.params["hidden_norm"], cfg.rms_eps
         )
         out = []
         for i in range(cfg.num_layers):
@@ -115,10 +125,10 @@ class DFlash2Head:
             x = backend.add(x, self._conv(h, c, self.params[f"{p}.attn_conv.base"][1]))
             h, c = self._conv_in(backend, x, f"{p}.post_attn_norm", f"{p}.mlp_conv")
             h = backend.silu_mul(
-                backend.linear(h, self.params[f"{p}.gate_proj"]),
-                backend.linear(h, self.params[f"{p}.up_proj"]),
+                self._lin(backend, h, f"{p}.gate_proj"),
+                self._lin(backend, h, f"{p}.up_proj"),
             )
-            h = backend.linear(h, self.params[f"{p}.down_proj"])
+            h = self._lin(backend, h, f"{p}.down_proj")
             x = backend.add(x, self._conv(h, c, self.params[f"{p}.mlp_conv.base"][1]))
         return backend.rmsnorm(x, self.params["norm"], cfg.rms_eps)
 
@@ -131,7 +141,7 @@ class DFlash2Head:
         unary, cand = torch.topk(
             self.trunk._linear(backend, hidden, head)[0].float(), dc.top_k, dim=-1
         )
-        proj = backend.linear(hidden, self.params["selector.proj"])[0].float()
+        proj = self._lin(backend, hidden, "selector.proj")[0].float()
         # gathered rows only: an f32 copy of either [248320,256] codebook is 254 MB
         pred, succ = self.params["selector.pred"], self.params["selector.succ"]
         out, prev = [], anchor
@@ -152,8 +162,11 @@ class DFlash2Head:
         return self.path(h[:, 1:], anchor, backend)
 
     # --- pieces -------------------------------------------------------------
+    def _lin(self, backend, x, key):
+        return self.layers._linear(backend, x, key)
+
     def _heads(self, backend, h, key, heads):
-        return backend.linear(h, self.params[key]).reshape(*h.shape[:2], heads, self.cfg.head_dim)
+        return self._lin(backend, h, key).reshape(*h.shape[:2], heads, self.cfg.head_dim)
 
     def _rope(self, backend, x, positions):
         cfg = self.cfg
@@ -168,13 +181,13 @@ class DFlash2Head:
         k = self._rope(backend, backend.rmsnorm(k, self.params[f"{p}.k_norm"], cfg.rms_eps), pos)
         k, v = torch.cat([ctx[0], k], 1), torch.cat([ctx[1], v], 1)
         out = _attend(q, k, v, pos, torch.cat([ctx_pos, pos]), self.dcfg.sliding_window)
-        return backend.linear(out.reshape(*h.shape[:2], -1), self.params[f"{p}.o_proj"])
+        return self._lin(backend, out.reshape(*h.shape[:2], -1), f"{p}.o_proj")
 
     def _conv_in(self, backend, x, norm_key, conv_key):
         """Norm, then the conv before the op — and the coefficients its partner
         after the op consumes. One projection yields both sides' taps."""
         h = backend.rmsnorm(x, self.params[norm_key], self.cfg.rms_eps)
-        c = backend.linear(h, self.params[f"{conv_key}.proj"]).reshape(
+        c = self._lin(backend, h, f"{conv_key}.proj").reshape(
             *h.shape[:2], 2, self.dcfg.taps, self.groups
         )
         return self._conv(h, c[:, :, 0], self.params[f"{conv_key}.base"][0]), c[:, :, 1]
