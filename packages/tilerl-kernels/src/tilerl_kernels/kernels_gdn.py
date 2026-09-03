@@ -56,8 +56,6 @@ def make_gdn_prep_bf16(target: str):
             pq = T.alloc_local((1,), "float32")
             pk = T.alloc_local((1,), "float32")
 
-            # every value head of a GQA group recomputes the group's q/k: cheaper
-            # than a second launch, and the reads hit L2
             cq[0] = 0.0
             ck[0] = 0.0
             cv[0] = 0.0
@@ -336,15 +334,15 @@ def make_gdn_chunk_wu(target: str, block_DK: int = 64, block_DV: int = 32,
     return gdn_chunk_wu
 
 
-def make_gdn_state_scan(target: str, block_DV: int = 32, threads: int = 128,
-                        num_stages: int = 0):
+def make_gdn_state_scan(target: str, block_DV: int = 32, threads: int = 128):
     """Inter-chunk state scan, S_next = exp(G_last) S + K^T (U - W S), the state in a
     fragment across the chunk loop; exports every chunk's entry state h for chunk_o
     (example_chunk_delta_h.py, tilelang_chunk_gated_delta_rule_fwd_h with
     use_g, use_initial_state, store_final_state, save_new_value all True).
-    num_stages must be 0: the state is loop-carried through b_h_shared, and the
-    software pipeliner reorders that copy (NaN at 1 and 2; the earlier port's lost
-    e_last * S term was the same fault, errors/2026-08-29-gdn-state-scan-port-wip.md)."""
+    The chunk loop cannot be pipelined: the state is loop-carried through b_h_shared,
+    and the software pipeliner reorders that copy (NaN at 1 and 2; the earlier port's
+    lost e_last * S term was the same fault,
+    errors/2026-08-29-gdn-state-scan-port-wip.md)."""
 
     @tilelang.jit(target=target, pass_configs={**_pass_configs(), _FAST_MATH: True})
     def gdn_state_scan(K, W, U, G, initial_state, chunk):
@@ -387,15 +385,12 @@ def make_gdn_state_scan(target: str, block_DV: int = 32, threads: int = 128,
             T.copy(initial_state[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV], b_h_shared)
             T.copy(b_h_shared, b_h_fragment)
 
-            for i_s in T.Pipelined(T.ceildiv(S, block_S), num_stages=num_stages):
-                # Store previous result to the hidden tensor, like the epilogue
+            for i_s in T.Pipelined(T.ceildiv(S, block_S), num_stages=0):
                 T.copy(b_h_shared, h[bb, i_s, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV])
 
-                # Recurrence
                 T.copy(W[bb, i_s * block_S : (i_s + 1) * block_S, bh, 0:DK], W_shared)
                 T.gemm(W_shared, b_h_shared, V_new_fragment, clear_accum=True)
 
-                # U - W * S
                 T.copy(
                     U[bb, i_s * block_S : (i_s + 1) * block_S, bh,
                       bv * block_DV : (bv + 1) * block_DV],
@@ -405,7 +400,6 @@ def make_gdn_state_scan(target: str, block_DV: int = 32, threads: int = 128,
                 for i_s2, i_v in T.Parallel(block_S, block_DV):
                     V_new_fragment[i_s2, i_v] = -V_new_fragment[i_s2, i_v] + U_fragment[i_s2, i_v]
 
-                # Save V_new
                 T.copy(V_new_fragment, dst=V_new_shared)
                 T.copy(
                     V_new_shared,
@@ -414,7 +408,6 @@ def make_gdn_state_scan(target: str, block_DV: int = 32, threads: int = 128,
                 )
 
                 T.copy(K[bb, i_s * block_S : (i_s + 1) * block_S, kh, 0:DK], K_shared)
-                # use_g
                 G_last_local = G[bb, (i_s + 1) * block_S - 1, bh]
                 for i_s2, i_v in T.Parallel(block_S, block_DV):
                     G_shared[i_s2, i_v] = G[bb, i_s * block_S + i_s2, bh]
@@ -430,13 +423,11 @@ def make_gdn_state_scan(target: str, block_DV: int = 32, threads: int = 128,
                 for i_k, i_v in T.Parallel(DK, block_DV):
                     b_h_fragment[i_k, i_v] *= G_last_local
 
-                # Update intermediate results
                 T.copy(V_new_fragment, V_new_shared)
                 T.gemm(K_shared, V_new_shared, b_h_fragment, transpose_A=True)
 
                 T.copy(b_h_fragment, b_h_shared)
 
-            # Save final state
             T.copy(b_h_fragment, final_state[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV])
         return h, final_state, V_new
 

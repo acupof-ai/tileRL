@@ -24,7 +24,7 @@ from .registry import _arch_for, _resolve, resolve_target
 __all__ = ["Backend", "get_backend", "resolve_target"]
 
 _THREADS = 64
-_WY_CHUNK = 64  # the chunkwise-WY kernels' chunk length
+_WY_CHUNK = 64  # gdn_state_scan/gdn_chunk_o size h by S // chunk: T must be a whole multiple
 
 
 def _round_up(x: int, m: int) -> int:
@@ -671,9 +671,8 @@ class Backend:
 
     def _full_rows(self, seq_q_lens, t: int) -> bool:
         """Every row's query span is the whole T -- the chunkwise form has no
-        per-row mask. The memo is not a micro-optimization: ``.min()`` is a host
-        sync, one tensor object reaches all 64 layers, and dropping it costs 64
-        pipeline drains a prefill tick -- the host cost this whole path removes."""
+        per-row mask. ``.min()`` is a host sync and one tensor object reaches all
+        64 layers, so without the memo a prefill tick pays 64 pipeline drains."""
         if seq_q_lens is None:
             return True
         hit = self._full_rows_memo
