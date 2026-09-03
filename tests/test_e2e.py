@@ -820,15 +820,18 @@ def test_max_think_tokens_forces_the_block_closed():
     assert tuple(out[2:4]) == end  # forced at the budget, then sampling resumes
 
 
-class _OracleDraft:
+class _OracleDraft(DraftHead):
     """A draft head proposing the trunk's own continuation: full acceptance
     every tick, so the verify path (chain KV, GDN state selection, multi-token
-    commit) is exercised; a random head is rejected at position 0."""
+    commit) is exercised; a random head is rejected at position 0. Inherits the
+    drafter contract and replaces only the two calls ``step`` makes into it."""
 
     def __init__(self, cfg, expected: dict[int, int]):
         self.cfg = replace(cfg, num_layers=1, full_attn_layers=(0,))
         self.params: dict = {}
         self.expected = expected  # absolute position -> token
+        self.width = 3
+        self.has_confidence = False
 
     def forward(self, hidden, ids, positions, kv, backend, hidden_out=None):
         pos = np.atleast_2d(np.asarray(positions))

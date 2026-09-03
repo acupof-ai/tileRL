@@ -36,8 +36,14 @@ import numpy as np
 import torch
 
 from . import precision
-from .dflash2 import DFlash2Head
-from .kv_cache import BLOCK_TOKENS, LinearStatePool, NoPrefixStore, PagedKvPool, PrefixStore
+from .kv_cache import (
+    BLOCK_TOKENS,
+    BatchKv,
+    LinearStatePool,
+    NoPrefixStore,
+    PagedKvPool,
+    PrefixStore,
+)
 from .spec import survival, verify_lens
 
 _PREFILL_BUCKET = 64  # prefill widths are padded to this: bounded kernel shapes
@@ -66,22 +72,6 @@ def _quantize_draft(params: dict[str, torch.Tensor], skip: tuple[str, ...] = ())
         else:
             out[k] = v
     return out
-
-
-def _draft_depth(draft: Any, spec_depth: int | None) -> int:
-    """Drafts per row per tick. A block drafter's width is its checkpoint's block,
-    so ``spec_depth`` is not the caller's to choose there."""
-    if draft is None:
-        return 0
-    if not isinstance(draft, DFlash2Head):
-        return 4 if spec_depth is None else spec_depth
-    if spec_depth is not None and spec_depth != draft.spec_depth:
-        raise ValueError(
-            f"spec_depth={spec_depth} with a block drafter: the checkpoint's block is "
-            f"{draft.dcfg.block_size} slots (anchor + {draft.spec_depth} drafts), so the "
-            f"verify width is fixed at {draft.dcfg.block_size}. Pass spec_depth=None."
-        )
-    return draft.spec_depth
 
 
 def _step_seed(seed: int, generated: int) -> int:
@@ -153,23 +143,17 @@ class _Req:
     ctx: list | None = None
     ctx_len: int = 0  # context positions already projected into ``ctx``
 
+    @property
+    def prefilling(self) -> bool:
+        return self.phase == _PHASE_PREFILL
 
-@dataclass
-class BatchKv:
-    """Batch-level KV descriptor for one model forward (the model reads it duck-typed).
+    @property
+    def decoding(self) -> bool:
+        return self.phase == _PHASE_DECODE
 
-    ``seq_len`` is each row's logical length AFTER this forward. ``seq_q_lens`` is
-    the per-row valid query count; rows are left-aligned and padded to a shared T,
-    and None means every row is valid for the full T.
-    """
-
-    block_table: torch.Tensor  # [B, num_blocks] long, padded with 0
-    seq_len: torch.Tensor  # [B] long
-    state_slot: torch.Tensor  # [B] long
-    kv_pool: Any
-    state_pool: Any
-    seq_q_lens: torch.Tensor | None = None  # [B] valid query tokens per row
-    keep_steps: int = 0  # verify: keep the recurrent state after each of the first N chain tokens
+    @property
+    def done(self) -> bool:
+        return self.phase == _PHASE_DONE
 
 
 class _DecodeGraph:
@@ -309,58 +293,44 @@ class Engine:
         self._pad_block: int | None = None
         self._graph_pool = None
 
-        # The draft has its own KV plane over the trunk's whole block space, so
-        # it attends over the same prefix the trunk does (a chain-local block
-        # dropped acceptance from 84.4% to 55.8%).
         self._draft = draft
-        # ponytail: two drafter interfaces branch on this flag; one drafter contract,
-        # with NextN's chain loop inside the NextN head, is the upgrade (ckl's call).
-        self._block = isinstance(draft, DFlash2Head)
-        self._aux_layers = draft.dcfg.target_layers if self._block else ()
-        self._spec_depth = _draft_depth(draft, spec_depth)
+        self._aux_layers = draft.aux_layers if draft is not None else ()
+        self._width = 1  # verify tick width: 1 committed token + width-1 drafts
         if draft is not None:
-            if not self._block and not hasattr(draft, "forward"):
+            from tilerl_kernels.backend import _MAX_VERIFY_W
+
+            if not hasattr(draft, "step"):
                 raise TypeError(
-                    f"draft head {type(draft).__name__} serves neither path: it is not a "
-                    f"block drafter and has no forward() for the chain drafter"
+                    f"draft head {type(draft).__name__} is not a drafter: it has no "
+                    f"step(rows). See the contract in spec.py."
+                )
+            draft.set_depth(spec_depth)
+            self._width = draft.width
+            if not 1 < self._width <= BLOCK_TOKENS:
+                raise ValueError(
+                    f"verify width must be in (1, {BLOCK_TOKENS}], got {self._width}"
+                )
+            if self._width > _MAX_VERIFY_W:
+                raise ValueError(
+                    f"verify width {self._width} exceeds the verify tile's {_MAX_VERIFY_W}: "
+                    f"paged_attention would route every verify tick off the decode path onto "
+                    f"the M-tiled prefill kernel, which costs more than the drafts save"
+                )
+            if draft.aux_layers and not isinstance(prefix_store, NoPrefixStore):
+                raise ValueError(
+                    "a drafter that taps the trunk's aux layers cannot serve behind a prefix "
+                    "cache. Its context is built only from positions this process forwarded; "
+                    "an adopted prefix skips them, so the draft would attend over whatever the "
+                    "recycled blocks hold and the failure would look like a weak drafter, not "
+                    "a bug. Pass prefix_store=NoPrefixStore()."
+                    # ponytail: rebuilding ctx from an adopted prefix is the upgrade.
                 )
             # Dense bf16 on Backend.linear's generic path was 9.7 ms per projection
             # vs 0.13 ms on the fp8 kernel; serve it the way the trunk is served.
-            served = backend.materialize(
-                _quantize_draft(draft.params, skip=getattr(draft, "no_quant", ()))
-            )
-            # In place: the head's Model holds THIS dict.
-            draft.params.clear()
+            served = backend.materialize(_quantize_draft(draft.params, skip=draft.no_quant))
+            draft.params.clear()  # in place: the head's Model holds THIS dict
             draft.params.update(served)
-            if not 0 < self._spec_depth < BLOCK_TOKENS:
-                raise ValueError(
-                    f"spec_depth must be in [1, {BLOCK_TOKENS}), got {self._spec_depth}"
-                )
-        if self._block:
-            from tilerl_kernels.backend import _MAX_VERIFY_W
-
-            if draft.dcfg.block_size > _MAX_VERIFY_W:
-                raise ValueError(
-                    f"block_size {draft.dcfg.block_size} exceeds the verify tile's "
-                    f"{_MAX_VERIFY_W}: paged_attention would route every verify tick off the "
-                    f"decode path onto the M-tiled prefill kernel, which costs more than the "
-                    f"block saves"
-                )
-            if not isinstance(prefix_store, NoPrefixStore):
-                raise ValueError(
-                    "a block drafter cannot serve behind a prefix cache. Its context K/V is "
-                    "built only from positions this process forwarded; an adopted prefix skips "
-                    "them, so the draft would attend over whatever the recycled blocks hold and "
-                    "the failure would look like a weak drafter, not a bug. "
-                    "Pass prefix_store=NoPrefixStore()."
-                    # ponytail: rebuilding ctx from an adopted prefix is the upgrade.
-                )
-        elif draft is not None:
-            self._draft_kv = PagedKvPool(
-                kv_pool.num_blocks, draft.cfg.num_kv_heads, draft.cfg.head_dim,
-                num_layers=draft.cfg.num_layers, device=backend.device,
-                layer_map=tuple(range(draft.cfg.num_layers)),
-            )
+            draft.attach(backend, kv_pool.num_blocks)
 
         self._pin = backend.device.type == "cuda"
         self._lock = threading.RLock()
@@ -407,7 +377,7 @@ class Engine:
                     f"({self.limits.max_total_tokens})"
                 )
             # +depth: a verify tick materializes the drafts past the last token
-            if self._kv.blocks_for_tokens(total + self._spec_depth) > self._kv.num_blocks:
+            if self._kv.blocks_for_tokens(total + self._width - 1) > self._kv.num_blocks:
                 raise ValueError(f"request ({total} tokens) exceeds KV pool capacity")
         with self._lock:
             rid = self._next_id
@@ -712,7 +682,7 @@ class Engine:
         if decodes and prefills:
             self._mixed_forwards += 1
         if self._draft is not None:
-            self._draft_step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
+            self._draft.step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
 
     def _finish_prefills(self, prefills: list[_Req], chunks: list[int], logits, base: int) -> None:
         done = []
@@ -779,151 +749,8 @@ class Engine:
                     r.hidden, r.hidden_from = g.hidden[i : i + 1], r.seq_len - 1
             self._sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
         if self._draft is not None:
-            self._draft_step(reqs)
+            self._draft.step(reqs)
         return True
-
-    def _draft_block(self, rows: list[_Req]) -> None:
-        """One block per row. A context position's K/V is a pure projection of the
-        trunk's aux taps there, so it is projected the tick it commits and kept —
-        re-projecting the whole context every tick is ~10 ms at T=512 B=8, a fifth
-        of the verify tick it rides. The context is trimmed to the head's sliding
-        window, past which every block slot masks it anyway.
-        # ponytail: one row at a time — ``path``'s walk syncs per slot; batching the
-        # rows through block_hidden/path is the upgrade.
-        """
-        head, dev = self._draft, self._backend.device
-        for r in rows:
-            if r.aux is None or r.phase == _PHASE_DONE:
-                continue
-            # The context is every position but the anchor; a row still prefilling has none.
-            end = r.seq_len if r.phase == _PHASE_PREFILL else r.seq_len - 1
-            lo, base = r.ctx_len, r.hidden_from
-            if lo < base:
-                raise RuntimeError(
-                    f"req {r.req_id}: context K/V has a hole at {lo}..{base} — the trunk "
-                    f"never forwarded those positions this process"
-                )
-            if end > lo:
-                pos = torch.arange(lo, end, device=dev)
-                new = head.context_kv(r.aux[:, lo - base : end - base], pos, self._backend)
-                r.ctx = new if r.ctx is None else [
-                    (torch.cat([k, nk], 1), torch.cat([v, nv], 1))
-                    for (k, v), (nk, nv) in zip(r.ctx, new)
-                ]
-                w = head.dcfg.sliding_window
-                if r.ctx[0][0].shape[1] > w:
-                    r.ctx = [(k[:, -w:], v[:, -w:]) for k, v in r.ctx]
-                r.ctx_len = end
-            if r.phase != _PHASE_DECODE or r.ctx is None:
-                continue
-            n = r.ctx[0][0].shape[1]
-            ctx_pos = torch.arange(r.ctx_len - n, r.ctx_len, device=dev)
-            anchor = r.tokens[-1]
-            h = head.block_hidden(r.ctx, ctx_pos, anchor, r.ctx_len, self._backend)
-            r.drafts = head.path(h[:, 1:], anchor, self._backend)
-
-    def _draft_step(self, rows: list[_Req]) -> None:
-        """Draft over every position a row materialized but has not drafted yet:
-        position q consumes the trunk hidden at q-1 and the token at q, so the
-        run spans ``[draft_pos+1 .. seq_len-1]`` and its last position drafts
-        the next token. Leaves next tick's chain in ``r.drafts``."""
-        if self._block:
-            return self._draft_block(rows)
-        dev = self._backend.device
-        plan = []
-        for r in rows:
-            if r.hidden is None or r.phase == _PHASE_DONE:
-                continue
-            lo, hi = max(1, r.draft_pos + 1), r.seq_len - 1
-            if hi < lo:
-                continue
-            plan.append((r, lo, hi))
-        if not plan:
-            return
-        w = max(hi - lo + 1 for _, lo, hi in plan)
-        nb = max(len(r.blocks) for r, _, _ in plan)
-        n = len(plan)
-        ids = np.zeros((n, w), dtype=np.int64)
-        pos = np.zeros((n, w), dtype=np.int64)
-        bt = torch.zeros(n, nb, dtype=torch.long)
-        hs, sl, sq = [], [], []
-        for i, (r, lo, hi) in enumerate(plan):
-            q = hi - lo + 1
-            ids[i, :q] = r.tokens[lo : hi + 1]
-            pos[i, :q] = np.arange(lo, hi + 1)
-            bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
-            sl.append(hi + 1)
-            sq.append(q)
-            # hidden at [lo-1 .. hi-1]; hidden_prev supplies the previous forward's position
-            h, base = r.hidden, r.hidden_from
-            if r.hidden_prev is not None:
-                h, base = torch.cat([r.hidden_prev, r.hidden], dim=1), base - 1
-            off = (lo - 1) - base
-            hs.append(torch.nn.functional.pad(h[:, off : off + q], (0, 0, 0, w - q)))
-        kv = BatchKv(
-            block_table=bt.to(dev), seq_len=torch.tensor(sl, device=dev),
-            state_slot=torch.zeros(n, dtype=torch.long, device=dev),
-            kv_pool=self._draft_kv, state_pool=None,
-            seq_q_lens=torch.tensor(sq, device=dev),
-        )
-        dh: list = []
-        logits = self._draft.forward(torch.cat(hs, dim=0), ids, pos, kv, self._backend,
-                                     hidden_out=dh)
-        last = torch.tensor([q - 1 for q in sq], device=dev)
-        rng = torch.arange(n, device=dev)
-        tok, prob = self._backend.greedy(logits[rng, last].unsqueeze(1))
-        h = dh[-1][rng, last].unsqueeze(1)
-        confs: list[list[float]] = [[] for _ in plan]
-        if self._spec_depth > 1:
-            conf = self._draft.confidence(h, prob, self._backend)
-            for i, c in enumerate(conf[:, -1].tolist()):
-                confs[i].append(float(c))
-        chains = [[int(t)] for t in tok[:, -1].tolist()]
-        for i, (r, _, hi) in enumerate(plan):
-            if r.draft_pos == 0:
-                # Position 0 is never drafted but attention still reads its page,
-                # which a recycled block leaves holding another request's.
-                b = r.blocks[0]
-                self._draft_kv.k_pool[:, b, :, 0, :] = 0
-                self._draft_kv.v_pool[:, b, :, 0, :] = 0
-            r.draft_pos = hi
-
-        # Remaining chain steps, one position each, bounded by the blocks the row owns.
-        # ponytail: clamps the chain instead of allocating; a row at a block boundary drafts shorter.
-        for j in range(1, self._spec_depth):
-            live = [i for i, (r, _, hi) in enumerate(plan)
-                    if hi + j < len(plan[i][0].blocks) * BLOCK_TOKENS]
-            if not live:
-                break
-            li = torch.tensor(live, device=dev)
-            kv = BatchKv(
-                block_table=bt[live].to(dev),
-                seq_len=torch.tensor([plan[i][2] + 1 + j for i in live], device=dev),
-                state_slot=torch.zeros(len(live), dtype=torch.long, device=dev),
-                kv_pool=self._draft_kv, state_pool=None,
-                seq_q_lens=torch.ones(len(live), dtype=torch.long, device=dev),
-            )
-            dh = []
-            logits = self._draft.forward(
-                h[li], np.array([[chains[i][-1]] for i in live], dtype=np.int64),
-                np.array([[plan[i][2] + j] for i in live], dtype=np.int64),
-                kv, self._backend, hidden_out=dh,
-            )
-            tok, prob = self._backend.greedy(logits)
-            conf = self._draft.confidence(dh[-1], prob, self._backend)
-            for k, c in enumerate(conf[:, -1].tolist()):
-                confs[live[k]].append(float(c))
-            for k, t in enumerate(tok[:, -1].tolist()):
-                chains[live[k]].append(int(t))
-            h = h.index_copy(0, li, dh[-1])
-
-        keep = verify_lens([survival(c) for c in confs]) if self._spec_depth > 1 \
-            else [1] * len(plan)
-        for i, (r, _, _) in enumerate(plan):
-            p = r.params
-            if p.max_think_tokens is not None and p.end_think_ids and not r.thought_closed:
-                keep[i] = 0  # a forced end-think token is not the sampler's
-            r.drafts = chains[i][: keep[i]]
 
     def _verify(self, rows, chains, logits, hidden) -> None:
         """Accept the leading run of drafts the trunk agrees with, adopt the
@@ -1072,6 +899,8 @@ def build_engine(
     """Wire a model + backend into an Engine; pool shapes come from ``cfg``.
     ``decode_graph`` None auto-enables the captured decode tick on CUDA."""
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
+    if draft is not None:
+        draft.set_depth(spec_depth)  # the state pool is sized by the width it settles on
     model.params = backend.materialize(model.params)
     kv_pool = PagedKvPool(
         num_blocks,
@@ -1089,7 +918,7 @@ def build_engine(
         dtype=precision.dtype("recurrent_state", backend.device),
         conv_window=cfg.linear_conv_kernel_dim - 1,
         conv_dim=cfg.linear_qkv_dim,
-        spec_steps=1 + _draft_depth(draft, spec_depth) if draft is not None else 0,
+        spec_steps=draft.width if draft is not None else 0,
     )
     store = PrefixStore(kv_pool) if prefix_store is None else prefix_store
     return Engine(

@@ -93,7 +93,63 @@ class DFlash2Head:
         #: .w8/.wscale dispatch the trunk has, over THIS params dict.
         self.layers = Model(cfg, params)
         #: the block is fixed by the checkpoint: anchor + block_size-1 drafts
-        self.spec_depth = dcfg.block_size - 1
+        self.width = dcfg.block_size  # verify tick: anchor + block_size-1 drafts
+        self.aux_layers = dcfg.target_layers
+
+    def set_depth(self, depth: int | None) -> None:
+        """The block is the checkpoint's, so ``spec_depth`` is not the caller's to choose."""
+        if depth is not None and depth != self.width - 1:
+            raise ValueError(
+                f"spec_depth={depth} with a block drafter: the checkpoint's block is "
+                f"{self.width} slots (anchor + {self.width - 1} drafts), so the verify "
+                f"width is fixed. Pass spec_depth=None."
+            )
+
+    def attach(self, backend, num_blocks: int) -> None:
+        """No KV plane of its own: the context K/V is projected from the trunk's aux taps."""
+        self.backend = backend
+
+    def step(self, rows) -> None:
+        """Contract: leave next tick's chain in ``r.drafts``. One block per row. A context position's K/V is a pure projection of the
+        trunk's aux taps there, so it is projected the tick it commits and kept —
+        re-projecting the whole context every tick is ~10 ms at T=512 B=8, a fifth
+        of the verify tick it rides. The context is trimmed to the head's sliding
+        window, past which every block slot masks it anyway.
+        # ponytail: one row at a time — ``path``'s walk syncs per slot; batching the
+        # rows through block_hidden/path is the upgrade.
+        """
+        backend = self.backend
+        dev = backend.device
+        for r in rows:
+            if r.aux is None or r.done:
+                continue
+            # The context is every position but the anchor; a row still prefilling has none.
+            end = r.seq_len if r.prefilling else r.seq_len - 1
+            lo, base = r.ctx_len, r.hidden_from
+            if lo < base:
+                raise RuntimeError(
+                    f"req {r.req_id}: context K/V has a hole at {lo}..{base} — the trunk "
+                    f"never forwarded those positions this process"
+                )
+            if end > lo:
+                pos = torch.arange(lo, end, device=dev)
+                new = self.context_kv(r.aux[:, lo - base : end - base], pos, backend)
+                r.ctx = new if r.ctx is None else [
+                    (torch.cat([k, nk], 1), torch.cat([v, nv], 1))
+                    for (k, v), (nk, nv) in zip(r.ctx, new)
+                ]
+                w = self.dcfg.sliding_window
+                if r.ctx[0][0].shape[1] > w:
+                    r.ctx = [(k[:, -w:], v[:, -w:]) for k, v in r.ctx]
+                r.ctx_len = end
+            if not r.decoding or r.ctx is None:
+                continue
+            n = r.ctx[0][0].shape[1]
+            ctx_pos = torch.arange(r.ctx_len - n, r.ctx_len, device=dev)
+            anchor = r.tokens[-1]
+            h = self.block_hidden(r.ctx, ctx_pos, anchor, r.ctx_len, backend)
+            r.drafts = self.path(h[:, 1:], anchor, backend)
+
 
     def context_kv(self, aux_hidden, positions, backend) -> list[tuple]:
         """Per-layer (k, v) for the context, straight off the trunk's stacked taps."""

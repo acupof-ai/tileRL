@@ -389,12 +389,14 @@ def test_selector_codebooks_survive_the_engines_fp8_pass(tmp_path):
 
 
 def test_spec_depth_is_the_checkpoints_block(tmp_path):
-    from tilerl.engine import _draft_depth
-
     head = _tiny_head(tmp_path)
-    assert _draft_depth(head, None) == _HF["dflash_config"]["block_size"] - 1
+    block = _HF["dflash_config"]["block_size"]
+    head.set_depth(None)  # None keeps the checkpoint's block
+    assert head.width == block
+    head.set_depth(block - 1)  # restating it is not a conflict
+    assert head.width == block
     with pytest.raises(ValueError, match="verify width is fixed"):
-        _draft_depth(head, 2)
+        head.set_depth(2)
 
 
 def test_engine_block_equals_the_full_context_block(tmp_path):
@@ -417,13 +419,13 @@ def test_engine_block_equals_the_full_context_block(tmp_path):
         prefix_store=NoPrefixStore(),  # 4: the prompt spans two prefill chunks
     )
     seen: list[tuple[list[int], list[int]]] = []
-    inner = engine._draft_block
+    inner = engine._draft.step
 
     def spy(rows):
         inner(rows)
         seen.extend((list(r.tokens), list(r.drafts)) for r in rows if r.drafts)
 
-    engine._draft_block = spy
+    engine._draft.step = spy
     rid = engine.submit(_PROMPT, SamplingParams(temperature=0.0, max_new_tokens=12, seed=0))
     for _ in range(48):
         if engine.poll().get(rid):
