@@ -15,8 +15,11 @@ from .kernels_mma import _pass_configs
 #: every model dim. The backend imports this name to pad, so it is defined once.
 #: TILERL_RED_TILE A/Bs it (errors/2026-08-29-mma8-is-register-bound.md).
 _RED_TILE = int(os.environ.get("TILERL_RED_TILE", "32"))
-if _RED_TILE % 16 or _RED_TILE <= 0:
-    raise ValueError(f"TILERL_RED_TILE must be a positive multiple of 16, got {_RED_TILE}")
+# 128 is the smallest K pad in backend._CUDA_PLAN; a tile that does not divide it
+# truncates that kernel's reduction the same silent way.
+if _RED_TILE <= 0 or _RED_TILE % 16 or 128 % _RED_TILE:
+    raise ValueError(
+        f"TILERL_RED_TILE must be a positive multiple of 16 dividing 128, got {_RED_TILE}")
 
 # ---------------------------------------------------------------- gemm (MMA)
 

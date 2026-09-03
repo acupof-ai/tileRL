@@ -10,7 +10,7 @@ RECIPES: dict[str, dict] = {
     # docs/roadmap.md P1. Pass --data gsm8k_train.jsonl --eval-gsm8k gsm8k_test.jsonl.
     "grpo-gsm8k-27b": dict(
         model="qwen38-27b", rl=True, steps=100, group=8, max_new_tokens=256, lora_rank=16,
-        max_think_tokens=0, eval_mmlu=1000, eval_n=500,
+        micro=1, max_think_tokens=0, eval_mmlu=1000, eval_n=500,
         status="pending-remote: roadmap P1"),
     "opd-gsm8k-27b": dict(
         model="qwen38-27b", opd=True, steps=100, max_new_tokens=256, lora_rank=16,

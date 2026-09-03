@@ -108,7 +108,7 @@ def _train_full(args: argparse.Namespace) -> None:
     import torch
 
     from . import train as train_mod
-    from .autograd import Adafactor, Tape, cosine_warmup
+    from .autograd import Adafactor, cosine_warmup
     from .model import drop_quantized
     from tilerl_kernels.backend import get_backend
 
@@ -128,7 +128,7 @@ def _train_full(args: argparse.Namespace) -> None:
         # ponytail: random-token batch; a real corpus plugs in here without touching train_step.
         input_ids = torch.randint(0, cfg.vocab_size, (2, 64), generator=gen)
         optimizer.lr = cosine_warmup(step, args.steps, 5, 1e-3)
-        loss = train_mod.train_step(model, input_ids, backend, optimizer, Tape())
+        loss = train_mod.train_step(model, input_ids, backend, optimizer)
         print(f"step {step + 1:4d}/{args.steps}  loss {loss:.4f}")
 
 
@@ -171,7 +171,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
         return _finish(prev, args.json)
     manifest["metrics"] = dict.fromkeys((
         "reward_first", "reward_last", "ce_last", "secs_per_step_median", "tied_group_fraction",
-        "mmlu_before", "mmlu_after", "gsm8k_before", "gsm8k_after"))
+        "mmlu_before", "mmlu_after", "gsm8k_before", "gsm8k_after", "peak_gib"))
 
     backend = get_backend()
     # LoRA on a frozen base needs no bf16 master (~27 GB on the 27B).
@@ -218,7 +218,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
 
         hist = train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
                                    group=args.group, sampling=params, seed=args.seed,
-                                   trainable=trainable)
+                                   trainable=trainable, micro=args.micro)
         for i, (r, ce, secs, tied) in enumerate(hist):
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
                 f"tied {tied:.2f}  {secs:.1f}s")
@@ -232,6 +232,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
         for i, loss in enumerate(losses):
             log(f"step {i + 1:4d}/{args.steps}  loss {loss:.4f}")
         manifest["metrics"]["ce_last"] = losses[-1]
+    if torch.cuda.is_available():  # the number the group size is really bounded by
+        manifest["metrics"]["peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
+        log(f"peak allocated {manifest['metrics']['peak_gib']:.2f} GiB")
     evals("after")
     return _finish(manifest, args.json)
 
@@ -434,6 +437,10 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="GRPO: the engine samples a group per prompt, a reward scores "
                               "them, the group mean is the baseline (no critic)")
     p_train.add_argument("--group", type=int, default=8, help="rollouts per prompt (--rl)")
+    p_train.add_argument("--micro", type=int, default=0,
+                         help="--rl: rows per backward, gradients accumulated to one "
+                              "update (0 = the whole group). The normalizer stays the "
+                              "batch's, so this is the same update, not a smaller one")
     p_train.add_argument("--max-new-tokens", type=int, default=32, help="rollout length")
     p_train.add_argument("--data", help="JSONL {prompt, answer}: real prompts, exact-match "
                          "reward on the last number (scripts/gsm8k_jsonl.py)")
