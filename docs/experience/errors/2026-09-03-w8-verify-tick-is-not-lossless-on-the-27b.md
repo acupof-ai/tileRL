@@ -19,44 +19,106 @@ question — two arms can score the same and still disagree.
 
 ## The finding
 
-**GSM8K greedy, 8 questions, PR #12's own tree with nothing else merged in:
-base 4/8, spec 0/8, 8 of 8 completions differ.** Every spec-arm completion ends
-in an unbroken tail of `!`.
+27B NVFP4, H20 GPU 7, one process, `decode_graph=False`,
+`prefix_store=NoPrefixStore()`, concurrency 8 — the training path's own engine
+config, matching the P1 baseline of 2026-09-02.
 
-| q | base chars | spec chars | diverges at char |
-|---:|---:|---:|---:|
-| 0 | 624 | 409 | 123 |
-| 1 | 423 | 345 | 115 |
-| 2 | 903 | 469 | 267 |
-| 3 | 541 | 309 | 69 |
-| 4 | 829 | 270 | 19 |
-| 5 | 845 | 410 | 117 |
-| 6 | 850 | 282 | 32 |
-| 7 | 894 | 427 | 180 |
+| suite | base | spec W=8 | completions that differ |
+|---|---:|---:|---:|
+| MMLU 0-shot | 742/1000 = 74.2% | 742/1000 = 74.2% | 0/1000 |
+| GSM8K greedy | 196/500 = 39.2% | **0/500 = 0.0%** | **500/500** |
+
+**Every one of 500 GSM8K completions differs, and the speculative arm answers
+nothing correctly.** Each spec completion runs out as an unbroken tail of `!`.
 
 ```
-q3 base  'To find the total number of meters James runs in a week, we can break the problem down into steps:\n\n**Step 1: ...'
-q3 spec  'To find the total number of meters James runs in a week, we can break!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+q1 base  'To determine the total number of bolts required, we can break down the requirements for each type of fiber:\n\n1.  **Blue fiber**: ...'
+q1 spec  'To determine the total number of bolts required, we can break down the requirements for each type of fiber:\n\n1.  **!!!!!!!!!!!!!!!!!'
 ```
 
 `!` is token id 0 in this checkpoint's tokenizer (`decode([0]) == '!'`,
-`encode('!') == [0]`), and `greedy` over all-NaN logits returns index 0. A tail
-of `!` is a NaN logit row, printed.
+`encode('!') == [0]`), and `greedy` over all-NaN logits returns index 0. So a
+tail of `!` is a NaN logit row, printed — and `torch.isnan` on the trunk logits
+inside `_verify` confirms it directly: **372 of 560 verify row-ticks came back
+NaN**.
 
-Three of the eight (q0, q5, q7) diverge into different but *sane* text first
-and collapse to `!` later, so a NaN tick can commit a wrong-yet-plausible token
-before the state is poisoned. Divergence runs from char 19 to char 267 with no
-pattern in the question — what a length-dependent kernel condition looks like,
-each request meeting it at a different point in its own decode.
+The base arm reproduces the P1 baseline — MMLU 742/1000 exactly, GSM8K 196/500
+against 194/500 — which is what says this is the same harness.
 
-## Root cause
+## The configured W=8 almost never ran
 
-Derived independently in review of PR #12 and confirmed by this run.
-`make_paged_attention_decode` splits the KV range. At W>1 a split whose tile
-range is non-empty can still be **wholly masked** for the low chain positions:
-`scores_max` stays at `-inf`, `exp2(-inf - (-inf))` is NaN, and the combine's
-`0 * NaN` propagates it instead of discarding an empty slice. The condition is
-`n % 64` in `[1, W-1]` — 7 of every 64 sequence lengths at W=8.
+The width histogram over the GSM8K phase is the most important number here:
+
+| tick width | 1 | 2 | 4 | 6 | 7 | 8 |
+|---|---:|---:|---:|---:|---:|---:|
+| decode forwards | 14328 | 15 | 1 | 4 | 3 | 47 |
+
+**70 wide ticks out of 14,398.** 99.5% of decode ticks ran at W=1. Drafted
+3080, accepted 2066 across 500 requests generating ~115k tokens.
+
+That is self-consistent with the corruption rather than independent of it: once
+a row's hidden state is NaN, `DraftHead.confidence` is NaN, every `survival`
+product is NaN, `p >= cut` is False for NaN, so `verify_lens` keeps nothing and
+the row decodes at W=1 for the rest of its life. The wide ticks are the
+pre-corruption window.
+
+## What the residues do and do not show
+
+The tracer records `n % 64` for `SeqLens = seq_len - 1 + W` at every wide tick,
+and separately at every tick whose trunk logits came back NaN.
+
+- All 64 residues were reached (560 wide row-ticks), so the run had coverage.
+- Of the 69 requests whose **first** NaN was caught inside `_verify`, **28 sit
+  at `n % 64` in [1,7]** — 41% where the null expectation is 7/64 = 11%, an
+  enrichment of 3.7x. That is consistent with the derived wholly-masked-split
+  condition.
+- It is **not** proof that the split is the only cause. `_verify` runs only on
+  wide ticks, so the tracer is blind to the 14,328 W=1 ticks; a NaN created on a
+  W=1 tick is only *observed* later, at whatever residue the next wide tick
+  happens to have. And 500 requests are corrupted while only ~560 wide row-ticks
+  exist in the whole run — roughly one per request — so corruption reaching
+  every request cannot be read off the wide ticks alone. Either NaN also arises
+  on the W=1-with-draft path, or it propagates between requests through state
+  the pool reuses (`step_states` / `step_windows` are not zeroed by
+  `alloc_slot`, unlike `states` and `conv_windows`).
+
+Both remain open. What is settled is that attaching this draft head at
+`spec_depth=7` corrupts every GSM8K answer on the 27B.
+
+## Speed, since the accuracy row and the speed row come from one session
+
+| arm | GSM8K wall | tok/s | tok per decode **forward** | peak |
+|---|---:|---:|---:|---:|
+| base | 1355.6 s | 86.9 | 7.94 | 25.90 GiB |
+| spec W=8 | 4745.9 s | 25.3 | 8.07 | 37.46 GiB |
+
+The speculative arm is **3.4x slower end to end**, not faster. It is not a fair
+speed comparison — every request runs to the 256-token cap emitting `!` instead
+of stopping at EOS, and the phase contains first-touch JIT with the GPU at 0%
+for long stretches — but it is the only end-to-end number, and the projection it
+was supposed to confirm was ~921 tok/s.
+
+`tok per decode forward` is tokens committed per decode *forward*, not per row:
+at concurrency 8 an unspeculated forward commits one token for each running row,
+so 7.94 says the batch held ~8 rows. It is not a speculation win, and the spec
+arm's 8.07 is not one either.
+
+The draft head costs **+11.56 GiB** (37.46 vs 25.90 GiB peak) for the step
+planes and its own weights.
+
+## The same failure on this branch alone
+
+The 500-question run above was measured on this branch merged with
+`fix/noprefix-snapshot-leak`, because the unfixed tree retains one 149.6 MiB
+state snapshot per 16 generated tokens under `NoPrefixStore` and cannot finish a
+500-question GSM8K eval on one card. The control is a smoke run on **this branch
+with nothing else merged in**: 8 GSM8K questions, base 4/8, spec 0/8, 8 of 8
+completions differ, every spec completion ending in `!`. Divergence runs from
+char 19 to char 267 across the eight, with no pattern in the question — a
+length-dependent condition, each request meeting it at a different point in its
+own decode. Three of the eight commit different *sane* text first and collapse
+later, so a NaN tick can commit a wrong-but-plausible token before the state is
+poisoned.
 
 ## Why the gates were green
 
@@ -77,26 +139,12 @@ skips a row already in `_PHASE_DONE`. The two arms execute the same code and
 agree on 200/200 completions; that agreement is a tautology, not evidence.
 An MMLU that tested speculation would have to generate more than one token.
 
-## Numbers from the run
-
-27B NVFP4, H20 GPU 7, one process, `decode_graph=False`,
-`prefix_store=NoPrefixStore()`, concurrency 8 — the training path's own engine
-config, matching the P1 baseline of 2026-09-02.
-
-| arm | MMLU 0-shot | decode fwd | GSM8K greedy | wall | tok/s | tok per decode forward |
-|---|---:|---:|---:|---:|---:|---:|
-| base | 742/1000 = 74.2% | 0 | 196/500 = 39.2% | 1355.6 s | 86.9 | 7.94 |
-| spec W=8 | 742/1000 = 74.2% | 0 | see above (8-question smoke) | | | |
-
-The base arm reproduces the P1 baseline: MMLU 742/1000 exactly, GSM8K 196/500
-against 194/500. **`tok per decode forward` is tokens committed per decode
-*forward*, not per row** — at concurrency 8 an unspeculated forward commits one
-token for each running row, so 7.94 says the batch held ~8 rows, which is the
-number being correct, not a speculation win.
-
-Memory, measured separately at 200 MMLU questions on one card: base peak 25.50
-GiB, W=8 peak 37.39 GiB. **The W=8 step planes and the draft head cost
-+11.89 GiB.**
+The 377.8 s the spec arm spent on MMLU against the base arm's 94.8 s is not a
+per-request draft cost — it is first-touch JIT of the draft path, which the spec
+arm pays because it is the first phase to touch those kernels. On a warm cache
+the same 200-question comparison on one card is 38.2 s base against 32.1 s spec,
+i.e. no penalty and no difference beyond noise, which is what a workload
+executing identical code should look like.
 
 ## Rule
 
