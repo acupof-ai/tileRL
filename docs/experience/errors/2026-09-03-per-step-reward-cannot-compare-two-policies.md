@@ -31,10 +31,15 @@ Look down the columns. Step 6 is 0.00 in all three arms. Step 7 is 1.00 in all
 three. Step 10 is 0.00 in all three. Steps 1 and 2 are 1.00 and 0.63 in all
 three.
 
-`grpo_loop` draws `prompts[step % len(prompts)]`, so every arm sees the same
-question at the same step, and **question difficulty dominates the per-step
-reward**. The columns agree because the prompt agrees, not because the policies
-do. Three curves plotted against a quantity that is mostly a property of the
+`grpo_loop` draws `prompts[step % len(prompts)]` (`train.py:250`), so every arm
+sees the same question at the same step, and **question difficulty dominates the
+per-step reward**.
+
+The input is shared twice over, not once: the group's seeds are
+`seed + step * group + g`, with `seed` defaulted, so at a given step every arm
+draws with the *same* seeds as well as the same prompt. The columns agree because
+the prompt and the sampling noise are both common — the only thing that differs
+between arms is the weights, and it is the smallest term. Three curves plotted against a quantity that is mostly a property of the
 input cannot separate three policies, and 20 steps is far too few for the
 learning signal to emerge from that variance.
 
