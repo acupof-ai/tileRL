@@ -85,7 +85,7 @@ measurement will:
 | # | failure | fix |
 |---|---|---|
 | 1 | `LinearStatePool exhausted` on the 2nd window | `num_slots > max_batch` — a padded tick keeps one slot for good ([entry](2026-09-03-num-slots-equals-max-batch-is-one-short.md)) |
-| 2 | first row flagged `UNWARMED` | call `precapture()` — B=4 needs **12** graphs (98-102 s measured) against B=1's 4 |
+| 2 | first row flagged `UNWARMED` | call `precapture()` — the engine spans **12** (bucket, width) graphs, 98-102 s cold and 9 s with a warm tilelang cache |
 | 3 | OOM at ctx=512 | `--max-ctx` — B=4 wanted 1.50 GiB with 0.69 free on a 32 GB card |
 | 4 | **six-minute hang, GPU at 0%** | wall-clock deadlines on every engine-stepping loop |
 
@@ -96,6 +96,13 @@ look exactly like a live run from outside. My loops satisfied the rule that ever
 cursor-driven loop carries an iteration cap, and missed its purpose. They now carry a
 deadline too and report what they were waiting on: requests admitted, outputs collected,
 requests still running.
+
+A note on number 2, since I got its arithmetic wrong at first: the 12 graphs are a property
+of the **engine's `max_batch`**, not of `--batch`. `graph_keys` spans buckets for rows
+`1..max_batch` × widths `1..1+depth`, and the script floors `max_batch` at 4, so even
+`--batch 1` precaptures 12. What made the early B=1 runs *look* fine is that they never
+called `precapture()` at all — warmup happened to cover the `(1, W)` keys those runs used,
+and B=4 then needed the `(2, W)` and `(4, W)` keys warmup never touched.
 
 A real defect turned up while looking: `poll()` drains `_finished` for *every* request, and
 the prefill loop called it inside a truth test (`and e.poll()`), discarding the result —
