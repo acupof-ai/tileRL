@@ -115,11 +115,12 @@ class DFlash2Head:
         re-projecting the whole context every tick is ~10 ms at T=512 B=8, a fifth
         of the verify tick it rides. The context is trimmed to the head's sliding
         window, past which every block slot masks it anyway.
-        # ponytail: one row at a time — ``path``'s walk syncs per slot; batching the
-        # rows through block_hidden/path is the upgrade.
+        The selector walk runs once for the whole tick; ``block_hidden`` is still
+        per row, which is what is left of the batching ceiling.
         """
         backend = self.backend
         dev = backend.device
+        live, hidden, anchors = [], [], []
         for r in rows:
             if r.aux is None or r.done:
                 continue
@@ -147,8 +148,13 @@ class DFlash2Head:
             n = r.ctx[0][0].shape[1]
             ctx_pos = torch.arange(r.ctx_len - n, r.ctx_len, device=dev)
             anchor = r.tokens[-1]
-            h = self.block_hidden(r.ctx, ctx_pos, anchor, r.ctx_len, backend)
-            r.drafts = self.path(h[:, 1:], anchor, backend)
+            live.append(r)
+            anchors.append(anchor)
+            hidden.append(self.block_hidden(r.ctx, ctx_pos, anchor, r.ctx_len, backend))
+        if live:
+            walked = self.paths(torch.cat(hidden)[:, 1:], anchors, backend)
+            for r, drafts in zip(live, walked):
+                r.drafts = drafts
 
 
     def context_kv(self, aux_hidden, positions, backend) -> list[tuple]:
@@ -189,23 +195,33 @@ class DFlash2Head:
         return backend.rmsnorm(x, self.params["norm"], cfg.rms_eps)
 
     def path(self, hidden, anchor, backend) -> list[int]:
-        """Top-k candidates per mask slot, then the best-scoring path from the
+        return self.paths(hidden, [anchor], backend)[0]
+
+    def paths(self, hidden, anchors, backend) -> list[list[int]]:
+        """Top-k candidates per mask slot, then the best-scoring path from each
         anchor. The walk only ever reads the row of the transition score whose
-        predecessor is the token it just emitted, so the row is all we build."""
+        predecessor is the token it just emitted, so the row is all we build.
+        The walk along the block is sequential — ``prev`` feeds the next slot —
+        but across rows it is not, so every row takes step ``j`` together and the
+        whole batch costs one host sync instead of one per row per slot."""
         dc = self.dcfg
         head = "embed_tokens" if self.trunk.cfg.tie_word_embeddings else "lm_head"
         unary, cand = torch.topk(
-            self.trunk._linear(backend, hidden, head)[0].float(), dc.top_k, dim=-1
+            self.trunk._linear(backend, hidden, head).float(), dc.top_k, dim=-1
         )
-        proj = self._lin(backend, hidden, "selector.proj")[0].float()
+        proj = self._lin(backend, hidden, "selector.proj").float()
         # gathered rows only: an f32 copy of either [248320,256] codebook is 254 MB
         pred, succ = self.params["selector.pred"], self.params["selector.succ"]
-        out, prev = [], anchor
+        prev = torch.as_tensor(anchors, dtype=torch.long, device=hidden.device)
+        rows = torch.arange(len(anchors), device=hidden.device)
+        out = []
         for j in range(hidden.shape[1]):
-            score = unary[j] + succ[cand[j]].float() @ (pred[prev].float() * proj[j])
-            prev = int(cand[j, int(score.argmax())])
+            score = unary[:, j] + torch.einsum(
+                "bkr,br->bk", succ[cand[:, j]].float(), pred[prev].float() * proj[:, j]
+            )
+            prev = cand[rows, j, score.argmax(-1)]
             out.append(prev)
-        return out
+        return torch.stack(out, 1).tolist()
 
     def draft(self, aux_hidden, positions, anchor, backend) -> list[int]:
         """``aux_hidden`` [1,T,len(target_layers)*H] concatenated in
@@ -257,8 +273,9 @@ class DFlash2Head:
         coef = base.float().reshape(1, 1, dc.taps, g, dc.group_size) + delta.float().unsqueeze(-1)
         out = coef[:, :, 0] * blocks
         for tap in range(1, dc.taps):
-            pad = torch.zeros_like(blocks[:, :tap])
-            out = out + coef[:, :, tap] * torch.cat([pad, blocks[:, :-tap]], 1)
+            # the zero-padded head of the shifted block contributes nothing, so
+            # add into the tail instead of materialising the pad and the concat
+            out[:, tap:] += coef[:, tap:, tap] * blocks[:, :-tap]
         return out.reshape(*x.shape[:2], -1)
 
 
