@@ -186,8 +186,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
         from .spec import load_draft
 
         draft = load_draft(model, args.draft)
+    # A block drafter's width is its checkpoint's block, and build_engine raises when
+    # spec_depth is passed alongside one, so the CLI's chain default must not reach it.
+    depth = None if getattr(draft, "spec_depth", None) is not None else args.depth
     engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8, draft=draft,
-                          spec_depth=args.depth, decode_graph=False, prefix_store=NoPrefixStore())
+                          spec_depth=depth, decode_graph=False, prefix_store=NoPrefixStore())
     # After build_engine: it materializes the params an adapter must point at.
     trainable = add_lora(model, rank=args.lora_rank)
     optimizer = AdamW(lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
@@ -462,7 +465,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="full-parameter SFT optimizer; --rl/--opd train LoRA and ignore it")
     p_train.add_argument("--lora-rank", type=int, default=16)
     p_train.add_argument("--draft", help="draft head safetensors: speculative rollout (--opd)")
-    p_train.add_argument("--depth", type=int, default=2, help="drafts per row per tick")
+    p_train.add_argument("--depth", type=int, default=2, help="drafts per row per tick; "
+                         "ignored for a block drafter, whose width is its checkpoint's block")
     p_train.add_argument("--recipe", choices=sorted(RECIPES),
                          help="a flag set that passed a gate (recipes.py); flags override it")
     # The recipe is the subparser's defaults, so anything typed still wins.
