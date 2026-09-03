@@ -137,21 +137,38 @@ def main() -> None:
     err("state (fla)", s, s_fla)
     assert worst <= 1e-2, f"end-to-end rel {worst:.3e} > 1e-2"
 
-    # (b2) the whole layer, gdn_prep and gdn_post included: the sm90 cells of both
-    # only ever run here and on the pod harness, never under the CPU parity gate
-    print("(b2) backend.linear_attn_chunk vs reference.gdn_forward")
+    # (b1)/(b2) the sm90 gdn_prep and gdn_post cells: they only ever run here and on the
+    # pod harness, never under the CPU parity gate. Amplitude 1.0, the scale
+    # test_gdn_chunk_fused_parity_full_scale settled on -- a pipeline that passed at 0.1
+    # was 26% wrong at 1.0 (errors/2026-08-25-gdn-chunked-gdr-rejected.md).
     qkvd = 2 * args.hk * args.dk + args.hv * args.dv
-    raw = lambda n: torch.randn(b, t, n, device=dev, dtype=torch.bfloat16) * 0.5
+    raw = lambda n: torch.randn(b, t, n, device=dev, dtype=torch.bfloat16)
     lw = dict(
         conv1d_weight=torch.randn(qkvd, 4, device=dev) * 0.1,
         dt_bias=torch.randn(args.hv, device=dev),
         a_log=torch.randn(args.hv, device=dev) * 0.1,
         norm_weight=torch.ones(args.dv, device=dev),
-        conv_window=torch.randn(b, 3, qkvd, device=dev) * 0.5,
+        conv_window=torch.randn(b, 3, qkvd, device=dev),
     )
     lq, lk, lv, lz = (raw(args.hk * args.dk), raw(args.hk * args.dk),
                       raw(args.hv * args.dv), raw(args.hv * args.dv))
     lg, lbeta = raw(args.hv), raw(args.hv)
+
+    # (b1) gdn_prep alone. The layer number below cannot separate this cell from the WY
+    # six, and a 1e-3 error in it reads as bf16 noise there.
+    print("(b1) gdn_prep vs reference.gdn_prep")
+    pw = {n: lw[n] for n in ("conv1d_weight", "dt_bias", "a_log", "conv_window")}
+    worst = max(
+        err(n, a, r)
+        for a, r, n in zip(
+            bk._gdn_prep(lq, lk, lv, lg, lbeta, st, **pw),
+            R.gdn_prep(lq, lk, lv, lg, lbeta, args.dk, **pw),
+            ("qn", "kn", "v", "g", "beta", "window"),
+        )
+    )
+    assert worst <= 1e-2, f"gdn_prep rel {worst:.3e} > 1e-2"
+
+    print("(b2) backend.linear_attn_chunk vs reference.gdn_forward")
     got = bk.linear_attn_chunk(lq, lk, lv, lg, lbeta, st, z=lz, **lw)
     ref = R.gdn_forward(lq, lk, lv, lg, lbeta, st, z=lz, **lw)
     worst = max(err(n, a, r) for a, r, n in zip(got, ref, ("out", "state", "window")))

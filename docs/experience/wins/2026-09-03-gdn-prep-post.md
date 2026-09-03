@@ -142,23 +142,66 @@ baseline.
 
 ## Correctness
 
-sm90 parity, `scripts/probe_gdn_wy.py` on H20, gate 1e-2 relative:
+sm90 parity, `scripts/probe_gdn_wy.py` on H20 (GPU 3, verified 0 MiB before the
+run), gate 1e-2 relative:
 
 | check | out | state | window |
 |---|---:|---:|---:|
-| (b2) `linear_attn_chunk` (WY) vs `reference.gdn_forward` | 5.9e-3 | 7.7e-3 | 0 |
+| (b2) `linear_attn_chunk` (WY) vs `reference.gdn_forward` | 4.0e-3 | 5.1e-3 | 0 |
 | (b) `_gdn_wy_core` vs `reference.gdn_chunk_core` | 6.6e-3 | 6.1e-3 | — |
 | (b) `_gdn_wy_core` vs fla `chunk_gated_delta_rule` | 3.5e-3 | 4.8e-3 | — |
 
 (b2) is the gate for the two new cells — the only thing that runs
-`make_gdn_prep_bf16` and the bf16 `gdn_post` at all. The bf16-IO error is three
-orders above the f32 cells and still inside 1e-2; the same shape appears in
-`test_gdn_chunk_fused_parity_full_scale`, where the bf16 kernel lands at 1.2%
-against a 5% tolerance.
+`make_gdn_prep_bf16` and the bf16 `gdn_post` at all. It used to build its inputs
+at amplitude 0.5 and read 5.9e-3 / 7.7e-3. Half the amplitude of the CPU gate is
+not a gate: `test_gdn_chunk_fused_parity_full_scale` exists because a pipeline
+that passed at 0.1 was 26% wrong at 1.0
+([2026-08-25-gdn-chunked-gdr-rejected.md](../errors/2026-08-25-gdn-chunked-gdr-rejected.md)).
+Raised to 1.0, where the row above was measured.
+
+### The 5.9e-3 was attributed to bf16; here it is decomposed
+
+Nothing separated `make_gdn_prep_bf16` — the newest code in the change, with a
+hand-rolled block allreduce and a GQA write predicate — from the six transcribed
+WY kernels, and a 1e-3 error inside it reads as bf16 noise at the layer level.
+`reference.gdn_prep` is now the front half of `gdn_forward` rather than a copy of
+it, so probe stage (b1) compares the cell's six outputs against the spec, at
+amplitude 1.0:
+
+| gdn_prep output | dtype | rel |
+|---|---|---:|
+| `qn` | bf16 | 2.1e-3 |
+| `kn` | bf16 | 2.6e-3 |
+| `v` | bf16 | 2.8e-3 |
+| `g` | **f32** | **8.3e-8** |
+| `beta` | bf16 | 2.0e-3 |
+| window | f32 | **0** |
+
+bf16 keeps 8 mantissa bits, so its own rounding unit is 2^-9 = 1.95e-3. Every
+bf16 output lands within 1.5x of that floor, and the two outputs the cell does
+*not* round — the log gate and the carried conv window — are exact to f32 and
+bit-exact respectively. The gate and the window run the same conv, softplus and
+window-slice arithmetic as the rest of the kernel, so their accuracy is what
+rules out an arithmetic fault and leaves the format. `qn` and `kn` are the two
+that go through the block allreduce; both sit at the floor.
+
+The layer's 4.0e-3 is therefore not prep-dominated: prep contributes ~2-3e-3 at
+the floor, and the WY core carries the remainder (6.6e-3 against the f32
+reference, 3.5e-3 against fla — two independent bf16 implementations of the same
+algorithm differing by that much *is* the format).
 
 Per-kernel parity of the WY core against fla 0.5.2: `kkt` 4.6e-4 max abs,
 `solve_tril` 4.9e-4, `w` 2.4e-4, `u` 0, `h` 9.8e-4, `V_new` 9.8e-4, final state
 4.7e-4, `o` 2.3e-4. State-scan known-answer rows exact.
+
+Two guards the numbers above cannot produce. `make_gdn_prep_bf16` binds one
+thread to a head column of q, k and v alike, so it needs key_dim == value_dim;
+the f32 cell loops each extent separately, so the CPU parity gate is structurally
+blind to it and a mismatched checkpoint would write past `Qo` rather than return
+a wrong number. And `gdn_state_scan` sizes `h` by `S // chunk` while looping
+`ceildiv`, so a tail chunk writes past it — the routing predicate was the only
+thing standing in the way. Both are asserts now, in `_gdn_prep` and
+`_gdn_wy_core`.
 
 Parity on the GPU-less machine, `Backend.linear_attn_chunk` vs
 `reference.gdn_forward`'s per-step scan, tiny model at full input scale:

@@ -24,7 +24,10 @@ from .registry import _arch_for, _resolve, resolve_target
 __all__ = ["Backend", "get_backend", "resolve_target"]
 
 _THREADS = 64
-_WY_CHUNK = 64  # gdn_state_scan/gdn_chunk_o size h by S // chunk: T must be a whole multiple
+#: chunkwise-WY chunk length. gdn_state_scan and gdn_chunk_o size h by S // chunk, so a T
+#: that is not a whole multiple writes past it. A verify width that reached one would also
+#: reach ``_full_rows``'s host sync, illegal under graph capture: keep _MAX_VERIFY_W below.
+_WY_CHUNK = 64
 
 
 def _round_up(x: int, m: int) -> int:
@@ -682,11 +685,14 @@ class Backend:
         self._full_rows_memo = (weakref.ref(seq_q_lens), t, full)
         return full
 
-    def _gdn_chunk_wy(self, q, k, v, g, beta, state, **kw):
-        """Chunkwise-WY prefill: gdn_prep, the WY core, gdn_post. The layer's
-        conv / norm / gate glue is two launches here, sixty as torch ops."""
+    def _gdn_prep(self, q, k, v, g, beta, state, **kw):
+        """``gdn_prep``'s six operands, marshalled -- the parity oracle is
+        :func:`reference.gdn_prep`. The sm90 cell binds one thread to a head
+        column of q, k and v alike, so it needs key_dim == value_dim; the f32
+        cell loops each extent separately and cannot fail the same way."""
         b, t = q.shape[0], q.shape[1]
         nvh, kd, vd = state.shape[1], state.shape[2], state.shape[3]
+        assert kd == vd, f"gdn_prep binds one thread per head column: {kd} != {vd}"
         hk = q.shape[-1] // kd
         ker = kw["conv1d_weight"].shape[1]
         io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
@@ -696,7 +702,7 @@ class Backend:
             if window is not None
             else torch.zeros(b, ker - 1, 2 * hk * kd + nvh * vd, device=self.device)
         )
-        qn, kn, vn, gt, bt, new_window = self._kernel("gdn_prep")(
+        return self._kernel("gdn_prep")(
             self._c(self._dev(q, io)).view(b, t, hk, kd),
             self._c(self._dev(k, io)).view(b, t, hk, kd),
             self._c(self._dev(v, io)).view(b, t, nvh, vd),
@@ -708,6 +714,15 @@ class Backend:
             self._c(win),
             threads=vd,
         )
+
+    def _gdn_chunk_wy(self, q, k, v, g, beta, state, **kw):
+        """Chunkwise-WY prefill: gdn_prep, the WY core, gdn_post. The layer's
+        conv / norm / gate glue is two launches here, sixty as torch ops."""
+        b, t = q.shape[0], q.shape[1]
+        nvh, vd = state.shape[1], state.shape[3]
+        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
+        window = kw.get("conv_window")
+        qn, kn, vn, gt, bt, new_window = self._gdn_prep(q, k, v, g, beta, state, **kw)
         if "gdn_state_scan" in _resolve(self.precision, self.arch):
             core, new_state = self._gdn_wy_core(qn, kn, vn, gt, bt, state)
         else:  # no WY schedule in this cell: the chunkwise reference is the core
@@ -727,6 +742,8 @@ class Backend:
         """fla's chunk_gated_delta_rule_fwd stage for stage: cumsum, kkt,
         solve_tril, w/u, the inter-chunk state scan, o. gdn_prep already put
         1/sqrt(key_dim) in q, so the o scale is 1."""
+        # a tail chunk writes past h, which gdn_state_scan sizes S // chunk
+        assert q.shape[1] % chunk == 0, f"WY core needs whole chunks: {q.shape[1]} % {chunk}"
         kern = self._kernel
         gc = kern("gdn_chunk_cumsum")(g, chunk)
         a = kern("gdn_solve_tril")(kern("gdn_chunk_kkt")(k, beta, gc, chunk), chunk)

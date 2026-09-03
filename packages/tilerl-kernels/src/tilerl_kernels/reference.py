@@ -532,47 +532,32 @@ def gdn_chunk_core(qn, kn, v, gt, bt, state, chunk: int = 64):
     return core, s
 
 
-def gdn_forward(
+def gdn_prep(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    state: torch.Tensor,
+    key_dim: int,
     *,
-    z: torch.Tensor,
     conv1d_weight: torch.Tensor,
     dt_bias: torch.Tensor,
     a_log: torch.Tensor,
-    norm_weight: torch.Tensor,
     conv_window: "torch.Tensor | None" = None,
     seq_q_lens: "torch.Tensor | None" = None,
     keep_steps: int = 0,
-    chunkwise: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
-    """Full GDN layer core, the executable spec (agent-infer's host reference
-    equation by equation). q/k [B,T,nkh*K], v/z [B,T,nvh*V], g/beta [B,T,nvh],
-    state [B,nvh,K,V]. ``conv_window`` [B,K-1,qkv_dim] is the previous
-    segment's last raw-qkv tokens (None: zero left-padding, third return
-    None). ``seq_q_lens`` [B] bounds each row's scan. ``keep_steps`` > 0
-    returns the state/window after each of the first keep_steps tokens with a
-    leading chain-step axis (speculative verify)."""
-    # ponytail: per-call param migration, keep params on the backend device at load
+) -> tuple[torch.Tensor, ...]:
+    """Front half of :func:`gdn_forward`, and the oracle for the ``gdn_prep``
+    kernel: conv1d + SiLU over q/k/v, the q/k L2-norm with 1/sqrt(key_dim) folded
+    into q, the log gate, sigmoid beta, and the next conv window. Returns
+    (qn, kn, v_raw, gt, bt, new_window) -- q/k [B,T,nkh,K], v [B,T,nvh,V]."""
     dev = q.device
-    q = _f32(q)
-    k = _f32(k)
-    v = _f32(v)
-    g = _f32(g)
-    beta = _f32(beta)
-    state = _f32(state).to(dev)
-    z = _f32(z)
+    q, k, v, g, beta = _f32(q), _f32(k), _f32(v), _f32(g), _f32(beta)
     conv1d_weight = _f32(conv1d_weight).to(dev)
-    dt_bias = _f32(dt_bias).to(dev)
-    a_log = _f32(a_log).to(dev)
-    norm_weight = _f32(norm_weight).to(dev)
+    dt_bias, a_log = _f32(dt_bias).to(dev), _f32(a_log).to(dev)
     b, t, _ = q.shape
-    nvh, key_dim, val_dim = state.shape[1], state.shape[2], state.shape[3]
-    nkh = q.shape[-1] // key_dim
+    nvh = g.shape[-1]
+    val_dim, nkh = v.shape[-1] // nvh, q.shape[-1] // key_dim
     kernel = conv1d_weight.shape[1]
     if seq_q_lens is None:
         seq_q_lens = torch.full((b,), t, dtype=torch.long, device=dev)
@@ -604,6 +589,52 @@ def gdn_forward(
     kn = k_raw / torch.sqrt(k_raw.pow(2).sum(-1, keepdim=True) + 1e-12)
     bt = torch.sigmoid(beta).view(b, t, nvh)
     gt = -torch.exp(a_log) * torch.nn.functional.softplus(g + dt_bias)
+    return qn, kn, v_raw, gt, bt, new_window
+
+
+def gdn_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    *,
+    z: torch.Tensor,
+    conv1d_weight: torch.Tensor,
+    dt_bias: torch.Tensor,
+    a_log: torch.Tensor,
+    norm_weight: torch.Tensor,
+    conv_window: "torch.Tensor | None" = None,
+    seq_q_lens: "torch.Tensor | None" = None,
+    keep_steps: int = 0,
+    chunkwise: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
+    """Full GDN layer core, the executable spec (agent-infer's host reference
+    equation by equation). q/k [B,T,nkh*K], v/z [B,T,nvh*V], g/beta [B,T,nvh],
+    state [B,nvh,K,V]. ``conv_window`` [B,K-1,qkv_dim] is the previous
+    segment's last raw-qkv tokens (None: zero left-padding, third return
+    None). ``seq_q_lens`` [B] bounds each row's scan. ``keep_steps`` > 0
+    returns the state/window after each of the first keep_steps tokens with a
+    leading chain-step axis (speculative verify)."""
+    # ponytail: per-call param migration, keep params on the backend device at load
+    dev = q.device
+    state = _f32(state).to(dev)
+    z = _f32(z)
+    norm_weight = _f32(norm_weight).to(dev)
+    b, t, _ = q.shape
+    nvh, key_dim, val_dim = state.shape[1], state.shape[2], state.shape[3]
+    nkh = q.shape[-1] // key_dim
+    if seq_q_lens is None:
+        seq_q_lens = torch.full((b,), t, dtype=torch.long, device=dev)
+    else:
+        seq_q_lens = torch.as_tensor(seq_q_lens, dtype=torch.long, device=dev).reshape(b)
+    qn, kn, v_raw, gt, bt, new_window = gdn_prep(
+        q, k, v, g, beta, key_dim,
+        conv1d_weight=conv1d_weight, dt_bias=dt_bias, a_log=a_log,
+        conv_window=conv_window, seq_q_lens=seq_q_lens, keep_steps=keep_steps,
+    )
+    silu = lambda x: x * torch.sigmoid(x)
     exp_g = torch.exp(gt)
     if chunkwise and not keep_steps and int(seq_q_lens.min()) == t:
         # the chunked form has no per-row mask: full-length rows only

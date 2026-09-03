@@ -415,11 +415,11 @@ def make_gdn_state_scan(target: str, block_DV: int = 32, threads: int = 128):
                 for i_s2, i_v in T.Parallel(block_S, block_DV):
                     V_new_fragment[i_s2, i_v] = (
                         V_new_fragment[i_s2, i_v]
-                        * T.exp2((G_last_local - G_fragment[i_s2, i_v]) * 1.442695)
+                        * T.exp2((G_last_local - G_fragment[i_s2, i_v]) * 1.4426950408889634)
                         if G_last_local - G_fragment[i_s2, i_v] <= 0
                         else 0
                     )
-                G_last_local = T.exp2(G_last_local * 1.442695)
+                G_last_local = T.exp2(G_last_local * 1.4426950408889634)
                 for i_k, i_v in T.Parallel(DK, block_DV):
                     b_h_fragment[i_k, i_v] *= G_last_local
 
