@@ -60,6 +60,23 @@ def test_step_seed_uses_all_seed_bits():
     assert len({_step_seed(s, 7) for s in range(10000)}) > 9990
 
 
+def test_restriction_is_the_same_batched_as_per_row():
+    """When every row cuts the same way, the sampler restricts [N,V] once instead of
+    N times -- one topk and one allowed_ids upload, not N of each. The rows must come
+    out identical; a batched topk that took the kth value across the batch instead of
+    per row would widen some rows' support and narrow others, and still sample."""
+    torch.manual_seed(4)
+    logits = torch.randn(4, 64)
+    for p in (
+        SamplingParams(top_k=5),
+        SamplingParams(allowed_ids=(1, 3, 7, 11, 13, 20, 31)),
+        SamplingParams(top_k=3, allowed_ids=(2, 5, 9, 14, 22, 40, 55, 60)),
+    ):
+        batched = _restrict(logits, p)
+        for i in range(4):
+            assert torch.equal(batched[i], _restrict(logits[i], p)), (p, i)
+
+
 def test_generate():
     """Same seed -> identical tokens, different seed -> different tokens."""
     engine = _build_engine(seed=1234)

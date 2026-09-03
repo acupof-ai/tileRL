@@ -808,13 +808,22 @@ class Engine:
         tick); per-row seeds keep the draws identical. The caller commits."""
         if not rows:
             return []
-        logits = torch.stack([_restrict(l, r.params) for r, l, _ in rows])
-        temps = [r.params.temperature for r, _, _ in rows]
-        top_ps = [r.params.top_p for r, _, _ in rows]
+        params = [r.params for r, _, _ in rows]
+        logits = torch.stack([l for _, l, _ in rows])
+        cut = params[0]
+        if all((p.allowed_ids, p.top_k) == (cut.allowed_ids, cut.top_k) for p in params):
+            # the restriction is per-row only in principle; when it is uniform this is
+            # one topk over [N,V] and one allowed_ids upload, not N of each
+            logits = _restrict(logits, cut)
+        else:
+            logits = torch.stack([_restrict(logits[i], p) for i, p in enumerate(params)])
+        temps = [p.temperature for p in params]
+        top_ps = [p.top_p for p in params]
         seeds = [_step_seed(r.params.seed, g) for r, _, g in rows]
-        toks, lps = self._backend.sample_batch(logits, temps, top_ps, seeds)
-        self._last_logprobs = (lps.tolist()
-                               if any(r.params.logprobs for r, _, _ in rows) else None)
+        # the greedy branch scores its draw with a second full-vocabulary log_softmax
+        want_lp = any(p.logprobs for p in params)
+        toks, lps = self._backend.sample_batch(logits, temps, top_ps, seeds, logprobs=want_lp)
+        self._last_logprobs = lps.tolist() if want_lp else None
         return toks.tolist()
 
     def _sample_commit(self, rows: list[tuple]) -> None:
