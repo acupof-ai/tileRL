@@ -172,6 +172,32 @@ slower); tracer removed and the drafter batched, ~83s (3.4x faster than base).
 The second number is what the batching work is worth, and it is why this is a
 `ponytail` marker and not a default flip.
 
+The trunk-tick half of that arithmetic is measured, not extrapolated: a B=8
+W=8 graph replay is 47.205 ms against the same batch's W=1 at 26.361 ms,
+**1.79x**, with W=1 reproducing to 0.8% as its own control and 1.79 on GPU 7
+against 1.81 on GPU 5
+([width-w entry](2026-09-03-width-w-verify-tick-on-the-decode-path.md)).
+1.79x over 5.5x fewer forwards predicts the spec arm's trunk time at 0.325 of
+the base arm's; the profile puts it at 61.6 s against a 278.6 s base that is
+mostly trunk and sampling, so 0.22 — two routes agreeing to the order, with
+the gap in the direction the base arm's non-trunk work explains.
+
+**Two limits on the 3.4x, both from review, neither closed here.** First,
+Amdahl on a self-time share is not a speedup: removing 68.4% predicts 3.16x
+only if the remaining 31.6% is unchanged, and a batched drafter is not zero —
+it is a smaller unmeasured number, so the honest form is "≤3.4x minus the
+batched drafter's own cost," and that subtrahend is the whole question.
+Second, **6.18 of 8 was measured with the drafter running per row, and it is
+an input to the 3.4x.** `path`'s walk carries a data dependency on `prev`, so
+batching it is either B independent walks or a restructure, and a restructure
+can move acceptance. An estimate that holds acceptance fixed while changing
+the code that produces it is assuming its own answer.
+
+What settles it is not a profile: a synthetic verify-only arm — trunk at W=8,
+B=8, graph on, drafts replayed from a trace recorded at the acceptance a real
+run achieved, no drafter in the process. That prices the ceiling with none of
+the drafter in it. Pending.
+
 ### Why the drafter costs what it does
 
 `_draft_block` walks the rows one at a time. Per tick at B=8 that is 8 serial
