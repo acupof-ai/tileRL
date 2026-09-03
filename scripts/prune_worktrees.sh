@@ -5,6 +5,7 @@
 set -uo pipefail
 
 here=$(pwd -P)
+junk='(^|/)(\.venv|__pycache__|\.pytest_cache|\.ruff_cache|\.mypy_cache|node_modules|\.DS_Store|\.coverage)/?$'
 git fetch -q origin main
 # the oid, not the name: a branch name is reused, gets commits after its PR
 # merges, or belongs to a fork, and all three still match by name. The oid list
@@ -30,10 +31,11 @@ git worktree list --porcelain | awk '
     { echo "keep     $dir  ($b: holds commits not in main)"; continue; }
   n=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
   [ "$n" = 0 ] || { echo "keep     $dir  ($b: $n uncommitted)"; continue; }
-  # status never reports ignored paths, and worktree remove deletes them anyway
-  for d in runs weights; do
-    [ -n "$(ls -A "$dir/$d" 2>/dev/null)" ] && { echo "keep     $dir  ($b: $d/ not empty)"; continue 2; }
-  done
+  # status never reports ignored paths and worktree remove deletes them anyway, so
+  # a worktree holding runs/ or .claude/ reads as 0 changes. Allowlist, not
+  # blocklist: an ignored path nobody listed here is a keep.
+  ig=$(git -C "$dir" status --porcelain --ignored 2>/dev/null | sed -n 's|^!! ||p' | grep -Ev "$junk")
+  [ -z "$ig" ] || { echo "keep     $dir  ($b: ignored $(echo $ig | head -c 60))"; continue; }
   if [ "${1:-}" = --apply ]; then
     git worktree remove "$dir" && echo "removed  $dir  ($b)"
   else
