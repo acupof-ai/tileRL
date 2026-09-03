@@ -55,6 +55,12 @@ Monotone in both directions and the shipped `(32, 16)` is within 17% of the best
 f32 = 64 KB, which does not fit. **No tuning win here; the shape has to change or
 nothing does.**
 
+**This table is S=32 only — prefill width.** It is not evidence that KVSPLIT=16 is faster
+for a spec tick, which runs S=1 (decode) and S=1+depth (verify); at S=1 the recorded case
+*for* 32 is the flat context slope (512→4096 at 157→163 µs,
+[wins/2026-09-01](../wins/2026-09-01-sm70-attention-thread-redundancy.md)). Cite the 4002-vs-4700
+figure only at prefill width.
+
 Threads reconfirm the earlier fix held: 248 / 158 / 154 / 302 µs at 32/64/128/256t —
 flat from 64 to 128, so the redundancy is still gone and only occupancy remains.
 
