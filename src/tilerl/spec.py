@@ -140,6 +140,7 @@ def read_head_params(path: str | Path, stems: dict[str, str]) -> dict[str, torch
 
     params: dict[str, torch.Tensor] = {}
     skipped: list[str] = []
+    unknown: list[str] = []
     nextn = False
     with safe_open(str(path), "pt", device="cpu") as f:
         for name in list(f.keys()):
@@ -161,10 +162,22 @@ def read_head_params(path: str | Path, stems: dict[str, str]) -> dict[str, torch
                 skipped.append(bare)
             elif mapped is not None:
                 params[mapped] = f.get_tensor(name)
+            else:
+                unknown.append(bare)
     if skipped:
         warnings.warn(
             f"draft head {path}: ignoring {sorted(skipped)} — the trunk's are shared",
             stacklevel=2,
+        )
+    # A tensor this map does not name is the wrong reader for this checkpoint, not
+    # dead weight: loading a DFlash2 head through _DRAFT_TOP drops all 11 of its
+    # conv and selector weights, and the first draft then dies on a KeyError far
+    # from the cause.
+    if unknown:
+        raise RuntimeError(
+            f"draft head {path}: {len(unknown)} tensor(s) map to no parameter — "
+            f"{sorted(unknown)[:8]}{'...' if len(unknown) > 8 else ''}. Wrong head "
+            "format for this reader, or a key this port does not implement."
         )
     # Zero-centered Qwen3_5RMSNorm (y = x*(1+w)): load_hf folds the +1 in for the
     # trunk, and only a Qwen NextN head is built that way. DSpark and DFlash norms
