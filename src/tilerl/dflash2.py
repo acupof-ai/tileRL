@@ -110,14 +110,11 @@ class DFlash2Head:
         self.backend = backend
 
     def step(self, rows) -> None:
-        """Contract: leave next tick's chain in ``r.drafts``. One block per row. A context position's K/V is a pure projection of the
-        trunk's aux taps there, so it is projected the tick it commits and kept —
-        re-projecting the whole context every tick is ~10 ms at T=512 B=8, a fifth
-        of the verify tick it rides. The context is trimmed to the head's sliding
-        window, past which every block slot masks it anyway.
-        The selector walk runs once for the whole tick; ``block_hidden`` is still
-        per row, which is what is left of the batching ceiling.
-        """
+        """Leave next tick's chain in ``r.drafts``. A context position's K/V is a
+        pure projection of the trunk's aux taps, so it is projected the tick it
+        commits and kept — re-projecting the whole context every tick is ~10 ms at
+        T=512 B=8. The walk runs once for the tick; ``block_hidden`` is still per
+        row, which is the rest of the batching ceiling."""
         backend = self.backend
         dev = backend.device
         live, hidden, anchors = [], [], []
@@ -198,17 +195,14 @@ class DFlash2Head:
         return self.paths(hidden, [anchor], backend)[0]
 
     def paths(self, hidden, anchors, backend) -> list[list[int]]:
-        """Top-k candidates per mask slot, then the best-scoring path from each
-        anchor. The walk only ever reads the row of the transition score whose
-        predecessor is the token it just emitted, so the row is all we build.
-        The walk along the block is sequential — ``prev`` feeds the next slot —
-        but across rows it is not, so every row takes step ``j`` together and the
-        whole batch costs one host sync instead of one per row per slot."""
+        """Top-k per slot, then one greedy walk per row. ``prev`` feeds the next
+        slot so the block is sequential; the rows are not, so they walk together
+        and the batch costs one host sync, not two per slot per row."""
         dc = self.dcfg
         head = "embed_tokens" if self.trunk.cfg.tie_word_embeddings else "lm_head"
-        unary, cand = torch.topk(
-            self.trunk._linear(backend, hidden, head).float(), dc.top_k, dim=-1
-        )
+        # topk before the widening cast: it is order-preserving, and an f32 copy of
+        # the full [B, W, 248320] readout is 55 MB at B=8
+        unary, cand = torch.topk(self.trunk._linear(backend, hidden, head), dc.top_k, dim=-1)
         proj = self._lin(backend, hidden, "selector.proj").float()
         # gathered rows only: an f32 copy of either [248320,256] codebook is 254 MB
         pred, succ = self.params["selector.pred"], self.params["selector.succ"]
@@ -216,7 +210,7 @@ class DFlash2Head:
         rows = torch.arange(len(anchors), device=hidden.device)
         out = []
         for j in range(hidden.shape[1]):
-            score = unary[:, j] + torch.einsum(
+            score = unary[:, j].float() + torch.einsum(
                 "bkr,br->bk", succ[cand[:, j]].float(), pred[prev].float() * proj[:, j]
             )
             prev = cand[rows, j, score.argmax(-1)]
@@ -273,8 +267,6 @@ class DFlash2Head:
         coef = base.float().reshape(1, 1, dc.taps, g, dc.group_size) + delta.float().unsqueeze(-1)
         out = coef[:, :, 0] * blocks
         for tap in range(1, dc.taps):
-            # the zero-padded head of the shifted block contributes nothing, so
-            # add into the tail instead of materialising the pad and the concat
             out[:, tap:] += coef[:, tap:, tap] * blocks[:, :-tap]
         return out.reshape(*x.shape[:2], -1)
 
