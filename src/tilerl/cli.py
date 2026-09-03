@@ -502,8 +502,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "also owns the per-step verify states)")
     p_serve.add_argument("--blocks", type=int, default=0,
                          help="KV blocks (16 tokens each); 0 = fit the pool to the card, "
-                              "capped by --max-ctx. Measured: 4046 blocks = 64736 tokens "
-                              "on a 32GB V100 at B=1")
+                              "capped by --max-ctx. Measured 2026-09-04: 3927 blocks = "
+                              "62832 tokens on a 32GB V100 at --slots 3 with a draft")
     p_serve.add_argument("--max-ctx", type=int, default=0,
                          help="cap served context (0 = the model's own limit); pairs with "
                               "--blocks so a request cannot outgrow the pool")

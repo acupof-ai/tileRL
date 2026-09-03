@@ -202,6 +202,7 @@ def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
 
     seen = []
     real_state, real_fit = eng_mod.LinearStatePool, eng_mod._fit_blocks
+    real_quant = eng_mod._quantize_draft
 
     def spy_state(*a, **k):
         seen.append("state")
@@ -211,13 +212,37 @@ def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
         seen.append("fit")
         return real_fit(*a, **k)
 
+    def spy_quant(*a, **k):
+        seen.append("draft")
+        return real_quant(*a, **k)
+
     monkeypatch.setattr(eng_mod, "LinearStatePool", spy_state)
     monkeypatch.setattr(eng_mod, "_fit_blocks", spy_fit)
+    monkeypatch.setattr(eng_mod, "_quantize_draft", spy_quant)
     cfg = tiny()
     e = build_engine(cfg, build_random(cfg, seed=7), get_backend(), num_blocks=0,
                      num_slots=2, max_batch=2, max_total_tokens=512, max_blocks=16)
     assert seen == ["state", "fit"], f"the KV fit ran before the state pool: {seen}"
     assert e.usable_blocks == 16, f"max_blocks must cap the fit, got {e.usable_blocks}"
+
+    # With a draft, its WEIGHTS must be served before the fit reads free memory. They
+    # used to be quantized inside Engine.__init__, i.e. after the fit had spent 2/3 of
+    # free memory and PrefixStore a quarter of the rest -- so on the 27B at serve's
+    # default --slots 16 the draft's own fp4 weights were charged to nothing and
+    # `serve --blocks 0 --draft` died in materialize's twiddle with 104 MiB free,
+    # before the fit's print. `draft` must come FIRST, not just before `fit`: the
+    # reclaim between them is what turns the fit into a measurement.
+    seen.clear()
+    trunk = build_random(cfg, seed=7)
+    build_engine(cfg, trunk, get_backend(), num_blocks=0, num_slots=3, max_batch=2,
+                 max_total_tokens=512, max_blocks=16,
+                 draft=_draft(cfg, trunk), spec_depth=3)
+    assert seen[:3] == ["draft", "state", "fit"], (
+        f"the draft's weights must be served before the state pool and the fit: {seen}")
+    # Engine.__init__ still calls it, for a caller who builds an Engine directly with an
+    # unquantized draft. That call is a no-op on already-packed params (_quantize_draft
+    # returns its input when it sees a .wq/.w8 key), which is why it may follow the fit.
+    assert seen[3:] in ([], ["draft"]), f"one re-serve at most, got {seen}"
 
 
 def test_graph_keys_covers_what_a_decode_tick_keys_on():

@@ -357,15 +357,13 @@ class Engine:
                     "a bug. Pass prefix_store=NoPrefixStore()."
                     # ponytail: rebuilding ctx from an adopted prefix is the upgrade.
                 )
-            # Dense bf16 on Backend.linear's generic path was 9.7 ms per projection
-            # vs 0.13 ms on the fp8 kernel; serve it the way the trunk is served.
-            # The FORMAT follows the kernel: fp8 has no sm70 cell, and quantizing
-            # to a format with no kernel routes every projection back to that
-            # generic path (120.91 ms/step against the trunk's whole 103.58 ms
-            # eager forward; fp4 measured 4.98 ms/step, 24x the dense path).
-            fp4 = not backend.has_kernel("linear_fp8")
+            # The draft's weights are served in `build_engine`, BEFORE the KV fit reads
+            # free memory -- see the comment there. A direct `Engine(...)` caller that
+            # passes an unquantized draft still gets one here; `_quantize_draft` returns
+            # its input unchanged once packed, so the common path pays a dict copy.
             served = backend.materialize(
-                _quantize_draft(draft.params, skip=draft.no_quant, fp4=fp4)
+                _quantize_draft(draft.params, skip=draft.no_quant,
+                                fp4=not backend.has_kernel("linear_fp8"))
             )
             draft.params.clear()  # in place: the head's Model holds THIS dict
             draft.params.update(served)
@@ -1164,12 +1162,26 @@ def build_engine(
     if draft is not None:
         draft.set_depth(spec_depth)  # the state pool is sized by the width it settles on
     model.params = backend.materialize(model.params)
+    # Serve the draft's own weights HERE, before anything reads free memory. They used
+    # to be quantized inside Engine.__init__, i.e. after the KV fit had already spent
+    # 2/3 of what was free and PrefixStore a quarter of the rest -- so the draft's fp4
+    # weights were charged to nothing and `serve --blocks 0 --draft` died in
+    # `materialize`'s twiddle with 104 MiB free, never reaching the fit's own print
+    # (measured at serve's default --slots 16 on a 32 GB V100). Same ordering fix the
+    # state pool below already uses: allocate, then MEASURE what is left.
+    if draft is not None:
+        served = backend.materialize(
+            _quantize_draft(draft.params, skip=draft.no_quant,
+                            fp4=not backend.has_kernel("linear_fp8"))
+        )
+        draft.params.clear()  # in place: the head's Model holds THIS dict
+        draft.params.update(served)
     # Reclaim the allocator's load-time reserve before anything reads free memory.
     # Loading and quantizing 27B leaves 29.02 GiB reserved against 15.96 allocated on
     # a 31.74 GiB card, and `mem_get_info` counts all 13.06 GiB of that as USED -- so
     # the store's budget below, and the KV fit, see 2.36 GiB free instead of 15.17.
     # Measured on sm70: this one call is the difference between a 1024-token and a
-    # 64912-token context at B=1.
+    # 62832-token context at B=1.
     if backend.device.type == "cuda":
         torch.cuda.empty_cache()
     pad = _graph_on(backend, decode_graph)  # the replay's padding row owns a slot and a block
