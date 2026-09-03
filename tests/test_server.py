@@ -149,6 +149,72 @@ def test_seedless_requests_decorrelate(client, model_id):
     assert len(seen) > 1, seen
 
 
+@pytest.mark.xfail(
+    reason="engine.step() holds _lock across the whole forward (engine.py:557), so no "
+           "reader can observe an in-flight request: measured take() blocking 325 ms of a "
+           "335 ms generation, 3 polls for 24 tokens. Incremental SSE needs the lock "
+           "narrowed, not an accessor.",
+    strict=True,
+)
+def test_the_stream_arrives_in_pieces_and_never_splits_a_character(client, model_id):
+    """SSE must deliver text as it is generated, not one block at the end.
+
+    server.py:245 awaits completion and emits ONE content delta, so a viewer sees a
+    pause and then the whole answer -- the generation rate is invisible.
+    test_completion_stream below passes either way: it only asserts SOME content
+    arrived, which one final delta satisfies. This is the discriminating version.
+
+    Two things must hold at once and they pull against each other. Deltas must
+    arrive as separate chunks (streaming), AND concatenating them must equal the
+    non-streamed text exactly (correctness). The trap is decoding per token: one
+    token is not one character, so a per-token decode splits multi-byte UTF-8.
+    _ByteTokenizer makes that reachable -- one id per BYTE, so any multi-byte
+    character is guaranteed to span tokens.
+
+    xfail is the honest state: an engine.peek() accessor was written and reverted
+    because the lock makes it unobservable. Remove the marker when the lock is
+    narrowed; strict=True so it fails loudly the moment streaming starts working.
+    """
+    body = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 24,
+        "temperature": 0.0,
+        "seed": 7,
+    }
+    streamed = client.post("/v1/chat/completions", json={**body, "stream": True})
+    assert streamed.status_code == 200, streamed.text
+    lines = [ln for ln in streamed.text.splitlines() if ln.startswith("data:")]
+    payloads = [json.loads(ln[len("data: ") :]) for ln in lines[:-1]]
+    deltas = [
+        p["choices"][0]["delta"]["content"]
+        for p in payloads
+        if p["choices"][0].get("delta", {}).get("content")
+    ]
+
+    # Streaming: more than one content chunk. A single delta means the whole
+    # completion was emitted at once, which is the behaviour this replaced.
+    assert len(deltas) > 1, (
+        f"only {len(deltas)} content delta(s): the stream is not incremental, "
+        f"so a viewer cannot see tokens arrive. deltas={deltas!r}"
+    )
+
+    # Correctness: the pieces must reassemble into the same text the non-streamed
+    # path returns for the same deterministic request.
+    plain = client.post("/v1/chat/completions", json={**body, "stream": False})
+    assert plain.status_code == 200, plain.text
+    expected = plain.json()["choices"][0]["message"]["content"]
+    assert "".join(deltas) == expected, (
+        f"stream != non-stream:\n  joined  {''.join(deltas)!r}\n  expected {expected!r}"
+    )
+
+    # No delta may carry U+FFFD: that is what a decode of a partial character
+    # produces, and it is the failure a per-token decode would introduce.
+    assert "�" not in "".join(deltas), (
+        f"replacement char in the stream -- a partial character was decoded: {deltas!r}"
+    )
+
+
 def test_completion_stream(client, model_id):
     resp = client.post(
         "/v1/chat/completions",
