@@ -97,18 +97,30 @@ def record(args) -> None:
                           spec_depth=max(1, args.width - 1),
                           decode_graph=args.graph,
                           prefix_store=NoPrefixStore())
-    ticks: list[list[int]] = []  # one [width, n_ok] per verified row
-    verify = engine._verify
+    ticks: list[list[int]] = []  # one [width, n_ok, committed] per verified row
+    # n_ok comes off select_step, which _verify calls once per row with exactly
+    # the accepted count. Deriving it from len(r.output) instead undercounts: a
+    # tick whose chain hits a stop token commits fewer tokens than it accepted
+    # (_commit returns early on stop), and a tick whose FIRST token is a stop
+    # commits none, which reads as -1 accepted.
+    verify, select = engine._verify, engine._states.select_step
+    pending: list[int] = []
+
+    def w_select(slot, step):
+        pending.append(int(step))
+        return select(slot, step)
 
     def w_verify(rows, chains, logits, hidden):
         before = [len(r.output) for r in rows]
+        pending.clear()
         out = verify(rows, chains, logits, hidden)
+        assert len(pending) == len(rows), (len(pending), len(rows))
         for i, (r, n0) in enumerate(zip(rows, before)):
-            # committed = accepted drafts + the trunk's bonus token
-            ticks.append([len(chains[i]), len(r.output) - n0 - 1])
+            ticks.append([len(chains[i]), pending[i], len(r.output) - n0])
         return out
 
     engine._verify = w_verify
+    engine._states.select_step = w_select
     rows = [json.loads(ln) for ln in Path(args.gsm8k).read_text().splitlines()
             if ln.strip()][: args.gsm8k_n]
     params = replace(sampling(tok, False, args.max_new_tokens, temperature=0.0,
@@ -122,15 +134,21 @@ def record(args) -> None:
     s = engine.stats()
     ok = sum(answer_match(t, r["answer"]) for t, r in zip(texts, rows))
 
-    widths = Counter(w for w, _ in ticks)
-    acc = Counter(n for _, n in ticks)
-    tokens = sum(n + 1 for _, n in ticks)
+    widths = Counter(w for w, _, _ in ticks)
+    acc = Counter(n for _, n, _ in ticks)
+    tokens = sum(c for _, _, c in ticks)  # what the run actually committed
+    short = [t for t in ticks if t[2] != t[1] + 1]
     print(f"gsm8k {ok}/{len(rows)}  {secs:.1f}s  drafted {s['spec_drafted']} "
           f"accepted {s['spec_accepted']}  decode fwd {s['decode_forwards']}")
     print(f"verified row-ticks {len(ticks)}, tokens committed through verify {tokens}")
     print(f"  width histogram   {dict(sorted(widths.items()))}")
     print(f"  accepted per tick {dict(sorted(acc.items()))}  "
           f"mean {sum(acc.elements()) / max(1, len(ticks)):.3f}")
+    print(f"  n_ok+1 == committed on {len(ticks) - len(short)}/{len(ticks)}; "
+          f"{len(short)} truncated by a stop token")
+    assert sum(n for _, n, _ in ticks) == s["spec_accepted"], (
+        f"traced accepted {sum(n for _, n, _ in ticks)} != engine "
+        f"{s['spec_accepted']}: the trace is not the run")
     o = Path(args.out)
     o.parent.mkdir(parents=True, exist_ok=True)
     o.write_text(json.dumps({
@@ -148,12 +166,14 @@ def record(args) -> None:
 def price(args) -> None:
     """Cost each width the trace used, on an engine holding no draft head."""
     tr = json.loads(Path(args.trace).read_text())
-    ticks = [(int(w), int(n)) for w, n in tr["ticks"]]
+    ticks = [(int(w), int(n), int(c)) for w, n, c in tr["ticks"]]
     if not ticks:
         raise SystemExit(f"{args.trace}: no verified ticks recorded")
     B = args.batch or int(tr["batch"])
-    tokens = sum(n + 1 for _, n in ticks)
-    per_width = Counter(w for w, _ in ticks)
+    # committed, not n_ok+1: a chain cut short by a stop token commits fewer, and
+    # the unspeculated arm would have paid one tick per token it actually kept
+    tokens = sum(c for _, _, c in ticks)
+    per_width = Counter(w for w, _, _ in ticks)
     # a row-tick is one row; the engine ticks B rows at once
     tick_rows = sorted(per_width)
     print(f"trace {args.trace}: {len(ticks)} row-ticks, {tokens} tokens, "
