@@ -14,7 +14,7 @@ Serve and RL-train Qwen3.8-27B (NVFP4) on one Hopper card, in one process.
 
 | one H20, Qwen3.8-27B | B=1 decode tok/s | prefill tok/s | MMLU 0-shot |
 |---|---:|---:|---:|
-| tileRL, native NVFP4 + FP8 | **92.4** | **2887.6** | 76.3% |
+| tileRL, native NVFP4 + FP8 | **92.4** | **2887.6** | 74.6% |
 | sglang, bf16 (cannot load NVFP4 on Hopper) | 54.2 | — | — |
 | sglang, online fp8 | 39.9 | — | — |
 
