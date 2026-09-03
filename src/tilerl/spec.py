@@ -236,6 +236,7 @@ class DraftHead:
         self.layers = Model(cfg, params)
         self.has_confidence = "confidence.weight" in params
         self.width = 3  # 2 drafts; ``set_depth`` overrides
+        self.forwards = 0  # cumulative draft forwards; a probe divides its own timing by this
 
     def forward(self, hidden, ids, positions, kv, backend, hidden_out=None,
                 last_only=False) -> torch.Tensor:
@@ -243,6 +244,7 @@ class DraftHead:
         each position predicts FROM) -> draft logits [B,T,vocab], or [B,1,vocab]
         when ``last_only`` selects one position per row. ``hidden_out`` receives
         the head's own hidden at FULL width, appended before the reduction."""
+        self.forwards += 1  # a tick runs 1..depth of these: the chain loop can break early
         eps = self.cfg.rms_eps
         ids = torch.as_tensor(ids, dtype=torch.long, device=backend.device)
         positions = torch.as_tensor(positions, dtype=torch.long, device=backend.device)

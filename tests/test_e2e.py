@@ -989,6 +989,47 @@ def _full_context_draft(cfg, model, draft, backend, toks: list[int]) -> torch.Te
                          np.arange(1, n + 1), kv, backend)[0, -1].float()
 
 
+def test_the_draft_forward_counter_counts_forwards_not_ticks():
+    """``DraftHead.forwards`` is the divisor a direct draft timing uses, and it must
+    count actual forwards, not ticks times depth.
+
+    The chain loop breaks when a row runs out of blocks (`spec.py:370`), so a
+    depth-d tick can run fewer than d forwards. Dividing a per-tick timing by the
+    configured depth would then under-price the draft, silently and in the direction
+    that makes speculation look better -- which is the number
+    `wins/2026-09-04-a-difference-amplifies-its-operands-noise.md` exists to stop
+    being quoted loosely. Counted against a spy on the one function that does a
+    draft forward, so the two cannot drift.
+    """
+    cfg = tiny()
+    backend = get_backend()
+    model = build_random(cfg, seed=5)
+    draft = _random_draft(cfg, 11, model)
+    depth = 3
+    engine = build_engine(cfg, model, backend, num_blocks=64, num_slots=4, max_batch=4,
+                          max_total_tokens=512, draft=draft, spec_depth=depth)
+    calls = {"n": 0}
+    inner = draft.forward
+
+    def spy(*a, **k):
+        calls["n"] += 1
+        return inner(*a, **k)
+
+    draft.forward = spy
+    try:
+        rid = engine.submit([3, 4, 5, 6, 7],
+                            SamplingParams(temperature=0.0, max_new_tokens=12, seed=0))
+        _drain(engine, [rid], 12)
+    finally:
+        draft.forward = inner
+    assert calls["n"] > 0, "the draft never ran"
+    assert draft.forwards == calls["n"], (
+        f"the counter reads {draft.forwards} against {calls['n']} real forwards")
+    ticks = engine.stats()["decode_forwards"]
+    assert calls["n"] <= ticks * depth, (
+        f"{calls['n']} forwards over {ticks} ticks exceeds {depth} per tick")
+
+
 @pytest.mark.parametrize(
     "rows,plen,batched_tokens,depth",
     [

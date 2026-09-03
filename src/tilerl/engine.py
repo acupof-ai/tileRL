@@ -402,6 +402,9 @@ class Engine:
         self._keep_draft_logits = False
         self._draft_logits = None
         self._trunk_logits = None
+        #: Set to a list to time each draft forward directly, as (forwards, ms). A
+        #: per-tick sync, so never on in serving; None keeps the path unchanged.
+        self._draft_ms: list[tuple[int, float]] | None = None
         self._verify_chains = None
         self._finished_logprobs: dict[int, list[float]] = {}
         self._taken_logprobs: set[int] = set()
@@ -773,7 +776,21 @@ class Engine:
                     r.blocks.append(self._kv.alloc_block())
                     r.own_blocks += 1
                     self._blocks_used += 1
-            self._draft.step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
+            if self._draft_ms is None:
+                self._draft.step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
+            else:
+                # Direct timing, opt-in: the draft cost derived by SUBTRACTING two
+                # rung-sharing tick means amplifies their noise by operand/difference,
+                # measured 12.9x -- 0.81% tick agreement became 10.42% draft
+                # disagreement (wins/2026-09-04-a-difference-amplifies-its-operands-noise.md).
+                # Events bracket the launches instead, so nothing cancels.
+                a, b = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+                f0 = self._draft.forwards
+                a.record()
+                self._draft.step(rows)
+                b.record()
+                b.synchronize()
+                self._draft_ms.append((self._draft.forwards - f0, a.elapsed_time(b)))
 
     def _finish_prefills(self, prefills: list[_Req], chunks: list[int], logits, base: int) -> None:
         done = []

@@ -180,7 +180,14 @@ def measure(e, prompts: list[list[int]], tokens: int) -> tuple[float, float, flo
     # Rows retire at different times, so tokens/forward is the batch's aggregate and
     # `m` below is the mean M actually launched, not rows x configured width.
     width = 1 + (s1["spec_drafted"] - s0["spec_drafted"]) / max(fwd, 1)
-    return wall / max(fwd, 1), n / max(fwd, 1), width, dict(per_rung)
+    # The engine's own event timings, if the caller armed them. Reported BESIDE the
+    # subtracted figure, never instead of it: the subtraction cancels verify without
+    # modelling it, the events do not cancel anything. Where they disagree, the events
+    # are the measurement and the difference is the amplified noise.
+    direct = list(e._draft_ms or ())
+    if e._draft_ms is not None:
+        e._draft_ms.clear()
+    return wall / max(fwd, 1), n / max(fwd, 1), width, dict(per_rung), direct
 
 
 def main() -> None:
@@ -202,6 +209,13 @@ def main() -> None:
                          "width >= 32 and the ladder rounds M up, so at B=4 depth 1 "
                          "fills rung 8 with ncols=1 while depth 3 half-fills rung 32 "
                          "with ncols=2")
+    ap.add_argument("--time-draft", action="store_true",
+                    help="time each draft forward with CUDA events instead of only "
+                         "deriving it from two tick means. The subtraction amplifies "
+                         "tick noise by operand/difference (measured 12.9x); this does "
+                         "not, but its per-tick sync perturbs the tick it is inside, so "
+                         "the ms/tick column of this run is not comparable to a run "
+                         "without it")
     args = ap.parse_args()
     batches = [int(b) for b in args.batch.split(",")]
     for B in batches:
@@ -243,6 +257,11 @@ def main() -> None:
     e = build_engine(cfg, model, be, num_blocks=need, num_slots=max(batches) + 1,
                      max_batch=max(batches), max_total_tokens=args.ctx + args.tokens + 64,
                      draft=draft, spec_depth=max(DEPTHS))
+    if args.time_draft:
+        # A sync per tick, so it changes the tick number it sits inside. That is the
+        # trade: the subtracted draft figure is free but amplifies tick noise 12.9x,
+        # this one is direct but perturbs the tick. Run it as its own pass.
+        e._draft_ms = []
     for B in batches:
         print(f"\n# B={B}, M=rows x width -> {'/'.join(str(1 + d) for d in DEPTHS)} "
               f"x {B} = {'/'.join(str(B * (1 + d)) for d in DEPTHS)}, "
@@ -284,6 +303,16 @@ def main() -> None:
                            for r, v in sorted(per_rung.items()))
             print(f"{d:>5} {1 + d:>3} {chain:>6.2f} {ms:>8.2f} {tpf:>8.2f} "
                   f"{1000 * tpf / ms:>7.1f}  {mix}")
+            direct = [fv for g in got for fv in g[4]]
+            if direct:
+                # The draft's own cost, timed rather than subtracted. Divided by the
+                # forwards the head COUNTED, not by depth: the chain loop breaks when a
+                # row runs out of blocks (spec.py:370), so a depth-3 tick can run fewer
+                # than 3 forwards and dividing by 3 would under-price it.
+                nf, tot = sum(f for f, _ in direct), sum(v for _, v in direct)
+                print(f"        draft: {tot / max(nf, 1):.2f} ms/forward "
+                      f"({nf / len(direct):.2f} forwards/tick over {len(direct)} ticks) "
+                      "-- timed, not differenced")
             print(f"        gpu: {gpu_state()}")
         best = max(DEPTHS, key=lambda d: rows[(B, d)][1] / rows[(B, d)][0])
         r_best, r_ship = (1000 * rows[(B, d)][1] / rows[(B, d)][0] for d in (best, 3))
