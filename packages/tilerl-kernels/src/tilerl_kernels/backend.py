@@ -25,9 +25,13 @@ __all__ = ["Backend", "get_backend", "resolve_target"]
 
 _THREADS = 64
 #: chunkwise-WY chunk length. gdn_state_scan and gdn_chunk_o size h by S // chunk, so a T
-#: that is not a whole multiple writes past it. A verify width that reached one would also
-#: reach ``_full_rows``'s host sync, illegal under graph capture: keep _MAX_VERIFY_W below.
+#: that is not a whole multiple writes past it.
 _WY_CHUNK = 64
+# ponytail: the DFlash2 verify block; wider runs take the M-tiled kernel until
+# the crossover between the two is measured
+_MAX_VERIFY_W = 8
+# a whole-chunk verify width would reach _full_rows' host sync, illegal under graph capture
+assert _MAX_VERIFY_W < _WY_CHUNK
 
 
 def _round_up(x: int, m: int) -> int:
@@ -482,8 +486,13 @@ class Backend:
         b, s = q.shape[0], q.shape[1]
         if seq_q_lens is None:
             seq_q_lens = torch.full((b,), s, dtype=torch.int32)
-        if self.arch == "sm90" and s == 1 and "paged_attention_decode" in _resolve(self.precision, self.arch):
-            out = self._paged_attention_decode(q, k_cache, v_cache, block_table, seq_lens, scale)
+        # the M tile is the GQA group at every chain position: a verify width
+        # rides the decode path while g*s still fits it
+        chain = s <= _MAX_VERIFY_W and s * (q.shape[2] // k_cache.shape[1]) <= 128
+        if self.arch == "sm90" and chain and "paged_attention_decode" in _resolve(self.precision, self.arch):
+            out = self._paged_attention_decode(
+                q, k_cache, v_cache, block_table, seq_lens, seq_q_lens, scale
+            )
         elif self.arch == "sm90":
             # pad S to block_M; seq_q_lens keeps the causal window on the true lengths
             block_m = 64 if s >= 64 else 16
@@ -527,30 +536,34 @@ class Backend:
             out = out * torch.sigmoid(self._dev(gate, out.dtype))
         return out
 
-    def _paged_attention_decode(self, q, k_cache, v_cache, block_table, seq_lens, scale):
-        b, h, d = q.shape[0], q.shape[2], q.shape[3]
+    def _paged_attention_decode(self, q, k_cache, v_cache, block_table, seq_lens, seq_q_lens,
+                                scale):
+        b, w, h, d = q.shape
         hkv = k_cache.shape[1]
+        g = h // hkv
+        block_m = _snap_mma_tile(g * w, 128)
+        assert g * w <= block_m, f"GQA group x width {g * w} past the M tile cap {block_m}"
         # split count from the pool's reach (host-static, graph-safe): 64 splits
         # past 64K tokens or when the 16-grid under-fills the SMs
         max_tokens = block_table.shape[1] * k_cache.shape[2]
         wide = 16 * hkv * b < 2 * self._sms and max_tokens >= 64 * k_cache.shape[2]
         ks, sfx = (64, "_64") if (max_tokens > 65536 or wide) else (16, "")
-        key = ("attn_ws", b, hkv, d, ks)
+        key = ("attn_ws", b, hkv, d, ks, block_m)
         ws = self._ones_cache.get(key)
         if ws is None:  # static workspace: graph-capturable
             ws = self._ones_cache[key] = (
-                torch.empty(b, hkv, ks, 16, d, dtype=torch.float32, device=self.device),
-                torch.empty(b, hkv, ks, 16, dtype=torch.float32, device=self.device),
-                torch.empty(b, hkv, ks, 16, dtype=torch.float32, device=self.device),
+                torch.empty(b, hkv, ks, block_m, d, dtype=torch.float32, device=self.device),
+                torch.empty(b, hkv, ks, block_m, dtype=torch.float32, device=self.device),
+                torch.empty(b, hkv, ks, block_m, dtype=torch.float32, device=self.device),
             )
         po, pm, pl = ws
         self._kernel("paged_attention_decode" + sfx)(
-            self._dev(self._c(q.reshape(b, h, d)), torch.bfloat16),
+            self._dev(self._c(q), torch.bfloat16),
             self._dev(k_cache, torch.bfloat16), self._dev(v_cache, torch.bfloat16),
-            self._i32(block_table), self._i32(seq_lens), po, pm, pl, float(scale),
-            int(k_cache.shape[2]),
+            self._i32(block_table), self._i32(seq_lens), self._i32(seq_q_lens),
+            po, pm, pl, float(scale), int(k_cache.shape[2]), block_m,
         )
-        return self._kernel("paged_attention_combine" + sfx)(po, pm, pl, h // hkv).reshape(b, 1, h, d)
+        return self._kernel("paged_attention_combine" + sfx)(po, pm, pl, g, w)
 
     def attention(self, q, k, v, scale, gate=None):
         """Dense causal GQA attention (training path). q/k/v [B,T,H,D]."""
@@ -754,20 +767,25 @@ class Backend:
         )
         return kern("gdn_chunk_o")(q, k, v_new, h, gc, chunk, 1.0), new_state
 
-    def gdn_decode(self, q, k, v, g, beta, pool, slots, layer, **kw):
-        """Decode (T=1) GDN core in one launch, state updated in place in
-        ``pool.states[slots, layer]``; None off sm90 (caller takes the
-        gather -> linear_attn_chunk -> scatter path)."""
-        if "gdn_decode_fused" not in _resolve(self.precision, self.arch):
+    def gdn_decode(self, q, k, v, g, beta, pool, slots, layer, keep_steps=0, **kw):
+        """GDN core for a T-token decode tick in one launch, state updated in
+        place in ``pool.states[slots, layer]``; None off sm90, or when T>1 is
+        not a verify tick whose rows are all T wide (the caller then takes the
+        gather -> linear_attn_chunk -> scatter path). ``keep_steps`` sends the
+        per-chain-step state straight to the pool's step planes, so the verify
+        pays no scatter."""
+        t = q.shape[1]
+        if "gdn_decode_fused" not in _resolve(self.precision, self.arch) or (
+            t > 1 and keep_steps != t
+        ):
             return None
-        slots_i = self._i32(slots).contiguous()
-        out = self._kernel("gdn_decode_fused")(
-            self._c(self._f32(q).squeeze(1)),
-            self._c(self._f32(k).squeeze(1)),
-            self._c(self._f32(v).squeeze(1)),
-            self._c(self._f32(kw["z"]).squeeze(1)),
-            self._c(self._f32(g).squeeze(1)),
-            self._c(self._f32(beta).squeeze(1)),
+        return self._kernel("gdn_decode_fused")(
+            self._c(self._f32(q)),
+            self._c(self._f32(k)),
+            self._c(self._f32(v)),
+            self._c(self._f32(kw["z"])),
+            self._c(self._f32(g)),
+            self._c(self._f32(beta)),
             self._c(self._const_f32(kw["dt_bias"])),
             self._c(self._const_f32(kw["a_log"])),
             self._c(self._const_f32(kw["norm_weight"])),
@@ -775,11 +793,14 @@ class Backend:
             pool.conv_windows,
             pool.win_parity,
             pool.states,
-            slots_i,
+            self._i32(slots).contiguous(),
+            # aliased onto the live planes when ks=0 leaves them unwritten
+            pool.step_states if keep_steps else pool.states.unsqueeze(2),
+            pool.step_windows if keep_steps else pool.conv_windows,
             int(layer),
+            int(keep_steps),
             threads=pool.states.shape[-1],
         )
-        return out.unsqueeze(1)
 
     def flip_window_parity(self, pool, slots) -> None:
         """After a decode tick's last GDN layer: the written planes become live."""

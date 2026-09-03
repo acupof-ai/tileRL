@@ -150,7 +150,6 @@ class _DecodeGraph:
     before any real request reads them.
     # ponytail: captured lazily on the first decode tick (first token pays JIT +
     # capture); capture at engine build is the upgrade.
-    # ponytail: captured lazily on the first decode tick, so first token pays JIT + capture.
     # ponytail: no recapture after training — the graph bakes the f32 embed cast.
     """
 
@@ -576,8 +575,9 @@ class Engine:
         )
         if chains is not None and max(map(len, chains)) == 1:
             chains = None  # the policy kept nothing: a plain decode tick
-        elif chains is not None and self._decode_graph_on:
-            # One graph per (B, width): pad to the widest chain. A repeated pad
+        elif chains is not None:
+            # Pad to the widest chain: one graph per (B, width), and the fused
+            # decode kernels take one width for the whole tick. A repeated pad
             # token is just a draft that gets rejected.
             w = max(map(len, chains))
             for c in chains:

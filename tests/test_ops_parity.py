@@ -437,6 +437,22 @@ def test_paged_attention_vs_naive(backend):
         _naive_paged(q3, k_cache, v_cache, block_table, seq_lens3, scale),
         "paged_attention prefill",
     )
+    # verify widths: one KV read serves the GQA group at every chain position.
+    # 8 query heads over one KV head put the M tile at 32 and 64 rows — both
+    # wide branches, and the tile is what the warp count has to divide.
+    # n=65 is the other axis: n % 64 in [1, W-1] leaves the last KV tile past the
+    # low chain positions' causal bound while its split is still non-empty.
+    k1 = torch.randn(10, 1, block, d).to(kv_dtype)
+    v1 = torch.randn(10, 1, block, d).to(kv_dtype)
+    bt1 = torch.tensor([[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]], dtype=torch.int32)
+    for w, n in ((4, 24), (8, 28), (8, 65)):
+        qw = torch.randn(b, w, 8, d)
+        lens_w = torch.tensor([n, n - 8], dtype=torch.int32)
+        _assert_close(
+            backend.paged_attention(qw, k1, v1, bt1, lens_w, scale),
+            _naive_paged(qw, k1, v1, bt1, lens_w, scale),
+            f"paged_attention verify width {w} len {n}",
+        )
 
 
 # ---------------------------------------------------------------- write tokens
@@ -592,41 +608,51 @@ def test_gdn_chunkwise_matches_serial():
             _assert_close(a, b_, f"gdn chunkwise({chunk}) {name}")
 
 
-def test_gdn_chunk_matches_decode(backend):
-    """The chunk kernel at T=1 equals the decode kernel (sm90 only)."""
+@pytest.mark.parametrize("t", [1, 4])
+def test_gdn_chunk_matches_decode(backend, t):
+    """The chunk kernel equals the in-place decode kernel, per-chain-step planes
+    included, at both a plain decode width and a verify width (sm90 only)."""
     if backend.arch != "sm90":
         pytest.skip("GDN fused kernels are sm90-only")
-    q, k, v, g, beta, z, state, kw = _gdn_inputs(2, 1, 2, 4, 16, 16, 4, 29)
+    q, k, v, g, beta, z, state, kw = _gdn_inputs(2, t, 2, 4, 16, 16, 4, 29)
     f32, bf16, c = backend._f32, backend._bf16, backend._c
     i32 = backend._i32
+    b, nvh, vd = state.shape[0], state.shape[1], state.shape[-1]
     common = (
         f32(kw["dt_bias"]),
         f32(kw["a_log"]),
         f32(kw["norm_weight"]),
         f32(kw["conv1d_weight"]),
     )
-    seq_q = i32(torch.full((q.shape[0],), q.shape[1], dtype=torch.int32))
+    seq_q = i32(torch.full((b,), t, dtype=torch.int32))
     states = f32(state).unsqueeze(1).contiguous()  # pool [B, 1 layer, ...], updated in place
     win = f32(kw["conv_window"]).unsqueeze(1)  # [B, W, D] -> planes [B, 1 layer, 2, W, D]
     windows = torch.stack([win, torch.zeros_like(win)], dim=2).contiguous()
-    par = i32(torch.zeros(q.shape[0], dtype=torch.int32))
+    par = i32(torch.zeros(b, dtype=torch.int32))
+    dstep = torch.empty((b, 1, t, *state.shape[1:]), dtype=torch.float32, device=backend.device)
+    dstepw = torch.empty((b, 1, t, *kw["conv_window"].shape[1:]), dtype=torch.float32,
+                         device=backend.device)
     dout = backend._kernel("gdn_decode_fused")(
-        c(f32(q).squeeze(1)),
-        c(f32(k).squeeze(1)),
-        c(f32(v).squeeze(1)),
-        c(f32(z).squeeze(1)),
-        c(f32(g).squeeze(1)),
-        c(f32(beta).squeeze(1)),
+        c(f32(q)),
+        c(f32(k)),
+        c(f32(v)),
+        c(f32(z)),
+        c(f32(g)),
+        c(f32(beta)),
         *common,
         windows,
         par,
         states,
-        i32(torch.arange(q.shape[0], dtype=torch.int32)),
+        i32(torch.arange(b, dtype=torch.int32)),
+        dstep,
+        dstepw,
         0,
-        threads=state.shape[-1],
+        t,
+        threads=vd,
     )
-    dstate = states[:, 0]
-    dwin = windows[:, 0, 1]  # written to the other plane
+    cstep = torch.empty((b, t, *state.shape[1:]), dtype=torch.float32, device=backend.device)
+    cstepw = torch.empty((b, t, *kw["conv_window"].shape[1:]), dtype=torch.bfloat16,
+                         device=backend.device)
     cout, cstate, cwin = backend._kernel("gdn_chunk_fused")(
         c(bf16(q)),
         c(bf16(k)),
@@ -638,23 +664,21 @@ def test_gdn_chunk_matches_decode(backend):
         bf16(kw["conv_window"]),
         f32(state),
         c(seq_q),
-        # KS=1 dummies, as Backend._gdn_chunk_fused passes them
-        torch.empty((*state.shape[:1], 1, *state.shape[1:]), dtype=torch.float32,
-                    device=backend.device),
-        torch.empty((state.shape[0], 1, *kw["conv_window"].shape[1:]), dtype=torch.bfloat16,
-                    device=backend.device),
-        threads=state.shape[-1],
+        cstep,
+        cstepw,
+        threads=vd,
     )
     # the chunk kernel returns the raw recurrence output; apply the caller's norm + z-gate
-    nvh, vd = state.shape[1], state.shape[-1]
     cout = backend.silu_mul(
-        backend._dev(z, torch.float32).reshape(cout.shape[0], cout.shape[1], nvh, vd),
-        backend.rmsnorm(cout.reshape(cout.shape[0], cout.shape[1], nvh, vd),
+        backend._dev(z, torch.float32).reshape(b, t, nvh, vd),
+        backend.rmsnorm(cout.reshape(b, t, nvh, vd),
                         backend._const_f32(kw["norm_weight"]), 1e-6),
     ).reshape(cout.shape)
-    _assert_close(cout.squeeze(1), dout, "chunk-vs-decode out")
-    _assert_close(cstate, dstate, "chunk-vs-decode state")
-    _assert_close(cwin, dwin, "chunk-vs-decode window")
+    _assert_close(cout, dout, "chunk-vs-decode out")
+    _assert_close(cstate, states[:, 0], "chunk-vs-decode state")
+    _assert_close(cstep, dstep[:, 0], "chunk-vs-decode step states")
+    _assert_close(cwin, windows[:, 0, 1], "chunk-vs-decode window")  # written to the other plane
+    _assert_close(cstepw.float(), dstepw[:, 0], "chunk-vs-decode step windows")
 
 
 def test_gdn_chunk_adjoint_is_exact():
