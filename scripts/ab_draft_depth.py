@@ -49,6 +49,7 @@ from tilerl_kernels.backend import get_backend
 from tilerl import cli
 from tilerl.cli import _build_model
 from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine
+from tilerl.kv_cache import BLOCK_TOKENS
 from tilerl.spec import LADDER_WIDTHS, load_draft
 from tilerl.tokenizer import get_tokenizer
 
@@ -234,9 +235,14 @@ def main() -> None:
     # thread), and each build re-quantizes the draft into new tensors. The graph
     # is captured per (batch, chain width), so each depth is warmed before it is
     # timed and the capture stays outside the window.
-    e = build_engine(cfg, model, be, num_blocks=2048, num_slots=max(batches) + 1,
-                     max_batch=max(batches), max_total_tokens=8192, draft=draft,
-                     spec_depth=max(DEPTHS))
+    # Blocks sized to what the run needs, not a round number. The trunk pool AND the
+    # draft's mirror of it are both num_blocks (spec.py:223), and at B=4 the flat 2048
+    # spent 3.0 GiB of the two on 288 blocks of live context -- which is what the draft's
+    # f32 prefill readout then could not find 1.88 GiB for.
+    need = -(-(args.ctx + args.tokens) // BLOCK_TOKENS) * max(batches) + 8
+    e = build_engine(cfg, model, be, num_blocks=need, num_slots=max(batches) + 1,
+                     max_batch=max(batches), max_total_tokens=args.ctx + args.tokens + 64,
+                     draft=draft, spec_depth=max(DEPTHS))
     for B in batches:
         print(f"\n# B={B}, M=rows x width -> {'/'.join(str(1 + d) for d in DEPTHS)} "
               f"x {B} = {'/'.join(str(B * (1 + d)) for d in DEPTHS)}, "
