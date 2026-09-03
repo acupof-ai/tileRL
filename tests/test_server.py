@@ -127,26 +127,25 @@ def test_completion_nonstream(client, model_id):
     assert body["choices"][0]["finish_reason"] == "length"
 
 
-def test_seedless_requests_decorrelate(client, model_id):
+def test_seedless_requests_decorrelate(client, model_id, monkeypatch):
     """Two seedless requests with the same prompt must not share a sampling
     stream (regression: every seedless request got seed=0, so concurrent
-    same-prompt requests returned byte-identical completions)."""
-    json_body = {
-        "model": model_id,
-        "messages": [{"role": "user", "content": "hi"}],
-        "temperature": 0.7,
-        "max_tokens": 8,
-    }
-    # Six draws, not two: on the tiny model's small vocabulary two 8-token
-    # samples collide often enough to fail a green build. The property is that
-    # the stream is not SHARED — one repeat is chance, six identical is a bug.
-    seen = {
-        client.post("/v1/chat/completions", json=json_body).json()["choices"][0]["message"][
-            "content"
-        ]
-        for _ in range(6)
-    }
-    assert len(seen) > 1, seen
+    same-prompt requests returned byte-identical completions).
+
+    Asserts the seeds the server draws, not the text it returns: at temperature
+    0.7 the tiny model's distribution is peaked enough that six draws came back
+    identical on ubuntu with the seeds all distinct."""
+    from tilerl import server as srv
+
+    seeds = []
+    real = srv.sampling
+    monkeypatch.setattr(srv, "sampling",
+                        lambda *a, **k: (lambda p: (seeds.append(p.seed), p)[1])(real(*a, **k)))
+    body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.7, "max_tokens": 8}
+    for _ in range(4):
+        assert client.post("/v1/chat/completions", json=body).status_code == 200
+    assert len(set(seeds)) == len(seeds) == 4, seeds
 
 
 def test_completion_stream(client, model_id):
