@@ -155,6 +155,10 @@ Re-running this entry's own arithmetic on that:
 | confounded prompt (above) | 3.34 | 0.881 | 2.831 | **1.017x** |
 | random-vocabulary prompt | 2.03 | 0.554 | 1.880 | **0.675x** |
 
+**The 0.675x in that second row is wrong — see the next section.** Break-even is
+not a constant to compare a new yield against; it scales with the `tok/forward` it
+was derived from. The correct figure for that row is 1.111x.
+
 So the REJECT stands and its margin widens from 1.7% to 32%. That matters for how
 much scrutiny the verdict needs, not for its direction: at 1.016x against a 1.16%
 noise floor this was one careful re-measurement away from flipping, and it is now
@@ -168,4 +172,70 @@ Neither prompt is the serving distribution — random vocabulary is the pessimis
 end and consecutive low ids the optimistic one. **The depth default is therefore
 still unsettled**, and settling it needs real text; this entry's verdict does not
 depend on which end is right, because the parallel head loses at both.
+
+## 2026-09-03, third pass: the draft forward is 3.93 ms, not 5.53
+
+The 5.53 ms draft forward, the 25.0% share and the 1.200x ceiling above are all
+**superseded**. Two defects, found in this order.
+
+**One: the depth knob in `scripts/ab_draft_depth.py` is dead in the tree.** It
+moves depth with `e._spec_depth = d`. That attribute was live at `engine.py:893` —
+the chain loop — until `7069a1f` (09-03 15:49) moved the loop onto the head, after
+which nothing reads it. The script's only two commits are both *after* that, so
+**the committed script has never worked**; the 5.53 measurement is dated 09-02 and
+its own table reads 60.93 vs 66.46 for depths 2 and 3, so the knob was live in the
+uncommitted version that produced it. A dead knob does not raise, it returns four
+plausible ticks — so the repair moves both holders of the width (`head.width` and
+`engine._width`, which `graph_keys` and the KV reserve read) and asserts the move
+took. Gate: `test_the_engines_verify_width_is_reachable_from_outside`, negative
+control run (stubbing `set_depth` to a no-op fails it, and nothing else in the
+suite).
+
+**Two, and this is what moved the number: each depth runs a MIXTURE of rungs.**
+`verify_lens` trims every tick's chain from the draft's confidences, so a
+configured depth is an upper bound. Measured per tick at ctx=1024: depth 2 ran 15
+rung-2 ticks and 56 rung-4, depth 3 ran 14 and 55. Subtracting the two depths'
+*mean* ticks moves part of that mixture across a 16.7 ms rung step and charges it
+to the draft. So ticks are now bucketed by their own rung and compared within one:
+
+| | old (mean ticks) | new (rung-4 ticks only) |
+|---|---:|---:|
+| one draft forward | 5.53 ms | **3.93 ms** |
+| depth-3 tick | 66.46 | 61.31 |
+| draft share | 25.0% | **19.2%** |
+| block-parallel ceiling | 1.200x | **1.147x** |
+
+Internal check on the method: verify cost derived independently at depth 2 and
+depth 3 for rung 4 comes out **49.52 ms both times** (56 and 55 ticks). Same rung,
+same verify, two depths — which is what the subtraction assumes, and what the
+mean-tick version asserted without being able to show. The mean-tick subtraction is
+still printed beside it, and the gap (4.54 vs 3.93, +0.61 ms) is the rung mix,
+measured rather than bounded.
+
+**The verdict's arithmetic, restated so the prompt cancels.** The previous pass
+compared a yield re-derived at p=0.554 against the break-even 2.784, which came
+from tpf=3.34 — two prompts in one comparison. Break-even is `tpf × ideal/tick`,
+i.e. proportional to the tok/forward it was measured on, so the only
+prompt-independent form is a ratio:
+
+    verdict = (yield / tok_forward) × ceiling
+
+| tok/fwd | p | yield | decay factor | verdict at the 1.147x ceiling |
+|---:|---:|---:|---:|---:|
+| 3.34 (confounded) | 0.881 | 2.831 | 0.847 | **0.972x** |
+| 2.62 (this pass) | 0.722 | 2.320 | 0.885 | **1.016x** |
+| 2.03 (random vocab) | 0.554 | 1.880 | 0.926 | **1.062x** |
+
+**REJECT stands.** Every arm is inside 6% of parity and the two nearest are inside
+the 1.16% noise floor — on a ceiling that already assumes the parallel head's one
+forward costs exactly what ours does. It does not: DSpark's head is 5 layers /
+1.86B against our 1 layer / 456M, **4.08x the parameters**. Break-even allows that
+forward 9.28 ms against our 3.93 (2.36x), so a head 4x the size clears it only if
+it is >1.7x more efficient per parameter than the head we already run. Nothing in
+the source study suggests that.
+
+Note the direction: the *tighter* draft measurement made the ceiling **worse**
+(1.200 → 1.147), because a cheaper draft is less to remove. The earlier pass had it
+backwards in saying the margin "widens to 32%" — the margin is a few percent, and
+it is the ceiling, not the acceptance, that decides.
 

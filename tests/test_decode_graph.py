@@ -211,3 +211,39 @@ def test_graph_keys_covers_what_a_decode_tick_keys_on():
         f"graph_keys goes past the drafter's settled width {e._width}: "
         f"{sorted({k[1] for k in keys})} — those captures are ~14 s each and dead"
     )
+
+
+def test_the_engines_verify_width_is_reachable_from_outside():
+    """A harness must be able to move a live engine's depth, and see that it moved.
+
+    `scripts/ab_draft_depth.py` prices one draft forward as the difference between
+    two depths, so its whole output is a difference. It set `e._spec_depth`, which
+    was live until 7069a1f moved the chain loop onto the head — after that the
+    assignment hit nothing, and the sweep would have measured ONE config four
+    times and reported drafting as free. A no-op knob does not produce a wrong
+    number, it produces a plausible one, which is why this is a test and not a
+    comment: `_width` on the engine and `width` on the head are the two places a
+    tick reads, and both have to answer.
+    """
+    backend, cfg = get_backend(), tiny()
+    trunk = build_random(cfg, seed=21)
+    head = _draft(cfg, trunk)
+    e = build_engine(cfg, trunk, backend, num_blocks=16, num_slots=3, max_batch=2,
+                     max_total_tokens=256, draft=head, spec_depth=3)
+    assert e._width == 4, f"spec_depth=3 must build width 4, got {e._width}"
+    for depth in (2, 1, 3):
+        head.set_depth(depth)
+        e._width = head.width
+        assert head.width == depth + 1
+        assert e._width == depth + 1
+        # The width has to reach what a tick keys on, or the move is cosmetic.
+        assert max(k[1] for k in e.graph_keys()) == depth + 1, (
+            f"depth {depth} did not reach graph_keys: "
+            f"{sorted({k[1] for k in e.graph_keys()})}"
+        )
+    # And the attribute the broken script wrote is still not one the engine reads,
+    # so a harness that regresses to it fails here rather than on the pod.
+    assert not hasattr(e, "_spec_depth"), (
+        "the Engine grew a _spec_depth attribute; if it is now the depth knob, say "
+        "so here — ab_draft_depth.py was broken for a whole refactor by assuming it"
+    )

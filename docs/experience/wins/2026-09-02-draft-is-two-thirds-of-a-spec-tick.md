@@ -1,9 +1,16 @@
 # Drafting is a quarter of a spec tick, not two thirds — V100 (sm70), 2026-09-02
 
-> Status: SUPERSEDES this file's earlier 55-68% figure, and with it the
-> 1.58-1.83× verdict on block-parallel drafting. Measured draft forward is
-> **5.53 ms, 25% of a depth-3 tick**; the block-parallel ceiling is **1.20×**.
-> Filename kept so existing links resolve.
+> Status: SUPERSEDED 2026-09-03 by
+> [errors/2026-09-03-block-parallel-drafting-is-1.016x-on-sm70.md](../errors/2026-09-03-block-parallel-drafting-is-1.016x-on-sm70.md),
+> third-pass section: **3.93 ms, 19.2% of a depth-3 tick, ceiling 1.147×**. The
+> 5.53 / 25.0% / 1.20× below came from each depth's MEAN tick, and `verify_lens`
+> trims per tick — so each depth ran a mixture of rungs (depth 2: 15 rung-2 ticks
+> and 56 rung-4; depth 3: 14 and 55) and the subtraction moved 16% of all ticks
+> across the 16.73 ms rung step. The isolating-pair *method* below is right; it
+> just has to be applied to same-rung ticks, not to depth means.
+>
+> This file's own earlier 55-68% figure, and the 1.58-1.83× verdict that rested on
+> it, were superseded by the 5.53 pass. Filename kept so existing links resolve.
 
 ## Context
 
