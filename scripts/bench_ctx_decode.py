@@ -47,7 +47,30 @@ def _sync() -> None:
         torch.cuda.synchronize()
 
 
-def measure(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, int]:
+def _prompt(ctx: int, i: int, vocab: int) -> list[int]:
+    """A ctx-token prompt drawn from ONE fixed distribution over the whole vocab.
+
+    Was `range(10 + i*ctx, 10 + (i+1)*ctx)`, which makes the prompt's CONTENT a
+    function of ctx: ctx=1024 read ids 10..1033 (0.4% of the vocab, mostly
+    byte-level and special tokens) while ctx=16384 read 10..16393 (6.6%, real
+    word pieces). Acceptance is a property of what the draft is predicting, so
+    every tok/forward in the sweep mixed "the context is longer" with "the prompt
+    is different" and the two cannot be separated after the fact -- measured
+    2.86 -> 2.03 across that pair, which is 1.41x of a 1.80x rate drop.
+
+    Same generator seed for every ctx, so a shorter prompt is a PREFIX of a
+    longer one in distribution: length is then the only variable.
+    """
+    g = torch.Generator().manual_seed(1000 + i)
+    # Not a default-able argument: vocab=0 would make randint raise from inside a
+    # 20-minute pod run rather than here, and vocab=<too small> would quietly
+    # narrow the distribution -- which is the exact confound this function removes.
+    if vocab < 1024:
+        raise SystemExit(f"_prompt: vocab={vocab} is not this model's vocabulary size")
+    return torch.randint(0, vocab, (ctx,), generator=g).tolist()
+
+
+def measure(e, ctx: int, tokens: int, batch: int = 1, vocab: int = 0) -> tuple[float, float, int]:
     """tok/s and tok/forward over DECODE ticks only.
 
     ``batch`` submits that many concurrent requests, which is the only way a tick
@@ -71,7 +94,7 @@ def measure(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, int
             batches.append(len(decodes))
         return orig(self, decodes, prefills, chunks)
 
-    rids = [e.submit(list(range(10 + i * ctx, 10 + (i + 1) * ctx)),
+    rids = [e.submit(_prompt(ctx, i, vocab),
                      SamplingParams(temperature=0.0, max_new_tokens=tokens, seed=0))
             for i in range(batch)]
     # poll() DRAINS _finished for every request, so anything it returns must be kept:
@@ -161,7 +184,7 @@ def measure(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, int
     return n / wall, n / max(fwd, 1), n
 
 
-def timed(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, str]:
+def timed(e, ctx: int, tokens: int, batch: int = 1, vocab: int = 0) -> tuple[float, float, str]:
     """Warm this context, then measure it, and flag an unwarmed reading.
 
     A speculative run captures a CUDA graph per (batch, chain width), and a
@@ -175,9 +198,9 @@ def timed(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, str]:
     Flags rather than raises: a SystemExit here leaves the engine holding the
     whole card, and the orphan is invisible until the next run OOMs.
     """
-    measure(e, ctx, tokens, batch)
-    warm, _, _ = measure(e, ctx, tokens, batch)
-    tps, per_fwd, _ = measure(e, ctx, tokens, batch)
+    measure(e, ctx, tokens, batch, vocab)
+    warm, _, _ = measure(e, ctx, tokens, batch, vocab)
+    tps, per_fwd, _ = measure(e, ctx, tokens, batch, vocab)
     return tps, per_fwd, " UNWARMED" if tps > 2 * warm else ""
 
 
@@ -260,9 +283,36 @@ def main() -> None:
     print(f"\n{label} B={args.batch} ({rows} rows/tick): "
           f"{'ctx':>6} {'tok/s':>8} {'ms/tok':>8} {'tok/fwd':>8}")
     for ctx in ctxs:
-        tps, per_fwd, flag = timed(e, ctx, args.tokens, args.batch)
+        tps, per_fwd, flag = timed(e, ctx, args.tokens, args.batch, cfg.vocab_size)
         print(f"{ctx:>6} {tps:>8.1f} {1000 / tps:>8.1f} {per_fwd:>8.2f}{flag}")
 
 
+def _self_check() -> None:
+    """The prompt must depend on ctx only through its LENGTH.
+
+    Runs on the GPU-less box, before a 20-minute pod job: the old prompt was
+    `range(10 + i*ctx, ...)`, so ctx also chose which slice of the vocabulary the
+    draft had to predict, and the acceptance column mixed two causes with no way
+    to separate them afterwards. errors/2026-09-03-the-context-sweep-changed-the-prompt.md
+    """
+    V = 248320
+    short, long = _prompt(1024, 0, V), _prompt(16384, 0, V)
+    assert short == long[:1024], "a shorter prompt must be a prefix of a longer one"
+    # The distributions must agree, which the old prompt's did not: mean id 522 vs 8202.
+    m_s, m_l = sum(short) / len(short), sum(long) / len(long)
+    assert abs(m_s / m_l - 1) < 0.10, f"prompt distribution shifts with ctx: {m_s} vs {m_l}"
+    assert _prompt(64, 0, V) != _prompt(64, 1, V), "each request needs its own prompt"
+    try:
+        _prompt(64, 0, 0)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("vocab=0 must be refused here, not inside a pod run")
+    print("bench_ctx_decode: prompt depends on ctx only through length")
+
+
 if __name__ == "__main__":
-    main()
+    if "--self-check" in sys.argv:
+        _self_check()
+    else:
+        main()
