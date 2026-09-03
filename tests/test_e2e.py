@@ -1044,9 +1044,23 @@ def test_a_batch_between_rungs_warns_about_its_padding():
     # The suggestion the guard prints must itself fill the rung, not restate the problem.
     src = (Path(__file__).resolve().parent.parent / "src/tilerl/engine.py").read_text()
     assert "rows not in LADDER_WIDTHS" in src, "engine must warn between rungs, not only past the top"
-    assert "are padding; use max_batch=" in src, "the warning must name the batch that fills the rung"
-    for w in (2, 4):  # verify widths that divide the top rung
-        assert 32 % w == 0 and rung(32 // w * w) == 32, f"width {w}: suggestion lands off-rung"
+    assert "are padding" in src, "the warning must say how much of the launch is wasted"
+
+    # A suggestion is only possible when the verify width DIVIDES the rung. Depth 3 (W=4)
+    # does, which is why testing only depth 3 hid this: at depth 2 (W=3) NO batch lands on
+    # a rung, and `rung // W` names 10 -- 30 rows, which pads too. The guard must stay
+    # silent there and let the depth warning carry it.
+    for depth, expect_fix in ((1, True), (2, False), (3, True), (7, True)):
+        w = 1 + depth
+        between = [b for b in range(2, 12) if (b * w) not in LADDER_WIDTHS and b * w < 32]
+        assert between, f"depth={depth}: nothing in the padding band to check"
+        for b in between:
+            up = next(x for x in LADDER_WIDTHS if x > b * w)
+            fills = up % w == 0
+            assert fills == expect_fix, f"depth={depth} max_batch={b}: divisibility {fills}"
+            if fills:
+                assert (up // w) * w in LADDER_WIDTHS, f"depth={depth}: suggestion still pads"
+    assert 'if rung % w == 0 else ""' in src, "the guard must withhold an impossible suggestion"
 
 
 def test_generate_fans_a_corpus_across_workers(tmp_path):

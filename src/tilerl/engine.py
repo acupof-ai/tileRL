@@ -326,7 +326,8 @@ class Engine:
                     f"{next(w for w in LADDER_WIDTHS if w > 1 + spec_depth) - 1}",
                     stacklevel=2,
                 )
-            rows = limits.max_batch * (1 + spec_depth)
+            w = 1 + spec_depth
+            rows = limits.max_batch * w
             if backend.arch == "sm70" and rows > max(LADDER_WIDTHS):
                 # The rung is chosen on ROWS, and a verify tick submits B*W of
                 # them (backend.py M = x2.shape[0]), which the width check above
@@ -345,11 +346,13 @@ class Engine:
                 # real one (7.53 vs 2.29 ms), so B=4 depth 3 -- 16 rows on the 32
                 # rung -- measures 42.7 tok/s where B=8's full rung gets 75.0.
                 rung = next(w for w in LADDER_WIDTHS if w > rows)
+                # Only advise a batch when the width divides the rung. At depth 2 (W=3)
+                # NO batch lands on a rung, and rung // W would name one that also pads.
+                fix = f"; use max_batch={rung // w} to fill it" if rung % w == 0 else ""
                 warnings.warn(
-                    f"max_batch={limits.max_batch} x verify width {1 + spec_depth} = {rows} "
+                    f"max_batch={limits.max_batch} x verify width {w} = {rows} "
                     f"rows launches the {rung}-row rung, so {rung - rows} of every "
-                    f"{rung} rows are padding; use max_batch={rung // (1 + spec_depth)} "
-                    f"to fill it",
+                    f"{rung} rows are padding{fix}",
                     stacklevel=2,
                 )
             self._draft_kv = PagedKvPool(

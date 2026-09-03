@@ -58,13 +58,13 @@ def measure(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, int
     and so reads ~batch no matter how wide the tick was.
     """
     rows: list[int] = []
-    reqs: list[int] = []
+    batches: list[int] = []
     orig = type(e)._run_forward
 
     def spy(self, decodes, prefills, chunks):
         if decodes and not prefills:
             rows.append(sum(1 + len(r.drafts) for r in decodes))
-            reqs.append(len(decodes))
+            batches.append(len(decodes))
         return orig(self, decodes, prefills, chunks)
 
     rids = [e.submit(list(range(10 + i * ctx, 10 + (i + 1) * ctx)),
@@ -140,8 +140,10 @@ def measure(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, int
     # with B. It killed a healthy B=8 run at 28 rows (8 requests, 4 drafts trimmed).
     # The claim worth checking is "did B requests actually decode together", which the
     # trim cannot affect.
-    if reqs and max(reqs) < batch:
-        raise SystemExit(f"ctx={ctx}: widest tick had {max(reqs)} requests, expected "
+    # Named `batches`, not `reqs`: the admission check below rebinds `reqs` to a list of
+    # _Req objects, and max() over those raises TypeError instead of comparing counts.
+    if batches and max(batches) < batch:
+        raise SystemExit(f"ctx={ctx}: widest tick had {max(batches)} requests, expected "
                          f"{batch}; this is not the batch it claims to be")
     if rows and max(rows) < batch:  # a chain trimmed to nothing still submits 1 row each
         raise SystemExit(f"ctx={ctx}: widest tick was {max(rows)} rows for {batch} "
