@@ -373,6 +373,54 @@ def test_backward_streaming_matches_collecting():
     assert worst == 0.0, f"streamed gradients differ by {worst:.3e}"
 
 
+#: Backend calls a training forward makes that carry no gradient. State plumbing
+#: moves the recurrent state in and out of the pool; neither is a differentiable op.
+_GRADIENT_FREE = {"state_gather", "state_scatter"}
+
+
+def test_every_op_the_training_forward_calls_is_on_the_tape():
+    """A backend method missing from ``_BWD`` loses its gradient in silence.
+
+    ``RecordingBackend.__getattr__`` returns the raw attribute for any name not in
+    ``_BWD``, so an op added without registering it records nothing -- no error,
+    no warning, and forward parity, the CPU twin and any output-level gate all
+    still pass. Only a gradcheck on that specific op would catch it, and a
+    gradcheck is written for the op you know about.
+
+    This asserts the population instead: every op a training forward actually
+    calls is either on the tape or named gradient-free above."""
+    from tilerl.autograd import _BWD
+    from tilerl.train import _training_kv
+
+    called: list[str] = []
+
+    class _Spy(RecordingBackend):
+        def __getattr__(self, name):
+            attr = super().__getattr__(name)
+            if not callable(attr) or name.startswith("_"):
+                return attr
+
+            def logged(*args, **kwargs):
+                called.append(name)
+                return attr(*args, **kwargs)
+
+            return logged
+
+    backend = get_backend()
+    model = build_random(tiny(), seed=0)
+    ids, pos = np.array([[1, 2, 3, 4]]), np.arange(4)
+    with Tape():
+        model.forward(ids, pos, _training_kv(model, 1, 4, device=backend.device), _Spy(backend))
+
+    untracked = sorted(set(called) - set(_BWD) - _GRADIENT_FREE)
+    assert not untracked, (
+        f"{untracked} run in a training forward and are not in _BWD, so the tape records "
+        "nothing for them and their gradient is silently zero. Register a backward, or add "
+        "them to _GRADIENT_FREE with the reason."
+    )
+    assert set(called) & set(_BWD), "the spy saw no tape op at all; it is not wrapping anything"
+
+
 def test_tape_gradcheck():
     """Tape backward vs central finite differences on rmsnorm+linear+CE, in f32
     (bf16 swamps a 1e-3 step)."""
