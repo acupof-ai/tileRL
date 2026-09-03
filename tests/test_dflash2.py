@@ -413,8 +413,8 @@ def test_engine_block_equals_the_full_context_block(tmp_path):
     model, taps = head.trunk, head.dcfg.target_layers
     engine = build_engine(
         tiny(), model, backend, num_blocks=64, num_slots=4, max_batch=4,
-        max_total_tokens=256, draft=head, decode_graph=False,
-        prefix_store=NoPrefixStore(),
+        max_total_tokens=256, max_num_batched_tokens=4, draft=head, decode_graph=False,
+        prefix_store=NoPrefixStore(),  # 4: the prompt spans two prefill chunks
     )
     seen: list[tuple[list[int], list[int]]] = []
     inner = engine._draft_block
