@@ -80,8 +80,8 @@ def copeland_scores(n: int, verdicts: dict[tuple[int, int], str],
     return [lo + (hi - lo) * rank[w] / (len(spread) - 1) for w in wins]
 
 
-def judgement_rows(group_id: str, verdicts: dict[tuple[int, int], str],
-                   subgroup: str, orders: dict[tuple[int, int], tuple[str, str]],
+def judgement_rows(group_id: str, subgroup: str,
+                   orders: dict[tuple[int, int], tuple[str, str]],
                    test_winner: dict[tuple[int, int], str | None] | None = None
                    ) -> list[dict[str, Any]]:
     """The JSONL rows aupai's ``eval/pairwise_judge.py`` scores.
@@ -90,17 +90,21 @@ def judgement_rows(group_id: str, verdicts: dict[tuple[int, int], str],
     on ``mixed`` pairs (where tests are a real gold standard) and production
     runs inside a subgroup, and a file that cannot tell them apart cannot be
     validated -- a tie-everything judge scored 1.0 before that field existed.
+
+    The scorer derives the verdict from ``order_ab``/``order_ba`` itself, which
+    is why a resolved verdict is not a field here: passing one changed nothing,
+    measured -- the real verdicts, ``{}`` and garbage all produced identical rows.
     """
-    rows = []
-    for (i, j), (ab, ba) in sorted(orders.items()):
-        rows.append({
+    return [
+        {
             "pair_id": f"{group_id}:{i}v{j}",
             "order_ab": ab,
             "order_ba": ba,
             "test_winner": (test_winner or {}).get((i, j)),
             "subgroup": subgroup,
-        })
-    return rows
+        }
+        for (i, j), (ab, ba) in sorted(orders.items())
+    ]
 
 
 def judge_rewards(rollouts: list[Any], passed: list[bool],
@@ -137,7 +141,7 @@ def judge_rewards(rollouts: list[Any], passed: list[bool],
         local_scores = copeland_scores(len(members), verdicts, band)
         for i in members:
             scores[i] = local_scores[local[i]]
-        rows += judgement_rows(group_id, verdicts, name, orders)
+        rows += judgement_rows(group_id, name, orders)
     return scores, rows
 
 
