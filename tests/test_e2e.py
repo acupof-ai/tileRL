@@ -77,6 +77,34 @@ def test_restriction_is_the_same_batched_as_per_row():
             assert torch.equal(batched[i], _restrict(logits[i], p)), (p, i)
 
 
+def test_rows_that_cut_differently_take_the_per_row_path():
+    """The batched restriction is an optimisation for the case every row cuts the
+    same way; rows that differ fall back to per-row. Nothing else builds a batch
+    with differing params, so the fallback shipped unexercised -- and it fails
+    silently, by cutting every row to row 0's rule and still sampling.
+    """
+    eng = _build_engine(seed=3)
+    v = tiny().vocab_size
+    torch.manual_seed(11)
+    logits = torch.randn(2, v, device=eng._backend.device)
+
+    class _R:
+        def __init__(self, params):
+            self.params = params
+
+    wide = SamplingParams(temperature=0.0, top_k=0, seed=5)
+    narrow = SamplingParams(temperature=0.0, top_k=1, seed=5)
+    # row 1's argmax must survive its own top_k=1; row 0 is unrestricted
+    mixed = eng._sample_batch([(_R(wide), logits[0], 0), (_R(narrow), logits[1], 0)])
+    alone = [eng._sample_batch([(_R(p), logits[i], 0)])[0]
+             for i, p in enumerate((wide, narrow))]
+    assert mixed == alone, (mixed, alone)
+
+    # negative control: the uniform path and the fallback must agree when they can
+    both_narrow = eng._sample_batch([(_R(narrow), logits[0], 0), (_R(narrow), logits[1], 0)])
+    assert both_narrow == [eng._sample_batch([(_R(narrow), logits[i], 0)])[0] for i in range(2)]
+
+
 def test_generate():
     """Same seed -> identical tokens, different seed -> different tokens."""
     engine = _build_engine(seed=1234)
