@@ -13,15 +13,19 @@ The short version. We are **stricter than both on on-policy discipline** and
 that is the structural bet the whole project rests on. Our sampler was truncated
 (`top_k=20`, `top_p=0.8`, `T=0.7`) while the gradient was taken under the full
 softmax, which biased every step run before 2026-09-03; **RL rollouts now draw
-untruncated, so the sampler is the policy.** That is a waypoint, not the
-destination — using the card's sampler in RL needs the rollout's kept set carried
-into the gradient, which three stacks shipped in the month before this was
-written and we have not. Our memory story is where both stacks did engineering
-and we did none, and it is why `grpo-gsm8k-27b` cannot finish a step.
+untruncated, so the sampler is the policy.** That is the estimator we keep, not a
+stepping stone: scored on the deployed sampler it beats both the status quo and
+the gradient-under-q alternative, and gradient-under-q is identically zero
+wherever the nucleus collapses to one token. Mask transport remains on the
+roadmap for what it buys — training under the card's sampler at all — not for
+reward. Our memory story is where both stacks did engineering and we did none,
+and it is why `grpo-gsm8k-27b` cannot finish a step.
 
-§2 has been amended twice since it was first written; both amendments are against
-the original text. Its claim of having no precedent was wrong, and its claim that
-we had the ingredients for importance weighting was half wrong — the ingredient
+§2 has been amended three times since it was first written; every amendment is
+against the original text. Its claim of having no precedent was wrong; its claim
+that we had the ingredients for importance weighting was half wrong — the
+ingredient was defective; and its first amendment called untruncated sampling a
+waypoint to mask transport, which the measurement below contradicts.
 was defective.
 
 ---
@@ -79,20 +83,83 @@ transport lands.
 rollouts** (`train.untruncated`, forced in `grpo_loop`), which makes the sampler
 the policy by construction. Serving keeps the card's values.
 
+### Untruncated sampling is the estimator, not a waypoint
+
+The first version of this section called it a waypoint on the way to mask
+transport. That was wrong and it is the kind of wrong a reader acts on — someone
+schedules mask transport expecting reward to improve. It will not.
+
+**The measurement that settles it grants the mask-transport case entirely.** Its
+premise is that `E_q[A]` is the objective, because q is what we deploy. So train
+each arm and then score it by **generating with the deployed sampler**
+(`T=0.7/p=0.8/k=20`). Tiny cfg, 12 steps, group 6, `AdamW(lr=0.05)`, 48
+completions per eval, 5 model seeds, reward from `tests/test_rl.py:99`:
+
+| arm | run 1 | run 2 (independent) |
+|---|---|---|
+| status quo: truncated rollout, gradient under π | +0.356 | +0.236 |
+| **untruncated rollout** | **+0.456** | **+0.556** |
+| truncated rollout, gradient under q | not run | +0.290 |
+
+**The ordering reproduced. The multipliers did not** — the same comparison gave
+1.28x and 2.36x, so no multiplier is quoted here. Run 1 had untruncated sampling
+regress on **1 of 5 seeds** (−0.149); run 2 reported 0 of 5. A claim of "no
+regressing seeds" that one of two runs contradicts does not belong in a document.
+`pending-remote`: this is the tiny model, 12 steps, 5 seeds.
+
+**If the 27B disagrees with this table, the table is superseded, not the
+argument.** What these runs establish is a direction, not a size — one
+reproduction of the margin came out 1.8x off the other. The structural result
+below does not depend on a seed or a model, so it survives a disagreeing 27B
+number; the reward rows do not.
+
+**The structural half needs no seed, and it is the stronger argument.**
+Differentiating q gives, at the logit level, `q*A − E_q[A]*q`. When the nucleus is
+a single token q is a point mass and that expression is **identically zero** — the
+whole position contributes nothing. Measured at 8 of 12 tiny positions under the
+card's sampler (3 of 12 with thinking on at `T=1.0/p=0.95`, 0 of 12 untruncated).
+Not "the tail gets no gradient": the position gets no gradient.
+
+The cleanest case: a token just outside the nucleus with π=0.024, q=0. The true
+gradient pushes it **up** (+0.062). The pre-fix gradient pushes it **down**
+(−0.014). Gradient-under-q leaves it at **exactly 0**, permanently — a token q can
+never draw is a token that estimator can never promote. So the model cannot learn
+to stop being confident about a token it is confidently wrong about.
+
+Gradient-under-q *is* unbiased for `E_q[A]` — verified, cosine 1.0000 against the
+analytic ∇log q, the `1/T` factor being the only scale difference. The objection
+is not that its math is wrong. It is that `E_q[A]` is not the objective the
+rewards define, and it vanishes exactly where truncation bites.
+
+**What mask transport is still for.** Training under the card's sampler at all,
+which is a real thing to want if a run must be trained on the distribution it
+serves. It is not an upgrade over untruncated sampling on reward. Kept on the
+roadmap with that justification.
+
+**One structural note for whoever picks this up.** Mask transport and importance
+weighting both collide with the micro-batching work on the same three lines —
+`rl_step`'s signature, `grad_fn`'s signature, and the `rl_step` call in
+`grpo_loop` — where untruncated sampling touches none of them. Neither needs a new
+backend op (the masked gradient is the shipped CE op on masked tempered logits,
+1.6e-08 against analytic ∇log q) and neither owes a CPU twin: `sample_batch` is
+not in `registry.py`'s `_CPU_KERNELS`, and `RefBackend.sample_batch is
+reference.sample_batch`, so a new keyword reaches the CPU path with no change to
+`testing.py`.
+
 **`opd_loop` needs no equivalent, and this is not an oversight.** It takes plain
 cross-entropy on the teacher's sampled sequence through `train_step` — maximum
 likelihood on given tokens, not a score-function estimator. The teacher's
 truncation chooses *which* completions to distill, a data-quality decision; there
 is no measure to mismatch. `untruncated()` belongs in `grpo_loop` alone.
 
-**How far the bias went, measured.** Not reversed — attenuated and rotated. Over
-6 configurations (3 model seeds x 2 prompt sets), 64 advantage draws per position:
-mean projection of the shipped gradient onto the true policy gradient **0.72–0.90**
-(so roughly 20% of the magnitude lost), cosine down to 0.20 at the worst
-positions, and **~11% of individual advantage draws** give a negative projection.
-Positions where the projection is negative for a *majority* of draws: 0/12 in every
-configuration. An earlier single-draw probe reported 2/12 and that was its own
-variance.
+**How far the pre-fix bias went, measured.** Not reversed — attenuated and
+rotated. Over 6 configurations (3 model seeds x 2 prompt sets), 64 advantage draws
+per position: mean projection of the shipped gradient onto the true policy
+gradient **0.72–0.90** (so roughly 20% of the magnitude lost), cosine down to 0.20
+at the worst positions, and **~11% of individual advantage draws** give a negative
+projection. Positions where the projection is negative for a *majority* of draws:
+0/12 in every configuration. An earlier single-draw probe reported 2/12; that was
+its own variance.
 
 **Three ways out, not two, and the third is where the field went.** This section
 originally read as if tileRL were alone here. It is not — the row was written
@@ -259,8 +326,8 @@ the 27B recipe has never completed a run. Flag, not a verdict.
 | stricter than both | on-policy discipline: no weight sync, no prefix cache, no captured graph (§1) |
 | ahead of both, pending a caveat | a tied-group gate rather than a log line — but a sparse reward ties every group, so it fires benignly on step 1 (§4) |
 | aligned on purpose | loss normalization, group-std advantages, no KL, no prompt truncation |
-| **fixed 2026-09-03** | the sampler is now the policy: RL rollouts draw untruncated (§2). Waypoint — the destination is mask transport |
-| behind the field, next | mask transport, so the card's sampler can be used in RL. Three stacks shipped it in the month before (§2) |
+| **fixed 2026-09-03** | the sampler is now the policy: RL rollouts draw untruncated (§2). The estimator we keep — it also wins on the deployed-sampler metric |
+| deferred, and not for reward | mask transport, which buys training under the card's sampler, not a better reward than untruncated sampling. Three stacks shipped it in the month before (§2) |
 | closed with numbers | importance weighting: 97.2% of π's mass outside q's support, ESS 1.74/8 at L=256, clips fire at 0.0% (§2) |
 | omission, blocks runs today | no gradient checkpointing, no micro-batching, five vocab-sized tensors per step (§5) |
 | omission, cheap | no LR schedule; no clipped-completion metric |
