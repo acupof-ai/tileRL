@@ -41,6 +41,12 @@ tighter than this harness's own run-to-run noise on *different* code, and I reco
 agree to 0.5% over a 128× context sweep are usually the same binary, and that reading was
 available without any new measurement.
 
+That table now has exactly one legitimate use: it is **the harness's noise floor**, since
+it is one kernel measured twice. Worst deviation **1.16%**, spread 1.16 points. So the 2%
+threshold committed for the corrected run sits at 1.7× the noise floor, and a real ncols
+effect at 16 rows has to clear ~1.2% to be distinguishable at all — which is the number
+that makes "the arms agreed too well" a quantitative claim rather than a hunch.
+
 Second time today an A/B compared a kernel against itself. The first was `ncols` passed
 positionally onto `abl`
 ([`errors/2026-09-03-the-ab-measured-abl-not-ncols.md`](2026-09-03-the-ab-measured-abl-not-ncols.md)),
@@ -73,13 +79,21 @@ also turns on". At B=1, W=8 is **8 rows on the 8 rung**, and `ncols` was off the
 
 `--batch N` on `bench_ctx_decode.py`, submitting N concurrent requests, with the reason in
 the docstring so the next reader does not have to rediscover that `max_batch` is a ceiling.
+Getting it to actually run took three more fixes, each found before it produced a number:
+`num_slots` had to exceed `max_batch` because a padded tick permanently keeps one state slot
+([`2026-09-03-num-slots-equals-max-batch-is-one-short.md`](2026-09-03-num-slots-equals-max-batch-is-one-short.md)),
+`precapture()` had to be called because B=4 needs **12** decode graphs (102 s) against B=1's
+4, and `--max-ctx` had to exist because B=4 **OOMs from ctx≥512** on this 32 GB card. The
+corrected A/B therefore runs at ctx=32 — which is where the question is sharpest anyway,
+since dense decode is fastest there and depth 3 already measured a 12% loss.
 
 The guard is a test, because this failure is silent by construction — a too-narrow tick
 produces plausible numbers rather than an error.
 `tests/test_e2e.py::test_a_verify_tick_submits_batch_times_width_rows` spies on
 `_run_forward` and asserts the widest pure-decode tick exceeds 4 rows with 4 concurrent
 requests. **Negative control verified**: with one request the widest tick is exactly 4
-rows and the assertion fails, which is the harness this entry is about.
+rows and the assertion fails, which is the harness this entry is about. `measure()` carries
+the same check inline, against `batch * width`.
 
 ## Rule
 
@@ -112,3 +126,7 @@ this entry will carry its numbers.
 | 2026-09-03 | 659b745 | V100 | cuda sm70 | qwen38-27b | **#36's spec-ncols "wash"** | **withdrawn — one path measured twice** |
 | 2026-09-03 | 659b745 | V100 | cuda sm70 | qwen38-27b | cost line's variable | **chain width at B=1, not launched rows** |
 | 2026-09-03 | 659b745 | V100 | cuda sm70 | qwen38-27b | new test, negative control | B=1 widest tick 4 rows → assertion fails |
+| 2026-09-03 | ae268d0 | V100 | cuda sm70 | qwen38-27b | **harness noise floor** (one kernel, twice, 5 ctx) | **worst 1.16% — so the 2% threshold is 1.7× it** |
+| 2026-09-03 | ae268d0 | V100 | cuda sm70 | qwen38-27b | B=4 tok/forward @ctx32 vs B=1 | 9.84 vs 2.44 = **2.46 vs 2.44 per request** (batching only) |
+| 2026-09-03 | ae268d0 | V100 | cuda sm70 | qwen38-27b | decode graphs to capture, B=4 vs B=1 | **12 (102 s) vs 4** — why the first row read UNWARMED |
+| 2026-09-03 | ae268d0 | V100 | cuda sm70 | qwen38-27b | B=4 memory ceiling on 32 GB | **OOMs from ctx≥512**; 1.50 GiB wanted, 0.69 free |
