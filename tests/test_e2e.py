@@ -77,6 +77,33 @@ def test_restriction_is_the_same_batched_as_per_row():
             assert torch.equal(batched[i], _restrict(logits[i], p)), (p, i)
 
 
+def test_rows_that_cut_differently_take_the_per_row_path():
+    """Rows whose (allowed_ids, top_k) differ fall back to per-row restriction.
+    Nothing else in the suite builds such a batch, so the fallback shipped
+    unexercised, and it fails silently: cutting every row to row 0's rule still
+    samples. The two rules disagree on purpose -- one row's allowed_ids exclude
+    that row's own argmax -- so row 0's rule applied to the batch moves a token."""
+    eng = _build_engine(seed=3)
+    v = tiny().vocab_size
+    torch.manual_seed(11)
+    logits = torch.randn(2, v, device=eng._backend.device)
+
+    class _R:
+        def __init__(self, params):
+            self.params = params
+
+    top = logits.argmax(-1).tolist()
+    wide = SamplingParams(temperature=0.0, seed=5)
+    narrow = SamplingParams(temperature=0.0, seed=5,
+                            allowed_ids=tuple(i for i in range(v) if i != top[1]))
+    for a, b in ((wide, narrow), (narrow, wide)):
+        rows = [(_R(a), logits[0], 0), (_R(b), logits[1], 0)]
+        assert eng._sample_batch(rows) == [eng._sample_batch([r])[0] for r in rows], (a, b)
+
+    # the assertions above only bite because the rules disagree on row 1
+    assert eng._sample_batch([(_R(narrow), logits[1], 0)])[0] != top[1]
+
+
 def test_generate():
     """Same seed -> identical tokens, different seed -> different tokens."""
     engine = _build_engine(seed=1234)
