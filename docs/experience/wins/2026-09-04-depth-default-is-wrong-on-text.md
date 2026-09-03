@@ -1,7 +1,11 @@
-# The spec depth default is wrong on text: depth 1 beats depth 3 by 1.266x — sm70, 2026-09-04
+# The spec depth winner flips with the corpus: depth 1 on wikitext, 3 on GSM8K — sm70, 2026-09-04
 
-> Status: measured, default NOT flipped. The flip needs the ncols=2/B=4 kernel
-> (task #40) priced first, because every number here is B=1 ncols=1.
+> Status: measured, default NOT flipped and now believed CORRECT as shipped for
+> reasoning traffic. The title of this file said "wrong on text" when it was written
+> against wikitext alone; the same-day section at the bottom corrects that with a
+> GSM8K acceptance number, and the filename is kept so links resolve.
+>
+> Every number here is B=1 ncols=1. Task #40 is the B-axis measurement.
 
 ## Context
 
@@ -55,10 +59,16 @@ distribution we serve.
 
 ## Rule
 
-Quote acceptance with the corpus it was measured on, and settle a depth or width
-default on text only. A cost measured on any prompt transfers (1.001-1.036x here);
-an acceptance measured on synthetic ids transfers to nothing, and it inverted this
-default.
+Quote acceptance with the corpus it was measured on, and never carry a
+depth or width default from one corpus to another. A cost measured on any prompt
+transfers (1.001-1.036x across corpora here, 2.5% across runs); an acceptance does
+not transfer at all — synthetic ids, wikitext and GSM8K give p = 0.81 / 0.59-0.69 / 0.92
+at the widths each was measured on, and depth 1 wins at the first two while depth 3
+wins at the third.
+
+The corollary that cost me a headline: **"real text" is not one distribution.**
+Replacing synthetic ids with wikitext felt like the end of the question and was only
+the end of one arm of it. One corpus licenses a statement about that corpus.
 
 Second: two runs of the identical command, or the number is not a number. The first
 wikitext run read 97.28 ms and 24.3 tok/s at depth 3 against 61.70 and 38.3 for the
@@ -68,6 +78,60 @@ a *negative* verify cost (-24.33 ms), which is what caught it; had the contentio
 been 20% instead of 58% the run would have published a plausible depth curve.
 `ab_draft_depth.py` now samples SM clock, throttle reasons and load per depth, and
 prints per-passage rows, so a contaminated run says so.
+
+Third, and it is a defect I introduced: **repeating one prompt is not repeating the
+measurement.** Adding `--batch` replaced `for p in prompts` with `prompts[:B]`, so at
+B=1 the four "per-passage" rows all measured passage 0 and printed 2.49 four times.
+Identical rows read as a clean instrument and are actually a stuck one — they hid the
+15.8% between-passage spread that is the only honest error bar on any p here. The
+script now cuts `prompts` into disjoint groups of B, refuses a `--prompts` that is not
+a multiple of `--batch`, and prints the group count so a single-group run says on its
+own header that it shows no spread.
+
+## 2026-09-04, same day: the winner flips with WHICH text, and one corpus is not "text"
+
+A peer session measured the same B=1 config on **GSM8K** with real generated
+continuations: 6.12 tok/forward at W=8, i.e. **p = 0.922** per position. Wikitext at
+W=4 reads 2.36 as a 3-passage mean, and its three passages read **2.49 / 2.44 /
+2.15** individually — a **15.8% between-passage spread**, p = **0.689 / 0.676 /
+0.592**. That spread is the resolution limit on any corpus-based depth claim. The two
+corpora differ by 1.43x at W=4 (3.55 vs 2.49 tok/fwd), well outside it.
+
+Run-to-run, by contrast, is nil: a re-run of passage 0 read 2.49 to three digits,
+the same value the first run read. Cost repeats, acceptance does not — and the
+variation is across passages, not across runs.
+
+Applying both acceptance regimes to **this entry's own measured tick costs** (an
+independent B=1 re-run: 35.04 / 56.39 / 61.42 / 99.61 ms at depths 1-4, reproducing
+the table above to within 2.5%):
+
+| depth | W | tok/s at p=0.689 (best wikitext passage) | tok/s at p=0.592 (worst) | tok/s at p=0.922 (GSM8K) |
+|---:|---:|---:|---:|---:|
+| **1** | 2 | **48.2** | **45.4** | 54.8 |
+| 2 | 3 | 38.4 | 34.4 | 49.1 |
+| **3** | 4 | 40.5 | 35.0 | **57.9** |
+| 4 | 5 | 27.3 | 22.8 | 42.9 |
+
+**The depth winner flips: 1 on wikitext, 3 on GSM8K** — and depth 1 wins on wikitext
+by 1.19x on its most-predictable passage and 1.30x on its least, so the 15.8%
+acceptance spread does not reach the flip. The corpus does. So this entry's headline
+— "the depth default is wrong on text" — is too strong, and is corrected here: it is
+wrong on *wikitext*, and right as shipped on GSM8K. The shipped default of 3 is the
+better choice for the reasoning traffic this stack is being built for.
+
+Why the sign is what it is: GSM8K completions are the model's own arithmetic
+scaffolding, highly self-predictable; wikitext is encyclopedic prose the draft head
+has to guess at. A 1-layer MTP head does much better on the former. Nothing here
+measures chat, code, or a mixed workload, and those are what a served default
+actually faces.
+
+**What this leaves standing, and it is the useful half:** tick cost is
+prompt-independent (measured within 3.6% across corpora, and 2.5% across two runs of
+the same one), so the cost column transfers and only acceptance has to be re-measured
+per distribution. The rung mechanism is also unchanged — depth 3 costs **1.753x**
+depth 1's tick because W=4 crosses rung 2 → 4, whatever the acceptance is. What is
+*not* established by any measurement here is a single depth default; that needs the
+serving mix, not another corpus.
 
 ## What this does NOT license
 

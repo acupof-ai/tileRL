@@ -111,10 +111,18 @@ def measure(e, prompts: list[list[int]], tokens: int) -> tuple[float, float, flo
 
     All of `prompts` are submitted before the first step, so `len(prompts)` is the
     batch: the depth question is not scale-free on this arch. `_NCOLS_MIN_M = 32`
-    means the verify GEMV switches kernel at M = rows x width >= 32, and the ladder
-    rounds M up, so at B=4 depth 1 lands on M=8 (rung 8, exactly filled, ncols=1)
-    while depth 3 lands on M=16 (rung 32, half padding, ncols=2). Two variables move
-    at once there and neither is the one that decided B=1.
+    switches the verify GEMV to ncols=2 at M = rows x width >= 32, and the ladder
+    rounds M up, so B decides which kernel each depth runs on AND how much of the
+    rung is padding. Enumerated (M, rung, kernel):
+
+        B=1   d1 (2,2,nc1)   d2 (3,4,nc1)   d3 (4,4,nc1)    d4 (5,8,nc1)
+        B=2   d1 (4,4,nc1)   d2 (6,8,nc1)   d3 (8,8,nc1)    d4 (10,32,nc2)
+        B=4   d1 (8,8,nc1)   d2 (12,32,nc2) d3 (16,32,nc2)  d4 (20,32,nc2)
+
+    So at B=4 depth 1 fills rung 8 exactly on the slow kernel while depth 3 half-
+    fills rung 32 on the fast one -- two variables move at once, and neither is the
+    one that decided B=1. Past M=32 the engine chunks at 32 rather than climbing
+    (engine.py:842), so B=8 d4 is 40 rows = two launches, not a rung.
 
     `prompt` content decides tok/forward and nothing else. ms/tick is a cost measured
     at a fixed rung and does not depend on which tokens are in the prompt, so the
@@ -184,8 +192,9 @@ def main() -> None:
                     help="wikitext-103 test text (default: the only arm whose "
                          "acceptance means anything) or uniform ids over the vocab")
     ap.add_argument("--prompts", type=int, default=3,
-                    help="distinct prompts per depth; acceptance varies by passage, "
-                         "so one prompt measures one passage")
+                    help="distinct passages, cut into disjoint groups of --batch. Must "
+                         "be a multiple of every --batch. Acceptance varies 15.8% "
+                         "between wikitext passages, so one group measures one sample")
     ap.add_argument("--batch", default="1",
                     help="comma-separated batch sizes. The depth answer is NOT "
                          "scale-free: the verify GEMV switches kernel at M=rows x "
@@ -194,11 +203,12 @@ def main() -> None:
                          "with ncols=2")
     args = ap.parse_args()
     batches = [int(b) for b in args.batch.split(",")]
-    if args.prompts < max(batches):
-        raise SystemExit(
-            f"--prompts {args.prompts} < --batch {max(batches)}: a batch needs one "
-            "distinct prompt per row, or rows share a prefix and the prefix cache "
-            "makes their acceptance identical")
+    for B in batches:
+        if args.prompts % B:
+            raise SystemExit(
+                f"--prompts {args.prompts} is not a multiple of --batch {B}: the run "
+                f"would silently drop {args.prompts % B} passage(s) from the last group "
+                "and compare batch sizes over different text")
     os.environ.setdefault("TILERL_TARGET", "cuda")
     cli._QWEN38_SOURCE = args.source
 
@@ -229,17 +239,25 @@ def main() -> None:
                      spec_depth=max(DEPTHS))
     for B in batches:
         print(f"\n# B={B}, M=rows x width -> {'/'.join(str(1 + d) for d in DEPTHS)} "
-              f"x {B} = {'/'.join(str(B * (1 + d)) for d in DEPTHS)}")
+              f"x {B} = {'/'.join(str(B * (1 + d)) for d in DEPTHS)}, "
+              f"{len(prompts) // B} disjoint passage group(s)"
+              + ("  -- ONE group, so no between-passage spread is visible here"
+                 if len(prompts) // B == 1 else ""))
         print(f"# {'depth':>5} {'W':>3} {'chain':>6} {'ms/tick':>8} "
               f"{'tok/fwd':>8} {'tok/s':>7}  per-M: rNxCOUNT:MEAN_MS")
         for d in DEPTHS:
             set_depth_in_place(e, draft, d)
-            batch = prompts[:B]
-            measure(e, batch, args.tokens)  # warm: JIT + this (B, width) capture
-            # Every depth sees the SAME prompts in the same order, so a between-depth
+            # DISJOINT groups of B, not `prompts[:B]` repeated: acceptance varies 15.8%
+            # between wikitext passages (2.15 to 2.49 tok/fwd at W=4), so repeating one
+            # passage prints four identical rows and reports run variance as if it were
+            # corpus variance. Measured: ds10 read 2.49 four times where ds8, which
+            # rotated, read 2.49/2.44/2.15 over the same three passages.
+            groups = [prompts[i * B : (i + 1) * B] for i in range(len(prompts) // B)]
+            measure(e, groups[0], args.tokens)  # warm: JIT + this (B, width) capture
+            # Every depth sees the SAME groups in the same order, so a between-depth
             # difference cannot be a between-passage difference.
-            got = [measure(e, batch, args.tokens) for _ in range(1 if B > 1 else len(prompts))]
-            # Per-run rows, not just their mean. Pooling hid a 1.58x drift: at
+            got = [measure(e, g, args.tokens) for g in groups]
+            # Per-group rows, not just their mean. Pooling hid a 1.58x drift: at
             # --prompts 3 on wikitext the pooled rung-4 mean read 97.5 ms against 61.8
             # for the first passage alone, which made verify come out NEGATIVE (-24 ms)
             # and the rate 24.3 tok/s against a known 45.9. A mean cannot show whether
