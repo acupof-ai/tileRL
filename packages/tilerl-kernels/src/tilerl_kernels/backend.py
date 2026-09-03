@@ -55,6 +55,9 @@ _MX = 8  # mma8 row cap: decode rows on the tensor cores
 #: rows up to which the M-row GEMV beats mma8 (27B decode replay, H20, ms:
 #: gemv 11.2/17.5/27.1/30.1 at M=1..4, mma8 27 flat); TILERL_MGEMV=0 disables
 _MGEMV = int(os.environ.get("TILERL_MGEMV", "3"))
+#: every kernel that loops `X // _RED_TILE` floor-divides, so a reduction
+#: dim padded to anything else drops its tail without a word: at 32 rows
+#: under TILERL_RED_TILE=64 the weight gradient came out exactly zero.
 _MMA_RED = kernels_linear._RED_TILE
 
 #: CUDA linear family: (op, M-regime) -> (kernel, K pad, N cap, N tile).
@@ -282,8 +285,8 @@ class Backend:
         )
         if self.target.startswith("cuda"):
             bM, bN = _snap_mma_tile(bM, 64), _snap_mma_tile(bN, 64)
-            x2 = _pad2d(x2, _round_up(M, bM), _round_up(K, 32))
-            w = _pad2d(w, _round_up(N, bN), _round_up(K, 32))
+            x2 = _pad2d(x2, _round_up(M, bM), _round_up(K, _MMA_RED))
+            w = _pad2d(w, _round_up(N, bN), _round_up(K, _MMA_RED))
             bias = _pad1d(bias, w.shape[0])
         y = self._kernel("gemm_nt")(x2, w, bias, bM, bN, _THREADS)
         y = y[:M, :N].reshape(*lead, N)
@@ -301,8 +304,8 @@ class Backend:
             # gx = g2 @ w (gemm_nn): reduction N, output [M, K]
             bM, bK = _snap_mma_tile(min(64, M), 64), _snap_mma_tile(min(64, K), 64)
             gx = self._kernel("gemm_nn")(
-                _pad2d(g2, _round_up(M, bM), _round_up(N, 32)),
-                _pad2d(w, _round_up(N, 32), _round_up(K, bK)),
+                _pad2d(g2, _round_up(M, bM), _round_up(N, _MMA_RED)),
+                _pad2d(w, _round_up(N, _MMA_RED), _round_up(K, bK)),
                 bM,
                 bK,
                 _THREADS,
@@ -310,8 +313,8 @@ class Backend:
             # gw = g2.T @ x2 (gemm_tn): reduction M, output [N, K]
             bN = _snap_mma_tile(min(64, N), 64)
             gw = self._kernel("gemm_tn")(
-                _pad2d(g2, _round_up(M, 32), _round_up(N, bN)),
-                _pad2d(x2, _round_up(M, 32), _round_up(K, bK)),
+                _pad2d(g2, _round_up(M, _MMA_RED), _round_up(N, bN)),
+                _pad2d(x2, _round_up(M, _MMA_RED), _round_up(K, bK)),
                 bN,
                 bK,
                 _THREADS,
