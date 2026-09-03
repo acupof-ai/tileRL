@@ -497,9 +497,13 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="drafts per row per tick; 3 fills the sm70 verify ladder's "
                               "4-row rung exactly (spec.LADDER_WIDTHS) — 4 spills to the "
                               "8-row rung and measured slower than no speculation")
-    p_serve.add_argument("--slots", type=int, default=16,
-                         help="GDN state slots; lower on <40GB GPUs (with --draft each slot "
-                              "also owns the per-step verify states)")
+    p_serve.add_argument("--slots", type=int, default=8,
+                         help="GDN state slots. A slot is held from submit to finish, so "
+                              "this must be >= --max-batch or that concurrency is "
+                              "unreachable; above it, each slot is one more queued "
+                              "request instead of a 503. They are expensive: measured on "
+                              "a 32GB V100 with a draft, slots 8/16 fit 42384/12112 "
+                              "tokens of context (step_states scales slots x width)")
     p_serve.add_argument("--blocks", type=int, default=0,
                          help="KV blocks (16 tokens each); 0 = fit the pool to the card, "
                               "capped by --max-ctx. Measured 2026-09-04: 3927 blocks = "

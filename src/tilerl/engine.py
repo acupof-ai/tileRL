@@ -324,6 +324,21 @@ class Engine:
             except RuntimeError:
                 pass  # pools sized without the spare: fall back to exact-size graphs
         self._graph_pool = None
+        # A slot is held from submit() to finish, so usable_slots -- not max_batch --
+        # is the real concurrency ceiling: below it, `submit` raises before a row can
+        # ever be admitted, and _build_plan's max_batch is unreachable. Warn rather
+        # than clamp, because a test that submits two rows into a 2-slot pool with the
+        # default max_batch=8 is a legitimate config, not a mistake.
+        if self.usable_slots < limits.max_batch:
+            warnings.warn(
+                f"{self.usable_slots} usable state slots against max_batch="
+                f"{limits.max_batch}: a slot is held from submit to finish, so "
+                f"concurrency is capped at {self.usable_slots} and submit raises "
+                f"beyond it. Pass num_slots >= max_batch"
+                + (" + 1 for the decode graph's pad row" if self._pad_slot is not None
+                   else ""),
+                stacklevel=2,
+            )
 
         self._draft = draft
         self._aux_layers = draft.aux_layers if draft is not None else ()
