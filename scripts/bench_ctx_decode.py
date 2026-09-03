@@ -77,7 +77,13 @@ def measure(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, int
     # WALL CLOCK as well as ticks, because an empty tick costs nothing and a tick cap
     # cannot tell "spinning" from "working".
     done: dict = {}
-    deadline = time.perf_counter() + 300.0
+    # Prefill is ~31 ms per PROMPT token on this card (see the prefill-roofline entry), so
+    # the budget has to scale with batch*ctx or it fires on work that is merely long:
+    # B=8 ctx=1024 is 8192 prompt tokens = ~254 s of legitimate prefill, and a flat 300 s
+    # killed it at 8/8 admitted -- reported as a stall when nothing was stuck. 4x that
+    # estimate, floored at the old 300 s.
+    prefill_budget = max(300.0, 4 * batch * ctx * 0.031)
+    deadline = time.perf_counter() + prefill_budget
     for _ in range(4096):  # burn the prefill chunks for every request
         done.update(e.poll())
         if any(rid in done for rid in rids):
@@ -86,7 +92,7 @@ def measure(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, int
         if all(r is not None and r.phase == _PHASE_DECODE for r in reqs):
             break
         if time.perf_counter() > deadline:
-            raise SystemExit(f"ctx={ctx}: prefill stalled 300 s with "
+            raise SystemExit(f"ctx={ctx}: prefill stalled {prefill_budget:.0f} s with "
                              f"{sum(r is not None for r in reqs)}/{batch} admitted")
         e.step()
     else:
