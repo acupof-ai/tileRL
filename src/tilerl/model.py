@@ -297,18 +297,19 @@ class Model:
             norm_weight=self.params[f"{p}.gdn_norm"],
             seq_q_lens=getattr(kv, "seq_q_lens", None),
         )
+        # Speculative verify keeps the state after every chain step for the engine to adopt.
+        ks = getattr(kv, "keep_steps", 0)
         out = None
-        if q.shape[1] == 1 and not getattr(kv, "dense", False):
+        if not getattr(kv, "dense", False):
             out = backend.gdn_decode(  # sm90: in-place pool state, one launch
-                q, k, v, a_proj, b_proj, kv.state_pool, kv.state_slot, linear_idx, **kwargs
+                q, k, v, a_proj, b_proj, kv.state_pool, kv.state_slot, linear_idx,
+                keep_steps=ks, **kwargs
             )
         if out is None:
             pool = kv.state_pool
             state, window = backend.state_gather(
                 pool.states, pool.conv_windows, kv.state_slot, linear_idx, pool.win_parity
             )
-            # Speculative verify keeps the state after every chain step for the engine to adopt.
-            ks = getattr(kv, "keep_steps", 0)
             if ks:  # the tape replays kwargs into gdn_backward, which has no such arg
                 kwargs["keep_steps"] = ks
             out, new_state, new_window = backend.linear_attn_chunk(
@@ -348,10 +349,12 @@ class Model:
         backend: "Backend",
         hidden_out: list | None = None,
         last_only: "bool | list[int]" = False,
+        aux_layers: tuple[int, ...] = (),
     ) -> torch.Tensor:
         """``input_ids`` [B,T], ``positions`` [T] or [B,T], ``kv`` a BatchKv with
-        pools attached -> logits [B,T,vocab]. ``hidden_out`` receives the
-        pre-final-norm hidden state (the MTP draft head's input)."""
+        pools attached -> logits [B,T,vocab]. ``hidden_out`` receives each
+        ``aux_layers`` layer's output in order (the DFlash2 drafter's fc input),
+        then the pre-final-norm hidden state (the MTP draft head's input)."""
         cfg = self.cfg
         device = backend.device
         ids = torch.as_tensor(input_ids, dtype=torch.long, device=device)
@@ -365,6 +368,8 @@ class Model:
                 x = self._gdn(i, linear_idx, x, kv, backend)
                 linear_idx += 1
             x = self._mlp(i, x, kv, backend)
+            if i in aux_layers and hidden_out is not None:
+                hidden_out.append(x)
         if hidden_out is not None:
             hidden_out.append(x)
         # lm_head over every prefill position is 4.7% of the FLOPs and a 508 MB

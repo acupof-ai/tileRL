@@ -580,3 +580,122 @@ def make_paged_attention(target: str):
         return Out
 
     return paged_attention
+
+
+# ---------------------------------------------------------------- gated delta
+
+
+def make_gdn_prep(target: str):
+    """Front half of a GDN layer in one launch: conv1d + SiLU over q/k/v, the
+    q/k L2-norm, the log gate and beta, and the next conv window -- exactly the
+    operands the chunkwise-WY kernels consume. Conv channels are laid out
+    q ++ k ++ v; one block per (value head, token, row), and every block in a
+    GQA group recomputes that group's q/k, which is why sm90 has its own cell."""
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    def gdn_prep(Q, Key, Val, GIn, BIn, DtBias, ALog, ConvW, Window, threads):
+        B, TT, HK, DK, NVH, DV, KER, QKVD = T.const("B, TT, HK, DK, NVH, DV, KER, QKVD")
+        Q: T.Tensor((B, TT, HK, DK), "float32")
+        Key: T.Tensor((B, TT, HK, DK), "float32")
+        Val: T.Tensor((B, TT, NVH, DV), "float32")
+        GIn: T.Tensor((B, TT, NVH), "float32")
+        BIn: T.Tensor((B, TT, NVH), "float32")
+        DtBias: T.Tensor((NVH,), "float32")
+        ALog: T.Tensor((NVH,), "float32")
+        ConvW: T.Tensor((QKVD, KER), "float32")
+        Window: T.Tensor((B, KER - 1, QKVD), "float32")
+        Qo = T.empty((B, TT, HK, DK), "float32")
+        Ko = T.empty((B, TT, HK, DK), "float32")
+        Vo = T.empty((B, TT, NVH, DV), "float32")
+        Go = T.empty((B, TT, NVH), "float32")
+        Bo = T.empty((B, TT, NVH), "float32")
+        NewWindow = T.empty((B, KER - 1, QKVD), "float32")
+        scale = T.rsqrt(T.cast(DK, "float32"))
+        with T.Kernel(NVH, TT, B, threads=threads) as (vh, t, bb):
+            kh = vh * HK // NVH
+            qc, kc, vc = kh * DK, HK * DK + kh * DK, 2 * HK * DK + vh * DV
+            qa = T.alloc_fragment((DK,), "float32")
+            ka = T.alloc_fragment((DK,), "float32")
+            va = T.alloc_fragment((DV,), "float32")
+            nq = T.alloc_fragment((1,), "float32")
+            nk = T.alloc_fragment((1,), "float32")
+
+            for j in T.serial(DK):
+                qa[j] = 0.0
+                ka[j] = 0.0
+            for j in T.serial(DV):
+                va[j] = 0.0
+            for tap in T.serial(KER):
+                if t + tap < KER - 1:  # the carried window, else this segment's raw qkv
+                    for j in T.serial(DK):
+                        qa[j] += Window[bb, t + tap, qc + j] * ConvW[qc + j, tap]
+                        ka[j] += Window[bb, t + tap, kc + j] * ConvW[kc + j, tap]
+                    for j in T.serial(DV):
+                        va[j] += Window[bb, t + tap, vc + j] * ConvW[vc + j, tap]
+                else:
+                    for j in T.serial(DK):
+                        qa[j] += Q[bb, t + tap - (KER - 1), kh, j] * ConvW[qc + j, tap]
+                        ka[j] += Key[bb, t + tap - (KER - 1), kh, j] * ConvW[kc + j, tap]
+                    for j in T.serial(DV):
+                        va[j] += Val[bb, t + tap - (KER - 1), vh, j] * ConvW[vc + j, tap]
+
+            nq[0] = 0.0
+            nk[0] = 0.0
+            for j in T.serial(DK):
+                qa[j] = qa[j] * T.sigmoid(qa[j])
+                ka[j] = ka[j] * T.sigmoid(ka[j])
+                nq[0] += qa[j] * qa[j]
+                nk[0] += ka[j] * ka[j]
+            nq[0] = T.rsqrt(nq[0] + 1e-12) * scale
+            nk[0] = T.rsqrt(nk[0] + 1e-12)
+            if vh % (NVH // HK) == 0:  # one value head per GQA group writes q/k
+                for j in T.serial(DK):
+                    Qo[bb, t, kh, j] = qa[j] * nq[0]
+                    Ko[bb, t, kh, j] = ka[j] * nk[0]
+            for j in T.serial(DV):
+                Vo[bb, t, vh, j] = va[j] * T.sigmoid(va[j])
+            x = GIn[bb, t, vh] + DtBias[vh]
+            Go[bb, t, vh] = -T.exp(ALog[vh]) * T.if_then_else(x > 20.0, x, T.log(1.0 + T.exp(x)))
+            Bo[bb, t, vh] = T.sigmoid(BIn[bb, t, vh])
+            if t == 0:  # next window: the last KER-1 raw tokens of Window ++ qkv
+                for tap in T.serial(KER - 1):
+                    if TT + tap < KER - 1:
+                        for j in T.serial(DK):
+                            NewWindow[bb, tap, qc + j] = Window[bb, TT + tap, qc + j]
+                            NewWindow[bb, tap, kc + j] = Window[bb, TT + tap, kc + j]
+                        for j in T.serial(DV):
+                            NewWindow[bb, tap, vc + j] = Window[bb, TT + tap, vc + j]
+                    else:
+                        for j in T.serial(DK):
+                            NewWindow[bb, tap, qc + j] = Q[bb, TT + tap - (KER - 1), kh, j]
+                            NewWindow[bb, tap, kc + j] = Key[bb, TT + tap - (KER - 1), kh, j]
+                        for j in T.serial(DV):
+                            NewWindow[bb, tap, vc + j] = Val[bb, TT + tap - (KER - 1), vh, j]
+        return Qo, Ko, Vo, Go, Bo, NewWindow
+
+    return gdn_prep
+
+
+def make_gdn_post(target: str, io: str = "float32"):
+    """GDN epilogue in one launch: RMSNorm over the value dim, the norm weight,
+    then the SiLU(z) gate. Rows are [B*T*value heads, V] off the chunk core."""
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    def gdn_post(Core, Z, NormW, eps: T.float32, threads):
+        M, N = T.const("M, N")
+        Core: T.Tensor((M, N), "float32")
+        Z: T.Tensor((M, N), io)
+        NormW: T.Tensor((N,), "float32")
+        Y = T.empty((M, N), io)
+        with T.Kernel(M, threads=threads) as row:
+            var = T.alloc_fragment((1,), "float32")
+            var[0] = 0.0
+            for j in T.serial(N):
+                var[0] += Core[row, j] * Core[row, j]
+            rstd = T.rsqrt(var[0] / N + eps)
+            for j in T.Parallel(N):
+                g = T.cast(Z[row, j], "float32")
+                Y[row, j] = T.cast(Core[row, j] * rstd * NormW[j] * g * T.sigmoid(g), io)
+        return Y
+
+    return gdn_post

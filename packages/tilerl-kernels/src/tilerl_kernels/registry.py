@@ -46,6 +46,8 @@ _CPU_KERNELS = {  # f32 kernels, bf16 cast at the boundary
     "embedding": kernels.make_embedding,
     "linear_fp4": kernels.make_linear_fp4,
     "paged_attention": kernels.make_paged_attention,
+    "gdn_prep": kernels.make_gdn_prep,
+    "gdn_post": kernels.make_gdn_post,
 }
 _register("bf16", "cpu", _CPU_KERNELS)
 _register("fp4", "cpu", _CPU_KERNELS)  # fp4 is a weight format, not a compute dtype
@@ -84,6 +86,15 @@ _SM90_KERNELS = {  # WGMMA schedules; the backend pads M/N to 16 and K to 32
     "attn_prep": kernels_mma.make_attn_prep,
     "gdn_decode_fused": kernels_gdn.make_gdn_decode_fused,
     "gdn_chunk_fused": kernels_gdn.make_gdn_chunk_fused,
+    "gdn_prep": kernels_gdn.make_gdn_prep_bf16,
+    "gdn_post": lambda t: kernels.make_gdn_post(t, "bfloat16"),
+    # chunkwise-WY prefill: the default for whole-chunk full-length rows
+    "gdn_chunk_cumsum": kernels_gdn.make_gdn_chunk_cumsum,
+    "gdn_chunk_kkt": kernels_gdn.make_gdn_chunk_kkt,
+    "gdn_solve_tril": kernels_gdn.make_gdn_solve_tril,
+    "gdn_chunk_wu": kernels_gdn.make_gdn_chunk_wu,
+    "gdn_state_scan": kernels_gdn.make_gdn_state_scan,
+    "gdn_chunk_o": kernels_gdn.make_gdn_chunk_o,
     "paged_attention": kernels_attn.make_paged_attention_mma,
     "paged_attention_decode": kernels_attn.make_paged_attention_decode,
     "paged_attention_combine": kernels_attn.make_paged_attention_combine,

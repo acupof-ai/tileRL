@@ -24,6 +24,14 @@ from .registry import _arch_for, _resolve, resolve_target
 __all__ = ["Backend", "get_backend", "resolve_target"]
 
 _THREADS = 64
+#: chunkwise-WY chunk length. gdn_state_scan and gdn_chunk_o size h by S // chunk, so a T
+#: that is not a whole multiple writes past it.
+_WY_CHUNK = 64
+# ponytail: the DFlash2 verify block; wider runs take the M-tiled kernel until
+# the crossover between the two is measured
+_MAX_VERIFY_W = 8
+# a whole-chunk verify width would reach _full_rows' host sync, illegal under graph capture
+assert _MAX_VERIFY_W < _WY_CHUNK
 
 
 def _round_up(x: int, m: int) -> int:
@@ -126,6 +134,7 @@ class Backend:
         self._const_f32_cache: dict[tuple[int, int | None], tuple[Any, int, torch.Tensor]] = {}
         self._ones_cache: dict[int, torch.Tensor] = {}
         self._step_scratch: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._full_rows_memo: tuple[Any, int, bool] | None = None
         self._sms = (
             torch.cuda.get_device_properties(self.device).multi_processor_count
             if self.device.type == "cuda"
@@ -477,8 +486,13 @@ class Backend:
         b, s = q.shape[0], q.shape[1]
         if seq_q_lens is None:
             seq_q_lens = torch.full((b,), s, dtype=torch.int32)
-        if self.arch == "sm90" and s == 1 and "paged_attention_decode" in _resolve(self.precision, self.arch):
-            out = self._paged_attention_decode(q, k_cache, v_cache, block_table, seq_lens, scale)
+        # the M tile is the GQA group at every chain position: a verify width
+        # rides the decode path while g*s still fits it
+        chain = s <= _MAX_VERIFY_W and s * (q.shape[2] // k_cache.shape[1]) <= 128
+        if self.arch == "sm90" and chain and "paged_attention_decode" in _resolve(self.precision, self.arch):
+            out = self._paged_attention_decode(
+                q, k_cache, v_cache, block_table, seq_lens, seq_q_lens, scale
+            )
         elif self.arch == "sm90":
             # pad S to block_M; seq_q_lens keeps the causal window on the true lengths
             block_m = 64 if s >= 64 else 16
@@ -522,30 +536,34 @@ class Backend:
             out = out * torch.sigmoid(self._dev(gate, out.dtype))
         return out
 
-    def _paged_attention_decode(self, q, k_cache, v_cache, block_table, seq_lens, scale):
-        b, h, d = q.shape[0], q.shape[2], q.shape[3]
+    def _paged_attention_decode(self, q, k_cache, v_cache, block_table, seq_lens, seq_q_lens,
+                                scale):
+        b, w, h, d = q.shape
         hkv = k_cache.shape[1]
+        g = h // hkv
+        block_m = _snap_mma_tile(g * w, 128)
+        assert g * w <= block_m, f"GQA group x width {g * w} past the M tile cap {block_m}"
         # split count from the pool's reach (host-static, graph-safe): 64 splits
         # past 64K tokens or when the 16-grid under-fills the SMs
         max_tokens = block_table.shape[1] * k_cache.shape[2]
         wide = 16 * hkv * b < 2 * self._sms and max_tokens >= 64 * k_cache.shape[2]
         ks, sfx = (64, "_64") if (max_tokens > 65536 or wide) else (16, "")
-        key = ("attn_ws", b, hkv, d, ks)
+        key = ("attn_ws", b, hkv, d, ks, block_m)
         ws = self._ones_cache.get(key)
         if ws is None:  # static workspace: graph-capturable
             ws = self._ones_cache[key] = (
-                torch.empty(b, hkv, ks, 16, d, dtype=torch.float32, device=self.device),
-                torch.empty(b, hkv, ks, 16, dtype=torch.float32, device=self.device),
-                torch.empty(b, hkv, ks, 16, dtype=torch.float32, device=self.device),
+                torch.empty(b, hkv, ks, block_m, d, dtype=torch.float32, device=self.device),
+                torch.empty(b, hkv, ks, block_m, dtype=torch.float32, device=self.device),
+                torch.empty(b, hkv, ks, block_m, dtype=torch.float32, device=self.device),
             )
         po, pm, pl = ws
         self._kernel("paged_attention_decode" + sfx)(
-            self._dev(self._c(q.reshape(b, h, d)), torch.bfloat16),
+            self._dev(self._c(q), torch.bfloat16),
             self._dev(k_cache, torch.bfloat16), self._dev(v_cache, torch.bfloat16),
-            self._i32(block_table), self._i32(seq_lens), po, pm, pl, float(scale),
-            int(k_cache.shape[2]),
+            self._i32(block_table), self._i32(seq_lens), self._i32(seq_q_lens),
+            po, pm, pl, float(scale), int(k_cache.shape[2]), block_m,
         )
-        return self._kernel("paged_attention_combine" + sfx)(po, pm, pl, h // hkv).reshape(b, 1, h, d)
+        return self._kernel("paged_attention_combine" + sfx)(po, pm, pl, g, w)
 
     def attention(self, q, k, v, scale, gate=None):
         """Dense causal GQA attention (training path). q/k/v [B,T,H,D]."""
@@ -651,30 +669,123 @@ class Backend:
     # ------------------------------------------------------------ gated delta
 
     def linear_attn_chunk(self, q, k, v, g, beta, state, **kw):
-        """Full-GDN layer core: the fused chunk kernel on sm90 for T>1, else the reference."""
-        _kset = _resolve(self.precision, self.arch)
-        # A/B lever: the chunkwise reference (all bmm + a triangular solve) vs the kernel
-        chunk = int(os.environ.get("TILERL_GDN_CHUNKWISE", "0"))
-        if chunk and q.shape[1] > 1 and not kw.get("keep_steps"):
-            return reference.gdn_forward(q, k, v, g, beta, state, chunkwise=chunk, **kw)
-        if q.shape[1] > 1 and "gdn_chunk_fused" in _kset:
+        """Full-GDN layer core: chunkwise-WY for full-length rows, else the
+        fused serial kernel on sm90, else the per-step reference."""
+        kset = _resolve(self.precision, self.arch)
+        t, chunkable = q.shape[1], q.shape[1] > 1 and not kw.get("keep_steps")
+        # A/B lever: the chunkwise reference, all bmm + a triangular solve (or fla)
+        ref_chunk = int(os.environ.get("TILERL_GDN_CHUNKWISE", "0"))
+        if ref_chunk and chunkable:
+            return reference.gdn_forward(q, k, v, g, beta, state, chunkwise=ref_chunk, **kw)
+        # the WY kernels scan whole chunks; a ragged length keeps the serial kernel
+        wy = "gdn_state_scan" not in kset or t % _WY_CHUNK == 0
+        if wy and chunkable and self._full_rows(kw.get("seq_q_lens"), t):
+            return self._gdn_chunk_wy(q, k, v, g, beta, state, **kw)
+        if t > 1 and "gdn_chunk_fused" in kset:
             return self._gdn_chunk_fused(q, k, v, g, beta, state, **kw)
         return reference.gdn_forward(q, k, v, g, beta, state, **kw)
 
-    def gdn_decode(self, q, k, v, g, beta, pool, slots, layer, **kw):
-        """Decode (T=1) GDN core in one launch, state updated in place in
-        ``pool.states[slots, layer]``; None off sm90 (caller takes the
-        gather -> linear_attn_chunk -> scatter path)."""
-        if "gdn_decode_fused" not in _resolve(self.precision, self.arch):
+    def _full_rows(self, seq_q_lens, t: int) -> bool:
+        """Every row's query span is the whole T -- the chunkwise form has no
+        per-row mask. ``.min()`` is a host sync and one tensor object reaches all
+        64 layers, so without the memo a prefill tick pays 64 pipeline drains."""
+        if seq_q_lens is None:
+            return True
+        hit = self._full_rows_memo
+        if hit is not None and hit[0]() is seq_q_lens and hit[1] == t:
+            return hit[2]
+        full = int(seq_q_lens.min()) == t
+        self._full_rows_memo = (weakref.ref(seq_q_lens), t, full)
+        return full
+
+    def _gdn_prep(self, q, k, v, g, beta, state, **kw):
+        """``gdn_prep``'s six operands, marshalled -- the parity oracle is
+        :func:`reference.gdn_prep`. The sm90 cell binds one thread to a head
+        column of q, k and v alike, so it needs key_dim == value_dim; the f32
+        cell loops each extent separately and cannot fail the same way."""
+        b, t = q.shape[0], q.shape[1]
+        nvh, kd, vd = state.shape[1], state.shape[2], state.shape[3]
+        assert kd == vd, f"gdn_prep binds one thread per head column: {kd} != {vd}"
+        hk = q.shape[-1] // kd
+        ker = kw["conv1d_weight"].shape[1]
+        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
+        window = kw.get("conv_window")
+        win = (
+            self._f32(window)
+            if window is not None
+            else torch.zeros(b, ker - 1, 2 * hk * kd + nvh * vd, device=self.device)
+        )
+        return self._kernel("gdn_prep")(
+            self._c(self._dev(q, io)).view(b, t, hk, kd),
+            self._c(self._dev(k, io)).view(b, t, hk, kd),
+            self._c(self._dev(v, io)).view(b, t, nvh, vd),
+            self._c(self._f32(g)),
+            self._c(self._f32(beta)),
+            self._const_f32(kw["dt_bias"]),
+            self._const_f32(kw["a_log"]),
+            self._const_f32(kw["conv1d_weight"]),
+            self._c(win),
+            threads=vd,
+        )
+
+    def _gdn_chunk_wy(self, q, k, v, g, beta, state, **kw):
+        """Chunkwise-WY prefill: gdn_prep, the WY core, gdn_post. The layer's
+        conv / norm / gate glue is two launches here, sixty as torch ops."""
+        b, t = q.shape[0], q.shape[1]
+        nvh, vd = state.shape[1], state.shape[3]
+        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
+        window = kw.get("conv_window")
+        qn, kn, vn, gt, bt, new_window = self._gdn_prep(q, k, v, g, beta, state, **kw)
+        if "gdn_state_scan" in _resolve(self.precision, self.arch):
+            core, new_state = self._gdn_wy_core(qn, kn, vn, gt, bt, state)
+        else:  # no WY schedule in this cell: the chunkwise reference is the core
+            core, new_state = reference.gdn_chunk_core(
+                qn, kn, vn, gt, bt, self._f32(state), chunk=_WY_CHUNK
+            )
+        out = self._kernel("gdn_post")(
+            self._c(core).view(-1, vd),
+            self._c(self._dev(kw["z"], io)).view(-1, vd),
+            self._const_f32(kw["norm_weight"]),
+            1e-6,
+            vd,
+        )
+        return out.view(b, t, nvh * vd), new_state, (new_window if window is not None else None)
+
+    def _gdn_wy_core(self, q, k, v, g, beta, state, chunk: int = _WY_CHUNK):
+        """fla's chunk_gated_delta_rule_fwd stage for stage: cumsum, kkt,
+        solve_tril, w/u, the inter-chunk state scan, o. gdn_prep already put
+        1/sqrt(key_dim) in q, so the o scale is 1."""
+        # a tail chunk writes past h, which gdn_state_scan sizes S // chunk
+        assert q.shape[1] % chunk == 0, f"WY core needs whole chunks: {q.shape[1]} % {chunk}"
+        kern = self._kernel
+        gc = kern("gdn_chunk_cumsum")(g, chunk)
+        a = kern("gdn_solve_tril")(kern("gdn_chunk_kkt")(k, beta, gc, chunk), chunk)
+        w, u = kern("gdn_chunk_wu")(k, v, beta, gc, a, chunk)
+        # the scan's gemm operand is bf16, so the state rounds on entry either way
+        h, new_state, v_new = kern("gdn_state_scan")(
+            k, w, u, gc, self._c(self._bf16(state)), chunk
+        )
+        return kern("gdn_chunk_o")(q, k, v_new, h, gc, chunk, 1.0), new_state
+
+    def gdn_decode(self, q, k, v, g, beta, pool, slots, layer, keep_steps=0, **kw):
+        """GDN core for a T-token decode tick in one launch, state updated in
+        place in ``pool.states[slots, layer]``; None off sm90, or when T>1 is
+        not a verify tick whose rows are all T wide (the caller then takes the
+        gather -> linear_attn_chunk -> scatter path). ``keep_steps`` sends the
+        per-chain-step state straight to the pool's step planes, so the verify
+        pays no scatter."""
+        t = q.shape[1]
+        if "gdn_decode_fused" not in _resolve(self.precision, self.arch) or (
+            t > 1 and keep_steps != t
+        ):
             return None
-        slots_i = self._i32(slots).contiguous()
-        out = self._kernel("gdn_decode_fused")(
-            self._c(self._f32(q).squeeze(1)),
-            self._c(self._f32(k).squeeze(1)),
-            self._c(self._f32(v).squeeze(1)),
-            self._c(self._f32(kw["z"]).squeeze(1)),
-            self._c(self._f32(g).squeeze(1)),
-            self._c(self._f32(beta).squeeze(1)),
+        return self._kernel("gdn_decode_fused")(
+            self._c(self._f32(q)),
+            self._c(self._f32(k)),
+            self._c(self._f32(v)),
+            self._c(self._f32(kw["z"])),
+            self._c(self._f32(g)),
+            self._c(self._f32(beta)),
             self._c(self._const_f32(kw["dt_bias"])),
             self._c(self._const_f32(kw["a_log"])),
             self._c(self._const_f32(kw["norm_weight"])),
@@ -682,11 +793,14 @@ class Backend:
             pool.conv_windows,
             pool.win_parity,
             pool.states,
-            slots_i,
+            self._i32(slots).contiguous(),
+            # aliased onto the live planes when ks=0 leaves them unwritten
+            pool.step_states if keep_steps else pool.states.unsqueeze(2),
+            pool.step_windows if keep_steps else pool.conv_windows,
             int(layer),
+            int(keep_steps),
             threads=pool.states.shape[-1],
         )
-        return out.unsqueeze(1)
 
     def flip_window_parity(self, pool, slots) -> None:
         """After a decode tick's last GDN layer: the written planes become live."""
