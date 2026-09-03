@@ -17,7 +17,7 @@ for j in range(hidden.shape[1]):
     prev = int(cand[j, int(score.argmax())])     # two host syncs, per slot, per row
 ```
 
-At B=8 and width 8 that is **56 device-to-host synchronisations in one tick**,
+At B=8 and width 8 that is **112 device-to-host synchronisations in one tick (14 at B=1)**,
 eight separate projections through the trunk's 1271.4 M-parameter `lm_head`, and
 eight through `selector.proj`. The drafter is 68.4% of a speculative tick, and a
 speculative tick is about 9.2x a base tick
@@ -32,9 +32,10 @@ batch materialises once, at the end, through a single `.tolist()`.
 
 | per tick, B=8 width 8 | before | after |
 |---|---:|---:|
-| host syncs in the walk | 56 | **1** |
+| host syncs in the walk (B=8) | 112 | **1** |
 | `lm_head` projections | 8 | **1** |
 | `selector.proj` projections | 8 | **1** |
+| host syncs in the walk (B=1) | 14 | **1** |
 | transition matmuls | 56 | 7 einsums |
 | `zeros_like` + `cat` in `_conv` | 80 | **0** |
 

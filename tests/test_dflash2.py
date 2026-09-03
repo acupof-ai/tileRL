@@ -277,7 +277,7 @@ def test_selector_walk_follows_the_token_it_emitted(tmp_path):
 def test_batched_walk_keeps_each_row_on_its_own_anchor(tmp_path):
     """One walk for the whole tick must still condition each row on its own
     predecessor. Batching the rows is the drafter's remaining lever -- 8 rows x 7
-    slots was 56 host syncs -- and the way it breaks silently is by letting one
+    slots x two int() calls was 112 host syncs, 14 at B=1 -- and it breaks silently by letting one
     row's ``prev`` score another row's candidates, which costs nothing visible
     and drafts tokens the trunk will reject.
     """
