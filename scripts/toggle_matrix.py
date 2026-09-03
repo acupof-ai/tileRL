@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import time
 from collections import Counter
@@ -72,6 +73,7 @@ class Arm:
     concurrency: int = 8
     fused: bool = True
     tf32: bool | None = None
+    num_blocks: int | None = None
 
 
 def groups(draft_path: str) -> dict[str, list[Arm]]:
@@ -90,6 +92,15 @@ def groups(draft_path: str) -> dict[str, list[Arm]]:
             Arm("spec-w8", "draft + spec_depth=7 (W=8)", engine=dict(draft=draft_path, width=8)),
             Arm("spec-w8-graph", "W=8 + decode_graph=True",
                 engine=dict(draft=draft_path, width=8, decode_graph=True)),
+            # _MAX_VERIFY_W=8: at W=12 the verify tick leaves the decode
+            # attention kernel for the M-tiled prefill one. Legal (spec_depth <
+            # BLOCK_TOKENS) and, per the W-verify entry, uncovered by parity.
+            Arm("spec-w12", "W=12 — past _MAX_VERIFY_W, onto the M-tiled kernel",
+                engine=dict(draft=draft_path, width=12)),
+            # The KV-split selector is host-static: ks=64 needs the pool past
+            # 65536 tokens (4096 blocks) or a narrow enough grid.
+            Arm("kvsplit-64", "num_blocks=4608 -> KVSPLIT=64 attention cells",
+                num_blocks=4608),
         ],
         # Kernel / numeric switches read at call time, plus the two read at
         # import time that a module attribute can still reach.
@@ -138,9 +149,10 @@ def groups(draft_path: str) -> dict[str, list[Arm]]:
 
 
 def designed_prompts(tok, rows: list[dict], want: int = RES) -> list[tuple[dict, str, list[int]]]:
-    """One question per residue of prompt length mod 64. A random slice reaches
-    a handful of residues; this reaches all of them, and the residue count is
-    what makes the run a gate rather than an anecdote."""
+    """One question per residue of prompt length mod 64, ``want`` residues of
+    them. A random slice reaches a handful of residues; this reaches all of the
+    ones it claims, and the residue count is what makes the run a gate rather
+    than an anecdote."""
 
     def enc(text: str) -> list[int]:
         return tok.encode(render_chat([("user", text)], False))
@@ -148,17 +160,19 @@ def designed_prompts(tok, rows: list[dict], want: int = RES) -> list[tuple[dict,
     picks: dict[int, tuple[dict, str, list[int]]] = {}
     for r in rows:
         ids = enc(r["prompt"])
-        picks.setdefault(len(ids) % want, (r, r["prompt"], ids))
+        res = len(ids) % RES
+        if res < want:
+            picks.setdefault(res, (r, r["prompt"], ids))
         if len(picks) == want:
             break
     base = rows[0]
     for res in range(want):  # pad a base question until it lands on a missing residue
         if res in picks:
             continue
-        for j in range(1, 4 * want):
+        for j in range(1, 4 * RES):
             text = ("ok " * j) + base["prompt"]
             ids = enc(text)
-            if len(ids) % want == res:
+            if len(ids) % RES == res:
                 picks[res] = (base, text, ids)
                 break
     return [picks[k] for k in sorted(picks)]
@@ -300,7 +314,7 @@ class Patched:
             torch.backends.cudnn.allow_tf32 = self.old_tf32
 
 
-def run_arm(a: Arm, cfg, models, backend, tok, prompts, sp, mmlu, num_blocks) -> dict:
+def run_arm(a: Arm, cfg, models, backend, tok, prompts, sp, mmlu, num_blocks, seen) -> dict:
     from tilerl.spec import load_draft
 
     e = dict(a.engine)
@@ -314,7 +328,12 @@ def run_arm(a: Arm, cfg, models, backend, tok, prompts, sp, mmlu, num_blocks) ->
     with Patched(a):
         model = models[a.fused]
         draft = load_draft(model, draft_path) if draft_path else None
-        kw = dict(num_blocks=num_blocks, num_slots=8, max_batch=8, decode_graph=False,
+        # +1 slot: with decode_graph on, the first under-filled bucket takes a
+        # pad slot and a pad block and never gives them back (engine.py:678),
+        # so num_slots == concurrency admits one request fewer and submit
+        # raises "LinearStatePool exhausted" instead of queueing.
+        kw = dict(num_blocks=a.num_blocks or num_blocks, num_slots=a.concurrency + 1,
+                  max_batch=8, decode_graph=False,
                   prefix_store=NoPrefixStore(), draft=draft, spec_depth=max(1, width - 1))
         kw.update(e)
         engine = build_engine(cfg, model, backend, **kw)
@@ -325,22 +344,30 @@ def run_arm(a: Arm, cfg, models, backend, tok, prompts, sp, mmlu, num_blocks) ->
         out["gdn_fla"] = os.environ.get("TILERL_GDN_FLA", "")
         out["tf32"] = torch.backends.cuda.matmul.allow_tf32
 
-        # Warm the JIT and the graph capture before anything is timed.
-        generate_ids(engine, [p[2] for p in prompts[:a.concurrency]],
-                     replace(sp, max_new_tokens=24), a.concurrency)
+        # Warm the JIT and the graph capture at every batch the phase will see.
+        # A uniform warmup finishes all rows on one tick and never compiles the
+        # tail shapes; the linear plan then JITs linear_fp4_gemv[2] mid-timing
+        # and the throughput row measures the compiler (6.6 tok/s on the smoke).
+        warm = [p[2] for p in prompts[:a.concurrency]]
+        for wid, ids in enumerate(warm):
+            engine.submit(ids, replace(sp, max_new_tokens=8 + 4 * wid))
+        while engine.stats()["running"] or engine.stats()["waiting"]:
+            engine.step()
+            engine.poll()
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
 
         tr = Trace(engine)
         if mmlu is not None:  # negative control: max_new_tokens=1, decode never runs
             (ids, rids), d = phase(engine, lambda: generate_ids(
-                engine, mmlu["ids"], mmlu["sp"], 8))
+                engine, mmlu["ids"], mmlu["sp"], a.concurrency))
             preds = [letter(tok.decode(t)) for t in ids]
             out["mmlu"] = dict(correct=sum(p == g for p, g in zip(preds, mmlu["gold"])),
-                               total=len(preds), timing=d, tokens=ids, pred=preds)
+                               total=len(preds), timing=d, tokens=ids, rids=rids, pred=preds)
             print(f"[{a.name}] mmlu CONTROL {out['mmlu']['correct']}/{len(preds)} "
                   f"decode_forwards {d['decode_forwards']} (0 expected)", flush=True)
 
+        warm_keys = {f"{k[0]}{list(k[1]) if k[1] else ''}" for k in backend._kernels}
         (ids, rids), d = phase(engine, lambda: generate_ids(
             engine, [p[2] for p in prompts], sp, a.concurrency))
         ok = [answer_match(tok.decode(t), r["answer"]) for t, (r, _, _) in zip(ids, prompts)]
@@ -353,13 +380,24 @@ def run_arm(a: Arm, cfg, models, backend, tok, prompts, sp, mmlu, num_blocks) ->
         out["gaps"] = {f"{k[0]}:{k[1]}": v for k, v in gaps.items()}
         out["peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
         out["prefix_snapshots"] = len(getattr(engine, "_prefix_state", {}))
+        # Which cells this arm actually compiled. This is the switch's negative
+        # control: a patched _MGEMV that never reaches the dispatch would leave
+        # ('linear_fp4_gemv', M) in the cache anyway, and the arm would be a
+        # relabelled copy of the reference.
+        keys = {f"{k[0]}{list(k[1]) if k[1] else ''}" for k in backend._kernels}
+        out["kernels_new"] = sorted(keys - seen)
+        out["jit_during_timing"] = sorted(keys - warm_keys)  # non-empty ⇒ the row is compiler
+        seen |= keys
 
         print(f"[{a.name}] gsm8k {sum(ok)}/{len(prompts)}  {d['secs']:.1f}s  "
               f"{d['tok_per_s']:.1f} tok/s  {d['tok_per_decode_forward']:.2f} tok/decode-fwd  "
               f"accept {100 * d['accept_rate']:.1f}%  peak {out['peak_gib']:.2f} GiB\n"
               f"[{a.name}] residues {summary['residues_reached']}/64 "
               f"(wide {summary['wide_residues_reached']}/64)  widths {summary['widths']}  "
-              f"NaN row-ticks {summary['nan_row_ticks']}", flush=True)
+              f"NaN row-ticks {summary['nan_row_ticks']}"
+              + (f"\n[{a.name}] WARNING: JIT inside the timed phase, throughput is not a "
+                 f"throughput: {out['jit_during_timing']}" if out["jit_during_timing"] else ""),
+              flush=True)
 
     engine = draft = None
     torch.cuda.empty_cache()
@@ -375,6 +413,7 @@ def compare(ref: dict, arm: dict, suite: str) -> dict:
     arm's top-1/top-2 margin at the first differing generated index: a flip at
     1e-6 is arithmetic, at 0.5 it is a bug."""
     a, b = ref[suite], arm[suite]
+    ar, br = a.get("rids") or [], b.get("rids") or []
     diffs = []
     for i, (x, y) in enumerate(zip(a["tokens"], b["tokens"])):
         if x == y:
@@ -383,8 +422,8 @@ def compare(ref: dict, arm: dict, suite: str) -> dict:
         diffs.append({"q": i, "index": k, "ref_len": len(x), "arm_len": len(y),
                       "ref_tok": x[k] if k < len(x) else None,
                       "arm_tok": y[k] if k < len(y) else None,
-                      "ref_gap": ref["gaps"].get(f"{a['rids'][i]}:{k}"),
-                      "arm_gap": arm["gaps"].get(f"{b['rids'][i]}:{k}")})
+                      "ref_gap": ref["gaps"].get(f"{ar[i]}:{k}") if i < len(ar) else None,
+                      "arm_gap": arm["gaps"].get(f"{br[i]}:{k}") if i < len(br) else None})
     gaps = [d["ref_gap"] for d in diffs if d["ref_gap"] is not None]
     bins = Counter()
     for g in gaps:
@@ -408,6 +447,7 @@ def main() -> None:
     p.add_argument("--num-blocks", type=int, default=1024)
     p.add_argument("--out", required=True)
     args = p.parse_args()
+    logging.getLogger("TileLang").setLevel(logging.WARNING)  # one INFO pair per JIT'd kernel
 
     backend = get_backend()
     assert backend.device.type == "cuda", "needs TILERL_TARGET=cuda"
@@ -445,9 +485,9 @@ def main() -> None:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    done = []
+    done, seen = [], set()
     for a in arms:
-        r = run_arm(a, cfg, models, backend, tok, prompts, sp, mmlu, args.num_blocks)
+        r = run_arm(a, cfg, models, backend, tok, prompts, sp, mmlu, args.num_blocks, seen)
         (out / f"{r['arm']}.json").write_text(json.dumps(r))
         done.append(r)
 
@@ -464,7 +504,10 @@ def main() -> None:
                "residues": f"{r['trace']['residues_reached']}/64",
                "wide_residues": f"{r['trace']['wide_residues_reached']}/64",
                "nan_row_ticks": r["trace"]["nan_row_ticks"],
-               "widths": r["trace"]["widths"]}
+               "widths": r["trace"]["widths"], "kernels_new": r["kernels_new"],
+               "jit_during_timing": r["jit_during_timing"],
+               "mgemv": r["mgemv"], "mma_red": r["mma_red"], "tf32": r["tf32"],
+               "gdn_chunkwise": r["gdn_chunkwise"], "gdn_fla": r["gdn_fla"]}
         if r is not ref:
             row["gsm8k_vs_ref"] = compare(ref, r, "gsm8k")
             if mmlu is not None:
