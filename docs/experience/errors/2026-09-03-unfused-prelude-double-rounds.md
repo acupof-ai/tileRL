@@ -51,25 +51,60 @@ so the choice is not re-derived:
 Unlanded deliberately: serving-path arithmetic wants its own tranche with a parity
 gate, and it should land beside a CPU twin for `attn_prep` rather than alone.
 
-## Why the parity gate could not catch it
+## Why the parity gate could not catch it — two independent holes
 
-`src/tilerl/testing.py:53`:
+**Hole 1: the branch has no CPU twin.** `src/tilerl/testing.py:53`:
 
     def attn_prep(self, *args, **kwargs):
         return None
 
-`RefBackend.attn_prep` is a stub. It returns `None` unconditionally, so
+`RefBackend.attn_prep` is a stub returning `None` unconditionally, so
 `model.py:212`'s `if qn is not None` is always false on the CPU target and the CPU
-cell **always takes the double-rounding path**. There is nothing for the parity
-gate to compare against: the gate runs the wrong arm against the reference and
-passes. `attn_prep` is reachable only on sm90, only through the fused branch, and
-the correctness gate is structurally incapable of reaching it.
+cell always takes the **discrete** path. Both arms of every CPU parity test run
+the same prelude, so the gate compares the wrong arm against the reference and
+passes. `attn_prep` is reachable only on sm90, only through the fused branch.
 
-This is not a missing test. Writing a test would not have helped without first
-writing the CPU twin. Same class as
+**Hole 2: the extra rounding is not in the CPU cell at all.** The rounding is
+`kernels.py:110`'s `Y = T.empty((M, N), "bfloat16")` in `make_rmsnorm_fused_bf16`,
+and `registry.py` registers the bf16 norm outputs **only in `_SM90_KERNELS`** —
+`_CPU_KERNELS` maps `rmsnorm_apply` to `make_rmsnorm_apply`, which emits f32
+(`kernels.py:60`), and has no `rmsnorm_fused` at all. The CPU cell is f32
+throughout and does not double-round.
+
+So writing the CPU twin makes the *branch* comparable on CPU and still leaves the
+*rounding* invisible there. **A CPU parity gate cannot catch this defect even after
+the twin lands**; the gate has to run on sm90. Two holes in the same defect, and
+closing the one that is easy to see does not close the other.
+
+The chain, counted: discrete is f32 → **bf16** (`rmsnorm_fused`) → f32
+(`Backend.rope` re-widens an already-rounded value, recovering nothing) → f32
+(rope kernel emits f32, `kernels.py:425`) → **bf16** (`write_tokens`).
+`attn_prep` is f32 → f32 → **bf16**. One extra rounding, which is the 2.0007x.
+
+This is not a missing test. Writing a test would not have helped without the CPU
+twin, and the twin alone would not have helped either. Same class as
 [a stub that replaces the component under test makes the gate blind to it](2026-09-03-an-oracle-stub-blinds-the-gate-it-sits-in.md),
 one level worse: there the stub replaced the component in one gate, here it is the
 only CPU implementation there has ever been, so every gate inherits it.
+
+## Where the extra rounding is observable
+
+`backend.rmsnorm` has six call sites in `model.py`, and the bf16 intermediate only
+matters where the norm's output survives to a stored value rather than being
+requantized immediately:
+
+| site | consumer | bf16 intermediate matters? |
+|---|---|---|
+| `input_norm` (199, 270) | fp4/fp8 GEMM | no — fp8 quantization rounds harder |
+| `post_attn_norm` (337) | fp4/fp8 GEMM | no — same |
+| `q_norm`/`k_norm` (239, 240) | rope → bf16 KV pool | **yes — this is the measured 2.0007x** |
+| `final_norm` (390) | lm_head `_linear` | **unmeasured, and it is the logit path** |
+
+`final_norm` is the open one. The argument that a bf16 intermediate is harmless
+where the result is requantized does not obviously transfer to the site whose
+output *is* the logits, and the flips being chased are logit-margin flips. It may
+be dominated by the head's own quantization; nobody has measured it. An f32-output
+variant covering q/k norm only would leave that site as it is.
 
 ## Four hypotheses that were wrong, and how each was killed
 
