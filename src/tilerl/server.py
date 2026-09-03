@@ -486,7 +486,8 @@ _LANDING = """<!doctype html>
 
 
 # ---------------------------------------------------------------------------
-# Single-file chat UI (~100 lines, no build step).
+# Single-file chat UI: inline CSS/JS, system fonts, no network fetch beyond this origin
+# (the server is often reached through a tunnel with no egress).
 # ---------------------------------------------------------------------------
 
 _CHAT_UI = """<!doctype html>
@@ -497,105 +498,370 @@ _CHAT_UI = """<!doctype html>
 <title>tilerl</title>
 <style>
   :root {
-    color-scheme: dark;
-    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
-    --fg: #e6e8eb; --dim: #8b93a1; --accent: #7aa2f7; --accent2: #9ece6a;
-    --tool: #e0af68; --obs: #7dcfff;
+    color-scheme: light;
+    --paper: #f3f2ef; --surface: #fbfaf8; --sunken: #eae8e3;
+    --line: #dcd9d3; --line-firm: #c5c1b8;
+    --ink: #22211e; --ink-2: #57534c; --ink-3: #726d64;
+    --accent: #4f746e; --accent-ink: #3d5b56; --accent-fg: #f8f8f6; --accent-wash: #e6ebe9;
+    --danger: #91574f; --danger-wash: #f1e6e4;
+    --shadow: 0 1px 2px rgba(34,33,30,.05), 0 10px 28px -18px rgba(34,33,30,.22);
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --r: 3px; --r2: 7px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --paper: #15161a; --surface: #1b1d21; --sunken: #212429;
+      --line: #2b2e34; --line-firm: #3d4148;
+      --ink: #e3e1dd; --ink-2: #a3a19b; --ink-3: #8d8c86;
+      --accent: #8fb0aa; --accent-ink: #a8c5c0; --accent-fg: #14161a; --accent-wash: #1e2625;
+      --danger: #c08d85; --danger-wash: #2a2020;
+      --shadow: 0 1px 2px rgba(0,0,0,.32), 0 12px 32px -20px rgba(0,0,0,.7);
+    }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body {
     margin: 0; height: 100vh; display: flex; flex-direction: column;
-    font: 15px/1.55 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
-    background: var(--bg); color: var(--fg);
+    font: 15px/1.6 var(--sans); background: var(--paper); color: var(--ink);
+    -webkit-font-smoothing: antialiased;
   }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  /* Header rail: identity left, mode switch middle, instrument cluster right. */
   header {
-    padding: 12px 18px; border-bottom: 1px solid var(--line);
-    display: flex; gap: 14px; align-items: center;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 10px 20px; border-bottom: 1px solid var(--line); background: var(--surface);
   }
-  header .logo { font-weight: 700; font-size: 17px; color: var(--accent); letter-spacing: .3px; }
-  header .model { color: var(--dim); font-size: 13px; }
-  header .metrics { margin-left: auto; display: flex; gap: 16px; font-size: 12px; color: var(--dim); }
-  header .metrics b { color: var(--accent2); font-variant-numeric: tabular-nums; }
-  .tabs { display: flex; gap: 4px; }
+  .mark { font: 600 14px/1 var(--mono); letter-spacing: -.2px; color: var(--ink); text-decoration: none; }
+  .mark:hover { color: var(--accent-ink); }
+  .id { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--line-firm); flex: none; }
+  .dot.live { background: var(--accent); animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .model {
+    font: 11.5px/1 var(--mono); color: var(--ink-3); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; max-width: 30ch;
+  }
+  .tabs { display: flex; gap: 2px; padding: 2px; background: var(--sunken); border-radius: var(--r2); }
   .tab {
-    padding: 5px 14px; border-radius: 8px; cursor: pointer; font-size: 13px;
-    color: var(--dim); background: transparent; border: 1px solid transparent;
+    padding: 5px 13px; border: 0; border-radius: 5px; cursor: pointer; background: transparent;
+    font: 500 12.5px/1.3 var(--sans); color: var(--ink-3);
   }
-  .tab.on { color: var(--fg); background: var(--panel2); border-color: var(--line); }
-  main { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
-  .msg { max-width: 780px; width: fit-content; padding: 9px 14px; border-radius: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .user { align-self: flex-end; background: #24406b; }
-  .assistant { align-self: flex-start; background: var(--panel2); }
-  .ev { max-width: 820px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-  .ev .head { padding: 5px 12px; font-size: 12px; font-weight: 600; letter-spacing: .4px; text-transform: uppercase; }
-  .ev .body { padding: 9px 12px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; background: var(--panel); }
-  .ev.thought .head { color: var(--dim); }
-  .ev.action .head { color: var(--tool); }
-  .ev.action .body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
-  .ev.observation .head { color: var(--obs); }
-  .ev.observation .body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; max-height: 240px; overflow: auto; }
-  .ev.answer { border-color: var(--accent2); }
-  .ev.answer .head { color: var(--accent2); }
-  .ev.error { border-color: #f7768e; }
-  .ev.error .head { color: #f7768e; }
-  form { display: flex; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--line); }
+  .tab:hover { color: var(--ink-2); }
+  .tab.on {
+    color: var(--ink); background: var(--surface); box-shadow: 0 1px 2px rgba(0,0,0,.07);
+  }
+
+  /* Instruments: the point of the demo, so tabular numerals and a real unit treatment. */
+  .gauges {
+    margin-left: auto; display: flex; border: 1px solid var(--line);
+    border-radius: var(--r2); background: var(--paper); overflow: hidden;
+  }
+  .gauge { padding: 4px 14px 5px; min-width: 96px; }
+  .gauge + .gauge { border-left: 1px solid var(--line); }
+  .gk {
+    display: block; font: 600 9.5px/1.4 var(--sans); text-transform: uppercase;
+    letter-spacing: .1em; color: var(--ink-3);
+  }
+  .gv { display: flex; align-items: baseline; gap: 3px; }
+  .gv b {
+    font: 500 17px/1.2 var(--mono); font-variant-numeric: tabular-nums;
+    color: var(--ink); letter-spacing: -.4px;
+  }
+  .gv i { font: 400 10px/1 var(--sans); font-style: normal; color: var(--ink-3); }
+
+  /* Transcript: a document with a role gutter, not two colored bubbles. */
+  main { flex: 1; overflow-y: auto; padding: 4px 20px 28px; }
+  .col { max-width: 760px; margin: 0 auto; }
+  .turn { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 18px; padding: 20px 0; }
+  .turn + .turn, .turn + .ev, .ev + .turn { border-top: 1px solid var(--line); }
+  .who {
+    font: 600 9.5px/2.2 var(--sans); text-transform: uppercase; letter-spacing: .1em;
+    color: var(--ink-3); text-align: right;
+  }
+  .turn.user .who { color: var(--ink-2); }
+  .content { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .turn.user .content {
+    font-size: 14.5px; color: var(--ink-2);
+    border-left: 2px solid var(--line-firm); padding-left: 13px;
+  }
+  .turn.assistant .content { font-size: 15px; line-height: 1.68; }
+  .content.streaming::after {
+    content: ""; display: inline-block; width: 2px; height: 1.05em; margin-left: 1px;
+    background: var(--accent); vertical-align: text-bottom; animation: blink 1.1s steps(2) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .note { font: 11.5px/1.6 var(--sans); color: var(--ink-3); padding: 4px 0 0 80px; }
+
+  /* Reasoning: present but subordinate — no box, hairline rule, smaller dim type. */
+  .think { margin: 0 0 14px; border-left: 2px solid var(--line); }
+  .think > summary {
+    display: flex; align-items: center; gap: 7px; padding: 1px 0 1px 13px; cursor: pointer;
+    list-style: none; font: 600 9.5px/1.8 var(--sans); text-transform: uppercase;
+    letter-spacing: .1em; color: var(--ink-3);
+  }
+  .think > summary::-webkit-details-marker { display: none; }
+  .think > summary:hover { color: var(--ink-2); }
+  .chev { font-size: 7px; line-height: 1; transition: transform .18s ease; }
+  .think[open] .chev { transform: rotate(90deg); }
+  .n { font: 400 9.5px/1 var(--mono); letter-spacing: 0; text-transform: none; color: var(--ink-3); }
+  .thinkbody {
+    padding: 7px 0 3px 13px; max-height: 300px; overflow: auto;
+    font-size: 13.5px; line-height: 1.62; color: var(--ink-2);
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+
+  /* Agent stream: the five kinds differ by weight and indent, not by hue. */
+  .ev { margin: 0 0 10px 80px; }
+  .ev:first-child { margin-top: 20px; }
+  .ev .head {
+    display: flex; align-items: center; gap: 7px;
+    font: 600 9.5px/1.8 var(--sans); text-transform: uppercase; letter-spacing: .1em;
+    color: var(--ink-3);
+  }
+  .mk { font: 400 11px/1 var(--mono); color: var(--ink-3); }
+  .ev .body { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+  .ev.thought { border-left: 2px solid var(--line); padding-left: 13px; }
+  .ev.thought .head { padding-bottom: 2px; }
+  .ev.thought .body { font-size: 13.5px; line-height: 1.62; color: var(--ink-2); }
+
+  .ev.action, .ev.observation {
+    margin-left: 100px; border: 1px solid var(--line); border-radius: var(--r);
+    background: var(--surface); overflow: hidden;
+  }
+  .ev.action .head, .ev.observation .head {
+    padding: 5px 11px; background: var(--sunken); border-bottom: 1px solid var(--line);
+  }
+  .ev.action .head span:last-child { font-family: var(--mono); text-transform: none; letter-spacing: 0; font-size: 11px; color: var(--ink-2); }
+  .ev.action .body, .ev.observation .body {
+    padding: 9px 11px; font: 12.5px/1.6 var(--mono); color: var(--ink-2);
+  }
+  /* A call and its return read as one unit. */
+  .ev.action + .ev.observation {
+    margin-top: -10px; border-top: 0;
+    border-top-left-radius: 0; border-top-right-radius: 0;
+  }
+  .ev.observation .body { background: var(--paper); max-height: 240px; overflow: auto; font-size: 12px; }
+
+  .ev.answer, .ev.error {
+    margin-left: 80px; padding: 13px 16px; border: 1px solid var(--line);
+    border-left: 3px solid var(--accent); border-radius: var(--r);
+    background: var(--surface); box-shadow: var(--shadow);
+  }
+  .ev.answer .body { font-size: 15px; line-height: 1.68; color: var(--ink); padding-top: 3px; }
+  .ev.error { border-left-color: var(--danger); background: var(--danger-wash); box-shadow: none; }
+  .ev.error .head { color: var(--danger); }
+  .ev.error .mk { color: var(--danger); }
+  .ev.error .body { font: 12.5px/1.6 var(--mono); color: var(--ink-2); padding-top: 3px; }
+
+  /* Empty state */
+  .empty { padding: 40px 0 0; max-width: 560px; }
+  .empty h1 { margin: 0 0 7px; font: 600 19px/1.3 var(--sans); letter-spacing: -.2px; }
+  .empty p { margin: 0; font-size: 14px; color: var(--ink-2); }
+  .seeds { display: flex; flex-wrap: wrap; gap: 7px; margin: 22px 0 0; padding: 0; list-style: none; }
+  .seed {
+    padding: 6px 12px; border: 1px solid var(--line); border-radius: 14px; cursor: pointer;
+    background: var(--surface); font: 12.5px/1.4 var(--sans); color: var(--ink-2); text-align: left;
+  }
+  .seed:hover { border-color: var(--line-firm); color: var(--ink); }
+  .legend {
+    margin: 30px 0 0; padding-top: 18px; border-top: 1px solid var(--line);
+    display: grid; grid-template-columns: 62px 1fr; gap: 6px 18px;
+    font-size: 12.5px; color: var(--ink-2);
+  }
+  .legend dt {
+    font: 600 9.5px/1.9 var(--sans); text-transform: uppercase; letter-spacing: .1em;
+    color: var(--ink-3); text-align: right;
+  }
+  .legend dd { margin: 0; }
+
+  /* Composer */
+  form { padding: 0 20px 18px; }
+  .dock {
+    max-width: 760px; margin: 0 auto; background: var(--surface);
+    border: 1px solid var(--line); border-radius: var(--r2); box-shadow: var(--shadow);
+  }
+  .dock:focus-within { border-color: var(--line-firm); }
   textarea {
-    flex: 1; resize: none; padding: 10px 12px; border-radius: 8px;
-    border: 1px solid var(--line); background: var(--panel); color: var(--fg); font: inherit;
+    display: block; width: 100%; resize: none; border: 0; background: transparent;
+    padding: 12px 14px 2px; color: var(--ink); font: 15px/1.6 var(--sans); max-height: 200px;
   }
-  textarea:focus { outline: none; border-color: var(--accent); }
-  button {
-    padding: 0 22px; border: 0; border-radius: 8px; background: var(--accent);
-    color: #0f1115; font-weight: 600; cursor: pointer;
+  textarea::placeholder { color: var(--ink-3); }
+  textarea:focus { outline: none; }
+  .dockbar { display: flex; align-items: center; gap: 10px; padding: 4px 10px 9px 14px; }
+  .hint { font: 11.5px/1.5 var(--sans); color: var(--ink-3); }
+  kbd {
+    font: 10px/1.5 var(--mono); border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: var(--r); padding: 0 4px; color: var(--ink-2); background: var(--sunken);
   }
-  button:disabled { opacity: .5; cursor: default; }
+  .btn {
+    margin-left: auto; padding: 6px 16px; border: 1px solid transparent; border-radius: var(--r);
+    font: 500 13px/1.5 var(--sans); cursor: pointer;
+    background: var(--accent); color: var(--accent-fg);
+  }
+  .btn:hover { background: var(--accent-ink); }
+  .btn:disabled { opacity: .42; cursor: default; background: var(--accent); }
+  .btn.ghost {
+    margin-left: 0; background: transparent; color: var(--ink-2); border-color: var(--line-firm);
+  }
+  .btn.ghost:hover { background: var(--sunken); color: var(--ink); }
+
+  @media (max-width: 640px) {
+    header { padding: 10px 14px; gap: 10px; }
+    .gauges { margin-left: 0; width: 100%; }
+    .gauge { flex: 1; min-width: 0; }
+    main { padding: 4px 14px 24px; }
+    form { padding: 0 14px 14px; }
+    .turn { grid-template-columns: 1fr; gap: 5px; }
+    .who { text-align: left; }
+    .ev, .ev.answer, .ev.error { margin-left: 0; }
+    .ev.action, .ev.observation { margin-left: 14px; }
+    .note { padding-left: 0; }
+    .legend { grid-template-columns: 1fr; gap: 2px; }
+    .legend dt { text-align: left; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::after { animation: none !important; transition: none !important; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <a class="logo" href="/" style="text-decoration:none;color:inherit">tilerl</a>
-  <span class="model" id="model">connecting…</span>
-  <div class="tabs">
-    <div class="tab on" id="tab-chat" onclick="setMode('chat')">Chat</div>
-    <div class="tab" id="tab-agent" onclick="setMode('agent')">Agent</div>
+  <div class="id">
+    <a class="mark" href="/">tilerl</a>
+    <span class="dot" id="dot"></span>
+    <span class="model" id="model">connecting…</span>
   </div>
-  <div class="metrics">
-    <span>TTFT <b id="ttft">–</b></span>
-    <span><b id="tps">–</b> tok/s</span>
+  <div class="tabs" role="tablist">
+    <button class="tab on" id="tab-chat" type="button" role="tab" aria-selected="true" onclick="setMode('chat')">Chat</button>
+    <button class="tab" id="tab-agent" type="button" role="tab" aria-selected="false" onclick="setMode('agent')">Agent</button>
+  </div>
+  <div class="gauges">
+    <div class="gauge">
+      <span class="gk">TTFT</span>
+      <span class="gv"><b id="ttft">–</b><i>ms</i></span>
+    </div>
+    <div class="gauge">
+      <span class="gk">Throughput</span>
+      <span class="gv"><b id="tps">–</b><i>tok/s</i></span>
+    </div>
   </div>
 </header>
-<main id="feed"></main>
+<main id="scroll">
+  <div class="col" id="feed">
+    <div class="empty" id="empty">
+      <h1>Playground</h1>
+      <p>Streamed straight from the local engine. Time to first token and throughput
+         are measured in the browser on every response.</p>
+      <ul class="seeds">
+        <li><button class="seed" type="button" data-seed="Explain paged KV cache to someone who has written a matmul kernel but never served a model.">Explain paged KV cache</button></li>
+        <li><button class="seed" type="button" data-seed="Write a Python function that merges overlapping intervals, then walk through its edge cases.">Write and review a function</button></li>
+        <li><button class="seed" type="button" data-seed="What limits decode throughput on a single GPU — memory bandwidth or compute? Reason it out.">Reason about a bottleneck</button></li>
+      </ul>
+      <dl class="legend">
+        <dt>Chat</dt><dd>One streaming turn at a time, with history threaded back each send.</dd>
+        <dt>Agent</dt><dd>A tool-calling loop; each thought, call, and return arrives as its own event.</dd>
+      </dl>
+    </div>
+  </div>
+</main>
 <form id="composer">
-  <textarea id="input" rows="2" placeholder="Message tilerl  (Enter to send, Shift+Enter for newline)" autofocus></textarea>
-  <button id="send" type="submit">Send</button>
+  <div class="dock">
+    <textarea id="input" rows="1" placeholder="Message tilerl…" autofocus></textarea>
+    <div class="dockbar">
+      <span class="hint"><kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a newline</span>
+      <button class="btn ghost" id="stop" type="button" hidden>Stop</button>
+      <button class="btn" id="send" type="submit">Send</button>
+    </div>
+  </div>
 </form>
 <script>
 const $ = (id) => document.getElementById(id);
 let busy = false, mode = "chat", history = [], abort = null;
 
+const PLACEHOLDER = {
+  chat: "Message tilerl…",
+  agent: "Give the agent a task — it can run shell, read and write files…",
+};
+
 function setMode(m) {
   mode = m;
-  $("tab-chat").classList.toggle("on", m === "chat");
-  $("tab-agent").classList.toggle("on", m === "agent");
-  $("input").placeholder = m === "agent"
-    ? "Give the agent a task — it can run shell, read/write files  (Enter to send)"
-    : "Message tilerl  (Enter to send, Shift+Enter for newline)";
+  for (const k of ["chat", "agent"]) {
+    const t = $("tab-" + k);
+    t.classList.toggle("on", m === k);
+    t.setAttribute("aria-selected", String(m === k));
+  }
+  $("input").placeholder = PLACEHOLDER[m];
+}
+
+// The empty state is real content, not a spacer: drop it the moment a turn lands.
+function clearEmpty() {
+  const e = $("empty");
+  if (e) e.remove();
 }
 
 function addMsg(role, text) {
-  const div = document.createElement("div");
-  div.className = "msg " + role;
-  div.textContent = text;
-  $("feed").appendChild(div);
+  clearEmpty();
+  const turn = document.createElement("div");
+  turn.className = "turn " + role;
+  const who = document.createElement("div");
+  who.className = "who";
+  who.textContent = role === "user" ? "You" : "tilerl";
+  const content = document.createElement("div");
+  content.className = "content";
+  content.textContent = text;
+  turn.appendChild(who); turn.appendChild(content);
+  $("feed").appendChild(turn);
   scrollDown();
-  return div;
+  return content;
 }
 
+function addNote(text) {
+  const n = document.createElement("div");
+  n.className = "note";
+  n.textContent = text;
+  $("feed").appendChild(n);
+  scrollDown();
+  return n;
+}
+
+// Reasoning sits above the answer inside the same turn, recessive and collapsible.
+function addThinking(bubble) {
+  const det = document.createElement("details");
+  det.className = "think";
+  det.open = true;
+  const sum = document.createElement("summary");
+  const chev = document.createElement("span");
+  chev.className = "chev"; chev.textContent = "▶";
+  const label = document.createElement("span");
+  label.textContent = "Reasoning";
+  const n = document.createElement("span");
+  n.className = "n";
+  sum.appendChild(chev); sum.appendChild(label); sum.appendChild(n);
+  const body = document.createElement("div");
+  body.className = "thinkbody";
+  det.appendChild(sum); det.appendChild(body);
+  bubble.parentNode.insertBefore(det, bubble);
+  scrollDown();
+  return body;
+}
+
+const MARKS = { thought: "~", action: "→", observation: "←", answer: "◆", error: "!" };
+
 function addEvent(kind, title) {
+  clearEmpty();
   const box = document.createElement("div");
   box.className = "ev " + kind;
   const head = document.createElement("div");
-  head.className = "head"; head.textContent = title;
+  head.className = "head";
+  const mk = document.createElement("span");
+  mk.className = "mk"; mk.textContent = MARKS[kind] || "·";
+  const label = document.createElement("span");
+  label.textContent = title;
+  head.appendChild(mk); head.appendChild(label);
   const body = document.createElement("div");
   body.className = "body";
   box.appendChild(head); box.appendChild(body);
@@ -604,7 +870,7 @@ function addEvent(kind, title) {
   return body;
 }
 
-const scrollDown = () => { const m = $("feed"); m.scrollTop = m.scrollHeight; };
+const scrollDown = () => { const m = $("scroll"); m.scrollTop = m.scrollHeight; };
 
 async function readSSE(resp, onFrame) {
   const reader = resp.body.getReader();
@@ -627,54 +893,65 @@ async function readSSE(resp, onFrame) {
 }
 
 async function sendChat(text) {
-  const bubble = addMsg("assistant", "…");
+  const bubble = addMsg("assistant", "");
+  bubble.classList.add("streaming");
   const t0 = performance.now(); let firstAt = 0;
   history.push({ role: "user", content: text });
   abort = new AbortController();
-  const resp = await fetch("/v1/chat/completions", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    signal: abort.signal,
-    body: JSON.stringify({ messages: history, stream: true, stream_options: { include_usage: true } }),
-  });
-  if (!resp.ok) throw new Error("HTTP " + resp.status);
-  bubble.textContent = "";
-  let raw = "", think = null;
-  await readSSE(resp, (obj) => {
-    // The usage-only chunk carries no choices, so read it before indexing into them.
-    if (obj.usage) {
-      const secs = (performance.now() - (firstAt || t0)) / 1000;
-      if (secs > 0) $("tps").textContent = (obj.usage.completion_tokens / secs).toFixed(1);
-      return;
-    }
-    const delta = obj.choices?.[0]?.delta?.content;
-    if (!delta) return;
-    if (!firstAt) { firstAt = performance.now(); $("ttft").textContent = Math.round(firstAt - t0) + " ms"; }
-    raw += delta;
-    // Split the model's reasoning out of the answer. The tags can land mid-delta, so
-    // re-partition the whole accumulated text each frame rather than tracking a state
-    // machine across chunk boundaries.
-    const open = raw.indexOf("<think>");
-    if (open < 0) { bubble.textContent = raw; scrollDown(); return; }
-    const close = raw.indexOf("</think>", open);
-    if (!think) think = addThinking(bubble);
-    think.textContent = raw.slice(open + 7, close < 0 ? undefined : close).trim();
-    bubble.textContent = (raw.slice(0, open) + (close < 0 ? "" : raw.slice(close + 8))).trim();
-    scrollDown();
-  });
+  let raw = "", think = null, collapsed = false;
+  try {
+    const resp = await fetch("/v1/chat/completions", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      signal: abort.signal,
+      body: JSON.stringify({ messages: history, stream: true, stream_options: { include_usage: true } }),
+    });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    await readSSE(resp, (obj) => {
+      // The usage-only chunk carries no choices, so read it before indexing into them.
+      if (obj.usage) {
+        const secs = (performance.now() - (firstAt || t0)) / 1000;
+        if (secs > 0) $("tps").textContent = (obj.usage.completion_tokens / secs).toFixed(1);
+        return;
+      }
+      const delta = obj.choices?.[0]?.delta?.content;
+      if (!delta) return;
+      if (!firstAt) { firstAt = performance.now(); $("ttft").textContent = Math.round(firstAt - t0); }
+      raw += delta;
+      // Split the model's reasoning out of the answer. The tags can land mid-delta, so
+      // re-partition the whole accumulated text each frame rather than tracking a state
+      // machine across chunk boundaries.
+      const open = raw.indexOf("<think>");
+      if (open < 0) { bubble.textContent = raw; scrollDown(); return; }
+      const close = raw.indexOf("</think>", open);
+      if (!think) think = addThinking(bubble);
+      think.textContent = raw.slice(open + 7, close < 0 ? undefined : close).trim();
+      think.parentNode.querySelector(".n").textContent = think.textContent.length + " chars";
+      bubble.textContent = (raw.slice(0, open) + (close < 0 ? "" : raw.slice(close + 8))).trim();
+      // Fold the reasoning away once the answer proper starts, but only once, so a
+      // reader who opened it back up keeps it open.
+      if (close >= 0 && !collapsed) { collapsed = true; think.parentNode.open = false; }
+      scrollDown();
+    });
+  } finally {
+    bubble.classList.remove("streaming");
+    // Keep partial text from a stopped stream, but never thread an empty turn back.
+    if (raw) history.push({ role: "assistant", content: raw });
+  }
   if (!bubble.textContent && !think) bubble.textContent = "(empty response)";
-  history.push({ role: "assistant", content: raw });
 }
 
 async function sendAgent(text) {
   const t0 = performance.now();
+  abort = new AbortController();
   const resp = await fetch("/v1/agent", {
     method: "POST", headers: { "Content-Type": "application/json" },
+    signal: abort.signal,
     body: JSON.stringify({ message: text }),
   });
   if (!resp.ok) throw new Error("HTTP " + resp.status);
   let firstAt = 0;
   await readSSE(resp, (obj) => {
-    if (!firstAt) { firstAt = performance.now(); $("ttft").textContent = Math.round(firstAt - t0) + " ms"; }
+    if (!firstAt) { firstAt = performance.now(); $("ttft").textContent = Math.round(firstAt - t0); }
     const { type, payload } = obj;
     if (type === "thought") addEvent("thought", "thinking").textContent = payload;
     else if (type === "action") addEvent("action", payload.tool).textContent = JSON.stringify(payload.args, null, 2);
@@ -684,25 +961,55 @@ async function sendAgent(text) {
   });
 }
 
+function setBusy(on) {
+  busy = on;
+  $("send").disabled = on;
+  $("stop").hidden = !on;
+  $("dot").classList.toggle("live", on);
+}
+
 async function send() {
   const text = $("input").value.trim();
   if (!text || busy) return;
-  busy = true; $("send").disabled = true;
+  setBusy(true);
   addMsg("user", text);
   $("input").value = "";
+  autosize();
   try {
     if (mode === "agent") await sendAgent(text); else await sendChat(text);
   } catch (err) {
-    addEvent("error", "error").textContent = String(err);
+    // Stopping is a deliberate act, not a failure worth an error card.
+    if (err && err.name === "AbortError") addNote("Stopped.");
+    else addEvent("error", "error").textContent = String(err);
   }
-  busy = false; $("send").disabled = false; $("input").focus();
+  abort = null;
+  setBusy(false);
+  $("input").focus();
+}
+
+function autosize() {
+  const t = $("input");
+  t.style.height = "auto";
+  t.style.height = Math.min(t.scrollHeight, 200) + "px";
 }
 
 $("composer").addEventListener("submit", (e) => { e.preventDefault(); send(); });
+$("stop").addEventListener("click", () => { if (abort) abort.abort(); });
+$("input").addEventListener("input", autosize);
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
-fetch("/v1/models").then((r) => r.json()).then((j) => { $("model").textContent = j.data[0].id; });
+for (const b of document.querySelectorAll(".seed")) {
+  b.addEventListener("click", () => {
+    $("input").value = b.dataset.seed;
+    autosize();
+    $("input").focus();
+  });
+}
+autosize();
+fetch("/v1/models").then((r) => r.json()).then((j) => {
+  $("model").textContent = j.data[0].id;
+}).catch(() => { $("model").textContent = "offline"; });
 </script>
 </body>
 </html>
