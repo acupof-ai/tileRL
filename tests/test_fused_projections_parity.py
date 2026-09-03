@@ -2,9 +2,9 @@
 
 The fp4 case lives in test_weights.py::test_fused_projections_parity; this
 covers the native-fp8 qkvz group: _fuse_projections concats .w8/.wscale along
-N, _gdn splits the fused output back at the qkv boundary. The CPU cell has no
-fp8 kernel, so Backend.materialize rebuilds a bf16 weight from the served
-bytes on both sides; the concat is lossless, so the logits match.
+N, _gdn splits the fused output back at the qkv boundary. sm90 serves the fp8
+bytes; every other cell has Backend.materialize rebuild a bf16 weight from
+them. Either way the concat is lossless, so the logits match.
 """
 
 from dataclasses import replace
@@ -58,8 +58,8 @@ def test_fused_fp8_qkvz_parity():
     d = backend.device
     model.params = backend.materialize(model.params)
     fused.params = backend.materialize(fused.params)
-    # the CPU cell serves no fp8: materialize left one bf16 weight per key
-    assert f"{gdn}.qkvz" in fused.params and f"{gdn}.qkvz.w8" not in fused.params
+    # sm90 keeps the fp8 bytes, every other cell got one bf16 weight -- never both
+    assert (f"{gdn}.qkvz" in fused.params) ^ (f"{gdn}.qkvz.w8" in fused.params)
     with torch.no_grad():
         y0 = model.forward(batch, positions, _training_kv(model, 2, 16, device=d), backend)
         y1 = fused.forward(batch, positions, _training_kv(fused, 2, 16, device=d), backend)
