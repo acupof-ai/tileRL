@@ -388,6 +388,20 @@ def test_selector_codebooks_survive_the_engines_fp8_pass(tmp_path):
     assert set(out) == {*head.no_quant, "fc.w8", "fc.wscale"}, sorted(out)
 
 
+def test_load_draft_takes_a_checkpoint_directory(tmp_path):
+    """A directory mmapped as a file raises OSError(ENODEV), which names nothing;
+    three 27B runs were spent on it."""
+    from tilerl.spec import load_draft
+
+    _tiny_head(tmp_path)  # writes config.json + model.safetensors under tmp_path
+    trunk = build_random(tiny(), seed=0)
+    assert load_draft(trunk, tmp_path).width == load_draft(
+        trunk, tmp_path / "model.safetensors").width
+    (empty := tmp_path / "empty").mkdir()
+    with pytest.raises(FileNotFoundError, match="no model.safetensors"):
+        load_draft(trunk, empty)
+
+
 def test_spec_depth_is_the_checkpoints_block(tmp_path):
     head = _tiny_head(tmp_path)
     block = _HF["dflash_config"]["block_size"]

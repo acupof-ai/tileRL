@@ -325,9 +325,16 @@ def read_head_params(path: str | Path, stems: dict[str, str]) -> dict[str, torch
 
 def load_draft(trunk: Any, path: str | Path) -> Any:
     """Load a draft head from one safetensors file beside the trunk: a Qwen
-    NextN / DSpark chain head, or the DFlash2 block drafter."""
+    NextN / DSpark chain head, or the DFlash2 block drafter. A checkpoint
+    directory resolves to its ``model.safetensors``; mmapping the directory
+    itself raises a bare ``OSError: No such device``, which names nothing."""
     from safetensors import safe_open
 
+    path = Path(path)
+    if path.is_dir():
+        path = path / "model.safetensors"
+        if not path.exists():
+            raise FileNotFoundError(f"draft head: {path.parent} holds no model.safetensors")
     with safe_open(str(path), "pt", device="cpu") as f:
         if any(n.startswith("candidate_selector.") for n in list(f.keys())):
             from .dflash2 import load_dflash2
