@@ -50,8 +50,33 @@ from tilerl import cli
 from tilerl.cli import _build_model
 from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine
 from tilerl.spec import LADDER_WIDTHS, load_draft
+from tilerl.tokenizer import get_tokenizer
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from corpus import wikitext_ids  # noqa: E402  (after the sys.path insert above)
 
 DEPTHS = (1, 2, 3, 4)
+
+
+def gpu_state() -> str:
+    """SM clock, throttle reasons and load, sampled per depth.
+
+    Two runs of the identical command on the same commit agreed to 0.1% at depths
+    1-2 and diverged 1.58x and 2.08x at depths 3-4, with the SAME tick counts --
+    same work, twice the wall time, only later in the run. A tick's wall is ~35 ms
+    longer than its GPU time (the draft runs outside the graph), so anything that
+    slows the host or the clock lands directly in these numbers. Sampling it makes
+    a contaminated run say so instead of publishing a depth curve.
+    """
+    import subprocess
+    try:
+        q = subprocess.run(
+            ["nvidia-smi", "--query-gpu=clocks.sm,clocks_throttle_reasons.active,"
+             "temperature.gpu,power.draw", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception as exc:  # a probe must never take the measurement down
+        q = f"unavailable: {exc}"
+    return f"{q} load={os.getloadavg()[0]:.2f}"
 
 
 def set_depth_in_place(e, head, depth: int) -> None:
@@ -73,33 +98,32 @@ def set_depth_in_place(e, head, depth: int) -> None:
     assert e._width == depth + 1, f"engine kept width {e._width} for depth {depth}"
 
 
-def measure(e, ctx: int, tokens: int, vocab: int) -> tuple[float, float, float]:
-    """(ms per decode tick, tokens per forward, mean chain width) over DECODE ticks.
+def measure(e, prompt: list[int], tokens: int) -> tuple[float, float, float, dict]:
+    """(ms per decode tick, tokens per forward, mean chain width, per-rung times).
 
-    The prompt is drawn from the whole vocabulary, not `range(10, 10+ctx)`. That
-    old prompt makes tok/forward a function of ctx -- it reads a different slice of
-    the vocab at every length -- and at ctx=1024 it inflated acceptance from 2.03
-    to 2.86, which is 1.409x and straddles the 2.776 break-even at W=4.
-    errors/2026-09-03-the-context-sweep-changed-the-prompt.md
+    `prompt` decides tok/forward and nothing else. ms/tick is a cost measured at a
+    fixed rung and does not depend on which tokens are in the prompt, so the
+    draft-share subtraction this script exists for holds on any prompt -- but the
+    ACCEPTANCE half only means something with its distribution named. Random
+    vocabulary reads 2.62 and `range(10, 10+ctx)` reads 3.34 at the same config
+    (errors/2026-09-03-the-context-sweep-changed-the-prompt.md), so a default
+    settled on either is settled on an artifact; `--prompt wikitext` is the arm
+    that answers for text.
 
-    Only the SECOND return value is affected. ms/tick is a cost, measured at a
-    fixed rung, and does not depend on which tokens are in the prompt -- so the
-    draft-share subtraction this script exists for stands either way.
-
-    The THIRD is what tells you the subtraction is legal at all. `verify_lens`
-    trims the chain per tick from the draft's confidences, so a configured depth
-    is an upper bound on the width a tick actually verifies -- and this script's
-    premise is that depths 2 and 3 land on the SAME rung. Measured, not assumed.
+    The third value tells you the subtraction is legal at all: `verify_lens` trims
+    the chain per tick from the draft's confidences, so a configured depth is an
+    upper bound on the width a tick verifies, and each depth runs a MIXTURE of
+    rungs. The fourth buckets ticks by their own rung so the comparison stays
+    inside one.
     """
-    rid = e.submit(torch.randint(0, vocab, (ctx,),
-                                 generator=torch.Generator().manual_seed(1000)).tolist(),
+    rid = e.submit(list(prompt),
                    SamplingParams(temperature=0.0, max_new_tokens=tokens, seed=0))
     req = None
     while req is None or req.phase != _PHASE_DECODE:
         e.step()
         req = next((r for r in e._running if r.req_id == rid), None)
         if req is None:
-            raise SystemExit(f"ctx={ctx}: finished during prefill")
+            raise SystemExit(f"ctx={len(prompt)}: finished during prefill")
     torch.cuda.synchronize()
     s0, t0 = e.stats(), time.perf_counter()
     out, per_rung = None, defaultdict(list)
@@ -126,7 +150,7 @@ def measure(e, ctx: int, tokens: int, vocab: int) -> tuple[float, float, float]:
     n = s1["tokens_generated"] - s0["tokens_generated"]
     fwd = s1["decode_forwards"] - s0["decode_forwards"]
     if s1["mixed_forwards"] - s0["mixed_forwards"]:
-        raise SystemExit(f"ctx={ctx}: mixed tick inside the window")
+        raise SystemExit(f"ctx={len(prompt)}: mixed tick inside the window")
     width = 1 + (s1["spec_drafted"] - s0["spec_drafted"]) / max(fwd, 1)
     return wall / max(fwd, 1), n / max(fwd, 1), width, dict(per_rung)
 
@@ -137,6 +161,12 @@ def main() -> None:
     ap.add_argument("--draft", required=True)
     ap.add_argument("--ctx", type=int, default=1024)
     ap.add_argument("--tokens", type=int, default=128)
+    ap.add_argument("--prompt", choices=("wikitext", "random"), default="wikitext",
+                    help="wikitext-103 test text (default: the only arm whose "
+                         "acceptance means anything) or uniform ids over the vocab")
+    ap.add_argument("--prompts", type=int, default=3,
+                    help="distinct prompts per depth; acceptance varies by passage, "
+                         "so one prompt measures one passage")
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
     cli._QWEN38_SOURCE = args.source
@@ -144,8 +174,15 @@ def main() -> None:
     be = get_backend()
     cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft)
+    if args.prompt == "wikitext":
+        prompts = wikitext_ids(get_tokenizer(args.source), args.prompts, args.ctx)
+    else:
+        g = torch.Generator().manual_seed(1000)
+        prompts = [torch.randint(0, cfg.vocab_size, (args.ctx,), generator=g).tolist()
+                   for _ in range(args.prompts)]
 
-    print(f"# ctx={args.ctx}. Configured width is depth+1; rungs are {LADDER_WIDTHS}.")
+    print(f"# ctx={args.ctx}, prompt={args.prompt} x{args.prompts}. "
+          f"Configured width is depth+1; rungs are {LADDER_WIDTHS}.")
     print(f"# {'depth':>5} {'W':>3} {'chain':>6} {'ms/tick':>8} "
           f"{'tok/fwd':>8} {'tok/s':>7}  per-rung: rNxCOUNT:MEAN_MS")
     rows = {}
@@ -158,23 +195,43 @@ def main() -> None:
                      max_total_tokens=8192, draft=draft, spec_depth=max(DEPTHS))
     for d in DEPTHS:
         set_depth_in_place(e, draft, d)
-        measure(e, args.ctx, args.tokens, cfg.vocab_size)  # warm: JIT + graph capture
-        ms, tpf, chain, per_rung = measure(e, args.ctx, args.tokens, cfg.vocab_size)
-        rows[d] = (ms, tpf, chain, per_rung)
+        measure(e, prompts[0], args.tokens)  # warm: JIT + this width's graph capture
+        # Every depth sees the SAME prompts in the same order, so a between-depth
+        # difference cannot be a between-passage difference.
+        got = [measure(e, p, args.tokens) for p in prompts]
+        # Per-passage rows, not just their mean. Pooling hid a 1.58x drift: at
+        # --prompts 3 on wikitext the pooled rung-4 mean read 97.5 ms against 61.8
+        # for the first passage alone, which made verify come out NEGATIVE (-24 ms)
+        # and the rate 24.3 tok/s against a known 45.9. A mean cannot show whether
+        # the spread is between passages or along the run; these rows can.
+        if len(got) > 1:
+            for i, g in enumerate(got):
+                r4 = g[3].get(4, [])
+                print(f"        p{i}: {g[0]:>8.2f} {g[1]:>8.2f} {1000 * g[1] / g[0]:>7.1f}"
+                      + (f"  r4x{len(r4)}:{sum(r4) / len(r4):.1f}" if r4 else ""))
+        ms = sum(g[0] for g in got) / len(got)
+        tpf = sum(g[1] for g in got) / len(got)
+        chain = sum(g[2] for g in got) / len(got)
+        per_rung = defaultdict(list)
+        for g in got:
+            for r, v in g[3].items():
+                per_rung[r].extend(v)
+        rows[d] = (ms, tpf, chain, dict(per_rung))
         mix = " ".join(f"r{r}x{len(v)}:{sum(v)/len(v):.1f}"
                        for r, v in sorted(per_rung.items()))
         print(f"{d:>5} {1 + d:>3} {chain:>6.2f} {ms:>8.2f} {tpf:>8.2f} "
               f"{1000 * tpf / ms:>7.1f}  {mix}")
+        print(f"        gpu: {gpu_state()}")
     e.shutdown()
 
     # One draft forward, priced WITHIN one rung. Depths 2 and 3 both configure
     # width 3/4 -> rung 4, but verify_lens trims per tick, so each depth actually
-    # runs a MIX: at ctx=1024 depth 2 was 72% rung-2 ticks and depth 3 was 56%.
-    # Subtracting the two depths' MEAN ticks therefore moves 16% of all ticks
-    # across a 10.54 ms rung step and charges it to the draft -- up to 1.69 of a
-    # 5.01 ms number. So compare rung-4 ticks at depth 3 against rung-4 ticks at
-    # depth 2: same verify shape on both sides, and the only difference left is
-    # the one extra draft forward. Same failure as
+    # runs a MIX -- measured at ctx=1024 on random ids: depth 2 was 15 rung-2 ticks
+    # and 56 rung-4, depth 3 was 14 and 55. Subtracting the two depths' MEAN ticks
+    # therefore drags part of that mixture across the 16.73 ms rung step and charges
+    # it to the draft (0.61 of 4.54 ms there). So compare rung-4 ticks at depth 3
+    # against rung-4 ticks at depth 2: same verify shape on both sides, and the only
+    # difference left is the one extra draft forward. Same failure as
     # wins/2026-09-03-long-context-decode-is-all-tick-cost.md, one level finer:
     # there the rung moved between contexts, here between depths.
     RUNG = 4
@@ -222,6 +279,18 @@ def main() -> None:
     print(f"  a parallel head wins iff it keeps > {100 / ceiling:.1f}% of the "
           f"autoregressive head's tok/forward, whatever that is on your prompt")
     print(f"  (at the {tpf3:.2f} measured here that is {tpf3 / ceiling:.2f} tok/fwd)")
+
+    # Which depth to SHIP, which is a different question from the one above and the
+    # reason --prompt exists. Rate is tok/fwd / ms/tick, and both move with depth,
+    # so the winner cannot be reasoned out of acceptance alone.
+    best = max(rows, key=lambda d: rows[d][1] / rows[d][0])
+    ship = 3  # engine default
+    r_best, r_ship = (1000 * rows[d][1] / rows[d][0] for d in (best, ship))
+    print(f"\nDEPTH DEFAULT on {args.prompt}: best is {best} at {r_best:.1f} tok/s, "
+          f"shipped is {ship} at {r_ship:.1f} ({r_best / r_ship:.3f}x)")
+    if best != ship and r_best / r_ship < 1.0116:
+        print("  ...but inside the 1.16% harness noise floor, so this does not "
+              "license a flip on its own")
 
 
 if __name__ == "__main__":

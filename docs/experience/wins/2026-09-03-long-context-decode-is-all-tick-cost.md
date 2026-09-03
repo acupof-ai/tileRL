@@ -44,6 +44,11 @@ is the pessimistic end (2.03 at W=4, below the 2.776 break-even); consecutive lo
 ids are the optimistic end (2.86, just above). Neither is the serving distribution,
 so **the depth default cannot be settled on either** — that needs real text.
 
+**Settled 2026-09-04 on wikitext-103, and random vocabulary was NOT the pessimistic
+end**: text accepts 2.36 at W=4 against random ids' 2.99, so the "pessimistic end"
+label above is wrong. Depth 1 beats the shipped depth 3 by 1.266x on text and loses
+on random ids. [wins/2026-09-04-depth-default-is-wrong-on-text.md](2026-09-04-depth-default-is-wrong-on-text.md)
+
 ## Open, and load-bearing for the next decision
 
 Tick cost is **not linear in context**: 9.08 ms per 1K over 1024→2048, then 2.15

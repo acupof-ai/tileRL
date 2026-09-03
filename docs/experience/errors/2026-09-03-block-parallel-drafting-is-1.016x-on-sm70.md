@@ -173,6 +173,13 @@ end and consecutive low ids the optimistic one. **The depth default is therefore
 still unsettled**, and settling it needs real text; this entry's verdict does not
 depend on which end is right, because the parallel head loses at both.
 
+*2026-09-04: measured on wikitext-103, and the "pessimistic end" label is wrong —
+text accepts 2.36 at W=4 against random ids' 2.99. The verdict is unaffected (a
+lower acceptance moves the arm toward parity, and 2.36 sits between the two arms
+already tabulated), but the depth default is settled the other way: depth 1 beats
+the shipped depth 3 by 1.266x on text.
+[wins/2026-09-04-depth-default-is-wrong-on-text.md](../wins/2026-09-04-depth-default-is-wrong-on-text.md)*
+
 ## 2026-09-03, third pass: the draft forward is 3.93 ms, not 5.53
 
 The 5.53 ms draft forward, the 25.0% share and the 1.200x ceiling above are all
@@ -223,16 +230,24 @@ prompt-independent form is a ratio:
 | tok/fwd | p | yield | decay factor | verdict at the 1.147x ceiling |
 |---:|---:|---:|---:|---:|
 | 3.34 (confounded) | 0.881 | 2.831 | 0.847 | **0.972x** |
-| 2.62 (this pass) | 0.722 | 2.320 | 0.885 | **1.016x** |
-| 2.03 (random vocab) | 0.554 | 1.880 | 0.926 | **1.062x** |
+| 2.62 (random ids) | 0.722 | 2.320 | 0.885 | **1.016x** |
+| 2.36 (wikitext) | 0.654 | 2.129 | 0.902 | **1.035x** |
 
-**REJECT stands.** Every arm is inside 6% of parity and the two nearest are inside
-the 1.16% noise floor — on a ceiling that already assumes the parallel head's one
-forward costs exactly what ours does. It does not: DSpark's head is 5 layers /
-1.86B against our 1 layer / 456M, **4.08x the parameters**. Break-even allows that
-forward 9.28 ms against our 3.93 (2.36x), so a head 4x the size clears it only if
-it is >1.7x more efficient per parameter than the head we already run. Nothing in
-the source study suggests that.
+*Correction, 2026-09-04: the ratio is prompt-independent in FORM but not in VALUE,
+and the earlier text here implied otherwise. The decay factor is `yield/tok_fwd`,
+and it rises monotonically as p falls (0.847 → 0.885 → 0.902) because the decay
+model shrinks the suffix geometrically — so at lower acceptance a larger share of
+the yield sits in the positions a parallel head keeps. Lower acceptance therefore
+FAVOURS block-parallel, and the wikitext p, which is the corpus we serve, gives the
+arm its best reading yet at 1.035x. That is still a reject, but it is carried by the
+parameter-count gap below, not by the margin.*
+
+**REJECT stands.** Every arm is inside 4% of parity, on a ceiling that already
+assumes the parallel head's one forward costs exactly what ours does. It does not:
+DSpark's head is 5 layers / 1.86B against our 1 layer / 456M, **4.08x the
+parameters**. Break-even allows that forward 9.28 ms against our 3.93 (2.36x), so a
+head 4x the size clears it only if it is >1.7x more efficient per parameter than the
+head we already run. Nothing in the source study suggests that.
 
 Note the direction: the *tighter* draft measurement made the ceiling **worse**
 (1.200 → 1.147), because a cheaper draft is less to remove. The earlier pass had it

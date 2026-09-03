@@ -32,6 +32,10 @@ from tilerl import cli
 from tilerl.cli import _build_model
 from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine
 from tilerl.spec import LADDER_WIDTHS, load_draft
+from tilerl.tokenizer import get_tokenizer
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from corpus import wikitext_ids  # noqa: E402  (after the sys.path insert above)
 
 #: Kernel-name substring -> the op class it belongs to. First match wins, so
 #: order matters: the fp4 GEMV names contain "gemv", attention contains "attn".
@@ -97,6 +101,8 @@ def main() -> None:
                     help="comma-separated contexts, profiled in ONE process so the "
                          "pool, the captured graphs and the allocator are identical")
     ap.add_argument("--tokens", type=int, default=16)
+    ap.add_argument("--prompt", choices=("random", "wikitext"), default="random",
+                    help="uniform ids over the vocab, or wikitext-103 test text")
     args = ap.parse_args()
     ctxs = [int(c) for c in args.ctx.split(",")]
     os.environ.setdefault("TILERL_TARGET", "cuda")
@@ -111,14 +117,23 @@ def main() -> None:
     def to_decode(ctx: int, tokens: int):
         """Submit and burn the prefill chunks; return the request id.
 
-        The prompt is drawn from the whole vocabulary, not `range(10, 10+ctx)`:
-        that old prompt makes its own CONTENT a function of ctx, so tok/forward
-        moves with length for a reason that is not length
+        The default prompt is drawn from the whole vocabulary, not
+        `range(10, 10+ctx)`: that old prompt makes its own CONTENT a function of
+        ctx, so tok/forward moves with length for a reason that is not length
         (errors/2026-09-03-the-context-sweep-changed-the-prompt.md). Here it would
         put a different acceptance in each row's per-token divisor.
+
+        `--prompt wikitext` exists because the two prompts do not just accept
+        differently, they cost differently: at ctx=1024 depth 3 reads 97.5 ms per
+        rung-4 tick on wikitext against 63.9 on random ids, same rung and same
+        binary. Same-rung ticks should cost the same regardless of content, so one
+        of those is measuring something other than the tick.
         """
-        ids = torch.randint(0, cfg.vocab_size, (ctx,),
-                            generator=torch.Generator().manual_seed(1000)).tolist()
+        if args.prompt == "wikitext":
+            ids = wikitext_ids(get_tokenizer(args.source), 1, ctx)[0]
+        else:
+            ids = torch.randint(0, cfg.vocab_size, (ctx,),
+                                generator=torch.Generator().manual_seed(1000)).tolist()
         rid = e.submit(ids, SamplingParams(temperature=0.0, max_new_tokens=tokens, seed=0))
         req = None
         while req is None or req.phase != _PHASE_DECODE:
