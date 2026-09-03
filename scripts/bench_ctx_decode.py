@@ -43,7 +43,7 @@ def _sync() -> None:
         torch.cuda.synchronize()
 
 
-def measure(e, ctx: int, tokens: int, batch: int = 1, width: int = 1) -> tuple[float, float, int]:
+def measure(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, int]:
     """tok/s and tok/forward over DECODE ticks only.
 
     ``batch`` submits that many concurrent requests, which is the only way a tick
@@ -53,17 +53,18 @@ def measure(e, ctx: int, tokens: int, batch: int = 1, width: int = 1) -> tuple[f
     does not). A B=1 run silently measured the same kernel in both arms of the
     spec-ncols A/B -- errors/2026-09-03-the-spec-ncols-ab-ran-at-b1.md.
 
-    ``width`` is the expected 1+depth, checked against the rows the engine really
-    submits. Only _run_forward sees that count: tok/forward cannot stand in for it,
-    since a fully-rejected batch still yields one token per request per tick and so
-    reads ~batch no matter how wide the tick was.
+    Only _run_forward sees the batch a tick really ran: tok/forward cannot stand in
+    for it, since a fully-rejected batch still yields one token per request per tick
+    and so reads ~batch no matter how wide the tick was.
     """
     rows: list[int] = []
+    reqs: list[int] = []
     orig = type(e)._run_forward
 
     def spy(self, decodes, prefills, chunks):
         if decodes and not prefills:
             rows.append(sum(1 + len(r.drafts) for r in decodes))
+            reqs.append(len(decodes))
         return orig(self, decodes, prefills, chunks)
 
     rids = [e.submit(list(range(10 + i * ctx, 10 + (i + 1) * ctx)),
@@ -131,13 +132,24 @@ def measure(e, ctx: int, tokens: int, batch: int = 1, width: int = 1) -> tuple[f
     mixed = s1["mixed_forwards"] - s0["mixed_forwards"]
     if mixed:  # a mixed tick never speculates; it would dilute tok/forward
         raise SystemExit(f"ctx={ctx}: {mixed} mixed ticks inside the window")
-    if rows and max(rows) < batch * width:
-        raise SystemExit(f"ctx={ctx}: widest tick was {max(rows)} rows, expected "
-                         f"{batch * width}; this is not the batch it claims to be")
+    # Guard the BATCH, not the row count. An earlier version asserted
+    # max(rows) >= batch * width, which is wrong for a reason that only shows up as the
+    # batch grows: verify_lens trims each request's chain independently
+    # (engine.py:991-997), so requiring the full B*W demands all B requests keep every
+    # draft in the SAME tick -- B independent events, so the false-positive rate rises
+    # with B. It killed a healthy B=8 run at 28 rows (8 requests, 4 drafts trimmed).
+    # The claim worth checking is "did B requests actually decode together", which the
+    # trim cannot affect.
+    if reqs and max(reqs) < batch:
+        raise SystemExit(f"ctx={ctx}: widest tick had {max(reqs)} requests, expected "
+                         f"{batch}; this is not the batch it claims to be")
+    if rows and max(rows) < batch:  # a chain trimmed to nothing still submits 1 row each
+        raise SystemExit(f"ctx={ctx}: widest tick was {max(rows)} rows for {batch} "
+                         f"requests; the spy is not seeing verify ticks")
     return n / wall, n / max(fwd, 1), n
 
 
-def timed(e, ctx: int, tokens: int, batch: int = 1, width: int = 1) -> tuple[float, float, str]:
+def timed(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, str]:
     """Warm this context, then measure it, and flag an unwarmed reading.
 
     A speculative run captures a CUDA graph per (batch, chain width), and a
@@ -151,9 +163,9 @@ def timed(e, ctx: int, tokens: int, batch: int = 1, width: int = 1) -> tuple[flo
     Flags rather than raises: a SystemExit here leaves the engine holding the
     whole card, and the orphan is invisible until the next run OOMs.
     """
-    measure(e, ctx, tokens, batch, width)
-    warm, _, _ = measure(e, ctx, tokens, batch, width)
-    tps, per_fwd, _ = measure(e, ctx, tokens, batch, width)
+    measure(e, ctx, tokens, batch)
+    warm, _, _ = measure(e, ctx, tokens, batch)
+    tps, per_fwd, _ = measure(e, ctx, tokens, batch)
     return tps, per_fwd, " UNWARMED" if tps > 2 * warm else ""
 
 
@@ -212,7 +224,7 @@ def main() -> None:
     print(f"\n{label} B={args.batch} ({rows} rows/tick): "
           f"{'ctx':>6} {'tok/s':>8} {'ms/tok':>8} {'tok/fwd':>8}")
     for ctx in ctxs:
-        tps, per_fwd, flag = timed(e, ctx, args.tokens, args.batch, w)
+        tps, per_fwd, flag = timed(e, ctx, args.tokens, args.batch)
         print(f"{ctx:>6} {tps:>8.1f} {1000 / tps:>8.1f} {per_fwd:>8.2f}{flag}")
 
 
