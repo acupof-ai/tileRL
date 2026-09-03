@@ -233,36 +233,27 @@ def _assert_stream_is_incremental(client, body) -> None:
         f"stream != non-stream:\n  joined  {''.join(deltas)!r}\n  expected {expected!r}"
     )
 
-    # Streaming is asserted separately, by _stream_deltas_for below: how many deltas
-    # a live engine produces is a race between generation speed and the loop's 20 ms
-    # poll, and the tiny model can finish a 24-token reply inside one window. Measured
-    # 3 deltas at seeds 7/42/3, 1 at 11/99, and 1 on macos-14 where it passed locally.
-    # Racing it here would make this gate flaky in both directions.
-
-    # No incremental delta may END on U+FFFD: that is where a multi-byte character
-    # was cut in half, and holding the trailing replacement run until its bytes
-    # arrive is the whole point of the loop's rstrip.
+    # No incremental delta may END on U+FFFD: that is where a multi-byte character was
+    # cut in half, and holding the trailing replacement run until its bytes arrive is
+    # the whole point of the loop's rstrip.
     #
     # Deliberately not "contains no U+FFFD": tiny() has random weights, so its bytes
     # are mostly not valid UTF-8 and the non-streamed reply carries interior
     # replacement chars on all four model seeds measured -- an assertion against
-    # containment is unsatisfiable for any loop that actually streams, and the
-    # earlier one passed only because the loop emitted nothing until the end.
+    # containment is unsatisfiable for any loop that actually streams, and the earlier
+    # one passed only because the loop emitted nothing until the end.
+    #
+    # How MUCH streamed is asserted by
+    # test_a_reply_that_arrives_over_many_polls_streams_over_many_deltas, against a
+    # stepped engine, and deliberately NOT here: the delta count off a live engine is
+    # a race between generation speed and the loop's 20 ms poll, and the tiny model
+    # can finish a 24-token reply inside one window. Measured 3 deltas at seeds
+    # 7/42/3 and 1 at 11/99. An assertion that the last delta is not the whole reply
+    # therefore fails on timing, not on a defect -- it did, 2 runs in 6 of this file,
+    # while passing every time the test ran alone. The stepped engine reveals one
+    # token per poll by construction and asserts the same invariant deterministically.
     assert not any(d.endswith("�") for d in deltas[:-1]), (
         f"an incremental delta ends mid-character: {deltas!r}"
-    )
-
-    # The LAST delta must not be the whole reply. Every check above passes when the
-    # poll loop emits nothing and the final tail chunk carries everything: the delta
-    # count is >1 (role frame plus tail) and the join is trivially correct. Measured
-    # across four model seeds, the two-defect loop -- a token count compared against
-    # a character count, plus a cut at the FIRST U+FFFD rather than the trailing run
-    # -- put the whole reply in the tail on 3 of 4, with `joined == expected` true in
-    # all 8 runs of both arms. This is the assertion that separates them: 0 of 4
-    # under the fix.
-    assert not expected or deltas[-1] != expected, (
-        f"the last delta is the entire reply, so nothing streamed while it generated: "
-        f"{deltas!r}"
     )
 
 

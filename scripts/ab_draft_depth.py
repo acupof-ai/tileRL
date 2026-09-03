@@ -58,6 +58,14 @@ from corpus import wikitext_ids  # noqa: E402  (after the sys.path insert above)
 DEPTHS = (1, 2, 3, 4)
 
 
+def _sync() -> None:
+    """Bracket a timed window, on any target. Unguarded `torch.cuda.synchronize()`
+    raises "Torch not compiled with CUDA enabled" on the CPU cell, so the batching
+    logic here could only be exercised on the pod."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def gpu_state() -> str:
     """SM clock, throttle reasons and load, sampled per depth.
 
@@ -98,59 +106,70 @@ def set_depth_in_place(e, head, depth: int) -> None:
     assert e._width == depth + 1, f"engine kept width {e._width} for depth {depth}"
 
 
-def measure(e, prompt: list[int], tokens: int) -> tuple[float, float, float, dict]:
-    """(ms per decode tick, tokens per forward, mean chain width, per-rung times).
+def measure(e, prompts: list[list[int]], tokens: int) -> tuple[float, float, float, dict]:
+    """(ms per decode tick, tokens per forward, mean rows x width, per-rung times).
 
-    `prompt` decides tok/forward and nothing else. ms/tick is a cost measured at a
-    fixed rung and does not depend on which tokens are in the prompt, so the
+    All of `prompts` are submitted before the first step, so `len(prompts)` is the
+    batch: the depth question is not scale-free on this arch. `_NCOLS_MIN_M = 32`
+    means the verify GEMV switches kernel at M = rows x width >= 32, and the ladder
+    rounds M up, so at B=4 depth 1 lands on M=8 (rung 8, exactly filled, ncols=1)
+    while depth 3 lands on M=16 (rung 32, half padding, ncols=2). Two variables move
+    at once there and neither is the one that decided B=1.
+
+    `prompt` content decides tok/forward and nothing else. ms/tick is a cost measured
+    at a fixed rung and does not depend on which tokens are in the prompt, so the
     draft-share subtraction this script exists for holds on any prompt -- but the
     ACCEPTANCE half only means something with its distribution named. Random
-    vocabulary reads 2.62 and `range(10, 10+ctx)` reads 3.34 at the same config
-    (errors/2026-09-03-the-context-sweep-changed-the-prompt.md), so a default
-    settled on either is settled on an artifact; `--prompt wikitext` is the arm
-    that answers for text.
+    vocabulary reads 2.99 at W=4 and wikitext 2.36
+    (wins/2026-09-04-depth-default-is-wrong-on-text.md), so a default settled on
+    synthetic ids is settled on an artifact.
 
     The third value tells you the subtraction is legal at all: `verify_lens` trims
     the chain per tick from the draft's confidences, so a configured depth is an
     upper bound on the width a tick verifies, and each depth runs a MIXTURE of
-    rungs. The fourth buckets ticks by their own rung so the comparison stays
-    inside one.
+    rungs. The fourth buckets ticks by their own M so the comparison stays inside
+    one.
     """
-    rid = e.submit(list(prompt),
-                   SamplingParams(temperature=0.0, max_new_tokens=tokens, seed=0))
-    req = None
-    while req is None or req.phase != _PHASE_DECODE:
+    rids = [e.submit(list(p), SamplingParams(temperature=0.0, max_new_tokens=tokens,
+                                             seed=0)) for p in prompts]
+    while True:
         e.step()
-        req = next((r for r in e._running if r.req_id == rid), None)
-        if req is None:
-            raise SystemExit(f"ctx={len(prompt)}: finished during prefill")
-    torch.cuda.synchronize()
+        live = [r for r in e._running if r.req_id in rids]
+        if len(live) == len(rids) and all(r.phase == _PHASE_DECODE for r in live):
+            break
+        if not live and e.poll():
+            raise SystemExit(f"B={len(prompts)}: finished during prefill")
+    _sync()
     s0, t0 = e.stats(), time.perf_counter()
-    out, per_rung = None, defaultdict(list)
-    while out is None:
+    done, per_rung = {}, defaultdict(list)
+    while len(done) < len(rids):
         b0, k0 = e.stats(), time.perf_counter()
         e.step()
         b1 = e.stats()
-        # Time and price each tick by ITS OWN rung, not by the rung of the mean.
-        # A mean chain of 2.56 is 72% rung-2 ticks and 28% rung-4; depth 3's 2.88
-        # is 56/44. So 0.16 of all ticks change rung between the two depths, and
-        # rung 2 -> 4 is 10.54 ms -- up to 1.69 of the 5.01 ms "one draft forward"
-        # is that mix moving, not a draft. Rounding the mean cannot see it.
+        # Time and price each tick by ITS OWN M = rows x width, not by the M of the
+        # mean. At B=1 a mean chain of 2.56 was 72% rung-2 ticks and 28% rung-4 while
+        # depth 3's 2.88 was 56/44, so 0.16 of all ticks changed rung between the two
+        # depths and the 16.73 ms rung step landed inside a 5 ms "draft forward".
         # No per-tick sync: that would serialize what the tick overlaps and change
         # the cost being measured. The deltas are therefore submission-to-
         # submission, which is what a serving loop sees, and the window total
         # below is still the synced number.
-        if b1["decode_forwards"] > b0["decode_forwards"]:
-            w = 1 + b1["spec_drafted"] - b0["spec_drafted"]
-            per_rung[next(r for r in LADDER_WIDTHS if r >= w)].append(
-                (time.perf_counter() - k0) * 1000)
-        out = e.poll().get(rid)
-    torch.cuda.synchronize()
+        nf = b1["decode_forwards"] - b0["decode_forwards"]
+        if nf:
+            rows = len([r for r in e._running if r.req_id in rids and r.req_id not in done])
+            w = 1 + (b1["spec_drafted"] - b0["spec_drafted"]) / max(rows, 1)
+            m = max(rows, 1) * w
+            per_rung[next(r for r in LADDER_WIDTHS if r >= m)].append(
+                (time.perf_counter() - k0) * 1000 / nf)
+        done.update({k: v for k, v in e.poll().items() if k in rids})
+    _sync()
     wall, s1 = (time.perf_counter() - t0) * 1000, e.stats()
     n = s1["tokens_generated"] - s0["tokens_generated"]
     fwd = s1["decode_forwards"] - s0["decode_forwards"]
     if s1["mixed_forwards"] - s0["mixed_forwards"]:
-        raise SystemExit(f"ctx={len(prompt)}: mixed tick inside the window")
+        raise SystemExit(f"B={len(prompts)}: mixed tick inside the window")
+    # Rows retire at different times, so tokens/forward is the batch's aggregate and
+    # `m` below is the mean M actually launched, not rows x configured width.
     width = 1 + (s1["spec_drafted"] - s0["spec_drafted"]) / max(fwd, 1)
     return wall / max(fwd, 1), n / max(fwd, 1), width, dict(per_rung)
 
@@ -167,7 +186,19 @@ def main() -> None:
     ap.add_argument("--prompts", type=int, default=3,
                     help="distinct prompts per depth; acceptance varies by passage, "
                          "so one prompt measures one passage")
+    ap.add_argument("--batch", default="1",
+                    help="comma-separated batch sizes. The depth answer is NOT "
+                         "scale-free: the verify GEMV switches kernel at M=rows x "
+                         "width >= 32 and the ladder rounds M up, so at B=4 depth 1 "
+                         "fills rung 8 with ncols=1 while depth 3 half-fills rung 32 "
+                         "with ncols=2")
     args = ap.parse_args()
+    batches = [int(b) for b in args.batch.split(",")]
+    if args.prompts < max(batches):
+        raise SystemExit(
+            f"--prompts {args.prompts} < --batch {max(batches)}: a batch needs one "
+            "distinct prompt per row, or rows share a prefix and the prefix cache "
+            "makes their acceptance identical")
     os.environ.setdefault("TILERL_TARGET", "cuda")
     cli._QWEN38_SOURCE = args.source
 
@@ -181,60 +212,89 @@ def main() -> None:
         prompts = [torch.randint(0, cfg.vocab_size, (args.ctx,), generator=g).tolist()
                    for _ in range(args.prompts)]
 
-    print(f"# ctx={args.ctx}, prompt={args.prompt} x{args.prompts}. "
+    # The token cap is a first-class parameter of the result, not a runtime knob: a
+    # cap below the natural completion length truncates every row and changes what
+    # is being compared, which is how a GSM8K arm read 38.5% against a recorded 85%.
+    print(f"# ctx={args.ctx}, prompt={args.prompt} x{args.prompts}, "
+          f"max_new_tokens={args.tokens}, ncols gate M>=32. "
           f"Configured width is depth+1; rungs are {LADDER_WIDTHS}.")
-    print(f"# {'depth':>5} {'W':>3} {'chain':>6} {'ms/tick':>8} "
-          f"{'tok/fwd':>8} {'tok/s':>7}  per-rung: rNxCOUNT:MEAN_MS")
     rows = {}
     # ONE engine, depth varied in place. A fresh engine per depth OOMs: the KV
     # pool and captured graphs outlive shutdown() (which only joins the daemon
     # thread), and each build re-quantizes the draft into new tensors. The graph
     # is captured per (batch, chain width), so each depth is warmed before it is
     # timed and the capture stays outside the window.
-    e = build_engine(cfg, model, be, num_blocks=1024, num_slots=4, max_batch=4,
-                     max_total_tokens=8192, draft=draft, spec_depth=max(DEPTHS))
-    for d in DEPTHS:
-        set_depth_in_place(e, draft, d)
-        measure(e, prompts[0], args.tokens)  # warm: JIT + this width's graph capture
-        # Every depth sees the SAME prompts in the same order, so a between-depth
-        # difference cannot be a between-passage difference.
-        got = [measure(e, p, args.tokens) for p in prompts]
-        # Per-passage rows, not just their mean. Pooling hid a 1.58x drift: at
-        # --prompts 3 on wikitext the pooled rung-4 mean read 97.5 ms against 61.8
-        # for the first passage alone, which made verify come out NEGATIVE (-24 ms)
-        # and the rate 24.3 tok/s against a known 45.9. A mean cannot show whether
-        # the spread is between passages or along the run; these rows can.
-        if len(got) > 1:
-            for i, g in enumerate(got):
-                r4 = g[3].get(4, [])
-                print(f"        p{i}: {g[0]:>8.2f} {g[1]:>8.2f} {1000 * g[1] / g[0]:>7.1f}"
-                      + (f"  r4x{len(r4)}:{sum(r4) / len(r4):.1f}" if r4 else ""))
-        ms = sum(g[0] for g in got) / len(got)
-        tpf = sum(g[1] for g in got) / len(got)
-        chain = sum(g[2] for g in got) / len(got)
-        per_rung = defaultdict(list)
-        for g in got:
-            for r, v in g[3].items():
-                per_rung[r].extend(v)
-        rows[d] = (ms, tpf, chain, dict(per_rung))
-        mix = " ".join(f"r{r}x{len(v)}:{sum(v)/len(v):.1f}"
-                       for r, v in sorted(per_rung.items()))
-        print(f"{d:>5} {1 + d:>3} {chain:>6.2f} {ms:>8.2f} {tpf:>8.2f} "
-              f"{1000 * tpf / ms:>7.1f}  {mix}")
-        print(f"        gpu: {gpu_state()}")
+    e = build_engine(cfg, model, be, num_blocks=2048, num_slots=max(batches) + 1,
+                     max_batch=max(batches), max_total_tokens=8192, draft=draft,
+                     spec_depth=max(DEPTHS))
+    for B in batches:
+        print(f"\n# B={B}, M=rows x width -> {'/'.join(str(1 + d) for d in DEPTHS)} "
+              f"x {B} = {'/'.join(str(B * (1 + d)) for d in DEPTHS)}")
+        print(f"# {'depth':>5} {'W':>3} {'chain':>6} {'ms/tick':>8} "
+              f"{'tok/fwd':>8} {'tok/s':>7}  per-M: rNxCOUNT:MEAN_MS")
+        for d in DEPTHS:
+            set_depth_in_place(e, draft, d)
+            batch = prompts[:B]
+            measure(e, batch, args.tokens)  # warm: JIT + this (B, width) capture
+            # Every depth sees the SAME prompts in the same order, so a between-depth
+            # difference cannot be a between-passage difference.
+            got = [measure(e, batch, args.tokens) for _ in range(1 if B > 1 else len(prompts))]
+            # Per-run rows, not just their mean. Pooling hid a 1.58x drift: at
+            # --prompts 3 on wikitext the pooled rung-4 mean read 97.5 ms against 61.8
+            # for the first passage alone, which made verify come out NEGATIVE (-24 ms)
+            # and the rate 24.3 tok/s against a known 45.9. A mean cannot show whether
+            # the spread is between passages or along the run; these rows can.
+            if len(got) > 1:
+                for i, g in enumerate(got):
+                    print(f"        p{i}: {g[0]:>8.2f} {g[1]:>8.2f} "
+                          f"{1000 * g[1] / g[0]:>7.1f}")
+            ms = sum(g[0] for g in got) / len(got)
+            tpf = sum(g[1] for g in got) / len(got)
+            chain = sum(g[2] for g in got) / len(got)
+            per_rung = defaultdict(list)
+            for g in got:
+                for r, v in g[3].items():
+                    per_rung[r].extend(v)
+            rows[(B, d)] = (ms, tpf, chain, dict(per_rung))
+            mix = " ".join(f"r{r}x{len(v)}:{sum(v)/len(v):.1f}"
+                           for r, v in sorted(per_rung.items()))
+            print(f"{d:>5} {1 + d:>3} {chain:>6.2f} {ms:>8.2f} {tpf:>8.2f} "
+                  f"{1000 * tpf / ms:>7.1f}  {mix}")
+            print(f"        gpu: {gpu_state()}")
+        best = max(DEPTHS, key=lambda d: rows[(B, d)][1] / rows[(B, d)][0])
+        r_best, r_ship = (1000 * rows[(B, d)][1] / rows[(B, d)][0] for d in (best, 3))
+        print(f"  B={B}: best depth {best} at {r_best:.1f} tok/s, shipped 3 at "
+              f"{r_ship:.1f} ({r_best / r_ship:.3f}x)"
+              + ("  -- inside the 1.16% noise floor" if r_best / r_ship < 1.0116 else ""))
     e.shutdown()
 
-    # One draft forward, priced WITHIN one rung. Depths 2 and 3 both configure
-    # width 3/4 -> rung 4, but verify_lens trims per tick, so each depth actually
-    # runs a MIX -- measured at ctx=1024 on random ids: depth 2 was 15 rung-2 ticks
-    # and 56 rung-4, depth 3 was 14 and 55. Subtracting the two depths' MEAN ticks
-    # therefore drags part of that mixture across the 16.73 ms rung step and charges
-    # it to the draft (0.61 of 4.54 ms there). So compare rung-4 ticks at depth 3
-    # against rung-4 ticks at depth 2: same verify shape on both sides, and the only
-    # difference left is the one extra draft forward. Same failure as
-    # wins/2026-09-03-long-context-decode-is-all-tick-cost.md, one level finer:
-    # there the rung moved between contexts, here between depths.
-    RUNG = 4
+    # One draft forward, priced WITHIN one rung, from the FIRST batch size only --
+    # the draft-cost question is per-configuration and mixing batches would put two
+    # kernels in one subtraction.
+    B0 = batches[0]
+    rows = {d: rows[(B0, d)] for d in DEPTHS}
+
+    # Depths 2 and 3 configure width 3/4, so at B=1 both land on rung 4, but
+    # verify_lens trims per tick and each depth actually runs a MIX -- measured at
+    # ctx=1024 on random ids: depth 2 was 15 rung-2 ticks and 56 rung-4, depth 3 was
+    # 14 and 55. Subtracting the two depths' MEAN ticks therefore drags part of that
+    # mixture across the 16.73 ms rung step and charges it to the draft (0.61 of 4.54
+    # ms there). So compare same-rung ticks on both sides: identical verify shape, and
+    # the only difference left is the one extra draft forward. Same failure as
+    # wins/2026-09-03-long-context-decode-is-all-tick-cost.md, one level finer: there
+    # the rung moved between contexts, here between depths.
+    #
+    # The rung is derived from B, not hardcoded: at B=1 depths 2 and 3 share rung 4,
+    # at B=4 they are M=12 -> rung 32 and M=16 -> rung 32 (shared), and at B=8 they
+    # are M=24 and M=32 (also shared, but with different padding). Where they do NOT
+    # share one, the subtraction is not a draft forward and the script says so.
+    r2, r3 = (next(r for r in LADDER_WIDTHS if r >= B0 * (1 + d)) for d in (2, 3))
+    if r2 != r3:
+        raise SystemExit(
+            f"at B={B0} depths 2 and 3 launch different rungs ({r2} vs {r3}), so "
+            "their difference is a rung step, not one draft forward -- price the "
+            "draft at a batch where they share a rung")
+    RUNG = r3
     have = {d: rows[d][3].get(RUNG, []) for d in (2, 3)}
     if min(len(v) for v in have.values()) < 5:
         raise SystemExit(
@@ -279,18 +339,6 @@ def main() -> None:
     print(f"  a parallel head wins iff it keeps > {100 / ceiling:.1f}% of the "
           f"autoregressive head's tok/forward, whatever that is on your prompt")
     print(f"  (at the {tpf3:.2f} measured here that is {tpf3 / ceiling:.2f} tok/fwd)")
-
-    # Which depth to SHIP, which is a different question from the one above and the
-    # reason --prompt exists. Rate is tok/fwd / ms/tick, and both move with depth,
-    # so the winner cannot be reasoned out of acceptance alone.
-    best = max(rows, key=lambda d: rows[d][1] / rows[d][0])
-    ship = 3  # engine default
-    r_best, r_ship = (1000 * rows[d][1] / rows[d][0] for d in (best, ship))
-    print(f"\nDEPTH DEFAULT on {args.prompt}: best is {best} at {r_best:.1f} tok/s, "
-          f"shipped is {ship} at {r_ship:.1f} ({r_best / r_ship:.3f}x)")
-    if best != ship and r_best / r_ship < 1.0116:
-        print("  ...but inside the 1.16% harness noise floor, so this does not "
-              "license a flip on its own")
 
 
 if __name__ == "__main__":

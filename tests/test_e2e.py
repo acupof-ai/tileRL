@@ -968,6 +968,12 @@ def _full_context_draft(cfg, model, draft, backend, toks: list[int]) -> torch.Te
         (3, 6, 512, 1),    # ragged widths: rows commit different counts after a reject
         (1, 24, 8, 1),     # chunked prefill: the prompt spans several forwards
         (1, 6, 512, 2),    # a chain, so a rejected step leaves stale KV behind it
+        # A prompt that ENDS one token short of a block boundary, batched. The tick
+        # after prefill drafts position `plen`, which is the first position in the
+        # next block -- and the engine grows r.blocks for `decodes` only, so the row
+        # does not own it yet. This is the minimal form of the bug the `manychunks`
+        # case below was blamed on: one block, no chunking, fails on tick 1.
+        (2, 15, 512, 1),
         # Many chunks AND more than one row. Two independent bugs live here; the first
         # is fixed, the second is not, so this case is xfail rather than deleted.
         #
@@ -975,16 +981,16 @@ def _full_context_draft(cfg, model, draft, backend, toks: list[int]) -> torch.Te
         #     drafting, so its span outruns the one-forward hidden the engine keeps. At
         #     ctx=2048 on the 27B it asked for 1535 positions against 512 of hidden and
         #     died in the fc concat as "1535 vs 511", three frames from the cause.
-        # (2) OPEN: the draft's KV write then indexes row 2 of a 2-row block table
-        #     (kv_cache.py:149, "index 2 is out of bounds for dimension 0 with size 2").
-        #     Reproduced on unmodified spec.py, so it predates the clamp above and is a
-        #     separate defect in how the draft sizes its batch against its block table.
-        pytest.param(2, 32, 8, 1, marks=pytest.mark.xfail(
-            raises=IndexError, strict=True,
-            reason="draft KV write indexes past its block table on multi-row chunked "
-                   "prefill; predates the hidden-span clamp")),
+        # (2) ALSO FIXED in spec.py, and it was not what this case's name says. The
+        #     engine grows r.blocks for `decodes` (engine.py:707) but `_draft.step`
+        #     runs on EVERY row, so a row that just left prefill writes a position the
+        #     trunk has no block for -- block index 1 of a 1-column table. Chunked
+        #     prefill was incidental: it reproduces with 16-token prompts in one block
+        #     and no chunking at all, on the first tick after prefill. `hi` is now
+        #     clamped to the blocks the row owns, like the hidden span above.
+        (2, 32, 8, 1),
     ],
-    ids=["single", "multirow", "chunked", "depth2", "manychunks"],
+    ids=["single", "multirow", "chunked", "depth2", "blockedge", "manychunks"],
 )
 def test_engine_draft_matches_full_context_draft(rows, plen, batched_tokens, depth):
     """The draft the engine runs equals the draft draft_check.py measures. A

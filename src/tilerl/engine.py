@@ -760,6 +760,19 @@ class Engine:
         if decodes and prefills:
             self._mixed_forwards += 1
         if self._draft is not None:
+            # The draft writes position seq_len-1 on EVERY row it sees, including a
+            # row that just left prefill this tick -- and the growth loop above only
+            # covers `decodes`. A 15-token prompt therefore reached the draft owning
+            # one block while position 15 needs the second, which raised
+            # `IndexError: index 1 is out of bounds` from kv_cache.py:149, three
+            # frames away inside the trunk's own writer. Clamping the draft's span
+            # instead leaves a hole in its KV and the next position attends over it:
+            # measured, the engine then drafted token 79 where full context drafts 61.
+            for r in rows:
+                while r.blocks and len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 1:
+                    r.blocks.append(self._kv.alloc_block())
+                    r.own_blocks += 1
+                    self._blocks_used += 1
             self._draft.step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
 
     def _finish_prefills(self, prefills: list[_Req], chunks: list[int], logits, base: int) -> None:
