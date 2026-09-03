@@ -189,21 +189,33 @@ def _reference_draft(head, aux, positions, anchor):
     return hidden, out
 
 
+def _serve(head, backend):
+    """The engine materializes a head's params onto the backend before any tick;
+    a head built in a test and called directly has to take the same step, or the
+    arithmetic that does not go through the backend keeps CPU tensors."""
+    head.params.update(backend.materialize(head.params))
+
+
 # --- gates ------------------------------------------------------------------
 def test_block_draft_matches_reference(tmp_path):
     """The whole block forward, against the transcribed reference."""
-    head = _tiny_head(tmp_path)
+    head, backend = _tiny_head(tmp_path), get_backend()
     positions = torch.arange(5)
     g = torch.Generator().manual_seed(1)
     aux = torch.randn(1, 5, 2 * _HF["hidden_size"], generator=g)
 
-    tokens = head.draft(aux, positions, anchor=7, backend=get_backend())
+    # The reference is a CPU transcription, so it reads the params before the
+    # engine's materialize step puts them where the kernels want them.
     want_hidden, want_tokens = _reference_draft(head, aux[0], positions, 7)
+    _serve(head, backend)
+    positions = positions.to(backend.device)  # block_hidden reads them as-is; draft migrates
 
+    tokens = head.draft(aux, positions, anchor=7, backend=backend)
     got_hidden = head.block_hidden(
-        head.context_kv(aux, positions, get_backend()), positions, 7, 5, get_backend()
+        head.context_kv(aux, positions, backend), positions, 7, 5, backend
     )
-    assert torch.allclose(got_hidden[0, 1:], want_hidden, rtol=1e-2, atol=1e-2)
+    # .float(): the CUDA cell serves bf16 hidden, the CPU cell f32.
+    assert torch.allclose(got_hidden[0, 1:].float().cpu(), want_hidden, rtol=1e-2, atol=1e-2)
     assert tokens == want_tokens, (tokens, want_tokens)
     assert len(tokens) == _HF["dflash_config"]["block_size"] - 1
     top1 = (want_hidden @ head.trunk.params["embed_tokens"].float().t()).argmax(-1).tolist()
@@ -237,7 +249,7 @@ def test_selector_walk_follows_the_token_it_emitted(tmp_path):
     slot 0's own best candidate) picks 9 here, and every downstream token is
     then conditioned on a predecessor that was never drafted.
     """
-    head = _tiny_head(tmp_path)
+    head, backend = _tiny_head(tmp_path), get_backend()
     dc, rank = head.dcfg, head.dcfg.rank
     v = head.cfg.vocab_size
     head.params["selector.pred"] = torch.zeros(v, rank)
@@ -255,8 +267,10 @@ def test_selector_walk_follows_the_token_it_emitted(tmp_path):
     head.params["selector.proj"][0, 0] = 1.0
     hidden = torch.zeros(1, 2, head.cfg.hidden_size)
     hidden[0, :, 0] = 1.0  # proj = e_0, so only codebook column 0 scores
+    _serve(head, backend)
+    head.trunk.logits = head.trunk.logits.to(backend.device)
 
-    assert head.path(hidden, anchor=0, backend=get_backend()) == [12, 5]
+    assert head.path(hidden.to(backend.device), anchor=0, backend=backend) == [12, 5]
     assert dc.top_k == 3
 
 
