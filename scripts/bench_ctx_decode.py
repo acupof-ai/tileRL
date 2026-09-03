@@ -149,6 +149,11 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=1,
                     help="concurrent requests per tick; the rung a verify tick compiles "
                          "keys on B*W, so B=1 never reaches the 32 rung serving uses")
+    ap.add_argument("--max-ctx", type=int, default=max(CTXS),
+                    help="skip contexts above this. B=4 OOMs at ctx>=512 on a 32 GB card: "
+                         "paged_attention asked for 1.50 GiB with 0.69 free, and the block "
+                         "pool is only 0.03 GB of that, so it is transient kernel work "
+                         "scaling with B*S*history, not something a pool size fixes")
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
     # cli binds _QWEN38_SOURCE from the env at import, which already happened.
@@ -164,10 +169,15 @@ def main() -> None:
     # requests and the next submit() raises "LinearStatePool exhausted" -- which it did,
     # twice, and the engine hides it by falling back to an exact-size graph.
     slots = b + 2
-    # Blocks for every concurrent request's longest context plus its generation, with
-    # headroom: batch=4 at ctx 4096 needs ~1056 and the old fixed 1024 would have died
-    # on the last context after twenty minutes of measuring.
-    blocks = slots * (-(-(max(CTXS) + args.tokens + 2 * (1 + args.depth)) // BLOCK_TOKENS)) + 64
+    # Blocks for max_batch concurrent requests at the longest context -- NOT num_slots,
+    # which is 2 higher and bought 0.5 GB of pool that OOMed a 32 GB card at B=4 (each
+    # block costs 0.92 MB: 0.79 trunk + 0.13 for the draft's plane, which mirrors
+    # num_blocks). ctx 4096 at B=4 needs 1060; the +32 is slack for block-boundary
+    # rounding, not for a fifth request.
+    ctxs = [c for c in CTXS if c <= args.max_ctx]
+    if not ctxs:
+        raise SystemExit(f"--max-ctx {args.max_ctx} excludes every context in {CTXS}")
+    blocks = b * (-(-(max(ctxs) + args.tokens + 2 * (1 + args.depth)) // BLOCK_TOKENS)) + 32
     e = build_engine(cfg, model, backend, num_blocks=blocks, num_slots=slots, max_batch=b,
                      max_total_tokens=8192, draft=draft,
                      spec_depth=args.depth if draft else 1)
@@ -184,7 +194,7 @@ def main() -> None:
     rows = args.batch * w
     print(f"\n{label} B={args.batch} ({rows} rows/tick): "
           f"{'ctx':>6} {'tok/s':>8} {'ms/tok':>8} {'tok/fwd':>8}")
-    for ctx in CTXS:
+    for ctx in ctxs:
         tps, per_fwd, flag = timed(e, ctx, args.tokens, args.batch, w)
         print(f"{ctx:>6} {tps:>8.1f} {1000 / tps:>8.1f} {per_fwd:>8.2f}{flag}")
 
