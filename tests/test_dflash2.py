@@ -362,6 +362,9 @@ def test_block_drafter_on_the_engine_tick(tmp_path):
 
     def path(hidden, anchor, backend):
         i = at["start"] - len(_PROMPT) + 1
+        # slot 0 is the token the trunk committed at ``start``; an off-by-one anchor
+        # is invisible to output equality, so it is checked where it is handed over
+        assert anchor == base[i - 1], (anchor, base[i - 1])
         return [base[i + j] if 0 <= i + j < len(base) else 0 for j in range(hidden.shape[1])]
 
     head.block_hidden, head.path = block_hidden, path
@@ -392,3 +395,46 @@ def test_spec_depth_is_the_checkpoints_block(tmp_path):
     assert _draft_depth(head, None) == _HF["dflash_config"]["block_size"] - 1
     with pytest.raises(ValueError, match="verify width is fixed"):
         _draft_depth(head, 2)
+
+
+def test_engine_block_equals_the_full_context_block(tmp_path):
+    """The block the engine drafts must equal the block ``draft()`` produces from
+    the whole sequence. Output equality cannot see this — a rejected draft costs
+    throughput, never tokens — so a starved or misaligned context is silent
+    everywhere else.
+    """
+    import numpy as np
+
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.kv_cache import NoPrefixStore
+    from tilerl.train import _training_kv
+
+    head, backend = _tiny_head(tmp_path), get_backend()
+    model, taps = head.trunk, head.dcfg.target_layers
+    engine = build_engine(
+        tiny(), model, backend, num_blocks=64, num_slots=4, max_batch=4,
+        max_total_tokens=256, draft=head, decode_graph=False,
+        prefix_store=NoPrefixStore(),
+    )
+    seen: list[tuple[list[int], list[int]]] = []
+    inner = engine._draft_block
+
+    def spy(rows):
+        inner(rows)
+        seen.extend((list(r.tokens), list(r.drafts)) for r in rows if r.drafts)
+
+    engine._draft_block = spy
+    rid = engine.submit(_PROMPT, SamplingParams(temperature=0.0, max_new_tokens=12, seed=0))
+    for _ in range(48):
+        if engine.poll().get(rid):
+            break
+        engine.step()
+
+    assert len(seen) >= 3, seen
+    for tokens, drafts in seen[:3]:
+        ctx, pos = tokens[:-1], np.arange(len(tokens) - 1)
+        hid: list = []
+        model.forward(np.array([ctx]), pos, _training_kv(model, 1, len(ctx), device=backend.device),
+                      backend, hidden_out=hid, aux_layers=taps)
+        want = head.draft(torch.cat(hid[:-1], -1), pos, tokens[-1], backend)
+        assert drafts == want, (len(ctx), drafts, want)
