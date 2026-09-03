@@ -32,7 +32,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import secrets
 import time
 from typing import Any
 
@@ -40,9 +39,15 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .prompt import blocks_to_text, render_prompt, render_tool_call, render_tools, sampling, strip_think
+from .prompt import (
+    blocks_to_text,
+    render_prompt,
+    render_tool_call,
+    render_tools,
+    sampling,
+    strip_think,
+)
 from .tokenizer import Tokenizer
-
 
 #: One JSONL row per request. Overridable so a test does not write the real one.
 _RECORD_ENV = "TILERL_MESSAGES_RECORD"

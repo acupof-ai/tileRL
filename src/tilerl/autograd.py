@@ -5,16 +5,17 @@ ops replayed in reverse, accumulated by ``id()`` — leaves are the params."""
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator
+from typing import Any
 
 import torch
 
 from . import precision
 
 # ContextVar so concurrent sessions never cross-record; cleared during backward.
-_current_tape: ContextVar["Tape | None"] = ContextVar("tilerl_current_tape", default=None)
+_current_tape: ContextVar[Tape | None] = ContextVar("tilerl_current_tape", default=None)
 
 
 def maybe_record(op_name: str, output: torch.Tensor, *args: Any, **kwargs: Any) -> None:
@@ -251,7 +252,7 @@ class Tape:
         self._consumed = False
         self.bwd_backend: Any = None  # set by RecordingBackend; else the TileLang singleton
 
-    def __enter__(self) -> "Tape":
+    def __enter__(self) -> Tape:
         if self._token is not None or self._entries or self._consumed:
             raise RuntimeError("Tape is already active (nested/reused tape)")
         self._token = _current_tape.set(self)

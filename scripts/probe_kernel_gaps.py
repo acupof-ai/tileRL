@@ -18,12 +18,12 @@ def main() -> None:
     args = ap.parse_args()
 
     import torch
+    from tilerl_kernels.backend import get_backend
     from torch.profiler import ProfilerActivity, profile
 
     from tilerl.config import qwen38_27b
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.model import load_hf
-    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     base = qwen38_27b()

@@ -11,9 +11,9 @@ import time
 from dataclasses import replace
 
 import torch
+from tilerl_kernels import reference
 
 from tilerl.engine import SamplingParams
-from tilerl_kernels import reference
 
 
 def _drive(engine, wid, max_steps) -> None:
@@ -50,10 +50,11 @@ def main() -> None:
     p.add_argument("--prefill-len", type=int, default=512)
     args = p.parse_args()
 
+    from tilerl_kernels.backend import get_backend
+
     from tilerl.config import qwen36_27b
     from tilerl.engine import build_engine
     from tilerl.model import load_hf
-    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     if backend.device.type != "cuda":

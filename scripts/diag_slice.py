@@ -9,12 +9,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
+from tilerl_kernels.backend import get_backend
+from tilerl_kernels.reference import pack_fp4, unpack_fp4
 
 from tilerl.config import qwen36_27b
 from tilerl.kv_cache import LinearStatePool
 from tilerl.model import load_hf
-from tilerl_kernels.backend import get_backend
-from tilerl_kernels.reference import pack_fp4, unpack_fp4
 
 
 def main() -> None:

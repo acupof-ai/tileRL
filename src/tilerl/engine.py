@@ -44,7 +44,7 @@ from .kv_cache import (
     PagedKvPool,
     PrefixStore,
 )
-from .spec import survival, verify_lens
+
 
 def _graph_on(backend, decode_graph: bool | None) -> bool:
     """The captured decode tick is on by default on CUDA only. One definition:
@@ -917,7 +917,7 @@ def build_engine(
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
-) -> "Engine":
+) -> Engine:
     """Wire a model + backend into an Engine; pool shapes come from ``cfg``.
     ``decode_graph`` None auto-enables the captured decode tick on CUDA."""
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)

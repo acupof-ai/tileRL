@@ -22,6 +22,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import qwen38_27b
 from tilerl.engine import build_engine
@@ -30,7 +31,6 @@ from tilerl.kv_cache import NoPrefixStore
 from tilerl.model import load_hf
 from tilerl.prompt import render_chat, sampling
 from tilerl.tokenizer import get_tokenizer
-from tilerl_kernels.backend import get_backend
 
 
 def phase(engine, fn):

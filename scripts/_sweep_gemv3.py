@@ -7,9 +7,9 @@ Variants: group4 (shipped), shared_pp (same-warp shared ping-pong, +32 LDS/STS, 
 import sys
 import time
 
-import torch
 import tilelang
 import tilelang.language as T
+import torch
 
 sys.path.insert(0, "src")
 from tilerl_kernels.backend import get_backend

@@ -9,11 +9,9 @@ import os
 import sys
 import time
 
-import torch
-
 import tilelang
 import tilelang.language as T
-
+import torch
 from tilerl_kernels.kernels_linear import make_linear_fp4_gemv, make_linear_fp4_mma
 from tilerl_kernels.reference import unpack_fp4
 

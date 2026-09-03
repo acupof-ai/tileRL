@@ -10,7 +10,6 @@ os.environ.setdefault("TILERL_TARGET", "cpu")
 
 import pytest
 import torch
-
 from tilerl_kernels import reference
 from tilerl_kernels.backend import _MX, _resolve, get_backend
 from tilerl_kernels.reference import pack_fp4, renorm_fp4_scale, twiddle_fp4, untwiddle_fp4

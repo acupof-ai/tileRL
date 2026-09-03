@@ -36,7 +36,7 @@ class DataParallelEngine:
         self._n = len(engines)
 
     @classmethod
-    def build(cls, devices: list[int], make_engine, **kw) -> "DataParallelEngine":
+    def build(cls, devices: list[int], make_engine, **kw) -> DataParallelEngine:
         # The Backend binds torch.cuda.current_device() on construction, so each
         # replica is built inside its own context or it shares device 0's pools.
         engines, devs = [], []

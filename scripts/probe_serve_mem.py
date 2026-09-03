@@ -10,12 +10,12 @@ import argparse
 from collections import defaultdict
 
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import qwen36_27b
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.kv_cache import BLOCK_TOKENS
 from tilerl.model import load_hf
-from tilerl_kernels.backend import get_backend
 
 GB = 1 << 30
 

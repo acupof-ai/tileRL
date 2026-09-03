@@ -227,10 +227,11 @@ def main() -> None:
     )
     args = p.parse_args()
 
+    from tilerl_kernels.backend import get_backend
+
     from tilerl.config import qwen36_27b
     from tilerl.engine import build_engine
     from tilerl.model import load_hf
-    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     if backend.device.type != "cuda":

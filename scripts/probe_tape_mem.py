@@ -41,11 +41,11 @@ def main() -> None:
 
     import numpy as np
     import torch
+    from tilerl_kernels.backend import get_backend
 
     from tilerl import autograd
     from tilerl.autograd import AdamW
     from tilerl.train import rl_step
-    from tilerl_kernels.backend import get_backend
 
     if args.no_recompute:
         autograd.checkpoint = lambda fn, *a: fn(*a)

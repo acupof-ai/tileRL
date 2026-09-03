@@ -17,8 +17,7 @@ from typing import Any
 
 import torch
 
-from . import kernels_linear
-from . import reference
+from . import kernels_linear, reference
 from .registry import _arch_for, _resolve, resolve_target
 
 __all__ = ["Backend", "get_backend", "resolve_target"]

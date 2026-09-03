@@ -13,12 +13,12 @@ import gc
 
 import numpy as np
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.autograd import Adafactor, AdamW, RecordingBackend, Tape
 from tilerl.config import qwen38_27b
 from tilerl.model import add_lora, drop_quantized, load_hf
 from tilerl.train import _training_kv
-from tilerl_kernels.backend import get_backend
 
 G = 2**30
 

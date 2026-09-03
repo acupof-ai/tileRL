@@ -14,7 +14,6 @@ import torch
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from cuda_codegen import TARGET, enable  # noqa: E402
-
 from tilerl_kernels import reference  # noqa: E402
 
 MICRO = (8, 16, 32)

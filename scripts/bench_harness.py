@@ -138,6 +138,7 @@ def _median_windows(step_fn, n_windows: int, ticks: int, sync) -> float:
 def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
     """Engine rebuilt per row so the pools are sized for that depth."""
     import benchkit as bk
+
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.kv_cache import BLOCK_TOKENS
 
@@ -199,6 +200,7 @@ def suite_decode_kv(gate, cfg, model, backend, batches, depths, ticks):
 def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
     """Gated as a ratio against the plain arm measured in the same process."""
     import benchkit as bk
+
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.spec import load_draft
 
@@ -249,6 +251,7 @@ def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
 
 def suite_prefill(gate, cfg, model, backend, lengths):
     import benchkit as bk
+
     from tilerl.engine import build_engine
 
     cap = min(8192, cfg.max_position_embeddings)
@@ -267,6 +270,7 @@ def suite_prefill(gate, cfg, model, backend, lengths):
 
 def suite_kv_reuse(gate, cfg, model, backend):
     import benchkit as bk
+
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.kv_cache import BLOCK_TOKENS
 
@@ -437,8 +441,8 @@ def main() -> int:
     cfg = model = None
     if any(s in gpu_suites for s in suites):
         from tilerl.cli import _build_model
-        from tilerl.model import load_hf
         from tilerl.config import qwen38_27b
+        from tilerl.model import load_hf
         if args.source:
             cfg = qwen38_27b()
             model = load_hf(cfg, args.source, fuse_projections=True)

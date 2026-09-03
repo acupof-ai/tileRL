@@ -28,7 +28,6 @@ def _have_sgl_kernel():
 
 
 def _candidate_fp4_ops():  # the fp4 entry point has moved across releases
-    import sgl_kernel
 
     cands = []
     for path in (
@@ -47,7 +46,6 @@ def _candidate_fp4_ops():  # the fp4 entry point has moved across releases
 
 def bench_fp8():
     import torch
-
     from sgl_kernel.ops import cutlass_scaled_mm
 
     print(f"\n== fp8 (cutlass_scaled_mm, M={M}) ==")
@@ -72,7 +70,6 @@ def bench_fp8():
 
 
 def bench_fp4():
-    import torch
 
     cands = _candidate_fp4_ops()
     if not cands:

@@ -7,9 +7,9 @@ shared-X / shared-LUT / 256-LUT / f32-X all worse.
 import sys
 import time
 
-import torch
 import tilelang
 import tilelang.language as T
+import torch
 
 sys.path.insert(0, "src")
 from tilerl_kernels.backend import get_backend

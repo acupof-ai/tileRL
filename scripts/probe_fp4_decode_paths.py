@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import argparse
 
-import torch
-from torch.profiler import ProfilerActivity, profile
-
 import tilerl_kernels.backend as B
+import torch
 from tilerl_kernels import reference
 from tilerl_kernels.backend import get_backend
+from torch.profiler import ProfilerActivity, profile
 
 SHAPES = "8192x5120,5120x6144,17408x5120,5120x17408,10240x5120,6144x5120"
 

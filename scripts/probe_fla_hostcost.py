@@ -7,9 +7,8 @@ import argparse
 import time
 
 import torch
-from torch.profiler import ProfilerActivity, profile
-
 from tilerl_kernels import reference as R
+from torch.profiler import ProfilerActivity, profile
 
 
 def main() -> None:

@@ -13,6 +13,7 @@ import sys
 
 import numpy as np
 import torch
+from tilerl_kernels.backend import Backend, resolve_target
 
 from tilerl.config import qwen38_27b
 from tilerl.model import load_hf
@@ -20,7 +21,6 @@ from tilerl.prompt import render_chat
 from tilerl.spec import load_draft
 from tilerl.tokenizer import get_tokenizer
 from tilerl.train import _training_kv
-from tilerl_kernels.backend import Backend, resolve_target
 
 SRC = os.environ.get("TILERL_QWEN38_SOURCE", "/work/Qwen3.8-27B-NVFP4")
 DRAFT = os.environ.get("TILERL_DFLASH2_SOURCE", "/work/Qwen3.8-27B-DFlash2")

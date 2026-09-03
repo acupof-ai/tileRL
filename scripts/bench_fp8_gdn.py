@@ -13,11 +13,11 @@ import argparse
 from dataclasses import replace
 
 import torch
+from tilerl_kernels.backend import get_backend
+from tilerl_kernels.reference import pack_fp4
 
 from tilerl.config import qwen36_27b
 from tilerl.model import load_hf
-from tilerl_kernels.backend import get_backend
-from tilerl_kernels.reference import pack_fp4
 
 
 def _time(fn, iters=20):

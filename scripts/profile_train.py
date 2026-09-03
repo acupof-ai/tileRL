@@ -28,12 +28,12 @@ def main() -> None:
 
     import numpy as np
     import torch
+    from tilerl_kernels.backend import get_backend
     from torch.profiler import ProfilerActivity, profile
 
     from tilerl.autograd import AdamW
     from tilerl.config import qwen38_27b
     from tilerl.model import add_lora, load_hf
-    from tilerl_kernels.backend import get_backend
     from tilerl.train import train_step
 
     backend = get_backend()

@@ -9,9 +9,9 @@ from __future__ import annotations
 import sys
 import time
 
-import torch
 import tilelang
 import tilelang.language as T
+import torch
 
 sys.path.insert(0, "src")
 from tilerl_kernels.reference import gdn_forward

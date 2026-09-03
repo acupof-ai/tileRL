@@ -12,11 +12,11 @@ from dataclasses import replace
 
 import torch
 import torch.distributed as dist
+from tilerl_kernels.backend import Backend, resolve_target
 
 from tilerl.config import tiny
 from tilerl.model import build_random
 from tilerl.tensor_parallel import shard_params, tp_config
-from tilerl_kernels.backend import Backend, resolve_target
 
 
 def _logits(cfg, params, backend, ids):

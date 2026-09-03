@@ -7,14 +7,14 @@ import argparse
 import time
 from dataclasses import replace
 
-import torch
-
 import tilerl_kernels.kernels_linear as KL
 import tilerl_kernels.registry as REG
+import torch
+from tilerl_kernels.backend import get_backend
+
 from tilerl.config import qwen38_27b
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.model import load_hf
-from tilerl_kernels.backend import get_backend
 
 WARMUP = 8
 

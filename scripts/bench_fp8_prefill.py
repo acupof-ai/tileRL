@@ -7,7 +7,6 @@ at prefill shapes, isolated with CUDA events.
 from __future__ import annotations
 
 import torch
-
 from tilerl_kernels.backend import get_backend
 from tilerl_kernels.reference import pack_fp4
 

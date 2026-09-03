@@ -5,12 +5,11 @@ kernel, same process, at MLP prefill shapes.
 
 from __future__ import annotations
 
-import torch
 import tilelang
 import tilelang.language as T
-
+import torch
 from tilerl_kernels import kernels_mma
-from tilerl_kernels.backend import _pad2d, _round_up, _THREADS, get_backend
+from tilerl_kernels.backend import _THREADS, _pad2d, _round_up, get_backend
 from tilerl_kernels.reference import pack_fp4
 
 

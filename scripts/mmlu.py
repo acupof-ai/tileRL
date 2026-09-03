@@ -21,7 +21,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from tilerl.eval import LETTERS, letter, mmlu_questions, mmlu_score  # noqa: E402
 from tilerl.tokenizer import get_tokenizer  # noqa: E402
 
-
 #: concurrency is part of the score: it sets B, B sets M = B*W, and M picks the
 #: fp4 linear arm, so two values can run two kernels on one question. cli.py's
 #: eval used 8 and this used the default 32; they are one number now.
@@ -29,10 +28,11 @@ CONCURRENCY = 8
 
 
 def score_tilerl(source: str, prompts: list[str]) -> list[str]:
+    from tilerl_kernels.backend import get_backend
+
     from tilerl.config import qwen38_27b
     from tilerl.engine import build_engine
     from tilerl.model import load_hf
-    from tilerl_kernels.backend import get_backend
 
     model = load_hf(qwen38_27b(), source, fuse_projections=True)
     engine = build_engine(model.cfg, model, get_backend(), num_blocks=2048, num_slots=64,

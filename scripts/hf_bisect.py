@@ -22,10 +22,10 @@ def main() -> int:
     os.environ.setdefault("TILERL_TARGET", "cuda")
 
     import torch
+    from tilerl_kernels.backend import get_backend
 
     from tilerl.config import qwen38_27b
     from tilerl.model import load_hf
-    from tilerl_kernels.backend import get_backend
     from tilerl.train import _training_kv
 
     ref = torch.load(args.ref, map_location="cpu")

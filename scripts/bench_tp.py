@@ -12,12 +12,12 @@ import statistics
 import time
 
 import torch
+from tilerl_kernels.backend import Backend, resolve_target
 
 from tilerl.config import qwen36_27b
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.model import _fuse_projections, load_hf
 from tilerl.tensor_parallel import shard_params, tp_config
-from tilerl_kernels.backend import Backend, resolve_target
 
 
 def time_decode(engine, cfg, B, ticks, windows=3):

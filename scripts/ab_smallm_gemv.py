@@ -13,13 +13,13 @@ import time
 from dataclasses import replace
 
 import torch
+from tilerl_kernels import backend as backend_mod
+from tilerl_kernels import reference
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import qwen36_27b
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.model import load_hf
-from tilerl_kernels import backend as backend_mod
-from tilerl_kernels import reference
-from tilerl_kernels.backend import get_backend
 
 WARM = 12  # ticks: flushes B=8's 8 one-per-tick prefill admissions + 4 decodes
 TICKS = 30

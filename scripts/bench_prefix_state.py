@@ -17,12 +17,12 @@ import argparse
 
 import numpy as np
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import qwen38_27b
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
 from tilerl.model import load_hf
-from tilerl_kernels.backend import get_backend
 
 
 def retained(engine) -> tuple[int, int]:

@@ -17,9 +17,8 @@ args = ap.parse_args()
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 os.environ.setdefault("TILERL_TARGET", "cuda")
 
-import torch  # noqa: E402
-
 import benchkit as bk  # noqa: E402
+import torch  # noqa: E402
 from tilerl_kernels.backend import get_backend  # noqa: E402
 
 backend = get_backend()

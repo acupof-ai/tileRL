@@ -30,12 +30,12 @@ def main() -> None:
 
     import numpy as np
     import torch
+    from tilerl_kernels.backend import get_backend
 
     from tilerl.config import qwen38_27b
     from tilerl.engine import BatchKv
     from tilerl.kv_cache import BLOCK_TOKENS, LinearStatePool, PagedKvPool
     from tilerl.model import load_hf
-    from tilerl_kernels.backend import get_backend
     from tilerl.server import get_tokenizer
 
     backend = get_backend()

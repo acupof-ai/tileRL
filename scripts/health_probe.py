@@ -34,10 +34,10 @@ def main() -> int:
 
     import numpy as np
     import torch
+    from tilerl_kernels.backend import get_backend
 
     from tilerl.config import qwen38_27b, tiny
     from tilerl.model import build_random, load_hf
-    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     if args.source:

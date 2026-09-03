@@ -10,12 +10,11 @@ from __future__ import annotations
 import argparse
 import re
 
-import torch
-from torch.profiler import ProfilerActivity, profile
-
 import tilelang
+import torch
 from tilerl_kernels import kernels_linear, reference
 from tilerl_kernels.backend import _pad2d, _round_up, get_backend
+from torch.profiler import ProfilerActivity, profile
 
 KERNEL = "linear_fp4_mma8_kernel"
 _want = [0]

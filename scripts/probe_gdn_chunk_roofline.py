@@ -6,9 +6,8 @@ from __future__ import annotations
 import argparse
 
 import torch
-from torch.profiler import ProfilerActivity, profile
-
 from tilerl_kernels.backend import get_backend
+from torch.profiler import ProfilerActivity, profile
 
 # (name, M, N, K, count per chunk) — the matmuls of _gdn_chunk_fwd, per head.
 SHAPES = [

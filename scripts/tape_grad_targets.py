@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.autograd import RecordingBackend, Tape
 from tilerl.config import tiny
 from tilerl.model import build_random
 from tilerl.train import _training_kv
-from tilerl_kernels.backend import get_backend
 
 KEYS = ("embed_tokens", "layers.0.q_proj", "layers.1.in_proj_a", "final_norm")
 

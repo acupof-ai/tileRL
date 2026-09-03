@@ -13,10 +13,10 @@ from dataclasses import replace
 import pytest
 import torch
 from safetensors.torch import save_file
+from tilerl_kernels import reference
 
 from tilerl.config import tiny
 from tilerl.model import build_random, fp4_param_keys, load_hf, param_specs, save_hf
-from tilerl_kernels import reference
 
 #: param suffix -> HF suffix (reverse of model._LAYER_SUFFIXES)
 _SIMPLE = {
@@ -283,8 +283,8 @@ def test_fp4_save_load_roundtrip(tmp_path):
 def test_fused_projections_parity(tmp_path):
     """fuse_projections concats same-input fp4 projections; logits match unfused."""
     import numpy as np
-
     from tilerl_kernels.backend import get_backend
+
     from tilerl.testing import RefBackend
     from tilerl.train import _training_kv
 

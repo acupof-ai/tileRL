@@ -12,12 +12,12 @@ from dataclasses import replace
 
 import numpy as np
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import qwen38_27b
 from tilerl.engine import BatchKv, SamplingParams, build_engine
 from tilerl.model import load_hf
 from tilerl.spec import load_draft
-from tilerl_kernels.backend import get_backend
 
 REPS = 20
 

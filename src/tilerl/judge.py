@@ -24,8 +24,9 @@ both are silent when they break:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from itertools import combinations
-from typing import Any, Callable
+from typing import Any
 
 __all__ = ["pair_verdict", "copeland_scores", "judge_rewards", "judgement_rows"]
 
