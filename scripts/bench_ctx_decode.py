@@ -171,6 +171,14 @@ def main() -> None:
     e = build_engine(cfg, model, backend, num_blocks=blocks, num_slots=slots, max_batch=b,
                      max_total_tokens=8192, draft=draft,
                      spec_depth=args.depth if draft else 1)
+    # Capture every (bucket, width) up front. The trim varies W per tick, so waiting for
+    # warmup to happen to hit each one is a lottery: at B=1 there are 4 graphs and two
+    # warmups absorbed them, but B=4 needs 12 (~14 s each) and the first row came back
+    # flagged UNWARMED. cli.py and prof_serve_ramp.py both do this; this bench did not.
+    t0 = time.perf_counter()
+    n_graphs = e.precapture()
+    if n_graphs:
+        print(f"precapture: {n_graphs} graphs in {time.perf_counter() - t0:.0f}s")
     label = f"spec d{args.depth}" if draft else "dense"
     w = 1 + args.depth if draft else 1
     rows = args.batch * w
