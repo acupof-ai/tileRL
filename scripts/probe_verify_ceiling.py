@@ -47,8 +47,10 @@ from pathlib import Path
 
 import torch
 
+from tilerl import precision
 from tilerl.config import qwen38_27b
-from tilerl.engine import SamplingParams, _DecodeGraph, build_engine
+from tilerl.engine import Engine, SamplingParams, StepLimits, _DecodeGraph, build_engine
+from tilerl.kv_cache import LinearStatePool, NoPrefixStore, PagedKvPool
 from tilerl.model import load_hf
 from tilerl_kernels.backend import get_backend
 
@@ -185,11 +187,27 @@ def price(args) -> None:
                   full_attn_layers=tuple(i for i in base.full_attn_layers if i < args.layers))
     model = load_hf(cfg, args.source)
     widths = sorted({1, *tick_rows})
-    # keep=W needs step planes, which build_engine sizes from spec_depth; no draft
-    # head is loaded, so nothing drafts -- the graph is replayed on canned chains.
-    engine = build_engine(cfg, model, backend, num_blocks=1024, num_slots=B + 2,
-                          decode_graph=True, spec_depth=max(1, max(widths) - 1))
+    # The pools are built here rather than through build_engine because the two
+    # requirements collide there: keep=W reads the step planes, and build_engine
+    # sizes them from ``draft.width`` -- so no drafter means no planes and the
+    # kernel takes None. Engine takes the pools directly, so the planes exist and
+    # nothing drafts.
+    kv_pool = PagedKvPool(1024, cfg.num_kv_heads, cfg.head_dim,
+                          device=backend.device, layer_map=cfg.full_attn_layers)
+    state_pool = LinearStatePool(
+        B + 2, cfg.num_layers - len(cfg.full_attn_layers),
+        cfg.linear_num_value_heads, cfg.linear_value_head_dim,
+        device=backend.device,
+        dtype=precision.dtype("recurrent_state", backend.device),
+        conv_window=cfg.linear_conv_kernel_dim - 1, conv_dim=cfg.linear_qkv_dim,
+        spec_steps=max(widths),  # the planes keep=W needs, with no drafter to fill them
+    )
+    model.params = backend.materialize(model.params)
+    engine = Engine(model, backend, kv_pool, state_pool, NoPrefixStore(),
+                    StepLimits(max_batch=B, max_total_tokens=8192),
+                    decode_graph=True)
     assert engine._draft is None, "the timed phase must hold no draft head"
+    assert state_pool.step_states is not None, "keep=W needs the step planes"
 
     gen = torch.Generator().manual_seed(7)
     for _ in range(B):
@@ -250,7 +268,9 @@ def main() -> None:
     r.add_argument("--gsm8k-n", type=int, default=32)
     r.add_argument("--batch", type=int, default=8)
     r.add_argument("--width", type=int, default=8)
-    r.add_argument("--max-new-tokens", type=int, default=256)
+    # 512, not the recipe's 256: at 256 GSM8K completions are cut mid-solution
+    # (1 of 16 correct vs 170 of 200 at 512), so a 256 trace measures truncation
+    r.add_argument("--max-new-tokens", type=int, default=512)
     r.add_argument("--graph", action="store_true", default=True)
     r.add_argument("--out", required=True)
     r.set_defaults(fn=record)
