@@ -3,12 +3,14 @@
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/profile_verify_replay.py \
-        /data00/Qwen3.8-27B-NVFP4 --widths 1,2,3,5
+        $TILERL_QWEN38_SOURCE --widths 1,2,4,8 --batches 1,8 \
+        --draft /data00/Qwen3.8-27B-NVFP4/model_mtp.safetensors
 """
 
 from __future__ import annotations
 
 import argparse
+import subprocess
 from collections import defaultdict
 
 import torch
@@ -17,6 +19,13 @@ from tilerl.config import qwen38_27b
 from tilerl.engine import SamplingParams, _DecodeGraph, build_engine
 from tilerl.model import load_hf
 from tilerl_kernels.backend import get_backend
+
+
+def host_load() -> str:
+    """Neighbour utilisation per row: a contended row gives a ratio, not an absolute."""
+    smi = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu",
+                          "--format=csv,noheader,nounits"], capture_output=True, text=True)
+    return "/".join(smi.stdout.split()) + "%"
 
 
 def timed(fn, reps=20):
@@ -55,25 +64,28 @@ def main() -> None:
         from tilerl.spec import load_draft
 
         draft = load_draft(model, args.draft)
-    engine = build_engine(cfg, model, backend, num_blocks=1024, num_slots=16,
-                          decode_graph=True, draft=draft, spec_depth=4)
+    batches = [int(x) for x in args.batches.split(",")]
+    widths = [int(x) for x in args.widths.split(",")]
+    # step planes are 151 MB x steps per slot: size them for the widest chain, no more
+    engine = build_engine(cfg, model, backend, num_blocks=1024, num_slots=max(batches) + 2,
+                          decode_graph=True, draft=draft, spec_depth=max(1, max(widths) - 1))
 
     gen = torch.Generator().manual_seed(7)
-    batches = [int(x) for x in args.batches.split(",")]
     for _ in range(max(batches)):
         engine.submit(torch.randint(0, cfg.vocab_size, (16,), generator=gen).tolist(),
                       SamplingParams(temperature=0.0, max_new_tokens=4096))
     for _ in range(8):
         engine.step()
     prev = None
+    gpool = torch.cuda.graph_pool_handle()  # one pool: a private pool per graph is never returned
     for B in batches:
       rows = list(engine._running)[:B]
-      for W in (int(x) for x in args.widths.split(",")):
+      for W in widths:
           chains = [[r.output[-1]] * W for r in rows] if W > 1 else None
           # keep=W as in a real verify tick (state written per chain step); needs --draft.
           keep = W if (chains and draft is not None) else 0
           g = _DecodeGraph(model, backend, engine._kv, engine._states, B,
-                           width=W, keep=keep)
+                           width=W, pool=gpool, keep=keep)
           ms = timed(lambda: g.run(rows, chains))
           with profile(activities=[ProfilerActivity.CUDA]) as prof:
               for _ in range(5):
@@ -89,7 +101,7 @@ def main() -> None:
               by[e.name[:52]][1] += us
               tot += us
           print(f"\n=== W={W} B={B}: replay {ms:.3f} ms, GPU-busy {tot / 1e3:.2f} ms, "
-                f"{sum(c for c, _ in by.values()) // 5} kernels ===")
+                f"{sum(c for c, _ in by.values()) // 5} kernels, host {host_load()} ===")
           print(f"{'kernel':<52} {'n':>6} {'us ea':>8} {'ms':>8}")
           for name, (c, us) in sorted(by.items(), key=lambda kv: -kv[1][1])[: args.top]:
               print(f"{name:<52} {c // 5:>6} {us / c * 5:>8.1f} {us / 1e3:>8.3f}")
