@@ -205,11 +205,12 @@ def untruncated(sampling: Any) -> Any:
     """The sampler the policy gradient is actually taken under. ``rl_step`` scores
     with the full softmax, so a truncated or tempered rollout draws from one
     distribution and is differentiated as another, and nothing reweights them.
-    Sampling untruncated makes the sampler the policy by construction.
-    # ponytail: waypoint. The destination is to carry the rollout's kept set into
-    # the gradient (DeepSeek-V3.2 §3.1 "Keep Sampling Mask"); recomputing the mask
-    # at train time instead drops the sampled token at 0.156% of positions, which
-    # is 96% of steps at 256 new tokens -- errors/2026-09-03-recomputed-mask-loses-the-step.md."""
+    Sampling untruncated makes the sampler the policy by construction, and it
+    scores best on the deployed sampler too -- differentiating the truncated
+    sampler instead is identically zero wherever the nucleus holds one token.
+    Carrying the rollout's kept set into the gradient (DeepSeek-V3.2 3.1) is what
+    would let RL train under the card's sampler; it is not a reward upgrade.
+    See docs/rl-sota-parity.md 2."""
     return replace(sampling, temperature=1.0, top_p=1.0, top_k=0)
 
 
