@@ -786,10 +786,21 @@ def test_sample_batch_matches_per_row():
     temps = torch.tensor([1.0, 0.0, 0.8, 0.0, 1.0])  # rows 1,3 greedy
     top_ps = torch.tensor([0.9, 1.0, 0.5, 1.0, 0.95])
     seeds = torch.tensor([42, 7, 99, 3, 42])
-    batched = reference.sample_batch(logits, temps, top_ps, seeds)
+    batched, lps = reference.sample_batch(logits, temps, top_ps, seeds)
     for i in range(5):
         one = reference.sample(logits[i : i + 1], float(temps[i]), float(top_ps[i]), int(seeds[i]))
         assert batched[i] == one[0], f"row {i}: batch {batched[i]} vs per-row {one[0]}"
+    # The score is log q under the row's own nucleus, not log softmax(logits/T):
+    # top_p renormalizes, so the latter reads low by log(kept mass).
+    for i in (0, 2, 4):
+        probs, order = reference.top_p_probs(logits[i] / float(temps[i]), float(top_ps[i]))
+        want = float(probs[(order == batched[i]).nonzero().item()].log())
+        assert abs(lps[i] - want) < 1e-5, f"row {i}: {lps[i]} vs log q {want}"
+        untruncated = float(torch.log_softmax(logits[i] / float(temps[i]), -1)[batched[i]])
+        assert lps[i] > untruncated, f"row {i}: nucleus score must exceed the untruncated one"
+    # A greedy row is scored at T=1 over the full softmax; the point mass would be 0.
+    for i in (1, 3):
+        assert abs(lps[i] - float(torch.log_softmax(logits[i], -1).max())) < 1e-5
 
 
 # ---------------------------------------------------------------- misc

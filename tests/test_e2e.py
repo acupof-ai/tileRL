@@ -19,6 +19,7 @@ from tilerl.config import tiny
 from tilerl.engine import (
     BLOCK_TOKENS,
     _PHASE_DECODE,
+    _restrict,
     _step_seed,
     BatchKv,
     Engine,
@@ -29,7 +30,7 @@ from tilerl.kv_cache import PagedKvPool
 from tilerl.model import add_lora, build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
 from tilerl_kernels.backend import get_backend
-from tilerl_kernels.reference import dequant_fp4, pack_fp4, unpack_fp4
+from tilerl_kernels.reference import dequant_fp4, pack_fp4, top_p_probs, unpack_fp4
 from tilerl.testing import RefBackend
 from tilerl.kv_cache import NoPrefixStore
 from tilerl.train import _training_kv, opd_loop, train_step
@@ -545,6 +546,29 @@ def test_logprobs_are_returned_and_deterministic():
     out, lps = run()
     assert lps is not None and len(lps) == len(out) == 4, (out, lps)
     assert all(x <= 1e-5 for x in lps), lps
+    # The value, not just the shape: log q under the sampler's own nucleus. A
+    # log_softmax over the un-renormalized logits reads low by log(kept mass),
+    # which every shape assertion above accepts.
+    sp_tp = replace(sp, top_p=0.8, top_k=20, max_new_tokens=3, seed=11)
+    fresh = build_engine(cfg, model, backend, num_blocks=64, num_slots=8,
+                         decode_graph=False, prefix_store=NoPrefixStore())
+    rid = fresh.submit(list(range(8)), sp_tp)
+    for _ in range(200):
+        fresh.step()
+        done = fresh.poll()
+        if rid in done:
+            toks = done[rid]
+            break
+    scored = fresh.logprobs(rid)
+    seq = np.asarray(list(range(8)) + list(toks), dtype=np.int64)[None, :]
+    kv = _training_kv(model, 1, seq.shape[1], device=backend.device)
+    with torch.no_grad():
+        dense = model.forward(seq, np.arange(seq.shape[1], dtype=np.int64), kv, backend)
+    for i, tok in enumerate(toks):
+        row = _restrict(dense[0, 7 + i].unsqueeze(0), sp_tp) / sp_tp.temperature
+        probs, order = top_p_probs(row, sp_tp.top_p)
+        want = float(probs[0, (order[0] == tok).nonzero().item()].log())
+        assert abs(scored[i] - want) < 2e-3, f"token {i}: reported {scored[i]} vs log q {want}"
     # greedy must not report the point mass (every logprob exactly 0)
     g = SamplingParams(temperature=0.0, max_new_tokens=3, seed=1, logprobs=True)
     rid = engine.submit(list(range(8)), g)

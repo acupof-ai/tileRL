@@ -411,8 +411,9 @@ class Engine:
             return out
 
     def logprobs(self, request_id: int) -> list[float] | None:
-        """log p of each returned token, or None unless the request asked. Pops;
-        a second read of the same id raises, so "never asked" and "already
+        """log q of each returned token under the truncated, tempered distribution
+        it was drawn from -- not the full softmax. None unless the request asked.
+        Pops; a second read of the same id raises, so "never asked" and "already
         taken" stay distinguishable at the RL call site.
         # ponytail: scores nobody reads live until the engine is dropped; a TTL sweep is the upgrade.
         """
@@ -841,21 +842,13 @@ class Engine:
         if not rows:
             return []
         logits = torch.stack([_restrict(l, r.params) for r, l, _ in rows])
-        dev = logits.device
         temps = [r.params.temperature for r, _, _ in rows]
         top_ps = [r.params.top_p for r, _, _ in rows]
         seeds = [_step_seed(r.params.seed, g) for r, _, g in rows]
-        toks = self._backend.sample_batch(logits, temps, top_ps, seeds).tolist()
-        if any(r.params.logprobs for r, _, _ in rows):
-            # Score under the sampling distribution; greedy (t=0) under t=1, since
-            # the point mass would report log p = 0 for every token.
-            t = torch.tensor([x if x > 0 else 1.0 for x in temps], device=dev).reshape(-1, 1)
-            lp = torch.log_softmax(logits.float() / t, dim=-1)
-            idx = torch.tensor(toks, device=dev).reshape(-1, 1)
-            self._last_logprobs = lp.gather(1, idx).reshape(-1).tolist()
-        else:
-            self._last_logprobs = None
-        return toks
+        toks, lps = self._backend.sample_batch(logits, temps, top_ps, seeds)
+        self._last_logprobs = (lps.tolist()
+                               if any(r.params.logprobs for r, _, _ in rows) else None)
+        return toks.tolist()
 
     def _sample_commit(self, rows: list[tuple]) -> None:
         toks = self._sample_batch(rows)

@@ -909,6 +909,20 @@ def greedy(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return tok.to(torch.long), prob
 
 
+def top_p_probs(logits: torch.Tensor, top_p: float | torch.Tensor):
+    """The nucleus distribution the sampler draws from, in descending-probability
+    order: ``(probs, sorted_idx)``. One definition, so scoring a token and drawing
+    one cannot disagree about which distribution produced it."""
+    sorted_logits, sorted_idx = torch.sort(_f32(logits), dim=-1, descending=True)
+    probs = torch.softmax(sorted_logits, dim=-1)
+    if not isinstance(top_p, torch.Tensor):
+        top_p = torch.as_tensor(top_p, dtype=probs.dtype, device=probs.device)
+    keep = torch.cumsum(probs, dim=-1) - probs < top_p.reshape(-1, *([1] * (probs.dim() - 1)))
+    keep[..., 0] = True
+    probs = probs * keep
+    return probs / probs.sum(-1, keepdim=True), sorted_idx
+
+
 def sample(logits: torch.Tensor, temperature: float, top_p: float, seed: int) -> torch.Tensor:
     """Top-p sampling, deterministic per seed; temperature <= 0 is greedy."""
     logits = _f32(logits)
@@ -917,13 +931,7 @@ def sample(logits: torch.Tensor, temperature: float, top_p: float, seed: int) ->
     gen = torch.Generator(device=logits.device).manual_seed(int(seed))
     if temperature != 1.0:
         logits = logits / temperature
-    sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
-    probs = torch.softmax(sorted_logits, dim=-1)
-    cum = torch.cumsum(probs, dim=-1)
-    keep = cum - probs < top_p
-    keep[..., 0] = True
-    probs = probs * keep
-    probs = probs / probs.sum(-1, keepdim=True)
+    probs, sorted_idx = top_p_probs(logits, top_p)
     sampled = torch.multinomial(probs, num_samples=1, generator=gen).squeeze(-1)
     return sorted_idx.gather(-1, sampled.unsqueeze(-1)).squeeze(-1).to(torch.long)
 
@@ -933,37 +941,38 @@ def sample_batch(
     temperatures: torch.Tensor,
     top_ps: torch.Tensor,
     seeds: torch.Tensor,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Batched :func:`sample`: one sort/softmax for the batch, identical draws
     per row. temperatures/top_ps/seeds are read on the host (device reads cost
-    two syncs a tick plus one per sampled row)."""
+    two syncs a tick plus one per sampled row). Returns the tokens and their log
+    prob under the row's own nucleus distribution -- the caller cannot recompute
+    that from the logits without duplicating the truncation rule. A greedy row
+    (t <= 0) is scored at t=1 over the full softmax, since its point mass would
+    report 0 for every token."""
     logits = _f32(logits)
     b = logits.shape[0]
     dev = logits.device
     temps = [float(t) for t in temperatures]
     out = torch.empty(b, dtype=torch.long, device=dev)
+    lp = torch.empty(b, dtype=torch.float32, device=dev)
     hot = [i for i, t in enumerate(temps) if t > 0]
     cold = [i for i, t in enumerate(temps) if t <= 0]
     if cold:
         ci = torch.tensor(cold, device=dev)
         out[ci] = logits[ci].argmax(-1).to(torch.long)
+        lp[ci] = torch.log_softmax(logits[ci], dim=-1).max(-1).values
     if hot:
         idx = torch.tensor(hot, device=dev)
         tt = torch.tensor([temps[i] for i in hot], dtype=torch.float32, device=dev)
         tp = torch.tensor([float(top_ps[i]) for i in hot], dtype=torch.float32, device=dev)
         sub = logits[idx] / tt[:, None]
-        sorted_logits, sorted_idx = torch.sort(sub, dim=-1, descending=True)
-        probs = torch.softmax(sorted_logits, dim=-1)
-        cum = torch.cumsum(probs, dim=-1)
-        keep = cum - probs < tp[:, None]
-        keep[:, 0] = True
-        probs = probs * keep
-        probs = probs / probs.sum(-1, keepdim=True)
+        probs, sorted_idx = top_p_probs(sub, tp)
         for k, i in enumerate(hot):
             gen = torch.Generator(device=dev).manual_seed(int(seeds[i]))
             draw = torch.multinomial(probs[k], num_samples=1, generator=gen)
             out[i] = sorted_idx[k, draw].to(torch.long)
-    return out
+            lp[i] = probs[k, draw].clamp_min(1e-45).log()
+    return out, lp
 
 
 def _check_chunk_core() -> None:
