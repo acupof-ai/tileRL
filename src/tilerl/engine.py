@@ -815,8 +815,11 @@ class Engine:
     def _verify(self, rows, chains, logits, hidden) -> None:
         """Accept the leading run of drafts the trunk agrees with, adopt the
         recurrent state at that length, and commit the prefix plus the trunk's
-        bonus token. Seeds are per generated index, so an accepted token is
-        bit-identical to the unspeculated one."""
+        bonus token. Every committed token is this tick's own draw from the
+        trunk at that chain position, under the per-generated-index seed the
+        unspeculated arm uses. That is the guarantee; the token is NOT
+        bit-identical to the unspeculated one, because a W>1 tile and a W=1
+        tile do not agree bit-for-bit off the CPU reference."""
         flat = [
             (r, logits[i, j], len(r.output) + j)
             for i, r in enumerate(rows)
