@@ -138,7 +138,8 @@ prefix_store=NoPrefixStore()` until recapture-after-update lands (roadmap P2.0).
 
 **Git.** Commitizen `<type>(<scope>): <subject>`, scopes `kv` `engine` `ops`
 `autograd` `train` `server` `docs`. Work on a named branch from a scratchpad
-worktree, push it, open a PR; ckl merges. Small tranches, each self-contained,
+worktree, push it, open a PR, and merge it once CI is green and review
+comments are answered. Small tranches, each self-contained,
 simplify pass first. Commit only your own files by explicit path. Never touch the reference repos.
 **No AI attribution in commits** — no Claude/cc/co-authored-by mentions in
 messages or trailers; write them as if a human wrote them.

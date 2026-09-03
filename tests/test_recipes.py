@@ -1,9 +1,9 @@
 """A recipe is the defaults; typed flags win; the manifest records the name."""
 
-import contextlib
 import json
 
 from tilerl.cli import _build_parser
+from tilerl.ledger import gates_pass
 from tilerl.recipes import RECIPES, flags
 
 
@@ -21,8 +21,13 @@ def test_recipe_runs_and_is_recorded(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path))
     monkeypatch.setattr("sys.argv", ["tilerl", "train", "--recipe", "grpo-tiny-smoke", "--json"])
-    with contextlib.suppress(SystemExit):  # the demo reward's gates may fail; the manifest is checked
-        main()
+    main()  # a passing run returns; _finish exits non-zero only on a failed gate
+    # TileLang's kernel-cache warnings go to stdout from C++, so --json cannot
+    # promise a lone object; the manifest is the last one printed.
     out = capsys.readouterr().out
     m = json.loads(out[out.index("{"):])
-    assert m["inputs"]["recipe"] == "grpo-tiny-smoke" and m["inputs"]["steps"] == 2
+    assert m["inputs"]["recipe"] == "grpo-tiny-smoke"
+    assert m["inputs"]["steps"] == flags("grpo-tiny-smoke")["steps"]
+    # The CPU smoke recipe is the only one that can fail a gate here, so its verdict
+    # IS the assertion: suppressing the exit is what stops it being a gate.
+    assert gates_pass(m), m["gates"]

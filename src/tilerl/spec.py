@@ -266,7 +266,7 @@ class DraftHead:
                    else torch.as_tensor([n - 1 for n in last_only], device=backend.device))
             x = x[torch.arange(x.shape[0], device=backend.device), idx].unsqueeze(1)
         x = backend.rmsnorm(x, self.params["norm"], eps)
-        head = "embed_tokens" if self.trunk.cfg.tie_word_embeddings else "lm_head"
+        head = self.trunk.cfg.head_key
         return self.trunk._linear(backend, x, head)
 
     def confidence(self, hidden, probs, backend) -> torch.Tensor:

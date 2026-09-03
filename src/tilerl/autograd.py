@@ -382,7 +382,21 @@ class Tape:
                 del grads[tid]
 
 
-class AdamW:
+class _Optimizer:
+    """``step`` is the same loop for every optimizer; ``step_one`` is the update."""
+
+    def begin(self) -> None:
+        self._step += 1
+
+    def step(self, params: Any, grads: dict[int, torch.Tensor]) -> None:
+        self.begin()
+        for p in params:
+            g = grads.get(id(p))
+            if g is not None:
+                self.step_one(p, g)
+
+
+class AdamW(_Optimizer):
     """AdamW (decoupled weight decay); fp32 moments keyed by ``id(param)``,
     the update computed in fp32 and cast back to the param's dtype."""
 
@@ -400,16 +414,6 @@ class AdamW:
         self._m: dict[int, torch.Tensor] = {}
         self._v: dict[int, torch.Tensor] = {}
         self._step = 0
-
-    def step(self, params: Any, grads: dict[int, torch.Tensor]) -> None:
-        self.begin()
-        for p in params:
-            g = grads.get(id(p))
-            if g is not None:
-                self.step_one(p, g)
-
-    def begin(self) -> None:
-        self._step += 1
 
     def step_one(self, p: torch.Tensor, g: torch.Tensor, key: Any = None) -> None:
         b1, b2 = self.betas
@@ -435,7 +439,7 @@ class AdamW:
         p.copy_(p32.to(p.dtype))
 
 
-class Adafactor:
+class Adafactor(_Optimizer):
     """Adafactor (Shazeer & Stern 2018, paper defaults): factored second moment,
     no first moment unless ``beta1 > 0``, relative step size (``lr`` is a
     multiplier on the param's RMS), update clipping at RMS ``clip``. Adam's m+v
@@ -465,16 +469,6 @@ class Adafactor:
     def _rms(t: torch.Tensor) -> torch.Tensor:
         # Stays on device: a float() here is one host sync per parameter, mid-backward.
         return t.norm() / math.sqrt(t.numel())
-
-    def begin(self) -> None:
-        self._step += 1
-
-    def step(self, params: Any, grads: dict[int, torch.Tensor]) -> None:
-        self.begin()
-        for p in params:
-            g = grads.get(id(p))
-            if g is not None:
-                self.step_one(p, g)
 
     def step_one(self, p: torch.Tensor, g: torch.Tensor, key: Any = None) -> None:
         b2 = 1.0 - self._step**self.decay_power
@@ -536,14 +530,22 @@ def clip_grad_norm(grads: dict[int, torch.Tensor], max_norm: float) -> float:
     fp64 accumulation on device with ONE sync: the per-grad ``.to("cpu")`` this
     replaced cost 126 device-to-host copies a step, 7% of the 27B LoRA step.
     MPS has no float64, so it sums on the host."""
-    dev = next(iter(grads.values())).device if grads else torch.device("cpu")
+    if not grads:  # _foreach_norm rejects an empty list; the norm of nothing is 0
+        return 0.0
+    dev = next(iter(grads.values())).device
     host = dev.type == "mps"
-    total_sq = torch.zeros((), dtype=torch.float64, device="cpu" if host else dev)
-    for g in grads.values():
-        # .to("cpu", float64) in one call would still convert on MPS.
-        gd = g.detach()
-        total_sq += (gd.to("cpu") if host else gd).to(torch.float64).pow(2).sum()
-    total = float(total_sq.sqrt().item())
+    gl = [g.detach() for g in grads.values()]
+    if host:
+        gl = [g.to("cpu") for g in gl]
+    # One fused norm kernel over the whole list, then one f64 reduction and one
+    # sync: measured 141 -> 17.5 ms at 27B-LoRA scale (1092 f32 adapters), the
+    # norm agreeing to 7.7e-07 relative. _foreach_norm squares in the INPUT
+    # dtype, so anything narrower than f32 is widened first — raw bf16 costs
+    # 1.3 decimal digits, raw f16 costs 0.9. The rescale below still walks
+    # grads.values(), so it scales the real gradients, not these copies.
+    norms = torch._foreach_norm(
+        [g if g.dtype.itemsize >= 4 else g.float() for g in gl], 2)
+    total = float(torch.stack(norms).to(torch.float64).pow(2).sum().sqrt().item())
     if not math.isfinite(total) or total == 0.0:
         return total
     if max_norm > 0.0 and math.isfinite(max_norm) and total > max_norm:

@@ -87,19 +87,27 @@ def trace_kernel_lengths(engine) -> dict[str, Counter]:
     return t
 
 
-def arm(name, cfg, model, backend, tok, draft_path, width, mmlu_n, rows, params, graph):
+def positive(v):
+    n = int(v)
+    if n < 1:  # generate() admits nothing and steps the engine forever
+        raise argparse.ArgumentTypeError(f"concurrency must be >= 1, got {n}")
+    return n
+
+
+def arm(name, cfg, model, backend, tok, draft_path, width, mmlu_n, rows, params, graph, conc):
     from tilerl.spec import load_draft
 
     draft = load_draft(model, draft_path) if draft_path else None
-    engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8, draft=draft,
+    engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=conc, max_batch=conc, draft=draft,
                           spec_depth=max(1, width - 1), decode_graph=graph,
                           prefix_store=NoPrefixStore())
     tr = trace_kernel_lengths(engine)
-    out = {"arm": name, "width": width if draft else 1, "decode_graph": graph}
+    out = {"arm": name, "width": width if draft else 1, "decode_graph": graph,
+           "concurrency": conc}
 
     if mmlu_n:
         prompts, golds, subjects = mmlu_questions(mmlu_n, seed=0)
-        texts, d = phase(engine, lambda: mmlu_score(engine, tok, prompts, concurrency=8))
+        texts, d = phase(engine, lambda: mmlu_score(engine, tok, prompts, concurrency=conc))
         preds = [letter(t) for t in texts]
         out["mmlu"] = dict(correct=sum(p == g for p, g in zip(preds, golds)), total=len(preds),
                            timing=d, subjects=subjects, gold=golds, pred=preds, text=texts,
@@ -112,7 +120,7 @@ def arm(name, cfg, model, backend, tok, draft_path, width, mmlu_n, rows, params,
     if rows:
         prompts = [render_chat([("user", r["prompt"])], False) for r in rows]
         sp = replace(params, temperature=0.0)
-        texts, d = phase(engine, lambda: generate(engine, tok, prompts, sp, 8))
+        texts, d = phase(engine, lambda: generate(engine, tok, prompts, sp, conc))
         ok = [answer_match(t, r["answer"]) for t, r in zip(texts, rows)]
         out["gsm8k"] = dict(correct=sum(ok), total=len(rows), timing=d, text=texts,
                             answer=[r["answer"] for r in rows],
@@ -151,6 +159,7 @@ def main() -> None:
     p.add_argument("--gsm8k-n", type=int, default=500)
     p.add_argument("--width", type=int, default=8, help="verify tick width: 1 committed + W-1 drafts")
     p.add_argument("--max-new-tokens", type=int, default=256)
+    p.add_argument("--concurrency", type=positive, default=8, help="rows in flight; 1 is the rollout shape")
     p.add_argument("--decode-graph", action="store_true")
     p.add_argument("--out", required=True)
     args = p.parse_args()
@@ -168,9 +177,9 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     arms = [arm("base", cfg, model, backend, tok, None, 1, args.mmlu_n, rows, params,
-                args.decode_graph),
+                args.decode_graph, args.concurrency),
             arm(f"spec-w{args.width}", cfg, model, backend, tok, args.draft, args.width,
-                args.mmlu_n, rows, params, args.decode_graph)]
+                args.mmlu_n, rows, params, args.decode_graph, args.concurrency)]
     for a in arms:
         (out / f"{a['arm']}.json").write_text(json.dumps(a))
 
