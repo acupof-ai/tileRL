@@ -78,11 +78,11 @@ def test_restriction_is_the_same_batched_as_per_row():
 
 
 def test_rows_that_cut_differently_take_the_per_row_path():
-    """The batched restriction is an optimisation for the case every row cuts the
-    same way; rows that differ fall back to per-row. Nothing else builds a batch
-    with differing params, so the fallback shipped unexercised -- and it fails
-    silently, by cutting every row to row 0's rule and still sampling.
-    """
+    """Rows whose (allowed_ids, top_k) differ fall back to per-row restriction.
+    Nothing else in the suite builds such a batch, so the fallback shipped
+    unexercised, and it fails silently: cutting every row to row 0's rule still
+    samples. The two rules disagree on purpose -- one row's allowed_ids exclude
+    that row's own argmax -- so row 0's rule applied to the batch moves a token."""
     eng = _build_engine(seed=3)
     v = tiny().vocab_size
     torch.manual_seed(11)
@@ -92,17 +92,16 @@ def test_rows_that_cut_differently_take_the_per_row_path():
         def __init__(self, params):
             self.params = params
 
-    wide = SamplingParams(temperature=0.0, top_k=0, seed=5)
-    narrow = SamplingParams(temperature=0.0, top_k=1, seed=5)
-    # row 1's argmax must survive its own top_k=1; row 0 is unrestricted
-    mixed = eng._sample_batch([(_R(wide), logits[0], 0), (_R(narrow), logits[1], 0)])
-    alone = [eng._sample_batch([(_R(p), logits[i], 0)])[0]
-             for i, p in enumerate((wide, narrow))]
-    assert mixed == alone, (mixed, alone)
+    top = logits.argmax(-1).tolist()
+    wide = SamplingParams(temperature=0.0, seed=5)
+    narrow = SamplingParams(temperature=0.0, seed=5,
+                            allowed_ids=tuple(i for i in range(v) if i != top[1]))
+    for a, b in ((wide, narrow), (narrow, wide)):
+        rows = [(_R(a), logits[0], 0), (_R(b), logits[1], 0)]
+        assert eng._sample_batch(rows) == [eng._sample_batch([r])[0] for r in rows], (a, b)
 
-    # negative control: the uniform path and the fallback must agree when they can
-    both_narrow = eng._sample_batch([(_R(narrow), logits[0], 0), (_R(narrow), logits[1], 0)])
-    assert both_narrow == [eng._sample_batch([(_R(narrow), logits[i], 0)])[0] for i in range(2)]
+    # the assertions above only bite because the rules disagree on row 1
+    assert eng._sample_batch([(_R(narrow), logits[1], 0)])[0] != top[1]
 
 
 def test_generate():
