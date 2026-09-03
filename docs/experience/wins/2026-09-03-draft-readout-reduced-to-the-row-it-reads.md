@@ -1,5 +1,13 @@
 # The draft readout allocated 191× what it read — fixed, and the ceiling held, V100 sm70, 2026-09-03
 
+> **Correction, 2026-09-04.** "Not sufficient" was more literal than this entry knew. The
+> reduction was wired at the trunk's call site (`engine.py:745`) and the graph capture, and
+> **not at `DraftHead.step` (`spec.py:404`) — the path every eager tick goes through.** A
+> 512-position prefill chunk there kept building the full [512, 248320] f32 readout, 485.9
+> MiB, which OOMed a ctx=8192 run a day later. The −1.53 GiB below is real and was measured
+> on the graph path; it is not the whole saving this fix was supposed to buy.
+> [errors/2026-09-04-the-draft-readout-was-never-reduced-on-prefill.md](../errors/2026-09-04-the-draft-readout-was-never-reduced-on-prefill.md)
+
 > Status: **shipped; correct but not sufficient.** `DraftHead.forward` gained `last_only`, so
 > the draft's readout is reduced to the one position per row that `_draft_step` actually reads.
 > PyTorch's allocation at B=8 ctx=512 drops **27.39 → 25.86 GiB (−1.53 GiB)** and the OOM
