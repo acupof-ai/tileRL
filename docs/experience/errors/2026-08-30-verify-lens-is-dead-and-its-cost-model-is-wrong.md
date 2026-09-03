@@ -1,5 +1,12 @@
 # verify_lens never runs on the shipped path, and its cost model is not this backend's — 2026-08-30
 
+> **Superseded in part, 2026-09-03.** "Keeps everything" holds at depths 1, 2
+> and 4 and nowhere else: on the 27B at depth 7 the policy trims **227 of
+> 1119** rows, and 235 of 1334 overall. It binds at depth 6 and above — see
+> [verify-lens-binds-where-nobody-measured-it](2026-09-03-verify-lens-binds-where-nobody-measured-it.md),
+> which also finds the cost model's *shape* wrong, not only its constants.
+> The cost table below stands and is what shows the shape is wrong.
+>
 > Status: audit finding, recorded only. No code changed — retuning a policy
 > constant needs a measurement, and this host has no GPU.
 
