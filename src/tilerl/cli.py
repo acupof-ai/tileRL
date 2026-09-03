@@ -148,7 +148,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
     from tilerl_kernels.backend import get_backend
 
     real = args.model == "qwen38-27b"
-    log = (lambda *a: None) if args.json else print
+    log = (lambda *a, **k: None) if args.json else print
     tok = get_tokenizer(_QWEN38_SOURCE if real else None)
     rows, eval_rows = _jsonl(args.data), _jsonl(args.eval_gsm8k)[: args.eval_n]
     thinking = (args.max_think_tokens > 0) if real else None
@@ -218,12 +218,14 @@ def _train_adapters(args: argparse.Namespace) -> None:
             def reward(prompt, completion):
                 return sum(1 for t in completion if t < half) / max(len(completion), 1)
 
-        hist = train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
-                                   group=args.group, sampling=params, seed=args.seed,
-                                   trainable=trainable, micro=args.micro)
-        for i, (r, ce, secs, tied) in enumerate(hist):
+        hist = []
+        for i, (r, ce, secs, tied) in enumerate(
+                train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
+                                    group=args.group, sampling=params, seed=args.seed,
+                                    trainable=trainable, micro=args.micro)):
+            hist.append((r, ce, secs, tied))
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
-                f"tied {tied:.2f}  {secs:.1f}s")
+                f"tied {tied:.2f}  {secs:.1f}s", flush=True)
         manifest["metrics"].update(
             reward_first=hist[0][0], reward_last=hist[-1][0], ce_last=hist[-1][1],
             secs_per_step_median=statistics.median(h[2] for h in hist),
