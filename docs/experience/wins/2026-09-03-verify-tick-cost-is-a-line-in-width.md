@@ -86,20 +86,42 @@ apart (W=4 and W=8 both launch 32 rows), so this line does not price the ladder'
 see the open item.
 
 - **0.67 dense ticks of fixed cost per tick** — the parts a tick pays once regardless of
-  width: the draft forward, the GDN state gather/scatter (6.40 of 8.80 torch ms, task
-  #31), the launch chain of 144 kernels.
-- **0.53 dense ticks per verify row** — the marginal row, at B=1. Just over half a dense
-  tick, which is the shape you get when rows share the weight stream: the GEMV re-reads
-  13 GB of weights once for the whole tick, so a second row adds arithmetic rather than
-  bytes. **Consistent with the slope, not established by it** — the sharing story predicts
-  a slope below 1, and it is 0.53, but nothing here rules out another term with the same
-  behaviour. Whatever the mechanism, it is not the extra draft forwards: those are
-  0.047 dense ticks each (1.12 ms against a 23.7 ms tick), 10× too small to be the slope.
+  width: the GDN state gather/scatter (6.40 of 8.80 torch ms, task #31), the launch chain
+  of 144 kernels.
+- **0.53 dense ticks per verify row** — the marginal row, 12.48 ms at ctx 1024. **This is
+  two mechanisms, not one**, and it is not weight-stream sharing (see below):
 
-The slope being **below 1.0** is the entire reason speculation can pay at all. If each
-verify row cost a full dense tick, break-even would be `W` tokens per forward — which no
-draft achieves — and speculation would be arithmetically impossible rather than merely
-hard.
+| term | ms per +1 W | share |
+|---|---:|---:|
+| one more draft forward | **5.53** (flat) | 34% |
+| the verify forward widening | **4.65-6.64** (falls with W) | 66% |
+| sum | **10.2-12.2** | vs the fitted **12.48** |
+
+Both terms are independently measured — the draft forward and the verify-only costs
+(`w≤2` 36.58, `w≤4` 49.87, `w≤8` 68.46 ms at ctx 1024) come from task #31's profiler four
+months earlier, recorded in `spec.py:20-22`. Rebuilding the tick from them:
+
+| W | recorded `verify(W) + (W−1)·5.53` | this entry's line | ratio |
+|---:|---:|---:|---:|
+| 2 | 1.777 dense ticks | 1.723 | 1.031× |
+| 4 | 2.804 | 2.776 | 1.010× |
+| 8 | 4.522 | 4.750 | 0.926× |
+
+**3-7% across three widths, from two fully independent instruments** — end-to-end tok/s
+here, a kernel profiler there. That is the mechanism confirmed, not merely consistent.
+
+**What it is not: weight-stream sharing.** I first wrote that a marginal row is cheap
+"because rows share the weight stream — a second row adds arithmetic, not bytes". The
+arithmetic refutes it: the marginal row costs 12.48 ms against a **14.4 ms** total weight
+stream (13 GB at 900 GB/s), i.e. **0.86× of re-reading every weight in the model**. If the
+rows genuinely shared one pass, the marginal cost would approach zero. Nor is it re-reads
+from chunking — `_sm70_chunks` returns **one** chunk for every width 1..8 at B=1. The cost
+is a second full forward (the draft's own weights and KV plane) plus a genuinely wider
+trunk forward.
+
+And the slope is still **below 1.0**, which is what lets speculation pay: a marginal row
+costs 0.53 of a dense tick rather than a full one, because the *verify* half widens
+sub-linearly as the ladder's rungs absorb it (6.64 → 4.65 ms/W from W=2→4 to W=4→8).
 
 ## It reproduces the depth staircase quantitatively
 
@@ -194,6 +216,15 @@ the four. Nothing was published, but only because the run finished before I comm
 which is luck, not method. A partial sweep read in arrival order is the same instrument as
 a complete one only when it is complete.
 
+Seventh, and the one that cost most: **the decomposition already existed and I re-derived
+it wrongly.** `wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md` says in its third
+paragraph "**depth moves two terms, not one** — depth D costs D draft forwards *and* one
+wider verify", with both terms measured. I then priced the slope as one mechanism, and
+excluded the draft using **1.12 ms** — the GEMV-only part from a different entry — when the
+measured draft forward is **5.53 ms**, 4.9× larger. Reading my own prior entry before
+theorizing would have given the right answer immediately, and the wrong exclusion is what
+sent me looking for a third mechanism that does not exist.
+
 ## Gate
 
 No behavior changed. `engine.py:314` had a stale comment saying the ladder was 1/2/4/8
@@ -235,3 +266,6 @@ W=4 share a rung at both B=1 and B=4 — the fact that kills the reprice, so it 
 | 2026-09-03 | 9f032ce | V100 | cuda sm70 | qwen38-27b | depth 3 @32 vs dense | 38.0 vs 43.1 (**0.882×, a loss**) |
 | 2026-09-03 | 9f032ce | V100 | cuda sm70 | qwen38-27b | depth 7 @1024 vs dense | 49.1 vs 42.1 (1.166×, still < d3's 51.7) |
 | 2026-09-03 | 9f032ce | V100 | cuda sm70 | qwen38-27b | **verify_lens trim price, sm70 vs H20** | **15.9/12.5 vs 211.0/0.53 ms — reprice rejected, wrong cost shape** |
+| 2026-09-03 | c4852e6 | V100 | cuda sm70 | qwen38-27b | **slope decomposed** | **5.53 draft + 4.65-6.64 verify widening = 10.2-12.2 vs 12.48 fitted** |
+| 2026-09-03 | c4852e6 | V100 | cuda sm70 | qwen38-27b | line vs task #31 components, W=2/4/8 | **1.031 / 1.010 / 0.926× — two independent instruments** |
+| 2026-09-03 | c4852e6 | V100 | cuda sm70 | qwen38-27b | marginal row vs full weight stream | 12.48 vs 14.4 ms (**0.86× — refutes weight sharing**) |

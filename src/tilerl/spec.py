@@ -20,7 +20,10 @@ import torch
 #: sm70 is a staircase, not a line: the GEMV ladder rounds verify width up to a
 #: rung, so at ctx 1024 verify costs w<=2 36.58, w<=4 49.87, w<=8 68.46 ms, one
 #: draft forward 5.53 (errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md,
-#: wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md).
+#: wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md). Those components rebuild
+#: the end-to-end tick to 3-7% at W=2/4/8, so depth moves TWO terms: one more draft
+#: forward (5.53 ms, flat) plus a wider verify (4.65-6.64 ms/W, falling as rungs
+#: absorb it) -- do not price it as one.
 #: H20 constants, and repricing them for sm70 is NOT the fix -- the cost's SHAPE is
 #: wrong here, not its scale. engine.py pads every chain to max(len) and the ladder
 #: rounds B*W up, so a trim between two widths sharing a rung saves nothing (W=3 and
@@ -95,6 +98,14 @@ if __name__ == "__main__":  # runnable check
         rung = {w: next(x for x in LADDER_WIDTHS if x >= B * w) for w in (1, 2, 3, 4)}
         assert rung[3] == rung[4] == collide, f"B={B}: W=3 and W=4 must share a rung: {rung}"
         assert rung[2] == cheap, f"B={B}: W=2 must be a cheaper rung: {rung}"
+
+    # The profiled components must still rebuild the end-to-end tick, or the two-term
+    # story above is stale. verify(W) + (W-1) draft forwards, against the measured line
+    # 0.670 + 0.5265*W dense ticks of 23.7 ms (ctx 1024). Held to 3-7% when written.
+    for w, verify_ms in ((2, 36.58), (4, 49.87), (8, 68.46)):
+        parts = (verify_ms + (w - 1) * 5.53) / 23.7
+        line = 0.670 + 0.5265 * w
+        assert abs(parts / line - 1) < 0.10, f"W={w}: parts {parts:.3f} vs line {line:.3f}"
     print("spec: verify_lens OK", lens)
 
 
