@@ -851,9 +851,11 @@ class Engine:
             )
         elif rows not in LADDER_WIDTHS:
             # Between rungs is worse than past the top: the launch pays for the whole
-            # rung. A padding row costs 3.3x the useful work layered on a real one
-            # (7.53 vs 2.29 ms), so B=4 depth 3 -- 16 rows on the 32 rung -- measures
-            # 42.7 tok/s where B=8's full rung gets 75.0.
+            # rung, and a padding row costs what a useful one costs. Measured on the
+            # same rung 8: 82.15 ms with 3 of 8 rows idle against 83.40 ms fully
+            # packed -- 60% more useful rows for 1.5% more time
+            # (wins/2026-09-04-rung-cost-not-useful-rows.md). So B=4 depth 3 -- 16
+            # rows on the 32 rung -- measures 42.7 tok/s where B=8's full rung gets 75.0.
             rung = next(x for x in LADDER_WIDTHS if x > rows)
             # Only advise a batch when the width divides the rung: at W=3 NO batch
             # lands on a rung, and rung // w would name one that also pads.
