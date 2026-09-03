@@ -107,7 +107,7 @@ def set_depth_in_place(e, head, depth: int) -> None:
     assert e._width == depth + 1, f"engine kept width {e._width} for depth {depth}"
 
 
-def measure(e, prompts: list[list[int]], tokens: int) -> tuple[float, float, float, dict]:
+def measure(e, prompts: list[list[int]], tokens: int) -> tuple:
     """(ms per decode tick, tokens per forward, mean rows x width, per-rung times).
 
     All of `prompts` are submitted before the first step, so `len(prompts)` is the
@@ -154,9 +154,10 @@ def measure(e, prompts: list[list[int]], tokens: int) -> tuple[float, float, flo
     if e._draft_ms is not None:
         e._draft_ms.clear()
     s0, t0 = e.stats(), time.perf_counter()
-    done, per_rung = {}, defaultdict(list)
+    done, per_rung, draft_rung = {}, defaultdict(list), defaultdict(list)
     while len(done) < len(rids):
         b0, k0 = e.stats(), time.perf_counter()
+        d0 = len(e._draft_ms or ())
         e.step()
         b1 = e.stats()
         # Time and price each tick by ITS OWN M = rows x width, not by the M of the
@@ -172,8 +173,13 @@ def measure(e, prompts: list[list[int]], tokens: int) -> tuple[float, float, flo
             rows = len([r for r in e._running if r.req_id in rids and r.req_id not in done])
             w = 1 + (b1["spec_drafted"] - b0["spec_drafted"]) / max(rows, 1)
             m = max(rows, 1) * w
-            per_rung[next(r for r in LADDER_WIDTHS if r >= m)].append(
-                (time.perf_counter() - k0) * 1000 / nf)
+            rung = next(r for r in LADDER_WIDTHS if r >= m)
+            per_rung[rung].append((time.perf_counter() - k0) * 1000 / nf)
+            # The draft goes in the SAME bucket as the tick that ran it. Verify is
+            # tick minus draft, so pooling the draft across rungs while bucketing the
+            # tick charges one rung's draft to another: at depth 4, 15 rung-4 ticks
+            # and 141 rung-8 ticks shared one 6.03 mean.
+            draft_rung[rung].extend(list(e._draft_ms or ())[d0:])
         done.update({k: v for k, v in e.poll().items() if k in rids})
     _sync()
     wall, s1 = (time.perf_counter() - t0) * 1000, e.stats()
@@ -191,7 +197,7 @@ def measure(e, prompts: list[list[int]], tokens: int) -> tuple[float, float, flo
     direct = list(e._draft_ms or ())
     if e._draft_ms is not None:
         e._draft_ms.clear()
-    return wall / max(fwd, 1), n / max(fwd, 1), width, dict(per_rung), direct
+    return wall / max(fwd, 1), n / max(fwd, 1), width, dict(per_rung), direct, dict(draft_rung)
 
 
 def main() -> None:
@@ -330,6 +336,23 @@ def main() -> None:
                 print(f"        draft: {tot / max(nf, 1):.2f} ms/forward "
                       f"({nf / len(direct):.2f} forwards/tick over {len(direct)} of "
                       f"{ticks} ticks) -- timed, not differenced")
+                # Verify per rung = that rung's tick minus that rung's OWN draft.
+                # This is the only line that prices verify without a cross-depth
+                # subtraction, so it is the one the spec.py staircase should read.
+                dr = defaultdict(list)
+                for g in got:
+                    for r, v in g[5].items():
+                        dr[r].extend(v)
+                parts = []
+                for r, v in sorted(per_rung.items()):
+                    dv = dr.get(r, ())
+                    if len(dv) < 0.5 * len(v):
+                        continue  # too few timings in this rung to price it
+                    d_per_tick = sum(x for _, x in dv) / len(dv)
+                    parts.append(f"r{r}:{sum(v) / len(v) - d_per_tick:.2f}")
+                if parts:
+                    print(f"        verify: {' '.join(parts)} ms -- tick minus its "
+                          f"OWN rung's draft, no cross-depth subtraction")
             print(f"        gpu: {gpu_state()}")
         best = max(DEPTHS, key=lambda d: rows[(B, d)][1] / rows[(B, d)][0])
         r_best, r_ship = (1000 * rows[(B, d)][1] / rows[(B, d)][0] for d in (best, 3))

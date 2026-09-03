@@ -155,7 +155,10 @@ not find 1.88 GiB for. Sweep one axis per process, and size the pool from
 **It does not reopen Task #22 — it strengthens the reject at the batch that matters.**
 The B=4 arm gives block-parallel a 1.115x ceiling and an 89.7% acceptance-retention
 break-even, against 1.16-1.21x and 82.7% at B=1. DSpark's head is 4.08x our parameter
-count against a 2.36x budget, and now it also has to lose less accuracy than before.
+count against a **1.47x** budget, and now it also has to lose less accuracy than before.
+(The "2.36x budget" this line first carried was a unit error — 2.36 tok/forward times
+3.93 ms; corrected in
+`errors/2026-09-03-block-parallel-drafting-is-1.016x-on-sm70.md`.)
 a corpus-specific result — applying a peer's GSM8K acceptance (p=0.922) to these same
 tick costs makes depth **3** win at B=1
 (`wins/2026-09-04-depth-default-is-wrong-on-text.md`). What transfers is the cost

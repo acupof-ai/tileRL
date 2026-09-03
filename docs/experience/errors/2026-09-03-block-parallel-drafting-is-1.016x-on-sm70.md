@@ -245,9 +245,20 @@ parameter-count gap below, not by the margin.*
 **REJECT stands.** Every arm is inside 4% of parity, on a ceiling that already
 assumes the parallel head's one forward costs exactly what ours does. It does not:
 DSpark's head is 5 layers / 1.86B against our 1 layer / 456M, **4.08x the
-parameters**. Break-even allows that forward 9.28 ms against our 3.93 (2.36x), so a
-head 4x the size clears it only if it is >1.7x more efficient per parameter than the
-head we already run. Nothing in the source study suggests that.
+parameters**. Break-even allows that forward **1.47x ours** (5.78 ms against 3.93 on
+these constants), so a head 4x the size clears it only if it is **2.77x** more
+efficient per parameter than the head we already run. Nothing in the source study
+suggests that.
+
+> **Correction, 2026-09-04.** This paragraph first read "break-even allows that
+> forward 9.28 ms against our 3.93 (2.36x)". **9.28 is a unit error** — it is
+> 2.36 × 3.93, a tok/forward multiplied by a millisecond. The break-even forward
+> solves `Y/(V+D_p) = O/(V+3D)`, which gives **5.78 ms = 1.47x**, so the budget
+> was overstated 1.61x and the efficiency the arm needs was understated (2.77x,
+> not 1.7x). The direction of the verdict is unchanged and the gap widens:
+> 4.08x parameters against a 1.47x budget. Re-derived on the directly-timed draft
+> (below) the budget is 1.83x and the requirement 2.23x — still a reject, and
+> still carried by the parameter gap rather than the margin.
 
 Note the direction: the *tighter* draft measurement made the ceiling **worse**
 (1.200 → 1.147), because a cheaper draft is less to remove. The earlier pass had it

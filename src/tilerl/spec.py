@@ -21,13 +21,14 @@ from .kv_cache import BLOCK_TOKENS, BatchKv
 
 #: One trunk verify forward = fixed + per-row cost, ms. agent-infer's H20 numbers.
 #: sm70 is a staircase, not a line: the GEMV ladder rounds verify width up to a
-#: rung, so at ctx 1024 verify costs w<=2 32.79, w<=4 49.52, w<=8 86.24 ms, one
-#: draft forward 3.93 (errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md,
-#: errors/2026-09-03-block-parallel-drafting-is-1.016x-on-sm70.md). Measured on
-#: ticks bucketed by their OWN rung, because verify_lens trims per tick and a
-#: configured depth runs a mixture. Those components rebuild the end-to-end tick to
-#: within 10% at W=2/4/8, so depth moves TWO terms: one more draft forward (3.93 ms,
-#: flat) plus a wider verify -- do not price it as one.
+#: rung, so at ctx 1024 verify costs w<=2 29.38, w<=4 45.49, w<=8 80.31 ms, one
+#: draft forward 5.75 (errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md,
+#: errors/2026-09-03-block-parallel-drafting-is-1.016x-on-sm70.md). Both measured
+#: DIRECTLY -- CUDA events on the draft, verify = that rung's tick minus that rung's
+#: own draft -- because a cross-depth subtraction amplifies tick noise 12.9x
+#: (wins/2026-09-04-a-difference-amplifies-its-operands-noise.md). Those components
+#: rebuild the end-to-end tick to within 14% at W=2/4/8, so depth moves TWO terms:
+#: one more draft forward (5.75 ms, flat) plus a wider verify -- do not price it as one.
 #: H20 constants, and repricing them for sm70 is NOT the fix -- the cost's SHAPE is
 #: wrong here, not its scale. engine.py pads every chain to max(len) and the ladder
 #: rounds B*W up, so a trim between two widths sharing a rung saves nothing (W=3 and
@@ -107,20 +108,26 @@ if __name__ == "__main__":  # runnable check
     # story above is stale. verify(W) + (W-1) draft forwards, against the measured line
     # 0.670 + 0.5265*W dense ticks of 23.7 ms (ctx 1024). 6.8-10.1% on the current
     # staircase; it was 3-7% against the withdrawn one.
-    # Measured staircase, rung -> ms, and one draft forward. Both come from ticks
-    # BUCKETED BY THEIR OWN RUNG at ctx=1024, B=1 (scripts/ab_draft_depth.py):
-    # verify_lens trims per tick, so a configured depth runs a MIXTURE of rungs,
-    # and subtracting two depths' mean ticks moves part of that mixture across a
-    # rung step and charges it to the draft. The rung-4 verify cost derives to
-    # 49.52 ms independently at depth 2 (56 ticks) and depth 3 (55) -- same rung,
-    # same cost, which is what the subtraction assumes.
-    # The previous values (VERIFY {2: 36.58, 4: 49.87, 8: 68.46}, DRAFT 5.53) were
-    # taken from each depth's MEAN tick, which mixes rungs: the mean-tick
-    # subtraction reads 4.54 ms against this 3.93, and the 0.61 gap is 16% of all
-    # ticks crossing the 16.73 ms rung-2 -> rung-4 step.
-    VERIFY_MS = {2: 32.79, 4: 49.52, 8: 86.24}
-    DRAFT_MS = 3.93
-    # The staircase sits 6.8-10.1% BELOW the 0.670 + 0.5265W dense-tick line. That
+    # Measured staircase, rung -> ms, and one draft forward. Both are now measured
+    # DIRECTLY -- CUDA events around `_draft.step`, verify = that rung's tick minus
+    # that rung's own draft (scripts/ab_draft_depth.py --time-draft, ds17). No
+    # cross-depth subtraction anywhere, which is what the previous values had:
+    # {2: 32.79, 4: 49.52, 8: 86.24} with DRAFT 3.93 came from differencing two
+    # depths' rung-matched ticks, and that difference amplifies tick noise 12.9x
+    # (wins/2026-09-04-a-difference-amplifies-its-operands-noise.md).
+    #
+    # The two instruments AGREE on the marginal forward within one run -- 5.21 ms
+    # subtracted against 5.29 direct, 1.6% -- so 3.93 was one draw of an amplified
+    # difference, not a different quantity. What it cost: the draft was 1.35x
+    # under-priced and the whole 3.93 gap sat in VERIFY_MS instead, which is why
+    # every rung there reads 7-10% high.
+    #
+    # Verify per rung now agrees across depths to 0.15-0.31% (rung 2 over four
+    # depths, rung 4 over three), against the 0% the subtraction asserted by
+    # construction and could not show.
+    VERIFY_MS = {2: 29.38, 4: 45.49, 8: 80.31}
+    DRAFT_MS = 5.75
+    # The staircase sits 4.2-14.0% off the 0.670 + 0.5265W dense-tick line. That
     # line was fitted with ncols=1 at B=1 and serving runs ncols=2 at B=4 (task
     # #40, open), so a per-rung disagreement of this size is the fit's, not the
     # staircase's -- the shape is what this gate is for and it holds. Tolerance is
@@ -175,23 +182,38 @@ if __name__ == "__main__":  # runnable check
     # Both sides are rung-4 ticks; a mean-tick rate would put a rung mixture on one
     # side only.
     #
-    # The bound is 1.06, not the 1.16% noise floor, because the verdict is NOT
-    # prompt-independent in value -- only in form. Lower acceptance favours the
-    # parallel head: 0.972x at p=0.881, 1.016x at 0.722, 1.035x at 0.654 (the
-    # wikitext p, which is the one set above). The decay model shrinks the suffix
-    # geometrically, so as p falls a larger share of the yield sits in positions the
-    # parallel head keeps. Below ~1.06 the arm stays inside the ceiling's own
-    # assumption that a block head's single forward costs what one of ours does,
-    # against a DSpark head of 4.08x the parameters and a 2.36x budget -- so the
-    # reject is carried by that gap, not by this margin. An arm ABOVE 1.06 would
-    # mean the decay model no longer bounds it and the verdict needs re-deriving,
-    # not retuning. errors/2026-09-03-block-parallel-drafting-is-1.016x-on-sm70.md
+    # The margin used to be asserted here against a 1.06 bound. That bound is GONE,
+    # and this is the re-derivation the old comment demanded rather than a retune:
+    # pricing the draft directly (5.75 against a differenced 3.93) moves the margin
+    # to 1.104x, past 1.06. But the margin was never the load-bearing quantity --
+    # it is a decay MODEL over a measurement, and it grows whenever the draft is
+    # re-measured upward, so any bound on it needs retuning every time.
+    #
+    # What the reject rests on is one comparison, and it needs neither the decay
+    # model nor the head's parameter count: **rung 8's verify alone (80.31 ms)
+    # exceeds our ENTIRE k=3 tick (62.74 ms).** A block head exists to make width
+    # cheap, so the arm it proposes is k=7 -- which lands on rung 8. Grant it a FREE
+    # forward and zero accuracy loss and it still reads 0.862x, because the width it
+    # buys is unaffordable before its own cost is priced at all.
+    #
+    # Falsifiable, not structural: both asserts fire under a control that prices rung
+    # 8 at 50.00 ms, and they were checked SEPARATELY (an assert that only fires
+    # after an earlier one has already failed has not been shown to do anything).
+    # An sm70 GEMV improvement at M=8 is what would flip this -- task #21.
     ours = _tok_per_fwd(3, decay=1.0) * 1000 / (VERIFY_MS[4] + 3 * DRAFT_MS)
-    assert rates[3] / ours < 1.06, (
-        f"block-parallel's margin outgrew the decay model's bound: "
-        f"{rates[3] / ours:.3f}x of our own {ours:.1f} tok/s at k=3"
+    assert VERIFY_MS[8] > VERIFY_MS[4] + 3 * DRAFT_MS, (
+        f"rung 8 verify {VERIFY_MS[8]:.2f} ms no longer exceeds our whole k=3 tick "
+        f"{VERIFY_MS[4] + 3 * DRAFT_MS:.2f} ms -- the width a block head buys has become "
+        "affordable and Task #22 needs re-deriving, not reopening on a margin"
     )
-    print("spec: verify_lens OK", lens)
+    free_wide = _tok_per_fwd(7, decay=1.0) * 1000 / (VERIFY_MS[8] + DRAFT_MS)
+    assert free_wide < ours, (
+        f"a block head with a FREE forward and zero accuracy loss reads {free_wide:.1f} "
+        f"against our {ours:.1f} tok/s at k=7; a win here reopens #22"
+    )
+    print(f"spec: verify_lens OK {lens}; rung 8 verify {VERIFY_MS[8]:.1f} ms > our whole "
+          f"k=3 tick {VERIFY_MS[4] + 3 * DRAFT_MS:.1f} ms, so a free-forward block head "
+          f"at k=7 reads {free_wide / ours:.3f}x")
 
     # The same arithmetic at B=4, the SERVING batch, where it comes out worse. Measured
     # on ticks bucketed by their own M (scripts/ab_draft_depth.py --batch 4): rung 32
