@@ -77,7 +77,48 @@ no longer takes effect is the failure mode this repo has already recorded once.
 | date | commit | host | target | model | tok/s | notes |
 |---|---|---|---|---|---|---|
 | 2026-09-03 | (this branch) | — | cpu | tiny | — | correctness only; CPU has no speculative tick to time |
-| pending-remote | | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | pending | 200 GSM8K B=8 W=8, both arms one process, against base 232.3 / spec 139.4 |
+| 2026-09-04 | 40bc83c | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | **135.5** | B=1 W=8, spec arm; base 78.4 — **1.728x** |
+| 2026-09-04 | 40bc83c | H20 gpu7 | cuda/sm90 | Qwen3.8-27B-NVFP4 | 225.4 | B=8 W=8, spec arm; base 242.9 — 0.928x, was 139.4 / 232.3 = 0.600x |
+
+200 GSM8K, greedy, `max_new_tokens=512`, decode graph on, both arms in one
+process, `--out /work/accspec_b1` and `/work/accspec512`.
+
+| | wall | tok/s | tok/decode-fwd | block accepted | GSM8K |
+|---|---:|---:|---:|---:|---:|
+| B=1 base | 823.5s | 78.4 | 1.00 | — | 168/200 |
+| B=1 spec w8 | 477.4s | **135.5** | 6.12 | 6.14 of 8 | 167/200 |
+| B=8 base | 266.7s | 242.9 | 7.79 | — | 165/200 |
+| B=8 spec w8 | 290.2s | 225.4 | 42.13 | 6.17 of 8 | 163/200 |
+
+**Speculation wins at B=1 and loses at B=8**, and B=1 is the shape a rollout has.
+At B=1 the trunk runs 6.11x fewer forwards (64565 -> 10569) for a 1.728x wall
+clock, so a width-8 spec tick costs 3.54x a width-1 tick — against the 2.41x
+recorded for the verify tick alone, the difference being the drafter. At B=8 the
+base tick already amortises across 8 rows, the same 6.1x forward reduction is
+worth less, and spec lands at 0.928x.
+
+The B=8 arm is the one comparable to the recorded pair: base reproduces 232.3 to
++4.6% and spec goes 139.4 -> 225.4, **1.617x** for the batched walk. Acceptance is
+unchanged at 6.17 against 6.18 of 8, which is the separation this entry needed —
+the drafter got faster without getting different. The same holds at B=1 (6.14).
+
+Two measurement notes, both bought the hard way. **The recorded pair was taken at
+`max_new_tokens=512`**; a first re-run at 256 put base GSM8K at 77/200 = 38.5%
+against the recorded 170/200, on an arm the drafter cannot touch — completions
+average 236 tokens, so most hit the cap and lose their final answer. The cap is a
+parameter of the result, not a runtime knob. And **every spec number in this
+repo's history before this entry is a B=8 number**: `scripts/acc_spec_arms.py`
+had `num_slots`, the MMLU concurrency and the GSM8K concurrency all as the
+literal `8`, so the script could not have produced anything else. `--concurrency`
+now exists; the B=1 rows above are the first B=1 spec measurement taken. Its own
+control is `tok/decode-fwd` reading 1.00 on the B=1 base arm against 7.79 at B=8
+— a dead flag would have read 7.79.
+
+The B=1 base arm reads 78.4 against the 92.4 recorded elsewhere for B=1 decode.
+Those are different measurements — 92.4 is a decode microbenchmark at d512, this
+is GSM8K with real prompts and context growing past 512 — and cards 0-3 carried
+another tenant at 100% throughout. The A/B is internally consistent either way,
+since both arms ran in one process on card 7.
 
 ## Rule
 
