@@ -1073,7 +1073,7 @@ class Engine:
                 self._wake.wait(0.005)
 
 
-def _fit_blocks(cfg, backend, io, cap: int) -> int:
+def _fit_blocks(cfg, backend, io, cap: int, draft_layers: int = 0) -> int:
     """KV blocks that fit the free memory left after the weights and the GDN pools.
 
     Called with the state pool already allocated, so free memory is measured, not
@@ -1083,15 +1083,25 @@ def _fit_blocks(cfg, backend, io, cap: int) -> int:
     KV; every bench passed num_blocks explicitly, so serve was the one caller that
     ever saw it.
 
+    ``draft_layers`` is the draft's own layer count, 0 for a dense engine. The draft
+    mirrors ``num_blocks`` into a pool of its own (``DraftHead.attach``), and that
+    pool's planes are not free: at the 27B's 16 full-attn planes one draft layer is
+    1/16 of the trunk's bytes, so charging for it when there is no draft under-fits
+    every training engine, and not charging when there is one over-fits serve.
+
     Holds back a third of what is free: ``PrefixStore`` takes a quarter of what
     remains after this, and the attention partials are transient and scale with B*S.
     ``cap`` wins over the 64-block floor -- a caller asking for fewer means it.
     """
     if backend.device.type != "cuda":
         return cap or 256
-    per_block = 2 * len(cfg.full_attn_layers) * cfg.num_kv_heads * BLOCK_TOKENS * cfg.head_dim
+    planes = 2 * len(cfg.full_attn_layers)
+    per_block = planes * cfg.num_kv_heads * BLOCK_TOKENS * cfg.head_dim
     per_block *= torch.tensor([], dtype=io).element_size()
-    per_block += per_block // (2 * len(cfg.full_attn_layers))  # the draft mirrors num_blocks
+    # per_block already carries the K+V factor, so one draft layer is per_block over
+    # the PLANE-PAIR count, not over `planes`. Dividing by `planes` charged half a
+    # layer and over-asked by 3.03% on the 27B.
+    per_block += draft_layers * per_block // len(cfg.full_attn_layers)
     fit = max(64, int(torch.cuda.mem_get_info()[0] * 2 / 3) // per_block)
     return min(fit, cap) if cap else fit
 
@@ -1144,7 +1154,8 @@ def build_engine(
     )
     kv_io = getattr(backend, "io", torch.bfloat16)
     if not num_blocks:
-        num_blocks = _fit_blocks(cfg, backend, kv_io, max_blocks)
+        num_blocks = _fit_blocks(cfg, backend, kv_io, max_blocks,
+                                 draft_layers=0 if draft is None else draft.cfg.num_layers)
     kv_pool = PagedKvPool(
         num_blocks + pad,
         cfg.num_kv_heads,

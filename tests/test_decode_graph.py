@@ -139,6 +139,56 @@ def test_the_kv_guard_measures_usable_capacity_not_the_pool():
             eng.submit(big, params)
 
 
+def test_the_block_fit_prices_a_block_at_what_the_pools_actually_allocate(monkeypatch):
+    """``_fit_blocks`` divides free memory by its own bytes-per-block, and nothing
+    checked that figure against the pools it is sizing.
+
+    The failure is silent in both directions and neither raises here: over-ask and
+    the OOM lands later, in whatever allocates next (measured on the V100 --
+    ``num_blocks=2048`` left the draft's prefill readout short 1.88 GiB with 892 MiB
+    free, and the traceback named ``linear_fp4``); under-ask and serve quietly loses
+    context it could have had. So this inverts the real function -- blocks it returns,
+    times the bytes the pools really take -- and checks the product lands on the 2/3
+    of free memory the function set out to spend.
+
+    Two errors it catches, both live before it was written: ``per_block`` already
+    carries the K+V factor, so a draft layer is ``per_block / len(full_attn_layers)``
+    and dividing by ``2 * len`` charged half a layer (3.03% over-ask on the 27B); and
+    the draft term was added unconditionally, so every dense engine -- all of
+    training -- was charged for a pool it never builds.
+    """
+    from types import SimpleNamespace
+
+    import torch
+
+    import tilerl.engine as eng_mod
+    from tilerl.kv_cache import PagedKvPool
+
+    cfg = tiny()
+    io = torch.float32
+    free = 8 << 30
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a: (free, free))
+    backend = SimpleNamespace(device=torch.device("cuda"), io=io)
+
+    def pool_bytes_per_block(layers, layer_map):
+        p = PagedKvPool(8, cfg.num_kv_heads, cfg.head_dim, num_layers=layers,
+                        device="cpu", dtype=io, layer_map=layer_map)
+        return (p.k_pool.numel() + p.v_pool.numel()) * p.k_pool.element_size() / 8
+
+    trunk = pool_bytes_per_block(len(cfg.full_attn_layers), cfg.full_attn_layers)
+    # DraftHead.attach mirrors num_blocks with layer_map=range(draft cfg.num_layers).
+    draft1 = pool_bytes_per_block(1, (0,))
+
+    for draft_layers, real in ((0, trunk), (1, trunk + draft1)):
+        blocks = eng_mod._fit_blocks(cfg, backend, io, 0, draft_layers=draft_layers)
+        spent = blocks * real
+        budget = free * 2 / 3
+        assert 0.999 <= spent / budget <= 1.0, (
+            f"draft_layers={draft_layers}: {blocks} blocks x {real:.0f} real B "
+            f"= {spent / 2**30:.4f} GiB against a {budget / 2**30:.4f} GiB budget "
+            f"({spent / budget:.4f}x) -- the fit is pricing a block wrong")
+
+
 def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
     """``num_blocks=0`` must fit against memory the GDN pools have already taken.
 
