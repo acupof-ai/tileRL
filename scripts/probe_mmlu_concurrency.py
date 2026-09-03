@@ -7,10 +7,24 @@ so two concurrencies can run two reduction orders on one question. What is NOT
 known is whether the questions that actually flipped are the near-ties that
 mechanism predicts.
 
-**Prediction, written before the run:** every flipped question's top-2 logit gap
-(over the four letter tokens) sits below the ~0.153 median |delta top-1| the
-width ladder measured for an arm change. A flip at a wide gap is not arithmetic;
-it is a defect, and it matters far more than 0.4%.
+**Prediction, written before the first run:** every flipped question's top-2 gap
+sits below the ~0.153 median |delta top-1| the width ladder measured for an arm
+change. A flip at a wide gap is a defect, not arithmetic.
+
+**That first run REFUTED the premise, not the prediction.** Concurrency 8 and 32
+returned 742/1000 each and **0 of 1000 answers differ**, with 41 questions (4.1%)
+sitting under 0.153 -- so near-ties existed and none moved. Concurrency does not
+change an MMLU answer, and the reason is that ``M`` on a prefill tick is set by
+``_PREFILL_BUCKET`` (64) from the prompt's own padded length, not by the batch:
+concurrency batches independent rows, each keeping its own width. The
+``M = B*W`` reasoning is a DECODE-tick mechanism, and MMLU at
+``max_new_tokens=1`` runs no decode ticks.
+
+The variable that does differ between the two callers is **fusion**:
+``scripts/mmlu.py`` passes ``fuse_projections=True``, ``cli.py`` defaults to
+False. Fusion concatenates q/k/v (and gate/up) into one weight, so the fused GEMM
+has a different N and a different reduction structure than three separate ones.
+The probe now crosses both knobs and labels which one moved each flip.
 
 One process, one card, one slice, but a **fresh engine with no prefix store per
 arm**: sharing an engine would let the first arm's published prefixes shorten the
@@ -93,6 +107,7 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--concurrencies", default="8,32")
+    ap.add_argument("--fuse", default="0,1", help="fuse_projections arms: 0, 1, or 0,1")
     ap.add_argument("--ladder-delta", type=float, default=0.153,
                     help="median |delta top-1| for an arm change, from the width ladder")
     ap.add_argument("--out", required=True)
@@ -102,73 +117,92 @@ def main() -> None:
     assert backend.device.type == "cuda", backend.device
     cfg = qwen38_27b()
     tok = get_tokenizer(a.source)
-    model = load_hf(cfg, a.source)
     prompts, golds, subjects = mmlu_questions(a.n, a.seed)
+    fuses = [bool(int(x)) for x in a.fuse.split(",")]
     allowed = tuple(sorted({tok.encode(f" {c}")[-1] for c in LETTERS}
                            | {tok.encode(c)[-1] for c in LETTERS}))
     concs = [int(x) for x in a.concurrencies.split(",")]
 
     arms = {}
-    for c in concs:
-        # A fresh engine with no prefix store per arm. Sharing one engine would let
-        # the first arm's published prefixes shorten the second arm's prefill, which
-        # changes the padded width and so changes M -- the variable under test.
-        engine = build_engine(cfg, model, backend, num_blocks=2048, num_slots=c + 2,
-                              max_batch=c, max_total_tokens=8192,
-                              prefix_store=NoPrefixStore())
-        texts, margins, secs = arm(engine, tok, prompts, c, allowed)
-        preds = [letter(t) for t in texts]
-        ok = sum(p == g for p, g in zip(preds, golds))
-        print(f"[conc {c:>3}] {ok}/{len(preds)} = {100 * ok / len(preds):.1f}%  {secs:.1f}s",
-              flush=True)
-        arms[c] = {"preds": preds, "margins": margins, "ok": ok, "secs": secs,
-                   "hits": engine.stats()["prefix_hits"]}
-        assert arms[c]["hits"] == 0, f"prefix hits at conc {c}: not a clean arm"
-        engine = None
+    for fuse in fuses:
+        # fuse_projections concatenates q/k/v (and gate/up) into one weight, so the
+        # fused GEMM has a different N and a different reduction structure than three
+        # separate ones. scripts/mmlu.py passes True, cli.py defaults to False.
+        model = load_hf(cfg, a.source, fuse_projections=fuse)
+        for c in concs:
+            # A fresh engine with no prefix store per arm: shared prefixes would
+            # shorten the next arm's prefill and change its padded width.
+            engine = build_engine(cfg, model, backend, num_blocks=2048, num_slots=c + 2,
+                                  max_batch=c, max_total_tokens=8192,
+                                  prefix_store=NoPrefixStore())
+            texts, margins, secs = arm(engine, tok, prompts, c, allowed)
+            preds = [letter(t) for t in texts]
+            ok = sum(p == g for p, g in zip(preds, golds))
+            key = (c, fuse)
+            print(f"[conc {c:>3} fuse {int(fuse)}] {ok}/{len(preds)} = "
+                  f"{100 * ok / len(preds):.1f}%  {secs:.1f}s", flush=True)
+            arms[key] = {"preds": preds, "margins": margins, "ok": ok, "secs": secs,
+                         "hits": engine.stats()["prefix_hits"]}
+            assert arms[key]["hits"] == 0, f"prefix hits at {key}: not a clean arm"
+            engine = None
+            torch.cuda.empty_cache()
+        model = None
         torch.cuda.empty_cache()
 
-    lo, hi = concs[0], concs[-1]
-    A, B = arms[lo], arms[hi]
-    flips = [i for i in range(len(prompts)) if A["preds"][i] != B["preds"][i]]
-    gaps = [top2_gap(A["margins"][i]) for i in range(len(prompts)) if i in A["margins"]]
-    print(f"\n=== concurrency {lo} vs {hi}: {A['ok']} vs {B['ok']} correct, "
-          f"{len(flips)} answers differ of {len(prompts)} ===")
-    if gaps:
-        q = lambda f: sorted(gaps)[min(len(gaps) - 1, int(f * len(gaps)))]  # noqa: E731
-        print(f"top-2 gap over ALL questions (conc {lo}): median {st.median(gaps):.3e}  "
-              f"p10 {q(.1):.3e}  min {min(gaps):.3e}")
-        under = sum(g < a.ladder_delta for g in gaps)
-        print(f"  questions with gap < {a.ladder_delta} (ladder's arm-change delta): "
-              f"{under}/{len(gaps)} = {100 * under / len(gaps):.2f}%")
-
-    rows = []
-    for i in flips:
-        ga = top2_gap(A["margins"][i]) if i in A["margins"] else float("nan")
-        gb = top2_gap(B["margins"][i]) if i in B["margins"] else float("nan")
-        d = (max(abs(x - y) for x, y in zip(A["margins"][i], B["margins"][i]))
-             if i in A["margins"] and i in B["margins"] else float("nan"))
-        rows.append({"q": i, "subject": subjects[i], "gold": golds[i],
-                     "pred_lo": A["preds"][i], "pred_hi": B["preds"][i],
-                     "gap_lo": ga, "gap_hi": gb, "arm_delta": d,
-                     "near_tie": bool(ga < a.ladder_delta)})
-        print(f"  q{i:<4} {subjects[i][:22]:<22} gold {golds[i]} "
-              f"{A['preds'][i]}->{B['preds'][i]}  gap {ga:.3e}/{gb:.3e}  "
-              f"|delta| {d:.3e}  {'NEAR-TIE' if ga < a.ladder_delta else 'WIDE GAP <-- defect'}")
-
-    if rows:
-        nt = sum(r["near_tie"] for r in rows)
-        print(f"\n{nt}/{len(rows)} flips are near-ties (gap < {a.ladder_delta}).")
-        print("PREDICTION HELD" if nt == len(rows) else
+    # every pair of arms, so which knob moves an answer is attributable
+    keys = sorted(arms)
+    pairs = [(x, y) for i, x in enumerate(keys) for y in keys[i + 1:]]
+    allrows = []
+    for x, y in pairs:
+        A, B = arms[x], arms[y]
+        flips = [i for i in range(len(prompts)) if A["preds"][i] != B["preds"][i]]
+        gaps = [top2_gap(A["margins"][i]) for i in range(len(prompts)) if i in A["margins"]]
+        lbl = f"conc{x[0]}/fuse{int(x[1])} vs conc{y[0]}/fuse{int(y[1])}"
+        knob = ("concurrency" if x[1] == y[1] else
+                "fusion" if x[0] == y[0] else "both")
+        print(f"\n=== {lbl}  [{knob}]: {A['ok']} vs {B['ok']} correct, "
+              f"{len(flips)} of {len(prompts)} answers differ ===")
+        if gaps and not allrows:
+            q = lambda f: sorted(gaps)[min(len(gaps) - 1, int(f * len(gaps)))]  # noqa: E731
+            under = sum(g < a.ladder_delta for g in gaps)
+            print(f"  top-2 gap over ALL questions: median {st.median(gaps):.3e}  "
+                  f"p10 {q(.1):.3e}  min {min(gaps):.3e}")
+            print(f"  questions with gap < {a.ladder_delta}: {under}/{len(gaps)} = "
+                  f"{100 * under / len(gaps):.2f}%  <- the flip count's denominator")
+        for i in flips:
+            ga, gb = top2_gap(A["margins"][i]), top2_gap(B["margins"][i])
+            d = max(abs(u - v) for u, v in zip(A["margins"][i], B["margins"][i]))
+            near = ga < a.ladder_delta
+            allrows.append({"pair": lbl, "knob": knob, "q": i, "subject": subjects[i],
+                            "gold": golds[i], "a": A["preds"][i], "b": B["preds"][i],
+                            "gap_a": ga, "gap_b": gb, "arm_delta": d, "near_tie": near})
+            print(f"  q{i:<4} {subjects[i][:20]:<20} gold {golds[i]} "
+                  f"{A['preds'][i]}->{B['preds'][i]}  gap {ga:.3e}  |delta| {d:.3e}  "
+                  f"{'NEAR-TIE' if near else 'WIDE GAP <-- defect'}")
+        if not flips:
+            print("  no flips: this knob moves no answer")
+    if allrows:
+        nt = sum(r["near_tie"] for r in allrows)
+        print(f"\n{nt}/{len(allrows)} flips are near-ties (gap < {a.ladder_delta}).")
+        print("PREDICTION HELD" if nt == len(allrows) else
               "PREDICTION FAILED: a flip at a wide gap is a defect, not arithmetic")
     else:
-        print("\nno flips: the two concurrencies agree on every answer")
+        print("\nno flips on any pair: neither knob moves an MMLU answer")
+    # the denominator, off the first arm: how many questions COULD flip under an
+    # arm-sized perturbation, which is what makes a flip count readable
+    ref = arms[keys[0]]["margins"]
+    allgaps = [top2_gap(v) for v in ref.values()]
 
     o = Path(a.out); o.mkdir(parents=True, exist_ok=True)
     (o / "concurrency.json").write_text(json.dumps({
         "n": a.n, "seed": a.seed, "concurrencies": concs, "ladder_delta": a.ladder_delta,
-        "correct": {str(c): arms[c]["ok"] for c in concs},
-        "secs": {str(c): arms[c]["secs"] for c in concs},
-        "flips": rows, "gap_median": st.median(gaps) if gaps else None,
+        "fuse": [int(f) for f in fuses],
+        "correct": {f"conc{k[0]}_fuse{int(k[1])}": arms[k]["ok"] for k in arms},
+        "secs": {f"conc{k[0]}_fuse{int(k[1])}": arms[k]["secs"] for k in arms},
+        "flips": allrows,
+        "gap_median": st.median(allgaps) if allgaps else None,
+        "under_delta": sum(g < a.ladder_delta for g in allgaps),
+        "questions_scored": len(allgaps),
     }, indent=1))
     print(f"wrote {o / 'concurrency.json'}")
 
