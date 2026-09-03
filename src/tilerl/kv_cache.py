@@ -414,3 +414,23 @@ class PrefixStore:
             "misses": self.misses,
             "evictions": self.evictions,
         }
+
+
+@dataclass
+class BatchKv:
+    """Batch-level KV descriptor for one model forward (the model reads it duck-typed).
+
+    ``seq_len`` is each row's logical length AFTER this forward. ``seq_q_lens`` is
+    the per-row valid query count; rows are left-aligned and padded to a shared T,
+    and None means every row is valid for the full T.
+    """
+
+    block_table: torch.Tensor  # [B, num_blocks] long, padded with 0
+    seq_len: torch.Tensor  # [B] long
+    state_slot: torch.Tensor  # [B] long
+    kv_pool: Any
+    state_pool: Any
+    seq_q_lens: torch.Tensor | None = None  # [B] valid query tokens per row
+    keep_steps: int = 0  # verify: keep the recurrent state after each of the first N chain tokens
+
+

@@ -14,7 +14,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
+
+from .kv_cache import BLOCK_TOKENS, BatchKv
 
 #: One trunk verify forward = fixed + per-row cost, ms. agent-infer's H20 numbers.
 BIAS_MS = 211.0
@@ -66,6 +69,29 @@ class DraftHead:
     short full-attention stack, read out through the trunk's lm_head. The layers
     are a ``Model`` with a 1-layer config, not a second transformer block."""
 
+    #: Drafter contract, shared with ``dflash2.DFlash2Head`` and read by the engine.
+    #: ``aux_layers`` are trunk layers whose output the head taps ( () = none, so the
+    #: head serves behind a prefix cache); ``width`` is the verify tick's width,
+    #: 1 committed token + width-1 drafts; ``no_quant`` stays out of the fp8 serve.
+    aux_layers: tuple[int, ...] = ()
+    no_quant: tuple[str, ...] = ()
+
+    def set_depth(self, depth: int | None) -> None:
+        """Apply the caller's ``spec_depth``; None keeps the head's own. Idempotent."""
+        if depth is not None:
+            self.width = depth + 1
+
+    def attach(self, backend, num_blocks: int) -> None:
+        """The draft KV plane spans the trunk's whole block space, so the head attends
+        over the same prefix the trunk does (a chain-local block dropped acceptance
+        from 84.4% to 55.8%)."""
+        from .kv_cache import PagedKvPool
+
+        self.backend = backend
+        self.kv = PagedKvPool(num_blocks, self.cfg.num_kv_heads, self.cfg.head_dim,
+                              num_layers=self.cfg.num_layers, device=backend.device,
+                              layer_map=tuple(range(self.cfg.num_layers)))
+
     def __init__(self, trunk: Any, params: dict[str, torch.Tensor], num_layers: int = 1) -> None:
         from .model import Model
 
@@ -77,6 +103,7 @@ class DraftHead:
         self.cfg = cfg
         self.layers = Model(cfg, params)
         self.has_confidence = "confidence.weight" in params
+        self.width = 3  # 2 drafts; ``set_depth`` overrides
 
     def forward(self, hidden, ids, positions, kv, backend, hidden_out=None) -> torch.Tensor:
         """hidden [B,T,H] (trunk's pre-final-norm state), ids [B,T] (the token
@@ -107,6 +134,110 @@ class DraftHead:
         y = backend.linear(hidden, self.params["confidence.weight"],
                            bias=self.params.get("confidence.bias"))
         return torch.sigmoid(y).reshape(y.shape[:-1])
+
+    def step(self, rows) -> None:
+        """Contract: leave next tick's chain in ``r.drafts``.
+
+        Draft over every position a row materialized but has not drafted yet:
+        position q consumes the trunk hidden at q-1 and the token at q, so the
+        run spans ``[draft_pos+1 .. seq_len-1]`` and its last position drafts
+        the next token. Leaves next tick's chain in ``r.drafts``."""
+        backend = self.backend
+        dev = backend.device
+        plan = []
+        for r in rows:
+            if r.hidden is None or r.done:
+                continue
+            lo, hi = max(1, r.draft_pos + 1), r.seq_len - 1
+            if hi < lo:
+                continue
+            plan.append((r, lo, hi))
+        if not plan:
+            return
+        w = max(hi - lo + 1 for _, lo, hi in plan)
+        nb = max(len(r.blocks) for r, _, _ in plan)
+        n = len(plan)
+        ids = np.zeros((n, w), dtype=np.int64)
+        pos = np.zeros((n, w), dtype=np.int64)
+        bt = torch.zeros(n, nb, dtype=torch.long)
+        hs, sl, sq = [], [], []
+        for i, (r, lo, hi) in enumerate(plan):
+            q = hi - lo + 1
+            ids[i, :q] = r.tokens[lo : hi + 1]
+            pos[i, :q] = np.arange(lo, hi + 1)
+            bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
+            sl.append(hi + 1)
+            sq.append(q)
+            # hidden at [lo-1 .. hi-1]; hidden_prev supplies the previous forward's position
+            h, base = r.hidden, r.hidden_from
+            if r.hidden_prev is not None:
+                h, base = torch.cat([r.hidden_prev, r.hidden], dim=1), base - 1
+            off = (lo - 1) - base
+            hs.append(torch.nn.functional.pad(h[:, off : off + q], (0, 0, 0, w - q)))
+        kv = BatchKv(
+            block_table=bt.to(dev), seq_len=torch.tensor(sl, device=dev),
+            state_slot=torch.zeros(n, dtype=torch.long, device=dev),
+            kv_pool=self.kv, state_pool=None,
+            seq_q_lens=torch.tensor(sq, device=dev),
+        )
+        dh: list = []
+        logits = self.forward(torch.cat(hs, dim=0), ids, pos, kv, backend,
+                                     hidden_out=dh)
+        last = torch.tensor([q - 1 for q in sq], device=dev)
+        rng = torch.arange(n, device=dev)
+        tok, prob = backend.greedy(logits[rng, last].unsqueeze(1))
+        h = dh[-1][rng, last].unsqueeze(1)
+        confs: list[list[float]] = [[] for _ in plan]
+        if (self.width - 1) > 1:
+            conf = self.confidence(h, prob, backend)
+            for i, c in enumerate(conf[:, -1].tolist()):
+                confs[i].append(float(c))
+        chains = [[int(t)] for t in tok[:, -1].tolist()]
+        for i, (r, _, hi) in enumerate(plan):
+            if r.draft_pos == 0:
+                # Position 0 is never drafted but attention still reads its page,
+                # which a recycled block leaves holding another request's.
+                b = r.blocks[0]
+                self.kv.k_pool[:, b, :, 0, :] = 0
+                self.kv.v_pool[:, b, :, 0, :] = 0
+            r.draft_pos = hi
+
+        # Remaining chain steps, one position each, bounded by the blocks the row owns.
+        # ponytail: clamps the chain instead of allocating; a row at a block boundary drafts shorter.
+        for j in range(1, (self.width - 1)):
+            live = [i for i, (r, _, hi) in enumerate(plan)
+                    if hi + j < len(plan[i][0].blocks) * BLOCK_TOKENS]
+            if not live:
+                break
+            li = torch.tensor(live, device=dev)
+            kv = BatchKv(
+                block_table=bt[live].to(dev),
+                seq_len=torch.tensor([plan[i][2] + 1 + j for i in live], device=dev),
+                state_slot=torch.zeros(len(live), dtype=torch.long, device=dev),
+                kv_pool=self.kv, state_pool=None,
+                seq_q_lens=torch.ones(len(live), dtype=torch.long, device=dev),
+            )
+            dh = []
+            logits = self.forward(
+                h[li], np.array([[chains[i][-1]] for i in live], dtype=np.int64),
+                np.array([[plan[i][2] + j] for i in live], dtype=np.int64),
+                kv, backend, hidden_out=dh,
+            )
+            tok, prob = backend.greedy(logits)
+            conf = self.confidence(dh[-1], prob, backend)
+            for k, c in enumerate(conf[:, -1].tolist()):
+                confs[live[k]].append(float(c))
+            for k, t in enumerate(tok[:, -1].tolist()):
+                chains[live[k]].append(int(t))
+            h = h.index_copy(0, li, dh[-1])
+
+        keep = verify_lens([survival(c) for c in confs]) if (self.width - 1) > 1 \
+            else [1] * len(plan)
+        for i, (r, _, _) in enumerate(plan):
+            p = r.params
+            if p.max_think_tokens is not None and p.end_think_ids and not r.thought_closed:
+                keep[i] = 0  # a forced end-think token is not the sampler's
+            r.drafts = chains[i][: keep[i]]
 
 
 #: Draft tensor stems -> param keys, matched after any ``layers.N.`` prefix.
@@ -194,9 +325,16 @@ def read_head_params(path: str | Path, stems: dict[str, str]) -> dict[str, torch
 
 def load_draft(trunk: Any, path: str | Path) -> Any:
     """Load a draft head from one safetensors file beside the trunk: a Qwen
-    NextN / DSpark chain head, or the DFlash2 block drafter."""
+    NextN / DSpark chain head, or the DFlash2 block drafter. A checkpoint
+    directory resolves to its ``model.safetensors``; mmapping the directory
+    itself raises a bare ``OSError: No such device``, which names nothing."""
     from safetensors import safe_open
 
+    path = Path(path)
+    if path.is_dir():
+        path = path / "model.safetensors"
+        if not path.exists():
+            raise FileNotFoundError(f"draft head: {path.parent} holds no model.safetensors")
     with safe_open(str(path), "pt", device="cpu") as f:
         if any(n.startswith("candidate_selector.") for n in list(f.keys())):
             from .dflash2 import load_dflash2

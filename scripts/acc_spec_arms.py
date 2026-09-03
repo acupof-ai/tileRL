@@ -71,6 +71,8 @@ def trace_kernel_lengths(engine) -> dict[str, Counter]:
 
     def traced_verify(rows, chains, logits, hidden):
         bad = torch.isnan(logits).flatten(1).any(dim=1)
+        if not bool(bad.any()):  # one sync, not one per row: the per-row bool() was 13.8%
+            return verify(rows, chains, logits, hidden)
         for i, r in enumerate(rows):
             if bool(bad[i]):
                 n = r.seq_len - 1 + len(chains[i])

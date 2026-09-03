@@ -23,6 +23,7 @@ from typing import Any
 import torch
 
 from .config import ModelConfig
+from .model import Model
 from .spec import read_head_params
 
 
@@ -81,15 +82,80 @@ class DFlash2Head:
     """``params`` holds the head's own weights only: the embedding and the
     readout are the trunk's, and the block's K/V never outlives one draft."""
 
+    #: codebooks the selector GATHERS rows from, not linears: block-quantizing
+    #: them would replace [248320,256] with a .w8 the walk cannot index.
+    no_quant = ("selector.pred", "selector.succ")
+
     def __init__(self, trunk: Any, params: dict[str, torch.Tensor], cfg, dcfg) -> None:
         self.trunk, self.params, self.cfg, self.dcfg = trunk, params, cfg, dcfg
         self.groups = cfg.hidden_size // dcfg.group_size
+        #: the engine re-serves the head fp8; a Model gives the head the same
+        #: .w8/.wscale dispatch the trunk has, over THIS params dict.
+        self.layers = Model(cfg, params)
+        #: the block is fixed by the checkpoint: anchor + block_size-1 drafts
+        self.width = dcfg.block_size  # verify tick: anchor + block_size-1 drafts
+        self.aux_layers = dcfg.target_layers
+
+    def set_depth(self, depth: int | None) -> None:
+        """The block is the checkpoint's, so ``spec_depth`` is not the caller's to choose."""
+        if depth is not None and depth != self.width - 1:
+            raise ValueError(
+                f"spec_depth={depth} with a block drafter: the checkpoint's block is "
+                f"{self.width} slots (anchor + {self.width - 1} drafts), so the verify "
+                f"width is fixed. Pass spec_depth=None."
+            )
+
+    def attach(self, backend, num_blocks: int) -> None:
+        """No KV plane of its own: the context K/V is projected from the trunk's aux taps."""
+        self.backend = backend
+
+    def step(self, rows) -> None:
+        """Contract: leave next tick's chain in ``r.drafts``. One block per row. A context position's K/V is a pure projection of the
+        trunk's aux taps there, so it is projected the tick it commits and kept —
+        re-projecting the whole context every tick is ~10 ms at T=512 B=8, a fifth
+        of the verify tick it rides. The context is trimmed to the head's sliding
+        window, past which every block slot masks it anyway.
+        # ponytail: one row at a time — ``path``'s walk syncs per slot; batching the
+        # rows through block_hidden/path is the upgrade.
+        """
+        backend = self.backend
+        dev = backend.device
+        for r in rows:
+            if r.aux is None or r.done:
+                continue
+            # The context is every position but the anchor; a row still prefilling has none.
+            end = r.seq_len if r.prefilling else r.seq_len - 1
+            lo, base = r.ctx_len, r.hidden_from
+            if lo < base:
+                raise RuntimeError(
+                    f"req {r.req_id}: context K/V has a hole at {lo}..{base} — the trunk "
+                    f"never forwarded those positions this process"
+                )
+            if end > lo:
+                pos = torch.arange(lo, end, device=dev)
+                new = self.context_kv(r.aux[:, lo - base : end - base], pos, backend)
+                r.ctx = new if r.ctx is None else [
+                    (torch.cat([k, nk], 1), torch.cat([v, nv], 1))
+                    for (k, v), (nk, nv) in zip(r.ctx, new)
+                ]
+                w = self.dcfg.sliding_window
+                if r.ctx[0][0].shape[1] > w:
+                    r.ctx = [(k[:, -w:], v[:, -w:]) for k, v in r.ctx]
+                r.ctx_len = end
+            if not r.decoding or r.ctx is None:
+                continue
+            n = r.ctx[0][0].shape[1]
+            ctx_pos = torch.arange(r.ctx_len - n, r.ctx_len, device=dev)
+            anchor = r.tokens[-1]
+            h = self.block_hidden(r.ctx, ctx_pos, anchor, r.ctx_len, backend)
+            r.drafts = self.path(h[:, 1:], anchor, backend)
+
 
     def context_kv(self, aux_hidden, positions, backend) -> list[tuple]:
         """Per-layer (k, v) for the context, straight off the trunk's stacked taps."""
         cfg = self.cfg
         h = backend.rmsnorm(
-            backend.linear(aux_hidden, self.params["fc"]), self.params["hidden_norm"], cfg.rms_eps
+            self._lin(backend, aux_hidden, "fc"), self.params["hidden_norm"], cfg.rms_eps
         )
         out = []
         for i in range(cfg.num_layers):
@@ -115,10 +181,10 @@ class DFlash2Head:
             x = backend.add(x, self._conv(h, c, self.params[f"{p}.attn_conv.base"][1]))
             h, c = self._conv_in(backend, x, f"{p}.post_attn_norm", f"{p}.mlp_conv")
             h = backend.silu_mul(
-                backend.linear(h, self.params[f"{p}.gate_proj"]),
-                backend.linear(h, self.params[f"{p}.up_proj"]),
+                self._lin(backend, h, f"{p}.gate_proj"),
+                self._lin(backend, h, f"{p}.up_proj"),
             )
-            h = backend.linear(h, self.params[f"{p}.down_proj"])
+            h = self._lin(backend, h, f"{p}.down_proj")
             x = backend.add(x, self._conv(h, c, self.params[f"{p}.mlp_conv.base"][1]))
         return backend.rmsnorm(x, self.params["norm"], cfg.rms_eps)
 
@@ -131,7 +197,7 @@ class DFlash2Head:
         unary, cand = torch.topk(
             self.trunk._linear(backend, hidden, head)[0].float(), dc.top_k, dim=-1
         )
-        proj = backend.linear(hidden, self.params["selector.proj"])[0].float()
+        proj = self._lin(backend, hidden, "selector.proj")[0].float()
         # gathered rows only: an f32 copy of either [248320,256] codebook is 254 MB
         pred, succ = self.params["selector.pred"], self.params["selector.succ"]
         out, prev = [], anchor
@@ -152,8 +218,11 @@ class DFlash2Head:
         return self.path(h[:, 1:], anchor, backend)
 
     # --- pieces -------------------------------------------------------------
+    def _lin(self, backend, x, key):
+        return self.layers._linear(backend, x, key)
+
     def _heads(self, backend, h, key, heads):
-        return backend.linear(h, self.params[key]).reshape(*h.shape[:2], heads, self.cfg.head_dim)
+        return self._lin(backend, h, key).reshape(*h.shape[:2], heads, self.cfg.head_dim)
 
     def _rope(self, backend, x, positions):
         cfg = self.cfg
@@ -168,13 +237,13 @@ class DFlash2Head:
         k = self._rope(backend, backend.rmsnorm(k, self.params[f"{p}.k_norm"], cfg.rms_eps), pos)
         k, v = torch.cat([ctx[0], k], 1), torch.cat([ctx[1], v], 1)
         out = _attend(q, k, v, pos, torch.cat([ctx_pos, pos]), self.dcfg.sliding_window)
-        return backend.linear(out.reshape(*h.shape[:2], -1), self.params[f"{p}.o_proj"])
+        return self._lin(backend, out.reshape(*h.shape[:2], -1), f"{p}.o_proj")
 
     def _conv_in(self, backend, x, norm_key, conv_key):
         """Norm, then the conv before the op — and the coefficients its partner
         after the op consumes. One projection yields both sides' taps."""
         h = backend.rmsnorm(x, self.params[norm_key], self.cfg.rms_eps)
-        c = backend.linear(h, self.params[f"{conv_key}.proj"]).reshape(
+        c = self._lin(backend, h, f"{conv_key}.proj").reshape(
             *h.shape[:2], 2, self.dcfg.taps, self.groups
         )
         return self._conv(h, c[:, :, 0], self.params[f"{conv_key}.base"][0]), c[:, :, 1]

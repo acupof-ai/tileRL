@@ -309,3 +309,148 @@ def test_norm_fold_is_per_format(tmp_path):
     save_file({"mtp.norm.weight": w, "mtp.pre_fc_norm_hidden.weight": w.clone()}, str(nextn))
     folded = read_head_params(nextn, _DRAFT_TOP)
     assert torch.allclose(folded["norm"], torch.full_like(w, _NORM + 1.0))
+
+
+# --- the block drafter on the engine tick ------------------------------------
+_PROMPT = [11, 42, 7, 99, 3, 56]
+
+
+def _engine_run(head, spec, n):
+    """Greedy ``n`` tokens through the engine, with and without the block drafter."""
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.kv_cache import NoPrefixStore
+
+    engine = build_engine(
+        tiny(), head.trunk, get_backend(), num_blocks=64, num_slots=4, max_batch=4,
+        max_total_tokens=256, draft=head if spec else None,
+        decode_graph=False, prefix_store=NoPrefixStore(),
+    )
+    rid = engine.submit(_PROMPT, SamplingParams(temperature=0.0, max_new_tokens=n, seed=0))
+    out: dict = {}
+    for _ in range(4 * n):
+        out.update(engine.poll())
+        if len(out.get(rid, ())) >= n:
+            break
+        engine.step()
+    return out[rid], engine.stats()
+
+
+def test_block_drafter_on_the_engine_tick(tmp_path):
+    """The engine's block-draft path must draft, and must not change the output.
+
+    Two arms in one process on one trunk. The random head accepts almost
+    nothing, so a second arm feeds the drafter the trunk's own continuation:
+    that is the only arm where a whole block commits, which is what exercises
+    the multi-token commit — ``select_step(n_ok)`` and the aux slice behind it.
+    """
+    head = _tiny_head(tmp_path)
+    base, base_stats = _engine_run(head, False, 24)
+
+    spec, stats = _engine_run(head, True, 24)
+    assert spec == base, (spec, base)
+    # Without this a drafter that silently never drafts passes the equality above.
+    assert stats["spec_drafted"] > 0, stats
+
+    # Oracle drafts: block_hidden carries the anchor's absolute position, so the
+    # continuation the base arm produced can be read off by position.
+    at: dict = {}
+    real = head.block_hidden
+
+    def block_hidden(ctx, ctx_pos, anchor, start, backend):
+        at["start"] = start
+        return real(ctx, ctx_pos, anchor, start, backend)
+
+    def path(hidden, anchor, backend):
+        i = at["start"] - len(_PROMPT) + 1
+        # slot 0 is the token the trunk committed at ``start``; an off-by-one anchor
+        # is invisible to output equality, so it is checked where it is handed over
+        assert anchor == base[i - 1], (anchor, base[i - 1])
+        return [base[i + j] if 0 <= i + j < len(base) else 0 for j in range(hidden.shape[1])]
+
+    head.block_hidden, head.path = block_hidden, path
+    oracle, ostats = _engine_run(head, True, 24)
+    assert oracle == base, (oracle, base)
+    assert ostats["spec_accepted"] > 0, ostats
+    # The point of drafting: the same 24 tokens in fewer trunk forwards. An
+    # anchor off by one still passes the equality checks and fails here.
+    assert ostats["decode_forwards"] < base_stats["decode_forwards"], (ostats, base_stats)
+
+
+def test_selector_codebooks_survive_the_engines_fp8_pass(tmp_path):
+    """``_quantize_draft`` packs any [N,K] with both dims >= 128, and the two
+    codebooks are [248320, 256] tables the walk indexes by token id. Shape
+    cannot tell them from a projection, so the head names them."""
+    from tilerl.engine import _quantize_draft
+
+    head = _tiny_head(tmp_path)
+    p = {k: torch.zeros(256, 256) for k in head.no_quant} | {"fc": torch.zeros(256, 256)}
+    out = _quantize_draft(p, skip=head.no_quant)
+    assert set(out) == {*head.no_quant, "fc.w8", "fc.wscale"}, sorted(out)
+
+
+def test_load_draft_takes_a_checkpoint_directory(tmp_path):
+    """A directory mmapped as a file raises OSError(ENODEV), which names nothing;
+    three 27B runs were spent on it."""
+    from tilerl.spec import load_draft
+
+    _tiny_head(tmp_path)  # writes config.json + model.safetensors under tmp_path
+    trunk = build_random(tiny(), seed=0)
+    assert load_draft(trunk, tmp_path).width == load_draft(
+        trunk, tmp_path / "model.safetensors").width
+    (empty := tmp_path / "empty").mkdir()
+    with pytest.raises(FileNotFoundError, match="no model.safetensors"):
+        load_draft(trunk, empty)
+
+
+def test_spec_depth_is_the_checkpoints_block(tmp_path):
+    head = _tiny_head(tmp_path)
+    block = _HF["dflash_config"]["block_size"]
+    head.set_depth(None)  # None keeps the checkpoint's block
+    assert head.width == block
+    head.set_depth(block - 1)  # restating it is not a conflict
+    assert head.width == block
+    with pytest.raises(ValueError, match="verify width is fixed"):
+        head.set_depth(2)
+
+
+def test_engine_block_equals_the_full_context_block(tmp_path):
+    """The block the engine drafts must equal the block ``draft()`` produces from
+    the whole sequence. Output equality cannot see this — a rejected draft costs
+    throughput, never tokens — so a starved or misaligned context is silent
+    everywhere else.
+    """
+    import numpy as np
+
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.kv_cache import NoPrefixStore
+    from tilerl.train import _training_kv
+
+    head, backend = _tiny_head(tmp_path), get_backend()
+    model, taps = head.trunk, head.dcfg.target_layers
+    engine = build_engine(
+        tiny(), model, backend, num_blocks=64, num_slots=4, max_batch=4,
+        max_total_tokens=256, max_num_batched_tokens=4, draft=head, decode_graph=False,
+        prefix_store=NoPrefixStore(),  # 4: the prompt spans two prefill chunks
+    )
+    seen: list[tuple[list[int], list[int]]] = []
+    inner = engine._draft.step
+
+    def spy(rows):
+        inner(rows)
+        seen.extend((list(r.tokens), list(r.drafts)) for r in rows if r.drafts)
+
+    engine._draft.step = spy
+    rid = engine.submit(_PROMPT, SamplingParams(temperature=0.0, max_new_tokens=12, seed=0))
+    for _ in range(48):
+        if engine.poll().get(rid):
+            break
+        engine.step()
+
+    assert len(seen) >= 3, seen
+    for tokens, drafts in seen[:3]:
+        ctx, pos = tokens[:-1], np.arange(len(tokens) - 1)
+        hid: list = []
+        model.forward(np.array([ctx]), pos, _training_kv(model, 1, len(ctx), device=backend.device),
+                      backend, hidden_out=hid, aux_layers=taps)
+        want = head.draft(torch.cat(hid[:-1], -1), pos, tokens[-1], backend)
+        assert drafts == want, (len(ctx), drafts, want)
