@@ -15,10 +15,13 @@ from . import kernels_mma
 
 _REGISTRY: dict[tuple[str, str], dict[str, object]] = {}
 
-# Shipped sm70 split count. Exported so the parity gate builds what runs -- it
-# used to pin 16 while this shipped 32, so the correctness gate never once
-# exercised the value on the card.
+# sm70 split counts, chosen per tick by query width (backend.py). 32 splits are
+# 1.20x faster at S=1 where PO is 3 MiB; at S>=_SM70_WIDE_S they are within 0.5%
+# of 16 while PO reaches 1.5 GiB, so a wide tick halves it for free. Exported so
+# the parity gate builds what ships -- it used to pin 16 against a shipped 32.
 SM70_KVSPLIT = 32
+SM70_KVSPLIT_WIDE = 16
+_SM70_WIDE_S = 8  # measured: 32 wins at S=1, a wash by S=4, PO grows linearly
 
 
 def _register(precision: str, arch: str, kernels: dict[str, object]) -> None:
@@ -128,11 +131,11 @@ _SM70_KERNELS = {
     # attention call takes it, leaving the generic kernel to the other targets.
     # sm70 only: the source is target-neutral but the win is filling 80 SMs, so
     # it loses where T.Kernel lowers to a serial loop (cpu) and is unproven on
-    # metal.
-    "paged_attention_split": lambda t: kernels.make_paged_attention_split(t, KVSPLIT=SM70_KVSPLIT),
-    "paged_attention_split_combine": lambda t: kernels.make_paged_attention_split_combine(
-        t, KVSPLIT=SM70_KVSPLIT
-    ),
+    # metal. Bare factories: KVSPLIT comes from the call site (backend.py) so a
+    # wide tick can trade splits for footprint, and Backend._kernel keys the
+    # compile cache on it.
+    "paged_attention_split": kernels.make_paged_attention_split,
+    "paged_attention_split_combine": kernels.make_paged_attention_split_combine,
 }
 _register("bf16", "sm70", _SM70_KERNELS)
 _register("fp4", "sm70", _SM70_KERNELS)

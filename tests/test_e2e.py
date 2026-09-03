@@ -1072,6 +1072,54 @@ def test_a_batch_between_rungs_warns_about_its_padding():
     assert 'if rung % w == 0 else ""' in src, "the guard must withhold an impossible suggestion"
 
 
+def test_the_sm70_split_count_follows_the_query_width():
+    """backend.py picks KVSPLIT by query width, and the two constraints sit at opposite
+    ends: 32 splits are 1.20x faster at S=1 (205.1 vs 246.5 us, ctx=4096) where PO is
+    3 MiB, and by S=32 the two are 1.005x apart while PO reaches 1.500 GiB and OOMs a
+    32 GB card at B=8 ctx=512. So a narrow tick must get 32 and a wide one 16, and the
+    threshold must sit above the widest verify a spec tick submits -- at depth 7, S=8.
+    Reads the source: the dispatch is sm70-only and never executes on the CPU target."""
+    from pathlib import Path
+
+    from tilerl_kernels.registry import (
+        _SM70_WIDE_S,
+        SM70_KVSPLIT,
+        SM70_KVSPLIT_WIDE,
+        _SM70_KERNELS,
+    )
+
+    assert SM70_KVSPLIT_WIDE < SM70_KVSPLIT, "the wide tick must be the one that saves bytes"
+
+    def po_gib(s, ks):  # 8 rows, 24 heads, D=256, f16 -- the shape that OOMed
+        return 8 * s * 24 * ks * 256 * 2 / 1024**3
+
+    pick = lambda s: SM70_KVSPLIT if s < _SM70_WIDE_S else SM70_KVSPLIT_WIDE  # noqa: E731
+    assert pick(1) == SM70_KVSPLIT, "decode must keep the faster split count"
+    assert pick(4) == SM70_KVSPLIT, "a depth-3 verify is still narrow"
+    assert pick(512) == SM70_KVSPLIT_WIDE, "a prefill-width tick must halve PO"
+    # The threshold has to clear every verify width the ladder can submit, or a spec
+    # tick silently takes the slower kernel.
+    assert _SM70_WIDE_S > 1 + 3, "depth 3 (S=4) must stay on the narrow count"
+    # And it must actually fix the failing case, not merely differ from it.
+    assert po_gib(512, pick(512)) == 0.75, f"wide PO is {po_gib(512, pick(512))} GiB"
+    assert po_gib(512, SM70_KVSPLIT) == 1.5, "the shipped narrow count is what OOMed"
+
+    # The registry must hand over bare factories: a closure that pins KVSPLIT swallows
+    # the call site's choice with a TypeError, which is how this was wired before.
+    import inspect
+
+    for name in ("paged_attention_split", "paged_attention_split_combine"):
+        sig = inspect.signature(_SM70_KERNELS[name])
+        assert "KVSPLIT" in sig.parameters, f"{name} must accept KVSPLIT from the call site"
+
+    src = (
+        Path(__file__).resolve().parent.parent
+        / "packages/tilerl-kernels/src/tilerl_kernels/backend.py"
+    ).read_text()
+    assert "KVSPLIT=ks" in src, "backend must pass the chosen split count to both kernels"
+    assert src.count("KVSPLIT=ks") == 2, "split and combine must agree, or the ABI asserts"
+
+
 def test_the_draft_readout_reduction_picks_the_last_valid_row():
     """`last_only` cuts the draft readout from [rows, T, vocab] to [rows, 1, vocab] --
     1.41 GiB down to 7.6 MiB at B=8 ctx=512, which is the difference between OOM and

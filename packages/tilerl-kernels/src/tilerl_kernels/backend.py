@@ -19,7 +19,14 @@ import torch
 
 from . import kernels_linear
 from . import reference
-from .registry import _arch_for, _resolve, resolve_target
+from .registry import (
+    _SM70_WIDE_S,
+    SM70_KVSPLIT,
+    SM70_KVSPLIT_WIDE,
+    _arch_for,
+    _resolve,
+    resolve_target,
+)
 
 __all__ = ["Backend", "get_backend", "resolve_target"]
 
@@ -699,7 +706,14 @@ class Backend:
             # blocks at one thread each. S is in the grid too, which is what
             # makes a speculative verify affordable — the dense kernel is serial
             # in S as well as in history (39 ms at S=1 -> 1018 ms at S=4).
-            po, pm, pl = self._kernel("paged_attention_split")(
+            #
+            # Split count by query width (host-static, graph-safe; same idiom as
+            # _paged_attention_decode). PO scales with S, and the two constraints
+            # sit at different widths: at S=1 32 splits beat 16 by 1.20x while PO
+            # is 3 MiB, and at prefill width they are 1.005x apart while PO is
+            # 1.5 GiB and OOMs a 32 GB card. So spend splits where they are free.
+            ks = SM70_KVSPLIT if s < _SM70_WIDE_S else SM70_KVSPLIT_WIDE
+            po, pm, pl = self._kernel("paged_attention_split", KVSPLIT=ks)(
                 self._f32(q),
                 self._f32(k_cache),
                 self._f32(v_cache),
@@ -710,7 +724,9 @@ class Backend:
                 int(k_cache.shape[2]),
                 _THREADS,
             )
-            out = self._kernel("paged_attention_split_combine")(po, pm, pl, _THREADS)
+            out = self._kernel("paged_attention_split_combine", KVSPLIT=ks)(
+                po, pm, pl, _THREADS
+            )
         elif self.arch == "sm90":
             # pad S to block_M; seq_q_lens keeps the causal window on the true lengths
             block_m = 64 if s >= 64 else 16
