@@ -379,6 +379,12 @@ def test_tape_gradcheck():
     """Tape backward vs central finite differences on rmsnorm+linear+CE, in f32
     (bf16 swamps a 1e-3 step)."""
     backend = get_backend()
+    if backend.target.startswith("cuda"):
+        # Backend._rows casts every activation to bf16 there, whose eps is 7.8e-3,
+        # so the 1e-3 step is a tenth of one ulp and rounds away. Measured on H20:
+        # a f32-in/f32-out linear differs from the reference by 1.9e-2, 38x this
+        # test's atol. The tape's cuda path is covered by tests/test_ops_parity.py.
+        pytest.skip("finite differences need an f32 forward; cuda casts to bf16")
     gen = torch.Generator().manual_seed(0)
     batch, dim, vocab = 4, 8, 16
     x = torch.randn(batch, dim, generator=gen, dtype=torch.float32)
@@ -771,9 +777,10 @@ def test_opd_ema_self_teacher_shares_the_model():
     cfg = replace(tiny(), fp4=True)
     model = build_random(cfg, seed=7)
     backend = get_backend()
-    trainable = add_lora(model, rank=4, seed=2)
+    # build_engine first: it materializes the params the adapters must point at.
     teacher = build_engine(cfg, model, backend, num_blocks=8, num_slots=4, max_batch=4,
                            max_total_tokens=512, decode_graph=False, prefix_store=NoPrefixStore())
+    trainable = add_lora(model, rank=4, seed=2)
     before = {k: v.clone() for k, v in model.params.items()}
     try:
         prompts = [np.random.default_rng(0).integers(3, cfg.vocab_size, size=8).astype(np.int64)]
@@ -783,7 +790,10 @@ def test_opd_ema_self_teacher_shares_the_model():
         teacher.shutdown()
     assert len(losses) == 2 and all(math.isfinite(x) for x in losses)
     moved = {k for k in before if not torch.equal(model.params[k], before[k])}
-    assert moved and moved <= set(trainable)
+    # sm90's first served forward rewrites .wq into the twiddled layout in place
+    # (Backend._served_fp4); that is a layout change, not a weight update.
+    twiddled = {k for k in before if getattr(model.params[k], "_tl_twiddled", False)}
+    assert moved and moved <= set(trainable) | twiddled
 
 
 def test_max_think_tokens_forces_the_block_closed():
