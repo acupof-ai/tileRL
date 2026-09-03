@@ -978,6 +978,80 @@ def test_speculation_reproduces_greedy_decode():
     assert trimmed == base, f"trimmed chain changed the output: {trimmed} != {base}"
 
 
+def test_verify_commits_the_trunks_own_draw():
+    """The two properties speculation guarantees on EVERY backend, which string
+    equality above only implies on the CPU reference: a committed token is this
+    verify tick's own draw from the trunk at that chain position, and the state
+    adopted with it is a step plane the same tick wrote. The second is not free
+    -- ``alloc_slot`` does not zero the step planes, so a plane written by an
+    earlier tick is a previous owner's state. Slots are reused across waves."""
+    prompt, n, depth = [3, 4, 5, 6], 24, 7
+    base, _ = _spec_run(prompt, n)
+    expected = {i: t for i, t in enumerate(prompt + base)}
+    cfg = tiny()
+    backend = get_backend()
+    model = build_random(cfg, seed=7)
+    # the oracle head is accepted whole, so ``n_ok`` reaches the top step plane
+    engine = build_engine(cfg, model, backend, num_blocks=64, num_slots=1, max_batch=4,
+                          max_total_tokens=512, draft=_OracleDraft(cfg, expected),
+                          spec_depth=depth)
+    written: set[tuple[int, int]] = set()
+    undrawn: list = []
+    stale: list = []
+    deep: list = []
+    step, verify, scatter = engine.step, engine._verify, backend.state_scatter
+    decode, select = backend.gdn_decode, engine._states.select_step
+
+    def note(slots, planes):
+        written.update((int(s), p) for s in torch.as_tensor(slots).reshape(-1).tolist()
+                       for p in range(planes))
+
+    def w_step():
+        written.clear()
+        return step()
+
+    def w_scatter(states, windows, slots, layer, new_state, new_window, parity=None, steps=False):
+        if steps:
+            note(slots, new_state.shape[1])
+        return scatter(states, windows, slots, layer, new_state, new_window, parity, steps)
+
+    def w_decode(q, k, v, g, beta, pool, slots, layer, keep_steps=0, **kw):
+        out = decode(q, k, v, g, beta, pool, slots, layer, keep_steps=keep_steps, **kw)
+        if out is not None and keep_steps:  # sm90 writes the planes inside the kernel
+            note(slots, keep_steps)
+        return out
+
+    def w_select(slot, plane):
+        if (int(slot), int(plane)) not in written:
+            stale.append((int(slot), int(plane), sorted(written)))
+        deep.append(int(plane))
+        return select(slot, plane)
+
+    def w_verify(rows, chains, logits, hidden):
+        before = [len(r.output) for r in rows]
+        out = verify(rows, chains, logits, hidden)
+        for i, (r, n0) in enumerate(zip(rows, before)):
+            for j in range(len(r.output) - n0):  # temperature 0: the tile's own argmax
+                if r.output[n0 + j] != int(logits[i, j].argmax()):
+                    undrawn.append((r.req_id, n0 + j))
+        return out
+
+    engine.step, engine._verify, engine._states.select_step = w_step, w_verify, w_select
+    backend.state_scatter, backend.gdn_decode = w_scatter, w_decode
+    try:
+        outs = []
+        for _ in range(3):  # submit() takes the slot, so reuse needs a drain between waves
+            rid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=n, seed=0))
+            outs.append(_drain(engine, [rid], n)[rid])
+    finally:
+        backend.state_scatter, backend.gdn_decode = scatter, decode
+    assert not undrawn, f"committed a token the verify tick did not draw: {undrawn[:5]}"
+    assert not stale, f"adopted step planes this tick never wrote: {stale[:2]}"
+    # coverage: the whole chain was accepted at least once, so the top plane was adopted
+    assert max(deep) == depth, f"deepest plane adopted was {max(deep)}, not {depth}"
+    assert outs == [base] * 3, "a reused slot changed the output"
+
+
 def test_generate_fans_a_corpus_across_workers(tmp_path):
     """Offline batch generation through the real subprocess path: every prompt back exactly once."""
     import json
