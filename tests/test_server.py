@@ -202,6 +202,40 @@ def test_the_stream_arrives_in_pieces_and_never_splits_a_character(client, model
     )
 
 
+def test_usage_in_the_stream_is_opt_in_and_counts_tokens_not_characters(client, model_id):
+    """The page's tok/s meter needs a real token count, and older clients must not break.
+
+    Without stream_options the stream carries no usage, so a client that reads
+    choices[0] on every frame keeps working -- an unconditional usage chunk broke two
+    tests in this file. With include_usage the final chunk has usage and an EMPTY choices
+    list, which is why a reader must check usage before indexing into choices.
+
+    completion_tokens is the engine's count, not a character estimate: the page used to
+    compute chars/4, which is ~4x low for Chinese (roughly one token per character).
+    """
+    body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16, "temperature": 0.0, "seed": 5, "stream": True}
+
+    def frames(extra):
+        resp = client.post("/v1/chat/completions", json={**body, **extra})
+        assert resp.status_code == 200, resp.text
+        lines = [ln for ln in resp.text.splitlines() if ln.startswith("data: {")]
+        return [json.loads(ln[len("data: ") :]) for ln in lines]
+
+    plain = frames({})
+    assert all(p.get("usage") is None for p in plain), "usage must be opt-in"
+    assert all(p["choices"] for p in plain), "every frame carries a choice without opt-in"
+
+    opted = frames({"stream_options": {"include_usage": True}})
+    last = opted[-1]
+    assert last["choices"] == [], f"the usage chunk must carry no choices: {last!r}"
+    usage = last["usage"]
+    assert usage["prompt_tokens"] > 0
+    assert usage["completion_tokens"] == 16, usage
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+    assert all(p["choices"] for p in opted[:-1]), "only the last frame may be choices-less"
+
+
 def test_completion_stream(client, model_id):
     resp = client.post(
         "/v1/chat/completions",

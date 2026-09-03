@@ -48,6 +48,9 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
     stream: bool | None = None
+    #: OpenAI's {"include_usage": true} -- adds a final choices-less usage chunk. Opt-in
+    #: because a client that indexes choices[0] on every frame breaks on it.
+    stream_options: dict | None = None
     seed: int | None = None
     #: OpenAI's knob, mapped to a thinking-token budget (see _THINK_BUDGET)
     reasoning_effort: str | None = None
@@ -81,8 +84,16 @@ def _message_text(message: ChatMessage) -> str:
     return "".join(part.get("text", "") for part in content if isinstance(part, dict))
 
 
-def _render_chat(messages: list[ChatMessage], enable_thinking: bool | None = None) -> str:
-    return render_chat([(m.role, _message_text(m)) for m in messages], thinking=enable_thinking)
+def _render_chat(
+    messages: list[ChatMessage],
+    enable_thinking: bool | None = None,
+    reasoning_effort: str | None = None,
+) -> str:
+    return render_chat(
+        [(m.role, _message_text(m)) for m in messages],
+        thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
+    )
 
 
 def _chat_chunk(
@@ -121,8 +132,18 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     app_started = int(time.time())
 
     def _submit(req: ChatCompletionRequest) -> tuple[int, int, int]:
-        et = req.chat_template_kwargs.get("enable_thinking") if req.chat_template_kwargs else None
-        prompt = _render_chat(req.messages, enable_thinking=et)
+        kw = req.chat_template_kwargs or {}
+        et = kw.get("enable_thinking")
+        if et is None:
+            # The checkpoint's template treats an undefined enable_thinking as TRUE and
+            # always emits <think> one way or the other, so leaving it unset made the model
+            # open the tag in its own output. Default to the template's answer, but only for
+            # a tokenizer that HAS the tag: ByteTokenizer spells it as 7 raw bytes, and its
+            # bare turn is the tiny/dev path the None state exists for.
+            et = len(tokenizer.encode("<think>")) == 1 or None
+        prompt = _render_chat(
+            req.messages, enable_thinking=et, reasoning_effort=kw.get("reasoning_effort")
+        )
         input_ids = tokenizer.encode(prompt)
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
@@ -193,7 +214,9 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
         if req.stream:
             return StreamingResponse(
-                _stream(request_id, max_new),
+                _stream(request_id, max_new, prompt_tokens, bool(
+                    (req.stream_options or {}).get("include_usage")
+                )),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -241,7 +264,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             "system_fingerprint": SYSTEM_FINGERPRINT,
         }
 
-    def _stream(request_id: int, max_new: int):
+    def _stream(request_id: int, max_new: int, prompt_tokens: int, include_usage: bool):
         created = int(time.time())
         chunk_id = f"chatcmpl-{request_id}"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {"role": "assistant"}))
@@ -284,6 +307,20 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             yield _sse(_chat_chunk(chunk_id, created, model_name, {"content": tail}))
         finish = "length" if len(output_ids) >= max_new else "stop"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=finish))
+        # A final usage-only chunk, OpenAI's include_usage shape. Without it a client can
+        # only guess the token count from characters, and chars/4 is ~4x low for Chinese
+        # (roughly one token per character) -- a fabricated rate on the page's own meter.
+        # Opt-in: it carries no choices, so a client that indexes choices[0] every frame
+        # would raise on it.
+        if include_usage:
+            usage = _chat_chunk(chunk_id, created, model_name, {})
+            usage["choices"] = []
+            usage["usage"] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": len(output_ids),
+                "total_tokens": prompt_tokens + len(output_ids),
+            }
+            yield _sse(usage)
         yield "data: [DONE]\n\n"
 
     # Anthropic Messages: what Claude Code speaks. Same engine, same tokenizer;
@@ -534,7 +571,7 @@ _CHAT_UI = """<!doctype html>
 </form>
 <script>
 const $ = (id) => document.getElementById(id);
-let busy = false, mode = "chat";
+let busy = false, mode = "chat", history = [], abort = null;
 
 function setMode(m) {
   mode = m;
@@ -591,23 +628,41 @@ async function readSSE(resp, onFrame) {
 
 async function sendChat(text) {
   const bubble = addMsg("assistant", "…");
-  const t0 = performance.now(); let firstAt = 0, chars = 0;
+  const t0 = performance.now(); let firstAt = 0;
+  history.push({ role: "user", content: text });
+  abort = new AbortController();
   const resp = await fetch("/v1/chat/completions", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages: [{ role: "user", content: text }], stream: true }),
+    signal: abort.signal,
+    body: JSON.stringify({ messages: history, stream: true, stream_options: { include_usage: true } }),
   });
   if (!resp.ok) throw new Error("HTTP " + resp.status);
   bubble.textContent = "";
+  let raw = "", think = null;
   await readSSE(resp, (obj) => {
-    const delta = obj.choices?.[0]?.delta?.content;
-    if (delta) {
-      if (!firstAt) { firstAt = performance.now(); $("ttft").textContent = Math.round(firstAt - t0) + " ms"; }
-      bubble.textContent += delta; chars += delta.length; scrollDown();
+    // The usage-only chunk carries no choices, so read it before indexing into them.
+    if (obj.usage) {
+      const secs = (performance.now() - (firstAt || t0)) / 1000;
+      if (secs > 0) $("tps").textContent = (obj.usage.completion_tokens / secs).toFixed(1);
+      return;
     }
+    const delta = obj.choices?.[0]?.delta?.content;
+    if (!delta) return;
+    if (!firstAt) { firstAt = performance.now(); $("ttft").textContent = Math.round(firstAt - t0) + " ms"; }
+    raw += delta;
+    // Split the model's reasoning out of the answer. The tags can land mid-delta, so
+    // re-partition the whole accumulated text each frame rather than tracking a state
+    // machine across chunk boundaries.
+    const open = raw.indexOf("<think>");
+    if (open < 0) { bubble.textContent = raw; scrollDown(); return; }
+    const close = raw.indexOf("</think>", open);
+    if (!think) think = addThinking(bubble);
+    think.textContent = raw.slice(open + 7, close < 0 ? undefined : close).trim();
+    bubble.textContent = (raw.slice(0, open) + (close < 0 ? "" : raw.slice(close + 8))).trim();
+    scrollDown();
   });
-  if (!bubble.textContent) bubble.textContent = "(empty response)";
-  const secs = (performance.now() - (firstAt || t0)) / 1000;
-  if (secs > 0) $("tps").textContent = Math.round((chars / 4) / secs);
+  if (!bubble.textContent && !think) bubble.textContent = "(empty response)";
+  history.push({ role: "assistant", content: raw });
 }
 
 async function sendAgent(text) {
