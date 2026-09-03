@@ -247,7 +247,6 @@ class Backend:
         y = self._kernel("rmsnorm_apply")(x2, w, p, float(eps), block_N, num_chunks, _THREADS)
         return y.reshape(*lead, w.shape[0])
 
-
     def rmsnorm_bwd(self, grad, x, w, eps):
         grad = self._f32(grad)
         x = self._f32(x)
