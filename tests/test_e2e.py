@@ -989,6 +989,42 @@ def _full_context_draft(cfg, model, draft, backend, toks: list[int]) -> torch.Te
                          np.arange(1, n + 1), kv, backend)[0, -1].float()
 
 
+def test_every_draft_call_site_is_covered_by_the_timer():
+    """`_draft_ms` must see EVERY draft step, not just the ones on one code path.
+
+    The engine calls `_draft.step` from two places — `_run_forward` (eager) and
+    `_run_decode_graph`. Instrumenting only the eager one produced a number 31x too
+    large on the V100: the graph path took 212 of 218 ticks, so the timer sampled the
+    6 warm/mixed ticks, which carry prefill work, and reported 165.97 ms/forward
+    against a subtracted 4.80-5.30. A mean over an unrepresentative subset looks
+    exactly like a mean, which is why this is a gate and not a comment.
+
+    Asserted by source, because the failure is a MISSING call and no CPU run reaches
+    the graph path: every `_draft.step(` in engine.py must sit in a `_draft_ms is
+    None` branch or inside the timing helper itself. Counting recorded entries at
+    runtime cannot see a site that was never wired.
+    """
+    import re
+    from pathlib import Path
+
+    import tilerl.engine as eng_mod
+
+    src = Path(eng_mod.__file__).read_text().split("\n")
+    sites = [i for i, ln in enumerate(src) if re.search(r"self\._draft\.step\(", ln)]
+    assert len(sites) >= 2, f"expected both draft call sites, found {len(sites)}"
+    helper = next(i for i, ln in enumerate(src) if "def _draft_step_timed" in ln)
+    for i in sites:
+        if i > helper:
+            continue  # the call inside the timing helper is the timed one
+        # the three lines above a plain call must gate it on the timer being off
+        window = "\n".join(src[max(0, i - 3):i])
+        assert "_draft_ms is None" in window, (
+            f"engine.py:{i + 1} calls _draft.step outside the timer's reach:\n{window}")
+    # and the timed twin must exist beside it
+    assert sum("_draft_step_timed(" in ln for ln in src) >= 3, (
+        "each gated call site needs a _draft_step_timed twin plus the definition")
+
+
 def test_the_draft_forward_counter_counts_forwards_not_ticks():
     """``DraftHead.forwards`` is the divisor a direct draft timing uses, and it must
     count actual forwards, not ticks times depth.

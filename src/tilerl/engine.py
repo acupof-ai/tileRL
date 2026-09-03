@@ -779,18 +779,7 @@ class Engine:
             if self._draft_ms is None:
                 self._draft.step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
             else:
-                # Direct timing, opt-in: the draft cost derived by SUBTRACTING two
-                # rung-sharing tick means amplifies their noise by operand/difference,
-                # measured 12.9x -- 0.81% tick agreement became 10.42% draft
-                # disagreement (wins/2026-09-04-a-difference-amplifies-its-operands-noise.md).
-                # Events bracket the launches instead, so nothing cancels.
-                a, b = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-                f0 = self._draft.forwards
-                a.record()
-                self._draft.step(rows)
-                b.record()
-                b.synchronize()
-                self._draft_ms.append((self._draft.forwards - f0, a.elapsed_time(b)))
+                self._draft_step_timed(rows)
 
     def _finish_prefills(self, prefills: list[_Req], chunks: list[int], logits, base: int) -> None:
         done = []
@@ -942,8 +931,35 @@ class Engine:
                     r.hidden, r.hidden_from = g.hidden[i : i + 1], r.seq_len - 1
             self._sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
         if self._draft is not None:
-            self._draft.step(reqs)
+            if self._draft_ms is None:
+                self._draft.step(reqs)
+            else:
+                self._draft_step_timed(reqs)
         return True
+
+    def _draft_step_timed(self, rows: list[_Req]) -> None:
+        """``_draft.step`` with CUDA events around it, recording (forwards, ms).
+
+        One helper because there are TWO draft call sites -- this graph path and the
+        eager one in ``_run_forward`` -- and instrumenting only the eager one produced
+        a number 31x too large: the graph path takes 212 of 218 ticks, so the timer saw
+        only the 6 warm/mixed ticks, which carry prefill work. It read 165.97 ms/forward
+        against a subtracted 4.80-5.30, and the tick it sat in read 155.74 against a
+        known 35.04. Both are >2x off a known number, which is the tell; the count in
+        its own output (6 of 218) is what named the cause.
+
+        Timed rather than subtracted because the subtraction of two rung-sharing tick
+        means amplifies their noise by operand/difference, measured 12.9x
+        (wins/2026-09-04-a-difference-amplifies-its-operands-noise.md). Events bracket
+        the launches, so nothing cancels -- at the price of a sync per tick.
+        """
+        a, b = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+        f0 = self._draft.forwards
+        a.record()
+        self._draft.step(rows)
+        b.record()
+        b.synchronize()
+        self._draft_ms.append((self._draft.forwards - f0, a.elapsed_time(b)))
 
     def _verify(self, rows, chains, logits, hidden) -> None:
         """Accept the leading run of drafts the trunk agrees with, adopt the

@@ -213,9 +213,9 @@ def main() -> None:
                     help="time each draft forward with CUDA events instead of only "
                          "deriving it from two tick means. The subtraction amplifies "
                          "tick noise by operand/difference (measured 12.9x); this does "
-                         "not, but its per-tick sync perturbs the tick it is inside, so "
-                         "the ms/tick column of this run is not comparable to a run "
-                         "without it")
+                         "not. Measured cost of its per-tick sync: 0.06-0.34% on the "
+                         "tick (35.06/56.52/61.63 against 35.04/56.39/61.42 without), "
+                         "so the ms/tick column IS comparable to a run without it")
     args = ap.parse_args()
     batches = [int(b) for b in args.batch.split(",")]
     for B in batches:
@@ -258,9 +258,9 @@ def main() -> None:
                      max_batch=max(batches), max_total_tokens=args.ctx + args.tokens + 64,
                      draft=draft, spec_depth=max(DEPTHS))
     if args.time_draft:
-        # A sync per tick, so it changes the tick number it sits inside. That is the
-        # trade: the subtracted draft figure is free but amplifies tick noise 12.9x,
-        # this one is direct but perturbs the tick. Run it as its own pass.
+        # A sync per tick, and it costs less than I claimed: measured 0.06-0.34% on the
+        # tick against a run without it, so the two arms ARE comparable. The trade is
+        # only that the subtracted figure is free while this one needs a pass.
         e._draft_ms = []
     for B in batches:
         print(f"\n# B={B}, M=rows x width -> {'/'.join(str(1 + d) for d in DEPTHS)} "
@@ -310,9 +310,20 @@ def main() -> None:
                 # row runs out of blocks (spec.py:370), so a depth-3 tick can run fewer
                 # than 3 forwards and dividing by 3 would under-price it.
                 nf, tot = sum(f for f, _ in direct), sum(v for _, v in direct)
+                # And refuse a partial sample. Instrumenting one of the engine's two
+                # draft call sites timed 6 of 218 ticks -- the eager ones, which carry
+                # prefill -- and printed 165.97 ms/forward against a subtracted 4.80.
+                # A mean over an unrepresentative subset looks exactly like a mean.
+                ticks = sum(len(v) for v in per_rung.values())
+                if len(direct) < 0.9 * ticks:
+                    raise SystemExit(
+                        f"--time-draft covered {len(direct)} of {ticks} ticks "
+                        f"({len(direct) / max(ticks, 1):.1%}); the timer is on a path this "
+                        "run does not take -- the engine has two draft call sites, "
+                        "_run_forward and _run_decode_graph")
                 print(f"        draft: {tot / max(nf, 1):.2f} ms/forward "
-                      f"({nf / len(direct):.2f} forwards/tick over {len(direct)} ticks) "
-                      "-- timed, not differenced")
+                      f"({nf / len(direct):.2f} forwards/tick over {len(direct)} of "
+                      f"{ticks} ticks) -- timed, not differenced")
             print(f"        gpu: {gpu_state()}")
         best = max(DEPTHS, key=lambda d: rows[(B, d)][1] / rows[(B, d)][0])
         r_best, r_ship = (1000 * rows[(B, d)][1] / rows[(B, d)][0] for d in (best, 3))
