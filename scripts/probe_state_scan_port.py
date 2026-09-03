@@ -42,7 +42,7 @@ def main() -> None:
         chunk_size=args.chunk, save_new_value=True)
 
     kern = kernels_gdn.make_gdn_state_scan(b.target, block_DV=args.block_dv)
-    vnew, out = kern(k, w, u, g, st, args.chunk)
+    _, out, vnew = kern(k, w, u, g, st.bfloat16(), args.chunk)
 
     for name, a, c in (("V_new", vnew.float(), vnew_ref.float()),
                        ("state", out.float(), out_ref.float())):
@@ -63,7 +63,7 @@ def main() -> None:
     t_fla = timed(lambda: chunk_gated_delta_rule_fwd_h(
         k=k, w=w, u=u, g=g, initial_state=st, output_final_state=True,
         chunk_size=args.chunk, save_new_value=True))
-    t_ours = timed(lambda: kern(k, w, u, g, st, args.chunk))
+    t_ours = timed(lambda: kern(k, w, u, g, st.bfloat16(), args.chunk))
     print(f"\n  fla  {t_fla:7.1f} us/layer   ours {t_ours:7.1f} us/layer"
           f"   {t_fla / t_ours:.2f}x")
 

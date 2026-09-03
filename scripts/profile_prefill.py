@@ -43,7 +43,7 @@ def main() -> None:
         while engine.stats()["running"] or engine.stats()["waiting"]:
             engine.step()
 
-    for arm, env in (("shipped serial GDN", {}),
+    for arm, env in (("shipped chunkwise-WY GDN", {}),
                      ("fla chunked GDN", {"TILERL_GDN_CHUNKWISE": "64", "TILERL_GDN_FLA": "1"})):
         old = {k: os.environ.get(k) for k in ("TILERL_GDN_CHUNKWISE", "TILERL_GDN_FLA")}
         os.environ.pop("TILERL_GDN_CHUNKWISE", None)
