@@ -1,17 +1,15 @@
-# Attention partials in f16 — parity passed, and the peak was twice what OOMed, V100 sm70, 2026-09-03
+# The sm70 attention partials: f16 plus a per-width split count opens B=8 at ctx=512, V100 sm70, 2026-09-03
 
-> Status: **shipped on a passed parity gate** (`70b53f2`). `PO [B, S, H, KVSPLIT, D]` is now
-> f16, halving the only allocation in the split-KV path that scales with the tick's padded
-> width. **All 21 (n, S) pairs pass against the dense paged kernel, worst
-> |split − generic| = 3.424e-04 — 30× inside `rtol=1e-2`**, and the same order as the
-> 2.1-2.6e-4 predicted before the run. ctx=32 is **60.9 vs 61.1 tok/s, −0.4%, inside the
-> 1.16% noise floor** — as predicted, a shape that already fits only moves bytes.
-> **ctx=512 still OOMs, and f16 alone cannot open it.** Two arms at different headroom show
-> the failing row tracks free memory rather than the peak (396 MiB free → dies at 5×512;
-> 1.11 GiB free → dies at 7×512), so the peak is **8×512 = 1.500 GiB in f16** against 1.11 GiB
-> free. **KVSPLIT 32→16 takes it to 0.750 GiB, which fits with 360 MiB spare** — and that flip
-> is now blocked on its own measurement, because 16's recorded speed win is at prefill width
-> only.
+> Status: **shipped, gate passed, the ceiling is gone** (`70b53f2` + `a158672`). Two changes:
+> `PO [B, S, H, KVSPLIT, D]` is f16 (was f32), and the sm70 split count is now chosen per tick
+> by query width instead of being one hard-wired 32. **B=8 ctx=512 runs at 88.5 tok/s where
+> every earlier arm OOMed**, and ctx=32 is unchanged at 61.1 (baseline 61.1). Parity passes on
+> the card at **both** shipped split counts.
+>
+> **88.5 vs 61.1 is not a speedup.** The ctx=512 tick is **1.063× slower** (244.1 vs 229.6 ms);
+> the higher rate is entirely acceptance — **tok/forward 21.60 vs 14.00, 1.543×** — and those
+> two multiplied give 1.451× against a measured 1.448×, **0.2% apart**. The result is that this
+> configuration exists at all.
 
 ## Context
 
@@ -76,7 +74,7 @@ Two more gate facts found by the workflow: `check_split_attn_parity.py:29` pins
 exercised the shipped value; and its sequence lengths were chosen to straddle 16, so at 32
 the ragged/empty-slice coverage sits off the slice boundary.
 
-## Why f16 alone does not open ctx=512
+## Why f16 alone did not open ctx=512
 
 A verifier transcribed `_build_plan` verbatim and drove it: the 1.50 GiB request that failed
 is **4 rows × 512**, but the same run reaches **8 rows × 512 = 3.000 GiB**.
@@ -114,7 +112,8 @@ That makes f16 necessary and not sufficient, with the arithmetic now unambiguous
 | **f16** | **1.500** | **0.750** |
 
 Against 1.11 GiB free, **f16 + KVSPLIT=16 = 0.750 GiB fits with 360 MiB spare**, and f16 alone
-(1.500) does not. Both halvings are needed.
+(1.500) does not. Both halvings are needed — and the run confirmed it: with the per-width
+split count in, **ctx=512 runs**.
 
 Recording the estimate error honestly: I named **three** row counts for this peak (4 measured,
 8 derived, 5 inferred from a byte count) and published the third. Dividing a failed
@@ -122,24 +121,71 @@ allocation by its per-row bytes gives a real shape — but **the shape of the re
 happened to fail is not the shape of the peak**, and one arm with more headroom was enough to
 show it.
 
-## KVSPLIT=16 is not yet a free win — the recorded number is at the wrong width
+## KVSPLIT=16 is not a free win — and the sweep pointed at a better change
 
-The workflow refuted the plan I was about to run. The **1.17× faster at KVSPLIT=16** figure
-(4002 vs 4700 µs) is at **ctx=4096, S=32** — prefill width. A spec tick runs **S=1** (decode)
-and **S=4** (verify at depth 3), and at S=1 the recorded case *for* 32 is real: a block owns
-≤128 positions, below launch overhead, which is what flattened the context slope
-(512→4096 went 157→163 µs).
+The workflow refuted the plan I was about to run, and then the measurement refuted the
+plan's premise. The **1.17× faster at KVSPLIT=16** figure (4002 vs 4700 µs) is at
+**ctx=4096, S=32** — prefill width. A spec tick runs **S=1** (decode) and **S=4** (verify at
+depth 3), and the 16→32 flip arrived **bundled** with the thread-redundancy rewrite, so the
+split count was never isolated on the current kernel.
 
-Worse, the 16→32 flip arrived **bundled** with the thread-redundancy rewrite, so the split
-count's own contribution was never isolated on the current kernel. So "16 is faster and
-smaller, take it" is unsupported at the widths that matter. `scripts/prof_attn_ctx.py` swept
-S=32 only; it now sweeps **S=1, 4, 32** and prints PO bytes per KVSPLIT, and that measurement
-decides the flip.
+Swept at the widths that actually run (ctx=4096, block_N=16, µs/call):
 
-One safety fact that removes a whole class of worry: a split/combine KVSPLIT mismatch
-**raises at call time** and can never silently produce wrong numbers. KVSPLIT is baked as an
-IntImm into the combine's input declarations (`kernels.py:739-741`), so the packed ABI asserts
-on it — verified on both execution paths.
+| S | ks16 | ks32 | ks64 | 16 vs 32 | PO at 8×512 |
+|---|---:|---:|---:|---:|---:|
+| **1** (decode) | 246.5 | **205.1** | 192.5 | **0.832× — 16 loses 20%** | 3 MiB |
+| **4** (verify d3) | 658.4 | 660.3 | 680.7 | 1.003× wash | 12 MiB |
+| **32** (prefill) | 4660.2 | 4682.3 | 4850.3 | 1.005× wash | **1.500 GiB** |
+
+**A flat flip to 16 would have cost 20% on decode** — the shape a spec tick is mostly made
+of. So the flip I had queued as "free" was not free.
+
+But the two constraints turn out to sit at **opposite ends of S**, and never conflict: 32
+earns its 20% exactly where PO is 3 MiB and saving bytes is pointless, and 16 is free exactly
+where PO is 1.5 GiB and OOMs the card. So **choose the split count by query width**, which is
+not a new mechanism — `_paged_attention_decode` (`backend.py:762-764`) already derives sm90's
+split count host-statically from shape, graph-safe. The sm70 path now does the same: `S < 8`
+→ 32, `S ≥ 8` → 16, with the threshold above the widest verify the ladder can submit (depth 7
+is S=8). A 512-wide tick's PO becomes **0.750 GiB against 1.11 GiB free**.
+
+Two wiring facts this needed. The registry's closures **swallowed** the call site's choice —
+`_SM70_KERNELS["paged_attention_split"]("c", KVSPLIT=8)` raised `TypeError`, so they are now
+bare factories and `Backend._kernel` keys its compile cache on the argument, as it already
+does for `linear_fp4_gemv_sm70_m`. And a split/combine mismatch **raises at call time** rather
+than computing silently: KVSPLIT is baked as an IntImm into the combine's input declarations
+(`kernels.py:739-741`), so the packed ABI asserts on it — verified on both execution paths.
+
+## The result, and what 88.5 is not
+
+With both changes in, B=8 depth 3 on the real 27B:
+
+| ctx | tok/s | ms/tok | tok/forward | tick ms |
+|---:|---:|---:|---:|---:|
+| 32 | 61.1 | 16.4 | 14.00 | 229.6 |
+| **512** | **88.5** | 11.3 | 21.60 | 244.1 |
+
+**88.5 vs 61.1 is not a 1.45× speedup, and reporting it as one would be wrong.** The ctx=512
+**tick is 1.063× slower** (244.1 vs 229.6 ms) — longer histories cost more attention, as they
+should. The entire rate gain is **acceptance**: `tok/forward` rises **14.00 → 21.60, 1.543×**,
+because a 512-token context gives the draft head far more to condition on than 32 tokens do.
+
+Those two are a closed check on the measurement rather than two loose observations:
+`1.543 / 1.063 = 1.451×` predicted, **1.448× measured — 0.2% apart**. Nothing else is needed
+to explain the number, which is also why no part of it can be claimed for the kernel work.
+
+**What the kernel work bought is that the row exists.** Every earlier arm at this
+configuration OOMed: 1.41 GiB in the draft readout, then 1.50 GiB in the partials, then
+960 MiB, then 1.31 GiB. ctx=32 confirms the price was zero where it should be — **61.1 against
+a 61.1 baseline**, and by construction, since every tick there is S≤4 and takes the same
+KVSPLIT=32 kernel it always took.
+
+## One number does not reproduce
+
+**I am naming the instrument rather than the result.** The recorded S=32 pair was
+ks16 4002 / ks32 4700; this run reads **4660 / 4682**. ks32 reproduces to 0.4%, ks16 is **16%
+slower than recorded**. The one change between the runs is PO f16, so either f16 costs ks16
+16% at S=32 or one of the two runs is off. Unresolved. The **within-run** comparisons the
+design rests on are unaffected — same process, same dtype, same call.
 
 ## What the padding actually costs
 
@@ -186,11 +232,26 @@ died at 7 rows instead. Because these partials are allocated and freed per call,
 climbs until one request exceeds what is free, so the failing size measures the *headroom*,
 and only a second arm at different headroom separates the two.
 
+Fourth: **a knob measured at one width is not a knob you understand.** The queued flip to
+KVSPLIT=16 looked free on a recorded 1.17×, and at the width a decode tick actually runs it
+**loses 20%**. Sweeping the shipped widths did not merely kill the flip — it showed the
+footprint constraint and the speed constraint sit at opposite ends of S, which is what made a
+per-width choice the right change rather than a compromise between the two.
+
+Fifth: **a rate that rises is not a kernel that got faster.** ctx=512's 88.5 tok/s against
+ctx=32's 61.1 looks like a 1.45× win and the tick is actually **1.063× slower** — the gain is
+acceptance, and multiplying the two closes to 0.2%. Splitting tok/s into tick time × tok/forward
+before reporting it is what keeps a capacity fix from being written up as a speed fix.
+
 ## Gate
 
-Parity on the pod, 21/21, worst 3.424e-04 against the dense kernel. 191 tests pass, ruff
-clean. Negative control on the CPU failure verified against pristine HEAD. GPU verified idle
-before launch.
+Parity on the pod at **both shipped split counts, 32 and 16** — `parity OK (cuda)`,
+`PARITY_EXIT=0`; the f16 arm before it was 21/21 with worst 3.424e-04 against the dense
+kernel. 192 tests pass, ruff clean. The width gate carries its own test with **two negative
+controls verified**: lowering the threshold to 2 (a depth-3 verify would take the slow kernel)
+fails it, and dropping `KVSPLIT` from the combine call — the real ABI-mismatch bug — fails it.
+Negative control on the CPU failure verified against pristine HEAD. GPU verified idle before
+each launch.
 
 ## Results table
 
@@ -202,7 +263,17 @@ before launch.
 | 2026-09-03 | 70b53f2 | V100 | cuda sm70 | qwen38-27b | **PO at the failing shape (4×512)** | **1.500 → 0.750 GiB** |
 | 2026-09-03 | 70b53f2 | V100 | cuda sm70 | qwen38-27b | **the ctx=512 PEAK (8×512)** | **3.000 → 1.500 GiB, free 1.38** |
 | 2026-09-03 | 70b53f2 | V100 | cuda sm70 | qwen38-27b | f16 + KVSPLIT=16 peak | **0.750 GiB — the pair that fits** |
-| 2026-09-03 | (recorded) | V100 | cuda sm70 | attention | KVSPLIT 16 vs 32 @ctx4096 S=32 | 4002 vs 4700 µs — **16 is 1.17× faster** |
+| 2026-09-03 | (recorded) | V100 | cuda sm70 | attention | KVSPLIT 16 vs 32 @ctx4096 **S=1** | **246.5 vs 205.1 µs — 16 LOSES 20%** |
+| 2026-09-03 | (recorded) | V100 | cuda sm70 | attention | KVSPLIT 16 vs 32 @ctx4096 **S=4** | 658.4 vs 660.3 µs — 1.003× wash |
+| 2026-09-03 | (recorded) | V100 | cuda sm70 | attention | KVSPLIT 16 vs 32 @ctx4096 **S=32** | 4660.2 vs 4682.3 µs — 1.005× wash |
+| 2026-09-03 | (recorded) | V100 | cuda sm70 | attention | the recorded 4002 for ks16 | **does NOT reproduce — 4660, 16% slower; ks32 reproduces to 0.4%** |
+| 2026-09-03 | (next) | V100 | cuda sm70 | qwen38-27b | **per-width KVSPLIT parity, both counts** | **parity OK (cuda) at 32 and 16, PARITY_EXIT=0** |
+| 2026-09-03 | a158672 | V100 | cuda sm70 | qwen38-27b | ks=16 worst error vs dense | **1.493e-04 — tighter than ks=32's 3.424e-04** |
+| 2026-09-03 | a158672 | V100 | cuda sm70 | qwen38-27b | **B=8 ctx=32, per-width KVSPLIT** | **61.1-61.2 tok/s vs 61.1 baseline — flat, as predicted** |
+| 2026-09-03 | a158672 | V100 | cuda sm70 | qwen38-27b | **B=8 ctx=512, per-width KVSPLIT** | **88.5 tok/s — RUNS; was OOM at every earlier arm** |
+| 2026-09-03 | a158672 | V100 | cuda sm70 | qwen38-27b | ctx=512 tick vs ctx=32 tick | 244.1 vs 229.6 ms — **1.063× SLOWER per tick** |
+| 2026-09-03 | a158672 | V100 | cuda sm70 | qwen38-27b | ctx=512 tok/forward | **21.60 vs 14.00 — 1.543× more accepted** |
+| 2026-09-03 | a158672 | V100 | cuda sm70 | qwen38-27b | those two multiplied vs measured tok/s | **1.451× predicted, 1.448× measured — 0.2% apart** |
 | 2026-09-03 | 70b53f2 | Mac | cpu | — | split kernel on target="c" | **does not compile — no CPU twin, predates this** |
 | 2026-09-03 | (this) | Mac | cpu | tiny | mixed-tick padding | **72% waste; decode ticks 0%** |
 | 2026-09-03 | 70b53f2 | V100 | cuda sm70 | qwen38-27b | **B=8 ctx=32 with PO f16** | **60.9 tok/s vs 61.1 — −0.4%, inside noise** |
