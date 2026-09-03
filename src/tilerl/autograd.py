@@ -225,6 +225,11 @@ _BWD: dict[str, _Handler] = {
     "linear_fp4_frozen": _frozen(False),
     "linear_fp8_frozen": _frozen(True),
     "rmsnorm": _default("rmsnorm"),
+    # _default's argument names the BACKWARD it resolves (`<name>_bwd`), not the key:
+    # "rmsnorm" here means rmsnorm_bwd, which is right because a norm's gradient does
+    # not depend on the dtype the forward stored. Omitting the key entirely records NO
+    # entry and silently drops the q/k norm gradient (measured: 1 entry vs 0).
+    "rmsnorm_f32": _default("rmsnorm"),
     "rope": _rope,
     "linear": _linear,
     "attention": _attention,
