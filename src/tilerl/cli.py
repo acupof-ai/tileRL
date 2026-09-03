@@ -195,9 +195,10 @@ def _train_adapters(args: argparse.Namespace) -> None:
 
     def evals(tag):
         if args.eval_mmlu:
-            c, n = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=8)
+            c, n, conc = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=8)
             manifest["metrics"][f"mmlu_{tag}"] = c / n
-            log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}%")
+            manifest["metrics"][f"mmlu_{tag}_concurrency"] = conc
+            log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}% (seed 0, concurrency {conc})")
         if eval_rows:
             c, n = gsm8k_accuracy(engine, tok, eval_rows, params, concurrency=8, thinking=thinking)
             manifest["metrics"][f"gsm8k_{tag}"] = c
