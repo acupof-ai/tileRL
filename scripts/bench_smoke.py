@@ -8,9 +8,8 @@ import sys
 
 sys.path.insert(0, "src")
 
-import torch
-
 import benchkit
+import torch
 from tilerl_kernels.backend import get_backend
 from tilerl_kernels.reference import gdn_forward
 

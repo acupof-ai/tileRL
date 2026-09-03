@@ -11,12 +11,12 @@ import argparse
 
 import numpy as np
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.autograd import AdamW
 from tilerl.config import qwen38_27b
 from tilerl.model import add_lora, load_hf
 from tilerl.train import train_step
-from tilerl_kernels.backend import get_backend
 
 
 def main() -> None:

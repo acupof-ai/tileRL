@@ -59,8 +59,9 @@ def _build_engine(cfg, model, backend, devices=None):
     if not devices:
         return engine_mod.build_engine(cfg, model, backend, **kw)
 
-    from .model import load_hf
     from tilerl_kernels.backend import Backend, resolve_target
+
+    from .model import load_hf
     from .parallel import DataParallelEngine
 
     def make(d, **kwargs):
@@ -74,8 +75,8 @@ def _build_engine(cfg, model, backend, devices=None):
 
 def cmd_serve(args: argparse.Namespace) -> None:
     import uvicorn
-
     from tilerl_kernels.backend import get_backend
+
     from .server import create_app, get_tokenizer
 
     backend = get_backend()
@@ -106,11 +107,11 @@ def _jsonl(path: str | None) -> list[dict]:
 def _train_full(args: argparse.Namespace) -> None:
     """Full-parameter SFT on random tokens: Adafactor or ISO, streamed updates."""
     import torch
+    from tilerl_kernels.backend import get_backend
 
     from . import train as train_mod
     from .autograd import Adafactor, cosine_warmup
     from .model import drop_quantized
-    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     cfg, model = _build_model(args.model, seed=args.seed, keep_master=True)
@@ -135,6 +136,7 @@ def _train_full(args: argparse.Namespace) -> None:
 def _train_adapters(args: argparse.Namespace) -> None:
     """GRPO or OPD: LoRA on the frozen base, the engine samples, the ledger gates."""
     import torch
+    from tilerl_kernels.backend import get_backend
 
     from . import train as train_mod
     from .autograd import AdamW
@@ -145,7 +147,6 @@ def _train_adapters(args: argparse.Namespace) -> None:
     from .model import add_lora
     from .prompt import render_chat, sampling
     from .tokenizer import get_tokenizer
-    from tilerl_kernels.backend import get_backend
 
     real = args.model == "qwen38-27b"
     log = (lambda *a, **k: None) if args.json else print
@@ -268,9 +269,10 @@ def _finish(m: dict, as_json: bool) -> None:
 
 
 def cmd_pretrain(args: argparse.Namespace) -> None:
+    from tilerl_kernels.backend import get_backend
+
     from . import train as train_mod
     from .autograd import AdamW
-    from tilerl_kernels.backend import get_backend
     from .server import get_tokenizer
 
     backend = get_backend()
@@ -339,9 +341,9 @@ def cmd_bench(args: argparse.Namespace) -> None:
         sys.exit(subprocess.call(cmd))
 
     import torch
+    from tilerl_kernels.backend import get_backend
 
     from . import engine as engine_mod
-    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     cfg, model = _build_model(args.model, seed=0)

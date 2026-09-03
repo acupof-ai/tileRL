@@ -10,10 +10,9 @@ from __future__ import annotations
 import argparse
 
 import torch
-from torch.profiler import ProfilerActivity, profile
-
 from tilerl_kernels import reference as R
 from tilerl_kernels.backend import get_backend
+from torch.profiler import ProfilerActivity, profile
 
 
 def err(name, ours, ref):

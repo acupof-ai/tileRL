@@ -46,13 +46,13 @@ from dataclasses import replace
 from pathlib import Path
 
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl import precision
 from tilerl.config import qwen38_27b
 from tilerl.engine import Engine, SamplingParams, StepLimits, _DecodeGraph, build_engine
 from tilerl.kv_cache import LinearStatePool, NoPrefixStore, PagedKvPool
 from tilerl.model import load_hf
-from tilerl_kernels.backend import get_backend
 
 
 def host_load() -> str:
@@ -236,7 +236,7 @@ def price(args) -> None:
     spec_ms = sum(engine_ticks[w] * ms[w] for w in engine_ticks)
     base_ticks = tokens / B  # the unspeculated arm: one token per row per tick
     base_ms = base_ticks * ms[1]
-    print(f"\n=== the ceiling: trunk-only cost of the two schedules ===")
+    print("\n=== the ceiling: trunk-only cost of the two schedules ===")
     print(f"  tokens committed          {tokens}")
     print(f"  spec engine ticks         {sum(engine_ticks.values()):.1f} "
           f"({', '.join(f'{v:.1f}x W={k}' for k, v in sorted(engine_ticks.items()))})")

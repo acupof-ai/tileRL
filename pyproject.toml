@@ -75,13 +75,7 @@ ignore = [
     "E702",   # multiple-statements-on-one-line-semicolon
     "E731",   # lambda-assignment
     "E741",   # ambiguous-variable-name
-    "F401",   # unused-import
-    "F541",   # f-string-missing-placeholders
-    "I001",   # unsorted-imports
-    "SIM108", # if-else-block-instead-of-if-exp
-    "UP006",  # non-pep585-annotation
-    "UP035",  # deprecated-import
-    "UP037",  # quoted-annotation
+    "SIM108", # if-else-block-instead-of-if-exp: its one site rewrites to a nested ternary
 ]
 
 [tool.ruff.lint.per-file-ignores]

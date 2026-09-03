@@ -7,7 +7,6 @@ different K, and a direct tilelang-vs-torch e4m3 cast check.
 from __future__ import annotations
 
 import torch
-
 from tilerl_kernels.backend import get_backend
 from tilerl_kernels.reference import dequant_fp4, linear_fp4, pack_fp4
 

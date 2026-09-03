@@ -39,9 +39,9 @@ def run_worker(
     os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
     # Imported after CUDA_VISIBLE_DEVICES: the Backend binds the current device on construction.
     import torch
+    from tilerl_kernels.backend import Backend, resolve_target
 
     from .engine import SamplingParams, build_engine
-    from tilerl_kernels.backend import Backend, resolve_target
 
     rows = _read_prompts(prompts_path)[rank::world]
     if not rows:

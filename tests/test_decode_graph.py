@@ -21,12 +21,12 @@ from dataclasses import replace
 
 import pytest
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import tiny
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.model import build_random
 from tilerl.spec import DraftHead
-from tilerl_kernels.backend import get_backend
 
 
 def _draft(cfg, trunk):

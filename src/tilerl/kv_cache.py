@@ -44,8 +44,9 @@ class PagedKvPool:
     Only full-attn layers own a plane: ``layer_map`` gives each plane's GLOBAL
     layer index, and every layer-indexed method takes a global index.
 
-    A block with refcount > 1 is shared (a live slot plus the prefix store);
-    :meth:`cow_for_append` duplicates it before a slot writes.
+    A block with refcount > 1 is shared (a live slot plus the prefix store).
+    Only whole blocks are ever published, so a shared block is never appended to
+    and no copy-on-write is needed; :meth:`PrefixStore.insert` enforces that.
     """
 
     def __init__(
@@ -97,16 +98,6 @@ class PagedKvPool:
     def is_shared(self, block: int) -> bool:
         return self.refcount[block] > 1
 
-    def cow_for_append(self, block: int) -> int:
-        """Writable block for a slot owning one ref of ``block``: a copy if shared."""
-        if not self.is_shared(block):
-            return block
-        new = self.alloc_block()
-        self.k_pool[:, new].copy_(self.k_pool[:, block])
-        self.v_pool[:, new].copy_(self.v_pool[:, block])
-        self.free_block(block)
-        return new
-
     def write_block(
         self,
         block: int,
@@ -127,11 +118,6 @@ class PagedKvPool:
         if offset < 0 or offset + n > BLOCK_TOKENS:
             raise ValueError(
                 f"write_block: span [{offset}, {offset + n}) outside block of {BLOCK_TOKENS}"
-            )
-        if self.is_shared(block):
-            raise RuntimeError(
-                f"write_block: block {block} is shared (refcount {self.refcount[block]}); "
-                "call cow_for_append first"
             )
         layer = self._plane[layer]
         self.k_pool[layer, block, :, offset : offset + n].copy_(
@@ -350,6 +336,12 @@ class PrefixStore:
         the blocks; True when a new entry was retained, False for a duplicate."""
         tokens = tuple(int(t) for t in tokens)
         blocks = tuple(blocks)
+        if len(blocks) * BLOCK_TOKENS > len(tokens):
+            raise ValueError(
+                f"insert: {len(blocks)} blocks cover {len(blocks) * BLOCK_TOKENS} tokens but only "
+                f"{len(tokens)} were given; publishing a partial block shares a page a slot is "
+                "still appending to"
+            )
         if not tokens:
             return False
         expected = PagedKvPool.blocks_for_tokens(len(tokens))

@@ -6,10 +6,9 @@ from __future__ import annotations
 import argparse
 
 import torch
-from torch.profiler import ProfilerActivity, profile
-
 from tilerl_kernels import kernels_gdn
 from tilerl_kernels.backend import get_backend
+from torch.profiler import ProfilerActivity, profile
 
 
 def main() -> None:

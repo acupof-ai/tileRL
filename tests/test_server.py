@@ -14,14 +14,13 @@ os.environ.setdefault("TILERL_TARGET", "cpu")
 
 import pytest
 from fastapi.testclient import TestClient
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import tiny
 from tilerl.engine import Engine, build_engine
-from tilerl.model import build_random
-from tilerl_kernels.backend import get_backend
 from tilerl.messages import render_tool_call
+from tilerl.model import build_random
 from tilerl.server import create_app, get_tokenizer
-
 
 # ---------------------------------------------------------------------------
 # helpers

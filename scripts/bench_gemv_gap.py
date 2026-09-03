@@ -13,12 +13,12 @@ import torch
 
 sys.path.insert(0, "scripts")
 import bench_fp4_gemv as bg  # noqa: E402 — _measure_bw_gbs, _time_calls
-
-from tilerl.config import qwen36_27b  # noqa: E402
-from tilerl.model import fp4_param_keys, load_hf  # noqa: E402
 from tilerl_kernels import kernels_linear  # noqa: E402
 from tilerl_kernels.backend import _round_up, get_backend  # noqa: E402
 from tilerl_kernels.reference import linear_fp4  # noqa: E402
+
+from tilerl.config import qwen36_27b  # noqa: E402
+from tilerl.model import fp4_param_keys, load_hf  # noqa: E402
 
 
 def main() -> None:

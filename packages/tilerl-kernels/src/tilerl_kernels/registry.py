@@ -7,11 +7,7 @@ import os
 
 import torch
 
-from . import kernels
-from . import kernels_attn
-from . import kernels_gdn
-from . import kernels_linear
-from . import kernels_mma
+from . import kernels, kernels_attn, kernels_gdn, kernels_linear, kernels_mma
 
 _REGISTRY: dict[tuple[str, str], dict[str, object]] = {}
 

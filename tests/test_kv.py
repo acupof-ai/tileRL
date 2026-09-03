@@ -103,7 +103,7 @@ def test_paged_gather_mimics_paged_attention():
     assert torch.equal(gathered, torch.cat([k0, k1], dim=1))
 
 
-# -------------------------------------------------------------- refcount / CoW
+# -------------------------------------------------------------- refcount
 
 
 def test_refcount_lifecycle():
@@ -125,35 +125,8 @@ def test_refcount_lifecycle():
         pool.retain(b)  # retaining a free block would corrupt the free list
 
 
-def test_cow_duplicates_shared_block():
-    pool = PagedKvPool(4, 1, 4)
-    b = pool.alloc_block()
-    k, v = _kv(0, 6)
-    pool.write_block(b, 0, k, v)
-    pool.retain(b)  # second owner (e.g. prefix store) -> shared
-    assert pool.is_shared(b)
-    # writing a shared block is a hard error
-    with pytest.raises(RuntimeError):
-        pool.write_block(b, 6, *_kv(1, 1))
-    nb = pool.cow_for_append(b)
-    assert nb != b
-    assert pool.refcount[b] == 1  # caller's ownership moved off it
-    assert pool.refcount[nb] == 1  # exclusive copy
-    # contents copied across every layer
-    assert torch.equal(pool.k_pool[0, nb, :, :6], k)
-    assert torch.equal(pool.v_pool[0, nb, :, :6], v)
-    # mutating the copy leaves the shared original byte-stable
-    k2, v2 = _kv(2, 1)
-    pool.write_block(nb, 6, k2, v2)
-    assert torch.equal(pool.k_pool[0, b, :, :6], k)
-    assert torch.equal(pool.k_pool[0, nb, :, 6:7], k2)
 
 
-def test_cow_exclusive_block_is_noop():
-    pool = PagedKvPool(2, 1, 4)
-    b = pool.alloc_block()
-    assert pool.cow_for_append(b) == b
-    assert pool.free_blocks == 1
 
 
 # -------------------------------------------------------------- prefix store
@@ -287,67 +260,21 @@ def test_alloc_raises_under_pressure():
         pool.alloc_block()
 
 
-# ------------------------------------------------- shared-prefix fork lifecycle
+# ------------------------------------------------- shared-prefix publication
 
 
-def test_shared_prefix_fork_cow():
-    """Two sequences share a cached prefix, then fork: each append CoWs."""
+def test_a_partial_block_cannot_be_published():
+    """The engine publishes whole blocks only, which is why a shared block is
+    never appended to. Stated as a guard here because nothing else states it:
+    without it a partial publish silently shares a page a slot keeps writing."""
     pool = PagedKvPool(8, 1, 4)
     store = PrefixStore(pool)
+    blocks = [pool.alloc_block(), pool.alloc_block()]
+    with pytest.raises(ValueError, match="partial block"):
+        store.insert(list(range(20)), blocks)  # 2 blocks cover 32 tokens, 20 given
+    assert store.insert(list(range(32)), blocks) is True
 
-    # Sequence A: 20-token prompt in [a0 (full), a1 (4 tokens)].
-    toks = list(range(20))
-    a0 = pool.alloc_block()
-    a1 = pool.alloc_block()
-    blocks_a = [a0, a1]
-    k0, v0 = _kv(0, BLOCK_TOKENS)
-    k1, v1 = _kv(1, 4)
-    pool.write_block(a0, 0, k0, v0)
-    pool.write_block(a1, 0, k1, v1)
-    store.insert(toks, blocks_a)  # store co-owns both
-    assert pool.refcount[a0] == 2 and pool.refcount[a1] == 2
 
-    # Sequence B: identical prompt -> prefix hit, adopts the same blocks.
-    hit = store.lookup(toks)
-    assert hit is not None and hit.length == 20 and hit.blocks == (a0, a1)
-    blocks_b = list(hit.blocks)
-    for b in hit.blocks:
-        pool.retain(b)
-    assert pool.refcount[a1] == 3  # A + store + B
-
-    # B appends one token: a1 is shared AND partial -> CoW.
-    assert pool.is_shared(blocks_b[-1])
-    b1 = pool.cow_for_append(blocks_b[-1])
-    blocks_b[-1] = b1
-    kb, vb = _kv(2, 1)
-    pool.write_block(b1, 4, kb, vb)
-    assert pool.refcount[a1] == 2  # B's ref moved to b1
-    assert pool.refcount[b1] == 1
-
-    # A appends too: a1 is still shared (A + store) -> A CoWs as well.
-    assert pool.is_shared(blocks_a[-1])
-    a1n = pool.cow_for_append(blocks_a[-1])
-    blocks_a[-1] = a1n
-    ka, va = _kv(3, 1)
-    pool.write_block(a1n, 4, ka, va)
-    assert pool.refcount[a1] == 1  # store only now
-
-    # The store's cached prefix is byte-stable; each fork reads its own token.
-    assert torch.equal(pool.k_pool[0, a1, :, :4], k1)
-    assert torch.equal(pool.v_pool[0, a1, :, :4], v1)
-    assert torch.equal(pool.k_pool[0, b1, :, 4:5], kb)
-    assert torch.equal(pool.k_pool[0, a1n, :, 4:5], ka)
-
-    # Cleanup: B releases its fork plus its ref on the shared head block;
-    # A releases its fork and head. The store keeps the prefix until evicted.
-    pool.free_block(b1)
-    pool.free_block(a0)  # B's ref on the shared head
-    assert pool.refcount[b1] == 0  # recycled
-    assert pool.refcount[a0] == 2  # A + store
-    pool.free_block(a1n)
-    pool.free_block(a0)
-    assert pool.refcount[a0] == 1 and pool.refcount[a1] == 1  # store only
-    assert pool.free_blocks == 6  # 8 total - 2 store-held
 
 
 def test_prefix_state_budget_evicts():

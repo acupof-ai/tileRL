@@ -19,12 +19,11 @@ os.environ.setdefault("TILERL_TARGET", "cpu")
 import shutil
 
 import pytest
+from test_server import _ByteTokenizer, _ScriptedEngine
 
 from tilerl import rollout as rollout_mod
 from tilerl.messages import render_tool_call
 from tilerl.server import create_app
-
-from test_server import _ByteTokenizer, _ScriptedEngine
 
 pytestmark = pytest.mark.skipif(shutil.which("claude") is None,
                                 reason="stage-2 gate needs the claude CLI")

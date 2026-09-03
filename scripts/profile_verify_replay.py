@@ -14,11 +14,11 @@ import subprocess
 from collections import defaultdict
 
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import qwen38_27b
 from tilerl.engine import SamplingParams, _DecodeGraph, build_engine
 from tilerl.model import load_hf
-from tilerl_kernels.backend import get_backend
 
 
 def host_load() -> str:
@@ -52,6 +52,7 @@ def main() -> None:
     args = ap.parse_args()
 
     from dataclasses import replace
+
     from torch.profiler import ProfilerActivity, profile
 
     backend = get_backend()

@@ -12,7 +12,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch  # noqa: E402
-
 from tilerl_kernels import reference  # noqa: E402
 from tilerl_kernels.backend import get_backend  # noqa: E402
 

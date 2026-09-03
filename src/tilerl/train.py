@@ -7,10 +7,11 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any
 
 import numpy as np
 import torch
@@ -140,7 +141,7 @@ def train_step(
     return _step(model, input_ids, backend, optimizer, trainable, grad_fn, micro)
 
 
-def group_advantages(rewards: Any, group: int) -> "np.ndarray":
+def group_advantages(rewards: Any, group: int) -> np.ndarray:
     """``(r - mean) / std`` within each group of ``group`` consecutive rollouts;
     a tied group yields zeros (no signal, no division by ~0)."""
     r = np.asarray(rewards, dtype=np.float64).reshape(-1, group)

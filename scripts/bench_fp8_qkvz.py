@@ -6,9 +6,8 @@ w8/wscale (lossless: 10240 = 80 blocks, 6144 = 48) plus a split.
 
 from __future__ import annotations
 
-import torch
-
 import benchkit
+import torch
 from tilerl_kernels.backend import get_backend
 
 

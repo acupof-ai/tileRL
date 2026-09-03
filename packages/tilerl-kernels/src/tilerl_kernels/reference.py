@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import math
 import os
+from typing import Any
 
 import torch
-from typing import Any
 
 
 def _f32(x: torch.Tensor) -> torch.Tensor:
@@ -543,8 +543,8 @@ def gdn_prep(
     conv1d_weight: torch.Tensor,
     dt_bias: torch.Tensor,
     a_log: torch.Tensor,
-    conv_window: "torch.Tensor | None" = None,
-    seq_q_lens: "torch.Tensor | None" = None,
+    conv_window: torch.Tensor | None = None,
+    seq_q_lens: torch.Tensor | None = None,
     keep_steps: int = 0,
 ) -> tuple[torch.Tensor, ...]:
     """Front half of :func:`gdn_forward`, and the oracle for the ``gdn_prep``
@@ -605,11 +605,11 @@ def gdn_forward(
     dt_bias: torch.Tensor,
     a_log: torch.Tensor,
     norm_weight: torch.Tensor,
-    conv_window: "torch.Tensor | None" = None,
-    seq_q_lens: "torch.Tensor | None" = None,
+    conv_window: torch.Tensor | None = None,
+    seq_q_lens: torch.Tensor | None = None,
     keep_steps: int = 0,
     chunkwise: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor, "torch.Tensor | None"]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Full GDN layer core, the executable spec (agent-infer's host reference
     equation by equation). q/k [B,T,nkh*K], v/z [B,T,nvh*V], g/beta [B,T,nvh],
     state [B,nvh,K,V]. ``conv_window`` [B,K-1,qkv_dim] is the previous
@@ -683,7 +683,7 @@ def gdn_backward(
     dt_bias: torch.Tensor,
     a_log: torch.Tensor,
     norm_weight: torch.Tensor,
-    conv_window: "torch.Tensor | None" = None,
+    conv_window: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Backward of :func:`gdn_forward`: (gq,gk,gv,gg,gbeta,gstate,gz,gconv1d,
     gdt_bias,ga_log,gnorm_weight). Only a zero ``conv_window`` is exact

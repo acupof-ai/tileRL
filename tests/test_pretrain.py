@@ -12,12 +12,12 @@ os.environ.setdefault("TILERL_TARGET", "cpu")
 
 import numpy as np
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.autograd import AdamW
 from tilerl.config import tiny
 from tilerl.engine import SamplingParams, build_engine
 from tilerl.model import build_random, load_hf, save_hf
-from tilerl_kernels.backend import get_backend
 from tilerl.server import ByteTokenizer
 from tilerl.train import JsonlDataset, pretrain
 

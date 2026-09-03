@@ -22,9 +22,9 @@ def main() -> None:
     os.environ.setdefault("TILERL_TARGET", "cuda")
 
     import torch
+    from tilerl_kernels.backend import get_backend
 
     from tilerl.config import qwen38_27b
-    from tilerl_kernels.backend import get_backend
 
     backend = get_backend()
     cfg = qwen38_27b()

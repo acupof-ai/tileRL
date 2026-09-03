@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 from typing import Any, Protocol
 
+
 class Tokenizer(Protocol):
     def encode(self, text: str) -> list[int]: ...
 

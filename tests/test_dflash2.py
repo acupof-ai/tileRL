@@ -19,12 +19,12 @@ os.environ.setdefault("TILERL_TARGET", "cpu")
 import pytest
 import torch
 from safetensors.torch import save_file
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import tiny
 from tilerl.dflash2 import load_dflash2
 from tilerl.model import build_random
 from tilerl.spec import _DRAFT_TOP, read_head_params
-from tilerl_kernels.backend import get_backend
 
 _NORM = 0.25
 #: The tiny trunk's random readout leaves ~10 logits between its top two tokens.

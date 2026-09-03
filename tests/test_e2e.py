@@ -11,28 +11,26 @@ os.environ.setdefault("TILERL_TARGET", "cpu")
 import numpy as np
 import pytest
 import torch
+from tilerl_kernels.backend import get_backend
+from tilerl_kernels.reference import dequant_fp4, pack_fp4, top_p_probs, unpack_fp4
 
-from tilerl.autograd import (Adafactor, AdamW, RecordingBackend, Tape, clip_grad_norm,
-                             cosine_warmup)
+from tilerl.autograd import Adafactor, AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
 from tilerl.cli import _build_model
 from tilerl.config import tiny
 from tilerl.engine import (
-    BLOCK_TOKENS,
     _PHASE_DECODE,
-    _restrict,
-    _step_seed,
+    BLOCK_TOKENS,
     BatchKv,
     Engine,
     SamplingParams,
+    _restrict,
+    _step_seed,
     build_engine,
 )
-from tilerl.kv_cache import PagedKvPool
+from tilerl.kv_cache import NoPrefixStore, PagedKvPool
 from tilerl.model import add_lora, build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
-from tilerl_kernels.backend import get_backend
-from tilerl_kernels.reference import dequant_fp4, pack_fp4, top_p_probs, unpack_fp4
 from tilerl.testing import RefBackend
-from tilerl.kv_cache import NoPrefixStore
 from tilerl.train import _training_kv, opd_loop, train_step
 
 
@@ -872,7 +870,7 @@ def _spec_run(prompt, n, draft=None, depth=3):
     return out, engine.stats()
 
 
-def _full_context_draft(cfg, model, draft, backend, toks: list[int]) -> "torch.Tensor":
+def _full_context_draft(cfg, model, draft, backend, toks: list[int]) -> torch.Tensor:
     """draft_check.py's shape: the head teacher-forced over the whole sequence;
     returns its logits at position len(toks) - 1."""
     n = len(toks) - 1
@@ -970,14 +968,20 @@ def test_speculation_reproduces_greedy_decode():
     assert spec == base, f"oracle draft changed the output: {spec} != {base}"
     assert sstats["spec_accepted"] > sstats["spec_drafted"] * 0.9, sstats
 
-    # chains trimmed below spec_depth write narrower step planes than the pool's
-    import tilerl.engine as eng
+    # chains trimmed below spec_depth write narrower step planes than the pool's.
+    # Patch tilerl.spec: DraftHead.step resolves verify_lens in that namespace, so
+    # patching any other module's copy leaves this arm untrimmed and identical to
+    # the one above it.
+    import tilerl.spec as spec_mod
 
-    orig, eng.verify_lens = eng.verify_lens, lambda surv: [2] * len(surv)
+    orig, spec_mod.verify_lens = spec_mod.verify_lens, lambda surv: [2] * len(surv)
     try:
-        trimmed, _ = _spec_run(prompt, n, draft=lambda cfg, m: _OracleDraft(cfg, expected))
+        trimmed, tstats = _spec_run(prompt, n, draft=lambda cfg, m: _OracleDraft(cfg, expected))
     finally:
-        eng.verify_lens = orig
+        spec_mod.verify_lens = orig
+    assert tstats["spec_drafted"] < sstats["spec_drafted"], (
+        f"the trim never took effect: {tstats['spec_drafted']} drafted, same as untrimmed"
+    )
     assert trimmed == base, f"trimmed chain changed the output: {trimmed} != {base}"
 
 

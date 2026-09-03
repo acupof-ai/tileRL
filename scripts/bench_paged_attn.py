@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 
 import torch
-
 from tilerl_kernels import kernels, kernels_mma
 
 #: 27B full-attn layer geometry (config.qwen36_27b).

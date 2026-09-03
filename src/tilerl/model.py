@@ -11,23 +11,21 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
-
-from . import autograd
-from . import precision
-from .config import ModelConfig, tiny
 from tilerl_kernels.reference import (
-    untwiddle_fp4,
     dequant_awq,
     dequant_fp8,
     dequant_nvfp4,
     pack_fp4,
     renorm_fp4_scale,
     unpack_fp4,
+    untwiddle_fp4,
 )
+
+from . import autograd, precision
+from .config import ModelConfig
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no tilelang import at runtime
     import numpy as np
-
     from tilerl_kernels.backend import Backend
 
 
@@ -157,14 +155,14 @@ class Model:
     def _has(self, key: str) -> bool:
         return key in self.params or _quantized(self.params, key)
 
-    def _linear(self, backend: "Backend", x: torch.Tensor, key: str, residual=None) -> torch.Tensor:
+    def _linear(self, backend: Backend, x: torch.Tensor, key: str, residual=None) -> torch.Tensor:
         y = self._base_linear(backend, x, key, residual)
         a = self.params.get(key + ".lora_a")
         if a is None:
             return y
         return backend.add(y, backend.linear(backend.linear(x, a), self.params[key + ".lora_b"]))
 
-    def _base_linear(self, backend: "Backend", x: torch.Tensor, key: str, residual=None):
+    def _base_linear(self, backend: Backend, x: torch.Tensor, key: str, residual=None):
         # ``master`` is recording-only: the STE grad lands on it.
         kw = {} if residual is None else {"residual": residual}
         wq, osc = self.params.get(key + ".wq"), self.params.get(key + ".oscale")
@@ -177,7 +175,7 @@ class Model:
             return backend.linear_fp8(x, w8, wscale, master=self.params.get(key), oscale=osc, **kw)
         return backend.linear(x, self.params[key], **kw)
 
-    def _add_via(self, backend: "Backend", kv: Any, x: torch.Tensor, h: torch.Tensor, key: str):
+    def _add_via(self, backend: Backend, kv: Any, x: torch.Tensor, h: torch.Tensor, key: str):
         """x + linear(h): in the GEMV epilogue when serving, backend.add otherwise."""
         if getattr(backend, "tp_world", 1) > 1:
             # Row-parallel: the residual add has to follow the all-reduce.
@@ -192,7 +190,7 @@ class Model:
         x: torch.Tensor,
         positions: torch.Tensor,
         kv: Any,
-        backend: "Backend",
+        backend: Backend,
     ) -> torch.Tensor:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
@@ -263,7 +261,7 @@ class Model:
         linear_idx: int,
         x: torch.Tensor,
         kv: Any,
-        backend: "Backend",
+        backend: Backend,
     ) -> torch.Tensor:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
@@ -326,12 +324,12 @@ class Model:
             backend.flip_window_parity(kv.state_pool, kv.state_slot)
         return self._add_via(backend, kv, x, out, f"{p}.out_proj")
 
-    def _mlp(self, layer_idx: int, x: torch.Tensor, kv: Any, backend: "Backend") -> torch.Tensor:
+    def _mlp(self, layer_idx: int, x: torch.Tensor, kv: Any, backend: Backend) -> torch.Tensor:
         # The layer's largest pure block: attention and GDN advance the pools, so
         # replaying either would recompute against state its own forward moved.
         return autograd.checkpoint(self._mlp_body, layer_idx, x, kv, backend)
 
-    def _mlp_body(self, layer_idx: int, x: torch.Tensor, kv: Any, backend: "Backend"):
+    def _mlp_body(self, layer_idx: int, x: torch.Tensor, kv: Any, backend: Backend):
         cfg = self.cfg
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.post_attn_norm"], cfg.rms_eps)
@@ -348,12 +346,12 @@ class Model:
 
     def forward(
         self,
-        input_ids: "np.ndarray | torch.Tensor",
-        positions: "np.ndarray | torch.Tensor",
+        input_ids: np.ndarray | torch.Tensor,
+        positions: np.ndarray | torch.Tensor,
         kv: Any,
-        backend: "Backend",
+        backend: Backend,
         hidden_out: list | None = None,
-        last_only: "bool | list[int]" = False,
+        last_only: bool | list[int] = False,
         aux_layers: tuple[int, ...] = (),
     ) -> torch.Tensor:
         """``input_ids`` [B,T], ``positions`` [T] or [B,T], ``kv`` a BatchKv with
@@ -397,7 +395,7 @@ class Model:
 
 
 def add_lora(
-    model: "Model", rank: int = 16, alpha: float = 32.0, seed: int = 0
+    model: Model, rank: int = 16, alpha: float = 32.0, seed: int = 0
 ) -> dict[str, torch.Tensor]:
     """Attach LoRA adapters to every linear (quantized or dense bf16) and return
     them. B starts at zero, so step 0 is bit-identical to the base; alpha/rank

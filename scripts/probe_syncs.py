@@ -71,9 +71,10 @@ def main() -> None:
     ap.add_argument("--chunk", type=int, default=32, help="prefill: tokens per tick")
     args = ap.parse_args()
 
+    from tilerl_kernels.backend import Backend, resolve_target
+
     from tilerl.config import tiny
     from tilerl.model import build_random
-    from tilerl_kernels.backend import Backend, resolve_target
 
     cfg = tiny()
     backend = Backend(resolve_target())

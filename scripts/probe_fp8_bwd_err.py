@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import torch
-
 from tilerl_kernels import reference as ref
 from tilerl_kernels.backend import get_backend
 

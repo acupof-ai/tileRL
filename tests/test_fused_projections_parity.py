@@ -11,10 +11,10 @@ from dataclasses import replace
 
 import numpy as np
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import tiny
 from tilerl.model import Model, _fuse_projections, build_random
-from tilerl_kernels.backend import get_backend
 from tilerl.train import _training_kv
 
 

@@ -45,7 +45,7 @@ def main() -> None:
     n = t // args.chunk
     print(f"fla inter-chunk state scan, T={t} ({n} chunks), {h} heads, DK=DV={dk}")
     print(f"  one layer: {us:.1f} us     48 layers: {us * 48 / 1e3:.2f} ms")
-    print(f"  the 2026-08-25 port's kernel B: 10760 us for one layer")
+    print("  the 2026-08-25 port's kernel B: 10760 us for one layer")
     print(f"  ratio: {10760 / us:.0f}x")
 
 
