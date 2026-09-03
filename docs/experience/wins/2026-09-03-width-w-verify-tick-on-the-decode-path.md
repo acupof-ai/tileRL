@@ -1,6 +1,9 @@
 # The width-W verify tick stays on the decode path — cuda(H20), 2026-09-03
 
-> Status: Shipped — measured twice, H20 GPU 7 and GPU 5, 2026-09-03.
+> Status: Shipped — measured twice, H20 GPU 7 and GPU 5, 2026-09-03. The tick is NaN-free on
+> `main` once the split-KV guard lands, but at W=8 it still does not reproduce the unspeculated
+> token stream on the 27B (4 of 8 GSM8K completions differ). See
+> [errors/2026-09-03-w8-verify-tick-is-not-lossless-on-the-27b.md](../errors/2026-09-03-w8-verify-tick-is-not-lossless-on-the-27b.md).
 
 ## Context
 
