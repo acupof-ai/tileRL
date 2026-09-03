@@ -169,14 +169,22 @@ def main() -> None:
 
     # block_N and KVSPLIT are the two shape knobs already in the factory, so the
     # cheapest next question is whether either is simply mistuned for S>1.
-    print("\n# block_N x KVSPLIT at 4096 ctx, S=32 (us) — factory knobs, no new kernel")
-    a = inputs(4096, 32, dev)
-    for ks in (16, 32, 64):
-        row = []
-        for bn in (16, 32, 64):
-            k = kernels.make_paged_attention_split(be.target, KVSPLIT=ks, block_N=bn)
-            row.append(f"{ms(lambda k=k: k(*a, scale, BLK, _THREADS), iters=5) * 1000:>9.1f}")
-        print(f"  KVSPLIT={ks:>3}: " + " ".join(row) + "   (block_N 16/32/64)")
+    # S=32 alone is prefill width: it is what the shipped 16->32 flip was NOT
+    # judged on, and it is not what a spec tick runs (S=1 decode, S=1+depth
+    # verify). Sweep all three, and print the partial bytes -- KVSPLIT is a
+    # footprint knob too, and PO is what OOMs B=8 at ctx=512.
+    print("\n# block_N x KVSPLIT at 4096 ctx (us) — factory knobs, no new kernel")
+    for S in (1, 4, 32):
+        print(f"  S={S} ({'decode' if S == 1 else 'verify d3' if S == 4 else 'prefill'})")
+        a = inputs(4096, S, dev)
+        for ks in (16, 32, 64):
+            row = []
+            for bn in (16, 32, 64):
+                k = kernels.make_paged_attention_split(be.target, KVSPLIT=ks, block_N=bn)
+                row.append(f"{ms(lambda k=k: k(*a, scale, BLK, _THREADS), iters=5) * 1000:>9.1f}")
+            po = 8 * 512 * H * ks * D * 2 / 1024**3  # the B=8 ctx=512 peak, f16
+            print(f"    KVSPLIT={ks:>3}: " + " ".join(row)
+                  + f"   (block_N 16/32/64)  PO@8x512={po:.3f} GiB")
 
 
 if __name__ == "__main__":
