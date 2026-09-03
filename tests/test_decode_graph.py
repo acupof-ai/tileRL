@@ -193,3 +193,21 @@ def test_graph_keys_covers_what_a_decode_tick_keys_on():
                 f"{(e._graph_bucket(rows), 1)}, which precapture would not build"
             )
         assert e._graph_bucket(max_batch) <= max_batch, "a bucket may not exceed max_batch"
+
+    # With a draft, every width a trimmed chain can present. Untested until it broke:
+    # the widths branch read a `_spec_depth` attribute the Engine never sets, so
+    # `precapture` died with AttributeError on the FIRST drafted run — every case
+    # above builds a dense engine and takes the `(1,)` path.
+    trunk = build_random(cfg, seed=21)
+    e = build_engine(cfg, trunk, backend, num_blocks=16, num_slots=3, max_batch=2,
+                     max_total_tokens=256, draft=_draft(cfg, trunk), spec_depth=3)
+    keys = e.graph_keys()
+    for w in range(1, e._width + 1):
+        assert (e._graph_bucket(1), w) in keys, (
+            f"a width-{w} verify tick keys on {(e._graph_bucket(1), w)}, which "
+            f"precapture would not build; widths present: {sorted({k[1] for k in keys})}"
+        )
+    assert max(k[1] for k in keys) == e._width, (
+        f"graph_keys goes past the drafter's settled width {e._width}: "
+        f"{sorted({k[1] for k in keys})} — those captures are ~14 s each and dead"
+    )

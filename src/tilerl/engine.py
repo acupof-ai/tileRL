@@ -853,7 +853,11 @@ class Engine:
 
     def graph_keys(self) -> set[tuple[int, int]]:
         """Every (bucket, width) a decode tick can key on under these limits."""
-        widths = range(1, 2 + self._spec_depth) if self._draft is not None else (1,)
+        # self._width, not spec_depth+1: it is the width the drafter SETTLED on
+        # (set_depth may clamp) and the one every tick keys on, and it is already
+        # range-checked in __init__. A second copy of the arithmetic here is how
+        # precapture came to reference a _spec_depth attribute that does not exist.
+        widths = range(1, 1 + self._width) if self._draft is not None else (1,)
         return {(self._graph_bucket(rows), w)
                 for rows in range(1, self.limits.max_batch + 1) for w in widths}
 

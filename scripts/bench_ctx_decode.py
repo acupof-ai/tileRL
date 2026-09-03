@@ -33,7 +33,10 @@ from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine
 from tilerl.kv_cache import BLOCK_TOKENS
 from tilerl.spec import load_draft
 
-CTXS = [32, 512, 1024, 2048, 4096]
+#: Every point costs THREE full prefills (two warmups + the measure) at ~31 ms per
+#: prompt token, so 32768 is ~51 min on its own — pair --min-ctx/--max-ctx to walk
+#: the long end one point per run rather than sweeping into a multi-hour job.
+CTXS = [32, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
 
 
 def _sync() -> None:
@@ -239,8 +242,10 @@ def main() -> None:
     print(f"pool: {blocks} blocks ({blocks * 2.125:.0f} MiB) sized for ctx={max(ctxs)}, "
           f"sweeping {ctxs}")
     e = build_engine(cfg, model, backend, num_blocks=blocks, num_slots=slots, max_batch=b,
-                     max_total_tokens=8192, draft=draft,
-                     spec_depth=args.depth if draft else 1)
+                     # Follows the sweep, not a constant: a hardcoded 8192 rejected the
+                     # ctx=8192 row itself, since a request is ctx + tokens + drafts.
+                     max_total_tokens=max(ctxs) + args.tokens + 2 * (1 + args.depth),
+                     draft=draft, spec_depth=args.depth if draft else 1)
     # Capture every (bucket, width) up front. The trim varies W per tick, so waiting for
     # warmup to happen to hit each one is a lottery: at B=1 there are 4 graphs and two
     # warmups absorbed them, but B=4 needs 12 (~14 s each) and the first row came back
