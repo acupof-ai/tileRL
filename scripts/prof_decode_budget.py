@@ -103,6 +103,14 @@ def main() -> None:
     ap.add_argument("--tokens", type=int, default=16)
     ap.add_argument("--prompt", choices=("random", "wikitext"), default="random",
                     help="uniform ids over the vocab, or wikitext-103 test text")
+    ap.add_argument("--depths", default="",
+                    help="comma-separated spec depths, profiled in ONE process at the "
+                         "FIRST --ctx. This is the rung-step instrument: a verify at "
+                         "rung W streams the same weights as W=1, only X grows, so a "
+                         "bandwidth-bound GEMV should be nearly flat in M. Measured "
+                         "end-to-end it is not (5.68/8.06/8.71 ms per extra row across "
+                         "rungs 1->2->4->8), and per-kernel is where that gets "
+                         "attributed. Needs --draft")
     args = ap.parse_args()
     ctxs = [int(c) for c in args.ctx.split(",")]
     os.environ.setdefault("TILERL_TARGET", "cuda")
@@ -170,17 +178,8 @@ def main() -> None:
         return (s1["tokens_generated"] - s0["tokens_generated"], fwd,
                 1 + (s1["spec_drafted"] - s0["spec_drafted"]) / max(fwd, 1))
 
-    for ctx in ctxs:
-        for _ in range(2):  # warm: JIT, this width's graph capture, allocator
-            drain(to_decode(ctx, args.tokens))
-    torch.cuda.synchronize()
-
-    # Profile the DECODE ticks only. A 4096 prompt is 8 chunked-prefill ticks
-    # and they dwarf a decode tick, so profiling across them reported 8217
-    # ms/token and 2900 GEMV calls/token — the prefill's work over the decode's
-    # token count.
-    rows = {}
-    for ctx in ctxs:
+    def profile_one(ctx: int):
+        """One profiled decode window at `ctx`. Returns the row tuple."""
         rid = to_decode(ctx, args.tokens)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -198,7 +197,18 @@ def main() -> None:
             by_cls[classify(ev.key)] += us
             ms, cnt = by_kernel[ev.key]
             by_kernel[ev.key] = (ms + us, cnt + ev.count)
-        rows[ctx] = (by_cls, by_kernel, n, fwd, wall_ms, width)
+        return (by_cls, by_kernel, n, fwd, wall_ms, width)
+
+    for ctx in ctxs:
+        for _ in range(2):  # warm: JIT, this width's graph capture, allocator
+            drain(to_decode(ctx, args.tokens))
+    torch.cuda.synchronize()
+
+    # Profile the DECODE ticks only. A 4096 prompt is 8 chunked-prefill ticks
+    # and they dwarf a decode tick, so profiling across them reported 8217
+    # ms/token and 2900 GEMV calls/token — the prefill's work over the decode's
+    # token count.
+    rows = {ctx: profile_one(ctx) for ctx in ctxs}
 
     label = "spec d3" if draft else "dense"
     for ctx, (by_cls, by_kernel, n, fwd, wall_ms, width) in rows.items():
@@ -226,6 +236,13 @@ def main() -> None:
         for name, (us, cnt) in sorted(by_kernel.items(), key=lambda kv: -kv[1][0])[:20]:
             print(f"{name[-52:]:>52} {us/1000/max(fwd,1):>8.2f} {cnt/max(fwd,1):>10.1f}")
 
+        # No per-shape GEMV table here, and that is a measured dead end rather than an
+        # omission: `record_shapes=True` groups by the ATen input shapes of the op that
+        # launched the kernel, and a TileLang kernel arrives as a raw CUDA kernel name
+        # with no ATen op above it -- so all 330 launches came back under one empty
+        # shape row (measured, bud7). The rung sweep below is the working instrument
+        # for what M costs.
+
     # The whole point of >1 ctx in one process: which CLASS carries the step. A
     # class that is flat across contexts cannot be the cause however large it is.
     if len(rows) > 1:
@@ -242,6 +259,49 @@ def main() -> None:
             print(f"{c:>14} {a.get(c,0)/1000/max(fa,1):>8.2f} "
                   f"{b.get(c,0)/1000/max(fb,1):>8.2f} {d:>+8.2f} "
                   f"{100*d/grew if d > 0 and grew else 0:>6.1f}%")
+
+    # The rung step, by CLASS, at one context. A verify at rung W re-streams the
+    # same weights as W=1 and launches the same kernels the same number of times
+    # -- only M grows -- so whatever carries the 5.68/8.06/8.71 ms per extra row
+    # has to show up here as a class that grows while the launch count does not.
+    # This is the number the block-parallel reject rests on: rung 8's 80.31 ms
+    # against our whole k=3 tick's 62.74.
+    if args.depths:
+        if draft is None:
+            raise SystemExit("--depths needs --draft: without a draft every tick is rung 1")
+        depths = [int(d) for d in args.depths.split(",")]
+        ctx = ctxs[0]
+        drows = {}
+        for d in depths:
+            draft.set_depth(d)
+            e._width = draft.width
+            assert e._width == d + 1, f"engine kept width {e._width} for depth {d}"
+            drain(to_decode(ctx, args.tokens))  # warm THIS width's capture
+            torch.cuda.synchronize()
+            drows[d] = profile_one(ctx)
+        print(f"\n# the rung step at ctx={ctx}, per FORWARD. Same weights, same launch "
+              "count at every depth; only M moves.")
+        hdr = "".join(f"{f'd{d}':>9}" for d in depths)
+        print(f"{'class':>14}{hdr}")
+        classes = {c for d in depths for c in drows[d][0]}
+        for c in sorted(classes, key=lambda c: -drows[depths[0]][0].get(c, 0)):
+            cells = "".join(f"{drows[d][0].get(c, 0)/1000/max(drows[d][3],1):>9.2f}"
+                            for d in depths)
+            print(f"{c:>14}{cells}")
+        print(f"{'-- GPU total':>14}"
+              + "".join(f"{sum(drows[d][0].values())/1000/max(drows[d][3],1):>9.2f}"
+                        for d in depths))
+        print(f"{'-- rung':>14}"
+              + "".join(f"{next(w for w in LADDER_WIDTHS if w >= round(drows[d][5])):>9d}"
+                        for d in depths))
+        # The control: if the launch count moves, the depths are not running the same
+        # kernels and a per-class delta is not an M cost.
+        def gemv_calls(d):
+            by_k = drows[d][1]
+            n = sum(c for k, (_, c) in by_k.items() if classify(k) == "fp4 GEMV")
+            return n / max(drows[d][3], 1)
+
+        print(f"{'-- GEMV calls':>14}" + "".join(f"{gemv_calls(d):>9.1f}" for d in depths))
 
 
 if __name__ == "__main__":
