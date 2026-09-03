@@ -28,11 +28,25 @@ leaves their decode rates standing and their MMLU column empty. Our prefill
 number was read on an idle box; the same code reads 2694.2 with neighbours on
 the other cards.
 
-The card, not the field: a tick reads 22.8 GB and the H20's measured copy
-bandwidth is 3312 GB/s. We read those 22.8 GB in 11.0 ms — 2.1 TB/s, 64% of the
-achievable roof, against sglang-bf16's 70%. That 64% was read at 90.9 tok/s, in
-the head-to-head above and before the occupancy split took decode to 92.4. The
-remaining gap is kernel efficiency, not the memory system.
+**The roofline percentage is under revision and should not be quoted.** The
+22.8 GB/tick it rests on is recorded in
+`docs/experience/2026-08-28-vs-sglang-h20.md` with no derivation, and two
+independent attempts to rebuild it from the checkpoint land elsewhere. What a
+tick streams is 12.81 GB of fp4 nibbles plus its block scales; the checkpoint
+holds one fp8 scale per 16 elements (1.60 GB) but `model.py:141` widens them to
+f32 at load and `kernels_linear.py:546` is the kernel signature that requires
+it, which is 6.41 GB — so 19.22 GB, and 19.22 GB in 11.0 ms is 1.75 TB/s, 53%
+of the 3312 GB/s the card measures. The residual 3.6 GB is not accounted for.
+A DRAM-read counter on one steady-state tick settles it; until then the honest
+statement is that decode is bandwidth-bound, the achieved fraction is between
+53% and 63%, and the gap is kernel efficiency rather than the memory system.
+
+That scale widening is itself the largest lever on record: the f32 scales are
+33% of what a tick streams and four times what the checkpoint holds, and
+`renorm_fp4_scale` divides by a per-row power of two, which moves the exponent
+and leaves the mantissa alone — so storing them back as e4m3 is lossless if no
+row underflows. 19.22 → 14.41 GB would be 1.33× fewer bytes on a
+bandwidth-bound kernel.
 
 RL on the 27B has not yet moved a downstream metric; that run is the first
 roadmap gate. Every number above sits in a dated entry under
