@@ -1,10 +1,13 @@
 # The ncols gate left spec decode on, and I said it didn't — V100 sm70, 2026-09-03
 
-> Status: **the code is right, the prose was wrong.** `ncols=2` *is* active on the
-> speculative verify path, which I stated three times it was not. Measured there it is
-> a **wash (0.988-1.000×, worst 1.2% against a 2% threshold)**, so the gate stays as
-> shipped and only the documentation changed — plus the test loop that could not have
-> caught this.
+> Status: **the code is right, the prose was wrong — and the measurement below is
+> WITHDRAWN.** `ncols=2` *is* active on the speculative verify path in serving, which I
+> stated three times it was not; that correction stands. But the "wash (0.988-1.000×)"
+> reading did not measure it: the A/B ran `bench_ctx_decode.py`, which submits **one**
+> request, so the tick was 4 rows on the 4 rung and `ncols=2` was **off in both arms** —
+> [`2026-09-03-the-spec-ncols-ab-ran-at-b1.md`](2026-09-03-the-spec-ncols-ab-ran-at-b1.md).
+> The suspiciously flat five-context agreement was the tell. Re-measured at B=4 there;
+> the gate and the test-loop fix below are unaffected.
 
 ## The false claim
 
@@ -51,6 +54,12 @@ argument cuts both ways at M=16 and I could not predict the sign:
 before the run: within 2% → keep the rung gate; a >2% loss → the gate must key on the
 real row count M rather than the compiled rung Mk.
 
+**WITHDRAWN — this table is one kernel measured twice.** The harness submitted a single
+request, so the tick ran 4 rows on the 4 rung and `Mk=4 < _NCOLS_MIN_M`: neither arm
+compiled the 2-column kernel. Kept here as the evidence, because the *pattern* is the
+lesson — five contexts agreeing to 0.5-1.2% is tighter than two different kernels track,
+and I read it as a passed threshold instead of as a null result.
+
 | ctx | nc1 | nc2 | nc2/nc1 |
 |---:|---:|---:|---:|
 | 32 | 38.0 | 37.8 | 0.995× |
@@ -59,22 +68,24 @@ real row count M rather than the compiled rung Mk.
 | 2048 | 44.6 | 44.4 | 0.996× |
 | 4096 | 41.3 | 41.2 | 0.998× |
 
-**Worst 1.2%, inside the threshold.** No code change; `_NCOLS_MIN_M` stays a rung
-threshold. (nc1 reads 51.7 at 1024 against the recorded 50.8 baseline — 1.8% above, the
-right direction and size for this session's other wins, so the harness is sound.)
+The nc1 column is still a valid **depth-3 at B=1** baseline (51.7 at 1024 against a
+recorded 50.8, 1.8% above and in the right direction), and it is the column reused for the
+depth comparisons in
+[`wins/2026-09-03-verify-tick-cost-is-a-line-in-width.md`](../wins/2026-09-03-verify-tick-cost-is-a-line-in-width.md).
+Only the ratio is void.
 
 ## What the three paths together say
 
 | path | rows | rung | ncols=2 |
 |---|---:|---:|---|
 | prefill | 512 | 32 | **1.52-1.60× — win** |
-| spec verify | 16 | 32 | 0.995× — wash |
+| spec verify | 16 | 32 | **unmeasured** (the run above was 4 rows) |
 | dense decode | 1 | 1 | 0.951× — loss, gated off |
 
-The gradient is monotone in rows and matches the mechanism: arithmetic per byte rises
-with M, so the same kernel goes from costing 4.9% to paying 1.6×. M=16 is the crossover
-and lands on neither side — which is why measuring it was worth a tick and predicting it
-would not have been.
+The two measured ends are monotone in rows and match the mechanism: arithmetic per byte
+rises with M, so the same kernel goes from costing 4.9% at M=1 to paying 1.6× at M=512.
+M=16 sits between them and is exactly the point a prediction is worth least — which is why
+it was worth a tick, and why running that tick at the wrong batch size wasted it.
 
 ## Fix
 
@@ -100,10 +111,12 @@ factual clause in an entry should be traceable to something executed.
 
 | date | commit | machine | target | model | measurement | value |
 |---|---|---|---|---|---|---|
-| 2026-09-03 | (this) | V100 32GB | cuda sm70 | qwen38-27b | spec d3 @4096, ncols on vs off | 41.2 vs 41.3 (**0.998×**) |
-| 2026-09-03 | (this) | V100 32GB | cuda sm70 | qwen38-27b | spec d3, worst point of five | **0.988× @1024 — wash** |
-| 2026-09-03 | (this) | V100 32GB | cuda sm70 | qwen38-27b | spec d3 @1024 control vs record | 51.7 vs 50.8 recorded |
-| 2026-09-03 | (this) | V100 32GB | cuda sm70 | qwen38-27b | verify rows at default depth 3 | B·W=16 → **rung 32, ncols on** |
+| 2026-09-03 | (this) | V100 32GB | cuda sm70 | qwen38-27b | spec d3 @4096, ncols on vs off | 41.2 vs 41.3 (**0.998× — void, same kernel**) |
+| 2026-09-03 | (this) | V100 32GB | cuda sm70 | qwen38-27b | spec d3, five-context spread | **0.988-1.000× — the tell, not a result** |
+| 2026-09-03 | (this) | V100 32GB | cuda sm70 | qwen38-27b | spec d3 @1024 control vs record | 51.7 vs 50.8 recorded (valid, B=1) |
+| 2026-09-03 | (this) | V100 32GB | cuda sm70 | qwen38-27b | verify rows in SERVING at depth 3 | B·W=16 → **rung 32, ncols on** |
+| 2026-09-03 | (this) | V100 32GB | cuda sm70 | qwen38-27b | verify rows in THIS BENCH | **B=1 → 4 rows → rung 4, ncols off** |
 
-Reproduce: `bench_ctx_decode.py --draft $CKPT/model-00018-of-00018.safetensors --depth 3`
-under `TILERL_NCOLS=2` and `=1`.
+Reproduce the corrected measurement with `--batch 4`; without it the bench runs one
+request and never reaches the rung the gate keys on
+([`2026-09-03-the-spec-ncols-ab-ran-at-b1.md`](2026-09-03-the-spec-ncols-ab-ran-at-b1.md)).

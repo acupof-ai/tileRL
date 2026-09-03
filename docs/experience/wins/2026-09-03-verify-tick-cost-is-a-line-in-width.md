@@ -79,14 +79,22 @@ does.
 
 ## What the line means
 
-The intercept and slope are both physical:
+Both terms are physical, and the axis is worth stating precisely because I later misread
+it: `bench_ctx_decode.py` submits **one** request, so every point here is a **B=1** tick
+and `W` is a chain width that happens to equal the launched row count. At B=4 those come
+apart (W=4 and W=8 both launch 32 rows), so this line does not price the ladder's rungs —
+see the open item.
 
 - **0.67 dense ticks of fixed cost per tick** — the parts a tick pays once regardless of
   width: the draft forward, the GDN state gather/scatter (6.40 of 8.80 torch ms, task
   #31), the launch chain of 144 kernels.
-- **0.53 dense ticks per verify row** — the marginal row. Just over half a dense tick,
-  because rows share the weight stream: the GEMV re-reads 13 GB of weights once for the
-  whole tick, and a second row adds arithmetic, not bytes.
+- **0.53 dense ticks per verify row** — the marginal row, at B=1. Just over half a dense
+  tick, which is the shape you get when rows share the weight stream: the GEMV re-reads
+  13 GB of weights once for the whole tick, so a second row adds arithmetic rather than
+  bytes. **Consistent with the slope, not established by it** — the sharing story predicts
+  a slope below 1, and it is 0.53, but nothing here rules out another term with the same
+  behaviour. Whatever the mechanism, it is not the extra draft forwards: those are
+  0.047 dense ticks each (1.12 ms against a 23.7 ms tick), 10× too small to be the slope.
 
 The slope being **below 1.0** is the entire reason speculation can pay at all. If each
 verify row cost a full dense tick, break-even would be `W` tokens per forward — which no
@@ -191,23 +199,28 @@ a complete one only when it is complete.
 No behavior changed. `engine.py:314` had a stale comment saying the ladder was 1/2/4/8
 after the 32 rung was added; `spec.py`'s H20 constants are annotated with the shape
 mismatch that makes repricing them the wrong fix, and its `__main__` asserts that W=3 and
-W=4 land on the same rung at B=4 — the fact that kills the reprice, so it fails if
+W=4 share a rung at both B=1 and B=4 — the fact that kills the reprice, so it fails if
 `LADDER_WIDTHS` changes without revisiting the trim. 187 tests pass, ruff clean.
 
 ## Open
 
-1. **Depth 1 vs 3 is context-dependent** with a crossover between 32 and 512. A
-   context-aware default is a one-line policy, but only short-prompt requests are in the
-   loss region, so the serving mix decides whether it is worth the branch.
-2. **A rung-aware trim** — `verify_lens` prices a line in total rows where sm70 pays a
-   staircase in the widest chain, and repricing its constants is rejected
+1. **Should the depth default be context-aware?** Picking the better of depth 1 and 3 per
+   context is worth **1.144× at ctx=32** and 1.018× at 2048, nothing elsewhere — one
+   threshold, not a table. No new machinery is needed: `graph_keys` already precaptures
+   every width in `range(1, 2+spec_depth)`, and the trim already varies W per tick. But the
+   better policy variable is probably **acceptance, not context** — ctx=32's loss traces to
+   tok/fwd 2.44 against a 2.78 break-even, i.e. p≈0.62, and the trim observes p every tick
+   while context is only a proxy for it.
+2. **A rung-aware trim, and first the slope at B=4.** `verify_lens` prices a line in total
+   rows where sm70 pays a staircase in the widest chain, and repricing its constants is
+   rejected
    ([`errors/2026-09-03-repricing-verify-lens-was-the-wrong-fix.md`](../errors/2026-09-03-repricing-verify-lens-was-the-wrong-fix.md)).
-   Enumerating `LADDER_WIDTHS` against this line is the real fix, and it needs the
-   acceptance distribution first: it only pays if the trim is reached near a rung boundary
-   often enough to matter.
+   This line cannot substitute for it: it is fitted at **B=1**, where W and launched rows
+   coincide, and a serving trim runs at B=4 where they do not. Four concurrent requests at
+   widths 2/3/4 is a new script, not a flag — until it exists, no trim change ships.
 3. **Why W=8's cost is noisier (13% spread) than W=2's (0.4%) and W=4's (1.8%)** with no
    context trend behind it. A fourth width would say whether variance grows with W or is
-   specific to the 32-row rung, where `ncols=2` also turns on.
+   specific to the 8-row rung.
 
 ## Results table
 

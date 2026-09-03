@@ -34,22 +34,32 @@ from tilerl_kernels.backend import get_backend
 CTXS = [32, 512, 1024, 2048, 4096]
 
 
-def measure(e, ctx: int, tokens: int) -> tuple[float, float, int]:
-    """tok/s and tok/forward over DECODE ticks only."""
-    rid = e.submit(list(range(10, 10 + ctx)),
-                   SamplingParams(temperature=0.0, max_new_tokens=tokens, seed=0))
-    req = e._running[-1] if e._running else None
-    while req is None or req.phase != _PHASE_DECODE:  # burn the prefill chunks
+def measure(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, int]:
+    """tok/s and tok/forward over DECODE ticks only.
+
+    ``batch`` submits that many concurrent requests, which is the only way a tick
+    reaches B*W rows: the engine's max_batch is an upper bound, so one request
+    speculates at W rows and never touches the rungs serving actually compiles
+    (B=4 W=4 is 16 rows -> rung 32, where ncols=2 turns on; B=1 W=4 is 4 rows and
+    does not). A B=1 run silently measured the same kernel in both arms of the
+    spec-ncols A/B -- errors/2026-09-03-the-spec-ncols-ab-ran-at-b1.md.
+    """
+    rids = [e.submit(list(range(10 + i * ctx, 10 + (i + 1) * ctx)),
+                     SamplingParams(temperature=0.0, max_new_tokens=tokens, seed=0))
+            for i in range(batch)]
+    while True:  # burn the prefill chunks for every request
+        reqs = [next((r for r in e._running if r.req_id == rid), None) for rid in rids]
+        if all(r is not None and r.phase == _PHASE_DECODE for r in reqs):
+            break
+        if any(r is None for r in reqs) and e.poll():
+            raise SystemExit(f"ctx={ctx}: a request finished during prefill")
         e.step()
-        req = next((r for r in e._running if r.req_id == rid), None)
-        if req is None:
-            raise SystemExit(f"ctx={ctx}: request finished during prefill")
     torch.cuda.synchronize()
     s0, t0 = e.stats(), time.perf_counter()
-    out = None
-    while out is None:
+    done: dict = {}
+    while len(done) < batch:
         e.step()
-        out = e.poll().get(rid)
+        done.update({k: v for k, v in e.poll().items() if k in rids})
     torch.cuda.synchronize()
     wall, s1 = time.perf_counter() - t0, e.stats()
     n = s1["tokens_generated"] - s0["tokens_generated"]
@@ -60,7 +70,7 @@ def measure(e, ctx: int, tokens: int) -> tuple[float, float, int]:
     return n / wall, n / max(fwd, 1), n
 
 
-def timed(e, ctx: int, tokens: int) -> tuple[float, float, str]:
+def timed(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, str]:
     """Warm this context, then measure it, and flag an unwarmed reading.
 
     A speculative run captures a CUDA graph per (batch, chain width), and a
@@ -74,9 +84,9 @@ def timed(e, ctx: int, tokens: int) -> tuple[float, float, str]:
     Flags rather than raises: a SystemExit here leaves the engine holding the
     whole card, and the orphan is invisible until the next run OOMs.
     """
-    measure(e, ctx, tokens)
-    warm, _, _ = measure(e, ctx, tokens)
-    tps, per_fwd, _ = measure(e, ctx, tokens)
+    measure(e, ctx, tokens, batch)
+    warm, _, _ = measure(e, ctx, tokens, batch)
+    tps, per_fwd, _ = measure(e, ctx, tokens, batch)
     return tps, per_fwd, " UNWARMED" if tps > 2 * warm else ""
 
 
@@ -86,6 +96,9 @@ def main() -> None:
     ap.add_argument("--draft")
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--tokens", type=int, default=128)
+    ap.add_argument("--batch", type=int, default=1,
+                    help="concurrent requests per tick; the rung a verify tick compiles "
+                         "keys on B*W, so B=1 never reaches the 32 rung serving uses")
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
     # cli binds _QWEN38_SOURCE from the env at import, which already happened.
@@ -94,15 +107,17 @@ def main() -> None:
     backend = get_backend()
     cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft) if args.draft else None
-    e = build_engine(cfg, model, backend, num_blocks=1024, num_slots=4, max_batch=4,
+    e = build_engine(cfg, model, backend, num_blocks=1024, num_slots=max(4, args.batch),
+                     max_batch=max(4, args.batch),
                      max_total_tokens=8192, draft=draft,
                      spec_depth=args.depth if draft else 1)
     label = f"spec d{args.depth}" if draft else "dense"
-    print(f"\n{label}: {'ctx':>6} {'tok/s':>8} {'ms/tok':>8} {'tok/fwd':>8}")
+    rows = args.batch * (1 + args.depth if draft else 1)
+    print(f"\n{label} B={args.batch} ({rows} rows/tick): "
+          f"{'ctx':>6} {'tok/s':>8} {'ms/tok':>8} {'tok/fwd':>8}")
     for ctx in CTXS:
-        tps, per_fwd, flag = timed(e, ctx, args.tokens)
-        print(f"{'':>{len(label) + 1}} {ctx:>6} {tps:>8.1f} {1000 / tps:>8.1f} "
-              f"{per_fwd:>8.2f}{flag}")
+        tps, per_fwd, flag = timed(e, ctx, args.tokens, args.batch)
+        print(f"{ctx:>6} {tps:>8.1f} {1000 / tps:>8.1f} {per_fwd:>8.2f}{flag}")
 
 
 if __name__ == "__main__":

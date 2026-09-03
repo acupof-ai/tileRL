@@ -23,13 +23,15 @@ import torch
 #: wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md).
 #: H20 constants, and repricing them for sm70 is NOT the fix -- the cost's SHAPE is
 #: wrong here, not its scale. engine.py pads every chain to max(len) and the ladder
-#: rounds B*W up, so at B=4 a trim from W=4 to W=3 launches the same 32 rows and
-#: saves nothing; only W<=2 is a cheaper rung. The measured price would cut W=4 at
-#: acceptance p~=0.92, just below the recorded 84.4%, exactly where the end-to-end
-#: numbers say W=4 earns 1.157-1.228x
+#: rounds B*W up, so a trim between two widths sharing a rung saves nothing (W=3 and
+#: W=4 collide at B=1 and at B=4 alike); only W<=2 is a cheaper rung. The measured
+#: price would cut W=4 at acceptance p~=0.92, just below the recorded 84.4%, exactly
+#: where the end-to-end numbers say W=4 earns 1.157-1.228x
 #: (errors/2026-09-03-repricing-verify-lens-was-the-wrong-fix.md).
-#: ponytail: H20 line on a staircase cost; replace with LADDER_WIDTHS priced by
-#: 0.670 + 0.5265*W when the trim is made rung-aware, not before.
+#: ponytail: H20 line on a staircase cost. The sm70 line 0.670 + 0.5265*W is fitted
+#: at B=1 (bench_ctx_decode.py submits one request), so its W is a chain width and
+#: not a launched-row count -- re-measure the slope at B=4 before pricing a trim with
+#: it, or the rung and the line are on different axes.
 BIAS_MS = 211.0
 ROW_MS = 0.53
 
@@ -85,13 +87,14 @@ if __name__ == "__main__":  # runnable check
     lens = verify_lens([[0.99, 0.9, 0.2], [0.3, 0.05, 0.01]], bias_ms=1.0, row_ms=0.1)
     assert lens[0] >= lens[1], lens
 
-    # A trim only pays on sm70 if it changes the RUNG, not the width: engine.py pads
-    # to max(len) and B*W rounds up, so at B=4 both W=3 and W=4 launch 32 rows. This
-    # is what makes repricing the constants the wrong fix -- it moves keep by one and
-    # buys nothing. Fails if LADDER_WIDTHS changes without revisiting the trim.
-    rung = {w: next(x for x in LADDER_WIDTHS if x >= 4 * w) for w in (1, 2, 3, 4)}
-    assert rung[3] == rung[4] == 32, f"W=3 and W=4 must cost the same at B=4: {rung}"
-    assert rung[2] == 8 and rung[1] == 4, f"only W<=2 is a cheaper rung: {rung}"
+    # A trim only pays on sm70 if it changes the RUNG, not the width: engine.py pads to
+    # max(len) and B*W rounds up, so a trim between two widths sharing a rung buys
+    # nothing. True at B=1 (W=3 and W=4 both launch 4 rows) and at B=4 (both 32), which
+    # is what makes repricing the constants the wrong fix. Fails if LADDER_WIDTHS changes.
+    for B, collide, cheap in ((1, 4, 2), (4, 32, 8)):
+        rung = {w: next(x for x in LADDER_WIDTHS if x >= B * w) for w in (1, 2, 3, 4)}
+        assert rung[3] == rung[4] == collide, f"B={B}: W=3 and W=4 must share a rung: {rung}"
+        assert rung[2] == cheap, f"B={B}: W=2 must be a cheaper rung: {rung}"
     print("spec: verify_lens OK", lens)
 
 

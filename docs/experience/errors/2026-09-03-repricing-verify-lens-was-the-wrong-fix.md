@@ -35,14 +35,26 @@ if chains is not None and max(map(len, chains)) == 1:
     chains = None  # the policy kept nothing: a plain decode tick
 ```
 
-Then `B·W` rows go through the sm70 ladder, which rounds **up**:
+Then `B·W` rows go through the sm70 ladder, which rounds **up**. At the shipped
+`max_batch=4`:
 
-| W | B·W rows at B=4 | rows launched | cost (dense ticks) |
-|---:|---:|---:|---:|
-| 1 | 4 | 4 | 1.20 (+ draft forward skipped) |
-| 2 | 8 | 8 | 1.72 |
-| **3** | **12** | **32** | **2.78 — same as W=4** |
-| 4 | 16 | 32 | 2.78 |
+| W | B·W rows | rows launched | trim within the rung? |
+|---:|---:|---:|---|
+| 1 | 4 | 4 | — (and `max(len)==1` drops to a plain decode tick) |
+| 2 | 8 | 8 | cheaper rung |
+| **3** | **12** | **32** | **same rung as W=4 — free of charge** |
+| 4 | 16 | 32 | baseline |
+
+**The cost line does not price this table.** `0.670 + 0.5265·W` was fitted by
+`bench_ctx_decode.py`, which submits **one** request, so its ticks ran at **B=1** where
+rows equal W exactly and no rounding happens (W=2 → 2 rows, W=4 → 4, W=8 → 8). Serving at
+B=4 launches 4/8/32/32 rows for the same widths, so the line's W is a **chain width at
+B=1**, not a launched-row count, and it cannot be evaluated on the 32-row rung. Anything
+that prices a serving trim needs the slope re-measured at the batch size that trim runs
+at — see the open item.
+
+The rung-collision conclusion survives regardless, because it holds at **both** batch
+sizes: at B=1, W=3 and W=4 both launch 4 rows; at B=4, both launch 32.
 
 So three defects, and the reprice addresses none of them:
 
@@ -103,6 +115,23 @@ question that mattered — *what changes at the shipped batch size* — has the 
 Third: **when a correct model gives a wrong answer through a wrong consumer, keep the
 model.** The cost line survived this rejection intact and picks the right depth 5/5; only
 the plan to inject it into `verify_lens` died.
+
+Fourth, found while trying to write the rung-aware trim this entry recommends: **the cost
+line's variable is a chain width at B=1, and I had been reading it as launched rows.** Both
+readings fit the four points, because at B=1 they are the same number. They come apart at
+B=4, where W=4 and W=8 launch the same 32 rows and therefore must cost the same — while the
+line says 2.78 and 4.75, a 1.71× gap. Attempting to price the rung with it produced a
+function that chose W=2 at every acceptance including 0.95, and the arithmetic that
+"confirmed" my first version had two errors cancelling. **A model fitted on one axis cannot
+be evaluated on a different axis just because both were called W.**
+
+## Open
+
+**The slope is unmeasured at the batch size serving runs.** `bench_ctx_decode.py` submits
+one request, so every number behind `0.670 + 0.5265·W` is a B=1 tick. A rung-aware trim
+needs the cost at B=4, where the ladder actually rounds — 4 concurrent requests, widths
+2/3/4, is a new script rather than a flag. Until that exists, no trim change should ship;
+the line remains valid for what it measured (choosing a depth at B=1, 5/5 correct).
 
 ## Gate
 

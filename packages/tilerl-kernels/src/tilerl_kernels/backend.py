@@ -83,7 +83,10 @@ _NCOLS = int(os.environ.get("TILERL_NCOLS", "2"))
 #: the grid only starves it: dense decode measured 39.1 -> 37.2 tok/s at 4096 with
 #: ncols on at M=1 (errors/2026-09-03-ncols2-cost-5-percent-of-decode.md). The sm70
 #: ladder is 1/2/4/8/32, so this covers prefill AND a verify tick of 9..32 rows --
-#: B*W=16 at the default depth 3 rounds UP to the 32 rung and keeps ncols=2.
+#: in SERVING, B*W=16 at max_batch=4 and depth 3 rounds UP to the 32 rung and keeps
+#: ncols=2. Note the row count is B*W, not W: a bench that submits one request runs
+#: 4 rows on the 4 rung with ncols OFF, which is how the first spec A/B compared this
+#: kernel with itself (errors/2026-09-03-the-spec-ncols-ab-ran-at-b1.md).
 _NCOLS_MIN_M = 32
 _MMA_RED = kernels_linear._RED_TILE
 

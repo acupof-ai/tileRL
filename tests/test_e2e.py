@@ -951,6 +951,45 @@ def test_speculation_reproduces_greedy_decode():
     assert trimmed == base, f"trimmed chain changed the output: {trimmed} != {base}"
 
 
+def test_a_verify_tick_submits_batch_times_width_rows():
+    """A bench that submits ONE request measures W rows, not B*W, and the sm70 rung
+    is chosen on rows: at B=1 depth 3 is 4 rows (rung 4, ncols=2 off) while serving's
+    B=4 is 16 (rung 32, on). A spec A/B run that way compared a kernel against itself
+    and read a flat 0.995-1.000x as "a wash" —
+    errors/2026-09-03-the-spec-ncols-ab-ran-at-b1.md. Assert the row count the engine
+    really submits, per concurrent request count, so the two cannot be confused again."""
+    import tilerl.engine as eng
+
+    cfg = tiny()
+    model = build_random(cfg, seed=7)
+    expected = dict(enumerate(range(3, 40)))
+    seen: list[int] = []
+    orig = eng.Engine._run_forward
+
+    def spy(self, decodes, prefills, chunks):
+        if decodes and not prefills:
+            seen.append(len(decodes) * (1 + len(decodes[0].drafts)))
+        return orig(self, decodes, prefills, chunks)
+
+    engine = build_engine(
+        cfg, model, get_backend(), num_blocks=32, num_slots=4, max_batch=4,
+        max_total_tokens=512, draft=_OracleDraft(cfg, expected), spec_depth=3,
+    )
+    eng.Engine._run_forward = spy
+    try:
+        rids = [engine.submit([3, 4, 5, 6], SamplingParams(temperature=0.0,
+                                                           max_new_tokens=12, seed=0))
+                for _ in range(4)]
+        _drain(engine, rids, max_new_tokens=12)
+    finally:
+        eng.Engine._run_forward = orig
+
+    assert seen, "no pure-decode tick ran"
+    # 4 concurrent rows at width <=4: a full tick is 16 rows, never the 4 a B=1 run sees.
+    assert max(seen) > 4, f"widest tick was {max(seen)} rows: this is a B=1 measurement"
+    assert max(seen) <= 16, f"tick exceeded max_batch*(1+depth): {max(seen)}"
+
+
 def test_generate_fans_a_corpus_across_workers(tmp_path):
     """Offline batch generation through the real subprocess path: every prompt back exactly once."""
     import json
