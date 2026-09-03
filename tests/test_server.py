@@ -149,20 +149,8 @@ def test_seedless_requests_decorrelate(client, model_id):
     assert len(seen) > 1, seen
 
 
-@pytest.mark.xfail(
-    reason="engine.step() holds _lock across the whole forward (engine.py:557), so no "
-           "reader can observe an in-flight request: measured take() blocking 325 ms of a "
-           "335 ms generation, 3 polls for 24 tokens. Incremental SSE needs the lock "
-           "narrowed, not an accessor.",
-    strict=True,
-)
 def test_the_stream_arrives_in_pieces_and_never_splits_a_character(client, model_id):
     """SSE must deliver text as it is generated, not one block at the end.
-
-    server.py:245 awaits completion and emits ONE content delta, so a viewer sees a
-    pause and then the whole answer -- the generation rate is invisible.
-    test_completion_stream below passes either way: it only asserts SOME content
-    arrived, which one final delta satisfies. This is the discriminating version.
 
     Two things must hold at once and they pull against each other. Deltas must
     arrive as separate chunks (streaming), AND concatenating them must equal the
@@ -170,10 +158,6 @@ def test_the_stream_arrives_in_pieces_and_never_splits_a_character(client, model
     token is not one character, so a per-token decode splits multi-byte UTF-8.
     _ByteTokenizer makes that reachable -- one id per BYTE, so any multi-byte
     character is guaranteed to span tokens.
-
-    xfail is the honest state: an engine.peek() accessor was written and reverted
-    because the lock makes it unobservable. Remove the marker when the lock is
-    narrowed; strict=True so it fails loudly the moment streaming starts working.
     """
     body = {
         "model": model_id,
@@ -208,10 +192,13 @@ def test_the_stream_arrives_in_pieces_and_never_splits_a_character(client, model
         f"stream != non-stream:\n  joined  {''.join(deltas)!r}\n  expected {expected!r}"
     )
 
-    # No delta may carry U+FFFD: that is what a decode of a partial character
-    # produces, and it is the failure a per-token decode would introduce.
-    assert "�" not in "".join(deltas), (
-        f"replacement char in the stream -- a partial character was decoded: {deltas!r}"
+    # No INCREMENTAL delta may carry U+FFFD: that is what a decode of a partial
+    # character produces, and it is the failure a per-token decode would introduce.
+    # The final delta is exempt -- tiny() has random weights, so its bytes are not
+    # valid UTF-8 at all and the non-stream path returns replacement chars too.
+    # Only the mid-stream cuts are the server's choice of where to split.
+    assert "�" not in "".join(deltas[:-1]), (
+        f"replacement char mid-stream -- a partial character was decoded: {deltas!r}"
     )
 
 

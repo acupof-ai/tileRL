@@ -1,5 +1,14 @@
 # Incremental SSE is blocked by the engine lock, not by a missing accessor, 2026-09-03
 
+> **SUPERSEDED the same day by
+> [`wins/2026-09-03-incremental-sse-was-a-starved-poll-loop.md`](../wins/2026-09-03-incremental-sse-was-a-starved-poll-loop.md).**
+> The conclusion below — that incremental streaming needs `step()`'s lock narrowed — is **wrong**.
+> The lock was never touched. `peek()` does not need the lock (GIL-atomic append/copy), and the
+> reason it saw nothing is that the poll loop called `take()` every iteration, which *does* take
+> the lock. Shipped at 5-6 deltas, 32.4 tok/s streamed vs 32.4 non-streamed. The lock timings
+> recorded here are accurate; only the attribution is not. Kept for the rule at the bottom, which
+> still holds, and as the record of a wrong attribution.
+
 > Status: **attempted, reverted, gap recorded as a strict xfail.** The demo needs a viewer to
 > see tokens arrive; `server.py:245` emits the whole completion as **one** SSE delta. I wrote
 > the obvious fix — an `engine.peek()` that copies the live output — and it cannot work:

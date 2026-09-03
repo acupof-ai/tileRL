@@ -530,6 +530,24 @@ class Engine:
                 )
             return None
 
+    def peek(self, request_id: int) -> list[int] | None:
+        """Tokens emitted so far, or None once the request has left the queues.
+
+        Deliberately lock-free: ``step()`` holds ``_lock`` across the whole forward, so any
+        reader that took the lock would block for the entire generation (measured: one
+        blocked call covered 325 ms of a 335 ms run). Under the GIL both the writer's
+        ``output.append`` and this ``list()`` are single bytecodes, so the copy is a
+        consistent prefix -- never a torn read; a stale one is fine.
+
+        None means "no longer waiting or running", so ``_finish`` has filed it under
+        ``_finished`` or ``_failed`` and ``take()`` will answer. That is what lets a caller
+        poll here without ever touching the lock until the run is over.
+        """
+        for req in (*self._waiting, *self._running):
+            if req.req_id == request_id:
+                return list(req.output)
+        return None
+
     def take(self, request_id: int) -> list[int] | None:
         """Pop one finished request's output, or None if not finished yet."""
         with self._lock:

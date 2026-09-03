@@ -242,21 +242,46 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         }
 
     def _stream(request_id: int, max_new: int):
-        # ponytail: engine.poll reports COMPLETED sequences, so the completion
-        # is emitted as one content delta + finish. Incremental token
-        # streaming needs an engine event stream (day-2).
         created = int(time.time())
         chunk_id = f"chatcmpl-{request_id}"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {"role": "assistant"}))
+        deadline = time.monotonic() + 1800.0
+        sent = 0  # characters already emitted; the decoded prefix only grows
         try:
+            while True:
+                # peek() is lock-free; take() blocks on the engine lock for a whole
+                # forward (325 ms of a 335 ms run measured), so calling it each poll
+                # would starve this loop back to one delta. Poll peek, take once it
+                # reports the request has left the queues.
+                # ponytail: one delta per ~21 tokens, narrow step()'s lock for per-token
+                live = engine.peek(request_id)
+                if live is None:
+                    break
+                if len(live) > sent:
+                    # Decode the whole prefix, not the new ids: one token can be a partial
+                    # UTF-8 sequence. A prefix can still END mid-character, and a decoder
+                    # renders that tail as U+FFFD, so hold anything from the first
+                    # replacement char onward until the bytes completing it arrive.
+                    text = tokenizer.decode(live)
+                    cut = text.find("�")
+                    if cut >= 0:
+                        text = text[:cut]
+                    if len(text) > sent:
+                        yield _sse(
+                            _chat_chunk(chunk_id, created, model_name, {"content": text[sent:]})
+                        )
+                        sent = len(text)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"request {request_id} did not finish within 1800.0s")
+                time.sleep(0.02)
             output_ids = _await_completion(request_id)
         except (TimeoutError, RuntimeError) as exc:
             yield _sse({"error": {"message": str(exc), "type": "api_error"}})
             yield "data: [DONE]\n\n"
             return
-        text = tokenizer.decode(output_ids)
-        if text:
-            yield _sse(_chat_chunk(chunk_id, created, model_name, {"content": text}))
+        tail = tokenizer.decode(output_ids)[sent:]
+        if tail:
+            yield _sse(_chat_chunk(chunk_id, created, model_name, {"content": tail}))
         finish = "length" if len(output_ids) >= max_new else "stop"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=finish))
         yield "data: [DONE]\n\n"
