@@ -995,9 +995,13 @@ def test_verify_commits_the_trunks_own_draw():
     backend = get_backend()
     model = build_random(cfg, seed=7)
     # the oracle head is accepted whole, so ``n_ok`` reaches the top step plane
+    # decode_graph=False by declaration: every assertion below reads a Python spy
+    # that runs once at capture and never at replay, so this gate can only be an
+    # eager one. Left on, capture aborts on the spy's own D2H copy and the engine
+    # silently drops to eager anyway -- for every width, not just this one.
     engine = build_engine(cfg, model, backend, num_blocks=64, num_slots=1, max_batch=4,
                           max_total_tokens=512, draft=_OracleDraft(cfg, expected),
-                          spec_depth=depth)
+                          spec_depth=depth, decode_graph=False)
     written: set[tuple[int, int]] = set()
     undrawn: list = []
     stale: list = []
