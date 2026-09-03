@@ -15,6 +15,11 @@ from . import kernels_mma
 
 _REGISTRY: dict[tuple[str, str], dict[str, object]] = {}
 
+# Shipped sm70 split count. Exported so the parity gate builds what runs -- it
+# used to pin 16 while this shipped 32, so the correctness gate never once
+# exercised the value on the card.
+SM70_KVSPLIT = 32
+
 
 def _register(precision: str, arch: str, kernels: dict[str, object]) -> None:
     _REGISTRY[(precision, arch)] = kernels
@@ -124,9 +129,9 @@ _SM70_KERNELS = {
     # sm70 only: the source is target-neutral but the win is filling 80 SMs, so
     # it loses where T.Kernel lowers to a serial loop (cpu) and is unproven on
     # metal.
-    "paged_attention_split": lambda t: kernels.make_paged_attention_split(t, KVSPLIT=32),
+    "paged_attention_split": lambda t: kernels.make_paged_attention_split(t, KVSPLIT=SM70_KVSPLIT),
     "paged_attention_split_combine": lambda t: kernels.make_paged_attention_split_combine(
-        t, KVSPLIT=32
+        t, KVSPLIT=SM70_KVSPLIT
     ),
 }
 _register("bf16", "sm70", _SM70_KERNELS)

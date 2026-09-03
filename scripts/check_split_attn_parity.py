@@ -25,8 +25,7 @@ sys.path.insert(
 import torch
 from tilerl_kernels import kernels
 from tilerl_kernels.backend import get_backend
-
-KVSPLIT = 16
+from tilerl_kernels.registry import SM70_KVSPLIT as KVSPLIT
 
 
 def main() -> None:
@@ -42,11 +41,11 @@ def main() -> None:
     torch.manual_seed(0)
     B, H, Hkv, D, BLOCK = 1, 4, 2, 64, 16
     dev = backend.device
-    # Lengths straddling BLOCK=16 and KVSPLIT=16 so empty and ragged slices,
-    # and slices shorter than one page, are all exercised. S>1 is a speculative
-    # verify width: each query gets its own causal window, which is the part a
-    # split can silently get wrong.
-    for n in (1, 15, 16, 17, 37, 100, 129):
+    # Lengths straddling BLOCK=16 and the shipped KVSPLIT so empty and ragged
+    # slices, and slices shorter than one page, are all exercised. S>1 is a
+    # speculative verify width: each query gets its own causal window, which is
+    # the part a split can silently get wrong.
+    for n in sorted({1, 15, 16, 17, 37, 100, 129, KVSPLIT - 1, KVSPLIT, KVSPLIT + 1}):
         for S in (1, 2, 4):
             if n < S:
                 continue
