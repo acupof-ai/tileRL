@@ -1016,6 +1016,39 @@ def test_a_padded_decode_tick_needs_a_spare_state_slot():
     assert "num_slots=slots, max_batch=b" in src, "bench_ctx_decode must pass them apart"
 
 
+def test_a_batch_between_rungs_warns_about_its_padding():
+    """B*W strictly between two sm70 rungs launches the whole upper rung, and a padding
+    row costs 3.3x the useful work on a real one (7.53 vs 2.29 ms measured), so the
+    shipped max_batch=4 at depth 3 -- 16 rows on the 32 rung -- gets 42.7 tok/s where
+    B=8's full rung gets 75.0. The old guard only fired PAST the top rung, so the entire
+    3..7 band was silent. Pure arithmetic over LADDER_WIDTHS: runs on the CPU target,
+    where the sm70 dispatch this describes never executes."""
+    from pathlib import Path
+
+    from tilerl.spec import LADDER_WIDTHS
+
+    def rung(rows):
+        return next((w for w in LADDER_WIDTHS if w >= rows), None)
+
+    # The band the old guard missed: every one of these pays for 32 rows.
+    for b in range(3, 8):
+        rows = b * 4
+        assert rows not in LADDER_WIDTHS, f"max_batch={b} would be silent by design"
+        assert rung(rows) == 32, f"max_batch={b}: {rows} rows -> {rung(rows)}"
+
+    # Negative controls: the two batch sizes that fill a rung must stay silent, or the
+    # warning fires on the config it is telling people to use.
+    assert rung(2 * 4) == 8 and 8 in LADDER_WIDTHS, "max_batch=2 fills the 8 rung"
+    assert rung(8 * 4) == 32 and 32 in LADDER_WIDTHS, "max_batch=8 fills the 32 rung"
+
+    # The suggestion the guard prints must itself fill the rung, not restate the problem.
+    src = (Path(__file__).resolve().parent.parent / "src/tilerl/engine.py").read_text()
+    assert "rows not in LADDER_WIDTHS" in src, "engine must warn between rungs, not only past the top"
+    assert "are padding; use max_batch=" in src, "the warning must name the batch that fills the rung"
+    for w in (2, 4):  # verify widths that divide the top rung
+        assert 32 % w == 0 and rung(32 // w * w) == 32, f"width {w}: suggestion lands off-rung"
+
+
 def test_generate_fans_a_corpus_across_workers(tmp_path):
     """Offline batch generation through the real subprocess path: every prompt back exactly once."""
     import json

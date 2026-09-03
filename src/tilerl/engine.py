@@ -326,16 +326,30 @@ class Engine:
                     f"{next(w for w in LADDER_WIDTHS if w > 1 + spec_depth) - 1}",
                     stacklevel=2,
                 )
-            if backend.arch == "sm70" and limits.max_batch * (1 + spec_depth) > max(LADDER_WIDTHS):
+            rows = limits.max_batch * (1 + spec_depth)
+            if backend.arch == "sm70" and rows > max(LADDER_WIDTHS):
                 # The rung is chosen on ROWS, and a verify tick submits B*W of
                 # them (backend.py M = x2.shape[0]), which the width check above
                 # cannot see. Past the top rung the dispatch chunks at 32, so a
                 # wide batch costs extra launches rather than extra per-row time.
                 warnings.warn(
                     f"max_batch={limits.max_batch} x verify width {1 + spec_depth} = "
-                    f"{limits.max_batch * (1 + spec_depth)} rows exceeds the sm70 ladder's top "
+                    f"{rows} rows exceeds the sm70 ladder's top "
                     f"rung ({max(LADDER_WIDTHS)}); a full batch verifies in "
-                    f"{-(-limits.max_batch * (1 + spec_depth) // 32)} launches per layer",
+                    f"{-(-rows // 32)} launches per layer",
+                    stacklevel=2,
+                )
+            elif backend.arch == "sm70" and rows not in LADDER_WIDTHS:
+                # Between rungs is worse than past the top: the launch pays for the
+                # whole rung. A padding row costs 3.3x the useful work layered on a
+                # real one (7.53 vs 2.29 ms), so B=4 depth 3 -- 16 rows on the 32
+                # rung -- measures 42.7 tok/s where B=8's full rung gets 75.0.
+                rung = next(w for w in LADDER_WIDTHS if w > rows)
+                warnings.warn(
+                    f"max_batch={limits.max_batch} x verify width {1 + spec_depth} = {rows} "
+                    f"rows launches the {rung}-row rung, so {rung - rows} of every "
+                    f"{rung} rows are padding; use max_batch={rung // (1 + spec_depth)} "
+                    f"to fill it",
                     stacklevel=2,
                 )
             self._draft_kv = PagedKvPool(
