@@ -219,10 +219,13 @@ def main() -> None:
     # twice, and the engine hides it by falling back to an exact-size graph.
     slots = b + 2
     # Blocks for max_batch concurrent requests at the longest context -- NOT num_slots,
-    # which is 2 higher and bought 0.5 GB of pool that OOMed a 32 GB card at B=4 (each
-    # block costs 0.92 MB: 0.79 trunk + 0.13 for the draft's plane, which mirrors
-    # num_blocks). ctx 4096 at B=4 needs 1060; the +32 is slack for block-boundary
-    # rounding, not for a fifth request.
+    # which is 2 higher and bought 0.5 GB of pool that OOMed a 32 GB card at B=4. A block
+    # costs 2.125 MiB on sm70: 2.000 trunk (16 full-attn planes x 4 kv heads x 16 tokens
+    # x 256 head_dim x 4 B, k and v) + 0.125 for the draft's plane, which mirrors
+    # num_blocks. f32 because sm70's attention IO is f32 (engine.py:1202); a bf16 card
+    # pays half. Measured by scripts/probe_block_bytes.py -- the 0.92 MB this comment
+    # used to claim was 2.42x low, bf16 and without the draft plane.
+    # The +32 is slack for block-boundary rounding, not for one more request.
     ctxs = [c for c in CTXS if args.min_ctx <= c <= args.max_ctx]
     if not ctxs:
         raise SystemExit(
@@ -232,7 +235,7 @@ def main() -> None:
     # Print it: the pool is a function of max(ctxs), so two runs that both report a
     # "ctx=512" row can be holding different amounts of free memory. Comparing those
     # rows across runs stalled one at a context the other measured at 88.5 tok/s.
-    print(f"pool: {blocks} blocks ({blocks * 0.92:.0f} MB) sized for ctx={max(ctxs)}, "
+    print(f"pool: {blocks} blocks ({blocks * 2.125:.0f} MiB) sized for ctx={max(ctxs)}, "
           f"sweeping {ctxs}")
     e = build_engine(cfg, model, backend, num_blocks=blocks, num_slots=slots, max_batch=b,
                      max_total_tokens=8192, draft=draft,
