@@ -26,6 +26,8 @@ process, one pool.
 context.** The whole rate curve is tick cost — 1.262x tick against a 1.220x rate,
 and `1.262 × (2.03/2.10) = 1.220` closes exactly. That is the opposite of what the
 confounded sweep said, where acceptance appeared to carry 1.409x of a 1.80x drop.
+(The attribution below splits that tick growth further: it is not all context.
+`verify_lens` widens the chain as context rises, and the wider rung is most of it.)
 
 The prompt change alone, at fixed ctx=1024, moves acceptance **2.86 → 2.03
 (1.409x)** and the tick **62.3 → 52.3 ms (0.840x, narrower chains are cheaper)**,
@@ -51,6 +53,53 @@ floor and the second ~3.6x. Something steps between 1024 and 2048 rather than
 scaling. Three points cannot say what; `scripts/prof_decode_budget.py` attributes
 by kernel inside the captured graph and can. Not guessed at here.
 
+## 2026-09-03, later: answered — the step was a rung, and context cost IS linear
+
+Profiled by kernel at 1024 and 2048. `fp4 GEMV` carried **+7.09 ms of the +10.79
+ms/forward** at an *identical* call count (330.2 → 330.0 calls/forward), which no
+shape change explains — until the chain width is printed. The mean drafted chain
+rises **2.28 → 3.70**, crossing the `LADDER_WIDTHS` rung 2 → 4. So that GEMV
+growth is the verify rung, not the context: the same staircase error as
+`errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md`, this time hidden
+because the launch count is per-layer and identical on both rungs.
+
+The clean control is the **dense** path, which is always rung 1, so the GEMV
+shapes cannot move:
+
+| ctx | GPU ms/fwd | fp4 GEMV | attention | everything else |
+|---:|---:|---:|---:|---:|
+| 1024 | 24.92 | 19.34 | 1.15 | 4.43 |
+| 2048 | 25.55 | 19.35 | 1.75 | 4.45 |
+| 4096 | 26.73 | 19.34 | 2.95 | 4.44 |
+
+**At a fixed rung, context costs attention and nothing else — 99.4% of the
+1024→4096 delta — and it is linear to the last digit**: 0.600 ms per 1K over both
+intervals, fitting `0.55 + 0.600 × ctx/1K` at 1.15 / 1.75 / 2.95 exactly. GEMV is
+flat to 0.05% across 4x the context, which is also this arm's order control: 1024
+ran first in every arm, and drift over a process would move GEMV too. (The spec
+arm was order-controlled directly: 1024 read 29.43 running first and 29.50
+running second, 0.24% apart.)
+
+So this entry's "not linear" claim above is **withdrawn**. It came from reading a
+rung crossing as a context cost.
+
+Two numbers this leaves:
+
+- **Attention runs 4.0x its own byte floor.** One dense row streams 128 KiB/token
+  of f32 KV, so 1K of context is 0.149 ms at 900 GB/s against 0.600 measured. The
+  0.597 ms/1K in the withdrawn paragraph was the *4-row* floor compared against a
+  1-row-equivalent slope — a mismatch that made attention look ~15x off when the
+  gap is 4.0x.
+- **The wider chain at long context is a loss, not a win.** Going 2.28 → 3.70
+  chain buys **+0.16 tok/forward** (1.88 → 2.04) and costs **+10.0 ms/forward**
+  of GEMV and attention. `verify_lens` trims on the draft's confidences, which
+  rise with context, so it spends a rung to keep tokens the verifier then
+  rejects. Capping verify width by context is a candidate lever; the size of it
+  is **not derived here**, because the profiler's wall (82.0 ms/fwd) carries
+  profiling overhead the 61.6 ms bench tick does not, and dividing one by the
+  other would be a fabricated ratio. It needs a direct A/B at ctx=2048 with the
+  rung pinned.
+
 ## Results
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
@@ -62,4 +111,8 @@ by kernel inside the captured graph and can. Not guessed at here.
 Single-stream, spec depth 3 (W=4), slots 3, one pool sized for ctx=4096, prompt
 from `_prompt(ctx, 0, 248320)`. Rows are ctx 1024 / 2048 / 4096.
 
-Raw artifacts: `$HOME/tilerl-logs/lcfix2.log` on the V100.
+Raw artifacts: `$HOME/tilerl-logs/lcfix2.log` on the V100. The attribution pass is
+`$HOME/tilerl-logs/bud4.log` (spec, rung crossing) and `bud5.log` (dense control),
+from `prof_decode_budget.py --ctx 1024,2048[,4096]`, 48 tokens per arm. Those are
+GPU-time-inside-the-profiler numbers and are not comparable to the wall-clock rows
+above; they are only compared to each other.
