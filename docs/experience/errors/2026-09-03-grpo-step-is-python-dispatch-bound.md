@@ -1,13 +1,13 @@
 ---
-question: The 27B GRPO recipe stopped OOMing. Why has step 1 not printed after 72 minutes?
+question: The 27B GRPO recipe prints nothing for 72 minutes. Is it stuck, and where does the time go?
 source: H20 sm90 GPU 4, tilelang 0.1.13 (/work/tl013), torch 2.11.0+cu129, Qwen3.8-27B-NVFP4, grpo-gsm8k-27b group=8 max_new_tokens=256; py-spy 60 s at 50 Hz, 2999 samples, pid verified through /proc/<pid>/cmdline
 ---
 
-# The 27B GRPO step is bound by per-call Python dispatch, not by memory or by compilation
+# The 27B GRPO step is ~72 s and dispatch-bound; the silence was the logging
 
 PR #15 took the step peak from an OOM at 95.04 GiB to 33.53 GiB, and the recipe
-now runs. It has not produced a step. 72 minutes of process time, memory flat at
-41.3 GiB, and the training banner long past.
+now runs. For 72 minutes it printed nothing, memory flat at 41.3 GiB, the
+training banner long past. It was at step 89 of 100.
 
 Two explanations were offered before anything was measured — that it was still
 compiling, and that it was stuck in the rollout. Both are wrong, and one
@@ -59,20 +59,38 @@ By call site:
 It is per call, not per load: the pad is recomputed on every linear in every
 layer of every forward.
 
-## What this costs
+## What this costs — corrected, and the correction is the point
 
-At 100 steps the recipe cannot finish. Step 1 has not completed in 72 minutes;
-even taking that as the whole step, 100 steps is 120 hours. The run is worth
-leaving up only until step 1 prints, because that number has never existed —
-nothing had previously survived the OOM to walk the 27B training backward.
+**The run was never stalled.** `py-spy dump --locals` on the same pid read
+`step: 89` out of 100, with `out` already holding 89 tuples of
+`(reward, ce, secs, tied)` whose `secs` are 70.0 and 73.9. **~72 s per step,
+100 steps in about two hours.**
+
+Nothing printed because nothing prints until the end: `grpo_loop` accumulates
+the whole history and returns it, and `cli.py:222` loops over the result to log
+it. A two-hour run emits no progress line until it is over.
+
+So the earlier reading of the silence — mine, in the first version of this
+entry, and a second agent's before that — was wrong, and wrong in the same way
+twice: an absent log line was read as an absent step. The profile above is
+unaffected; it measured where the time goes, not how much there was.
+
+The defect worth fixing is the logging, not the speed. A recipe that runs for
+two hours and reports nothing until it exits cannot be watched, cannot be
+stopped early on a bad curve, and produces exactly this class of mistake.
 
 ## Rule
 
-A stall gets a profile before it gets an explanation. Two people produced two
-confident diagnoses here — "still compiling" and "stuck in the rollout" — from
-`tail` and from single `py-spy dump`s, and the 60 s profile agreed with neither.
-A single stack sample is one sample; it says where the process was, not where it
-spends its time.
+A stall gets a profile before it gets an explanation, and **a stall gets
+confirmed before it is called a stall**. Three diagnoses were offered here —
+"still compiling", "stuck in the rollout", "step 1 has not finished in 72
+minutes" — and all three were wrong. The first two came from `tail` and from
+single `py-spy dump`s; the third came from me, from the absence of a log line.
+
+`py-spy dump --locals` reads the loop counter straight out of the running
+frame. It cost one command and it is the measurement all three guesses were
+substituting for. Reach for it before describing a process as hung: silence in
+a log is a fact about the logging.
 
 The second rule is narrower. `# ponytail: torch-eager backward, tilelang kernel
 when perf demands` is now cashed: perf demands. 28.4% of the step is in the
