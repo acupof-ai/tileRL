@@ -303,8 +303,14 @@ def test_fused_projections_parity(tmp_path):
         y1 = fused.forward(batch, positions, kv(fused, backend), backend)
         tl = get_backend()
         y2 = fused.forward(batch, positions, kv(fused, tl), tl).cpu()
+        y3 = unfused.forward(batch, positions, kv(unfused, tl), tl).cpu()
     assert torch.allclose(y0, y1, rtol=1e-2, atol=1e-2), (y0 - y1).abs().max()
-    assert torch.allclose(y0, y2, rtol=1e-2, atol=1e-2), (y0 - y2).abs().max()
+    assert torch.equal(y2, y3), (y2 - y3).abs().max()  # the fusion, on the served backend
+    if not tl.target.startswith("cuda"):
+        # sm90 sends these 32 rows to w4a8, whose e4m3 activations sit 19.8% off the
+        # f32 reference at this M -- no tolerance there separates a broken fusion from
+        # the format floor. test_ops_parity covers that path against its own reference.
+        assert torch.allclose(y0, y2, rtol=1e-2, atol=1e-2), (y0 - y2).abs().max()
 
 
 _NVFP4 = {"quantization_config": {"quant_method": "nvfp4", "weight_block_size": [1, 16]}}

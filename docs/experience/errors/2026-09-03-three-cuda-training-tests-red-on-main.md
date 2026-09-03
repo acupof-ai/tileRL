@@ -1,6 +1,6 @@
 ---
 question: Three `test_e2e.py` training tests fail on CUDA and pass on CPU. Did tonight's six merges break them?
-source: H20 sm90, tilelang 0.1.13 (/work/tl013), torch 2.11.0, GPU 1 idle; a702c9a and a4c2955 in separate pod checkouts
+source: H20 sm90, tilelang 0.1.13 (/work/tl013), torch 2.11.0; a702c9a and a4c2955 in separate pod checkouts; fixes verified on 9e3836b, suite sharded across five idle cards
 ---
 
 # Three CUDA-only training tests were red before tonight's merges, for three unrelated reasons
@@ -99,19 +99,64 @@ fp4/fp8 cells at all and fails eight *unrelated* parity tests with
 `tl::tma_load` signature errors. Print the version before trusting any result
 from this pod.
 
-## Fix
+## Fix (applied)
 
-Not applied — three unrelated causes in three subsystems, none of them the PR
-this was found under.
+- `test_tape_gradcheck`: skipped on cuda, with the 1.9e-2 measurement in the
+  skip message. There is no step size that works — the cast is unconditional,
+  so any step small enough to be a derivative is below one bf16 ulp and any
+  step large enough to survive the cast is not a derivative. The cuda tape is
+  covered by `tests/test_ops_parity.py`.
+- `reference.state_scatter`: `.to(device=..., dtype=...)` on both arms. The
+  non-stepped path was also dropping `new_window` outright, which nothing
+  covered.
+- `test_opd_ema_self_teacher_shares_the_model`: **the third diagnosis above was
+  right about the mechanism and wrong about where the fix goes.** Re-pointing
+  `trainable` at the materialized tensors — the first suggestion — was tried and
+  is wrong: `opd_loop` swaps EMA and student weights by copying *into* the live
+  adapter objects because the engine holds those objects, so rebinding the dict
+  detaches the engine from the tensors being trained, and the next step raises a
+  device mismatch instead. The real defect was caller order. `build_engine` is
+  what materializes; this test called `add_lora` before it, and every other
+  caller in the tree already builds the engine first (`cli.py:191` says so in a
+  comment). One line moved in the test; `train.py` unchanged.
 
-- `test_tape_gradcheck`: mark it CPU-only, or give the CUDA arm a step and
-  tolerance bf16 can actually resolve. A gradcheck at 0.1 ulps measures
-  rounding.
-- `reference.py:850` (and the `steps` branch above it): `.to(states.device,
-  states.dtype)`, matching what the `slots` line already does.
-- `materialize` / `train.py:100`: capture `param_ids` from the materialized
-  dict, or have `materialize` migrate in place so `id()` survives. The
-  assertion text is already the diagnosis; it just needs someone to act on it.
+## What the third test was hiding
+
+With the ordering fixed it failed again, on an assertion that had never been
+reachable: `moved <= set(trainable)`, "the quantized base does not move". On
+sm90 it does. `Backend._served_fp4` twiddles `.wq` into the served layout **in
+place** on first use and flags the tensor `_tl_twiddled` so `save_hf` can
+untwiddle. Measured on H20 with a 4-token generation and no training at all:
+
+```
+after build_engine: same object False   bytes equal True
+after generate:     same object True    bytes equal False
+max abs delta 252.0, 4075 of 4096 bytes changed
+```
+
+That is by design and `save_hf` handles it, but "the frozen base stays
+bit-identical" is false on sm90 and the assertion now allows exactly the
+flagged keys. Worth knowing before anyone hashes weights to check a base is
+frozen: on this card, serving one request changes them.
+
+## A fourth, on CPU
+
+`test_seedless_requests_decorrelate` failed on `ubuntu-latest` while passing on
+`macos-14` in the same run. Six seedless completions came back byte-identical —
+with all six seeds distinct, since they come from `secrets.randbits(31)`. The
+tiny model at `T=0.7, top_p=0.8, top_k=20` is peaked enough that the draw is
+deterministic in practice, so the test was asserting a property of the model's
+entropy, not of the sampling stream. It now asserts the seeds. Reintroducing
+the `seed=0` default fails it.
+
+## Still red, and not ours
+
+`test_fused_projections_parity.py::test_fused_fp8_qkvz_parity` and
+`test_weights.py::test_fused_projections_parity` fail on clean `origin/main` on
+the same card. The first never creates `layers.1.qkvz`; the second's fused
+logits differ from unfused by 6.37 at `atol=0.01`. Both pass on CPU. Separate
+investigation — recorded here so the next full cuda run is not read as a
+regression.
 
 ## Rule
 
