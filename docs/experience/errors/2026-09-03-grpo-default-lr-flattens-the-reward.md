@@ -78,6 +78,27 @@ it did not include is **1e-3, the value the recipe actually ships**, and that
 one sits outside the cluster. A sweep that omits the shipped value can only ever
 conclude that the arms it did run are the same.
 
+## Reproduced the same day, and the reason it cannot recover
+
+A 20-step arm at 1e-3 on the current pod tree, hours after the 100-step run and
+on a different card:
+
+```
+step  1-7   reward 1.00 .. 1.00   ce 2.13 -> 3.63   tied 1.00 mostly
+step  8     reward 0.3750         ce 5.2451         tied 0.00
+step  9-20  reward 0.0000 x12     ce 3.32 .. 6.11   tied 1.00 EVERY step
+```
+
+Same shape, same step. And the last column is the part the 100-step gate line
+only hinted at with `tied_group_fraction=0.97`: **from step 9 on, every group is
+tied, on every step.** A tied group has zero advantage, so there is no gradient
+at all. The policy is not learning slowly at 1e-3 — it is frozen at a broken
+state, and it cannot recover, because scoring 0 on every rollout of a group is
+exactly the condition that removes the signal that would fix it.
+
+That also explains why `ce` wanders 3.3-6.1 without trend after step 9 rather
+than continuing to climb: nothing is updating the weights.
+
 ## Fix
 
 `lr=1e-4` in the `grpo-gsm8k-27b` recipe. Not in the CLI default, which also
