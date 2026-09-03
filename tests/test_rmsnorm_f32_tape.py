@@ -26,6 +26,43 @@ from tilerl import autograd
 from tilerl.testing import RefBackend
 
 
+def test_every_cell_can_actually_deliver_an_f32_norm_output():
+    """`_rmsnorm`'s fallback invariant, asserted instead of commented.
+
+    `rmsnorm_f32` takes `rmsnorm_fused_f32` when the cell has it and otherwise
+    falls back to `rmsnorm_partial` + `rmsnorm_apply` — which is f32 in every cell
+    except sm90, which overrides it to bf16 and is also the only cell carrying
+    `rmsnorm_fused_f32`. So the invariant holds in all six populated cells today.
+
+    The trap is the seventh. A future cell (sm100 and sm120 are already registered
+    pending-remote) that overrides `rmsnorm_apply` to bf16 for the bandwidth reason
+    sm90 did, without adding `rmsnorm_fused_f32`, makes `rmsnorm_f32` **silently
+    return bf16** — the same defect this op exists to remove, on a target nobody
+    re-derives the reasoning for. A comment addresses whoever edits `_rmsnorm`;
+    the person who breaks this will be editing `registry.py`.
+
+    Static, so it fires when the cell is added rather than when a training run
+    quietly loses precision. The registry-level twin of the `_BWD` population
+    gate."""
+    from tilerl_kernels import kernels
+    from tilerl_kernels.registry import _REGISTRY
+
+    checked = []
+    for (precision, arch), cell in sorted(_REGISTRY.items()):
+        if not cell:
+            continue  # pending-remote bring-up: no kernels to check yet
+        checked.append(f"{precision}/{arch}")
+        if "rmsnorm_fused_f32" in cell:
+            continue
+        assert cell.get("rmsnorm_apply") is kernels.make_rmsnorm_apply, (
+            f"cell {precision}/{arch} overrides rmsnorm_apply to "
+            f"{getattr(cell.get('rmsnorm_apply'), '__name__', None)} and has no "
+            "rmsnorm_fused_f32: Backend.rmsnorm_f32 would silently return a "
+            "narrowed dtype there. Add rmsnorm_fused_f32 to the cell."
+        )
+    assert len(checked) >= 2, f"only checked {checked}: the registry did not populate"
+
+
 def test_rmsnorm_f32_records_a_tape_entry_and_its_gradient_is_right():
     be = RefBackend()
     torch.manual_seed(0)
