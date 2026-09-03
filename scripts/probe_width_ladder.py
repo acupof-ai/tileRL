@@ -5,26 +5,30 @@ greedy. Every sampled position records the top-2 logits the sampler saw, keyed b
 (prompt, generated index), so any two arms can be differenced on the positions
 where their histories still agree.
 
-The rungs are chosen so each one moves ONE factor. At B=1, M = W, and the fp4
-linear arm is picked by M against ``_MGEMV`` (3) and ``_MX`` (8), while
-attention's M tile is ``_snap_mma_tile(G*W, 128)`` with G=6:
+Attention's M tile is ``_snap_mma_tile(G*W, 128)``, G=6, a function of W alone
+(B is a grid dimension, not a tile dimension): 16, 16, 32, 32, 64 at W=1,2,3,4,8.
 
-    W  M  fp4 linear arm            attn block_m  policy / P cast
-    1  1  gemv, factory M=1         16            Square  / via shared
-    2  2  gemv, factory M=2         16            Square  / via shared
-    3  3  gemv, factory M=3         32            FullRow / direct
-    4  4  mma8, pads x2 to 8 rows   32            FullRow / direct
-    8  8  mma8, 8 real rows         64            FullRow / direct
+The fp4 linear arm is picked by **M = B*W** against ``_MGEMV`` (3) and ``_MX``
+(8) -- NOT by W. ``concurrency`` sets B, and B falls from the concurrency down
+to 1 as rows retire, so one arm sweeps several linear kernels:
 
-    1->2  null control: same gemv kernel on the same M=1 plan, same bN and
-          padding, same attention tile. Per-row reductions are identical in both
-          families, so a nonzero delta here is NEITHER suspect -- it would point
-          at the chain plumbing or GDN's ks, which nothing has on the board.
-    2->3  attention 16->32 alone: warp policy and the P cast flip together.
-    3->4  gemv->mma8 alone, attention fixed at 32.
-    4->8  attention 32->64 alone. The linears are bit-identical here: both pad
-          to _MX=8 rows through one kernel at one Np32/Kp, so row i cannot see
-          which arm it was in.
+    B  W=1        W=2         W=3          W=4          W=8
+    1  gemv(M=1)  gemv(M=2)   gemv(M=3)    mma8         mma8
+    2  gemv(M=2)  mma8        mma8         mma8         w4a8(Mp=16)
+    4  mma8       mma8        w4a8(Mp=16)  w4a8(Mp=16)  w4a8(Mp=32)
+    8  mma8       w4a8(Mp=16) w4a8(Mp=32)  w4a8(Mp=32)  w4a8(Mp=64)
+
+So at ``--concurrency 1`` (M = W) each rung moves one factor and W=1<->W=2 is a
+null control: one gemv kernel on the M=1 plan, one attention tile. Above B=1 no
+rung isolates attention, but W=3<->W=4 still nearly holds the linears -- same
+arm at B=2,3,4,6,7,8, differing only at B=1 and B=5 -- while attention's tile is
+32 for both. Measured at concurrency 8: that rung is the ONLY one at 0.000e+00
+median with 7 of 8 completions bit-identical, and every rung that moves the
+linears sits at ~1.5e-01. The projections own the divergence; attention's tile
+does not.
+
+    an earlier version of this docstring read the table as if M were W, which is
+    true only at B=1, and called W=1<->W=2 a null control at any B.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/probe_width_ladder.py \
@@ -100,7 +104,7 @@ def instrument(engine):
     return rec, ids
 
 
-def arm(width, cfg, model, backend, tok, draft_path, rows, params):
+def arm(width, cfg, model, backend, tok, draft_path, rows, params, conc):
     from tilerl.spec import load_draft
 
     name = f"w{width}"
@@ -111,7 +115,7 @@ def arm(width, cfg, model, backend, tok, draft_path, rows, params):
     rec, ids = instrument(engine)
     prompts = [render_chat([("user", r["prompt"])], False) for r in rows]
     torch.cuda.synchronize(); t0 = time.perf_counter()
-    texts = generate(engine, tok, prompts, params, 8)
+    texts = generate(engine, tok, prompts, params, conc)
     torch.cuda.synchronize(); secs = time.perf_counter() - t0
     s = engine.stats()
     ok = sum(answer_match(t, r["answer"]) for t, r in zip(texts, rows))
@@ -182,6 +186,8 @@ def main() -> None:
     p.add_argument("--gsm8k-n", type=int, default=8)
     p.add_argument("--widths", default="1,2,3,4,8")
     p.add_argument("--max-new-tokens", type=int, default=256)
+    # B enters the linear arm through M = B*W; 1 is what makes a rung one-factor
+    p.add_argument("--concurrency", type=int, default=8)
     p.add_argument("--out", required=True)
     a = p.parse_args()
 
@@ -192,12 +198,19 @@ def main() -> None:
     cfg = qwen38_27b()
     g = cfg.num_attention_heads // cfg.num_kv_heads
     widths = [int(w) for w in a.widths.split(",")]
-    print(f"arm geometry (B=1 so M=W; _MGEMV={_MGEMV} _MX={_MX} G={g}):")
+    print(f"geometry (_MGEMV={_MGEMV} _MX={_MX} G={g}, concurrency {a.concurrency}):")
+    print("  attention block_m is a function of W alone:")
     for w in widths:
         bm = _snap_mma_tile(g * w, 128)
-        print(f"  W={w}: fp4 linear {fp4_arm(w):18s} attn block_m {bm:3d} "
-              f"policy {'FullRow' if bm >= 32 else 'Square ':7s} "
-              f"P cast {'direct' if bm >= 32 else 'via shared'}")
+        print(f"    W={w}: block_m {bm:3d}  policy "
+              f"{'FullRow' if bm >= 32 else 'Square ':7s} P cast "
+              f"{'direct' if bm >= 32 else 'via shared'}")
+    print("  fp4 linear arm is a function of M = B*W, and B falls to 1 as rows retire:")
+    print("    B  " + "  ".join(f"W={w:<14}" for w in widths))
+    for b in range(1, a.concurrency + 1):
+        print(f"    {b}  " + "  ".join(f"{fp4_arm(b * w):<16}" for w in widths))
+    if a.concurrency > 1:
+        print("  NOTE: no rung isolates attention above B=1 -- see the docstring.")
 
     tok = get_tokenizer(a.source)
     model = load_hf(cfg, a.source)
@@ -206,7 +219,8 @@ def main() -> None:
     params = replace(sampling(tok, False, a.max_new_tokens, temperature=0.0,
                               max_think_tokens=0, seed=0), temperature=0.0)
 
-    arms = {w: arm(w, cfg, model, backend, tok, a.draft, rows, params) for w in widths}
+    arms = {w: arm(w, cfg, model, backend, tok, a.draft, rows, params, a.concurrency)
+            for w in widths}
 
     # consecutive rungs isolate one factor each; the endpoints reproduce the
     # recorded W=1<->W=8 number so the ladder is anchored to it
