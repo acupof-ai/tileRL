@@ -10,6 +10,11 @@
 > the higher rate is entirely acceptance — **tok/forward 21.60 vs 14.00, 1.543×** — and those
 > two multiplied give 1.451× against a measured 1.448×, **0.2% apart**. The result is that this
 > configuration exists at all.
+>
+> **Caveat, now measured:** the 88.5 run carried
+> `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, which the tree sets nowhere, and the arm
+> without it **OOMs** — in the MLP, not attention.
+> [errors/2026-09-03-expandable-segments-is-load-bearing.md](../errors/2026-09-03-expandable-segments-is-load-bearing.md)
 
 ## Context
 
@@ -178,6 +183,15 @@ configuration OOMed: 1.41 GiB in the draft readout, then 1.50 GiB in the partial
 960 MiB, then 1.31 GiB. ctx=32 confirms the price was zero where it should be — **61.1 against
 a 61.1 baseline**, and by construction, since every tick there is S≤4 and takes the same
 KVSPLIT=32 kernel it always took.
+
+**Precondition, measured and confirmed:** this run carried
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, which is set **nowhere in the tree** —
+`src/`, `packages/` and every script are free of it; it lived only in the pod runner. **The arm
+without it OOMs**, so the flag is load-bearing and the 88.5 is *"reachable with the allocator
+flag"*, not what the shipped server does. The failing allocation is no longer in attention: it
+is the fused `gate_up` projection's f32 buffer at `backend.py:500`, **476 MiB = 7 rows × 512** —
+the same padded shape, one buffer over.
+[errors/2026-09-03-expandable-segments-is-load-bearing.md](../errors/2026-09-03-expandable-segments-is-load-bearing.md)
 
 ## One number does not reproduce
 
