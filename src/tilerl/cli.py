@@ -164,26 +164,51 @@ def _train_full(args: argparse.Namespace) -> None:
 
     from . import train as train_mod
     from .autograd import Adafactor, cosine_warmup
+    from .ledger import commit, new_manifest, read_manifest, runs_root
     from .model import drop_quantized
+
+    log = (lambda *a, **k: None) if args.json else print
+    # The ledger is per-RUN, not per-algorithm: sft-iso-27b exists to produce a
+    # P3 verdict and had nowhere to record one.
+    manifest = new_manifest("train", {
+        "model": args.model, "recipe": args.recipe,
+        "source": _QWEN38_SOURCE if args.model == "qwen38-27b" else "tiny",
+        "commit": commit(), "algo": "sft", "optim": args.optim,
+        "steps": args.steps, "lr": args.lr, "seed": args.seed})
+    prev = read_manifest(runs_root(), manifest["id"])
+    if prev and prev["finished"] and not args.force:
+        log(f"run {prev['id']} already finished; --force reruns")
+        return _finish(prev, args.json)
+    manifest["metrics"] = dict.fromkeys(("ce_first", "ce_last", "secs_per_step_median"))
 
     backend = get_backend()
     cfg, model = _build_model(args.model, seed=args.seed, keep_master=True)
     drop_quantized(model)
     # Adam's m+v on the 27B is 200.4 GiB; Adafactor is 0.03 GiB and streams its updates.
-    optimizer = Adafactor(lr=1e-2, weight_decay=0.1)
+    optimizer = Adafactor(lr=args.lr, weight_decay=0.1)
     if args.optim == "iso":
         from .iso import ISO
 
         optimizer = ISO(optimizer)
     gen = torch.Generator().manual_seed(args.seed)
-    print(f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
-          f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}")
+    log(f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
+        f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}")
+    losses, secs = [], []
     for step in range(args.steps):
         # ponytail: random-token batch; a real corpus plugs in here without touching train_step.
         input_ids = torch.randint(0, cfg.vocab_size, (2, 64), generator=gen)
-        optimizer.lr = cosine_warmup(step, args.steps, 5, 1e-3)
+        optimizer.lr = cosine_warmup(step, args.steps, 5, args.lr)
+        t0 = time.perf_counter()
         loss = train_mod.train_step(model, input_ids, backend, optimizer)
-        print(f"step {step + 1:4d}/{args.steps}  loss {loss:.4f}")
+        secs.append(time.perf_counter() - t0)
+        losses.append(loss)
+        log(f"step {step + 1:4d}/{args.steps}  loss {loss:.4f}  {secs[-1]:.1f}s")
+    manifest["metrics"].update(
+        ce_first=losses[0], ce_last=losses[-1],
+        secs_per_step_median=statistics.median(secs))
+    if torch.cuda.is_available():
+        manifest["metrics"]["peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
+    return _finish(manifest, args.json)
 
 
 def _train_adapters(args: argparse.Namespace) -> None:
@@ -310,15 +335,20 @@ def _finish(m: dict, as_json: bool) -> None:
 
     if not m["finished"]:
         g = m["metrics"]
-        mmlu_floor = None if g["mmlu_before"] is None else g["mmlu_before"] - 0.03
+        # .get, not [...]: "a gate whose metric was not evaluated passes
+        # vacuously" already covers a metric set that never had the key, which
+        # is what an SFT run's manifest is.
+        mmlu_floor = None if g.get("mmlu_before") is None else g["mmlu_before"] - 0.03
         m["gates"] = [
             {"name": n, "value": v, "threshold": t,
              "passed": v is None or t is None or ok(v, t)}
             for n, v, t, ok in (
-                ("reward_rises", g["reward_last"], g["reward_first"], lambda v, t: v > t),
-                ("mmlu_holds", g["mmlu_after"], mmlu_floor, lambda v, t: v >= t),
-                ("gsm8k_improves", g["gsm8k_after"], g["gsm8k_before"], lambda v, t: v > t),
-                ("groups_untied", g["tied_group_fraction"], 0.5, lambda v, t: v < t),
+                ("reward_rises", g.get("reward_last"), g.get("reward_first"), lambda v, t: v > t),
+                ("mmlu_holds", g.get("mmlu_after"), mmlu_floor, lambda v, t: v >= t),
+                ("gsm8k_improves", g.get("gsm8k_after"), g.get("gsm8k_before"),
+                 lambda v, t: v > t),
+                ("groups_untied", g.get("tied_group_fraction"), 0.5, lambda v, t: v < t),
+                ("ce_falls", g.get("ce_last"), g.get("ce_first"), lambda v, t: v < t),
             )]
         m["finished"] = now()
         write_manifest(runs_root(), m)

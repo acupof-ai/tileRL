@@ -54,7 +54,10 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
             "--group", "2", "--max-new-tokens", "4", "--lora-rank", "4"]
     code = _train(argv)
     (m,) = list_runs(tmp_path / "runs")
-    assert [g["name"] for g in m["gates"]] == ["reward_rises", "mmlu_holds", "gsm8k_improves", "groups_untied"]
+    assert [g["name"] for g in m["gates"]] == [
+        "reward_rises", "mmlu_holds", "gsm8k_improves", "groups_untied", "ce_falls"]
+    # ce_falls carries no ce_first on the RL path, so it passes vacuously here.
+    assert m["metrics"].get("ce_first") is None
     assert code == (0 if gates_pass(m) else 1)
     assert isinstance(m["metrics"]["gsm8k_before"], int)
     assert isinstance(m["metrics"]["gsm8k_after"], int)
@@ -67,6 +70,30 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
 
     cmd_ledger(_build_parser().parse_args(["ledger", "--json"]))
     assert [r["id"] for r in json.loads(capsys.readouterr().out)] == [m["id"]]
+
+
+def test_sft_writes_a_manifest_and_gates_on_the_loss_falling(tmp_path, monkeypatch, capsys):
+    """`tilerl train` without --rl/--opd wrote no manifest at all, so sft-iso-27b
+    -- a recipe whose whole purpose is a P3 verdict -- had nowhere to record one.
+    The ledger is per-run, not per-algorithm."""
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
+    argv = ["--model", "tiny", "--steps", "4"]
+    code = _train(argv)
+    (m,) = list_runs(tmp_path / "runs")
+    assert m["inputs"]["algo"] == "sft" and m["inputs"]["optim"] == "adafactor"
+    assert code == (0 if gates_pass(m) else 1)
+    ce = m["metrics"]
+    assert ce["ce_first"] is not None and ce["ce_last"] is not None
+    assert ce["secs_per_step_median"] is not None
+    # The RL gates have no metrics on this path and must pass vacuously.
+    for g in m["gates"]:
+        if g["name"] != "ce_falls":
+            assert g["passed"] and g["value"] is None, g
+
+    capsys.readouterr()
+    assert _train(argv + ["--json"]) == code
+    again = json.loads(capsys.readouterr().out)
+    assert again["finished"] == m["finished"], "a finished SFT run was retrained"
 
 
 if __name__ == "__main__":  # runnable check
