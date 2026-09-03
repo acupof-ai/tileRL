@@ -88,11 +88,15 @@ def record(args) -> None:
     tok = get_tokenizer(args.source)
     model = load_hf(cfg, args.source)
     draft = load_draft(model, args.draft)
+    # NoPrefixStore unconditionally: a drafter tapping the trunk's aux layers
+    # builds its context only from positions this process forwarded, so an
+    # adopted prefix would leave it attending over recycled blocks. Engine
+    # raises on the combination; the graph is orthogonal to it.
     engine = build_engine(cfg, model, backend, num_blocks=1024,
                           num_slots=args.batch + 2, draft=draft,
                           spec_depth=max(1, args.width - 1),
                           decode_graph=args.graph,
-                          prefix_store=None if args.graph else NoPrefixStore())
+                          prefix_store=NoPrefixStore())
     ticks: list[list[int]] = []  # one [width, n_ok] per verified row
     verify = engine._verify
 
