@@ -83,6 +83,11 @@ Two designs would work and neither is a retune: carry the staircase, or
 restrict the policy to trims that cross an arm boundary. Which one is better is
 a goodput question, and goodput on the wide tick is not measured yet.
 
+Note, not a recommendation: the arm-boundary option needs only the boundary set
+— `_MGEMV`, `_MX`, and `_snap_mma_tile`'s 16/32/64/128 — all host-known and
+needing no calibration, while carrying the staircase needs per-arm timings that
+go stale on every kernel change.
+
 Deleting the policy is off the table — it is live at the depths it was about to
 be deleted for not reaching.
 
