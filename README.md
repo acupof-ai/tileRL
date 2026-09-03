@@ -12,17 +12,28 @@ Serve and RL-train Qwen3.8-27B (NVFP4) on one Hopper card, in one process.
 - **One CLI an agent drives.** `train --recipe` → `ledger` → `merge` →
   `serve`; every run writes a manifest with its inputs and gates.
 
-| one H20, Qwen3.8-27B | B=1 decode tok/s | MMLU 0-shot |
-|---|---:|---:|
-| tileRL, native NVFP4 + FP8 | **92.4** | 76.3% |
-| sglang, bf16 (cannot load NVFP4 on Hopper) | 54.2 | — |
-| sglang, online fp8 | 39.9 | — |
+| one H20, Qwen3.8-27B | B=1 decode tok/s | prefill tok/s | MMLU 0-shot |
+|---|---:|---:|---:|
+| tileRL, native NVFP4 + FP8 | **92.4** | **2887.6** | 76.3% |
+| sglang, bf16 (cannot load NVFP4 on Hopper) | 54.2 | — | — |
+| sglang, online fp8 | 39.9 | — | — |
 
-sglang is ahead at batch ≥ 8 and on prefill; those are not the target —
-rollout is single-stream decode. RL on the 27B has not yet moved a
-downstream metric; that run is the first roadmap gate and is pending a free
-card. Every number above sits in a dated entry under `docs/experience/`,
-gated at ≥ 0.97× the committed baseline.
+The card, not the field: a tick reads 20.4 GB, and the H20's measured copy
+bandwidth is 3312 GB/s, so unspeculated B=1 decode roofs at 162 tok/s. 92.4 is
+57% of that — the remaining gap is kernel efficiency, not the memory system.
+sglang is ahead at batch ≥ 8; that is not the target, rollout is single-stream
+decode.
+
+Speculative decode is the lever that passes the roofline, because one weight
+pass verifies a block. Both halves are measured and neither is wired to the
+other yet: a width-8 verify tick costs 2.4× a width-1 tick at B=1 and 1.8× at
+B=8, and the DFlash2 block drafter lands 5.8 of 8 tokens. Their product is not
+a throughput number until the drafter runs on the tick, and this table will not
+carry one until it does.
+
+RL on the 27B has not yet moved a downstream metric; that run is the first
+roadmap gate. Every number above sits in a dated entry under
+`docs/experience/`, gated at ≥ 0.97× the committed baseline.
 
 ## Quickstart
 
