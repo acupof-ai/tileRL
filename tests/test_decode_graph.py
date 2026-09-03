@@ -76,3 +76,64 @@ def test_decode_graph_matches_eager(spec):
             assert not spec or max(widths) > 1, f"no verify-width graph captured: {widths}"
             return
     raise AssertionError("requests did not finish")
+
+
+def test_the_graphs_padding_row_is_not_taken_from_the_callers_capacity():
+    """``num_slots=N`` must serve N concurrent requests with the graph on.
+
+    A replay's padding rows write to the state and KV pools, so they need a slot
+    and a block. Taking those from the pools the caller sized left N slots
+    serving N-1, and the N-th ``submit`` raised from ``alloc_slot`` with no
+    fallback. Runs on any target: what is gated is the reservation and the
+    accounting, not the capture, which only CUDA does.
+    """
+    cfg, backend = tiny(), get_backend()
+    n = 3
+
+    def engine(decode_graph):
+        return build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=16,
+                            num_slots=n, max_batch=n, decode_graph=decode_graph)
+
+    on, off = engine(True), engine(False)
+    # The pad row is engine overhead: the pool grows by it, the reported capacity does not.
+    assert on._states.num_slots == n + 1 and on._kv.num_blocks == 16 + 1
+    assert on._pad_slot is not None and on._pad_block is not None
+    assert on.stats()["slots_total"] == n and on.stats()["blocks_total"] == 16
+    # Negative control: with the graph off nothing is reserved and nothing is added.
+    assert off._states.num_slots == n and off._kv.num_blocks == 16
+    assert off._pad_slot is None and off.stats()["slots_total"] == n
+
+    prompt = torch.randint(0, cfg.vocab_size, (8,),
+                           generator=torch.Generator().manual_seed(5)).tolist()
+    params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=0)
+    ids = [on.submit(prompt, params) for _ in range(n)]  # the N-th used to raise
+    assert len(set(ids)) == n and on.stats()["slots_used"] == n
+
+
+def test_the_kv_guard_measures_usable_capacity_not_the_pool():
+    """``submit``'s KV guard must compare against capacity net of the pad row.
+
+    The pools are sized one larger when the captured tick is on, so a guard
+    reading ``self._kv.num_blocks`` admits the one request sized to the whole
+    pool and then fails on the allocation behind it — the same shape as the pad
+    row itself, one level down.
+    """
+    cfg, backend = tiny(), get_backend()
+    nb = 16  # 16 blocks x BLOCK_TOKENS 16 = 256 tokens usable, 272 gross
+
+    def engine(decode_graph):
+        return build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=nb,
+                            num_slots=2, max_batch=2, max_total_tokens=512,
+                            decode_graph=decode_graph)
+
+    on, off = engine(True), engine(False)
+    assert on.usable_blocks == nb and on._kv.num_blocks == nb + 1
+    assert off.usable_blocks == nb and off._kv.num_blocks == nb
+
+    # 260 + spec_depth needs 17 blocks: over the 16 usable, inside the 17 gross.
+    big = torch.randint(0, cfg.vocab_size, (260,),
+                        generator=torch.Generator().manual_seed(2)).tolist()
+    params = SamplingParams(temperature=0.0, max_new_tokens=1, seed=0)
+    for eng in (on, off):  # graph off is the control: same rejection, no pad row
+        with pytest.raises(ValueError, match="exceeds KV pool capacity"):
+            eng.submit(big, params)
