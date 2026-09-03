@@ -73,11 +73,19 @@ def mmlu_score(engine: Any, tok: Any, prompts: list[str], concurrency: int = 32)
 
 
 def mmlu_accuracy(engine: Any, tok: Any, n: int, seed: int = 0,
-                  concurrency: int = 32) -> tuple[int, int]:
-    """(correct, total) on the fixed slice."""
+                  concurrency: int = 32) -> tuple[int, int, int]:
+    """(correct, total, concurrency) on the slice ``seed`` picks.
+
+    ``concurrency`` is returned because it is part of the score, not of how the
+    score was obtained: it sets the batch size, the batch size sets ``M``, and
+    ``M`` picks the fp4 linear arm across the ``_MGEMV``/``_MX`` boundaries, so
+    two concurrencies can run two kernels on the same question. Measured on the
+    27B, two arms at concurrency 8 agree on 1000 of 1000 while a concurrency-32
+    run of the same slice differs on 4. Callers disagreed (``cli.py`` 8,
+    ``scripts/mmlu.py`` the default) and nothing recorded which was used."""
     prompts, golds, _ = mmlu_questions(n, seed)
     preds = [letter(t) for t in mmlu_score(engine, tok, prompts, concurrency)]
-    return sum(p == g for p, g in zip(preds, golds)), len(preds)
+    return sum(p == g for p, g in zip(preds, golds)), len(preds), concurrency
 
 
 def gsm8k_accuracy(engine: Any, tok: Any, rows: list[dict], sampling: Any,

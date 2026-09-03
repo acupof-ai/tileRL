@@ -66,3 +66,28 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
 if __name__ == "__main__":  # runnable check
     test_run_id_is_canonical()
     print("ledger: ids OK")
+
+
+def test_mmlu_score_reports_the_concurrency_it_used():
+    """A score whose value depends on concurrency has to carry it.
+
+    concurrency sets B, B sets M = B*W, and M picks the fp4 linear arm across
+    the _MGEMV/_MX boundaries -- so two concurrencies can run two kernels on one
+    question, and the 27B showed 4 of 1000 answers moving between them. The two
+    callers disagreed silently (cli.py 8, scripts/mmlu.py the default 32).
+
+    Gated on the signature rather than end to end: mmlu_accuracy needs the real
+    dataset, and what regresses is a caller unpacking two values again.
+    """
+    import inspect
+
+    from tilerl.eval import mmlu_accuracy
+
+    src = inspect.getsource(mmlu_accuracy)
+    assert "concurrency" in src.split("return")[-1], (
+        "mmlu_accuracy must return the concurrency it scored at:\n" + src)
+
+    cli = inspect.getsource(__import__("tilerl.cli", fromlist=["_"]))
+    call = next(ln for ln in cli.splitlines() if "mmlu_accuracy(" in ln and "import" not in ln)
+    assert call.count(",") >= 2 and "conc" in call, f"cli.py drops the concurrency: {call!r}"
+    assert '_concurrency"] = conc' in cli, "cli.py must record it in the manifest"

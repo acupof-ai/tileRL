@@ -22,6 +22,12 @@ from tilerl.eval import LETTERS, letter, mmlu_questions, mmlu_score  # noqa: E40
 from tilerl.tokenizer import get_tokenizer  # noqa: E402
 
 
+#: concurrency is part of the score: it sets B, B sets M = B*W, and M picks the
+#: fp4 linear arm, so two values can run two kernels on one question. cli.py's
+#: eval used 8 and this used the default 32; they are one number now.
+CONCURRENCY = 8
+
+
 def score_tilerl(source: str, prompts: list[str]) -> list[str]:
     from tilerl.config import qwen38_27b
     from tilerl.engine import build_engine
@@ -31,7 +37,7 @@ def score_tilerl(source: str, prompts: list[str]) -> list[str]:
     model = load_hf(qwen38_27b(), source, fuse_projections=True)
     engine = build_engine(model.cfg, model, get_backend(), num_blocks=2048, num_slots=64,
                           max_batch=8, max_total_tokens=8192)
-    return mmlu_score(engine, get_tokenizer(source), prompts)
+    return mmlu_score(engine, get_tokenizer(source), prompts, CONCURRENCY)
 
 
 def accuracy(source: str, n: int = 200, seed: int = 0) -> tuple[int, int]:
@@ -88,6 +94,8 @@ def main() -> None:
     out = args.out or f"/work/mmlu_{args.engine}.json"
     Path(out).write_text(json.dumps({"pred": preds, "gold": golds, "acc": correct / len(preds),
                                      "engine": args.engine, "source": args.source, "n": len(preds),
+                                     "seed": args.seed,
+                                     "concurrency": CONCURRENCY if args.engine == "tilerl" else None,
                                      "raw": texts[:50]}))
 
 
