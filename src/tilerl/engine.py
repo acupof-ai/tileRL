@@ -931,6 +931,8 @@ class Engine:
                     r.hidden, r.hidden_from = g.hidden[i : i + 1], r.seq_len - 1
             self._sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
         if self._draft is not None:
+            # No block-growth loop needed here: this path runs only with `not prefills`, so
+            # the pre-fork `seq_len - 1 + q` loop already covers the draft's furthest write.
             if self._draft_ms is None:
                 self._draft.step(reqs)
             else:

@@ -149,6 +149,10 @@ def measure(e, prompts: list[list[int]], tokens: int) -> tuple[float, float, flo
         if not live and e.poll():
             raise SystemExit(f"B={len(prompts)}: finished during prefill")
     _sync()
+    # Drop the prefill drain's draft timings: those 6 eager ticks carry the prompt's own
+    # forward (165.97 ms/forward measured alone) and moved depth 3 from 5.67 to 7.68.
+    if e._draft_ms is not None:
+        e._draft_ms.clear()
     s0, t0 = e.stats(), time.perf_counter()
     done, per_rung = {}, defaultdict(list)
     while len(done) < len(rids):
@@ -315,12 +319,14 @@ def main() -> None:
                 # prefill -- and printed 165.97 ms/forward against a subtracted 4.80.
                 # A mean over an unrepresentative subset looks exactly like a mean.
                 ticks = sum(len(v) for v in per_rung.values())
-                if len(direct) < 0.9 * ticks:
+                if not 0.9 * ticks <= len(direct) <= ticks:
                     raise SystemExit(
-                        f"--time-draft covered {len(direct)} of {ticks} ticks "
-                        f"({len(direct) / max(ticks, 1):.1%}); the timer is on a path this "
-                        "run does not take -- the engine has two draft call sites, "
-                        "_run_forward and _run_decode_graph")
+                        f"--time-draft covered {len(direct)} of {ticks} decode ticks; "
+                        "the timer is not sampling the ticks being priced. UNDER means "
+                        "it sits on a path this run does not take (the engine has two "
+                        "draft call sites, _run_forward and _run_decode_graph); OVER "
+                        "means it caught ticks outside the window, e.g. the eager "
+                        "prefill drain, which read 165.97 ms/forward on its own")
                 print(f"        draft: {tot / max(nf, 1):.2f} ms/forward "
                       f"({nf / len(direct):.2f} forwards/tick over {len(direct)} of "
                       f"{ticks} ticks) -- timed, not differenced")

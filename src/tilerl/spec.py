@@ -335,6 +335,13 @@ class DraftHead:
             lo = max(lo, base + 1)
             if hi < lo:
                 continue
+            # A block shortfall here is silent: the write lands on the wrong page and the
+            # next position attends over garbage. Both engine paths reason to this
+            # separately; this is the one place that knows `hi`.
+            assert len(r.blocks) * BLOCK_TOKENS > hi, (
+                f"draft would write position {hi} but the row owns {len(r.blocks)} "
+                f"blocks x {BLOCK_TOKENS} = {len(r.blocks) * BLOCK_TOKENS} positions "
+                f"(seq_len={r.seq_len}, draft_pos={r.draft_pos})")
             plan.append((r, lo, hi))
         if not plan:
             return
