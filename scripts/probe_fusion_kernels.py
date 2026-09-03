@@ -45,11 +45,11 @@ import json
 from pathlib import Path
 
 import torch
+from tilerl_kernels import reference
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import qwen38_27b
 from tilerl.model import _fuse_projections, _projection_groups, load_hf
-from tilerl_kernels import reference
-from tilerl_kernels.backend import get_backend
 
 
 def fmt_of(p, key) -> str | None:

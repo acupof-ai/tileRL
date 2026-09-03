@@ -32,10 +32,10 @@ from __future__ import annotations
 import argparse
 
 import torch
+from tilerl_kernels import reference
 
 from tilerl.config import qwen38_27b
 from tilerl.model import _fuse_projections, _projection_groups, load_hf
-from tilerl_kernels import reference
 
 
 def quantized(p, key) -> bool:

@@ -13,11 +13,11 @@ so a CPU parity gate would pass with it present.
 
 import pytest
 import torch
-
-from tilerl.config import qwen38_27b
 from tilerl_kernels import reference
 from tilerl_kernels.backend import get_backend
 from tilerl_kernels.registry import _resolve
+
+from tilerl.config import qwen38_27b
 
 
 def test_the_oracle_agrees_with_the_reference_rope_it_inlines():
