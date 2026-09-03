@@ -16,6 +16,7 @@ import os
 
 os.environ.setdefault("TILERL_TARGET", "cpu")
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -267,6 +268,29 @@ class _StubTrunk:
 
     def _linear(self, backend, hidden, key):
         return self.logits.unsqueeze(0)
+
+
+def test_unmapped_tensors_raise_instead_of_vanishing(tmp_path):
+    """A DFlash2 checkpoint read through the NextN map must raise, not load a
+    crippled head. The 11 conv and selector tensors mapped to None and were
+    dropped without a word; the first draft then died on a KeyError far from the
+    cause, and only because every conv weight is a direct subscript -- 19 of them,
+    no .get() anywhere. Had one been tolerant, the head would have drafted garbage.
+    """
+    _tiny_head(tmp_path)  # writes model.safetensors + config.json
+    head_file = tmp_path / "model.safetensors"
+
+    # Negative control: the correct reader takes the same file with nothing dropped.
+    from tilerl.dflash2 import _DFLASH2_TOP
+
+    ok = read_head_params(head_file, _DFLASH2_TOP)
+    assert any(k.endswith("attn_conv.proj") for k in ok), sorted(ok)[:5]
+    assert "selector.pred" in ok and "selector.succ" in ok
+
+    with pytest.raises(RuntimeError, match="map to no parameter") as e:
+        read_head_params(head_file, _DRAFT_TOP)
+    for name in ("candidate_selector", "attention_conv", "mlp_conv"):
+        assert name in str(e.value), str(e.value)
 
 
 def test_norm_fold_is_per_format(tmp_path):
