@@ -19,10 +19,11 @@ head, the ledger); TP, CP and the 128K–256K budget are under P6 below.
 |---|---|---|
 | Serving | H20 B=1 decode 92.4 tok/s (sglang bf16 54.2, Arle 84.5); B=8 0.8× sglang; prefill 0.4× | `wins/2026-08-28-decode-split-by-occupancy.md`, `wins/bench-baseline.json`, `docs/experience/2026-08-28-vs-sglang-h20.md` |
 | Accuracy | MMLU 0-shot 74.6% (1000 q, `sample` draw; the recorded 76.3% was a different 1000 questions) | `wins/2026-08-28-mmlu-letter-restricted.md`, `errors/2026-09-03-the-mmlu-slice-moved-under-the-number.md` |
-| Speculation | correct, 1.87 committed tokens per trunk forward; **loses 4.9× because a draft disables graph capture** | CHANGELOG 2026-08-29 verdict |
+| Speculation | correct, 1.87 committed tokens per trunk forward; **loses 4.9× on H20 because a draft disables graph capture**. On sm70 the draft runs eager, outside the captured tick, and costs 5.53 ms = 25% of a depth-3 tick; capturing it is rejected at a 1.14× ceiling (the tick is 88% GPU-bound). spec 49.7 tok/s at 1024 vs dense 37.6 | CHANGELOG 2026-08-29 verdict, `wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md`, `errors/2026-09-02-capturing-the-draft-is-rejected.md` |
 | Training | LoRA-AdamW and Adafactor full fine-tune run on one card (73.2 GiB); GRPO and self-OPD exist; real prompts, GSM8K reward, MMLU before/after wired | `wins/2026-08-29-full-finetune-fits.md`, `wins/2026-09-02-rl-real-task.md` |
 | RL on the 27B | **never moved a downstream metric**; the run is pending-remote (pod held by another job) | same |
-| Kernels | one TileLang tree; cpu (CI/parity), metal, sm90 executed it; 71% of kernel lines are sm90 schedules | `docs/support-matrix.md` |
+| Kernels | one TileLang tree; cpu (CI/parity), metal, sm90, sm70 executed it; 71% of kernel lines are sm90 schedules | `docs/support-matrix.md`, `wins/2026-08-29-sm70-volta-fp4-cell.md` |
+| sm70 (V100) | fp4 inference runs: decode 37.6 tok/s at 4096 ctx against a 56.1 tok/s weight-bandwidth ceiling, prefill 7.89 ms/prompt token, GEMV 746 GB/s = 83% of peak | `docs/experience/LOG-v100-sm70.md` |
 | Ledger | human-written `docs/experience/`; per-run manifests landing 2026-09-02 (P4) | — |
 
 ## P1 — RL moves a number on the 27B — needs the pod
@@ -227,7 +228,8 @@ P3 CPU half (now)     ├─► P1 (RL moves a number) ─┬─► P2.0 recaptu
 - **GDN2** — trigger: a GDN2 checkpoint in the target family
   (`docs/design-gdn2.md`).
 - **Other SMs and ROCm** — sm100/sm120 are registered and empty; sm86/89 are
-  unregistered; ROCm has no cell. Trigger: hardware in hand. The claim to make
-  then is "a new arch is a bounded job" (register a cell, run the suite, tune
-  the compute-bound kernels), not "runs everywhere".
+  unregistered; ROCm has no cell. Trigger: hardware in hand. sm70 is the one
+  case where the claim was tested rather than asserted: a new cell, the suite,
+  and the compute-bound kernels tuned — "a new arch is a bounded job", not
+  "runs everywhere".
 - **Web front end** — trigger: a second human user.

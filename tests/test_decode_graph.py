@@ -137,3 +137,28 @@ def test_the_kv_guard_measures_usable_capacity_not_the_pool():
     for eng in (on, off):  # graph off is the control: same rejection, no pad row
         with pytest.raises(ValueError, match="exceeds KV pool capacity"):
             eng.submit(big, params)
+
+
+def test_graph_keys_covers_what_a_decode_tick_keys_on():
+    """`graph_keys` is what `precapture` builds, so it must contain every key
+    `_run_decode_graph` would look up — otherwise warming succeeds, reports N
+    graphs, and a real request captures anyway (~14 s on the 27B).
+
+    That is exactly what a generate-and-hope warmup did: chain width depends on
+    the draft's confidence, so no number of generated tokens guarantees a width
+    appears, and two were left uncaptured. Runs off CUDA because it checks keys,
+    not captures; capture parity is the CUDA test above.
+    """
+    backend = get_backend()
+    cfg = tiny()
+    for max_batch in (1, 2, 4, 8):
+        e = build_engine(cfg, build_random(cfg, seed=21), backend, num_blocks=16,
+                         num_slots=max_batch + 1, max_batch=max_batch,
+                         max_total_tokens=256)
+        keys = e.graph_keys()
+        for rows in range(1, max_batch + 1):
+            assert (e._graph_bucket(rows), 1) in keys, (
+                f"max_batch={max_batch}: a {rows}-row tick keys on "
+                f"{(e._graph_bucket(rows), 1)}, which precapture would not build"
+            )
+        assert e._graph_bucket(max_batch) <= max_batch, "a bucket may not exceed max_batch"

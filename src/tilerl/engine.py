@@ -12,7 +12,9 @@ other target run eager.
 Speculation (``draft=``): a decode row drafts up to ``spec_depth`` tokens and the
 same forward verifies them. Paged KV needs no rollback (a rejected draft's slot
 is overwritten next tick); the gated-delta state does, so the verify forward
-keeps the state after every chain step (``BatchKv.keep_steps``).
+keeps the state after every chain step (``BatchKv.keep_steps``). A spec tick is
+captured too, one graph per (batch bucket, chain width) — a width first seen
+inside a timed window puts its capture in the number.
 
 Prefix reuse adopts only block-aligned hits: retain the matched blocks and
 restore the gated-delta snapshot at the boundary (state + conv1d window), keyed
@@ -44,6 +46,7 @@ from .kv_cache import (
     PagedKvPool,
     PrefixStore,
 )
+from .spec import LADDER_WIDTHS
 
 
 def _graph_on(backend, decode_graph: bool | None) -> bool:
@@ -65,17 +68,34 @@ _PHASE_DONE = 3
 _HASH_MASK = 0x7FFFFFFF
 
 
-def _quantize_draft(params: dict[str, torch.Tensor], skip: tuple[str, ...] = ()) -> \
-        dict[str, torch.Tensor]:
-    """Re-serve a draft head's [N,K] projections as block-quantized fp8. ``skip``
-    names tensors the head GATHERS rows from: shape cannot tell a [248320,256]
-    codebook from a projection, and packing one leaves a .w8 the walk cannot index."""
+def _quantize_draft(params: dict[str, torch.Tensor], skip: tuple[str, ...] = (),
+                    fp4: bool = False) -> dict[str, torch.Tensor]:
+    """Re-serve a draft head's [N,K] projections block-quantized: fp8 by default,
+    fp4 where that is the arch's only fused GEMV (sm70 has no ``linear_fp8``).
+
+    ``skip`` names tensors the head GATHERS rows from: shape cannot tell a
+    [248320,256] codebook from a projection, and packing one leaves a .w8 the
+    walk cannot index.
+
+    Idempotent: `build_engine` writes the result back into `draft.params` in
+    place, so a second engine over the same draft would otherwise re-pack the
+    already-packed `fc.wq` into `fc.wq.wq` and the plain `fc` lookup would raise
+    `KeyError: 'fc'`. One engine per process is the shipped path, but a train loop
+    or a profiler comparing configurations builds several.
+    """
     from tilerl_kernels import reference
 
+    if any(k.endswith((".wq", ".w8")) for k in params):
+        return dict(params)  # already served
     out: dict[str, torch.Tensor] = {}
     for k, v in params.items():
         if k not in skip and v.ndim == 2 and v.shape[0] >= 128 and v.shape[1] >= 128:
-            out[f"{k}.w8"], out[f"{k}.wscale"] = reference.quant_fp8(v)
+            if fp4:
+                wq, scale = reference.pack_fp4(v)
+                scale, oscale = reference.renorm_fp4_scale(scale)
+                out[f"{k}.wq"], out[f"{k}.scale"], out[f"{k}.oscale"] = wq, scale, oscale
+            else:
+                out[f"{k}.w8"], out[f"{k}.wscale"] = reference.quant_fp8(v)
         else:
             out[k] = v
     return out
@@ -168,8 +188,6 @@ class _DecodeGraph:
     H2D copies of the inputs plus one replay. Replay mutates the engine's own
     pools like the eager path; warmup writes to block 0 / slot 0 are overwritten
     before any real request reads them.
-    # ponytail: captured lazily on the first decode tick (first token pays JIT +
-    # capture); capture at engine build is the upgrade.
     # ponytail: no recapture after training — the graph bakes the f32 embed cast.
     """
 
@@ -341,10 +359,19 @@ class Engine:
                 )
             # Dense bf16 on Backend.linear's generic path was 9.7 ms per projection
             # vs 0.13 ms on the fp8 kernel; serve it the way the trunk is served.
-            served = backend.materialize(_quantize_draft(draft.params, skip=draft.no_quant))
+            # The FORMAT follows the kernel: fp8 has no sm70 cell, and quantizing
+            # to a format with no kernel routes every projection back to that
+            # generic path (120.91 ms/step against the trunk's whole 103.58 ms
+            # eager forward; fp4 measured 4.98 ms/step, 24x the dense path).
+            fp4 = not backend.has_kernel("linear_fp8")
+            served = backend.materialize(
+                _quantize_draft(draft.params, skip=draft.no_quant, fp4=fp4)
+            )
             draft.params.clear()  # in place: the head's Model holds THIS dict
             draft.params.update(served)
-            draft.attach(backend, kv_pool.num_blocks)
+            if backend.arch == "sm70":
+                self._warn_sm70_ladder(limits.max_batch, self._width)
+            draft.attach(backend, kv_pool.num_blocks, dtype=kv_pool.k_pool.dtype)
 
         self._pin = backend.device.type == "cuda"
         self._lock = threading.RLock()
@@ -369,6 +396,13 @@ class Engine:
         self._tokens_generated = 0
         self._spec_drafted = 0
         self._spec_accepted = 0
+        # Diagnostic only: set True to keep the last tick's draft and trunk
+        # logits so a probe can rank the trunk's pick inside the draft's
+        # ordering. A [rows, vocab] copy per tick, so never on in serving.
+        self._keep_draft_logits = False
+        self._draft_logits = None
+        self._trunk_logits = None
+        self._verify_chains = None
         self._finished_logprobs: dict[int, list[float]] = {}
         self._taken_logprobs: set[int] = set()
         self._last_logprobs: list[float] | None = None
@@ -489,6 +523,24 @@ class Engine:
                     "exactly one reader may have them. Record them once at that reader."
                 )
             return None
+
+    def peek(self, request_id: int) -> list[int] | None:
+        """Tokens emitted so far, or None once the request has left the queues.
+
+        Deliberately lock-free: ``step()`` holds ``_lock`` across the whole forward, so any
+        reader that took the lock would block for the entire generation (measured: one
+        blocked call covered 325 ms of a 335 ms run). Under the GIL both the writer's
+        ``output.append`` and this ``list()`` are single bytecodes, so the copy is a
+        consistent prefix -- never a torn read; a stale one is fine.
+
+        None means "no longer waiting or running", so ``_finish`` has filed it under
+        ``_finished`` or ``_failed`` and ``take()`` will answer. That is what lets a caller
+        poll here without ever touching the lock until the run is over.
+        """
+        for req in (*self._waiting, *self._running):
+            if req.req_id == request_id:
+                return list(req.output)
+        return None
 
     def take(self, request_id: int) -> list[int] | None:
         """Pop one finished request's output, or None if not finished yet."""
@@ -731,31 +783,114 @@ class Engine:
                 else:
                     pf.phase = _PHASE_DECODE
 
+    def _graph_bucket(self, rows: int) -> int:
+        """The batch dimension a tick of ``rows`` decodes keys its graph on: the
+        next bucket up, or the exact size above the ladder. `precapture` walks
+        this over every admissible row count, so the two cannot disagree about
+        which graphs exist."""
+        b = next((c for c in _GRAPH_BUCKETS if c >= rows), None)
+        return rows if b is None or self.limits.max_batch < b else b
+
+    def _graph_for(self, B: int, W: int, keep: bool) -> _DecodeGraph | None:
+        """The (B, W) graph, capturing it on first use. None (and graphs off) if
+        capture fails, so the caller runs eager."""
+        g = self._decode_graphs.get((B, W))
+        if g is not None:
+            return g
+        try:
+            if self._graph_pool is None:
+                self._graph_pool = torch.cuda.graph_pool_handle()
+            g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B,
+                             width=W, pool=self._graph_pool, keep=W if keep else 0,
+                             aux_layers=self._aux_layers)
+        except Exception as exc:
+            warnings.warn(f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback")
+            self._decode_graph_on = False
+            return None
+        self._decode_graphs[(B, W)] = g
+        return g
+
+    @staticmethod
+    def _warn_sm70_ladder(max_batch: int, w: int) -> None:
+        """The sm70 GEMV serves 1/2/4/8/32 rows and rounds up, so a verify tick's
+        B*W rows can pay for a rung it does not fill. Warn rather than clamp -- the
+        ladder is one arch's shape, not a property of speculation."""
+        if w not in LADDER_WIDTHS:
+            # depth 4 (W=5) buys an 8-row launch: 31.5 tok/s on coding against 43.8
+            # at depth 3 and 32.6 with no speculation at all. A verify tick costs
+            # 0.67 + 0.53*W dense ticks, so rounding W up is a real cost.
+            warnings.warn(
+                f"verify width {w} is not an sm70 rung; it rounds up to "
+                f"{next(x for x in LADDER_WIDTHS if x >= w)} rows. Use depth "
+                f"{max(x for x in LADDER_WIDTHS if x <= w) - 1} or "
+                f"{next(x for x in LADDER_WIDTHS if x > w) - 1}",
+                stacklevel=3,
+            )
+        rows = max_batch * w
+        if rows > max(LADDER_WIDTHS):
+            # Past the top rung the dispatch chunks at 32, so a wide batch costs
+            # extra launches rather than extra per-row time.
+            warnings.warn(
+                f"max_batch={max_batch} x verify width {w} = {rows} rows exceeds the sm70 "
+                f"ladder's top rung ({max(LADDER_WIDTHS)}); a full batch verifies in "
+                f"{-(-rows // 32)} launches per layer",
+                stacklevel=3,
+            )
+        elif rows not in LADDER_WIDTHS:
+            # Between rungs is worse than past the top: the launch pays for the whole
+            # rung. A padding row costs 3.3x the useful work layered on a real one
+            # (7.53 vs 2.29 ms), so B=4 depth 3 -- 16 rows on the 32 rung -- measures
+            # 42.7 tok/s where B=8's full rung gets 75.0.
+            rung = next(x for x in LADDER_WIDTHS if x > rows)
+            # Only advise a batch when the width divides the rung: at W=3 NO batch
+            # lands on a rung, and rung // w would name one that also pads.
+            fix = f"; use max_batch={rung // w} to fill it" if rung % w == 0 else ""
+            warnings.warn(
+                f"max_batch={max_batch} x verify width {w} = {rows} rows launches the "
+                f"{rung}-row rung, so {rung - rows} of every {rung} rows are padding{fix}",
+                stacklevel=3,
+            )
+
+    def graph_keys(self) -> set[tuple[int, int]]:
+        """Every (bucket, width) a decode tick can key on under these limits."""
+        widths = range(1, 2 + self._spec_depth) if self._draft is not None else (1,)
+        return {(self._graph_bucket(rows), w)
+                for rows in range(1, self.limits.max_batch + 1) for w in widths}
+
+    def precapture(self) -> int:
+        """Capture every graph a decode tick can ask for; return how many exist.
+
+        Capture costs ~14 s each and, until a graph exists, that tick IS the
+        capture rather than a replay — 1088 ms/token on a cold server against 26
+        warm. Waiting for real traffic to produce each width is a lottery: chain
+        width varies per tick because the draft's confidence truncates it, so a
+        warmup that merely generated tokens left two widths uncaptured and the
+        first two requests paid 14 s and 12 s. `graph_keys` enumerates instead.
+        """
+        if not self._decode_graph_on:
+            return 0
+        for B, W in sorted(self.graph_keys()):
+            # keep matches the tick that will use this graph: W>1 is a verify
+            # (chains present, keep=W), W==1 is a plain decode (chains None).
+            if self._graph_for(B, W, keep=W > 1) is None:
+                break  # capture failed: graphs are off now
+        return len(self._decode_graphs)
+
     def _run_decode_graph(self, reqs: list[_Req], chains=None) -> bool:
         """Captured decode for a pure-decode tick, one graph per size bucket (a
         graph per exact size OOMed B=64 on the drain). Returns False and flips
         the flag off when capture failed, so the caller runs eager."""
         n, W = len(reqs), len(chains[0]) if chains else 1
-        B = next((c for c in _GRAPH_BUCKETS if c >= n), None)
-        if B is None or self.limits.max_batch < B:
-            B = n  # above the ladder: one exact-size graph rather than none
+        B = self._graph_bucket(n)
         if n < B and self._pad_slot is None:
-            B = n  # nothing reserved to park padding rows on: exact size
-        g = self._decode_graphs.get((B, W))
-        if g is None:
             try:
-                if self._graph_pool is None:
-                    self._graph_pool = torch.cuda.graph_pool_handle()
-                g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B,
-                                 width=W, pool=self._graph_pool, keep=W if chains else 0,
-                                 aux_layers=self._aux_layers)
-            except Exception as exc:
-                warnings.warn(
-                    f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback"
-                )
-                self._decode_graph_on = False
-                return False
-            self._decode_graphs[(B, W)] = g
+                self._pad_slot = self._states.alloc_slot()
+                self._pad_block = self._kv.alloc_block()
+            except RuntimeError:
+                B = n  # no spare capacity to park padding rows on: exact size
+        g = self._graph_for(B, W, keep=bool(chains))
+        if g is None:
+            return False
         pad = None if self._pad_slot is None else (self._pad_slot, self._pad_block)
         logits = g.run(reqs, chains, pad=pad)
         self._decode_forwards += 1
@@ -782,6 +917,9 @@ class Engine:
         unspeculated arm uses. That is the guarantee; the token is NOT
         bit-identical to the unspeculated one, because a W>1 tile and a W=1
         tile do not agree bit-for-bit off the CPU reference."""
+        if self._keep_draft_logits:  # rank of the trunk's pick in the draft's order
+            self._trunk_logits = logits.detach().clone()
+            self._verify_chains = [list(c) for c in chains]
         flat = [
             (r, logits[i, j], len(r.output) + j)
             for i, r in enumerate(rows)
@@ -896,8 +1034,15 @@ class Engine:
     def _loop(self) -> None:
         while not self._wake.is_set():
             with self._lock:
-                busy = bool(self._running or self._waiting)
-            if busy:
+                has_running = bool(self._running)
+                has_waiting = bool(self._waiting)
+            if has_running or has_waiting:
+                # Batch concurrent submissions: a burst of HTTP requests
+                # arrives over ~10ms. Without this window the first one
+                # starts a prefill alone and the rest land in eager mixed
+                # ticks (decode graph off, ~10x slower per tick).
+                if not has_running and has_waiting:
+                    self._wake.wait(0.01)
                 try:
                     self.step()
                 except Exception:
@@ -937,6 +1082,12 @@ def build_engine(
         cfg.head_dim,
         device=backend.device,
         layer_map=cfg.full_attn_layers,
+        # Match the attention kernel's IO dtype. sm70's is f32, and a bf16 pool
+        # made every attention call cast the WHOLE plane (all num_blocks, not
+        # the live ones): 4.71 ms/token, 14% of a 4096-ctx token, independent of
+        # context. Same trade the state pool makes below. getattr: test doubles
+        # stand in for Backend without declaring an io dtype.
+        dtype=getattr(backend, "io", torch.bfloat16),
     )
     state_pool = LinearStatePool(
         num_slots + pad,
@@ -949,7 +1100,14 @@ def build_engine(
         conv_dim=cfg.linear_qkv_dim,
         spec_steps=draft.width if draft is not None else 0,
     )
-    store = PrefixStore(kv_pool) if prefix_store is None else prefix_store
+    # A resident store entry owns a GDN state snapshot in HBM (144 MiB at 27B f32)
+    # and a decode publishes one every BLOCK_TOKENS, so the store's byte budget must
+    # fit the card: the 8 GiB default is most of a 32 GB V100's post-weights headroom.
+    # Spend a quarter of what is still free after weights and pools.
+    kw = {}
+    if backend.device.type == "cuda":
+        kw["state_bytes"] = int(torch.cuda.mem_get_info()[0] // 4)
+    store = PrefixStore(kv_pool, **kw) if prefix_store is None else prefix_store
     return Engine(
         model,
         backend,

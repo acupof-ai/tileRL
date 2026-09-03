@@ -46,16 +46,30 @@ def _build_model(
     )
 
 
-def _build_engine(cfg, model, backend, devices=None):
-    """Serving-size engine; ``devices`` replicates it across those CUDA indices."""
+def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16,
+                  blocks=0, max_ctx=0, max_batch=8):
+    """Serving-size engine; ``devices`` replicates it across those CUDA indices.
+
+    ``max_ctx`` caps the served context and ``blocks`` the KV pool. Both default
+    to the model's own limit, which for the 27B is 262144 tokens = 131072 blocks
+    = 275 GB of f32 KV — fine on the 96 GB card this was written for, an instant
+    OOM on a 32 GB V100. The bench scripts always passed num_blocks explicitly,
+    so ``serve`` was the one path that never saw the real number.
+
+    ``slots`` sizes the GDN state pool; with a draft each slot also owns
+    spec_steps of step-state, so a 32 GB card needs 4, not 16. The block default
+    follows ``max_batch`` — the pool only has to hold rows admittable at once.
+    """
     from . import engine as engine_mod
     from .kv_cache import BLOCK_TOKENS
 
     # Token budget follows the context; ByteTokenizer makes one token per byte.
-    ctx = int(cfg.max_position_embeddings)
+    ctx = int(max_ctx or cfg.max_position_embeddings)
 
-    kw = dict(num_blocks=max(256, (ctx * 8) // BLOCK_TOKENS), num_slots=16,
-              max_batch=8, max_total_tokens=ctx)
+    kw = dict(num_blocks=blocks or max(256, (ctx * max_batch) // BLOCK_TOKENS), num_slots=slots,
+              max_batch=max_batch, max_total_tokens=ctx)
+    if draft is not None:
+        kw["draft"], kw["spec_depth"] = draft, depth
     if not devices:
         return engine_mod.build_engine(cfg, model, backend, **kw)
 
@@ -81,12 +95,26 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     backend = get_backend()
     cfg, model = _build_model(args.model, seed=0, fuse_projections=True)
-    engine = _build_engine(cfg, model, backend, devices=args.devices)
+    draft = None
+    if args.draft:
+        from .spec import load_draft
+
+        draft = load_draft(model, args.draft)
+    engine = _build_engine(cfg, model, backend, devices=args.devices,
+                           draft=draft, depth=args.depth, slots=args.slots,
+                           blocks=args.blocks, max_ctx=args.max_ctx,
+                           max_batch=args.max_batch)
     tokenizer = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
-    engine.run()
     print(f"tilerl serve: model={cfg.name} target={backend.target}")
+    if args.warmup:
+        # One capture per (bucket x chain width); generating tokens instead is a
+        # lottery with no floor, since the draft's confidence sets each width.
+        t0 = time.perf_counter()
+        n = engine.precapture()
+        print(f"tilerl serve: {n} decode graphs in {time.perf_counter() - t0:.0f}s")
+    engine.run()
     print(f"tilerl serve: http://{args.host}:{args.port}  (Ctrl+C to stop)")
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
@@ -431,6 +459,32 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "the others down while HTTP keeps answering; for independent endpoints "
                               "run one process per card under CUDA_VISIBLE_DEVICES instead.",
                          type=lambda v: _devices(v) if v else [])
+    p_serve.add_argument("--draft", help="MTP/NextN head safetensors: speculative decode. For "
+                                        "Qwen3.8-27B-NVFP4 the mtp.* keys all live in "
+                                        "model-00018-of-00018.safetensors, so pass that shard.")
+    p_serve.add_argument("--depth", type=int, default=3,
+                         help="drafts per row per tick; 3 fills the sm70 verify ladder's "
+                              "4-row rung exactly (spec.LADDER_WIDTHS) — 4 spills to the "
+                              "8-row rung and measured slower than no speculation")
+    p_serve.add_argument("--slots", type=int, default=16,
+                         help="GDN state slots; lower on <40GB GPUs (with --draft each slot "
+                              "also owns the per-step verify states)")
+    p_serve.add_argument("--blocks", type=int, default=0,
+                         help="KV blocks (16 tokens each); 0 = size from the model's context. "
+                              "The 27B's 262144-token context asks for 131072 blocks = 275 GB "
+                              "of f32 KV, so a 32GB card needs this set: 512 serves one 4K "
+                              "request with slack, 2048 serves 8 rows at 4K")
+    p_serve.add_argument("--max-ctx", type=int, default=0,
+                         help="cap served context (0 = the model's own limit); pairs with "
+                              "--blocks so a request cannot outgrow the pool")
+    p_serve.add_argument("--max-batch", type=int, default=8,
+                         help="concurrent rows; drop to 2 for a single-user endpoint (a decode "
+                              "graph is captured per bucket x chain width, so a lower "
+                              "ceiling is fewer captures)")
+    p_serve.add_argument("--no-warmup", dest="warmup", action="store_false",
+                         help="skip precapturing the decode graphs; the first real messages "
+                              "then pay for them (1088 ms/token falling to 26 over six "
+                              "requests on sm70)")
     p_serve.set_defaults(func=cmd_serve)
 
     p_train = sub.add_parser("train", help="SFT, --rl (GRPO) or --opd; --recipe for a gated flag set")

@@ -896,7 +896,7 @@ class _OracleDraft(DraftHead):
         self.width = 3
         self.has_confidence = False
 
-    def forward(self, hidden, ids, positions, kv, backend, hidden_out=None):
+    def forward(self, hidden, ids, positions, kv, backend, hidden_out=None, last_only=False):
         pos = np.atleast_2d(np.asarray(positions))
         logits = torch.zeros(*pos.shape, self.cfg.vocab_size, device=backend.device)
         for i in range(pos.shape[0]):
@@ -904,6 +904,12 @@ class _OracleDraft(DraftHead):
                 logits[i, j, self.expected.get(int(pos[i, j]) + 1, 0)] = 10.0
         if hidden_out is not None:
             hidden_out.append(torch.as_tensor(hidden))
+        # Mirror DraftHead: reduce AFTER hidden_out, so the caller's [:, :1] read is
+        # the row it asked for and not position 0 of a full-width block.
+        if last_only is not False and logits.shape[1] > 1:
+            idx = ([logits.shape[1] - 1] * logits.shape[0] if last_only is True
+                   else [n - 1 for n in last_only])
+            logits = logits[torch.arange(logits.shape[0]), torch.tensor(idx)].unsqueeze(1)
         return logits
 
     def confidence(self, hidden, probs, backend):
@@ -983,13 +989,16 @@ def test_engine_draft_matches_full_context_draft(rows, plen, batched_tokens, dep
     step = {"n": 0}
     inner = draft.forward
 
-    def spy(hidden, ids, positions, kv, be, hidden_out=None):
-        out = inner(hidden, ids, positions, kv, be, hidden_out=hidden_out)
+    def spy(hidden, ids, positions, kv, be, hidden_out=None, last_only=False):
+        out = inner(hidden, ids, positions, kv, be, hidden_out=hidden_out,
+                    last_only=last_only)
         # chain step 0 on full-batch ticks only: later steps consume the draft's
         # own hidden, and a partial batch would shift row -> request
         if step["n"] % max(depth, 1) == 0 and out.shape[0] == rows:
             pos = np.asarray(positions)
             for i in range(rows):
+                # out[i, -1] is the last valid row either way: with last_only the
+                # readout is already reduced to it, without it T-1 is that position.
                 seen[i] = (int(pos[i][-1]), out[i, -1].detach().float().clone())
         step["n"] += 1
         return out
@@ -1126,6 +1135,212 @@ def test_verify_commits_the_trunks_own_draw():
     # coverage: the whole chain was accepted at least once, so the top plane was adopted
     assert max(deep) == depth, f"deepest plane adopted was {max(deep)}, not {depth}"
     assert outs == [base] * 3, "a reused slot changed the output"
+def test_a_verify_tick_submits_batch_times_width_rows():
+    """A bench that submits ONE request measures W rows, not B*W, and the sm70 rung
+    is chosen on rows: at B=1 depth 3 is 4 rows (rung 4, ncols=2 off) while serving's
+    B=4 is 16 (rung 32, on). A spec A/B run that way compared a kernel against itself
+    and read a flat 0.995-1.000x as "a wash" —
+    errors/2026-09-03-the-spec-ncols-ab-ran-at-b1.md. Assert the row count the engine
+    really submits, per concurrent request count, so the two cannot be confused again."""
+    import tilerl.engine as eng
+
+    cfg = tiny()
+    model = build_random(cfg, seed=7)
+    expected = dict(enumerate(range(3, 40)))
+    seen: list[int] = []
+    orig = eng.Engine._run_forward
+
+    def spy(self, decodes, prefills, chunks):
+        if decodes and not prefills:
+            seen.append(len(decodes) * (1 + len(decodes[0].drafts)))
+        return orig(self, decodes, prefills, chunks)
+
+    engine = build_engine(
+        cfg, model, get_backend(), num_blocks=32, num_slots=4, max_batch=4,
+        max_total_tokens=512, draft=_OracleDraft(cfg, expected), spec_depth=3,
+    )
+    eng.Engine._run_forward = spy
+    try:
+        rids = [engine.submit([3, 4, 5, 6], SamplingParams(temperature=0.0,
+                                                           max_new_tokens=12, seed=0))
+                for _ in range(4)]
+        _drain(engine, rids, max_new_tokens=12)
+    finally:
+        eng.Engine._run_forward = orig
+
+    assert seen, "no pure-decode tick ran"
+    # 4 concurrent rows at width <=4: a full tick is 16 rows, never the 4 a B=1 run sees.
+    assert max(seen) > 4, f"widest tick was {max(seen)} rows: this is a B=1 measurement"
+    assert max(seen) <= 16, f"tick exceeded max_batch*(1+depth): {max(seen)}"
+
+
+def test_a_padded_decode_tick_needs_a_spare_state_slot():
+    """A tick with fewer rows than its graph bucket permanently reserves one state slot
+    for the padding rows (engine.py:827) out of the same pool, and never returns it. So
+    num_slots == max_batch leaves max_batch-1 for requests and the next submit() raises
+    "LinearStatePool exhausted" — which killed two 10-minute pod runs, because the engine
+    swallows its own failure (`except RuntimeError: B = n`) and only the caller sees it.
+    Pure bookkeeping, so it runs on the CPU target where no graph is ever captured."""
+    from pathlib import Path
+
+    from tilerl.engine import _GRAPH_BUCKETS
+    def bucket(rows: int, max_batch: int) -> int:
+        b = next((c for c in _GRAPH_BUCKETS if c >= rows), None)
+        return rows if b is None or max_batch < b else b
+
+    # A batch draining one request at a time hits n = max_batch-1, which pads at 4.
+    pads = {n: n < bucket(n, 4) for n in (1, 2, 3, 4)}
+    assert pads[3], f"n=3 must pad into the 4 bucket, else this test guards nothing: {pads}"
+    assert not pads[4], f"a full batch must not pad: {pads}"
+
+    # So any harness sizing num_slots == max_batch is one slot short. bench_ctx_decode.py
+    # is the one that was, twice; assert its sizing keeps room for the pad row.
+    src = (Path(__file__).resolve().parent.parent / "scripts/bench_ctx_decode.py").read_text()
+    assert "slots = b + 2" in src, "bench_ctx_decode must size num_slots above max_batch"
+    assert "num_slots=slots, max_batch=b" in src, "bench_ctx_decode must pass them apart"
+
+
+def test_a_batch_between_rungs_warns_about_its_padding():
+    """B*W strictly between two sm70 rungs launches the whole upper rung, and a padding
+    row costs 3.3x the useful work on a real one (7.53 vs 2.29 ms measured), so the
+    shipped max_batch=4 at depth 3 -- 16 rows on the 32 rung -- gets 42.7 tok/s where
+    B=8's full rung gets 75.0. The old guard only fired PAST the top rung, so the entire
+    3..7 band was silent. Pure arithmetic over LADDER_WIDTHS: runs on the CPU target,
+    where the sm70 dispatch this describes never executes."""
+    from pathlib import Path
+
+    from tilerl.spec import LADDER_WIDTHS
+
+    def rung(rows):
+        return next((w for w in LADDER_WIDTHS if w >= rows), None)
+
+    # The band the old guard missed: every one of these pays for 32 rows.
+    for b in range(3, 8):
+        rows = b * 4
+        assert rows not in LADDER_WIDTHS, f"max_batch={b} would be silent by design"
+        assert rung(rows) == 32, f"max_batch={b}: {rows} rows -> {rung(rows)}"
+
+    # Negative controls: the two batch sizes that fill a rung must stay silent, or the
+    # warning fires on the config it is telling people to use.
+    assert rung(2 * 4) == 8 and 8 in LADDER_WIDTHS, "max_batch=2 fills the 8 rung"
+    assert rung(8 * 4) == 32 and 32 in LADDER_WIDTHS, "max_batch=8 fills the 32 rung"
+
+    # The suggestion the guard prints must itself fill the rung, not restate the problem.
+    src = (Path(__file__).resolve().parent.parent / "src/tilerl/engine.py").read_text()
+    assert "rows not in LADDER_WIDTHS" in src, "engine must warn between rungs, not only past the top"
+    assert "are padding" in src, "the warning must say how much of the launch is wasted"
+
+    # A suggestion is only possible when the verify width DIVIDES the rung. Depth 3 (W=4)
+    # does, which is why testing only depth 3 hid this: at depth 2 (W=3) NO batch lands on
+    # a rung, and `rung // W` names 10 -- 30 rows, which pads too. The guard must stay
+    # silent there and let the depth warning carry it.
+    for depth, expect_fix in ((1, True), (2, False), (3, True), (7, True)):
+        w = 1 + depth
+        between = [b for b in range(2, 12) if (b * w) not in LADDER_WIDTHS and b * w < 32]
+        assert between, f"depth={depth}: nothing in the padding band to check"
+        for b in between:
+            up = next(x for x in LADDER_WIDTHS if x > b * w)
+            fills = up % w == 0
+            assert fills == expect_fix, f"depth={depth} max_batch={b}: divisibility {fills}"
+            if fills:
+                assert (up // w) * w in LADDER_WIDTHS, f"depth={depth}: suggestion still pads"
+    assert 'if rung % w == 0 else ""' in src, "the guard must withhold an impossible suggestion"
+
+
+def test_the_sm70_split_count_follows_the_query_width():
+    """backend.py picks KVSPLIT by query width, and the two constraints sit at opposite
+    ends: 32 splits are 1.20x faster at S=1 (205.1 vs 246.5 us, ctx=4096) where PO is
+    3 MiB, and by S=32 the two are 1.005x apart while PO reaches 1.500 GiB and OOMs a
+    32 GB card at B=8 ctx=512. So a narrow tick must get 32 and a wide one 16, and the
+    threshold must sit above the widest verify a spec tick submits -- at depth 7, S=8.
+    Reads the source: the dispatch is sm70-only and never executes on the CPU target."""
+    from pathlib import Path
+
+    from tilerl_kernels.registry import (
+        _SM70_KERNELS,
+        SM70_KVSPLIT,
+        SM70_KVSPLIT_WIDE,
+        sm70_kvsplit,
+    )
+
+    assert SM70_KVSPLIT_WIDE < SM70_KVSPLIT, "the wide tick must be the one that saves bytes"
+
+    def po_gib(s, ks):  # 8 rows, 24 heads, D=256, f16 -- the shape that OOMed
+        return 8 * s * 24 * ks * 256 * 2 / 1024**3
+
+    # Call the shipped rule, don't restate it: a copy here would pass while backend drifts.
+    assert sm70_kvsplit(1) == SM70_KVSPLIT, "decode must keep the faster split count"
+    assert sm70_kvsplit(4) == SM70_KVSPLIT, "a depth-3 verify is still narrow"
+    assert sm70_kvsplit(512) == SM70_KVSPLIT_WIDE, "a prefill-width tick must halve PO"
+    # The threshold has to clear every verify width the ladder can submit, or a spec
+    # tick silently takes the slower kernel. Depth 7 is the widest, S=8.
+    assert sm70_kvsplit(1 + 3) == SM70_KVSPLIT, "depth 3 (S=4) must stay on the narrow count"
+    # And it must actually fix the failing case, not merely differ from it.
+    assert po_gib(512, sm70_kvsplit(512)) == 0.75, f"wide PO is {po_gib(512, sm70_kvsplit(512))}"
+    assert po_gib(512, SM70_KVSPLIT) == 1.5, "the shipped narrow count is what OOMed"
+
+    # The registry must hand over bare factories: a closure that pins KVSPLIT swallows
+    # the call site's choice with a TypeError, which is how this was wired before.
+    import inspect
+
+    for name in ("paged_attention_split", "paged_attention_split_combine"):
+        sig = inspect.signature(_SM70_KERNELS[name])
+        assert "KVSPLIT" in sig.parameters, f"{name} must accept KVSPLIT from the call site"
+
+    src = (
+        Path(__file__).resolve().parent.parent
+        / "packages/tilerl-kernels/src/tilerl_kernels/backend.py"
+    ).read_text()
+    assert "KVSPLIT=ks" in src, "backend must pass the chosen split count to both kernels"
+    assert src.count("KVSPLIT=ks") == 2, "split and combine must agree, or the ABI asserts"
+
+
+def test_the_draft_readout_reduction_picks_the_last_valid_row():
+    """`last_only` cuts the draft readout from [rows, T, vocab] to [rows, 1, vocab] --
+    1.41 GiB down to 7.6 MiB at B=8 ctx=512, which is the difference between OOM and
+    running. It must select the LAST VALID position per row, and the existing parity
+    test cannot check that: its spy reads out[i, -1] AFTER the reduction, so a wrong
+    index inside the reduction is compared against whatever that index chose. Picking
+    row 0 passes all four parity cases.
+
+    This drives the real DraftHead.forward twice on identical input and asserts the
+    reduced readout equals the full-width one at the row it claims."""
+    cfg, model = _build_model("tiny", seed=0)
+    backend = get_backend()
+    draft = _random_draft(cfg, 21, model)
+
+    toks = [3, 4, 5, 6, 7, 8]
+    n = len(toks) - 1
+    hid: list = []
+    model.forward(np.array([toks]), np.arange(len(toks)),
+                  _training_kv(model, 1, len(toks), device=backend.device),
+                  backend, hidden_out=hid, last_only=False)
+    nblk = -(-n // BLOCK_TOKENS) + 1
+
+    def run(**kw):
+        kv = BatchKv(
+            block_table=torch.arange(nblk, dtype=torch.long).reshape(1, nblk),
+            seq_len=torch.tensor([n]), state_slot=torch.zeros(1, dtype=torch.long),
+            kv_pool=PagedKvPool(nblk, cfg.num_kv_heads, cfg.head_dim, num_layers=1,
+                                device=backend.device, layer_map=(0,)),
+            state_pool=None, seq_q_lens=torch.tensor([n]),
+        )
+        return draft.forward(hid[-1][:, :n], np.array([toks[1:]]),
+                             np.arange(1, n + 1), kv, backend, **kw)
+
+    full = run()
+    assert full.shape[:2] == (1, n), full.shape
+    # Positions must differ, or "picked the right row" is unfalsifiable.
+    assert not torch.allclose(full[:, 0], full[:, n - 1], atol=1e-4), \
+        "this head gives every position the same logits; the test proves nothing"
+
+    for want, kw in ((n - 1, {"last_only": True}), (n - 2, {"last_only": [n - 1]})):
+        got = run(**kw)
+        assert got.shape == (1, 1, full.shape[-1]), got.shape
+        assert torch.allclose(got[0, 0], full[0, want], atol=1e-3), (
+            f"{kw}: reduction returned argmax {int(got[0, 0].argmax())}, "
+            f"position {want} has {int(full[0, want].argmax())}"
+        )
 
 
 def test_generate_fans_a_corpus_across_workers(tmp_path):

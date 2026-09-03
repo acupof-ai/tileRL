@@ -526,7 +526,7 @@ def make_gdn_chunk_o(target: str, block_DK: int = 128, block_DV: int = 128,
     return gdn_chunk_o
 
 
-def make_gdn_decode_fused(target: str):
+def make_gdn_decode_fused(target: str, out_dtype: str = "bfloat16"):
     """Fused GDN decode core over TT tokens per row, one launch: conv1d + SiLU +
     q/k L2-norm + decay-first delta recurrence + gated RMSNorm + z-gate. One
     block per (value head, batch); thread tv owns state column S[:, tv], carried
@@ -534,7 +534,9 @@ def make_gdn_decode_fused(target: str):
     ``ks`` > 0 (speculative verify) also keeps the state and window after each of
     the first ks tokens, which is what lets a TT>1 tick skip the gather/scatter.
     Ported from tilelang examples/gdn/qwen36_gdr_decode_fused.py
-    (branch feat/qwen36-gdn-megakernel), f32 IO, time-major conv window."""
+    (branch feat/qwen36-gdn-megakernel), f32 IO, time-major conv window.
+    ``out_dtype`` is out_proj's input dtype: bf16 on sm90, f32 on sm70, which
+    cannot codegen a bf16 load."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def gdn_decode_fused(
@@ -566,7 +568,7 @@ def make_gdn_decode_fused(target: str):
         # ks=0 leaves these unwritten; the caller aliases them onto States/Windows
         StepStates: T.Tensor((S, L, KS, NVH, K, V), "float32")
         StepWindows: T.Tensor((S, L, KW, KER - 1, QKVD), "float32")
-        Out = T.empty((B, TT, VD), "bfloat16")  # out_proj (fp8 GEMV) reads bf16
+        Out = T.empty((B, TT, VD), out_dtype)  # out_proj's IO dtype
         with T.Kernel(NVH, B, threads=threads) as (vh, bb):
             tv = T.get_thread_binding(0)
             slot = Slots[bb]
@@ -676,7 +678,7 @@ def make_gdn_decode_fused(target: str):
                 T.tvm_storage_sync("shared")
                 gate = Z[bb, t, vh * V + tv]
                 Out[bb, t, vh * V + tv] = T.cast(
-                    out_s[tv] * rms_s[0] * NormW[tv] * (gate * T.sigmoid(gate)), "bfloat16"
+                    out_s[tv] * rms_s[0] * NormW[tv] * (gate * T.sigmoid(gate)), out_dtype
                 )
 
             for j in T.serial(K):

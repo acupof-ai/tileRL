@@ -20,8 +20,34 @@ import torch
 from .kv_cache import BLOCK_TOKENS, BatchKv
 
 #: One trunk verify forward = fixed + per-row cost, ms. agent-infer's H20 numbers.
+#: sm70 is a staircase, not a line: the GEMV ladder rounds verify width up to a
+#: rung, so at ctx 1024 verify costs w<=2 36.58, w<=4 49.87, w<=8 68.46 ms, one
+#: draft forward 5.53 (errors/2026-09-01-spec-depth-is-a-staircase-not-a-line.md,
+#: wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md). Those components rebuild
+#: the end-to-end tick to 3-7% at W=2/4/8, so depth moves TWO terms: one more draft
+#: forward (5.53 ms, flat) plus a wider verify (4.65-6.64 ms/W, falling as rungs
+#: absorb it) -- do not price it as one.
+#: H20 constants, and repricing them for sm70 is NOT the fix -- the cost's SHAPE is
+#: wrong here, not its scale. engine.py pads every chain to max(len) and the ladder
+#: rounds B*W up, so a trim between two widths sharing a rung saves nothing (W=3 and
+#: W=4 collide at B=1 and at B=4 alike); only W<=2 is a cheaper rung. The measured
+#: price would cut W=4 at acceptance p~=0.92, just below the recorded 84.4%, exactly
+#: where the end-to-end numbers say W=4 earns 1.157-1.228x
+#: (errors/2026-09-03-repricing-verify-lens-was-the-wrong-fix.md).
+#: ponytail: H20 line on a staircase cost. The sm70 line 0.670 + 0.5265*W is fitted
+#: at B=1 (bench_ctx_decode.py submits one request), so its W is a chain width and
+#: not a launched-row count -- re-measure the slope at B=4 before pricing a trim with
+#: it, or the rung and the line are on different axes.
 BIAS_MS = 211.0
 ROW_MS = 0.53
+
+#: Verify widths the sm70 M-ladder serves without padding waste. A width
+#: between rungs pays the next rung's full price: depth 5 (W=6) costs the same
+#: 8-row launch as depth 7 (W=8), which measured 10% SLOWER than depth 3 on the
+#: one workload where every draft is accepted. 32 is the top rung, and it is
+#: no longer a cliff — X is pre-packed f16 there too, 29-36 us/row against the
+#: 122-128 it cost when the flag stopped at 8.
+LADDER_WIDTHS = (1, 2, 4, 8, 32)
 
 
 def survival(confidences: list[float]) -> list[float]:
@@ -36,7 +62,12 @@ def verify_lens(
     survivals: list[list[float]], bias_ms: float = BIAS_MS, row_ms: float = ROW_MS
 ) -> list[int]:
     """Per-request draft-keep lengths maximizing verify goodput. ``survivals[r]``
-    is monotone decreasing, so one global cut yields a prefix per request."""
+    is monotone decreasing, so one global cut yields a prefix per request.
+
+    Prices a tick as ``bias_ms + row_ms * rows`` -- the H20 shape. sm70 instead pays
+    a staircase in the WIDEST chain, so the two disagree about the optimal cut; see
+    the module constants.
+    """
     eps = 1e-6
     r = len(survivals)
     flat = sorted((p for s in survivals for p in s if p >= eps), reverse=True)
@@ -61,6 +92,57 @@ if __name__ == "__main__":  # runnable check
     assert verify_lens([[1e-9, 1e-9]]) == [0]
     lens = verify_lens([[0.99, 0.9, 0.2], [0.3, 0.05, 0.01]], bias_ms=1.0, row_ms=0.1)
     assert lens[0] >= lens[1], lens
+
+    # A trim only pays on sm70 if it changes the RUNG, not the width: engine.py pads to
+    # max(len) and B*W rounds up, so a trim between two widths sharing a rung buys
+    # nothing. True at B=1 (W=3 and W=4 both launch 4 rows) and at B=4 (both 32), which
+    # is what makes repricing the constants the wrong fix. Fails if LADDER_WIDTHS changes.
+    for B, collide, cheap in ((1, 4, 2), (4, 32, 8)):
+        rung = {w: next(x for x in LADDER_WIDTHS if x >= B * w) for w in (1, 2, 3, 4)}
+        assert rung[3] == rung[4] == collide, f"B={B}: W=3 and W=4 must share a rung: {rung}"
+        assert rung[2] == cheap, f"B={B}: W=2 must be a cheaper rung: {rung}"
+
+    # The profiled components must still rebuild the end-to-end tick, or the two-term
+    # story above is stale. verify(W) + (W-1) draft forwards, against the measured line
+    # 0.670 + 0.5265*W dense ticks of 23.7 ms (ctx 1024). Held to 3-7% when written.
+    VERIFY_MS = {2: 36.58, 4: 49.87, 8: 68.46}  # measured staircase, rung -> ms
+    DRAFT_MS = 5.53
+    for w, verify_ms in VERIFY_MS.items():
+        parts = (verify_ms + (w - 1) * DRAFT_MS) / 23.7
+        line = 0.670 + 0.5265 * w
+        assert abs(parts / line - 1) < 0.10, f"W={w}: parts {parts:.3f} vs line {line:.3f}"
+
+    # Block-parallel drafting is rejected because WIDER is worse here, and that is
+    # arithmetic over this ladder plus the staircase above -- so it belongs next to
+    # them and breaks if either moves. A block head pays ONE draft forward at any k,
+    # which is the whole mechanism; the suffix decays 0.79 per position (DSpark's own
+    # measured [72,57,45]) off our p=0.881 (inverted from the measured 3.34 tok/fwd).
+    # k=3 is the optimum at 1.016x, and k=7 -- the width block-parallel makes cheap --
+    # falls to 0.818x, because rung 4 -> 8 costs 18.59 ms for +0.213 tok/forward.
+    # Negative control run: price rung 8 at rung 4's 49.87 ms (the "wider is free" world
+    # the mechanism assumes) and the optimum moves to k=7 at 54.9 tok/s, tripping both
+    # assertions below -- so they are load-bearing on the staircase, not tautologies.
+    # errors/2026-09-03-block-parallel-drafting-is-1.016x-on-sm70.md
+    def _tok_per_fwd(k, p=0.8808, decay=0.79):
+        total, carry = 1.0, 1.0
+        for i in range(k):
+            carry *= p * decay**i
+            total += carry
+        return total
+
+    rates = {}
+    for k in (2, 3, 4, 5, 6, 7):
+        rung = next(x for x in LADDER_WIDTHS if x >= 1 + k)
+        if rung in VERIFY_MS:
+            rates[k] = _tok_per_fwd(k) * 1000 / (VERIFY_MS[rung] + DRAFT_MS)
+    assert max(rates, key=rates.get) == 3, f"k=3 must stay the optimum: {rates}"
+    assert rates[7] < rates[3], (
+        f"the go-wider gift must stay negative: k=7 {rates[7]:.1f} vs k=3 {rates[3]:.1f} tok/s"
+    )
+    assert rates[3] / 50.3 < 1.03, (
+        f"block-parallel's margin must stay inside the 1.16% noise floor: "
+        f"{rates[3] / 50.3:.3f}x of the measured 50.3 tok/s"
+    )
     print("spec: verify_lens OK", lens)
 
 
@@ -81,16 +163,18 @@ class DraftHead:
         if depth is not None:
             self.width = depth + 1
 
-    def attach(self, backend, num_blocks: int) -> None:
+    def attach(self, backend, num_blocks: int, dtype=None) -> None:
         """The draft KV plane spans the trunk's whole block space, so the head attends
         over the same prefix the trunk does (a chain-local block dropped acceptance
-        from 84.4% to 55.8%)."""
+        from 84.4% to 55.8%). ``dtype`` mirrors the trunk pool: the pool dtype IS the
+        attention kernel's ABI, and sm70 runs f32 IO."""
         from .kv_cache import PagedKvPool
 
         self.backend = backend
+        kw = {} if dtype is None else {"dtype": dtype}
         self.kv = PagedKvPool(num_blocks, self.cfg.num_kv_heads, self.cfg.head_dim,
                               num_layers=self.cfg.num_layers, device=backend.device,
-                              layer_map=tuple(range(self.cfg.num_layers)))
+                              layer_map=tuple(range(self.cfg.num_layers)), **kw)
 
     def __init__(self, trunk: Any, params: dict[str, torch.Tensor], num_layers: int = 1) -> None:
         from .model import Model
@@ -105,10 +189,12 @@ class DraftHead:
         self.has_confidence = "confidence.weight" in params
         self.width = 3  # 2 drafts; ``set_depth`` overrides
 
-    def forward(self, hidden, ids, positions, kv, backend, hidden_out=None) -> torch.Tensor:
+    def forward(self, hidden, ids, positions, kv, backend, hidden_out=None,
+                last_only=False) -> torch.Tensor:
         """hidden [B,T,H] (trunk's pre-final-norm state), ids [B,T] (the token
-        each position predicts FROM) -> draft logits [B,T,vocab]. ``hidden_out``
-        receives the head's own hidden, which the next draft position consumes."""
+        each position predicts FROM) -> draft logits [B,T,vocab], or [B,1,vocab]
+        when ``last_only`` selects one position per row. ``hidden_out`` receives
+        the head's own hidden at FULL width, appended before the reduction."""
         eps = self.cfg.rms_eps
         ids = torch.as_tensor(ids, dtype=torch.long, device=backend.device)
         positions = torch.as_tensor(positions, dtype=torch.long, device=backend.device)
@@ -123,6 +209,14 @@ class DraftHead:
             x = self.layers._mlp(i, x, kv, backend)
         if hidden_out is not None:
             hidden_out.append(x)
+        # Same trade the trunk makes (model.py:371): a vocab-wide readout over every
+        # prefill position is thrown away one line later. Here it OOMed a 32 GB card --
+        # 1.41 GiB at B=8 ctx=512, of which 8 rows (7.6 MiB) were read.
+        if last_only is not False and x.shape[1] > 1:
+            idx = (torch.full((x.shape[0],), x.shape[1] - 1, device=backend.device)
+                   if last_only is True
+                   else torch.as_tensor([n - 1 for n in last_only], device=backend.device))
+            x = x[torch.arange(x.shape[0], device=backend.device), idx].unsqueeze(1)
         x = backend.rmsnorm(x, self.params["norm"], eps)
         head = "embed_tokens" if self.trunk.cfg.tie_word_embeddings else "lm_head"
         return self.trunk._linear(backend, x, head)
@@ -274,7 +368,8 @@ def read_head_params(path: str | Path, stems: dict[str, str]) -> dict[str, torch
     unknown: list[str] = []
     nextn = False
     with safe_open(str(path), "pt", device="cpu") as f:
-        for name in list(f.keys()):
+        names = list(f.keys())
+        for name in names:
             bare = name.removeprefix("mtp.").removeprefix("model.")
             stem = bare.removesuffix(".weight").removesuffix(".bias")
             nextn |= stem == "pre_fc_norm_hidden"
