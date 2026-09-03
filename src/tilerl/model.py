@@ -326,6 +326,11 @@ class Model:
         return self._add_via(backend, kv, x, out, f"{p}.out_proj")
 
     def _mlp(self, layer_idx: int, x: torch.Tensor, kv: Any, backend: "Backend") -> torch.Tensor:
+        # ~60% of a layer's stored activations and the only pure block — GDN
+        # advances the state pool, so it cannot be replayed.
+        return autograd.checkpoint(self._mlp_body, layer_idx, x, kv, backend)
+
+    def _mlp_body(self, layer_idx: int, x: torch.Tensor, kv: Any, backend: "Backend"):
         cfg = self.cfg
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.post_attn_norm"], cfg.rms_eps)

@@ -841,19 +841,38 @@ def softmax(x: torch.Tensor, axis: int) -> torch.Tensor:
 
 
 def cross_entropy_loss_grad(logits: torch.Tensor, input_ids: object) -> tuple[float, torch.Tensor]:
-    """Stable shifted causal CE and its matching logit gradient."""
+    """Stable shifted causal CE and its matching logit gradient, written back
+    INTO ``logits`` — the returned gradient aliases the input, so a caller must
+    not read the logits afterwards.
+
+    A vocab row is 2.2 GiB for one 27B group of 8 at T=275 and the old
+    shape-for-shape version held four of them at once. ``softmax - onehot``
+    needs no second buffer, so it is written over the softmax in place — the
+    trick AReaL's vocab-parallel backward uses, and the reason there is nothing
+    to chunk the way TRL does. Worth 0.2-2.0 GiB here; the training peak is the
+    stored layer activations, not this (wins/2026-09-03-grpo-27b-fits-the-card)."""
     b, t, v = logits.shape
     if t < 2:
         raise ValueError("cross_entropy_loss_grad needs at least two tokens")
-    flat = _f32(logits[:, :-1]).reshape(-1, v)
-    labels = torch.as_tensor(input_ids, dtype=torch.long, device=flat.device)[:, 1:].reshape(-1)
-    loss = (torch.logsumexp(flat, dim=-1) - flat.gather(-1, labels[:, None]).squeeze(-1)).mean()
-    grad = torch.softmax(flat, dim=-1)
-    grad.scatter_add_(-1, labels[:, None], -torch.ones_like(labels[:, None], dtype=grad.dtype))
-    grad /= flat.shape[0]
-    out = torch.zeros(b, t, v, dtype=torch.float32, device=logits.device)
-    out[:, :-1] = grad.reshape(b, t - 1, v)
-    return float(loss), out
+    g = logits if logits.dtype == torch.float32 and logits.is_contiguous() else _f32(
+        logits).contiguous()
+    ids = torch.as_tensor(input_ids, dtype=torch.long, device=g.device)
+    tgt = torch.full((b, t), -1, dtype=torch.long, device=g.device)
+    tgt[:, :-1] = ids[:, 1:]  # -1 marks the last column, which predicts nothing
+    tgt = tgt.reshape(-1)
+    flat = g.reshape(b * t, v)
+    keep = tgt >= 0
+    y = tgt.clamp_min(0).unsqueeze(-1)
+    picked = flat.gather(-1, y).squeeze(-1)
+    m = flat.amax(-1)
+    flat.sub_(m.unsqueeze(-1)).exp_()
+    s = flat.sum(-1)
+    n = float(b * (t - 1))
+    loss = torch.where(keep, m + s.log() - picked, s.new_zeros(())).sum() / n
+    flat.div_(s.unsqueeze(-1) * n)
+    flat.scatter_add_(-1, y, keep.to(flat.dtype).unsqueeze(-1).mul_(-1.0 / n))
+    g[:, -1] = 0.0
+    return float(loss), g
 
 
 def state_gather(states, windows, slots, layer_idx, parity=None):

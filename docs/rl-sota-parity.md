@@ -132,8 +132,17 @@ the rest is activations the tape is holding.
 TRL's reason for rejecting `auto_find_batch_size` is the reason the fix cannot
 be "use a smaller group": the group is the baseline. Micro-batching with
 gradient accumulation is the only shrink that leaves the advantage
-normalization untouched. Fixed on `train/grpo-memory`, with the equivalence
-proved as a test rather than argued.
+normalization untouched, and the equivalence is proved as a test rather than
+argued.
+
+**One thing does not carry over.** Both stacks call the vocab-sized logits
+tensor the true peak, and it is tempting to conclude ours must be worse because
+our vocab is bigger. Measured, it is not: with the layer activations stored,
+replacing four vocab tensors with one moved the peak by 0.02 GiB, because the
+peak sits inside the layer-stack backward, after the cross-entropy buffers are
+already freed. Gradient checkpointing and micro-batching are worth 36 GiB
+between them; the logits are worth 0.2 to 2.0
+([wins/2026-09-03-grpo-27b-fits-the-card.md](experience/wins/2026-09-03-grpo-27b-fits-the-card.md)).
 
 ## 6. Sequence handling
 

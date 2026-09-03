@@ -30,6 +30,25 @@ def maybe_record(op_name: str, output: torch.Tensor, *args: Any, **kwargs: Any) 
         tape.record(op_name, args, kwargs, output)
 
 
+def checkpoint(fn: Callable[..., torch.Tensor], *args: Any) -> torch.Tensor:
+    """Recompute instead of store: run ``fn(*args)`` with recording off and
+    record one entry that replays it under a sub-tape during backward, so the
+    segment's activations never coexist with the rest of the forward. ``fn``
+    must be pure — a segment that advances the KV or GDN state pool would
+    recompute against state its own forward already moved. Both TRL and AReaL
+    run every shipped recipe with this on."""
+    tape = _current_tape.get()
+    if tape is None or not tape.recompute:
+        return fn(*args)
+    token = _current_tape.set(None)
+    try:
+        out = fn(*args)
+    finally:
+        _current_tape.reset(token)
+    tape.record("checkpoint", args, {"fn": fn}, out)
+    return out
+
+
 # Recorded views: a raw torch view between two backend ops breaks the id() chain.
 def reshape(x: torch.Tensor, *shape: int) -> torch.Tensor:
     y = x.reshape(*shape)
@@ -86,7 +105,7 @@ class _Entry:
     output: torch.Tensor
 
 
-# A handler yields (slot, grad): slot is an arg index or ("kw", name).
+# A handler yields (slot, grad): slot is an arg index, ("kw", name), or ("id", id(t)).
 
 _Handler = Callable[[Any, torch.Tensor, tuple, dict], Iterator[tuple]]
 
@@ -167,6 +186,19 @@ def _linear_attn_chunk(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
             yield ("kw", _GDN_KW[i - len(args)]), gi
 
 
+def _checkpoint(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
+    sub = Tape()
+    sub.bwd_backend = backend
+    with sub:
+        kw["fn"](*args)
+    inputs = {id(a): i for i, a in enumerate(args)}
+    # A leaf inside the segment (a LoRA adapter) is not an arg of this entry, so
+    # it is addressed by id; ``needs`` is not forwarded, the segment has no
+    # gradient worth skipping.
+    for tid, gi in sub.backward(g).items():
+        yield inputs.get(tid, ("id", tid)), gi
+
+
 def _reshape(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
     yield 0, g.reshape(args[0].shape)
 
@@ -204,14 +236,19 @@ _BWD: dict[str, _Handler] = {
     "reshape": _reshape,
     "slice": _slice,
     "add": _add,
+    "checkpoint": _checkpoint,
 }
 
 
 class Tape:
     """Records backend ops while active; ``backward(grad_of_last_output)``
-    replays them in reverse and returns ``{id(leaf): grad}``. One backward per tape."""
+    replays them in reverse and returns ``{id(leaf): grad}``. One backward per
+    tape. ``recompute`` (default on, as in every TRL and AReaL recipe):
+    :func:`checkpoint` segments store their input instead of
+    their activations and are replayed during backward."""
 
-    def __init__(self) -> None:
+    def __init__(self, recompute: bool = True) -> None:
+        self.recompute = recompute
         self._entries: list[_Entry] = []
         self._token: Any = None
         self._consumed = False
@@ -308,16 +345,22 @@ class Tape:
                         else (backend, g_out, entry.args, entry.kwargs))
                 for slot, g_in in handler(*call):
                     if isinstance(slot, int):
-                        target = entry.args[slot]
-                    else:
-                        target = entry.kwargs[slot[1]]
-                    tid = id(target)
-                    if tid in grads:
-                        grads[tid] = grads[tid] + g_in
-                    else:
-                        grads[tid] = g_in
+                        tid = id(entry.args[slot])
+                    elif slot[0] == "kw":
+                        tid = id(entry.kwargs[slot[1]])
+                    else:  # ("id", tid): a leaf inside a checkpointed segment
+                        tid = slot[1]
+                        # The segment ran whole, so its leaf grads are final here.
+                        # A param shared by two segments would break that; the
+                        # ``taken`` check below is what would catch it.
+                        first_use.setdefault(tid, i)
+                    if tid in taken:
+                        raise RuntimeError(
+                            f"gradient for leaf {tid} arrived after it was streamed "
+                            "out: a tensor is read in two checkpointed segments")
+                    grads[tid] = grads[tid] + g_in if tid in grads else g_in
+                grads.pop(id(entry.output), None)  # consumed: nothing below reads it
                 if on_grad is not None:
-                    grads.pop(id(entry.output), None)
                     self._release(grads, first_use, produced_at, taken, i, on_grad)
         finally:
             _current_tape.reset(token)

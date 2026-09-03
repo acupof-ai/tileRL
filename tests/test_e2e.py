@@ -280,7 +280,7 @@ def test_adafactor_trains_with_factored_state():
     optimizer = Adafactor(lr=1e-2)
     batch = np.random.default_rng(7).integers(3, cfg.vocab_size, size=(2, 32)).astype(np.int64)
 
-    losses = [float(train_step(model, batch, backend, optimizer, Tape())) for _ in range(20)]
+    losses = [float(train_step(model, batch, backend, optimizer)) for _ in range(20)]
     first5, last5 = sum(losses[:5]) / 5, sum(losses[-5:]) / 5
     assert last5 < first5, f"loss did not decrease: {first5:.4f} -> {last5:.4f}"
 
@@ -299,9 +299,39 @@ def test_train_loss_decreases():
     optimizer = AdamW(lr=3e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
     batch = np.random.default_rng(7).integers(3, cfg.vocab_size, size=(2, 32)).astype(np.int64)
 
-    losses = [float(train_step(model, batch, backend, optimizer, Tape())) for _ in range(20)]
+    losses = [float(train_step(model, batch, backend, optimizer)) for _ in range(20)]
     first5, last5 = sum(losses[:5]) / 5, sum(losses[-5:]) / 5
     assert last5 < first5, f"loss did not decrease: {first5:.4f} -> {last5:.4f}"
+
+
+def test_recompute_matches_stored_activations():
+    """A checkpointed MLP block is replayed in backward instead of stored, so
+    its gradients must equal the ones the stored forward gives. The MLP is ~60%
+    of a layer's activations and the 27B's group of 8 does not fit without this.
+    """
+    backend = RefBackend()
+    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    ids = np.arange(1, 33, dtype=np.int64).reshape(2, 16) % cfg.vocab_size
+    pos = np.arange(16, dtype=np.int64)
+
+    def run(recompute):
+        kv = _training_kv(model, 2, 16, device=backend.device)
+        tape = Tape(recompute=recompute)
+        with torch.no_grad(), tape:
+            logits = model.forward(ids, pos, kv, RecordingBackend(backend))
+        held = len(tape._entries)
+        _, gl = backend.cross_entropy_loss_grad(logits, ids)
+        return held, tape.backward(gl)
+
+    stored, ref = run(False)
+    replayed, got = run(True)
+    assert replayed < stored, f"recompute recorded {replayed} entries, stored {stored}"
+    by_id = {id(v): k for k, v in model.params.items()}
+    ref = {by_id[k]: v for k, v in ref.items() if k in by_id}
+    got = {by_id[k]: v for k, v in got.items() if k in by_id}
+    assert set(ref) == set(got), f"recompute lost {sorted(set(ref) - set(got))[:4]}"
+    worst = max((ref[k] - got[k]).abs().max().item() for k in ref)
+    assert worst < 1e-6, f"recomputed gradients differ by {worst:.2e}"
 
 
 def test_backward_streaming_matches_collecting():
@@ -500,7 +530,10 @@ def test_production_model_gradcheck():
     # judge a gradient, so an inconsistent probe is skipped, not blamed on the tape.
     step = 0.1
     checked = 0
-    for key in ("embed_tokens", "layers.0.q_proj", "layers.1.in_proj_a", "final_norm"):
+    # down_proj is inside the checkpointed MLP block: its gradient comes from a
+    # replayed forward, so it needs the finite difference as much as the rest.
+    for key in ("embed_tokens", "layers.0.q_proj", "layers.1.in_proj_a", "final_norm",
+                "layers.0.down_proj"):
         p = model.params[key]
         idx = (0, 0) if p.ndim == 2 else (0,)
         analytic = grads[id(p)][idx].item()
