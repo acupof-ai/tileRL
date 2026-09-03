@@ -8,9 +8,10 @@ RECIPES: dict[str, dict] = {
         model="tiny", rl=True, steps=2, group=2, max_new_tokens=4, lora_rank=4,
         status="cpu: tests/test_recipes.py"),
     # docs/roadmap.md P1. Pass --data gsm8k_train.jsonl --eval-gsm8k gsm8k_test.jsonl.
+    # lr: the CLI default of 1e-3 flattens the reward from step 9 on; 1e-4 does not.
     "grpo-gsm8k-27b": dict(
         model="qwen38-27b", rl=True, steps=100, group=8, max_new_tokens=256, lora_rank=16,
-        micro=1, max_think_tokens=0, eval_mmlu=1000, eval_n=500,
+        micro=1, max_think_tokens=0, eval_mmlu=1000, eval_n=500, lr=1e-4,
         status="pending-remote: roadmap P1"),
     "opd-gsm8k-27b": dict(
         model="qwen38-27b", opd=True, steps=100, max_new_tokens=256, lora_rank=16,
