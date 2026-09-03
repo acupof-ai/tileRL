@@ -193,6 +193,35 @@ if __name__ == "__main__":  # runnable check
     )
     print("spec: verify_lens OK", lens)
 
+    # The same arithmetic at B=4, the SERVING batch, where it comes out worse. Measured
+    # on ticks bucketed by their own M (scripts/ab_draft_depth.py --batch 4): rung 32
+    # verify derives to 170.03 ms independently at depth 2 (52 ticks) and depth 3 (46),
+    # and 169.47 at depth 4 (47) -- three depths with 12/16/20 useful rows agreeing to
+    # 0.33%, which is the rung thesis with no cross-batch subtraction in it. One draft
+    # forward there is 10.36 ms, so drafting is 15% of a rung-32 tick against 19-24% of
+    # a rung-4 tick at B=1.
+    #
+    # A block head replaces k forwards with one, so a SMALLER draft share is a LOWER
+    # ceiling: 1.115x here against 1.16-1.21x at B=1, and the acceptance it must retain
+    # rises from 82.7% to 89.7%. Batching makes this arm harder, not easier, because the
+    # verify launch it cannot shrink grows as a share of the tick. Asserted so a future
+    # change that makes drafting cheaper cannot quietly revive the arm without moving
+    # this number too. wins/2026-09-04-rung-cost-not-useful-rows.md
+    B4_VERIFY_32_MS, B4_DRAFT_MS, B4_K = 170.03, 10.36, 3
+    b4_tick = B4_VERIFY_32_MS + B4_K * B4_DRAFT_MS
+    b4_ceiling = b4_tick / (B4_VERIFY_32_MS + B4_DRAFT_MS)
+    assert b4_ceiling < 1.16, (
+        f"B=4's block-parallel ceiling {b4_ceiling:.3f}x must stay below B=1's 1.16x: "
+        "a bigger batch spends more of the tick on the verify launch a block head "
+        "cannot remove"
+    )
+    assert 1 / b4_ceiling > 0.86, (
+        f"break-even retention {1 / b4_ceiling:.3f} -- the arm needs the parallel head "
+        "to keep this share of tok/forward, and at B=4 it is stricter than B=1's 0.827"
+    )
+    print(f"spec: B=4 block-parallel ceiling {b4_ceiling:.3f}x, "
+          f"break-even retention {1 / b4_ceiling:.1%}")
+
 
 class DraftHead:
     """NextN / DSpark draft head: ``fc([norm(embed(t)), norm(h_trunk)])`` into a
