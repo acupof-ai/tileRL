@@ -1054,6 +1054,29 @@ class Engine:
                 self._wake.wait(0.005)
 
 
+def _fit_blocks(cfg, backend, io, cap: int) -> int:
+    """KV blocks that fit the free memory left after the weights and the GDN pools.
+
+    Called with the state pool already allocated, so free memory is measured, not
+    estimated -- and only after ``empty_cache``, without which the allocator's load
+    reserve hides 13 GiB and this returns 64 blocks. The default it replaces was
+    ``ctx * max_batch``, which on the 27B's own 262144-token limit is 275 GB of f32
+    KV; every bench passed num_blocks explicitly, so serve was the one caller that
+    ever saw it.
+
+    Holds back a third of what is free: ``PrefixStore`` takes a quarter of what
+    remains after this, and the attention partials are transient and scale with B*S.
+    ``cap`` wins over the 64-block floor -- a caller asking for fewer means it.
+    """
+    if backend.device.type != "cuda":
+        return cap or 256
+    per_block = 2 * len(cfg.full_attn_layers) * cfg.num_kv_heads * BLOCK_TOKENS * cfg.head_dim
+    per_block *= torch.tensor([], dtype=io).element_size()
+    per_block += per_block // (2 * len(cfg.full_attn_layers))  # the draft mirrors num_blocks
+    fit = max(64, int(torch.cuda.mem_get_info()[0] * 2 / 3) // per_block)
+    return min(fit, cap) if cap else fit
+
+
 def build_engine(
     cfg,
     model: Any,
@@ -1064,18 +1087,45 @@ def build_engine(
     max_batch: int = 8,
     max_total_tokens: int = 8192,
     max_num_batched_tokens: int = 512,
+    max_blocks: int = 0,
     prefix_store: Any = None,
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
 ) -> Engine:
     """Wire a model + backend into an Engine; pool shapes come from ``cfg``.
-    ``decode_graph`` None auto-enables the captured decode tick on CUDA."""
+    ``decode_graph`` None auto-enables the captured decode tick on CUDA.
+    ``num_blocks`` 0 fits the KV pool to free memory, capped at ``max_blocks``."""
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
     if draft is not None:
         draft.set_depth(spec_depth)  # the state pool is sized by the width it settles on
     model.params = backend.materialize(model.params)
+    # Reclaim the allocator's load-time reserve before anything reads free memory.
+    # Loading and quantizing 27B leaves 29.02 GiB reserved against 15.96 allocated on
+    # a 31.74 GiB card, and `mem_get_info` counts all 13.06 GiB of that as USED -- so
+    # the store's budget below, and the KV fit, see 2.36 GiB free instead of 15.17.
+    # Measured on sm70: this one call is the difference between a 1024-token and a
+    # 64912-token context at B=1.
+    if backend.device.type == "cuda":
+        torch.cuda.empty_cache()
     pad = _graph_on(backend, decode_graph)  # the replay's padding row owns a slot and a block
+    # The GDN pools first, so fitting the KV pool below can MEASURE what is left
+    # instead of estimating it: at slots=3 depth=3 they are 2.94 GiB, 79% of it the
+    # per-step verify states, which scale with slots*width and not with max_batch.
+    state_pool = LinearStatePool(
+        num_slots + pad,
+        n_linear,
+        cfg.linear_num_value_heads,
+        cfg.linear_value_head_dim,
+        device=backend.device,
+        dtype=precision.dtype("recurrent_state", backend.device),
+        conv_window=cfg.linear_conv_kernel_dim - 1,
+        conv_dim=cfg.linear_qkv_dim,
+        spec_steps=draft.width if draft is not None else 0,
+    )
+    kv_io = getattr(backend, "io", torch.bfloat16)
+    if not num_blocks:
+        num_blocks = _fit_blocks(cfg, backend, kv_io, max_blocks)
     kv_pool = PagedKvPool(
         num_blocks + pad,
         cfg.num_kv_heads,
@@ -1087,18 +1137,7 @@ def build_engine(
         # the live ones): 4.71 ms/token, 14% of a 4096-ctx token, independent of
         # context. Same trade the state pool makes below. getattr: test doubles
         # stand in for Backend without declaring an io dtype.
-        dtype=getattr(backend, "io", torch.bfloat16),
-    )
-    state_pool = LinearStatePool(
-        num_slots + pad,
-        n_linear,
-        cfg.linear_num_value_heads,
-        cfg.linear_value_head_dim,
-        device=backend.device,
-        dtype=precision.dtype("recurrent_state", backend.device),
-        conv_window=cfg.linear_conv_kernel_dim - 1,
-        conv_dim=cfg.linear_qkv_dim,
-        spec_steps=draft.width if draft is not None else 0,
+        dtype=kv_io,
     )
     # A resident store entry owns a GDN state snapshot in HBM (144 MiB at 27B f32)
     # and a decode publishes one every BLOCK_TOKENS, so the store's byte budget must

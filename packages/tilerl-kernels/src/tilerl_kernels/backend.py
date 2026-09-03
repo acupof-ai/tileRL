@@ -417,7 +417,7 @@ class Backend:
         return y if residual is None else y + residual
 
     def linear_bwd(self, grad, x, w):
-        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
+        io = self.io
         grad = self._dev(grad, io)
         x = self._dev(x, io)
         w = self._dev(w, io)
@@ -981,7 +981,7 @@ class Backend:
         assert kd == vd, f"gdn_prep binds one thread per head column: {kd} != {vd}"
         hk = q.shape[-1] // kd
         ker = kw["conv1d_weight"].shape[1]
-        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
+        io = self.io
         window = kw.get("conv_window")
         win = (
             self._f32(window)
@@ -1006,7 +1006,7 @@ class Backend:
         conv / norm / gate glue is two launches here, sixty as torch ops."""
         b, t = q.shape[0], q.shape[1]
         nvh, vd = state.shape[1], state.shape[3]
-        io = torch.bfloat16 if self.target.startswith("cuda") else torch.float32
+        io = self.io
         window = kw.get("conv_window")
         qn, kn, vn, gt, bt, new_window = self._gdn_prep(q, k, v, g, beta, state, **kw)
         if "gdn_state_scan" in _resolve(self.precision, self.arch):

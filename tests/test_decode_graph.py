@@ -139,6 +139,37 @@ def test_the_kv_guard_measures_usable_capacity_not_the_pool():
             eng.submit(big, params)
 
 
+def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
+    """``num_blocks=0`` must fit against memory the GDN pools have already taken.
+
+    Order is the whole content of this: the state pool is 2.94 GiB at slots=3 depth=3
+    on the 27B, so a fit measured before it OVER-asks by that much. Sizing it from
+    cli.py, one call earlier, asked for 10.21 GiB with 4.96 free and OOMed inside
+    PagedKvPool -- and the fit is arch- and card-specific, so no CPU gate can catch
+    that numerically. Assert the sequence instead.
+    """
+    import tilerl.engine as eng_mod
+
+    seen = []
+    real_state, real_fit = eng_mod.LinearStatePool, eng_mod._fit_blocks
+
+    def spy_state(*a, **k):
+        seen.append("state")
+        return real_state(*a, **k)
+
+    def spy_fit(*a, **k):
+        seen.append("fit")
+        return real_fit(*a, **k)
+
+    monkeypatch.setattr(eng_mod, "LinearStatePool", spy_state)
+    monkeypatch.setattr(eng_mod, "_fit_blocks", spy_fit)
+    cfg = tiny()
+    e = build_engine(cfg, build_random(cfg, seed=7), get_backend(), num_blocks=0,
+                     num_slots=2, max_batch=2, max_total_tokens=512, max_blocks=16)
+    assert seen == ["state", "fit"], f"the KV fit ran before the state pool: {seen}"
+    assert e.usable_blocks == 16, f"max_blocks must cap the fit, got {e.usable_blocks}"
+
+
 def test_graph_keys_covers_what_a_decode_tick_keys_on():
     """`graph_keys` is what `precapture` builds, so it must contain every key
     `_run_decode_graph` would look up — otherwise warming succeeds, reports N

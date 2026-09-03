@@ -50,15 +50,15 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
                   blocks=0, max_ctx=0, max_batch=8):
     """Serving-size engine; ``devices`` replicates it across those CUDA indices.
 
-    ``max_ctx`` caps the served context and ``blocks`` the KV pool. Both default
-    to the model's own limit, which for the 27B is 262144 tokens = 131072 blocks
-    = 275 GB of f32 KV — fine on the 96 GB card this was written for, an instant
-    OOM on a 32 GB V100. The bench scripts always passed num_blocks explicitly,
-    so ``serve`` was the one path that never saw the real number.
+    ``max_ctx`` caps the served context; it still defaults to the model's own limit,
+    which for the 27B is 262144 tokens = 275 GB of f32 KV, so it is now a CAP on the
+    fit rather than the pool size. ``blocks`` 0 hands the pool to build_engine, which
+    fits it after materialize and the allocator reclaim — the only point where free
+    memory means anything. Sizing it here instead asked for 10.21 GiB with 4.96 free
+    and OOMed in PagedKvPool.
 
-    ``slots`` sizes the GDN state pool; with a draft each slot also owns
-    spec_steps of step-state, so a 32 GB card needs 4, not 16. The block default
-    follows ``max_batch`` — the pool only has to hold rows admittable at once.
+    ``slots`` sizes the GDN state pool; with a draft each slot also owns spec_steps
+    of step-state, so a 32 GB card needs 4, not 16.
     """
     from . import engine as engine_mod
     from .kv_cache import BLOCK_TOKENS
@@ -66,8 +66,8 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
     # Token budget follows the context; ByteTokenizer makes one token per byte.
     ctx = int(max_ctx or cfg.max_position_embeddings)
 
-    kw = dict(num_blocks=blocks or max(256, (ctx * max_batch) // BLOCK_TOKENS), num_slots=slots,
-              max_batch=max_batch, max_total_tokens=ctx)
+    kw = dict(num_blocks=blocks, num_slots=slots, max_batch=max_batch,
+              max_total_tokens=ctx, max_blocks=(ctx * max_batch) // BLOCK_TOKENS)
     if draft is not None:
         kw["draft"], kw["spec_depth"] = draft, depth
     if not devices:
@@ -107,7 +107,13 @@ def cmd_serve(args: argparse.Namespace) -> None:
     tokenizer = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
-    print(f"tilerl serve: model={cfg.name} target={backend.target}")
+    # Print the pool: with --blocks 0 it is fitted to the card, so this is the served
+    # context ceiling and the one number a 32 GB card gets wrong silently.
+    from .kv_cache import BLOCK_TOKENS
+
+    kv = engine.stats()["blocks_total"]
+    print(f"tilerl serve: model={cfg.name} target={backend.target} "
+          f"kv={kv} blocks = {kv * BLOCK_TOKENS} tokens")
     if args.warmup:
         # One capture per (bucket x chain width); generating tokens instead is a
         # lottery with no floor, since the draft's confidence sets each width.
@@ -470,10 +476,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="GDN state slots; lower on <40GB GPUs (with --draft each slot "
                               "also owns the per-step verify states)")
     p_serve.add_argument("--blocks", type=int, default=0,
-                         help="KV blocks (16 tokens each); 0 = size from the model's context. "
-                              "The 27B's 262144-token context asks for 131072 blocks = 275 GB "
-                              "of f32 KV, so a 32GB card needs this set: 512 serves one 4K "
-                              "request with slack, 2048 serves 8 rows at 4K")
+                         help="KV blocks (16 tokens each); 0 = fit the pool to the card, "
+                              "capped by --max-ctx. Measured: 4046 blocks = 64736 tokens "
+                              "on a 32GB V100 at B=1")
     p_serve.add_argument("--max-ctx", type=int, default=0,
                          help="cap served context (0 = the model's own limit); pairs with "
                               "--blocks so a request cannot outgrow the pool")

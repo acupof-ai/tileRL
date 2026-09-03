@@ -361,7 +361,7 @@ def read_head_params(path: str | Path, stems: dict[str, str]) -> dict[str, torch
     tensors, ``_param_key_for`` the ordinary Qwen3 layer ones."""
     from safetensors import safe_open
 
-    from .model import _param_key_for
+    from .model import _is_lm_head, _param_key_for
 
     params: dict[str, torch.Tensor] = {}
     skipped: list[str] = []
@@ -384,7 +384,11 @@ def read_head_params(path: str | Path, stems: dict[str, str]) -> dict[str, torch
             # forward reads the embedding and the readout off the TRUNK, so a head
             # shipping its own is dead weight — and engine._quantize_draft packs
             # anything 2-D, which at 248320x5120 is 2.5 GB on a card that has OOMed.
-            if mapped in ("embed_tokens", "lm_head", "final_norm"):
+            # _is_lm_head, not `mapped == "lm_head"`: a QUANTIZED readout arrives as
+            # three tensors (lm_head.wq/scale/oscale) that _param_key_for cannot name,
+            # so matching on the mapped key sent all three to `unknown` and made the
+            # 27B NVFP4 draft shard unloadable -- the one shard we actually serve.
+            if _is_lm_head(bare) or mapped in ("embed_tokens", "final_norm"):
                 skipped.append(bare)
             elif mapped is not None:
                 params[mapped] = f.get_tensor(name)
