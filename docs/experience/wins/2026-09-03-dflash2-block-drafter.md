@@ -1,6 +1,16 @@
 # DFlash2 block drafter — H20 GPU 2, 2026-09-03
 
-> Status: Shipped (drafter + loader; engine wiring waits on the width-W verify tick)
+> **Status, corrected 2026-09-03:** this head has no path through the product.
+> The engine calls `draft.forward()` and `draft.confidence()`; `DFlash2Head` has
+> neither. `draft()` is reached only from `tests/test_dflash2.py` and
+> `scripts/probe_dflash2_acceptance.py`. The width-W verify tick landing did not
+> change this — the gap is that `_draft_step` is autoregressive and this head
+> emits a block. **Every acceptance number below is a probe-script measurement on
+> a path the engine cannot take**, and must not be composed with the width-W
+> tick's cost, which was measured with the NextN head at a width the CLI does not
+> default to.
+
+> Status: the drafter and loader are written and gated; **the product cannot run them** (see above)
 
 ## Context
 
