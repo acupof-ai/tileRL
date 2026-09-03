@@ -103,7 +103,7 @@ class ModelConfig:
         return self.linear_q_dim + self.linear_k_dim + self.linear_v_dim
 
     def is_full_attn(self, layer_idx: int) -> bool:
-        return layer_idx in self.full_attn_layer_set
+        return layer_idx in self.full_attn_layers  # a tuple scan beats rebuilding the set
 
 
 def qwen38_27b() -> ModelConfig:

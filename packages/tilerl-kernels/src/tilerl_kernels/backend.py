@@ -1001,8 +1001,8 @@ class Backend:
         # ponytail: torch-eager, tilelang kernel when perf demands
         return reference.greedy(logits)
 
-    def sample_batch(self, logits, temperatures, top_ps, seeds):
-        return reference.sample_batch(logits, temperatures, top_ps, seeds)
+    def sample_batch(self, logits, temperatures, top_ps, seeds, logprobs=True):
+        return reference.sample_batch(logits, temperatures, top_ps, seeds, logprobs)
 
 
 _BACKEND: Backend | None = None

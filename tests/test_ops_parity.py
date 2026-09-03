@@ -786,6 +786,12 @@ def test_sample_batch_matches_per_row():
     top_ps = torch.tensor([0.9, 1.0, 0.5, 1.0, 0.95])
     seeds = torch.tensor([42, 7, 99, 3, 42])
     batched, lps = reference.sample_batch(logits, temps, top_ps, seeds)
+    # Skipping the scores must not move a single token. The greedy branch scores its
+    # draw with a second full-vocabulary log_softmax, so the engine turns it off when
+    # no request asked -- and a sampler whose draw depends on that is the silent bug.
+    cheap, none_lps = reference.sample_batch(logits, temps, top_ps, seeds, logprobs=False)
+    assert none_lps is None
+    assert (cheap == batched).all(), (cheap, batched)
     for i in range(5):
         one = reference.sample(logits[i : i + 1], float(temps[i]), float(top_ps[i]), int(seeds[i]))
         assert batched[i] == one[0], f"row {i}: batch {batched[i]} vs per-row {one[0]}"

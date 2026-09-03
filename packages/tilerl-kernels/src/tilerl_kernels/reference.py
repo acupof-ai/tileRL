@@ -993,26 +993,29 @@ def sample_batch(
     temperatures: torch.Tensor,
     top_ps: torch.Tensor,
     seeds: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    logprobs: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Batched :func:`sample`: one sort/softmax for the batch, identical draws
     per row. temperatures/top_ps/seeds are read on the host (device reads cost
     two syncs a tick plus one per sampled row). Returns the tokens and their log
     prob under the row's own nucleus distribution -- the caller cannot recompute
     that from the logits without duplicating the truncation rule. A greedy row
     (t <= 0) is scored at t=1 over the full softmax, since its point mass would
-    report 0 for every token."""
+    report 0 for every token -- which is a second full-vocabulary pass, so
+    ``logprobs=False`` skips it and returns None for the scores."""
     logits = _f32(logits)
     b = logits.shape[0]
     dev = logits.device
     temps = [float(t) for t in temperatures]
     out = torch.empty(b, dtype=torch.long, device=dev)
-    lp = torch.empty(b, dtype=torch.float32, device=dev)
+    lp = torch.empty(b, dtype=torch.float32, device=dev) if logprobs else None
     hot = [i for i, t in enumerate(temps) if t > 0]
     cold = [i for i, t in enumerate(temps) if t <= 0]
     if cold:
         ci = torch.tensor(cold, device=dev)
         out[ci] = logits[ci].argmax(-1).to(torch.long)
-        lp[ci] = torch.log_softmax(logits[ci], dim=-1).max(-1).values
+        if logprobs:
+            lp[ci] = torch.log_softmax(logits[ci], dim=-1).max(-1).values
     if hot:
         idx = torch.tensor(hot, device=dev)
         tt = torch.tensor([temps[i] for i in hot], dtype=torch.float32, device=dev)
@@ -1023,7 +1026,8 @@ def sample_batch(
             gen = torch.Generator(device=dev).manual_seed(int(seeds[i]))
             draw = torch.multinomial(probs[k], num_samples=1, generator=gen)
             out[i] = sorted_idx[k, draw].to(torch.long)
-            lp[i] = probs[k, draw].clamp_min(1e-45).log()
+            if logprobs:
+                lp[i] = probs[k, draw].clamp_min(1e-45).log()
     return out, lp
 
 
