@@ -234,8 +234,11 @@ class Model:
             q = autograd.reshape(q, b, t, hq, d)
         k = autograd.reshape(k, b, t, hkv, d)
         v = autograd.reshape(v, b, t, hkv, d)
-        q = backend.rmsnorm(q, self.params[f"{p}.q_norm"], cfg.rms_eps)
-        k = backend.rmsnorm(k, self.params[f"{p}.k_norm"], cfg.rms_eps)
+        # f32 out: these feed rope and then the bf16 KV pool, so a bf16 store here
+        # would round twice. input_norm/post_attn_norm/final_norm keep bf16 -- their
+        # consumers requantize (errors/2026-09-03-unfused-prelude-double-rounds.md).
+        q = backend.rmsnorm_f32(q, self.params[f"{p}.q_norm"], cfg.rms_eps)
+        k = backend.rmsnorm_f32(k, self.params[f"{p}.k_norm"], cfg.rms_eps)
         q = backend.rope(q, positions, cfg.rope_theta, rotary_dim=cfg.effective_rotary_dim)
         k = backend.rope(k, positions, cfg.rope_theta, rotary_dim=cfg.effective_rotary_dim)
         if getattr(kv, "dense", False):
