@@ -1,6 +1,9 @@
 # MMLU 0-shot at 76.3% once sampling is restricted to the four letters — H20/sm90, 2026-08-28
 
-> Status: Shipped
+> Status: Shipped. The 763/1000 below is a slice the code no longer draws — `81e9789` replaced
+> shuffle-then-take with `sample`, so today's 1000 questions share 2 with these. Same runner,
+> clean main, 2026-09-03: 746/1000 = 74.6%. See
+> [errors/2026-09-03-the-mmlu-slice-moved-under-the-number.md](../errors/2026-09-03-the-mmlu-slice-moved-under-the-number.md).
 
 ## Context
 

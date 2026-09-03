@@ -18,7 +18,7 @@ head, the ledger); TP, CP and the 128K–256K budget are under P6 below.
 | Area | State | Evidence |
 |---|---|---|
 | Serving | H20 B=1 decode 92.4 tok/s (sglang bf16 54.2, Arle 84.5); B=8 0.8× sglang; prefill 0.4× | `wins/2026-08-28-decode-split-by-occupancy.md`, `wins/bench-baseline.json`, `docs/experience/2026-08-28-vs-sglang-h20.md` |
-| Accuracy | MMLU 0-shot 76.3% (1000 q) | `wins/2026-08-28-mmlu-letter-restricted.md` |
+| Accuracy | MMLU 0-shot 74.6% (1000 q, `sample` draw; the recorded 76.3% was a different 1000 questions) | `wins/2026-08-28-mmlu-letter-restricted.md`, `errors/2026-09-03-the-mmlu-slice-moved-under-the-number.md` |
 | Speculation | correct, 1.87 committed tokens per trunk forward; **loses 4.9× because a draft disables graph capture** | CHANGELOG 2026-08-29 verdict |
 | Training | LoRA-AdamW and Adafactor full fine-tune run on one card (73.2 GiB); GRPO and self-OPD exist; real prompts, GSM8K reward, MMLU before/after wired | `wins/2026-08-29-full-finetune-fits.md`, `wins/2026-09-02-rl-real-task.md` |
 | RL on the 27B | **never moved a downstream metric**; the run is pending-remote (pod held by another job) | same |
