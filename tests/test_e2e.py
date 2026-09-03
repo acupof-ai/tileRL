@@ -766,7 +766,7 @@ class _OracleDraft:
 
     def forward(self, hidden, ids, positions, kv, backend, hidden_out=None):
         pos = np.atleast_2d(np.asarray(positions))
-        logits = torch.zeros(*pos.shape, self.cfg.vocab_size)
+        logits = torch.zeros(*pos.shape, self.cfg.vocab_size, device=backend.device)
         for i in range(pos.shape[0]):
             for j in range(pos.shape[1]):
                 logits[i, j, self.expected.get(int(pos[i, j]) + 1, 0)] = 10.0

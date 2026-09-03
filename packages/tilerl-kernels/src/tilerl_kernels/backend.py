@@ -540,7 +540,8 @@ class Backend:
             )
         po, pm, pl = ws
         self._kernel("paged_attention_decode" + sfx)(
-            self._dev(self._c(q.reshape(b, h, d)), torch.bfloat16), k_cache, v_cache,
+            self._dev(self._c(q.reshape(b, h, d)), torch.bfloat16),
+            self._dev(k_cache, torch.bfloat16), self._dev(v_cache, torch.bfloat16),
             self._i32(block_table), self._i32(seq_lens), po, pm, pl, float(scale),
             int(k_cache.shape[2]),
         )

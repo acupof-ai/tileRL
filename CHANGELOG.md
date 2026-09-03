@@ -3,6 +3,10 @@
 One line per event — phase exit, default flip, accept-or-reject verdict — with
 its `docs/experience/` entry. Newest first.
 
+## 2026-09-03
+
+- **accept** — `paged_attention_combine` wrote nothing at `head_dim < 32` (`for i in T.unroll(D // 32)` has extent 0 at 16), so every CUDA test decoding through the split-KV path read an uninitialised buffer: `tests/test_e2e.py -k "specul or draft"` was 5 failed on sm90 and is 5 passed. Serving is unaffected — the 27B is `head_dim=256`. [errors/2026-09-03-combine-loop-extent-zero-at-small-head-dim.md](docs/experience/errors/2026-09-03-combine-loop-extent-zero-at-small-head-dim.md)
+
 ## 2026-09-02
 
 - **phase exit** — stage 4(b), judge verdicts reach GRPO: tests decide first and the judge only breaks ties inside the all-pass or all-fail subgroup, so no judged ordering lifts a failure above a pass (disjoint bands, 0.6–1.0 and 0.0–0.4). Only the ORDER is used — Copeland win counts, not Elo, because pairwise LLM verdicts are not guaranteed transitive and a cycle must read as "no signal" rather than an invented ranking. A judge that cannot separate a group injects zero advantage, which is the property that stops a useless judge from looking like learning. Gate `tests/test_judge.py` (7 tests, incl. the non-transitive and always-tie cases).
