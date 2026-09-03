@@ -53,6 +53,11 @@ class RefBackend:
     def attn_prep(self, *args, **kwargs):
         return None
 
+    def rmsnorm_f32(self, x, w, eps):
+        from tilerl_kernels import reference
+
+        return reference.rmsnorm(x, w, eps)  # the reference is f32 already
+
     def linear_fp4(self, x, wq, scale, master=None, oscale=None):
         from tilerl_kernels import reference
 

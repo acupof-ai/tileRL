@@ -59,6 +59,9 @@ _SM90_KERNELS = {  # WGMMA schedules; the backend pads M/N to 16 and K to 32
     **_CPU_KERNELS,
     "rmsnorm_apply": kernels.make_rmsnorm_apply_bf16,
     "rmsnorm_fused": kernels.make_rmsnorm_fused_bf16,
+    # q/k norm: the output survives to the bf16 KV pool, so a bf16 store here
+    # rounds twice (errors/2026-09-03-unfused-prelude-double-rounds.md)
+    "rmsnorm_fused_f32": kernels.make_rmsnorm_fused_f32,
     "silu_mul": kernels.make_silu_mul_bf16,
     "gemm_nt": kernels_linear.make_gemm_nt_mma,
     "gemm_nn": kernels_linear.make_gemm_nn_mma,

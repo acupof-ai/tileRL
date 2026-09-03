@@ -213,19 +213,40 @@ class Backend:
     # ------------------------------------------------------------ rmsnorm
 
     def rmsnorm(self, x, w, eps):
+        return self._rmsnorm(x, w, eps, out_f32=False)
+
+    def rmsnorm_f32(self, x, w, eps):
+        """rmsnorm whose output stays f32. For q/k norm, whose result reaches the
+        bf16 KV pool through rope: a bf16 store here would round twice.
+
+        A separate method rather than a keyword on :meth:`rmsnorm` because
+        `_TapeBackend.__getattr__` forwards **kwargs into the recorded entry and
+        `_default("rmsnorm")` passes them to `rmsnorm_bwd(grad, x, w, eps)`, which
+        would raise. It is registered in `autograd._BWD` against the same
+        `rmsnorm_bwd` -- the backward of a norm does not depend on the dtype the
+        forward stored -- and an unregistered op records NO tape entry at all,
+        silently (measured: 1 entry for rmsnorm, 0 for an unregistered twin)."""
+        return self._rmsnorm(x, w, eps, out_f32=True)
+
+    def _rmsnorm(self, x, w, eps, *, out_f32: bool):
         x = self._f32(x)
         w = self._const_f32(w)
         lead = x.shape[:-1]
         x2 = self._c(x.reshape(-1, x.shape[-1]))
         N = x2.shape[-1]
-        if "rmsnorm_fused" in _resolve(self.precision, self.arch):
-            y = self._kernel("rmsnorm_fused")(x2, w, float(eps), 256)
+        kset = _resolve(self.precision, self.arch)
+        key = "rmsnorm_fused_f32" if out_f32 else "rmsnorm_fused"
+        if key in kset:
+            y = self._kernel(key)(x2, w, float(eps), 256)
             return y.reshape(*lead, w.shape[0])
         block_N = min(256, N)
         num_chunks = (N + block_N - 1) // block_N
         p = self._kernel("rmsnorm_partial")(x2, block_N, num_chunks, _THREADS)
+        # the cell's rmsnorm_apply is f32 everywhere but sm90, which overrides it
+        # to bf16; out_f32 there needs the fused f32 kernel, handled above
         y = self._kernel("rmsnorm_apply")(x2, w, p, float(eps), block_N, num_chunks, _THREADS)
         return y.reshape(*lead, w.shape[0])
+
 
     def rmsnorm_bwd(self, grad, x, w, eps):
         grad = self._f32(grad)

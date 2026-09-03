@@ -98,17 +98,22 @@ def make_rmsnorm_apply_bf16(target: str):
     return rmsnorm_apply
 
 
-def make_rmsnorm_fused_bf16(target: str):
+def make_rmsnorm_fused(target: str, out_dtype: str = "bfloat16"):
     """One-launch rmsnorm (sm90): a block per row, block-wide allreduce of the
-    squared sum, bf16 out. A serial single-thread reduce regressed 20%
-    (errors/2026-08-27-fused-rmsnorm-regression.md)."""
+    squared sum. A serial single-thread reduce regressed 20%
+    (errors/2026-08-27-fused-rmsnorm-regression.md).
+
+    ``out_dtype`` is bf16 where the consumer is a bf16-IO GEMM and f32 where the
+    output survives to a stored value: q/k norm feeds rope and then the bf16 KV
+    pool, so a bf16 output there rounds twice and costs one extra ulp
+    (errors/2026-09-03-unfused-prelude-double-rounds.md)."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def rmsnorm_fused(X, W, eps: T.float32, threads):
         M, N = T.const("M, N")
         X: T.Tensor((M, N), "float32")
         W: T.Tensor((N,), "float32")
-        Y = T.empty((M, N), "bfloat16")
+        Y = T.empty((M, N), out_dtype)
         with T.Kernel(M, threads=threads) as row:
             tx = T.get_thread_binding(0)
             part = T.alloc_local((1,), "float32")
@@ -130,10 +135,18 @@ def make_rmsnorm_fused_bf16(target: str):
             for i in T.serial(T.ceildiv(N, threads)):
                 kk = i * threads + tx
                 if kk < N:
-                    Y[row, kk] = T.cast(X[row, kk] * rstd * W[kk], "bfloat16")
+                    Y[row, kk] = T.cast(X[row, kk] * rstd * W[kk], out_dtype)
         return Y
 
     return rmsnorm_fused
+
+
+def make_rmsnorm_fused_bf16(target: str):
+    return make_rmsnorm_fused(target, "bfloat16")
+
+
+def make_rmsnorm_fused_f32(target: str):
+    return make_rmsnorm_fused(target, "float32")
 
 
 def make_rmsnorm_rstd(target: str):
