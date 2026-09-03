@@ -26,7 +26,7 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    from tilerl.autograd import AdamW, Tape
+    from tilerl.autograd import AdamW
     from tilerl.config import qwen36_27b
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.model import load_hf
@@ -82,7 +82,7 @@ def main() -> None:
     seq = np.asarray(prompt + out, dtype=np.int64)[None, :]
     for step in range(args.train_steps):
         t0 = time.perf_counter()
-        loss = train_step(model, seq, backend, opt, Tape())
+        loss = train_step(model, seq, backend, opt)
         if backend.device.type == "cuda":
             torch.cuda.synchronize()
         dt = time.perf_counter() - t0

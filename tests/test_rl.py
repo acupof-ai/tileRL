@@ -81,6 +81,33 @@ def test_rl_step_ignores_padding():
     assert worst < 1e-6, f"prompt/padding leaked into the RL gradient: {worst:.2e}"
 
 
+def test_micro_batching_is_the_same_update():
+    """A group split into micro-batches must land on the same weights as the
+    whole group in one backward, or micro-batching would be a quieter way of
+    shrinking the group — the thing that changes the training signal. Rows have
+    different advantages, prompt lengths and seq lens, so a normalizer that
+    silently follows the micro-batch size would show up here.
+    """
+    rng = np.random.default_rng(0)
+    ids = rng.integers(1, 300, size=(8, 20)).astype(np.int64)
+    adv = np.array([1.5, -0.5, 0.0, 2.0, -1.25, 0.75, -2.0, 0.25])
+    plens = np.array([3, 5, 4, 6, 3, 7, 5, 4], dtype=np.int64)
+    slens = np.array([20, 18, 15, 20, 12, 19, 17, 20], dtype=np.int64)
+    backend = RefBackend()
+
+    deltas = []
+    for micro in (0, 1, 3):
+        _, model = _build_model("tiny", seed=0, keep_master=True)
+        snap = _snapshot(model)
+        rl_step(model, ids, adv, plens, backend, AdamW(lr=1e-3), seq_lens=slens, micro=micro)
+        deltas.append({k: model.params[k] - v for k, v in snap.items()})
+    moved = max(v.abs().max().item() for v in deltas[0].values())
+    assert moved > 1e-5, "the reference step did not move the weights"
+    for micro, d in zip((1, 3), deltas[1:]):
+        worst = max((deltas[0][k] - d[k]).abs().max().item() for k in d)
+        assert worst < 1e-6, f"micro={micro} changed the update: {worst:.2e} (moved {moved:.2e})"
+
+
 def test_grpo_loop_raises_reward():
     """End to end on the tiny model: rollouts through the engine, a reward the
     policy can move, and reward must go up. The engine that samples is the model

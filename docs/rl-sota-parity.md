@@ -194,22 +194,25 @@ mitigate it. Our vocab is 248320, larger than either.
 
 | | TRL | AReaL | tileRL |
 |---|---|---|---|
-| gradient checkpointing | `gradient_checkpointing=True` (TRL overrides HF's `False`) | `False` in the dataclass, `true` in every example | **none** |
-| micro-batching | `gradient_accumulation_steps`; `auto_find_batch_size` **rejected outright** because halving the batch breaks prompt-group integrity | `max_tokens_per_mb=None` → 1e12, i.e. no split out of the box; every example sets 10240 | **none** — the whole group goes through one backward |
-| logits handling | `_get_per_token_logps_and_entropies` chunks rows, still materializes `[b, C, V]`; `selective_log_softmax` loops row by row; the real fix is Liger's fused chunked LM head, which never materializes `[B,T,V]` | `logprobs_chunk_size=1024`; vocab-parallel custom autograd whose backward **overwrites the saved softmax in place** as `onehot - softmax`, allocating no new large tensor | `cross_entropy_loss_grad` holds **four** `[B,T,V]` f32 tensors at once (`reference.py:817-824`), then `rl_step` allocates a fifth for `grad * w * scale` |
+| gradient checkpointing | `gradient_checkpointing=True` (TRL overrides HF's `False`) | `False` in the dataclass, `true` in every example | `autograd.checkpoint`, on by default; the MLP block only — attention and GDN advance their pools and cannot be replayed |
+| micro-batching | `gradient_accumulation_steps`; `auto_find_batch_size` **rejected outright** because halving the batch breaks prompt-group integrity | `max_tokens_per_mb=None` → 1e12, i.e. no split out of the box; every example sets 10240 | `rl_step(micro=N)`, `--micro`; the scored-token normalizer is the whole batch's, so the split is gradient-identical (`test_micro_batching_is_the_same_update`) |
+| logits handling | `_get_per_token_logps_and_entropies` chunks rows, still materializes `[b, C, V]`; `selective_log_softmax` loops row by row; the real fix is Liger's fused chunked LM head, which never materializes `[B,T,V]` | `logprobs_chunk_size=1024`; vocab-parallel custom autograd whose backward **overwrites the saved softmax in place** as `onehot - softmax`, allocating no new large tensor | `cross_entropy_loss_grad` writes `softmax - onehot` over the logits and `rl_step` scales that buffer in place — one `[B,T,V]` f32 tensor, where the shape-for-shape version held five |
 | optimizer state | HF defaults, 8-bit/paged available | `optimizer_dtype="float32"` | fp32 moments (`precision.py:12`), but only over LoRA adapters |
 
-**Verdict: omission, and it is the reason the recipe dies.**
+**Verdict: was the reason the recipe died; now aligned.**
 `tilerl train --recipe grpo-gsm8k-27b` (group 8, 256 new tokens, LoRA rank 16)
-reaches the training step and raises `torch.OutOfMemoryError` allocating a
+used to reach the training step and raise `torch.OutOfMemoryError` allocating a
 146 MiB buffer with 95.15 of 95.22 GiB already used. Weights are ~23 GiB, so
-the rest is activations the tape is holding.
+the rest was activations the tape was holding.
 
-TRL's reason for rejecting `auto_find_batch_size` is the reason the fix cannot
-be "use a smaller group": the group is the baseline. Micro-batching with
+TRL's reason for rejecting `auto_find_batch_size` is the reason the fix could
+not be "use a smaller group": the group is the baseline. Micro-batching with
 gradient accumulation is the only shrink that leaves the advantage
-normalization untouched. Fixed on `train/grpo-memory`, with the equivalence
-proved as a test rather than argued.
+normalization untouched, and its equivalence is a test rather than an argument
+([wins/2026-09-03-grpo-27b-fits-the-card.md](experience/wins/2026-09-03-grpo-27b-fits-the-card.md)).
+One row still reads differently than both surveys: the in-place CE is worth
+0.25 GiB here, because our peak is the stored layer activations, not the vocab
+tensor.
 
 ## 6. Sequence handling
 

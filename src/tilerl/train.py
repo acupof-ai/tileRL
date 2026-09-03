@@ -51,30 +51,39 @@ def _step(
     input_ids: Any,
     backend: Any,
     optimizer: AdamW,
-    tape: Tape | None,
     trainable: dict[str, Any] | None,
     grad_fn: Any,
+    micro: int = 0,
 ) -> float:
-    """Forward under a tape, ``grad_fn`` for the logit gradient, backward, clip,
-    update. The step is skipped when the loss or grad norm is non-finite."""
+    """Forward under a tape, ``grad_fn(logits, rows, offset)`` for the logit
+    gradient, backward, clip, update. ``micro`` > 0 runs that many rows at a time
+    and sums the parameter gradients before one update: ``grad_fn`` normalizes by
+    the whole batch, so the update is the same however the rows were split.
+    The step is skipped when the loss or grad norm is non-finite."""
     input_ids = np.asarray(input_ids, dtype=np.int64)
-    b, t = input_ids.shape
-    positions = np.arange(t, dtype=np.int64)
+    b = input_ids.shape[0]
     model.params = backend.materialize(model.params)
-    kv = _training_kv(model, b, t, device=backend.device)
-    if tape is None:
-        tape = Tape()
-
-    with torch.no_grad(), tape:
-        logits = model.forward(input_ids, positions, kv, RecordingBackend(backend))
-
-    loss, grad_logits = grad_fn(logits, input_ids)
-    if not math.isfinite(loss):
-        return loss
-
     params = model.params if trainable is None else trainable
     by_id = {id(p): p for p in params.values()}
     param_ids = set(by_id)
+    rows = micro if 0 < micro < b else b
+    if rows != b and getattr(optimizer, "streams", False):
+        raise ValueError(
+            "micro-batching holds every parameter gradient until the update, which is "
+            "the 50.1 GiB a streaming optimizer exists to avoid; use one row per step")
+
+    def run(lo: int, on_grad: Any) -> tuple[float, dict[int, torch.Tensor]]:
+        chunk = input_ids[lo : lo + rows]
+        n, t = chunk.shape
+        kv = _training_kv(model, n, t, device=backend.device)
+        tape = Tape()
+        with torch.no_grad(), tape:
+            logits = model.forward(chunk, np.arange(t, dtype=np.int64), kv,
+                                   RecordingBackend(backend))
+        loss, grad_logits = grad_fn(logits, chunk, lo)
+        if not math.isfinite(loss):
+            return loss, {}
+        return loss, tape.backward(grad_logits, on_grad=on_grad, needs=param_ids)
 
     if getattr(optimizer, "streams", False):
         # Every weight gradient coexisting is 50.1 GiB on the 27B: this
@@ -85,25 +94,31 @@ def _step(
 
         def _apply(tid: int, g: torch.Tensor) -> bool:
             nonlocal seen
-            p = by_id.get(tid)
-            if p is None:
-                return True
-            optimizer.step_one(p, g)
-            seen += 1
+            if tid in param_ids:
+                optimizer.step_one(by_id[tid], g)
+                seen += 1
             return True
 
-        tape.backward(grad_logits, on_grad=_apply, needs=param_ids)
-        assert seen, _NO_GRAD
+        loss, _ = run(0, _apply)
+        assert seen or not math.isfinite(loss), _NO_GRAD
         return loss
 
-    grads = tape.backward(grad_logits, needs=param_ids)
-    assert param_ids & set(grads), _NO_GRAD
-    # The GDN initial state is a tape leaf whose grad must not enter the clip norm.
-    grads = {k: v for k, v in grads.items() if k in param_ids}
-    norm = clip_grad_norm(grads, 1.0)
+    acc: dict[int, torch.Tensor] = {}
+    total = 0.0
+    for lo in range(0, b, rows):
+        loss, grads = run(lo, None)
+        if not math.isfinite(loss):
+            return loss
+        total += loss * min(rows, b - lo) / b
+        for tid in param_ids & set(grads):
+            prev = acc.get(tid)
+            # fp32 accumulation: bf16 adapter grads summed over a group lose bits.
+            acc[tid] = prev.add_(grads[tid]) if prev is not None else grads[tid].float()
+    assert acc, _NO_GRAD
+    norm = clip_grad_norm(acc, 1.0)
     if math.isfinite(norm):
-        optimizer.step(params.values(), grads)
-    return loss
+        optimizer.step(params.values(), acc)
+    return total
 
 
 def train_step(
@@ -111,12 +126,18 @@ def train_step(
     input_ids: Any,
     backend: Any,
     optimizer: AdamW,
-    tape: Tape | None = None,
     trainable: dict[str, Any] | None = None,
+    micro: int = 0,
 ) -> float:
     """One SFT step: causal cross-entropy on ``input_ids``. Returns the loss."""
-    return _step(model, input_ids, backend, optimizer, tape, trainable,
-                 lambda logits, ids: backend.cross_entropy_loss_grad(logits, ids))
+    b = np.asarray(input_ids).shape[0]
+
+    def grad_fn(logits, chunk, lo):
+        loss, grad = backend.cross_entropy_loss_grad(logits, chunk)
+        # CE averages over this chunk's rows; rescale to the batch's.
+        return loss, grad.mul_(len(chunk) / b)
+
+    return _step(model, input_ids, backend, optimizer, trainable, grad_fn, micro)
 
 
 def group_advantages(rewards: Any, group: int) -> "np.ndarray":
@@ -135,9 +156,9 @@ def rl_step(
     prompt_lens: Any,
     backend: Any,
     optimizer: AdamW,
-    tape: Tape | None = None,
     trainable: dict[str, Any] | None = None,
     seq_lens: Any = None,
+    micro: int = 0,
 ) -> float:
     """One policy-gradient step: the causal-CE gradient scaled per row by the
     advantage and zeroed on prompt/padding positions. ``input_ids`` [B,T] is
@@ -145,27 +166,31 @@ def rl_step(
     (default T). Returns the batch cross-entropy as a diagnostic.
     # ponytail: single-update REINFORCE-with-baseline; add the PPO ratio+clip
     # when a rollout is reused for more than one step."""
+    ids = np.asarray(input_ids, dtype=np.int64)
+    b, t = ids.shape
     adv = torch.as_tensor(np.asarray(advantages, dtype=np.float32))
-    plen = np.asarray(prompt_lens, dtype=np.int64)
-    slen = None if seq_lens is None else np.asarray(seq_lens, dtype=np.int64)
+    plen = np.asarray(prompt_lens, dtype=np.int64).reshape(b, 1)
+    slen = (np.full((b, 1), t) if seq_lens is None
+            else np.asarray(seq_lens, dtype=np.int64).reshape(b, 1))
+    pos = np.arange(t)
+    # Position i predicts token i+1: scored iff prompt_len <= i+1 < seq_len. Counted
+    # over the WHOLE batch — a per-micro-batch normalizer reweights the rows silently.
+    n = float(((pos >= plen - 1) & (pos < slen - 1)).sum())
 
-    def grad_fn(logits, ids):
-        b, t, _ = logits.shape
-        loss, grad = backend.cross_entropy_loss_grad(logits, ids)
+    def grad_fn(logits, chunk, lo):
+        bm, tm = chunk.shape
+        loss, grad = backend.cross_entropy_loss_grad(logits, chunk)
         dev = grad.device
-        # Position i predicts token i+1: scored iff prompt_len <= i+1 < seq_len.
-        pos = torch.arange(t, device=dev).reshape(1, t)
-        keep = pos >= torch.as_tensor(plen, device=dev).reshape(b, 1) - 1
-        if slen is not None:
-            keep = keep & (pos < torch.as_tensor(slen, device=dev).reshape(b, 1) - 1)
-        w = keep.float() * adv.to(dev).reshape(b, 1)
-        # CE averages over b*(t-1) positions; rescale to the scored count so the
-        # step size does not depend on how much prompt or padding is in the batch.
-        n = float(keep[:, :-1].sum().item())
-        grad = grad * w.unsqueeze(-1) * (b * (t - 1) / max(n, 1.0))
-        return loss, grad
+        p = torch.arange(tm, device=dev).reshape(1, tm)
+        rows = slice(lo, lo + bm)
+        keep = (p >= torch.as_tensor(plen[rows], device=dev) - 1) & (
+            p < torch.as_tensor(slen[rows], device=dev) - 1)
+        w = keep.float() * adv[rows].to(dev).reshape(bm, 1)
+        # CE averaged over this chunk's bm*(tm-1) positions; rescale to the batch's
+        # scored count so prompt, padding and micro-batch size cost nothing.
+        return loss, grad.mul_(w.unsqueeze(-1) * (bm * (tm - 1) / max(n, 1.0)))
 
-    return _step(model, input_ids, backend, optimizer, tape, trainable, grad_fn)
+    return _step(model, ids, backend, optimizer, trainable, grad_fn, micro)
 
 
 def _require_on_policy(engine: Any) -> None:
@@ -201,10 +226,12 @@ def grpo_loop(
     sampling: Any = None,
     seed: int = 0,
     trainable: dict[str, Any] | None = None,
+    micro: int = 0,
 ) -> list[tuple[float, float, float, float]]:
     """GRPO: sample ``group`` completions per prompt in one engine batch, score
     them with ``reward_fn(prompt_ids, completion_ids) -> float``, take one
-    policy-gradient step on the group-normalized advantages. The engine that
+    policy-gradient step on the group-normalized advantages, in ``micro`` rows
+    at a time (``0`` = the whole group at once). The engine that
     generates IS the model that trains, so it must be built with the prefix
     cache and decode graph off, and rollouts are drawn untruncated so the
     sampler is the policy the step differentiates. Returns per step
@@ -246,8 +273,8 @@ def grpo_loop(
         ])
         plens = np.full(group, len(prompt), dtype=np.int64)
         slens = np.array([len(prompt) + len(c) for c in comps], dtype=np.int64)
-        ce = rl_step(model, batch, adv, plens, backend, optimizer,
-                     trainable=trainable, seq_lens=slens)
+        ce = rl_step(model, batch, adv, plens, backend, optimizer, trainable=trainable,
+                     seq_lens=slens, micro=micro)
         out.append((float(np.mean(rewards)), ce, time.perf_counter() - t0, tied))
     return out
 
@@ -361,7 +388,7 @@ def pretrain(
         for idx in rng.permutation(len(sequences)):
             input_ids = np.asarray(sequences[idx], dtype=np.int64)[None, :]
             optimizer.lr = cosine_warmup(step, steps, warmup, lr)
-            loss = train_step(model, input_ids, backend, optimizer, Tape())
+            loss = train_step(model, input_ids, backend, optimizer)
             losses.append(loss)
             if log_every and (step % log_every == 0 or step == steps - 1):
                 print(f"step {step + 1:4d}/{steps}  loss {loss:.4f}  lr {optimizer.lr:.2e}")
