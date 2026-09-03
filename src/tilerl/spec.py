@@ -124,7 +124,7 @@ class DraftHead:
         if hidden_out is not None:
             hidden_out.append(x)
         x = backend.rmsnorm(x, self.params["norm"], eps)
-        head = "embed_tokens" if self.trunk.cfg.tie_word_embeddings else "lm_head"
+        head = self.trunk.cfg.head_key
         return self.trunk._linear(backend, x, head)
 
     def confidence(self, hidden, probs, backend) -> torch.Tensor:

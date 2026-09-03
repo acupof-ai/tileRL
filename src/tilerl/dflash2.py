@@ -199,7 +199,7 @@ class DFlash2Head:
         slot so the block is sequential; the rows are not, so they walk together
         and the batch costs one host sync, not two per slot per row."""
         dc = self.dcfg
-        head = "embed_tokens" if self.trunk.cfg.tie_word_embeddings else "lm_head"
+        head = self.trunk.cfg.head_key
         # topk before the widening cast: it is order-preserving, and an f32 copy of
         # the full [B, W, 248320] readout is 55 MB at B=8
         unary, cand = torch.topk(self.trunk._linear(backend, hidden, head), dc.top_k, dim=-1)

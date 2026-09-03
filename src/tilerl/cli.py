@@ -16,6 +16,26 @@ from .recipes import RECIPES, flags
 # ponytail: placeholder hub id; pin the real Qwen3-27B repo when weights land.
 _QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")
 
+_NO_WEIGHTS = (
+    "hint: download the checkpoint (or set TILERL_QWEN38_SOURCE to a\n"
+    "      local safetensors directory), or use --model tiny."
+)
+
+
+def _qwen38_tokenizer():
+    """The 27B tokenizer, with the same hint as its weights: a bare hub id 401s."""
+    from .tokenizer import get_tokenizer
+
+    try:
+        return get_tokenizer(_QWEN38_SOURCE)
+    except Exception as exc:
+        # HF's 401 body is a dozen lines of auth advice; the first names the cause.
+        # Some exceptions (MemoryError) stringify empty, so splitlines() can be [].
+        first = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+        print(f"error: could not load the Qwen3-27B tokenizer from {_QWEN38_SOURCE!r}: "
+              f"{first}\n{_NO_WEIGHTS}", file=sys.stderr)
+        sys.exit(1)
+
 
 def _build_model(
     model_name: str, seed: int, fuse_projections: bool = False, keep_master: bool = False
@@ -33,8 +53,7 @@ def _build_model(
         except Exception as exc:
             print(
                 f"error: could not load Qwen3-27B weights from {_QWEN38_SOURCE!r}: {exc}\n"
-                "hint: download the checkpoint (or set TILERL_QWEN38_SOURCE to a\n"
-                "      local safetensors directory), or use --model tiny.",
+                f"{_NO_WEIGHTS}",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -82,7 +101,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     backend = get_backend()
     cfg, model = _build_model(args.model, seed=0, fuse_projections=True)
     engine = _build_engine(cfg, model, backend, devices=args.devices)
-    tokenizer = get_tokenizer(_QWEN38_SOURCE if args.model == "qwen38-27b" else None)
+    tokenizer = _qwen38_tokenizer() if args.model == "qwen38-27b" else get_tokenizer(None)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
     engine.run()
@@ -150,7 +169,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
 
     real = args.model == "qwen38-27b"
     log = (lambda *a, **k: None) if args.json else print
-    tok = get_tokenizer(_QWEN38_SOURCE if real else None)
+    tok = _qwen38_tokenizer() if real else get_tokenizer(None)
     rows, eval_rows = _jsonl(args.data), _jsonl(args.eval_gsm8k)[: args.eval_n]
     thinking = (args.max_think_tokens > 0) if real else None
     params = sampling(tok, thinking, args.max_new_tokens, temperature=args.temperature,
@@ -227,8 +246,14 @@ def _train_adapters(args: argparse.Namespace) -> None:
             hist.append((r, ce, secs, tied))
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
                 f"tied {tied:.2f}  {secs:.1f}s", flush=True)
+        # Windowed means, not hist[0] vs hist[-1]: per-step reward moves with the
+        # sampled prompt, so two single steps compare two draws, not two policies
+        # (tests/test_rl.py::test_grpo_loop_raises_reward uses the same windows).
+        w = max(1, len(hist) // 4)
         manifest["metrics"].update(
-            reward_first=hist[0][0], reward_last=hist[-1][0], ce_last=hist[-1][1],
+            reward_first=statistics.mean(h[0] for h in hist[:w]),
+            reward_last=statistics.mean(h[0] for h in hist[-w:]),
+            ce_last=hist[-1][1],
             secs_per_step_median=statistics.median(h[2] for h in hist),
             tied_group_fraction=statistics.mean(h[3] for h in hist))
     else:
@@ -540,7 +565,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
 def main() -> None:
     recipe = getattr(_build_parser().parse_known_args()[0], "recipe", None)
     if recipe:
-        print(f"recipe {recipe}: {RECIPES[recipe]['status']}")
+        # stderr: --json is not known until the parser is built, and stdout is the JSON stream.
+        print(f"recipe {recipe}: {RECIPES[recipe]['status']}", file=sys.stderr)
     args = _build_parser(recipe).parse_args()
     args.func(args)
 

@@ -82,7 +82,7 @@ def main() -> int:
             x = model._mlp(i, x, backend)
             caps.append((f"mlp{i}Δ", (x - x1).detach()[0, -1].float().clone()))
         x = backend.rmsnorm(x, model.params["final_norm"], cfg.rms_eps)
-        head = "embed_tokens" if cfg.tie_word_embeddings else "lm_head"
+        head = cfg.head_key
         logits = model._linear(backend, x, head)
         caps.append(("logits", logits.detach()[0, -1].float().clone()))
         return caps
