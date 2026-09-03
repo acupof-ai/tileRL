@@ -185,6 +185,13 @@ def main() -> None:
                          "paged_attention asked for 1.50 GiB with 0.69 free, and the block "
                          "pool is only 0.03 GB of that, so it is transient kernel work "
                          "scaling with B*S*history, not something a pool size fixes")
+    ap.add_argument("--min-ctx", type=int, default=0,
+                    help="skip contexts below this. Raising --max-ctx grows the KV pool "
+                         "(blocks come from max(ctxs)), so a ceiling probe re-runs every "
+                         "shorter context with less free memory than its own run had: "
+                         "--max-ctx 1024 costs 236 MB more pool than 512 and stalled the "
+                         "ctx=512 step that reads 88.5 tok/s on its own. Pair the two to "
+                         "measure ONE context at its own pool size")
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
     # cli binds _QWEN38_SOURCE from the env at import, which already happened.
@@ -205,10 +212,17 @@ def main() -> None:
     # block costs 0.92 MB: 0.79 trunk + 0.13 for the draft's plane, which mirrors
     # num_blocks). ctx 4096 at B=4 needs 1060; the +32 is slack for block-boundary
     # rounding, not for a fifth request.
-    ctxs = [c for c in CTXS if c <= args.max_ctx]
+    ctxs = [c for c in CTXS if args.min_ctx <= c <= args.max_ctx]
     if not ctxs:
-        raise SystemExit(f"--max-ctx {args.max_ctx} excludes every context in {CTXS}")
+        raise SystemExit(
+            f"--min-ctx {args.min_ctx} --max-ctx {args.max_ctx} excludes every context in {CTXS}"
+        )
     blocks = b * (-(-(max(ctxs) + args.tokens + 2 * (1 + args.depth)) // BLOCK_TOKENS)) + 32
+    # Print it: the pool is a function of max(ctxs), so two runs that both report a
+    # "ctx=512" row can be holding different amounts of free memory. Comparing those
+    # rows across runs stalled one at a context the other measured at 88.5 tok/s.
+    print(f"pool: {blocks} blocks ({blocks * 0.92:.0f} MB) sized for ctx={max(ctxs)}, "
+          f"sweeping {ctxs}")
     e = build_engine(cfg, model, backend, num_blocks=blocks, num_slots=slots, max_batch=b,
                      max_total_tokens=8192, draft=draft,
                      spec_depth=args.depth if draft else 1)
