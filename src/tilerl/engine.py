@@ -812,17 +812,14 @@ class Engine:
         logits = torch.stack([l for _, l, _ in rows])
         cut = params[0]
         if all((p.allowed_ids, p.top_k) == (cut.allowed_ids, cut.top_k) for p in params):
-            # the restriction is per-row only in principle; when it is uniform this is
-            # one topk over [N,V] and one allowed_ids upload, not N of each
-            logits = _restrict(logits, cut)
+            logits = _restrict(logits, cut)  # one topk and one id upload, not N
         else:
             logits = torch.stack([_restrict(logits[i], p) for i, p in enumerate(params)])
-        temps = [p.temperature for p in params]
-        top_ps = [p.top_p for p in params]
-        seeds = [_step_seed(r.params.seed, g) for r, _, g in rows]
-        # the greedy branch scores its draw with a second full-vocabulary log_softmax
-        want_lp = any(p.logprobs for p in params)
-        toks, lps = self._backend.sample_batch(logits, temps, top_ps, seeds, logprobs=want_lp)
+        want_lp = any(p.logprobs for p in params)  # a greedy score is a second full softmax
+        toks, lps = self._backend.sample_batch(
+            logits, [p.temperature for p in params], [p.top_p for p in params],
+            [_step_seed(r.params.seed, g) for r, _, g in rows], logprobs=want_lp,
+        )
         self._last_logprobs = lps.tolist() if want_lp else None
         return toks.tolist()
 
