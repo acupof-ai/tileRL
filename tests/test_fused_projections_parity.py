@@ -5,6 +5,11 @@ covers the native-fp8 qkvz group: _fuse_projections concats .w8/.wscale along
 N, _gdn splits the fused output back at the qkv boundary. sm90 serves the fp8
 bytes; every other cell has Backend.materialize rebuild a bf16 weight from
 them. Either way the concat is lossless, so the logits match.
+
+The concat being lossless does NOT make the two arms equivalent: on a full-attn
+layer, fusing also switches the prelude to backend.attn_prep, which is a
+different implementation of norm+rope+kv-write and not just a different GEMM
+shape. See errors/2026-09-03-unfused-prelude-double-rounds.md.
 """
 
 from dataclasses import replace
@@ -15,6 +20,7 @@ from tilerl_kernels.backend import get_backend
 
 from tilerl.config import tiny
 from tilerl.model import Model, _fuse_projections, build_random
+from tilerl.testing import RefBackend
 from tilerl.train import _training_kv
 
 
@@ -64,3 +70,26 @@ def test_fused_fp8_qkvz_parity():
         y0 = model.forward(batch, positions, _training_kv(model, 2, 16, device=d), backend)
         y1 = fused.forward(batch, positions, _training_kv(fused, 2, 16, device=d), backend)
     assert torch.allclose(y0, y1, rtol=1e-2, atol=1e-2), (y0 - y1).abs().max()
+
+
+def test_attn_prep_has_no_cpu_twin_so_the_parity_gate_misses_the_fused_prelude():
+    """The coverage hole that let the unfused prelude's double-rounding ship.
+
+    `fuse_projections=True` does not only concat weights: on a full-attn layer it
+    switches the prelude to `backend.attn_prep` (norm+rope+kv-write in one launch)
+    and never reaches the discrete `rmsnorm`/`rope`/`write_tokens` sequence.
+    `RefBackend.attn_prep` returns None unconditionally, so the CPU cell always
+    takes the discrete path -- both arms of every CPU parity test, this file's
+    included, run the SAME prelude, and the sm90 one is untested.
+
+    Measured on the 27B (card 6): the discrete prelude is 2.0007x further from a
+    dense f32 norm+rope than `attn_prep` on 580/580 differing K-plane elements,
+    which is exactly one extra bf16 rounding step.
+
+    This asserts the hole rather than closing it: closing it means writing a CPU
+    `attn_prep`, which is a serving-path change. When that lands, this test
+    should fail and be replaced by a real parity check."""
+    assert RefBackend.attn_prep(None) is None, (
+        "RefBackend.attn_prep now returns something: write the real parity check "
+        "against the discrete prelude and delete this test"
+    )

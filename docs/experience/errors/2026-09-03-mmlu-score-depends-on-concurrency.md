@@ -1,6 +1,6 @@
 ---
 question: The same MMLU slice scored 746/1000 and 742/1000 on clean main. What moved?
-status: mechanism identified and the recording fixed; the 4 questions are not yet attributed
+status: MECHANISM CORRECTED 2026-09-03 -- concurrency moves 0 of 1000 answers; the real variable was fuse_projections (see 2026-09-03-unfused-prelude-double-rounds.md). The recording fix stands.
 source: read on origin/main 87f59b2; the 4-question gap measured on H20 sm90, 27B NVFP4
 ---
 
@@ -17,6 +17,19 @@ The difference between the two runs was **concurrency**: 32 (the
 `cli.py:197` passes).
 
 ## Why concurrency can change an answer
+
+**This section is wrong, and the correction is measured.** Concurrency 8 and 32
+return 742/1000 each with **0 of 1000 answers differing**, so concurrency changes
+no MMLU answer. `M` on a prefill tick comes from `_PREFILL_BUCKET` (64) and the
+prompt's own padded length, not from the batch: concurrency batches independent
+rows and each keeps its own width. `M = B * W` is a **decode**-tick mechanism, and
+MMLU at `max_new_tokens=1` runs no decode ticks. The variable that actually
+differed between the two callers was `fuse_projections` —
+[the unfused prelude double-rounds](2026-09-03-unfused-prelude-double-rounds.md).
+
+The fix recorded below still stands: recording which concurrency a score used was
+right, and the reason given for why it mattered was not. Kept rather than deleted
+because the reasoning is the error worth reading.
 
 `concurrency` sets the engine's batch size. The batch size sets `M = B * W`. And
 `M` picks the fp4 linear arm:
@@ -63,15 +76,17 @@ the two-tuple turns it red, which was run rather than assumed.
 
 ## What is not settled
 
-**Whether those 4 questions are near-ties.** The mechanism above predicts they
-are, and the ladder makes the prediction quantitative, but nobody has looked at
-their top-2 gaps. The discriminator is the same one the W=8 divergence used: a
-flip at a gap below ~0.15 is arithmetic; a flip at a wide gap is a defect and
-matters far more than 0.4%. Same slice, same seed, same card, concurrency 8
-against 32, comparing per-question top-2 margins.
+**Settled 2026-09-03, and the answer was that the question was wrong.** There are
+no 4 flipped questions: concurrency 8 and 32 both score 742/1000 and **0 of 1000
+answers differ**, with 41 questions (4.1%) sitting under the 0.153 arm-change
+delta — near-ties existed and none of them moved. The 746-vs-742 gap was
+`fuse_projections`, not concurrency, and the flipped answers there are **not**
+near-ties: 53 questions, |Δ logit| median 1.071 and max 4.462, only 3 of 53 inside
+0.153. That is the wide-gap case this section called a defect, and it was one —
+[the unfused prelude double-rounds](2026-09-03-unfused-prelude-double-rounds.md).
 
-Until that runs, **74.6% and 74.2% should be read as one number measured two
-ways**, not as a change.
+So **74.6% and 74.2% are two different numbers, not one measured two ways**: 74.6%
+is the accurate arm.
 
 ## Rule
 
