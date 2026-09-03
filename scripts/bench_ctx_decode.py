@@ -28,13 +28,22 @@ import torch
 from tilerl import cli
 from tilerl.cli import _build_model
 from tilerl.engine import _PHASE_DECODE, SamplingParams, build_engine
+from tilerl.kv_cache import BLOCK_TOKENS
 from tilerl.spec import load_draft
 from tilerl_kernels.backend import get_backend
 
 CTXS = [32, 512, 1024, 2048, 4096]
 
 
-def measure(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, int]:
+def _sync() -> None:
+    """Drain the device before reading the clock. Conditional so the control flow
+    below is testable on a CPU-only box, which is where the batch=4 slot leak that
+    killed a 20-minute pod run would have been caught."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def measure(e, ctx: int, tokens: int, batch: int = 1, width: int = 1) -> tuple[float, float, int]:
     """tok/s and tok/forward over DECODE ticks only.
 
     ``batch`` submits that many concurrent requests, which is the only way a tick
@@ -43,34 +52,72 @@ def measure(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, int
     (B=4 W=4 is 16 rows -> rung 32, where ncols=2 turns on; B=1 W=4 is 4 rows and
     does not). A B=1 run silently measured the same kernel in both arms of the
     spec-ncols A/B -- errors/2026-09-03-the-spec-ncols-ab-ran-at-b1.md.
+
+    ``width`` is the expected 1+depth, checked against the rows the engine really
+    submits. Only _run_forward sees that count: tok/forward cannot stand in for it,
+    since a fully-rejected batch still yields one token per request per tick and so
+    reads ~batch no matter how wide the tick was.
     """
+    rows: list[int] = []
+    orig = type(e)._run_forward
+
+    def spy(self, decodes, prefills, chunks):
+        if decodes and not prefills:
+            rows.append(sum(1 + len(r.drafts) for r in decodes))
+        return orig(self, decodes, prefills, chunks)
+
     rids = [e.submit(list(range(10 + i * ctx, 10 + (i + 1) * ctx)),
                      SamplingParams(temperature=0.0, max_new_tokens=tokens, seed=0))
             for i in range(batch)]
-    while True:  # burn the prefill chunks for every request
+    for _ in range(4096):  # burn the prefill chunks for every request
         reqs = [next((r for r in e._running if r.req_id == rid), None) for rid in rids]
         if all(r is not None and r.phase == _PHASE_DECODE for r in reqs):
             break
         if any(r is None for r in reqs) and e.poll():
             raise SystemExit(f"ctx={ctx}: a request finished during prefill")
         e.step()
-    torch.cuda.synchronize()
+    else:
+        raise SystemExit(f"ctx={ctx}: prefill did not finish in 4096 ticks")
+    _sync()
     s0, t0 = e.stats(), time.perf_counter()
+    # Close the window at the FIRST completion: speculation accepts different numbers
+    # of drafts per request, so past that point ticks run at B-1, B-2, ... and dilute
+    # the measurement with the narrow ticks this batch flag exists to avoid.
     done: dict = {}
-    while len(done) < batch:
+    type(e)._run_forward = spy
+    try:
+        for _ in range(8 * tokens + 64):
+            if done:
+                break
+            e.step()
+            done.update({k: v for k, v in e.poll().items() if k in rids})
+        else:
+            raise SystemExit(f"ctx={ctx}: no request completed in the tick budget")
+        _sync()
+        wall, s1 = time.perf_counter() - t0, e.stats()
+    finally:
+        type(e)._run_forward = orig
+    # Retire the rest before returning: a slot frees at _finish, so a request left in
+    # _running makes the next measure() raise "LinearStatePool exhausted".
+    for _ in range(8 * tokens + 64):
+        if not e._running:
+            break
         e.step()
-        done.update({k: v for k, v in e.poll().items() if k in rids})
-    torch.cuda.synchronize()
-    wall, s1 = time.perf_counter() - t0, e.stats()
+        e.poll()
+    else:
+        raise SystemExit(f"ctx={ctx}: {len(e._running)} requests would not retire")
     n = s1["tokens_generated"] - s0["tokens_generated"]
     fwd = s1["decode_forwards"] - s0["decode_forwards"]
     mixed = s1["mixed_forwards"] - s0["mixed_forwards"]
     if mixed:  # a mixed tick never speculates; it would dilute tok/forward
         raise SystemExit(f"ctx={ctx}: {mixed} mixed ticks inside the window")
+    if rows and max(rows) < batch * width:
+        raise SystemExit(f"ctx={ctx}: widest tick was {max(rows)} rows, expected "
+                         f"{batch * width}; this is not the batch it claims to be")
     return n / wall, n / max(fwd, 1), n
 
 
-def timed(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, str]:
+def timed(e, ctx: int, tokens: int, batch: int = 1, width: int = 1) -> tuple[float, float, str]:
     """Warm this context, then measure it, and flag an unwarmed reading.
 
     A speculative run captures a CUDA graph per (batch, chain width), and a
@@ -84,9 +131,9 @@ def timed(e, ctx: int, tokens: int, batch: int = 1) -> tuple[float, float, str]:
     Flags rather than raises: a SystemExit here leaves the engine holding the
     whole card, and the orphan is invisible until the next run OOMs.
     """
-    measure(e, ctx, tokens, batch)
-    warm, _, _ = measure(e, ctx, tokens, batch)
-    tps, per_fwd, _ = measure(e, ctx, tokens, batch)
+    measure(e, ctx, tokens, batch, width)
+    warm, _, _ = measure(e, ctx, tokens, batch, width)
+    tps, per_fwd, _ = measure(e, ctx, tokens, batch, width)
     return tps, per_fwd, " UNWARMED" if tps > 2 * warm else ""
 
 
@@ -107,16 +154,21 @@ def main() -> None:
     backend = get_backend()
     cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft) if args.draft else None
-    e = build_engine(cfg, model, backend, num_blocks=1024, num_slots=max(4, args.batch),
-                     max_batch=max(4, args.batch),
+    b = max(4, args.batch)
+    # Blocks for every concurrent request's longest context plus its generation, with
+    # headroom: batch=4 at ctx 4096 needs ~1056 and the old fixed 1024 would have died
+    # on the last context after twenty minutes of measuring.
+    blocks = b * (-(-(max(CTXS) + args.tokens + 2 * (1 + args.depth)) // BLOCK_TOKENS)) + 64
+    e = build_engine(cfg, model, backend, num_blocks=blocks, num_slots=b, max_batch=b,
                      max_total_tokens=8192, draft=draft,
                      spec_depth=args.depth if draft else 1)
     label = f"spec d{args.depth}" if draft else "dense"
-    rows = args.batch * (1 + args.depth if draft else 1)
+    w = 1 + args.depth if draft else 1
+    rows = args.batch * w
     print(f"\n{label} B={args.batch} ({rows} rows/tick): "
           f"{'ctx':>6} {'tok/s':>8} {'ms/tok':>8} {'tok/fwd':>8}")
     for ctx in CTXS:
-        tps, per_fwd, flag = timed(e, ctx, args.tokens, args.batch)
+        tps, per_fwd, flag = timed(e, ctx, args.tokens, args.batch, w)
         print(f"{ctx:>6} {tps:>8.1f} {1000 / tps:>8.1f} {per_fwd:>8.2f}{flag}")
 
 
