@@ -886,16 +886,20 @@ def state_scatter(
     """Store one recurrent-state layer for a batch of slots. ``steps``: the
     tensors carry a chain-step axis and land in the pool's leading step planes."""
     slots = torch.as_tensor(slots, dtype=torch.long, device=states.device).reshape(-1)
+    # device too, not just dtype: a caller holding CPU state writes into a CUDA pool
+    def _as(t, ref):
+        return t.to(device=ref.device, dtype=ref.dtype)
+
     if steps:
         ks = new_state.shape[1]
-        states[slots, layer_idx, :ks] = new_state.to(states.dtype)
+        states[slots, layer_idx, :ks] = _as(new_state, states)
         if new_window is not None:
-            windows[slots, layer_idx, :ks] = new_window.to(windows.dtype)
+            windows[slots, layer_idx, :ks] = _as(new_window, windows)
         return
-    states[slots, layer_idx] = new_state.to(states.dtype)
+    states[slots, layer_idx] = _as(new_state, states)
     if new_window is not None:
         par = torch.zeros_like(slots) if parity is None else parity[slots].long()
-        windows[slots, layer_idx, par] = new_window.to(windows.dtype)
+        windows[slots, layer_idx, par] = _as(new_window, windows)
 
 
 # ---------------------------------------------------------------- embedding
