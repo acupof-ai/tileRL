@@ -99,6 +99,35 @@ exactly the condition that removes the signal that would fix it.
 That also explains why `ce` wanders 3.3-6.1 without trend after step 9 rather
 than continuing to climb: nothing is updating the weights.
 
+**The freezing is self-sustaining**, which is why 92 of 100 steps are exactly
+0.0 rather than noisy-small:
+
+    zero reward -> every rollout ties -> zero advantage -> no gradient -> zero reward
+
+A trap, not a slow arm. Nothing in the loop can leave that state.
+
+### Two causes, one observable, told apart by the tied *value*
+
+[tied-groups-are-the-rewards-shape](2026-09-03-tied-groups-are-the-rewards-shape.md)
+measures the same observable from the other end: GSM8K's reward is
+all-or-nothing, so it ties groups on the tiny model at any learning rate
+(36/36 group-steps, against 0/12 under a graded reward). Tying is therefore
+*expected* here and is not by itself evidence of anything.
+
+What separates the two is the value the group is tied at, and **the log already
+carries it.** `group=8` with a batch of 8 gives exactly one group per step, so
+`tied` is only ever 0.00 or 1.00 and the printed mean reward *is* that group's
+reward whenever `tied` is 1.00:
+
+| line | reading |
+|---|---|
+| `reward 1.0000  tied 1.00` (step 1) | the reward's shape — every rollout solved it |
+| `reward 0.0000  tied 1.00` x12 (steps 9-20) | collapse — every rollout failed |
+
+No new field is needed; the pair of columns is the discriminator, and this
+entry and the tied-groups entry describe the same mechanism reached from
+opposite directions.
+
 ## Fix
 
 `lr=1e-4` in the `grpo-gsm8k-27b` recipe. Not in the CLI default, which also
