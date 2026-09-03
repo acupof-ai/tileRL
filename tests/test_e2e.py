@@ -882,7 +882,8 @@ def test_opd_ema_self_teacher_shares_the_model():
     moved = {k for k in before if not torch.equal(model.params[k], before[k])}
     # sm90's first served forward rewrites .wq into the twiddled layout in place
     # (Backend._served_fp4); that is a layout change, not a weight update.
-    twiddled = {k for k in before if getattr(model.params[k], "_tl_twiddled", False)}
+    twiddled = {k for k in before
+                if getattr(model.params[k], "_tl_layout", "natural") != "natural"}
     assert moved and moved <= set(trainable) | twiddled
 
 

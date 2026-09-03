@@ -192,7 +192,7 @@ def dequant_fp4(wq: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     lay = getattr(wq, "_tl_layout", "natural")
     if lay == "tw-f16":  # sm70 served bytes
         wq = untwiddle_fp4_f16(wq)
-    elif lay == "tw-bf16" or getattr(wq, "_tl_twiddled", False):  # sm90 served bytes
+    elif lay == "tw-bf16":  # sm90 served bytes
         wq = untwiddle_fp4(wq)
     assert wq.dtype == torch.uint8
     n, k2 = wq.shape
