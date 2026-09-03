@@ -91,6 +91,8 @@ def _restrict(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
         keep[..., idx] = logits[..., idx]
         logits = keep
     if 0 < params.top_k < logits.shape[-1]:  # on-device, no sync: a threshold and a mask
+        # ponytail: masks strictly below the kth value, so tied logits at the boundary
+        # leave the support wider than top_k (vLLM #49577 review); exact k needs a sort.
         kth = torch.topk(logits, params.top_k, dim=-1).values[..., -1:]
         logits = logits.masked_fill(logits < kth, float("-inf"))
     return logits

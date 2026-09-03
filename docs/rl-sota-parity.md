@@ -10,12 +10,19 @@ shipped example YAML disagree, both are given — in AReaL that gap is usually
 the whole story.
 
 The short version. We are **stricter than both on on-policy discipline** and
-that is the structural bet the whole project rests on. We are **missing the
-entire off-policy correction layer**, and because our sampler is truncated
-(`top_k=20`, `top_p=0.8`, `T=0.7`) while the gradient is taken under the full
-softmax, that is not a dormant gap — it biases every step we have ever run.
-Our memory story is where both stacks did engineering and we did none, and it
-is why `grpo-gsm8k-27b` cannot finish a step.
+that is the structural bet the whole project rests on. Our sampler was truncated
+(`top_k=20`, `top_p=0.8`, `T=0.7`) while the gradient was taken under the full
+softmax, which biased every step run before 2026-09-03; **RL rollouts now draw
+untruncated, so the sampler is the policy.** That is a waypoint, not the
+destination — using the card's sampler in RL needs the rollout's kept set carried
+into the gradient, which three stacks shipped in the month before this was
+written and we have not. Our memory story is where both stacks did engineering
+and we did none, and it is why `grpo-gsm8k-27b` cannot finish a step.
+
+§2 has been amended twice since it was first written; both amendments are against
+the original text. Its claim of having no precedent was wrong, and its claim that
+we had the ingredients for importance weighting was half wrong — the ingredient
+was defective.
 
 ---
 
@@ -58,17 +65,74 @@ score function is ∇log π. Nothing reweights one to the other.
 | AReaL | decoupled PPO: `ratio = exp(logprobs - proximal_logprobs)` (`functional.py:452`); the behaviour-policy weight is applied only when `rejection_sampling` is configured, and `cli_args.py:1943` warns when it is not |
 | tileRL | none |
 
-We have the ingredients and do not use them. `SamplingParams.logprobs`
-produces per-token log-probs of the sampled tokens (`engine.py:856-864`) and
-`Engine.logprobs()` returns them (`engine.py:420-432`), but `grpo_loop` never
-sets the flag and never reads them — a fact `wins/2026-08-29-grpo.md:16-17`
-already recorded about an earlier version of the same field.
+We had the ingredients and they were broken. `SamplingParams.logprobs` produces
+per-token log-probs (`engine.py:856-864`) and `Engine.logprobs()` returns them
+(`engine.py:420-432`), but `_restrict` applied `top_k` and not `top_p` while the
+sampler applied both, so the reported score was low by exactly
+`-log(kept top_p mass)` — +0.212 nats mean at this vocab, and a value of −0.054
+for draws whose true log q was 0.0. Fixed 2026-09-03
+(`errors/2026-09-03-logprobs-skipped-top-p.md`). `grpo_loop` still never sets the
+flag; it does not need to under the untruncated sampler, and it will when mask
+transport lands.
 
-**Verdict: omission.** Two ways out, and they are not equivalent. Sampling at
-`temperature=1.0, top_p=1.0, top_k=0` makes the sampler the policy and costs
-nothing but rollout quality — TRL's choice. Keeping the card's sampler means
-carrying an importance weight, which needs the per-token log-probs we already
-compute — AReaL's choice, and the same machinery a PPO ratio would need.
+**Verdict: omission. Fixed as of 2026-09-03 by sampling untruncated during RL
+rollouts** (`train.untruncated`, forced in `grpo_loop`), which makes the sampler
+the policy by construction. Serving keeps the card's values.
+
+**`opd_loop` needs no equivalent, and this is not an oversight.** It takes plain
+cross-entropy on the teacher's sampled sequence through `train_step` — maximum
+likelihood on given tokens, not a score-function estimator. The teacher's
+truncation chooses *which* completions to distill, a data-quality decision; there
+is no measure to mismatch. `untruncated()` belongs in `grpo_loop` alone.
+
+**How far the bias went, measured.** Not reversed — attenuated and rotated. Over
+6 configurations (3 model seeds x 2 prompt sets), 64 advantage draws per position:
+mean projection of the shipped gradient onto the true policy gradient **0.72–0.90**
+(so roughly 20% of the magnitude lost), cosine down to 0.20 at the worst
+positions, and **~11% of individual advantage draws** give a negative projection.
+Positions where the projection is negative for a *majority* of draws: 0/12 in every
+configuration. An earlier single-draw probe reported 2/12 and that was its own
+variance.
+
+**Three ways out, not two, and the third is where the field went.** This section
+originally read as if tileRL were alone here. It is not — the row was written
+before three stacks converged on the same answer, all in the month before:
+
+| stack | what they do | measured? |
+|---|---|---|
+| **DeepSeek-V3.2 §3.1** "Keep Sampling Mask" (arXiv:2512.02556) | "preserve the truncation masks during sampling ... and apply them to [the current policy] during training, ensuring both policies share identical action subspaces" | no — qualitative, no ablation, rollout values undisclosed |
+| **vLLM PR #49577** "Mask Replay", merged 2026-08-13 | exposes the per-token kept support as CSR so the trainer renormalizes over the same set | yes, distribution alignment only: ratio ~1 with replay; "consistently below 1" with a "persistent negative bias" without |
+| **prime-rl #3235 -> #3431**, merged | same, citing DeepSeek. `logprob = logits[label]/T - logsumexp(logits[kept]/T)` at masked positions | yes: at `top_p=0.97`, reward 0.19->0.75 vs baseline 0.18->0.73 — parity |
+
+vLLM's unreplayed measurement is worth noting: a ratio "consistently below 1"
+with a persistent negative bias is the same sign as the `top_p` scoring defect
+found here on 2026-09-03 (`errors/2026-09-03-logprobs-skipped-top-p.md`), from an
+independent codebase.
+
+**prime-rl shipped untruncated rollouts first, ran on them, then built mask
+transport.** tileRL took that order for the same reason: with no completed GRPO
+run, a subtler estimator has nothing to be measured against.
+
+**The importance-weight route (AReaL's) is closed, with numbers.** Not merely
+noisy — structurally unusable for a truncated sampler. Measured at V=248320,
+`T=0.7, top_p=0.8, top_k=20`:
+
+| | |
+|---|---|
+| π mass outside q's support, per position | **97.2%** — ratio is infinite there, unreachable by any weight |
+| ESS over a group of 8, L=8 / 32 / 256 | 5.50 / 3.51 / **1.74** |
+| mean sequence log-ratio at L=256 | −921.6 |
+| fires at TRL's `clip_max=3.0` / AReaL's `upper=5.0` | **0.0% / 0.0%** |
+
+The clip never fires because every weight sits far *below* 1. Both stacks' caps
+are upper bounds on a weight that collapses downward, so the guardrail is on the
+wrong side. A group of 8 becomes under 2 effective samples at the recipe's own
+length. This is why the ratio+clip marker at `train.py:146` is about rollout
+reuse only — it was never going to carry this correction.
+
+**Recomputing the mask at train time is not the same as transporting it**, and
+the difference is 96% of the steps:
+`errors/2026-09-03-recomputed-mask-loses-the-step.md`.
 
 ## 3. The loss
 
@@ -106,10 +170,22 @@ policy. The clip is optional; the importance weight is not.
 | degenerate groups | **not filtered.** No DAPO dynamic sampling anywhere in `trl/trainer/` | **not filtered.** `drop_incomplete_group=False` drops on rollout failure, not on constant reward | not filtered, but **counted and gated**: `tied_group_fraction` is a run metric and `groups_untied` fails the run above 0.5 (`cli.py:254`) |
 | second whitening | none | every example adds `adv_norm: {mean batch, std batch}` on top | none |
 
-**Verdict: aligned, and one place we are ahead.** Nobody filters degenerate
-groups; we are the only one of the three that makes "the group tied" a gate
-rather than a log line. The missing second batch-wide whitening is a real
-difference — with one prompt per step there is no batch to whiten over.
+**Verdict: aligned, and one place we are ahead — with a caveat that may reverse
+it.** Nobody filters degenerate groups; we are the only one of the three that
+makes "the group tied" a gate rather than a log line. The missing second
+batch-wide whitening is a real difference — with one prompt per step there is no
+batch to whiten over.
+
+The caveat, measured 2026-09-03: **an all-or-nothing reward ties every group, at
+every completion length** (36/36 group-steps on the tiny model, vs 0/12 under a
+graded reward). GSM8K is all-or-nothing, so the gate is expected to fire on the
+first steps of a cold LoRA — for a reason that is not a defect, with an exit code
+indistinguishable from a wrong gradient. A gate that fires on the expected first
+step is a gate that gets switched off by whoever hits it. TRL's choice to log
+`frac_reward_zero_std` instead may be the better one for exactly the run we are
+about to make. Open question for ckl, not a proposal:
+`errors/2026-09-03-tied-groups-are-the-rewards-shape.md` carries the numbers and
+the discriminator.
 
 ## 5. Memory — the measured failure
 
@@ -181,9 +257,14 @@ the 27B recipe has never completed a run. Flag, not a verdict.
 | | |
 |---|---|
 | stricter than both | on-policy discipline: no weight sync, no prefix cache, no captured graph (§1) |
-| ahead of both | a tied-group gate rather than a log line (§4) |
+| ahead of both, pending a caveat | a tied-group gate rather than a log line — but a sparse reward ties every group, so it fires benignly on step 1 (§4) |
 | aligned on purpose | loss normalization, group-std advantages, no KL, no prompt truncation |
-| omission, biases runs today | the sampler is not the policy and nothing corrects for it (§2) |
+| **fixed 2026-09-03** | the sampler is now the policy: RL rollouts draw untruncated (§2). Waypoint — the destination is mask transport |
+| behind the field, next | mask transport, so the card's sampler can be used in RL. Three stacks shipped it in the month before (§2) |
+| closed with numbers | importance weighting: 97.2% of π's mass outside q's support, ESS 1.74/8 at L=256, clips fire at 0.0% (§2) |
 | omission, blocks runs today | no gradient checkpointing, no micro-batching, five vocab-sized tensors per step (§5) |
 | omission, cheap | no LR schedule; no clipped-completion metric |
-| deferred with a marker | PPO ratio and clip (`train.py:146`); graph recapture after update (`train.py:199`) |
+| deferred with a marker | PPO ratio and clip for rollout reuse (`train.py:146`); graph recapture after update (`train.py:199`) |
+
+Every number in §2 is the tiny model (vocab 320) or synthetic at V=248320.
+Nothing here was read off the real checkpoint: `pending-remote`.

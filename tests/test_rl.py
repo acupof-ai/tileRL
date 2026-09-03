@@ -8,6 +8,8 @@ The loop then has to actually raise reward on a task the tiny model can learn.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import torch
 
@@ -131,6 +133,36 @@ def test_grpo_loop_raises_reward():
     first = np.mean([r for r, *_ in hist[:3]])
     last = np.mean([r for r, *_ in hist[-3:]])
     assert last > first, f"GRPO did not raise reward: {first:.3f} -> {last:.3f}"
+
+
+def test_grpo_rollouts_are_drawn_untruncated():
+    """The gradient is taken under the full softmax, so the rollout must be drawn
+    from it too. A truncated or tempered sampler passed in is overridden, and the
+    engine has to see the override -- checking the returned params alone would
+    pass even if grpo_loop kept sampling from the caller's values."""
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.kv_cache import NoPrefixStore
+    from tilerl.train import grpo_loop, untruncated
+
+    card = SamplingParams(temperature=0.7, top_p=0.8, top_k=20, max_new_tokens=4)
+    assert untruncated(card) == replace(card, temperature=1.0, top_p=1.0, top_k=0)
+    # max_new_tokens and the stop set are the caller's; only the measure is ours.
+    keep = SamplingParams(max_new_tokens=7, stop_token_ids=(3,), top_k=20)
+    assert untruncated(keep).max_new_tokens == 7
+    assert untruncated(keep).stop_token_ids == (3,)
+
+    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    backend = RefBackend()
+    engine = build_engine(cfg, model, backend, num_blocks=128, num_slots=4,
+                          decode_graph=False, prefix_store=NoPrefixStore())
+    seen = []
+    real = engine.submit
+    engine.submit = lambda p, s: (seen.append(s), real(p, s))[1]
+    grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(len(c)), 1, backend,
+              AdamW(lr=1e-3), group=2, sampling=card)
+    assert seen, "grpo_loop never submitted"
+    for s in seen:
+        assert (s.temperature, s.top_p, s.top_k) == (1.0, 1.0, 0), s
 
 
 def test_last_number():
