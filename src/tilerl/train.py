@@ -235,8 +235,9 @@ def grpo_loop(
     at a time (``0`` = the whole group at once). The engine that
     generates IS the model that trains, so it must be built with the prefix
     cache and decode graph off, and rollouts are drawn untruncated so the
-    sampler is the policy the step differentiates. Returns per step
-    ``(mean reward, cross-entropy, seconds, tied-group fraction)``.
+    sampler is the policy the step differentiates. Yields
+    ``(mean reward, cross-entropy, seconds, tied-group fraction)`` as each step
+    finishes, so a 100-step run reports progress instead of printing at the end.
     # ponytail: recapture the graph and drop the prefix entries after each
     # update instead of disabling both, once a rollout's decode cost matters."""
     _require_on_policy(engine)
@@ -244,7 +245,6 @@ def grpo_loop(
         optimizer = AdamW(lr=1e-5)
     sampling = untruncated(sampling if sampling is not None
                            else SamplingParams(max_new_tokens=32))
-    out: list[tuple[float, float, float, float]] = []
     for step in range(steps):
         t0 = time.perf_counter()
         prompt = np.asarray(prompts[step % len(prompts)], dtype=np.int64)
@@ -276,8 +276,7 @@ def grpo_loop(
         slens = np.array([len(prompt) + len(c) for c in comps], dtype=np.int64)
         ce = rl_step(model, batch, adv, plens, backend, optimizer, trainable=trainable,
                      seq_lens=slens, micro=micro)
-        out.append((float(np.mean(rewards)), ce, time.perf_counter() - t0, tied))
-    return out
+        yield float(np.mean(rewards)), ce, time.perf_counter() - t0, tied
 
 
 def opd_loop(

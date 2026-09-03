@@ -31,7 +31,7 @@ def test_on_policy_guard_refuses_cached_engines():
     cfg, model = _build_model("tiny", seed=0, keep_master=True)
     engine = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=4)  # prefix cache on
     with pytest.raises(ValueError, match="on-policy"):
-        grpo_loop(engine, model, [[1, 2, 3]], lambda p, c: 0.0, 1, RefBackend())
+        list(grpo_loop(engine, model, [[1, 2, 3]], lambda p, c: 0.0, 1, RefBackend()))
 
 
 if __name__ == "__main__":  # runnable check

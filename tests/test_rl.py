@@ -128,11 +128,31 @@ def test_grpo_loop_raises_reward():
         return sum(1 for t in completion if t < half) / max(len(completion), 1)
 
     prompts = [[1, 2, 3, 4]]
-    hist = grpo_loop(engine, model, prompts, reward, 12, backend,
-                     AdamW(lr=0.05), group=6, sampling=SamplingParams(max_new_tokens=6), seed=0)
+    hist = list(grpo_loop(engine, model, prompts, reward, 12, backend,
+                          AdamW(lr=0.05), group=6, sampling=SamplingParams(max_new_tokens=6),
+                          seed=0))
     first = np.mean([r for r, *_ in hist[:3]])
     last = np.mean([r for r, *_ in hist[-3:]])
     assert last > first, f"GRPO did not raise reward: {first:.3f} -> {last:.3f}"
+
+
+def test_grpo_loop_reports_a_step_before_the_run_ends():
+    """A 100-step run that prints only on return says nothing for two hours, so a
+    live run cannot be told from a hung one. The first step must be readable
+    while later steps are still to come."""
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.kv_cache import NoPrefixStore
+    from tilerl.train import grpo_loop
+
+    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    backend = RefBackend()
+    engine = build_engine(cfg, model, backend, num_blocks=128, num_slots=4,
+                          decode_graph=False, prefix_store=NoPrefixStore())
+    gen = grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(len(c)), 3, backend,
+                    AdamW(lr=1e-3), group=2, sampling=SamplingParams(max_new_tokens=4))
+    first = next(gen)
+    assert len(first) == 4, first
+    assert sum(1 for _ in gen) == 2, "every step must be yielded, not just the first"
 
 
 def test_grpo_rollouts_are_drawn_untruncated():
@@ -158,8 +178,10 @@ def test_grpo_rollouts_are_drawn_untruncated():
     seen = []
     real = engine.submit
     engine.submit = lambda p, s: (seen.append(s), real(p, s))[1]
-    grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(len(c)), 1, backend,
-              AdamW(lr=1e-3), group=2, sampling=card)
+    # list() runs the generator; without it nothing submits and `seen` is empty,
+    # which reads as the sampler's failure rather than the loop never starting.
+    list(grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(len(c)), 1, backend,
+                   AdamW(lr=1e-3), group=2, sampling=card))
     assert seen, "grpo_loop never submitted"
     for s in seen:
         assert (s.temperature, s.top_p, s.top_k) == (1.0, 1.0, 0), s
