@@ -767,6 +767,12 @@ def make_paged_attention_split_combine(target: str, KVSPLIT: int = 32):
                 for d in T.Parallel(D):
                     o[d] += w * T.cast(PO[bb, tt, hh, sp, d], "float32")
             for d in T.Parallel(D):
+                # l > 0 always: n >= 1 for every row the dispatch can produce, so
+                # per = ceildiv(n, KVSPLIT) >= 1 and split 0 gets p1 = min(n, per) >= 1 --
+                # it runs a tile holding key 0, which every query may attend. An all-empty
+                # row would divide by exactly 0 here (m init is finite, so w = exp(0) = 1),
+                # and tests/test_split_combine_denominator.py pins the arithmetic because
+                # the split kernel has no CPU twin to check it end to end.
                 Out[bb, tt, hh, d] = o[d] / l[0]
         return Out
 

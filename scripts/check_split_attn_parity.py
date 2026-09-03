@@ -36,6 +36,7 @@ def main() -> None:
     torch.manual_seed(0)
     B, H, Hkv, D, BLOCK = 1, 4, 2, 64, 16
     dev = backend.device
+    worst_l = float("inf")
 
     # Both shipped split counts: backend.py picks by query width, so gating only
     # one leaves half the dispatch untested.
@@ -65,6 +66,21 @@ def main() -> None:
                 got = combine(po, pm, pl, 64)
                 ref = generic(q, kc, vc, bt, sl, sql, float(scale), block_size=BLOCK, threads=64)
 
+                # combine divides by l = sum_s w_s PL_s, so an all-empty row would
+                # give 0/0. It is unreachable by construction -- n >= 1, so
+                # per = ceildiv(n, KVSPLIT) >= 1 and split 0 gets p1 = min(n, per) >= 1,
+                # i.e. it always runs a tile holding key 0, which every query may
+                # attend. Nothing said so, and the failure would be silent: my m[0]
+                # init is finite (-1e30), so an empty row divides by exactly 0 and
+                # yields inf rather than the NaN an -inf init would give.
+                w = torch.exp(pm.float() - pm.float().amax(dim=-1, keepdim=True))
+                lsum = (w * pl.float()).sum(dim=-1)
+                assert lsum.min().item() > 0.0, (
+                    f"combine would divide by {lsum.min().item()} at "
+                    f"KVSPLIT={KVSPLIT} n={n} S={S}: an all-empty row is reachable"
+                )
+                worst_l = min(worst_l, lsum.min().item())
+
                 d = (got.float() - ref.float()).abs().max().item()
                 ok = torch.allclose(got.float(), ref.float(), rtol=1e-2, atol=1e-3)
                 print(f"ks={KVSPLIT:3d} n={n:4d} S={S}  max|split-generic|={d:.3e} "
@@ -72,6 +88,7 @@ def main() -> None:
                 assert ok, f"split-KV diverges at KVSPLIT={KVSPLIT} n={n} S={S}: {d}"
 
     print(f"parity OK ({tgt}) at KVSPLIT {SM70_KVSPLIT} and {SM70_KVSPLIT_WIDE}")
+    print(f"combine denominator: min l = {worst_l:.4f} over every shape above (must be > 0)")
 
 
 if __name__ == "__main__":
