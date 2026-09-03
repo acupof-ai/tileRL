@@ -61,11 +61,11 @@ import math
 from pathlib import Path
 
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import qwen38_27b
 from tilerl.kv_cache import PagedKvPool
 from tilerl.model import load_hf
-from tilerl_kernels.backend import get_backend
 
 
 class Kv:
