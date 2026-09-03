@@ -274,6 +274,39 @@ def test_selector_walk_follows_the_token_it_emitted(tmp_path):
     assert dc.top_k == 3
 
 
+def test_batched_walk_keeps_each_row_on_its_own_anchor(tmp_path):
+    """One walk for the whole tick must still condition each row on its own
+    predecessor. Batching the rows is the drafter's remaining lever -- 8 rows x 7
+    slots was 56 host syncs -- and the way it breaks silently is by letting one
+    row's ``prev`` score another row's candidates, which costs nothing visible
+    and drafts tokens the trunk will reject.
+    """
+    head, backend = _tiny_head(tmp_path), get_backend()
+    rank, v = head.dcfg.rank, head.cfg.vocab_size
+    head.params["selector.pred"] = torch.zeros(v, rank)
+    head.params["selector.succ"] = torch.zeros(v, rank)
+    # anchor 0 reads codebook column 1, anchor 12 reads column 0.
+    head.params["selector.pred"][0, 1] = 1.0
+    head.params["selector.pred"][12, 0] = 1.0
+    head.params["selector.succ"][5, 0], head.params["selector.succ"][9, 0] = 10.0, -10.0
+    head.params["selector.succ"][9, 1], head.params["selector.succ"][5, 1] = 10.0, -10.0
+
+    unary = torch.zeros(2, v)
+    unary[0, 12], unary[0, 9], unary[0, 3] = 3.0, 2.0, 1.0
+    unary[1, 9], unary[1, 5], unary[1, 3] = 3.0, 2.0, 1.0
+    head.trunk = _StubTrunk(unary)
+    head.params["selector.proj"] = torch.zeros(rank, head.cfg.hidden_size)
+    head.params["selector.proj"][0, 0] = head.params["selector.proj"][1, 0] = 1.0
+    _serve(head, backend)
+    head.trunk.logits = head.trunk.logits.to(backend.device)
+
+    hidden = torch.zeros(2, 2, head.cfg.hidden_size, device=backend.device)
+    hidden[:, :, 0] = 1.0  # both rows see identical logits; only the anchor differs
+    assert head.paths(hidden, [0, 12], backend) == [[9, 9], [12, 5]]
+    # negative control: swap the anchors and the rows swap with them
+    assert head.paths(hidden, [12, 0], backend) == [[12, 5], [9, 9]]
+
+
 class _StubTrunk:
     """A readout that hands back fixed logits, so the walk is the only variable."""
 
@@ -281,7 +314,7 @@ class _StubTrunk:
         self.logits, self.cfg = logits, tiny()
 
     def _linear(self, backend, hidden, key):
-        return self.logits.unsqueeze(0)
+        return self.logits.unsqueeze(0).expand(hidden.shape[0], -1, -1)
 
 
 def test_unmapped_tensors_raise_instead_of_vanishing(tmp_path):
@@ -374,14 +407,15 @@ def test_block_drafter_on_the_engine_tick(tmp_path):
         at["start"] = start
         return real(ctx, ctx_pos, anchor, start, backend)
 
-    def path(hidden, anchor, backend):
+    def paths(hidden, anchors, backend):
         i = at["start"] - len(_PROMPT) + 1
         # slot 0 is the token the trunk committed at ``start``; an off-by-one anchor
         # is invisible to output equality, so it is checked where it is handed over
-        assert anchor == base[i - 1], (anchor, base[i - 1])
-        return [base[i + j] if 0 <= i + j < len(base) else 0 for j in range(hidden.shape[1])]
+        assert anchors == [base[i - 1]], (anchors, base[i - 1])
+        return [[base[i + j] if 0 <= i + j < len(base) else 0
+                 for j in range(hidden.shape[1])] for _ in anchors]
 
-    head.block_hidden, head.path = block_hidden, path
+    head.block_hidden, head.paths = block_hidden, paths
     oracle, ostats = _engine_run(head, True, 24)
     assert oracle == base, (oracle, base)
     assert ostats["spec_accepted"] > 0, ostats
