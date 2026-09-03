@@ -6,8 +6,10 @@
 > reading did not measure it: the A/B ran `bench_ctx_decode.py`, which submits **one**
 > request, so the tick was 4 rows on the 4 rung and `ncols=2` was **off in both arms** —
 > [`2026-09-03-the-spec-ncols-ab-ran-at-b1.md`](2026-09-03-the-spec-ncols-ab-ran-at-b1.md).
-> The suspiciously flat five-context agreement was the tell. Re-measured at B=4 there;
-> the gate and the test-loop fix below are unaffected.
+> The suspiciously flat five-context agreement was the tell. **Re-measured at B=4: it is a
+> 1.498x WIN** (42.7 vs 28.5 tok/s, confirm arm 42.8) --
+> [`wins/2026-09-03-ncols2-is-1.5x-on-the-verify-path.md`](../wins/2026-09-03-ncols2-is-1.5x-on-the-verify-path.md).
+> The gate and the test-loop fix below are unaffected; only the "wash" claim dies.
 
 ## The false claim
 
@@ -79,13 +81,15 @@ Only the ratio is void.
 | path | rows | rung | ncols=2 |
 |---|---:|---:|---|
 | prefill | 512 | 32 | **1.52-1.60× — win** |
-| spec verify | 16 | 32 | **unmeasured** (the run above was 4 rows) |
+| spec verify | 16 | 32 | **1.498x — win** (measured at B=4) |
 | dense decode | 1 | 1 | 0.951× — loss, gated off |
 
-The two measured ends are monotone in rows and match the mechanism: arithmetic per byte
-rises with M, so the same kernel goes from costing 4.9% at M=1 to paying 1.6× at M=512.
-M=16 sits between them and is exactly the point a prediction is worth least — which is why
-it was worth a tick, and why running that tick at the wrong batch size wasted it.
+All three paths are monotone in real rows and match the mechanism: arithmetic per byte
+rises with M, so the same kernel goes from costing 4.9% at M=1 to paying **1.498× at 16
+rows** and 1.52-1.60× at M=512. M=16 was exactly the point a prediction was worth least —
+which is why it was worth a tick, and why running that tick at the wrong batch size wasted
+it. The prediction I could not sign turned out to be a win, and closer to prefill than to
+decode.
 
 ## Fix
 

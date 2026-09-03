@@ -3,12 +3,13 @@
 > Status: **SHIPPED, gated to the top rung.** 1.82× on the microbench at M=32, and
 > **1.52-1.60× on the 27B's prefill** (8.91 → 5.86 ms/token at 4096, TTFT 35.5 → 24.0 s).
 > Greedy text is identical to `ncols=1` on real prompts. Applied where M reaches the 32
-> rung — prefill (1.52-1.60×) and, in serving, a speculative verify (16 rows, **being
-> re-measured**: the first attempt ran the bench at B=1, so it compared the 1-column
-> kernel with itself) — but not on M=1 dense decode, where the same kernel *costs* 4.9%
+> rung — prefill (1.52-1.60×) and the speculative verify (16 rows, **1.498×**, measured at
+> B=4 after the first attempt ran the bench at B=1 and compared the 1-column kernel with
+> itself) — but not on M=1 dense decode, where the same kernel *costs* 4.9%
 > because the GEMV is bandwidth-bound there and halving the grid only starves it:
 > [`errors/2026-09-03-ncols2-cost-5-percent-of-decode.md`](../errors/2026-09-03-ncols2-cost-5-percent-of-decode.md),
-> [`errors/2026-09-03-the-spec-ncols-ab-ran-at-b1.md`](../errors/2026-09-03-the-spec-ncols-ab-ran-at-b1.md).
+> [`errors/2026-09-03-the-spec-ncols-ab-ran-at-b1.md`](../errors/2026-09-03-the-spec-ncols-ab-ran-at-b1.md),
+> [`wins/2026-09-03-ncols2-is-1.5x-on-the-verify-path.md`](2026-09-03-ncols2-is-1.5x-on-the-verify-path.md).
 > Fourth attempt in this family and the first that pays.
 
 ## Context
@@ -161,5 +162,5 @@ gates `ncols=2` on `Np == N and N % 2 == 0`.
 | 2026-09-03 | (gated) | V100 | cuda sm70 | qwen38-27b | prefill ms/token @512, gated | 7.88 → **4.91 (1.60×)** |
 | 2026-09-03 | (gated) | V100 | cuda sm70 | qwen38-27b | dense decode @4096, gated | **39.1 tok/s (no regression)** |
 | 2026-09-03 | f6d0805 | V100 | cuda sm70 | qwen38-27b | dense decode @4096, ncols at M=1 | 37.2 tok/s (**−4.9%, rejected**) |
-| 2026-09-03 | (gated) | V100 | cuda sm70 | qwen38-27b | spec d3 @4096, ncols on (16 rows → rung 32) | **void — bench ran B=1, 4 rows, ncols off in both arms** |
+| 2026-09-03 | (gated) | V100 | cuda sm70 | qwen38-27b | **spec d3 @ctx32, B=4 (16 rows → rung 32)** | **42.7 vs 28.5 tok/s = 1.498×** |
 | 2026-09-03 | (this) | V100 | cuda sm70 | qwen38-27b | greedy text vs ncols=1 | identical, M=1 and M>8 |
