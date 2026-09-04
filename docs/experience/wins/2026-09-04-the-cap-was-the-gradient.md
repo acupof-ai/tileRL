@@ -70,8 +70,14 @@ Then the target metric came in and contradicted what that led me to write.
 | the 256-cap arm | 474/500 = 94.8% | +5.2 pts |
 
 **Eight gradient steps moved GSM8K 6.8 points** — more than the 100-step arm
-that produced the thinking-cap result, and the two arms are not distinguishable
-from each other (+1.6 pts, z=1.23, p=0.22).
+that produced the thinking-cap result.
+
+The two arms differ by +1.6 points, z=1.23, p=0.22. **That is not a finding of
+equivalence**, and the interval says why: the 95% CI on the difference is
+**[−0.9, +4.1] points**, which holds both "the capped arm is 0.9 better" and
+"the loose arm is 4.1 better". Separating arms 1.6 points apart at 80% power
+needs about **2,600 per arm**; we ran 500. So the correct statement is that
+this experiment cannot rank the two arms, not that they are equal.
 
 MMLU went 75.2% → 73.0%, which is **not** significant (z=-1.12, p=0.26) and is
 recorded without being read as a regression.
@@ -101,11 +107,17 @@ The cap's difficulty-pressure function is still real and still measured: at
 2048 the policy solves 96.6% of training prompts against 0.86 at 256, and the
 tie rate goes 72% → 92%. That part of the mechanism holds.
 
-What does *not* survive is the implication that the 256 cap was therefore
-necessary for the accuracy gain. Both arms reach the same place. **The cap
-bought sample efficiency — 28% of steps carrying gradient instead of 8% — and
-the token reduction, which the 2048 arm has no reason to produce.** It did not
-buy the accuracy.
+What does *not* survive is the claim that the 256 cap was **necessary** for the
+accuracy gain: an arm without it also cleared the base by 6.8 points, so the
+cap cannot be load-bearing for reaching ~95%.
+
+**That is weaker than saying the cap bought no accuracy, and the weaker claim
+is the one the data supports.** The between-arm interval [−0.9, +4.1] cannot
+rule out a real difference in either direction. What the cap demonstrably buys
+is **sample efficiency** — 28% of steps carrying gradient against 8% — and the
+22.8% token reduction, which the loose arm has no mechanism to produce. Whether
+it also buys accuracy is open, and answering it needs ~2,600 per arm or a
+pre-registered equivalence margin, neither of which this run has.
 
 This makes the loose arm a *worse* null control than intended, and a more
 interesting result than intended.

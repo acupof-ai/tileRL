@@ -51,10 +51,10 @@ are the serving bill, so this is a win in the units the product is sold in.
 The control moved the claim twice. Retrained at 2048, the policy solves 96.6% of
 training prompts and **92% of GRPO steps carry no gradient** — the tight cap was
 holding the task hard enough to keep groups mixed. But that arm still reached
-**96.4% on GSM8K, off 8 gradient steps**, which is not distinguishable from the
-capped arm's 94.8%. So the cap bought sample efficiency and the token reduction;
-it did not buy the accuracy. A binary reward against a strong policy wastes
-compute without diluting the steps that survive it.
+**96.4% on GSM8K, off 8 gradient steps** — so the cap is not what gets the
+policy to ~95%. What it demonstrably buys is sample efficiency and the token
+cut; whether it also buys accuracy this run cannot say, since ranking two arms
+1.6 points apart needs ~2,600 questions each and we ran 500.
 
 [The result](docs/experience/wins/2026-09-04-the-thinking-cap.md) ·
 [the control that reinterpreted it](docs/experience/wins/2026-09-04-the-cap-was-the-gradient.md) ·
