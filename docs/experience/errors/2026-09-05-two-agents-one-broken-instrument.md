@@ -73,11 +73,39 @@ gh api "repos/.../commits/$SHA/check-runs"
 Verified on the replacement PR before handing it over: head `9fcc989`, three check-runs
 on that exact sha.
 
+### The same defect, second form, twenty minutes after writing the rule above
+
+That sha-keyed script then reported `ALL 1 CHECKS SETTLED` on head `32e6caa` — and it was
+arithmetically right. Checks register over several seconds, so immediately after a push
+only GitGuardian exists, and "every registered check is complete" is already true with
+`total_count = 1`. Both gates were still unregistered.
+
+So the second version failed the same way as the first: **the number it read was correct,
+and it was the answer to a different question.** `gh pr checks` answers "was something
+recently green" when asked "is this code green". Counting completed checks answers "is the
+currently-known set finished" when asked "did CI pass". Keying on the sha fixed the first
+substitution and left the second one untouched.
+
+Fixed by naming the checks that must be present rather than counting whatever is:
+
+```bash
+for w in "gate (macos-14)" "gate (ubuntu-latest)"; do
+  jq -e --arg n "$w" '[.check_runs[] | select(.name==$n and .status=="completed")] | length > 0'
+done
+```
+
 ## Rule
 
 **A green is a claim about a commit, so the check must name the commit.** Any CI query
 that returns conclusions without a sha cannot answer "has *this* code been tested" — it
 answers "was something recently green".
+
+**Assert on the checks that must be present, never on a count of what is present.** A
+count is a claim about the set the API happens to know right now, and that set grows for
+several seconds after a push. Both failures in this entry are the same substitution: a
+number that is arithmetically correct and answers a question nobody asked. The fix in both
+cases is to name the thing — the sha, then the gates — rather than to trust a quantity
+derived from whatever was in scope.
 
 **Cross-checking is worth what the instruments' independence is worth, not what the head
 count is.** Every other mutual check between these two sessions today worked — the peer
@@ -90,3 +118,10 @@ methods agreeing is ([agreement-is-not-verification], now with a measured instan
 **Distinguish "the result was right" from "the process was right" out loud.** The merge
 was correct by accident. Recording it as a success would have kept a broken check in the
 flow with a green next to it.
+
+**Writing the rule down does not install it.** The second form above happened twenty
+minutes after this entry's first draft, in the script written to obey it, by the author of
+both. A rule stops a defect only where a check enforces it
+([guard-at-point-of-use-not-memory]) — here that meant the gate names in the loop
+condition, not the sentence in this file.
+
