@@ -25,11 +25,21 @@ weights — LoRA on the frozen fp4 base, no weight sync, no second stack.
 `train --recipe` → `ledger` → `merge` → `serve`, every run writing a manifest with its
 inputs and its gates.
 
-**RL has not yet moved a downstream metric, and the number that said it had was an
-artifact.** A run reported GSM8K 39.0% → 94.2%; the 39.0% control was measuring the
-256-token cap, not the model. Uncapped the base scores **89.6%**, leaving 10.4 points
-of headroom against 4.8 resolvable at n=500. The honest re-run is the first roadmap
-gate. [The audit.](docs/experience/errors/2026-09-04-the-eval-cap-measured-itself.md)
+**The thinking cap: training under a tight token budget buys accuracy *and* economy.**
+Cap the rollout at 256 tokens, score correctness only, then measure uncapped — the
+policy finds the shorter path to the same answer.
+
+| GSM8K, uncapped, n=500 | accuracy | total tokens | tokens / correct |
+|---|---:|---:|---:|
+| base | 89.6% | 157,601 | 351.8 |
+| after 100 GRPO steps | **94.8%** | **121,642** | **256.6** |
+| | +5.2 pts, p=0.002 | **−22.8%** | **−27.1%** |
+
+It transfers to tasks the adapter never saw — tokens fall 22.0% on MMLU, 18.9% on
+ARC-Easy, 22.9% on PIQA, with no measurable accuracy change at n=100. Output tokens
+are the serving bill, so this is a win in the units the product is sold in.
+[The result](docs/experience/wins/2026-09-04-the-thinking-cap.md) ·
+[why the first number was wrong](docs/experience/errors/2026-09-04-the-eval-cap-measured-itself.md)
 
 ## Quickstart
 
