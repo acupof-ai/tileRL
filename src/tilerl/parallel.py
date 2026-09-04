@@ -72,6 +72,10 @@ class DataParallelEngine:
         i = request_id % self._n
         return self._engines[i].take(request_id // self._n)
 
+    def peek(self, request_id: int) -> list[int] | None:
+        i = request_id % self._n
+        return self._engines[i].peek(request_id // self._n)
+
     def stats(self) -> dict[str, Any]:
         per = [e.stats() for e in self._engines]
         total = {k: sum(s[k] for s in per) for k in per[0] if isinstance(per[0][k], int)}
