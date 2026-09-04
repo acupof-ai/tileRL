@@ -105,8 +105,9 @@ class DFlash2Head:
                 f"width is fixed. Pass spec_depth=None."
             )
 
-    def attach(self, backend, num_blocks: int) -> None:
-        """No KV plane of its own: the context K/V is projected from the trunk's aux taps."""
+    def attach(self, backend, num_blocks: int, dtype=None) -> None:
+        """No KV plane of its own: the context K/V is projected from the trunk's aux taps,
+        so ``dtype`` (the trunk pool's, part of the contract) has nothing to size here."""
         self.backend = backend
 
     def step(self, rows) -> None:

@@ -11,6 +11,18 @@ from . import kernels, kernels_attn, kernels_gdn, kernels_linear, kernels_mma
 
 _REGISTRY: dict[tuple[str, str], dict[str, object]] = {}
 
+# sm70 split counts, chosen per tick by query width. 32 splits are 1.20x faster
+# at S=1 where PO is 3 MiB; by S=8 they are within 0.5% of 16 while PO reaches
+# 1.5 GiB, so a wide tick halves it for free. The threshold clears the widest
+# verify the ladder submits (depth 7 is S=8). Exported so the parity gate and the
+# guard test read the shipped rule instead of restating it.
+SM70_KVSPLIT = 32
+SM70_KVSPLIT_WIDE = 16
+
+
+def sm70_kvsplit(s: int) -> int:
+    return SM70_KVSPLIT if s < 8 else SM70_KVSPLIT_WIDE
+
 
 def _register(precision: str, arch: str, kernels: dict[str, object]) -> None:
     _REGISTRY[(precision, arch)] = kernels
@@ -103,6 +115,44 @@ _SM90_KERNELS = {  # WGMMA schedules; the backend pads M/N to 16 and K to 32
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)
+# Volta: T.gemm lowers to fp16-only mma.sync.m8n8k4, so the sm90 MMA family is
+# dead — the cell is the CPU f32 floor plus the kernels that also run on Volta.
+_SM70_KERNELS = {
+    **_CPU_KERNELS,
+    # Narrow variants for the elementwise ops whose output feeds a GEMV: the sm70
+    # GEMV wants X in f16 and used to cast it at dispatch — one cast per launch,
+    # over bytes rmsnorm/silu_mul had just written. Producing f16 at the source
+    # removes 193 of the 305 casts a dense token pays. Separate keys, not a
+    # replacement: q_norm/k_norm feed rope and attention, which are f32.
+    "rmsnorm_apply_narrow": lambda t: kernels.make_rmsnorm_apply_bf16(t, out_dtype="float16"),
+    "silu_mul": lambda t: kernels.make_silu_mul_bf16(t, out_dtype="float16"),
+    "linear_fp4_gemv": kernels_linear.make_linear_fp4_gemv_sm70,
+    # M-row ladder (decode/verify M<=8, prefill M=32) as ONE entry: M/xh/sh are
+    # factory args and Backend._kernel keys the compile cache on them, so a
+    # 2-row verify does not pay for 8. Rounding X to f16 once outside the kernel
+    # took 127 us/row flat down to 24-45 us/row.
+    "linear_fp4_gemv_sm70_m": kernels_linear.make_linear_fp4_gemv_sm70_m,
+    # gdn_decode_fused and write_tokens fix graph capture: their eager fallbacks
+    # host-sync on int(device_tensor) per token.
+    "gdn_decode_fused": lambda t: kernels_gdn.make_gdn_decode_fused(t, out_dtype="float32"),
+    # without it prefill (T>1) falls to reference.gdn_forward, a Python serial
+    # scan — ~250k eager ops for 8x64, 62s of the 64s tick 1
+    "gdn_chunk_fused": kernels_gdn.make_gdn_chunk_fused,
+    # f32 pool: the attention kernel is f32-IO, and a bf16 pool cast the whole
+    # plane per call (4.71 ms/token, 14% of a 4096-ctx token)
+    "write_tokens": kernels_mma.make_write_tokens_f32,
+    # split-KV decode attention, S>=1 (speculative verify too); every sm70
+    # attention call takes it, leaving the generic kernel to the other targets.
+    # sm70 only: the source is target-neutral but the win is filling 80 SMs, so
+    # it loses where T.Kernel lowers to a serial loop (cpu) and is unproven on
+    # metal. Bare factories: KVSPLIT comes from the call site (backend.py) so a
+    # wide tick can trade splits for footprint, and Backend._kernel keys the
+    # compile cache on it.
+    "paged_attention_split": kernels.make_paged_attention_split,
+    "paged_attention_split_combine": kernels.make_paged_attention_split_combine,
+}
+_register("bf16", "sm70", _SM70_KERNELS)
+_register("fp4", "sm70", _SM70_KERNELS)
 for _arch in ("sm100", "sm120"):
     _register("bf16", _arch, {})  # pending-remote slot
 

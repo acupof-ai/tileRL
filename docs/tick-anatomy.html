@@ -1,0 +1,338 @@
+<title>Speculative Tick Anatomy</title>
+<meta name="description" content="Every layer of one V100 speculative decode tick, measured against its byte floor">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,600;1,6..72,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ink: #17181c;
+    --ink-soft: #4a4d57;
+    --ink-faint: #7c8090;
+    --ground: #f7f6f3;
+    --panel: #fffffe;
+    --rule: #dedcd5;
+    --rule-soft: #ebe9e3;
+    --draft: #1f6f5c;
+    --draft-wash: #e2efeb;
+    --verify: #7a3b8f;
+    --verify-wash: #efe4f3;
+    --floor: #b8b4a8;
+    --alarm: #b4442c;
+    --alarm-wash: #f7e6e1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ink: #eceaf2;
+      --ink-soft: #a8a6b4;
+      --ink-faint: #74727f;
+      --ground: #131418;
+      --panel: #1b1c22;
+      --rule: #2e2f38;
+      --rule-soft: #24252c;
+      --draft: #57c9a8;
+      --draft-wash: #14312a;
+      --verify: #c48ddb;
+      --verify-wash: #2c1d33;
+      --floor: #4e4c58;
+      --alarm: #f08466;
+      --alarm-wash: #3a1d15;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ink: #eceaf2;
+    --ink-soft: #a8a6b4;
+    --ink-faint: #74727f;
+    --ground: #131418;
+    --panel: #1b1c22;
+    --rule: #2e2f38;
+    --rule-soft: #24252c;
+    --draft: #57c9a8;
+    --draft-wash: #14312a;
+    --verify: #c48ddb;
+    --verify-wash: #2c1d33;
+    --floor: #4e4c58;
+    --alarm: #f08466;
+    --alarm-wash: #3a1d15;
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "Newsreader", Georgia, serif;
+    font-size: 17px;
+    line-height: 1.6;
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 56px 28px 96px; }
+  .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace; font-size: 11px; font-weight: 600;
+    letter-spacing: .13em; text-transform: uppercase; color: var(--ink-faint);
+  }
+  h1 { font-size: 40px; font-weight: 600; line-height: 1.12; margin: 12px 0 0; text-wrap: balance; letter-spacing: -.015em; }
+  .lede { font-size: 20px; color: var(--ink-soft); max-width: 62ch; margin: 16px 0 0; }
+  h2 {
+    font-size: 13px; font-family: "IBM Plex Mono", monospace; font-weight: 600;
+    letter-spacing: .11em; text-transform: uppercase; color: var(--ink-faint);
+    margin: 0 0 20px; padding-bottom: 9px; border-bottom: 1px solid var(--rule);
+  }
+  section { margin-top: 56px; }
+  p { max-width: 66ch; }
+
+  /* ---- verdict strip ---- */
+  .verdict { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); margin-top: 36px; }
+  .v { background: var(--panel); padding: 16px 18px; }
+  .v .k { font-family: "IBM Plex Mono", monospace; font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); }
+  .v .n { font-family: "IBM Plex Mono", monospace; font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 6px; letter-spacing: -.02em; }
+  .v .s { font-size: 14px; color: var(--ink-soft); }
+  .v.bad .n { color: var(--alarm); }
+
+  /* ---- the tick bar ---- */
+  .tick { border: 1px solid var(--rule); background: var(--panel); padding: 22px 24px 24px; }
+  .bar { display: flex; height: 46px; border: 1px solid var(--rule); overflow: hidden; }
+  .seg { display: flex; align-items: center; justify-content: center; font-family: "IBM Plex Mono", monospace; font-size: 12px; font-weight: 600; color: #fff; }
+  .seg.d { background: var(--draft); }
+  .seg.v { background: var(--verify); }
+  .barkey { display: flex; gap: 22px; margin-top: 14px; flex-wrap: wrap; font-size: 14px; color: var(--ink-soft); }
+  .barkey b { font-family: "IBM Plex Mono", monospace; font-weight: 600; color: var(--ink); }
+  .sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: baseline; }
+  .sw.d { background: var(--draft); } .sw.v { background: var(--verify); }
+
+  /* ---- layer ladder ---- */
+  .ladder { border: 1px solid var(--rule); background: var(--panel); }
+  .row { display: grid; grid-template-columns: 30px 1fr 96px 74px 88px; gap: 14px; align-items: center; padding: 11px 20px; border-bottom: 1px solid var(--rule-soft); }
+  .row:last-child { border-bottom: 0; }
+  .row.hdr { background: var(--ground); border-bottom: 1px solid var(--rule); }
+  .row.hdr span { font-family: "IBM Plex Mono", monospace; font-size: 10px; letter-spacing: .09em; text-transform: uppercase; color: var(--ink-faint); }
+  .row .idx { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--ink-faint); }
+  .row .op { font-size: 15px; }
+  .row .op small { display: block; color: var(--ink-faint); font-size: 12.5px; font-family: "IBM Plex Mono", monospace; }
+  .row .sh, .row .ms, .row .rung { font-family: "IBM Plex Mono", monospace; font-size: 13px; text-align: right; }
+  .row .rung { text-align: right; color: var(--ink-soft); }
+  .row.sub { background: var(--draft-wash); }
+  .row.sub2 { background: var(--verify-wash); }
+  .row .tag { font-family: "IBM Plex Mono", monospace; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+
+  /* ---- gap chart ---- */
+  .gaps { display: grid; gap: 14px; }
+  .gap { border: 1px solid var(--rule); background: var(--panel); padding: 15px 18px; }
+  .gap h3 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+  .gap .meta { font-family: "IBM Plex Mono", monospace; font-size: 12.5px; color: var(--ink-soft); }
+  .track { position: relative; height: 26px; margin-top: 11px; background: var(--rule-soft); }
+  .fill { position: absolute; inset: 0 auto 0 0; display: flex; align-items: center; padding-left: 9px; font-family: "IBM Plex Mono", monospace; font-size: 11px; font-weight: 600; color: #fff; }
+  .fl { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink); }
+  .fl span { position: absolute; left: 6px; top: -1px; font-family: "IBM Plex Mono", monospace; font-size: 10px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink); white-space: nowrap; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+  th, td { text-align: right; padding: 8px 12px; border-bottom: 1px solid var(--rule-soft); }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { font-family: "IBM Plex Mono", monospace; font-size: 10px; letter-spacing: .09em; text-transform: uppercase; color: var(--ink-faint); border-bottom: 1px solid var(--rule); }
+  td.mono, th.mono { font-family: "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; }
+  .scroll { overflow-x: auto; border: 1px solid var(--rule); background: var(--panel); }
+  .scroll table { min-width: 560px; }
+  .scroll th, .scroll td { padding: 9px 16px; }
+
+  .note { border-left: 3px solid var(--alarm); background: var(--alarm-wash); padding: 15px 20px; margin-top: 22px; }
+  .note b { font-family: "IBM Plex Mono", monospace; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--alarm); display: block; margin-bottom: 7px; }
+  .note p { margin: 0; max-width: 68ch; }
+  .fine { font-size: 14px; color: var(--ink-faint); }
+  .fine code, p code { font-family: "IBM Plex Mono", monospace; font-size: .9em; }
+</style>
+
+<div class="wrap">
+
+  <div class="eyebrow">V100 · sm70 · Qwen3.8-27B NVFP4 · ctx 1024 · depth 3</div>
+  <h1>Anatomy of one speculative tick</h1>
+  <p class="lede">Every layer the engine touches to emit 3.34 tokens, measured, and set against
+  the bytes it has to move. The time adds up. What it adds up to is mostly waste.</p>
+
+  <div class="verdict">
+    <div class="v"><div class="k">Tick, measured</div><div class="n">66.46<span style="font-size:15px"> ms</span></div><div class="s">50.3 tok/s at 3.34 tok/fwd</div></div>
+    <div class="v"><div class="k">Draft · 3 forwards</div><div class="n" style="color:var(--draft)">16.59</div><div class="s">25% of the tick</div></div>
+    <div class="v"><div class="k">Verify · 1 forward</div><div class="n" style="color:var(--verify)">49.87</div><div class="s">75% of the tick</div></div>
+    <div class="v bad"><div class="k">Off the byte floor</div><div class="n">3.5×</div><div class="s">19.2 ms would suffice</div></div>
+  </div>
+
+  <section>
+    <h2>Where the 66 ms goes</h2>
+    <div class="tick">
+      <div class="bar">
+        <div class="seg d" style="flex:5.53">D1</div>
+        <div class="seg d" style="flex:5.53">D2</div>
+        <div class="seg d" style="flex:5.53">D3</div>
+        <div class="seg v" style="flex:49.87">VERIFY — one trunk forward, 4 rows</div>
+      </div>
+      <div class="barkey">
+        <div><span class="sw d"></span>Draft <b>3 × 5.53 ms</b> — 1-layer head, sequential</div>
+        <div><span class="sw v"></span>Verify <b>49.87 ms</b> — 64 layers, all 4 candidates at once</div>
+      </div>
+    </div>
+    <p style="margin-top:20px">The shape is the whole argument for speculation on this card. Verify checks four
+    candidate tokens for the price of one trunk pass, because a trunk pass is bound by
+    reading 14.43&nbsp;GB of weights and four rows read the same weights as one. The draft
+    is three sequential passes over a 456M-parameter head — cheap per pass, but they
+    cannot overlap: each position needs the hidden state the previous one produced.</p>
+  </section>
+
+  <section>
+    <h2>Draft forward — every layer, per pass</h2>
+    <div class="ladder">
+      <div class="row hdr"><span></span><span>Operation</span><span>Shape</span><span>Rung</span><span>MB read</span></div>
+      <div class="row"><div class="idx">1</div><div class="op">embed lookup<small>trunk's embed_tokens, one gathered row</small></div><div class="sh">248320×5120</div><div class="rung">—</div><div class="ms">0.01</div></div>
+      <div class="row"><div class="idx">2</div><div class="op">norm(embed) ‖ norm(h_trunk)<small>pre_fc_norm_embedding, pre_fc_norm_hidden</small></div><div class="sh">2 × 5120</div><div class="rung">—</div><div class="ms">0.02</div></div>
+      <div class="row"><div class="idx">3</div><div class="op">fc — the DFlash join<small>concat(10240) → 5120</small></div><div class="sh">5120×10240</div><div class="rung">1</div><div class="ms">29</div></div>
+      <div class="row"><div class="idx">4</div><div class="op">q / k / v projections<small>fused qkv, 24 heads + 4 KV, head_dim 256</small></div><div class="sh">14336×5120</div><div class="rung">1</div><div class="ms">41</div></div>
+      <div class="row"><div class="idx">5</div><div class="op">RoPE + q_norm / k_norm<small>rotary_dim 64, partial</small></div><div class="sh">—</div><div class="rung">—</div><div class="ms">0.00</div></div>
+      <div class="row"><div class="idx">6</div><div class="op">paged attention, split-KV<small>1 query row over the head's own KV</small></div><div class="sh">S=1</div><div class="rung">—</div><div class="ms">0.1</div></div>
+      <div class="row"><div class="idx">7</div><div class="op">o projection<small>back to hidden</small></div><div class="sh">5120×6144</div><div class="rung">1</div><div class="ms">18</div></div>
+      <div class="row"><div class="idx">8</div><div class="op">gate / up, SiLU, down<small>fused gate_up then down</small></div><div class="sh">34816×5120 · 5120×17408</div><div class="rung">1</div><div class="ms">150</div></div>
+      <div class="row"><div class="idx">9</div><div class="op">final norm<small>the head's own</small></div><div class="sh">5120</div><div class="rung">—</div><div class="ms">0.01</div></div>
+      <div class="row"><div class="idx">10</div><div class="op">lm_head — read out through the <em>trunk</em><small>the draft carries no vocabulary projection of its own</small></div><div class="sh">248320×5120</div><div class="rung">1</div><div class="ms">715</div></div>
+      <div class="row sub"><div class="idx"></div><div class="op"><span class="tag" style="color:var(--draft)">Per draft forward</span></div><div class="sh">954 MB</div><div class="rung"></div><div class="ms" style="font-weight:600">1.06 ms floor</div></div>
+      <div class="row sub"><div class="idx"></div><div class="op"><span class="tag" style="color:var(--alarm)">Measured</span></div><div class="sh"></div><div class="rung"></div><div class="ms" style="font-weight:600;color:var(--alarm)">5.53 ms</div></div>
+    </div>
+    <p style="margin-top:18px"><b>75% of a draft forward is the vocabulary projection.</b> The head itself is 425M
+    parameters; reading out through the trunk's 1.27B-parameter lm_head costs three times
+    as much as everything above it combined. That is a property of a 248k vocabulary, not
+    of the head — and it is why a bigger draft head is cheaper than it looks, and a
+    smaller one barely helps.</p>
+  </section>
+
+  <section>
+    <h2>Verify forward — the trunk, once, over 4 rows</h2>
+    <div class="ladder">
+      <div class="row hdr"><span></span><span>Operation</span><span>Shape</span><span>×/pass</span><span>GB read</span></div>
+      <div class="row"><div class="idx">1</div><div class="op">gated-delta layers<small>qkvz fused · a/b · conv1d · fused GDN recurrence · out</small></div><div class="sh">16384×5120 · 5120×6144</div><div class="rung">48</div><div class="ms">3.12</div></div>
+      <div class="row"><div class="idx">2</div><div class="op">full-attention layers<small>qkv fused · RoPE · split-KV paged attn · o</small></div><div class="sh">14336×5120 · 5120×6144</div><div class="rung">16</div><div class="ms">0.84</div></div>
+      <div class="row"><div class="idx">3</div><div class="op">MLP, every layer<small>gate_up fused, SiLU, down</small></div><div class="sh">34816×5120 · 5120×17408</div><div class="rung">64</div><div class="ms">9.64</div></div>
+      <div class="row"><div class="idx">4</div><div class="op">final norm + lm_head<small>4 candidate rows share one weight read</small></div><div class="sh">248320×5120</div><div class="rung">1</div><div class="ms">0.72</div></div>
+      <div class="row sub2"><div class="idx"></div><div class="op"><span class="tag" style="color:var(--verify)">One trunk pass</span> <small>305 GEMV launches</small></div><div class="sh">14.43 GB</div><div class="rung"></div><div class="ms" style="font-weight:600">16.03 ms floor</div></div>
+      <div class="row sub2"><div class="idx"></div><div class="op"><span class="tag" style="color:var(--alarm)">Measured at rung 4</span></div><div class="sh"></div><div class="rung"></div><div class="ms" style="font-weight:600;color:var(--alarm)">49.87 ms</div></div>
+    </div>
+    <p style="margin-top:18px">Verify accepts the longest prefix the trunk agrees with. Paged KV needs no rollback —
+    a rejected draft's slot is overwritten next tick — but the gated-delta recurrent state
+    does, so the forward keeps state after every chain step and the engine adopts the one
+    at the accepted length.</p>
+  </section>
+
+  <section>
+    <h2>Both halves against their floors</h2>
+    <div class="gaps">
+      <div class="gap">
+        <h3>Verify — 75% of the tick, 3.1× its floor</h3>
+        <div class="meta">14.43 GB at 900 GB/s = 16.03 ms · measured 49.87 ms · 33.8 ms unexplained</div>
+        <div class="track">
+          <div class="fill" style="width:100%;background:var(--verify)">49.87 ms</div>
+          <div class="fl" style="left:32.1%"><span>floor 16.03</span></div>
+        </div>
+      </div>
+      <div class="gap">
+        <h3>Draft — 25% of the tick</h3>
+        <div class="meta">measured 5.53 ms · ~9 GEMV launches × 125 µs = 1.12 ms of GPU each · runs outside the captured graph</div>
+        <div class="track">
+          <div class="fill" style="width:100%;background:var(--draft)">5.53 ms</div>
+          <div class="fl" style="left:19.2%"><span>bytes 1.06 — not the binding floor</span></div>
+        </div>
+      </div>
+      <div class="gap">
+        <h3>Dense decode, for scale — 1.7× its floor</h3>
+        <div class="meta">16.04 GB at 900 GB/s = 17.8 ms · measured 26.6 ms · fully graph-captured</div>
+        <div class="track">
+          <div class="fill" style="width:100%;background:var(--floor)">26.6 ms</div>
+          <div class="fl" style="left:66.9%"><span>floor 17.8</span></div>
+        </div>
+      </div>
+    </div>
+    <p style="margin-top:20px">Dense decode is the control, and it is the one that reconciles: 1.7× off its floor,
+    running entirely inside a captured CUDA graph. Verify runs the same kernels over 4 rows
+    and is 3.1× off. Draft runs <em>outside</em> the graph, but that turned out not to be what
+    costs it: see the correction below.</p>
+  </section>
+
+  <section>
+    <h2>Is the implementation right?</h2>
+    <p>Numerically, yes — and the pieces that were wrong are documented. The head loads with the
+    correct RMSNorm convention (a Qwen NextN head is zero-centred, <code>y = x·(1+w)</code>; a
+    DSpark head is plain <code>w·x</code>, and folding the wrong one produced logits
+    anti-correlated with the trunk, argmax ranked 248191/248320). <code>fc</code> consumes
+    <code>concat(norm_embed, norm_hidden)</code> in that order; the other order looks like a head
+    that simply does not predict. Acceptance is 3.34 tokens per forward, and drafted-token rank
+    inside the trunk's own ordering is top-1 96.8%.</p>
+    <p><b>Structurally, the tick is 88% GPU-bound, so there is little for the host to give
+    back.</b> <code>_draft_step</code> does run outside the captured graph
+    (<code>engine.py:836</code>), but per-kernel attribution puts <b>58.5 ms of GPU-busy in a
+    66.46 ms tick</b> — capturing <em>every</em> remaining launch caps at 1.14×, and 71% of that
+    GPU time is a single kernel (<code>linear_fp4_gemv_sm70_m</code>, 332 launches × 125 µs =
+    41.49 ms) which a graph replays at the same speed. Rejected.</p>
+    <div class="scroll" style="margin-top:20px">
+      <table>
+        <thead><tr><th>Depth</th><th class="mono">Verify width</th><th class="mono">Rung</th><th class="mono">ms/tick</th><th class="mono">tok/fwd</th><th class="mono">tok/s</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td class="mono">2</td><td class="mono">2</td><td class="mono">42.11</td><td class="mono">1.92</td><td class="mono">45.7</td></tr>
+          <tr><td>2</td><td class="mono">3</td><td class="mono">4</td><td class="mono">60.93</td><td class="mono">2.65</td><td class="mono">43.4</td></tr>
+          <tr><td><b>3</b></td><td class="mono">4</td><td class="mono">4</td><td class="mono">66.46</td><td class="mono">3.34</td><td class="mono"><b>50.3</b></td></tr>
+          <tr><td>4</td><td class="mono">5</td><td class="mono">8</td><td class="mono">90.58</td><td class="mono">3.74</td><td class="mono">41.2</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="fine" style="margin-top:14px">Depths 2 and 3 both dispatch rung 4, so verify is identical between them and their
+    difference is exactly one draft forward: 5.53 ms. Feeding that back through depths 1 and 4
+    reproduces the verify staircase (36.58 / 49.87 / 49.87 / 68.46, rung ratios 1.363 and 1.373),
+    which is what turns one subtraction into a measurement.</p>
+
+    <div class="note">
+      <b>Correction to an earlier claim</b>
+      <p>Three of my own write-ups say the sync fix took a draft forward from 15.13 ms to 5.53 ms.
+      That attribution is wrong. Both depth sweeps — before and after the fix — produced the same
+      tick times to within 0.5% (42.36/61.29/66.76/90.96 then 42.11/60.93/66.46/90.58). Had three
+      forwards each dropped 9.6 ms, the depth-3 tick would have fallen to ~37 ms. It did not.
+      15.13 was never a draft cost: it was the slope of a line fitted through a staircase, which
+      charges verify's growth to the draft. The sync fix's own benefit was never measured
+      separately, and the commit message, CHANGELOG and wins entry all need correcting.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>What the two gaps mean</h2>
+    <p>They turn out to be the same problem, and it is not speculation's. Both the draft and
+    verify spend their time in one kernel at 125 µs per launch. Verify's 3.1× is the
+    schedule question that caps prefill: the sm70 fp4 GEMV reaches 83% of bandwidth peak at
+    M=1 and roughly a quarter of packed-f16 FLOP peak at M=32, because X is reloaded from L2
+    per row per tile. <code>X[32,5120]</code> in f16 is 328 KB — it fits the 6 MB L2 but not
+    the 128 KB L1, so those reads sit on the FMA critical path at ~200 cycles.</p>
+    <p>Two candidate fixes for that have already been measured and rejected: raising
+    <code>n_partition</code> is flat from 4 to 16 and 28% worse at 32, and splitting the
+    kernel's 8-deep FMA accumulator chain is 1.00–1.01× at every M. Staging X in shared memory
+    is the one remaining candidate with a mechanism behind it rather than an analogy — it
+    removes the loads instead of reordering the math, which is precisely what those two
+    measurements showed does not help.</p>
+  </section>
+
+  <section>
+    <h2>Where the tick actually is</h2>
+    <p>Per-kernel attribution of one depth-3 tick, which is what settled the question above.
+    GPU-busy sums to 58.5 ms against the 66.46 ms the tick really takes &mdash; 88% GPU-bound.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Kernel</th><th class="mono">launches</th><th class="mono">&micro;s each</th><th class="mono">ms</th><th class="mono">share of GPU</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">linear_fp4_gemv_sm70_m</td><td class="mono">332</td><td class="mono">125.0</td><td class="mono"><b>41.49</b></td><td class="mono"><b>71%</b></td></tr>
+          <tr><td class="mono">index_elementwise (torch)</td><td class="mono">252</td><td class="mono">15.8</td><td class="mono">3.97</td><td class="mono">7%</td></tr>
+          <tr><td class="mono">gdn_chunk_fused</td><td class="mono">48</td><td class="mono">52.4</td><td class="mono">2.51</td><td class="mono">4%</td></tr>
+          <tr><td class="mono">everything else (~1900)</td><td class="mono">&mdash;</td><td class="mono">&mdash;</td><td class="mono">10.53</td><td class="mono">18%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:18px">One kernel is 71% of the tick, at a per-launch cost that barely
+    moves with M. That is the whole optimisation surface, and it is a schedule question, not a
+    launch-overhead one. The 332 launches are ~305 for the trunk's verify plus ~9 per draft
+    forward &times; 3.</p>
+    <p class="fine">Second-largest is not model math: 252 launches of torch&rsquo;s
+    <code>index_elementwise</code>, the chain bookkeeping in <code>_draft_step</code> and
+    <code>_verify</code>. Smaller than the GEMV work but larger than the GDN scan, and removable
+    without restructuring anything.</p>
+    <p class="fine">The profiler that produced this table reads 121.5 ms/tick where the real tick
+    is 66.46 &mdash; <code>torch.profiler</code> serialises launches, so its wall clock and its
+    &ldquo;52% host&rdquo; line are instrument artifacts and are not used here. A sum of kernel
+    durations survives that distortion; a wall-clock ratio does not.</p>
+  </section>
+
+</div>

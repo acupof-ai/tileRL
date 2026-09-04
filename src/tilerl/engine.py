@@ -12,7 +12,9 @@ other target run eager.
 Speculation (``draft=``): a decode row drafts up to ``spec_depth`` tokens and the
 same forward verifies them. Paged KV needs no rollback (a rejected draft's slot
 is overwritten next tick); the gated-delta state does, so the verify forward
-keeps the state after every chain step (``BatchKv.keep_steps``).
+keeps the state after every chain step (``BatchKv.keep_steps``). A spec tick is
+captured too, one graph per (batch bucket, chain width) — a width first seen
+inside a timed window puts its capture in the number.
 
 Prefix reuse adopts only block-aligned hits: retain the matched blocks and
 restore the gated-delta snapshot at the boundary (state + conv1d window), keyed
@@ -44,6 +46,7 @@ from .kv_cache import (
     PagedKvPool,
     PrefixStore,
 )
+from .spec import LADDER_WIDTHS
 
 
 def _graph_on(backend, decode_graph: bool | None) -> bool:
@@ -65,17 +68,34 @@ _PHASE_DONE = 3
 _HASH_MASK = 0x7FFFFFFF
 
 
-def _quantize_draft(params: dict[str, torch.Tensor], skip: tuple[str, ...] = ()) -> \
-        dict[str, torch.Tensor]:
-    """Re-serve a draft head's [N,K] projections as block-quantized fp8. ``skip``
-    names tensors the head GATHERS rows from: shape cannot tell a [248320,256]
-    codebook from a projection, and packing one leaves a .w8 the walk cannot index."""
+def _quantize_draft(params: dict[str, torch.Tensor], skip: tuple[str, ...] = (),
+                    fp4: bool = False) -> dict[str, torch.Tensor]:
+    """Re-serve a draft head's [N,K] projections block-quantized: fp8 by default,
+    fp4 where that is the arch's only fused GEMV (sm70 has no ``linear_fp8``).
+
+    ``skip`` names tensors the head GATHERS rows from: shape cannot tell a
+    [248320,256] codebook from a projection, and packing one leaves a .w8 the
+    walk cannot index.
+
+    Idempotent: `build_engine` writes the result back into `draft.params` in
+    place, so a second engine over the same draft would otherwise re-pack the
+    already-packed `fc.wq` into `fc.wq.wq` and the plain `fc` lookup would raise
+    `KeyError: 'fc'`. One engine per process is the shipped path, but a train loop
+    or a profiler comparing configurations builds several.
+    """
     from tilerl_kernels import reference
 
+    if any(k.endswith((".wq", ".w8")) for k in params):
+        return dict(params)  # already served
     out: dict[str, torch.Tensor] = {}
     for k, v in params.items():
         if k not in skip and v.ndim == 2 and v.shape[0] >= 128 and v.shape[1] >= 128:
-            out[f"{k}.w8"], out[f"{k}.wscale"] = reference.quant_fp8(v)
+            if fp4:
+                wq, scale = reference.pack_fp4(v)
+                scale, oscale = reference.renorm_fp4_scale(scale)
+                out[f"{k}.wq"], out[f"{k}.scale"], out[f"{k}.oscale"] = wq, scale, oscale
+            else:
+                out[f"{k}.w8"], out[f"{k}.wscale"] = reference.quant_fp8(v)
         else:
             out[k] = v
     return out
@@ -168,8 +188,6 @@ class _DecodeGraph:
     H2D copies of the inputs plus one replay. Replay mutates the engine's own
     pools like the eager path; warmup writes to block 0 / slot 0 are overwritten
     before any real request reads them.
-    # ponytail: captured lazily on the first decode tick (first token pays JIT +
-    # capture); capture at engine build is the upgrade.
     # ponytail: no recapture after training — the graph bakes the f32 embed cast.
     """
 
@@ -306,6 +324,21 @@ class Engine:
             except RuntimeError:
                 pass  # pools sized without the spare: fall back to exact-size graphs
         self._graph_pool = None
+        # A slot is held from submit() to finish, so usable_slots -- not max_batch --
+        # is the real concurrency ceiling: below it, `submit` raises before a row can
+        # ever be admitted, and _build_plan's max_batch is unreachable. Warn rather
+        # than clamp, because a test that submits two rows into a 2-slot pool with the
+        # default max_batch=8 is a legitimate config, not a mistake.
+        if self.usable_slots < limits.max_batch:
+            warnings.warn(
+                f"{self.usable_slots} usable state slots against max_batch="
+                f"{limits.max_batch}: a slot is held from submit to finish, so "
+                f"concurrency is capped at {self.usable_slots} and submit raises "
+                f"beyond it. Pass num_slots >= max_batch"
+                + (" + 1 for the decode graph's pad row" if self._pad_slot is not None
+                   else ""),
+                stacklevel=2,
+            )
 
         self._draft = draft
         self._aux_layers = draft.aux_layers if draft is not None else ()
@@ -339,12 +372,19 @@ class Engine:
                     "a bug. Pass prefix_store=NoPrefixStore()."
                     # ponytail: rebuilding ctx from an adopted prefix is the upgrade.
                 )
-            # Dense bf16 on Backend.linear's generic path was 9.7 ms per projection
-            # vs 0.13 ms on the fp8 kernel; serve it the way the trunk is served.
-            served = backend.materialize(_quantize_draft(draft.params, skip=draft.no_quant))
+            # The draft's weights are served in `build_engine`, BEFORE the KV fit reads
+            # free memory -- see the comment there. A direct `Engine(...)` caller that
+            # passes an unquantized draft still gets one here; `_quantize_draft` returns
+            # its input unchanged once packed, so the common path pays a dict copy.
+            served = backend.materialize(
+                _quantize_draft(draft.params, skip=draft.no_quant,
+                                fp4=not backend.has_kernel("linear_fp8"))
+            )
             draft.params.clear()  # in place: the head's Model holds THIS dict
             draft.params.update(served)
-            draft.attach(backend, kv_pool.num_blocks)
+            if backend.arch == "sm70":
+                self._warn_sm70_ladder(limits.max_batch, self._width)
+            draft.attach(backend, kv_pool.num_blocks, dtype=kv_pool.k_pool.dtype)
 
         self._pin = backend.device.type == "cuda"
         self._lock = threading.RLock()
@@ -369,6 +409,16 @@ class Engine:
         self._tokens_generated = 0
         self._spec_drafted = 0
         self._spec_accepted = 0
+        # Diagnostic only: set True to keep the last tick's draft and trunk
+        # logits so a probe can rank the trunk's pick inside the draft's
+        # ordering. A [rows, vocab] copy per tick, so never on in serving.
+        self._keep_draft_logits = False
+        self._draft_logits = None
+        self._trunk_logits = None
+        #: Set to a list to time each draft forward directly, as (forwards, ms). A
+        #: per-tick sync, so never on in serving; None keeps the path unchanged.
+        self._draft_ms: list[tuple[int, float]] | None = None
+        self._verify_chains = None
         self._finished_logprobs: dict[int, list[float]] = {}
         self._taken_logprobs: set[int] = set()
         self._last_logprobs: list[float] | None = None
@@ -489,6 +539,24 @@ class Engine:
                     "exactly one reader may have them. Record them once at that reader."
                 )
             return None
+
+    def peek(self, request_id: int) -> list[int] | None:
+        """Tokens emitted so far, or None once the request has left the queues.
+
+        Deliberately lock-free: ``step()`` holds ``_lock`` across the whole forward, so any
+        reader that took the lock would block for the entire generation (measured: one
+        blocked call covered 325 ms of a 335 ms run). Under the GIL both the writer's
+        ``output.append`` and this ``list()`` are single bytecodes, so the copy is a
+        consistent prefix -- never a torn read; a stale one is fine.
+
+        None means "no longer waiting or running", so ``_finish`` has filed it under
+        ``_finished`` or ``_failed`` and ``take()`` will answer. That is what lets a caller
+        poll here without ever touching the lock until the run is over.
+        """
+        for req in (*self._waiting, *self._running):
+            if req.req_id == request_id:
+                return list(req.output)
+        return None
 
     def take(self, request_id: int) -> list[int] | None:
         """Pop one finished request's output, or None if not finished yet."""
@@ -708,7 +776,23 @@ class Engine:
         if decodes and prefills:
             self._mixed_forwards += 1
         if self._draft is not None:
-            self._draft.step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
+            # The draft writes position seq_len-1 on EVERY row it sees, including a
+            # row that just left prefill this tick -- and the growth loop above only
+            # covers `decodes`. A 15-token prompt therefore reached the draft owning
+            # one block while position 15 needs the second, which raised
+            # `IndexError: index 1 is out of bounds` from kv_cache.py:149, three
+            # frames away inside the trunk's own writer. Clamping the draft's span
+            # instead leaves a hole in its KV and the next position attends over it:
+            # measured, the engine then drafted token 79 where full context drafts 61.
+            for r in rows:
+                while r.blocks and len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 1:
+                    r.blocks.append(self._kv.alloc_block())
+                    r.own_blocks += 1
+                    self._blocks_used += 1
+            if self._draft_ms is None:
+                self._draft.step(rows)  # every tick, or a chunked prefill leaves the draft KV empty
+            else:
+                self._draft_step_timed(rows)
 
     def _finish_prefills(self, prefills: list[_Req], chunks: list[int], logits, base: int) -> None:
         done = []
@@ -731,31 +815,120 @@ class Engine:
                 else:
                     pf.phase = _PHASE_DECODE
 
+    def _graph_bucket(self, rows: int) -> int:
+        """The batch dimension a tick of ``rows`` decodes keys its graph on: the
+        next bucket up, or the exact size above the ladder. `precapture` walks
+        this over every admissible row count, so the two cannot disagree about
+        which graphs exist."""
+        b = next((c for c in _GRAPH_BUCKETS if c >= rows), None)
+        return rows if b is None or self.limits.max_batch < b else b
+
+    def _graph_for(self, B: int, W: int, keep: bool) -> _DecodeGraph | None:
+        """The (B, W) graph, capturing it on first use. None (and graphs off) if
+        capture fails, so the caller runs eager."""
+        g = self._decode_graphs.get((B, W))
+        if g is not None:
+            return g
+        try:
+            if self._graph_pool is None:
+                self._graph_pool = torch.cuda.graph_pool_handle()
+            g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B,
+                             width=W, pool=self._graph_pool, keep=W if keep else 0,
+                             aux_layers=self._aux_layers)
+        except Exception as exc:
+            warnings.warn(f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback")
+            self._decode_graph_on = False
+            return None
+        self._decode_graphs[(B, W)] = g
+        return g
+
+    @staticmethod
+    def _warn_sm70_ladder(max_batch: int, w: int) -> None:
+        """The sm70 GEMV serves 1/2/4/8/32 rows and rounds up, so a verify tick's
+        B*W rows can pay for a rung it does not fill. Warn rather than clamp -- the
+        ladder is one arch's shape, not a property of speculation."""
+        if w not in LADDER_WIDTHS:
+            # depth 4 (W=5) buys an 8-row launch: 31.5 tok/s on coding against 43.8
+            # at depth 3 and 32.6 with no speculation at all. A verify tick costs
+            # 0.67 + 0.53*W dense ticks, so rounding W up is a real cost.
+            warnings.warn(
+                f"verify width {w} is not an sm70 rung; it rounds up to "
+                f"{next(x for x in LADDER_WIDTHS if x >= w)} rows. Use depth "
+                f"{max(x for x in LADDER_WIDTHS if x <= w) - 1} or "
+                f"{next(x for x in LADDER_WIDTHS if x > w) - 1}",
+                stacklevel=3,
+            )
+        rows = max_batch * w
+        if rows > max(LADDER_WIDTHS):
+            # Past the top rung the dispatch chunks at 32, so a wide batch costs
+            # extra launches rather than extra per-row time.
+            warnings.warn(
+                f"max_batch={max_batch} x verify width {w} = {rows} rows exceeds the sm70 "
+                f"ladder's top rung ({max(LADDER_WIDTHS)}); a full batch verifies in "
+                f"{-(-rows // 32)} launches per layer",
+                stacklevel=3,
+            )
+        elif rows not in LADDER_WIDTHS:
+            # Between rungs is worse than past the top: the launch pays for the whole
+            # rung, and a padding row costs what a useful one costs. Measured on the
+            # same rung 8: 82.15 ms with 3 of 8 rows idle against 83.40 ms fully
+            # packed -- 60% more useful rows for 1.5% more time
+            # (wins/2026-09-04-rung-cost-not-useful-rows.md). So B=4 depth 3 -- 16
+            # rows on the 32 rung -- measures 42.7 tok/s where B=8's full rung gets 75.0.
+            rung = next(x for x in LADDER_WIDTHS if x > rows)
+            # Only advise a batch when the width divides the rung: at W=3 NO batch
+            # lands on a rung, and rung // w would name one that also pads.
+            fix = f"; use max_batch={rung // w} to fill it" if rung % w == 0 else ""
+            warnings.warn(
+                f"max_batch={max_batch} x verify width {w} = {rows} rows launches the "
+                f"{rung}-row rung, so {rung - rows} of every {rung} rows are padding{fix}",
+                stacklevel=3,
+            )
+
+    def graph_keys(self) -> set[tuple[int, int]]:
+        """Every (bucket, width) a decode tick can key on under these limits."""
+        # self._width, not spec_depth+1: it is the width the drafter SETTLED on
+        # (set_depth may clamp) and the one every tick keys on, and it is already
+        # range-checked in __init__. A second copy of the arithmetic here is how
+        # precapture came to reference a _spec_depth attribute that does not exist.
+        widths = range(1, 1 + self._width) if self._draft is not None else (1,)
+        return {(self._graph_bucket(rows), w)
+                for rows in range(1, self.limits.max_batch + 1) for w in widths}
+
+    def precapture(self) -> int:
+        """Capture every graph a decode tick can ask for; return how many exist.
+
+        Capture costs ~14 s each and, until a graph exists, that tick IS the
+        capture rather than a replay — 1088 ms/token on a cold server against 26
+        warm. Waiting for real traffic to produce each width is a lottery: chain
+        width varies per tick because the draft's confidence truncates it, so a
+        warmup that merely generated tokens left two widths uncaptured and the
+        first two requests paid 14 s and 12 s. `graph_keys` enumerates instead.
+        """
+        if not self._decode_graph_on:
+            return 0
+        for B, W in sorted(self.graph_keys()):
+            # keep matches the tick that will use this graph: W>1 is a verify
+            # (chains present, keep=W), W==1 is a plain decode (chains None).
+            if self._graph_for(B, W, keep=W > 1) is None:
+                break  # capture failed: graphs are off now
+        return len(self._decode_graphs)
+
     def _run_decode_graph(self, reqs: list[_Req], chains=None) -> bool:
         """Captured decode for a pure-decode tick, one graph per size bucket (a
         graph per exact size OOMed B=64 on the drain). Returns False and flips
         the flag off when capture failed, so the caller runs eager."""
         n, W = len(reqs), len(chains[0]) if chains else 1
-        B = next((c for c in _GRAPH_BUCKETS if c >= n), None)
-        if B is None or self.limits.max_batch < B:
-            B = n  # above the ladder: one exact-size graph rather than none
+        B = self._graph_bucket(n)
         if n < B and self._pad_slot is None:
-            B = n  # nothing reserved to park padding rows on: exact size
-        g = self._decode_graphs.get((B, W))
-        if g is None:
             try:
-                if self._graph_pool is None:
-                    self._graph_pool = torch.cuda.graph_pool_handle()
-                g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B,
-                                 width=W, pool=self._graph_pool, keep=W if chains else 0,
-                                 aux_layers=self._aux_layers)
-            except Exception as exc:
-                warnings.warn(
-                    f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback"
-                )
-                self._decode_graph_on = False
-                return False
-            self._decode_graphs[(B, W)] = g
+                self._pad_slot = self._states.alloc_slot()
+                self._pad_block = self._kv.alloc_block()
+            except RuntimeError:
+                B = n  # no spare capacity to park padding rows on: exact size
+        g = self._graph_for(B, W, keep=bool(chains))
+        if g is None:
+            return False
         pad = None if self._pad_slot is None else (self._pad_slot, self._pad_block)
         logits = g.run(reqs, chains, pad=pad)
         self._decode_forwards += 1
@@ -771,8 +944,37 @@ class Engine:
                     r.hidden, r.hidden_from = g.hidden[i : i + 1], r.seq_len - 1
             self._sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
         if self._draft is not None:
-            self._draft.step(reqs)
+            # No block-growth loop needed here: this path runs only with `not prefills`, so
+            # the pre-fork `seq_len - 1 + q` loop already covers the draft's furthest write.
+            if self._draft_ms is None:
+                self._draft.step(reqs)
+            else:
+                self._draft_step_timed(reqs)
         return True
+
+    def _draft_step_timed(self, rows: list[_Req]) -> None:
+        """``_draft.step`` with CUDA events around it, recording (forwards, ms).
+
+        One helper because there are TWO draft call sites -- this graph path and the
+        eager one in ``_run_forward`` -- and instrumenting only the eager one produced
+        a number 31x too large: the graph path takes 212 of 218 ticks, so the timer saw
+        only the 6 warm/mixed ticks, which carry prefill work. It read 165.97 ms/forward
+        against a subtracted 4.80-5.30, and the tick it sat in read 155.74 against a
+        known 35.04. Both are >2x off a known number, which is the tell; the count in
+        its own output (6 of 218) is what named the cause.
+
+        Timed rather than subtracted because the subtraction of two rung-sharing tick
+        means amplifies their noise by operand/difference, measured 12.9x
+        (wins/2026-09-04-a-difference-amplifies-its-operands-noise.md). Events bracket
+        the launches, so nothing cancels -- at the price of a sync per tick.
+        """
+        a, b = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+        f0 = self._draft.forwards
+        a.record()
+        self._draft.step(rows)
+        b.record()
+        b.synchronize()
+        self._draft_ms.append((self._draft.forwards - f0, a.elapsed_time(b)))
 
     def _verify(self, rows, chains, logits, hidden) -> None:
         """Accept the leading run of drafts the trunk agrees with, adopt the
@@ -782,6 +984,9 @@ class Engine:
         unspeculated arm uses. That is the guarantee; the token is NOT
         bit-identical to the unspeculated one, because a W>1 tile and a W=1
         tile do not agree bit-for-bit off the CPU reference."""
+        if self._keep_draft_logits:  # rank of the trunk's pick in the draft's order
+            self._trunk_logits = logits.detach().clone()
+            self._verify_chains = [list(c) for c in chains]
         flat = [
             (r, logits[i, j], len(r.output) + j)
             for i, r in enumerate(rows)
@@ -896,8 +1101,15 @@ class Engine:
     def _loop(self) -> None:
         while not self._wake.is_set():
             with self._lock:
-                busy = bool(self._running or self._waiting)
-            if busy:
+                has_running = bool(self._running)
+                has_waiting = bool(self._waiting)
+            if has_running or has_waiting:
+                # Batch concurrent submissions: a burst of HTTP requests
+                # arrives over ~10ms. Without this window the first one
+                # starts a prefill alone and the rest land in eager mixed
+                # ticks (decode graph off, ~10x slower per tick).
+                if not has_running and has_waiting:
+                    self._wake.wait(0.01)
                 try:
                     self.step()
                 except Exception:
@@ -907,6 +1119,39 @@ class Engine:
                     traceback.print_exc()
             else:
                 self._wake.wait(0.005)
+
+
+def _fit_blocks(cfg, backend, io, cap: int, draft_layers: int = 0) -> int:
+    """KV blocks that fit the free memory left after the weights and the GDN pools.
+
+    Called with the state pool already allocated, so free memory is measured, not
+    estimated -- and only after ``empty_cache``, without which the allocator's load
+    reserve hides 13 GiB and this returns 64 blocks. The default it replaces was
+    ``ctx * max_batch``, which on the 27B's own 262144-token limit is 275 GB of f32
+    KV; every bench passed num_blocks explicitly, so serve was the one caller that
+    ever saw it.
+
+    ``draft_layers`` is the draft's own layer count, 0 for a dense engine. The draft
+    mirrors ``num_blocks`` into a pool of its own (``DraftHead.attach``), and that
+    pool's planes are not free: at the 27B's 16 full-attn planes one draft layer is
+    1/16 of the trunk's bytes, so charging for it when there is no draft under-fits
+    every training engine, and not charging when there is one over-fits serve.
+
+    Holds back a third of what is free: ``PrefixStore`` takes a quarter of what
+    remains after this, and the attention partials are transient and scale with B*S.
+    ``cap`` wins over the 64-block floor -- a caller asking for fewer means it.
+    """
+    if backend.device.type != "cuda":
+        return cap or 256
+    planes = 2 * len(cfg.full_attn_layers)
+    per_block = planes * cfg.num_kv_heads * BLOCK_TOKENS * cfg.head_dim
+    per_block *= torch.tensor([], dtype=io).element_size()
+    # per_block already carries the K+V factor, so one draft layer is per_block over
+    # the PLANE-PAIR count, not over `planes`. Dividing by `planes` charged half a
+    # layer and over-asked by 3.03% on the 27B.
+    per_block += draft_layers * per_block // len(cfg.full_attn_layers)
+    fit = max(64, int(torch.cuda.mem_get_info()[0] * 2 / 3) // per_block)
+    return min(fit, cap) if cap else fit
 
 
 def build_engine(
@@ -919,25 +1164,45 @@ def build_engine(
     max_batch: int = 8,
     max_total_tokens: int = 8192,
     max_num_batched_tokens: int = 512,
+    max_blocks: int = 0,
     prefix_store: Any = None,
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
 ) -> Engine:
     """Wire a model + backend into an Engine; pool shapes come from ``cfg``.
-    ``decode_graph`` None auto-enables the captured decode tick on CUDA."""
+    ``decode_graph`` None auto-enables the captured decode tick on CUDA.
+    ``num_blocks`` 0 fits the KV pool to free memory, capped at ``max_blocks``."""
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
     if draft is not None:
         draft.set_depth(spec_depth)  # the state pool is sized by the width it settles on
     model.params = backend.materialize(model.params)
+    # Serve the draft's own weights HERE, before anything reads free memory. They used
+    # to be quantized inside Engine.__init__, i.e. after the KV fit had already spent
+    # 2/3 of what was free and PrefixStore a quarter of the rest -- so the draft's fp4
+    # weights were charged to nothing and `serve --blocks 0 --draft` died in
+    # `materialize`'s twiddle with 104 MiB free, never reaching the fit's own print
+    # (measured at serve's default --slots 16 on a 32 GB V100). Same ordering fix the
+    # state pool below already uses: allocate, then MEASURE what is left.
+    if draft is not None:
+        served = backend.materialize(
+            _quantize_draft(draft.params, skip=draft.no_quant,
+                            fp4=not backend.has_kernel("linear_fp8"))
+        )
+        draft.params.clear()  # in place: the head's Model holds THIS dict
+        draft.params.update(served)
+    # Reclaim the allocator's load-time reserve before anything reads free memory.
+    # Loading and quantizing 27B leaves 29.02 GiB reserved against 15.96 allocated on
+    # a 31.74 GiB card, and `mem_get_info` counts all 13.06 GiB of that as USED -- so
+    # the store's budget below, and the KV fit, see 2.36 GiB free instead of 15.17.
+    # Measured on sm70: this one call is the difference between a 1024-token and a
+    # 62832-token context at B=1.
+    if backend.device.type == "cuda":
+        torch.cuda.empty_cache()
     pad = _graph_on(backend, decode_graph)  # the replay's padding row owns a slot and a block
-    kv_pool = PagedKvPool(
-        num_blocks + pad,
-        cfg.num_kv_heads,
-        cfg.head_dim,
-        device=backend.device,
-        layer_map=cfg.full_attn_layers,
-    )
+    # The GDN pools first, so fitting the KV pool below can MEASURE what is left
+    # instead of estimating it: at slots=3 depth=3 they are 2.94 GiB, 79% of it the
+    # per-step verify states, which scale with slots*width and not with max_batch.
     state_pool = LinearStatePool(
         num_slots + pad,
         n_linear,
@@ -949,7 +1214,41 @@ def build_engine(
         conv_dim=cfg.linear_qkv_dim,
         spec_steps=draft.width if draft is not None else 0,
     )
-    store = PrefixStore(kv_pool) if prefix_store is None else prefix_store
+    # The KV pool's dtype IS the attention kernel's ABI, but only a cuda kernel has one
+    # here: main passed NO dtype and every target took PagedKvPool's bf16 default, so
+    # routing backend.io in unconditionally moved cpu and metal from bf16 to f32 --
+    # K and V stopped being rounded on store on the cell that certifies every kernel in
+    # this repo, at 2x the bytes, with the whole suite green (a parity check moves the
+    # TileLang and torch sides together, so nothing could see it). io itself is right on
+    # cpu; PagedKvPool's DEFAULT is what disagrees with it, so narrow the call site.
+    # getattr on BOTH: RefBackend and the other test doubles declare neither, and
+    # asking for .arch directly raised AttributeError in 7 tests.
+    kv_io = (getattr(backend, "io", torch.bfloat16)
+             if getattr(backend, "arch", "").startswith("sm") else torch.bfloat16)
+    if not num_blocks:
+        num_blocks = _fit_blocks(cfg, backend, kv_io, max_blocks,
+                                 draft_layers=0 if draft is None else draft.cfg.num_layers)
+    kv_pool = PagedKvPool(
+        num_blocks + pad,
+        cfg.num_kv_heads,
+        cfg.head_dim,
+        device=backend.device,
+        layer_map=cfg.full_attn_layers,
+        # Match the attention kernel's IO dtype. sm70's is f32, and a bf16 pool
+        # made every attention call cast the WHOLE plane (all num_blocks, not
+        # the live ones): 4.71 ms/token, 14% of a 4096-ctx token, independent of
+        # context. Same trade the state pool makes below. getattr: test doubles
+        # stand in for Backend without declaring an io dtype.
+        dtype=kv_io,
+    )
+    # A resident store entry owns a GDN state snapshot in HBM (144 MiB at 27B f32)
+    # and a decode publishes one every BLOCK_TOKENS, so the store's byte budget must
+    # fit the card: the 8 GiB default is most of a 32 GB V100's post-weights headroom.
+    # Spend a quarter of what is still free after weights and pools.
+    kw = {}
+    if backend.device.type == "cuda":
+        kw["state_bytes"] = int(torch.cuda.mem_get_info()[0] // 4)
+    store = PrefixStore(kv_pool, **kw) if prefix_store is None else prefix_store
     return Engine(
         model,
         backend,

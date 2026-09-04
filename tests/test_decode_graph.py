@@ -137,3 +137,188 @@ def test_the_kv_guard_measures_usable_capacity_not_the_pool():
     for eng in (on, off):  # graph off is the control: same rejection, no pad row
         with pytest.raises(ValueError, match="exceeds KV pool capacity"):
             eng.submit(big, params)
+
+
+def test_the_block_fit_prices_a_block_at_what_the_pools_actually_allocate(monkeypatch):
+    """``_fit_blocks`` divides free memory by its own bytes-per-block, and nothing
+    checked that figure against the pools it is sizing.
+
+    The failure is silent in both directions and neither raises here: over-ask and
+    the OOM lands later, in whatever allocates next (measured on the V100 --
+    ``num_blocks=2048`` left the draft's prefill readout short 1.88 GiB with 892 MiB
+    free, and the traceback named ``linear_fp4``); under-ask and serve quietly loses
+    context it could have had. So this inverts the real function -- blocks it returns,
+    times the bytes the pools really take -- and checks the product lands on the 2/3
+    of free memory the function set out to spend.
+
+    Two errors it catches, both live before it was written: ``per_block`` already
+    carries the K+V factor, so a draft layer is ``per_block / len(full_attn_layers)``
+    and dividing by ``2 * len`` charged half a layer (3.03% over-ask on the 27B); and
+    the draft term was added unconditionally, so every dense engine -- all of
+    training -- was charged for a pool it never builds.
+    """
+    from types import SimpleNamespace
+
+    import torch
+
+    import tilerl.engine as eng_mod
+    from tilerl.kv_cache import PagedKvPool
+
+    cfg = tiny()
+    io = torch.float32
+    free = 8 << 30
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a: (free, free))
+    backend = SimpleNamespace(device=torch.device("cuda"), io=io)
+
+    def pool_bytes_per_block(layers, layer_map):
+        p = PagedKvPool(8, cfg.num_kv_heads, cfg.head_dim, num_layers=layers,
+                        device="cpu", dtype=io, layer_map=layer_map)
+        return (p.k_pool.numel() + p.v_pool.numel()) * p.k_pool.element_size() / 8
+
+    trunk = pool_bytes_per_block(len(cfg.full_attn_layers), cfg.full_attn_layers)
+    # DraftHead.attach mirrors num_blocks with layer_map=range(draft cfg.num_layers).
+    draft1 = pool_bytes_per_block(1, (0,))
+
+    for draft_layers, real in ((0, trunk), (1, trunk + draft1)):
+        blocks = eng_mod._fit_blocks(cfg, backend, io, 0, draft_layers=draft_layers)
+        spent = blocks * real
+        budget = free * 2 / 3
+        assert 0.999 <= spent / budget <= 1.0, (
+            f"draft_layers={draft_layers}: {blocks} blocks x {real:.0f} real B "
+            f"= {spent / 2**30:.4f} GiB against a {budget / 2**30:.4f} GiB budget "
+            f"({spent / budget:.4f}x) -- the fit is pricing a block wrong")
+
+
+def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
+    """``num_blocks=0`` must fit against memory the GDN pools have already taken.
+
+    Order is the whole content of this: the state pool is 2.94 GiB at slots=3 depth=3
+    on the 27B, so a fit measured before it OVER-asks by that much. Sizing it from
+    cli.py, one call earlier, asked for 10.21 GiB with 4.96 free and OOMed inside
+    PagedKvPool -- and the fit is arch- and card-specific, so no CPU gate can catch
+    that numerically. Assert the sequence instead.
+    """
+    import tilerl.engine as eng_mod
+
+    seen = []
+    real_state, real_fit = eng_mod.LinearStatePool, eng_mod._fit_blocks
+    real_quant = eng_mod._quantize_draft
+
+    def spy_state(*a, **k):
+        seen.append("state")
+        return real_state(*a, **k)
+
+    def spy_fit(*a, **k):
+        seen.append("fit")
+        return real_fit(*a, **k)
+
+    def spy_quant(*a, **k):
+        seen.append("draft")
+        return real_quant(*a, **k)
+
+    monkeypatch.setattr(eng_mod, "LinearStatePool", spy_state)
+    monkeypatch.setattr(eng_mod, "_fit_blocks", spy_fit)
+    monkeypatch.setattr(eng_mod, "_quantize_draft", spy_quant)
+    cfg = tiny()
+    e = build_engine(cfg, build_random(cfg, seed=7), get_backend(), num_blocks=0,
+                     num_slots=2, max_batch=2, max_total_tokens=512, max_blocks=16)
+    assert seen == ["state", "fit"], f"the KV fit ran before the state pool: {seen}"
+    assert e.usable_blocks == 16, f"max_blocks must cap the fit, got {e.usable_blocks}"
+
+    # With a draft, its WEIGHTS must be served before the fit reads free memory. They
+    # used to be quantized inside Engine.__init__, i.e. after the fit had spent 2/3 of
+    # free memory and PrefixStore a quarter of the rest -- so on the 27B at serve's
+    # default --slots 16 the draft's own fp4 weights were charged to nothing and
+    # `serve --blocks 0 --draft` died in materialize's twiddle with 104 MiB free,
+    # before the fit's print. `draft` must come FIRST, not just before `fit`: the
+    # reclaim between them is what turns the fit into a measurement.
+    seen.clear()
+    trunk = build_random(cfg, seed=7)
+    build_engine(cfg, trunk, get_backend(), num_blocks=0, num_slots=3, max_batch=2,
+                 max_total_tokens=512, max_blocks=16,
+                 draft=_draft(cfg, trunk), spec_depth=3)
+    assert seen[:3] == ["draft", "state", "fit"], (
+        f"the draft's weights must be served before the state pool and the fit: {seen}")
+    # Engine.__init__ still calls it, for a caller who builds an Engine directly with an
+    # unquantized draft. That call is a no-op on already-packed params (_quantize_draft
+    # returns its input when it sees a .wq/.w8 key), which is why it may follow the fit.
+    assert seen[3:] in ([], ["draft"]), f"one re-serve at most, got {seen}"
+
+
+def test_graph_keys_covers_what_a_decode_tick_keys_on():
+    """`graph_keys` is what `precapture` builds, so it must contain every key
+    `_run_decode_graph` would look up — otherwise warming succeeds, reports N
+    graphs, and a real request captures anyway (~14 s on the 27B).
+
+    That is exactly what a generate-and-hope warmup did: chain width depends on
+    the draft's confidence, so no number of generated tokens guarantees a width
+    appears, and two were left uncaptured. Runs off CUDA because it checks keys,
+    not captures; capture parity is the CUDA test above.
+    """
+    backend = get_backend()
+    cfg = tiny()
+    for max_batch in (1, 2, 4, 8):
+        e = build_engine(cfg, build_random(cfg, seed=21), backend, num_blocks=16,
+                         num_slots=max_batch + 1, max_batch=max_batch,
+                         max_total_tokens=256)
+        keys = e.graph_keys()
+        for rows in range(1, max_batch + 1):
+            assert (e._graph_bucket(rows), 1) in keys, (
+                f"max_batch={max_batch}: a {rows}-row tick keys on "
+                f"{(e._graph_bucket(rows), 1)}, which precapture would not build"
+            )
+        assert e._graph_bucket(max_batch) <= max_batch, "a bucket may not exceed max_batch"
+
+    # With a draft, every width a trimmed chain can present. Untested until it broke:
+    # the widths branch read a `_spec_depth` attribute the Engine never sets, so
+    # `precapture` died with AttributeError on the FIRST drafted run — every case
+    # above builds a dense engine and takes the `(1,)` path.
+    trunk = build_random(cfg, seed=21)
+    e = build_engine(cfg, trunk, backend, num_blocks=16, num_slots=3, max_batch=2,
+                     max_total_tokens=256, draft=_draft(cfg, trunk), spec_depth=3)
+    keys = e.graph_keys()
+    for w in range(1, e._width + 1):
+        assert (e._graph_bucket(1), w) in keys, (
+            f"a width-{w} verify tick keys on {(e._graph_bucket(1), w)}, which "
+            f"precapture would not build; widths present: {sorted({k[1] for k in keys})}"
+        )
+    assert max(k[1] for k in keys) == e._width, (
+        f"graph_keys goes past the drafter's settled width {e._width}: "
+        f"{sorted({k[1] for k in keys})} — those captures are ~14 s each and dead"
+    )
+
+
+def test_the_engines_verify_width_is_reachable_from_outside():
+    """A harness must be able to move a live engine's depth, and see that it moved.
+
+    `scripts/ab_draft_depth.py` prices one draft forward as the difference between
+    two depths, so its whole output is a difference. It set `e._spec_depth`, which
+    was live until 7069a1f moved the chain loop onto the head — after that the
+    assignment hit nothing, and the sweep would have measured ONE config four
+    times and reported drafting as free. A no-op knob does not produce a wrong
+    number, it produces a plausible one, which is why this is a test and not a
+    comment: `_width` on the engine and `width` on the head are the two places a
+    tick reads, and both have to answer.
+    """
+    backend, cfg = get_backend(), tiny()
+    trunk = build_random(cfg, seed=21)
+    head = _draft(cfg, trunk)
+    e = build_engine(cfg, trunk, backend, num_blocks=16, num_slots=3, max_batch=2,
+                     max_total_tokens=256, draft=head, spec_depth=3)
+    assert e._width == 4, f"spec_depth=3 must build width 4, got {e._width}"
+    for depth in (2, 1, 3):
+        head.set_depth(depth)
+        e._width = head.width
+        assert head.width == depth + 1
+        assert e._width == depth + 1
+        # The width has to reach what a tick keys on, or the move is cosmetic.
+        assert max(k[1] for k in e.graph_keys()) == depth + 1, (
+            f"depth {depth} did not reach graph_keys: "
+            f"{sorted({k[1] for k in e.graph_keys()})}"
+        )
+    # And the attribute the broken script wrote is still not one the engine reads,
+    # so a harness that regresses to it fails here rather than on the pod.
+    assert not hasattr(e, "_spec_depth"), (
+        "the Engine grew a _spec_depth attribute; if it is now the depth knob, say "
+        "so here — ab_draft_depth.py was broken for a whole refactor by assuming it"
+    )

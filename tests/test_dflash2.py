@@ -340,6 +340,33 @@ def test_unmapped_tensors_raise_instead_of_vanishing(tmp_path):
         assert name in str(e.value), str(e.value)
 
 
+def test_a_quantized_readout_is_skipped_not_unknown(tmp_path):
+    """A draft shard whose lm_head is quantized must load, dropping all three tensors.
+
+    The 27B NVFP4 shard we serve ships lm_head as wq/scale/oscale. _param_key_for
+    names none of them, so a skip keyed on `mapped == "lm_head"` sent all three to
+    `unknown` and read_head_params raised on the only draft head in production --
+    while every test here used an f16 head with a single lm_head.weight and passed.
+    """
+    w = torch.full((8,), _NORM)
+    head = tmp_path / "q_readout.safetensors"
+    save_file({"mtp.norm.weight": w, "mtp.pre_fc_norm_hidden.weight": w.clone(),
+               "mtp.fc.weight": torch.zeros(8, 16),
+               "lm_head.wq": torch.zeros(4, 8, dtype=torch.uint8),
+               "lm_head.scale": torch.ones(4, 1),
+               "lm_head.oscale": torch.ones(1)}, str(head))
+    got = read_head_params(head, _DRAFT_TOP)
+    assert not any("lm_head" in k for k in got), f"the readout was kept: {sorted(got)}"
+    assert {"norm", "fc", "pre_fc_norm_hidden"} <= set(got), sorted(got)
+
+    # Negative control: an unrelated unmapped tensor still raises, so this is a
+    # narrower skip and not a blanket "ignore what we cannot name".
+    bad = tmp_path / "bad.safetensors"
+    save_file({"mtp.norm.weight": w, "mtp.lm_head_extra.wq": torch.zeros(2, 2)}, str(bad))
+    with pytest.raises(RuntimeError, match="map to no parameter"):
+        read_head_params(bad, _DRAFT_TOP)
+
+
 def test_norm_fold_is_per_format(tmp_path):
     """The zero-centered +1 fold belongs to Qwen NextN alone.
 

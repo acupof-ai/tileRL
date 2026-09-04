@@ -3,6 +3,7 @@ loud-failure paths."""
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 
@@ -280,6 +281,99 @@ def test_fp4_save_load_roundtrip(tmp_path):
     assert greedy(loaded) == greedy(model)
 
 
+def test_sm70_chunks_cover_every_row_exactly_once():
+    """The sm70 GEMV ladder chunks M into 1/2/4/8/32-row launches. A slicing bug
+    is invisible where it runs — only M that does not divide 32 exposes it, and the
+    sm70 branch never executes on the CPU target the parity tests use — so gate the
+    arithmetic directly: chunks must tile [0, M) with no gap, no overlap, and each
+    chunk's rung must be the smallest that holds its rows."""
+    from tilerl_kernels.backend import _sm70_chunks
+
+    for m in (1, 2, 3, 5, 8, 9, 16, 32, 33, 40, 64, 100, 512):
+        chunks = _sm70_chunks(m)
+        assert [o for o, _, _ in chunks] == list(
+            itertools.accumulate([r for _, r, _ in chunks][:-1], initial=0)
+        ), f"M={m}: offsets do not follow the row counts"
+        assert sum(r for _, r, _ in chunks) == m, f"M={m}: chunks do not cover M"
+        for _, r, rung in chunks:
+            assert rung >= r, f"M={m}: rung {rung} cannot hold {r} rows"
+            assert rung in (1, 2, 4, 8, 32), f"M={m}: {rung} is not a ladder rung"
+            smaller = [w for w in (1, 2, 4, 8, 32) if w >= r]
+            assert rung == min(smaller), f"M={m}: {r} rows took rung {rung}, not {min(smaller)}"
+    # The whole point of the per-chunk rung: 40 rows is 32+8, not 32+32.
+    assert [rung for _, _, rung in _sm70_chunks(40)] == [32, 8]
+
+
+def test_the_mma8_row_cap_is_never_above_the_plans_padded_M():
+    """Both mma8 branches feed the kernel exactly ``_MX`` rows, and the fp8 one takes
+    them from an ``x2`` the plan already padded to ``Mp = _snap_mma_tile(M, 128)``.
+    Mp is 16 for EVERY M in 2.._MX, so `_pad2d(x2, _MX, Kp)` asked to SHRINK 16 rows
+    to 8 -- which main got away with because F.pad crops on a negative pad, and which
+    the guard in `_pad2d` correctly refuses. Measured on sm90: 1191 calls at M=8 in a
+    single B=8 tick, so this was every speculative config and dense B=8.
+
+    Gate the arithmetic, not the kernel: neither mma8 branch can execute on the CPU
+    target where the parity tests live, and the fp4 twin does NOT pre-pad x2, so the
+    two branches disagree about what x2's row count is when they slice it."""
+    from tilerl_kernels.backend import _MX, _snap_mma_tile
+
+    for m in range(2, _MX + 1):
+        mp = _snap_mma_tile(m, 128)
+        assert mp >= _MX, (
+            f"M={m}: the plan pads x2 to {mp} rows but the mma8 kernel wants {_MX}; "
+            "if Mp could fall below _MX the slice would silently drop real rows"
+        )
+        # The real rows are the first m of Mp, so taking _MX of them keeps all of them.
+        assert m <= _MX <= mp, f"M={m}: {m} <= {_MX} <= {mp} is what makes the slice exact"
+
+
+def test_the_mma8_N_rung_can_be_narrower_than_the_plans_and_the_drop_is_exact():
+    """The mma8 branches re-target wq/scale from the plan's ``Np`` to ``Np32``, and the
+    two rungs DO NOT ORDER: Np = _round_up(N, bN) with bN from the plan's N tile (64 on
+    the fp4 decode arm) overshoots Np32 = _round_up(N, 32) whenever bN's rounding jumps
+    past 32. sm90 reported it as `_pad2d: (64, 256) exceeds the target [32, 256]` -- the
+    fp4 twin of the fp8 row bug, and my published claim that "the fp4 branch does not
+    pre-pad, which is why only fp8 breaks" was wrong: it pre-pads on the N axis.
+
+    Two things to gate, and the first is why the second is needed: that Np > Np32 really
+    happens (or `_fit_rows` is dead code), and that dropping those rows equals never
+    padding them -- rows between N and either rung are zero, so the two agree elementwise.
+    """
+    import torch
+    from tilerl_kernels.backend import _fit_rows, _pad2d, _round_up
+
+    over = [(n, _round_up(n, 64), _round_up(n, 32))
+            for n in (24, 40, 96, 130) if _round_up(n, 64) > _round_up(n, 32)]
+    assert over, "no N has Np > Np32, so the mma8 re-target can never over-ask"
+
+    for n, np_, np32 in over:
+        plane = torch.arange(n * 8, dtype=torch.float32).reshape(n, 8)
+        # what the branch does: pad to the plan's rung, then re-target to the narrow one
+        got = _fit_rows(_pad2d(plane, np_, 8), np32, 8)
+        assert got.shape == (np32, 8), f"N={n}: {tuple(got.shape)} is not [{np32}, 8]"
+        assert torch.equal(got, _pad2d(plane, np32, 8)), (
+            f"N={n}: dropping rows off the [{np_}, 8] plane differs from padding the "
+            f"[{n}, 8] one to {np32} -- the dropped rows were not all zero pad"
+        )
+
+
+def test_fp4_save_widens_f16_scale_plane(tmp_path):
+    """A backend may serve the block scales narrowed (sm70 does, at f16); the NVFP4
+    format's are f32, so save_hf must widen them or the written checkpoint is
+    unreadable by anything that trusts the format. The dtype is all save_hf reacts
+    to, so narrowing the planes directly keeps this hermetic."""
+    cfg = replace(tiny(), fp4=True, tie_word_embeddings=False)
+    model = build_random(cfg, seed=7)
+    for key in fp4_param_keys(cfg):
+        model.params[key + ".scale"] = model.params[key + ".scale"].to(torch.float16)
+    save_hf(model, tmp_path / "ckpt")
+    loaded = load_hf(cfg, str(tmp_path / "ckpt"))
+    for key in fp4_param_keys(cfg):
+        sc = loaded.params[key + ".scale"]
+        assert sc.dtype == torch.float32, f"{key}.scale saved as {sc.dtype}, not the format's f32"
+        assert torch.equal(sc, model.params[key + ".scale"].float())  # widening is exact
+
+
 def test_fused_projections_parity(tmp_path):
     """fuse_projections concats same-input fp4 projections; logits match unfused."""
     import numpy as np
@@ -368,7 +462,11 @@ def test_nvfp4_modelopt_load(tmp_path):
     for key, exp in expected.items():
         assert torch.equal(loaded.params[key], exp), f"param {key} dequant mismatch"
     for key, (w, ws) in expected_fp8.items():
-        assert torch.equal(loaded.params[key + ".w8"], w), f"param {key}.w8 mismatch"
+        # uint8 view: torch 2.5.1 has no `equal_cpu` for Float8_e4m3fn, which failed
+        # three loader tests on the V100 pod while passing on a newer torch. fp8 is a
+        # bit pattern, so the view compares exactly what the dtype compare would.
+        assert torch.equal(loaded.params[key + ".w8"].view(torch.uint8),
+                           w.view(torch.uint8)), f"param {key}.w8 mismatch"
         assert torch.equal(loaded.params[key + ".wscale"], ws), f"param {key}.wscale mismatch"
 
 
@@ -431,7 +529,11 @@ def test_nvfp4_official_load(tmp_path, fp4):
         else:
             assert torch.equal(got, exp), f"param {key} dequant mismatch"
     for key, (w, ws, os_) in expected_fp8.items():
-        assert torch.equal(loaded.params[key + ".w8"], w), f"param {key}.w8 mismatch"
+        # uint8 view: torch 2.5.1 has no `equal_cpu` for Float8_e4m3fn, which failed
+        # three loader tests on the V100 pod while passing on a newer torch. fp8 is a
+        # bit pattern, so the view compares exactly what the dtype compare would.
+        assert torch.equal(loaded.params[key + ".w8"].view(torch.uint8),
+                           w.view(torch.uint8)), f"param {key}.w8 mismatch"
         assert torch.equal(loaded.params[key + ".wscale"], ws), f"param {key}.wscale mismatch"
         assert torch.equal(loaded.params[key + ".oscale"], os_), f"param {key}.oscale mismatch"
         # the served 8-bit path and the bf16 master agree

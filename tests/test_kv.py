@@ -287,3 +287,31 @@ def test_prefix_state_budget_evicts():
     assert store.stats()["entries"] == 2 and store.stats()["state_bytes"] == 800
     assert store.lookup(list(range(16))) is None
     assert store.lookup(list(range(16, 32))).state[0].shape == (100,)
+
+
+def test_a_block_costs_2125_kib_at_the_27b_shape():
+    """Pin the per-block byte cost the pool-sizing arithmetic is written against.
+
+    bench_ctx_decode.py sizes its pool from this number and prints it, and a wrong
+    value is invisible: the run still works, it just reserves the wrong amount and
+    every "how much headroom did that arm have" comparison across runs is off. The
+    comment claimed 0.92 MB for months -- 2.42x low, because it was bf16 and left
+    out the draft's mirrored plane.
+    """
+    from tilerl.config import qwen38_27b
+
+    cfg = qwen38_27b()
+    n = 8
+    # f32: sm70's attention IO dtype, which the pool matches (engine.py:1202).
+    trunk = PagedKvPool(n, cfg.num_kv_heads, cfg.head_dim, device="cpu",
+                        layer_map=cfg.full_attn_layers, dtype=torch.float32)
+    draft = PagedKvPool(n, cfg.num_kv_heads, cfg.head_dim, num_layers=1, device="cpu",
+                        layer_map=(0,), dtype=torch.float32)
+    per_block = sum(
+        t.numel() * t.element_size()
+        for t in (trunk.k_pool, trunk.v_pool, draft.k_pool, draft.v_pool)
+    ) / n
+    assert per_block == 2.125 * 2**20, (
+        f"a block is {per_block / 2**20:.4f} MiB; bench_ctx_decode.py sizes and prints its "
+        f"pool at 2.125 MiB/block, so both that number and its comment are now wrong"
+    )

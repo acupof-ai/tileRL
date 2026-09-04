@@ -40,6 +40,34 @@ class _ByteTokenizer:
         return bytes(i - 3 for i in ids if 3 <= i < 259).decode("utf-8", errors="replace")
 
 
+class _TextTokenizer(_ByteTokenizer):
+    """Byte-level decode of a FIXED text, indexed by how many ids arrived.
+
+    Exists because the streaming test's premise cannot depend on model weights.
+    `_ByteTokenizer` decodes whatever bytes the random tiny model samples, and on
+    macos-14 CI those were mostly UTF-8 continuation bytes: every prefix ended in
+    U+FFFD, `rstrip` held the visible text flat, and the whole reply arrived in one
+    delta. Green locally, red there, for a reason that has nothing to do with the
+    loop under test.
+
+    Decoding `pattern[:len(ids)]` keeps every property the test needs -- a prefix
+    that grows one byte at a time, multi-byte characters that a cut lands inside --
+    and makes all of them independent of what was sampled.
+    """
+
+    #: Two properties the defects need in order to bite, so the negative controls
+    #: discriminate. Multi-byte characters ('é' 2 bytes, '→' 3) so a prefix can cut
+    #: one -- and a raw 0xFF, which is not valid UTF-8 in any position and so decodes
+    #: to an INTERIOR U+FFFD in every longer prefix. Without that byte, `split("�")[0]`
+    #: and `rstrip("�")` agree on all but 3 of 51 prefixes and both mutations pass.
+    #: A bytes literal, not str.encode: every codec turns \xff back into valid UTF-8.
+    PATTERN = b"the caf\xc3\xa9 \xff menu \xe2\x86\x92 three courses"
+
+    def decode(self, ids) -> str:
+        n = sum(1 for i in ids if 3 <= i < 259)
+        return self.PATTERN[:n].decode("utf-8", errors="replace")
+
+
 def _build_engine(seed: int) -> Engine:
     cfg = tiny()
     model = build_random(cfg, seed=seed)
@@ -145,6 +173,209 @@ def test_seedless_requests_decorrelate(client, model_id, monkeypatch):
     for _ in range(4):
         assert client.post("/v1/chat/completions", json=body).status_code == 200
     assert len(set(seeds)) == len(seeds) == 4, seeds
+
+
+def test_the_stream_arrives_in_pieces_and_never_splits_a_character():
+    """SSE must deliver text as it is generated, not one block at the end.
+
+    Two things must hold at once and they pull against each other. Deltas must
+    arrive as separate chunks (streaming), AND concatenating them must equal the
+    non-streamed text exactly (correctness). The trap is decoding per token: one
+    token is not one character, so a per-token decode splits multi-byte UTF-8.
+    _ByteTokenizer makes that reachable -- one id per BYTE, so any multi-byte
+    character is guaranteed to span tokens.
+
+    Uses _TextTokenizer, whose decode is a function of the id COUNT against a fixed
+    string, so the premise does not depend on which bytes the random weights sample.
+    With plain _ByteTokenizer this passed locally and failed on macos-14: the reply
+    there was mostly UTF-8 continuation bytes, so every prefix ended in U+FFFD, the
+    rstrip held the visible text flat, and one delta carried everything.
+
+    Builds its own engine at seed 7 rather than taking the module `client`, whose
+    seed 42 is the one seed measured where the two-defect loop still produced two
+    deltas -- i.e. where this test cannot see the bug. At seed 7 the broken loop
+    puts the entire reply in the final chunk.
+    """
+    engine = _build_engine(seed=7)
+    engine.run()
+    try:
+        client = TestClient(create_app(engine, _TextTokenizer()))
+        model_id = client.get("/v1/models").json()["data"][0]["id"]
+        body = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 24,
+            "temperature": 0.0,
+            "seed": 7,
+        }
+        _assert_stream_is_incremental(client, body)
+    finally:
+        engine.shutdown()
+
+
+def _assert_stream_is_incremental(client, body) -> None:
+    streamed = client.post("/v1/chat/completions", json={**body, "stream": True})
+    assert streamed.status_code == 200, streamed.text
+    lines = [ln for ln in streamed.text.splitlines() if ln.startswith("data:")]
+    payloads = [json.loads(ln[len("data: ") :]) for ln in lines[:-1]]
+    deltas = [
+        p["choices"][0]["delta"]["content"]
+        for p in payloads
+        if p["choices"][0].get("delta", {}).get("content")
+    ]
+
+    # Correctness first, because it holds unconditionally: the pieces must reassemble
+    # into the same text the non-streamed path returns for the same request.
+    plain = client.post("/v1/chat/completions", json={**body, "stream": False})
+    assert plain.status_code == 200, plain.text
+    expected = plain.json()["choices"][0]["message"]["content"]
+    assert "".join(deltas) == expected, (
+        f"stream != non-stream:\n  joined  {''.join(deltas)!r}\n  expected {expected!r}"
+    )
+
+    # No incremental delta may END on U+FFFD: that is where a multi-byte character was
+    # cut in half, and holding the trailing replacement run until its bytes arrive is
+    # the whole point of the loop's rstrip.
+    #
+    # Deliberately not "contains no U+FFFD": tiny() has random weights, so its bytes
+    # are mostly not valid UTF-8 and the non-streamed reply carries interior
+    # replacement chars on all four model seeds measured -- an assertion against
+    # containment is unsatisfiable for any loop that actually streams, and the earlier
+    # one passed only because the loop emitted nothing until the end.
+    #
+    # How MUCH streamed is asserted by
+    # test_a_reply_that_arrives_over_many_polls_streams_over_many_deltas, against a
+    # stepped engine, and deliberately NOT here: the delta count off a live engine is
+    # a race between generation speed and the loop's 20 ms poll, and the tiny model
+    # can finish a 24-token reply inside one window. Measured 3 deltas at seeds
+    # 7/42/3 and 1 at 11/99. An assertion that the last delta is not the whole reply
+    # therefore fails on timing, not on a defect -- it did, 2 runs in 6 of this file,
+    # while passing every time the test ran alone. The stepped engine reveals one
+    # token per poll by construction and asserts the same invariant deterministically.
+    assert not any(d.endswith("�") for d in deltas[:-1]), (
+        f"an incremental delta ends mid-character: {deltas!r}"
+    )
+
+
+class _StepEngine:
+    """An engine whose peek() reveals ONE more token per call. No race, no weights.
+
+    The live-engine test above cannot assert delta COUNT: that is a race between
+    generation speed and the loop's 20 ms poll, and the tiny model can finish a
+    24-token reply inside one window -- measured 3 deltas at model seeds 7/42/3, 1 at
+    11/99, and 1 on macos-14 CI where the same test passed locally. So the claim
+    "text arrives while it generates" gets asserted here instead, against a driver
+    that makes the arrival order deterministic.
+    """
+
+    def __init__(self, ids: list[int]) -> None:
+        self.ids, self.n = ids, 0
+
+    def submit(self, input_ids, params) -> int:
+        return 1
+
+    def peek(self, request_id: int):
+        if self.n > len(self.ids):
+            return None  # left the queues: the loop breaks and calls take()
+        self.n += 1
+        return self.ids[: self.n - 1]
+
+    def take(self, request_id: int):
+        return self.ids
+
+    def stats(self) -> dict:
+        return {}
+
+    def run(self) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+
+def test_a_reply_that_arrives_over_many_polls_streams_over_many_deltas():
+    """One delta per poll that reveals new text, and the last one is not the whole reply.
+
+    Catches the load-bearing half of the original loop's two defects: cutting the
+    decode at the FIRST U+FFFD (`split("�")[0]`) instead of stripping the trailing
+    run. Verified by mutation -- it drops this from 30 deltas to 10, the last of which
+    dumps 22 characters, because everything after the reply's first unmappable byte is
+    invisible until the tail chunk.
+
+    The other defect -- gating on `sent` (characters) instead of `seen` (tokens) --
+    does NOT change the output here and this test does not claim to catch it: with one
+    id per byte the two counters advance together, so the substitution is a no-op.
+    It mattered on the real tokenizer, where one token is many characters.
+    """
+    text = _TextTokenizer.PATTERN
+    ids = [b + 3 for b in text]  # one id per byte, so a prefix can cut a character
+    engine = _StepEngine(ids)
+    client = TestClient(create_app(engine, _TextTokenizer()))
+    body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": len(ids),
+            "temperature": 0.0, "stream": True}
+    r = client.post("/v1/chat/completions", json=body)
+    assert r.status_code == 200, r.text
+    lines = [ln for ln in r.text.splitlines() if ln.startswith("data:")]
+    payloads = [json.loads(ln[len("data: ") :]) for ln in lines[:-1]]
+    deltas = [p["choices"][0]["delta"]["content"] for p in payloads
+              if p["choices"][0].get("delta", {}).get("content")]
+    full = text.decode("utf-8", errors="replace")  # the 0xFF is a U+FFFD, deliberately
+
+    assert "".join(deltas) == full, f"joined {''.join(deltas)!r} != {full!r}"
+    # One delta per character the prefix grows by, minus the multi-byte ones whose
+    # first byte reveals no complete character. Loose bound, tight enough to fail
+    # either defect: both collapse this to 1.
+    assert len(deltas) > len(full) // 2, (
+        f"{len(deltas)} deltas for {len(full)} characters revealed one byte at a time: "
+        f"the loop is not emitting as text arrives. deltas={deltas!r}"
+    )
+    assert deltas[-1] != full, f"the last delta is the whole reply: {deltas!r}"
+    # The pattern's own 0xFF is a legitimate U+FFFD in the content, so a delta MAY end
+    # on one. What must not happen is a delta ending on a replacement char that a later
+    # delta resolves into a real character -- that is a split multi-byte sequence. Check
+    # the invariant that catches it: each delta only ever APPENDS, so the running join
+    # must be a prefix of the final text at every step.
+    running = ""
+    for i, d in enumerate(deltas):
+        running += d
+        assert full.startswith(running), (
+            f"delta {i} makes the stream diverge from the final text: "
+            f"{running!r} is not a prefix of {full!r}"
+        )
+
+
+def test_usage_in_the_stream_is_opt_in_and_counts_tokens_not_characters(client, model_id):
+    """The page's tok/s meter needs a real token count, and older clients must not break.
+
+    Without stream_options the stream carries no usage, so a client that reads
+    choices[0] on every frame keeps working -- an unconditional usage chunk broke two
+    tests in this file. With include_usage the final chunk has usage and an EMPTY choices
+    list, which is why a reader must check usage before indexing into choices.
+
+    completion_tokens is the engine's count, not a character estimate: the page used to
+    compute chars/4, which is ~4x low for Chinese (roughly one token per character).
+    """
+    body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16, "temperature": 0.0, "seed": 5, "stream": True}
+
+    def frames(extra):
+        resp = client.post("/v1/chat/completions", json={**body, **extra})
+        assert resp.status_code == 200, resp.text
+        lines = [ln for ln in resp.text.splitlines() if ln.startswith("data: {")]
+        return [json.loads(ln[len("data: ") :]) for ln in lines]
+
+    plain = frames({})
+    assert all(p.get("usage") is None for p in plain), "usage must be opt-in"
+    assert all(p["choices"] for p in plain), "every frame carries a choice without opt-in"
+
+    opted = frames({"stream_options": {"include_usage": True}})
+    last = opted[-1]
+    assert last["choices"] == [], f"the usage chunk must carry no choices: {last!r}"
+    usage = last["usage"]
+    assert usage["prompt_tokens"] > 0
+    assert usage["completion_tokens"] == 16, usage
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+    assert all(p["choices"] for p in opted[:-1]), "only the last frame may be choices-less"
 
 
 def test_completion_stream(client, model_id):
@@ -402,3 +633,42 @@ def test_image_blocks_are_refused_not_dropped(client, tmp_path, monkeypatch):
     })
     assert r.status_code == 400, r.text
     assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_serve_sizes_its_pools_from_the_flags_not_the_context():
+    """`tilerl serve`'s own engine builder must honour --blocks / --max-ctx.
+
+    This is the one path no benchmark reaches: every bench script constructs the
+    engine itself and passes num_blocks, so `_build_engine`'s default went
+    unexercised until it asked for 275 GB of KV on a 32 GB card (131072 blocks
+    from the 27B's 262144-token context). The gate is that the flags win and
+    that the default is still derived from the context, which is what a
+    large-card target relies on.
+    """
+    from tilerl import cli
+    from tilerl.engine import _graph_on
+    from tilerl.kv_cache import BLOCK_TOKENS
+
+    cfg = tiny(max_position_embeddings=4096)
+    model = build_random(cfg, seed=3)
+    be = get_backend()
+    # The captured decode tick's padding row owns a block of its own, reserved up
+    # front so the capacity the caller asked for stays whole. It is on by default on
+    # CUDA, so the pool is num_blocks + 1 there and num_blocks on cpu/metal: this
+    # test read `65 == 64` on both sm90 and sm70 and passed on cpu for that reason,
+    # which made an intentional reservation look like an off-by-one in _fit_blocks.
+    pad = int(_graph_on(be, None))
+
+    e = cli._build_engine(cfg, model, be, blocks=64, max_ctx=256, max_batch=2)
+    assert e._kv.num_blocks - pad == 64
+    assert e.limits.max_total_tokens == 256, "a request must not outgrow the pool"
+    assert e.limits.max_batch == 2
+
+    d = cli._build_engine(cfg, model, be)
+    assert d._kv.num_blocks - pad == (4096 * d.limits.max_batch) // BLOCK_TOKENS, (
+        "the default pool must cover max_batch rows of the context — no more "
+        "(bytes are the long-context limit) and no less (a full batch must fit). "
+        "On CUDA this is _fit_blocks' cap; a card too small to fit even the tiny "
+        "model's 2048 blocks would report less, and that is a real capacity limit "
+        "rather than a bug in the sizing"
+    )

@@ -19,6 +19,7 @@ from tilerl_kernels.reference import (
     renorm_fp4_scale,
     unpack_fp4,
     untwiddle_fp4,
+    untwiddle_fp4_f16,
 )
 
 from . import autograd, precision
@@ -194,7 +195,7 @@ class Model:
     ) -> torch.Tensor:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
-        h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps)
+        h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps, narrow=True)
         hq, hkv, d = cfg.num_attention_heads, cfg.num_kv_heads, cfg.head_dim
         qkv_key = f"{p}.qkv"
         if self._has(qkv_key):
@@ -268,7 +269,7 @@ class Model:
     ) -> torch.Tensor:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
-        h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps)
+        h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps, narrow=True)
         qkvz_key = f"{p}.qkvz"
         if self._has(qkvz_key):
             qkvz = self._linear(backend, h, qkvz_key)
@@ -335,7 +336,7 @@ class Model:
     def _mlp_body(self, layer_idx: int, x: torch.Tensor, kv: Any, backend: Backend):
         cfg = self.cfg
         p = f"layers.{layer_idx}"
-        h = backend.rmsnorm(x, self.params[f"{p}.post_attn_norm"], cfg.rms_eps)
+        h = backend.rmsnorm(x, self.params[f"{p}.post_attn_norm"], cfg.rms_eps, narrow=True)
         gu_key = f"{p}.gate_up"
         if self._has(gu_key):
             gu = self._linear(backend, h, gu_key)
@@ -388,7 +389,7 @@ class Model:
             else:
                 idx = torch.as_tensor([n - 1 for n in last_only], device=device)
                 x = x[torch.arange(x.shape[0], device=device), idx].unsqueeze(1)
-        x = backend.rmsnorm(x, self.params["final_norm"], cfg.rms_eps)
+        x = backend.rmsnorm(x, self.params["final_norm"], cfg.rms_eps, narrow=True)
         head_key = cfg.head_key
         logits = self._linear(backend, x, head_key)
         if getattr(backend, "tp_world", 1) > 1 and not cfg.tie_word_embeddings:
@@ -902,8 +903,13 @@ def save_hf(model: Model, path: str | Path) -> None:
             stem = hf.removesuffix(".weight")
             for suffix in (".wq", ".scale", ".oscale"):
                 t = model.params[key + suffix]
-                if getattr(t, "_tl_twiddled", False):  # sm90 serves twiddled bytes
+                layout = getattr(t, "_tl_layout", "natural")
+                if layout == "tw-bf16":  # sm90 serves bf16-twiddled bytes
                     t = untwiddle_fp4(t)
+                elif layout == "tw-f16":  # sm70 serves fp16-twiddled bytes
+                    t = untwiddle_fp4_f16(t)
+                if suffix == ".scale":
+                    t = t.float()  # the format's scale plane is f32, whatever was served
                 tensors[stem + suffix] = t
         else:
             missing.append(key)
