@@ -88,6 +88,29 @@ failure mode this bug had for its whole life.
 Both mutations were run and both fail it: reverting the width rounding, and reverting
 `nb` to `max(len(r.blocks))`. 256 passed / 8 skipped.
 
+## What the widening cost, priced rather than assumed
+
+`nb = self.kv.num_blocks` widens a per-tick H2D copy, and `spec.py` builds its table with
+plain `torch.zeros` where `engine.py:667` pins its own. The draft's `step` runs on every
+decode tick (124 against 5 prefills in one served request), so this is ~25 copies per
+request, not one. Measured with `scripts/probe_bt_copy.py`, 200 reps, against the 5.54 ms
+draft forward — both `nb` arms at both `n`, because comparing an n=8 row against the n=1
+pre-fix row read `+101 us` of "widening cost" that was mostly eight rows instead of one:
+
+| n | nb 6 → 256 | nb 6 → 4146 |
+|---:|---:|---:|
+| 1 | **−1 us** (−0.02%) | +12 us (0.22%) |
+| 8 | +25 us (0.45%) | +135 us (2.44%) |
+
+**At the shipped config (B=1, 256 blocks) the widening is free** — a 2 KiB copy is all
+launch overhead, so 256 columns cost the same as 6. Memory is a non-issue at every width:
+259 KiB worst case against 24.4 GiB of weights.
+
+Pinning recovers 97 of the 135 us at B=8/ctx=8192 (0.254 → 0.157 ms). **Not done**: that
+configuration OOMs on sm70 at any depth (#72), and 2.44% of one term of the tick is under
+the harness's own 1.16% noise floor once expressed as a tick fraction. The number is here
+so it can be re-read rather than re-derived when B=8 becomes reachable.
+
 ## Rule
 
 When two code paths run the same shape-specialized kernel, a bucket on one of them is not
