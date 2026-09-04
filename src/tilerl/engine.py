@@ -46,7 +46,7 @@ from .kv_cache import (
     PagedKvPool,
     PrefixStore,
 )
-from .spec import LADDER_WIDTHS
+from .spec import _PREFILL_BUCKET, LADDER_WIDTHS
 
 
 def _graph_on(backend, decode_graph: bool | None) -> bool:
@@ -56,7 +56,6 @@ def _graph_on(backend, decode_graph: bool | None) -> bool:
     return backend.device.type == "cuda" if decode_graph is None else decode_graph
 
 
-_PREFILL_BUCKET = 64  # prefill widths are padded to this: bounded kernel shapes
 
 #: Decode-graph size ladder: a tick pads up to the first bucket >= its row count.
 _GRAPH_BUCKETS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)

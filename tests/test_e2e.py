@@ -1637,3 +1637,53 @@ def test_a_mixed_tick_pays_the_widest_rows_width_on_every_row():
         _drain(engine, [short, long_], max_new_tokens=8)
     finally:
         engine.shutdown()
+
+
+def test_the_draft_prefill_width_is_bucketed_like_the_trunks():
+    """Every distinct prompt length used to give the draft a new kernel shape.
+
+    `engine.py:740` buckets the trunk's prefill width to `_PREFILL_BUCKET`, and
+    `spec.py` took `w = max(hi - lo + 1)` raw. The draft runs the same two kernels
+    that take `seq_q_lens` (`write_tokens_f32`, `paged_attention_split`), both of
+    which bake their shape, so a prompt nobody had asked before compiled them
+    inline: measured on the live V100 server, a first visit at a new prompt length
+    paid **14 compiles / 15.5 s** and read **4.4 tok/s** where the identical prompt
+    repeated read **45.0**.
+
+    Asserting on the widths the draft's own forward SEES, not on a formula --
+    a mirror of the arithmetic passes even when `spec.py` stops calling it.
+    """
+    cfg = tiny()
+    model = build_random(cfg, seed=31)
+    draft = _random_draft(cfg, 32, model)
+    engine = build_engine(
+        cfg, model, backend=get_backend(), num_blocks=64, num_slots=4, max_batch=4,
+        max_total_tokens=512, draft=draft, spec_depth=1,
+    )
+    widths: list[int] = []
+    inner = draft.forward
+
+    def spy(hidden, ids, positions, kv, be, hidden_out=None, last_only=False):
+        widths.append(int(np.asarray(ids).shape[1]))
+        return inner(hidden, ids, positions, kv, be, hidden_out=hidden_out,
+                     last_only=last_only)
+
+    draft.forward = spy
+    try:
+        rng = np.random.default_rng(7)
+        params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=1)
+        # Three prompt lengths that are NOT bucket multiples and are pairwise
+        # distinct mod the bucket -- unbucketed they give three shapes, bucketed one.
+        for plen in (19, 37, 53):
+            _drain(engine, [engine.submit(rng.integers(3, 320, size=plen).astype(np.int64),
+                                          params)], max_new_tokens=4)
+    finally:
+        draft.forward = inner
+        engine.shutdown()
+
+    wide = sorted({w for w in widths if w > 1})
+    assert wide, f"the draft never ran a multi-position tick: {widths}"
+    assert wide == [_PREFILL_BUCKET], (
+        f"draft prefill widths {wide} are not all the bucket ({_PREFILL_BUCKET}): "
+        "three distinct prompt lengths compiled three kernel shapes"
+    )

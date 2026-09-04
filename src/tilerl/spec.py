@@ -43,6 +43,11 @@ from .kv_cache import BLOCK_TOKENS, BatchKv
 BIAS_MS = 211.0
 ROW_MS = 0.53
 
+#: Prefill widths are padded to this so kernel shapes stay bounded. Lives here, not
+#: in engine.py, because engine imports spec and both paths must round identically --
+#: the draft skipping the bucket cost a served first visit 14 compiles inline.
+_PREFILL_BUCKET = 64
+
 #: Verify widths the sm70 M-ladder serves without padding waste. A width
 #: between rungs pays the next rung's full price: depth 5 (W=6) costs the same
 #: 8-row launch as depth 7 (W=8), which measured 10% SLOWER than depth 3 on the
@@ -391,7 +396,15 @@ class DraftHead:
             plan.append((r, lo, hi))
         if not plan:
             return
+        # Bucket the draft's prefill width the way the trunk does (engine.py:741).
+        # Unbucketed, every distinct prompt length gave the draft a new (n, w) and
+        # recompiled the two seq_q_lens kernels: a served first visit at a new prompt
+        # length paid 14 compiles / 15.5 s inline, 4.4 tok/s against 45.0 on the
+        # repeat. The padding rows are free of correctness risk because the kernels
+        # already gate on SeqQLens (kernels_mma.py:71), and `sq` below stays exact.
         w = max(hi - lo + 1 for _, lo, hi in plan)
+        if w > 1:
+            w = -(-w // _PREFILL_BUCKET) * _PREFILL_BUCKET
         nb = max(len(r.blocks) for r, _, _ in plan)
         n = len(plan)
         ids = np.zeros((n, w), dtype=np.int64)
