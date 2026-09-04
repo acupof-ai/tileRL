@@ -327,6 +327,36 @@ def test_the_mma8_row_cap_is_never_above_the_plans_padded_M():
         assert m <= _MX <= mp, f"M={m}: {m} <= {_MX} <= {mp} is what makes the slice exact"
 
 
+def test_the_mma8_N_rung_can_be_narrower_than_the_plans_and_the_drop_is_exact():
+    """The mma8 branches re-target wq/scale from the plan's ``Np`` to ``Np32``, and the
+    two rungs DO NOT ORDER: Np = _round_up(N, bN) with bN from the plan's N tile (64 on
+    the fp4 decode arm) overshoots Np32 = _round_up(N, 32) whenever bN's rounding jumps
+    past 32. sm90 reported it as `_pad2d: (64, 256) exceeds the target [32, 256]` -- the
+    fp4 twin of the fp8 row bug, and my published claim that "the fp4 branch does not
+    pre-pad, which is why only fp8 breaks" was wrong: it pre-pads on the N axis.
+
+    Two things to gate, and the first is why the second is needed: that Np > Np32 really
+    happens (or `_fit_rows` is dead code), and that dropping those rows equals never
+    padding them -- rows between N and either rung are zero, so the two agree elementwise.
+    """
+    import torch
+    from tilerl_kernels.backend import _fit_rows, _pad2d, _round_up
+
+    over = [(n, _round_up(n, 64), _round_up(n, 32))
+            for n in (24, 40, 96, 130) if _round_up(n, 64) > _round_up(n, 32)]
+    assert over, "no N has Np > Np32, so the mma8 re-target can never over-ask"
+
+    for n, np_, np32 in over:
+        plane = torch.arange(n * 8, dtype=torch.float32).reshape(n, 8)
+        # what the branch does: pad to the plan's rung, then re-target to the narrow one
+        got = _fit_rows(_pad2d(plane, np_, 8), np32, 8)
+        assert got.shape == (np32, 8), f"N={n}: {tuple(got.shape)} is not [{np32}, 8]"
+        assert torch.equal(got, _pad2d(plane, np32, 8)), (
+            f"N={n}: dropping rows off the [{np_}, 8] plane differs from padding the "
+            f"[{n}, 8] one to {np32} -- the dropped rows were not all zero pad"
+        )
+
+
 def test_fp4_save_widens_f16_scale_plane(tmp_path):
     """A backend may serve the block scales narrowed (sm70 does, at f16); the NVFP4
     format's are f32, so save_hf must widen them or the written checkpoint is

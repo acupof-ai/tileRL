@@ -76,6 +76,20 @@ def _pad2d(t: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, pc, 0, pr))
 
 
+def _fit_rows(t: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Pad to [rows, cols], or drop rows off a plane the caller padded to a WIDER rung.
+
+    The mma8 branches re-target tensors the plan line above already padded, and the
+    two rungs do not order: Np = _round_up(N, bN) overshoots Np32 = _round_up(N, 32)
+    whenever bN's rounding jumps past 32 (N=24 on the fp4 decode plan: bN=64 gives
+    Np=64 against Np32=32). Every row between the real N and either rung is zero pad,
+    so dropping rows here is exact -- verified in test_weights.py against padding the
+    unpadded plane straight to the narrow rung. `main` got this from F.pad's crop
+    silently; _pad2d now refuses a negative pad, so the three re-target sites say it.
+    """
+    return t[:rows] if t.shape[0] > rows and t.shape[1] == cols else _pad2d(t, rows, cols)
+
+
 def _pad1d(t: torch.Tensor, n: int) -> torch.Tensor:
     p = n - t.shape[0]
     return t if p == 0 else torch.nn.functional.pad(t, (0, p))
@@ -582,7 +596,13 @@ class Backend:
             # M=1 stays on the GEMV: mma8 measured 2.2x slower there (39.9 vs 87 tok/s)
             if 2 <= M <= _MX and "linear_fp4_mma8" in _resolve(self.precision, self.arch):
                 Np32 = _round_up(N, 32)
-                wq, scale = _pad2d(wq, Np32, Kp // 2), _pad2d(scale, Np32, Kp // blk)
+                # _fit_rows, not _pad2d: Np32 can be NARROWER than the Np the line
+                # above already padded these to. bN comes from the decode plan's N
+                # tile (64), so N=24 gives Np=64 against Np32=32 -- the shape the
+                # sm90 suite reported as `_pad2d: (64, 256) exceeds the target
+                # [32, 256]`. Rows 24..64 are zero pad either way.
+                wq = _fit_rows(wq, Np32, Kp // 2)
+                scale = _fit_rows(scale, Np32, Kp // blk)
                 osc = self._ones(Np32) if oscale is None else self._const_f32(oscale, Np32)
                 xm = _pad2d(x2, _MX, Kp)
                 res = None if residual is None else self._f32(residual).reshape(M, N)
@@ -655,17 +675,18 @@ class Backend:
         wscale = _pad2d(self._const_f32(wscale), -(-Np // 128), Kp // 128)
         if 2 <= M <= _MX and "linear_fp8_mma8" in _resolve(self.precision, self.arch):
             Np32 = _round_up(N, 32)
-            w8 = _pad2d(w8, Np32, Kp)
-            wscale = _pad2d(wscale, -(-Np32 // 128), Kp // 128)
+            # Same non-ordering as the fp4 twin: Np32 can be narrower than the Np
+            # these were padded to on the three lines above.
+            w8 = _fit_rows(w8, Np32, Kp)
+            wscale = _fit_rows(wscale, -(-Np32 // 128), Kp // 128)
             osc = self._ones(Np32) if oscale is None else self._const_f32(oscale, Np32)
             # x2 was already padded to Mp (=_snap_mma_tile(M,128), so 16 for every
             # M in 2..8) at the plan line above, and _pad2d REFUSES to shrink -- so
             # this asked for [8, K] from a 16-row tensor and raised
             # `_pad2d: (16, 5120) exceeds the target [8, 5120]`, killing every M in
-            # 2..8: all speculation and dense B=8. The fp4 twin two branches up does
-            # not pre-pad, which is why only fp8 breaks. Slice back to the mma8 rung
-            # rather than re-pad: M<=_MX<=Mp always, so this is exact.
-            xm = x2[:_MX] if x2.shape[0] >= _MX else _pad2d(x2, _MX, Kp)
+            # 2..8: all speculation and dense B=8. M<=_MX<=Mp always, so the drop
+            # is exact.
+            xm = _fit_rows(x2, _MX, Kp)
             res = None if residual is None else self._f32(residual).reshape(M, N)
             r2 = self._zeros2(_MX, Np32) if res is None or Np32 != N else _pad2d(res, _MX, N)
             y2 = self._kernel("linear_fp8_mma8")(xm, w8, wscale, osc, r2)[:M, :N]

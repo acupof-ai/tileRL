@@ -646,19 +646,29 @@ def test_serve_sizes_its_pools_from_the_flags_not_the_context():
     large-card target relies on.
     """
     from tilerl import cli
+    from tilerl.engine import _graph_on
     from tilerl.kv_cache import BLOCK_TOKENS
 
     cfg = tiny(max_position_embeddings=4096)
     model = build_random(cfg, seed=3)
     be = get_backend()
+    # The captured decode tick's padding row owns a block of its own, reserved up
+    # front so the capacity the caller asked for stays whole. It is on by default on
+    # CUDA, so the pool is num_blocks + 1 there and num_blocks on cpu/metal: this
+    # test read `65 == 64` on both sm90 and sm70 and passed on cpu for that reason,
+    # which made an intentional reservation look like an off-by-one in _fit_blocks.
+    pad = int(_graph_on(be, None))
 
     e = cli._build_engine(cfg, model, be, blocks=64, max_ctx=256, max_batch=2)
-    assert e._kv.num_blocks == 64
+    assert e._kv.num_blocks - pad == 64
     assert e.limits.max_total_tokens == 256, "a request must not outgrow the pool"
     assert e.limits.max_batch == 2
 
     d = cli._build_engine(cfg, model, be)
-    assert d._kv.num_blocks == (4096 * d.limits.max_batch) // BLOCK_TOKENS, (
+    assert d._kv.num_blocks - pad == (4096 * d.limits.max_batch) // BLOCK_TOKENS, (
         "the default pool must cover max_batch rows of the context — no more "
-        "(bytes are the long-context limit) and no less (a full batch must fit)"
+        "(bytes are the long-context limit) and no less (a full batch must fit). "
+        "On CUDA this is _fit_blocks' cap; a card too small to fit even the tiny "
+        "model's 2048 blocks would report less, and that is a real capacity limit "
+        "rather than a bug in the sizing"
     )
