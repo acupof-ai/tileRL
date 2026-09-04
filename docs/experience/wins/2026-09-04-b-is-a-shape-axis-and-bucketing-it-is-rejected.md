@@ -3,8 +3,9 @@
 **Date:** 2026-09-04
 **Arch:** sm70 (Tesla V100-SXM2-32GB), 27B NVFP4 + 456M draft
 **Task:** #74
-**Instrument:** `scripts/probe_b_axis.py` (CPU, negative result) + the pod's tilelang
-cache read by `(rank, dtype)` signature and mtime
+**Instrument:** `scripts/read_kernel_cache.py` (the pod's tilelang cache, read by
+`(rank, dtype)` signature with an mtime window) + `scripts/probe_b_axis.py` (CPU,
+negative result)
 **Verdict:** REJECTED — do not bucket B. The measurement stands; the fix does not.
 
 ## Where this came from
@@ -20,20 +21,29 @@ tuple**, and nothing rounds it: `engine.py:666` sizes rows by `len(reqs)`, `spec
 by `len(plan)`, and `spec.py:484`'s chain loop by `len(live)`, which *shrinks* mid-chain as
 rows hit block boundaries. 20 kernels across the four kernel files bake B this way.
 
-## Measured: B costs 41 of 76 compiles
+## Measured: B costs 41-42 compiles on each of the two kernels
 
-From the pod's cache, `write_tokens_f32` entries only (matched on the 7-param
-`(4,4,4,4,2,1,1)` rank+dtype signature, not on a guessed name):
+From the pod's cache, matched on the full `(rank, dtype)` signature of every param
+(`params.pkl` stores inputs, the scalar, **and** the `T.empty` outputs — see the
+corrections below):
 
-| | count |
-|---|---:|
-| distinct (B, S) pairs | **76** |
-| distinct S values | 35 |
-| distinct B values | **7** (1,2,3,4,5,6,7) |
-| pairs / distinct S | **2.17** (1.0 would mean B never varied) |
-| compiles if B were one value | 35 — **41 fewer** |
+| | `write_tokens_f32` | `paged_attention_split` |
+|---|---:|---:|
+| distinct (B, S) pairs | **76** | **77** |
+| distinct S values | 35 | 35 |
+| distinct B values | **7** (1-7) | **7** (1-7) |
+| pairs / distinct S | **2.17** | **2.20** |
+| compiles if B were one value | 35 — **41 fewer** | 35 — **42 fewer** |
 
-So B is not a theoretical axis. It is 54% of this kernel's compile count.
+Both kernels, the same 35 S values, the same 7 B values. 19 of 35 S values ran at
+more than one batch size; S=64 and S=512 each ran at all seven. So B is not a
+theoretical axis — it is ~54% of each kernel's compile count.
+
+**Both figures are pre-fix.** The cache's last write is 14:40 and `6c6f6df` was
+committed 14:48, so **zero** entries for either kernel postdate the fix; the live
+server (started 14:49) has compiled nothing. The B-axis count is therefore a
+property of the dispatch, which `029b27c`/`6c6f6df` did not touch, but the post-fix
+cache is empty and cannot confirm it independently.
 
 ## And bucketing it is still wrong
 
@@ -69,7 +79,7 @@ unexplained. **It is not, and the cache says so:** the B values present are 1-7,
 run was B=8 at depth 1, where `spec.py:484`'s chain loop never executes. 7 B values across
 35 S values cannot produce 269 compiles of one kernel. That run stays open.
 
-## Two instrument corrections
+## Three instrument corrections
 
 **1. The CPU target cannot answer this.** `scripts/probe_b_axis.py` recorded nothing and
 its assert caught it: `backend.py:889` falls back to the pool's torch loop when
@@ -77,31 +87,72 @@ its assert caught it: `backend.py:889` falls back to the pool's torch loop when
 `paged_attention`, never `paged_attention_split`. The two kernels that bake B on the served
 path do not run on the twin. The script is kept for its negative result.
 
-**2. `params.pkl` has no names, so my first two labels were wrong.** I mapped rank tuples
-to kernels by guessing: `(4,2,1,4)` and `(5,4,4,4)`. Dumping the full param lists showed
-`(5,4,4,4)` with dtypes f16/f32/f32/f32 is `paged_attention_split_**combine**`
-(PO[B,S,H,KVSPLIT,D]), and `(4,2,1,4)` is neither kernel. The B×S table I printed first was
-for two kernels I had not intended to measure. Matching on rank **and dtype** against the
-declaration fixed it. `paged_attention_split` itself matched **zero** entries — its sm70
-partials went f16 in #44, so the signature I built from `kernels.py:31` is stale, and that
-kernel's axis count is **unmeasured** rather than zero.
+**2. `params.pkl` stores the whole kernel signature, not the declared inputs.** I built
+signatures from the `T.Tensor` lines and matched on rank tuples, which was wrong three
+times before it was right:
 
-## Why the cache's unbucketed S values are not a #73 regression
+- `(5,4,4,4)` f16/f32/f32/f32 is `paged_attention_split_**combine**` (PO[B,S,H,KVSPLIT,D]),
+  not `_split`. `(4,2,1,4)` is neither kernel.
+- `paged_attention_split` is **10** params, not the 6 it declares: `params.pkl` includes the
+  scalar `scale` and the three `T.empty` outputs PO/PM/PL.
+- Two arity-10 groups exist with the same rank tuple, 634 entries and 39. They differ only
+  in **PO's dtype**: f16 is the live kernel, f32 is pre-#44 history. My first correct-arity
+  guess still matched the dead one, reporting "B costs 0 of 7 compiles" for a kernel that
+  had not run since #44.
 
-The cache holds S ∈ {13,15,16,23,24,26,37,...} — not multiples of 64 — with mtimes as late
-as 14:40 today, which would contradict #73's "a first visit compiles 0". It does not: the
-live server (pid 1829415) started at **14:49**, its own log has **0** occurrences of
-"compil", and the pod checkout is at `6c6f6df` with both fixes at `spec.py:407` and `:413`.
-Those entries are pre-fix history from the day's bench and probe runs. The cache is
-cumulative, so every claim read from it needs an mtime window.
+Only dumping the concrete shapes of one entry from each group settled it. `KVSPLIT` appears
+as 16 and 32 in the live group and is a factory arg (`backend.py:789` passes per-width ks),
+so it is not a shape axis.
+
+**3. Mb reads as 78 distinct values, and that is pre-fix history, not a missed call site.**
+The live split kernel's BlockTable width takes 78 values across the cache — which would
+mean `6c6f6df` failed. Splitting on the commit's own timestamp (`git log --format=%ct`,
+14:48) against file mtime: **78 before, 0 after**. Every entry predates the fix.
+
+## B is not the only unbucketed axis, and the per-dimension view is what shows it
+
+The per-kernel scripts I wrote first counted (B, S) pairs, so they could not see that the
+live split kernel has **98** distinct Q shapes against only **77** (B, S) pairs. Reading
+every dimension separately (`read_kernel_cache.py` prints `=N` for a dim that never varied):
+
+```
+4f32,4f32,4f32,2i32,1i32,1i32,0f32,5f16,4f32,4f32     paged_attention_split, 634 entries
+    p0 (Q):          [7, 35, 3, 2]      B=7  S=35  H=3  D=2
+    p1 (KCache):     [24, 3, =16, 2]    NB=24  Hkv=3  block=16  D=2
+    p3 (BlockTable): [7, 78]            B=7  Mb=78
+```
+
+H taking 3 values and D taking 2 is the trunk-vs-draft head geometry — a *third* and
+*fourth* axis, and neither is a bug: the draft head is a different model, so its shapes are
+genuinely distinct kernels rather than avoidable specializations. That is why 98 > 77, and it
+is the reason a per-axis printout beats a pair count: the pair count silently attributes the
+extra 21 compiles to nothing.
+
+## The window between the two #73 fixes is direct evidence they worked
+
+`--since 029b27c` (the width fix) selects the 6 entries written before `6c6f6df` (the block
+table). They read:
+
+```
+    p0: [=1, =64, =24, =256]      S pinned at 64
+    p3: [=1, 6]                   Mb still taking 6 values
+```
+
+S is `=64` — the width fix is in effect — while Mb is the only remaining axis, which is
+exactly the intermediate state, and `--since 6c6f6df` returns **no entries at all**. The
+pair of windows is a positive and a negative control on the same instrument: an empty result
+alone would equally well mean the mtime filter was broken.
 
 ## Rule
 
 An axis being real and an axis being worth removing are two measurements. B is provably a
-shape axis worth 41 compiles, and removing it is still a 2-8x loss, because the padding a
-bucket introduces is discarded on one axis and executed on the other. Check what the kernel
-does with the padding before pricing the bucket.
+shape axis worth 41-42 compiles per kernel, and removing it is still a 2-8x loss, because
+the padding a bucket introduces is discarded on one axis and executed on the other. Check
+what the kernel does with the padding before pricing the bucket.
 
-And when the artifact carries no names, the signature must be matched against the
-declaration, not recognized. Two of my three labels were wrong on rank alone; adding dtype
-settled all three and revealed the third kernel was not in the cache at all.
+And a cache entry is identified by its full signature, not recognized by its shape. Four
+readings of the same 634 files gave four different answers — wrong kernel, wrong arity,
+wrong dtype, then right — and each intermediate one looked like a result: "B costs 0 of 7
+compiles" was a complete, plausible sentence about a kernel that had not run since #44.
+Where `params.pkl` carries no names, the only check is dumping the concrete shapes of one
+entry per candidate group and reading which declaration they match.
