@@ -39,7 +39,7 @@ from html.parser import HTMLParser
 import pytest
 from fastapi.testclient import TestClient
 
-from tilerl.server import _CHAT_UI, _LANDING
+from tilerl.ui_assets import _CHAT_UI, _LANDING
 
 #: Statement keywords that a naive "identifier followed by (" also matches.
 _KEYWORDS = {
@@ -458,7 +458,7 @@ def test_no_markdown_input_can_add_an_attribute_to_the_output():
     node = shutil.which("node")
     if node is None:
         pytest.skip("node not available; the renderer's output cannot be exercised")
-    from tilerl.server import _MD_JS
+    from tilerl.ui_assets import _MD_JS
 
     #: Every attribute the renderer is allowed to emit, over every input.
     allowed = {"href", "target", "rel", "class", "data-lang"}
@@ -526,7 +526,7 @@ def test_markdown_renders_and_escapes():
     node = shutil.which("node")
     if node is None:
         pytest.skip("node not available; the renderer's output cannot be exercised")
-    from tilerl.server import _MD_JS
+    from tilerl.ui_assets import _MD_JS
 
     checks = [
         ("**b** and `c`", ["<strong>b</strong>", "<code>c</code>"]),
