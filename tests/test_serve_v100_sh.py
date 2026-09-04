@@ -2,10 +2,12 @@
 
 It runs the real script with a stub `python`, because a check that greps a shell script
 asserts what the script says, not what it does. Both defects it caught were behavioural:
-TERM stopped the supervisor without stopping the server (23 GiB held, nothing watching),
-and the sandboxes landed in the repo checkout because the pod has no TMPDIR.
+TERM stopped the supervisor without stopping the server (23466 MiB held, nothing
+watching), and the sandboxes landed in the repo checkout because the pod sets no TMPDIR.
 
-Run it on the pod -- macOS has no flock(1).
+Skips where flock(1) is absent, which is every macOS row including CI's -- the supervisor
+refuses to run unlocked, so there is nothing to assert there. It fires on the linux row
+and on the pod.
 """
 import contextlib
 import pathlib
@@ -14,7 +16,12 @@ import subprocess
 import tempfile
 import time
 
-SRC = pathlib.Path(__file__).parent / "serve_v100.sh"
+import pytest
+
+SRC = pathlib.Path(__file__).parent.parent / "scripts" / "serve_v100.sh"
+
+pytestmark = pytest.mark.skipif(shutil.which("flock") is None,
+                                reason="flock(1) absent; the supervisor refuses to run unlocked")
 
 
 @contextlib.contextmanager
@@ -48,19 +55,23 @@ def boots_of(path):
     return len(path.read_text().split()) if path.exists() else 0
 
 
-if __name__ == "__main__":
-    if shutil.which("flock") is None:
-        raise SystemExit("flock(1) absent (macOS): run this on the pod")
-
+def test_a_crash_restarts_and_the_cap_gives_up():
     with sandbox(7) as (_, script, boots):
         rc = subprocess.run(["bash", str(script)], capture_output=True, timeout=120).returncode
-        assert (boots_of(boots), rc) == (3, 1), f"crash: want 3 boots then give up, got {boots_of(boots)}/{rc}"
+        assert (boots_of(boots), rc) == (3, 1), \
+            f"want 3 boots then give up, got {boots_of(boots)}/{rc}"
 
+
+def test_a_deliberate_stop_is_not_restarted():
     with sandbox(143) as (_, script, boots):
         rc = subprocess.run(["bash", str(script)], capture_output=True, timeout=120).returncode
-        assert (boots_of(boots), rc) == (1, 143), f"TERM must not restart, got {boots_of(boots)}/{rc}"
+        assert (boots_of(boots), rc) == (1, 143), \
+            f"TERM must not restart, got {boots_of(boots)}/{rc}"
 
-    # TERM to the supervisor must reach the server.
+
+def test_term_to_the_supervisor_reaches_the_server():
+    """The defect this caught: the supervisor exited in 1s and left python holding
+    23466 MiB of the card with nothing supervising it."""
     with sandbox(0, sleep_s=30) as (d, script, boots):
         sup = subprocess.Popen(["bash", str(script)])
         try:
@@ -75,15 +86,20 @@ if __name__ == "__main__":
             if sup.poll() is None:
                 sup.kill()
         assert (d / "terms").exists(), "the server never saw TERM; it would outlive the supervisor"
-        assert rc == 143 and boots_of(boots) == 1, f"want one boot and rc 143, got {boots_of(boots)}/{rc}"
+        assert rc == 143 and boots_of(boots) == 1, \
+            f"want one boot and rc 143, got {boots_of(boots)}/{rc}"
 
-    # The lock, and the control proving it is the lock that refuses.
+
+def test_a_second_supervisor_is_refused_and_the_lock_is_why():
     with sandbox(0) as (d, script, _):
-        holder = subprocess.Popen(["bash", "-c", f"exec 9>{d}/.serve70.lock; flock -n 9; sleep 10"])
+        holder = subprocess.Popen(["bash", "-c",
+                                   f"exec 9>{d}/.serve70.lock; flock -n 9; sleep 10"])
         try:
             time.sleep(0.5)
             r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=60)
             assert r.returncode == 1 and "already running" in r.stderr, r.stderr[:200]
+            # Control: strip the guard and the second copy runs, so it is the lock
+            # that refuses and not some other early exit.
             unlocked = d / "u.sh"
             unlocked.write_text(script.read_text().replace("flock -n 9 ||", "false &&"))
             rc = subprocess.run(["bash", str(unlocked)], capture_output=True, timeout=60).returncode
@@ -91,6 +107,11 @@ if __name__ == "__main__":
         finally:
             holder.kill()
 
-    left = list(pathlib.Path.cwd().glob("serve_v100_check.*"))
-    assert not left, f"the check left sandboxes in the CWD: {left}"
-    print("restart, give-up cap, TERM propagation, the lock, and its control: all pass")
+
+def test_the_sandboxes_do_not_land_in_the_cwd():
+    """The other defect this caught: the pod sets no TMPDIR, so `gettempdir()` falls
+    back to the CWD and six sandboxes were left in the repo checkout."""
+    with sandbox(0) as (d, _, _boots):
+        assert d.exists()
+    assert not d.exists(), "sandbox() did not remove its directory"
+    assert not list(pathlib.Path.cwd().glob("serve_v100_check.*"))

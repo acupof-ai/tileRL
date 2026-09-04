@@ -38,7 +38,7 @@ import textwrap
 import pytest
 from fastapi.testclient import TestClient
 
-from tilerl.server import _CHAT_UI
+from tilerl.server import _CHAT_UI, _LANDING
 
 #: Statement keywords that a naive "identifier followed by (" also matches.
 _KEYWORDS = {
@@ -71,8 +71,16 @@ def _css() -> str:
 
 
 def _script(html: str) -> str:
+    """The FIRST inline script in `html`.
+
+    `rsplit("</script>")` took the LAST closing tag, so a page with two script blocks
+    returned everything between the first open and the final close -- measured on
+    _LANDING + _CHAT_UI, 27299 characters of markup captured as JavaScript, which the
+    resolver would then scan for bare calls. Correct today only because every caller
+    hands this one page; `split` makes it correct regardless.
+    """
     assert "<script>" in html, "the page has no inline script"
-    return html.split("<script>", 1)[1].rsplit("</script>", 1)[0]
+    return html.split("<script>", 1)[1].split("</script>", 1)[0]
 
 
 def _code_only(js: str) -> str:
@@ -106,6 +114,22 @@ def _unresolved(js: str) -> set[str]:
     for params in re.findall(r"function\s*[\w$]*\s*\(([^)]*)\)", js):
         defined |= {p.strip().lstrip("...").split("=")[0].strip() for p in params.split(",")}
     return bare - _KEYWORDS - _BROWSER_GLOBALS - defined - {""}
+
+
+def test_the_slicers_take_one_block_from_a_two_block_page():
+    """`server.py` holds two pages, so both slicers can over-capture.
+
+    `_script` used rsplit, which on a two-block page returns everything from the first
+    open tag to the LAST close tag: 27299 characters of markup handed to the resolver as
+    JavaScript. `_css` has the same shape and its docstring warns about it. Neither
+    hazard is reachable today -- every caller passes `_CHAT_UI` -- so this is the gate
+    that fails if a page merge makes it reachable.
+    """
+    page = _LANDING + _CHAT_UI
+    assert "</script>" not in _script(page), "_script spans past its own block"
+    assert "</style>" not in _CHAT_UI[_CHAT_UI.index("<style>") : _CHAT_UI.index("</style>")]
+    # And the real page still yields the script the other tests assert on.
+    assert "function mdRender" in _script(_CHAT_UI)
 
 
 def test_every_bare_call_in_the_page_js_resolves():
