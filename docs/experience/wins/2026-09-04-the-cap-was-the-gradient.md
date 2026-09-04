@@ -22,7 +22,9 @@ predict.
 ## The measurement
 
 Registered before the run's counters were read: tie rate ≈ 0.30, from `p⁸` at
-p = 0.86. **It came back 0.887.** Over the first 62 steps:
+p = 0.86. **It came back 0.887 at step 62, and 0.920 over the full run.** The
+run has since finished; the table reads at step 62 so the prediction is scored
+against the number that was available when it was registered.
 
 | | 256 cap | 2048 cap |
 |---|---:|---:|
@@ -50,6 +52,28 @@ Solving `pⁿ + (1−p)ⁿ = 0.887` at p = 0.9657 gives the effective group:
     effective independent group    3.44
 
 **Eight correlated rollouts buy the diversity of 3.4 independent ones.**
+
+## The full run, and the direction it moved
+
+100 steps finished. The tie rate **rose** across the run — 88.7% over the first
+62 steps, **92.0% over all 100** — which is the mechanism running forward: each
+gradient step makes the policy slightly better at the training prompts, so the
+next group is slightly more likely to agree, so fewer steps carry gradient. A
+binary reward against a strengthening policy is self-extinguishing.
+
+| | value |
+|---|---|
+| steps with zero gradient | **92 of 100** |
+| mean reward across the run | 0.9775 |
+| peak allocated | 82.37 GiB |
+| adapter | 170.8M params, `runs/8ca073e54686` |
+| MMLU before → after | 75.2% → **73.0%** |
+
+**The MMLU move is not read as an effect.** It is n=1, from a run in which 92
+of 100 steps trained on nothing; the 8 steps that did carry gradient are not
+enough signal for a 2.2-point downstream claim in either direction. What the
+number does support is the opposite of a result: an arm this starved should not
+be expected to move a downstream metric at all, and it did not.
 
 ## Group size is the wrong lever, and sampling has no headroom
 
