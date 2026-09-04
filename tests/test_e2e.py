@@ -732,7 +732,7 @@ def test_opd_lora_self_teacher():
     prompts = [list(range(8)), list(range(4, 12))]
     losses = opd_loop(teacher, model, prompts, steps=2, backend=backend,
                       optimizer=AdamW(lr=1e-2), seed=0, trainable=trainable)
-    assert len(losses) == 2 and all(l == l for l in losses), losses
+    assert len(losses) == 2 and all(math.isfinite(x) for x in losses), losses
     for k, v in base.items():
         assert torch.equal(model.params[k], v), f"frozen base moved: {k}"
     moved = sum(not torch.equal(trainable[k], v) for k, v in before.items())
