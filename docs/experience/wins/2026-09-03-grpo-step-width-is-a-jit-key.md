@@ -72,6 +72,21 @@ measurement. Two earlier runs of the same probe reported 1.3x and 1.0x from a
 shared `TILELANG_CACHE_DIR` that labelled cache hits `novel`
 (errors/2026-09-03-probe-rebuilt-the-setup-in-the-wrong-order.md).
 
+**What n=5 resolves.** These are paired draws, so the statistic is the mean of
+the five differences: 12.6/11.3/11.4/8.2/8.8, mean 10.46 s, sd 1.87, se 0.84.
+A t-interval at 4 df is **8.13 to 12.79 s, i.e. 1.37x to 1.58x**. Quote it as
+**1.5x (95% CI 1.37-1.58, n=5)** and do not distinguish the median ratio
+(1.499) from the mean ratio (1.471): the interval is 4x wider than that gap, so
+the second decimal is not measured. The differences are also bimodal -- three
+near 11.5-12.6, two near 8.2-8.8, nothing between -- which is the shape two
+distinct compiled widths would make, but at n=5 it is a hint, not a finding.
+
+Variances add, so the compile's own spread is
+`sqrt(sd_novel^2 - sd_repeat^2) = sqrt(1.63^2 - 0.40^2) = 1.58 s` of the novel
+arm's 1.63. The step contributes **5.9% of the variance**: nearly all the
+scatter is in the compile, which is what "compile time tracks what the JIT has
+to build" predicts.
+
 This also bounds what the fix is worth against the P1 entry's
 `secs_per_step_median = 60.45` at gen 256: `rl_step` is ~22 s of that, leaving
 ~38 s of rollout, and compile can add 11 s only to the steps that hit a new
