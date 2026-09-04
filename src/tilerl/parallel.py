@@ -76,6 +76,18 @@ class DataParallelEngine:
         i = request_id % self._n
         return self._engines[i].peek(request_id // self._n)
 
+    @property
+    def limits(self) -> Any:
+        # Part of the seam, not an Engine internal: a caller clamps its request against
+        # this before submitting, and messages.py does exactly that for Claude Code's
+        # max_tokens=32000. Missing it, its `getattr(engine, "limits", None)` read 0, the
+        # clamp went dead and every turn came back 400 "exceeds max_total_tokens" under
+        # --devices while the same engine unwrapped answered 200.
+        # min, not [0]: submit routes to the shortest queue, so the budget a caller can
+        # rely on is whatever the smallest replica accepts.
+        return min((e.limits for e in self._engines),
+                   key=lambda lim: lim.max_total_tokens)
+
     def stats(self) -> dict[str, Any]:
         per = [e.stats() for e in self._engines]
         total = {k: sum(s[k] for s in per) for k in per[0] if isinstance(per[0][k], int)}
