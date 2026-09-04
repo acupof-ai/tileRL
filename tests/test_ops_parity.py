@@ -219,10 +219,14 @@ def test_fp4_w4a8_e4m3_range():
 def test_linear_fp4_parity(backend):
     torch.manual_seed(4)
     wq, scale = pack_fp4(torch.randn(24, 32))
-    # the reference follows the dispatch: fp4 through M=_MX, w4a8 above
+    # The reference must follow the DISPATCH, and the dispatch is per-cell, not per
+    # target: `cuda` was standing in for "has a w4a8 kernel", which is true on sm90
+    # and false on sm70 -- whose M>_MX goes through the fp4 twiddle ladder instead.
+    # Comparing that against a w4a8 reference charges the kernel for e4m3's ~2% quant
+    # error on both operands, and it read as `max abs diff 6.695e-01` on a V100.
     for m in (6, _MX + 8):
         x = torch.randn(m, 32)
-        fp8_path = backend.target.startswith("cuda") and m > _MX
+        fp8_path = m > _MX and backend.has_kernel("linear_fp4_fp8")
         ref = _linear_fp4_fp8_ref(x, wq, scale) if fp8_path else reference.linear_fp4(x, wq, scale)
         _assert_close(backend.linear_fp4(x, wq, scale), ref, f"linear_fp4 M={m}")
 
@@ -242,14 +246,15 @@ def test_linear_fp4_gemv_parity(backend):
 
 
 def test_linear_fp4_fp8_parity(backend):
-    """Prefill w4a8 path (M > _MX) vs the identical-quant reference on CUDA;
-    the f32 reference on CPU/metal."""
+    """Prefill w4a8 path (M > _MX) vs the identical-quant reference where that kernel
+    exists; the f32 reference where it does not (sm70's M>_MX takes the fp4 twiddle
+    ladder, and cpu/metal take the generic fp4 kernel)."""
     torch.manual_seed(21)
     for M, N, K in [(_MX + 8, 64, 256), (_MX + 4, 96, 128)]:
         wq, scale = pack_fp4(torch.randn(N, K) * 0.1)
         x = torch.randn(M, K) * 0.5
         out = backend.linear_fp4(x, wq, scale)
-        ref = _linear_fp4_fp8_ref if backend.target.startswith("cuda") else reference.linear_fp4
+        ref = _linear_fp4_fp8_ref if backend.has_kernel("linear_fp4_fp8") else reference.linear_fp4
         _assert_close(out, ref(x, wq, scale), f"linear_fp4_fp8 M={M} N={N} K={K}")
 
 
