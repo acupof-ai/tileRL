@@ -27,10 +27,20 @@ POST 15687 bytes, client budget 900s (server cap is 600s in the deployed 550740a
 COMPLETED in 39.1s  input_tokens=3478 output_tokens=8  (11.25 ms/input token)
 ```
 
-**39.1 s.** The 600 s cap did not fire and could not have: adding a full 2048-token
-output at the measured 50.3 tok/s decode rate gives 39.1 + 40.7 = **80 s**, still
-7.5x under the cap. At this service's `--max-ctx 4096` the 600 s limit is
-unreachable.
+**39.1 s.** The 600 s cap did not fire and could not have. This service's
+`--max-ctx 4096` leaves **618 tokens** of output room after a 3478-token prompt, not
+the 2048 I first wrote — so the worst case is 39.1 + 618/41.9 = **53.9 s**, 11.1x
+under the cap.
+
+Getting to 41.9 tok/s took two corrections, both mine, and they are recorded because
+each is the error this entry is about at a smaller scale — a rate quoted outside the
+configuration it was measured in:
+
+1. I first used the 50.3 tok/s measured at *short* context for a 4K-context decode.
+   The tree's table falls with context, so it has to be scaled.
+2. I then scaled it by the **dense** column's falloff (41.0 → 37.6, 0.917). The live
+   service runs `--depth 1`, so 50.3 is a *speculative* rate, and the spec column
+   falls harder: 48.4 → 40.3, **0.833**. 50.3 × 0.833 = 41.9.
 
 So the cited ~600 s is **15x** the real single-request cost.
 
@@ -68,7 +78,13 @@ as a *request* figure.
 **And the 4.3x fix landed one commit BEFORE the cap was raised.** `git log` order:
 `1ecf8ee` (the 4.3x prefill win) → `2e1bf72` → `50076b4` → `bd17d55` → `5cdbf7e`
 (the cap raise). So the cap was raised to accommodate a cost that the tree had
-already made 4.3x cheaper four commits earlier. 4.3x of the 15x gap is exactly this.
+already made 4.3x cheaper four commits earlier.
+
+**Not claimed: that 4.3x accounts for a specific share of the 15x.** 15.35 / 4.3
+leaves 3.57x, and I have not measured what that is — the B=8-vs-B=1 units error is the
+obvious candidate but the two figures come from different harnesses on different days,
+so multiplying them into a factorization would be exactly the move this entry warns
+about. The 4.3x is here because of *when* it landed, not as a term in an equation.
 
 Neither the commit nor any `docs/experience/` entry records a 4K single-request
 timing; `grep` for "600 s" across `docs/` and `CHANGELOG.md` returns nothing. The
@@ -113,8 +129,18 @@ request completed through `/v1/chat/completions` and raised `TimeoutError` throu
 question from whether the two paths must agree.
 
 **Withdrawn:** "a 4K prefill on sm70 takes ~600 s on its own" — as a fact about a
-single request on the current tree. It is 39.1 s measured, 80 s worst-case with a
-full output. The cap could be 300 s and 4K would still fit.
+single request on the current tree. It is 39.1 s measured, 53.9 s worst-case once the
+context limit is respected. The cap could be 120 s and 4K would still fit.
+
+**Also corrected, mine, twice:** the 80 s worst case I wrote first used the
+short-context decode rate and assumed 2048 output tokens where the context leaves 618.
+Fixing that gave 52.5 s — still wrong, because I scaled by the dense column's falloff
+for a service running `--depth 1`, whose rate falls on the spec column. 53.9 s.
+
+Every one of those errors made the number *larger*, so the conclusion strengthened each
+time and nothing looked wrong. That is the reason to re-derive a supporting number:
+an error that flatters the claim generates no surprise, and surprise is what makes
+you look twice.
 
 **Not claimed:** that ~600 s was wrong for the configuration it was taken in. A B=8
 tick at 4096 tokens per row was never measured, and this entry does not measure it.
