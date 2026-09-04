@@ -250,6 +250,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
         return _finish(prev, args.json)
     manifest["metrics"] = dict.fromkeys((
         "reward_first", "reward_last", "ce_last", "secs_per_step_median", "tied_group_fraction",
+        "tokens_first", "tokens_last",
         "mmlu_before", "mmlu_after", "gsm8k_before", "gsm8k_after", "peak_gib"))
 
     backend = get_backend()
@@ -313,14 +314,14 @@ def _train_adapters(args: argparse.Namespace) -> None:
         tiebreak = _judge_tiebreak(engine, tok, params) if args.judge else None
 
         hist = []
-        for i, (r, ce, secs, tied) in enumerate(
+        for i, (r, ce, secs, tied, ntok) in enumerate(
                 train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
                                     group=args.group, sampling=params, seed=args.seed,
                                     trainable=trainable, micro=args.micro,
                                     tiebreak=tiebreak)):
-            hist.append((r, ce, secs, tied))
+            hist.append((r, ce, secs, tied, ntok))
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
-                f"tied {tied:.2f}  {secs:.1f}s", flush=True)
+                f"tied {tied:.2f}  tok {ntok:.0f}  {secs:.1f}s", flush=True)
         # Windowed means, not hist[0] vs hist[-1]: per-step reward moves with the
         # sampled prompt, so two single steps compare two draws, not two policies
         # (tests/test_rl.py::test_grpo_loop_raises_reward uses the same windows).
@@ -330,7 +331,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
             reward_last=statistics.mean(h[0] for h in hist[-w:]),
             ce_last=hist[-1][1],
             secs_per_step_median=statistics.median(h[2] for h in hist),
-            tied_group_fraction=statistics.mean(h[3] for h in hist))
+            tied_group_fraction=statistics.mean(h[3] for h in hist),
+            # --judge drives tied_group_fraction toward 0 by construction, so it
+            # cannot report a bad judge. Length is the signal that can.
+            tokens_first=statistics.mean(h[4] for h in hist[:w]),
+            tokens_last=statistics.mean(h[4] for h in hist[-w:]))
     else:
         losses = train_mod.opd_loop(engine, model, prompts, args.steps, backend, optimizer,
                                     seed=args.seed, trainable=trainable, sampling=params)
