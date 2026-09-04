@@ -18,6 +18,8 @@ sweep producing a confident answer:
 
 ## Every row is clean, by the widest margin this harness has produced
 
+**ctx=2048**
+
 | depth | W | rungs | ms/tick | tok/fwd | tok/s | model / measured |
 |---:|---:|---|---:|---:|---:|---:|
 | 1 | 2 | r2 x215 | 37.48 | 1.78 | **47.5** | 1.0018x |
@@ -25,55 +27,87 @@ sweep producing a confident answer:
 | 3 | 4 | r4 x144 | 64.30 | 2.73 | 42.5 | 1.0008x |
 | 4 | 5 | r2 x2, r4 x29, r8 x105 | 96.15 | 2.91 | 30.3 | 1.0017x |
 
-Monotone in tick (37.48 → 57.99 → 64.30 → 96.15), and the two-term model closes to
-**0.18% / 0.02% / 0.08% / 0.17%**. #60's contaminated rows read 5.46x and 1.82x on the
-same model, so the test discriminates rather than passing everything.
+**ctx=1024**
+
+| depth | W | rungs | ms/tick | tok/fwd | tok/s | model / measured |
+|---:|---:|---|---:|---:|---:|---:|
+| 1 | 2 | r2 x218 | 36.13 | 1.75 | **48.4** | 1.0000x |
+| 2 | 3 | r2 x3, r4 x174 | 56.30 | 2.16 | 38.4 | 0.9999x |
+| 3 | 4 | r2 x2, r4 x159 | 61.53 | 2.38 | 38.7 | 1.0003x |
+| 4 | 5 | r2 x1, r4 x15, r8 x141 | 99.48 | 2.45 | 24.6 | 0.9993x |
+
+Eight rows, **all clean and all monotone in tick**. The two-term model
+`verify(own rung) + fpt·draft` closes to within **0.18%** everywhere and to
+**0.00-0.07%** on the whole ctx=1024 arm. #60's contaminated rows read 5.46x and 1.82x
+on the same model, so the test discriminates rather than passing everything.
 
 **The decomposition is not circular**, which is what makes these numbers usable. The
 harness times the draft directly (`-- timed, not differenced`) and derives verify as
-tick minus its *own* rung's draft, so a rung measured at several independent depths is
-a free cross-check:
+tick minus its *own* rung's draft, so a rung visited by several depths cross-checks for
+free — and here every rung was visited by three or four independent depths:
 
-| rung | depths | spread |
-|---|---|---:|
-| r2 | 30.44 (d1), 30.40 (d2), 30.39 (d4) | **0.16%** |
-| r4 | 47.10 (d2), 47.50 (d3), 47.68 (d4) | **1.23%** |
-| r8 | 82.70 (d4) | one depth |
+| | rung 2 | rung 4 | rung 8 |
+|---|---|---|---|
+| ctx 1024 | 29.38 / 29.34 / 29.33 / 29.36 — **0.17%** | 45.43 / 45.48 / 45.55 — **0.26%** | 80.22 |
+| ctx 2048 | 30.44 / 30.40 / 30.39 — **0.16%** | 47.10 / 47.50 / 47.68 — **1.23%** | 82.70 |
 
-Three independent depths agreeing on rung 2 to 0.16% is the strongest internal check
-this harness has produced. And `verify r2 = 30.44` against #60's independently measured
-**30.58** is 0.46% — a fourth instrument, on a different day.
+Four independent depths agreeing on rung 2 to 0.17% is the strongest internal check
+this harness has produced. And `verify r2 = 29.38` at ctx=1024 is **byte-identical** to
+#60's independently measured 29.38, on a different day.
 
-## Depth 1 wins, and the shipped default is depth 3
+### The rung step reproduces, and it retroactively validates #60's figure
 
-```
-depth 1  47.5 tok/s
-depth 2  40.0 tok/s   0.8424x
-depth 3  42.5 tok/s   0.8940x     <- cli.py:496 default
-depth 4  30.3 tok/s   0.6373x
-```
-
-**Depth 1 is 1.1186x faster than the shipped default**, on clean rows, at 5.6x the
-registered 1.02x threshold. Depth 4 is the worst of the four, at 0.64x.
-
-Why depth 2 costs so much for what it adds — the staircase, not a slope:
+Measured **rung-locally** — `r4 − r2` inside one depth, never across depths:
 
 ```
-gains  +0.54 tok/fwd (1.78 -> 2.32)
-costs  the rung 2->4 verify step 16.70 ms, PLUS one more draft forward 5.91 ms
-       tick 37.48 -> 57.99 = 1.5472x
-needs  tok/fwd >= 1.78 x 1.5472 = 2.754 to break even.  Got 2.32.
+r4 - r2:  16.09  16.15  16.19  16.70  17.29   (5 independent measurements, mean 16.48)
+r8 - r4:  34.67  35.02                        (mean 34.84)
 ```
 
-The **16.70 ms** rung step is measured *within one depth* here (r4 47.10 − r2 30.40 at
-depth 2), so it no longer depends on the cross-depth subtraction #60 used for its
-16.11.
+#60 derived **16.11 and 34.82** by cross-depth subtraction, the method this entry
+avoids. Both land **inside** the rung-local ranges. So #60's step figures were right;
+what was wrong there was the draft cost and the contaminated rows, not the staircase.
 
-Depth 3 recovers some of depth 2's loss because it fills rung 4 exactly — 144 of 144
-ticks, no rung-2 remainder to pay the step twice — which is the reasoning
-`cli.py:496`'s help text gives. That reasoning is right about the *ladder* and wrong
-about the *winner*: filling rung 4 beats straddling it, and not entering rung 4 beats
-both.
+## Depth 1 wins at both contexts, and the shipped default is depth 3
+
+```
+             d1      d2      d3 (shipped)   d4        d1 / d3
+ctx 1024   48.4    38.4      38.7         24.6      1.2522x
+ctx 2048   47.5    40.0      42.5         30.3      1.1186x
+```
+
+**Depth 1 beats the shipped default by 1.2522x at ctx=1024 and 1.1186x at ctx=2048** —
+12x and 5.6x the registered 1.02x threshold. Depth 4 is the worst row at both contexts.
+
+Note the direction of the margin: it is **larger at the shorter context**, the opposite
+of #71's premise.
+
+### Why, in one number: the step costs 60% of a tick and acceptance pays 23-30%
+
+Depth 1 is the only depth that sits alone on rung 2. Entering rung 4 costs the verify
+step **plus** one more draft forward:
+
+| | ctx 1024 | ctx 2048 |
+|---|---:|---:|
+| rung step + one draft | 16.15 + 5.7 = **21.8 ms** | 16.70 + 5.7 = **22.4 ms** |
+| as a share of the depth-1 tick | **60%** | **60%** |
+| what acceptance buys | +0.41 tok/fwd (**23%**) | +0.54 tok/fwd (**30%**) |
+
+A 60% cost against a 23-30% gain, at both contexts. Nothing about acceptance closes
+that, which is why no context makes a deeper chain pay.
+
+### `cli.py:496`'s help text is right about the ladder and wrong about the winner
+
+Its argument is that depth 3 fills the rung-4 tile exactly while depth 4 spills to
+rung 8. Both halves check out — and the effect is small:
+
+```
+filling rung 4 vs straddling it (d3 vs d2):   1.008x at ctx1024,  1.062x at ctx2048
+NOT ENTERING rung 4 at all     (d1 vs d3):    1.252x            1.119x
+```
+
+Filling the rung is worth 0.8-6.2%. Staying off it is worth 12-25%. The help text
+optimizes within the wrong branch of the staircase.
 
 ## #71's premise had the sign backwards, again
 
@@ -111,6 +145,39 @@ never the lever; the rung step is.
 This is the second time in two days a #60-derived premise has been refuted with the
 sign reversed. Both times the mechanism was the same: a figure taken from a
 contaminated row, or from a ratio of two harnesses.
+
+## The clean-row test I registered has a hole, found on the peer's B=8 row
+
+Test (ii) — `verify(own rung) + fpt·draft` within 1.3x of the tick — reads **1.0026x on
+the peer's B=8 depth-1 row**, which is contaminated beyond argument: its rung-2 verify
+is **15693 ms on one tick** against my 29-30, and its tok/fwd is 12.51 against a B=1
+1.78.
+
+The test passes because the harness *derives* verify as tick minus its own rung's draft.
+Verify therefore carries whatever the tick carries, and reassembling `verify + draft` is
+near-tautological — it recovers the tick by construction, compile included. It caught
+#60's rows only because those pooled the draft **across** rungs, which broke the
+identity; a per-rung draft restores it and the test goes blind.
+
+So the eight rows above are clean, but **this test is not what proves it.** What proves
+it is the rung cross-check: the same rung measured at three or four independent depths
+agreeing to 0.16-0.26%. A compile inside one rung's mean shows up there immediately —
+15693 against 29.33 is 535x.
+
+**Replacement, for any future sweep:** a row is admissible when every rung it reports
+agrees with that rung measured elsewhere at the **same `(rows, W, ctx)`**, and its
+tok/fwd is physically reachable. Drop the two-term identity; it is a restatement of the
+harness's own subtraction.
+
+One further correction, mine: I first flagged rung 4 and rung 8 as "split" between my
+rows (45-48, 80-83) and the peer's (24, 25). That is **not** contamination. The ladder
+rounds `rows × W`, so the same rung is reached from different `(rows, W)` — my rung 4 is
+1 row at W=3-5, theirs is 2 rows at W=2 — and attention splits history by `KVSPLIT =
+f(s)` on the query width (`registry.py:23`) with a per-row launch over per-row history.
+Same rung, different kernel shape, different context. **Rung identity does not make two
+verify times comparable across B**; only identical `(rows, W, ctx)` does. Rung 2 is the
+exception that makes the peer's compile visible, because there both runs are 1 row at
+W=2.
 
 ## The draft cost has two terms, and the four depths separate them
 
@@ -201,9 +268,18 @@ is a code read; the 51 is a measurement; the gap is the open question.
 ## Rule
 
 Time the thing, do not difference it. Every wrong draft-cost number in this task's
-history came from subtracting two ticks that sat on different rungs; the one that
-cross-checks to 0.13% came from a timer around the draft and a rung-local
+history came from subtracting two ticks that sat on different rungs; the ones that
+cross-check to 0.16-0.26% came from a timer around the draft and a rung-local
 subtraction.
 
-And a single-rung row is worth more than a sweep. Depth 1 alone answers #22, because
-215 of 215 ticks share one rung and nothing has to be held equal across a staircase.
+A single-rung row is worth more than a sweep. Depth 1 alone answers #22, because 215 of
+215 ticks share one rung and nothing has to be held equal across a staircase.
+
+And a pre-registered rule is not automatically a working rule. Test (ii) here was
+registered before the data, honestly applied, and still near-vacuous — it reassembled a
+quantity the harness had just decomposed. Registering a rule protects against fitting it
+to the answer; it does not protect against the rule having no content. What made these
+rows trustworthy was a redundancy the harness happened to provide (one rung, four
+depths), not the test I wrote down. When a check passes on everything, find the case it
+should fail on before believing it — the peer's contaminated row was that case, and it
+scored 1.0026x.
