@@ -246,9 +246,16 @@ class LinearStatePool:
         if not self._free:
             raise RuntimeError(f"LinearStatePool exhausted: all {self.num_slots} slots in use")
         slot = self._free.pop()
-        self.states[slot].zero_()
-        if self.conv_windows is not None:
-            self.conv_windows[slot].zero_()
+        # The zeroing can raise (an OOM on a 27B is not hypothetical) after the pop has
+        # already taken the slot out of _free, and the caller never receives it -- so
+        # nothing can free_slot it and the pool loses a slot for the process's life.
+        try:
+            self.states[slot].zero_()
+            if self.conv_windows is not None:
+                self.conv_windows[slot].zero_()
+        except Exception:
+            self._free.append(slot)
+            raise
         return slot
 
     def free_slot(self, slot: int) -> None:

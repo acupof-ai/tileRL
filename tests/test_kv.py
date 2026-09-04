@@ -249,6 +249,30 @@ def test_state_pool_lifecycle():
         sp.free_slot(slots[0])  # double free
 
 
+def test_a_failed_alloc_slot_does_not_consume_the_slot():
+    """``alloc_slot`` pops before it zeroes, and the zeroing can raise -- an OOM on a
+    27B is not hypothetical. Without the unwind the slot has left ``_free`` and reached
+    no caller, so nothing can ``free_slot`` it and the pool is one slot smaller for the
+    life of the process. Measured before the fix: 3 slots became 2."""
+    sp = LinearStatePool(3, 1, 1, 8)
+
+    class _Boom:
+        def zero_(self):
+            raise RuntimeError("simulated OOM inside zero_")
+
+    victim = sp._free[-1]  # alloc_slot pops from the end
+    real = sp.states
+    sp.states = {victim: _Boom()}
+    try:
+        with pytest.raises(RuntimeError, match="OOM"):
+            sp.alloc_slot()
+    finally:
+        sp.states = real
+    # The slot came back, so the pool still offers all three.
+    assert len(sp._free) == 3, f"leaked: {sp._free}"
+    assert [sp.alloc_slot() for _ in range(3)]
+
+
 # ----------------------------------------------------------------- exhaustion
 
 
