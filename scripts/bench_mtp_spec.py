@@ -23,9 +23,34 @@ from tilerl.mtp import load_mtp_head
 from tilerl.ops.backend import get_backend
 
 
-def _rand_prompt(vocab: int, n: int, seed: int) -> list[int]:
-    gen = torch.Generator().manual_seed(seed)
-    return torch.randint(0, vocab, (n,), generator=gen).tolist()
+def _make_prompt(source: str, n: int) -> list[int]:
+    """Chat-templated prompt — raw/repeated tokens cause greedy repetitive loops."""
+    try:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(source)
+        msg = (
+            "Write a detailed explanation of how the internet works, covering "
+            "routers, packets, protocols, and data centers. Explain each topic "
+            "in simple terms with real-world examples. "
+        )
+        ids = tok.apply_chat_template(
+            [{"role": "user", "content": msg}],
+            add_generation_prompt=True,
+        )
+        return (ids * (n // len(ids) + 1))[:n]
+    except Exception:
+        gen = torch.Generator().manual_seed(11)
+        return torch.randint(0, 248320, (n,), generator=gen).tolist()
+
+
+def _decode(source: str, ids: list[int]) -> str:
+    try:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(source).decode(ids)
+    except Exception:
+        return str(ids[:10])
 
 
 def _drive(engine, wids, max_steps=8192):
@@ -69,12 +94,18 @@ def main() -> None:
     p.add_argument("source", help="HF checkpoint directory (with model_mtp.safetensors)")
     p.add_argument("--n-decode", type=int, default=64)
     p.add_argument("--prompt-len", type=int, default=512)
+    p.add_argument("--no-fp4", action="store_true", help="use bf16 master weights (skip fp4 packing)")
     args = p.parse_args()
 
     backend = get_backend()
     if backend.device.type != "cuda":
         raise SystemExit("needs CUDA target (TILERL_TARGET=cuda)")
     cfg = qwen38_27b()
+    if args.no_fp4:
+        from dataclasses import replace
+
+        cfg = replace(cfg, fp4=False)
+        print("fp4 DISABLED — using bf16 master weights", flush=True)
 
     t0 = time.perf_counter()
     model = load_hf(cfg, args.source, fuse_projections=True)
@@ -93,7 +124,7 @@ def main() -> None:
     print(f"engines built (spec_decode={eng_on._spec_decode})", flush=True)
 
     for B in (1, 8):
-        prompt = _rand_prompt(cfg.vocab_size, args.prompt_len, seed=11)
+        prompt = _make_prompt(args.source, args.prompt_len)
         sp = SamplingParams(temperature=0.0, max_new_tokens=args.n_decode, seed=42)
         # Warmup: B requests stagger into decode over ~2B ticks (each prefill
         # spans a large chunk + a small remainder, one prefill per tick), then
@@ -115,6 +146,10 @@ def main() -> None:
                         break
                 raise SystemExit(1)
         print(f"B={B}: lossless OK ({len(out_off[wids_off[0]])} tokens/req)", flush=True)
+        # Sanity: show what the model actually generates.
+        first = out_off[wids_off[0]][:10]
+        print(f"  first 10 tokens: {first}", flush=True)
+        print(f"  decoded: {repr(_decode(args.source, first))}", flush=True)
 
         # Timed spec-OFF.
         wids_off = [eng_off.submit(prompt, sp) for _ in range(B)]

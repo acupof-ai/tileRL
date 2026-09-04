@@ -1,0 +1,1 @@
+{"command": "PYTHONPATH=src TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=7 TILELANG_CACHE_DIR=/work/tilelang_cache python3 scripts/bench_mtp_spec.py /data00/Qwen3.8-27B-NVFP4", "variants": [{"name": "mtp_spec", "env": {}}], "timeout": 3600, "out_dir": "/work"}
