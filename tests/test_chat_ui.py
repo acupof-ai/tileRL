@@ -332,12 +332,10 @@ def test_the_reasoning_split_handles_a_reply_that_starts_inside_think():
     assert not bad, f"splitThink is wrong on: {bad}"
 
 
-def test_the_index_route_serves_the_page():
-    """`/` returns the CHAT page, and the landing page is still reachable at /about.
+def _tiny_client():
+    """A TestClient over the real app on the tiny model.
 
-    Asserting 200 + text/html + <title> cannot tell the two pages apart -- both satisfy
-    all three -- so the route swap would have been invisible. Key on the composer, which
-    only the chat page has.
+    Two tests need it; building the engine twice doubles the slowest part of this file.
     """
     from tilerl_kernels.backend import get_backend
 
@@ -350,7 +348,17 @@ def test_the_index_route_serves_the_page():
     cfg = tiny()
     engine = build_engine(cfg, build_random(cfg, seed=3), get_backend(),
                           num_blocks=64, num_slots=2, max_batch=2, max_total_tokens=512)
-    client = TestClient(create_app(engine, get_tokenizer(None), model_name="tiny"))
+    return TestClient(create_app(engine, get_tokenizer(None), model_name="tiny"))
+
+
+def test_the_index_route_serves_the_page():
+    """`/` returns the CHAT page, and the landing page is still reachable at /about.
+
+    Asserting 200 + text/html + <title> cannot tell the two pages apart -- both satisfy
+    all three -- so the route swap would have been invisible. Key on the composer, which
+    only the chat page has.
+    """
+    client = _tiny_client()
     for route in ("/", "/chat"):
         r = client.get(route)
         assert r.status_code == 200, route
