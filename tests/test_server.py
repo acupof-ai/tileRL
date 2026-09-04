@@ -113,6 +113,42 @@ def test_health(client):
     resp = client.get("/health")
     assert resp.status_code == 200, resp.text
     assert isinstance(resp.json(), dict)
+    assert resp.json()["status"] == "ok"
+
+
+def test_health_says_degraded_when_the_engine_raises():
+    """`status` was the literal "ok", so a broken engine and a healthy one gave the same
+    body — a health endpoint that cannot report ill health. No consumer reads the field
+    today (all three script readers take `stats`, and each fails on None), which is why
+    this was found by reading rather than by an outage.
+
+    Asserts the two states DIFFER, plus that the healthy one still says ok, so a fix
+    that marks everything degraded does not pass.
+    """
+
+    class _StatsRaises:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def stats(self):
+            raise RuntimeError("engine is wedged")
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    engine = _build_engine(seed=34)
+    engine.run()
+    try:
+        with TestClient(create_app(engine, _ByteTokenizer())) as c:
+            good = c.get("/health").json()
+        with TestClient(create_app(_StatsRaises(engine), _ByteTokenizer())) as c:
+            bad = c.get("/health").json()
+    finally:
+        engine.shutdown()
+
+    assert good["status"] == "ok" and good["stats"], good
+    assert bad["status"] != "ok", f"a raising engine still reports {bad['status']!r}"
+    assert bad["stats"] is None and "RuntimeError" in bad.get("error", ""), bad
 
 
 def test_models(client, model_id):
@@ -834,3 +870,104 @@ def test_a_data_parallel_engine_can_stream():
     finally:
         for e in engines:
             e.shutdown()
+
+
+def test_a_stream_that_dies_mid_decode_does_not_look_like_success():
+    """`_stream` catches only (TimeoutError, RuntimeError). Anything else the engine
+    raises escapes the generator AFTER the 200 header has gone out, so the client gets
+    HTTP 200 with zero frames, no error frame and no [DONE] — a success status over a
+    failed request. The non-stream route answers 5xx for the same conditions.
+
+    Not hypothetical: `DataParallelEngine` had no `peek`, so `serve --devices` hit
+    exactly this with an AttributeError. Measured across six exception types injected at
+    the engine boundary, the two caught ones delivered 3 frames + an error frame +
+    [DONE]; the other four delivered 0 frames and neither marker, all under HTTP 200.
+
+    The gate is the CONTRACT, not the status code: a stream either terminates with
+    [DONE] or says why it stopped. A 200 with neither is what a client reads as an empty
+    reply. Deliberately independent of whether `_stream` grows a catch-all — a
+    root-cause fix satisfies this too, and a catch-all that turns silence into a tidy
+    error frame must not be the only thing that does.
+    """
+
+    class _DiesAfterOnePeek:
+        """peek works once, then raises — a request that dies mid-decode."""
+
+        def __init__(self, inner, exc):
+            self._inner, self._exc, self._left = inner, exc, 1
+
+        def peek(self, rid):
+            if self._left <= 0:
+                raise self._exc("injected at the engine boundary")
+            self._left -= 1
+            return self._inner.peek(rid)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    engine = _build_engine(seed=31)
+    engine.run()
+    try:
+        body = {"model": "tiny", "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 24, "stream": True}
+        for exc in (RuntimeError, ValueError, AttributeError, KeyError):
+            app = create_app(_DiesAfterOnePeek(engine, exc), _ByteTokenizer())
+            with TestClient(app, raise_server_exceptions=False) as c:
+                r = c.post("/v1/chat/completions", json=body)
+                assert "[DONE]" in r.text or '"error"' in r.text or r.status_code >= 400, (
+                    f"{exc.__name__}: HTTP {r.status_code} with no [DONE] and no error "
+                    f"frame — a client reads this as an empty reply. "
+                    f"body={r.text[:200]!r}")
+    finally:
+        engine.shutdown()
+
+
+def test_v1_messages_never_answers_200_for_an_engine_failure(tmp_path, monkeypatch):
+    """`/v1/messages` builds the whole body before its `sse()` yields anything, so the
+    route's handler still owns the status code and a failed request cannot come back as
+    success. That is the structural reason `_stream` needed a catch-all and this route
+    does not — measured, because the structure is what makes it true today and only a
+    measurement says the structure is what ships.
+
+    Asserts the STREAM and NON-STREAM answers agree, not a specific code. Three of the
+    six types land on FastAPI's bare 500 rather than a typed error body, which is a
+    different and smaller problem: the client still gets a status it can act on.
+    """
+    from fastapi import FastAPI
+
+    from tilerl.messages import mount_messages
+
+    class _Dies:
+        def __init__(self, inner, exc):
+            self._inner, self._exc, self._left = inner, exc, 1
+
+        def take(self, rid):
+            if self._left <= 0:
+                raise self._exc("injected at the engine boundary")
+            self._left -= 1
+            return self._inner.take(rid)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "rec.jsonl"))
+    engine = _build_engine(seed=33)
+    engine.run()
+    try:
+        body = {"model": "tiny", "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]}
+        for exc in (RuntimeError, ValueError, AttributeError, KeyError):
+            app = FastAPI()
+            mount_messages(app, _Dies(engine, exc), _ByteTokenizer(), "tiny")
+            with TestClient(app, raise_server_exceptions=False) as c:
+                codes = [c.post("/v1/messages", json={**body, "stream": s}).status_code
+                         for s in (False, True)]
+            assert codes[0] == codes[1], (
+                f"{exc.__name__}: non-stream {codes[0]} but stream {codes[1]} — the "
+                f"streaming path is diverging, which is how server.py's _stream came "
+                f"to answer 200 for a failed request")
+            assert codes[0] >= 400, (
+                f"{exc.__name__}: HTTP {codes[0]} for an engine failure — a client "
+                f"cannot tell this from a model that chose to say nothing")
+    finally:
+        engine.shutdown()
