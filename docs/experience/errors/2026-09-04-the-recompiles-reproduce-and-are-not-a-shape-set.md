@@ -1,4 +1,4 @@
-# The 51 recompiles reproduce on demand, and they are not a shape set being enumerated
+# The 51 recompiles reproduce on demand, and on B=8 the rate does not decay (title claim retracted below)
 
 **Date:** 2026-09-04
 **Arch:** sm70 (Tesla V100-SXM2-32GB), 27B NVFP4 + draft, B=8, ctx=1024, `--prompts 24`
@@ -67,6 +67,34 @@ or their cache key includes something that changes per call. **I am not naming w
 This entry records a reproducible symptom with its rate and its share, not a mechanism —
 the difference between this and the four wrong attributions above is that a bound got
 reported as an answer before, and here the count climbed past my bound while I watched.
+
+## RETRACTED the same day: fact 1 does not generalize, and the shape hypothesis is alive
+
+Fact 1 above — "the rate is steady, therefore a finite set is not being enumerated" — is
+a claim about a distribution drawn from **one run**, and a 6-group B=1 sweep 40 minutes
+later contradicts it. `t74` at `1f58293`, same logger enabled:
+
+```
+13:02:00  write_tokens_f32          13:02:08  write_tokens_f32
+13:02:02  paged_attention_split     13:02:10  paged_attention_split
+13:02:45  write_tokens_f32          13:02:47  paged_attention_split
+```
+
+**6 compiles, 3 pairs, all inside 50 s at the depth-3 → depth-4 transition, then zero
+across the remaining ~9 minutes and 287 further ticks.** That is exhaustion, and it is
+the shape hypothesis behaving exactly as it should: depth 4 is the only depth that reaches
+rung 8 (`r8x244` of 287 ticks; depths 1-3 live on r2/r4), so the two `seq_q_lens` kernels
+compile for the new shape and the set closes.
+
+The compiles also account for that run's stalls: the two blown groups carry 16.09 s of
+draft excess (tick-side route: 19.77 s) against 12 s of logged compile wall time.
+
+So the shape hypothesis was killed off a single B=8 log, and the correct statement is
+narrower: **on that B=8 run the rate was flat**, and what distinguishes it from a B=1 run
+that exhausts in three pairs is not yet measured. The 269-compile run is the outlier
+needing explanation, not the 6-compile one. Full numbers in
+`wins/2026-09-04-depth-4-stalls-are-compiles-and-block-parallel-closes.md`.
+
 
 ## What it costs, and where it does not
 

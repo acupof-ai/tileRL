@@ -4,6 +4,13 @@
 **Arch:** sm70 (Tesla V100-SXM2-32GB), 27B NVFP4 + draft, B=1, wikitext x3, `--tokens 128`, ctx=2048
 **Task:** #71, closing the gating number for #22
 
+> **Superseded on the numbers, not the direction:** every row here is a 3-group run
+> (p0/p1/p2), and 6 groups later showed the p3+ region this could not see, the clean
+> rung-4 pair (d2 vs d3), and the depth-4 stalls' cause. The #22 rejection stands and
+> got stronger. See
+> [`2026-09-04-depth-4-stalls-are-compiles-and-block-parallel-closes.md`](2026-09-04-depth-4-stalls-are-compiles-and-block-parallel-closes.md).
+
+
 ## The rule, registered before the data
 
 Written into #71 before the run launched, because #60's failure was a contaminated
