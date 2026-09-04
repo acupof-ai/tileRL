@@ -148,33 +148,52 @@ globalThis.TextDecoder = class { decode(){ return ""; } };
 """
 
 
-def test_the_page_js_parses():
-    """The whole script block, through a real parser.
+@pytest.mark.parametrize("name,page", [("_CHAT_UI", _CHAT_UI), ("_LANDING", _LANDING)])
+def test_the_page_js_parses(name, page):
+    """Each page's whole script block, through a real parser.
 
-    `_CHAT_UI` is an ordinary triple-quoted string, so Python eats every backslash
-    escape in it. A `\\n` inside a `//` comment became a real newline and split the
+    Both pages are ordinary triple-quoted strings, so Python eats every backslash
+    escape in them. A `\\n` inside a `//` comment became a real newline and split the
     comment in two, leaving `", so` as a statement: SyntaxError, the entire script
     block dead, and a page that renders but cannot send. The bare-call resolver saw
     nothing wrong -- it scans text and does not parse -- and every other gate here
     passed. The served page was broken for a whole deploy.
 
-    This is also why _MD_JS is `r\"\"\"`; the same escape class had already cost a
-    working regex earlier the same day.
+    Parametrized over both pages because `_LANDING`'s 261 bytes of JS carry the same
+    hazard and had no gate of any kind. This is also why _MD_JS is `r\"\"\"`; the same
+    escape class had already cost a working regex earlier the same day.
     """
     node = shutil.which("node")
     if node is None:
         pytest.skip("node not available; the page JS cannot be parsed")
-    js = _script(_CHAT_UI)
+    js = _script(page)
     r = subprocess.run([node, "--check", "-"], input=js, capture_output=True,
                        text=True, timeout=60)
-    assert r.returncode == 0, f"the page's JS does not parse:\n{r.stderr.strip()[:600]}"
+    assert r.returncode == 0, f"{name}'s JS does not parse:\n{r.stderr.strip()[:600]}"
     # A stray escape shows up as a line that is the tail of a broken string literal.
     # Cheap, runs without node, and names the cause rather than a parse offset.
     for n, line in enumerate(js.splitlines(), 1):
         assert not line.lstrip().startswith('", '), (
-            f"line {n} is {line.strip()!r}: a backslash escape in _CHAT_UI was eaten by "
-            f"Python and split a comment or string. _CHAT_UI is not a raw string."
+            f"{name} line {n} is {line.strip()!r}: a backslash escape was eaten by "
+            f"Python and split a comment or string. These pages are not raw strings."
         )
+
+
+@pytest.mark.parametrize("name,page,reader", [
+    ("_CHAT_UI", _CHAT_UI, r'\$\("([\w-]+)"\)'),
+    ("_LANDING", _LANDING, r'getElementById\("([\w-]+)"\)'),
+])
+def test_every_element_the_js_reads_exists_in_the_markup(name, page, reader):
+    """An id the JS reads and the markup does not define is a null deref at load.
+
+    On the chat page that kills the whole script -- the same shape as the parse break,
+    caught only at runtime. `_LANDING` had no gate at all, and its two ids are the
+    only thing between it and a page whose header never leaves "connecting…".
+    """
+    wanted = set(re.findall(reader, _script(page)))
+    assert wanted, f"{name}: the id reader matched nothing; the regex is stale"
+    present = set(re.findall(r'id="([\w-]+)"', page))
+    assert wanted <= present, f"{name}'s JS reads ids the markup lacks: {wanted - present}"
 
 
 def test_sending_reaches_fetch_and_the_fold_stays_clickable():
@@ -190,10 +209,8 @@ def test_sending_reaches_fetch_and_the_fold_stays_clickable():
         pytest.skip("node not available; the send path cannot be executed")
     # Populate the stub from the page's own ids rather than a hand-kept list -- a stub
     # missing one id fails as a null deref, which reads like a page bug and is not one.
-    # Asserting they match also catches a `$("x")` whose element was renamed away.
+    # That they all exist in the markup is its own test above.
     wanted = set(re.findall(r'\$\("([\w-]+)"\)', _script(_CHAT_UI)))
-    present = set(re.findall(r'id="([\w-]+)"', _CHAT_UI))
-    assert wanted <= present, f"the JS reads ids the markup does not define: {wanted - present}"
     ids = "const IDS = {};\n" + "".join(f'IDS["{i}"] = mk("div");\n' for i in sorted(wanted))
     harness = _DOM_STUB + ids + _script(_CHAT_UI) + textwrap.dedent("""
         const out = {};
