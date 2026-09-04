@@ -85,6 +85,45 @@ the pass condition, not a failure.** `mmlu_holds` exists to catch collateral
 damage, and GRPO caused none. A flat MMLU is evidence the run did not break the
 model. It is not evidence about whether GSM8K improved, in either direction.
 
+## The same class, second instrument: `reward_rises`
+
+`grpo_loop` takes `prompts[step % len(prompts)]` (`train.py:265`) -- positional,
+not sampled. With 512 training rows and 100 steps no prompt repeats, so the
+windows `cli.py:301-302` average over are **disjoint prompt sets**:
+
+- `reward_first` = steps 1-25 = prompts 0-24
+- `reward_last` = steps 76-100 = prompts 75-99
+
+`0.705 -> 0.94` therefore compares one policy on one set of questions against a
+different policy on a different set of questions. Policy improvement and prompt
+difficulty are summed and cannot be separated. The `reward_rises` gate passed on
+that comparison.
+
+The code comment at `cli.py:298` shows the per-step version of this was known --
+"per-step reward moves with the sampled prompt, so two single steps compare two
+draws, not two policies" -- and windows were the response. Averaging reduces the
+variance; it does not remove the offset, because the two windows were never the
+same questions.
+
+Ruled out first, so this is the remaining explanation for rollout reward 0.705
+against a 39.0% eval at the same cap: train and test are indistinguishable in
+difficulty (median prompt 228 vs 222 chars, 4 vs 3 sentences), and greedy vs
+untruncated differ by 1.7 points (36.7% vs 35.0%, n=60).
+
+**Gate status after this audit:**
+
+| gate | valid? |
+|---|---|
+| `mmlu_holds` | yes -- `max_new_tokens=1`, the cap cannot reach it |
+| `groups_untied` | yes -- and it FAILED at 0.76, unremarked |
+| `gsm8k_improves` | was broken by the cap; valid once both arms run uncapped |
+| `reward_rises` | **confounded** -- disjoint prompt sets |
+
+Two of four were reporting on something other than what their name says.
+`gsm8k_before`/`after` is unaffected by this one: it scores the same fixed 500
+test questions before and after, which is the comparison `reward_rises` only
+appears to make.
+
 ## Fix
 
 - Size the rollout KV pool from `max(prompt) + max_new_tokens`. A flat
