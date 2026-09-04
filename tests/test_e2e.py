@@ -19,6 +19,7 @@ from tilerl.cli import _build_model
 from tilerl.config import tiny
 from tilerl.engine import (
     _PHASE_DECODE,
+    _PREFILL_BUCKET,
     BLOCK_TOKENS,
     BatchKv,
     Engine,
@@ -1556,3 +1557,83 @@ def test_noprefix_store_retains_no_snapshot():
     prompt = np.random.default_rng(5).integers(3, 320, size=40).astype(np.int64)
     _drain(engine, [engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=40, seed=0))], 40)
     assert engine.stats()["prefix_published"] == 0
+
+
+def test_a_mixed_tick_pays_the_widest_rows_width_on_every_row():
+    """A tick's activations are `len(rows) x width`, not `sum(tokens)` -- so one prefill
+    row makes the whole tick as wide as itself.
+
+    `engine.py:741-742` builds one rectangle from the WIDEST row:
+
+        width = ceil(max(seq_q) / _PREFILL_BUCKET) * _PREFILL_BUCKET  if chunk > 1
+        input_ids = np.zeros((len(rows), width))
+
+    `max_num_batched_tokens` bounds `sum(chunks)`, so it caps prompt tokens per tick and
+    says nothing about the rectangle they are padded into. At B=8 on the 27B that cost
+    272 MiB in `silu_mul` -- 8 rows x 512, against the 102 MiB the token budget suggests --
+    and OOMed a 32 GiB card at spec depth 1. The ceiling is not "B=8 needs more memory",
+    it is "a mixed tick pays the widest row's width on every row".
+
+    Silent until it OOMs: shapes and tokens are both correct, only the padding is wasted,
+    and a tiny model's rectangle fits anywhere. Asserted on the width RULE rather than on
+    a reconstructed tick, because reconstructing from outside `step()` reads state that
+    `_build_plan` has not yet promoted -- measured, it reports 0.00x waste. The e2e half
+    below only has to show a mixed tick happens at all; `mixed_forwards` had no coverage.
+    """
+    bucket = _PREFILL_BUCKET
+
+    def rect(seq_q, chunks=()):
+        """The rectangle _run_forward materializes, mirroring engine.py:740-742.
+
+        The bucket branch is gated on `max(chunks)` -- the PREFILL chunks -- not on
+        `max(seq_q)`. A verify tick has no prefills, so it takes the exact branch even at
+        width 5; only a tick carrying a multi-token prefill pays a bucket. Getting this
+        wrong is how the first version of this test asserted `rect([5]*8) == 40` and got
+        512.
+        """
+        chunk = max(chunks, default=0)
+        width = -(-max(seq_q) // bucket) * bucket if chunk > 1 else max(seq_q)
+        return len(seq_q) * width
+
+    # A decode row (1 position) beside a prefill chunk: the decode row is padded from 1
+    # to the bucket, so the rectangle is 2x the bucket for bucket+1 real tokens.
+    assert rect([1, bucket], chunks=[bucket]) == 2 * bucket
+    assert rect([1, bucket], chunks=[bucket]) / (1 + bucket) > 1.9, "a mixed tick must waste ~2x on 2 rows"
+    # Eight rows, one of them prefilling: the OOM shape, 8x the widest row.
+    assert rect([1] * 7 + [512], chunks=[512]) == 8 * 512
+    assert rect([1] * 7 + [512], chunks=[512]) / (7 + 512) > 6.0, "the 27B OOM shape wastes >6x"
+    # Decode-only ticks are NOT padded: chunk == 1 takes the exact-width branch.
+    assert rect([1] * 8) == 8, "a decode-only tick must not pay a bucket"
+    # Bucket rounding, on a width that is NOT already a multiple -- the cases above use
+    # 64 and 512, where rounding is a no-op, so they cannot see it. Checked: mutating the
+    # rounding away leaves every one of them passing.
+    assert rect([1, 96], chunks=[96]) == 2 * 128, "96 must round up to the 128 bucket"
+    assert rect([1, 65], chunks=[65]) == 2 * 128
+    assert rect([1, 63], chunks=[63]) == 2 * 64
+    # A verify tick is exact: no prefill chunk, so no bucket, even at width 5.
+    assert rect([5] * 8) == 8 * 5
+    # And a SINGLE-token prefill chunk does not trigger the bucket either (chunk > 1).
+    assert rect([1, 1], chunks=[1]) == 2
+
+    engine = _build_engine(seed=91)
+    try:
+        rng = np.random.default_rng(5)
+        params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=1)
+        short = engine.submit(rng.integers(3, 320, size=4).astype(np.int64), params)
+        for _ in range(4):
+            engine.step()
+            if any(r.phase == _PHASE_DECODE for r in engine._running):
+                break
+        assert any(r.phase == _PHASE_DECODE for r in engine._running), "short prompt never decoded"
+        long_ = engine.submit(rng.integers(3, 320, size=96).astype(np.int64), params)
+        for _ in range(24):
+            engine.step()
+            if engine.stats()["mixed_forwards"]:
+                break
+        assert engine.stats()["mixed_forwards"], (
+            "no decode+prefill tick occurred, so the rectangle above was never reached "
+            "in a real run; the arithmetic asserts still hold but nothing exercises them"
+        )
+        _drain(engine, [short, long_], max_new_tokens=8)
+    finally:
+        engine.shutdown()

@@ -131,18 +131,31 @@ the model says 2.11, 1.39x low) — depth 1 does not fit either, and depths 2-4 
 reached. **That is the reportable row for #72: on sm70 the B=8 arm does not run at any
 depth, at ctx=1024 or ctx=2048.**
 
-**One number in it I cannot account for.** The failing allocation is 272 MiB =
-`4096 × 17408` f32 — 4096 rows into `silu_mul`. But `_build_plan` decrements a *shared*
-token budget (`engine.py:591`, `:608`): `budget = max_num_batched_tokens − len(decodes)`
-= 512, the first prefill row takes `min(1152, 512) = 512` and drives the budget to 0, so
-the next row breaks out. One tick should therefore prefill **512 tokens → 512 rows → 102
-MiB**. The observed tensor is **8x** that, as if all eight rows each took a full 512-wide
-chunk.
+**The 8x is resolved, and it was my reading of the budget that was wrong.** The failing
+allocation is 272 MiB = `4096 × 17408` f32, and I claimed `_build_plan`'s shared
+512-token budget (`engine.py:591`, `:608`) permits only 512 rows. The budget does bound
+`sum(chunks)` — but the forward tensor is a **rectangle**:
 
-Either my reading of the budget is wrong or something else feeds `silu_mul` a
-`[8, 512, ·]` activation. I have not established which, and the whole point of this entry
-is not to fill that kind of gap with a plausible story — the four dead mechanisms above
-are what that costs.
+```python
+width = -(-max(seq_q) // _PREFILL_BUCKET) * _PREFILL_BUCKET if chunk > 1 else max(seq_q)
+input_ids = np.zeros((len(rows), width), dtype=np.int64)      # engine.py:741-742
+```
+
+`len(rows)` is decodes **plus** prefills, and every row is padded to the widest one. So
+one 512-token prefill chunk beside 7 decode rows gives `8 × 512 = 4096` rows into
+`silu_mul` — exactly the observed 272 MiB. The budget caps how many prompt *tokens* enter
+a tick; it says nothing about the rectangle those tokens are padded into.
+
+That is a different mechanism from the verify ladder's padding rows (#41, "a padding row
+costs 3.3x a useful one"), which is about `rows × W` rounding up the M-ladder. This one is
+the prefill width padding *decode* rows out to a prefill chunk's length, and its cost is
+memory rather than launches: at B=8 a single prefill row makes the whole tick's
+activations 8x wider than the tokens in it.
+
+**Consequence for #72 beyond the B=8 arm:** the OOM is not "B=8 needs more memory than
+this card has" but "a mixed tick at B=8 pays the widest row's width on every row". A
+decode-only tick at B=8 is 8 rows × width 5, which is trivial. `--max-batch 8` is
+survivable; `--max-batch 8` *while a prefill is in flight* is what does not fit.
 
 ## Rule
 
