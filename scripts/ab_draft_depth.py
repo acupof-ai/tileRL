@@ -67,6 +67,22 @@ def _sync() -> None:
         torch.cuda.synchronize()
 
 
+def _rung(m: float) -> int:
+    """The sm70 rung a tick of M = rows x width lands on.
+
+    Above the top rung the ladder does not continue -- the dispatch chunks at 32
+    (engine.py:864, "a full batch verifies in ceil(rows/32) launches per layer"),
+    so M=40 is two launches and not a 64-row rung. Bucket those by launch count so
+    they stay comparable to each other instead of raising: bare
+    `next(r for r in LADDER_WIDTHS if r >= m)` has no default and killed the B=8
+    depth-4 row with StopIteration.
+    """
+    top = max(LADDER_WIDTHS)
+    if m > top:
+        return top * -(-int(m) // top)  # 40 -> 64, printed as r64, meaning 2 launches
+    return next(r for r in LADDER_WIDTHS if r >= m)
+
+
 def _alloc_state() -> dict:
     """Allocator counters, or {} off CUDA. Sampled at both ends of a timed window."""
     if not torch.cuda.is_available():
@@ -99,7 +115,6 @@ def _alloc_delta(a0: dict) -> dict:
 
 
 def gpu_state() -> str:
-
     """SM clock, throttle reasons and load, sampled per depth.
 
     Two runs of the identical command on the same commit agreed to 0.1% at depths
@@ -210,7 +225,7 @@ def measure(e, prompts: list[list[int]], tokens: int) -> tuple:
             rows = len([r for r in e._running if r.req_id in rids and r.req_id not in done])
             w = 1 + (b1["spec_drafted"] - b0["spec_drafted"]) / max(rows, 1)
             m = max(rows, 1) * w
-            rung = next(r for r in LADDER_WIDTHS if r >= m)
+            rung = _rung(m)
             per_rung[rung].append((time.perf_counter() - k0) * 1000 / nf)
             # The draft goes in the SAME bucket as the tick that ran it. Verify is
             # tick minus draft, so pooling the draft across rungs while bucketing the
@@ -439,7 +454,7 @@ def main() -> None:
     # at B=4 they are M=12 -> rung 32 and M=16 -> rung 32 (shared), and at B=8 they
     # are M=24 and M=32 (also shared, but with different padding). Where they do NOT
     # share one, the subtraction is not a draft forward and the script says so.
-    r2, r3 = (next(r for r in LADDER_WIDTHS if r >= B0 * (1 + d)) for d in (2, 3))
+    r2, r3 = (_rung(B0 * (1 + d)) for d in (2, 3))
     if r2 != r3:
         raise SystemExit(
             f"at B={B0} depths 2 and 3 launch different rungs ({r2} vs {r3}), so "
