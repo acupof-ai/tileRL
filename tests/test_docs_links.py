@@ -115,5 +115,71 @@ def test_the_resolver_reports_a_reference_that_does_not_exist():
     )
 
 
+def test_no_doc_invokes_a_flag_the_cli_does_not_have():
+    """A doc that writes `tilerl serve --x` must mean a flag `serve` accepts.
+
+    `docs/serve-v100.md:163` recommended `--kv-tier <dir>` as one of three ways past the
+    KV capacity wall, alongside two real ones, and added "the engine path is tested" —
+    `tilerl serve --kv-tier /tmp/x` answers `unrecognized arguments`. The code was written
+    on another branch and only the prose describing it was ported. That is invisible to
+    every other check: the flag name resolves as English, the file it lives in is tracked,
+    and nothing executes the line.
+
+    Scoped to flags on the same line AFTER a `tilerl <sub>` invocation. A first version
+    compared every `--flag` in docs/ against the CLI and reported 18 misses, of which the
+    real count was 1: `--query-compute-apps` is nvidia-smi's, `--system-site-packages` is
+    venv's, `--tokens` belongs to a script. Most flags in these docs are scripts' flags,
+    so the wider question has a different answer than the one being asked.
+
+    Reads the parser in-process rather than shelling out to `--help` seven times: measured
+    0.01s against 0.55s, and verified the two agree on all seven subcommands (12/24/10/8/
+    9/5/3 flags, exact match), including under each of the four recipes, since
+    `_build_parser` takes one.
+
+    **This gate does not catch the `--kv-tier` line that motivated it.** That line is prose
+    naming a flag, with no `tilerl serve` on it, and the negative control confirms it passes
+    — deliberately, because a scan wide enough to catch prose reported 18 misses for 1 real
+    one. What the gate covers is the copy-pasteable form: a command someone will run. Prose
+    recommending a flag stays a reading problem.
+    """
+    import sys
+
+    sys.path.insert(0, str(ROOT / "src"))
+    from tilerl import cli
+
+    parser = cli._build_parser()
+    accepted: dict[str, set[str]] = {}
+    for action in parser._actions:
+        if action.dest == "cmd" and getattr(action, "choices", None):
+            for name, sp in action.choices.items():
+                accepted[name] = {o for a in sp._actions for o in a.option_strings
+                                  if o.startswith("--")}
+    assert accepted, "could not read subcommands off the parser"
+
+    invoke = re.compile(r"\btilerl\s+(" + "|".join(sorted(accepted)) + r")\b")
+    flag = re.compile(r"(--[a-z][a-z0-9-]{2,})")
+    bad = []
+    for rel in sorted(_tracked()):
+        p = ROOT / rel
+        if not p.is_file():
+            continue
+        for i, line in enumerate(p.read_text().splitlines(), 1):
+            if "NOT IMPLEMENTED" in line:
+                continue
+            # Segment per invocation: one line can name two subcommands, and taking only
+            # the first attributes the second's flags to it. CHANGELOG.md:235 has
+            # `tilerl train --rl` and `tilerl ledger [--lineage ID]` -- both real, but a
+            # first-match-only scan reported `train --lineage` as a phantom.
+            hits = list(invoke.finditer(line))
+            for n, m in enumerate(hits):
+                end = hits[n + 1].start() if n + 1 < len(hits) else len(line)
+                for f in flag.findall(line[m.end():end]):
+                    if f not in accepted[m.group(1)]:
+                        bad.append(f"{rel}:{i} -> tilerl {m.group(1)} {f}")
+    assert not bad, (
+        "docs invoke flags the CLI does not accept (mark a deliberate proposal with "
+        "NOT IMPLEMENTED on the same line):\n  " + "\n  ".join(bad))
+
+
 if __name__ == "__main__":
     print(f"{len(_dead())} dead references across {len(_tracked())} tracked docs")
