@@ -22,7 +22,9 @@ predict.
 ## The measurement
 
 Registered before the run's counters were read: tie rate ≈ 0.30, from `p⁸` at
-p = 0.86. **It came back 0.887.** Over the first 62 steps:
+p = 0.86. **It came back 0.887 at step 62, and 0.920 over the full run.** The
+run has since finished; the table reads at step 62 so the prediction is scored
+against the number that was available when it was registered.
 
 | | 256 cap | 2048 cap |
 |---|---:|---:|
@@ -50,6 +52,75 @@ Solving `pⁿ + (1−p)ⁿ = 0.887` at p = 0.9657 gives the effective group:
     effective independent group    3.44
 
 **Eight correlated rollouts buy the diversity of 3.4 independent ones.**
+
+## The full run, and the result I predicted against
+
+100 steps finished. The tie rate **rose** — 88.7% over the first 62 steps,
+**92.0% over all 100** — which is the mechanism running forward: each gradient
+step makes the policy better at the training prompts, the next group is likelier
+to agree, and fewer steps carry gradient. A binary reward against a
+strengthening policy extinguishes itself.
+
+Then the target metric came in and contradicted what that led me to write.
+
+| GSM8K, uncapped, n=500 | accuracy | vs base |
+|---|---:|---:|
+| base | 448/500 = 89.6% | — |
+| **grpo2k, 2048 cap** | **482/500 = 96.4%** | **+6.8 pts, z=4.25, p=2.1e-05** |
+| the 256-cap arm | 474/500 = 94.8% | +5.2 pts |
+
+**Eight gradient steps moved GSM8K 6.8 points** — more than the 100-step arm
+that produced the thinking-cap result.
+
+The two arms differ by +1.6 points, z=1.23, p=0.22. **That is not a finding of
+equivalence**, and the interval says why: the 95% CI on the difference is
+**[−0.9, +4.1] points**, which holds both "the capped arm is 0.9 better" and
+"the loose arm is 4.1 better". Separating arms 1.6 points apart at 80% power
+needs about **2,600 per arm**; we ran 500. So the correct statement is that
+this experiment cannot rank the two arms, not that they are equal.
+
+MMLU went 75.2% → 73.0%, which is **not** significant (z=-1.12, p=0.26) and is
+recorded without being read as a regression.
+
+## What this refutes, including something written on this page
+
+I wrote, before this number existed, that an arm with 92 dead steps "should not
+be expected to move a downstream metric at all". That was wrong, and it was
+wrong in the way predictions usually are: I had one number (MMLU, down) and
+treated it as the answer while the metric the run was actually optimizing had
+not reported yet.
+
+The correction is not just to the sentence. **A high tie rate does not mean a
+weak run.** 92% of steps carrying no gradient sounds like a starved run, and it
+is — but the 8 steps that did carry gradient were each computed from a group
+where the policy genuinely disagreed with itself, which is exactly the
+condition under which a REINFORCE step is informative. Tied groups cost wall
+clock; they do not dilute the steps that are not tied.
+
+So `tied_group_fraction` measures **efficiency, not efficacy**. This run spent
+about 5.5 hours to take 8 useful steps. The right complaint is that it wasted
+92% of the compute, not that it learned less.
+
+## What survives, and what the thinking cap now means
+
+The cap's difficulty-pressure function is still real and still measured: at
+2048 the policy solves 96.6% of training prompts against 0.86 at 256, and the
+tie rate goes 72% → 92%. That part of the mechanism holds.
+
+What does *not* survive is the claim that the 256 cap was **necessary** for the
+accuracy gain: an arm without it also cleared the base by 6.8 points, so the
+cap cannot be load-bearing for reaching ~95%.
+
+**That is weaker than saying the cap bought no accuracy, and the weaker claim
+is the one the data supports.** The between-arm interval [−0.9, +4.1] cannot
+rule out a real difference in either direction. What the cap demonstrably buys
+is **sample efficiency** — 28% of steps carrying gradient against 8% — and the
+22.8% token reduction, which the loose arm has no mechanism to produce. Whether
+it also buys accuracy is open, and answering it needs ~2,600 per arm or a
+pre-registered equivalence margin, neither of which this run has.
+
+This makes the loose arm a *worse* null control than intended, and a more
+interesting result than intended.
 
 ## Group size is the wrong lever, and sampling has no headroom
 
