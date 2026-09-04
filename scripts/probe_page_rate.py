@@ -45,10 +45,15 @@ def one(max_tokens=200):
             if payload == "[DONE]":
                 break
             obj = json.loads(payload)
+            # Content frames carry cumulative usage too, so the usage-ONLY chunk is the
+            # one with no choices. Keying on obj["usage"] alone skipped every content
+            # frame and the probe reported "no content frames arrived" against a server
+            # that had just sent 109 of them.
             if obj.get("usage"):
                 usage = obj["usage"]
+            if not obj.get("choices"):
                 continue
-            if (obj.get("choices") or [{}])[0].get("delta", {}).get("content"):
+            if obj["choices"][0].get("delta", {}).get("content"):
                 frames += 1
                 if first is None:
                     first = time.perf_counter()

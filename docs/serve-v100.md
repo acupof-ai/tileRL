@@ -34,6 +34,13 @@ Read the pid off the listening socket rather than matching a command line:
 `pgrep -f serve_v100.sh` also matches the ssh command you typed to run it, so the
 count it returns is not the number of supervisors.
 
+To restart the server on new code, TERM the **server** and leave the supervisor
+alone — it reboots the child at the new SHA, which the next `=== boot N ===` line
+records. That distinction is load-bearing: the supervisor used to read "stopped on
+purpose" off the child's exit code, and since a killed server exits 143 either way,
+TERMing it exited the supervisor too and left nothing listening
+(errors/2026-09-05-the-supervisor-read-stopped-on-purpose-off-the-wrong-process.md).
+
 ## 2. Open it
 
 The server binds `0.0.0.0`, so from this Mac the pod's address works directly:

@@ -35,9 +35,11 @@ def sandbox(exit_code, sleep_s=0):
         (d / "venv70/bin").mkdir(parents=True)
         boots = d / "boots"
         # sleep_s > 0 stands in for a healthy server: runs until signalled, and
-        # records into `terms` if TERM is what stops it.
+        # records into `terms` if TERM is what stops it. It writes its own pid so a
+        # test can signal the SERVER rather than the supervisor.
         (d / "venv70/bin/python").write_text(
-            f'#!/bin/bash\necho x >> {boots}\ntrap "echo t >> {d}/terms; exit 143" TERM\n'
+            f'#!/bin/bash\necho x >> {boots}\necho $$ > {d}/pid\n'
+            f'trap "echo t >> {d}/terms; exit 143" TERM\n'
             f"[ {sleep_s} -gt 0 ] && sleep {sleep_s} & wait $!\nexit {exit_code}\n"
         )
         (d / "venv70/bin/python").chmod(0o755)
@@ -68,12 +70,50 @@ def test_a_crash_restarts_and_the_cap_gives_up():
         )
 
 
-def test_a_deliberate_stop_is_not_restarted():
-    with sandbox(143) as (_, script, boots):
+def test_a_clean_exit_is_not_restarted():
+    with sandbox(0) as (_, script, boots):
         rc = subprocess.run(["bash", str(script)], capture_output=True, timeout=120).returncode
-        assert (boots_of(boots), rc) == (1, 143), (
-            f"TERM must not restart, got {boots_of(boots)}/{rc}"
+        assert (boots_of(boots), rc) == (1, 0), (
+            f"a clean exit must not restart, got {boots_of(boots)}/{rc}"
         )
+
+
+def test_killing_only_the_server_restarts_it():
+    """The defect this caught: restarting the server to pick up new code left nothing
+    listening on 8000, and the supervisor was gone too.
+
+    The loop used to read "stopped on purpose" off the CHILD's exit code, and a server
+    killed by anything other than the supervisor exits 143 -- a plain `kill -TERM <server
+    pid>`, or the OOM killer. So it walked away from exactly the case it exists for. Only
+    a signal aimed at the supervisor means stop, which the trap knows and the exit code
+    does not.
+    """
+    with sandbox(0, sleep_s=30) as (d, script, boots):
+        sup = subprocess.Popen(["bash", str(script)])
+        try:
+            for _ in range(100):
+                if boots.exists():
+                    break
+                time.sleep(0.1)
+            time.sleep(0.5)
+            # The stub writes its own pid; kill THAT, not the supervisor.
+            child = int((d / "pid").read_text().strip())
+            subprocess.run(["kill", "-TERM", str(child)], check=True)
+            for _ in range(200):
+                if boots_of(boots) >= 2:
+                    break
+                time.sleep(0.1)
+            assert boots_of(boots) >= 2, (
+                f"the server was killed and never came back ({boots_of(boots)} boot(s)): "
+                f"nothing is listening and the supervisor has walked away"
+            )
+            assert sup.poll() is None, "the supervisor exited when only the server was killed"
+        finally:
+            sup.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                sup.wait(timeout=30)
+            if sup.poll() is None:
+                sup.kill()
 
 
 def test_term_to_the_supervisor_reaches_the_server():

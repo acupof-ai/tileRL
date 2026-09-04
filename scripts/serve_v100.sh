@@ -35,7 +35,8 @@ export TILERL_QWEN38_SOURCE=$CKPT
 # Without this, TERM to the supervisor left python holding 23 GiB of the card with
 # nothing supervising it -- measured, it needed a second kill by pid.
 child=
-trap 'if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait "$child"; fi; exit 143' TERM INT
+stopping=
+trap 'stopping=1; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait "$child"; fi; exit 143' TERM INT
 
 for ((n = 0; n <= MAX_RESTARTS; n++)); do
   # An unbounded log on this pod is how 123 GiB once filled the disk.
@@ -52,7 +53,12 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
   wait "$child"; rc=$?; child=
   ran=$((SECONDS - started))
   echo "=== exit rc=$rc after ${ran}s ===" >> "$LOG"
-  case $rc in 0 | 130 | 143) exit "$rc" ;; esac   # stopped on purpose
+  # Only a signal aimed at the SUPERVISOR means stop; the trap sets that flag before it
+  # ever reaches here. Reading it off the child's rc instead treats every externally
+  # killed server as deliberate -- a plain `kill -TERM <server pid>`, or the OOM killer,
+  # exits 143 and the supervisor walked away from exactly the case it exists for
+  # (measured: restarting the server to pick up new code left nothing listening).
+  if [ -n "$stopping" ] || [ "$rc" = 0 ]; then exit "$rc"; fi
   [ "$ran" -lt 60 ] && sleep 30                   # a load takes ~40s; faster means it never served
 done
 echo "=== gave up after $MAX_RESTARTS restarts ===" >> "$LOG"
