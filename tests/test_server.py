@@ -784,6 +784,46 @@ def test_max_tokens_is_clamped_not_refused(client, tmp_path, monkeypatch):
     assert r.json()["stop_reason"] in ("end_turn", "max_tokens", "tool_use")
 
 
+def test_the_clamp_survives_the_data_parallel_wrapper(tmp_path, monkeypatch):
+    """Same engine, same limits, wrapped and unwrapped — the answers must agree.
+
+    `messages.py` clamps max_tokens against `engine.limits.max_total_tokens` through
+    `getattr(engine, "limits", None)`. DataParallelEngine had no `limits`, so the
+    default 0 fired, the clamp went dead and the request went to the engine at its
+    asked-for 32000. Measured before the fix, one engine and one request:
+    plain Engine 200, DataParallelEngine 400 "request (32060 tokens) exceeds
+    max_total_tokens (512)" — `serve --devices` 400-ed every Claude Code turn.
+
+    Both arms, not just the wrapped one: a fix that broke the clamp everywhere would
+    make a one-arm test pass by making both 400.
+    """
+    import torch
+
+    from tilerl.parallel import DataParallelEngine
+
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "dp.jsonl"))
+    body = {"model": "tiny", "max_tokens": 32000,
+            "messages": [{"role": "user", "content": "hi"}]}
+    codes = {}
+    for arm in ("plain", "wrapped"):
+        e = _build_engine(seed=41)
+        engine = e if arm == "plain" else DataParallelEngine([e], [torch.device("cpu")])
+        e.run()
+        try:
+            with TestClient(create_app(engine, _ByteTokenizer(), model_name="tiny"),
+                            raise_server_exceptions=False) as c:
+                codes[arm] = c.post("/v1/messages", json=body).status_code
+        finally:
+            e.shutdown()
+    assert codes["plain"] == codes["wrapped"], (
+        f"the wrapper changed the answer: plain {codes['plain']}, wrapped "
+        f"{codes['wrapped']} — an engine attribute the shim reads is missing from "
+        f"DataParallelEngine, the shape of the `peek` gap")
+    assert codes["plain"] == 200, (
+        f"a clamped max_tokens must not 400: got {codes['plain']} on both arms, so "
+        f"the clamp is broken for every caller rather than only under --devices")
+
+
 def test_image_blocks_are_refused_not_dropped(client, tmp_path, monkeypatch):
     """A text-only model must say so rather than answer a turn missing its subject."""
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "i.jsonl"))
