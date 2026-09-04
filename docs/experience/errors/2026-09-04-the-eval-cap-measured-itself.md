@@ -135,6 +135,53 @@ appears to make.
 - Re-run before/after in one uncapped configuration (8192 cap, thinking on), so
   the control measures the model.
 
+## The honest baseline, and what it costs the experiment
+
+Measured 2026-09-04 by the re-run's own before-arm, uncapped, thinking on, n=500:
+
+```
+gsm8k greedy 448/500 = 89.6%
+```
+
+Not 82.5% (n=40) and not 84.5% (n=200). **`gsm8k_test.jsonl` is ordered**: the
+first 200 rows score 169/200 = 84.5% and rows 200-499 score 279/300 = 93.0%,
+z = 3.05, p = 0.0023. 169 + 279 = 448 exactly, so the two probes and the full run
+are arithmetically one measurement -- which is what rules out a protocol
+difference and leaves ordering as the explanation. Any prefix slice of that file
+is biased low, including my own n=200 probe, by 5 points.
+
+The consequence is the finding. **Headroom above 89.6% is 10.4 points**, and the
+unverified 94.2% is +4.6 over it. A higher baseline leaves less room for any
+measurable gain, so a good baseline makes the experiment harder, not easier.
+
+### Threshold correction, recorded before the after-arm landed
+
+The rule below was first registered at **6.20 points**, computed against an
+assumed 82.5% base. With the base measured at 89.6% the correct figure is
+**4.79 points**: binomial variance falls near the ceiling, so the resolvable gap
+shrinks. Registered at n=500/arm, 80% power, alpha 0.05 two-sided:
+
+| base | resolves |
+|---|---|
+| 82.5% (assumed, n=40) | 6.20 pts |
+| 84.5% (assumed, n=200) | 5.85 pts |
+| **89.6% (measured, n=500)** | **4.79 pts** |
+
+This lowers the bar, so it is stated with its reason and its date. It is
+legitimate only because the power calculation always keyed off the baseline,
+which is a different quantity from the effect, and because **the after-arm had
+not run when this was written**. Both figures are kept so the change is
+auditable.
+
+For the specific +4.6 the unverified run implies: n = 548/arm for 80% power,
+734/arm for 90%. At n=500 the power to detect a true +4.6 is **76.1%** -- about
+one run in four with a genuine effect of that size reports "not significant".
+
+**What this design can and cannot do:** it distinguishes "training bought >= 4.8
+points" from "not resolvable", and nothing finer. The test set holds 500 rows;
+resolving a 4-point effect needs ~1250 per arm. Full GSM8K test is 1319 questions
+and would.
+
 ## The reading, fixed before the number
 
 Registered before the re-run reports, so the interpretation is not chosen after
@@ -149,6 +196,15 @@ points need 797, 168 and 59 per arm respectively.
   gain lands here, and separating that from zero needs n ~ 1250 per arm.
 - The uncapped before-arm is the only valid comparison partner. The 39.0%
   figure is not a baseline and no delta may be quoted against it.
+
+## The 2048 config cannot share a card
+
+Peak is **81.38 GiB of the H20's 95.22** -- a 13.8 GiB margin. Two independent
+observations of a co-tenant killing it: the run died on `Tried to allocate
+140.00 MiB` with 53.41 + 41.61 GiB resident from two processes, having completed
+the identical config at 81.38 GiB peak on an exclusive card. State it as a
+requirement, not a scheduling preference: a successful exclusive-card run is not
+evidence that it fits alongside anything.
 
 ## Rule
 
