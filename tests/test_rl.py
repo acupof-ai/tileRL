@@ -314,3 +314,32 @@ def test_the_judge_restores_gradient_without_crossing_the_bands():
     # a judge that contradicts itself across the swap must yield no order, not a guess
     flat, _ = judge_rewards(list(range(4)), [True] * 4, lambda a, b: ("A", "A"))
     assert len(set(flat)) > 1 or not group_advantages(flat, 4).any()
+
+
+def test_the_gsm8k_eval_reports_the_tokens_it_spent():
+    """Length is a result on this path, not bookkeeping.
+
+    A --judge arm's claim is that completions get SHORTER, and the eval is the only
+    measurement where the training cap is absent -- so a run could otherwise finish,
+    write gsm8k_after, and still answer nothing about length. The count comes from
+    the ids the engine emitted: re-encoding the decoded text asks a different
+    question, since decode/encode is not always a round trip.
+    """
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl.config import tiny
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.eval import gsm8k_accuracy
+    from tilerl.model import build_random
+    from tilerl.tokenizer import get_tokenizer
+
+    cfg = tiny()
+    engine = build_engine(cfg, build_random(cfg, seed=3), get_backend(), num_blocks=128,
+                          num_slots=4, max_batch=4, max_total_tokens=1024)
+    rows = [{"prompt": "What is 2+2?", "answer": "4"}, {"prompt": "What is 3+5?", "answer": "8"}]
+    c, n, ntok = gsm8k_accuracy(engine, get_tokenizer(None), rows,
+                                SamplingParams(max_new_tokens=12), concurrency=2)
+    assert (n, c <= n) == (2, True)
+    # tiny never emits EOS, so every completion runs to max_new_tokens: 2 x 12 exactly.
+    # An equality, not a bound -- a re-encode of decoded text would drift off it.
+    assert ntok == 24, f"eval token count is not the emitted ids: {ntok}"

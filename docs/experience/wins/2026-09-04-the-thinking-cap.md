@@ -96,6 +96,14 @@ Reproduction is exact: `52b8251e79bc` matches the original `a4332cbca4fa` on
 every metric — gsm8k 195/471, reward 0.705/0.94, ce 3.269, tied 0.76, mmlu
 0.752/0.750 — differing only in `peak_gib` by 0.01.
 
+**The two token columns were not reproducible from the tree when this was
+written.** `gsm8k_accuracy` returned `(correct, total)` and discarded the
+completions on decode, so 157,601 and 121,642 came from a probe script and no
+`uv run tilerl train` could produce them — the headline number of a merged entry,
+resting on something outside the repo. #70 makes it `(correct, total, tokens)`
+and records `gsm8k_before_tokens` / `gsm8k_after_tokens` in the manifest, so a
+rerun prints these two columns itself.
+
 ## Rule
 
 **A tight budget during training is a lever, not just a constraint.** Cap the

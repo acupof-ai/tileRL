@@ -24,9 +24,16 @@ def answer_match(text: str | None, answer: str) -> bool:
     return got is not None and want is not None and abs(got - want) < 1e-6
 
 
-def generate(engine: Any, tok: Any, prompts: list[str], sp: Any, concurrency: int) -> list[str]:
-    """One decoded completion per prompt; ``concurrency`` <= the engine's state slots."""
-    texts: list = [None] * len(prompts)
+def generate_ids(engine: Any, tok: Any, prompts: list[str], sp: Any,
+                 concurrency: int) -> list[list[int]]:
+    """One completion per prompt, as the ids the engine emitted.
+
+    Split out from ``generate`` because the token COUNT is a result, not
+    bookkeeping: output tokens are the serving bill, and length is the one signal
+    ``--judge`` cannot fake. Re-encoding the decoded text would answer a slightly
+    different question -- decode/encode is not always a round trip.
+    """
+    out: list = [None] * len(prompts)
     pending, todo = {}, list(enumerate(prompts))
     while pending or todo:
         while todo and len(pending) < concurrency:
@@ -34,8 +41,13 @@ def generate(engine: Any, tok: Any, prompts: list[str], sp: Any, concurrency: in
             pending[engine.submit(tok.encode(p), sp)] = i
         engine.step()
         for wid, ids in engine.poll().items():
-            texts[pending.pop(wid)] = tok.decode(ids)
-    return texts
+            out[pending.pop(wid)] = ids
+    return out
+
+
+def generate(engine: Any, tok: Any, prompts: list[str], sp: Any, concurrency: int) -> list[str]:
+    """One decoded completion per prompt; ``concurrency`` <= the engine's state slots."""
+    return [tok.decode(ids) for ids in generate_ids(engine, tok, prompts, sp, concurrency)]
 
 
 def mmlu_questions(n: int, seed: int = 0) -> tuple[list[str], list[str], list[str]]:
@@ -89,13 +101,20 @@ def mmlu_accuracy(engine: Any, tok: Any, n: int, seed: int = 0,
 
 
 def gsm8k_accuracy(engine: Any, tok: Any, rows: list[dict], sampling: Any,
-                   concurrency: int = 8, thinking: bool | None = None) -> tuple[int, int]:
-    """(correct, total) on ``rows`` ({prompt, answer}), greedy under the
-    training's own ``sampling`` (stop ids, length, no-think template)."""
+                   concurrency: int = 8, thinking: bool | None = None) -> tuple[int, int, int]:
+    """(correct, total, completion tokens) on ``rows`` ({prompt, answer}), greedy
+    under the training's own ``sampling`` (stop ids, length, no-think template).
+
+    The token total is here because it is the only place the cap is absent: a
+    training-step length says what the rollouts did under the training config, and
+    this says what the policy became. Length claims about a trained policy have to
+    be scored here, not on the rollouts."""
     from dataclasses import replace
 
     from .prompt import render_chat
 
     prompts = [render_chat([("user", r["prompt"])], thinking) for r in rows]
-    texts = generate(engine, tok, prompts, replace(sampling, temperature=0.0), concurrency)
-    return sum(answer_match(t, r["answer"]) for t, r in zip(texts, rows)), len(rows)
+    ids = generate_ids(engine, tok, prompts, replace(sampling, temperature=0.0), concurrency)
+    texts = [tok.decode(i) for i in ids]
+    correct = sum(answer_match(t, r["answer"]) for t, r in zip(texts, rows))
+    return correct, len(rows), sum(len(i) for i in ids)
