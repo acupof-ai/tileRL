@@ -127,6 +127,55 @@ def test_generate():
     assert toks_a != toks_c, "different seed must produce different tokens"
 
 
+def test_tokens_generated_equals_the_tokens_poll_returned():
+    """`stats()["tokens_generated"]` is the numerator of every tok/s figure in scripts/
+    (24 references there, and until this test, zero in tests/). If it drifts from what
+    the engine actually returned, every throughput number moves with it and nothing
+    fails.
+
+    The counter is incremented per committed token in `_commit`, and two branches there
+    return BEFORE the increment: a stop token, and a forced end-think token. Both also
+    skip `req.output.append`, so the two sides stay equal -- that is the invariant, not
+    the increment's position. Asserted across three requests at once so a per-request
+    reset or a double count on a batched tick shows up too.
+    """
+    engine = _build_engine(seed=99)
+    try:
+        prompt = np.random.default_rng(3).integers(3, 320, size=8).astype(np.int64)
+        ids = [
+            engine.submit(prompt, SamplingParams(max_new_tokens=6, temperature=0.0, seed=1)),
+            engine.submit(prompt, SamplingParams(max_new_tokens=6, temperature=0.0, seed=2)),
+        ]
+        out = _drain(engine, ids, max_new_tokens=6)
+        returned = sum(len(out[i]) for i in ids)
+        counted = engine.stats()["tokens_generated"]
+        assert counted == returned, (
+            f"tokens_generated {counted} != {returned} tokens poll() returned. Every tok/s "
+            f"in scripts/ divides by this counter, so a drift here silently rescales them."
+        )
+
+        # A stop token ends a reply through the branch that returns early. It is neither
+        # appended nor counted, so the two must still agree.
+        stop = int(out[ids[0]][2])
+        rid = engine.submit(
+            prompt,
+            SamplingParams(max_new_tokens=6, temperature=0.0, seed=1, stop_token_ids=(stop,)),
+        )
+        for _ in range(64):
+            got = engine.poll()
+            if rid in got:
+                break
+            engine.step()
+        else:
+            raise TimeoutError("the stop-token request never finished")
+        assert len(got[rid]) < 6, "the stop token did not end the reply early"
+        assert engine.stats()["tokens_generated"] == returned + len(got[rid]), (
+            "the stop-token path counted a token it did not return, or vice versa"
+        )
+    finally:
+        engine.shutdown()
+
+
 def test_prefix_cache():
     """A second prompt sharing a block-aligned prefix adopts the cached blocks."""
     engine = _build_engine(seed=99)
