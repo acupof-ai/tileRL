@@ -18,6 +18,15 @@ and wins B=8 decode; both its arms run a dequantized bf16 checkpoint that emits
 garbage, which is why their MMLU column is empty. Speculation is a B=1 lever only —
 at B=8 it lands at 0.928x.
 
+**The same checkpoint also runs on a V100** — sm70, no bf16, no fp8 hardware path, two
+generations before NVFP4 existed. 43.2 tok/s wall over the network, 22 GiB. It is not
+the perf target; it is the evidence that the kernels are not bound to one arch.
+
+```
+curl http://10.37.2.27:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen38-27b","messages":[{"role":"user","content":"hi"}]}'
+```
+
 ## One runtime, not two
 
 GRPO and self-teacher distillation roll out through the same engine and the same
@@ -38,7 +47,16 @@ policy finds the shorter path to the same answer.
 It transfers to tasks the adapter never saw — tokens fall 22.0% on MMLU, 18.9% on
 ARC-Easy, 22.9% on PIQA, with no measurable accuracy change at n=100. Output tokens
 are the serving bill, so this is a win in the units the product is sold in.
+
+The control says why it worked, and it was not the reason we wrote down first. Retrain
+at 2048 and the cap's effect vanishes — not because brevity pressure is gone, but
+because **the policy now solves 96.6% of training prompts and 88.7% of GRPO steps
+carry no gradient at all.** The tight cap was holding the task hard enough to keep
+groups mixed. A binary reward against a strong policy is the real constraint; the cap
+was hiding it.
+
 [The result](docs/experience/wins/2026-09-04-the-thinking-cap.md) ·
+[the control that reinterpreted it](docs/experience/wins/2026-09-04-the-cap-was-the-gradient.md) ·
 [why the first number was wrong](docs/experience/errors/2026-09-04-the-eval-cap-measured-itself.md)
 
 ## Quickstart
