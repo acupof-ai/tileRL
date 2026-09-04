@@ -11,10 +11,18 @@ must keep and fails only when that property breaks.
 
 Two of them are about the inline JS rather than the CSS. `addThinking` shipped
 called-but-never-defined and no gate could see it: the whole suite asserts on
-SSE bytes, and `_CHAT_UI` is 21 KB of JavaScript that Python only measures the
+SSE bytes, and `_CHAT_UI` is a single Python string that Python only measures the
 length of. `node --check` does NOT close this -- verified: it reports SYNTAX_OK
 on `function a(){ return undefinedFn(1); }`, because an undefined call is a
 runtime error. The resolver below needs no JS runtime and so always runs in CI.
+
+Which bounds what these eight tests see, so state it in measured bytes rather than
+call the page "21 KB of JavaScript": of 19.6 KB, only **6.8 KB is script**. The
+other **12.9 KB is CSS and markup** -- a 1.91:1 split -- and the resolver never
+parses it. Measured by mutating the real source: a dangling *call* is caught, a
+dangling *route* (a string literal) is not, a dangling *button* (markup) is not,
+and the CSS gates catch a spacing regression but nothing about behaviour. Sizes
+drift with every edit to the page; the split is the part worth keeping.
 
 # ponytail: undefined calls only, stub-DOM execution when the page grows
 """
