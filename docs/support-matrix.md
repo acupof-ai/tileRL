@@ -6,24 +6,45 @@ source of truth and this file mirrors it.
 
 ## What "one kernel source" means
 
-Three targets have executed the source: **cpu**, **metal**, **sm90**.
-`_REGISTRY` holds 8 keys but 3 distinct kernel sets. ROCm has no cell: it was
-an alias of the CPU set that never ran, removed until a HIP host runs the suite.
+Four targets have executed the source: **cpu**, **metal**, **sm90**, **sm70**.
+`_REGISTRY` holds 10 keys but 4 distinct kernel sets (each arch is registered
+under both `bf16` and `fp4`, since fp4 is a weight format, not a compute dtype).
+sm100/sm120 are the two empty pending-remote slots. ROCm has no cell: it was an
+alias of the CPU set that never ran, removed until a HIP host runs the suite.
 
-Line partition of `kernels*.py` (1,969 lines, by top-level function span):
+Cell sizes, counted off the imported module rather than the source text — a name
+two cells share is only an override when the maker differs:
 
-| lines | % | scope |
-| ---: | ---: | --- |
-| 1,406 | 71.4% | **sm90-only** — `kernels_attn.py`, `kernels_gdn.py`, `kernels_linear.py`, `kernels_mma.py`, four whole files reached only from `_SM90_KERNELS` |
-| 175 | 8.9% | shared and executed on all three targets — `rmsnorm` x4, `silu_mul`, `softmax`, `rope`, `embedding` |
-| 144 | 7.3% | `kernels.py` header: docstring, imports, `_pass_configs` |
-| 105 | 5.3% | cpu + metal, overridden on sm90 — `linear_fp4`, `paged_attention` |
-| 81 | 4.1% | cpu only — the three `T.gemm` gemms (metal and sm90 both override) |
-| 58 | 2.9% | metal only — the three naive FMA gemms |
+| cell | entries | overrides cpu | added | same maker as cpu |
+| --- | ---: | ---: | ---: | ---: |
+| cpu | 15 | — | — | — |
+| metal | 15 | 3 (`gemm_nn/nt/tn`) | 0 | 12 |
+| sm90 | 41 | 9 | 26 | 6 |
+| sm70 | 23 | 1 (`silu_mul`) | 8 | 14 |
 
-8 of `kernels.py`'s 16 makers execute on sm90. The cpu cell has 13 entries,
-metal 13 (3 overridden), sm90 23 (5 overridden, 10 added) — so sm90 shares
-exactly the 8 makers above with CPU and nothing else.
+**sm70 reuses the CPU source more than any other accelerated cell**: 14 of its
+23 entries are the same maker object CPU runs, and only `silu_mul` is replaced.
+Its 8 additions are the sm70-specific decode path — `linear_fp4_gemv`,
+`linear_fp4_gemv_sm70_m`, `paged_attention_split`,
+`paged_attention_split_combine`, `gdn_chunk_fused`, `gdn_decode_fused`,
+`rmsnorm_apply_narrow`, `write_tokens`.
+
+Line partition of `kernels*.py` (**4,037** lines: `kernels_linear.py` 1750,
+`kernels_gdn.py` 929, `kernels.py` 911, `kernels_attn.py` 290,
+`kernels_mma.py` 157).
+
+> The partition table that stood here apportioned **1,969** lines, 2.05x under the
+> real count, and every share in it was derived from that figure — including the
+> "1,406 lines / 71.4% sm90-only" line that has been quoted as the cost of
+> supporting a second arch. It is withdrawn rather than rescaled: the shares were
+> assigned by eye to whole files, and `kernels_linear.py` alone now holds both the
+> sm90 WGMMA schedules and the sm70 GEMV ladder, so a per-file split cannot
+> attribute it. Re-deriving it needs a per-function span walk keyed on which
+> `_register` set reaches each maker.
+
+`kernels.py` defines 25 `make_*` functions. cpu and metal reach 15 each, sm70
+reaches 16, sm90 reaches 10 — sm90 is the cell that replaces the most of the
+shared source, not the one that shares the most.
 
 ## Dispatch model
 
@@ -31,11 +52,19 @@ Kernels are registered in a `(precision, arch) -> kernel set` dict. Resolution
 walks the fallback chain `exact -> (precision, "any") -> ("any", "any")`; a
 registered-but-empty set raises `NotImplementedError` (pending-remote bring-up).
 Adding fp8 or a new SM arch is ONE `_register()` call. Arch tags: `cpu`
-(target `"c"`), `sm90`/`sm100`/`sm120` (CUDA capability), `metal`.
+(target `"c"`), `sm70`/`sm90`/`sm100`/`sm120` (CUDA capability), `metal`.
 
-`Backend.precision` is the constant `"bf16"` (`ops/backend.py:130`), so every
-row below resolves through its arch's bf16 cell. The fp4 and fp8 tables are
-weight-format tables, not separate registry cells.
+`Backend.precision` is the constant `"bf16"`
+(`packages/tilerl-kernels/src/tilerl_kernels/backend.py:188`), so every row below
+resolves through its arch's bf16 cell. The fp4 and fp8 tables are weight-format
+tables, not separate registry cells.
+
+**`precision` is not the tensor dtype.** It is the registry key; the dtype
+kernels actually see is `Backend.io` (`backend.py:206`), which is `float32` for
+cpu, metal and **sm70**, and `bfloat16` only for sm90 and later. Volta's MMA has
+no bf16 path, and its kernels are written against the CPU cell's f32 parity
+target, so feeding sm70 bf16 silently hands those kernels the wrong dtype. Two
+cells resolve through the same `"bf16"` key and run different dtypes.
 
 All CPU kernels are f32 compute with bf16 cast at the boundary (tilelang eager
 JIT does not specialize on dtype). `linear_fp4` dequantizes on the fly.
@@ -49,29 +78,42 @@ is no per-call fallback (see below).
 
 ## bf16
 
-| Op | cpu | sm90 | sm100 | metal |
-| --- | --- | --- | --- | --- |
-| rmsnorm (fwd/bwd) | done | done | pending-remote | done |
-| linear (fwd/bwd) | done | done | pending-remote | done |
-| rope (fwd/bwd) | done | done | pending-remote | done |
-| attention (dense, fwd/bwd) | done | done | pending-remote | done |
-| paged_attention (fwd) | done | done | pending-remote | done |
-| gdn_forward (full GDN layer) | done | done | pending-remote | done |
-| gdn_backward | done | done | pending-remote | done |
-| silu_mul (fwd/bwd) | done | done | pending-remote | done |
-| softmax | done | done | pending-remote | done |
-| embedding (fwd/bwd) | done | done | pending-remote | done |
-| sample | done | done | pending-remote | done |
-| add | done | done | pending-remote | done |
+sm70 is the served arch (27B NVFP4 on a V100), so its **fwd** column is
+evidenced end to end; **bwd** on sm70 has never been run and is marked
+accordingly rather than inferred from the registry. A cell with no sm70 entry
+resolves through the fallback chain to the CPU maker, which is how sm70 runs 14
+of its 23 entries — reached, not reimplemented.
+
+| Op | cpu | sm70 | sm90 | sm100 | metal |
+| --- | --- | --- | --- | --- | --- |
+| rmsnorm (fwd/bwd) | done | fwd done, bwd untested | done | pending-remote | done |
+| linear (fwd/bwd) | done | fwd done, bwd untested | done | pending-remote | done |
+| rope (fwd/bwd) | done | fwd done, bwd untested | done | pending-remote | done |
+| attention (dense, fwd/bwd) | done | via cpu maker, untested | done | pending-remote | done |
+| paged_attention (fwd) | done | done (split-KV) | done | pending-remote | done |
+| gdn_forward (full GDN layer) | done | done (fused) | done | pending-remote | done |
+| gdn_backward | done | untested | done | pending-remote | done |
+| silu_mul (fwd/bwd) | done | fwd done, bwd untested | done | pending-remote | done |
+| softmax | done | done | done | pending-remote | done |
+| embedding (fwd/bwd) | done | fwd done, bwd untested | done | pending-remote | done |
+| sample | done | via cpu maker | done | pending-remote | done |
+| add | done | via cpu maker | done | pending-remote | done |
 
 ## fp4 (OCP e2m1 weight format)
 
-| Op | cpu | sm90 | sm100 | metal |
-| --- | --- | --- | --- | --- |
-| pack_fp4 / unpack_fp4 | done | done | pending-remote | done |
-| linear_fp4 (fwd) | done | done | pending-remote | done |
-| linear_fp4_gemv (M=1) | — | done | pending-remote | — |
-| linear_fp4_fp8 (w4a8, M>1) | — | done | pending-remote | — |
+| Op | cpu | sm70 | sm90 | sm100 | metal |
+| --- | --- | --- | --- | --- | --- |
+| pack_fp4 / unpack_fp4 | done | via cpu maker | done | pending-remote | done |
+| linear_fp4 (fwd) | done | done | done | pending-remote | done |
+| linear_fp4_gemv (M=1) | — | done | done | pending-remote | — |
+| linear_fp4_gemv_sm70_m (M ladder) | — | done | — | pending-remote | — |
+| linear_fp4_fp8 (w4a8, M>1) | — | — | done | pending-remote | — |
+
+The sm70 M-ladder kernel is the one entry with no counterpart on any other arch:
+`make_linear_fp4_mma8` covers the same M<=8 range on sm90 but issues
+`mma.m16n8k16`, which is Ampere-and-later, so Volta reaches small-M through a
+rung ladder instead
+(`wins/2026-09-04-the-rung-step-is-93-percent-gemv.md`).
 
 No cell needs a packed-weight backward kernel: training runs
 `backend.linear(x, master)` on the bf16 master and its ordinary `linear_bwd`
@@ -81,16 +123,20 @@ The rest of the layer (attention, norms, activations) runs the bf16 path.
 
 ## fp8 (e4m3 weight format)
 
-| Op | cpu | sm90 | sm100 | metal |
-| --- | --- | --- | --- | --- |
-| linear_fp8 (native WGMMA, M>1) | bf16 at load | done | pending-remote | bf16 at load |
-| linear_fp8_gemv (M=1) | bf16 at load | done | pending-remote | bf16 at load |
-| quant_fp8 (per-token e4m3 activation) | — | done | pending-remote | — |
+| Op | cpu | sm70 | sm90 | sm100 | metal |
+| --- | --- | --- | --- | --- | --- |
+| linear_fp8 (native WGMMA, M>1) | dense at load | dense at load | done | pending-remote | dense at load |
+| linear_fp8_gemv (M=1) | dense at load | dense at load | done | pending-remote | dense at load |
+| quant_fp8 (per-token e4m3 activation) | — | — | done | pending-remote | — |
 
 There is no `_register("fp8", ...)` cell: fp8 is a weight format inside the
-bf16/fp4 cells, exactly like fp4. **bf16 at load** means `Backend.materialize`
-rebuilds one bf16 weight from `.w8/.wscale/.oscale` when the cell has no fp8
-kernel — once, at wiring time. `Backend.linear_fp8` raises
+bf16/fp4 cells, exactly like fp4. **dense at load** means `Backend.materialize`
+rebuilds one dense weight from `.w8/.wscale/.oscale` when the cell has no fp8
+kernel — once, at wiring time — in that backend's own `Backend.io` dtype. That
+dtype is **not bf16 everywhere**: only sm90 has bf16 tensor cores, so
+`backend.py:206` sets `io = float32` for cpu, metal **and sm70**, and bf16 only
+for sm90+. Calling this row "bf16 at load" was wrong for three of the five cells.
+`Backend.linear_fp8` raises
 `NotImplementedError` naming the cell if it is ever reached without that
 conversion; it never falls back to a master weight per call.
 
@@ -176,5 +222,12 @@ with neither (fused projections, native-fp8 serving) still raise.
   is not where kernel outputs land). The 2-layer Qwen3.6-27B NVFP4 slice
   forwards and trains with CPU/CUDA logits matching to 6 decimals
   (`docs/experience/wins/2026-08-24-sm90-real-slice.md`).
+- **sm70/bf16 + fp4**: the served path, not a test-suite row. `TILERL_TARGET=cuda
+  uv run pytest` has never been run on the V100; what is evidenced is the 27B
+  NVFP4 checkpoint serving end to end — `docs/serve-v100.md`, measured 2026-09-05
+  at **50.3 tok/s decode-only / 46.3 wall, ttft 324 ms**, ctx 4096, B=1, 22 GiB.
+  So `fwd` above means "this op runs inside a served token" and `bwd` means
+  nothing has exercised it. `Backend.io` is **f32** here, not bf16 (see Dispatch
+  model); building the kernels needs cuda-12.4's nvcc.
 - **sm100/sm120**: registered as empty sets, `NotImplementedError` on use;
   bring-up pending-remote.
