@@ -1,7 +1,8 @@
 """Attribute a spec tick's CUDA kernels to REGIONS, by wrapping the model's own
 methods in `record_function` and reading the profiler's parent range.
 
-Differencing configurations (prof_elementwise_diff.py) said one draft forward adds
+Differencing configurations (errors/2026-09-02-differencing-attributed-the-trunk-to-the-draft.md)
+said one draft forward adds
 955 torch elementwise launches while each further depth step adds 29 -- a 33x
 first-vs-later ratio where tilelang scales 4.6x. That is not something one
 1-layer draft forward can do, so the difference was attributing more than the

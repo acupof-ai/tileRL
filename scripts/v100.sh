@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sync this checkout to the V100 (sm70) host and run a command there.
-#   scripts/v100.sh 'python3 scripts/ab_gemv_xh.py'          # sync, run, wait
+#   scripts/v100.sh 'python3 scripts/ab_gemv_xh_m32.py'      # sync, run, wait
 #   scripts/v100.sh run <name> 'command'                     # sync, detach, poll
 #
 # /usr/bin/ssh, not ssh: the local shell wraps ssh in a function that is not
