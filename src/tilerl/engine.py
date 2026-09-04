@@ -480,12 +480,20 @@ class Engine:
                 self._prefix_misses += 1
 
             total_blocks = (len(tokens) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
-            blocks = list(hit_blocks)
-            slot = None
+            # The slot first, and `blocks` empty: the unwind frees what this request
+            # incremented, and nothing is incremented until retain() runs. Seeding it
+            # with hit_blocks made an alloc_slot() failure decrement refcounts the
+            # PrefixStore still holds -- free_block cannot tell that from a release.
+            slot = self._states.alloc_slot()
+            blocks: list[int] = []
             try:
-                slot = self._states.alloc_slot()
-                for b in blocks:
+                # Releasing all of `blocks` on the way out is safe because retain
+                # cannot fail here: it raises only at refcount 0, and hit_blocks
+                # came from _match_prefix under the same lock. Everything after
+                # this loop CAN raise, and by then every entry is retained.
+                for b in hit_blocks:
                     self._kv.retain(b)  # adopt the store's blocks
+                    blocks.append(b)
                 needed = total_blocks - len(blocks)
                 self._prefix.evict_until_free(needed)
                 if self._kv.free_blocks < needed:
@@ -495,8 +503,7 @@ class Engine:
             except Exception:
                 for b in blocks:
                     self._kv.free_block(b)
-                if slot is not None:
-                    self._states.free_slot(slot)
+                self._states.free_slot(slot)
                 raise
             own_blocks = total_blocks - matched // BLOCK_TOKENS
             self._blocks_used += own_blocks

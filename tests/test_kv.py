@@ -339,3 +339,43 @@ def test_a_block_costs_2125_kib_at_the_27b_shape():
         f"a block is {per_block / 2**20:.4f} MiB; bench_ctx_decode.py sizes and prints its "
         f"pool at 2.125 MiB/block, so both that number and its comment are now wrong"
     )
+
+
+def test_a_rejected_submit_does_not_release_the_prefix_stores_blocks():
+    """The unwind must free what this request incremented, not what it hoped to adopt.
+
+    submit() seeded its block list from the prefix hit before retaining any of it,
+    so an alloc_slot() failure -- an engine at slot capacity, which is ordinary --
+    ran the handler over blocks it never retained. free_block decrements without
+    ownership tracking, so those decrements are indistinguishable from releases:
+    the store's refcount falls, the block reaches the free list while the store
+    still lists it, and a later request is handed a page holding someone else's KV.
+
+    The hit needs a LONGER prompt sharing the prefix: _match_prefix treats
+    matched >= len(tokens) as a miss, so resubmitting the same tokens never hits.
+    """
+    from tilerl.cli import _build_model
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.testing import RefBackend
+
+    cfg, model = _build_model("tiny", seed=0)
+    engine = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=2,
+                          max_batch=2)
+    base = list(range(1, 49))
+    rid = engine.submit(base, SamplingParams(max_new_tokens=2, seed=0))
+    for _ in range(40):
+        if rid in engine.poll():
+            break
+        engine.step()
+
+    longer = base + list(range(100, 116))
+    for _ in range(2):  # fill the slots, and hit the prefix while doing it
+        engine.submit(longer, SamplingParams(max_new_tokens=8, seed=0))
+    assert engine.stats()["prefix_hits"] >= 1, "no prefix hit; the test is inert"
+
+    before = {b: n for b, n in enumerate(engine._kv.refcount) if n > 0}
+    with pytest.raises(RuntimeError):
+        engine.submit(longer, SamplingParams(max_new_tokens=1, seed=0))
+    after = {b: engine._kv.refcount[b] for b in before}
+    assert after == before, f"the rejected submit released blocks: {before} -> {after}"
+
