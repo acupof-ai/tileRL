@@ -246,9 +246,14 @@ def _train_adapters(args: argparse.Namespace) -> None:
     # unreachable however the recipe was written. Size the pool from the ask instead.
     from .kv_cache import BLOCK_TOKENS
 
-    ctx = max(map(len, prompts)) + args.max_new_tokens + 64
+    # 1024 floor = the old flat 512 blocks. evals submit prompts this function never
+    # sees -- MMLU reaches 515 tokens against GSM8K's 183 -- so a short
+    # --max-new-tokens must not shrink the pool under them. max_total_tokens only
+    # guards one request and costs no memory, so it never drops below the 8192 default.
+    ctx = max(max(map(len, prompts)) + args.max_new_tokens + 64, 1024)
     engine = build_engine(cfg, model, backend, num_slots=8, max_batch=8, draft=draft,
-                          num_blocks=-(-ctx // BLOCK_TOKENS) * 8 + 8, max_total_tokens=ctx,
+                          num_blocks=-(-ctx // BLOCK_TOKENS) * 8 + 8,
+                          max_total_tokens=max(ctx, 8192),
                           spec_depth=args.depth, decode_graph=False,
                           prefix_store=NoPrefixStore())
     # After build_engine: it materializes the params an adapter must point at.

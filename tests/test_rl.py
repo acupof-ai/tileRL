@@ -247,6 +247,12 @@ def test_the_train_pool_holds_what_max_new_tokens_asks_for(tmp_path, monkeypatch
     per_slot = seen["num_blocks"] * BLOCK_TOKENS / seen["num_slots"]
     assert per_slot >= want, f"{per_slot:.0f} tokens per slot cannot hold {want}"
     assert seen["max_total_tokens"] >= want
+    # Sizing from the training prompts alone once shrank both under the evals, which
+    # submit prompts this path never sees: MMLU reached 515 tokens against GSM8K's
+    # 183 and mmlu_score died on "request (515 tokens) exceeds max_total_tokens
+    # (503)". Neither may fall under what build_engine would have given by default.
+    assert seen["max_total_tokens"] >= 8192, seen["max_total_tokens"]
+    assert per_slot >= 1024, f"{per_slot:.0f} tokens per slot is under the old flat pool"
 
 
 def test_the_run_saves_the_adapter_that_produced_its_metrics(tmp_path, monkeypatch):
