@@ -34,6 +34,7 @@ import re
 import shutil
 import subprocess
 import textwrap
+from html.parser import HTMLParser
 
 import pytest
 from fastapi.testclient import TestClient
@@ -434,15 +435,22 @@ def test_no_markdown_input_can_add_an_attribute_to_the_output():
 
     `mdEscape` escaped `&`, `<`, `>` and no quotes, while two rules interpolate its
     result into an HTML ATTRIBUTE -- `href="..."` in the link rule and `data-lang="..."`
-    on a fence. So a quote in a URL or a fence language closed the attribute and the
-    rest of the token became markup. Executed against the real renderer, both produced
-    live event handlers.
+    on a fence. So a `"` closed the attribute and the rest of the token became markup:
+    `[x](https://a"onmouseover="alert(1))` produced a live handler.
 
-    Asserts on the attribute NAMES in the output, not on substrings. A substring search
-    cannot tell an attribute from text -- `&quot;onmouseover=&quot;` contains the handler
-    name and is inert -- and that difference is exactly what the fix creates. It is also
-    what caught the half the first fix missed: escaping only `"` left the single-quote
-    variant parsing as a real `onmouseover` attribute.
+    Asserts on the attribute NAMES a real parser finds, not on substrings and not on a
+    regex. Both weaker checks give wrong answers here, in opposite directions:
+
+    * A substring search cannot tell an attribute from text. After the fix the output
+      contains the inert literal `&quot;onmouseover=&quot;`, which matches.
+    * A regex over tag interiors invents attributes. `[\\s"']([a-zA-Z-]+)\\s*=` treats
+      `'` as an attribute separator, so inside the double-quoted value
+      `href="https://a'onmouseover='b"` it reports an `onmouseover` attribute that is
+      not there. Measured: the regex says [href, onmouseover, target, rel];
+      `html.parser` says [href, target, rel]. Every attribute this template writes is
+      double-quoted, so a `'` in a URL is an ordinary character -- the single-quote
+      variant was never a breakout, and the regex version of this gate reported a
+      kill for a mutation that reintroduces no bug.
 
     The allow-list is closed rather than a deny-list of `on*`: `style`, `srcdoc` and
     `formaction` are all reachable without an event handler name.
@@ -477,27 +485,31 @@ def test_no_markdown_input_can_add_an_attribute_to_the_output():
         'it\'s a "test"',
     ]
     harness = _MD_JS + "\nconst C = " + json.dumps(attacks) + ";\n" + textwrap.dedent("""
-        const out = [];
-        for (const s of C) {
-          const html = mdRender(s);
-          const attrs = new Set();
-          // Tag interiors only, so attribute-looking text in the body is not counted.
-          for (const tag of html.match(/<[a-z][^>]*>/g) || [])
-            for (const m of tag.matchAll(/[\\s"']([a-zA-Z-]+)\\s*=/g)) attrs.add(m[1]);
-          out.push([s, [...attrs], html]);
-        }
-        console.log(JSON.stringify(out));
+        console.log(JSON.stringify(C.map((s) => [s, mdRender(s)])));
     """)
     r = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, f"the renderer threw: {r.stderr.strip()[:400]}"
     rows = json.loads(r.stdout.strip().splitlines()[-1])
-    for src, attrs, html in rows:
-        extra = sorted(set(attrs) - allowed)
+
+    class _Attrs(HTMLParser):
+        """Attribute names per start tag, from the parser the browser's rules match."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.names: set[str] = set()
+
+        def handle_starttag(self, tag, attrs):
+            self.names |= {k for k, _ in attrs}
+
+    for src, html in rows:
+        p = _Attrs()
+        p.feed(html)
+        extra = sorted(p.names - allowed)
         assert not extra, (
             f"input {src!r} put {extra} into the markup, which innerHTML will honour:\n  {html}"
         )
     # The benign rows must still render, or an over-eager escape passes this vacuously.
-    by_src = {src: html for src, _, html in rows}
+    by_src = dict(rows)
     assert 'href="https://e.com/a?b=1&amp;c=2"' in by_src['[ok](https://e.com/a?b=1&c=2)']
     assert 'data-lang="py"' in by_src['```py\nprint(1)\n```']
 
