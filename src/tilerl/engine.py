@@ -100,6 +100,23 @@ def _quantize_draft(params: dict[str, torch.Tensor], skip: tuple[str, ...] = (),
     return out
 
 
+def _serve_draft(draft: Any, backend: Any) -> None:
+    """Quantize and materialize a draft head's weights into its own params dict.
+
+    Called from `build_engine` (before anything reads free memory) and again from
+    `Engine.__init__` for a direct caller. One function rather than two copies
+    because `fp4=not has_kernel("linear_fp8")` is the arch policy: a second copy
+    is a second thing to keep in step, and `_quantize_draft` is idempotent so the
+    common path just pays a dict copy.
+    """
+    served = backend.materialize(
+        _quantize_draft(draft.params, skip=draft.no_quant,
+                        fp4=not backend.has_kernel("linear_fp8"))
+    )
+    draft.params.clear()  # in place: the head's Model holds THIS dict
+    draft.params.update(served)
+
+
 def _step_seed(seed: int, generated: int) -> int:
     # Full-width hashes: a shift-then-mask collapsed seeds 1/2049/16385 to one stream.
     return ((int(seed) * 2_654_435_761) ^ (generated * 2_246_822_519)) & _HASH_MASK
@@ -373,14 +390,8 @@ class Engine:
                 )
             # The draft's weights are served in `build_engine`, BEFORE the KV fit reads
             # free memory -- see the comment there. A direct `Engine(...)` caller that
-            # passes an unquantized draft still gets one here; `_quantize_draft` returns
-            # its input unchanged once packed, so the common path pays a dict copy.
-            served = backend.materialize(
-                _quantize_draft(draft.params, skip=draft.no_quant,
-                                fp4=not backend.has_kernel("linear_fp8"))
-            )
-            draft.params.clear()  # in place: the head's Model holds THIS dict
-            draft.params.update(served)
+            # passes an unquantized draft still gets one here.
+            _serve_draft(draft, backend)
             if backend.arch == "sm70":
                 self._warn_sm70_ladder(limits.max_batch, self._width)
             draft.attach(backend, kv_pool.num_blocks, dtype=kv_pool.k_pool.dtype)
@@ -1183,12 +1194,7 @@ def build_engine(
     # (measured at serve's default --slots 16 on a 32 GB V100). Same ordering fix the
     # state pool below already uses: allocate, then MEASURE what is left.
     if draft is not None:
-        served = backend.materialize(
-            _quantize_draft(draft.params, skip=draft.no_quant,
-                            fp4=not backend.has_kernel("linear_fp8"))
-        )
-        draft.params.clear()  # in place: the head's Model holds THIS dict
-        draft.params.update(served)
+        _serve_draft(draft, backend)
     # Reclaim the allocator's load-time reserve before anything reads free memory.
     # Loading and quantizing 27B leaves 29.02 GiB reserved against 15.96 allocated on
     # a 31.74 GiB card, and `mem_get_info` counts all 13.06 GiB of that as USED -- so
