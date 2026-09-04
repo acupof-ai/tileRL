@@ -375,7 +375,7 @@ _LANDING = """<!doctype html>
   <div class="brand">tilerl</div>
   <div class="tag">Cross-platform train + inference for <b>Qwen3.8-27B (NVFP4)</b>, one TileLang kernel source.</div>
   <div class="sub">One kernel tree compiles for CPU, Metal, and CUDA — including <b>Volta / sm70</b>,
-    the first pre-Ampere card to run the stack. Paged KV with an SSD tier, an on-policy-distillation
+    the first pre-Ampere card to run the stack. Paged KV with a prefix cache, an on-policy-distillation
     trainer that shares the serving engine — no second stack.</div>
 
   <div class="cta">
@@ -388,7 +388,7 @@ _LANDING = """<!doctype html>
   <div class="grid">
     <div class="card"><b id="model">…</b><p id="mstat">connecting…</p></div>
     <div class="card"><b>NVFP4 W4A16</b><p>4-bit weights in HBM, dequant in-kernel, fp16/f32 compute</p></div>
-    <div class="card"><b>Paged KV + SSD tier</b><p>prefix cache spills below HBM, reload skips prefill</p></div>
+    <div class="card"><b>Paged KV + prefix cache</b><p>a repeated prefix is retained in HBM and skips prefill</p></div>
   </div>
 
   <h2>Target matrix</h2>

@@ -68,7 +68,8 @@ class ISO(_Optimizer):
             # ponytail: torch.linalg.svd at init, Newton-Schulz when it matters
             u, s, vh = torch.linalg.svd(p.to(self.frame_dtype), full_matrices=False)
             # A frame dtype that cannot hold orthonormality trains on a drifting spectrum.
-            err = float((u.T @ u - torch.eye(u.shape[1], dtype=u.dtype)).abs().max())
+            eye = torch.eye(u.shape[1], dtype=u.dtype, device=u.device)
+            err = float((u.T @ u - eye).abs().max())
             if err > 1e-3:
                 raise ValueError(f"ISO: frames in {self.frame_dtype} are not orthonormal "
                                  f"(max|UᵀU−I| = {err:.1e}); change precision.py, not this call")
