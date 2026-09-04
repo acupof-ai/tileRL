@@ -1,0 +1,88 @@
+"""Two ways to divide the same request, on the same host, in the same run.
+
+The page's number and the earlier 39-40 tok/s differ by 1.257x while acceptance moved
+1.010x, so the gap is a measurement口径, not the engine. This prints both windows per
+request so the difference is attributed rather than guessed:
+
+  decode  = tokens / (last_frame - first_frame)   what the page shows
+  wall    = tokens / (last_frame - request_sent)  prefill and queueing folded in
+
+Run on the pod: from the Mac, RTT lands inside both windows and neither number is the
+engine's.
+"""
+
+import json
+import sys
+import time
+import urllib.request
+
+URL = "http://127.0.0.1:8000/v1/chat/completions"
+BODY = {
+    "messages": [{"role": "user", "content": "Explain speculative decoding in three sentences."}],
+    "max_tokens": 200,
+    "stream": True,
+    "stream_options": {"include_usage": True},
+    "chat_template_kwargs": {"enable_thinking": True},
+    "temperature": 0.0,
+}
+
+
+def one(max_tokens=200):
+    body = dict(BODY, max_tokens=max_tokens)
+    req = urllib.request.Request(
+        URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
+    )
+    sent = time.perf_counter()
+    first = None
+    usage = None
+    frames = 0
+    with urllib.request.urlopen(req, timeout=900) as r:
+        for line in r:
+            line = line.decode().strip()
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload == "[DONE]":
+                break
+            obj = json.loads(payload)
+            # Content frames carry cumulative usage too, so the usage-ONLY chunk is the
+            # one with no choices. Keying on obj["usage"] alone skipped every content
+            # frame and the probe reported "no content frames arrived" against a server
+            # that had just sent 109 of them.
+            if obj.get("usage"):
+                usage = obj["usage"]
+            if not obj.get("choices"):
+                continue
+            if obj["choices"][0].get("delta", {}).get("content"):
+                frames += 1
+                if first is None:
+                    first = time.perf_counter()
+    end = time.perf_counter()
+    assert first is not None and usage, "no content frames arrived"
+    n = usage["completion_tokens"]
+    # The decode window opens at the FIRST frame, so tokens inside that frame were
+    # generated before it and n/(end-first) overstates the rate by c_1/n. c_1 is not
+    # visible client-side, but frames is: at frames == n the server put one token in
+    # each, c_1 == 1, and the overstatement is 1/n. Printed so the bound is read off
+    # the run instead of assumed.
+    return (first - sent) * 1000, n, frames, n / (end - first), n / (end - sent)
+
+
+if __name__ == "__main__":
+    arg = sys.argv[1] if len(sys.argv) > 1 else "3"
+    if arg == "--sweep":
+        # Decode rate is not one number: the tick grows with context (#47/#57), so a
+        # rate quoted without its length is not comparable to another one.
+        for m in (200, 400, 800, 1600):
+            _, n, frames, decode, _ = one(m)
+            print(f"max_tokens {m:5d}  got {n:5d}  frames {frames:5d}  decode {decode:.1f} tok/s")
+        raise SystemExit
+    rows = [one() for _ in range(int(arg))]
+    for i, (ttft, n, frames, decode, wall) in enumerate(rows):
+        print(
+            f"run{i}: ttft {ttft:.0f}ms  tokens {n}  frames {frames}  "
+            f"decode {decode:.1f}  wall {wall:.1f} tok/s"
+        )
+    dec = sorted(r[3] for r in rows)[len(rows) // 2]
+    wal = sorted(r[4] for r in rows)[len(rows) // 2]
+    print(f"median decode {dec:.1f}  wall {wal:.1f} tok/s  ratio {dec / wal:.3f}x")

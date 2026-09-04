@@ -29,11 +29,17 @@ drift with every edit to the page; the split is the part worth keeping.
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
+import subprocess
+import textwrap
+from html.parser import HTMLParser
 
+import pytest
 from fastapi.testclient import TestClient
 
-from tilerl.server import _CHAT_UI
+from tilerl.server import _CHAT_UI, _LANDING
 
 #: Statement keywords that a naive "identifier followed by (" also matches.
 _KEYWORDS = {
@@ -66,8 +72,16 @@ def _css() -> str:
 
 
 def _script(html: str) -> str:
+    """The FIRST inline script in `html`.
+
+    `rsplit("</script>")` took the LAST closing tag, so a page with two script blocks
+    returned everything between the first open and the final close -- measured on
+    _LANDING + _CHAT_UI, 27299 characters of markup captured as JavaScript, which the
+    resolver would then scan for bare calls. Correct today only because every caller
+    hands this one page; `split` makes it correct regardless.
+    """
     assert "<script>" in html, "the page has no inline script"
-    return html.split("<script>", 1)[1].rsplit("</script>", 1)[0]
+    return html.split("<script>", 1)[1].split("</script>", 1)[0]
 
 
 def _code_only(js: str) -> str:
@@ -103,6 +117,154 @@ def _unresolved(js: str) -> set[str]:
     return bare - _KEYWORDS - _BROWSER_GLOBALS - defined - {""}
 
 
+#: A DOM small enough to run the page's own send path. Not a browser -- it answers one
+#: question the other gates cannot: does clicking send actually reach fetch, and does
+#: the fold's summary keep the structure that makes it clickable.
+_DOM_STUB = """
+const mk = (tag) => ({
+  tagName: tag.toUpperCase(), className: "", textContent: "", innerHTML: "", children: [],
+  style: {}, dataset: {}, open: false, value: "", disabled: false, hidden: false,
+  scrollTop: 0, scrollHeight: 0,
+  classList: { add(){}, remove(){}, toggle(){} },
+  appendChild(c){ this.children.push(c); c.parentNode = this; return c; },
+  insertBefore(c){ this.children.push(c); c.parentNode = this; return c; },
+  querySelector(sel){
+    const hit = (e) => ("." + e.className) === sel ? e : e.children.map(hit).find(Boolean);
+    return hit(this) || mk("span");
+  },
+  querySelectorAll(){ return []; },
+  addEventListener(ev, fn){ (this._h ||= {})[ev] = fn; },
+  setAttribute(){}, getAttribute(){}, focus(){}, remove(){}, scrollIntoView(){},
+});
+globalThis.document = { createElement: mk, getElementById: (i) => IDS[i] ?? null,
+  querySelector: () => mk("div"), querySelectorAll: () => [],
+  addEventListener(){}, body: mk("body") };
+globalThis.window = { addEventListener(){}, location: { origin: "http://x" } };
+globalThis.performance = { now: () => 0 };
+const CALLS = [];
+globalThis.fetch = async (u, o) => { CALLS.push({ u, body: o && o.body });
+  return { ok: true, status: 200, body: { getReader: () => ({ read: async () => ({done: true}) }) } }; };
+globalThis.AbortController = class { constructor(){ this.signal = {}; } abort(){} };
+globalThis.TextDecoder = class { decode(){ return ""; } };
+"""
+
+
+@pytest.mark.parametrize("name,page", [("_CHAT_UI", _CHAT_UI), ("_LANDING", _LANDING)])
+def test_the_page_js_parses(name, page):
+    """Each page's whole script block, through a real parser.
+
+    Both pages are ordinary triple-quoted strings, so Python eats every backslash
+    escape in them. A `\\n` inside a `//` comment became a real newline and split the
+    comment in two, leaving `", so` as a statement: SyntaxError, the entire script
+    block dead, and a page that renders but cannot send. The bare-call resolver saw
+    nothing wrong -- it scans text and does not parse -- and every other gate here
+    passed. The served page was broken for a whole deploy.
+
+    Parametrized over both pages because `_LANDING`'s 261 bytes of JS carry the same
+    hazard and had no gate of any kind. This is also why _MD_JS is `r\"\"\"`; the same
+    escape class had already cost a working regex earlier the same day.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the page JS cannot be parsed")
+    js = _script(page)
+    r = subprocess.run([node, "--check", "-"], input=js, capture_output=True,
+                       text=True, timeout=60)
+    assert r.returncode == 0, f"{name}'s JS does not parse:\n{r.stderr.strip()[:600]}"
+    # A stray escape shows up as a line that is the tail of a broken string literal.
+    # Cheap, runs without node, and names the cause rather than a parse offset.
+    for n, line in enumerate(js.splitlines(), 1):
+        assert not line.lstrip().startswith('", '), (
+            f"{name} line {n} is {line.strip()!r}: a backslash escape was eaten by "
+            f"Python and split a comment or string. These pages are not raw strings."
+        )
+
+
+@pytest.mark.parametrize("name,page,reader", [
+    ("_CHAT_UI", _CHAT_UI, r'\$\("([\w-]+)"\)'),
+    ("_LANDING", _LANDING, r'getElementById\("([\w-]+)"\)'),
+])
+def test_every_element_the_js_reads_exists_in_the_markup(name, page, reader):
+    """An id the JS reads and the markup does not define is a null deref at load.
+
+    On the chat page that kills the whole script -- the same shape as the parse break,
+    caught only at runtime. `_LANDING` had no gate at all, and its two ids are the
+    only thing between it and a page whose header never leaves "connecting…".
+    """
+    wanted = set(re.findall(reader, _script(page)))
+    assert wanted, f"{name}: the id reader matched nothing; the regex is stale"
+    present = set(re.findall(r'id="([\w-]+)"', page))
+    assert wanted <= present, f"{name}'s JS reads ids the markup lacks: {wanted - present}"
+
+
+def test_sending_reaches_fetch_and_the_fold_stays_clickable():
+    """The page's own send path, executed.
+
+    Two failures got past every text-level gate here and reached the user: the script
+    block did not parse at all, and `display: flex` on the <summary> cost it the
+    disclosure behaviour, so the fold rendered and would not open. Both are only
+    visible if the code runs, so run it -- against a stub DOM, no browser.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the send path cannot be executed")
+    # Populate the stub from the page's own ids rather than a hand-kept list -- a stub
+    # missing one id fails as a null deref, which reads like a page bug and is not one.
+    # That they all exist in the markup is its own test above.
+    wanted = set(re.findall(r'\$\("([\w-]+)"\)', _script(_CHAT_UI)))
+    ids = "const IDS = {};\n" + "".join(f'IDS["{i}"] = mk("div");\n' for i in sorted(wanted))
+    harness = _DOM_STUB + ids + _script(_CHAT_UI) + textwrap.dedent("""
+        const out = {};
+        const bubble = addMsg("user", "hello");
+        out.addMsg = bubble ? bubble.tagName : null;
+        out.feed = IDS.feed.children.length;
+        await sendChat("hi");
+        // The page also probes /v1/models on load, which carries no body -- pick the
+        // completion POST rather than assuming it is the first call.
+        const post = CALLS.filter((c) => c.body);
+        out.posts = post.length;
+        out.url = post.length ? post[0].u : null;
+        out.thinking = post.length ? post[0].body.includes("enable_thinking") : false;
+        // The fold: <details><summary><span class="row">..., because a flex summary
+        // is not clickable.
+        const body = addThinking(addMsg("assistant", ""));
+        const det = body.parentNode;
+        out.summary = det.children[0].tagName;
+        out.row = det.children[0].children[0].className;
+        out.chev = det.children[0].children[0].children[0].className;
+        console.log(JSON.stringify(out));
+    """)
+    r = subprocess.run([node, "--input-type=module", "-e", harness],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"the page threw when run: {r.stderr.strip()[:600]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["addMsg"] == "DIV" and got["feed"] >= 1, f"addMsg built nothing: {got}"
+    assert got["posts"] == 1, f"send did not reach fetch: {got}"
+    assert got["url"] == "/v1/chat/completions", f"send posted to {got['url']!r}"
+    assert got["thinking"], f"the request does not ask for thinking: {got}"
+    assert got["summary"] == "SUMMARY", f"the fold is not a summary: {got}"
+    assert got["row"] == "row" and got["chev"] == "chev", (
+        f"the summary lays itself out instead of an inner row, which is what made the "
+        f"fold unclickable: {got}"
+    )
+
+
+def test_the_slicers_take_one_block_from_a_two_block_page():
+    """`server.py` holds two pages, so both slicers can over-capture.
+
+    `_script` used rsplit, which on a two-block page returns everything from the first
+    open tag to the LAST close tag: 27299 characters of markup handed to the resolver as
+    JavaScript. `_css` has the same shape and its docstring warns about it. Neither
+    hazard is reachable today -- every caller passes `_CHAT_UI` -- so this is the gate
+    that fails if a page merge makes it reachable.
+    """
+    page = _LANDING + _CHAT_UI
+    assert "</script>" not in _script(page), "_script spans past its own block"
+    assert "</style>" not in _CHAT_UI[_CHAT_UI.index("<style>") : _CHAT_UI.index("</style>")]
+    # And the real page still yields the script the other tests assert on.
+    assert "function mdRender" in _script(_CHAT_UI)
+
+
 def test_every_bare_call_in_the_page_js_resolves():
     unresolved = _unresolved(_script(_CHAT_UI))
     assert not unresolved, (
@@ -126,8 +288,56 @@ def test_the_check_catches_an_undefined_call():
     assert _unresolved("// call ghost(1) in a comment\nlet a = 1;") == set()
 
 
-def test_the_index_route_serves_the_page():
-    """`/` returns the page as HTML. The route is one line and nothing covered it."""
+def test_the_reasoning_split_handles_a_reply_that_starts_inside_think():
+    """The stream carries only `</think>`, and the page has to fold on that.
+
+    The checkpoint's template ends the prompt with "<think>\\n", so generation begins
+    inside the block: measured against the served V100, a 300-token reply contained
+    `</think>` and no `<think>`. The first version keyed on the opening tag, so the
+    fold never fired and the reasoning printed inline as prose -- and no gate saw it,
+    because every assertion here was about markup and CSS.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; splitThink's behaviour cannot be exercised")
+    js = _script(_CHAT_UI)
+    start = js.index("function splitThink")
+    fn = js[start : js.index("\nfunction ", start + 1)]
+
+    # (raw, inside) -> (reasoning, answer). `inside` is the page's THINK flag.
+    cases = [
+        # What the server actually sends: no open tag, close tag mid-reply.
+        ["why\n</think>\nthe answer", True, "why\n", "\nthe answer"],
+        # Mid-stream, before the close tag arrives: all reasoning, no answer yet.
+        ["thinking about it", True, "thinking about it", ""],
+        # Thinking off: no tags at all, so all of it is the answer.
+        ["just the answer", False, "", "just the answer"],
+        # A reply that does carry both tags (backfilled history, or a paste).
+        ["<think>r</think>a", False, "r", "a"],
+        # An unclosed open tag is still reasoning, not an answer.
+        ["<think>r only", False, "r only", ""],
+        # A close tag with nothing before it: empty reasoning, not a dropped answer.
+        ["</think>a", True, "", "a"],
+    ]
+    harness = fn + "\nconst C = " + json.dumps(cases) + ";\n" + textwrap.dedent("""
+        const bad = [];
+        for (const [raw, inside, wantR, wantA] of C) {
+          const [r, a] = splitThink(raw, inside);
+          if (r !== wantR || a !== wantA) bad.push([raw, inside, [r, a], [wantR, wantA]]);
+        }
+        console.log(JSON.stringify(bad));
+    """)
+    r = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"splitThink threw: {r.stderr.strip()[:400]}"
+    bad = json.loads(r.stdout.strip().splitlines()[-1])
+    assert not bad, f"splitThink is wrong on: {bad}"
+
+
+def _tiny_client():
+    """A TestClient over the real app on the tiny model.
+
+    Two tests need it; building the engine twice doubles the slowest part of this file.
+    """
     from tilerl_kernels.backend import get_backend
 
     from tilerl.config import tiny
@@ -139,11 +349,25 @@ def test_the_index_route_serves_the_page():
     cfg = tiny()
     engine = build_engine(cfg, build_random(cfg, seed=3), get_backend(),
                           num_blocks=64, num_slots=2, max_batch=2, max_total_tokens=512)
-    app = create_app(engine, get_tokenizer(None), model_name="tiny")
-    r = TestClient(app).get("/")
-    assert r.status_code == 200
-    assert r.headers["content-type"].startswith("text/html")
-    assert "<title>" in r.text and "</html>" in r.text
+    return TestClient(create_app(engine, get_tokenizer(None), model_name="tiny"))
+
+
+def test_the_index_route_serves_the_page():
+    """`/` returns the CHAT page, and the landing page is still reachable at /about.
+
+    Asserting 200 + text/html + <title> cannot tell the two pages apart -- both satisfy
+    all three -- so the route swap would have been invisible. Key on the composer, which
+    only the chat page has.
+    """
+    client = _tiny_client()
+    for route in ("/", "/chat"):
+        r = client.get(route)
+        assert r.status_code == 200, route
+        assert r.headers["content-type"].startswith("text/html"), route
+        assert "<title>" in r.text and "</html>" in r.text, route
+        assert "<textarea" in r.text, f"{route} is not the chat page"
+    about = client.get("/about")
+    assert about.status_code == 200 and "<textarea" not in about.text
 
 
 def test_every_gutter_offset_comes_from_one_token():
@@ -204,3 +428,127 @@ def test_the_stream_marks_and_unmarks_the_pending_bubble():
     finished turn keeps a blinking cursor; if never added, the wait is silent."""
     assert '.classList.add("streaming")' in _CHAT_UI
     assert '.classList.remove("streaming")' in _CHAT_UI
+
+
+def test_no_markdown_input_can_add_an_attribute_to_the_output():
+    """Attribute breakout: the renderer's output goes to innerHTML.
+
+    `mdEscape` escaped `&`, `<`, `>` and no quotes, while two rules interpolate its
+    result into an HTML ATTRIBUTE -- `href="..."` in the link rule and `data-lang="..."`
+    on a fence. So a `"` closed the attribute and the rest of the token became markup:
+    `[x](https://a"onmouseover="alert(1))` produced a live handler.
+
+    Asserts on the attribute NAMES a real parser finds, not on substrings and not on a
+    regex. Both weaker checks give wrong answers here, in opposite directions:
+
+    * A substring search cannot tell an attribute from text. After the fix the output
+      contains the inert literal `&quot;onmouseover=&quot;`, which matches.
+    * A regex over tag interiors invents attributes. `[\\s"']([a-zA-Z-]+)\\s*=` treats
+      `'` as an attribute separator, so inside the double-quoted value
+      `href="https://a'onmouseover='b"` it reports an `onmouseover` attribute that is
+      not there. Measured: the regex says [href, onmouseover, target, rel];
+      `html.parser` says [href, target, rel]. Every attribute this template writes is
+      double-quoted, so a `'` in a URL is an ordinary character -- the single-quote
+      variant was never a breakout, and the regex version of this gate reported a
+      kill for a mutation that reintroduces no bug.
+
+    The allow-list is closed rather than a deny-list of `on*`: `style`, `srcdoc` and
+    `formaction` are all reachable without an event handler name.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the renderer's output cannot be exercised")
+    from tilerl.server import _MD_JS
+
+    #: Every attribute the renderer is allowed to emit, over every input.
+    allowed = {"href", "target", "rel", "class", "data-lang"}
+    attacks = [
+        '[x](https://a"onmouseover="alert(1))',
+        "[x](https://a'onmouseover='b)",
+        '```js"onload="alert(1)\ncode\n```',
+        "```js'onload='alert(1)\ncode\n```",
+        '[x](https://a"style="width:99vw)',           # not an on* name
+        '[x](javascript:alert(1))',                    # scheme, not breakout
+        '# h"onclick="x',
+        '- item"onclick="x',
+        '> quote"onclick="x',
+        '**b"onclick="x**',
+        # A raw tag, so this gate covers the `<` escape too and not only the quotes.
+        # Without it, dropping the `<` escape read MISSED under mutation while the
+        # quote mutations were caught.
+        '<img src=x onerror=alert(1)>',
+        '<a href="javascript:alert(1)">x</a>',
+        # Benign inputs must keep working: a regression here is a broken page, and a
+        # gate that only feeds attacks cannot see it.
+        '[ok](https://e.com/a?b=1&c=2)',
+        '```py\nprint(1)\n```',
+        'it\'s a "test"',
+    ]
+    harness = _MD_JS + "\nconst C = " + json.dumps(attacks) + ";\n" + textwrap.dedent("""
+        console.log(JSON.stringify(C.map((s) => [s, mdRender(s)])));
+    """)
+    r = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"the renderer threw: {r.stderr.strip()[:400]}"
+    rows = json.loads(r.stdout.strip().splitlines()[-1])
+
+    class _Attrs(HTMLParser):
+        """Attribute names per start tag, from the parser the browser's rules match."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.names: set[str] = set()
+
+        def handle_starttag(self, tag, attrs):
+            self.names |= {k for k, _ in attrs}
+
+    for src, html in rows:
+        p = _Attrs()
+        p.feed(html)
+        extra = sorted(p.names - allowed)
+        assert not extra, (
+            f"input {src!r} put {extra} into the markup, which innerHTML will honour:\n  {html}"
+        )
+    # The benign rows must still render, or an over-eager escape passes this vacuously.
+    by_src = dict(rows)
+    assert 'href="https://e.com/a?b=1&amp;c=2"' in by_src['[ok](https://e.com/a?b=1&c=2)']
+    assert 'data-lang="py"' in by_src['```py\nprint(1)\n```']
+
+
+def test_markdown_renders_and_escapes():
+    """The renderer's OUTPUT, not just that its calls resolve.
+
+    `test_every_bare_call_in_the_page_js_resolves` passes on a renderer that emits
+    nothing, and an escape bug here is an XSS in a page that displays model output.
+    Runs the real JS under node; skips where node is absent (CI's cpu row has it, a
+    bare pod may not) rather than asserting on the source text, which would prove
+    only that the strings exist.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the renderer's output cannot be exercised")
+    from tilerl.server import _MD_JS
+
+    checks = [
+        ("**b** and `c`", ["<strong>b</strong>", "<code>c</code>"]),
+        ("# H\n\ntext", ["<h1>H</h1>", "<p>text</p>"]),
+        ("- one\n- two", ["<ul>", "<li>one</li>"]),
+        ("1. a\n2. b", ["<ol>", "<li>a</li>"]),
+        ("> q", ["<blockquote>q</blockquote>"]),
+        ("a <script>x</script> b", ["&lt;script&gt;"]),          # escape, never inject
+        ("```py\nprint(1)\n```", ['<pre class="code"', 'data-lang="py"']),
+        ("```\nunclosed", ['<pre class="code"']),                 # degrades, not swallows
+        ("```\n**not bold**\n```", ["**not bold**"]),             # no inline rules in a fence
+    ]
+    harness = _MD_JS + "\nconst C = " + json.dumps(checks) + ";\n" + textwrap.dedent("""
+        const bad = [];
+        for (const [src, wants] of C) {
+          const out = mdRender(src);
+          for (const w of wants) if (!out.includes(w)) bad.push([src, w, out]);
+        }
+        if (mdRender("```\\n**x**\\n```").includes("<strong>")) bad.push(["fence", "isolation", ""]);
+        console.log(JSON.stringify(bad));
+    """)
+    r = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"the renderer threw: {r.stderr.strip()[:400]}"
+    bad = json.loads(r.stdout.strip().splitlines()[-1])
+    assert not bad, f"markdown output wrong: {bad}"

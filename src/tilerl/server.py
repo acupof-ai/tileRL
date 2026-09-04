@@ -6,6 +6,7 @@ Route surface (mirrors agent-infer's infer-server, trimmed to tileRL):
 * ``GET  /v1/models``              — served model identity
 * ``POST /v1/chat/completions``    — OpenAI schema; ``stream=true`` -> SSE
 * ``GET  /``                       — single-file HTML chat UI (no build step)
+* ``GET  /about``                  — what tileRL is, target matrix
 
 This module never imports torch or tilelang: prompts cross the boundary as
 ``list[int]`` and the engine owns all tensor traffic.
@@ -88,6 +89,14 @@ def _chat_chunk(
 
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _usage(prompt_tokens: int, completion_tokens: int) -> dict:
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -222,11 +231,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                     "finish_reason": "length" if len(output_ids) >= max_new else "stop",
                 }
             ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": len(output_ids),
-                "total_tokens": prompt_tokens + len(output_ids),
-            },
+            "usage": _usage(prompt_tokens, len(output_ids)),
             "system_fingerprint": SYSTEM_FINGERPRINT,
         }
 
@@ -237,6 +242,19 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         deadline = time.monotonic() + 1800.0
         sent = 0  # characters of the STRIPPED reply already emitted
         seen = 0  # tokens already decoded, so a quiet poll costs nothing
+
+        def content_frame(text: str, completion: int) -> str:
+            # Cumulative tokens on every content frame, vLLM's continuous_usage_stats
+            # shape. Without it a live rate gauge can only count frames, and this loop
+            # coalesces ~1.8 tokens into each (measured: 109 frames for 200 tokens on the
+            # 27B), so the page would show roughly half the real rate until the final
+            # usage chunk landed. choices stays populated, so a client that indexes it is
+            # unharmed; the usage-ONLY chunk remains the one with an empty choices list.
+            chunk = _chat_chunk(chunk_id, created, model_name, {"content": text})
+            if include_usage:
+                chunk["usage"] = _usage(prompt_tokens, completion)
+            return _sse(chunk)
+
         try:
             while True:
                 # peek() is lock-free; take() blocks on the engine lock for a whole
@@ -256,9 +274,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                     # contains an unmappable byte, which is every prefix on the tiny model.
                     text = strip_think(tokenizer.decode(live).rstrip("�"))
                     if len(text) > sent:
-                        yield _sse(
-                            _chat_chunk(chunk_id, created, model_name, {"content": text[sent:]})
-                        )
+                        yield content_frame(text[sent:], seen)
                         sent = len(text)
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"request {request_id} did not finish within 1800.0s")
@@ -272,7 +288,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         # this is the remainder of the same string the deltas were cut from
         tail = strip_think(tokenizer.decode(output_ids))[sent:]
         if tail:
-            yield _sse(_chat_chunk(chunk_id, created, model_name, {"content": tail}))
+            yield content_frame(tail, len(output_ids))
         finish = "length" if len(output_ids) >= max_new else "stop"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=finish))
         # A final usage-only chunk, OpenAI's include_usage shape. Without it a client can
@@ -283,11 +299,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         if include_usage:
             usage = _chat_chunk(chunk_id, created, model_name, {})
             usage["choices"] = []
-            usage["usage"] = {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": len(output_ids),
-                "total_tokens": prompt_tokens + len(output_ids),
-            }
+            usage["usage"] = _usage(prompt_tokens, len(output_ids))
             yield _sse(usage)
         yield "data: [DONE]\n\n"
 
@@ -297,13 +309,16 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
     mount_messages(app, engine, tokenizer, model_name)
 
+    # The root is the playground: whoever opens the host:port wants to type at the
+    # model, not read what tileRL is. The landing page keeps its content at /about.
     @app.get("/", response_class=HTMLResponse)
-    def index() -> str:
-        return _LANDING
-
     @app.get("/chat", response_class=HTMLResponse)
     def chat() -> str:
         return _CHAT_UI
+
+    @app.get("/about", response_class=HTMLResponse)
+    def about() -> str:
+        return _LANDING
 
     return app
 
@@ -406,6 +421,100 @@ _LANDING = """<!doctype html>
 # Single-file chat UI: inline CSS/JS, system fonts, no network fetch beyond this origin
 # (the server is often reached through a tunnel with no egress).
 # ---------------------------------------------------------------------------
+
+_MD_JS = r"""// Markdown, enough of it for model output: fenced code, inline code, bold, italic,
+// headings, lists, blockquote, links, rules. Hand-written rather than a CDN library
+// because the page is one self-contained string and the JS gate walks every bare call
+// in it (test_chat_ui.py:106) -- a script tag would move the code out of that check.
+// Escapes FIRST, so nothing below can inject markup, and pulls fenced blocks out
+// before any inline rule can match inside them.
+const BT = String.fromCharCode(96);  // no literal backtick: see mdInline
+
+function mdEscape(s) {
+  // Quotes matter as much as `<` here: two rules interpolate escaped text into an
+  // HTML ATTRIBUTE -- href="..." in the link rule and data-lang="..." on a fence --
+  // so a quote breaks out and the rest of the token becomes markup. Executed, not
+  // reasoned about: [x](https://a"onmouseover="alert(1)) produced a live onmouseover
+  // handler, and ```js"onload="alert(1) a live onload.
+  //
+  // BOTH quote characters. Only `"` is load-bearing today, because every attribute
+  // this template writes is double-quoted; `'` is defence in depth for the next
+  // single-quoted attribute someone adds. A claim that `'` was also a live breakout
+  // came from a regex whose class treated `'` as an attribute separator and reported
+  // one that html.parser does not see -- retracted in
+  // errors/2026-09-05-a-regex-standing-in-for-a-parser-invented-a-bug.md, and the gate
+  // now parses tag interiors with html.parser instead of matching them.
+  //
+  // Escaped at the source rather than by tightening the URL character class, because
+  // a class only guards the rule it sits in and leaves the next attribute exposed.
+  // The entities render as the characters themselves in text content.
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function mdInline(s) {
+  return s
+    .replace(new RegExp(BT + "([^" + BT + "\\n]+)" + BT, "g"), (_, c) => "<code>" + c + "</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/\[([^\]\n]+)\]\((https?:[^)\s]+)\)/g,
+             '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+
+function mdRender(src) {
+  // Split on fences FIRST and keep the parts, so no inline rule can reach inside a
+  // code block and no sentinel placeholder is needed -- an earlier version used one and
+  // it cost a literal NUL byte in the Python source plus two false hits in the JS gate.
+  const parts = mdEscape(src).split(new RegExp(BT + BT + BT));
+  let out = "";
+  for (let k = 0; k < parts.length; k++) {
+    if (k % 2 === 1) {
+      const nl = parts[k].indexOf("\n");
+      const lang = nl < 0 ? "" : parts[k].slice(0, nl).trim();
+      const body = nl < 0 ? parts[k] : parts[k].slice(nl + 1);
+      out += "<pre class=\"code\"" + (lang ? " data-lang=\"" + lang + "\"" : "") +
+             "><code>" + body.replace(/\s+$/, "") + "</code></pre>";
+    } else {
+      out += mdBlocks(parts[k]);
+    }
+  }
+  return out;
+}
+
+function mdBlocks(text) {
+  const out = [];
+  let list = null;
+  const closeList = () => { if (list) { out.push("</" + list + ">"); list = null; } };
+  for (const line of text.split("\n")) {
+    if (!line.trim()) { closeList(); continue; }
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h) { closeList(); const n = h[1].length; out.push("<h" + n + ">" + mdInline(h[2]) + "</h" + n + ">"); continue; }
+    if (/^\s*([-*_])\1{2,}\s*$/.test(line)) { closeList(); out.push("<hr>"); continue; }
+    const q = line.match(/^&gt;\s?(.*)$/);
+    if (q) { closeList(); out.push("<blockquote>" + mdInline(q[1]) + "</blockquote>"); continue; }
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (ul || ol) {
+      const want = ul ? "ul" : "ol";
+      if (list !== want) { closeList(); out.push("<" + want + ">"); list = want; }
+      out.push("<li>" + mdInline((ul || ol)[1]) + "</li>");
+      continue;
+    }
+    closeList();
+    out.push("<p>" + mdInline(line) + "</p>");
+  }
+  closeList();
+  return out.join("");
+}
+
+// Assistant text is markdown; user text is not (never render what a user typed).
+function setBody(el, text, md) {
+  el.classList.toggle("md", !!md);
+  if (md) el.innerHTML = mdRender(text);
+  else el.textContent = text;
+}
+"""
+
 
 _CHAT_UI = """<!doctype html>
 <html lang="en">
@@ -510,6 +619,36 @@ _CHAT_UI = """<!doctype html>
     border-left: 2px solid var(--line-firm); padding-left: 13px;
   }
   .turn.assistant .content { font-size: 15px; line-height: 1.68; }
+  /* Rendered markdown brings its own block structure, so pre-wrap's newlines would
+     double every gap. `md` is set by setBody only for assistant text. */
+  .content.md { white-space: normal; }
+  .content.md > :first-child { margin-top: 0; }
+  .content.md > :last-child { margin-bottom: 0; }
+  .content.md p { margin: 0 0 var(--s-3); }
+  .content.md h1, .content.md h2, .content.md h3, .content.md h4 {
+    margin: var(--s-5) 0 var(--s-2); line-height: 1.3; font-weight: 600;
+  }
+  .content.md h1 { font-size: 19px; }
+  .content.md h2 { font-size: 17px; }
+  .content.md h3 { font-size: 15.5px; }
+  .content.md h4 { font-size: 15px; color: var(--ink-2); }
+  .content.md ul, .content.md ol { margin: 0 0 var(--s-3); padding-left: var(--s-5); }
+  .content.md li { margin: var(--s-1) 0; }
+  .content.md blockquote {
+    margin: 0 0 var(--s-3); padding-left: var(--s-3);
+    border-left: 2px solid var(--line-firm); color: var(--ink-2);
+  }
+  .content.md hr { border: 0; border-top: 1px solid var(--line); margin: var(--s-5) 0; }
+  .content.md code {
+    font: 13px/1.5 var(--mono); background: var(--accent-wash);
+    padding: 1px 4px; border-radius: var(--r);
+  }
+  .content.md pre.code {
+    margin: 0 0 var(--s-3); padding: var(--s-3); overflow-x: auto;
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--r2);
+  }
+  .content.md pre.code code { background: none; padding: 0; font-size: 12.5px; line-height: 1.6; }
+  .content.md a { color: var(--accent); }
   .content.streaming::after {
     content: ""; display: inline-block; width: 2px; height: 1.05em; margin-left: 1px;
     background: var(--accent); vertical-align: text-bottom; animation: blink 1.1s steps(2) infinite;
@@ -522,13 +661,18 @@ _CHAT_UI = """<!doctype html>
 
   /* Reasoning: present but subordinate — no box, hairline rule, smaller dim type. */
   .think { margin: 0 0 14px; border-left: 2px solid var(--line); }
+  /* `display: flex` on a <summary> costs it the disclosure behaviour in Chrome and
+     Safari -- the fold rendered and would not open. Keep the summary as list-item and
+     lay the row out on an inner span instead. */
   .think > summary {
-    display: flex; align-items: center; gap: 7px; padding: 1px 0 1px 13px; cursor: pointer;
-    list-style: none; font: 600 9.5px/1.8 var(--sans); text-transform: uppercase;
-    letter-spacing: .1em; color: var(--ink-3);
+    display: list-item; list-style: none; cursor: pointer;
+    padding: 1px 0 1px 13px; font: 600 9.5px/1.8 var(--sans);
+    text-transform: uppercase; letter-spacing: .1em; color: var(--ink-3);
   }
-  .think > summary::-webkit-details-marker { display: none; }
+  .think > summary::marker,
+  .think > summary::-webkit-details-marker { content: ""; display: none; }
   .think > summary:hover { color: var(--ink-2); }
+  .think > summary > .row { display: flex; align-items: center; gap: 7px; }
   .chev { font-size: 7px; line-height: 1; transition: transform .18s ease; }
   .think[open] .chev { transform: rotate(90deg); }
   .n { font: 400 9.5px/1 var(--mono); letter-spacing: 0; text-transform: none; color: var(--ink-3); }
@@ -648,7 +792,7 @@ _CHAT_UI = """<!doctype html>
 <body>
 <header>
   <div class="id">
-    <a class="mark" href="/">tilerl</a>
+    <a class="mark" href="/about">tilerl</a>
     <span class="dot" id="dot"></span>
     <span class="model" id="model">connecting…</span>
   </div>
@@ -692,6 +836,10 @@ _CHAT_UI = """<!doctype html>
 </form>
 <script>
 const $ = (id) => document.getElementById(id);
+// One switch for both the request and the split: enable_thinking decides whether the
+// reply starts inside a <think> block, so a page that asked for one and a splitter
+// that assumed the other is how the fold died.
+const THINK = true;
 let busy = false, history = [], abort = null;
 
 // The empty state is real content, not a spacer: drop it the moment a turn lands.
@@ -699,6 +847,8 @@ function clearEmpty() {
   const e = $("empty");
   if (e) e.remove();
 }
+
+""" + _MD_JS + """
 
 function addMsg(role, text) {
   clearEmpty();
@@ -726,18 +876,41 @@ function addNote(text) {
 }
 
 // Reasoning sits above the answer inside the same turn, recessive and collapsible.
+// Split a reply into [reasoning, answer].
+//
+// `inside` says the reply BEGINS in the reasoning block, which is what the request
+// asked for: the checkpoint's template ends the prompt with an OPEN think tag, so
+// generation starts inside it and the stream carries only the CLOSING tag --
+// measured on the V100, 300 tokens with </think> and no <think>. Keying on the open
+// tag left the fold dead and printed the reasoning inline as prose. It matters most
+// mid-stream: before </think> arrives there is no tag at all, and guessing from the
+// text would show every reasoning token as the answer and then yank it away.
+function splitThink(raw, inside) {
+  const open = raw.indexOf("<think>");
+  const from = open < 0 ? 0 : open + 7;
+  const close = raw.indexOf("</think>", from);
+  if (open < 0 && !inside) return ["", raw];        // no reasoning in this reply
+  if (close < 0) return [raw.slice(from), ""];      // still reasoning
+  return [raw.slice(from, close), raw.slice(0, open < 0 ? 0 : open) + raw.slice(close + 8)];
+}
+
 function addThinking(bubble) {
   const det = document.createElement("details");
   det.className = "think";
   det.open = true;
   const sum = document.createElement("summary");
+  // The flex row is an inner span: laying the summary itself out with flex costs it
+  // the disclosure behaviour, so the fold rendered and would not open.
+  const row = document.createElement("span");
+  row.className = "row";
   const chev = document.createElement("span");
   chev.className = "chev"; chev.textContent = "▶";
   const label = document.createElement("span");
   label.textContent = "Reasoning";
   const n = document.createElement("span");
   n.className = "n";
-  sum.appendChild(chev); sum.appendChild(label); sum.appendChild(n);
+  row.appendChild(chev); row.appendChild(label); row.appendChild(n);
+  sum.appendChild(row);
   const body = document.createElement("div");
   body.className = "thinkbody";
   det.appendChild(sum); det.appendChild(body);
@@ -792,7 +965,7 @@ async function readSSE(resp, onFrame) {
 async function sendChat(text) {
   const bubble = addMsg("assistant", "");
   bubble.classList.add("streaming");
-  const t0 = performance.now(); let firstAt = 0;
+  const t0 = performance.now(); let firstAt = 0, tokens = 0;
   history.push({ role: "user", content: text });
   abort = new AbortController();
   let raw = "", think = null, collapsed = false;
@@ -800,39 +973,62 @@ async function sendChat(text) {
     const resp = await fetch("/v1/chat/completions", {
       method: "POST", headers: { "Content-Type": "application/json" },
       signal: abort.signal,
-      body: JSON.stringify({ messages: history, stream: true, stream_options: { include_usage: true } }),
+      // enable_thinking makes the template open a <think> block at the end of the
+      // prompt, so the reply starts inside it and splitThink can find the boundary.
+      // Left unset, the checkpoint reasons at its default xhigh effort and emits the
+      // reasoning as untagged prose, and the fold has nothing to key on.
+      body: JSON.stringify({ messages: history, stream: true,
+                             chat_template_kwargs: { enable_thinking: THINK },
+                             stream_options: { include_usage: true } }),
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     await readSSE(resp, (obj) => {
-      // The usage-only chunk carries no choices, so read it before indexing into them.
-      if (obj.usage) {
-        const secs = (performance.now() - (firstAt || t0)) / 1000;
-        if (secs > 0) $("tps").textContent = (obj.usage.completion_tokens / secs).toFixed(1);
+      // Content frames now carry cumulative usage too, so the usage-ONLY chunk is the
+      // one with no choices. Keying on obj.usage alone would return early on every
+      // content frame and nothing would ever render.
+      const delta = obj.choices?.[0]?.delta?.content;
+      // The engine's own token count, authoritative over any client-side tally.
+      if (obj.usage) tokens = obj.usage.completion_tokens;
+      if (!delta) {
+        if (!obj.choices?.length && tokens && firstAt) {
+          const secs = (performance.now() - firstAt) / 1000;
+          if (secs > 0) $("tps").textContent = (tokens / secs).toFixed(1);
+        }
         return;
       }
-      const delta = obj.choices?.[0]?.delta?.content;
-      if (!delta) return;
       if (!firstAt) { firstAt = performance.now(); $("ttft").textContent = Math.round(firstAt - t0); }
       raw += delta;
-      // Split the model's reasoning out of the answer. The tags can land mid-delta, so
-      // re-partition the whole accumulated text each frame rather than tracking a state
-      // machine across chunk boundaries.
-      const open = raw.indexOf("<think>");
-      if (open < 0) { bubble.textContent = raw; scrollDown(); return; }
-      const close = raw.indexOf("</think>", open);
+      // Live decode rate, updated per frame: the window opens at the FIRST token, so
+      // prefill is excluded by construction -- charging prefill to decode is what read
+      // as a 15% serve regression that did not exist
+      // (errors/2026-09-04-a-served-first-visit-pays-10x-and-serve-was-not-immune.md).
+      // Counting FRAMES here read 1.8x low: this server coalesces tokens per poll.
+      const dt = (performance.now() - firstAt) / 1000;
+      if (tokens && dt > 0.15) $("tps").textContent = (tokens / dt).toFixed(1);
+      // Split the model's reasoning out of the answer. Re-partition the whole
+      // accumulated text each frame: the tag can land mid-delta, and the reply starts
+      // inside the block, so there is no state machine to run across chunks.
+      const [reason, answer] = splitThink(raw, THINK);
+      if (!reason) { setBody(bubble, answer, true); scrollDown(); return; }
       if (!think) think = addThinking(bubble);
-      think.textContent = raw.slice(open + 7, close < 0 ? undefined : close).trim();
+      think.textContent = reason.trim();
       think.parentNode.querySelector(".n").textContent = think.textContent.length + " chars";
-      bubble.textContent = (raw.slice(0, open) + (close < 0 ? "" : raw.slice(close + 8))).trim();
+      setBody(bubble, answer.trim(), true);
       // Fold the reasoning away once the answer proper starts, but only once, so a
       // reader who opened it back up keeps it open.
-      if (close >= 0 && !collapsed) { collapsed = true; think.parentNode.open = false; }
+      if (answer && !collapsed) { collapsed = true; think.parentNode.open = false; }
       scrollDown();
     });
   } finally {
     bubble.classList.remove("streaming");
-    // Keep partial text from a stopped stream, but never thread an empty turn back.
-    if (raw) history.push({ role: "assistant", content: raw });
+    // Keep partial text from a stopped stream, but never thread an empty turn back --
+    // and never thread the reasoning back either: the checkpoint's template drops prior
+    // <think> blocks from history, so sending them re-primes the model on its own
+    // scratchpad.
+    if (raw) {
+      const answer = splitThink(raw, THINK)[1].trim();
+      history.push({ role: "assistant", content: answer || raw });
+    }
   }
   if (!bubble.textContent && !think) bubble.textContent = "(empty response)";
 }

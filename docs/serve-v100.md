@@ -1,43 +1,107 @@
 # Serving the 27B from the V100, with the web UI on your Mac
 
 The engine runs on the pod (the checkpoint and the GPU are there); the browser
-runs here. One SSH tunnel connects them, so nothing is exposed off the pod.
+runs here.
 
-## 1. Tunnel
-
-```bash
-ssh -N -L 8000:127.0.0.1:8000 v100
-```
-
-Leave it open. `-N` means no shell, just the forward. `127.0.0.1` on the pod side
-matters: the server binds loopback only, so the tunnel is the only way in.
-
-## 2. Start the server on the pod
+## 1. Start the server on the pod
 
 ```bash
 ssh v100
-cd ~/tilerl-v100
-export PATH=/usr/local/cuda-12.4/bin:$PATH
-export PYTHONPATH=$HOME/tilerl-v100/src:$HOME/tilerl-v100/packages/tilerl-kernels/src
-export TILELANG_CACHE_DIR=$HOME/.tilelang_cache
-export TILERL_TARGET=cuda
-CKPT=$HOME/models/Qwen3.8-27B-NVFP4
-export TILERL_QWEN38_SOURCE=$CKPT
-
-/usr/bin/python3 -c 'from tilerl.cli import main; main()' \
-    serve --model qwen38-27b --port 8000 \
-    --draft $CKPT/model-00018-of-00018.safetensors --depth 3 \
-    --slots 4 --blocks 2048 --max-ctx 4096
+cd ~/tilerl-git
+setsid nohup scripts/serve_v100.sh >/dev/null 2>&1 &
 ```
 
-It prints `N decode graphs in Ms` before the URL: every (batch bucket × chain
-width) a decode tick can key on is captured up front, so the first real message
-starts at the plateau instead of paying ~14 s per capture. Without it, serving
-reads 1088 ms/token cold and reaches 26 only after about six requests.
-`--no-warmup` opts out. `--max-batch` defaults to 2 — right for one person, and
-it is also the size of the grid to capture and hold.
+`scripts/serve_v100.sh` carries the settled flags and restarts the server if it
+dies — capped at 10, then it stays dead, because a server that restarts forever on
+an OOM hides the OOM. `setsid` matters: without it the supervisor is killed when
+the ssh session ends (`loginctl show-user` reports `Linger=no` on this pod, which
+is also why this is a bash loop and not a systemd unit).
 
-For reference, the benched numbers (direct `step()` loop, fully warm):
+It logs to `~/serve70c.log`, one `=== boot N at <time> sha <rev> dirty <n> ===`
+line per start, and the log is truncated past 32 MiB. A model load takes ~36 s;
+`ss -ltn | grep :8000` tells you when it is up.
+
+To stop it, TERM the supervisor and the server goes with it (verified: one TERM,
+both processes gone in 2 s, card released):
+
+```bash
+ss -ltnp | grep :8000                    # the server's pid, from the socket that owns it
+awk '{print $4}' /proc/<server-pid>/stat # its parent, the supervisor
+kill -TERM <supervisor-pid>
+```
+
+Read the pid off the listening socket rather than matching a command line:
+`pgrep -f serve_v100.sh` also matches the ssh command you typed to run it, so the
+count it returns is not the number of supervisors.
+
+To restart the server on new code, TERM the **server** and leave the supervisor
+alone — it reboots the child at the new SHA, which the next `=== boot N ===` line
+records. That distinction is load-bearing: the supervisor used to read "stopped on
+purpose" off the child's exit code, and since a killed server exits 143 either way,
+TERMing it exited the supervisor too and left nothing listening
+(errors/2026-09-05-the-supervisor-read-stopped-on-purpose-off-the-wrong-process.md).
+
+## 2. Open it
+
+The server binds `0.0.0.0`, so from this Mac the pod's address works directly:
+
+```
+http://10.37.2.27:8000/
+```
+
+`/` is the playground, `/about` is what tileRL is, `/health` has queue depth,
+block usage, prefix-cache hits and the spec counters.
+
+Two things that cost time to find out: the pod's FQDN has an **AAAA record that
+does not answer** (8 s timeout), so use the bare IPv4; and a stale local server on
+`127.0.0.1:8000` will answer instead of the tunnel if you have one, with a
+different model and garbage output.
+
+An SSH tunnel still works if you would rather not reach the pod directly:
+
+```bash
+ssh -N -L 8000:10.37.2.27:8000 v100
+```
+
+Note the pod-side address is **not** `127.0.0.1` — the server does not bind
+loopback.
+
+## Flags, and why
+
+Set in `scripts/serve_v100.sh`, each from a measurement:
+
+| flag | why |
+|---|---|
+| `--depth 1` | beats the shipped 3 by 1.204x at B=1 (#22/#72) |
+| `--max-batch 1` | B=8 only survives while no prefill is in flight (#42) |
+| `--max-ctx 4096` | the KV pool sizes itself from the config's 262144 otherwise |
+| `--slots 8` (default) | 16 costs 5.19x the KV pool (#65) |
+
+**`--max-ctx` is not optional on this card.** The 27B's config says 262144 tokens
+of context and the pool sizes itself from that: f32 KV for the full window is
+**275 GB**. The card has 32, of which 19 are already weights.
+
+The server prints `N decode graphs in Ms` before the URL: every (batch bucket ×
+chain width) a decode tick can key on is captured up front, so the first message
+starts at the plateau instead of paying ~14 s per capture. `--no-warmup` opts out.
+Note the graph covers the shapes capture *visited* — a request can still introduce
+one it did not, which is what a first-visit compile spike is.
+
+## Rates
+
+Measured on the live server, 2026-09-04, from the pod so RTT is outside the window:
+
+| window | tok/s |
+|---|---:|
+| decode-only (first token → last) | **50.0** |
+| wall (request sent → last token) | 46.3 |
+
+Both are right; they answer different questions, and the page's live counter shows
+the first. **`wall_ms / tokens` is neither** — it charges prefill to decode, reads
+~40, and has already been mistaken for a 15% regression that did not exist. Use
+`scripts/probe_page_rate.py`, which prints both windows from one request.
+
+Benched numbers for reference (direct `step()` loop, fully warm, `--depth 3`):
 
 | ctx | dense tok/s | spec tok/s | prefill ms/token |
 |---:|---:|---:|---:|
@@ -46,27 +110,22 @@ For reference, the benched numbers (direct `step()` loop, fully warm):
 | 2048 | 39.4 | 44.0 | 8.33 |
 | 4096 | 37.6 | 40.3 | 8.92 |
 
-Speculation is on by default (`--depth 3`) and wins from 512 tokens up; at very
-short contexts it loses, because the draft costs more than a short trunk forward
-saves. Drop `--draft` to compare.
+## Environment, if you start it by hand
 
-`/usr/bin/python3`, not the venv: it has torch 2.5.1+cu121, which matches the 535
-driver. nvcc must be 12.4 — the one on the default PATH is 11.8 and rejects
-`-std=c++20`.
+The supervisor sets these; you need them only outside it.
 
-`-c 'from tilerl.cli import main; main()'` rather than `-m tilerl` or the `tilerl`
-console script: the package ships no `__main__.py`, and the entry point pyproject
-declares is installed into the venv, not into `/usr/bin/python3`.
+```bash
+export PATH=/usr/local/cuda-12.4/bin:$PATH      # the default nvcc is 11.8 and rejects -std=c++20
+export TILERL_TARGET=cuda
+export TMPDIR=$HOME/pytmp TMP=$TMPDIR TEMP=$TMPDIR
+export PYTHONPATH=$HOME/tilerl-git/src:$HOME/tilerl-git/packages/tilerl-kernels/src
+export TILERL_QWEN38_SOURCE=$HOME/models/Qwen3.8-27B-NVFP4
+~/venv70/bin/python -u -m tilerl.cli serve --model qwen38-27b \
+    --draft $TILERL_QWEN38_SOURCE/model-00018-of-00018.safetensors --depth 1 \
+    --host 0.0.0.0 --port 8000 --max-batch 1 --max-ctx 4096
+```
 
-**`--blocks 2048 --max-ctx 4096` is not optional on this card.** The 27B's config
-says 262144 tokens of context, and the KV pool sizes itself from that: 131072
-blocks of f32 KV is **275 GB**. The card has 32, of which 19 are already weights.
-Serving is the only path that ever asked for the default — every bench script
-passed `num_blocks` explicitly — so this was unexercised until now. 2048 blocks =
-32768 tokens of KV = 4.3 GB, which serves 8 concurrent rows at 4K.
-
-For 8K context: `--blocks 4096 --max-ctx 8192` (8.6 GB). Above that you are
-trading against the weights.
+`~/venv70/bin/python` has torch 2.5.1+cu121, which matches the 535 driver.
 
 ## How long a context fits, and what buys more
 
@@ -84,9 +143,12 @@ Headroom after weights, states and allocator slack is about **7.5 GiB**:
 | 32768 | 4096 | 8.00 GiB | no, just over |
 | 65536 | 8192 | 16.00 GiB | no |
 
-So **16K works today** with `--max-ctx 16384 --blocks 2048`, and 32K needs one of
-the levers below. Note `--max-batch` multiplies all of it: dropping 8 → 2 is what
-moved the ceiling from 4K to 16K, and `--max-batch 1` doubles it again.
+So **16K works today** with `--max-ctx 16384`, and 32K needs one of the levers
+below. `--blocks` no longer has to be passed: the pool is sized from `--max-ctx`
+and `--max-batch` together — the live server logs `blocks = 4096 tokens` for
+`--max-ctx 4096 --max-batch 1`, which is 256 blocks, half the table's row because
+the table assumes `--max-batch 8`. That multiplier is the point: dropping 8 → 2 is
+what moved the ceiling from 4K to 16K, and `--max-batch 1` doubles it again.
 
 Three levers, cheapest first:
 
@@ -112,22 +174,16 @@ fixed-size recurrent state, so their cost does not grow with context at all —
 which is why this model's context is cheaper than a 64-layer full-attention model
 of the same size.
 
-## 3. Open it
-
-- <http://127.0.0.1:8000/chat> — the playground
-- <http://127.0.0.1:8000/> — landing page
-- <http://127.0.0.1:8000/health> — queue depth, block usage, prefix-cache hits,
-  speculation accept rate
-
 ## Startup is slow, and that is expected
 
-Weight load is ~5 minutes (19 GB from disk, dequantized and twiddled). Then the
-warmup request compiles kernels and captures graphs: cold JIT is 30-120 s per
-kernel shape, and `TILELANG_CACHE_DIR` on persistent storage makes the next run
-~0.2 s each. All of that happens before the URL is printed.
+Weight load is ~5 minutes on a cold page cache (19 GB from disk, dequantized and
+twiddled); warm it is ~36 s to listening. Then the warmup captures graphs: cold JIT
+is 30-120 s per kernel shape, and the tilelang cache (`~/.tilelang/cache`) makes the next run
+~0.2 s each. All of it happens before the URL is printed.
 
 A 4096-token prompt then takes ~36 s to first token (7.89-8.92 ms per prompt
-token). Generation rate: see the table below, not the bench numbers.
+token) — the same figure as a warm load, coincidentally, and a different thing.
+Generation rate: the Rates section above, not the bench table.
 
 If startup looks hung, it is compiling. `tail -f` the server's output to watch.
 
@@ -149,14 +205,20 @@ six-request run. Two separate costs are being paid down here:
    better than with no warmup.
 2. **fp4 kernel JIT**, which specializes per prefill shape. That is the residual
    13.6 → 25.5 ramp, with every graph already resident. It settles after a few
-   messages and `TILELANG_CACHE_DIR` keeps it across restarts.
+   messages, and the tilelang cache (`~/.tilelang/cache`, the default — nothing
+   sets `TILELANG_CACHE_DIR`) keeps it across restarts.
 
 ## If it OOMs anyway
 
-Lower `--blocks` first, then `--slots` (each GDN state slot also owns the
-per-step verify states when a draft is loaded, so 4 is right for 32 GB, not the
-16 a 96 GB card affords). `--max-ctx` caps what a request may ask for, so it
-cannot outgrow the pool you sized.
+Lower `--max-ctx` first — it is what sizes the pool now, and it also caps what a
+request may ask for, so nothing can outgrow the pool you sized. Then `--max-batch`,
+which multiplies it. `--slots` last: the live server runs the default 8 and each GDN
+state slot also owns the per-step verify states when a draft is loaded, so 16 costs
+5.19x the pool (#65) and there is little to reclaim below 8.
+
+`--blocks` still exists and still overrides the derived count, but the live config
+does not pass it; prefer the two knobs above so the number stays derived from what
+you actually want to serve.
 
 ## One job at a time
 
