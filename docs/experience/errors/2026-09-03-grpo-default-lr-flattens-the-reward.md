@@ -30,7 +30,7 @@ tokens against 1/16 at 256. **Wrong**: truncation starves the reward from step
 The second reading was that the reward column is noise. `grpo_loop` draws
 `prompts[step % len(prompts)]`, so consecutive steps are different questions
 and a within-arm trajectory compares prompts, not policies
-([lr-sweep-cannot-attribute](2026-09-03-lr-sweep-cannot-attribute.md)). True,
+([lr-sweep-cannot-attribute](2026-09-03-per-step-reward-cannot-compare-two-policies.md)). True,
 and it is exactly what makes the *across-arm* comparison sound: the prompt is
 `step`-indexed and the seed is `seed + step*group + g`, both identical across
 arms, so at a fixed step every arm sees the same question with the same
@@ -73,7 +73,7 @@ the first non-tied update.
 That entry is not wrong; it was under-powered against the wrong hypothesis. It
 compared 1e-4, 1e-5 and 1e-6 and correctly found them indistinguishable — they
 are one cluster
-([lr-sweep-cannot-attribute](2026-09-03-lr-sweep-cannot-attribute.md)). The arm
+([lr-sweep-cannot-attribute](2026-09-03-per-step-reward-cannot-compare-two-policies.md)). The arm
 it did not include is **1e-3, the value the recipe actually ships**, and that
 one sits outside the cluster. A sweep that omits the shipped value can only ever
 conclude that the arms it did run are the same.

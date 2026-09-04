@@ -127,6 +127,140 @@ def test_generate():
     assert toks_a != toks_c, "different seed must produce different tokens"
 
 
+def test_tokens_generated_equals_the_tokens_poll_returned():
+    """`stats()["tokens_generated"]` is the numerator of every tok/s figure in scripts/
+    (24 references there, and until this test, zero in tests/). If it drifts from what
+    the engine actually returned, every throughput number moves with it and nothing
+    fails.
+
+    The counter is incremented per committed token in `_commit`, and two branches there
+    return BEFORE the increment: a stop token, and a forced end-think token. Both also
+    skip `req.output.append`, so the two sides stay equal -- that is the invariant, not
+    the increment's position. Asserted across three requests at once so a per-request
+    reset or a double count on a batched tick shows up too.
+    """
+    engine = _build_engine(seed=99)
+    try:
+        prompt = np.random.default_rng(3).integers(3, 320, size=8).astype(np.int64)
+        ids = [
+            engine.submit(prompt, SamplingParams(max_new_tokens=6, temperature=0.0, seed=1)),
+            engine.submit(prompt, SamplingParams(max_new_tokens=6, temperature=0.0, seed=2)),
+        ]
+        out = _drain(engine, ids, max_new_tokens=6)
+        returned = sum(len(out[i]) for i in ids)
+        counted = engine.stats()["tokens_generated"]
+        assert counted == returned, (
+            f"tokens_generated {counted} != {returned} tokens poll() returned. Every tok/s "
+            f"in scripts/ divides by this counter, so a drift here silently rescales them."
+        )
+
+        # A stop token ends a reply through the branch that returns early. It is neither
+        # appended nor counted, so the two must still agree.
+        stop = int(out[ids[0]][2])
+        rid = engine.submit(
+            prompt,
+            SamplingParams(max_new_tokens=6, temperature=0.0, seed=1, stop_token_ids=(stop,)),
+        )
+        for _ in range(64):
+            got = engine.poll()
+            if rid in got:
+                break
+            engine.step()
+        else:
+            raise TimeoutError("the stop-token request never finished")
+        assert len(got[rid]) < 6, "the stop token did not end the reply early"
+        assert engine.stats()["tokens_generated"] == returned + len(got[rid]), (
+            "the stop-token path counted a token it did not return, or vice versa"
+        )
+    finally:
+        engine.shutdown()
+
+
+def test_blocks_used_is_what_the_engine_owns_not_what_the_pool_holds():
+    """`blocks_used` gates admission (`usable_blocks` is compared against it), and it is
+    maintained by hand: three `+= ` sites and one `-=`. Nothing asserted its value
+    mid-run, only that it returns to 0 after a failure rollback (:240).
+
+    The invariant is `blocks_used == sum(r.own_blocks)`, NOT `== pool.used_blocks`. The
+    two diverge on purpose: `_finish` frees every block in `req.blocks` but subtracts
+    only `own_blocks`, because a prefix hit adopts blocks the engine did not allocate.
+    So on a hit the pool holds more than the engine owns, and that gap is the prefix
+    store's retention -- which is why both counters exist.
+
+    Checked while a request is live, since a counter that is only inspected at rest
+    cannot show a leak that cancels on teardown.
+    """
+    engine = _build_engine(seed=99)
+    try:
+        rng = np.random.default_rng(1)
+        head = rng.integers(3, 320, size=16).astype(np.int64)  # exactly one block
+        params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=5)
+
+        engine.submit(head, params)
+        engine.step()  # prefill, so blocks are allocated and the request is still live
+        live = list(engine._running) + list(engine._waiting)
+        assert live, "no request is live, so this measures the idle state instead"
+        owned = sum(r.own_blocks for r in live)
+        assert engine.stats()["blocks_used"] == owned, (
+            f"blocks_used {engine.stats()['blocks_used']} != {owned} owned by live requests; "
+            f"admission compares usable_blocks against this number"
+        )
+
+        # Step through decode and re-check every tick. A request growing past a block
+        # boundary allocates mid-run (engine.py:725 and :788), and both sites charge the
+        # counter. Checking only after prefill and after finish misses that: the charge
+        # and the release cancel, so a growth site that never charges still lands on 0.
+        # Measured: without this loop, deleting the `_blocks_used += 1` at :725 was MISSED.
+        grew = False
+        for _ in range(64):
+            engine.step()
+            live = list(engine._running) + list(engine._waiting)
+            if not live:
+                break
+            owned = sum(r.own_blocks for r in live)
+            assert engine.stats()["blocks_used"] == owned, (
+                f"mid-decode: blocks_used {engine.stats()['blocks_used']} != {owned} owned. "
+                f"A growth site allocated a block without charging it, or charged twice."
+            )
+            grew = grew or owned > 1
+        assert grew, (
+            "no request ever owned more than one block, so the mid-run growth path at "
+            "engine.py:725/:788 was never exercised and this loop asserts nothing about it"
+        )
+        engine.poll()
+
+        # Second prompt extends the first by a whole block, so it adopts one.
+        engine.submit(np.concatenate([head, rng.integers(3, 320, size=16).astype(np.int64)]),
+                      params)
+        engine.step()
+        st = engine.stats()
+        live = list(engine._running) + list(engine._waiting)
+        # Asserted unconditionally, not under `if st["prefix_hits"]`: a conditional guard
+        # here would skip the only two checks that matter whenever the adoption stopped
+        # happening, which is exactly the regression to catch. Measured: hits 1,
+        # blocks_used 1, pool_used_blocks 2.
+        assert st["prefix_hits"] == 1, (
+            f"the second prompt did not adopt the first's block (hits={st['prefix_hits']}), "
+            f"so the two counters cannot be compared below"
+        )
+        assert st["blocks_used"] == sum(r.own_blocks for r in live), (
+            "after a prefix hit the engine must count only the blocks it allocated"
+        )
+        assert st["blocks_used"] < st["pool_used_blocks"], (
+            f"a prefix hit adopted blocks, so the pool ({st['pool_used_blocks']}) must "
+            f"hold more than the engine owns ({st['blocks_used']}); equal means either "
+            f"the adopted blocks were charged to the engine or nothing was adopted"
+        )
+    finally:
+        engine.shutdown()
+    # NOT asserted: blocks_used == 0 here. `shutdown` only stops the daemon thread; it
+    # does not finish or free live requests, so a request still running legitimately keeps
+    # its blocks charged. Asserting 0 fails at 1, and the defect would be in the test.
+    assert engine.stats()["blocks_used"] == sum(
+        r.own_blocks for r in list(engine._running) + list(engine._waiting)
+    ), "a request outlived the accounting: charged blocks with no live owner"
+
+
 def test_prefix_cache():
     """A second prompt sharing a block-aligned prefix adopts the cached blocks."""
     engine = _build_engine(seed=99)
@@ -732,7 +866,7 @@ def test_opd_lora_self_teacher():
     prompts = [list(range(8)), list(range(4, 12))]
     losses = opd_loop(teacher, model, prompts, steps=2, backend=backend,
                       optimizer=AdamW(lr=1e-2), seed=0, trainable=trainable)
-    assert len(losses) == 2 and all(l == l for l in losses), losses
+    assert len(losses) == 2 and all(math.isfinite(x) for x in losses), losses
     for k, v in base.items():
         assert torch.equal(model.params[k], v), f"frozen base moved: {k}"
     moved = sum(not torch.equal(trainable[k], v) for k, v in before.items())

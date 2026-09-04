@@ -28,7 +28,7 @@ downstream prep kernel hardcodes `(1 + w)` there.
 
 So a DSpark checkpoint's `1.0` became `2.0`, with no exception and no warning.
 This is the mirror image of
-[errors/2026-08-29](2026-08-29-zero-centered-rmsnorm.md): same silent scale
+[errors/2026-08-29](2026-08-29-draft-head-missing-zero-centered-fold.md): same silent scale
 corruption, opposite direction — and this direction produces none of the
 anti-correlated-logits signature (argmax ranked 248191/248320) that made the
 first one findable. It would have surfaced as "the new head drafts badly",
