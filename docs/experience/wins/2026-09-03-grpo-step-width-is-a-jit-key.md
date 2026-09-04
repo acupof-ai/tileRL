@@ -1,6 +1,6 @@
 # The GRPO batch width is a JIT cache key — cpu, 2026-09-03
 
-> Status: Shipped (cpu); pending-remote (sm90)
+> Status: Shipped (cpu and sm90)
 
 ## Context
 
@@ -61,11 +61,51 @@ once hides a 500× tail.
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
 | 2026-09-03 | pending | Mac (M-series, no GPU) | cpu | tiny | n/a | n/a | n/a |
+| 2026-09-03 | pending | H20 card 6 | cuda sm90 | qwen38-27b | n/a | n/a | n/a |
+
+**sm90 constant, measured (n=5, private cache, LoRA r16, group 8, T≈384):** a
+novel width costs **11.05 s on a 22.23 s `rl_step`, ratio 1.5x** -- novel
+34.7/33.3/33.8/31.2/31.0 s against repeats 22.1/22.0/22.4/23.0/22.2 s. Cold
+warm-up alone is 170.9 s. So the mechanism transfers and the constant does not:
+tiny's 530x is an artifact of a 71 ms step, where compile time is the whole
+measurement. Two earlier runs of the same probe reported 1.3x and 1.0x from a
+shared `TILELANG_CACHE_DIR` that labelled cache hits `novel`
+(errors/2026-09-03-probe-rebuilt-the-setup-in-the-wrong-order.md).
+
+**What n=5 resolves.** These are paired draws, so the statistic is the mean of
+the five differences: 12.6/11.3/11.4/8.2/8.8, mean 10.46 s, sd 1.87, se 0.84.
+A t-interval at 4 df is **8.13 to 12.79 s, i.e. 1.37x to 1.58x**. Quote it as
+**1.5x (95% CI 1.37-1.58, n=5)** and do not distinguish the median ratio
+(1.499) from the mean ratio (1.471): the interval is 4x wider than that gap, so
+the second decimal is not measured. The differences are also bimodal -- three
+near 11.5-12.6, two near 8.2-8.8, nothing between -- which is the shape two
+distinct compiled widths would make, but at n=5 it is a hint, not a finding.
+
+Variances add, so the compile's own spread is
+`sqrt(sd_novel^2 - sd_repeat^2) = sqrt(1.63^2 - 0.40^2) = 1.58 s` of the novel
+arm's 1.63. The step contributes **5.9% of the variance**: nearly all the
+scatter is in the compile, which is what "compile time tracks what the JIT has
+to build" predicts.
+
+The two arms are negatively correlated (r = -0.53), so the paired design
+*widened* the interval rather than tightening it: sd of the differences is
+1.873 s against 1.680 s if the arms were independent, and an unpaired interval
+would read 8.73-12.19 s (1.39x-1.55x) at 8 df. The reported 1.37-1.58x is
+therefore the conservative one -- it is not overstated, and there is no need to
+re-derive this. At n=5, r is indistinguishable from zero; do not read a
+mechanism into it.
+
+This also bounds what the fix is worth against the P1 entry's
+`secs_per_step_median = 60.45` at gen 256: `rl_step` is ~22 s of that, leaving
+~38 s of rollout, and compile can add 11 s only to the steps that hit a new
+width. **The median step carried no surcharge**, so the recorded 60.45 describes
+the step rather than the harness -- the opposite of what the tiny number
+suggested.
 
 Training-step timings, not serving throughput — the serving columns do not apply
-to this entry. sm90 is `pending-remote`: the mechanism is TileLang shape
-specialization, which is target-independent, but the constant is not measured
-there.
+to this entry. The sm90 constant is now measured (table above); it is 1.5x, not
+tiny's 530x, because the 27B step has 22 s of real compute for the compile to be
+a surcharge on.
 
 Raw artifacts: measured inline in this session; reproduce with
 `TILERL_TARGET=cpu uv run tilerl train --recipe grpo-tiny-smoke --force` (12
