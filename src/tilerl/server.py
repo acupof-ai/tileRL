@@ -632,13 +632,18 @@ _CHAT_UI = """<!doctype html>
 
   /* Reasoning: present but subordinate — no box, hairline rule, smaller dim type. */
   .think { margin: 0 0 14px; border-left: 2px solid var(--line); }
+  /* `display: flex` on a <summary> costs it the disclosure behaviour in Chrome and
+     Safari -- the fold rendered and would not open. Keep the summary as list-item and
+     lay the row out on an inner span instead. */
   .think > summary {
-    display: flex; align-items: center; gap: 7px; padding: 1px 0 1px 13px; cursor: pointer;
-    list-style: none; font: 600 9.5px/1.8 var(--sans); text-transform: uppercase;
-    letter-spacing: .1em; color: var(--ink-3);
+    display: list-item; list-style: none; cursor: pointer;
+    padding: 1px 0 1px 13px; font: 600 9.5px/1.8 var(--sans);
+    text-transform: uppercase; letter-spacing: .1em; color: var(--ink-3);
   }
-  .think > summary::-webkit-details-marker { display: none; }
+  .think > summary::marker,
+  .think > summary::-webkit-details-marker { content: ""; display: none; }
   .think > summary:hover { color: var(--ink-2); }
+  .think > summary > .row { display: flex; align-items: center; gap: 7px; }
   .chev { font-size: 7px; line-height: 1; transition: transform .18s ease; }
   .think[open] .chev { transform: rotate(90deg); }
   .n { font: 400 9.5px/1 var(--mono); letter-spacing: 0; text-transform: none; color: var(--ink-3); }
@@ -845,7 +850,7 @@ function addNote(text) {
 // Split a reply into [reasoning, answer].
 //
 // `inside` says the reply BEGINS in the reasoning block, which is what the request
-// asked for: the checkpoint's template ends the prompt with "<think>\n", so
+// asked for: the checkpoint's template ends the prompt with an OPEN think tag, so
 // generation starts inside it and the stream carries only the CLOSING tag --
 // measured on the V100, 300 tokens with </think> and no <think>. Keying on the open
 // tag left the fold dead and printed the reasoning inline as prose. It matters most
@@ -865,13 +870,18 @@ function addThinking(bubble) {
   det.className = "think";
   det.open = true;
   const sum = document.createElement("summary");
+  // The flex row is an inner span: laying the summary itself out with flex costs it
+  // the disclosure behaviour, so the fold rendered and would not open.
+  const row = document.createElement("span");
+  row.className = "row";
   const chev = document.createElement("span");
   chev.className = "chev"; chev.textContent = "▶";
   const label = document.createElement("span");
   label.textContent = "Reasoning";
   const n = document.createElement("span");
   n.className = "n";
-  sum.appendChild(chev); sum.appendChild(label); sum.appendChild(n);
+  row.appendChild(chev); row.appendChild(label); row.appendChild(n);
+  sum.appendChild(row);
   const body = document.createElement("div");
   body.className = "thinkbody";
   det.appendChild(sum); det.appendChild(body);

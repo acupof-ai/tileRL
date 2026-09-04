@@ -116,6 +116,121 @@ def _unresolved(js: str) -> set[str]:
     return bare - _KEYWORDS - _BROWSER_GLOBALS - defined - {""}
 
 
+#: A DOM small enough to run the page's own send path. Not a browser -- it answers one
+#: question the other gates cannot: does clicking send actually reach fetch, and does
+#: the fold's summary keep the structure that makes it clickable.
+_DOM_STUB = """
+const mk = (tag) => ({
+  tagName: tag.toUpperCase(), className: "", textContent: "", innerHTML: "", children: [],
+  style: {}, dataset: {}, open: false, value: "", disabled: false, hidden: false,
+  scrollTop: 0, scrollHeight: 0,
+  classList: { add(){}, remove(){}, toggle(){} },
+  appendChild(c){ this.children.push(c); c.parentNode = this; return c; },
+  insertBefore(c){ this.children.push(c); c.parentNode = this; return c; },
+  querySelector(sel){
+    const hit = (e) => ("." + e.className) === sel ? e : e.children.map(hit).find(Boolean);
+    return hit(this) || mk("span");
+  },
+  querySelectorAll(){ return []; },
+  addEventListener(ev, fn){ (this._h ||= {})[ev] = fn; },
+  setAttribute(){}, getAttribute(){}, focus(){}, remove(){}, scrollIntoView(){},
+});
+globalThis.document = { createElement: mk, getElementById: (i) => IDS[i] ?? null,
+  querySelector: () => mk("div"), querySelectorAll: () => [],
+  addEventListener(){}, body: mk("body") };
+globalThis.window = { addEventListener(){}, location: { origin: "http://x" } };
+globalThis.performance = { now: () => 0 };
+const CALLS = [];
+globalThis.fetch = async (u, o) => { CALLS.push({ u, body: o && o.body });
+  return { ok: true, status: 200, body: { getReader: () => ({ read: async () => ({done: true}) }) } }; };
+globalThis.AbortController = class { constructor(){ this.signal = {}; } abort(){} };
+globalThis.TextDecoder = class { decode(){ return ""; } };
+"""
+
+
+def test_the_page_js_parses():
+    """The whole script block, through a real parser.
+
+    `_CHAT_UI` is an ordinary triple-quoted string, so Python eats every backslash
+    escape in it. A `\\n` inside a `//` comment became a real newline and split the
+    comment in two, leaving `", so` as a statement: SyntaxError, the entire script
+    block dead, and a page that renders but cannot send. The bare-call resolver saw
+    nothing wrong -- it scans text and does not parse -- and every other gate here
+    passed. The served page was broken for a whole deploy.
+
+    This is also why _MD_JS is `r\"\"\"`; the same escape class had already cost a
+    working regex earlier the same day.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the page JS cannot be parsed")
+    js = _script(_CHAT_UI)
+    r = subprocess.run([node, "--check", "-"], input=js, capture_output=True,
+                       text=True, timeout=60)
+    assert r.returncode == 0, f"the page's JS does not parse:\n{r.stderr.strip()[:600]}"
+    # A stray escape shows up as a line that is the tail of a broken string literal.
+    # Cheap, runs without node, and names the cause rather than a parse offset.
+    for n, line in enumerate(js.splitlines(), 1):
+        assert not line.lstrip().startswith('", '), (
+            f"line {n} is {line.strip()!r}: a backslash escape in _CHAT_UI was eaten by "
+            f"Python and split a comment or string. _CHAT_UI is not a raw string."
+        )
+
+
+def test_sending_reaches_fetch_and_the_fold_stays_clickable():
+    """The page's own send path, executed.
+
+    Two failures got past every text-level gate here and reached the user: the script
+    block did not parse at all, and `display: flex` on the <summary> cost it the
+    disclosure behaviour, so the fold rendered and would not open. Both are only
+    visible if the code runs, so run it -- against a stub DOM, no browser.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the send path cannot be executed")
+    # Populate the stub from the page's own ids rather than a hand-kept list -- a stub
+    # missing one id fails as a null deref, which reads like a page bug and is not one.
+    # Asserting they match also catches a `$("x")` whose element was renamed away.
+    wanted = set(re.findall(r'\$\("([\w-]+)"\)', _script(_CHAT_UI)))
+    present = set(re.findall(r'id="([\w-]+)"', _CHAT_UI))
+    assert wanted <= present, f"the JS reads ids the markup does not define: {wanted - present}"
+    ids = "const IDS = {};\n" + "".join(f'IDS["{i}"] = mk("div");\n' for i in sorted(wanted))
+    harness = _DOM_STUB + ids + _script(_CHAT_UI) + textwrap.dedent("""
+        const out = {};
+        const bubble = addMsg("user", "hello");
+        out.addMsg = bubble ? bubble.tagName : null;
+        out.feed = IDS.feed.children.length;
+        await sendChat("hi");
+        // The page also probes /v1/models on load, which carries no body -- pick the
+        // completion POST rather than assuming it is the first call.
+        const post = CALLS.filter((c) => c.body);
+        out.posts = post.length;
+        out.url = post.length ? post[0].u : null;
+        out.thinking = post.length ? post[0].body.includes("enable_thinking") : false;
+        // The fold: <details><summary><span class="row">..., because a flex summary
+        // is not clickable.
+        const body = addThinking(addMsg("assistant", ""));
+        const det = body.parentNode;
+        out.summary = det.children[0].tagName;
+        out.row = det.children[0].children[0].className;
+        out.chev = det.children[0].children[0].children[0].className;
+        console.log(JSON.stringify(out));
+    """)
+    r = subprocess.run([node, "--input-type=module", "-e", harness],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"the page threw when run: {r.stderr.strip()[:600]}"
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert got["addMsg"] == "DIV" and got["feed"] >= 1, f"addMsg built nothing: {got}"
+    assert got["posts"] == 1, f"send did not reach fetch: {got}"
+    assert got["url"] == "/v1/chat/completions", f"send posted to {got['url']!r}"
+    assert got["thinking"], f"the request does not ask for thinking: {got}"
+    assert got["summary"] == "SUMMARY", f"the fold is not a summary: {got}"
+    assert got["row"] == "row" and got["chev"] == "chev", (
+        f"the summary lays itself out instead of an inner row, which is what made the "
+        f"fold unclickable: {got}"
+    )
+
+
 def test_the_slicers_take_one_block_from_a_two_block_page():
     """`server.py` holds two pages, so both slicers can over-capture.
 
