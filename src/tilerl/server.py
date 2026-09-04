@@ -426,10 +426,10 @@ _CHAT_UI = """<!doctype html>
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     --r: 3px; --r2: 7px;
     /* Spacing, on a 4px step. Colour, type and radius were tokenized and this
-       was not, so 35 hand-picked pixel values decided how components line up.
-       Cross-component margins spend these; the handful of raw values left are
-       optical adjustments INSIDE one component (a 7px icon gap, a gauge's
-       4/14/5 padding), which a scale would only make worse. */
+       was not, so 79 hand-picked pixel values decided how components line up.
+       Cross-component margins spend these; 23 raw values over 9 distinct sizes
+       remain, and they are optical adjustments INSIDE one component (a 7px icon
+       gap, a gauge's 4/14/5 padding), which a scale would only make worse. */
     --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 20px;
     --s-6: 24px; --s-8: 32px; --s-10: 40px;
     /* The transcript's label column plus its gap. Notes and events indent to
