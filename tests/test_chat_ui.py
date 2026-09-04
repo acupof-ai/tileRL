@@ -132,7 +132,12 @@ def test_the_check_catches_an_undefined_call():
 
 
 def test_the_index_route_serves_the_page():
-    """`/` returns the page as HTML. The route is one line and nothing covered it."""
+    """`/` returns the CHAT page, and the landing page is still reachable at /about.
+
+    Asserting 200 + text/html + <title> cannot tell the two pages apart -- both satisfy
+    all three -- so the route swap would have been invisible. Key on the composer, which
+    only the chat page has.
+    """
     from tilerl_kernels.backend import get_backend
 
     from tilerl.config import tiny
@@ -144,11 +149,15 @@ def test_the_index_route_serves_the_page():
     cfg = tiny()
     engine = build_engine(cfg, build_random(cfg, seed=3), get_backend(),
                           num_blocks=64, num_slots=2, max_batch=2, max_total_tokens=512)
-    app = create_app(engine, get_tokenizer(None), model_name="tiny")
-    r = TestClient(app).get("/")
-    assert r.status_code == 200
-    assert r.headers["content-type"].startswith("text/html")
-    assert "<title>" in r.text and "</html>" in r.text
+    client = TestClient(create_app(engine, get_tokenizer(None), model_name="tiny"))
+    for route in ("/", "/chat"):
+        r = client.get(route)
+        assert r.status_code == 200, route
+        assert r.headers["content-type"].startswith("text/html"), route
+        assert "<title>" in r.text and "</html>" in r.text, route
+        assert "<textarea" in r.text, f"{route} is not the chat page"
+    about = client.get("/about")
+    assert about.status_code == 200 and "<textarea" not in about.text
 
 
 def test_every_gutter_offset_comes_from_one_token():
