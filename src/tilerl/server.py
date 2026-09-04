@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from typing import Any
 
@@ -61,12 +60,6 @@ class ChatCompletionRequest(BaseModel):
     chat_template_kwargs: dict | None = None
 
     model_config = {"populate_by_name": True}
-
-
-class AgentRequest(BaseModel):
-    message: str
-    max_steps: int | None = Field(default=None, ge=1, le=32)
-    max_tokens: int | None = Field(default=None, ge=1)
 
 
 #: reasoning_effort -> cap on <think> tokens; "none" switches thinking off in the prompt.
@@ -304,57 +297,6 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
     mount_messages(app, engine, tokenizer, model_name)
 
-    # The agent loop runs shell on the server, so it is OFF unless the operator
-    # opts in with TILERL_AGENT_TOOLS=1 and pins the tool root there. The root
-    # is never client-controlled (that would be unauthenticated RCE).
-    _agent_root = os.environ.get("TILERL_AGENT_TOOLS")
-
-    @app.post("/v1/agent")
-    async def agent_run(req: AgentRequest):
-        """Run the tool-calling agent loop and stream its events as SSE.
-
-        Disabled unless TILERL_AGENT_TOOLS names the tool root; the tools run
-        real shell/file ops, so enabling this exposes the server host."""
-        from .agent import Tools, run_agent
-        from .engine import SamplingParams
-
-        if not _agent_root:
-            return JSONResponse(
-                status_code=403,
-                content={"error": {"message": "agent tools disabled; set TILERL_AGENT_TOOLS "
-                                              "to the tool root to enable", "type": "forbidden"}},
-            )
-
-        def generate(messages: list[dict]) -> str:
-            prompt = _render_chat([ChatMessage(**m) for m in messages])
-            input_ids = tokenizer.encode(prompt)
-            params = SamplingParams(
-                temperature=0.0,
-                max_new_tokens=req.max_tokens or 512,
-                seed=0,
-                stop_token_ids=tuple(getattr(tokenizer, "stop_token_ids", ())),
-            )
-            rid = engine.submit(input_ids, params)
-            return tokenizer.decode(_await_completion(rid))
-
-        tools = Tools(_agent_root)
-
-        def _events():
-            try:
-                for kind, payload in run_agent(
-                    req.message, generate, tools, max_steps=req.max_steps or 8
-                ):
-                    yield _sse({"type": kind, "payload": payload})
-            except Exception as exc:  # noqa: BLE001 - surface loop errors to the client
-                yield _sse({"type": "error", "payload": str(exc)})
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(
-            _events(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         return _LANDING
@@ -419,7 +361,7 @@ _LANDING = """<!doctype html>
   <div class="tag">Cross-platform train + inference for <b>Qwen3.8-27B (NVFP4)</b>, one TileLang kernel source.</div>
   <div class="sub">One kernel tree compiles for CPU, Metal, and CUDA — including <b>Volta / sm70</b>,
     the first pre-Ampere card to run the stack. Paged KV with an SSD tier, an on-policy-distillation
-    trainer that shares the serving engine, and a tool-calling agent loop — no second stack.</div>
+    trainer that shares the serving engine — no second stack.</div>
 
   <div class="cta">
     <a class="primary" href="/chat">Open the playground &rarr;</a>
@@ -446,10 +388,9 @@ _LANDING = """<!doctype html>
   <h2>Two ways in</h2>
   <div class="grid">
     <div class="card"><b>Chat</b><p>Stream from the model directly. Live TTFT and tok/s. <a href="/chat">Chat &rarr;</a></p></div>
-    <div class="card"><b>Agent</b><p>Multi-turn tool calls (shell, file read/write) run on the server, streamed live. <a href="/chat">Agent tab &rarr;</a></p></div>
   </div>
 
-  <footer>OpenAI-compatible at <code>POST /v1/chat/completions</code> &middot; agent loop at <code>POST /v1/agent</code></footer>
+  <footer>OpenAI-compatible at <code>POST /v1/chat/completions</code></footer>
 </main>
 <script>
   fetch("/v1/models").then(r => r.json()).then(j => {
@@ -505,7 +446,7 @@ _CHAT_UI = """<!doctype html>
   }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
 
-  /* Header rail: identity left, mode switch middle, instrument cluster right. */
+  /* Header rail: identity left, instrument cluster right. */
   header {
     display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
     padding: 10px 20px; border-bottom: 1px solid var(--line); background: var(--surface);
@@ -589,7 +530,7 @@ _CHAT_UI = """<!doctype html>
     white-space: pre-wrap; overflow-wrap: anywhere;
   }
 
-  /* Agent stream: the five kinds differ by weight and indent, not by hue. */
+  /* Event stream: the kinds differ by weight and indent, not by hue. */
   .ev { margin: 0 0 10px 80px; }
   .ev:first-child { margin-top: 20px; }
   .ev .head {
@@ -711,10 +652,6 @@ _CHAT_UI = """<!doctype html>
     <span class="dot" id="dot"></span>
     <span class="model" id="model">connecting…</span>
   </div>
-  <div class="tabs" role="tablist">
-    <button class="tab on" id="tab-chat" type="button" role="tab" aria-selected="true" onclick="setMode('chat')">Chat</button>
-    <button class="tab" id="tab-agent" type="button" role="tab" aria-selected="false" onclick="setMode('agent')">Agent</button>
-  </div>
   <div class="gauges">
     <div class="gauge">
       <span class="gk">TTFT</span>
@@ -739,7 +676,6 @@ _CHAT_UI = """<!doctype html>
       </ul>
       <dl class="legend">
         <dt>Chat</dt><dd>One streaming turn at a time, with history threaded back each send.</dd>
-        <dt>Agent</dt><dd>A tool-calling loop; each thought, call, and return arrives as its own event.</dd>
       </dl>
     </div>
   </div>
@@ -756,22 +692,7 @@ _CHAT_UI = """<!doctype html>
 </form>
 <script>
 const $ = (id) => document.getElementById(id);
-let busy = false, mode = "chat", history = [], abort = null;
-
-const PLACEHOLDER = {
-  chat: "Message tilerl…",
-  agent: "Give the agent a task — it can run shell, read and write files…",
-};
-
-function setMode(m) {
-  mode = m;
-  for (const k of ["chat", "agent"]) {
-    const t = $("tab-" + k);
-    t.classList.toggle("on", m === k);
-    t.setAttribute("aria-selected", String(m === k));
-  }
-  $("input").placeholder = PLACEHOLDER[m];
-}
+let busy = false, history = [], abort = null;
 
 // The empty state is real content, not a spacer: drop it the moment a turn lands.
 function clearEmpty() {
@@ -916,27 +837,6 @@ async function sendChat(text) {
   if (!bubble.textContent && !think) bubble.textContent = "(empty response)";
 }
 
-async function sendAgent(text) {
-  const t0 = performance.now();
-  abort = new AbortController();
-  const resp = await fetch("/v1/agent", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    signal: abort.signal,
-    body: JSON.stringify({ message: text }),
-  });
-  if (!resp.ok) throw new Error("HTTP " + resp.status);
-  let firstAt = 0;
-  await readSSE(resp, (obj) => {
-    if (!firstAt) { firstAt = performance.now(); $("ttft").textContent = Math.round(firstAt - t0); }
-    const { type, payload } = obj;
-    if (type === "thought") addEvent("thought", "thinking").textContent = payload;
-    else if (type === "action") addEvent("action", payload.tool).textContent = JSON.stringify(payload.args, null, 2);
-    else if (type === "observation") addEvent("observation", "observation").textContent = payload;
-    else if (type === "answer") addEvent("answer", "answer").textContent = payload;
-    else if (type === "error") addEvent("error", "error").textContent = payload;
-  });
-}
-
 function setBusy(on) {
   busy = on;
   $("send").disabled = on;
@@ -952,7 +852,7 @@ async function send() {
   $("input").value = "";
   autosize();
   try {
-    if (mode === "agent") await sendAgent(text); else await sendChat(text);
+    await sendChat(text);
   } catch (err) {
     // Stopping is a deliberate act, not a failure worth an error card.
     if (err && err.name === "AbortError") addNote("Stopped.");
