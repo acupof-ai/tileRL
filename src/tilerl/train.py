@@ -276,11 +276,14 @@ def grpo_loop(
         done = _drain(engine, ids, "grpo_loop rollout")
         comps = [done[i] for i in ids]
         rewards = [float(reward_fn(prompt, c)) for c in comps]
-        # A binary reward stops producing gradient once the policy clears the task:
-        # at an 86% rollout accuracy a group of 8 is all-correct 0.86**8 = 30% of the
-        # time, measured 72% on the 256-token run. `tiebreak` reorders WITHIN the
-        # all-pass and all-fail subgroups so those steps carry signal; it never
-        # crosses the two, so nothing it says can lift a wrong answer over a right one.
+        # A binary reward stops producing gradient once the policy clears the task.
+        # `tied` is that fraction and is the run's health metric: 72% at the 256 cap,
+        # 88.7% at 2048. Do not predict it with p**group -- a tie is all-SAME, not
+        # all-correct, and eight rollouts on one prompt behave like 3.4 independent
+        # ones (wins/2026-09-04-the-cap-was-the-gradient.md). `tiebreak` reorders
+        # WITHIN the all-pass and all-fail subgroups so those steps carry signal; it
+        # never crosses the two, so nothing it says can lift a wrong answer over a
+        # right one.
         if tiebreak is not None:
             rewards = tiebreak(prompt, comps, [r > 0.5 for r in rewards])
         adv = group_advantages(rewards, group)
