@@ -10,6 +10,7 @@ Durable tools — run from a checkout, documented in their docstrings:
 | `rl_compare.sh` | roadmap P5: same pod, same task, tileRL vs verl+sglang |
 | `pod_sync.sh`, `pod.sh`, `pod_fan.sh` | sync this checkout to the H20 pod and run there |
 | `hf_reference.py`, `health_probe.py`, `verify_h20_fp4.py` | external ground truth and the 27B verify checks |
+| `probe_served_rate.py` | the served rate over HTTP, from /health's forward counters — three clock-based instruments got it wrong |
 | `cuda_codegen.py`, `op_parity.py`, `parity_*.py` | kernel codegen inspection and parity gates |
 
 Everything prefixed `probe_`, `diag_`, `bench_<kernel>`, `ab_`, `_` is a

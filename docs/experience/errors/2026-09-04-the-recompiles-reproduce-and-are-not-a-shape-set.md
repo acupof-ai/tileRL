@@ -95,6 +95,14 @@ that exhausts in three pairs is not yet measured. The 269-compile run is the out
 needing explanation, not the 6-compile one. Full numbers in
 `wins/2026-09-04-depth-4-stalls-are-compiles-and-block-parallel-closes.md`.
 
+**Candidate (b) is also refuted**, by a third measurement on the served path: an
+*identical* repeat request compiles **zero** times where its first visit compiled 14. So
+nothing in the cache key changes per call — whatever varies is stable across identical
+requests, which is ordinary first-visit shape specialization. Three data points now
+(6-compile B=1 bench, 14-compile served first visit, 0-compile served repeat) all say
+first-visit; only the 269-compile B=8 run does not, and it is the one left unexplained.
+
+
 
 ## What it costs, and where it does not
 
@@ -103,6 +111,15 @@ needing explanation, not the 6-compile one. Full numbers in
 capture"), and `B` is bucketed to `_GRAPH_BUCKETS` (`engine.py:823`), so a served tick
 replays a graph whose compiles were paid once at capture. At the shipped `--max-batch 8`
 the whole reachable `(B, S)` space is 20 pairs.
+
+> **This paragraph is WRONG and was measured wrong the same day.** The live server
+> compiles **81 times over 40 minutes**, and a first-visit request pays **15.5 s of it
+> inline** — 14 compiles, 17320 ms, 4.4 tok/s, against 1687 ms and 45.0 tok/s for the
+> identical prompt repeated. `engine.py:223` does force the JIT before capture; the
+> conclusion drawn from it is still false, because the graph covers the shapes *capture
+> visited* and a request can introduce one it did not. See
+> [`2026-09-04-a-served-first-visit-pays-10x-and-serve-was-not-immune.md`](2026-09-04-a-served-first-visit-pays-10x-and-serve-was-not-immune.md).
+
 
 **It does bound what the harness can measure.** At B=1 the sweep produced eight clean
 rows because a compile has to land inside a *timed window* to contaminate it, and B=1
