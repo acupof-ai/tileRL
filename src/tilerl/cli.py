@@ -240,7 +240,15 @@ def _train_adapters(args: argparse.Namespace) -> None:
         from .spec import load_draft
 
         draft = load_draft(model, args.draft)
-    engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8, draft=draft,
+    # The pool holds every in-flight row's whole sequence, so a flat 512 blocks is
+    # 8192 tokens across 8 slots -- 1024 each. Past that the rollout dies mid-step on
+    # "PagedKvPool exhausted" (kv_cache.py:80), so --max-new-tokens above ~1024 was
+    # unreachable however the recipe was written. Size the pool from the ask instead.
+    from .kv_cache import BLOCK_TOKENS
+
+    ctx = max(map(len, prompts)) + args.max_new_tokens + 64
+    engine = build_engine(cfg, model, backend, num_slots=8, max_batch=8, draft=draft,
+                          num_blocks=-(-ctx // BLOCK_TOKENS) * 8 + 8, max_total_tokens=ctx,
                           spec_depth=args.depth, decode_graph=False,
                           prefix_store=NoPrefixStore())
     # After build_engine: it materializes the params an adapter must point at.

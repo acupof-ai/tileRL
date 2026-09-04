@@ -217,3 +217,33 @@ if __name__ == "__main__":  # runnable check
     test_group_advantages()
     test_rl_step_matches_sft_at_unit_advantage()
     print("rl: advantage + step OK")
+
+
+def test_the_train_pool_holds_what_max_new_tokens_asks_for(tmp_path, monkeypatch):
+    """A rollout cannot outgrow the pool without the engine raising, so the pool has
+    to follow --max-new-tokens. A flat 512 blocks is 8192 tokens over 8 slots, 1024
+    each, and past that the rollout dies on "PagedKvPool exhausted" rather than
+    truncating. Assert on the kwargs build_engine is HANDED -- recomputing the
+    formula here would pass either way."""
+    import contextlib
+    import json
+
+    from tilerl import cli
+    from tilerl import engine as engine_mod
+    from tilerl.kv_cache import BLOCK_TOKENS
+
+    data = tmp_path / "d.jsonl"
+    data.write_text(json.dumps({"prompt": "2+2?", "answer": "4"}) + "\n")
+    seen, real = {}, engine_mod.build_engine
+    monkeypatch.setattr(engine_mod, "build_engine",
+                        lambda *a, **kw: (seen.update(kw), real(*a, **kw))[1])
+    monkeypatch.setattr("tilerl.ledger.runs_root", lambda: tmp_path)
+    want = 4096
+    with contextlib.suppress(SystemExit):  # a failed gate exits; the kwargs are what matter
+        cli.cmd_train(cli._build_parser().parse_args(
+            ["train", "--rl", "--steps", "1", "--group", "2", "--lora-rank", "2",
+             "--max-new-tokens", str(want), "--data", str(data)]))
+    assert seen, "build_engine was never called"
+    per_slot = seen["num_blocks"] * BLOCK_TOKENS / seen["num_slots"]
+    assert per_slot >= want, f"{per_slot:.0f} tokens per slot cannot hold {want}"
+    assert seen["max_total_tokens"] >= want
