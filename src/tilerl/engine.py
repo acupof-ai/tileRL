@@ -408,16 +408,15 @@ class Engine:
         self._tokens_generated = 0
         self._spec_drafted = 0
         self._spec_accepted = 0
-        # Diagnostic only: set True to keep the last tick's draft and trunk
-        # logits so a probe can rank the trunk's pick inside the draft's
-        # ordering. A [rows, vocab] copy per tick, so never on in serving.
+        # Diagnostic only: set True to keep the last tick's trunk logits and the
+        # chains they scored, so a probe can rank the trunk's pick inside the
+        # draft's ordering. A [rows, vocab] copy per tick, so never on in serving.
         self._keep_draft_logits = False
-        self._draft_logits = None
         self._trunk_logits = None
+        self._verify_chains = None
         #: Set to a list to time each draft forward directly, as (forwards, ms). A
         #: per-tick sync, so never on in serving; None keeps the path unchanged.
         self._draft_ms: list[tuple[int, float]] | None = None
-        self._verify_chains = None
         self._finished_logprobs: dict[int, list[float]] = {}
         self._taken_logprobs: set[int] = set()
         self._last_logprobs: list[float] | None = None
