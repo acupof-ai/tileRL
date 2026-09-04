@@ -51,12 +51,11 @@ loss value; nothing raises.
 
 ## Two things this cost me
 
-**The position rate is not the step rate.** A tenth of a percent reads as
-negligible and it is the wrong denominator. A step is lost if *any* of its scored
-positions drops its token, so the rate compounds over `group x length` and most
-steps go at the recipe's own settings even at the lowest rate measured. Any
-per-token error rate in a training path has to be converted to a per-step rate
-before it can be called small.
+**The position rate is not the step rate.** 0.156% reads as negligible and it is
+the wrong denominator. A step is lost if *any* of its scored positions drops its
+token, so the rate compounds over `group x length` and reaches near-certainty at
+the recipe's own settings. Any per-token error rate in a training path has to be
+converted to a per-step rate before it can be called small.
 
 **My planned test could not have caught it.** The gate I intended was a bitwise
 no-op check at `top_k=0, top_p=1.0, T=1.0` — proving the masked gradient equals
@@ -65,11 +64,10 @@ disabling truncation is exactly the configuration where a dropped token cannot
 occur. A guard that constrains only the case where the mechanism is absent is
 not a guard.
 
-## What transporting the mask would fix, and what it would not
+## The fix, which has a name
 
-Carrying the rollout's kept set into the gradient rather than recomputing it
-removes this failure mode. Converged on independently by three stacks in the month
-before this was written:
+Carry the rollout's kept set into the gradient rather than recomputing it.
+Converged on independently by three stacks in the month before this was written:
 
 - **DeepSeek-V3.2 §3.1, "Keep Sampling Mask"** (arXiv:2512.02556): "we preserve
   the truncation masks during sampling ... and apply them to [the current
@@ -85,17 +83,8 @@ before this was written:
 
 prime-rl's history is the useful part: they hardcoded truncation **off** for
 train rollouts first, ran on that, and only then built mask transport. tileRL
-took the same order for the same reason — the recipe had never completed a step,
-so there was nothing for a subtler estimator to be measured against.
-
-**But transporting the mask is not an upgrade on reward, and the first version of
-this entry implied it was.** Scored on the deployed sampler — the metric that
-grants the whole case for training under q — untruncated rollouts beat both the
-status quo and gradient-under-q, and gradient-under-q is identically zero at 8 of
-12 tiny positions because a one-token nucleus makes `q*A − E_q[A]*q ≡ 0`. Mask
-transport buys the ability to train under the card's sampler at all. That is worth
-having and it is not the same claim. `docs/rl-sota-parity.md` §2 carries the
-numbers and the seed-level spread.
+took the same order for the same reason — the recipe has never completed a step,
+so there is nothing for a subtler estimator to be measured against.
 
 ## Rule
 

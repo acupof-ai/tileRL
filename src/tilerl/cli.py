@@ -265,7 +265,20 @@ def _train_adapters(args: argparse.Namespace) -> None:
         from .spec import load_draft
 
         draft = load_draft(model, args.draft)
-    engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=8, draft=draft,
+    # The pool holds every in-flight row's whole sequence, so a flat 512 blocks is
+    # 8192 tokens across 8 slots -- 1024 each. Past that the rollout dies mid-step on
+    # "PagedKvPool exhausted" (kv_cache.py:80), so --max-new-tokens above ~1024 was
+    # unreachable however the recipe was written. Size the pool from the ask instead.
+    from .kv_cache import BLOCK_TOKENS
+
+    # 1024 floor = the old flat 512 blocks. evals submit prompts this function never
+    # sees -- MMLU reaches 515 tokens against GSM8K's 183 -- so a short
+    # --max-new-tokens must not shrink the pool under them. max_total_tokens only
+    # guards one request and costs no memory, so it never drops below the 8192 default.
+    ctx = max(max(map(len, prompts)) + args.max_new_tokens + 64, 1024)
+    engine = build_engine(cfg, model, backend, num_slots=8, max_batch=8, draft=draft,
+                          num_blocks=-(-ctx // BLOCK_TOKENS) * 8 + 8,
+                          max_total_tokens=max(ctx, 8192),
                           spec_depth=args.depth, decode_graph=False,
                           prefix_store=NoPrefixStore())
     # After build_engine: it materializes the params an adapter must point at.
@@ -297,11 +310,14 @@ def _train_adapters(args: argparse.Namespace) -> None:
             def reward(prompt, completion):
                 return sum(1 for t in completion if t < half) / max(len(completion), 1)
 
+        tiebreak = _judge_tiebreak(engine, tok, params) if args.judge else None
+
         hist = []
         for i, (r, ce, secs, tied) in enumerate(
                 train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
                                     group=args.group, sampling=params, seed=args.seed,
-                                    trainable=trainable, micro=args.micro)):
+                                    trainable=trainable, micro=args.micro,
+                                    tiebreak=tiebreak)):
             hist.append((r, ce, secs, tied))
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
                 f"tied {tied:.2f}  {secs:.1f}s", flush=True)
@@ -324,8 +340,66 @@ def _train_adapters(args: argparse.Namespace) -> None:
     if torch.cuda.is_available():  # the number the group size is really bounded by
         manifest["metrics"]["peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
         log(f"peak allocated {manifest['metrics']['peak_gib']:.2f} GiB")
+    # Before the after-eval, not after it: a gsm8k_after that beats its own baseline is
+    # the run's whole claim, and without the weights that produced it nobody can check
+    # whether the metric moved or the reward was gamed. An eval that dies still leaves
+    # the adapter behind.
+    from safetensors.torch import save_file
+
+    d = Path(runs_root()) / manifest["id"]
+    d.mkdir(parents=True, exist_ok=True)
+    save_file({k: v.detach().cpu().contiguous() for k, v in trainable.items()},
+              str(d / "adapter.safetensors"))
+    manifest["artifacts"]["adapter"] = "adapter.safetensors"
+    log(f"adapter {sum(v.numel() for v in trainable.values()) / 1e6:.1f}M params -> {d}")
     evals("after")
     return _finish(manifest, args.json)
+
+
+def _judge_tiebreak(engine, tok, params):
+    """Rank rollouts the binary reward cannot separate, using the policy as its own judge.
+
+    `answer_match` decides first and the judge only reorders inside the all-pass or
+    all-fail subgroup (judge.py enforces that split), so no judgement can lift a wrong
+    answer over a right one. All C(K,2) pairs are generated in ONE batch and looked up,
+    because judge_rewards asks pair by pair and 56 sequential round trips per step
+    would cost more than the training step itself.
+    """
+    from dataclasses import replace
+
+    from .eval import generate
+    from .judge import judge_rewards
+    from .prompt import render_chat
+
+    sp = replace(params, temperature=0.0, max_new_tokens=4, max_think_tokens=0)
+
+    def ask(q, a, b):
+        return render_chat([("user",
+            f"Problem:\n{q}\n\nTwo worked solutions.\n\n[A]\n{a}\n\n[B]\n{b}\n\n"
+            "Which shows the better reasoning: clearer steps, no unjustified leaps, "
+            "no wasted work? Reply with exactly one token: A or B or tie.")], False)
+
+    def pick(t):
+        t = (t or "").strip().upper()
+        return "A" if t.startswith("A") else "B" if t.startswith("B") else "tie"
+
+    def tiebreak(prompt, comps, passed):
+        q = tok.decode([int(t) for t in prompt])
+        texts = [tok.decode([int(t) for t in c]) for c in comps]
+        pairs = [(i, j) for i in range(len(comps)) for j in range(i + 1, len(comps))]
+        # Both orders for every pair: pair_verdict abstains unless the swapped call
+        # agrees, which is the position-bias control and is not optional.
+        prompts = [ask(q, texts[i], texts[j]) for i, j in pairs] + \
+                  [ask(q, texts[j], texts[i]) for i, j in pairs]
+        out = generate(engine, tok, prompts, sp, 8)
+        n = len(pairs)
+        seen = {(i, j): (pick(out[k]), pick(out[k + n])) for k, (i, j) in enumerate(pairs)}
+        scores, _ = judge_rewards(list(range(len(comps))), passed,
+                                  lambda a, b: seen[(a, b)] if (a, b) in seen
+                                  else tuple(reversed(seen[(b, a)])))
+        return scores
+
+    return tiebreak
 
 
 def _finish(m: dict, as_json: bool) -> None:
@@ -577,6 +651,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_train.add_argument("--eval-gsm8k", help="JSONL {prompt, answer}: greedy exact-match "
                          "accuracy before and after")
     p_train.add_argument("--eval-n", type=int, default=100, help="rows of --eval-gsm8k to score")
+    p_train.add_argument("--judge", action="store_true",
+                         help="let the policy rank rollouts the binary reward ties "
+                              "(judge.py: tests decide first, order only)")
     p_train.add_argument("--force", action="store_true",
                          help="retrain even if this run's manifest is already finished")
     p_train.add_argument("--json", action="store_true",

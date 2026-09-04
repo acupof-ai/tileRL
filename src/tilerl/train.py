@@ -243,6 +243,7 @@ def grpo_loop(
     seed: int = 0,
     trainable: dict[str, Any] | None = None,
     micro: int = 0,
+    tiebreak: Any = None,
 ) -> list[tuple[float, float, float, float]]:
     """GRPO: sample ``group`` completions per prompt in one engine batch, score
     them with ``reward_fn(prompt_ids, completion_ids) -> float``, take one
@@ -271,6 +272,13 @@ def grpo_loop(
         done = _drain(engine, ids, "grpo_loop rollout")
         comps = [done[i] for i in ids]
         rewards = [float(reward_fn(prompt, c)) for c in comps]
+        # A binary reward stops producing gradient once the policy clears the task:
+        # at an 86% rollout accuracy a group of 8 is all-correct 0.86**8 = 30% of the
+        # time, measured 72% on the 256-token run. `tiebreak` reorders WITHIN the
+        # all-pass and all-fail subgroups so those steps carry signal; it never
+        # crosses the two, so nothing it says can lift a wrong answer over a right one.
+        if tiebreak is not None:
+            rewards = tiebreak(prompt, comps, [r > 0.5 for r in rewards])
         adv = group_advantages(rewards, group)
         tied = float((adv.reshape(-1, group) == 0).all(axis=1).mean())
         # One rectangle of a FIXED width: TileLang specializes per shape, so a
