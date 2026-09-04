@@ -399,7 +399,10 @@ def test_fused_projections_parity(tmp_path):
         y2 = fused.forward(batch, positions, kv(fused, tl), tl).cpu()
         y3 = unfused.forward(batch, positions, kv(unfused, tl), tl).cpu()
     assert torch.allclose(y0, y1, rtol=1e-2, atol=1e-2), (y0 - y1).abs().max()
-    assert torch.equal(y2, y3), (y2 - y3).abs().max()  # the fusion, on the served backend
+    # The fusion, on the served backend. NOT torch.equal: one fused gemm and two
+    # separate ones reduce in a different order, which is bit-identical on cpu and
+    # 9.5e-06 apart on metal. A broken fusion is off by orders of magnitude.
+    assert torch.allclose(y2, y3, rtol=0, atol=1e-4), (y2 - y3).abs().max()
     if not tl.target.startswith("cuda"):
         # sm90 sends these 32 rows to w4a8, whose e4m3 activations sit 19.8% off the
         # f32 reference at this M -- no tolerance there separates a broken fusion from
