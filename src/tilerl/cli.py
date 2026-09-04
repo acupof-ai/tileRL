@@ -285,11 +285,14 @@ def _train_adapters(args: argparse.Namespace) -> None:
             def reward(prompt, completion):
                 return sum(1 for t in completion if t < half) / max(len(completion), 1)
 
+        tiebreak = _judge_tiebreak(engine, tok, params) if args.judge else None
+
         hist = []
         for i, (r, ce, secs, tied) in enumerate(
                 train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
                                     group=args.group, sampling=params, seed=args.seed,
-                                    trainable=trainable, micro=args.micro)):
+                                    trainable=trainable, micro=args.micro,
+                                    tiebreak=tiebreak)):
             hist.append((r, ce, secs, tied))
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
                 f"tied {tied:.2f}  {secs:.1f}s", flush=True)
@@ -326,6 +329,52 @@ def _train_adapters(args: argparse.Namespace) -> None:
     log(f"adapter {sum(v.numel() for v in trainable.values()) / 1e6:.1f}M params -> {d}")
     evals("after")
     return _finish(manifest, args.json)
+
+
+def _judge_tiebreak(engine, tok, params):
+    """Rank rollouts the binary reward cannot separate, using the policy as its own judge.
+
+    `answer_match` decides first and the judge only reorders inside the all-pass or
+    all-fail subgroup (judge.py enforces that split), so no judgement can lift a wrong
+    answer over a right one. All C(K,2) pairs are generated in ONE batch and looked up,
+    because judge_rewards asks pair by pair and 56 sequential round trips per step
+    would cost more than the training step itself.
+    """
+    from dataclasses import replace
+
+    from .eval import generate
+    from .judge import judge_rewards
+    from .prompt import render_chat
+
+    sp = replace(params, temperature=0.0, max_new_tokens=4, max_think_tokens=0)
+
+    def ask(q, a, b):
+        return render_chat([("user",
+            f"Problem:\n{q}\n\nTwo worked solutions.\n\n[A]\n{a}\n\n[B]\n{b}\n\n"
+            "Which shows the better reasoning: clearer steps, no unjustified leaps, "
+            "no wasted work? Reply with exactly one token: A or B or tie.")], False)
+
+    def pick(t):
+        t = (t or "").strip().upper()
+        return "A" if t.startswith("A") else "B" if t.startswith("B") else "tie"
+
+    def tiebreak(prompt, comps, passed):
+        q = tok.decode([int(t) for t in prompt])
+        texts = [tok.decode([int(t) for t in c]) for c in comps]
+        pairs = [(i, j) for i in range(len(comps)) for j in range(i + 1, len(comps))]
+        # Both orders for every pair: pair_verdict abstains unless the swapped call
+        # agrees, which is the position-bias control and is not optional.
+        prompts = [ask(q, texts[i], texts[j]) for i, j in pairs] + \
+                  [ask(q, texts[j], texts[i]) for i, j in pairs]
+        out = generate(engine, tok, prompts, sp, 8)
+        n = len(pairs)
+        seen = {(i, j): (pick(out[k]), pick(out[k + n])) for k, (i, j) in enumerate(pairs)}
+        scores, _ = judge_rewards(list(range(len(comps))), passed,
+                                  lambda a, b: seen[(a, b)] if (a, b) in seen
+                                  else tuple(reversed(seen[(b, a)])))
+        return scores
+
+    return tiebreak
 
 
 def _finish(m: dict, as_json: bool) -> None:
@@ -572,6 +621,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_train.add_argument("--eval-gsm8k", help="JSONL {prompt, answer}: greedy exact-match "
                          "accuracy before and after")
     p_train.add_argument("--eval-n", type=int, default=100, help="rows of --eval-gsm8k to score")
+    p_train.add_argument("--judge", action="store_true",
+                         help="let the policy rank rollouts the binary reward ties "
+                              "(judge.py: tests decide first, order only)")
     p_train.add_argument("--force", action="store_true",
                          help="retrain even if this run's manifest is already finished")
     p_train.add_argument("--json", action="store_true",

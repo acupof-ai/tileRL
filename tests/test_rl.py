@@ -279,3 +279,33 @@ def test_the_run_saves_the_adapter_that_produced_its_metrics(tmp_path, monkeypat
     got = load_file(str(run / "adapter.safetensors"))
     assert got, "adapter file is empty"
     assert any(k.endswith((".lora_a", ".lora_b")) or "lora" in k for k in got), sorted(got)[:5]
+
+
+def test_the_judge_restores_gradient_without_crossing_the_bands():
+    """A binary reward stops teaching once the policy clears the task: at 86% rollout
+    accuracy a group of 8 is all-correct 30% of the time, and the 256-token run measured
+    72% of steps with every advantage zero. The tiebreak has to fix that WITHOUT letting
+    a judged ordering lift a wrong answer over a right one -- if it ever can, the judge
+    is scoring a fact it cannot see."""
+    from tilerl.judge import judge_rewards
+    from tilerl.train import group_advantages
+
+    # what the run actually hits: 8 correct rollouts, one reward, no signal
+    tied = [1.0] * 8
+    assert not group_advantages(tied, 8).any(), "a tied group already had gradient"
+
+    def prefers_lower(a, b):  # a stable, transitive order, both call orders agreeing
+        v = "A" if a < b else "B"
+        return (v, v)
+
+    scored, _ = judge_rewards(list(range(8)), [True] * 8, prefers_lower)
+    assert group_advantages(scored, 8).any(), "the judge left the group with no gradient"
+
+    # bands: every failure stays under every pass, whatever the judge said
+    mixed, _ = judge_rewards(list(range(6)), [True, True, True, False, False, False],
+                             prefers_lower)
+    assert min(mixed[:3]) > max(mixed[3:]), f"a failure outranked a pass: {mixed}"
+
+    # a judge that contradicts itself across the swap must yield no order, not a guess
+    flat, _ = judge_rewards(list(range(4)), [True] * 4, lambda a, b: ("A", "A"))
+    assert len(set(flat)) > 1 or not group_advantages(flat, 4).any()
