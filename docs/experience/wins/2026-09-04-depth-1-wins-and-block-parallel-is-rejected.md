@@ -169,6 +169,22 @@ agrees with that rung measured elsewhere at the **same `(rows, W, ctx)`**, and i
 tok/fwd is physically reachable. Drop the two-term identity; it is a restatement of the
 harness's own subtraction.
 
+**And the replacement has a limit worth stating, found by the peer from the other side.**
+`verify` cannot anchor anything: it is *defined* as tick minus its own rung's draft, so a
+stall lifts tick and draft together and verify absorbs none of it. Their B=8 run read
+verify **48.30 / 48.32 / 47.92** across three depths whose ticks moved **11x** — the
+flatness was the subtraction, not the kernel. So the rung cross-check above is a
+**consistency check between clean rows, not a filter that finds dirty ones**: rung 2
+agreeing to 0.17% across four depths works because those four ticks were themselves
+clean. The harness has exactly one independently measured timing per tick — the draft, via
+CUDA events — and everything else is algebra on the wall clock.
+
+These eight rows survive that reading (all monotone, all groups within 1.075x, verdict
+unchanged with the first group dropped), and **three groups is not enough replication in
+general**: at 3 groups the peer's B=8 depth 1 looked like one outlier of three and read
+320 tok/s; at 6 groups all six were clean and it read 305.1. Nothing here faced that
+question, which is luck about which regime B=1 sits in rather than a property of 3 groups.
+
 One further correction, mine: I first flagged rung 4 and rung 8 as "split" between my
 rows (45-48, 80-83) and the peer's (24, 25). That is **not** contamination. The ladder
 rounds `rows × W`, so the same rung is reached from different `(rows, W)` — my rung 4 is

@@ -299,8 +299,20 @@ def main() -> None:
             # the spread is between passages or along the run; these rows can.
             if len(got) > 1:
                 for i, g in enumerate(got):
+                    # The draft PER GROUP, not just pooled. The pooled figure is the one
+                    # term that actually moves when a group stalls, and reading it pooled
+                    # cost the sm90 peer a published 24.5x "draft scales with depth" that
+                    # was three differently-contaminated pools compared to each other:
+                    # at 3 groups depth 1 read 9.21 ms/forward, at 6 groups 4.18. And it
+                    # cannot be recovered as `tick - verify`, because verify is DEFINED as
+                    # tick minus its own rung's draft -- a stall lifts tick and draft
+                    # together and verify absorbs none of it, which is why verify read
+                    # 48.30/48.32/47.92 across ticks that moved 11x.
+                    dnf = sum(f for f, _ in g[4])
+                    dms = sum(v for _, v in g[4]) / max(dnf, 1) if g[4] else 0.0
                     print(f"        p{i}: {g[0]:>8.2f} {g[1]:>8.2f} "
-                          f"{1000 * g[1] / g[0]:>7.1f}")
+                          f"{1000 * g[1] / g[0]:>7.1f}"
+                          + (f"  draft {dms:>7.2f}" if g[4] else ""))
             ms = sum(g[0] for g in got) / len(got)
             tpf = sum(g[1] for g in got) / len(got)
             chain = sum(g[2] for g in got) / len(got)
