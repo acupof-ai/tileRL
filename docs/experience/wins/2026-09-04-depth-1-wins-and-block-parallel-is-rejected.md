@@ -179,15 +179,19 @@ verify times comparable across B**; only identical `(rows, W, ctx)` does. Rung 2
 exception that makes the peer's compile visible, because there both runs are 1 row at
 W=2.
 
-## Checked: the sm90 peer's p0 contamination does not reach these rows
+## Checked: B=8's group-to-group swing does not reach these rows
 
-At B=8 the peer measured `groups[0]` — the same prompts the warm pass had just run —
-coming out **3.0x slower** than the two unwarmed groups, and concluded that
-`measure(groups[0])` at `:291` is one insufficient warm pass, making **p0 structurally
-unusable at any `--prompts`**. That would put a contaminated third inside every pooled
-mean here, so it needed checking rather than assuming.
+At B=8 on sm90 the peer's groups swing violently — up to **25x** between groups of the
+same depth — which would put a contaminated share inside every pooled mean here if the
+same effect were present. It needed checking rather than assuming.
 
-It does not hold at B=1. My p0 is the **fastest** group in 6 of 8 rows:
+**No mechanism is offered for that swing.** The peer first proposed that
+`measure(groups[0])` at `:291` is one insufficient warm pass, making `p0` the dirty group
+always; their own later depths refuted it and they retracted it before this entry landed.
+The contamination is not pass-ordered — it was p0 at depth 1, p2 at depth 2, p1 *and* p2
+at depth 3. Recorded as an observation with no explanation, which is where it stands.
+
+It does not reach B=1. My p0 is the **fastest** group in 6 of 8 rows:
 
 ```
                 p0      p1      p2    p0/min(p1,p2)
@@ -197,7 +201,7 @@ ctx2048 d1   36.18   38.11   38.16      0.9494x
 ctx2048 d4   98.64   91.79   98.03      1.0746x   <- worst
 ```
 
-Worst p0 excess across all eight rows is **1.0746x** against the peer's 3.0x. A compile
+Worst group excess across all eight rows is **1.0746x** against B=8's 25x. A compile
 moves the *tick*; nothing here does.
 
 What does vary across my groups is **tok/fwd, falling monotonically** — 1.90 → 1.79 →
