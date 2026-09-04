@@ -2,25 +2,33 @@
 
 **Serve and RL-train Qwen3.8-27B (NVFP4) on one Hopper card, in one process.**
 
-sglang refuses this checkpoint on Hopper; vLLM falls back to weight-only Marlin.
-tileRL runs fp4 weights × fp8 activations in its own TileLang kernels — **135.5 tok/s
-single-stream against sglang's 54.2** — and the engine that samples is the model that trains.
+sglang refuses this checkpoint on Hopper. tileRL runs it in its own TileLang kernels —
+**135.5 tok/s single-stream against sglang's 54.2** — and the engine that samples is the
+model that trains.
 
 | one H20, Qwen3.8-27B | B=1 decode tok/s | prefill tok/s | MMLU 0-shot |
 |---|---:|---:|---:|
-| **tileRL**, NVFP4 + FP8, speculation on | **135.5** | — | 74.2% |
-| **tileRL**, NVFP4 + FP8 | **92.4** | **2887.6** | 74.6% |
-| sglang, bf16 (cannot load NVFP4 on Hopper) | 54.2 | — | — |
-| sglang, online fp8 | 39.9 | — | — |
+| **tileRL**, NVFP4 + FP8, speculation on | **135.5** | — | — |
+| **tileRL**, NVFP4 + FP8 | **92.4** | **2689.8** | 74.6% |
+| sglang, bf16 (cannot load NVFP4 on Hopper) | 54.2 | 2512 | — |
+| sglang, online fp8 | 39.9 | **4022** | — |
 
-B=1 decode is the target because that is the shape a rollout has. sglang wins prefill
-and wins B=8 decode; both its arms run a dequantized bf16 checkpoint that emits
-garbage, which is why their MMLU column is empty. Speculation is a B=1 lever only —
-at B=8 it lands at 0.928x.
+B=1 decode is the target because that is the shape a rollout has. sglang's fp8 arm still
+wins prefill; its bf16 arm no longer does. Both its arms run a dequantized bf16
+checkpoint that emits garbage, which is why their MMLU column is empty. Speculation is a
+B=1 lever only — at B=8 it lands at 0.928x, and it leaves MMLU bit-identical, so the two
+tileRL rows share one accuracy number.
+
+The two decode rows are different experiments, not a before/after: 135.5's own base arm
+read 78.4 on that workload (1.728x), while 92.4 is the committed `d512-b1` baseline.
+Weights are fp4 against **bf16** activations at B=1 — the fp8-activation path is the
+M > 1 kernel, so it carries prefill and batched decode, not the single-stream number
+this table leads with.
 
 **The same checkpoint also runs on a V100** — sm70, no bf16, no fp8 hardware path, two
-generations before NVFP4 existed. 43.2 tok/s wall over the network, 22 GiB. It is not
-the perf target; it is the evidence that the kernels are not bound to one arch.
+generations before NVFP4 existed. 50.0 tok/s decode-only, 46.3 wall measured from the
+pod with RTT outside the window; 19 GB of weights off disk. It is not the perf target;
+it is the evidence that the kernels are not bound to one arch.
 
 ```
 curl http://10.37.2.27:8000/v1/chat/completions -H 'Content-Type: application/json' \
@@ -71,6 +79,7 @@ OpenAI `/v1/chat/completions` and Anthropic `/v1/messages` — point a client, o
 Code, at it. No GPU: `uv run tilerl serve` runs the tiny model on CPU.
 
 ```bash
+uv add datasets   # only for the GSM8K dump below; not a runtime dependency
 python scripts/gsm8k_jsonl.py train gsm8k.jsonl
 uv run tilerl train --recipe grpo-gsm8k-27b --data gsm8k.jsonl --eval-gsm8k gsm8k_test.jsonl
 uv run tilerl ledger
@@ -86,5 +95,8 @@ uv run tilerl ledger
 [`docs/experience/`](docs/experience/) — every measurement, win and dead end, dated ·
 [`AGENTS.md`](AGENTS.md) — the gates a change clears
 
-Every number above sits in a dated entry under `docs/experience/`, gated at ≥ 0.97× the
-committed baseline. `uv run pytest` is the suite that gates every commit.
+Every number above sits in a dated entry under `docs/experience/`. The decode, prefill,
+KV-reuse and training rows are additionally held by `bench` against
+[`bench-baseline.json`](docs/experience/wins/bench-baseline.json) at ≥ 0.97×; the sglang
+comparison, the V100 arm and the GSM8K results have no baseline key and rest on their
+entries alone. `uv run pytest` is the suite that gates every commit.
