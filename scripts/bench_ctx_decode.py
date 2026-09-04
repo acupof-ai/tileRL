@@ -184,8 +184,9 @@ def measure(e, ctx: int, tokens: int, batch: int = 1, vocab: int = 0) -> tuple[f
     return n / wall, n / max(fwd, 1), n
 
 
-def timed(e, ctx: int, tokens: int, batch: int = 1, vocab: int = 0) -> tuple[float, float, str]:
-    """Warm this context, then measure it, and flag an unwarmed reading.
+def timed(e, ctx: int, tokens: int, batch: int = 1, vocab: int = 0,
+          repeats: int = 2) -> tuple[float, float, float, float, str]:
+    """Warm this context, then measure it ``repeats`` times, and report the spread.
 
     A speculative run captures a CUDA graph per (batch, chain width), and a
     width first seen inside a timed window puts its multi-second compile in the
@@ -195,13 +196,27 @@ def timed(e, ctx: int, tokens: int, batch: int = 1, vocab: int = 0) -> tuple[flo
     that still slipped through, since a capture is seconds against a tick of
     tens of ms and a clean pair agrees closely.
 
+    The spread is REPORTED, not discarded. This function already took three draws
+    and returned the last one, so two warm draws per point existed and were thrown
+    away -- which is how a 1.20x acceptance difference at ctx 1024 and 4096 with
+    0.99x at 2048 got read as a code change (task #67). A number without its spread
+    cannot be compared to another run's, and every acceptance claim in this file's
+    history was one draw.
+
     Flags rather than raises: a SystemExit here leaves the engine holding the
     whole card, and the orphan is invisible until the next run OOMs.
     """
-    measure(e, ctx, tokens, batch, vocab)
-    warm, _, _ = measure(e, ctx, tokens, batch, vocab)
-    tps, per_fwd, _ = measure(e, ctx, tokens, batch, vocab)
-    return tps, per_fwd, " UNWARMED" if tps > 2 * warm else ""
+    measure(e, ctx, tokens, batch, vocab)  # JIT + capture absorber, never timed
+    draws = [measure(e, ctx, tokens, batch, vocab)[:2] for _ in range(max(2, repeats))]
+    tps = [d[0] for d in draws]
+    pf = [d[1] for d in draws]
+    mean_tps, mean_pf = sum(tps) / len(tps), sum(pf) / len(pf)
+    # Spread as a ratio of the mean: a capture that slipped into one draw shows up
+    # here as a large number, which is what the old `tps > 2 * warm` check tested
+    # with one draw against another and no third opinion.
+    return (mean_tps, mean_pf, (max(tps) - min(tps)) / mean_tps,
+            (max(pf) - min(pf)) / mean_pf,
+            " UNWARMED" if max(tps) > 2 * min(tps) else "")
 
 
 def main() -> None:
@@ -210,6 +225,12 @@ def main() -> None:
     ap.add_argument("--draft")
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--tokens", type=int, default=128)
+    ap.add_argument("--repeats", type=int, default=2,
+                    help="timed draws per context, after one untimed warmup. The mean and "
+                         "the max-min spread are both printed: one draw of tok/fwd moved "
+                         "1.20x between two runs of the identical command (task #67), so a "
+                         "single-draw acceptance number cannot be compared across runs. "
+                         "Each draw costs one full prefill at ~31 ms/prompt token.")
     ap.add_argument("--batch", type=int, default=1,
                     help="concurrent requests per tick; the rung a verify tick compiles "
                          "keys on B*W, so B=1 never reaches the 32 rung serving uses")
@@ -259,11 +280,17 @@ def main() -> None:
             f"--min-ctx {args.min_ctx} --max-ctx {args.max_ctx} excludes every context in {CTXS}"
         )
     blocks = b * (-(-(max(ctxs) + args.tokens + 2 * (1 + args.depth)) // BLOCK_TOKENS)) + 32
-    # Print it: the pool is a function of max(ctxs), so two runs that both report a
-    # "ctx=512" row can be holding different amounts of free memory. Comparing those
-    # rows across runs stalled one at a context the other measured at 88.5 tok/s.
+    # Print the pool AND every parameter the numbers depend on. The pool alone is not
+    # enough: lcfix2.log and lc19.log differ by 554 vs 562 blocks, which inverts to
+    # --tokens 64 vs 128 and nothing else, and comparing their tok/fwd columns as if
+    # they were the same configuration cost four wrong causal theories (task #67).
+    # --tokens IS the measurement window -- it closes at the first completion, so a
+    # shorter window averages acceptance over a different stretch of the generation.
     print(f"pool: {blocks} blocks ({blocks * 2.125:.0f} MiB) sized for ctx={max(ctxs)}, "
           f"sweeping {ctxs}")
+    print(f"config: depth={args.depth} tokens={args.tokens} batch={args.batch} "
+          f"slots={slots} max_batch={b} repeats={args.repeats} "
+          f"prompt=randint(vocab,seed=1000+i)")
     e = build_engine(cfg, model, backend, num_blocks=blocks, num_slots=slots, max_batch=b,
                      # Follows the sweep, not a constant: a hardcoded 8192 rejected the
                      # ctx=8192 row itself, since a request is ctx + tokens + drafts.
@@ -280,11 +307,13 @@ def main() -> None:
     label = f"spec d{args.depth}" if draft else "dense"
     w = 1 + args.depth if draft else 1
     rows = args.batch * w
-    print(f"\n{label} B={args.batch} ({rows} rows/tick): "
-          f"{'ctx':>6} {'tok/s':>8} {'ms/tok':>8} {'tok/fwd':>8}")
+    print(f"\n{label} B={args.batch} ({rows} rows/tick), {args.repeats} timed draws/point: "
+          f"{'ctx':>6} {'tok/s':>8} {'ms/tok':>8} {'tok/fwd':>8} {'s_tps':>7} {'s_tpf':>7}")
     for ctx in ctxs:
-        tps, per_fwd, flag = timed(e, ctx, args.tokens, args.batch, cfg.vocab_size)
-        print(f"{ctx:>6} {tps:>8.1f} {1000 / tps:>8.1f} {per_fwd:>8.2f}{flag}")
+        tps, per_fwd, s_tps, s_pf, flag = timed(
+            e, ctx, args.tokens, args.batch, cfg.vocab_size, args.repeats)
+        print(f"{ctx:>6} {tps:>8.1f} {1000 / tps:>8.1f} {per_fwd:>8.2f} "
+              f"{s_tps:>6.1%} {s_pf:>6.1%}{flag}")
 
 
 def _self_check() -> None:
@@ -308,7 +337,23 @@ def _self_check() -> None:
         pass
     else:
         raise AssertionError("vocab=0 must be refused here, not inside a pod run")
-    print("bench_ctx_decode: prompt depends on ctx only through length")
+    # `timed` must return the MEAN of its draws and a spread that catches a divergent
+    # one, on the GPU-less box, because the failure it exists to stop is silent: a
+    # single draw prints the same shape as a mean. Fake `measure` with a known set.
+    global measure
+    real, seq = measure, iter([(40.0, 2.0, 0), (44.0, 2.4, 0), (36.0, 2.0, 0)])
+    measure = lambda *a, **k: next(seq)  # noqa: E731
+    try:
+        tps, pf, s_tps, s_pf, flag = timed(None, 0, 0, repeats=2)
+    finally:
+        measure = real
+    # First draw is the untimed absorber, so the mean is of 44.0 and 36.0.
+    assert abs(tps - 40.0) < 1e-9, f"timed must average its TIMED draws, got {tps}"
+    assert abs(pf - 2.2) < 1e-9, f"tok/fwd must be averaged too, got {pf}"
+    assert abs(s_tps - 8.0 / 40.0) < 1e-9, f"spread must be (max-min)/mean, got {s_tps}"
+    assert not flag, f"a 1.22x spread is not UNWARMED, got {flag!r}"
+    print("bench_ctx_decode: prompt depends on ctx only through length; "
+          f"timed() averages {2} draws and reports {s_tps:.1%} spread")
 
 
 if __name__ == "__main__":

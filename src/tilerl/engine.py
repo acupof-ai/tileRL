@@ -1214,7 +1214,17 @@ def build_engine(
         conv_dim=cfg.linear_qkv_dim,
         spec_steps=draft.width if draft is not None else 0,
     )
-    kv_io = getattr(backend, "io", torch.bfloat16)
+    # The KV pool's dtype IS the attention kernel's ABI, but only a cuda kernel has one
+    # here: main passed NO dtype and every target took PagedKvPool's bf16 default, so
+    # routing backend.io in unconditionally moved cpu and metal from bf16 to f32 --
+    # K and V stopped being rounded on store on the cell that certifies every kernel in
+    # this repo, at 2x the bytes, with the whole suite green (a parity check moves the
+    # TileLang and torch sides together, so nothing could see it). io itself is right on
+    # cpu; PagedKvPool's DEFAULT is what disagrees with it, so narrow the call site.
+    # getattr on BOTH: RefBackend and the other test doubles declare neither, and
+    # asking for .arch directly raised AttributeError in 7 tests.
+    kv_io = (getattr(backend, "io", torch.bfloat16)
+             if getattr(backend, "arch", "").startswith("sm") else torch.bfloat16)
     if not num_blocks:
         num_blocks = _fit_blocks(cfg, backend, kv_io, max_blocks,
                                  draft_layers=0 if draft is None else draft.cfg.num_layers)

@@ -14,6 +14,13 @@ process, one pool.
 
 ## What Worked
 
+> **Label added 2026-09-04:** these rows are `--tokens 64`, recoverable only by
+> inverting the 554-block pool line. `--tokens` IS the measurement window, so
+> tok/forward here is not comparable to any 128-token row — the same code reads 2.44
+> at ctx=1024 with `--tokens 128`. The rows are correct; they were unlabelled, and
+> four commits were investigated for the resulting gap.
+> [errors/2026-09-04-four-candidates-cleared-for-a-flag-difference.md](../errors/2026-09-04-four-candidates-cleared-for-a-flag-difference.md)
+
 | ctx | tok/s | ms/tok | tok/fwd | tick ms |
 |---:|---:|---:|---:|---:|
 | 1024 | 38.8 | 25.8 | 2.03 | 52.3 |

@@ -981,8 +981,13 @@ def _full_context_draft(cfg, model, draft, backend, toks: list[int]) -> torch.Te
     kv = BatchKv(
         block_table=torch.arange(nblk, dtype=torch.long).reshape(1, nblk),
         seq_len=torch.tensor([n]), state_slot=torch.zeros(1, dtype=torch.long),
+        # The pool dtype IS the attention/write kernel's ABI, and PagedKvPool defaults
+        # to bf16 while sm70's is f32: without this the write_tokens_f32 kernel rejects
+        # K with "input K dtype mismatch, expected float32" and six arms of the parity
+        # test below fail on a V100 for a reason that is this helper's, not the engine's.
         kv_pool=PagedKvPool(nblk, cfg.num_kv_heads, cfg.head_dim, num_layers=1,
-                            device=backend.device, layer_map=(0,)),
+                            device=backend.device, layer_map=(0,),
+                            dtype=getattr(backend, "io", torch.bfloat16)),
         state_pool=None, seq_q_lens=torch.tensor([n]),
     )
     return draft.forward(hid[-1][:, :n], np.array([toks[1:]]),
@@ -1428,6 +1433,40 @@ def test_the_sm70_split_count_follows_the_query_width():
     assert src.count("KVSPLIT=ks") == 2, "split and combine must agree, or the ABI asserts"
 
 
+def test_the_cpu_kv_pool_keeps_mains_dtype_now_that_build_engine_passes_one():
+    """``build_engine`` passes ``backend.io`` as the paged KV pool's dtype; origin/main
+    passed NOTHING and the pool took ``PagedKvPool``'s bf16 default. So the branch
+    changes the CPU parity cell's KV dtype **bf16 -> f32** — and the cause is not the
+    arch split, which agrees with main on cpu (main computed io inline as
+    `cuda ? bf16 : f32`, i.e. f32 on cpu). The cause is that PagedKvPool's DEFAULT
+    disagrees with main's own io rule, so routing io into it moves cpu even when io
+    is right.
+
+    K and V are no longer rounded to bf16 on store, so ``paged_attention`` computes
+    different values on the target that certifies every kernel in this repo, and the
+    pool costs 2x the bytes. The whole suite stayed green: a parity check compares
+    TileLang against a torch reference in the SAME process, so both sides moved
+    together and no assertion could see it.
+
+    Asserts the pool a CPU engine really builds, not a dtype table — a rule restated
+    here would agree with itself while build_engine drifted."""
+    cfg = tiny()
+    backend = get_backend()
+    if backend.arch != "cpu":
+        pytest.skip("this pins the CPU parity cell's dtype; other arches have their own")
+    model = build_random(cfg, seed=3)
+    e = build_engine(cfg, model, backend, num_blocks=8, num_slots=2, max_batch=2,
+                     max_total_tokens=64)
+    got = e._kv.k_pool.dtype
+    assert got is torch.bfloat16, (
+        f"the CPU KV pool is {got} where origin/main built bfloat16. build_engine now "
+        "passes backend.io (f32 on cpu) where main passed no dtype and PagedKvPool "
+        "defaulted to bf16, so K/V are no longer rounded on store and the parity cell "
+        "computes different attention values than main. Pass io only on cuda, or make "
+        "the pool's default follow it."
+    )
+
+
 def test_the_draft_readout_reduction_picks_the_last_valid_row():
     """`last_only` cuts the draft readout from [rows, T, vocab] to [rows, 1, vocab] --
     1.41 GiB down to 7.6 MiB at B=8 ctx=512, which is the difference between OOM and
@@ -1455,7 +1494,8 @@ def test_the_draft_readout_reduction_picks_the_last_valid_row():
             block_table=torch.arange(nblk, dtype=torch.long).reshape(1, nblk),
             seq_len=torch.tensor([n]), state_slot=torch.zeros(1, dtype=torch.long),
             kv_pool=PagedKvPool(nblk, cfg.num_kv_heads, cfg.head_dim, num_layers=1,
-                                device=backend.device, layer_map=(0,)),
+                                device=backend.device, layer_map=(0,),
+                                dtype=getattr(backend, "io", torch.bfloat16)),
             state_pool=None, seq_q_lens=torch.tensor([n]),
         )
         return draft.forward(hid[-1][:, :n], np.array([toks[1:]]),

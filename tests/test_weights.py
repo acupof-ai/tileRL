@@ -304,6 +304,29 @@ def test_sm70_chunks_cover_every_row_exactly_once():
     assert [rung for _, _, rung in _sm70_chunks(40)] == [32, 8]
 
 
+def test_the_mma8_row_cap_is_never_above_the_plans_padded_M():
+    """Both mma8 branches feed the kernel exactly ``_MX`` rows, and the fp8 one takes
+    them from an ``x2`` the plan already padded to ``Mp = _snap_mma_tile(M, 128)``.
+    Mp is 16 for EVERY M in 2.._MX, so `_pad2d(x2, _MX, Kp)` asked to SHRINK 16 rows
+    to 8 -- which main got away with because F.pad crops on a negative pad, and which
+    the guard in `_pad2d` correctly refuses. Measured on sm90: 1191 calls at M=8 in a
+    single B=8 tick, so this was every speculative config and dense B=8.
+
+    Gate the arithmetic, not the kernel: neither mma8 branch can execute on the CPU
+    target where the parity tests live, and the fp4 twin does NOT pre-pad x2, so the
+    two branches disagree about what x2's row count is when they slice it."""
+    from tilerl_kernels.backend import _MX, _snap_mma_tile
+
+    for m in range(2, _MX + 1):
+        mp = _snap_mma_tile(m, 128)
+        assert mp >= _MX, (
+            f"M={m}: the plan pads x2 to {mp} rows but the mma8 kernel wants {_MX}; "
+            "if Mp could fall below _MX the slice would silently drop real rows"
+        )
+        # The real rows are the first m of Mp, so taking _MX of them keeps all of them.
+        assert m <= _MX <= mp, f"M={m}: {m} <= {_MX} <= {mp} is what makes the slice exact"
+
+
 def test_fp4_save_widens_f16_scale_plane(tmp_path):
     """A backend may serve the block scales narrowed (sm70 does, at f16); the NVFP4
     format's are f32, so save_hf must widen them or the written checkpoint is
@@ -409,7 +432,11 @@ def test_nvfp4_modelopt_load(tmp_path):
     for key, exp in expected.items():
         assert torch.equal(loaded.params[key], exp), f"param {key} dequant mismatch"
     for key, (w, ws) in expected_fp8.items():
-        assert torch.equal(loaded.params[key + ".w8"], w), f"param {key}.w8 mismatch"
+        # uint8 view: torch 2.5.1 has no `equal_cpu` for Float8_e4m3fn, which failed
+        # three loader tests on the V100 pod while passing on a newer torch. fp8 is a
+        # bit pattern, so the view compares exactly what the dtype compare would.
+        assert torch.equal(loaded.params[key + ".w8"].view(torch.uint8),
+                           w.view(torch.uint8)), f"param {key}.w8 mismatch"
         assert torch.equal(loaded.params[key + ".wscale"], ws), f"param {key}.wscale mismatch"
 
 
@@ -472,7 +499,11 @@ def test_nvfp4_official_load(tmp_path, fp4):
         else:
             assert torch.equal(got, exp), f"param {key} dequant mismatch"
     for key, (w, ws, os_) in expected_fp8.items():
-        assert torch.equal(loaded.params[key + ".w8"], w), f"param {key}.w8 mismatch"
+        # uint8 view: torch 2.5.1 has no `equal_cpu` for Float8_e4m3fn, which failed
+        # three loader tests on the V100 pod while passing on a newer torch. fp8 is a
+        # bit pattern, so the view compares exactly what the dtype compare would.
+        assert torch.equal(loaded.params[key + ".w8"].view(torch.uint8),
+                           w.view(torch.uint8)), f"param {key}.w8 mismatch"
         assert torch.equal(loaded.params[key + ".wscale"], ws), f"param {key}.wscale mismatch"
         assert torch.equal(loaded.params[key + ".oscale"], os_), f"param {key}.oscale mismatch"
         # the served 8-bit path and the bf16 master agree

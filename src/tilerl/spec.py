@@ -215,6 +215,30 @@ if __name__ == "__main__":  # runnable check
           f"k=3 tick {VERIFY_MS[4] + 3 * DRAFT_MS:.1f} ms, so a free-forward block head "
           f"at k=7 reads {free_wide / ours:.3f}x")
 
+    # The reject above has ONE free variable, and it is acceptance -- which this repo
+    # keeps measuring 1.4x apart between prompts. At decay=1 the two sides share every
+    # tick constant, so `free_wide < ours` reduces to
+    #   (1 + p^4) * (VERIFY_MS[4] + 3*DRAFT_MS) / (VERIFY_MS[8] + DRAFT_MS) < 1
+    # -- the ladder, the decay model and DSpark's parameter count all cancel. Solve it
+    # and the reject holds only while p < 0.781. That bound sat in a scratch calculation
+    # and nowhere in the tree, so a future prompt reading tok/fwd 2.9 would pass both
+    # asserts above while the sentence they encode ("the width is unaffordable") had
+    # stopped being true. Asserted here, at the p the constants were derived from.
+    #
+    # Measured, same harness, same randint(vocab, seed=1000) prompt: ctx 1024-4096 read
+    # tok/fwd 2.03-2.10 (p 0.576-0.593) and ctx 8192 read 2.89 -- p 0.786, PAST the
+    # bound, where a free-forward k=7 reads 1.007x. Whether that is context or the
+    # draft-KV fix in b9af605 is task #67 and is not settled here; what is settled is
+    # that the margin is one prompt wide.
+    p_bound = ((VERIFY_MS[8] + DRAFT_MS) / (VERIFY_MS[4] + 3 * DRAFT_MS) - 1) ** 0.25
+    assert p_bound > 0.6536, (
+        f"the p={0.6536} these constants were derived from is at or past the reject's own "
+        f"bound {p_bound:.4f} -- (1+p^4)*tick_ratio has reached 1, so a free-forward block "
+        "head at k=7 no longer loses and #22 must be re-derived at the measured acceptance"
+    )
+    print(f"spec: the reject holds while acceptance p < {p_bound:.4f}; derived at "
+          f"p=0.6536 (tok/fwd 2.36, wikitext), and ctx 8192 measured p=0.786 (#67)")
+
     # The same arithmetic at B=4, the SERVING batch, where it comes out worse. Measured
     # on ticks bucketed by their own M (scripts/ab_draft_depth.py --batch 4): rung 32
     # verify derives to 170.03 ms independently at depth 2 (52 ticks) and depth 3 (46),

@@ -66,8 +66,11 @@ def _pad2d(t: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
         return t
     # F.pad CROPS on a negative pad rather than raising, so an oversized tensor
     # here becomes well-formed garbage: a [5120, 12800] weight silently returns
-    # [5120, 5120]. Pads are non-negative by construction on the shipped path,
-    # so this only fires on a shape the caller got wrong.
+    # [5120, 5120]. One shipped call site was RELYING on that crop -- linear_fp8's
+    # mma8 branch asked for 8 rows from an x2 already padded to 16 -- and it read
+    # as intentional nowhere, so this guard turned it into a hard error on every
+    # M in 2..8 (measured: 1191 calls at M=8 in one sm90 B=8 tick). That call site
+    # now slices explicitly. Any negative pad reaching here is a caller bug.
     if pr < 0 or pc < 0:
         raise ValueError(f"_pad2d: {tuple(t.shape)} exceeds the target [{rows}, {cols}]")
     return torch.nn.functional.pad(t, (0, pc, 0, pr))
@@ -176,7 +179,17 @@ class Backend:
         # bf16/fp16 and skip the _f32 wrap — flipping sm70 to bf16/fp16 here
         # silently feeds those kernels the wrong dtype. sm70's fp16 GEMV does
         # its f32->fp16 cvt inside the kernel, not via io.
-        self.io = torch.bfloat16 if self.arch == "sm90" else torch.float32
+        # main had this inline at four call sites as `cuda ? bf16 : f32` -- a TARGET
+        # test. Keep that for cpu and metal (f32, unchanged) and carve out only sm70,
+        # which needs f32 on a cuda target. Writing it as `sm90 ? bf16 : f32` flipped
+        # cpu and metal too once build_engine started passing this as the KV pool
+        # dtype, and writing it as `sm70 ? f32 : bf16` flips them the other way:
+        # _arch_for returns cpu/metal/sm70/sm90, so neither binary split isolates
+        # sm70. The CPU cell is the parity target for every kernel here, and its
+        # suite stayed green through the first version because a parity check
+        # compares TileLang against a torch reference in the SAME process, moving
+        # both sides together.
+        self.io = torch.float32 if self.arch in ("cpu", "metal", "sm70") else torch.bfloat16
         # Declared beside io for the same reason: the store (materialize) and the
         # kernel annotation must not drift (wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi).
         self.scale_io = torch.float16 if self.arch == "sm70" else torch.float32
@@ -645,7 +658,14 @@ class Backend:
             w8 = _pad2d(w8, Np32, Kp)
             wscale = _pad2d(wscale, -(-Np32 // 128), Kp // 128)
             osc = self._ones(Np32) if oscale is None else self._const_f32(oscale, Np32)
-            xm = _pad2d(x2, _MX, Kp)
+            # x2 was already padded to Mp (=_snap_mma_tile(M,128), so 16 for every
+            # M in 2..8) at the plan line above, and _pad2d REFUSES to shrink -- so
+            # this asked for [8, K] from a 16-row tensor and raised
+            # `_pad2d: (16, 5120) exceeds the target [8, 5120]`, killing every M in
+            # 2..8: all speculation and dense B=8. The fp4 twin two branches up does
+            # not pre-pad, which is why only fp8 breaks. Slice back to the mma8 rung
+            # rather than re-pad: M<=_MX<=Mp always, so this is exact.
+            xm = x2[:_MX] if x2.shape[0] >= _MX else _pad2d(x2, _MX, Kp)
             res = None if residual is None else self._f32(residual).reshape(M, N)
             r2 = self._zeros2(_MX, Np32) if res is None or Np32 != N else _pad2d(res, _MX, N)
             y2 = self._kernel("linear_fp8_mma8")(xm, w8, wscale, osc, r2)[:M, :N]
