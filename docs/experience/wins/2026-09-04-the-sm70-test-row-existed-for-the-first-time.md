@@ -130,7 +130,7 @@ passes them while cropping a 64-row `wq` to 32), one new test with a wrong
 expectation (the pad row; product sizing byte-identical on both), and
 `[chunked]`, which **fails on `main` too** and is now explained as a drift/margin
 lottery, not a draft bug
-([errors/2026-09-04-the-argmax-gate-was-a-lottery-on-the-drift.md](2026-09-04-the-argmax-gate-was-a-lottery-on-the-drift.md)).
+([errors/2026-09-04-the-argmax-gate-was-a-lottery-on-the-drift.md](../errors/2026-09-04-the-argmax-gate-was-a-lottery-on-the-drift.md)).
 sm70's 14 across the whole run: all test defects, 0 product defects.
 
 Scope not covered, beyond the two limits the sm90 section states for itself: the

@@ -104,7 +104,7 @@ empty `choices` list when opted in.
 **Not yet measured on the card**: the corrected prompt changes what the model sees, so the
 served token rate and the acceptance rate could both move. That is a separate arm and needs the
 server restarted on this commit; the B=1 curve in
-[`wins/2026-09-03-single-stream-b1-baseline.md`](2026-09-03-single-stream-b1-baseline.md) was
+[`wins/2026-09-03-single-stream-b1-baseline.md`](../wins/2026-09-03-single-stream-b1-baseline.md) was
 measured on the bench path, which does not go through `render_chat`, so it is unaffected.
 
 ## Results table

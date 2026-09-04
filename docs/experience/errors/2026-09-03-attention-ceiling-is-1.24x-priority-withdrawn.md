@@ -9,7 +9,7 @@
 
 ## Context
 
-[The prior entry](2026-09-03-prefill-attention-is-what-grows.md) found attention is
+[The prior entry](../wins/2026-09-03-prefill-attention-is-what-grows.md) found attention is
 19.6% of a 4096 prefill and the only class that grows with context, running at 0.75
 TFLOPS with neither roofline binding. I concluded the cost was the kernel's shape and
 called it the next lever. This tick measured the shape — and then did the ceiling

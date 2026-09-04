@@ -10,7 +10,7 @@
 
 ## Context
 
-[The batching sweep](2026-09-03-batching-is-non-monotone-padding-rows-cost-3x.md) found the
+[The batching sweep](../errors/2026-09-03-batching-is-non-monotone-padding-rows-cost-3x.md) found the
 tick is dominated by *launched* rows, and that a padding row costs **3.3×** the useful work
 layered on it. `max_batch=4` at depth 3 launches 32 rows to do 16 rows of work — the one
 config in the sweep whose useful rows are not a rung — so it is the worst point measured.

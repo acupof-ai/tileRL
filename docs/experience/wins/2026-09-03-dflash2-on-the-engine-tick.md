@@ -143,7 +143,7 @@ wall clock is 1.67x worse. A spec tick costs about 9.2x a base tick.
 
 1322 wide ticks, every one at width 8; 0 NaN trunk logits. 152 of 200
 completions differ from the base arm's, which W>1 has never promised not to do
-([w8-not-lossless](2026-09-03-w8-verify-tick-is-not-lossless-on-the-27b.md)). The 1.5-point accuracy gap
+([w8-not-lossless](../errors/2026-09-03-w8-verify-tick-is-not-lossless-on-the-27b.md)). The 1.5-point accuracy gap
 is 3 questions against a 2.5-point binomial sd at n=200 — it does not support a
 regression claim either way.
 

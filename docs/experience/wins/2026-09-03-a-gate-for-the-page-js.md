@@ -1,7 +1,7 @@
 # The page's JS now has a gate, and `node --check` is not it, 2026-09-03
 
 > Status: **shipped.** `addThinking` shipped called-but-never-defined
-> ([`errors/2026-09-03-addthinking-was-never-defined.md`](2026-09-03-addthinking-was-never-defined.md))
+> ([`errors/2026-09-03-addthinking-was-never-defined.md`](../errors/2026-09-03-addthinking-was-never-defined.md))
 > and 197 Python tests could not see it. The obvious fix — run `node --check` on the extracted
 > script — **does not work**, and I verified that before writing it. What ships instead is a
 > syntactic reference check that needs no JS runtime, so CI always executes it. **Negative
