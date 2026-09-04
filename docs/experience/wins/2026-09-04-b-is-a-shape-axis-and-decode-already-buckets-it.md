@@ -1,12 +1,15 @@
-# B is a shape axis too, and bucketing it is rejected: the padding costs 2-8x the compile it saves
+# B is a shape axis worth 34 compiles; my REJECT of bucketing it was wrong, and decode already does it
 
 **Date:** 2026-09-04
 **Arch:** sm70 (Tesla V100-SXM2-32GB), 27B NVFP4 + 456M draft
 **Task:** #74
 **Instrument:** `scripts/read_kernel_cache.py` (the pod's tilelang cache, read by
-`(rank, dtype)` signature with an mtime window) + `scripts/probe_b_axis.py` (CPU,
-negative result)
-**Verdict:** REJECTED — do not bucket B. The measurement stands; the fix does not.
+`(rank, dtype)` signature with an mtime window and a geometry filter) +
+`scripts/probe_b_axis.py` (CPU, negative result)
+**Verdict:** B costs **34 of the served model's 59 compiles** per kernel. Bucketing it is
+**free** on the rung cost model — my first REJECT used a cost model I invented instead of
+the one this repo already measured. Decode already buckets B (`engine.py:817`); the draft
+and the eager verify path do not, which is the real open scope.
 
 ## Where this came from
 
@@ -50,31 +53,65 @@ server (started 14:49) has compiled nothing. The B-axis count is therefore a
 property of the dispatch, which `029b27c`/`6c6f6df` did not touch, but the post-fix
 cache is empty and cannot confirm it independently.
 
-## And bucketing it is still wrong
+## And bucketing it: my first verdict was REJECT on a cost model I invented
 
-Padding B is not like padding S. A padded prefill row is thrown away inside the kernel
-(`kernels_mma.py:71` gates on `SeqQLens`), which is why #73's width fix was free. A padded
-*batch* row is a real row through every kernel of every tick — #41 measured one at **3.3x**
-the cost of a useful row at B=4.
+**The REJECT below is withdrawn.** I priced each padding row at `TICK_MS / B × 3.3` —
+39-70 ms — and both inputs were wrong:
 
-The compile is paid once per (B, S). The padding is paid on every tick of that request's
-life. `/health` on the live server reads `decode_forwards 124` against `prefill_forwards 5`,
-so a request runs ~124 ticks. Break-even, at 1108 ms/compile (#73's measured figure) and a
-35.56 ms B=1 tick:
+- **3.3× is not a multiplier on a tick share.** `#41` fitted
+  `tick_ms = 25.6 + 7.53·launched + 2.29·useful`; 3.3× is the ratio of the *marginal
+  launched row* (7.53 ms) to the *marginal useful row* (2.29 ms).
+- **A tick costs its rung, not its rows.** `wins/2026-09-04-rung-cost-not-useful-rows.md`
+  measured rung 8 with 3 of 8 rows idle at **82.15 ms** against **83.40 ms** fully packed —
+  60% more useful rows for 1.5% more time, and `engine.py:870` carries that comment.
 
-| B | bucket | pad rows | added ms/tick | ticks to break even | verdict |
-|---:|---:|---:|---:|---:|---|
-| 1, 2, 4 | — | 0 | — | never pads | free |
-| 3 | 4 | 1 | 39.1 | **28.3** | loss |
-| 5 | 8 | 3 | 70.4 | **15.7** | loss |
-| 6 | 8 | 2 | 39.1 | **28.3** | loss |
-| 7 | 8 | 1 | 16.8 | **66.1** | loss |
+So padding B costs nothing *unless it pushes M = B·W onto a higher rung*. At the served
+config (depth 1, W=2), for every B the cache actually shows:
 
-Every B that would need padding breaks even in 16-66 ticks against the ~124 a request
-actually runs. Bucketing B pays **2-8x the compile it saves**. Rejected.
+| B | M=B·W | rung | B→bucket | M₂ | rung₂ | rung step | cost |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 2 | 2 | 1 | 2 | 2 | 0 | free |
+| 2 | 4 | 4 | 2 | 4 | 4 | 0 | free |
+| 3 | 6 | 8 | 4 | 8 | 8 | 0 | free |
+| 4 | 8 | 8 | 4 | 8 | 8 | 0 | free |
+| 5 | 10 | 32 | 8 | 16 | 32 | 0 | free |
+| 6 | 12 | 32 | 8 | 16 | 32 | 0 | free |
+| 7 | 14 | 32 | 8 | 16 | 32 | 0 | free |
 
-The asymmetry is the point: S and Mb were free to bucket because the kernel discards the
-padding, and B is not, because nothing discards a batch row.
+**Every one lands on the rung it already occupied.** 0 of 7 lose.
+
+And the result is not specific to the served width — sweeping every W the engine can reach
+(`scripts/price_b_bucket.py`):
+
+| W | B values whose bucket crosses a rung |
+|---:|---|
+| 1, 2, 3, 4 | none — free for every B |
+| **5** | **B=5, 6** |
+| **6** | **B=5** |
+| 7, 8 | none — free for every B |
+
+Only W=5 and W=6 cost anything, and W=5 is depth 4 — the width `engine.py:849` **warns**
+about rather than clamps, so it is reachable. So bucketing B is free at every width the
+ladder endorses and costs only where the ladder already says the width is wrong. The 34
+compiles are a real saving.
+
+I nearly published "free at W=2" instead: my first negative control was W=4, which is also
+free, so it did not discriminate. Sweeping the whole range is what turned a config-specific
+claim into a property of the ladder.
+
+## The scope was also wrong: decode already does this, the draft never can
+
+`engine.py:817` `_graph_bucket` rounds rows to `_GRAPH_BUCKETS = (1,2,4,8,16,24,32,48,64,96,128)`
+and `_run_decode_graph` parks the padding rows on a spare slot and block
+(`engine.py:921-926`). **B-bucketing is already implemented on the decode graph path.**
+
+`spec.py` contains the string "graph" **zero** times: the draft always runs eager, so its B
+is never bucketed — and neither is the eager verify/prefill path the compiles were measured
+on. That is the actual scope of the finding, and it is the same file #73 fixed for S and Mb.
+
+What this leaves is a narrower, cheaper question than the one I opened: the draft's own B.
+Not priced here, because doing it properly needs the draft's rung behaviour measured rather
+than borrowed from the trunk's, and the card is unavailable.
 
 ## What this does NOT explain
 
@@ -180,12 +217,21 @@ alone would equally well mean the mtime filter was broken.
 
 ## Rule
 
-An axis being real and an axis being worth removing are two measurements. B is provably a
-shape axis worth 41-42 compiles per kernel, and removing it is still a 2-8x loss, because
-the padding a bucket introduces is discarded on one axis and executed on the other. Check
-what the kernel does with the padding before pricing the bucket.
+**Use the cost model the repo already measured; do not invent one from a ratio.** The 3.3×
+figure was sitting in an entry that also carried the fit it came from
+(`tick_ms = 25.6 + 7.53·launched + 2.29·useful`) and a second entry measured the padding
+directly at 1.5%. I turned that into `TICK_MS / B × 3.3` and got 39-70 ms per padding row,
+16-66 tick break-evens, and a REJECT — from numbers whose own source says the padding is
+free at this rung. A borrowed constant without its model is not a measurement.
 
-And a cache entry is identified by its full signature, not recognized by its shape. Four
+**And check whether the fix already exists before pricing it.** `engine.py:817` has bucketed
+B on the decode graph path the whole time. Two ticks of pricing preceded reading it.
+
+An axis being real and an axis being worth removing are two measurements. B is a shape axis
+worth 34 of the served model's 59 compiles per kernel, and at W=2 the rung ladder is coarse
+enough that bucketing it costs nothing.
+
+A cache entry is identified by its full signature, not recognized by its shape. Four
 readings of the same 634 files gave four different answers — wrong kernel, wrong arity,
 wrong dtype, then right — and each intermediate one looked like a result: "B costs 0 of 7
 compiles" was a complete, plausible sentence about a kernel that had not run since #44.

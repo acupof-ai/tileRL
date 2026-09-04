@@ -18,9 +18,10 @@ falls back to the pool's torch loop when `write_tokens` is absent from the arch'
 registry, and CPU dispatches `paged_attention`, never `paged_attention_split` -- so
 neither B-baking kernel runs on the twin and the assert below fires. The axis was
 measured instead by reading the pod's tilelang cache
-(wins/2026-09-04-b-is-a-shape-axis-and-bucketing-it-is-rejected.md): 76 distinct
-(B, S) pairs over 35 S values, and bucketing B is REJECTED because a padded batch row
-costs 3.3x a useful one where a padded prefill row is discarded.
+(wins/2026-09-04-b-is-a-shape-axis-and-decode-already-buckets-it.md): 59 distinct
+(B, S) pairs over 25 S values for the served geometry, 34 attributable to B. Bucketing it
+is free -- a tick costs its rung, and at W=2 every observed B rounds within its rung --
+and `engine.py:817` already does it on the decode graph path.
 
     uv run python scripts/probe_b_axis.py    # asserts: records nothing on cpu
 """
