@@ -76,17 +76,44 @@ Negative control: with the property removed and `__pycache__` cleared, the gate 
 
 ## Surface, so this is the last one here
 
-Every engine attribute the server layer reads, by grep over `server.py` and
-`messages.py`: `submit`, `take`, `peek`, `logprobs`, `stats`, `limits`, `_thread`. The
-last is only in a comment — the one I wrote in #83 saying it would be vacuous on DP —
-so there is no live read. `limits` was the last of the six that `DataParallelEngine`
-lacked; all six are now forwarded or defined.
+Every engine attribute the server layer reads: `submit`, `take`, `peek`, `logprobs`,
+`stats`, `limits`. `_thread` appears only in a comment — the one I wrote in #83 saying
+it would be vacuous on DP — so there is no live read. `limits` was the last of the six
+that `DataParallelEngine` lacked; all six are now forwarded or defined.
 
-**Not claimed:** that the other wrapper-shaped gaps in the tree are enumerated. This
-covers the `server.py`/`messages.py` reads only. `train.py:213` reads
-`engine._decode_graph_on` and `engine._prefix` off the engine and would raise
-`AttributeError` on a `DataParallelEngine` — that path is not reachable today (training
-engines are built unwrapped) and is not fixed here.
+**No grep produced that list, and the reason is the finding.** #80's probe took the set
+difference between `engine.<name>(` call sites and `dir(DataParallelEngine)` and
+reported `peek` as the only missing member. Re-run today it still misses this one, and
+so does a widened `engine\.[a-z_]+` that drops the parenthesis — because `limits` is
+never written as `engine.limits`. It is read as
+`getattr(getattr(engine, "limits", None), ...)`, with the attribute name inside a string
+literal, invisible to any scan keyed on attribute syntax. The widened grep adds only
+`_thread` (a comment) and `py` (from the words "engine.py" in another comment), neither
+a real read.
+
+So the two properties compound: **a `getattr` with a default is both the quietest
+failure shape — nothing raises, a plausible number comes back — and the shape a
+syntactic probe cannot see.** This one was found by reading `mount_messages`' first
+twenty lines and finding a doubled `getattr` suspicious enough to measure. No search
+would have led there.
+
+That also narrows what #80 established. "`peek` was the only missing method" holds as
+"the only missing member called as `engine.<name>(`" — which is what its probe asked.
+Recording evidence strength ("this rests on one run") does not cover this: the run was
+fine, and the question it asked was narrower than the conclusion drawn from it.
+
+**Where the three gates added today stop.** #83's, #85's and this one each work by
+writing down a range some set has to exhaust — a handler set over exception types, doc
+invocations over the CLI's flags, one wrapper's answers against another's. That is why a
+test can hold them: the range is enumerable. The fourth range in this family — *which
+attributes must an object have* — is not, because a read can be a string literal, so
+there is no static form of the question. This class stays a reading problem, and the
+reviewable signal is the shape `getattr(x, "y", <non-None default>)` itself.
+
+**Not claimed:** that the other wrapper-shaped gaps in the tree are enumerated, by this
+or any scan. `train.py:213` reads `engine._decode_graph_on` and `engine._prefix`
+directly and would raise `AttributeError` on a `DataParallelEngine` — unreachable today
+(training engines are built unwrapped) and not fixed here.
 
 ## Rule
 

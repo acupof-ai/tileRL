@@ -21,17 +21,40 @@ def test_iso_frames_follow_the_policy():
 
 
 def test_on_policy_guard_refuses_cached_engines():
+    """Both arms, because only one of them was reachable from this test.
+
+    The guard refuses a captured decode graph OR a live prefix store. Measured by
+    mutation: with the `_decode_graph_on` half deleted this test still passed — on cpu
+    `_graph_on` returns False, so the engine it builds trips the prefix arm and the
+    graph arm never fires. That arm is the one that matters on the pod, where
+    `_graph_on` defaults to True for CUDA and a `grpo_loop` call that forgot
+    `decode_graph=False` lands on exactly the untested half.
+
+    Deleting either half now fails: prefix arm CAUGHT before, graph arm CAUGHT after.
+    """
     import pytest
 
     from tilerl.cli import _build_model
     from tilerl.engine import build_engine
+    from tilerl.kv_cache import NoPrefixStore
     from tilerl.testing import RefBackend
     from tilerl.train import grpo_loop
 
     cfg, model = _build_model("tiny", seed=0, keep_master=True)
-    engine = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=4)  # prefix cache on
+    run = lambda e: list(grpo_loop(e, model, [[1, 2, 3]], lambda p, c: 0.0, 1, RefBackend()))
+
+    # prefix cache on, graph off
+    cached = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=4)
     with pytest.raises(ValueError, match="on-policy"):
-        list(grpo_loop(engine, model, [[1, 2, 3]], lambda p, c: 0.0, 1, RefBackend()))
+        run(cached)
+
+    # graph on, prefix off — decode_graph=True is honoured on cpu, so this is testable
+    # here and not a CUDA-only path.
+    graphed = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=4,
+                           decode_graph=True, prefix_store=NoPrefixStore())
+    assert graphed._decode_graph_on is True, "decode_graph=True was not honoured"
+    with pytest.raises(ValueError, match="on-policy"):
+        run(graphed)
 
 
 def test_kernel_io_is_keyed_on_arch_not_on_being_cuda():
