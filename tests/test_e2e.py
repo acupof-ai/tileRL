@@ -176,6 +176,91 @@ def test_tokens_generated_equals_the_tokens_poll_returned():
         engine.shutdown()
 
 
+def test_blocks_used_is_what_the_engine_owns_not_what_the_pool_holds():
+    """`blocks_used` gates admission (`usable_blocks` is compared against it), and it is
+    maintained by hand: three `+= ` sites and one `-=`. Nothing asserted its value
+    mid-run, only that it returns to 0 after a failure rollback (:240).
+
+    The invariant is `blocks_used == sum(r.own_blocks)`, NOT `== pool.used_blocks`. The
+    two diverge on purpose: `_finish` frees every block in `req.blocks` but subtracts
+    only `own_blocks`, because a prefix hit adopts blocks the engine did not allocate.
+    So on a hit the pool holds more than the engine owns, and that gap is the prefix
+    store's retention -- which is why both counters exist.
+
+    Checked while a request is live, since a counter that is only inspected at rest
+    cannot show a leak that cancels on teardown.
+    """
+    engine = _build_engine(seed=99)
+    try:
+        rng = np.random.default_rng(1)
+        head = rng.integers(3, 320, size=16).astype(np.int64)  # exactly one block
+        params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=5)
+
+        engine.submit(head, params)
+        engine.step()  # prefill, so blocks are allocated and the request is still live
+        live = list(engine._running) + list(engine._waiting)
+        assert live, "no request is live, so this measures the idle state instead"
+        owned = sum(r.own_blocks for r in live)
+        assert engine.stats()["blocks_used"] == owned, (
+            f"blocks_used {engine.stats()['blocks_used']} != {owned} owned by live requests; "
+            f"admission compares usable_blocks against this number"
+        )
+
+        # Step through decode and re-check every tick. A request growing past a block
+        # boundary allocates mid-run (engine.py:725 and :788), and both sites charge the
+        # counter. Checking only after prefill and after finish misses that: the charge
+        # and the release cancel, so a growth site that never charges still lands on 0.
+        # Measured: without this loop, deleting the `_blocks_used += 1` at :725 was MISSED.
+        grew = False
+        for _ in range(64):
+            engine.step()
+            live = list(engine._running) + list(engine._waiting)
+            if not live:
+                break
+            owned = sum(r.own_blocks for r in live)
+            assert engine.stats()["blocks_used"] == owned, (
+                f"mid-decode: blocks_used {engine.stats()['blocks_used']} != {owned} owned. "
+                f"A growth site allocated a block without charging it, or charged twice."
+            )
+            grew = grew or owned > 1
+        assert grew, (
+            "no request ever owned more than one block, so the mid-run growth path at "
+            "engine.py:725/:788 was never exercised and this loop asserts nothing about it"
+        )
+        engine.poll()
+
+        # Second prompt extends the first by a whole block, so it adopts one.
+        engine.submit(np.concatenate([head, rng.integers(3, 320, size=16).astype(np.int64)]),
+                      params)
+        engine.step()
+        st = engine.stats()
+        live = list(engine._running) + list(engine._waiting)
+        # Asserted unconditionally, not under `if st["prefix_hits"]`: a conditional guard
+        # here would skip the only two checks that matter whenever the adoption stopped
+        # happening, which is exactly the regression to catch. Measured: hits 1,
+        # blocks_used 1, pool_used_blocks 2.
+        assert st["prefix_hits"] == 1, (
+            f"the second prompt did not adopt the first's block (hits={st['prefix_hits']}), "
+            f"so the two counters cannot be compared below"
+        )
+        assert st["blocks_used"] == sum(r.own_blocks for r in live), (
+            "after a prefix hit the engine must count only the blocks it allocated"
+        )
+        assert st["blocks_used"] < st["pool_used_blocks"], (
+            f"a prefix hit adopted blocks, so the pool ({st['pool_used_blocks']}) must "
+            f"hold more than the engine owns ({st['blocks_used']}); equal means either "
+            f"the adopted blocks were charged to the engine or nothing was adopted"
+        )
+    finally:
+        engine.shutdown()
+    # NOT asserted: blocks_used == 0 here. `shutdown` only stops the daemon thread; it
+    # does not finish or free live requests, so a request still running legitimately keeps
+    # its blocks charged. Asserting 0 fails at 1, and the defect would be in the test.
+    assert engine.stats()["blocks_used"] == sum(
+        r.own_blocks for r in list(engine._running) + list(engine._waiting)
+    ), "a request outlived the accounting: charged blocks with no live owner"
+
+
 def test_prefix_cache():
     """A second prompt sharing a block-aligned prefix adopts the cached blocks."""
     engine = _build_engine(seed=99)
