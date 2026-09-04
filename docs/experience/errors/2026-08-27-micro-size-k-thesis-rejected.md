@@ -6,7 +6,7 @@
 
 ## Context
 
-The brief (`docs/experience/2026-08-27-tilelang-vs-native.md`) named
+The brief (`docs/analysis/2026-08-27-tilelang-vs-native.md`) named
 `micro_size_k = 8 → 32` as "the main event": the fp4 decode GEMV issues
 `LDG.32` (4 B/thread) where its bf16/fp8 siblings issue `LDG.128` (16 B), so
 widening the load was predicted to buy 1.5–1.85× on the GEMV. The kill
@@ -52,7 +52,7 @@ from the docstring was, in fact, correct.
    the head of the queue.
 3. **The register-resident SR (Marlin-shaped) kernel is now the main path, not
    a fallback.** The CAN verdict stands
-   (`docs/experience/2026-08-27-tilelang-vs-native.md`); it is the only route
+   (`docs/analysis/2026-08-27-tilelang-vs-native.md`); it is the only route
    to Marlin's 38.9 µs, and the sweep proved there is no cheaper one inside the
    current kernel.
 

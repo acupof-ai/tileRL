@@ -5,7 +5,7 @@
 `README.md` stated that a decode tick reads 22.8 GB in 11.0 ms — 2.1 TB/s, 64%
 of the H20's measured 3312 GB/s — and used it to argue the remaining gap is
 kernel efficiency, and to frame the whole sglang comparison. The 22.8 comes from
-`docs/experience/2026-08-28-vs-sglang-h20.md:22`, which records it in a table
+`docs/analysis/2026-08-28-vs-sglang-h20.md:22`, which records it in a table
 with no derivation.
 
 Two sessions tried to rebuild it from the checkpoint and neither reached it.

@@ -3,7 +3,7 @@
 ## Context
 
 `README.md` claimed a decode tick reads 22.8 GB, from
-`docs/experience/2026-08-28-vs-sglang-h20.md:22`, which records it with no
+`docs/analysis/2026-08-28-vs-sglang-h20.md:22`, which records it with no
 derivation. Two sessions independently tried to rebuild it and both landed near
 19.2 GB, three and a half short. One of them (this one) went as far as editing
 the README to mark the roofline percentage "under revision" and publishing 53%.
@@ -42,7 +42,7 @@ built on the same bad population and is retracted.
 
 README quotes 60% against the measured 21.89 GB, and names the population trap
 next to it so the next reader does not repeat the derivation. The
-`docs/experience/2026-08-28-vs-sglang-h20.md` entry still shows no derivation for
+`docs/analysis/2026-08-28-vs-sglang-h20.md` entry still shows no derivation for
 its own figure — it was right, and it was unauditable, and those are separate
 problems.
 

@@ -175,7 +175,7 @@ a TileLang-native SR kernel the fallback, behind the same sm90 registry cell.
 
 Pair it with one ncu run reporting registers/thread and blocks/SM: if micro=32
 spills to local memory, the repo has already seen that failure mode take a
-kernel to 22% of roof (`wins/2026-08-25-fp4-gemv-grouped-dequant.md`).
+kernel to 22% of roof (`docs/experience/wins/2026-08-25-fp4-gemv-grouped-dequant.md`).
 
 ## Judge split
 
