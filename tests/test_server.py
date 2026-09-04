@@ -672,3 +672,34 @@ def test_serve_sizes_its_pools_from_the_flags_not_the_context():
         "model's 2048 blocks would report less, and that is a real capacity limit "
         "rather than a bug in the sizing"
     )
+
+
+def test_a_request_that_omits_max_tokens_fits_a_tight_context():
+    """The advertised GPU-less path: `uv run tilerl serve` on the tiny model, whose
+    ``max_total_tokens`` is 512, and a client that sends no ``max_tokens``.
+
+    The default was a hardcoded 512, so ``prompt + 512 > 512`` for ANY non-empty
+    prompt and submit raised 400 — the first message on the path README recommends
+    ("No GPU: `uv run tilerl serve` runs the tiny model on CPU"). The chat page is
+    one such client (its ``sendChat`` sends no ``max_tokens``), but fixing the page
+    would leave every other one broken, so the default is now ``min(512, room)``
+    where room is what the engine's own limit leaves after the prompt.
+
+    A tight engine, not the module fixture: that one runs ``max_total_tokens=4096``
+    where 512 fits and the bug is invisible, which is the whole reason no test saw
+    it. Found by a peer clicking send in a browser, after the suite went green.
+    """
+    cfg = tiny()
+    engine = build_engine(
+        cfg, build_random(cfg, seed=9), get_backend(),
+        num_blocks=64, num_slots=2, max_batch=1, max_total_tokens=512,
+    )
+    engine.run()
+    try:
+        with TestClient(create_app(engine, _ByteTokenizer())) as c:
+            r = c.post("/v1/chat/completions",
+                       json={"messages": [{"role": "user", "content": "hi"}]})
+            assert r.status_code == 200, r.text
+            assert r.json()["choices"][0]["message"]["content"] is not None
+    finally:
+        engine.shutdown()

@@ -128,7 +128,17 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         ))
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
-        params = sampling(tokenizer, thinking, req.max_tokens if req.max_tokens is not None else 512,
+        # A client that omits max_tokens gets what FITS, not a fixed 512. The old
+        # default was 512 against a tiny model's max_total_tokens of 512, so
+        # `prompt + 512` exceeded the limit for ANY non-empty prompt and submit
+        # raised 400 -- on the exact configuration README tells GPU-less users to
+        # run ("No GPU: uv run tilerl serve runs the tiny model on CPU"), where the
+        # first message on the advertised path failed. Server-side because the
+        # server is what knows the limit: fixing it in the chat page would leave
+        # every other client that omits the field still broken.
+        room = getattr(getattr(engine, "limits", None), "max_total_tokens", 0) - len(input_ids)
+        want = req.max_tokens if req.max_tokens is not None else min(512, max(room, 1))
+        params = sampling(tokenizer, thinking, want,
                           temperature=req.temperature, top_p=req.top_p, max_think_tokens=cap,
                           seed=req.seed, logprobs=bool(req.logprobs))
         return engine.submit(input_ids, params), len(input_ids), params.max_new_tokens
