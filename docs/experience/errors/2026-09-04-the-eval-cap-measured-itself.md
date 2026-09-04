@@ -74,6 +74,21 @@ leakage.
 - Re-run before/after in one uncapped configuration (8192 cap, thinking on), so
   the control measures the model.
 
+## The reading, fixed before the number
+
+Registered before the re-run reports, so the interpretation is not chosen after
+seeing the result. Both arms score `eval_n=500` (`recipes.py`) in one uncapped
+configuration. Against an 82.5% base at 80% power, alpha 0.05 two-sided, a
+two-proportion test at n=500 per arm resolves **6.2 points**; 5, 10 and 15
+points need 797, 168 and 59 per arm respectively.
+
+- gain >= 6.2 points: confirmed.
+- gain below 6.2 points: **underpowered, not refuted.** "No significant
+  difference" at this n does not mean training did nothing -- a real 4-point
+  gain lands here, and separating that from zero needs n ~ 1250 per arm.
+- The uncapped before-arm is the only valid comparison partner. The 39.0%
+  figure is not a baseline and no delta may be quoted against it.
+
 ## Rule
 
 **A control that saturates its own instrument is not a control.** Before
