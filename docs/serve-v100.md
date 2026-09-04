@@ -160,10 +160,11 @@ Three levers, cheapest first:
    a bf16 pool against the f32 kernel cast the whole plane every call, 4.71
    ms/token). It needs an f16 `paged_attention_split`, its own parity run, and a
    check that f16 K/V does not degrade long-range attention. Not done.
-3. **`--kv-tier <dir>`** — spill cold blocks to disk (`KvTier`, wired to `serve`
-   here). Trades prefix hit rate for capacity, so it suits long documents that
-   get re-read rather than one long generation. The engine path is tested; the
-   capacity it buys on this card is unmeasured.
+3. **Spilling cold blocks to disk** — trades prefix hit rate for capacity, so it
+   suits long documents that get re-read rather than one long generation. `KvTier`
+   and a `--kv-tier <dir>` flag were written and reviewed on the sm70 branch
+   (`e9d5852`, `29b58a3`) but **never reached `main`** — `e4aaf8c` ported the
+   server work and left the code behind. Not a lever until it is ported.
 
 The table above is arithmetic from the block size, not a measured sweep — 4K is
 the only row actually served end to end so far. Treat the rest as what to try,
