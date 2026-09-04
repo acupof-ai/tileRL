@@ -208,6 +208,9 @@ class Backend:
         # kernel annotation must not drift (wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi).
         self.scale_io = torch.float16 if self.arch == "sm70" else torch.float32
         #: Metal's packed ABI rejects a kernel argument whose byte_offset is not 0.
+        #: Arch-gated, not unconditional: sm90 hands _c 6 contiguous-but-offset views
+        #: per decode tick at 6.68 us a clone, 40 us it does not owe (cpu and metal
+        #: are 0). Re-derive with scripts/probe_c_offset.py before deleting this.
         self._zero_offset = self.arch == "metal"
         # Narrow dtype for the embedding gather only — NOT io, which the f32
         # kernels depend on. Half the table's bytes on the card, and the gather
