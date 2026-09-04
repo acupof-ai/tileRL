@@ -34,6 +34,7 @@ import datetime
 import pathlib
 import pickle
 import subprocess
+import sys
 
 DT = {"float32": "f32", "float16": "f16", "bfloat16": "bf16", "int32": "i32",
       "int64": "i64", "uint8": "u8", "float8_e4m3": "f8"}
@@ -56,6 +57,16 @@ def sig(xs) -> str:
     )
 
 
+def _is_geom(shapes: list[tuple], geom: int) -> bool:
+    """Does this entry belong to the model whose head_dim is `geom`?
+
+    Only a rank-4 [B,S,H,D] leading tensor carries head_dim. Testing the last dim of
+    any leading tensor kept 103 entries of an [M,256]x[M,1] reduction, where 256 is an
+    N dim that merely equals the served head_dim.
+    """
+    return bool(shapes and len(shapes[0]) == 4 and shapes[0][-1] == geom)
+
+
 def load(cache: pathlib.Path, since: float | None, geom: int | None) -> dict[str, list]:
     by_sig: dict[str, list] = collections.defaultdict(list)
     for d in cache.iterdir():
@@ -71,9 +82,7 @@ def load(cache: pathlib.Path, since: float | None, geom: int | None) -> dict[str
             continue
         xs = xs if isinstance(xs, (list, tuple)) else [xs]
         shapes = [dims(x) for x in xs]
-        # head_dim is the last dim of the leading tensor: the cheapest thing that
-        # separates the served 27B (256) from the tiny parity config (16).
-        if geom is not None and not (shapes and shapes[0] and shapes[0][-1] == geom):
+        if geom is not None and not _is_geom(shapes, geom):
             continue
         by_sig[sig(xs)].append((t, shapes))
     return by_sig
@@ -140,5 +149,22 @@ def main() -> None:
           f"(not an axis), a bare count means it did.")
 
 
+def _selftest() -> None:
+    """--geom must match head_dim, not any dim that happens to equal it.
+
+    Calls `_is_geom` itself -- the predicate `load` uses -- so this fails if that
+    changes. Both shape lists below are real cache entries.
+    """
+    attn = [(1, 64, 24, 256), (257, 4, 16, 256)]      # Q [B,S,H,D] -> head_dim 256
+    gemv = [(101, 256), (101, 1)]                      # [M,N] x [M,1] -> N 256, NOT head_dim
+    assert _is_geom(attn, 256), "a rank-4 [B,S,H,D] leading tensor must match its head_dim"
+    assert not _is_geom(gemv, 256), "a rank-2 GEMV whose N equals head_dim must NOT match"
+    assert not _is_geom(attn, 16), "head_dim 256 must not match a filter for 16"
+    print("selftest ok")
+
+
 if __name__ == "__main__":
-    main()
+    if "--selftest" in sys.argv:
+        _selftest()
+    else:
+        main()

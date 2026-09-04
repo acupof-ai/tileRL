@@ -84,7 +84,7 @@ unexplained. **It is not, and the cache says so:** the B values present are 1-7,
 run was B=8 at depth 1, where `spec.py:484`'s chain loop never executes. 7 B values across
 25 served S values cannot produce 269 compiles of one kernel. That run stays open.
 
-## Four instrument corrections
+## Five instrument corrections
 
 **1. The CPU target cannot answer this.** `scripts/probe_b_axis.py` recorded nothing and
 its assert caught it: `backend.py:889` falls back to the pool's torch loop when
@@ -121,6 +121,14 @@ both kernels. This surfaced only because I had asserted the extra geometries wer
 draft" and then checked: `spec.py:312` builds the draft as `replace(trunk.cfg, ...)`, so it
 shares H/D/Hkv and cannot be a distinct geometry at all. Every cache-derived count needs a
 geometry filter as well as an mtime window.
+
+**5. The geometry filter itself matched a coincidence.** Written as "the last dim of the
+leading tensor", `--geom 256` also kept 103 entries of an `[M,256] x [M,1]` reduction, where
+256 is an N dim that merely equals the served head_dim — 16 signatures survived the filter
+where 6 should. Only a rank-4 `[B,S,H,D]` leading tensor carries head_dim, so the predicate
+now requires rank 4. The two attention kernels read 558 either way, so #74's number is
+unaffected; a count over any other kernel would not have been. `--selftest` asserts both
+directions against `_is_geom` itself, and reverting the rank check fails it.
 
 ## B is not the only unbucketed axis, and the per-dimension view is what shows it
 
