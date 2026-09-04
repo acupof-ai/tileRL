@@ -15,10 +15,14 @@ Four things this exists to stop repeating:
 3. Symbolic dims come back as tvm `Var`, not int. A dim that is still symbolic is not
    a shape axis; `int()` on it raises.
 4. The cache is cumulative across every run of the tree, so a claim about the CURRENT
-   code needs an mtime window (`--since`).
+   code needs an mtime window (`--since`), and one cache holds SEVERAL models: the pod's
+   has the served 27B (H=24, D=256) next to the tiny CPU-parity config (H=4, D=16). An
+   unfiltered count inflated #74's figure ~20% (41 of 76 against the served 34 of 59),
+   so a per-model claim needs `--geom` too.
 
     python3 scripts/read_kernel_cache.py --cache ~/.tilelang/cache/0.1.13/linux-x86_64/kernels
     python3 scripts/read_kernel_cache.py --since 6c6f6df --repo ~/tilerl-git   # post-fix only
+    python3 scripts/read_kernel_cache.py --geom 256   # served model only (D=256)
     python3 scripts/read_kernel_cache.py --sig 4f32,4f32,4f32,4f32,2i32,1i32,1i32  # one kernel
 """
 
@@ -52,7 +56,7 @@ def sig(xs) -> str:
     )
 
 
-def load(cache: pathlib.Path, since: float | None) -> dict[str, list]:
+def load(cache: pathlib.Path, since: float | None, geom: int | None) -> dict[str, list]:
     by_sig: dict[str, list] = collections.defaultdict(list)
     for d in cache.iterdir():
         f = d / "params.pkl"
@@ -66,7 +70,12 @@ def load(cache: pathlib.Path, since: float | None) -> dict[str, list]:
         except Exception:
             continue
         xs = xs if isinstance(xs, (list, tuple)) else [xs]
-        by_sig[sig(xs)].append((t, [dims(x) for x in xs]))
+        shapes = [dims(x) for x in xs]
+        # head_dim is the last dim of the leading tensor: the cheapest thing that
+        # separates the served 27B (256) from the tiny parity config (16).
+        if geom is not None and not (shapes and shapes[0] and shapes[0][-1] == geom):
+            continue
+        by_sig[sig(xs)].append((t, shapes))
     return by_sig
 
 
@@ -76,6 +85,9 @@ def main() -> None:
                     default=pathlib.Path.home() / ".tilelang/cache/0.1.13/linux-x86_64/kernels")
     ap.add_argument("--sig", help="only this (rank, dtype) signature")
     ap.add_argument("--since", help="git rev: ignore entries written at or before its commit time")
+    ap.add_argument("--geom", type=int,
+                    help="keep only entries whose leading tensor's last dim is this "
+                         "(head_dim: 256 = served 27B, 16 = tiny parity config)")
     ap.add_argument("--repo", type=pathlib.Path, default=pathlib.Path.cwd())
     ap.add_argument("--top", type=int, default=6, help="how many signatures to detail")
     a = ap.parse_args()
@@ -87,9 +99,14 @@ def main() -> None:
         cut = int(out.stdout.strip())
         print(f"# entries after {a.since} ({datetime.datetime.fromtimestamp(cut):%m-%d %H:%M})")
 
-    by_sig = load(a.cache, cut)
+    by_sig = load(a.cache, cut, a.geom)
     if not by_sig:
-        print("no entries" + (" in that window" if cut else ""))
+        why = []
+        if cut:
+            why.append("that mtime window")
+        if a.geom:
+            why.append(f"head_dim {a.geom}")
+        print("no entries" + (" in " + " / ".join(why) if why else ""))
         return
 
     order = sorted(by_sig.items(), key=lambda kv: -len(kv[1]))

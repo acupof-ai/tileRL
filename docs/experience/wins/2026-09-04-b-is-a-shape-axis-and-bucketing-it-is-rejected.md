@@ -21,23 +21,28 @@ tuple**, and nothing rounds it: `engine.py:666` sizes rows by `len(reqs)`, `spec
 by `len(plan)`, and `spec.py:484`'s chain loop by `len(live)`, which *shrinks* mid-chain as
 rows hit block boundaries. 20 kernels across the four kernel files bake B this way.
 
-## Measured: B costs 41-42 compiles on each of the two kernels
+## Measured: B costs 34 of the served model's 59 compiles, per kernel
 
 From the pod's cache, matched on the full `(rank, dtype)` signature of every param
 (`params.pkl` stores inputs, the scalar, **and** the `T.empty` outputs — see the
-corrections below):
+corrections below) **and filtered to the served geometry**, since the same cache holds
+tiny-model compiles from CPU-parity runs:
 
 | | `write_tokens_f32` | `paged_attention_split` |
 |---|---:|---:|
-| distinct (B, S) pairs | **76** | **77** |
-| distinct S values | 35 | 35 |
+| distinct (B, S) pairs | **59** | **59** |
+| distinct S values | 25 | 25 |
 | distinct B values | **7** (1-7) | **7** (1-7) |
-| pairs / distinct S | **2.17** | **2.20** |
-| compiles if B were one value | 35 — **41 fewer** | 35 — **42 fewer** |
+| pairs / distinct S | **2.36** | **2.36** |
+| compiles if B were one value | 25 — **34 fewer** | 25 — **34 fewer** |
 
-Both kernels, the same 35 S values, the same 7 B values. 19 of 35 S values ran at
-more than one batch size; S=64 and S=512 each ran at all seven. So B is not a
-theoretical axis — it is ~54% of each kernel's compile count.
+Both kernels give identical counts over the same 558 entries, which is the expected
+result: they are called once each per attention layer with the same batch and width.
+B is ~58% of each kernel's compile count for the served model.
+
+The unfiltered figures are **76 and 77 pairs, 41 and 42 attributable to B** — inflated by
+the tiny config's 36-37 pairs. Either number supports the same verdict, but the served one
+is the one that describes serving.
 
 **Both figures are pre-fix.** The cache's last write is 14:40 and `6c6f6df` was
 committed 14:48, so **zero** entries for either kernel postdate the fix; the live
@@ -77,9 +82,9 @@ I opened #74 predicting this was the mechanism behind the 269-compile B=8 run th
 `errors/2026-09-04-the-recompiles-reproduce-and-are-not-a-shape-set.md:165` leaves
 unexplained. **It is not, and the cache says so:** the B values present are 1-7, and that
 run was B=8 at depth 1, where `spec.py:484`'s chain loop never executes. 7 B values across
-35 S values cannot produce 269 compiles of one kernel. That run stays open.
+25 served S values cannot produce 269 compiles of one kernel. That run stays open.
 
-## Three instrument corrections
+## Four instrument corrections
 
 **1. The CPU target cannot answer this.** `scripts/probe_b_axis.py` recorded nothing and
 its assert caught it: `backend.py:889` falls back to the pool's torch loop when
@@ -109,6 +114,14 @@ The live split kernel's BlockTable width takes 78 values across the cache — wh
 mean `6c6f6df` failed. Splitting on the commit's own timestamp (`git log --format=%ct`,
 14:48) against file mtime: **78 before, 0 after**. Every entry predates the fix.
 
+**4. One cache serves three models, and I published a number over all of them.** The first
+figures (41 of 76, 42 of 77) counted the tiny config's compiles alongside the served
+model's — ~20% inflation. Filtering on `(H, D, Hkv) = (24, 256, 4)` gives **34 of 59** for
+both kernels. This surfaced only because I had asserted the extra geometries were "trunk vs
+draft" and then checked: `spec.py:312` builds the draft as `replace(trunk.cfg, ...)`, so it
+shares H/D/Hkv and cannot be a distinct geometry at all. Every cache-derived count needs a
+geometry filter as well as an mtime window.
+
 ## B is not the only unbucketed axis, and the per-dimension view is what shows it
 
 The per-kernel scripts I wrote first counted (B, S) pairs, so they could not see that the
@@ -122,11 +135,25 @@ every dimension separately (`read_kernel_cache.py` prints `=N` for a dim that ne
     p3 (BlockTable): [7, 78]            B=7  Mb=78
 ```
 
-H taking 3 values and D taking 2 is the trunk-vs-draft head geometry — a *third* and
-*fourth* axis, and neither is a bug: the draft head is a different model, so its shapes are
-genuinely distinct kernels rather than avoidable specializations. That is why 98 > 77, and it
-is the reason a per-axis printout beats a pair count: the pair count silently attributes the
-extra 21 compiles to nothing.
+H taking 3 values and D taking 2 is a *third* and *fourth* axis, and reading the values
+shows what they are — three whole model geometries, not three head counts:
+
+| H | D | Hkv | entries | what |
+|---:|---:|---:|---:|---|
+| 24 | 256 | 4 | 558 | `qwen38_27b()` (config.py:123-125) — the served model |
+| 4 | 16 | 2 | 74 | `tiny()` (config.py:165-167) — the CPU test config |
+| 8 | 16 | 1 | 2 | matches no config in the tree; a microbench's own literals |
+
+**The draft head is not among them.** `spec.py:312` builds it as
+`replace(trunk.cfg, num_layers=num_layers, ...)`, so it shares H, D and Hkv with the trunk
+and cannot be a distinct geometry — my first reading of this table asserted "trunk-vs-draft
+head geometry" and that is wrong. What actually inflates 77 (B, S) pairs to 98 Q shapes is
+the pod's cache holding *tiny-model* compiles from CPU-parity runs alongside the served
+model's, plus two stray microbench shapes.
+
+That makes the extra 21 compiles irrelevant to serving rather than benign-for-a-good-reason:
+they belong to other configs entirely. A per-axis printout is what distinguishes those cases;
+the pair count attributes them to nothing.
 
 ## The window between the two #73 fixes is direct evidence they worked
 
