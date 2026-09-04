@@ -181,5 +181,48 @@ def test_no_doc_invokes_a_flag_the_cli_does_not_have():
         "NOT IMPLEMENTED on the same line):\n  " + "\n  ".join(bad))
 
 
+def test_no_readme_number_is_absent_from_every_dated_entry():
+    """README:89 says every number above it sits in a dated entry. Hold it to that.
+
+    `43.2 tok/s wall over the network` sat on README:22 with no entry anywhere: its only
+    source was the body of the commit that added it, and that commit touched README.md
+    alone — so it passed the every-runtime-change-gets-an-entry rule by not being a
+    runtime change, and the number had no measurement record at all. Measured: of the 23
+    distinct decimals in README, exactly that one was absent from all 285 dated entries.
+
+    **This gate falsifies, it does not verify.** A number found in some entry is not
+    thereby sourced *by* that entry — README:57's "1.6 points apart" (MMLU significance)
+    matches "~1.6% of f32 peak" in the chunkwise-WY entry, two unrelated quantities
+    sharing a digit string. What the gate can prove is the other direction: a number
+    present in NO dated entry has no source, and that is a fact about the README rather
+    than a guess about provenance. Signal is good at this scope — 1 finding, 0 false
+    positives across 23 numbers — because the range is small and the claim is absolute.
+
+    Integers are excluded deliberately: `8`, `27`, `4096` are configuration, not
+    measurements, and scanning them reported mostly version numbers and tensor shapes.
+    """
+    import re as _re
+
+    dated = [p for p in _tracked() if _re.search(r"docs/.*/20\d\d-\d\d-\d\d-", p)]
+    assert len(dated) > 100, f"only {len(dated)} dated entries found — the scan is broken"
+
+    readme = ROOT / "README.md"
+    text = readme.read_text()
+    # A decimal, not bounded by word chars or another dot: `1.6` must not match `21.65`
+    # or a version like `0.1.8`.
+    num = _re.compile(r"(?<![\w.])(\d+\.\d+)(?![\w.])")
+    corpus = "\n".join((ROOT / p).read_text(errors="ignore")
+                       for p in dated if (ROOT / p).is_file())
+
+    missing = []
+    for n in dict.fromkeys(num.findall(text)):
+        if not _re.search(rf"(?<![\w.]){_re.escape(n)}(?![\w.])", corpus):
+            line = next(i for i, ln in enumerate(text.splitlines(), 1) if n in num.findall(ln))
+            missing.append(f"README.md:{line} -> {n}")
+    assert not missing, (
+        "README numbers that appear in no dated entry under docs/ — either the entry is "
+        "missing or the number was never measured:\n  " + "\n  ".join(missing))
+
+
 if __name__ == "__main__":
     print(f"{len(_dead())} dead references across {len(_tracked())} tracked docs")
