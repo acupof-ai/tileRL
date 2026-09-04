@@ -46,6 +46,13 @@ It is first-visit cost, which is the ordinary shape-specialization story — the
 declared dead this morning off a single B=8 log and then un-declared dead off a 6-group
 B=1 run. Third data point, same conclusion as the second.
 
+> **RESOLVED**: it was `spec.py` skipping two shape buckets the trunk has — the prefill
+> width and the block-table width. Fixed in `029b27c` + `6c6f6df`; a first visit at a new
+> prompt length now compiles **0** where it compiled 14, wall **17320 → 1104 ms (15.7x)**.
+> See [`../wins/2026-09-04-the-draft-skipped-two-shape-buckets.md`](../wins/2026-09-04-the-draft-skipped-two-shape-buckets.md).
+> The section below records the state before it was located, including the two candidates
+> I eliminated and the two I had not thought of.
+
 ## What keys on 37 is NOT identified
 
 Two candidates checked and eliminated:
