@@ -247,3 +247,29 @@ def test_the_train_pool_holds_what_max_new_tokens_asks_for(tmp_path, monkeypatch
     per_slot = seen["num_blocks"] * BLOCK_TOKENS / seen["num_slots"]
     assert per_slot >= want, f"{per_slot:.0f} tokens per slot cannot hold {want}"
     assert seen["max_total_tokens"] >= want
+
+
+def test_the_run_saves_the_adapter_that_produced_its_metrics(tmp_path, monkeypatch):
+    """A gsm8k_after that beats its baseline is the run's claim, and the claim is not
+    checkable without the weights. The manifest declared an `artifacts` dict that the
+    train path never filled, so every finished RL run was unreproducible."""
+    import contextlib
+    import json
+
+    from safetensors.torch import load_file
+
+    from tilerl import cli
+
+    data = tmp_path / "d.jsonl"
+    data.write_text(json.dumps({"prompt": "2+2?", "answer": "4"}) + "\n")
+    monkeypatch.setattr("tilerl.ledger.runs_root", lambda: tmp_path)
+    with contextlib.suppress(SystemExit):  # a failed gate exits; the artifact is what matters
+        cli.cmd_train(cli._build_parser().parse_args(
+            ["train", "--rl", "--steps", "1", "--group", "2", "--lora-rank", "2",
+             "--max-new-tokens", "4", "--data", str(data)]))
+    run = next(p for p in tmp_path.iterdir() if (p / "manifest.json").exists())
+    m = json.loads((run / "manifest.json").read_text())
+    assert m["artifacts"].get("adapter") == "adapter.safetensors", m["artifacts"]
+    got = load_file(str(run / "adapter.safetensors"))
+    assert got, "adapter file is empty"
+    assert any(k.endswith((".lora_a", ".lora_b")) or "lora" in k for k in got), sorted(got)[:5]

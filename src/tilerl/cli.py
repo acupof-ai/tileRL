@@ -307,6 +307,18 @@ def _train_adapters(args: argparse.Namespace) -> None:
     if torch.cuda.is_available():  # the number the group size is really bounded by
         manifest["metrics"]["peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
         log(f"peak allocated {manifest['metrics']['peak_gib']:.2f} GiB")
+    # Before the after-eval, not after it: a gsm8k_after that beats its own baseline is
+    # the run's whole claim, and without the weights that produced it nobody can check
+    # whether the metric moved or the reward was gamed. An eval that dies still leaves
+    # the adapter behind.
+    from safetensors.torch import save_file
+
+    d = Path(runs_root()) / manifest["id"]
+    d.mkdir(parents=True, exist_ok=True)
+    save_file({k: v.detach().cpu().contiguous() for k, v in trainable.items()},
+              str(d / "adapter.safetensors"))
+    manifest["artifacts"]["adapter"] = "adapter.safetensors"
+    log(f"adapter {sum(v.numel() for v in trainable.values()) / 1e6:.1f}M params -> {d}")
     evals("after")
     return _finish(manifest, args.json)
 
