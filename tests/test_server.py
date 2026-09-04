@@ -436,6 +436,8 @@ def test_the_chat_page_reads_the_stream_this_server_sends(client, model_id):
         "  firstHasContent: hasText(whole[0]),\n"
         "  emptyChoices: whole.filter((o) => Array.isArray(o.choices) && !o.choices.length).length,\n"
         "  usage: whole.filter((o) => o.usage).length,\n"
+        "  finalUsage: whole.filter((o) => o.usage && !o.choices?.length).length,\n"
+        "  counts: whole.filter((o) => o.usage).map((o) => o.usage.completion_tokens),\n"
         "}));\n"
     )
     out = subprocess.run([node, "--input-type=module", "-e", harness],
@@ -457,7 +459,21 @@ def test_the_chat_page_reads_the_stream_this_server_sends(client, model_id):
         f"{got['emptyChoices']}. A reader indexing choices[0] unconditionally dies on it, "
         f"which this test's own harness did before optional chaining: {got}"
     )
-    assert got["usage"] == 1, f"the usage chunk did not arrive exactly once: {got}"
+    assert got["finalUsage"] == 1, f"the final usage-only chunk did not arrive once: {got}"
+    # Content frames carry cumulative usage so the page's live gauge reads tokens rather
+    # than frames -- this server coalesces ~1.8 tokens into each frame on the 27B
+    # (measured: 109 frames for 200 tokens), so a frame-counting gauge reads ~1.8x low.
+    # The count is per-CONTENT-frame, and the tiny model finishes inside one poll, so
+    # this fixture legitimately has a single content frame: the invariant that holds for
+    # both is "every content frame carries a count, and the counts never go backwards",
+    # not "there are several".
+    counts = got["counts"]
+    assert len(counts) == got["content"] + 1, (
+        f"{len(counts)} frames carried usage but there are {got['content']} content frames "
+        f"plus one final chunk: a content frame without a count leaves the live gauge "
+        f"counting frames for that stretch: {got}"
+    )
+    assert counts == sorted(counts), f"cumulative token counts went backwards: {counts}"
 
 
 def test_completion_stream(client, model_id):

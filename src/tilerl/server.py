@@ -91,6 +91,14 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _usage(prompt_tokens: int, completion_tokens: int) -> dict:
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
 # ---------------------------------------------------------------------------
 # App factory.
 # ---------------------------------------------------------------------------
@@ -223,11 +231,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                     "finish_reason": "length" if len(output_ids) >= max_new else "stop",
                 }
             ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": len(output_ids),
-                "total_tokens": prompt_tokens + len(output_ids),
-            },
+            "usage": _usage(prompt_tokens, len(output_ids)),
             "system_fingerprint": SYSTEM_FINGERPRINT,
         }
 
@@ -238,6 +242,19 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         deadline = time.monotonic() + 1800.0
         sent = 0  # characters of the STRIPPED reply already emitted
         seen = 0  # tokens already decoded, so a quiet poll costs nothing
+
+        def content_frame(text: str, completion: int) -> str:
+            # Cumulative tokens on every content frame, vLLM's continuous_usage_stats
+            # shape. Without it a live rate gauge can only count frames, and this loop
+            # coalesces ~1.8 tokens into each (measured: 109 frames for 200 tokens on the
+            # 27B), so the page would show roughly half the real rate until the final
+            # usage chunk landed. choices stays populated, so a client that indexes it is
+            # unharmed; the usage-ONLY chunk remains the one with an empty choices list.
+            chunk = _chat_chunk(chunk_id, created, model_name, {"content": text})
+            if include_usage:
+                chunk["usage"] = _usage(prompt_tokens, completion)
+            return _sse(chunk)
+
         try:
             while True:
                 # peek() is lock-free; take() blocks on the engine lock for a whole
@@ -257,9 +274,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                     # contains an unmappable byte, which is every prefix on the tiny model.
                     text = strip_think(tokenizer.decode(live).rstrip("�"))
                     if len(text) > sent:
-                        yield _sse(
-                            _chat_chunk(chunk_id, created, model_name, {"content": text[sent:]})
-                        )
+                        yield content_frame(text[sent:], seen)
                         sent = len(text)
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"request {request_id} did not finish within 1800.0s")
@@ -273,7 +288,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         # this is the remainder of the same string the deltas were cut from
         tail = strip_think(tokenizer.decode(output_ids))[sent:]
         if tail:
-            yield _sse(_chat_chunk(chunk_id, created, model_name, {"content": tail}))
+            yield content_frame(tail, len(output_ids))
         finish = "length" if len(output_ids) >= max_new else "stop"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=finish))
         # A final usage-only chunk, OpenAI's include_usage shape. Without it a client can
@@ -284,11 +299,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         if include_usage:
             usage = _chat_chunk(chunk_id, created, model_name, {})
             usage["choices"] = []
-            usage["usage"] = {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": len(output_ids),
-                "total_tokens": prompt_tokens + len(output_ids),
-            }
+            usage["usage"] = _usage(prompt_tokens, len(output_ids))
             yield _sse(usage)
         yield "data: [DONE]\n\n"
 
@@ -426,11 +437,13 @@ function mdEscape(s) {
   // reasoned about: [x](https://a"onmouseover="alert(1)) produced a live onmouseover
   // handler, and ```js"onload="alert(1) a live onload.
   //
-  // BOTH quote characters, and `'` is not optional: with only `"` escaped, the
-  // single-quote variant [x](https://a'onmouseover='b) still parsed as a real
-  // onmouseover ATTRIBUTE. A substring search for the handler name cannot see that
-  // difference -- `&quot;onmouseover=&quot;` contains the name and is inert -- so the
-  // gate parses tag interiors for attribute names instead.
+  // BOTH quote characters. Only `"` is load-bearing today, because every attribute
+  // this template writes is double-quoted; `'` is defence in depth for the next
+  // single-quoted attribute someone adds. A claim that `'` was also a live breakout
+  // came from a regex whose class treated `'` as an attribute separator and reported
+  // one that html.parser does not see -- retracted in
+  // errors/2026-09-05-a-regex-standing-in-for-a-parser-invented-a-bug.md, and the gate
+  // now parses tag interiors with html.parser instead of matching them.
   //
   // Escaped at the source rather than by tightening the URL character class, because
   // a class only guards the rule it sits in and leaves the next attribute exposed.
@@ -952,7 +965,7 @@ async function readSSE(resp, onFrame) {
 async function sendChat(text) {
   const bubble = addMsg("assistant", "");
   bubble.classList.add("streaming");
-  const t0 = performance.now(); let firstAt = 0, seen = 0;
+  const t0 = performance.now(); let firstAt = 0, tokens = 0;
   history.push({ role: "user", content: text });
   abort = new AbortController();
   let raw = "", think = null, collapsed = false;
@@ -970,26 +983,28 @@ async function sendChat(text) {
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     await readSSE(resp, (obj) => {
-      // The usage-only chunk carries no choices, so read it before indexing into them.
-      // Its completion_tokens is the engine's own count -- authoritative over the
-      // delta count below, which is frames, not tokens.
-      if (obj.usage) {
-        const secs = (performance.now() - (firstAt || t0)) / 1000;
-        if (secs > 0) $("tps").textContent = (obj.usage.completion_tokens / secs).toFixed(1);
+      // Content frames now carry cumulative usage too, so the usage-ONLY chunk is the
+      // one with no choices. Keying on obj.usage alone would return early on every
+      // content frame and nothing would ever render.
+      const delta = obj.choices?.[0]?.delta?.content;
+      // The engine's own token count, authoritative over any client-side tally.
+      if (obj.usage) tokens = obj.usage.completion_tokens;
+      if (!delta) {
+        if (!obj.choices?.length && tokens && firstAt) {
+          const secs = (performance.now() - firstAt) / 1000;
+          if (secs > 0) $("tps").textContent = (tokens / secs).toFixed(1);
+        }
         return;
       }
-      const delta = obj.choices?.[0]?.delta?.content;
-      if (!delta) return;
       if (!firstAt) { firstAt = performance.now(); $("ttft").textContent = Math.round(firstAt - t0); }
       raw += delta;
       // Live decode rate, updated per frame: the window opens at the FIRST token, so
       // prefill is excluded by construction -- charging prefill to decode is what read
       // as a 15% serve regression that did not exist
       // (errors/2026-09-04-a-served-first-visit-pays-10x-and-serve-was-not-immune.md).
-      // Frames are a lower bound on tokens until the usage chunk corrects it.
-      seen += 1;
+      // Counting FRAMES here read 1.8x low: this server coalesces tokens per poll.
       const dt = (performance.now() - firstAt) / 1000;
-      if (dt > 0.15) $("tps").textContent = (seen / dt).toFixed(1);
+      if (tokens && dt > 0.15) $("tps").textContent = (tokens / dt).toFixed(1);
       // Split the model's reasoning out of the answer. Re-partition the whole
       // accumulated text each frame: the tag can land mid-delta, and the reply starts
       // inside the block, so there is no state machine to run across chunks.

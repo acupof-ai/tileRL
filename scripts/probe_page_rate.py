@@ -35,6 +35,7 @@ def one(max_tokens=200):
     sent = time.perf_counter()
     first = None
     usage = None
+    frames = 0
     with urllib.request.urlopen(req, timeout=900) as r:
         for line in r:
             line = line.decode().strip()
@@ -47,12 +48,19 @@ def one(max_tokens=200):
             if obj.get("usage"):
                 usage = obj["usage"]
                 continue
-            if (obj.get("choices") or [{}])[0].get("delta", {}).get("content") and first is None:
-                first = time.perf_counter()
+            if (obj.get("choices") or [{}])[0].get("delta", {}).get("content"):
+                frames += 1
+                if first is None:
+                    first = time.perf_counter()
     end = time.perf_counter()
     assert first is not None and usage, "no content frames arrived"
     n = usage["completion_tokens"]
-    return (first - sent) * 1000, n, n / (end - first), n / (end - sent)
+    # The decode window opens at the FIRST frame, so tokens inside that frame were
+    # generated before it and n/(end-first) overstates the rate by c_1/n. c_1 is not
+    # visible client-side, but frames is: at frames == n the server put one token in
+    # each, c_1 == 1, and the overstatement is 1/n. Printed so the bound is read off
+    # the run instead of assumed.
+    return (first - sent) * 1000, n, frames, n / (end - first), n / (end - sent)
 
 
 if __name__ == "__main__":
@@ -61,12 +69,15 @@ if __name__ == "__main__":
         # Decode rate is not one number: the tick grows with context (#47/#57), so a
         # rate quoted without its length is not comparable to another one.
         for m in (200, 400, 800, 1600):
-            _, n, decode, _ = one(m)
-            print(f"max_tokens {m:5d}  got {n:5d}  decode {decode:.1f} tok/s")
+            _, n, frames, decode, _ = one(m)
+            print(f"max_tokens {m:5d}  got {n:5d}  frames {frames:5d}  decode {decode:.1f} tok/s")
         raise SystemExit
     rows = [one() for _ in range(int(arg))]
-    for i, (ttft, n, decode, wall) in enumerate(rows):
-        print(f"run{i}: ttft {ttft:.0f}ms  tokens {n}  decode {decode:.1f}  wall {wall:.1f} tok/s")
-    dec = sorted(r[2] for r in rows)[len(rows) // 2]
-    wal = sorted(r[3] for r in rows)[len(rows) // 2]
+    for i, (ttft, n, frames, decode, wall) in enumerate(rows):
+        print(
+            f"run{i}: ttft {ttft:.0f}ms  tokens {n}  frames {frames}  "
+            f"decode {decode:.1f}  wall {wall:.1f} tok/s"
+        )
+    dec = sorted(r[3] for r in rows)[len(rows) // 2]
+    wal = sorted(r[4] for r in rows)[len(rows) // 2]
     print(f"median decode {dec:.1f}  wall {wal:.1f} tok/s  ratio {dec / wal:.3f}x")
