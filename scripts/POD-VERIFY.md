@@ -275,7 +275,8 @@ continuations.
   continuation regardless of prompt. Check `tie_word_embeddings=False` and that
   `lm_head.weight` actually landed.
 - **FAIL "degenerate"** — signal is dying somewhere in the stack. Next tool is
-  `scripts/diag_slice.py`, which prints every rmsnorm output norm and the final
+  `wins/2026-08-27-zero-centered-rmsnorm.md` (the probe is deleted; the finding is
+  the entry), which recorded every rmsnorm output norm and the final
   logits std. Read the raw ids first: greedy decode now stops on the
   tokenizer's `<|im_end|>`/`<|endoftext|>` set, but a healthy model that emits
   one of them inside 8 tokens still trips the "only N tokens generated" arm.

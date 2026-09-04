@@ -16,3 +16,16 @@ Durable tools — run from a checkout, documented in their docstrings:
 Everything prefixed `probe_`, `diag_`, `bench_<kernel>`, `ab_`, `_` is a
 one-off from one investigation; its result lives in `docs/experience/` and
 the script is kept only so the entry can be re-run. Do not build on one.
+
+And stop keeping it when that stops being true: **a probe whose entry is
+superseded, or whose mechanism a later measurement excludes, is deleted — the
+entry is the record, not the script.** Repair its inbound references in the
+same commit.
+
+"Nothing references it" is not that test, and grepping the script's name is not
+that test either. Three ways a live script looks dead: an entry cites the *log*
+it wrote and never names it (`bench_smoke.py` — `/work/bench_smoke.log`); it is
+a launcher, which by definition nothing imports (`_pod_*.sh`, which carry the
+setsid/CUDA_VISIBLE_DEVICES/redirect combination that took real failures to get
+right); or it is the only producer of an artifact something else consumes. Check
+the log name and what the script *calls* before deleting it.
