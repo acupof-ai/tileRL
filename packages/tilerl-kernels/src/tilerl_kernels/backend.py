@@ -257,7 +257,12 @@ class Backend:
 
     @staticmethod
     def _c(t: torch.Tensor) -> torch.Tensor:
-        return t if t.is_contiguous() else t.contiguous()
+        # A row slice is contiguous AND starts partway into its storage, and the Metal
+        # ABI rejects a non-zero byte_offset that CUDA tolerates. `.contiguous()` is a
+        # no-op on such a view (it is already contiguous), so the reset needs a copy.
+        if t.is_contiguous():
+            return t if t.storage_offset() == 0 else t.clone()
+        return t.contiguous()
 
     def _dev(self, t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         """Cast and migrate at the tilelang boundary (callers may pass CPU tensors)."""
