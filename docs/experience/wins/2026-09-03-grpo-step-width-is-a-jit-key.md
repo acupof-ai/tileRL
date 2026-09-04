@@ -87,6 +87,14 @@ arm's 1.63. The step contributes **5.9% of the variance**: nearly all the
 scatter is in the compile, which is what "compile time tracks what the JIT has
 to build" predicts.
 
+The two arms are negatively correlated (r = -0.53), so the paired design
+*widened* the interval rather than tightening it: sd of the differences is
+1.873 s against 1.680 s if the arms were independent, and an unpaired interval
+would read 8.73-12.19 s (1.39x-1.55x) at 8 df. The reported 1.37-1.58x is
+therefore the conservative one -- it is not overstated, and there is no need to
+re-derive this. At n=5, r is indistinguishable from zero; do not read a
+mechanism into it.
+
 This also bounds what the fix is worth against the P1 entry's
 `secs_per_step_median = 60.45` at gen 256: `rl_step` is ~22 s of that, leaving
 ~38 s of rollout, and compile can add 11 s only to the steps that hit a new
