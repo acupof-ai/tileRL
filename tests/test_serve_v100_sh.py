@@ -9,6 +9,7 @@ Skips where flock(1) is absent, which is every macOS row including CI's -- the s
 refuses to run unlocked, so there is nothing to assert there. It fires on the linux row
 and on the pod.
 """
+
 import contextlib
 import pathlib
 import shutil
@@ -20,8 +21,9 @@ import pytest
 
 SRC = pathlib.Path(__file__).parent.parent / "scripts" / "serve_v100.sh"
 
-pytestmark = pytest.mark.skipif(shutil.which("flock") is None,
-                                reason="flock(1) absent; the supervisor refuses to run unlocked")
+pytestmark = pytest.mark.skipif(
+    shutil.which("flock") is None, reason="flock(1) absent; the supervisor refuses to run unlocked"
+)
 
 
 @contextlib.contextmanager
@@ -36,15 +38,18 @@ def sandbox(exit_code, sleep_s=0):
         # records into `terms` if TERM is what stops it.
         (d / "venv70/bin/python").write_text(
             f'#!/bin/bash\necho x >> {boots}\ntrap "echo t >> {d}/terms; exit 143" TERM\n'
-            f'[ {sleep_s} -gt 0 ] && sleep {sleep_s} & wait $!\nexit {exit_code}\n')
+            f"[ {sleep_s} -gt 0 ] && sleep {sleep_s} & wait $!\nexit {exit_code}\n"
+        )
         (d / "venv70/bin/python").chmod(0o755)
         script = d / "s.sh"
-        script.write_text(SRC.read_text()
-                          .replace("ROOT=/data00/home/chenkailun.c", f"ROOT={d}")
-                          .replace("MAX_RESTARTS=10", "MAX_RESTARTS=2")
-                          .replace("sleep 30", "sleep 0")
-                          .replace("$(git rev-parse --short HEAD)", "stub")
-                          .replace("$(git status --porcelain | wc -l)", "0"))
+        script.write_text(
+            SRC.read_text()
+            .replace("ROOT=/data00/home/chenkailun.c", f"ROOT={d}")
+            .replace("MAX_RESTARTS=10", "MAX_RESTARTS=2")
+            .replace("sleep 30", "sleep 0")
+            .replace("$(git rev-parse --short HEAD)", "stub")
+            .replace("$(git status --porcelain | wc -l)", "0")
+        )
         script.chmod(0o755)
         yield d, script, boots
     finally:
@@ -58,15 +63,17 @@ def boots_of(path):
 def test_a_crash_restarts_and_the_cap_gives_up():
     with sandbox(7) as (_, script, boots):
         rc = subprocess.run(["bash", str(script)], capture_output=True, timeout=120).returncode
-        assert (boots_of(boots), rc) == (3, 1), \
+        assert (boots_of(boots), rc) == (3, 1), (
             f"want 3 boots then give up, got {boots_of(boots)}/{rc}"
+        )
 
 
 def test_a_deliberate_stop_is_not_restarted():
     with sandbox(143) as (_, script, boots):
         rc = subprocess.run(["bash", str(script)], capture_output=True, timeout=120).returncode
-        assert (boots_of(boots), rc) == (1, 143), \
+        assert (boots_of(boots), rc) == (1, 143), (
             f"TERM must not restart, got {boots_of(boots)}/{rc}"
+        )
 
 
 def test_term_to_the_supervisor_reaches_the_server():
@@ -86,14 +93,14 @@ def test_term_to_the_supervisor_reaches_the_server():
             if sup.poll() is None:
                 sup.kill()
         assert (d / "terms").exists(), "the server never saw TERM; it would outlive the supervisor"
-        assert rc == 143 and boots_of(boots) == 1, \
+        assert rc == 143 and boots_of(boots) == 1, (
             f"want one boot and rc 143, got {boots_of(boots)}/{rc}"
+        )
 
 
 def test_a_second_supervisor_is_refused_and_the_lock_is_why():
     with sandbox(0) as (d, script, _):
-        holder = subprocess.Popen(["bash", "-c",
-                                   f"exec 9>{d}/.serve70.lock; flock -n 9; sleep 10"])
+        holder = subprocess.Popen(["bash", "-c", f"exec 9>{d}/.serve70.lock; flock -n 9; sleep 10"])
         try:
             time.sleep(0.5)
             r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=60)

@@ -10,6 +10,7 @@ request so the difference is attributed rather than guessed:
 Run on the pod: from the Mac, RTT lands inside both windows and neither number is the
 engine's.
 """
+
 import json
 import sys
 import time
@@ -18,15 +19,19 @@ import urllib.request
 URL = "http://127.0.0.1:8000/v1/chat/completions"
 BODY = {
     "messages": [{"role": "user", "content": "Explain speculative decoding in three sentences."}],
-    "max_tokens": 200, "stream": True, "stream_options": {"include_usage": True},
-    "chat_template_kwargs": {"enable_thinking": True}, "temperature": 0.0,
+    "max_tokens": 200,
+    "stream": True,
+    "stream_options": {"include_usage": True},
+    "chat_template_kwargs": {"enable_thinking": True},
+    "temperature": 0.0,
 }
 
 
 def one(max_tokens=200):
     body = dict(BODY, max_tokens=max_tokens)
-    req = urllib.request.Request(URL, data=json.dumps(body).encode(),
-                                headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
+    )
     sent = time.perf_counter()
     first = None
     usage = None
