@@ -115,6 +115,35 @@ uses ctx=1024, where the estimate leaves margin at depth 1-2 — and the estimat
 **1.39x low** (#55 measured 2.94 GiB where this model says 2.11), so the deep rows may
 OOM; that outcome is reportable.
 
+## The run ended in OOM at depth 1, and the failing shape is 8x what the plan permits
+
+After 269 compiles and 10 minutes it died — **at depth 1**, where my estimate said there
+was margin:
+
+```
+torch.OutOfMemoryError: Tried to allocate 272.00 MiB.
+  31.74 GiB total, 186.38 MiB free, 31.55 GiB in use (30.33 allocated by PyTorch)
+  backend.py:1202 in silu_mul  <-  self._c(self._f32(gate).reshape(-1))
+```
+
+So the estimate was wrong in the direction already flagged (#55 measured 2.94 GiB where
+the model says 2.11, 1.39x low) — depth 1 does not fit either, and depths 2-4 were never
+reached. **That is the reportable row for #72: on sm70 the B=8 arm does not run at any
+depth, at ctx=1024 or ctx=2048.**
+
+**One number in it I cannot account for.** The failing allocation is 272 MiB =
+`4096 × 17408` f32 — 4096 rows into `silu_mul`. But `_build_plan` decrements a *shared*
+token budget (`engine.py:591`, `:608`): `budget = max_num_batched_tokens − len(decodes)`
+= 512, the first prefill row takes `min(1152, 512) = 512` and drives the budget to 0, so
+the next row breaks out. One tick should therefore prefill **512 tokens → 512 rows → 102
+MiB**. The observed tensor is **8x** that, as if all eight rows each took a full 512-wide
+chunk.
+
+Either my reading of the budget is wrong or something else feeds `silu_mul` a
+`[8, 512, ·]` activation. I have not established which, and the whole point of this entry
+is not to fill that kind of gap with a plausible story — the four dead mechanisms above
+are what that costs.
+
 ## Rule
 
 A steady rate refutes an enumeration. Before attributing repeated work to a finite set of
