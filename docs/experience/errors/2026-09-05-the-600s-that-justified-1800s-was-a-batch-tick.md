@@ -34,6 +34,25 @@ unreachable.
 
 So the cited ~600 s is **15x** the real single-request cost.
 
+### The 39.1 s reconciles against a bench measured a different way
+
+`docs/serve-v100.md:106-112` already holds a prefill table taken through a direct
+`step()` loop, fully warm, no HTTP: **8.92 ms/token at 4096 ctx**. Applied to this
+request's 3478 tokens that is 31.0 s, plus 0.16 s for 8 output tokens at 50.3 tok/s:
+
+| component | s |
+|---|---:|
+| prefill, tree's bench rate × 3478 tokens | 31.0 |
+| 8 decode tokens at 50.3 tok/s | 0.16 |
+| **accounted** | **31.2** |
+| measured end-to-end | 39.1 |
+| unaccounted (HTTP, tokenize, template render, scheduling) | 7.9 (20%) |
+
+Two methods with nothing in common — an in-process `step()` loop and an HTTP request
+from another machine — agree within **1.26x**, and the sign is right: mine carries
+the overhead the bench does not. That is what makes 39.1 s a measurement rather than
+a single unreplicated number, and it is the check the ~600 s figure never had.
+
 ## Root cause of the wrong figure
 
 Two things, and the ordering is the interesting one.
@@ -54,6 +73,17 @@ already made 4.3x cheaper four commits earlier. 4.3x of the 15x gap is exactly t
 Neither the commit nor any `docs/experience/` entry records a 4K single-request
 timing; `grep` for "600 s" across `docs/` and `CHANGELOG.md` returns nothing. The
 figure entered the tree as a commit-body assertion and was never checked.
+
+### One comparison I am NOT making
+
+The B=8 entry works out to 29.49 ms/token (15.1 s / 512) against my 11.24, i.e. the
+batched tick costs 2.62x more per token — which would be an interesting finding about
+batching, and I am not reporting it as one. **79 runtime commits sit between the two
+measurements** (`git log --since=2026-08-31 -- src/tilerl/ packages/`), the row lengths
+differ 54-fold (64 vs 3478 tokens), and the two used different harnesses. That ratio
+mixes five days of code change, a row-length effect and a batch effect into one number.
+Dividing one recorded figure by another from a different day is the same move as summing
+a ceiling with a trace row.
 
 ## The instrument I nearly reported instead
 
