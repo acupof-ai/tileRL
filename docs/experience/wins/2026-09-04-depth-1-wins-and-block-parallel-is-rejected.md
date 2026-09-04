@@ -179,6 +179,46 @@ verify times comparable across B**; only identical `(rows, W, ctx)` does. Rung 2
 exception that makes the peer's compile visible, because there both runs are 1 row at
 W=2.
 
+## Checked: the sm90 peer's p0 contamination does not reach these rows
+
+At B=8 the peer measured `groups[0]` — the same prompts the warm pass had just run —
+coming out **3.0x slower** than the two unwarmed groups, and concluded that
+`measure(groups[0])` at `:291` is one insufficient warm pass, making **p0 structurally
+unusable at any `--prompts`**. That would put a contaminated third inside every pooled
+mean here, so it needed checking rather than assuming.
+
+It does not hold at B=1. My p0 is the **fastest** group in 6 of 8 rows:
+
+```
+                p0      p1      p2    p0/min(p1,p2)
+ctx1024 d1   34.87   38.35   35.16      0.9918x
+ctx1024 d4   98.79  100.67   98.98      0.9981x
+ctx2048 d1   36.18   38.11   38.16      0.9494x
+ctx2048 d4   98.64   91.79   98.03      1.0746x   <- worst
+```
+
+Worst p0 excess across all eight rows is **1.0746x** against the peer's 3.0x. A compile
+moves the *tick*; nothing here does.
+
+What does vary across my groups is **tok/fwd, falling monotonically** — 1.90 → 1.79 →
+1.65 at ctx2048 d1, up to 3.43 → 3.10 → 2.19 at d4. That is the passage effect the
+harness already documents at `:286` (15.8% between wikitext passages) and the reason it
+prints per-group rows at all. Corpus variance moves acceptance with a flat tick;
+a compile moves the tick with flat acceptance. The two are distinguishable, and this is
+the second.
+
+**Neither verdict moves if p0 is dropped anyway**, which is the test that matters:
+
+```
+                 all 3 groups              p1+p2 only
+ctx1024   d1 48.3  best=d1  d1/d3 1.2516x  |  46.9  best=d1  1.2468x
+ctx2048   d1 47.5  best=d1  d1/d3 1.1199x  |  45.1  best=d1  1.1608x
+#22 draft share / ceiling    19.0% 1.2340x  |  18.6% 1.2291x
+```
+
+Depth 1 wins on either arm at both contexts, and the #22 ceiling moves by 0.4 points.
+The headline figures in this entry pool all three groups, as the harness printed them.
+
 ## The draft cost has two terms, and the four depths separate them
 
 Depth 1's draft reads **7.18 ms/forward** against 5.91 / 5.79 / 5.75 at depths 2-4,
