@@ -248,7 +248,10 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             # One whole-message delta per block, not per-token: the record
             # carries the token sequence, so streaming granularity is a UI
             # concern here.
-            # ponytail: per-token deltas when a human watches this live.
+            # ponytail: per-token deltas when a human watches this live; that rewrite
+            # needs its own catch-all, since a raise past the 200 header reaches the
+            # client as success with no content (server.py's _stream did, for four
+            # exception types).
             def ev(name: str, payload: dict[str, Any]) -> str:
                 return f"event: {name}\ndata: {json.dumps(payload)}\n\n"
 

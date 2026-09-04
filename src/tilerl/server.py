@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any
 
@@ -148,10 +149,16 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
     @app.get("/health")
     def health() -> dict:
+        # "ok" was a literal, so an engine whose stats() raises answered the same as a
+        # healthy one. Loop liveness is deliberately NOT checked: it would need
+        # engine._thread, which DataParallelEngine lacks, so the check would pass
+        # vacuously on --devices -- the shape of the peek gap. That wants a liveness
+        # method on the engine.
         try:
             stats = engine.stats()
-        except Exception:
-            stats = None
+        except Exception as exc:
+            return {"status": "degraded", "model": model_name, "stats": None,
+                    "error": f"{type(exc).__name__}: {exc}"}
         return {"status": "ok", "model": model_name, "stats": stats}
 
     @app.get("/v1/models")
@@ -282,6 +289,18 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             output_ids = _await_completion(request_id)
         except (TimeoutError, RuntimeError) as exc:
             yield _sse({"error": {"message": str(exc), "type": "api_error"}})
+            yield "data: [DONE]\n\n"
+            return
+        except Exception as exc:
+            # The 200 header left before this generator ran, so an escaping exception
+            # reaches the client as 200 with zero frames and no [DONE] -- a success
+            # status over a failed request, which reads as an empty reply. Measured:
+            # DataParallelEngine had no `peek`, and `serve --devices` returned exactly
+            # that. Logged as well as framed, because a tidy error frame is easier to
+            # ignore than silence and this branch means a defect, not a busy engine.
+            logging.exception("stream for request %s died", request_id)
+            yield _sse({"error": {"message": f"{type(exc).__name__}: {exc}",
+                                  "type": "internal_error"}})
             yield "data: [DONE]\n\n"
             return
         # reasoning is the model's, not the reply; sent counts stripped characters, so
