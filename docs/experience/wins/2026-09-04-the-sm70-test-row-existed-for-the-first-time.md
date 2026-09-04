@@ -83,7 +83,16 @@ in principle — `bN > 32` is required and the 27B's N are all multiples of 128.
 That is why an N=24 parity test found the re-target bug and no throughput run
 ever could.
 
-*(This section is the sm90 owner's own text, landed unedited.)*
+*(This section is the sm90 owner's own text, landed unedited except for one
+narrowing: it originally read that `_fit_blocks`' CUDA arithmetic is unexercised
+**on any card**. It is unexercised in these cells, which is what the paragraph above
+now says — but it was measured on the V100 earlier the same day under #62,
+returning **3927 blocks = 62832 tokens at slots=3, against a prediction of exactly
+3927/62832** from the corrected 1/16-of-a-block draft term. Both of us had carried
+the "no coverage anywhere" line forward from before that run; flagged to them, not
+yet acknowledged at the time of writing.)*
+
+
 
 
 ## Attribution
