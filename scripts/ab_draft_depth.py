@@ -98,8 +98,8 @@ def _alloc_delta(a0: dict) -> dict:
 
     An ordered, compounding per-group stall (2.3x then 2.3x on the sm90 peer's
     depth-3 tail) is not the prefill rectangle: `measure` opens its window only
-    after every row reaches _PHASE_DECODE (:144-150) and submits nothing inside
-    it, so `decodes and prefills` (engine.py:776) cannot fire -- and :188 already
+    after every row reaches _PHASE_DECODE (:195-199) and submits nothing inside
+    it, so `decodes and prefills` (engine.py:776) cannot fire -- and :240-241 already
     raises if it does, which every printed row therefore passed. What CAN grow
     monotonically along a run is fragmentation: each group allocates and frees the
     same shapes, and `num_alloc_retries` counts the times the caching allocator
