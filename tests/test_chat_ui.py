@@ -429,6 +429,79 @@ def test_the_stream_marks_and_unmarks_the_pending_bubble():
     assert '.classList.remove("streaming")' in _CHAT_UI
 
 
+def test_no_markdown_input_can_add_an_attribute_to_the_output():
+    """Attribute breakout: the renderer's output goes to innerHTML.
+
+    `mdEscape` escaped `&`, `<`, `>` and no quotes, while two rules interpolate its
+    result into an HTML ATTRIBUTE -- `href="..."` in the link rule and `data-lang="..."`
+    on a fence. So a quote in a URL or a fence language closed the attribute and the
+    rest of the token became markup. Executed against the real renderer, both produced
+    live event handlers.
+
+    Asserts on the attribute NAMES in the output, not on substrings. A substring search
+    cannot tell an attribute from text -- `&quot;onmouseover=&quot;` contains the handler
+    name and is inert -- and that difference is exactly what the fix creates. It is also
+    what caught the half the first fix missed: escaping only `"` left the single-quote
+    variant parsing as a real `onmouseover` attribute.
+
+    The allow-list is closed rather than a deny-list of `on*`: `style`, `srcdoc` and
+    `formaction` are all reachable without an event handler name.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the renderer's output cannot be exercised")
+    from tilerl.server import _MD_JS
+
+    #: Every attribute the renderer is allowed to emit, over every input.
+    allowed = {"href", "target", "rel", "class", "data-lang"}
+    attacks = [
+        '[x](https://a"onmouseover="alert(1))',
+        "[x](https://a'onmouseover='b)",
+        '```js"onload="alert(1)\ncode\n```',
+        "```js'onload='alert(1)\ncode\n```",
+        '[x](https://a"style="width:99vw)',           # not an on* name
+        '[x](javascript:alert(1))',                    # scheme, not breakout
+        '# h"onclick="x',
+        '- item"onclick="x',
+        '> quote"onclick="x',
+        '**b"onclick="x**',
+        # A raw tag, so this gate covers the `<` escape too and not only the quotes.
+        # Without it, dropping the `<` escape read MISSED under mutation while the
+        # quote mutations were caught.
+        '<img src=x onerror=alert(1)>',
+        '<a href="javascript:alert(1)">x</a>',
+        # Benign inputs must keep working: a regression here is a broken page, and a
+        # gate that only feeds attacks cannot see it.
+        '[ok](https://e.com/a?b=1&c=2)',
+        '```py\nprint(1)\n```',
+        'it\'s a "test"',
+    ]
+    harness = _MD_JS + "\nconst C = " + json.dumps(attacks) + ";\n" + textwrap.dedent("""
+        const out = [];
+        for (const s of C) {
+          const html = mdRender(s);
+          const attrs = new Set();
+          // Tag interiors only, so attribute-looking text in the body is not counted.
+          for (const tag of html.match(/<[a-z][^>]*>/g) || [])
+            for (const m of tag.matchAll(/[\\s"']([a-zA-Z-]+)\\s*=/g)) attrs.add(m[1]);
+          out.push([s, [...attrs], html]);
+        }
+        console.log(JSON.stringify(out));
+    """)
+    r = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"the renderer threw: {r.stderr.strip()[:400]}"
+    rows = json.loads(r.stdout.strip().splitlines()[-1])
+    for src, attrs, html in rows:
+        extra = sorted(set(attrs) - allowed)
+        assert not extra, (
+            f"input {src!r} put {extra} into the markup, which innerHTML will honour:\n  {html}"
+        )
+    # The benign rows must still render, or an over-eager escape passes this vacuously.
+    by_src = {src: html for src, _, html in rows}
+    assert 'href="https://e.com/a?b=1&amp;c=2"' in by_src['[ok](https://e.com/a?b=1&c=2)']
+    assert 'data-lang="py"' in by_src['```py\nprint(1)\n```']
+
+
 def test_markdown_renders_and_escapes():
     """The renderer's OUTPUT, not just that its calls resolve.
 

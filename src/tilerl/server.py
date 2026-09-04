@@ -420,7 +420,23 @@ _MD_JS = r"""// Markdown, enough of it for model output: fenced code, inline cod
 const BT = String.fromCharCode(96);  // no literal backtick: see mdInline
 
 function mdEscape(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // Quotes matter as much as `<` here: two rules interpolate escaped text into an
+  // HTML ATTRIBUTE -- href="..." in the link rule and data-lang="..." on a fence --
+  // so a quote breaks out and the rest of the token becomes markup. Executed, not
+  // reasoned about: [x](https://a"onmouseover="alert(1)) produced a live onmouseover
+  // handler, and ```js"onload="alert(1) a live onload.
+  //
+  // BOTH quote characters, and `'` is not optional: with only `"` escaped, the
+  // single-quote variant [x](https://a'onmouseover='b) still parsed as a real
+  // onmouseover ATTRIBUTE. A substring search for the handler name cannot see that
+  // difference -- `&quot;onmouseover=&quot;` contains the name and is inert -- so the
+  // gate parses tag interiors for attribute names instead.
+  //
+  // Escaped at the source rather than by tightening the URL character class, because
+  // a class only guards the rule it sits in and leaves the next attribute exposed.
+  // The entities render as the characters themselves in text content.
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 function mdInline(s) {
