@@ -1,7 +1,7 @@
 ---
 question: Does tileRL run on Apple Silicon, and how fast is the 27B there?
 status: measured
-source: tileRL, M4 Pro (48 GB unified), 2026-09-04; TILERL_TARGET=metal, torch 2.13.0, tilelang 0.1.13
+source: tileRL, M4 Pro (48 GB unified) + H20 card 0, 2026-09-04; torch 2.13.0, tilelang 0.1.13
 ---
 
 # Metal runs the suite green, and its gemms are 28x off torch-eager
@@ -124,6 +124,17 @@ unmeasurable today for a disk reason, not a memory one — 48 GB of unified memo
 would hold the weights fine. The per-layer figures above are measured on real
 27B shapes with random weights, which prices the arithmetic without needing the
 checkpoint.
+
+## All three targets green
+
+| target | result |
+|---|---|
+| metal (M4 Pro) | 256 passed, 9 skipped |
+| cpu | 257 passed, 8 skipped |
+| sm90 (H20, card 0) | 256 passed, 10 skipped |
+
+The sm90 run is the one that matters for the gate: it confirms the branch costs
+CUDA nothing and breaks nothing, measured rather than argued.
 
 ## Rule
 
