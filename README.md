@@ -48,12 +48,13 @@ It transfers to tasks the adapter never saw — tokens fall 22.0% on MMLU, 18.9%
 ARC-Easy, 22.9% on PIQA, with no measurable accuracy change at n=100. Output tokens
 are the serving bill, so this is a win in the units the product is sold in.
 
-The control says why it worked, and it was not the reason we wrote down first. Retrain
-at 2048 and the cap's effect vanishes — not because brevity pressure is gone, but
-because **the policy now solves 96.6% of training prompts and 88.7% of GRPO steps
-carry no gradient at all.** The tight cap was holding the task hard enough to keep
-groups mixed. A binary reward against a strong policy is the real constraint; the cap
-was hiding it.
+The control moved the claim twice. Retrained at 2048, the policy solves 96.6% of
+training prompts and **92% of GRPO steps carry no gradient** — the tight cap was
+holding the task hard enough to keep groups mixed. But that arm still reached
+**96.4% on GSM8K, off 8 gradient steps**, which is not distinguishable from the
+capped arm's 94.8%. So the cap bought sample efficiency and the token reduction;
+it did not buy the accuracy. A binary reward against a strong policy wastes
+compute without diluting the steps that survive it.
 
 [The result](docs/experience/wins/2026-09-04-the-thinking-cap.md) ·
 [the control that reinterpreted it](docs/experience/wins/2026-09-04-the-cap-was-the-gradient.md) ·
