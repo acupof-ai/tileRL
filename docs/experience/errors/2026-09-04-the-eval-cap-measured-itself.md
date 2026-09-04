@@ -63,6 +63,28 @@ Not the cause, but checked and cleared: `gsm8k_train.jsonl` (512 rows) and
 appear as some train answer, which is the small integer range of GSM8K, not
 leakage.
 
+## What survives the defect: MMLU
+
+`mmlu_score` (`eval.py:71`) builds its own `SamplingParams(max_new_tokens=1, ...)`
+and never touches the shared `params` object, so the answer comes off the prefill
+and the cap cannot reach it. MMLU is the one metric in these runs the defect does
+not corrupt:
+
+| run | MMLU before | after | delta |
+|---|---:|---:|---:|
+| `a4332cbca4fa` GRPO | 75.2% | 75.0% | **-0.2** |
+| `41e3301e22a5` OPD | 75.2% | 81.4% | **+6.2** |
+
+At n=1000, treating the arms as independent (conservative -- they are paired on
+the same questions and seed, so the real test is sharper), the 95% interval on a
+difference is +/-3.8 points. GRPO's -0.2 is no movement; OPD's +6.2 is 3.2 sd and
+is real.
+
+Read this correctly: **MMLU is an off-task holdout for GSM8K training, so flat is
+the pass condition, not a failure.** `mmlu_holds` exists to catch collateral
+damage, and GRPO caused none. A flat MMLU is evidence the run did not break the
+model. It is not evidence about whether GSM8K improved, in either direction.
+
 ## Fix
 
 - Size the rollout KV pool from `max(prompt) + max_new_tokens`. A flat
