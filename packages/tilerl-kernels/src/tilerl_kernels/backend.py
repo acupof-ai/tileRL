@@ -207,6 +207,8 @@ class Backend:
         # Declared beside io for the same reason: the store (materialize) and the
         # kernel annotation must not drift (wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi).
         self.scale_io = torch.float16 if self.arch == "sm70" else torch.float32
+        #: Metal's packed ABI rejects a kernel argument whose byte_offset is not 0.
+        self._zero_offset = self.arch == "metal"
         # Narrow dtype for the embedding gather only — NOT io, which the f32
         # kernels depend on. Half the table's bytes on the card, and the gather
         # widens to f32 on read.
@@ -255,13 +257,15 @@ class Backend:
 
     # ------------------------------------------------------------ helpers
 
-    @staticmethod
-    def _c(t: torch.Tensor) -> torch.Tensor:
-        # A row slice is contiguous AND starts partway into its storage, and the Metal
-        # ABI rejects a non-zero byte_offset that CUDA tolerates. `.contiguous()` is a
-        # no-op on such a view (it is already contiguous), so the reset needs a copy.
+    def _c(self, t: torch.Tensor) -> torch.Tensor:
+        # A row slice is contiguous AND starts partway into its storage. The Metal ABI
+        # rejects that non-zero byte_offset; CUDA tolerates it. `.contiguous()` cannot
+        # fix it -- the view already satisfies its predicate -- so the reset is a copy,
+        # and the copy is charged only to the target that needs it: measured 6 offset
+        # views per sm90 decode tick at 6.68 us each, 40 us a tick that CUDA does not
+        # owe (wins/2026-09-04-metal-is-green-and-28x-off-torch-eager.md).
         if t.is_contiguous():
-            return t if t.storage_offset() == 0 else t.clone()
+            return t.clone() if self._zero_offset and t.storage_offset() else t
         return t.contiguous()
 
     def _dev(self, t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

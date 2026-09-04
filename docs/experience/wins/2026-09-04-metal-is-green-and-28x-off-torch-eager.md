@@ -39,19 +39,47 @@ x[1:2].clone()        offset=0
 x[:, 1:3].contiguous() offset=0   <- resets, because this view is NOT contiguous
 ```
 
-So `_c` needs a copy, not a `.contiguous()`:
+So `_c` needs a copy, not a `.contiguous()` — and the copy is charged only to the
+target that needs it, because the next section measures that CUDA would pay for
+it too:
 
 ```python
 if t.is_contiguous():
-    return t if t.storage_offset() == 0 else t.clone()
+    return t.clone() if self._zero_offset and t.storage_offset() else t
 return t.contiguous()
 ```
 
-One helper, 50 call sites, no per-call-site `.contiguous()`.
+`_zero_offset` is `arch == "metal"`, set beside `io` and `scale_io` in
+`__init__`. One helper, 49 call sites, no per-call-site `.contiguous()`.
 
 **Negative control:** reverting `_c` (with `__pycache__` cleared) brings back
 exactly the three failures and nothing else — 3 failed / 9 passed in
-`test_dflash2.py`, against 12 passed with the fix.
+`test_dflash2.py`, against 12 passed with the fix. Forcing `_zero_offset = False`
+on metal reproduces the same three, so the gate is what carries the fix.
+
+## The clone is not free on sm90, which is why it is gated
+
+The first version of this fix cloned unconditionally. CUDA *tolerates* the
+non-zero offset, so that would have been a new device-to-device copy on a helper
+49 call sites reach, on a target that never needed it. Counted with
+`scripts/probe_c_offset.py`, one tiny-model decode tick:
+
+| target | contiguous, offset==0 | **contiguous, offset!=0** | non-contiguous |
+|---|---:|---:|---:|
+| cpu | 224 | **0** | 8 |
+| metal | 224 | **0** | 8 |
+| **sm90 (H20)** | 158 | **6** | 6 |
+
+sm90 is not zero. Six `[1, 1, 32]` f32 views at offsets 32 and 64, and a
+`[1,1,32]` clone measures **6.68 us** on the H20 — **40 us per tick**, 0.35% of an
+11.4 ms B=1 decode tick. Under the 0.97x gate, but not nothing, and not a cost
+CUDA owes. With the gate, sm90 reports `zero_offset=False` and clones none of
+them.
+
+The offset views come from `h[:, 1:]` on the draft path (dflash2.py:153, :229),
+which drops the first position: `test_dflash2.py` alone produces **76** of them,
+all `[3, 64]` f32, via `model.py:177 _base_linear -> backend.py:427 linear ->
+_rows`.
 
 ## The second failure `-x` hid
 
@@ -90,15 +118,16 @@ measured the CPU target and labelled it Metal. The `assert be.device.type ==
 
 ## The 27B checkpoint cannot be moved here
 
-`/work/Qwen3.8-27B-NVFP4` is **22 GB** on the pod. The Mac has **6.5 GiB free of
-460 GiB** (99% full). So the end-to-end number is unmeasurable today for a disk
-reason, not a memory one — 48 GB of unified memory would hold the weights fine.
-The per-layer figures above are measured on real 27B shapes with random weights,
-which prices the arithmetic without needing the checkpoint.
+`/work/Qwen3.8-27B-NVFP4` is **22 GB** on the pod. The Mac was at **6.5 GiB free
+of 460 GiB** (99% full) when this was measured. So the end-to-end number is
+unmeasurable today for a disk reason, not a memory one — 48 GB of unified memory
+would hold the weights fine. The per-layer figures above are measured on real
+27B shapes with random weights, which prices the arithmetic without needing the
+checkpoint.
 
 ## Rule
 
-Two things generalize past Metal:
+Three things generalize past Metal:
 
 `is_contiguous()` is not "safe to hand to a kernel". A view can be contiguous
 and still start at a non-zero offset, and `.contiguous()` will not fix it
@@ -108,3 +137,9 @@ zero offset, test `storage_offset()` and copy.
 `torch.equal` between two arithmetically-equivalent-but-differently-ordered
 computations is a target-portability bug waiting for a second backend. It held
 on cpu for as long as cpu was the only target that ran it.
+
+A fix for one target, placed in a helper every target shares, is a cost for
+every target until someone counts. "CUDA tolerates this, so the copy is
+harmless" was wrong by six copies a tick; the count is what turned a plausible
+claim into a gate. Count on the target that pays, not on the one that is
+convenient — cpu and metal both said 0 here, and sm90 said 6.
