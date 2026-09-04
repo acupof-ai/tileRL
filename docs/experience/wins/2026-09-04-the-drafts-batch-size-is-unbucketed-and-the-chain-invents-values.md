@@ -33,11 +33,20 @@ Staggered arrivals so the batch forms and drains, depth 3, tiny config:
 Across all arms: **n ∈ {1, 2, 3, 4, 6, 7, 8}** — 7 values, of which the `max_batch=8` arm
 alone contributes 6 (it never forms a single-row batch).
 
-**n=3 and n=7 never appear at the prefill site.** They exist only because the chain loop
-drops rows mid-chain — `spec.py:476` breaks or narrows when a row has no block room left,
-and the `ponytail:` comment there says so: "a row at a block boundary drafts shorter". So
-the draft compiles shapes the batch itself never formed, and no `max_batch` setting predicts
-them.
+**n=3 and n=7 never appear at the prefill site.** I first attributed that to the block
+clamp at `spec.py:474-476` ("a row at a block boundary drafts shorter"). **That was wrong,
+and two probes disagreeing is what caught it:** `scripts/probe_short_chain.py` counts chain
+positions granted per row and found **0 short chains in 156 row-steps, 312 of 312 positions
+granted**. The clamp never fired.
+
+The real mechanism is one line earlier. `spec.py:372-374` skips a row whose `hidden is None`
+or that is `done`, so `len(plan)` is already smaller than the batch *before* the chain loop
+runs, and `len(live)` inherits it. Measured directly — `rows 4 → live 2` at seq_len 36/41
+with 48 positions of block capacity, i.e. plenty of room, and separately `rows 2 → live 0`.
+
+So the odd n values are **rows finishing at different times**, not block-boundary alignment.
+That is both more common and fully outside any knob: it happens whenever requests in a batch
+have different lengths.
 
 At `max_batch=8` that is 6 specializations where bucketing to powers of two gives 3
 (2, 4, 8) — and the previous entry established the padding is free at every width the
@@ -70,8 +79,14 @@ read `spec.py:474-476` instead of trusting the arithmetic I expected.
 
 A count taken at one call site is not the axis. The chain loop's `len(live)` produced two
 values the batch never had (n=3, n=7), so counting only where the batch is *chosen* would
-have found 5 specializations across the arms and missed 2 — and those 2 depend on
-block-boundary alignment, which no configuration knob exposes.
+have found 5 specializations across the arms and missed 2.
+
+**And a mechanism that fits the numbers is not the mechanism.** "A row at a block boundary
+drafts shorter" is a real code path with a comment describing exactly the shape of what I
+observed, and it was not what happened — the clamp fired **0 times in 156 row-steps**. The
+cause was `spec.py:372`, one line above, where a finished row leaves `plan` entirely. The
+only reason I know that is that a second probe measured the clamp directly instead of
+inferring it from the batch size, and the two disagreed.
 
 And an invariant that fails is worth more than one that passes: both of this probe's numbers
 were wrong until an assert rejected them, first on a bad delimiter and then on a real
