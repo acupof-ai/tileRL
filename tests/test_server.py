@@ -380,6 +380,34 @@ def test_usage_in_the_stream_is_opt_in_and_counts_tokens_not_characters(client, 
     assert all(p["choices"] for p in opted[:-1]), "only the last frame may be choices-less"
 
 
+def test_both_api_paths_wait_the_same_wall_clock_for_one_completion():
+    """The two front ends submit to one engine, so a cap that fits one fits both.
+
+    They drifted: 5cdbf7e raised the OpenAI path's cap from 600 s to 1800 s because a 4K
+    prefill on sm70 takes ~600 s on its own, so the shorter cap fired before decoding
+    began -- and it changed only server.py. `/v1/messages`, which is what Claude Code
+    speaks, kept waiting 600 s for the same work on the same card.
+
+    Read out of the source rather than by running a 600 s request: the number is a
+    constant, and the defect was two constants that should have been one.
+    """
+    import pathlib
+    import re
+
+    from tilerl import messages as msg
+    from tilerl import server as srv
+
+    text = pathlib.Path(srv.__file__).read_text()
+    caps = {float(m) for m in re.findall(r"time\.monotonic\(\) \+ ([\d_]+\.?\d*)", text)}
+    caps |= {float(m) for m in re.findall(r"timeout_s: float = ([\d_]+\.?\d*)", text)}
+    assert caps, "no wall-clock cap found in server.py; the pattern moved"
+    assert caps == {msg._COMPLETION_TIMEOUT_S}, (
+        f"server.py waits {sorted(caps)} s per completion but messages.py waits "
+        f"{msg._COMPLETION_TIMEOUT_S} s. Both submit to the same engine on the same card, "
+        f"so whichever is shorter times out work the other one tolerates."
+    )
+
+
 def test_the_chat_page_reads_the_stream_this_server_sends(client, model_id):
     """The server's own SSE bytes, through the chat page's own reader.
 

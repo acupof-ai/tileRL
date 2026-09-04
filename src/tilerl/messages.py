@@ -55,6 +55,12 @@ _RECORD_ENV = "TILERL_MESSAGES_RECORD"
 #: The episode tag, set per rollout via ANTHROPIC_CUSTOM_HEADERS.
 _ROLLOUT_HEADER = "x-tilerl-rollout"
 
+#: Wall-clock cap on one completion. 1800 rather than 600 because a 4K prefill on sm70
+#: takes ~600 s on its own, so the shorter cap fired before decoding began -- the same
+#: reason server.py raised it (5cdbf7e), which changed only the OpenAI path and left this
+#: one at 600.
+_COMPLETION_TIMEOUT_S = 1800.0
+
 
 def record_path() -> str:
     return os.environ.get(_RECORD_ENV, "runs/messages_requests.jsonl")
@@ -165,7 +171,7 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         params = sampling(tokenizer, _thinking(req), min(req.max_tokens, budget),
                           temperature=req.temperature, top_p=req.top_p, logprobs=True)
         rid = engine.submit(input_ids, params)
-        deadline = time.monotonic() + 600.0
+        deadline = time.monotonic() + _COMPLETION_TIMEOUT_S
         out: list[int] | None = None
         while time.monotonic() < deadline:
             out = engine.take(rid)
@@ -173,7 +179,9 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
                 break
             time.sleep(0.02)
         if out is None:
-            raise TimeoutError(f"request {rid} did not finish within 600s")
+            raise TimeoutError(
+                f"request {rid} did not finish within {_COMPLETION_TIMEOUT_S}s"
+            )
         scores = engine.logprobs(rid)  # single reader; a second one raises
         text = strip_think(tokenizer.decode(out))
         prose, calls = _parse_tool_calls(text, req.tools)
