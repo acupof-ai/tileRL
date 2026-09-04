@@ -29,8 +29,13 @@ drift with every edit to the page; the split is the part worth keeping.
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
+import subprocess
+import textwrap
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tilerl.server import _CHAT_UI
@@ -204,3 +209,43 @@ def test_the_stream_marks_and_unmarks_the_pending_bubble():
     finished turn keeps a blinking cursor; if never added, the wait is silent."""
     assert '.classList.add("streaming")' in _CHAT_UI
     assert '.classList.remove("streaming")' in _CHAT_UI
+
+
+def test_markdown_renders_and_escapes():
+    """The renderer's OUTPUT, not just that its calls resolve.
+
+    `test_every_bare_call_in_the_page_js_resolves` passes on a renderer that emits
+    nothing, and an escape bug here is an XSS in a page that displays model output.
+    Runs the real JS under node; skips where node is absent (CI's cpu row has it, a
+    bare pod may not) rather than asserting on the source text, which would prove
+    only that the strings exist.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the renderer's output cannot be exercised")
+    from tilerl.server import _MD_JS
+
+    checks = [
+        ("**b** and `c`", ["<strong>b</strong>", "<code>c</code>"]),
+        ("# H\n\ntext", ["<h1>H</h1>", "<p>text</p>"]),
+        ("- one\n- two", ["<ul>", "<li>one</li>"]),
+        ("1. a\n2. b", ["<ol>", "<li>a</li>"]),
+        ("> q", ["<blockquote>q</blockquote>"]),
+        ("a <script>x</script> b", ["&lt;script&gt;"]),          # escape, never inject
+        ("```py\nprint(1)\n```", ['<pre class="code"', 'data-lang="py"']),
+        ("```\nunclosed", ['<pre class="code"']),                 # degrades, not swallows
+        ("```\n**not bold**\n```", ["**not bold**"]),             # no inline rules in a fence
+    ]
+    harness = _MD_JS + "\nconst C = " + json.dumps(checks) + ";\n" + textwrap.dedent("""
+        const bad = [];
+        for (const [src, wants] of C) {
+          const out = mdRender(src);
+          for (const w of wants) if (!out.includes(w)) bad.push([src, w, out]);
+        }
+        if (mdRender("```\\n**x**\\n```").includes("<strong>")) bad.push(["fence", "isolation", ""]);
+        console.log(JSON.stringify(bad));
+    """)
+    r = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"the renderer threw: {r.stderr.strip()[:400]}"
+    bad = json.loads(r.stdout.strip().splitlines()[-1])
+    assert not bad, f"markdown output wrong: {bad}"

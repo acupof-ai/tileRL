@@ -6,6 +6,7 @@ Route surface (mirrors agent-infer's infer-server, trimmed to tileRL):
 * ``GET  /v1/models``              — served model identity
 * ``POST /v1/chat/completions``    — OpenAI schema; ``stream=true`` -> SSE
 * ``GET  /``                       — single-file HTML chat UI (no build step)
+* ``GET  /about``                  — what tileRL is, target matrix
 
 This module never imports torch or tilelang: prompts cross the boundary as
 ``list[int]`` and the engine owns all tensor traffic.
@@ -297,13 +298,16 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
     mount_messages(app, engine, tokenizer, model_name)
 
+    # The root is the playground: whoever opens the host:port wants to type at the
+    # model, not read what tileRL is. The landing page keeps its content at /about.
     @app.get("/", response_class=HTMLResponse)
-    def index() -> str:
-        return _LANDING
-
     @app.get("/chat", response_class=HTMLResponse)
     def chat() -> str:
         return _CHAT_UI
+
+    @app.get("/about", response_class=HTMLResponse)
+    def about() -> str:
+        return _LANDING
 
     return app
 
@@ -406,6 +410,82 @@ _LANDING = """<!doctype html>
 # Single-file chat UI: inline CSS/JS, system fonts, no network fetch beyond this origin
 # (the server is often reached through a tunnel with no egress).
 # ---------------------------------------------------------------------------
+
+_MD_JS = r"""// Markdown, enough of it for model output: fenced code, inline code, bold, italic,
+// headings, lists, blockquote, links, rules. Hand-written rather than a CDN library
+// because the page is one self-contained string and the JS gate walks every bare call
+// in it (test_chat_ui.py:106) -- a script tag would move the code out of that check.
+// Escapes FIRST, so nothing below can inject markup, and pulls fenced blocks out
+// before any inline rule can match inside them.
+const BT = String.fromCharCode(96);  // no literal backtick: see mdInline
+
+function mdEscape(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function mdInline(s) {
+  return s
+    .replace(new RegExp(BT + "([^" + BT + "\\n]+)" + BT, "g"), (_, c) => "<code>" + c + "</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/\[([^\]\n]+)\]\((https?:[^)\s]+)\)/g,
+             '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+
+function mdRender(src) {
+  // Split on fences FIRST and keep the parts, so no inline rule can reach inside a
+  // code block and no sentinel placeholder is needed -- an earlier version used one and
+  // it cost a literal NUL byte in the Python source plus two false hits in the JS gate.
+  const parts = mdEscape(src).split(new RegExp(BT + BT + BT));
+  let out = "";
+  for (let k = 0; k < parts.length; k++) {
+    if (k % 2 === 1) {
+      const nl = parts[k].indexOf("\n");
+      const lang = nl < 0 ? "" : parts[k].slice(0, nl).trim();
+      const body = nl < 0 ? parts[k] : parts[k].slice(nl + 1);
+      out += "<pre class=\"code\"" + (lang ? " data-lang=\"" + lang + "\"" : "") +
+             "><code>" + body.replace(/\s+$/, "") + "</code></pre>";
+    } else {
+      out += mdBlocks(parts[k]);
+    }
+  }
+  return out;
+}
+
+function mdBlocks(text) {
+  const out = [];
+  let list = null;
+  const closeList = () => { if (list) { out.push("</" + list + ">"); list = null; } };
+  for (const line of text.split("\n")) {
+    if (!line.trim()) { closeList(); continue; }
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h) { closeList(); const n = h[1].length; out.push("<h" + n + ">" + mdInline(h[2]) + "</h" + n + ">"); continue; }
+    if (/^\s*([-*_])\1{2,}\s*$/.test(line)) { closeList(); out.push("<hr>"); continue; }
+    const q = line.match(/^&gt;\s?(.*)$/);
+    if (q) { closeList(); out.push("<blockquote>" + mdInline(q[1]) + "</blockquote>"); continue; }
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (ul || ol) {
+      const want = ul ? "ul" : "ol";
+      if (list !== want) { closeList(); out.push("<" + want + ">"); list = want; }
+      out.push("<li>" + mdInline((ul || ol)[1]) + "</li>");
+      continue;
+    }
+    closeList();
+    out.push("<p>" + mdInline(line) + "</p>");
+  }
+  closeList();
+  return out.join("");
+}
+
+// Assistant text is markdown; user text is not (never render what a user typed).
+function setBody(el, text, md) {
+  el.classList.toggle("md", !!md);
+  if (md) el.innerHTML = mdRender(text);
+  else el.textContent = text;
+}
+"""
+
 
 _CHAT_UI = """<!doctype html>
 <html lang="en">
@@ -510,6 +590,36 @@ _CHAT_UI = """<!doctype html>
     border-left: 2px solid var(--line-firm); padding-left: 13px;
   }
   .turn.assistant .content { font-size: 15px; line-height: 1.68; }
+  /* Rendered markdown brings its own block structure, so pre-wrap's newlines would
+     double every gap. `md` is set by setBody only for assistant text. */
+  .content.md { white-space: normal; }
+  .content.md > :first-child { margin-top: 0; }
+  .content.md > :last-child { margin-bottom: 0; }
+  .content.md p { margin: 0 0 var(--s-3); }
+  .content.md h1, .content.md h2, .content.md h3, .content.md h4 {
+    margin: var(--s-5) 0 var(--s-2); line-height: 1.3; font-weight: 600;
+  }
+  .content.md h1 { font-size: 19px; }
+  .content.md h2 { font-size: 17px; }
+  .content.md h3 { font-size: 15.5px; }
+  .content.md h4 { font-size: 15px; color: var(--ink-2); }
+  .content.md ul, .content.md ol { margin: 0 0 var(--s-3); padding-left: var(--s-5); }
+  .content.md li { margin: var(--s-1) 0; }
+  .content.md blockquote {
+    margin: 0 0 var(--s-3); padding-left: var(--s-3);
+    border-left: 2px solid var(--line-firm); color: var(--ink-2);
+  }
+  .content.md hr { border: 0; border-top: 1px solid var(--line); margin: var(--s-5) 0; }
+  .content.md code {
+    font: 13px/1.5 var(--mono); background: var(--accent-wash);
+    padding: 1px 4px; border-radius: var(--r);
+  }
+  .content.md pre.code {
+    margin: 0 0 var(--s-3); padding: var(--s-3); overflow-x: auto;
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--r2);
+  }
+  .content.md pre.code code { background: none; padding: 0; font-size: 12.5px; line-height: 1.6; }
+  .content.md a { color: var(--accent); }
   .content.streaming::after {
     content: ""; display: inline-block; width: 2px; height: 1.05em; margin-left: 1px;
     background: var(--accent); vertical-align: text-bottom; animation: blink 1.1s steps(2) infinite;
@@ -648,7 +758,7 @@ _CHAT_UI = """<!doctype html>
 <body>
 <header>
   <div class="id">
-    <a class="mark" href="/">tilerl</a>
+    <a class="mark" href="/about">tilerl</a>
     <span class="dot" id="dot"></span>
     <span class="model" id="model">connecting…</span>
   </div>
@@ -699,6 +809,8 @@ function clearEmpty() {
   const e = $("empty");
   if (e) e.remove();
 }
+
+""" + _MD_JS + """
 
 function addMsg(role, text) {
   clearEmpty();
@@ -792,7 +904,7 @@ async function readSSE(resp, onFrame) {
 async function sendChat(text) {
   const bubble = addMsg("assistant", "");
   bubble.classList.add("streaming");
-  const t0 = performance.now(); let firstAt = 0;
+  const t0 = performance.now(); let firstAt = 0, seen = 0;
   history.push({ role: "user", content: text });
   abort = new AbortController();
   let raw = "", think = null, collapsed = false;
@@ -800,11 +912,18 @@ async function sendChat(text) {
     const resp = await fetch("/v1/chat/completions", {
       method: "POST", headers: { "Content-Type": "application/json" },
       signal: abort.signal,
-      body: JSON.stringify({ messages: history, stream: true, stream_options: { include_usage: true } }),
+      // enable_thinking makes the template WRAP the reasoning in <think>. Left unset,
+      // the checkpoint reasons at its default xhigh effort and emits the reasoning as
+      // plain prose, so the fold below had nothing to key on and never fired.
+      body: JSON.stringify({ messages: history, stream: true,
+                             chat_template_kwargs: { enable_thinking: true },
+                             stream_options: { include_usage: true } }),
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     await readSSE(resp, (obj) => {
       // The usage-only chunk carries no choices, so read it before indexing into them.
+      // Its completion_tokens is the engine's own count -- authoritative over the
+      // delta count below, which is frames, not tokens.
       if (obj.usage) {
         const secs = (performance.now() - (firstAt || t0)) / 1000;
         if (secs > 0) $("tps").textContent = (obj.usage.completion_tokens / secs).toFixed(1);
@@ -814,16 +933,24 @@ async function sendChat(text) {
       if (!delta) return;
       if (!firstAt) { firstAt = performance.now(); $("ttft").textContent = Math.round(firstAt - t0); }
       raw += delta;
+      // Live decode rate, updated per frame: the window opens at the FIRST token, so
+      // prefill is excluded by construction -- charging prefill to decode is what read
+      // as a 15% serve regression that did not exist
+      // (errors/2026-09-04-a-served-first-visit-pays-10x-and-serve-was-not-immune.md).
+      // Frames are a lower bound on tokens until the usage chunk corrects it.
+      seen += 1;
+      const dt = (performance.now() - firstAt) / 1000;
+      if (dt > 0.15) $("tps").textContent = (seen / dt).toFixed(1);
       // Split the model's reasoning out of the answer. The tags can land mid-delta, so
       // re-partition the whole accumulated text each frame rather than tracking a state
       // machine across chunk boundaries.
       const open = raw.indexOf("<think>");
-      if (open < 0) { bubble.textContent = raw; scrollDown(); return; }
+      if (open < 0) { setBody(bubble, raw, true); scrollDown(); return; }
       const close = raw.indexOf("</think>", open);
       if (!think) think = addThinking(bubble);
       think.textContent = raw.slice(open + 7, close < 0 ? undefined : close).trim();
       think.parentNode.querySelector(".n").textContent = think.textContent.length + " chars";
-      bubble.textContent = (raw.slice(0, open) + (close < 0 ? "" : raw.slice(close + 8))).trim();
+      setBody(bubble, (raw.slice(0, open) + (close < 0 ? "" : raw.slice(close + 8))).trim(), true);
       // Fold the reasoning away once the answer proper starts, but only once, so a
       // reader who opened it back up keeps it open.
       if (close >= 0 && !collapsed) { collapsed = true; think.parentNode.open = false; }
@@ -831,8 +958,16 @@ async function sendChat(text) {
     });
   } finally {
     bubble.classList.remove("streaming");
-    // Keep partial text from a stopped stream, but never thread an empty turn back.
-    if (raw) history.push({ role: "assistant", content: raw });
+    // Keep partial text from a stopped stream, but never thread an empty turn back --
+    // and never thread the reasoning back either: the checkpoint's template drops prior
+    // <think> blocks from history, so sending them re-primes the model on its own
+    // scratchpad. Sliced by index, not by regex: _CHAT_UI is not a raw Python string.
+    if (raw) {
+      const o = raw.indexOf("<think>"), c = raw.indexOf("</think>", o);
+      const answer = o < 0 ? raw
+                   : (raw.slice(0, o) + (c < 0 ? "" : raw.slice(c + 8))).trim();
+      history.push({ role: "assistant", content: answer || raw });
+    }
   }
   if (!bubble.textContent && !think) bubble.textContent = "(empty response)";
 }
