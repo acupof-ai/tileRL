@@ -1661,10 +1661,12 @@ def test_the_draft_prefill_width_is_bucketed_like_the_trunks():
         max_total_tokens=512, draft=draft, spec_depth=1,
     )
     widths: list[int] = []
+    tables: list[int] = []
     inner = draft.forward
 
     def spy(hidden, ids, positions, kv, be, hidden_out=None, last_only=False):
         widths.append(int(np.asarray(ids).shape[1]))
+        tables.append(int(kv.block_table.shape[1]))
         return inner(hidden, ids, positions, kv, be, hidden_out=hidden_out,
                      last_only=last_only)
 
@@ -1686,4 +1688,13 @@ def test_the_draft_prefill_width_is_bucketed_like_the_trunks():
     assert wide == [_PREFILL_BUCKET], (
         f"draft prefill widths {wide} are not all the bucket ({_PREFILL_BUCKET}): "
         "three distinct prompt lengths compiled three kernel shapes"
+    )
+    # The block-table width is the SECOND shape axis, and bucketing w alone left it
+    # varying: on the served path that still cost 4-8 compiles per new prompt length,
+    # all at S=64 with tables [1,1] / [1,3] / [1,4] / [1,5] / [1,6]. `Mb` is compiled
+    # in (engine.py:666 says so for the trunk), so it must be the pool size, not the
+    # blocks a row happens to own.
+    assert len(set(tables)) == 1, (
+        f"draft block-table widths {sorted(set(tables))} vary: Mb is a compiled-in "
+        "dimension, so each width is another kernel"
     )

@@ -405,7 +405,12 @@ class DraftHead:
         w = max(hi - lo + 1 for _, lo, hi in plan)
         if w > 1:
             w = -(-w // _PREFILL_BUCKET) * _PREFILL_BUCKET
-        nb = max(len(r.blocks) for r, _, _ in plan)
+        # Table width = pool size, for the same reason as engine.py:666 -- the kernels
+        # compile Mb in, so a per-tick width recompiles. `max(len(r.blocks))` grows one
+        # column per BLOCK_TOKENS of context, so it was a second shape axis after the
+        # width: measured on the served path, bucketing w alone cut a new prompt length
+        # from 14 compiles to 4-8, all at S=64 with block tables [1,1]/[1,3]/[1,4]/[1,5]/[1,6].
+        nb = self.kv.num_blocks
         n = len(plan)
         ids = np.zeros((n, w), dtype=np.int64)
         pos = np.zeros((n, w), dtype=np.int64)
