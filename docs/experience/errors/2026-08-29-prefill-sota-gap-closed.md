@@ -31,7 +31,7 @@ there; the forward it competes with is already one fused kernel per layer.)
 
 ## What the target actually is
 
-`2026-08-28-vs-sglang-h20.md` is the source of the 4022, and reading it again
+`docs/analysis/2026-08-28-vs-sglang-h20.md` is the source of the 4022, and reading it again
 changes the framing twice:
 
 | | prefill tok/s (len 512, B=1) |
