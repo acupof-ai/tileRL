@@ -67,7 +67,39 @@ def _sync() -> None:
         torch.cuda.synchronize()
 
 
+def _alloc_state() -> dict:
+    """Allocator counters, or {} off CUDA. Sampled at both ends of a timed window."""
+    if not torch.cuda.is_available():
+        return {}
+    s = torch.cuda.memory_stats()
+    return {k: s.get(k, 0) for k in
+            ("num_alloc_retries", "num_ooms", "allocated_bytes.all.current",
+             "reserved_bytes.all.current", "active_bytes.all.current")}
+
+
+def _alloc_delta(a0: dict) -> dict:
+    """What the window cost the allocator.
+
+    An ordered, compounding per-group stall (2.3x then 2.3x on the sm90 peer's
+    depth-3 tail) is not the prefill rectangle: `measure` opens its window only
+    after every row reaches _PHASE_DECODE (:144-150) and submits nothing inside
+    it, so `decodes and prefills` (engine.py:776) cannot fire -- and :188 already
+    raises if it does, which every printed row therefore passed. What CAN grow
+    monotonically along a run is fragmentation: each group allocates and frees the
+    same shapes, and `num_alloc_retries` counts the times the caching allocator
+    had to flush and re-try because no free block fit. A retry calls
+    cudaFree/cudaMalloc, which synchronizes the device -- that is a stall of
+    exactly this shape, and it compounds because the freed-block map only gets
+    worse. Zero retries with a stall present refutes it just as cleanly.
+    """
+    if not a0:
+        return {}
+    a1 = _alloc_state()
+    return {k: a1[k] - a0[k] for k in a0} | {"peak_reserved": a1["reserved_bytes.all.current"]}
+
+
 def gpu_state() -> str:
+
     """SM clock, throttle reasons and load, sampled per depth.
 
     Two runs of the identical command on the same commit agreed to 0.1% at depths
@@ -109,6 +141,10 @@ def set_depth_in_place(e, head, depth: int) -> None:
 
 def measure(e, prompts: list[list[int]], tokens: int) -> tuple:
     """(ms per decode tick, tokens per forward, mean rows x width, per-rung times).
+
+    The seventh value is the allocator's own delta over the window -- see
+    `_alloc_delta` for why a per-group stall needs it and cannot be the prefill
+    rectangle.
 
     All of `prompts` are submitted before the first step, so `len(prompts)` is the
     batch: the depth question is not scale-free on this arch. `_NCOLS_MIN_M = 32`
@@ -154,6 +190,7 @@ def measure(e, prompts: list[list[int]], tokens: int) -> tuple:
     if e._draft_ms is not None:
         e._draft_ms.clear()
     s0, t0 = e.stats(), time.perf_counter()
+    a0 = _alloc_state()
     done, per_rung, draft_rung = {}, defaultdict(list), defaultdict(list)
     while len(done) < len(rids):
         b0, k0 = e.stats(), time.perf_counter()
@@ -197,7 +234,8 @@ def measure(e, prompts: list[list[int]], tokens: int) -> tuple:
     direct = list(e._draft_ms or ())
     if e._draft_ms is not None:
         e._draft_ms.clear()
-    return wall / max(fwd, 1), n / max(fwd, 1), width, dict(per_rung), direct, dict(draft_rung)
+    return (wall / max(fwd, 1), n / max(fwd, 1), width, dict(per_rung), direct,
+            dict(draft_rung), _alloc_delta(a0))
 
 
 def main() -> None:
@@ -310,9 +348,17 @@ def main() -> None:
                     # 48.30/48.32/47.92 across ticks that moved 11x.
                     dnf = sum(f for f, _ in g[4])
                     dms = sum(v for _, v in g[4]) / max(dnf, 1) if g[4] else 0.0
+                    # Retries and reserved bytes beside the time. A stall whose group
+                    # shows retries>0 is the allocator synchronizing; one with retries==0
+                    # and flat reserved bytes is not, and that is the whole point of
+                    # printing them next to the number rather than in a separate run.
+                    al = g[6]
+                    tag = (f"  retry {al['num_alloc_retries']:>3d}"
+                           f" oom {al['num_ooms']:>2d}"
+                           f" resv {al['peak_reserved'] / 2**30:>6.2f}G" if al else "")
                     print(f"        p{i}: {g[0]:>8.2f} {g[1]:>8.2f} "
                           f"{1000 * g[1] / g[0]:>7.1f}"
-                          + (f"  draft {dms:>7.2f}" if g[4] else ""))
+                          + (f"  draft {dms:>7.2f}" if g[4] else "") + tag)
             ms = sum(g[0] for g in got) / len(got)
             tpf = sum(g[1] for g in got) / len(got)
             chain = sum(g[2] for g in got) / len(got)
