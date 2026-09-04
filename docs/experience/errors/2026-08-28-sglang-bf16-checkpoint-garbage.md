@@ -2,7 +2,7 @@
 
 ## Context
 
-`docs/experience/2026-08-28-vs-sglang-h20.md` compares tileRL against sglang on
+`docs/analysis/2026-08-28-vs-sglang-h20.md` compares tileRL against sglang on
 the same card and the same model. sglang has no NVFP4 path on Hopper, so the
 comparison runs it on `/work/Qwen3.8-27B-bf16`, produced by
 `scripts/dequant_to_bf16.py` from the NVFP4 checkpoint. That comparison measured

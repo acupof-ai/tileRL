@@ -2,7 +2,7 @@
 
 Prefill ends the day at **2109.7 tok/s** (GPU-busy 970.7 ms for 2048 tokens,
 64 layers, B=1). The comparison target is sglang's **4022 tok/s at the same
-B=1** (`2026-08-28-vs-sglang-h20.md`; its 4908 is the B=8 row, and it runs a
+B=1** (`docs/analysis/2026-08-28-vs-sglang-h20.md`; its 4908 is the B=8 row, and it runs a
 dequantized bf16 checkpoint that scores 0/1000 on MMLU — same shapes, broken
 model).
 

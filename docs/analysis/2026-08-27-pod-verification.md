@@ -141,7 +141,7 @@ reference at the real 27B dims.
 ## Levers, re-prioritized after the sweep
 
 The micro_size_k load-width thesis is **dead** (measured: micro=16 −10%,
-micro=32 −35%; see `errors/2026-08-27-micro-size-k-thesis-rejected.md`). New order:
+micro=32 −35%; see `docs/experience/errors/2026-08-27-micro-size-k-thesis-rejected.md`). New order:
 
 0. **Fix check 2.** Nothing below matters until the model is correct.
 1. **scale dtype f32→bf16** — the #1 GEMV lever now (¼ of the fp4 stream; Gate B's 6 µs gap).

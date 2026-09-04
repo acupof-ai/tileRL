@@ -18,7 +18,7 @@
 
 ## Context
 
-[B=8's ceiling was located](2026-09-03-b8-ceiling-is-the-draft-f32-readout.md) by letting the
+[B=8's ceiling was located](../errors/2026-09-03-b8-ceiling-is-the-draft-f32-readout.md) by letting the
 run fail with its traceback: `_draft_step → DraftHead.forward → linear_fp4` allocating a
 vocab-wide f32 `y2` at prefill width. `_draft_step` reads one row per request out of it —
 **8 rows of 248320 = 7.6 MiB against 1444 MiB allocated, 191×**.

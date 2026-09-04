@@ -10,7 +10,7 @@
 
 ## Context
 
-[B=8 fills the 32 rung and is 1.79× `serve`'s default](2026-09-03-b8-fills-the-32-rung-1.79x-over-serve-default.md),
+[B=8 fills the 32 rung and is 1.79× `serve`'s default](../wins/2026-09-03-b8-fills-the-32-rung-1.79x-over-serve-default.md),
 measured at ctx=32 with a peak of 31110 of 32768 MiB — 1.6 GB spare. B=4 was already known to
 OOM from ctx≥512. The flip was held back on exactly this question.
 

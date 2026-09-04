@@ -17,7 +17,7 @@ head, the ledger); TP, CP and the 128K–256K budget are under P6 below.
 
 | Area | State | Evidence |
 |---|---|---|
-| Serving | H20 B=1 decode 92.4 tok/s (sglang bf16 54.2, Arle 84.5); B=8 0.8× sglang; prefill 0.4× | `wins/2026-08-28-decode-split-by-occupancy.md`, `wins/bench-baseline.json`, `docs/experience/2026-08-28-vs-sglang-h20.md` |
+| Serving | H20 B=1 decode 92.4 tok/s (sglang bf16 54.2, Arle 84.5); B=8 0.8× sglang; prefill 0.4× | `wins/2026-08-28-decode-split-by-occupancy.md`, `wins/bench-baseline.json`, `docs/analysis/2026-08-28-vs-sglang-h20.md` |
 | Accuracy | MMLU 0-shot 74.6% (1000 q, `sample` draw; the recorded 76.3% was a different 1000 questions) | `wins/2026-08-28-mmlu-letter-restricted.md`, `errors/2026-09-03-the-mmlu-slice-moved-under-the-number.md` |
 | Speculation | correct, 1.87 committed tokens per trunk forward; **loses 4.9× on H20 because a draft disables graph capture**. On sm70 the draft runs eager, outside the captured tick, and costs 5.53 ms = 25% of a depth-3 tick; capturing it is rejected at a 1.14× ceiling (the tick is 88% GPU-bound). spec 49.7 tok/s at 1024 vs dense 37.6 | CHANGELOG 2026-08-29 verdict, `wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md`, `errors/2026-09-02-capturing-the-draft-is-rejected.md` |
 | Training | LoRA-AdamW and Adafactor full fine-tune run on one card (73.2 GiB); GRPO and self-OPD exist; real prompts, GSM8K reward, MMLU before/after wired | `wins/2026-08-29-full-finetune-fits.md`, `wins/2026-09-02-rl-real-task.md` |
@@ -222,7 +222,7 @@ P3 CPU half (now)     ├─► P1 (RL moves a number) ─┬─► P2.0 recaptu
 
 - **Serve throughput at B ≥ 8 and prefill vs sglang** — sglang's home turf,
   not what an RL runtime is priced on
-  (`docs/experience/2026-08-29-what-sota-would-require.md`).
+  (`docs/analysis/2026-08-29-what-sota-would-require.md`).
 - **PD / AFD** — design only (`docs/design-pd-afd.md`); trigger: one engine
   is batch-limited.
 - **GDN2** — trigger: a GDN2 checkpoint in the target family
