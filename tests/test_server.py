@@ -798,3 +798,39 @@ def test_serve_sizes_its_pools_from_the_flags_not_the_context():
         "model's 2048 blocks would report less, and that is a real capacity limit "
         "rather than a bug in the sizing"
     )
+
+
+def test_a_data_parallel_engine_can_stream():
+    """`serve --devices 0,1` wraps the engines in DataParallelEngine, which had no
+    `peek` -- and `_stream` calls `engine.peek(request_id)` unconditionally, while its
+    handler catches only (TimeoutError, RuntimeError). The SSE 200 header is already
+    sent by then, so the client got HTTP 200 with an empty body: measured before the
+    fix, 0 frames. Asserting frames rather than the status, because the status passes
+    against the bug; asserting behaviour rather than hasattr, because a `peek` that
+    returned the wrong thing would satisfy that.
+    """
+    import torch
+
+    from tilerl.parallel import DataParallelEngine
+
+    dev = torch.device("cpu")
+    engines = [_build_engine(seed=11), _build_engine(seed=12)]
+    dp = DataParallelEngine(engines, [dev, dev])
+    for e in engines:
+        e.run()
+    try:
+        app = create_app(dp, _ByteTokenizer())
+        with TestClient(app, raise_server_exceptions=False) as c:
+            body = {"model": "tiny", "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 8}
+            # submit/take are shared with the stream path, so a failure here is
+            # something other than the peek gap.
+            assert c.post("/v1/chat/completions", json={**body, "stream": False}).status_code == 200
+            r = c.post("/v1/chat/completions", json={**body, "stream": True})
+            assert r.text.count("data:") > 0, (
+                f"no SSE frames from a DataParallelEngine (status {r.status_code}, "
+                f"body {r.text[:200]!r}) -- the stream died mid-response")
+            assert "[DONE]" in r.text, f"stream never terminated: {r.text[-200:]!r}"
+    finally:
+        for e in engines:
+            e.shutdown()
