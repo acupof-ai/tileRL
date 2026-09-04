@@ -251,7 +251,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
     manifest["metrics"] = dict.fromkeys((
         "reward_first", "reward_last", "ce_last", "secs_per_step_median", "tied_group_fraction",
         "tokens_first", "tokens_last",
-        "mmlu_before", "mmlu_after", "gsm8k_before", "gsm8k_after", "peak_gib"))
+        "mmlu_before", "mmlu_after", "gsm8k_before", "gsm8k_after",
+        "gsm8k_before_tokens", "gsm8k_after_tokens", "peak_gib"))
 
     backend = get_backend()
     # LoRA on a frozen base needs no bf16 master (~27 GB on the 27B).
@@ -293,9 +294,14 @@ def _train_adapters(args: argparse.Namespace) -> None:
             manifest["metrics"][f"mmlu_{tag}_concurrency"] = conc
             log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}% (seed 0, concurrency {conc})")
         if eval_rows:
-            c, n = gsm8k_accuracy(engine, tok, eval_rows, params, concurrency=8, thinking=thinking)
+            c, n, ntok = gsm8k_accuracy(engine, tok, eval_rows, params, concurrency=8,
+                                        thinking=thinking)
             manifest["metrics"][f"gsm8k_{tag}"] = c
-            log(f"gsm8k greedy {c}/{n} = {100 * c / n:.1f}%")
+            manifest["metrics"][f"gsm8k_{tag}_tokens"] = ntok
+            # tokens/correct, not tokens: the ratio is what a length claim compares
+            # on, and it cannot be improved by getting fewer questions right.
+            per = f"  {ntok} tokens ({ntok / c:.1f}/correct)" if c else f"  {ntok} tokens"
+            log(f"gsm8k greedy {c}/{n} = {100 * c / n:.1f}%{per}")
 
     evals("before")  # LoRA B is zero at init: the base model's score
     if args.rl:
