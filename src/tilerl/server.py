@@ -802,6 +802,10 @@ _CHAT_UI = """<!doctype html>
 </form>
 <script>
 const $ = (id) => document.getElementById(id);
+// One switch for both the request and the split: enable_thinking decides whether the
+// reply starts inside a <think> block, so a page that asked for one and a splitter
+// that assumed the other is how the fold died.
+const THINK = true;
 let busy = false, history = [], abort = null;
 
 // The empty state is real content, not a spacer: drop it the moment a turn lands.
@@ -838,6 +842,24 @@ function addNote(text) {
 }
 
 // Reasoning sits above the answer inside the same turn, recessive and collapsible.
+// Split a reply into [reasoning, answer].
+//
+// `inside` says the reply BEGINS in the reasoning block, which is what the request
+// asked for: the checkpoint's template ends the prompt with "<think>\n", so
+// generation starts inside it and the stream carries only the CLOSING tag --
+// measured on the V100, 300 tokens with </think> and no <think>. Keying on the open
+// tag left the fold dead and printed the reasoning inline as prose. It matters most
+// mid-stream: before </think> arrives there is no tag at all, and guessing from the
+// text would show every reasoning token as the answer and then yank it away.
+function splitThink(raw, inside) {
+  const open = raw.indexOf("<think>");
+  const from = open < 0 ? 0 : open + 7;
+  const close = raw.indexOf("</think>", from);
+  if (open < 0 && !inside) return ["", raw];        // no reasoning in this reply
+  if (close < 0) return [raw.slice(from), ""];      // still reasoning
+  return [raw.slice(from, close), raw.slice(0, open < 0 ? 0 : open) + raw.slice(close + 8)];
+}
+
 function addThinking(bubble) {
   const det = document.createElement("details");
   det.className = "think";
@@ -912,11 +934,12 @@ async function sendChat(text) {
     const resp = await fetch("/v1/chat/completions", {
       method: "POST", headers: { "Content-Type": "application/json" },
       signal: abort.signal,
-      // enable_thinking makes the template WRAP the reasoning in <think>. Left unset,
-      // the checkpoint reasons at its default xhigh effort and emits the reasoning as
-      // plain prose, so the fold below had nothing to key on and never fired.
+      // enable_thinking makes the template open a <think> block at the end of the
+      // prompt, so the reply starts inside it and splitThink can find the boundary.
+      // Left unset, the checkpoint reasons at its default xhigh effort and emits the
+      // reasoning as untagged prose, and the fold has nothing to key on.
       body: JSON.stringify({ messages: history, stream: true,
-                             chat_template_kwargs: { enable_thinking: true },
+                             chat_template_kwargs: { enable_thinking: THINK },
                              stream_options: { include_usage: true } }),
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
@@ -941,19 +964,18 @@ async function sendChat(text) {
       seen += 1;
       const dt = (performance.now() - firstAt) / 1000;
       if (dt > 0.15) $("tps").textContent = (seen / dt).toFixed(1);
-      // Split the model's reasoning out of the answer. The tags can land mid-delta, so
-      // re-partition the whole accumulated text each frame rather than tracking a state
-      // machine across chunk boundaries.
-      const open = raw.indexOf("<think>");
-      if (open < 0) { setBody(bubble, raw, true); scrollDown(); return; }
-      const close = raw.indexOf("</think>", open);
+      // Split the model's reasoning out of the answer. Re-partition the whole
+      // accumulated text each frame: the tag can land mid-delta, and the reply starts
+      // inside the block, so there is no state machine to run across chunks.
+      const [reason, answer] = splitThink(raw, THINK);
+      if (!reason) { setBody(bubble, answer, true); scrollDown(); return; }
       if (!think) think = addThinking(bubble);
-      think.textContent = raw.slice(open + 7, close < 0 ? undefined : close).trim();
+      think.textContent = reason.trim();
       think.parentNode.querySelector(".n").textContent = think.textContent.length + " chars";
-      setBody(bubble, (raw.slice(0, open) + (close < 0 ? "" : raw.slice(close + 8))).trim(), true);
+      setBody(bubble, answer.trim(), true);
       // Fold the reasoning away once the answer proper starts, but only once, so a
       // reader who opened it back up keeps it open.
-      if (close >= 0 && !collapsed) { collapsed = true; think.parentNode.open = false; }
+      if (answer && !collapsed) { collapsed = true; think.parentNode.open = false; }
       scrollDown();
     });
   } finally {
@@ -961,11 +983,9 @@ async function sendChat(text) {
     // Keep partial text from a stopped stream, but never thread an empty turn back --
     // and never thread the reasoning back either: the checkpoint's template drops prior
     // <think> blocks from history, so sending them re-primes the model on its own
-    // scratchpad. Sliced by index, not by regex: _CHAT_UI is not a raw Python string.
+    // scratchpad.
     if (raw) {
-      const o = raw.indexOf("<think>"), c = raw.indexOf("</think>", o);
-      const answer = o < 0 ? raw
-                   : (raw.slice(0, o) + (c < 0 ? "" : raw.slice(c + 8))).trim();
+      const answer = splitThink(raw, THINK)[1].trim();
       history.push({ role: "assistant", content: answer || raw });
     }
   }

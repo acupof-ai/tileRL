@@ -131,6 +131,51 @@ def test_the_check_catches_an_undefined_call():
     assert _unresolved("// call ghost(1) in a comment\nlet a = 1;") == set()
 
 
+def test_the_reasoning_split_handles_a_reply_that_starts_inside_think():
+    """The stream carries only `</think>`, and the page has to fold on that.
+
+    The checkpoint's template ends the prompt with "<think>\\n", so generation begins
+    inside the block: measured against the served V100, a 300-token reply contained
+    `</think>` and no `<think>`. The first version keyed on the opening tag, so the
+    fold never fired and the reasoning printed inline as prose -- and no gate saw it,
+    because every assertion here was about markup and CSS.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; splitThink's behaviour cannot be exercised")
+    js = _script(_CHAT_UI)
+    start = js.index("function splitThink")
+    fn = js[start : js.index("\nfunction ", start + 1)]
+
+    # (raw, inside) -> (reasoning, answer). `inside` is the page's THINK flag.
+    cases = [
+        # What the server actually sends: no open tag, close tag mid-reply.
+        ["why\n</think>\nthe answer", True, "why\n", "\nthe answer"],
+        # Mid-stream, before the close tag arrives: all reasoning, no answer yet.
+        ["thinking about it", True, "thinking about it", ""],
+        # Thinking off: no tags at all, so all of it is the answer.
+        ["just the answer", False, "", "just the answer"],
+        # A reply that does carry both tags (backfilled history, or a paste).
+        ["<think>r</think>a", False, "r", "a"],
+        # An unclosed open tag is still reasoning, not an answer.
+        ["<think>r only", False, "r only", ""],
+        # A close tag with nothing before it: empty reasoning, not a dropped answer.
+        ["</think>a", True, "", "a"],
+    ]
+    harness = fn + "\nconst C = " + json.dumps(cases) + ";\n" + textwrap.dedent("""
+        const bad = [];
+        for (const [raw, inside, wantR, wantA] of C) {
+          const [r, a] = splitThink(raw, inside);
+          if (r !== wantR || a !== wantA) bad.push([raw, inside, [r, a], [wantR, wantA]]);
+        }
+        console.log(JSON.stringify(bad));
+    """)
+    r = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"splitThink threw: {r.stderr.strip()[:400]}"
+    bad = json.loads(r.stdout.strip().splitlines()[-1])
+    assert not bad, f"splitThink is wrong on: {bad}"
+
+
 def test_the_index_route_serves_the_page():
     """`/` returns the CHAT page, and the landing page is still reachable at /about.
 
