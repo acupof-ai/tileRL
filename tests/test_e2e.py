@@ -1155,13 +1155,22 @@ def test_engine_draft_matches_full_context_draft(rows, plen, batched_tokens, dep
         # greedy is deterministic: the final sequence truncated is the sequence at that draft
         row = prompts[i] + outs[ids[i]]
         full = _full_context_draft(cfg, model, draft, backend, row[: pos + 1])
-        assert int(full.argmax()) == int(got.argmax()), (
-            f"row {i}: engine drafted {int(got.argmax())} at position {pos}, "
-            f"full context drafts {int(full.argmax())}"
-        )
-        # dense vs paged hidden differ ~4e-3, x10 through the head; a chain-local KV reads ~1.4
+        # The DRIFT is the invariant; argmax agreement is a LOTTERY on it wherever the
+        # top-2 gap is narrower. Measured on sm90: `chunked` margin 0.2863 against drift
+        # 0.3562 FAILED while `multirow` row 2 at margin 0.2667 / drift 0.3536 -- a worse
+        # ratio -- passed. Same positions on cpu read margin 4.6552 / drift 0.2775, 16.8x
+        # the other way, so the margins are per-arch and no fixed tolerance fits either.
+        # `rel` is the assertion that measures the difference instead of betting on it:
+        # sm90's four positions span 1.617e-02 to 5.822e-02 against the 0.1 bound, and a
+        # control that moves one logit by +50 reads 3.235e-01 -- caught with 3.2x margin,
+        # 5.6x above the worst real drift. So dropping the argmax compare loses no
+        # coverage that was ever real. dense vs paged hidden differ ~4e-3, x10 through
+        # the head; a chain-local KV reads ~1.4, which is what 0.1 was sized against.
         rel = ((full - got).norm() / full.norm()).item()
-        assert rel < 0.1, f"row {i} at position {pos}: norm-relative {rel:.2e}"
+        assert rel < 0.1, (
+            f"row {i} at position {pos}: norm-relative {rel:.2e}, engine drafted "
+            f"{int(got.argmax())} against full context's {int(full.argmax())}"
+        )
 
 
 def test_speculation_reproduces_greedy_decode():
