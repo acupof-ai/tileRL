@@ -2,14 +2,20 @@
 
 **Date:** 2026-09-05
 **Arch:** sm70 (Tesla V100-SXM2-32GB), 27B NVFP4 — the fix is a constant; the 4K
-end-to-end confirmation is `pending-remote`
+end-to-end confirmation landed later the same day (39.1 s, see *Resolved* below)
 **Task:** local audit, no GPU window (the resident server holds 22.3 of 32 GB)
 
 ## Context
 
-`5cdbf7e` raised the server's per-completion wall-clock cap from 600 s to 1800 s, for a
-measured reason: **a 4K prefill on sm70 takes ~600 s on its own**, so the 600 s cap fired
-before the decode phase began. That commit touched one file, `src/tilerl/server.py`.
+`5cdbf7e` raised the server's per-completion wall-clock cap from 600 s to 1800 s, citing
+**"a 4K prefill on sm70 takes ~600 s"** so that the 600 s cap fired before the decode
+phase began. That commit touched one file, `src/tilerl/server.py`.
+
+**That figure is withdrawn** — measured 39.1 s for 3478 tokens, 15x lower, and it was a
+B=8 whole-tick cost quoted as a single request. See
+[2026-09-05-the-600s-that-justified-1800s-was-a-batch-tick.md](2026-09-05-the-600s-that-justified-1800s-was-a-batch-tick.md).
+The defect recorded here does not depend on it: whatever the right cap is, the two paths
+have to agree on it.
 
 There are two front ends over one engine. `/v1/chat/completions` lives in `server.py`;
 `/v1/messages` — the API Claude Code speaks — lives in `messages.py` and has its own wait
@@ -30,14 +36,13 @@ The fix is one constant, hoisted to `_COMPLETION_TIMEOUT_S = 1800.0` because the
 appeared **twice** in that function — once as the deadline and once in the error message,
 so changing one alone would have made the other lie.
 
-**Not measured here:** that a 4K request through `/v1/messages` now completes. That needs
-the card, and the resident 27B server holds 22.3 of 32 GB. What is verified is the
-constant, the parity between the two paths, and the gate below. The ~600 s prefill figure
-is `5cdbf7e`'s measurement, not a fresh one — it is the reason the fix is correct, and it
-was already paid for.
-
-`pending-remote`: one 4K `/v1/messages` request against the live V100, asserting it returns
-rather than raising at 600 s.
+**Resolved** (measured after this entry was first written, on the live V100 running
+`550740a`, which still carried both 600 s constants): a **3478-token** `/v1/messages`
+request **COMPLETED in 39.1 s**, so the cap never fired. The client budget was set to
+900 s on purpose — above the server's 600 s — so that whichever side gave up first was
+identifiable; a client-side timeout would have said nothing about the server's cap. What
+this measurement establishes is that the two paths now agree and that 4K fits comfortably
+inside either cap. What it withdraws is the ~600 s premise, in the entry linked above.
 
 ## The gate
 

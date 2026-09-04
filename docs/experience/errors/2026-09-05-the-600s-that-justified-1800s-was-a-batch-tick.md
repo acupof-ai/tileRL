@@ -1,0 +1,160 @@
+# The ~600s that justified an 1800s cap was never a 4K prefill — 2026-09-05
+
+## Context
+
+`5cdbf7e` (2026-08-31) raised the per-completion wall-clock cap in `server.py` from
+600 s to 1800 s. Its whole justification, and the only record of the number
+anywhere, is one line of commit body:
+
+> 4K prefill on sm70 takes ~600s; the 600s server-side timeout fired before the
+> decode request finished. Match the client-side 1800s.
+
+I cited that figure twice today — in `936396c`'s commit body and in
+`errors/2026-09-05-the-timeout-fix-landed-on-one-of-two-api-paths.md` — as the
+reason `/v1/messages` needed the same 1800 s. The structural defect that commit
+fixed is real and independent of the figure. The figure is not.
+
+## What I measured
+
+The live V100 service runs `550740a`, which still carries `messages.py`'s two 600 s
+constants, so one request measures the cost and tests the cap at the same time.
+`--max-batch 1`, `--max-ctx 4096`, 27B NVFP4 + draft head at depth 1. Client budget
+set to 900 s deliberately, above the server's 600 s, so that whichever side gives up
+first is identifiable — a client timeout would have said nothing about the server.
+
+```
+POST 15687 bytes, client budget 900s (server cap is 600s in the deployed 550740a)
+COMPLETED in 39.1s  input_tokens=3478 output_tokens=8  (11.25 ms/input token)
+```
+
+**39.1 s.** The 600 s cap did not fire and could not have. This service's
+`--max-ctx 4096` leaves **618 tokens** of output room after a 3478-token prompt, not
+the 2048 I first wrote — so the worst case is 39.1 + 618/41.9 = **53.9 s**, 11.1x
+under the cap.
+
+Getting to 41.9 tok/s took two corrections, both mine, and they are recorded because
+each is the error this entry is about at a smaller scale — a rate quoted outside the
+configuration it was measured in:
+
+1. I first used the 50.3 tok/s measured at *short* context for a 4K-context decode.
+   The tree's table falls with context, so it has to be scaled.
+2. I then scaled it by the **dense** column's falloff (41.0 → 37.6, 0.917). The live
+   service runs `--depth 1`, so 50.3 is a *speculative* rate, and the spec column
+   falls harder: 48.4 → 40.3, **0.833**. 50.3 × 0.833 = 41.9.
+
+So the cited ~600 s is **15x** the real single-request cost.
+
+### The 39.1 s reconciles against a bench measured a different way
+
+`docs/serve-v100.md:106-112` already holds a prefill table taken through a direct
+`step()` loop, fully warm, no HTTP: **8.92 ms/token at 4096 ctx**. Applied to this
+request's 3478 tokens that is 31.0 s, plus 0.16 s for 8 output tokens at 50.3 tok/s:
+
+| component | s |
+|---|---:|
+| prefill, tree's bench rate × 3478 tokens | 31.0 |
+| 8 decode tokens at 50.3 tok/s | 0.16 |
+| **accounted** | **31.2** |
+| measured end-to-end | 39.1 |
+| unaccounted (HTTP, tokenize, template render, scheduling) | 7.9 (20%) |
+
+Two methods with nothing in common — an in-process `step()` loop and an HTTP request
+from another machine — agree within **1.26x**, and the sign is right: mine carries
+the overhead the bench does not. That is what makes 39.1 s a measurement rather than
+a single unreplicated number, and it is the check the ~600 s figure never had.
+
+## Root cause of the wrong figure
+
+Two things, and the ordering is the interesting one.
+
+**The number was measured at B=8, not B=1, and for the whole prefill tick rather
+than one request.** `wins/2026-08-31-sm70-gdn-chunk-fused.md:60-65` is the only
+prefill measurement from that day: `B=8`, 27B NVFP4, warm prefill **~65 s before,
+15.1 s after**, with the breakdown labelled "tick 1, 8x64 tokens". A B=8 tick at
+512 tokens each, extrapolated to 4096 tokens each, lands in the hundreds of seconds
+— which is where ~600 s plausibly comes from. It is a *batch* figure being quoted
+as a *request* figure.
+
+**And the 4.3x fix landed one commit BEFORE the cap was raised.** `git log` order:
+`1ecf8ee` (the 4.3x prefill win) → `2e1bf72` → `50076b4` → `bd17d55` → `5cdbf7e`
+(the cap raise). So the cap was raised to accommodate a cost that the tree had
+already made 4.3x cheaper four commits earlier.
+
+**Not claimed: that 4.3x accounts for a specific share of the 15x.** 15.35 / 4.3
+leaves 3.57x, and I have not measured what that is — the B=8-vs-B=1 units error is the
+obvious candidate but the two figures come from different harnesses on different days,
+so multiplying them into a factorization would be exactly the move this entry warns
+about. The 4.3x is here because of *when* it landed, not as a term in an equation.
+
+Neither the commit nor any `docs/experience/` entry records a 4K single-request
+timing; `grep` for "600 s" across `docs/` and `CHANGELOG.md` returns nothing. The
+figure entered the tree as a commit-body assertion and was never checked.
+
+### One comparison I am NOT making
+
+The B=8 entry works out to 29.49 ms/token (15.1 s / 512) against my 11.24, i.e. the
+batched tick costs 2.62x more per token — which would be an interesting finding about
+batching, and I am not reporting it as one. **79 runtime commits sit between the two
+measurements** (`git log --since=2026-08-31 -- src/tilerl/ packages/`), the row lengths
+differ 54-fold (64 vs 3478 tokens), and the two used different harnesses. That ratio
+mixes five days of code change, a row-length effect and a batch effect into one number.
+Dividing one recorded figure by another from a different day is the same move as summing
+a ceiling with a trace row.
+
+## The instrument I nearly reported instead
+
+My first attempt fitted a line through four shorter prompts and extrapolated:
+
+```
+input_tokens=  124  wall= 13.20s
+input_tokens=  465  wall=  8.75s
+input_tokens=  921  wall= 20.00s
+input_tokens= 1603  wall= 17.78s
+fit: wall = 11.04s + 5.007 ms/token   ->  4096 tokens: 31.5s
+```
+
+31.5 s is close to the 39.1 s that direct measurement later gave, so the conclusion
+would have survived. The fit still had to be thrown away: **465 tokens came back
+faster than 124**. A longer prompt finishing sooner means the dominant term is not
+prefill — the 124-token point almost certainly absorbed a scheduling or
+first-request cost — so the slope describes noise, and any conclusion resting on it
+would have been right by luck. Direct measurement was one request away.
+
+## What stands and what is withdrawn
+
+**Stands:** `936396c` is correct and independent of this. The defect it fixed is
+that one policy lived in two constants and only one was updated, so the same
+request completed through `/v1/chat/completions` and raised `TimeoutError` through
+`/v1/messages`. Whether the shared value should be 600 or 1800 is a separate
+question from whether the two paths must agree.
+
+**Withdrawn:** "a 4K prefill on sm70 takes ~600 s on its own" — as a fact about a
+single request on the current tree. It is 39.1 s measured, 53.9 s worst-case once the
+context limit is respected. The cap could be 120 s and 4K would still fit.
+
+**Also corrected, mine, twice:** the 80 s worst case I wrote first used the
+short-context decode rate and assumed 2048 output tokens where the context leaves 618.
+Fixing that gave 52.5 s — still wrong, because I scaled by the dense column's falloff
+for a service running `--depth 1`, whose rate falls on the spec column. 53.9 s.
+
+Every one of those errors made the number *larger*, so the conclusion strengthened each
+time and nothing looked wrong. That is the reason to re-derive a supporting number:
+an error that flatters the claim generates no surprise, and surprise is what makes
+you look twice.
+
+**Not claimed:** that ~600 s was wrong for the configuration it was taken in. A B=8
+tick at 4096 tokens per row was never measured, and this entry does not measure it.
+The error is quoting a batch-tick figure as a per-request one, not the figure itself.
+
+**The `pending-remote` stub in
+`errors/2026-09-05-the-timeout-fix-landed-on-one-of-two-api-paths.md` is now
+resolved** — by a measurement that removes the reason the stub existed.
+
+## Rule
+
+A number that survives only in a commit body has never been checked. Before citing
+one as the reason for a change, find the `docs/experience/` entry it came from; if
+there is none, either measure it or label it as an unverified assertion from that
+commit. And check what the figure's *units* were: ~600 s was a B=8 whole-tick cost
+quoted as a single-request cost, which is the same class of error as summing a
+ceiling with a trace row ([`bound-is-not-a-measurement`]).
