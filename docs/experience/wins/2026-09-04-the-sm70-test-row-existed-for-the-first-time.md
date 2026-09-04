@@ -41,15 +41,50 @@ sm90    d0b438c   248 passed,   1 failed  (main: 200 passed, 1 failed, SAME test
 sm70    ff75987   245 passed,   0 failed
 ```
 
-sm90 throughput, 200 GSM8K greedy at `max_new_tokens=512`, decode graph on, one
-process per arm, against the 40bc83c baseline (the peer's cells): B=1 base
-78.4 → 82.0, B=1 spec 135.5 → 135.8, B=8 base 242.9 → 245.9, B=8 spec 225.4 → 230.6.
-**Worst ratio 1.002x against a 0.97x gate, no cell regressed.** The +1.0 to +4.6%
-is not claimed as a win: one draw per cell, and `bench_ctx_decode`'s measured
-spread is 0.3–0.9%, so three of four deltas are inside noise. Acceptance is the
-evidence that the draft path did not move — B=1 is **54329/73983 accepted,
-byte-identical to main**; B=8 is 53867/72828 against 53911/72947, 6.18 per block of
-8 on both.
+## sm90 (H20), 200 GSM8K, greedy, `max_new_tokens=512`, decode graph on
+
+Both arms in one process on card 7, one job on the host. Branch at `9b2f182`,
+baseline at `40bc83c`, each from a `git worktree` checkout rather than a file
+push — the pod tree used for the baseline was verified against the sha by
+enumerating all 154 `.py` files, not the changeset (`src/` and `packages/`:
+zero differences).
+
+**The draft path did not move.** At B=1 the branch accepts **54329 of 73983**
+drafted tokens — byte-identical counts to the baseline run. At B=8 it is
+53867/72828 against 53911/72947, which is 6.18 accepted per block of 8 on
+both; the totals differ because the completions differ by one question. That
+is a stronger statement than any wall-clock ratio below, and it is the one
+that says the batched selector walk and the sm70 work leave the draft
+arithmetic alone.
+
+| cell | baseline | 9b2f182 | ratio | GSM8K | tok/decode-fwd |
+|---|---:|---:|---:|---|---:|
+| B=1 base | 78.4 | 82.0 | 1.046 | 168/200 → 168/200 | 1.00 |
+| B=1 spec w8 | 135.5 | 135.8 | 1.002 | 167/200 → 167/200 | 6.12 |
+| B=8 base | 242.9 | 245.9 | 1.012 | 165/200 → 165/200 | 7.79 |
+| B=8 spec w8 | 225.4 | 230.6 | 1.023 | 163/200 → 164/200 | 42.55 |
+
+**No cell regressed, and none is outside run-to-run spread.** The gate is
+0.97x and the worst cell is 1.002x. **No direction is claimed on the deltas**:
+there is one draw per cell, `bench_ctx_decode`'s measured spread is 0.3–0.9%
+on tok/s, and three of the four deltas fall inside 2.3%. The B=1 base cell at
++4.6% is the only one outside that band and it has no second draw.
+
+B=1 speculation still beats its own base arm by **1.656x** (135.8 / 82.0), so
+the accept verdict for speculative decode at B=1 survives the branch.
+
+**Two things this section does not establish.** Throughput parity is not a
+correctness gate — the `_tl_layout` rename, whose stale reader built an empty
+exemption set and failed only on sm90 with a served forward, would have run at
+full speed. And `_fit_blocks`' CUDA arithmetic is not exercised here:
+`acc_spec_arms.py` passes `num_blocks=512` explicitly, so `num_blocks=0` is
+never taken, and `_fit_rows` cannot differ from `_pad2d` at these shapes even
+in principle — `bN > 32` is required and the 27B's N are all multiples of 128.
+That is why an N=24 parity test found the re-target bug and no throughput run
+ever could.
+
+*(This section is the sm90 owner's own text, landed unedited.)*
+
 
 ## Attribution
 
@@ -89,12 +124,11 @@ lottery, not a draft bug
 ([errors/2026-09-04-the-argmax-gate-was-a-lottery-on-the-drift.md](2026-09-04-the-argmax-gate-was-a-lottery-on-the-drift.md)).
 sm70's 14 across the whole run: all test defects, 0 product defects.
 
-Scope not covered: the sm70 row is a test-suite row, not a throughput row — it says
-the kernels agree with their references on that card, not what they cost there.
-Throughput parity is not a correctness gate either, which the `_tl_layout` bug
-already demonstrated. And `_fit_blocks`' CUDA arithmetic is **still unexercised on
-any card**: `test_serve_sizes_...` turned out to be a test defect rather than the
-coverage it looked like, so `serve --blocks 0` remains unmeasured (#62's open half).
+Scope not covered, beyond the two limits the sm90 section states for itself: the
+sm70 row is a test-suite row, not a throughput row — it says the kernels agree with
+their references on that card, not what they cost there. `serve --blocks 0` on a
+real card is the one open item at the time of writing (#62's other half).
+
 
 
 ## Rule
