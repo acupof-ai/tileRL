@@ -425,6 +425,18 @@ _CHAT_UI = """<!doctype html>
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     --r: 3px; --r2: 7px;
+    /* Spacing, on a 4px step. Colour, type and radius were tokenized and this
+       was not, so 79 hand-picked pixel values decided how components line up.
+       Cross-component margins spend these; 23 raw values over 9 distinct sizes
+       remain, and they are optical adjustments INSIDE one component (a 7px icon
+       gap, a gauge's 4/14/5 padding), which a scale would only make worse. */
+    --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 20px;
+    --s-6: 24px; --s-8: 32px; --s-10: 40px;
+    /* The transcript's label column plus its gap. Notes and events indent to
+       the same place, and three rules used to spell the sum as a literal 80px
+       with nothing tying them to the two values it comes from. */
+    --label: 64px; --label-gap: var(--s-4);
+    --gutter: calc(var(--label) + var(--label-gap));
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -448,8 +460,8 @@ _CHAT_UI = """<!doctype html>
 
   /* Header rail: identity left, instrument cluster right. */
   header {
-    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
-    padding: 10px 20px; border-bottom: 1px solid var(--line); background: var(--surface);
+    display: flex; align-items: center; gap: var(--s-4); flex-wrap: wrap;
+    padding: var(--s-2) var(--s-5); border-bottom: 1px solid var(--line); background: var(--surface);
   }
   .mark { font: 600 14px/1 var(--mono); letter-spacing: -.2px; color: var(--ink); text-decoration: none; }
   .mark:hover { color: var(--accent-ink); }
@@ -461,16 +473,6 @@ _CHAT_UI = """<!doctype html>
     font: 11.5px/1 var(--mono); color: var(--ink-3); white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; max-width: 30ch;
   }
-  .tabs { display: flex; gap: 2px; padding: 2px; background: var(--sunken); border-radius: var(--r2); }
-  .tab {
-    padding: 5px 13px; border: 0; border-radius: 5px; cursor: pointer; background: transparent;
-    font: 500 12.5px/1.3 var(--sans); color: var(--ink-3);
-  }
-  .tab:hover { color: var(--ink-2); }
-  .tab.on {
-    color: var(--ink); background: var(--surface); box-shadow: 0 1px 2px rgba(0,0,0,.07);
-  }
-
   /* Instruments: the point of the demo, so tabular numerals and a real unit treatment. */
   .gauges {
     margin-left: auto; display: flex; border: 1px solid var(--line);
@@ -490,9 +492,12 @@ _CHAT_UI = """<!doctype html>
   .gv i { font: 400 10px/1 var(--sans); font-style: normal; color: var(--ink-3); }
 
   /* Transcript: a document with a role gutter, not two colored bubbles. */
-  main { flex: 1; overflow-y: auto; padding: 4px 20px 28px; }
+  main { flex: 1; overflow-y: auto; padding: var(--s-1) var(--s-5) var(--s-8); }
   .col { max-width: 760px; margin: 0 auto; }
-  .turn { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 18px; padding: 20px 0; }
+  .turn {
+    display: grid; grid-template-columns: var(--label) minmax(0, 1fr);
+    gap: var(--label-gap); padding: var(--s-5) 0;
+  }
   .turn + .turn, .turn + .ev, .ev + .turn { border-top: 1px solid var(--line); }
   .who {
     font: 600 9.5px/2.2 var(--sans); text-transform: uppercase; letter-spacing: .1em;
@@ -510,7 +515,10 @@ _CHAT_UI = """<!doctype html>
     background: var(--accent); vertical-align: text-bottom; animation: blink 1.1s steps(2) infinite;
   }
   @keyframes blink { 50% { opacity: 0; } }
-  .note { font: 11.5px/1.6 var(--sans); color: var(--ink-3); padding: 4px 0 0 80px; }
+  .note {
+    font: 11.5px/1.6 var(--sans); color: var(--ink-3);
+    padding: var(--s-1) 0 0 var(--gutter);
+  }
 
   /* Reasoning: present but subordinate — no box, hairline rule, smaller dim type. */
   .think { margin: 0 0 14px; border-left: 2px solid var(--line); }
@@ -531,8 +539,8 @@ _CHAT_UI = """<!doctype html>
   }
 
   /* Event stream: the kinds differ by weight and indent, not by hue. */
-  .ev { margin: 0 0 10px 80px; }
-  .ev:first-child { margin-top: 20px; }
+  .ev { margin: 0 0 var(--s-3) var(--gutter); }
+  .ev:first-child { margin-top: var(--s-5); }
   .ev .head {
     display: flex; align-items: center; gap: 7px;
     font: 600 9.5px/1.8 var(--sans); text-transform: uppercase; letter-spacing: .1em;
@@ -541,52 +549,33 @@ _CHAT_UI = """<!doctype html>
   .mk { font: 400 11px/1 var(--mono); color: var(--ink-3); }
   .ev .body { white-space: pre-wrap; overflow-wrap: anywhere; }
 
-  .ev.thought { border-left: 2px solid var(--line); padding-left: 13px; }
-  .ev.thought .head { padding-bottom: 2px; }
-  .ev.thought .body { font-size: 13.5px; line-height: 1.62; color: var(--ink-2); }
-
-  .ev.action, .ev.observation {
-    margin-left: 100px; border: 1px solid var(--line); border-radius: var(--r);
-    background: var(--surface); overflow: hidden;
-  }
-  .ev.action .head, .ev.observation .head {
-    padding: 5px 11px; background: var(--sunken); border-bottom: 1px solid var(--line);
-  }
-  .ev.action .head span:last-child { font-family: var(--mono); text-transform: none; letter-spacing: 0; font-size: 11px; color: var(--ink-2); }
-  .ev.action .body, .ev.observation .body {
-    padding: 9px 11px; font: 12.5px/1.6 var(--mono); color: var(--ink-2);
-  }
-  /* A call and its return read as one unit. */
-  .ev.action + .ev.observation {
-    margin-top: -10px; border-top: 0;
-    border-top-left-radius: 0; border-top-right-radius: 0;
-  }
-  .ev.observation .body { background: var(--paper); max-height: 240px; overflow: auto; font-size: 12px; }
-
-  .ev.answer, .ev.error {
-    margin-left: 80px; padding: 13px 16px; border: 1px solid var(--line);
+  .ev.error {
+    margin-left: var(--gutter); padding: var(--s-3) var(--s-4); border: 1px solid var(--line);
     border-left: 3px solid var(--accent); border-radius: var(--r);
     background: var(--surface); box-shadow: var(--shadow);
   }
-  .ev.answer .body { font-size: 15px; line-height: 1.68; color: var(--ink); padding-top: 3px; }
   .ev.error { border-left-color: var(--danger); background: var(--danger-wash); box-shadow: none; }
+  .ev.error .body { font-size: 15px; line-height: 1.68; color: var(--ink); padding-top: 3px; }
   .ev.error .head { color: var(--danger); }
   .ev.error .mk { color: var(--danger); }
   .ev.error .body { font: 12.5px/1.6 var(--mono); color: var(--ink-2); padding-top: 3px; }
 
   /* Empty state */
-  .empty { padding: 40px 0 0; max-width: 560px; }
+  .empty { padding: var(--s-10) 0 0; max-width: 560px; }
   .empty h1 { margin: 0 0 7px; font: 600 19px/1.3 var(--sans); letter-spacing: -.2px; }
   .empty p { margin: 0; font-size: 14px; color: var(--ink-2); }
-  .seeds { display: flex; flex-wrap: wrap; gap: 7px; margin: 22px 0 0; padding: 0; list-style: none; }
+  .seeds {
+    display: flex; flex-wrap: wrap; gap: var(--s-2); margin: var(--s-6) 0 0;
+    padding: 0; list-style: none;
+  }
   .seed {
     padding: 6px 12px; border: 1px solid var(--line); border-radius: 14px; cursor: pointer;
     background: var(--surface); font: 12.5px/1.4 var(--sans); color: var(--ink-2); text-align: left;
   }
   .seed:hover { border-color: var(--line-firm); color: var(--ink); }
   .legend {
-    margin: 30px 0 0; padding-top: 18px; border-top: 1px solid var(--line);
-    display: grid; grid-template-columns: 62px 1fr; gap: 6px 18px;
+    margin: var(--s-8) 0 0; padding-top: var(--s-5); border-top: 1px solid var(--line);
+    display: grid; grid-template-columns: var(--label) 1fr; gap: var(--s-2) var(--label-gap);
     font-size: 12.5px; color: var(--ink-2);
   }
   .legend dt {
@@ -596,7 +585,7 @@ _CHAT_UI = """<!doctype html>
   .legend dd { margin: 0; }
 
   /* Composer */
-  form { padding: 0 20px 18px; }
+  form { padding: 0 var(--s-5) var(--s-5); }
   .dock {
     max-width: 760px; margin: 0 auto; background: var(--surface);
     border: 1px solid var(--line); border-radius: var(--r2); box-shadow: var(--shadow);
@@ -604,18 +593,21 @@ _CHAT_UI = """<!doctype html>
   .dock:focus-within { border-color: var(--line-firm); }
   textarea {
     display: block; width: 100%; resize: none; border: 0; background: transparent;
-    padding: 12px 14px 2px; color: var(--ink); font: 15px/1.6 var(--sans); max-height: 200px;
+    padding: var(--s-3) var(--s-4) var(--s-1); color: var(--ink); font: 15px/1.6 var(--sans); max-height: 200px;
   }
   textarea::placeholder { color: var(--ink-3); }
   textarea:focus { outline: none; }
-  .dockbar { display: flex; align-items: center; gap: 10px; padding: 4px 10px 9px 14px; }
+  .dockbar {
+    display: flex; align-items: center; gap: var(--s-3);
+    padding: var(--s-1) var(--s-3) var(--s-2) var(--s-4);
+  }
   .hint { font: 11.5px/1.5 var(--sans); color: var(--ink-3); }
   kbd {
     font: 10px/1.5 var(--mono); border: 1px solid var(--line); border-bottom-width: 2px;
     border-radius: var(--r); padding: 0 4px; color: var(--ink-2); background: var(--sunken);
   }
   .btn {
-    margin-left: auto; padding: 6px 16px; border: 1px solid transparent; border-radius: var(--r);
+    margin-left: auto; padding: var(--s-2) var(--s-4); border: 1px solid transparent; border-radius: var(--r);
     font: 500 13px/1.5 var(--sans); cursor: pointer;
     background: var(--accent); color: var(--accent-fg);
   }
@@ -627,21 +619,29 @@ _CHAT_UI = """<!doctype html>
   .btn.ghost:hover { background: var(--sunken); color: var(--ink); }
 
   @media (max-width: 640px) {
-    header { padding: 10px 14px; gap: 10px; }
+    header { padding: var(--s-2) var(--s-4); gap: var(--s-3); }
     .gauges { margin-left: 0; width: 100%; }
     .gauge { flex: 1; min-width: 0; }
-    main { padding: 4px 14px 24px; }
-    form { padding: 0 14px 14px; }
-    .turn { grid-template-columns: 1fr; gap: 5px; }
+    main { padding: var(--s-1) var(--s-4) var(--s-6); }
+    form { padding: 0 var(--s-4) var(--s-4); }
+    .turn { grid-template-columns: 1fr; gap: var(--s-1); }
     .who { text-align: left; }
-    .ev, .ev.answer, .ev.error { margin-left: 0; }
-    .ev.action, .ev.observation { margin-left: 14px; }
+    .ev, .ev.error { margin-left: 0; }
     .note { padding-left: 0; }
-    .legend { grid-template-columns: 1fr; gap: 2px; }
+    .legend { grid-template-columns: 1fr; gap: var(--s-1); }
     .legend dt { text-align: left; }
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::after { animation: none !important; transition: none !important; }
+    /* The caret and the header dot were the only two pending affordances and
+       both are animations, so stripping animation left the wait unsignalled.
+       Give pending a static cue instead of taking its only one away. */
+    .content.streaming::after { width: 7px; height: 3px; vertical-align: baseline; }
+    .content.streaming::before {
+      content: "working"; margin-right: var(--s-2); padding: 1px var(--s-1);
+      font: 600 9.5px/1.6 var(--sans); text-transform: uppercase; letter-spacing: .1em;
+      color: var(--accent-ink); background: var(--accent-wash); border-radius: var(--r);
+    }
   }
 </style>
 </head>
@@ -746,7 +746,7 @@ function addThinking(bubble) {
   return body;
 }
 
-const MARKS = { thought: "~", action: "→", observation: "←", answer: "◆", error: "!" };
+const MARKS = { error: "!" };  // addEvent has one call site and it passes "error"
 
 function addEvent(kind, title) {
   clearEmpty();
