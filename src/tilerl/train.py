@@ -252,8 +252,12 @@ def grpo_loop(
     generates IS the model that trains, so it must be built with the prefix
     cache and decode graph off, and rollouts are drawn untruncated so the
     sampler is the policy the step differentiates. Yields
-    ``(mean reward, cross-entropy, seconds, tied-group fraction)`` as each step
-    finishes, so a 100-step run reports progress instead of printing at the end.
+    ``(mean reward, cross-entropy, seconds, tied-group fraction, mean completion
+    tokens)`` as each step finishes, so a 100-step run reports progress instead of
+    printing at the end. The token count is there because ``tied_group_fraction``
+    cannot fall and be bad: ``--judge`` reorders inside the all-pass subgroup by
+    construction, so it drives ties toward 0 whether or not it ranks anything real.
+    Length is the independent signal that separates the two.
     # ponytail: recapture the graph and drop the prefix entries after each
     # update instead of disabling both, once a rollout's decode cost matters."""
     _require_on_policy(engine)
@@ -296,7 +300,8 @@ def grpo_loop(
         slens = np.array([len(prompt) + len(c) for c in comps], dtype=np.int64)
         ce = rl_step(model, batch, adv, plens, backend, optimizer, trainable=trainable,
                      seq_lens=slens, micro=micro)
-        yield float(np.mean(rewards)), ce, time.perf_counter() - t0, tied
+        yield (float(np.mean(rewards)), ce, time.perf_counter() - t0, tied,
+               float(np.mean([len(c) for c in comps])))
 
 
 def opd_loop(

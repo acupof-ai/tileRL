@@ -134,6 +134,11 @@ def test_grpo_loop_raises_reward():
     first = np.mean([r for r, *_ in hist[:3]])
     last = np.mean([r for r, *_ in hist[-3:]])
     assert last > first, f"GRPO did not raise reward: {first:.3f} -> {last:.3f}"
+    # Length is logged because tied_group_fraction cannot report a bad --judge:
+    # the judge reorders inside the all-pass subgroup, so it drives ties toward 0
+    # whether or not it ranks anything real. A step yields a real token count.
+    toks = [h[4] for h in hist]
+    assert all(0 < t <= 6 for t in toks), f"completion length not reported: {toks}"
 
 
 def test_grpo_loop_reports_a_step_before_the_run_ends():
@@ -151,7 +156,7 @@ def test_grpo_loop_reports_a_step_before_the_run_ends():
     gen = grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(len(c)), 3, backend,
                     AdamW(lr=1e-3), group=2, sampling=SamplingParams(max_new_tokens=4))
     first = next(gen)
-    assert len(first) == 4, first
+    assert len(first) == 5, first  # reward, ce, secs, tied, mean completion tokens
     assert sum(1 for _ in gen) == 2, "every step must be yielded, not just the first"
 
 
