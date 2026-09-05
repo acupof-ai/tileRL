@@ -1,9 +1,7 @@
 # `--max-ctx 4096` was a flag, not a ceiling — V100 sm70, 2026-09-05
 
-> Status: Shipped (doc + flag). The restart is **pending-remote**: the pod's
-> checkout sits on branch `docs-disk-full` at `550740a`, whose
-> `serve_v100.sh:51` still reads 4096, so the flag does not take effect until the
-> pod fetches this change.
+> Status: **Shipped and measured on the card.** `blocks_total` 256 → 2048, and the
+> 11019-token prompt that returned 400 now returns 200.
 
 ## Context
 
@@ -69,6 +67,43 @@ allocated, whereas `_fit_blocks` runs *after* `torch.cuda.empty_cache()`
 state the fit saw. The measured 2649 supersedes the derived 2453; the doc now cites
 the measurement.
 
+## Measured on the card
+
+Restarted at this change (`boot 0 at 09:39:13 sha 6a4e737`) and measured before
+anything else touched the server, because the first request is the only one that can
+carry a cold JIT cost.
+
+| | 4096 (was) | 32768 (now) |
+|---|---:|---:|
+| `blocks_total` | 256 | **2048** |
+| 11019-token prompt | `400 exceeds max_total_tokens` | **200**, `prompt_tokens 11019` |
+| idle VRAM | 22136 MiB | 25980 MiB |
+| peak during the long prefill | — | **27036 MiB** of 32768 |
+
+**The KV arithmetic checks out independently.** The idle delta is
+25980 − 22136 = **3844 MiB** against a predicted 4352 − 544 = **3808 MiB** — 1.009x.
+That is the 2.125 MiB block confirmed by a second route, and it would have been
+1.062x had the draft's 1/16 plane been left out.
+
+**Peak is 27036 MiB, 5732 MiB spare**, and the transient above idle is only
+1056 MiB — the prefill partials at 11019 tokens, which is what the third held back
+from the fit exists to cover.
+
+**First-request cost: 19.4 s, not 182 s.** The first request took 182.5 s wall and an
+identical second took 163.1 s (1.119x). Only the 19.4 s difference is the one-time fp4
+JIT for that prefill shape; the remaining 163 s is what an 11019-token prompt costs
+every time. Reporting 182 s as "the JIT cost" would have been wrong by 9.4x, and the
+second request is the only thing that separates them.
+
+That warm 163.1 s is **14.68 ms per prompt token** (163.1 s minus ~1.3 s for 64
+decoded tokens at the measured 50.0 tok/s, over 11019 tokens), against the 8.92
+ms/token the bench table records at ctx 4096. Prefill cost per token grows with
+context; this entry does not claim the shape of that curve, only the two endpoints.
+
+**19.4 s is the `kv_tier` cold-start baseline**, and it is small — which matters for
+`kv_tier`: an offload tier has to beat re-prefilling, and re-prefilling this prompt
+costs 163 s while the JIT it avoids is worth 19.
+
 ## Rule
 
 When a limit and a derived cap are numerically equal, the number cannot say which one
@@ -77,22 +112,25 @@ memory from a later `nvidia-smi`: `empty_cache()` runs in between and is worth 6
 
 ## Results
 
-| date | commit | machine | target | model | max ctx | blocks | KV pool |
-|---|---|---|---|---|---:|---:|---:|
-| 2026-09-05 | (this) | V100-SXM2-32GB | cuda sm70 | 27B NVFP4, draft d1 | 4096 → **32768** | 256 → **2048** | 544 → **4352 MiB** |
+| date | commit | machine | target | model | max ctx | blocks | idle VRAM | peak |
+|---|---|---|---|---|---:|---:|---:|---:|
+| 2026-09-05 | 6a4e737 | V100-SXM2-32GB | cuda sm70 | 27B NVFP4, draft d1 | 4096 | 256 | 22136 MiB | — |
+| 2026-09-05 | 6a4e737 | V100-SXM2-32GB | cuda sm70 | 27B NVFP4, draft d1 | **32768** | **2048** | **25980 MiB** | **27036 MiB** |
 
-Unmeasured, and the reason this entry is not fully Shipped: peak memory at 32K, the
-first long request's JIT cost, and a >11017-token request returning 200. All three
-need a restart at this change, and the pod's checkout is on `docs-disk-full` at
-`550740a` where `serve_v100.sh:51` still reads 4096.
+**Two claims withdrawn from this entry, both recorded rather than deleted.**
 
-**A claim withdrawn from this section.** It first said those three were unmeasured
-because "the resident server is mid-session and was not interrupted." That was
-assumed, not read. `/health` reports `finished: 0`, `tokens_generated: 0`,
-`running: 0` and the log has zero request lines, against a process start of
-09:00:44 — **31.5 minutes of uptime and not one request served.** Nothing was in
-session. The three numbers are unmeasured because I did not measure them, and the
-premise that excused it was the flattering one, which is why it went unchecked.
+1. **"The resident server is mid-session, so this is unmeasured."** Assumed, never
+   read. `/health` gave `finished: 0`, `tokens_generated: 0`, `running: 0` against
+   31.5 minutes of uptime, and the log had zero request lines — nothing was in
+   session. The numbers were unmeasured because I had not measured them, and the
+   premise that excused it needed no defending, which is why it went unchecked. They
+   are measured above now.
+2. **The 2453-block / 39248-token ceiling**, derived from a `25492 / 32768 MiB` read.
+   Superseded by the measured 2048 at cap and #65's 2649 at fit; see the section
+   above.
+
+Raw artifacts: `~/serve70c.log` on the pod (`=== boot 0 at 2026-09-05T09:39:13
++08:00 sha 6a4e737 ===`); `/health` `blocks_total` before and after.
 
 That JIT number is also the **`kv_tier` cold-start baseline**, and `kv_tier`'s
 before-arm must be **32768**, not 4096 — 8x of the headroom is a flag, and folding it
