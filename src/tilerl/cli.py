@@ -560,7 +560,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
         tiebreak = _judge_tiebreak(engine, tok, params) if args.judge else None
 
         hist = []
-        for i, (r, ce, secs, tied, ntok, timings) in enumerate(
+        for i, (r, ce, secs, tied, ntok, timings, width) in enumerate(
                 train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
                                     group=args.group, sampling=params, seed=args.seed,
                                     trainable=trainable, micro=args.micro,
@@ -569,7 +569,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             for phase, elapsed in timings.items():
                 manifest["metrics"][phase] = manifest["metrics"].get(phase, 0.0) + elapsed
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
-                f"tied {tied:.2f}  tok {ntok:.0f}  {secs:.1f}s  "
+                f"tied {tied:.2f}  tok {ntok:.0f}  width {width}  {secs:.1f}s  "
                 f"rollout {timings['rollout_secs']:.3f}s  "
                 f"backward {timings['backward_secs']:.3f}s  "
                 f"optimizer {timings['optimizer_secs']:.6f}s", flush=True)
