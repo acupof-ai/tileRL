@@ -1030,3 +1030,49 @@ def test_v1_messages_never_answers_200_for_an_engine_failure(tmp_path, monkeypat
                 f"cannot tell this from a model that chose to say nothing")
     finally:
         engine.shutdown()
+
+
+def test_the_record_says_which_operand_capped_the_completion(tmp_path, monkeypatch):
+    """A short completion must be attributable from one row, without arithmetic.
+
+    Six live requests came back with `stop_reason: "max_tokens"` and 1, 1, 1, 1, 4 and 8
+    completion tokens. Establishing that the cap was the CLIENT's `max_tokens` and not the
+    server's context budget took decoding the completion ids to see the model had been cut
+    mid-word, then computing `max_total_tokens - len(prompt)` per row to show the budget
+    was five digits. Both operands of `min(req.max_tokens, budget)` are in the row now, so
+    the same question is one field lookup.
+
+    `effective_max_tokens` is what `SamplingParams` actually carried: asserting only the
+    two inputs would pass while a third operand nobody logged did the capping.
+    """
+    tok = _ByteTokenizer()
+    record = tmp_path / "rec.jsonl"
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(record))
+    engine = _ScriptedEngine(tok, ["hello there"])
+    with TestClient(create_app(engine, tok)) as client:
+        r = client.post(
+            "/v1/messages",
+            json={"model": "m", "max_tokens": 3,
+                  "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert r.status_code == 200, r.text
+    rows = [json.loads(x) for x in record.read_text().splitlines() if x.strip()]
+    assert rows, f"nothing recorded; file={record.read_text()[:200]!r}"
+    row = rows[-1]
+    for field in ("asked_max_tokens", "budget", "engine_limit", "prompt_len",
+                  "effective_max_tokens", "stream", "stop_reason"):
+        assert field in row, (
+            f"{field!r} missing from the record, so a capped completion cannot be "
+            f"attributed without re-deriving it. Row keys: {sorted(row)}"
+        )
+    assert row["asked_max_tokens"] == 3, row["asked_max_tokens"]
+    assert row["prompt_len"] == len(row["prompt_ids"]), (
+        "prompt_len disagrees with the ids it summarises"
+    )
+    # The cap must be explained by one of the two operands, or the row still cannot
+    # answer the question it exists for.
+    assert row["effective_max_tokens"] in (row["asked_max_tokens"], row["budget"]), (
+        f"effective_max_tokens {row['effective_max_tokens']} is neither the asked "
+        f"{row['asked_max_tokens']} nor the budget {row['budget']}: a third operand caps "
+        f"completions and is not logged"
+    )

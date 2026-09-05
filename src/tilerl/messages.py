@@ -204,6 +204,18 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             "request_id": rid,
             "rollout": rollout,
             "model": req.model or model_name,
+            # What capped the completion, all four operands. A row of six requests
+            # returning 1 token each with stop_reason "max_tokens" took a decode of the
+            # completion ids plus arithmetic over cli.py's max_total_tokens to establish
+            # that `budget` was five digits and the cap therefore came from the client.
+            # With these fields it is one line to read.
+            "asked_max_tokens": req.max_tokens,
+            "budget": budget,
+            "engine_limit": engine_limit,
+            "prompt_len": len(input_ids),
+            "effective_max_tokens": params.max_new_tokens,
+            "stream": bool(req.stream),
+            "thinking": _thinking(req),
             "prompt_ids": [int(t) for t in input_ids],
             "completion_ids": [int(t) for t in out],
             "logprobs": scores,
