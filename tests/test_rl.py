@@ -156,7 +156,7 @@ def test_grpo_loop_reports_a_step_before_the_run_ends():
     gen = grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(len(c)), 3, backend,
                     AdamW(lr=1e-3), group=2, sampling=SamplingParams(max_new_tokens=4))
     first = next(gen)
-    assert len(first) == 5, first  # reward, ce, secs, tied, mean completion tokens
+    assert len(first) == 6, first  # reward, ce, secs, tied, mean completion tokens, timings
     assert sum(1 for _ in gen) == 2, "every step must be yielded, not just the first"
 
 
