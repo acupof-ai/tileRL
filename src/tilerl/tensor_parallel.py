@@ -137,6 +137,56 @@ def kv_replicas(total_kv_heads: int, world: int) -> tuple[int, int]:
     return total_kv_heads // world, 1
 
 
+def is_sharded(key: str) -> bool:
+    """Does this rank hold only a SLICE of this tensor, or the whole of it?
+
+    Names only, so it answers from the sharded config too -- ``model.cfg`` after
+    ``tp_config`` no longer knows the original head counts, and reading
+    ``num_kv_heads`` off it would call a sharded ``k_proj`` replicated (tiny at
+    tp=2 shards kv 2 -> 1, and 1 reads as "one head, replicated everywhere").
+    Callers that reduce across ranks need this: a replicated tensor is already
+    identical on every rank, and summing it counts it ``world`` times.
+
+    A LoRA pair splits on ONE side only, because it is attached after sharding
+    and inherits the base weight's narrow dimension: on a column-parallel base
+    (split output rows) B is [n/w, r] and A is the full [r, k]; on a row-parallel
+    base (split input columns) A is [r, k/w] and B is the full [n, r]. Measured
+    on tiny at tp=2: q_proj.lora_a (4,64) both ways while lora_b goes 128->64,
+    and o_proj/down_proj the mirror image.
+    # ponytail: a model with exactly ONE kv head replicates k/v to every rank, and
+    # this still says sharded; take the full cfg here when such a config exists.
+    """
+    head, _, suf = key.rpartition(".")
+    if suf in ("lora_a", "lora_b"):
+        base = head.rsplit(".", 1)[-1]
+        # A is narrow on a row-parallel base, B is narrow on a column-parallel one.
+        return base in _ROW if suf == "lora_a" else base in _COLUMN
+    base = _base_name(key)
+    return base in _ROW or base in _COLUMN
+
+
+def _base_name(key: str) -> str:
+    head, _, suf = key.rpartition(".")
+    return (head if suf in _QUANT_SUFFIX else key).rsplit(".", 1)[-1]
+
+
+def _kind(key: str, cfg, world: int):
+    """``(None|"row"|"col", dim, segs, replicas)`` -- how ``shard_params`` splits
+    a key of the FULL model. ``replicas`` is 1 except for K/V, which replicate
+    whole heads across the ranks sharing one."""
+    base = _base_name(key)
+    replicas = 1
+    if base in ("k_proj", "v_proj"):
+        _, replicas = kv_replicas(cfg.num_kv_heads, world)
+        if world // replicas == 1:  # one KV head in the whole model: every rank keeps it
+            return None, 0, (), 1
+    if base in _ROW:
+        return "row", 1, (), replicas
+    if base in _COLUMN:
+        return "col", 0, _segment_sizes(cfg, _COLUMN[base]), replicas
+    return None, 0, (), 1  # norms, embed_tokens, biases: replicated
+
+
 def tp_config(cfg, world: int):
     """``cfg`` with every sharded dimension divided by ``world``; ``hidden_size``
     stays whole (the replicated activation width)."""
@@ -196,25 +246,16 @@ def shard_params(params: dict, cfg, rank: int, world: int) -> dict:
     config and ``params`` must be unfused (``load_hf(fuse_projections=False)``)."""
     if world == 1:
         return params
-    _, replicas = kv_replicas(cfg.num_kv_heads, world)
     out: dict[str, torch.Tensor] = {}
     for key, t in params.items():
         head, _, suf = key.rpartition(".")
         stem = head if suf in _QUANT_SUFFIX else key
-        base = stem.rsplit(".", 1)[-1]
-        if base in _ROW:
-            kind, dim, segs = "row", 1, ()
-        elif base in _COLUMN:
-            kind, dim, segs = "col", 0, _segment_sizes(cfg, _COLUMN[base])
-        else:
-            out[key] = t  # norms, embed_tokens, biases: replicated
-            continue
-        # K and V replicate across the ranks that share a head; Q does not.
-        r = rank // replicas if base in ("k_proj", "v_proj") else rank
-        w = world // replicas if base in ("k_proj", "v_proj") else world
-        if w == 1:
+        kind, dim, segs, replicas = _kind(key, cfg, world)
+        if kind is None:  # norms, embed_tokens, biases: replicated
             out[key] = t
             continue
+        # K and V replicate across the ranks that share a head; Q does not.
+        r, w = rank // replicas, world // replicas
         if t.ndim == 1:  # oscale / dt_bias / a_log
             out[key] = t if kind == "row" else _take(t, segs, r, w, 0)
             continue
@@ -266,6 +307,30 @@ if __name__ == "__main__":  # runnable check: the rules, not the plumbing
 
     assert pad_vocab(248320, 4) == 248320
     assert pad_vocab(1000, 8) == 1024
+
+    # is_sharded must agree with what shard_params actually did, for EVERY param
+    # including the LoRA pairs -- which split on one side only, and whose side
+    # flips between a row- and a column-parallel base. A wrong answer here is a
+    # gradient counted twice in the clip norm, which is silent.
+    from . import model as _model_mod
+    from .config import tiny as _tiny
+
+    _cfg = _tiny()
+    _one = _model_mod.build_random(_cfg, seed=0, keep_master=True)
+    _model_mod.add_lora(_one, rank=4)
+    _loc = _model_mod.Model(tp_config(_cfg, 2),
+                            shard_params(_model_mod.build_random(
+                                _cfg, seed=0, keep_master=True).params, _cfg, 0, 2))
+    _model_mod.add_lora(_loc, rank=4)
+    _n = 0
+    for _k, _full in _one.params.items():
+        if _k not in _loc.params:
+            continue
+        _n += 1
+        assert is_sharded(_k) == (_full.shape != _loc.params[_k].shape), (
+            f"{_k}: is_sharded={is_sharded(_k)} but {tuple(_full.shape)} -> "
+            f"{tuple(_loc.params[_k].shape)}")
+    assert _n >= 59, f"only {_n} params compared"
 
     # Mesh: every rank in a (dp=2, tp=4) world lands in exactly one tp group and
     # one dp group, and the two groups intersect in that rank alone. A layout bug

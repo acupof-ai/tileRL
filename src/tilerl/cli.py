@@ -38,9 +38,15 @@ def _qwen38_tokenizer():
 
 
 def _build_model(
-    model_name: str, seed: int, fuse_projections: bool = False, keep_master: bool = False
+    model_name: str, seed: int, fuse_projections: bool = False, keep_master: bool = False,
+    tp: int = 1, backend=None,
 ):
-    """(cfg, model): serving fuses projections, training keeps the bf16 masters."""
+    """(cfg, model): serving fuses projections, training keeps the bf16 masters.
+
+    ``tp`` > 1 shards both here, because a model can only be sharded where it is
+    built: the config's head counts must already be divided before any layer
+    reshapes with them.
+    """
     from . import config as config_mod
     from . import model as model_mod
 
@@ -57,12 +63,48 @@ def _build_model(
                 file=sys.stderr,
             )
             sys.exit(1)
-        return cfg, model
+        return _shard(cfg, model, tp, backend, model_mod)
     # tiny-agent is tiny with room for one real agent turn; see config.tiny().
     cfg = config_mod.tiny(65536) if model_name == "tiny-agent" else config_mod.tiny()
-    return cfg, model_mod.build_random(
+    model = model_mod.build_random(
         cfg, seed=seed, fuse_projections=fuse_projections, keep_master=keep_master
     )
+    return _shard(cfg, model, tp, backend, model_mod)
+
+
+def _shard(cfg, model, tp: int, backend, model_mod):
+    """Every rank builds the WHOLE model and keeps its slice.
+
+    Wasteful and deliberate: sharding at load time needs a loader that reads
+    per-rank slices out of the checkpoint, and that is a separate change. On the
+    27B this costs each rank a transient full copy.
+    # ponytail: whole-model build then slice, per-rank checkpoint reads when the
+    # 27B's transient copy is the binding constraint
+    """
+    if tp <= 1:
+        return cfg, model
+    from .tensor_parallel import Mesh, shard_params, tp_config
+
+    # dp is DERIVED from the world, never a second flag: two numbers that must
+    # multiply to a third invite a launch where they do not.
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    if world % tp:
+        raise SystemExit(f"--tp {tp} does not divide WORLD_SIZE={world}")
+    if world // tp > 1:
+        # Nothing averages gradients across dp replicas yet -- no dp all-reduce
+        # exists anywhere in the tree, and DataParallelEngine is a serving object
+        # (N engines on N devices in one process), not this axis. Such a run would
+        # not fail: each replica would train its own divergent model on its own
+        # data and the losses would look fine. Refuse until the dp reduce lands.
+        raise SystemExit(
+            f"--tp {tp} under WORLD_SIZE={world} implies dp={world // tp}, and gradients "
+            "are not reduced across dp replicas yet: each replica would silently train a "
+            f"different model. Launch with --nproc_per_node={tp}, or use tp={world}.")
+    mesh = Mesh(dp=1, tp=tp, rank=rank)  # validates rank < world and the layout
+    backend.init_tp(world, rank, [mesh.tp_group()])
+    return tp_config(cfg, tp), model_mod.Model(
+        tp_config(cfg, tp), shard_params(model.params, cfg, mesh.tp_rank, tp))
 
 
 def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16,
@@ -307,6 +349,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
         "group": args.group, "max_new_tokens": args.max_new_tokens,
         "temperature": params.temperature, "max_think_tokens": args.max_think_tokens,
         "lr": args.lr, "lora_rank": args.lora_rank, "seed": args.seed, "eval_mmlu": args.eval_mmlu,
+        # In the id: tp=1 and tp=4 are different runs, and without this the second
+        # would be handed the first's finished manifest and never train.
+        "tp": args.tp,
         "reward": args.reward,
         "eval_gsm8k": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
         "eval_n": args.eval_n})
@@ -320,7 +365,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
 
     backend = get_backend()
     # LoRA on a frozen base needs no bf16 master (~27 GB on the 27B).
-    cfg, model = _build_model(args.model, seed=args.seed, keep_master=False)
+    cfg, model = _build_model(args.model, seed=args.seed, keep_master=False,
+                              tp=args.tp, backend=backend)
     log(f"tilerl train: model={cfg.name} layers={cfg.num_layers} "
         f"hidden={cfg.hidden_size} vocab={cfg.vocab_size} steps={args.steps}")
     gen = torch.Generator().manual_seed(args.seed)
@@ -805,6 +851,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_train.add_argument("--optim", choices=["adafactor", "iso"], default="adafactor",
                          help="full-parameter SFT optimizer; --rl/--opd train LoRA and ignore it")
     p_train.add_argument("--lora-rank", type=int, default=16)
+    p_train.add_argument("--tp", type=int, default=1,
+                         help="tensor-parallel width; launch under "
+                              "torchrun --nproc_per_node=<tp>. dp>1 is refused for now.")
     p_train.add_argument("--draft", help="draft head safetensors: speculative rollout (--opd)")
     p_train.add_argument("--depth", type=int, help="drafts per row per tick; default is the "
                          "head's own (chain: 2; block: its checkpoint's block minus the anchor)")

@@ -55,9 +55,9 @@ def test_pretrain_clips_params_only(tmp_path, monkeypatch):
     seen: dict = {}
     real = train_mod.clip_grad_norm
 
-    def spy(grads, max_norm):
+    def spy(grads, max_norm, sharded=None, backend=None):
         seen.update(grads)
-        return real(grads, max_norm)
+        return real(grads, max_norm, sharded, backend)
 
     monkeypatch.setattr(train_mod, "clip_grad_norm", spy)
     pretrain(
