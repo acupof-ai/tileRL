@@ -22,11 +22,14 @@ RECIPES: dict[str, dict] = {
         eval_max_new_tokens=2048,
         status="pending-remote: roadmap P1"),
     # GSM8K is solved: 88.0% uncapped base, so 81% of groups tie at the ceiling
-    # (wins/2026-09-05-p1-grpo-27b-run.md). Sampled on the 27B before this run:
-    # levels 3-5 score 75% (6/8), level 5 alone 45.8% (11/24) -- so LEVEL 5 ONLY.
-    # max_new_tokens 2048, not 512: the base policy's mean completion on level 5 is
-    # 1038 tokens (measured, n=500), so a 512 cap truncates every rollout before the
-    # \boxed{} and 5 of the first 6 steps tied at the FLOOR with reward 0.
+    # (wins/2026-09-05-p1-grpo-27b-run.md). TRAINING data is level 5 only (2304 rows,
+    # verified against the parquet shards). The EVAL file is levels 3-5 mixed
+    # (165/157/178), so its 80.0% base is not a level-5 number -- both arms score the
+    # same file so the delta holds, it is just measured on an easier set than the one
+    # trained on. A level-5-only eval is a separate run.
+    # max_new_tokens 2048, not 512: the base policy's mean completion is 1029 tokens
+    # (measured on that mixed file, n=500), so a 512 cap truncates every rollout before
+    # the \boxed{} and 5 of the first 6 steps tied at the FLOOR with reward 0.
     # eval_max_new_tokens is explicit for the same reason gsm8k's is: scoring at the
     # 512 rollout cap would measure the cap (errors/2026-09-04-the-eval-cap-measured-itself.md).
     "grpo-math-27b": dict(
