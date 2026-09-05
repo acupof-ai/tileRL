@@ -687,7 +687,8 @@ class Engine:
                 "prefix_state_bytes": store["state_bytes"],
                 # Present only with a host tier; a demotion is a prefix the card could not
                 # keep but did not have to lose.
-                **{k: v for k, v in store.items() if k.startswith("dram_")},
+                **{k: v for k, v in store.items()
+                   if k.startswith(("dram_", "ssd_"))},
                 "prefix_demoted": store.get("demoted", 0),
                 "prefill_forwards": self._prefill_forwards,
                 "decode_forwards": self._decode_forwards,
