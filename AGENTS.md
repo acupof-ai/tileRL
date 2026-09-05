@@ -141,11 +141,17 @@ reached `tilerl-27` because a grant commit read "via tilerl-27".)
 **Pod jobs go through `scripts/pod_run.sh <name> <card> -- <cmd>`.** Never
 hand-type the launcher: it reaps the job (a `setsid nohup` from an exiting
 shell orphans to a PID 1 that is `sleep infinity` and never `wait()`s), logs
-to `/work`, the tree that survives a container restart, claims with the
-python pid and retries only
-the device-fd refusal, releases from a trap, and refuses a card holding
->64 MiB with no claim. After any kill, read `ps -o stat=`: `kill -0`,
-`/proc/<pid>` and `pgrep -f` all call a zombie alive.
+to `/work`, the tree that survives a container restart, claims with the python
+pid and retries only the device-fd refusal, releases from a trap, and refuses
+a card holding >64 MiB with no claim. After any kill, read `ps -o stat=`:
+`kill -0`, `/proc/<pid>` and `pgrep -f` all call a zombie alive.
+
+**Writing `bench-baseline.json`.** Append-mostly and shared, so serialize it
+with `json.dumps(d, indent=2, sort_keys=True)`. Any other form reindents the
+file and a one-row append becomes 196 insertions that every peer's edit then
+conflicts against; `merge=union` covers CHANGELOG, not this. Since #112 a beat
+is a candidate written to `runs/<id>/baseline-candidate.json`, so a write here
+is a deliberate promotion.
 
 **On-policy rollouts.** `grpo_loop` and self-OPD refuse an engine whose caches
 would outlive an update, per cache: `recapture_graph=` waives the decode graph,
