@@ -13,6 +13,12 @@ kind: find | rule | block | done | ask | note.  find/rule/done need --artifact.
 The board lives in the main checkout's runs/ (gitignored), so every worktree
 sees one file. Every command first prints what is new to this session.
 Set TILERL_SESSION=<roster name>; the branch name is the fallback identity.
+
+Scope: live session state only -- who works on what, who holds a card, what
+blocks whom. Conclusions and numbers go to CHANGELOG.md and docs/experience/;
+a board row that carries one is a second source of truth and is wrong here.
+Rows are append-only and timestamped; the newest row on a topic is its state,
+and it is a claim -- nvidia-smi and git ls-tree stay the measurement.
 """
 
 import argparse
