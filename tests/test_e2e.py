@@ -676,6 +676,35 @@ def test_the_dram_tier_demotes_instead_of_evicting():
     )
 
 
+def test_the_host_tier_drops_the_oldest_snapshot_not_an_arbitrary_one():
+    """The DRAM tier evicts by bytes; this asserts it evicts the OLDEST.
+
+    `test_a_promotion_that_comes_back_empty_is_a_miss` already drives `drops >= 1` and
+    checks a lookup degrades safely, but it never says WHICH snapshot went — so a tier that
+    dropped the newest, or a random one, passes it. With three snapshots against a
+    two-snapshot budget the first demoted must be gone and the last two held.
+
+    Negative control: `popitem(last=True)` instead of `last=False` inverts the victim and
+    fails on the first assert.
+    """
+    torch.manual_seed(0)
+    snaps = [(torch.randn(3, 4, 8, 8) + i, torch.randn(3, 2, 16)) for i in range(3)]
+    one = sum(t.nbytes for t in snaps[0])
+    dram = DramSnapshots(budget_bytes=2 * one + one // 2)
+    for i, snap in enumerate(snaps):
+        assert dram.demote(i, snap), f"snapshot {i} was refused by a budget that fits two"
+    assert dram.drops == 1, f"expected exactly one drop at this budget, got {dram.drops}"
+    dev = torch.device("cpu")
+    assert dram.promote(0, dev) is None, (
+        "the OLDEST snapshot survived; an LRU tier must evict it first, and evicting the "
+        "newest throws away what a lookup is about to ask for"
+    )
+    for i in (1, 2):
+        back = dram.promote(i, dev)
+        assert back is not None, f"snapshot {i} was dropped instead of the oldest"
+        assert torch.equal(back[0], snaps[i][0]), f"snapshot {i} came back changed"
+
+
 def test_a_promotion_that_comes_back_empty_is_a_miss():
     """A snapshot the tier dropped must not serve its blocks anyway.
 
@@ -887,6 +916,59 @@ def test_a_spill_truncated_by_a_crash_is_a_miss_not_a_raise(tmp_path):
                        ssd=cold_tier)
     hit = cold.lookup(toks)  # must not raise
     assert hit is None, f"a truncated spill served a hit of length {hit and hit.length}"
+
+
+def test_the_disk_tier_evicts_the_oldest_entry_past_its_byte_budget(tmp_path):
+    """A byte budget that only reports is unbounded disk growth.
+
+    Four prefixes spilled against a budget that holds two. The oldest entry's files must be
+    gone and `resident()` False for it, while the newest is still there -- LRU, so the
+    victim is the least recently touched, not the largest or the first inserted.
+
+    The negative control is the budget itself: with it effectively unlimited, every file
+    survives. Without that arm "the files are gone" would also pass for a tier that deleted
+    them for some other reason.
+    """
+    torch.manual_seed(0)
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+    toks = list(range(16 * BLOCK_TOKENS))
+
+    def spill_four(max_bytes: int, tag: str):
+        d = str(tmp_path / tag)
+        pool = PagedKvPool(128, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+        tier = KvTier(d, "fp-lru", min_tokens=BLOCK_TOKENS, max_bytes=max_bytes)
+        store = PrefixStore(pool, ssd=tier)
+        keys = []
+        for k in range(1, 5):
+            n = k * 4 * BLOCK_TOKENS
+            blocks = [pool.alloc_block() for _ in range(n // BLOCK_TOKENS)]
+            assert store.insert(toks[:n], blocks, (state[0].clone(), state[1].clone()))
+            keys.append(store._hash_all(tuple(toks[:n])))
+            _flushed(tier)
+        return tier, keys, os.path.join(d, "tilerl_kvtier")
+
+    # Negative control first, and it also measures what one entry costs on disk.
+    big, _, d_big = spill_four(1 << 40, "unlimited")
+    assert big.stats()["ssd_entries"] == 4, "setup: four entries should have landed"
+    assert big.over_budget == 0, f"the unlimited arm evicted {big.over_budget} entries"
+    assert len(os.listdir(d_big)) == 9, (  # 4 pairs + the .kvtier marker
+        f"the unlimited arm lost files: {sorted(os.listdir(d_big))}"
+    )
+    one_pair = big.stats()["ssd_bytes"] // 4
+
+    small, keys, _ = spill_four(2 * one_pair, "capped")
+    assert small.over_budget >= 1, (
+        f"nothing was evicted at a {2 * one_pair} byte budget (total "
+        f"{small.stats()['ssd_bytes']}), so this test is inert"
+    )
+    assert not small.resident(keys[0]), "the oldest entry survived the byte budget"
+    assert small.resident(keys[-1]), "the newest entry was evicted instead of the oldest"
+    assert not os.path.exists(small._kv(keys[0])), (
+        "the oldest entry left its .kv on disk, so the budget is not bounding the directory"
+    )
+    assert small.stats()["ssd_bytes"] <= 2 * one_pair, (
+        f"still {small.stats()['ssd_bytes']} bytes tracked against a {2 * one_pair} budget"
+    )
 
 
 def _flushed(tier, tries: int = 500) -> None:
