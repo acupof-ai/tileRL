@@ -67,3 +67,39 @@ def test_rl_refuses_a_data_file_with_no_rows(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.argv", ["tilerl", "train", "--rl", "--data", str(empty)])
     with pytest.raises(SystemExit, match="has no rows"):
         cli.main()
+
+
+def test_math_reward_scores_what_the_number_matcher_cannot():
+    """MATH answers are symbolic, and `--reward number` does not fail on them -- it
+    scores them WRONG, which is worse: `last_number` reads the denominator, so
+    `\\frac{1}{2}` and `\\frac{3}{2}` both parse to 2.0 and a wrong rollout is
+    rewarded. The recipe therefore carries `reward="boxed"`, and this asserts the
+    two matchers genuinely disagree -- a flag selecting an equivalent function is
+    not a fix."""
+    from tilerl.eval import answer_match
+    from tilerl.math_answer import boxed_match
+
+    wrong = r"we get \boxed{\frac{3}{2}}"
+    assert answer_match(wrong, r"\frac{1}{2}"), "last_number compares the denominators"
+    assert not boxed_match(wrong, r"\frac{1}{2}"), "boxed_match must reject it"
+    assert boxed_match(r"we get \boxed{\frac{1}{2}}", r"\frac{1}{2}")
+    assert flags("grpo-math-27b")["reward"] == "boxed"
+
+
+def test_math_prompts_ask_for_the_box():
+    """`boxed_match` scores nothing unless the model boxes, and nothing downstream
+    asks it to: `render_chat` emits bare ChatML and the recipe runs thinking off.
+    Without the instruction every group ties at the FLOOR, which --level cannot fix.
+    Asserted against the generator's own constant, so removing it fails here."""
+    import re
+    from pathlib import Path
+
+    from tilerl.math_answer import boxed_match
+
+    src = Path(__file__).resolve().parents[1] / "scripts" / "math_jsonl.py"
+    text = src.read_text()
+    assert re.search(r"_INSTRUCTION\s*=", text), "the generator lost its instruction constant"
+    assert '+ _INSTRUCTION' in text, "the instruction is defined but not appended to the prompt"
+    assert r"\\boxed" in text
+    # and the matcher it exists to satisfy really does need the box:
+    assert not boxed_match("the answer is 2", "2")

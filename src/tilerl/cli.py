@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from .eval import answer_match
+from .math_answer import boxed_match
 from .recipes import RECIPES, flags
 
 # ponytail: placeholder hub id; pin the real Qwen3-27B repo when weights land.
@@ -293,6 +294,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
         "group": args.group, "max_new_tokens": args.max_new_tokens,
         "temperature": params.temperature, "max_think_tokens": args.max_think_tokens,
         "lr": args.lr, "lora_rank": args.lora_rank, "seed": args.seed, "eval_mmlu": args.eval_mmlu,
+        "reward": args.reward,
         "eval_gsm8k": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
         "eval_n": args.eval_n})
     prev = read_manifest(runs_root(), manifest["id"])
@@ -360,10 +362,13 @@ def _train_adapters(args: argparse.Namespace) -> None:
     if args.rl:
         if rows:
             gold = {tuple(p): r["answer"] for p, r in zip(prompts, rows)}
+            # MATH answers are not numbers: last_number scores `\frac{1}{2}` as 2,
+            # so every group would tie on the wrong reading.
+            match = boxed_match if args.reward == "boxed" else answer_match
 
             def reward(prompt, completion):
                 text = tok.decode([int(t) for t in completion])
-                return float(answer_match(text, gold[tuple(int(t) for t in prompt)]))
+                return float(match(text, gold[tuple(int(t) for t in prompt)]))
         else:
             half = cfg.vocab_size // 2
 
@@ -712,6 +717,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_train.add_argument("--max-new-tokens", type=int, default=32, help="rollout length")
     p_train.add_argument("--data", help="JSONL {prompt, answer}: real prompts, exact-match "
                          "reward on the last number (scripts/gsm8k_jsonl.py)")
+    p_train.add_argument("--reward", choices=["number", "boxed"], default="number",
+                         help="how --data's answer is matched: last number (GSM8K) or the "
+                              "last \\boxed{} (MATH, scripts/math_jsonl.py)")
     p_train.add_argument("--temperature", type=float, default=None,
                          help="rollout temperature (default: the model card's, per thinking mode)")
     p_train.add_argument("--max-think-tokens", type=int, default=0,
