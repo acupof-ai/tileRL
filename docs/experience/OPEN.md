@@ -1,7 +1,8 @@
 # Open defects
 
 Documented in `errors/` with a fix named and not landed. A PR that lands the fix removes
-its line. Reviewers check a change on the same path against this list.
+its line. Writing the entry and adding the line are one act — an entry with `Status: open`
+and no line here is the same defect this file exists to stop. Reviewers check a change on the same path against this list.
 
 | entry | path | fix |
 |---|---|---|

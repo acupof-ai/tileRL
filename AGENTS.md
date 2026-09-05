@@ -177,17 +177,22 @@ accept-or-reject verdict**.
 non-obvious *why* in ≤1 English line, never the *what* and never which task
 added it. If the code already reads clearly, leave it bare — no comment.
 
-**Before a number leaves your session** (2026-09-05: twenty errors entries in one day,
-most of them one of these five):
+**Before a number leaves your session** (2026-09-05: 20 errors entries by 06:00Z,
+most of them one of these shapes):
 - A mechanism claim ships with the probe that tested it. Arithmetic over config dims and
   a reading of the code are hypotheses; two of each were wrong in both directions today.
 - An arm's number needs a placement control: the same arm in another position, another
   process, or another card. First-position JIT, an idle-card microbench (11.6 vs 161.9 ms
   in-path) and a two-conversation sweep each produced a clean, false table.
-- A gate is green only after its negative control is red. Four vacuous gates today: a
-  capture path that silently fell back on CPU, a `callable(getattr(...))` true for every
-  engine, a monkeypatch that never reached the importlib'd copy, a one-step test that a
-  loop-entry clear satisfied.
+- A gate is green only after its negative control is red, and the control must fail for
+  the reason under test. Five controls today passed by a second route the author did not
+  know existed (a second module object, cached bytecode, bash's own reaping, a whole-prompt
+  publish, inherited categories): name the route by which the assertion is true and check
+  the guard is the only one. [errors/2026-09-05-a-control-that-cannot-fail.md](docs/experience/errors/2026-09-05-a-control-that-cannot-fail.md)
+- A second measurement that inherits the first's categories is not a second measurement.
+  Two sessions bucketed one adapter file and agreed to the digit; the second had hardcoded
+  the first's suffixes, and a third suffix (`.wscale`, 466 keys) sat uncounted until a
+  loader refused. Enumerate what is there, never count the categories you already believe.
 - Volume is not time. A pad histogram in elements says where copies are, not where
   seconds go; only a phase-attributed profile does.
 - A negative verdict on a condition with two variables needs a sweep of each. "DRAM tier
