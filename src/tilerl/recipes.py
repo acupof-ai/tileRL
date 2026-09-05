@@ -10,7 +10,8 @@ RECIPES: dict[str, dict] = {
     # rather than two policies. Same shape as tests/test_rl.py's passing loop.
     "grpo-tiny-smoke": dict(
         model="tiny", rl=True, steps=12, group=6, max_new_tokens=8, lora_rank=4,
-        lr=0.05, status="cpu: tests/test_recipes.py"),
+        # 8 tokens is below any real completion; the length guard is for real runs.
+        lr=0.05, allow_short_rollouts=True, status="cpu: tests/test_recipes.py"),
     # docs/roadmap.md P1. Pass --data gsm8k_train.jsonl --eval-gsm8k gsm8k_test.jsonl.
     # lr: the CLI default of 1e-3 flattens the reward from step 9 on; 1e-4 does not.
     # eval_max_new_tokens 2048 is the protocol the published before/after numbers
@@ -23,10 +24,13 @@ RECIPES: dict[str, dict] = {
     # GSM8K is solved: 88.0% uncapped base, so 81% of groups tie at the ceiling
     # (wins/2026-09-05-p1-grpo-27b-run.md). Sampled on the 27B before this run:
     # levels 3-5 score 75% (6/8), level 5 alone 45.8% (11/24) -- so LEVEL 5 ONLY.
+    # max_new_tokens 2048, not 512: the base policy's mean completion on level 5 is
+    # 1038 tokens (measured, n=500), so a 512 cap truncates every rollout before the
+    # \boxed{} and 5 of the first 6 steps tied at the FLOOR with reward 0.
     # eval_max_new_tokens is explicit for the same reason gsm8k's is: scoring at the
     # 512 rollout cap would measure the cap (errors/2026-09-04-the-eval-cap-measured-itself.md).
     "grpo-math-27b": dict(
-        model="qwen38-27b", rl=True, steps=100, group=8, max_new_tokens=512, lora_rank=16,
+        model="qwen38-27b", rl=True, steps=100, group=8, max_new_tokens=2048, lora_rank=16,
         micro=1, max_think_tokens=0, reward="boxed", eval_mmlu=1000, eval_n=500, lr=1e-4,
         eval_max_new_tokens=2048,
         status="pending-remote: roadmap P1, GSM8K's successor task"),

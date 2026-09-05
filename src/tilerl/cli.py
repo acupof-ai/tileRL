@@ -301,16 +301,52 @@ def _load_adapter(trainable: dict, path: str, log) -> None:
     log(f"loaded adapter {sum(v.numel() for v in saved.values()) / 1e6:.1f}M params <- {path}")
 
 
-def _write_eval_rows(run_id: str, tag: str, rows: list) -> None:
+def _write_eval_rows(run_id: str, tag: str, rows: list) -> float:
     """One JSON row per problem, so two arms over the same set can be compared
-    paired. P1 fell back to the unpaired interval because only totals were kept."""
+    paired. Returns the mean completion length. P1 fell back to the unpaired
+    interval because only totals were kept.
+
+    Creates the run directory: `_finish` makes it, and `_finish` runs AFTER both
+    eval arms, so a `not is_dir(): return` here silently wrote nothing at all --
+    which is what it did on the first MATH run.
+    """
     from .ledger import runs_root
 
     d = Path(runs_root()) / run_id
-    if not d.is_dir():
-        return
+    d.mkdir(parents=True, exist_ok=True)
     with (d / f"eval-{tag}.jsonl").open("w") as f:
         f.writelines(json.dumps(r) + "\n" for r in rows)
+    return sum(r["tokens"] for r in rows) / max(1, len(rows))
+
+
+#: the before-arm's mean completion must leave headroom under the rollout cap. 0.8
+#: rather than 1.0 because the MEAN fitting exactly means half the rollouts do not.
+_ROLLOUT_HEADROOM = 0.8
+
+
+def _refuse_short_rollouts(mean_len: float | None, cap: int, allow: bool = False) -> None:
+    """Stop before training when the rollouts cannot reach an answer.
+
+    The base policy's own completion length is measured by the before-arm that just
+    ran, so this compares two known numbers rather than guessing. Truncated rollouts
+    never emit the answer, every sample in a group scores 0, and GRPO trains on a
+    reward that is constant -- 100 steps of tied-at-the-floor groups, which looks
+    like a hard task rather than a misconfiguration (measured: MATH level 5 needs
+    1038 tokens against a 512 cap, 5 of the first 6 steps tied at 1.00, reward 0).
+
+    The mirror of it is the eval cap, which scores the cap instead of the policy
+    (errors/2026-09-04-the-eval-cap-measured-itself.md). Same family: a length
+    parameter set without measuring the length it bounds.
+    """
+    if not mean_len or allow or mean_len <= _ROLLOUT_HEADROOM * cap:
+        return
+    sys.exit(
+        f"error: the base policy averages {mean_len:.0f} completion tokens but "
+        f"--max-new-tokens is {cap}. Rollouts would be truncated before they answer, "
+        f"so every group ties at the floor and no gradient flows. Raise the cap above "
+        f"{mean_len / _ROLLOUT_HEADROOM:.0f}, pick an easier task, or pass "
+        f"--allow-short-rollouts if the truncation is deliberate."
+    )
 
 
 def _train_adapters(args: argparse.Namespace) -> None:
@@ -402,6 +438,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
         _load_adapter(trainable, args.load_adapter, log)
     optimizer = AdamW(lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
 
+    mean_len: dict[str, float] = {}
+
     def evals(tag):
         if args.eval_mmlu:
             c, n, conc = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=8)
@@ -414,7 +452,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
                                         thinking=thinking,
                                         match=MATCHERS[args.reward],
                                         per_problem=rows_out)
-            _write_eval_rows(manifest["id"], tag, rows_out)
+            mean_len[tag] = _write_eval_rows(manifest["id"], tag, rows_out)
             manifest["metrics"][f"gsm8k_{tag}"] = c
             manifest["metrics"][f"gsm8k_{tag}_tokens"] = ntok
             # tokens/correct, not tokens: the ratio is what a length claim compares
@@ -426,6 +464,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
     if args.steps == 0:
         evals("after")
         return _finish(manifest, args.json)
+    _refuse_short_rollouts(mean_len.get("before"), args.max_new_tokens,
+                           args.allow_short_rollouts)
     if args.rl:
         if rows:
             gold = {tuple(p): r["answer"] for p, r in zip(prompts, rows)}
@@ -848,6 +888,10 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="adapter.safetensors to copy into the LoRA tensors before "
                          "training/eval; refuses a file whose keys do not match. With "
                          "--steps 0 this re-scores a finished run's adapter")
+    p_train.add_argument("--allow-short-rollouts", action="store_true",
+                         help="train even when the base policy's measured completion is "
+                              "longer than --max-new-tokens; the smoke recipes want the "
+                              "truncation, a real run almost never does")
     p_train.add_argument("--eval-max-new-tokens", type=int, default=2048,
                          help="eval generation length; independent of --max-new-tokens, "
                          "which caps the ROLLOUTS. Scoring at the training cap measures "
