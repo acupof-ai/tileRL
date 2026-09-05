@@ -731,6 +731,59 @@ def test_gdn_bwd_spans_chunks():
                             max_rel=5e-5)
 
 
+
+def test_gdn_backward_precision_tracks_the_chunk_size():
+    """The gates above cannot see `_GDN_CHUNK`, so this one is written to.
+
+    `51e965e` chose 16 over upstream's 64 on a measured precision tradeoff and priced
+    it with a three-tier probe that never entered the suite. Every shipped gate sits
+    orders of magnitude away from where that decision lives: the tightest,
+    `test_gdn_bwd_spans_chunks`, allows 5e-5 while chunk 64 measures 2.7e-6 -- inside
+    by 18x, so raising the constant to 64, or to 128, leaves every test green. A gate
+    that cannot move with the value it protects is not protecting it.
+
+    Asserts the ORDERING, not an absolute bound: the absolute error is a property of
+    the machine's f32 reduction order, while "coarser chunks round worse" is the
+    property the constant was chosen on. Three seeds, because one seed put 64 below
+    32 and read like a reversal of the tradeoff -- it was noise.
+
+    Measured here, worst over seeds 0/1/2: 16 -> 3.3e-6, 32 -> 5.5e-6, 64 -> 1.1e-5.
+    """
+    def worst_rel(chunk: int, seed: int) -> float:
+        torch.manual_seed(seed)
+        b, t, nkh, nvh, kd, vd, kern = 1, 128, 2, 4, 16, 16, 4
+        rnd = lambda *s: torch.randn(*s, dtype=torch.float32)
+        q, k = rnd(b, t, nkh * kd), rnd(b, t, nkh * kd)
+        v, z = rnd(b, t, nvh * vd), rnd(b, t, nvh * vd)
+        g, beta = rnd(b, t, nvh), rnd(b, t, nvh)
+        state, grad = torch.zeros(b, nvh, kd, vd), rnd(b, t, nvh * vd)
+        kw = dict(z=z, conv1d_weight=rnd(nkh * kd * 2 + nvh * vd, kern),
+                  dt_bias=rnd(nvh), a_log=rnd(nvh), norm_weight=rnd(vd))
+        keep = reference._GDN_CHUNK
+        try:
+            # chunk 1 is the serial scan: the reduction order 51e965e measured against
+            reference._GDN_CHUNK = 1
+            ref = [x.double() for x in reference.gdn_backward(grad, q, k, v, g, beta, state, **kw)]
+            reference._GDN_CHUNK = chunk
+            got = reference.gdn_backward(grad, q, k, v, g, beta, state, **kw)
+        finally:
+            reference._GDN_CHUNK = keep
+        return max((a.double() - r).abs().max().item() / max(r.abs().max().item(), 1e-30)
+                   for a, r in zip(got, ref))
+
+    seeds = (0, 1, 2)
+    e16 = max(worst_rel(16, s) for s in seeds)
+    e64 = max(worst_rel(64, s) for s in seeds)
+    assert e16 < e64, (
+        f"chunk 16 ({e16:.2e}) is not more accurate than chunk 64 ({e64:.2e}) -- the "
+        "tradeoff 51e965e priced no longer holds, so revisit the constant rather than "
+        "this test")
+    assert reference._GDN_CHUNK <= 16, (
+        f"_GDN_CHUNK is {reference._GDN_CHUNK}; 51e965e chose 16 for precision "
+        f"(measured here: 16 -> {e16:.1e}, 64 -> {e64:.1e}). Raising it is a real "
+        "tradeoff, not a free speedup -- price it in an entry first")
+
+
 def test_gdn_bwd():
     """gdn_backward vs torch.autograd (finite differences are too noisy across the scan)."""
     q, k, v, g, beta, z, state, kw = _gdn_inputs(1, 3, 1, 1, 4, 4, 4, 24)
