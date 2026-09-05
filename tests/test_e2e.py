@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import math
 import os
+import threading
 import time
+import unittest.mock
 from dataclasses import replace
 
 os.environ.setdefault("TILERL_TARGET", "cpu")
@@ -941,6 +943,72 @@ def test_a_spill_truncated_by_a_crash_is_a_miss_not_a_raise(tmp_path, suffix):
             "the state loaded but ssd_faults is 0, so load_kv was never reached and this arm "
             "does not exercise its guard"
         )
+
+
+def test_a_spill_still_in_the_queue_is_served_from_memory(tmp_path):
+    """`resident()` is two conditions and only the `_lru` one was tested.
+
+    A spill sits in `_pending` from the moment `spill_kv` enqueues it until the daemon's
+    `torch.save` returns -- ~100 ms, and the whole point of moving the save off-tick. During
+    that window there is NO FILE. Both halves of `resident()` and both loads have a
+    pending-table branch for it; deleting the `_pending` half of the `or` leaves all 70 tests
+    in this file passing (measured), so what the tier does for the first 100 ms of every
+    entry's life was unasserted.
+
+    Getting it wrong is not a crash: `resident()` returns False, the lookup walks past a
+    prefix that is in memory, and the request re-prefills. Silent, and it is the window a
+    burst of same-prefix requests lands in.
+
+    Blocking the daemon is what makes the window observable. The queue item is taken before
+    the block, so `_pending` stays populated and no file is written -- asserted, or a
+    passing `resident()` could just be reading the disk.
+    """
+    torch.manual_seed(0)
+    toks = list(range(4 * BLOCK_TOKENS))
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+    pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    tier = KvTier(str(tmp_path), "fp-pending", min_tokens=BLOCK_TOKENS)
+    store = PrefixStore(pool, ssd=tier)
+
+    gate = threading.Event()
+    real_save = torch.save
+
+    def held_save(*a, **kw):
+        gate.wait(5)
+        return real_save(*a, **kw)
+
+    blocks = [pool.alloc_block() for _ in range(4)]
+    for i, b in enumerate(blocks):
+        pool.k_pool[:, b] = float(i + 1)
+        pool.v_pool[:, b] = float(-i - 1)
+    with unittest.mock.patch.object(torch, "save", held_save):
+        assert store.insert(toks, blocks, (state[0].clone(), state[1].clone()))
+        h = store._hash_all(tuple(toks))
+        for _ in range(500):  # the enqueue is synchronous, the daemon's pickup is not
+            if tier._pending and tier._pending_st:
+                break
+            time.sleep(0.01)
+        assert tier._pending and tier._pending_st, (
+            "nothing reached the queue, so the pending window below is not being tested"
+        )
+        d = os.path.join(str(tmp_path), "tilerl_kvtier")
+        on_disk = [f for f in os.listdir(d) if f.endswith((".kv", ".st"))]
+        assert not on_disk, (
+            f"{len(on_disk)} files are already written, so a resident() hit below could be "
+            "reading the disk rather than the pending table"
+        )
+        assert tier.resident(h), (
+            "an entry in the queue is not resident, so a lookup in the ~100 ms before the "
+            "save lands walks past a prefix that is in memory and re-prefills it"
+        )
+        cold_pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+        assert tier.load_kv(h, tuple(toks), [cold_pool.alloc_block() for _ in range(4)],
+                            cold_pool), "load_kv did not serve a pending blob"
+        assert tier.load_state(h, tuple(toks)) is not None, (
+            "load_state did not serve a pending blob"
+        )
+        gate.set()
+    _flushed(tier)
 
 
 def test_the_disk_tier_evicts_the_oldest_entry_past_its_byte_budget(tmp_path):

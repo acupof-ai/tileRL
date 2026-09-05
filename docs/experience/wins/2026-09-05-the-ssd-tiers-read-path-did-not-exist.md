@@ -32,6 +32,17 @@ to answer a question the index already answers. That same probe suppresses the
 write-back, so a fault-in does not re-spill the bytes it just read — asserted,
 `ssd_offered == 0` on the faulted arm.
 
+`resident()` is two conditions, and only the `_lru` one was tested. An entry sits in
+`_pending` from the enqueue until the daemon's `torch.save` returns — ~100 ms, and the whole
+reason the save is off-tick — and in that window there is no file, so both loads have a
+pending-table branch and `resident()` has the second half of an `or` for it. Deleting that
+half left all 70 tests passing. Getting it wrong is not a crash: the lookup walks past a
+prefix that is in memory and re-prefills, silently, in exactly the window a burst of
+same-prefix requests lands in. Now gated by blocking `torch.save`, asserting no file exists
+yet, and then asserting the probe and both loads serve from memory — three assertions with
+three separate negative controls (drop the `or` half, drop `load_kv`'s pending read, drop
+`load_state`'s; each fails only its own).
+
 Wired through `--ssd-path`, keyed on `_weight_fingerprint(cfg)`: **every**
 dataclass field, not a hand-picked list. The first draft picked seven and named
 `cfg.num_heads`, which does not exist on this config — the field is
@@ -173,6 +184,18 @@ concurrent sessions, because an empty HBM makes every lookup reach back.
 And before reporting a storage number, divide the bytes by the device's measured
 bandwidth. If the wall clock is smaller, the device was not involved — no
 arm-order control detects this, and three of them passed while it was happening.
+
+**Three of this change's four gates each covered one branch of a two-branch fact, and each
+was found by mutating rather than by reading.** The truncation test reached `load_state` only
+(`_fault_in` returns on its miss, so `load_kv`'s guard was deletable); the fingerprint test
+asserted the mismatch does not serve but never that it unlinks, which is the tier's only disk
+reclamation; the `resident()` probe was tested on `_lru` and not on `_pending`, the state
+every entry is in for its first ~100 ms. All three passed the whole suite with the untested
+branch deleted. The generalization is not "test both operands of an `or`": these were an
+early `return`, a side effect next to a return value, and an `or` — what they share is that
+one fact needs two assertions and a plausible test satisfies one. Delete each branch and
+re-run; a suite that stays green names the gap. And assert a counter only the second path
+increments — "it did not raise" is also satisfied by never getting there.
 
 ## Results
 
