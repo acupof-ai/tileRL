@@ -180,6 +180,34 @@ the tier. Two things had to be handled so that it stays a loss rather than a fau
   by cross-control: deleting `load_kv`'s guard fails `.kv` alone, deleting `load_state`'s
   fails `.st` alone.
 
+**A `drop()` inside that same window resurrects the prefix, and the guard against it had no
+test either.** `drop()` clears the pending tables and unlinks, but the daemon is already past
+that point holding the blob: its `torch.save` completes *after* the drop and rewrites the file
+the drop removed. `_flush_loop` re-checks `table.get(k) is blob` afterwards and unlinks again.
+Remove that rollback and the dropped entry comes back — `ssd_entries` 0 → 1 plus one orphan
+`.kv` on disk — and `_track_written` has indexed it, so a lookup can match a prefix the tier
+was told to forget; after an `invalidate()` that is KV from the previous weights.
+
+**The gate's own first version was inert, and its negative control passed.** It waited with
+`_flushed`, which polls the pending tables — and `drop()` had just emptied them, so the helper
+returned while the daemon was still inside `torch.save`. The second attempt waited on
+`_q.unfinished_tasks`, which never reaches 0 because nothing calls `task_done()`; that one
+worked but spent 6.46 s in a timeout, and a wait condition that cannot change is the same
+defect as one already satisfied. What works is waiting on the save actually in flight (one
+`torch.save`, not two: the state half is skipped at the `table.get(k) is not blob` check
+without ever calling save) and then polling the directory. 0.01 s, control red.
+
+**One mutation that survived is not a gap — it is redundant code.** The eviction victim search
+skips keys still in the pending tables, and deleting that skip changes no test. It is not
+untested: the skip *does* filter, 6 of 12 candidates in a forced-eviction probe (a key enters
+`_lru` when its first half lands, so it is indexed and pending at once). But orphan files,
+half pairs and unaccounted bytes all came out identical with and without it, because the
+`table.get(k) is blob` re-check plus the rollback above already cover the same race one layer
+down. Left in place; recorded so the next person does not spend the same hour writing a gate
+for a condition whose removal has no observable effect. The distinction is worth the two
+probes it took: "the suite stays green" means either a missing gate or dead weight, and only
+comparing the observable state tells you which.
+
 What is NOT claimed: no fsync on the publish path, so a host power loss can lose an entry
 the daemon believes it wrote. The tier is a cache — every entry is reconstructible by
 prefill — so durability past process death was not bought.
