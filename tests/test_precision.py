@@ -57,6 +57,34 @@ def test_on_policy_guard_refuses_cached_engines():
         run(graphed)
 
 
+
+def test_opd_refuses_a_cached_engine_with_no_adapters_too():
+    """The guard must be unconditional, not conditional on `trainable`.
+
+    `opd_loop` used to skip it when `trainable is None`, reasoning that "a frozen teacher
+    with no adapters cannot go stale". The teacher is not frozen: with no `trainable`,
+    `train_step` updates `model.params` (train.py:81) and the engine samples from that same
+    object (engine.py:320). Measured on tiny, 27 of the teacher's parameters changed within
+    two steps -- the exempt path was the one that went stale fastest.
+
+    Asserts the no-adapter call is refused, because the tree has no caller passing None
+    today and "nobody passes it" is a fact that a future caller silently reverses. The
+    other arm (with adapters) is covered above.
+    """
+    import pytest
+
+    from tilerl.cli import _build_model
+    from tilerl.engine import build_engine
+    from tilerl.testing import RefBackend
+    from tilerl.train import opd_loop
+
+    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    # Prefix store on: the same cached-engine condition the adapter arm is refused for.
+    cached = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=4)
+    with pytest.raises(ValueError, match="on-policy"):
+        opd_loop(cached, model, [[1, 2, 3]], 1, RefBackend(), trainable=None)
+
+
 def test_kernel_io_is_keyed_on_arch_not_on_being_cuda():
     """No dtype decision in backend.py may read `target.startswith("cuda")`.
 
