@@ -42,6 +42,7 @@ from .kv_cache import (
     BLOCK_TOKENS,
     BatchKv,
     DramSnapshots,
+    KvTier,
     LinearStatePool,
     NoPrefixStore,
     PagedKvPool,
@@ -1224,6 +1225,24 @@ def _fit_blocks(cfg, backend, io, cap: int, draft_layers: int = 0) -> int:
     return min(fit, cap) if cap else fit
 
 
+def _weight_fingerprint(cfg) -> str:
+    """What the spilled KV was computed under, as far as the config knows.
+
+    EVERY config field, not a hand-picked list of the ones that look load-bearing: a
+    mismatch is the only thing standing between a restart and serving KV computed under
+    other weights, and a field left out of the list is exactly how that happens. The
+    first draft of this named `cfg.num_heads`, which does not exist -- the real field is
+    `num_attention_heads` -- so the list was already wrong when it was written.
+
+    It does NOT distinguish two checkpoints of the same architecture. Pass
+    `ssd_fingerprint` explicitly when one spill directory serves both.
+    """
+    import dataclasses
+
+    fields = "-".join(f"{f.name}={getattr(cfg, f.name)!r}" for f in dataclasses.fields(cfg))
+    return f"{fields}-block{BLOCK_TOKENS}"
+
+
 def build_engine(
     cfg,
     model: Any,
@@ -1246,6 +1265,17 @@ def build_engine(
     #: so a flag would mostly be turned on below the threshold where it is 1.51x worse.
     #: `/health`'s `dram_promotions` is what says the workload crossed it.
     dram_bytes: int = 0,
+    #: directory for the SSD prefix tier; "" is off. Unlike the DRAM tier this one does
+    #: not need concurrent sessions to pay: after a restart HBM is empty, so the first
+    #: lookup of every returning conversation reaches back and the disk is what answers.
+    #: ``ssd_fingerprint`` must change whenever the weights do -- a tier serving KV
+    #: computed under other weights is silently wrong, and the fingerprint is the only
+    #: thing that stops it. Defaults to the model's shape, which does NOT cover a
+    #: different checkpoint at the same shape.
+    #: # ponytail: shape-derived fingerprint; hash the weights when two checkpoints of
+    #: #   one architecture are served from one spill dir
+    ssd_path: str = "",
+    ssd_fingerprint: str = "",
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
@@ -1331,6 +1361,10 @@ def build_engine(
         # host, not the process. 4 GiB is 28 snapshots against HBM's 9.
         if dram_bytes:
             kw["dram"] = DramSnapshots(budget_bytes=dram_bytes)
+    if ssd_path:
+        # Not gated on cuda: the tier is target-independent, and the CPU target is where
+        # its parity is checked.
+        kw["ssd"] = KvTier(ssd_path, ssd_fingerprint or _weight_fingerprint(cfg))
     store = PrefixStore(kv_pool, **kw) if prefix_store is None else prefix_store
     return Engine(
         model,
