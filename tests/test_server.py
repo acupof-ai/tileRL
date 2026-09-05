@@ -982,14 +982,29 @@ def test_v1_messages_never_answers_200_for_an_engine_failure(tmp_path, monkeypat
     from tilerl.messages import mount_messages
 
     class _Dies:
+        """Raises on the first `take` that would have returned a finished request.
+
+        `_left = 1` (let one call through, raise on the next) raced the engine loop: when
+        the request finished before the route's first poll, that first `take` returned the
+        completed tokens, `_run` left its wait loop, and the raising call never happened —
+        200 for the non-stream arm while the stream arm, whose allowance was already spent,
+        got 400. Measured at 1 in 12 runs, with exactly that signature.
+
+        Keying on the RESULT removes the race: a `take` returning None means the request is
+        still running and the route keeps waiting, which is not the moment under test; the
+        first one carrying a result is. `_DiesAfterOnePeek` above keeps the count-based form
+        deliberately — it measured 0 in 12, because it asserts a contract an unfired
+        injection still satisfies.
+        """
+
         def __init__(self, inner, exc):
-            self._inner, self._exc, self._left = inner, exc, 1
+            self._inner, self._exc = inner, exc
 
         def take(self, rid):
-            if self._left <= 0:
-                raise self._exc("injected at the engine boundary")
-            self._left -= 1
-            return self._inner.take(rid)
+            out = self._inner.take(rid)
+            if out is None:
+                return None
+            raise self._exc("injected at the engine boundary")
 
         def __getattr__(self, name):
             return getattr(self._inner, name)
