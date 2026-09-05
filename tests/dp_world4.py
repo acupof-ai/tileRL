@@ -114,6 +114,14 @@ def _dp_ref_rank(r: int, out: dict, streams: bool = False) -> None:
                      for k, v in local.params.items()})
 
 
+#: bf16 rounding steps two summation orders may differ by. 1 for AdamW, which is
+#: elementwise; Adafactor divides by a reduced sqrt statistic, so a 2.9e-07
+#: relative difference in the reduced sum-of-squares (measured, tp=2 vs tp=1)
+#: comes out amplified -- 4 ulp on 2 of 27 tensors. The defect this gate exists
+#: for is 304911 ulp, so the margin is five orders either way.
+_ULP_TOL = {False: 1.01, True: 4.01}
+
+
 def _dp_gate(no_dp: bool, streams: bool = False, scramble: bool | str = False) -> bool:
     mgr = mp.Manager()
     ref = mgr.dict()
@@ -137,7 +145,7 @@ def _dp_gate(no_dp: bool, streams: bool = False, scramble: bool | str = False) -
             d = (a.float() - b.float()).abs()
             ulp = torch.exp2(torch.floor(torch.log2(b.float().abs().clamp_min(1e-30))) - 7)
             worst = max(worst, (d / ulp).max().item())
-            if (d > ulp * 1.01).sum().item():
+            if (d > ulp * _ULP_TOL[streams]).sum().item():
                 if ok:
                     print(f"rank {r}: {k} differs from the dp=1 step by "
                           f"{(d / ulp).max().item():.1f} ulp")

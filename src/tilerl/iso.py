@@ -82,7 +82,20 @@ class ISO(_Optimizer):
     def _offloaded(self, p: torch.Tensor) -> bool:
         return p.device.type == "cuda" if self.offload is None else self.offload
 
-    def step_one(self, p: torch.Tensor, g: torch.Tensor) -> None:
+    def step_one(self, p: torch.Tensor, g: torch.Tensor, key: Any = None,
+                 sharded: int | None = None) -> None:
+        """``sharded`` is refused, not handled: this reparameterizes a 2D weight
+        by its own SVD, and a shard's singular vectors are not a slice of the
+        whole matrix's -- no reduce recovers them. Adafactor's per-tensor
+        statistics could be summed across ranks; a factorization cannot.
+        # ponytail: TP + ISO needs a distributed SVD (or frames computed once on
+        # rank 0 and sharded to match the weight); refuse until one exists.
+        """
+        if sharded is not None:
+            raise ValueError(
+                "ISO does not support tensor parallelism: it trains each 2D weight in its "
+                "own SVD frame, and a shard's SVD is not a slice of the full matrix's. "
+                "Use --optim adafactor with --tp, or tp=1.")
         if p.dim() != 2:
             self.base.step_one(p, g)
             return
