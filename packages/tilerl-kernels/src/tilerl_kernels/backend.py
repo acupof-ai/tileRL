@@ -1260,6 +1260,9 @@ class Backend:
             dist.all_reduce(t, op=dist.ReduceOp.SUM if op == "sum" else dist.ReduceOp.MAX)
             return t
 
+        # Every shard is exactly vloc wide: pad_vocab rounds the vocabulary to
+        # to*world before sharding, so there is no ragged last shard for
+        # tp_rank * vloc to skew.
         vloc = logits.shape[-1]
         return reference.cross_entropy_sharded(
             logits, input_ids, all_reduce, self.tp_rank * vloc, vloc * self.tp_world

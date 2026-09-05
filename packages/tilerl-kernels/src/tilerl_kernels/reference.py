@@ -956,6 +956,15 @@ def cross_entropy_sharded(
     b, t, vloc = logits.shape
     if t < 2:
         raise ValueError("cross_entropy_sharded needs at least two tokens")
+    # The only check that catches a wrong rank: every other symptom is a plausible
+    # loss. A shard running past the vocabulary means vocab_start was computed from
+    # the wrong tp_rank, and the target-column test below would then silently claim
+    # rows that belong to another rank (or none).
+    if vocab_start < 0 or vocab_start + vloc > vocab_total:
+        raise ValueError(
+            f"shard [{vocab_start}, {vocab_start + vloc}) runs past vocab_total="
+            f"{vocab_total}: vocab_start does not match this rank"
+        )
     g = logits if logits.dtype == torch.float32 and logits.is_contiguous() else _f32(
         logits).contiguous()
     ids = torch.as_tensor(input_ids, dtype=torch.long, device=g.device)
