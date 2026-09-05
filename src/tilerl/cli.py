@@ -334,7 +334,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
     engine = build_engine(cfg, model, backend, num_slots=8, max_batch=8, draft=draft,
                           num_blocks=-(-ctx // BLOCK_TOKENS) * 8 + 8,
                           max_total_tokens=max(ctx, 8192),
-                          spec_depth=args.depth, decode_graph=False,
+                          spec_depth=args.depth, decode_graph=True,
                           prefix_store=NoPrefixStore())
     # After build_engine: it materializes the params an adapter must point at.
     trainable = add_lora(model, rank=args.lora_rank)
@@ -382,7 +382,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
                 train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
                                     group=args.group, sampling=params, seed=args.seed,
                                     trainable=trainable, micro=args.micro,
-                                    tiebreak=tiebreak)):
+                                    tiebreak=tiebreak, recapture_graph=True)):
             hist.append((r, ce, secs, tied, ntok))
             for phase, elapsed in timings.items():
                 manifest["metrics"][phase] = manifest["metrics"].get(phase, 0.0) + elapsed
@@ -408,7 +408,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
             tokens_last=statistics.mean(h[4] for h in hist[-w:]))
     else:
         losses = train_mod.opd_loop(engine, model, prompts, args.steps, backend, optimizer,
-                                    seed=args.seed, trainable=trainable, sampling=params)
+                                    seed=args.seed, trainable=trainable, sampling=params,
+                                    recapture_graph=True)
         for i, loss in enumerate(losses):
             log(f"step {i + 1:4d}/{args.steps}  loss {loss:.4f}")
         manifest["metrics"]["ce_last"] = losses[-1]

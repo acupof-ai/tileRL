@@ -169,6 +169,11 @@
     "date": "2026-08-29",
     "tok_s": 194.73286026185278
   },
+  "train/27b-grpo-step-g8-t256/sm90": {
+    "commit": "a4a9473+98",
+    "date": "2026-09-05",
+    "secs_per_step": 34.09
+  },
   "train/tiny-b2t128/cpu": {
     "commit": "717172d",
     "date": "2026-08-29",
