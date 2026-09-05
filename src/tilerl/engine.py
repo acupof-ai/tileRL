@@ -685,6 +685,7 @@ class Engine:
                 # snapshot the sm70 budget (free/4 = 1417 MiB) holds 9 of them.
                 "prefix_evictions": store["evictions"],
                 "prefix_state_bytes": store["state_bytes"],
+                "prefix_state_bytes_budget": store.get("state_bytes_budget", 0),
                 # Present only with a host tier; a demotion is a prefix the card could not
                 # keep but did not have to lose.
                 **{k: v for k, v in store.items()

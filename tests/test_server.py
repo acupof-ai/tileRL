@@ -1113,3 +1113,36 @@ def test_serve_dram_bytes_reaches_health(dram_bytes, monkeypatch, capsys):
         assert "dram_budget" not in stats, (
             f"the tier is on without the flag: dram_budget={stats.get('dram_budget')}"
         )
+
+
+def test_health_publishes_each_ceiling_beside_its_counter(client):
+    """A counter without its ceiling cannot say whether the thing it counts is at a limit.
+
+    `prefix_state_bytes` had no bound to compare against: `state_bytes` is set from
+    `mem_get_info` at build time and is unknowable from outside, so "is the store at its
+    byte ceiling" was unanswerable over HTTP. Measured on H20 card 6 once the budget was
+    published: state bytes sat at 2.78 of 17.68 GiB (15.7%) while 27 entries were evicted,
+    which named block pressure in one run instead of four.
+
+    `blocks_used` is the ENGINE's counter -- blocks the prefix store retains belong to no
+    live request, so it reads 0 while the pool drains. `pool_used_blocks` is the pool's own
+    number and was already published; this asserts the pair stays distinguishable, because
+    reading them as the same quantity is what made `blocks_used=0/512` look like an idle
+    pool while 438 blocks were retained.
+    """
+    stats = client.get("/health").json()["stats"]
+    for fill, ceiling in (("blocks_used", "blocks_total"),
+                          ("prefix_state_bytes", "prefix_state_bytes_budget")):
+        assert fill in stats and ceiling in stats, (
+            f"{fill}/{ceiling} must both be published or pressure is unreadable; "
+            f"keys: {sorted(stats)}"
+        )
+        assert stats[ceiling] > 0, f"{ceiling}={stats[ceiling]} is not a bound"
+        assert stats[fill] <= stats[ceiling], f"{fill}={stats[fill]} > {ceiling}"
+    # The pool's count is a SECOND quantity, not blocks_used by another name: the store
+    # retains blocks that no request owns, so these two legitimately disagree.
+    assert "pool_used_blocks" in stats, sorted(stats)
+    assert stats["pool_used_blocks"] >= stats["blocks_used"], (
+        f"pool_used_blocks={stats['pool_used_blocks']} below blocks_used="
+        f"{stats['blocks_used']}: the pool cannot hold fewer blocks than requests own"
+    )
