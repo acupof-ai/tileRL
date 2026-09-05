@@ -138,6 +138,9 @@ class Backend:
 
     name = "tilelang"
     tp_world = 1
+    #: this rank's index in the TP group. #106 deleted it as unread; the sharded
+    #: cross-entropy needs it to locate its slice of the vocabulary.
+    tp_rank = 0
 
     def init_tp(self, world: int, rank: int) -> None:
         """Join the TP group; framework layers never import torch.distributed."""
@@ -148,7 +151,7 @@ class Backend:
         if not dist.is_initialized():
             comm = "nccl" if self.device.type == "cuda" else "gloo"
             dist.init_process_group(comm, world_size=world, rank=rank)
-        self.tp_world = world
+        self.tp_world, self.tp_rank = world, rank
 
     def tp_fork(self, x: torch.Tensor) -> torch.Tensor:
         """Identity forward, all-reduce backward: the dual of ``all_reduce``.
@@ -1247,7 +1250,20 @@ class Backend:
 
     def cross_entropy_loss_grad(self, logits, input_ids):
         # ponytail: torch-eager training loss, tilelang kernel when perf demands
-        return reference.cross_entropy_loss_grad(logits, input_ids)
+        if self.tp_world == 1:
+            return reference.cross_entropy_loss_grad(logits, input_ids)
+        # Vocab-parallel head: reduce to scalars per row rather than gathering the
+        # [B, T, vocab] f32 row (0.947 MiB per row, 1.89 GiB at B=8 T=256 on the 27B).
+        import torch.distributed as dist
+
+        def all_reduce(t, op):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM if op == "sum" else dist.ReduceOp.MAX)
+            return t
+
+        vloc = logits.shape[-1]
+        return reference.cross_entropy_sharded(
+            logits, input_ids, all_reduce, self.tp_rank * vloc, vloc * self.tp_world
+        )
 
     # ------------------------------------------------------------ embedding
 

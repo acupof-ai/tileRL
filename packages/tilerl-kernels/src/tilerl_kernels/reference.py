@@ -933,6 +933,61 @@ def cross_entropy_loss_grad(logits: torch.Tensor, input_ids: object) -> tuple[fl
     return float(loss), g
 
 
+def cross_entropy_sharded(
+    logits: torch.Tensor, input_ids: object, all_reduce, vocab_start: int, vocab_total: int
+) -> tuple[float, torch.Tensor]:
+    """CE over a vocab-parallel head: ``logits`` is this rank's ``[B, T, V/world]``.
+
+    Never forms the full row. All-gathering the logits to reuse the unsharded CE
+    would materialise ``[B, T, 248320]`` in f32: a row is 0.947 MiB at the 27B's
+    vocab, so 1.89 GiB per rank per step at B=8, T=256, on top of the weights and
+    the tape. Instead each rank reduces its own shard to two scalars per row, and
+    three all-reduces combine them:
+
+        m   = max_r m_r                      one all_reduce (max), [B*T]
+        s   = sum_r exp(m_r - m) * s_r       one all_reduce (sum), [B*T]
+        x[target] = sum_r picked_r           one all_reduce (sum), [B*T]
+        loss = m + log(s) - x[target]
+
+    ``all_reduce(t, op)`` sums or maxes across ranks in place. ``vocab_start`` is
+    this rank's first column in the global vocabulary; the gradient comes back
+    sharded, which is what the sharded weight wants.
+    """
+    b, t, vloc = logits.shape
+    if t < 2:
+        raise ValueError("cross_entropy_sharded needs at least two tokens")
+    g = logits if logits.dtype == torch.float32 and logits.is_contiguous() else _f32(
+        logits).contiguous()
+    ids = torch.as_tensor(input_ids, dtype=torch.long, device=g.device)
+    tgt = torch.full((b, t), -1, dtype=torch.long, device=g.device)
+    tgt[:, :-1] = ids[:, 1:]  # -1 marks the last column, which predicts nothing
+    tgt = tgt.reshape(-1)
+    flat = g.reshape(b * t, vloc)
+    keep = tgt >= 0
+
+    # The target column lives on exactly one rank; every other rank contributes 0
+    # and the sum over ranks picks the right one.
+    local = (tgt - vocab_start).clamp(0, vloc - 1)
+    mine = keep & (tgt >= vocab_start) & (tgt < vocab_start + vloc)
+    picked = torch.where(mine, flat.gather(-1, local.unsqueeze(-1)).squeeze(-1),
+                         flat.new_zeros(()))
+    all_reduce(picked, "sum")
+
+    m = flat.amax(-1)
+    all_reduce(m, "max")
+    flat.sub_(m.unsqueeze(-1)).exp_()
+    s = flat.sum(-1)
+    all_reduce(s, "sum")
+
+    n = float(b * (t - 1))
+    loss = torch.where(keep, m + s.log() - picked, s.new_zeros(())).sum() / n
+    flat.div_(s.unsqueeze(-1) * n)
+    # softmax - onehot, but only on the rank that owns the target column.
+    flat.scatter_add_(-1, local.unsqueeze(-1), mine.to(flat.dtype).unsqueeze(-1).mul_(-1.0 / n))
+    g[:, -1] = 0.0
+    return float(loss), g
+
+
 def state_gather(states, windows, slots, layer_idx, parity=None):
     """Gather one recurrent-state layer for a batch of slots; ``parity`` [S]
     picks the live conv-window plane of the double-buffered pool."""
