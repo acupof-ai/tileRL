@@ -21,10 +21,12 @@ import torch.multiprocessing as mp
 sys.path[:0] = ["src", "packages/tilerl-kernels/src"]
 
 
-def _run(rank: int, world: int, no_fork: bool, out: dict) -> None:
+def _run(rank: int, world: int, no_fork: bool, tie: bool, out: dict) -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29517")
     os.environ["TILERL_TARGET"] = "cpu"
+
+    from dataclasses import replace
 
     from tilerl import model as model_mod
     from tilerl.autograd import RecordingBackend, Tape
@@ -38,7 +40,9 @@ def _run(rank: int, world: int, no_fork: bool, out: dict) -> None:
 
         m._tp_fork = lambda backend, x: x
 
-    cfg = tiny()
+    # tiny() ties the head, so tie=False is the ONLY arm that runs the
+    # vocab-parallel lm_head -- the branch the 27B takes.
+    cfg = tiny() if tie else replace(tiny(), tie_word_embeddings=False)
     full = model_mod.build_random(cfg, seed=0, keep_master=True)
     backend = RefBackend()
 
@@ -66,22 +70,23 @@ def _run(rank: int, world: int, no_fork: bool, out: dict) -> None:
                  if (g := grads.get(id(v))) is not None}
 
 
-def main() -> int:
-    no_fork = "--no-fork" in sys.argv
+def _one(no_fork: bool, tie: bool) -> tuple[bool, int]:
+    from dataclasses import replace
+
     from tilerl.config import tiny
     from tilerl.tensor_parallel import shard_params
 
     mgr = mp.Manager()
 
     one: dict = {}
-    _run(0, 1, no_fork, one)
+    _run(0, 1, no_fork, tie, one)
     ref = {k: torch.tensor(v).reshape(s) for k, (v, s) in one[0].items()}
     assert ref, "world=1 produced no gradients at all"
 
     two = mgr.dict()
-    mp.spawn(_run, args=(2, no_fork, two), nprocs=2, join=True)
+    mp.spawn(_run, args=(2, no_fork, tie, two), nprocs=2, join=True)
 
-    cfg = tiny()
+    cfg = tiny() if tie else replace(tiny(), tie_word_embeddings=False)
     ok, compared = True, 0
     for r in (0, 1):
         got = {k: torch.tensor(v).reshape(s) for k, (v, s) in two[r].items()}
@@ -112,13 +117,29 @@ def main() -> int:
                       f"sum-ratio={ratio:.4f}")
                 ok = False
 
-    print(f"compared {compared} gradient tensors across 2 ranks")
-    if no_fork:
-        # The control must FAIL. A control that passes is not a control.
-        print("negative control:", "correctly FAILED" if not ok else "PASSED -- vacuous gate")
-        return 0 if not ok else 1
-    print("TP-2 gradients match TP-1" if ok else "TP-2 gradients DIFFER from TP-1")
-    return 0 if ok else 1
+    return ok, compared
+
+
+def main() -> int:
+    no_fork = "--no-fork" in sys.argv
+    rc = 0
+    for tie in (True, False):
+        head = "tied head" if tie else "vocab-parallel head"
+        ok, compared = _one(no_fork, tie)
+        print(f"[{head}] compared {compared} gradient tensors across 2 ranks: "
+              + ("match" if ok else "DIFFER"))
+        if no_fork:
+            # The control must FAIL on both arms. A control that passes is not one.
+            if ok:
+                print(f"[{head}] negative control PASSED -- vacuous gate")
+                rc = 1
+        elif not ok:
+            rc = 1
+    if no_fork and rc == 0:
+        print("negative control: correctly FAILED on both head layouts")
+    elif rc == 0:
+        print("TP-2 gradients match TP-1 on both head layouts")
+    return rc
 
 
 if __name__ == "__main__":
