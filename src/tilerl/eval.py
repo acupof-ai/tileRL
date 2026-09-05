@@ -10,6 +10,8 @@ import random
 import re
 from typing import Any
 
+from .math_answer import boxed_match
+
 LETTERS = "ABCD"
 _NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 
@@ -100,10 +102,28 @@ def mmlu_accuracy(engine: Any, tok: Any, n: int, seed: int = 0,
     return sum(p == g for p, g in zip(preds, golds)), len(preds), concurrency
 
 
+#: `--reward` name -> the one matcher that scores it. The training reward and the
+#: eval both read this, so they cannot disagree -- they did once, the reward on
+#: \boxed{} and the eval on the last number, which scores `\frac{3}{2}` correct
+#: against `\frac{1}{2}`. A new reward adds a row and cannot ship half-wired.
+MATCHERS = {"number": answer_match, "boxed": boxed_match}
+
+
 def gsm8k_accuracy(engine: Any, tok: Any, rows: list[dict], sampling: Any,
-                   concurrency: int = 8, thinking: bool | None = None) -> tuple[int, int, int]:
+                   concurrency: int = 8, thinking: bool | None = None,
+                   match: Any = None, per_problem: list | None = None,
+                   ) -> tuple[int, int, int]:
     """(correct, total, completion tokens) on ``rows`` ({prompt, answer}), greedy
     under ``sampling``.
+
+    ``match`` defaults to ``answer_match`` (last number). On MATH it must be
+    ``math_answer.boxed_match``: last_number reads `\\frac{3}{2}` and `\\frac{1}{2}`
+    as the same answer, 2, so a wrong rollout scores correct -- measured. The
+    training reward already switched on ``--reward boxed`` while this did not.
+
+    ``per_problem`` receives one dict per row. Two arms over the same problems can
+    only get a paired interval if which problem went which way was written down;
+    P1's GSM8K comparison fell back to the wider unpaired one for want of it.
 
     ``sampling`` must NOT be the rollout's: at the training cap this scores the cap
     rather than the policy (38.4% with mean completion 238.7 against a 256 cap, and
@@ -117,8 +137,13 @@ def gsm8k_accuracy(engine: Any, tok: Any, rows: list[dict], sampling: Any,
 
     from .prompt import render_chat
 
+    scorer = match or answer_match
     prompts = [render_chat([("user", r["prompt"])], thinking) for r in rows]
     ids = generate_ids(engine, tok, prompts, replace(sampling, temperature=0.0), concurrency)
     texts = [tok.decode(i) for i in ids]
-    correct = sum(answer_match(t, r["answer"]) for t, r in zip(texts, rows))
-    return correct, len(rows), sum(len(i) for i in ids)
+    hits = [bool(scorer(t, r["answer"])) for t, r in zip(texts, rows)]
+    if per_problem is not None:
+        per_problem.extend(
+            {"i": i, "correct": h, "tokens": len(d), "answer": r["answer"]}
+            for i, (h, d, r) in enumerate(zip(hits, ids, rows)))
+    return sum(hits), len(rows), sum(len(i) for i in ids)
