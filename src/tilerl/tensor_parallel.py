@@ -140,6 +140,15 @@ def zigzag_key_positions(seq_len: int, cp: int) -> torch.Tensor:
     return torch.cat([zigzag_positions(seq_len, cp, r) for r in range(cp)])
 
 
+def zigzag_chunk_ids(cp: int, cp_rank: int) -> list[int]:
+    """The sequence-order chunk indices this rank holds: ``r`` and ``2cp-1-r``.
+
+    The scan and the conv halo both index by CHUNK, not by rank -- which rank
+    holds a chunk is free, so long as the composition runs in sequence order.
+    """
+    return [cp_rank, 2 * cp - 1 - cp_rank]
+
+
 def pad_vocab(vocab: int, world: int, to: int = 64) -> int:
     """Vocab rounded up so the TP divide is exact; trim ``logits[:, :vocab]`` after the gather."""
     step = to * world
