@@ -32,8 +32,8 @@ hand sample of level 5, a different set entirely.
 **Neither number was wrong; the comparison was.** The recipe comment put them in
 the same sentence, which is what made the gap look like a model result.
 
-The file itself carries no level column — `mk_math.py` writes only `prompt` and
-`answer` — so nothing downstream could have caught it. The name was the only
+The file itself carries no level column — `scripts/math_jsonl.py` writes only `prompt`
+and `answer` — so nothing downstream could have caught it. The name was the only
 claim about the contents, and a name is not a measurement.
 
 The same build produced the "mean completion on level 5 is 1038 tokens" line.
@@ -59,6 +59,6 @@ source is one query.** Verify the filter actually applied before quoting an
 accuracy against an expectation from a different set. When a measured number
 misses expectation by 34 points, the file is a cheaper hypothesis than the model.
 
-And a derived dataset should carry the field it was filtered on. `mk_math.py`
+And a derived dataset should carry the field it was filtered on. `scripts/math_jsonl.py`
 reads `level`, filters on it, then drops it — so the one fact that distinguishes
 these four files exists nowhere in their output.
