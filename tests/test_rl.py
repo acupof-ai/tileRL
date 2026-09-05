@@ -433,3 +433,121 @@ def test_every_adapter_receives_a_gradient():
                               needs={id(v) for v in adapters.values()})
         dead = sorted(k for k, v in adapters.items() if id(v) not in grads)
         assert not dead, f"fp4={fp4}: {len(dead)} adapters never receive a gradient: {dead[:4]}"
+
+
+def test_the_eval_is_not_scored_at_the_rollout_cap(tmp_path, monkeypatch):
+    """Scoring the policy at the training cap measures the cap, not the policy.
+
+    `cmd_train` built ONE SamplingParams from --max-new-tokens and handed it to both
+    the rollouts and `gsm8k_accuracy`, so a run trained at 256 was also evaluated at
+    256: 38.4% with mean completion 238.7, against ~82.5% uncapped
+    (errors/2026-09-04-the-eval-cap-measured-itself.md, documented and unfixed).
+
+    The gate captures the max_new_tokens gsm8k_accuracy is HANDED. Asserting the flag
+    parsed would pass without the wiring, and asserting on completion lengths would
+    need a model long-winded enough to reach the cap -- the tiny model is not.
+    """
+    import contextlib
+    import json
+
+    from tilerl import cli
+    from tilerl import eval as eval_mod
+
+    data = tmp_path / "d.jsonl"
+    data.write_text(json.dumps({"prompt": "2+2?", "answer": "4"}) + "\n")
+    seen = {}
+    real = eval_mod.gsm8k_accuracy
+
+    def spy(engine, tok, rows, sampling, **kw):
+        seen["eval_cap"] = sampling.max_new_tokens
+        return real(engine, tok, rows, sampling, **kw)
+
+    # cli.py imports gsm8k_accuracy into cmd_train's LOCAL scope at call time, so
+    # there is no module attribute to patch -- patch the source module instead.
+    monkeypatch.setattr("tilerl.eval.gsm8k_accuracy", spy)
+    monkeypatch.setattr("tilerl.ledger.runs_root", lambda: tmp_path)
+    with contextlib.suppress(SystemExit):
+        cli.cmd_train(cli._build_parser().parse_args(
+            ["train", "--rl", "--steps", "1", "--group", "2", "--lora-rank", "2",
+             "--max-new-tokens", "4", "--eval-max-new-tokens", "64",
+             "--data", str(data), "--eval-gsm8k", str(data)]))
+    assert seen, "gsm8k_accuracy was never called"
+    assert seen["eval_cap"] == 64, (
+        f"the eval ran at max_new_tokens={seen['eval_cap']}, the ROLLOUT cap; "
+        "the eval measures the cap rather than the policy")
+
+
+def test_a_loaded_adapter_actually_changes_the_output(tmp_path, monkeypatch):
+    """A loader that attaches nothing re-scores the BASE model and returns a clean
+    number under a trained run's name -- the same failure shape as the dead adapters
+    in #98, where 32 tensors were carried, optimized and saved without ever being read.
+
+    So the gate is behavioural, not structural: greedy-decode the same prompt with and
+    without the loaded adapter and require the token sequences to differ. The adapter
+    is trained for a few real steps rather than filled with noise, so "differs" means
+    the trained weights reached the forward, not that random values broke it.
+    """
+    import contextlib
+    import json
+
+    from safetensors.torch import load_file
+
+    from tilerl import cli
+
+    data = tmp_path / "d.jsonl"
+    data.write_text(json.dumps({"prompt": "2+2?", "answer": "4"}) + "\n")
+    monkeypatch.setattr("tilerl.ledger.runs_root", lambda: tmp_path)
+    # No --data, so cmd_train takes its DENSE reward (fraction of tokens below
+    # vocab/2, cli.py:363) instead of exact-match on a gold answer. Exact-match on a
+    # tiny random model scores 0 for every rollout, every group ties,
+    # group_advantages returns zeros, and lora_b never leaves its zero init -- the
+    # adapter would be an exact no-op and `differs` would fail for a reason that has
+    # nothing to do with the loader. --recipe grpo-tiny-smoke is what allows no --data.
+    argv = ["train", "--rl", "--recipe", "grpo-tiny-smoke", "--model", "tiny",
+            "--steps", "4", "--group", "4", "--lora-rank", "2",
+            "--max-new-tokens", "6", "--lr", "0.5"]
+    with contextlib.suppress(SystemExit):
+        cli.cmd_train(cli._build_parser().parse_args(argv))
+    run = next(p for p in tmp_path.iterdir() if (p / "manifest.json").exists())
+    saved = run / "adapter.safetensors"
+    assert saved.exists(), "no adapter to load"
+    # lora_b SPECIFICALLY: it inits to zero, so y + B(Ax) == y until it moves. A
+    # nonzero lora_a proves only that add_lora ran.
+    got = load_file(str(saved))
+    assert any(v.abs().max() > 0 for k, v in got.items() if k.endswith(".lora_b")), (
+        "every lora_b is still zero, so the adapter is an exact no-op and this test "
+        "could not tell a working loader from a broken one")
+
+    def decode(load: str | None) -> list[int]:
+        from tilerl_kernels.backend import get_backend
+
+        from tilerl.cli import _build_engine, _build_model
+        from tilerl.engine import SamplingParams
+        from tilerl.model import add_lora
+
+        cfg, model = _build_model("tiny", seed=0, keep_master=False)
+        engine = _build_engine(cfg, model, get_backend())
+        trainable = add_lora(model, rank=2)
+        if load:
+            cli._load_adapter(trainable, load, lambda *a, **k: None)
+        rid = engine.submit([1, 2, 3, 4], SamplingParams(max_new_tokens=8, temperature=0.0))
+        for _ in range(64):
+            engine.step()
+            if rid in (done := engine.poll()):
+                return list(done[rid])
+        raise AssertionError("decode never finished")
+
+    assert decode(None) != decode(str(saved)), (
+        "the loaded adapter did not change the output: it was not attached to the "
+        "tensors the forward reads, so an eval would re-score the base model")
+
+    # And a file that does not match is refused, not silently partially applied.
+    import torch
+    from safetensors.torch import save_file
+
+    bad = tmp_path / "bad.safetensors"
+    good = load_file(str(saved))
+    save_file({**good, "layers.0.q_proj.scale.lora_a": torch.zeros(2, 2)}, str(bad))
+    with contextlib.suppress(SystemExit):
+        decode(str(bad))
+        raise AssertionError("an adapter with an unknown key was accepted")

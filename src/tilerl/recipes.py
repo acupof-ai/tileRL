@@ -13,13 +13,16 @@ RECIPES: dict[str, dict] = {
         lr=0.05, status="cpu: tests/test_recipes.py"),
     # docs/roadmap.md P1. Pass --data gsm8k_train.jsonl --eval-gsm8k gsm8k_test.jsonl.
     # lr: the CLI default of 1e-3 flattens the reward from step 9 on; 1e-4 does not.
+    # eval_max_new_tokens 2048 is the protocol the published before/after numbers
+    # were scored under; it must not follow max_new_tokens, which caps the rollouts.
     "grpo-gsm8k-27b": dict(
         model="qwen38-27b", rl=True, steps=100, group=8, max_new_tokens=256, lora_rank=16,
         micro=1, max_think_tokens=0, eval_mmlu=1000, eval_n=500, lr=1e-4,
+        eval_max_new_tokens=2048,
         status="pending-remote: roadmap P1"),
     "opd-gsm8k-27b": dict(
         model="qwen38-27b", opd=True, steps=100, max_new_tokens=256, lora_rank=16,
-        eval_mmlu=1000, eval_n=500,
+        eval_mmlu=1000, eval_n=500, eval_max_new_tokens=2048,
         status="pending-remote: roadmap P1"),
     # docs/roadmap.md P3, the SFT half: full-parameter ISO vs Adafactor.
     "sft-iso-27b": dict(model="qwen38-27b", optim="iso", steps=100,
