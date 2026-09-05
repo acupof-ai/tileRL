@@ -28,7 +28,7 @@ from tilerl.engine import (
     _step_seed,
     build_engine,
 )
-from tilerl.kv_cache import NoPrefixStore, PagedKvPool, PrefixStore
+from tilerl.kv_cache import DramSnapshots, NoPrefixStore, PagedKvPool, PrefixStore
 from tilerl.model import add_lora, build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
 from tilerl.testing import RefBackend
@@ -527,6 +527,178 @@ def test_a_chunk_end_off_the_bucket_still_restores_an_exact_state():
         f"a chunk end off the {_PREFILL_BUCKET} bucket restored an inexact state: max|delta| "
         f"{(hit_state - ref_state).abs().max():.3e} — then the publish gate must test the "
         f"bucket, not {BLOCK_TOKENS}"
+    )
+
+
+def test_the_dram_tier_pays_only_above_its_session_count():
+    """The tier's condition is `concurrent sessions > HBM snapshot budget`, both operands.
+
+    A demotion takes the LRU snapshot and a lookup wants the MRU one, so within ONE
+    conversation they never meet — measured on the V100, 43 demotions and 0 promotions,
+    and 1.51x worse wall clock for it. Across conversations the LRU end IS another
+    session's newest entry, so the tier starts paying as soon as sessions outnumber the
+    budget. Rotating N conversations against a 9-snapshot budget: 2 -> 0 promotions,
+    4 -> 0, 9 -> 17, 12 -> 24, 20 -> 40.
+
+    Both halves are asserted here because either alone reads as a law: I published
+    "structurally dead" off a sweep that held sessions at 2, which is the same relation
+    with the wrong operand pinned. The below-threshold arm is what stops that from
+    happening again.
+    """
+    torch.manual_seed(0)
+
+    def snap(i: int):
+        return (torch.randn(3, 4, 8, 8) + i, torch.randn(3, 2, 16))
+
+    one = sum(t.nbytes for t in snap(0))
+    budget = 9
+
+    def rotate(nconv: int, dram):
+        pool = PagedKvPool(8192, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+        store = PrefixStore(pool, state_bytes=budget * one, dram=dram)
+        convs = [list(range(c * 2000, c * 2000 + 800)) for c in range(nconv)]
+        hits = 0
+        for turn in range(3):
+            for toks in convs:
+                length = (turn + 1) * BLOCK_TOKENS * 3
+                if store.lookup(toks[:length]):
+                    hits += 1
+                for end in range(BLOCK_TOKENS * 3, length + 1, BLOCK_TOKENS * 3):
+                    store.insert(
+                        toks[:end],
+                        [pool.alloc_block() for _ in range(end // BLOCK_TOKENS)],
+                        snap(end),
+                    )
+        return hits, store.stats()
+
+    # Below the threshold the tier must not even engage: two sessions fit in nine.
+    _, few = rotate(2, DramSnapshots(budget_bytes=400 * one))
+    assert few["dram_promotions"] == 0, (
+        f"2 sessions against a {budget}-snapshot budget promoted "
+        f"{few['dram_promotions']}; nothing should have been demoted to promote"
+    )
+
+    # Above it, the tier is the difference between no reuse and complete reuse.
+    plain_hits, plain = rotate(12, None)
+    tier_hits, tier = rotate(12, DramSnapshots(budget_bytes=400 * one))
+    assert plain["evictions"] > 0, (
+        "the no-tier arm evicted nothing, so 12 sessions did not exceed the budget and "
+        "this comparison has no floor"
+    )
+    assert tier["dram_promotions"] > 0, (
+        f"12 sessions promoted nothing (demotions={tier['dram_demotions']}); the tier "
+        "never served a snapshot back and the hit count below cannot be its doing"
+    )
+    assert tier_hits > plain_hits, (
+        f"the tier bought no hits at 12 sessions: {tier_hits} against {plain_hits}"
+    )
+
+
+def test_the_dram_tier_demotes_instead_of_evicting():
+    """Under `state_bytes` pressure the snapshot goes to the host and the entry stays.
+
+    The snapshot is what binds, not the KV: 144 MiB at 27B against 2.125 MiB per block,
+    and `build_engine` sets `state_bytes` to a quarter of free memory. Measured on the
+    live V100: 54 published, **43 evicted with 64% of the block pool still free** — every
+    eviction was state bytes, and every one of them threw away a reusable prefix for a
+    byte the host could have held.
+
+    Same pressure, both arms, six prefixes inserted against room for two snapshots:
+
+    | arm | entries | evictions | hits |
+    |---|---:|---:|---:|
+    | no tier | 2 | 4 | 2/6 |
+    | DRAM | 6 | 0 | 6/6 |
+
+    The round trip is asserted with `torch.equal`, not `allclose`: a pinned host copy and
+    a copy back is a byte-for-byte move, so anything less than exact means the tier
+    reshaped or re-dtyped the snapshot on the way through.
+    """
+    torch.manual_seed(0)
+
+    def snap(i: int):
+        return (torch.randn(3, 4, 8, 8) + i, torch.randn(3, 2, 16))
+
+    one = sum(t.nbytes for t in snap(0))
+
+    def run(dram):
+        pool = PagedKvPool(256, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+        store = PrefixStore(pool, state_bytes=2 * one, dram=dram)
+        toks = list(range(400))
+        kept = {}
+        for k in range(1, 7):
+            length = k * BLOCK_TOKENS * 2
+            kept[length] = snap(k)
+            store.insert(
+                toks[:length],
+                [pool.alloc_block() for _ in range(length // BLOCK_TOKENS)],
+                kept[length],
+            )
+        return store, toks, kept
+
+    plain, toks, _ = run(None)
+    assert plain.stats()["evictions"] >= 1, (
+        "the no-tier arm evicted nothing, so state_bytes pressure was never reached and "
+        "the comparison below has no floor"
+    )
+    plain_hits = sum(1 for k in range(1, 7) if plain.lookup(toks[: k * BLOCK_TOKENS * 2]))
+
+    tiered, toks, kept = run(DramSnapshots(budget_bytes=50 * one))
+    st = tiered.stats()
+    assert st["demoted"] >= 1, (
+        f"nothing was demoted (dram_demotions={st['dram_demotions']}), so this passes for "
+        "the same reason a store with no pressure would"
+    )
+    assert st["evictions"] == 0, (
+        f"the tier still evicted {st['evictions']} entries; demotion is supposed to "
+        f"relieve state-byte pressure without giving up a prefix"
+    )
+    tiered_hits = 0
+    for length, want in kept.items():
+        hit = tiered.lookup(toks[:length])
+        assert hit is not None and hit.length == length, f"lost the prefix at {length}"
+        tiered_hits += 1
+        for got, expect in zip(hit.state, want):
+            assert torch.equal(got, expect), (
+                f"the snapshot at {length} came back changed: max|delta| "
+                f"{(got - expect).abs().max():.3e}"
+            )
+    assert tiered_hits > plain_hits, (
+        f"the tier bought nothing: {tiered_hits}/6 hits against {plain_hits}/6 without it"
+    )
+
+
+def test_a_promotion_that_comes_back_empty_is_a_miss():
+    """A snapshot the tier dropped must not serve its blocks anyway.
+
+    Adopting KV for N tokens with no recurrent state runs the GDN layers from zero over
+    KV that is not zero. It is wrong and it is silent — the earlier truncated-entry bug
+    was byte-identical in output with the snapshot's norm off by 1.86x — so the entry is
+    dropped and the lookup falls through to shorter prefixes or misses.
+    """
+    torch.manual_seed(0)
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+    one = sum(t.nbytes for t in state)
+    pool = PagedKvPool(256, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    # DRAM holds one snapshot, HBM none: inserting two demotes the first, then the tier's
+    # own byte LRU drops it when the second arrives.
+    dram = DramSnapshots(budget_bytes=one)
+    store = PrefixStore(pool, state_bytes=0, dram=dram)
+    toks = list(range(200))
+    for length in (BLOCK_TOKENS * 2, BLOCK_TOKENS * 4):
+        store.insert(
+            toks[:length],
+            [pool.alloc_block() for _ in range(length // BLOCK_TOKENS)],
+            (state[0].clone(), state[1].clone()),
+        )
+    assert dram.drops >= 1, (
+        f"the tier dropped nothing (drops={dram.drops}), so no lookup below hits the "
+        "empty-promotion path and this test is inert"
+    )
+    hit = store.lookup(toks[: BLOCK_TOKENS * 2])
+    assert hit is None or hit.state is not None, (
+        "a hit came back with blocks and no snapshot; the caller would prefill the GDN "
+        "layers from a zero state over non-zero KV"
     )
 
 
