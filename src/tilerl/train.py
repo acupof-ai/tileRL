@@ -365,6 +365,7 @@ def opd_loop(
     trainable: dict[str, Any] | None = None,
     ema_decay: float = 0.999,
     sampling: Any = None,
+    recapture_graph: bool = False,
 ) -> list[float]:
     """On-policy distillation: the teacher engine generates a completion, the
     student takes one :func:`train_step` on prompt + completion. With
@@ -374,7 +375,9 @@ def opd_loop(
     # and the engine samples from that same object, so the no-adapter teacher is the one
     # that goes stale fastest -- measured on tiny, 27 of the teacher's parameters changed
     # within two steps. The exemption this replaces claimed the opposite.
-    _require_on_policy(teacher_engine)
+    _require_on_policy(teacher_engine, recapture_graph)
+    if recapture_graph:
+        teacher_engine.invalidate_weights()
     if optimizer is None:
         optimizer = AdamW(lr=1e-3)
     if sampling is None:
@@ -401,6 +404,10 @@ def opd_loop(
             for k, e in ema.items():
                 student[k].copy_(trainable[k])
                 e.mul_(ema_decay).add_(trainable[k], alpha=1.0 - ema_decay)
+        if recapture_graph:
+            # The teacher's weights are swapped every step (ema <-> student above),
+            # so a graph traced on either set replays the wrong policy.
+            teacher_engine.invalidate_weights()
     return losses
 
 

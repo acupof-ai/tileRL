@@ -551,3 +551,51 @@ def test_a_loaded_adapter_actually_changes_the_output(tmp_path, monkeypatch):
     with contextlib.suppress(SystemExit):
         decode(str(bad))
         raise AssertionError("an adapter with an unknown key was accepted")
+
+
+def test_the_training_engine_keeps_its_decode_graph(tmp_path, monkeypatch):
+    """The graph is 2.16x on the 27B RL step, and the flag that buys it is one word.
+
+    `cmd_train` built its engine with `decode_graph=False` because a graph traced on
+    old weights replays the old policy silently. #94 made that recoverable --
+    `recapture_graph=True` clears the graphs after every update -- and the card
+    measured what it is worth: 73.62 -> 34.09 s/step, a 100-step run 123 -> 57 min
+    (wins/2026-09-05-recapture-after-update.md).
+
+    Both halves are asserted because either alone is a silent regression: graphs on
+    without the waiver raises, and the waiver without graphs on is a no-op that
+    still reads as "recapture is enabled".
+    """
+    import contextlib
+    import json
+
+    from tilerl import cli
+    from tilerl import engine as engine_mod
+    from tilerl import train as train_mod
+
+    data = tmp_path / "d.jsonl"
+    data.write_text(json.dumps({"prompt": "2+2?", "answer": "4"}) + "\n")
+    seen = {}
+    real_build, real_loop = engine_mod.build_engine, train_mod.grpo_loop
+
+    def spy_build(*a, **kw):
+        seen["decode_graph"] = kw.get("decode_graph")
+        return real_build(*a, **kw)
+
+    def spy_loop(*a, **kw):
+        seen["recapture_graph"] = kw.get("recapture_graph")
+        return real_loop(*a, **kw)
+
+    monkeypatch.setattr("tilerl.engine.build_engine", spy_build)
+    monkeypatch.setattr("tilerl.train.grpo_loop", spy_loop)
+    monkeypatch.setattr("tilerl.ledger.runs_root", lambda: tmp_path)
+    with contextlib.suppress(SystemExit):
+        cli.cmd_train(cli._build_parser().parse_args(
+            ["train", "--rl", "--steps", "1", "--group", "2", "--lora-rank", "2",
+             "--max-new-tokens", "4", "--data", str(data)]))
+    assert seen.get("decode_graph") is True, (
+        f"the training engine was built with decode_graph={seen.get('decode_graph')}; "
+        "the RL step pays 2.16x for that")
+    assert seen.get("recapture_graph") is True, (
+        "grpo_loop was not told to recapture, so a kept graph would replay the "
+        "weights it was traced on")

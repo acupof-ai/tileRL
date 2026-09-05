@@ -58,22 +58,38 @@ matching names, so a new dead target nobody anticipated fails it too. Two
 negative controls, each failing on its own — reverting the sidecar guard leaves
 30 dead, reverting only the `.conv1d` exclusion leaves 2.
 
-## What this does NOT establish
+## The 27B number, reconciled
 
-**The 27B number is unreconciled.** Applying the pre-fix rule to `param_specs` at
-rank 16 predicts 200.8 M adapter params (132.7 M live, 68.1 M dead), but
-[the thinking cap](../wins/2026-09-04-the-thinking-cap.md) records the real run's
-adapter as **170.8 M / 341 MB** — a 30.0 M gap. The formula reproduces
-`add_lora` exactly on a tiny build (15028 == 15028), so the gap is in the 27B
-parameter set, not the arithmetic: `load_hf` may not produce what `param_specs`
-describes. No checkpoint is reachable from this machine, so the dead share on the
-27B is **an estimate, not a measurement**, and every published adapter-params
-number stays suspect until someone counts the keys of a real run's
-`adapter.safetensors` and buckets them by `.scale`/`.conv1d`.
+Counted from a real run's `adapter.safetensors`
+(`/work/tilerl-p1/runs/1fa1e58388a2`, 341 741 400 bytes, 2086 keys), bucketed by
+the stem the LoRA hangs off:
 
-Nothing in the tree loads `adapter.safetensors` back — only a test reads it — so
-no loader was written to reject the stale files. A run's adapter from before this
-fix simply carries keys that a post-fix run does not.
+| | predicted | measured |
+|---|---:|---:|
+| live | 132.7 M | **125.25 M** (1462 keys) |
+| dead `.scale` | — | 37.65 M (528 keys) |
+| dead `.conv1d` | — | 7.87 M (96 keys) |
+| dead, total | 68.1 M | **45.52 M** (624 keys) |
+| total | 200.8 M | **170.76 M** |
+
+The thinking cap's 170.8 M / 341 MB was right; the whole 30.0 M gap was in the
+prediction. Dead share 26.6% measured against 33.9% predicted.
+
+**The estimate was biased, not noisy.** Both buckets missed in the same
+direction — live by 7.5 M, dead by 22.6 M — because the formula rounded up per
+key and multiplied by a key count nobody had verified against a checkpoint. A
+component-wise error that is positive everywhere is a method fault; 200.8 M is
+struck rather than kept as one end of a range.
+
+This run launched from `91977a8`, before the fix landed at `863a257`, so those
+624 dead adapters are **in this checkpoint** — carried through 100 steps, each
+with two AdamW moments. That is what makes the loader gate behavioural rather
+than structural: the file parsing proves nothing when 528 of its keys were never
+going to attach, so `test_a_loaded_adapter_actually_changes_the_output` decodes
+with and without and requires the tokens to differ.
+
+Nothing in the tree loaded `adapter.safetensors` back when this was written; the
+loader and that gate landed in #104.
 
 ## Rule
 
