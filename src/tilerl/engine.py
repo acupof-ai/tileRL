@@ -930,6 +930,25 @@ class Engine:
                 break  # capture failed: graphs are off now
         return len(self._decode_graphs)
 
+    def invalidate_weights(self) -> int:
+        """Drop everything computed under the previous weights; return graphs dropped.
+
+        An optimizer step makes both caches lie: a captured graph replays the
+        forward as it was traced, and a cached prefix serves KV from the old
+        policy. Both are silent -- nothing raises, the rollout is just off-policy
+        -- which is why ``_require_on_policy`` refuses an engine carrying either.
+        Calling this after each update is what lets a training engine keep them.
+
+        The graphs are dropped rather than re-traced here: the next tick that
+        needs one captures it, so a bucket the run never reaches costs nothing.
+        """
+        n = len(self._decode_graphs)
+        self._decode_graphs.clear()
+        # The pool owns the captured memory; a new pool per invalidation would
+        # leak one arena per step.
+        self._prefix.clear()
+        return n
+
     def _run_decode_graph(self, reqs: list[_Req], chains=None) -> bool:
         """Captured decode for a pure-decode tick, one graph per size bucket (a
         graph per exact size OOMed B=64 on the drain). Returns False and flips

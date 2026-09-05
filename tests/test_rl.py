@@ -343,3 +343,60 @@ def test_the_gsm8k_eval_reports_the_tokens_it_spent():
     # tiny never emits EOS, so every completion runs to max_new_tokens: 2 x 12 exactly.
     # An equality, not a bound -- a re-encode of decoded text would drift off it.
     assert ntok == 24, f"eval token count is not the emitted ids: {ntok}"
+
+
+def test_a_recapturing_engine_drops_what_the_update_invalidated():
+    """The caches an optimizer step makes stale must be cleared per step.
+
+    A captured graph replays the forward as it was traced and a cached prefix
+    serves KV from the old policy -- both silently, which is why the guard refuses
+    an engine carrying either. The waivers are per cache: `recapture_graph=True`
+    and `clear_prefix=True`, so a caller that turned graphs off and said only
+    "graphs" is still refused for the live prefix store it forgot.
+
+    CPU cannot gate the graph half. Capture calls torch.cuda.graph_pool_handle(),
+    which raises here, and the handler flips _decode_graph_on to False -- so a
+    "captured vs eager" comparison on cpu would compare eager to eager and pass
+    against any implementation at all. This gates the state machine instead: the
+    entries go away when they must. The sm90 half is in the bench entry.
+    """
+    import pytest
+
+    from tilerl.engine import build_engine
+    from tilerl.train import grpo_loop
+
+    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    run = lambda e, **kw: list(  # noqa: E731
+        grpo_loop(e, model, [[1, 2, 3]], lambda p, c: 0.0, 1, RefBackend(), group=2,
+                  sampling=SamplingParams(max_new_tokens=4), **kw))
+
+    # Same engine the guard refuses (live prefix store) -- accepted only with the flag.
+    from tilerl.engine import SamplingParams
+
+    engine = build_engine(cfg, model, RefBackend(), num_blocks=64, num_slots=4)
+    with pytest.raises(ValueError, match="on-policy"):
+        run(engine)
+    # One flag is not the other: this engine's graphs are already off, so waiving
+    # them changes nothing and the live prefix store must still raise.
+    with pytest.raises(ValueError, match="prefix"):
+        run(engine, recapture_graph=True)
+
+    # Clearing at loop ENTRY is not enough and a one-step test cannot tell the two
+    # apart: it passes either way. Re-dirty the caches between steps, so only a
+    # clear that runs AFTER EVERY update leaves them empty at the end.
+    from tilerl.kv_cache import BLOCK_TOKENS
+
+    def dirty():
+        engine._decode_graphs[(1, 1)] = "stale-graph"  # cpu never captures; stand-in
+        if engine._prefix.stats()["entries"] == 0:
+            # insert() refcounts, it does not allocate: the pool must own the block.
+            engine._prefix.insert(list(range(1, BLOCK_TOKENS + 1)), [engine._kv.alloc_block()])
+
+    dirty()
+    assert engine._prefix.stats()["entries"] == 1
+    for _ in grpo_loop(engine, model, [[1, 2, 3]], lambda p, c: 0.0, 2, RefBackend(),
+                       group=2, sampling=SamplingParams(max_new_tokens=4),
+                       recapture_graph=True, clear_prefix=True):
+        assert engine._decode_graphs == {}, "the update left a graph traced on old weights"
+        assert engine._prefix.stats()["entries"] == 0, "the update left KV from the old policy"
+        dirty()  # the next step must clear it again, not rely on loop entry

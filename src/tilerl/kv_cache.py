@@ -303,6 +303,9 @@ class NoPrefixStore:
     def evict_until_free(self, blocks: int) -> None:
         return None
 
+    def clear(self) -> None:
+        return None
+
 
 class PrefixStore:
     """Rolling-hash prefix cache over a :class:`PagedKvPool`.
@@ -403,6 +406,16 @@ class PrefixStore:
             self._pool.free_block(b)
         self._state_used -= entry.nbytes
         self.evictions += 1
+
+    def clear(self) -> None:
+        """Drop every entry: the KV behind them was computed under older weights.
+
+        An optimizer step invalidates the whole store at once, so this is
+        ``_evict_one`` to exhaustion rather than a second teardown path -- the
+        block frees and the state-bytes accounting have to match it exactly.
+        """
+        while self._fifo:
+            self._evict_one()
 
     def stats(self) -> dict[str, int]:
         return {

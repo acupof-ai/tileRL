@@ -208,12 +208,30 @@ def rl_step(
     return _step(model, ids, backend, optimizer, trainable, grad_fn, micro)
 
 
-def _require_on_policy(engine: Any) -> None:
-    # A cached prefix or a captured decode graph samples from an earlier policy without raising.
-    if engine._decode_graph_on is not False or not isinstance(engine._prefix, NoPrefixStore):
-        raise ValueError("on-policy rollouts need build_engine(decode_graph=False, "
-                         "prefix_store=NoPrefixStore()): a captured graph or a cached "
-                         "prefix samples from an earlier policy")
+def _require_on_policy(
+    engine: Any, recapture_graph: bool = False, clear_prefix: bool = False
+) -> None:
+    """Refuse an engine whose caches would outlive an update.
+
+    A cached prefix or a captured decode graph samples from an earlier policy
+    without raising. Two independent caches, so two waivers: a caller that clears
+    them after every update passes the matching flag and must then actually call
+    ``invalidate_weights()`` -- ``grpo_loop`` does, at loop entry and after each
+    step. One flag for both would waive the prefix store for a caller that only
+    said "graphs": ``build_engine(decode_graph=False)`` alone still carries a live
+    ``PrefixStore``. Neither flag is a capability check: every Engine has the
+    method, so testing for it would make this guard pass for everyone.
+    """
+    if not recapture_graph and engine._decode_graph_on is not False:
+        raise ValueError("on-policy rollouts need build_engine(decode_graph=False), or "
+                         "recapture_graph=True if the loop calls "
+                         "engine.invalidate_weights() after every update: a captured "
+                         "graph replays a forward traced on the old weights")
+    if not clear_prefix and not isinstance(engine._prefix, NoPrefixStore):
+        raise ValueError("on-policy rollouts need build_engine(prefix_store="
+                         "NoPrefixStore()), or clear_prefix=True if the loop calls "
+                         "engine.invalidate_weights() after every update: a cached "
+                         "prefix serves KV from the old policy")
 
 
 def untruncated(sampling: Any) -> Any:
@@ -244,6 +262,8 @@ def grpo_loop(
     trainable: dict[str, Any] | None = None,
     micro: int = 0,
     tiebreak: Any = None,
+    recapture_graph: bool = False,
+    clear_prefix: bool = False,
 ) -> list[tuple[float, float, float, float]]:
     """GRPO: sample ``group`` completions per prompt in one engine batch, score
     them with ``reward_fn(prompt_ids, completion_ids) -> float``, take one
@@ -260,7 +280,10 @@ def grpo_loop(
     Length is the independent signal that separates the two.
     # ponytail: recapture the graph and drop the prefix entries after each
     # update instead of disabling both, once a rollout's decode cost matters."""
-    _require_on_policy(engine)
+    _require_on_policy(engine, recapture_graph, clear_prefix)
+    if recapture_graph or clear_prefix:
+        # Whatever the engine cached before this loop was built under other weights.
+        engine.invalidate_weights()
     if optimizer is None:
         optimizer = AdamW(lr=1e-5)
     sampling = untruncated(sampling if sampling is not None
@@ -303,6 +326,11 @@ def grpo_loop(
         slens = np.array([len(prompt) + len(c) for c in comps], dtype=np.int64)
         ce = rl_step(model, batch, adv, plens, backend, optimizer, trainable=trainable,
                      seq_lens=slens, micro=micro)
+        if recapture_graph or clear_prefix:
+            # After the update, not before the next rollout: a caller that stops
+            # iterating must not leave the engine holding graphs traced on weights
+            # that no longer exist.
+            engine.invalidate_weights()
         yield (float(np.mean(rewards)), ce, time.perf_counter() - t0, tied,
                float(np.mean([len(c) for c in comps])))
 
