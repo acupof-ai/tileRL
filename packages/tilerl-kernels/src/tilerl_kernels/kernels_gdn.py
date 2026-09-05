@@ -18,28 +18,38 @@ _FAST_MATH = tilelang.PassConfigKey.TL_ENABLE_FAST_MATH.value
 # the HK key heads and the kernels index bh // (H // HK): no head-repeat copy.
 
 
-def make_gdn_prep_bf16(target: str):
-    """:func:`kernels.make_gdn_prep` on sm90: one thread per head column, the
-    q/k L2 sums by block allreduce, bf16 out for the WY gemms. The conv window
-    stays f32 at both ends -- it is the state pool's dtype."""
+def make_gdn_prep_bf16(target: str, io: str = "bfloat16"):
+    """:func:`kernels.make_gdn_prep` with one thread per head column, the q/k L2
+    sums by block allreduce, and ``io`` for the WY gemms' operands. The conv
+    window stays f32 at both ends -- it is the state pool's dtype.
+
+    ``io`` is the only difference between the cells: sm90 takes bf16, sm70's
+    kernels are f32 (``Backend.io``). Parameterised rather than copied because
+    the schedule is the whole point -- the f32 cell in ``kernels.py`` loops
+    ``T.serial(DK)`` in every thread while the launch passes ``threads=DK``, so
+    all 128 threads compute the same 128 columns. Measured on sm70 at T=2048,
+    NVH=48, DK=128: the shipped call is 264.33 ms and the same work at
+    ``threads=1`` is 54.04 ms, a 4.89x spread that is pure redundancy (dropping
+    conv taps 4 -> 2 moves it only 1.51x, so it is not read traffic).
+    """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def gdn_prep(Q, Key, Val, GIn, BIn, DtBias, ALog, ConvW, Window, threads):
         B, TT, HK, DK, NVH, DV, KER, QKVD = T.const("B, TT, HK, DK, NVH, DV, KER, QKVD")
-        Q: T.Tensor((B, TT, HK, DK), "bfloat16")
-        Key: T.Tensor((B, TT, HK, DK), "bfloat16")
-        Val: T.Tensor((B, TT, NVH, DV), "bfloat16")
+        Q: T.Tensor((B, TT, HK, DK), io)
+        Key: T.Tensor((B, TT, HK, DK), io)
+        Val: T.Tensor((B, TT, NVH, DV), io)
         GIn: T.Tensor((B, TT, NVH), "float32")
         BIn: T.Tensor((B, TT, NVH), "float32")
         DtBias: T.Tensor((NVH,), "float32")
         ALog: T.Tensor((NVH,), "float32")
         ConvW: T.Tensor((QKVD, KER), "float32")
         Window: T.Tensor((B, KER - 1, QKVD), "float32")
-        Qo = T.empty((B, TT, HK, DK), "bfloat16")
-        Ko = T.empty((B, TT, HK, DK), "bfloat16")
-        Vo = T.empty((B, TT, NVH, DV), "bfloat16")
+        Qo = T.empty((B, TT, HK, DK), io)
+        Ko = T.empty((B, TT, HK, DK), io)
+        Vo = T.empty((B, TT, NVH, DV), io)
         Go = T.empty((B, TT, NVH), "float32")
-        Bo = T.empty((B, TT, NVH), "bfloat16")
+        Bo = T.empty((B, TT, NVH), io)
         NewWindow = T.empty((B, KER - 1, QKVD), "float32")
         scale = T.rsqrt(T.cast(DK, "float32"))
         with T.Kernel(NVH, TT, B, threads=threads) as (vh, t, bb):
@@ -71,7 +81,7 @@ def make_gdn_prep_bf16(target: str):
                     cv[0] += T.cast(Val[bb, s, vh, tv], "float32") * ConvW[vc, tap]
             cq[0] = cq[0] * T.sigmoid(cq[0])
             ck[0] = ck[0] * T.sigmoid(ck[0])
-            Vo[bb, t, vh, tv] = T.cast(cv[0] * T.sigmoid(cv[0]), "bfloat16")
+            Vo[bb, t, vh, tv] = T.cast(cv[0] * T.sigmoid(cv[0]), io)
 
             pq[0] = cq[0] * cq[0]
             pk[0] = ck[0] * ck[0]
@@ -92,13 +102,13 @@ def make_gdn_prep_bf16(target: str):
                     T.tvm_thread_allreduce(T.uint32(1), pk[0], True, sk[0], tv, dtype="handle")
                 )
             if vh % (NVH // HK) == 0:  # one value head per GQA group writes q/k
-                Qo[bb, t, kh, tv] = T.cast(cq[0] * T.rsqrt(sq[0] + 1e-12) * scale, "bfloat16")
-                Ko[bb, t, kh, tv] = T.cast(ck[0] * T.rsqrt(sk[0] + 1e-12), "bfloat16")
+                Qo[bb, t, kh, tv] = T.cast(cq[0] * T.rsqrt(sq[0] + 1e-12) * scale, io)
+                Ko[bb, t, kh, tv] = T.cast(ck[0] * T.rsqrt(sk[0] + 1e-12), io)
             if tv == 0:
                 x = GIn[bb, t, vh] + DtBias[vh]
                 sp = T.if_then_else(x > 20.0, x, T.log(1.0 + T.exp(x)))
                 Go[bb, t, vh] = -T.exp(ALog[vh]) * sp
-                Bo[bb, t, vh] = T.cast(T.sigmoid(BIn[bb, t, vh]), "bfloat16")
+                Bo[bb, t, vh] = T.cast(T.sigmoid(BIn[bb, t, vh]), io)
             if t == 0:  # next window: the last KER-1 raw tokens of Window ++ qkv
                 for tap in T.serial(KER - 1):
                     if TT + tap < KER - 1:
