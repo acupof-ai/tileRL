@@ -61,30 +61,44 @@ negative controls, each failing on its own — reverting the sidecar guard leave
 ## The 27B number, reconciled
 
 Counted from a real run's `adapter.safetensors`
-(`/work/tilerl-p1/runs/1fa1e58388a2`, 341 741 400 bytes, 2086 keys), bucketed by
-the stem the LoRA hangs off:
+(`/work/tilerl-p1/runs/1fa1e58388a2`, 341 741 400 bytes, 2086 keys), grouped by
+the suffix of the stem each LoRA hangs off:
 
-| | predicted | measured |
+| bucket | keys | params |
 |---|---:|---:|
-| live | 132.7 M | **125.25 M** (1462 keys) |
-| dead `.scale` | — | 37.65 M (528 keys) |
-| dead `.conv1d` | — | 7.87 M (96 keys) |
-| dead, total | 68.1 M | **45.52 M** (624 keys) |
-| total | 200.8 M | **170.76 M** |
+| live | **996** | **124.838 M** |
+| dead `.scale` | 528 | 37.650 M |
+| dead `.wscale` | 466 | 0.409 M |
+| dead `.conv1d` | 96 | 7.867 M |
+| dead, total | **1090** | **45.926 M** |
+| total | 2086 | **170.76 M** |
 
-The thinking cap's 170.8 M / 341 MB was right; the whole 30.0 M gap was in the
-prediction. Dead share 26.6% measured against 33.9% predicted.
+**1090 of 2086 keys are dead — 52%.** The param share stays small because the
+466 `.wscale` sidecars carry 0.409 M between them: tiny tensors, and they are
+what blocked the load.
 
-**The estimate was biased, not noisy.** Both buckets missed in the same
-direction — live by 7.5 M, dead by 22.6 M — because the formula rounded up per
-key and multiplied by a key count nobody had verified against a checkpoint. A
-component-wise error that is positive everywhere is a method fault; 200.8 M is
+The prediction was 200.8 M (132.7 M live, 68.1 M dead). The thinking cap's
+170.8 M / 341 MB was right and the whole 30.0 M gap was in the prediction, which
+missed high in every component — a method fault, not noise, from rounding up per
+key and multiplying by a key count never checked against a checkpoint. 200.8 M is
 struck rather than kept as one end of a range.
 
+**The first two measurements of this file agreed with each other and were both
+wrong.** Each bucketed on `.scale` and `.conv1d` and took live as the complement,
+so `.wscale` fell into live and the split read 1462/624. The second measurement
+was run on the pod specifically to avoid transcribing the first, but it reused
+the first's category list — a re-execution of one partition on the same bytes,
+which can only agree. Enumerating every suffix present takes the same one query
+and shows `.wscale` immediately.
+
+What actually found it: `--load-adapter` refused this checkpoint with **1090
+unknown keys**. #104's gate caught a partition error that two people measuring by
+hand did not.
+
 This run launched from `91977a8`, before the fix landed at `863a257`, so those
-624 dead adapters are **in this checkpoint** — carried through 100 steps, each
+1090 dead adapters are **in this checkpoint** — carried through 100 steps, each
 with two AdamW moments. That is what makes the loader gate behavioural rather
-than structural: the file parsing proves nothing when 528 of its keys were never
+than structural: the file parsing proves nothing when half its keys were never
 going to attach, so `test_a_loaded_adapter_actually_changes_the_output` decodes
 with and without and requires the tokens to differ.
 
