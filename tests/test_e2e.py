@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
+import threading
+import time
+import unittest.mock
 from dataclasses import replace
 
 os.environ.setdefault("TILERL_TARGET", "cpu")
@@ -28,7 +32,13 @@ from tilerl.engine import (
     _step_seed,
     build_engine,
 )
-from tilerl.kv_cache import DramSnapshots, NoPrefixStore, PagedKvPool, PrefixStore
+from tilerl.kv_cache import (
+    DramSnapshots,
+    KvTier,
+    NoPrefixStore,
+    PagedKvPool,
+    PrefixStore,
+)
 from tilerl.model import add_lora, build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
 from tilerl.testing import RefBackend
@@ -668,6 +678,35 @@ def test_the_dram_tier_demotes_instead_of_evicting():
     )
 
 
+def test_the_host_tier_drops_the_oldest_snapshot_not_an_arbitrary_one():
+    """The DRAM tier evicts by bytes; this asserts it evicts the OLDEST.
+
+    `test_a_promotion_that_comes_back_empty_is_a_miss` already drives `drops >= 1` and
+    checks a lookup degrades safely, but it never says WHICH snapshot went — so a tier that
+    dropped the newest, or a random one, passes it. With three snapshots against a
+    two-snapshot budget the first demoted must be gone and the last two held.
+
+    Negative control: `popitem(last=True)` instead of `last=False` inverts the victim and
+    fails on the first assert.
+    """
+    torch.manual_seed(0)
+    snaps = [(torch.randn(3, 4, 8, 8) + i, torch.randn(3, 2, 16)) for i in range(3)]
+    one = sum(t.nbytes for t in snaps[0])
+    dram = DramSnapshots(budget_bytes=2 * one + one // 2)
+    for i, snap in enumerate(snaps):
+        assert dram.demote(i, snap), f"snapshot {i} was refused by a budget that fits two"
+    assert dram.drops == 1, f"expected exactly one drop at this budget, got {dram.drops}"
+    dev = torch.device("cpu")
+    assert dram.promote(0, dev) is None, (
+        "the OLDEST snapshot survived; an LRU tier must evict it first, and evicting the "
+        "newest throws away what a lookup is about to ask for"
+    )
+    for i in (1, 2):
+        back = dram.promote(i, dev)
+        assert back is not None, f"snapshot {i} was dropped instead of the oldest"
+        assert torch.equal(back[0], snaps[i][0]), f"snapshot {i} came back changed"
+
+
 def test_a_promotion_that_comes_back_empty_is_a_miss():
     """A snapshot the tier dropped must not serve its blocks anyway.
 
@@ -700,6 +739,338 @@ def test_a_promotion_that_comes_back_empty_is_a_miss():
         "a hit came back with blocks and no snapshot; the caller would prefill the GDN "
         "layers from a zero state over non-zero KV"
     )
+
+
+def test_the_ssd_flag_reaches_the_store_and_the_fingerprint_covers_the_config(tmp_path):
+    """`--ssd-path` must arrive at the PrefixStore, and the fingerprint must move with
+    every config field.
+
+    Two separate silent failures, so two asserts. A flag that parses and is never
+    forwarded reads exactly like a working one — `dram_bytes` had no CLI entry at all and
+    the review had to find that by reading `_build_engine`. And a fingerprint that misses
+    a field serves KV computed under other weights after a restart, which is wrong and
+    silent; the first draft of `_weight_fingerprint` hand-listed the fields and named
+    `cfg.num_heads`, which does not exist on this config at all.
+
+    The fingerprint is checked over EVERY field via `dataclasses.replace`, not a sample:
+    a hand-picked list is the defect being guarded against.
+    """
+    import dataclasses
+
+    from tilerl.cli import _build_engine as cli_build
+    from tilerl.engine import _weight_fingerprint
+
+    cfg = tiny()
+    base = _weight_fingerprint(cfg)
+    for f in dataclasses.fields(cfg):
+        old = getattr(cfg, f.name)
+        new = (old + 1) if isinstance(old, int) and not isinstance(old, bool) else None
+        if new is None:
+            continue
+        with contextlib.suppress(ValueError):  # some fields validate against each other
+            assert _weight_fingerprint(dataclasses.replace(cfg, **{f.name: new})) != base, (
+                f"changing {f.name} left the fingerprint unchanged, so a restart would "
+                "serve KV computed under a different config"
+            )
+
+    cfg, model = _build_model("tiny", seed=11)
+    engine = cli_build(cfg, model, get_backend(), slots=2, blocks=64, max_ctx=256,
+                       ssd_path=str(tmp_path))
+    tier = engine._prefix._ssd
+    assert tier is not None, (
+        "--ssd-path parsed but never reached the store; the flag would read as working"
+    )
+    assert os.path.isdir(os.path.join(str(tmp_path), "tilerl_kvtier"))
+    assert tier._fingerprint == _weight_fingerprint(cfg)
+
+
+def test_a_restart_faults_the_prefix_back_in_off_disk(tmp_path):
+    """The whole point of the SSD tier: HBM is empty after a restart, the disk is not.
+
+    A second store over the same directory and fingerprint is what a restart looks like
+    to this layer. Its pool holds no blocks and its index no entries, so without a read
+    path every lookup misses and the tier is write-only — which is what it was: `spill_kv`
+    had a caller and `load_kv`/`load_state`/`has` had none.
+
+    Three things are asserted, because two of them are the ones that fail silently:
+
+    * the fault-in **hits** (`ssd_hits == 1`) rather than the lookup walking past it;
+    * the KV comes back byte-for-byte — a `torch.save`/`load` round trip is exact, so
+      anything less means the spill reshaped or re-dtyped it;
+    * the snapshot comes back too, and is not None. Adopting blocks with a zero state
+      runs the GDN layers from zero over non-zero KV: wrong, and byte-identical in
+      output for a while.
+
+    The negative control is the fingerprint: a mismatched one must NOT hit, or the tier
+    would serve KV computed under different weights — and it must also unlink, since that
+    unlink is the only path that ever reclaims this tier's disk.
+    """
+    torch.manual_seed(0)
+    toks = list(range(4 * BLOCK_TOKENS))
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+
+    def store_at(fingerprint: str):
+        pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+        tier = KvTier(str(tmp_path), fingerprint, min_tokens=BLOCK_TOKENS)
+        return PrefixStore(pool, ssd=tier), pool, tier
+
+    warm, pool, tier = store_at("fp-a")
+    blocks = [pool.alloc_block() for _ in range(4)]
+    for i, b in enumerate(blocks):
+        pool.k_pool[:, b] = float(i + 1)
+        pool.v_pool[:, b] = float(-i - 1)
+    assert warm.insert(toks, blocks, (state[0].clone(), state[1].clone()))
+    _flushed(tier)
+    assert tier.stats()["ssd_entries"] == 1, (
+        f"nothing reached disk (offered={tier.offered} refusals={tier.refusals}), so the "
+        "restart below cannot hit and this test is inert"
+    )
+
+    cold, cold_pool, cold_tier = store_at("fp-a")
+    assert cold_tier.recovered == 1, f"recovery adopted {cold_tier.recovered} entries, not 1"
+    hit = cold.lookup(toks)
+    st = cold.stats()
+    assert hit is not None and st["ssd_hits"] == 1, (
+        f"a cold lookup missed with the prefix on disk: ssd_hits={st['ssd_hits']} "
+        f"ssd_faults={st['ssd_faults']} entries={st['ssd_entries']}"
+    )
+    assert hit.length == len(toks)
+    for i, b in enumerate(hit.blocks):
+        assert torch.equal(cold_pool.k_pool[:, b], torch.full_like(cold_pool.k_pool[:, b],
+                                                                   float(i + 1))), (
+            f"block {i} came back changed; a save/load round trip is byte-exact"
+        )
+    assert hit.state is not None and torch.equal(hit.state[0], state[0]), (
+        "the snapshot did not survive the disk round trip, so the blocks would be adopted "
+        "with a zero recurrent state"
+    )
+    # A re-publish of what was just faulted in must not write the bytes back.
+    assert cold_tier.offered == 0, f"the fault-in re-spilled its own read ({cold_tier.offered})"
+
+    other, _, other_tier = store_at("fp-b")
+    assert other_tier.recovered == 0 and other.lookup(toks) is None, (
+        "a different fingerprint served KV computed under other weights"
+    )
+    # And the mismatch must UNLINK, not merely decline to index. `recovered == 0` above
+    # cannot see the difference: with the files left in place it is still 0, because a
+    # mismatch clears `prev` either way -- the whole suite passes with the unlink deleted
+    # (measured). The bytes matter because this unlink is the only thing that ever reclaims
+    # the tier's disk: `invalidate()` deliberately writes one marker instead of walking a
+    # 20 GiB directory inside a training step, so every generation's spill accumulates
+    # until some later `_recover` mismatches and removes it.
+    left = [f for f in os.listdir(os.path.join(str(tmp_path), "tilerl_kvtier"))
+            if f.endswith((".kv", ".st"))]
+    assert not left, (
+        f"a fingerprint mismatch left {len(left)} spill files on disk; nothing else reclaims "
+        "them, so every optimizer step's spill accumulates until the disk fills"
+    )
+
+    # An optimizer step calls clear(), and a tier that keeps serving afterwards hands the
+    # trainer KV computed under the PREVIOUS weights -- off-policy, and silent. clear()
+    # bumps the fingerprint rather than unlinking 20 GiB inside a training step, so what
+    # has to be asserted is that a store built after it does not recover.
+    # A fresh directory: the fp-b store above already unlinked the files, since a
+    # fingerprint mismatch deletes what it cannot serve. Reusing it would make the setup
+    # assert below pass for the wrong reason -- it caught exactly that.
+    d2 = str(tmp_path / "clear")
+    pool2 = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    tier2 = KvTier(d2, "fp-c", min_tokens=BLOCK_TOKENS)
+    warm2 = PrefixStore(pool2, ssd=tier2)
+    b2 = [pool2.alloc_block() for _ in range(4)]
+    assert warm2.insert(toks, b2, (state[0].clone(), state[1].clone()))
+    _flushed(tier2)
+    assert KvTier(d2, "fp-c", min_tokens=BLOCK_TOKENS).recovered == 1, (
+        "setup: the entry must be adoptable before clear(), or the assert below is inert"
+    )
+    warm2.clear()
+    after_tier = KvTier(d2, "fp-c", min_tokens=BLOCK_TOKENS)
+    after = PrefixStore(PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,)),
+                        ssd=after_tier)
+    assert after_tier.recovered == 0 and after.lookup(toks) is None, (
+        f"clear() left {after_tier.recovered} entries adoptable, so an optimizer step "
+        "would serve KV computed under the weights it just replaced"
+    )
+
+
+@pytest.mark.parametrize("suffix", [".st", ".kv"])
+def test_a_spill_truncated_by_a_crash_is_a_miss_not_a_raise(tmp_path, suffix):
+    """A kill between torch.save starting and finishing leaves a partial blob on disk.
+
+    `_recover` adopts entries by FILE SIZE, so it cannot tell a truncated blob from a whole
+    one -- it will happily index a half-written pair. The read then has to survive it: a
+    `torch.load` raising inside `lookup` takes down the request that happened to match,
+    which is a crash for a cache miss.
+
+    ONE ARM PER GUARD, because `_fault_in` reads the state first and returns on its miss:
+    truncating both files only ever reaches `load_state`, so `load_kv`'s guard can be deleted
+    and a both-files test still passes (25 measured exactly that). The `.kv` arm leaves the
+    state whole so the KV guard is the one that fires, and `ssd_faults` is what proves it --
+    that counter is incremented only on `load_kv` returning False.
+
+    The durability window this covers is real and bounded: the flush daemon writes off-tick,
+    so an entry published within the last flush is on disk partially or not at all. Losing
+    it is correct (it re-prefills); raising on it is not.
+    """
+    torch.manual_seed(0)
+    toks = list(range(4 * BLOCK_TOKENS))
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+    pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    tier = KvTier(str(tmp_path), "fp-trunc", min_tokens=BLOCK_TOKENS)
+    store = PrefixStore(pool, ssd=tier)
+    assert store.insert(toks, [pool.alloc_block() for _ in range(4)],
+                        (state[0].clone(), state[1].clone()))
+    _flushed(tier)
+
+    d = os.path.join(str(tmp_path), "tilerl_kvtier")
+    victims = [f for f in os.listdir(d) if f.endswith(suffix)]
+    assert victims, f"nothing spilled a {suffix}, so the truncation below is inert"
+    for name in victims:
+        path = os.path.join(d, name)
+        with open(path, "r+b") as fh:
+            fh.truncate(os.path.getsize(path) // 3)
+
+    cold_tier = KvTier(str(tmp_path), "fp-trunc", min_tokens=BLOCK_TOKENS)
+    assert cold_tier.recovered >= 1, (
+        "recovery skipped the truncated files, so the load path below is never reached -- "
+        "it adopts by size and a truncated file still has one"
+    )
+    cold = PrefixStore(PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,)),
+                       ssd=cold_tier)
+    hit = cold.lookup(toks)  # must not raise
+    assert hit is None, f"a truncated spill served a hit of length {hit and hit.length}"
+    if suffix == ".kv":
+        assert cold.ssd_faults == 1, (
+            "the state loaded but ssd_faults is 0, so load_kv was never reached and this arm "
+            "does not exercise its guard"
+        )
+
+
+def test_a_spill_still_in_the_queue_is_served_from_memory(tmp_path):
+    """`resident()` is two conditions and only the `_lru` one was tested.
+
+    A spill sits in `_pending` from the moment `spill_kv` enqueues it until the daemon's
+    `torch.save` returns -- ~100 ms, and the whole point of moving the save off-tick. During
+    that window there is NO FILE. Both halves of `resident()` and both loads have a
+    pending-table branch for it; deleting the `_pending` half of the `or` leaves all 70 tests
+    in this file passing (measured), so what the tier does for the first 100 ms of every
+    entry's life was unasserted.
+
+    Getting it wrong is not a crash: `resident()` returns False, the lookup walks past a
+    prefix that is in memory, and the request re-prefills. Silent, and it is the window a
+    burst of same-prefix requests lands in.
+
+    Blocking the daemon is what makes the window observable. The queue item is taken before
+    the block, so `_pending` stays populated and no file is written -- asserted, or a
+    passing `resident()` could just be reading the disk.
+    """
+    torch.manual_seed(0)
+    toks = list(range(4 * BLOCK_TOKENS))
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+    pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    tier = KvTier(str(tmp_path), "fp-pending", min_tokens=BLOCK_TOKENS)
+    store = PrefixStore(pool, ssd=tier)
+
+    gate = threading.Event()
+    real_save = torch.save
+
+    def held_save(*a, **kw):
+        gate.wait(5)
+        return real_save(*a, **kw)
+
+    blocks = [pool.alloc_block() for _ in range(4)]
+    for i, b in enumerate(blocks):
+        pool.k_pool[:, b] = float(i + 1)
+        pool.v_pool[:, b] = float(-i - 1)
+    with unittest.mock.patch.object(torch, "save", held_save):
+        assert store.insert(toks, blocks, (state[0].clone(), state[1].clone()))
+        h = store._hash_all(tuple(toks))
+        for _ in range(500):  # the enqueue is synchronous, the daemon's pickup is not
+            if tier._pending and tier._pending_st:
+                break
+            time.sleep(0.01)
+        assert tier._pending and tier._pending_st, (
+            "nothing reached the queue, so the pending window below is not being tested"
+        )
+        d = os.path.join(str(tmp_path), "tilerl_kvtier")
+        on_disk = [f for f in os.listdir(d) if f.endswith((".kv", ".st"))]
+        assert not on_disk, (
+            f"{len(on_disk)} files are already written, so a resident() hit below could be "
+            "reading the disk rather than the pending table"
+        )
+        assert tier.resident(h), (
+            "an entry in the queue is not resident, so a lookup in the ~100 ms before the "
+            "save lands walks past a prefix that is in memory and re-prefills it"
+        )
+        cold_pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+        assert tier.load_kv(h, tuple(toks), [cold_pool.alloc_block() for _ in range(4)],
+                            cold_pool), "load_kv did not serve a pending blob"
+        assert tier.load_state(h, tuple(toks)) is not None, (
+            "load_state did not serve a pending blob"
+        )
+        gate.set()
+    _flushed(tier)
+
+
+def test_the_disk_tier_evicts_the_oldest_entry_past_its_byte_budget(tmp_path):
+    """A byte budget that only reports is unbounded disk growth.
+
+    Four prefixes spilled against a budget that holds two. The oldest entry's files must be
+    gone and `resident()` False for it, while the newest is still there -- LRU, so the
+    victim is the least recently touched, not the largest or the first inserted.
+
+    The negative control is the budget itself: with it effectively unlimited, every file
+    survives. Without that arm "the files are gone" would also pass for a tier that deleted
+    them for some other reason.
+    """
+    torch.manual_seed(0)
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+    toks = list(range(16 * BLOCK_TOKENS))
+
+    def spill_four(max_bytes: int, tag: str):
+        d = str(tmp_path / tag)
+        pool = PagedKvPool(128, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+        tier = KvTier(d, "fp-lru", min_tokens=BLOCK_TOKENS, max_bytes=max_bytes)
+        store = PrefixStore(pool, ssd=tier)
+        keys = []
+        for k in range(1, 5):
+            n = k * 4 * BLOCK_TOKENS
+            blocks = [pool.alloc_block() for _ in range(n // BLOCK_TOKENS)]
+            assert store.insert(toks[:n], blocks, (state[0].clone(), state[1].clone()))
+            keys.append(store._hash_all(tuple(toks[:n])))
+            _flushed(tier)
+        return tier, keys, os.path.join(d, "tilerl_kvtier")
+
+    # Negative control first, and it also measures what one entry costs on disk.
+    big, _, d_big = spill_four(1 << 40, "unlimited")
+    assert big.stats()["ssd_entries"] == 4, "setup: four entries should have landed"
+    assert big.over_budget == 0, f"the unlimited arm evicted {big.over_budget} entries"
+    assert len(os.listdir(d_big)) == 9, (  # 4 pairs + the .kvtier marker
+        f"the unlimited arm lost files: {sorted(os.listdir(d_big))}"
+    )
+    one_pair = big.stats()["ssd_bytes"] // 4
+
+    small, keys, _ = spill_four(2 * one_pair, "capped")
+    assert small.over_budget >= 1, (
+        f"nothing was evicted at a {2 * one_pair} byte budget (total "
+        f"{small.stats()['ssd_bytes']}), so this test is inert"
+    )
+    assert not small.resident(keys[0]), "the oldest entry survived the byte budget"
+    assert small.resident(keys[-1]), "the newest entry was evicted instead of the oldest"
+    assert not os.path.exists(small._kv(keys[0])), (
+        "the oldest entry left its .kv on disk, so the budget is not bounding the directory"
+    )
+    assert small.stats()["ssd_bytes"] <= 2 * one_pair, (
+        f"still {small.stats()['ssd_bytes']} bytes tracked against a {2 * one_pair} budget"
+    )
+
+
+def _flushed(tier, tries: int = 500) -> None:
+    """Wait for the flush daemon to land what is queued. Bounded, so a wedged writer
+    fails the assert that follows rather than hanging the suite."""
+    for _ in range(tries):
+        if not tier._pending and not tier._pending_st:
+            return
+        time.sleep(0.01)
 
 
 def test_prefix_hit_survives_evicting_its_own_entry():

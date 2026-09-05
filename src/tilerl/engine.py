@@ -42,6 +42,7 @@ from .kv_cache import (
     BLOCK_TOKENS,
     BatchKv,
     DramSnapshots,
+    KvTier,
     LinearStatePool,
     NoPrefixStore,
     PagedKvPool,
@@ -686,7 +687,8 @@ class Engine:
                 "prefix_state_bytes": store["state_bytes"],
                 # Present only with a host tier; a demotion is a prefix the card could not
                 # keep but did not have to lose.
-                **{k: v for k, v in store.items() if k.startswith("dram_")},
+                **{k: v for k, v in store.items()
+                   if k.startswith(("dram_", "ssd_"))},
                 "prefix_demoted": store.get("demoted", 0),
                 "prefill_forwards": self._prefill_forwards,
                 "decode_forwards": self._decode_forwards,
@@ -851,7 +853,11 @@ class Engine:
                 # A chunk end IS a state-pool boundary: nothing has been sampled yet, so
                 # the slot holds exactly tokens[:prefill_from]. This is the publish that
                 # makes a ragged prompt shareable -- `_pick` cut the chunk short for it.
-                self._publish_prefix(pf, pf.prefill_from)
+                # An intermediate chunk boundary: the prompt-complete publish below covers
+                # the same tokens and more, so this one is not offered to disk. Measured on
+                # H20 card 6, spilling all six publishes of a 2729-token prompt cost 0.925 s
+                # of a 2.041 s request against 0.180 s for the last one alone.
+                self._publish_prefix(pf, pf.prefill_from, spill=False)
         if not done:
             return
         self._sample_commit(done)
@@ -1140,15 +1146,22 @@ class Engine:
             if tok != raw:  # a forced end-think token: the rest of the chain is stale
                 return
 
-    def _publish_prefix(self, req: _Req, length: int) -> None:
+    def _publish_prefix(self, req: _Req, length: int, spill: bool = True) -> None:
         """Hand tokens[:length], its blocks and the linear-state snapshot at that
-        boundary to the store; the store owns and evicts all three together."""
+        boundary to the store; the store owns and evicts all three together.
+
+        ``spill=False`` for a publish a later one supersedes -- the entry stays in HBM but
+        is not written to the disk tier. Every mid-prefill chunk boundary is such a publish:
+        the prompt-complete entry that follows covers it, and on a real second turn the
+        prompt is LONGER, so the longest entry is the one that serves. Skipping them takes
+        one 2729-token prompt from 1624 MB spilled to 325 MB.
+        """
         snap = (
             self._states.states[req.state_slot].clone(),
             self._states.window_snapshot(req.state_slot),
         )
         self._prefix_published += self._prefix.insert(
-            req.tokens[:length], req.blocks[: length // BLOCK_TOKENS], snap
+            req.tokens[:length], req.blocks[: length // BLOCK_TOKENS], snap, spill=spill
         )
 
     def _finish(self, req: _Req, error: str | None = None) -> None:
@@ -1224,6 +1237,24 @@ def _fit_blocks(cfg, backend, io, cap: int, draft_layers: int = 0) -> int:
     return min(fit, cap) if cap else fit
 
 
+def _weight_fingerprint(cfg) -> str:
+    """What the spilled KV was computed under, as far as the config knows.
+
+    EVERY config field, not a hand-picked list of the ones that look load-bearing: a
+    mismatch is the only thing standing between a restart and serving KV computed under
+    other weights, and a field left out of the list is exactly how that happens. The
+    first draft of this named `cfg.num_heads`, which does not exist -- the real field is
+    `num_attention_heads` -- so the list was already wrong when it was written.
+
+    It does NOT distinguish two checkpoints of the same architecture. Pass
+    `ssd_fingerprint` explicitly when one spill directory serves both.
+    """
+    import dataclasses
+
+    fields = "-".join(f"{f.name}={getattr(cfg, f.name)!r}" for f in dataclasses.fields(cfg))
+    return f"{fields}-block{BLOCK_TOKENS}"
+
+
 def build_engine(
     cfg,
     model: Any,
@@ -1246,6 +1277,23 @@ def build_engine(
     #: so a flag would mostly be turned on below the threshold where it is 1.51x worse.
     #: `/health`'s `dram_promotions` is what says the workload crossed it.
     dram_bytes: int = 0,
+    #: directory for the SSD prefix tier; "" is off. Unlike the DRAM tier this one does
+    #: not need concurrent sessions to pay: after a restart HBM is empty, so the first
+    #: lookup of every returning conversation reaches back and the disk is what answers.
+    #: ``ssd_fingerprint`` must change whenever the weights do -- a tier serving KV
+    #: computed under other weights is silently wrong, and the fingerprint is the only
+    #: thing that stops it. Defaults to the model's shape, which does NOT cover a
+    #: different checkpoint at the same shape.
+    #: # ponytail: shape-derived fingerprint; hash the weights when two checkpoints of
+    #: #   one architecture are served from one spill dir
+    ssd_path: str = "",
+    ssd_fingerprint: str = "",
+    #: spill floor in tokens; 0 takes KvTier's own default (one chunk). Measured on H20
+    #: card 6: write-through costs 0.925 s of a 2.041 s prefill, and the reason is that a
+    #: GDN snapshot is a CONSTANT ~157 MB at every prefix length, so the 6 publishes of one
+    #: 2729-token prompt copy 941 MB of state to serve a single 157 MB entry. Raising this
+    #: drops the short publishes, which are the ones a longer prefix supersedes anyway.
+    ssd_min_tokens: int = 0,
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
@@ -1331,6 +1379,11 @@ def build_engine(
         # host, not the process. 4 GiB is 28 snapshots against HBM's 9.
         if dram_bytes:
             kw["dram"] = DramSnapshots(budget_bytes=dram_bytes)
+    if ssd_path:
+        # Not gated on cuda: the tier is target-independent, and the CPU target is where
+        # its parity is checked.
+        kw["ssd"] = KvTier(ssd_path, ssd_fingerprint or _weight_fingerprint(cfg),
+                           **({"min_tokens": ssd_min_tokens} if ssd_min_tokens else {}))
     store = PrefixStore(kv_pool, **kw) if prefix_store is None else prefix_store
     return Engine(
         model,
