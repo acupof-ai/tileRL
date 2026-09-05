@@ -213,6 +213,27 @@ def _add(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
     yield 1, g
 
 
+def _tp_fork(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
+    # Identity forward, all-reduce backward. Each rank's column-parallel linears
+    # contribute their own share of dX for the one replicated activation they
+    # all read; the sum is the true dX.
+    yield 0, backend.all_reduce(g)
+
+
+def _all_reduce(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
+    # Row-parallel forward: Y = sum_r Y_r, so dY_r = dY on every rank already.
+    # The entry exists so the tape's id() chain crosses the collective; without it
+    # RecordingBackend passes all_reduce through and the residual add below it
+    # reads a tensor no entry produced.
+    yield 0, g
+
+
+def _all_gather(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
+    # Forward concatenates each rank's slice; the backward keeps this rank's.
+    dim = kw.get("dim", -1)
+    yield 0, g.chunk(backend.tp_world, dim=dim)[backend.tp_rank].contiguous()
+
+
 def _frozen(fp8: bool) -> _Handler:
     # No master: only dX flows.
     def handler(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
@@ -240,6 +261,9 @@ _BWD: dict[str, _Handler] = {
     "reshape": _reshape,
     "slice": _slice,
     "add": _add,
+    "all_reduce": _all_reduce,
+    "all_gather": _all_gather,
+    "tp_fork": _tp_fork,
     "checkpoint": _checkpoint,
 }
 
@@ -275,6 +299,16 @@ class Tape:
         kwargs: dict[str, Any],
         output: torch.Tensor,
     ) -> None:
+        # An in-place op that returns its own input is invisible here: backward
+        # writes the gradient under id(output), then pops it as consumed, and the
+        # input's gradient vanishes with no error anywhere. all_reduce did exactly
+        # this -- dX came back None. A view is enough to separate them.
+        if any(a is output for a in args) or any(v is output for v in kwargs.values()):
+            raise RuntimeError(
+                f"{op_name} returned one of its own inputs; the tape addresses "
+                "tensors by id(), so its gradient would be dropped silently. "
+                "Return a distinct object (x.view_as(x) for an in-place op)."
+            )
         self._entries.append(_Entry(op_name, tuple(args), dict(kwargs), output))
 
     def _first_use(self) -> dict[int, int]:

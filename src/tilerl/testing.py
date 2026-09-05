@@ -36,6 +36,39 @@ class RefBackend:
     name = "reference"
     target = "cpu"
     device = torch.device("cpu")
+    tp_world = 1
+    tp_rank = 0
+
+    def init_tp(self, world: int, rank: int) -> None:
+        """Same seam as ``Backend.init_tp``; gloo, so the TP gate runs CPU-only."""
+        if world == 1:
+            return
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            dist.init_process_group("gloo", world_size=world, rank=rank)
+        self.tp_world, self.tp_rank = world, rank
+
+    def all_reduce(self, x):
+        if self.tp_world == 1:
+            return x
+        import torch.distributed as dist
+
+        dist.all_reduce(x)
+        return x.view_as(x)  # distinct object: the tape addresses by id()
+
+    def all_gather(self, x, dim: int = -1):
+        if self.tp_world == 1:
+            return x
+        import torch.distributed as dist
+
+        x = x.contiguous()
+        parts = [torch.empty_like(x) for _ in range(self.tp_world)]
+        dist.all_gather(parts, x)
+        return torch.cat(parts, dim=dim)
+
+    def tp_fork(self, x):
+        return x if self.tp_world == 1 else x.view_as(x)
 
     def __getattr__(self, name):
         if name in _REF_OPS:
