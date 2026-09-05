@@ -62,6 +62,15 @@ detected the defect, printed it, and the harness above it called that a pass. Ru
 the check under the shell CI uses (bash), and assert on `$?` of the process
 itself — a grep or a pipe in between reports its own status, not the gate's.
 
+*Reproduced by the author of this entry, hours after writing that sentence.* Checking
+whether a bench guard fired under `-O`, I ran `python3 -O scripts/... ; echo $?` through
+`| tail -3` and read `0`, which says the guard did not fire. Dropping the pipe gave `1`:
+it had fired all along. The rule that would have caught it is not "remember that a pipe
+eats `$?`" — that is exactly what the paragraph above already says, and it did not help.
+It is **capture the process's status, then look at its output separately**: `rc=$?` on its
+own line before anything reads the output. A habit at the point of use, not a fact in
+memory.
+
 **7. A compared tensor with a local term.** The guard: an ungrouped TP all-reduce
 destroys DP, so dp0's and dp1's gradients must differ. They did differ — max|d|
 3.4e+02 — with the bug live. `embed_tokens`' gradient carries a scatter over each
