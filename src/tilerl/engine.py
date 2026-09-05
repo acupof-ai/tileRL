@@ -1240,6 +1240,11 @@ def build_engine(
     #: workload is measured where it wins. A single conversation is not one: it re-reads
     #: only its newest entry, so the LRU snapshot a demotion picks is never asked for
     #: again -- measured, 43 demotions and 0 promotions, with the wall clock 1.51x worse.
+    #: **No CLI flag, deliberately: settable only from here.** The condition is
+    #: `concurrent sessions > HBM snapshot budget` (measured: 2 -> 0 promotions, 9 -> 17,
+    #: 12 -> 24), and a serving operator cannot read either operand off the command line,
+    #: so a flag would mostly be turned on below the threshold where it is 1.51x worse.
+    #: `/health`'s `dram_promotions` is what says the workload crossed it.
     dram_bytes: int = 0,
     decode_graph: bool | None = None,
     draft: Any = None,
