@@ -177,6 +177,38 @@ accept-or-reject verdict**.
 non-obvious *why* in ≤1 English line, never the *what* and never which task
 added it. If the code already reads clearly, leave it bare — no comment.
 
+**Before a number leaves your session** (2026-09-05: 20 errors entries by 06:00Z,
+most of them one of these shapes):
+- A mechanism claim ships with the probe that tested it. Arithmetic over config dims and
+  a reading of the code are hypotheses; two of each were wrong in both directions today.
+- An arm's number needs a placement control: the same arm in another position, another
+  process, or another card. First-position JIT, an idle-card microbench (11.6 vs 161.9 ms
+  in-path) and a two-conversation sweep each produced a clean, false table.
+- A gate is green only after its negative control is red, and the control must fail for
+  the reason under test. Five controls today passed by a second route the author did not
+  know existed (a second module object, cached bytecode, bash's own reaping, a whole-prompt
+  publish, inherited categories): name the route by which the assertion is true and check
+  the guard is the only one. [errors/2026-09-05-a-control-that-cannot-fail.md](docs/experience/errors/2026-09-05-a-control-that-cannot-fail.md)
+- A second measurement that inherits the first's categories is not a second measurement.
+  Two sessions bucketed one adapter file and agreed to the digit; the second had hardcoded
+  the first's suffixes, and a third suffix (`.wscale`, 466 keys) sat uncounted until a
+  loader refused. Enumerate what is there, never count the categories you already believe.
+- Volume is not time. A pad histogram in elements says where copies are, not where
+  seconds go; only a phase-attributed profile does.
+- A negative verdict on a condition with two variables needs a sweep of each. "DRAM tier
+  is structurally useless" came from a sweep of the HBM budget at two sessions; the
+  condition was sessions > budget, and the other axis reversed it (0/63 → 24/0 hits).
+  A one-axis sweep finds a threshold, and a threshold reads like a law. A veto gets the
+  scrutiny a claim gets; an instrument that errs toward your conclusion produces no
+  surprise and so never gets checked.
+- Before building, `git log -S<symbol> --all`: KvTier was four commits and a review pass
+  on a branch when "no such tier exists" was written on main.
+
+**An errors entry that names a fix is not a fixed bug.** The eval cap was written up on
+09-04 with its fix and scored a live run on 09-05. An entry whose fix has not landed says
+`Status: open` and is listed in [`docs/experience/OPEN.md`](docs/experience/OPEN.md); the
+PR that closes it removes the line. Review a training or serving change against that list.
+
 **Memory.** Skeletons: `errors/YYYY-MM-DD-slug.md` = Context / Root Cause /
 Fix / Rule; `wins/…` = Context / What Worked / Rule. Bench snapshots use
 [TEMPLATE-bench.md](docs/experience/wins/TEMPLATE-bench.md), never overwritten.
