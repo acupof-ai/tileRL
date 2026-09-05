@@ -614,18 +614,22 @@ class Engine:
             chunk = min(len(r.tokens) - r.prefill_from, budget)
             if chunk <= 0:
                 break
-            # Cut a ragged tail off the FIRST chunk so the boundary the store publishes at
-            # is _PREFILL_BUCKET-aligned. The state pool is exact only at a chunk end, so
-            # `_finish_prefills` used to publish a 40-token prompt nowhere at all --
-            # 40 % BLOCK_TOKENS != 0 skipped it, and 15 of every 16 prompt lengths are
-            # ragged. Measured on the live V100: prefix_published 4, all four from decode,
-            # prefix_hits 0 over a 6-turn chat. The tail is one extra forward (a launch,
-            # not extra tokens) and buys back 5568 of 5682 shareable tokens, 50.1 s of a
-            # 74.0 s 6-turn prefill.
+            # Cut a ragged tail off the FIRST chunk so at least one publish point exists.
+            # Two separate conditions, and only the first gates publishing: a publish needs
+            # `% BLOCK_TOKENS == 0` (the entry slices whole blocks) and a state that is
+            # exact, which holds at ANY chunk end. 64 is not required -- measured, a chunk
+            # ending at 48 publishes and its restored state is allclose to a NoPrefixStore
+            # engine's, max|delta| 0.000e+00. What 64 buys is reachability: a prompt shorter
+            # than the token budget is ONE chunk, and `_finish_prefills` then had nowhere
+            # aligned to publish, since it required the WHOLE prompt length to be aligned
+            # and 15 of every 16 lengths are not. Measured on the live V100 before this:
+            # prefix_published 4, all four from decode, prefix_hits 0 over a 6-turn chat.
+            # The tail is one extra forward -- a launch, not extra tokens.
             # ponytail: the first chunk only. A later chunk is ragged whenever a decode row
             # shares the tick (budget = max_num_batched_tokens - len(decodes)), and aligning
-            # those too would round the token budget itself down to 64 -- a hot-path change
-            # for prompts that already published at their first boundary.
+            # those would round that budget down to 64 -- shrinking the token budget for the
+            # DECODE rows sharing the tick, a throughput cost on every batched tick to help
+            # prompts that already published at their first boundary.
             aligned = (chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
             if r.prefill_from == 0 and aligned and aligned != chunk:
                 chunk = aligned
@@ -661,6 +665,7 @@ class Engine:
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
+            store = self._prefix.stats()
             return {
                 "waiting": len(self._waiting),
                 "running": len(self._running),
@@ -673,6 +678,11 @@ class Engine:
                 "prefix_hits": self._prefix_hits,
                 "prefix_misses": self._prefix_misses,
                 "prefix_published": self._prefix_published,
+                # Whether the store is under pressure at all: a DRAM/SSD tier below it can
+                # only recover entries that were actually evicted, and at 144 MiB a 27B
+                # snapshot the sm70 budget (free/4 = 1417 MiB) holds 9 of them.
+                "prefix_evictions": store["evictions"],
+                "prefix_state_bytes": store["state_bytes"],
                 "prefill_forwards": self._prefill_forwards,
                 "decode_forwards": self._decode_forwards,
                 "mixed_forwards": self._mixed_forwards,

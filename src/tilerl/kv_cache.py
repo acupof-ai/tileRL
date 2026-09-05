@@ -294,6 +294,11 @@ class NoPrefixStore:
     """Never matches, never retains: a training rollout must not serve KV
     computed under an earlier policy. Also the miss-path double for tests."""
 
+    #: Nothing is retained, so nothing is ever evicted. Declared rather than left to a
+    #: getattr default at the read site: a duck-type miss there reports 0 evictions for a
+    #: real store too, which is exactly the "no pressure" reading a tier below would act on.
+    evictions = 0
+
     def lookup(self, tokens: Sequence[int]) -> PrefixHit | None:
         return None
 
@@ -305,6 +310,10 @@ class NoPrefixStore:
 
     def clear(self) -> None:
         return None
+
+    def stats(self) -> dict[str, int]:
+        return {"entries": 0, "capacity": 0, "state_bytes": 0, "hits": 0, "misses": 0,
+                "evictions": 0}
 
 
 class PrefixStore:
