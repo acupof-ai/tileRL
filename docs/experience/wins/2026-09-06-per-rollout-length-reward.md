@@ -54,6 +54,27 @@ The gate samples `len(list_runs(root))` at the start of every step and asserts i
 is never 0; removing the pre-loop write turns it red with `list_runs saw
 [0, 0, 0, 0, 0, 0, 0, 0, 0]`.
 
+**Sending the signal a second time found what the fix leaves behind.** A cpu run
+at group 8, SIGTERM by verified pid after 22 steps: `rollouts.jsonl` held exactly
+`22 × 8 = 176` rows, the last one `step 22`, matching the last step line — the
+per-step append loses nothing when the append is the last thing a step does. The
+manifest is now on disk, `finished: null`, and `tilerl ledger` shows the run.
+
+But it prints **`skip`**, rc 0:
+
+```
+c13cfab9f89b  train  running  skip
+```
+
+`_finish` never ran, so `gates` holds only the pre-seeded `rollouts_within_cap`
+with `skipped: true`, and `format_run`'s verdict is `skip` when every gate is
+skipped and `pass` when the list is empty — a run killed before step 1 reads
+`pass`. Neither says "interrupted". The `running` in the timestamp column is the
+only signal, and it comes from `finished: null` rather than from any gate. So the
+ledger can now *see* an interrupted run, which is the point of the fix, but it
+does not *judge* it: do not read a verdict off a run whose finished field is null.
+Distinguishing "killed" from "passed" is a separate change and is not in this PR.
+
 `manifest["metrics"]["length_reward_r"]` is the Pearson r of (tokens, reward)
 pooled over **within-group deviations**. Centering per group is the whole
 mechanism: a hard prompt shifts both its lengths and its rewards, and that shift
@@ -113,6 +134,10 @@ the finding.
 run loses one metric. It loses the whole manifest, and the ledger cannot see the
 run at all. Reading a code path tells you what it does when reached; only killing
 a real process tells you what is on disk when it is not.
+
+Signalling once found the missing manifest; signalling again after the fix found
+that the recovered manifest reads `skip` — one probe answers one question, and
+the fix's own output is the next thing to probe.
 
 ## Results
 
