@@ -143,11 +143,15 @@ def test_grpo_length_buckets_preserve_real_token_loss_and_gradients(monkeypatch)
         np.testing.assert_allclose(results[0][0], results[1][0], rtol=1e-5, atol=1e-6)
         assert results[0][1].keys() == results[1][1].keys()
         failures = []
+        # atol: the conv1d gradient sums over a width-dependent padded axis; the macos-14
+        # runner (3 threads, torch 2.13) measured |d| 2.0e-6 on |ref| 0.055 between widths
+        # 512 and 2048, where 3 Linux/Mac hosts gave 0. Five times that, not a bug bound.
+        atol = 1e-5
         for key, actual in results[0][1].items():
             ref = results[1][1][key]
-            if not torch.allclose(actual, ref, rtol=1e-5, atol=1e-6):
+            if not torch.allclose(actual, ref, rtol=1e-5, atol=atol):
                 failures.append(f"{key}: max |d|={(actual - ref).abs().max().item():.9g}, "
-                                f"max |ref|={ref.abs().max().item():.9g}, rtol=1e-5, atol=1e-6")
+                                f"max |ref|={ref.abs().max().item():.9g}, rtol=1e-5, atol={atol}")
         assert not failures, (
             f"cap={cap}, longest={longest}, width={width}; torch={torch.__version__}, "
             f"threads={torch.get_num_threads()}, platform={platform.platform()}\n"
