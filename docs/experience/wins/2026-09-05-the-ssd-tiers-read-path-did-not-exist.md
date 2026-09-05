@@ -115,7 +115,15 @@ Two mechanisms, both inside the tier:
   156896685–156901293 B, a 4.6 KB spread). So a 2729-token prompt's six publishes spilled
   941 MB of state plus 683 MB of KV = 1624 MB, to serve **one** 325 MB entry — 5.0x the
   bytes that can ever be read. `insert(..., spill=False)` on the intermediate chunk
-  boundaries keeps them in HBM and skips the disk: 1624 MB → 325 MB.
+  boundaries keeps them in HBM and skips the disk: 1624 MB → 325 MB. **Gated only after
+  the fact:** dropping the kwarg left all 328 tests passing, so the entire difference between
+  8.96% and 45.3% was a one-word regression no local run would catch — the number is measured
+  on a machine this suite never runs on. `test_an_intermediate_chunk_publish_stays_out_of_the_disk_tier`
+  asserts `prefix_published == 5, ssd_offered == 1` at a 48-token budget over 240 tokens;
+  without the kwarg it is 5 and 5, the same 5.0x. Both operands are asserted because the
+  warm-up length decides whether either is even reachable: a ragged one never fires the
+  prompt-complete publish, so the expected offer count is 0 and "only the last spilled"
+  cannot be told from "nothing spilled".
 * **`.cpu()` is a synchronous pageable copy.** Pinned destination plus `non_blocking=True`,
   with the flush daemon waiting on a recorded event before it reads the buffer.
 
@@ -172,9 +180,64 @@ the tier. Two things had to be handled so that it stays a loss rather than a fau
   by cross-control: deleting `load_kv`'s guard fails `.kv` alone, deleting `load_state`'s
   fails `.st` alone.
 
+**A `drop()` inside that same window is handled by two guards, and neither had a test.**
+`drop()` clears the pending tables and unlinks, but the daemon is already past that point
+holding the blob: its `torch.save` completes *after* the drop and rewrites the file the drop
+removed. Two separate lines catch it, and they cost different things:
+
+| mutation | `ssd_entries` | files left | consequence |
+|---|---:|---:|---|
+| `still_pending = table.get(k) is blob` forced True | **1** | 1 | the dropped prefix is indexed, so a lookup can serve it — after `invalidate()`, KV from the previous weights |
+| `os.remove(dst)` after the save deleted | 0 | 1 | one unpaired `.kv`; the next `_recover` drops it because it adopts by pair — a leak until restart, not stale service |
+| both | 1 | 1 | as row 1 |
+
+**Both are process-local**, which bounds the severity and is worth stating rather than leaving
+alarming. `drop()` clears both pending tables, so only the half already in flight is rewritten and
+the `.st` half never reaches disk. Measured under row 1: in-process `ssd_entries` 1, and after a
+fresh `KvTier` over the same directory, `recovered: 0` with the file gone — an unpaired blob is
+dropped whichever guard failed. So row 1 is stale service until the process exits, not a
+permanently poisoned entry; row 2 is wasted bytes for the same span.
+
+**I first reported row 1's numbers as row 2's**, because the mutation I ran replaced the whole
+`if still_pending: ... else: remove` block rather than only the rollback, so it removed both
+guards at once and I attributed the resurrection to the unlink. Codex caught it on review of
+#132. The fix is one assertion per guard, **index first** — pytest stops at the first failure,
+and both mutations leave a file, so asserting the file first makes the index assertion
+unreachable in every arm. That ordering is exactly what let the wrong claim stand: the
+assertion whose message said "indexed again" was never executed in the run I quoted.
+
+**The gate's own first version was inert, and its negative control passed.** It waited with
+`_flushed`, which polls the pending tables — and `drop()` had just emptied them, so the helper
+returned while the daemon was still inside `torch.save`. The second attempt waited on
+`_q.unfinished_tasks`, which never reaches 0 because nothing calls `task_done()`; that one
+worked but spent 6.46 s in a timeout, and a wait condition that cannot change is the same
+defect as one already satisfied. What works is waiting on the save actually in flight (one
+`torch.save`, not two: the state half is skipped at the `table.get(k) is not blob` check
+without ever calling save) and then polling the directory. 0.01 s, control red.
+
+**One mutation that survived is not a gap — it is redundant code.** The eviction victim search
+skips keys still in the pending tables, and deleting that skip changes no test. It is not
+untested: the skip *does* filter, 6 of 12 candidates in a forced-eviction probe (a key enters
+`_lru` when its first half lands, so it is indexed and pending at once). But orphan files,
+half pairs and unaccounted bytes all came out identical with and without it, because the
+`table.get(k) is blob` re-check plus the rollback above already cover the same race one layer
+down. Left in place; recorded so the next person does not spend the same hour writing a gate
+for a condition whose removal has no observable effect. The distinction is worth the two
+probes it took: "the suite stays green" means either a missing gate or dead weight, and only
+comparing the observable state tells you which.
+
 What is NOT claimed: no fsync on the publish path, so a host power loss can lose an entry
 the daemon believes it wrote. The tier is a cache — every entry is reconstructible by
 prefill — so durability past process death was not bought.
+
+Also not covered, deliberately: the hop from `args.<flag>` to `_build_engine` inside `serve`.
+Replacing `ssd_min_tokens=args.ssd_min_tokens` with a constant leaves all 330 tests passing,
+and the same is true of the seven other arguments in that call and of all 70 `add_argument`
+entries — it is one direct-pass call site, so covering it per-argument is 70 assertions for one
+line of plumbing. The proportionate gate is one end-to-end CLI start that reads the values back
+off `/health`, which needs a server process and is not in this change. Recorded rather than
+quietly left: the flags are covered from `_build_engine` inward (both, with separate controls
+for "did not arrive" and "arrived and does nothing"), and uncovered from argparse to that call.
 
 ## Rule
 
@@ -196,6 +259,26 @@ early `return`, a side effect next to a return value, and an `or` — what they 
 one fact needs two assertions and a plausible test satisfies one. Delete each branch and
 re-run; a suite that stays green names the gap. And assert a counter only the second path
 increments — "it did not raise" is also satisfied by never getting there.
+
+**A mutation must be as narrow as the claim it supports.** Writing one gate for two guards, I
+replaced the whole `if still_pending: ... else: remove` block, saw the resurrection, and
+published it as the cost of deleting the unlink — two guards' worth of damage attributed to one
+line. Measured apart, they differ in kind: the `still_pending` check keeps the dropped key out
+of the index (stale service if it fails), the `os.remove` keeps the bytes off the disk (a leak).
+Codex caught it on review.
+
+**Assertion order decides which claim is testable at all, and a red control names an assertion,
+not your assertion.** Both mutations above leave a file on disk. The file assertion came first.
+pytest stops at the first failure — so the assertion whose message said "indexed again" **never
+executed** in the run I cited as its proof. I had already written the rule "run every control in
+the failing state and confirm it fails", and I did; the control failed; the claim was still
+untested. So: put the discriminating assertion first, keep anything that fails in every arm
+after it, and read the assertion text in the failure output rather than the exit status. Filed as
+instance 8 in
+[errors/2026-09-05-a-control-that-cannot-fail.md](../errors/2026-09-05-a-control-that-cannot-fail.md),
+which is where the next person looks for this shape — the other seven there are controls that
+passed when they should have failed, so that file taught "run it in the failing state", which is
+exactly what was not enough here.
 
 ## Results
 

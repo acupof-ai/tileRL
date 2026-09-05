@@ -1,4 +1,4 @@
-# A control that cannot fail — seven instances in one day, 2026-09-05
+# A control that cannot fail — eight instances in one day, 2026-09-05
 
 **Date:** 2026-09-05
 **Sessions:** tilerl-25, tilerl-48 and v100-sm70-fp4-55, independently
@@ -7,14 +7,22 @@
 ## Context
 
 A negative control is supposed to answer "would this test notice if the thing it
-guards were broken?". Seven times in one day, across three sessions, the control
+guards were broken?". Eight times in one day, across three sessions, the control
 itself was broken in a way that made it answer yes when the honest answer was no.
 None was caught by reading. Four were caught by deleting the guard and watching
 the test pass anyway; the fifth by a loader refusing the file, the sixth by running
-the same command under a different shell, and the seventh by replacing the tensor
-the control looked at.
+the same command under a different shell, the seventh by replacing the tensor
+the control looked at, and the eighth by a reviewer reading the code path and
+saying the counter I quoted cannot move.
 
-## The five
+**The eighth is the inverse of the other seven and is listed with them because the
+lesson generalizes, not because the mechanism matches.** Seven controls passed when
+they should have failed. The eighth *failed* — correctly, on a real defect — but by a
+different assertion than the one carrying the claim, so the red looked like proof of
+something it never tested. That is harder to catch, because every habit built for the
+first seven treats red as the end of the check.
+
+## The instances
 
 **1. A second module copy (`importlib`).** `_timing_snapshot` loads
 `bench_harness.py` through `importlib.util.spec_from_file_location`, which builds
@@ -90,6 +98,36 @@ same number. Distance from the defect is the risk factor. A control has to be
 sensitive to the defect, not merely downstream of it: in instance 7 the shortest
 distance was one line, reducing a tensor whose correct value is known per rank.
 
+### Instance 8: the control failed, and the assertion that failed was not the one under test
+
+| | the claim | what actually went red |
+|---|---|---|
+| 8 | "deleting the rollback re-indexes the dropped prefix (`ssd_entries` 0 → 1)" | `assert not left` — a file on disk, which **both** candidate mutations leave |
+
+`_flush_loop` catches a `drop()` that lands mid-save with two separate lines: a
+`still_pending = table.get(k) is blob` check that keeps the key out of the index, and an
+`os.remove(dst)` that removes the bytes. I mutated the whole `if still_pending: … else:
+remove` block, saw the resurrection, and published it as the cost of the `os.remove` line.
+Measured apart:
+
+| mutation | `ssd_entries` | files left |
+|---|---:|---:|
+| `still_pending` forced True | **1** | 1 |
+| `os.remove(dst)` deleted only | **0** | 1 |
+
+So the claim belonged to the other guard. Two things had to go wrong together, and both are
+generic:
+
+* **the mutation was wider than the claim** — one edit removed two guards, and I attributed
+  the damage to the line my commit message happened to name;
+* **assertion order decided what was testable** — both mutations leave a file, the file
+  assertion came first, and pytest stops at the first failure, so the assertion whose message
+  said "indexed again" **never executed** in the run I cited as its proof.
+
+Caught on PR review by codex reading the code path: `still_pending` is already false after a
+`drop()`, so `_track_written` is skipped and the counter cannot move. Confirmed independently
+by tilerl-25 re-running all four mutations of that PR.
+
 ## Fix
 
 Run every negative control **in the failing state at least once**, and record that
@@ -99,6 +137,14 @@ control, not about the code.
 Concretely: delete the guard, clear `__pycache__`, run the
 test, confirm FAIL, restore, confirm PASS. In this session that turned up two
 vacuous controls out of five written.
+
+**And read which assertion failed.** Instance 8 is here because the paragraph above was
+followed exactly and was not enough: the control ran in the failing state, it failed, and it
+failed by an assertion that fires in every arm. So the check has three parts, not one — mutate
+one line per claim; order the assertions so the discriminating one comes first and anything that
+fails in every arm comes after it; then read the assertion text in the failure output and
+confirm it is the one you are about to cite. A red test names *an* assertion, not *your*
+assertion.
 
 And run it under the shell that will run it in CI. The sixth instance never touched
 the test at all: the assertion was correct, the failure was printed, and the step
@@ -114,6 +160,10 @@ between two derivations that share a premise tests the arithmetic, not the premi
 a test pass proves nothing about what it would catch; the only evidence is a run
 where it caught something. Budget the extra run — it is one command, and both
 vacuous controls here would have shipped as proof otherwise.
+
+**And a control seen to fail is not yet evidence for the claim it was written for.**
+That is instance 8: the failure was real and named a different assertion. Red is where
+the check starts, not where it ends.
 
 Related, from the same day:
 [the gate cannot see the number it guards](2026-09-05-the-gate-cannot-see-the-number-it-guards.md)

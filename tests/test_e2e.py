@@ -540,6 +540,62 @@ def test_a_chunk_end_off_the_bucket_still_restores_an_exact_state():
     )
 
 
+def test_an_intermediate_chunk_publish_stays_out_of_the_disk_tier(tmp_path):
+    """Only the LAST publish of a prompt is offered to disk, and that is the whole 8.96%.
+
+    Every chunk boundary publishes, and each publish offered to the tier costs a D2H inside
+    the prefill that made it. The intermediate ones are pure waste: the prompt-complete
+    publish covers the same tokens and more, and a GDN snapshot is a CONSTANT ~157 MB at
+    every prefix length, so on H20 card 6 a 2729-token prompt's six publishes spilled
+    1624 MB to serve one 325 MB entry — 0.925 s of a 2.041 s request against 0.180 s for the
+    last publish alone.
+
+    `spill=False` on the mid-chunk branch is that fix and nothing asserted it: dropping the
+    kwarg leaves all 328 tests passing (measured), and the regression is invisible except as
+    45.3% instead of 8.96% on a machine this suite does not run on.
+
+    The count is what carries it, so both operands are asserted: `prefix_published` proves the
+    intermediate publishes HAPPENED (otherwise `offered == 1` passes because there was only
+    ever one publish), and `ssd_offered == 1` proves only one reached the tier. The warm-up is
+    block-ALIGNED here, unlike the state test above: a ragged length never fires the
+    prompt-complete branch, so the expected offer count would be 0 and the assertion could
+    not tell "only the last publish spilled" from "nothing spilled at all". Measured at this
+    configuration: 5 publishes, 1 offer.
+    """
+    cfg = tiny()
+    params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=5)
+    rng = np.random.default_rng(7)
+    conv = rng.integers(3, 320, size=600).astype(np.int64)
+    budget, warm_to = 48, 240
+    assert warm_to % BLOCK_TOKENS == 0 and warm_to > budget, (
+        "the warm-up must be block-aligned so the prompt-complete publish fires (that is the "
+        "one offer being counted) and longer than one chunk so intermediate publishes exist"
+    )
+    engine = build_engine(
+        cfg, build_random(cfg, seed=99), get_backend(), num_blocks=64, num_slots=4,
+        max_batch=4, max_total_tokens=2048, max_num_batched_tokens=budget,
+        ssd_path=str(tmp_path), ssd_min_tokens=BLOCK_TOKENS,
+    )
+    engine.submit(conv[:warm_to], params)
+    for _ in range(300):
+        engine.step()
+        if not (list(engine._running) + list(engine._waiting)):
+            break
+    engine.poll()
+
+    st = engine.stats()
+    assert st["prefix_published"] >= 3, (
+        f"only {st['prefix_published']} publishes at a {budget}-token budget over {warm_to} "
+        "tokens; with no intermediate publish the offer count below is trivially 1"
+    )
+    assert st["ssd_offered"] == 1, (
+        f"{st['ssd_offered']} publishes reached the disk tier against "
+        f"{st['prefix_published']} in memory; every intermediate one pays a device-to-host "
+        "copy inside the prefill that made it, and the prompt-complete publish already "
+        "covers those tokens"
+    )
+
+
 def test_the_dram_tier_pays_only_above_its_session_count():
     """The tier's condition is `concurrent sessions > HBM snapshot budget`, both operands.
 
@@ -783,6 +839,29 @@ def test_the_ssd_flag_reaches_the_store_and_the_fingerprint_covers_the_config(tm
     assert os.path.isdir(os.path.join(str(tmp_path), "tilerl_kvtier"))
     assert tier._fingerprint == _weight_fingerprint(cfg)
 
+    # `--ssd-min-tokens` goes through the same `_build_engine` and had no assertion. It is
+    # what every bench uses to drive the tier at a prompt shorter than the 64-token default,
+    # so dropping it silently reports 0 offers -- a tier that looks dead instead of a flag
+    # that was ignored. Asserted by behaviour, not just the attribute: a 32-token prefix is
+    # under the default floor and over this one, so it spills only if the flag arrived.
+    floor = 2 * BLOCK_TOKENS
+    assert floor < 4 * BLOCK_TOKENS, "the test floor must be below KvTier's default"
+    lowered = cli_build(cfg, model, get_backend(), slots=2, blocks=64, max_ctx=256,
+                        ssd_path=str(tmp_path / "low"), ssd_min_tokens=floor)
+    low_tier = lowered._prefix._ssd
+    assert low_tier.min_tokens == floor, (
+        f"--ssd-min-tokens={floor} did not reach the tier (min_tokens={low_tier.min_tokens}); "
+        "every bench that lowers the floor would quietly measure the default"
+    )
+    toks = list(range(floor))
+    pool = lowered._kv
+    assert lowered._prefix.insert(toks, [pool.alloc_block() for _ in range(2)],
+                                 (torch.zeros(3, 4, 8, 8), torch.zeros(3, 2, 16)))
+    assert low_tier.offered == 1, (
+        f"a {floor}-token prefix was not offered to a tier with min_tokens={floor}, so the "
+        "flag arrived but does not take effect"
+    )
+
 
 def test_a_restart_faults_the_prefix_back_in_off_disk(tmp_path):
     """The whole point of the SSD tier: HBM is empty after a restart, the disk is not.
@@ -1009,6 +1088,84 @@ def test_a_spill_still_in_the_queue_is_served_from_memory(tmp_path):
         )
         gate.set()
     _flushed(tier)
+
+
+def test_a_drop_landing_mid_save_does_not_resurrect_the_prefix(tmp_path):
+    """An eviction while the daemon is inside `torch.save` must not leave the bytes behind.
+
+    `drop()` clears the pending tables and unlinks, but the daemon is already past that point
+    with the blob in hand: its `torch.save` completes AFTER the drop and writes the file the
+    drop just removed. Two guards handle it, and they cost different things:
+
+    * `still_pending = table.get(k) is blob` keeps the dropped key OUT OF THE INDEX. Remove it
+      and `ssd_entries` goes 0 -> 1: a lookup can then match a prefix the tier was told to
+      forget, and after an `invalidate()` that is KV computed under the previous weights.
+    * the `os.remove(dst)` after it removes the FILE. Remove only that and the index stays
+      clean at 0 -- what leaks is one unpaired `.kv`, which the next `_recover` drops anyway
+      because it adopts by pair. A leak until the next restart, not stale service.
+
+    So the two assertions are ordered index-first: pytest stops at the first failure, and
+    asserting the file first would make the index assertion unreachable in both mutations,
+    which is how the first version of this test claimed 0 -> 1 for a mutation that leaves it
+    at 0. Verified separately: dropping `still_pending` fails the index assert, dropping the
+    unlink fails the file assert.
+
+    The window is narrow and this is the only way to open it deterministically: block inside
+    `torch.save`, drop, then release.
+    """
+    torch.manual_seed(0)
+    toks = list(range(4 * BLOCK_TOKENS))
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+    pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    tier = KvTier(str(tmp_path), "fp-race", min_tokens=BLOCK_TOKENS)
+    store = PrefixStore(pool, ssd=tier)
+    h = store._hash_all(tuple(toks))
+
+    in_save, let_go, saved = threading.Event(), threading.Event(), threading.Event()
+    real_save = torch.save
+
+    def held_save(*a, **kw):
+        in_save.set()
+        let_go.wait(5)
+        try:
+            return real_save(*a, **kw)
+        finally:
+            saved.set()
+
+    with unittest.mock.patch.object(torch, "save", held_save):
+        assert store.insert(toks, [pool.alloc_block() for _ in range(4)],
+                            (state[0].clone(), state[1].clone()))
+        assert in_save.wait(5), (
+            "the daemon never entered torch.save, so the drop below does not land mid-save "
+            "and this test proves nothing"
+        )
+        tier.drop(h)
+        let_go.set()
+    # NOT `_flushed`: `drop()` empties the pending tables, so that helper returns immediately
+    # while the daemon is still inside `torch.save` -- the first version of this test did that
+    # and its negative control PASSED. `_q.unfinished_tasks` is no good either: nothing calls
+    # `task_done()`, so it never reaches 0. Wait for the save that is in flight, then give the
+    # daemon its next few instructions -- the rollback is the line after `torch.save` returns.
+    assert saved.wait(5), "the held torch.save never completed"
+    d = os.path.join(str(tmp_path), "tilerl_kvtier")
+    for _ in range(20):
+        if not [f for f in os.listdir(d) if f.endswith((".kv", ".st"))]:
+            break
+        time.sleep(0.01)
+
+    left = [f for f in os.listdir(d) if f.endswith((".kv", ".st"))]
+    # Index first: this is the assertion for `still_pending`, and it is the one that means
+    # stale service rather than wasted bytes. Asserting the file first would shadow it --
+    # both mutations leave a file, so the index assert would never be reached.
+    assert tier.stats()["ssd_entries"] == 0, (
+        f"the dropped prefix is indexed again ({tier.stats()['ssd_entries']} entries), so a "
+        f"lookup can match a prefix the tier was told to forget; files left: {left}"
+    )
+    assert not left, (
+        f"a drop mid-save left {len(left)} files on disk: {left}. The index is clean, so this "
+        "is the unlink after `torch.save`: an unpaired blob nothing reads until the next "
+        "_recover drops it"
+    )
 
 
 def test_the_disk_tier_evicts_the_oldest_entry_past_its_byte_budget(tmp_path):
