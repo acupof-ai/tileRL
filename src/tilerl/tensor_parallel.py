@@ -165,6 +165,22 @@ def is_sharded(key: str) -> bool:
     return base in _ROW or base in _COLUMN
 
 
+def shard_dim(key: str) -> int | None:
+    """Which dim this rank holds a slice of: 0 column-parallel, 1 row-parallel.
+
+    ``None`` when the tensor is replicated. An optimizer with a whole-tensor
+    statistic needs the axis, not just the fact, because which of its per-row and
+    per-column reductions are partial depends on it.
+    """
+    if not is_sharded(key):
+        return None
+    head, _, suf = key.rpartition(".")
+    if suf in ("lora_a", "lora_b"):
+        # A [r, k] narrows on its input columns, B [n, r] on its output rows.
+        return 1 if suf == "lora_a" else 0
+    return 1 if _base_name(key) in _ROW else 0
+
+
 def _base_name(key: str) -> str:
     head, _, suf = key.rpartition(".")
     return (head if suf in _QUANT_SUFFIX else key).rsplit(".", 1)[-1]
@@ -327,9 +343,14 @@ if __name__ == "__main__":  # runnable check: the rules, not the plumbing
         if _k not in _loc.params:
             continue
         _n += 1
-        assert is_sharded(_k) == (_full.shape != _loc.params[_k].shape), (
-            f"{_k}: is_sharded={is_sharded(_k)} but {tuple(_full.shape)} -> "
-            f"{tuple(_loc.params[_k].shape)}")
+        _small = _loc.params[_k].shape
+        assert is_sharded(_k) == (_full.shape != _small), (
+            f"{_k}: is_sharded={is_sharded(_k)} but {tuple(_full.shape)} -> {tuple(_small)}")
+        # And the AXIS, which an optimizer with a per-row statistic needs: whether
+        # its row or its column reduction is the partial one depends on it.
+        _axes = [d for d in range(len(_full.shape)) if _full.shape[d] != _small[d]]
+        assert shard_dim(_k) == (_axes[0] if _axes else None), (
+            f"{_k}: shard_dim={shard_dim(_k)} but {tuple(_full.shape)} -> {tuple(_small)}")
     assert _n >= 59, f"only {_n} params compared"
 
     # Mesh: every rank in a (dp=2, tp=4) world lands in exactly one tp group and

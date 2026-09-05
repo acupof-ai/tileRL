@@ -106,3 +106,17 @@ if __name__ == "__main__":  # runnable check
     test_spectrum_preserved_on_tiny_model()
     losses, dt = test_iso_lowers_loss_on_tiny_model()
     print(f"iso: loss {losses[0]:.4f} -> {losses[-1]:.4f}, {dt:.2f}s/step")
+
+
+def test_iso_refuses_a_sharded_param():
+    """A shard's SVD is not a slice of the full matrix's, so no reduce fixes ISO
+    under TP -- it has to refuse. Adafactor's per-tensor statistics can be summed
+    across ranks; a factorization cannot."""
+    import pytest
+
+    opt = ISO(base=Adafactor(lr=1e-3))
+    p = torch.randn(8, 6)
+    with pytest.raises(ValueError, match="does not support tensor parallelism"):
+        opt.step_one(p, torch.randn_like(p), sharded=0)
+    opt.begin()
+    opt.step_one(p, torch.randn_like(p))  # unsharded still works

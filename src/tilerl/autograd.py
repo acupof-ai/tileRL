@@ -449,7 +449,9 @@ class AdamW(_Optimizer):
         self._v: dict[int, torch.Tensor] = {}
         self._step = 0
 
-    def step_one(self, p: torch.Tensor, g: torch.Tensor, key: Any = None) -> None:
+    def step_one(self, p: torch.Tensor, g: torch.Tensor, key: Any = None,
+                 sharded: bool = False) -> None:
+        # AdamW is elementwise: no whole-tensor quantity, so a shard needs nothing.
         b1, b2 = self.betas
         bc1 = 1.0 - b1**self._step
         bc2 = 1.0 - b2**self._step
@@ -504,7 +506,60 @@ class Adafactor(_Optimizer):
         # Stays on device: a float() here is one host sync per parameter, mid-backward.
         return t.norm() / math.sqrt(t.numel())
 
-    def step_one(self, p: torch.Tensor, g: torch.Tensor, key: Any = None) -> None:
+    @staticmethod
+    def _rms_over(t: torch.Tensor, all_reduce: Any) -> torch.Tensor:
+        """RMS of a tensor this rank holds only a slice of.
+
+        Both RMS uses here are per-TENSOR quantities -- the update clip and the
+        relative step size -- so under TP each rank computing its own shard's
+        clips and steps by a different factor. Measured on tiny at tp=2: 32
+        tensors ended up to 304911 ulp from the tp=1 step.
+        """
+        pair = torch.stack([t.detach().float().pow(2).sum(),
+                            torch.tensor(float(t.numel()), device=t.device)])
+        all_reduce(pair)
+        return (pair[0] / pair[1]).sqrt()
+
+    @staticmethod
+    def _mean_over(partial: torch.Tensor, n_local: int, all_reduce: Any) -> torch.Tensor:
+        """A mean whose terms are split across ranks: sum the terms AND the count.
+
+        ``partial`` is this rank's mean over ``n_local`` terms.
+        """
+        s = torch.cat([partial.detach().float() * n_local,
+                       torch.tensor([float(n_local)], device=partial.device)])
+        all_reduce(s)
+        return s[:-1] / s[-1]
+
+    #: ``all_reduce(t)`` over the tp group, set by the caller when this rank holds
+    #: only a slice of the params it updates. None means whole tensors.
+    tp_reduce: Any = None
+
+    # Every whole-tensor statistic in step_one, and what a shard does to it.
+    # Column-parallel splits dim 0, row-parallel splits dim 1. Measured by
+    # splitting a tensor and comparing, not read off the code:
+    #
+    #   statistic              dim-0 shard    dim-1 shard
+    #   u.mean(dim=1)  (r)     whole          NEEDS REDUCE
+    #   u.mean(dim=0)  (c)     NEEDS REDUCE   whole
+    #   r.mean()               NEEDS REDUCE   whole (r is whole)
+    #   _rms(upd)              NEEDS REDUCE   NEEDS REDUCE
+    #   _rms(p32)              NEEDS REDUCE   NEEDS REDUCE
+    #   v (unfactored)         elementwise    elementwise
+    #   weight_decay           via step       via step
+    #
+    # The two RMS are over every element, so both axes hit them. v and the beta1
+    # moment are elementwise. weight_decay scales by step, already reduced.
+
+    def step_one(self, p: torch.Tensor, g: torch.Tensor, key: Any = None,
+                 sharded: int | None = None) -> None:
+        """``sharded`` is the dim this rank holds a slice of (0 column-parallel,
+        1 row-parallel), or None when it holds the whole tensor.
+
+        Every whole-tensor statistic below has to be reduced across the shards or
+        each rank scales by its own slice's value. Which ones are partial depends
+        on the axis -- see the table in the docstring of :meth:`_sharded_stats`.
+        """
         b2 = 1.0 - self._step**self.decay_power
         g = g.to(torch.float32)
         u = g.mul(g).add_(self.eps[0])
@@ -522,20 +577,32 @@ class Adafactor(_Optimizer):
             if self.beta1 > 0.0:
                 st = st + (torch.zeros_like(g),)
             self._state[key] = st
+        red = self.tp_reduce if sharded is not None else None
         if factored:
             r, c = st[0], st[1]
-            r.mul_(b2).add_(u.mean(dim=1), alpha=1.0 - b2)
-            c.mul_(b2).add_(u.mean(dim=0), alpha=1.0 - b2)
-            # outer(r / mean(r), c) is the rank-1 reconstruction of v
-            upd = g * torch.rsqrt(r.div(r.mean()).unsqueeze(1) * c.unsqueeze(0))
+            # r averages along dim 1 and c along dim 0, so the one whose averaging
+            # axis IS the sharded axis has only this rank's terms.
+            ru, cu = u.mean(dim=1), u.mean(dim=0)
+            if red is not None and sharded == 1:
+                ru = self._mean_over(ru, u.shape[1], red)
+            if red is not None and sharded == 0:
+                cu = self._mean_over(cu, u.shape[0], red)
+            r.mul_(b2).add_(ru, alpha=1.0 - b2)
+            c.mul_(b2).add_(cu, alpha=1.0 - b2)
+            # outer(r / mean(r), c) is the rank-1 reconstruction of v. r.mean() is
+            # over ALL rows, so a dim-0 shard holds only some of them.
+            rmean = (self._mean_over(r.mean().reshape(1), r.numel(), red)
+                     if red is not None and sharded == 0 else r.mean())
+            upd = g * torch.rsqrt(r.div(rmean).unsqueeze(1) * c.unsqueeze(0))
         else:
             v = st[0]
             v.mul_(b2).add_(u, alpha=1.0 - b2)
             upd = g * torch.rsqrt(v)
         # A non-finite gradient makes the factor nan or 0; nan_to_num lands it as zeros.
-        upd = torch.nan_to_num(upd.mul_(self.clip / self._rms(upd).clamp(min=self.clip)))
+        rms = (lambda t: self._rms_over(t, red)) if red is not None else self._rms
+        upd = torch.nan_to_num(upd.mul_(self.clip / rms(upd).clamp(min=self.clip)))
         p32 = p.to(torch.float32)
-        step = self._rms(p32).clamp(min=self.eps[1]).mul(self.lr)
+        step = rms(p32).clamp(min=self.eps[1]).mul(self.lr)
         if self.weight_decay > 0.0:
             p32.mul_(1.0 - step * self.weight_decay)
         if self.beta1 > 0.0:

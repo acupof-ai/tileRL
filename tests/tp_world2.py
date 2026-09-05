@@ -8,6 +8,7 @@ recovers by the next step.
     TILERL_TARGET=cpu python3 tests/tp_world2.py            # the gate
     TILERL_TARGET=cpu python3 tests/tp_world2.py --no-fork     # control: no backward collective
     TILERL_TARGET=cpu python3 tests/tp_world2.py --local-clip  # control: clip on the local shard
+    TILERL_TARGET=cpu python3 tests/tp_world2.py --local-stats # control: per-shard Adafactor stats
 """
 
 from __future__ import annotations
@@ -121,7 +122,8 @@ def _one(no_fork: bool, tie: bool) -> tuple[bool, int]:
     return ok, compared
 
 
-def _step_run(rank: int, world: int, local_clip: bool, out: dict) -> None:
+def _step_run(rank: int, world: int, local_clip: bool, out: dict,
+              streams: bool = False, local_stats: bool = False) -> None:
     """One real ``train_step`` (forward, backward, clip, AdamW) and the weights
     it produced. The gradient arms above stop before the update, so nothing there
     sees the clip norm -- which is global, and was this shard's own.
@@ -134,12 +136,16 @@ def _step_run(rank: int, world: int, local_clip: bool, out: dict) -> None:
     os.environ["WORLD_SIZE"], os.environ["RANK"] = str(world), str(rank)
 
     from tilerl import model as model_mod
-    from tilerl.autograd import AdamW
+    from tilerl.autograd import Adafactor, AdamW
     from tilerl.cli import _shard
     from tilerl.config import tiny
     from tilerl.testing import RefBackend
     from tilerl.train import train_step
 
+    if local_stats:  # the control: let each rank use its own shard's statistics
+        import tilerl.tensor_parallel as tp
+
+        tp.shard_dim = lambda k: None
     if local_clip:  # the control: clip on this rank's shard, the pre-fix behaviour
         import tilerl.train as t
 
@@ -152,23 +158,24 @@ def _step_run(rank: int, world: int, local_clip: bool, out: dict) -> None:
     _, local = _shard(cfg, full, world, backend, model_mod)
 
     ids = np.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=np.int64)
-    loss = train_step(local, ids, backend, AdamW(lr=1e-2))
+    loss = train_step(local, ids, backend, Adafactor(lr=1e-2) if streams else AdamW(lr=1e-2))
     out[rank] = (loss, {k: (v.float().tolist(), tuple(v.shape))
                         for k, v in local.params.items()})
 
 
-def _one_step(local_clip: bool) -> tuple[bool, int, float, float]:
+def _one_step(local_clip: bool, streams: bool = False,
+              local_stats: bool = False) -> tuple[bool, int, float, float]:
     from tilerl.config import tiny
     from tilerl.tensor_parallel import shard_params
 
     one: dict = {}
-    _step_run(0, 1, local_clip, one)
+    _step_run(0, 1, local_clip, one, streams, local_stats)
     loss1, w1 = one[0]
     ref = {k: torch.tensor(v).reshape(s) for k, (v, s) in w1.items()}
 
     mgr = mp.Manager()
     two = mgr.dict()
-    mp.spawn(_step_run, args=(2, local_clip, two), nprocs=2, join=True)
+    mp.spawn(_step_run, args=(2, local_clip, two, streams, local_stats), nprocs=2, join=True)
 
     cfg = tiny()
     ok, compared = True, 0
@@ -193,7 +200,7 @@ def _one_step(local_clip: bool) -> tuple[bool, int, float, float]:
             # one loose enough to allow it is 4 bf16 steps wide.
             d = (got[k].float() - w.float()).abs()
             ulp = torch.exp2(torch.floor(torch.log2(w.float().abs().clamp_min(1e-30))) - 7)
-            off = (d > ulp * 1.01).sum().item()
+            off = (d > ulp * (4.01 if streams else 1.01)).sum().item()
             if off:
                 print(f"rank {r}: {k} POST-UPDATE MISMATCH {off}/{d.numel()} weights off by "
                       f">1 bf16 ulp, max {(d / ulp).max().item():.1f} ulp")
@@ -266,15 +273,28 @@ def main() -> int:
 
     # End to end: a whole train_step, weights compared AFTER the update.
     local_clip = "--local-clip" in sys.argv
+    local_stats = "--local-stats" in sys.argv
+    if local_stats:
+        # Adafactor's own control: each rank keeps its shard's statistics, which
+        # is what shipped before the reduce. It must FAIL.
+        st, _, _, _ = _one_step(False, streams=True, local_stats=True)
+        print("local-stats control:", "correctly FAILED" if not st else "PASSED -- vacuous gate")
+        return 0 if not st else 1
     ok, compared, loss1, loss2 = _one_step(local_clip)
     print(f"[train_step] loss tp=1 {loss1:.6f} vs tp=2 {loss2:.6f}; "
           f"{compared} updated tensors compared: " + ("match" if ok else "DIFFER"))
     if local_clip:
         print("local-clip control:", "correctly FAILED" if not ok else "PASSED -- vacuous gate")
         return 0 if not ok else 1
+
+    # Adafactor is the 27B optimizer and clips by whole-TENSOR statistics, which a
+    # shard does not have. AdamW is elementwise and cannot catch this.
+    af, afn, _, _ = _one_step(False, streams=True)
+    print(f"[train_step Adafactor] {afn} updated tensors compared: "
+          + ("match" if af else "DIFFER"))
     if not _refusals():
         rc = 1
-    return rc or (0 if ok else 1)
+    return rc or (0 if ok and af else 1)
 
 
 if __name__ == "__main__":

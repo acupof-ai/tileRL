@@ -125,10 +125,15 @@ def _step(
     # Which gradients this rank holds only a slice of, so clipping can use the
     # whole model's norm instead of this shard's.
     sharded_ids: set[int] = set()
+    shard_dims: dict[int, int] = {}
     if getattr(backend, "tp_world", 1) > 1:
-        from .tensor_parallel import is_sharded
+        from .tensor_parallel import shard_dim
 
-        sharded_ids = {id(p) for k, p in params.items() if is_sharded(k)}
+        for k, p in params.items():
+            d = shard_dim(k)
+            if d is not None:
+                sharded_ids.add(id(p))
+                shard_dims[id(p)] = d
     rows = micro if 0 < micro < b else b
     # One name for "average this gradient over the dp replicas". Absent on a
     # backend that predates dp, and a no-op at dp_world == 1.
@@ -156,6 +161,12 @@ def _step(
         return loss, tape.backward(grad_logits, on_grad=on_grad, needs=param_ids)
 
     if getattr(optimizer, "streams", False):
+        # This optimizer clips by each tensor's own RMS and sizes its step by the
+        # param's, both whole-tensor quantities -- so under TP it must reduce them
+        # across the shards or each rank clips and steps by a different factor
+        # (measured on tiny at tp=2: 32 tensors up to 304911 ulp from the tp=1 step).
+        if sharded_ids and hasattr(optimizer, "tp_reduce"):
+            optimizer.tp_reduce = backend.all_reduce
         # Every weight gradient coexisting is 50.1 GiB on the 27B: this
         # optimizer clips per update, so each gradient is applied and dropped
         # the moment backward finalizes it.
@@ -178,7 +189,7 @@ def _step(
                     # at gate time so the assumption cannot rot silently.
                     order.append(name_of[tid])
                     dp_reduce(g)
-                optimizer.step_one(by_id[tid], g)
+                optimizer.step_one(by_id[tid], g, sharded=shard_dims.get(tid))
                 if timings is not None:
                     timings["optimizer_secs"] += time.perf_counter() - t_update
                 seen += 1
