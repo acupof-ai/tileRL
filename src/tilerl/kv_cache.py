@@ -1030,6 +1030,11 @@ class PrefixStore:
             "entries": len(self._by_id),
             "capacity": self.capacity,
             "state_bytes": self._state_used,
+            # The budget beside the fill, for the reason `dram_budget` exists: `state_bytes`
+            # alone cannot say whether the store is at its ceiling, so a reader cannot tell
+            # state pressure from block pressure. Set from mem_get_info at build time and
+            # otherwise unknowable from outside.
+            "state_bytes_budget": self.state_bytes,
             "hits": self.hits,
             "misses": self.misses,
             "evictions": self.evictions,
