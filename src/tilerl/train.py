@@ -421,8 +421,13 @@ def grpo_loop(
         adv = group_advantages(rewards, group)
         tied = float((adv.reshape(-1, group) == 0).all(axis=1).mean())
         # Power-of-two buckets bound shape JITs (tiny: 37.7 s new width, 71 ms repeat).
+        # Clamped to the cap: an odd cap would otherwise round PAST it (1500 -> 2048, a
+        # 36% overshoot of padding the mask discards). The clamp costs no extra JIT --
+        # the width set is {256, 512, 1024, cap} either way -- and cannot narrow below
+        # the longest completion, since that never exceeds the cap.
         floor = min(256, int(sampling.max_new_tokens))
-        gen = 1 << (max(floor, max(len(c) for c in comps), 1) - 1).bit_length()
+        gen = min(int(sampling.max_new_tokens),
+                  1 << (max(floor, max(len(c) for c in comps), 1) - 1).bit_length())
         batch = np.stack([
             np.concatenate([prompt, np.asarray(c, dtype=np.int64),
                             np.zeros(gen - len(c), dtype=np.int64)])
@@ -437,8 +442,10 @@ def grpo_loop(
             # iterating must not leave the engine holding graphs traced on weights
             # that no longer exist.
             engine.invalidate_weights()
+        # `gen` is the padded width and the mean is the real one: run 2 could not tell
+        # "a long tail" from "every completion at the cap" without both.
         yield (float(np.mean(rewards)), ce, time.perf_counter() - t0, tied,
-               float(np.mean([len(c) for c in comps])), timings)
+               float(np.mean([len(c) for c in comps])), timings, gen)
 
 
 def opd_loop(
