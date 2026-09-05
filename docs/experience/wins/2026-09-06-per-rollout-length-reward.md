@@ -47,12 +47,26 @@ carries `step/g/tokens/reward/advantage` and no model, cap, group, lr, seed or
 commit — the run id is a hash of those and cannot be inverted. The rows survived
 and nothing could say which run made them.
 
-One `write_manifest` before the loop fixes it; `_finish` overwrites it with the
-finished manifest. Re-probed: `list_runs` **0 → 1**, and the manifest on disk
-carries `model`, `commit`, `group`, `max_new_tokens` and the rest of the inputs.
-The gate samples `len(list_runs(root))` at the start of every step and asserts it
-is never 0; removing the pre-loop write turns it red with `list_runs saw
+One `write_manifest` before the eval arms fixes it, for **both algos**; `_finish`
+overwrites it with the finished manifest. Re-probed: `list_runs` **0 → 1**, and the
+manifest on disk carries `model`, `commit`, `group`, `max_new_tokens` and the rest
+of the inputs. The gate samples `len(list_runs(root))` at the start of every step
+and asserts it is never 0; removing the write turns it red with `list_runs saw
 [0, 0, 0, 0, 0, 0, 0, 0, 0]`.
+
+**The first version of that fix covered one branch of two.** It sat inside
+`if args.rl:`, so an interrupted OPD run still left **no run directory at all** —
+worse than the grpo case, which at least had `rollouts.jsonl`. Probed rather than
+read: `tilerl ledger --json` listed 0 runs, and after hoisting the write above
+`evals("before")` it listed 1. The gate cannot see this, because it exercises the
+grpo path only; the OPD half rests on the probe.
+
+That probe also lied once. Its first run reported "0 step lines" after a 180 s
+wait, which reads as a stalled loop — the OPD step line calls `log` without
+`flush=True` (the grpo one at `cli.py:630` passes it), so a pipe buffered every
+line. Re-running the child under `python -u` showed the loop running normally. A
+stdout-driven probe cannot distinguish a quiet loop from a stopped one when the
+thing it reads is buffered.
 
 **Sending the signal a second time found what the fix leaves behind.** A cpu run
 at group 8, SIGTERM by verified pid after 22 steps: `rollouts.jsonl` held exactly
@@ -136,8 +150,10 @@ run at all. Reading a code path tells you what it does when reached; only killin
 a real process tells you what is on disk when it is not.
 
 Signalling once found the missing manifest; signalling again after the fix found
-that the recovered manifest reads `skip` — one probe answers one question, and
-the fix's own output is the next thing to probe.
+that the recovered manifest reads `skip`; signalling the *other algo* found the fix
+had covered one branch of two. One probe answers one question, the fix's own output
+is the next thing to probe — and a fix guarded by a test only on the path the test
+exercises is not yet a fix on the other path.
 
 ## Results
 
