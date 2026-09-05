@@ -23,6 +23,8 @@ _REF_OPS = frozenset(
         "softmax",
         "cross_entropy_loss_grad",
         "state_gather",
+        "gdn_span_ab",
+        "gdn_span_ab_raw",
         "state_scatter",
         "embedding",
         "embedding_bwd",
@@ -130,6 +132,28 @@ class RefBackend:
         out = torch.empty_like(parts[0])
         dist.reduce_scatter(out, parts, group=self._cp_pg)
         return out
+
+    def cp_prefix_scan(self, a, b, chunk_ids=None):
+        """See ``Backend.cp_prefix_scan``; the same shared implementation."""
+        if self.cp_world == 1:
+            return None, None
+        from tilerl_kernels import reference
+
+        return reference.affine_prefix_scan(a, b, self._cp_pg, self.cp_rank,
+                                            self.cp_world, chunk_ids)
+
+    def cp_halo(self, x, ids_by_rank, width: int):
+        """See ``Backend.cp_halo``: left context for the depthwise conv."""
+        if self.cp_world == 1:
+            return [None] * len(ids_by_rank[self.cp_rank])
+        import torch.distributed as dist
+
+        tails = x[:, :, -width:].contiguous()
+        parts = [torch.empty_like(tails) for _ in range(self.cp_world)]
+        dist.all_gather(parts, tails, group=self._cp_pg)
+        owner = {c: (r, i) for r, ids in enumerate(ids_by_rank) for i, c in enumerate(ids)}
+        return [None if c == 0 else parts[owner[c - 1][0]][owner[c - 1][1]]
+                for c in ids_by_rank[self.cp_rank]]
 
     def __getattr__(self, name):
         if name in _REF_OPS:

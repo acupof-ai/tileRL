@@ -278,6 +278,43 @@ class Backend:
         dist.reduce_scatter(out, parts, group=self._cp_pg)
         return out
 
+    def cp_prefix_scan(self, a: torch.Tensor, b: torch.Tensor, chunk_ids=None):
+        """Exclusive scan of the affine pairs ``(A, B)`` over the cp group, so a
+        rank starts each of its chunks from ``A_pre @ s + B_pre`` rather than
+        waiting for its predecessor. See :func:`reference.affine_prefix_scan`."""
+        if self.cp_world == 1:
+            return None, None
+        return reference.affine_prefix_scan(a, b, self._cp_pg, self.cp_rank,
+                                            self.cp_world, chunk_ids)
+
+    def cp_halo(self, x: torch.Tensor, ids_by_rank: list[list[int]], width: int):
+        """The last ``width`` rows of the chunk BEFORE each of this rank's chunks.
+
+        A depthwise conv of kernel K needs K-1 rows of left context, and under CP
+        those live on whichever rank holds chunk c-1 — a different rank per chunk
+        once the layout is zigzag. Dropping them does not just dirty the boundary
+        rows: the corrupted k/v feed the recurrence, so the whole chunk is wrong
+        (measured 0.61 relative after the boundary against 0.79 on the 3 rows).
+
+        ``ids_by_rank[r]`` is rank r's chunk indices in the order it stacks them,
+        so the layout rule lives at the caller and is not restated here. One
+        ``all_gather`` of the tails rather than point-to-point: the payload is
+        0.21 MiB per layer at B=1 and 1.69 at B=8 on the 27B, against a 24 MiB
+        state, and the zigzag source pattern is irregular enough that hand-rolled
+        sends would be the larger risk. ``None`` for chunk 0, which has no
+        predecessor.
+        """
+        if self.cp_world == 1:
+            return [None] * len(ids_by_rank[self.cp_rank])
+        import torch.distributed as dist
+
+        tails = x[:, :, -width:].contiguous()  # [chunks, B, width, D] per rank
+        parts = [torch.empty_like(tails) for _ in range(self.cp_world)]
+        dist.all_gather(parts, tails, group=self._cp_pg)
+        owner = {c: (r, i) for r, ids in enumerate(ids_by_rank) for i, c in enumerate(ids)}
+        return [None if c == 0 else parts[owner[c - 1][0]][owner[c - 1][1]]
+                for c in ids_by_rank[self.cp_rank]]
+
     def __init__(self, target: str):
         self.target = target
         if target == "metal":
