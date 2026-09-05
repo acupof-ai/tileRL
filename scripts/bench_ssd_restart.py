@@ -53,6 +53,11 @@ import time
 import urllib.error
 import urllib.request
 
+#: Turn 2's extra text. Short on purpose: it must extend the prompt past turn 1 (so the
+#: stored entry is a strict prefix and therefore servable) without adding enough tokens to
+#: move the wall clock.
+_FOLLOWUP = "Now also explain what happens on a cache miss."
+
 _FILLER = (
     "Explain in detail how a paged key-value cache serves a transformer decode step, "
     "including how block tables map logical positions to physical pages. "
@@ -119,15 +124,15 @@ def _compiles(log: str) -> int:
 
 
 def _entry_bytes(spill: str) -> int:
-    """Bytes a single fault-in reads: the servable .kv (second largest) plus its .st."""
+    """Bytes a single fault-in reads: the servable .kv (the longest) plus its .st."""
     d = os.path.join(spill, "tilerl_kvtier")
     if not os.path.isdir(d):
         return 0
     kvs = sorted((os.path.getsize(os.path.join(d, f)), f)
                  for f in os.listdir(d) if f.endswith(".kv"))
-    if len(kvs) < 2:
+    if not kvs:
         return 0
-    size, name = kvs[-2]
+    size, name = kvs[-1]
     st = os.path.join(d, name[:-3] + ".st")
     return size + (os.path.getsize(st) if os.path.exists(st) else 0)
 
@@ -136,19 +141,20 @@ def _matched_tokens(spill: str) -> int:
     """Tokens covered by the entry that can actually serve, from the spill file sizes.
 
     Every .kv is a whole number of publish units, so the sizes give the coverage ladder
-    directly. The LARGEST one is the whole prompt and cannot serve -- `_match_prefix`
-    treats a full-length hit as a miss -- so the servable one is the second largest.
-    Returns 0 when there is no second entry, which makes the ceiling check say so instead
-    of dividing by zero.
+    directly, and the LONGEST entry is the one that serves: the measured request is turn 1
+    plus a follow-up, so turn 1's prompt-complete publish is a strict prefix of it. (When
+    the two requests are identical the longest entry is a full-length match, which
+    `_match_prefix` treats as a miss -- that is a bench artifact, and the fix is the
+    follow-up rather than reading the second-longest here.)
     """
     d = os.path.join(spill, "tilerl_kvtier")
     sizes = sorted(
         os.path.getsize(os.path.join(d, f))
         for f in os.listdir(d) if f.endswith(".kv")
     ) if os.path.isdir(d) else []
-    if len(sizes) < 2:
+    if not sizes:
         return 0
-    return round(sizes[-2] / sizes[0]) * _UNIT_TOKENS
+    return round(sizes[-1] / sizes[0]) * _UNIT_TOKENS
 
 
 #: Tokens per publish unit, derived from the size ladder rather than assumed: the smallest
@@ -286,14 +292,20 @@ def main() -> None:
     _arm(args, "jitwarm", warm_dir, prompt)
     shutil.rmtree(warm_dir, ignore_errors=True)
 
+    # Turn 2 is turn 1 plus more text -- that is what a chat client sends, and it is what
+    # makes the tier's LAST publish the entry that serves. Re-sending the IDENTICAL prompt
+    # instead makes the longest stored entry a full-length match, which `_match_prefix`
+    # treats as a miss, so the served entry would be the second-longest and the bench would
+    # disagree with production about which publish matters.
+    turn2 = prompt + " " + _FOLLOWUP
     rows = [_arm(args, "cold", main_dir, prompt)]
     print(json.dumps(rows[-1]), flush=True)
     # The spill was just WRITTEN, so it is in page cache. Evict it, or the faulted arm
     # measures memory and reports it as disk.
     print(json.dumps({"evict": _evict_cache(main_dir)}), flush=True)
-    rows.append(_arm(args, "faulted", main_dir, prompt))
+    rows.append(_arm(args, "faulted", main_dir, turn2))
     print(json.dumps(rows[-1]), flush=True)
-    rows.append(_arm(args, "control", ctrl_dir, prompt))
+    rows.append(_arm(args, "control", ctrl_dir, turn2))
     print(json.dumps(rows[-1]), flush=True)
 
     cold, faulted, control = rows
