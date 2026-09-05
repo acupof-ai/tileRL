@@ -12,12 +12,20 @@ Both numbers are measured, not assumed.
 |---|---:|---|
 | `/data00` sequential read | **189 MB/s** | `dd` 1 GiB `iflag=direct` |
 | `/data00` sequential write | **229 MB/s** | `dd` 1 GiB `oflag=direct` |
+| pinned DRAM→HBM | **11.52 GiB/s** | `copy_` of a 149.6 MiB snapshot, 20 iters |
+| pinned HBM→DRAM | **12.26 GiB/s** | same, reversed |
+| unpinned DRAM→HBM | **6.12 GiB/s** | same buffer without `pin_memory` |
 | PCIe link | **Gen3 x16** | `nvidia-smi --query-gpu=pcie.link.gen.current` |
 | host RAM | **31 GiB total, 25 available** | `free -g` |
 | both block devices | **`ROTA 1`** — no NVMe | `lsblk -d -o NAME,SIZE,ROTA` |
 
 I had been about to design against a 2 GB/s NVMe assumption. The real device is
 **10.6x slower** than that, and it is not flash.
+
+**The pinned figure is now measured, not estimated.** 11.52 GiB/s against the 12
+GB/s I estimated — 1.03x, so every projection below that used the estimate stands.
+And **pinning is worth 1.88x on H2D, 2.76x on D2H**, which was also an untested
+claim in the first draft of this page.
 
 The other number that matters is one this session measured on the card: an
 11019-token prompt re-prefills in **163 s** (14.68 ms/token). That is what any
@@ -29,11 +37,14 @@ An entry is `ceil(tokens/16)` KV blocks at **2.125 MiB** plus **one GDN snapshot
 149.6 MiB** (f32 on sm70: 48 linear layers × 48 heads × 128² state, plus one
 conv-window plane).
 
-| tokens | entry size | DRAM→HBM (est, 12 GB/s) | disk→HBM (**measured** 189 MB/s) | re-prefill |
+| tokens | entry size | DRAM→HBM (**measured** 11.52 GiB/s) | disk→HBM (**measured** 189 MB/s) | re-prefill |
 |---:|---:|---:|---:|---:|
-| 2048 | 421.6 MiB | 34 ms | **2231 ms** | 30065 ms |
-| 11019 | 1613.7 MiB | 131 ms | **8538 ms** | 161759 ms |
-| 32768 | 4501.6 MiB | 366 ms | **23818 ms** | 481034 ms |
+| 2048 | 421.6 MiB | 36 ms | **2231 ms** | 30065 ms |
+| 11019 | 1613.7 MiB | **137 ms** | **8538 ms** | 161759 ms |
+| 32768 | 4501.6 MiB | 382 ms | **23818 ms** | 481034 ms |
+
+A **snapshot alone** — which is what the first tier moves — is **12.7 ms**, measured
+directly rather than divided out of the table.
 
 Even at 189 MB/s the disk beats re-prefilling by **13-20x**, and the breakeven is
 **57 tokens**. So the disk tier "works" arithmetically. The reason not to build it
@@ -83,9 +94,11 @@ evicting after roughly **181 generated tokens**, on state bytes, with KV blocks
 still available.
 
 So a DRAM tier that holds *only snapshots* raises the store's reach from 11 to
-**171 entries in 25 GiB** for 149.6 MiB of transfer per hit (~12 ms estimated),
-touching no KV path at all. That is a much smaller change than block tiering and
-it relieves the limit that actually binds.
+**171 entries in 25 GiB** — **15.1x** — for **12.7 ms of measured transfer per
+hit**, touching no KV path at all. Against the 163 s that re-prefilling the 11019-
+token prompt costs, that is **12,860x**; against the 19.4 s one-time JIT it also
+avoids, **1,530x**. It is a much smaller change than block tiering and it relieves
+the limit that actually binds.
 
 ## Layout per tier
 
@@ -151,13 +164,15 @@ tier is meant to relieve, and it is measured rather than projected.
 
 ## What I have not established
 
-- The **12 GB/s DRAM estimate is an estimate** — labelled as such everywhere
-  above. A pinned H2D `copy_` benchmark on this card would settle it and costs
-  one short GPU job.
-- Whether promotion can overlap the prefill it saves. If yes the 131 ms is hidden
+- Whether promotion can overlap the prefill it saves. If yes the 137 ms is hidden
   entirely; if the copy must complete before the first attention call, it is on
   the critical path. This is a code-reading question about the engine's stream
   usage, not a measurement.
 - Hit rate. Every figure here is the cost of a hit, and none of it is worth
-  anything if the workload does not re-read prefixes. `prefix_hits: 0 /
-  misses: 2` is all the evidence that exists so far.
+  anything if the workload does not re-read prefixes. The two shapes to measure
+  are the chat client's growing prefix and a rollout group's shared prompt; both
+  are real, neither is measured yet. `prefix_hits: 0 / misses: 2` is all the
+  evidence that exists so far.
+- The **bandwidth figures were taken with the 27B server resident and idle**, so
+  they are lower bounds on an idle card. Co-tenancy can only make them worse,
+  which is the safe direction for a design that rests on them.
