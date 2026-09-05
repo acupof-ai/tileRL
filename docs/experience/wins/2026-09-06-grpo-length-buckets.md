@@ -25,8 +25,13 @@ the paged KV pool. The cost was memory and backward FLOPs.
 
 The clamp adds no JIT. Checked exhaustively over every `(cap, longest)` pair to
 2099: **zero cases where the width exceeds the cap or falls below the longest
-completion**, and the width set is `{256, 512, 1024, cap}` at any cap — four
-either way. `min(bucket, cap)` was the right shape; capping by rounding the cap
+completion**, and the width set is the powers of two from 256 up to the cap plus
+the cap itself — `{256, 512, 1024, 2048}` at cap 2048, `{256, 512, 1024, 1200}`
+at cap 1200, `{256, 300}` at cap 300, `{8}` at cap 8. Same size as the unclamped
+expression's at every cap to 2099, with only the largest entry differing (cap
+instead of the power of two above it), so the clamp trades no extra JIT for the
+saved padding.
+`min(bucket, cap)` was the right shape; capping by rounding the cap
 down would have reintroduced the data-dependent widths the buckets remove.
 
 The CPU tiny gate runs three arms: longest 300 and 1100 at cap 2048 (widths
