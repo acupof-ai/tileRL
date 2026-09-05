@@ -67,12 +67,17 @@ layers while dK/dV live one layer at a time. The crossover goes from ~64K to
 
 - **CP is unusable on Qwen3.8-27B.** 48 of its 64 layers are GDN, and `_gdn`
   refuses `cp>1` rather than silently start a chunk from a zero state. This is
-  the attention half; the model-level claim waits on the GDN `(A, B)` all-gather.
+  the attention half; the model-level claim waits on the GDN `(A, B)` scan.
+- **Nothing selects CP.** There is no `--cp` flag and `cli.py` passes no
+  `cp_groups`, so the op is reachable only from `tests/cp_world2.py`. The gate
+  proves the math, not that a run can use it.
+- **The `cp>1` refusal now lives in three places** — `Mesh` lost its blanket one,
+  and `_gdn` and the paged path grew their own. Collapse to a single site when
+  the GDN op lands; three checks that must agree is two too many.
 - world=2 on CPU/gloo is the largest exercised. No NCCL, no multi-GPU, no 27B run
   (`pending-remote`).
 - No perf number of any kind. The collective is unbucketed and unoverlapped, and
   the exposed-cost measurement the ring decision rests on still does not exist.
-- The paged path refuses `cp>1` too — serving holds whole sequences.
 
 ## Rule
 
