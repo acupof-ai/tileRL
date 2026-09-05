@@ -41,6 +41,7 @@ from . import precision
 from .kv_cache import (
     BLOCK_TOKENS,
     BatchKv,
+    DramSnapshots,
     LinearStatePool,
     NoPrefixStore,
     PagedKvPool,
@@ -614,6 +615,25 @@ class Engine:
             chunk = min(len(r.tokens) - r.prefill_from, budget)
             if chunk <= 0:
                 break
+            # Cut a ragged tail off the FIRST chunk so at least one publish point exists.
+            # Two separate conditions, and only the first gates publishing: a publish needs
+            # `% BLOCK_TOKENS == 0` (the entry slices whole blocks) and a state that is
+            # exact, which holds at ANY chunk end. 64 is not required -- measured, a chunk
+            # ending at 48 publishes and its restored state is allclose to a NoPrefixStore
+            # engine's, max|delta| 0.000e+00. What 64 buys is reachability: a prompt shorter
+            # than the token budget is ONE chunk, and `_finish_prefills` then had nowhere
+            # aligned to publish, since it required the WHOLE prompt length to be aligned
+            # and 15 of every 16 lengths are not. Measured on the live V100 before this:
+            # prefix_published 4, all four from decode, prefix_hits 0 over a 6-turn chat.
+            # The tail is one extra forward -- a launch, not extra tokens.
+            # ponytail: the first chunk only. A later chunk is ragged whenever a decode row
+            # shares the tick (budget = max_num_batched_tokens - len(decodes)), and aligning
+            # those would round that budget down to 64 -- shrinking the token budget for the
+            # DECODE rows sharing the tick, a throughput cost on every batched tick to help
+            # prompts that already published at their first boundary.
+            aligned = (chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
+            if r.prefill_from == 0 and aligned and aligned != chunk:
+                chunk = aligned
             # Rows pad to a shared width: pack only within one bucket.
             b = -(-chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
             if prefills and b != bucket:
@@ -646,6 +666,7 @@ class Engine:
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
+            store = self._prefix.stats()
             return {
                 "waiting": len(self._waiting),
                 "running": len(self._running),
@@ -658,6 +679,15 @@ class Engine:
                 "prefix_hits": self._prefix_hits,
                 "prefix_misses": self._prefix_misses,
                 "prefix_published": self._prefix_published,
+                # Whether the store is under pressure at all: a DRAM/SSD tier below it can
+                # only recover entries that were actually evicted, and at 144 MiB a 27B
+                # snapshot the sm70 budget (free/4 = 1417 MiB) holds 9 of them.
+                "prefix_evictions": store["evictions"],
+                "prefix_state_bytes": store["state_bytes"],
+                # Present only with a host tier; a demotion is a prefix the card could not
+                # keep but did not have to lose.
+                **{k: v for k, v in store.items() if k.startswith("dram_")},
+                "prefix_demoted": store.get("demoted", 0),
                 "prefill_forwards": self._prefill_forwards,
                 "decode_forwards": self._decode_forwards,
                 "mixed_forwards": self._mixed_forwards,
@@ -817,6 +847,11 @@ class Engine:
             pf.seq_len = pf.prefill_from
             if pf.prefill_from >= len(pf.tokens):
                 done.append((pf, logits[base + k, min(c, logits.shape[1]) - 1], 0))
+            elif pf.prefill_from % BLOCK_TOKENS == 0:
+                # A chunk end IS a state-pool boundary: nothing has been sampled yet, so
+                # the slot holds exactly tokens[:prefill_from]. This is the publish that
+                # makes a ragged prompt shareable -- `_pick` cut the chunk short for it.
+                self._publish_prefix(pf, pf.prefill_from)
         if not done:
             return
         self._sample_commit(done)
@@ -1201,6 +1236,16 @@ def build_engine(
     max_num_batched_tokens: int = 512,
     max_blocks: int = 0,
     prefix_store: Any = None,
+    #: host-tier budget for demoted GDN snapshots; 0 is off, which is the default until a
+    #: workload is measured where it wins. A single conversation is not one: it re-reads
+    #: only its newest entry, so the LRU snapshot a demotion picks is never asked for
+    #: again -- measured, 43 demotions and 0 promotions, with the wall clock 1.51x worse.
+    #: **No CLI flag, deliberately: settable only from here.** The condition is
+    #: `concurrent sessions > HBM snapshot budget` (measured: 2 -> 0 promotions, 9 -> 17,
+    #: 12 -> 24), and a serving operator cannot read either operand off the command line,
+    #: so a flag would mostly be turned on below the threshold where it is 1.51x worse.
+    #: `/health`'s `dram_promotions` is what says the workload crossed it.
+    dram_bytes: int = 0,
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
@@ -1278,6 +1323,14 @@ def build_engine(
     kw = {}
     if backend.device.type == "cuda":
         kw["state_bytes"] = int(torch.cuda.mem_get_info()[0] // 4)
+        # Host tier for snapshots the card cannot keep resident. Measured on the live
+        # V100: 43 of 43 evictions happened with 64% of the block pool free, so every one
+        # was state bytes -- a prefix thrown away for a byte the host could hold. 4 GiB
+        # rather than the ~25 GiB free: pinned pages cannot be swapped and this pod has
+        # 31 GiB of RAM against a 32 GiB card, so pinning most of it destabilises the
+        # host, not the process. 4 GiB is 28 snapshots against HBM's 9.
+        if dram_bytes:
+            kw["dram"] = DramSnapshots(budget_bytes=dram_bytes)
     store = PrefixStore(kv_pool, **kw) if prefix_store is None else prefix_store
     return Engine(
         model,

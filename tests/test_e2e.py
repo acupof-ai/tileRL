@@ -28,7 +28,7 @@ from tilerl.engine import (
     _step_seed,
     build_engine,
 )
-from tilerl.kv_cache import NoPrefixStore, PagedKvPool, PrefixStore
+from tilerl.kv_cache import DramSnapshots, NoPrefixStore, PagedKvPool, PrefixStore
 from tilerl.model import add_lora, build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
 from tilerl.testing import RefBackend
@@ -391,6 +391,315 @@ def test_prefix_snapshots_die_with_their_store_entry():
         rid = engine.submit([i + 1, i + 2, i + 3], SamplingParams(max_new_tokens=20, seed=i))
         assert len(_drain(engine, [rid], 20)[rid]) == 20
     assert engine._prefix.stats()["evictions"] >= 1
+
+
+def test_a_ragged_prompt_publishes_and_its_state_matches_no_store():
+    """A prompt whose length is not block-aligned must still become shareable, and the
+    state a hit restores must equal the state a store-less engine computes.
+
+    Two failures at once, both measured on the live V100 before the fix:
+    `prefix_published` 4 with `prefix_hits` 0 over a 6-turn chat, every publish from
+    decode and none from prefill. `_finish_prefills` only published when the WHOLE
+    prompt length was block-aligned, and 15 of every 16 lengths are not -- so a chat
+    client resending a growing conversation shared nothing. `_pick` now cuts the first
+    chunk at a _PREFILL_BUCKET boundary and the chunk end publishes.
+
+    The state assert is the half that cannot be dropped. A truncated entry pairs KV
+    for N tokens with a state that absorbed more, and argmax over a vocabulary hides
+    it: an earlier attempt at this was byte-identical in output while the snapshot's
+    norm was 74.0 against a correct 39.75. Comparison happens with both arms at the
+    SAME prefill_from -- reading after one tick puts the hit arm at 164 and the
+    control at 128, which reports 66.5 vs 43.75 and is a measurement error, not a bug.
+
+    `hits >= 1` is asserted first: without a hit nothing was restored and the state
+    comparison is two identical fresh computations. On origin/main this test fails
+    there (hits=0), which is what makes the rest of it mean anything.
+    """
+    cfg = tiny()
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=5)
+    rng = np.random.default_rng(7)
+    conv = rng.integers(3, 320, size=300).astype(np.int64)
+    short, long = 100, 164  # neither is block-aligned; both cross a 64 boundary
+
+    def run(no_store: bool):
+        kw = {"prefix_store": NoPrefixStore()} if no_store else {}
+        engine = build_engine(
+            cfg, build_random(cfg, seed=99), get_backend(), num_blocks=64, num_slots=4,
+            max_batch=4, max_total_tokens=2048, max_num_batched_tokens=512, **kw,
+        )
+        if not no_store:  # warm the store with the shorter prompt
+            engine.submit(conv[:short], params)
+            for _ in range(200):
+                engine.step()
+                if not (list(engine._running) + list(engine._waiting)):
+                    break
+            engine.poll()
+        rid = engine.submit(conv[:long], params)
+        for _ in range(50):
+            engine.step()
+            live = [r for r in list(engine._running) + list(engine._waiting) if r.req_id == rid]
+            assert live, "the row finished before its prompt was prefilled"
+            row = live[0]
+            if row.prefill_from >= long:
+                break
+        return engine, engine._states.states[row.state_slot].clone()
+
+    hit_engine, hit_state = run(False)
+    _, ref_state = run(True)
+    st = hit_engine.stats()
+    assert st["prefix_published"] >= 1, (
+        f"a {short}-token prompt published nothing ({short} % {BLOCK_TOKENS} = "
+        f"{short % BLOCK_TOKENS}); the chunk was not cut at a bucket boundary"
+    )
+    assert st["prefix_hits"] >= 1, (
+        f"no prefix hit (hits={st['prefix_hits']}), so the state comparison below is two "
+        "identical fresh computations and this test is inert"
+    )
+    assert torch.allclose(hit_state, ref_state, rtol=1e-2, atol=1e-5), (
+        f"the restored GDN state differs from a store-less engine's: max|delta| "
+        f"{(hit_state - ref_state).abs().max():.3e}, norms {hit_state.norm():.4f} vs "
+        f"{ref_state.norm():.4f}. The output can be byte-identical while this is wrong."
+    )
+
+
+def test_a_chunk_end_off_the_bucket_still_restores_an_exact_state():
+    """A publish needs block alignment, NOT `_PREFILL_BUCKET` alignment — and the state it
+    restores is exact either way.
+
+    `_pick` aligns the first chunk to `_PREFILL_BUCKET` (64) while the publish gate tests
+    `% BLOCK_TOKENS` (16), which a reviewer read as an inconsistency. It is not: a publish
+    needs whole blocks to slice (`% 16`) and a state that is exact, which holds at ANY
+    chunk end. 64 only guarantees that a single-chunk prompt HAS an aligned boundary.
+
+    Driven with `max_num_batched_tokens=48` so mid-prompt chunk ends land at 48/96/144 —
+    multiples of 16, none of them multiples of 64. The warm-up length is 150, which is
+    NOT block-aligned, so the full-prompt publish branch cannot fire and every entry in
+    the store comes from the mid-chunk `elif`. That isolation is what makes the negative
+    control bite: with the gate switched to `_PREFILL_BUCKET` this configuration publishes
+    **0** entries against 3, so the hit assert fails. A warm-up at 144 does NOT isolate it
+    — the full-prompt branch publishes there and the test passes either way, which is how
+    the first version of this test came out inert.
+    """
+    cfg = tiny()
+    params = SamplingParams(temperature=0.0, max_new_tokens=6, seed=5)
+    rng = np.random.default_rng(7)
+    conv = rng.integers(3, 320, size=600).astype(np.int64)
+    budget, warm_to, target = 48, 150, 272
+    assert budget % BLOCK_TOKENS == 0 and budget % _PREFILL_BUCKET != 0, (
+        "the chunk ends must be block-aligned but off the bucket, or this proves nothing"
+    )
+    assert warm_to % BLOCK_TOKENS != 0, (
+        "the warm-up length must be ragged, or the full-prompt branch publishes and the "
+        "mid-chunk branch this test targets is never exercised"
+    )
+
+    def run(no_store: bool):
+        kw = {"prefix_store": NoPrefixStore()} if no_store else {}
+        engine = build_engine(
+            cfg, build_random(cfg, seed=99), get_backend(), num_blocks=64, num_slots=4,
+            max_batch=4, max_total_tokens=2048, max_num_batched_tokens=budget, **kw,
+        )
+        if not no_store:
+            engine.submit(conv[:warm_to], params)
+            for _ in range(300):
+                engine.step()
+                if not (list(engine._running) + list(engine._waiting)):
+                    break
+            engine.poll()
+        rid = engine.submit(conv[:target], params)
+        for _ in range(300):
+            engine.step()
+            live = [r for r in list(engine._running) + list(engine._waiting) if r.req_id == rid]
+            assert live, "the row finished before its prompt was prefilled"
+            row = live[0]
+            if row.prefill_from >= target:
+                break
+        return engine, engine._states.states[row.state_slot].clone()
+
+    hit_engine, hit_state = run(False)
+    _, ref_state = run(True)
+    st = hit_engine.stats()
+    assert st["prefix_hits"] >= 1, (
+        f"no hit (hits={st['prefix_hits']}), so the state comparison is two identical fresh "
+        "computations and this test is inert"
+    )
+    assert torch.allclose(hit_state, ref_state, rtol=1e-2, atol=1e-5), (
+        f"a chunk end off the {_PREFILL_BUCKET} bucket restored an inexact state: max|delta| "
+        f"{(hit_state - ref_state).abs().max():.3e} — then the publish gate must test the "
+        f"bucket, not {BLOCK_TOKENS}"
+    )
+
+
+def test_the_dram_tier_pays_only_above_its_session_count():
+    """The tier's condition is `concurrent sessions > HBM snapshot budget`, both operands.
+
+    A demotion takes the LRU snapshot and a lookup wants the MRU one, so within ONE
+    conversation they never meet — measured on the V100, 43 demotions and 0 promotions,
+    and 1.51x worse wall clock for it. Across conversations the LRU end IS another
+    session's newest entry, so the tier starts paying as soon as sessions outnumber the
+    budget. Rotating N conversations against a 9-snapshot budget: 2 -> 0 promotions,
+    4 -> 0, 9 -> 17, 12 -> 24, 20 -> 40.
+
+    Both halves are asserted here because either alone reads as a law: I published
+    "structurally dead" off a sweep that held sessions at 2, which is the same relation
+    with the wrong operand pinned. The below-threshold arm is what stops that from
+    happening again.
+    """
+    torch.manual_seed(0)
+
+    def snap(i: int):
+        return (torch.randn(3, 4, 8, 8) + i, torch.randn(3, 2, 16))
+
+    one = sum(t.nbytes for t in snap(0))
+    budget = 9
+
+    def rotate(nconv: int, dram):
+        pool = PagedKvPool(8192, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+        store = PrefixStore(pool, state_bytes=budget * one, dram=dram)
+        convs = [list(range(c * 2000, c * 2000 + 800)) for c in range(nconv)]
+        hits = 0
+        for turn in range(3):
+            for toks in convs:
+                length = (turn + 1) * BLOCK_TOKENS * 3
+                if store.lookup(toks[:length]):
+                    hits += 1
+                for end in range(BLOCK_TOKENS * 3, length + 1, BLOCK_TOKENS * 3):
+                    store.insert(
+                        toks[:end],
+                        [pool.alloc_block() for _ in range(end // BLOCK_TOKENS)],
+                        snap(end),
+                    )
+        return hits, store.stats()
+
+    # Below the threshold the tier must not even engage: two sessions fit in nine.
+    _, few = rotate(2, DramSnapshots(budget_bytes=400 * one))
+    assert few["dram_promotions"] == 0, (
+        f"2 sessions against a {budget}-snapshot budget promoted "
+        f"{few['dram_promotions']}; nothing should have been demoted to promote"
+    )
+
+    # Above it, the tier is the difference between no reuse and complete reuse.
+    plain_hits, plain = rotate(12, None)
+    tier_hits, tier = rotate(12, DramSnapshots(budget_bytes=400 * one))
+    assert plain["evictions"] > 0, (
+        "the no-tier arm evicted nothing, so 12 sessions did not exceed the budget and "
+        "this comparison has no floor"
+    )
+    assert tier["dram_promotions"] > 0, (
+        f"12 sessions promoted nothing (demotions={tier['dram_demotions']}); the tier "
+        "never served a snapshot back and the hit count below cannot be its doing"
+    )
+    assert tier_hits > plain_hits, (
+        f"the tier bought no hits at 12 sessions: {tier_hits} against {plain_hits}"
+    )
+
+
+def test_the_dram_tier_demotes_instead_of_evicting():
+    """Under `state_bytes` pressure the snapshot goes to the host and the entry stays.
+
+    The snapshot is what binds, not the KV: 144 MiB at 27B against 2.125 MiB per block,
+    and `build_engine` sets `state_bytes` to a quarter of free memory. Measured on the
+    live V100: 54 published, **43 evicted with 64% of the block pool still free** — every
+    eviction was state bytes, and every one of them threw away a reusable prefix for a
+    byte the host could have held.
+
+    Same pressure, both arms, six prefixes inserted against room for two snapshots:
+
+    | arm | entries | evictions | hits |
+    |---|---:|---:|---:|
+    | no tier | 2 | 4 | 2/6 |
+    | DRAM | 6 | 0 | 6/6 |
+
+    The round trip is asserted with `torch.equal`, not `allclose`: a pinned host copy and
+    a copy back is a byte-for-byte move, so anything less than exact means the tier
+    reshaped or re-dtyped the snapshot on the way through.
+    """
+    torch.manual_seed(0)
+
+    def snap(i: int):
+        return (torch.randn(3, 4, 8, 8) + i, torch.randn(3, 2, 16))
+
+    one = sum(t.nbytes for t in snap(0))
+
+    def run(dram):
+        pool = PagedKvPool(256, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+        store = PrefixStore(pool, state_bytes=2 * one, dram=dram)
+        toks = list(range(400))
+        kept = {}
+        for k in range(1, 7):
+            length = k * BLOCK_TOKENS * 2
+            kept[length] = snap(k)
+            store.insert(
+                toks[:length],
+                [pool.alloc_block() for _ in range(length // BLOCK_TOKENS)],
+                kept[length],
+            )
+        return store, toks, kept
+
+    plain, toks, _ = run(None)
+    assert plain.stats()["evictions"] >= 1, (
+        "the no-tier arm evicted nothing, so state_bytes pressure was never reached and "
+        "the comparison below has no floor"
+    )
+    plain_hits = sum(1 for k in range(1, 7) if plain.lookup(toks[: k * BLOCK_TOKENS * 2]))
+
+    tiered, toks, kept = run(DramSnapshots(budget_bytes=50 * one))
+    st = tiered.stats()
+    assert st["demoted"] >= 1, (
+        f"nothing was demoted (dram_demotions={st['dram_demotions']}), so this passes for "
+        "the same reason a store with no pressure would"
+    )
+    assert st["evictions"] == 0, (
+        f"the tier still evicted {st['evictions']} entries; demotion is supposed to "
+        f"relieve state-byte pressure without giving up a prefix"
+    )
+    tiered_hits = 0
+    for length, want in kept.items():
+        hit = tiered.lookup(toks[:length])
+        assert hit is not None and hit.length == length, f"lost the prefix at {length}"
+        tiered_hits += 1
+        for got, expect in zip(hit.state, want):
+            assert torch.equal(got, expect), (
+                f"the snapshot at {length} came back changed: max|delta| "
+                f"{(got - expect).abs().max():.3e}"
+            )
+    assert tiered_hits > plain_hits, (
+        f"the tier bought nothing: {tiered_hits}/6 hits against {plain_hits}/6 without it"
+    )
+
+
+def test_a_promotion_that_comes_back_empty_is_a_miss():
+    """A snapshot the tier dropped must not serve its blocks anyway.
+
+    Adopting KV for N tokens with no recurrent state runs the GDN layers from zero over
+    KV that is not zero. It is wrong and it is silent — the earlier truncated-entry bug
+    was byte-identical in output with the snapshot's norm off by 1.86x — so the entry is
+    dropped and the lookup falls through to shorter prefixes or misses.
+    """
+    torch.manual_seed(0)
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+    one = sum(t.nbytes for t in state)
+    pool = PagedKvPool(256, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    # DRAM holds one snapshot, HBM none: inserting two demotes the first, then the tier's
+    # own byte LRU drops it when the second arrives.
+    dram = DramSnapshots(budget_bytes=one)
+    store = PrefixStore(pool, state_bytes=0, dram=dram)
+    toks = list(range(200))
+    for length in (BLOCK_TOKENS * 2, BLOCK_TOKENS * 4):
+        store.insert(
+            toks[:length],
+            [pool.alloc_block() for _ in range(length // BLOCK_TOKENS)],
+            (state[0].clone(), state[1].clone()),
+        )
+    assert dram.drops >= 1, (
+        f"the tier dropped nothing (drops={dram.drops}), so no lookup below hits the "
+        "empty-promotion path and this test is inert"
+    )
+    hit = store.lookup(toks[: BLOCK_TOKENS * 2])
+    assert hit is None or hit.state is not None, (
+        "a hit came back with blocks and no snapshot; the caller would prefill the GDN "
+        "layers from a zero state over non-zero KV"
+    )
 
 
 def test_prefix_hit_survives_evicting_its_own_entry():

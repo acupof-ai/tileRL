@@ -4,7 +4,7 @@ Read of `PagedKvPool`, `LinearStatePool`, `PrefixStore` and the two engine call
 sites, plus four measurements on the pod. One conclusion up front, because it
 changes what the first PR should be.
 
-## The headline: the disk tier is not worth building on this pod, and DRAM barely is
+## The headline: the disk tier does not pay on THIS pod; on an NVMe host it is untested
 
 Both numbers are measured, not assumed.
 
@@ -67,10 +67,14 @@ is also where the checkpoint, the logs and `~/pytmp` live — and `/` is current
 **100% full, 0 bytes**, so the write path has one volume available and it is the
 one under memory pressure already.
 
-**Recommendation: build the DRAM tier, and do not build the disk tier this round.**
-Not "defer for simplicity" — the measurement says its capacity-per-latency is
-poor on this specific hardware, and the same code on a Gen4/NVMe host would be a
-different verdict. Revisit when the target host has NVMe.
+**Recommendation: build the DRAM tier first; the disk tier's value is on the H20,
+not here.** Not "defer for simplicity" — the measurement says its
+capacity-per-latency is poor on **this specific hardware**, a spinning device on a
+host whose `/` is already 100% full. The same code on a Gen4/NVMe host is a
+different verdict, and the H20's `/work` has not been measured yet. So the disk
+tier ships, and every number it reports from this pod is a **lower bound** on what
+the target host does: 189 MB/s is what a `ROTA 1` device gives, not what the
+feature is worth.
 
 ## The snapshot, not the KV, is what to tier first
 
@@ -99,6 +103,106 @@ hit**, touching no KV path at all. Against the 163 s that re-prefilling the 1101
 token prompt costs, that is **12,860x**; against the 19.4 s one-time JIT it also
 avoids, **1,530x**. It is a much smaller change than block tiering and it relieves
 the limit that actually binds.
+
+## Measured after the fact: every eviction was state bytes, and that changed the shape
+
+The section above predicted this; the live server confirmed it and the confirmation
+reordered the code. With `/health` reporting `prefix_evictions` and
+`prefix_state_bytes`, one 4-turn chat at `--grow 40 --max-tokens 200`:
+
+| | value |
+|---|---:|
+| published | 54 |
+| **evictions** | **43** |
+| state bytes | 1646 MiB |
+| block pool | 728 of 2048 used — **64% free** |
+
+**Every one of the 43 evictions ran with two thirds of the block pool idle.** So none
+of them needed the blocks back; each threw away a reusable prefix to reclaim a
+snapshot byte the host could have held.
+
+That rules out the obvious design. Three shapes were considered:
+
+| shape | outcome |
+|---|---|
+| demote the snapshot **when the entry is evicted** | dead — `_evict_one` removes the entry from `_entries`, and `lookup` only reads `_entries`, so the demoted snapshot is unreachable |
+| split eviction into two kinds | `PrefixStore` would carry blocks-without-state, state-without-blocks and whole entries — three states where there was one |
+| **demote INSTEAD of evicting, under state pressure** | the entry keeps its tokens, its blocks and its index slot; only `_Entry.state` moves. One new field, one new branch |
+
+The third ships. `_demote_one` moves the LRU resident snapshot to the host and marks
+the entry; `lookup` promotes it back on the hit; entries are still evicted outright
+when the **block pool** is the pressure, which is the one case a snapshot tier cannot
+help with. `clear()` needs no new path — it drives `_drop`, which calls the tier's
+`forget`, so an optimizer step invalidates DRAM with HBM and a stale snapshot cannot
+outlive its weights.
+
+A promotion that comes back empty (the tier's own byte LRU dropped it) **drops the
+entry rather than serving it**. Blocks without a snapshot would run the GDN layers
+from a zero state over non-zero KV: wrong, and silent in exactly the way the
+truncated-entry bug was — byte-identical output with the snapshot norm off 1.86x.
+
+Isolated arms, six prefixes against room for two snapshots:
+
+| arm | entries | evictions | hits |
+|---|---:|---:|---:|
+| no tier | 2 | 4 | 2/6 |
+| DRAM | 6 | 0 | **6/6** |
+
+## Verdict: it wins when concurrent sessions exceed the HBM snapshot budget, and only then
+
+I first read this as a structural dead end — "demotion picks the LRU end, a lookup
+always wants the MRU one, so they never meet" — and that reading is **wrong**. It holds
+*within* one conversation. Across conversations the LRU end **is** some other
+conversation's newest entry, so a lookup reaches it as soon as there are more live
+conversations than the budget holds.
+
+Rotating N conversations against a fixed 9-snapshot budget:
+
+| conversations | promotions | demotions |
+|---:|---:|---:|
+| 2 | 0 | 0 |
+| 4 | 0 | 3 |
+| **9** | **17** | 35 |
+| 12 | 24 | 51 |
+| 20 | 40 | 91 |
+
+And at 12 conversations the tier is the difference between no reuse and full reuse:
+
+| arm | hits | evictions |
+|---|---:|---:|
+| no tier | **0** | 63 |
+| DRAM | **24** | 0 |
+
+So the value proposition is **concurrent sessions > HBM snapshot budget** — 9 users on
+this V100. A single-user endpoint never reaches it, which is exactly what the earlier
+measurements showed: one conversation gave 43 demotions and 0 promotions, and two
+interleaved gave 16 and 0. Those are not the tier failing; they are two sessions
+against a budget of nine.
+
+The earlier `state_bytes` sweep says the same thing read correctly — "only a budget of
+2 produces promotions" *at two conversations* is the same rule with the other operand
+fixed.
+
+Cost when it runs without winning: **161.9 ms per demotion in situ**, 14.0x the
+11.55 ms an idle-card probe reports, and **1.51x total wall clock** on the single 4-turn
+chat. Only 7.0 s of that 68.7 s is the copies; the rest is contention in the prefill
+they interrupt.
+
+**Ships `dram_bytes=0`, opt-in for multi-user serving.** Off is right for the
+single-session endpoint this pod runs and wrong above 9 concurrent sessions, and the
+flag is the only thing that distinguishes them. What is still unmeasured is the V100
+wall clock at 12 sessions — the CPU numbers above are hit counts, not time.
+
+**RL rollouts are not a second case for it:** within a group the shared prompt is the
+MRU entry, and the store is cleared between steps, so nothing ages out and returns.
+
+**Consequence for the disk tier:** a runtime LRU-demotion disk tier inherits the same
+condition. The cold-start path does not — after a restart HBM is empty, so *every*
+lookup reaches back. Build the disk tier as write-through plus restart recovery
+(rescan the directory, rebuild the index, serve the first hit), not as a third rung
+under the DRAM LRU.
+
+See [errors/2026-09-05-a-two-variable-condition-read-as-a-dead-end.md](experience/errors/2026-09-05-a-two-variable-condition-read-as-a-dead-end.md).
 
 ## Layout per tier
 
