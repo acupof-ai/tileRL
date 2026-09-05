@@ -420,12 +420,9 @@ def grpo_loop(
             rewards = tiebreak(prompt, comps, [r > 0.5 for r in rewards])
         adv = group_advantages(rewards, group)
         tied = float((adv.reshape(-1, group) == 0).all(axis=1).mean())
-        # One rectangle of a FIXED width: TileLang specializes per shape, so a
-        # data-dependent width JITs a fresh kernel set per step (measured on tiny:
-        # 37.7 s for a new width against 71 ms for a repeat). prompt + max_new_tokens
-        # is known before the rollout; seq_lens carries the true lengths and the
-        # advantage mask keeps the padding out of the gradient.
-        gen = max(int(sampling.max_new_tokens), max(len(c) for c in comps))
+        # Power-of-two buckets bound shape JITs (tiny: 37.7 s new width, 71 ms repeat).
+        floor = min(256, int(sampling.max_new_tokens))
+        gen = 1 << (max(floor, max(len(c) for c in comps), 1) - 1).bit_length()
         batch = np.stack([
             np.concatenate([prompt, np.asarray(c, dtype=np.int64),
                             np.zeros(gen - len(c), dtype=np.int64)])
