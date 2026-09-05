@@ -42,9 +42,14 @@ def _run(rank: int, ungrouped: bool, out: dict) -> None:
     mesh = Mesh(dp=DP, tp=TP, rank=rank)
     cfg = tiny()
     full = model_mod.build_random(cfg, seed=0, keep_master=True)
+    # BOTH backends, in one run. RefBackend carries the model; the real Backend is
+    # what production uses, and dropping group= from it left this gate green when
+    # only RefBackend was exercised. It joins gloo on the cpu target, so there is
+    # no reason for it to go unchecked.
     backend = RefBackend()
     groups = None if ungrouped else _all_tp_groups()
     backend.init_tp(WORLD, rank, groups)
+    real = _real_backend(rank, groups)
 
     local = model_mod.Model(tp_config(cfg, TP), shard_params(full.params, cfg, mesh.tp_rank, TP))
 
@@ -66,8 +71,27 @@ def _run(rank: int, ungrouped: bool, out: dict) -> None:
     # grouped, ranks 0,1 sum to 1 and ranks 2,3 to 5; ungrouped, everyone gets 6.
     probe = torch.tensor([float(rank)])
     backend.all_reduce(probe)
+    real_probe = torch.tensor([float(rank)])
+    if real is not None:
+        real.all_reduce(real_probe)
 
-    out[rank] = (mesh.dp_rank, mesh.tp_rank, g.float().reshape(-1).tolist(), probe.item())
+    out[rank] = (mesh.dp_rank, mesh.tp_rank, g.float().reshape(-1).tolist(),
+                 probe.item(), real_probe.item() if real is not None else None)
+
+
+def _real_backend(rank: int, groups):
+    """The production Backend on the cpu target, sharing the initialized gloo world.
+
+    Returns None if tilelang cannot load here; the RefBackend arm still runs and
+    the caller says the real arm was skipped rather than passing silently.
+    """
+    try:
+        from tilerl_kernels.backend import Backend, resolve_target
+    except Exception:
+        return None
+    b = Backend(resolve_target())
+    b.init_tp(WORLD, rank, groups)
+    return b
 
 
 def _all_tp_groups() -> list[list[int]]:
@@ -91,10 +115,12 @@ def main() -> int:
 
     by_dp: dict[int, list[torch.Tensor]] = {}
     probes: dict[int, float] = {}
+    real_probes: dict[int, float | None] = {}
     for r in range(WORLD):
-        dp_rank, _tp_rank, flat, probe = got[r]
+        dp_rank, _tp_rank, flat, probe, real_probe = got[r]
         by_dp.setdefault(dp_rank, []).append(torch.tensor(flat))
         probes[r] = probe
+        real_probes[r] = real_probe
 
     ok = True
     # Within one dp replica the tp ranks share a batch, so a replicated param's
@@ -104,17 +130,24 @@ def main() -> int:
             print(f"dp{d}: tp ranks disagree, max|d|={(gs[0] - gs[1]).abs().max():.3e}")
             ok = False
 
-    # The tp all-reduce must span this rank's tp group and nothing else.
+    # The tp all-reduce must span this rank's tp group and nothing else, on EACH
+    # backend: they carry separate group= plumbing and one can regress alone.
     want = {r: float(sum(Mesh(dp=DP, tp=TP, rank=r).tp_group())) for r in range(WORLD)}
     if probes != want:
-        print(f"tp all_reduce spans the wrong ranks: got {probes}, want {want} "
+        print(f"RefBackend all_reduce spans the wrong ranks: got {probes}, want {want} "
               "(all four equal means it crossed the dp replicas)")
+        ok = False
+    if all(v is None for v in real_probes.values()):
+        print("NOTE: tilelang did not import, so the production Backend arm was SKIPPED")
+    elif real_probes != want:
+        print(f"Backend all_reduce spans the wrong ranks: got {real_probes}, want {want}")
         ok = False
 
     a, b = by_dp[0][0], by_dp[1][0]
     delta = (a - b).abs().max().item()
 
-    print(f"tp all_reduce sums: {probes} (want {want}); dp0 vs dp1 grad max|d|={delta:.3e}")
+    print(f"tp all_reduce sums: RefBackend {probes}, Backend {real_probes} "
+          f"(want {want}); dp0 vs dp1 grad max|d|={delta:.3e}")
     if ungrouped:
         print("ungrouped control:", "correctly FAILED" if not ok else "PASSED -- vacuous gate")
         return 0 if not ok else 1

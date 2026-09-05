@@ -1280,7 +1280,10 @@ class Backend:
         import torch.distributed as dist
 
         def all_reduce(t, op):
-            dist.all_reduce(t, op=dist.ReduceOp.SUM if op == "sum" else dist.ReduceOp.MAX)
+            # group= or the CE statistics are reduced across the dp replicas too,
+            # and the loss stays finite and plausible while measuring the wrong batch.
+            dist.all_reduce(t, op=dist.ReduceOp.SUM if op == "sum" else dist.ReduceOp.MAX,
+                            group=self._tp_pg)
             return t
 
         # Every shard is exactly vloc wide: pad_vocab rounds the vocabulary to
