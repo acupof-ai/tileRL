@@ -12,6 +12,7 @@ from tilerl.ledger import (
     lineage,
     list_runs,
     new_manifest,
+    now,
     read_manifest,
     run_id,
     write_manifest,
@@ -31,6 +32,12 @@ def test_manifest_round_trip_and_lineage(tmp_path):
     for m in (parent, child):
         write_manifest(tmp_path, m)
     assert read_manifest(tmp_path, child["id"]) == child and gates_pass(child)
+    # `finished` has to be set for a verdict to mean anything: gates are written by
+    # `_finish`, so an unfinished manifest carries none and `gates_pass([])` is True.
+    # This line asserted `pass` on a manifest that never finished, which is the defect
+    # a killed run hit -- `e069c8ff28b7 train running pass` on cpu.
+    assert format_run(child).split()[3] == "killed"
+    child["finished"] = now()
     assert format_run(child).split()[3] == "pass"
     assert [m["id"] for m in lineage(tmp_path, child["id"])] == [child["id"], parent["id"]]
     assert {m["id"] for m in list_runs(tmp_path)} == {parent["id"], child["id"]}

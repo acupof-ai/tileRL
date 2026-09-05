@@ -81,8 +81,18 @@ def gates_pass(m: dict) -> bool:
 def format_run(m: dict) -> str:
     mt = " ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
                   for k, v in m["metrics"].items() if v is not None)
-    verdict = "skip" if m["gates"] and all(g.get("skipped", False) for g in m["gates"]) else "pass" if gates_pass(m) else "FAIL"
-    return f"{m['id']}  {m['command']:<6} {m['finished'] or 'running':<25} {verdict:<5} {mt}"
+    # `finished` first: gates are written by `_finish`, so an interrupted run carries
+    # only whatever was pre-seeded -- an empty list for opd, which `gates_pass` reads
+    # as True, so a run killed mid-training printed `pass`. Measured on cpu: SIGTERM
+    # after the manifest write, `e069c8ff28b7 train running pass`. No gate was
+    # evaluated, so the only honest verdict is that the run did not reach one.
+    if not m["finished"]:
+        verdict = "killed"
+    elif m["gates"] and all(g.get("skipped", False) for g in m["gates"]):
+        verdict = "skip"
+    else:
+        verdict = "pass" if gates_pass(m) else "FAIL"
+    return f"{m['id']}  {m['command']:<6} {m['finished'] or 'running':<25} {verdict:<6} {mt}"
 
 
 if __name__ == "__main__":  # runnable check
