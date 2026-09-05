@@ -87,7 +87,8 @@ def mmlu_score(engine: Any, tok: Any, prompts: list[str], concurrency: int = 32)
 
 
 def mmlu_accuracy(engine: Any, tok: Any, n: int, seed: int = 0,
-                  concurrency: int = 32) -> tuple[int, int, int]:
+                  concurrency: int = 32, questions: Any = None,
+                  per_problem: list | None = None) -> tuple[int, int, int]:
     """(correct, total, concurrency) on the slice ``seed`` picks.
 
     ``concurrency`` is returned because it is part of the score, not of how the
@@ -97,8 +98,12 @@ def mmlu_accuracy(engine: Any, tok: Any, n: int, seed: int = 0,
     27B, two arms at concurrency 8 agree on 1000 of 1000 while a concurrency-32
     run of the same slice differs on 4. Callers disagreed (``cli.py`` 8,
     ``scripts/mmlu.py`` the default) and nothing recorded which was used."""
-    prompts, golds, _ = mmlu_questions(n, seed)
+    prompts, golds, _ = questions if questions is not None else mmlu_questions(n, seed)
     preds = [letter(t) for t in mmlu_score(engine, tok, prompts, concurrency)]
+    if per_problem is not None:
+        per_problem.extend({"dataset": "mmlu", "i": i, "correct": p == g,
+                            "answer": g, "prediction": p, "tokens": 1}
+                           for i, (p, g) in enumerate(zip(preds, golds)))
     return sum(p == g for p, g in zip(preds, golds)), len(preds), concurrency
 
 
