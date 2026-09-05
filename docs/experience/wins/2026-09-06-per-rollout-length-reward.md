@@ -21,9 +21,21 @@ pairing never reached disk, and no re-analysis of run 2 can recover it.
 `grpo_loop` takes `per_rollout: list | None`, extended with one dict per
 completion — `step`, `g`, `tokens`, `reward`, `advantage` — in the same
 out-parameter idiom `gsm8k_accuracy(per_problem=...)` already uses. The CLI
-writes `runs/<id>/rollouts.jsonl` beside the existing `eval-{before,after}.jsonl`,
-**including when the drift guard breaks the loop**: the rows up to the break are
-the ones that describe the collapse.
+appends the new rows to `runs/<id>/rollouts.jsonl` **at the end of every step**,
+beside the existing `eval-{before,after}.jsonl`.
+
+Per step rather than once at the end, because the run this reacts to did not end
+at the end. Nothing in `src/tilerl/` installs a signal handler, an `atexit` hook
+or a `try/finally` around the loop; run 2 took a SIGTERM at step 45 and never
+reached any writer — `eval-before.jsonl` survived only because it had already
+been written. A single write after the loop would therefore have lost every row
+of exactly the run that motivated the file. Appending per step costs nothing to
+measure against: a row is 70 bytes, so a 100-step run at group 8 writes 55 KB in
+100 appends. A killed run keeps every completed step's rows and loses at most the
+step in flight — but only the rows. `length_reward_r` is computed after the loop
+and reaches the manifest through `_finish`, so a SIGTERM'd run has the data and
+not the number; recompute it from `rollouts.jsonl`. A run stopped by the drift
+guard exits through `_finish` and reports it normally.
 
 `manifest["metrics"]["length_reward_r"]` is the Pearson r of (tokens, reward)
 pooled over **within-group deviations**. Centering per group is the whole
