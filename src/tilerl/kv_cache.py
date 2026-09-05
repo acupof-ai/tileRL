@@ -358,6 +358,10 @@ class DramSnapshots:
 
     def stats(self) -> dict[str, int]:
         return {
+            # The budget, not just the fill: `dram_bytes` is what is held, so it is 0 both
+            # when the tier is off and when it is on and nothing has been demoted yet --
+            # an operator who set --dram-bytes cannot tell the two apart from it.
+            "dram_budget": self.budget_bytes,
             "dram_entries": len(self._held),
             "dram_bytes": self._used,
             "dram_demotions": self.demotions,

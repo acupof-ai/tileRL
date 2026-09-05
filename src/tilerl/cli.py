@@ -109,7 +109,8 @@ def _shard(cfg, model, tp: int, backend, model_mod):
 
 
 def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16,
-                  blocks=0, max_ctx=0, max_batch=8, ssd_path="", ssd_min_tokens=0):
+                  blocks=0, max_ctx=0, max_batch=8, ssd_path="", ssd_min_tokens=0,
+                  dram_bytes=0):
     """Serving-size engine; ``devices`` replicates it across those CUDA indices.
 
     ``max_ctx`` caps the served context; it still defaults to the model's own limit,
@@ -136,6 +137,8 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
         kw["ssd_path"] = ssd_path
         if ssd_min_tokens:
             kw["ssd_min_tokens"] = ssd_min_tokens
+    if dram_bytes:
+        kw["dram_bytes"] = dram_bytes
     if not devices:
         return engine_mod.build_engine(cfg, model, backend, **kw)
 
@@ -170,7 +173,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            draft=draft, depth=args.depth, slots=args.slots,
                            blocks=args.blocks, max_ctx=args.max_ctx,
                            max_batch=args.max_batch, ssd_path=args.ssd_path,
-                           ssd_min_tokens=args.ssd_min_tokens)
+                           ssd_min_tokens=args.ssd_min_tokens, dram_bytes=args.dram_bytes)
     tokenizer = _qwen38_tokenizer() if args.model == "qwen38-27b" else get_tokenizer(None)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
@@ -1020,6 +1023,17 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "constant ~157 MB at any prefix length, so every short "
                               "publish costs as much to spill as a long one; raising this "
                               "drops the publishes a longer prefix supersedes anyway")
+    p_serve.add_argument("--dram-bytes", type=int, default=0,
+                         help="host budget in bytes for demoted GDN snapshots (0 = off, the "
+                              "default). Turn it on only when concurrent sessions outnumber "
+                              "the snapshots HBM holds (free/4, which on a 32GB V100 is 9 at "
+                              "144 MiB each): measured 2 sessions -> 0 promotions, 9 -> 17, "
+                              "12 -> 24. Below that threshold it is 1.51x WORSE on wall "
+                              "clock -- one conversation re-reads only its newest entry, so "
+                              "the LRU snapshot a demotion picks is never asked for again "
+                              "(43 demotions, 0 promotions). Read /health's dram_promotions "
+                              "to see whether the workload crossed it, and dram_budget to "
+                              "see the tier is on at all")
     p_serve.add_argument("--max-batch", type=int, default=8,
                          help="concurrent rows; drop to 2 for a single-user endpoint (a decode "
                               "graph is captured per bucket x chain width, so a lower "
