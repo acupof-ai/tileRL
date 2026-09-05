@@ -67,7 +67,8 @@ What each layer needs, **forward → backward**, the row that does not exist yet
 | column-parallel linear (`q/k/v/gate/up`) | none | `all_reduce(dX)` |
 | row-parallel linear (`o/down`) | `all_reduce(Y)` | none |
 | vocab-parallel `lm_head` | **sharded CE**, three scalar `all_reduce` per row | gradient stays sharded |
-| GDN scan, CP | `all_gather` of local `(A, B)` | same scan reversed |
+| GDN scan, CP | log₂ prefix scan of `(A, B)` | same scan reversed |
+| **full attention, CP** | `all_gather` of K/V | **`reduce_scatter(dK, dV)`** — not a slice |
 | ring attention, CP | `send`/`recv` ring | reversed ring |
 | SP norm/embedding | `all_gather` in, `reduce_scatter` out | mirrored |
 | dp gradients | none | `all_reduce(grad)` once per step |
@@ -134,6 +135,12 @@ for the 27B (16 full-attn layers, 4 KV heads, head_dim 256, bf16 K and V):
 | ring latency floor @ 21.5 µs/call | 344 µs | 1032 µs | **2408 µs** |
 | all-gather latency floor | 344 µs | 344 µs | **344 µs** |
 
+**Both columns double once the backward is counted.** The backward of the K/V
+gather is a `reduce_scatter`, not a slice (measured, see below), so every step
+moves the same bytes twice and issues the same calls twice: at cp=8, 224 MiB and
+ring 4816 µs against all-gather 688 µs. The **ratio is unchanged** — the doubling
+is common to both schemes — so the decision below stands on the same 7x.
+
 Bytes are the same because each scheme moves every remote chunk to every rank
 exactly once. What differs is the **call count**: ring is `cp-1` sequential
 send/recv per layer, all-gather is one. Against the measured 21.5 µs NCCL floor
@@ -174,34 +181,110 @@ What ring buys instead is memory — it never holds the whole KV:
 | | B=8 T=256 | B=8 T=2048 | B=1 T=65536 | B=1 T=131072 |
 |---|---:|---:|---:|---:|
 | whole KV per rank, all-gathered | 0.12 GiB | 1.00 GiB | 4.00 GiB | **8.00 GiB** |
+| + dK/dV f32, one layer live | 0.14 GiB | 1.12 GiB | 4.50 GiB | **9.00 GiB** |
 
-**So: all-gather for the RL path, ring only past ~64K** — on floor arithmetic,
+The backward adds a flat **+12.5%**, not another factor: the gathered K/V are
+retained for all 16 layers, while dK and dV exist for one layer at a time. It
+moves the crossover by that much and no more — a 4 GiB budget at B=1 holds
+**58254** tokens rather than 65536.
+
+**So: all-gather for the RL path, ring only past ~58K** — on floor arithmetic,
 pending an exposed-cost measurement (see below). At the shapes RL
-actually runs (B=8, T=256–2048) the gathered KV is 0.12–1.00 GiB against a 96 GB
+actually runs (B=8, T=256–2048) the gathered KV is 0.14–1.12 GiB against a 96 GB
 card and all-gather is 7x cheaper in latency at cp=8. Ring's memory advantage
-only pays once the whole KV stops being free, which is the same ~64K threshold
-section (b) gives for CP being worth doing at all. Implementing ring first would
-be optimizing the case CP is not yet used for.
+only pays once the whole KV stops being free, which is the ~64K threshold
+section (b) gives for CP being worth doing at all, pulled in to ~58K by the
+backward's dK/dV. Implementing ring first would be optimizing the case CP is not
+yet used for.
 
 This makes the first CP op an `all_gather` of K and V per full-attn layer —
-already on the tape (#115), with `reduce_scatter`-free backward since the
-backward of a gather is a slice. Ring stays a `# ponytail:` note on it.
+already on the tape (#115). Its backward is a **`reduce_scatter`**, not a slice.
+The slice rule holds for the vocab gather, where each rank owns a distinct slice
+of the output; it fails here because every rank's queries read every rank's keys,
+so each rank's dK covers the whole sequence as a partial sum. Measured against a
+dense single-rank reference at cp=4: slicing is wrong by **1.03 of a 1.78 peak
+(58% of full scale)**, summing matches to **2.4e-07**. dQ stays local. Ring stays
+a `# ponytail:` note on it.
 
-The GDN scan is separate and cheaper to reason about: the state is
-`B × 48 × 128 × 128` f32 = **24.0 MiB per layer**, 1.12 GiB across 48 layers at
-B=8, and it composes (`S_i = A_i S_{i-1} + B_i`), so one all-gather of the
-per-chunk `(A, B)` fixes the incoming state without moving the states themselves.
+**Chunks are assigned zigzag, not contiguously.** Under a causal mask rank r's
+queries score against chunks 0..r, so contiguous chunking leaves the last rank
+doing `(cp+1)/2` times the mean work while the gather barrier waits on it. Rank
+r takes chunks `r` and `2cp-1-r`, so every rank's pair sums the same. Measured at
+cp=4, T=32, scored q·k pairs per rank: contiguous **[36, 100, 164, 228]** (6.3x
+max/min), zigzag **[132, 132, 132, 132]** (1.0x). The gathered chunks therefore
+arrive in **rank order, not sequence order**, so the mask is built from absolute
+positions passed alongside the tensors — never inferred from an index.
+
+
+### The GDN scan: a log₂ prefix scan, not an all-gather
+
+The state is `B × 48 × 128 × 128` f32 = **24.0 MiB per layer**, 1.12 GiB across
+48 layers at B=8. The recurrence composes, so a rank holding a later chunk never
+needs its predecessor's state — only the composed `(A, B)` of everything before
+it, and composition `(A₂A₁, A₂B₁ + B₂)` is associative, so the prefixes come from
+a scan.
+
+**`A` is a `DK × DK` operator, not the decay scalar.** Reading `_gdn_chunk_fwd`:
+`d = U − W s`, so `s_next = exp(glast)·s + Rᵀd = (exp(glast)I − RᵀW)·s + RᵀU`.
+The state's own influence runs through `d`, and folding it in is what makes the
+recurrence affine. The natural misreading — decay the state, add the chunk's
+contribution — is **wrong by 23%** (measured) and still produces a plausible
+loss. `tests/gdn_cp_scan.py --decay-a` is that misreading as a control.
+
+**Three schemes, priced with the compute column** (48 GDN layers, HV=48,
+DK=DV=128, f32, 400 GB/s assumed, 21.5 µs measured floor, whole step in ms):
+
+| | cp=2 | cp=4 | cp=8 |
+|---|---:|---:|---:|
+| sequential state pass | 26.0 | 32.1 | 44.2 |
+| `(A,B)` all-gather | 34.8 | 50.6 | 94.8 |
+| **`(A,B)` log₂ scan** | **28.7** | **32.5** | **40.4** |
+
+*T=2048, B=8, 300 TFLOP/s effective.* The sequential pass is not cheap because
+of its bytes — it is cheap on bytes — but rank r idles until rank r−1 finishes,
+so **every rank pays the full-sequence compute** and the step gets *worse* with
+cp (26.0 → 44.2). That is CP buying nothing on 48 of the 27B's 64 layers. The
+all-gather loses on bytes instead: `(A, B)` is 2× the state per chunk and zigzag
+gives `2cp−1` remote chunks. The scan needs only prefixes: `⌈log₂ cp⌉` steps of
+2 states each — 3 steps at cp=8 against 15 payloads.
+
+**At the shapes CP is actually for, the margin is not close:**
+
+| T, B | cp=2 | cp=8 |
+|---|---|---|
+| 2048, 8 | seq by 1.10× | scan by 1.09× |
+| 65536, 1 | scan by 1.37× | **scan by 4.69×** |
+| 131072, 1 | scan by 1.37× | **scan by 5.06×** |
+
+Sequential's compute term is the whole sequence on every rank while the scan's
+divides by cp, and per-layer comm barely moves, so the gap opens with T. The one
+cell where sequential wins is **T=2048, cp=2 at 300 TFLOP/s** — below 100
+TFLOP/s effective the scan wins there too (1.16×). That is the only
+throughput-sensitive cell; everywhere else the ordering is stable.
+
+**Cost line:** building `(A, B)` and applying the prefix correction is **+45%
+FLOPs** on the layer (+64.4 of 143.9 GFLOP at T=2048, B=8). It parallelizes, so
+it divides by cp, which is why the scan's compute column is not `base/cp`.
+
+These are FLOP-model numbers with an assumed 400 GB/s. No CP kernel exists, so
+the exposed cost is unmeasured — the same caveat as (d2), and the same
+revisit-when-measured standing.
 
 ## (e) Order
 
 1. **TP training.** DONE except the mesh: three `_BWD` entries (#115) and the
    sharded CE (#119), both gated. The mesh is what still blocks full-parameter
    RL, which is the P3 dependency.
-2. **CP.** GDN as the scan `S_i = A_i S_{i-1} + B_i` (composes, so one all-gather
-   fixes the incoming state); **all-gather** attention for full attention, whose
-   merge is the split-KV combine already shipped — not ring, per the arithmetic
-   in (d2): same bytes, 7x fewer calls at cp=8, and ring's memory advantage does
-   not pay below ~64K.
+2. **CP.** Attention first: the K/V all-gather with its `reduce_scatter` backward
+   and zigzag chunking, gated by `tests/cp_world2.py`. **GDN second, and CP is
+   unusable until it lands** — 48 of the 27B's 64 layers are GDN, and `_gdn`
+   refuses `cp>1` rather than start a chunk from a zero state. The scan
+   `S_i = A_i S_{i-1} + B_i` composes, so a **log₂ prefix scan** of the per-chunk
+   `(A, B)` fixes the incoming state — not an all-gather, which loses to a plain
+   sequential state pass at every cp measured, and not the sequential pass
+   either, which makes every rank pay the full-sequence compute. Attention is not
+   ring, per the arithmetic in (d2): same bytes, 7x fewer calls at cp=8, and
+   ring's memory advantage does not pay below ~58K.
 3. **SP is not a third mechanism** — it is CP applied to the norm and embedding
    traffic that TP leaves replicated. It lands as part of CP, not before it, and
    it is worth naming only because it is where the last replicated activation

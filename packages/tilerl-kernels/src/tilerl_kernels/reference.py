@@ -383,52 +383,75 @@ def dequant_awq(
 # ---------------------------------------------------------------- full attention (training)
 
 
-def dense_attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
+def _causal_mask(
+    q: torch.Tensor, k: torch.Tensor, q_pos: torch.Tensor | None, k_pos: torch.Tensor | None
 ) -> torch.Tensor:
-    """Causal GQA attention (training path). q [B,T,Hq,D], k/v [B,T,Hkv,D] -> [B,T,Hq,D]."""
+    """``-inf`` where a query must not see a key, from ABSOLUTE positions.
+
+    Defaults reproduce ``triu(diagonal=1)``. They stop being right under CP: the
+    queries are one chunk of the sequence and the keys are every chunk, so the
+    lengths differ, and under the zigzag assignment the gathered keys arrive in
+    rank order rather than sequence order. Neither is recoverable from a shape,
+    so the caller passes the positions rather than the kernel inferring them.
+    """
+    tq, tk = q.shape[1], k.shape[1]
+    qp = torch.arange(tq, device=q.device) if q_pos is None else q_pos.to(q.device)
+    kp = torch.arange(tk, device=q.device) if k_pos is None else k_pos.to(q.device)
+    return torch.where(kp[None, :] > qp[:, None], float("-inf"), 0.0)
+
+
+def dense_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float,
+    q_pos: torch.Tensor | None = None, k_pos: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Causal GQA attention (training path). q [B,Tq,Hq,D], k/v [B,Tk,Hkv,D] -> [B,Tq,Hq,D]."""
     q = _f32(q)
     k = _f32(k)
     v = _f32(v)
     b, t, hq, d = q.shape
-    hkv = k.shape[2]
+    tk, hkv = k.shape[1], k.shape[2]
     group = hq // hkv
     if group > 1:
-        k = k[:, :, :, None, :].expand(b, t, hkv, group, d).reshape(b, t, hq, d)
-        v = v[:, :, :, None, :].expand(b, t, hkv, group, d).reshape(b, t, hq, d)
+        k = k[:, :, :, None, :].expand(b, tk, hkv, group, d).reshape(b, tk, hq, d)
+        v = v[:, :, :, None, :].expand(b, tk, hkv, group, d).reshape(b, tk, hq, d)
     att = torch.einsum("bthd,bshd->bhts", q, k) * scale
-    mask = torch.triu(torch.full((t, t), float("-inf"), device=q.device), diagonal=1)
-    p = torch.softmax(att + mask, dim=-1)
+    p = torch.softmax(att + _causal_mask(q, k, q_pos, k_pos), dim=-1)
     return torch.einsum("bhts,bshd->bthd", p, v)
 
 
 def dense_attention_bwd(
-    grad: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
+    grad: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float,
+    q_pos: torch.Tensor | None = None, k_pos: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backward of :func:`dense_attention`. Returns (gq, gk, gv) in model layout."""
+    """Backward of :func:`dense_attention`. Returns (gq, gk, gv) in model layout.
+
+    Under CP ``gk``/``gv`` cover every key this rank read, which is the whole
+    sequence -- they are PARTIAL sums that the caller must reduce across the cp
+    group. Measured on a dense reference at cp=4: keeping only this rank's slice
+    is wrong by 58% of full scale.
+    """
     q = _f32(q)
     k = _f32(k)
     v = _f32(v)
     grad = _f32(grad)
     b, t, hq, d = q.shape
-    hkv = k.shape[2]
+    tk, hkv = k.shape[1], k.shape[2]
     group = hq // hkv
     if group > 1:
-        ke = k[:, :, :, None, :].expand(b, t, hkv, group, d).reshape(b, t, hq, d)
-        ve = v[:, :, :, None, :].expand(b, t, hkv, group, d).reshape(b, t, hq, d)
+        ke = k[:, :, :, None, :].expand(b, tk, hkv, group, d).reshape(b, tk, hq, d)
+        ve = v[:, :, :, None, :].expand(b, tk, hkv, group, d).reshape(b, tk, hq, d)
     else:
         ke, ve = k, v
     att = torch.einsum("bthd,bshd->bhts", q, ke) * scale
-    mask = torch.triu(torch.full((t, t), float("-inf"), device=q.device), diagonal=1)
-    p = torch.softmax(att + mask, dim=-1)
+    p = torch.softmax(att + _causal_mask(q, k, q_pos, k_pos), dim=-1)
     gve = torch.einsum("bhts,bthd->bshd", p, grad)
     gatt = torch.einsum("bthd,bshd->bhts", grad, ve)
     gp = p * (gatt - (gatt * p).sum(-1, keepdim=True))
     gq = torch.einsum("bhts,bshd->bthd", gp, ke) * scale
     gke = torch.einsum("bhts,bthd->bshd", gp, q) * scale
     if group > 1:
-        gk = gke.reshape(b, t, hkv, group, d).sum(3)
-        gv = gve.reshape(b, t, hkv, group, d).sum(3)
+        gk = gke.reshape(b, tk, hkv, group, d).sum(3)
+        gv = gve.reshape(b, tk, hkv, group, d).sum(3)
     else:
         gk, gv = gke, gve
     return gq, gk, gv

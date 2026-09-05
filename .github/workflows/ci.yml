@@ -52,7 +52,7 @@ jobs:
         run: |
           set -e
           ran=0
-          for gate in tests/tp_world2.py tests/ce_sharded_world2.py tests/mesh_world4.py tests/dp_world4.py; do
+          for gate in tests/tp_world2.py tests/ce_sharded_world2.py tests/mesh_world4.py tests/dp_world4.py tests/cp_world2.py tests/gdn_cp_scan.py; do
             [ -f "$gate" ] || continue
             echo "== $gate"
             uv run python3 "$gate"

@@ -66,11 +66,6 @@ class Mesh:
 
     so a tp group is contiguous and lands inside one node, which is where NVLink
     is. dp ranks talk once per step and go outermost.
-
-    ``cp > 1`` is refused: the axis is in the arithmetic because leaving it out
-    would mean renumbering every rank later, but no context-parallel op exists,
-    and a mesh that accepts ``cp=2`` would silently run tp-only math on a
-    sequence it claims to have split.
     """
 
     dp: int = 1
@@ -82,11 +77,6 @@ class Mesh:
         for name, n in (("dp", self.dp), ("tp", self.tp), ("cp", self.cp)):
             if n < 1:
                 raise ValueError(f"{name}={n} must be >= 1")
-        if self.cp != 1:
-            raise ValueError(
-                "cp>1 is not implemented: no context-parallel op exists, so a cp mesh "
-                "would run tp-only math on a sequence it claims to have split"
-            )
         if not 0 <= self.rank < self.world:
             raise ValueError(f"rank={self.rank} outside world={self.world}")
 
@@ -115,6 +105,39 @@ class Mesh:
         """The ranks sharing this rank's tp and cp position, one per dp replica."""
         off = self.tp_rank * self.cp + self.cp_rank
         return [d * self.tp * self.cp + off for d in range(self.dp)]
+
+    def cp_group(self) -> list[int]:
+        """The ranks splitting this rank's sequence, in cp_rank order (contiguous)."""
+        base = self.rank - self.cp_rank
+        return [base + i for i in range(self.cp)]
+
+
+def zigzag_positions(seq_len: int, cp: int, cp_rank: int) -> torch.Tensor:
+    """Absolute positions this cp rank owns: chunks ``r`` and ``2*cp-1-r``.
+
+    A causal mask makes contiguous chunking lopsided -- rank r's queries score
+    against chunks 0..r, so the last rank does most of the work and the gather
+    barrier waits on it. Pairing a low chunk with its mirror gives every rank the
+    same pair sum. Measured at cp=4, T=32, scored q*k pairs per rank: contiguous
+    [36, 100, 164, 228] (6.3x max/min), zigzag [132, 132, 132, 132] (1.0x).
+    """
+    if seq_len % (2 * cp):
+        raise ValueError(f"seq_len={seq_len} must be a multiple of 2*cp={2 * cp} to zigzag")
+    half = seq_len // (2 * cp)
+    lo = torch.arange(cp_rank * half, (cp_rank + 1) * half)
+    hi = torch.arange((2 * cp - 1 - cp_rank) * half, (2 * cp - cp_rank) * half)
+    return torch.cat([lo, hi])
+
+
+def zigzag_key_positions(seq_len: int, cp: int) -> torch.Tensor:
+    """Positions of the gathered K/V, in the order ``cp_gather`` concatenates them.
+
+    Derived, not communicated: every rank can compute every rank's chunk, so
+    gathering the positions alongside the tensors would be a second collective
+    for a value that is already known -- and it would land on the tape, which
+    only carries things with gradients.
+    """
+    return torch.cat([zigzag_positions(seq_len, cp, r) for r in range(cp)])
 
 
 def pad_vocab(vocab: int, world: int, to: int = 64) -> int:
@@ -370,12 +393,34 @@ if __name__ == "__main__":  # runnable check: the rules, not the plumbing
     assert len(set(seen_dp)) == 4 and all(len(g) == 2 for g in set(seen_dp))
     assert sorted(r for g in set(seen_dp) for r in g) == list(range(8))
 
-    for bad in (dict(cp=2), dict(tp=0), dict(tp=2, rank=2), dict(tp=2, rank=-1)):
+    for bad in (dict(tp=0), dict(tp=2, rank=2), dict(tp=2, rank=-1)):
         try:
             Mesh(**bad)
         except ValueError:
             pass
         else:
             raise AssertionError(f"Mesh({bad}) must raise")
+
+    # cp is the fastest axis, so a cp group is contiguous and disjoint from the
+    # tp group except at this rank -- same invariant the dp check above holds.
+    for r in range(8):
+        m = Mesh(dp=1, tp=4, cp=2, rank=r)
+        assert m.cp_group() == [r - m.cp_rank, r - m.cp_rank + 1], r
+        assert set(m.cp_group()) & set(m.tp_group()) == {r}
+
+    # Zigzag: every rank's chunk pair sums to the same total, which is the point
+    # of it -- a causal mask makes contiguous chunking (cp+1)/2 lopsided.
+    for cp in (2, 4):
+        pos = [zigzag_positions(32, cp, r) for r in range(cp)]
+        assert sorted(p.item() for c in pos for p in c) == list(range(32))
+        work = [int((p[:, None] >= torch.arange(32)[None, :]).sum()) for p in pos]
+        assert len(set(work)) == 1, f"cp={cp} zigzag is unbalanced: {work}"
+        assert torch.equal(zigzag_key_positions(32, cp), torch.cat(pos))
+    try:
+        zigzag_positions(6, 4, 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a seq_len that 2*cp does not divide must raise")
 
     print("tensor_parallel: gqa replication + alignment refusal + vocab pad + mesh OK")
