@@ -149,6 +149,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 def cmd_train(args: argparse.Namespace) -> None:
     if args.rl or args.opd:
+        if not args.data and not (args.recipe == "grpo-tiny-smoke" and args.model == "tiny"):
+            sys.exit("error: --data is required for RL/OPD training")
         return _train_adapters(args)
     _train_full(args)
 

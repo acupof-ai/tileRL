@@ -2,9 +2,27 @@
 
 import json
 
+import pytest
+
 from tilerl.cli import _build_parser
 from tilerl.ledger import gates_pass
 from tilerl.recipes import RECIPES, flags
+
+
+@pytest.mark.parametrize("argv", [
+    ["--recipe", "grpo-gsm8k-27b"],
+    ["--recipe", "opd-gsm8k-27b"],
+    ["--rl"],
+    ["--opd"],
+    ["--recipe", "grpo-tiny-smoke", "--model", "qwen38-27b"],
+])
+def test_rl_opd_recipe_requires_data(argv, monkeypatch):
+    from tilerl import cli
+
+    monkeypatch.setattr("sys.argv", ["tilerl", "train", *argv])
+    monkeypatch.setattr(cli, "_train_adapters", lambda args: None)
+    with pytest.raises(SystemExit, match="^error: --data is required for RL/OPD training$"):
+        cli.main()
 
 
 def test_every_recipe_parses_and_flags_override():
