@@ -40,8 +40,11 @@ class RefBackend:
     tp_rank = 0
 
     _tp_pg = None
+    dp_world = 1
+    _dp_pg = None
 
-    def init_tp(self, world: int, rank: int, tp_groups: list[list[int]] | None = None) -> None:
+    def init_tp(self, world: int, rank: int, tp_groups: list[list[int]] | None = None,
+                dp_groups: list[list[int]] | None = None) -> None:
         """Same seam as ``Backend.init_tp``; gloo, so the TP gate runs CPU-only."""
         if world == 1:
             return
@@ -58,8 +61,26 @@ class RefBackend:
             if mine is None:
                 raise ValueError(f"rank {rank} is in none of the tp groups {tp_groups}")
             self.tp_world, self.tp_rank = len(mine), mine.index(rank)
-            return
-        self.tp_world, self.tp_rank = world, rank
+        else:
+            self.tp_world, self.tp_rank = world, rank
+        if dp_groups:
+            mine = None
+            for g in dp_groups:
+                pg = dist.new_group(list(g))
+                if rank in g:
+                    mine, self._dp_pg = g, pg
+            if mine is None:
+                raise ValueError(f"rank {rank} is in none of the dp groups {dp_groups}")
+            self.dp_world = len(mine)
+
+    def dp_reduce(self, x):
+        """Mean across the dp replicas; see ``Backend.dp_reduce``."""
+        if self.dp_world == 1:
+            return x
+        import torch.distributed as dist
+
+        dist.all_reduce(x, group=self._dp_pg)
+        return x.div_(self.dp_world)
 
     def all_reduce(self, x):
         if self.tp_world == 1:

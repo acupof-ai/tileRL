@@ -9,7 +9,8 @@ gradient-equality check and quietly destroys data parallelism.
     TILERL_TARGET=cpu python3 tests/mesh_world4.py --ungrouped # the control
 
 ``--ungrouped`` drops the tp process group, which is the whole-world all_reduce
-this exists to prevent. It must FAIL.
+this exists to prevent. It must FAIL. The dp gradient average has its own file,
+tests/dp_world4.py: a second mp.spawn in a process that already ran gloo aborts.
 """
 
 from __future__ import annotations

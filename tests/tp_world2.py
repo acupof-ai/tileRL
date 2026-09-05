@@ -202,13 +202,13 @@ def _one_step(local_clip: bool) -> tuple[bool, int, float, float]:
 
 
 def _refusals() -> bool:
-    """``--tp`` must refuse the two layouts it cannot train correctly.
+    """``--tp`` must refuse a width the world does not divide.
 
     The refusal has to happen BEFORE ``init_tp``: this runs in the parent, where
     the spawned arms have already left MASTER_ADDR set, so a ``_shard`` that
-    accepted dp=2 would block in ``init_process_group(world_size=4)`` waiting for
-    three ranks that do not exist. A control that hangs reports nothing, so the
-    backend here raises instead of joining -- reaching it at all is the failure.
+    accepted it would block in ``init_process_group`` waiting for ranks that do
+    not exist. A control that hangs reports nothing, so the backend here raises
+    instead of joining -- reaching it at all is the failure.
     """
     from tilerl import model as model_mod
     from tilerl.cli import _shard
@@ -223,7 +223,7 @@ def _refusals() -> bool:
     keep = os.environ.get("WORLD_SIZE"), os.environ.get("RANK")
     os.environ["WORLD_SIZE"], os.environ["RANK"] = "4", "0"
     ok = True
-    for tp, want in ((3, "does not divide"), (2, "not reduced across dp replicas")):
+    for tp, want in ((3, "does not divide"),):
         try:
             _shard(cfg, m, tp, _NoJoin(), model_mod)
         except SystemExit as e:
@@ -238,7 +238,7 @@ def _refusals() -> bool:
             ok = False
     for k, v in zip(("WORLD_SIZE", "RANK"), keep):
         os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
-    print("--tp refuses a non-dividing world and an unreduced dp>1" if ok else "--tp: FAILED")
+    print("--tp refuses a width the world does not divide" if ok else "--tp: FAILED")
     return ok
 
 

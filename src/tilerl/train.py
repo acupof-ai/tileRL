@@ -90,6 +90,9 @@ def _step(
 
         sharded_ids = {id(p) for k, p in params.items() if is_sharded(k)}
     rows = micro if 0 < micro < b else b
+    # One name for "average this gradient over the dp replicas". Absent on a
+    # backend that predates dp, and a no-op at dp_world == 1.
+    dp_reduce = getattr(backend, "dp_reduce", None) if getattr(backend, "dp_world", 1) > 1 else None
     if rows != b and getattr(optimizer, "streams", False):
         raise ValueError(
             "micro-batching holds every parameter gradient until the update, which is "
@@ -113,6 +116,16 @@ def _step(
         return loss, tape.backward(grad_logits, on_grad=on_grad, needs=param_ids)
 
     if getattr(optimizer, "streams", False):
+        if dp_reduce is not None:
+            # A streaming optimizer applies each gradient the moment backward
+            # finalizes it, and that order is the tape's, not a name order every
+            # rank agrees on -- so the dp all-reduce cannot be issued from here
+            # without ranks meeting on different tensors. Refuse rather than hang:
+            # gloo aborts the process on the mismatch instead of raising.
+            raise ValueError(
+                "dp>1 with a streaming optimizer is not supported: gradients are applied "
+                "in completion order, which differs per rank, so the dp all-reduce would "
+                "pair different tensors. Use AdamW, or dp=1.")
         # Every weight gradient coexisting is 50.1 GiB on the 27B: this
         # optimizer clips per update, so each gradient is applied and dropped
         # the moment backward finalizes it.
@@ -149,6 +162,19 @@ def _step(
             acc[tid] = prev.add_(grads[tid]) if prev is not None else grads[tid].float()
     assert acc, _NO_GRAD
     t_update = time.perf_counter()
+    # Before the clip, not after: the clipped norm has to be the global one, and
+    # clipping each replica's own gradients would scale them by different factors
+    # for the same reason the tp shards did.
+    #
+    # By NAME, not by iterating acc: acc is keyed by id() in gradient-completion
+    # order, which differs per rank, so every rank would all-reduce a different
+    # tensor at each step. gloo aborts the process on the size mismatch
+    # (EnforceNotMet in pair.cc) rather than raising -- measured.
+    if dp_reduce is not None:
+        for k in sorted(params):
+            g = acc.get(id(params[k]))
+            if g is not None:
+                dp_reduce(g)
     norm = clip_grad_norm(acc, 1.0, sharded_ids, backend)
     if math.isfinite(norm):
         optimizer.step(params.values(), acc)
