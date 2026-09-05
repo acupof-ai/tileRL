@@ -49,9 +49,24 @@ argument: that a second `mp.spawn` in a gloo-initialized process was the cause
 (the arm aborts alone, with one spawn), and that the two arms collided on
 `MASTER_PORT` (distinct ports changed nothing).
 
-**The streaming optimizer cannot do this at all.** It applies each gradient the
-moment backward finalizes it, which is exactly the order that differs per rank,
-so `_step` raises for `dp>1` with `streams=True` rather than shipping a hang.
+**The streaming optimizer needed measuring, not refusing.** My first read was
+that it applies each gradient "in completion order, which differs per rank", and
+I made `dp>1` with `streams=True` raise. That reasoning was wrong and untested:
+the tape walks its entries in the order it *recorded* them, which is the model's
+graph, and a probe over four ranks found the sequence **identical on all of them**
+(27 params, same order). The per-rank order in the abort above came from
+`param_ids & set(grads)` — a set of `id()` ints, iterated by hash — not from the
+tape. So the streaming path reduces each gradient where it applies it, and the
+refusal is gone.
+
+This mattered: `Adafactor` with streamed updates is the 27B's optimizer
+(`cli.py:240`, Adam's m+v is 200.4 GiB there), so a refusal would have made dp
+unusable on the only model actually trained.
+
+`_order_agrees()` re-checks the assumption instead of trusting it: each rank
+hashes its own apply order and all-gathers the hash **over the dp group**, once
+per step, behind `TILERL_CHECK_DP_ORDER` so gates pay for it and training does
+not. It turns a process abort into a message naming the cause.
 
 ## The gate
 
@@ -62,8 +77,20 @@ group plumbing is what gets gated.
 
 | arm | worst deviation from the dp=1 step |
 |---|---|
-| gate | **1.0 ulp** |
+| gate (AdamW) | **1.0 ulp** |
+| gate (Adafactor, streamed updates) | **1.0 ulp** |
 | `--no-dp` (averaging removed, layout kept) | **83671 ulp** |
+| `--scramble` (one dp rank's order reversed) | reports the mismatch |
+
+The streamed arm compares against a **streamed** dp=1 reference: Adafactor and
+AdamW produce different weights from the same gradients, so a cross-optimizer
+comparison would measure the optimizers rather than the reduce.
+
+**The scramble control passed at first, and its own bug is the reason.** It
+reversed the order on `rank % 2`, but the check compares within the dp group,
+which for rank r is {r, r+2} — both members always have the same parity, so it
+reversed both sides of every comparison and they still agreed. Keyed on
+`dp_rank` instead, it reports.
 
 In ulps, not absolutely, for the reason
 [the clip entry](../errors/2026-09-05-the-clip-norm-was-this-shards-own.md)
@@ -79,8 +106,9 @@ also keeps each gate's failure attributable to one thing.
 world=4 on CPU/gloo is the largest exercised; no NCCL run and no 27B run
 (`pending-remote`). The dp all-reduce is one call per gradient with no bucketing
 or overlap with backward — at the 27B's parameter count that is the obvious next
-cost, and it is unmeasured here. `dp>1` with the streaming optimizer is refused,
-not solved.
+cost, and it is unmeasured here. The tape's order is measured identical across
+ranks on `tiny` at world=4; `_order_agrees` is what would catch a model or a tape
+change where it is not.
 
 ## Rule
 
@@ -91,3 +119,11 @@ or an explicit index are shared. When a collective goes wrong this way the
 process aborts inside the transport rather than raising, so the traceback points
 at `mp.spawn`, not at the loop — expect to find it by reading the ordering, not
 by reading the error.
+
+**And the second rule, which cost more: I turned one diagnosis into a refusal
+without testing it.** Having found `id()` order to be per-rank, I assumed the
+tape's order was too and made the streaming path raise — which would have made dp
+unusable on the 27B, since Adafactor is its optimizer. The probe that settled it
+took one run. A refusal is a claim about what does not work; it needs the same
+evidence as a claim about what does.
+

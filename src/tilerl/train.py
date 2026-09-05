@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from collections.abc import Iterator
 from dataclasses import replace
@@ -60,6 +61,37 @@ _NO_GRAD = (
     "device/dtype differs, and the new object has a new id()"
 )
 
+#: Check that every rank reduced its gradients in the same order. One extra
+#: collective per step, so gates set it and training does not: a mismatch aborts
+#: the process inside gloo, which is exactly the failure this would explain.
+_CHECK_DP_ORDER = bool(os.environ.get("TILERL_CHECK_DP_ORDER"))
+
+
+def _order_agrees(order: list[str], backend: Any) -> None:
+    """Raise if the dp ranks did not all-reduce the same parameters in the same order.
+
+    A collective pairs by call sequence, so two ranks disagreeing here meet on
+    different tensors -- and gloo kills the process (``EnforceNotMet`` in
+    ``pair.cc``) rather than raising, with no traceback near the loop. Comparing
+    a hash costs one collective and turns that into a message.
+
+    Over the DP group, since that is the group the reduce ran on: ``all_gather``
+    spans the tp group and would compare each rank only against its own replica.
+    """
+    import hashlib
+
+    import torch.distributed as dist
+
+    h = hashlib.sha256("\n".join(order).encode()).digest()[:8]
+    mine = torch.tensor(list(h), dtype=torch.float64)
+    parts = [torch.empty_like(mine) for _ in range(backend.dp_world)]
+    dist.all_gather(parts, mine, group=backend._dp_pg)
+    if any(not bool((p == parts[0]).all()) for p in parts):
+        raise RuntimeError(
+            f"dp ranks reduced gradients in different orders ({len(order)} params here); "
+            "a collective pairs by call sequence, so this would abort in gloo instead "
+            "of raising. The tape's order must be identical on every rank.")
+
 
 def _step(
     model: Any,
@@ -81,6 +113,7 @@ def _step(
     model.params = backend.materialize(model.params)
     params = model.params if trainable is None else trainable
     by_id = {id(p): p for p in params.values()}
+    name_of = {id(p): k for k, p in params.items()}
     param_ids = set(by_id)
     # Which gradients this rank holds only a slice of, so clipping can use the
     # whole model's norm instead of this shard's.
@@ -116,16 +149,6 @@ def _step(
         return loss, tape.backward(grad_logits, on_grad=on_grad, needs=param_ids)
 
     if getattr(optimizer, "streams", False):
-        if dp_reduce is not None:
-            # A streaming optimizer applies each gradient the moment backward
-            # finalizes it, and that order is the tape's, not a name order every
-            # rank agrees on -- so the dp all-reduce cannot be issued from here
-            # without ranks meeting on different tensors. Refuse rather than hang:
-            # gloo aborts the process on the mismatch instead of raising.
-            raise ValueError(
-                "dp>1 with a streaming optimizer is not supported: gradients are applied "
-                "in completion order, which differs per rank, so the dp all-reduce would "
-                "pair different tensors. Use AdamW, or dp=1.")
         # Every weight gradient coexisting is 50.1 GiB on the 27B: this
         # optimizer clips per update, so each gradient is applied and dropped
         # the moment backward finalizes it.
@@ -134,11 +157,20 @@ def _step(
         if timings is not None:
             timings["optimizer_secs"] += time.perf_counter() - t_update
         seen = 0
+        order: list[str] = []
 
         def _apply(tid: int, g: torch.Tensor) -> bool:
             nonlocal seen
             if tid in param_ids:
                 t_update = time.perf_counter()
+                if dp_reduce is not None:
+                    # Safe here because the tape walks its entries in the order it
+                    # recorded them, and that order is the model's own graph, not
+                    # anything per-rank: measured identical on all 4 ranks of a
+                    # (dp=2, tp=2) world, 27 params. _order_agrees() re-checks it
+                    # at gate time so the assumption cannot rot silently.
+                    order.append(name_of[tid])
+                    dp_reduce(g)
                 optimizer.step_one(by_id[tid], g)
                 if timings is not None:
                     timings["optimizer_secs"] += time.perf_counter() - t_update
@@ -147,6 +179,8 @@ def _step(
 
         loss, _ = run(0, _apply)
         assert seen or not math.isfinite(loss), _NO_GRAD
+        if dp_reduce is not None and _CHECK_DP_ORDER:
+            _order_agrees(order, backend)
         return loss
 
     acc: dict[int, torch.Tensor] = {}
@@ -171,10 +205,11 @@ def _step(
     # tensor at each step. gloo aborts the process on the size mismatch
     # (EnforceNotMet in pair.cc) rather than raising -- measured.
     if dp_reduce is not None:
-        for k in sorted(params):
-            g = acc.get(id(params[k]))
-            if g is not None:
-                dp_reduce(g)
+        order = [k for k in sorted(params) if id(params[k]) in acc]
+        for k in order:
+            dp_reduce(acc[id(params[k])])
+        if _CHECK_DP_ORDER:
+            _order_agrees(order, backend)
     norm = clip_grad_norm(acc, 1.0, sharded_ids, backend)
     if math.isfinite(norm):
         optimizer.step(params.values(), acc)
