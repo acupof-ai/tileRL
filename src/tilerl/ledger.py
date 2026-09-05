@@ -75,13 +75,13 @@ def lineage(root: str | os.PathLike, id: str) -> list[dict]:
 
 
 def gates_pass(m: dict) -> bool:
-    return all(g["passed"] for g in m["gates"])
+    return all(g.get("skipped", False) or g["passed"] for g in m["gates"])
 
 
 def format_run(m: dict) -> str:
     mt = " ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
                   for k, v in m["metrics"].items() if v is not None)
-    verdict = "pass" if gates_pass(m) else "FAIL"
+    verdict = "skip" if m["gates"] and all(g.get("skipped", False) for g in m["gates"]) else "pass" if gates_pass(m) else "FAIL"
     return f"{m['id']}  {m['command']:<6} {m['finished'] or 'running':<25} {verdict:<5} {mt}"
 
 

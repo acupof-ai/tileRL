@@ -189,6 +189,8 @@ def _train_full(args: argparse.Namespace) -> None:
     if prev and prev["finished"] and not args.force:
         log(f"run {prev['id']} already finished; --force reruns")
         return _finish(prev, args.json)
+    if args.steps == 0:
+        return _finish(manifest, args.json)
     manifest["metrics"] = dict.fromkeys(("ce_first", "ce_last", "secs_per_step_median"))
 
     backend = get_backend()
@@ -302,8 +304,6 @@ def _train_adapters(args: argparse.Namespace) -> None:
         log(f"run {prev['id']} already finished; --force reruns")
         return _finish(prev, args.json)
     manifest["metrics"] = dict.fromkeys((
-        "reward_first", "reward_last", "ce_last", "secs_per_step_median", "tied_group_fraction",
-        "tokens_first", "tokens_last",
         "mmlu_before", "mmlu_after", "gsm8k_before", "gsm8k_after",
         "gsm8k_before_tokens", "gsm8k_after_tokens", "peak_gib"))
 
@@ -359,6 +359,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
             log(f"gsm8k greedy {c}/{n} = {100 * c / n:.1f}%{per}")
 
     evals("before")  # LoRA B is zero at init: the base model's score
+    if args.steps == 0:
+        evals("after")
+        return _finish(manifest, args.json)
     if args.rl:
         if rows:
             gold = {tuple(p): r["answer"] for p, r in zip(prompts, rows)}
@@ -527,9 +530,10 @@ def _finish(m: dict, as_json: bool) -> None:
         # vacuously" already covers a metric set that never had the key, which
         # is what an SFT run's manifest is.
         mmlu_floor = None if g.get("mmlu_before") is None else g["mmlu_before"] - 0.03
+        skipped = m["inputs"].get("steps") == 0
         m["gates"] = [
             {"name": n, "value": v, "threshold": t,
-             "passed": v is None or t is None or ok(v, t)}
+             "skipped": skipped, "passed": None if skipped else v is None or t is None or ok(v, t)}
             for n, v, t, ok in (
                 ("reward_rises", g.get("reward_last"), g.get("reward_first"), lambda v, t: v > t),
                 ("mmlu_holds", g.get("mmlu_after"), mmlu_floor, lambda v, t: v >= t),
