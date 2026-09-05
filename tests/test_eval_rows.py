@@ -155,6 +155,79 @@ def test_eval_rows_are_written_before_the_manifest_exists(tmp_path, monkeypatch)
     assert mean == 20.0, "the mean completion length is what the rollout guard reads"
 
 
+def test_before_eval_cache_reuses_rows_and_invalidates_length(tmp_path, monkeypatch):
+    from contextlib import suppress
+
+    from tilerl import cli
+    from tilerl import eval as eval_mod
+    from tilerl.ledger import list_runs
+
+    root = tmp_path / "runs"
+    monkeypatch.setenv("TILERL_RUNS", str(root))
+    data = tmp_path / "eval.jsonl"
+    data.write_text('{"prompt": "1+1?", "answer": "2"}\n')
+    monkeypatch.setattr(eval_mod, "mmlu_questions", lambda *a: (["1+1? A. 2 B. 3"], ["A"], ["math"]))
+    calls = []
+    generate = eval_mod.generate_ids
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return generate(*args, **kwargs)
+
+    monkeypatch.setattr(eval_mod, "generate_ids", counted)
+
+    def run(lr, cap, load=None):
+        previous = {m["id"] for m in list_runs(root)}
+        calls.clear()
+        argv = [
+            "train", "--rl", "--model", "tiny", "--steps", "1", "--group", "2",
+            "--data", str(data), "--eval-gsm8k", str(data), "--eval-mmlu", "1",
+            "--max-new-tokens", "4", "--eval-max-new-tokens", str(cap),
+            "--lora-rank", "2", "--lr", str(lr), "--allow-short-rollouts"]
+        args = cli._build_parser().parse_args(argv + (["--load-adapter", str(load)] if load else []))
+        with suppress(SystemExit):
+            cli.cmd_train(args)
+        (m,) = [m for m in list_runs(root) if m["id"] not in previous]
+        rows = (root / m["id"] / "eval-before.jsonl").read_text()
+        return m, rows, len(calls)
+
+    first, rows, first_calls = run(0.001, 4)
+    second, cached_rows, second_calls = run(0.002, 4)
+    assert first_calls == 4 and second_calls == 2, "only the after arm may sample on a cache hit"
+    assert not first["eval_before_cache"]["cache_hit"]
+    assert second["eval_before_cache"]["cache_hit"]
+    key = second["eval_before_cache"]["key"]
+    assert key == first["eval_before_cache"]["key"] and len(key) == 64
+    assert cached_rows == rows
+    saved = json.loads((root / "eval-cache" / f"{key}.json").read_text())
+    assert saved["rows"] == [json.loads(line) for line in rows.splitlines()]
+    assert all(second["metrics"][k] == v for k, v in saved["metrics"].items())
+    third, _, third_calls = run(0.002, 8)
+    assert third_calls == 4 and not third["eval_before_cache"]["cache_hit"]
+    assert third["eval_before_cache"]["key"] != key
+    loaded, _, loaded_calls = run(0.002, 4, root / first["id"] / "adapter.safetensors")
+    assert loaded_calls == 4 and "eval_before_cache" not in loaded
+
+
+def test_before_eval_cache_tracks_checkpoint_file_mtime(tmp_path, monkeypatch):
+    import os
+    from types import SimpleNamespace
+
+    from tilerl import cli
+    from tilerl.config import tiny
+
+    monkeypatch.setattr(cli, "_QWEN38_SOURCE", str(tmp_path))
+    weights = tmp_path / "model.safetensors"
+    weights.write_bytes(b"a")
+    args = cli._build_parser().parse_args(["train", "--model", "qwen38-27b"])
+    backend = SimpleNamespace(target="cpu", precision="bf16")
+    key = cli._before_eval_key(args, tiny(), backend, SamplingParams(), None)
+    stat = weights.stat()
+    weights.write_bytes(b"b")
+    os.utime(weights, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+    assert cli._before_eval_key(args, tiny(), backend, SamplingParams(), None) != key
+
+
 if __name__ == "__main__":
     import sys
 
