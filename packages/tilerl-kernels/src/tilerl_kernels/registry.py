@@ -141,6 +141,12 @@ _SM70_KERNELS = {
     # f32 pool: the attention kernel is f32-IO, and a bf16 pool cast the whole
     # plane per call (4.71 ms/token, 14% of a 4096-ctx token)
     "write_tokens": kernels_mma.make_write_tokens_f32,
+    # Same schedule as sm90, f32 operands: one thread per head column instead of
+    # every thread looping T.serial(DK). The f32 cell in kernels.py stays as the
+    # CPU twin. Measured at T=2048 NVH=48 DK=128, the looping form is 264.33 ms
+    # against 54.04 ms for the same work at threads=1 -- 4.89x of pure redundancy,
+    # and gdn_prep was 53.5% of a prefill tick's GPU time.
+    "gdn_prep": lambda t: kernels_gdn.make_gdn_prep_bf16(t, "float32"),
     # split-KV decode attention, S>=1 (speculative verify too); every sm70
     # attention call takes it, leaving the generic kernel to the other targets.
     # sm70 only: the source is target-neutral but the win is filling 80 SMs, so

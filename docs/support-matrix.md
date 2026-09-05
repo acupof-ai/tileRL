@@ -20,10 +20,16 @@ two cells share is only an override when the maker differs:
 | cpu | 15 | — | — | — |
 | metal | 15 | 3 (`gemm_nn/nt/tn`) | 0 | 12 |
 | sm90 | 41 | 9 | 26 | 6 |
-| sm70 | 23 | 1 (`silu_mul`) | 8 | 14 |
+| sm70 | 23 | 2 (`silu_mul`, `gdn_prep`) | 8 | 13 |
 
-**sm70 reuses the CPU source more than any other accelerated cell**: 14 of its
-23 entries are the same maker object CPU runs, and only `silu_mul` is replaced.
+**sm70 reuses the CPU source more than any other accelerated cell**: 13 of its
+23 entries are the same maker object CPU runs, and only `silu_mul` and
+`gdn_prep` are replaced. `gdn_prep` became an override because the CPU source
+loops `T.serial(DK)` in every thread while the launch passes `threads=DK`, so all
+128 threads computed the same 128 columns — measured at T=2048, NVH=48, DK=128,
+264.33 ms against 54.04 ms for the same work at `threads=1`, and `gdn_prep` was
+53.5% of a prefill tick's GPU time. sm70 now takes sm90's one-thread-per-column
+schedule at f32 rather than a third copy of the kernel.
 Its 8 additions are the sm70-specific decode path — `linear_fp4_gemv`,
 `linear_fp4_gemv_sm70_m`, `paged_attention_split`,
 `paged_attention_split_combine`, `gdn_chunk_fused`, `gdn_decode_fused`,
