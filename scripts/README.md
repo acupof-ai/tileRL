@@ -29,3 +29,13 @@ a launcher, which by definition nothing imports (`_pod_*.sh`, which carry the
 setsid/CUDA_VISIBLE_DEVICES/redirect combination that took real failures to get
 right); or it is the only producer of an artifact something else consumes. Check
 the log name and what the script *calls* before deleting it.
+
+A dead-code scanner does not apply that test either. Measured 2026-09-05: a
+vulture run at 60% confidence produced 11 symbols, and 10 had live callers —
+`rmsnorm_bwd`, `attn_prelude`, `iso_merge`, `is_shared`, `write_block` and
+`roles` are called from `tests/`, `_trunk_logits`/`_verify_chains` and `init_tp`
+from `scripts/`. Both of its **100%**-confidence hits were `types` in
+`__torch_dispatch__`/`__torch_function__` — required positional parameters of a
+torch protocol, so deleting them breaks the probe at call time rather than at
+import. Confidence scores rank how sure the parse is, not how sure the repo is.
+Grep `tests/` and `scripts/` for every candidate before proposing a deletion.

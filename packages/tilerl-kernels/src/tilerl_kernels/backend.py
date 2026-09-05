@@ -138,7 +138,6 @@ class Backend:
 
     name = "tilelang"
     tp_world = 1
-    tp_rank = 0
 
     def init_tp(self, world: int, rank: int) -> None:
         """Join the TP group; framework layers never import torch.distributed."""
@@ -149,7 +148,7 @@ class Backend:
         if not dist.is_initialized():
             comm = "nccl" if self.device.type == "cuda" else "gloo"
             dist.init_process_group(comm, world_size=world, rank=rank)
-        self.tp_world, self.tp_rank = world, rank
+        self.tp_world = world
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         """Sum across the TP group in place. 21.5 us floor per call on 6 H20s,
