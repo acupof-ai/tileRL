@@ -853,7 +853,11 @@ class Engine:
                 # A chunk end IS a state-pool boundary: nothing has been sampled yet, so
                 # the slot holds exactly tokens[:prefill_from]. This is the publish that
                 # makes a ragged prompt shareable -- `_pick` cut the chunk short for it.
-                self._publish_prefix(pf, pf.prefill_from)
+                # An intermediate chunk boundary: the prompt-complete publish below covers
+                # the same tokens and more, so this one is not offered to disk. Measured on
+                # H20 card 6, spilling all six publishes of a 2729-token prompt cost 0.925 s
+                # of a 2.041 s request against 0.180 s for the last one alone.
+                self._publish_prefix(pf, pf.prefill_from, spill=False)
         if not done:
             return
         self._sample_commit(done)
@@ -1142,15 +1146,22 @@ class Engine:
             if tok != raw:  # a forced end-think token: the rest of the chain is stale
                 return
 
-    def _publish_prefix(self, req: _Req, length: int) -> None:
+    def _publish_prefix(self, req: _Req, length: int, spill: bool = True) -> None:
         """Hand tokens[:length], its blocks and the linear-state snapshot at that
-        boundary to the store; the store owns and evicts all three together."""
+        boundary to the store; the store owns and evicts all three together.
+
+        ``spill=False`` for a publish a later one supersedes -- the entry stays in HBM but
+        is not written to the disk tier. Every mid-prefill chunk boundary is such a publish:
+        the prompt-complete entry that follows covers it, and on a real second turn the
+        prompt is LONGER, so the longest entry is the one that serves. Skipping them takes
+        one 2729-token prompt from 1624 MB spilled to 325 MB.
+        """
         snap = (
             self._states.states[req.state_slot].clone(),
             self._states.window_snapshot(req.state_slot),
         )
         self._prefix_published += self._prefix.insert(
-            req.tokens[:length], req.blocks[: length // BLOCK_TOKENS], snap
+            req.tokens[:length], req.blocks[: length // BLOCK_TOKENS], snap, spill=spill
         )
 
     def _finish(self, req: _Req, error: str | None = None) -> None:
@@ -1277,6 +1288,12 @@ def build_engine(
     #: #   one architecture are served from one spill dir
     ssd_path: str = "",
     ssd_fingerprint: str = "",
+    #: spill floor in tokens; 0 takes KvTier's own default (one chunk). Measured on H20
+    #: card 6: write-through costs 0.925 s of a 2.041 s prefill, and the reason is that a
+    #: GDN snapshot is a CONSTANT ~157 MB at every prefix length, so the 6 publishes of one
+    #: 2729-token prompt copy 941 MB of state to serve a single 157 MB entry. Raising this
+    #: drops the short publishes, which are the ones a longer prefix supersedes anyway.
+    ssd_min_tokens: int = 0,
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
@@ -1365,7 +1382,8 @@ def build_engine(
     if ssd_path:
         # Not gated on cuda: the tier is target-independent, and the CPU target is where
         # its parity is checked.
-        kw["ssd"] = KvTier(ssd_path, ssd_fingerprint or _weight_fingerprint(cfg))
+        kw["ssd"] = KvTier(ssd_path, ssd_fingerprint or _weight_fingerprint(cfg),
+                           **({"min_tokens": ssd_min_tokens} if ssd_min_tokens else {}))
     store = PrefixStore(kv_pool, **kw) if prefix_store is None else prefix_store
     return Engine(
         model,

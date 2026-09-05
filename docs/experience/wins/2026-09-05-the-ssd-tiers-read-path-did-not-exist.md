@@ -71,6 +71,82 @@ disk traffic, so it never did it. All three arm-order controls passed throughout
 along with writing `3` to `/proc/sys/vm/drop_caches` on a shared host before
 reasoning about it.
 
+## What write-through costs, and four wrong guesses at why
+
+Every publish is offered to the tier, so the copy lands inside the prefill that published
+it. On H20 card 6, one 2729-token prompt, `--ssd-path` the only variable, arms alternated,
+`ssd_hits` 0 in both arms (this is the write path), 0 refusals throughout:
+
+| config | on | off | cost | % | offers | n |
+|---|---:|---:|---:|---:|---:|---:|
+| every publish, pageable copy | 2.966 | 2.041 | +0.925 | **45.3%** | 6 | 4 |
+| every publish, pinned + non_blocking | 2.391 | 2.008 | +0.383 | 19.1% | 6 | 3 |
+| every publish, pinned via a (numel,dtype) pool | 2.472 | 2.051 | +0.421 | 20.5% | 6 | 3 |
+| every publish, pinned via a 2-slot arena | 3.692 | 2.052 | +1.640 | 79.9% | 6 | 3 |
+| last publish only, pageable | 2.276 | 2.069 | +0.207 | 10.0% | 1 | 3 |
+| **SHIPPED: last publish, pinned** | 2.196 | 2.015 | **+0.180** | **8.96%** | 1 | 4 |
+
+Two mechanisms, both inside the tier:
+
+* **A GDN snapshot is a CONSTANT ~157 MB at every prefix length** (four .st files measured
+  156896685–156901293 B, a 4.6 KB spread). So a 2729-token prompt's six publishes spilled
+  941 MB of state plus 683 MB of KV = 1624 MB, to serve **one** 325 MB entry — 5.0x the
+  bytes that can ever be read. `insert(..., spill=False)` on the intermediate chunk
+  boundaries keeps them in HBM and skips the disk: 1624 MB → 325 MB.
+* **`.cpu()` is a synchronous pageable copy.** Pinned destination plus `non_blocking=True`,
+  with the flush daemon waiting on a recorded event before it reads the buffer.
+
+**Four guesses at the residual, three of them wrong, and the split is what settled it.**
+After the two fixes the cost was still 0.199 s for 325 MB — 1585 MB/s, pageable-class,
+which said the remaining cost was not the copy I had just fixed. The guesses:
+
+1. `cudaHostAlloc` per spill. **Wrong**: a (numel, dtype) buffer pool measured *worse*,
+   0.421 s against 0.383 s, and in that bench the lengths repeat so the pool was hitting.
+2. Pool too shallow. **Wrong in the same direction**: a two-slot arena measured 1.640 s,
+   because a request's six publishes outrun a depth the daemon only frees after
+   `torch.save`, and 16 of 18 spills fell back to pageable (`ssd_pin_misses` 16).
+3. The 171-slice `torch.stack` block gather. **Wrong**: stage timers put it at **1 ms**.
+4. The device-to-host copy. **Right**: `ssd_copy_ms` **170 ms** of a 180 ms total cost.
+
+So the cost is one 325 MB D2H, and it does not go below that on the prefill stream: a
+pinned `non_blocking` copy returns immediately only if the source is not still being
+written by kernels queued ahead of it, and here it is. Moving the spill to a side stream
+that waits on a prefill event is the upgrade path, not done.
+
+**Do not build a buffer pool above torch's pinned allocator.** Both hand-written layers
+lost to it — `CachingHostAllocator` already reuses pinned blocks, and the pools added their
+own contention on top. Both were deleted; the shipped path is `torch.empty(pin_memory=True)`
+per spill. The stage timers stay on `/health` (`ssd_gather_ms`, `ssd_copy_ms`) so the next
+person reads the split instead of guessing at it a fifth time.
+
+**Verdict: `--ssd-path` stays off by default.** 8.96% on every publishing request against
+1.821x recovered once per restart is a good trade only when prefixes are actually re-served
+across restarts; that is a deployment property, not something this bench can settle. The
+flag is one word and the counters say whether it is paying.
+
+## Durability window
+
+The spill is **not durable at the moment of publish**. `insert` does a GPU→CPU copy and
+enqueues; a daemon thread does the `torch.save` off-tick, because a ~100 ms save inside a
+prefill tick would cost more than the tier saves. So an entry published within the last
+flush is on disk **partially or not at all** when the process dies.
+
+Losing it is correct — the prefix re-prefills, which is exactly what happens today without
+the tier. Two things had to be handled so that it stays a loss rather than a fault:
+
+* `_recover` adopts entries **by file size**, so it cannot distinguish a truncated blob
+  from a whole one and will index a half-written pair.
+* therefore the read path must survive one. Without a guard, `torch.load` on a truncated
+  spill raises `PytorchStreamReader failed reading zip archive` **out of `lookup`** — a
+  crash for what should be a cache miss. Both loads now treat an unreadable file as a miss
+  and drop the key. `test_a_spill_truncated_by_a_crash_is_a_miss_not_a_raise` truncates
+  every spill file to a third of its length and requires the lookup to return None;
+  removing either guard reproduces the raise.
+
+What is NOT claimed: no fsync on the publish path, so a host power loss can lose an entry
+the daemon believes it wrote. The tier is a cache — every entry is reconstructible by
+prefill — so durability past process death was not bought.
+
 ## Rule
 
 A restart is the disk tier's whole case: unlike a host-memory tier it needs no
