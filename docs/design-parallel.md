@@ -120,14 +120,81 @@ CPU, world=2, gloo, tiny model — runs here, no card:
    asserted on the CPU target.
 4. 27B numbers `pending-remote`.
 
+## (d2) CP: ring or all-gather, decided on the arithmetic
+
+The attention CP op is the first one needing a CPU twin, so the collective is
+named here before any code. Both candidates move **identical bytes** — computed
+for the 27B (16 full-attn layers, 4 KV heads, head_dim 256, bf16 K and V):
+
+| | cp=2 | cp=4 | cp=8 |
+|---|---:|---:|---:|
+| bytes/step, either scheme (B=8, T=256) | 64 MiB | 96 MiB | 112 MiB |
+| **ring** calls/step | 16 | 48 | **112** |
+| **all-gather** calls/step | 16 | 16 | **16** |
+| ring latency floor @ 21.5 µs/call | 344 µs | 1032 µs | **2408 µs** |
+| all-gather latency floor | 344 µs | 344 µs | **344 µs** |
+
+Bytes are the same because each scheme moves every remote chunk to every rank
+exactly once. What differs is the **call count**: ring is `cp-1` sequential
+send/recv per layer, all-gather is one. Against the measured 21.5 µs NCCL floor
+(flat from 20 KB to 1.3 MB, CHANGELOG 08-30) that is a 7x latency difference at
+cp=8, and the chunks here are inside the flat region, so the floor *is* the cost.
+
+**That table assumes both are fully exposed, which is unfair to ring** — ring's
+whole point is that hop `i+1` overlaps block `i`'s attention compute, so its
+exposed cost is `max(compute, hop)` per block, not the sum. The overlap only
+helps if there is compute to hide behind, so: at B=8, T=256, cp=8 each block is
+**32 tokens**, and one full-attn layer's attention over it is
+`2·B·H·blk²·D·2` = **0.201 GFLOP**.
+
+| effective throughput | per-block attention | hop floor |
+|---|---:|---:|
+| 100 TFLOP/s (conservative) | **2.0 µs** | 21.5 µs |
+| 300 TFLOP/s | 0.7 µs | 21.5 µs |
+| 989 TFLOP/s (H20 bf16 peak) | 0.2 µs | 21.5 µs |
+
+Compute is **10–100x below the hop floor**, so `max(compute, hop) ≈ hop` and
+overlap recovers almost nothing at these shapes. The 2408 µs stands. This flips
+only when a block is large enough for its attention to exceed 21.5 µs — around
+T/cp ≈ 400+ tokens at 100 TFLOP/s, i.e. the long-sequence regime where ring also
+wins on memory. Same threshold, twice.
+
+(These are FLOP-model numbers, not a bench: there is no CP attention kernel to
+measure yet. The margin is two orders of magnitude, so the conclusion does not
+depend on the model being tight — but it is an estimate and is labelled one.)
+
+What ring buys instead is memory — it never holds the whole KV:
+
+| | B=8 T=256 | B=8 T=2048 | B=1 T=65536 | B=1 T=131072 |
+|---|---:|---:|---:|---:|
+| whole KV per rank, all-gathered | 0.12 GiB | 1.00 GiB | 4.00 GiB | **8.00 GiB** |
+
+**So: all-gather for the RL path, ring only past ~64K.** At the shapes RL
+actually runs (B=8, T=256–2048) the gathered KV is 0.12–1.00 GiB against a 96 GB
+card and all-gather is 7x cheaper in latency at cp=8. Ring's memory advantage
+only pays once the whole KV stops being free, which is the same ~64K threshold
+section (b) gives for CP being worth doing at all. Implementing ring first would
+be optimizing the case CP is not yet used for.
+
+This makes the first CP op an `all_gather` of K and V per full-attn layer —
+already on the tape (#115), with `reduce_scatter`-free backward since the
+backward of a gather is a slice. Ring stays a `# ponytail:` note on it.
+
+The GDN scan is separate and cheaper to reason about: the state is
+`B × 48 × 128 × 128` f32 = **24.0 MiB per layer**, 1.12 GiB across 48 layers at
+B=8, and it composes (`S_i = A_i S_{i-1} + B_i`), so one all-gather of the
+per-chunk `(A, B)` fixes the incoming state without moving the states themselves.
+
 ## (e) Order
 
 1. **TP training.** DONE except the mesh: three `_BWD` entries (#115) and the
    sharded CE (#119), both gated. The mesh is what still blocks full-parameter
    RL, which is the P3 dependency.
 2. **CP.** GDN as the scan `S_i = A_i S_{i-1} + B_i` (composes, so one all-gather
-   fixes the incoming state); ring attention for full attention, whose merge is
-   the split-KV combine already shipped.
+   fixes the incoming state); **all-gather** attention for full attention, whose
+   merge is the split-KV combine already shipped — not ring, per the arithmetic
+   in (d2): same bytes, 7x fewer calls at cp=8, and ring's memory advantage does
+   not pay below ~64K.
 3. **SP is not a third mechanism** — it is CP applied to the norm and embedding
    traffic that TP leaves replicated. It lands as part of CP, not before it, and
    it is worth naming only because it is where the last replicated activation
