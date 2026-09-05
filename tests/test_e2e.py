@@ -1067,6 +1067,73 @@ def test_a_spill_still_in_the_queue_is_served_from_memory(tmp_path):
     _flushed(tier)
 
 
+def test_a_drop_landing_mid_save_does_not_resurrect_the_prefix(tmp_path):
+    """An eviction while the daemon is inside `torch.save` must not leave the bytes behind.
+
+    `drop()` clears the pending tables and unlinks, but the daemon is already past that point
+    with the blob in hand: its `torch.save` completes AFTER the drop and writes the file the
+    drop just removed. So `_flush_loop` re-checks `table.get(k) is blob` afterwards and
+    unlinks again when the entry is gone.
+
+    Without that rollback the dropped prefix comes back: measured here, `ssd_entries` goes
+    0 -> 1 and a `.kv` file is left on disk. That entry is worse than a leak -- `_track_written`
+    indexes it, so a lookup can match a prefix the tier was told to forget, and after an
+    `invalidate()` that means KV computed under the previous weights.
+
+    The window is narrow and this is the only way to open it deterministically: block inside
+    `torch.save`, drop, then release. `_flushed` afterwards, or the assertions race the daemon.
+    """
+    torch.manual_seed(0)
+    toks = list(range(4 * BLOCK_TOKENS))
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+    pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    tier = KvTier(str(tmp_path), "fp-race", min_tokens=BLOCK_TOKENS)
+    store = PrefixStore(pool, ssd=tier)
+    h = store._hash_all(tuple(toks))
+
+    in_save, let_go, saved = threading.Event(), threading.Event(), threading.Event()
+    real_save = torch.save
+
+    def held_save(*a, **kw):
+        in_save.set()
+        let_go.wait(5)
+        try:
+            return real_save(*a, **kw)
+        finally:
+            saved.set()
+
+    with unittest.mock.patch.object(torch, "save", held_save):
+        assert store.insert(toks, [pool.alloc_block() for _ in range(4)],
+                            (state[0].clone(), state[1].clone()))
+        assert in_save.wait(5), (
+            "the daemon never entered torch.save, so the drop below does not land mid-save "
+            "and this test proves nothing"
+        )
+        tier.drop(h)
+        let_go.set()
+    # NOT `_flushed`: `drop()` empties the pending tables, so that helper returns immediately
+    # while the daemon is still inside `torch.save` -- the first version of this test did that
+    # and its negative control PASSED. `_q.unfinished_tasks` is no good either: nothing calls
+    # `task_done()`, so it never reaches 0. Wait for the save that is in flight, then give the
+    # daemon its next few instructions -- the rollback is the line after `torch.save` returns.
+    assert saved.wait(5), "the held torch.save never completed"
+    d = os.path.join(str(tmp_path), "tilerl_kvtier")
+    for _ in range(20):
+        if not [f for f in os.listdir(d) if f.endswith((".kv", ".st"))]:
+            break
+        time.sleep(0.01)
+
+    left = [f for f in os.listdir(d) if f.endswith((".kv", ".st"))]
+    assert not left, (
+        f"a drop mid-save left {len(left)} files on disk: {left}. The save completed after the "
+        "unlink, so the rollback in _flush_loop is what removes them"
+    )
+    assert tier.stats()["ssd_entries"] == 0, (
+        f"the dropped prefix is indexed again ({tier.stats()['ssd_entries']} entries), so a "
+        "lookup can match a prefix the tier was told to forget"
+    )
+
+
 def test_the_disk_tier_evicts_the_oldest_entry_past_its_byte_budget(tmp_path):
     """A byte budget that only reports is unbounded disk growth.
 
