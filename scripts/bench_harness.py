@@ -9,7 +9,9 @@
   accuracy    MMLU 0-shot % on a fixed slice (27B only) — the one non-speed gate
 
 Baseline docs/experience/wins/bench-baseline.json, keyed (suite, shape, target) -> tok/s + commit
-+ date. PASS at >= 0.97x, auto-raise on a beat, FAIL (exit 1) below; a first run seeds it.
++ date, SOTA-only: one row per key, the best measurement. PASS at >= 0.97x, FAIL (exit 1)
+below, and a beat is written as a CANDIDATE for review rather than promoted -- a run that
+raises its own baseline cannot then regress against it. A first run seeds a missing key.
 
   uv run tilerl bench --suite train                       # CPU, tiny
   tilerl bench --source /data00/Qwen3.8-27B-NVFP4 --gpu 7  # pod, all GPU suites
@@ -67,6 +69,7 @@ class Gate:
         self.commit = _git_commit()
         self.date = _today()
         self.rows: list[dict] = []
+        self.candidates: dict[str, dict] = {}
         self.failed = False
         self.dirty = False
         self.seed_only = update_only  # first-seed run: record, never fail
@@ -86,10 +89,14 @@ class Gate:
             self.dirty = True
             verdict = "SEED"
         elif tok_s > prev["tok_s"] * _RAISE and spread <= _RAISE - 1.0:
-            print(f"  RAISED {key}: {prev['tok_s']:.1f} -> {tok_s:.1f} tok/s")
-            self.baseline[key] = {"tok_s": tok_s, "commit": self.commit, "date": self.date}
-            self.dirty = True
-            verdict = "RAISE"
+            # Proposed, not written: the json is the SOTA row the 0.97x gate compares
+            # against, so a run that promotes its own result has nothing left to regress
+            # against -- the next slow run is measured against the fast one it replaced.
+            print(f"  BEAT   {key}: {prev['tok_s']:.1f} -> {tok_s:.1f} {unit}  "
+                  f"(candidate, not written)")
+            self.candidates[key] = {"tok_s": tok_s, "commit": self.commit, "date": self.date,
+                                    "replaces": prev}
+            verdict = "BEAT"
         elif tok_s >= prev["tok_s"] * _GATE:
             verdict = "PASS"
         else:
@@ -103,10 +110,14 @@ class Gate:
         )
         return verdict
 
-    def finish(self) -> int:
-        if self.dirty:
+    def finish(self, candidate_path: Path | None = None) -> int:
+        if self.dirty:  # seeds only: a key with no row yet has nothing to regress against
             _save_baseline(self.baseline)
-            print(f"\n  baseline updated: {_BASELINE}")
+            print(f"\n  baseline seeded: {_BASELINE}")
+        if self.candidates and candidate_path is not None:
+            candidate_path.parent.mkdir(parents=True, exist_ok=True)
+            candidate_path.write_text(json.dumps(self.candidates, indent=2, sort_keys=True) + "\n")
+            print(f"  {len(self.candidates)} candidate row(s) for review: {candidate_path}")
         print("\n=== bench summary ===")
         for r in self.rows:
             soft = "  (report-only)" if r["verdict"] == "FAIL" and self.target == "cpu" else ""
@@ -411,6 +422,9 @@ def main() -> int:
     ap.add_argument("--depths", default=",".join(map(str, _KV_DEPTHS)))
     ap.add_argument("--ticks", type=int, default=20)
     ap.add_argument("--json", default=None)
+    ap.add_argument("--candidates", default=None,
+                    help="write rows that BEAT the baseline here for review; without it a "
+                         "beat is printed and dropped, never written to the baseline")
     ap.add_argument("--spec-depth", type=int, default=2, help="drafts per row per tick")
     ap.add_argument("--mmlu-n", type=int, default=200, help="accuracy suite question count")
     ap.add_argument("--reseed", action="store_true", help="record every row as the new baseline (no gate)")
@@ -477,7 +491,7 @@ def main() -> int:
 
     if args.json:
         Path(args.json).write_text(json.dumps(gate.rows, indent=2) + "\n")
-    return gate.finish()
+    return gate.finish(Path(args.candidates) if args.candidates else None)
 
 
 if __name__ == "__main__":

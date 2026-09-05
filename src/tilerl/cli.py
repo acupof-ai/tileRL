@@ -472,6 +472,44 @@ def _judge_tiebreak(engine, tok, params):
     return tiebreak
 
 
+def _timing_snapshot(m: dict) -> None:
+    """Compare this run's speed against the SOTA baseline row and record the verdict.
+
+    steps/SECOND, not seconds/step: every row in bench-baseline.json is higher-is-better
+    and the gate's three comparisons are all `>`, so raw seconds would make a SLOWER run
+    read as a new record (tests/test_bench_gate.py holds that).
+
+    Best-effort: a run's result is the manifest, and a missing bench harness must not
+    fail the run that produced it.
+    """
+    import importlib.util
+
+    from .ledger import runs_root
+
+    secs = (m.get("metrics") or {}).get("secs_per_step_median")
+    if not secs:
+        return
+    hp = Path(__file__).resolve().parents[2] / "scripts" / "bench_harness.py"
+    spec = importlib.util.spec_from_file_location("bench_harness", hp)
+    if spec is None or spec.loader is None:
+        return
+    try:
+        bh = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bh)
+        i = m["inputs"]
+        shape = f"{i['model']}-{i['algo']}-g{i.get('group')}-t{i.get('max_new_tokens')}"
+        # seed_only=False AND never dirty: seeding writes the tracked json, and every
+        # pytest run of grpo-tiny-smoke would seed a row -- five junk CPU rows landed in
+        # it the first time this ran. A run reports against the baseline; it never
+        # edits it. Adding a key stays a deliberate act.
+        gate = bh.Gate(os.environ.get("TILERL_TARGET", "cpu"))
+        gate.check("train-run", shape, 1.0 / secs, unit="step/s")
+        gate.dirty = False
+        gate.finish(Path(runs_root()) / m["id"] / "baseline-candidate.json")
+    except Exception as exc:  # noqa: BLE001 - the manifest is already written
+        print(f"  (timing snapshot skipped: {exc})")
+
+
 def _finish(m: dict, as_json: bool) -> None:
     """Gate, write the manifest, print it, exit non-zero on a failed gate.
     A gate whose metric was not evaluated passes vacuously (value null)."""
@@ -496,6 +534,7 @@ def _finish(m: dict, as_json: bool) -> None:
             )]
         m["finished"] = now()
         write_manifest(runs_root(), m)
+        _timing_snapshot(m)
     print(json.dumps(m, indent=1) if as_json else format_run(m))
     if not gates_pass(m):
         sys.exit(1)
