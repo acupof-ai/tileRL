@@ -400,3 +400,36 @@ def test_a_recapturing_engine_drops_what_the_update_invalidated():
         assert engine._decode_graphs == {}, "the update left a graph traced on old weights"
         assert engine._prefix.stats()["entries"] == 0, "the update left KV from the old policy"
         dirty()  # the next step must clear it again, not rely on loop entry
+
+
+def test_every_adapter_receives_a_gradient():
+    """An adapter no forward reads is invisible: it costs two AdamW moments and
+    checkpoint bytes, trains nothing, and inflates the params number a run
+    publishes. `add_lora` took any 2-D parameter as a linear weight, which caught
+    a quantized weight's sidecar (`.scale` is [N, K/32]) and `conv1d` [qkv, 4] --
+    32 of 64 adapters on an fp4 tiny were dead. Shape does not identify a linear;
+    what `_linear` resolves an adapter FOR does.
+
+    Both precisions, because the two causes differ: the sidecars exist only under
+    fp4, conv1d is dead in either. Counting gradients rather than inspecting names
+    is what makes this fail for a new dead target nobody thought of.
+    """
+    from tilerl.autograd import RecordingBackend, Tape
+    from tilerl.config import tiny
+    from tilerl.model import add_lora, build_random
+    from tilerl.train import _training_kv
+
+    for fp4 in (True, False):
+        cfg = replace(tiny(), fp4=fp4)
+        model = build_random(cfg, seed=0, keep_master=False)
+        backend = RefBackend()
+        adapters = add_lora(model, rank=4)
+        tape = Tape()
+        with torch.no_grad(), tape:
+            logits = model.forward(np.array([[1, 2, 3, 4]]), np.arange(4, dtype=np.int64),
+                                   _training_kv(model, 1, 4, device=backend.device),
+                                   RecordingBackend(backend))
+        grads = tape.backward(torch.ones_like(logits),
+                              needs={id(v) for v in adapters.values()})
+        dead = sorted(k for k, v in adapters.items() if id(v) not in grads)
+        assert not dead, f"fp4={fp4}: {len(dead)} adapters never receive a gradient: {dead[:4]}"

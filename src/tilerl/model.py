@@ -403,7 +403,16 @@ def add_lora(
 ) -> dict[str, torch.Tensor]:
     """Attach LoRA adapters to every linear (quantized or dense bf16) and return
     them. B starts at zero, so step 0 is bit-identical to the base; alpha/rank
-    is folded into A's init."""
+    is folded into A's init.
+
+    Only what ``_linear`` resolves an adapter for gets one. A 2-D parameter is not
+    by itself a linear weight: a quantized weight's sidecar (``.scale`` [N, K/32],
+    ``.wscale``) and ``conv1d`` [qkv, 4] both qualified on shape alone and got a
+    full adapter pair each, which no forward ever read -- ``_linear`` looks up
+    ``lora_a`` on the base key, and ``conv1d`` goes to the GDN kernel, not a
+    linear. Measured on an fp4 tiny before this: 32 of 64 adapters received a
+    gradient, and the other 32 still cost two AdamW moments and checkpoint bytes.
+    """
     g = torch.Generator().manual_seed(seed)
     new: dict[str, torch.Tensor] = {}
     for k in sorted(model.params):
@@ -414,9 +423,11 @@ def add_lora(
             n, kk = model.params[k].shape
         elif (
             model.params[k].ndim == 2
-            and not any(k.endswith(x) for x in (".lora_a", ".lora_b"))
+            and not any(k.endswith(x) for x in (".lora_a", ".lora_b", ".conv1d"))
             and f"{k}.wq" not in model.params
             and f"{k}.w8" not in model.params
+            and f"{base}.wq" not in model.params
+            and f"{base}.w8" not in model.params
         ):  # dense base: the key IS the weight
             base, n, kk = k, *model.params[k].shape
         else:
