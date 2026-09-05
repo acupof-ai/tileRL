@@ -190,6 +190,12 @@ most of them one of these five):
   loop-entry clear satisfied.
 - Volume is not time. A pad histogram in elements says where copies are, not where
   seconds go; only a phase-attributed profile does.
+- A negative verdict on a condition with two variables needs a sweep of each. "DRAM tier
+  is structurally useless" came from a sweep of the HBM budget at two sessions; the
+  condition was sessions > budget, and the other axis reversed it (0/63 → 24/0 hits).
+  A one-axis sweep finds a threshold, and a threshold reads like a law. A veto gets the
+  scrutiny a claim gets; an instrument that errs toward your conclusion produces no
+  surprise and so never gets checked.
 - Before building, `git log -S<symbol> --all`: KvTier was four commits and a review pass
   on a branch when "no such tier exists" was written on main.
 
