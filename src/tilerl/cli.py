@@ -592,6 +592,12 @@ def _train_adapters(args: argparse.Namespace) -> None:
              "skipped": True, "passed": None}
     if args.rl:
         manifest["gates"].append(drift)
+    # Before the eval arms, and for BOTH algos: `write_manifest` otherwise runs only
+    # inside `_finish`, so a run killed anywhere earlier left no manifest and
+    # `tilerl ledger` could not see it. Measured on cpu: SIGTERM at step 6 of a grpo
+    # run left 12 rollout rows and no manifest; the same kill on an opd run left no
+    # run DIRECTORY at all. `_finish` overwrites this with the finished manifest.
+    write_manifest(runs_root(), manifest)
     evals("before")  # LoRA B is zero at init: the base model's score
     if args.steps == 0:
         evals("after")
@@ -617,14 +623,6 @@ def _train_adapters(args: argparse.Namespace) -> None:
         hist = []
         rollouts: list = []
         written = 0
-        # The rows are useless without the run they came from: a killed run reached
-        # no `write_manifest` at all (that lives in `_finish`), so `tilerl ledger`
-        # returned [] and the only thing on disk was rollouts.jsonl -- which carries
-        # no model, cap, group, lr, seed or commit, and the directory name is a hash
-        # of those and cannot be inverted. Measured on cpu: SIGTERM at step 6 left 12
-        # rows and no manifest. One write before the loop makes the run identifiable;
-        # `_finish` overwrites it with the finished one.
-        write_manifest(runs_root(), manifest)
         for i, (r, ce, secs, tied, ntok, timings, width) in enumerate(
                 train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
                                     group=args.group, sampling=params, seed=args.seed,

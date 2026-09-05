@@ -47,12 +47,26 @@ carries `step/g/tokens/reward/advantage` and no model, cap, group, lr, seed or
 commit — the run id is a hash of those and cannot be inverted. The rows survived
 and nothing could say which run made them.
 
-One `write_manifest` before the loop fixes it; `_finish` overwrites it with the
-finished manifest. Re-probed: `list_runs` **0 → 1**, and the manifest on disk
-carries `model`, `commit`, `group`, `max_new_tokens` and the rest of the inputs.
-The gate samples `len(list_runs(root))` at the start of every step and asserts it
-is never 0; removing the pre-loop write turns it red with `list_runs saw
+One `write_manifest` before the eval arms fixes it, for **both algos**; `_finish`
+overwrites it with the finished manifest. Re-probed: `list_runs` **0 → 1**, and the
+manifest on disk carries `model`, `commit`, `group`, `max_new_tokens` and the rest
+of the inputs. The gate samples `len(list_runs(root))` at the start of every step
+and asserts it is never 0; removing the write turns it red with `list_runs saw
 [0, 0, 0, 0, 0, 0, 0, 0, 0]`.
+
+**The first version of that fix covered one branch of two.** It sat inside
+`if args.rl:`, so an interrupted OPD run still left **no run directory at all** —
+worse than the grpo case, which at least had `rollouts.jsonl`. Probed rather than
+read: `tilerl ledger --json` listed 0 runs, and after hoisting the write above
+`evals("before")` it listed 1. The gate cannot see this, because it exercises the
+grpo path only; the OPD half rests on the probe.
+
+That probe also lied once. Its first run reported "0 step lines" after a 180 s
+wait, which reads as a stalled loop — the OPD step line calls `log` without
+`flush=True` (the grpo one at `cli.py:630` passes it), so a pipe buffered every
+line. Re-running the child under `python -u` showed the loop running normally. A
+stdout-driven probe cannot distinguish a quiet loop from a stopped one when the
+thing it reads is buffered.
 
 **Sending the signal a second time found what the fix leaves behind.** A cpu run
 at group 8, SIGTERM by verified pid after 22 steps: `rollouts.jsonl` held exactly
@@ -68,12 +82,25 @@ c13cfab9f89b  train  running  skip
 
 `_finish` never ran, so `gates` holds only the pre-seeded `rollouts_within_cap`
 with `skipped: true`, and `format_run`'s verdict is `skip` when every gate is
-skipped and `pass` when the list is empty — a run killed before step 1 reads
-`pass`. Neither says "interrupted". The `running` in the timestamp column is the
-only signal, and it comes from `finished: null` rather than from any gate. So the
-ledger can now *see* an interrupted run, which is the point of the fix, but it
-does not *judge* it: do not read a verdict off a run whose finished field is null.
-Distinguishing "killed" from "passed" is a separate change and is not in this PR.
+skipped and `pass` when the list is empty. On the grpo path the list is never
+empty — `manifest["gates"].append(drift)` runs before the write — so `skip` is
+the only reachable verdict there, however early the kill lands.
+
+**`pass` is reachable, on the other algo.** An OPD run appends no drift gate, so
+its manifest goes to disk with `gates: []`. Killed by verified pid mid-run:
+
+```
+e230f7c29f5a  train  running  pass     gates: []   finished: null
+```
+
+An interrupted run reporting `pass` is the worse of the two readings, and it is
+the one the hoist made reachable — before the hoist that run left no directory to
+misread. Neither verdict says "interrupted"; the `running` in the timestamp column
+is the only signal, and it comes from `finished: null` rather than from any gate.
+So the ledger can now *see* an interrupted run on both paths, which is the point
+of the fix, but it does not *judge* one: do not read a verdict off a run whose
+finished field is null. Distinguishing "killed" from "passed" is a separate change
+and is not in this PR.
 
 `manifest["metrics"]["length_reward_r"]` is the Pearson r of (tokens, reward)
 pooled over **within-group deviations**. Centering per group is the whole
@@ -136,8 +163,11 @@ run at all. Reading a code path tells you what it does when reached; only killin
 a real process tells you what is on disk when it is not.
 
 Signalling once found the missing manifest; signalling again after the fix found
-that the recovered manifest reads `skip` — one probe answers one question, and
-the fix's own output is the next thing to probe.
+that the recovered manifest reads `skip`; signalling the *other algo* found the fix
+had covered one branch of two, and then that the branch it added reports `pass` on
+an interrupted run. One probe answers one question, the fix's own output is the
+next thing to probe — and a fix guarded by a test only on the path the test
+exercises is not yet a fix on the other path.
 
 ## Results
 
