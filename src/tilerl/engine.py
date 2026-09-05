@@ -41,6 +41,7 @@ from . import precision
 from .kv_cache import (
     BLOCK_TOKENS,
     BatchKv,
+    DramSnapshots,
     LinearStatePool,
     NoPrefixStore,
     PagedKvPool,
@@ -683,6 +684,10 @@ class Engine:
                 # snapshot the sm70 budget (free/4 = 1417 MiB) holds 9 of them.
                 "prefix_evictions": store["evictions"],
                 "prefix_state_bytes": store["state_bytes"],
+                # Present only with a host tier; a demotion is a prefix the card could not
+                # keep but did not have to lose.
+                **{k: v for k, v in store.items() if k.startswith("dram_")},
+                "prefix_demoted": store.get("demoted", 0),
                 "prefill_forwards": self._prefill_forwards,
                 "decode_forwards": self._decode_forwards,
                 "mixed_forwards": self._mixed_forwards,
@@ -1231,6 +1236,11 @@ def build_engine(
     max_num_batched_tokens: int = 512,
     max_blocks: int = 0,
     prefix_store: Any = None,
+    #: host-tier budget for demoted GDN snapshots; 0 is off, which is the default until a
+    #: workload is measured where it wins. A single conversation is not one: it re-reads
+    #: only its newest entry, so the LRU snapshot a demotion picks is never asked for
+    #: again -- measured, 43 demotions and 0 promotions, with the wall clock 1.51x worse.
+    dram_bytes: int = 0,
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
@@ -1308,6 +1318,14 @@ def build_engine(
     kw = {}
     if backend.device.type == "cuda":
         kw["state_bytes"] = int(torch.cuda.mem_get_info()[0] // 4)
+        # Host tier for snapshots the card cannot keep resident. Measured on the live
+        # V100: 43 of 43 evictions happened with 64% of the block pool free, so every one
+        # was state bytes -- a prefix thrown away for a byte the host could hold. 4 GiB
+        # rather than the ~25 GiB free: pinned pages cannot be swapped and this pod has
+        # 31 GiB of RAM against a 32 GiB card, so pinning most of it destabilises the
+        # host, not the process. 4 GiB is 28 snapshots against HBM's 9.
+        if dram_bytes:
+            kw["dram"] = DramSnapshots(budget_bytes=dram_bytes)
     store = PrefixStore(kv_pool, **kw) if prefix_store is None else prefix_store
     return Engine(
         model,
