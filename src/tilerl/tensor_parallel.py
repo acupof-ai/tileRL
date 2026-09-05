@@ -24,7 +24,7 @@ this model's configuration.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -54,6 +54,67 @@ _QUANT_SUFFIX = ("wq", "scale", "oscale", "w8", "wscale", "lora_a", "lora_b")
 #: fp4 packs two values per byte and carries a scale per 16 input columns.
 _FP4_ROW_ALIGN = 32
 _FP8_BLOCK = 128
+
+
+@dataclass(frozen=True)
+class Mesh:
+    """A rank's position in the ``(dp, tp, cp)`` grid. Sizes multiply to ``world``.
+
+    Layout is **cp fastest, then tp, then dp**::
+
+        rank = ((dp_i * tp) + tp_i) * cp + cp_i
+
+    so a tp group is contiguous and lands inside one node, which is where NVLink
+    is. dp ranks talk once per step and go outermost.
+
+    ``cp > 1`` is refused: the axis is in the arithmetic because leaving it out
+    would mean renumbering every rank later, but no context-parallel op exists,
+    and a mesh that accepts ``cp=2`` would silently run tp-only math on a
+    sequence it claims to have split.
+    """
+
+    dp: int = 1
+    tp: int = 1
+    cp: int = 1
+    rank: int = 0
+
+    def __post_init__(self) -> None:
+        for name, n in (("dp", self.dp), ("tp", self.tp), ("cp", self.cp)):
+            if n < 1:
+                raise ValueError(f"{name}={n} must be >= 1")
+        if self.cp != 1:
+            raise ValueError(
+                "cp>1 is not implemented: no context-parallel op exists, so a cp mesh "
+                "would run tp-only math on a sequence it claims to have split"
+            )
+        if not 0 <= self.rank < self.world:
+            raise ValueError(f"rank={self.rank} outside world={self.world}")
+
+    @property
+    def world(self) -> int:
+        return self.dp * self.tp * self.cp
+
+    @property
+    def cp_rank(self) -> int:
+        return self.rank % self.cp
+
+    @property
+    def tp_rank(self) -> int:
+        return (self.rank // self.cp) % self.tp
+
+    @property
+    def dp_rank(self) -> int:
+        return self.rank // (self.cp * self.tp)
+
+    def tp_group(self) -> list[int]:
+        """The ranks sharing this rank's tp group, in tp_rank order."""
+        base = self.dp_rank * self.tp * self.cp + self.cp_rank
+        return [base + i * self.cp for i in range(self.tp)]
+
+    def dp_group(self) -> list[int]:
+        """The ranks sharing this rank's tp and cp position, one per dp replica."""
+        off = self.tp_rank * self.cp + self.cp_rank
+        return [d * self.tp * self.cp + off for d in range(self.dp)]
 
 
 def pad_vocab(vocab: int, world: int, to: int = 64) -> int:
@@ -205,4 +266,30 @@ if __name__ == "__main__":  # runnable check: the rules, not the plumbing
 
     assert pad_vocab(248320, 4) == 248320
     assert pad_vocab(1000, 8) == 1024
-    print("tensor_parallel: gqa replication + alignment refusal + vocab pad OK")
+
+    # Mesh: every rank in a (dp=2, tp=4) world lands in exactly one tp group and
+    # one dp group, and the two groups intersect in that rank alone. A layout bug
+    # that duplicates or drops a rank fails here rather than as a hung collective.
+    m0 = Mesh(dp=2, tp=4, rank=0)
+    assert m0.world == 8
+    seen_tp, seen_dp = [], []
+    for r in range(8):
+        m = Mesh(dp=2, tp=4, rank=r)
+        assert m.dp_rank * 4 + m.tp_rank == r, r  # cp=1, so rank decomposes exactly
+        seen_tp.append(tuple(m.tp_group()))
+        seen_dp.append(tuple(m.dp_group()))
+        assert r in m.tp_group() and r in m.dp_group()
+        assert set(m.tp_group()) & set(m.dp_group()) == {r}
+    assert sorted(set(seen_tp)) == [(0, 1, 2, 3), (4, 5, 6, 7)]
+    assert len(set(seen_dp)) == 4 and all(len(g) == 2 for g in set(seen_dp))
+    assert sorted(r for g in set(seen_dp) for r in g) == list(range(8))
+
+    for bad in (dict(cp=2), dict(tp=0), dict(tp=2, rank=2), dict(tp=2, rank=-1)):
+        try:
+            Mesh(**bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Mesh({bad}) must raise")
+
+    print("tensor_parallel: gqa replication + alignment refusal + vocab pad + mesh OK")

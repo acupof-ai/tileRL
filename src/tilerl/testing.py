@@ -39,7 +39,9 @@ class RefBackend:
     tp_world = 1
     tp_rank = 0
 
-    def init_tp(self, world: int, rank: int) -> None:
+    _tp_pg = None
+
+    def init_tp(self, world: int, rank: int, tp_groups: list[list[int]] | None = None) -> None:
         """Same seam as ``Backend.init_tp``; gloo, so the TP gate runs CPU-only."""
         if world == 1:
             return
@@ -47,6 +49,16 @@ class RefBackend:
 
         if not dist.is_initialized():
             dist.init_process_group("gloo", world_size=world, rank=rank)
+        if tp_groups:
+            mine = None
+            for g in tp_groups:  # every rank builds every group, in order
+                pg = dist.new_group(list(g))
+                if rank in g:
+                    mine, self._tp_pg = g, pg
+            if mine is None:
+                raise ValueError(f"rank {rank} is in none of the tp groups {tp_groups}")
+            self.tp_world, self.tp_rank = len(mine), mine.index(rank)
+            return
         self.tp_world, self.tp_rank = world, rank
 
     def all_reduce(self, x):
@@ -54,7 +66,7 @@ class RefBackend:
             return x
         import torch.distributed as dist
 
-        dist.all_reduce(x)
+        dist.all_reduce(x, group=self._tp_pg)
         return x.view_as(x)  # distinct object: the tape addresses by id()
 
     def all_gather(self, x, dim: int = -1):
@@ -64,7 +76,7 @@ class RefBackend:
 
         x = x.contiguous()
         parts = [torch.empty_like(x) for _ in range(self.tp_world)]
-        dist.all_gather(parts, x)
+        dist.all_gather(parts, x, group=self._tp_pg)
         return torch.cat(parts, dim=dim)
 
     def tp_fork(self, x):

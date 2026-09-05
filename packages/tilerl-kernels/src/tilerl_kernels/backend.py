@@ -141,9 +141,22 @@ class Backend:
     #: this rank's index in the TP group. #106 deleted it as unread; the sharded
     #: cross-entropy needs it to locate its slice of the vocabulary.
     tp_rank = 0
+    #: this rank's tp process group; None means "the whole world is one tp group"
+    _tp_pg = None
 
-    def init_tp(self, world: int, rank: int) -> None:
-        """Join the TP group; framework layers never import torch.distributed."""
+    def init_tp(self, world: int, rank: int, tp_groups: list[list[int]] | None = None) -> None:
+        """Join the TP group; framework layers never import torch.distributed.
+
+        ``tp_groups`` is EVERY tp group in the mesh, in mesh order
+        (``[m.tp_group() for m in ...]``, deduped by the caller). Omit it and the
+        whole world is one tp group, which is right for a pure-TP run and WRONG
+        the moment dp > 1: an ungrouped ``all_reduce`` sums across the dp
+        replicas too, averaging away the independence dp exists for.
+
+        All of them, not just this rank's, because ``new_group`` is itself
+        collective -- every rank must call it for every group, in the same
+        order, or the ranks that skipped one deadlock the first time it is used.
+        """
         if world == 1:
             return
         import torch.distributed as dist
@@ -151,6 +164,16 @@ class Backend:
         if not dist.is_initialized():
             comm = "nccl" if self.device.type == "cuda" else "gloo"
             dist.init_process_group(comm, world_size=world, rank=rank)
+        if tp_groups:
+            mine = None
+            for g in tp_groups:
+                pg = dist.new_group(list(g))
+                if rank in g:
+                    mine, self._tp_pg = g, pg
+            if mine is None:
+                raise ValueError(f"rank {rank} is in none of the tp groups {tp_groups}")
+            self.tp_world, self.tp_rank = len(mine), mine.index(rank)
+            return
         self.tp_world, self.tp_rank = world, rank
 
     def tp_fork(self, x: torch.Tensor) -> torch.Tensor:
@@ -173,7 +196,7 @@ class Backend:
             return x
         import torch.distributed as dist
 
-        dist.all_reduce(x)
+        dist.all_reduce(x, group=self._tp_pg)
         return x.view_as(x)
 
     def all_gather(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -184,7 +207,7 @@ class Backend:
 
         x = x.contiguous()
         parts = [torch.empty_like(x) for _ in range(self.tp_world)]
-        dist.all_gather(parts, x)
+        dist.all_gather(parts, x, group=self._tp_pg)
         return torch.cat(parts, dim=dim)
 
     def __init__(self, target: str):
@@ -1257,7 +1280,10 @@ class Backend:
         import torch.distributed as dist
 
         def all_reduce(t, op):
-            dist.all_reduce(t, op=dist.ReduceOp.SUM if op == "sum" else dist.ReduceOp.MAX)
+            # group= or the CE statistics are reduced across the dp replicas too,
+            # and the loss stays finite and plausible while measuring the wrong batch.
+            dist.all_reduce(t, op=dist.ReduceOp.SUM if op == "sum" else dist.ReduceOp.MAX,
+                            group=self._tp_pg)
             return t
 
         # Every shard is exactly vloc wide: pad_vocab rounds the vocabulary to
