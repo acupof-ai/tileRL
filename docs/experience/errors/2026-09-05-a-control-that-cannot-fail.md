@@ -66,6 +66,14 @@ gives `{0:6, 1:6, 2:6, 3:6}`, and the control then fails.
 This is the only one of the seven caught **before** shipping, and only because the
 control was run at all. The gate itself was green.
 
+**8. A red control stopped at the wrong assertion (#132).** The SSD-tier control
+did fail, but the stray-file assertion came before the index assertion. Both
+mutations left a file, and pytest stops at the first failing assert, so the
+assertion whose message said "indexed again" never executed in the cited run.
+The red result proved the file assertion, leaving the index claim untested.
+Fixed by narrowing each mutation to one guard and putting the discriminating
+index assertion first; recorded in [the SSD-tier entry](../wins/2026-09-05-the-ssd-tiers-read-path-did-not-exist.md).
+
 ## Root cause
 
 They share a shape. In each, the control's *setup* silently satisfied the
@@ -114,6 +122,8 @@ between two derivations that share a premise tests the arithmetic, not the premi
 a test pass proves nothing about what it would catch; the only evidence is a run
 where it caught something. Budget the extra run — it is one command, and both
 vacuous controls here would have shipped as proof otherwise.
+
+Quote the assertion message that fired; order or narrow the control so only the claim's assertion can fire.
 
 Related, from the same day:
 [the gate cannot see the number it guards](2026-09-05-the-gate-cannot-see-the-number-it-guards.md)
