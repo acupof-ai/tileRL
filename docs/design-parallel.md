@@ -46,9 +46,12 @@ LoRA fits on one card, full-param does not.
 
 ## (c) Collectives seam
 
-One `comm.py`. NCCL on CUDA, **gloo on CPU** so the parity gate runs on this
-machine — gloo has `all_reduce`/`all_gather`/`reduce_scatter` and `send`/`recv`,
-which is the whole surface.
+Collectives live in **`Backend`**, in the kernel package — backend isolation says
+only `tilerl_kernels` touches `torch.distributed`, and `all_reduce`/`all_gather`
+are already there. The mesh lives in `tilerl` and calls through `Backend`. **No
+`src/tilerl/comm.py`.** NCCL on CUDA, **gloo on CPU** so the parity gate runs on
+this machine — gloo has `all_reduce`/`all_gather`/`reduce_scatter` and
+`send`/`recv`, which is the whole surface.
 
 ```
 all_reduce(x, group)        reduce_scatter(x, group)
@@ -61,7 +64,7 @@ What each layer needs, **forward → backward**, the row that does not exist yet
 |---|---|---|
 | column-parallel linear (`q/k/v/gate/up`) | none | `all_reduce(dX)` |
 | row-parallel linear (`o/down`) | `all_reduce(Y)` | none |
-| vocab-parallel `lm_head` | `all_gather(logits)` | `reduce_scatter(dlogits)` |
+| vocab-parallel `lm_head` | **sharded CE**, two scalar `all_reduce` per row | gradient stays sharded |
 | GDN scan, CP | `all_gather` of local `(A, B)` | same scan reversed |
 | ring attention, CP | `send`/`recv` ring | reversed ring |
 | SP norm/embedding | `all_gather` in, `reduce_scatter` out | mirrored |
@@ -71,9 +74,16 @@ The pattern is that column and row are **duals**: a forward all-reduce means no
 backward one, and vice versa. Getting that backwards costs a factor of `world` in
 the gradient and is silent — which is what the gate below is for.
 
-On the tape, this is two new `_BWD` entries (`all_reduce` → identity,
-`all_gather` → `reduce_scatter`) plus recording the existing calls. The tape is
-hand-written, so a collective is an op like any other; no autograd hooks.
+**The `lm_head` row is the one that must not follow the pattern.** All-gathering
+logits materialises `[B, T, 248320]` in f32 — the **8.5 GiB** that failed on
+08-30. The sharded cross-entropy never forms them: each rank takes a local row max
+and a local sum-exp, two scalar `all_reduce`s per row combine them, and the
+gradient is produced already sharded. So the new `_BWD` entry is for **that op**,
+not for a `reduce_scatter` of `dlogits` that would have to exist first.
+
+On the tape, the rest is two `_BWD` entries (`all_reduce` → identity, `all_gather`
+→ `reduce_scatter`) plus recording the existing calls. The tape is hand-written, so
+a collective is an op like any other; no autograd hooks.
 
 ## (d) Gates
 
@@ -103,10 +113,11 @@ CPU, world=2, gloo, tiny model — runs here, no card:
 ## Two risks worth stating now
 
 - **TP forfeits the decode graph** until `Backend.all_reduce` is capturable
-  (`tensor_parallel.py:21` already says so). The graph is worth **2.12× on the RL
-  step** (measured today, card 6: 73.12 → 34.43 s), so TP-8 that loses it starts
-  2× behind and has to win that back before it is a gain. This is the single
-  biggest number in this document and it argues for `tp=4, dp=2` over `tp=8`
-  wherever the weights fit.
+  (`tensor_parallel.py:21` already says so). The graph is worth **2.16× on the RL
+  step** (measured 2026-09-05 on card 6: 73.62 → 34.09 s, n=10 pooled over both
+  arm orders — `wins/2026-09-05-recapture-after-update.md`), and it is now the
+  default there. So TP-8 that loses it starts 2× behind and has to win that back
+  before it is a gain. This is the single biggest number in this document and it
+  argues for `tp=4, dp=2` over `tp=8` wherever the weights fit.
 - **The GDN scan is the one novel kernel.** It does not touch the 27B until the
   tiny gradcheck passes.
