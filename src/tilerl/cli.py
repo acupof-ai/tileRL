@@ -10,8 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from .eval import answer_match
-from .math_answer import boxed_match
+from .eval import MATCHERS
 from .recipes import RECIPES, flags
 
 # ponytail: placeholder hub id; pin the real Qwen3-27B repo when weights land.
@@ -257,6 +256,18 @@ def _load_adapter(trainable: dict, path: str, log) -> None:
     log(f"loaded adapter {sum(v.numel() for v in saved.values()) / 1e6:.1f}M params <- {path}")
 
 
+def _write_eval_rows(run_id: str, tag: str, rows: list) -> None:
+    """One JSON row per problem, so two arms over the same set can be compared
+    paired. P1 fell back to the unpaired interval because only totals were kept."""
+    from .ledger import runs_root
+
+    d = Path(runs_root()) / run_id
+    if not d.is_dir():
+        return
+    with (d / f"eval-{tag}.jsonl").open("w") as f:
+        f.writelines(json.dumps(r) + "\n" for r in rows)
+
+
 def _train_adapters(args: argparse.Namespace) -> None:
     """GRPO or OPD: LoRA on the frozen base, the engine samples, the ledger gates."""
     import torch
@@ -349,8 +360,12 @@ def _train_adapters(args: argparse.Namespace) -> None:
             manifest["metrics"][f"mmlu_{tag}_concurrency"] = conc
             log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}% (seed 0, concurrency {conc})")
         if eval_rows:
+            rows_out: list = []
             c, n, ntok = gsm8k_accuracy(engine, tok, eval_rows, eval_params, concurrency=8,
-                                        thinking=thinking)
+                                        thinking=thinking,
+                                        match=MATCHERS[args.reward],
+                                        per_problem=rows_out)
+            _write_eval_rows(manifest["id"], tag, rows_out)
             manifest["metrics"][f"gsm8k_{tag}"] = c
             manifest["metrics"][f"gsm8k_{tag}_tokens"] = ntok
             # tokens/correct, not tokens: the ratio is what a length claim compares
@@ -365,9 +380,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
     if args.rl:
         if rows:
             gold = {tuple(p): r["answer"] for p, r in zip(prompts, rows)}
-            # MATH answers are not numbers: last_number scores `\frac{1}{2}` as 2,
-            # so every group would tie on the wrong reading.
-            match = boxed_match if args.reward == "boxed" else answer_match
+            match = MATCHERS[args.reward]
 
             def reward(prompt, completion):
                 text = tok.decode([int(t) for t in completion])
