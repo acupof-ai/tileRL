@@ -462,6 +462,74 @@ def test_a_ragged_prompt_publishes_and_its_state_matches_no_store():
     )
 
 
+def test_a_chunk_end_off_the_bucket_still_restores_an_exact_state():
+    """A publish needs block alignment, NOT `_PREFILL_BUCKET` alignment — and the state it
+    restores is exact either way.
+
+    `_pick` aligns the first chunk to `_PREFILL_BUCKET` (64) while the publish gate tests
+    `% BLOCK_TOKENS` (16), which a reviewer read as an inconsistency. It is not: a publish
+    needs whole blocks to slice (`% 16`) and a state that is exact, which holds at ANY
+    chunk end. 64 only guarantees that a single-chunk prompt HAS an aligned boundary.
+
+    Driven with `max_num_batched_tokens=48` so mid-prompt chunk ends land at 48/96/144 —
+    multiples of 16, none of them multiples of 64. The warm-up length is 150, which is
+    NOT block-aligned, so the full-prompt publish branch cannot fire and every entry in
+    the store comes from the mid-chunk `elif`. That isolation is what makes the negative
+    control bite: with the gate switched to `_PREFILL_BUCKET` this configuration publishes
+    **0** entries against 3, so the hit assert fails. A warm-up at 144 does NOT isolate it
+    — the full-prompt branch publishes there and the test passes either way, which is how
+    the first version of this test came out inert.
+    """
+    cfg = tiny()
+    params = SamplingParams(temperature=0.0, max_new_tokens=6, seed=5)
+    rng = np.random.default_rng(7)
+    conv = rng.integers(3, 320, size=600).astype(np.int64)
+    budget, warm_to, target = 48, 150, 272
+    assert budget % BLOCK_TOKENS == 0 and budget % _PREFILL_BUCKET != 0, (
+        "the chunk ends must be block-aligned but off the bucket, or this proves nothing"
+    )
+    assert warm_to % BLOCK_TOKENS != 0, (
+        "the warm-up length must be ragged, or the full-prompt branch publishes and the "
+        "mid-chunk branch this test targets is never exercised"
+    )
+
+    def run(no_store: bool):
+        kw = {"prefix_store": NoPrefixStore()} if no_store else {}
+        engine = build_engine(
+            cfg, build_random(cfg, seed=99), get_backend(), num_blocks=64, num_slots=4,
+            max_batch=4, max_total_tokens=2048, max_num_batched_tokens=budget, **kw,
+        )
+        if not no_store:
+            engine.submit(conv[:warm_to], params)
+            for _ in range(300):
+                engine.step()
+                if not (list(engine._running) + list(engine._waiting)):
+                    break
+            engine.poll()
+        rid = engine.submit(conv[:target], params)
+        for _ in range(300):
+            engine.step()
+            live = [r for r in list(engine._running) + list(engine._waiting) if r.req_id == rid]
+            assert live, "the row finished before its prompt was prefilled"
+            row = live[0]
+            if row.prefill_from >= target:
+                break
+        return engine, engine._states.states[row.state_slot].clone()
+
+    hit_engine, hit_state = run(False)
+    _, ref_state = run(True)
+    st = hit_engine.stats()
+    assert st["prefix_hits"] >= 1, (
+        f"no hit (hits={st['prefix_hits']}), so the state comparison is two identical fresh "
+        "computations and this test is inert"
+    )
+    assert torch.allclose(hit_state, ref_state, rtol=1e-2, atol=1e-5), (
+        f"a chunk end off the {_PREFILL_BUCKET} bucket restored an inexact state: max|delta| "
+        f"{(hit_state - ref_state).abs().max():.3e} — then the publish gate must test the "
+        f"bucket, not {BLOCK_TOKENS}"
+    )
+
+
 def test_prefix_hit_survives_evicting_its_own_entry():
     """submit()'s own evict_until_free can evict the entry it just matched;
     the snapshot must be read before that, not after.
