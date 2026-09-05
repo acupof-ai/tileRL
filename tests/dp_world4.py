@@ -9,6 +9,7 @@ train_step produced rather than on a loss.
     TILERL_TARGET=cpu python3 tests/dp_world4.py          # the gate
     TILERL_TARGET=cpu python3 tests/dp_world4.py --no-dp     # control: no averaging
     TILERL_TARGET=cpu python3 tests/dp_world4.py --scramble  # control: order check
+    TILERL_TARGET=cpu python3 tests/dp_world4.py --scramble-keys  # control: key-set check
 
 Its own file, not an arm of tests/mesh_world4.py: a second mp.spawn in a process
 that already ran gloo aborts with SIGABRT (measured).
@@ -30,7 +31,7 @@ WORLD = DP * TP
 
 
 def _dp_step(rank: int, no_dp: bool, out: dict, streams: bool = False,
-             scramble: bool = False) -> None:
+             scramble: bool | str = False) -> None:
     """A real train_step at (dp=2, tp=2), each replica on its own half of the
     batch. The weights it produces must equal a dp=1 tp=2 step on the WHOLE
     batch: that is what averaging the gradients across replicas buys.
@@ -71,7 +72,12 @@ def _dp_step(rank: int, no_dp: bool, out: dict, streams: bool = False,
         # reverses BOTH members of every pair and they still agree. That version
         # of this control passed, which is how the bug in it was found.
         flip = Mesh(dp=DP, tp=TP, rank=rank).dp_rank == 1
-        tr._order_agrees = lambda order, b: real(order[::-1] if flip else order, b)
+        if scramble == "keys":
+            # A rank-conditional parameter set, same order: sorted(params) agrees
+            # across ranks only because the key sets do, and nothing else says so.
+            tr._order_agrees = lambda order, b: real(order[:-1] if flip else order, b)
+        else:
+            tr._order_agrees = lambda order, b: real(order[::-1] if flip else order, b)
 
     rows = np.array([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=np.int64)
     mine = rows[Mesh(dp=DP, tp=TP, rank=rank).dp_rank][None, :]
@@ -108,7 +114,7 @@ def _dp_ref_rank(r: int, out: dict, streams: bool = False) -> None:
                      for k, v in local.params.items()})
 
 
-def _dp_gate(no_dp: bool, streams: bool = False, scramble: bool = False) -> bool:
+def _dp_gate(no_dp: bool, streams: bool = False, scramble: bool | str = False) -> bool:
     mgr = mp.Manager()
     ref = mgr.dict()
     mp.spawn(_dp_ref_rank, args=(ref, streams), nprocs=TP, join=True)
@@ -141,15 +147,16 @@ def _dp_gate(no_dp: bool, streams: bool = False, scramble: bool = False) -> bool
 
 
 def main() -> int:
-    no_dp, scramble = "--no-dp" in sys.argv, "--scramble" in sys.argv
+    no_dp = "--no-dp" in sys.argv
+    scramble = "keys" if "--scramble-keys" in sys.argv else "--scramble" in sys.argv
     if scramble:
         # The control for the order check itself: reverse one rank's recorded
         # order. The reduce still pairs correctly (the tape order is unchanged),
         # so this is a test of _order_agrees, and it must report, not hang.
         try:
-            _dp_gate(False, streams=True, scramble=True)
+            _dp_gate(False, streams=True, scramble=scramble)
         except Exception as e:
-            reason = "reduced gradients in different orders" in str(e)
+            reason = "different parameters, or in different orders" in str(e)
             print("scramble control: correctly reported the order mismatch" if reason
                   else f"scramble control: failed for another reason: {str(e)[-200:]}")
             return 0 if reason else 1

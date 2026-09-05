@@ -68,6 +68,13 @@ hashes its own apply order and all-gathers the hash **over the dp group**, once
 per step, behind `TILERL_CHECK_DP_ORDER` so gates pay for it and training does
 not. It turns a process abort into a message naming the cause.
 
+It hashes the ordered **key list**, so it catches the other half too, raised on
+review: `sorted(params)` agrees across ranks only because every rank holds the
+same keys. A rank-conditional adapter would break that with the sequence itself
+still sorted, and nothing else in the tree would say so. The `--scramble-keys`
+control drops one key on one dp rank and the check reports it; `--scramble`
+reverses the order instead. Both fail, for their own reasons.
+
 ## The gate
 
 `tests/dp_world4.py`: four gloo ranks as (dp=2, tp=2), each replica training a

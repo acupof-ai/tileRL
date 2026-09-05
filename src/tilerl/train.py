@@ -75,6 +75,11 @@ def _order_agrees(order: list[str], backend: Any) -> None:
     ``pair.cc``) rather than raising, with no traceback near the loop. Comparing
     a hash costs one collective and turns that into a message.
 
+    The hash is over the ORDERED KEY LIST, so it catches both failures: a
+    different sequence, and a different key SET. ``sorted(params)`` agrees across
+    ranks only because every rank holds the same keys -- a rank-conditional
+    adapter breaks that, and nothing else would say so.
+
     Over the DP group, since that is the group the reduce ran on: ``all_gather``
     spans the tp group and would compare each rank only against its own replica.
     """
@@ -83,14 +88,16 @@ def _order_agrees(order: list[str], backend: Any) -> None:
     import torch.distributed as dist
 
     h = hashlib.sha256("\n".join(order).encode()).digest()[:8]
-    mine = torch.tensor(list(h), dtype=torch.float64)
+    mine = torch.tensor([len(order), *h], dtype=torch.float64)
     parts = [torch.empty_like(mine) for _ in range(backend.dp_world)]
     dist.all_gather(parts, mine, group=backend._dp_pg)
     if any(not bool((p == parts[0]).all()) for p in parts):
+        counts = sorted({int(p[0].item()) for p in parts})
         raise RuntimeError(
-            f"dp ranks reduced gradients in different orders ({len(order)} params here); "
-            "a collective pairs by call sequence, so this would abort in gloo instead "
-            "of raising. The tape's order must be identical on every rank.")
+            "dp ranks reduced different parameters, or in different orders "
+            f"(counts across ranks: {counts}; {len(order)} here). A collective pairs by "
+            "call sequence, so this would abort inside gloo rather than raise. Every rank "
+            "must hold the same parameter keys and walk them in the same order.")
 
 
 def _step(
