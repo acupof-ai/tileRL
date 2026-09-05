@@ -115,7 +115,15 @@ Two mechanisms, both inside the tier:
   156896685–156901293 B, a 4.6 KB spread). So a 2729-token prompt's six publishes spilled
   941 MB of state plus 683 MB of KV = 1624 MB, to serve **one** 325 MB entry — 5.0x the
   bytes that can ever be read. `insert(..., spill=False)` on the intermediate chunk
-  boundaries keeps them in HBM and skips the disk: 1624 MB → 325 MB.
+  boundaries keeps them in HBM and skips the disk: 1624 MB → 325 MB. **Gated only after
+  the fact:** dropping the kwarg left all 328 tests passing, so the entire difference between
+  8.96% and 45.3% was a one-word regression no local run would catch — the number is measured
+  on a machine this suite never runs on. `test_an_intermediate_chunk_publish_stays_out_of_the_disk_tier`
+  asserts `prefix_published == 5, ssd_offered == 1` at a 48-token budget over 240 tokens;
+  without the kwarg it is 5 and 5, the same 5.0x. Both operands are asserted because the
+  warm-up length decides whether either is even reachable: a ragged one never fires the
+  prompt-complete publish, so the expected offer count is 0 and "only the last spilled"
+  cannot be told from "nothing spilled".
 * **`.cpu()` is a synchronous pageable copy.** Pinned destination plus `non_blocking=True`,
   with the flush daemon waiting on a recorded event before it reads the buffer.
 
