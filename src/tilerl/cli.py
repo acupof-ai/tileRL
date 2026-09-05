@@ -156,7 +156,14 @@ def cmd_train(args: argparse.Namespace) -> None:
 
 
 def _jsonl(path: str | None) -> list[dict]:
-    return [json.loads(ln) for ln in Path(path).read_text().splitlines() if ln.strip()] if path else []
+    if not path:
+        return []
+    rows = [json.loads(ln) for ln in Path(path).read_text().splitlines() if ln.strip()]
+    # A named file with no rows is silent otherwise: cmd_train's `or [...]` falls back
+    # to random prompts, so a 100-step GRPO run trains on noise and reports a reward.
+    if not rows:
+        sys.exit(f"error: {path} has no rows")
+    return rows
 
 
 def _train_full(args: argparse.Namespace) -> None:
