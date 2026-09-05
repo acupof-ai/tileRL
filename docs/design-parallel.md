@@ -159,9 +159,15 @@ only when a block is large enough for its attention to exceed 21.5 µs — aroun
 T/cp ≈ 400+ tokens at 100 TFLOP/s, i.e. the long-sequence regime where ring also
 wins on memory. Same threshold, twice.
 
-(These are FLOP-model numbers, not a bench: there is no CP attention kernel to
-measure yet. The margin is two orders of magnitude, so the conclusion does not
-depend on the model being tight — but it is an estimate and is labelled one.)
+**What this decision rests on, stated plainly.** These are FLOP-model numbers,
+not a measurement: there is no CP attention kernel to bench, so nobody has timed
+the quantity that actually decides it — the **exposed** comms cost, how long a
+layer stalls with ring's hops overlapping block compute. The choice above is made
+on unoverlapped floor arithmetic plus a two-orders-of-magnitude margin, and it is
+**revisitable the moment that number exists**. If a real ring implementation
+overlaps better than the model says, or the attention kernel is far off 100
+TFLOP/s effective at 32-token blocks, this flips. Treat it as the default to
+build first, not as settled.
 
 What ring buys instead is memory — it never holds the whole KV:
 
@@ -169,7 +175,8 @@ What ring buys instead is memory — it never holds the whole KV:
 |---|---:|---:|---:|---:|
 | whole KV per rank, all-gathered | 0.12 GiB | 1.00 GiB | 4.00 GiB | **8.00 GiB** |
 
-**So: all-gather for the RL path, ring only past ~64K.** At the shapes RL
+**So: all-gather for the RL path, ring only past ~64K** — on floor arithmetic,
+pending an exposed-cost measurement (see below). At the shapes RL
 actually runs (B=8, T=256–2048) the gathered KV is 0.12–1.00 GiB against a 96 GB
 card and all-gather is 7x cheaper in latency at cp=8. Ring's memory advantage
 only pays once the whole KV stops being free, which is the same ~64K threshold
