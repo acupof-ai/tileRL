@@ -141,7 +141,8 @@ reached `tilerl-27` because a grant commit read "via tilerl-27".)
 **Pod jobs go through `scripts/pod_run.sh <name> <card> -- <cmd>`.** Never
 hand-type the launcher: it reaps the job (a `setsid nohup` from an exiting
 shell orphans to a PID 1 that is `sleep infinity` and never `wait()`s), logs
-to `/work` because `/` is full, claims with the python pid and retries only
+to `/work`, the tree that survives a container restart, claims with the
+python pid and retries only
 the device-fd refusal, releases from a trap, and refuses a card holding
 >64 MiB with no claim. After any kill, read `ps -o stat=`: `kill -0`,
 `/proc/<pid>` and `pgrep -f` all call a zombie alive.

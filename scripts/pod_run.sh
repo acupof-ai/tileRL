@@ -11,7 +11,9 @@
 #     `sleep infinity` and never calls wait(): four jobs ended as permanent
 #     zombies, one holding 28.2 GB long enough that another team nearly restarted
 #     the container -- which would have killed a run on another card.
-#   * logs under /work, never /tmp: the pod's / is full.
+#   * logs under /work: it survives a container restart, and it is where
+#     pod_sync and the runs already live. (Not a disk-space reason: /, /tmp and
+#     /work are one filesystem -- same fsid, 263G free, 87% used.)
 #   * card_claim with the PYTHON descendant's pid, not the wrapper's. card_claim
 #     refuses a shell pid by name and tells you which child to claim.
 #   * retry ONLY on "no device fd yet" (~1.3 s); "is a shell" is never retried.
