@@ -81,7 +81,15 @@ def main() -> int:
         ap.error("--sessions must be >= 1")
 
     fillers = _fillers(args.sessions)
-    assert len(set(fillers)) == args.sessions, "fillers collide, so sessions share a prefix"
+    # Not an assert: `-O` strips those, and this guard's whole value is firing in someone
+    # else's later edit. Distinct heads, not just distinct strings -- prefixes hash from
+    # token 0, so two fillers agreeing there share one entry however they end.
+    if len({s[:20] for s in fillers}) != args.sessions:
+        raise SystemExit(
+            f"{args.sessions} sessions produced {len({s[:20] for s in fillers})} distinct "
+            "prefixes: the conversations would share cache entries and the hit rate would "
+            "measure the fixture, not the tier"
+        )
     convs: list[list[dict]] = [[] for _ in fillers]
     rows = []
     for turn in range(args.turns):
