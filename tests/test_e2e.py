@@ -820,6 +820,74 @@ def test_a_restart_faults_the_prefix_back_in_off_disk(tmp_path):
         "a different fingerprint served KV computed under other weights"
     )
 
+    # An optimizer step calls clear(), and a tier that keeps serving afterwards hands the
+    # trainer KV computed under the PREVIOUS weights -- off-policy, and silent. clear()
+    # bumps the fingerprint rather than unlinking 20 GiB inside a training step, so what
+    # has to be asserted is that a store built after it does not recover.
+    # A fresh directory: the fp-b store above already unlinked the files, since a
+    # fingerprint mismatch deletes what it cannot serve. Reusing it would make the setup
+    # assert below pass for the wrong reason -- it caught exactly that.
+    d2 = str(tmp_path / "clear")
+    pool2 = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    tier2 = KvTier(d2, "fp-c", min_tokens=BLOCK_TOKENS)
+    warm2 = PrefixStore(pool2, ssd=tier2)
+    b2 = [pool2.alloc_block() for _ in range(4)]
+    assert warm2.insert(toks, b2, (state[0].clone(), state[1].clone()))
+    _flushed(tier2)
+    assert KvTier(d2, "fp-c", min_tokens=BLOCK_TOKENS).recovered == 1, (
+        "setup: the entry must be adoptable before clear(), or the assert below is inert"
+    )
+    warm2.clear()
+    after_tier = KvTier(d2, "fp-c", min_tokens=BLOCK_TOKENS)
+    after = PrefixStore(PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,)),
+                        ssd=after_tier)
+    assert after_tier.recovered == 0 and after.lookup(toks) is None, (
+        f"clear() left {after_tier.recovered} entries adoptable, so an optimizer step "
+        "would serve KV computed under the weights it just replaced"
+    )
+
+
+def test_a_spill_truncated_by_a_crash_is_a_miss_not_a_raise(tmp_path):
+    """A kill between torch.save starting and finishing leaves a partial blob on disk.
+
+    `_recover` adopts entries by FILE SIZE, so it cannot tell a truncated blob from a whole
+    one -- it will happily index a half-written pair. The read then has to survive it: a
+    `torch.load` raising inside `lookup` takes down the request that happened to match,
+    which is a crash for a cache miss.
+
+    The durability window this covers is real and bounded: the flush daemon writes off-tick,
+    so an entry published within the last flush is on disk partially or not at all. Losing
+    it is correct (it re-prefills); raising on it is not.
+    """
+    torch.manual_seed(0)
+    toks = list(range(4 * BLOCK_TOKENS))
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+    pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    tier = KvTier(str(tmp_path), "fp-trunc", min_tokens=BLOCK_TOKENS)
+    store = PrefixStore(pool, ssd=tier)
+    assert store.insert(toks, [pool.alloc_block() for _ in range(4)],
+                        (state[0].clone(), state[1].clone()))
+    _flushed(tier)
+
+    d = os.path.join(str(tmp_path), "tilerl_kvtier")
+    victims = [f for f in os.listdir(d) if f.endswith((".kv", ".st"))]
+    assert victims, "nothing spilled, so the truncation below is inert"
+    for name in victims:
+        path = os.path.join(d, name)
+        keep = os.path.getsize(path) // 3
+        with open(path, "r+b") as fh:
+            fh.truncate(keep)
+
+    cold_tier = KvTier(str(tmp_path), "fp-trunc", min_tokens=BLOCK_TOKENS)
+    assert cold_tier.recovered >= 1, (
+        "recovery skipped the truncated files, so the load path below is never reached -- "
+        "it adopts by size and a truncated file still has one"
+    )
+    cold = PrefixStore(PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,)),
+                       ssd=cold_tier)
+    hit = cold.lookup(toks)  # must not raise
+    assert hit is None, f"a truncated spill served a hit of length {hit and hit.length}"
+
 
 def _flushed(tier, tries: int = 500) -> None:
     """Wait for the flush daemon to land what is queued. Bounded, so a wedged writer

@@ -71,6 +71,29 @@ disk traffic, so it never did it. All three arm-order controls passed throughout
 along with writing `3` to `/proc/sys/vm/drop_caches` on a shared host before
 reasoning about it.
 
+## Durability window
+
+The spill is **not durable at the moment of publish**. `insert` does a GPU→CPU copy and
+enqueues; a daemon thread does the `torch.save` off-tick, because a ~100 ms save inside a
+prefill tick would cost more than the tier saves. So an entry published within the last
+flush is on disk **partially or not at all** when the process dies.
+
+Losing it is correct — the prefix re-prefills, which is exactly what happens today without
+the tier. Two things had to be handled so that it stays a loss rather than a fault:
+
+* `_recover` adopts entries **by file size**, so it cannot distinguish a truncated blob
+  from a whole one and will index a half-written pair.
+* therefore the read path must survive one. Without a guard, `torch.load` on a truncated
+  spill raises `PytorchStreamReader failed reading zip archive` **out of `lookup`** — a
+  crash for what should be a cache miss. Both loads now treat an unreadable file as a miss
+  and drop the key. `test_a_spill_truncated_by_a_crash_is_a_miss_not_a_raise` truncates
+  every spill file to a third of its length and requires the lookup to return None;
+  removing either guard reproduces the raise.
+
+What is NOT claimed: no fsync on the publish path, so a host power loss can lose an entry
+the daemon believes it wrote. The tier is a cache — every entry is reconstructible by
+prefill — so durability past process death was not bought.
+
 ## Rule
 
 A restart is the disk tier's whole case: unlike a host-memory tier it needs no

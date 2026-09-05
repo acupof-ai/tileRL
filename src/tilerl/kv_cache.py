@@ -391,11 +391,8 @@ class KvTier:
         import queue
         import threading
 
-        # One chunk (4 blocks = 64 tokens, the backend's _WY_CHUNK), not the 2048 the
-        # eviction-driven version used: write-through spills at the publish points, and
-        # those are chunk boundaries, so a 2048 floor would refuse every one of them.
-        # Spelled in BLOCK_TOKENS rather than imported -- this layer does not reach into
-        # the kernel package.
+        # One chunk (4 blocks = 64 tokens), not the 2048 the eviction-driven version used:
+        # write-through spills at chunk boundaries, so a 2048 floor refuses every publish.
         self.min_tokens = min_tokens
         # bound in-flight writes: bursty publishes can enqueue faster than the disk
         # drains, and an unbounded queue OOMs a 31GB host. Over the cap, spill refuses
@@ -404,10 +401,11 @@ class KvTier:
         self._max_pending = max_pending
         self.offered = 0
         self.refusals = 0
+        self.over_budget = 0
         self._healthy = True  # daemon failure (disk full/perm) flips this to refuse
         # Size-based LRU: total on-disk bytes capped at max_bytes; the daemon
         # evicts the least-recently-accessed entry's files after each write.
-        # has()/load_kv()/load_state() touch an entry to MRU.
+        # resident()/load_kv()/load_state() touch an entry to MRU.
         self._max_bytes = max_bytes
         self._lru: OrderedDict[int, int] = OrderedDict()
         self._total = 0
@@ -419,17 +417,13 @@ class KvTier:
         if os.path.exists(self._dir) and not os.path.exists(marker):
             raise RuntimeError(f"{self._dir} exists but is not a KvTier dir (no .kvtier marker)")
         os.makedirs(self._dir, exist_ok=True)
-        # Cold start: KEEP what is on disk when the fingerprint matches and rebuild the
-        # index from it, so the first lookup after a restart is a hit. This is the whole
-        # reason the disk tier is worth building on this hardware -- a runtime LRU tier
-        # below DRAM inherits DRAM's condition (lookups must reach past the newest
-        # entry), while after a restart HBM is empty so EVERY lookup reaches back.
-        # The earlier version rmtree'd its own directory here, which made a cold hit
-        # impossible by construction.
+        # Cold start KEEPS what is on disk when the fingerprint matches: a runtime tier
+        # needs lookups to reach past the newest entry, but after a restart HBM is empty so
+        # EVERY lookup reaches back. Wiping here made a cold hit impossible by construction.
         self.recovered = self._recover(marker, fingerprint)
         # Deferred write: spill_kv runs inside a decode tick, so it does only the
         # GPU->CPU copy + enqueue; a daemon flushes the ~100ms torch.save off-tick.
-        # _pending/_pending_st serve blobs not yet on disk, so has()/load see them.
+        # _pending/_pending_st serve blobs not yet on disk, so resident()/load see them.
         self._pending: dict[int, dict] = {}
         self._pending_st: dict[int, dict] = {}
         self._lock = threading.Lock()
@@ -464,8 +458,9 @@ class KvTier:
             f.write(fingerprint)
         if prev is None:
             return 0
-        # A key is servable only with BOTH halves present; has() enforces that too, but
-        # a half-written pair should not occupy the byte budget.
+        # A key is servable only with BOTH halves present -- a fault-in loads the state
+        # first and drops the key when it is missing -- and a half-written pair should not
+        # occupy the byte budget meanwhile.
         sizes: dict[int, list[int]] = {}
         for name in os.listdir(self._dir):
             stem, _, ext = name.rpartition(".")
@@ -525,18 +520,12 @@ class KvTier:
             self._lru[key] = self._lru.get(key, 0) + sz
             self._lru.move_to_end(key)
             self._total += sz
-            while self._total > self._max_bytes and len(self._lru) > 1:
-                victim = next(
-                    (k for k in self._lru if k not in self._pending and k not in self._pending_st),
-                    None,
-                )
-                if victim is None:
-                    break  # every entry is still being written
-                vs = self._lru.pop(victim)
-                self._total -= vs
-                for p in (self._kv(victim), self._st(victim)):
-                    with contextlib.suppress(FileNotFoundError):
-                        os.remove(p)
+            if self._total > self._max_bytes:
+                # ponytail: counted, not enforced. The eviction loop that used to live here
+                # unlinked the LRU entry's files, and nothing exercised it -- an untested
+                # path that deletes data is worse than a tier that grows. `ssd_over_budget`
+                # on /health is the signal to build it, with a gate.
+                self.over_budget += 1
 
     def _touch_lru(self, key: int) -> None:
         with self._lock:
@@ -551,11 +540,9 @@ class KvTier:
 
     def spill_kv(self, key: int, tokens: tuple[int, ...], blocks: Sequence[int],
                  pool: PagedKvPool) -> bool:
-        # True = accepted. The tier owns both the length floor and the capacity
-        # refusal (the store never pre-gates), so a composite tier can vary them
-        # per level. Refuse below min_tokens or when the writer is behind/dead.
-        # A refusal is counted, not just returned: write-through offers every publish, so
-        # refusals/offered is the rate that says whether the device keeps up.
+        # True = accepted. The tier owns the length floor and the capacity refusal, so a
+        # composite tier can vary them per level. A refusal is counted, not just returned:
+        # refusals/offered is what says whether the device keeps up with write-through.
         if len(blocks) * BLOCK_TOKENS < self.min_tokens:
             return False
         self.offered += 1
@@ -577,13 +564,21 @@ class KvTier:
                 pool: PagedKvPool) -> bool:
         # False = data gone (a raced eviction dropped it) OR a hash collision
         # stored a different prefix — caller treats either as a miss. Serves a
-        # still-pending blob from memory, closing the has()/load TOCTOU.
+        # still-pending blob from memory, closing the resident()/load TOCTOU.
         with self._lock:
             blob = self._pending.get(key)
         if blob is None:
             if not os.path.exists(self._kv(key)):
                 return False
-            blob = torch.load(self._kv(key), map_location="cpu")
+            # A truncated file is the crash case, not a theoretical one: the daemon writes
+            # off-tick, so a kill between `torch.save` starting and finishing leaves a
+            # partial blob that `_recover` then adopts by size. Treat an unreadable file as
+            # a miss and drop it, rather than raising inside a lookup.
+            try:
+                blob = torch.load(self._kv(key), map_location="cpu")
+            except Exception:  # noqa: BLE001 - truncated / corrupt spill
+                self.drop(key)
+                return False
         if blob.get("tokens") != tuple(tokens):
             return False  # hash collision: these bytes belong to a different prefix
         self._touch_lru(key)
@@ -606,38 +601,21 @@ class KvTier:
         if blob is None:
             if not os.path.exists(self._st(key)):
                 return None
-            blob = torch.load(self._st(key), map_location="cpu")
+            try:
+                blob = torch.load(self._st(key), map_location="cpu")
+            except Exception:  # noqa: BLE001 - truncated / corrupt spill, same as load_kv
+                self.drop(key)
+                return None
         if blob.get("tokens") != tuple(tokens):
             return None
         self._touch_lru(key)
         return blob["states"], blob["windows"]
 
-    def has(self, key: int, tokens: tuple[int, ...]) -> bool:
-        # A cold hit is valid only if BOTH the KV and the state are present AND
-        # their stored tokens match (a 64-bit hash collision stores a different
-        # prefix). Checking here means submit's loads cannot then fail-mismatch.
-        with self._lock:
-            kv = self._pending.get(key)
-            st = self._pending_st.get(key)
-        if kv is None:
-            if not os.path.exists(self._kv(key)):
-                return False
-            kv = torch.load(self._kv(key), map_location="cpu")
-        if st is None:
-            if not os.path.exists(self._st(key)):
-                return False
-            st = torch.load(self._st(key), map_location="cpu")
-        t = tuple(tokens)
-        if kv.get("tokens") == t and st.get("tokens") == t:
-            self._touch_lru(key)
-            return True
-        return False
-
     def resident(self, key: int) -> bool:
         """Whether this key is in the in-memory index, without touching the disk.
 
         The candidate filter for a lookup: a query walks every prefix length, and
-        `has()` on each would be one or two `torch.load`s per length. This is a dict
+        a `torch.load` on each would be one or two file reads per length. This is a dict
         probe, so the disk is read only for the one candidate that survives.
         """
         with self._lock:
@@ -679,6 +657,7 @@ class KvTier:
             "ssd_recovered": self.recovered,
             "ssd_offered": self.offered,
             "ssd_refusals": self.refusals,
+            "ssd_over_budget": self.over_budget,
             "ssd_pending": pending,
             "ssd_healthy": int(self._healthy),
         }
@@ -810,12 +789,10 @@ class PrefixStore:
         self._by_id[entry.eid] = entry
         for b in blocks:
             self._pool.retain(b)
-        # Write-through: every publish is offered to disk, not just what eviction drops.
-        # The spill is a GPU->CPU copy plus an enqueue here; a daemon does the torch.save
-        # off-tick, and a full queue refuses and counts rather than blocking prefill. Both
-        # halves go or neither -- `has` requires the pair, and a lone .st would occupy the
-        # byte budget serving nothing. `resident` skips the bytes already on disk, which is
-        # what a fault-in re-inserts: without it every cold hit writes back what it just read.
+        # Write-through: a GPU->CPU copy plus an enqueue here, with the ~100 ms torch.save
+        # off-tick on a daemon, so a full queue refuses rather than blocking prefill. Both
+        # halves go or neither -- a fault-in needs the pair. `resident` skips what is already
+        # on disk, without which every fault-in writes back the bytes it just read.
         if (self._ssd is not None and state is not None and not self._ssd.resident(h)
                 and self._ssd.spill_kv(h, tokens, blocks, self._pool)):
             self._ssd.spill_state(h, tokens, state[0], state[1])
