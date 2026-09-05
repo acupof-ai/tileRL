@@ -22,6 +22,7 @@ same file scores the same way through `--data`, `--eval-gsm8k` and a re-score.
 """
 
 import argparse
+import collections
 import json
 import random
 
@@ -52,7 +53,8 @@ def main() -> None:
         if ans is None:
             dropped += 1
             continue
-        rows.append({"prompt": r["problem"].strip() + _INSTRUCTION, "answer": ans})
+        rows.append({"prompt": r["problem"].strip() + _INSTRUCTION, "answer": ans,
+                     "level": r["level"]})
 
     order = list(range(len(rows)))
     if args.seed is not None:
@@ -62,8 +64,13 @@ def main() -> None:
     with open(args.out, "w") as f:
         for i in order:
             f.write(json.dumps(rows[i]) + "\n")
+    hist = collections.Counter(rows[i]["level"] for i in order)
     print(f"{args.out}: {len(order)} rows, level={args.level or 'all'}, seed={args.seed}, "
           f"{dropped} dropped for no \\boxed{{}}")
+    # The written rows' own levels, not the filter's: run 2's eval file was built
+    # without --level and its name said otherwise, so 80.0% was read as a level-5
+    # score (errors/2026-09-05-the-eval-file-was-not-the-level-it-was-named.md).
+    print("  levels written:", dict(sorted(hist.items())))
 
 
 if __name__ == "__main__":
