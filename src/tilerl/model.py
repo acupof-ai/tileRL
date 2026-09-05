@@ -24,6 +24,7 @@ from tilerl_kernels.reference import (
 
 from . import autograd, precision
 from .config import ModelConfig
+from .tensor_parallel import zigzag_key_positions
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no tilelang import at runtime
     import numpy as np
@@ -257,8 +258,26 @@ class Model:
         q = backend.rope(q, positions, cfg.rope_theta, rotary_dim=cfg.effective_rotary_dim)
         k = backend.rope(k, positions, cfg.rope_theta, rotary_dim=cfg.effective_rotary_dim)
         if getattr(kv, "dense", False):
-            out = backend.attention(q, k, v, 1.0 / math.sqrt(d), gate=gate)
+            cp = getattr(backend, "cp_world", 1)
+            if cp > 1:
+                # This rank holds one chunk of the queries and, after the gather,
+                # every rank's keys. The mask comes from absolute positions: the
+                # gathered chunks arrive in RANK order, which zigzag makes differ
+                # from sequence order, so a shape cannot imply it.
+                k = backend.cp_gather(k, dim=1)
+                v = backend.cp_gather(v, dim=1)
+                out = backend.attention(
+                    q, k, v, 1.0 / math.sqrt(d), gate=gate, q_pos=positions,
+                    k_pos=zigzag_key_positions(int(positions.shape[0]) * cp, cp),
+                )
+            else:
+                out = backend.attention(q, k, v, 1.0 / math.sqrt(d), gate=gate)
         else:
+            if getattr(backend, "cp_world", 1) > 1:
+                raise NotImplementedError(
+                    "cp>1 is training-only: the paged pool holds whole sequences, so a "
+                    "cp rank would attend its own chunk's KV and call it the prefix"
+                )
             backend.write_tokens(k, v, kv, layer_idx)
             k_plane, v_plane = kv.kv_pool.kv_layer(layer_idx)
             out = backend.paged_attention(
@@ -283,6 +302,14 @@ class Model:
     ) -> torch.Tensor:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
+        # The mesh no longer refuses cp>1, and the GDN scan is not split yet: its
+        # recurrence carries state across the whole sequence, so a rank holding
+        # one chunk would silently start from a zero state and still produce a loss.
+        if getattr(backend, "cp_world", 1) > 1:
+            raise NotImplementedError(
+                "cp>1 does not cover the GDN layers yet: the scan S_i = A_i S_{i-1} + B_i "
+                "needs an all-gather of the per-chunk (A, B) to fix the incoming state"
+            )
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps, narrow=True)
         h = _tp_fork(backend, h)
         qkvz_key = f"{p}.qkvz"

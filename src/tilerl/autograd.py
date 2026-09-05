@@ -151,16 +151,18 @@ def _attention(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
     q, k, v = args[0], args[1], args[2]
     scale = args[3] if len(args) > 3 else kw.get("scale", 1.0)
     gate = kw.get("gate")
+    # The forward's mask, or the backward recomputes softmax over a different one.
+    pos = {"q_pos": kw.get("q_pos"), "k_pos": kw.get("k_pos")}
     if gate is not None:
-        attn_out = backend.attention(q, k, v, scale)
+        attn_out = backend.attention(q, k, v, scale, **pos)
         g_attn, g_gate = backend.attention_gate_bwd(g, attn_out, gate)
-        gq, gk, gv = backend.attention_bwd(g_attn, q, k, v, scale)
+        gq, gk, gv = backend.attention_bwd(g_attn, q, k, v, scale, **pos)
         yield 0, gq
         yield 1, gk
         yield 2, gv
         yield ("kw", "gate"), g_gate
     else:
-        gq, gk, gv = backend.attention_bwd(g, q, k, v, scale)
+        gq, gk, gv = backend.attention_bwd(g, q, k, v, scale, **pos)
         yield 0, gq
         yield 1, gk
         yield 2, gv
@@ -234,6 +236,14 @@ def _all_gather(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
     yield 0, g.chunk(backend.tp_world, dim=dim)[backend.tp_rank].contiguous()
 
 
+def _cp_gather(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
+    # NOT a slice, unlike _all_gather above. There each rank owns a distinct
+    # slice of the output; here every rank's queries read every rank's K/V, so
+    # each rank's incoming gradient covers the whole sequence and the chunks must
+    # be summed before this rank keeps its own.
+    yield 0, backend.cp_reduce_scatter(g, dim=kw.get("dim", 1))
+
+
 def _frozen(fp8: bool) -> _Handler:
     # No master: only dX flows.
     def handler(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
@@ -263,6 +273,7 @@ _BWD: dict[str, _Handler] = {
     "add": _add,
     "all_reduce": _all_reduce,
     "all_gather": _all_gather,
+    "cp_gather": _cp_gather,
     "tp_fork": _tp_fork,
     "checkpoint": _checkpoint,
 }
