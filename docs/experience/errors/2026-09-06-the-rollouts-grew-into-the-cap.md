@@ -4,8 +4,10 @@
 **Session:** tilerl-25
 **Task:** MATH run 2, `grpo-math-27b`, run `0f7006c74ea0`, card 0
 
-> Status: REJECTED. Killed at step 45 of 100, no after-arm. The policy collapsed
-> onto the rollout cap at step 41 and stopped producing a gradient.
+> Status: REJECTED (the run) / **OPEN** (all three fixes). Killed at step 45 of 100,
+> no after-arm. The policy collapsed onto the rollout cap at step 41 and stopped
+> producing a gradient. The fixes below are listed in `OPEN.md`; the run's verdict
+> being final does not close them, and two are on run 3's path.
 
 ## Context
 
