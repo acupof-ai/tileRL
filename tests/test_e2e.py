@@ -839,6 +839,29 @@ def test_the_ssd_flag_reaches_the_store_and_the_fingerprint_covers_the_config(tm
     assert os.path.isdir(os.path.join(str(tmp_path), "tilerl_kvtier"))
     assert tier._fingerprint == _weight_fingerprint(cfg)
 
+    # `--ssd-min-tokens` goes through the same `_build_engine` and had no assertion. It is
+    # what every bench uses to drive the tier at a prompt shorter than the 64-token default,
+    # so dropping it silently reports 0 offers -- a tier that looks dead instead of a flag
+    # that was ignored. Asserted by behaviour, not just the attribute: a 32-token prefix is
+    # under the default floor and over this one, so it spills only if the flag arrived.
+    floor = 2 * BLOCK_TOKENS
+    assert floor < 4 * BLOCK_TOKENS, "the test floor must be below KvTier's default"
+    lowered = cli_build(cfg, model, get_backend(), slots=2, blocks=64, max_ctx=256,
+                        ssd_path=str(tmp_path / "low"), ssd_min_tokens=floor)
+    low_tier = lowered._prefix._ssd
+    assert low_tier.min_tokens == floor, (
+        f"--ssd-min-tokens={floor} did not reach the tier (min_tokens={low_tier.min_tokens}); "
+        "every bench that lowers the floor would quietly measure the default"
+    )
+    toks = list(range(floor))
+    pool = lowered._kv
+    assert lowered._prefix.insert(toks, [pool.alloc_block() for _ in range(2)],
+                                 (torch.zeros(3, 4, 8, 8), torch.zeros(3, 2, 16)))
+    assert low_tier.offered == 1, (
+        f"a {floor}-token prefix was not offered to a tier with min_tokens={floor}, so the "
+        "flag arrived but does not take effect"
+    )
+
 
 def test_a_restart_faults_the_prefix_back_in_off_disk(tmp_path):
     """The whole point of the SSD tier: HBM is empty after a restart, the disk is not.
