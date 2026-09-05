@@ -627,6 +627,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
     log(f"adapter {sum(v.numel() for v in trainable.values()) / 1e6:.1f}M params -> {d}")
     if drift["passed"] is not False:
         evals("after")
+    else:
+        # The after-arm never ran, so `mmlu_after`/`gsm8k_after` are None -- and
+        # `_finish`'s `v is None or ...` would score both gates PASS on a run that
+        # measured neither. Mark them skipped so the manifest says "not measured".
+        manifest["gates_skip_after"] = True
     return _finish(manifest, args.json)
 
 
@@ -714,6 +719,11 @@ def _timing_snapshot(m: dict) -> None:
         print(f"  (timing snapshot skipped: {exc})")
 
 
+#: Gates whose value comes from the after-arm. A guard stop skips that arm, so these
+#: are "not measured" rather than passed -- `_finish` scores a None value as True.
+_AFTER_GATES = frozenset({"mmlu_holds", "gsm8k_improves"})
+
+
 def _finish(m: dict, as_json: bool) -> None:
     """Gate, write the manifest, print it, exit non-zero on a failed gate.
     A gate whose metric was not evaluated passes vacuously (value null)."""
@@ -726,9 +736,12 @@ def _finish(m: dict, as_json: bool) -> None:
         # is what an SFT run's manifest is.
         mmlu_floor = None if g.get("mmlu_before") is None else g["mmlu_before"] - 0.03
         skipped = m["inputs"].get("steps") == 0
+        after_skipped = bool(m.pop("gates_skip_after", False))
         m["gates"] += [
             {"name": n, "value": v, "threshold": t,
-             "skipped": skipped, "passed": None if skipped else v is None or t is None or ok(v, t)}
+             "skipped": skipped or (after_skipped and n in _AFTER_GATES),
+             "passed": None if skipped or (after_skipped and n in _AFTER_GATES)
+             else v is None or t is None or ok(v, t)}
             for n, v, t, ok in (
                 ("reward_rises", g.get("reward_last"), g.get("reward_first"), lambda v, t: v > t),
                 ("mmlu_holds", g.get("mmlu_after"), mmlu_floor, lambda v, t: v >= t),

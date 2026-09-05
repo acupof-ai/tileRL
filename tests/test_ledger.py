@@ -143,7 +143,15 @@ def test_periodic_rollout_guard_stops_at_first_window_crossing(tmp_path, monkeyp
             assert gate["skipped"] and gate["passed"] is None
         else:
             assert not gate["skipped"] and gate["passed"] is False and not gates_pass(m)
-            assert (gate["value"], gate["threshold"], gate["step"]) == (17.6, 16.0, 9)
+            assert gate["value"] == pytest.approx(17.6)
+            assert (gate["threshold"], gate["step"]) == (16.0, 9)
+            # The after-arm never ran, so these must read "not measured", not "pass":
+            # _finish scores a None value as passed, which is how a stopped run would
+            # report mmlu_holds and gsm8k_improves green having measured neither.
+            for name in ("mmlu_holds", "gsm8k_improves"):
+                g = next(x for x in m["gates"] if x["name"] == name)
+                assert g["skipped"] and g["passed"] is None, name
+            assert m["metrics"].get("mmlu_after") is None
             assert "step 9" in gate["reason"] and "--max-new-tokens is 20" in gate["reason"]
             assert gate["reason"] in capsys.readouterr().out
 
