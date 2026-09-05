@@ -72,8 +72,11 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
     data = tmp_path / "d.jsonl"
     data.write_text('{"prompt": "1+1?", "answer": "2"}\n{"prompt": "2+2?", "answer": "4"}\n')
+    # --allow-short-rollouts: max_new_tokens 4 is deliberately below any real
+    # completion here, which is exactly what the length guard refuses.
     argv = ["--rl", "--data", str(data), "--eval-gsm8k", str(data), "--steps", "2",
-            "--group", "2", "--max-new-tokens", "4", "--lora-rank", "4"]
+            "--group", "2", "--max-new-tokens", "4", "--lora-rank", "4",
+            "--allow-short-rollouts"]
     code = _train(argv)
     (m,) = list_runs(tmp_path / "runs")
     assert [g["name"] for g in m["gates"]] == [

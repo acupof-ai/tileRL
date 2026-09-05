@@ -80,6 +80,66 @@ def test_per_problem_rows_make_the_pairing_recoverable(monkeypatch, tmp_path):
     assert len((tmp_path / "eval.jsonl").read_text().splitlines()) == 2
 
 
+def test_the_rollout_cap_must_clear_the_measured_completion_length():
+    """A cap below what the policy needs truncates every rollout before the answer,
+    so every group ties at the floor and GRPO trains on a constant reward.
+
+    Measured on MATH level 5: the base policy averages 1038 tokens, the recipe's cap
+    was 512, and 5 of the first 6 steps came back reward 0.0000 tied 1.00 tok 512.
+    The one untied step is the one whose completions fit (tok 259, reward 0.75).
+    """
+    import pytest
+
+    from tilerl.cli import _ROLLOUT_HEADROOM, _refuse_short_rollouts
+
+    _refuse_short_rollouts(1038, 2048)  # the fix: headroom, no raise
+    _refuse_short_rollouts(None, 512)  # no before-arm measured: nothing to compare
+
+    with pytest.raises(SystemExit) as e:
+        _refuse_short_rollouts(1038, 512)  # what run 2 actually did
+    assert "1038" in str(e.value) and "512" in str(e.value), (
+        "the message must name both numbers; 'rollouts too short' sends the reader "
+        "back to the log to find them")
+
+    # The boundary is the mean, so a cap the mean exactly fits still truncates half.
+    _refuse_short_rollouts(_ROLLOUT_HEADROOM * 1000, 1000)
+    with pytest.raises(SystemExit):
+        _refuse_short_rollouts(_ROLLOUT_HEADROOM * 1000 + 1, 1000)
+
+    # And it must be CALLED: everything above passes with the call site deleted,
+    # which is a guard that exists and never runs.
+    import inspect
+
+    from tilerl import cli
+
+    src = inspect.getsource(cli._train_adapters)
+    assert "_refuse_short_rollouts(" in src, (
+        "_train_adapters no longer calls the guard; the tests above only prove the "
+        "function works, not that training consults it")
+    before, after = src.split("_refuse_short_rollouts(", 1)
+    assert 'evals("before")' in before, "the guard must run AFTER the arm that measures the length"
+    assert "grpo_loop" in after or "train_mod" in after, "and BEFORE the training loop"
+
+
+def test_eval_rows_are_written_before_the_manifest_exists(tmp_path, monkeypatch):
+    """`_finish` creates runs/<id>/ and runs AFTER both eval arms, so a
+    `if not is_dir(): return` in the row writer silently wrote nothing -- which is
+    what it did on the first MATH run: 500 before-arm rows measured, zero on disk.
+    """
+    from tilerl.cli import _write_eval_rows
+
+    monkeypatch.setattr("tilerl.ledger.runs_root", lambda: tmp_path)
+    rows = [{"i": 0, "correct": True, "tokens": 10, "answer": "1"},
+            {"i": 1, "correct": False, "tokens": 30, "answer": "2"}]
+    assert not (tmp_path / "r1").exists(), "the run dir must not exist yet"
+
+    mean = _write_eval_rows("r1", "before", rows)
+
+    written = (tmp_path / "r1" / "eval-before.jsonl").read_text().splitlines()
+    assert len(written) == 2, "the rows went nowhere; the guard returned early"
+    assert mean == 20.0, "the mean completion length is what the rollout guard reads"
+
+
 if __name__ == "__main__":
     import sys
 
