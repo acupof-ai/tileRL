@@ -212,6 +212,15 @@ What is NOT claimed: no fsync on the publish path, so a host power loss can lose
 the daemon believes it wrote. The tier is a cache — every entry is reconstructible by
 prefill — so durability past process death was not bought.
 
+Also not covered, deliberately: the hop from `args.<flag>` to `_build_engine` inside `serve`.
+Replacing `ssd_min_tokens=args.ssd_min_tokens` with a constant leaves all 330 tests passing,
+and the same is true of the seven other arguments in that call and of all 70 `add_argument`
+entries — it is one direct-pass call site, so covering it per-argument is 70 assertions for one
+line of plumbing. The proportionate gate is one end-to-end CLI start that reads the values back
+off `/health`, which needs a server process and is not in this change. Recorded rather than
+quietly left: the flags are covered from `_build_engine` inward (both, with separate controls
+for "did not arrive" and "arrived and does nothing"), and uncovered from argparse to that call.
+
 ## Rule
 
 A restart is the disk tier's whole case: unlike a host-memory tier it needs no
