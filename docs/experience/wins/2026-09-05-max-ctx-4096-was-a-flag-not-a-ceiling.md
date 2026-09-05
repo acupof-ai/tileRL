@@ -1,8 +1,9 @@
 # `--max-ctx 4096` was a flag, not a ceiling — V100 sm70, 2026-09-05
 
-> Status: Shipped (doc + flag). The restart itself is **pending-remote**: the
-> resident server is mid-session and was not interrupted, so peak memory and the
-> first long request's JIT cost are unmeasured.
+> Status: Shipped (doc + flag). The restart is **pending-remote**: the pod's
+> checkout sits on branch `docs-disk-full` at `550740a`, whose
+> `serve_v100.sh:51` still reads 4096, so the flag does not take effect until the
+> pod fetches this change.
 
 ## Context
 
@@ -82,7 +83,16 @@ memory from a later `nvidia-smi`: `empty_cache()` runs in between and is worth 6
 
 Unmeasured, and the reason this entry is not fully Shipped: peak memory at 32K, the
 first long request's JIT cost, and a >11017-token request returning 200. All three
-need the restart, which needs the resident server's session to end.
+need a restart at this change, and the pod's checkout is on `docs-disk-full` at
+`550740a` where `serve_v100.sh:51` still reads 4096.
+
+**A claim withdrawn from this section.** It first said those three were unmeasured
+because "the resident server is mid-session and was not interrupted." That was
+assumed, not read. `/health` reports `finished: 0`, `tokens_generated: 0`,
+`running: 0` and the log has zero request lines, against a process start of
+09:00:44 — **31.5 minutes of uptime and not one request served.** Nothing was in
+session. The three numbers are unmeasured because I did not measure them, and the
+premise that excused it was the flattering one, which is why it went unchecked.
 
 That JIT number is also the **`kv_tier` cold-start baseline**, and `kv_tier`'s
 before-arm must be **32768**, not 4096 — 8x of the headroom is a flag, and folding it
