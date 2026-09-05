@@ -614,6 +614,21 @@ class Engine:
             chunk = min(len(r.tokens) - r.prefill_from, budget)
             if chunk <= 0:
                 break
+            # Cut a ragged tail off the FIRST chunk so the boundary the store publishes at
+            # is _PREFILL_BUCKET-aligned. The state pool is exact only at a chunk end, so
+            # `_finish_prefills` used to publish a 40-token prompt nowhere at all --
+            # 40 % BLOCK_TOKENS != 0 skipped it, and 15 of every 16 prompt lengths are
+            # ragged. Measured on the live V100: prefix_published 4, all four from decode,
+            # prefix_hits 0 over a 6-turn chat. The tail is one extra forward (a launch,
+            # not extra tokens) and buys back 5568 of 5682 shareable tokens, 50.1 s of a
+            # 74.0 s 6-turn prefill.
+            # ponytail: the first chunk only. A later chunk is ragged whenever a decode row
+            # shares the tick (budget = max_num_batched_tokens - len(decodes)), and aligning
+            # those too would round the token budget itself down to 64 -- a hot-path change
+            # for prompts that already published at their first boundary.
+            aligned = (chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
+            if r.prefill_from == 0 and aligned and aligned != chunk:
+                chunk = aligned
             # Rows pad to a shared width: pack only within one bucket.
             b = -(-chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
             if prefills and b != bucket:
@@ -817,6 +832,11 @@ class Engine:
             pf.seq_len = pf.prefill_from
             if pf.prefill_from >= len(pf.tokens):
                 done.append((pf, logits[base + k, min(c, logits.shape[1]) - 1], 0))
+            elif pf.prefill_from % BLOCK_TOKENS == 0:
+                # A chunk end IS a state-pool boundary: nothing has been sampled yet, so
+                # the slot holds exactly tokens[:prefill_from]. This is the publish that
+                # makes a ragged prompt shareable -- `_pick` cut the chunk short for it.
+                self._publish_prefix(pf, pf.prefill_from)
         if not done:
             return
         self._sample_commit(done)

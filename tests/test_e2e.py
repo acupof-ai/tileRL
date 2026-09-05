@@ -393,6 +393,75 @@ def test_prefix_snapshots_die_with_their_store_entry():
     assert engine._prefix.stats()["evictions"] >= 1
 
 
+def test_a_ragged_prompt_publishes_and_its_state_matches_no_store():
+    """A prompt whose length is not block-aligned must still become shareable, and the
+    state a hit restores must equal the state a store-less engine computes.
+
+    Two failures at once, both measured on the live V100 before the fix:
+    `prefix_published` 4 with `prefix_hits` 0 over a 6-turn chat, every publish from
+    decode and none from prefill. `_finish_prefills` only published when the WHOLE
+    prompt length was block-aligned, and 15 of every 16 lengths are not -- so a chat
+    client resending a growing conversation shared nothing. `_pick` now cuts the first
+    chunk at a _PREFILL_BUCKET boundary and the chunk end publishes.
+
+    The state assert is the half that cannot be dropped. A truncated entry pairs KV
+    for N tokens with a state that absorbed more, and argmax over a vocabulary hides
+    it: an earlier attempt at this was byte-identical in output while the snapshot's
+    norm was 74.0 against a correct 39.75. Comparison happens with both arms at the
+    SAME prefill_from -- reading after one tick puts the hit arm at 164 and the
+    control at 128, which reports 66.5 vs 43.75 and is a measurement error, not a bug.
+
+    `hits >= 1` is asserted first: without a hit nothing was restored and the state
+    comparison is two identical fresh computations. On origin/main this test fails
+    there (hits=0), which is what makes the rest of it mean anything.
+    """
+    cfg = tiny()
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=5)
+    rng = np.random.default_rng(7)
+    conv = rng.integers(3, 320, size=300).astype(np.int64)
+    short, long = 100, 164  # neither is block-aligned; both cross a 64 boundary
+
+    def run(no_store: bool):
+        kw = {"prefix_store": NoPrefixStore()} if no_store else {}
+        engine = build_engine(
+            cfg, build_random(cfg, seed=99), get_backend(), num_blocks=64, num_slots=4,
+            max_batch=4, max_total_tokens=2048, max_num_batched_tokens=512, **kw,
+        )
+        if not no_store:  # warm the store with the shorter prompt
+            engine.submit(conv[:short], params)
+            for _ in range(200):
+                engine.step()
+                if not (list(engine._running) + list(engine._waiting)):
+                    break
+            engine.poll()
+        rid = engine.submit(conv[:long], params)
+        for _ in range(50):
+            engine.step()
+            live = [r for r in list(engine._running) + list(engine._waiting) if r.req_id == rid]
+            assert live, "the row finished before its prompt was prefilled"
+            row = live[0]
+            if row.prefill_from >= long:
+                break
+        return engine, engine._states.states[row.state_slot].clone()
+
+    hit_engine, hit_state = run(False)
+    _, ref_state = run(True)
+    st = hit_engine.stats()
+    assert st["prefix_published"] >= 1, (
+        f"a {short}-token prompt published nothing ({short} % {BLOCK_TOKENS} = "
+        f"{short % BLOCK_TOKENS}); the chunk was not cut at a bucket boundary"
+    )
+    assert st["prefix_hits"] >= 1, (
+        f"no prefix hit (hits={st['prefix_hits']}), so the state comparison below is two "
+        "identical fresh computations and this test is inert"
+    )
+    assert torch.allclose(hit_state, ref_state, rtol=1e-2, atol=1e-5), (
+        f"the restored GDN state differs from a store-less engine's: max|delta| "
+        f"{(hit_state - ref_state).abs().max():.3e}, norms {hit_state.norm():.4f} vs "
+        f"{ref_state.norm():.4f}. The output can be byte-identical while this is wrong."
+    )
+
+
 def test_prefix_hit_survives_evicting_its_own_entry():
     """submit()'s own evict_until_free can evict the entry it just matched;
     the snapshot must be read before that, not after.
