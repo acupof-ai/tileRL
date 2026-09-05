@@ -558,17 +558,30 @@ def cosine_warmup(step: int, total: int, warmup: int, lr: float) -> float:
     return lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
-def clip_grad_norm(grads: dict[int, torch.Tensor], max_norm: float) -> float:
+def clip_grad_norm(
+    grads: dict[int, torch.Tensor], max_norm: float, sharded: set[int] | None = None,
+    backend: Any = None,
+) -> float:
     """Scale grads in place to global L2 norm <= ``max_norm`` (``<= 0`` disables);
     returns the pre-clip norm, non-finite as-is for the caller to reject.
     fp64 accumulation on device with ONE sync: the per-grad ``.to("cpu")`` this
     replaced cost 126 device-to-host copies a step, 7% of the 27B LoRA step.
-    MPS has no float64, so it sums on the host."""
+    MPS has no float64, so it sums on the host.
+
+    Under TP the norm must be the WHOLE model's or each rank scales its shard by
+    a different factor. ``sharded`` is the ids whose gradient this rank holds only
+    a slice of; those squares are summed across the tp group, the replicated ones
+    are already identical on every rank and are added once. Measured on tiny at
+    tp=2: local norms 2399.73 and 2288.83 (4.85% apart, so two different scales),
+    against the true 2641.80 -- which naive summing overshoots to 3316.24 by
+    counting every replicated gradient twice.
+    """
     if not grads:  # _foreach_norm rejects an empty list; the norm of nothing is 0
         return 0.0
     dev = next(iter(grads.values())).device
     host = dev.type == "mps"
-    gl = [g.detach() for g in grads.values()]
+    ids = list(grads)  # one order for the norms and the sharded mask below
+    gl = [grads[t].detach() for t in ids]
     if host:
         gl = [g.to("cpu") for g in gl]
     # One fused norm kernel over the whole list, then one f64 reduction and one
@@ -579,7 +592,14 @@ def clip_grad_norm(grads: dict[int, torch.Tensor], max_norm: float) -> float:
     # grads.values(), so it scales the real gradients, not these copies.
     norms = torch._foreach_norm(
         [g if g.dtype.itemsize >= 4 else g.float() for g in gl], 2)
-    total = float(torch.stack(norms).to(torch.float64).pow(2).sum().sqrt().item())
+    sq = torch.stack(norms).to(torch.float64).pow(2)
+    if sharded and getattr(backend, "tp_world", 1) > 1:
+        keep = torch.tensor([t in sharded for t in ids], device=sq.device)
+        part = torch.stack([sq.mul(keep).sum(), sq.mul(~keep).sum()])
+        backend.all_reduce(part)  # [sum of sharded squares, world x the replicated ones]
+        total = float((part[0] + part[1] / backend.tp_world).sqrt().item())
+    else:
+        total = float(sq.sum().sqrt().item())
     if not math.isfinite(total) or total == 0.0:
         return total
     if max_norm > 0.0 and math.isfinite(max_norm) and total > max_norm:

@@ -82,6 +82,13 @@ def _step(
     params = model.params if trainable is None else trainable
     by_id = {id(p): p for p in params.values()}
     param_ids = set(by_id)
+    # Which gradients this rank holds only a slice of, so clipping can use the
+    # whole model's norm instead of this shard's.
+    sharded_ids: set[int] = set()
+    if getattr(backend, "tp_world", 1) > 1:
+        from .tensor_parallel import is_sharded
+
+        sharded_ids = {id(p) for k, p in params.items() if is_sharded(k)}
     rows = micro if 0 < micro < b else b
     if rows != b and getattr(optimizer, "streams", False):
         raise ValueError(
@@ -142,7 +149,7 @@ def _step(
             acc[tid] = prev.add_(grads[tid]) if prev is not None else grads[tid].float()
     assert acc, _NO_GRAD
     t_update = time.perf_counter()
-    norm = clip_grad_norm(acc, 1.0)
+    norm = clip_grad_norm(acc, 1.0, sharded_ids, backend)
     if math.isfinite(norm):
         optimizer.step(params.values(), acc)
     if timings is not None:
