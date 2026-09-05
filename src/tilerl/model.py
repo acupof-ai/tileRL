@@ -144,6 +144,18 @@ def _native_fp4(packed, weight_scale, gscale, *, divide: bool = False):
 
 
 # --- Model ------------------------------------------------------------------
+def _tp_fork(backend: Backend, x: torch.Tensor) -> torch.Tensor:
+    """Mark a replicated tensor whose consumers are sharded: identity forward,
+    all-reduce backward. Off the TP path it is not even a call.
+
+    Two kinds of tensor need it. An activation feeding column-parallel linears,
+    where each rank's backward carries only its own shard's share of dX. And a
+    replicated WEIGHT applied per shard -- q_norm/k_norm/gdn_norm are per-head-dim
+    and every rank runs them over its own heads, so each rank's gradient is a
+    partial sum (measured: rank0+rank1 == the world=1 gradient, exactly)."""
+    return backend.tp_fork(x) if getattr(backend, "tp_world", 1) > 1 else x
+
+
 class Model:
     """``params`` maps :func:`param_specs` keys to bf16 tensors; quantized
     linears carry ``<key>.wq/.scale`` (fp4) or ``<key>.w8/.wscale`` (fp8) plus an
@@ -196,6 +208,7 @@ class Model:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps, narrow=True)
+        h = _tp_fork(backend, h)
         hq, hkv, d = cfg.num_attention_heads, cfg.num_kv_heads, cfg.head_dim
         qkv_key = f"{p}.qkv"
         if self._has(qkv_key):
@@ -205,7 +218,8 @@ class Model:
             qn = None
             if cfg.full_attn_gated and not getattr(kv, "dense", False):
                 qn = backend.attn_prep(
-                    qkv, self.params[f"{p}.q_norm"], self.params[f"{p}.k_norm"], positions,
+                    qkv, _tp_fork(backend, self.params[f"{p}.q_norm"]),
+                    _tp_fork(backend, self.params[f"{p}.k_norm"]), positions,
                     cfg.rope_theta, cfg.effective_rotary_dim, kv, layer_idx, hq, hkv, cfg.rms_eps,
                 )
             if qn is not None:  # sm90: norm+rope+kv-write in one launch
@@ -238,8 +252,8 @@ class Model:
         # f32 out: these feed rope and then the bf16 KV pool, so a bf16 store here
         # would round twice. input_norm/post_attn_norm/final_norm keep bf16 -- their
         # consumers requantize (errors/2026-09-03-unfused-prelude-double-rounds.md).
-        q = backend.rmsnorm_f32(q, self.params[f"{p}.q_norm"], cfg.rms_eps)
-        k = backend.rmsnorm_f32(k, self.params[f"{p}.k_norm"], cfg.rms_eps)
+        q = backend.rmsnorm_f32(q, _tp_fork(backend, self.params[f"{p}.q_norm"]), cfg.rms_eps)
+        k = backend.rmsnorm_f32(k, _tp_fork(backend, self.params[f"{p}.k_norm"]), cfg.rms_eps)
         q = backend.rope(q, positions, cfg.rope_theta, rotary_dim=cfg.effective_rotary_dim)
         k = backend.rope(k, positions, cfg.rope_theta, rotary_dim=cfg.effective_rotary_dim)
         if getattr(kv, "dense", False):
@@ -270,6 +284,7 @@ class Model:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps, narrow=True)
+        h = _tp_fork(backend, h)
         qkvz_key = f"{p}.qkvz"
         if self._has(qkvz_key):
             qkvz = self._linear(backend, h, qkvz_key)
@@ -296,7 +311,7 @@ class Model:
             conv1d_weight=self.params[f"{p}.conv1d"],
             dt_bias=self.params[f"{p}.dt_bias"],
             a_log=self.params[f"{p}.a_log"],
-            norm_weight=self.params[f"{p}.gdn_norm"],
+            norm_weight=_tp_fork(backend, self.params[f"{p}.gdn_norm"]),
             seq_q_lens=getattr(kv, "seq_q_lens", None),
         )
         # Speculative verify keeps the state after every chain step for the engine to adopt.
@@ -337,6 +352,7 @@ class Model:
         cfg = self.cfg
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.post_attn_norm"], cfg.rms_eps, narrow=True)
+        h = _tp_fork(backend, h)
         gu_key = f"{p}.gate_up"
         if self._has(gu_key):
             gu = self._linear(backend, h, gu_key)
@@ -390,6 +406,11 @@ class Model:
                 idx = torch.as_tensor([n - 1 for n in last_only], device=device)
                 x = x[torch.arange(x.shape[0], device=device), idx].unsqueeze(1)
         x = backend.rmsnorm(x, self.params["final_norm"], cfg.rms_eps, narrow=True)
+        if not cfg.tie_word_embeddings:
+            # Only a vocab-parallel head splits dX across ranks. A tied head is the
+            # replicated embedding table: every rank computes the WHOLE dX there, so
+            # forking would all-reduce it to world x and scale the model below it.
+            x = _tp_fork(backend, x)
         head_key = cfg.head_key
         logits = self._linear(backend, x, head_key)
         if getattr(backend, "tp_world", 1) > 1 and not cfg.tie_word_embeddings:

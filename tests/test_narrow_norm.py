@@ -66,7 +66,9 @@ def _consumers(name: str, after: int, fn: ast.FunctionDef) -> list[str]:
 
 #: The only consumers a narrowed norm may have. `_linear`/`_base_linear` dispatch to
 #: the fp4 GEMV, which reads gemv_io natively; `_add_via` forwards to a linear too.
-ALLOWED = {"_linear", "_base_linear", "_add_via"}
+#: `_tp_fork` is dtype-transparent -- it returns `x.view_as(x)` and its whole job is
+#: to put an entry on the tape, so the narrowed value reaches the linear unchanged.
+ALLOWED = {"_linear", "_base_linear", "_add_via", "_tp_fork"}
 
 
 def test_a_narrowed_rmsnorm_only_feeds_a_quantized_linear():

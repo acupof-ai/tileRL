@@ -150,15 +150,28 @@ class Backend:
             dist.init_process_group(comm, world_size=world, rank=rank)
         self.tp_world = world
 
+    def tp_fork(self, x: torch.Tensor) -> torch.Tensor:
+        """Identity forward, all-reduce backward: the dual of ``all_reduce``.
+
+        A replicated activation feeding column-parallel linears needs no forward
+        collective, but each rank's backward produces only its own shard's share
+        of dX. Without this the norm below reads dX/world and the loss still
+        looks right, which is the silent factor-of-world the TP gates check."""
+        if self.tp_world == 1:
+            return x
+        return x.view_as(x)
+
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         """Sum across the TP group in place. 21.5 us floor per call on 6 H20s,
-        flat from 20 KB to 1.3 MB: the cost is per layer, not per byte."""
+        flat from 20 KB to 1.3 MB: the cost is per layer, not per byte.
+        Returns a distinct view: the tape addresses tensors by id(), and an op
+        that returns its own input pops the gradient it just wrote for it."""
         if self.tp_world == 1:
             return x
         import torch.distributed as dist
 
         dist.all_reduce(x)
-        return x
+        return x.view_as(x)
 
     def all_gather(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
         """Concatenate from every rank along ``dim`` (vocab-parallel lm_head)."""
