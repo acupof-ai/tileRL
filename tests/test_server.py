@@ -419,10 +419,14 @@ def test_usage_in_the_stream_is_opt_in_and_counts_tokens_not_characters(client, 
 def test_both_api_paths_wait_the_same_wall_clock_for_one_completion():
     """The two front ends submit to one engine, so a cap that fits one fits both.
 
-    They drifted: 5cdbf7e raised the OpenAI path's cap from 600 s to 1800 s because a 4K
-    prefill on sm70 takes ~600 s on its own, so the shorter cap fired before decoding
-    began -- and it changed only server.py. `/v1/messages`, which is what Claude Code
-    speaks, kept waiting 600 s for the same work on the same card.
+    They drifted: 5cdbf7e raised the OpenAI path's cap from 600 s to 1800 s and changed
+    only server.py, so `/v1/messages` -- what Claude Code speaks -- kept waiting 600 s for
+    the same work on the same card. The reason it gave, "a 4K prefill takes ~600 s", is
+    **withdrawn**: that was a B=8 whole-tick cost quoted per request, and a live V100
+    measured a 3478-token request at 39.1 s
+    (errors/2026-09-05-the-600s-that-justified-1800s-was-a-batch-tick.md). What this gate
+    asserts is unaffected, because it is about the two constants agreeing, not about which
+    value they agree on.
 
     Read out of the source rather than by running a 600 s request: the number is a
     constant, and the defect was two constants that should have been one.
