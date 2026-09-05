@@ -425,6 +425,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
         "commit": commit(), "algo": "grpo" if args.rl else "opd",
         "data": file_hash(args.data) if args.data else None, "steps": args.steps,
         "group": args.group, "max_new_tokens": args.max_new_tokens,
+        "allow_short_rollouts": args.allow_short_rollouts,
         "temperature": params.temperature, "max_think_tokens": args.max_think_tokens,
         "lr": args.lr, "lora_rank": args.lora_rank, "seed": args.seed, "eval_mmlu": args.eval_mmlu,
         # In the id: tp=1 and tp=4 are different runs, and without this the second
@@ -531,6 +532,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
                 json.dump(saved, f)
             os.replace(f.name, cache)
 
+    drift = {"name": "rollouts_within_cap", "value": None,
+             "threshold": _ROLLOUT_HEADROOM * args.max_new_tokens,
+             "skipped": True, "passed": None}
+    if args.rl:
+        manifest["gates"].append(drift)
     evals("before")  # LoRA B is zero at init: the base model's score
     if args.steps == 0:
         evals("after")
@@ -567,11 +573,26 @@ def _train_adapters(args: argparse.Namespace) -> None:
                 f"rollout {timings['rollout_secs']:.3f}s  "
                 f"backward {timings['backward_secs']:.3f}s  "
                 f"optimizer {timings['optimizer_secs']:.6f}s", flush=True)
+            if len(hist) >= 5 and not args.allow_short_rollouts:
+                mean = statistics.mean(h[4] for h in hist[-5:])
+                drift.update(value=mean, step=i + 1, skipped=False,
+                             passed=mean <= drift["threshold"])
+                manifest["metrics"]["rollout_window_mean"] = mean
+                if not drift["passed"]:
+                    drift["reason"] = (
+                        f"error: at step {i + 1} the last 5 steps average {mean:.1f} "
+                        f"completion tokens but --max-new-tokens is {args.max_new_tokens}. "
+                        f"Rollouts risk truncation before they answer. Raise the cap above "
+                        f"{mean / _ROLLOUT_HEADROOM:.0f}, pick an easier task, or pass "
+                        f"--allow-short-rollouts if the truncation is deliberate.")
+                    log(drift["reason"], flush=True)
+                    break
         # Windowed means, not hist[0] vs hist[-1]: per-step reward moves with the
         # sampled prompt, so two single steps compare two draws, not two policies
         # (tests/test_rl.py::test_grpo_loop_raises_reward uses the same windows).
         w = max(1, len(hist) // 4)
         manifest["metrics"].update(
+            steps_completed=len(hist),
             reward_first=statistics.mean(h[0] for h in hist[:w]),
             reward_last=statistics.mean(h[0] for h in hist[-w:]),
             ce_last=hist[-1][1],
@@ -604,7 +625,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
               str(d / "adapter.safetensors"))
     manifest["artifacts"]["adapter"] = "adapter.safetensors"
     log(f"adapter {sum(v.numel() for v in trainable.values()) / 1e6:.1f}M params -> {d}")
-    evals("after")
+    if drift["passed"] is not False:
+        evals("after")
     return _finish(manifest, args.json)
 
 
@@ -704,7 +726,7 @@ def _finish(m: dict, as_json: bool) -> None:
         # is what an SFT run's manifest is.
         mmlu_floor = None if g.get("mmlu_before") is None else g["mmlu_before"] - 0.03
         skipped = m["inputs"].get("steps") == 0
-        m["gates"] = [
+        m["gates"] += [
             {"name": n, "value": v, "threshold": t,
              "skipped": skipped, "passed": None if skipped else v is None or t is None or ok(v, t)}
             for n, v, t, ok in (
@@ -960,8 +982,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          "training/eval; refuses a file whose keys do not match. With "
                          "--steps 0 this re-scores a finished run's adapter")
     p_train.add_argument("--allow-short-rollouts", action="store_true",
-                         help="train even when the base policy's measured completion is "
-                              "longer than --max-new-tokens; the smoke recipes want the "
+                         help="bypass the before-eval and periodic rollout-length guards; "
+                              "the smoke recipes want the "
                               "truncation, a real run almost never does")
     p_train.add_argument("--eval-max-new-tokens", type=int, default=2048,
                          help="eval generation length; independent of --max-new-tokens, "
