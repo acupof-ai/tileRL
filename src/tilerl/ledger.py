@@ -75,7 +75,7 @@ def lineage(root: str | os.PathLike, id: str) -> list[dict]:
 
 
 def gates_pass(m: dict) -> bool:
-    return all(g["passed"] for g in m["gates"])
+    return all(g.get("skipped", False) or g["passed"] for g in m["gates"])
 
 
 def format_run(m: dict) -> str:

@@ -3,6 +3,8 @@ rerun, gates are data in the manifest and an exit code in the CLI."""
 
 import json
 
+import pytest
+
 from tilerl.cli import _build_parser, cmd_ledger, cmd_train
 from tilerl.ledger import (
     gates_pass,
@@ -40,6 +42,23 @@ def _train(argv):
     except SystemExit as e:
         return e.code
     return 0
+
+
+@pytest.mark.parametrize("mode", ["--rl", "--opd"])
+def test_zero_steps_writes_eval_manifest(tmp_path, monkeypatch, mode):
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
+    data = tmp_path / "eval.jsonl"
+    data.write_text('{"prompt": "1+1?", "answer": "2"}\n')
+    assert _train([mode, "--model", "tiny", "--steps", "0", "--data", str(data),
+                   "--eval-gsm8k", str(data), "--eval-max-new-tokens", "4"]) == 0
+    (m,) = list_runs(tmp_path / "runs")
+    assert m["finished"] and isinstance(m["metrics"]["gsm8k_after"], int)
+    assert m["metrics"]["gsm8k_after_tokens"] > 0
+    assert not {"reward_first", "reward_last", "ce_last", "secs_per_step_median",
+                "secs_total", "tied_group_fraction", "tokens_first", "tokens_last",
+                "rollout_secs", "backward_secs", "optimizer_secs"} & m["metrics"].keys()
+    assert all(g["skipped"] and g["passed"] is None for g in m["gates"])
+    assert gates_pass(m)
 
 
 def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, capsys):
