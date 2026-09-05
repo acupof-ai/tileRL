@@ -876,13 +876,20 @@ def test_a_restart_faults_the_prefix_back_in_off_disk(tmp_path):
     )
 
 
-def test_a_spill_truncated_by_a_crash_is_a_miss_not_a_raise(tmp_path):
+@pytest.mark.parametrize("suffix", [".st", ".kv"])
+def test_a_spill_truncated_by_a_crash_is_a_miss_not_a_raise(tmp_path, suffix):
     """A kill between torch.save starting and finishing leaves a partial blob on disk.
 
     `_recover` adopts entries by FILE SIZE, so it cannot tell a truncated blob from a whole
     one -- it will happily index a half-written pair. The read then has to survive it: a
     `torch.load` raising inside `lookup` takes down the request that happened to match,
     which is a crash for a cache miss.
+
+    ONE ARM PER GUARD, because `_fault_in` reads the state first and returns on its miss:
+    truncating both files only ever reaches `load_state`, so `load_kv`'s guard can be deleted
+    and a both-files test still passes (25 measured exactly that). The `.kv` arm leaves the
+    state whole so the KV guard is the one that fires, and `ssd_faults` is what proves it --
+    that counter is incremented only on `load_kv` returning False.
 
     The durability window this covers is real and bounded: the flush daemon writes off-tick,
     so an entry published within the last flush is on disk partially or not at all. Losing
@@ -899,13 +906,12 @@ def test_a_spill_truncated_by_a_crash_is_a_miss_not_a_raise(tmp_path):
     _flushed(tier)
 
     d = os.path.join(str(tmp_path), "tilerl_kvtier")
-    victims = [f for f in os.listdir(d) if f.endswith((".kv", ".st"))]
-    assert victims, "nothing spilled, so the truncation below is inert"
+    victims = [f for f in os.listdir(d) if f.endswith(suffix)]
+    assert victims, f"nothing spilled a {suffix}, so the truncation below is inert"
     for name in victims:
         path = os.path.join(d, name)
-        keep = os.path.getsize(path) // 3
         with open(path, "r+b") as fh:
-            fh.truncate(keep)
+            fh.truncate(os.path.getsize(path) // 3)
 
     cold_tier = KvTier(str(tmp_path), "fp-trunc", min_tokens=BLOCK_TOKENS)
     assert cold_tier.recovered >= 1, (
@@ -916,6 +922,11 @@ def test_a_spill_truncated_by_a_crash_is_a_miss_not_a_raise(tmp_path):
                        ssd=cold_tier)
     hit = cold.lookup(toks)  # must not raise
     assert hit is None, f"a truncated spill served a hit of length {hit and hit.length}"
+    if suffix == ".kv":
+        assert cold.ssd_faults == 1, (
+            "the state loaded but ssd_faults is 0, so load_kv was never reached and this arm "
+            "does not exercise its guard"
+        )
 
 
 def test_the_disk_tier_evicts_the_oldest_entry_past_its_byte_budget(tmp_path):
