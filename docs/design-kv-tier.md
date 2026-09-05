@@ -190,8 +190,10 @@ they interrupt.
 
 **Ships `dram_bytes=0`, opt-in for multi-user serving.** Off is right for the
 single-session endpoint this pod runs and wrong above 9 concurrent sessions, and the
-flag is the only thing that distinguishes them. What is still unmeasured is the V100
-wall clock at 12 sessions — the CPU numbers above are hit counts, not time.
+flag is the only thing that distinguishes them. `tilerl serve --dram-bytes <n>` sets it;
+`/health`'s `dram_budget` says the tier is on and `dram_promotions` says the workload
+crossed the threshold. What is still unmeasured is the V100 wall clock at 12 sessions —
+the CPU numbers above are hit counts, not time.
 
 **RL rollouts are not a second case for it:** within a group the shared prompt is the
 MRU entry, and the store is cleared between steps, so nothing ages out and returns.

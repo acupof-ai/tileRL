@@ -1076,3 +1076,40 @@ def test_the_record_says_which_operand_capped_the_completion(tmp_path, monkeypat
         f"{row['asked_max_tokens']} nor the budget {row['budget']}: a third operand caps "
         f"completions and is not logged"
     )
+
+
+@pytest.mark.parametrize("dram_bytes", [0, 12345678])
+def test_serve_dram_bytes_reaches_health(dram_bytes, monkeypatch, capsys):
+    """`--dram-bytes` must arrive at the tier, and `/health` must say so.
+
+    End-to-end through `cmd_serve`, not `build_engine`: the flag crosses three hops
+    (parser -> `_build_engine` -> `build_engine`) and a miss at any of them leaves the
+    tier off with the command line claiming otherwise. The control arm is the same
+    command without the flag, and it asserts `dram_budget` is ABSENT rather than 0 --
+    `dram_bytes`, the key that was already published, is 0 in both arms because it counts
+    bytes held, so an equality on it would pass with the tier off.
+    """
+    from tilerl import cli
+
+    served: dict = {}
+    monkeypatch.setattr(
+        "uvicorn.run",
+        lambda app, **kw: served.update(health=TestClient(app).get("/health").json()),
+    )
+    argv = ["serve", "--slots", "2", "--max-batch", "2", "--blocks", "64",
+            "--max-ctx", "512", "--no-warmup"]
+    if dram_bytes:
+        argv += ["--dram-bytes", str(dram_bytes)]
+    cli.cmd_serve(cli._build_parser().parse_args(argv))
+    capsys.readouterr()
+
+    stats = served["health"]["stats"]
+    dram = {k: v for k, v in stats.items() if k.startswith("dram_")}
+    if dram_bytes:
+        assert stats.get("dram_budget") == dram_bytes, (
+            f"--dram-bytes {dram_bytes} did not reach the tier; dram_* served: {dram}"
+        )
+    else:
+        assert "dram_budget" not in stats, (
+            f"the tier is on without the flag: dram_budget={stats.get('dram_budget')}"
+        )
