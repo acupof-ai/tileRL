@@ -5,6 +5,7 @@ import pytest
 
 
 def _assert_unique_lines(path):
+    # Exact whole lines catch merge=union duplicates; near-duplicates are outside this check.
     counts = Counter(line for line in path.read_text().splitlines() if line.strip())
     duplicates = [line for line, count in counts.items() if count > 1]
     assert not duplicates, f"Duplicated non-blank lines in {path}: {duplicates}"

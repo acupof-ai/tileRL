@@ -7,6 +7,7 @@ import pytest
 
 from tilerl.cli import _build_parser, cmd_ledger, cmd_train
 from tilerl.ledger import (
+    format_run,
     gates_pass,
     lineage,
     list_runs,
@@ -30,6 +31,7 @@ def test_manifest_round_trip_and_lineage(tmp_path):
     for m in (parent, child):
         write_manifest(tmp_path, m)
     assert read_manifest(tmp_path, child["id"]) == child and gates_pass(child)
+    assert format_run(child).split()[3] == "pass"
     assert [m["id"] for m in lineage(tmp_path, child["id"])] == [child["id"], parent["id"]]
     assert {m["id"] for m in list_runs(tmp_path)} == {parent["id"], child["id"]}
     assert read_manifest(tmp_path, "missing") is None
@@ -59,6 +61,7 @@ def test_zero_steps_writes_eval_manifest(tmp_path, monkeypatch, mode):
                 "rollout_secs", "backward_secs", "optimizer_secs"} & m["metrics"].keys()
     assert all(g["skipped"] and g["passed"] is None for g in m["gates"])
     assert gates_pass(m)
+    assert format_run(m).split()[3] == "skip"
 
 
 def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, capsys):
