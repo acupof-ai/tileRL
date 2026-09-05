@@ -91,18 +91,16 @@ def _shard(cfg, model, tp: int, backend, model_mod):
     rank = int(os.environ.get("RANK", "0"))
     if world % tp:
         raise SystemExit(f"--tp {tp} does not divide WORLD_SIZE={world}")
-    if world // tp > 1:
-        # Nothing averages gradients across dp replicas yet -- no dp all-reduce
-        # exists anywhere in the tree, and DataParallelEngine is a serving object
-        # (N engines on N devices in one process), not this axis. Such a run would
-        # not fail: each replica would train its own divergent model on its own
-        # data and the losses would look fine. Refuse until the dp reduce lands.
-        raise SystemExit(
-            f"--tp {tp} under WORLD_SIZE={world} implies dp={world // tp}, and gradients "
-            "are not reduced across dp replicas yet: each replica would silently train a "
-            f"different model. Launch with --nproc_per_node={tp}, or use tp={world}.")
-    mesh = Mesh(dp=1, tp=tp, rank=rank)  # validates rank < world and the layout
-    backend.init_tp(world, rank, [mesh.tp_group()])
+    mesh = Mesh(dp=world // tp, tp=tp, rank=rank)  # validates rank < world and the layout
+    # Every rank builds every group, tp first then dp, in the same order:
+    # new_group is collective, so a rank that skips one deadlocks on first use.
+    tp_groups, dp_groups = [], []
+    for r in range(world):
+        m = Mesh(dp=world // tp, tp=tp, rank=r)
+        for g, seen in ((m.tp_group(), tp_groups), (m.dp_group(), dp_groups)):
+            if g not in seen:
+                seen.append(g)
+    backend.init_tp(world, rank, tp_groups, dp_groups)
     return tp_config(cfg, tp), model_mod.Model(
         tp_config(cfg, tp), shard_params(model.params, cfg, mesh.tp_rank, tp))
 
@@ -869,8 +867,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="full-parameter SFT optimizer; --rl/--opd train LoRA and ignore it")
     p_train.add_argument("--lora-rank", type=int, default=16)
     p_train.add_argument("--tp", type=int, default=1,
-                         help="tensor-parallel width; launch under "
-                              "torchrun --nproc_per_node=<tp>. dp>1 is refused for now.")
+                         help="tensor-parallel width; dp is WORLD_SIZE//tp, cp is 1. "
+                              "Launch under torchrun --nproc_per_node=WORLD_SIZE.")
     p_train.add_argument("--draft", help="draft head safetensors: speculative rollout (--opd)")
     p_train.add_argument("--depth", type=int, help="drafts per row per tick; default is the "
                          "head's own (chain: 2; block: its checkpoint's block minus the anchor)")

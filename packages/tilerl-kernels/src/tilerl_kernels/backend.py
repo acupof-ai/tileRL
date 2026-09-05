@@ -143,8 +143,13 @@ class Backend:
     tp_rank = 0
     #: this rank's tp process group; None means "the whole world is one tp group"
     _tp_pg = None
+    #: ranks holding the same shard in the other dp replicas, and their group.
+    #: 1 means no data parallelism, so the gradient reduce below is a no-op.
+    dp_world = 1
+    _dp_pg = None
 
-    def init_tp(self, world: int, rank: int, tp_groups: list[list[int]] | None = None) -> None:
+    def init_tp(self, world: int, rank: int, tp_groups: list[list[int]] | None = None,
+                dp_groups: list[list[int]] | None = None) -> None:
         """Join the TP group; framework layers never import torch.distributed.
 
         ``tp_groups`` is EVERY tp group in the mesh, in mesh order
@@ -156,6 +161,8 @@ class Backend:
         All of them, not just this rank's, because ``new_group`` is itself
         collective -- every rank must call it for every group, in the same
         order, or the ranks that skipped one deadlock the first time it is used.
+        The same applies to ``dp_groups``, and to the ORDER of the two loops:
+        every rank builds all tp groups first, then all dp groups.
         """
         if world == 1:
             return
@@ -173,8 +180,30 @@ class Backend:
             if mine is None:
                 raise ValueError(f"rank {rank} is in none of the tp groups {tp_groups}")
             self.tp_world, self.tp_rank = len(mine), mine.index(rank)
-            return
-        self.tp_world, self.tp_rank = world, rank
+        else:
+            self.tp_world, self.tp_rank = world, rank
+        if dp_groups:
+            mine = None
+            for g in dp_groups:
+                pg = dist.new_group(list(g))
+                if rank in g:
+                    mine, self._dp_pg = g, pg
+            if mine is None:
+                raise ValueError(f"rank {rank} is in none of the dp groups {dp_groups}")
+            self.dp_world = len(mine)
+
+    def dp_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        """Average one gradient across the dp replicas, in place.
+
+        Mean, not sum: each replica's loss already averages over its own rows, so
+        summing would scale the update by ``dp_world`` -- a learning-rate change
+        that hides as a convergence difference rather than an error."""
+        if self.dp_world == 1:
+            return x
+        import torch.distributed as dist
+
+        dist.all_reduce(x, group=self._dp_pg)
+        return x.div_(self.dp_world)
 
     def tp_fork(self, x: torch.Tensor) -> torch.Tensor:
         """Identity forward, all-reduce backward: the dual of ``all_reduce``.
