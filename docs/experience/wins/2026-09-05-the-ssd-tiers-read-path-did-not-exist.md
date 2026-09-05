@@ -191,6 +191,13 @@ removed. Two separate lines catch it, and they cost different things:
 | `os.remove(dst)` after the save deleted | 0 | 1 | one unpaired `.kv`; the next `_recover` drops it because it adopts by pair — a leak until restart, not stale service |
 | both | 1 | 1 | as row 1 |
 
+**Both are process-local**, which bounds the severity and is worth stating rather than leaving
+alarming. `drop()` clears both pending tables, so only the half already in flight is rewritten and
+the `.st` half never reaches disk. Measured under row 1: in-process `ssd_entries` 1, and after a
+fresh `KvTier` over the same directory, `recovered: 0` with the file gone — an unpaired blob is
+dropped whichever guard failed. So row 1 is stale service until the process exits, not a
+permanently poisoned entry; row 2 is wasted bytes for the same span.
+
 **I first reported row 1's numbers as row 2's**, because the mutation I ran replaced the whole
 `if still_pending: ... else: remove` block rather than only the rollback, so it removed both
 guards at once and I attributed the resurrection to the unlink. Codex caught it on review of
