@@ -304,20 +304,33 @@ def _load_adapter(trainable: dict, path: str, log) -> None:
     log(f"loaded adapter {sum(v.numel() for v in saved.values()) / 1e6:.1f}M params <- {path}")
 
 
-def _before_eval_key(args, cfg, backend, eval_params, mmlu_set) -> str:
+def _before_eval_key(args, cfg, backend, eval_params, mmlu_set) -> str | None:
+    """The cache key, or None when the base model's identity is not in it.
+
+    ``weights`` is always present and never absent-by-omission: the 27B keys on its
+    checkpoint files, `tiny` is a pure function of ``--seed`` and says so, and any
+    other model REFUSES to cache rather than key on a base it cannot identify --
+    a key that silently omits the weights serves one model's before-arm for another.
+    """
     from .ledger import file_hash
 
-    checkpoint = None
     if args.model == "qwen38-27b":
         source = Path(_QWEN38_SOURCE)
         if not source.is_dir():
             from huggingface_hub import snapshot_download
 
             source = Path(snapshot_download(_QWEN38_SOURCE, local_files_only=True))
-        checkpoint = [(str(p.resolve()), s.st_size, s.st_mtime_ns)
-                      for p in sorted(source.iterdir()) if p.is_file() for s in [p.stat()]]
+        weights = [(str(p.resolve()), s.st_size, s.st_mtime_ns)
+                   for p in sorted(source.iterdir()) if p.is_file() for s in [p.stat()]]
+    elif args.model.startswith("tiny"):
+        weights = None  # built by build_random(seed), and the seed is in `sampling`
+    else:
+        return None
     inputs = {
-        "version": 1, "checkpoint": checkpoint, "config": asdict(cfg),
+        "version": 2, "weights": weights, "config": asdict(cfg),
+        # cfg is already tp_config(cfg, tp) here, so tp reaches the key through the
+        # sharded dims -- but only while that call order holds. Explicit is cheaper.
+        "tp": args.tp,
         "target": backend.target, "precision": backend.precision,
         "eval_file": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
         "eval_n": args.eval_n, "matcher": args.reward, "sampling": asdict(eval_params),
@@ -471,8 +484,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
     cache = None
     if (eval_rows or mmlu_set) and not args.load_adapter and not args.draft:
         key = _before_eval_key(args, cfg, backend, eval_params, mmlu_set)
-        cache = Path(runs_root()) / "eval-cache" / f"{key}.json"
-        manifest["eval_before_cache"] = {"key": key, "cache_hit": cache.is_file()}
+        if key is not None:
+            cache = Path(runs_root()) / "eval-cache" / f"{key}.json"
+            manifest["eval_before_cache"] = {"key": key, "cache_hit": cache.is_file()}
 
     def evals(tag):
         if tag == "before" and cache is not None and cache.is_file():

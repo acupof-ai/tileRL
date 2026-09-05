@@ -228,6 +228,56 @@ def test_before_eval_cache_tracks_checkpoint_file_mtime(tmp_path, monkeypatch):
     assert cli._before_eval_key(args, tiny(), backend, SamplingParams(), None) != key
 
 
+def test_before_eval_cache_keys_on_weights_or_refuses(tmp_path, monkeypatch):
+    """Every cached key names the base model's weights, and a model whose weights the
+    key cannot identify gets no cache rather than a key that omits them.
+
+    `tiny` is the one exception and it is a derivation, not an omission: `build_random`
+    is a pure function of `--seed`, and the seed reaches the key through `sampling`.
+    A third real checkpoint added without a `weights` branch would otherwise serve the
+    27B's before-arm for it.
+    """
+    from types import SimpleNamespace
+
+    from tilerl import cli
+    from tilerl.config import tiny as tiny_cfg
+    from tilerl.prompt import sampling
+    from tilerl.tensor_parallel import tp_config
+    from tilerl.tokenizer import get_tokenizer
+
+    backend = SimpleNamespace(target="cpu", precision="bf16")
+    tok = get_tokenizer(None)
+
+    def key(cfg=None, **over):
+        argv = ["train", "--model", over.pop("model", "tiny")]
+        for k, v in over.items():
+            argv += [f"--{k.replace('_', '-')}", str(v)]
+        a = cli._build_parser().parse_args(argv)
+        p = sampling(tok, None, a.eval_max_new_tokens, temperature=a.temperature,
+                     max_think_tokens=a.max_think_tokens, seed=a.seed)
+        return cli._before_eval_key(a, cfg or tiny_cfg(), backend, p, None)
+
+    base = key()
+    assert base is not None and len(base) == 64
+    # tiny's weights ARE the seed, so the seed must move the key.
+    assert key(seed=7) != base, "two seeds are two base models and must not share a cache"
+    # Everything the eval arm reads, and nothing the training arm does.
+    for flag, val in (("eval_n", 50), ("eval_max_new_tokens", 512), ("temperature", 0.5)):
+        assert key(**{flag: val}) != base, f"--{flag} does not reach the key"
+    for flag, val in (("lora_rank", 32), ("steps", 5), ("lr", 0.5)):
+        assert key(**{flag: val}) == base, f"--{flag} changes the key and should not"
+    # tp reaches it through the sharded cfg AND explicitly; either alone is enough.
+    assert key(cfg=tp_config(tiny_cfg(), 2)) != base and key(tp=2) != base
+
+    # An unknown model refuses. Faked by name because the parser's choices are closed:
+    # the point is the branch, and a new choice would land here without one.
+    a = cli._build_parser().parse_args(["train", "--model", "tiny"])
+    a.model = "some-new-checkpoint"
+    p = sampling(tok, None, a.eval_max_new_tokens, seed=a.seed)
+    assert cli._before_eval_key(a, tiny_cfg(), backend, p, None) is None, (
+        "a model with no weights branch must get no cache, not a key without weights")
+
+
 if __name__ == "__main__":
     import sys
 
