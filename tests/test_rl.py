@@ -350,8 +350,9 @@ def test_a_recapturing_engine_drops_what_the_update_invalidated():
 
     A captured graph replays the forward as it was traced and a cached prefix
     serves KV from the old policy -- both silently, which is why the guard refuses
-    an engine carrying either. `recaptures=True` is the alternative: the loop keeps
-    them and clears them after every update.
+    an engine carrying either. The waivers are per cache: `recapture_graph=True`
+    and `clear_prefix=True`, so a caller that turned graphs off and said only
+    "graphs" is still refused for the live prefix store it forgot.
 
     CPU cannot gate the graph half. Capture calls torch.cuda.graph_pool_handle(),
     which raises here, and the handler flips _decode_graph_on to False -- so a
@@ -375,6 +376,10 @@ def test_a_recapturing_engine_drops_what_the_update_invalidated():
     engine = build_engine(cfg, model, RefBackend(), num_blocks=64, num_slots=4)
     with pytest.raises(ValueError, match="on-policy"):
         run(engine)
+    # One flag is not the other: this engine's graphs are already off, so waiving
+    # them changes nothing and the live prefix store must still raise.
+    with pytest.raises(ValueError, match="prefix"):
+        run(engine, recapture_graph=True)
 
     # Clearing at loop ENTRY is not enough and a one-step test cannot tell the two
     # apart: it passes either way. Re-dirty the caches between steps, so only a
@@ -390,7 +395,8 @@ def test_a_recapturing_engine_drops_what_the_update_invalidated():
     dirty()
     assert engine._prefix.stats()["entries"] == 1
     for _ in grpo_loop(engine, model, [[1, 2, 3]], lambda p, c: 0.0, 2, RefBackend(),
-                       group=2, sampling=SamplingParams(max_new_tokens=4), recaptures=True):
+                       group=2, sampling=SamplingParams(max_new_tokens=4),
+                       recapture_graph=True, clear_prefix=True):
         assert engine._decode_graphs == {}, "the update left a graph traced on old weights"
         assert engine._prefix.stats()["entries"] == 0, "the update left KV from the old policy"
         dirty()  # the next step must clear it again, not rely on loop entry
