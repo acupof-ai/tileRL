@@ -131,10 +131,28 @@ integration in a scratchpad worktree and fast-forward `main`. Before a push
 or a fast-forward pull, tell the peers `ListAgents` shows for this repo
 (`SendMessage`) which files you touch, and wait a few minutes for objections.
 
-**On-policy rollouts.** `grpo_loop` and self-OPD refuse an engine with the
-decode graph or the prefix store on — both sample from an earlier policy
-without raising. Training engines are built with `decode_graph=False,
-prefix_store=NoPrefixStore()` until recapture-after-update lands (roadmap P2.0).
+**Addressing.** Send to `name [ref]` from `runs/roster.json`, never a bare
+name: several projects run sessions whose names share a prefix. And **a relay
+channel is not the owner of the work it relays** — a session named in a grant,
+a merge or a hand-off is the channel, not the runner, and a review sent to it
+goes to the wrong desk. Name the runner. (2026-09-05: a MoE-bench review
+reached `tilerl-27` because a grant commit read "via tilerl-27".)
+
+**Pod jobs go through `scripts/pod_run.sh <name> <card> -- <cmd>`.** Never
+hand-type the launcher: it reaps the job (a `setsid nohup` from an exiting
+shell orphans to a PID 1 that is `sleep infinity` and never `wait()`s), logs
+to `/work` because `/` is full, claims with the python pid and retries only
+the device-fd refusal, releases from a trap, and refuses a card holding
+>64 MiB with no claim. After any kill, read `ps -o stat=`: `kill -0`,
+`/proc/<pid>` and `pgrep -f` all call a zombie alive.
+
+**On-policy rollouts.** `grpo_loop` and self-OPD refuse an engine whose caches
+would outlive an update, per cache: `recapture_graph=` waives the decode graph,
+`clear_prefix=` the prefix store, and a waiver obliges the loop to call
+`invalidate_weights()` after every step. The RL path now runs with
+`decode_graph=True, recapture_graph=True` — worth 2.16x on the 27B step
+(73.62 → 34.09 s) — and `prefix_store=NoPrefixStore()` until the block-granular
+store lands, since today's store publishes and never serves.
 
 **Git.** Commitizen `<type>(<scope>): <subject>`, scopes `kv` `engine` `ops`
 `autograd` `train` `server` `docs`. Work on a named branch from a scratchpad
