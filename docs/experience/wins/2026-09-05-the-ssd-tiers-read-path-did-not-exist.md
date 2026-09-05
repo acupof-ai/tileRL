@@ -260,14 +260,20 @@ one fact needs two assertions and a plausible test satisfies one. Delete each br
 re-run; a suite that stays green names the gap. And assert a counter only the second path
 increments — "it did not raise" is also satisfied by never getting there.
 
-**A mutation must be as narrow as the claim it supports, and the assertion must actually
-execute.** Writing one gate for two guards, I replaced the whole `if still_pending: ... else:
-remove` block, saw the resurrection, and published it as the cost of deleting the unlink — two
-guards' worth of damage attributed to one line. Codex caught it. The mechanism that hid it is
-assertion order: both mutations leave a file on disk, the file assertion came first, and pytest
-stops there, so the assertion whose message said "indexed again" never ran in the run I quoted.
-So: mutate one line per claim, order the assertions so the one carrying the claim is reached
-first, and read which assertion actually failed rather than that the test went red.
+**A mutation must be as narrow as the claim it supports.** Writing one gate for two guards, I
+replaced the whole `if still_pending: ... else: remove` block, saw the resurrection, and
+published it as the cost of deleting the unlink — two guards' worth of damage attributed to one
+line. Measured apart, they differ in kind: the `still_pending` check keeps the dropped key out
+of the index (stale service if it fails), the `os.remove` keeps the bytes off the disk (a leak).
+Codex caught it on review.
+
+**Assertion order decides which claim is testable at all, and a red control names an assertion,
+not your assertion.** Both mutations above leave a file on disk. The file assertion came first.
+pytest stops at the first failure — so the assertion whose message said "indexed again" **never
+executed** in the run I cited as its proof. I had already written the rule "run every control in
+the failing state and confirm it fails", and I did; the control failed; the claim was still
+untested. So: put the discriminating assertion first, keep anything that fails in every arm
+after it, and read the assertion text in the failure output rather than the exit status.
 
 ## Results
 
