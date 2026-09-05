@@ -401,7 +401,7 @@ class KvTier:
         self._max_pending = max_pending
         self.offered = 0
         self.refusals = 0
-        self.over_budget = 0
+        self.over_budget = 0  # byte-budget evictions
         self._healthy = True  # daemon failure (disk full/perm) flips this to refuse
         # Size-based LRU: total on-disk bytes capped at max_bytes; the daemon
         # evicts the least-recently-accessed entry's files after each write.
@@ -520,12 +520,23 @@ class KvTier:
             self._lru[key] = self._lru.get(key, 0) + sz
             self._lru.move_to_end(key)
             self._total += sz
-            if self._total > self._max_bytes:
-                # ponytail: counted, not enforced. The eviction loop that used to live here
-                # unlinked the LRU entry's files, and nothing exercised it -- an untested
-                # path that deletes data is worse than a tier that grows. `ssd_over_budget`
-                # on /health is the signal to build it, with a gate.
+            # Enforced, not just counted: a budget that only reports is unbounded disk
+            # growth, and this repo has filled a disk once. An entry still being written is
+            # never the victim -- dropping it mid-save would resurrect it when the daemon
+            # finishes, and `_flush_loop` reads the pending table to decide that.
+            while self._total > self._max_bytes and len(self._lru) > 1:
+                victim = next(
+                    (k for k in self._lru
+                     if k not in self._pending and k not in self._pending_st),
+                    None,
+                )
+                if victim is None:
+                    break  # every entry is still in flight
+                self._total -= self._lru.pop(victim)
                 self.over_budget += 1
+                for path in (self._kv(victim), self._st(victim)):
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(path)
 
     def _touch_lru(self, key: int) -> None:
         with self._lock:
@@ -657,7 +668,7 @@ class KvTier:
             "ssd_recovered": self.recovered,
             "ssd_offered": self.offered,
             "ssd_refusals": self.refusals,
-            "ssd_over_budget": self.over_budget,
+            "ssd_evictions": self.over_budget,
             "ssd_pending": pending,
             "ssd_healthy": int(self._healthy),
         }
