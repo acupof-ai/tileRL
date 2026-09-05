@@ -372,6 +372,7 @@ def grpo_loop(
     tiebreak: Any = None,
     recapture_graph: bool = False,
     clear_prefix: bool = False,
+    per_rollout: list | None = None,
 ) -> Iterator[tuple[float, float, float, float, float, dict[str, float]]]:
     """GRPO: sample ``group`` completions per prompt in one engine batch, score
     them with ``reward_fn(prompt_ids, completion_ids) -> float``, take one
@@ -386,6 +387,12 @@ def grpo_loop(
     cannot fall and be bad: ``--judge`` reorders inside the all-pass subgroup by
     construction, so it drives ties toward 0 whether or not it ranks anything real.
     Length is the independent signal that separates the two.
+
+    ``per_rollout``, when given, is extended with one dict per completion
+    (``step``, ``g``, ``tokens``, ``reward``, ``advantage``). The yielded tuple
+    carries only means, which is the axis a length-vs-reward claim cannot be made
+    on: the advantage is computed within a group on one prompt, so pairing has to
+    survive to the row level or prompt difficulty confounds it.
     # ponytail: recapture the graph and drop the prefix entries after each
     # update instead of disabling both, once a rollout's decode cost matters."""
     _require_on_policy(engine, recapture_graph, clear_prefix)
@@ -420,6 +427,17 @@ def grpo_loop(
             rewards = tiebreak(prompt, comps, [r > 0.5 for r in rewards])
         adv = group_advantages(rewards, group)
         tied = float((adv.reshape(-1, group) == 0).all(axis=1).mean())
+        if per_rollout is not None:
+            # Per rollout, not the group means: length and reward are paired only
+            # WITHIN a group, on one prompt, and a step yields one mean of each --
+            # so a cross-step correlation is confounded by prompt difficulty and
+            # cannot support a claim about the advantage
+            # (wins/2026-09-06-what-a-length-term-can-recover.md).
+            per_rollout.extend(
+                {"step": step + 1, "g": g, "tokens": len(c), "reward": r,
+                 "advantage": float(a)}
+                for g, (c, r, a) in enumerate(zip(comps, rewards, adv))
+            )
         # Power-of-two buckets bound shape JITs (tiny: 37.7 s new width, 71 ms repeat).
         # Clamped to the cap: an odd cap would otherwise round PAST it (1500 -> 2048, a
         # 36% overshoot of padding the mask discards). The clamp costs no extra JIT --

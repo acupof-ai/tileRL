@@ -28,6 +28,83 @@ def _max_delta(model, snap):
     return max((model.params[k] - v).abs().max().item() for k, v in snap.items())
 
 
+def test_the_within_group_r_removes_the_prompt_confound():
+    """Run 2's mechanism claim came from two group MEANS per step, which is a
+    cross-step correlation: a hard prompt makes both longer completions and lower
+    reward, so pooling over steps measures difficulty. Centering per group is what
+    removes it, and the gate is that the two disagree on the SAME rows.
+    """
+    from tilerl.cli import _within_group_r
+
+    def rows(spec):
+        return [{"step": s, "g": i, "tokens": t, "reward": r}
+                for s, g in enumerate(spec, 1) for i, (t, r) in enumerate(g)]
+
+    def pooled(rs):
+        mx = sum(r["tokens"] for r in rs) / len(rs)
+        my = sum(r["reward"] for r in rs) / len(rs)
+        den = (sum((r["tokens"] - mx) ** 2 for r in rs)
+               * sum((r["reward"] - my) ** 2 for r in rs)) ** 0.5
+        return sum((r["tokens"] - mx) * (r["reward"] - my) for r in rs) / den
+
+    # Hard prompts long+low, easy short+high, but WITHIN each group the reward has
+    # variance and no relation to length (which row is correct alternates).
+    confounded = rows([[(1700, 0.0), (1900, 0.4)], [(1600, 0.4), (1800, 0.0)],
+                       [(500, 0.8), (700, 1.0)], [(400, 1.0), (600, 0.8)]])
+    assert pooled(confounded) < -0.8, "fixture must carry a strong cross-step correlation"
+    assert abs(_within_group_r(confounded)) < 1e-9, (
+        f"prompt difficulty survived centering: r={_within_group_r(confounded)}")
+
+    # And a real within-group effect must still register, in both directions.
+    assert _within_group_r(rows([[(400, 1.0), (1900, 0.0)], [(500, 1.0), (1800, 0.0)],
+                                 [(600, 1.0), (1700, 0.0)]])) < -0.9
+    assert _within_group_r(rows([[(400, 0.0), (1900, 1.0)],
+                                 [(500, 0.0), (1800, 1.0)]])) > 0.9
+
+    # No variance to correlate: None rather than a fabricated 0.0. The tied case is
+    # 19 of run 2's 45 steps, and at the cap every length is identical too.
+    assert _within_group_r(rows([[(400, 1.0), (1900, 1.0)]])) is None
+    assert _within_group_r(rows([[(2048, 0.0), (2048, 1.0)]])) is None
+    assert _within_group_r([]) is None
+
+
+def test_grpo_loop_records_one_row_per_rollout():
+    """The yielded tuple carries means, so a length-vs-reward claim needs the rows."""
+    cfg, model = _build_model("tiny", seed=0)
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.kv_cache import NoPrefixStore
+    from tilerl.train import grpo_loop
+
+    backend = RefBackend()
+    engine = build_engine(cfg, model, backend, num_blocks=128, num_slots=4,
+                          decode_graph=False, prefix_store=NoPrefixStore())
+    rollouts: list = []
+    steps, group = 2, 2
+    # The reward must DIFFER within a group or every advantage is 0.0 and a
+    # misaligned pairing is unobservable: tiny never emits EOS, so `len(c)` is
+    # max_new_tokens for every rollout and the group ties. Key on the first token
+    # instead, which the per-rollout seed varies.
+    list(grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(c[0]), steps, backend,
+                   AdamW(lr=0.0), group=group, sampling=SamplingParams(max_new_tokens=4),
+                   per_rollout=rollouts))
+    assert len(rollouts) == steps * group, f"{len(rollouts)} rows for {steps}x{group} rollouts"
+    assert [r["step"] for r in rollouts] == [1, 1, 2, 2]
+    assert sorted({r["g"] for r in rollouts}) == list(range(group))
+    assert all(r["tokens"] == 4 for r in rollouts), rollouts
+    # The advantage must be the one THIS row's reward earned, not another row's:
+    # a misaligned zip would still write the right count of rows with the right
+    # step and g, and every assertion above would pass.
+    seen_signal = False
+    for s in (1, 2):
+        rows = [r for r in rollouts if r["step"] == s]
+        want = group_advantages([r["reward"] for r in rows], group)
+        assert np.allclose([r["advantage"] for r in rows], want), rows
+        seen_signal = seen_signal or np.abs(want).max() > 1e-8
+    assert seen_signal, (
+        f"every group tied, so the advantage assertion compared zeros and could not "
+        f"catch a misaligned pairing: {rollouts}")
+
+
 def test_group_advantages():
     # Group-normalized: mean 0, unit std, and no signal when the group ties.
     adv = group_advantages([1.0, 2.0, 3.0, 4.0, 5.0, 5.0], group=3)
