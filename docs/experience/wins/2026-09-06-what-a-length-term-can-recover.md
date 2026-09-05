@@ -57,9 +57,12 @@ a search and called it the boundary; that number was luck.
 **On an all-pass group λ cancels completely.** `group_advantages` divides by the
 group's std, so when correctness is constant the advantage depends only on the
 *ordering* of lengths — λ = 0.1 and λ = 1.0 produce the identical vector
-`[1.29, 0.80, 0.62, 0.38, 0.18, −0.27, −0.94, −2.05]`. λ therefore does nothing
-on 14 of the 19 tied steps, and tunes only the correctness/length trade-off on
-mixed groups. Anyone tuning λ against the tie fraction will see no movement and
+`[1.29, 0.80, 0.62, 0.38, 0.18, −0.27, −0.94, −2.05]`. On a tied group that is
+the intended behaviour and not a defect: ordering is the whole signal there, and
+there is nothing for a magnitude to trade against. What it means practically is
+that **λ must be read on mixed groups**, where it does not cancel (0.1 and 1.0
+differ), because that is the only place it does anything. Anyone sweeping λ
+against the tie fraction will see no movement on 14 of the 19 target steps and
 conclude the term does not work.
 
 ## The claim this does not support
@@ -73,6 +76,18 @@ both longer completions and lower reward. Each of the 45 steps drew a different
 prompt, so nothing in this table separates length from difficulty, and the
 mechanism sentence is an inference rather than a measurement. The fix may still
 be right; the evidence offered for it is about the wrong axis.
+
+**The run-2 finding is stated on the wrong axis, and no re-analysis of that run
+can move it onto the right one**, because the data does not exist:
+`grpo_loop` yields `float(np.mean(rewards))` and
+`float(np.mean([len(c) for c in comps]))` (`train.py:443-444`), so both quantities
+are averaged over the group before anything records them. The within-group pairing
+is destroyed at the source, not lost in the write-up. **Run 3 must log
+per-completion `(length, reward)`** — 8 pairs per step, not two means — or the
+same claim will be restated from the same unusable axis. That log is also the only
+thing that can measure whether the term worked: the prediction is a negative
+within-group correlation shrinking over training, and a step's two means cannot
+express it.
 
 ## Rule
 
