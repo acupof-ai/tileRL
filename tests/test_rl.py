@@ -81,6 +81,83 @@ def test_rl_step_ignores_padding():
     assert worst < 1e-6, f"prompt/padding leaked into the RL gradient: {worst:.2e}"
 
 
+def test_grpo_length_buckets_preserve_real_token_loss_and_gradients(monkeypatch):
+    import platform
+    from types import SimpleNamespace
+
+    from tilerl import train
+    from tilerl.engine import SamplingParams
+    from tilerl.kv_cache import NoPrefixStore
+
+    prompt = [1, 2, 3]
+    # (cap, longest, expected width). The 1200 arm is the one that catches an
+    # unclamped bucket: 1200 is not a power of two, so rounding up gives 2048 --
+    # 848 tokens of padding past a cap the completions can never exceed. At 2048
+    # the defect is invisible, because the round-up lands on the cap itself.
+    for cap, longest, width in ((2048, 300, 512), (2048, 1100, 2048), (1200, 1200, 1200)):
+        comps = {i: (np.arange(n) % 100 + 4).tolist()
+                 for i, n in enumerate((longest, longest // 2))}
+        requests = iter(comps)
+        engine = SimpleNamespace(
+            _decode_graph_on=False, _prefix=NoPrefixStore(),
+            submit=lambda p, s: next(requests), step=lambda: None, poll=lambda: comps,
+        )
+        captured = []
+        with monkeypatch.context() as m:
+            m.setattr(train, "rl_step", lambda *a, **kw: captured.append((a, kw)) or 0.0)
+            list(train.grpo_loop(engine, None, [prompt], lambda p, c: len(c), 1,
+                                 RefBackend(), group=2,
+                                 sampling=SamplingParams(max_new_tokens=cap)))
+        args, kwargs = captured[0]
+        batch, adv, plens = args[1:4]
+        assert batch.shape == (2, len(prompt) + width), "wrong completion bucket width"
+        slens = kwargs["seq_lens"]
+        np.testing.assert_array_equal(slens, [len(prompt) + len(c) for c in comps.values()])
+        full = np.pad(batch, ((0, 0), (0, cap - width)))
+        results = []
+        for ids in (batch, full):
+            losses, gradients = [], {}
+
+            class Backend(RefBackend):
+                def cross_entropy_loss_grad(self, logits, tokens):
+                    for row, end in enumerate(slens):
+                        start = len(prompt) - 1
+                        loss, _ = RefBackend().cross_entropy_loss_grad(
+                            logits[row:row + 1, start:end], tokens[row:row + 1, start:end])
+                        losses.append(loss)
+                    return RefBackend().cross_entropy_loss_grad(logits, tokens)
+
+            _, model = _build_model("tiny", seed=0, keep_master=True)
+            clip = train.clip_grad_norm
+
+            def capture(grads, *a):
+                gradients.update({k: grads[id(v)].clone() for k, v in model.params.items()
+                                  if id(v) in grads})
+                return clip(grads, *a)
+
+            with monkeypatch.context() as m:
+                m.setattr(train, "clip_grad_norm", capture)
+                rl_step(model, ids, adv, plens, Backend(), AdamW(lr=0), seq_lens=slens)
+            assert gradients and max(g.abs().max().item() for g in gradients.values()) > 0
+            results.append((losses, gradients))
+        np.testing.assert_allclose(results[0][0], results[1][0], rtol=1e-5, atol=1e-6)
+        assert results[0][1].keys() == results[1][1].keys()
+        failures = []
+        # atol: the conv1d gradient sums over a width-dependent padded axis; the macos-14
+        # runner (3 threads, torch 2.13) measured |d| 2.0e-6 on |ref| 0.055 between widths
+        # 512 and 2048, where 3 Linux/Mac hosts gave 0. Five times that, not a bug bound.
+        atol = 1e-5
+        for key, actual in results[0][1].items():
+            ref = results[1][1][key]
+            if not torch.allclose(actual, ref, rtol=1e-5, atol=atol):
+                failures.append(f"{key}: max |d|={(actual - ref).abs().max().item():.9g}, "
+                                f"max |ref|={ref.abs().max().item():.9g}, rtol=1e-5, atol={atol}")
+        assert not failures, (
+            f"cap={cap}, longest={longest}, width={width}; torch={torch.__version__}, "
+            f"threads={torch.get_num_threads()}, platform={platform.platform()}\n"
+            + "\n".join(failures))
+
+
 def test_micro_batching_is_the_same_update():
     """A group split into micro-batches must land on the same weights as the
     whole group in one backward, or micro-batching would be a quieter way of
@@ -156,7 +233,7 @@ def test_grpo_loop_reports_a_step_before_the_run_ends():
     gen = grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(len(c)), 3, backend,
                     AdamW(lr=1e-3), group=2, sampling=SamplingParams(max_new_tokens=4))
     first = next(gen)
-    assert len(first) == 6, first  # reward, ce, secs, tied, mean completion tokens, timings
+    assert len(first) == 7, first  # reward, ce, secs, tied, mean tokens, timings, bucket width
     assert sum(1 for _ in gen) == 2, "every step must be yielded, not just the first"
 
 
