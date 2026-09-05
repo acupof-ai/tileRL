@@ -67,7 +67,7 @@ def _build_model(
 
 
 def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16,
-                  blocks=0, max_ctx=0, max_batch=8):
+                  blocks=0, max_ctx=0, max_batch=8, ssd_path=""):
     """Serving-size engine; ``devices`` replicates it across those CUDA indices.
 
     ``max_ctx`` caps the served context; it still defaults to the model's own limit,
@@ -90,6 +90,8 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
               max_total_tokens=ctx, max_blocks=(ctx * max_batch) // BLOCK_TOKENS)
     if draft is not None:
         kw["draft"], kw["spec_depth"] = draft, depth
+    if ssd_path:
+        kw["ssd_path"] = ssd_path
     if not devices:
         return engine_mod.build_engine(cfg, model, backend, **kw)
 
@@ -123,7 +125,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     engine = _build_engine(cfg, model, backend, devices=args.devices,
                            draft=draft, depth=args.depth, slots=args.slots,
                            blocks=args.blocks, max_ctx=args.max_ctx,
-                           max_batch=args.max_batch)
+                           max_batch=args.max_batch, ssd_path=args.ssd_path)
     tokenizer = _qwen38_tokenizer() if args.model == "qwen38-27b" else get_tokenizer(None)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
@@ -730,6 +732,13 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.add_argument("--max-ctx", type=int, default=0,
                          help="cap served context (0 = the model's own limit); pairs with "
                               "--blocks so a request cannot outgrow the pool")
+    p_serve.add_argument("--ssd-path", default="",
+                         help="directory for the SSD prefix tier (empty = off). Unlike the "
+                              "host snapshot tier this one pays without concurrent sessions: "
+                              "after a restart HBM is empty, so the first lookup of every "
+                              "returning conversation reaches back to disk. The tier keys its "
+                              "files on the model's config, so a shape change makes them "
+                              "unreadable rather than serving KV from other weights")
     p_serve.add_argument("--max-batch", type=int, default=8,
                          help="concurrent rows; drop to 2 for a single-user endpoint (a decode "
                               "graph is captured per bucket x chain width, so a lower "

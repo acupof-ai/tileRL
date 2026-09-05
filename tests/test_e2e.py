@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import time
@@ -707,6 +708,49 @@ def test_a_promotion_that_comes_back_empty_is_a_miss():
         "a hit came back with blocks and no snapshot; the caller would prefill the GDN "
         "layers from a zero state over non-zero KV"
     )
+
+
+def test_the_ssd_flag_reaches_the_store_and_the_fingerprint_covers_the_config(tmp_path):
+    """`--ssd-path` must arrive at the PrefixStore, and the fingerprint must move with
+    every config field.
+
+    Two separate silent failures, so two asserts. A flag that parses and is never
+    forwarded reads exactly like a working one — `dram_bytes` had no CLI entry at all and
+    the review had to find that by reading `_build_engine`. And a fingerprint that misses
+    a field serves KV computed under other weights after a restart, which is wrong and
+    silent; the first draft of `_weight_fingerprint` hand-listed the fields and named
+    `cfg.num_heads`, which does not exist on this config at all.
+
+    The fingerprint is checked over EVERY field via `dataclasses.replace`, not a sample:
+    a hand-picked list is the defect being guarded against.
+    """
+    import dataclasses
+
+    from tilerl.cli import _build_engine as cli_build
+    from tilerl.engine import _weight_fingerprint
+
+    cfg = tiny()
+    base = _weight_fingerprint(cfg)
+    for f in dataclasses.fields(cfg):
+        old = getattr(cfg, f.name)
+        new = (old + 1) if isinstance(old, int) and not isinstance(old, bool) else None
+        if new is None:
+            continue
+        with contextlib.suppress(ValueError):  # some fields validate against each other
+            assert _weight_fingerprint(dataclasses.replace(cfg, **{f.name: new})) != base, (
+                f"changing {f.name} left the fingerprint unchanged, so a restart would "
+                "serve KV computed under a different config"
+            )
+
+    cfg, model = _build_model("tiny", seed=11)
+    engine = cli_build(cfg, model, get_backend(), slots=2, blocks=64, max_ctx=256,
+                       ssd_path=str(tmp_path))
+    tier = engine._prefix._ssd
+    assert tier is not None, (
+        "--ssd-path parsed but never reached the store; the flag would read as working"
+    )
+    assert os.path.isdir(os.path.join(str(tmp_path), "tilerl_kvtier"))
+    assert tier._fingerprint == _weight_fingerprint(cfg)
 
 
 def test_a_restart_faults_the_prefix_back_in_off_disk(tmp_path):
