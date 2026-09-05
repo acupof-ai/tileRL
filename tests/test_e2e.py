@@ -800,7 +800,8 @@ def test_a_restart_faults_the_prefix_back_in_off_disk(tmp_path):
       output for a while.
 
     The negative control is the fingerprint: a mismatched one must NOT hit, or the tier
-    would serve KV computed under different weights.
+    would serve KV computed under different weights — and it must also unlink, since that
+    unlink is the only path that ever reclaims this tier's disk.
     """
     torch.manual_seed(0)
     toks = list(range(4 * BLOCK_TOKENS))
@@ -847,6 +848,19 @@ def test_a_restart_faults_the_prefix_back_in_off_disk(tmp_path):
     other, _, other_tier = store_at("fp-b")
     assert other_tier.recovered == 0 and other.lookup(toks) is None, (
         "a different fingerprint served KV computed under other weights"
+    )
+    # And the mismatch must UNLINK, not merely decline to index. `recovered == 0` above
+    # cannot see the difference: with the files left in place it is still 0, because a
+    # mismatch clears `prev` either way -- the whole suite passes with the unlink deleted
+    # (measured). The bytes matter because this unlink is the only thing that ever reclaims
+    # the tier's disk: `invalidate()` deliberately writes one marker instead of walking a
+    # 20 GiB directory inside a training step, so every generation's spill accumulates
+    # until some later `_recover` mismatches and removes it.
+    left = [f for f in os.listdir(os.path.join(str(tmp_path), "tilerl_kvtier"))
+            if f.endswith((".kv", ".st"))]
+    assert not left, (
+        f"a fingerprint mismatch left {len(left)} spill files on disk; nothing else reclaims "
+        "them, so every optimizer step's spill accumulates until the disk fills"
     )
 
     # An optimizer step calls clear(), and a tier that keeps serving afterwards hands the

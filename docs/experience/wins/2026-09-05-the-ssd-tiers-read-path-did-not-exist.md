@@ -38,6 +38,18 @@ dataclass field, not a hand-picked list. The first draft picked seven and named
 `num_attention_heads` — so the list was already wrong when written, and a field
 left out is how a restart serves KV computed under other weights.
 
+**The fingerprint control asserted the safe half and missed the disk half.** It read
+`other_tier.recovered == 0 and other.lookup(toks) is None`, which is one claim written as
+two: a mismatch sets `prev = None`, so nothing is indexed, so `resident()` is False, so
+`_fault_in` is never called — the `lookup` half cannot fail while the first half holds.
+What the pair never touched is that a mismatch must **unlink**. Deleting the unlink loop
+from `_recover` leaves all 327 tests passing (measured). That matters because this unlink is
+the tier's ONLY disk reclamation: `invalidate()` deliberately writes one marker instead of
+walking a 20 GiB directory inside a training step, so each generation's spill sits on disk
+until some later `_recover` mismatches and removes it. Now asserted on the directory listing
+rather than on `recovered`, since `recovered` is 0 either way. Negative control: the same
+mutation fails it with "left 2 spill files on disk".
+
 **Two numbers, two scenarios, both measured.** A process restart empties HBM and
 leaves the host page cache alone, so the fault-in reads from memory — that is the
 common case and what was asked about. A host reboot, or a spill old enough to be
