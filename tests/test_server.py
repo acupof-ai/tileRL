@@ -470,7 +470,7 @@ def test_the_chat_page_reads_the_stream_this_server_sends(client, model_id):
     node = shutil.which("node")
     if node is None:
         pytest.skip("node not available; the page's reader cannot be executed")
-    from tilerl.server import _CHAT_UI
+    from tilerl.ui_assets import _CHAT_UI
 
     resp = client.post("/v1/chat/completions", json={
         "model": model_id, "messages": [{"role": "user", "content": "hi"}],
