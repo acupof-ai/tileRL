@@ -42,9 +42,13 @@ class RefBackend:
     _tp_pg = None
     dp_world = 1
     _dp_pg = None
+    cp_world = 1
+    cp_rank = 0
+    _cp_pg = None
 
     def init_tp(self, world: int, rank: int, tp_groups: list[list[int]] | None = None,
-                dp_groups: list[list[int]] | None = None) -> None:
+                dp_groups: list[list[int]] | None = None,
+                cp_groups: list[list[int]] | None = None) -> None:
         """Same seam as ``Backend.init_tp``; gloo, so the TP gate runs CPU-only."""
         if world == 1:
             return
@@ -52,26 +56,28 @@ class RefBackend:
 
         if not dist.is_initialized():
             dist.init_process_group("gloo", world_size=world, rank=rank)
-        if tp_groups:
-            mine = None
-            for g in tp_groups:  # every rank builds every group, in order
+
+        def join(groups, axis):
+            mine, pg_mine = None, None
+            for g in groups:  # every rank builds every group, in order
                 pg = dist.new_group(list(g))
                 if rank in g:
-                    mine, self._tp_pg = g, pg
+                    mine, pg_mine = g, pg
             if mine is None:
-                raise ValueError(f"rank {rank} is in none of the tp groups {tp_groups}")
+                raise ValueError(f"rank {rank} is in none of the {axis} groups {groups}")
+            return mine, pg_mine
+
+        if tp_groups:
+            mine, self._tp_pg = join(tp_groups, "tp")
             self.tp_world, self.tp_rank = len(mine), mine.index(rank)
         else:
             self.tp_world, self.tp_rank = world, rank
         if dp_groups:
-            mine = None
-            for g in dp_groups:
-                pg = dist.new_group(list(g))
-                if rank in g:
-                    mine, self._dp_pg = g, pg
-            if mine is None:
-                raise ValueError(f"rank {rank} is in none of the dp groups {dp_groups}")
+            mine, self._dp_pg = join(dp_groups, "dp")
             self.dp_world = len(mine)
+        if cp_groups:
+            mine, self._cp_pg = join(cp_groups, "cp")
+            self.cp_world, self.cp_rank = len(mine), mine.index(rank)
 
     def dp_reduce(self, x):
         """Mean across the dp replicas; see ``Backend.dp_reduce``."""
@@ -102,6 +108,28 @@ class RefBackend:
 
     def tp_fork(self, x):
         return x if self.tp_world == 1 else x.view_as(x)
+
+    def cp_gather(self, x, dim: int = 1):
+        """See ``Backend.cp_gather``: chunks come back in cp_rank order."""
+        if self.cp_world == 1:
+            return x
+        import torch.distributed as dist
+
+        x = x.contiguous()
+        parts = [torch.empty_like(x) for _ in range(self.cp_world)]
+        dist.all_gather(parts, x, group=self._cp_pg)
+        return torch.cat(parts, dim=dim)
+
+    def cp_reduce_scatter(self, x, dim: int = 1):
+        """See ``Backend.cp_reduce_scatter``: a sum, not a slice."""
+        if self.cp_world == 1:
+            return x
+        import torch.distributed as dist
+
+        parts = [p.contiguous() for p in x.chunk(self.cp_world, dim=dim)]
+        out = torch.empty_like(parts[0])
+        dist.reduce_scatter(out, parts, group=self._cp_pg)
+        return out
 
     def __getattr__(self, name):
         if name in _REF_OPS:
@@ -134,18 +162,18 @@ class RefBackend:
 
         return reference.linear_fp8(x, w8, wscale, oscale)
 
-    def attention(self, q, k, v, scale, gate=None):
+    def attention(self, q, k, v, scale, gate=None, q_pos=None, k_pos=None):
         from tilerl_kernels import reference
 
-        out = reference.dense_attention(q, k, v, scale)
+        out = reference.dense_attention(q, k, v, scale, q_pos, k_pos)
         if gate is not None:
             out = out * torch.sigmoid(gate.float())
         return out
 
-    def attention_bwd(self, grad, q, k, v, scale):
+    def attention_bwd(self, grad, q, k, v, scale, q_pos=None, k_pos=None):
         from tilerl_kernels import reference
 
-        return reference.dense_attention_bwd(grad, q, k, v, float(scale))
+        return reference.dense_attention_bwd(grad, q, k, v, float(scale), q_pos, k_pos)
 
     def add(self, a, b):
         return a + b

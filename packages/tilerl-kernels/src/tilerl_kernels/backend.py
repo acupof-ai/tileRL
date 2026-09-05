@@ -147,9 +147,14 @@ class Backend:
     #: 1 means no data parallelism, so the gradient reduce below is a no-op.
     dp_world = 1
     _dp_pg = None
+    #: ranks holding the other chunks of this rank's sequence, and their group.
+    cp_world = 1
+    cp_rank = 0
+    _cp_pg = None
 
     def init_tp(self, world: int, rank: int, tp_groups: list[list[int]] | None = None,
-                dp_groups: list[list[int]] | None = None) -> None:
+                dp_groups: list[list[int]] | None = None,
+                cp_groups: list[list[int]] | None = None) -> None:
         """Join the TP group; framework layers never import torch.distributed.
 
         ``tp_groups`` is EVERY tp group in the mesh, in mesh order
@@ -161,8 +166,8 @@ class Backend:
         All of them, not just this rank's, because ``new_group`` is itself
         collective -- every rank must call it for every group, in the same
         order, or the ranks that skipped one deadlock the first time it is used.
-        The same applies to ``dp_groups``, and to the ORDER of the two loops:
-        every rank builds all tp groups first, then all dp groups.
+        The same applies to ``dp_groups`` and ``cp_groups``, and to the ORDER of
+        the three loops: every rank builds all tp groups, then all dp, then all cp.
         """
         if world == 1:
             return
@@ -171,26 +176,28 @@ class Backend:
         if not dist.is_initialized():
             comm = "nccl" if self.device.type == "cuda" else "gloo"
             dist.init_process_group(comm, world_size=world, rank=rank)
-        if tp_groups:
-            mine = None
-            for g in tp_groups:
+
+        def join(groups: list[list[int]], axis: str) -> list[int]:
+            mine, pg_mine = None, None
+            for g in groups:
                 pg = dist.new_group(list(g))
                 if rank in g:
-                    mine, self._tp_pg = g, pg
+                    mine, pg_mine = g, pg
             if mine is None:
-                raise ValueError(f"rank {rank} is in none of the tp groups {tp_groups}")
+                raise ValueError(f"rank {rank} is in none of the {axis} groups {groups}")
+            return mine, pg_mine
+
+        if tp_groups:
+            mine, self._tp_pg = join(tp_groups, "tp")
             self.tp_world, self.tp_rank = len(mine), mine.index(rank)
         else:
             self.tp_world, self.tp_rank = world, rank
         if dp_groups:
-            mine = None
-            for g in dp_groups:
-                pg = dist.new_group(list(g))
-                if rank in g:
-                    mine, self._dp_pg = g, pg
-            if mine is None:
-                raise ValueError(f"rank {rank} is in none of the dp groups {dp_groups}")
+            mine, self._dp_pg = join(dp_groups, "dp")
             self.dp_world = len(mine)
+        if cp_groups:
+            mine, self._cp_pg = join(cp_groups, "cp")
+            self.cp_world, self.cp_rank = len(mine), mine.index(rank)
 
     def dp_reduce(self, x: torch.Tensor) -> torch.Tensor:
         """Average one gradient across the dp replicas, in place.
@@ -238,6 +245,38 @@ class Backend:
         parts = [torch.empty_like(x) for _ in range(self.tp_world)]
         dist.all_gather(parts, x, group=self._tp_pg)
         return torch.cat(parts, dim=dim)
+
+    def cp_gather(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+        """Concatenate every cp rank's sequence chunk, in cp_rank order.
+
+        Chunks come back in RANK order, which is not sequence order under the
+        zigzag assignment -- the caller pairs this with the matching positions
+        and never infers them from the index."""
+        if self.cp_world == 1:
+            return x
+        import torch.distributed as dist
+
+        x = x.contiguous()
+        parts = [torch.empty_like(x) for _ in range(self.cp_world)]
+        dist.all_gather(parts, x, group=self._cp_pg)
+        return torch.cat(parts, dim=dim)
+
+    def cp_reduce_scatter(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+        """Sum across the cp group and keep this rank's chunk: the backward of
+        :meth:`cp_gather`.
+
+        A slice alone is wrong. Every rank's queries read every rank's K/V, so
+        each rank's dK is a partial sum over the whole sequence -- measured on a
+        dense reference at cp=4, keeping only the local slice is off by 58% of
+        full scale, while the summed version matches to 2.4e-07."""
+        if self.cp_world == 1:
+            return x
+        import torch.distributed as dist
+
+        parts = [p.contiguous() for p in x.chunk(self.cp_world, dim=dim)]
+        out = torch.empty_like(parts[0])
+        dist.reduce_scatter(out, parts, group=self._cp_pg)
+        return out
 
     def __init__(self, target: str):
         self.target = target
@@ -951,10 +990,13 @@ class Backend:
         )
         return self._kernel("paged_attention_combine" + sfx)(po, pm, pl, g, w)
 
-    def attention(self, q, k, v, scale, gate=None):
-        """Dense causal GQA attention (training path). q/k/v [B,T,H,D]."""
+    def attention(self, q, k, v, scale, gate=None, q_pos=None, k_pos=None):
+        """Dense causal GQA attention (training path). q [B,Tq,H,D], k/v [B,Tk,H,D].
+
+        ``q_pos``/``k_pos`` are absolute sequence positions, needed once CP gives
+        this rank a subset of the queries against every rank's keys."""
         # ponytail: torch-eager forward, tilelang kernel when perf demands
-        out = reference.dense_attention(q, k, v, float(scale))
+        out = reference.dense_attention(q, k, v, float(scale), q_pos, k_pos)
         if gate is not None:
             out = out * torch.sigmoid(self._f32(gate))
         return out
@@ -1052,9 +1094,9 @@ class Backend:
         # ponytail: torch-eager backward, tilelang dequant only exists for fp4
         return reference.linear_frozen_bwd(grad, wq, scale, oscale=oscale, fp8=fp8)
 
-    def attention_bwd(self, grad, q, k, v, scale):
+    def attention_bwd(self, grad, q, k, v, scale, q_pos=None, k_pos=None):
         # ponytail: torch-eager backward, tilelang kernel when perf demands
-        return reference.dense_attention_bwd(grad, q, k, v, float(scale))
+        return reference.dense_attention_bwd(grad, q, k, v, float(scale), q_pos, k_pos)
 
     def attention_gate_bwd(self, grad, attn_out, gate):
         return reference.attention_gate_bwd(grad, attn_out, gate)
