@@ -363,6 +363,61 @@ def _write_eval_rows(run_id: str, tag: str, rows: list) -> float:
 _ROLLOUT_HEADROOM = 0.8
 
 
+def _write_rollout_rows(run_id: str, rows: list, written: int = 0) -> int:
+    """Append the rows not yet on disk, and return the new count.
+
+    One JSON row per completion, so length and reward stay paired. Run 2's mechanism
+    claim -- short rollouts score better, so the policy lengthens -- was made from two
+    group MEANS per step, which is a cross-step correlation confounded by prompt
+    difficulty; each step draws a different prompt
+    (wins/2026-09-06-what-a-length-term-can-recover.md). Nothing could have been
+    re-derived from that run because the pairing never reached disk.
+
+    Per step rather than once at the end, because nothing in this package handles a
+    signal: run 2 took a SIGTERM at step 45 and never reached any writer. A run killed
+    that way now loses at most the step in flight.
+    """
+    from .ledger import runs_root
+
+    if len(rows) <= written:
+        return written
+    d = Path(runs_root()) / run_id
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / "rollouts.jsonl").open("a" if written else "w") as f:
+        f.writelines(json.dumps(r) + "\n" for r in rows[written:])
+    return len(rows)
+
+
+def _within_group_r(rows: list) -> float | None:
+    """Pearson r of (tokens, reward) POOLED over within-group deviations.
+
+    Centering per group is what removes prompt difficulty: a hard prompt shifts
+    both its lengths and its rewards, and that shift is the confound. A tied group
+    contributes zero deviation in reward and so cannot move r -- which is correct,
+    it carries no signal, and it is also why r is None on a run where every group
+    tied.
+    """
+    import collections
+
+    groups = collections.defaultdict(list)
+    for r in rows:
+        groups[r["step"]].append((r["tokens"], r["reward"]))
+    dx: list[float] = []
+    dy: list[float] = []
+    for g in groups.values():
+        if len(g) < 2:
+            continue
+        mx = sum(t for t, _ in g) / len(g)
+        my = sum(v for _, v in g) / len(g)
+        dx.extend(t - mx for t, _ in g)
+        dy.extend(v - my for _, v in g)
+    sxx = sum(a * a for a in dx)
+    syy = sum(b * b for b in dy)
+    if sxx <= 0 or syy <= 0:
+        return None
+    return sum(a * b for a, b in zip(dx, dy)) / (sxx * syy) ** 0.5
+
+
 def _refuse_short_rollouts(mean_len: float | None, cap: int, allow: bool = False) -> None:
     """Stop before training when the rollouts cannot reach an answer.
 
@@ -560,12 +615,16 @@ def _train_adapters(args: argparse.Namespace) -> None:
         tiebreak = _judge_tiebreak(engine, tok, params) if args.judge else None
 
         hist = []
+        rollouts: list = []
+        written = 0
         for i, (r, ce, secs, tied, ntok, timings, width) in enumerate(
                 train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
                                     group=args.group, sampling=params, seed=args.seed,
                                     trainable=trainable, micro=args.micro,
-                                    tiebreak=tiebreak, recapture_graph=True)):
+                                    tiebreak=tiebreak, recapture_graph=True,
+                                    per_rollout=rollouts)):
             hist.append((r, ce, secs, tied, ntok))
+            written = _write_rollout_rows(manifest["id"], rollouts, written)
             for phase, elapsed in timings.items():
                 manifest["metrics"][phase] = manifest["metrics"].get(phase, 0.0) + elapsed
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
@@ -603,6 +662,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # cannot report a bad judge. Length is the signal that can.
             tokens_first=statistics.mean(h[4] for h in hist[:w]),
             tokens_last=statistics.mean(h[4] for h in hist[-w:]))
+        manifest["metrics"]["length_reward_r"] = _within_group_r(rollouts)
     else:
         losses = train_mod.opd_loop(engine, model, prompts, args.steps, backend, optimizer,
                                     seed=args.seed, trainable=trainable, sampling=params,
