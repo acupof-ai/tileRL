@@ -1095,16 +1095,23 @@ def test_a_drop_landing_mid_save_does_not_resurrect_the_prefix(tmp_path):
 
     `drop()` clears the pending tables and unlinks, but the daemon is already past that point
     with the blob in hand: its `torch.save` completes AFTER the drop and writes the file the
-    drop just removed. So `_flush_loop` re-checks `table.get(k) is blob` afterwards and
-    unlinks again when the entry is gone.
+    drop just removed. Two guards handle it, and they cost different things:
 
-    Without that rollback the dropped prefix comes back: measured here, `ssd_entries` goes
-    0 -> 1 and a `.kv` file is left on disk. That entry is worse than a leak -- `_track_written`
-    indexes it, so a lookup can match a prefix the tier was told to forget, and after an
-    `invalidate()` that means KV computed under the previous weights.
+    * `still_pending = table.get(k) is blob` keeps the dropped key OUT OF THE INDEX. Remove it
+      and `ssd_entries` goes 0 -> 1: a lookup can then match a prefix the tier was told to
+      forget, and after an `invalidate()` that is KV computed under the previous weights.
+    * the `os.remove(dst)` after it removes the FILE. Remove only that and the index stays
+      clean at 0 -- what leaks is one unpaired `.kv`, which the next `_recover` drops anyway
+      because it adopts by pair. A leak until the next restart, not stale service.
+
+    So the two assertions are ordered index-first: pytest stops at the first failure, and
+    asserting the file first would make the index assertion unreachable in both mutations,
+    which is how the first version of this test claimed 0 -> 1 for a mutation that leaves it
+    at 0. Verified separately: dropping `still_pending` fails the index assert, dropping the
+    unlink fails the file assert.
 
     The window is narrow and this is the only way to open it deterministically: block inside
-    `torch.save`, drop, then release. `_flushed` afterwards, or the assertions race the daemon.
+    `torch.save`, drop, then release.
     """
     torch.manual_seed(0)
     toks = list(range(4 * BLOCK_TOKENS))
@@ -1147,13 +1154,17 @@ def test_a_drop_landing_mid_save_does_not_resurrect_the_prefix(tmp_path):
         time.sleep(0.01)
 
     left = [f for f in os.listdir(d) if f.endswith((".kv", ".st"))]
-    assert not left, (
-        f"a drop mid-save left {len(left)} files on disk: {left}. The save completed after the "
-        "unlink, so the rollback in _flush_loop is what removes them"
-    )
+    # Index first: this is the assertion for `still_pending`, and it is the one that means
+    # stale service rather than wasted bytes. Asserting the file first would shadow it --
+    # both mutations leave a file, so the index assert would never be reached.
     assert tier.stats()["ssd_entries"] == 0, (
         f"the dropped prefix is indexed again ({tier.stats()['ssd_entries']} entries), so a "
-        "lookup can match a prefix the tier was told to forget"
+        f"lookup can match a prefix the tier was told to forget; files left: {left}"
+    )
+    assert not left, (
+        f"a drop mid-save left {len(left)} files on disk: {left}. The index is clean, so this "
+        "is the unlink after `torch.save`: an unpaired blob nothing reads until the next "
+        "_recover drops it"
     )
 
 

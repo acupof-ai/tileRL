@@ -180,13 +180,24 @@ the tier. Two things had to be handled so that it stays a loss rather than a fau
   by cross-control: deleting `load_kv`'s guard fails `.kv` alone, deleting `load_state`'s
   fails `.st` alone.
 
-**A `drop()` inside that same window resurrects the prefix, and the guard against it had no
-test either.** `drop()` clears the pending tables and unlinks, but the daemon is already past
-that point holding the blob: its `torch.save` completes *after* the drop and rewrites the file
-the drop removed. `_flush_loop` re-checks `table.get(k) is blob` afterwards and unlinks again.
-Remove that rollback and the dropped entry comes back — `ssd_entries` 0 → 1 plus one orphan
-`.kv` on disk — and `_track_written` has indexed it, so a lookup can match a prefix the tier
-was told to forget; after an `invalidate()` that is KV from the previous weights.
+**A `drop()` inside that same window is handled by two guards, and neither had a test.**
+`drop()` clears the pending tables and unlinks, but the daemon is already past that point
+holding the blob: its `torch.save` completes *after* the drop and rewrites the file the drop
+removed. Two separate lines catch it, and they cost different things:
+
+| mutation | `ssd_entries` | files left | consequence |
+|---|---:|---:|---|
+| `still_pending = table.get(k) is blob` forced True | **1** | 1 | the dropped prefix is indexed, so a lookup can serve it — after `invalidate()`, KV from the previous weights |
+| `os.remove(dst)` after the save deleted | 0 | 1 | one unpaired `.kv`; the next `_recover` drops it because it adopts by pair — a leak until restart, not stale service |
+| both | 1 | 1 | as row 1 |
+
+**I first reported row 1's numbers as row 2's**, because the mutation I ran replaced the whole
+`if still_pending: ... else: remove` block rather than only the rollback, so it removed both
+guards at once and I attributed the resurrection to the unlink. Codex caught it on review of
+#132. The fix is one assertion per guard, **index first** — pytest stops at the first failure,
+and both mutations leave a file, so asserting the file first makes the index assertion
+unreachable in every arm. That ordering is exactly what let the wrong claim stand: the
+assertion whose message said "indexed again" was never executed in the run I quoted.
 
 **The gate's own first version was inert, and its negative control passed.** It waited with
 `_flushed`, which polls the pending tables — and `drop()` had just emptied them, so the helper
@@ -241,6 +252,15 @@ early `return`, a side effect next to a return value, and an `or` — what they 
 one fact needs two assertions and a plausible test satisfies one. Delete each branch and
 re-run; a suite that stays green names the gap. And assert a counter only the second path
 increments — "it did not raise" is also satisfied by never getting there.
+
+**A mutation must be as narrow as the claim it supports, and the assertion must actually
+execute.** Writing one gate for two guards, I replaced the whole `if still_pending: ... else:
+remove` block, saw the resurrection, and published it as the cost of deleting the unlink — two
+guards' worth of damage attributed to one line. Codex caught it. The mechanism that hid it is
+assertion order: both mutations leave a file on disk, the file assertion came first, and pytest
+stops there, so the assertion whose message said "indexed again" never ran in the run I quoted.
+So: mutate one line per claim, order the assertions so the one carrying the claim is reached
+first, and read which assertion actually failed rather than that the test went red.
 
 ## Results
 
