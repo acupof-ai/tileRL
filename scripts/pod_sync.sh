@@ -15,9 +15,17 @@ git -C "$ROOT" rev-parse --short HEAD > "$ROOT/.synced_commit" 2>/dev/null || tr
 REMOTE_DIR="${REMOTE_DIR:-/work/tilerl}"
 POD_NAME="${POD_NAME:-sglang-test}"
 
+# ONE prelude for both entry points. It used to live inside the `run` branch only, so a
+# plain `pod_sync.sh 'cmd'` ran the container's tilelang 0.1.8 while `run` ran 0.1.13 from
+# the uv venv on /work -- two environments behind one script. `\$PATH` stays literal so the
+# pod expands it; a missing /work/tl013 in PATH is ignored, so no `[ -d ]` test.
+POD_ENV="export PATH=/work/tl013/bin:\$PATH TILELANG_CACHE_DIR=/work/tilelang_cache"
+POD_ENV+=" PYTHONPATH=$REMOTE_DIR/src:$REMOTE_DIR/packages/tilerl-kernels/src"
+POD_ENV+=" TILERL_TARGET=cuda"
+
 # ~/bin/pod's crictl exec lacks -i (no stdin), so drive tn exec directly.
 # tilelang's JIT cache lives on /work: the container's HOME is ephemeral.
-inner="cat > /tmp/tilerl-sync.tgz && mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && find . -mindepth 1 -delete && tar xzf /tmp/tilerl-sync.tgz && export TILELANG_CACHE_DIR=/work/tilelang_cache${1:+ && $1}"
+inner="cat > /tmp/tilerl-sync.tgz && mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && find . -mindepth 1 -delete && tar xzf /tmp/tilerl-sync.tgz && $POD_ENV${1:+ && $1}"
 remote="cid=\$(crictl ps -q --name $POD_NAME --state Running 2>/dev/null | head -1); "
 remote+="if [ -z \"\$cid\" ]; then echo 'pod: container not Running' >&2; exit 1; fi; "
 remote+="crictl exec -i \$cid bash -lc $(printf '%q' "$inner")"
@@ -25,8 +33,8 @@ remote+="crictl exec -i \$cid bash -lc $(printf '%q' "$inner")"
 if [ "${1:-}" = run ]; then
   name="$2"; shift 2
   "$0" >/dev/null   # sync this checkout first; the job runs against it
-  script=$(printf 'set -x\ncd %s\n[ -d /work/tl013 ] && export PATH=/work/tl013/bin:$PATH  # uv venv: tilelang 0.1.13; the container ships 0.1.8\nexport TILELANG_CACHE_DIR=/work/tilelang_cache PYTHONPATH=%s/src:%s/packages/tilerl-kernels/src TILERL_TARGET=cuda\n%s\necho DONE_%s\n' \
-                  "$REMOTE_DIR" "$REMOTE_DIR" "$REMOTE_DIR" "$1" "$name" | base64 | tr -d '\n')
+  script=$(printf 'set -x\ncd %s\n%s\n%s\necho DONE_%s\n' \
+                  "$REMOTE_DIR" "$POD_ENV" "$1" "$name" | base64 | tr -d '\n')
   pod_exec() {
     tn exec "cid=\$(crictl ps -q --name $POD_NAME --state Running | head -1); crictl exec \$cid bash -lc $(printf '%q' "$1")"
   }
