@@ -220,6 +220,40 @@ def _train_full(args: argparse.Namespace) -> None:
     return _finish(manifest, args.json)
 
 
+def _load_adapter(trainable: dict, path: str, log) -> None:
+    """Copy a saved adapter INTO the tensors add_lora just attached.
+
+    ``copy_``, never rebind: the forward reads the objects add_lora put in
+    ``model.params``, so assigning new tensors here would load an adapter the model
+    never sees and re-score the base while reporting a trained number.
+
+    Unknown or missing keys are refused rather than skipped. An adapter saved before
+    the dead-adapter fix (#98) carries ``<weight>.scale.lora_*`` and ``conv1d.lora_*``
+    keys that no longer exist, and silently dropping them would load a partial adapter
+    under a full adapter's name.
+    """
+    import torch
+    from safetensors.torch import load_file
+
+    saved = load_file(path)
+    extra, missing = set(saved) - set(trainable), set(trainable) - set(saved)
+    if extra or missing:
+        raise SystemExit(
+            f"error: {path} does not match this model's adapter\n"
+            + (f"  {len(extra)} unknown key(s), e.g. {sorted(extra)[:3]}\n" if extra else "")
+            + (f"  {len(missing)} missing key(s), e.g. {sorted(missing)[:3]}\n" if missing else "")
+            + "  hint: an adapter saved before the dead-adapter fix carries "
+              ".scale/.conv1d adapters that no longer exist; retrain or strip them")
+    with torch.no_grad():
+        for k, v in saved.items():
+            t = trainable[k]
+            if tuple(v.shape) != tuple(t.shape):
+                raise SystemExit(
+                    f"error: {path}: {k} is {tuple(v.shape)}, expected {tuple(t.shape)}")
+            t.copy_(v.to(device=t.device, dtype=t.dtype))
+    log(f"loaded adapter {sum(v.numel() for v in saved.values()) / 1e6:.1f}M params <- {path}")
+
+
 def _train_adapters(args: argparse.Namespace) -> None:
     """GRPO or OPD: LoRA on the frozen base, the engine samples, the ledger gates."""
     import torch
@@ -242,6 +276,14 @@ def _train_adapters(args: argparse.Namespace) -> None:
     thinking = (args.max_think_tokens > 0) if real else None
     params = sampling(tok, thinking, args.max_new_tokens, temperature=args.temperature,
                       max_think_tokens=args.max_think_tokens, seed=args.seed)
+    # A SEPARATE params for the eval arms. Sharing `params` scored the policy at the
+    # ROLLOUT cap, so the eval measured the cap: 38.4% with mean completion 238.7
+    # against a 256 cap, ~82.5% uncapped
+    # (errors/2026-09-04-the-eval-cap-measured-itself.md). Same prompt template and
+    # stop ids -- only the length differs, and gsm8k_accuracy forces temperature 0.
+    eval_params = sampling(tok, thinking, args.eval_max_new_tokens,
+                           temperature=args.temperature,
+                           max_think_tokens=args.max_think_tokens, seed=args.seed)
 
     # Same inputs = same run: a finished one is returned instead of retrained.
     manifest = new_manifest("train", {
@@ -294,6 +336,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
                           prefix_store=NoPrefixStore())
     # After build_engine: it materializes the params an adapter must point at.
     trainable = add_lora(model, rank=args.lora_rank)
+    if args.load_adapter:
+        _load_adapter(trainable, args.load_adapter, log)
     optimizer = AdamW(lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
 
     def evals(tag):
@@ -303,7 +347,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             manifest["metrics"][f"mmlu_{tag}_concurrency"] = conc
             log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}% (seed 0, concurrency {conc})")
         if eval_rows:
-            c, n, ntok = gsm8k_accuracy(engine, tok, eval_rows, params, concurrency=8,
+            c, n, ntok = gsm8k_accuracy(engine, tok, eval_rows, eval_params, concurrency=8,
                                         thinking=thinking)
             manifest["metrics"][f"gsm8k_{tag}"] = c
             manifest["metrics"][f"gsm8k_{tag}_tokens"] = ntok
@@ -674,6 +718,14 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="cap on <think> per rollout, forced closed past it; 0 = thinking off")
     p_train.add_argument("--eval-mmlu", type=int, default=0,
                          help="score N MMLU questions before and after (needs `datasets`)")
+    p_train.add_argument("--load-adapter",
+                         help="adapter.safetensors to copy into the LoRA tensors before "
+                         "training/eval; refuses a file whose keys do not match. With "
+                         "--steps 0 this re-scores a finished run's adapter")
+    p_train.add_argument("--eval-max-new-tokens", type=int, default=2048,
+                         help="eval generation length; independent of --max-new-tokens, "
+                         "which caps the ROLLOUTS. Scoring at the training cap measures "
+                         "the cap, not the policy")
     p_train.add_argument("--eval-gsm8k", help="JSONL {prompt, answer}: greedy exact-match "
                          "accuracy before and after")
     p_train.add_argument("--eval-n", type=int, default=100, help="rows of --eval-gsm8k to score")

@@ -103,12 +103,16 @@ def mmlu_accuracy(engine: Any, tok: Any, n: int, seed: int = 0,
 def gsm8k_accuracy(engine: Any, tok: Any, rows: list[dict], sampling: Any,
                    concurrency: int = 8, thinking: bool | None = None) -> tuple[int, int, int]:
     """(correct, total, completion tokens) on ``rows`` ({prompt, answer}), greedy
-    under the training's own ``sampling`` (stop ids, length, no-think template).
+    under ``sampling``.
 
-    The token total is here because it is the only place the cap is absent: a
-    training-step length says what the rollouts did under the training config, and
-    this says what the policy became. Length claims about a trained policy have to
-    be scored here, not on the rollouts."""
+    ``sampling`` must NOT be the rollout's: at the training cap this scores the cap
+    rather than the policy (38.4% with mean completion 238.7 against a 256 cap, and
+    ~82.5% uncapped -- errors/2026-09-04-the-eval-cap-measured-itself.md). ``cmd_train``
+    builds a separate ``eval_params`` from ``--eval-max-new-tokens`` for exactly this.
+
+    The token total is here because a training-step length says what the rollouts did
+    under the training config, and this says what the policy became. Length claims
+    about a trained policy have to be scored here, not on the rollouts."""
     from dataclasses import replace
 
     from .prompt import render_chat
