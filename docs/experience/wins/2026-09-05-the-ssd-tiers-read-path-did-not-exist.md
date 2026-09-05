@@ -273,7 +273,12 @@ pytest stops at the first failure — so the assertion whose message said "index
 executed** in the run I cited as its proof. I had already written the rule "run every control in
 the failing state and confirm it fails", and I did; the control failed; the claim was still
 untested. So: put the discriminating assertion first, keep anything that fails in every arm
-after it, and read the assertion text in the failure output rather than the exit status.
+after it, and read the assertion text in the failure output rather than the exit status. Filed as
+instance 8 in
+[errors/2026-09-05-a-control-that-cannot-fail.md](../errors/2026-09-05-a-control-that-cannot-fail.md),
+which is where the next person looks for this shape — the other seven there are controls that
+passed when they should have failed, so that file taught "run it in the failing state", which is
+exactly what was not enough here.
 
 ## Results
 
