@@ -80,14 +80,29 @@ def test_grpo_loop_records_one_row_per_rollout():
                           decode_graph=False, prefix_store=NoPrefixStore())
     rollouts: list = []
     steps, group = 2, 2
-    list(grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(len(c)), steps, backend,
+    # The reward must DIFFER within a group or every advantage is 0.0 and a
+    # misaligned pairing is unobservable: tiny never emits EOS, so `len(c)` is
+    # max_new_tokens for every rollout and the group ties. Key on the first token
+    # instead, which the per-rollout seed varies.
+    list(grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(c[0]), steps, backend,
                    AdamW(lr=0.0), group=group, sampling=SamplingParams(max_new_tokens=4),
                    per_rollout=rollouts))
     assert len(rollouts) == steps * group, f"{len(rollouts)} rows for {steps}x{group} rollouts"
     assert [r["step"] for r in rollouts] == [1, 1, 2, 2]
     assert sorted({r["g"] for r in rollouts}) == list(range(group))
-    # The reward IS the length here, so the pairing is checkable rather than opaque.
-    assert all(r["reward"] == r["tokens"] for r in rollouts), rollouts
+    assert all(r["tokens"] == 4 for r in rollouts), rollouts
+    # The advantage must be the one THIS row's reward earned, not another row's:
+    # a misaligned zip would still write the right count of rows with the right
+    # step and g, and every assertion above would pass.
+    seen_signal = False
+    for s in (1, 2):
+        rows = [r for r in rollouts if r["step"] == s]
+        want = group_advantages([r["reward"] for r in rows], group)
+        assert np.allclose([r["advantage"] for r in rows], want), rows
+        seen_signal = seen_signal or np.abs(want).max() > 1e-8
+    assert seen_signal, (
+        f"every group tied, so the advantage assertion compared zeros and could not "
+        f"catch a misaligned pairing: {rollouts}")
 
 
 def test_group_advantages():
