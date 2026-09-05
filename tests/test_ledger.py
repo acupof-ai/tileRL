@@ -80,7 +80,8 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
     code = _train(argv)
     (m,) = list_runs(tmp_path / "runs")
     assert [g["name"] for g in m["gates"]] == [
-        "reward_rises", "mmlu_holds", "gsm8k_improves", "groups_untied", "ce_falls"]
+        "rollouts_within_cap", "reward_rises", "mmlu_holds", "gsm8k_improves",
+        "groups_untied", "ce_falls"]
     # ce_falls carries no ce_first on the RL path, so it passes vacuously here.
     assert m["metrics"].get("ce_first") is None
     assert code == (0 if gates_pass(m) else 1)
@@ -95,6 +96,56 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
 
     cmd_ledger(_build_parser().parse_args(["ledger", "--json"]))
     assert [r["id"] for r in json.loads(capsys.readouterr().out)] == [m["id"]]
+
+
+def test_periodic_rollout_guard_stops_at_first_window_crossing(tmp_path, monkeypatch, capsys):
+    from contextlib import suppress
+
+    from tilerl import cli, train
+    from tilerl.engine import Engine
+    from tilerl.ledger import gates_pass, list_runs
+
+    root = tmp_path / "runs"
+    monkeypatch.setenv("TILERL_RUNS", str(root))
+    data = tmp_path / "data.jsonl"
+    data.write_text('{"prompt": "1+1?", "answer": "2"}\n')
+    lengths = [6, 8, 10, 12, 14, 16, 18, 20, 20, 20]
+    sampled = []
+
+    def rollout(engine, ids, what):
+        n = lengths[len(sampled)]
+        sampled.append(n)
+        return {i: [4] * n for i in ids}
+
+    # Keep the real GRPO loop and CLI; only generation and the expensive update are stubbed.
+    def update(*a, timings, **kw):
+        timings.update(backward_secs=0.01, optimizer_secs=0.001)
+        return 1.0
+
+    monkeypatch.setattr(train, "_drain", rollout)
+    monkeypatch.setattr(train, "rl_step", update)
+    argv = ["train", "--rl", "--data", str(data), "--steps", "10", "--group", "2",
+            "--max-new-tokens", "20", "--lora-rank", "2"]
+    for allow, expected in ((False, 9), (True, 10)):
+        sampled.clear()
+        # No pending requests in the stubbed drain: submit only supplies unique ids.
+        requests = iter(range(20))
+        monkeypatch.setattr(Engine, "submit", lambda *a, **kw: next(requests))
+        with suppress(SystemExit):
+            cli.cmd_train(cli._build_parser().parse_args(
+                argv + (["--allow-short-rollouts"] if allow else [])))
+        assert len(sampled) == expected, "periodic guard stopped at the wrong step"
+        m = next(m for m in list_runs(root) if m["inputs"]["allow_short_rollouts"] == allow)
+        gate = next(g for g in m["gates"] if g["name"] == "rollouts_within_cap")
+        assert m["metrics"]["steps_completed"] == expected
+        assert (root / m["id"] / m["artifacts"]["adapter"]).is_file()
+        if allow:
+            assert gate["skipped"] and gate["passed"] is None
+        else:
+            assert not gate["skipped"] and gate["passed"] is False and not gates_pass(m)
+            assert (gate["value"], gate["threshold"], gate["step"]) == (17.6, 16.0, 9)
+            assert "step 9" in gate["reason"] and "--max-new-tokens is 20" in gate["reason"]
+            assert gate["reason"] in capsys.readouterr().out
 
 
 def test_sft_writes_a_manifest_and_gates_on_the_loss_falling(tmp_path, monkeypatch, capsys):
