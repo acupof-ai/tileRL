@@ -89,7 +89,11 @@ def test_grpo_length_buckets_preserve_real_token_loss_and_gradients(monkeypatch)
     from tilerl.kv_cache import NoPrefixStore
 
     prompt = [1, 2, 3]
-    for longest, width in ((300, 512), (1100, 2048)):
+    # (cap, longest, expected width). The 1200 arm is the one that catches an
+    # unclamped bucket: 1200 is not a power of two, so rounding up gives 2048 --
+    # 848 tokens of padding past a cap the completions can never exceed. At 2048
+    # the defect is invisible, because the round-up lands on the cap itself.
+    for cap, longest, width in ((2048, 300, 512), (2048, 1100, 2048), (1200, 1200, 1200)):
         comps = {i: (np.arange(n) % 100 + 4).tolist()
                  for i, n in enumerate((longest, longest // 2))}
         requests = iter(comps)
@@ -102,13 +106,13 @@ def test_grpo_length_buckets_preserve_real_token_loss_and_gradients(monkeypatch)
             m.setattr(train, "rl_step", lambda *a, **kw: captured.append((a, kw)) or 0.0)
             list(train.grpo_loop(engine, None, [prompt], lambda p, c: len(c), 1,
                                  RefBackend(), group=2,
-                                 sampling=SamplingParams(max_new_tokens=2048)))
+                                 sampling=SamplingParams(max_new_tokens=cap)))
         args, kwargs = captured[0]
         batch, adv, plens = args[1:4]
         assert batch.shape == (2, len(prompt) + width), "wrong completion bucket width"
         slens = kwargs["seq_lens"]
         np.testing.assert_array_equal(slens, [len(prompt) + len(c) for c in comps.values()])
-        full = np.pad(batch, ((0, 0), (0, 2048 - width)))
+        full = np.pad(batch, ((0, 0), (0, cap - width)))
         results = []
         for ids in (batch, full):
             losses, gradients = [], {}
@@ -217,7 +221,7 @@ def test_grpo_loop_reports_a_step_before_the_run_ends():
     gen = grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(len(c)), 3, backend,
                     AdamW(lr=1e-3), group=2, sampling=SamplingParams(max_new_tokens=4))
     first = next(gen)
-    assert len(first) == 6, first  # reward, ce, secs, tied, mean completion tokens, timings
+    assert len(first) == 7, first  # reward, ce, secs, tied, mean tokens, timings, bucket width
     assert sum(1 for _ in gen) == 2, "every step must be yielded, not just the first"
 
 
