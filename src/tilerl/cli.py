@@ -453,7 +453,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
     from .engine import build_engine
     from .eval import gsm8k_accuracy, mmlu_accuracy, mmlu_questions
     from .kv_cache import NoPrefixStore
-    from .ledger import commit, file_hash, new_manifest, read_manifest, runs_root
+    from .ledger import commit, file_hash, new_manifest, read_manifest, runs_root, write_manifest
     from .model import add_lora
     from .prompt import render_chat, sampling
     from .tokenizer import get_tokenizer
@@ -617,6 +617,14 @@ def _train_adapters(args: argparse.Namespace) -> None:
         hist = []
         rollouts: list = []
         written = 0
+        # The rows are useless without the run they came from: a killed run reached
+        # no `write_manifest` at all (that lives in `_finish`), so `tilerl ledger`
+        # returned [] and the only thing on disk was rollouts.jsonl -- which carries
+        # no model, cap, group, lr, seed or commit, and the directory name is a hash
+        # of those and cannot be inverted. Measured on cpu: SIGTERM at step 6 left 12
+        # rows and no manifest. One write before the loop makes the run identifiable;
+        # `_finish` overwrites it with the finished one.
+        write_manifest(runs_root(), manifest)
         for i, (r, ce, secs, tied, ntok, timings, width) in enumerate(
                 train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
                                     group=args.group, sampling=params, seed=args.seed,

@@ -37,6 +37,23 @@ and reaches the manifest through `_finish`, so a SIGTERM'd run has the data and
 not the number; recompute it from `rollouts.jsonl`. A run stopped by the drift
 guard exits through `_finish` and reports it normally.
 
+**A probe found that understated it: the manifest did not exist at all.** Both of
+us reasoned from the code that a killed run loses `length_reward_r`. Signalling a
+real training process by pid says worse — `write_manifest` is only reached inside
+`_finish`, so a SIGTERM at step 6 left **12 rows and no `manifest.json`**, and
+`tilerl ledger --json` printed `[]` with rc 0. `list_runs` globs
+`*/manifest.json`, so the run was not in the ledger at all, and `rollouts.jsonl`
+carries `step/g/tokens/reward/advantage` and no model, cap, group, lr, seed or
+commit — the run id is a hash of those and cannot be inverted. The rows survived
+and nothing could say which run made them.
+
+One `write_manifest` before the loop fixes it; `_finish` overwrites it with the
+finished manifest. Re-probed: `list_runs` **0 → 1**, and the manifest on disk
+carries `model`, `commit`, `group`, `max_new_tokens` and the rest of the inputs.
+The gate samples `len(list_runs(root))` at the start of every step and asserts it
+is never 0; removing the pre-loop write turns it red with `list_runs saw
+[0, 0, 0, 0, 0, 0, 0, 0, 0]`.
+
 `manifest["metrics"]["length_reward_r"]` is the Pearson r of (tokens, reward)
 pooled over **within-group deviations**. Centering per group is the whole
 mechanism: a hard prompt shifts both its lengths and its rewards, and that shift
@@ -91,6 +108,11 @@ to disk — an aggregate computed at the source cannot be un-averaged later, and
 the claim will get restated from the only axis the data supports. Report the
 centered statistic next to the pooled one when both exist; their disagreement is
 the finding.
+
+**And send the signal.** Two sessions read the same code and agreed that a killed
+run loses one metric. It loses the whole manifest, and the ledger cannot see the
+run at all. Reading a code path tells you what it does when reached; only killing
+a real process tells you what is on disk when it is not.
 
 ## Results
 

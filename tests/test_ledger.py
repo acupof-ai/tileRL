@@ -112,6 +112,7 @@ def test_periodic_rollout_guard_stops_at_first_window_crossing(tmp_path, monkeyp
     lengths = [6, 8, 10, 12, 14, 16, 18, 20, 20, 20]
     sampled = []
     on_disk = []
+    identified = []
 
     def rollout(engine, ids, what):
         # Sampled at the START of each step, so it reads what earlier steps wrote:
@@ -119,6 +120,11 @@ def test_periodic_rollout_guard_stops_at_first_window_crossing(tmp_path, monkeyp
         # mid-training keeps nothing. Run 2 died on a SIGTERM at step 45.
         found = [p for p in root.glob("*/rollouts.jsonl")]
         on_disk.append(sum(len(p.read_text().splitlines()) for p in found))
+        # And the rows are useless without the run that made them: rollouts.jsonl
+        # carries no model, cap, group, lr, seed or commit, and the directory name
+        # is a hash of those. Measured before the fix: a SIGTERM at step 6 left 12
+        # rows, no manifest, and `tilerl ledger --json` printed [].
+        identified.append(len(list_runs(root)))
         n = lengths[len(sampled)]
         sampled.append(n)
         return {i: [4] * n for i in ids}
@@ -135,6 +141,7 @@ def test_periodic_rollout_guard_stops_at_first_window_crossing(tmp_path, monkeyp
     for allow, expected in ((False, 9), (True, 10)):
         sampled.clear()
         on_disk.clear()
+        identified.clear()
         # No pending requests in the stubbed drain: submit only supplies unique ids.
         requests = iter(range(20))
         monkeypatch.setattr(Engine, "submit", lambda *a, **kw: next(requests))
@@ -146,6 +153,11 @@ def test_periodic_rollout_guard_stops_at_first_window_crossing(tmp_path, monkeyp
         # arm 1's rows, still there when arm 2 runs; the deltas are what this asserts.
         assert [n - on_disk[0] for n in on_disk] == [2 * i for i in range(expected)], (
             f"rollout rows are not written per step: {on_disk}")
+        # This run is in the ledger from its first step, not only once it finishes.
+        # A run interrupted before `_finish` is otherwise a directory of rows nothing
+        # can attribute: `list_runs` globs */manifest.json and would return [].
+        assert min(identified) >= 1, (
+            f"the run was not in the ledger while it ran: list_runs saw {identified}")
         m = next(m for m in list_runs(root) if m["inputs"]["allow_short_rollouts"] == allow)
         gate = next(g for g in m["gates"] if g["name"] == "rollouts_within_cap")
         assert m["metrics"]["steps_completed"] == expected
