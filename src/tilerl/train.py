@@ -69,6 +69,7 @@ def _step(
     trainable: dict[str, Any] | None,
     grad_fn: Any,
     micro: int = 0,
+    timings: dict[str, float] | None = None,
 ) -> float:
     """Forward under a tape, ``grad_fn(logits, rows, offset)`` for the logit
     gradient, backward, clip, update. ``micro`` > 0 runs that many rows at a time
@@ -104,13 +105,19 @@ def _step(
         # Every weight gradient coexisting is 50.1 GiB on the 27B: this
         # optimizer clips per update, so each gradient is applied and dropped
         # the moment backward finalizes it.
+        t_update = time.perf_counter()
         optimizer.begin()
+        if timings is not None:
+            timings["optimizer_secs"] += time.perf_counter() - t_update
         seen = 0
 
         def _apply(tid: int, g: torch.Tensor) -> bool:
             nonlocal seen
             if tid in param_ids:
+                t_update = time.perf_counter()
                 optimizer.step_one(by_id[tid], g)
+                if timings is not None:
+                    timings["optimizer_secs"] += time.perf_counter() - t_update
                 seen += 1
             return True
 
@@ -130,9 +137,12 @@ def _step(
             # fp32 accumulation: bf16 adapter grads summed over a group lose bits.
             acc[tid] = prev.add_(grads[tid]) if prev is not None else grads[tid].float()
     assert acc, _NO_GRAD
+    t_update = time.perf_counter()
     norm = clip_grad_norm(acc, 1.0)
     if math.isfinite(norm):
         optimizer.step(params.values(), acc)
+    if timings is not None:
+        timings["optimizer_secs"] += time.perf_counter() - t_update
     return total
 
 
@@ -174,6 +184,7 @@ def rl_step(
     trainable: dict[str, Any] | None = None,
     seq_lens: Any = None,
     micro: int = 0,
+    timings: dict[str, float] | None = None,
 ) -> float:
     """One policy-gradient step: the causal-CE gradient scaled per row by the
     advantage and zeroed on prompt/padding positions. ``input_ids`` [B,T] is
@@ -181,6 +192,9 @@ def rl_step(
     (default T). Returns the batch cross-entropy as a diagnostic.
     # ponytail: single-update REINFORCE-with-baseline; add the PPO ratio+clip
     # when a rollout is reused for more than one step."""
+    t0 = time.perf_counter()
+    if timings is not None:
+        timings["optimizer_secs"] = 0.0
     ids = np.asarray(input_ids, dtype=np.int64)
     b, t = ids.shape
     adv = torch.as_tensor(np.asarray(advantages, dtype=np.float32))
@@ -205,7 +219,11 @@ def rl_step(
         # scored count so prompt, padding and micro-batch size cost nothing.
         return loss, grad.mul_(w.unsqueeze(-1) * (bm * (tm - 1) / max(n, 1.0)))
 
-    return _step(model, ids, backend, optimizer, trainable, grad_fn, micro)
+    loss = _step(model, ids, backend, optimizer, trainable, grad_fn, micro, timings)
+    if timings is not None:
+        # Includes the recorded forward, loss and gradient accumulation.
+        timings["backward_secs"] = time.perf_counter() - t0 - timings["optimizer_secs"]
+    return loss
 
 
 def _require_on_policy(
@@ -264,7 +282,7 @@ def grpo_loop(
     tiebreak: Any = None,
     recapture_graph: bool = False,
     clear_prefix: bool = False,
-) -> list[tuple[float, float, float, float]]:
+) -> Iterator[tuple[float, float, float, float, float, dict[str, float]]]:
     """GRPO: sample ``group`` completions per prompt in one engine batch, score
     them with ``reward_fn(prompt_ids, completion_ids) -> float``, take one
     policy-gradient step on the group-normalized advantages, in ``micro`` rows
@@ -273,7 +291,7 @@ def grpo_loop(
     cache and decode graph off, and rollouts are drawn untruncated so the
     sampler is the policy the step differentiates. Yields
     ``(mean reward, cross-entropy, seconds, tied-group fraction, mean completion
-    tokens)`` as each step finishes, so a 100-step run reports progress instead of
+    tokens, phase seconds)`` as each step finishes, so a 100-step run reports progress instead of
     printing at the end. The token count is there because ``tied_group_fraction``
     cannot fall and be bad: ``--judge`` reorders inside the all-pass subgroup by
     construction, so it drives ties toward 0 whether or not it ranks anything real.
@@ -297,6 +315,7 @@ def grpo_loop(
             for g in range(group)
         ]
         done = _drain(engine, ids, "grpo_loop rollout")
+        timings = {"rollout_secs": time.perf_counter() - t0}
         comps = [done[i] for i in ids]
         rewards = [float(reward_fn(prompt, c)) for c in comps]
         # A binary reward stops producing gradient once the policy clears the task.
@@ -325,14 +344,14 @@ def grpo_loop(
         plens = np.full(group, len(prompt), dtype=np.int64)
         slens = np.array([len(prompt) + len(c) for c in comps], dtype=np.int64)
         ce = rl_step(model, batch, adv, plens, backend, optimizer, trainable=trainable,
-                     seq_lens=slens, micro=micro)
+                     seq_lens=slens, micro=micro, timings=timings)
         if recapture_graph or clear_prefix:
             # After the update, not before the next rollout: a caller that stops
             # iterating must not leave the engine holding graphs traced on weights
             # that no longer exist.
             engine.invalidate_weights()
         yield (float(np.mean(rewards)), ce, time.perf_counter() - t0, tied,
-               float(np.mean([len(c) for c in comps])))
+               float(np.mean([len(c) for c in comps])), timings)
 
 
 def opd_loop(

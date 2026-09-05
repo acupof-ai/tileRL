@@ -31,3 +31,8 @@ def test_recipe_runs_and_is_recorded(tmp_path, monkeypatch, capsys):
     # The CPU smoke recipe is the only one that can fail a gate here, so its verdict
     # IS the assertion: suppressing the exit is what stops it being a gate.
     assert gates_pass(m), m["gates"]
+    saved = json.loads((tmp_path / m["id"] / "manifest.json").read_text())
+    metrics = saved["metrics"]
+    phases = [metrics[k] for k in ("rollout_secs", "backward_secs", "optimizer_secs")]
+    assert all(s > 0 for s in phases), metrics
+    assert abs(sum(phases) - metrics["secs_total"]) <= 0.2 * metrics["secs_total"], metrics

@@ -320,14 +320,19 @@ def _train_adapters(args: argparse.Namespace) -> None:
         tiebreak = _judge_tiebreak(engine, tok, params) if args.judge else None
 
         hist = []
-        for i, (r, ce, secs, tied, ntok) in enumerate(
+        for i, (r, ce, secs, tied, ntok, timings) in enumerate(
                 train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
                                     group=args.group, sampling=params, seed=args.seed,
                                     trainable=trainable, micro=args.micro,
                                     tiebreak=tiebreak)):
             hist.append((r, ce, secs, tied, ntok))
+            for phase, elapsed in timings.items():
+                manifest["metrics"][phase] = manifest["metrics"].get(phase, 0.0) + elapsed
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
-                f"tied {tied:.2f}  tok {ntok:.0f}  {secs:.1f}s", flush=True)
+                f"tied {tied:.2f}  tok {ntok:.0f}  {secs:.1f}s  "
+                f"rollout {timings['rollout_secs']:.3f}s  "
+                f"backward {timings['backward_secs']:.3f}s  "
+                f"optimizer {timings['optimizer_secs']:.6f}s", flush=True)
         # Windowed means, not hist[0] vs hist[-1]: per-step reward moves with the
         # sampled prompt, so two single steps compare two draws, not two policies
         # (tests/test_rl.py::test_grpo_loop_raises_reward uses the same windows).
@@ -337,6 +342,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             reward_last=statistics.mean(h[0] for h in hist[-w:]),
             ce_last=hist[-1][1],
             secs_per_step_median=statistics.median(h[2] for h in hist),
+            secs_total=sum(h[2] for h in hist),
             tied_group_fraction=statistics.mean(h[3] for h in hist),
             # --judge drives tied_group_fraction toward 0 by construction, so it
             # cannot report a bad judge. Length is the signal that can.
