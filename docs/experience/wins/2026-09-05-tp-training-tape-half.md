@@ -75,6 +75,20 @@ TP still forfeits the decode graph, which is worth 2.16x on the RL step
 ([recapture-after-update](2026-09-05-recapture-after-update.md)). TP-8 starts 2x
 behind and has to win that back.
 
+## The only CPU config hid half the code
+
+`tiny()` sets `tie_word_embeddings=True`, so its head is the replicated embedding
+table. Every branch guarded by `not cfg.tie_word_embeddings` — the vocab-parallel
+head, its fork, and the sharded cross-entropy that follows it — was therefore
+**unreachable from CI**, on the only config this machine can run. The first
+version of this gate passed with 54 tensors and a control that failed, and still
+covered none of the path the 27B takes.
+
+The gate now runs both layouts: 54 tensors tied, 56 untied, and `--no-fork` fails
+on both. Two of us hit this from opposite ends within a minute — a review of the
+gate's coverage, and a new op that turned out unreachable — which is what a
+config-level hole looks like rather than a test-level one.
+
 ## Rule
 
 **A gradient gate must compare the sharded tensors, not just the replicated
