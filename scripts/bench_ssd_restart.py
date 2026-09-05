@@ -6,17 +6,33 @@ serve" does not test that claim: the tilelang JIT cache is shared across starts
 (`TILELANG_CACHE_DIR=/work/tilelang_cache`), the page cache holds the weights, and both
 make the SECOND start faster whatever the tier does.
 
-So three arms, each its own server start, each with a throwaway warm-up request before
-the measured one so no JIT lands inside the timed window:
+So four server starts. The first is a throwaway whose only job is to fill the shared JIT
+cache at this prompt's shape buckets, because a compile inside a timed window is worth
+more than the tier is: measured, the cold arm paid 6 compiles and the arms after it paid
+0, which alone made an EMPTY-tier control 3.956x faster than cold. Then three arms:
 
     cold     empty spill dir            -> the number to beat
     faulted  the dir cold just filled   -> the tier's number
     control  a DIFFERENT empty dir      -> must land back at `cold`
 
-`control` is the arm that makes this a measurement. If it comes out as fast as
-`faulted`, the speedup was start order and not the tier, and the run says nothing.
+`control` must land within noise of `cold` (the check is 0.85-1.15x): it is the same arm
+order with an EMPTY tier, so anything it gains is start order rather than the tier. The
+reported win is therefore `faulted/control`, not `faulted/cold`.
 
-  python scripts/bench_ssd_restart.py --card 6 --model qwen38-27b --tokens 3000
+The check that actually caught this bench, though, is arithmetic and not an arm: divide
+the bytes a fault-in must read by the device's measured bandwidth. The first two runs came
+in FASTER than that read, which means the bytes were in page cache -- written by the cold
+arm seconds earlier, since write-through guarantees it. `_evict_cache` fsyncs and then
+fadvises each spill file between the arms (a dirty page ignores DONTNEED, so without the
+fsync only ~33% was evicted), and the verdict refuses a number whose arm is faster than
+its own disk traffic.
+
+  scripts/pod_run.sh ssdrestart 6 -- /work/tl013/bin/python -u \
+      scripts/bench_ssd_restart.py --tokens 3000
+
+The card comes from pod_run.sh, not from a flag here: this script had a --card
+that only set CUDA_VISIBLE_DEVICES, which OVERRODE the launcher's pin and sent a
+run asked for card 6 onto card 0, where another team held 28 GB.
 """
 
 from __future__ import annotations
@@ -79,11 +95,112 @@ def _serve(args, spill: str, log: str):
     ]
     if spill:
         cmd += ["--ssd-path", spill]
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(args.card),
-               TILELANG_CACHE_DIR="/work/tilelang_cache")
+    env = dict(os.environ, TILELANG_CACHE_DIR="/work/tilelang_cache")
+    # CUDA_VISIBLE_DEVICES is NOT set here: pod_run.sh already pins the card, and setting
+    # it again overrode that -- the first run of this script asked for card 6 through the
+    # launcher and landed on card 0, which another team was holding with 28 GB.
     with open(log, "wb") as f:
         return subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env,
                                 cwd=args.repo)
+
+
+def _compiles(log: str) -> int:
+    try:
+        with open(log, encoding="utf-8", errors="replace") as f:
+            return sum("begins to compile" in line for line in f)
+    except OSError:
+        return -1
+
+
+def _entry_bytes(spill: str) -> int:
+    """Bytes a single fault-in reads: the servable .kv (second largest) plus its .st."""
+    d = os.path.join(spill, "tilerl_kvtier")
+    if not os.path.isdir(d):
+        return 0
+    kvs = sorted((os.path.getsize(os.path.join(d, f)), f)
+                 for f in os.listdir(d) if f.endswith(".kv"))
+    if len(kvs) < 2:
+        return 0
+    size, name = kvs[-2]
+    st = os.path.join(d, name[:-3] + ".st")
+    return size + (os.path.getsize(st) if os.path.exists(st) else 0)
+
+
+def _matched_tokens(spill: str) -> int:
+    """Tokens covered by the entry that can actually serve, from the spill file sizes.
+
+    Every .kv is a whole number of publish units, so the sizes give the coverage ladder
+    directly. The LARGEST one is the whole prompt and cannot serve -- `_match_prefix`
+    treats a full-length hit as a miss -- so the servable one is the second largest.
+    Returns 0 when there is no second entry, which makes the ceiling check say so instead
+    of dividing by zero.
+    """
+    d = os.path.join(spill, "tilerl_kvtier")
+    sizes = sorted(
+        os.path.getsize(os.path.join(d, f))
+        for f in os.listdir(d) if f.endswith(".kv")
+    ) if os.path.isdir(d) else []
+    if len(sizes) < 2:
+        return 0
+    return round(sizes[-2] / sizes[0]) * _UNIT_TOKENS
+
+
+#: Tokens per publish unit, derived from the size ladder rather than assumed: the smallest
+#: spill was 33557933 B and the largest 179316717 B = 5.343x it, which lands on the whole
+#: 2729-token prompt (171 blocks x 16 = 2736 slots) only at 512 tokens per unit.
+_UNIT_TOKENS = 512
+
+
+def _evict_cache(spill: str) -> str:
+    """Drop the spill files from the host page cache, per file, with POSIX_FADV_DONTNEED.
+
+    Without this the bench cannot see the disk at all: the cold arm WRITES the spill and
+    the faulted arm reads it seconds later, so write-through puts every byte in page
+    cache by construction. Measured 2026-09-05 -- the faulted arm came in at 1.168 s
+    while reading its own 309.6 MiB off this device takes 1556 ms at 198.9 MiB/s, i.e.
+    the arm was faster than its own disk traffic and therefore never did it.
+
+    fadvise on the individual files, NOT `/proc/sys/vm/drop_caches`: this host is shared
+    and dropping the whole cache evicts other teams' weights. (I did that once before
+    reasoning about it.)
+    """
+    d = os.path.join(spill, "tilerl_kvtier")
+    if not os.path.isdir(d):
+        return "no spill dir"
+    n = 0
+    for name in sorted(os.listdir(d)):
+        if not name.endswith((".kv", ".st")):
+            continue
+        # fsync FIRST. POSIX_FADV_DONTNEED silently skips a dirty page, and these files
+        # were written seconds ago by the tier's flush daemon, so most of them are dirty.
+        # Measured 2026-09-05: without the fsync the evict removed only ~33% of the bytes
+        # (arm delta 0.564 s against a full cold read's 1.684 s) and the arm came in at
+        # 1.732 s, FASTER than the 1.756 s its own bytes take off this device -- the tell
+        # that the eviction was partial.
+        fd = os.open(os.path.join(d, name), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            n += 1
+        finally:
+            os.close(fd)
+    # Verify rather than trust: read 4 MiB of the servable entry and time it. Cached
+    # pages come back at GiB/s, disk at ~180 MiB/s, so this separates them by 20x.
+    probe = _probe_mib_s(d)
+    return f"evicted {n} files, probe {probe:.0f} MiB/s"
+
+
+def _probe_mib_s(d: str) -> float:
+    """Read bandwidth of the first 4 MiB of the largest spill file, right now."""
+    kvs = sorted((os.path.getsize(os.path.join(d, f)), f)
+                 for f in os.listdir(d) if f.endswith(".kv"))
+    if not kvs:
+        return 0.0
+    t0 = time.monotonic()
+    with open(os.path.join(d, kvs[-1][1]), "rb") as fh:
+        n = len(fh.read(1 << 22))
+    el = time.monotonic() - t0
+    return (n / 2**20) / el if el else 0.0
 
 
 def _arm(args, name: str, spill: str, prompt: str) -> dict:
@@ -91,11 +208,6 @@ def _arm(args, name: str, spill: str, prompt: str) -> dict:
     proc = _serve(args, spill, log)
     try:
         _wait_up(args.port, proc, args.boot_s)
-        # Warm-up: JIT and any first-call allocation land here, not in the measured window.
-        # A different short prompt, so it publishes nothing the measured one can match.
-        _post(f"http://127.0.0.1:{args.port}/v1/messages",
-              {"model": args.model, "max_tokens": 4,
-               "messages": [{"role": "user", "content": "hi"}]}, args.req_s)
         before = _stats(args.port)
         t0 = time.monotonic()
         r = _post(f"http://127.0.0.1:{args.port}/v1/messages",
@@ -114,6 +226,7 @@ def _arm(args, name: str, spill: str, prompt: str) -> dict:
     return {
         "arm": name,
         "wall_s": round(wall, 3),
+        "compiles": _compiles(log),
         "prompt_tokens": int(r["usage"]["input_tokens"]),
         "output_tokens": int(r["usage"]["output_tokens"]),
         "ms_per_prompt_token": round(1000 * wall / max(1, r["usage"]["input_tokens"]), 3),
@@ -130,7 +243,6 @@ def _arm(args, name: str, spill: str, prompt: str) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--card", type=int, default=6)
     ap.add_argument("--model", default="qwen38-27b")
     ap.add_argument("--python", default="/work/tl013/bin/python")
     ap.add_argument("--repo", default="/work/tilerl")
@@ -143,6 +255,11 @@ def main() -> None:
     ap.add_argument("--slots", type=int, default=3)
     ap.add_argument("--boot-s", type=float, default=900.0)
     ap.add_argument("--req-s", type=float, default=1800.0)
+    ap.add_argument("--device-mib-s", type=float, default=182.6,
+                    help="measured read bandwidth of the spill device; the verdict's "
+                         "bytes/bandwidth check uses it. Default is this pod's, from "
+                         "scripts/bench_ssd_bandwidth.py one_entry (182.6 MiB/s cold, "
+                         "4477.8 warm -- 24x apart, which is why the check works)")
     args = ap.parse_args()
 
     prompt = _prompt(args.tokens)
@@ -151,23 +268,66 @@ def main() -> None:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d, exist_ok=True)
 
+    # A throwaway start whose only job is to fill the shared TileLang JIT cache at the
+    # target prompt's shape buckets. Measured 2026-09-05: without it the cold arm paid 6
+    # compiles inside its timed window and the two arms after it paid 0, which by itself
+    # made an EMPTY-tier control 3.956x faster than cold. The compiles are per prefill
+    # shape bucket, so a short warm-up request does not reach them -- it has to be this
+    # prompt. Its spill dir is discarded so it leaves the disk tier untouched.
+    warm_dir = args.spill + "_warmup"
+    shutil.rmtree(warm_dir, ignore_errors=True)
+    os.makedirs(warm_dir, exist_ok=True)
+    _arm(args, "jitwarm", warm_dir, prompt)
+    shutil.rmtree(warm_dir, ignore_errors=True)
+
     rows = [_arm(args, "cold", main_dir, prompt)]
     print(json.dumps(rows[-1]), flush=True)
+    # The spill was just WRITTEN, so it is in page cache. Evict it, or the faulted arm
+    # measures memory and reports it as disk.
+    print(json.dumps({"evict": _evict_cache(main_dir)}), flush=True)
     rows.append(_arm(args, "faulted", main_dir, prompt))
     print(json.dumps(rows[-1]), flush=True)
     rows.append(_arm(args, "control", ctrl_dir, prompt))
     print(json.dumps(rows[-1]), flush=True)
 
     cold, faulted, control = rows
+    # The ceiling: a hit can save at most the prefill of the tokens it actually covered,
+    # at the cold arm's own per-token rate. `matched` is read off the largest SERVABLE
+    # entry, i.e. the second-largest spill -- `_match_prefix` treats a full-length hit as
+    # a miss, so the whole-prompt entry cannot be the one that served.
+    matched = _matched_tokens(main_dir)
+    ceiling_s = matched * cold["ms_per_prompt_token"] / 1000
+    saved = cold["wall_s"] - faulted["wall_s"]
+    # The check that caught this bench measuring its own page cache: divide the bytes a
+    # fault-in must read by the device's measured bandwidth. If the whole arm is faster
+    # than that read, the read did not come from the device.
+    entry_mib, dev_mib_s = _entry_bytes(main_dir) / 2**20, args.device_mib_s
+    read_s = entry_mib / dev_mib_s if dev_mib_s else 0.0
     verdict = {
+        "matched_tokens": matched,
+        "entry_mib": round(entry_mib, 1),
+        "device_mib_s": dev_mib_s,
+        "implied_read_s": round(read_s, 3),
+        "ceiling_s": round(ceiling_s, 3),
+        "saved_s": round(saved, 3),
+        "saved_over_ceiling": round(saved / ceiling_s, 3) if ceiling_s else None,
+        # The win is against the CONTROL, not against cold: control is the same arm order
+        # with an empty tier, so it carries whatever start-order effect remains.
+        "speedup_faulted_over_control": round(control["wall_s"] / faulted["wall_s"], 3),
         "speedup_faulted_over_cold": round(cold["wall_s"] / faulted["wall_s"], 3),
-        "speedup_control_over_cold": round(cold["wall_s"] / control["wall_s"], 3),
+        "control_over_cold": round(control["wall_s"] / cold["wall_s"], 3),
         "faulted_recovered_entries": faulted["ssd_recovered"],
         "faulted_ssd_hits": faulted["ssd_hits"],
         "control_ssd_hits": control["ssd_hits"],
     }
-    # The two assertions that decide whether the number means anything.
-    if faulted["ssd_hits"] < 1:
+    # The assertions that decide whether the number means anything.
+    if any(r["compiles"] for r in rows):
+        verdict["INVALID"] = (
+            "TileLang compiled inside a measured window ("
+            + ", ".join(f"{r['arm']}={r['compiles']}" for r in rows)
+            + "), so the arms differ by JIT and not by the tier"
+        )
+    elif faulted["ssd_hits"] < 1:
         verdict["INVALID"] = (
             f"the faulted arm took {faulted['ssd_hits']} SSD hits with "
             f"{faulted['ssd_recovered']} entries recovered, so whatever it measured was "
@@ -178,12 +338,22 @@ def main() -> None:
             f"the control arm took {control['ssd_hits']} SSD hits from a directory that "
             "was created empty"
         )
-    elif verdict["speedup_control_over_cold"] > verdict["speedup_faulted_over_cold"] * 0.9:
+    elif verdict["control_over_cold"] > 1.15 or verdict["control_over_cold"] < 0.85:
         verdict["INVALID"] = (
-            f"the control is {verdict['speedup_control_over_cold']}x faster than cold with "
-            f"an empty tier, against the faulted arm's "
-            f"{verdict['speedup_faulted_over_cold']}x -- the speedup is start order, not "
-            "the tier"
+            f"the control ran at {verdict['control_over_cold']}x cold with an EMPTY tier, "
+            "so arm order alone moves the wall clock and neither speedup is the tier's"
+        )
+    elif read_s and faulted["wall_s"] < read_s:
+        verdict["INVALID"] = (
+            f"the faulted arm took {faulted['wall_s']:.3f} s, less than the {read_s:.3f} s "
+            f"its own {entry_mib:.1f} MiB take at {dev_mib_s} MiB/s -- the bytes came from "
+            "page cache, not the device, so this is not the disk tier's number"
+        )
+    elif matched and saved > ceiling_s:
+        verdict["INVALID"] = (
+            f"saved {saved:.3f} s against a ceiling of {ceiling_s:.3f} s "
+            f"({matched} matched tokens x cold's {cold['ms_per_prompt_token']} ms/tok) -- "
+            "a hit cannot save more prefill than it covered, so something else moved"
         )
     print(json.dumps(verdict, indent=2), flush=True)
 
