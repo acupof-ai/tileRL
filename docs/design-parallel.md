@@ -8,16 +8,18 @@ Not greenfield, and the design has to say what it is *adding*:
 
 | shipped | where |
 |---|---|
-| `Backend.all_reduce` / `all_gather` over `torch.distributed` | `backend.py:154-173` |
+| `Backend.all_reduce` / `all_gather` / `tp_fork` | `backend.py:153`, `:164`, `:176` |
 | weight sharding, column/row split tables, fp4/fp8 alignment checks | `tensor_parallel.py` |
-| `tp_config`, `pad_vocab`, `kv_replicas` | `tensor_parallel.py:59-101` |
-| row-parallel all-reduce in the forward | `model.py:183` (`_add_via`) |
+| `pad_vocab`, `kv_replicas`, `tp_config` | `tensor_parallel.py:59`, `:65`, `:79` |
+| row-parallel all-reduce in the forward | `model.py:191` (`_add_via`) |
 | data-parallel engines, one per card | `parallel.py` |
 | NCCL cost: **21.5 µs per call, flat 20 KB → 1.3 MB** | CHANGELOG 2026-08-30 |
 
-**The gap is the backward.** `_BWD` (`autograd.py:224`) registers no collective,
-so every shipped collective is inference-only. Nothing in the tree trains sharded.
-That, plus a mesh, is this work.
+**The backward landed in #115.** `_BWD` (`autograd.py:245`) now registers
+`all_reduce`, `all_gather` and `tp_fork`, gated by `tests/tp_world2.py` on two
+gloo ranks. The sharded cross-entropy followed in #119. **What remains of this
+document is the mesh** — nothing yet selects a `(dp, tp, cp)` layout — and CP/SP
+in section (e).
 
 ## (b) Topology
 
@@ -64,7 +66,7 @@ What each layer needs, **forward → backward**, the row that does not exist yet
 |---|---|---|
 | column-parallel linear (`q/k/v/gate/up`) | none | `all_reduce(dX)` |
 | row-parallel linear (`o/down`) | `all_reduce(Y)` | none |
-| vocab-parallel `lm_head` | **sharded CE**, two scalar `all_reduce` per row | gradient stays sharded |
+| vocab-parallel `lm_head` | **sharded CE**, three scalar `all_reduce` per row | gradient stays sharded |
 | GDN scan, CP | `all_gather` of local `(A, B)` | same scan reversed |
 | ring attention, CP | `send`/`recv` ring | reversed ring |
 | SP norm/embedding | `all_gather` in, `reduce_scatter` out | mirrored |
@@ -75,33 +77,54 @@ backward one, and vice versa. Getting that backwards costs a factor of `world` i
 the gradient and is silent — which is what the gate below is for.
 
 **The `lm_head` row is the one that must not follow the pattern.** All-gathering
-logits materialises `[B, T, 248320]` in f32 — the **8.5 GiB** that failed on
-08-30. The sharded cross-entropy never forms them: each rank takes a local row max
-and a local sum-exp, two scalar `all_reduce`s per row combine them, and the
-gradient is produced already sharded. So the new `_BWD` entry is for **that op**,
-not for a `reduce_scatter` of `dlogits` that would have to exist first.
+logits materialises `[B, T, 248320]` in f32: one row is **0.947 MiB** at this
+vocab, so **1.89 GiB per rank per step at B=8, T=256** (3.79 GiB at T=512), on top
+of the weights and the tape. (Not the 08-30 OOM's 8.5 GiB, which this document
+previously cited — that was three `(3072, 248320)` tensors from `lm_head` over
+every position at B=32, a different failure.) The sharded cross-entropy never
+forms them: each rank takes a local row max and a local sum-exp, and **three**
+scalar `all_reduce`s per row combine them — max, sum-exp, and one selecting the
+target column, which lives on exactly one rank and contributes zero elsewhere.
+The gradient is produced already sharded. Shipped in #119.
 
-On the tape, the rest is two `_BWD` entries (`all_reduce` → identity, `all_gather`
-→ `reduce_scatter`) plus recording the existing calls. The tape is hand-written, so
-a collective is an op like any other; no autograd hooks.
+On the tape it took **three** entries, not two: `all_reduce` → identity,
+`all_gather` → keep this rank's chunk (a `reduce_scatter` was never needed, since
+nothing sums across ranks on that path), and **`tp_fork`** — identity forward,
+all-reduce backward — which this document did not anticipate. `tp_fork` is where
+the column-parallel dX sum lives, and it turned out to be needed for replicated
+*weights* over sharded heads (`q_norm`/`k_norm`/`gdn_norm`) as well as for
+activations. The tape is hand-written, so a collective is an op like any other; no
+autograd hooks.
 
 ## (d) Gates
 
 CPU, world=2, gloo, tiny model — runs here, no card:
 
-1. **TP-2 loss and gradients equal TP-1** to 1e-3, on the same seed and batch.
-   Not loss alone: a missing backward all-reduce leaves the loss right and the
-   gradient wrong by a factor of 2, and the loss recovers by the next step.
+1. **TP-2 loss and gradients equal TP-1**, on the same seed and batch. Not loss
+   alone: a missing backward all-reduce leaves the loss right and the gradient
+   wrong by a factor of `world`, and the loss recovers by the next step. SHIPPED
+   (`tests/tp_world2.py`): all 54 tensors compared by shipping the world=1
+   gradients through `shard_params`, since comparing only the replicated ones
+   passes with every sharded gradient wrong; both head layouts, because `tiny()`
+   ties its head and the vocab-parallel branch is the one the 27B takes. The
+   1e-3 here was a guess — the measured bf16 spread is 1.4e-4, and the shipped
+   tolerance is rtol 2e-3.
 2. **CP-2 the same**, with a sequence long enough to cross the chunk boundary —
    a CP test on one chunk exercises nothing.
 3. **Negative control for each**: delete the backward collective and the test must
    fail. Without it, "TP-2 matches TP-1" also passes for `world` silently 1.
+   `--no-fork` does this and fails on both head layouts. For the sharded CE the
+   control is a resource one — `--gather` is numerically correct and must fail
+   the memory assertion — and that assertion is a shape, not a byte count:
+   `tracemalloc` reports 80 bytes for a 4 MB torch tensor, so bytes cannot be
+   asserted on the CPU target.
 4. 27B numbers `pending-remote`.
 
 ## (e) Order
 
-1. **TP training.** Two `_BWD` entries, the mesh, the gates. Unblocks
-   full-parameter RL, which is the P3 dependency.
+1. **TP training.** DONE except the mesh: three `_BWD` entries (#115) and the
+   sharded CE (#119), both gated. The mesh is what still blocks full-parameter
+   RL, which is the P3 dependency.
 2. **CP.** GDN as the scan `S_i = A_i S_{i-1} + B_i` (composes, so one all-gather
    fixes the incoming state); ring attention for full attention, whose merge is
    the split-KV combine already shipped.
