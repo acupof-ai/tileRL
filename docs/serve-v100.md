@@ -74,7 +74,7 @@ Set in `scripts/serve_v100.sh`, each from a measurement:
 |---|---|
 | `--depth 1` | beats the shipped 3 by 1.204x at B=1 (#22/#72) |
 | `--max-batch 1` | B=8 only survives while no prefill is in flight (#42) |
-| `--max-ctx 4096` | the KV pool sizes itself from the config's 262144 otherwise |
+| `--max-ctx 32768` | the KV pool sizes itself from the config's 262144 otherwise; 32K is what fits at `--max-batch 1` |
 | `--slots 8` (default) | 16 costs 5.19x the KV pool (#65) |
 
 **`--max-ctx` is not optional on this card.** The 27B's config says 262144 tokens
@@ -122,7 +122,7 @@ export PYTHONPATH=$HOME/tilerl-git/src:$HOME/tilerl-git/packages/tilerl-kernels/
 export TILERL_QWEN38_SOURCE=$HOME/models/Qwen3.8-27B-NVFP4
 ~/venv70/bin/python -u -m tilerl.cli serve --model qwen38-27b \
     --draft $TILERL_QWEN38_SOURCE/model-00018-of-00018.safetensors --depth 1 \
-    --host 0.0.0.0 --port 8000 --max-batch 1 --max-ctx 4096
+    --host 0.0.0.0 --port 8000 --max-batch 1 --max-ctx 32768
 ```
 
 `~/venv70/bin/python` has torch 2.5.1+cu121, which matches the 535 driver.
@@ -130,45 +130,66 @@ export TILERL_QWEN38_SOURCE=$HOME/models/Qwen3.8-27B-NVFP4
 ## How long a context fits, and what buys more
 
 The limit is KV bytes, not the model. One 16-token block holds f32 K and V for 16
-full-attention layers × 4 KV heads × head_dim 256 = **2.00 MiB**, and the pool has
-to cover `max_batch` rows of the context you admit.
+full-attention layers × 4 KV heads × head_dim 256 = 2.000 MiB, **plus the draft's
+mirrored plane** — one draft layer against 16 trunk layers is another 1/16, so with
+`--depth 1` a block is **2.125 MiB** (`DraftHead.attach` mirrors `num_blocks`, and
+`_fit_blocks` charges for it). The pool covers `max_batch` rows of the context you
+admit.
 
-Headroom after weights, states and allocator slack is about **7.5 GiB**:
+`_fit_blocks` spends **two thirds** of what is free after the weights, the draft's
+weights and the GDN state pool, holding a third back for `PrefixStore` (a quarter of
+what remains) and the transient attention partials. It then returns `min(fit, cap)`,
+where `cap` is `--max-ctx × --max-batch / 16` (`cli.py:89`).
 
-| ctx | blocks @ max_batch 2 | f32 pool | fits |
+**`fit` is not the binding constraint at 32K, `cap` is.** The fit was measured
+directly (#65, `wins/2026-09-04-slots-default-8-not-16.md`) at `--slots 8` with a
+draft at `--depth 3`: **2649 blocks = 42384 tokens**. `serve_v100.sh` runs `--depth 1`,
+whose per-step verify states are smaller (they scale with `slots × width`), so its
+free memory — and therefore its fit — is at least that. 32768 tokens is 2048 blocks,
+below the fit measured in a strictly more expensive configuration.
+
+At `--max-batch 1`, which is what `serve_v100.sh` runs:
+
+| ctx | blocks (= cap) | pool @ 2.125 MiB | |
 |---:|---:|---:|:--|
-| 4096 | 512 | 1.00 GiB | yes |
-| 8192 | 1024 | 2.00 GiB | yes |
-| 16384 | 2048 | 4.00 GiB | yes |
-| 32768 | 4096 | 8.00 GiB | no, just over |
-| 65536 | 8192 | 16.00 GiB | no |
+| 4096 | 256 | 544 MiB | what shipped before; 8x left on the table |
+| 8192 | 512 | 1088 MiB | |
+| 16384 | 1024 | 2176 MiB | |
+| **32768** | **2048** | **4352 MiB** | **shipped — cap binds, fit has room** |
+| 42384 | 2649 | 5629 MiB | the measured fit at the costlier `--depth 3` |
 
-So **16K works today** with `--max-ctx 16384`, and 32K needs one of the levers
-below. `--blocks` no longer has to be passed: the pool is sized from `--max-ctx`
-and `--max-batch` together — the live server logs `blocks = 4096 tokens` for
-`--max-ctx 4096 --max-batch 1`, which is 256 blocks, half the table's row because
-the table assumes `--max-batch 8`. That multiplier is the point: dropping 8 → 2 is
-what moved the ceiling from 4K to 16K, and `--max-batch 1` doubles it again.
+Every pool figure is arithmetic from the 2.125 MiB block; the 2649-block fit is
+measured. Going past 32K means raising `--max-ctx` until `fit` starts binding, and
+that is where the number stops being predictable — the fit is read from
+`mem_get_info()` at build time, so it moves with the draft, `--slots`, and whatever
+the allocator is holding.
 
-Three levers, cheapest first:
+`--max-batch` multiplies what you *ask* for, not what you get — it scales `cap`, and
+`fit` still clamps it. At `--max-batch 2` nothing OOMs; you simply cannot hold two 32K
+rows at once, and the second request waits. `--blocks` does not have to be passed at
+all; the pool is sized from `--max-ctx` and `--max-batch`.
 
-1. **`--max-batch 1`** — halves the pool, so 32K fits. Free for one person; costs
-   concurrency you were not using.
-2. **An f16 KV pool** — halves the block to 1.00 MiB, so 32K costs 4 GiB and 64K
-   costs 8. This is the real fix and it is *not* free: the pool dtype IS the
-   attention kernel's ABI (`wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi.md` —
+Two levers past 32K, cheaper first:
+
+1. **An f16 KV pool** — halves the block to 1.06 MiB, so 64K costs 4352 MiB, exactly
+   what 32K costs today. This is the real fix and it is *not* free: the pool dtype IS
+   the attention kernel's ABI (`wins/2026-09-02-kv-pool-dtype-is-the-kernel-abi.md` —
    a bf16 pool against the f32 kernel cast the whole plane every call, 4.71
    ms/token). It needs an f16 `paged_attention_split`, its own parity run, and a
    check that f16 K/V does not degrade long-range attention. Not done.
-3. **Spilling cold blocks to disk** — trades prefix hit rate for capacity, so it
+2. **Spilling cold blocks to disk** — trades prefix hit rate for capacity, so it
    suits long documents that get re-read rather than one long generation. `KvTier`
    and a `--kv-tier <dir>` flag were written and reviewed on the sm70 branch
    (`e9d5852`, `29b58a3`) but **never reached `main`** — `e4aaf8c` ported the
-   server work and left the code behind. Not a lever until it is ported.
+   server work and left the code behind. Not a lever until it is ported. Its
+   baseline is **32768**, not the 4096 that shipped before: 8x of the headroom is
+   a flag, and folding it into offload's credit would overstate offload.
 
-The table above is arithmetic from the block size, not a measured sweep — 4K is
-the only row actually served end to end so far. Treat the rest as what to try,
-and expect the allocator to want more slack than the ideal number.
+Every row in the table is arithmetic from the block size, not a measured sweep. The
+budget is derived, not read: `25492 / 32768 MiB` resident with a 544 MiB pool is
+measured, and `mem_get_info()[0]` at the moment `_fit_blocks` runs — before the pool
+exists — is reconstructed as 7276 + 544 ≈ **7820 MiB**. That one inference is why
+32768 was picked over the arithmetic 39248.
 
 Not a lever: the GDN layers. 48 of the 64 layers are gated-delta and carry a
 fixed-size recurrent state, so their cost does not grow with context at all —

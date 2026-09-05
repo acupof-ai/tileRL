@@ -5,7 +5,10 @@
 #
 # Flags are settled measurements: --depth 1 beats the shipped 3 by 1.204x at B=1
 # (#22/#72), --slots 8 because 16 costs 5.19x the KV pool (#65), --max-batch 1
-# because B=8 only survives while no prefill is in flight (#42).
+# because B=8 only survives while no prefill is in flight (#42). --max-ctx 32768
+# because _fit_blocks returns min(fit, cap) and 32768 keeps CAP the binding one:
+# 2048 blocks against a fit measured at 2649 (#65, at the costlier --depth 3).
+# 4096 left 8x on the table.
 #
 # ponytail: bash loop, not a systemd unit -- `loginctl show-user` reports Linger=no
 # on this pod, so a --user unit dies with the ssh session.
@@ -48,7 +51,7 @@ for ((n = 0; n <= MAX_RESTARTS; n++)); do
   # foreground child, which for a healthy server is forever.
   "$ROOT/venv70/bin/python" -u -m tilerl.cli serve --model qwen38-27b \
       --draft "$CKPT/model-00018-of-00018.safetensors" --depth 1 \
-      --host 0.0.0.0 --port 8000 --max-batch 1 --max-ctx 4096 >> "$LOG" 2>&1 &
+      --host 0.0.0.0 --port 8000 --max-batch 1 --max-ctx 32768 >> "$LOG" 2>&1 &
   child=$!
   wait "$child"; rc=$?; child=
   ran=$((SECONDS - started))
