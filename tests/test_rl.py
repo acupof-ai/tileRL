@@ -82,6 +82,7 @@ def test_rl_step_ignores_padding():
 
 
 def test_grpo_length_buckets_preserve_real_token_loss_and_gradients(monkeypatch):
+    import platform
     from types import SimpleNamespace
 
     from tilerl import train
@@ -141,9 +142,16 @@ def test_grpo_length_buckets_preserve_real_token_loss_and_gradients(monkeypatch)
             results.append((losses, gradients))
         np.testing.assert_allclose(results[0][0], results[1][0], rtol=1e-5, atol=1e-6)
         assert results[0][1].keys() == results[1][1].keys()
-        for key in results[0][1]:
-            torch.testing.assert_close(results[0][1][key], results[1][1][key],
-                                       rtol=1e-5, atol=1e-6, msg=key)
+        failures = []
+        for key, actual in results[0][1].items():
+            ref = results[1][1][key]
+            if not torch.allclose(actual, ref, rtol=1e-5, atol=1e-6):
+                failures.append(f"{key}: max |d|={(actual - ref).abs().max().item():.9g}, "
+                                f"max |ref|={ref.abs().max().item():.9g}, rtol=1e-5, atol=1e-6")
+        assert not failures, (
+            f"cap={cap}, longest={longest}, width={width}; torch={torch.__version__}, "
+            f"threads={torch.get_num_threads()}, platform={platform.platform()}\n"
+            + "\n".join(failures))
 
 
 def test_micro_batching_is_the_same_update():
