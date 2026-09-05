@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import replace
 
 os.environ.setdefault("TILERL_TARGET", "cpu")
@@ -28,7 +29,13 @@ from tilerl.engine import (
     _step_seed,
     build_engine,
 )
-from tilerl.kv_cache import DramSnapshots, NoPrefixStore, PagedKvPool, PrefixStore
+from tilerl.kv_cache import (
+    DramSnapshots,
+    KvTier,
+    NoPrefixStore,
+    PagedKvPool,
+    PrefixStore,
+)
 from tilerl.model import add_lora, build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
 from tilerl.testing import RefBackend
@@ -700,6 +707,83 @@ def test_a_promotion_that_comes_back_empty_is_a_miss():
         "a hit came back with blocks and no snapshot; the caller would prefill the GDN "
         "layers from a zero state over non-zero KV"
     )
+
+
+def test_a_restart_faults_the_prefix_back_in_off_disk(tmp_path):
+    """The whole point of the SSD tier: HBM is empty after a restart, the disk is not.
+
+    A second store over the same directory and fingerprint is what a restart looks like
+    to this layer. Its pool holds no blocks and its index no entries, so without a read
+    path every lookup misses and the tier is write-only — which is what it was: `spill_kv`
+    had a caller and `load_kv`/`load_state`/`has` had none.
+
+    Three things are asserted, because two of them are the ones that fail silently:
+
+    * the fault-in **hits** (`ssd_hits == 1`) rather than the lookup walking past it;
+    * the KV comes back byte-for-byte — a `torch.save`/`load` round trip is exact, so
+      anything less means the spill reshaped or re-dtyped it;
+    * the snapshot comes back too, and is not None. Adopting blocks with a zero state
+      runs the GDN layers from zero over non-zero KV: wrong, and byte-identical in
+      output for a while.
+
+    The negative control is the fingerprint: a mismatched one must NOT hit, or the tier
+    would serve KV computed under different weights.
+    """
+    torch.manual_seed(0)
+    toks = list(range(4 * BLOCK_TOKENS))
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+
+    def store_at(fingerprint: str):
+        pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+        tier = KvTier(str(tmp_path), fingerprint, min_tokens=BLOCK_TOKENS)
+        return PrefixStore(pool, ssd=tier), pool, tier
+
+    warm, pool, tier = store_at("fp-a")
+    blocks = [pool.alloc_block() for _ in range(4)]
+    for i, b in enumerate(blocks):
+        pool.k_pool[:, b] = float(i + 1)
+        pool.v_pool[:, b] = float(-i - 1)
+    assert warm.insert(toks, blocks, (state[0].clone(), state[1].clone()))
+    _flushed(tier)
+    assert tier.stats()["ssd_entries"] == 1, (
+        f"nothing reached disk (offered={tier.offered} refusals={tier.refusals}), so the "
+        "restart below cannot hit and this test is inert"
+    )
+
+    cold, cold_pool, cold_tier = store_at("fp-a")
+    assert cold_tier.recovered == 1, f"recovery adopted {cold_tier.recovered} entries, not 1"
+    hit = cold.lookup(toks)
+    st = cold.stats()
+    assert hit is not None and st["ssd_hits"] == 1, (
+        f"a cold lookup missed with the prefix on disk: ssd_hits={st['ssd_hits']} "
+        f"ssd_faults={st['ssd_faults']} entries={st['ssd_entries']}"
+    )
+    assert hit.length == len(toks)
+    for i, b in enumerate(hit.blocks):
+        assert torch.equal(cold_pool.k_pool[:, b], torch.full_like(cold_pool.k_pool[:, b],
+                                                                   float(i + 1))), (
+            f"block {i} came back changed; a save/load round trip is byte-exact"
+        )
+    assert hit.state is not None and torch.equal(hit.state[0], state[0]), (
+        "the snapshot did not survive the disk round trip, so the blocks would be adopted "
+        "with a zero recurrent state"
+    )
+    # A re-publish of what was just faulted in must not write the bytes back.
+    assert cold_tier.offered == 0, f"the fault-in re-spilled its own read ({cold_tier.offered})"
+
+    other, _, other_tier = store_at("fp-b")
+    assert other_tier.recovered == 0 and other.lookup(toks) is None, (
+        "a different fingerprint served KV computed under other weights"
+    )
+
+
+def _flushed(tier, tries: int = 500) -> None:
+    """Wait for the flush daemon to land what is queued. Bounded, so a wedged writer
+    fails the assert that follows rather than hanging the suite."""
+    for _ in range(tries):
+        if not tier._pending and not tier._pending_st:
+            return
+        time.sleep(0.01)
 
 
 def test_prefix_hit_survives_evicting_its_own_entry():
