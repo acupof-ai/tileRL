@@ -44,6 +44,26 @@ jobs:
         run: uv run pytest -v
         env:
           TILERL_TARGET: cpu
+      - name: Distributed gates (gloo, world=2)
+        # These drive mp.spawn and own their own pass/fail, so they define no
+        # test_ function and `pytest` collects ZERO items from them -- measured.
+        # Until this step existed they ran only when someone typed them, which
+        # is the same as not having them. Each exits non-zero on failure.
+        run: |
+          set -e
+          ran=0
+          for gate in tests/tp_world2.py tests/ce_sharded_world2.py tests/mesh_world4.py; do
+            [ -f "$gate" ] || continue
+            echo "== $gate"
+            uv run python3 "$gate"
+            ran=$((ran + 1))
+          done
+          # A rename would otherwise skip every gate and pass: the step must fail
+          # when it ran nothing, not report success for doing nothing.
+          [ "$ran" -gt 0 ] || { echo "no distributed gate ran -- renamed?" >&2; exit 1; }
+          echo "distributed gates run: $ran"
+        env:
+          TILERL_TARGET: cpu
       - name: Both distributions build
         # The workspace ships two wheels; a release that cannot build one of
         # them is found at publish time otherwise.

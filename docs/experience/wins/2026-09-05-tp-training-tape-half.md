@@ -89,6 +89,13 @@ on both. Two of us hit this from opposite ends within a minute — a review of t
 gate's coverage, and a new op that turned out unreachable — which is what a
 config-level hole looks like rather than a test-level one.
 
+**"Unreachable from CI" understated it, and this entry was wrong when written.**
+The gate file drives `mp.spawn` and prints its own verdict, so it defines no
+`test_` function and `pytest` collected **zero items** from it; CI ran only
+`pytest`. So neither layout ran in CI — the whole gate, control included, ran when
+someone typed it. #121 adds the step that invokes it. Every claim above about what
+"the gate covers" describes a hand-run until then.
+
 ## Rule
 
 **A gradient gate must compare the sharded tensors, not just the replicated
