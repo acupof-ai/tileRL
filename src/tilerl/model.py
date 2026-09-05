@@ -373,11 +373,14 @@ class Model:
         hidden_out: list | None = None,
         last_only: bool | list[int] = False,
         aux_layers: tuple[int, ...] = (),
+        sharded_logits: bool = False,
     ) -> torch.Tensor:
         """``input_ids`` [B,T], ``positions`` [T] or [B,T], ``kv`` a BatchKv with
         pools attached -> logits [B,T,vocab]. ``hidden_out`` receives each
         ``aux_layers`` layer's output in order (the DFlash2 drafter's fc input),
-        then the pre-final-norm hidden state (the MTP draft head's input)."""
+        then the pre-final-norm hidden state (the MTP draft head's input).
+        ``sharded_logits`` returns this rank's vocab shard instead of gathering:
+        training pairs it with the sharded cross-entropy, serving never does."""
         cfg = self.cfg
         device = backend.device
         ids = torch.as_tensor(input_ids, dtype=torch.long, device=device)
@@ -413,8 +416,12 @@ class Model:
             x = _tp_fork(backend, x)
         head_key = cfg.head_key
         logits = self._linear(backend, x, head_key)
-        if getattr(backend, "tp_world", 1) > 1 and not cfg.tie_word_embeddings:
-            # Vocab-parallel head; a tied head is the replicated embedding table.
+        # Vocab-parallel head; a tied head is the replicated embedding table.
+        # Serving gathers to get a full row to sample from. TRAINING must not: the
+        # gather is [B, T, vocab] in f32, 1.89 GiB at B=8 T=256 on the 27B, and the sharded
+        # cross-entropy takes this rank's shard directly.
+        if (getattr(backend, "tp_world", 1) > 1 and not cfg.tie_word_embeddings
+                and not sharded_logits):
             logits = backend.all_gather(logits, dim=-1)[..., : cfg.vocab_size]
         return logits
 

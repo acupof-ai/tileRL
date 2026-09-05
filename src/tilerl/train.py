@@ -94,8 +94,12 @@ def _step(
         kv = _training_kv(model, n, t, device=backend.device)
         tape = Tape()
         with torch.no_grad(), tape:
+            # A vocab-parallel head keeps its shard here: the gathered row is
+            # [B, T, vocab] f32 (1.89 GiB at B=8 T=256 on the 27B) and
+            # cross_entropy_loss_grad reduces it sharded instead.
             logits = model.forward(chunk, np.arange(t, dtype=np.int64), kv,
-                                   RecordingBackend(backend))
+                                   RecordingBackend(backend),
+                                   sharded_logits=getattr(backend, "tp_world", 1) > 1)
         loss, grad_logits = grad_fn(logits, chunk, lo)
         if not math.isfinite(loss):
             return loss, {}
