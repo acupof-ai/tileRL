@@ -11,6 +11,14 @@ raise it if the tie fraction at step 10 is not well under 0.5.
 
 Rows whose solution has no \\boxed{} are dropped, not given an empty answer -- a
 row nothing can score is a permanent tie in every group it lands in.
+
+The prompt carries the boxing instruction, because nothing downstream adds one:
+`render_chat` (prompt.py:18) emits only ChatML with the turn left open, and the
+recipe runs thinking off. Without the instruction a no-think model boxes nothing,
+`boxed_match` returns False for every rollout, and every group ties at the FLOOR
+-- which the --level knob cannot fix, because it is not a difficulty problem.
+It lives here rather than in the renderer so the JSONL is self-contained: the
+same file scores the same way through `--data`, `--eval-gsm8k` and a re-score.
 """
 
 import argparse
@@ -20,6 +28,8 @@ import random
 from datasets import load_dataset
 
 from tilerl.math_answer import extract_boxed
+
+_INSTRUCTION = "\n\nPut your final answer in \\boxed{}."
 
 
 def main() -> None:
@@ -42,7 +52,7 @@ def main() -> None:
         if ans is None:
             dropped += 1
             continue
-        rows.append({"prompt": r["problem"].strip(), "answer": ans})
+        rows.append({"prompt": r["problem"].strip() + _INSTRUCTION, "answer": ans})
 
     order = list(range(len(rows)))
     if args.seed is not None:
