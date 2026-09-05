@@ -50,15 +50,27 @@ run 3 reports a number.
 
 ## Controls
 
-Three mutations, each red on its own assertion:
+Four mutations, each red on its own assertion:
 
 | mutation | result |
 |---|---|
 | drop the per-group centering | r = **+0.484**, "prompt difficulty survived centering" |
 | return `0.0` instead of `None` with no variance | `assert 0.0 is None` |
 | record group means instead of per-rollout rows (the run-2 defect) | "2 rows for 2x2 rollouts" |
+| reverse `adv` so each row gets another row's advantage | `[-1.0, 1.0]` against `[1., -1.]` |
 
 The third is the defect itself reintroduced, and the gate names the row count.
+
+**The fourth control passed on the first attempt, and that was the fixture's
+fault.** The row count, `step` and `g` all survive a misaligned `zip`, so the
+advantage had to be checked against `group_advantages` of the row's own reward.
+With `reward_fn = len(c)` that check compares zeros: tiny never emits EOS, so
+every completion is exactly `max_new_tokens`, the group ties, and
+`group_advantages` returns all zeros — reversing zeros changes nothing. Keying
+the reward on `c[0]`, which the per-rollout seed varies, makes the control fail.
+The test now also asserts that at least one group did **not** tie, so the same
+inertness cannot return silently: a fixture that stops producing reward variance
+fails loudly instead of passing vacuously.
 
 ## Rule
 
