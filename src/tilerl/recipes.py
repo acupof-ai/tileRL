@@ -20,6 +20,13 @@ RECIPES: dict[str, dict] = {
         micro=1, max_think_tokens=0, eval_mmlu=1000, eval_n=500, lr=1e-4,
         eval_max_new_tokens=2048,
         status="pending-remote: roadmap P1"),
+    # GSM8K ties 87% of groups at the ceiling by step 35 (errors/2026-09-03-p1-ties-
+    # at-the-ceiling.md): the task must be hard enough that a group still disagrees.
+    # Levels 3-5 only; raise the floor if the tie fraction at step 10 is not under 0.5.
+    "grpo-math-27b": dict(
+        model="qwen38-27b", rl=True, steps=100, group=8, max_new_tokens=512, lora_rank=16,
+        micro=1, max_think_tokens=0, reward="boxed", eval_mmlu=1000, eval_n=500, lr=1e-4,
+        status="pending-remote: roadmap P1, GSM8K's successor task"),
     "opd-gsm8k-27b": dict(
         model="qwen38-27b", opd=True, steps=100, max_new_tokens=256, lora_rank=16,
         eval_mmlu=1000, eval_n=500, eval_max_new_tokens=2048,

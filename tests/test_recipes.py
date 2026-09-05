@@ -67,3 +67,20 @@ def test_rl_refuses_a_data_file_with_no_rows(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.argv", ["tilerl", "train", "--rl", "--data", str(empty)])
     with pytest.raises(SystemExit, match="has no rows"):
         cli.main()
+
+
+def test_math_reward_scores_what_the_number_matcher_cannot():
+    """MATH answers are symbolic, and `--reward number` does not fail on them -- it
+    scores them WRONG, which is worse: `last_number` reads the denominator, so
+    `\\frac{1}{2}` and `\\frac{3}{2}` both parse to 2.0 and a wrong rollout is
+    rewarded. The recipe therefore carries `reward="boxed"`, and this asserts the
+    two matchers genuinely disagree -- a flag selecting an equivalent function is
+    not a fix."""
+    from tilerl.eval import answer_match
+    from tilerl.math_answer import boxed_match
+
+    wrong = r"we get \boxed{\frac{3}{2}}"
+    assert answer_match(wrong, r"\frac{1}{2}"), "last_number compares the denominators"
+    assert not boxed_match(wrong, r"\frac{1}{2}"), "boxed_match must reject it"
+    assert boxed_match(r"we get \boxed{\frac{1}{2}}", r"\frac{1}{2}")
+    assert flags("grpo-math-27b")["reward"] == "boxed"
