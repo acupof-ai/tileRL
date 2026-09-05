@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
 import sys
+import tempfile
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from .eval import MATCHERS
@@ -301,6 +304,29 @@ def _load_adapter(trainable: dict, path: str, log) -> None:
     log(f"loaded adapter {sum(v.numel() for v in saved.values()) / 1e6:.1f}M params <- {path}")
 
 
+def _before_eval_key(args, cfg, backend, eval_params, mmlu_set) -> str:
+    from .ledger import file_hash
+
+    checkpoint = None
+    if args.model == "qwen38-27b":
+        source = Path(_QWEN38_SOURCE)
+        if not source.is_dir():
+            from huggingface_hub import snapshot_download
+
+            source = Path(snapshot_download(_QWEN38_SOURCE, local_files_only=True))
+        checkpoint = [(str(p.resolve()), s.st_size, s.st_mtime_ns)
+                      for p in sorted(source.iterdir()) if p.is_file() for s in [p.stat()]]
+    inputs = {
+        "version": 1, "checkpoint": checkpoint, "config": asdict(cfg),
+        "target": backend.target, "precision": backend.precision,
+        "eval_file": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
+        "eval_n": args.eval_n, "matcher": args.reward, "sampling": asdict(eval_params),
+        "thinking": args.max_think_tokens > 0 if args.model == "qwen38-27b" else None,
+        "mmlu": mmlu_set, "concurrency": 8,
+    }
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+
 def _write_eval_rows(run_id: str, tag: str, rows: list) -> float:
     """One JSON row per problem, so two arms over the same set can be compared
     paired. Returns the mean completion length. P1 fell back to the unpaired
@@ -357,7 +383,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
     from . import train as train_mod
     from .autograd import AdamW
     from .engine import build_engine
-    from .eval import gsm8k_accuracy, mmlu_accuracy
+    from .eval import gsm8k_accuracy, mmlu_accuracy, mmlu_questions
     from .kv_cache import NoPrefixStore
     from .ledger import commit, file_hash, new_manifest, read_manifest, runs_root
     from .model import add_lora
@@ -392,6 +418,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
         # would be handed the first's finished manifest and never train.
         "tp": args.tp,
         "reward": args.reward,
+        "eval_max_new_tokens": args.eval_max_new_tokens,
+        "load_adapter": file_hash(args.load_adapter) if args.load_adapter else None,
         "eval_gsm8k": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
         "eval_n": args.eval_n})
     prev = read_manifest(runs_root(), manifest["id"])
@@ -438,27 +466,56 @@ def _train_adapters(args: argparse.Namespace) -> None:
         _load_adapter(trainable, args.load_adapter, log)
     optimizer = AdamW(lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
 
-    mean_len: dict[str, float] = {}
+    mean_len: dict[str, float | None] = {}
+    mmlu_set = mmlu_questions(args.eval_mmlu) if args.eval_mmlu else None
+    cache = None
+    if (eval_rows or mmlu_set) and not args.load_adapter and not args.draft:
+        key = _before_eval_key(args, cfg, backend, eval_params, mmlu_set)
+        cache = Path(runs_root()) / "eval-cache" / f"{key}.json"
+        manifest["eval_before_cache"] = {"key": key, "cache_hit": cache.is_file()}
 
     def evals(tag):
+        if tag == "before" and cache is not None and cache.is_file():
+            saved = json.loads(cache.read_text())
+            manifest["metrics"].update(saved["metrics"])
+            _write_eval_rows(manifest["id"], tag, saved["rows"])
+            mean_len[tag] = saved["mean_len"]
+            manifest["eval_before_cache"]["cache_hit"] = True
+            log(f"eval before: cache hit {cache.stem}")
+            return
+        rows_out: list = []
         if args.eval_mmlu:
-            c, n, conc = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=8)
+            c, n, conc = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=8,
+                                       questions=mmlu_set, per_problem=rows_out)
             manifest["metrics"][f"mmlu_{tag}"] = c / n
             manifest["metrics"][f"mmlu_{tag}_concurrency"] = conc
+            manifest["metrics"][f"mmlu_{tag}_correct"] = c
+            manifest["metrics"][f"mmlu_{tag}_total"] = n
             log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}% (seed 0, concurrency {conc})")
         if eval_rows:
-            rows_out: list = []
+            gsm_rows: list = []
             c, n, ntok = gsm8k_accuracy(engine, tok, eval_rows, eval_params, concurrency=8,
                                         thinking=thinking,
                                         match=MATCHERS[args.reward],
-                                        per_problem=rows_out)
-            mean_len[tag] = _write_eval_rows(manifest["id"], tag, rows_out)
+                                        per_problem=gsm_rows)
+            mean_len[tag] = sum(r["tokens"] for r in gsm_rows) / max(1, len(gsm_rows))
+            rows_out.extend(dict(r, dataset="gsm8k") for r in gsm_rows)
             manifest["metrics"][f"gsm8k_{tag}"] = c
             manifest["metrics"][f"gsm8k_{tag}_tokens"] = ntok
+            manifest["metrics"][f"gsm8k_{tag}_total"] = n
             # tokens/correct, not tokens: the ratio is what a length claim compares
             # on, and it cannot be improved by getting fewer questions right.
             per = f"  {ntok} tokens ({ntok / c:.1f}/correct)" if c else f"  {ntok} tokens"
             log(f"gsm8k greedy {c}/{n} = {100 * c / n:.1f}%{per}")
+        if rows_out:
+            _write_eval_rows(manifest["id"], tag, rows_out)
+        if tag == "before" and cache is not None:
+            saved = {"metrics": {k: v for k, v in manifest["metrics"].items() if "_before" in k},
+                     "rows": rows_out, "mean_len": mean_len.get(tag)}
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", dir=cache.parent, delete=False) as f:
+                json.dump(saved, f)
+            os.replace(f.name, cache)
 
     evals("before")  # LoRA B is zero at init: the base model's score
     if args.steps == 0:
