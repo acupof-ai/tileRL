@@ -28,7 +28,7 @@ from tilerl.engine import (
     _step_seed,
     build_engine,
 )
-from tilerl.kv_cache import NoPrefixStore, PagedKvPool
+from tilerl.kv_cache import NoPrefixStore, PagedKvPool, PrefixStore
 from tilerl.model import add_lora, build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
 from tilerl.testing import RefBackend
@@ -261,6 +261,34 @@ def test_blocks_used_is_what_the_engine_owns_not_what_the_pool_holds():
     ), "a request outlived the accounting: charged blocks with no live owner"
 
 
+def test_the_reread_prefix_survives_capacity_pressure():
+    """The shape both real workloads have: one conversation's prefix re-read every
+    turn while other traffic pushes the store past capacity.
+
+    FIFO evicts by insertion order, so the conversation's own entry -- the oldest
+    and the only one anybody asks for again -- goes first and every turn misses.
+    LRU keeps it because each turn touches it. Asserted as a hit COUNT rather than
+    a policy read, so it fails if `lookup` stops recording recency or `_evict_one`
+    stops taking the LRU end.
+    """
+    pool = PagedKvPool(64, num_kv_heads=2, head_dim=8, num_layers=1)
+    store = PrefixStore(pool, capacity=4)
+
+    def blocks(n):
+        return [pool.alloc_block() for _ in range(n)]
+
+    convo = list(range(1, BLOCK_TOKENS + 1))
+    store.insert(convo, blocks(1))
+    for turn in range(6):
+        # Each turn re-reads the conversation, then unrelated traffic arrives.
+        assert store.lookup(convo) is not None, f"turn {turn}: the re-read prefix was evicted"
+        store.insert(list(range(1000 + turn * 100, 1000 + turn * 100 + BLOCK_TOKENS)), blocks(1))
+
+    # 4-entry capacity, 7 inserts, so eviction ran; the re-read entry outlived it.
+    assert store.stats()["evictions"] >= 3
+    assert store.hits == 6 and store.misses == 0
+
+
 def test_prefix_cache():
     """A second prompt sharing a block-aligned prefix adopts the cached blocks."""
     engine = _build_engine(seed=99)
@@ -367,7 +395,22 @@ def test_prefix_snapshots_die_with_their_store_entry():
 
 def test_prefix_hit_survives_evicting_its_own_entry():
     """submit()'s own evict_until_free can evict the entry it just matched;
-    the snapshot must be read before that, not after."""
+    the snapshot must be read before that, not after.
+
+    Unchanged by the FIFO->LRU switch: nothing here looks the matched entry up, and
+    with no hits recorded LRU order IS insertion order, so the entry published
+    first is still the first victim.
+
+    # ponytail: this asserts eviction HAPPENED, not that it hit the matched entry
+    # -- and measured, it does not. evict_until_free needs 2 blocks; the matched
+    # entry's 2 are already retained by this request so freeing them yields
+    # nothing, and the decoy's 2 satisfy the need, so the loop stops with the
+    # matched entry still resident (probed: entries 2 -> 1, free 1 -> 3, and a
+    # re-match after eviction still returns its snapshot). Two mutations moving
+    # the snapshot read after eviction both survive. Making it bite needs the
+    # matched entry to be the only source of free blocks, which then hits
+    # "insufficient KV blocks" first -- a fixture problem, not a one-line fix.
+    """
     cfg = tiny()
     engine = build_engine(cfg, build_random(cfg, seed=9), get_backend(), num_blocks=8, num_slots=4)
 
@@ -379,7 +422,7 @@ def test_prefix_hit_survives_evicting_its_own_entry():
 
     tokens = list(range(1, 4 * BLOCK_TOKENS + 1))
     key = tuple(tokens[: 2 * BLOCK_TOKENS])
-    publish(key, 2, (engine._states.states[0].clone(), None))  # matched entry, FIFO head
+    publish(key, 2, (engine._states.states[0].clone(), None))  # matched entry, LRU head
     publish(range(9000, 9000 + 2 * BLOCK_TOKENS), 2)  # younger, unretained
     [engine._kv.alloc_block() for _ in range(engine._kv.free_blocks - 1)]
 

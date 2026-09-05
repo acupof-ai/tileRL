@@ -8,7 +8,7 @@ device, after agent-infer's ``host_paged_kv_pool.rs`` / ``prefix_store.rs``.
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -312,8 +312,12 @@ class PrefixStore:
 
     An entry maps a prefix's full hash to (token tuple, physical blocks, state
     snapshot); every hash hit is verified against the stored tokens. Insert
-    retains every block; FIFO eviction at ``capacity`` entries, ``state_bytes``
+    retains every block; LRU eviction at ``capacity`` entries, ``state_bytes``
     of snapshots, or under block pressure releases blocks and snapshot together.
+
+    LRU, not FIFO: both real workloads re-read a growing prefix -- a chat client
+    resends the whole conversation each turn, and a group of rollouts shares one
+    prompt -- so the hottest entry is the oldest one, and FIFO evicted exactly it.
     """
 
     def __init__(
@@ -328,8 +332,10 @@ class PrefixStore:
         self._state_used = 0
         self._roll = _rolling_hash
         self._entries: dict[int, list[_Entry]] = {}
-        self._by_id: dict[int, _Entry] = {}
-        self._fifo: deque[int] = deque()
+        # Recency IS the iteration order, so there is no second structure to keep in
+        # step with it: the eviction victim is the first key, and a hit moves its key
+        # to the end. A parallel deque plus dict is what this replaces.
+        self._by_id: OrderedDict[int, _Entry] = OrderedDict()
         self._next_id = 0
         self.hits = 0
         self.misses = 0
@@ -368,7 +374,6 @@ class PrefixStore:
         self._next_id += 1
         self._entries.setdefault(h, []).append(entry)
         self._by_id[entry.eid] = entry
-        self._fifo.append(entry.eid)
         for b in blocks:
             self._pool.retain(b)
         while len(self._by_id) > self.capacity or self._state_used > self.state_bytes:
@@ -387,17 +392,17 @@ class PrefixStore:
             for e in self._entries.get(prefix_hashes[i - 1], ()):
                 if e.tokens == tokens[:i]:
                     self.hits += 1
+                    self._by_id.move_to_end(e.eid)  # this is the whole of "recently used"
                     return PrefixHit(i, e.blocks, e.state)
         self.misses += 1
         return None
 
     def evict_until_free(self, blocks: int) -> None:
-        while self._pool.free_blocks < blocks and self._fifo:
+        while self._pool.free_blocks < blocks and self._by_id:
             self._evict_one()
 
     def _evict_one(self) -> None:
-        eid = self._fifo.popleft()
-        entry = self._by_id.pop(eid)
+        _, entry = self._by_id.popitem(last=False)  # least recently used
         chain = self._entries[entry.h]
         chain.remove(entry)
         if not chain:
@@ -414,7 +419,7 @@ class PrefixStore:
         ``_evict_one`` to exhaustion rather than a second teardown path -- the
         block frees and the state-bytes accounting have to match it exactly.
         """
-        while self._fifo:
+        while self._by_id:
             self._evict_one()
 
     def stats(self) -> dict[str, int]:
