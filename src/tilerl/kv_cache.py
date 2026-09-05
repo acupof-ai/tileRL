@@ -401,6 +401,10 @@ class KvTier:
         self._max_pending = max_pending
         self.offered = 0
         self.refusals = 0
+        # Stage timers: three guesses at the per-publish cost were wrong in a row, so the
+        # spill reports where its time goes instead of being guessed at a fourth time.
+        self.copy_ms = 0.0
+        self.gather_ms = 0.0
         self.over_budget = 0  # byte-budget evictions
         self._healthy = True  # daemon failure (disk full/perm) flips this to refuse
         # Size-based LRU: total on-disk bytes capped at max_bytes; the daemon
@@ -484,7 +488,13 @@ class KvTier:
 
     def _flush_loop(self) -> None:
         while True:
-            tag, blob, dst = self._q.get()
+            tag, blob, dst, events = self._q.get()
+            # The copies were launched non_blocking, so the host buffers are not valid
+            # until their events fire. Waiting HERE is the point: the prefill path pays a
+            # launch and this thread pays the transfer.
+            for ev in events:
+                if ev is not None:
+                    ev.synchronize()
             # Write only while the entry is still pending: a drop() that raced us
             # already removed it, and writing now would resurrect an evicted
             # prefix on disk (write-back invalidation → wrong tokens).
@@ -561,15 +571,47 @@ class KvTier:
             if not self._healthy or len(self._pending) >= self._max_pending:
                 self.refusals += 1
                 return False
-        k = torch.stack([pool.k_pool[:, b] for b in blocks]).contiguous().cpu()
-        v = torch.stack([pool.v_pool[:, b] for b in blocks]).contiguous().cpu()
+        # The gather is timed separately: `torch.stack` over N block slices is N slice
+        # kernels plus a device-to-device copy of the whole entry, all on the prefill
+        # stream, and it is a candidate for the residual cost.
+        tg = time.perf_counter()
+        kk = torch.stack([pool.k_pool[:, b] for b in blocks])
+        vv = torch.stack([pool.v_pool[:, b] for b in blocks])
+        self.gather_ms += (time.perf_counter() - tg) * 1000
+        k, ev_k = self._to_host(kk)
+        v, ev_v = self._to_host(vv)
         # Store tokens too: files are keyed by a 64-bit hash, so a collision would
         # otherwise load a different prefix's KV. load_kv verifies before copying.
         blob = {"k": k, "v": v, "tokens": tuple(tokens)}
         with self._lock:
             self._pending[key] = blob
-        self._q.put((key, blob, self._kv(key)))
+        self._q.put((key, blob, self._kv(key), [ev_k, ev_v]))
         return True
+
+    def _to_host(self, t: torch.Tensor):
+        """``(host tensor, event)`` -- a pinned async D2H, or a plain copy off CUDA.
+
+        `.cpu()` on a pageable destination is SYNCHRONOUS and lands mid-prefill: measured
+        on H20 card 6, write-through cost 0.925 s of a 2.041 s request, and stage timers put
+        660 ms of it in this copy against 4 ms in the block gather. So the destination is
+        pinned and the copy is `non_blocking`; the event is what the daemon waits on.
+
+        `torch.empty(pin_memory=True)` per spill, deliberately -- torch's
+        CachingHostAllocator already reuses pinned blocks, and two hand-written pools on top
+        of it both measured WORSE: keyed per (numel, dtype), 0.421 s against 0.383 s; as a
+        two-slot arena, 1.640 s, because a request's 6 publishes outrun a depth the flush
+        daemon only frees after `torch.save` and 16 of 18 spills fell back to pageable.
+        """
+        if t.device.type != "cuda":
+            return t.contiguous().cpu(), None
+        tg = time.perf_counter()
+        t = t.contiguous()
+        host = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+        host.copy_(t, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        self.copy_ms += (time.perf_counter() - tg) * 1000
+        return host, ev
 
     def load_kv(self, key: int, tokens: tuple[int, ...], blocks: Sequence[int],
                 pool: PagedKvPool) -> bool:
@@ -599,11 +641,12 @@ class KvTier:
         return True
 
     def spill_state(self, key: int, tokens: tuple[int, ...], states, windows) -> None:
-        blob = {"states": states.cpu(), "windows": None if windows is None else windows.cpu(),
-                "tokens": tuple(tokens)}
+        st, ev_s = self._to_host(states)
+        win, ev_w = (None, None) if windows is None else self._to_host(windows)
+        blob = {"states": st, "windows": win, "tokens": tuple(tokens)}
         with self._lock:
             self._pending_st[key] = blob
-        self._q.put((("st", key), blob, self._st(key)))
+        self._q.put((("st", key), blob, self._st(key), [ev_s, ev_w]))
 
     def load_state(self, key: int, tokens: tuple[int, ...]):
         # None = gone or a hash-collision mismatch — caller degrades to a miss.
@@ -668,6 +711,8 @@ class KvTier:
             "ssd_recovered": self.recovered,
             "ssd_offered": self.offered,
             "ssd_refusals": self.refusals,
+            "ssd_gather_ms": int(self.gather_ms),
+            "ssd_copy_ms": int(self.copy_ms),
             "ssd_evictions": self.over_budget,
             "ssd_pending": pending,
             "ssd_healthy": int(self._healthy),
@@ -709,7 +754,8 @@ class NoPrefixStore:
     def lookup(self, tokens: Sequence[int]) -> PrefixHit | None:
         return None
 
-    def insert(self, tokens: Sequence[int], blocks: Sequence[int], state: Any = None) -> bool:
+    def insert(self, tokens: Sequence[int], blocks: Sequence[int], state: Any = None,
+               spill: bool = True) -> bool:
         return False
 
     def evict_until_free(self, blocks: int) -> None:
@@ -771,9 +817,17 @@ class PrefixStore:
             h = self._roll(h, int(t))
         return h
 
-    def insert(self, tokens: Sequence[int], blocks: Sequence[int], state: Any = None) -> bool:
+    def insert(self, tokens: Sequence[int], blocks: Sequence[int], state: Any = None,
+               spill: bool = True) -> bool:
         """Cache ``tokens`` (covered by ``blocks``) with its ``state`` snapshot and retain
-        the blocks; True when a new entry was retained, False for a duplicate."""
+        the blocks; True when a new entry was retained, False for a duplicate.
+
+        ``spill=False`` keeps the entry in HBM but does not offer it to the disk tier. The
+        caller uses it for a publish a later one supersedes: measured on H20 card 6, one
+        2729-token prompt publishes 6 times and spills 1624 MB, of which only the longest
+        entry (325 MB) is ever read -- 5.0x the bytes for nothing, because a GDN snapshot
+        is a CONSTANT ~157 MB at every prefix length.
+        """
         tokens = tuple(int(t) for t in tokens)
         blocks = tuple(blocks)
         if len(blocks) * BLOCK_TOKENS > len(tokens):
@@ -804,7 +858,7 @@ class PrefixStore:
         # off-tick on a daemon, so a full queue refuses rather than blocking prefill. Both
         # halves go or neither -- a fault-in needs the pair. `resident` skips what is already
         # on disk, without which every fault-in writes back the bytes it just read.
-        if (self._ssd is not None and state is not None and not self._ssd.resident(h)
+        if (spill and self._ssd is not None and state is not None and not self._ssd.resident(h)
                 and self._ssd.spill_kv(h, tokens, blocks, self._pool)):
             self._ssd.spill_state(h, tokens, state[0], state[1])
         while len(self._by_id) > self.capacity or self._state_used > self.state_bytes:
