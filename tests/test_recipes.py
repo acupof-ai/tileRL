@@ -54,3 +54,16 @@ def test_recipe_runs_and_is_recorded(tmp_path, monkeypatch, capsys):
     phases = [metrics[k] for k in ("rollout_secs", "backward_secs", "optimizer_secs")]
     assert all(s > 0 for s in phases), metrics
     assert abs(sum(phases) - metrics["secs_total"]) <= 0.2 * metrics["secs_total"], metrics
+
+
+def test_rl_refuses_a_data_file_with_no_rows(tmp_path, monkeypatch):
+    """An empty --data file is the failure #99's flag check cannot see: the flag is
+    present, the path exists, and cmd_train's `or [...]` quietly substitutes random
+    prompts -- so a 100-step GRPO run trains on noise and still reports a reward."""
+    from tilerl import cli
+
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("\n  \n")  # blank lines only: `if ln.strip()` drops them all
+    monkeypatch.setattr("sys.argv", ["tilerl", "train", "--rl", "--data", str(empty)])
+    with pytest.raises(SystemExit, match="has no rows"):
+        cli.main()
