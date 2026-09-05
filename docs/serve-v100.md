@@ -41,6 +41,22 @@ purpose" off the child's exit code, and since a killed server exits 143 either w
 TERMing it exited the supervisor too and left nothing listening
 (errors/2026-09-05-the-supervisor-read-stopped-on-purpose-off-the-wrong-process.md).
 
+**But a change to `serve_v100.sh` itself needs the SUPERVISOR restarted, and the
+`=== boot N ===` line will lie to you about it.** Bash parses the whole `for` loop
+before running it, so a supervisor started 8 hours ago relaunches the child from the
+flag string it read at *its* start, while `git rev-parse` runs fresh each boot and
+stamps the new sha. Measured: `=== boot 3 … sha 6a4e737 dirty 0 ===` with
+`--max-ctx 32768` on disk, and the child's own `/proc/<pid>/cmdline` still reading
+`--max-ctx 4096`. So for a flag or supervisor change:
+
+```bash
+kill -TERM <supervisor-pid>              # both go; card free in ~10 s
+cd ~/tilerl-git && setsid nohup scripts/serve_v100.sh >/dev/null 2>&1 &
+```
+
+Verify by reading the child's `/proc/<pid>/cmdline`, never the boot line's sha — the
+sha says which commit is checked out, not which flags the running process got.
+
 ## 2. Open it
 
 The server binds `0.0.0.0`, so from this Mac the pod's address works directly:
@@ -155,14 +171,18 @@ At `--max-batch 1`, which is what `serve_v100.sh` runs:
 | 4096 | 256 | 544 MiB | what shipped before; 8x left on the table |
 | 8192 | 512 | 1088 MiB | |
 | 16384 | 1024 | 2176 MiB | |
-| **32768** | **2048** | **4352 MiB** | **shipped — cap binds, fit has room** |
+| **32768** | **2048** | **4352 MiB** | **shipped and measured — cap binds, fit has room** |
 | 42384 | 2649 | 5629 MiB | the measured fit at the costlier `--depth 3` |
 
-Every pool figure is arithmetic from the 2.125 MiB block; the 2649-block fit is
-measured. Going past 32K means raising `--max-ctx` until `fit` starts binding, and
-that is where the number stops being predictable — the fit is read from
-`mem_get_info()` at build time, so it moves with the draft, `--slots`, and whatever
-the allocator is holding.
+The 32768 row is measured, not predicted: `/health` reports `blocks_total: 2048`, and
+idle VRAM moved 22136 → **25980 MiB**, a 3844 MiB delta against the 3808 MiB the table
+predicts (1.009x). Peak during an 11019-token prefill was **27036 MiB** of 32768, so
+the transient above idle is 1056 MiB. Leaving the draft's 1/16 out of the block size
+would have predicted 3616 MiB and missed by 1.062x.
+
+Going past 32K means raising `--max-ctx` until `fit` starts binding, and that is where
+the number stops being predictable — the fit is read from `mem_get_info()` at build
+time, so it moves with the draft, `--slots`, and whatever the allocator is holding.
 
 `--max-batch` multiplies what you *ask* for, not what you get — it scales `cap`, and
 `fit` still clamps it. At `--max-batch 2` nothing OOMs; you simply cannot hold two 32K
@@ -206,6 +226,14 @@ is 30-120 s per kernel shape, and the tilelang cache (`~/.tilelang/cache`) makes
 A 4096-token prompt then takes ~36 s to first token (7.89-8.92 ms per prompt
 token) — the same figure as a warm load, coincidentally, and a different thing.
 Generation rate: the Rates section above, not the bench table.
+
+**At 32K the prompt is the cost.** Measured on the first two requests after a restart,
+11019 prompt tokens with `max_tokens 64`: **182.5 s** for the first, **163.1 s** for an
+identical second. Only the 19.4 s difference is the one-time fp4 JIT for that prefill
+shape — the 163 s is what the prompt costs every time, i.e. **14.68 ms per prompt
+token** against 8.92 at 4096. Per-token prefill grows with context; these are two
+endpoints, not a curve. Reading the 182.5 s as "the JIT cost" overstates it by 9.4x,
+and the second request is the only thing that separates them.
 
 If startup looks hung, it is compiling. `tail -f` the server's output to watch.
 
