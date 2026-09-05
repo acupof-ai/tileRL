@@ -323,8 +323,11 @@ def opd_loop(
     student takes one :func:`train_step` on prompt + completion. With
     ``trainable`` (LoRA adapters) the teacher is the same model generating
     under an EMA of the adapters, so only adapter-sized memory is duplicated."""
-    if trainable is not None:  # a frozen teacher with no adapters cannot go stale
-        _require_on_policy(teacher_engine)
+    # Unconditional: without `trainable`, train_step updates model.params (train.py:81)
+    # and the engine samples from that same object, so the no-adapter teacher is the one
+    # that goes stale fastest -- measured on tiny, 27 of the teacher's parameters changed
+    # within two steps. The exemption this replaces claimed the opposite.
+    _require_on_policy(teacher_engine)
     if optimizer is None:
         optimizer = AdamW(lr=1e-3)
     if sampling is None:
