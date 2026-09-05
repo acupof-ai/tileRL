@@ -177,6 +177,27 @@ accept-or-reject verdict**.
 non-obvious *why* in ≤1 English line, never the *what* and never which task
 added it. If the code already reads clearly, leave it bare — no comment.
 
+**Before a number leaves your session** (2026-09-05: twenty errors entries in one day,
+most of them one of these five):
+- A mechanism claim ships with the probe that tested it. Arithmetic over config dims and
+  a reading of the code are hypotheses; two of each were wrong in both directions today.
+- An arm's number needs a placement control: the same arm in another position, another
+  process, or another card. First-position JIT, an idle-card microbench (11.6 vs 161.9 ms
+  in-path) and a two-conversation sweep each produced a clean, false table.
+- A gate is green only after its negative control is red. Four vacuous gates today: a
+  capture path that silently fell back on CPU, a `callable(getattr(...))` true for every
+  engine, a monkeypatch that never reached the importlib'd copy, a one-step test that a
+  loop-entry clear satisfied.
+- Volume is not time. A pad histogram in elements says where copies are, not where
+  seconds go; only a phase-attributed profile does.
+- Before building, `git log -S<symbol> --all`: KvTier was four commits and a review pass
+  on a branch when "no such tier exists" was written on main.
+
+**An errors entry that names a fix is not a fixed bug.** The eval cap was written up on
+09-04 with its fix and scored a live run on 09-05. An entry whose fix has not landed says
+`Status: open` and is listed in [`docs/experience/OPEN.md`](docs/experience/OPEN.md); the
+PR that closes it removes the line. Review a training or serving change against that list.
+
 **Memory.** Skeletons: `errors/YYYY-MM-DD-slug.md` = Context / Root Cause /
 Fix / Rule; `wins/…` = Context / What Worked / Rule. Bench snapshots use
 [TEMPLATE-bench.md](docs/experience/wins/TEMPLATE-bench.md), never overwritten.
