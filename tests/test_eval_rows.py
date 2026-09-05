@@ -106,19 +106,34 @@ def test_the_rollout_cap_must_clear_the_measured_completion_length():
     with pytest.raises(SystemExit):
         _refuse_short_rollouts(_ROLLOUT_HEADROOM * 1000 + 1, 1000)
 
-    # And it must be CALLED: everything above passes with the call site deleted,
-    # which is a guard that exists and never runs.
-    import inspect
 
-    from tilerl import cli
+def test_training_stops_on_a_cap_the_policy_cannot_answer_in(tmp_path, monkeypatch):
+    """The guard through the CLI, because everything above it passes with the call
+    site deleted -- a guard that exists and never runs.
 
-    src = inspect.getsource(cli._train_adapters)
-    assert "_refuse_short_rollouts(" in src, (
-        "_train_adapters no longer calls the guard; the tests above only prove the "
-        "function works, not that training consults it")
-    before, after = src.split("_refuse_short_rollouts(", 1)
-    assert 'evals("before")' in before, "the guard must run AFTER the arm that measures the length"
-    assert "grpo_loop" in after or "train_mod" in after, "and BEFORE the training loop"
+    `--max-new-tokens 4` on the tiny model against a 32-token eval arm: the refusal
+    must name both numbers, and `--allow-short-rollouts` must train through it.
+    """
+    import pytest
+
+    from tilerl.cli import _build_parser, cmd_train
+
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
+    data = tmp_path / "d.jsonl"
+    data.write_text('{"prompt": "1+1?", "answer": "2"}\n{"prompt": "2+2?", "answer": "4"}\n')
+    argv = ["train", "--rl", "--data", str(data), "--eval-gsm8k", str(data), "--steps", "1",
+            "--group", "2", "--max-new-tokens", "4", "--lora-rank", "4",
+            "--eval-max-new-tokens", "32"]
+
+    with pytest.raises(SystemExit) as e:
+        cmd_train(_build_parser().parse_args(argv))
+    assert "32" in str(e.value) and "4" in str(e.value), (
+        "the refusal must name the measured length and the cap")
+
+    with pytest.raises(SystemExit) as ok:  # gate failure on a 1-step run, not the guard
+        cmd_train(_build_parser().parse_args([*argv, "--allow-short-rollouts"]))
+    assert "truncated" not in str(ok.value), (
+        "--allow-short-rollouts must reach training; it hit the refusal instead")
 
 
 def test_eval_rows_are_written_before_the_manifest_exists(tmp_path, monkeypatch):
