@@ -540,6 +540,62 @@ def test_a_chunk_end_off_the_bucket_still_restores_an_exact_state():
     )
 
 
+def test_an_intermediate_chunk_publish_stays_out_of_the_disk_tier(tmp_path):
+    """Only the LAST publish of a prompt is offered to disk, and that is the whole 8.96%.
+
+    Every chunk boundary publishes, and each publish offered to the tier costs a D2H inside
+    the prefill that made it. The intermediate ones are pure waste: the prompt-complete
+    publish covers the same tokens and more, and a GDN snapshot is a CONSTANT ~157 MB at
+    every prefix length, so on H20 card 6 a 2729-token prompt's six publishes spilled
+    1624 MB to serve one 325 MB entry — 0.925 s of a 2.041 s request against 0.180 s for the
+    last publish alone.
+
+    `spill=False` on the mid-chunk branch is that fix and nothing asserted it: dropping the
+    kwarg leaves all 328 tests passing (measured), and the regression is invisible except as
+    45.3% instead of 8.96% on a machine this suite does not run on.
+
+    The count is what carries it, so both operands are asserted: `prefix_published` proves the
+    intermediate publishes HAPPENED (otherwise `offered == 1` passes because there was only
+    ever one publish), and `ssd_offered == 1` proves only one reached the tier. The warm-up is
+    block-ALIGNED here, unlike the state test above: a ragged length never fires the
+    prompt-complete branch, so the expected offer count would be 0 and the assertion could
+    not tell "only the last publish spilled" from "nothing spilled at all". Measured at this
+    configuration: 5 publishes, 1 offer.
+    """
+    cfg = tiny()
+    params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=5)
+    rng = np.random.default_rng(7)
+    conv = rng.integers(3, 320, size=600).astype(np.int64)
+    budget, warm_to = 48, 240
+    assert warm_to % BLOCK_TOKENS == 0 and warm_to > budget, (
+        "the warm-up must be block-aligned so the prompt-complete publish fires (that is the "
+        "one offer being counted) and longer than one chunk so intermediate publishes exist"
+    )
+    engine = build_engine(
+        cfg, build_random(cfg, seed=99), get_backend(), num_blocks=64, num_slots=4,
+        max_batch=4, max_total_tokens=2048, max_num_batched_tokens=budget,
+        ssd_path=str(tmp_path), ssd_min_tokens=BLOCK_TOKENS,
+    )
+    engine.submit(conv[:warm_to], params)
+    for _ in range(300):
+        engine.step()
+        if not (list(engine._running) + list(engine._waiting)):
+            break
+    engine.poll()
+
+    st = engine.stats()
+    assert st["prefix_published"] >= 3, (
+        f"only {st['prefix_published']} publishes at a {budget}-token budget over {warm_to} "
+        "tokens; with no intermediate publish the offer count below is trivially 1"
+    )
+    assert st["ssd_offered"] == 1, (
+        f"{st['ssd_offered']} publishes reached the disk tier against "
+        f"{st['prefix_published']} in memory; every intermediate one pays a device-to-host "
+        "copy inside the prefill that made it, and the prompt-complete publish already "
+        "covers those tokens"
+    )
+
+
 def test_the_dram_tier_pays_only_above_its_session_count():
     """The tier's condition is `concurrent sessions > HBM snapshot budget`, both operands.
 
