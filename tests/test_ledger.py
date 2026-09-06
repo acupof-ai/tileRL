@@ -39,6 +39,13 @@ def test_manifest_round_trip_and_lineage(tmp_path):
     assert format_run(child).split()[3] == "killed"
     child["finished"] = now()
     assert format_run(child).split()[3] == "pass"
+    # The fourth verdict: finished with no gates DEFINED. Distinct from `skip`, which in
+    # this tree means a gate existed and was suppressed, and from `pass`, which is what
+    # `gates_pass([])` returned before -- a judgement over zero checks. `tilerl merge` is
+    # the producer; `test_merge.py` asserts it end to end.
+    gateless = dict(child, gates=[])
+    assert format_run(gateless).split()[3] == "none", format_run(gateless)
+    assert gates_pass(gateless), "gates_pass is unchanged, so exit codes are unchanged"
     assert [m["id"] for m in lineage(tmp_path, child["id"])] == [child["id"], parent["id"]]
     assert {m["id"] for m in list_runs(tmp_path)} == {parent["id"], child["id"]}
     assert read_manifest(tmp_path, "missing") is None

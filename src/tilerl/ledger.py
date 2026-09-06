@@ -88,7 +88,15 @@ def format_run(m: dict) -> str:
     # evaluated, so the only honest verdict is that the run did not reach one.
     if not m["finished"]:
         verdict = "killed"
-    elif m["gates"] and all(g.get("skipped", False) for g in m["gates"]):
+    elif not m["gates"]:
+        # A finished run with no gates DEFINED, which is not a pass: `gates_pass([])` is
+        # `all([])` = True, so every `tilerl merge` row read `pass` over zero checks.
+        # Measured on cpu with a real merge: `144b31c31f4d merge <ts> pass tensors=1`,
+        # manifest `gates: []`. `none` rather than `skip`, which in this tree means a gate
+        # existed and was suppressed (`gates_skip_after`, the drift gate under
+        # --allow-short-rollouts) -- merge defines none, so the two states stay distinct.
+        verdict = "none"
+    elif all(g.get("skipped", False) for g in m["gates"]):
         verdict = "skip"
     else:
         verdict = "pass" if gates_pass(m) else "FAIL"
