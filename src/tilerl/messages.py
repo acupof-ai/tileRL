@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field
 
 from .prompt import (
     blocks_to_text,
+    refuse_unsupported,
     render_prompt,
     render_tool_call,
     render_tools,
@@ -132,6 +133,26 @@ def _parse_tool_calls(text: str,
     return (text[:first.start()] if first else text).strip(), calls
 
 
+#: Context edits we already perform, so asking for them is not a lie. Claude Code
+#: sends clear_thinking on EVERY request, and `blocks_to_text` already drops
+#: thinking blocks when replaying history -- the edit is satisfied by
+#: construction. Measured 2026-09-06 by capturing the CLI's body:
+#: {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}.
+_SATISFIED_EDITS = ("clear_thinking",)
+
+
+def _unsatisfied_edits(cm: Any) -> list[str]:
+    """The context_management edits we do NOT already perform, named.
+
+    Refusing the whole field broke the live client: every Claude Code request
+    carries one, and it asks for behaviour we have anyway. Refuse only an edit
+    that would change what we send the model.
+    """
+    edits = (cm or {}).get("edits") if isinstance(cm, dict) else None
+    return [f"context_management edit {e.get('type', '?')}" for e in edits or []
+            if not str(e.get("type", "")).startswith(_SATISFIED_EDITS)]
+
+
 def _thinking(req: MessagesRequest) -> bool:
     """Whether the prompt opens a reasoning block.
 
@@ -167,6 +188,10 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def _run(req: MessagesRequest, rollout: str | None = None) -> tuple[dict[str, Any], int]:
+        # stop_sequences was accepted and never applied, so `stop_reason` could
+        # never be "stop_sequence" and a client waiting for one waited forever.
+        refuse_unsupported(*_unsatisfied_edits(req.context_management),
+                           stop_sequences=req.stop_sequences)
         input_ids = tokenizer.encode(_render(req))
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
@@ -235,8 +260,9 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             "model": req.model or model_name,
             "content": content,
             "stop_reason": stop_reason,
-            # stop_sequences is accepted and ignored, so the API's
-            # "stop_sequence" stop_reason never occurs here.
+            # Always null: a request carrying stop_sequences is now refused
+            # (_run), so this stop_reason cannot occur rather than merely not
+            # occurring.
             "stop_sequence": None,
             "usage": {"input_tokens": len(input_ids), "output_tokens": len(out),
                       # Claude Code reads these for context accounting; we

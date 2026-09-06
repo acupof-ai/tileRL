@@ -1,6 +1,6 @@
 # Three API surfaces matched to spec, and the SDKs found what hand-written JSON could not — cpu, 2026-09-06
 
-> Status: Shipped (chat completions + messages); V100 numbers `pending-remote`
+> Status: Shipped; the fixes verified live on the V100 2026-09-06, perf still unmeasured
 
 ## Context
 
@@ -100,12 +100,29 @@ moved outside its own spread, and this bench cannot resolve a per-request cost
 of this size. Sizing the real per-token cost needs the V100:
 `pending-remote`.
 
+## Verified live, later the same day
+
+Both fixes here were confirmed against the V100 (27B NVFP4, sm70) on merge sha
+`33a69a0` by `scripts/api_e2e.py`: **11/11 checks, 0 skipped**. The reasoning
+split holds on a real tokenizer — `<think>` is one token there, so the field
+carries 101 chars and no bare closer reaches `content` — and the 27B emits a
+well-formed `<tool_call>` on both routes, which the canned engine could only
+assume. Detail in
+[the Responses entry](2026-09-06-responses-api-and-the-construct-gap.md).
+
+The perf statement above is unchanged and still unmeasured: the live run checks
+shape, not cost.
+
 ## Not established
 
 - **No `/v1/responses`.** The route 404s; the OpenAI SDK's `responses.create`
-  is the tranche-(c) target and nothing here implements it.
+  is the tranche-(c) target and nothing here implements it. *(Superseded the same
+  day: it ships in
+  [the Responses entry](2026-09-06-responses-api-and-the-construct-gap.md).)*
 - **`tool_choice` is accepted and ignored.** It is a field on the request model
   so a client sending it is not rejected; nothing forces or forbids a call.
+  *(Superseded the same day: tranche (d) refuses it —
+  [entry](2026-09-06-accepted-and-ignored-is-a-format-lie.md).)*
 - **The chat stream does not emit `tool_calls` deltas.** A streaming client
   asking for tools gets the XML in `content` deltas. Non-stream is fixed;
   streaming tool calls are not, and no test covers them.

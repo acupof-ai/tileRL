@@ -173,3 +173,34 @@ def render_tools(tools: list[dict[str, Any]] | None, effort: str | None = None) 
     return (head + "\n\n" + body) if head else body
 
 
+
+
+def refuse_unsupported(*fields: str, **flagged: Any) -> None:
+    """Raise on any field we accept but do not honour.
+
+    A field taken and ignored is a format lie with a delayed cost: the client's
+    NEXT request is built assuming the first one honoured it, so the failure
+    surfaces a turn later and somewhere else. The same reason `blocks_to_text`
+    raises on an image block rather than dropping it.
+
+    Two forms, and the split is deliberate. Positional `fields` are already-decided
+    refusals -- the caller tested the condition and passes the exact text to name,
+    so `refuse_unsupported(*_unsatisfied_edits(cm))` can name one bad edit out of
+    several. Keyword `flagged` is `name=<truthy?>`: it fires only when the client
+    asked, and the NAME is what appears, never the value.
+
+    An earlier version let a truthy string value replace the kwarg name, which made
+    `previous_response_id="resp_1"` report "resp_1 is not supported" -- naming the
+    value instead of the field, in three arms at once. Keeping the two forms apart
+    is what makes that unrepresentable.
+
+    Fields whose absence changes nothing observable are NOT passed by callers --
+    `metadata` (echoed back) and `parallel_tool_calls` (we never emit parallel
+    calls, so one call is a valid outcome either way).
+    """
+    named = list(fields) + [name for name, asked in flagged.items() if asked]
+    if named:
+        plural = "s are" if len(named) > 1 else " is"
+        raise ValueError(
+            f"{', '.join(sorted(named))}{plural} not supported by this server: the "
+            f"request is refused rather than answered as if the field had been applied")

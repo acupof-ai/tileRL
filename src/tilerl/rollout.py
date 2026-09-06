@@ -82,6 +82,35 @@ def sandbox_settings(host: str, port: int) -> dict[str, Any]:
     }
 
 
+def capture_bodies(app: Any, path: str = "/v1/messages") -> list[dict[str, Any]]:
+    """Record every JSON request body `app` receives on `path`, in order.
+
+    The instrument for "does any real client send this field?". The V100 request
+    log records token ids, not bodies, so a question about the wire shape has to
+    be answered by capturing one -- and a field list in a doc is not a capture.
+    Measured 2026-09-06: refusing `context_management` as unsupported broke the
+    rollout gate, because Claude Code sends it on every request and asks for
+    behaviour we already had.
+
+    Returns the list the middleware appends to; drive the client, then read it.
+    """
+    seen: list[dict[str, Any]] = []
+
+    @app.middleware("http")
+    async def _capture(request: Any, call_next: Any):
+        if request.url.path == path:
+            raw = await request.body()
+            try:
+                seen.append(json.loads(raw))
+            except (ValueError, UnicodeDecodeError):
+                # A body we cannot parse is still evidence of a request; record
+                # its shape rather than dropping the observation.
+                seen.append({"_unparsed_bytes": len(raw)})
+        return await call_next(request)
+
+    return seen
+
+
 def serve_app(app: Any, host: str = "127.0.0.1", port: int | None = None,
               timeout_s: float = 60.0) -> tuple[str, threading.Thread]:
     """Run any ASGI app on a daemon thread; return (base_url, thread) once it accepts.

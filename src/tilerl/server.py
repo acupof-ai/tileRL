@@ -28,7 +28,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .messages import _parse_tool_calls, mount_messages
-from .prompt import render_prompt, sampling, split_think
+from .prompt import refuse_unsupported, render_prompt, sampling, split_think
 from .responses import mount_responses
 from .tokenizer import ByteTokenizer, Tokenizer, get_tokenizer  # noqa: F401
 from .ui_assets import _CHAT_UI, _LANDING
@@ -70,12 +70,25 @@ class ChatCompletionRequest(BaseModel):
     #: both want Anthropic's flat {name, description, input_schema}.
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
+    #: Declared only so it can be REFUSED: an undeclared field is dropped by
+    #: pydantic without a trace, so the client gets a 200 and no sign its stop
+    #: never applied. Unimplemented, not unsupported -- see
+    #: errors/2026-09-06-stop-sequences-accepted-and-never-applied.md.
+    stop: str | list[str] | None = None
 
     model_config = {"populate_by_name": True}
 
 
 #: reasoning_effort -> cap on <think> tokens; "none" switches thinking off in the prompt.
 _MAX_THINK = {"none": 0, "minimal": 128, "low": 512, "medium": 2048, "high": 8192}
+
+
+def _unsupported_choice(choice: Any) -> bool:
+    """`tool_choice` beyond auto/none, or None when it is honourable as given."""
+    if choice is None:
+        return None
+    name = choice if isinstance(choice, str) else (choice or {}).get("type")
+    return name not in ("auto", "none", None)
 
 
 def _flatten_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
@@ -174,6 +187,10 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             # a tokenizer that HAS the tag: ByteTokenizer spells it as 7 raw bytes, and its
             # bare turn is the tiny/dev path the None state exists for.
             thinking = (len(tokenizer.encode("<think>")) == 1 or None) if cap != 0 else False
+        # We render tools into the prompt and cannot force or forbid a call, so a
+        # tool_choice stronger than a hint is refused rather than echoed.
+        refuse_unsupported(tool_choice=_unsupported_choice(req.tool_choice),
+                           stop=req.stop)
         tools = _flatten_tools(req.tools)
         input_ids = tokenizer.encode(_render_chat(
             req.messages, thinking, kw.get("reasoning_effort") or req.reasoning_effort, tools
