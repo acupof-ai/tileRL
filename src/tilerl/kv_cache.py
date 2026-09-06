@@ -409,6 +409,10 @@ class KvTier:
         # spill reports where its time goes instead of being guessed at a fourth time.
         self.copy_ms = 0.0
         self.gather_ms = 0.0
+        # The save was the one stage the timers above skipped, and it is the one the
+        # "~100 ms" in five comments described: measured 641.8 ms for a 320.6 MiB entry.
+        self.save_ms = 0.0
+        self.saves = 0
         self.over_budget = 0  # byte-budget evictions
         self._healthy = True  # daemon failure (disk full/perm) flips this to refuse
         # Size-based LRU: total on-disk bytes capped at max_bytes; the daemon
@@ -430,7 +434,9 @@ class KvTier:
         # EVERY lookup reaches back. Wiping here made a cold hit impossible by construction.
         self.recovered = self._recover(marker, fingerprint)
         # Deferred write: spill_kv runs inside a decode tick, so it does only the
-        # GPU->CPU copy + enqueue; a daemon flushes the ~100ms torch.save off-tick.
+        # GPU->CPU copy + enqueue; a daemon flushes the save off-tick. Measured 641.8
+        # ms/save for a 320.6 MiB entry on a 499.6 MiB/s host SSD (`ssd_save_ms`), not
+        # the ~100 ms five comments used to assert.
         # _pending/_pending_st serve blobs not yet on disk, so resident()/load see them.
         self._pending: dict[int, dict] = {}
         self._pending_st: dict[int, dict] = {}
@@ -508,7 +514,10 @@ class KvTier:
                 if table.get(k) is not blob:
                     continue
             try:
+                ts = time.perf_counter()
                 torch.save(blob, dst)
+                self.save_ms += (time.perf_counter() - ts) * 1000
+                self.saves += 1
             except Exception:  # noqa: BLE001 - disk full / perm: stop trusting the tier
                 self._healthy = False
                 continue
@@ -717,6 +726,8 @@ class KvTier:
             "ssd_refusals": self.refusals,
             "ssd_gather_ms": int(self.gather_ms),
             "ssd_copy_ms": int(self.copy_ms),
+            "ssd_save_ms": int(self.save_ms),
+            "ssd_saves": self.saves,
             "ssd_evictions": self.over_budget,
             "ssd_pending": pending,
             "ssd_healthy": int(self._healthy),
@@ -858,8 +869,9 @@ class PrefixStore:
         self._by_id[entry.eid] = entry
         for b in blocks:
             self._pool.retain(b)
-        # Write-through: a GPU->CPU copy plus an enqueue here, with the ~100 ms torch.save
-        # off-tick on a daemon, so a full queue refuses rather than blocking prefill. Both
+        # Write-through: a GPU->CPU copy plus an enqueue here, with the save off-tick on
+        # a daemon (641.8 ms measured for a 320.6 MiB entry, `ssd_save_ms`), so a full
+        # queue refuses rather than blocking prefill. Both
         # halves go or neither -- a fault-in needs the pair. `resident` skips what is already
         # on disk, without which every fault-in writes back the bytes it just read.
         if (spill and self._ssd is not None and state is not None and not self._ssd.resident(h)
