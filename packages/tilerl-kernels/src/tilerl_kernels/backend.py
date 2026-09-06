@@ -1144,6 +1144,16 @@ class Backend:
 
     # ------------------------------------------------------------ gated delta
 
+    def _wy_eligible(self, t: int, kw: dict, chunkable: bool) -> bool:
+        # one predicate so the forward and the backward's recompute cannot disagree on the
+        # chunking
+        return (
+            chunkable
+            and ("gdn_state_scan" not in _resolve(self.precision, self.arch)
+                 or t % _WY_CHUNK == 0)
+            and self._full_rows(kw.get("seq_q_lens"), t)
+        )
+
     def linear_attn_chunk(self, q, k, v, g, beta, state, **kw):
         """Full-GDN layer core: chunkwise-WY for full-length rows, else the
         fused serial kernel on sm90, else the per-step reference."""
@@ -1154,8 +1164,7 @@ class Backend:
         if ref_chunk and chunkable:
             return reference.gdn_forward(q, k, v, g, beta, state, chunkwise=ref_chunk, **kw)
         # the WY kernels scan whole chunks; a ragged length keeps the serial kernel
-        wy = "gdn_state_scan" not in kset or t % _WY_CHUNK == 0
-        if wy and chunkable and self._full_rows(kw.get("seq_q_lens"), t):
+        if self._wy_eligible(t, kw, chunkable):
             return self._gdn_chunk_wy(q, k, v, g, beta, state, **kw)
         if t > 1 and "gdn_chunk_fused" in kset:
             return self._gdn_chunk_fused(q, k, v, g, beta, state, **kw)
@@ -1213,7 +1222,7 @@ class Backend:
         window = kw.get("conv_window")
         qn, kn, vn, gt, bt, new_window = self._gdn_prep(q, k, v, g, beta, state, **kw)
         if "gdn_state_scan" in _resolve(self.precision, self.arch):
-            core, new_state = self._gdn_wy_core(qn, kn, vn, gt, bt, state)
+            core, new_state, _ = self._gdn_wy_core(qn, kn, vn, gt, bt, state)
         else:  # no WY schedule in this cell: the chunkwise reference is the core
             core, new_state = reference.gdn_chunk_core(
                 qn, kn, vn, gt, bt, self._f32(state), chunk=_WY_CHUNK
@@ -1230,7 +1239,8 @@ class Backend:
     def _gdn_wy_core(self, q, k, v, g, beta, state, chunk: int = _WY_CHUNK):
         """fla's chunk_gated_delta_rule_fwd stage for stage: cumsum, kkt,
         solve_tril, w/u, the inter-chunk state scan, o. gdn_prep already put
-        1/sqrt(key_dim) in q, so the o scale is 1."""
+        1/sqrt(key_dim) in q, so the o scale is 1. ``saved`` = the stage outputs the
+        adjoints take as inputs."""
         # a tail chunk writes past h, which gdn_state_scan sizes S // chunk
         assert q.shape[1] % chunk == 0, f"WY core needs whole chunks: {q.shape[1]} % {chunk}"
         kern = self._kernel
@@ -1241,7 +1251,8 @@ class Backend:
         h, new_state, v_new = kern("gdn_state_scan")(
             k, w, u, gc, self._c(self._bf16(state)), chunk
         )
-        return kern("gdn_chunk_o")(q, k, v_new, h, gc, chunk, 1.0), new_state
+        out = kern("gdn_chunk_o")(q, k, v_new, h, gc, chunk, 1.0)
+        return out, new_state, dict(gc=gc, a=a, w=w, u=u, h=h, v_new=v_new, chunk=chunk)
 
     def gdn_decode(self, q, k, v, g, beta, pool, slots, layer, keep_steps=0, **kw):
         """GDN core for a T-token decode tick in one launch, state updated in
