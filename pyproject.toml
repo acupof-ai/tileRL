@@ -58,6 +58,8 @@ dev = [
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "uvicorn>=0.52.4",
+    "openai>=3.8.0",
+    "anthropic>=1.4.0",
 ]
 
 [tool.ruff]
