@@ -29,7 +29,7 @@ emitting the whole block in ONE forward removes (D-1) draft forwards and nothing
 else. If drafting is a tenth of the tick, the idea is capped at ~10%.
 
   scripts/v100.sh run ds 'CKPT=...; /usr/bin/python3 -u scripts/ab_draft_depth.py \
-      --source $CKPT --draft $CKPT/model-00018-of-00018.safetensors'
+      --source $CKPT --draft $CKPT/model_mtp.safetensors'
 """
 
 from __future__ import annotations
@@ -57,6 +57,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from corpus import wikitext_ids  # noqa: E402  (after the sys.path insert above)
 
 DEPTHS = (1, 2, 3, 4)
+#: sm90 dispatch thresholds, mirroring backend.py's `_MGEMV` and `_MX`. Copied
+#: rather than imported: those are private to the kernels package, and a probe
+#: that silently followed a change there would relabel old logs.
+_SM90_MGEMV = 3
+_SM90_MX = 8
 
 
 def _sync() -> None:
@@ -67,20 +72,45 @@ def _sync() -> None:
         torch.cuda.synchronize()
 
 
-def _rung(m: float) -> int:
-    """The sm70 rung a tick of M = rows x width lands on.
+def bucket(arch: str, m: float) -> tuple[str, int]:
+    """(kernel label, rows the launch actually pays for) for a tick of M rows.
 
-    Above the top rung the ladder does not continue -- the dispatch chunks at 32
-    (engine.py:864, "a full batch verifies in ceil(rows/32) launches per layer"),
-    so M=40 is two launches and not a 64-row rung. Bucket those by launch count so
-    they stay comparable to each other instead of raising: bare
+    Two ticks belong in one bucket only if they run the SAME kernel at the same
+    padded width -- that is what makes "verify is flat inside a bucket" a claim
+    about one launch shape rather than about an integer. The label is returned
+    with the width because the integer alone means different things per arch:
+    sm70's 64 is two 32-row launches, sm90's is one 64-row WGMMA tile.
+
+    sm70 (`LADDER_WIDTHS`, gated to this arch at engine.py:428): 1/2/4/8/32, and
+    above the top rung the dispatch chunks at 32 rather than continuing the
+    ladder, so M=40 is two launches. Bare
     `next(r for r in LADDER_WIDTHS if r >= m)` has no default and killed the B=8
     depth-4 row with StopIteration.
+
+    sm90 (backend.py:810-850, the fp8 path a draft actually takes): M=1 GEMV,
+    2..`_MGEMV` an M-row GEMV, up to `_MX` mma8 with x padded to 8, and above
+    that WGMMA with M snapped by `_snap_mma_tile` to 16/32/64/128. ONE launch --
+    the ceil(rows/32) chunking is `_sm70_chunks` and is not on this path.
     """
+    m = int(m)
+    if arch == "sm90":
+        if m == 1:
+            return "gemv", 1
+        if m <= _SM90_MGEMV:
+            return "gemv", m
+        if m <= _SM90_MX:
+            return "mma8", _SM90_MX
+        return "wgmma", min(128, next((t for t in (16, 32, 64, 128) if t >= m), 128))
     top = max(LADDER_WIDTHS)
     if m > top:
-        return top * -(-int(m) // top)  # 40 -> 64, printed as r64, meaning 2 launches
-    return next(r for r in LADDER_WIDTHS if r >= m)
+        return "gemv", top * -(-m // top)  # 40 -> 64, i.e. 2 launches of 32
+    return "gemv", next(r for r in LADDER_WIDTHS if r >= m)
+
+
+def _label(arch: str, m: float) -> str:
+    """`bucket` as one printable token, so a log row names its own kernel."""
+    k, w = bucket(arch, m)
+    return f"{k}{w}"
 
 
 def _alloc_state() -> dict:
@@ -154,7 +184,7 @@ def set_depth_in_place(e, head, depth: int) -> None:
     assert e._width == depth + 1, f"engine kept width {e._width} for depth {depth}"
 
 
-def measure(e, prompts: list[list[int]], tokens: int) -> tuple:
+def measure(e, prompts: list[list[int]], tokens: int, arch: str = "sm70") -> tuple:
     """(ms per decode tick, tokens per forward, mean rows x width, per-rung times).
 
     The seventh value is the allocator's own delta over the window -- see
@@ -225,7 +255,7 @@ def measure(e, prompts: list[list[int]], tokens: int) -> tuple:
             rows = len([r for r in e._running if r.req_id in rids and r.req_id not in done])
             w = 1 + (b1["spec_drafted"] - b0["spec_drafted"]) / max(rows, 1)
             m = max(rows, 1) * w
-            rung = _rung(m)
+            rung = bucket(arch, m)  # (kernel, padded rows): the grouping key
             per_rung[rung].append((time.perf_counter() - k0) * 1000 / nf)
             # The draft goes in the SAME bucket as the tick that ran it. Verify is
             # tick minus draft, so pooling the draft across rungs while bucketing the
@@ -254,6 +284,7 @@ def measure(e, prompts: list[list[int]], tokens: int) -> tuple:
 
 
 def main() -> None:
+    global DEPTHS
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True)
     ap.add_argument("--draft", required=True)
@@ -272,6 +303,12 @@ def main() -> None:
                          "width >= 32 and the ladder rounds M up, so at B=4 depth 1 "
                          "fills rung 8 with ncols=1 while depth 3 half-fills rung 32 "
                          "with ncols=2")
+    ap.add_argument("--depths", default=",".join(str(d) for d in DEPTHS),
+                    help="comma-separated chain depths; width is depth+1. The default "
+                         "is the sm70 sweep this script was written for. On another arch "
+                         "pick depths whose B*(depth+1) share a launch bucket, or the "
+                         "draft-cost solve refuses: at B=8 on sm90, depths 4-7 all land "
+                         "on one 64-row WGMMA tile")
     ap.add_argument("--time-draft", action="store_true",
                     help="time each draft forward with CUDA events instead of only "
                          "deriving it from two tick means. The subtraction amplifies "
@@ -281,6 +318,9 @@ def main() -> None:
                          "so the ms/tick column IS comparable to a run without it")
     args = ap.parse_args()
     batches = [int(b) for b in args.batch.split(",")]
+    DEPTHS = tuple(int(d) for d in args.depths.split(","))
+    if min(DEPTHS) < 1:
+        raise SystemExit(f"--depths must all be >= 1, got {sorted(DEPTHS)}")
     for B in batches:
         if args.prompts % B:
             raise SystemExit(
@@ -291,6 +331,7 @@ def main() -> None:
     cli._QWEN38_SOURCE = args.source
 
     be = get_backend()
+    arch = getattr(be, "arch", "") or "sm70"
     cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft)
     if args.prompt == "wikitext":
@@ -332,7 +373,7 @@ def main() -> None:
               + ("  -- ONE group, so no between-passage spread is visible here"
                  if len(prompts) // B == 1 else ""))
         print(f"# {'depth':>5} {'W':>3} {'chain':>6} {'ms/tick':>8} "
-              f"{'tok/fwd':>8} {'tok/s':>7}  per-M: rNxCOUNT:MEAN_MS")
+              f"{'tok/fwd':>8} {'tok/s':>7}  per-M: KERNELxCOUNT:MEAN_MS")
         for d in DEPTHS:
             set_depth_in_place(e, draft, d)
             # DISJOINT groups of B, not `prompts[:B]` repeated: acceptance varies 15.8%
@@ -341,10 +382,10 @@ def main() -> None:
             # corpus variance. Measured: ds10 read 2.49 four times where ds8, which
             # rotated, read 2.49/2.44/2.15 over the same three passages.
             groups = [prompts[i * B : (i + 1) * B] for i in range(len(prompts) // B)]
-            measure(e, groups[0], args.tokens)  # warm: JIT + this (B, width) capture
+            measure(e, groups[0], args.tokens, arch)  # warm: JIT + this (B, width) capture
             # Every depth sees the SAME groups in the same order, so a between-depth
             # difference cannot be a between-passage difference.
-            got = [measure(e, g, args.tokens) for g in groups]
+            got = [measure(e, g, args.tokens, arch) for g in groups]
             # Per-group rows, not just their mean. Pooling hid a 1.58x drift: at
             # --prompts 3 on wikitext the pooled rung-4 mean read 97.5 ms against 61.8
             # for the first passage alone, which made verify come out NEGATIVE (-24 ms)
@@ -382,8 +423,8 @@ def main() -> None:
                 for r, v in g[3].items():
                     per_rung[r].extend(v)
             rows[(B, d)] = (ms, tpf, chain, dict(per_rung))
-            mix = " ".join(f"r{r}x{len(v)}:{sum(v)/len(v):.1f}"
-                           for r, v in sorted(per_rung.items()))
+            mix = " ".join(f"{k}{w}x{len(v)}:{sum(v)/len(v):.1f}"
+                           for (k, w), v in sorted(per_rung.items()))
             print(f"{d:>5} {1 + d:>3} {chain:>6.2f} {ms:>8.2f} {tpf:>8.2f} "
                   f"{1000 * tpf / ms:>7.1f}  {mix}")
             direct = [fv for g in got for fv in g[4]]
@@ -422,15 +463,19 @@ def main() -> None:
                     if len(dv) < 0.5 * len(v):
                         continue  # too few timings in this rung to price it
                     d_per_tick = sum(x for _, x in dv) / len(dv)
-                    parts.append(f"r{r}:{sum(v) / len(v) - d_per_tick:.2f}")
+                    parts.append(f"{r[0]}{r[1]}:{sum(v) / len(v) - d_per_tick:.2f}")
                 if parts:
                     print(f"        verify: {' '.join(parts)} ms -- tick minus its "
-                          f"OWN rung's draft, no cross-depth subtraction")
+                          f"OWN bucket's draft, no cross-depth subtraction")
             print(f"        gpu: {gpu_state()}")
         best = max(DEPTHS, key=lambda d: rows[(B, d)][1] / rows[(B, d)][0])
-        r_best, r_ship = (1000 * rows[(B, d)][1] / rows[(B, d)][0] for d in (best, 3))
-        print(f"  B={B}: best depth {best} at {r_best:.1f} tok/s, shipped 3 at "
+        # 3 is the shipped default; if this sweep does not include it there is
+        # nothing to compare against and the deepest arm stands in, named.
+        ref = 3 if 3 in DEPTHS else max(DEPTHS)
+        r_best, r_ship = (1000 * rows[(B, d)][1] / rows[(B, d)][0] for d in (best, ref))
+        print(f"  B={B}: best depth {best} at {r_best:.1f} tok/s, depth {ref} at "
               f"{r_ship:.1f} ({r_best / r_ship:.3f}x)"
+              + ("  (shipped)" if ref == 3 else "  (deepest in this sweep, not the shipped 3)")
               + ("  -- inside the 1.16% noise floor" if r_best / r_ship < 1.0116 else ""))
     e.shutdown()
 
@@ -454,58 +499,109 @@ def main() -> None:
     # at B=4 they are M=12 -> rung 32 and M=16 -> rung 32 (shared), and at B=8 they
     # are M=24 and M=32 (also shared, but with different padding). Where they do NOT
     # share one, the subtraction is not a draft forward and the script says so.
-    r2, r3 = (_rung(B0 * (1 + d)) for d in (2, 3))
-    if r2 != r3:
+    lo, hi = sorted(DEPTHS)[:2] if len(DEPTHS) >= 2 else (None, None)
+    # Any two depths whose ticks land in the SAME bucket differ by exactly the
+    # draft forwards between them; pick the widest such pair, since a longer lever
+    # divides the tick noise the subtraction amplifies. Where no pair shares a
+    # bucket the difference is a kernel or tile step and this refuses rather than
+    # calling it a draft forward.
+    pairs = [(a, b) for i, a in enumerate(sorted(DEPTHS)) for b in sorted(DEPTHS)[i + 1:]
+             if bucket(arch, B0 * (1 + a)) == bucket(arch, B0 * (1 + b))]
+    if not pairs:
         raise SystemExit(
-            f"at B={B0} depths 2 and 3 launch different rungs ({r2} vs {r3}), so "
-            "their difference is a rung step, not one draft forward -- price the "
-            "draft at a batch where they share a rung")
-    RUNG = r3
-    have = {d: rows[d][3].get(RUNG, []) for d in (2, 3)}
+            f"at B={B0} on {arch}, no two of depths {sorted(DEPTHS)} share a launch "
+            f"bucket ({', '.join(f'd{d}->{_label(arch, B0 * (1 + d))}' for d in sorted(DEPTHS))}), "
+            "so every difference is a kernel or tile step rather than a draft "
+            "forward -- sweep depths that land on one bucket")
+    lo, hi = max(pairs, key=lambda ab: ab[1] - ab[0])
+    KEY = bucket(arch, B0 * (1 + hi))
+    NAME = _label(arch, B0 * (1 + hi))
+    have = {d: rows[d][3].get(KEY, []) for d in (lo, hi)}
     if min(len(v) for v in have.values()) < 5:
         raise SystemExit(
-            f"too few rung-{RUNG} ticks to price a draft forward: depth 2 has "
-            f"{len(have[2])}, depth 3 has {len(have[3])} -- verify_lens trimmed "
+            f"too few {NAME} ticks to price a draft forward: depth {lo} has "
+            f"{len(have[lo])}, depth {hi} has {len(have[hi])} -- verify_lens trimmed "
             "almost everything, so raise --tokens or lower --ctx")
-    t2, t3 = (sum(v) / len(v) for v in (have[2], have[3]))
-    draft = t3 - t2
-    verify = t2 - 2 * draft
-    print(f"\nrung-{RUNG} ticks only ({len(have[2])} at depth 2, {len(have[3])} at "
-          f"depth 3): {t3:.2f} - {t2:.2f} = {draft:.2f} ms per draft forward")
-    print(f"  a rung-{RUNG} depth-3 tick = {verify:.2f} verify + 3 x {draft:.2f} draft")
-    print(f"  drafting is {100 * 3 * draft / t3:.0f}% of it")
+    t_lo, t_hi = (sum(have[d]) / len(have[d]) for d in (lo, hi))
+    draft = (t_hi - t_lo) / (hi - lo)
+    verify = t_lo - lo * draft
+    print(f"\n{NAME} ticks only ({len(have[lo])} at depth {lo}, {len(have[hi])} at "
+          f"depth {hi}): ({t_hi:.2f} - {t_lo:.2f}) / {hi - lo} = {draft:.2f} ms per "
+          f"draft forward")
+    print(f"  a {NAME} depth-{hi} tick = {verify:.2f} verify + {hi} x {draft:.2f} draft")
+    print(f"  drafting is {100 * hi * draft / t_hi:.0f}% of it")
     # The mean-tick subtraction the previous version reported, kept as the
     # contamination measurement rather than deleted: the gap between the two IS
-    # the rung mix, and printing both is what makes that visible.
-    ms2, ms3, tpf3 = rows[2][0], rows[3][0], rows[3][1]
-    print(f"  (mean-tick subtraction: {ms3:.2f} - {ms2:.2f} = {ms3 - ms2:.2f} ms, "
-          f"{ms3 - ms2 - draft:+.2f} of which is the rung mix moving)")
-    # Verify cost per rung, measured directly now that ticks are bucketed: each
-    # rung's mean tick minus its own draft forwards. These must form a staircase,
-    # and it is an independent check on the one draft number above.
-    print("  verify by rung: " + ", ".join(
-        f"r{r}@d{d}: {sum(v)/len(v) - d * draft:.2f} ({len(v)})"
-        for d in sorted(rows) for r, v in sorted(rows[d][3].items()) if len(v) >= 3))
+    # the bucket mix, and printing both is what makes that visible.
+    ms_lo, ms_hi, tpf_hi = rows[lo][0], rows[hi][0], rows[hi][1]
+    print(f"  (mean-tick subtraction: {ms_hi:.2f} - {ms_lo:.2f} = {ms_hi - ms_lo:.2f} ms "
+          f"over {hi - lo} forwards, {(ms_hi - ms_lo) / (hi - lo) - draft:+.2f}/forward "
+          "of which is the bucket mix moving)")
+    # Verify cost per bucket, measured directly now that ticks are bucketed: each
+    # bucket's mean tick minus its own draft forwards. On one kernel these must be
+    # flat, and across kernels they are a staircase -- an independent check on the
+    # one draft number above.
+    print("  verify by bucket: " + ", ".join(
+        f"{k}{w}@d{d}: {sum(v)/len(v) - d * draft:.2f} ({len(v)})"
+        for d in sorted(rows) for (k, w), v in sorted(rows[d][3].items()) if len(v) >= 3))
 
     # A block-parallel head emits the whole block in ONE forward, so it removes
-    # (D-1) draft forwards and changes nothing else. Priced on rung-4 ticks, the
-    # same population the draft number came from.
-    ideal = t3 - 2 * draft
-    ceiling = t3 / ideal
-    print("\nCEILING for a block-parallel draft head (1 forward instead of 3):")
-    print(f"  {t3:.2f} -> {ideal:.2f} ms/tick, {ceiling:.3f}x at the same tok/forward")
+    # (depth - 1) draft forwards and changes nothing else. Priced on the same
+    # bucket population the draft number came from, at the deeper of the pair.
+    ideal = t_hi - (hi - 1) * draft
+    ceiling = t_hi / ideal
+    print(f"\nCEILING for a block-parallel draft head (1 forward instead of {hi}):")
+    print(f"  {t_hi:.2f} -> {ideal:.2f} ms/tick, {ceiling:.3f}x at the same tok/forward")
     print("Upper bound: it assumes a parallel head drafts as well as the")
     print("autoregressive one, and a parallel position cannot see what was")
     print("sampled before it, so every point of accuracy lost cuts tok/fwd.")
     # The verdict is a RATIO and the prompt cancels out of it. Quoting a
     # break-even in tok/forward invites comparing it against an acceptance
     # measured on a different prompt, which is how a 1.111x arm got recorded as
-    # 0.675x: break-even scales WITH tok/forward (= tpf x ideal/t3), so only
+    # 0.675x: break-even scales WITH tok/forward (= tpf x ideal/tick), so only
     # `yield / tok_fwd x ceiling` is prompt-independent.
     print(f"  a parallel head wins iff it keeps > {100 / ceiling:.1f}% of the "
           f"autoregressive head's tok/forward, whatever that is on your prompt")
-    print(f"  (at the {tpf3:.2f} measured here that is {tpf3 / ceiling:.2f} tok/fwd)")
+    print(f"  (at the {tpf_hi:.2f} measured here that is {tpf_hi / ceiling:.2f} tok/fwd)")
+
+
+def _check_buckets() -> None:
+    """Pin the two arches' launch shapes. Runs off-GPU, so CI covers it.
+
+    The reason this exists: `bucket` used to be sm70-only and returned a bare
+    int, so on sm90 every label was wrong while the grouping still partitioned
+    the ticks -- the fit produced a residual and only the meaning of "r64" was
+    fiction. An integer that means "two 32-row launches" on one arch and "one
+    64-row tile" on the other cannot be checked by eye in a log.
+    """
+    # sm70: the (1,2,4,8,32) ladder, then ceil(M/32) launches of 32 above it.
+    assert [bucket("sm70", m) for m in (1, 2, 3, 4, 8, 16, 32)] == [
+        ("gemv", 1), ("gemv", 2), ("gemv", 4), ("gemv", 4), ("gemv", 8),
+        ("gemv", 32), ("gemv", 32)]
+    assert bucket("sm70", 40) == ("gemv", 64), "M=40 is two 32-row launches"
+    assert bucket("sm70", 64) == ("gemv", 64)
+    # sm90: GEMV to _MGEMV, mma8 to _MX padded to 8, then WGMMA snapped 16/32/64/128.
+    assert [bucket("sm90", m) for m in (1, 2, 3, 4, 8)] == [
+        ("gemv", 1), ("gemv", 2), ("gemv", 3), ("mma8", 8), ("mma8", 8)]
+    assert [bucket("sm90", m) for m in (9, 16, 24, 32, 40, 64, 65, 200)] == [
+        ("wgmma", 16), ("wgmma", 16), ("wgmma", 32), ("wgmma", 32),
+        ("wgmma", 64), ("wgmma", 64), ("wgmma", 128), ("wgmma", 128)]
+    # The disagreement that made this function necessary, both halves named.
+    assert bucket("sm70", 16) == ("gemv", 32) and bucket("sm90", 16) == ("wgmma", 16), \
+        "W=2 at B=8 is one 32-row sm70 launch and a 16-row sm90 tile"
+    assert bucket("sm70", 64) != bucket("sm90", 64), "same 64, different launch"
+    # B=8, the shape the sm90 sweep runs: which widths share a bucket.
+    groups: dict = {}
+    for w in range(1, 9):
+        groups.setdefault(bucket("sm90", 8 * w), []).append(w)
+    assert groups[("wgmma", 64)] == [5, 6, 7, 8], groups
+    assert groups[("wgmma", 32)] == [3, 4], groups
+    assert _label("sm90", 64) == "wgmma64" and _label("sm70", 64) == "gemv64"
+    print("ab_draft_depth: bucket() OK on both arches")
 
 
 if __name__ == "__main__":
-    main()
+    if "--check" in sys.argv:
+        _check_buckets()
+    else:
+        main()
