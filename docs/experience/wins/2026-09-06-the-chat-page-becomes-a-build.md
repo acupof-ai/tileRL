@@ -87,7 +87,7 @@ redundancy.
 Negative control on the fix itself, because an install that is already present
 proves nothing: removing the `dev` entry and re-running `uv sync --dev`
 uninstalls the package (`- websockets==17.1`) and `find_spec` returns None;
-restoring it reinstalls (`+ websockets==17.1`) and the 13 chat-UI tests pass.
+restoring it reinstalls (`+ websockets==17.1`) and the chat-UI tests pass.
 
 **Four negative controls, each fired:**
 
@@ -101,6 +101,87 @@ restoring it reinstalls (`+ websockets==17.1`) and the 13 chat-UI tests pass.
 The second is the one worth keeping: the control failed with the truncation
 gate's own message, not an earlier assertion, so it exercises the branch it
 names.
+
+**The stop cut folded into `_deltas` on the rebase, and my first control was
+aimed at the wrong files.** #174 landed the stop sequences with its cut inside
+`_stream`; rebasing onto it put the cut in the shared generator instead, so
+`/ws/chat` gets it without a second copy. 48's finding is that
+`_ScriptedEngine` honours `stop_texts` itself, so a route arm stays green with
+the *engine's* matching deleted — all six of theirs did. Two arms therefore,
+one per layer.
+
+I deleted the streaming cut and ran `test_server.py` + `test_chat_ui.py`: **48
+passed**. That reads as "the fold is untested" and was instead my control
+pointed at files that never exercised it — the gate lives in
+`test_api_sdk.py`. Re-run there, both halves are load-bearing separately:
+
+| revert | leaked text | expected |
+|---|---|---|
+| whole cut deleted | `The answer is` | `The answer` |
+| holdback only, no completed-match cut | `The answer ` | `The answer` |
+
+The second reproduces 48's own first error exactly — the trailing space of
+`" is"`, in the frame before the last. The arithmetic, from 48: the stop is
+three characters, so `hold` is 2 and the frame carries everything up to
+`len(text) - 2`, which is one character past the match's start. That is why a
+holdback fails on a *completed* match rather than on a forming one: it is
+sized for the prefix case and a completed match is already inside the window
+it releases.
+
+The WS arm added here (`test_the_websocket_route_never_emits_a_stop_sequence`)
+is red under both reverts, failing on its own assertion rather than an earlier
+one, so it covers the layer the two transports share. The route also had to
+learn `stop`: the page sends none, but a gate on a field the route silently
+drops would pass on an empty list forever.
+
+**What is NOT gated here, and why it is not on this double.** v100 suggested
+forcing the cut mid-token, where `len(output_ids)` and the decoded-character
+count diverge most sharply. `_ByteTokenizer` cannot express it: decoding every
+prefix of `"The answer is 4."` gives 17 tokens for 16 characters — k=1 → `''`,
+then one character per step to k=17. After a single leading no-character
+token, every token carries exactly one character, so a stop string always
+begins at a token boundary and the two counts stay locked. `" is"` as one
+token is a real-tokenizer property this double structurally lacks, so that arm
+belongs in `test_e2e.py` against the real tokenizer, which is where 48 put the
+genuine stop gate for the same reason.
+
+**Two things review found that are not fixed here, recorded so the next reader
+does not rediscover them.** From 48: if a stream dies after a stop matched,
+`_deltas`'s error branch returns before `engine.stop_text(request_id)` runs, so
+the `_finished_stop` entry never pops and outlives the request — bounded to
+one short string per abandoned stream that actually matched, and being fixed
+engine-side rather than by asking every caller to remember. `gen.close()` on
+`WebSocketDisconnect` is the same shape and equally bounded. Second: the WS
+route's `except Exception` turns a `_submit` refusal (`tool_choice`,
+`stop_texts` without a decode) into an `{"t": "error"}` frame, so the page
+cannot tell "refused" from "the engine died". Correct for a socket, which has
+no status code, and the place to change if the playground should ever show a
+refusal reason.
+
+**A committed artifact can go stale and nothing here catches it.** The bundle
+is built from `web/src/` and committed, so an edit to a source without
+`npm run build` leaves a bundle that is internally consistent and simply old:
+every test passes and the served page is the previous version. That is the
+`_CHAT_UI` defect reintroduced one layer out, where the string Python only
+measured the length of becomes a bundle nothing rebuilds — and removing that
+defect is this PR's whole justification.
+
+**The id gate is not a partial version of this check.** It catches an id
+renamed in `index.html` without a rebuild; this is a changed `render.ts` with
+no rebuild. Different failure, different symptom, zero overlap — a reader who
+sees "there is a gate on the bundle" will assume coverage that does not exist.
+
+Verified by hand for this PR (rebuild, `diff -r`, identical) and checked that
+nothing ahead in the queue touches those paths: #177, #178 and
+`753da30..origin/main` all touch neither `web/` nor `src/tilerl/static/`,
+confirmed independently by 48.
+
+Not gated in CI here because it needs node, and this tree's convention is that
+node-dependent gates skip where node is absent — which would make it a gate
+that does not run on the pod. Two upgrade paths, cheapest first: commit a hash
+of `web/src/` beside the bundle and assert in Python that it matches a rehash
+(no node, runs everywhere, catches exactly "sources changed, bundle didn't");
+or a CI step that rebuilds and diffs, once node is a hard CI dependency.
 
 ## Rule
 
