@@ -40,28 +40,53 @@ All eight replies were semantically correct (Paris, Jupiter, Shakespeare, Au,
 Everest, yen, Portuguese) — worth stating because a degenerate model produces a
 plausible tok/s on garbage, and this run's tokens are real.
 
-**One GRPO step** (`train --model qwen38-27b --rl --steps 1 --max-new-tokens 2048
---data /work/gsm8k_train.jsonl`, group 8, adapter 124.8M params, peak 88.21 GiB):
+**GRPO** (`train --model qwen38-27b --rl --max-new-tokens 2048 --data
+/work/gsm8k_train.jsonl`, group 8, adapter 124.8M params). Two runs, and the
+first one's number is **not** a step cost:
 
-| phase | s |
-|---|---:|
-| rollout | **73.183** |
-| backward | **44.697** |
-| optimizer | 0.165 |
-| **total** | **118.1** |
+| run | tilelang cache | step 1 total | rollout | backward | optimizer |
+|---|---|---:|---:|---:|---:|
+| A, `--steps 1` | cold | 118.1 s | 73.183 | 44.697 | 0.165 |
+| B, `--steps 3` | warm from A | **25.3 s** | **16.959** | **8.070** | 0.241 |
 
-Against the 229.2 s median cited for run 2, that is **1.94x faster**. The split
-is 62% rollout / 38% backward.
+**4.67x of run A is one-time cost** — 4.32x on rollout, 5.54x on backward. Same
+config, same data, same cap, same card; the only difference is that A compiled the
+kernels and captured the graphs inside its own timing. The B=1 round in this same
+snapshot showed the same shape openly (warmup 25.2 s, then 0.2 s) and I still
+quoted A as a step cost.
+
+The per-token check is what makes B credible: **0.097 s/token** of rollout (16.959
+over 174 tokens) against the 0.077 s/token from run 2's MATH rows — **1.3x**, where
+run A read 0.420 s/token, **5.5x**. A 5.5x gap against a known number is an
+instrument problem, and it was.
+
+**Run B died at step 2 with CUDA OOM**, so no steady-state median exists at this
+cap: `Tried to allocate 296.00 MiB. GPU 0 has 95.22 GiB of which 221.56 MiB is
+free. Process 750071 has 95.00 GiB in use` — one process, not contention. Peak in
+run A was 88.21 GiB, so a second step's allocations do not fit. **At `--max-new-tokens
+2048`, group 8, this configuration does not survive past step 1 on one H20.** That is
+a capacity finding, not a timing one, and it is the reason a 3-step median was not
+obtained.
+
+**No comparison to run 2's 229.2 s is made.** That row is MATH level 5 at a
+1434-token mean; this is gsm8k at 174 tokens, and #140's buckets put the backward
+at width 256 against run 2's 2048. The ratio would measure the task and the bucket.
+The one same-task reference is P1's **56.88 s/step median** (`wins/2026-09-05-p1-grpo-27b-run.md:22`),
+also gsm8k, also group 8 — but at cap **256** against this cap **2048**, and 25.3 s
+is a warm *first* step rather than a median over 100. Both differences push the
+same way, so the honest statement is that no valid s/step comparison exists yet at
+cap 2048; what run B establishes is that a warm step is ~4.7x cheaper than the
+cold one, and that step 2 does not fit.
 
 ## Three readings that would mislead the next agent
 
-**The run exits 1 and the ledger says FAIL, and the timings are still valid.**
+**The run exits 1 and the ledger says FAIL, and the phase split is still valid.**
 The failing gate is `groups_untied`: value 1.0 against threshold 0.5. All eight
-rollouts in the group tied, so the advantage is zero and this step carried **no
-learning signal** — but rollout, backward and optimizer all executed, so 118.1 s
-is a real measurement of the step's cost. What it is not is a measurement of a
-step that learns. `reward 1.0000`, `ce 2.5102`, `tok 174` on one gsm8k group is
-consistent with a tie, not with a broken run.
+rollouts in the group tied, so the advantage is zero and the step carried **no
+learning signal** — but rollout, backward and optimizer all executed, so the split
+is real work. P1's own run FAILS the same gate at 0.81
+(`wins/2026-09-05-p1-grpo-27b-run.md:33`), so a tie is the common case on gsm8k, not
+a broken run. `reward 1.0000`, `ce 2.5102`, `tok 174` is consistent with it.
 
 **`0.0 step/s` in the bench summary is display precision, not zero.** `1.0/118.1`
 is 0.00847, and the summary formats to one decimal. Reading that line as a failed
@@ -94,9 +119,21 @@ promotion is deliberate; nothing here is promoted.
 
 ## Rule
 
-A ledger FAIL and an invalid measurement are different things: read which gate
-failed before discarding the numbers. Here the gate is about whether the step
-*learned*, and the question asked was what the step *costs*.
+**A single-step run times its own warmup.** Run A's 118.1 s is 4.67x run B's warm
+first step at the same config, and I published it as a step cost while this same
+snapshot's decode round printed `warmup pass 1: 25.2s / pass 2: 0.2s` three
+paragraphs earlier. One step is never a step: the first one carries JIT and graph
+capture, so a cost claim needs at least a second step on a warm cache — or, when
+step 2 does not fit in memory, an explicit statement that no steady-state number
+exists.
+
+Second: a per-token cross-check catches this without a rerun. 0.420 s/token against
+a known 0.077 is 5.5x, which is the "suspect the instrument" threshold; the warm
+step reads 0.097, 1.3x.
+
+Third: a ledger FAIL and an invalid measurement are different things. Read which
+gate failed — `groups_untied` asks whether the step *learned*, and P1's shipped run
+fails it too at 0.81.
 
 ## Results
 
@@ -105,8 +142,8 @@ failed before discarding the numbers. Here the gate is about whether the step
 | 2026-09-06 | faae3c8 | H20 card 6 | cuda sm90 | Qwen3.8-27B NVFP4 | 0.3311 (512) | 10.61 (B=1) | 94.3 (B=1) |
 | 2026-09-06 | faae3c8 | H20 card 6 | cuda sm90 | Qwen3.8-27B NVFP4 | 0.3483 (2048) | 23.7 (B=8 tick) | 354.8 (B=8 agg) |
 | 2026-09-06 | faae3c8 | H20 card 6 | cuda sm90 | Qwen3.8-27B NVFP4 | 0.3677 (8192) | — | 2719.6 (prefill 8192) |
-| 2026-09-06 | faae3c8 | H20 card 6 | cuda sm90 | Qwen3.8-27B NVFP4 + LoRA 124.8M | — | — | 118.1 s/GRPO step (73.18 rollout / 44.70 backward) |
+| 2026-09-06 | faae3c8 | H20 card 6 | cuda sm90 | Qwen3.8-27B NVFP4 + LoRA 124.8M | — | — | **25.3 s** warm step 1 (16.96 rollout / 8.07 backward); cold 118.1 s; **step 2 OOM at cap 2048, no median** |
 
 Raw artifacts: `/work/snap1.log`, `/work/snapb8.log`, `/work/grpo1.log`,
-`runs/8d4f82034be3/manifest.json`, `runs/8d4f82034be3/rollouts.jsonl` (all on the
-pod).
+`/work/grpo3.log`, `runs/8d4f82034be3/manifest.json` and its `rollouts.jsonl` (all
+on the pod).
