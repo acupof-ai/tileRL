@@ -1051,8 +1051,7 @@ class Engine:
         nothing -- so the refill is driven here. The prefix store is cleared: it
         holds KV, not addresses.
         """
-        # Not len(self._decode_graphs): the graphs stay, and the number worth
-        # returning is the one that says the refill walk actually ran.
+        # returns the refill count, not len(graphs): the graphs stay
         n = self._backend.refill_const_f32()
         # The pool owns the captured memory; a new pool per invalidation would
         # leak one arena per step.
