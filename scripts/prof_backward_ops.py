@@ -380,13 +380,23 @@ def main() -> int:
 
         from tilerl.train import _MLP_SEGMENT_MAX_T
         t_batch = int(batch.shape[1])
-        has_wy = "gdn_state_scan" in _resolve(backend.precision, backend.arch)
+        kset = _resolve(backend.precision, backend.arch)
+        has_wy = "gdn_state_scan" in kset
         wy = backend._wy_eligible(t_batch, {"seq_q_lens": None}, t_batch > 1)
+        # the same order linear_attn_chunk falls through: WY, then the fused kernel, then the
+        # per-step reference. "not WY" is three different implementations, not one.
+        if not has_wy:
+            arm = "n/a (no WY cell on this arch)"
+        elif wy:
+            arm = "wy_kernels"
+        elif t_batch > 1 and "gdn_chunk_fused" in kset:
+            arm = "gdn_chunk_fused"
+        else:
+            arm = "reference.gdn_forward"
         print(json.dumps({"T": t_batch, "wy_chunk": _WY_CHUNK,
                           "T_mod_chunk": t_batch % _WY_CHUNK,
                           "wy_kernels_registered": has_wy,
-                          "gdn_arm": ("wy_kernels" if wy else "fused_or_serial") if has_wy
-                                    else "n/a (no WY cell on this arch)",
+                          "gdn_forward_arm": arm,
                           # T crosses this cap and the WY multiple independently, so two
                           # shapes can differ in both at once and did (T=1280 vs 1324)
                           "segment": "layer" if t_batch > _MLP_SEGMENT_MAX_T else "mlp"},
