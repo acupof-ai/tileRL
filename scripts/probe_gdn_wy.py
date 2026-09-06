@@ -128,7 +128,7 @@ def main() -> None:
     # the unrepeated key heads, the shape gdn_prep emits: the kernels index the GQA group
     qh, kh_ = bk._c(qn.bfloat16()), bk._c(kn.bfloat16())
     wy_core = lambda: bk._gdn_wy_core(qh, kh_, vb, gt, beta, st, C)
-    core, s = wy_core()
+    core, s, _ = wy_core()
     core_ref, s_ref = R.gdn_chunk_core(qn, kn, v, gt, bt, st, chunk=C)
     worst = max(err("core", core, core_ref), err("state", s, s_ref))
     core_fla, s_fla = R.gdn_chunk_core_fla(qn, kn, v, gt, bt, st, chunk=C)
