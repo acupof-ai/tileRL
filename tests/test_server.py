@@ -254,7 +254,7 @@ def test_the_stream_arrives_in_pieces_and_never_splits_a_character():
 def _assert_stream_is_incremental(client, body) -> None:
     streamed = client.post("/v1/chat/completions", json={**body, "stream": True})
     assert streamed.status_code == 200, streamed.text
-    lines = [ln for ln in streamed.text.splitlines() if ln.startswith("data:")]
+    lines = [ln for ln in streamed.text.split("\n") if ln.startswith("data:")]
     payloads = [json.loads(ln[len("data: ") :]) for ln in lines[:-1]]
     deltas = [
         p["choices"][0]["delta"]["content"]
@@ -353,7 +353,7 @@ def test_a_reply_that_arrives_over_many_polls_streams_over_many_deltas():
             "temperature": 0.0, "stream": True}
     r = client.post("/v1/chat/completions", json=body)
     assert r.status_code == 200, r.text
-    lines = [ln for ln in r.text.splitlines() if ln.startswith("data:")]
+    lines = [ln for ln in r.text.split("\n") if ln.startswith("data:")]
     payloads = [json.loads(ln[len("data: ") :]) for ln in lines[:-1]]
     deltas = [p["choices"][0]["delta"]["content"] for p in payloads
               if p["choices"][0].get("delta", {}).get("content")]
@@ -399,7 +399,7 @@ def test_usage_in_the_stream_is_opt_in_and_counts_tokens_not_characters(client, 
     def frames(extra):
         resp = client.post("/v1/chat/completions", json={**body, **extra})
         assert resp.status_code == 200, resp.text
-        lines = [ln for ln in resp.text.splitlines() if ln.startswith("data: {")]
+        lines = [ln for ln in resp.text.split("\n") if ln.startswith("data: {")]
         return [json.loads(ln[len("data: ") :]) for ln in lines]
 
     plain = frames({})
@@ -544,6 +544,66 @@ def test_the_chat_page_reads_the_stream_this_server_sends(client, model_id):
     assert counts == sorted(counts), f"cumulative token counts went backwards: {counts}"
 
 
+class _SplitlinesTokenizer(_ByteTokenizer):
+    """Decodes a fixed text containing the three characters `splitlines()` cuts on and
+    `split("\\n")` does not.
+
+    `_sse` writes `json.dumps(..., ensure_ascii=False)`, so a non-ASCII character reaches
+    the wire verbatim. Measured: of the nine separators `splitlines()` splits on beyond
+    `\\n`, only these three cut a payload mid-JSON -- `\\v \\f \\r \\x1c \\x1d \\x1e` are
+    ASCII controls that `json.dumps` escapes, so no literal byte is ever emitted. All
+    three are reachable from sampled ids (U+0085 is bytes 194,133 -> ids 197,136, inside
+    tiny()'s vocab of 320), which is why the failure was intermittent and appeared on
+    ubuntu but not macos rather than being deterministic.
+    """
+
+    PATTERN = "a\x85b c d".encode()
+
+    def decode(self, ids) -> str:
+        n = sum(1 for i in ids if 3 <= i < 259)
+        return self.PATTERN[:n].decode("utf-8", errors="replace")
+
+
+def test_sse_frames_survive_a_separator_splitlines_cuts_on():
+    """The stream parses when a delta carries U+0085 / U+2028 / U+2029.
+
+    Negative control: with `splitlines()` in place of `split("\\n")` below, the same
+    stream raises `json.JSONDecodeError: Unterminated string`, which is the failure this
+    test exists to keep out. The assertion on `joined` is what makes the test exercise
+    the characters rather than merely tolerate their absence.
+    """
+    engine = _build_engine(seed=42)
+    engine.run()
+    try:
+        with TestClient(create_app(engine, _SplitlinesTokenizer())) as c:
+            resp = c.post("/v1/chat/completions", json={
+                "model": "tiny", "messages": [{"role": "user", "content": "hi"}],
+                "stream": True, "max_tokens": 16, "temperature": 0.0, "seed": 5,
+            })
+        assert resp.status_code == 200, resp.text
+        lines = [ln for ln in resp.text.split("\n") if ln.startswith("data: {")]
+        assert lines, f"no SSE payload frames: {resp.text[:200]!r}"
+        payloads = [json.loads(ln[len("data: ") :]) for ln in lines]
+    finally:
+        engine.shutdown()
+
+    joined = "".join(p["choices"][0].get("delta", {}).get("content") or "" for p in payloads)
+    assert any(ch in joined for ch in ("\x85", " ", " ")), (
+        f"the stream carried none of the three characters, so this test proves nothing "
+        f"about them: {joined!r}"
+    )
+    # Segment COUNTS do not discriminate: cutting at \x85 splits one frame into a `data:`
+    # half and a remainder that no longer starts with `data:`, so the remainder is filtered
+    # out and both splits yield the same total. What differs is the surviving frame's
+    # content, so the control below parses rather than counts.
+    #
+    # The negative control, executed rather than described: the OLD parse must actually
+    # raise on this very stream.
+    with pytest.raises(json.JSONDecodeError):
+        old = [ln for ln in resp.text.splitlines() if ln.startswith("data: {")]
+        [json.loads(ln[len("data: ") :]) for ln in old]
+
+
 def test_completion_stream(client, model_id):
     resp = client.post(
         "/v1/chat/completions",
@@ -558,7 +618,13 @@ def test_completion_stream(client, model_id):
     assert "text/event-stream" in resp.headers.get("content-type", ""), (
         f"not an SSE stream: {resp.headers.get('content-type')!r}"
     )
-    lines = [line for line in resp.text.splitlines() if line.startswith("data:")]
+    # split("\n"), NOT splitlines(): SSE frames are \n-delimited, and splitlines() also
+    # splits on \x85,   and  , which `_sse`'s ensure_ascii=False puts on the wire
+    # verbatim. Measured -- those three cut a payload mid-JSON while \v \f \r \x1c-\x1e do
+    # not (json.dumps escapes the ASCII controls), and all three are reachable from sampled
+    # ids: \x85 is bytes 194,133 -> ids 197,136, both inside tiny()'s vocab of 320. That is
+    # the intermittent `Unterminated string` this test hit on ubuntu and not macos.
+    lines = [line for line in resp.text.split("\n") if line.startswith("data:")]
     assert lines, "no SSE data lines received"
     assert lines[-1].strip() == "data: [DONE]", f"stream did not end with [DONE]: {lines[-1]!r}"
 
