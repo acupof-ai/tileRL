@@ -116,7 +116,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     app = FastAPI(title="tilerl", version="0.1.0")
     app_started = int(time.time())
 
-    def _submit(req: ChatCompletionRequest) -> tuple[int, int, int]:
+    def _submit(req: ChatCompletionRequest) -> tuple[int, int, int, bool]:
         cap = _MAX_THINK.get((req.reasoning_effort or "").lower())
         kw = req.chat_template_kwargs or {}
         thinking = kw.get("enable_thinking")
@@ -135,7 +135,9 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         params = sampling(tokenizer, thinking, req.max_tokens if req.max_tokens is not None else 512,
                           temperature=req.temperature, top_p=req.top_p, max_think_tokens=cap,
                           seed=req.seed, logprobs=bool(req.logprobs))
-        return engine.submit(input_ids, params), len(input_ids), params.max_new_tokens
+        # bool(thinking): True when the prompt opened <think>, so the reply carries only
+        # the closer and strip_think must be told (None = bare turn, nothing to strip)
+        return engine.submit(input_ids, params), len(input_ids), params.max_new_tokens, bool(thinking)
 
     def _await_completion(request_id: int, timeout_s: float = 1800.0) -> list[int]:
         deadline = time.monotonic() + timeout_s
@@ -179,7 +181,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
         try:
-            request_id, prompt_tokens, max_new = _submit(req)
+            request_id, prompt_tokens, max_new, opened = _submit(req)
         except ValueError as exc:
             return JSONResponse(
                 status_code=400,
@@ -193,7 +195,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
         if req.stream:
             return StreamingResponse(
-                _stream(request_id, max_new, prompt_tokens, bool(
+                _stream(request_id, max_new, prompt_tokens, opened, bool(
                     (req.stream_options or {}).get("include_usage")
                 )),
                 media_type="text/event-stream",
@@ -212,7 +214,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                 status_code=500,
                 content={"error": {"message": str(exc), "type": "api_error"}},
             )
-        text = strip_think(tokenizer.decode(output_ids))  # reasoning is the model's, not the reply
+        text = strip_think(tokenizer.decode(output_ids), opened=opened)
         created = int(time.time())
         # OpenAI's shape: one entry per emitted token, decoded alongside its
         # score. A forced end-think token was never sampled and carries NaN,
@@ -243,7 +245,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             "system_fingerprint": SYSTEM_FINGERPRINT,
         }
 
-    def _stream(request_id: int, max_new: int, prompt_tokens: int, include_usage: bool):
+    def _stream(request_id: int, max_new: int, prompt_tokens: int, opened: bool,
+                include_usage: bool):
         created = int(time.time())
         chunk_id = f"chatcmpl-{request_id}"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {"role": "assistant"}))
@@ -280,7 +283,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                     # replacement chars and hold them until the bytes arrive -- cutting at
                     # the FIRST one drops the whole reply whenever the text legitimately
                     # contains an unmappable byte, which is every prefix on the tiny model.
-                    text = strip_think(tokenizer.decode(live).rstrip("�"))
+                    text = strip_think(tokenizer.decode(live).rstrip("�"), opened=opened)
                     if len(text) > sent:
                         yield content_frame(text[sent:], seen)
                         sent = len(text)
@@ -306,7 +309,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             return
         # reasoning is the model's, not the reply; sent counts stripped characters, so
         # this is the remainder of the same string the deltas were cut from
-        tail = strip_think(tokenizer.decode(output_ids))[sent:]
+        tail = strip_think(tokenizer.decode(output_ids), opened=opened)[sent:]
         if tail:
             yield content_frame(tail, len(output_ids))
         finish = "length" if len(output_ids) >= max_new else "stop"
