@@ -134,6 +134,20 @@ Both red arms fired on the sandboxed assertion, not on the negative control belo
 the part that makes them controls at all: a revert that broke the unsandboxed half instead
 would produce the same red count and prove nothing.
 
+**The docstring was part of the defect.** It called `failIfUnavailable` "the important key",
+which is why the first control I wrote went at the wrong one. Rewritten to name two failures
+and which key binds each, and `failIfUnavailable` now has the control it never had:
+`test_a_host_without_a_sandbox_refuses_rather_than_running_bare` stubs `sandbox_available()`
+to report a host with no sandbox and requires a `RuntimeError` with nothing spawned. Its own
+negative control removes the refusal and runs bare — red on `DID NOT RAISE RuntimeError`. It
+also checks `sandbox=False` still spawns without `--settings`, so a refusal that swallowed the
+escape hatch would be red too.
+
+tilerl-25 hit the same shape an hour later and named the sharper half of it: of the two keys
+that stayed green, `failIfUnavailable` is the more dangerous, because its name sounds like the
+write path. A comment that misnames what binds does not just fail to help — it aims the next
+person's control.
+
 ## Still open, filed separately — now closed here
 
 `rollout.py:176`'s `{**os.environ, ...}` meant every rollout inherited the spawning machine's

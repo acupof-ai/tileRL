@@ -66,9 +66,15 @@ def sandbox_available() -> tuple[bool, str]:
 def sandbox_settings(host: str, port: int) -> dict[str, Any]:
     """Claude Code's sandbox config for a rollout: our server and nothing else.
 
-    ``failIfUnavailable`` is the important key -- without it a host that cannot
-    sandbox runs the agent bare, and a rollout that touched the real filesystem
-    is worse than a rollout that did not happen.
+    Two independent failures, two different keys, measured by reverting each alone against
+    `test_sandbox_confines_writes_to_the_rollout_dir`:
+
+    * ``enabled`` (and this payload reaching the CLI at all) is what confines the writes.
+      Reverting either turns that gate red.
+    * ``failIfUnavailable`` is what stops a host that *cannot* sandbox from running the agent
+      bare. Reverting it leaves the confinement gate green, because it governs a case that
+      gate never enters -- so it needs a control of its own, and this docstring used to call
+      it "the important key", which sent the first such control at the wrong key.
     """
     return {
         "sandbox": {

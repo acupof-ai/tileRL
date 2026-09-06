@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 
 os.environ.setdefault("TILERL_TARGET", "cpu")
 
@@ -147,6 +148,32 @@ def test_sandbox_confines_writes_to_the_rollout_dir(tmp_path, monkeypatch):
         "negative control failed: the escape did not write even unsandboxed, so "
         "the sandboxed assertion above proves nothing"
     )
+
+
+def test_a_host_without_a_sandbox_refuses_rather_than_running_bare(tmp_path, monkeypatch):
+    """`failIfUnavailable`'s own gate, because the confinement gate does not reach it.
+
+    Reverting `failIfUnavailable` leaves test_sandbox_confines_writes_to_the_rollout_dir
+    green -- it governs the case where the host cannot sandbox at all, which that test never
+    enters. So drive that case: make `sandbox_available()` report a host with no sandbox and
+    require a refusal, not a bare run.
+    """
+    monkeypatch.setattr(rollout_mod, "sandbox_available", lambda: (False, "no sandbox here"))
+    spawned = []
+
+    def fake_run(cmd, **kw):
+        spawned.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(rollout_mod.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="sandbox unavailable"):
+        rollout_mod.run_rollout("t", str(tmp_path), "http://127.0.0.1:9000", "ep")
+    assert not spawned, "ran the agent bare on a host with no sandbox"
+
+    # And the escape hatch still works, so the refusal is a default and not a wall.
+    rollout_mod.run_rollout("t", str(tmp_path), "http://127.0.0.1:9000", "ep", sandbox=False)
+    assert len(spawned) == 1 and "--settings" not in spawned[0]
 
 
 def test_no_refused_field_is_sent_by_the_real_client(tmp_path, monkeypatch):
