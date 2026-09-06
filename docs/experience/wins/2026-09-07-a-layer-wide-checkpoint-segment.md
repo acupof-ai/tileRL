@@ -1,7 +1,7 @@
 # A layer-wide checkpoint segment — H20 sm90, 2026-09-07
 
 > Status: **Accepted as the shape-picked arm.** `"mlp"` stays the default; `"layer"`
-> is selected at `train.py:155` when T exceeds the measured bracket's low end.
+> is selected at `train.py:166` when T exceeds the measured bracket's low end.
 
 ## Verdict
 
@@ -26,19 +26,23 @@ the checkpoint explained 12% of a 42.929 GiB accumulation. This entry is the
 obvious follow-up — make the segment the whole layer — and its point is whether
 the obvious thing is worth defaulting to.
 
-`forward(..., segment=)` takes `"mlp"` (unchanged default) or `"layer"`.
+`forward(..., segment=)` takes `"mlp"` or `"layer"`, and `_step` selects between them by T
+at `train.py:166`.
 
-**How an arm is selected, since nothing outside the tests passes the flag.**
-`git grep 'segment='` finds only `tests/test_e2e.py`; the two forward calls that
-reach a tape are `train.py:155` (the shipped training path, via
-`_step` → `run`) and `scripts/prof_forward_memory.py:138`. So the card arms are
-selected by editing those two lines in the measured tree — rows 1 and 3 at
-`train.py:155`, row 2 in the probe — not by a flag threaded through
-`rl_step`/`grpo_loop`/`cli`. That is deliberate: `train.py:155` is the one line
-that changes permanently if `"layer"` wins, and a plumbing chain added for the
-measurement would be deleted by the same PR that wins. The measured arm is
-therefore the shipped training path with one word changed, not a probe-local
-monkeypatch.
+**How the arms were selected while measuring, before that selector existed.** The two
+forward calls that build a tape are `train.py:166` (the shipped training path, via
+`_step` → `run`) and `scripts/prof_forward_memory.py:138`; nothing else in `src/`,
+`scripts/` or `packages/` passes `segment=`. Each arm was therefore produced by editing
+that one line in the measured tree — rows 1 and 3 in `train.py`, row 2 in the probe — not
+by a flag threaded through `rl_step`/`grpo_loop`/`cli`. Deliberate: the same line is where
+the shipped selector now lives, so the measured arm was the shipped path with one word
+changed, and a plumbing chain added for the measurement would have been deleted by the PR
+that resolved it.
+
+This mattered more than a convenience. When I wrote it down I found that **`segment=` was
+reachable from nothing but the tests** — I would have arrived on the card with an arm I could
+not select. Both sed round-trips were validated byte-exact locally before the pod ran them,
+because a failed revert would have made the second arm a silent duplicate of the first.
 
 ## Why a layer can be a segment at all
 
@@ -82,7 +86,7 @@ comparison raises `Boolean value of Tensor with more than one value is ambiguous
 rather than asserting. `_training_kv` sizes `num_slots` by batch (`train.py:47`)
 and the test helper used batch 1 — the one shape where a 1-element tensor
 bool-ables and both defects are invisible. Found by selecting the arm at
-`train.py:155` and running the real `grpo_loop`: **11 tests in `test_rl.py` went
+`train.py:166` and running the real `grpo_loop`: **11 tests in `test_rl.py` went
 red.** Now `.clone()` + `torch.equal`, with a batch-2 arm.
 
 ## What the CPU half establishes
@@ -106,7 +110,7 @@ Tiny model, CPU target, `segment="layer"` against `segment="mlp"`:
 | the 27-gradient equality is not vacuous | the same assertion is what the mutation arm fails |
 | the parity assert can fail at all | flipping `win_parity[0]` after layer 1 fails with `win_parity moved [0, 0] -> [1, 0]`; before the clone fix this control passed silently |
 | the batch-2 arm is not decoration | a raise-on-`numel > 1` probe inside `forward` fires with `numel=2`, so the arm reaches a real parity vector rather than the bool-able 1-element case |
-| the arm runs on the shipped path | `segment="layer"` selected at `train.py:155` and the full `grpo_loop` tests run: 41 passed (they were 11 red before the parity fix) |
+| the arm runs on the shipped path | `segment="layer"` selected at `train.py:166` and the full `grpo_loop` tests run: 41 passed (they were 11 red before the parity fix) |
 | the selector fires on both sides | `pick(1280) == "mlp"` and `pick(4352) == "layer"` on the expression `_step` uses, plus a source check that the call site reads `_MLP_SEGMENT_MAX_T` rather than a literal. **Two controls, each red by its own assertion:** hardcoding `segment="layer"` fails with `_step must select the segment by T, got segment="layer")`, and moving the threshold to 8192 fails with `T=4352 OOMs with the MLP segment` |
 | card state before any peak was read | card 6 free **by UUID**, not by index: 6 compute-app rows, none on `GPU-88e98123-…`; 0 MiB, 0% util, read in the same call as the tree shas |
 | the rest of the box, read with every row | all 8 cards' util and memory before, between and after each arm. Cards 1-5 and 7 held **98-100%** from another team's job for the whole session, and a same-code arm elsewhere drifted 133.65 → 140.43 s under it. Card 6 showed `clocks_throttle_reasons.active 0x0` at 1980 MHz, so the coupling is host/PCIe/bandwidth, not thermal. Every row's two arms therefore run back to back in one session |
