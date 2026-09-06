@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 LOCAL = Path(__file__).resolve().parent.parent / "docs/experience/wins/bench-baseline.json"
@@ -88,17 +89,43 @@ def show() -> int:
     return 0
 
 
+def _two_commits(d: Path) -> tuple[str, str]:
+    """A throwaway repo with a known ancestry. The arms below used HEAD and HEAD~1,
+    which needs history CI's depth-1 checkout does not have."""
+    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(d)]
+    subprocess.run(git[:-2] + ["init", "-q", str(d)], check=True)
+    out = []
+    for msg in ("first", "second"):
+        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", msg], check=True)
+        out.append(subprocess.check_output(git + ["rev-parse", "--short", "HEAD"],
+                                          text=True).strip())
+    return out[0], out[1]
+
+
 def _selfcheck() -> int:
-    head, prev = (
-        subprocess.check_output(["git", "rev-parse", "--short", r], cwd=LOCAL.parent,
-                                text=True).strip()
-        for r in ("HEAD", "HEAD~1")
-    )
+    global LOCAL
+    was = LOCAL
+    with tempfile.TemporaryDirectory() as d:
+        prev, head = _two_commits(Path(d))
+        LOCAL = Path(d) / LOCAL.name  # _local_is_newer resolves git from LOCAL.parent
+        try:
+            _check_ancestry(prev, head)
+        finally:
+            LOCAL = was
+    _check_strays()
+    print("selfcheck ok")
+    return 0
+
+
+def _check_ancestry(prev: str, head: str) -> None:
     assert _local_is_newer(prev, head), "a pod row measured one commit back must be held"
     assert not _local_is_newer(head, prev), "a pod row measured later must still raise"
     assert not _local_is_newer(head, head), "same commit is not newer"
     assert not _local_is_newer("unknown", head), "unknown provenance falls back to higher-wins"
-    # A stray row is skipped and named, never merged and never fatal.
+
+
+def _check_strays() -> None:
+    """A stray row is skipped and named, never merged and never fatal."""
     keep, skip = _tok_s_only({
         "suite/shape/sm90": {"commit": "abc", "tok_s": 1.0},
         "train/step/sm90": {"commit": "abc", "secs_per_step": 34.09},
@@ -106,8 +133,6 @@ def _selfcheck() -> int:
     assert list(keep) == ["suite/shape/sm90"], keep
     assert skip == [("train/step/sm90", ["commit", "secs_per_step"])], skip
     assert _tok_s_only({}) == ({}, []), "empty stays empty"
-    print("selfcheck ok")
-    return 0
 
 
 if __name__ == "__main__":
