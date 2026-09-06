@@ -25,7 +25,14 @@ POD_ENV+=" TILERL_TARGET=cuda"
 
 # ~/bin/pod's crictl exec lacks -i (no stdin), so drive tn exec directly.
 # tilelang's JIT cache lives on /work: the container's HOME is ephemeral.
-inner="cat > /tmp/tilerl-sync.tgz && mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && find . -mindepth 1 -delete && tar xzf /tmp/tilerl-sync.tgz && $POD_ENV${1:+ && $1}"
+# runs/ is exempt: the pod is not a git repo, and since 8388cbf a run writes its
+# manifest before the eval arms, so a killed run leaves the one copy that exists.
+# Not `-path ./runs -prune -o -delete` -- `-delete` implies `-depth`, which disables
+# `-prune`. GNU find refuses that outright (rc=1, nothing deleted); BSD find accepts it
+# and deletes runs/ silently, so it reads as protection on a Mac
+# (errors/2026-09-06-the-oom-was-micro-zero.md).
+wipe="find . -mindepth 1 \\! -path './runs' \\! -path './runs/*' -delete"
+inner="cat > /tmp/tilerl-sync.tgz && mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && $wipe && tar xzf /tmp/tilerl-sync.tgz && $POD_ENV${1:+ && $1}"
 remote="cid=\$(crictl ps -q --name $POD_NAME --state Running 2>/dev/null | head -1); "
 remote+="if [ -z \"\$cid\" ]; then echo 'pod: container not Running' >&2; exit 1; fi; "
 remote+="crictl exec -i \$cid bash -lc $(printf '%q' "$inner")"

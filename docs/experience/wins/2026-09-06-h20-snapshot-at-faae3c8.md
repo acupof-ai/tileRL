@@ -82,11 +82,12 @@ s/step median against P1's 56.88 — 1.18x**, same task, same group, same `micro
 differing only in cap (2048 vs 256). The 25.3 s warm first step stands as a warm
 first step and not as a median.
 
-Run 2's own peak, which would have answered this in one line, is unavailable: the
-entry records no peak figure and `runs/0f7006c74ea0/manifest.json` is gone from the
-pod, because `pod_sync.sh:28` runs `find . -mindepth 1 -delete` on the remote
-checkout — my sync this tick destroyed it. Line 12 rescues `bench-baseline.json`;
-nothing rescues `runs/`.
+Run 2's own peak, which would have answered this in one line, was never written:
+per tilerl-25, who ran it, run 2 died on SIGTERM at step 45 and `write_manifest`
+lived only inside `_finish` until `8388cbf`. **I wrote here that my sync destroyed
+it; that was wrong** — corrected in
+[the OOM was micro=0](../errors/2026-09-06-the-oom-was-micro-zero.md), which also
+lands the `runs/` exemption `pod_sync.sh` needed anyway.
 
 **No comparison to run 2's 229.2 s is made.** That row is MATH level 5 at a
 1434-token mean; this is gsm8k at 174 tokens, and #140's buckets put the backward
