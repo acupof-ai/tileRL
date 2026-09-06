@@ -33,7 +33,9 @@ write-back, so a fault-in does not re-spill the bytes it just read — asserted,
 `ssd_offered == 0` on the faulted arm.
 
 `resident()` is two conditions, and only the `_lru` one was tested. An entry sits in
-`_pending` from the enqueue until the daemon's `torch.save` returns — ~100 ms, and the whole
+`_pending` from the enqueue until the daemon's `torch.save` returns — ~100 ms as written
+here, **measured 641.8 ms** on 2026-09-06
+(`errors/2026-09-06-the-save-stage-had-no-timer.md`), and the whole
 reason the save is off-tick — and in that window there is no file, so both loads have a
 pending-table branch and `resident()` has the second half of an `or` for it. Deleting that
 half left all 70 tests passing. Getting it wrong is not a crash: the lookup walks past a
@@ -159,7 +161,10 @@ flag is one word and the counters say whether it is paying.
 
 The spill is **not durable at the moment of publish**. `insert` does a GPU→CPU copy and
 enqueues; a daemon thread does the `torch.save` off-tick, because a ~100 ms save inside a
-prefill tick would cost more than the tier saves. So an entry published within the last
+prefill tick would cost more than the tier saves — **and the save is 641.8 ms, not ~100**
+(`errors/2026-09-06-the-save-stage-had-no-timer.md`), so the durability window is 6.4x
+wider than this section assumed and the off-tick decision is more right, not less. So an
+entry published within the last
 flush is on disk **partially or not at all** when the process dies.
 
 Losing it is correct — the prefix re-prefills, which is exactly what happens today without
