@@ -57,6 +57,11 @@ KIND = {
     "attention": "eager",
     "paged_attention": "eager",
     "linear_attn_chunk": "eager (GDN)",
+    #: --inside-gdn rows
+    "_gdn_chunk_fwd": "eager: the recompute, exclusive of the M solve",
+    "_gdn_chunk_bwd": "eager: the adjoint",
+    "gdn_backward": "eager: prologue + epilogue remainder",
+    "solve_triangular (in recompute)": "torch/cuBLAS batched triangular solve",
     "silu_mul": "eager",
     "embedding": "eager",
     "reshape": "view",
@@ -202,8 +207,9 @@ def _selfcheck() -> int:
             assert callable(getattr(ref, name, None)), f"reference has no {name}"
         real = {n: getattr(ref, n) for n in ("_gdn_chunk_fwd", "_gdn_chunk_bwd",
                                              "gdn_backward")}
+        real_solve = torch.linalg.solve_triangular
         try:
-            ref._gdn_chunk_fwd = lambda *a: time.sleep(0.02)
+            ref._gdn_chunk_fwd = lambda *a: (time.sleep(0.01), _tiny_solve())[0]
             ref._gdn_chunk_bwd = lambda *a: time.sleep(0.02)
             # calls the helpers by GLOBAL name, as gdn_backward:929/:955 do
             def stub(*a, **kw):
@@ -213,15 +219,22 @@ def _selfcheck() -> int:
             ref.gdn_backward = stub
             secs3, calls3 = instrument_gdn(lambda: None)
             ref.gdn_backward()
-            assert calls3 == {"gdn_backward": 1, "_gdn_chunk_fwd": 1, "_gdn_chunk_bwd": 1}, calls3
+            assert calls3 == {"gdn_backward": 1, "_gdn_chunk_fwd": 1, "_gdn_chunk_bwd": 1,
+                              "solve_triangular (in recompute)": 1}, dict(calls3)
             for n in ("_gdn_chunk_fwd", "_gdn_chunk_bwd"):
-                assert 0.015 <= secs3[n] < 0.035, f"{n} should be its own sleep: {dict(secs3)}"
+                assert 0.008 <= secs3[n] < 0.035, f"{n} should be its own sleep: {dict(secs3)}"
             assert 0.015 <= secs3["gdn_backward"] < 0.035, (
                 "gdn_backward is charged for the helpers -- the timer is inclusive, and its "
                 f"row is meant to be the prologue/epilogue remainder: {dict(secs3)}")
+            # the solve nests inside the recompute, so its time comes OUT of that row
+            solve = secs3["solve_triangular (in recompute)"]
+            assert solve > 0, "the solve row is empty -- torch.linalg was not patched"
+            assert secs3["_gdn_chunk_fwd"] + solve >= 0.01, (
+                f"recompute + solve should cover the fwd stub: {dict(secs3)}")
         finally:
             for n, fn in real.items():
                 setattr(ref, n, fn)
+            torch.linalg.solve_triangular = real_solve   # a global patch, unlike the others
     finally:
         ag._BWD.clear()
         ag._BWD.update(saved)
@@ -230,8 +243,17 @@ def _selfcheck() -> int:
           f"{secs2['inner']:.3f}s inner, exclusive so the shares sum to 100%; "
           f"{len(pairs)} of main()'s imports resolved; --inside-gdn splits a stub into "
           f"{secs3['gdn_backward']:.3f}s remainder + {secs3['_gdn_chunk_fwd']:.3f}s recompute "
-          f"+ {secs3['_gdn_chunk_bwd']:.3f}s adjoint")
+          f"+ {secs3['_gdn_chunk_bwd']:.3f}s adjoint, with the M solve "
+          f"({secs3['solve_triangular (in recompute)'] * 1000:.3f}ms) taken OUT of recompute")
     return 0
+
+
+def _tiny_solve():
+    """A real solve_triangular call, so the selfcheck's recompute stub reaches the patched
+    `torch.linalg` the way `_gdn_chunk_fwd:611` does."""
+    n = 4
+    eye = torch.eye(n)
+    return torch.linalg.solve_triangular(eye, eye, upper=False, unitriangular=True)
 
 
 def instrument_gdn(sync) -> tuple[dict, dict]:
@@ -250,6 +272,11 @@ def instrument_gdn(sync) -> tuple[dict, dict]:
     epilogue (norm/silu/conv adjoints, the head-group folds) are straight-line code, not
     functions, so they are not wrapped. They fall out as `gdn_backward` minus the two
     helpers, and that remainder is reported as its own row rather than left implicit.
+
+    One more row nests below the recompute: the `M` solve (`reference.py:611`) is reached as
+    `torch.linalg.solve_triangular`, so it is patched on `torch.linalg` — a PROCESS-WIDE
+    mutation, unlike the others, and not restored (this probe runs one profile and exits).
+    Its time comes out of `_gdn_chunk_fwd`'s row, not in addition to it.
     """
     secs: dict[str, float] = defaultdict(float)
     calls: dict[str, int] = defaultdict(int)
@@ -275,6 +302,12 @@ def instrument_gdn(sync) -> tuple[dict, dict]:
     # subtraction rather than an assumption about what is left over.
     for name in ("_gdn_chunk_fwd", "_gdn_chunk_bwd", "gdn_backward"):
         setattr(ref, name, wrap(name, getattr(ref, name)))
+    # The M solve (reference.py:611) is reached as `torch.linalg.solve_triangular`, an
+    # attribute of torch.linalg rather than a global of `reference`, so patching `ref`
+    # would miss it. It nests inside _gdn_chunk_fwd, and the exclusive timer already
+    # subtracts a callee from its caller, so this row comes OUT of the recompute row.
+    torch.linalg.solve_triangular = wrap(
+        "solve_triangular (in recompute)", torch.linalg.solve_triangular)
     return secs, calls
 
 
