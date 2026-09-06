@@ -1,7 +1,8 @@
 # A closed socket does not stop the request — V100 sm70, 2026-09-07
 
-> Status: Fixed. 1891 tokens and 104 KV blocks were generated for a reader who
-> had already left.
+> Status: Fixed and verified live on the merge sha. 1891 tokens and 104 KV blocks
+> were generated for a reader who had already left; after the fix, 6 tokens and
+> 0 blocks.
 
 ## Context
 
@@ -87,6 +88,46 @@ A gate on `Engine.cancel` alone would pass with both call sites missing, which i
 exactly the state this shipped in, so a second test asserts the routes call it.
 
 **440 passed, 14 skipped** on cpu, rebased onto #208 (438 before it; #208 brought two arms).
+
+## Verified on the live V100 after the merge
+
+Same endpoint, same shape, on the merge sha `09e1e84` — child 2855749, confirmed
+running that code rather than a stale import (both `.pyc` files written *after*
+process start, and `engine.py`/`server.py` hash-match the `09e1e84` blobs).
+
+```
+     t  run wait     tok  fin  blk
+  6.45    1    0     200    1    9
+  6.79    1    0     220    1   10   <- socket CLOSED at t=7.00
+  7.16    0    0     226    2    0
+```
+
+Running and blocks back **0.16 s** after the close, against 104 blocks held for
+~34 s before the fix. Tokens 220 → 226: six, against ~47 tok/s over the ten rows
+before the close, so under one poll's worth — the cancel landed inside the step
+already in flight.
+
+**The first repeat could not have shown the token half.** It sampled every 2 s,
+so the close at t=7.00 fell between the t=6.01 and t=8.10 rows and the 55-token
+gap across it was unattributable — every one of those tokens could have been
+generated before the close. The block result survived that poll and the token
+result did not, and the difference is what each one is: a **level** stays put and
+tolerates a slow sampler, a **delta across an instant** does not. Re-run at
+0.25 s.
+
+**`blocks_used` cannot prove this on its own.** It is the engine's own counter,
+decremented by `_release` at `engine.py:1255` — the very function under test — so
+a `free_block` that never landed would still print 0. `pool_used_blocks` is the
+allocator's `num_blocks - len(self._free)` and is independent of it.
+
+It initially looked like a contradiction: across two runs `pool_used_blocks` went
+1 → 7 → 17 while `blocks_used` returned to 0 each time, the +10 on the second run
+exactly the peak that run had held. It is the prefix cache, and the control says
+so rather than the inference — one **normally completing** request moves the pool
+17 → 19 with `prefix_published` 7 → 9 and `blocks_used` 0. A completion retains
+the same way a cancel does, `free_block` only reaches the free list at refcount 0,
+and `_blocks_used` is documented "retains excluded" at `engine.py:447`. The two
+counters disagree by design, and the disagreement is not about cancel.
 
 ## Rule
 
