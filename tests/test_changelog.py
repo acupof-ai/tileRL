@@ -8,11 +8,7 @@ import pytest
 #: and the retracted-vs-corrected pair that #169's rebase resurrected also collides here.
 _PREFIX = 60
 
-#: The b071797 pair, already on main: one squash merged both versions of its own line
-#: (195 words vs 278, and a 302 -> 303 correction). Exempted by its own 60-char key, not a
-#: longer sentence — the key IS the truncation, so a longer needle never matches it.
-#: Remove this entry when someone reconciles the two versions.
-_KNOWN = ("- **accept** — **GSM8K is too easy for the no-think 27B, so ",)
+_KNOWN: tuple[str, ...] = ()
 
 
 def _entries(text: str) -> list[str]:
