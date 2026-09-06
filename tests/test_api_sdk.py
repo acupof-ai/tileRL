@@ -440,3 +440,105 @@ def test_messages_replaying_a_thinking_block_drops_the_reasoning(an, engine):
     # The turn is not dropped wholesale: its tool_use and the result both render.
     assert "<tool_call>" in prompt and "<tool_response>" in prompt and "a.txt" in prompt
     assert _text_of(second) == REPLY
+
+
+# --- accepted-and-ignored is a format lie: each field must 400 ---------------
+
+
+@pytest.mark.parametrize("body,field", [
+    ({"store": True}, "store"),
+    ({"previous_response_id": "resp_1"}, "previous_response_id"),
+    ({"include": ["reasoning.encrypted_content"]}, "include"),
+    ({"truncation": "auto"}, "truncation"),
+    ({"tool_choice": "required"}, "tool_choice"),
+    ({"tool_choice": {"type": "function", "name": "Bash"}}, "tool_choice"),
+    ({"tools": [{"type": "web_search"}]}, "web_search"),
+    ({"tools": [{"type": "code_interpreter", "container": {}}]}, "code_interpreter"),
+    ({"tools": [{"type": "file_search", "vector_store_ids": ["x"]}]}, "file_search"),
+])
+def test_responses_refuses_a_field_it_cannot_honour(oa, body, field):
+    """A field taken and ignored is a lie the client pays for one turn later.
+
+    `store=true` means the next request may send only previous_response_id; a
+    hosted tool type means the client expects US to run the search. Answering as
+    if we had is worse than refusing, so each returns 400 naming the field.
+    """
+    with pytest.raises(openai.BadRequestError) as exc:
+        oa.responses.create(model="tilerl", input="hi", **body)
+    assert field in exc.value.body["message"], exc.value.body
+    assert exc.value.body["type"] == "invalid_request_error"
+
+
+def test_responses_still_accepts_what_it_does_honour(oa):
+    """The refusal must not be a blanket one.
+
+    truncation="disabled" IS our behaviour, tool_choice auto/none is a hint we
+    can respect by rendering or omitting the tools, and metadata is echoed --
+    refusing these would break a compliant client for no gain.
+    """
+    r = oa.responses.create(model="tilerl", input="hi", truncation="disabled",
+                            tool_choice="auto", metadata={"k": "v"},
+                            parallel_tool_calls=False, extra_body=THINKING_ON)
+    assert r.output_text == REPLY
+    assert r.metadata == {"k": "v"}
+
+
+def test_chat_refuses_a_tool_choice_it_cannot_force(oa):
+    with pytest.raises(openai.BadRequestError) as exc:
+        oa.chat.completions.create(
+            model="tilerl", messages=[{"role": "user", "content": "hi"}],
+            tool_choice="required",
+            tools=[{"type": "function", "function": {"name": "Bash"}}])
+    assert "tool_choice" in exc.value.body["message"]
+
+
+def test_messages_refuses_stop_sequences_and_context_management(an):
+    """stop_sequences was accepted and never applied, so stop_reason could never
+    be "stop_sequence" -- a client waiting for one waited forever."""
+    with pytest.raises(anthropic.BadRequestError) as exc:
+        an.messages.create(model="tilerl", max_tokens=64,
+                           messages=[{"role": "user", "content": "hi"}],
+                           stop_sequences=["\n\n"])
+    assert "stop_sequences" in exc.value.body["error"]["message"]
+    # An edit we do NOT perform is refused and named.
+    with pytest.raises(anthropic.BadRequestError) as exc2:
+        an.messages.create(model="tilerl", max_tokens=64,
+                           messages=[{"role": "user", "content": "hi"}],
+                           extra_body={"context_management": {"edits": [
+                               {"type": "clear_tool_uses_20250919"}]}})
+    assert "clear_tool_uses" in exc2.value.body["error"]["message"]
+
+
+def test_messages_accepts_the_context_edit_claude_code_always_sends(an):
+    """Claude Code sends context_management on EVERY request, and refusing the
+    whole field broke the live rollout gate. Measured by capturing the CLI's
+    body: {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]} --
+    which asks for behaviour `blocks_to_text` already has, since it drops
+    thinking blocks when replaying history. Satisfied by construction, so
+    accepting it is not a lie.
+    """
+    m = an.messages.create(model="tilerl", max_tokens=64,
+                           messages=[{"role": "user", "content": "hi"}],
+                           extra_body={"context_management": {"edits": [
+                               {"type": "clear_thinking_20251015", "keep": "all"}]}})
+    assert _text_of(m) == REPLY
+
+
+def test_chat_refuses_stop_rather_than_dropping_it(oa):
+    """`stop` is a core OpenAI field we do not implement.
+
+    It was not even declared, so pydantic discarded it and the client got a 200
+    with no sign the stop never applied. Refused with 400 until the engine grows
+    multi-token stop ids (errors/2026-09-06-stop-sequences-accepted-and-never-
+    applied.md); tracked in OPEN.md rather than treated as settled.
+    """
+    with pytest.raises(openai.BadRequestError) as exc:
+        oa.chat.completions.create(model="tilerl", stop=["\n\n"],
+                                   messages=[{"role": "user", "content": "hi"}])
+    assert "stop" in exc.value.body["message"]
+
+
+def test_responses_refuses_stop_rather_than_dropping_it(oa):
+    with pytest.raises(openai.BadRequestError) as exc:
+        oa.responses.create(model="tilerl", input="hi", extra_body={"stop": ["\n\n"]})
+    assert "stop" in exc.value.body["message"]

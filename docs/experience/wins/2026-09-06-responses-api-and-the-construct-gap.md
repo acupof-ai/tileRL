@@ -1,6 +1,6 @@
 # /v1/responses, and the SDK that will not tell you a required field is missing — cpu, 2026-09-06
 
-> Status: Shipped (route + CPU gate); live V100 run `pending-remote`
+> Status: Shipped; verified live on the V100 (27B NVFP4, sm70) 2026-09-06
 
 ## Context
 
@@ -114,11 +114,28 @@ the run-to-run spread established in the previous entry (0.96 ms on
 `messages non-stream` against deltas of ~0.3). **No claim is made about the
 per-request cost of mounting the route**; a real number needs the pod.
 
-## Not established
+## The live run, which the CPU gate could not stand in for
 
-- **No live run.** Every number and every parse here is against
-  `_ScriptedEngine`. `api_e2e.py` exists precisely because that is not evidence;
-  `pending-remote`.
+`scripts/api_e2e.py --base-url http://10.37.2.27:8000 --model qwen38-27b`, run by
+27 against the V100 on merge sha `33a69a0`: **rc 0, all 11 checks passed, 0
+skipped.** The zero matters as much as the eleven — the skip floor exists because
+the first canned run reported success with 5 of 11 skipped, so "0 skipped" is what
+distinguishes real coverage from a probe that agreed with itself.
+
+Four facts only a real tokenizer and real weights could establish, all of which
+SKIP on the canned engine:
+
+| fact | on the V100 |
+|---|---|
+| is `<think>` one token? | **yes** — reasoning arrives as its own field, 101 chars on the non-stream chat arm, no bare closer in `content` |
+| does the 27B emit a well-formed `<tool_call>`? | **yes, on both routes** — `Bash {"command": "ls"}` parsed, and the Messages round trip answered after the `tool_result` |
+| does `/v1/messages` return a thinking block? | **yes** |
+| does `/v1/responses` return typed items? | **yes** — reasoning + message |
+
+So the five deviations fixed in the previous entry and the route added here are
+confirmed against the deployment, not only against a canned reply.
+
+## Not established
 - **Stateless only.** `store` is accepted and ignored, so there is no
   `previous_response_id` and no `GET /v1/responses/{id}`. A client that relies
   on server-side conversation state will not work; one that sends its history in

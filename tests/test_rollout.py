@@ -107,3 +107,38 @@ def test_sandbox_confines_writes_to_the_rollout_dir(tmp_path, monkeypatch):
         "negative control failed: the escape did not write even unsandboxed, so "
         "the sandboxed assertion above proves nothing"
     )
+
+
+def test_no_refused_field_is_sent_by_the_real_client(tmp_path, monkeypatch):
+    """Every field the routes refuse, checked against what the CLI actually sends.
+
+    The rule this enforces was learned the hard way: `context_management` was
+    refused as unsupported, and Claude Code sends it on EVERY request asking for
+    behaviour `blocks_to_text` already had -- a 400 for a field we do honour.
+    A field list in a doc is not a capture, so this drives the real client and
+    reads its bodies.
+    """
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "rec.jsonl"))
+    tok = _ByteTokenizer()
+    app = create_app(_ScriptedEngine(tok, ["done"] * 8), tok)
+    seen = rollout_mod.capture_bodies(app)
+    base, _ = rollout_mod.serve_app(app)
+    rollout_mod.run_rollout("say done", cwd=str(tmp_path), base_url=base,
+                            tag="ep-refuse", sandbox=False, timeout_s=120.0)
+
+    assert seen, "captured no request bodies: the capture, not the client, is broken"
+    sent = {k for body in seen for k in body}
+    # Refused outright on /v1/messages. `stop` and the OpenAI-only fields are not
+    # in this route's vocabulary, so only these two can appear here.
+    for field in ("stop_sequences",):
+        assert field not in sent or not any(body.get(field) for body in seen), \
+            f"the CLI sends {field}, which the route refuses"
+    # context_management IS sent, and must be accepted: this is the regression.
+    assert "context_management" in sent, \
+        "the CLI stopped sending context_management -- re-derive which edits it asks for"
+    edits = [e for body in seen for e in (body.get("context_management") or {}).get("edits", [])]
+    assert edits, f"context_management with no edits: {seen[0].get('context_management')!r}"
+    from tilerl.messages import _unsatisfied_edits
+    for body in seen:
+        assert not _unsatisfied_edits(body.get("context_management")), \
+            f"the CLI asks for an edit we refuse: {body['context_management']}"

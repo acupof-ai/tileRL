@@ -173,3 +173,19 @@ def render_tools(tools: list[dict[str, Any]] | None, effort: str | None = None) 
     return (head + "\n\n" + body) if head else body
 
 
+
+
+def refuse_unsupported(*fields: str, **flagged: Any) -> None:
+    """Raise on a field we accept but do not honour: the client's NEXT request
+    assumes the first one applied it, so the lie surfaces a turn later.
+
+    Positional args are the exact text to name (one bad item out of several);
+    keyword args are `name=<truthy?>` and name themselves, never the value --
+    apart, so a value like "resp_1" cannot end up as the field name.
+    """
+    named = list(fields) + [name for name, asked in flagged.items() if asked]
+    if named:
+        plural = "s are" if len(named) > 1 else " is"
+        raise ValueError(
+            f"{', '.join(sorted(named))}{plural} not supported by this server: the "
+            f"request is refused rather than answered as if the field had been applied")

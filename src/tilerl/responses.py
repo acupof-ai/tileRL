@@ -35,7 +35,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .messages import _parse_tool_calls
-from .prompt import render_prompt, sampling, split_think
+from .prompt import refuse_unsupported, render_prompt, sampling, split_think
 from .tokenizer import Tokenizer
 
 
@@ -55,6 +55,14 @@ class ResponsesRequest(BaseModel):
     parallel_tool_calls: bool | None = None
     reasoning: dict[str, Any] | None = None
     store: bool | None = None
+    #: Declared only so they can be REFUSED. pydantic drops an undeclared field
+    #: silently, so without these lines `previous_response_id` never reaches the
+    #: handler and cannot be rejected -- measured: model_extra is None.
+    previous_response_id: str | None = None
+    include: list[str] | None = None
+    truncation: str | None = None
+    #: Same as the chat route: declared to be refusable rather than dropped.
+    stop: str | list[str] | None = None
     metadata: dict[str, Any] | None = None
     #: The same vLLM-style override the chat route takes, for the same reason:
     #: whether the template opens <think> is otherwise inferred from the
@@ -96,6 +104,28 @@ def _render_call(name: str, arguments: str) -> str:
     return render_tool_call(name, args)
 
 
+#: Tool types that are the provider's to run, not ours. Declaring one means the
+#: client expects the SERVER to perform the search or execution.
+_HOSTED = ("file_search", "web_search", "web_search_preview", "computer",
+           "computer_use_preview", "code_interpreter", "image_generation",
+           "local_shell", "mcp", "custom", "apply_patch", "shell")
+
+
+def _hosted_tools(tools: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """The hosted tool types present in a request, as refusal kwargs."""
+    kinds = {t.get("type") for t in tools or []} & set(_HOSTED)
+    return {f"tools[type={k}]": True for k in sorted(kinds)}
+
+
+def _unsupported_choice(choice: Any) -> bool:
+    """`tool_choice` beyond auto/none. We render tools into the prompt and cannot
+    force or forbid a call, so anything stronger than a hint is unimplementable."""
+    if choice is None:
+        return None
+    name = choice if isinstance(choice, str) else (choice or {}).get("type")
+    return name not in ("auto", "none", None)
+
+
 def _flatten_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
     """Responses' ``{type, name, parameters}`` as the flat shape the template
     renders and ``_parse_tool_calls`` reads schemas from -- the same vocabulary
@@ -122,6 +152,15 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         return len(tokenizer.encode("<think>")) == 1 or None
 
     def _run(req: ResponsesRequest) -> dict[str, Any]:
+        refuse_unsupported(
+            previous_response_id=req.previous_response_id,
+            include=req.include,
+            # "disabled" is our behaviour already, so only "auto" is a lie.
+            truncation=req.truncation not in (None, "disabled"),
+            store=req.store,
+            stop=req.stop,
+            tool_choice=_unsupported_choice(req.tool_choice),
+            **_hosted_tools(req.tools))
         thinking = _thinking(req)
         tools = _flatten_tools(req.tools)
         prompt = render_prompt(_to_messages(req.input), req.instructions, tools,
