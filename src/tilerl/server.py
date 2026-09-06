@@ -93,6 +93,15 @@ class ChatCompletionRequest(BaseModel):
 _MAX_THINK = {"none": 0, "minimal": 128, "low": 512, "medium": 2048, "high": 8192}
 
 
+def _ws_body(ask: dict) -> dict:
+    """Top-level enable_thinking moves into chat_template_kwargs; the rest passes as sent."""
+    body = dict(ask)
+    if "enable_thinking" in body:
+        body["chat_template_kwargs"] = {**(body.get("chat_template_kwargs") or {}),
+                                        "enable_thinking": body.pop("enable_thinking")}
+    return body
+
+
 def _unsupported_choice(choice: Any) -> bool:
     """`tool_choice` beyond auto/none, or None when it is honourable as given."""
     if choice is None:
@@ -502,10 +511,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         except Exception:  # a client that closes before sending has nothing to answer
             return
         try:
-            kw = {"enable_thinking": ask["enable_thinking"]} if "enable_thinking" in ask else None
-            req = ChatCompletionRequest(messages=ask["messages"],
-                                        max_tokens=ask.get("max_tokens"),
-                                        stop=ask.get("stop"), chat_template_kwargs=kw)
+            # A picked constructor hides every other field from extra="allow".
+            req = ChatCompletionRequest.model_validate(_ws_body(ask))
             request_id, prompt_tokens, max_new, opened, _ = _submit(req)
         except Exception as exc:
             await ws.send_json({"t": "error", "message": f"{type(exc).__name__}: {exc}"})

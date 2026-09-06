@@ -333,6 +333,53 @@ def test_a_reply_cut_off_inside_the_block_says_length():
     assert "".join(f.get("reasoning_content", "") for f in frames) == reply, frames
 
 
+def test_the_socket_neither_drops_nor_mislabels_the_fields_a_client_sends():
+    """The WS route built its request from four hand-picked keys, so every other field
+    the client sent vanished before pydantic ran -- and #201's `extra="allow"` could not
+    see it either, because the extras never reached the constructor. Measured before the
+    fix: temperature=0.5 and seed=7 arrived as None with no warning.
+
+    Asserted at `SamplingParams`, not at the request object: what the defect actually
+    broke is the value the ENGINE samples with, and `_ScriptedEngine` records the params
+    of every submit.
+    """
+    import warnings
+
+    from test_server import _ByteTokenizer, _ScriptedEngine
+
+    from tilerl.server import create_app
+
+    tok = _ByteTokenizer()
+    engine = _ScriptedEngine(tok, ["</think>\n\nhi"])
+    app = create_app(engine, tok)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with TestClient(app) as c, c.websocket_connect("/ws/chat") as ws:
+            ws.send_json({"messages": [{"role": "user", "content": "page"}],
+                          "max_tokens": 16, "enable_thinking": True,
+                          "temperature": 0.5, "top_p": 0.9,
+                          "a_field_we_do_not_declare": "xyz"})
+            while ws.receive_json()["t"] not in ("done", "error"):
+                pass
+    texts = [str(w.message) for w in caught]
+
+    # 1. the undeclared field is named -- #201's mechanism now reaches this route
+    assert any("a_field_we_do_not_declare" in t for t in texts), (
+        f"an undeclared field crossed the socket with no warning: {texts}")
+    # 2. declared fields reach the ENGINE, which is what the key pick silently dropped
+    params = engine.params[-1]
+    assert params.temperature == 0.5, f"temperature never reached the engine: {params}"
+    assert params.top_p == 0.9, f"top_p never reached the engine: {params}"
+    # 3. `enable_thinking` must NOT warn: we honour it, so warning about it would be a
+    #    fix that looks right and breaks the toggle.
+    assert not any("enable_thinking" in t for t in texts), (
+        f"warned about a field we honour: {texts}")
+    # 4. and it is honoured by being MOVED, not dropped -- the prompt opens <think>.
+    from tilerl.server import _ws_body
+    moved = _ws_body({"enable_thinking": True})
+    assert moved == {"chat_template_kwargs": {"enable_thinking": True}}, moved
+
+
 def test_the_websocket_protocol_library_is_installed():
     """`TestClient.websocket_connect` fakes the transport in-process.
 
