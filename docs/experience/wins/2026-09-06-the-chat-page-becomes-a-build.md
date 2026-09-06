@@ -1,6 +1,6 @@
-# The chat page becomes a build — WebSocket transport, CPU + pending-remote, 2026-09-06
+# The chat page becomes a build — WebSocket transport, V100 + CPU, 2026-09-06
 
-> Status: pending-remote (V100 wall-clock unmeasured; local CPU gates green)
+> Status: Shipped (#175, `363de2a`; served on the V100, throughput below)
 
 ## Context
 
@@ -193,15 +193,36 @@ so a `server`-extra-only dependency is absent on CI and present locally.
 
 ## Results
 
-| date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
-|---|---|---|---|---|---|---|---|
-| 2026-09-06 | pending | Mac (CPU) | cpu | tiny | — | — | n/a — gates only |
-| pending-remote | — | V100 | cuda sm70 | Qwen3.8-27B | — | — | — |
+| date | commit | machine | target | model | ttft s | throughput tok/s | tokens |
+|---|---|---|---|---|---:|---:|---:|
+| 2026-09-06 | 363de2a | Mac (CPU) | cpu | tiny | — | n/a — gates only | — |
+| 2026-09-06 17:5x +0800 | 363de2a | V100 | cuda sm70 | Qwen3.8-27B | 0.57 | **46.5** | 1500 (cap, `length`) |
+| 2026-09-06 17:5x +0800 | 363de2a | V100 | cuda sm70 | Qwen3.8-27B | 0.78 | **50.4** | 491 (`stop`) |
+
+Measured by 27 over `/ws/chat`, idle endpoint, thinking on, cap 1500,
+**client-side timing from the first delta to the last, one request per row** —
+not a server-side counter and not an average over repeats, so treat these as
+single-sample. Row 1 is a 300-word essay in 32.3 s over 817 frames; row 2 an
+HTML page in 9.7 s over 254 frames.
+
+**The coalescing ratio holds on the real model: 1.84 and 1.93 tokens per
+frame**, against the 1.83 the SSE path measured on the 27B and recorded in
+`_stream`'s own comment. That resolves the one anomaly from the first live
+run, where a 74-character reasoning block arrived in 21 frames (3.5
+chars/frame) and looked like a different coalescing regime; it was the
+short-block case, where the 20 ms poll dominates rather than the decode.
+
+Row 1's `length` finish is the truncation branch firing on real weights —
+until this run it was exercised only on the CPU double.
+
+**Against the 34.0 tok/s the SSE page last measured: both figures stand, no
+ratio.** Different day, different card state, different measurement harness;
+dividing them would manufacture a speedup out of two unpaired samples. A
+transport comparison needs both arms on one card in one session, which nobody
+has run.
 
 No hot-path arithmetic changed: `_deltas` is the same poll loop the SSE route
-already ran, moved behind a function boundary. The remote row is the served
-tok/s over `/ws/chat` versus the 34.0 tok/s the SSE page last measured, which
-needs a card and a redeploy.
+already ran, moved behind a function boundary.
 
 Raw artifacts: `web/` sources, `src/tilerl/static/` bundle, byte counts above
 reproducible with `wc -c` and `gzip -c`.
