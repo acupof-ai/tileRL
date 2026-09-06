@@ -1,9 +1,11 @@
 """What does write-through cost the prefill it runs inside?
 
 `insert` offers every publish to the tier: a GPU->CPU copy of the KV and the GDN snapshot
-plus an enqueue, with the save handed to a daemon (641.8 ms measured for a 320.6 MiB
-entry on a 499.6 MiB/s host SSD, `scripts/probe_save_ms.py` — not the ~100 ms this line
-used to assert). The copy is synchronous
+plus an enqueue, with the save handed to a daemon (**1337 ms durable** for a 320.6 MiB
+entry on the pod's `/work` = 240 MiB/s; `ssd_save_ms` reports 273 there because the timer
+wraps `torch.save` with no fsync, and the 641.8 this line used to quote was a Mac whose
+volume writes 26x faster — errors/2026-09-06-ssd-save-ms-is-page-cache-time.md). The copy
+is synchronous
 and lands mid-prefill, so it is charged to the request that published it. This measures
 that charge with the ONLY variable being `--ssd-path`.
 
