@@ -9,11 +9,16 @@ import { type Frame, parseFrame } from "./protocol"
  * `onFrame` is called for each frame; the promise settles when the socket closes,
  * and rejects only on a transport error. The caller's `finally` is what releases
  * the composer, so a dropped connection cannot leave the page stuck.
+ *
+ * `onStop` receives a function that closes the socket. Handing it out rather than
+ * returning the socket keeps the WebSocket itself inside this file -- the caller
+ * can end the stream and cannot send on it.
  */
 export const ask = (
   url: string,
   body: unknown,
   onFrame: (f: Frame) => void,
+  onStop?: (stop: () => void) => void,
 ): Promise<void> =>
   new Promise<void>((resolve, reject) => {
     const ws = new WebSocket(url)
@@ -30,6 +35,11 @@ export const ask = (
     // on a `done` frame that a dropped connection never sends.
     ws.onclose = () => resolve()
     ws.onerror = () => reject(new Error("connection failed"))
+    // resolve on user stop: the tokens on screen are the reply, not a failure
+    onStop?.(() => {
+      ws.close()
+      resolve()
+    })
   })
 
 /** ws:// for http://, wss:// for https://. Derived from the page's own origin so
