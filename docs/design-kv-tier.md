@@ -189,11 +189,21 @@ chat. Only 7.0 s of that 68.7 s is the copies; the rest is contention in the pre
 they interrupt.
 
 **Ships `dram_bytes=0`, opt-in for multi-user serving.** Off is right for the
-single-session endpoint this pod runs and wrong above 9 concurrent sessions, and the
-flag is the only thing that distinguishes them. `tilerl serve --dram-bytes <n>` sets it;
+single-session endpoint this pod runs. `tilerl serve --dram-bytes <n>` sets it;
 `/health`'s `dram_budget` says the tier is on and `dram_promotions` says the workload
-crossed the threshold. What is still unmeasured is the V100 wall clock at 12 sessions —
-the CPU numbers above are hit counts, not time.
+crossed the threshold.
+
+**Measured above the crossover 2026-09-06, and the answer is negative on this
+workload.** The claim "wrong above 9 concurrent sessions" came from hit counts on a
+pool that was block-bound, so the tier never ran. With the pool enlarged to 3072 blocks
+(`--max-ctx 49152`) at 12 sessions on H20 card 6, state bytes did reach their ceiling
+first — by 7.5 points — and 7 demotions fired. Then blocks hit 99.4% and every insert
+after that took `evict_until_free`, which cannot demote: **262 evictions, 7 demotions,
+0 promotions, 635 ms of demote copies for nothing.** A demotion returns bytes and no
+blocks, and the two ceilings arrive 1.4 points apart, so relieving one buys a single
+request rather than a regime. The validity criterion for any future arm is
+`dram_promotions > 0`, not `dram_demotions > 0`.
+[errors/2026-09-06-the-tier-crosses-the-ceiling-and-stops.md](experience/errors/2026-09-06-the-tier-crosses-the-ceiling-and-stops.md)
 
 **RL rollouts are not a second case for it:** within a group the shared prompt is the
 MRU entry, and the store is cleared between steps, so nothing ages out and returns.

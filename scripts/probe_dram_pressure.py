@@ -1,21 +1,29 @@
-"""Which pressure evicted 27 entries per arm -- blocks, or state bytes?
+"""Which operand binds when the prefix store evicts -- blocks, or state bytes?
 
-`demote=0` with `evictions=27` in every arm says the tier was never called. There are two
-eviction paths and only one of them can demote:
+There are two eviction paths and only one can demote:
 
 * `insert`'s tail loop, on `len > capacity or state_used > state_bytes` -- this one tries
   `_demote_one` first when a tier exists.
 * `evict_until_free`, called when the BLOCK POOL cannot satisfy an allocation -- it calls
-  `_evict_one` directly and cannot demote, by design: a snapshot tier cannot return blocks.
+  `_evict_one` directly and cannot demote, by design: a snapshot tier returns no blocks.
 
-Reading the code says which is which; it does not say which one ran. So serve the same
-prompts with the tier on and read `/health` after every turn, printing both operands of
-each condition: `blocks_used`/`blocks_total` and `prefix_state_bytes` against the store's
-byte budget. Whichever is at its ceiling when evictions jump is the pressure.
+Reading the code says which is which; it does not say which one ran. This serves
+interleaved prompts and prints EVERY `/health` key after each turn, so both operands and
+both ceilings are in the record: `pool_used_blocks`/`blocks_total` and
+`prefix_state_bytes`/`prefix_state_bytes_budget`.
+
+Measured with it on H20 card 6 at `--max-ctx 49152 --sessions 12`: state bytes reached
+99.4% while blocks were at 91.9%, 7 demotions fired, and then blocks hit 99.4% and every
+subsequent insert took `evict_until_free` -- 262 evictions, 0 promotions. A demotion
+returns bytes and no blocks, so crossing the byte ceiling first buys one request.
+
+  scripts/pod_run.sh calib 6 -- /work/tl013/bin/python -u \\
+      scripts/probe_dram_pressure.py --max-ctx 49152 --sessions 12
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import signal
@@ -38,12 +46,23 @@ def _stats():
 
 
 def main() -> int:
-    sessions, turns, grow = 2, 3, 40
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--max-ctx", type=int, default=8192,
+                    help="block pool ceiling. 8192 is block-bound throughout; 49152 crosses "
+                         "the byte ceiling first for exactly one request")
+    ap.add_argument("--sessions", type=int, default=2)
+    ap.add_argument("--turns", type=int, default=3)
+    ap.add_argument("--grow", type=int, default=40)
+    ap.add_argument("--slots", type=int, default=3)
+    ap.add_argument("--log", default=LOG)
+    a = ap.parse_args()
+    sessions, turns, grow = a.sessions, a.turns, a.grow
     cmd = [sys.executable, "-u", "-m", "tilerl.cli", "serve", "--model", "qwen38-27b",
            "--host", "127.0.0.1", "--port", str(PORT), "--max-batch", "1",
-           "--max-ctx", "8192", "--slots", "3", "--dram-bytes", str(4 << 30)]
+           "--max-ctx", str(a.max_ctx), "--slots", str(a.slots),
+           "--dram-bytes", str(4 << 30)]
     env = dict(os.environ, TILELANG_CACHE_DIR="/work/tilelang_cache")
-    with open(LOG, "wb") as f:
+    with open(a.log, "wb") as f:
         proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
     try:
         end = time.monotonic() + 900
@@ -59,9 +78,9 @@ def main() -> int:
             raise TimeoutError("server not up")
 
         assert st.get("dram_budget") == (4 << 30), f"tier off: dram_budget={st.get('dram_budget')}"
-        # `/health` does not publish the store's byte budget, so state-byte pressure is
-        # read as prefix_state_bytes RISING and then flattening, not against a ceiling.
-        print(f"pool: blocks_total={st['blocks_total']}", flush=True)
+        print(f"pool: blocks_total={st['blocks_total']}  max_ctx={a.max_ctx}  "
+              f"state_budget={st.get('prefix_state_bytes_budget', 0) / (1 << 30):.2f} GiB",
+              flush=True)
         # EVERY key, not a chosen subset. Three of the four rounds this probe took were
         # spent on a question `pool_used_blocks` already answered: it was in the response
         # the whole time and absent from the tuple I had listed, so the probe reported a
