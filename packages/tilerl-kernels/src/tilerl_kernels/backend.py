@@ -1036,8 +1036,8 @@ class Backend:
 
         ``q_pos``/``k_pos`` are absolute sequence positions, needed once CP gives
         this rank a subset of the queries against every rank's keys."""
-        # ponytail: torch-eager chunked forward, tilelang kernel when perf demands
-        out = reference.chunked_attention(q, k, v, float(scale), q_pos, k_pos)
+        # ponytail: torch-eager forward, tilelang kernel when perf demands
+        out = reference.dense_attention(q, k, v, float(scale), q_pos, k_pos)
         if gate is not None:
             out = out * torch.sigmoid(self._f32(gate))
         return out
@@ -1136,8 +1136,8 @@ class Backend:
         return reference.linear_frozen_bwd(grad, wq, scale, oscale=oscale, fp8=fp8)
 
     def attention_bwd(self, grad, q, k, v, scale, q_pos=None, k_pos=None):
-        # ponytail: torch-eager chunked backward, tilelang kernel when perf demands
-        return reference.chunked_attention_bwd(grad, q, k, v, float(scale), q_pos, k_pos)
+        # ponytail: torch-eager backward, tilelang kernel when perf demands
+        return reference.dense_attention_bwd(grad, q, k, v, float(scale), q_pos, k_pos)
 
     def attention_gate_bwd(self, grad, attn_out, gate):
         return reference.attention_gate_bwd(grad, attn_out, gate)
