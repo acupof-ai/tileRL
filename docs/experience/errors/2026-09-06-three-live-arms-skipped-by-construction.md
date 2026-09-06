@@ -75,6 +75,12 @@ prompt provokes long reasoning, and `max_tokens` was spent inside the block — 
 reply was reasoning and nothing else, and the messages arm correctly reported
 `max_tokens` rather than a stop.
 
+**This is not specific to this probe.** 25 pointed out that the WS page's own
+truncation notice exists for the same condition, so "the cap is spent inside `<think>`
+and the client receives no prose" is the default outcome of **any** thinking-on request
+with a modest `max_tokens` — not a quirk of `api_e2e.py`. Anything that asserts on prose
+has to either disable thinking or size the cap for reasoning plus the answer.
+
 **Chosen fix: thinking OFF on all three stop arms** (`enable_thinking: false` on the
 OpenAI route, `thinking: {"type": "disabled"}` on Anthropic), not a larger
 `max_tokens`. The stop contract is about the prose a client receives; a cap sized for
