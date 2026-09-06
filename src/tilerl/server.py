@@ -28,7 +28,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .messages import _parse_tool_calls, mount_messages
-from .prompt import refuse_unsupported, render_prompt, sampling, split_think
+from .prompt import (
+    cut_at_stop,
+    refuse_unsupported,
+    render_prompt,
+    sampling,
+    split_think,
+    stop_texts,
+)
 from .responses import mount_responses
 from .tokenizer import ByteTokenizer, Tokenizer, get_tokenizer  # noqa: F401
 from .ui_assets import _CHAT_UI, _LANDING
@@ -70,10 +77,8 @@ class ChatCompletionRequest(BaseModel):
     #: both want Anthropic's flat {name, description, input_schema}.
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
-    #: Declared only so it can be REFUSED: an undeclared field is dropped by
-    #: pydantic without a trace, so the client gets a 200 and no sign its stop
-    #: never applied. Unimplemented, not unsupported -- see
-    #: errors/2026-09-06-stop-sequences-accepted-and-never-applied.md.
+    #: A bare string or a list; both are documented. Honoured by the engine, so
+    #: `finish_reason` is "stop" and the sequence is cut from the returned text.
     stop: str | list[str] | None = None
 
     model_config = {"populate_by_name": True}
@@ -189,8 +194,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             thinking = (len(tokenizer.encode("<think>")) == 1 or None) if cap != 0 else False
         # We render tools into the prompt and cannot force or forbid a call, so a
         # tool_choice stronger than a hint is refused rather than echoed.
-        refuse_unsupported(tool_choice=_unsupported_choice(req.tool_choice),
-                           stop=req.stop)
+        refuse_unsupported(tool_choice=_unsupported_choice(req.tool_choice))
         tools = _flatten_tools(req.tools)
         input_ids = tokenizer.encode(_render_chat(
             req.messages, thinking, kw.get("reasoning_effort") or req.reasoning_effort, tools
@@ -199,7 +203,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             raise ValueError("empty prompt after tokenization")
         params = sampling(tokenizer, thinking, req.max_tokens if req.max_tokens is not None else 512,
                           temperature=req.temperature, top_p=req.top_p, max_think_tokens=cap,
-                          seed=req.seed, logprobs=bool(req.logprobs))
+                          seed=req.seed, logprobs=bool(req.logprobs), stop=req.stop)
         # bool(thinking): True when the prompt opened <think>, so the reply carries only
         # the closer and strip_think must be told (None = bare turn, nothing to strip)
         return (engine.submit(input_ids, params), len(input_ids), params.max_new_tokens,
@@ -263,7 +267,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             return StreamingResponse(
                 _stream(request_id, max_new, prompt_tokens, opened, bool(
                     (req.stream_options or {}).get("include_usage")
-                )),
+                ), stop_texts(req.stop)),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -285,6 +289,10 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         # only, and a client that switched got the reasoning on one path and lost
         # it on the other.
         reasoning, text = split_think(tokenizer.decode(output_ids), opened)
+        # The engine keeps the token that completed the match, so `text` still
+        # carries the sequence and all three APIs exclude it.
+        stopped = engine.stop_text(request_id)
+        text = cut_at_stop(text, stopped)
         # The template answers a tool request in <tool_call> XML; parse it with the
         # SAME function /v1/messages uses, so one call cannot mean two things
         # depending on which API asked. The prose before the first call is the
@@ -325,8 +333,10 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                                 "reasoning_content": reasoning or None,
                                 "tool_calls": tool_calls},
                     "logprobs": None if content is None else {"content": content},
-                    "finish_reason": ("tool_calls" if tool_calls else
-                                      "length" if len(output_ids) >= max_new else "stop"),
+                    # A stop sequence is OpenAI's "stop" too, and it takes precedence
+                    # over length: the cap was not what ended this one.
+                    "finish_reason": ("tool_calls" if tool_calls else "stop" if stopped
+                                      else "length" if len(output_ids) >= max_new else "stop"),
                 }
             ],
             "usage": _usage(prompt_tokens, len(output_ids)),
@@ -334,7 +344,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         }
 
     def _stream(request_id: int, max_new: int, prompt_tokens: int, opened: bool,
-                include_usage: bool):
+                include_usage: bool, stops: tuple[str, ...] = ()):
         created = int(time.time())
         chunk_id = f"chatcmpl-{request_id}"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {"role": "assistant"}))
@@ -342,6 +352,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         sent = 0  # characters of the STRIPPED reply already emitted
         sent_r = 0  # characters of the reasoning already emitted
         seen = 0  # tokens already decoded, so a quiet poll costs nothing
+        # the most of a stop sequence that can still turn out to be a prefix
+        hold = max((len(x) for x in stops), default=1) - 1
 
         def content_frame(delta: dict, completion: int) -> str:
             # Cumulative tokens on every content frame, vLLM's continuous_usage_stats
@@ -382,6 +394,13 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                     if len(reasoning) > sent_r:
                         yield content_frame({"reasoning_content": reasoning[sent_r:]}, seen)
                         sent_r = len(reasoning)
+                    # Two cases, and a holdback alone gets the first one wrong: once a
+                    # match is COMPLETE cut there; while one may still be forming, hold
+                    # back `hold` chars. Measured: holding only, the frame before the
+                    # final one carried "The answer " -- the leading space of " is".
+                    if stops:
+                        done = [text.index(x) for x in stops if x in text]
+                        text = text[:min(done)] if done else text[:max(0, len(text) - hold)]
                     if len(text) > sent:
                         yield content_frame({"content": text[sent:]}, seen)
                         sent = len(text)
@@ -408,11 +427,15 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         # sent counts stripped characters, so these are the remainders of the same
         # strings the deltas were cut from
         reasoning, text = split_think(tokenizer.decode(output_ids), opened)
+        stopped = engine.stop_text(request_id)
+        text = cut_at_stop(text, stopped)
         if len(reasoning) > sent_r:
             yield content_frame({"reasoning_content": reasoning[sent_r:]}, len(output_ids))
+        # The held-back tail lands here, minus the stop sequence: `sent` counts what
+        # actually went out, so this is the remainder either way.
         if len(text) > sent:
             yield content_frame({"content": text[sent:]}, len(output_ids))
-        finish = "length" if len(output_ids) >= max_new else "stop"
+        finish = "stop" if stopped else "length" if len(output_ids) >= max_new else "stop"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=finish))
         # A final usage-only chunk, OpenAI's include_usage shape. Without it a client can
         # only guess the token count from characters, and chars/4 is ~4x low for Chinese

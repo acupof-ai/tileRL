@@ -110,7 +110,7 @@ def _shard(cfg, model, tp: int, backend, model_mod):
 
 def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16,
                   blocks=0, max_ctx=0, max_batch=8, ssd_path="", ssd_min_tokens=0,
-                  dram_bytes=0):
+                  dram_bytes=0, decode=None):
     """Serving-size engine; ``devices`` replicates it across those CUDA indices.
 
     ``max_ctx`` caps the served context; it still defaults to the model's own limit,
@@ -139,6 +139,10 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
             kw["ssd_min_tokens"] = ssd_min_tokens
     if dram_bytes:
         kw["dram_bytes"] = dram_bytes
+    # Text stop sequences are matched on decoded ids, so the engine needs the
+    # tokenizer's decode; without it `submit` refuses a request that carries one.
+    if decode is not None:
+        kw["decode"] = decode
     if not devices:
         return engine_mod.build_engine(cfg, model, backend, **kw)
 
@@ -169,12 +173,14 @@ def cmd_serve(args: argparse.Namespace) -> None:
         from .spec import load_draft
 
         draft = load_draft(model, args.draft)
+    # Before the engine: it takes the decode for stop sequences.
+    tokenizer = _qwen38_tokenizer() if args.model == "qwen38-27b" else get_tokenizer(None)
     engine = _build_engine(cfg, model, backend, devices=args.devices,
                            draft=draft, depth=args.depth, slots=args.slots,
                            blocks=args.blocks, max_ctx=args.max_ctx,
                            max_batch=args.max_batch, ssd_path=args.ssd_path,
-                           ssd_min_tokens=args.ssd_min_tokens, dram_bytes=args.dram_bytes)
-    tokenizer = _qwen38_tokenizer() if args.model == "qwen38-27b" else get_tokenizer(None)
+                           ssd_min_tokens=args.ssd_min_tokens, dram_bytes=args.dram_bytes,
+                           decode=tokenizer.decode)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
     # Print the pool: with --blocks 0 it is fitted to the card, so this is the served

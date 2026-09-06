@@ -36,6 +36,10 @@ PLAIN = f"{REASON}\n</think>\n\n{REPLY}"
 TOOL_CALL = ("</think>\n\nI will run it.\n<tool_call>\n<function=Bash>\n"
              "<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>")
 
+#: reasoning with a paragraph break INSIDE the block, then two more after it: a stop
+#: of "\n\n" matched from token 0 fires on the first and returns no answer at all.
+PARAGRAPHS = "a\n\nb</think>\n\nc\n\nd"
+
 
 class _PromptKeyedEngine(_ScriptedEngine):
     """``_ScriptedEngine`` serves replies in SUBMIT order, which makes every
@@ -59,7 +63,8 @@ class _PromptKeyedEngine(_ScriptedEngine):
         # assertion reads as a route defect. The tool response in the prompt is
         # what distinguishes turn 2.
         wants_call = "run ls" in prompt and "<tool_response>" not in prompt
-        self._replies = [TOOL_CALL if wants_call else PLAIN]
+        self._replies = [TOOL_CALL if wants_call
+                         else PARAGRAPHS if "paragraphs" in prompt else PLAIN]
         return super().submit(input_ids, params)
 
 
@@ -492,14 +497,7 @@ def test_chat_refuses_a_tool_choice_it_cannot_force(oa):
     assert "tool_choice" in exc.value.body["message"]
 
 
-def test_messages_refuses_stop_sequences_and_context_management(an):
-    """stop_sequences was accepted and never applied, so stop_reason could never
-    be "stop_sequence" -- a client waiting for one waited forever."""
-    with pytest.raises(anthropic.BadRequestError) as exc:
-        an.messages.create(model="tilerl", max_tokens=64,
-                           messages=[{"role": "user", "content": "hi"}],
-                           stop_sequences=["\n\n"])
-    assert "stop_sequences" in exc.value.body["error"]["message"]
+def test_messages_refuses_a_context_edit_it_does_not_perform(an):
     # An edit we do NOT perform is refused and named.
     with pytest.raises(anthropic.BadRequestError) as exc2:
         an.messages.create(model="tilerl", max_tokens=64,
@@ -524,21 +522,95 @@ def test_messages_accepts_the_context_edit_claude_code_always_sends(an):
     assert _text_of(m) == REPLY
 
 
-def test_chat_refuses_stop_rather_than_dropping_it(oa):
-    """`stop` is a core OpenAI field we do not implement.
+#: cuts REPLY ("The answer is 4.") mid-sentence, so a passing arm proves the reply
+#: was actually truncated -- a stop that matched only at the very end would pass
+#: even if nothing applied it.
+STOP = " is"
+CUT = "The answer"
 
-    It was not even declared, so pydantic discarded it and the client got a 200
-    with no sign the stop never applied. Refused with 400 until the engine grows
-    multi-token stop ids (errors/2026-09-06-stop-sequences-accepted-and-never-
-    applied.md); tracked in OPEN.md rather than treated as settled.
+
+def test_chat_applies_a_stop_sequence_and_excludes_it(oa):
+    """A stop cuts the reply at the match and reports finish_reason "stop".
+
+    The engine keeps the token that completed the match so the caller can find it;
+    the route cuts there, because OpenAI excludes the sequence from the content.
     """
-    with pytest.raises(openai.BadRequestError) as exc:
-        oa.chat.completions.create(model="tilerl", stop=["\n\n"],
-                                   messages=[{"role": "user", "content": "hi"}])
-    assert "stop" in exc.value.body["message"]
+    r = oa.chat.completions.create(model="tilerl", stop=[STOP],
+                                   messages=[{"role": "user", "content": "hi"}],
+                                   extra_body=THINKING_ON)
+    assert r.choices[0].message.content == CUT
+    assert r.choices[0].finish_reason == "stop"
 
 
-def test_responses_refuses_stop_rather_than_dropping_it(oa):
-    with pytest.raises(openai.BadRequestError) as exc:
-        oa.responses.create(model="tilerl", input="hi", extra_body={"stop": ["\n\n"]})
-    assert "stop" in exc.value.body["message"]
+def test_chat_takes_a_bare_string_stop(oa):
+    """OpenAI documents `stop` as a string OR a list; a list-only reader would
+    treat "is" as four separate one-character stops and cut at the first "i"."""
+    r = oa.chat.completions.create(model="tilerl", stop=STOP,
+                                   messages=[{"role": "user", "content": "hi"}],
+                                   extra_body=THINKING_ON)
+    assert r.choices[0].message.content == CUT
+
+
+def test_chat_stream_never_emits_the_stop_sequence(oa):
+    """The stop arrives one token at a time, so a stream that forwards each delta
+    as it decodes leaks a prefix of it before the match completes."""
+    chunks = oa.chat.completions.create(
+        model="tilerl", stop=[STOP], stream=True, extra_body=THINKING_ON,
+        messages=[{"role": "user", "content": "hi"}])
+    text, finish = "", None
+    for c in chunks:
+        if c.choices:
+            text += c.choices[0].delta.content or ""
+            finish = c.choices[0].finish_reason or finish
+    assert text == CUT
+    assert finish == "stop"
+
+
+def test_messages_reports_the_sequence_that_stopped_it(an):
+    """Anthropic's shape: stop_reason "stop_sequence" AND the matched string, which
+    is what a client keys on to tell "hit my delimiter" from "finished"."""
+    m = an.messages.create(model="tilerl", max_tokens=64, stop_sequences=[STOP],
+                           messages=[{"role": "user", "content": "hi"}],
+                           extra_body=THINKING_ON)
+    assert _text_of(m) == CUT
+    assert m.stop_reason == "stop_sequence"
+    assert m.stop_sequence == STOP
+
+
+def test_a_stop_does_not_fire_inside_the_reasoning_block(an):
+    """A paragraph stop must not end the request inside <think>.
+
+    With thinking on, matching from the first token means "\n\n" fires on the
+    reasoning's first paragraph break: the client gets a truncated thought and NO
+    answer, on every such request. Measured on a real engine before the fix -- the
+    request ended at token 1. Stops match only past the closer.
+    """
+    m = an.messages.create(model="tilerl", max_tokens=64, stop_sequences=["\n\n"],
+                           messages=[{"role": "user", "content": "paragraphs"}],
+                           extra_body=THINKING_ON)
+    # "c", not "a": the two breaks inside the block are not matches, the one after is.
+    assert _text_of(m) == "c"
+    assert m.stop_reason == "stop_sequence"
+    assert m.stop_sequence == "\n\n"
+
+
+def test_messages_stop_sequence_is_null_when_none_matched(an):
+    """The negative half: a request with a stop that never fires must report null,
+    or a client reading the field cannot distinguish the two endings."""
+    m = an.messages.create(model="tilerl", max_tokens=64, stop_sequences=["ZZZ"],
+                           messages=[{"role": "user", "content": "hi"}],
+                           extra_body=THINKING_ON)
+    assert _text_of(m) == REPLY
+    assert m.stop_reason == "end_turn"
+    assert m.stop_sequence is None
+
+
+def test_responses_applies_a_stop_and_stays_completed(oa):
+    """A stop sequence is a COMPLETE response: reporting incomplete/max_output_tokens
+    would tell a client to ask for more when it already got what it asked for."""
+    r = oa.responses.create(model="tilerl", input="hi", extra_body=dict(
+        THINKING_ON, stop=[STOP]))
+    assert r.output_text == CUT
+    assert r.status == "completed"
+    assert r.incomplete_details is None
+

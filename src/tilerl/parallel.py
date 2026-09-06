@@ -76,6 +76,10 @@ class DataParallelEngine:
         i = request_id % self._n
         return self._engines[i].peek(request_id // self._n)
 
+    def stop_text(self, request_id: int) -> str | None:
+        i = request_id % self._n
+        return self._engines[i].stop_text(request_id // self._n)
+
     @property
     def limits(self) -> Any:
         # Part of the seam, not an Engine internal: a caller clamps its request against

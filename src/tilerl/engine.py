@@ -22,7 +22,8 @@ by the matched token tuple. The engine is the sole publisher, so an entry
 without a snapshot can never be adopted. Full-length hits are misses.
 
 Sampling is seeded per (request, position), so same seed + input => same
-output. The engine is tokenizer-free.
+output. The engine is tokenizer-free unless a caller asks for text stop
+sequences: ``decode=`` is the one place ids become text, for ``stop_texts``.
 # ponytail: no preemption/swap — admission is capped at ``max_batch``.
 """
 
@@ -132,6 +133,10 @@ class SamplingParams:
     max_new_tokens: int = 16
     seed: int = 0
     stop_token_ids: tuple[int, ...] = ()
+    #: text stop sequences; generation ends at the token that completes one. Needs
+    #: ``Engine(decode=...)`` -- ``submit`` refuses these without it rather than
+    #: accepting a stop that can never fire.
+    stop_texts: tuple[str, ...] = ()
     allowed_ids: tuple[int, ...] | None = None  # restrict sampling to these ids
     #: cap on <think>: ``end_think_ids`` are forced after this many tokens; None = unbounded
     max_think_tokens: int | None = None
@@ -151,6 +156,24 @@ def _restrict(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
         kth = torch.topk(logits, params.top_k, dim=-1).values[..., -1:]
         logits = logits.masked_fill(logits < kth, float("-inf"))
     return logits
+
+
+def _stop_hit(decode: Any, reply: list[int], stops: tuple[str, ...]) -> str | None:
+    """The stop sequence the newest token just completed, or None.
+
+    ``reply`` is the tokens a stop may match against -- the output PAST the reasoning
+    block, never the reasoning itself: a stop like "\n\n" would otherwise fire on the
+    first paragraph break inside <think> and end the request with a truncated thought
+    and no answer at all.
+
+    Decodes only the last ``k`` tokens, ``k`` = the longest stop in characters: a
+    token carries at least one character, so k of them always cover a k-character
+    match, and the per-token cost is one decode of a short id list instead of the
+    whole output. Ties go to the earliest occurrence, which is where the caller cuts.
+    """
+    tail = decode(reply[-max(len(s) for s in stops):])
+    hits = [(tail.find(s), s) for s in stops if s in tail]
+    return min(hits)[1] if hits else None
 
 
 @dataclass(frozen=True)
@@ -174,6 +197,8 @@ class _Req:
     output: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     thought_closed: bool = False  # the reasoning block ended (model's or forced)
+    stop_text: str | None = None  # the stop sequence that ended it, for the caller to cut at
+    reply_from: int = 0  # index in `output` past the reasoning closer; stops match only here on
     #: trunk hidden [1,w,H] at positions [hidden_from, hidden_from+w): the draft's fc input
     hidden: torch.Tensor | None = None
     hidden_prev: torch.Tensor | None = None  # [1,1,H] at hidden_from-1
@@ -318,9 +343,15 @@ class Engine:
         decode_graph: bool | None = None,
         draft: Any = None,
         spec_depth: int | None = None,
+        decode: Any = None,
     ) -> None:
         self._model = model
         self._backend = backend
+        # Text stop sequences need ids->str, and only here: a stop string does not
+        # have to be a token boundary, so a tail-of-ids comparison would miss the
+        # match whenever the model merged the last character into a wider token.
+        # Still tokenizer-FREE by default -- `decode=None` disables `stop_texts`.
+        self._decode = decode
         self._kv = kv_pool
         self._states = state_pool
         self._prefix = prefix_store
@@ -407,6 +438,9 @@ class Engine:
         self._waiting: deque[_Req] = deque()
         self._running: list[_Req] = []
         self._finished: dict[int, list[int]] = {}
+        #: rid -> the stop sequence that ended it. Not popped with the tokens: the
+        #: routes read it after `take`, and only a matched request has an entry.
+        self._finished_stop: dict[int, str] = {}
         self._failed: dict[int, str] = {}
         self._finished_count = 0
 
@@ -456,6 +490,15 @@ class Engine:
         tokens = [int(t) for t in input_ids]
         if not tokens:
             raise ValueError("prompt must be non-empty")
+        if params.stop_texts and self._decode is None:
+            raise ValueError(
+                "stop_texts needs Engine(decode=tokenizer.decode): matching happens on "
+                "decoded text, and accepting the field without it is a stop that can "
+                "never fire"
+            )
+        if any(not s for s in params.stop_texts):
+            # "" is in every string, so it would end the request at token 1.
+            raise ValueError("stop_texts entries must be non-empty")
         if params.max_new_tokens > 0:
             total = len(tokens) + params.max_new_tokens
             if total > self.limits.max_total_tokens:
@@ -539,6 +582,12 @@ class Engine:
             out = dict(self._finished)
             self._finished.clear()
             return out
+
+    def stop_text(self, request_id: int) -> str | None:
+        """The stop sequence that ended this request, or None if none did. Pops, so
+        the routes' `_finished_stop` entries do not outlive the run."""
+        with self._lock:
+            return self._finished_stop.pop(request_id, None)
 
     def logprobs(self, request_id: int) -> list[float] | None:
         """log q of each returned token under the truncated, tempered distribution
@@ -1135,9 +1184,21 @@ class Engine:
                 req.logprobs.append(float("nan") if tok != raw else lps[i])
             if n and not req.thought_closed and tuple(req.output[-n:]) == p.end_think_ids:
                 req.thought_closed = True
+                req.reply_from = len(req.output)
             req.tokens.append(tok)
             req.seq_len += 1
             self._tokens_generated += 1
+            # After the append: the contract keeps the token that completed the match
+            # in `output`, so the caller's decode sees it and cuts the text at the
+            # match's start. Dropping it would leave a partial stop in the reply.
+            # Only past the closer when the prompt opened <think> -- a stop inside the
+            # reasoning would return a truncated thought and no answer.
+            if (p.stop_texts and (req.thought_closed or not p.end_think_ids)
+                    and (hit := _stop_hit(self._decode, req.output[req.reply_from:],
+                                          p.stop_texts))):
+                req.stop_text = hit
+                self._finish(req)
+                return
             materialized = req.seq_len - 1
             if i == last and req.phase == _PHASE_DECODE and materialized % BLOCK_TOKENS == 0:
                 self._publish_prefix(req, materialized)
@@ -1175,6 +1236,8 @@ class Engine:
         self._slots_used -= 1
         if error is None:
             self._finished[req.req_id] = req.output
+            if req.stop_text is not None:
+                self._finished_stop[req.req_id] = req.stop_text
             if req.params.logprobs:
                 self._finished_logprobs[req.req_id] = req.logprobs
         else:
@@ -1298,6 +1361,7 @@ def build_engine(
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
+    decode: Any = None,
 ) -> Engine:
     """Wire a model + backend into an Engine; pool shapes come from ``cfg``.
     ``decode_graph`` None auto-enables the captured decode tick on CUDA.
@@ -1401,4 +1465,5 @@ def build_engine(
         decode_graph=decode_graph,
         draft=draft,
         spec_depth=spec_depth,
+        decode=decode,
     )
