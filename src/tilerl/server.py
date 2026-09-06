@@ -5,6 +5,8 @@ Route surface (mirrors agent-infer's infer-server, trimmed to tileRL):
 * ``GET  /health``                 — liveness + engine stats
 * ``GET  /v1/models``              — served model identity
 * ``POST /v1/chat/completions``    — OpenAI schema; ``stream=true`` -> SSE
+* ``POST /v1/messages``            — Anthropic Messages (messages.py)
+* ``POST /v1/responses``           — OpenAI Responses (responses.py)
 * ``GET  /``                       — single-file HTML chat UI (no build step)
 * ``GET  /about``                  — what tileRL is, target matrix
 
@@ -27,6 +29,7 @@ from pydantic import BaseModel, Field
 
 from .messages import _parse_tool_calls, mount_messages
 from .prompt import render_prompt, sampling, split_think
+from .responses import mount_responses
 from .tokenizer import ByteTokenizer, Tokenizer, get_tokenizer  # noqa: F401
 from .ui_assets import _CHAT_UI, _LANDING
 
@@ -409,6 +412,10 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     # Anthropic Messages: what Claude Code speaks. Same engine, same tokenizer;
     # it records token ids per request, which the OpenAI route does not.
     mount_messages(app, engine, tokenizer, model_name)
+
+    # OpenAI Responses: the same engine again, differing only in wire shape --
+    # a flat typed `output` list instead of `choices`.
+    mount_responses(app, engine, tokenizer, model_name)
 
     # The root is the playground: whoever opens the host:port wants to type at the
     # model, not read what tileRL is. The landing page keeps its content at /about.
