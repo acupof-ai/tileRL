@@ -172,8 +172,13 @@ def run_rollout(task: str, cwd: str, base_url: str, tag: str, *, sandbox: bool =
                 f"sandbox unavailable ({why}); pass sandbox=False to run unisolated"
             )
         cmd += ["--settings", json.dumps(sandbox_settings(host, int(port or 80)))]
-    env = {
-        **os.environ,
+    # Strip by prefix, not by an allow-list of names: this machine exports 20 ANTHROPIC_*/
+    # CLAUDE* vars, and a rollout that inherits them depends on which session spawned it --
+    # ANTHROPIC_MODEL made the child print `unrecognized_model`, and
+    # CLAUDE_CODE_MESSAGING_SOCKET/_TOKEN hand it a channel back into the parent session.
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("ANTHROPIC_", "CLAUDE"))}
+    env |= {
         "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_API_KEY": "tilerl-local",
         "ANTHROPIC_CUSTOM_HEADERS": f"x-tilerl-rollout: {tag}",
