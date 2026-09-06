@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field
 
 from .prompt import (
     blocks_to_text,
+    cut_at_stop,
     refuse_unsupported,
     render_prompt,
     render_tool_call,
@@ -188,10 +189,7 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def _run(req: MessagesRequest, rollout: str | None = None) -> tuple[dict[str, Any], int]:
-        # stop_sequences was accepted and never applied, so `stop_reason` could
-        # never be "stop_sequence" and a client waiting for one waited forever.
-        refuse_unsupported(*_unsatisfied_edits(req.context_management),
-                           stop_sequences=req.stop_sequences)
+        refuse_unsupported(*_unsatisfied_edits(req.context_management))
         input_ids = tokenizer.encode(_render(req))
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
@@ -199,7 +197,8 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         # refusing would 400 every Claude Code turn, which always asks for 32000.
         budget = max(1, engine_limit - len(input_ids)) if engine_limit else req.max_tokens
         params = sampling(tokenizer, _thinking(req), min(req.max_tokens, budget),
-                          temperature=req.temperature, top_p=req.top_p, logprobs=True)
+                          temperature=req.temperature, top_p=req.top_p, logprobs=True,
+                          stop=req.stop_sequences)
         rid = engine.submit(input_ids, params)
         deadline = time.monotonic() + _COMPLETION_TIMEOUT_S
         out: list[int] | None = None
@@ -214,7 +213,8 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             )
         scores = engine.logprobs(rid)  # single reader; a second one raises
         reasoning, text = split_think(tokenizer.decode(out), opened=_thinking(req))
-        prose, calls = _parse_tool_calls(text, req.tools)
+        stopped = engine.stop_text(rid)
+        prose, calls = _parse_tool_calls(cut_at_stop(text, stopped), req.tools)
         content: list[dict[str, Any]] = []
         # Anthropic's native shape for reasoning is its own block, ahead of the
         # text, and it must come first: a client renders content in order. We
@@ -230,6 +230,8 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
                     for i, (n, a) in enumerate(calls)]
         if calls:
             stop_reason = "tool_use"
+        elif stopped:
+            stop_reason = "stop_sequence"
         else:
             stop_reason = "max_tokens" if len(out) >= params.max_new_tokens else "end_turn"
         _record({
@@ -252,6 +254,7 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             "completion_ids": [int(t) for t in out],
             "logprobs": scores,
             "stop_reason": stop_reason,
+            "stop_sequence": stopped,
         })
         return {
             "id": f"msg_{rid}",
@@ -260,10 +263,9 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             "model": req.model or model_name,
             "content": content,
             "stop_reason": stop_reason,
-            # Always null: a request carrying stop_sequences is now refused
-            # (_run), so this stop_reason cannot occur rather than merely not
-            # occurring.
-            "stop_sequence": None,
+            # The matched sequence, and null for every other stop_reason -- which is
+            # what a client keys on to tell "you hit my delimiter" from "I finished".
+            "stop_sequence": stopped,
             "usage": {"input_tokens": len(input_ids), "output_tokens": len(out),
                       # Claude Code reads these for context accounting; we
                       # cache nothing, and 0 is the shape it expects.
@@ -328,7 +330,7 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
                 yield ev("content_block_stop", {"type": "content_block_stop", "index": i})
             yield ev("message_delta", {"type": "message_delta",
                                        "delta": {"stop_reason": body["stop_reason"],
-                                                 "stop_sequence": None},
+                                                 "stop_sequence": body["stop_sequence"]},
                                        "usage": body["usage"]})
             yield ev("message_stop", {"type": "message_stop"})
 

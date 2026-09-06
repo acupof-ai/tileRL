@@ -197,6 +197,55 @@ def main() -> int:
         return f"{len(names)} events, {len(text)} chars"
     check("responses stream", resp_stream)
 
+    # --- stop sequences
+    # The stop is taken from the model's OWN reply, mid-string: a fixed guess like
+    # "\n\n" may not occur, which would report a pass for a stop that never fired.
+    # Only a real tokenizer can say whether a multi-character stop lands on a token
+    # boundary at all, which is the half the canned engine cannot establish.
+    def _mid_stop() -> str | None:
+        r = oa.chat.completions.create(model=m, messages=ask, max_completion_tokens=cap)
+        text = (r.choices[0].message.content or "").strip()
+        return text[1:4] if len(text) > 5 else None
+
+    def stop_chat():
+        stop = _mid_stop()
+        if not stop:
+            return "SKIP  (reply too short to cut inside)"
+        r = oa.chat.completions.create(model=m, messages=ask, stop=[stop],
+                                       max_completion_tokens=cap)
+        text = r.choices[0].message.content or ""
+        assert stop not in text, f"the stop sequence is still in the reply: {text!r}"
+        assert r.choices[0].finish_reason == "stop", r.choices[0].finish_reason
+        return f"cut at {stop!r}, {len(text)} chars left"
+    check("chat stop sequence", stop_chat)
+
+    def stop_chat_stream():
+        stop = _mid_stop()
+        if not stop:
+            return "SKIP  (reply too short to cut inside)"
+        text = ""
+        for c in oa.chat.completions.create(model=m, messages=ask, stream=True,
+                                            stop=[stop], max_completion_tokens=cap):
+            if c.choices:
+                text += c.choices[0].delta.content or ""
+        # The frames are where a partial stop leaks: it arrives one token at a time.
+        assert stop not in text, f"the stop leaked into the stream: {text!r}"
+        return f"{len(text)} chars, stop absent"
+    check("chat stop sequence (stream)", stop_chat_stream)
+
+    def stop_messages():
+        stop = _mid_stop()
+        if not stop:
+            return "SKIP  (reply too short to cut inside)"
+        r = an.messages.create(model=m, max_tokens=cap, messages=ask,
+                               stop_sequences=[stop])
+        text = "".join(b.text for b in r.content if b.type == "text")
+        assert stop not in text, f"the stop sequence is still in the reply: {text!r}"
+        assert r.stop_reason == "stop_sequence", r.stop_reason
+        assert r.stop_sequence == stop, r.stop_sequence
+        return f"stop_reason=stop_sequence, stop_sequence={stop!r}"
+    check("messages stop_sequences", stop_messages)
+
     print()
     if FAILED:
         print(f"{len(FAILED)} FAILED, {len(SKIPPED)} skipped")

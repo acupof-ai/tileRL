@@ -328,6 +328,9 @@ class _StepEngine:
         self.n += 1
         return self.ids[: self.n - 1]
 
+    def stop_text(self, request_id: int):
+        return None
+
     def take(self, request_id: int):
         return self.ids
 
@@ -742,6 +745,8 @@ class _ScriptedEngine:
         self._lp: dict[int, list[float]] = {}
         self._taken: set[int] = set()
         self._peeked: dict[int, int] = {}
+        self._stopped: dict[int, str] = {}
+        self.params: list = []  # what each submit asked for, for the stop-sequence gates
 
     def peek(self, request_id: int):
         """Half the reply, then all of it, then gone -- the live path and the tail."""
@@ -751,11 +756,28 @@ class _ScriptedEngine:
 
     def submit(self, input_ids, params=None) -> int:
         self._next += 1
+        self.params.append(params)
         text = self._replies.pop(0) if self._replies else ""
         ids = self._tok.encode(text)
+        # Honour stop_texts the way the engine does: cut the ids after the token
+        # that completes the first match, so the routes are gated against the same
+        # contract a real engine gives them (the sequence is still in `output`).
+        # Past the reasoning closer only, for the engine's reason: a stop like
+        # "\n\n" inside <think> would return a truncated thought and no answer.
+        closer = self._tok.decode(list(getattr(params, "end_think_ids", ()) or ()))
+        start = (text.find(closer) + len(closer)) if closer else 0
+        for stop in (getattr(params, "stop_texts", ()) or ()) if start >= len(closer) else ():
+            hit = text.find(stop, start)
+            if hit >= 0:
+                ids = self._tok.encode(text[: hit + len(stop)])
+                self._stopped[self._next] = stop
+                break
         self._done[self._next] = ids
         self._lp[self._next] = [-0.1] * len(ids)
         return self._next
+
+    def stop_text(self, request_id: int):
+        return self._stopped.pop(request_id, None)
 
     def take(self, request_id: int):
         return self._done.pop(request_id, None)

@@ -1,6 +1,7 @@
 # A field accepted and ignored is a format lie, and three of them were never even received — cpu, 2026-09-06
 
-> Status: Shipped (refusals + gate); `stop`/`stop_sequences` tracked open
+> Status: Shipped (refusals + gate); `stop`/`stop_sequences` were tracked open and
+> are now implemented — [wins/2026-09-06-stop-sequences-matched-on-text-not-token-ids.md](2026-09-06-stop-sequences-matched-on-text-not-token-ids.md)
 
 ## Context
 
@@ -122,9 +123,15 @@ The third is the one worth keeping: a blanket refusal passes every test that
 asserts a 400 and breaks the requests that should work, so "the refusals fire"
 and "the refusals are narrow" are two claims needing two controls.
 
-## `stop_sequences` is a different kind of field, and is tracked open
+## `stop_sequences` is a different kind of field, and was tracked open
 
-Refusing it is right today, but it is a **core field of both published APIs**,
+**Superseded 2026-09-06 (same day): the field is implemented, not refused** —
+matched on decoded text, because the guess below that the token-level mechanism
+was nearly enough is wrong (a stop string need not start at a token boundary).
+[wins/2026-09-06-stop-sequences-matched-on-text-not-token-ids.md](2026-09-06-stop-sequences-matched-on-text-not-token-ids.md).
+The paragraph is kept because the reasoning it contains is the mistake.
+
+Refusing it was right that day, but it is a **core field of both published APIs**,
 not an unsupported extension, so it goes to `OPEN.md` rather than onto the
 hosted-tools list. `messages.py:244` already carried a comment admitting the
 field was ignored, which is the defect describing itself and being left alone.
@@ -145,8 +152,9 @@ tokens and must be truncated out of the reply. Details and the named fix:
 | tilerl chat page | `tests/test_chat_ui.py` | none of the refused fields |
 
 `stop` and `stop_sequences` appear in **neither** capture, which is why refusing
-them breaks nothing today — a measurement rather than the inference in the first
-draft of this entry.
+them broke nothing that day — a measurement rather than the inference in the first
+draft of this entry. It is also why implementing them the same day changed no
+observed client's behaviour.
 
 **What the capture does not prove.** It records what the CLI sends *on the task
 shape the gate runs*. `output_config` and `thinking` already vary between requests

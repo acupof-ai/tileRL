@@ -1,6 +1,12 @@
 # Stop sequences are a core field of all three APIs, accepted and never applied — cpu, 2026-09-06
 
-> Status: open (refused with 400; the engine-side fix is named below and not landed)
+> Status: FIXED 2026-09-06 by
+> [stop sequences matched on decoded text](../wins/2026-09-06-stop-sequences-matched-on-text-not-token-ids.md).
+> **The fix named in this entry was not the one that shipped**: `stop_ids` cannot
+> work, because a stop string need not begin at a token boundary, so matching
+> happens on decoded text and the single-token/multi-token split disappeared. The
+> analysis below is left as written — it is what was believed at the time, and the
+> reason it was wrong is the finding.
 
 ## Context
 

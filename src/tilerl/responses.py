@@ -35,7 +35,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .messages import _parse_tool_calls
-from .prompt import refuse_unsupported, render_prompt, sampling, split_think
+from .prompt import cut_at_stop, refuse_unsupported, render_prompt, sampling, split_think
 from .tokenizer import Tokenizer
 
 
@@ -61,7 +61,8 @@ class ResponsesRequest(BaseModel):
     previous_response_id: str | None = None
     include: list[str] | None = None
     truncation: str | None = None
-    #: Same as the chat route: declared to be refusable rather than dropped.
+    #: Not in the Responses schema at all, but honoured on the same terms as the
+    #: chat route's: a client that sends one gets it applied, not ignored.
     stop: str | list[str] | None = None
     metadata: dict[str, Any] | None = None
     #: The same vLLM-style override the chat route takes, for the same reason:
@@ -158,7 +159,6 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
             # "disabled" is our behaviour already, so only "auto" is a lie.
             truncation=req.truncation not in (None, "disabled"),
             store=req.store,
-            stop=req.stop,
             tool_choice=_unsupported_choice(req.tool_choice),
             **_hosted_tools(req.tools))
         thinking = _thinking(req)
@@ -169,7 +169,7 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
         params = sampling(tokenizer, thinking, req.max_output_tokens or 512,
-                          temperature=req.temperature, top_p=req.top_p)
+                          temperature=req.temperature, top_p=req.top_p, stop=req.stop)
         rid = engine.submit(input_ids, params)
         deadline = time.monotonic() + 1800.0
         out = None
@@ -181,13 +181,14 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         if out is None:
             raise TimeoutError(f"request {rid} did not finish within 1800.0s")
         reasoning, text = split_think(tokenizer.decode(out), bool(thinking))
-        text, calls = _parse_tool_calls(text, tools)
+        stopped = engine.stop_text(rid)
+        text, calls = _parse_tool_calls(cut_at_stop(text, stopped), tools)
         return _body(rid, req, model_name, reasoning, text, calls,
-                     len(input_ids), len(out), params.max_new_tokens)
+                     len(input_ids), len(out), params.max_new_tokens, stopped=stopped)
 
     def _body(rid: int, req: ResponsesRequest, model: str, reasoning: str, text: str,
               calls: list, n_in: int, n_out: int, max_new: int,
-              output: list | None = None) -> dict[str, Any]:
+              output: list | None = None, stopped: str | None = None) -> dict[str, Any]:
         """``Response``, with the fields the SDK's model requires.
 
         ``parallel_tool_calls`` and ``tool_choice`` are declared required and
@@ -196,7 +197,9 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         ``status`` is "incomplete" with a reason when the cap cut it, which is how
         a client tells a finished answer from a truncated one.
         """
-        cut = n_out >= max_new and not calls
+        # A stop sequence is a COMPLETE response: the cap is not what ended it, so
+        # a client must not see incomplete/max_output_tokens for a delimiter it asked for.
+        cut = n_out >= max_new and not calls and not stopped
         return {
             "id": f"resp_{rid}",
             "object": "response",

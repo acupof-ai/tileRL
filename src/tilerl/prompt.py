@@ -42,7 +42,7 @@ def render_prompt(messages: list[dict[str, Any]], system: Any = None,
 def sampling(tok: Any, thinking: bool | None, max_new_tokens: int, *,
              temperature: float | None = None, top_p: float | None = None,
              max_think_tokens: int | None = None, seed: int | None = None,
-             logprobs: bool = False):
+             logprobs: bool = False, stop: Any = None):
     """SamplingParams from the model card for this thinking mode; explicit
     ``temperature`` / ``top_p`` win. ``thinking=None`` (tiny/dev) samples at 1.0."""
     from .engine import SamplingParams
@@ -55,6 +55,7 @@ def sampling(tok: Any, thinking: bool | None, max_new_tokens: int, *,
     return SamplingParams(
         max_new_tokens=max_new_tokens, seed=secrets.randbits(31) if seed is None else seed,
         stop_token_ids=tuple(getattr(tok, "stop_token_ids", ())), logprobs=logprobs,
+        stop_texts=stop_texts(stop),
         # With thinking off the prompt closes the block itself, so no cap applies.
         max_think_tokens=max_think_tokens if thinking else None,
         end_think_ids=tuple(tok.encode("</think>\n\n")) if thinking else (), **kw)
@@ -173,6 +174,24 @@ def render_tools(tools: list[dict[str, Any]] | None, effort: str | None = None) 
     return (head + "\n\n" + body) if head else body
 
 
+
+
+def stop_texts(stop: Any) -> tuple[str, ...]:
+    """A route's ``stop`` / ``stop_sequences`` as engine ``stop_texts``.
+
+    A bare string and a list are both documented shapes on the OpenAI routes.
+    Empty entries are dropped rather than refused: "" matches at token 1, and a
+    client that sends one meant "no stop", not "stop immediately".
+    """
+    items = [stop] if isinstance(stop, str) else list(stop or [])
+    return tuple(s for s in items if isinstance(s, str) and s)
+
+
+def cut_at_stop(text: str, stop: str | None) -> str:
+    """The reply up to the stop sequence. The engine keeps the token that completed
+    the match, so the text still carries it and the caller cuts at the match START
+    -- OpenAI and Anthropic both exclude the sequence from the returned text."""
+    return text if not stop else text.split(stop)[0]
 
 
 def refuse_unsupported(*fields: str, **flagged: Any) -> None:

@@ -42,15 +42,17 @@ from tilerl.kv_cache import (
 from tilerl.model import add_lora, build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
 from tilerl.testing import RefBackend
+from tilerl.tokenizer import ByteTokenizer
 from tilerl.train import _training_kv, opd_loop, train_step
 
 
-def _build_engine(seed: int) -> Engine:
+def _build_engine(seed: int, decode=None) -> Engine:
     cfg = tiny()
     model = build_random(cfg, seed=seed)
     backend = get_backend()
     return build_engine(
-        cfg, model, backend, num_blocks=8, num_slots=4, max_batch=4, max_total_tokens=512
+        cfg, model, backend, num_blocks=8, num_slots=4, max_batch=4, max_total_tokens=512,
+        decode=decode,
     )
 
 
@@ -337,6 +339,82 @@ def test_generated_prefix_matches_cold_path():
     cold_id = cold.submit(followup, next_params)
     assert _drain(cached, [cached_id], 2)[cached_id] == _drain(cold, [cold_id], 2)[cold_id]
     assert cached.stats()["prefix_hits"] == 1
+
+
+def test_the_engine_stops_at_a_text_sequence_and_names_it():
+    """The whole contract of a text stop, on a REAL engine.
+
+    The canned engine in test_server.py implements stopping itself, so every route
+    arm passes with the engine's matching disabled -- measured, 6 of 6. This is the
+    arm that goes red: it drives `_commit`, which is where the match happens.
+
+    A stop is forced rather than hoped for. The tiny model's output is noise, so
+    the sequence is whatever byte it emits FIRST: that makes the stop certain and
+    still exercises the same path, since `_stop_hit` cannot know why the text matched.
+    """
+    eng = _build_engine(seed=5)
+    tok = ByteTokenizer()
+    prompt = tok.encode("hello")
+    plain = SamplingParams(max_new_tokens=12, seed=7)
+    rid = eng.submit(prompt, plain)
+    ref = _drain(eng, [rid], 12)[rid]
+    assert len(ref) == 12, "the unstopped run must reach the cap, or the stop proves nothing"
+
+    stop = tok.decode(ref[:1])
+    eng2 = _build_engine(seed=5, decode=tok.decode)
+    rid2 = eng2.submit(prompt, replace(plain, stop_texts=(stop,)))
+    out = _drain(eng2, [rid2], 1)[rid2]
+    # Stops at the token completing the match, and KEEPS it: the caller decodes and
+    # cuts at the match start, so dropping it here would leave a partial stop.
+    assert len(out) == 1 and out == ref[:1]
+    assert eng2.stop_text(rid2) == stop
+    # Pops: a second read must not report the same stop twice.
+    assert eng2.stop_text(rid2) is None
+
+
+def test_the_engine_does_not_stop_inside_the_reasoning_block():
+    """A stop must not fire before the reasoning closer, on a REAL engine.
+
+    Measured before the fix: with thinking on and the stop set to the reasoning's
+    first byte, the request ended at token 1 -- a truncated thought and no answer,
+    which is every thinking-on request carrying a paragraph stop. The route arm in
+    test_api_sdk.py cannot see this: the canned double has the same rule, so it
+    would pass with this gate removed.
+    """
+    tok = ByteTokenizer()
+    eng = _build_engine(seed=5, decode=tok.decode)
+    # max_think_tokens forces the closer after 3 tokens, so the block is bounded and
+    # `output` provably contains text on both sides of it.
+    p = SamplingParams(max_new_tokens=24, seed=7, max_think_tokens=3,
+                       end_think_ids=tuple(tok.encode("</think>\n\n")))
+    rid = eng.submit(tok.encode("hi"), p)
+    ref = _drain(eng, [rid], 24)[rid]
+    first = tok.decode(ref[:1])  # a byte INSIDE the reasoning
+
+    eng2 = _build_engine(seed=5, decode=tok.decode)
+    rid2 = eng2.submit(tok.encode("hi"), replace(p, stop_texts=(first,)))
+    out = _drain(eng2, [rid2], 1)[rid2]
+    # Not 1: the reasoning's own bytes are not matchable. Either it never fires, or
+    # it fires later on a repeat past the closer -- both are past the block.
+    assert len(out) > 1, "the stop fired inside the reasoning block"
+    # And if it did fire, it fired on a repeat AFTER the closer: the match must sit
+    # past the block, not before it.
+    if (hit := eng2.stop_text(rid2)) is not None:
+        text = tok.decode(out)
+        assert text.index(hit, text.index("</think>")) > text.index("</think>")
+
+
+def test_a_stop_that_cannot_fire_is_refused_at_submit():
+    """Two ways a stop is accepted and can never match, both silent 200s: no decode
+    to match with, and an empty string (which is in every text, so it would end the
+    request at token 1 instead of never)."""
+    eng = _build_engine(seed=5)  # no decode= : the default, tokenizer-free
+    p = SamplingParams(max_new_tokens=4, stop_texts=("END",))
+    with pytest.raises(ValueError, match="stop_texts needs"):
+        eng.submit([1, 2, 3], p)
+    eng2 = _build_engine(seed=5, decode=ByteTokenizer().decode)
+    with pytest.raises(ValueError, match="non-empty"):
+        eng2.submit([1, 2, 3], replace(p, stop_texts=("",)))
 
 
 def test_submit_rollback_and_terminal_failure():
