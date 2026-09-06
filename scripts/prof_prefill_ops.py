@@ -32,9 +32,13 @@ does not say what ran.
     # CPU gate (this machine)
     TILERL_TARGET=cpu uv run python scripts/prof_prefill_ops.py --selfcheck
 
-    # V100, inside the maintenance window, with the serve child stopped
-    /work/tl013/bin/python -u scripts/prof_prefill_ops.py \\
-        --model qwen38-27b --tokens 2048,8192,16384 --json /work/prefill_ops.json
+    # V100, inside the maintenance window, with the serve child stopped.
+    # Paths are the V100's, verified on the host: there is no /work mount there
+    # (that is the H20 pod) and the serving interpreter is venv70.
+    cd /data00/home/chenkailun.c/tilerl-git && \\
+    /data00/home/chenkailun.c/venv70/bin/python -u scripts/prof_prefill_ops.py \\
+        --model qwen38-27b --tokens 2048,8192,16384 \\
+        --json /data00/home/chenkailun.c/prefill_ops.json
 """
 
 from __future__ import annotations
@@ -53,11 +57,20 @@ sys.path.insert(0, "packages/tilerl-kernels/src")
 from tilerl_kernels.backend import get_backend  # noqa: E402
 from tilerl_kernels.registry import _REGISTRY  # noqa: E402
 
-from tilerl.config import tiny  # noqa: E402
+from tilerl.cli import _build_model  # noqa: E402
 from tilerl.engine import _PHASE_PREFILL, SamplingParams, build_engine  # noqa: E402
 from tilerl.kv_cache import NoPrefixStore  # noqa: E402
 
 _MAX_TICKS = 20000
+
+#: The V100 TTFT fit from #213: ttft = C0 + C1*n + C2*n^2, R^2 0.9999, arms to
+#: 9483 tokens. Only the n and n^2 terms are compared here -- C0 absorbs route
+#: and decode cost the per-chunk sum does not contain.
+_FIT_C0, _FIT_C1, _FIT_C2 = 0.56, 0.00422, 4.117e-07
+#: A profile more than this far from the fit is measuring a different model, not
+#: a different kernel. 2x, because sync overhead alone was 36% at 16k and the fit
+#: carries its own error; the failure this catches was 221x.
+_RECONCILE_TOL = 2.0
 
 #: ops worth a row of their own; everything else lands in "other" rather than
 #: being dropped, so the buckets sum to the tick.
@@ -182,7 +195,9 @@ def _prefill_arm(engine, timer, n_tokens: int, vocab: int, seed: int) -> dict:
     if req.phase == _PHASE_PREFILL:
         raise RuntimeError(f"prefill did not finish in {_MAX_TICKS} ticks")
     return {"tokens": n_tokens, "chunks": chunks, "prefill_secs": total,
-            "n_chunks": len(chunks)}
+            "n_chunks": len(chunks),
+            "sync_secs": sum(c["sync_secs"] for c in chunks),
+            "ops_secs": sum(v for c in chunks for v in c["ops"].values())}
 
 
 def _bucket(ops: dict) -> dict:
@@ -239,6 +254,8 @@ def main() -> int:
     ap.add_argument("--model", default="tiny")
     ap.add_argument("--tokens", default="512,1024,2048")
     ap.add_argument("--json")
+    ap.add_argument("--no-reconcile", action="store_true",
+                    help="suppress the not-the-27B banner; shares stay unquotable")
     ap.add_argument("--selfcheck", action="store_true",
                     help="CPU gate: assert the instrument sees what it claims to")
     args = ap.parse_args()
@@ -256,18 +273,36 @@ def main() -> int:
         print(f"  {op:<24} {here or '-- not registered':<40}"
               + (f"same maker as: {','.join(shared)}" if shared else ""))
 
-    if args.model != "tiny":
-        raise SystemExit("only the tiny/tiny-agent config is wired here; "
-                         "pass --model tiny and set --tokens")
-
     ctx = max(lengths) + 64
-    cfg = tiny(max_position_embeddings=ctx)
-    from tilerl.model import build_random
+    # tiny caps at 512 positions; tiny-agent is the same config with room for a
+    # real prompt. Asking for 2k+ tokens on plain tiny would refuse at submit.
+    name = "tiny-agent" if args.model == "tiny" and ctx > 512 else args.model
+    if name != args.model:
+        print(f"note: --model tiny caps at 512 positions; using {name} for ctx={ctx}")
+    cfg, model = _build_model(name, seed=7, keep_master=False)
+    if ctx > cfg.max_position_embeddings:
+        raise SystemExit(f"{name} holds {cfg.max_position_embeddings} positions; "
+                         f"--tokens asks for {ctx}")
     timer = _Timer(backend)
-    model = build_random(cfg, seed=7)
-    engine = build_engine(cfg, model, timer, num_blocks=(ctx // 16) * 4 + 64,
-                          num_slots=4, max_batch=1, max_total_tokens=ctx,
+    # One prompt plus slack: the old 4x pool was 10.76 GiB at 21.7k, past the V100's budget.
+    blocks = (ctx + 15) // 16 + 8
+    engine = build_engine(cfg, model, timer, num_blocks=blocks,
+                          num_slots=2, max_batch=1, max_total_tokens=ctx,
                           prefix_store=NoPrefixStore())
+    print(f"pool {blocks} blocks for ctx={ctx} (one request + 8 slack)")
+    print(f"model={cfg.name} layers={cfg.num_layers} "
+          f"full_attn={len(cfg.full_attn_layers)} H={cfg.num_attention_heads} "
+          f"D={cfg.head_dim} ctx={cfg.max_position_embeddings}")
+
+    # TileLang compiles on first call, and a compile inside a timed chunk reads as
+    # attention cost: a 2048 arm on the V100 put 5.276 s of paged_attention and
+    # 4.008 s of write_tokens in chunk 0 against 0.001-0.002 s in every later
+    # chunk, and every selfcheck assertion was true of it. Warm first, untimed.
+    # Warm at the LARGEST arm's shapes: TileLang keys its cache on the tile shapes,
+    # so warming at 2k compiles nothing the 16k arm will use.
+    t_jit = time.perf_counter()
+    _prefill_arm(engine, timer, max(lengths), cfg.vocab_size, seed=1)
+    print(f"JIT warm-up (untimed, real shapes): {time.perf_counter() - t_jit:.1f} s")
 
     arms = []
     for i, n in enumerate(lengths):
@@ -278,11 +313,81 @@ def main() -> int:
     if args.selfcheck:
         _selfcheck(arms)
 
+    if backend.arch == "sm70" and cfg.name == "qwen38-27b":
+        _reconcile(arms)
+        _efficiency(cfg, arms)
+    elif not args.no_reconcile:
+        print("\n(no reconciliation: the fit is the 27B on sm70; this run is "
+              f"{cfg.name} on {backend.arch}, so SHARES HERE DO NOT DESCRIBE THE 27B)")
+
     if args.json:
         with open(args.json, "w") as f:
             json.dump({"arch": backend.arch, "provenance": prov, "arms": arms}, f, indent=1)
         print(f"\nwrote {args.json}")
     return 0
+
+
+def _attention_floor(cfg, prefix: int, chunk: int) -> float:
+    """FLOP for this chunk's causal QK^T + PV over the whole prefix, full-attn layers.
+
+    Each of `chunk` queries attends over `prefix` keys plus its own causal share
+    of the chunk. Two matmuls, 2 FLOP per MAC, D per head per layer.
+    """
+    heads = cfg.num_attention_heads * len(cfg.full_attn_layers)
+    keys = chunk * prefix + chunk * (chunk + 1) / 2
+    return heads * keys * cfg.head_dim * 2 * 2
+
+
+#: V100 fp32, no tensor cores. The floor is a floor: a kernel at 1.0 is perfect.
+_V100_FP32 = 15.7e12
+
+
+def _efficiency(cfg, arms: list) -> None:
+    """Measured attention seconds against the arithmetic floor for the same work.
+
+    This is the number that decides whether a new kernel is worth writing. The
+    n^2 term being 68% of TTFT does not by itself say the kernel is bad -- causal
+    attention IS quadratic. What says it is bad is spending many times the FLOP
+    floor for the same chunk.
+    """
+    print(f"\n{'n':>7} {'prefix':>7} {'attn_s':>8} {'floor_s':>9} {'x floor':>8}")
+    for a in arms:
+        for c in a["chunks"]:
+            secs = c["ops"].get("paged_attention", 0.0) or c["ops"].get("attention", 0.0)
+            if secs <= 0:
+                continue
+            floor = _attention_floor(cfg, c["prefix"], c["chunk"]) / _V100_FP32
+            print(f"{a['tokens']:>7} {c['prefix']:>7} {secs:>8.4f} {floor:>9.5f} "
+                  f"{secs / floor if floor else float('nan'):>8.1f}")
+    print("floor = causal QK^T+PV FLOP / 15.7 TFLOP/s (V100 fp32 peak); "
+          "a ratio near 1 needs no new kernel")
+
+
+def _reconcile(arms: list) -> None:
+    """The profile must land near the fit, or it is profiling a different model.
+
+    This is the gate that was missing. A V100 run of `tiny` printed a clean table
+    with a 32.6% attention share and passed every selfcheck assertion, while its
+    total was 0.813 s against the fit's 179.7 s at the same n -- 221x. Nothing in
+    the output said so, because every assertion asked whether the INSTRUMENT
+    worked, and it did; none asked whether the number was the right size.
+
+    Only the n and n^2 terms of the fit are used: the per-chunk sum has no decode
+    step and no route overhead, which is what the fit's constant absorbs.
+    """
+    for a in arms:
+        n = a["tokens"]
+        expect = _FIT_C1 * n + _FIT_C2 * n * n
+        got = sum(c["tick_secs"] for c in a["chunks"])
+        ratio = got / expect if expect else float("inf")
+        lo, hi = 1 / _RECONCILE_TOL, _RECONCILE_TOL
+        print(f"reconcile n={n}: profile {got:.2f} s vs fit {expect:.2f} s "
+              f"({ratio:.2f}x, sync {a['sync_secs']:.2f} s)")
+        assert lo <= ratio <= hi, (
+            f"n={n}: the profile sums to {got:.2f} s where the V100 fit predicts "
+            f"{expect:.2f} s ({ratio:.3g}x, tolerance {lo:.2f}-{hi:.2f}x). This is "
+            "not a slow kernel, it is a different model or a different card -- "
+            "the shares from this run describe neither and must not be quoted")
 
 
 def _selfcheck(arms: list) -> None:
@@ -305,6 +410,19 @@ def _selfcheck(arms: list) -> None:
             assert attributed <= c["tick_secs"] * 1.5 + 1e-3, (
                 f"ops sum {attributed:.4f} exceeds tick {c['tick_secs']:.4f} at "
                 f"prefix {c['prefix']}: the proxy is counting a call twice")
+
+    # A first chunk far above the rest is a compile, not a cost. Every other
+    # assertion here is true of a compile, so without this the gate passes a
+    # void arm -- which is worse than no gate.
+    for a in arms:
+        rest = [c["tick_secs"] for c in a["chunks"][1:]]
+        if len(rest) >= 2:
+            med = sorted(rest)[len(rest) // 2]
+            c0 = a["chunks"][0]["tick_secs"]
+            assert c0 <= max(med * 20, med + 0.05), (
+                f"{a['tokens']}-token arm: chunk 0 took {c0:.3f} s against a median "
+                f"{med:.3f} s for the rest -- that is a JIT compile inside the timed "
+                "region, not attention. Warm the kernels first; this arm is void")
 
     # the prefix really advances, or "cost rises with prefix" is unmeasurable
     pref = [c["prefix"] for c in long["chunks"]]
