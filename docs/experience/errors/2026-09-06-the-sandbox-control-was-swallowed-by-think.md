@@ -111,6 +111,29 @@ handles rather than a shape only a test produces.
 Before the fix both arms parsed **0**. The sandboxed assertion was passing because no attempt
 was made, which is exactly what 25's control was designed to catch, and did.
 
+## And the repaired gate got the same treatment
+
+Both arms parsing the call shows an attempt is made; it does not yet show the **sandbox** is
+what stops it. So the thing under test was reverted one key at a time, each arm requiring the
+gate to go red:
+
+| revert | gate | assertion that fired |
+|---|---|---|
+| none (as shipped) | pass | — |
+| `allowUnsandboxedCommands` → `True` | **pass** | none |
+| `failIfUnavailable` → `False` | **pass** | none |
+| `enabled` → `False` | **fail** | `sandboxed rollout wrote outside its directory` |
+| drop `--settings` entirely | **fail** | same |
+
+The confinement is `enabled` plus the `--settings` payload reaching the CLI. The two keys that
+left it green govern *refusal to run when the sandbox is unavailable*, not the write path, so
+neither is a valid control for this assertion — the first one I tried was one of them, and had
+I stopped at its green I would have reported a second vacuity that does not exist.
+
+Both red arms fired on the sandboxed assertion, not on the negative control below it, which is
+the part that makes them controls at all: a revert that broke the unsandboxed half instead
+would produce the same red count and prove nothing.
+
 ## Still open, filed separately
 
 `rollout.py:176`'s `{**os.environ, ...}` means every rollout inherits the spawning machine's
@@ -133,6 +156,12 @@ observation, not N.** "It fails here", "it's environmental", "it's pre-existing"
 compatible with every cause, so they accumulate confidence without adding evidence. The
 report that broke the chain named the *unproven half* rather than the symptom. When repeating
 someone else's finding, either open it or say plainly that you have not.
+
+Fourth, from the revert sweep: **a control that leaves the gate green has two readings** — the
+gate is vacuous, or the key you reverted is not the one that binds. Sweeping the candidates
+separates them; stopping at the first green picks whichever reading you already expected. The
+two keys that left it green are the ones whose docstring calls them "the important key", which
+is how a plausible control gets chosen.
 
 ## Results
 
