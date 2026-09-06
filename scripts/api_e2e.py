@@ -209,6 +209,18 @@ def main() -> int:
     # skip that is guaranteed by construction is not coverage.
     say_more = [{"role": "user",
                  "content": "In two full sentences, say what the capital of France is."}]
+    # THINKING OFF on all three stop arms, and this is the second thing the live run
+    # corrected. With it on, the 27B spends `max_tokens` inside <think>: the run of
+    # 2507dcf returned "0 chars of prose" on the chat arms and max_tokens on the
+    # messages arm, because the reply was reasoning and nothing else.
+    #
+    # Off rather than a larger cap: the stop contract is about the PROSE the client
+    # receives, so a cap big enough for reasoning plus two sentences is a per-prompt
+    # guess that silently reverts to this failure whenever the model thinks longer.
+    # Thinking-on is not left uncovered -- it is exactly what probe 1 in the win
+    # entry establishes, and the reasoning gate has its own arms on the CPU side.
+    NO_THINK_OA = {"chat_template_kwargs": {"enable_thinking": False}}
+    NO_THINK_AN = {"type": "disabled"}
 
     def _mid_stop() -> tuple[str | None, str]:
         """A 4-char stop from inside the model's own reply, or None and WHY.
@@ -225,7 +237,8 @@ def main() -> int:
         a control, not by reading.
         """
         r = oa.chat.completions.create(model=m, messages=say_more,
-                                       max_completion_tokens=cap)
+                                       max_completion_tokens=cap,
+                                       extra_body=NO_THINK_OA)
         text = (r.choices[0].message.content or "").strip()
         prose = text.split("</think>")[-1].strip()  # prose only; never cut the markup
         # Past the first word: a stop inside word 1 leaves almost nothing to assert on.
@@ -239,7 +252,8 @@ def main() -> int:
         if not stop:
             return f"SKIP  ({why})"
         r = oa.chat.completions.create(model=m, messages=say_more, stop=[stop],
-                                       max_completion_tokens=cap)
+                                       max_completion_tokens=cap,
+                                       extra_body=NO_THINK_OA)
         text = r.choices[0].message.content or ""
         assert stop not in text, f"the stop sequence is still in the reply: {text!r}"
         assert r.choices[0].finish_reason == "stop", r.choices[0].finish_reason
@@ -252,7 +266,8 @@ def main() -> int:
             return f"SKIP  ({why})"
         text = ""
         for c in oa.chat.completions.create(model=m, messages=say_more, stream=True,
-                                            stop=[stop], max_completion_tokens=cap):
+                                            stop=[stop], max_completion_tokens=cap,
+                                            extra_body=NO_THINK_OA):
             if c.choices:
                 text += c.choices[0].delta.content or ""
         # The frames are where a partial stop leaks: it arrives one token at a time.
@@ -265,7 +280,7 @@ def main() -> int:
         if not stop:
             return f"SKIP  ({why})"
         r = an.messages.create(model=m, max_tokens=cap, messages=say_more,
-                               stop_sequences=[stop])
+                               stop_sequences=[stop], thinking=NO_THINK_AN)
         text = "".join(b.text for b in r.content if b.type == "text")
         assert stop not in text, f"the stop sequence is still in the reply: {text!r}"
         assert r.stop_reason == "stop_sequence", r.stop_reason

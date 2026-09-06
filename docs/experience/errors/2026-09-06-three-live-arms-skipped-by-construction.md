@@ -1,7 +1,9 @@
 # Three live arms skipped by construction, and the skip said only "too short" — cpu, 2026-09-06
 
-> Status: FIXED (the arms fire; a control confirms they still skip honestly).
-> Not yet re-run against the V100 — `pending-remote`.
+> Status: fixed twice, and **still not passing against real weights**. The prompt fix
+> made the arms reachable; the live re-run then failed a different way (the cap went to
+> reasoning), fixed by running them thinking-off. Canned: 3/3 fire, 3/3 skip honestly.
+> Live: `pending-remote` on a third run.
 
 ## Context
 
@@ -60,12 +62,42 @@ My first repair for that was to **refuse** a reply containing the closer, which 
 all three arms skip on every canned run: correct-looking, and it would have removed
 the local smoke test entirely, leaving the arms exercised nowhere but the pod.
 
+## Second live run: the arms fired, and spent the cap inside `<think>`
+
+27 re-ran the fixed arms from this branch (`2507dcf`) against the same live V100, no
+restart. **rc 1** — the eleven older arms passed, the two chat stop arms skipped with
+`"0 chars of prose"`, and `messages stop_sequences` **FAILED** with
+`AssertionError: max_tokens`.
+
+The new skip message is what diagnosed it in one line: `0 chars` cannot be a short
+answer, it is no answer. Thinking is on by default on `/v1/messages`, the `say_more`
+prompt provokes long reasoning, and `max_tokens` was spent inside the block — so the
+reply was reasoning and nothing else, and the messages arm correctly reported
+`max_tokens` rather than a stop.
+
+**Chosen fix: thinking OFF on all three stop arms** (`enable_thinking: false` on the
+OpenAI route, `thinking: {"type": "disabled"}` on Anthropic), not a larger
+`max_tokens`. The stop contract is about the prose a client receives; a cap sized for
+"reasoning plus two sentences" is a per-prompt guess that silently returns to this
+same failure the first time the model thinks longer. Thinking-on is not left
+uncovered — it is what probe 1 establishes, and the reasoning gate has its own arms on
+the CPU side.
+
 ## Controls
 
 | canned reply | arms |
 |---|---|
 | `"The capital of France is Paris. It has held that role for centuries."` | 3/3 fire — `cut at 'apit'`, stream `stop absent`, `stop_reason=stop_sequence` |
 | `"Paris."` | 3/3 skip, each naming `6 chars of prose` |
+
+Both re-run after the thinking-off change, same results.
+
+## Not established
+
+- **The arms have still never passed against real weights.** Two live runs, two
+  different reasons: the prompt could not produce a long enough reply, then the cap
+  went to reasoning. Whether the 27B answers `say_more` with enough prose once
+  thinking is off is unmeasured — likely, and the skip will name the number if not.
 
 ## Rule
 
