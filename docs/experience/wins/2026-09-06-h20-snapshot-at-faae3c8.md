@@ -63,10 +63,30 @@ instrument problem, and it was.
 **Run B died at step 2 with CUDA OOM**, so no steady-state median exists at this
 cap: `Tried to allocate 296.00 MiB. GPU 0 has 95.22 GiB of which 221.56 MiB is
 free. Process 750071 has 95.00 GiB in use` — one process, not contention. Peak in
-run A was 88.21 GiB, so a second step's allocations do not fit. **At `--max-new-tokens
-2048`, group 8, this configuration does not survive past step 1 on one H20.** That is
-a capacity finding, not a timing one, and it is the reason a 3-step median was not
-obtained.
+run A was 88.21 GiB.
+
+**No capacity fact is claimed, and the cause is now measured.** MATH run 2
+(`0f7006c74ea0`) ran **45 steps** at group 8 and cap 2048 on one H20 without OOM
+([the rollouts grew into the cap](../errors/2026-09-06-the-rollouts-grew-into-the-cap.md)),
+so "cap 2048 does not fit" was wrong. The configurations differed on a variable
+neither side had listed: `recipes.py:36` gives `grpo-math-27b` **`micro=1`** and my
+runs took the CLI default **`micro=0`**, which `train.py:137` turns into one
+backward over all 8 group rows instead of one row at a time. Rerun at `--micro 1`:
+**3/3 steps, peak 44.55 GiB against 88.21, median 67.3 s/step**
+([the OOM was micro=0](../errors/2026-09-06-the-oom-was-micro-zero.md)). So the
+snapshot's GRPO row is a `micro=0` measurement, and `micro=0` at this group and cap
+is what does not fit.
+
+That probe also supplies the valid comparison this entry declined above: **67.3
+s/step median against P1's 56.88 — 1.18x**, same task, same group, same `micro=1`,
+differing only in cap (2048 vs 256). The 25.3 s warm first step stands as a warm
+first step and not as a median.
+
+Run 2's own peak, which would have answered this in one line, is unavailable: the
+entry records no peak figure and `runs/0f7006c74ea0/manifest.json` is gone from the
+pod, because `pod_sync.sh:28` runs `find . -mindepth 1 -delete` on the remote
+checkout — my sync this tick destroyed it. Line 12 rescues `bench-baseline.json`;
+nothing rescues `runs/`.
 
 **No comparison to run 2's 229.2 s is made.** That row is MATH level 5 at a
 1434-token mean; this is gsm8k at 174 tokens, and #140's buckets put the backward
