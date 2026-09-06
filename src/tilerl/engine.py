@@ -1042,8 +1042,9 @@ class Engine:
 
     def _run_decode_graph(self, reqs: list[_Req], chains=None) -> bool:
         """Captured decode for a pure-decode tick, one graph per size bucket (a
-        graph per exact size OOMed B=64 on the drain). Returns False and flips
-        the flag off when capture failed, so the caller runs eager."""
+        graph per exact size OOMed B=64 on the drain). Returns False -- caller
+        runs eager -- when capture failed (flag off too) or when this tick would
+        need a graph outside the `graph_keys` grid."""
         n, W = len(reqs), len(chains[0]) if chains else 1
         B = self._graph_bucket(n)
         if n < B and self._pad_slot is None:
@@ -1051,7 +1052,9 @@ class Engine:
                 self._pad_slot = self._states.alloc_slot()
                 self._pad_block = self._kv.alloc_block()
             except RuntimeError:
-                B = n  # no spare capacity to park padding rows on: exact size
+                # no pad row: an exact-size graph is off the graph_keys grid and would
+                # capture mid-request
+                return False
         g = self._graph_for(B, W, keep=bool(chains))
         if g is None:
             return False
