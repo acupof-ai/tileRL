@@ -7,7 +7,8 @@ Route surface (mirrors agent-infer's infer-server, trimmed to tileRL):
 * ``POST /v1/chat/completions``    — OpenAI schema; ``stream=true`` -> SSE
 * ``POST /v1/messages``            — Anthropic Messages (messages.py)
 * ``POST /v1/responses``           — OpenAI Responses (responses.py)
-* ``GET  /``                       — single-file HTML chat UI (no build step)
+* ``WS   /ws/chat``                — the playground's transport, delta/done/error
+* ``GET  /``, ``GET /chat``        — the chat UI, built from ``web/`` into ``static/``
 * ``GET  /about``                  — what tileRL is, target matrix
 
 This module never imports torch or tilelang: prompts cross the boundary as
@@ -20,11 +21,13 @@ import asyncio
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .messages import _parse_tool_calls, mount_messages
@@ -38,7 +41,7 @@ from .prompt import (
 )
 from .responses import mount_responses
 from .tokenizer import ByteTokenizer, Tokenizer, get_tokenizer  # noqa: F401
-from .ui_assets import _CHAT_UI, _LANDING
+from .ui_assets import _LANDING
 
 __all__ = ["ByteTokenizer", "get_tokenizer", "create_app"]
 
@@ -343,30 +346,24 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             "system_fingerprint": SYSTEM_FINGERPRINT,
         }
 
-    def _stream(request_id: int, max_new: int, prompt_tokens: int, opened: bool,
-                include_usage: bool, stops: tuple[str, ...] = ()):
-        created = int(time.time())
-        chunk_id = f"chatcmpl-{request_id}"
-        yield _sse(_chat_chunk(chunk_id, created, model_name, {"role": "assistant"}))
+    def _deltas(request_id: int, max_new: int, opened: bool, stops: tuple[str, ...] = ()):
+        """One request's reply, as ``(kind, payload, completion_tokens)`` triples.
+
+        ``kind`` is ``delta`` (payload is a ``reasoning_content``/``content`` dict),
+        ``error`` (an OpenAI error body) or ``done`` (payload is the finish_reason,
+        and it is the last item). Shared by the SSE route and ``/ws/chat``: the two
+        transports differ only in how they frame these, so they cannot disagree about
+        where a ``</think>`` goes, where a stop sequence cuts, or when a reply is
+        ``length``.
+
+        Blocking, by design -- it is driven from a thread on both routes.
+        """
         deadline = time.monotonic() + 1800.0
         sent = 0  # characters of the STRIPPED reply already emitted
         sent_r = 0  # characters of the reasoning already emitted
         seen = 0  # tokens already decoded, so a quiet poll costs nothing
         # the most of a stop sequence that can still turn out to be a prefix
         hold = max((len(x) for x in stops), default=1) - 1
-
-        def content_frame(delta: dict, completion: int) -> str:
-            # Cumulative tokens on every content frame, vLLM's continuous_usage_stats
-            # shape. Without it a live rate gauge can only count frames, and this loop
-            # coalesces ~1.8 tokens into each (measured: 109 frames for 200 tokens on the
-            # 27B), so the page would show roughly half the real rate until the final
-            # usage chunk landed. choices stays populated, so a client that indexes it is
-            # unharmed; the usage-ONLY chunk remains the one with an empty choices list.
-            chunk = _chat_chunk(chunk_id, created, model_name, delta)
-            if include_usage:
-                chunk["usage"] = _usage(prompt_tokens, completion)
-            return _sse(chunk)
-
         try:
             while True:
                 # peek() is lock-free; take() blocks on the engine lock for a whole
@@ -392,7 +389,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                     # reasoning goes out as vLLM's reasoning_content, so the page folds
                     # on the field rather than on a closer the reply no longer carries
                     if len(reasoning) > sent_r:
-                        yield content_frame({"reasoning_content": reasoning[sent_r:]}, seen)
+                        yield "delta", {"reasoning_content": reasoning[sent_r:]}, seen
                         sent_r = len(reasoning)
                     # Two cases, and a holdback alone gets the first one wrong: once a
                     # match is COMPLETE cut there; while one may still be forming, hold
@@ -402,15 +399,14 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                         done = [text.index(x) for x in stops if x in text]
                         text = text[:min(done)] if done else text[:max(0, len(text) - hold)]
                     if len(text) > sent:
-                        yield content_frame({"content": text[sent:]}, seen)
+                        yield "delta", {"content": text[sent:]}, seen
                         sent = len(text)
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"request {request_id} did not finish within 1800.0s")
                 time.sleep(0.02)
             output_ids = _await_completion(request_id)
         except (TimeoutError, RuntimeError) as exc:
-            yield _sse({"error": {"message": str(exc), "type": "api_error"}})
-            yield "data: [DONE]\n\n"
+            yield "error", {"message": str(exc), "type": "api_error"}, seen
             return
         except Exception as exc:
             # The 200 header left before this generator ran, so an escaping exception
@@ -420,9 +416,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             # that. Logged as well as framed, because a tidy error frame is easier to
             # ignore than silence and this branch means a defect, not a busy engine.
             logging.exception("stream for request %s died", request_id)
-            yield _sse({"error": {"message": f"{type(exc).__name__}: {exc}",
-                                  "type": "internal_error"}})
-            yield "data: [DONE]\n\n"
+            yield "error", {"message": f"{type(exc).__name__}: {exc}",
+                            "type": "internal_error"}, seen
             return
         # sent counts stripped characters, so these are the remainders of the same
         # strings the deltas were cut from
@@ -430,13 +425,39 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         stopped = engine.stop_text(request_id)
         text = cut_at_stop(text, stopped)
         if len(reasoning) > sent_r:
-            yield content_frame({"reasoning_content": reasoning[sent_r:]}, len(output_ids))
+            yield "delta", {"reasoning_content": reasoning[sent_r:]}, len(output_ids)
         # The held-back tail lands here, minus the stop sequence: `sent` counts what
         # actually went out, so this is the remainder either way.
         if len(text) > sent:
-            yield content_frame({"content": text[sent:]}, len(output_ids))
-        finish = "stop" if stopped else "length" if len(output_ids) >= max_new else "stop"
-        yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=finish))
+            yield "delta", {"content": text[sent:]}, len(output_ids)
+        yield ("done", "stop" if stopped else "length" if len(output_ids) >= max_new
+               else "stop", len(output_ids))
+
+    def _stream(request_id: int, max_new: int, prompt_tokens: int, opened: bool,
+                include_usage: bool, stops: tuple[str, ...] = ()):
+        created = int(time.time())
+        chunk_id = f"chatcmpl-{request_id}"
+        yield _sse(_chat_chunk(chunk_id, created, model_name, {"role": "assistant"}))
+        completion = 0
+        for kind, payload, completion in _deltas(request_id, max_new, opened, stops):
+            if kind == "error":
+                yield _sse({"error": payload})
+                yield "data: [DONE]\n\n"
+                return
+            if kind == "delta":
+                # Cumulative tokens on every content frame, vLLM's continuous_usage_stats
+                # shape. Without it a live rate gauge can only count frames, and this loop
+                # coalesces ~1.8 tokens into each (measured: 109 frames for 200 tokens on
+                # the 27B), so the page would show roughly half the real rate until the
+                # final usage chunk landed. choices stays populated, so a client that
+                # indexes it is unharmed; the usage-ONLY chunk remains the one with an
+                # empty choices list.
+                chunk = _chat_chunk(chunk_id, created, model_name, payload)
+                if include_usage:
+                    chunk["usage"] = _usage(prompt_tokens, completion)
+                yield _sse(chunk)
+            else:
+                yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=payload))
         # A final usage-only chunk, OpenAI's include_usage shape. Without it a client can
         # only guess the token count from characters, and chars/4 is ~4x low for Chinese
         # (roughly one token per character) -- a fabricated rate on the page's own meter.
@@ -445,7 +466,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         if include_usage:
             usage = _chat_chunk(chunk_id, created, model_name, {})
             usage["choices"] = []
-            usage["usage"] = _usage(prompt_tokens, len(output_ids))
+            usage["usage"] = _usage(prompt_tokens, completion)
             yield _sse(usage)
         yield "data: [DONE]\n\n"
 
@@ -457,15 +478,68 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     # a flat typed `output` list instead of `choices`.
     mount_responses(app, engine, tokenizer, model_name)
 
-    # The root is the playground: whoever opens the host:port wants to type at the
-    # model, not read what tileRL is. The landing page keeps its content at /about.
-    @app.get("/", response_class=HTMLResponse)
-    @app.get("/chat", response_class=HTMLResponse)
-    def chat() -> str:
-        return _CHAT_UI
+    @app.websocket("/ws/chat")
+    async def ws_chat(ws: WebSocket) -> None:
+        """The playground's transport. Frames: delta / done / error, one request each.
+
+        WebSocket rather than SSE because the page has to SEND a turn as well as read
+        one, and EventSource is receive-only -- the old page posted the turn and opened
+        a second connection for the reply. One socket per turn, so there are no request
+        ids on the wire and a reload cannot leave a stream attached to the wrong bubble.
+        """
+        await ws.accept()
+        try:
+            ask = await ws.receive_json()
+        except Exception:  # a client that closes before sending has nothing to answer
+            return
+        try:
+            kw = {"enable_thinking": ask["enable_thinking"]} if "enable_thinking" in ask else None
+            request_id, prompt_tokens, max_new, opened, _ = _submit(ChatCompletionRequest(
+                messages=ask["messages"], max_tokens=ask.get("max_tokens"),
+                chat_template_kwargs=kw))
+        except Exception as exc:
+            await ws.send_json({"t": "error", "message": f"{type(exc).__name__}: {exc}"})
+            await ws.close()
+            return
+
+        # _deltas blocks on the engine; stepping it in a thread keeps the event loop free
+        # to serve the other routes while one page streams.
+        gen, end = _deltas(request_id, max_new, opened), object()
+        try:
+            while (item := await asyncio.to_thread(next, gen, end)) is not end:
+                kind, payload, completion = item
+                if kind == "delta":
+                    await ws.send_json({"t": "delta", **payload})
+                elif kind == "error":
+                    await ws.send_json({"t": "error", "message": payload["message"]})
+                    break
+                else:
+                    await ws.send_json({"t": "done", "finish_reason": payload,
+                                        "usage": _usage(prompt_tokens, completion)})
+        except WebSocketDisconnect:
+            # The reader left mid-reply. Close the generator so its poll loop stops rather
+            # than running the request to max_tokens with nobody reading.
+            gen.close()
+            return
+        await ws.close()
 
     @app.get("/about", response_class=HTMLResponse)
     def about() -> str:
         return _LANDING
+
+    _STATIC = Path(__file__).parent / "static"
+
+    @app.get("/chat", include_in_schema=False)
+    def chat() -> FileResponse:
+        # StaticFiles(html=True) answers "/" with index.html but treats "/chat" as a
+        # missing file, and /chat is the URL the landing page links to.
+        return FileResponse(_STATIC / "index.html")
+
+    # The root is the playground: whoever opens the host:port wants to type at the model,
+    # not read what tileRL is; the landing page keeps its content at /about. The bundle is
+    # built by `web/` and committed, so serving it needs no node here. Mounted LAST:
+    # Starlette matches routes in registration order and a mount at "/" swallows every
+    # path declared after it.
+    app.mount("/", StaticFiles(directory=_STATIC, html=True), name="chat-assets")
 
     return app

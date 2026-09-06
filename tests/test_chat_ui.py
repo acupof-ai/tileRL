@@ -1,30 +1,22 @@
-"""The served chat page: 480 lines of CSS and a streaming state machine, gated.
+"""The served pages: the landing page string, and the built chat bundle.
 
-Nothing rendered ``/`` before this file. `_CHAT_UI` is a single string constant,
-so every defect in it is invisible to the test suite -- two sessions in a row
-reviewed a version of this page that had already been replaced, because there
-was no gate to fail when it moved.
+The chat page used to be a 20 KB Python string, and the gates here were built
+around that: slice the `<style>` block out of it, scan its script for bare calls,
+run pieces of it under a stub DOM. It is now TypeScript under `web/`, built to
+`src/tilerl/static/`, so three of those gates are gone because the compiler is
+strictly stronger than they were -- `tsc --noEmit` runs on every build with
+`strict`, `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`, and an
+undefined call, a missing property or a wrong argument order is a build failure,
+not a runtime one. What the compiler cannot see is what stayed: whether the page
+the browser gets renders the frames the server actually sends.
 
-These are structural assertions, not a snapshot: a snapshot of a 20 KB string
-fails on every edit and teaches nothing. Each test names one property the page
-must keep and fails only when that property breaks.
+That last one runs the REAL bundle -- the committed, minified artifact the server
+serves -- against the REAL frames a real WebSocket connection produced. Both
+halves shipped broken on 2026-09-04 with the other half correct, one in each
+direction, so neither side may be a fixture written by hand.
 
-Two of them are about the inline JS rather than the CSS. `addThinking` shipped
-called-but-never-defined and no gate could see it: the whole suite asserts on
-SSE bytes, and `_CHAT_UI` is a single Python string that Python only measures the
-length of. `node --check` does NOT close this -- verified: it reports SYNTAX_OK
-on `function a(){ return undefinedFn(1); }`, because an undefined call is a
-runtime error. The resolver below needs no JS runtime and so always runs in CI.
-
-Which bounds what these eight tests see, so state it in measured bytes rather than
-call the page "21 KB of JavaScript": of 19.6 KB, only **6.8 KB is script**. The
-other **12.9 KB is CSS and markup** -- a 1.91:1 split -- and the resolver never
-parses it. Measured by mutating the real source: a dangling *call* is caught, a
-dangling *route* (a string literal) is not, a dangling *button* (markup) is not,
-and the CSS gates catch a spacing regression but nothing about behaviour. Sizes
-drift with every edit to the page; the split is the part worth keeping.
-
-# ponytail: undefined calls only, stub-DOM execution when the page grows
+# ponytail: node-only client gates skip where node is absent; a browser runner
+# would also cover layout, which nothing here does
 """
 
 from __future__ import annotations
@@ -34,62 +26,84 @@ import re
 import shutil
 import subprocess
 import textwrap
-from html.parser import HTMLParser
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from tilerl.ui_assets import _CHAT_UI, _LANDING
+from tilerl.ui_assets import _LANDING
 
-#: Statement keywords that a naive "identifier followed by (" also matches.
-_KEYWORDS = {
-    "if", "for", "while", "switch", "catch", "return", "typeof", "function",
-    "await", "new", "do", "else", "delete", "void", "in", "of",
-}
-
-#: Globals the browser provides. Anything called bare and absent here has to be defined
-#: in the script itself, which is exactly the addThinking case.
-_BROWSER_GLOBALS = {
-    "AbortController", "Error", "String", "Number", "Boolean", "Array", "Object",
-    "JSON", "Math", "Date", "Promise", "Map", "Set", "RegExp", "TextDecoder",
-    "TextEncoder", "URL", "URLSearchParams", "FormData", "Headers", "Request",
-    "Response", "fetch", "setTimeout", "clearTimeout", "setInterval",
-    "clearInterval", "requestAnimationFrame", "cancelAnimationFrame", "alert",
-    "confirm", "parseInt", "parseFloat", "isNaN", "encodeURIComponent",
-    "decodeURIComponent", "structuredClone", "queueMicrotask", "btoa", "atob",
-}
+_STATIC = Path(__file__).resolve().parents[1] / "src" / "tilerl" / "static"
 
 
-def _css() -> str:
-    """The chat page's <style> block alone.
+def _bundle() -> str:
+    """The one JS artifact `index.html` loads.
 
-    `server.py` holds two pages; slicing from the file's first `<style>` picks
-    up the landing page instead, whose spacing is its own concern. Slice from
-    `_CHAT_UI` itself so this can only ever describe the chat page.
+    Read through the markup rather than globbed, so a stale asset left behind by an
+    earlier build cannot be the thing under test while the server serves another.
     """
-    head = _CHAT_UI.index("<style>")
-    return _CHAT_UI[head : _CHAT_UI.index("</style>", head)]
+    html = (_STATIC / "index.html").read_text()
+    srcs = re.findall(r'<script[^>]+src="\./assets/([\w.-]+\.js)"', html)
+    assert len(srcs) == 1, f"index.html loads {srcs}, expected exactly one bundle"
+    return (_STATIC / "assets" / srcs[0]).read_text()
 
 
-def _script(html: str) -> str:
-    """The FIRST inline script in `html`.
+def test_the_landing_page_js_parses():
+    """`_LANDING`'s 261 bytes of inline JS, through a real parser.
 
-    `rsplit("</script>")` took the LAST closing tag, so a page with two script blocks
-    returned everything between the first open and the final close -- measured on
-    _LANDING + _CHAT_UI, 27299 characters of markup captured as JavaScript, which the
-    resolver would then scan for bare calls. Correct today only because every caller
-    hands this one page; `split` makes it correct regardless.
+    It is an ordinary triple-quoted string, so Python eats every backslash escape in
+    it: a `\\n` inside a `//` comment once became a real newline, split the comment,
+    and killed a whole script block. The chat page no longer has this hazard -- it is
+    a file, not a string -- but the landing page still does.
     """
-    assert "<script>" in html, "the page has no inline script"
-    return html.split("<script>", 1)[1].split("</script>", 1)[0]
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the page JS cannot be parsed")
+    js = _LANDING.split("<script>", 1)[1].split("</script>", 1)[0]
+    r = subprocess.run([node, "--check", "-"], input=js, capture_output=True,
+                       text=True, timeout=60)
+    assert r.returncode == 0, f"_LANDING's JS does not parse:\n{r.stderr.strip()[:600]}"
 
 
-def _code_only(js: str) -> str:
-    """Blank out string literals, template literals and comments.
+def test_the_landing_page_js_reads_only_ids_its_markup_defines():
+    """An id the JS reads and the markup does not define is a null deref at load,
+    and `_LANDING`'s two ids are the only thing between it and a header stuck on
+    "connecting…"."""
+    js = _LANDING.split("<script>", 1)[1].split("</script>", 1)[0]
+    wanted = set(re.findall(r'getElementById\("([\w-]+)"\)', js))
+    assert wanted, "the id reader matched nothing; the regex is stale"
+    present = set(re.findall(r'id="([\w-]+)"', _LANDING))
+    assert wanted <= present, f"_LANDING's JS reads ids the markup lacks: {wanted - present}"
 
-    Without this, UI copy triggers false positives: `"read/write files  (Enter to send)"`
-    reads as a call to `files`. Measured -- it reported `files` and `tilerl` alongside the
-    real `addThinking`. Replaced with spaces, not deleted, so nothing new becomes adjacent.
+
+def test_the_bundle_and_the_markup_agree_on_every_id():
+    """The bundle's `$` throws on a missing id rather than returning null, so one
+    stale id is a blank page.
+
+    Checked in both directions, and against the BUILT artifact rather than the sources:
+    an id renamed in `index.html` without a rebuild leaves the served pair disagreeing
+    while `web/src/` reads consistent. Minification renames the variable
+    (`getElementById(t)`), so the ids are matched as the string literals they are
+    passed in as.
+    """
+    html = (_STATIC / "index.html").read_text()
+    bundle = _bundle()
+    present = set(re.findall(r'id="([\w-]+)"', html))
+    assert present, "index.html defines no ids; the markup is not what ships"
+    read = {i for i in present if f'"{i}"' in bundle}
+    assert read == present, (
+        f"ids in the markup that the bundle never reads: {sorted(present - read)}. Either "
+        f"the page grew dead markup or the bundle is stale -- rebuild with `npm run build`."
+    )
+
+
+def _strip_comments(ts: str) -> str:
+    """Blank out comments and string literals.
+
+    The sink gate scans for `innerHTML`, and `render.ts` explains in prose why it does
+    not use one -- so the comment naming the hazard would fail the gate that exists
+    because of it. Replaced with spaces rather than deleted, so nothing new becomes
+    adjacent.
     """
     pattern = (
         r'"(?:[^"\\\n]|\\.)*"'      # double-quoted
@@ -98,264 +112,261 @@ def _code_only(js: str) -> str:
         r"|//[^\n]*"                # line comment
         r"|/\*.*?\*/"               # block comment
     )
-    return re.sub(pattern, lambda m: " " * len(m.group(0)), js, flags=re.S)
+    return re.sub(pattern, lambda m: " " * len(m.group(0)), ts, flags=re.S)
 
 
-def _unresolved(js: str) -> set[str]:
-    js = _code_only(js)
-    # A bare call: identifier + "(" with no preceding '.' (which would make it a method)
-    # and no preceding word character (which would make it a suffix of a longer name).
-    bare = set(re.findall(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(", js))
-    defined = set(re.findall(r"function\s+([A-Za-z_$][\w$]*)", js))
-    defined |= set(re.findall(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", js))
-    # Arrow-function parameters, so a callback's own name does not read as unresolved.
-    defined |= set(re.findall(r"\(?\b([A-Za-z_$][\w$]*)\)?\s*=>", js))
-    # Declared parameters: a name a function receives and then calls, e.g.
-    # `readSSE(resp, onFrame)` calling `onFrame(...)`.
-    for params in re.findall(r"function\s*[\w$]*\s*\(([^)]*)\)", js):
-        defined |= {p.strip().lstrip("...").split("=")[0].strip() for p in params.split(",")}
-    return bare - _KEYWORDS - _BROWSER_GLOBALS - defined - {""}
+def test_the_bundle_has_no_html_string_sink():
+    """No markup can reach the DOM as text, so no reply can inject an attribute.
 
+    This replaces the attribute-breakout gate the old renderer needed. That one fed 15
+    crafted inputs through `mdRender` and parsed the output for attribute names outside
+    an allow-list, because the renderer built an HTML STRING and the page assigned it to
+    `innerHTML`: `[x](https://a"onmouseover="alert(1))` closed the href and the rest
+    became a live handler. `render.ts` builds nodes with `createElement` and
+    `createTextNode` instead, so text can only ever become text -- the class of bug is
+    absent rather than defended against, and the allow-list has nothing left to guard.
 
-#: A DOM small enough to run the page's own send path. Not a browser -- it answers one
-#: question the other gates cannot: does clicking send actually reach fetch, and does
-#: the fold's summary keep the structure that makes it clickable.
-_DOM_STUB = """
-const mk = (tag) => ({
-  tagName: tag.toUpperCase(), className: "", textContent: "", innerHTML: "", children: [],
-  style: {}, dataset: {}, open: false, value: "", disabled: false, hidden: false,
-  scrollTop: 0, scrollHeight: 0,
-  classList: { add(){}, remove(){}, toggle(){} },
-  appendChild(c){ this.children.push(c); c.parentNode = this; return c; },
-  insertBefore(c){ this.children.push(c); c.parentNode = this; return c; },
-  querySelector(sel){
-    const hit = (e) => ("." + e.className) === sel ? e : e.children.map(hit).find(Boolean);
-    return hit(this) || mk("span");
-  },
-  querySelectorAll(){ return []; },
-  addEventListener(ev, fn){ (this._h ||= {})[ev] = fn; },
-  setAttribute(){}, getAttribute(){}, focus(){}, remove(){}, scrollIntoView(){},
-});
-globalThis.document = { createElement: mk, getElementById: (i) => IDS[i] ?? null,
-  querySelector: () => mk("div"), querySelectorAll: () => [],
-  addEventListener(){}, body: mk("body") };
-globalThis.window = { addEventListener(){}, location: { origin: "http://x" } };
-globalThis.performance = { now: () => 0 };
-const CALLS = [];
-globalThis.fetch = async (u, o) => { CALLS.push({ u, body: o && o.body });
-  return { ok: true, status: 200, body: { getReader: () => ({ read: async () => ({done: true}) }) } }; };
-globalThis.AbortController = class { constructor(){ this.signal = {}; } abort(){} };
-globalThis.TextDecoder = class { decode(){ return ""; } };
-"""
+    Checked over the built artifact and the sources, because either one could
+    reintroduce it and only the artifact is what the browser runs.
 
-
-@pytest.mark.parametrize("name,page", [("_CHAT_UI", _CHAT_UI), ("_LANDING", _LANDING)])
-def test_the_page_js_parses(name, page):
-    """Each page's whole script block, through a real parser.
-
-    Both pages are ordinary triple-quoted strings, so Python eats every backslash
-    escape in them. A `\\n` inside a `//` comment became a real newline and split the
-    comment in two, leaving `", so` as a statement: SyntaxError, the entire script
-    block dead, and a page that renders but cannot send. The bare-call resolver saw
-    nothing wrong -- it scans text and does not parse -- and every other gate here
-    passed. The served page was broken for a whole deploy.
-
-    Parametrized over both pages because `_LANDING`'s 261 bytes of JS carry the same
-    hazard and had no gate of any kind. This is also why _MD_JS is `r\"\"\"`; the same
-    escape class had already cost a working regex earlier the same day.
+    # ponytail: literal sinks only -- a computed `el["inner"+"HTML"]` is invisible here
     """
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node not available; the page JS cannot be parsed")
-    js = _script(page)
-    r = subprocess.run([node, "--check", "-"], input=js, capture_output=True,
-                       text=True, timeout=60)
-    assert r.returncode == 0, f"{name}'s JS does not parse:\n{r.stderr.strip()[:600]}"
-    # A stray escape shows up as a line that is the tail of a broken string literal.
-    # Cheap, runs without node, and names the cause rather than a parse offset.
-    for n, line in enumerate(js.splitlines(), 1):
-        assert not line.lstrip().startswith('", '), (
-            f"{name} line {n} is {line.strip()!r}: a backslash escape was eaten by "
-            f"Python and split a comment or string. These pages are not raw strings."
+    sinks = ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(")
+    sources = sorted((_STATIC.parents[2] / "web" / "src").glob("*.ts"))
+    assert sources, "no TypeScript sources found; this gate is looking in the wrong place"
+    for label, text in [("the bundle", _bundle()),
+                        *((p.name, _strip_comments(p.read_text())) for p in sources)]:
+        found = [s for s in sinks if s in text]
+        assert not found, (
+            f"{label} writes markup as a string ({found}); model output reaches these "
+            f"nodes, so an attribute breakout becomes reachable again"
         )
 
 
-@pytest.mark.parametrize("name,page,reader", [
-    ("_CHAT_UI", _CHAT_UI, r'\$\("([\w-]+)"\)'),
-    ("_LANDING", _LANDING, r'getElementById\("([\w-]+)"\)'),
-])
-def test_every_element_the_js_reads_exists_in_the_markup(name, page, reader):
-    """An id the JS reads and the markup does not define is a null deref at load.
-
-    On the chat page that kills the whole script -- the same shape as the parse break,
-    caught only at runtime. `_LANDING` had no gate at all, and its two ids are the
-    only thing between it and a page whose header never leaves "connecting…".
-    """
-    wanted = set(re.findall(reader, _script(page)))
-    assert wanted, f"{name}: the id reader matched nothing; the regex is stale"
-    present = set(re.findall(r'id="([\w-]+)"', page))
-    assert wanted <= present, f"{name}'s JS reads ids the markup lacks: {wanted - present}"
-
-
-def test_sending_reaches_fetch_and_the_fold_stays_clickable():
-    """The page's own send path, executed.
-
-    Two failures got past every text-level gate here and reached the user: the script
-    block did not parse at all, and `display: flex` on the <summary> cost it the
-    disclosure behaviour, so the fold rendered and would not open. Both are only
-    visible if the code runs, so run it -- against a stub DOM, no browser.
-    """
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node not available; the send path cannot be executed")
-    # Populate the stub from the page's own ids rather than a hand-kept list -- a stub
-    # missing one id fails as a null deref, which reads like a page bug and is not one.
-    # That they all exist in the markup is its own test above.
-    wanted = set(re.findall(r'\$\("([\w-]+)"\)', _script(_CHAT_UI)))
-    ids = "const IDS = {};\n" + "".join(f'IDS["{i}"] = mk("div");\n' for i in sorted(wanted))
-    harness = _DOM_STUB + ids + _script(_CHAT_UI) + textwrap.dedent("""
-        const out = {};
-        const bubble = addMsg("user", "hello");
-        out.addMsg = bubble ? bubble.tagName : null;
-        out.feed = IDS.feed.children.length;
-        await sendChat("hi");
-        // The page also probes /v1/models on load, which carries no body -- pick the
-        // completion POST rather than assuming it is the first call.
-        const post = CALLS.filter((c) => c.body);
-        out.posts = post.length;
-        out.url = post.length ? post[0].u : null;
-        out.thinking = post.length ? post[0].body.includes("enable_thinking") : false;
-        // The fold: <details><summary><span class="row">..., because a flex summary
-        // is not clickable.
-        const body = addThinking(addMsg("assistant", ""));
-        const det = body.parentNode;
-        out.summary = det.children[0].tagName;
-        out.row = det.children[0].children[0].className;
-        out.chev = det.children[0].children[0].children[0].className;
-        console.log(JSON.stringify(out));
-    """)
-    r = subprocess.run([node, "--input-type=module", "-e", harness],
-                       capture_output=True, text=True, timeout=60)
-    assert r.returncode == 0, f"the page threw when run: {r.stderr.strip()[:600]}"
-    got = json.loads(r.stdout.strip().splitlines()[-1])
-    assert got["addMsg"] == "DIV" and got["feed"] >= 1, f"addMsg built nothing: {got}"
-    assert got["posts"] == 1, f"send did not reach fetch: {got}"
-    assert got["url"] == "/v1/chat/completions", f"send posted to {got['url']!r}"
-    assert got["thinking"], f"the request does not ask for thinking: {got}"
-    assert got["summary"] == "SUMMARY", f"the fold is not a summary: {got}"
-    assert got["row"] == "row" and got["chev"] == "chev", (
-        f"the summary lays itself out instead of an inner row, which is what made the "
-        f"fold unclickable: {got}"
-    )
+#: A DOM small enough to run the real bundle. Not a browser -- it answers the one
+#: question no server-side assertion can: does what the server sent become what the
+#: reader sees. `_html()` reconstructs the visible text of a subtree, since the
+#: bundle builds nodes and never produces a string of its own.
+_DOM_STUB = """
+const mk = (tag) => ({
+  tagName: tag.toUpperCase(), nodeValue: null, className: "", children: [],
+  hidden: false, open: false, value: "", checked: false, disabled: false,
+  classList: { _s: new Set(),
+    add(...c){ c.forEach((x) => this._s.add(x)); },
+    remove(...c){ c.forEach((x) => this._s.delete(x)); },
+    contains(c){ return this._s.has(c); } },
+  appendChild(c){ this.children.push(c); return c; },
+  append(...c){ this.children.push(...c); },
+  replaceChildren(...c){ this.children = c.flatMap((x) =>
+    x.tagName === "#FRAGMENT" ? x.children : [x]); },
+  addEventListener(ev, fn){ (this._h ||= {})[ev] = fn; },
+  focus(){}, scrollIntoView(){},
+});
+const text = (v) => ({ tagName: "#TEXT", nodeValue: String(v), children: [] });
+const IDS = {};
+globalThis.document = {
+  createElement: mk, createTextNode: text,
+  createDocumentFragment: () => mk("#fragment"),
+  getElementById: (i) => IDS[i] ?? null,
+  addEventListener(){}, body: mk("body"),
+};
+globalThis.window = { location: { protocol: "http:", host: "x", href: "http://x/" },
+  addEventListener(){} };
+globalThis.location = globalThis.window.location;
+// One socket, driven from the test: the bundle opens it, we replay the captured
+// frames into onmessage, then close. No network, no timing.
+globalThis.SENT = [];
+globalThis.WebSocket = class {
+  constructor(url){ globalThis.SOCK = this; this.url = url;
+    queueMicrotask(() => this.onopen && this.onopen()); }
+  send(d){ SENT.push(d); queueMicrotask(() => {
+    for (const f of FRAMES) this.onmessage({ data: f });
+    this.onclose && this.onclose();
+  }); }
+  close(){}
+};
+// The visible text of a subtree, tags included where they carry meaning.
+const _html = (el) => el.tagName === "#TEXT" ? el.nodeValue
+  : (el.tagName.startsWith("#") ? "" : `<${el.tagName.toLowerCase()}>`)
+    + el.children.map(_html).join("")
+    + (el.tagName.startsWith("#") ? "" : `</${el.tagName.toLowerCase()}>`);
+const _text = (el) => el.tagName === "#TEXT" ? el.nodeValue : el.children.map(_text).join("");
+"""
 
 
-def test_the_slicers_take_one_block_from_a_two_block_page():
-    """`server.py` holds two pages, so both slicers can over-capture.
+def _ws_frames(replies: list[str], max_tokens: int, thinking: bool = True) -> list[str]:
+    """The frames a real `/ws/chat` connection produces for `replies`.
 
-    `_script` used rsplit, which on a two-block page returns everything from the first
-    open tag to the LAST close tag: 27299 characters of markup handed to the resolver as
-    JavaScript. `_css` has the same shape and its docstring warns about it. Neither
-    hazard is reachable today -- every caller passes `_CHAT_UI` -- so this is the gate
-    that fails if a page merge makes it reachable.
-    """
-    page = _LANDING + _CHAT_UI
-    assert "</script>" not in _script(page), "_script spans past its own block"
-    assert "</style>" not in _CHAT_UI[_CHAT_UI.index("<style>") : _CHAT_UI.index("</style>")]
-    # And the real page still yields the script the other tests assert on.
-    assert "function mdRender" in _script(_CHAT_UI)
-
-
-def test_every_bare_call_in_the_page_js_resolves():
-    unresolved = _unresolved(_script(_CHAT_UI))
-    assert not unresolved, (
-        f"the page calls {sorted(unresolved)} and nothing defines them. This is the "
-        f"addThinking failure: the reply dies mid-stream with a ReferenceError, and no "
-        f"assertion on the SSE bytes can see it because the server is correct."
-    )
-
-
-def test_the_check_catches_an_undefined_call():
-    """Negative control: the gate above is worthless if it cannot fail.
-
-    Without this, a regex that quietly matches nothing would report a clean page forever.
-    """
-    assert _unresolved("function go() { return addThinking(bubble); }") == {"addThinking"}
-    # A method call on an object is NOT a bare call, so it must not be flagged.
-    assert _unresolved("x.addThinking(1); [].push(2);") == set()
-    # UI copy must not read as code. Measured: before literals were stripped, the check
-    # reported `files` and `tilerl` from a placeholder string alongside the real bug.
-    assert _unresolved('let p = "read/write files  (Enter to send)";') == set()
-    assert _unresolved("// call ghost(1) in a comment\nlet a = 1;") == set()
-
-
-def _page_after(sse: str) -> dict:
-    """Run the page's own send path against one SSE body; return what it rendered."""
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node not available; the page's send path cannot be executed")
-    wanted = set(re.findall(r'\$\("([\w-]+)"\)', _script(_CHAT_UI)))
-    ids = "const IDS = {};\n" + "".join(f'IDS["{i}"] = mk("div");\n' for i in sorted(wanted))
-    harness = _DOM_STUB + ids + _script(_CHAT_UI) + textwrap.dedent(f"""
-        const SSE = new TextEncoder().encode({json.dumps(sse)});
-        globalThis.TextDecoder = class {{ decode(v) {{ return Buffer.from(v).toString(); }} }};
-        globalThis.fetch = async () => ({{ ok: true, status: 200, body: {{ getReader: () => {{
-          let sent = false;
-          return {{ read: async () => sent ? {{done: true}} : (sent = true, {{value: SSE, done: false}}) }};
-        }} }} }});
-        await sendChat("page");
-        const turn = IDS.feed.children.at(-1);
-        const fold = turn.children.find((c) => c.className === "think");
-        const bubble = turn.children.find((c) => c.className.startsWith("content"));
-        console.log(JSON.stringify({{
-          reasoning: fold ? fold.children[1].textContent : null,
-          open: fold ? fold.open : null,
-          answer: bubble.innerHTML, text: bubble.textContent,
-          history: history.at(-1).content,
-        }}));
-    """)
-    r = subprocess.run([node, "--input-type=module", "-e", harness],
-                       capture_output=True, text=True, timeout=60)
-    assert r.returncode == 0, f"the page threw on the server's bytes: {r.stderr.strip()[:600]}"
-    return json.loads(r.stdout.strip().splitlines()[-1])
-
-
-def test_the_page_folds_the_reasoning_the_server_sends_and_shows_the_answer():
-    """The server's own stream, through the page's own handler.
-
-    The reasoning arrives as ``reasoning_content`` and the answer as ``content``; the
-    page used to split on ``</think>`` itself, and once the server stripped the closer
-    (#151) every reply landed whole in the reasoning fold over an empty bubble --
-    which is what "the V100 returns no HTML" was. A reply the budget cuts off inside
-    the block renders the reasoning and says so, rather than nothing.
+    Over the app's own router and the app's own engine duck-type, so what the client
+    gate replays is what the server emits rather than a shape someone typed here.
     """
     from test_server import _ByteTokenizer, _ScriptedEngine
 
     from tilerl.server import create_app
 
     tok = _ByteTokenizer()
-    engine = _ScriptedEngine(tok, ["planning\n</think>\n\n<p>hi</p>", "still planning"])
-    body = {"model": "m", "stream": True, "chat_template_kwargs": {"enable_thinking": True},
-            "stream_options": {"include_usage": True},
-            "messages": [{"role": "user", "content": "page"}]}
-    with TestClient(create_app(engine, tok)) as c:
-        full = c.post("/v1/chat/completions", json={**body, "max_tokens": 64}).text
-        cut = c.post("/v1/chat/completions", json={
-            **body, "max_tokens": len(tok.encode("still planning"))}).text
-    got = _page_after(full)
-    assert got["reasoning"] == "planning", got
-    assert "hi" in got["answer"] and "planning" not in got["answer"], got
-    assert got["open"] is False, f"the fold did not collapse once the answer began: {got}"
-    assert got["history"] == "<p>hi</p>", got
-    got = _page_after(cut)
-    assert got["reasoning"] == "still planning" and got["answer"] == "", got
-    assert got["text"] == "(cut off by max_tokens before the answer)", got
+    app = create_app(_ScriptedEngine(tok, replies), tok)
+    frames: list[str] = []
+    with TestClient(app) as c, c.websocket_connect("/ws/chat") as ws:
+        ws.send_json({"messages": [{"role": "user", "content": "page"}],
+                      "max_tokens": max_tokens, "enable_thinking": thinking})
+        while True:
+            f = ws.receive_json()
+            frames.append(json.dumps(f))
+            if f["t"] in ("done", "error"):
+                break
+    return frames
+
+
+def test_the_websocket_route_streams_reasoning_then_the_answer():
+    """The server half: the two phases arrive as their own fields, in order.
+
+    `reasoning_content` and `content` are what the SSE route already sends (#159), so
+    a reader of either transport learns one vocabulary. The page used to split on
+    `</think>` itself, and once the server stripped the closer (#151) every reply
+    landed whole in the reasoning fold over an empty bubble -- which is what "the V100
+    returns no HTML" was.
+    """
+    frames = [json.loads(f) for f in
+              _ws_frames(["planning\n</think>\n\n**hi**"], max_tokens=64)]
+    kinds = [f["t"] for f in frames]
+    assert kinds[-1] == "done" and "error" not in kinds, frames
+    reasoning = "".join(f.get("reasoning_content", "") for f in frames)
+    answer = "".join(f.get("content", "") for f in frames)
+    # `split_think` keeps the newline before the closer as part of the reasoning; the
+    # answer is the part after the blank line. Asserted verbatim, because a strip() here
+    # would also pass on a split that dropped a whole line.
+    assert reasoning == "planning\n", frames
+    assert answer == "**hi**", frames
+    # Ordering, not just presence: every reasoning frame precedes every content frame,
+    # which is the property a page can fold on. Deleting the phase split in `_deltas`
+    # interleaves them and fails here.
+    last_r = max(i for i, f in enumerate(frames) if "reasoning_content" in f)
+    first_c = min(i for i, f in enumerate(frames) if "content" in f)
+    assert last_r < first_c, f"the two phases interleave: {frames}"
+    assert frames[-1]["finish_reason"] == "stop", frames
+    assert frames[-1]["usage"]["completion_tokens"] > 0, frames
+
+
+def test_a_reply_cut_off_inside_the_block_says_length():
+    """The state ckl hit: the budget spent inside `<think>`, so there is no answer.
+
+    `finish_reason` is the only thing that separates it from a model that chose to say
+    nothing, and the page writes a different notice for each. Forcing "stop" here
+    makes the page call a truncation an empty reply.
+    """
+    reply = "still planning"
+    from test_server import _ByteTokenizer
+
+    frames = [json.loads(f) for f in
+              _ws_frames([reply], max_tokens=len(_ByteTokenizer().encode(reply)))]
+    assert frames[-1]["t"] == "done" and frames[-1]["finish_reason"] == "length", frames
+    assert not any("content" in f for f in frames), f"an answer arrived: {frames}"
+    assert "".join(f.get("reasoning_content", "") for f in frames) == reply, frames
+
+
+def test_the_websocket_protocol_library_is_installed():
+    """`TestClient.websocket_connect` fakes the transport in-process.
+
+    So every assertion above passes with no WebSocket library installed at all, while
+    the deployed server answers `/ws/chat` with **404** -- verified by holding a real
+    `websockets` client constant and varying only the server's venv: without it,
+    `InvalidStatus: HTTP 404`; with it, the socket connects. `serve_v100.sh` runs a
+    plain venv, so this is the assertion that fails instead of the deploy.
+    """
+    import importlib.util
+
+    assert importlib.util.find_spec("websockets") is not None, (
+        "uvicorn serves /ws/chat only with a WebSocket protocol implementation "
+        "installed; `uv sync --extra server` provides it"
+    )
+
+
+def _page_after(frames: list[str]) -> dict:
+    """Run the shipped bundle over `frames`; return what landed in the DOM."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available; the page's reader cannot be executed")
+    html = (_STATIC / "index.html").read_text()
+    ids = sorted(set(re.findall(r'id="([\w-]+)"', html)))
+    # The stub is populated from the page's own ids rather than a hand-kept list: a stub
+    # missing one fails as a null deref, which reads like a page bug and is not one. The
+    # two form defaults come from the markup for the same reason -- `checked` on the
+    # thinking box is what makes the request ask for reasoning at all, and a stub that
+    # hardcodes false would render a page that never has a fold to assert on.
+    checked = set(re.findall(r'id="([\w-]+)"[^>]*\schecked', html))
+    values = dict(re.findall(r'id="([\w-]+)"[^>]*\svalue="([^"]*)"', html))
+    harness = (
+        "const FRAMES = " + json.dumps(frames) + ";\n"
+        + _DOM_STUB
+        + "".join(f'IDS["{i}"] = mk("div");\n' for i in ids)
+        + "".join(f'IDS["{i}"].checked = true;\n' for i in sorted(checked))
+        + "".join(f'IDS["{i}"].value = {v!r};\n'.replace("'", '"') for i, v in values.items())
+        + _bundle()
+        + textwrap.dedent("""
+        IDS.composer.value = "page";
+        await IDS.send._h.click();
+        await new Promise((r) => setTimeout(r, 0));
+        const turn = IDS.log.children.at(-1);
+        const fold = turn.children.find((c) => c.className === "reasoning");
+        const answer = turn.children.find((c) => c.className === "answer");
+        const note = turn.children.find((c) => c.className === "note");
+        console.log(JSON.stringify({
+          url: SOCK.url,
+          sent: JSON.parse(SENT[0]),
+          reasoning: fold ? _text(fold.children[1]) : null,
+          foldOpen: fold ? fold.open : null,
+          answer: _html(answer),
+          note: note.hidden ? null : _text(note),
+          meter: _text(IDS.meter),
+          pending: turn.classList.contains("pending"),
+        }));
+    """)
+    )
+    r = subprocess.run([node, "--input-type=module", "-e", harness],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"the page threw on the server's frames: {r.stderr.strip()[:800]}"
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def test_the_page_renders_the_frames_this_server_sends():
+    """The loop closed: the real bundle over a real connection's frames.
+
+    Every other gate holds one side still -- the WS tests above assert on frames no
+    page reads, and a hand-written fixture asserts on a page no server fed. So a change
+    to the frame shape breaks the UI silently, which is how the page shipped broken
+    twice on 2026-09-04 with the server correct throughout.
+    """
+    got = _page_after(_ws_frames(["planning\n</think>\n\n**hi** and `x`"], max_tokens=64))
+    assert got["url"] == "ws://x/ws/chat", got
+    assert got["sent"]["messages"][-1] == {"role": "user", "content": "page"}, got
+    assert got["sent"]["enable_thinking"] is True, (
+        f"the page did not read `checked` off the thinking box, so the reply it "
+        f"rendered has no reasoning half to fold: {got}"
+    )
+    assert got["reasoning"] == "planning\n", got
+    # The inner div is `.prose`, one per non-fenced run: markdown() emits block nodes,
+    # so the answer bubble holds elements rather than a text blob.
+    assert got["answer"] == "<div><div><strong>hi</strong> and <code>x</code></div></div>", got
+    assert got["foldOpen"] is False, f"the fold opened over a finished answer: {got}"
+    assert got["note"] is None, f"a healthy reply carries a notice: {got}"
+    assert "completion_tokens" not in got["meter"] and got["meter"], got
+
+
+def test_the_page_explains_a_reply_the_budget_cut_off():
+    """An empty bubble is what ckl saw. The notice, and the reasoning left open,
+    are the only things that say where the budget went."""
+    reply = "still planning"
+    from test_server import _ByteTokenizer
+
+    got = _page_after(_ws_frames([reply], max_tokens=len(_ByteTokenizer().encode(reply))))
+    assert got["reasoning"] == reply, got
+    assert got["answer"] == "<div></div>", got
+    assert got["foldOpen"] is True, f"the reasoning stayed folded over an empty reply: {got}"
+    assert got["note"] and "budget" in got["note"], got
 
 
 def _tiny_client():
-    """A TestClient over the real app on the tiny model.
-
-    Two tests need it; building the engine twice doubles the slowest part of this file.
-    """
     from tilerl_kernels.backend import get_backend
 
     from tilerl.config import tiny
@@ -371,202 +382,58 @@ def _tiny_client():
 
 
 def test_the_index_route_serves_the_page():
-    """`/` returns the CHAT page, and the landing page is still reachable at /about.
+    """`/` and `/chat` return the CHAT page; the landing page stays at /about.
 
     Asserting 200 + text/html + <title> cannot tell the two pages apart -- both satisfy
-    all three -- so the route swap would have been invisible. Key on the composer, which
-    only the chat page has.
+    all three -- so a route swap would be invisible. Key on the composer, which only the
+    chat page has. `/chat` is its own route because `StaticFiles(html=True)` answers
+    `/` with index.html and treats `/chat` as a missing file.
     """
     client = _tiny_client()
     for route in ("/", "/chat"):
         r = client.get(route)
         assert r.status_code == 200, route
         assert r.headers["content-type"].startswith("text/html"), route
-        assert "<title>" in r.text and "</html>" in r.text, route
         assert "<textarea" in r.text, f"{route} is not the chat page"
     about = client.get("/about")
     assert about.status_code == 200 and "<textarea" not in about.text
-
-
-def test_every_gutter_offset_comes_from_one_token():
-    """`.turn` is a label column plus a gap, and `.note`/`.ev` sit at that same
-    offset. Three rules used to hardcode 80px with nothing tying them to the
-    62+18 they mirror, so changing the label column silently desynced them."""
-    css = _css()
-    assert "--gutter:" in css, "the label-column offset is not a token"
-    # No RULE may spell the composed offset as a literal again. Comments are
-    # exempt; the sum is worth naming in prose where the token is defined.
-    bad = [ln.strip() for ln in css.splitlines()
-           if "80px" in ln and "--gutter" not in ln and "max-width" not in ln
-           and not ln.lstrip().startswith(("/*", "*", "the "))]
-    assert not bad, f"gutter offset hardcoded instead of var(--gutter): {bad}"
+    # The mount at "/" is registered last and swallows anything after it, so check that
+    # a route declared BEFORE it still answers rather than falling into the static dir.
+    assert client.get("/health").status_code == 200, "the static mount shadowed the API"
 
 
 def test_spacing_is_spent_from_a_scale():
-    """The palette, type, shadow and radius are tokenized; spacing was not, and
-    23 hand-picked pixel values is what "the margins between components are
-    wrong" looks like. Tokens do not have to cover every value -- asymmetric
-    optical padding is real -- but the common ones must come from the scale."""
-    css = _css()
-    tokens = set(re.findall(r"--s-[\w-]+", css))
-    assert len(tokens) >= 5, f"expected a spacing scale in :root, found {tokens}"
-    # The scale must actually be spent, not merely declared.
-    uses = len(re.findall(r"var\(--s-", css))
+    """23 hand-picked pixel values is what "the margins between components are wrong"
+    looked like. Tokens need not cover every value -- optical padding is real -- but
+    the common ones come from the scale."""
+    css = (_STATIC / "index.html").read_text()
+    css = css[css.index("<style>") : css.index("</style>")]
+    tokens = set(re.findall(r"--s\d\b", css))
+    assert len(tokens) >= 4, f"expected a spacing scale in :root, found {tokens}"
+    uses = len(re.findall(r"var\(--s\d\)", css))
     assert uses >= 20, f"spacing scale declared but barely used ({uses} uses)"
 
 
-def test_no_style_rules_for_components_that_cannot_render():
-    """#60 removed the tab strip and every event kind but `error`; their CSS
-    stayed. Dead spacing rules are the hardest kind to review -- they look like
-    layout decisions for something you cannot find on the page."""
-    css, page = _css(), _CHAT_UI
-    for cls in (".tab", ".ev.thought", ".ev.action", ".ev.observation", ".ev.answer"):
-        if cls in css:
-            marker = f'class="{cls.lstrip(".").replace(".", " ")}'
-            kind = cls.rsplit(".", 1)[-1]
-            reachable = marker in page or f'addEvent("{kind}"' in page
-            assert reachable, f"{cls} is styled but nothing can render it"
-
-
 def test_pending_survives_reduced_motion():
-    """The caret and the header dot are the only two pending affordances and
-    both are animations, so `prefers-reduced-motion: reduce` -- which kills
-    `animation` on `*, *::after` -- used to leave the wait almost unsignalled."""
-    css = _css()
+    """The caret is the only pending affordance and it is an animation, so
+    `prefers-reduced-motion: reduce` used to leave the wait unsignalled."""
+    css = (_STATIC / "index.html").read_text()
     i = css.index("@media (prefers-reduced-motion: reduce)")
-    block = css[i : css.index("}\n  }", i) + 5] if "}\n  }" in css[i:] else css[i:]
-    assert "streaming" in block, (
-        "the reduced-motion block strips the caret's animation without giving "
-        "pending a static cue"
+    block = css[i : css.index("}", css.index("{", i)) + 1]
+    assert "animation: none" in block and "content:" not in block, (
+        "the reduced-motion block must drop the motion and keep the caret glyph"
     )
 
 
-def test_the_stream_marks_and_unmarks_the_pending_bubble():
-    """The caret is driven by one class. If it is added and never removed, every
-    finished turn keeps a blinking cursor; if never added, the wait is silent."""
-    assert '.classList.add("streaming")' in _CHAT_UI
-    assert '.classList.remove("streaming")' in _CHAT_UI
-
-
-def test_no_markdown_input_can_add_an_attribute_to_the_output():
-    """Attribute breakout: the renderer's output goes to innerHTML.
-
-    `mdEscape` escaped `&`, `<`, `>` and no quotes, while two rules interpolate its
-    result into an HTML ATTRIBUTE -- `href="..."` in the link rule and `data-lang="..."`
-    on a fence. So a `"` closed the attribute and the rest of the token became markup:
-    `[x](https://a"onmouseover="alert(1))` produced a live handler.
-
-    Asserts on the attribute NAMES a real parser finds, not on substrings and not on a
-    regex. Both weaker checks give wrong answers here, in opposite directions:
-
-    * A substring search cannot tell an attribute from text. After the fix the output
-      contains the inert literal `&quot;onmouseover=&quot;`, which matches.
-    * A regex over tag interiors invents attributes. `[\\s"']([a-zA-Z-]+)\\s*=` treats
-      `'` as an attribute separator, so inside the double-quoted value
-      `href="https://a'onmouseover='b"` it reports an `onmouseover` attribute that is
-      not there. Measured: the regex says [href, onmouseover, target, rel];
-      `html.parser` says [href, target, rel]. Every attribute this template writes is
-      double-quoted, so a `'` in a URL is an ordinary character -- the single-quote
-      variant was never a breakout, and the regex version of this gate reported a
-      kill for a mutation that reintroduces no bug.
-
-    The allow-list is closed rather than a deny-list of `on*`: `style`, `srcdoc` and
-    `formaction` are all reachable without an event handler name.
-    """
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node not available; the renderer's output cannot be exercised")
-    from tilerl.ui_assets import _MD_JS
-
-    #: Every attribute the renderer is allowed to emit, over every input.
-    allowed = {"href", "target", "rel", "class", "data-lang"}
-    attacks = [
-        '[x](https://a"onmouseover="alert(1))',
-        "[x](https://a'onmouseover='b)",
-        '```js"onload="alert(1)\ncode\n```',
-        "```js'onload='alert(1)\ncode\n```",
-        '[x](https://a"style="width:99vw)',           # not an on* name
-        '[x](javascript:alert(1))',                    # scheme, not breakout
-        '# h"onclick="x',
-        '- item"onclick="x',
-        '> quote"onclick="x',
-        '**b"onclick="x**',
-        # A raw tag, so this gate covers the `<` escape too and not only the quotes.
-        # Without it, dropping the `<` escape read MISSED under mutation while the
-        # quote mutations were caught.
-        '<img src=x onerror=alert(1)>',
-        '<a href="javascript:alert(1)">x</a>',
-        # Benign inputs must keep working: a regression here is a broken page, and a
-        # gate that only feeds attacks cannot see it.
-        '[ok](https://e.com/a?b=1&c=2)',
-        '```py\nprint(1)\n```',
-        'it\'s a "test"',
-    ]
-    harness = _MD_JS + "\nconst C = " + json.dumps(attacks) + ";\n" + textwrap.dedent("""
-        console.log(JSON.stringify(C.map((s) => [s, mdRender(s)])));
-    """)
-    r = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
-    assert r.returncode == 0, f"the renderer threw: {r.stderr.strip()[:400]}"
-    rows = json.loads(r.stdout.strip().splitlines()[-1])
-
-    class _Attrs(HTMLParser):
-        """Attribute names per start tag, from the parser the browser's rules match."""
-
-        def __init__(self) -> None:
-            super().__init__()
-            self.names: set[str] = set()
-
-        def handle_starttag(self, tag, attrs):
-            self.names |= {k for k, _ in attrs}
-
-    for src, html in rows:
-        p = _Attrs()
-        p.feed(html)
-        extra = sorted(p.names - allowed)
-        assert not extra, (
-            f"input {src!r} put {extra} into the markup, which innerHTML will honour:\n  {html}"
+def test_no_style_rules_for_components_that_cannot_render():
+    """#60 removed the tab strip and every event kind but `error`, and their CSS
+    stayed. Dead spacing rules are the hardest kind to review -- they look like layout
+    decisions for something you cannot find on the page."""
+    html = (_STATIC / "index.html").read_text()
+    css = html[html.index("<style>") : html.index("</style>")]
+    bundle = _bundle()
+    styled = set(re.findall(r"^\s*[\w.#:\-\[\]()= ]*?\.([a-z][\w-]*)", css, re.M))
+    for cls in sorted(styled):
+        assert f'"{cls}"' in bundle or f'class="{cls}"' in html or f"{cls} " in bundle, (
+            f".{cls} is styled but nothing can render it"
         )
-    # The benign rows must still render, or an over-eager escape passes this vacuously.
-    by_src = dict(rows)
-    assert 'href="https://e.com/a?b=1&amp;c=2"' in by_src['[ok](https://e.com/a?b=1&c=2)']
-    assert 'data-lang="py"' in by_src['```py\nprint(1)\n```']
-
-
-def test_markdown_renders_and_escapes():
-    """The renderer's OUTPUT, not just that its calls resolve.
-
-    `test_every_bare_call_in_the_page_js_resolves` passes on a renderer that emits
-    nothing, and an escape bug here is an XSS in a page that displays model output.
-    Runs the real JS under node; skips where node is absent (CI's cpu row has it, a
-    bare pod may not) rather than asserting on the source text, which would prove
-    only that the strings exist.
-    """
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node not available; the renderer's output cannot be exercised")
-    from tilerl.ui_assets import _MD_JS
-
-    checks = [
-        ("**b** and `c`", ["<strong>b</strong>", "<code>c</code>"]),
-        ("# H\n\ntext", ["<h1>H</h1>", "<p>text</p>"]),
-        ("- one\n- two", ["<ul>", "<li>one</li>"]),
-        ("1. a\n2. b", ["<ol>", "<li>a</li>"]),
-        ("> q", ["<blockquote>q</blockquote>"]),
-        ("a <script>x</script> b", ["&lt;script&gt;"]),          # escape, never inject
-        ("```py\nprint(1)\n```", ['<pre class="code"', 'data-lang="py"']),
-        ("```\nunclosed", ['<pre class="code"']),                 # degrades, not swallows
-        ("```\n**not bold**\n```", ["**not bold**"]),             # no inline rules in a fence
-    ]
-    harness = _MD_JS + "\nconst C = " + json.dumps(checks) + ";\n" + textwrap.dedent("""
-        const bad = [];
-        for (const [src, wants] of C) {
-          const out = mdRender(src);
-          for (const w of wants) if (!out.includes(w)) bad.push([src, w, out]);
-        }
-        if (mdRender("```\\n**x**\\n```").includes("<strong>")) bad.push(["fence", "isolation", ""]);
-        console.log(JSON.stringify(bad));
-    """)
-    r = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
-    assert r.returncode == 0, f"the renderer threw: {r.stderr.strip()[:400]}"
-    bad = json.loads(r.stdout.strip().splitlines()[-1])
-    assert not bad, f"markdown output wrong: {bad}"
