@@ -1393,7 +1393,7 @@ def _segment_run(model, backend, ids, pos, segment):
     """One forward + backward under `segment`; returns (named grads, pool-unchanged)."""
     from tilerl.train import _training_kv
 
-    kv = _training_kv(model, 1, ids.shape[1], device=backend.device)
+    kv = _training_kv(model, ids.shape[0], ids.shape[1], device=backend.device)
     tape = Tape()
     with torch.no_grad(), tape:
         out = model.forward(ids, pos, kv, RecordingBackend(backend), segment=segment)
@@ -1428,6 +1428,12 @@ def test_layer_segment_matches_the_mlp_segment():
 
     g_mlp, pool_mlp = _segment_run(model, backend, ids, pos, "mlp")
     g_layer, pool_layer = _segment_run(model, backend, ids, pos, "layer")
+
+    # batch 2, because _training_kv sizes num_slots by batch: at batch 1 win_parity is a
+    # 1-element tensor and `==` bool-ables, so the parity assert only compares a real
+    # vector here. Caught by grpo_loop at batch 8, never by a batch-1 arm.
+    ids2 = np.repeat(ids, 2, axis=0)
+    _segment_run(model, backend, ids2, pos, "layer")
 
     assert pool_mlp and pool_layer, "backward moved the state pool"
     assert set(g_mlp) == set(g_layer), (

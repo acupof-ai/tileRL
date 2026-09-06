@@ -498,7 +498,9 @@ class Model:
         pos = torch.as_tensor(positions, dtype=torch.long, device=device)
         x = backend.embedding(ids, self.params["embed_tokens"])
         linear_idx = 0
-        parity0 = getattr(kv.state_pool, "win_parity", None) if hasattr(kv, "state_pool") else None
+        pool0 = getattr(kv, "state_pool", None) if segment == "layer" else None
+        # clone: the reference would compare against itself
+        parity0 = None if pool0 is None else pool0.win_parity.clone()
         for i in range(cfg.num_layers):
             if segment == "layer":
                 state_in = window_in = None
@@ -523,11 +525,11 @@ class Model:
                 hidden_out.append(x)
         if hidden_out is not None:
             hidden_out.append(x)
-        if segment == "layer" and parity0 is not None:
+        if parity0 is not None:
             # a flip mid-forward would send a replayed scatter to the other plane
-            assert kv.state_pool.win_parity == parity0, (
-                f"win_parity moved {parity0} -> {kv.state_pool.win_parity} during a "
-                f"segmented forward: a checkpoint replay would scatter to the wrong plane"
+            assert torch.equal(pool0.win_parity, parity0), (
+                f"win_parity moved {parity0.tolist()} -> {pool0.win_parity.tolist()} "
+                f"during a segmented forward: a replay would scatter to the wrong plane"
             )
         # lm_head over every prefill position is 4.7% of the FLOPs and a 508 MB
         # output thrown away; the caller passes ``last_only`` (a list gives the

@@ -61,6 +61,17 @@ rather than the tidier "move both boundary ops outside".
 would send a replayed scatter to the other plane. Training never flips it (the
 flip is in `_gdn`'s serving branch), so this is an assertion, not a fix.
 
+**The first version of that assertion was broken two ways at once**, and the two
+hid each other. `parity0` held a reference to the live pool tensor, so
+`win_parity == parity0` compared it against itself and could never fail; and
+`win_parity` is `[num_slots] int32` (`kv_cache.py:229`), so above one slot the
+comparison raises `Boolean value of Tensor with more than one value is ambiguous`
+rather than asserting. `_training_kv` sizes `num_slots` by batch (`train.py:47`)
+and the test helper used batch 1 — the one shape where a 1-element tensor
+bool-ables and both defects are invisible. Found by selecting the arm at
+`train.py:155` and running the real `grpo_loop`: **11 tests in `test_rl.py` went
+red.** Now `.clone()` + `torch.equal`, with a batch-2 arm.
+
 ## What the CPU half establishes
 
 Tiny model, CPU target, `segment="layer"` against `segment="mlp"`:
@@ -80,6 +91,9 @@ Tiny model, CPU target, `segment="layer"` against `segment="mlp"`:
 | the handed-in state is load-bearing | source-mutating `_gdn` to re-gather instead of using `state_in` moves **26 of 27** gradients, worst rel **8.087e-01** at `layers.1.in_proj_qkv` |
 | a pool comparison alone | **does not discriminate** — the re-gathering arm leaves the pool byte-identical, because the scatter converges. Only the gradients see it. |
 | the 27-gradient equality is not vacuous | the same assertion is what the mutation arm fails |
+| the parity assert can fail at all | flipping `win_parity[0]` after layer 1 fails with `win_parity moved [0, 0] -> [1, 0]`; before the clone fix this control passed silently |
+| the batch-2 arm is not decoration | a raise-on-`numel > 1` probe inside `forward` fires with `numel=2`, so the arm reaches a real parity vector rather than the bool-able 1-element case |
+| the arm runs on the shipped path | `segment="layer"` selected at `train.py:155` and the full `grpo_loop` tests run: 41 passed (they were 11 red before the parity fix) |
 | card state before any peak is read | (pending) `nvidia-smi --query-compute-apps=pid,used_memory` returning zero rows, read in the same call as the numbers |
 
 ## Results
@@ -115,8 +129,13 @@ step 0 here is not a cold number.
   last from another session's keep-graphs arm B step 0. The 71.53→67.77 gap was
   itself argued to be noise in the errors entry (#190 measured at 0.947x), so
   quoting it as the band is partly circular. Row 1 is judged against the
-  cross-tree span of **±4.2 s**, and a difference under 0.5 s is inside even the
+  cross-tree span of **±4.6 s**, and a difference under 0.5 s is inside even the
   same-code spread.
+
+  Six dense `backward_secs` readings exist now, from six trees, all H20 card 6 at
+  this recipe: **71.53 / 68.30 / 68.26 / 67.77 / 67.31 / 66.92**, span **4.61 s**.
+  Six points from six trees are a range, not a sample from a distribution, so no
+  confidence interval is computed from them.
 - Row 1 regresses and row 3 fits → default stays `"mlp"` and the caller picks by
   shape, with the threshold measured on live activation bytes at T **on both
   arms**, not derived from one.
