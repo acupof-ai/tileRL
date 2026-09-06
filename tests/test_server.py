@@ -655,6 +655,13 @@ class _ScriptedEngine:
         self._done: dict[int, list[int]] = {}
         self._lp: dict[int, list[float]] = {}
         self._taken: set[int] = set()
+        self._peeked: dict[int, int] = {}
+
+    def peek(self, request_id: int):
+        """Half the reply, then all of it, then gone -- the live path and the tail."""
+        ids = self._done.get(request_id)
+        n = self._peeked[request_id] = self._peeked.get(request_id, 0) + 1
+        return None if ids is None or n > 2 else ids[: len(ids) * n // 2]
 
     def submit(self, input_ids, params=None) -> int:
         self._next += 1
@@ -1171,3 +1178,39 @@ def test_a_reply_that_carries_only_the_think_closer_is_the_answer(tmp_path, monk
             "model": "m", "max_tokens": 64,
             "messages": [{"role": "user", "content": "page"}]}).json()
         assert bare["choices"][0]["message"]["content"] == "bare turn", bare
+
+
+def _chat_stream_fields(client, reply: str, max_tokens: int) -> tuple[list, list, str]:
+    """(reasoning deltas, content deltas, finish) of one thinking-on chat stream."""
+    resp = client.post("/v1/chat/completions", json={
+        "model": "m", "max_tokens": max_tokens, "stream": True,
+        "chat_template_kwargs": {"enable_thinking": True},
+        "messages": [{"role": "user", "content": reply}]})
+    assert resp.status_code == 200, resp.text
+    frames = [json.loads(ln[6:]) for ln in resp.text.splitlines()
+              if ln.startswith("data: ") and ln != "data: [DONE]"]
+    assert not any("error" in f for f in frames), frames
+    kinds = [(k, c["delta"][k]) for f in frames for c in f["choices"]
+             for k in ("reasoning_content", "content") if c.get("delta", {}).get(k)]
+    finish = [c["finish_reason"] for f in frames for c in f["choices"] if c.get("finish_reason")]
+    return ([t for k, t in kinds if k == "reasoning_content"],
+            [t for k, t in kinds if k == "content"], finish[-1])
+
+
+def test_the_stream_carries_the_reasoning_as_its_own_field(tmp_path, monkeypatch):
+    """With the block opened, reasoning streams as ``reasoning_content`` and the answer
+    as ``content``, in that order, and neither carries the closer. Measured on the V100
+    at eccac47: the server stripped the closer, the page still split on it, and a
+    whole HTML reply landed in the reasoning fold with an empty bubble underneath.
+    A reply the budget cuts off inside the block is reasoning only, finish ``length``."""
+    tok = _ByteTokenizer()
+    engine = _ScriptedEngine(tok, ["planning\n</think>\n\n<p>hi</p>", "still planning"])
+    with TestClient(create_app(engine, tok)) as c:
+        reasoning, content, finish = _chat_stream_fields(c, "page", 64)
+        assert "".join(reasoning) == "planning\n", reasoning
+        assert "".join(content) == "<p>hi</p>", content
+        assert len(reasoning) >= 1 and len(content) >= 1 and finish == "stop"
+        assert not any("</think>" in t for t in reasoning + content)
+        reasoning, content, finish = _chat_stream_fields(c, "page", len(tok.encode("still planning")))
+        assert "".join(reasoning) == "still planning" and content == [], (reasoning, content)
+        assert finish == "length"

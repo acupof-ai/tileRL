@@ -288,49 +288,67 @@ def test_the_check_catches_an_undefined_call():
     assert _unresolved("// call ghost(1) in a comment\nlet a = 1;") == set()
 
 
-def test_the_reasoning_split_handles_a_reply_that_starts_inside_think():
-    """The stream carries only `</think>`, and the page has to fold on that.
-
-    The checkpoint's template ends the prompt with "<think>\\n", so generation begins
-    inside the block: measured against the served V100, a 300-token reply contained
-    `</think>` and no `<think>`. The first version keyed on the opening tag, so the
-    fold never fired and the reasoning printed inline as prose -- and no gate saw it,
-    because every assertion here was about markup and CSS.
-    """
+def _page_after(sse: str) -> dict:
+    """Run the page's own send path against one SSE body; return what it rendered."""
     node = shutil.which("node")
     if node is None:
-        pytest.skip("node not available; splitThink's behaviour cannot be exercised")
-    js = _script(_CHAT_UI)
-    start = js.index("function splitThink")
-    fn = js[start : js.index("\nfunction ", start + 1)]
-
-    # (raw, inside) -> (reasoning, answer). `inside` is the page's THINK flag.
-    cases = [
-        # What the server actually sends: no open tag, close tag mid-reply.
-        ["why\n</think>\nthe answer", True, "why\n", "\nthe answer"],
-        # Mid-stream, before the close tag arrives: all reasoning, no answer yet.
-        ["thinking about it", True, "thinking about it", ""],
-        # Thinking off: no tags at all, so all of it is the answer.
-        ["just the answer", False, "", "just the answer"],
-        # A reply that does carry both tags (backfilled history, or a paste).
-        ["<think>r</think>a", False, "r", "a"],
-        # An unclosed open tag is still reasoning, not an answer.
-        ["<think>r only", False, "r only", ""],
-        # A close tag with nothing before it: empty reasoning, not a dropped answer.
-        ["</think>a", True, "", "a"],
-    ]
-    harness = fn + "\nconst C = " + json.dumps(cases) + ";\n" + textwrap.dedent("""
-        const bad = [];
-        for (const [raw, inside, wantR, wantA] of C) {
-          const [r, a] = splitThink(raw, inside);
-          if (r !== wantR || a !== wantA) bad.push([raw, inside, [r, a], [wantR, wantA]]);
-        }
-        console.log(JSON.stringify(bad));
+        pytest.skip("node not available; the page's send path cannot be executed")
+    wanted = set(re.findall(r'\$\("([\w-]+)"\)', _script(_CHAT_UI)))
+    ids = "const IDS = {};\n" + "".join(f'IDS["{i}"] = mk("div");\n' for i in sorted(wanted))
+    harness = _DOM_STUB + ids + _script(_CHAT_UI) + textwrap.dedent(f"""
+        const SSE = new TextEncoder().encode({json.dumps(sse)});
+        globalThis.TextDecoder = class {{ decode(v) {{ return Buffer.from(v).toString(); }} }};
+        globalThis.fetch = async () => ({{ ok: true, status: 200, body: {{ getReader: () => {{
+          let sent = false;
+          return {{ read: async () => sent ? {{done: true}} : (sent = true, {{value: SSE, done: false}}) }};
+        }} }} }});
+        await sendChat("page");
+        const turn = IDS.feed.children.at(-1);
+        const fold = turn.children.find((c) => c.className === "think");
+        const bubble = turn.children.find((c) => c.className.startsWith("content"));
+        console.log(JSON.stringify({{
+          reasoning: fold ? fold.children[1].textContent : null,
+          open: fold ? fold.open : null,
+          answer: bubble.innerHTML, text: bubble.textContent,
+          history: history.at(-1).content,
+        }}));
     """)
-    r = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
-    assert r.returncode == 0, f"splitThink threw: {r.stderr.strip()[:400]}"
-    bad = json.loads(r.stdout.strip().splitlines()[-1])
-    assert not bad, f"splitThink is wrong on: {bad}"
+    r = subprocess.run([node, "--input-type=module", "-e", harness],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"the page threw on the server's bytes: {r.stderr.strip()[:600]}"
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def test_the_page_folds_the_reasoning_the_server_sends_and_shows_the_answer():
+    """The server's own stream, through the page's own handler.
+
+    The reasoning arrives as ``reasoning_content`` and the answer as ``content``; the
+    page used to split on ``</think>`` itself, and once the server stripped the closer
+    (#151) every reply landed whole in the reasoning fold over an empty bubble --
+    which is what "the V100 returns no HTML" was. A reply the budget cuts off inside
+    the block renders the reasoning and says so, rather than nothing.
+    """
+    from test_server import _ByteTokenizer, _ScriptedEngine
+
+    from tilerl.server import create_app
+
+    tok = _ByteTokenizer()
+    engine = _ScriptedEngine(tok, ["planning\n</think>\n\n<p>hi</p>", "still planning"])
+    body = {"model": "m", "stream": True, "chat_template_kwargs": {"enable_thinking": True},
+            "stream_options": {"include_usage": True},
+            "messages": [{"role": "user", "content": "page"}]}
+    with TestClient(create_app(engine, tok)) as c:
+        full = c.post("/v1/chat/completions", json={**body, "max_tokens": 64}).text
+        cut = c.post("/v1/chat/completions", json={
+            **body, "max_tokens": len(tok.encode("still planning"))}).text
+    got = _page_after(full)
+    assert got["reasoning"] == "planning", got
+    assert "hi" in got["answer"] and "planning" not in got["answer"], got
+    assert got["open"] is False, f"the fold did not collapse once the answer began: {got}"
+    assert got["history"] == "<p>hi</p>", got
+    got = _page_after(cut)
+    assert got["reasoning"] == "still planning" and got["answer"] == "", got
+    assert got["text"] == "(cut off by max_tokens before the answer)", got
 
 
 def _tiny_client():
