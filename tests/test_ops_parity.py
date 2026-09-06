@@ -5,6 +5,7 @@ torch.autograd."""
 from __future__ import annotations
 
 import os
+import pathlib
 
 os.environ.setdefault("TILERL_TARGET", "cpu")
 
@@ -819,6 +820,140 @@ def test_attention_bwd():
         lambda go, q, k, v: reference.dense_attention_bwd(go, q, k, v, 0.5),
         [q, k, v],
     )
+
+
+# ------------------------------------------------- chunked attention (the training path)
+
+#: (B, Tq, Hq, Hkv, D). Tq spans the chunk: 2 is one tile, 200 and 150 are several
+#: with an uneven tail, and Hq > Hkv exercises GQA without expanding K/V.
+_ATTN_SHAPES = ((1, 2, 4, 4, 8), (2, 200, 8, 2, 16), (1, 150, 6, 3, 8))
+
+
+def _attn_inputs(shape, seed=3):
+    torch.manual_seed(seed)
+    b, t, hq, hkv, d = shape
+    return (torch.randn(b, t, hq, d), torch.randn(b, t, hkv, d), torch.randn(b, t, hkv, d))
+
+
+def _rel(a, b):
+    return ((a - b).abs().max() / b.abs().max().clamp_min(1e-12)).item()
+
+
+@pytest.mark.parametrize("shape", _ATTN_SHAPES)
+def test_chunked_attention_matches_the_dense_oracle(shape):
+    """Forward and backward, against the dense pair. The three mutation arms in
+    `test_chunked_attention_needs_its_rescale_and_mask` are what make this
+    non-vacuous: at Tq <= _ATTN_CHUNK a chunk IS the whole matrix."""
+    q, k, v = _attn_inputs(shape)
+    assert _rel(reference.chunked_attention(q, k, v, 0.5),
+                reference.dense_attention(q, k, v, 0.5)) < 1e-2, shape
+    go = torch.randn(*q.shape)
+    got = reference.chunked_attention_bwd(go, q, k, v, 0.5)
+    want = reference.dense_attention_bwd(go, q, k, v, 0.5)
+    for name, a, b in zip(("gq", "gk", "gv"), got, want):
+        assert _rel(a, b) < 1e-2, f"{shape} {name}"
+
+
+def test_chunked_attention_bwd_gradcheck():
+    q, k, v = _attn_inputs((2, 200, 8, 2, 16))
+    _autograd_gradcheck(
+        "chunked_attention_bwd",
+        lambda q, k, v: reference.chunked_attention(q, k, v, 0.5),
+        lambda go, q, k, v: reference.chunked_attention_bwd(go, q, k, v, 0.5),
+        [q, k, v],
+    )
+
+
+def test_chunked_attention_allocates_no_score_matrix():
+    """The largest intermediate must not grow with T.
+
+    Asserted by doubling T, not by a byte bound: the score TILE is
+    [B,Hkv,G,C,C], legitimately larger than an input, so "smaller than q" is the
+    wrong ceiling. And not by looking for [T,T]-shaped tensors -- that probe can
+    only find the failure it assumes and reports zero for a correct chunked path.
+    Both T values exceed _ATTN_CHUNK, or one tile spans the sequence.
+    """
+    c = reference._ATTN_CHUNK
+    seen = {}
+    for t in (c * 2, c * 4):
+        q, k, v = _attn_inputs((1, t, 4, 4, 8))
+        go = torch.randn(*q.shape)
+        for label, call in (("fwd", lambda: reference.chunked_attention(q, k, v, 0.5)),
+                            ("bwd", lambda: reference.chunked_attention_bwd(go, q, k, v, 0.5))):
+            big, shape = _largest_tensor(call)
+            assert shape[-2:] != (t, t), f"{label} T={t}: allocated a {t}x{t} score matrix"
+            seen.setdefault(label, []).append((t, big, shape))
+    for label, rows in seen.items():
+        (t0, b0, s0), (t1, b1, s1) = rows
+        assert b1 == b0, (
+            f"{label}: largest intermediate grew {b0}B {s0} at T={t0} -> {b1}B {s1} "
+            f"at T={t1}; a chunked path's peak is set by the tile, not the sequence"
+        )
+
+
+def _largest_tensor(call):
+    """Bytes and shape of the largest tensor the call allocates."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Watch(TorchDispatchMode):
+        big, shape = 0, ()
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            for x in out if isinstance(out, (list, tuple)) else [out]:
+                if isinstance(x, torch.Tensor) and x.numel() * x.element_size() > self.big:
+                    self.big, self.shape = x.numel() * x.element_size(), tuple(x.shape)
+            return out
+
+    w = Watch()
+    with w:
+        call()
+    return w.big, w.shape
+
+
+def test_chunked_attention_does_not_sync_per_tile():
+    """No host sync, at any T. The per-tile `int(k_pos.min())` this replaced cost
+    one each and showed up only as 7-vs-2 in test_train_step_does_not_sync_per_parameter,
+    a budget shared with the optimizer -- so the property gets its own gate."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Count(TorchDispatchMode):
+        n = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if str(func) == "aten._local_scalar_dense.default":
+                Count.n += 1
+            return func(*args, **(kwargs or {}))
+
+    for t in (reference._ATTN_CHUNK * 2, reference._ATTN_CHUNK * 8):
+        q, k, v = _attn_inputs((1, t, 4, 4, 8))
+        go = torch.randn(*q.shape)
+        for label, call in (("fwd", lambda: reference.chunked_attention(q, k, v, 0.5)),
+                            ("bwd", lambda: reference.chunked_attention_bwd(go, q, k, v, 0.5))):
+            Count.n = 0
+            with Count():
+                call()
+            assert Count.n == 0, f"{label} T={t}: {Count.n} host syncs"
+
+
+@pytest.mark.parametrize(
+    "what,find,repl",
+    [
+        ("acc rescale", "acc = acc * r[..., None] +", "acc = acc +"),
+        ("l rescale", "l = l * r + p.sum(-1)", "l = l + p.sum(-1)"),
+        ("causal mask", '.masked_fill(kp[None, :] > qp[:, None], float("-inf"))', ""),
+    ],
+)
+def test_chunked_attention_needs_its_rescale_and_mask(what, find, repl):
+    """Negative control per mechanism: each removal must break parity. Run on a
+    multi-chunk shape -- the rescales are unreachable at one chunk."""
+    src = pathlib.Path(reference.__file__).read_text()
+    assert src.count(find) == 1, f"{what}: anchor moved, this control is dead"
+    ns = {}
+    exec(compile(src.replace(find, repl), "<mutated>", "exec"), ns)
+    q, k, v = _attn_inputs((2, 200, 8, 2, 16))
+    rel = _rel(ns["chunked_attention"](q, k, v, 0.5), reference.dense_attention(q, k, v, 0.5))
+    assert rel > 1e-2, f"removing the {what} changed nothing (rel {rel:.2e})"
 
 
 # ---------------------------------------------------------------- sampling
