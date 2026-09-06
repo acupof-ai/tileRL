@@ -89,11 +89,93 @@ that names it. The helpers are plain functions, not generators, so there is no d
 
 ## Results
 
-(pending — card 6, `--gen 1024 --group 8`, tree `cd98e3a`)
+Card 6, uncontended (8/8 at 0 MiB before launch), `--gen 1024 --group 8`, tree `cd98e3a`,
+artifact `/work/gdnsplit.json`. Step 2, warm. `backward_secs` 83.613 (step 1: 80.454).
 
-Acceptance: the rows must sum to the 45.3 s within the sync overhead, or the probe is not
-measuring the handler.
+| row | raw s | share | calls | ms/call |
+|---|---:|---:|---:|---:|
+| `_gdn_chunk_bwd` — the adjoint | 31.268 | 55.2% | 30720 | 1.018 |
+| `_gdn_chunk_fwd` — the recompute | 19.596 | 34.6% | 30720 | 0.638 |
+| `gdn_backward` — prologue + epilogue remainder | 5.752 | 10.2% | 384 | 14.979 |
+
+30720 = 384 GDN handler calls × 80 chunks a layer, which is the expected count at T=1280, C=16.
+
+**The acceptance test 27 set does not pass on the raw numbers, and that is the finding, not a
+footnote.** The rows sum to **56.616 s** against the **45.300 s** the registry-mode profile
+measured for the same handler. This mode makes **61824** timed calls against that mode's 21936,
+with two device syncs each, so the sync cost is inside the rows:
+
+| | |
+|---|---:|
+| rows, summed | 56.616 s |
+| the handler, measured without these syncs | 45.300 s |
+| excess | **+11.316 s** |
+| ÷ 61824 calls | **0.183 ms a call** |
+
+Subtracting a uniform per-call cost brings the sum back to 45.300 by construction:
+
+| row | corrected s | share |
+|---|---:|---:|
+| `_gdn_chunk_bwd` | 25.645 | 56.6% |
+| `_gdn_chunk_fwd` | 13.973 | 30.8% |
+| `gdn_backward` | 5.682 | 12.5% |
+
+That correction is a **model** — it assumes every timed call pays the same sync — so the two
+readings bracket the answer rather than one replacing the other:
+
+- the adjoint is **55-57%** of the GDN backward
+- the recompute is **31-35%**
+- the prologue and epilogue are **10-13%**
+
+The bracket is tight enough to decide the lever, which is what it was for.
+
+### What this means for the port
+
+Against the whole step, using the registry mode's 45.300 s for GDN and 73.775 s for the
+backward:
+
+| | s | of the GDN backward | of `backward_secs` |
+|---|---:|---:|---:|
+| the adjoint — the three upstream examples reach this | 25.6-31.3 | 55-57% | 35-38% |
+| the recompute — no upstream *backward* kernel; `chunk_delta_h`/`wy_fast` forward would | 14.0-19.6 | 31-35% | 19-24% |
+| prologue + epilogue — nothing upstream at any point | 5.7 | 10-13% | 7-8% |
+
+**A port of the three backward examples addresses at most 57% of the GDN row**, i.e. ~37% of
+the backward — not the 65.7% the one-line handler total suggests. Reaching the recompute needs
+the forward kernels as well, and 10-13% is reachable by neither.
+
+For the prologue/epilogue row, 27 asked for calls alongside seconds because elementwise
+adjoints are usually launch-bound. Counted from the source blocks (`:898-922`, `:957-994`):
+**45 tensor ops a call — 19 prologue, 26 epilogue — so 17280 a step** at 14.979 ms a call. The
+row is 45 ops each moving f32 activations, not one expensive kernel, so its lever is fusion and
+dtype, not a port. It is also the row where an f32→bf16 decision would show up.
 
 ## Not established
 
-- (pending the run)
+- **The sync correction is a model, not a measurement.** It assumes a uniform per-call cost.
+  A cheaper way to settle it would be an arm that syncs only around `gdn_backward` and derives
+  the two inner rows by difference — one call per layer instead of 61824.
+- **The absolute seconds are not the shipped path's**, and here they are further from it than in
+  the registry profile: `backward_secs` reads 83.613 against that run's 73.775, +9.838 s of
+  sync. The **shares** are the quotable part, as a bracket.
+- **Not a kernel profile.** A row includes python, dispatch and allocation. The recompute row
+  in particular is 80 python-level chunk iterations a layer, so part of its 31-35% is loop
+  overhead a kernel removes for free and part is real arithmetic — this profile does not
+  separate them.
+- **The port's ceiling is bounded above, not predicted.** "At most 57%" is what the adjoint
+  costs today, not what it would cost after the port; a kernel that is 3x faster on that row
+  buys ~37% × 2/3, and nothing here measures the kernels themselves.
+- One warm step, one process, one shape, one card.
+
+## Rule
+
+Split a lever before sizing it. `linear_attn_chunk`'s 65.7% read as one addressable block; it
+is 55-57% adjoint, 31-35% forward recompute and 10-13% elementwise pre/post, and the three have
+three different fixes — a backward kernel port, a forward kernel or a tape change, and fusion.
+The one-line handler total would have justified a port that reaches a third of what it looked
+like it would.
+
+When a finer probe disagrees with a coarser one, the disagreement is a quantity to measure, not
+a discrepancy to explain away. 56.616 against 45.300 divided by the 39888 extra timed calls
+gives 0.183 ms a call, which is a plausible cost for two device syncs — the arithmetic both
+identified the cause and bounded the answer.
