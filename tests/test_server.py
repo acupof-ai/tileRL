@@ -1349,7 +1349,7 @@ def test_the_stream_carries_the_reasoning_as_its_own_field(tmp_path, monkeypatch
 def test_an_omitted_max_tokens_gets_the_context_remainder(client, model_id, monkeypatch):
     """Omitted means "as much as fits", not 512.
 
-    ckl, 2026-09-06: "默认尽量输出不限制不超上限就行". A flat 512 ends a long reply at
+    ckl, 2026-09-06: the default should be the ceiling, not a flat cap. A flat 512 ends a reply at
     ``finish_reason=length``, which reads to a client as a dropped stream. The assertion
     is on the value handed to ``sampling``, not on the reply: the tiny model's answer is
     short either way, so a test that only read the reply would stay green with the 512

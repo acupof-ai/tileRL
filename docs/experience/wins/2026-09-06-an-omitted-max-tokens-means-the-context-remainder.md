@@ -4,9 +4,9 @@
 
 ## Context
 
-ckl, on the V100 endpoint: "现在最大输出长度是多少有限制吧 默认尽量输出不限制不超上限就行" —
-a reply that stops early reads to a client as a dropped stream, and the report was that
-replies were being cut.
+ckl, on the V100 endpoint: the default should be as much as fits under the ceiling, not a
+flat cap. A reply that stops early reads to a client as a dropped stream, and the report was
+that replies were being cut.
 
 Two independent caps were producing that, one on each side of the wire:
 
