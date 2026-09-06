@@ -1,9 +1,9 @@
 # Three live arms skipped by construction, and the skip said only "too short" — cpu, 2026-09-06
 
-> Status: fixed twice, and **still not passing against real weights**. The prompt fix
-> made the arms reachable; the live re-run then failed a different way (the cap went to
-> reasoning), fixed by running them thinking-off. Canned: 3/3 fire, 3/3 skip honestly.
-> Live: `pending-remote` on a third run.
+> Status: FIXED, and verified live on the third run — `api_e2e.py` from `c8ca8d2`
+> against the V100 (27B NVFP4, sm70) serving `753da30`: **rc 0, all 14 checks passed,
+> 0 skipped**, the three stop arms among them. Took two failed live runs to get there,
+> for two different reasons; both are recorded below rather than trimmed.
 
 ## Context
 
@@ -92,12 +92,30 @@ the CPU side.
 
 Both re-run after the thinking-off change, same results.
 
+## Third live run: 14/14, 0 skipped
+
+`scripts/api_e2e.py` from `c8ca8d2`, against the V100 serving `753da30`, run by 27
+with no restart. **rc 0, all 14 checks passed, 0 skipped** — the first run in which
+this feature's automated arms executed against real weights at all:
+
+| arm | result |
+|---|---|
+| `chat stop sequence` | `cut at 'apit', 5 chars left` |
+| `chat stop sequence (stream)` | `5 chars, stop absent` |
+| `messages stop_sequences` | `stop_reason=stop_sequence, stop_sequence='apit'` |
+
+The zero matters as much as the fourteen: the skip floor exists because a probe can
+skip its way to exit 0, and two earlier runs did exactly that on these arms. Raw
+output is at `/tmp/api_e2e_v100_4.txt` on 27's machine.
+
 ## Not established
 
-- **The arms have still never passed against real weights.** Two live runs, two
-  different reasons: the prompt could not produce a long enough reply, then the cap
-  went to reasoning. Whether the 27B answers `say_more` with enough prose once
-  thinking is off is unmeasured — likely, and the skip will name the number if not.
+- **One run, not a trend.** The arms passed once. The stop is derived from the
+  model's own reply each time, so a future run against a terser deployment can still
+  skip — legitimately now, and it will name the number.
+- **The wall-clock time of the run is not recorded here.** 27 reported the sha and
+  the results; I do not have the timestamp, and a plausible-looking one written from
+  memory is worse than its absence.
 
 ## Rule
 
