@@ -192,19 +192,97 @@ def _selfcheck() -> int:
                  ("tilerl.train", "untruncated"))
         for mod, name in pairs:
             assert hasattr(importlib.import_module(mod), name), f"{mod} has no {name}"
+
+        # --inside-gdn: the three names it patches must exist on the reference module, and
+        # gdn_backward must reach the two helpers through module globals or the patch sees
+        # nothing. A stub gdn_backward that calls them proves the wiring; the real one is
+        # what the pod run exercises.
+        ref = importlib.import_module("tilerl_kernels.reference")
+        for name in ("_gdn_chunk_fwd", "_gdn_chunk_bwd", "gdn_backward"):
+            assert callable(getattr(ref, name, None)), f"reference has no {name}"
+        real = {n: getattr(ref, n) for n in ("_gdn_chunk_fwd", "_gdn_chunk_bwd",
+                                             "gdn_backward")}
+        try:
+            ref._gdn_chunk_fwd = lambda *a: time.sleep(0.02)
+            ref._gdn_chunk_bwd = lambda *a: time.sleep(0.02)
+            # calls the helpers by GLOBAL name, as gdn_backward:929/:955 do
+            def stub(*a, **kw):
+                time.sleep(0.02)          # stands in for the prologue/epilogue
+                ref._gdn_chunk_fwd()
+                ref._gdn_chunk_bwd()
+            ref.gdn_backward = stub
+            secs3, calls3 = instrument_gdn(lambda: None)
+            ref.gdn_backward()
+            assert calls3 == {"gdn_backward": 1, "_gdn_chunk_fwd": 1, "_gdn_chunk_bwd": 1}, calls3
+            for n in ("_gdn_chunk_fwd", "_gdn_chunk_bwd"):
+                assert 0.015 <= secs3[n] < 0.035, f"{n} should be its own sleep: {dict(secs3)}"
+            assert 0.015 <= secs3["gdn_backward"] < 0.035, (
+                "gdn_backward is charged for the helpers -- the timer is inclusive, and its "
+                f"row is meant to be the prologue/epilogue remainder: {dict(secs3)}")
+        finally:
+            for n, fn in real.items():
+                setattr(ref, n, fn)
     finally:
         ag._BWD.clear()
         ag._BWD.update(saved)
     print(f"selfcheck ok: a drained handler timed {secs['slow']:.3f}s, an undrained call "
           f"{undrained * 1000:.3f}ms; nested {secs2['outer']:.3f}s outer + "
           f"{secs2['inner']:.3f}s inner, exclusive so the shares sum to 100%; "
-          f"{len(pairs)} of main()'s imports resolved")
+          f"{len(pairs)} of main()'s imports resolved; --inside-gdn splits a stub into "
+          f"{secs3['gdn_backward']:.3f}s remainder + {secs3['_gdn_chunk_fwd']:.3f}s recompute "
+          f"+ {secs3['_gdn_chunk_bwd']:.3f}s adjoint")
     return 0
+
+
+def instrument_gdn(sync) -> tuple[dict, dict]:
+    """Split `reference.gdn_backward` — the 45.3 s row — into its own sub-calls.
+
+    Two functions carry almost all of it and both are module-level, so patching
+    `reference._gdn_chunk_fwd` / `_gdn_chunk_bwd` catches every call:
+
+    * `_gdn_chunk_fwd` is called from `gdn_backward:929` to RECOMPUTE the forward chunk
+      loop, because the tape keeps no chunk intermediates. That time is recompute, not
+      gradient work, and no upstream backward kernel replaces it — a tape change would.
+    * `_gdn_chunk_bwd` (:955) is the adjoint proper, the part `example_chunk_delta_bwd`
+      and `example_wy_fast_bwd_split` would replace.
+
+    `gdn_backward`'s own prologue (conv1d taps, silu, the two L2 norms, softplus) and
+    epilogue (norm/silu/conv adjoints, the head-group folds) are straight-line code, not
+    functions, so they are not wrapped. They fall out as `gdn_backward` minus the two
+    helpers, and that remainder is reported as its own row rather than left implicit.
+    """
+    secs: dict[str, float] = defaultdict(float)
+    calls: dict[str, int] = defaultdict(int)
+    child = [0.0]
+
+    def wrap(name, fn):
+        def timed(*a, **kw):
+            sync()
+            outer, child[0] = child[0], 0.0
+            t0 = time.perf_counter()
+            out = fn(*a, **kw)  # NOT a generator, unlike a _BWD handler: no drain needed
+            sync()
+            elapsed = time.perf_counter() - t0
+            secs[name] += elapsed - child[0]
+            calls[name] += 1
+            child[0] = outer + elapsed
+            return out
+
+        return timed
+
+    from tilerl_kernels import reference as ref
+    # gdn_backward wrapped too, so the prologue/epilogue remainder is a measured
+    # subtraction rather than an assumption about what is left over.
+    for name in ("_gdn_chunk_fwd", "_gdn_chunk_bwd", "gdn_backward"):
+        setattr(ref, name, wrap(name, getattr(ref, name)))
+    return secs, calls
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--selfcheck", action="store_true")
+    ap.add_argument("--inside-gdn", action="store_true",
+                    help="split reference.gdn_backward instead of the _BWD registry")
     ap.add_argument("--model", default="qwen38-27b")
     ap.add_argument("--gen", type=int, default=1024)
     ap.add_argument("--group", type=int, default=8)
@@ -245,7 +323,7 @@ def main() -> int:
     vocab = int(getattr(cfg, "vocab_size", 0)) or 1000
     prompt = rng.integers(1, vocab, size=a.prompt_tokens, dtype=np.int64)
 
-    secs, calls = instrument(sync)
+    secs, calls = instrument_gdn(sync) if a.inside_gdn else instrument(sync)
     rows_out = []
     for step in range(a.steps):
         ids = [engine.submit(list(prompt), sampling) for _ in range(a.group)]
