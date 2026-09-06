@@ -32,9 +32,13 @@ does not say what ran.
     # CPU gate (this machine)
     TILERL_TARGET=cpu uv run python scripts/prof_prefill_ops.py --selfcheck
 
-    # V100, inside the maintenance window, with the serve child stopped
-    /work/tl013/bin/python -u scripts/prof_prefill_ops.py \\
-        --model qwen38-27b --tokens 2048,8192,16384 --json /work/prefill_ops.json
+    # V100, inside the maintenance window, with the serve child stopped.
+    # Paths are the V100's, verified on the host: there is no /work mount there
+    # (that is the H20 pod) and the serving interpreter is venv70.
+    cd /data00/home/chenkailun.c/tilerl-git && \\
+    /data00/home/chenkailun.c/venv70/bin/python -u scripts/prof_prefill_ops.py \\
+        --model qwen38-27b --tokens 2048,8192,16384 \\
+        --json /data00/home/chenkailun.c/prefill_ops.json
 """
 
 from __future__ import annotations
@@ -53,7 +57,7 @@ sys.path.insert(0, "packages/tilerl-kernels/src")
 from tilerl_kernels.backend import get_backend  # noqa: E402
 from tilerl_kernels.registry import _REGISTRY  # noqa: E402
 
-from tilerl.config import tiny  # noqa: E402
+from tilerl.cli import _build_model  # noqa: E402
 from tilerl.engine import _PHASE_PREFILL, SamplingParams, build_engine  # noqa: E402
 from tilerl.kv_cache import NoPrefixStore  # noqa: E402
 
@@ -182,7 +186,9 @@ def _prefill_arm(engine, timer, n_tokens: int, vocab: int, seed: int) -> dict:
     if req.phase == _PHASE_PREFILL:
         raise RuntimeError(f"prefill did not finish in {_MAX_TICKS} ticks")
     return {"tokens": n_tokens, "chunks": chunks, "prefill_secs": total,
-            "n_chunks": len(chunks)}
+            "n_chunks": len(chunks),
+            "sync_secs": sum(c["sync_secs"] for c in chunks),
+            "ops_secs": sum(v for c in chunks for v in c["ops"].values())}
 
 
 def _bucket(ops: dict) -> dict:
@@ -256,18 +262,30 @@ def main() -> int:
         print(f"  {op:<24} {here or '-- not registered':<40}"
               + (f"same maker as: {','.join(shared)}" if shared else ""))
 
-    if args.model != "tiny":
-        raise SystemExit("only the tiny/tiny-agent config is wired here; "
-                         "pass --model tiny and set --tokens")
-
     ctx = max(lengths) + 64
-    cfg = tiny(max_position_embeddings=ctx)
-    from tilerl.model import build_random
+    # tiny caps at 512 positions; tiny-agent is the same config with room for a
+    # real prompt. Asking for 2k+ tokens on plain tiny would refuse at submit.
+    name = "tiny-agent" if args.model == "tiny" and ctx > 512 else args.model
+    if name != args.model:
+        print(f"note: --model tiny caps at 512 positions; using {name} for ctx={ctx}")
+    cfg, model = _build_model(name, seed=7, keep_master=False)
+    if ctx > cfg.max_position_embeddings:
+        raise SystemExit(f"{name} holds {cfg.max_position_embeddings} positions; "
+                         f"--tokens asks for {ctx}")
     timer = _Timer(backend)
-    model = build_random(cfg, seed=7)
     engine = build_engine(cfg, model, timer, num_blocks=(ctx // 16) * 4 + 64,
                           num_slots=4, max_batch=1, max_total_tokens=ctx,
                           prefix_store=NoPrefixStore())
+    print(f"model={cfg.name} layers={cfg.num_layers} "
+          f"full_attn={len(cfg.full_attn_layers)} H={cfg.num_attention_heads} "
+          f"D={cfg.head_dim} ctx={cfg.max_position_embeddings}")
+
+    # TileLang compiles on first call, and a compile inside a timed chunk reads as
+    # attention cost: a 2048 arm on the V100 put 5.276 s of paged_attention and
+    # 4.008 s of write_tokens in chunk 0 against 0.001-0.002 s in every later
+    # chunk, and every selfcheck assertion was true of it. Warm first, untimed.
+    print("warming the JIT (untimed)...")
+    _prefill_arm(engine, timer, min(lengths), cfg.vocab_size, seed=1)
 
     arms = []
     for i, n in enumerate(lengths):
@@ -305,6 +323,19 @@ def _selfcheck(arms: list) -> None:
             assert attributed <= c["tick_secs"] * 1.5 + 1e-3, (
                 f"ops sum {attributed:.4f} exceeds tick {c['tick_secs']:.4f} at "
                 f"prefix {c['prefix']}: the proxy is counting a call twice")
+
+    # A first chunk far above the rest is a compile, not a cost. Every other
+    # assertion here is true of a compile, so without this the gate passes a
+    # void arm -- which is worse than no gate.
+    for a in arms:
+        rest = [c["tick_secs"] for c in a["chunks"][1:]]
+        if len(rest) >= 2:
+            med = sorted(rest)[len(rest) // 2]
+            c0 = a["chunks"][0]["tick_secs"]
+            assert c0 <= max(med * 20, med + 0.05), (
+                f"{a['tokens']}-token arm: chunk 0 took {c0:.3f} s against a median "
+                f"{med:.3f} s for the rest -- that is a JIT compile inside the timed "
+                "region, not attention. Warm the kernels first; this arm is void")
 
     # the prefix really advances, or "cost rises with prefix" is unmeasurable
     pref = [c["prefix"] for c in long["chunks"]]
