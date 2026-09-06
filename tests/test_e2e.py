@@ -427,11 +427,21 @@ def test_submit_rollback_and_terminal_failure():
         num_slots=1,
         max_total_tokens=32,
     )
-    engine.submit([1], SamplingParams(max_new_tokens=1))
+    # Two requests that stay alive, so the single slot is genuinely contended: at
+    # max_new_tokens=1 each finished inside its own step() and freed the slot before the
+    # next was considered, so nothing ever competed.
+    engine.submit([1], SamplingParams(max_new_tokens=8))
+    engine.step()  # admit the first request, so it holds the only slot
     free_blocks = engine._kv.free_blocks
-    with pytest.raises(RuntimeError, match="LinearStatePool exhausted"):
-        engine.submit([2], SamplingParams(max_new_tokens=1))
-    assert engine._kv.free_blocks == free_blocks
+    # Slot exhaustion is a WAIT, not a raise: allocation moved to the planner, and an
+    # exception there reaches `step`'s handler, which fails every RUNNING request -- one
+    # queued request arriving with the slots full would have killed the live ones.
+    engine.submit([2], SamplingParams(max_new_tokens=8))
+    engine.step()
+    # `_waiting` directly, not `stats()["waiting"]`: with a loop thread running, `stats()`
+    # returns the snapshot published during the last tick, which predates this submit.
+    assert len(engine._waiting) == 1, "the second request was not left waiting"
+    assert engine._kv.free_blocks == free_blocks, "a request that did not fit took blocks"
 
     engine._model.forward = lambda *_, **__: (_ for _ in ()).throw(RuntimeError("boom"))
     with pytest.raises(RuntimeError, match="boom"):
@@ -1342,6 +1352,7 @@ def test_prefix_hit_survives_evicting_its_own_entry():
     [engine._kv.alloc_block() for _ in range(engine._kv.free_blocks - 1)]
 
     rid = engine.submit(tokens, SamplingParams(max_new_tokens=4))
+    engine.step()  # eviction happens at admission now, not in submit
     assert engine._prefix.stats()["evictions"] >= 1 and rid > 0
 
 
