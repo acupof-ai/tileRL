@@ -93,6 +93,11 @@ def main() -> int:
     timed("messages stream (drain)", lambda: [
         e for e in an.messages.create(model="tilerl", max_tokens=64, messages=msg,
                                       stream=True)])
+    timed("responses non-stream", lambda: oa.responses.create(
+        model="tilerl", input="hi", extra_body=think))
+    timed("responses stream (drain)", lambda: [
+        e for e in oa.responses.create(model="tilerl", input="hi", stream=True,
+                                       extra_body=think)])
     srv.should_exit = True
     return 0
 

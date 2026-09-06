@@ -12,6 +12,7 @@ GPU: the replies are canned, and what is under test is the HTTP surface.
 
 from __future__ import annotations
 
+import json
 import socket
 import threading
 import time
@@ -316,3 +317,126 @@ def test_messages_rejects_a_bad_field_with_anthropics_error_envelope(an):
                            messages=[{"role": "user", "content": "hi"}])
     assert exc.value.body["error"]["message"]
     assert exc.value.body["type"] == "error"
+
+
+# --- OpenAI Responses ------------------------------------------------------
+
+
+def test_responses_non_stream(oa):
+    r = oa.responses.create(model="tilerl", input="hi", extra_body=THINKING_ON)
+    assert r.output_text == REPLY
+    assert r.status == "completed"
+    assert [i.type for i in r.output] == ["reasoning", "message"]
+    assert r.usage.total_tokens == r.usage.input_tokens + r.usage.output_tokens
+
+
+def test_responses_carries_the_fields_the_model_declares_required(oa, base_url):
+    """`Response` declares parallel_tool_calls / tool_choice / tools required.
+
+    Asserted by name because the SDK will NOT catch their absence: measured,
+    `Response.model_validate` rejects a body without parallel_tool_calls, but the
+    client builds replies with `construct`, so a missing required field arrives as
+    None and every other assertion still passes. Read off the raw JSON, since the
+    parsed object cannot distinguish "absent" from "null".
+    """
+    import httpx
+
+    raw = httpx.post(f"{base_url}/v1/responses", timeout=30,
+                     json={"model": "tilerl", "input": "hi"}).json()
+    for field in ("parallel_tool_calls", "tool_choice", "tools", "object",
+                  "created_at", "usage"):
+        assert field in raw, f"{field} missing from the response body"
+    assert raw["object"] == "response"
+
+
+def test_responses_reasoning_is_its_own_item(oa):
+    r = oa.responses.create(model="tilerl", input="hi", extra_body=THINKING_ON)
+    item = next(i for i in r.output if i.type == "reasoning")
+    assert [c.text.rstrip("\n") for c in item.content] == [REASON]
+    # output_text is the message items only, so the reasoning must not leak in.
+    assert REASON not in r.output_text
+
+
+def test_responses_stream_events_and_order(oa):
+    names, text = [], ""
+    for ev in oa.responses.create(model="tilerl", input="hi", stream=True, extra_body=THINKING_ON):
+        names.append(ev.type)
+        if ev.type == "response.output_text.delta":
+            text += ev.delta
+    assert text == REPLY
+    assert names[0] == "response.created"
+    assert names[-1] == "response.completed"
+    for want in ("response.in_progress", "response.output_item.added",
+                 "response.content_part.added", "response.output_text.done",
+                 "response.content_part.done", "response.output_item.done"):
+        assert want in names, f"{want} missing from {names}"
+
+
+def test_responses_tool_call_and_replay(oa, engine):
+    """A call out, then its output back in -- the shape an agent loop sends.
+
+    The second request replays the function_call and function_call_output items;
+    they must reach the same template the first turn used, or a loop's history
+    silently degrades to a bare prompt.
+    """
+    tools = [{"type": "function", "name": "Bash", "description": "run a command",
+              "parameters": {"type": "object",
+                             "properties": {"command": {"type": "string"}}}}]
+    first = oa.responses.create(model="tilerl", input="run ls", tools=tools,
+                               extra_body=THINKING_ON)
+    call = next(i for i in first.output if i.type == "function_call")
+    assert call.name == "Bash" and json.loads(call.arguments) == {"command": "ls"}
+    assert first.status == "completed"
+
+    before = len(engine.prompts)
+    second = oa.responses.create(model="tilerl", tools=tools, extra_body=THINKING_ON, input=[
+        {"type": "message", "role": "user", "content": "run ls"},
+        {"type": "function_call", "call_id": call.call_id, "name": call.name,
+         "arguments": call.arguments},
+        {"type": "function_call_output", "call_id": call.call_id, "output": "a.txt"},
+    ])
+    prompt = engine.prompts[before]
+    assert "<tool_response>" in prompt and "a.txt" in prompt, prompt
+    assert second.output_text == REPLY
+
+
+def test_responses_max_output_tokens_reports_incomplete(oa):
+    r = oa.responses.create(model="tilerl", input="hi", max_output_tokens=4,
+                            extra_body=THINKING_ON)
+    assert r.status == "incomplete"
+    assert r.incomplete_details.reason == "max_output_tokens"
+
+
+def test_messages_replaying_a_thinking_block_drops_the_reasoning(an, engine):
+    """Claude Code sends the thinking block back in the next assistant turn.
+
+    `blocks_to_text` keeps only kinds it knows, so an unknown one vanishes -- and
+    that is the wanted behaviour here: the template re-opens <think> only after
+    the last real user query, so replaying old reasoning is off-distribution.
+    Untested until now, which is the same shape as a silent format regression.
+    """
+    tools = [{"name": "Bash", "description": "run a command",
+              "input_schema": {"type": "object",
+                               "properties": {"command": {"type": "string"}}}}]
+    first = an.messages.create(model="tilerl", max_tokens=64, tools=tools,
+                               messages=[{"role": "user", "content": "run ls"}])
+    use = next(b for b in first.content if b.type == "tool_use")
+
+    before = len(engine.prompts)
+    second = an.messages.create(
+        model="tilerl", max_tokens=64, tools=tools,
+        thinking={"type": "enabled", "budget_tokens": 32},
+        messages=[
+            {"role": "user", "content": "run ls"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "I should list them.", "signature": ""},
+                {"type": "tool_use", "id": use.id, "name": use.name, "input": use.input},
+            ]},
+            {"role": "user", "content": [{"type": "tool_result",
+                                          "tool_use_id": use.id, "content": "a.txt"}]},
+        ])
+    prompt = engine.prompts[before]
+    assert "I should list them." not in prompt, "replayed reasoning reached the prompt"
+    # The turn is not dropped wholesale: its tool_use and the result both render.
+    assert "<tool_call>" in prompt and "<tool_response>" in prompt and "a.txt" in prompt
+    assert _text_of(second) == REPLY
