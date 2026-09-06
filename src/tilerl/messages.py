@@ -50,6 +50,7 @@ from .prompt import (
     split_think,
     strip_think,
     unknown_fields,
+    unsupported_choice,
 )
 from .tokenizer import Tokenizer
 
@@ -89,6 +90,8 @@ class MessagesRequest(BaseModel):
     stream: bool | None = None
     stop_sequences: list[str] | None = None
     metadata: dict[str, Any] | None = None
+    #: Refused beyond auto/none: we render tools as text and cannot force a call.
+    tool_choice: dict[str, Any] | str | None = None
     #: {"type": "adaptive"} from Claude Code; only its presence is used
     thinking: dict[str, Any] | None = None
     output_config: dict[str, Any] | None = None
@@ -178,9 +181,7 @@ def _effort(req: MessagesRequest) -> str | None:
 
 def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: str) -> FastAPI:
     """Add POST /v1/messages to an existing app, sharing its engine."""
-    # The engine refuses prompt+max_new_tokens over its budget; the real API
-    # accepts any max_tokens and stops at the context edge, so the completion
-    # is clamped to what is left rather than the request rejected.
+    # For the recorder row only: a `budget` below `engine_limit - prompt_len` was pool-capped.
     engine_limit = getattr(getattr(engine, "limits", None), "max_total_tokens", 0)
 
     def _render(req: MessagesRequest) -> str:
@@ -193,14 +194,18 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def _run(req: MessagesRequest, rollout: str | None = None) -> tuple[dict[str, Any], int]:
-        refuse_unsupported(*_unsatisfied_edits(req.context_management))
+        refuse_unsupported(*_unsatisfied_edits(req.context_management),
+                           tool_choice=unsupported_choice(req.tool_choice))
         input_ids = tokenizer.encode(_render(req))
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
         # The real API accepts any max_tokens and stops at the context edge;
         # refusing would 400 every Claude Code turn, which always asks for 32000.
-        budget = max(1, engine_limit - len(input_ids)) if engine_limit else req.max_tokens
-        params = sampling(tokenizer, _thinking(req), min(req.max_tokens, budget),
+        # `room_for`, not `max_total_tokens - prompt`: submit enforces two ceilings.
+        budget = engine.room_for(len(input_ids))
+        # max(1, ...): room_for is 0 when the prompt does not fit, and submit skips its
+        # ceiling checks at 0.
+        params = sampling(tokenizer, _thinking(req), max(1, min(req.max_tokens, budget)),
                           temperature=req.temperature, top_p=req.top_p, logprobs=True,
                           stop=req.stop_sequences)
         rid = engine.submit(input_ids, params)

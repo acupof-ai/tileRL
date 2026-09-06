@@ -236,6 +236,20 @@ def _shape(v: Any) -> str:
     return type(v).__name__
 
 
+def unsupported_choice(choice: Any) -> bool | None:
+    """`tool_choice` beyond auto/none, for either route's spelling.
+
+    Both APIs accept a str or a `{"type": ...}`; Anthropic's `any` and `tool` and
+    OpenAI's `required`/`{type: function}` all force a call. We render tools into the
+    prompt and cannot force or forbid one, so anything stronger than a hint is
+    unimplementable and is refused rather than dropped.
+    """
+    if choice is None:
+        return None
+    name = choice if isinstance(choice, str) else (choice or {}).get("type")
+    return name not in ("auto", "none", None)
+
+
 def refuse_unsupported(*fields: str, **flagged: Any) -> None:
     """Raise on a field we accept but do not honour: the client's NEXT request
     assumes the first one applied it, so the lie surfaces a turn later.

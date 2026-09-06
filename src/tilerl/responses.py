@@ -42,6 +42,7 @@ from .prompt import (
     sampling,
     split_think,
     unknown_fields,
+    unsupported_choice,
 )
 from .tokenizer import Tokenizer
 
@@ -128,15 +129,6 @@ def _hosted_tools(tools: list[dict[str, Any]] | None) -> dict[str, Any]:
     return {f"tools[type={k}]": True for k in sorted(kinds)}
 
 
-def _unsupported_choice(choice: Any) -> bool:
-    """`tool_choice` beyond auto/none. We render tools into the prompt and cannot
-    force or forbid a call, so anything stronger than a hint is unimplementable."""
-    if choice is None:
-        return None
-    name = choice if isinstance(choice, str) else (choice or {}).get("type")
-    return name not in ("auto", "none", None)
-
-
 def _flatten_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
     """Responses' ``{type, name, parameters}`` as the flat shape the template
     renders and ``_parse_tool_calls`` reads schemas from -- the same vocabulary
@@ -170,7 +162,7 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
             # "disabled" is our behaviour already, so only "auto" is a lie.
             truncation=req.truncation not in (None, "disabled"),
             store=req.store,
-            tool_choice=_unsupported_choice(req.tool_choice),
+            tool_choice=unsupported_choice(req.tool_choice),
             **_hosted_tools(req.tools))
         thinking = _thinking(req)
         tools = _flatten_tools(req.tools)
