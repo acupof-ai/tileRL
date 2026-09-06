@@ -204,7 +204,13 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         ))
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
-        params = sampling(tokenizer, thinking, req.max_tokens if req.max_tokens is not None else 512,
+        # Omitted max_tokens means "as much as fits", not 512: a 512 cap ends a long
+        # reply at finish_reason=length, which reads to a client as a dropped stream.
+        # `room_for` is the engine's own admission arithmetic, so the default is always
+        # accepted and a prompt that does not fit still hits submit's refusal.
+        max_new = (req.max_tokens if req.max_tokens is not None
+                   else engine.room_for(len(input_ids)))
+        params = sampling(tokenizer, thinking, max_new,
                           temperature=req.temperature, top_p=req.top_p, max_think_tokens=cap,
                           seed=req.seed, logprobs=bool(req.logprobs), stop=req.stop)
         # bool(thinking): True when the prompt opened <think>, so the reply carries only

@@ -66,15 +66,23 @@ binding term, and "reduce the KV pool" is the obvious wrong fix that would have 
 plausible indefinitely.
 
 **What actually binds:** the training forward materializes a full T² attention matrix per
-full-attn layer and the tape retains it for backward. At the 27B's 24 heads and T = 4352
-(4096 gen + 256 prompt), f32: **24 × 4352² × 4 B = 1.69 GiB each**, matching the failing
-allocation exactly, **× 16 full-attn layers = 27.1 GiB**, quadratic in generated length.
-gen 4096 → 1024 divides it by 16 (0.094 GiB each) and it fits with room.
+full-attn layer. At the 27B's 24 heads and T = 4352 (4096 gen + 256 prompt), f32:
+**24 × 4352² × 4 B = 1.69 GiB each**, matching the failing allocation exactly, quadratic in
+generated length.
 
-**So this bounds the rollout cap from the training side.** The run-3 recipe's 4096 cap is
-not reachable through this training path on one 95 GiB card at group 8; the decomposition
-above is therefore at gen 1024, and a longer-generation step needs the attention matrix not
-to be materialized rather than a bigger card.
+**Corrected 2026-09-06 (was `× 16 full-attn layers = 27.1 GiB`).** That figure assumed the
+tape retains one matrix per layer. It does not: `autograd.py:149-166`'s `_attention` handler
+saves q, k and v and never saves `att`, so each T² tensor dies when its call returns.
+tilerl-48 measured the live bytes by refcount death through a `TorchDispatchMode`: the peak
+is **3 concurrent matrices in forward (5.08 GiB) and 6 in backward (10.16 GiB)**, not 16.
+The OOM at 94.42 GiB in use is real; the attribution to a 27 GiB per-layer tensor family
+was not. gen 4096 → 1024 divides each matrix by 16 (0.094 GiB) and it fits with room.
+
+**So this bounds the rollout cap from the training side**, at 10.16 GiB rather than 27.1: the
+run-3 recipe's 4096 cap is not reachable through this training path on one 95 GiB card at
+group 8, since the card was already at 94.42 GiB in use when a single 1.69 GiB matrix failed
+to allocate. The decomposition above is therefore at gen 1024, and a longer-generation step
+needs the attention matrix not to be materialized rather than a bigger card.
 
 ## Rule
 
@@ -82,6 +90,12 @@ to be materialized rather than a bigger card.
 by 3.63 GiB and observing 0.36 GiB *more* in use is what killed the pool hypothesis in one
 run; without that arm the 1.69 GiB allocation and a large pool are perfectly consistent with
 each other and the wrong fix ships.
+
+**A per-call tensor size times a layer count is not a live-bytes figure.** The 27.1 GiB in
+the first version of this entry was 1.69 × 16 — arithmetic over the config, with retention
+assumed. Which tensors the tape *saves* is a property of the handler, and `_attention` saves
+q/k/v only, so 13 of those 16 matrices never coexist. The number that binds is concurrent
+live bytes at the peak, and only a refcount- or allocator-level measurement gives it.
 
 **A residual has to be named and checked, not assumed small.** `unattributed_secs` is 0.025 s
 and `unexplained_ticks` is 0 — but the probe credits a tick that moves no forward counter to
@@ -103,7 +117,7 @@ selfcheck goes red on the counts assertion.
 | 2026-09-06 | a16ff9c | H20 6 | unexplained ticks | **0** |
 | 2026-09-06 | a16ff9c | H20 6 | sync overhead | 37 µs/tick, 0.028% |
 | 2026-09-06 | a16ff9c | H20 6 | cold step 0 | 183.62 s, 1.396x warm |
-| 2026-09-06 | a16ff9c | H20 6 | T² attention, T=4352 f32 | **1.69 GiB × 16 layers = 27.1 GiB** |
+| 2026-09-06 | a16ff9c | H20 6 | T² attention, T=4352 f32 | **1.69 GiB each; peak 3 live fwd = 5.08, 6 bwd = 10.16 GiB** |
 
 ## Limitations
 

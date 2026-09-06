@@ -754,6 +754,14 @@ class _ScriptedEngine:
     def stats(self) -> dict:
         return {"waiting": 0, "running": 0, "finished": len(self._taken)}
 
+    def room_for(self, prompt_tokens: int) -> int:
+        # Part of the seam a route may call when max_tokens is omitted. This engine
+        # has no KV pool to bound, so the number is arbitrary and deliberately not
+        # the real engine's formula: whether the remainder is computed CORRECTLY is
+        # asserted against a real engine, and re-deriving it here would let a broken
+        # `Engine.room_for` still pass every arm in this file.
+        return 64
+
 
 def test_messages_tool_use_round_trip(tmp_path, monkeypatch):
     """The full agent shape: tool_use out, tool_result back in, answer out.
@@ -878,6 +886,11 @@ def test_the_clamp_survives_the_data_parallel_wrapper(tmp_path, monkeypatch):
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "dp.jsonl"))
     body = {"model": "tiny", "max_tokens": 32000,
             "messages": [{"role": "user", "content": "hi"}]}
+    #: The omitted-cap default calls `engine.room_for`, the second seam attribute the
+    #: wrapper has to forward. Without it `serve --devices` 500-ed on every request
+    #: that left max_tokens out -- the same defect as the missing `limits`, one route later.
+    omitted = {"model": "tiny", "stream": False,
+               "messages": [{"role": "user", "content": "hi"}]}
     codes = {}
     for arm in ("plain", "wrapped"):
         e = _build_engine(seed=41)
@@ -887,6 +900,8 @@ def test_the_clamp_survives_the_data_parallel_wrapper(tmp_path, monkeypatch):
             with TestClient(create_app(engine, _ByteTokenizer(), model_name="tiny"),
                             raise_server_exceptions=False) as c:
                 codes[arm] = c.post("/v1/messages", json=body).status_code
+                codes[f"{arm}/omitted"] = c.post("/v1/chat/completions",
+                                                 json=omitted).status_code
         finally:
             e.shutdown()
     assert codes["plain"] == codes["wrapped"], (
@@ -896,6 +911,8 @@ def test_the_clamp_survives_the_data_parallel_wrapper(tmp_path, monkeypatch):
     assert codes["plain"] == 200, (
         f"a clamped max_tokens must not 400: got {codes['plain']} on both arms, so "
         f"the clamp is broken for every caller rather than only under --devices")
+    assert codes["plain/omitted"] == codes["wrapped/omitted"] == 200, (
+        f"an omitted max_tokens must be admitted through both: {codes}")
 
 
 def test_image_blocks_are_refused_not_dropped(client, tmp_path, monkeypatch):
@@ -909,6 +926,51 @@ def test_image_blocks_are_refused_not_dropped(client, tmp_path, monkeypatch):
     })
     assert r.status_code == 400, r.text
     assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_every_engine_the_routes_accept_implements_what_they_call():
+    """The seam is what the routes CALL, and every implementation has to have all of it.
+
+    Twice now a method the routes need was missing from `DataParallelEngine` and shipped:
+    `limits` 400-ed every Claude Code turn under `--devices`, and `room_for` 500-ed every
+    request that omitted `max_tokens`. One arm per method catches the method it was written
+    for and nothing else, so this enumerates instead — the names are read out of the route
+    modules' own source, so a route that starts calling `engine.foo()` extends the required
+    set without anyone remembering to add an arm here.
+    """
+    import inspect
+    import re
+
+    import torch
+
+    from tilerl import messages, parallel, responses, server
+
+    called: set[str] = set()
+    for mod in (server, messages, responses):
+        src = inspect.getsource(mod)
+        called |= set(re.findall(r"\bengine\.([a-z_][a-z0-9_]*)", src))
+        # `getattr(engine, "limits", ...)` is a call on the seam too, and the regex
+        # above cannot see it: messages.py reads `limits` exactly this way.
+        called |= set(re.findall(r'getattr\(\s*engine\s*,\s*"([a-z_][a-z0-9_]*)"', src))
+    # Prose, not calls: "engine.py" in a docstring, and a comment in server.py's /health
+    # explaining why loop liveness deliberately does NOT read engine._thread. Reading a
+    # comment as a call is how this gate would demand an attribute nothing needs.
+    called -= {"py", "_thread"}
+
+    # The set is asserted, not just used: a regex that silently matched nothing would make
+    # every implementation pass. These are the names the routes call today.
+    assert called >= {"submit", "take", "peek", "stop_text", "logprobs", "stats",
+                      "room_for", "limits"}, called
+
+    # Instances, not classes: `Engine.limits` is assigned in __init__, so `hasattr` on the
+    # class reports it missing and this gate would fail on a correct engine.
+    plain = _build_engine(seed=61)
+    for impl in (plain, parallel.DataParallelEngine([plain], [torch.device("cpu")])):
+        missing = sorted(n for n in called if not hasattr(impl, n))
+        assert not missing, (
+            f"{type(impl).__name__} is accepted by the routes but does not implement "
+            f"{missing} — the shape of the missing `limits` (400 on every turn) and the "
+            f"missing `room_for` (500 on every omitted cap)")
 
 
 def test_serve_sizes_its_pools_from_the_flags_not_the_context():
@@ -1282,3 +1344,80 @@ def test_the_stream_carries_the_reasoning_as_its_own_field(tmp_path, monkeypatch
         reasoning, content, finish = _chat_stream_fields(c, "page", len(tok.encode("still planning")))
         assert "".join(reasoning) == "still planning" and content == [], (reasoning, content)
         assert finish == "length"
+
+
+def test_an_omitted_max_tokens_gets_the_context_remainder(client, model_id, monkeypatch):
+    """Omitted means "as much as fits", not 512.
+
+    ckl, 2026-09-06: the default should be the ceiling, not a flat cap. A flat 512 ends a reply at
+    ``finish_reason=length``, which reads to a client as a dropped stream. The assertion
+    is on the value handed to ``sampling``, not on the reply: the tiny model's answer is
+    short either way, so a test that only read the reply would stay green with the 512
+    still in place.
+    """
+    import tilerl.server as srv
+
+    seen: list[int] = []
+    real = srv.sampling
+
+    def spy(tokenizer, thinking, max_new, **kw):
+        seen.append(max_new)
+        return real(tokenizer, thinking, max_new, **kw)
+
+    monkeypatch.setattr(srv, "sampling", spy)
+    r = client.post("/v1/chat/completions",
+                    json={"model": model_id, "stream": False,
+                          "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    assert seen, "sampling was never called"
+    prompt_tokens = r.json()["usage"]["prompt_tokens"]
+    # The fixture's engine: max_total_tokens=4096, 256 blocks (4096 tokens), width 1,
+    # so max_total binds and the remainder is exact.
+    assert seen[-1] == 4096 - prompt_tokens, (seen[-1], prompt_tokens)
+    assert seen[-1] != 512, "the omitted default is still the old flat 512"
+
+
+def test_an_omitted_max_output_tokens_gets_the_remainder_on_responses(client, model_id,
+                                                                     monkeypatch):
+    """The Responses route carries the same default, asserted through its own module.
+
+    One route's fix is not the other's: `responses.py` reads `max_output_tokens` and
+    imports `sampling` itself, so patching `server.sampling` would not observe it.
+    """
+    import tilerl.responses as rsp
+
+    seen: list[int] = []
+    real = rsp.sampling
+
+    def spy(tokenizer, thinking, max_new, **kw):
+        seen.append(max_new)
+        return real(tokenizer, thinking, max_new, **kw)
+
+    monkeypatch.setattr(rsp, "sampling", spy)
+    r = client.post("/v1/responses",
+                    json={"model": model_id, "input": "hi"})
+    assert r.status_code == 200, r.text
+    assert seen, "sampling was never called"
+    assert seen[-1] != 512, "the omitted default is still the old flat 512"
+    # Prompt length is not echoed the same way here, so bound it rather than guess:
+    # the remainder must be positive and within the fixture's context.
+    assert 0 < seen[-1] < 4096, seen[-1]
+
+
+def test_an_explicit_max_tokens_is_still_honoured(client, model_id, monkeypatch):
+    """The negative control for both tests above: a caller who asks for 8 gets 8.
+
+    Without this, "the remainder" could be unconditional and both tests would still
+    pass -- a default that overrides an explicit request is the failure this catches.
+    """
+    import tilerl.server as srv
+
+    seen: list[int] = []
+    real = srv.sampling
+    monkeypatch.setattr(srv, "sampling",
+                        lambda t, th, mn, **kw: (seen.append(mn), real(t, th, mn, **kw))[1])
+    r = client.post("/v1/chat/completions",
+                    json={"model": model_id, "stream": False, "max_tokens": 8,
+                          "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    assert seen[-1] == 8, seen
