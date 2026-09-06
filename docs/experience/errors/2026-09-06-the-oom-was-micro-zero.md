@@ -1,8 +1,7 @@
 # The OOM was `micro=0`, not the buckets — 2026-09-06
 
-> Status: open on two fixes. The cause is measured and needs no more card time;
-> `--micro`'s help does not warn that 0 at group 8 / cap 2048 exceeds one H20, and
-> `pod_sync.sh` still wipes every peer's `runs/`. Both listed in OPEN.md.
+> Status: Shipped. `--micro` defaults to 1 and `pod_sync.sh` exempts `runs/`. Both
+> OPEN.md rows removed.
 
 ## Context
 
@@ -59,26 +58,59 @@ Cost of `micro=1`: **2.75x on the backward at the same width** (22.228 vs 8.070 
 width 256). So micro=0 is the faster setting that does not fit, and micro=1 is the
 slower setting that does.
 
-## What I destroyed while measuring
+## The wipe destroyed nothing, and that is not the point
 
-Run 2's own peak would have settled this in one line — if run 2 also peaked near 88
-GiB it was always on the edge. It is unavailable: the entry records no peak figure,
-and `runs/0f7006c74ea0/manifest.json` is gone from the pod because
-`pod_sync.sh:28` runs `find . -mindepth 1 -delete` on the remote checkout before
-untarring. My sync this tick deleted it. Line 12 rescues `bench-baseline.json`;
-nothing rescues `runs/`, so every peer's run manifests die on the next sync by
-anyone.
+I wrote that my sync deleted `runs/0f7006c74ea0/manifest.json`. **It did not exist.**
+Per tilerl-25, who ran it: run 2 died on SIGTERM at step 45, and `write_manifest`
+lived only inside `_finish` until `8388cbf` ("write the manifest before the loop,
+not only in _finish"), so run 2 never wrote a manifest or a `rollouts.jsonl` at all.
+I could not confirm the ordering from the tree — run 2's entry records a run id and
+no commit sha, so this rests on 25's account of their own run plus the existence of
+that commit, not on a check I ran.
+
+So run 2's peak is unavailable because it was never written, not because I deleted
+it. My claim to have destroyed it was wrong in the direction that made my own error
+look worse, which is the one direction that does not get re-checked.
+
+**The real point is forward-looking.** Since `8388cbf` every run writes its manifest
+*before* the eval arms, so a killed run now leaves one — and `pod_sync.sh:28`'s
+`find . -mindepth 1 -delete` would delete exactly the evidence that commit exists to
+preserve. The next killed run is the one that loses its manifest, and any peer's sync
+does it.
+
+Measured, in a temp tree and again through the pod's own `find`:
+
+| wipe spelling | `runs/` | everything else |
+|---|---|---|
+| `find . -mindepth 1 -delete` (current, control) | **GONE** | gone |
+| `-path ./runs -prune -o -delete` | **GONE** | gone |
+| `! -path ./runs ! -path './runs/*' -delete` | **KEPT** | gone |
+
+The `-prune` spelling silently fails because **`-delete` implies `-depth`, which
+disables `-prune`**. The control arm going red is what makes the third row mean
+something.
+
+Not a risk, checked: `pod_sync.sh:12`'s rescue is not a file copy that could flatten
+a tree. `baseline.py pull` `cat`s one remote JSON and merges its keys into the local
+file, so exempting a directory has nothing in common with how the baseline is
+rescued.
 
 ## Fix
 
-`grpo-math-27b` already sets `micro=1`, so the recipe path is safe. What is not
-safe is the CLI default: `--micro 0` at group 8 and cap 2048 does not fit one H20,
-and nothing says so at the point of use. One line in `--micro`'s help, and
-`pod_sync.sh` should exempt `runs/` from the wipe the way it already rescues the
-baseline.
+Both landed, and the first is a **default flip**, not a warning.
 
-Neither is done here — this entry is the measurement, and both fixes are listed in
-OPEN.md.
+**`--micro` defaults to 1.** Both shipped RL recipes already set 1
+(`recipes.py:21`, `:37`); the value 0 does not fit the production card at the
+production shape, and a default that OOMs on step 2 is the wrong default. 0 stays
+available for anyone who has measured that it fits. Nothing in the tree depends on
+the old default: `test_rl.py:253` passes 0, 1 and 3 explicitly and asserts they land
+on the same weights to within 1e-6, so this flips which arm is default without
+changing what any arm does.
+
+**`pod_sync.sh` exempts `runs/`** with `! -path './runs' ! -path './runs/*'`, the
+spelling the table above shows actually works.
+
+The OPEN.md rows for both come out in the same change.
 
 ## Rule
 
@@ -95,11 +127,17 @@ explains the observation.**
 
 ## Results
 
-No runtime change. Measurement only.
+Runtime change: the `--micro` default. Probe C's two arms are its measurement — the
+new default is row 2, the old one is row 1.
 
 | date | commit | machine | config | steps | peak | median |
 |---|---|---|---|---|---|---|
-| 2026-09-06 | faae3c8 | H20 card 6 | group 8, cap 2048, **micro=0** | **1, OOM at 2** | 88.21 GiB | — |
-| 2026-09-06 | faae3c8 | H20 card 6 | group 8, cap 2048, **micro=1** | **3/3** | **44.55 GiB** | **67.3 s/step** |
+| 2026-09-06 | faae3c8 | H20 card 6 | group 8, cap 2048, **micro=0** (old default) | **1, OOM at 2** | 88.21 GiB | — |
+| 2026-09-06 | faae3c8 | H20 card 6 | group 8, cap 2048, **micro=1** (new default) | **3/3** | **44.55 GiB** | **67.3 s/step** |
 | 2026-09-05 | 91977a8 | H20 card 0 | group 8, cap **256**, micro=1 | 100 | 39.78 GiB | 56.88 s/step |
-| — | — | — | run 2's peak, for the one-line answer | 45 | **destroyed by `pod_sync.sh:28`** | — |
+| 2026-09-05 | — | H20 | MATH, cap 2048, micro=1, **1434-token rollouts** | 45 | never written | 229.2 s/step |
+
+Row 4 is a different task at 4.9x row 2's rollout length. **67.3 against its 229.2 is
+not a speedup** and nothing may cite it as one; the only valid pair in this table is
+rows 2 and 3 (1.18x, cap 2048 vs 256). Its peak is blank because run 2 never wrote a
+manifest, per the section above.

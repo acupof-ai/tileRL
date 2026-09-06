@@ -1054,10 +1054,13 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="GRPO: the engine samples a group per prompt, a reward scores "
                               "them, the group mean is the baseline (no critic)")
     p_train.add_argument("--group", type=int, default=8, help="rollouts per prompt (--rl)")
-    p_train.add_argument("--micro", type=int, default=0,
+    p_train.add_argument("--micro", type=int, default=1,
                          help="--rl: rows per backward, gradients accumulated to one "
                               "update (0 = the whole group). The normalizer stays the "
-                              "batch's, so this is the same update, not a smaller one")
+                              "batch's, so this is the same update, not a smaller one. "
+                              "Default 1 because 0 does not fit the production shape: at "
+                              "group 8 / cap 2048 on one H20, 0 peaks 88.21 GiB and OOMs "
+                              "on step 2, against 44.55 GiB and 3/3 steps at 1")
     p_train.add_argument("--max-new-tokens", type=int, default=32, help="rollout length")
     p_train.add_argument("--data", help="JSONL {prompt, answer}: real prompts, exact-match "
                          "reward on the last number (scripts/gsm8k_jsonl.py)")
