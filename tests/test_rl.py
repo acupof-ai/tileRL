@@ -499,7 +499,7 @@ def test_the_gsm8k_eval_reports_the_tokens_it_spent():
     assert ntok == 24, f"eval token count is not the emitted ids: {ntok}"
 
 
-def test_a_recapturing_engine_drops_what_the_update_invalidated():
+def test_a_recapturing_engine_clears_what_the_update_invalidated():
     """The caches an optimizer step makes stale must be cleared per step.
 
     A captured graph replays the forward as it was traced and a cached prefix
@@ -508,11 +508,17 @@ def test_a_recapturing_engine_drops_what_the_update_invalidated():
     and `clear_prefix=True`, so a caller that turned graphs off and said only
     "graphs" is still refused for the live prefix store it forgot.
 
-    CPU cannot gate the graph half. Capture calls torch.cuda.graph_pool_handle(),
-    which raises here, and the handler flips _decode_graph_on to False -- so a
-    "captured vs eager" comparison on cpu would compare eager to eager and pass
-    against any implementation at all. This gates the state machine instead: the
-    entries go away when they must. The sm90 half is in the bench entry.
+    The graphs are now KEPT across the update rather than dropped: every address
+    a capture baked survives an in-place optimizer step, and the one thing that
+    does not -- a cached cast -- is refilled by `invalidate_weights` instead. So
+    what this asserts of the graph half is that they SURVIVE and the refill ran;
+    the staleness question itself is a replay question and lives on the card.
+
+    CPU cannot gate the graph half by comparison. Capture calls
+    torch.cuda.graph_pool_handle(), which raises here, and the handler flips
+    _decode_graph_on to False -- so a "captured vs eager" comparison on cpu would
+    compare eager to eager and pass against any implementation at all. This gates
+    the state machine instead. The sm90 half is in the bench entry.
     """
     import pytest
 
@@ -536,8 +542,8 @@ def test_a_recapturing_engine_drops_what_the_update_invalidated():
         run(engine, recapture_graph=True)
 
     # Clearing at loop ENTRY is not enough and a one-step test cannot tell the two
-    # apart: it passes either way. Re-dirty the caches between steps, so only a
-    # clear that runs AFTER EVERY update leaves them empty at the end.
+    # apart: it passes either way. Re-dirty the prefix between steps, so only a
+    # clear that runs AFTER EVERY update leaves it empty at the end.
     from tilerl.kv_cache import BLOCK_TOKENS
 
     def dirty():
@@ -551,7 +557,9 @@ def test_a_recapturing_engine_drops_what_the_update_invalidated():
     for _ in grpo_loop(engine, model, [[1, 2, 3]], lambda p, c: 0.0, 2, RefBackend(),
                        group=2, sampling=SamplingParams(max_new_tokens=4),
                        recapture_graph=True, clear_prefix=True):
-        assert engine._decode_graphs == {}, "the update left a graph traced on old weights"
+        assert engine._decode_graphs == {(1, 1): "stale-graph"}, (
+            "the update dropped the graphs; they are kept and their casts refilled"
+        )
         assert engine._prefix.stats()["entries"] == 0, "the update left KV from the old policy"
         dirty()  # the next step must clear it again, not rely on loop entry
 

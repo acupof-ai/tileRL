@@ -1035,7 +1035,7 @@ class Engine:
         return len(self._decode_graphs)
 
     def invalidate_weights(self) -> int:
-        """Drop everything computed under the previous weights; return graphs dropped.
+        """Drop everything computed under the previous weights; return casts refilled.
 
         An optimizer step makes both caches lie: a captured graph replays the
         forward as it was traced, and a cached prefix serves KV from the old
@@ -1043,11 +1043,17 @@ class Engine:
         -- which is why ``_require_on_policy`` refuses an engine carrying either.
         Calling this after each update is what lets a training engine keep them.
 
-        The graphs are dropped rather than re-traced here: the next tick that
-        needs one captures it, so a bucket the run never reaches costs nothing.
+        The graphs are KEPT, because every address one baked survives the update:
+        ``AdamW.step_one`` and ``Adafactor.step_one`` both end ``p.copy_()`` (in
+        place), and ``materialize`` rebuilds the dict but not the tensors. The
+        one thing that does not survive on its own is a cached cast --
+        ``_const_f32`` refills only when something calls it, and a replay calls
+        nothing -- so the refill is driven here. The prefix store is cleared: it
+        holds KV, not addresses.
         """
-        n = len(self._decode_graphs)
-        self._decode_graphs.clear()
+        # Not len(self._decode_graphs): the graphs stay, and the number worth
+        # returning is the one that says the refill walk actually ran.
+        n = self._backend.refill_const_f32()
         # The pool owns the captured memory; a new pool per invalidation would
         # leak one arena per step.
         self._prefix.clear()

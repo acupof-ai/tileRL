@@ -378,3 +378,60 @@ def test_the_sweeps_launch_buckets_match_each_arch():
         runpy.run_path("scripts/ab_draft_depth.py", run_name="__main__")
     finally:
         _sys.argv = ["pytest"]
+
+
+
+
+def test_invalidate_refills_the_cached_casts_a_replay_would_read_stale():
+    """The refill walk, on cpu, where no card is needed to run it.
+
+    `_const_f32` caches a parameter's cast and refills it in place when called
+    with new values (#190). A graph replay calls nothing, so a run that keeps its
+    captured graphs across an optimizer step reads the cast taken BEFORE the step
+    unless something drives the refill -- which is what `invalidate_weights` now
+    does. Measured before this existed: the address survived `p.copy_()` and the
+    values did not.
+
+    The count is asserted non-zero because a walk over an empty cache returns 0
+    and would pass every assertion below it.
+    """
+    from tilerl.autograd import AdamW
+
+    backend = get_backend()
+    w = torch.randn(8, 8, dtype=torch.bfloat16, device=backend.device)
+    cached = backend._const_f32(w)
+    baked, before = cached.data_ptr(), cached.clone()
+
+    opt = AdamW(lr=1.0)
+    opt._step = 1
+    opt.step_one(w, torch.randn(8, 8, device=backend.device) * 5.0)
+    # The premise the whole scheme rests on: an in-place update, so the address a
+    # capture baked is still the address the new values land behind.
+    assert torch.equal(cached, before), "something refilled the cast without being asked"
+
+    assert backend.refill_const_f32() >= 1, "the walk refilled nothing; every arm below is vacuous"
+    # Ask the CACHE what it holds, not the handle: a refill that reallocates leaves
+    # this handle -- the buffer a capture baked -- correct-looking and orphaned, and
+    # the value assertion below could not tell that from never refilling at all.
+    assert backend._const_f32_cache[(w.data_ptr(), None, torch.float32)][2] is cached, (
+        "the refill rebound the cache to a new buffer; a captured graph still reads the old one"
+    )
+    assert cached.data_ptr() == baked, "the refill moved the buffer a graph would have baked"
+    assert not torch.equal(cached, before), "the cached cast still holds the pre-step values"
+    assert torch.equal(cached, w.to(torch.float32)), "the refilled cast is not the new weights"
+
+
+def test_a_dead_parameter_leaves_no_entry_behind():
+    """A freed parameter's address can be reused, so its entry must not outlive it.
+
+    Without this the walk would re-cast through a dangling weakref, or keep an
+    entry a later parameter at the same address would collide with.
+    """
+    backend = get_backend()
+    w = torch.randn(4, 4, dtype=torch.bfloat16, device=backend.device)
+    backend._const_f32(w)
+    n = len(backend._const_f32_cache)
+    assert n >= 1
+    del w
+    backend.refill_const_f32()
+    assert len(backend._const_f32_cache) < n, "the entry outlived its parameter"

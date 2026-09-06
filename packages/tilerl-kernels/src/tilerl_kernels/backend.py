@@ -1436,6 +1436,40 @@ class Backend:
         self._const_f32_cache[key] = (weakref.ref(t), t._version, c)
         return c
 
+    def refill_const_f32(self) -> int:
+        """Re-cast every live cached parameter in place; return how many moved.
+
+        ``_const_f32`` refills only when something calls it, and a graph replay
+        calls nothing -- so a caller that keeps its captured graphs across an
+        optimizer step has to drive the refill itself or the replay reads the
+        cast taken before the step. Measured on cpu: the address survives
+        ``p.copy_()`` and the values do not.
+
+        Entries whose parameter is gone are dropped. An entry whose cast would
+        change shape is dropped rather than refilled: the buffer a graph baked
+        cannot be resized, so the next eager call reallocates and any graph
+        holding it is already invalid.
+        """
+        n = 0
+        for key, (ref, ver, c) in list(self._const_f32_cache.items()):
+            t = ref()
+            if t is None:
+                del self._const_f32_cache[key]
+                continue
+            if ver == t._version:
+                continue
+            _, pad_to, dtype = key
+            fresh = self._dev(t, dtype)
+            if pad_to is not None and pad_to != fresh.shape[0]:
+                fresh = torch.nn.functional.pad(fresh, (0, pad_to - fresh.shape[0]))
+            if fresh.shape != c.shape or fresh.dtype != c.dtype:
+                del self._const_f32_cache[key]
+                continue
+            c.copy_(fresh)
+            self._const_f32_cache[key] = (ref, t._version, c)
+            n += 1
+        return n
+
     def _ones(self, n: int):
         t = self._ones_cache.get(n)
         if t is None:
