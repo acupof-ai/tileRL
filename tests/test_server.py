@@ -695,6 +695,47 @@ def test_a_request_in_flight_does_not_freeze_the_server(tmp_path, monkeypatch, p
     assert done.get("code") == 200, f"the {path} request itself failed: {done}"
 
 
+def test_health_does_not_wait_on_the_engine_lock(tmp_path):
+    """`/health` must answer while `step()` holds `_lock` across a forward.
+
+    Separate defect from the `to_thread` freeze above, and the reason both gates exist: that
+    one was the event loop, this one is the lock, and fixing the loop did not fix this. On
+    the live V100 during a 21.7k-token prefill /health ran at a median of 8.12 s and a max of
+    **87.66 s**, against 0.002 s idle — four orders of magnitude on identical code, because
+    `stats()` took the lock that a 43-chunk prefill holds one chunk at a time.
+
+    A real `Engine` is used, not a double: the property under test is which lock `stats()`
+    takes, and a double that reimplements `stats()` would assert its own behaviour. The
+    forward is replaced by a sleep so the tick is slow without needing a model — that is the
+    only substitution, and it is at the layer below the one being measured.
+    """
+    cfg = tiny()
+    engine = build_engine(cfg, build_random(cfg, seed=43), get_backend(),
+                          num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096)
+
+    held = threading.Event()
+
+    def _slow_forward(*_a, **_kw):
+        held.set()
+        time.sleep(2.0)  # 20x the 100 ms assertion, so a lock-taking reader cannot pass
+
+    engine._run_forward = _slow_forward
+    engine.submit([1, 2, 3], SamplingParams(max_new_tokens=4))
+    engine.run()
+    try:
+        assert held.wait(10.0), "the forward never started; the arm proves nothing"
+        t0 = time.monotonic()
+        snap = engine.stats()
+        elapsed = time.monotonic() - t0
+    finally:
+        engine.shutdown()
+
+    assert isinstance(snap, dict) and "pool_used_blocks" in snap, snap
+    assert elapsed < 0.1, (
+        f"stats() took {elapsed:.2f}s while step() held the lock across a forward — "
+        f"/health waits on the engine lock instead of reading a published snapshot")
+
+
 def test_messages_route_records_token_ids(client, tmp_path, monkeypatch):
     """The Messages shim answers Claude Code's shape and records the ids.
 
