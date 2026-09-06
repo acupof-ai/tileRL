@@ -208,9 +208,11 @@ Once a verify row cost 10.7 ms against a 30.9 ms token, depth 3 pays:
 | 1052 | 27.4 | **35.4** | 1.29x |
 
 100% draft acceptance in serving (292/292 on the counting task), 2.95
-tok/forward. 52.7 is 94% of the 56.1 tok/s *dense* roofline, and **32-42% of the
+tok/forward. 52.7 is 94% of the 56.1 tok/s *dense* roofline, and **38.2% of the
 ceiling a speculative rate is bound by**: a weight roofline bounds forwards, and
-2.95 tok/forward puts that at 126-166 tok/s
+2.95 tok/forward over a 19.24 GB depth-3 tick puts that at 138.0 tok/s. Measured
+2026-09-06 — a draft forward streams **1.065 GB** (0.265 served fp4 + the trunk's
+0.800 lm_head), which closed the earlier 32-42% bracket
 (`errors/2026-09-06-a-spec-rate-over-a-dense-roofline.md`).
 
 The "1.3 tok/s" scare was a MEASUREMENT artifact: `bench_b1_decode.py` warms up
