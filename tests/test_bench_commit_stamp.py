@@ -23,6 +23,10 @@ _READ = (
 def _commit_for(stamp: str | None, tmp: Path, harness_src: str | None = None) -> str:
     """What does _git_commit() report in a tree with no .git and this stamp content?"""
     tmp.mkdir(parents=True)
+    # `git -C` walks UP: a repo anywhere above tmp would make rev-parse succeed and the
+    # stamp path never run. Measured: from a non-repo subdir of a repo it returns that
+    # repo's sha. pytest's tmp base has none, and this assert is what says so out loud.
+    assert not any((p / ".git").exists() for p in [tmp, *tmp.parents]), f"repo above {tmp}"
     (tmp / "scripts").mkdir()
     (tmp / "scripts" / "bench_harness.py").write_text(harness_src or HARNESS.read_text())
     if stamp is not None:
@@ -61,6 +65,7 @@ def _stamp_block() -> str:
 def _stamp_after(block: str, tmp: Path) -> str:
     """Run the stamp block where git must fail, with a previous stamp in place."""
     tmp.mkdir(parents=True)
+    assert not any((p / ".git").exists() for p in [tmp, *tmp.parents]), f"repo above {tmp}"
     (tmp / ".synced_commit").write_text("faae3c8\n")
     (tmp / "s.sh").write_text(block)
     subprocess.run(["bash", "s.sh"], cwd=tmp, env={"ROOT": str(tmp), "PATH": "/usr/bin:/bin"},
