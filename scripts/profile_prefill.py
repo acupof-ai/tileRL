@@ -1,7 +1,7 @@
 """Per-kernel GPU time of one prefill forward, serial GDN vs fla chunked GDN, in one process.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
-    TILERL_TARGET=cuda python3 scripts/profile_prefill.py /data00/Qwen3.8-27B-NVFP4
+    TILERL_TARGET=cuda python3 scripts/profile_prefill.py /work/Qwen3.8-27B-NVFP4
 """
 
 from __future__ import annotations

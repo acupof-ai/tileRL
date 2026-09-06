@@ -14,7 +14,7 @@ below, and a beat is written as a CANDIDATE for review rather than promoted -- a
 raises its own baseline cannot then regress against it. A first run seeds a missing key.
 
   uv run tilerl bench --suite train                       # CPU, tiny
-  tilerl bench --source /data00/Qwen3.8-27B-NVFP4 --gpu 7  # pod, all GPU suites
+  tilerl bench --source /work/Qwen3.8-27B-NVFP4 --gpu 7  # pod, all GPU suites
 """
 
 from __future__ import annotations

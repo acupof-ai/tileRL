@@ -1,7 +1,7 @@
 """Per-kernel GPU time inside the captured decode graph (torch.profiler over replays);
 the eager-event benches price launch+sync, not graph cost.
 
-  python scripts/profile_graph_kernels.py /data00/Qwen3.8-27B-NVFP4 --gpu 6 --layers 8
+  python scripts/profile_graph_kernels.py /work/Qwen3.8-27B-NVFP4 --gpu 6 --layers 8
 """
 
 from __future__ import annotations

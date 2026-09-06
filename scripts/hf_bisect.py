@@ -1,7 +1,7 @@
 """Per-layer cosine + relerr of tileRL's forward against /work/hf_ref.pt
 (dumped by hf_reference.py) on the same token ids; the first layer with
 cos << 1 is the bug site.
-  python3 -u scripts/hf_bisect.py /data00/Qwen3.8-27B-NVFP4 --gpu 7
+  python3 -u scripts/hf_bisect.py /work/Qwen3.8-27B-NVFP4 --gpu 7
 """
 
 from __future__ import annotations

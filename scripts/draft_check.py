@@ -1,6 +1,6 @@
 """Is the draft head wired correctly? Teacher-forced, one forward, no rollout
 bookkeeping: top-1 agreement with the trunk argmax plus mean max-probability.
-  python scripts/draft_check.py /data00/Qwen3.8-27B-NVFP4 --gpu 7
+  python scripts/draft_check.py /work/Qwen3.8-27B-NVFP4 --gpu 7
 """
 
 from __future__ import annotations

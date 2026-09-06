@@ -7,8 +7,8 @@ the logits come back ANTI-correlated (argmax ranked 248191/248320). This measure
 the thing that matters: top-1 agreement and the trunk's rank of the draft pick.
 
   TILERL_TARGET=cuda python3 scripts/check_mtp_draft.py \
-      --source /data00/home/chenkailun.c/models/Qwen3.8-27B-NVFP4 \
-      --draft  /data00/home/chenkailun.c/models/Qwen3.8-27B-NVFP4/model-00018-of-00018.safetensors
+      --source /work/Qwen3.8-27B-NVFP4 \
+      --draft  /work/Qwen3.8-27B-NVFP4/model-00018-of-00018.safetensors
 """
 
 from __future__ import annotations

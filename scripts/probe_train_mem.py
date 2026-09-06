@@ -2,7 +2,7 @@
 state size. b=2 x t=256 OOMs on a 95 GB H20, capping training at ~256 tokens per step.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
-    TILERL_TARGET=cuda python3 scripts/probe_train_mem.py /data00/Qwen3.8-27B-NVFP4
+    TILERL_TARGET=cuda python3 scripts/probe_train_mem.py /work/Qwen3.8-27B-NVFP4
 """
 
 from __future__ import annotations

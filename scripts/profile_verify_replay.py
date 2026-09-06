@@ -4,7 +4,7 @@
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/profile_verify_replay.py \
         $TILERL_QWEN38_SOURCE --widths 1,2,4,8 --batches 1,8 \
-        --draft /data00/Qwen3.8-27B-NVFP4/model_mtp.safetensors
+        --draft /work/Qwen3.8-27B-NVFP4/model_mtp.safetensors
 """
 
 from __future__ import annotations

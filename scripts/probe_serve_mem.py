@@ -1,7 +1,7 @@
 """Serving memory after each construction step, then the largest live tensors by shape.
 The arithmetic says 34 GiB at B=64 depth 512; the card fills at 94.
 
-    CUDA_VISIBLE_DEVICES=6 python3 scripts/probe_serve_mem.py /data00/... --batches 32,64
+    CUDA_VISIBLE_DEVICES=6 python3 scripts/probe_serve_mem.py /work/Qwen3.8-27B-NVFP4 --batches 32,64
 """
 
 from __future__ import annotations

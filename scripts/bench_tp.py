@@ -1,7 +1,7 @@
 """TP decode throughput on the 27B, tp=N vs tp=1, both eager (a graph tick
 would have to capture the NCCL collectives too).
   torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29540 \
-      scripts/bench_tp.py /data00/Qwen3.8-27B-NVFP4 --batches 1,8,16
+      scripts/bench_tp.py /work/Qwen3.8-27B-NVFP4 --batches 1,8,16
 """
 
 from __future__ import annotations

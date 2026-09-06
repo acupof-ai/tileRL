@@ -1,6 +1,6 @@
 """Kernel-vs-reference fro-relerr per op at the real 27B dims (hidden 5120,
 head_dim 256), which the tiny parity gate cannot reach.
-  PYTHONPATH=src TILERL_TARGET=cuda python3 -u scripts/op_parity.py /data00/Qwen3.8-27B-NVFP4 --gpu 7
+  PYTHONPATH=src TILERL_TARGET=cuda python3 -u scripts/op_parity.py /work/Qwen3.8-27B-NVFP4 --gpu 7
 """
 
 from __future__ import annotations

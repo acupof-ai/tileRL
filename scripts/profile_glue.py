@@ -1,7 +1,7 @@
 """Attribute the torch glue kernels (copies / index / elementwise) in one decode
 forward to their Python call sites: eager forward of N layers under
 torch.profiler(with_stack), CUDA time grouped by the innermost tilerl frame.
-  python scripts/profile_glue.py /data00/Qwen3.8-27B-NVFP4 --gpu 7 --layers 8"""
+  python scripts/profile_glue.py /work/Qwen3.8-27B-NVFP4 --gpu 7 --layers 8"""
 
 from __future__ import annotations
 

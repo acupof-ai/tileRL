@@ -1,6 +1,6 @@
 """Thinking effort on the real checkpoint: same prompt at several budgets.
 
-  python scripts/think_effort.py /data00/Qwen3.8-27B-NVFP4
+  python scripts/think_effort.py /work/Qwen3.8-27B-NVFP4
 """
 
 from __future__ import annotations

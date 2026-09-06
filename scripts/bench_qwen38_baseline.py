@@ -1,6 +1,6 @@
 """Qwen3.8-27B NVFP4 serving baseline: decode B=1 ms/tick and prefill tok/s
 at 512 / 2048 / 8192 tokens through the serving build (fused, decode graph on).
-    TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src python3 scripts/bench_qwen38_baseline.py /data00/Qwen3.8-27B-NVFP4
+    TILERL_TARGET=cuda CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src python3 scripts/bench_qwen38_baseline.py /work/Qwen3.8-27B-NVFP4
 """
 
 from __future__ import annotations
