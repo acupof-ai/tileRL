@@ -322,3 +322,22 @@ def test_the_engines_verify_width_is_reachable_from_outside():
         "the Engine grew a _spec_depth attribute; if it is now the depth knob, say "
         "so here — ab_draft_depth.py was broken for a whole refactor by assuming it"
     )
+
+
+def test_the_sweeps_launch_buckets_match_each_arch():
+    """`ab_draft_depth.py` groups ticks by launch shape, and the shape is per-arch.
+
+    Its bucket function used to be sm70's ladder returning a bare int. On sm90 that
+    mislabelled every tick while still partitioning them correctly, so the fit
+    produced a residual and the only wrong thing was what the label meant: sm70's
+    "64" is two 32-row launches, sm90's is one 64-row WGMMA tile. A wrong label in
+    a log is not visible the way a crash is, so the table is pinned here.
+    """
+    import runpy
+    import sys as _sys
+
+    _sys.argv = ["ab_draft_depth.py", "--check"]
+    try:
+        runpy.run_path("scripts/ab_draft_depth.py", run_name="__main__")
+    finally:
+        _sys.argv = ["pytest"]
