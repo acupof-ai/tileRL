@@ -40,6 +40,13 @@ _LINK = re.compile(r"\[[^\]]*\]\(([^)#]+\.md)[^)]*\)")
 _TICK = re.compile(r"`((?:docs/|\.\./)?(?:experience/)?(?:wins|errors)/[\w./-]+\.md)`")
 _BARE = re.compile(r"`(20\d\d-\d\d-\d\d-[\w.-]+\.md)`")
 
+#: AGENTS.md documents the entry skeleton as `errors/YYYY-MM-DD-slug.md`, a literal
+#: template. Once root-level .md files came into the scan it read as a dead link, twice
+#: (AGENTS.md and the CLAUDE.md symlink). Exempt the placeholder itself, not every
+#: undated name: requiring `20\d\d` in _TICK also dropped three real hits on
+#: `TEMPLATE-bench.md`, which the gate should keep checking.
+_PLACEHOLDER = re.compile(r"\bYYYY-MM-DD\b")
+
 
 def _tracked() -> set[str]:
     """Repo-relative paths git knows about, which is what CI checks out.
@@ -58,16 +65,33 @@ def _tracked() -> set[str]:
     return set(out.stdout.split())
 
 
+def _scanned(tracked: set[str]) -> list[str]:
+    """Markdown files whose links this gate checks.
+
+    `docs/` plus the root-level `.md` files, which is where CHANGELOG.md lives: it
+    carries 321 `.md` links and AGENTS.md calls it the central progress record, and it
+    was outside the scan until 2026-09-06. It has `merge=union`, so a cherry-pick copies
+    another branch's line in verbatim -- a citation of an entry that is not on this
+    branch, which is exactly the dead link this gate exists to catch.
+    """
+    return sorted(
+        p for p in tracked
+        if p.endswith(".md") and (p.startswith("docs/") or "/" not in p)
+    )
+
+
 def _dead() -> list[str]:
     tracked = _tracked()
     out = []
-    for rel in sorted(p for p in tracked if p.endswith(".md") and p.startswith("docs/")):
+    for rel in _scanned(tracked):
         md = ROOT / rel
         if not md.exists():  # tracked but not checked out (sparse checkout)
             continue
         text = md.read_text(errors="ignore")
         for m in (*_LINK.finditer(text), *_TICK.finditer(text), *_BARE.finditer(text)):
             raw = m.group(1)
+            if _PLACEHOLDER.search(raw):
+                continue
             bases = (
                 Path(rel).parent,
                 Path("docs"),
@@ -113,6 +137,57 @@ def test_the_resolver_reports_a_reference_that_does_not_exist():
         "a reference to a file that does not exist was not reported: the resolver's base "
         f"list matches too broadly. Got {dead}"
     )
+
+
+def test_a_root_level_md_is_scanned():
+    """CHANGELOG.md was outside the scan, and it is the file most likely to carry one.
+
+    `_scanned` is an `or` -- `docs/` prefix, or no slash at all -- and only the first half
+    had a test. It carries 321 `.md` links, and `merge=union` means a cherry-pick copies a
+    peer's line in verbatim, citing an entry that is not on this branch: measured on
+    2026-09-06, that happened and the gate stayed green.
+
+    The probe goes at the repo root, not under docs/, so deleting the `"/" not in p` half
+    turns this red while `test_the_resolver_reports_a_reference_that_does_not_exist` stays
+    green -- which is the point of having both.
+    """
+    probe = ROOT / "_ROOT_LINK_PROBE.md"
+    rel = probe.name
+    probe.write_text("[x](2026-01-01-no-such-entry.md)\n")
+    subprocess.run(["git", "-C", str(ROOT), "add", "--intent-to-add", rel], check=True)
+    try:
+        assert rel in _tracked(), "the probe was not staged, so the scan cannot see it"
+        assert rel in _scanned(_tracked()), "a root-level .md is not in the scanned set"
+        dead = _dead()
+    finally:
+        subprocess.run(["git", "-C", str(ROOT), "rm", "--cached", "-q", "--", rel], check=False)
+        probe.unlink()
+    assert any(rel in d for d in dead), f"a dead link in a root-level .md was not reported: {dead}"
+
+
+def test_the_placeholder_exemption_does_not_swallow_a_real_dead_link():
+    """`YYYY-MM-DD` is exempt because AGENTS.md documents the entry skeleton with it.
+
+    An exemption is a second guard and needs its own negative: a dated name must still be
+    reported from the same file shape. Requiring `20\\d\\d` in `_TICK` instead was tried and
+    rejected -- it dropped three real hits on `TEMPLATE-bench.md`.
+    """
+    probe = DOCS / "_exempt_probe.md"
+    rel = str(probe.relative_to(ROOT))
+    probe.write_text(
+        "skeleton `errors/YYYY-MM-DD-slug.md` is a template\n"
+        "`errors/2026-01-01-no-such-entry.md` is not\n"
+    )
+    subprocess.run(["git", "-C", str(ROOT), "add", "--intent-to-add", rel], check=True)
+    try:
+        assert rel in _tracked(), "the probe was not staged, so the scan cannot see it"
+        dead = _dead()
+    finally:
+        subprocess.run(["git", "-C", str(ROOT), "rm", "--cached", "-q", "--", rel], check=False)
+        probe.unlink()
+    hits = [d for d in dead if "_exempt_probe.md" in d]
+    assert len(hits) == 1, f"expected exactly the dated link reported, got {hits}"
+    assert "2026-01-01" in hits[0], f"the reported link is not the dated one: {hits[0]}"
 
 
 def test_no_doc_invokes_a_flag_the_cli_does_not_have():
