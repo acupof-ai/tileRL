@@ -35,7 +35,7 @@ export const ask = (
     // on a `done` frame that a dropped connection never sends.
     ws.onclose = () => resolve()
     ws.onerror = () => reject(new Error("connection failed"))
-    // resolve on user stop: the tokens on screen are the reply, not a failure
+    // resolve on user stop: closing the socket cancels the request server-side
     onStop?.(() => {
       ws.close()
       resolve()
