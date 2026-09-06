@@ -494,9 +494,10 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             return
         try:
             kw = {"enable_thinking": ask["enable_thinking"]} if "enable_thinking" in ask else None
-            request_id, prompt_tokens, max_new, opened, _ = _submit(ChatCompletionRequest(
-                messages=ask["messages"], max_tokens=ask.get("max_tokens"),
-                chat_template_kwargs=kw))
+            req = ChatCompletionRequest(messages=ask["messages"],
+                                        max_tokens=ask.get("max_tokens"),
+                                        stop=ask.get("stop"), chat_template_kwargs=kw)
+            request_id, prompt_tokens, max_new, opened, _ = _submit(req)
         except Exception as exc:
             await ws.send_json({"t": "error", "message": f"{type(exc).__name__}: {exc}"})
             await ws.close()
@@ -504,7 +505,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
         # _deltas blocks on the engine; stepping it in a thread keeps the event loop free
         # to serve the other routes while one page streams.
-        gen, end = _deltas(request_id, max_new, opened), object()
+        gen, end = _deltas(request_id, max_new, opened, stop_texts(req.stop)), object()
         try:
             while (item := await asyncio.to_thread(next, gen, end)) is not end:
                 kind, payload, completion = item

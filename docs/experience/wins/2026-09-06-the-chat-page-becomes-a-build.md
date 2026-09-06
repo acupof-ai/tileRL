@@ -87,7 +87,7 @@ redundancy.
 Negative control on the fix itself, because an install that is already present
 proves nothing: removing the `dev` entry and re-running `uv sync --dev`
 uninstalls the package (`- websockets==17.1`) and `find_spec` returns None;
-restoring it reinstalls (`+ websockets==17.1`) and the 13 chat-UI tests pass.
+restoring it reinstalls (`+ websockets==17.1`) and the chat-UI tests pass.
 
 **Four negative controls, each fired:**
 
@@ -101,6 +101,45 @@ restoring it reinstalls (`+ websockets==17.1`) and the 13 chat-UI tests pass.
 The second is the one worth keeping: the control failed with the truncation
 gate's own message, not an earlier assertion, so it exercises the branch it
 names.
+
+**The stop cut folded into `_deltas` on the rebase, and my first control was
+aimed at the wrong files.** #174 landed the stop sequences with its cut inside
+`_stream`; rebasing onto it put the cut in the shared generator instead, so
+`/ws/chat` gets it without a second copy. 48's finding is that
+`_ScriptedEngine` honours `stop_texts` itself, so a route arm stays green with
+the *engine's* matching deleted — all six of theirs did. Two arms therefore,
+one per layer.
+
+I deleted the streaming cut and ran `test_server.py` + `test_chat_ui.py`: **48
+passed**. That reads as "the fold is untested" and was instead my control
+pointed at files that never exercised it — the gate lives in
+`test_api_sdk.py`. Re-run there, both halves are load-bearing separately:
+
+| revert | leaked text | expected |
+|---|---|---|
+| whole cut deleted | `The answer is` | `The answer` |
+| holdback only, no completed-match cut | `The answer ` | `The answer` |
+
+The second reproduces 48's own first error exactly — the trailing space of
+`" is"`, in the frame before the last. A holdback covers a *forming* match and
+not a *completed* one.
+
+The WS arm added here (`test_the_websocket_route_never_emits_a_stop_sequence`)
+is red under both reverts, failing on its own assertion rather than an earlier
+one, so it covers the layer the two transports share. The route also had to
+learn `stop`: the page sends none, but a gate on a field the route silently
+drops would pass on an empty list forever.
+
+**What is NOT gated here, and why it is not on this double.** v100 suggested
+forcing the cut mid-token, where `len(output_ids)` and the decoded-character
+count diverge most sharply. `_ByteTokenizer` cannot express it: decoding every
+prefix of `"The answer is 4."` gives 17 tokens for 16 characters — k=1 → `''`,
+then one character per step to k=17. After a single leading no-character
+token, every token carries exactly one character, so a stop string always
+begins at a token boundary and the two counts stay locked. `" is"` as one
+token is a real-tokenizer property this double structurally lacks, so that arm
+belongs in `test_e2e.py` against the real tokenizer, which is where 48 put the
+genuine stop gate for the same reason.
 
 ## Rule
 

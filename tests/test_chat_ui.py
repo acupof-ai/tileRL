@@ -194,6 +194,43 @@ const _text = (el) => el.tagName === "#TEXT" ? el.nodeValue : el.children.map(_t
 """
 
 
+def test_the_websocket_route_never_emits_a_stop_sequence():
+    """`_deltas` owns the stop cut for both transports, so the WS route gets it free.
+
+    Two arms, one per layer, because the SSE arm alone does not cover this one:
+    `_ScriptedEngine` honours `stop_texts` itself (`test_server.py`), so a route arm
+    stays green with the *engine's* matching deleted — 48 measured all six route arms
+    passing that way. This arm is red only when `_deltas`'s own streaming cut is
+    reverted, which is the layer the WS route shares.
+
+    The cut needs both halves, and each was verified to fail alone against
+    `test_api_sdk.py::test_chat_stream_never_emits_the_stop_sequence`: with the whole
+    cut deleted the stream leaks `"The answer is"`, and with only the holdback kept it
+    leaks `"The answer "` — the trailing space of `" is"`, 48's own first error.
+    """
+    from test_server import _ByteTokenizer, _ScriptedEngine
+
+    from tilerl.server import create_app
+
+    tok = _ByteTokenizer()
+    reply = "</think>\n\nThe answer is 4."
+    app = create_app(_ScriptedEngine(tok, [reply]), tok)
+    frames = []
+    with TestClient(app) as c, c.websocket_connect("/ws/chat") as ws:
+        ws.send_json({"messages": [{"role": "user", "content": "hi"}],
+                      "max_tokens": 64, "enable_thinking": True, "stop": [" is"]})
+        while True:
+            f = ws.receive_json()
+            frames.append(f)
+            if f["t"] in ("done", "error"):
+                break
+    answer = "".join(f.get("content", "") for f in frames if f["t"] == "delta")
+    assert answer == "The answer", (
+        f"the stop sequence, or a prefix of it, reached the page: {answer!r}"
+    )
+    assert frames[-1]["t"] == "done" and frames[-1]["finish_reason"] == "stop", frames[-1]
+
+
 def _ws_frames(replies: list[str], max_tokens: int, thinking: bool = True) -> list[str]:
     """The frames a real `/ws/chat` connection produces for `replies`.
 
