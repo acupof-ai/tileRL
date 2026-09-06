@@ -245,6 +245,43 @@ def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
     assert seen[3:] in ([], ["draft"]), f"one re-serve at most, got {seen}"
 
 
+def test_a_tick_with_no_pad_row_runs_eager_instead_of_capturing_mid_request():
+    """Without the pad row, an under-full tick must NOT capture an exact-size graph.
+
+    `precapture` builds `graph_keys()`, which enumerates buckets only: at
+    max_batch=4 that is {1, 2, 4}. The old exact-size fallback set ``B = n``, so a
+    3-row tick with the pad row gone asked `_graph_for(3, 1)` — a key precapture
+    never builds — and captured it inside a live request (~14 s on the 27B), under
+    exactly the pool pressure that removed the pad row. One eager tick is cheaper.
+
+    Target-independent: what is gated is which key the tick asks for, not the
+    capture. `_graph_for` is spied so the assertion is the call itself.
+    """
+    cfg, backend = tiny(), get_backend()
+    e = build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=16,
+                     num_slots=4, max_batch=4, decode_graph=True)
+    asked: list[tuple[int, int]] = []
+    e._graph_for = lambda B, W, keep: asked.append((B, W))  # None => caller runs eager
+
+    # Only len(reqs) is read before the branch under test.
+    reqs = [object(), object(), object()]
+    assert e._graph_bucket(3) == 4, "this test needs a row count that pads"
+
+    # Control: the pad row is there, so the tick keys on the bucket precapture built.
+    assert e._pad_slot is not None
+    assert e._run_decode_graph(reqs) is False  # the spy returns None
+    assert asked == [(4, 1)], f"a padded tick must key on its bucket, got {asked}"
+
+    # The case: no pad row and no capacity to take one.
+    asked.clear()
+    e._pad_slot = e._pad_block = None
+    e._states._free.clear()
+    e._kv._free.clear()
+    assert e._run_decode_graph(reqs) is False
+    assert asked == [], f"an unpadded tick asked for an off-grid graph: {asked}"
+    assert (3, 1) not in e.graph_keys(), "3 is a bucket here; pick another row count"
+
+
 def test_graph_keys_covers_what_a_decode_tick_keys_on():
     """`graph_keys` is what `precapture` builds, so it must contain every key
     `_run_decode_graph` would look up — otherwise warming succeeds, reports N
