@@ -120,8 +120,8 @@ _EFFORT_INSTRUCTIONS = {
 _THINK_RE = re.compile(r"<think>.*?(?:</think>\s*|\Z)", re.S)
 
 
-def strip_think(text: str, opened: bool = False) -> str:
-    """Drop a reasoning block from assistant text.
+def split_think(text: str, opened: bool = False) -> tuple[str, str]:
+    """(reasoning, reply) of assistant text; the reasoning block is dropped from the reply.
 
     ``opened``: the prompt already emitted ``<think>`` (the 27B template does when
     thinking is on), so the model's own text carries only the closer. Measured on
@@ -130,7 +130,14 @@ def strip_think(text: str, opened: bool = False) -> str:
     """
     if opened and not text.lstrip().startswith("<think>"):
         text = "<think>" + text
-    return _THINK_RE.sub("", text)
+    m = _THINK_RE.search(text)
+    block = "" if m is None else m.group(0)[len("<think>"):]
+    end = block.find("</think>")
+    return (block if end < 0 else block[:end]), _THINK_RE.sub("", text)
+
+
+def strip_think(text: str, opened: bool = False) -> str:
+    return split_think(text, opened)[1]
 
 
 def render_tool_call(name: str, args: dict[str, Any]) -> str:

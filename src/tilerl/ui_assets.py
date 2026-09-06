@@ -520,9 +520,9 @@ _CHAT_UI = """<!doctype html>
 </form>
 <script>
 const $ = (id) => document.getElementById(id);
-// One switch for both the request and the split: enable_thinking decides whether the
-// reply starts inside a <think> block, so a page that asked for one and a splitter
-// that assumed the other is how the fold died.
+// enable_thinking opens the <think> block in the prompt; the server then streams the
+// reasoning as reasoning_content and only the answer as content. A page that split
+// the two itself on </think> died the day the server started stripping the closer.
 const THINK = true;
 let busy = false, history = [], abort = null;
 
@@ -560,24 +560,6 @@ function addNote(text) {
 }
 
 // Reasoning sits above the answer inside the same turn, recessive and collapsible.
-// Split a reply into [reasoning, answer].
-//
-// `inside` says the reply BEGINS in the reasoning block, which is what the request
-// asked for: the checkpoint's template ends the prompt with an OPEN think tag, so
-// generation starts inside it and the stream carries only the CLOSING tag --
-// measured on the V100, 300 tokens with </think> and no <think>. Keying on the open
-// tag left the fold dead and printed the reasoning inline as prose. It matters most
-// mid-stream: before </think> arrives there is no tag at all, and guessing from the
-// text would show every reasoning token as the answer and then yank it away.
-function splitThink(raw, inside) {
-  const open = raw.indexOf("<think>");
-  const from = open < 0 ? 0 : open + 7;
-  const close = raw.indexOf("</think>", from);
-  if (open < 0 && !inside) return ["", raw];        // no reasoning in this reply
-  if (close < 0) return [raw.slice(from), ""];      // still reasoning
-  return [raw.slice(from, close), raw.slice(0, open < 0 ? 0 : open) + raw.slice(close + 8)];
-}
-
 function addThinking(bubble) {
   const det = document.createElement("details");
   det.className = "think";
@@ -652,13 +634,11 @@ async function sendChat(text) {
   const t0 = performance.now(); let firstAt = 0, tokens = 0;
   history.push({ role: "user", content: text });
   abort = new AbortController();
-  let raw = "", think = null, collapsed = false;
+  let reason = "", answer = "", finish = null, think = null, collapsed = false;
   try {
     const resp = await fetch("/v1/chat/completions", {
       method: "POST", headers: { "Content-Type": "application/json" },
       signal: abort.signal,
-      // enable_thinking makes the template open a <think> block at the end of the
-      // prompt, so the reply starts inside it and splitThink can find the boundary.
       // Left unset, the checkpoint reasons at its default xhigh effort and emits the
       // reasoning as untagged prose, and the fold has nothing to key on.
       body: JSON.stringify({ messages: history, stream: true,
@@ -670,10 +650,11 @@ async function sendChat(text) {
       // Content frames now carry cumulative usage too, so the usage-ONLY chunk is the
       // one with no choices. Keying on obj.usage alone would return early on every
       // content frame and nothing would ever render.
-      const delta = obj.choices?.[0]?.delta?.content;
+      const choice = obj.choices?.[0], delta = choice?.delta || {};
+      if (choice?.finish_reason) finish = choice.finish_reason;
       // The engine's own token count, authoritative over any client-side tally.
       if (obj.usage) tokens = obj.usage.completion_tokens;
-      if (!delta) {
+      if (!delta.content && !delta.reasoning_content) {
         if (!obj.choices?.length && tokens && firstAt) {
           const secs = (performance.now() - firstAt) / 1000;
           if (secs > 0) $("tps").textContent = (tokens / secs).toFixed(1);
@@ -681,7 +662,6 @@ async function sendChat(text) {
         return;
       }
       if (!firstAt) { firstAt = performance.now(); $("ttft").textContent = Math.round(firstAt - t0); }
-      raw += delta;
       // Live decode rate, updated per frame: the window opens at the FIRST token, so
       // prefill is excluded by construction -- charging prefill to decode is what read
       // as a 15% serve regression that did not exist
@@ -689,18 +669,19 @@ async function sendChat(text) {
       // Counting FRAMES here read 1.8x low: this server coalesces tokens per poll.
       const dt = (performance.now() - firstAt) / 1000;
       if (tokens && dt > 0.15) $("tps").textContent = (tokens / dt).toFixed(1);
-      // Split the model's reasoning out of the answer. Re-partition the whole
-      // accumulated text each frame: the tag can land mid-delta, and the reply starts
-      // inside the block, so there is no state machine to run across chunks.
-      const [reason, answer] = splitThink(raw, THINK);
-      if (!reason) { setBody(bubble, answer, true); scrollDown(); return; }
-      if (!think) think = addThinking(bubble);
-      think.textContent = reason.trim();
-      think.parentNode.querySelector(".n").textContent = think.textContent.length + " chars";
-      setBody(bubble, answer.trim(), true);
-      // Fold the reasoning away once the answer proper starts, but only once, so a
-      // reader who opened it back up keeps it open.
-      if (answer && !collapsed) { collapsed = true; think.parentNode.open = false; }
+      if (delta.reasoning_content) {
+        reason += delta.reasoning_content;
+        if (!think) think = addThinking(bubble);
+        think.textContent = reason.trim();
+        think.parentNode.querySelector(".n").textContent = think.textContent.length + " chars";
+      }
+      if (delta.content) {
+        answer += delta.content;
+        setBody(bubble, answer.trim(), true);
+        // Fold the reasoning away once the answer proper starts, but only once, so a
+        // reader who opened it back up keeps it open.
+        if (think && !collapsed) { collapsed = true; think.parentNode.open = false; }
+      }
       scrollDown();
     });
   } finally {
@@ -709,12 +690,14 @@ async function sendChat(text) {
     // and never thread the reasoning back either: the checkpoint's template drops prior
     // <think> blocks from history, so sending them re-primes the model on its own
     // scratchpad.
-    if (raw) {
-      const answer = splitThink(raw, THINK)[1].trim();
-      history.push({ role: "assistant", content: answer || raw });
-    }
+    if (answer || reason) history.push({ role: "assistant", content: answer.trim() || reason });
   }
-  if (!bubble.textContent && !think) bubble.textContent = "(empty response)";
+  // A reply whose budget the reasoning used up is the one case that used to render as
+  // nothing at all: 512 tokens by default, all of them inside the block.
+  if (!answer.trim()) {
+    bubble.textContent = finish === "length" ? "(cut off by max_tokens before the answer)"
+                                             : "(empty response)";
+  }
 }
 
 function setBusy(on) {

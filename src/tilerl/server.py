@@ -24,7 +24,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .prompt import render_prompt, sampling, strip_think
+from .prompt import render_prompt, sampling, split_think, strip_think
 from .tokenizer import ByteTokenizer, Tokenizer, get_tokenizer  # noqa: F401
 from .ui_assets import _CHAT_UI, _LANDING
 
@@ -252,16 +252,17 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         yield _sse(_chat_chunk(chunk_id, created, model_name, {"role": "assistant"}))
         deadline = time.monotonic() + 1800.0
         sent = 0  # characters of the STRIPPED reply already emitted
+        sent_r = 0  # characters of the reasoning already emitted
         seen = 0  # tokens already decoded, so a quiet poll costs nothing
 
-        def content_frame(text: str, completion: int) -> str:
+        def content_frame(delta: dict, completion: int) -> str:
             # Cumulative tokens on every content frame, vLLM's continuous_usage_stats
             # shape. Without it a live rate gauge can only count frames, and this loop
             # coalesces ~1.8 tokens into each (measured: 109 frames for 200 tokens on the
             # 27B), so the page would show roughly half the real rate until the final
             # usage chunk landed. choices stays populated, so a client that indexes it is
             # unharmed; the usage-ONLY chunk remains the one with an empty choices list.
-            chunk = _chat_chunk(chunk_id, created, model_name, {"content": text})
+            chunk = _chat_chunk(chunk_id, created, model_name, delta)
             if include_usage:
                 chunk["usage"] = _usage(prompt_tokens, completion)
             return _sse(chunk)
@@ -283,9 +284,18 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                     # replacement chars and hold them until the bytes arrive -- cutting at
                     # the FIRST one drops the whole reply whenever the text legitimately
                     # contains an unmappable byte, which is every prefix on the tiny model.
-                    text = strip_think(tokenizer.decode(live).rstrip("�"), opened=opened)
+                    raw = tokenizer.decode(live).rstrip("�")
+                    reasoning, text = split_think(raw, opened)
+                    if "</think>" not in raw:
+                        # the prefix may end in a partial closer; hold that much back
+                        reasoning = reasoning[: -len("</think>")]
+                    # reasoning goes out as vLLM's reasoning_content, so the page folds
+                    # on the field rather than on a closer the reply no longer carries
+                    if len(reasoning) > sent_r:
+                        yield content_frame({"reasoning_content": reasoning[sent_r:]}, seen)
+                        sent_r = len(reasoning)
                     if len(text) > sent:
-                        yield content_frame(text[sent:], seen)
+                        yield content_frame({"content": text[sent:]}, seen)
                         sent = len(text)
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"request {request_id} did not finish within 1800.0s")
@@ -307,11 +317,13 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                                   "type": "internal_error"}})
             yield "data: [DONE]\n\n"
             return
-        # reasoning is the model's, not the reply; sent counts stripped characters, so
-        # this is the remainder of the same string the deltas were cut from
-        tail = strip_think(tokenizer.decode(output_ids), opened=opened)[sent:]
-        if tail:
-            yield content_frame(tail, len(output_ids))
+        # sent counts stripped characters, so these are the remainders of the same
+        # strings the deltas were cut from
+        reasoning, text = split_think(tokenizer.decode(output_ids), opened)
+        if len(reasoning) > sent_r:
+            yield content_frame({"reasoning_content": reasoning[sent_r:]}, len(output_ids))
+        if len(text) > sent:
+            yield content_frame({"content": text[sent:]}, len(output_ids))
         finish = "length" if len(output_ids) >= max_new else "stop"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=finish))
         # A final usage-only chunk, OpenAI's include_usage shape. Without it a client can
