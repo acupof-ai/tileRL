@@ -14,12 +14,12 @@
 #   * logs under /work: it survives a container restart, and it is where
 #     pod_sync and the runs already live. (Not a disk-space reason: /, /tmp and
 #     /work are one filesystem -- same fsid, 263G free, 87% used.)
-#   * card_claim with `--wait-for-device $DEVICE_WAIT` (300 s, not its 90 s default: a 27B
-#     load does not touch CUDA inside 90 s and the guard killed the job), which follows
-#     \$JOB's descendants until one holds
-#     a device. \$JOB is a shell whenever the command is a wrapper script, and a shell pid is
-#     refused: that refusal was never retried, so `-- bash wrapper.sh` ran the whole way
-#     unclaimed and the card read ORPHAN with 69583 MiB for 5 minutes (2026-09-07).
+#   * card_claim `--require-device`, POLLED once a second up to $DEVICE_WAIT (300 s): a 27B
+#     load takes minutes to open the card. `--wait-for-device` is wrong here — it follows the
+#     pid's DESCENDANTS, and $CMD is python directly, so the pid handed to it is the one that
+#     opens the card and has no descendant to find. It timed out and killed two 27B runs.
+#     A shell pid (`-- bash wrapper.sh`) still has no device of its own: such a wrapper calls
+#     the exported pod_run_claim per arm, on its own python pid.
 #   * an unclaimable job is KILLED, exit 4. An unclaimed card is what gets a container
 #     restarted under someone else's run, so continuing past a refusal is the worse failure.
 #   * the claim result is echoed by the CALLER, not only into /work/pod_run_<name>.out:
@@ -39,8 +39,7 @@ POD_NAME="${POD_NAME:-sglang-test}"
 REMOTE_DIR="${REMOTE_DIR:-/work/tilerl}"
 AUPAI="${AUPAI:-/work/aupai}"
 ORPHAN_MIB="${ORPHAN_MIB:-64}"
-# card_claim defaults to 90 s, which a 27B load does not reach before touching CUDA:
-# a row-45 arm was killed at 90 s with the model still loading.
+# seconds to poll for the job's device fd: a 27B load takes minutes to open the card
 DEVICE_WAIT="${DEVICE_WAIT:-300}"
 
 [ $# -ge 4 ] || { echo "usage: $0 <name> <card> -- <command...>" >&2; exit 2; }
@@ -88,17 +87,31 @@ trap release EXIT INT TERM
 # multi-arm wrapper can invoke it per arm -- the arms run inside \$CMD, out of reach of the
 # block below.
 pod_run_claim() {  # pod_run_claim <pid> -- claim CARD for it, or kill it and exit 4
-  local pid=\$1 out
-  out=\$(python3 $AUPAI/scripts/card_claim.py acquire --name tilerl-$NAME --cards $CARD \\
-          --pid \$pid --wait-for-device $DEVICE_WAIT 2>&1) || true
-  case "\$out" in
-    *ZOMBIE*) python3 $AUPAI/scripts/card_claim.py release --name tilerl-$NAME >/dev/null 2>&1 || true
-              out=\$(python3 $AUPAI/scripts/card_claim.py acquire --name tilerl-$NAME \\
-                      --cards $CARD --pid \$pid --wait-for-device $DEVICE_WAIT 2>&1) || true;;
-  esac
-  case "\$out" in
-    *"claimed"*) echo "pod_run: \$out"; return 0;;
-  esac
+  # --require-device, polled: \$CMD is python DIRECTLY, so the pid we are handed is the one
+  # that opens the card and it has no descendant. --wait-for-device polls for a descendant
+  # that by construction never appears, and killed two 27B runs at its deadline.
+  local pid=\$1 out i
+  echo "pod_run: claim pending for \$pid, polling up to ${DEVICE_WAIT}s for a device fd"
+  for i in \$(seq 1 $DEVICE_WAIT); do
+    kill -0 \$pid 2>/dev/null || break
+    # BOTH shapes, because \$CMD may be either: --wait-for-device 1 finds the python
+    # descendant of a wrapper script, --require-device claims a pid that IS the python. One
+    # short poll each per second; neither alone covers both (a 300 s descendant wait killed
+    # two direct-python 27B runs, and --require-device alone never claims a wrapper).
+    out=\$(python3 $AUPAI/scripts/card_claim.py acquire --name tilerl-$NAME --cards $CARD \\
+            --pid \$pid --wait-for-device 1 2>&1) || true
+    case "\$out" in
+      *"claimed"*) echo "pod_run: \$out"; return 0;;
+      *ZOMBIE*)    python3 $AUPAI/scripts/card_claim.py release --name tilerl-$NAME >/dev/null 2>&1 || true;;
+    esac
+    out=\$(python3 $AUPAI/scripts/card_claim.py acquire --name tilerl-$NAME --cards $CARD \\
+            --pid \$pid --require-device 2>&1) || true
+    case "\$out" in
+      *"claimed"*) echo "pod_run: \$out"; return 0;;
+      *ZOMBIE*)    python3 $AUPAI/scripts/card_claim.py release --name tilerl-$NAME >/dev/null 2>&1 || true;;
+    esac
+    sleep 1
+  done
   if kill -0 \$pid 2>/dev/null; then
     echo "pod_run: card_claim FAILED, killing \$pid: \$out" >&2
     kill -TERM \$pid 2>/dev/null; wait \$pid 2>/dev/null; exit 4
@@ -113,10 +126,9 @@ setsid $CMD > /work/$NAME.log 2>&1 < /dev/null &
 JOB=\$!
 echo "pod_run: job pid \$JOB, log /work/$NAME.log"
 
-# card_claim refuses a shell pid, and \$JOB is a shell whenever CMD is a wrapper script --
-# that refusal was never retried, so a wrapper-launched job ran the whole way unclaimed and
-# the card read ORPHAN (2026-09-07, 69583 MiB for 5 minutes). --wait-for-device follows
-# \$JOB's descendants until one holds a device, covering the "no device fd yet" case too.
+# The card read ORPHAN for 5 minutes once (2026-09-07, 69583 MiB) because a refusal was not
+# retried. pod_run_claim polls --require-device instead: \$JOB opens the card itself, so there
+# is no descendant to follow, and the only question is whether the fd is open yet.
 pod_run_claim \$JOB
 
 wait \$JOB; rc=\$?
