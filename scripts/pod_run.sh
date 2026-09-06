@@ -14,7 +14,9 @@
 #   * logs under /work: it survives a container restart, and it is where
 #     pod_sync and the runs already live. (Not a disk-space reason: /, /tmp and
 #     /work are one filesystem -- same fsid, 263G free, 87% used.)
-#   * card_claim with `--wait-for-device`, which follows \$JOB's descendants until one holds
+#   * card_claim with `--wait-for-device $DEVICE_WAIT` (300 s, not its 90 s default: a 27B
+#     load does not touch CUDA inside 90 s and the guard killed the job), which follows
+#     \$JOB's descendants until one holds
 #     a device. \$JOB is a shell whenever the command is a wrapper script, and a shell pid is
 #     refused: that refusal was never retried, so `-- bash wrapper.sh` ran the whole way
 #     unclaimed and the card read ORPHAN with 69583 MiB for 5 minutes (2026-09-07).
@@ -37,6 +39,9 @@ POD_NAME="${POD_NAME:-sglang-test}"
 REMOTE_DIR="${REMOTE_DIR:-/work/tilerl}"
 AUPAI="${AUPAI:-/work/aupai}"
 ORPHAN_MIB="${ORPHAN_MIB:-64}"
+# card_claim defaults to 90 s, which a 27B load does not reach before touching CUDA:
+# a row-45 arm was killed at 90 s with the model still loading.
+DEVICE_WAIT="${DEVICE_WAIT:-300}"
 
 [ $# -ge 4 ] || { echo "usage: $0 <name> <card> -- <command...>" >&2; exit 2; }
 NAME=$1 CARD=$2; shift 2
@@ -85,11 +90,11 @@ trap release EXIT INT TERM
 pod_run_claim() {  # pod_run_claim <pid> -- claim CARD for it, or kill it and exit 4
   local pid=\$1 out
   out=\$(python3 $AUPAI/scripts/card_claim.py acquire --name tilerl-$NAME --cards $CARD \\
-          --pid \$pid --wait-for-device 2>&1) || true
+          --pid \$pid --wait-for-device $DEVICE_WAIT 2>&1) || true
   case "\$out" in
     *ZOMBIE*) python3 $AUPAI/scripts/card_claim.py release --name tilerl-$NAME >/dev/null 2>&1 || true
               out=\$(python3 $AUPAI/scripts/card_claim.py acquire --name tilerl-$NAME \\
-                      --cards $CARD --pid \$pid --wait-for-device 2>&1) || true;;
+                      --cards $CARD --pid \$pid --wait-for-device $DEVICE_WAIT 2>&1) || true;;
   esac
   case "\$out" in
     *"claimed"*) echo "pod_run: \$out"; return 0;;
