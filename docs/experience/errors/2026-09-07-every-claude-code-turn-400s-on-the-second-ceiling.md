@@ -1,6 +1,6 @@
 # Every Claude Code turn 400s on the second ceiling
 
-`Status: open` — the fix is its own PR; this entry is the finding.
+`Status: fixed` — `messages.py` clamps with `engine.room_for()`.
 
 ## Context
 
@@ -96,8 +96,29 @@ clamp.
 
 ## Fix
 
-`messages.py` clamps with `engine.room_for(len(input_ids))` instead of
-re-deriving one ceiling. Its own PR.
+`messages.py` clamps with `engine.room_for(len(input_ids))` instead of re-deriving
+one ceiling. `max(1, ...)` on the result is load-bearing: `room_for` returns 0 when
+the prompt alone does not fit, and `submit` skips both ceiling checks when
+`max_new_tokens` is 0. `engine_limit` stays, read for the recorder row only — a row
+whose `budget` is below `engine_limit - prompt_len` is one the pool capped, which the
+old row could not express.
+
+The gate is a real 32-block engine (512 pool tokens against a 4096 context, so the
+pool binds by ~9x) that asserts it binds on the pool before asserting anything else;
+a fake with a declared pool and width would restate `room_for`'s formula and let a
+broken `room_for` pass. The boundary is asserted at the seam, not through the route:
+after the fix a client cap above `room_for` is clamped *down* rather than refused.
+
+Negative control, hand clamp restored, red on its own assertion:
+
+```
+AssertionError: a 32000-token ask 400-ed on a pool-bound engine:
+{"message":"request (4096 tokens) exceeds KV pool capacity"} — the clamp bounds
+one of submit's two ceilings
+assert 400 == 200
+```
+
+`total = 4096` exactly, the same landing-on-the-edge shape as the V100's 32768.
 
 ## Rule
 
@@ -116,3 +137,45 @@ review that adopted `room_for` asked "which routes have an omitted-cap case",
 which is the wrong question by one step: `messages.py` has no omitted case and
 still needed the same arithmetic. Ask what the route does with the value, not
 whether the value is present.
+
+## Second defect, found by #201's instrument on the live endpoint
+
+`unknown_fields` produced its **first non-null value in production** on this endpoint:
+`{'tool_choice': 'dict{type}'}`. `tool_choice` is a documented Anthropic parameter that
+`MessagesRequest` declared nowhere, so `extra="allow"` kept it and nothing read it — the
+request was answered as if the forced tool had been honoured.
+
+`/v1/responses` has refused it since it landed (`_unsupported_choice`, now
+`prompt.unsupported_choice`): we render tools into the prompt as text and cannot force or
+forbid a call, so anything stronger than a hint is unimplementable. `/v1/messages` never
+got the treatment. `refuse_unsupported`'s own docstring names the cost — "the client's NEXT
+request assumes the first one applied it, so the lie surfaces a turn later" — which for
+`tool_choice` means the client believes the tool it forced was the tool that ran.
+
+Fixed by declaring the field and refusing beyond auto/none, reusing the Responses helper
+rather than writing a second one; it takes either spelling, since Anthropic's `any`/`tool`
+and OpenAI's `required`/`{type: function}` all force a call. Six arms, and the three
+permissive ones matter as much as the three refusing: a fix that refused every
+`tool_choice` would pass a one-sided test, and `auto` is the value a client sends when it
+means "your choice" — refusing it breaks a request that asked for nothing. Control with the
+refusal removed: 3 red, 3 green, each red naming its own value.
+
+**The rule:** the instrument found this, not a reading. `unknown_fields` had been null on
+every synthetic request and went non-null the first time a real client-shaped body reached
+it — a declared-field list is only as good as the bodies it has actually seen.
+
+**And then the instrument's own limit, measured.** `unknown_fields` reports what a request
+*carried*, so it finds one field per client that happens to send it —
+`tool_choice` surfaced that way on a route live for days. So the set was enumerated instead
+of discovered: `scripts/capture_client_body.py` drives the real CLI against a recording
+stub and diffs every field sent against `MessagesRequest.model_fields`. **Result: the CLI
+sends 10 fields, we declare 14, and 0 are undeclared** — `context_management, max_tokens,
+messages, metadata, model, output_config, stream, system, thinking, tools`. Negative
+control: hiding `thinking` and `tools` from the declared set makes the diff name both, so
+the zero is a measurement and not an empty diff.
+
+That zero corrects a claim I had written from the same evidence that produced the fix:
+`tool_choice` is **not** sent on every turn — it is in neither captured request. It is
+conditional, which is exactly why it evaded every earlier observation. The refusal is still
+right (a forced call is unimplementable here), and the reason the permissive arms matter is
+the one above, not a frequency claim I had not measured.

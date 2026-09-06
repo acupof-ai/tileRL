@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from tilerl_kernels.backend import get_backend
 
 from tilerl.config import tiny
-from tilerl.engine import Engine, build_engine
+from tilerl.engine import Engine, SamplingParams, build_engine
 from tilerl.messages import render_tool_call
 from tilerl.model import build_random
 from tilerl.server import create_app, get_tokenizer
@@ -665,6 +665,43 @@ def test_messages_route_records_token_ids(client, tmp_path, monkeypatch):
     assert row["stop_reason"] == out["stop_reason"]
 
 
+@pytest.mark.parametrize("choice,refused", [
+    ({"type": "any"}, True),      # Anthropic's "call some tool"
+    ({"type": "tool", "name": "Bash"}, True),
+    ("required", True),           # OpenAI's spelling, same claim
+    ({"type": "auto"}, False),    # a hint, which is what we already do
+    ({"type": "none"}, False),
+    (None, False),
+])
+def test_messages_refuses_a_tool_choice_it_cannot_honour(client, tmp_path, monkeypatch,
+                                                         choice, refused):
+    """Forcing a call is unimplementable here, so it must 400 rather than be ignored.
+
+    Found by the live endpoint, not by reading: #201's `unknown_fields` produced its first
+    non-null value in production, `{'tool_choice': 'dict{type}'}` — a documented Anthropic
+    parameter this route declared nowhere and dropped silently. `/v1/responses` has refused
+    it since it landed; `/v1/messages` never got the treatment. The lie surfaces a turn
+    later, when the client assumes the tool it forced was the tool that ran.
+
+    Both spellings, because `unsupported_choice` takes either: a bare string and a
+    `{"type": ...}`. auto/none stay 200 — `auto` is what a client sends when it means
+    "your choice", so refusing it would refuse a request that asked for nothing.
+    """
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "tc.jsonl"))
+    body = {"model": "tiny", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "Bash", "description": "run",
+                       "input_schema": {"properties": {}}}]}
+    if choice is not None:
+        body["tool_choice"] = choice
+    r = client.post("/v1/messages", json=body)
+    if refused:
+        assert r.status_code == 400, f"{choice!r} was accepted: {r.text[:200]}"
+        assert "tool_choice" in r.json()["error"]["message"], r.text
+    else:
+        assert r.status_code == 200, f"{choice!r} must not be refused: {r.text[:200]}"
+
+
 def test_messages_stream_is_anthropic_sse(client, tmp_path, monkeypatch):
     """stream=true emits the event names Claude Code's parser expects."""
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "s.jsonl"))
@@ -913,6 +950,59 @@ def test_the_clamp_survives_the_data_parallel_wrapper(tmp_path, monkeypatch):
         f"the clamp is broken for every caller rather than only under --devices")
     assert codes["plain/omitted"] == codes["wrapped/omitted"] == 200, (
         f"an omitted max_tokens must be admitted through both: {codes}")
+
+
+def test_the_messages_clamp_honours_the_pool_not_only_the_context(tmp_path, monkeypatch):
+    """A pool-bound engine must admit a 32000-token ask, the way Claude Code sends it.
+
+    The clamp used to compute `max_total_tokens - prompt` by hand while `submit` enforces
+    that ceiling AND the KV pool, so `total` landed on the pool's edge exactly and was
+    refused there by `width - 1` tokens -- a 400 on every Claude Code turn against the
+    V100, whose 2048 blocks hold precisely its 32768-token context.
+
+    The fixture reproduces that region on CPU: 32 blocks is 512 tokens against a 4096
+    context, so the pool binds by ~9x and the context ceiling alone would admit an ask
+    the engine then refuses. The chat route is the control -- it has called `room_for`
+    since #195, so it stays 200 whatever this route does.
+    """
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "pool.jsonl"))
+    cfg = tiny()
+    engine = build_engine(cfg, build_random(cfg, seed=41), get_backend(),
+                          num_blocks=32, num_slots=4, max_batch=4, max_total_tokens=4096)
+    engine.run()
+    try:
+        assert engine.room_for(1) < engine.limits.max_total_tokens - 1, (
+            "fixture does not bind on the pool, so it cannot see the defect")
+        with TestClient(create_app(engine, _ByteTokenizer(), model_name="tiny"),
+                        raise_server_exceptions=False) as c:
+            body = {"model": "tiny", "max_tokens": 32000,
+                    "messages": [{"role": "user", "content": "hi"}]}
+            got = c.post("/v1/messages", json=body)
+            control = c.post("/v1/chat/completions", json={k: v for k, v in body.items()
+                                                           if k != "max_tokens"})
+        assert control.status_code == 200, f"the control route broke: {control.text}"
+        assert got.status_code == 200, (
+            f"a 32000-token ask 400-ed on a pool-bound engine: {got.text} — the clamp "
+            f"bounds one of submit's two ceilings")
+        row_file = tmp_path / "pool.jsonl"
+        # Named, because the refusal is raised inside `submit` before the recorder runs:
+        # with the defect present there is no row at all, and the bare FileNotFoundError
+        # reads as a broken test rather than the second half of the same finding.
+        assert row_file.exists(), (
+            "no recorder row: submit refused before `_record`, so the request log cannot "
+            "see this failure class")
+        row = json.loads(row_file.read_text().splitlines()[-1])
+        # The clamp is the pool's number, and tight: room_for is what submit accepts to
+        # the token, so an off-by-one here is the shape the hand-rolled version had.
+        room = engine.room_for(row["prompt_len"])
+        assert row["budget"] == room, f"budget {row['budget']} is not room_for {room}"
+        assert room < row["engine_limit"] - row["prompt_len"], (
+            "the pool did not bind on the recorded prompt, so `budget` proves nothing")
+        with pytest.raises(ValueError, match="KV pool"):
+            engine.submit(list(range(row["prompt_len"])),
+                          SamplingParams(max_new_tokens=room + 1))
+    finally:
+        engine.shutdown()
 
 
 def test_image_blocks_are_refused_not_dropped(client, tmp_path, monkeypatch):
