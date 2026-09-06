@@ -51,7 +51,8 @@ KIND = {
     "rmsnorm_f32": "kernel: rmsnorm_rstd + rmsnorm_bwd_x",
     "linear": "kernel: gemm_nn",
     "linear_fp4_frozen": "kernel: linear_fp4_bwd (sm90)",
-    "linear_fp8_frozen": "kernel: linear_fp4_bwd path, fp8",
+    #: the kernel is gated `not fp8` (:1118), so fp8 falls through to the reference at :1136
+    "linear_fp8_frozen": "eager (no fp4_bwd for fp8)",
     "rope": "eager",
     "attention": "eager",
     "paged_attention": "eager",
@@ -184,18 +185,20 @@ def _selfcheck() -> int:
         # and died 40 s into a pod run with ModuleNotFoundError. Importing them here is the
         # cheapest gate that fails on this machine instead of on the card.
         import importlib
-        for mod, name in (("tilerl.model", "add_lora"), ("tilerl.autograd", "AdamW"),
-                          ("tilerl.engine", "SamplingParams"), ("tilerl.engine", "build_engine"),
-                          ("tilerl.cli", "_build_model"), ("tilerl.kv_cache", "NoPrefixStore"),
-                          ("tilerl.train", "rl_step"), ("tilerl.train", "group_advantages"),
-                          ("tilerl.train", "untruncated")):
+        pairs = (("tilerl.model", "add_lora"), ("tilerl.autograd", "AdamW"),
+                 ("tilerl.engine", "SamplingParams"), ("tilerl.engine", "build_engine"),
+                 ("tilerl.cli", "_build_model"), ("tilerl.kv_cache", "NoPrefixStore"),
+                 ("tilerl.train", "rl_step"), ("tilerl.train", "group_advantages"),
+                 ("tilerl.train", "untruncated"))
+        for mod, name in pairs:
             assert hasattr(importlib.import_module(mod), name), f"{mod} has no {name}"
     finally:
         ag._BWD.clear()
         ag._BWD.update(saved)
     print(f"selfcheck ok: a drained handler timed {secs['slow']:.3f}s, an undrained call "
           f"{undrained * 1000:.3f}ms; nested {secs2['outer']:.3f}s outer + "
-          f"{secs2['inner']:.3f}s inner, exclusive so the shares sum to 100%")
+          f"{secs2['inner']:.3f}s inner, exclusive so the shares sum to 100%; "
+          f"{len(pairs)} of main()'s imports resolved")
     return 0
 
 
@@ -274,9 +277,17 @@ def main() -> int:
     table = _rows(secs, calls, attributed)
     print(f"\n# backward_secs {bwd:.3f} (rl_step's own timing, no per-handler sync)")
     print(f"# attributed to handlers {attributed:.3f} over {sum(calls.values())} calls")
-    print(f"# sync overhead this probe adds: {attributed - bwd:+.3f} s "
-          f"({(attributed / bwd - 1) * 100:+.1f}%) -- a per-handler sync the shipped path "
-          f"does not pay, so shares are the quotable part and absolute seconds are not")
+    # A RESIDUAL, named as one. It was labelled "sync overhead this probe adds" and printed
+    # -4.797 s: a negative overhead is a contradiction, and the sign says the handlers do not
+    # account for all of backward_secs. What is outside them is Tape.backward's own loop --
+    # grads dict arithmetic, the `grads[tid] + g_in` accumulate, _release, entry bookkeeping --
+    # plus whatever the per-handler syncs add on top, which is why this is a net figure and
+    # not a measurement of either term.
+    resid = bwd - attributed
+    print(f"# unattributed: {resid:+.3f} s ({resid / bwd * 100:+.1f}% of backward_secs) -- "
+          f"Tape.backward's own loop and bookkeeping, NET of the per-handler sync overhead "
+          f"this probe adds. Shares are within the attributed total; absolute seconds are not "
+          f"the shipped path's")
     print(f"\n# {'op':<20} {'secs':>9} {'share':>7} {'calls':>7} {'ms/call':>9}  kind")
     for r in table:
         print(f"  {r['op']:<20} {r['secs']:9.3f} {r['share']:6.2f}% {r['calls']:7d} "
