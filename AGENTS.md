@@ -161,6 +161,10 @@ would outlive an update, per cache: `recapture_graph=` waives the decode graph,
 (73.62 → 34.09 s) — and `prefix_store=NoPrefixStore()` until the block-granular
 store lands, since today's store publishes and never serves.
 
+**`--ssd-path` stays off on the serve path**: 1.65x worse per turn at 12 sessions and 0
+hits, see
+[errors/2026-09-06-the-ssd-tier-is-165x-worse-at-12-sessions.md](docs/experience/errors/2026-09-06-the-ssd-tier-is-165x-worse-at-12-sessions.md).
+
 **Git.** Commitizen `<type>(<scope>): <subject>`, scopes `kv` `engine` `ops`
 `autograd` `train` `server` `docs`. Work on a named branch from a scratchpad
 worktree, push it, open a PR, and merge it once CI is green and review
