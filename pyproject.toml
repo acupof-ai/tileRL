@@ -59,6 +59,11 @@ dev = [
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "uvicorn>=0.52.4",
+    # Not redundant with the `server` extra: CI runs `uv sync --dev`, which does not
+    # install extras, and /ws/chat 404s without a WebSocket protocol implementation.
+    # `test_the_websocket_protocol_library_is_installed` failed on both CI legs while
+    # passing locally for exactly this reason -- the gate working as intended.
+    "websockets>=17.1",
     "openai>=3.8.0",
     "anthropic>=1.4.0",
 ]

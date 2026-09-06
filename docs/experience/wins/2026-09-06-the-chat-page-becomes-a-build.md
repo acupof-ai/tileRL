@@ -74,6 +74,21 @@ a plain venv, so the suite carries `find_spec("websockets") is not None` as
 its own assertion, and `websockets>=17.1` is in the `server` extra. Deploy
 with `uv sync --extra server`.
 
+**The gate then caught a second install path I had not considered, on CI
+rather than here.** Both legs went red on that exact assertion while my local
+run was green: CI runs `uv sync --dev`, which does **not** install extras, and
+the `dev` group duplicates `fastapi`/`httpx`/`uvicorn` precisely because of
+that. My local venv had the extra from an earlier `uv build`, so the
+dependency was present for a reason unrelated to how it is declared — the
+shape of "it works on my machine". `websockets>=17.1` now appears in both the
+extra and the `dev` group, and the duplication is the point rather than
+redundancy.
+
+Negative control on the fix itself, because an install that is already present
+proves nothing: removing the `dev` entry and re-running `uv sync --dev`
+uninstalls the package (`- websockets==17.1`) and `find_spec` returns None;
+restoring it reinstalls (`+ websockets==17.1`) and the 13 chat-UI tests pass.
+
 **Four negative controls, each fired:**
 
 | mutation | expected failure | observed |
@@ -91,7 +106,9 @@ names.
 
 A test whose transport is faked in-process proves the handler, never the
 deploy. Assert the dependency that carries the protocol, or the suite stays
-green while the served route 404s.
+green while the served route 404s — and check every install path that runs the
+suite, not only the one on your machine: `uv sync --dev` installs no extras,
+so a `server`-extra-only dependency is absent on CI and present locally.
 
 ## Results
 
