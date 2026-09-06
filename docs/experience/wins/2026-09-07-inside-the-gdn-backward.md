@@ -50,6 +50,32 @@ Two facts to carry into the port:
 - the upstream README links `common/chunk_delta_h.py`, which does not exist in this checkout;
   the file is `examples/kda/chunk_delta_h_fwd.py`.
 
+## Recompute is forced, not chosen: 164.80 GiB on a 96 GiB card
+
+The recompute row invites "why not keep the intermediates instead". At this shape that is not
+a tradeoff, it is impossible. `_gdn_chunk_fwd` returns 16 saved tensors per chunk
+(`reference.py:625-627`), and at B=8, T=1280, HV=48, DK=DV=128, C=16 (80 chunks/layer):
+
+| | f32 bytes |
+|---|---:|
+| one chunk's cache | 43.95 MiB |
+| **one layer's caches — what `gdn_backward` holds live today** | **3.43 GiB** |
+| all 48 GDN layers — what "keep the intermediates" would cost | **164.80 GiB** |
+| the card | 96.00 GiB |
+| the forward peak now, after the layer-wide segment ([#211](2026-09-07-a-layer-wide-checkpoint-segment.md)) | 14.90 GiB |
+
+164.80 GiB is **1.7x the whole card**, against a forward that currently peaks at 14.90. The
+single biggest entry is the incoming state `s` at 24.0 MiB/chunk — 90.00 GiB of the total — and
+it is exactly the one a scan recomputes for free, so dropping it still leaves **74.80 GiB**.
+
+The 3.43 GiB figure is the one to keep for the port: `caches` is local to one `gdn_backward`
+call, so one layer's worth is live at a time and freed on return. The ×48 never coexists today,
+and that is why the recompute exists.
+
+Dims are read from the checkpoint (`text_config`: `linear_num_value_heads` 48,
+`linear_key_head_dim` 128, `num_hidden_layers` 64, `full_attention_interval` 4 → 48 GDN
+layers), not from the config dataclass, whose defaults are zeros.
+
 ## Method
 
 `scripts/prof_backward_ops.py --inside-gdn` patches `reference._gdn_chunk_fwd`,
