@@ -89,7 +89,15 @@ def test_sandbox_confines_writes_to_the_rollout_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "rec.jsonl"))
     outside = tmp_path / "outside" / "ESCAPED.txt"
     outside.parent.mkdir()
-    escape = render_tool_call("Bash", {"command": f"echo pwned > {outside} && echo wrote"})
+    # `</think>` first: Claude Code sends thinking adaptive, so the 27B template opens a
+    # reasoning block in the prompt and `split_think(opened=True)` prepends `<think>` to a
+    # reply that has no closer -- which routes the WHOLE reply to reasoning and leaves the
+    # text empty. `_parse_tool_calls` then never sees the call, and both arms of this test
+    # go quiet: the sandboxed one "blocks" a call that was never made, and the control
+    # cannot write. Measured: with opened=True the call lands in reasoning and the reply is
+    # ''; with a leading closer it lands in the reply.
+    escape = "</think>" + render_tool_call(
+        "Bash", {"command": f"echo pwned > {outside} && echo wrote"})
 
     def attempt(sandbox: bool, tag: str) -> None:
         tok = _ByteTokenizer()
