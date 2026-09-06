@@ -41,13 +41,26 @@ That lands on shapes with no room. Blocks per SM under the 2col kernel:
 Task #21 had already recorded these small-N decode shapes at **5-33% of peak** —
 grid-starved before the change. Halving their grid is exactly the wrong direction.
 
+> **Both retired figures below are withdrawn, and this entry's conclusion does not
+> rest on them.** The 5-33% band came from an eager microbench over a shape table the
+> model does not launch — `attn o` at N=1024 does not exist, `o_proj` is 5120×6144 ×16
+> — and in the captured graph the whole GEMV class runs at **746 GB/s = 83% of peak**
+> ([per-shape gap was a wrong shape table](2026-09-02-per-shape-gap-was-a-wrong-shape-table.md),
+> which closed #21 as not a defect the day before this entry). "144 launches" has no
+> instrument behind it at all; the two in-graph counts are **305** and **313.4**
+> ([task 21 numbers do not survive a grep](2026-09-05-task-21-numbers-do-not-survive-a-grep.md)).
+> The `ncols=2` measurement itself — 39.1 → 37.2 tok/s, uniform 0.946-0.951x with a
+> reproducing confirm arm — is independent of both.
+
 ## Why the microbench said nothing
 
 The accept run read M=1 at **1.05×**, and the same entry states ±4% is the M=1 noise
 floor. So the reading was *inside its own error bar* — "no signal", which I read as
 "no risk". Two further reasons it could not have caught this: six shapes in isolation
-are not the 144-launch decode path, and a microbench at fixed N cannot show grid
-starvation interacting with the other 143 launches competing for the same SMs.
+are not the whole decode path, and a microbench at fixed N cannot show grid starvation
+interacting with the other launches competing for the same SMs. (The launch count in
+the original wording, 144, is withdrawn — see the note above; the argument needs only
+that there are many, and the measured figure is ~305.)
 
 ## Fix
 
