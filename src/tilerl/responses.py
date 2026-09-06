@@ -168,7 +168,10 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         input_ids = tokenizer.encode(prompt)
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
-        params = sampling(tokenizer, thinking, req.max_output_tokens or 512,
+        # Omitted means "as much as fits" -- see the same default in server.py's chat
+        # route. `or` rather than `is not None`: 0 is not a usable cap here either.
+        max_new = req.max_output_tokens or engine.room_for(len(input_ids))
+        params = sampling(tokenizer, thinking, max_new,
                           temperature=req.temperature, top_p=req.top_p, stop=req.stop)
         rid = engine.submit(input_ids, params)
         deadline = time.monotonic() + 1800.0

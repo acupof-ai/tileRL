@@ -92,6 +92,11 @@ class DataParallelEngine:
         return min((e.limits for e in self._engines),
                    key=lambda lim: lim.max_total_tokens)
 
+    def room_for(self, prompt_tokens: int) -> int:
+        # min for the same reason `limits` takes the min: submit routes to the shortest
+        # queue, so the only budget every replica honours is the smallest one's.
+        return min(e.room_for(prompt_tokens) for e in self._engines)
+
     def stats(self) -> dict[str, Any]:
         per = [e.stats() for e in self._engines]
         total = {k: sum(s[k] for s in per) for k in per[0] if isinstance(per[0][k], int)}

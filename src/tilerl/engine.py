@@ -482,6 +482,19 @@ class Engine:
     def usable_slots(self) -> int:
         return self._states.num_slots - (self._pad_slot is not None)
 
+    def room_for(self, prompt_tokens: int) -> int:
+        """Largest ``max_new_tokens`` this prompt can ask for and still be admitted.
+
+        The two ceilings `submit` enforces, so a caller that wants "as much as fits"
+        does not re-derive them: ``max_total_tokens``, and the KV pool including the
+        ``width - 1`` drafts a verify tick materializes past the last token. Returns 0
+        when the prompt alone does not fit -- the caller keeps its own refusal, since
+        `submit` refuses that case with a message naming which bound it hit.
+        """
+        by_total = self.limits.max_total_tokens - prompt_tokens
+        by_pool = BLOCK_TOKENS * self.usable_blocks - prompt_tokens - self._width + 1
+        return max(0, min(by_total, by_pool))
+
     def submit(self, input_ids: Any, params: SamplingParams | None = None) -> int:
         """Queue a request; returns its opaque id. Prefix lookup, block and
         state-slot allocation happen here, not at admission."""
