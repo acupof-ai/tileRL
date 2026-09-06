@@ -142,10 +142,36 @@ export interface Turn {
    * so a partial UTF-8 tail that later completes cannot leave a stale glyph. */
   reasoning: string
   answer: string
+  /** How much of `answer` is already on screen as finished blocks. Only the text
+   * past this point is re-parsed per frame; see `paint`. */
+  settled: number
   readonly fold: HTMLDetailsElement
   readonly reasoningBody: HTMLElement
+  /** Finished blocks, appended to and never rebuilt. */
   readonly answerBody: HTMLElement
+  /** The block still being written; the only node a frame replaces. */
+  readonly answerTail: HTMLElement
   readonly note: HTMLElement
+}
+
+/** Where the block currently being written begins.
+ *
+ * Everything before this is finished: no later token can change it, because the
+ * grammar's block boundaries are a blank line and a fence, and both are already
+ * behind us. Everything after has to be re-parsed on every frame -- a paragraph
+ * becomes a list, an open fence closes.
+ *
+ * Fences are counted first: inside an open one the whole block is provisional,
+ * including any blank lines in it, so the boundary is that fence's own start.
+ */
+export const lastBlockStart = (src: string): number => {
+  const fences = src.split("```").length - 1
+  if (fences % 2 === 1) return src.lastIndexOf("```")
+  const closed = src.lastIndexOf("```")
+  const gap = src.lastIndexOf("\n\n")
+  // A closed fence ends a block as firmly as a blank line does.
+  if (closed !== -1 && closed + 3 > gap) return closed + 3
+  return gap === -1 ? 0 : gap + 2
 }
 
 export const newTurn = (into: HTMLElement, role: "user" | "assistant"): Turn => {
@@ -164,21 +190,38 @@ export const newTurn = (into: HTMLElement, role: "user" | "assistant"): Turn => 
 
   const answerBody = document.createElement("div")
   answerBody.className = "answer"
+  const answerTail = document.createElement("div")
+  answerTail.className = "tail"
+  answerBody.appendChild(answerTail)
   const note = document.createElement("div")
   note.className = "note"
   note.hidden = true
 
   root.append(fold, answerBody, note)
   into.appendChild(root)
-  return { root, reasoning: "", answer: "", fold, reasoningBody, answerBody, note }
+  return { root, reasoning: "", answer: "", settled: 0, fold, reasoningBody,
+           answerBody, answerTail, note }
 }
 
+/** Render what has arrived, re-parsing only the block still being written.
+ *
+ * The whole answer used to be re-parsed and every node replaced on each frame,
+ * which is O(reply^2) over a stream and throws away the DOM under the reader's
+ * selection. Finished blocks are appended once and never touched again; the tail
+ * is the only node a frame replaces.
+ */
 export const paint = (t: Turn): void => {
   if (t.reasoning !== "") {
     t.fold.hidden = false
     t.reasoningBody.replaceChildren(document.createTextNode(t.reasoning))
   }
-  t.answerBody.replaceChildren(markdown(t.answer))
+  const cut = lastBlockStart(t.answer)
+  if (cut > t.settled) {
+    // insertBefore, not append: the tail has to stay last.
+    t.answerBody.insertBefore(markdown(t.answer.slice(t.settled, cut)), t.answerTail)
+    t.settled = cut
+  }
+  t.answerTail.replaceChildren(markdown(t.answer.slice(t.settled)))
 }
 
 /** The end state. `truncated` is the only one that writes a notice: the reasoning

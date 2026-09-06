@@ -117,6 +117,9 @@
     padding: 0 var(--s4); font: inherit; font-weight: 500; cursor: pointer;
   }
   button:disabled { opacity: .45; cursor: default; }
+  /* The stop button replaces Send while a turn streams, so it takes the quiet
+     treatment: ending a reply is not the page's primary action. */
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); }
   #meter { color: var(--dim); font-size: 12px; text-align: center;
            max-width: var(--wide); margin: var(--s2) auto 0; font-variant-numeric: tabular-nums; }
 </style>
@@ -135,6 +138,7 @@
   <div class="composer">
     <textarea id="composer" placeholder="Ask the model…" autofocus></textarea>
     <button id="send">Send</button>
+    <button id="stop" class="ghost" hidden>Stop</button>
   </div>
   <div id="meter"></div>
 </footer>

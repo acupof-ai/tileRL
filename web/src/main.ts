@@ -14,6 +14,25 @@ const send = $<HTMLButtonElement>("send")
 const thinking = $<HTMLInputElement>("thinking")
 const budget = $<HTMLInputElement>("budget")
 const meter = $("meter")
+const stop = $<HTMLButtonElement>("stop")
+
+/** Within a few px of the bottom. Not `=== 0`: sub-pixel layout and zoom leave a
+ * fractional remainder on a log the reader has scrolled all the way down. */
+const atBottom = (el: HTMLElement): boolean =>
+  el.scrollHeight - el.scrollTop - el.clientHeight < 32
+
+/** Follow the stream only while the reader is already at the bottom.
+ *
+ * Measured BEFORE the paint and applied after: once the new tokens are in the
+ * DOM the old scroll position is no longer at the bottom, so a check after the
+ * fact can never tell "following along" from "reading back". Scrolling someone
+ * away from the line they are on is the failure this exists to prevent.
+ */
+const following = (el: HTMLElement, paintFn: () => void): void => {
+  const stick = atBottom(el)
+  paintFn()
+  if (stick) el.scrollTop = el.scrollHeight
+}
 
 const history: Array<{ role: "user" | "assistant"; content: string }> = []
 let inFlight = false
@@ -39,7 +58,7 @@ const stream = (turn: Turn, cap: number | null): Promise<void> =>
       if (f.t === "delta") {
         if (f.reasoning_content !== undefined) turn.reasoning += f.reasoning_content
         if (f.content !== undefined) turn.answer += f.content
-        paint(turn)
+        following(log, () => paint(turn))
       } else if (f.t === "done") {
         // The notice names the budget that was actually spent, so with no typed cap
         // it comes from usage -- the page has no other honest number to quote.
@@ -58,13 +77,19 @@ const stream = (turn: Turn, cap: number | null): Promise<void> =>
         fail(turn, cap ?? 0, f.message)
       }
     },
+    (close) => {
+      stopStream = close
+    },
   )
+
+let stopStream: (() => void) | null = null
 
 const submit = async (): Promise<void> => {
   const text = composer.value.trim()
   if (text === "" || inFlight) return
   inFlight = true
   send.disabled = true
+  stop.hidden = false
   composer.value = ""
 
   const you = newTurn(log, "user")
@@ -88,12 +113,15 @@ const submit = async (): Promise<void> => {
     // has to release the composer, or the page is stuck with no error shown.
     inFlight = false
     send.disabled = false
+    stop.hidden = true
+    stopStream = null
     turn.root.classList.remove("pending")
     composer.focus()
   }
 }
 
 send.addEventListener("click", () => void submit())
+stop.addEventListener("click", () => stopStream?.())
 composer.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault()

@@ -187,11 +187,21 @@ const mk = (tag) => ({
     remove(...c){ c.forEach((x) => this._s.delete(x)); },
     contains(c){ return this._s.has(c); } },
   appendChild(c){ this.children.push(c); return c; },
+  // Real ordering, not an append alias: `paint` inserts finished blocks BEFORE
+  // the streaming tail, so a stub that ignored the ref node would hide a tail
+  // that drifted out of last place.
+  insertBefore(c, ref){ const i = this.children.indexOf(ref);
+    const kids = c.tagName === "#FRAGMENT" ? c.children : [c];
+    this.children.splice(i === -1 ? this.children.length : i, 0, ...kids); return c; },
   append(...c){ this.children.push(...c); },
   replaceChildren(...c){ this.children = c.flatMap((x) =>
     x.tagName === "#FRAGMENT" ? x.children : [x]); },
   addEventListener(ev, fn){ (this._h ||= {})[ev] = fn; },
   focus(){}, scrollIntoView(){},
+  // Scroll geometry, so the page's "am I at the bottom" check has something to
+  // read. A test sets scrollTop; scrollHeight/clientHeight are fixed, so
+  // scrollTop === 900 is the bottom and anything less is scrolled back.
+  scrollTop: 900, scrollHeight: 1000, clientHeight: 100,
 });
 const text = (v) => ({ tagName: "#TEXT", nodeValue: String(v), children: [] });
 const IDS = {};
@@ -350,7 +360,8 @@ def test_the_websocket_protocol_library_is_installed():
     )
 
 
-def _page_after(frames: list[str], budget: str = "") -> dict:
+def _page_after(frames: list[str], budget: str = "",
+                scroll_top: int | None = None, stop_after: bool = False) -> dict:
     """Run the shipped bundle over `frames`; return what landed in the DOM.
 
     ``budget`` is what the user typed in the budget box; "" is the shipped default
@@ -370,6 +381,8 @@ def _page_after(frames: list[str], budget: str = "") -> dict:
     values = dict(re.findall(r'id="([\w-]+)"[^>]*\svalue="([^"]*)"', html))
     harness = (
         "const FRAMES = " + json.dumps(frames) + ";\n"
+        + ("const SCROLLTOP = " + json.dumps(scroll_top) + ";\n" if scroll_top is not None else "")
+        + "const STOP = " + ("true" if stop_after else "false") + ";\n"
         + _DOM_STUB
         + "".join(f'IDS["{i}"] = mk("div");\n' for i in ids)
         + "".join(f'IDS["{i}"].checked = true;\n' for i in sorted(checked))
@@ -378,7 +391,12 @@ def _page_after(frames: list[str], budget: str = "") -> dict:
         + _bundle()
         + textwrap.dedent("""
         IDS.composer.value = "page";
-        await IDS.send._h.click();
+        if (typeof SCROLLTOP === "number") IDS.log.scrollTop = SCROLLTOP;
+        const done = IDS.send._h.click();
+        // Mid-stream: the socket replays its frames on a microtask, so a click
+        // scheduled here lands while the turn is still pending.
+        if (STOP) IDS.stop._h.click();
+        await done;
         await new Promise((r) => setTimeout(r, 0));
         const turn = IDS.log.children.at(-1);
         const fold = turn.children.find((c) => c.className === "reasoning");
@@ -386,6 +404,8 @@ def _page_after(frames: list[str], budget: str = "") -> dict:
         const note = turn.children.find((c) => c.className === "note");
         console.log(JSON.stringify({
           url: SOCK.url,
+          scrollTop: IDS.log.scrollTop,
+          stopHidden: IDS.stop.hidden,
           sent: JSON.parse(SENT[0]),
           reasoning: fold ? _text(fold.children[1]) : null,
           foldOpen: fold ? fold.open : null,
@@ -499,6 +519,72 @@ def test_a_fence_still_streaming_renders_as_code_not_as_a_paragraph():
     assert "```" not in got["answer"], f"the fence marker leaked into the text: {got['answer']}"
 
 
+def test_a_finished_block_is_not_rebuilt_by_a_later_frame():
+    """Only the block still being written is re-parsed per frame.
+
+    The whole answer used to be re-parsed and every node replaced on every frame:
+    O(reply^2) over a stream, and it throws away the DOM under the reader's
+    selection. `lastBlockStart` is the boundary -- everything before it is settled
+    because the grammar's block breaks (a blank line, a closed fence) are already
+    behind us.
+
+    Driven through the real bundle: the reply has a finished paragraph, a closed
+    fence and an open tail, so all three cases appear in one stream. The finished
+    blocks must be siblings BEFORE the tail, which is the ordering `insertBefore`
+    exists for.
+    """
+    reply = "</think>\nfirst para\n\n```py\nx = 1\n```\n\nstill typing"
+    got = _page_after(_ws_frames([reply], max_tokens=512))
+    html = got["answer"]
+    # The settled paragraph and the closed fence both survived to the end.
+    assert "first para" in html and "x = 1" in html and "still typing" in html, html
+    assert "<pre>" in html, f"the closed fence did not become a code block: {html}"
+    # The tail is last: everything settled precedes it.
+    assert html.rindex("still typing") > html.rindex("x = 1"), (
+        f"the streaming tail is not last; a finished block was inserted after it: {html}"
+    )
+
+
+def test_the_log_follows_the_stream_only_when_the_reader_is_at_the_bottom():
+    """Scrolling someone away from the line they are reading is the bug here.
+
+    Two arms, because a page that never scrolls passes the second alone and a page
+    that always scrolls passes the first alone. The stub's geometry makes
+    scrollTop 900 the bottom (scrollHeight 1000 - clientHeight 100).
+    """
+    frames = _ws_frames(["</think>\nsome reply text"], max_tokens=512)
+    at_bottom = _page_after(frames, scroll_top=900)
+    assert at_bottom["scrollTop"] == 1000, (
+        f"a reader at the bottom stopped following the stream: {at_bottom['scrollTop']}"
+    )
+    scrolled_back = _page_after(frames, scroll_top=100)
+    assert scrolled_back["scrollTop"] == 100, (
+        f"the page yanked a reader who had scrolled back: {scrolled_back['scrollTop']}"
+    )
+
+
+def test_the_stop_button_is_shown_only_while_a_turn_is_in_flight():
+    """It is `hidden` at rest and revealed on submit; the `finally` hides it again.
+
+    Asserted after the stream settles rather than during it, which is the state a
+    leak would show up in: a stop button still on screen with nothing to stop.
+    """
+    got = _page_after(_ws_frames(["</think>\nok"], max_tokens=512))
+    assert got["stopHidden"] is True, "the stop button outlived the turn it belongs to"
+
+
+def test_stopping_settles_the_turn_instead_of_raising():
+    """A user stop is not a failure: the tokens already on screen are the reply.
+
+    `ask` resolves on stop rather than rejecting, so the turn keeps its text and
+    shows no error note. Driven by clicking stop mid-stream -- the stub's socket
+    replays frames on a microtask, so the click lands while the turn is pending.
+    """
+    got = _page_after(_ws_frames(["</think>\npartial answer"], max_tokens=512), stop_after=True)
+    assert got["note"] is None, f"a user stop rendered an error: {got['note']}"
+    assert got["pending"] is False, "the turn stayed pending after a stop"
+
+
 def test_the_page_renders_the_frames_this_server_sends():
     """The loop closed: the real bundle over a real connection's frames.
 
@@ -517,7 +603,7 @@ def test_the_page_renders_the_frames_this_server_sends():
     assert got["reasoning"] == "planning\n", got
     # The inner div is `.prose`, one per non-fenced run: markdown() emits block nodes,
     # so the answer bubble holds elements rather than a text blob.
-    assert got["answer"] == "<div><p><strong>hi</strong> and <code>x</code></p></div>", got
+    assert got["answer"] == "<div><div><p><strong>hi</strong> and <code>x</code></p></div></div>", got
     assert got["foldOpen"] is False, f"the fold opened over a finished answer: {got}"
     assert got["note"] is None, f"a healthy reply carries a notice: {got}"
     assert "completion_tokens" not in got["meter"] and got["meter"], got
@@ -531,9 +617,38 @@ def test_the_page_explains_a_reply_the_budget_cut_off():
 
     got = _page_after(_ws_frames([reply], max_tokens=len(_ByteTokenizer().encode(reply))))
     assert got["reasoning"] == reply, got
-    assert got["answer"] == "<div></div>", got
+    assert got["answer"] == "<div><div></div></div>", got
     assert got["foldOpen"] is True, f"the reasoning stayed folded over an empty reply: {got}"
     assert got["note"] and "budget" in got["note"], got
+
+
+def test_a_typed_budget_spent_inside_the_block_names_the_number_the_user_typed():
+    """The truncated notice quotes the TYPED cap when there is one, usage when not.
+
+    The arm above drives the cap through the server fixture with the box empty, so
+    it only ever exercises `cap ?? f.usage.completion_tokens` on the usage side.
+    #194 made the box optional, which created a second path nothing covered: a
+    user who types 12 must see 12, not the completion count that happens to equal
+    it here by construction.
+
+    So the number is made distinguishable on purpose -- the reply is longer than
+    the typed cap, and the server is told a different, larger limit. If the page
+    quoted usage instead of the typed value the notice would name that larger
+    number and this fails.
+    """
+    from test_server import _ByteTokenizer
+
+    reply = "still planning and planning"
+    served = len(_ByteTokenizer().encode(reply))
+    got = _page_after(_ws_frames([reply], max_tokens=served), budget="12")
+    assert got["note"] is not None, f"a cut-off reply showed no notice: {got}"
+    assert "12-token" in got["note"], (
+        f"the notice must name the budget the user typed, got: {got['note']}"
+    )
+    assert str(served) not in got["note"], (
+        f"the notice quoted the served completion count over the typed cap: {got['note']}"
+    )
+    assert got["foldOpen"] is True, "the reasoning stayed folded over an empty reply"
 
 
 def _tiny_client():
