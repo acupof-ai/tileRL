@@ -90,6 +90,7 @@ def test_grpo_length_buckets_preserve_real_token_loss_and_gradients(monkeypatch)
     from tilerl.kv_cache import NoPrefixStore
 
     prompt = [1, 2, 3]
+    failures = []
     # (cap, longest, expected width). The 1200 arm is the one that catches an
     # unclamped bucket: 1200 is not a power of two, so rounding up gives 2048 --
     # 848 tokens of padding past a cap the completions can never exceed. At 2048
@@ -142,16 +143,15 @@ def test_grpo_length_buckets_preserve_real_token_loss_and_gradients(monkeypatch)
             results.append((losses, gradients))
         np.testing.assert_allclose(results[0][0], results[1][0], rtol=1e-5, atol=1e-6)
         assert results[0][1].keys() == results[1][1].keys()
-        failures = []
         for key, actual in results[0][1].items():
             ref = results[1][1][key]
             if not torch.allclose(actual, ref, rtol=1e-5, atol=1e-6):
-                failures.append(f"{key}: max |d|={(actual - ref).abs().max().item():.9g}, "
+                failures.append(f"cap={cap}, longest={longest}, width={width}; "
+                                f"{key}: max |d|={(actual - ref).abs().max().item():.9g}, "
                                 f"max |ref|={ref.abs().max().item():.9g}, rtol=1e-5, atol=1e-6")
-        assert not failures, (
-            f"cap={cap}, longest={longest}, width={width}; torch={torch.__version__}, "
-            f"threads={torch.get_num_threads()}, platform={platform.platform()}\n"
-            + "\n".join(failures))
+    assert not failures, (
+        f"torch={torch.__version__}, threads={torch.get_num_threads()}, "
+        f"platform={platform.platform()}\n" + "\n".join(failures))
 
 
 def test_micro_batching_is_the_same_update():
