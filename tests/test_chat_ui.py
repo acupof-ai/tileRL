@@ -428,6 +428,77 @@ def test_an_empty_budget_box_sends_no_max_tokens_at_all():
     )
 
 
+def test_the_renderer_builds_each_markdown_block_as_its_own_element():
+    """Headings, lists, links and fences become real nodes, not styled text.
+
+    One arm per construct, because a renderer that handles four of five looks
+    identical to one that handles all five until the fifth appears in a reply.
+    Asserted on tag names in the rendered subtree -- `_html` prints them -- rather
+    than on the source text, which the old `.prose` path would also have passed.
+    """
+    reply = "\n".join([
+        "## Result",
+        "",
+        "The answer is **391**, see [docs](https://example.com/x).",
+        "",
+        "- first",
+        "- second",
+        "",
+        "1. one",
+        "2. two",
+        "",
+        "```python",
+        "print(17 * 23)",
+        "```",
+    ])
+    got = _page_after(_ws_frames(["</think>\n" + reply], max_tokens=512))
+    html = got["answer"]
+    for tag in ("<h2>", "<ul>", "<li>", "<ol>", "<a>", "<pre>", "<code>", "<strong>"):
+        assert tag in html, f"{tag} missing from the rendered answer: {html}"
+    assert "## Result" not in html, f"the heading marker survived as text: {html}"
+    assert "- first" not in html, f"the bullet marker survived as text: {html}"
+    assert "print(17 * 23)" in html, f"the fenced body was lost: {html}"
+    # The list markers are consumed, the text is not.
+    assert "first" in html and "second" in html and "one" in html
+
+
+def test_a_link_can_only_carry_a_scheme_we_allow():
+    """`createElement` closes attribute breakout; it does NOT close `javascript:`.
+
+    A node built with `a.href = "javascript:..."` is a live handler exactly as an
+    injected attribute would be, so the string-vs-node argument that retired the
+    old escaper does not cover this one. Anything but http/https/mailto/relative
+    renders as plain text.
+
+    Three arms: a hostile scheme is refused, an ordinary link still works (an
+    "refuse everything" regression passes the first arm alone), and the refused
+    link's TEXT is still shown rather than silently dropped.
+    """
+    bad = _page_after(_ws_frames(["</think>\nsee [click](javascript:alert(1)) here"],
+                                 max_tokens=512))
+    assert "<a>" not in bad["answer"], f"a javascript: href became a link: {bad['answer']}"
+    assert "click" in bad["answer"], f"the refused link lost its text: {bad['answer']}"
+
+    ok = _page_after(_ws_frames(["</think>\nsee [click](https://example.com) here"],
+                                max_tokens=512))
+    assert "<a>" in ok["answer"], f"an ordinary https link was refused: {ok['answer']}"
+
+
+def test_a_fence_still_streaming_renders_as_code_not_as_a_paragraph():
+    """An unterminated ``` is a code block whose body is what has arrived.
+
+    Every frame repaints from the accumulated text, so mid-stream the last fence
+    has no closer. Treating that as prose makes the block flip from paragraph to
+    code when the closer lands -- the text reflows under the reader. The server
+    here sends a reply that simply has no closing fence, which is the same input
+    the renderer sees on every frame before the last.
+    """
+    got = _page_after(_ws_frames(["</think>\nintro\n\n```python\nprint(1)"], max_tokens=512))
+    assert "<pre>" in got["answer"], f"an open fence rendered as prose: {got['answer']}"
+    assert "print(1)" in got["answer"], got["answer"]
+    assert "```" not in got["answer"], f"the fence marker leaked into the text: {got['answer']}"
+
+
 def test_the_page_renders_the_frames_this_server_sends():
     """The loop closed: the real bundle over a real connection's frames.
 
@@ -446,7 +517,7 @@ def test_the_page_renders_the_frames_this_server_sends():
     assert got["reasoning"] == "planning\n", got
     # The inner div is `.prose`, one per non-fenced run: markdown() emits block nodes,
     # so the answer bubble holds elements rather than a text blob.
-    assert got["answer"] == "<div><div><strong>hi</strong> and <code>x</code></div></div>", got
+    assert got["answer"] == "<div><p><strong>hi</strong> and <code>x</code></p></div>", got
     assert got["foldOpen"] is False, f"the fold opened over a finished answer: {got}"
     assert got["note"] is None, f"a healthy reply carries a notice: {got}"
     assert "completion_tokens" not in got["meter"] and got["meter"], got
