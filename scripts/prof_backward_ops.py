@@ -372,6 +372,25 @@ def main() -> int:
         adv = group_advantages(np.ones(a.group), a.group)
         plens = np.full(a.group, len(prompt), dtype=np.int64)
         slens = np.array([len(prompt) + len(c) for c in seqs], dtype=np.int64)
+        # which GDN arm this shape takes, asked of the backend rather than recomputed here.
+        # The t % chunk term binds only where gdn_state_scan is registered (sm90); on cpu the
+        # predicate is vacuously true, so `gdn_arm` discriminates on the pod and not locally.
+        from tilerl_kernels.backend import _WY_CHUNK
+        from tilerl_kernels.registry import _resolve
+
+        from tilerl.train import _MLP_SEGMENT_MAX_T
+        t_batch = int(batch.shape[1])
+        has_wy = "gdn_state_scan" in _resolve(backend.precision, backend.arch)
+        wy = backend._wy_eligible(t_batch, {"seq_q_lens": None}, t_batch > 1)
+        print(json.dumps({"T": t_batch, "wy_chunk": _WY_CHUNK,
+                          "T_mod_chunk": t_batch % _WY_CHUNK,
+                          "wy_kernels_registered": has_wy,
+                          "gdn_arm": ("wy_kernels" if wy else "fused_or_serial") if has_wy
+                                    else "n/a (no WY cell on this arch)",
+                          # T crosses this cap and the WY multiple independently, so two
+                          # shapes can differ in both at once and did (T=1280 vs 1324)
+                          "segment": "layer" if t_batch > _MLP_SEGMENT_MAX_T else "mlp"},
+                         sort_keys=True), flush=True)
 
         secs.clear(); calls.clear()  # keep only the LAST step: step 0 pays every JIT
         timings: dict[str, float] = {}
