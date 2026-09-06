@@ -63,6 +63,16 @@ a16ff9c is 0.947x on backward and 0.995x on the step**, i.e. #190 alone moved ba
 `backend.py:1424`'s early return catches the 63 repeat calls; only the first
 after a version bump copies.
 
+**What that control does not cover.** The refill happens only when something
+*calls* `_const_f32`, and a graph replay calls nothing — so a replayed graph reads
+the pre-step cast until an eager call refills the buffer in place (tilerl-25,
+measured on cpu: the address survives `p.copy_()` as #190 intended, the values do
+not). This measurement is on the training path, where the eager forward performs
+that refill, so **0.947x is #190's cost on the normal path and says nothing about
+the replay path #190 was written for.** #190 makes the refill possible rather than
+automatic; the mechanism in flight for the replay case is `invalidate_weights`
+walking the cache and refilling every live entry.
+
 ## Controls
 
 | control | reading |
