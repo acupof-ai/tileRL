@@ -433,6 +433,9 @@ class Engine:
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        #: Last published stats dict, swapped in by the loop. `stats()` returns it without
+        #: the lock; None until the loop or a direct caller has built one.
+        self._stats_snapshot: dict[str, Any] | None = None
 
         self._next_id = 1
         self._waiting: deque[_Req] = deque()
@@ -652,12 +655,21 @@ class Engine:
             decodes, prefills, chunks = self._build_plan()
             if not decodes and not prefills:
                 return
+            # BEFORE the forward, not only after: a snapshot published on the way out leaves
+            # the FIRST forward with none, and `stats()` then falls back to the locking path
+            # and waits for it. Measured by the gate at 106 s against a 2 s sleep.
+            self._stats_snapshot = self._build_stats()
             try:
                 self._run_forward(decodes, prefills, chunks)
             except Exception as exc:
                 for req in list(self._running):
                     self._finish(req, error=str(exc))
                 raise
+            finally:
+                # And after, because `_loop` stops calling `step` once nothing is running --
+                # so this is the only publish that can carry the state the last tick left,
+                # including the state a failed forward left behind.
+                self._stats_snapshot = self._build_stats()
 
     def _build_plan(self) -> tuple[list[_Req], list[_Req], list[int]]:
         """Admit the whole waiting queue up to ``max_batch``, then all running
@@ -728,6 +740,33 @@ class Engine:
             return not self._waiting and not self._running
 
     def stats(self) -> dict[str, Any]:
+        """Lock-free while the loop thread runs; a fresh build when it does not.
+
+        Lock-free on the served path, for the same reason `peek` is: `step()` holds `_lock`
+        across the whole forward, so a reader that took it waits for that forward. Measured
+        on the live V100 during a 21.7k-token prefill, /health median 8.12 s and max
+        87.66 s against 0.002 s idle -- four orders of magnitude, on identical code.
+
+        The dict is only ever REPLACED, never mutated in place, so a reader sees one
+        consistent generation. A stale snapshot is the deliberate trade on that path: it is
+        at most one tick old, and /health's job is liveness, not a transaction.
+
+        **A direct-drive caller gets the live numbers instead.** With no loop thread there is
+        no background forward to wait on, so the snapshot buys nothing and costs correctness:
+        a caller that submits and reads between its own `step()` calls would see the previous
+        tick's counters and conclude, for instance, that a prefix hit it just caused had not
+        happened. `test_a_rejected_submit_does_not_release_the_prefix_stores_blocks` reads
+        exactly that way and caught it.
+        """
+        if self._thread is None:
+            return self._build_stats()
+        snap = self._stats_snapshot
+        if snap is None:
+            # Loop started, first tick not finished yet.
+            return self._build_stats()
+        return snap
+
+    def _build_stats(self) -> dict[str, Any]:
         with self._lock:
             store = self._prefix.stats()
             return {
