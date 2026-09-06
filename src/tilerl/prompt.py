@@ -120,8 +120,16 @@ _EFFORT_INSTRUCTIONS = {
 _THINK_RE = re.compile(r"<think>.*?(?:</think>\s*|\Z)", re.S)
 
 
-def strip_think(text: str) -> str:
-    """Drop a reasoning block from historical assistant text."""
+def strip_think(text: str, opened: bool = False) -> str:
+    """Drop a reasoning block from assistant text.
+
+    ``opened``: the prompt already emitted ``<think>`` (the 27B template does when
+    thinking is on), so the model's own text carries only the closer. Measured on
+    the V100 endpoint: without this the reply began with the reasoning and a bare
+    ``</think>``, and a client saw prose where it asked for HTML.
+    """
+    if opened and not text.lstrip().startswith("<think>"):
+        text = "<think>" + text
     return _THINK_RE.sub("", text)
 
 

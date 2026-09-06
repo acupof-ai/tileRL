@@ -696,9 +696,10 @@ def test_messages_tool_use_round_trip(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "rt.jsonl"))
     tok = _ByteTokenizer()
+    # /v1/messages opens <think> in the prompt, so a real reply starts with the closer
     engine = _ScriptedEngine(tok, [
-        render_tool_call("Bash", {"command": "ls"}),
-        "there are 3 files",
+        "</think>\n\n" + render_tool_call("Bash", {"command": "ls"}),
+        "</think>\n\nthere are 3 files",
     ])
     app = create_app(engine, tok)
     with TestClient(app) as c:
@@ -756,7 +757,7 @@ def test_parallel_tool_calls_become_separate_blocks(tmp_path, monkeypatch):
     tok = _ByteTokenizer()
     reply = ("Listing both.\n" + render_tool_call("Bash", {"command": "ls"})
              + "\n" + render_tool_call("Bash", {"command": "pwd"}))
-    app = create_app(_ScriptedEngine(tok, [reply]), tok)
+    app = create_app(_ScriptedEngine(tok, ["</think>\n\n" + reply]), tok)
     with TestClient(app) as c:
         body = c.post("/v1/messages", json={
             "max_tokens": 64,
@@ -1048,7 +1049,7 @@ def test_the_record_says_which_operand_capped_the_completion(tmp_path, monkeypat
     tok = _ByteTokenizer()
     record = tmp_path / "rec.jsonl"
     monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(record))
-    engine = _ScriptedEngine(tok, ["hello there"])
+    engine = _ScriptedEngine(tok, ["</think>\n\nhello there"])
     with TestClient(create_app(engine, tok)) as client:
         r = client.post(
             "/v1/messages",
@@ -1146,3 +1147,27 @@ def test_health_publishes_each_ceiling_beside_its_counter(client):
         f"pool_used_blocks={stats['pool_used_blocks']} below blocks_used="
         f"{stats['blocks_used']}: the pool cannot hold fewer blocks than requests own"
     )
+
+
+def test_a_reply_that_carries_only_the_think_closer_is_the_answer(tmp_path, monkeypatch):
+    """The 27B template opens ``<think>`` in the PROMPT, so the model's text has only
+    ``</think>``. Measured on the V100 endpoint at 73bef1d: both routes returned the
+    reasoning, a bare closer, then the HTML the client asked for. With the block
+    opened, only what follows the closer is the reply; with thinking off, or on a
+    bare turn (the byte tokenizer has no ``<think>`` token), nothing is stripped."""
+    tok = _ByteTokenizer()
+    engine = _ScriptedEngine(tok, ["planning\n</think>\n\n<p>hi</p>", "no block here",
+                                   "bare turn"])
+    with TestClient(create_app(engine, tok)) as c:
+        opened = c.post("/v1/messages", json={
+            "model": "m", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "page"}]}).json()
+        assert opened["content"][0]["text"] == "<p>hi</p>", opened
+        off = c.post("/v1/messages", json={
+            "model": "m", "max_tokens": 64, "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "page"}]}).json()
+        assert off["content"][0]["text"] == "no block here", off
+        bare = c.post("/v1/chat/completions", json={
+            "model": "m", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "page"}]}).json()
+        assert bare["choices"][0]["message"]["content"] == "bare turn", bare

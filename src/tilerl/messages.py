@@ -187,7 +187,7 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
                 f"request {rid} did not finish within {_COMPLETION_TIMEOUT_S}s"
             )
         scores = engine.logprobs(rid)  # single reader; a second one raises
-        text = strip_think(tokenizer.decode(out))
+        text = strip_think(tokenizer.decode(out), opened=_thinking(req))
         prose, calls = _parse_tool_calls(text, req.tools)
         content: list[dict[str, Any]] = []
         if prose or not calls:
@@ -324,6 +324,10 @@ if __name__ == "__main__":  # pragma: no cover - self-check
                             {"type": "tool_result", "content": "out"}]) == (
         "hi\n<tool_response>\nout\n</tool_response>")
     assert strip_think("<think>\nplanning\n</think>\n\nthe answer") == "the answer"
+    # the template opened the block: the model's text has only the closer
+    assert strip_think("planning\n</think>\n\n<p>hi</p>", opened=True) == "<p>hi</p>"
+    assert strip_think("planning\n</think>\n\n<p>hi</p>") != "<p>hi</p>"
+    assert strip_think("still planning", opened=True) == ""  # cut off mid-reasoning
     tools = render_tools([{"name": "Bash", "description": "Run it",
                             "input_schema": {"properties": {"command": {}}}}], "low")
     assert tools.startswith("Reasoning effort is set to low.")
