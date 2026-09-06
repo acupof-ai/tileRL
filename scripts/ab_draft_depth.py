@@ -353,6 +353,9 @@ def main() -> None:
 
     be = get_backend()
     arch = getattr(be, "arch", "") or "sm70"
+    # _build_model reads TILERL_QWEN38_SOURCE, not --source: without it cli.py:20 falls
+    # back to the Hub and the run dies on a network error after the backend is up.
+    os.environ.setdefault("TILERL_QWEN38_SOURCE", args.source)
     cfg, model = _build_model("qwen38-27b", seed=0, fuse_projections=True)
     draft = load_draft(model, args.draft)
     if args.prompt == "wikitext":
