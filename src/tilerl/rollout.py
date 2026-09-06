@@ -66,9 +66,11 @@ def sandbox_available() -> tuple[bool, str]:
 def sandbox_settings(host: str, port: int) -> dict[str, Any]:
     """Claude Code's sandbox config for a rollout: our server and nothing else.
 
-    ``failIfUnavailable`` is the important key -- without it a host that cannot
-    sandbox runs the agent bare, and a rollout that touched the real filesystem
-    is worse than a rollout that did not happen.
+    Two keys, two independent failures, one gate each:
+    ``enabled`` (with this payload reaching the CLI) confines the writes
+    -- `test_sandbox_confines_writes_to_the_rollout_dir`; ``failIfUnavailable`` refuses a
+    host that cannot sandbox rather than running bare
+    -- `test_a_host_without_a_sandbox_refuses_rather_than_running_bare`.
     """
     return {
         "sandbox": {

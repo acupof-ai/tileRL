@@ -111,6 +111,41 @@ handles rather than a shape only a test produces.
 Before the fix both arms parsed **0**. The sandboxed assertion was passing because no attempt
 was made, which is exactly what 25's control was designed to catch, and did.
 
+## And then the repaired gate got the same treatment
+
+Both arms parsing the call shows an attempt is made; it does not show the **sandbox** is what
+stops it. So the thing under test was reverted one key at a time, each arm required to go red:
+
+| revert | gate | assertion that fired |
+|---|---|---|
+| none (as shipped) | pass | — |
+| `allowUnsandboxedCommands` → `True` | **pass** | none |
+| `failIfUnavailable` → `False` | **pass** | none |
+| `enabled` → `False` | **fail** | `sandboxed rollout wrote outside its directory` |
+| drop `--settings` entirely | **fail** | same |
+
+The confinement is `enabled` plus the payload reaching the CLI. The two keys that left it green
+govern *refusal to run where no sandbox exists* — a case this gate never enters — so neither is
+a valid control for this assertion, and **the first one I tried was one of them.** Had I stopped
+at its green I would have reported a second vacuity that does not exist.
+
+**The docstring was part of the defect.** It called `failIfUnavailable` "the important key",
+which is what aimed that first control at the wrong one; tilerl-25 named the sharper half — of
+the two, `failIfUnavailable` is the more dangerous, because its name *sounds* like the write
+path. A comment that misnames what binds does not merely fail to help, it aims the next
+person's control. Rewritten to two facts, one gate named per key, with this history left here
+rather than in the source. `failIfUnavailable` also gained the control it never had
+(`test_a_host_without_a_sandbox_refuses_rather_than_running_bare`, red on `DID NOT RAISE` when
+the refusal is removed).
+
+**A control that leaves a gate green has two readings** — the gate is vacuous, or the key you
+reverted is not the one that binds — and only sweeping the candidates separates them. Stopping
+at the first green picks whichever reading you already expected.
+
+Both red arms fired on the sandboxed assertion, not on the negative control below it, which is
+what makes them controls: a revert that broke the unsandboxed half instead would produce the
+same red count and prove nothing.
+
 ## Still open, filed separately — now closed here
 
 `rollout.py:176`'s `{**os.environ, ...}` meant every rollout inherited the spawning machine's
