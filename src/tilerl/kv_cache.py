@@ -245,6 +245,10 @@ class LinearStatePool:
         self.conv_windows[slot, :, 0].copy_(snap)
         self.win_parity[slot] = 0
 
+    @property
+    def free_slots(self) -> int:
+        return len(self._free)
+
     def alloc_slot(self) -> int:
         if not self._free:
             raise RuntimeError(f"LinearStatePool exhausted: all {self.num_slots} slots in use")
@@ -785,6 +789,7 @@ class NoPrefixStore:
     #: getattr default at the read site: a duck-type miss there reports 0 evictions for a
     #: real store too, which is exactly the "no pressure" reading a tier below would act on.
     evictions = 0
+    blocks_freed = 0
 
     def lookup(self, tokens: Sequence[int]) -> PrefixHit | None:
         return None
@@ -796,12 +801,15 @@ class NoPrefixStore:
     def evict_until_free(self, blocks: int) -> None:
         return None
 
+    def reclaimable_blocks(self) -> int:
+        return 0
+
     def clear(self) -> None:
         return None
 
     def stats(self) -> dict[str, int]:
         return {"entries": 0, "capacity": 0, "state_bytes": 0, "hits": 0, "misses": 0,
-                "evictions": 0}
+                "evictions": 0, "blocks_freed": 0}
 
 
 class PrefixStore:
@@ -843,6 +851,7 @@ class PrefixStore:
         self.hits = 0
         self.misses = 0
         self.evictions = 0
+        self.blocks_freed = 0
         self.ssd_hits = 0
         self.ssd_faults = 0
 
@@ -996,6 +1005,15 @@ class PrefixStore:
         while self._pool.free_blocks < blocks and self._by_id:
             self._evict_one()
 
+    def reclaimable_blocks(self) -> int:
+        """Blocks eviction would actually free: refcount 0 once the store's own holds go."""
+        held: dict[int, int] = {}
+        for entry in self._by_id.values():
+            for b in entry.blocks:
+                held[b] = held.get(b, 0) + 1
+        # Per entry, not per block: a growing prefix republishes, so shared blocks sit above 1.
+        return sum(1 for b, n in held.items() if self._pool.refcount[b] == n)
+
     def _drop(self, entry: _Entry) -> None:
         """Remove one entry and release everything it holds. The single teardown path:
         eviction, a promotion that came back empty, and ``clear`` all go through it, so
@@ -1005,8 +1023,12 @@ class PrefixStore:
         chain.remove(entry)
         if not chain:
             del self._entries[entry.h]
+        before = self._pool.free_blocks
         for b in entry.blocks:
             self._pool.free_block(b)
+        # Blocks, not entries: `free_block` is a refcount decrement, so an entry whose blocks
+        # a live request retains frees nothing while still counting an eviction.
+        self.blocks_freed += self._pool.free_blocks - before
         if not entry.demoted:
             self._state_used -= entry.nbytes
         if self._dram is not None:
@@ -1071,6 +1093,7 @@ class PrefixStore:
             "hits": self.hits,
             "misses": self.misses,
             "evictions": self.evictions,
+            "blocks_freed": self.blocks_freed,
             "demoted": sum(1 for e in self._by_id.values() if e.demoted),
         }
         if self._dram is not None:

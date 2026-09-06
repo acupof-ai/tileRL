@@ -1,6 +1,17 @@
 # `/health` waited on the engine lock: 87.66 s on a liveness endpoint — V100 sm70, 2026-09-07
 
-> Status: fixed
+> Status: fixed — **verified live on the V100 (`7d5700b`, child pid 2895338) during a real
+> 30,000-character prefill: `/health` median 1.24 ms, min 1.16, max 1.36, against 8.12 s median
+> and 87.66 s max before the fix (~6,500x on the median) and indistinguishable from the 1.45 ms
+> idle baseline.** Engine state at the time: `running=1`, `blocks_used=939`,
+> `pool_used_blocks=940`, `slots_used=1` — so the samples were taken against a genuinely busy
+> engine, which is the whole point: an idle reading is what had me call this work non-urgent
+> earlier the same day. 12 samples, each from a separate ssh so the poll could not be serialized
+> behind the request by a shared connection. The request finished normally afterwards
+> (`finished=1`, `blocks_used` back to 0). Deployment verified by clock, not by sha: process
+> start epoch 1788734914.534 against `engine.py` mtime 1788734911.942, so the child began 2.59 s
+> after the post-fix source was written, with `__pycache__` cleared and `find src -name '*.pyc'`
+> returning 0.
 
 ## Context
 
@@ -50,6 +61,9 @@ The loop publishes a snapshot; `stats()` returns it without the lock.
 - `stats()` returns the published dict. The dict is only ever *replaced*, never
   mutated, so a reader sees one consistent generation; assignment is a single
   bytecode under the GIL, which is `peek`'s own argument.
+
+A stale read is the deliberate trade on the served path: the snapshot is at most
+one tick old, and `/health`'s job is liveness, not a transaction.
 
 Two details that are load-bearing, both found by a red gate rather than by
 reading:

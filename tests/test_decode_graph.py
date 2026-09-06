@@ -107,6 +107,7 @@ def test_the_graphs_padding_row_is_not_taken_from_the_callers_capacity():
                            generator=torch.Generator().manual_seed(5)).tolist()
     params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=0)
     ids = [on.submit(prompt, params) for _ in range(n)]  # the N-th used to raise
+    on.step()  # slots are taken at admission now, not in submit
     assert len(set(ids)) == n and on.stats()["slots_used"] == n
 
 
