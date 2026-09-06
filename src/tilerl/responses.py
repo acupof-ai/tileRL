@@ -26,6 +26,7 @@ fields by name rather than trusting a parse to catch them.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any
@@ -258,7 +259,8 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
     @app.post("/v1/responses")
     async def responses(req: ResponsesRequest):
         try:
-            body = _run(req)
+            # to_thread, same reason as messages.py.
+            body = await asyncio.to_thread(_run, req)
         except ValueError as exc:
             return JSONResponse(status_code=400,
                                 content={"error": {"message": str(exc),

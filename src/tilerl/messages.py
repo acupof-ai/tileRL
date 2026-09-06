@@ -29,6 +29,7 @@ all rather than being a translation layer someone writes twice:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -291,7 +292,8 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
         # passes it through verbatim, which metadata.user_id would not survive.
         rollout = request.headers.get(_ROLLOUT_HEADER)
         try:
-            body, rid = _run(req, rollout)
+            # to_thread: `_run` polls take() with sleep, which on the loop starves every route.
+            body, rid = await asyncio.to_thread(_run, req, rollout)
         except ValueError as exc:
             return JSONResponse(status_code=400,
                                 content={"type": "error",

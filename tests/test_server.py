@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 
 os.environ.setdefault("TILERL_TARGET", "cpu")
 
@@ -622,6 +624,75 @@ def test_sampling_bounds(client, field, value):
 def test_configured_tokenizer_fails_closed(tmp_path):
     with pytest.raises(Exception):
         get_tokenizer(str(tmp_path))
+
+
+@pytest.mark.parametrize("path,body", [
+    ("/v1/messages", {"model": "tiny", "max_tokens": 8,
+                      "messages": [{"role": "user", "content": "hi"}]}),
+    # Both, because /v1/responses had the SAME defect and 27's brief named only messages:
+    # `async def responses` called `_run` directly, and its own poll loop sleeps at :186.
+    # A gate on one route would have left a known instance of this defect in the tree.
+    ("/v1/responses", {"model": "tiny", "max_output_tokens": 8, "input": "hi"}),
+])
+def test_a_request_in_flight_does_not_freeze_the_server(tmp_path, monkeypatch, path, body):
+    """`/health` must answer while a reply is being generated, on every async route.
+
+    `_run` polls `engine.take` with `time.sleep(0.02)`. The routes are `async def`, so
+    before the fix that poll ran ON the event loop and every other route starved for the
+    length of the reply — measured on the live V100 as a 10-minute freeze on a 30k-token
+    prompt, with /health timing out and CLOSE-WAIT sockets piling up. The chat route has
+    always awaited its wait through `asyncio.to_thread` (`server.py`); this is that, on the
+    two routes that did not.
+
+    The gate is a second request answering while the first is still in flight, which is the
+    property the defect broke. A slow engine, not a slow model: `take` returning None for a
+    fixed number of polls is the same shape as a long generation and costs the suite ~1 s.
+    """
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "loop.jsonl"))
+    tok = _ByteTokenizer()
+
+    class _SlowEngine(_ScriptedEngine):
+        #: ~1.4 s of polling at _run's 0.02 s interval — long enough that a blocked loop
+        #: cannot answer /health inside the 1 s assertion, short enough for the suite.
+        POLLS = 70
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._left: dict[int, int] = {}
+
+        def take(self, request_id: int):
+            self._left.setdefault(request_id, self.POLLS)
+            if self._left[request_id] > 0:
+                self._left[request_id] -= 1
+                return None
+            return super().take(request_id)
+
+    engine = _SlowEngine(tok, ["</think>\n\ndone"])
+    app = create_app(engine, tok, model_name="tiny")
+    with TestClient(app) as c:
+        done: dict[str, object] = {}
+        t = threading.Thread(target=lambda: done.update(
+            code=c.post(path, json=body).status_code))
+        t.start()
+        try:
+            # Wait for the request to be IN FLIGHT, else /health answers before the poll
+            # loop starts and the arm passes on a server that was never busy.
+            for _ in range(200):
+                if engine.params:
+                    break
+                time.sleep(0.01)
+            assert engine.params, f"{path} never reached submit; the arm proves nothing"
+            t0 = time.monotonic()
+            health = c.get("/health")
+            elapsed = time.monotonic() - t0
+        finally:
+            t.join(timeout=30)
+
+    assert health.status_code == 200, health.text
+    assert elapsed < 1.0, (
+        f"/health took {elapsed:.2f}s while {path} was generating — the route blocks the "
+        f"event loop instead of awaiting through asyncio.to_thread")
+    assert done.get("code") == 200, f"the {path} request itself failed: {done}"
 
 
 def test_messages_route_records_token_ids(client, tmp_path, monkeypatch):
