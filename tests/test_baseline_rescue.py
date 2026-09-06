@@ -17,6 +17,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pod_sync_source as src
+
 ROOT = Path(__file__).resolve().parents[1]
 BASE = "docs/experience/wins/bench-baseline.json"
 
@@ -63,8 +65,7 @@ def test_the_unguarded_pull_raises():
 
 
 def _sync_line() -> str:
-    return next(ln for ln in (ROOT / "scripts" / "pod_sync.sh").read_text().splitlines()
-                if "baseline.py" in ln and "SKIP_BASELINE_PULL" in ln)
+    return src.line("baseline.py", "SKIP_BASELINE_PULL")
 
 
 def _reaches_the_wipe(line: str, tmp: Path, skip: str = "0") -> bool:

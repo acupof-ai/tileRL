@@ -5,20 +5,12 @@ deletes runs/ while reading as if it protects it. The expression is extracted fr
 shipped script rather than copied, so a rewrite there is what this test sees.
 """
 
-import re
 import subprocess
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+import pod_sync_source as src
 
-
-def _wipe() -> str:
-    line = next(
-        ln for ln in (ROOT / "scripts" / "pod_sync.sh").read_text().splitlines()
-        if ln.startswith("wipe=")
-    )
-    # the script embeds the expression for a nested bash -lc, so \\! arrives as \!
-    return re.sub(r"\\+!", "!", line[len("wipe=") :].strip('"'))
+_wipe = src.wipe_expr
 
 
 def _run(expr: str, tmp: Path) -> tuple[bool, bool]:
