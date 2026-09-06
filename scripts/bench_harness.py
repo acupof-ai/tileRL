@@ -45,7 +45,9 @@ def _git_commit() -> str:
         ).strip()
     except Exception:  # the pod is a tarball, not a clone; pod_sync stamps HEAD here
         stamp = _ROOT / ".synced_commit"
-        return stamp.read_text().strip() if stamp.exists() else "unknown"
+        # .strip() or "unknown", not exists(): a redirect truncates the file before git
+        # runs, so a failed stamp leaves it empty and a blank commit reads as provenance.
+        return (stamp.read_text().strip() if stamp.exists() else "") or "unknown"
 
 
 def _today() -> str:

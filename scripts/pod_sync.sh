@@ -10,8 +10,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # the remote checkout is wiped below; pull any bench row the pod raised first.
 [ "${SKIP_BASELINE_PULL:-0}" = 1 ] || python3 "$ROOT/scripts/baseline.py" pull >/dev/null 2>&1 || true
-# the pod is not a git repo: stamp HEAD so bench rows carry provenance.
-git -C "$ROOT" rev-parse --short HEAD > "$ROOT/.synced_commit" 2>/dev/null || true
+# the pod is not a git repo: stamp HEAD so bench rows carry provenance. Write only when
+# git succeeded: `git ... > stamp || true` truncates the file before git runs, so a
+# failure left it empty and bench_harness read empty as a blank commit, not "unknown".
+if sha=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null); then
+  printf '%s\n' "$sha" > "$ROOT/.synced_commit"
+fi
 REMOTE_DIR="${REMOTE_DIR:-/work/tilerl}"
 POD_NAME="${POD_NAME:-sglang-test}"
 
