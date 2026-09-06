@@ -70,8 +70,12 @@ class RefBackend:
         if tp_groups:
             mine, self._tp_pg = join(tp_groups, "tp")
             self.tp_world, self.tp_rank = len(mine), mine.index(rank)
-        else:
+        elif not (dp_groups or cp_groups):
+            # bare init_tp(world, rank): the whole world is one tp group
             self.tp_world, self.tp_rank = world, rank
+        else:
+            # another axis owns the world; inheriting it all-reduced o_proj (rel 1.2e+00)
+            self.tp_world, self.tp_rank = 1, 0
         if dp_groups:
             mine, self._dp_pg = join(dp_groups, "dp")
             self.dp_world = len(mine)
