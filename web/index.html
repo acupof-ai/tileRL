@@ -5,51 +5,71 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tilerl</title>
 <style>
-  /* Same tokens as the landing page in ui_assets.py, so the two pages stay one
-     product rather than two that happen to share a host. */
+  /* Warm paper, one terracotta accent, no pure white and no saturated blue.
+     Both schemes are defined token-only: every rule below reads a var, so the
+     dark block redefines colours and nothing else. */
   :root {
-    color-scheme: dark;
-    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
-    --fg: #e6e8eb; --dim: #8b93a1; --accent: #7aa2f7; --accent2: #9ece6a;
-    --warn: #e0af68;
+    color-scheme: light dark;
+    --paper: #faf9f7; --card: #fffdfa; --sunk: #f1eee8; --line: #e5e0d8;
+    --fg: #1f1e1c; --dim: #6d6a63; --accent: #bd5d3a; --accent-ink: #fdfcfa;
+    --user: #f2ece3; --warn: #8a6a2f;
     --s1: 6px; --s2: 12px; --s3: 18px; --s4: 28px;
+    --wide: 720px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #21201c; --card: #292824; --sunk: #2f2e29; --line: #3b3934;
+      --fg: #e9e7e2; --dim: #a29e95; --accent: #d97757; --accent-ink: #1b1a17;
+      --user: #34312a; --warn: #d2a760;
+    }
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; height: 100vh; display: flex; flex-direction: column;
-    font: 15px/1.6 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
-    background: var(--bg); color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--paper); color: var(--fg);
+    -webkit-font-smoothing: antialiased;
   }
   header {
     display: flex; align-items: center; gap: var(--s3);
     padding: var(--s2) var(--s3); border-bottom: 1px solid var(--line);
   }
-  header .brand { font-weight: 800; color: var(--accent); letter-spacing: -.3px; }
+  header .inner { display: flex; align-items: center; gap: var(--s3);
+    max-width: var(--wide); width: 100%; margin: 0 auto; }
+  /* Serif on the wordmark only -- the one place it reads as voice rather than
+     as a second body font competing with the reply. */
+  header .brand { font-family: "Iowan Old Style", Georgia, "Times New Roman", serif;
+    font-size: 19px; letter-spacing: -.2px; color: var(--fg); }
   header label { color: var(--dim); font-size: 13px; display: flex; align-items: center; gap: var(--s1); }
-  header input[type=number] { width: 72px; background: var(--panel2); color: var(--fg);
-    border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; font: inherit; font-size: 13px; }
-  header a { margin-left: auto; color: var(--accent); font-size: 13px; }
+  header input[type=number] { width: 68px; background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 3px 6px; font: inherit; font-size: 13px; }
+  header a { margin-left: auto; color: var(--accent); font-size: 13px; text-decoration: none; }
+  header a:hover { text-decoration: underline; }
   #log { flex: 1; overflow-y: auto; padding: var(--s4) var(--s3); display: flex;
-         flex-direction: column; gap: var(--s3); max-width: 860px; width: 100%; margin: 0 auto; }
+         flex-direction: column; gap: var(--s4); max-width: var(--wide); width: 100%; margin: 0 auto; }
   .turn { display: flex; flex-direction: column; gap: var(--s2); }
   .turn.user .answer {
-    align-self: flex-end; background: var(--accent); color: #0f1115;
+    align-self: flex-end; background: var(--user); border: 1px solid var(--line);
     padding: var(--s2) var(--s3); border-radius: 12px; max-width: 76%;
   }
-  .turn.assistant .answer { background: var(--panel); border: 1px solid var(--line);
-    border-radius: 12px; padding: var(--s2) var(--s3); }
+  /* The assistant speaks on the paper itself; only the user's turn is a card.
+     A border on both made the page read as a form rather than a conversation. */
   .turn.assistant .answer:empty { display: none; }
-  details.reasoning { background: var(--panel2); border: 1px solid var(--line);
-    border-radius: 10px; padding: var(--s1) var(--s2); }
-  details.reasoning summary { color: var(--dim); font-size: 13px; cursor: pointer; }
+  details.reasoning { background: var(--sunk); border: 1px solid var(--line);
+    border-radius: 12px; padding: var(--s1) var(--s2); }
+  details.reasoning summary { color: var(--dim); font-size: 13px; cursor: pointer;
+    list-style: none; }
+  details.reasoning summary::before { content: "▸ "; }
+  details.reasoning[open] summary::before { content: "▾ "; }
+  details.reasoning summary::-webkit-details-marker { display: none; }
   .reasoning-body { color: var(--dim); font-size: 14px; white-space: pre-wrap;
     margin-top: var(--s1); }
   .note { color: var(--warn); font-size: 13px; }
   .prose { white-space: pre-wrap; }
-  pre { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
-        padding: var(--s2); overflow-x: auto; margin: var(--s1) 0; }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
-  .prose code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--sunk); border: 1px solid var(--line); border-radius: 12px;
+        padding: var(--s2) var(--s3); overflow-x: auto; margin: var(--s2) 0; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13.5px; }
+  .prose code { background: var(--sunk); padding: 1px 5px; border-radius: 5px; }
   .pending .answer::after {
     content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite;
   }
@@ -58,28 +78,34 @@
     /* The caret still marks the pending turn; only the motion goes. */
     .pending .answer::after { animation: none; }
   }
-  footer { border-top: 1px solid var(--line); padding: var(--s2) var(--s3); }
-  .composer { display: flex; gap: var(--s2); max-width: 860px; margin: 0 auto; }
+  footer { border-top: 1px solid var(--line); padding: var(--s3); }
+  .composer { display: flex; gap: var(--s2); max-width: var(--wide); margin: 0 auto; }
   textarea {
-    flex: 1; resize: none; min-height: 44px; max-height: 180px;
-    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
-    border-radius: 10px; padding: var(--s2); font: inherit;
+    flex: 1; resize: none; min-height: 46px; max-height: 180px;
+    background: var(--card); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 12px; padding: var(--s2) var(--s3); font: inherit;
+  }
+  textarea::placeholder { color: var(--dim); }
+  textarea:focus-visible, button:focus-visible, input:focus-visible, a:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
   }
   button {
-    background: var(--accent); color: #0f1115; border: 0; border-radius: 10px;
-    padding: 0 var(--s4); font: inherit; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 12px;
+    padding: 0 var(--s4); font: inherit; font-weight: 500; cursor: pointer;
   }
-  button:disabled { opacity: .5; cursor: default; }
+  button:disabled { opacity: .45; cursor: default; }
   #meter { color: var(--dim); font-size: 12px; text-align: center;
-           max-width: 860px; margin: var(--s1) auto 0; font-variant-numeric: tabular-nums; }
+           max-width: var(--wide); margin: var(--s2) auto 0; font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
 <header>
-  <span class="brand">tilerl</span>
-  <label><input type="checkbox" id="thinking" checked> thinking</label>
-  <label>budget <input type="number" id="budget" value="512" min="1" step="64"></label>
-  <a href="/about">about</a>
+  <div class="inner">
+    <span class="brand">tilerl</span>
+    <label><input type="checkbox" id="thinking" checked> thinking</label>
+    <label>budget <input type="number" id="budget" placeholder="auto" min="1" step="64"></label>
+    <a href="/about">about</a>
+  </div>
 </header>
 <div id="log"></div>
 <footer>

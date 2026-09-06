@@ -24,17 +24,27 @@ const fail = (turn: Turn, cap: number, message: string): void => {
   turn.note.replaceChildren(document.createTextNode(message))
 }
 
-const stream = (turn: Turn, cap: number): Promise<void> =>
+const stream = (turn: Turn, cap: number | null): Promise<void> =>
   ask(
     socketUrl(window.location, "/ws/chat"),
-    { messages: history, max_tokens: cap, enable_thinking: thinking.checked },
+    {
+      messages: history,
+      // Omitted, not zero: an empty box means "whatever fits", and the server owns
+      // that number. Sending a placeholder here would put the page's guess in
+      // front of the context remainder the server computes.
+      ...(cap === null ? {} : { max_tokens: cap }),
+      enable_thinking: thinking.checked,
+    },
     (f) => {
       if (f.t === "delta") {
         if (f.reasoning_content !== undefined) turn.reasoning += f.reasoning_content
         if (f.content !== undefined) turn.answer += f.content
         paint(turn)
       } else if (f.t === "done") {
-        settle(turn, outcome(f.finish_reason, turn.answer, turn.reasoning !== ""), cap)
+        // The notice names the budget that was actually spent, so with no typed cap
+        // it comes from usage -- the page has no other honest number to quote.
+        settle(turn, outcome(f.finish_reason, turn.answer, turn.reasoning !== ""),
+               cap ?? f.usage.completion_tokens)
         meter.replaceChildren(
           document.createTextNode(
             `${f.usage.prompt_tokens} prompt + ${f.usage.completion_tokens} completion tokens`,
@@ -45,7 +55,7 @@ const stream = (turn: Turn, cap: number): Promise<void> =>
         // replaying an empty answer teaches the model to answer nothing.
         if (turn.answer !== "") history.push({ role: "assistant", content: turn.answer })
       } else {
-        fail(turn, cap, f.message)
+        fail(turn, cap ?? 0, f.message)
       }
     },
   )
@@ -65,12 +75,14 @@ const submit = async (): Promise<void> => {
 
   const turn = newTurn(log, "assistant")
   turn.root.classList.add("pending")
-  const cap = Math.max(1, Number(budget.value) || 512)
+  // Empty box = no cap of our own; the server decides what fits.
+  const typed = budget.value.trim()
+  const cap = typed === "" ? null : Math.max(1, Number(typed) || 1)
 
   try {
     await stream(turn, cap)
   } catch (e) {
-    fail(turn, cap, String(e))
+    fail(turn, cap ?? 0, String(e))
   } finally {
     // A stream that ends without a `done` frame -- a dropped connection -- still
     // has to release the composer, or the page is stuck with no error shown.
