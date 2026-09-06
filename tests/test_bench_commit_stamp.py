@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pod_sync_source as src
+
 ROOT = Path(__file__).resolve().parents[1]
 HARNESS = ROOT / "scripts" / "bench_harness.py"
 
@@ -56,10 +58,7 @@ def test_the_exists_spelling_reports_a_blank_commit(tmp_path):
 
 
 def _stamp_block() -> str:
-    lines = (ROOT / "scripts" / "pod_sync.sh").read_text().splitlines()
-    i = next(n for n, ln in enumerate(lines) if ln.startswith("# the pod is not a git repo"))
-    j = next(n for n in range(i, len(lines)) if lines[n] == "fi")
-    return "\n".join(lines[i : j + 1])
+    return src.block("# the pod is not a git repo", "fi")
 
 
 def _stamp_after(block: str, tmp: Path) -> str:
