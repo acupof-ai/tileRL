@@ -95,14 +95,20 @@ Tiny model, CPU target, `segment="layer"` against `segment="mlp"`:
 | the batch-2 arm is not decoration | a raise-on-`numel > 1` probe inside `forward` fires with `numel=2`, so the arm reaches a real parity vector rather than the bool-able 1-element case |
 | the arm runs on the shipped path | `segment="layer"` selected at `train.py:155` and the full `grpo_loop` tests run: 41 passed (they were 11 red before the parity fix) |
 | card state before any peak is read | (pending) `nvidia-smi --query-compute-apps=pid,used_memory` returning zero rows, read in the same call as the numbers |
+| the rest of the box, read with the card | (pending) all 8 cards' util and memory. Another team's job took cards 1-5 and 7 to 100% during the arms above, and a same-code run drifted 133.65 → 140.43 s under it. Card 6 itself showed 59% util, 1980 MHz, `clocks_throttle_reasons.active 0x0`, so the coupling is host/PCIe/bandwidth, not thermal. **Row 1 is a time and is not comparable across that boundary**; rows 2-3 are byte counts, which contention does not change, but the allocator's behaviour under a busy host is not something to assume. |
 
 ## Results
 
 | # | measurement | `segment="mlp"` | `segment="layer"` | verdict |
 |---|---|---:|---:|---|
-| 1 | gen 1024, `backward_secs` | 67.77 s | | |
-| 2 | gen 4096, forward peak | 54.038 GiB | | |
-| 3 | gen 4096, does the step fit | no (OOM, 290.00 MiB) | | |
+| 1 | gen 1024, `backward_secs`, paired in one session | | | |
+| 2 | gen 4096, forward peak | | | |
+| 3 | gen 4096, does the step fit | | | |
+
+Both columns of every row are measured in this session. The earlier figures —
+67.77 s backward, 54.038 GiB forward peak, and the 290.00 MiB OOM — are the
+cross-session reference, not the `"mlp"` column: they were taken on a quiet box and
+row 1 is a time.
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
@@ -119,23 +125,33 @@ and the tree+path is not reproducible by checkout.
 The JIT cache at `/work/tilelang_cache` is warm from another session's arms, so
 step 0 here is not a cold number.
 
+**Row 1 needs its own dense control from this session, not the 67.77 s.** All six
+readings in the span below were taken while the box was quiet; the box is now
+running another team's job on 6 of 8 cards, and a same-code arm drifted from a
+133.65 s mean to 140.43 s under it. A `"layer"` reading taken now against a
+`"mlp"` reading taken then would measure the neighbours. So row 1 is a **paired**
+measurement — both arms back to back in one session on one machine state — and the
+67.77 s stays in the table only as the cross-session reference. If the box does not
+quiet down, the pair is still valid and the absolute numbers are not comparable to
+the earlier entries.
+
 ## Decision rule, fixed before the numbers exist
 
-- Row 1 within noise of 67.77 → `"layer"` becomes the default and the `"mlp"` arm
-  is deleted; no two-arm surface survives. **The noise band, stated with its
-  estimator rather than as one number:** two steps of one run with identical code
-  differ by **0.49 s** (68.26 / 67.77); across trees where no change should touch
-  backward, dense readings span **71.53 / 68.26 / 67.77 / 67.31 = 4.22 s**, the
-  last from another session's keep-graphs arm B step 0. The 71.53→67.77 gap was
-  itself argued to be noise in the errors entry (#190 measured at 0.947x), so
-  quoting it as the band is partly circular. Row 1 is judged against the
-  cross-tree span of **±4.6 s**, and a difference under 0.5 s is inside even the
-  same-code spread.
+- Row 1 within noise of the paired `"mlp"` reading → `"layer"` becomes the default
+  and the `"mlp"` arm is deleted; no two-arm surface survives.
 
-  Six dense `backward_secs` readings exist now, from six trees, all H20 card 6 at
-  this recipe: **71.53 / 68.30 / 68.26 / 67.77 / 67.31 / 66.92**, span **4.61 s**.
-  Six points from six trees are a range, not a sample from a distribution, so no
-  confidence interval is computed from them.
+  **The noise band, with its estimator named.** Two steps of one run with identical
+  code differ by **0.49 s** (68.26 / 67.77) — that is the within-run spread and it
+  is what a paired comparison is judged against. Six dense `backward_secs` readings
+  from six trees, all H20 card 6 at this recipe, span **4.61 s**
+  (71.53 / 68.30 / 68.26 / 67.77 / 67.31 / 66.92) — that is the cross-tree spread,
+  and it bounds only cross-session comparisons. The 71.53→67.77 end of it was itself
+  argued to be noise (#190 at 0.947x), so quoting the full span as an error bar
+  partly cites a conclusion as its own evidence. Six points from six trees are a
+  range, not a sample, so no confidence interval is computed from them.
+
+  Since row 1 is paired in one session, the band that applies is the **0.49 s**
+  within-run figure, not the 4.61 s span.
 - Row 1 regresses and row 3 fits → default stays `"mlp"` and the caller picks by
   shape, with the threshold measured on live activation bytes at T **on both
   arms**, not derived from one.
