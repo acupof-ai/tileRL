@@ -80,7 +80,11 @@ With a verify row at 10.7 ms against a 30.9 ms token, depth 3 pays:
 | dialogue | 31.9 | 32.0 | 1.00x |
 | thinking | 32.0 | 30.2 | 0.94x |
 
-52.7 is 82% of the 64 tok/s weight roofline, but counting is near-zero-entropy
+52.7 is 94% of the 56.1 tok/s *dense* weight roofline, and **32-42% of the
+ceiling that applies to a speculative rate** — 2.95 tok/forward means a weight
+bound on forwards permits 126-166 tok/s, so the "82% of 64" this entry first
+carried overstated by 2.95x on top of a retired denominator
+(`errors/2026-09-06-a-spec-rate-over-a-dense-roofline.md`). Counting is also near-zero-entropy
 under greedy decode — coding at 1.33x is the honest headline. A first reading
 of 1.3 tok/s was a warmup artifact in the bench, not the engine
 (`errors/2026-09-01-spec-warmup-one-width.md`), and the depth that gets this is
