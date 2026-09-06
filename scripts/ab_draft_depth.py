@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import pathlib
 import sys
 import time
 from collections import defaultdict
@@ -70,6 +71,26 @@ def _sync() -> None:
     logic here could only be exercised on the pod."""
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def _sha(path: str) -> str:
+    """Short content hash of this file, so a copied probe names itself.
+
+    Content, not `git rev-parse`: the pod tree is not a git repository, and the
+    interesting case is exactly the one where the script came from a different
+    revision than the tree around it.
+    """
+    import hashlib
+
+    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()[:12] + " (content)"
+
+
+def _engine_sha() -> str:
+    """Whatever `pod_sync` stamped for the tree the engine is imported from."""
+    for p in (pathlib.Path(".synced_commit"), pathlib.Path("../.synced_commit")):
+        if p.exists():
+            return p.read_text().strip() or "empty stamp"
+    return "no .synced_commit"
 
 
 def bucket(arch: str, m: float) -> tuple[str, int]:
@@ -344,9 +365,14 @@ def main() -> None:
     # The token cap is a first-class parameter of the result, not a runtime knob: a
     # cap below the natural completion length truncates every row and changes what
     # is being compared, which is how a GSM8K arm read 38.5% against a recorded 85%.
+    # Provenance in the artifact, not only in whatever note quotes it: a probe
+    # copied onto a pod tree at a different revision leaves `.synced_commit`
+    # describing the engine and silently wrong about the script.
+    print(f"# probe {_sha(__file__)}, engine tree {_engine_sha()}, arch {arch}")
     print(f"# ctx={args.ctx}, prompt={args.prompt} x{args.prompts}, "
-          f"max_new_tokens={args.tokens}, ncols gate M>=32. "
-          f"Configured width is depth+1; rungs are {LADDER_WIDTHS}.")
+          f"max_new_tokens={args.tokens}, depths {sorted(DEPTHS)}. "
+          f"Configured width is depth+1; buckets are {arch}'s launch shapes "
+          f"(--check prints the table).")
     rows = {}
     # ONE engine, depth varied in place. A fresh engine per depth OOMs: the KV
     # pool and captured graphs outlive shutdown() (which only joins the daemon
