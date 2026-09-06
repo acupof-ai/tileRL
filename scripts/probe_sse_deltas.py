@@ -36,7 +36,9 @@ def main() -> None:
                     "stream": True,
                 },
             )
-        lines = [ln for ln in r.text.splitlines() if ln.startswith("data:")]
+        # split("\n"), not splitlines(): the writer uses ensure_ascii=False, so \x85,
+        #   and   reach the wire verbatim and splitlines() cuts a payload mid-JSON.
+        lines = [ln for ln in r.text.split("\n") if ln.startswith("data:")]
         payloads = [json.loads(ln[6:]) for ln in lines[:-1]]
         deltas = [
             p["choices"][0]["delta"]["content"]
