@@ -101,6 +101,13 @@ def test_merge_checkpoints_streams_shards_and_records(tmp_path, monkeypatch):
     main()
     m = json.loads(next((tmp_path / "runs").glob("*/manifest.json")).read_text())
     assert m["command"] == "merge" and m["metrics"]["tensors"] == n
+    # `cmd_merge` writes its manifest directly, never through `_finish`, so it defines no
+    # gates -- and `gates_pass([])` is `all([])` = True, which made every merge row read
+    # `pass` over zero checks. The verdict for a finished run with no gates is `none`.
+    from tilerl.ledger import format_run
+
+    assert m["gates"] == [] and m["finished"], m
+    assert format_run(m).split()[3] == "none", format_run(m)
 
 
 if __name__ == "__main__":  # runnable check
