@@ -457,25 +457,31 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         chunk_id = f"chatcmpl-{request_id}"
         yield _sse(_chat_chunk(chunk_id, created, model_name, {"role": "assistant"}))
         completion = 0
-        for kind, payload, completion in _deltas(request_id, max_new, opened, stops):
-            if kind == "error":
-                yield _sse({"error": payload})
-                yield "data: [DONE]\n\n"
-                return
-            if kind == "delta":
-                # Cumulative tokens on every content frame, vLLM's continuous_usage_stats
-                # shape. Without it a live rate gauge can only count frames, and this loop
-                # coalesces ~1.8 tokens into each (measured: 109 frames for 200 tokens on
-                # the 27B), so the page would show roughly half the real rate until the
-                # final usage chunk landed. choices stays populated, so a client that
-                # indexes it is unharmed; the usage-ONLY chunk remains the one with an
-                # empty choices list.
-                chunk = _chat_chunk(chunk_id, created, model_name, payload)
-                if include_usage:
-                    chunk["usage"] = _usage(prompt_tokens, completion)
-                yield _sse(chunk)
-            else:
-                yield _sse(_chat_chunk(chunk_id, created, model_name, {}, finish=payload))
+        try:
+            for kind, payload, completion in _deltas(request_id, max_new, opened, stops):
+                if kind == "error":
+                    yield _sse({"error": payload})
+                    yield "data: [DONE]\n\n"
+                    return
+                if kind == "delta":
+                    # Cumulative tokens on every content frame, vLLM's
+                    # continuous_usage_stats shape. Without it a live rate gauge can only
+                    # count frames, and this loop coalesces ~1.8 tokens into each
+                    # (measured: 109 frames for 200 tokens on the 27B), so the page would
+                    # show roughly half the real rate until the final usage chunk landed.
+                    # choices stays populated, so a client that indexes it is unharmed;
+                    # the usage-ONLY chunk remains the one with an empty choices list.
+                    chunk = _chat_chunk(chunk_id, created, model_name, payload)
+                    if include_usage:
+                        chunk["usage"] = _usage(prompt_tokens, completion)
+                    yield _sse(chunk)
+                else:
+                    yield _sse(_chat_chunk(chunk_id, created, model_name, {},
+                                           finish=payload))
+        except GeneratorExit:
+            # GeneratorExit = the client hung up; engine.cancel, as in ws_chat.
+            engine.cancel(request_id)
+            raise
         # A final usage-only chunk, OpenAI's include_usage shape. Without it a client can
         # only guess the token count from characters, and chars/4 is ~4x low for Chinese
         # (roughly one token per character) -- a fabricated rate on the page's own meter.
@@ -534,9 +540,10 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                     await ws.send_json({"t": "done", "finish_reason": payload,
                                         "usage": _usage(prompt_tokens, completion)})
         except WebSocketDisconnect:
-            # The reader left mid-reply. Close the generator so its poll loop stops rather
-            # than running the request to max_tokens with nobody reading.
+            # gen.close() stops this poll loop; the cancel is what stops the engine,
+            # measured at 1891 tokens and 104 KV blocks after one socket closed.
             gen.close()
+            engine.cancel(request_id)
             return
         await ws.close()
 

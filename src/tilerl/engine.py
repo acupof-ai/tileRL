@@ -1247,14 +1247,17 @@ class Engine:
             req.tokens[:length], req.blocks[: length // BLOCK_TOKENS], snap, spill=spill
         )
 
-    def _finish(self, req: _Req, error: str | None = None) -> None:
-        # Freed here, not at poll, so pool capacity returns immediately.
+    def _release(self, req: _Req) -> None:
+        """Give back the blocks and the slot. Here, not at poll, so capacity returns now."""
         req.phase = _PHASE_DONE
         for b in req.blocks:
             self._kv.free_block(b)
         self._blocks_used -= req.own_blocks
         self._states.free_slot(req.state_slot)
         self._slots_used -= 1
+
+    def _finish(self, req: _Req, error: str | None = None) -> None:
+        self._release(req)
         if error is None:
             self._finished[req.req_id] = req.output
             if req.stop_text is not None:
@@ -1265,6 +1268,26 @@ class Engine:
             self._failed[req.req_id] = error
         self._finished_count += 1
         self._running.remove(req)
+
+    def cancel(self, request_id: int) -> bool:
+        """Drop a request whose reader left; True if it was still in the engine.
+
+        Not `_finish`: that ends with `_running.remove(req)` and raises on a request
+        still waiting, which owns blocks and a slot just the same. `_failed`, not
+        `_finished`, so a later `take()` raises instead of returning the None that
+        already means "not finished yet".
+        """
+        # ponytail: `_failed` grows one entry per abandoned request; TTL sweep if it bites.
+        with self._lock:
+            for queue in (self._running, self._waiting):
+                req = next((r for r in queue if r.req_id == request_id), None)
+                if req is not None:
+                    self._release(req)
+                    self._failed[request_id] = "cancelled: the reader disconnected"
+                    self._finished_count += 1
+                    queue.remove(req)
+                    return True
+            return False
 
     def _loop(self) -> None:
         while not self._wake.is_set():

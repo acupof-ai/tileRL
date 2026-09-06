@@ -1629,3 +1629,84 @@ def test_an_explicit_max_tokens_is_still_honoured(client, model_id, monkeypatch)
                           "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 200, r.text
     assert seen[-1] == 8, seen
+
+
+def test_a_cancel_returns_the_blocks_a_disconnected_reader_was_holding():
+    """A reader that leaves must not cost a whole generation.
+
+    Measured on the live V100 before this existed: a `/ws/chat` socket closed after
+    12 delta frames left the engine generating for ~34 s more -- 1891 tokens and up
+    to 104 KV blocks for nobody -- because `gen.close()` ends `_deltas`' poll loop
+    and nothing told the engine. There was no cancel path at all.
+
+    Both queues, because they fail differently. A RUNNING request is what the V100
+    measured. A WAITING one is the case `_finish` cannot handle: it ends with
+    `_running.remove(req)` and raises on a request that never reached the running
+    set, and a waiting request is not free to drop either -- `submit` allocates its
+    blocks and state slot up front, so the pool only gets them back if cancel frees
+    them from that queue too.
+    """
+    import pytest as _pytest
+
+    from tilerl.engine import SamplingParams
+
+    eng = _build_engine(seed=71)
+    params = SamplingParams(max_new_tokens=64, temperature=0.0, seed=0)
+
+    # --- running arm -------------------------------------------------------
+    rid = eng.submit(list(range(1, 40)), params)
+    for _ in range(4):
+        eng.step()
+    assert any(r.req_id == rid for r in eng._running), "nothing to cancel: never ran"
+    held = eng._blocks_used
+    assert held > 0, "the request holds no blocks; the free assertion below is vacuous"
+
+    assert eng.cancel(rid) is True
+    assert not any(r.req_id == rid for r in eng._running), "cancel left it running"
+    assert eng._blocks_used == 0, f"blocks not returned: {eng._blocks_used} of {held}"
+    assert eng._slots_used == 0, "the state slot was not returned"
+
+    # "not finished yet" and "cancelled" are the same answer unless take() raises.
+    with _pytest.raises(RuntimeError, match="cancelled"):
+        eng.take(rid)
+    assert eng.cancel(rid) is False, "a second cancel claims it dropped something"
+
+    # --- waiting arm: cancel before the request has ever stepped -----------
+    # max_batch=1 at build: StepLimits is frozen, so this is the only way to force
+    # a second request to sit in _waiting.
+    cfg = tiny()
+    one = build_engine(cfg, build_random(cfg, seed=71), get_backend(), num_blocks=256,
+                       num_slots=4, max_batch=1, max_total_tokens=4096)
+    a = one.submit(list(range(1, 40)), params)
+    b = one.submit(list(range(1, 40)), params)
+    one.step()
+    waiting = [r.req_id for r in one._waiting]
+    assert b in waiting, f"b was admitted; the waiting arm is vacuous ({waiting})"
+    before = one._blocks_used
+
+    assert one.cancel(b) is True
+    assert b not in [r.req_id for r in one._waiting], "cancel left it waiting"
+    assert one._blocks_used < before, "a waiting request's blocks were never returned"
+    assert any(r.req_id == a for r in one._running), "cancel took the wrong request"
+
+
+def test_the_routes_cancel_when_the_client_hangs_up():
+    """The engine cancel is only worth having if the routes call it.
+
+    A gate on `Engine.cancel` alone passes while both call sites are missing, which
+    is the state this shipped in: the WS branch closed the generator and the SSE
+    generator did nothing at all.
+    """
+    import inspect
+
+    from tilerl import server
+
+    src = inspect.getsource(server)
+    assert src.count("engine.cancel(request_id)") == 2, (
+        "expected the WebSocketDisconnect branch and the SSE generator's GeneratorExit "
+        f"to cancel; found {src.count('engine.cancel(request_id)')}"
+    )
+    assert "except GeneratorExit:" in src, (
+        "the SSE route needs GeneratorExit: starlette closes the generator when the "
+        "client hangs up, and without it an abandoned SSE stream runs to its cap"
+    )
