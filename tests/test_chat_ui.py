@@ -76,6 +76,37 @@ def test_the_landing_page_js_reads_only_ids_its_markup_defines():
     assert wanted <= present, f"_LANDING's JS reads ids the markup lacks: {wanted - present}"
 
 
+def test_every_colour_token_is_defined_before_a_scheme_redefines_it():
+    """A colour whose ONLY definition sits inside `prefers-color-scheme: dark`
+    renders as nothing in light mode -- and the page still loads, still streams,
+    and still passes every other gate here, so no existing test can see it.
+
+    Checked in three directions on the SHIPPED html:
+    every `var(--x)` resolves to a token the bare `:root` defines; the dark block
+    only redefines tokens the bare block already has; and neither block leaves a
+    token nothing reads (a dead token is a palette drifting out of step with the
+    rules that were supposed to use it).
+    """
+    css = (_STATIC / "index.html").read_text()
+    blocks = re.findall(r":root\s*\{([^}]*)\}", css)
+    assert len(blocks) == 2, f"expected a bare :root and one scheme override, got {len(blocks)}"
+    base = set(re.findall(r"(--[\w-]+)\s*:", blocks[0]))
+    dark = set(re.findall(r"(--[\w-]+)\s*:", blocks[1]))
+    used = set(re.findall(r"var\((--[\w-]+)\)", css))
+
+    assert used <= base, (
+        f"read but never defined in the bare :root: {sorted(used - base)} -- these render "
+        f"as an empty value in light mode, which is the classic unreadable-artifact bug"
+    )
+    assert dark <= base, f"the dark block invents tokens the light one lacks: {sorted(dark - base)}"
+    assert base <= used, f"defined but nothing reads them: {sorted(base - used)}"
+
+    # And the direction ckl actually asked for: no pure white, no pure black.
+    assert not re.search(r"#fff\b|#ffffff\b|#000\b|#000000\b", css, re.I), (
+        "the palette is warm off-white on warm charcoal; a pure #fff or #000 slipped in"
+    )
+
+
 def test_the_bundle_and_the_markup_agree_on_every_id():
     """The bundle's `$` throws on a missing id rather than returning null, so one
     stale id is a blank page.
@@ -319,8 +350,12 @@ def test_the_websocket_protocol_library_is_installed():
     )
 
 
-def _page_after(frames: list[str]) -> dict:
-    """Run the shipped bundle over `frames`; return what landed in the DOM."""
+def _page_after(frames: list[str], budget: str = "") -> dict:
+    """Run the shipped bundle over `frames`; return what landed in the DOM.
+
+    ``budget`` is what the user typed in the budget box; "" is the shipped default
+    (an empty box), which is what makes the ask omit ``max_tokens``.
+    """
     node = shutil.which("node")
     if node is None:
         pytest.skip("node not available; the page's reader cannot be executed")
@@ -339,6 +374,7 @@ def _page_after(frames: list[str]) -> dict:
         + "".join(f'IDS["{i}"] = mk("div");\n' for i in ids)
         + "".join(f'IDS["{i}"].checked = true;\n' for i in sorted(checked))
         + "".join(f'IDS["{i}"].value = {v!r};\n'.replace("'", '"') for i, v in values.items())
+        + f'IDS["budget"].value = {budget!r};\n'.replace("'", '"')
         + _bundle()
         + textwrap.dedent("""
         IDS.composer.value = "page";
@@ -364,6 +400,32 @@ def _page_after(frames: list[str]) -> dict:
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, f"the page threw on the server's frames: {r.stderr.strip()[:800]}"
     return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def test_an_empty_budget_box_sends_no_max_tokens_at_all():
+    """Empty means "as much as fits", and OMITTING the field is the mechanism.
+
+    The server reads absent/None as the context remainder
+    (`min(max_total_tokens - prompt, 16*usable_blocks - prompt - width + 1)`), so a
+    page that keeps sending its own 512 gets 512 and the change does nothing. A `0`
+    or `""` is not the same thing either -- it serializes to `max_tokens: 0` and
+    trips the `ge=1` validator.
+
+    Two arms against the BUILT bundle: empty omits the key entirely, and a typed
+    number still arrives verbatim. The second is the control -- an "omit always"
+    regression passes the first arm alone.
+    """
+    empty = _page_after(_ws_frames(["ok"], max_tokens=16))["sent"]
+    assert "max_tokens" not in empty, (
+        f"the page sent max_tokens={empty.get('max_tokens')!r} with an empty box; the "
+        f"server would use that instead of the context remainder"
+    )
+    assert empty["messages"], "the ask lost its messages while losing max_tokens"
+
+    typed = _page_after(_ws_frames(["ok"], max_tokens=16), budget="128")["sent"]
+    assert typed.get("max_tokens") == 128, (
+        f"a typed budget must reach the server verbatim, got {typed.get('max_tokens')!r}"
+    )
 
 
 def test_the_page_renders_the_frames_this_server_sends():
