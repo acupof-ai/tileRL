@@ -28,7 +28,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .messages import _parse_tool_calls, mount_messages
 from .prompt import (
@@ -38,6 +38,7 @@ from .prompt import (
     sampling,
     split_think,
     stop_texts,
+    unknown_fields,
 )
 from .responses import mount_responses
 from .tokenizer import ByteTokenizer, Tokenizer, get_tokenizer  # noqa: F401
@@ -84,7 +85,8 @@ class ChatCompletionRequest(BaseModel):
     #: `finish_reason` is "stop" and the sequence is cut from the returned text.
     stop: str | list[str] | None = None
 
-    model_config = {"populate_by_name": True}
+    # One assignment: a second would replace this config, not merge into it.
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
 
 
 #: reasoning_effort -> cap on <think> tokens; "none" switches thinking off in the prompt.
@@ -197,6 +199,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             thinking = (len(tokenizer.encode("<think>")) == 1 or None) if cap != 0 else False
         # We render tools into the prompt and cannot force or forbid a call, so a
         # tool_choice stronger than a hint is refused rather than echoed.
+        unknown_fields(req)  # warns; this route has no recorder, so the warn is all there is
         refuse_unsupported(tool_choice=_unsupported_choice(req.tool_choice))
         tools = _flatten_tools(req.tools)
         input_ids = tokenizer.encode(_render_chat(

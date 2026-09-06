@@ -34,6 +34,8 @@ export TMPDIR=$ROOT/pytmp TMP=$ROOT/pytmp TEMP=$ROOT/pytmp
 export PYTHONPATH=$REPO/src:$REPO/packages/tilerl-kernels/src
 CKPT=$ROOT/models/Qwen3.8-27B-NVFP4
 export TILERL_QWEN38_SOURCE=$CKPT
+# Named explicitly: the default is relative to cwd, so the row's location varied.
+export TILERL_MESSAGES_RECORD=$ROOT/messages_requests.jsonl
 
 # Without this, TERM to the supervisor left python holding 23 GiB of the card with
 # nothing supervising it -- measured, it needed a second kill by pid.

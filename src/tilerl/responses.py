@@ -32,14 +32,24 @@ from typing import Any
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .messages import _parse_tool_calls
-from .prompt import cut_at_stop, refuse_unsupported, render_prompt, sampling, split_think
+from .prompt import (
+    cut_at_stop,
+    refuse_unsupported,
+    render_prompt,
+    sampling,
+    split_think,
+    unknown_fields,
+)
 from .tokenizer import Tokenizer
 
 
 class ResponsesRequest(BaseModel):
+    #: See MessagesRequest: undeclared fields are kept so `unknown_fields` can see them.
+    model_config = ConfigDict(extra="allow")
+
     model: str | None = None
     #: A bare string or the typed item list; both are documented, and an agent
     #: loop sends the list because that is how it replays its own history.
@@ -153,6 +163,7 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         return len(tokenizer.encode("<think>")) == 1 or None
 
     def _run(req: ResponsesRequest) -> dict[str, Any]:
+        unknown_fields(req)  # warns; no recorder on this route either
         refuse_unsupported(
             previous_response_id=req.previous_response_id,
             include=req.include,
