@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
-import subprocess
 
 os.environ.setdefault("TILERL_TARGET", "cpu")
 
@@ -461,30 +459,17 @@ def test_both_api_paths_wait_the_same_wall_clock_for_one_completion():
     )
 
 
-def test_the_chat_page_reads_the_stream_this_server_sends(client, model_id):
-    """The server's own SSE bytes, through the chat page's own reader.
+def test_the_sse_stream_keeps_the_shape_a_reader_has_to_handle(client, model_id):
+    """Two properties of the real stream a careless reader dies on.
 
-    Every other gate holds one side still: the SSE tests here assert on bytes no page
-    reads, and `tests/test_chat_ui.py` feeds the page frames no server wrote. So a
-    change to the frame shape breaks the UI silently -- and the UI shipped broken twice
-    on 2026-09-04 in the other direction, with the server correct throughout.
-
-    Two properties of the real stream a careless reader dies on: the FIRST frame carries
-    `{"role": "assistant"}` and no content, and the usage chunk carries no `choices` at
-    all. Feeding the bytes whole and then one byte at a time also pins that frame
-    boundaries do not depend on how the transport split them.
-
-    Scope, measured by mutation: this catches a first frame that starts carrying content
-    (CAUGHT) and a reader that stops buffering partial frames (CAUGHT). It does NOT catch
-    usage becoming unconditional, because it always opts in --
-    `test_usage_in_the_stream_is_opt_in_and_counts_tokens_not_characters` owns that half
-    and was verified to fail on it.
+    The FIRST frame carries `{"role": "assistant"}` and no content, and the usage chunk
+    carries no `choices` at all -- a reader that indexes `choices[0].delta` on every
+    frame throws on it. This used to run the chat page's own SSE reader over these
+    bytes, which is the right shape of gate and no longer the right pairing: the page
+    speaks WebSocket now, and `tests/test_chat_ui.py` closes that loop against the
+    frames `/ws/chat` emits. What is left here is the wire contract itself, which the
+    SDK clients in `test_api_sdk.py` depend on.
     """
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node not available; the page's reader cannot be executed")
-    from tilerl.ui_assets import _CHAT_UI
-
     resp = client.post("/v1/chat/completions", json={
         "model": model_id, "messages": [{"role": "user", "content": "hi"}],
         "max_tokens": 8, "temperature": 0.0, "seed": 11,
@@ -493,69 +478,38 @@ def test_the_chat_page_reads_the_stream_this_server_sends(client, model_id):
     assert resp.status_code == 200, resp.text[:200]
     sse = resp.text
     assert "[DONE]" in sse and '"usage"' in sse, "the fixture is not a complete stream"
+    frames = [json.loads(ln[6:]) for ln in sse.splitlines()
+              if ln.startswith("data: ") and ln[6:] != "[DONE]"]
+    assert len(frames) > 1, f"the stream yielded nothing usable: {frames}"
 
-    js = _CHAT_UI.split("<script>", 1)[1].split("</script>", 1)[0]
-    reader = js[js.index("async function readSSE") : js.index("\nasync function sendChat")]
-    harness = reader + (
-        "\nconst SSE = " + json.dumps(sse) + ";\n"
-        "const enc = new TextEncoder();\n"
-        "async function drive(parts) {\n"
-        "  const frames = [], q = [...parts];\n"
-        "  const resp = { body: { getReader: () => ({ read: async () =>\n"
-        "    q.length ? {value: enc.encode(q.shift()), done: false} : {done: true} }) } };\n"
-        "  await readSSE(resp, (o) => frames.push(o));\n"
-        "  return frames;\n"
-        "}\n"
-        "const whole = await drive([SSE]), bytewise = await drive([...SSE]);\n"
-        # `choices` is present but EMPTY on the usage frame, so `choices[0].delta` throws.
-        # Optional chaining here for the same reason the page uses it: this harness made
-        # the exact mistake the test exists to catch.
-        "const hasText = (o) => !!o.choices?.[0]?.delta?.content;\n"
-        "console.log(JSON.stringify({\n"
-        "  whole: whole.length, bytewise: bytewise.length,\n"
-        "  content: whole.filter(hasText).length,\n"
-        "  firstHasContent: hasText(whole[0]),\n"
-        "  emptyChoices: whole.filter((o) => Array.isArray(o.choices) && !o.choices.length).length,\n"
-        "  usage: whole.filter((o) => o.usage).length,\n"
-        "  finalUsage: whole.filter((o) => o.usage && !o.choices?.length).length,\n"
-        "  counts: whole.filter((o) => o.usage).map((o) => o.usage.completion_tokens),\n"
-        "}));\n"
-    )
-    out = subprocess.run([node, "--input-type=module", "-e", harness],
-                         capture_output=True, text=True, timeout=60)
-    assert out.returncode == 0, f"the page's reader threw on real bytes: {out.stderr[:500]}"
-    got = json.loads(out.stdout.strip().splitlines()[-1])
-    assert got["whole"] > 1, f"the reader yielded nothing usable: {got}"
-    assert got["whole"] == got["bytewise"], (
-        f"frame count depends on chunk boundaries ({got['whole']} vs {got['bytewise']}): "
-        f"the reader does not buffer partial frames"
-    )
-    assert got["content"] >= 1, f"no content frame survived the reader: {got}"
-    assert not got["firstHasContent"], (
+    def has_text(f):
+        ch = f.get("choices") or [{}]
+        return bool(ch[0].get("delta", {}).get("content"))
+
+    assert not has_text(frames[0]), (
         "this server's first frame now carries content, so the assertion no longer "
         "exercises the role-only frame a real reply starts with"
     )
-    assert got["emptyChoices"] == 1, (
+    empty_choices = [f for f in frames if isinstance(f.get("choices"), list)
+                     and not f["choices"]]
+    assert len(empty_choices) == 1, (
         f"exactly one frame must carry an empty choices list -- the usage chunk. Got "
-        f"{got['emptyChoices']}. A reader indexing choices[0] unconditionally dies on it, "
-        f"which this test's own harness did before optional chaining: {got}"
+        f"{len(empty_choices)}. A reader indexing choices[0] unconditionally dies on it."
     )
-    assert got["finalUsage"] == 1, f"the final usage-only chunk did not arrive once: {got}"
-    # Content frames carry cumulative usage so the page's live gauge reads tokens rather
-    # than frames -- this server coalesces ~1.8 tokens into each frame on the 27B
-    # (measured: 109 frames for 200 tokens), so a frame-counting gauge reads ~1.8x low.
-    # The count is per-CONTENT-frame, and the tiny model finishes inside one poll, so
-    # this fixture legitimately has a single content frame: the invariant that holds for
-    # both is "every content frame carries a count, and the counts never go backwards",
-    # not "there are several".
-    counts = got["counts"]
-    assert len(counts) == got["content"] + 1, (
-        f"{len(counts)} frames carried usage but there are {got['content']} content frames "
-        f"plus one final chunk: a content frame without a count leaves the live gauge "
-        f"counting frames for that stretch: {got}"
+    assert empty_choices[0].get("usage"), "the final usage-only chunk did not arrive"
+    # Content frames carry cumulative usage so a live gauge reads tokens rather than
+    # frames -- this server coalesces ~1.8 tokens into each frame on the 27B (measured:
+    # 109 frames for 200 tokens), so a frame-counting gauge reads ~1.8x low. The tiny
+    # model finishes inside one poll, so this fixture legitimately has a single content
+    # frame: the invariant is "every content frame carries a count, and the counts never
+    # go backwards", not "there are several".
+    counts = [f["usage"]["completion_tokens"] for f in frames if f.get("usage")]
+    assert len(counts) == sum(map(has_text, frames)) + 1, (
+        f"{len(counts)} frames carried usage but there are {sum(map(has_text, frames))} "
+        f"content frames plus one final chunk: a content frame without a count leaves "
+        f"the live gauge counting frames for that stretch"
     )
     assert counts == sorted(counts), f"cumulative token counts went backwards: {counts}"
-
 
 class _SplitlinesTokenizer(_ByteTokenizer):
     """Decodes a fixed text containing the three characters `splitlines()` cuts on and
