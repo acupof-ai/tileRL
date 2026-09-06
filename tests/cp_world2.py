@@ -57,6 +57,11 @@ def _rank(r: int, world: int, slice_bwd: bool, seq_mask: bool, out: dict) -> Non
     backend = RefBackend()
     mesh = Mesh(cp=world, rank=r)
     backend.init_tp(world, r, cp_groups=[mesh.cp_group()])
+    # this op gate never reaches `_add_via`, so only the assertion sees a stray tp_world
+    assert backend.tp_world == 1 and backend.tp_rank == 0, (
+        f"cp-only mesh set tp_world={backend.tp_world}: the residual add will "
+        f"all-reduce across the CP ranks"
+    )
 
     q_all, k_all, v_all, g_all = _inputs()
     pos = zigzag_positions(T, world, backend.cp_rank)
