@@ -85,6 +85,59 @@ def test_opd_refuses_a_cached_engine_with_no_adapters_too():
         opd_loop(cached, model, [[1, 2, 3]], 1, RefBackend(), trainable=None)
 
 
+def test_the_cached_cast_keeps_its_address_across_an_optimizer_step():
+    """`_const_f32`'s buffer must survive a `_version` bump at the same address.
+
+    A captured CUDA graph bakes the ADDRESS of every tensor its kernels read.
+    `AdamW.step_one` ends `p.copy_(...)`, which is in place — the parameter's
+    address never moves, so on that count a replay would read the new weights.
+    The cast was the thing that moved: `copy_` bumps `t._version`, the cache
+    missed, and `self._dev(t, dtype)` allocated the converted copy somewhere new.
+    That is what `engine.py`'s `# ponytail: no recapture after training — the
+    graph bakes the f32 embed cast` names, and it is 27 call sites, not one.
+
+    Four arms, because the refill is guarded and an unguarded arm is the one
+    production takes: the address holds, the values are those of a fresh cast,
+    and a `pad_to` or `dtype` change must still allocate rather than write into a
+    buffer of the wrong shape.
+    """
+    from tilerl_kernels.backend import get_backend
+
+    b = get_backend()
+    p = torch.randn(8, 4, dtype=torch.bfloat16, device=b.device)
+
+    first = b._const_f32(p)
+    addr = first.data_ptr()
+    assert first.dtype == torch.float32, "nothing was cast; pick a dtype that converts"
+
+    p.copy_(torch.randn(8, 4, dtype=torch.bfloat16, device=b.device))  # the optimizer
+    second = b._const_f32(p)
+    assert second.data_ptr() == addr, (
+        "the cached cast moved across an optimizer step: a captured graph baked "
+        f"{addr:#x} and would replay stale bytes"
+    )
+    # Address stability is worthless if the buffer kept the OLD values.
+    assert torch.equal(second, p.to(torch.float32)), "the refill did not land"
+
+    # Guard arm 1: a different pad_to is a different cache key, so it must allocate
+    # rather than write into the unpadded buffer. 1-D because that is what the call
+    # sites pass -- `pad_to` compares shape[0] but F.pad fills the LAST dim, so the
+    # two agree only for a vector (every real caller passes a per-row scale).
+    v = torch.randn(8, dtype=torch.bfloat16, device=b.device)
+    plain = b._const_f32(v)
+    padded = b._const_f32(v, pad_to=12)
+    assert padded.shape[0] == 12 and padded.data_ptr() != plain.data_ptr()
+    assert torch.equal(padded[:8], v.to(torch.float32))
+    assert torch.equal(padded[8:], torch.zeros_like(padded[8:]))
+
+    # Guard arm 2: a different dtype likewise, and the f32 entry keeps its own
+    # address afterwards -- the refill must not be confused by a neighbouring key.
+    p.copy_(torch.randn(8, 4, dtype=torch.bfloat16, device=b.device))
+    half = b._const_f32(p, dtype=torch.float16)
+    assert half.dtype == torch.float16 and half.data_ptr() != addr
+    assert b._const_f32(p).data_ptr() == addr, "the f32 entry lost its address"
+
+
 def test_kernel_io_is_keyed_on_arch_not_on_being_cuda():
     """No dtype decision in backend.py may read `target.startswith("cuda")`.
 
