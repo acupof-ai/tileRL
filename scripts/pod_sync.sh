@@ -28,7 +28,8 @@ POD_ENV+=" TILERL_TARGET=cuda"
 # runs/ is exempt: the pod is not a git repo, and since 8388cbf a run writes its
 # manifest before the eval arms, so a killed run leaves the one copy that exists.
 # Not `-path ./runs -prune -o -delete` -- `-delete` implies `-depth`, which disables
-# `-prune`, so that spelling deletes runs/ while reading as if it protects it
+# `-prune`. GNU find refuses that outright (rc=1, nothing deleted); BSD find accepts it
+# and deletes runs/ silently, so it reads as protection on a Mac
 # (errors/2026-09-06-the-oom-was-micro-zero.md).
 wipe="find . -mindepth 1 \\! -path './runs' \\! -path './runs/*' -delete"
 inner="cat > /tmp/tilerl-sync.tgz && mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && $wipe && tar xzf /tmp/tilerl-sync.tgz && $POD_ENV${1:+ && $1}"

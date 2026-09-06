@@ -42,7 +42,15 @@ def test_the_bare_wipe_deletes_runs(tmp_path):
     assert not kept and not other
 
 
-def test_prune_does_not_protect_runs(tmp_path):
-    # the spelling this test exists to keep out of the script
-    kept, _ = _run("find . -mindepth 1 -path ./runs -prune -o -delete", tmp_path / "c")
-    assert not kept
+def test_prune_is_not_a_working_exemption(tmp_path):
+    """The spelling this test exists to keep out of the script — on either find.
+
+    The two implementations diverge, and only one of them is loud about it. GNU find
+    (the pod, ubuntu CI) refuses: rc=1, nothing deleted, and it prints "the -delete
+    action automatically turns on -depth, but -prune does nothing when -depth is in
+    effect". BSD find (macOS) takes it and deletes runs/ anyway. So the assertion has
+    to be "this does not wipe the checkout while keeping runs/", which is true both
+    ways, rather than "runs/ is deleted", which is BSD-only.
+    """
+    kept, other = _run("find . -mindepth 1 -path ./runs -prune -o -delete", tmp_path / "c")
+    assert not (kept and not other), "-prune became a working exemption; re-check the script"

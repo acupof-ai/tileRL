@@ -78,17 +78,29 @@ look worse, which is the one direction that does not get re-checked.
 preserve. The next killed run is the one that loses its manifest, and any peer's sync
 does it.
 
-Measured, in a temp tree and again through the pod's own `find`:
+Measured per implementation, because **the two `find`s do not agree and I first
+published the table as if they did**:
 
-| wipe spelling | `runs/` | everything else |
+| wipe spelling | GNU 4.9.0 (pod, ubuntu CI) | BSD (macOS) |
 |---|---|---|
-| `find . -mindepth 1 -delete` (current, control) | **GONE** | gone |
-| `-path ./runs -prune -o -delete` | **GONE** | gone |
-| `! -path ./runs ! -path './runs/*' -delete` | **KEPT** | gone |
+| `find . -mindepth 1 -delete` (current, control) | `runs/` **GONE** | `runs/` **GONE** |
+| `-path ./runs -prune -o -delete` | **refuses**, rc=1, deletes nothing | `runs/` **GONE**, rc=0, silent |
+| `! -path './runs' ! -path './runs/*' -delete` | **KEPT**, rest gone | **KEPT**, rest gone |
 
-The `-prune` spelling silently fails because **`-delete` implies `-depth`, which
-disables `-prune`**. The control arm going red is what makes the third row mean
-something.
+Row 3 — the shipped spelling — is the same on both, which is what the fix needed.
+Row 2 is where they diverge: **`-delete` implies `-depth`, which disables `-prune`**,
+and GNU says so in its own words (`the -delete action automatically turns on -depth,
+but -prune does nothing when -depth is in effect`) and exits 1 without deleting, while
+BSD accepts the expression and deletes `runs/` with no complaint.
+
+**My first table reported the BSD consequence as the mechanism's consequence**, on a
+line that also claimed the pod's `find` had confirmed it. Two errors in one row: I ran
+the Mac probe through a shell function that resolves to `bfs`, not `find` at all, and
+the arm I did run on the pod was the shipped spelling, never the `-prune` one. The
+ubuntu CI leg of my own PR is what caught it — `test_prune_does_not_protect_runs`
+asserted `runs/` was deleted, which is false on GNU. The test now asserts what holds on
+both: `-prune` never yields a working exemption. The mechanism claim stands; the claim
+that it silently deletes does not, off macOS.
 
 Not a risk, checked: `pod_sync.sh:12`'s rescue is not a file copy that could flatten
 a tree. `baseline.py pull` `cat`s one remote JSON and merges its keys into the local
