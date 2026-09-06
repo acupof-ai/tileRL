@@ -2,7 +2,7 @@
 sglang's offline Engine — same prompts, one greedy token, letter scored.
 Saves per-question predictions so two engines can be diffed.
 
-  python scripts/mmlu.py --engine tilerl --source /data00/Qwen3.8-27B-NVFP4 --gpu 7 --n 1000
+  python scripts/mmlu.py --engine tilerl --source /work/Qwen3.8-27B-NVFP4 --gpu 7 --n 1000
   PYTHONPATH=/work/sgl-src/python python scripts/mmlu.py --engine sglang --source /work/Qwen3.8-27B-bf16 --gpu 7 --n 1000
 """
 

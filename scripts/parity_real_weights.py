@@ -6,7 +6,7 @@ checkpoint and checks each projection — isolates whether the kernel is wrong o
 weights (layout/scale) or the bug is upstream (fuse, gated-delta, engine).
 
   PATH=/usr/local/cuda-12.4/bin:$PATH TILELANG_CACHE_DIR=/tmp/tl_sm70f16 \
-    TILERL_TARGET=cuda TILERL_QWEN38_SOURCE=/data00/.../Qwen3.8-27B-NVFP4 \
+    TILERL_TARGET=cuda TILERL_QWEN38_SOURCE=/work/Qwen3.8-27B-NVFP4 \
     PYTHONPATH=packages/tilerl-kernels/src:src CUDA_VISIBLE_DEVICES=0 \
     python3 scripts/parity_real_weights.py
 """

@@ -2,7 +2,7 @@
   default: a mid-sequence multi-token forward vs token-by-token decode.
   --loop:  the block loop (snapshot / verify / roll back / re-absorb) with an
            always-right or always-wrong draft; committed tokens must equal greedy.
-  python scripts/parity_chunk_vs_decode.py /data00/Qwen3.8-27B-NVFP4 --gpu 7
+  python scripts/parity_chunk_vs_decode.py /work/Qwen3.8-27B-NVFP4 --gpu 7
 """
 
 from __future__ import annotations

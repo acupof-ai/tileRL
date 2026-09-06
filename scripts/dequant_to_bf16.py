@@ -1,6 +1,6 @@
 """Dequantize the NVFP4/FP8 checkpoint to a plain bf16 HF checkpoint (~54 GB)
 so sglang, which has no w4a4 NVFP4 path on Hopper, can run the same model.
-  python scripts/dequant_to_bf16.py /data00/Qwen3.8-27B-NVFP4 /work/Qwen3.8-27B-bf16
+  python scripts/dequant_to_bf16.py /work/Qwen3.8-27B-NVFP4 /work/Qwen3.8-27B-bf16
 """
 
 from __future__ import annotations

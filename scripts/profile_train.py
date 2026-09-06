@@ -1,6 +1,6 @@
 """Per-kernel GPU time in one train_step (forward + tape backward).
 
-  python scripts/profile_train.py /data00/Qwen3.8-27B-NVFP4 --gpu 7 --len 64
+  python scripts/profile_train.py /work/Qwen3.8-27B-NVFP4 --gpu 7 --len 64
 """
 
 from __future__ import annotations

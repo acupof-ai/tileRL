@@ -1,8 +1,8 @@
 """Where do the ~11 ms of a one-layer draft step go? Times each stage of DraftHead.forward.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
-    TILERL_TARGET=cuda python3 scripts/probe_draft_step.py /data00/Qwen3.8-27B-NVFP4 \
-        --draft /data00/Qwen3.8-27B-NVFP4/model_mtp.safetensors --batches 1,8
+    TILERL_TARGET=cuda python3 scripts/probe_draft_step.py /work/Qwen3.8-27B-NVFP4 \
+        --draft /work/Qwen3.8-27B-NVFP4/model_mtp.safetensors --batches 1,8
 """
 
 from __future__ import annotations

@@ -3,7 +3,7 @@ the last-token residual delta between two prompts. The first sublayer whose
 delta cosine reaches ~1.0 is where the prompt stops mattering (a norm/finite
 check cannot see two streams silently converging). Exit 0 if cos < 0.99 throughout.
   PYTHONPATH=src TILERL_TARGET=cuda python3 -u scripts/health_probe.py \
-      /data00/Qwen3.8-27B-NVFP4 --gpu 7 [--tokens 256]   (no source = tiny smoke)
+      /work/Qwen3.8-27B-NVFP4 --gpu 7 [--tokens 256]   (no source = tiny smoke)
 """
 
 from __future__ import annotations

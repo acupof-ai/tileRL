@@ -1,6 +1,6 @@
 """HF transformers ground truth: per-layer last-token hidden + logits for
 'The capital of France is', saved to /work/hf_ref.pt for hf_bisect.py.
-  python3 -u scripts/hf_reference.py /data00/Qwen3.8-27B-NVFP4 --gpu 6
+  python3 -u scripts/hf_reference.py /work/Qwen3.8-27B-NVFP4 --gpu 6
 """
 
 from __future__ import annotations

@@ -2,7 +2,7 @@
 
 C4 isn't cached on the pod; wikitext-103-raw-v1 test is the standard substitute.
 
-  python3 scripts/bench_c4_ppl.py --source /data00/Qwen3.8-27B-NVFP4 --gpu 7 --n 50
+  python3 scripts/bench_c4_ppl.py --source /work/Qwen3.8-27B-NVFP4 --gpu 7 --n 50
 """
 
 from __future__ import annotations

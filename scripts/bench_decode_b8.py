@@ -6,7 +6,7 @@ tok/s (total tokens / wall) plus per-request correctness. The weight read is
 amortized across 8 rows, so aggregate t/s should exceed B=1.
 
   PATH=/usr/local/cuda-12.4/bin:$PATH TILELANG_CACHE_DIR=/tmp/tl_sm70f16 \
-    TILERL_TARGET=cuda TILERL_QWEN38_SOURCE=/data00/.../Qwen3.8-27B-NVFP4 \
+    TILERL_TARGET=cuda TILERL_QWEN38_SOURCE=/work/Qwen3.8-27B-NVFP4 \
     PYTHONPATH=packages/tilerl-kernels/src:src CUDA_VISIBLE_DEVICES=0 \
     python3 scripts/bench_decode_b8.py
 """

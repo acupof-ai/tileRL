@@ -11,7 +11,7 @@
 GPUs 0-5 are the user's training run: the script pins one of 6/7 before torch initializes,
 refuses a busy GPU, and asserts torch sees one device. ``--selftest`` runs a CPU tiny model.
 
-    PYTHONPATH=src python3 scripts/verify_h20_fp4.py /data00/Qwen3.8-27B-NVFP4
+    PYTHONPATH=src python3 scripts/verify_h20_fp4.py /work/Qwen3.8-27B-NVFP4
 """
 
 from __future__ import annotations
@@ -758,7 +758,7 @@ def _print_rope_tie(source: str) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("source", nargs="?", default="/data00/Qwen3.8-27B-NVFP4")
+    p.add_argument("source", nargs="?", default="/work/Qwen3.8-27B-NVFP4")
     p.add_argument("--gpu", type=int, default=OURS[-1], help=f"physical GPU; only {list(OURS)} allowed")
     p.add_argument("--max-util", type=int, default=10, help="refuse to start above this GPU util %%")
     p.add_argument("--max-used-mib", type=int, default=256, help="refuse to start above this resident MiB")

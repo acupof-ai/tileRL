@@ -3,7 +3,7 @@ LoRA peaks fit 0.055 GiB/token with a ~28.6 GiB intercept that does not scale wi
 finds it.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src \
-    TILERL_TARGET=cuda python3 scripts/probe_train_ledger.py /data00/Qwen3.8-27B-NVFP4
+    TILERL_TARGET=cuda python3 scripts/probe_train_ledger.py /work/Qwen3.8-27B-NVFP4
 """
 
 from __future__ import annotations
