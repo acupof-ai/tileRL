@@ -404,7 +404,8 @@ def dense_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float,
     q_pos: torch.Tensor | None = None, k_pos: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Causal GQA attention (training path). q [B,Tq,Hq,D], k/v [B,Tk,Hkv,D] -> [B,Tq,Hq,D]."""
+    """Causal GQA attention, materializing [B,H,Tq,Tk]. The PARITY ORACLE for
+    :func:`chunked_attention`, which is what the training path calls."""
     q = _f32(q)
     k = _f32(k)
     v = _f32(v)
@@ -454,6 +455,148 @@ def dense_attention_bwd(
         gv = gve.reshape(b, tk, hkv, group, d).sum(3)
     else:
         gk, gv = gke, gve
+    return gq, gk, gv
+
+
+#: Q/K tile of the chunked attention pair. ponytail: untuned on CPU (this is the
+#: correctness harness); the sm90 cell measures C against its tile shape.
+_ATTN_CHUNK = 64
+
+
+def _attn_positions(
+    q: torch.Tensor, k: torch.Tensor, q_pos: torch.Tensor | None, k_pos: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Absolute positions, read once instead of per chunk. See :func:`_causal_mask`."""
+    qp = torch.arange(q.shape[1], device=q.device) if q_pos is None else q_pos.to(q.device)
+    kp = torch.arange(k.shape[1], device=q.device) if k_pos is None else k_pos.to(q.device)
+    return qp, kp
+
+
+def _chunk_scores(
+    qc: torch.Tensor, kc: torch.Tensor, qp: torch.Tensor, kp: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """Masked scores for one tile pair. ``qc`` [B,cq,Hkv,G,D], ``kc`` [B,ck,Hkv,D].
+
+    ``G`` stays its own axis, so K/V are never expanded to Hq and the key grads
+    accumulate straight into [B,Tk,Hkv,D] -- the dense path's expand-then-fold
+    costs Hq/Hkv times the memory this function exists to avoid.
+    """
+    s = torch.einsum("bqhgd,bkhd->bhgqk", qc, kc) * scale
+    return s.masked_fill(kp[None, :] > qp[:, None], float("-inf"))
+
+
+def _online_softmax(
+    qc: torch.Tensor, k: torch.Tensor, v: torch.Tensor, qp: torch.Tensor, kp: torch.Tensor,
+    scale: float, js: list[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stream the K/V tiles in ``js`` into (acc, m, l) for one Q tile."""
+    b, cq, hkv, g, d = qc.shape
+    acc = qc.new_zeros(b, hkv, g, cq, d)
+    m = qc.new_full((b, hkv, g, cq), float("-inf"))
+    l = qc.new_zeros(b, hkv, g, cq)
+    for j in js:
+        s = _chunk_scores(qc, k[:, j:j + _ATTN_CHUNK], qp, kp[j:j + _ATTN_CHUNK], scale)
+        mn = torch.maximum(m, s.amax(-1))
+        # a wholly-masked tile gives -inf - -inf = nan; reachable under CP zigzag,
+        # where the first Q chunk can precede an entire gathered K chunk. Not
+        # in-place: the gradcheck harness runs this forward under torch.autograd.
+        r = torch.nan_to_num(torch.exp(m - mn), 0.0)
+        p = torch.nan_to_num(torch.exp(s - mn[..., None]), 0.0)
+        acc = acc * r[..., None] + torch.einsum(
+            "bhgqk,bkhd->bhgqd", p, v[:, j:j + _ATTN_CHUNK]
+        )
+        l = l * r + p.sum(-1)
+        m = mn
+    return acc, m, l
+
+
+def _tile_reach(qp: torch.Tensor, kp: torch.Tensor) -> list[list[int]]:
+    """Per Q tile, the K tiles it can see. The causal saving, and the reason
+    ``k_pos`` cannot be assumed contiguous: under zigzag the gathered keys arrive
+    in rank order.
+
+    One host sync for the whole layer, not one per tile pair: `int()` on a device
+    tensor is a sync, and `test_train_step_does_not_sync_per_parameter` counts
+    them. The tile mins/maxes are reduced on device first, then read once.
+    """
+    qh = torch.stack([t.max() for t in qp.split(_ATTN_CHUNK)])
+    kl = torch.stack([t.min() for t in kp.split(_ATTN_CHUNK)])
+    return (kl[None, :] <= qh[:, None]).tolist()
+
+
+def _tiles(row: list[bool]) -> list[int]:
+    """K-tile start offsets from one row of :func:`_tile_reach`."""
+    return [n * _ATTN_CHUNK for n, live in enumerate(row) if live]
+
+
+def chunked_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float,
+    q_pos: torch.Tensor | None = None, k_pos: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """:func:`dense_attention` without the [B,H,T,T] score matrix.
+
+    Same signature and result; the scores live one [C,C] tile at a time. Dense
+    peaked at 3x that matrix in forward and 6x in backward (the tape saves q/k/v,
+    not ``att``, so layers do not accumulate) -- 10.2 GiB at T=4352, H=24, which
+    is the largest allocation in a training step and the only one quadratic in T.
+    """
+    q, k, v = _f32(q), _f32(k), _f32(v)
+    b, tq, hq, d = q.shape
+    hkv = k.shape[2]
+    g = hq // hkv
+    qp, kp = _attn_positions(q, k, q_pos, k_pos)
+    reach = _tile_reach(qp, kp)
+    out = q.new_empty(b, tq, hq, d)
+    for n, i in enumerate(range(0, tq, _ATTN_CHUNK)):
+        sl = slice(i, i + _ATTN_CHUNK)
+        qc = q[:, sl].reshape(b, -1, hkv, g, d)
+        acc, _, l = _online_softmax(qc, k, v, qp[sl], kp, scale, _tiles(reach[n]))
+        out[:, sl] = (acc / l[..., None]).permute(0, 3, 1, 2, 4).reshape(b, -1, hq, d)
+    return out
+
+
+def chunked_attention_bwd(
+    grad: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float,
+    q_pos: torch.Tensor | None = None, k_pos: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward of :func:`chunked_attention`, two passes and no stored statistics.
+
+    Pass 1 is the forward's online softmax kept for ``m``/``l``/``O`` only; pass 2
+    recomputes each tile's scores and forms ``P = exp(s - m)/l`` directly, which
+    needs no rescale because ``m``/``l`` are already final. 2x the score FLOPs of
+    the forward. Returning m/l from the forward instead would change
+    ``attention_bwd``'s signature for a cost nothing has measured.
+
+    ``gk``/``gv`` are PARTIAL sums under CP, exactly as in
+    :func:`dense_attention_bwd` -- see its note.
+    """
+    q, k, v, grad = _f32(q), _f32(k), _f32(v), _f32(grad)
+    b, tq, hq, d = q.shape
+    tk, hkv = k.shape[1], k.shape[2]
+    g = hq // hkv
+    qp, kp = _attn_positions(q, k, q_pos, k_pos)
+    reach = _tile_reach(qp, kp)
+    gq = torch.zeros_like(q)
+    gk = k.new_zeros(b, tk, hkv, d)
+    gv = v.new_zeros(b, tk, hkv, d)
+    for n, i in enumerate(range(0, tq, _ATTN_CHUNK)):
+        sl = slice(i, i + _ATTN_CHUNK)
+        qc = q[:, sl].reshape(b, -1, hkv, g, d)
+        gc = grad[:, sl].reshape(b, -1, hkv, g, d).permute(0, 2, 3, 1, 4)
+        js = _tiles(reach[n])
+        acc, m, l = _online_softmax(qc, k, v, qp[sl], kp, scale, js)
+        delta = (gc * (acc / l[..., None])).sum(-1)
+        gqc = torch.zeros_like(acc)
+        for j in js:
+            ksl = slice(j, j + _ATTN_CHUNK)
+            s = _chunk_scores(qc, k[:, ksl], qp[sl], kp[ksl], scale)
+            p = torch.nan_to_num(torch.exp(s - m[..., None]) / l[..., None], 0.0)
+            gv[:, ksl] += torch.einsum("bhgqk,bhgqd->bkhd", p, gc)
+            dp = torch.einsum("bhgqd,bkhd->bhgqk", gc, v[:, ksl])
+            ds = p * (dp - delta[..., None])
+            gqc += torch.einsum("bhgqk,bkhd->bhgqd", ds, k[:, ksl]) * scale
+            gk[:, ksl] += torch.einsum("bhgqk,bqhgd->bkhd", ds, qc) * scale
+        gq[:, sl] = gqc.permute(0, 3, 1, 2, 4).reshape(b, -1, hq, d)
     return gq, gk, gv
 
 

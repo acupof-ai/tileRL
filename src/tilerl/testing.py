@@ -193,7 +193,7 @@ class RefBackend:
     def attention(self, q, k, v, scale, gate=None, q_pos=None, k_pos=None):
         from tilerl_kernels import reference
 
-        out = reference.dense_attention(q, k, v, scale, q_pos, k_pos)
+        out = reference.chunked_attention(q, k, v, scale, q_pos, k_pos)
         if gate is not None:
             out = out * torch.sigmoid(gate.float())
         return out
@@ -201,7 +201,7 @@ class RefBackend:
     def attention_bwd(self, grad, q, k, v, scale, q_pos=None, k_pos=None):
         from tilerl_kernels import reference
 
-        return reference.dense_attention_bwd(grad, q, k, v, float(scale), q_pos, k_pos)
+        return reference.chunked_attention_bwd(grad, q, k, v, float(scale), q_pos, k_pos)
 
     def add(self, a, b):
         return a + b
