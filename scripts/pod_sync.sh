@@ -8,8 +8,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# the remote checkout is wiped below; pull any bench row the pod raised first.
-[ "${SKIP_BASELINE_PULL:-0}" = 1 ] || python3 "$ROOT/scripts/baseline.py" pull >/dev/null 2>&1 || true
+# the remote checkout is wiped below and the tarball overwrites bench-baseline.json with
+# this tree's copy, so a failed pull silently drops any row the pod raised. No `|| true`:
+# the sync aborts instead. SKIP_BASELINE_PULL=1 stays the deliberate overwrite.
+[ "${SKIP_BASELINE_PULL:-0}" = 1 ] || python3 "$ROOT/scripts/baseline.py" pull >/dev/null
 # the pod is not a git repo: stamp HEAD so bench rows carry provenance. Write only when
 # git succeeded: `git ... > stamp || true` truncates the file before git runs, so a
 # failure left it empty and bench_harness read empty as a blank commit, not "unknown".

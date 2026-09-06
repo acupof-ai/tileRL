@@ -34,11 +34,14 @@ def _local_is_newer(remote_commit: str | None, local_commit: str | None) -> bool
 
 
 def pull() -> int:
-    raw = subprocess.run(
-        [str(Path.home() / "bin/pod"), f"cat {REMOTE}"], capture_output=True, text=True
-    )
+    launcher = Path.home() / "bin/pod"
+    try:
+        raw = subprocess.run([str(launcher), f"cat {REMOTE}"], capture_output=True, text=True)
+    except OSError as e:  # ~/bin/pod is a symlink into another repo: absent when it moves
+        print(f"pull: cannot run {launcher}: {e}", file=sys.stderr)
+        return 1
     if raw.returncode != 0 or not raw.stdout.strip():
-        print("pull: no remote snapshot", raw.stderr.strip()[:200])
+        print("pull: no remote snapshot", raw.stderr.strip()[:200], file=sys.stderr)
         return 1
     remote, local = json.loads(raw.stdout), _load(LOCAL)
     raised, held = [], []
