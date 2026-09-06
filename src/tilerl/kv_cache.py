@@ -398,14 +398,19 @@ class KvTier:
         # One chunk (4 blocks = 64 tokens), not the 2048 the eviction-driven version used:
         # write-through spills at chunk boundaries, so a 2048 floor refuses every publish.
         self.min_tokens = min_tokens
-        # bound in-flight writes: bursty publishes can enqueue faster than the disk drains.
+        # bound in-flight writes: bursty publishes can enqueue faster than the drain.
         # Over the cap, spill refuses and counts it -- `refusals` over `offered` is the rate
-        # that says whether the device keeps up with write-through at all. Measured on the
-        # pod's /work: 185 MiB/s sequential, and 240 MiB/s durable per 320.6 MiB entry, so a
-        # full queue of 32 takes 42.8 s to drain. The OOM this used to cite is not the live
-        # risk -- 32 x 320.6 MiB = 10.0 GiB against 1928 GiB total / 1473 available -- and the
-        # cap is still unsized: that needs a measured ARRIVAL rate, which nothing reports
-        # (errors/2026-09-06-ssd-save-ms-is-page-cache-time.md).
+        # that says whether the drain keeps up. Measured 2026-09-06 on H20 card 6, 12
+        # sessions served serially: arrival 0.93-0.95 offers/s at 585.0 MiB each, peak
+        # `_pending` of 4 against this cap of 32, 0 refusals. The cap does not bind and is
+        # not what protects the host. What empties `_pending` is `torch.save` RETURNING --
+        # a page-cache accept at ~1784 MiB/s, 7.4x the device's 106.5 MiB/s -- so the queue
+        # drains 3x faster than this workload fills it, and the 240 MiB/s durable figure
+        # describes the device, never the queue's service rate. The real oversubscription is
+        # 5.08x at the device, absorbed by 386 GiB of allowed dirty pages (dirty_ratio=20 of
+        # 1928 GiB); a full queue is 18.3 GiB, 4.7% of that. What would bind first is
+        # `max_bytes` (37 of 72 offers were evicted in that run), not this
+        # (errors/2026-09-06-the-max-pending-cap-is-not-the-queue-that-binds.md).
         self._max_pending = max_pending
         self.offered = 0
         self.refusals = 0
@@ -417,7 +422,9 @@ class KvTier:
         # "~100 ms" in five comments described. This timer wraps `torch.save` with no
         # fsync, so it is PAGE-CACHE time: 273 ms for a 320.6 MiB entry on the pod's
         # /work, where the durable cost of the same entry is 1337 (5.75x). Do not size a
-        # cap on it (errors/2026-09-06-ssd-save-ms-is-page-cache-time.md).
+        # cap on it (errors/2026-09-06-ssd-save-ms-is-page-cache-time.md). Under a real
+        # 12-session workload it reads 164 ms per save on a 292.5 MiB half-entry, and
+        # summed it is 30% of wall clock -- on the writer thread, so not 30% of any tick.
         self.save_ms = 0.0
         self.saves = 0
         self.over_budget = 0  # byte-budget evictions
@@ -446,6 +453,10 @@ class KvTier:
         # (240 MiB/s) -- the timer has no fsync, so it stops before the device has the
         # bytes. The 641.8 this comment used to quote was measured on a Mac whose volume
         # writes 26x faster (errors/2026-09-06-ssd-save-ms-is-page-cache-time.md).
+        # The durable figure is the DEVICE's rate, not this queue's: the daemon pops an
+        # entry once `torch.save` returns, which is a page-cache accept, so `_pending`
+        # empties at ~1784 MiB/s and a 585.0 MiB-per-offer workload never fills it
+        # (errors/2026-09-06-the-max-pending-cap-is-not-the-queue-that-binds.md).
         # _pending/_pending_st serve blobs not yet on disk, so resident()/load see them.
         self._pending: dict[int, dict] = {}
         self._pending_st: dict[int, dict] = {}

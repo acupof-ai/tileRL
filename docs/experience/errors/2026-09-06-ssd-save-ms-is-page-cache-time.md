@@ -71,6 +71,15 @@ the same defect as [the rollouts grew into the cap](2026-09-06-the-rollouts-grew
 one axis over — a bound set without measuring the thing it bounds. The OPEN.md row stays, with
 the operand corrected from 641.8 to 1337 and the missing half named.
 
+**Closed later the same day, and the drain figure above is not the queue's service rate.**
+[The arrival rate is measured](2026-09-06-the-max-pending-cap-is-not-the-queue-that-binds.md):
+0.93-0.95 offers/s, peak `ssd_pending` of **4** against the cap of 32, and 0 refusals. Two
+corrections to this section fall out of it. The entry under that workload is **585.0 MiB**, not
+320.6, so an entries-per-second drain rate does not carry between workloads. And 240 MiB/s is
+the **device**; what empties `_pending` is `torch.save` returning, which is a page-cache accept
+at ~1784 MiB/s — 7.4x faster — so the queue this section reasons about never fills. The real
+oversubscription is 5.08x at the device, invisible to every counter the tier reports.
+
 ## Also: the "byte-identical" claim I nearly made
 
 Before benchmarking arm 5 I checked that serialize-to-RAM-then-write produces the same file.
