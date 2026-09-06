@@ -469,6 +469,107 @@ def attention_gate_bwd(
 # ---------------------------------------------------------------- gated delta (full GDN layer)
 
 
+def gdn_span_ab(qc, kc, vc, bc, gtc, chunk: int = 64):
+    """The affine map ``(A, B)`` of a whole span of chunks: ``s_out = A s_in + B``.
+
+    Each chunk's map is ``A_i = exp(glast) I - R^T W`` and ``B_i = R^T U``, read
+    off :func:`_gdn_chunk_fwd` (``d = U - W s``, so the state's own influence
+    runs through ``d``). **A is a DK x DK operator, not the decay scalar** —
+    dropping the ``R^T W`` term is wrong by 23% and still produces a plausible
+    loss. Composition is ``(A2 A1, A2 B1 + B2)``.
+
+    ``B`` is the span run from a zero state, which is exactly what a CP rank
+    computes anyway, so only ``A`` is extra work.
+    """
+    b, t, hv, dk = qc.shape
+    dv = vc.shape[-1]
+    a_acc = torch.eye(dk, dtype=torch.float32, device=qc.device).expand(b, hv, dk, dk).contiguous()
+    b_acc = torch.zeros(b, hv, dk, dv, dtype=torch.float32, device=qc.device)
+    for c0 in range(0, t, chunk):
+        sl = slice(c0, min(c0 + chunk, t))
+        _, b_i, c = _gdn_chunk_fwd(qc[:, sl], kc[:, sl], vc[:, sl], bc[:, sl], gtc[:, sl], b_acc)
+        eye = torch.eye(dk, dtype=torch.float32, device=qc.device).expand(b, hv, dk, dk)
+        a_i = torch.exp(c["glast"]).unsqueeze(-1).unsqueeze(-1) * eye - c["R"].transpose(-1, -2) @ c["W"]
+        # b_i already ran this chunk from b_acc, so it IS A_i b_acc + B_i.
+        a_acc, b_acc = a_i @ a_acc, b_i
+    return a_acc, b_acc
+
+
+def gdn_span_ab_raw(q, k, v, g, beta, state_shape, *, conv1d_weight, dt_bias, a_log,
+                    conv_window=None, chunk: int = 64):
+    """:func:`gdn_span_ab` from the layer's RAW projections.
+
+    ``gdn_span_ab`` takes post-:func:`gdn_prep` tensors; a caller holding the
+    projections has to run the conv, the norms and the gates first — and with the
+    same ``conv_window`` the real forward will use, or ``A`` and ``B`` describe a
+    different span than the one that runs.
+
+    ``gdn_prep`` therefore runs twice per chunk under CP, once here and once in
+    the forward. It is the conv plus two norms against the scan's DK x DK
+    matmuls, and reusing it would mean threading prepped tensors through the
+    backend contract for one caller.
+    """
+    key_dim = state_shape[2]
+    qn, kn, v_raw, gt, bt, _ = gdn_prep(
+        q, k, v, g, beta, key_dim, conv1d_weight=conv1d_weight, dt_bias=dt_bias,
+        a_log=a_log, conv_window=conv_window,
+    )
+    return gdn_span_ab(qn, kn, v_raw, bt, gt, chunk=chunk)
+
+
+def affine_prefix_scan(a, b, pg, rank: int, world: int, chunk_ids=None):
+    """Exclusive scan of affine pairs ``(A, B)`` in SEQUENCE order, over a group.
+
+    ``a``/``b`` are this rank's pairs stacked on dim 0, and ``chunk_ids`` gives
+    each one's position in the sequence — required whenever a rank's chunks are
+    not ``rank*entries + i``, which under **zigzag** they are not (rank 0 of 2
+    holds chunks 0 and 3, not 0 and 1). Returns, for each of this rank's pairs,
+    the composed map of every chunk strictly before it, so a rank starts each
+    chunk from ``A_pre @ s + B_pre`` rather than waiting for its predecessor.
+    Composition ``(A2 A1, A2 B1 + B2)`` is associative, which is what allows this.
+
+    Sharing attention's zigzag is not optional: a token's residual stream lives
+    on one rank for all 64 layers, so a different GDN assignment costs an
+    all-to-all between every layer pair — 96.6 ms/step at T=2048 B=8, against
+    24.2 ms for this whole collective.
+
+    One ``all_gather`` and a local fold, not a log2 butterfly. The butterfly
+    moves fewer bytes at cp=8 (60.4 vs 96.6 ms) and MORE at cp=2 (36.2 vs 24.2),
+    needs irregular point-to-point across a zigzag layout, and buys 4.5 ms on a
+    step that runs to hundreds. Revisit past cp=8 if a measurement asks.
+    """
+    import torch.distributed as dist
+
+    entries = a.shape[0]
+    ids = list(range(rank * entries, (rank + 1) * entries)) if chunk_ids is None \
+        else [int(c) for c in chunk_ids]
+    ids_t = torch.tensor(ids, dtype=torch.float64)
+    payload = torch.cat([a.reshape(entries, -1).double(), b.reshape(entries, -1).double(),
+                         ids_t.unsqueeze(1)], dim=1).contiguous()
+    parts = [torch.empty_like(payload) for _ in range(world)]
+    dist.all_gather(parts, payload, group=pg)
+
+    na, nb = a[0].numel(), b[0].numel()
+    flat = torch.cat(parts, dim=0)
+    # Sort by the shipped chunk id: the gather returns rank order, and only the
+    # ids say what the sequence order is.
+    order = sorted(range(flat.shape[0]), key=lambda j: flat[j, -1].item())
+    want = {c: i for i, c in enumerate(ids)}
+
+    acc_a = torch.eye(a.shape[-1], dtype=a.dtype, device=a.device).expand_as(a[0]).contiguous()
+    acc_b = torch.zeros_like(b[0])
+    out_a, out_b = torch.empty_like(a), torch.empty_like(b)
+    for j in order:
+        c = int(flat[j, -1].item())
+        if c in want:  # exclusive: what stands before this chunk
+            out_a[want[c]], out_b[want[c]] = acc_a, acc_b
+        c_a = flat[j, :na].reshape(a[0].shape).to(a.dtype)
+        c_b = flat[j, na:na + nb].reshape(b[0].shape).to(b.dtype)
+        acc_a, acc_b = c_a @ acc_a, c_a @ acc_b + c_b
+    return out_a, out_b
+
+
+
 def linear_attn_bwd(
     grad: torch.Tensor,
     q: torch.Tensor,

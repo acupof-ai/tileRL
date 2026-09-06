@@ -51,16 +51,15 @@ jobs:
         # is the same as not having them. Each exits non-zero on failure.
         run: |
           set -e
+          # globbed: a hand-maintained list omitted three gates
           ran=0
-          for gate in tests/tp_world2.py tests/ce_sharded_world2.py tests/mesh_world4.py tests/dp_world4.py tests/cp_world2.py tests/gdn_cp_scan.py; do
-            [ -f "$gate" ] || continue
+          for gate in tests/*_world[0-9].py tests/gdn_cp_scan.py; do
             echo "== $gate"
             uv run python3 "$gate"
             ran=$((ran + 1))
           done
-          # A rename would otherwise skip every gate and pass: the step must fail
-          # when it ran nothing, not report success for doing nothing.
-          [ "$ran" -gt 0 ] || { echo "no distributed gate ran -- renamed?" >&2; exit 1; }
+          # no -f skip: an absent or renamed gate fails loudly instead of passing
+          [ "$ran" -ge 9 ] || { echo "only $ran distributed gates ran, expected >= 9" >&2; exit 1; }
           echo "distributed gates run: $ran"
         env:
           TILERL_TARGET: cpu
