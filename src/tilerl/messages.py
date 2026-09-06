@@ -37,7 +37,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .prompt import (
     blocks_to_text,
@@ -49,6 +49,7 @@ from .prompt import (
     sampling,
     split_think,
     strip_think,
+    unknown_fields,
 )
 from .tokenizer import Tokenizer
 
@@ -74,6 +75,9 @@ def record_path() -> str:
 
 
 class MessagesRequest(BaseModel):
+    # allow, not ignore: an undeclared field would vanish before the recorder sees it.
+    model_config = ConfigDict(extra="allow")
+
     model: str | None = None
     messages: list[dict[str, Any]]
     max_tokens: int = Field(default=512, ge=1)
@@ -255,6 +259,8 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
             "logprobs": scores,
             "stop_reason": stop_reason,
             "stop_sequence": stopped,
+            # Shapes only: what the client sent that we do not honour, without its values.
+            "unknown_fields": unknown_fields(req),
         })
         return {
             "id": f"msg_{rid}",

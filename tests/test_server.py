@@ -928,6 +928,53 @@ def test_image_blocks_are_refused_not_dropped(client, tmp_path, monkeypatch):
     assert r.json()["error"]["type"] == "invalid_request_error"
 
 
+def test_an_undeclared_field_is_recorded_by_shape_on_every_route(client, tmp_path,
+                                                                monkeypatch, recwarn):
+    """A field the client sends and we do not declare must become visible, not vanish.
+
+    Before `extra="allow"`, pydantic dropped unknown keys before any handler ran AND the
+    recorded row was built from the parsed model, so an ignored field was invisible twice:
+    "no unsupported fields observed" could not be told from "we dropped six of them". That
+    is not hypothetical -- `previous_response_id` had to be DECLARED in order to be refused.
+
+    Values are never recorded, only shapes: a body carries the user's prompt and may carry
+    credentials. Both halves are asserted -- the field is named, and its contents are absent.
+    """
+    rec = tmp_path / "unknown.jsonl"
+    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(rec))
+    secret = "this-string-must-not-be-recorded"
+    extra = {"made_up_field": secret, "a_number": 7, "an_object": {"type": "auto", "k": 1}}
+
+    # /v1/messages is the only route with a recorder, and the one Claude Code drives.
+    r = client.post("/v1/messages", json={"model": "tiny", "max_tokens": 8,
+                                          "messages": [{"role": "user", "content": "hi"}],
+                                          **extra})
+    assert r.status_code == 200, r.text
+    text = rec.read_text(encoding="utf-8")
+    got = json.loads(text.splitlines()[-1])["unknown_fields"]
+    # Named before indexed: `set(None)` raises a TypeError that reads as a broken test.
+    assert got, ("the row recorded no unknown fields at all -- the request model is "
+                 "dropping them before the handler runs (extra=\"ignore\")")
+    assert set(got) == set(extra), got
+    assert got["made_up_field"] == f"str[{len(secret)}]", got
+    assert got["a_number"] == "int(7)", got
+    # Keys of a nested object say whether we should honour it; its values do not.
+    assert got["an_object"] == "dict{k,type}", got
+    assert secret not in text, "the field's VALUE reached the row"
+
+    # No recorder on these two, so the warning is the only signal -- and it must name it.
+    for path, body in (("/v1/chat/completions",
+                        {"model": "tiny", "stream": False, "max_tokens": 8,
+                         "messages": [{"role": "user", "content": "hi"}], **extra}),
+                       ("/v1/responses", {"model": "tiny", "input": "hi", **extra})):
+        recwarn.clear()
+        assert client.post(path, json=body).status_code == 200, path
+        texts = [str(w.message) for w in recwarn]
+        assert any("made_up_field" in t for t in texts), (
+            f"{path} ignored an undeclared field with no warning: {texts}")
+        assert secret not in " ".join(texts), f"{path} warned with the field's VALUE"
+
+
 def test_every_engine_the_routes_accept_implements_what_they_call():
     """The seam is what the routes CALL, and every implementation has to have all of it.
 

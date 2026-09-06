@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import warnings
 from typing import Any
 
 # Qwen3.8-27B model card sampling per thinking mode (non-thinking also wants
@@ -192,6 +193,47 @@ def cut_at_stop(text: str, stop: str | None) -> str:
     the match, so the text still carries it and the caller cuts at the match START
     -- OpenAI and Anthropic both exclude the sequence from the returned text."""
     return text if not stop else text.split(stop)[0]
+
+
+def unknown_fields(req: Any) -> dict[str, str] | None:
+    """A request's undeclared fields, as name -> shape. Values are never recorded.
+
+    Every request model declares ``extra="allow"`` so these survive parsing; without it
+    pydantic drops them before any handler runs, and the recorded row is built from the
+    parsed model, so a field we silently ignore is invisible in both. Not hypothetical:
+    ``previous_response_id`` had to be DECLARED in order to be refused (see responses.py's
+    own note), and it was found by reading the code, not by reading a log.
+
+    Shape, not value: a body carries the user's prompt and may carry credentials, so a str
+    becomes ``str[42]`` and a dict becomes ``dict{a,b}``. That is enough to tell a field we
+    should honour from one we should refuse, and it cannot leak content.
+    """
+    extra = getattr(req, "model_extra", None)
+    if not extra:
+        return None
+    shapes = {k: _shape(v) for k, v in sorted(extra.items())}
+    # Warn too: the other two routes have no recorder, so this is their only signal.
+    warnings.warn(
+        f"{type(req).__name__}: ignoring undeclared request fields {shapes} -- declare one "
+        "to honour it, or pass it to refuse_unsupported to reject it",
+        stacklevel=2,
+    )
+    return shapes
+
+
+def _shape(v: Any) -> str:
+    if isinstance(v, bool) or v is None:  # bool before int: bool IS an int
+        return repr(v)
+    if isinstance(v, (int, float)):
+        return f"{type(v).__name__}({v})"  # a number is its own shape, and the value matters
+    if isinstance(v, str):
+        return f"str[{len(v)}]"
+    if isinstance(v, (list, tuple)):
+        return f"{type(v).__name__}[{len(v)}]"
+    if isinstance(v, dict):
+        # Keys say whether we should honour the field; values are content.
+        return f"dict{{{','.join(sorted(map(str, v)))}}}"
+    return type(v).__name__
 
 
 def refuse_unsupported(*fields: str, **flagged: Any) -> None:
