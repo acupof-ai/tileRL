@@ -1,6 +1,10 @@
 # Stop sequences, matched on decoded text rather than token ids — cpu, 2026-09-06
 
-> Status: Shipped (CPU gates); the live arms are `pending-remote` until the V100 restart
+> Status: Shipped. Verified live on the V100 (27B NVFP4, sm70) 2026-09-06 on merge sha
+> `753da30` — **by three manual probes, not by the e2e arms**: all three
+> `api_e2e.py` stop arms SKIPPED there ("reply too short to cut inside"), so the
+> automated coverage of this feature against real weights is still zero. See
+> [the live run](#the-live-run-three-manual-probes-because-the-arms-skipped).
 
 ## Context
 
@@ -117,14 +121,48 @@ arm in `test_e2e.py` is what actually holds the engine to the contract, and it
 forces the stop from the model's own first byte rather than hoping noise contains
 a chosen string.
 
+## The live run: three manual probes, because the arms skipped
+
+Run by 27 against the V100 (27B NVFP4, sm70) on merge sha `753da30`.
+`scripts/api_e2e.py`: **rc 0, 11 passed — and all three stop arms SKIPPED**,
+`"reply too short to cut inside"`. The arms derive the stop from the model's own
+reply as `text[1:4]` and skip below 6 characters; the probe's prompts ask for
+one-word answers, so the reply is too short by construction. **The arms cannot
+fire as written, which means they have never run against real weights.** Own
+entry: [three live arms skipped by construction](../errors/2026-09-06-three-live-arms-skipped-by-construction.md);
+recorded here as the reason the evidence is manual.
+
+The three probes, each naming what only real weights could establish:
+
+| # | request | result |
+|---|---|---|
+| 1 | `/v1/messages`, thinking ON, `stop_sequences: ["\n\n"]`, "Explain in three separate paragraphs why the sky is blue", `max_tokens` 600 | `stop_reason stop_sequence`, `stop_sequence "\n\n"`, **thinking block 1218 chars intact** + text 696 chars = the first paragraph only |
+| 2 | `/v1/messages`, thinking disabled, `stop_sequences: [" is"]`, "Complete this sentence in one line: The capital of France" | `stop_reason stop_sequence`, `stop_sequence " is"`, text `"The capital of France"` |
+| 3 | `/v1/chat/completions` stream, `enable_thinking false`, `stop: ["Paris"]` | `finish_reason stop`, joined deltas `"The capital of France is "`, `"Paris"` in **no** frame |
+
+**Probe 2 is the one this whole design rests on.** `" is"` inside `" is 4."`-shaped
+text is the case where the 27B's BPE can merge the leading space into one token, so
+a tail-of-ids comparison would miss it. The match fired and the exact requested
+string came back — the mid-token case survives on the real tokenizer, which is
+precisely what the CPU gate and the byte tokenizer cannot say.
+
+**Probe 1 is the reasoning gate on real weights**, and it is the probe the automated
+suite could never have produced: the 27B emitted 1218 characters of reasoning
+containing paragraph breaks, and none of them fired the stop. Before the gate, that
+request returned a truncated thought and no answer.
+
+**Probe 3 confirms the streaming cut end to end** — the holdback plus the
+complete-match cut, on a model that emits the stop mid-reply rather than at the end.
+
 ## Not established
 
-- **Nothing is live yet.** The three arms added to `scripts/api_e2e.py` derive
-  the stop from the model's own reply (a fixed guess like `"\n\n"` may not occur,
-  which would pass for a stop that never fired) and were smoke-tested against the
-  canned server only: 3/3 ok, the skip floor still firing at 6/14. Whether a
-  multi-character stop lands mid-token on the 27B's real tokenizer is exactly
-  what the canned run cannot say, and it is the reason this design exists.
+- **Automated coverage against real weights is zero.** Everything above is manual.
+  The three `api_e2e.py` arms skipped on the live run and are fixed in a follow-up;
+  until that runs, a regression in this feature would be caught by the CPU gates
+  only, and those run over a double that implements the behaviour itself.
+- **No arm covers the reasoning gate automatically, live or canned-with-weights.**
+  Probe 1 was hand-driven with a prompt chosen to provoke multi-paragraph reasoning;
+  nothing in the suite provokes it.
 - **No cap on how many stop sequences a request may carry.** Anthropic's API
   allows four; we accept any number, and `_stop_hit` is linear in that count.
 - **`k` is in characters, not tokens.** For a stop string of mostly multi-byte
