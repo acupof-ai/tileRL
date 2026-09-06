@@ -66,6 +66,14 @@ _NO_GRAD = (
 #: the process inside gloo, which is exactly the failure this would explain.
 _CHECK_DP_ORDER = bool(os.environ.get("TILERL_CHECK_DP_ORDER"))
 
+#: The largest T measured to run with the MLP segment; above it the segment becomes the
+#: whole layer. Group 8 on one H20: T=1280 runs either way and the layer segment costs
+#: 1.079x on backward (69.748 -> 75.259 s), so it stays MLP; T=4352 OOMs with the MLP
+#: segment and fits with the layer one (forward peak 54.038 -> 14.896 GiB).
+#: ponytail: the crossover is somewhere in 1280..4352 and this switches at the bottom,
+#: paying 1.079x on shapes between; measure both arms at 2048 and 3072 to move it.
+_MLP_SEGMENT_MAX_T = 1280
+
 
 def _order_agrees(order: list[str], backend: Any) -> None:
     """Raise if the dp ranks did not all-reduce the same parameters in the same order.
@@ -154,7 +162,8 @@ def _step(
             # cross_entropy_loss_grad reduces it sharded instead.
             logits = model.forward(chunk, np.arange(t, dtype=np.int64), kv,
                                    RecordingBackend(backend),
-                                   sharded_logits=getattr(backend, "tp_world", 1) > 1)
+                                   sharded_logits=getattr(backend, "tp_world", 1) > 1,
+                                   segment="layer" if t > _MLP_SEGMENT_MAX_T else "mlp")
         loss, grad_logits = grad_fn(logits, chunk, lo)
         if not math.isfinite(loss):
             return loss, {}

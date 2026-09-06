@@ -1,7 +1,20 @@
 # A layer-wide checkpoint segment — H20 sm90, 2026-09-07
 
-> Status: **measurement pending** — the CPU half is green and the three card rows
-> below are empty on purpose. No default has moved.
+> Status: **Accepted as the shape-picked arm.** `"mlp"` stays the default; `"layer"`
+> is selected at `train.py:155` when T exceeds the measured bracket's low end.
+
+## Verdict
+
+| row | `segment="mlp"` | `segment="layer"` | |
+|---|---:|---:|---|
+| gen 1024 `backward_secs`, paired | 69.748 s | 75.259 s | **1.079x — costs 5.51 s** |
+| gen 4096 forward peak | 54.038 GiB | 14.896 GiB | **3.63x smaller** |
+| gen 4096, does the step fit | no (OOM, 290.00 MiB) | **yes, 518.5 s** | **the shape that could not run, runs** |
+
+The two point opposite ways, so neither arm is deleted: the layer segment buys a shape
+that did not exist before and costs 1.079x on backward where the MLP one already works.
+`_MLP_SEGMENT_MAX_T = 1280` in `train.py` switches at the low end of the measured bracket,
+and the ponytail line there names both endpoints so a later measurement can move it.
 
 ## Context
 
@@ -94,25 +107,98 @@ Tiny model, CPU target, `segment="layer"` against `segment="mlp"`:
 | the parity assert can fail at all | flipping `win_parity[0]` after layer 1 fails with `win_parity moved [0, 0] -> [1, 0]`; before the clone fix this control passed silently |
 | the batch-2 arm is not decoration | a raise-on-`numel > 1` probe inside `forward` fires with `numel=2`, so the arm reaches a real parity vector rather than the bool-able 1-element case |
 | the arm runs on the shipped path | `segment="layer"` selected at `train.py:155` and the full `grpo_loop` tests run: 41 passed (they were 11 red before the parity fix) |
-| card state before any peak is read | (pending) `nvidia-smi --query-compute-apps=pid,used_memory` returning zero rows, read in the same call as the numbers |
-| the rest of the box, read with the card | (pending) all 8 cards' util and memory. Another team's job took cards 1-5 and 7 to 100% during the arms above, and a same-code run drifted 133.65 → 140.43 s under it. Card 6 itself showed 59% util, 1980 MHz, `clocks_throttle_reasons.active 0x0`, so the coupling is host/PCIe/bandwidth, not thermal. **Row 1 is a time and is not comparable across that boundary**; rows 2-3 are byte counts, which contention does not change, but the allocator's behaviour under a busy host is not something to assume. |
+| the selector fires on both sides | `pick(1280) == "mlp"` and `pick(4352) == "layer"` on the expression `_step` uses, plus a source check that the call site reads `_MLP_SEGMENT_MAX_T` rather than a literal. **Two controls, each red by its own assertion:** hardcoding `segment="layer"` fails with `_step must select the segment by T, got segment="layer")`, and moving the threshold to 8192 fails with `T=4352 OOMs with the MLP segment` |
+| card state before any peak was read | card 6 free **by UUID**, not by index: 6 compute-app rows, none on `GPU-88e98123-…`; 0 MiB, 0% util, read in the same call as the tree shas |
+| the rest of the box, read with every row | all 8 cards' util and memory before, between and after each arm. Cards 1-5 and 7 held **98-100%** from another team's job for the whole session, and a same-code arm elsewhere drifted 133.65 → 140.43 s under it. Card 6 showed `clocks_throttle_reasons.active 0x0` at 1980 MHz, so the coupling is host/PCIe/bandwidth, not thermal. Every row's two arms therefore run back to back in one session |
+| the arm was really selected, not assumed | each arm printed its file sha and `segment=` count at launch — `train.py f1b4e2e8ada3` count 0, then `74c258fabda2` count 1; probe `e6d17462707b` count 0, then `ba727b91e3e6` count 1 — and both reverts were `diff`-verified byte-exact after (`TRAIN_ROUNDTRIP_EXACT`, `PROBE_ROUNDTRIP_EXACT`) |
+| row 3's answer is its exit status, so the status is captured | `ROW3_EXIT=0`. The first draft piped the probe through `tail`, which reports `tail`'s status and would have made an OOM indistinguishable from quiet output |
 
 ## Results
 
 | # | measurement | `segment="mlp"` | `segment="layer"` | verdict |
 |---|---|---:|---:|---|
-| 1 | gen 1024, `backward_secs`, paired in one session | | | |
-| 2 | gen 4096, forward peak | | | |
-| 3 | gen 4096, does the step fit | | | |
+| 1 | gen 1024, `backward_secs`, paired in one session | **69.748 s** | **75.259 s** | **+5.51 s, 1.079x — a real regression** |
+| 2 | gen 4096, forward peak | **54.038 GiB** | **14.896 GiB** | **−39.14 GiB, 3.63x smaller** |
+| 3 | gen 4096, does the step fit | no (OOM, 290.00 MiB) | **yes** | **the shape that could not run, runs** |
 
-Both columns of every row are measured in this session. The earlier figures —
-67.77 s backward, 54.038 GiB forward peak, and the 290.00 MiB OOM — are the
-cross-session reference, not the `"mlp"` column: they were taken on a quiet box and
-row 1 is a time.
+Row 1's `mlp` column: warm mean of steps 2-3, **69.839 / 69.656, spread 0.18 s**; step 0
+(70.534) excluded as the JIT step. `layer`: **75.028 / 75.490, spread 0.46 s**; step 0
+75.229. Card 6, `c61c1aa`, probe `f1c4b6d6dd86`, `train.py f1b4e2e8ada3` (`segment=` count
+0) then `74c258fabda2` (count 1), both printed at launch and the revert `diff`-verified
+byte-exact after.
+
+**The regression is 11.9x the largest within-arm spread (5.51 s against 0.46 s), so it is
+not noise.** The cost is confined to backward, as the mechanism predicts: `decode_secs`
+moves 59.586 → 59.738 (0.25%) and the rollout is untouched, while `step_secs` goes
+132.891 → 138.588 (1.043x). Recomputing attention and GDN in every segment replay is work
+the MLP-only arrangement did not do.
+
+**Why this row is not 67.77.** The same code on a quiet box measured 67.77 s (#202). This
+session's control is **+1.98 s, 1.029x**, with 6 of 8 cards at 98-100% from another team's
+job for the whole window. That offset is 36% of the effect being measured, which is why both
+columns are measured here rather than one being cited.
+
+Row 2, both arms this session, probe `e6d17462707b` (count 0) then `ba727b91e3e6` (count 1),
+64 of 64 segments recorded in each, `ROW2_MLP_EXIT=0` / `ROW2_LAYER_EXIT=0`:
+
+| quantity | `mlp` | `layer` | ratio |
+|---|---:|---:|---:|
+| forward peak (`max_memory_allocated`) | 54.038 GiB | **14.896 GiB** | 3.63x |
+| forward delta (before → end, the quotable form) | 53.968 GiB | 14.826 GiB | 3.64x |
+| accumulated over 64 segments | 42.929 GiB | **4.228 GiB** | 10.15x |
+| mean rise per segment | 697.8 MiB | **68.7 MiB** | 10.16x |
+| live tensors at forward end | 53.984 GiB, 36 shapes | 14.862 GiB, 26 shapes | 3.63x |
+
+**68.7 MiB per segment is below the 85.0 MiB of one retained `[T,hidden]` input** (0.81 of
+it), so the layer segment retains less than the MLP one stored — the remaining accumulation
+is smaller than `checkpoint`'s own recorded `args`. The 42.929 GiB this entry's predecessor
+attributed 88% of to unwrapped activations is now 4.228 GiB, which is the predecessor's
+claim confirmed by removal rather than by arithmetic.
+
+### Row 3: the gen-4096 step completes
+
+`ROW3_EXIT=0`, one step, group 8, LoRA-16, micro 1 — **the first time this shape has run on
+one card.** #192 concluded cap 4096 was unreachable at group 8; #196 tried to reach it by
+removing the T² score matrix and still OOMed at the same 290.00 MiB MLP intermediate. This
+reaches it by not keeping 64 layers of attention and GDN activations alive.
+
+```
+step_secs   518.528   (step 0: the JIT is inside this number, no warm mean exists)
+backward    269.375   51.9%
+rollout     249.034   decode 243.463 over 4095 ticks = 59.5 ms/tick
+optimizer     0.119
+reconciles to 0.0012 s
+```
+
+Two things this row is **not**. It is not a warm step — one step means step 0, so the JIT
+and the first capture are inside 518.5 s and the number is an upper bound on a warm one. And
+it is not a comparison: the `mlp` column is an OOM, so there is no paired time here, only
+fits-versus-does-not.
+
+Decode holds at **59.5 ms/tick against 58.4 ms at gen 1024** (1.9%), so the rollout scales
+with token count and not with the segment change. Backward goes **75.259 → 269.375 s for 4x
+the tokens = 3.58x**, slightly sublinear.
+
+Both columns of every row are measured in this session. The 290.00 MiB OOM in row 3's
+`"mlp"` column is the one figure carried over (from the #202 traceback) rather than
+re-run — re-OOMing the card to confirm it buys nothing.
+
+**Row 2's `"mlp"` column reproduced the earlier session exactly: 54.038 GiB both times**,
+and the accumulation 42.929 GiB both times, on a quiet box then and a box with six cards at
+100% now. So a forward peak is repeatable across the contention boundary that moves a time
+by 1.029x — which is the byte-count-versus-time distinction holding up under test rather
+than being assumed.
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
-| 2026-09-07 | 7538517 | H20 card 6 | cuda sm90 | 27B | n/a | n/a | pending |
+| 2026-09-07 | c61c1aa | H20 card 6 | cuda sm90 | 27B, gen 1024, `mlp` | n/a | n/a | backward 69.748 s/step |
+| 2026-09-07 | c61c1aa | H20 card 6 | cuda sm90 | 27B, gen 1024, `layer` | n/a | n/a | backward 75.259 s/step |
+| 2026-09-07 | c61c1aa | H20 card 6 | cuda sm90 | 27B, gen 4096, `layer` | n/a | n/a | fwd peak 14.896 GiB, step 518.5 s |
+
+Raw artifacts on the pod: `/work/lcpair.log` (row 1, both arms), `/work/lcpeak.log` and
+`/work/lc_peak_mlp.txt` / `/work/lc_peak_layer.txt` (row 2), `/work/lc_row3.txt` (row 3),
+`/work/lc_mlp.json` / `/work/lc_layer.json`. Tree `c61c1aa`, stamp and all four file shas
+read in the same call as the numbers.
 
 Comparability of row 1: the control is `backward_secs` from `prof_grpo_step.py`,
 **not** `train_secs` — `train_secs` wraps the whole `rl_step` including the
@@ -154,11 +240,32 @@ the earlier entries.
   within-run figure, not the 4.61 s span.
 - Row 1 regresses and row 3 fits → default stays `"mlp"` and the caller picks by
   shape, with the threshold measured on live activation bytes at T **on both
-  arms**, not derived from one.
+  arms**, not derived from one. **← this branch fired.**
 - Row 3 still does not fit → the whole thing comes out, and this entry's finding is
   that one card is the wrong shape for cap 4096.
 
+**What the threshold actually is, versus what this rule asked for.** The rule wanted a
+threshold on live activation bytes at T, measured on both arms. What shipped is a T
+threshold at the bracket's low end: `_MLP_SEGMENT_MAX_T = 1280`, from two shapes rather
+than a curve — 1280 runs both ways and MLP is 1.079x cheaper, 4352 runs only as `"layer"`.
+Deliberate, and cheaper than what the rule asked for: a bytes model needs a sweep to
+calibrate and would still be a model of the quantity rather than the quantity. The cost of
+the shortcut is named in the code — shapes in 1280..4352 pay 1.079x that a measured
+crossover might avoid — and the ponytail line says which measurement moves it (both arms at
+2048 and 3072).
+
 ## Rule
 
-(pending the numbers — a rule written before the measurement would be the
-prediction, not the finding)
+**A checkpoint segment's boundary is a shape decision, not a correctness one, and the two
+directions do not trade off against each other.** Widening the segment from the MLP to the
+whole layer cut the forward peak 3.63x and made a shape run that had OOMed twice under two
+different diagnoses — and cost 1.079x on backward at a shape that already worked. Neither
+number argues against the other; they argue for a selector. The mistake available here was
+to read the 3.63x as a win and flip the default, which would have taxed every training shape
+we actually run to buy a shape we do not run yet.
+
+Corollary on how the bracket was reached: **the two arms had to be measured in one session.**
+The same control read 67.77 s on a quiet box and 69.748 s with six neighbouring cards at
+100% — a 1.029x offset, 36% of the effect. Citing the earlier figure would have reported
+1.11x instead of 1.079x, and the direction would still have been right, which is what makes
+that class of error survive.

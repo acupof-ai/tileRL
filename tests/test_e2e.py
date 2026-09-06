@@ -1474,6 +1474,34 @@ def test_the_layer_segment_swallows_the_ops_the_mlp_one_leaves_out():
     )
 
 
+def test_the_segment_selector_switches_on_the_measured_bracket():
+    """`_step` picks the segment by T, and both sides of the threshold must be reachable.
+
+    A branch on a measured constant is the kind that stops firing when the constant moves:
+    every real training shape landing on one side reads as a working selector. Asserted by
+    driving the expression `_step` uses, at the bracket's own endpoints — 1280 ran with the
+    MLP segment (1.079x cheaper on backward), 4352 only runs with the layer one.
+    """
+    import re
+    from pathlib import Path
+
+    from tilerl import train as train_mod
+    from tilerl.train import _MLP_SEGMENT_MAX_T
+
+    pick = lambda t: "layer" if t > _MLP_SEGMENT_MAX_T else "mlp"  # noqa: E731
+    assert pick(1280) == "mlp", "T=1280 was measured to run with the MLP segment"
+    assert pick(4352) == "layer", "T=4352 OOMs with the MLP segment"
+    assert pick(_MLP_SEGMENT_MAX_T + 1) == "layer" and pick(_MLP_SEGMENT_MAX_T) == "mlp"
+
+    # and the call site must use that expression, not a hardcoded segment: a literal
+    # segment="layer" would pass every assertion above while ignoring T entirely.
+    src = Path(train_mod.__file__).read_text()
+    call = re.search(r"segment=([^\n]+)", src)
+    assert call and "_MLP_SEGMENT_MAX_T" in call.group(1), (
+        f"_step must select the segment by T, got segment={call.group(1) if call else None}"
+    )
+
+
 def test_layer_segment_needs_the_handed_in_state():
     """The control for `test_layer_segment_matches_the_mlp_segment`: mutate `_gdn` so the
     segment re-gathers instead of using the state handed to it, and the GDN gradients must
