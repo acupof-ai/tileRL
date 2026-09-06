@@ -928,6 +928,51 @@ def test_image_blocks_are_refused_not_dropped(client, tmp_path, monkeypatch):
     assert r.json()["error"]["type"] == "invalid_request_error"
 
 
+def test_every_engine_the_routes_accept_implements_what_they_call():
+    """The seam is what the routes CALL, and every implementation has to have all of it.
+
+    Twice now a method the routes need was missing from `DataParallelEngine` and shipped:
+    `limits` 400-ed every Claude Code turn under `--devices`, and `room_for` 500-ed every
+    request that omitted `max_tokens`. One arm per method catches the method it was written
+    for and nothing else, so this enumerates instead — the names are read out of the route
+    modules' own source, so a route that starts calling `engine.foo()` extends the required
+    set without anyone remembering to add an arm here.
+    """
+    import inspect
+    import re
+
+    import torch
+
+    from tilerl import messages, parallel, responses, server
+
+    called: set[str] = set()
+    for mod in (server, messages, responses):
+        src = inspect.getsource(mod)
+        called |= set(re.findall(r"\bengine\.([a-z_][a-z0-9_]*)", src))
+        # `getattr(engine, "limits", ...)` is a call on the seam too, and the regex
+        # above cannot see it: messages.py reads `limits` exactly this way.
+        called |= set(re.findall(r'getattr\(\s*engine\s*,\s*"([a-z_][a-z0-9_]*)"', src))
+    # Prose, not calls: "engine.py" in a docstring, and a comment in server.py's /health
+    # explaining why loop liveness deliberately does NOT read engine._thread. Reading a
+    # comment as a call is how this gate would demand an attribute nothing needs.
+    called -= {"py", "_thread"}
+
+    # The set is asserted, not just used: a regex that silently matched nothing would make
+    # every implementation pass. These are the names the routes call today.
+    assert called >= {"submit", "take", "peek", "stop_text", "logprobs", "stats",
+                      "room_for", "limits"}, called
+
+    # Instances, not classes: `Engine.limits` is assigned in __init__, so `hasattr` on the
+    # class reports it missing and this gate would fail on a correct engine.
+    plain = _build_engine(seed=61)
+    for impl in (plain, parallel.DataParallelEngine([plain], [torch.device("cpu")])):
+        missing = sorted(n for n in called if not hasattr(impl, n))
+        assert not missing, (
+            f"{type(impl).__name__} is accepted by the routes but does not implement "
+            f"{missing} — the shape of the missing `limits` (400 on every turn) and the "
+            f"missing `room_for` (500 on every omitted cap)")
+
+
 def test_serve_sizes_its_pools_from_the_flags_not_the_context():
     """`tilerl serve`'s own engine builder must honour --blocks / --max-ctx.
 
