@@ -14,9 +14,12 @@ Shapes are DERIVED from param_specs + _projection_groups (see ``shapes``), not
 written down: serving fuses projections, and the hand-written table this replaced
 had three wrong rows while still reproducing the byte total.
 
-The absolute times carry an eager-launch floor (~60 us regardless of shape) that
-the graph-captured decode path does not pay, and that floor dominates the small-N
-rows — read the RATIO here and take per-shape cost from prof_decode_budget.py.
+The absolute times carry an eager-launch floor -- measured on sm70 as ~10 us amortized
+(what `benchkit.timeit` reports) and ~21-26 us per-call-with-sync, flat across four
+decades of element count, so shape-independent as claimed but 6x smaller than the ~60 us
+this file used to assert (wins/2026-09-06-the-launch-floor-is-ten-microseconds.md). It is
+still the largest relative distortion on the small-N rows -- read the RATIO here and take
+per-shape cost from prof_decode_budget.py.
 In the captured graph the GEMV runs at 746 GB/s, 83% of peak; this harness read
 58% off the same kernel (errors/2026-09-02-per-shape-gap-was-a-wrong-shape-
 table.md).

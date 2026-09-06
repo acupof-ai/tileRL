@@ -10,7 +10,9 @@ Three figures, carried in the task description: `attn o` at N=1024 running at **
 peak**, `gdn out`/`gdn z` at **32%**, and **144 GEMV launches/token**. The instruction is
 to measure in the captured graph first, because the microbench has a ~60 µs eager launch
 floor the graph path does not pay, and to find out how much of the 5% is real before
-touching `n_partition` or fusing shapes.
+touching `n_partition` or fusing shapes. (That fourth figure is now measured too:
+**~10 µs amortized / ~21-26 µs per-call** on sm70, so this quote's ~60 is 6x high —
+[the launch floor is ten microseconds](../wins/2026-09-06-the-launch-floor-is-ten-microseconds.md).)
 
 Before running anything I looked for where those three numbers came from. None of them
 survives.

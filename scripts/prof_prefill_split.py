@@ -8,7 +8,8 @@ request pays, unlike a prefix cache that only pays off on a hit.
 Uses torch.profiler over ONE prefill forward of the real model at the real shape, and
 attributes by kernel/op name rather than by wrapping layers -- wrapping changes what is
 timed, and an eager microbench of a single layer carries a launch floor that swamps the
-answer (docs/experience: the ~60us eager launch floor).
+answer (measured on sm70: ~10 us amortized, ~21-26 us per call with a sync --
+wins/2026-09-06-the-launch-floor-is-ten-microseconds.md).
 
 Prints the top ops by self CUDA time plus a GDN / attention / linear rollup. One job at
 a time: reads nvidia-smi first and refuses if another process holds the card.

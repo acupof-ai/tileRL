@@ -14,7 +14,10 @@ a stated diagnosis (n_partition=4 cannot fill 80 SMs at small N) and two levers
 
 The task itself carried the right next step, and it is the one that saved the
 work: **re-measure in the captured graph before optimizing**, because the
-microbench has a ~60 µs eager launch floor the graph path does not pay.
+microbench has an eager launch floor the graph path does not pay. (Measured 2026-09-06 at
+**~10 µs amortized / ~21-26 µs per-call**, not the ~60 µs written here;
+[the launch floor is ten microseconds](../wins/2026-09-06-the-launch-floor-is-ten-microseconds.md).
+The instruction stands — ~10% of a 100 µs microbench reading rather than ~60%.)
 
 ## Root Cause
 
