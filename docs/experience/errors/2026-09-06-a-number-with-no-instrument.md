@@ -1,7 +1,11 @@
 # A number with no instrument, cited five times — 2026-09-06
 
-> Status: open. The floor is unmeasured; `scripts/probe_launch_floor.py` measures it
-> and refuses a busy card, and the V100 holds the production endpoint.
+> Status: **Closed 2026-09-06.** Measured on an idle-issuing V100: **10.1 µs amortized,
+> 21.2 µs per-call-with-sync, 25.6 µs isolated**, flat across four decades of element
+> count. So "regardless of shape" was right and the magnitude was 6x high, and the ~60
+> came from no timer convention this card produces. All five citations now carry the
+> measurement. [the launch floor is ten
+> microseconds](../wins/2026-09-06-the-launch-floor-is-ten-microseconds.md)
 
 ## Context
 

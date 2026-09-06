@@ -111,5 +111,9 @@ the end rather than produce a wrong number).
 
 Reconciliation: scaled to all 305 launches the microbench predicts 4558 ms per
 512-row prefill against 3406 measured in-graph, 0.75×. Same order, so it is a
-usable A/B harness at M=32 — unlike M=1, where its ~60 µs eager launch floor
-dominates the small shapes.
+usable A/B harness at M=32 — unlike M=1, where its eager launch floor dominates the
+small shapes. (The floor was measured on 2026-09-06 as **~10 µs amortized / ~21-26 µs
+per-call**, not the ~60 µs written here;
+[the launch floor is ten microseconds](../wins/2026-09-06-the-launch-floor-is-ten-microseconds.md).
+The M=1 conclusion holds — the floor is still largest relative to the small shapes — at
+6x less magnitude.)
