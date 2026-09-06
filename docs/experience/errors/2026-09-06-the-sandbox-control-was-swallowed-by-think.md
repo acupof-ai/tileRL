@@ -134,11 +134,39 @@ Both red arms fired on the sandboxed assertion, not on the negative control belo
 the part that makes them controls at all: a revert that broke the unsandboxed half instead
 would produce the same red count and prove nothing.
 
-## Still open, filed separately
+## Still open, filed separately — now closed here
 
-`rollout.py:176`'s `{**os.environ, ...}` means every rollout inherits the spawning machine's
-`ANTHROPIC_MODEL`, so a child's behaviour depends on which session started it. Not this
-failure's cause, and a reproducibility defect regardless.
+`rollout.py:176`'s `{**os.environ, ...}` meant every rollout inherited the spawning machine's
+environment. Not this failure's cause, and a reproducibility defect regardless, so it is fixed
+in the same branch. **Enumerated rather than listed from memory**: this machine exports **20**
+matching variables, not the five model vars the original note named —
+
+```
+ANTHROPIC_AUTH_TOKEN  ANTHROPIC_BASE_URL  ANTHROPIC_MODEL
+ANTHROPIC_DEFAULT_{HAIKU,OPUS,SONNET}_MODEL                          (6)
+CLAUDECODE  CLAUDE_PID  CLAUDE_EFFORT  CLAUDE_PLUGIN_DATA
+CLAUDE_CODE_{ATTRIBUTION_HEADER,CHILD_SESSION,DISABLE_TERMINAL_TITLE,
+  ENTRYPOINT,EXECPATH,MAX_CONTEXT_TOKENS,MESSAGING_SOCKET,
+  MESSAGING_TOKEN,SESSION_ID,SUBAGENT_MODEL}                        (14)
+```
+
+Two of those are worse than a wrong model id: `CLAUDE_CODE_MESSAGING_SOCKET` and
+`CLAUDE_CODE_MESSAGING_TOKEN` are this session's cross-session channel, so a sandboxed rollout
+child was being handed the address and credential to message the agent session that spawned it.
+Nothing observed it doing so; the point is that an allow-list of five model names would have
+left both in place.
+
+The fix strips by prefix (`ANTHROPIC_`, `CLAUDE`) and then sets the four the rollout needs.
+Its gate, `test_rollout_env_carries_no_var_from_the_spawning_session`, asserts on the env dict
+handed to `subprocess.run` — the CLI's own `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` acts one level
+further in and cannot be observed from here — and checks an unrelated `TILERL_KEEP_ME` survives,
+so a scrub that took the whole environment would also be red. Its negative control restores
+`{**os.environ, ...}` and fails on the leaked-var assertion by name:
+
+```
+AssertionError: spawning session's vars reached the child:
+  ['ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'CLAUDECODE', 'CLAUDE_CODE_MESSAGING_SOCKET']
+```
 
 ## Rule
 
@@ -162,6 +190,11 @@ gate is vacuous, or the key you reverted is not the one that binds. Sweeping the
 separates them; stopping at the first green picks whichever reading you already expected. The
 two keys that left it green are the ones whose docstring calls them "the important key", which
 is how a plausible control gets chosen.
+
+Fifth, from the env scrub: **an allow-list of the names you remember is not a scrub.** The
+original note said "ANTHROPIC_MODEL and the four sibling model vars" because those were the
+five I had seen in an error message; `env | grep` found 20, two of them a live channel back
+into the parent session. Enumerate what is actually there before writing the set down.
 
 ## Results
 
