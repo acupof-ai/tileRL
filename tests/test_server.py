@@ -70,6 +70,16 @@ class _TextTokenizer(_ByteTokenizer):
         return self.PATTERN[:n].decode("utf-8", errors="replace")
 
 
+def _text_blocks(body: dict) -> str:
+    """The text blocks of a /v1/messages reply, joined.
+
+    Selected by type, never by index: a reasoning block now precedes the text
+    when the prompt opened <think>, and `content[0]["text"]` raises a KeyError
+    that reads like a routing defect.
+    """
+    return "".join(b["text"] for b in body["content"] if b["type"] == "text")
+
+
 def _build_engine(seed: int) -> Engine:
     cfg = tiny()
     model = build_random(cfg, seed=seed)
@@ -643,7 +653,13 @@ def test_sampling_bounds(client, field, value):
         "/v1/chat/completions",
         json={"messages": [{"role": "user", "content": "hi"}], field: value},
     )
-    assert resp.status_code == 422
+    # 400 with OpenAI's envelope, not FastAPI's 422 `detail` list: the SDKs map
+    # 422 to UnprocessableEntityError, so a client catching BadRequestError missed
+    # every rejected field. The field is named in the message.
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]["type"] == "invalid_request_error"
+    assert field in body["error"]["message"]
 
 
 def test_configured_tokenizer_fails_closed(tmp_path):
@@ -677,7 +693,11 @@ def test_messages_route_records_token_ids(client, tmp_path, monkeypatch):
     out = r.json()
     assert out["type"] == "message" and out["role"] == "assistant"
     assert out["stop_reason"] in ("end_turn", "max_tokens", "tool_use")
-    assert out["content"] and out["content"][0]["type"] in ("text", "tool_use")
+    # By type, not index: a thinking block now leads a reply whose prompt opened
+    # <think>, so content[0] is no longer the text block.
+    assert out["content"]
+    assert {b["type"] for b in out["content"]} <= {"thinking", "text", "tool_use"}
+    assert any(b["type"] in ("text", "tool_use") for b in out["content"])
     rid = r.headers["x-tilerl-request-id"]
 
     row = json.loads(rec.read_text().splitlines()[-1])
@@ -1235,11 +1255,17 @@ def test_a_reply_that_carries_only_the_think_closer_is_the_answer(tmp_path, monk
         opened = c.post("/v1/messages", json={
             "model": "m", "max_tokens": 64,
             "messages": [{"role": "user", "content": "page"}]}).json()
-        assert opened["content"][0]["text"] == "<p>hi</p>", opened
+        assert _text_blocks(opened) == "<p>hi</p>", opened
+        # The reasoning is not discarded, it moves to its own block -- Anthropic's
+        # native shape. Asserted here so a regression to stripping is caught by the
+        # same test that gates the closer handling.
+        assert [b["thinking"] for b in opened["content"]
+                if b["type"] == "thinking"] == ["planning\n"], opened
         off = c.post("/v1/messages", json={
             "model": "m", "max_tokens": 64, "thinking": {"type": "disabled"},
             "messages": [{"role": "user", "content": "page"}]}).json()
-        assert off["content"][0]["text"] == "no block here", off
+        assert _text_blocks(off) == "no block here", off
+        assert not [b for b in off["content"] if b["type"] == "thinking"], off
         bare = c.post("/v1/chat/completions", json={
             "model": "m", "max_tokens": 64,
             "messages": [{"role": "user", "content": "page"}]}).json()

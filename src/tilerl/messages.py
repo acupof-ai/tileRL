@@ -45,6 +45,7 @@ from .prompt import (
     render_tool_call,
     render_tools,
     sampling,
+    split_think,
     strip_think,
 )
 from .tokenizer import Tokenizer
@@ -187,9 +188,15 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
                 f"request {rid} did not finish within {_COMPLETION_TIMEOUT_S}s"
             )
         scores = engine.logprobs(rid)  # single reader; a second one raises
-        text = strip_think(tokenizer.decode(out), opened=_thinking(req))
+        reasoning, text = split_think(tokenizer.decode(out), opened=_thinking(req))
         prose, calls = _parse_tool_calls(text, req.tools)
         content: list[dict[str, Any]] = []
+        # Anthropic's native shape for reasoning is its own block, ahead of the
+        # text, and it must come first: a client renders content in order. We
+        # sign nothing, so `signature` is empty rather than invented -- the field
+        # exists for replaying a block back to the real API, which this is not.
+        if reasoning:
+            content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
         if prose or not calls:
             content.append({"type": "text", "text": prose})
         # One block per call, distinct ids: Claude Code runs them in parallel
@@ -273,14 +280,22 @@ def mount_messages(app: FastAPI, engine: Any, tokenizer: Tokenizer, model_name: 
 
             yield ev("message_start", {"type": "message_start",
                                        "message": {**body, "content": []}})
+            # Per block TYPE, not a tool/else pair: a thinking block carries
+            # neither `text` nor `input`, and the two-way branch raised inside the
+            # generator -- past the 200 header, so the client saw an incomplete
+            # chunked body rather than an error.
+            _EMPTY = {"thinking": {"type": "thinking", "thinking": "", "signature": ""},
+                      "text": {"type": "text", "text": ""}}
             for i, blk in enumerate(body["content"]):
-                tool = blk["type"] == "tool_use"
+                kind = blk["type"]
                 opening = ({k: v for k, v in blk.items() if k != "input"} | {"input": {}}
-                           if tool else {"type": "text", "text": ""})
+                           if kind == "tool_use" else _EMPTY[kind])
                 yield ev("content_block_start", {"type": "content_block_start",
                                                  "index": i, "content_block": opening})
                 delta = ({"type": "input_json_delta",
-                          "partial_json": json.dumps(blk["input"])} if tool
+                          "partial_json": json.dumps(blk["input"])} if kind == "tool_use"
+                         else {"type": "thinking_delta", "thinking": blk["thinking"]}
+                         if kind == "thinking"
                          else {"type": "text_delta", "text": blk["text"]})
                 yield ev("content_block_delta",
                          {"type": "content_block_delta", "index": i, "delta": delta})

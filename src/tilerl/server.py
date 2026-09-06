@@ -20,11 +20,13 @@ import logging
 import time
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .prompt import render_prompt, sampling, split_think, strip_think
+from .messages import _parse_tool_calls, mount_messages
+from .prompt import render_prompt, sampling, split_think
 from .tokenizer import ByteTokenizer, Tokenizer, get_tokenizer  # noqa: F401
 from .ui_assets import _CHAT_UI, _LANDING
 
@@ -61,6 +63,10 @@ class ChatCompletionRequest(BaseModel):
     logprobs: bool | None = None
     #: vLLM/sglang-style template overrides, e.g. {"enable_thinking": false}
     chat_template_kwargs: dict | None = None
+    #: OpenAI nests the schema under "function"; the template and messages.py
+    #: both want Anthropic's flat {name, description, input_schema}.
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -69,10 +75,26 @@ class ChatCompletionRequest(BaseModel):
 _MAX_THINK = {"none": 0, "minimal": 128, "low": 512, "medium": 2048, "high": 8192}
 
 
+def _flatten_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """OpenAI's ``{type, function: {name, description, parameters}}`` as the flat
+    ``{name, description, input_schema}`` the template renders and
+    ``messages._parse_tool_calls`` reads schemas from. One tool vocabulary for
+    both routes, so a call parses identically whichever API asked for it."""
+    if not tools:
+        return None
+    out = []
+    for t in tools:
+        fn = t.get("function") or t
+        out.append({"name": fn.get("name"), "description": fn.get("description", ""),
+                    "input_schema": fn.get("parameters") or fn.get("input_schema") or {}})
+    return out
+
+
 def _render_chat(messages: list[ChatMessage], thinking: bool | None = None,
-                 reasoning_effort: str | None = None) -> str:
-    return render_prompt([m.model_dump() for m in messages], thinking=thinking,
-                         effort=reasoning_effort)
+                 reasoning_effort: str | None = None,
+                 tools: list[dict[str, Any]] | None = None) -> str:
+    return render_prompt([m.model_dump() for m in messages], tools=tools,
+                         thinking=thinking, effort=reasoning_effort)
 
 
 def _chat_chunk(
@@ -116,7 +138,29 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     app = FastAPI(title="tilerl", version="0.1.0")
     app_started = int(time.time())
 
-    def _submit(req: ChatCompletionRequest) -> tuple[int, int, int, bool]:
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request: Request, exc: RequestValidationError):
+        """A rejected field must speak the envelope of the API it was sent to.
+
+        FastAPI's default is `{"detail": [...]}` with status 422, which no
+        OpenAI or Anthropic client can read: both look under `error.message`,
+        and the SDKs map 422 to UnprocessableEntityError rather than
+        BadRequestError. Each route's hand-written 400s already emit the right
+        shape -- pydantic runs before the handler body, so it bypassed them.
+        One app serves both APIs, so the envelope is chosen by path.
+        """
+        msg = "; ".join(
+            f"{'.'.join(str(p) for p in e.get('loc', ())[1:]) or 'body'}: {e.get('msg', '')}"
+            for e in exc.errors()) or "invalid request"
+        if request.url.path.startswith("/v1/messages"):
+            body: dict[str, Any] = {"type": "error",
+                                    "error": {"type": "invalid_request_error", "message": msg}}
+        else:
+            body = {"error": {"message": msg, "type": "invalid_request_error",
+                              "param": None, "code": None}}
+        return JSONResponse(status_code=400, content=body)
+
+    def _submit(req: ChatCompletionRequest) -> tuple[int, int, int, bool, list | None]:
         cap = _MAX_THINK.get((req.reasoning_effort or "").lower())
         kw = req.chat_template_kwargs or {}
         thinking = kw.get("enable_thinking")
@@ -127,8 +171,9 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             # a tokenizer that HAS the tag: ByteTokenizer spells it as 7 raw bytes, and its
             # bare turn is the tiny/dev path the None state exists for.
             thinking = (len(tokenizer.encode("<think>")) == 1 or None) if cap != 0 else False
+        tools = _flatten_tools(req.tools)
         input_ids = tokenizer.encode(_render_chat(
-            req.messages, thinking, kw.get("reasoning_effort") or req.reasoning_effort
+            req.messages, thinking, kw.get("reasoning_effort") or req.reasoning_effort, tools
         ))
         if not input_ids:
             raise ValueError("empty prompt after tokenization")
@@ -137,7 +182,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                           seed=req.seed, logprobs=bool(req.logprobs))
         # bool(thinking): True when the prompt opened <think>, so the reply carries only
         # the closer and strip_think must be told (None = bare turn, nothing to strip)
-        return engine.submit(input_ids, params), len(input_ids), params.max_new_tokens, bool(thinking)
+        return (engine.submit(input_ids, params), len(input_ids), params.max_new_tokens,
+                bool(thinking), tools)
 
     def _await_completion(request_id: int, timeout_s: float = 1800.0) -> list[int]:
         deadline = time.monotonic() + timeout_s
@@ -181,7 +227,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
         try:
-            request_id, prompt_tokens, max_new, opened = _submit(req)
+            request_id, prompt_tokens, max_new, opened, tools = _submit(req)
         except ValueError as exc:
             return JSONResponse(
                 status_code=400,
@@ -214,7 +260,21 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                 status_code=500,
                 content={"error": {"message": str(exc), "type": "api_error"}},
             )
-        text = strip_think(tokenizer.decode(output_ids), opened=opened)
+        # Same split as _stream below, so flipping `stream` does not change which
+        # fields a reply has: #159 wired reasoning_content into the streaming path
+        # only, and a client that switched got the reasoning on one path and lost
+        # it on the other.
+        reasoning, text = split_think(tokenizer.decode(output_ids), opened)
+        # The template answers a tool request in <tool_call> XML; parse it with the
+        # SAME function /v1/messages uses, so one call cannot mean two things
+        # depending on which API asked. The prose before the first call is the
+        # model's own explanation and stays as content.
+        text, calls = _parse_tool_calls(text, tools)
+        tool_calls = [
+            {"id": f"call_{request_id}_{i}", "type": "function",
+             "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}}
+            for i, (n, a) in enumerate(calls)
+        ] or None
         created = int(time.time())
         # OpenAI's shape: one entry per emitted token, decoded alongside its
         # score. A forced end-think token was never sampled and carries NaN,
@@ -236,9 +296,17 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
+                    "message": {"role": "assistant",
+                                # null, not "", when a tool call carries no prose:
+                                # OpenAI's shape, and "" reads as an empty reply.
+                                "content": text or None if tool_calls else text,
+                                # None, not "": the field is absent for a bare turn
+                                # or thinking off, which is what a client checks.
+                                "reasoning_content": reasoning or None,
+                                "tool_calls": tool_calls},
                     "logprobs": None if content is None else {"content": content},
-                    "finish_reason": "length" if len(output_ids) >= max_new else "stop",
+                    "finish_reason": ("tool_calls" if tool_calls else
+                                      "length" if len(output_ids) >= max_new else "stop"),
                 }
             ],
             "usage": _usage(prompt_tokens, len(output_ids)),
@@ -340,8 +408,6 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
     # Anthropic Messages: what Claude Code speaks. Same engine, same tokenizer;
     # it records token ids per request, which the OpenAI route does not.
-    from .messages import mount_messages
-
     mount_messages(app, engine, tokenizer, model_name)
 
     # The root is the playground: whoever opens the host:port wants to type at the

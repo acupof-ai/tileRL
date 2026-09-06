@@ -21,14 +21,6 @@ from test_server import _ByteTokenizer, _ScriptedEngine
 
 from tilerl.server import create_app
 
-
-#: strict=True: these five record deviations MEASURED on main today, so the marker
-#: fails the build if one starts passing without the marker being removed. Tranche
-#: (b) fixes the route and deletes the marker; it is not a permission to skip.
-def deviates(why: str):
-    return pytest.mark.xfail(strict=True, reason=why)
-
-
 openai = pytest.importorskip("openai")
 anthropic = pytest.importorskip("anthropic")
 uvicorn = pytest.importorskip("uvicorn")
@@ -54,9 +46,13 @@ class _PromptKeyedEngine(_ScriptedEngine):
     def __init__(self, tokenizer):
         super().__init__(tokenizer, [])
         self._tok = tokenizer
+        #: every prompt this engine was handed, so a test can assert what the
+        #: route RENDERED and not only what it parsed back
+        self.prompts: list[str] = []
 
     def submit(self, input_ids, params=None) -> int:
         prompt = self._tok.decode(list(input_ids))
+        self.prompts.append(prompt)
         # A tool round trip replays the original "run ls" turn, so keying on the
         # request alone answers the FOLLOW-UP with another tool call and the
         # assertion reads as a route defect. The tool response in the prompt is
@@ -73,14 +69,15 @@ def _free_port() -> int:
 
 
 @pytest.fixture(scope="module")
-def base_url(tmp_path_factory):
+def engine_and_url(tmp_path_factory):
     import os
 
     # /v1/messages appends a JSONL row per request; keep it out of the repo.
     os.environ["TILERL_MESSAGES_RECORD"] = str(tmp_path_factory.mktemp("rec") / "r.jsonl")
     port = _free_port()
     tok = _ByteTokenizer()
-    app = create_app(_PromptKeyedEngine(tok), tok, model_name="tilerl")
+    eng = _PromptKeyedEngine(tok)
+    app = create_app(eng, tok, model_name="tilerl")
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,
                                            log_level="error"))
     threading.Thread(target=server.run, daemon=True).start()
@@ -90,7 +87,7 @@ def base_url(tmp_path_factory):
         time.sleep(0.05)
     else:
         pytest.fail("uvicorn did not start")
-    yield f"http://127.0.0.1:{port}"
+    yield eng, f"http://127.0.0.1:{port}"
     server.should_exit = True
 
 
@@ -100,6 +97,16 @@ def base_url(tmp_path_factory):
 #: token, so asking explicitly is what makes this harness match production --
 #: without it every reasoning assertion below passes or fails for the wrong reason.
 THINKING_ON = {"chat_template_kwargs": {"enable_thinking": True}}
+
+
+@pytest.fixture
+def base_url(engine_and_url):
+    return engine_and_url[1]
+
+
+@pytest.fixture
+def engine(engine_and_url):
+    return engine_and_url[0]
 
 
 @pytest.fixture
@@ -136,7 +143,6 @@ def test_chat_stream_reconstructs_the_same_text(oa):
     assert got == REPLY
 
 
-@deviates("server.py:217 uses strip_think, so the non-stream path drops the reasoning the stream returns in reasoning_content")
 def test_chat_reasoning_is_the_same_field_on_both_paths(oa):
     """#159 put the reasoning in `reasoning_content` on the STREAM only.
 
@@ -166,7 +172,6 @@ def test_chat_stream_usage_is_opt_in_and_final(oa):
     assert chunks[-1].usage.completion_tokens > 0
 
 
-@deviates("ChatCompletionRequest has no tools field: nothing renders them into the prompt and the raw <tool_call> XML reaches the client in message.content")
 def test_chat_tools_come_back_as_tool_calls(oa):
     """The XML the template emits must reach the client as a structured call.
 
@@ -191,20 +196,44 @@ def test_chat_tools_come_back_as_tool_calls(oa):
     assert choice.finish_reason == "tool_calls"
 
 
-@deviates("no RequestValidationError handler, so pydantic returns FastAPI's 422 detail list instead of OpenAI's {error: {message, type}}")
+def test_chat_tools_reach_the_prompt(oa, engine):
+    """The schemas must be RENDERED, not only parsed back out.
+
+    Deleting the render call leaves every other tool assertion green, because a
+    canned engine emits the same call whether or not the prompt defined the tool
+    -- so parsing the reply cannot tell you the model was told what Bash is.
+    """
+    before = len(engine.prompts)
+    oa.chat.completions.create(
+        model="tilerl", messages=[{"role": "user", "content": "run ls"}],
+        tools=[{"type": "function", "function": {
+            "name": "Bash", "description": "run a command",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}}}}}])
+    prompt = engine.prompts[before]
+    assert "<tools>" in prompt and '"name": "Bash"' in prompt
+    assert "run a command" in prompt
+
+
 def test_chat_rejects_a_bad_field_with_openais_error_envelope(oa):
     """A pydantic failure must not escape as FastAPI's `detail` list.
 
-    Every OpenAI client reads `body["error"]["message"]`; a 422 with `detail`
-    raises the wrong exception class and carries no message where the SDK looks.
-    The route's own 400/503 paths already emit the right envelope -- validation
-    bypasses them.
+    The class is the load-bearing assertion: FastAPI's default 422 makes the SDK
+    raise UnprocessableEntityError, so a client catching BadRequestError does not
+    catch it at all. The route's own 400/503 paths already emit the right
+    envelope -- validation ran before them.
+
+    `.body` is the *unwrapped* `error` object, not the whole document: the SDK
+    reads `error` off the response itself, which is exactly why the wrapper has
+    to be there. The offending field is named in the message so a caller can
+    tell which one was rejected.
     """
     with pytest.raises(openai.BadRequestError) as exc:
         oa.chat.completions.create(model="tilerl", max_completion_tokens=0,
                                    messages=[{"role": "user", "content": "hi"}])
-    assert exc.value.body["error"]["message"]
-    assert exc.value.body["error"]["type"] == "invalid_request_error"
+    assert exc.value.status_code == 400
+    assert exc.value.body["type"] == "invalid_request_error"
+    assert "max_completion_tokens" in exc.value.body["message"]
 
 
 def test_models_list(oa):
@@ -214,10 +243,17 @@ def test_models_list(oa):
 # --- Anthropic messages ----------------------------------------------------
 
 
+def _text_of(message):
+    """The text block, selected by type. Indexing content[0] assumes the reply
+    starts with text, which stops being true the moment a thinking block is
+    prepended -- and then reads as a route defect."""
+    return "".join(b.text for b in message.content if b.type == "text")
+
+
 def test_messages_non_stream(an):
     m = an.messages.create(model="tilerl", max_tokens=64,
                            messages=[{"role": "user", "content": "hi"}])
-    assert m.content[0].text == REPLY
+    assert _text_of(m) == REPLY
     assert m.stop_reason == "end_turn"
     assert m.usage.output_tokens > 0
 
@@ -236,7 +272,6 @@ def test_messages_stream_events_and_text(an):
     assert names[-1] == "message_stop"
 
 
-@deviates("messages.py:190 strips the reasoning and emits no thinking content block")
 def test_messages_thinking_is_a_thinking_block(an):
     """Anthropic's native shape for reasoning is a `thinking` content block.
 
@@ -250,7 +285,7 @@ def test_messages_thinking_is_a_thinking_block(an):
     kinds = [b.type for b in m.content]
     assert "thinking" in kinds, f"reasoning was dropped, got {kinds}"
     thinking = next(b for b in m.content if b.type == "thinking")
-    assert thinking.thinking == REASON
+    assert thinking.thinking.rstrip("\n") == REASON  # see the chat arm on the newline
     assert [b.text for b in m.content if b.type == "text"] == [REPLY]
 
 
@@ -272,10 +307,9 @@ def test_messages_tool_use_round_trip(an):
                   {"role": "user", "content": [{"type": "tool_result",
                                                 "tool_use_id": use.id,
                                                 "content": "a.txt"}]}])
-    assert follow.content[0].text == REPLY
+    assert _text_of(follow) == REPLY
 
 
-@deviates("no RequestValidationError handler, so pydantic returns FastAPI's 422 detail list instead of Anthropic's {type: error, error: {...}}")
 def test_messages_rejects_a_bad_field_with_anthropics_error_envelope(an):
     with pytest.raises(anthropic.BadRequestError) as exc:
         an.messages.create(model="tilerl", max_tokens=0,
