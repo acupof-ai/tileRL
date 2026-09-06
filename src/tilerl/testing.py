@@ -169,6 +169,10 @@ class RefBackend:
     def materialize(self, params):
         return params
 
+    def refill_const_f32(self) -> int:
+        # No cast cache to refill: this backend hands every op the parameter itself.
+        return 0
+
     def gdn_decode(self, *args, **kwargs):
         return None  # no fused in-place decode: the model takes the gather/scatter path
 

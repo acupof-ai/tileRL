@@ -329,6 +329,11 @@ def _require_on_policy(
     said "graphs": ``build_engine(decode_graph=False)`` alone still carries a live
     ``PrefixStore``. Neither flag is a capability check: every Engine has the
     method, so testing for it would make this guard pass for everyone.
+
+    ``recapture_graph`` is still the waiver even though the graphs are now kept:
+    what it asserts is that the caller calls ``invalidate_weights()`` at all, and
+    that call is what refills the cached casts a replay would otherwise read
+    stale.
     """
     if not recapture_graph and engine._decode_graph_on is not False:
         raise ValueError("on-policy rollouts need build_engine(decode_graph=False), or "

@@ -75,6 +75,10 @@ def _drain_attributed(engine, ids, stats_of):
                "unexplained_ticks_secs": 0.0}
     counts = {"prefill_ticks": 0, "decode_ticks": 0, "mixed_ticks": 0, "unexplained_ticks": 0}
     sync_secs = 0.0
+    # A recapture lands inside ONE tick -- the first of its bucket after an invalidate --
+    # so it is invisible in a phase total and shows only as a slow tick. Without these,
+    # "the delta is recapture" is an inference from where else it could be.
+    slow: list[float] = []
     before = {k: stats_of().get(k, 0) for k in _PHASES}
     for tick in range(_MAX_TICKS):
         t0 = time.perf_counter()
@@ -88,6 +92,8 @@ def _drain_attributed(engine, ids, stats_of):
         moved = [k for k in _PHASES if after[k] > before[k]]
         before = after
         dt = t1 - t0
+        if dt > 1.0:
+            slow.append(round(dt, 4))
         if len(moved) > 1 or moved == ["mixed_forwards"]:
             buckets["mixed_secs"] += dt
             counts["mixed_ticks"] += 1
@@ -101,12 +107,15 @@ def _drain_attributed(engine, ids, stats_of):
             buckets["unexplained_ticks_secs"] += dt
             counts["unexplained_ticks"] += 1
         if all(i in done for i in ids):
+            counts["slow_ticks"] = len(slow)
+            counts["slow_tick_secs"] = round(sum(slow), 4)
+            counts["slow_tick_list"] = slow[:12]
             return done, buckets, counts, sync_secs, tick + 1
     raise RuntimeError(f"rollout did not finish within {_MAX_TICKS} ticks")
 
 
 def one_step(engine, model, prompt, reward_fn, backend, optimizer, trainable, *,
-             group, sampling, seed, step, micro):
+             group, sampling, seed, step, micro, invalidate=False):
     """`grpo_loop`'s body with the rollout instrumented. Returns the phase dict."""
     t_step = time.perf_counter()
     # `replace`, the same call `grpo_loop` makes: reconstructing from __dict__ would
@@ -141,6 +150,21 @@ def one_step(engine, model, prompt, reward_fn, backend, optimizer, trainable, *,
     _sync()
     train_secs = time.perf_counter() - t_train
 
+    # `grpo_loop(recapture_graph=True)` calls this after every update; without it the
+    # probe measures a configuration no RL run is in -- graphs captured once and never
+    # touched again. `held_after` is what makes the next step's capture cost
+    # attributable: N graphs gone here is N captures paid in the next rollout's first
+    # tick per bucket, not a number read off the total.
+    held_before = len(engine._decode_graphs)
+    invalidate_secs = 0.0
+    refilled = 0
+    if invalidate:
+        t_inv = time.perf_counter()
+        refilled = engine.invalidate_weights()
+        _sync()
+        invalidate_secs = time.perf_counter() - t_inv
+    held_after = len(engine._decode_graphs)
+
     rollout_secs = t_drain - t_step
     attributed = sum(buckets.values())
     out = {
@@ -156,6 +180,14 @@ def one_step(engine, model, prompt, reward_fn, backend, optimizer, trainable, *,
         "train_secs": train_secs,
         "backward_secs": timings.get("backward_secs", 0.0),
         "optimizer_secs": timings.get("optimizer_secs", 0.0),
+        "invalidate_secs": invalidate_secs,
+        "graphs_held_before_invalidate": held_before,
+        "graphs_held_after_invalidate": held_after,
+        "graphs_dropped": held_before - held_after,
+        # NOT "casts_refilled": this is whatever invalidate_weights RETURNS, and an
+        # arm that reverts that method changes what the number means -- the arm-A
+        # revert returns graphs dropped, and the old label read as 4 casts refilled.
+        "invalidate_returned": refilled,
         # Everything in the rollout the tick buckets do not explain: submit, poll, the
         # python around them. A residual, not a measurement of host overhead.
         "unattributed_secs": rollout_secs - attributed,
@@ -180,6 +212,12 @@ def main() -> int:
     ap.add_argument("--blocks", type=int, default=4096)
     ap.add_argument("--prompt-tokens", type=int, default=256)
     ap.add_argument("--out", default="")
+    ap.add_argument("--invalidate", action="store_true",
+                    help="call engine.invalidate_weights() after every update, which is "
+                         "what grpo_loop(recapture_graph=True) does and what the shipped "
+                         "--rl path (cli.py:538, decode_graph=True) therefore pays; "
+                         "without it the probe never invalidates and both arms of a "
+                         "keep-graphs comparison are the same configuration")
     a = ap.parse_args()
     if a.selfcheck:
         return _selfcheck()
@@ -204,7 +242,7 @@ def main() -> int:
     for step in range(a.steps):
         row = one_step(engine, model, prompt, lambda p, c: float(len(c) > 0), backend,
                        optimizer, trainable, group=a.group, sampling=sampling, seed=0,
-                       step=step, micro=a.micro)
+                       step=step, micro=a.micro, invalidate=a.invalidate)
         rows.append(row)
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
                           for k, v in row.items()}, sort_keys=True), flush=True)
@@ -213,13 +251,16 @@ def main() -> int:
     warm = rows[1:] or rows
     keys = ["step_secs", "rollout_secs", "prefill_secs", "decode_secs", "mixed_secs",
             "unexplained_ticks_secs", "unattributed_secs", "reward_secs", "train_secs",
-            "backward_secs", "optimizer_secs", "sync_secs"]
+            "backward_secs", "optimizer_secs", "sync_secs", "invalidate_secs"]
     summary = {f"mean_{k}": round(float(np.mean([r[k] for r in warm])), 4) for k in keys}
+    for k in ("graphs_dropped", "graphs_held_before_invalidate", "invalidate_returned"):
+        summary[f"mean_{k}"] = round(float(np.mean([r[k] for r in warm])), 2)
     summary["warm_steps"] = len(warm)
     summary["step0_secs"] = round(rows[0]["step_secs"], 4)
     m = summary
     # The decomposition has to add up, or a bucket is being double-counted.
-    parts = (m["mean_rollout_secs"] + m["mean_reward_secs"] + m["mean_train_secs"])
+    parts = (m["mean_rollout_secs"] + m["mean_reward_secs"] + m["mean_train_secs"]
+             + m["mean_invalidate_secs"])
     summary["sum_of_parts_secs"] = round(parts, 4)
     summary["step_minus_parts_secs"] = round(m["mean_step_secs"] - parts, 4)
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
@@ -265,8 +306,14 @@ def _selfcheck() -> int:
     done, buckets, counts, sync_secs, ticks = _drain_attributed(e, [0], e.stats)
     assert done == {0: [1, 2]}, done
     assert ticks == 5, ticks
-    assert counts == {"prefill_ticks": 1, "decode_ticks": 2, "mixed_ticks": 1,
-                      "unexplained_ticks": 1}, counts
+    assert {k: counts[k] for k in ("prefill_ticks", "decode_ticks", "mixed_ticks",
+                                   "unexplained_ticks")} == {
+        "prefill_ticks": 1, "decode_ticks": 2, "mixed_ticks": 1,
+        "unexplained_ticks": 1}, counts
+    # No tick here is over 1 s, so the slow-tick fields must exist and read zero:
+    # absent keys would make every arm that reads them a KeyError, and a nonzero
+    # count on a fake engine would mean the threshold fires on nothing.
+    assert counts["slow_ticks"] == 0 and counts["slow_tick_secs"] == 0, counts
     # The one tick that moved nothing must be in its own bucket, not in a phase.
     assert buckets["unexplained_ticks_secs"] > 0, buckets
     assert sum(buckets.values()) > 0
@@ -282,8 +329,47 @@ def _selfcheck() -> int:
     _, b2, c2, _, t2 = _drain_attributed(e2, [0], e2.stats)
     assert t2 == 1 and c2["mixed_ticks"] == 1, (t2, c2)
     assert b2["prefill_secs"] == 0.0 and b2["decode_secs"] == 0.0, b2
+
+    # --invalidate must actually call the engine, and must be off by default. Without
+    # this the flag can be wired to nothing and both arms of the keep-graphs comparison
+    # measure the same configuration -- which is the defect that produced this flag.
+    class InvEngine(FakeEngine):
+        def __init__(self, drops):
+            super().__init__()
+            self.calls = 0
+            self._decode_graphs = dict.fromkeys(range(drops), "g")
+            self._drops = drops
+
+        def submit(self, *a, **kw):
+            return 0
+
+        def invalidate_weights(self):
+            self.calls += 1
+            self._decode_graphs.clear()  # arm A: graphs dropped
+            return 7  # casts refilled
+
+    def _row(**kw):
+        e = InvEngine(3)
+        return e, one_step(e, None, np.zeros(2, dtype=np.int64), lambda p, c: 1.0, None,
+                           None, None, group=1, sampling=replace(
+                               SamplingParams(max_new_tokens=4), seed=0),
+                           seed=0, step=0, micro=1, **kw)
+
+    import tilerl.train as _train_mod
+    real_rl_step = _train_mod.rl_step
+    globals()["rl_step"] = lambda *a, **kw: 0.0  # no model here; only the flag is under test
+    try:
+        off_e, off = _row(invalidate=False)
+        on_e, on = _row(invalidate=True)
+    finally:
+        globals()["rl_step"] = real_rl_step
+    assert off_e.calls == 0 and off["graphs_dropped"] == 0, (off_e.calls, off)
+    assert on_e.calls == 1, on_e.calls
+    assert on["graphs_dropped"] == 3, on
+    assert on["invalidate_returned"] == 7, on
     print(f"selfcheck ok: 5 ticks -> {counts}; a two-counter tick is mixed, "
-          f"an unexplained tick is its own bucket")
+          f"an unexplained tick is its own bucket; --invalidate calls the engine "
+          f"({on_e.calls}) and off does not ({off_e.calls})")
     return 0
 
 

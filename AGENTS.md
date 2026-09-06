@@ -156,10 +156,18 @@ is a deliberate promotion.
 **On-policy rollouts.** `grpo_loop` and self-OPD refuse an engine whose caches
 would outlive an update, per cache: `recapture_graph=` waives the decode graph,
 `clear_prefix=` the prefix store, and a waiver obliges the loop to call
-`invalidate_weights()` after every step. The RL path now runs with
-`decode_graph=True, recapture_graph=True` — worth 2.16x on the 27B step
-(73.62 → 34.09 s) — and `prefix_store=NoPrefixStore()` until the block-granular
-store lands, since today's store publishes and never serves.
+`invalidate_weights()` after every step. The RL path runs with
+`decode_graph=True, recapture_graph=True` and
+`prefix_store=NoPrefixStore()` until the block-granular store lands, since
+today's store publishes and never serves.
+`invalidate_weights()` **keeps** the captured graphs: both optimizers end
+`p.copy_()` and `materialize` rebuilds the dict but not the tensors, so every
+address a capture baked survives the step. The exception is a cached cast —
+`_const_f32` refills only when called, and a replay calls nothing — so the call
+walks that cache and refills it in place. Keeping the graphs without the refill
+is silently off-policy. Worth **3.87 s off a 133.65 s step (2.9%)** at group 8 /
+gen 1024 / LoRA-16 / micro 1 on H20, four recaptures removed per step, see
+[wins/2026-09-07-an-update-keeps-the-decode-graphs.md](docs/experience/wins/2026-09-07-an-update-keeps-the-decode-graphs.md).
 
 **`--ssd-path` stays off on the serve path**: 1.65x worse per turn at 12 sessions and 0
 hits, see
