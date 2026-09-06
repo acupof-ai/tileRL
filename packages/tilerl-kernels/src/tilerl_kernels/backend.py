@@ -1411,10 +1411,12 @@ class Backend:
     def _const_f32(self, t, pad_to: int | None = None, dtype=torch.float32):
         """Cached cast of a PARAMETER (never an activation), invalidated by
         _version (optimizer copy_) and by weakref identity (a freed address
-        can be reused by a fresh model)."""
+        can be reused by a fresh model). A refill reuses the cached buffer, so
+        the address survives the invalidation."""
         if t.dtype == dtype and t.device == self.device and pad_to is None:
             return t
         key = (t.data_ptr(), pad_to, dtype)
+        stale = None
         hit = self._const_f32_cache.get(key)
         if hit is not None:
             ref, ver, c = hit
@@ -1422,9 +1424,15 @@ class Backend:
                 del self._const_f32_cache[key]
             elif ver == t._version:
                 return c
+            else:
+                stale = c  # same parameter, new values
         c = self._dev(t, dtype)
         if pad_to is not None and pad_to != c.shape[0]:
             c = torch.nn.functional.pad(c, (0, pad_to - c.shape[0]))
+        if stale is not None and stale.shape == c.shape and stale.dtype == c.dtype:
+            # a captured graph bakes this address; refill so a replay after an update
+            # reads the new values
+            c = stale.copy_(c)
         self._const_f32_cache[key] = (weakref.ref(t), t._version, c)
         return c
 
