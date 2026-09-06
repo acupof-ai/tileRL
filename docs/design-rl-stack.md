@@ -141,7 +141,9 @@ tilerl ledger  [--lineage <id>] [--json]        # what exists, what it descends 
 ```
 
 Every flag above ships except `serve --run`: `serve` takes `--model/--draft/--blocks/
---slots/--max-batch/--max-ctx/--host/--port/--devices/--depth/--no-warmup`, so an adapter
+--slots/--max-batch/--max-ctx/--host/--port/--devices/--depth/--no-warmup` plus the
+tier flags `--ssd-path/--ssd-min-tokens/--dram-bytes`
+(`wins/2026-09-06-dram-bytes-flag-and-health-gate.md`), so an adapter
 is loaded by path, not by run id. The block reads as a status list precisely because 7 of
 its 8 flags are real, which is why the one that is not says so.
 

@@ -13,7 +13,7 @@ a GPU not in hand ships its code with `pending-remote` in the wins entry and
 does not claim the number. Detail: `docs/design-rl-stack.md` (ISO, the draft
 head, the ledger); TP, CP and the 128K–256K budget are under P6 below.
 
-## Where we are (2026-09-02)
+## Where we are (2026-09-06)
 
 | Area | State | Evidence |
 |---|---|---|
@@ -21,10 +21,10 @@ head, the ledger); TP, CP and the 128K–256K budget are under P6 below.
 | Accuracy | MMLU 0-shot 74.6% (1000 q, `sample` draw; the recorded 76.3% was a different 1000 questions) | `wins/2026-08-28-mmlu-letter-restricted.md`, `errors/2026-09-03-the-mmlu-slice-moved-under-the-number.md` |
 | Speculation | correct, 1.87 committed tokens per trunk forward; **loses 4.9× on H20 because a draft disables graph capture**. On sm70 the draft runs eager, outside the captured tick, and costs 5.53 ms = 25% of a depth-3 tick; capturing it is rejected at a 1.14× ceiling (the tick is 88% GPU-bound). spec 49.7 tok/s at 1024 vs dense 37.6 | CHANGELOG 2026-08-29 verdict, `wins/2026-09-02-draft-is-two-thirds-of-a-spec-tick.md`, `errors/2026-09-02-capturing-the-draft-is-rejected.md` |
 | Training | LoRA-AdamW and Adafactor full fine-tune run on one card (73.2 GiB); GRPO and self-OPD exist; real prompts, GSM8K reward, MMLU before/after wired | `wins/2026-08-29-full-finetune-fits.md`, `wins/2026-09-02-rl-real-task.md` |
-| RL on the 27B | **never moved a downstream metric**; the run is pending-remote (pod held by another job) | same |
+| RL on the 27B | **never moved a downstream metric**. GSM8K exhausts (0.87 tied at step 35); MATH run 2 was killed at step 45 of 100 because a correctness-only reward lengthens rollouts into the cap and every group then ties at the floor | same, `errors/2026-09-06-the-rollouts-grew-into-the-cap.md` |
 | Kernels | one TileLang tree; cpu (CI/parity), metal, sm90, sm70 executed it; 71% of kernel lines are sm90 schedules | `docs/support-matrix.md`, `wins/2026-08-29-sm70-volta-fp4-cell.md` |
 | sm70 (V100) | fp4 inference runs: decode 37.6 tok/s at 4096 ctx against a 56.1 tok/s weight-bandwidth ceiling, prefill 7.89 ms/prompt token, GEMV 746 GB/s = 83% of peak | `docs/experience/LOG-v100-sm70.md` |
-| Ledger | human-written `docs/experience/`; per-run manifests landing 2026-09-02 (P4) | — |
+| Ledger | human-written `docs/experience/`; per-run manifests landing 2026-09-02 (P4). A run killed mid-training used to report `pass` — gates are written at the end and `all([])` is true — and now reports `killed` | `wins/2026-09-06-an-interrupted-run-reported-pass.md` |
 
 ## P1 — RL moves a number on the 27B — needs the pod
 
@@ -40,6 +40,15 @@ Prerequisites, all code, all CPU-gated:
   `NoPrefixStore()`, `copy_` into the adapter tensors.
 - Log the fraction of tied groups (all-equal rewards give zero advantage,
   `train.py group_advantages`); a no-think 27B on GSM8K may tie most groups.
+- A pre-flight length check does not constrain a policy that lengthens as it
+  trains: run 2 cleared it at a 1029-token mean and reached the 2048 cap at
+  step 41. `rollouts_within_cap` now re-measures every step over the last five
+  and stops at 0.8×cap (`wins/2026-09-06-periodic-rollout-guard.md`), and the
+  training rectangle is bucketed to the group's longest completion rather than
+  the cap (`wins/2026-09-06-grpo-length-buckets.md`). Neither addresses the
+  cause: `boxed_match` is pure correctness, so nothing in the objective prefers
+  the shorter of two correct answers
+  (`errors/2026-09-06-the-rollouts-grew-into-the-cap.md`).
 
 Run: `tilerl train --recipe grpo-gsm8k-27b --data gsm8k_train.jsonl
 --eval-gsm8k gsm8k_test.jsonl` (the recipe is 100 steps, group 8, 256 tokens,
@@ -49,6 +58,13 @@ Exit, both seeds: GSM8K held-out (500 q) after − before ≥ +5 pt (SE ≈ 2 pt
 MMLU (1000 q) after ≥ before − 2 pt; tied-group fraction < 50% (else the task
 is too easy for this model and the run says nothing — move to MATH). Then
 self-OPD, same gate. The manifest (P4) records the verdict.
+
+The move to MATH has happened and level 5 clears the tied-group bar — 0.34 tied
+at step 35, where GSM8K sat at 0.87 — so difficulty is no longer what blocks
+this phase. What blocks it is the reward: at a 2048 cap the run costs 229.2
+s/step and the backward is cap-bound rather than token-bound, and the policy
+drifts into the cap before 100 steps
+(`errors/2026-09-06-the-rollouts-grew-into-the-cap.md`).
 
 ## P2 — the speculative tick is captured, and the head stays on-policy — needs the pod
 

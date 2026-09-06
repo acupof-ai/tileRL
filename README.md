@@ -68,6 +68,13 @@ cut; whether it also buys accuracy this run cannot say, since ranking two arms
 [the control that reinterpreted it](docs/experience/wins/2026-09-04-the-cap-was-the-gradient.md) ·
 [why the first number was wrong](docs/experience/errors/2026-09-04-the-eval-cap-measured-itself.md)
 
+The cap is doing more work in that result than a reward would. On MATH level 5,
+where the task does not exhaust, a correctness-only reward lengthens rollouts
+until they hit the cap and every group ties at the floor — run 2 was killed at
+step 45 of 100. So the token cut above is a property of training under a tight
+cap on a task the model largely solves, not a general result about the reward.
+[The run](docs/experience/errors/2026-09-06-the-rollouts-grew-into-the-cap.md)
+
 ## Quickstart
 
 ```bash
