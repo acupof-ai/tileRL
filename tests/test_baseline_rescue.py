@@ -121,3 +121,25 @@ def test_the_overwrite_is_what_loses_the_row(tmp_path):
     lost = sim(False, tmp_path / "bad")
     assert good["d/a/sm70"]["tok_s"] == 140.0 and len(good) == 2
     assert lost["d/a/sm70"]["tok_s"] == 100.0 and len(lost) == 1, "the loss path changed"
+
+
+def test_a_baseline_row_without_tok_s_is_skipped_and_named():
+    """`pull` compares rows with `>` on tok_s, so a row lacking it used to raise
+    KeyError and kill the sync for every session — before the wipe, so nothing was
+    half-synced, but no sync could run at all. One hand-written `secs_per_step`
+    row on the pod did exactly that.
+
+    Skipping silently would be the other failure, so the stray is NAMED on stderr
+    and never merged. Driven through `baseline.py selfcheck` rather than importing
+    the function, because the selfcheck is otherwise reachable only by typing it.
+    """
+    out = subprocess.run([sys.executable, str(ROOT / "scripts" / "baseline.py"), "selfcheck"],
+                         cwd=ROOT, capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert "selfcheck ok" in out.stdout, out.stdout
+
+    # And the shipped baseline has no stray of its own: the row this fixed is gone,
+    # so a reader of the file cannot reintroduce the shape by copying a neighbour.
+    rows = json.loads((ROOT / BASE).read_text())
+    strays = {k: sorted(v) for k, v in rows.items() if "tok_s" not in v}
+    assert not strays, f"bench-baseline.json rows without tok_s: {strays}"

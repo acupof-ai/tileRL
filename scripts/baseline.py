@@ -21,6 +21,21 @@ def _load(p: Path) -> dict:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
+def _tok_s_only(rows: dict) -> tuple[dict, list[tuple[str, list[str]]]]:
+    """Split rows into the mergeable ones and the strays, which are NAMED not dropped.
+
+    Every row here is higher-is-better tok/s (`cli.py:762`), and `pull` compares with
+    `>`. One hand-written `secs_per_step` row on the pod raised `KeyError: 'tok_s'`
+    and killed the sync for every session -- before the wipe, so nothing was
+    half-synced, but no sync could run at all. Skipping silently would be the other
+    failure: a pod-raised row that never reaches the repo and nobody notices.
+    """
+    keep, skip = {}, []
+    for k, v in rows.items():
+        (keep.__setitem__(k, v) if "tok_s" in v else skip.append((k, sorted(v))))
+    return keep, skip
+
+
 def _local_is_newer(remote_commit: str | None, local_commit: str | None) -> bool:
     """Pod row stale = its commit is a proper ancestor of the local row's; unknown -> higher-wins."""
     if not remote_commit or not local_commit or remote_commit == local_commit:
@@ -44,6 +59,9 @@ def pull() -> int:
         print("pull: no remote snapshot", raw.stderr.strip()[:200], file=sys.stderr)
         return 1
     remote, local = json.loads(raw.stdout), _load(LOCAL)
+    remote, skipped = _tok_s_only(remote)
+    for k, keys in skipped:
+        print(f"pull: skipped {k}: no tok_s, keys {keys}", file=sys.stderr)
     raised, held = [], []
     for k, v in remote.items():
         cur = local.get(k)
@@ -80,6 +98,14 @@ def _selfcheck() -> int:
     assert not _local_is_newer(head, prev), "a pod row measured later must still raise"
     assert not _local_is_newer(head, head), "same commit is not newer"
     assert not _local_is_newer("unknown", head), "unknown provenance falls back to higher-wins"
+    # A stray row is skipped and named, never merged and never fatal.
+    keep, skip = _tok_s_only({
+        "suite/shape/sm90": {"commit": "abc", "tok_s": 1.0},
+        "train/step/sm90": {"commit": "abc", "secs_per_step": 34.09},
+    })
+    assert list(keep) == ["suite/shape/sm90"], keep
+    assert skip == [("train/step/sm90", ["commit", "secs_per_step"])], skip
+    assert _tok_s_only({}) == ({}, []), "empty stays empty"
     print("selfcheck ok")
     return 0
 
