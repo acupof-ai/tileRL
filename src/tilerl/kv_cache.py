@@ -398,10 +398,14 @@ class KvTier:
         # One chunk (4 blocks = 64 tokens), not the 2048 the eviction-driven version used:
         # write-through spills at chunk boundaries, so a 2048 floor refuses every publish.
         self.min_tokens = min_tokens
-        # bound in-flight writes: bursty publishes can enqueue faster than the disk
-        # drains, and an unbounded queue OOMs a 31GB host. Over the cap, spill refuses
-        # and counts it -- `refusals` over `offered` is the rate that says whether a
-        # 229 MB/s spinning device keeps up with write-through at all.
+        # bound in-flight writes: bursty publishes can enqueue faster than the disk drains.
+        # Over the cap, spill refuses and counts it -- `refusals` over `offered` is the rate
+        # that says whether the device keeps up with write-through at all. Measured on the
+        # pod's /work: 185 MiB/s sequential, and 240 MiB/s durable per 320.6 MiB entry, so a
+        # full queue of 32 takes 42.8 s to drain. The OOM this used to cite is not the live
+        # risk -- 32 x 320.6 MiB = 10.0 GiB against 1928 GiB total / 1473 available -- and the
+        # cap is still unsized: that needs a measured ARRIVAL rate, which nothing reports
+        # (errors/2026-09-06-ssd-save-ms-is-page-cache-time.md).
         self._max_pending = max_pending
         self.offered = 0
         self.refusals = 0
@@ -410,7 +414,10 @@ class KvTier:
         self.copy_ms = 0.0
         self.gather_ms = 0.0
         # The save was the one stage the timers above skipped, and it is the one the
-        # "~100 ms" in five comments described: measured 641.8 ms for a 320.6 MiB entry.
+        # "~100 ms" in five comments described. This timer wraps `torch.save` with no
+        # fsync, so it is PAGE-CACHE time: 273 ms for a 320.6 MiB entry on the pod's
+        # /work, where the durable cost of the same entry is 1337 (5.75x). Do not size a
+        # cap on it (errors/2026-09-06-ssd-save-ms-is-page-cache-time.md).
         self.save_ms = 0.0
         self.saves = 0
         self.over_budget = 0  # byte-budget evictions
@@ -434,9 +441,11 @@ class KvTier:
         # EVERY lookup reaches back. Wiping here made a cold hit impossible by construction.
         self.recovered = self._recover(marker, fingerprint)
         # Deferred write: spill_kv runs inside a decode tick, so it does only the
-        # GPU->CPU copy + enqueue; a daemon flushes the save off-tick. Measured 641.8
-        # ms/save for a 320.6 MiB entry on a 499.6 MiB/s host SSD (`ssd_save_ms`), not
-        # the ~100 ms five comments used to assert.
+        # GPU->CPU copy + enqueue; a daemon flushes the save off-tick. On the pod's /work
+        # one 320.6 MiB entry is 273 ms as `ssd_save_ms` counts it and **1337 ms durable**
+        # (240 MiB/s) -- the timer has no fsync, so it stops before the device has the
+        # bytes. The 641.8 this comment used to quote was measured on a Mac whose volume
+        # writes 26x faster (errors/2026-09-06-ssd-save-ms-is-page-cache-time.md).
         # _pending/_pending_st serve blobs not yet on disk, so resident()/load see them.
         self._pending: dict[int, dict] = {}
         self._pending_st: dict[int, dict] = {}
@@ -870,8 +879,9 @@ class PrefixStore:
         for b in blocks:
             self._pool.retain(b)
         # Write-through: a GPU->CPU copy plus an enqueue here, with the save off-tick on
-        # a daemon (641.8 ms measured for a 320.6 MiB entry, `ssd_save_ms`), so a full
-        # queue refuses rather than blocking prefill. Both
+        # a daemon (1337 ms durable for a 320.6 MiB entry on the pod's /work; `ssd_save_ms`
+        # reports 273 because it has no fsync), so a full queue refuses rather than
+        # blocking prefill. Both
         # halves go or neither -- a fault-in needs the pair. `resident` skips what is already
         # on disk, without which every fault-in writes back the bytes it just read.
         if (spill and self._ssd is not None and state is not None and not self._ssd.resident(h)

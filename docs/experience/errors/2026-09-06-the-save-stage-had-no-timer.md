@@ -1,8 +1,12 @@
 # The one spill stage with no timer was the one with a number — 2026-09-06
 
-> Status: partly open. The write side is measured here on a 499.6 MiB/s host SSD;
-> the pod's device is not measured, so the pod figure is an extrapolation and is
-> labelled as one. Listed in OPEN.md.
+> Status: superseded on the operand, 2026-09-06. The write side measured here is
+> **page-cache time** — the timer wraps `torch.save` with no `fsync`. Measured since on the
+> pod's `/work`: 273 ms as this timer counts it, **1337 ms durable (5.75x)**, and this Mac's
+> volume writes **26x** the pod's, which inverted three conclusions drawn from it. The 641.8
+> below is correct for this Mac and is not the number to size anything with:
+> [ssd_save_ms is page-cache time](2026-09-06-ssd-save-ms-is-page-cache-time.md). This entry's
+> caution that "the pod figure is an extrapolation" was right; the extrapolation was 2.1x low.
 
 ## Context
 
