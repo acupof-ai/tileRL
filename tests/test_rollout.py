@@ -31,12 +31,44 @@ pytestmark = pytest.mark.skipif(shutil.which("claude") is None,
 
 def test_sandbox_settings_refuse_rather_than_run_bare():
     s = rollout_mod.sandbox_settings("127.0.0.1", 9000)["sandbox"]
-    # The one key that matters: a host that cannot sandbox must not run the
-    # agent unconfined -- an unisolated rollout is worse than a missing one.
+    # `enabled` is what confines the writes -- measured by reverting each key alone and
+    # watching test_sandbox_confines_writes_to_the_rollout_dir: only `enabled` and the
+    # `--settings` payload turn it red. The two below govern refusal-to-run on a host with
+    # no sandbox, which is a different failure and equally worth keeping.
     assert s["enabled"] and s["failIfUnavailable"]
     assert s["allowUnsandboxedCommands"] is False
     assert s["network"]["allowedDomains"] == ["127.0.0.1:9000"]
     assert s["network"]["strictAllowlist"] is True
+
+
+def test_rollout_env_carries_no_var_from_the_spawning_session(monkeypatch):
+    """A rollout child must not inherit this machine's ANTHROPIC_*/CLAUDE* vars.
+
+    Two concrete leaks motivated the scrub: ANTHROPIC_MODEL made the CLI print
+    `unrecognized_model`, and CLAUDE_CODE_MESSAGING_SOCKET/_TOKEN hand the child a channel
+    back into the parent agent session. Asserted on the env dict handed to subprocess.run,
+    because the CLI's own scrub happens one level further in and cannot be observed here.
+    """
+    for k in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+              "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDECODE"):
+        monkeypatch.setenv(k, "leaked")
+    monkeypatch.setenv("TILERL_KEEP_ME", "yes")  # unrelated vars must survive
+
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen.update(kw["env"])
+        raise AssertionError("stop before spawning")
+
+    monkeypatch.setattr(rollout_mod.subprocess, "run", fake_run)
+    with pytest.raises(AssertionError, match="stop before spawning"):
+        rollout_mod.run_rollout("t", ".", "http://127.0.0.1:9000", "ep", sandbox=False)
+
+    leaked = [k for k, v in seen.items() if v == "leaked"]
+    assert not leaked, f"spawning session's vars reached the child: {leaked}"
+    assert seen["TILERL_KEEP_ME"] == "yes", "the scrub took unrelated vars with it"
+    assert seen["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9000"
+    assert seen["ANTHROPIC_API_KEY"] == "tilerl-local"
 
 
 def test_rollout_records_carry_the_episode_tag(tmp_path, monkeypatch):
