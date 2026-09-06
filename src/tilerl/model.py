@@ -359,7 +359,10 @@ class Model:
         x: torch.Tensor,
         kv: Any,
         backend: Backend,
+        state_in: torch.Tensor | None = None,
+        window_in: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # pre-gathered state: a replay must not re-gather what its own forward advanced
         cfg = self.cfg
         p = f"layers.{layer_idx}"
         h = backend.rmsnorm(x, self.params[f"{p}.input_norm"], cfg.rms_eps, narrow=True)
@@ -404,9 +407,13 @@ class Model:
             )
         if out is None:
             pool = kv.state_pool
-            state, window = backend.state_gather(
-                pool.states, pool.conv_windows, kv.state_slot, linear_idx, pool.win_parity
-            )
+            if state_in is None:
+                state, window = backend.state_gather(
+                    pool.states, pool.conv_windows, kv.state_slot, linear_idx,
+                    pool.win_parity
+                )
+            else:
+                state, window = state_in, window_in
             if ks:  # the tape replays kwargs into gdn_backward, which has no such arg
                 kwargs["keep_steps"] = ks
             cp = getattr(backend, "cp_world", 1)
@@ -432,6 +439,24 @@ class Model:
         # The layer's largest pure block: attention and GDN advance the pools, so
         # replaying either would recompute against state its own forward moved.
         return autograd.checkpoint(self._mlp_body, layer_idx, x, kv, backend)
+
+    def _layer_body(
+        self,
+        layer_idx: int,
+        linear_idx: int,
+        x: torch.Tensor,
+        pos: torch.Tensor,
+        kv: Any,
+        backend: Backend,
+        state_in: torch.Tensor | None,
+        window_in: torch.Tensor | None,
+    ) -> torch.Tensor:
+        # one segment per layer: the MLP-only one left 697.8 MiB live to store 85.0
+        if self.cfg.is_full_attn(layer_idx):
+            x = self._full_attn(layer_idx, x, pos, kv, backend)
+        else:
+            x = self._gdn(layer_idx, linear_idx, x, kv, backend, state_in, window_in)
+        return self._mlp_body(layer_idx, x, kv, backend)
 
     def _mlp_body(self, layer_idx: int, x: torch.Tensor, kv: Any, backend: Backend):
         cfg = self.cfg
@@ -459,6 +484,7 @@ class Model:
         last_only: bool | list[int] = False,
         aux_layers: tuple[int, ...] = (),
         sharded_logits: bool = False,
+        segment: str = "mlp",
     ) -> torch.Tensor:
         """``input_ids`` [B,T], ``positions`` [T] or [B,T], ``kv`` a BatchKv with
         pools attached -> logits [B,T,vocab]. ``hidden_out`` receives each
@@ -472,17 +498,39 @@ class Model:
         pos = torch.as_tensor(positions, dtype=torch.long, device=device)
         x = backend.embedding(ids, self.params["embed_tokens"])
         linear_idx = 0
+        pool0 = getattr(kv, "state_pool", None) if segment == "layer" else None
+        # clone: the reference would compare against itself
+        parity0 = None if pool0 is None else pool0.win_parity.clone()
         for i in range(cfg.num_layers):
-            if cfg.is_full_attn(i):
-                x = self._full_attn(i, x, pos, kv, backend)
+            if segment == "layer":
+                state_in = window_in = None
+                if not cfg.is_full_attn(i):
+                    # outside the segment: a replay would re-gather advanced state
+                    pool = kv.state_pool
+                    state_in, window_in = backend.state_gather(
+                        pool.states, pool.conv_windows, kv.state_slot, linear_idx,
+                        pool.win_parity
+                    )
+                x = autograd.checkpoint(self._layer_body, i, linear_idx, x, pos, kv,
+                                        backend, state_in, window_in)
             else:
-                x = self._gdn(i, linear_idx, x, kv, backend)
+                if cfg.is_full_attn(i):
+                    x = self._full_attn(i, x, pos, kv, backend)
+                else:
+                    x = self._gdn(i, linear_idx, x, kv, backend)
+                x = self._mlp(i, x, kv, backend)
+            if not cfg.is_full_attn(i):
                 linear_idx += 1
-            x = self._mlp(i, x, kv, backend)
             if i in aux_layers and hidden_out is not None:
                 hidden_out.append(x)
         if hidden_out is not None:
             hidden_out.append(x)
+        if parity0 is not None:
+            # a flip mid-forward would send a replayed scatter to the other plane
+            assert torch.equal(pool0.win_parity, parity0), (
+                f"win_parity moved {parity0.tolist()} -> {pool0.win_parity.tolist()} "
+                f"during a segmented forward: a replay would scatter to the wrong plane"
+            )
         # lm_head over every prefill position is 4.7% of the FLOPs and a 508 MB
         # output thrown away; the caller passes ``last_only`` (a list gives the
         # per-row valid length of a mixed tick) because a device-side length

@@ -1386,6 +1386,166 @@ def test_adafactor_streaming_matches_collecting():
         assert torch.equal(streamed[k], v), f"{k} diverged"
 
 
+# ------------------------------------------------- segment = layer vs segment = mlp
+
+
+def _segment_run(model, backend, ids, pos, segment):
+    """One forward + backward under `segment`; returns (named grads, pool-unchanged)."""
+    from tilerl.train import _training_kv
+
+    kv = _training_kv(model, ids.shape[0], ids.shape[1], device=backend.device)
+    tape = Tape()
+    with torch.no_grad(), tape:
+        out = model.forward(ids, pos, kv, RecordingBackend(backend), segment=segment)
+    # snapshot AFTER the forward: the claim is that backward's replays do not move the
+    # pool. Gradients being equal cannot show this -- a corrupted recurrence has
+    # produced byte-identical outputs on this project before.
+    snap = {n: getattr(kv.state_pool, n).clone()
+            for n in ("states", "conv_windows") if getattr(kv.state_pool, n, None) is not None}
+    assert snap, "no pool tensor to compare: this arm would be vacuous"
+    grads = tape.backward(torch.ones_like(out))
+    intact = all(torch.equal(v, getattr(kv.state_pool, n)) for n, v in snap.items())
+    by_id = {id(t): n for n, t in model.params.items()}
+    return {by_id[k]: v for k, v in grads.items() if k in by_id}, intact
+
+
+def test_layer_segment_matches_the_mlp_segment():
+    """A layer-wide checkpoint must give the same gradients as the per-MLP one, and
+    must leave the state pool where the forward left it.
+
+    The hazard is GDN: its recurrent state is gathered from the pool, so a replay
+    that re-gathers reads the state its own forward advanced. The state and conv
+    window are handed into the segment for exactly that reason; the control in
+    `test_layer_segment_needs_the_handed_in_state` is what shows this test can fail.
+    """
+    torch.manual_seed(19)
+    cfg = tiny()
+    model = build_random(cfg, seed=7)
+    backend = get_backend()
+    t = 24
+    ids = np.random.default_rng(1).integers(3, cfg.vocab_size, size=(1, t)).astype(np.int64)
+    pos = np.arange(t, dtype=np.int64)
+
+    g_mlp, pool_mlp = _segment_run(model, backend, ids, pos, "mlp")
+    g_layer, pool_layer = _segment_run(model, backend, ids, pos, "layer")
+
+    # batch 2, because _training_kv sizes num_slots by batch: at batch 1 win_parity is a
+    # 1-element tensor and `==` bool-ables, so the parity assert only compares a real
+    # vector here. Caught by grpo_loop at batch 8, never by a batch-1 arm.
+    ids2 = np.repeat(ids, 2, axis=0)
+    _segment_run(model, backend, ids2, pos, "layer")
+
+    assert pool_mlp and pool_layer, "backward moved the state pool"
+    assert set(g_mlp) == set(g_layer), (
+        f"different parameters got gradients: only mlp {sorted(set(g_mlp) - set(g_layer))}, "
+        f"only layer {sorted(set(g_layer) - set(g_mlp))}"
+    )
+    assert g_mlp, "no named parameter gradients: the comparison would be vacuous"
+    for name in sorted(g_mlp):
+        a, b = g_mlp[name], g_layer[name]
+        rel = (a - b).abs().max().item() / max(a.abs().max().item(), 1e-12)
+        assert rel < 1e-2, f"{name}: layer-segment gradient differs by rel {rel:.3e}"
+
+
+def test_the_layer_segment_swallows_the_ops_the_mlp_one_leaves_out():
+    """The point of the change, on the tape: with `segment="layer"` the attention and
+    GDN ops move INSIDE the segments instead of staying live for the whole forward.
+    Measured on the 27B at gen 4096, the per-MLP arrangement retained 697.8 MiB per
+    segment against the 85.0 MiB the wrapper stores."""
+    from tilerl.train import _training_kv
+
+    cfg = tiny()
+    model = build_random(cfg, seed=7)
+    backend = get_backend()
+    t = 24
+    ids = np.random.default_rng(1).integers(3, cfg.vocab_size, size=(1, t)).astype(np.int64)
+    pos = np.arange(t, dtype=np.int64)
+    counts = {}
+    for segment in ("mlp", "layer"):
+        tape = Tape()
+        with torch.no_grad(), tape:
+            model.forward(ids, pos, _training_kv(model, 1, t, device=backend.device),
+                          RecordingBackend(backend), segment=segment)
+        outside = [e.op_name for e in tape._entries if e.op_name != "checkpoint"]
+        counts[segment] = len(outside)
+    assert counts["layer"] < counts["mlp"] / 2, (
+        f"{counts['layer']} ops left outside the segments against {counts['mlp']}: the "
+        f"layer segment is not absorbing the attention/GDN work"
+    )
+
+
+def test_the_segment_selector_switches_on_the_measured_bracket():
+    """`_step` picks the segment by T, and both sides of the threshold must be reachable.
+
+    A branch on a measured constant is the kind that stops firing when the constant moves:
+    every real training shape landing on one side reads as a working selector. Asserted by
+    driving the expression `_step` uses, at the bracket's own endpoints — 1280 ran with the
+    MLP segment (1.079x cheaper on backward), 4352 only runs with the layer one.
+    """
+    import re
+    from pathlib import Path
+
+    from tilerl import train as train_mod
+    from tilerl.train import _MLP_SEGMENT_MAX_T
+
+    pick = lambda t: "layer" if t > _MLP_SEGMENT_MAX_T else "mlp"  # noqa: E731
+    assert pick(1280) == "mlp", "T=1280 was measured to run with the MLP segment"
+    assert pick(4352) == "layer", "T=4352 OOMs with the MLP segment"
+    assert pick(_MLP_SEGMENT_MAX_T + 1) == "layer" and pick(_MLP_SEGMENT_MAX_T) == "mlp"
+
+    # and the call site must use that expression, not a hardcoded segment: a literal
+    # segment="layer" would pass every assertion above while ignoring T entirely.
+    src = Path(train_mod.__file__).read_text()
+    call = re.search(r"segment=([^\n]+)", src)
+    assert call and "_MLP_SEGMENT_MAX_T" in call.group(1), (
+        f"_step must select the segment by T, got segment={call.group(1) if call else None}"
+    )
+
+
+def test_layer_segment_needs_the_handed_in_state():
+    """The control for `test_layer_segment_matches_the_mlp_segment`: mutate `_gdn` so the
+    segment re-gathers instead of using the state handed to it, and the GDN gradients must
+    go wrong.
+
+    Written as a source mutation rather than as two calls on a live pool. The obvious
+    version -- call `_gdn` with and without `state_in` and compare pool contents -- proves
+    nothing on tiny: the scatter converges, so the re-gathering call left the pool
+    byte-identical and the arm passed while discriminating nothing. Measured: this
+    mutation moves `layers.1.in_proj_qkv`'s gradient by rel 8.1e-01.
+    """
+    import pathlib
+
+    from tilerl import model as model_mod
+
+    src = pathlib.Path(model_mod.__file__).read_text()
+    find = "                state, window = state_in, window_in"
+    assert src.count(find) == 1, "anchor moved; this control is dead"
+    repl = ("                state, window = backend.state_gather(\n"
+            "                    pool.states, pool.conv_windows, kv.state_slot, "
+            "linear_idx, pool.win_parity)")
+    ns: dict = {"__name__": model_mod.__name__, "__package__": model_mod.__package__,
+                "__file__": model_mod.__file__}
+    exec(compile(src.replace(find, repl), model_mod.__file__, "exec"), ns)
+
+    cfg = tiny()
+    backend = get_backend()
+    t = 24
+    ids = np.random.default_rng(1).integers(3, cfg.vocab_size, size=(1, t)).astype(np.int64)
+    pos = np.arange(t, dtype=np.int64)
+    good = build_random(cfg, seed=7)
+    assert "Model" in ns, f"model class not found in the mutated module: {sorted(ns)[:8]}"
+    bad = ns["Model"](cfg, good.params)  # same weights, mutated forward
+
+    g_ok, _ = _segment_run(good, backend, ids, pos, "layer")
+    g_bad, _ = _segment_run(bad, backend, ids, pos, "layer")
+    worst = max((g_ok[n] - g_bad[n]).abs().max().item() / max(g_ok[n].abs().max().item(), 1e-12)
+                for n in set(g_ok) & set(g_bad))
+    assert worst > 1e-2, (
+        f"re-gathering inside the segment changed no gradient (worst rel {worst:.3e}): "
+        f"the handed-in state is not what makes the layer segment correct"
+    )
+
+
 def test_train_step_does_not_sync_per_parameter():
     """One host sync per step (the loss), not two per parameter inside Adafactor.step_one."""
     from torch.utils._python_dispatch import TorchDispatchMode
