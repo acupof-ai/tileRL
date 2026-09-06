@@ -202,16 +202,43 @@ def main() -> int:
     # "\n\n" may not occur, which would report a pass for a stop that never fired.
     # Only a real tokenizer can say whether a multi-character stop lands on a token
     # boundary at all, which is the half the canned engine cannot establish.
-    def _mid_stop() -> str | None:
-        r = oa.chat.completions.create(model=m, messages=ask, max_completion_tokens=cap)
+    #
+    # Its OWN prompt, not `ask`. On the V100 run of 753da30 all three arms skipped
+    # with "reply too short to cut inside": `ask` demands a one-word answer, so the
+    # reply cannot be long enough to cut inside and the arms could never fire. A
+    # skip that is guaranteed by construction is not coverage.
+    say_more = [{"role": "user",
+                 "content": "In two full sentences, say what the capital of France is."}]
+
+    def _mid_stop() -> tuple[str | None, str]:
+        """A 4-char stop from inside the model's own reply, or None and WHY.
+
+        The reason is returned, with its number, because "reply too short" alone is
+        what let three arms skip on every live run without anyone noticing they
+        could not fire at all.
+
+        A reply may still carry `</think>` when the tokenizer has no <think> token
+        (the tiny/dev path, same condition `chat non-stream` skips on). The stop is
+        then taken from AFTER the closer, never across it: cutting inside the markup
+        made the two chat arms "pass" on `/thi` while the messages route correctly
+        refused, since its reasoning gate does not match before the closer. Found by
+        a control, not by reading.
+        """
+        r = oa.chat.completions.create(model=m, messages=say_more,
+                                       max_completion_tokens=cap)
         text = (r.choices[0].message.content or "").strip()
-        return text[1:4] if len(text) > 5 else None
+        prose = text.split("</think>")[-1].strip()  # prose only; never cut the markup
+        # Past the first word: a stop inside word 1 leaves almost nothing to assert on.
+        cut = prose.find(" ") + 1
+        if len(prose) <= cut + 8:
+            return None, f"reply too short to cut inside: {len(prose)} chars of prose"
+        return prose[cut + 1:cut + 5], ""
 
     def stop_chat():
-        stop = _mid_stop()
+        stop, why = _mid_stop()
         if not stop:
-            return "SKIP  (reply too short to cut inside)"
-        r = oa.chat.completions.create(model=m, messages=ask, stop=[stop],
+            return f"SKIP  ({why})"
+        r = oa.chat.completions.create(model=m, messages=say_more, stop=[stop],
                                        max_completion_tokens=cap)
         text = r.choices[0].message.content or ""
         assert stop not in text, f"the stop sequence is still in the reply: {text!r}"
@@ -220,11 +247,11 @@ def main() -> int:
     check("chat stop sequence", stop_chat)
 
     def stop_chat_stream():
-        stop = _mid_stop()
+        stop, why = _mid_stop()
         if not stop:
-            return "SKIP  (reply too short to cut inside)"
+            return f"SKIP  ({why})"
         text = ""
-        for c in oa.chat.completions.create(model=m, messages=ask, stream=True,
+        for c in oa.chat.completions.create(model=m, messages=say_more, stream=True,
                                             stop=[stop], max_completion_tokens=cap):
             if c.choices:
                 text += c.choices[0].delta.content or ""
@@ -234,10 +261,10 @@ def main() -> int:
     check("chat stop sequence (stream)", stop_chat_stream)
 
     def stop_messages():
-        stop = _mid_stop()
+        stop, why = _mid_stop()
         if not stop:
-            return "SKIP  (reply too short to cut inside)"
-        r = an.messages.create(model=m, max_tokens=cap, messages=ask,
+            return f"SKIP  ({why})"
+        r = an.messages.create(model=m, max_tokens=cap, messages=say_more,
                                stop_sequences=[stop])
         text = "".join(b.text for b in r.content if b.type == "text")
         assert stop not in text, f"the stop sequence is still in the reply: {text!r}"
