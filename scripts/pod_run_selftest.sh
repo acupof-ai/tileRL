@@ -7,13 +7,11 @@
 # POD_RUN_EMIT_RUNNER=1. The previous version inlined its own copy, which would have passed
 # against any bug in pod_run.sh -- including the one this file now covers.
 #
-# What it asserts, each having failed on the pod:
-#   * a WRAPPER-SCRIPT command still ends up claimed. card_claim refuses a shell pid and
-#     that refusal was never retried, so `-- bash wrapper.sh` ran unclaimed and card 6 read
-#     ORPHAN with 69583 MiB for 5 minutes (2026-09-07).
-#   * an unclaimable job is KILLED, not left running: an unclaimed card is what gets a
-#     container restarted under someone else's run.
-#   * the claim is released even so.
+# What it asserts, each having failed on the pod (errors/2026-09-07-a-guard-that-stopped-guarding.md):
+#   * a WRAPPER-SCRIPT command ends up claimed -- its python is a descendant.
+#   * a DIRECT-PYTHON command is claimed as itself -- it has no descendant to follow.
+#   * a multi-arm wrapper re-claims per arm, so no arm runs on an unclaimed card.
+#   * an unclaimable job is KILLED, not left running, and the claim is released even so.
 set -euo pipefail
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
@@ -30,11 +28,20 @@ log = os.environ["CLAIM_LOG"]
 argv = " ".join(sys.argv[1:])
 with open(log, "a") as f:
     f.write(argv + "\n")
+# Both refusals are the REAL messages, measured against /work/aupai on 2026-09-07 against a
+# python holding no device: --require-device says "holds no GPU device fd", --wait-for-device
+# says "no descendant ... opened a GPU device". A mock that granted on the flag alone made
+# --wait-for-device look sufficient for every shape, which it is not.
 mode = os.environ.get("CLAIM_MODE", "shell_then_device")
 if argv.startswith("acquire"):
     if mode == "never":
-        print("pid 123 is a shell, not the job: 'bash /work/wrapper.sh'")
-    elif "--wait-for-device" in argv:
+        print("pid 123 holds no GPU device fd: '/usr/bin/python3 -c ...'")
+    elif mode == "self_device":       # $CMD is python directly: it IS the pid on the card
+        if "--require-device" in argv:
+            print("claimed 6 for tilerl-selftest")
+        else:
+            print("no descendant of pid 123 opened a GPU device in 1s -- TIMEOUT")
+    elif "--wait-for-device" in argv:  # a wrapper: the python is a descendant
         print("claimed 6 for tilerl-selftest")
     else:
         print("pid 123 is a shell, not the job: 'bash /work/wrapper.sh'")
@@ -52,7 +59,7 @@ export PATH="$TMP/bin:$PATH" CLAIM_LOG="$TMP/claims.txt"
 
 # A wrapper script as the command: the shape whose claim was refused and never retried.
 cat > "$TMP/work/wrapper.sh" <<'SH'
-python3 -c "import time; time.sleep(1); print('job done')"
+python3 -c "import time; time.sleep(${JOB_SECS:-1}); print('job done')"
 SH
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -73,7 +80,10 @@ run_arm() {  # run_arm <mode> <outdir> -> writes rc to $2/rc
   set +e
   # CLAIM_MODE must reach the RUN, not just the emit: setting it only on the pod_run.sh call
   # left the control using the default mode, and arm 2 passed while proving nothing.
-  ( cd "$TMP/work" && CLAIM_MODE=$mode CLAIM_LOG=$CLAIM_LOG bash "$out/runner.sh" > "$out/wrapper.out" 2>&1 )
+  # JOB_SECS reaches the RUN too: the wrapper reads it when the runner executes it, and the
+  # same "set it only on the emit" mistake already cost this file an arm that proved nothing.
+  ( cd "$TMP/work" && CLAIM_MODE=$mode CLAIM_LOG=$CLAIM_LOG JOB_SECS=${JOB_SECS:-1} \
+      bash "$out/runner.sh" > "$out/wrapper.out" 2>&1 )
   echo $? > "$out/rc"
   set -e
   cp "$CLAIM_LOG" "$out/claims.txt"
@@ -115,10 +125,21 @@ n_acq=$(grep -c '^acquire' "$CLAIM_LOG")
 [ "$n_acq" -ge 3 ] || fail "arm 3: expected >=3 acquires (wrapper + 2 arms), got $n_acq: $(cat "$CLAIM_LOG")"
 grep -q "arm two" "$TMP/work/selftest.log" || fail "arm 3: the second arm did not run"
 
+# ---- arm 4: a DIRECT-python job is claimed as itself, not as a descendant ------------
+# The shape every profile run takes: $JOB is the python itself, with no descendant to follow.
+run_arm self_device "$TMP/a4"
+grep -q "claimed 6" "$TMP/a4/wrapper.out" || fail "arm 4: a direct-python job was not claimed: $(cat "$TMP/a4/wrapper.out")"
+grep -q -- "--require-device" "$TMP/a4/claims.txt" || fail "arm 4: acquire never tried --require-device: $(cat "$TMP/a4/claims.txt")"
+[ "$(cat "$TMP/a4/rc")" = 0 ] || fail "arm 4: rc $(cat "$TMP/a4/rc"), out: $(cat "$TMP/a4/wrapper.out")"
+
 # ---- arm 2 (the control): an unclaimable job is killed, not left running -------------
 # Without this arm, arm 1 passes on a runner that ignores the claim result entirely.
-run_arm never "$TMP/a2"
+# DEVICE_WAIT=2 with a job that outlives it: the condition is "never claimed while ALIVE",
+# not "exited before the claim landed" -- a 1 s job under a 300 s poll exits first and takes
+# the benign path, which made this arm pass on rc 0.
+JOB_SECS=8 DEVICE_WAIT=2 run_arm never "$TMP/a2"
 [ "$(cat "$TMP/a2/rc")" = 4 ] || fail "arm 2: an unclaimable job must exit 4, got $(cat "$TMP/a2/rc"): $(cat "$TMP/a2/wrapper.out")"
+grep -q "card_claim FAILED, killing" "$TMP/a2/wrapper.out" || fail "arm 2: the job was not killed: $(cat "$TMP/a2/wrapper.out")"
 grep -q "card_claim FAILED" "$TMP/a2/wrapper.out" || fail "arm 2: the failure was not reported: $(cat "$TMP/a2/wrapper.out")"
 grep -q "^release " "$TMP/a2/claims.txt" || fail "arm 2: release never ran after a kill"
 
@@ -127,4 +148,4 @@ grep -q "^release " "$TMP/a2/claims.txt" || fail "arm 2: release never ran after
 # macOS's launchd reaps. Verified directly on the pod instead: a child whose bash parent exits
 # reads `stat=Zs ppid=1`, the same child under a parent that waits reads reaped. A grep for
 # stat=reaped here would pass against a wrapper with the reaping removed.
-echo "PASS: a wrapper-launched job is claimed via --wait-for-device; an unclaimable one exits 4 and releases"
+echo "PASS: a wrapper-launched job claims via --wait-for-device, a direct-python one via --require-device, a multi-arm wrapper re-claims per arm, and an unclaimable job exits 4 and releases"
