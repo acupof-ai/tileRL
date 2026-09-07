@@ -732,6 +732,12 @@ def test_gdn_bwd_spans_chunks():
 
 
 
+#: Worst acceptable relative gradient error for the shipped `_GDN_CHUNK`. Provisional:
+#: nothing has measured what a GRPO update absorbs
+#: (errors/2026-09-07-what-gradient-error-is-acceptable.md).
+_GDN_GRAD_BAR = 1e-4
+
+
 def test_gdn_backward_precision_tracks_the_chunk_size():
     """The gates above cannot see `_GDN_CHUNK`, so this one is written to.
 
@@ -742,10 +748,18 @@ def test_gdn_backward_precision_tracks_the_chunk_size():
     by 18x, so raising the constant to 64, or to 128, leaves every test green. A gate
     that cannot move with the value it protects is not protecting it.
 
-    Asserts the ORDERING, not an absolute bound: the absolute error is a property of
-    the machine's f32 reduction order, while "coarser chunks round worse" is the
-    property the constant was chosen on. Three seeds, because one seed put 64 below
-    32 and read like a reversal of the tradeoff -- it was noise.
+    Asserts the ORDERING, a dtype-class bar, and an ALLOW-LIST of chunk values. The
+    ordering is the property the constant was chosen on ("coarser chunks round worse").
+    The bar catches a dtype regression, not a chunk raise: measured on this fixture the
+    whole f32 family is inside 1e-4 (T=512: C=128 3.9e-5, C=256 9.9e-5), and once
+    chunk >= T there is one chunk and the error stops moving (T=128: C=128 and C=256 both
+    6.9e-6). So the allow-list is what keeps this gate moving with the constant. Three
+    seeds, because one seed put 64 below 32 and read like a reversal of the tradeoff --
+    it was noise.
+
+    The bar is 1e-4 and that number is provisional: nothing has measured what relative
+    gradient error a GRPO update can absorb (errors/2026-09-07-what-gradient-error-is-
+    acceptable.md owns the question). Raise it there, with a measurement, not here.
 
     Measured here, worst over seeds 0/1/2: 16 -> 3.3e-6, 32 -> 5.5e-6, 64 -> 1.1e-5.
     """
@@ -778,10 +792,19 @@ def test_gdn_backward_precision_tracks_the_chunk_size():
         f"chunk 16 ({e16:.2e}) is not more accurate than chunk 64 ({e64:.2e}) -- the "
         "tradeoff 51e965e priced no longer holds, so revisit the constant rather than "
         "this test")
-    assert reference._GDN_CHUNK <= 16, (
-        f"_GDN_CHUNK is {reference._GDN_CHUNK}; 51e965e chose 16 for precision "
-        f"(measured here: 16 -> {e16:.1e}, 64 -> {e64:.1e}). Raising it is a real "
-        "tradeoff, not a free speedup -- price it in an entry first")
+    shipped = max(worst_rel(reference._GDN_CHUNK, s) for s in seeds)
+    assert shipped < _GDN_GRAD_BAR, (
+        f"_GDN_CHUNK is {reference._GDN_CHUNK} and measures {shipped:.2e}, over the "
+        f"{_GDN_GRAD_BAR:.0e} bar (16 -> {e16:.1e}, 64 -> {e64:.1e})")
+    # An absolute bar cannot bound the chunk on its own: measured on this fixture the whole
+    # f32 family is inside 1e-4 (T=512: C=128 3.9e-5, C=256 9.9e-5), and once chunk >= T
+    # there is one chunk and the error stops moving. So the allow-list is what makes raising
+    # the constant a deliberate act; the bar above only catches a dtype-class regression.
+    assert reference._GDN_CHUNK in (16, 64), (
+        f"_GDN_CHUNK is {reference._GDN_CHUNK}; 51e965e chose 16 and "
+        f"wins/2026-09-07-c64-backward-chunk.md raised it to 64 on a measured step time "
+        f"(here: 16 -> {e16:.1e}, 64 -> {e64:.1e}). Another value is a real tradeoff, not a "
+        "free speedup -- price it in an entry and add it here")
 
 
 def test_gdn_bwd():

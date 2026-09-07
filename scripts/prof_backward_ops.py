@@ -324,6 +324,13 @@ def main() -> int:
     ap.add_argument("--blocks", type=int, default=4096)
     ap.add_argument("--prompt-tokens", type=int, default=256)
     ap.add_argument("--steps", type=int, default=2, help="step 0 pays the JIT; the last is warm")
+    #: `_GDN_CHUNK` is read as a module global at call time (reference.py:923, :928), so
+    #: setting it here reaches gdn_backward without touching the shipped default.
+    ap.add_argument("--gdn-chunk", type=int, default=0,
+                    help="override reference._GDN_CHUNK for this run (0 = the shipped value)")
+    ap.add_argument("--count-kernels", action="store_true",
+                    help="CUDA launch count for the warm step instead of per-op times; the "
+                         "profiler distorts wall time, so never read seconds off this run")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     if a.selfcheck:
@@ -357,6 +364,9 @@ def main() -> int:
     prompt = rng.integers(1, vocab, size=a.prompt_tokens, dtype=np.int64)
 
     secs, calls = instrument_gdn(sync) if a.inside_gdn else instrument(sync)
+    from tilerl_kernels import reference
+    if a.gdn_chunk:
+        reference._GDN_CHUNK = a.gdn_chunk
     rows_out = []
     for step in range(a.steps):
         ids = [engine.submit(list(prompt), sampling) for _ in range(a.group)]
@@ -397,6 +407,9 @@ def main() -> int:
                           "T_mod_chunk": t_batch % _WY_CHUNK,
                           "wy_kernels_registered": has_wy,
                           "gdn_forward_arm": arm,
+                          # read back from the module, not from the flag: the constant the
+                          # backward actually uses is the only one worth recording
+                          "gdn_chunk": reference._GDN_CHUNK,
                           # T crosses this cap and the WY multiple independently, so two
                           # shapes can differ in both at once and did (T=1280 vs 1324)
                           "segment": "layer" if t_batch > _MLP_SEGMENT_MAX_T else "mlp"},
@@ -404,12 +417,27 @@ def main() -> int:
 
         secs.clear(); calls.clear()  # keep only the LAST step: step 0 pays every JIT
         timings: dict[str, float] = {}
+        warm = step == a.steps - 1
         t0 = time.perf_counter()
-        rl_step(model, batch, adv, plens, backend, optimizer, trainable=trainable,
-                seq_lens=slens, micro=a.micro, timings=timings)
-        sync()
-        rows_out.append({"step": step + 1, "train_secs": round(time.perf_counter() - t0, 4),
-                         "backward_secs": round(timings.get("backward_secs", 0.0), 4)})
+        if a.count_kernels and warm and cuda:
+            from torch.profiler import ProfilerActivity, profile
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                rl_step(model, batch, adv, plens, backend, optimizer, trainable=trainable,
+                        seq_lens=slens, micro=a.micro, timings=timings)
+                sync()
+            launches = sum(1 for e in prof.events() if e.device_type.name == "CUDA")
+        else:
+            rl_step(model, batch, adv, plens, backend, optimizer, trainable=trainable,
+                    seq_lens=slens, micro=a.micro, timings=timings)
+            sync()
+            launches = None
+        row = {"step": step + 1, "train_secs": round(time.perf_counter() - t0, 4),
+               "backward_secs": round(timings.get("backward_secs", 0.0), 4)}
+        if launches is not None:
+            # under the profiler, so train_secs on this row is inflated and not comparable
+            row["cuda_launches"] = launches
+            row["profiled"] = True
+        rows_out.append(row)
         print(json.dumps(rows_out[-1], sort_keys=True), flush=True)
 
     attributed = sum(secs.values())
