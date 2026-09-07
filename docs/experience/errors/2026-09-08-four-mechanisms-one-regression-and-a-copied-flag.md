@@ -1,19 +1,18 @@
-# Four mechanisms for one regression, all refuted, and the variable was a flag I copied — H20 + CPU, 2026-09-08
+# Seven withdrawn readings for one regression, and the cause was entries-per-row against the budget — H20 + CPU, 2026-09-08
 
 **Date:** 2026-09-08
 **Machine:** H20 pod card 0 (cells), local CPU target (diagnosis)
-**Status:** open — the 2.03x reproduces, and its attribution splits. The hit-depth collapse is measured
-and #271-shaped; the cold-prefill doubling has no identified cause and the instrument that would have
-answered it (`compiles`) was vacuous on this grid. Forward fix, a bounded publish ladder, has not
-landed. Listed in [OPEN.md](../OPEN.md), with the latent `_demote_one` count guard and the cold-miss
-question as further lines.
+**Status:** open — the regression is settled: **1.88–2.03x across 16 lines of `engine.py`**, 100% TTFT,
+with the hit cost going 0.715 → 9.9–10.3 s, caused by one count-vs-budget tradeoff whose sign flips
+with turn depth. The forward fix has not landed, and at this cell's budget it may not be satisfiable —
+see the sizing criterion. Listed in [OPEN.md](../OPEN.md) with the latent `_demote_one` count guard.
 
-> The sections below are in the order they were written, so the four refuted mechanisms and the
-> superseded "what remains open" stand as the record. **The settled reading starts at
-> [Resolved in part](#resolved-in-part-203x-reproduces-and-the-hit-depth-is-the-readable-half),
-> and its two limits are the
-> [7-commit range](#not-one-variable-the-range-is-7-commits-and-the-cold-miss-doubles) and the
-> [vacuous compiles verdict](#the-compiles-clean-on-every-cell-of-this-grid-was-vacuous).**
+> Sections are in the order they were written, so seven withdrawn readings stand as the record.
+> **The settled result starts at
+> [Resolved](#resolved-188203x-across-16-lines-and-the-mechanism-is-one-count-vs-budget-tradeoff).**
+> Withdrawn, in order: four mechanisms for the discrepancy, then a solved-for TTFT split, a
+> population-skew objection, a single-variable claim against a 7-commit range, and a cold-prefill
+> doubling that was one noisy row. Every one was self-consistent when written.
 
 ## Context
 
@@ -25,7 +24,12 @@ Re-running [the 09-07 DRAM tier cell](../wins/2026-09-07-the-dram-tier-is-357x-w
 at its exact parameters to settle that entry's Pending flag produced 403.01 s against its 199.35 s,
 and the tier that had been worth 3.57x there promoted nothing. Four mechanisms were proposed for that
 over the next two hours. All four were refuted, each because it was confirmed against a different
-operand than the one the card ran.
+operand than the one the card ran. Three more readings fell after them.
+
+The regression is real and the cause is #271. What took seven withdrawals was saying **why**, and the
+answer is not the one this entry spent its first half looking for: not the tier, not the pool, not the
+publisher's block retention, but the number of published entries per row measured against how many the
+budget can hold.
 
 ## The data that settles it
 
@@ -192,121 +196,134 @@ apart**. The block axis cannot distinguish publishers.
 A fifth hypothesis, that the eviction difference was an accounting shift into `superseded`, is
 refuted by the table: `superseded` is 36 in both cell357 arms and 46 in both of the others. Flat.
 
-## Resolved in part: 2.03x reproduces, and the hit depth is the readable half
+## Resolved: 1.88–2.03x across 16 lines, and the mechanism is one count-vs-budget tradeoff
 
-`169d7bd` (pre-fix) run at cell357's exact flags — same workload, same `--blocks 8192`, same
-`--state-bytes`, tier off — with both numbers from job logs rather than from an entry's prose:
+The single-variable pair is **`45acd87` → `a43a379`**, which are parent and child
+(`git rev-parse a43a379^` = `45acd87`): 16 lines of `engine.py` — the `interior_published`
+counter and the `== 1 or last` gate — plus a `ent=` field in the bench and docs. Every flag,
+the workload, and the prompt tokens row-for-row are identical.
 
-| | wall | mean TTFT | hits | published | evictions | pool peak |
-|---|---:|---:|---:|---:|---:|---:|
-| pre-fix 169d7bd | **198.32 s** | 5.14 s | **24/36** | 876 | 835 | 1999 |
-| post-fix a43a379 | **403.01 s** | 10.83 s | **35/36** | 144 | 103 | 3735 |
+| | wall | hit n | mean hit TTFT | miss n | mean miss TTFT |
+|---|---:|---:|---:|---:|---:|
+| parent `45acd87` | **198.47 s** | 24 | **0.715 s** | 12 | 14.031 s |
+| child `a43a379` run 1 | **403.01 s** | 35 | **10.342 s** | 1 | 28.050 s |
+| child `a43a379` run 2 | **373.14 s** | 35 | **9.891 s** | 1 | 13.940 s |
 
-**2.03x.** The pre-fix arm reproduces the 09-07 entry's 199.35 s to 0.5%, so that number was always
-sound. Provenance: the pod tree was stamped `169d7bd` before the run and read back from the job log.
+**1.88–2.03x**, and the hit costs **13.8–14.5x** the parent's. The child hits *more often*
+(35/36 against 24/36) and each hit is an order of magnitude dearer. The regression is
+**100% TTFT**: the three turn deltas sum to 204.47 s against a 204.54 s wall delta on run 1.
 
-**Not one variable — see the section below.** The range is 7 commits and the cold miss doubles, so the
-2.03x is real and its attribution splits. What follows here is the half that is readable.
+`169d7bd` also ran at these flags (198.32 s), matching the parent to 0.08% and reproducing the
+09-07 entry's 199.35 s to 0.5% — so the pre-#271 number was always sound, and #272 in between
+changes nothing measurable (its cold miss is 14.07 s against 169d7bd's 14.02 s).
 
-**Why every counter here except one is unreadable.** The entry population is what the commit changed —
-876 published against 144 — so `evictions 835 vs 103`, `blocks_freed`, and every per-eviction yield
-carry the commit in numerator *and* denominator. Reaching for `evictions 835 vs 103` as the mechanism
-would have been the fifth withdrawn reading of this session.
+### The mechanism: entries per row against the budget decides whether depth binds or survival binds
 
-**The exception is `hits`, whose denominator is turns, and turns are 36 in both arms.** Post-fix hits
-**more often** (97% vs 67%) and is **twice as slow**. A fixed denominator makes that comparison sound,
-and it forces one conclusion: each hit serves far less.
+One sentence covers all three turns, and the sign flips inside the run:
 
-So #271 raised the hit *rate* and collapsed the hit *depth*, and the net on this cell is 2x. Its accept
-grid counted token reuse at an unpressured capacity, where the deep entry never goes missing and the
-intermediate entries look redundant.
+| turn | parent (61 rungs) | child (2 rungs) | delta |
+|---|---|---|---:|
+| 0 | deep hit, **0.4–0.6 s** | shallow hit, **11.0–17.7 s** | +143.99 s |
+| 1 | deep hit, **0.8–1.0 s** | shallow hit, **10.5–16.2 s** | +114.76 s |
+| 2 | 11/12 **MISS** at 14 s, `evict=64` | shallow hit, **6.8–12.2 s** | **−54.28 s** |
 
-**Fix direction: a bounded ladder** — a few spread publishes per row, keeping intermediate fallbacks
-without returning to 62. Publishing only the last boundary is the **worst** available option, since it
-removes the remaining fallback entirely. No revert: the flood was a real defect with a measured
-cascade.
+The parent's turn-2 misses are the flood evicting itself — 61 entries per row against a
+6-snapshot budget, so a row's own turn-1 entries are gone by turn 2. That is exactly the defect
+#271 was written to fix, and at turn 2 the child genuinely wins by 54 s. The child's 2 entries
+survive. So:
 
-### The regression is entirely prefill, and the buckets were in the log all along
+- **parent**: deep rungs, self-evicting → fast early, misses late
+- **child**: shallow only, survives → slow early, hits late
 
-`mean_ttft × 36` is 185.0 s of pre's 198.32 (93.3%) and 389.9 s of post's 403.01 (96.7%), so the
-deltas are **204.7 s wall against 204.8 s TTFT** — 0.15 s apart. The regression is time-to-first-token
-in full. Nothing in decode, sampling or the tier contributes measurably, which retires every
-mechanism that would have shown up as slower generation.
+Net at this shape: **−144 −115 +54 = the child loses by 205 s**, because turns 0 and 1 lose more
+than turn 2 gains. This is why #271's accept grid liked the change: the grid measured reuse at
+admission, which both a self-evicting flood and a shallow survivor score well on, and it never
+priced the early turns in seconds.
 
-**The hit and miss TTFT are per-turn columns in the bench output.** Read straight off
-`/work/pre357off.out` and `/work/cell357off.out`:
+### The fix has a sizing criterion, and it may not be satisfiable at this budget
 
-| | hit turns | mean hit TTFT | miss turns | mean miss TTFT | mean hit prompt | mean miss prompt |
-|---|---:|---:|---:|---:|---:|---:|
-| pre-fix 169d7bd | 24 | **0.702 s** | 12 | **14.030 s** | 30528 | 31689 |
-| post-fix a43a379 | 35 | **10.342 s** | 1 | **28.050 s** | 30938 | 30115 |
+The two arms are the endpoints of a count axis and both endpoints lose something. K rungs
+spanning the range is not a compromise — it is the only region where depth is available early
+**and** the entries survive to turn 2. The constraint is
+**K × snapshot_bytes ≤ budget**, so a row's own rungs never evict each other.
 
-A pre-fix hit costs **5.0%** of a pre-fix miss. A post-fix hit costs **74%** of pre-fix's miss cost.
-The hit got **14.7x more expensive** while the hit *rate* rose from 24/36 to 35/36. Both numbers are
-measured; nothing is solved for.
+At this cell that is a hard limit rather than a free parameter: the budget holds
+**6 snapshots for 12 sessions**, so K ≥ 2 per row already oversubscribes it. **The honest reading
+is that no publisher wins both ends at this budget** — the ladder is the right shape for a card
+with more budget per session, and this cell's answer is that its budget is too small. The earlier
+K-spaced refutation measured token-counted reuse, the one unit that cannot see either failure;
+it should be re-tested in TTFT at a budget where K ≥ 3 fits.
 
-**How this was nearly reported instead.** Two of us derived the same buckets algebraically — two
-equations in the one free parameter `m` (the mean miss TTFT), swept over `m`'s admissible range, and
-concluded `h_post` sits at 10.7–11.0 s regardless of `m` because the post arm has 1 miss in 36. The
-conclusion was right, the range for `h_pre` (0.66–7.70 s) was honest and useless, and the whole
-exercise reconstructed columns the instrument had already printed. `m_pre` measured **14.03 s** lands
-on the 14.1 s the 09-07 entry quotes, which is exactly why the model agreed with itself and why
-neither of us looked. **A model that reproduces the authority feels like confirmation and is
-circularity.** Before modelling a quantity, grep the log for it.
+**No revert.** The flood is a real defect with a measured cascade, and the child is genuinely
+better at turn 2.
 
-A second withdrawal followed from the same rows. The population objection — prompts grow under
+**Depth is still inferred from time.** `prefix_hit_tokens` now records it per turn, so the next
+card window settles it directly.
+
+### The buckets were per-turn columns in the log, and two of us modelled them instead
+
+The table above is read off `ttft=` and `hits=` on each turn row. It was nearly reported as a
+derivation instead: two of us wrote the two-bucket system
+
+```
+185.04 = 24·h_pre  + 12·m
+389.88 = 35·h_post +  1·m
+```
+
+swept the one free parameter `m` (the mean miss TTFT), and concluded `h_post` sits at 10.7–11.0 s for
+every admissible `m` because the post arm has 1 miss in 36. The conclusion was right and the range for
+`h_pre` (0.66–7.70 s) was honest and useless. `m_pre` measured **14.03 s**, which is the 14.1 s the
+model had imported from the 09-07 entry — so the model reproduced the number it was built from, and
+that agreement read as validation. **A model that reproduces the authority it borrowed from is not
+corroboration, and it feels exactly like corroboration.** Before modelling a quantity, grep the log
+for it.
+
+A second withdrawal came from the same rows. The population objection — prompts grow under
 `--grow 10`, so misses skew early and short, so the true `m_pre` is below 14.1 s, so `h_pre` is higher
 and the collapse softer — has the sign backwards. Misses are the **longer** prompts (31689 against
 30528). The chain was valid and the premise about which turns miss was wrong; only the rows could say.
 
-**What the depth reading now rests on.** A post-fix hit at 10.342 s against a measured 14.03 s full
-prefill does 74% of a miss's work: it matches, it reports a hit, and it re-prefills most of the prompt.
-That is why the hit rate rose while the wall clock doubled — post-fix almost always finds the
-512-token entry, so it almost never records a miss. Pre-fix's 12 real misses were cheaper in aggregate
-than post-fix's 35 nominal hits.
-
-That also corrects the mechanism as first stated. The claim was "the deep entry is never published"; it
-is published, and found — it is published and then **evicted**, and post-fix the only thing left below
-it is 512 tokens. Pre-fix's 61-entry chain meant the fallback after losing the deepest was still
-near-deep. The defect is neither the publish depth nor the eviction: it is that **first+last leaves no
-rung between 512 and the full prefix**, and every rung matters precisely because eviction is guaranteed
-at this shape. What #271 removed is graceful degradation.
+**One earlier reading survives in corrected form.** The first mechanism written here was "the deep
+entry is never published", and it is published and found. What happens is that it is published and
+then **evicted**, so post-fix the only thing left below it is 512 tokens — which is the
+count-vs-budget tradeoff above, stated from the child's side only. The full statement needs both
+sides, because the parent's flood evicts *itself* and that is what turn 2 shows.
 
 **Time is still not depth.** A hit could be slow for a reason other than shallowness, even with none in
 evidence. `bench_chat_interleaved.py` now records `prefix_hit_tokens` per turn and prints
 `depth=` as a fraction of that turn's own prompt, so the next card window settles it directly rather
 than by inference.
 
-The earlier K-spaced refutation was measured in token-counted reuse on the CPU grid, which is the unit
-that cannot see any of this. It should be re-tested in TTFT.
+### Not one variable at first, and the cold miss was noise: two withdrawals
 
-### Not one variable: the range is 7 commits, and the cold miss doubles
+**"The commit is the only variable" was written against `169d7bd..a43a379`, which is 7 commits.**
+That went into an entry and a PR body before anyone counted the range. The claim is true for the
+parent pair above and was false as first stated; the fix was to find the right bracket, not to
+abandon the claim. `git log --oneline A..B | wc -l` is the check and it costs one command.
 
-`169d7bd..a43a379` contains **7 commits**, not one. The entry and its PR body both said "the commit is
-the only variable"; that is false. #272 (fp8 KV pool and fp8 attention readers) is in the range, and
-the rows show a second effect the publisher cannot reach:
+**And a "cold-prefill doubling" was reported from a single row.** Turn 0 conv A read 28.05 s against
+the parent's 14.07 s — a full prefill on an empty store, where no publish policy can reach — so it
+looked like a second, unattributed effect. Three things killed it:
 
-```
-turn 0 conv A, empty store, nothing published yet:
-  pre-fix   ttft 14.02 s
-  post-fix  ttft 28.05 s        2.0x
-```
+1. **It is 6.8% of the regression.** Per-turn, the delta is +143.99 / +114.76 / −54.28 s; that one row
+   contributes +13.98 s and everything else +190.49 s.
+2. **The neighbouring rows degrade the same way.** Conv B..L go from 0.41–0.58 s to 10.99–17.74 s at
+   *identical* prompt tokens, and every one is a hit in both arms. Conv A is simply the only row with
+   no hit to degrade, so its degradation appears as a doubled miss instead of a shallow hit.
+3. **It does not reproduce.** A second `a43a379` run at the same flags reads **13.94 s** on that row,
+   against the first run's 28.05 s.
 
-A cold miss on an empty store is untouched by any publish policy. So the 2.03x wall clock reproduces,
-and **its attribution splits**: the hit-depth collapse is measured and is #271-shaped, the cold-prefill
-doubling is not.
+Two arguments were built on that row before it was re-run, and both were over-fitting one sample: that
+its 2.0007x exactness was a structural signature (thermals do not land on 2.000), and that the
+publisher change predicted the opposite sign so a mechanism was missing. Neither survives a row that
+moves 14 s between runs. **The point-vs-mean error was made three times inside one investigation** —
+comparing one row to a 12-row mean, positing a 12-row distribution to explain that gap, then reading
+exactness off the same row — and the 12 rows were in the file every time.
 
-**#272 is ruled out on the default path, by reading it.** `--kv-fp8` defaults to `""`
-(`cli.py:1060`) and neither arm passed it, so `kv_fp8` is None. `_kv_operands` returns
-`pool.kv_operands(layer_idx)` when `pool.kv_fp8 is None`, which returns the raw planes with no copy —
-the 87.5 ms dequantize in its docstring is the fallback branch, reachable only with fp8 on and the fp8
-kernel absent. `_weight_fingerprint` did gain a `-kv{kv_fp8 or 'io'}` suffix, which would invalidate a
-cache, but it is consumed only at `engine.py:1675` under `if ssd_path:` and neither arm passed
-`--ssd-path`.
-
-So the cold doubling has **no identified cause**, and the two candidates a reader would reach for are
-both eliminated by code. The remaining hypothesis is run-to-run warm state — page cache, kernel cache,
-or a JIT inside turn 0 — and the instrument that should have answered it was broken:
+**What the re-run also exposed: the headline had unmeasured spread.** `a43a379` is 403.01 s and
+373.14 s on two runs, 8.0% apart, so the ratio is **1.88–2.03x** rather than 2.03x. Every earlier
+version of this entry quoted a single run's wall clock as the result. One run gives no error bar, and
+a ratio of two single runs hides two.
 
 ### The `compiles: clean` on every cell of this grid was vacuous
 
@@ -350,12 +367,11 @@ arm above then put the publisher squarely back in scope. What survives is the na
 `pub271off` arm supports on its own: 139 evictions at **8.8%** occupancy cannot be capacity.
 
 Still open:
-- **The cold-prefill doubling** (14.02 → 28.05 s on turn 0, empty store). #271 cannot reach it and #272
-  is eliminated on the default path by reading the code. The decisive arm is **`45acd87`** at these
-  flags: against `a43a379` it isolates #271 with fp8 held constant, and against `169d7bd` its own
-  turn-0 cold miss prices whatever else is in the range. One run answers both. Run the server under
-  `python3 -u` so `compiles` can go red.
-- **The bounded ladder**, gated on `prefix_hit_tokens` confirming the depth collapse directly.
+- **The ladder, if this budget admits one.** `K × snapshot_bytes ≤ budget` gives K ≈ 1 at 6 snapshots
+  for 12 sessions, and K = 1 is the child. So the arm to run is the same pair at a budget where K ≥ 3
+  fits, measured in TTFT rather than token-counted reuse.
+- **Depth directly.** `prefix_hit_tokens` is recorded now; one card window converts the mechanism from
+  inferred-from-time to measured.
 - **The per-eviction yield split** — per eviction, the count of the entry's blocks where
   `refcount[b] > n`, logged with the entry's token length.
 
@@ -376,7 +392,7 @@ Two arms agreeing tells you nothing when both were measured against the wrong op
 Operationally: before a number becomes a cause, name the operand it was measured against and check
 that operand matches the failing configuration — not the configuration you meant to reproduce.
 
-Three more, each from a mistake made *after* the four above were written up:
+Five more, each from a mistake made *after* the four above were written up:
 
 **Before modelling a quantity, grep the log for it.** Two sessions solved a two-equation system for the
 hit and miss TTFT buckets, swept the free parameter, and argued about the bound. Both columns were
@@ -392,4 +408,17 @@ costs one command.
 0-byte logs: `_compiles` returned 0 for an empty file, and the server ran without `-u` so SIGTERM
 flushed nothing. The negative control is not "does the parser count markers" — it is "can this file
 ever contain one". Check the instrument's input is non-empty before reading its output as a result.
+
+**A single row is not a distribution, and this was got wrong three times in one investigation.** The
+28.05 s cold miss was compared against a 12-row mean (mine); a 12-row distribution was then posited to
+explain the gap (a peer's); then its 2.0007x exactness was read as a structural signature, since
+thermals do not land on 2.000 (mine again). The 12 rows were in the file for all three. A second run
+put that row at 13.94 s. Exactness in one sample is not evidence of mechanism — a single draw has no
+shape to be a signature of.
+
+**One run is not a measurement of a ratio.** `a43a379` came back 403.01 s and 373.14 s at identical
+flags, 8.0% apart, so the honest figure is 1.88–2.03x. Every earlier version of this entry quoted the
+first run as the result. A ratio built from two single runs hides two error bars, and the one that
+mattered here was large enough to move the headline.
+
 
