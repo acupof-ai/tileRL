@@ -54,6 +54,19 @@ from .kv_cache import (
 from .spec import _PREFILL_BUCKET, LADDER_WIDTHS
 
 
+def _last_prefill_boundary(n: int) -> int:
+    """Where `_pick` ends the final prefill chunk of an `n`-token prompt, 0 if aligned.
+
+    One definition for the cut and for the spill decision: they disagreed once, and the
+    symptom was a prompt length that published an entry and then withheld it from disk.
+    """
+    tail = n % BLOCK_TOKENS
+    if not tail:
+        return 0                       # the prompt-complete branch handles it
+    end = (n // BLOCK_TOKENS) * BLOCK_TOKENS
+    return end - BLOCK_TOKENS if tail == 1 else end
+
+
 def _graph_on(backend, decode_graph: bool | None) -> bool:
     """The captured decode tick is on by default on CUDA only. One definition:
     ``build_engine`` sizes the pools for the pad row from the same answer the
@@ -750,6 +763,26 @@ class Engine:
             aligned = (chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
             if r.prefill_from == 0 and aligned and aligned != chunk:
                 chunk = aligned
+            # And cut the LAST chunk to a block boundary, for the same reason one step on:
+            # the prompt-complete publish needs `len(prompt) % BLOCK_TOKENS == 0`, which 15
+            # of 16 prompts fail, so the only entry reaching disk was the decode one --
+            # prompt PLUS generated text, which `blocks_to_text` strips from replayed
+            # history by design, so no client could ever match it. Cut here rather than
+            # slicing the entry: the state snapshot is exact only AT a chunk end, and an
+            # entry sliced below it pairs KV for N tokens with a state that absorbed more.
+            end = r.prefill_from + chunk
+            tail = end % BLOCK_TOKENS
+            short = (end // BLOCK_TOKENS) * BLOCK_TOKENS - r.prefill_from
+            if end == len(r.tokens) and tail and short > 0:
+                # A 1-token tail would be a T=1 prefill row, and `width` bucket-rounds only
+                # when `chunk > 1`, so it reaches the prefill kernels with a zero block size
+                # (`Divide by zero` from `T.ceildiv`, measured). Back off one block: a
+                # 17-token tail costs 16 tokens of prefix not served on a hit, against a
+                # 1-in-16 hole that publishes nothing at all.
+                if tail == 1:
+                    short -= BLOCK_TOKENS
+                if short > 0:
+                    chunk = short  # the <=17-token tail becomes one more forward
             # Rows pad to a shared width: pack only within one bucket.
             b = -(-chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
             if prefills and b != bucket:
@@ -999,11 +1032,16 @@ class Engine:
                 # A chunk end IS a state-pool boundary: nothing has been sampled yet, so
                 # the slot holds exactly tokens[:prefill_from]. This is the publish that
                 # makes a ragged prompt shareable -- `_pick` cut the chunk short for it.
-                # An intermediate chunk boundary: the prompt-complete publish below covers
-                # the same tokens and more, so this one is not offered to disk. Measured on
-                # H20 card 6, spilling all six publishes of a 2729-token prompt cost 0.925 s
-                # of a 2.041 s request against 0.180 s for the last one alone.
-                self._publish_prefix(pf, pf.prefill_from, spill=False)
+                # Only the last boundary reaches disk. It is the longest prompt-only entry
+                # there will ever be (the prompt-complete branch below cannot fire on a
+                # ragged length), and spilling the earlier ones is pure cost: measured on
+                # H20 card 6, all six publishes of a 2729-token prompt cost 0.925 s of a
+                # 2.041 s request against 0.180 s for the last alone. Ask `_pick` where it
+                # put that boundary instead of inferring it from what remains -- the
+                # 1-token-tail back-off leaves 17, and a `< BLOCK_TOKENS` test reads that
+                # as "more to come" and spills nothing at all for `len % 16 == 1`.
+                last = pf.prefill_from == _last_prefill_boundary(len(pf.tokens))
+                self._publish_prefix(pf, pf.prefill_from, spill=last)
         if not done:
             return
         self._sample_commit(done)
