@@ -110,8 +110,10 @@ def main() -> int:
             )
             d = {
                 k: after.get(k, 0) - before.get(k, 0)
+                # a publisher retiring its own entry counts as superseded, not eviction,
+                # so an eviction delta alone cannot say whether pressure eased or moved.
                 for k in ("prefix_hits", "prefix_published", "prefix_evictions",
-                          "dram_demotions", "dram_promotions")
+                          "prefix_superseded", "dram_demotions", "dram_promotions")
             }
             n = out.get("usage", {}).get("prompt_tokens", 0)
             rows.append({"turn": turn, "conv": _label(c), "prompt_tokens": n,
@@ -119,7 +121,8 @@ def main() -> int:
             print(
                 f"turn {turn} conv {_label(c)}  prompt={n:6d}  wall={wall:8.2f}s  "
                 f"hits={d['prefix_hits']}  demote={d['dram_demotions']}  "
-                f"promote={d['dram_promotions']}  evict={d['prefix_evictions']}",
+                f"promote={d['dram_promotions']}  evict={d['prefix_evictions']}  "
+                f"super={d['prefix_superseded']}",
                 flush=True,
             )
 

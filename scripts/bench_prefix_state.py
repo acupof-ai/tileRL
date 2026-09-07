@@ -58,6 +58,9 @@ def run(name, cfg, model, backend, store, n_prompts, plen, blocks, newtok=2) -> 
     st = engine._prefix.stats() if hasattr(engine._prefix, "stats") else {}
     print(f"{name:<26} snapshots {n:>4}  {b / 2**30:>6.2f} GiB   "
           f"published {engine.stats()['prefix_published']:>4}  evictions {st.get('evictions', 0):>4}  "
+          # a publisher retiring its own entry counts as superseded, not eviction, so a drop in
+          # evictions alone reads as relieved pressure whether or not the churn merely moved.
+          f"superseded {st.get('superseded', 0):>4}  "
           f"peak {(torch.cuda.max_memory_allocated() - base) / 2**30:>6.2f} GiB "
           f"(abs {torch.cuda.max_memory_allocated() / 2**30:.2f})", flush=True)
     engine = None

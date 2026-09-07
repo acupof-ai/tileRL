@@ -59,6 +59,9 @@ def main() -> int:
                     "pool_used_blocks", "slots_used", "prefix_hits", "prefix_misses",
                     "prefix_published", "prefix_evictions", "prefill_forwards",
                     "decode_forwards", "tokens_generated")})
+                # .get, not the strict index above: this samples a RUNNING server, which
+                # may predate the key. Absent reads 0, which is also its pre-row-62 value.
+                row["prefix_superseded"] = s.get("prefix_superseded", 0)
                 # Derived, because /health does not expose it: the allocator's own test at
                 # engine.py:557 is `free_blocks < needed`, so this is the quantity that
                 # decides a 503.
@@ -80,7 +83,8 @@ def main() -> int:
         secs = sorted(r["secs"] for r in ok)
         print(f"free_blocks: min {min(free)}  max {max(free)}  last {free[-1]}"
               f" of {ok[-1]['blocks_total']}")
-        print(f"prefix_evictions: {ok[0]['prefix_evictions']} -> {ok[-1]['prefix_evictions']}")
+        print(f"prefix_evictions: {ok[0]['prefix_evictions']} -> {ok[-1]['prefix_evictions']}"
+              f"   superseded: {ok[0]['prefix_superseded']} -> {ok[-1]['prefix_superseded']}")
         print(f"/health seconds: min {secs[0]:.2f}  median {secs[len(secs) // 2]:.2f}"
               f"  max {secs[-1]:.2f}")
     print(f"rows: {a.out}")

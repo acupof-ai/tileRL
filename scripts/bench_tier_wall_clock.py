@@ -133,6 +133,10 @@ def run_arm(args, arm: str, spill: str, log: str) -> list[dict]:
                         "prefix_hits": after.get("prefix_hits", 0),
                         "d_prefix_evictions": (after.get("prefix_evictions", 0)
                                                - before.get("prefix_evictions", 0)),
+                        # Read together: a publisher retiring its own entry counts as superseded, not eviction,
+                        # so the eviction delta alone falls whether pressure eased or moved.
+                        "d_prefix_superseded": (after.get("prefix_superseded", 0)
+                                                - before.get("prefix_superseded", 0)),
                         "ssd_evictions": after.get("ssd_evictions", 0),
                         "ssd_offered": after.get("ssd_offered", 0),
                         "ssd_refusals": after.get("ssd_refusals", 0),
@@ -213,6 +217,7 @@ def main() -> int:
             peak = max((r["pool_used_blocks"] or 0) for r in rs)
             cell[f"{arm}_pool_peak_pct"] = round(100.0 * peak / rs[0]["blocks_total"], 1)
             cell[f"{arm}_prefix_evictions"] = max(r["prefix_evictions"] for r in rs)
+            cell[f"{arm}_prefix_superseded"] = max(r.get("d_prefix_superseded", 0) for r in rs)
             if arm == "on":
                 cell["ssd_evictions"] = max(r["ssd_evictions"] for r in rs)
                 cell["ssd_offered"] = max(r["ssd_offered"] for r in rs)
