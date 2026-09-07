@@ -757,6 +757,114 @@ def make_gdn_post(target: str, io: str = "float32"):
 # (gq, D) fragment layout lands upstream.
 
 
+def make_paged_attention_prefill(target: str, block_M: int = 64, block_N: int = 16):
+    """Query-tiled paged causal GQA attention: the CPU twin of the sm70 cell.
+
+    Same contract as ``make_paged_attention`` -- Q [B, S, H, D], paged f32 K/V,
+    SeqLens the total length after this forward, SeqQLens the valid query rows.
+    What differs is the shape of the work: the query tile is in the GRID, so one
+    K/V tile serves ``block_M`` rows instead of one. ``paged_attention_split``
+    opens ``Qf[d] = Q[bb, tt, hh, d]`` -- one query row per block -- which is
+    right for a verify width of at most 8 and re-reads K/V once per row for a
+    512-row prefill chunk. That re-read is 100.5 s of a 197.6 s 16k prefill on
+    the V100, 29.9x the arithmetic floor.
+
+    block_M=64, block_N=16 is what the sm70 cell will use, and it is chosen by
+    shared memory: (block_M + 2*block_N) * D * 4 at D=256 is exactly Volta's
+    96 KiB. See scripts/sm70_tile_occupancy.py.
+
+    ``kv_dtype`` is a maker parameter rather than f32 throughout so the fp16-tile
+    variant is one instantiation and not a second kernel; the accumulators stay
+    f32 either way.
+    # ponytail: CPU cell, f32 tiles; the sm70 schedule is a per-arch override.
+    """
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    def paged_attention_prefill(
+        Q, KCache, VCache, BlockTable, SeqLens, SeqQLens, scale: T.float32, block_size, threads
+    ):
+        B, S, H, D = T.const("B, S, H, D")
+        Hkv = T.const("Hkv")
+        NB = T.const("NB")
+        Mb = T.const("Mb")
+        Q: T.Tensor((B, S, H, D), "float32")
+        KCache: T.Tensor((NB, Hkv, block_size, D), "float32")
+        VCache: T.Tensor((NB, Hkv, block_size, D), "float32")
+        BlockTable: T.Tensor((B, Mb), "int32")
+        SeqLens: T.Tensor((B,), "int32")
+        SeqQLens: T.Tensor((B,), "int32")
+        Out = T.empty((B, S, H, D), "float32")
+        with T.Kernel(T.ceildiv(S, block_M), H, B, threads=threads) as (bx, hh, bb):
+            hkv = hh * Hkv // H
+            hist = SeqLens[bb] - SeqQLens[bb]
+            Qt = T.alloc_fragment((block_M, D), "float32")
+            acc = T.alloc_fragment((block_M, D), "float32")
+            m = T.alloc_fragment((block_M,), "float32")
+            l = T.alloc_fragment((block_M,), "float32")
+            Kt = T.alloc_fragment((block_N, D), "float32")
+            Vt = T.alloc_fragment((block_N, D), "float32")
+            sc = T.alloc_fragment((block_M, block_N), "float32")
+            for i, d in T.Parallel(block_M, D):
+                t = bx * block_M + i
+                Qt[i, d] = T.if_then_else(t < S, Q[bb, T.min(t, S - 1), hh, d], 0.0)
+                acc[i, d] = 0.0
+            for i in T.Parallel(block_M):
+                m[i] = -1.0e30
+                l[i] = 0.0
+            # The tile's last row bounds the K/V range every row in it needs;
+            # each row masks its own causal cut below.
+            last = T.min(bx * block_M + block_M, S) - 1
+            upper = hist + last + 1
+            for k in T.serial(T.ceildiv(upper, block_N)):
+                for j, d in T.Parallel(block_N, D):
+                    # Clamped so an out-of-range lane loads a live address; its
+                    # score is masked to -inf below, so the value never counts.
+                    p = T.min(k * block_N + j, upper - 1)
+                    blk = BlockTable[bb, T.min(p // block_size, Mb - 1)]
+                    Kt[j, d] = KCache[blk, hkv, p % block_size, d]
+                    Vt[j, d] = VCache[blk, hkv, p % block_size, d]
+                for i, j in T.Parallel(block_M, block_N):
+                    dot = T.alloc_fragment((1,), "float32")
+                    dot[0] = 0.0
+                    for d in T.serial(D):
+                        dot[0] += Qt[i, d] * Kt[j, d]
+                    # The row cut is the one a query tile adds; the tile's own
+                    # K/V bound is the last row's.
+                    p = k * block_N + j
+                    sc[i, j] = T.if_then_else(
+                        (p < upper) and (p <= hist + bx * block_M + i),
+                        dot[0] * scale,
+                        -1.0e30,
+                    )
+                # Serial-scalar, not T.reduce_*: tl.reduce has no "c" target.
+                for i in T.serial(block_M):
+                    mn = T.alloc_fragment((1,), "float32")
+                    mn[0] = m[i]
+                    for j in T.serial(block_N):
+                        mn[0] = T.max(mn[0], sc[i, j])
+                    cf = T.alloc_fragment((1,), "float32")
+                    cf[0] = T.exp(m[i] - mn[0])
+                    for d in T.Parallel(D):
+                        acc[i, d] = acc[i, d] * cf[0]
+                    sm = T.alloc_fragment((1,), "float32")
+                    sm[0] = 0.0
+                    for j in T.serial(block_N):
+                        pj = T.alloc_fragment((1,), "float32")
+                        pj[0] = T.exp(sc[i, j] - mn[0])
+                        sm[0] += pj[0]
+                        for d in T.Parallel(D):
+                            acc[i, d] += pj[0] * Vt[j, d]
+                    l[i] = l[i] * cf[0] + sm[0]
+                    m[i] = mn[0]
+            for i, d in T.Parallel(block_M, D):
+                t = bx * block_M + i
+                if t < S:
+                    Out[bb, t, hh, d] = acc[i, d] / l[i]
+        return Out
+
+    return paged_attention_prefill
+
+
 def make_paged_attention_split(target: str, KVSPLIT: int = 32, block_N: int = 16):
     """Phase 1 of split-KV attention: per-slice online-softmax partials.
 

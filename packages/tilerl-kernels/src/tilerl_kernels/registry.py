@@ -54,6 +54,7 @@ _CPU_KERNELS = {  # f32 kernels, bf16 cast at the boundary
     "embedding": kernels.make_embedding,
     "linear_fp4": kernels.make_linear_fp4,
     "paged_attention": kernels.make_paged_attention,
+    "paged_attention_prefill": kernels.make_paged_attention_prefill,
     "gdn_prep": kernels.make_gdn_prep,
     "gdn_post": kernels.make_gdn_post,
 }

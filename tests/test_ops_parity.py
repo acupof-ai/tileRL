@@ -462,6 +462,50 @@ def test_paged_attention_vs_naive(backend):
 # ---------------------------------------------------------------- write tokens
 
 
+def test_paged_attention_prefill_tiled_vs_naive(backend):
+    """The query-tiled CPU twin of the sm70 prefill cell.
+
+    Arms chosen for the two cuts a query tile adds and a one-row kernel gets
+    free: the tile's K/V bound is the LAST row's, so every row also masks its
+    own causal cut, and S need not be a multiple of block_M. Each arm below
+    fails at least one of six mutations (dropped row cut, row cut at the tile's
+    last row, an off-by-one in it, dropped acc rescale, dropped l rescale, a Q
+    index missing the tile offset) -- measured, not assumed.
+    """
+    torch.manual_seed(7)
+    hkv, d, block = 2, 16, 16
+    scale = 1.0 / (d**0.5)
+    arms = [
+        # (label, S, hist, block_M, block_N, H, Hkv)
+        ("prefix 0, one tile", 16, 0, 16, 8, 4, 2),
+        ("prefix 0, several tiles", 48, 0, 16, 8, 4, 2),
+        ("with history", 48, 96, 16, 8, 4, 2),
+        ("S == block_M", 16, 33, 16, 8, 4, 2),
+        ("S == block_M + 1", 17, 33, 16, 8, 4, 2),
+        ("ragged S and hist", 23, 47, 16, 8, 4, 2),
+        ("block_N > block_size", 24, 40, 16, 32, 4, 2),
+        ("uneven GQA", 20, 44, 16, 8, 6, 3),
+    ]
+    for label, s, hist, bm, bn, h, hkv in arms:
+        n = hist + s
+        nb = (n + block - 1) // block + 1
+        b = 2
+        k_cache = torch.randn(nb * b, hkv, block, d)
+        v_cache = torch.randn(nb * b, hkv, block, d)
+        block_table = torch.arange(nb * b, dtype=torch.int32).reshape(b, nb)
+        q = torch.randn(b, s, h, d)
+        seq_lens = torch.tensor([n] * b, dtype=torch.int32)
+        seq_q = torch.tensor([s] * b, dtype=torch.int32)
+        got = backend._kernel("paged_attention_prefill", block_M=bm, block_N=bn)(
+            q, k_cache, v_cache, block_table, seq_lens, seq_q, scale, block, 32
+        )
+        _assert_close(
+            got,
+            _naive_paged(q, k_cache, v_cache, block_table, seq_lens, scale),
+            f"paged_attention_prefill {label} (S={s} hist={hist} tile={bm}x{bn})",
+        )
+
+
 def test_write_tokens_parity(backend):
     """Paged KV scatter kernel vs the pool's torch-loop write (sm90 only)."""
     if backend.arch != "sm90":
