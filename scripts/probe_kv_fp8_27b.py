@@ -110,16 +110,21 @@ def _gen(cfg, model, backend, prompts, n_new, kv_fp8):
     batch -- the decode arm wants throughput, the accuracy arm wants the ids.
     """
     from tilerl.engine import SamplingParams, build_engine
+    from tilerl.kv_cache import BLOCK_TOKENS
 
     batch = prompts if isinstance(prompts[0], list) else [prompts]
     longest = max(len(p) for p in batch)
-    # num_blocks=0 is what asks `_fit_blocks` to MEASURE free memory. build_engine's default
-    # is 64 blocks = 1024 tokens, so leaving it out silently caps every arm at a pool no
-    # 2048-token prompt can enter -- and caps both dtypes identically, which is what made the
-    # boundary arm unable to separate them.
+    ctx = longest + n_new + 64
+    # num_blocks=0 asks `_fit_blocks` to MEASURE free memory; build_engine's default is 64
+    # blocks = 1024 tokens, so leaving it out caps every arm at a pool no 2048-token prompt
+    # can enter. But an UNCAPPED fit takes 2/3 of a nearly-empty card -- ~54 GiB -- and the
+    # prefill transients at B=8 then have nowhere to go (OOM at 94.27 GiB in use). `max_blocks`
+    # caps the fit at what this batch can actually address, the same thing cli.py:132 does.
+    # The boundary arm deliberately does NOT cap: the size of the fit is its measurement.
     eng = build_engine(cfg, model, backend, num_slots=max(2, len(batch)),
                        max_batch=max(2, len(batch)), num_blocks=0,
-                       max_total_tokens=longest + n_new + 64, kv_fp8=kv_fp8)
+                       max_blocks=-(-ctx // BLOCK_TOKENS) * len(batch) + 8,
+                       max_total_tokens=ctx, kv_fp8=kv_fp8)
     rids = [eng.submit(p, SamplingParams(temperature=0.0, max_new_tokens=n_new, seed=0))
             for p in batch]
     # poll() returns {request_id: token_ids} and DRAINS, so accumulate rather than re-read
@@ -223,10 +228,11 @@ def arm_boundary(cfg, model, backend, ctx: int, batch: int, n_new: int) -> dict:
     prompts = [torch.randint(3, cfg.vocab_size - 1, (ctx,)).tolist() for _ in range(batch)]
     out: dict = {"ctx": ctx, "batch": batch}
     for nick, dt in (("bf16", None), ("fp8", torch.float8_e4m3fn)):
-        eng = None
+        eng, blocks = None, 0
         try:
             eng = build_engine(cfg, model, backend, num_slots=batch, max_batch=batch,
                                num_blocks=0, max_total_tokens=ctx + n_new + 64, kv_fp8=dt)
+            blocks = eng.usable_blocks  # read BEFORE generating: the fit is the measurement
             rids = [eng.submit(p, SamplingParams(temperature=0.0, max_new_tokens=n_new, seed=0))
                     for p in prompts]
             done: dict = {}
@@ -243,17 +249,21 @@ def arm_boundary(cfg, model, backend, ctx: int, batch: int, n_new: int) -> dict:
                 "kv_bytes_per_token": eng._kv.bytes_per_token,
             }
         except Exception as exc:  # noqa: BLE001 -- a raise here is a result, not a crash
+            # The fitted block count is the headline, and it is known before the generation.
+            # Keep it: an uncapped fit leaves little room for 32 prefills at once, so this
+            # arm can OOM in the transients with the capacity answer already measured.
             out[nick] = {"raised": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            if blocks:
+                out[nick]["blocks_total"] = blocks
         # `empty_cache` alone frees nothing while `eng` is still bound, and the bf16 pool
         # here is the largest thing either arm allocates.
         _release(eng)
         eng = None
     both = [out[k] for k in ("bf16", "fp8")]
-    if all("peak_running" in d for d in both):
-        out["resident_ratio"] = both[1]["peak_running"] / max(1, both[0]["peak_running"])
-        # The unclipped capacity number. `resident_ratio` is bounded by the batch: if fp8
-        # holds all of it, the ratio reads however far bf16 fell short rather than how much
-        # more fp8 could have held. blocks_ratio has no such ceiling and is the headline.
+    # blocks_ratio FIRST and on its own guard: it is the headline, it is known before either
+    # generation runs, and an arm that OOMs in the prefill transients still has it. Nesting it
+    # under peak_running lost the capacity answer in exactly the case that produces it.
+    if all("blocks_total" in d for d in both):
         out["blocks_ratio"] = both[1]["blocks_total"] / max(1, both[0]["blocks_total"])
         # The arm separates the dtypes only if the pools were sized differently. Off CUDA
         # `_fit_blocks` returns a fixed floor for both, so equal block counts mean the fit
@@ -262,7 +272,11 @@ def arm_boundary(cfg, model, backend, ctx: int, batch: int, n_new: int) -> dict:
             out["inconclusive"] = (
                 f"both pools got {both[0]['blocks_total']} blocks, so _fit_blocks did not "
                 "measure free memory (it returns a floor off CUDA) -- this arm needs a card")
-        elif both[0]["peak_running"] >= batch:
+    if all("peak_running" in d for d in both):
+        # Bounded by the batch: if fp8 holds all of it, this reads however far bf16 fell
+        # short rather than how much more fp8 could have held. blocks_ratio has no ceiling.
+        out["resident_ratio"] = both[1]["peak_running"] / max(1, both[0]["peak_running"])
+        if both[0]["peak_running"] >= batch:
             out["inconclusive"] = (
                 f"bf16 already held all {batch} requests resident, so the batch cannot show a "
                 "concurrency difference -- raise --boundary-batch or --boundary-ctx")
@@ -324,6 +338,11 @@ def main() -> int:
         results["range"] = arm_range(
             bf16_eng._kv, {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2})
         print(f"\nrange: {json.dumps(results['range'], sort_keys=True)}", flush=True)
+        # The range arm is the last reader of this pool, and the decode arm below fits its
+        # own against whatever is left. Held, this one was still resident at B=8 and the
+        # card reached 94.27 GiB.
+        _release(bf16_eng)
+        bf16_eng = None
         for ctx in a.decode_ctx:
             for batch in a.decode_batch:
                 key = f"decode_{ctx}_b{batch}"
@@ -341,11 +360,14 @@ def main() -> int:
                                         a.new_tokens)
             d = results[key]
             print(f"\n{key}: blocks {d['bf16'].get('blocks_total')} -> "
-                  f"{d['fp8'].get('blocks_total')}, peak resident "
-                  f"{d['bf16'].get('peak_running')} -> {d['fp8'].get('peak_running')} of "
-                  f"{a.boundary_batch}"
+                  f"{d['fp8'].get('blocks_total')}"
+                  + (f" = {d['blocks_ratio']:.3f}x" if "blocks_ratio" in d else "")
+                  + f", peak resident {d['bf16'].get('peak_running')} -> "
+                  f"{d['fp8'].get('peak_running')} of {a.boundary_batch}"
                   + (f" = {d['resident_ratio']:.3f}x" if "resident_ratio" in d else "")
-                  + (f"\n  INCONCLUSIVE: {d['inconclusive']}" if "inconclusive" in d else ""),
+                  + (f"\n  INCONCLUSIVE: {d['inconclusive']}" if "inconclusive" in d else "")
+                  + (f"\n  bf16 raised: {d['bf16']['raised']}" if "raised" in d["bf16"] else "")
+                  + (f"\n  fp8 raised: {d['fp8']['raised']}" if "raised" in d["fp8"] else ""),
                   flush=True)
             print(json.dumps(d, sort_keys=True), flush=True)
     except Exception as exc:  # noqa: BLE001 -- the failure text is the answer
