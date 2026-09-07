@@ -82,6 +82,22 @@ This reproduces the serve-path finding
 at a different budget and with the mechanism now attributed to `ssd_save_ms`
 rather than inferred from wall clock.
 
+## Pending: the publisher this was measured against has changed
+
+The 3.57x was measured against a publisher emitting **62 entries per 31k-token miss**, and this
+entry's own mechanism paragraph says the tier does not stop that flood — it gives the flood
+somewhere to go. That publisher is fixed as of
+[wins/2026-09-08-cut-the-prefill-publish-flood.md](2026-09-08-cut-the-prefill-publish-flood.md):
+2 publishes per row at any prompt length. **So 3.57x is provisional** until the same cell runs on
+the fixed publisher, and this section is the flag rather than a revision — a token-count probe on
+CPU cannot rewrite a wall-clock verdict, and the card cell is scoped and pending.
+
+One structural fact from that probe does land here, because it is not a speed claim: **the tier is
+inert below a 4-snapshot budget.** At `--dram-bytes` worth 3 snapshots it demoted nothing and
+changed no cell of a 9-cell grid, under both the flooding and the fixed publisher. It is
+all-or-nothing at these sizes, so a budget that cannot hold ~4 snapshots is not worth wiring at
+all.
+
 ## Deployment: the default does not flip
 
 **The mechanism verdict and the deployment verdict rest on different evidence and
