@@ -104,9 +104,12 @@ def main() -> int:
                                  "content": out["choices"][0]["message"]["content"]})
                 ev = after["prefix_evictions"] - before["prefix_evictions"]
                 dm = after["dram_demotions"] - before["dram_demotions"]
+                # a publisher retiring its own entry counts as superseded, not eviction, so an
+                # eviction delta alone cannot tell relieved pressure from relocated churn.
+                sp = after.get("prefix_superseded", 0) - before.get("prefix_superseded", 0)
                 # Peak, not delta: the question is whether an operand REACHED its ceiling.
                 print(f"turn {turn} c{c} tokens={out['usage']['prompt_tokens']:5d} "
-                      f"evict+{ev:3d} demote+{dm:3d} | "
+                      f"evict+{ev:3d} super+{sp:3d} demote+{dm:3d} | "
                       + "  ".join(f"{k}={after.get(k)}" for k in keys), flush=True)
     finally:
         proc.send_signal(signal.SIGTERM)
