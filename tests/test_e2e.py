@@ -1059,6 +1059,49 @@ def test_a_restart_faults_the_prefix_back_in_off_disk(tmp_path):
     )
 
 
+def test_load_kv_writes_the_same_bytes_in_two_calls_not_two_per_block(tmp_path):
+    """The batched index_copy_ must reproduce the per-block loop it replaced.
+
+    Blocks are deliberately out of order and filled with noise: the neighbouring
+    restart test fills block i with the constant i+1 in ascending order, so a
+    sorted or transposed index writes the right bytes to the right place by luck.
+    """
+    torch.manual_seed(7)
+    pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    tier = KvTier(str(tmp_path), "fp-batch", min_tokens=BLOCK_TOKENS)
+    blocks = [11, 3, 29, 7, 19]          # not ascending, not contiguous
+    toks = list(range(len(blocks) * BLOCK_TOKENS))
+    for b in blocks:
+        pool.k_pool[:, b].normal_()
+        pool.v_pool[:, b].normal_()
+    assert tier.spill_kv(0xB47C, tuple(toks), blocks, pool), "fixture: spill refused"
+
+    blob = tier._pending[0xB47C]
+    ref = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    for i, b in enumerate(blocks):       # the loop this replaced
+        ref.k_pool[:, b].copy_(blob["k"][i])
+        ref.v_pool[:, b].copy_(blob["v"][i])
+
+    got = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    calls = []
+    real = torch.Tensor.copy_
+    torch.Tensor.copy_ = lambda self, *a, **k: (calls.append(1), real(self, *a, **k))[1]
+    try:
+        assert tier.load_kv(0xB47C, tuple(toks), blocks, got)
+    finally:
+        torch.Tensor.copy_ = real
+
+    assert torch.equal(got.k_pool, ref.k_pool) and torch.equal(got.v_pool, ref.v_pool), (
+        "the batched write differs from the per-block loop"
+    )
+    assert torch.equal(got.k_pool[:, blocks[1]], pool.k_pool[:, blocks[1]]), (
+        "block 3 (second in the caller's order, first by value) holds another block's KV: "
+        "the index was sorted somewhere"
+    )
+    assert got.k_pool.abs().sum() > 0, "both pools are zero, so equality above is vacuous"
+    assert not calls, f"load_kv issued {len(calls)} per-block copies; it should issue none"
+
+
 @pytest.mark.parametrize("suffix", [".st", ".kv"])
 def test_a_spill_truncated_by_a_crash_is_a_miss_not_a_raise(tmp_path, suffix):
     """A kill between torch.save starting and finishing leaves a partial blob on disk.
