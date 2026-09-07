@@ -4,9 +4,26 @@
 
 Decode on the V100 fit `ms/tok = 31.9 + 6.20 * (ctx/1K)`, residuals within
 ±0.3 ms from 32 to 4096 — a clean line whose slope had no physical basis. KV is
-64 KiB/token (16 full-attn layers × 4 KV heads × 128 dim × 4 B × 2), so 1K of
-context is 67 MB = **0.07 ms** at 900 GB/s. The measured slope was **83× off
+128 KiB/token (16 full-attn layers × 4 KV heads × **256** dim × 4 B × 2), so 1K of
+context is 134 MB = **0.15 ms** at 900 GB/s. The measured slope was **42× off
 roofline**, and it capped long-context decode at 17.4 tok/s against 32.7 short.
+
+This paragraph first read 64 KiB/token, 67 MB, 0.07 ms and **83×**, from a
+`head_dim` of 128. The checkpoint's `text_config.head_dim` is **256**
+(`num_key_value_heads` 4, `num_hidden_layers` 64), so every byte figure here was
+half the real one. The conclusion is unaffected — 42× is as far off roofline as
+83×, and the cause was identified by timing the two kernels, not by the ratio —
+but the halved bytes propagate: any later reasoning that starts from
+"64 KiB/token" on sm70 is using bf16's byte count on a pool that
+`backend.py:353` allocates as **f32** for `arch in ("cpu", "metal", "sm70")`,
+routed as `kv_io` at `engine.py:1513`/`:1529`.
+
+**This entry already knew.** The note at the µs tables below records the same
+`head_dim` 128 error, and the third Rule states it as a lesson. The byte figure
+in this paragraph is the one place the correction was never applied — the fix
+went to the benchmark harness that produced the tables, and the arithmetic in
+the prose kept the old constant for six days. A rule written from a defect does
+not retroactively check the file it is written in.
 
 GDN decode is O(1) in context (`kernels_gdn.py` `gdn_decode_fused` takes no
 SeqLens and has no history loop — state is updated in place), so the whole
@@ -117,3 +134,13 @@ Third, from the head_dim error: a microbenchmark that hardcodes the shape is
 measuring a model nobody runs. Read the dimension out of `config.py` or print
 what you ran — a wrong constant in the harness is invisible in every number it
 produces, and this one was off by 2× on the exact axis under investigation.
+
+Fourth, from that same constant surviving six days in this file: **a
+wrong-constant sweep has to cover the prose in the same file, not only the code
+that produced the numbers.** The 2026-09-01 fix went to the harness and to the
+µs tables; the Context section's arithmetic kept `head_dim` 128 and quietly
+halved every byte figure derived from it, six days after the Rule above was
+written here. A rule written from a defect does not retroactively check the file
+it is written in — the sweep is a separate act, and its scope is the figure, not
+the factorisation: two different wrong operands (dim 128 with f32 here, dim 256
+with bf16 in a later break-even) both produced the same memorable 64 KiB/token.
