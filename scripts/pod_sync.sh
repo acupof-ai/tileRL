@@ -36,7 +36,7 @@ fi
 # pod expands it; a missing /work/tl013 in PATH is ignored, so no `[ -d ]` test.
 POD_ENV="export PATH=/work/tl013/bin:\$PATH TILELANG_CACHE_DIR=/work/tilelang_cache"
 POD_ENV+=" PYTHONPATH=$REMOTE_DIR/src:$REMOTE_DIR/packages/tilerl-kernels/src"
-POD_ENV+=" TILERL_TARGET=cuda"
+POD_ENV+=" TILERL_TARGET=cuda REMOTE_DIR=$REMOTE_DIR"
 
 # ~/bin/pod's crictl exec lacks -i (no stdin), so drive tn exec directly.
 # tilelang's JIT cache lives on /work: the container's HOME is ephemeral.
