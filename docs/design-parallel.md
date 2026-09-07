@@ -13,7 +13,7 @@ Not greenfield, and the design has to say what it is *adding*:
 | `pad_vocab`, `kv_replicas`, `tp_config` | `tensor_parallel.py:59`, `:65`, `:79` |
 | row-parallel all-reduce in the forward | `model.py:191` (`_add_via`) |
 | data-parallel engines, one per card | `parallel.py` |
-| NCCL cost: **21.5 µs per call, flat 20 KB → 1.3 MB** | CHANGELOG 2026-08-30 |
+| NCCL cost: **20.6 µs per call, flat 20 KB → 1.3 MB** | [measured](experience/wins/2026-09-07-the-nccl-floor-was-measured-a-week-early.md) |
 
 **The backward landed in #115.** `_BWD` (`autograd.py:245`) now registers
 `all_reduce`, `all_gather` and `tp_fork`, gated by `tests/tp_world2.py` on two
@@ -132,7 +132,7 @@ for the 27B (16 full-attn layers, 4 KV heads, head_dim 256, bf16 K and V):
 | bytes/step, either scheme (B=8, T=256) | 64 MiB | 96 MiB | 112 MiB |
 | **ring** calls/step | 16 | 48 | **112** |
 | **all-gather** calls/step | 16 | 16 | **16** |
-| ring latency floor @ 21.5 µs/call | 344 µs | 1032 µs | **2408 µs** |
+| ring latency floor @ 20.6 µs/call | 344 µs | 1032 µs | **2408 µs** |
 | all-gather latency floor | 344 µs | 344 µs | **344 µs** |
 
 **Both columns double once the backward is counted.** The backward of the K/V
@@ -143,7 +143,7 @@ is common to both schemes — so the decision below stands on the same 7x.
 
 Bytes are the same because each scheme moves every remote chunk to every rank
 exactly once. What differs is the **call count**: ring is `cp-1` sequential
-send/recv per layer, all-gather is one. Against the measured 21.5 µs NCCL floor
+send/recv per layer, all-gather is one. Against the measured 20.6 µs NCCL floor
 (flat from 20 KB to 1.3 MB, CHANGELOG 08-30) that is a 7x latency difference at
 cp=8, and the chunks here are inside the flat region, so the floor *is* the cost.
 
@@ -156,13 +156,13 @@ helps if there is compute to hide behind, so: at B=8, T=256, cp=8 each block is
 
 | effective throughput | per-block attention | hop floor |
 |---|---:|---:|
-| 100 TFLOP/s (conservative) | **2.0 µs** | 21.5 µs |
-| 300 TFLOP/s | 0.7 µs | 21.5 µs |
-| 989 TFLOP/s (H20 bf16 peak) | 0.2 µs | 21.5 µs |
+| 100 TFLOP/s (conservative) | **2.0 µs** | 20.6 µs |
+| 300 TFLOP/s | 0.7 µs | 20.6 µs |
+| 989 TFLOP/s (H20 bf16 peak) | 0.2 µs | 20.6 µs |
 
 Compute is **10–100x below the hop floor**, so `max(compute, hop) ≈ hop` and
 overlap recovers almost nothing at these shapes. The 2408 µs stands. This flips
-only when a block is large enough for its attention to exceed 21.5 µs — around
+only when a block is large enough for its attention to exceed 20.6 µs — around
 T/cp ≈ 400+ tokens at 100 TFLOP/s, i.e. the long-sequence regime where ring also
 wins on memory. Same threshold, twice.
 
@@ -232,7 +232,7 @@ contribution — is **wrong by 23%** (measured) and still produces a plausible
 loss. `tests/gdn_cp_scan.py --decay-a` is that misreading as a control.
 
 **Three schemes, priced with the compute column** (48 GDN layers, HV=48,
-DK=DV=128, f32, 400 GB/s assumed, 21.5 µs measured floor, whole step in ms):
+DK=DV=128, f32, 400 GB/s assumed, 20.6 µs measured floor, whole step in ms):
 
 | | cp=2 | cp=4 | cp=8 |
 |---|---:|---:|---:|

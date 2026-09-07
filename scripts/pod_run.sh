@@ -2,8 +2,9 @@
 # Run one job on one H20 card, with every pod gotcha we paid for on 2026-09-05
 # already encoded. Nobody should hand-type this shape again.
 #
-#   scripts/pod_run.sh <name> <card> -- <command...>
+#   scripts/pod_run.sh <name> <card[,card...]> -- <command...>
 #   scripts/pod_run.sh arms 6 -- python3 scripts/recapture_arms.py --steps 6
+#   scripts/pod_run.sh tp2 0,1 -- torchrun --nproc_per_node=2 scripts/x.py
 #
 # What it encodes, each line a thing that actually went wrong:
 #   * a bash parent that WAITS, so the job is reaped. `setsid nohup ... &` from a
@@ -25,7 +26,7 @@
 #   * release by name in a trap, so a crash does not leave the claim held.
 #   * a zombie claim from a previous crash is released and re-acquired: kill -0
 #     and /proc both call a zombie alive, and only `ps -o stat=` says Zs.
-#   * refuse to start if the card already holds >64 MiB with no claim.
+#   * refuse to start if a card already holds >64 MiB with no claim.
 #   * on exit, print `ps -o stat=` for the job and nvidia-smi for the card, so
 #     "it finished" is a reading rather than an assumption.
 set -euo pipefail
@@ -41,7 +42,7 @@ ORPHAN_MIB="${ORPHAN_MIB:-64}"
 # seconds to poll for the job's device fd: a 27B load takes minutes to open the card
 DEVICE_WAIT="${DEVICE_WAIT:-300}"
 
-[ $# -ge 4 ] || { echo "usage: $0 <name> <card> -- <command...>" >&2; exit 2; }
+[ $# -ge 4 ] || { echo "usage: $0 <name> <card[,card...]> -- <command...>" >&2; exit 2; }
 NAME=$1 CARD=$2; shift 2
 [ "$1" = "--" ] || { echo "$0: expected -- before the command" >&2; exit 2; }
 shift
@@ -71,12 +72,15 @@ export TILERL_TARGET=\${TILERL_TARGET:-cuda} CUDA_VISIBLE_DEVICES=$CARD
 export TILERL_QWEN38_SOURCE=\${TILERL_QWEN38_SOURCE:-/work/Qwen3.8-27B-NVFP4}
 export REMOTE_DIR=$REMOTE_DIR
 
-used=\$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i $CARD)
-held=\$(python3 $AUPAI/scripts/card_claim.py status 2>/dev/null | grep -c " $CARD " || true)
-if [ "\$used" -gt $ORPHAN_MIB ] && [ "\$held" -eq 0 ]; then
-  echo "pod_run: card $CARD holds \${used} MiB with no claim -- an orphan. Refusing." >&2
-  exit 3
-fi
+# per card, because \`-i 0,1\` returns a line per card and the -gt test needs one integer
+for c in ${CARD//,/ }; do
+  used=\$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i \$c)
+  held=\$(python3 $AUPAI/scripts/card_claim.py status 2>/dev/null | grep -c " \$c " || true)
+  if [ "\$used" -gt $ORPHAN_MIB ] && [ "\$held" -eq 0 ]; then
+    echo "pod_run: card \$c holds \${used} MiB with no claim -- an orphan. Refusing." >&2
+    exit 3
+  fi
+done
 
 release() { python3 $AUPAI/scripts/card_claim.py release --name tilerl-$NAME >/dev/null 2>&1 || true; }
 trap release EXIT INT TERM

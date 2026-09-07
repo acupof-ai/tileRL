@@ -1,6 +1,6 @@
 """All-reduce rate at TP's message size: 2 per layer over [B, hidden] f32,
 so the small-message rate decides TP, not peak NVLink.
-  torchrun --nproc_per_node=8 scripts/nccl_probe.py
+  torchrun --nproc_per_node=2 scripts/nccl_probe.py   # any world; 2 idle cards is enough
 """
 
 from __future__ import annotations

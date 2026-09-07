@@ -1,7 +1,12 @@
 # The NCCL floor a design verdict rests on has no instrument — 2026-09-06
 
-> Status: open. `scripts/nccl_probe.py` is the instrument, exists, and is cited by
-> nothing; no run of it is recorded anywhere.
+> Status: CLOSED 2026-09-07. The floor is **20.6 µs**, measured at world=2 on an idle
+> H20 pair — [the floor was measured a week
+> early](../wins/2026-09-07-the-nccl-floor-was-measured-a-week-early.md). Two things this
+> entry got wrong: four runs of the probe already existed on the pod, dated 2026-08-29,
+> so "no run of it is recorded anywhere" was true of the tree and false of the machine;
+> and the cited 21.5 was accurate to 4%, so none of the ten sites needed more than a
+> re-pointed citation.
 
 ## Context
 
@@ -67,6 +72,12 @@ inherits that.
 
 Not run here: the H20 needs 8 cards for `--nproc_per_node=8`, and this session holds
 one job at a time.
+
+**Done, and the premise was wrong twice.** The probe is world-agnostic — only its
+docstring says 8 — so `--nproc_per_node=2` on an idle pair settles it, and no session
+ever needed 8 cards. And four runs already existed at `/work/nccl*.log`, from a week
+before this entry. Measured 20.6 µs, flat to 4% across 20 KB → 1.3 MB; all nine prose
+sites re-pointed at the measurement.
 
 ## A gate for this was tried and does not work
 
