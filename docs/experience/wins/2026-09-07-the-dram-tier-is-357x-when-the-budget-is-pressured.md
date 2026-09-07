@@ -110,6 +110,15 @@ that happened to compose into a plausible 9. The V100 grid is a measurement to
 run, not arithmetic to publish, and there the tier is HBM→SSD with no host layer
 (`kv_cache.py:390-396`) — the arm this entry shows to be the worst of the three.
 
+**A block costs 1.0 MiB here and 2.0 MiB there, and the difference is the dtype.**
+`PagedKvPool` allocates `k_pool` and `v_pool` as two tensors of
+`[planes, blocks, heads, 16, head_dim]`, and the engine passes `Backend.io`:
+`backend.py:359` is `float32 if arch in ("cpu", "metal", "sm70") else bfloat16`. So one
+block is 1.0 MiB for K+V at bf16 on this H20 and **2.0 MiB at f32 on the V100**, both
+measured on a real pool at the 27B's shape. The 12x31k agent shape therefore needs
+24 GiB of blocks on the H20 and **48 GiB on the V100** — which is why it does not fit a
+32 GB card, and why a byte-size claim about this pool is wrong without its dtype.
+
 ## Rule
 
 **A tier's own regime is a flag on both of its terms, and the verdict inside it
