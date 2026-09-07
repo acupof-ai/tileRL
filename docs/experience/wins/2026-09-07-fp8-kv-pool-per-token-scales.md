@@ -1,7 +1,14 @@
 # fp8 KV pool and fp8 attention readers, per-token scales — sm90 + cpu, 2026-09-07
 
 > Status: Shipped (flag, default off) — writers and readers both fp8, gated on card.
-> **No tok/s claim yet**: the 27B decode arms are pending-remote.
+> **Capacity 1.969x, measured slower in both phases that were measured.**
+>
+> The headline cost is **1.73x wall clock** on a B=32 x 32k run — and that is a whole-run
+> number at equal total work, **not** equal concurrency: bf16 carried 22 rows per tick where
+> fp8 carried 32. So what is measured is *"fp8 KV finished this workload slower"*, not
+> *"fp8 KV is slower"*. The per-tick ratio at equal rows, which would say the second, is the
+> one number this entry does not have (ceiling 1.079x). The verdict — default off — does not
+> depend on which of the two it is, which is what makes the distinction cheap to keep.
 
 ## Context
 
