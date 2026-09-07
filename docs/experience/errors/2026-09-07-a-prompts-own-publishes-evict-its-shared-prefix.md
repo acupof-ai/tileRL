@@ -1,7 +1,9 @@
 # A prompt's own publishes evict the prefix it shares — 2026-09-07
 
-> Status: open. The mechanism is measured on the CPU target; the fix is not
-> written. Listed in [`OPEN.md`](../OPEN.md).
+> Status: open. The mechanism is measured on the CPU target and the binding operand is
+> now measured too — a shared head survives a gap of `budget − 1` publishes, so 10 on
+> the V100 against 70 per conversation. The fix is still not written. Listed in
+> [`OPEN.md`](../OPEN.md).
 
 ## Context
 
@@ -67,8 +69,63 @@ decides nothing, and the sharing rate has never been measured here. It comes fro
 traffic, not from a card. A fix priced against an assumed rate would be priced
 against nothing.
 
+## The operand is an interval, not a rate — 2026-09-07
+
+The paragraph above asked for the wrong quantity, and `scripts/probe_shared_prefix_lru.py`
+says which one it is. The premise it missed is one line: **`kv_cache.py:1120` moves a
+matched entry to the MRU end**, so the shared head is only the LRU victim while nothing
+is hitting it. Three arms, budget 3, one conversation publishing 8 boundaries:
+
+| arm | head still hits | resident lengths |
+|---|---|---|
+| no hit on the head | False | `[96, 112, 128]` |
+| one hit, right after the head is published | False | `[96, 112, 128]` |
+| a hit after every publish | **True** | `[32, 112, 128]` |
+
+The first arm reproduces this entry's own `[96, 112, 128]`, so the probe sees the
+eviction that was measured rather than a new one.
+
+**A single hit at any position fails — including one after the last publish.** That is
+the mechanism, and it is not "the refresh is too weak": a lookup refreshes only an entry
+that is still resident, and once the head is gone the lookup is a miss, which restores
+nothing. So the quantity is the *gap between* arrivals, not their recency or their share.
+
+Sweeping the gap against the budget gives an exact relation, asserted rather than
+eyeballed:
+
+| budget | max gap that keeps the head |
+|---:|---:|
+| 2 | 1 |
+| 3 | 2 |
+| 4 | 3 |
+| 6 | 5 |
+| 8 | 7 |
+| 11 | **10** |
+
+`interval = budget − 1` at all six points, with no fitted term — so the V100's 11-entry
+budget tolerates a gap of **10 publishes**. One conversation emits 70 at gen 1024, so a
+shared head survives only if a second session arrives inside every 10 of them, about
+**7 arrivals per conversation**.
+
+That is a condition a live server can be tested against, which the 1.4%-to-50% range
+never was. It also re-shapes the fix: the failure is not that LRU misprices
+shareability, it is that **one producer's publish rate outruns any consumer's arrival
+rate** — 70 publishes against a 10-publish window. Scoring by shareability would help
+only if it also stopped the tail from filling the budget 7 times per conversation, so
+throttling the decode-boundary publishes is the cheaper half and should be priced first.
+
 ## Rule
 
 An LRU over entries of *increasing* length evicts the shared prefix first, because
 the shared part is the oldest part. Recency and shareability point in opposite
 directions when one producer emits a nested family of keys.
+
+Second, from asking for the wrong operand first: **"what fraction shares this prefix"
+and "how often does a sharer arrive" are different questions, and only the second one
+has an answer the code can be tested against.** A rate looks like the natural operand
+because the policy is described in terms of shareability, so the missing number gets
+named after the policy rather than after the mechanism. The mechanism here is a
+refresh that reaches only resident entries, which makes the binding quantity an
+interval — and an interval has a threshold (`budget − 1`) where a rate had only a
+range. When a missing operand yields a range too wide to decide anything, suspect it
+is the wrong operand rather than an unmeasured one.
