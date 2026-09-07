@@ -153,7 +153,7 @@ def test_prefix_longest_match():
     # cold miss
     assert store.lookup(list(range(100, 148))) is None
     s = store.stats()
-    assert s["entries"] == 3 and s["hits"] == 3 and s["misses"] == 1
+    assert s["entries"] == 3 and s["lookups_matched"] == 3 and s["lookups_missed"] == 1
 
 
 def test_prefix_hash_collision_is_verified():
@@ -599,10 +599,10 @@ def test_every_key_the_store_publishes_reaches_health_or_is_named_as_dropped():
     assert engine._prefix.insert(toks, blks, None), "fixture: insert refused"
     for b in blks:
         engine._kv.free_block(b)
-    engine._prefix.lookup(toks)                 # moves the store's own hits
+    engine._prefix.lookup(toks)                 # moves the store's lookups_matched
     engine._prefix.clear()                      # moves evictions and blocks_freed
     st = engine._prefix.stats()
-    assert st["evictions"] and st["blocks_freed"] and st["hits"], (
+    assert st["evictions"] and st["blocks_freed"] and st["lookups_matched"], (
         f"fixture left the counters at zero, so the value check cannot discriminate: {st}")
 
     published = set(engine._prefix.stats())

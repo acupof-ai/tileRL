@@ -808,7 +808,8 @@ class NoPrefixStore:
         return None
 
     def stats(self) -> dict[str, int]:
-        return {"entries": 0, "capacity": 0, "state_bytes": 0, "hits": 0, "misses": 0,
+        return {"entries": 0, "capacity": 0, "state_bytes": 0,
+                "lookups_matched": 0, "lookups_missed": 0,
                 "evictions": 0, "blocks_freed": 0}
 
 
@@ -848,8 +849,8 @@ class PrefixStore:
         # to the end. A parallel deque plus dict is what this replaces.
         self._by_id: OrderedDict[int, _Entry] = OrderedDict()
         self._next_id = 0
-        self.hits = 0
-        self.misses = 0
+        self.lookups_matched = 0
+        self.lookups_missed = 0
         self.evictions = 0
         self.blocks_freed = 0
         self.ssd_hits = 0
@@ -945,7 +946,7 @@ class PrefixStore:
                             self._drop(e)
                             break
                         self._state_used += e.nbytes
-                    self.hits += 1
+                    self.lookups_matched += 1  # per LOOKUP; /health's prefix_hits is per admission
                     self._by_id.move_to_end(e.eid)  # this is the whole of "recently used"
                     return PrefixHit(i, e.blocks, e.state)
             # Nothing resident at this length. Before trying a shorter prefix, ask the disk:
@@ -955,7 +956,7 @@ class PrefixStore:
                 hit = self._fault_in(prefix_hashes[i - 1], tokens[:i])
                 if hit is not None:
                     return hit
-        self.misses += 1
+        self.lookups_missed += 1
         return None
 
     def _fault_in(self, h: int, tokens: tuple[int, ...]) -> PrefixHit | None:
@@ -998,7 +999,7 @@ class PrefixStore:
             for b in blocks:
                 self._pool.free_block(b)
         self.ssd_hits += 1
-        self.hits += 1
+        self.lookups_matched += 1
         return PrefixHit(len(tokens), tuple(blocks), state)
 
     def evict_until_free(self, blocks: int) -> None:
@@ -1090,8 +1091,8 @@ class PrefixStore:
             # state pressure from block pressure. Set from mem_get_info at build time and
             # otherwise unknowable from outside.
             "state_bytes_budget": self.state_bytes,
-            "hits": self.hits,
-            "misses": self.misses,
+            "lookups_matched": self.lookups_matched,
+            "lookups_missed": self.lookups_missed,
             "evictions": self.evictions,
             "blocks_freed": self.blocks_freed,
             "demoted": sum(1 for e in self._by_id.values() if e.demoted),

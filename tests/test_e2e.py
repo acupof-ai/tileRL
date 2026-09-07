@@ -298,7 +298,7 @@ def test_the_reread_prefix_survives_capacity_pressure():
 
     # 4-entry capacity, 7 inserts, so eviction ran; the re-read entry outlived it.
     assert store.stats()["evictions"] >= 3
-    assert store.hits == 6 and store.misses == 0
+    assert store.lookups_matched == 6 and store.lookups_missed == 0
 
 
 def test_prefix_cache():

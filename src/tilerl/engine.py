@@ -70,9 +70,7 @@ _PHASE_DONE = 3
 _HASH_MASK = 0x7FFFFFFF
 
 #: Store stats deliberately not on the wire; the seam gate forbids any OTHER unforwarded key.
-#: hits/misses: lookups incl. admission retries, where /health's prefix_hits counts admissions;
-#: 4 in-tree readers, one the kv-reuse bench cell whose recorded values are that definition.
-_STORE_STATS_INTERNAL = ("hits", "misses")
+_STORE_STATS_INTERNAL = ("lookups_matched", "lookups_missed")
 
 
 def _quantize_draft(params: dict[str, torch.Tensor], skip: tuple[str, ...] = (),
