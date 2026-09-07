@@ -897,6 +897,10 @@ class _Entry:
     #: the snapshot lives in the DRAM tier, not in ``state``; ``nbytes`` is kept so a
     #: promotion can re-charge exactly what the demotion credited
     demoted: bool = False
+    #: rows that have wanted this prefix: 1 at publish, +1 on a lookup match and +1 when a
+    #: second row publishes the same prefix. Both are events the store already sees, so this
+    #: costs no walk. It is the eviction weight -- see `_evict_one`.
+    sharers: int = 1
 
 
 class NoPrefixStore:
@@ -1100,6 +1104,7 @@ class PrefixStore:
         h = self._hash_all(tokens)
         for e in self._entries.get(h, ()):
             if e.tokens == tokens:
+                e.sharers += 1   # a second row published the same prefix: it is shared
                 return False
         entry = _Entry(self._next_id, tokens, blocks, h, state, _nbytes(state))
         self._state_used += entry.nbytes
@@ -1159,6 +1164,7 @@ class PrefixStore:
                             break
                         self._state_used += e.nbytes
                     self.lookups_matched += 1  # per LOOKUP; /health's prefix_hits is per admission
+                    e.sharers += 1
                     self._by_id.move_to_end(e.eid)  # this is the whole of "recently used"
                     return PrefixHit(i, e.blocks, e.state)
             # Nothing resident at this length. Before trying a shorter prefix, ask the disk:
@@ -1267,8 +1273,28 @@ class PrefixStore:
             self.superseded += 1
 
     def _evict_one(self) -> None:
-        eid = next(iter(self._by_id))  # least recently used
-        self._drop(self._by_id[eid])
+        """Evict the least valuable entry, value = prefix length x rows that wanted it.
+
+        Pure LRU is wrong here and not because of recency. A miss prefills from token 0 and
+        publishes at every chunk end -- 62 of them at a 31k prompt -- so within one
+        conversation the shared head is the least recent entry and goes first. The next row
+        then misses and does the same: errors/2026-09-07-a-miss-self-reinforces.md, 11 of 12
+        sessions missing in sequence at 14.1 s each.
+
+        Both factors are needed and each alone was measured worse; the gate in tests/test_kv.py
+        kills all three degenerate forms. Length alone keeps the deepest private prefix, which
+        only its own row can use. Sharers alone keeps a 16-token prefix matched 3 times over a
+        128-token one nobody has matched yet, and what a hit saves is tokens, not matches. The
+        product keeps a head once enough rows have matched it -- note that ONE match only ties
+        (a 64-token head at 2 sharers equals a private 128-token leaf, and a tie falls to dict
+        order, which is LRU) -- and within one conversation keeps the deepest, which is the
+        only entry that saves that row anything.
+
+        Measured over shared-head x budget, reuse in tokens at admission (probe in
+        wins/2026-09-08-evict-by-length-times-sharers.md, 196608 possible): this 115712,
+        pure LRU 81408, and four refuted policies between.
+        """
+        self._drop(min(self._by_id.values(), key=lambda e: len(e.tokens) * e.sharers))
 
     def retire(self, tokens: Sequence[int]) -> bool:
         """Drop the publisher's own earlier entry for exactly ``tokens``. True if one went.

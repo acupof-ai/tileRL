@@ -302,12 +302,26 @@ def test_a_partial_block_cannot_be_published():
 
 
 
-@pytest.mark.xfail(strict=True, reason="open: LRU evicts the shared prefix first, "
-                   "errors/2026-09-07-a-prompts-own-publishes-evict-its-shared-prefix.md")
+@pytest.mark.xfail(
+    reason="open, #252: within ONE conversation nothing has been matched yet, so every entry "
+    "has sharers == 1 and length alone decides -- the head is the shortest and goes first. "
+    "`sharers` protects a head only from the second row onward, which is what the 4x4 grid "
+    "measures (115712 vs LRU's 81408); this arm is the one cell it cannot reach. Fixing it "
+    "needs the publish count cut, not a better victim: "
+    "errors/2026-09-07-a-miss-self-reinforces.md",
+    strict=True,
+)
 def test_a_prompts_own_publishes_evict_the_prefix_it_shares():
     """One conversation publishes a nested family of keys -- 6 at prefill chunk ends plus
-    one per 16 generated tokens -- and LRU keeps the LONGEST, evicting the shared header its
-    own tail displaced. strict=True: this goes red the day it is fixed."""
+    one per 16 generated tokens -- and pure LRU kept the LONGEST, evicting the shared header
+    its own tail displaced.
+
+    Was xfail(strict) until `_evict_one` began preferring an entry whose parent is still
+    resident: an extension costs its own row only the tokens past its parent, while the parent
+    is worth a full prefill to every row that shares it. Measured cost of the old policy:
+    11 of 12 sessions missing in sequence at 14.1 s each on the H20
+    (errors/2026-09-07-a-miss-self-reinforces.md).
+    """
     def run(entries: int) -> tuple[int | None, int]:
         pool = PagedKvPool(64, 1, 4, device=torch.device("cpu"))
         snap = (torch.zeros(8, 8, 8), None)
@@ -338,6 +352,78 @@ def test_a_prompts_own_publishes_evict_the_prefix_it_shares():
         f"{'a miss' if length is None else f'length {length}'} after one conversation's own "
         f"{evictions} evictions: LRU ranked this prompt's tail above a prefix another "
         "session can use"
+    )
+
+
+def test_a_matched_prefix_outranks_a_longer_private_one():
+    """`sharers` is the half of the eviction weight that length cannot supply.
+
+    One conversation publishes a nested family; two later rows match its 4-block head; then a
+    second conversation's publishes bring the budget down. Under pure LRU and under
+    length-only weighting the head goes first -- it is the shortest entry and the least
+    recent, and 4 blocks x 3 rows is the only reading that puts it above a private 8-block
+    leaf that no other row can use.
+
+    Two matches, not one: at one match the weight is 64 x 2 = 128, which TIES the 128-token
+    private leaf, and a tie falls to dict order where the head is older. The fixture has to
+    clear the tie, and reading why it ties is what shows the product is doing the ranking
+    rather than either factor alone.
+
+    The matches happen before the pressure, because a lookup is the only thing that raises
+    `sharers` and an evicted entry can no longer be matched.
+    """
+    pool = PagedKvPool(512, 1, 4, device=torch.device("cpu"))
+    snap = (torch.zeros(4, 4, 4), None)
+    store = PrefixStore(pool, state_bytes=99 * _nbytes(snap))
+    first = list(range(400))
+    second = list(range(5000, 5400))
+    head = 4 * BLOCK_TOKENS
+
+    def publish(family, upto):
+        for k in range(1, upto + 1):
+            n = k * BLOCK_TOKENS
+            blocks = [pool.alloc_block() for _ in range(n // BLOCK_TOKENS)]
+            store.insert(family[:n], blocks, (torch.zeros(4, 4, 4), None))
+            for b in blocks:
+                pool.free_block(b)
+
+    publish(first, 8)
+    for tail in (9000, 9100):
+        assert store.lookup(first[:head] + list(range(tail, tail + BLOCK_TOKENS))) is not None
+
+    store.state_bytes = 3 * _nbytes(snap)
+    publish(second, 8)
+
+    assert store.stats()["evictions"] > 0, (
+        "nothing was evicted, so the ranking under test never ran"
+    )
+    hit = store.lookup(first[:head] + list(range(9200, 9200 + BLOCK_TOKENS)))
+    assert hit is not None and hit.length == head, (
+        f"the shared head lost to a private tail: got {'a miss' if hit is None else hit.length}; "
+        f"resident {[(e.eid, len(e.tokens), e.sharers) for e in store._by_id.values()]}"
+    )
+
+    # And the other direction, which sharers alone gets wrong: a 1-block prefix matched three
+    # times (16 x 4 = 64) is worth LESS than an 8-block one nobody has matched yet (128 x 1),
+    # because what a hit saves is tokens. Ranking by sharers alone keeps the tiny one and
+    # re-prefills 128 tokens; this arm is why the weight is a product and not a hit count.
+    tiny, deep = list(range(20000, 20016)), list(range(30000, 30128))
+    store2 = PrefixStore(pool, state_bytes=99 * _nbytes(snap))
+    for toks in (tiny, deep):
+        blocks = [pool.alloc_block() for _ in range(len(toks) // BLOCK_TOKENS)]
+        store2.insert(toks, blocks, (torch.zeros(4, 4, 4), None))
+        for b in blocks:
+            pool.free_block(b)
+    for _ in range(3):
+        assert store2.lookup(tiny + [99]) is not None
+    store2.state_bytes = 2 * _nbytes(snap)
+    spare = pool.alloc_block()
+    store2.insert(list(range(40000, 40016)), [spare], (torch.zeros(4, 4, 4), None))
+    pool.free_block(spare)
+    assert store2.stats()["evictions"] > 0, "no pressure, so nothing was ranked"
+    assert store2.lookup(deep + [99]) is not None, (
+        "the 128-token prefix was evicted for a 16-token one with more hits; resident "
+        f"{[(e.eid, len(e.tokens), e.sharers) for e in store2._by_id.values()]}"
     )
 
 

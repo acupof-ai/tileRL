@@ -748,6 +748,55 @@ def test_the_dram_tier_pays_only_above_its_session_count():
     )
 
 
+def test_a_cold_session_does_not_evict_the_head_every_other_session_shares():
+    """N sessions sharing one long head, through the ENGINE, under state-byte pressure.
+
+    The store-level arm (tests/test_kv.py, the former #252 xfail) drives `insert` directly.
+    This one goes through submit/step, because the defect is produced by the engine's publish
+    pattern: a miss prefills from token 0 and publishes at every chunk end, and those publishes
+    are what evict the head. Measured on the H20 before the fix: turn-2 hits 1/12, 199.35 s.
+
+    `state_bytes`, not `capacity`, is the pressure that reproduces it -- the real cell ran
+    capacity 4096 and the binding budget was the snapshot bytes. Pressuring capacity instead
+    reads 5/6 hits even with pure LRU, which is how an earlier version of this probe passed
+    against the unfixed store.
+
+    The head is published by session 0's own chunk boundaries, never as a standalone entry: the
+    engine has no such publish, and a probe that inserts one cannot see this defect.
+    """
+    cfg = tiny()
+    eng = build_engine(cfg, build_random(cfg, seed=15), get_backend(), num_blocks=4096,
+                       num_slots=8, max_batch=1, max_total_tokens=32768)
+    budget_snapshots = 6                       # the H20 cell's ratio: 6 resident, 12 sessions
+    head = [5] * (8 * 512)
+    sessions = 6
+    hits = []
+    for i in range(sessions):
+        before = eng.stats()["prefix_hits"]
+        rid = eng.submit(head + [20 + i] * 512,
+                         SamplingParams(max_new_tokens=8, temperature=0.0))
+        ticks = 0
+        while rid not in eng.poll() and ticks < 900:
+            eng.step()
+            ticks += 1
+            # Applied once a snapshot exists, since S is only known after one publish.
+            one = eng._prefix._snapshot_bytes
+            if one:
+                eng._prefix.state_bytes = budget_snapshots * one
+        assert ticks < 900, f"session {i} never finished"
+        hits.append(eng.stats()["prefix_hits"] - before)
+
+    st = eng._prefix.stats()
+    assert st["evictions"] > 0, (
+        "nothing was evicted, so the budget never bound and this arm proves nothing"
+    )
+    assert hits[0] == 0, f"session 0 hit something before anything was published: {hits}"
+    assert all(h > 0 for h in hits[1:]), (
+        f"per-session hits {hits} with {st['evictions']} evictions: a cold session's own "
+        f"publishes evicted the head every other session shares"
+    )
+
+
 def test_the_dram_tier_demotes_instead_of_evicting():
     """Under `state_bytes` pressure the snapshot goes to the host and the entry stays.
 
@@ -795,7 +844,15 @@ def test_the_dram_tier_demotes_instead_of_evicting():
         "the no-tier arm evicted nothing, so state_bytes pressure was never reached and "
         "the comparison below has no floor"
     )
-    plain_hits = sum(1 for k in range(1, 7) if plain.lookup(toks[: k * BLOCK_TOKENS * 2]))
+    # Exact length, not merely non-None: `lookup` returns the longest stored PREFIX, so a
+    # surviving short entry answers every longer query. Counting any match read 6/6 for both
+    # arms once eviction began keeping the shortest entries, which is the tier's own effect
+    # measured away -- the tiered loop below already asserts `hit.length == length`.
+    plain_hits = 0
+    for k in range(1, 7):
+        want = k * BLOCK_TOKENS * 2
+        hit = plain.lookup(toks[:want])
+        plain_hits += hit is not None and hit.length == want
 
     tiered, toks, kept = run(DramSnapshots(budget_bytes=50 * one))
     st = tiered.stats()
