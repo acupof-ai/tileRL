@@ -197,13 +197,18 @@ Physics that fixes the design:
   scheduled**. Collectives are 5.95% of the step as a loose upper bound, 99% of
   it in `tp_fork` rather than `all_reduce` (whose backward communicates
   nothing), and the two ranks differ 3x on that op — part of the figure is rank
-  skew absorbed by the collective, not communication.
+  skew absorbed by the collective, not communication, so rank 1's 2.39% is the
+  closer estimate. **Fusing the calls recovers 0.34% of the step, not 6%**: at
+  0.441 ms/call `tp_fork` is 21.4x the 20.6 µs floor, so the time is inside the
+  calls rather than in launching them.
   [entry](experience/wins/2026-09-07-tp2-on-two-cards.md)
 - **A first TP run pays a full JIT rebuild, per rank**: step 1 was 456 s against
-  step 2's 10.0 s, because both ranks compile independently and the shard shapes
-  miss a `tilelang_cache` warm for single-card runs. Warming or sharing a compile
-  cache is a prerequisite for any TP wall-clock claim, and it is paid again on
-  every new shard width.
+  step 2's 10.0 s, because both ranks compile independently and the new shard
+  width changes the GEMM tile shapes the autotuner searches over. The cost is
+  the re-search, not the cache miss as such — fp8's kernels are cold too and
+  compile in 3-6 s, keeping their bf16 twins' launch geometry. Warming or
+  sharing a compile cache is a prerequisite for any TP wall-clock claim, and it
+  is paid again on every new shard width.
 - CP for GDN is a scan, not a hand-off: `S_i = A_i S_{i-1} + B_i` composes,
   so each rank computes local (A, B), one all-gather fixes the incoming
   state, a second pass produces outputs; backward is the same scan reversed.

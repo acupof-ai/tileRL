@@ -70,11 +70,37 @@ rank 1, over the same 1672 calls. An all-reduce makes the early rank wait for th
 one, so the difference is rank skew absorbed by the collective, not communication. The
 0.745 s is therefore an upper bound twice over: once for the profiler's syncs removing
 overlap, once because part of it is a wait. **Someone optimizing "the collective" would
-be optimizing a wait.**
+be optimizing a wait.** Rank 1's 0.2402 s is 2.39% of the step, and that is the closer
+estimate of what TP comms actually cost; the 0.4969 s gap cannot be communication,
+because both ranks move the same bytes through the same collective.
 
-The consequence for the roadmap: at 0.745 s of a 10.0 s step, with both bounds loose and
-`linear_attn_chunk` alone at 2.87-3.22 s, gradient bucketing and compute/comms overlap
-are not worth scheduling off this measurement.
+**What the gap is remains open, and this run cannot close it.** Two readings fit equally:
+the shard split is uneven, so the same rank is always late and the fix is rebalancing
+rather than anything comms-related; or arrival alternates per call and the gap is
+straggler jitter with nothing to rebalance. Distinguishing them needs per-call timings,
+and `instrument()` keeps only the sum and the count (`prof_backward_ops.py:124-137`) —
+there is no per-call series to inspect, so the question is not answerable from these
+JSONs. Naming it rather than picking the flattering reading: "the shards are uneven" is a
+finding, "there is jitter" is not, and I have no evidence for either.
+
+
+**And bucketing the calls recovers almost nothing.** At 0.441 ms/call, `tp_fork` runs
+**21.4x the 20.6 µs NCCL floor**, so its time is not launch latency: 1672 × 20.6 µs =
+34.4 ms, which is 4.7% of the op and **0.34% of the step**. Fusing 1672 calls into a
+handful therefore buys 0.34%, not 6%. The call count is not the lever here, which is the
+opposite of the decode case where a small collective at the floor makes count the only
+lever.
+
+One reading to avoid: "99% of the time is in one op, so the other 2695 calls are noise"
+conflates op-share with call-share. The 1024 `all_reduce` calls are noise; the other
+**1672 calls are `tp_fork`**. It is one op carrying most of the calls, not one call
+carrying the op.
+
+The consequence for the roadmap: at 0.745 s of a 10.0 s step, with both bounds loose,
+only 0.34% of it recoverable by fusion, and `linear_attn_chunk` alone at 2.87-3.22 s,
+gradient bucketing and compute/comms overlap are not worth scheduling off this
+measurement.
+
 
 ## The first TP run on a box pays a full JIT rebuild, per rank
 
@@ -83,6 +109,15 @@ independently, so every kernel compiles twice with no sharing; and the shard sha
 new, so `/work/tilelang_cache` — warm for months of single-card runs — misses on
 essentially every kernel the TP arm needs. 500+ `begins to compile` lines before the first
 step.
+
+**The cost is the autotuner, not the cache miss.** `tilerl-48` measured the contrast the
+same afternoon: their fp8 kernels are cold-cache too and compile in 3-6 s, because
+`write_tokens_fp8` and its siblings keep the launch geometry of their bf16 twins and
+differ only in operand dtype — there is nothing to re-search. A new shard width changes
+the GEMM tile shapes the autotuner searches over, so the miss lands on kernels with a real
+tuning space. A shape change costs minutes; a dtype change on identical geometry costs
+seconds.
+
 
 This invalidated my own estimate, which is the reason it is here: I priced the window at
 4 × 8m33s from the tp=1 control, a **cache-warm** configuration. A per-arm cost measured
@@ -156,3 +191,11 @@ Each arm spawns a fresh process and pays a full 27B load. `tilerl-48`'s probe sh
 model object across two engine builds for exactly this reason, and doing the same here
 would cut most of the wall clock. Recorded rather than presented as a floor:
 `tp_step_arms.py` could load once and run all four arms in-process.
+
+With one caveat that makes the naive version worse than the loads it saves, from 48's own
+card run: the **engines** hold the memory, not the model. Two arms each holding a fitted
+KV pool left the third sizing itself into what remained and asking for 47.50 GiB.
+`empty_cache` frees nothing while an engine is still bound, and an `Engine` sits in
+reference cycles so `del` alone does not release it — `gc.collect()` is required. Sharing
+the model without releasing each arm's engine turns the saving into an OOM at arm 3.
+
