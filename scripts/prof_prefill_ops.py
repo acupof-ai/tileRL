@@ -235,12 +235,24 @@ def _report(arm: dict) -> None:
 
     # The discriminator: does an op's per-chunk cost rise with the prefix?
     if len(chunks) >= 3:
-        print("\nper-chunk trend (first chunk -> last), the n^2 signature:")
-        first, last = chunks[0], chunks[-1]
+        # Only same-size chunks compare. At n=21727 the tail chunk is 223 tokens
+        # and the raw ratio read linear_fp4 at 0.51x -- an op getting CHEAPER with
+        # prefix. The scheduler also cuts chunk 0 to a 64 multiple, so both ends
+        # are picked by size, not position.
+        width = max(c["chunk"] for c in chunks)
+        full = [c for c in chunks if c["chunk"] == width]
+        print(f"\nper-chunk trend ({width}-token chunks, first -> last), "
+              "the n^2 signature:")
+        if len(full) < 2:
+            print(f"  only {len(full)} chunk(s) at {width} tokens; no trend")
+            return
+        first, last = full[0], full[-1]
         fb, lb = _bucket(first["ops"]), _bucket(last["ops"])
         span = last["prefix"] / max(first["prefix"], 1) if first["prefix"] else float("inf")
         print(f"  prefix {first['prefix']} -> {last['prefix']}"
-              + (f" ({span:.1f}x)" if span != float("inf") else ""))
+              + (f" ({span:.1f}x)" if span != float("inf") else "")
+              + (f", {len(chunks) - len(full)} odd-size chunk(s) skipped"
+                 if len(full) != len(chunks) else ""))
         for k in sorted(set(fb) | set(lb), key=lambda k: -(lb.get(k, 0))):
             a, b = fb.get(k, 0.0), lb.get(k, 0.0)
             if max(a, b) < 1e-4:
