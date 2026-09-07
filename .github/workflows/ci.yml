@@ -59,7 +59,7 @@ jobs:
             ran=$((ran + 1))
           done
           # no -f skip: an absent or renamed gate fails loudly instead of passing
-          [ "$ran" -ge 9 ] || { echo "only $ran distributed gates ran, expected >= 9" >&2; exit 1; }
+          [ "$ran" -ge 10 ] || { echo "only $ran distributed gates ran, expected >= 10" >&2; exit 1; }
           echo "distributed gates run: $ran"
         env:
           TILERL_TARGET: cpu

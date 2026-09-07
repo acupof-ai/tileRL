@@ -326,6 +326,10 @@ class Backend:
         if target == "metal":
             self.device = torch.device("mps")
         elif target.startswith("cuda"):
+            # bind this rank's card first: unbound, every rank takes card 0
+            local = int(os.environ.get("LOCAL_RANK", -1))
+            if 0 <= local < torch.cuda.device_count():
+                torch.cuda.set_device(local)
             # index None is not the device kernel outputs land on
             self.device = torch.device("cuda", torch.cuda.current_device())
             # fp32 matmuls in the eager backward were 23% of a train step on SIMT cores
