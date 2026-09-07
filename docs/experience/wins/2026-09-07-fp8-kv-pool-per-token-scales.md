@@ -9,6 +9,12 @@
 > *"fp8 KV is slower"*. The per-tick ratio at equal rows, which would say the second, is the
 > one number this entry does not have (ceiling 1.079x). The verdict — default off — does not
 > depend on which of the two it is, which is what makes the distinction cheap to keep.
+>
+> The direction of that caveat is worth being explicit about, because it is the opposite of
+> what "unequal concurrency" usually implies. More rows per tick means **fewer ticks** for
+> the same total work: fp8 needed 0.688x as many ticks and still spent 1.73x the wall clock,
+> which puts its per-tick cost at roughly **2.5x**. The unequal rows make the measured loss
+> an *understatement* of the per-tick penalty, not an excuse for it.
 
 ## Context
 
