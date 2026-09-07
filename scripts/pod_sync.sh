@@ -3,11 +3,22 @@
 # and optionally run a command there.
 # Usage: scripts/pod_sync.sh ['remote shell command']   # sync, run, wait
 #        scripts/pod_sync.sh run <name> 'command'        # sync, detach, poll
+#        scripts/pod_sync.sh --session <name> [...]      # sync into that session's tree
 # `run` detaches under setsid and polls the log: the connection drops before a 27B bench
 # finishes. The script goes over as base64 because a heredoc through `tn exec` arrives empty.
+# The wipe below is confined to $REMOTE_DIR, one tree per session (scripts/pod_session.sh).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/pod_session.sh
+. "$ROOT/scripts/pod_session.sh"
+if [ "${1:-}" = --session ]; then
+  POD_SESSION="$2"; shift 2
+fi
+SESSION="$(pod_session_name "$ROOT")"
+REMOTE_DIR="${REMOTE_DIR:-$(pod_session_tree "$ROOT")}"
+POD_NAME="${POD_NAME:-sglang-test}"
+
 # the remote checkout is wiped below and the tarball overwrites bench-baseline.json with
 # this tree's copy, so a failed pull silently drops any row the pod raised. No `|| true`:
 # the sync aborts instead. SKIP_BASELINE_PULL=1 stays the deliberate overwrite.
@@ -18,8 +29,6 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if sha=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null); then
   printf '%s\n' "$sha" > "$ROOT/.synced_commit"
 fi
-REMOTE_DIR="${REMOTE_DIR:-/work/tilerl}"
-POD_NAME="${POD_NAME:-sglang-test}"
 
 # ONE prelude for both entry points. It used to live inside the `run` branch only, so a
 # plain `pod_sync.sh 'cmd'` ran the container's tilelang 0.1.8 while `run` ran 0.1.13 from
@@ -45,9 +54,10 @@ remote+="crictl exec -i \$cid bash -lc $(printf '%q' "$inner")"
 
 if [ "${1:-}" = run ]; then
   name="$2"; shift 2
-  "$0" >/dev/null   # sync this checkout first; the job runs against it
-  script=$(printf 'set -x\ncd %s\n%s\n%s\necho DONE_%s\n' \
-                  "$REMOTE_DIR" "$POD_ENV" "$1" "$name" | base64 | tr -d '\n')
+  POD_SESSION="$SESSION" "$0" >/dev/null   # sync this checkout first; the job runs against it
+  script=$(printf 'set -x\ncd %s\n%s\necho "pod_sync: tree %s sha %s"\n%s\necho DONE_%s\n' \
+                  "$REMOTE_DIR" "$POD_ENV" "$REMOTE_DIR" "$(cat "$ROOT/.synced_commit" 2>/dev/null || echo unknown)" \
+                  "$1" "$name" | base64 | tr -d '\n')
   pod_exec() {
     tn exec "cid=\$(crictl ps -q --name $POD_NAME --state Running | head -1); crictl exec \$cid bash -lc $(printf '%q' "$1")"
   }

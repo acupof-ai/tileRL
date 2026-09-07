@@ -7,11 +7,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-REMOTE_DIR="${REMOTE_DIR:-/work/tilerl}"
+# shellcheck source=scripts/pod_session.sh
+. "$ROOT/scripts/pod_session.sh"
+REMOTE_DIR="${REMOTE_DIR:-$(pod_session_tree "$ROOT")}"   # one tree per session, see pod_session.sh
 POD_NAME="${POD_NAME:-sglang-test}"
 NAME="${NAME:-fan}"
 
-"$ROOT/scripts/pod_sync.sh" >/dev/null   # one sync for all arms
+# Pass the name, so a REMOTE_DIR override here cannot diverge from the child's default.
+POD_SESSION="$(pod_session_name "$ROOT")" "$ROOT/scripts/pod_sync.sh" >/dev/null
 
 pod_exec() {
   tn exec "cid=\$(crictl ps -q --name $POD_NAME --state Running | head -1); crictl exec \$cid bash -lc $(printf '%q' "$1")"

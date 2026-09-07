@@ -20,6 +20,7 @@ raises its own baseline cannot then regress against it. A first run seeds a miss
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import subprocess
 import sys
@@ -62,6 +63,13 @@ def _load_baseline() -> dict:
 
 def _save_baseline(b: dict) -> None:
     _BASELINE.write_text(json.dumps(b, indent=2, sort_keys=True) + "\n")
+    # The pod's tree is wiped on every sync, so a row written only here never reaches
+    # `pull`. Merged, not written: a plain write drops what another session raised meanwhile.
+    shared = Path(os.environ.get("POD_BASELINE_DIR", "/work/tilerl-baseline"))
+    if shared.is_dir():
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from baseline import merge_into
+        merge_into(shared / "bench-baseline.json", b)
 
 
 class Gate:
