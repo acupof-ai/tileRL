@@ -268,27 +268,35 @@ with more budget per session, and this cell's answer is that its budget is too s
 K-spaced refutation measured token-counted reuse, the one unit that cannot see either failure;
 it should be re-tested in TTFT at a budget where K ≥ 3 fits.
 
-**The measured model prices K, so this stops being a judgement call — and it adds a second constraint
-that bites harder than the byte one.** A hit costs `2.51 + 10.45 × (1 − depth)`, so a rung lifting a
-row's match from *d* to *d′* saves `10.45 × (d′ − d)` — **0.10 s per percentage point of depth**. But the
-2.51 s fixed term is paid per *hit*, not per rung, so a rung only earns its place if the depth it adds
-saves more than the alternative of matching nothing extra:
+**The measured model gives K a price, but not yet a tight one.** A rung lifting a row's match by
+Δtokens saves `Δtokens / 2681 tok/s`, and it only earns its place if that beats the per-hit fixed cost:
 
-**`10.45 × Δdepth > 2.51` → Δdepth > 24.0% of the prompt.**
+**`Δtokens / 2681 > fixed`, with fixed measured at 1.2–2.5 s → Δ of 3200–6700 tokens, i.e. 11–24% of a
+30k prompt.**
 
-**Rungs spaced closer than ~24% of the prompt are net negative**, which caps K at about 4 on depth
-grounds before the byte budget is consulted — and the byte budget already says K ≈ 1 here. Both
-constraints point the same way at this cell, from different data.
+That caps K somewhere between **4 and 11** on depth grounds. The byte budget says **K ≈ 1**. Those two do
+not bracket — **they conflict**: the depth axis wants several rungs and the budget affords one. An earlier
+version of this entry claimed they agreed, which rested on the pooled 2.51 s (weakly identified, see the
+model section).
 
-The ratchet says who needs the rungs: the early sessions in the queue, matching 1.7–8.5%. So the
-arithmetic to run before writing any ladder is `10.45 × Δdepth × hits` against the snapshot bytes the
-rung takes from the store, and it needs no card window.
+The conflict is the more useful statement, because it names the tension a ladder has to resolve rather
+than pretending the design space is already narrowed — and it reaches the same conclusion as the byte
+argument from the opposite side: **no publisher wins both ends at this budget.** What survives is the
+*form* of the criterion, not a number to build against:
+
+- a rung is worth its snapshot bytes only if it adds more than `fixed × 2681` tokens of match
+- the ratchet says who needs rungs most: the early sessions in the queue, at 1.7–8.5% depth
+- the byte budget is the binding constraint at this cell either way
+
+**So the ladder's ROI is arithmetic and the arithmetic is not yet decidable**, because its threshold term
+varies 2x across the only run that measured it. The cheap fix is a run with turns held constant — one
+turn, more sessions — which pins `fixed` without the covariate and needs no new instrument.
 
 **No revert.** The flood is a real defect with a measured cascade, and the child is genuinely
 better at turn 2.
 
-**Depth is measured**, not inferred — see the section below. A hit's cost is the full prefill times
-the fraction it did not match, to a median of 0.9% over 35 turns.
+**Depth is measured**, not inferred — see the section below. TTFT is linear in the tokens a hit did not
+match, R² 0.998, pooled and within every turn separately.
 
 ### The buckets were per-turn columns in the log, and two of us modelled them instead
 
@@ -342,25 +350,90 @@ The one-parameter form is good on average (median −0.9%) and its residuals **m
 depth**, +6.6% shallow to −8.7% deep — a 15-point trend, which is structure absorbed into an average,
 not noise. Adding an intercept removes the trend entirely and takes the residual sd from 6.0% to 1.4%.
 
-So the measured cost of a hit is **2.51 s fixed plus 10.45 s × the fraction it did not match**, and both
-terms mean something:
+**The right regressor is unmatched TOKENS, not the unmatched fraction.** A prompt that grows between
+turns makes those two different quantities, and seconds follow the tokens:
 
-- **The 2.51 s is depth-independent** — paid at any match length, and it would be paid at 100%.
-- **The slope is 10.45 s, not the 13.96 s miss.** Unmatched tokens re-prefill *cheaper per token* than a
-  cold miss, which is what a prefill starting with a populated block table and a warm pool should look
-  like.
+| regressor | fixed | R² | residual sd | out-of-sample |
+|---|---:|---:|---:|---|
+| `1 − depth` | 2.507 s | 0.99475 | 1.35% | — |
+| `prompt × (1 − depth)` | **1.781 s** | **0.99802** | **0.81%** | miss row predicted 13.01 s vs 13.96 s, **−6.8%** |
 
-**Where the 2.51 s does NOT come from.** The obvious candidate is the state restore, since a snapshot is
-a constant size at any prefix length (`kv_cache.py:1434`) and a depth-independent cost is exactly that
-shape. **The arithmetic refuses it**: this checkpoint's snapshot is 156.9 MiB, which is 0.17 ms at HBM
-bandwidth and 82 ms even at a slow 2 GB/s host copy — three to four orders of magnitude short of 2510 ms.
-So the shape fits and the magnitude does not, and the term is **unattributed**. Naming the restore here
-would be the tenth withdrawal.
+The token form is better on every measure and it survives the one test the fraction form cannot take:
+the single **miss** row was not in the fit, and predicting it means extrapolating to a different row type
+entirely. Landing 6.8% low is itself informative — a miss has no state restore and no matched blocks, so
+under-predicting it is what a real-but-smaller fixed term looks like. **This is the strongest evidence in
+the section**: a good R² can flatter an interpolation, but an extrapolation onto an unfitted row cannot be
+flattered. Implied prefill rate 2681 tok/s against the engine's own `prefill_rate` of 2228.5.
 
-This closes the honesty limit that mattered: a shallow hit and a deep hit that stalls on something else
-are now distinguishable, because a stall would appear as depth-correlated residual and after the
-intercept there is none (+0.6% shallow, +0.4% deep). What replaces it is a smaller, sharper open
-question — what the 2.51 s is.
+**The fixed term is weakly identified, and that is the tenth withdrawal.** Fitting within each turn,
+where prompt length is nearly constant:
+
+| | fixed | slope on `1−depth` | own `u` range | R² |
+|---|---:|---:|---|---:|
+| turn 0 (n=11) | 2.10 s | 10.82 | 0.813–0.983 | 0.9910 |
+| turn 1 (n=12) | 1.49 s | 11.98 | 0.618–0.801 | 0.9968 |
+| turn 2 (n=12) | 1.19 s | 12.96 | 0.437–0.615 | 0.9962 |
+| pooled (n=35) | **2.51 s** | 10.45 | 0.437–0.983 | 0.9947 |
+
+The intercept marches 2.10 → 1.49 → 1.19 and the pooled value sits *above all three*. **But the march is
+mostly a fit artifact, not a physical drift**, and the test that shows it is evaluating each turn's line
+at a point inside the data instead of at `u = 0`:
+
+```
+spread of the three lines at a COMMON u = 0.70 :  0.59 s =  6.1%
+spread of their INTERCEPTS at u = 0            :  0.91 s = 75.9%
+```
+
+The lines nearly coincide mid-range and diverge only where none of them has data. Each turn's `u` spans
+about 0.18, so extrapolating to 0 is a lever four times the observed range, and an intercept/slope
+trade-off there produces exactly this: force the slope up and the intercept falls to compensate. The
+pooled `u` reaches only 0.437, so **"the cost paid at 100% match" is a fitted value 44% beyond the nearest
+observation** — a constant reported at an x never observed.
+
+**What is a real drift is the per-token cost.** Normalising each turn's slope by that turn's prompt
+length removes the length effect and a third of the spread with it, and what remains does not go away:
+
+```
+turn 0: 10.82 / 30106 = 359.5 us/token
+turn 1: 11.98 / 30801 = 388.9 us/token
+turn 2: 12.96 / 31837 = 407.0 us/token     spread 13.2% (19.7% before normalising)
+```
+
+Per-token prefill genuinely gets **13% slower across the run** while pool occupancy falls 45.6% → 38.5%.
+Three turns is three points, so that is a trend and not a mechanism, but it is the effect worth naming as
+unexplained — not the intercept.
+
+**So the honest statement: `fixed + per_token × unmatched_tokens`, with `fixed` at 1.2–2.5 s and weakly
+identified because the data never approaches full match.** What does not depend on the constant is
+robust: **TTFT is linear in unmatched tokens at R² > 0.99 pooled and within every turn separately.**
+
+**What the fixed term is made of, priced with the engine's own `prefill_forwards`:**
+
+```
+total prompt over 36 turns   1,112,934 tokens
+matched                        322,560
+unmatched -> must prefill      790,406  -> 1,544 forwards minimum
+                                        -> 1,580 if every row wastes a partial forward
+prefill_forwards observed        1,602
+excess: +22 against the worst case, +58 against the arithmetic minimum
+```
+
+Both baselines are legitimate and they answer different questions, so the excess is **+22 to +58
+forwards**. At 237.3 ms per forward that is 5.2–13.8 s over 35 hits = **0.15–0.39 s per hit**.
+
+So forwards are **not** eliminated: they are 6–16% of a 2.5 s fixed term, or 13–33% of a 1.2 s one. Real,
+and not the mechanism. An earlier version of this section said "neither forwards nor tokens", which
+overstated the elimination in the same direction the 2.51 s overstated the measurement.
+
+Re-prefilled tokens the match should have covered would already sit inside the 790,406, and the small
+excess says they largely don't. The state restore has the right *shape* — a snapshot is constant size at
+any prefix length (`kv_cache.py:1434`) — and the wrong *magnitude*: 156.9 MiB is 0.17 ms at HBM bandwidth
+and 82 ms even at a slow 2 GB/s host copy, against ~1200–2500 ms. So one candidate is partial, one is
+mostly ruled out, and one is refused on magnitude.
+
+This closes the honesty limit that mattered — a shallow hit and a deep hit that stalls on something else
+are distinguishable, since a stall would show as depth-correlated residual and within each turn there is
+none. What replaces it is sharper and smaller: what the 1.2–2.5 s is, and what moves it with turn.
 
 **What the ratchet says about the publisher.** 512×k across sessions in submission order is not a
 property of any row's prompt — it is the store serving one more block-chunk to each successive session.
@@ -473,18 +546,23 @@ arm above then put the publisher squarely back in scope. What survives is the na
 `pub271off` arm supports on its own: 139 evictions at **8.8%** occupancy cannot be capacity.
 
 Still open:
-- **What the 2.51 s per-hit fixed cost is.** Measured at R² 0.9947 and unattributed. The state restore
-  has exactly the right shape — constant at any prefix length — and is 0.17 ms at HBM bandwidth against
-  2510 ms observed, so it is not that. This is the sharpest open question in the entry and it needs a
-  phase-attributed profile of one hit, not an argument.
-- **The ladder, if any budget admits one.** Two independent constraints now, and they agree:
-  `K × snapshot_bytes ≤ budget` gives K ≈ 1 here, and `10.45 × Δdepth > 2.51` caps useful rung spacing
-  at ~24% of the prompt. The arm is the same pair at a budget where K ≥ 2 fits, measured in TTFT.
+- **What the 1.2–2.5 s per-hit fixed cost is, and why it is only a range.** The data's `u` reaches 0.437,
+  so the constant is extrapolated 44% past the nearest point and an intercept/slope trade-off moves it
+  freely — the three per-turn lines agree to 6.1% mid-range and to 75.9% at `u = 0`. Extra forwards
+  explain 0.15–0.39 s; the state restore has the right shape and is 3–4 orders of magnitude too small.
+  **The cheap fix is one run with turns held constant** — one turn, more sessions, so depth varies without
+  prompt length — pinning the constant without the covariate, no new instrument.
+- **Why per-token prefill slows 13% across the run** (359 → 407 µs/token) while pool occupancy falls
+  45.6% → 38.5%. Three turns is three points; this is the real drift, not the intercept.
+- **The ladder, if any budget admits one.** The two constraints **conflict** rather than agree:
+  `K × snapshot_bytes ≤ budget` gives K ≈ 1 here, while the depth threshold admits K ≈ 4–11. Naming the
+  conflict is the point — the arm is the same pair at a budget where K ≥ 2 fits, in TTFT.
 - **The per-eviction yield split** — per eviction, the count of the entry's blocks where
   `refcount[b] > n`, logged with the entry's token length.
 
-Closed by the depth run: whether the mechanism is hit depth (yes, R² 0.9947), and whether `compiles`
-can now go red (yes — 164 bytes, flushed).
+Closed by the depth run: whether the mechanism is hit depth (yes — TTFT linear in unmatched tokens,
+R² 0.998, and it predicts the unfitted miss row to −6.8%), and whether `compiles` can now go red
+(yes — 164 bytes, flushed).
 
 
 ## Rule
