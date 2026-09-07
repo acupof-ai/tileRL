@@ -289,7 +289,8 @@ def main() -> int:
           f"precision={getattr(backend, 'precision', '?')} "
           f"prefill_kv={prefill_kv_dtype()}")
     mine = prov.get(backend.arch, {})
-    for op in ("paged_attention", "paged_attention_split", "attn_prep", "gdn_chunk_fused"):
+    for op in ("paged_attention", "paged_attention_prefill", "paged_attention_split",
+               "attn_prep", "gdn_chunk_fused"):
         here = mine.get(op)
         others = {a: t[op] for a, t in prov.items() if op in t and a != backend.arch}
         shared = [a for a, t in others.items() if t == here]

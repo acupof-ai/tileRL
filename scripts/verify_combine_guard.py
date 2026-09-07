@@ -26,14 +26,14 @@ import tilelang
 import tilelang.language as T
 import torch
 from tilerl_kernels.backend import _snap_mma_tile, get_backend
-from tilerl_kernels.kernels_mma import _pass_configs
+from tilerl_kernels.kernels_mma import _mma_pass_configs
 
 
 def unguarded_combine(target: str, KVSPLIT: int = 16):
     """The combine as it stood before PR #30 -- the negative control. Kept here
     and not imported, because the point is to run the arithmetic the guard replaced."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def combine(PO, PM, PL, G, W):
         B, Hkv, D = T.const("B, Hkv, D")
         Mt = T.const("Mt")

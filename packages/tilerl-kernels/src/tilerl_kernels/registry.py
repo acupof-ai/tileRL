@@ -157,10 +157,9 @@ _SM70_KERNELS = {
     # compile cache on it.
     "paged_attention_split": kernels.make_paged_attention_split,
     "paged_attention_split_combine": kernels.make_paged_attention_split_combine,
-    # Query-tiled prefill (s > _MAX_VERIFY_W). Overrides the CPU twin of the same
-    # name: same tiling and masking, reduce intrinsics and shared tiles instead
-    # of serial scalars. Bare factory — block_M/block_N/kv_dtype come from the
-    # call site, and the fp16 tile is a second instantiation, not a second cell.
+    # Query-tiled prefill (s > _MAX_VERIFY_W), overriding the CPU twin of the same
+    # name. Bare factory: block_M/block_N/kv_dtype come from the call site, so the
+    # fp16 tile is a second instantiation.
     "paged_attention_prefill": kernels_attn.make_paged_attention_prefill_sm70,
 }
 _register("bf16", "sm70", _SM70_KERNELS)

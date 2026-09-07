@@ -6,7 +6,7 @@ import tilelang
 import tilelang.language as T
 
 
-def _pass_configs() -> dict[str, object]:
+def _mma_pass_configs() -> dict[str, object]:
     # the static race check false-positives on per-thread fragments
     return {"tl.disable_data_race_check": True}
 
@@ -17,7 +17,7 @@ def make_write_tokens(target: str):
     left-aligned valid tokens, SeqQLens bounds each row. bf16 IO follows the
     sm90 pool; sm70's f32 pool has its own twin below."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def write_tokens(K, V, KPool, VPool, BlockTable, SeqLens, SeqQLens, block_size, threads):
         B, S, H, D = T.const("B, S, H, D")
         NB = T.const("NB")
@@ -53,7 +53,7 @@ def make_write_tokens_f32(target: str):
     scope inside a T.Tensor annotation.
     """
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def write_tokens_f32(K, V, KPool, VPool, BlockTable, SeqLens, SeqQLens, block_size, threads):
         B, S, H, D = T.const("B, S, H, D")
         NB = T.const("NB")
@@ -85,7 +85,7 @@ def make_attn_prep(target: str):
     [hkv x D] ++ [hkv x D]; block (b*s, h) does q head h, and k/v head h when
     h < hkv."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def attn_prep(
         QKV, Wq, Wk, Positions, InvFreq, KPool, VPool, BlockTable, SeqLens, SeqQLens,
         eps: T.float32, hq, hkv, block_size, threads,

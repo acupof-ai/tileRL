@@ -10,6 +10,31 @@
 > window writes the accept-or-reject line; there is no CHANGELOG entry until it
 > runs.
 
+## Arm 0: it builds, it routes, and it compiles once
+
+The first V100 window was stopped before any timed arm — the card went back to
+serving — so there is no speed number. Three facts survive it, all verified on
+the pod by the session that owns the card:
+
+- **It compiles.** 13m27s cold, and **exactly one** compile line across
+  `--tokens 8192,16384,21727`: the kernel is shape-generic, so three chunk
+  counts share one binary rather than paying per length.
+- **It routes.** `backend.py:969` — the prefill branch — in **191 of 191**
+  py-spy samples. The `elif` at 985 (`paged_attention_split`) took none. This
+  needed a py-spy frame to establish: the profiler's per-op table is keyed by
+  the backend *method* (`paged_attention`), not the dispatched kernel, so
+  grepping its output for `paged_attention_prefill` finds nothing whether or not
+  the cell ran.
+- **It persists.** A 21 MB cubin under `~/.tilelang/cache/0.1.13/cuda-binaries`,
+  hash-named — which is why an earlier `ls | grep prefill` found nothing and
+  read as "the cache never wrote". So 13m27s is a first-compile cost, not a
+  per-restart one, and `scripts/serve_v100.sh` needs no change.
+
+**Whether the next process hits that entry is unverified.** The cubin existing
+is not the same claim as the key matching on a fresh interpreter; the proof is
+zero "begins to compile" lines on the re-run, and that is an arm-0 fact the
+re-run has to produce, not one this window produced.
+
 ## What landed
 
 `make_paged_attention_prefill_sm70` in `kernels_attn.py`, and the routing that
@@ -22,9 +47,33 @@ registered per target, and `"c"` is not one). `KVSPLIT` is gone: 8 query tiles �
 24 heads is 192 blocks against 80 SMs, so the card fills without splitting the
 history.
 
-`kv_dtype` is a maker parameter, so the fp16 rung is an instantiation rather
-than a second kernel, and `--prefill-kv-dtype f32|f16` reaches it from the
-profiler without editing the serving tree.
+`kv_dtype` is a maker parameter, so the fp16 rung is a second instantiation and
+`--prefill-kv-dtype f32|f16` reaches it from the profiler without editing the
+serving tree.
+
+## Two `_pass_configs`, and they are not interchangeable
+
+`kernels_attn.py` needed both: `kernels_mma`'s zero-arg one for the three sm90
+cells already in the file, and `kernels.py`'s target-aware one for this cell,
+which the parity gate compiles on `"c"`. Importing the second under its own name
+shadowed the first and moved a `TypeError` onto three working kernels, so the
+first fix was an alias. The alias is gone now — `kernels_mma`'s is
+`_mma_pass_configs`, renamed at 30 call sites (mma 3, gdn 9, linear 14,
+attn 3, plus `scripts/verify_combine_guard.py`).
+
+**They differ on exactly one target.** Anyone tempted to collapse them should
+measure first:
+
+| target | `kernels.py` | `kernels_mma.py` |
+|---|---|---|
+| `c` / `llvm` | `tirx.disable_vectorize`, `tl.disable_data_race_check` | `tl.disable_data_race_check` |
+| `cuda*` | `tl.disable_data_race_check` | `tl.disable_data_race_check` |
+| `metal` | `tl.disable_data_race_check` | `tl.disable_data_race_check` |
+| anything else | `{}` | `tl.disable_data_race_check` |
+
+Identical on every target the kernels actually run on except `"c"`, which is the
+one CI uses. The `{}` row is unreachable: `Backend._kernel` passes `self.target`,
+never a bare arch string.
 
 ## One predicate, and a gate that counts call sites
 

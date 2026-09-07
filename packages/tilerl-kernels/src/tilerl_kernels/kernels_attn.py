@@ -6,8 +6,8 @@ from __future__ import annotations
 import tilelang
 import tilelang.language as T
 
-from .kernels import _pass_configs as _target_pass_configs
-from .kernels_mma import _pass_configs
+from .kernels import _pass_configs
+from .kernels_mma import _mma_pass_configs
 
 
 def make_paged_attention_mma(target: str):
@@ -21,7 +21,7 @@ def make_paged_attention_mma(target: str):
     block_N = 64
     accum_dtype = T.float32
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def paged_attention(
         Q,
         KCache,
@@ -133,7 +133,7 @@ def make_paged_attention_decode(target: str, KVSPLIT: int = 16):
     block_N = 64
     accum_dtype = T.float32
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def paged_attention_decode(Q, KCache, VCache, BlockTable, SeqLens, SeqQLens, PO, PM, PL, scale: T.float32, block_size, block_M):
         B, W, H, D = T.const("B, W, H, D")
         Hkv = T.const("Hkv")
@@ -247,7 +247,7 @@ def make_paged_attention_combine(target: str, KVSPLIT: int = 16):
     Guarded rather than asserted -- seq_lens lives on the device and this path
     must stay graph-capturable, so the host cannot read it to check."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def paged_attention_combine(PO, PM, PL, G, W):
         B, Hkv, D = T.const("B, Hkv, D")
         Mt = T.const("Mt")
@@ -316,10 +316,9 @@ def make_paged_attention_prefill_sm70(
     """
     accum = "float32"
 
-    # The target-aware one: this cell is registered for sm70 and compiled on the
-    # cpu target by the parity gate, and kernels_mma's waives the race check
-    # unconditionally, which is wrong for "c".
-    @tilelang.jit(target=target, pass_configs=_target_pass_configs(target))
+    # kernels.py's, not kernels_mma's: the parity gate compiles this cell on "c",
+    # which needs tirx.disable_vectorize that the sm90 config does not set.
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
     def paged_attention_prefill_sm70(
         Q, KCache, VCache, BlockTable, SeqLens, SeqQLens, scale: T.float32, block_size, threads
     ):
@@ -360,8 +359,7 @@ def make_paged_attention_prefill_sm70(
             upper = hist + last + 1
             for k in T.Pipelined(T.ceildiv(upper, block_N), num_stages=1):
                 for j, d in T.Parallel(block_N, D):
-                    # Clamped so an out-of-range lane loads a live address; the
-                    # score is masked to -inf below, so the value never counts.
+                    # Clamped to a live address; the score is masked below.
                     p = T.min(k * block_N + j, upper - 1)
                     blk = BlockTable[bb, T.min(p // block_size, Mb - 1)]
                     Ks[j, d] = T.cast(KCache[blk, hkv, p % block_size, d], kv_dtype)

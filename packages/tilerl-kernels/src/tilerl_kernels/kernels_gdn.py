@@ -6,7 +6,7 @@ from __future__ import annotations
 import tilelang
 import tilelang.language as T
 
-from .kernels_mma import _pass_configs
+from .kernels_mma import _mma_pass_configs
 
 _NO_WARP_SPEC = tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED.value
 _FAST_MATH = tilelang.PassConfigKey.TL_ENABLE_FAST_MATH.value
@@ -33,7 +33,7 @@ def make_gdn_prep_bf16(target: str, io: str = "bfloat16"):
     conv taps 4 -> 2 moves it only 1.51x, so it is not read traffic).
     """
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def gdn_prep(Q, Key, Val, GIn, BIn, DtBias, ALog, ConvW, Window, threads):
         B, TT, HK, DK, NVH, DV, KER, QKVD = T.const("B, TT, HK, DK, NVH, DV, KER, QKVD")
         Q: T.Tensor((B, TT, HK, DK), io)
@@ -129,7 +129,7 @@ def make_gdn_chunk_cumsum(target: str, threads: int = 256):
     """Chunk-local inclusive cumsum of the gate (example_cumsum.py,
     tilelang_chunk_local_cumsum_scalar: head_first=False, use_fragment=False)."""
 
-    @tilelang.jit(target=target, pass_configs={**_pass_configs(), _NO_WARP_SPEC: True})
+    @tilelang.jit(target=target, pass_configs={**_mma_pass_configs(), _NO_WARP_SPEC: True})
     def gdn_chunk_cumsum(G, chunk):
         B, S, H = T.const("B, S, H")
         G: T.Tensor((B, S, H), "float32")
@@ -150,7 +150,7 @@ def make_gdn_chunk_kkt(target: str, block_DK: int = 64, threads: int = 128,
     """A = tril(beta_i <k_i,k_j> exp(G_i - G_j), -1) per chunk, f32 for the solve
     (example_chunk_scaled_dot_kkt.py, tilelang_chunk_scaled_dot_kkt_fwd, use_g=True)."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def gdn_chunk_kkt(K, Beta, G, chunk):
         B, S, HK, DK = T.const("B, S, HK, DK")
         H = T.const("H")
@@ -213,7 +213,7 @@ def make_gdn_solve_tril(target: str, threads: int = 32):
     The block products run at tf32 where fla's dots are ieee; the bf16 output rounds
     coarser than either."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def gdn_solve_tril(A, chunk):
         B, S, H = T.const("B, S, H")
         A: T.Tensor((B, S, H, chunk), "float32")
@@ -266,7 +266,7 @@ def make_gdn_chunk_wu(target: str, block_DK: int = 64, block_DV: int = 32,
     """W = A (K beta exp(G)), U = A (V beta) per chunk, A = (I + kkt)^-1
     (example_wy_fast.py, tilelang_recompute_w_u_fwd)."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def gdn_chunk_wu(K, V, Beta, G, A, chunk):
         B, S, HK, DK = T.const("B, S, HK, DK")
         H, DV = T.const("H, DV")
@@ -354,7 +354,7 @@ def make_gdn_state_scan(target: str, block_DV: int = 32, threads: int = 128):
     lost e_last * S term was the same fault,
     errors/2026-08-29-gdn-state-scan-port-wip.md)."""
 
-    @tilelang.jit(target=target, pass_configs={**_pass_configs(), _FAST_MATH: True})
+    @tilelang.jit(target=target, pass_configs={**_mma_pass_configs(), _FAST_MATH: True})
     def gdn_state_scan(K, W, U, G, initial_state, chunk):
         B, S, HK, DK = T.const("B, S, HK, DK")
         H, DV = T.const("H, DV")
@@ -450,7 +450,7 @@ def make_gdn_chunk_o(target: str, block_DK: int = 128, block_DV: int = 128,
     chunk's entry state (example_chunk_o.py, tilelang_chunk_fwd_o, use_g=True).
     O is f32: the gated RMSNorm after it runs in f32, so a bf16 O was one more cast."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def gdn_chunk_o(Q, K, V, HIDDEN, G, chunk, scale):
         B, S, HK, DK = T.const("B, S, HK, DK")
         H, DV = T.const("H, DV")
@@ -548,7 +548,7 @@ def make_gdn_decode_fused(target: str, out_dtype: str = "bfloat16"):
     ``out_dtype`` is out_proj's input dtype: bf16 on sm90, f32 on sm70, which
     cannot codegen a bf16 load."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def gdn_decode_fused(
         Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Windows, Par, States, Slots,
         StepStates, StepWindows, layer: T.int32, ks, threads,
@@ -753,7 +753,7 @@ def make_gdn_chunk_fused(target: str):
     Serial scan, not chunkwise-WY: measured slower at our shapes,
     errors/2026-08-25-gdn-chunked-gdr-rejected."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def gdn_chunk_fused(
         Q, Key, Val, Z, GIn, BIn, DtBias, ALog, NormW, ConvW, Window, State, SeqQLens,
         StepStates, StepWindows, threads,

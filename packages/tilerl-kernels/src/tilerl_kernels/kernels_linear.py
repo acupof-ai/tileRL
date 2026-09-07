@@ -9,7 +9,7 @@ import os
 import tilelang
 import tilelang.language as T
 
-from .kernels_mma import _pass_configs
+from .kernels_mma import _mma_pass_configs
 
 #: Reduction tile (K for gemm_nt/nn, M for gemm_tn): 2 WGMMA K-steps, divides
 #: every model dim. The backend imports this name to pad, so it is defined once.
@@ -27,7 +27,7 @@ if _RED_TILE <= 0 or _RED_TILE % 16 or 128 % _RED_TILE:
 def make_gemm_nt_mma(target: str):
     """C = A @ B.T + Bias. A [M,K], B [N,K] -> C [M,N] (example_gemm.py, bf16 WGMMA)."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def gemm_nt(A, B, Bias, block_M, block_N, threads):
         # tiles under 32 rows cannot be partitioned across a 4-warp group
         threads = 128 if block_M >= 32 else threads
@@ -56,7 +56,7 @@ def make_gemm_nt_mma(target: str):
 def make_gemm_nn_mma(target: str):
     """C = A @ B. A [M,K], B [K,N] -> C [M,N]."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def gemm_nn(A, B, block_M, block_N, threads):
         threads = 128 if block_M >= 32 else threads
         M, N, K = T.const("M, N, K")
@@ -81,7 +81,7 @@ def make_gemm_nn_mma(target: str):
 def make_gemm_tn_mma(target: str):
     """C = A.T @ B. A [M,N], B [M,K] -> C [N,K] (C_ij = sum_m A_mi B_mj)."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def gemm_tn(A, B, block_N, block_K, threads):
         threads = 128 if block_N >= 32 else threads
         M, N, K = T.const("M, N, K")
@@ -919,7 +919,7 @@ def make_linear_fp4_gemv(target: str, M: int = 1, GROUP: int = 4):
     16-elem tile never straddles a scale; ``M`` rows share one W stream.
     bf16 accumulation stays inside one scale block: relerr 4e-3."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def linear_fp4_gemv(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
         N, K = T.const("N, K")
         assert block % 16 == 0  # one scale per 16-elem tile (block 16) or per two (32)
@@ -976,7 +976,7 @@ def make_linear_fp4_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4, W8: 
     (errors/2026-08-28-batched-scalar-gemv)."""
     NB = NG * 8
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def linear_fp4_mma8(X, WQ, Scale, OScale, Res, block):
         N, K = T.const("N, K")
         assert block % 16 == 0
@@ -1042,7 +1042,7 @@ def make_linear_bf16_gemv(target: str):
     """bf16 GEMV, the M=1 path of linear: split-K across reduce_thread lanes,
     warp allreduce (example_dequant_gemv_fp16xint4.py without the dequant)."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def linear_bf16_gemv(X, W, reduce_thread, n_partition):
         N, K = T.const("N, K")
         micro_size_k = 8  # 128-bit transaction / 16-bit bf16
@@ -1104,7 +1104,7 @@ def make_linear_fp4_gemv_sm70(target: str, GROUP: int = 4):
     pointer land in local memory.
     """
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def linear_fp4_gemv_sm70(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
         N, K = T.const("N, K")
         micro = 16  # one scale block (NVFP4 block=16); 8 twiddled bytes = 1 decode pair
@@ -1241,7 +1241,7 @@ def make_linear_fp4_gemv_sm70_m(
     if ncols == 2 and not xh:
         raise ValueError("ncols=2 requires xh=True (it shares one f16 X load across columns)")
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def linear_fp4_gemv_sm70_m(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
         N, K = T.const("N, K")
         micro = 16  # 8 twiddled bytes = 1 decode pair; block is 16 or 32 (>= micro)
@@ -1348,7 +1348,7 @@ def make_linear_fp4_gemv_sm70_m(
                     Y[m, n] = Res[m, n] + acc[m] * OScale[n]
         return Y
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def linear_fp4_gemv_sm70_m_2col(X, WQ, Scale, OScale, Res, reduce_thread, n_partition, block):
         """ncols=2: one thread over TWO output columns, so one X load feeds 16 FMAs
         instead of 8. The grid halves; column pairs are (n, n + half) so each
@@ -1434,7 +1434,7 @@ def make_linear_fp8_gemv(target: str, M: int = 1, GROUP: int = 4):
     """fp8 twin of make_linear_fp4_gemv: e4m3 W with a per-128-block scale
     (a thread's 16-elem slice never crosses a block), bf16x2 FMA tiles in C."""
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def linear_fp8_gemv(X, W8, WScale, OScale, Res, reduce_thread, n_partition):
         N, K = T.const("N, K")
         micro_size_k = 16  # 128-bit transaction / 8-bit e4m3
@@ -1486,7 +1486,7 @@ def make_linear_fp8_mma8(target: str, NG: int = 4, KW: int = 4, G: int = 4):
     """fp8 twin of make_linear_fp4_mma8 (per-128-block scale)."""
     NB = NG * 8
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def linear_fp8_mma8(X, W8, WScale, OScale, Res):
         N, K = T.const("N, K")
         nchunk = K // 32
@@ -1541,7 +1541,7 @@ def make_quant_fp8_e4m3(target: str):
     per-K-tile fragment breaks the WGMMA pipeline, ~2x)."""
     FP8_MAX = 448.0  # e4m3fn finite max
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def quant_fp8(X, XQ, Scale, threads):
         M, K = T.const("M, K")
         X: T.Tensor((M, K), "bfloat16")
@@ -1683,7 +1683,7 @@ def make_linear_fp8_mma(target: str):
     the accumulator, AScale [M] divided in the epilogue."""
     _BLOCK_K = 128  # the checkpoint's scale block
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def linear_fp8(XQ, W8, WScale, AScale, block_M, block_N, threads):
         threads = 128 if block_M >= 32 else threads
         M, N, K = T.const("M, N, K")
@@ -1722,7 +1722,7 @@ def make_linear_fp4_bwd_mma(target: str, local_size: int = 8, block: int = 16):
     The caller folds the per-row scale into grad."""
     dequant = _dequant_fp4_macro("bfloat16", local_size, block)
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    @tilelang.jit(target=target, pass_configs=_mma_pass_configs())
     def linear_fp4_bwd(A, WQ, Scale, block_M, block_N, threads):
         M, N = T.const("M, N")
         K2 = T.const("K2")
