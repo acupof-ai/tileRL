@@ -927,6 +927,43 @@ def test_the_ssd_flag_reaches_the_store_and_the_fingerprint_covers_the_config(tm
     assert os.path.isdir(os.path.join(str(tmp_path), "tilerl_kvtier"))
     assert tier._fingerprint == _weight_fingerprint(cfg)
 
+    # The KV STORE FORMAT is in the fingerprint too, and unlike a config field it is not a
+    # dataclass field, so the loop above cannot reach it. Two spilled formats in one
+    # directory is a live crash: a bf16 pool adopting an fp8 blob reaches `index_copy_` and
+    # raises out of `_admit`, which fails every running request.
+    #
+    # Assert the REFUSAL, not just that the numbers differ. A mismatch wipes the files and
+    # returns 0 entries, which is byte-identical to a cold start -- so a silent
+    # non-adoption reads as a cache miss, and a bench then reports a cold number with no
+    # visible cause. `recovered` and the surviving files are what separate them.
+    from tilerl.kv_cache import KvTier
+
+    def _seed(root, fp):
+        KvTier(root, fp)  # writes the marker, as the run that spilled would have
+        sub = os.path.join(root, "tilerl_kvtier")
+        torch.save({"k": torch.zeros(1, 2, 2, BLOCK_TOKENS, 8),
+                    "v": torch.zeros(1, 2, 2, BLOCK_TOKENS, 8)},
+                   os.path.join(sub, "deadbeef.kv"))
+        torch.save({"states": torch.zeros(2, 2)}, os.path.join(sub, "deadbeef.st"))
+        return sub
+
+    fp8_fp = _weight_fingerprint(cfg, torch.float8_e4m3fn)
+    same = tmp_path / "same"
+    sub = _seed(str(same), fp8_fp)
+    kept = KvTier(str(same), fp8_fp)
+    assert kept.recovered == 1 and len(os.listdir(sub)) == 3, (
+        f"a matching fingerprint adopted {kept.recovered} entries; if this is 0 the "
+        "mismatch assertion below is vacuous -- both arms would read as a cold start"
+    )
+
+    flipped = tmp_path / "flipped"
+    sub = _seed(str(flipped), fp8_fp)
+    cold = KvTier(str(flipped), _weight_fingerprint(cfg))  # same cfg, bf16 pool
+    assert cold.recovered == 0 and not [f for f in os.listdir(sub) if f.endswith(".kv")], (
+        "an fp8-written store was adopted by a bf16 run: the KV format is not in the "
+        "fingerprint, and the first cold hit raises out of _admit"
+    )
+
     # `--ssd-min-tokens` goes through the same `_build_engine` and had no assertion. It is
     # what every bench uses to drive the tier at a prompt shorter than the 64-token default,
     # so dropping it silently reports 0 offers -- a tier that looks dead instead of a flag
