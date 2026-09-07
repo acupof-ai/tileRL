@@ -132,7 +132,8 @@ def main() -> int:
         driver = shlex.join(["python3", "-u", "scripts/tp_step_arms.py",
                              "--out-dir", "/work/tpstep", "--tp", str(a.tp)])
         print("# both arms in ONE pod job, so they share a session and a tree:")
-        print(f"scripts/pod_run.sh tpstep 0,1 -- {driver}")
+        # 0,6 are tileRL's cards; 1-5 and 7 are aupai's and are never taken
+        print(f"scripts/pod_run.sh tpstep 0,6 -- {driver}")
         print("# TILERL_TARGET=cuda, PYTHONPATH and the weights path come from pod_run.sh")
         print("tn exec 'tail -f /work/tpstep.log'   # the four arms stream here")
         return 0

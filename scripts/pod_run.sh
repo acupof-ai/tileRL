@@ -4,7 +4,7 @@
 #
 #   scripts/pod_run.sh <name> <card[,card...]> -- <command...>
 #   scripts/pod_run.sh arms 6 -- python3 scripts/recapture_arms.py --steps 6
-#   scripts/pod_run.sh tp2 0,1 -- torchrun --nproc_per_node=2 scripts/x.py
+#   scripts/pod_run.sh tp2 0,6 -- torchrun --nproc_per_node=2 scripts/x.py
 #
 # What it encodes, each line a thing that actually went wrong:
 #   * a bash parent that WAITS, so the job is reaped. `setsid nohup ... &` from a
