@@ -3342,3 +3342,74 @@ def test_a_ragged_prompt_spills_a_prompt_only_entry(tmp_path, extra, back_off):
         f"spilled {lengths}: everything below {aligned} is a mid-prefill boundary the "
         f"last one supersedes, and each write is a D2H of the whole prefix"
     )
+
+
+def test_a_row_waits_for_its_own_fetch_and_does_not_block_the_queue(tmp_path):
+    """Two properties of the hold, in one engine because they trade off.
+
+    The bug it fixes: `submit` queues a prefetch, the very next tick admits the row,
+    `lookup` declines the in-flight prefix, and the row prefills the whole prompt while
+    the bytes land with nobody to take them. Measured on card 1 -- every bench arm 0 SSD
+    hits with the entry recovered, so the tier wrote 321 MiB and never read.
+
+    The hold must therefore exist, and must NOT be a `break`: head-of-line would stall
+    every other row for a read only the held one benefits from.
+    """
+    cfg = tiny()
+    params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=3)
+    rng = np.random.default_rng(11)
+    conv = rng.integers(3, 320, size=256).astype(np.int64)
+    warm, other = conv[:128], rng.integers(3, 320, size=64).astype(np.int64)
+
+    def engine_at():
+        return build_engine(
+            cfg, build_random(cfg, seed=13), get_backend(), num_blocks=64, num_slots=4,
+            max_batch=4, max_total_tokens=2048, ssd_path=str(tmp_path),
+            ssd_min_tokens=BLOCK_TOKENS,
+        )
+
+    def drain(eng, ticks=300):
+        for _ in range(ticks):
+            eng.step()
+            if not (list(eng._running) + list(eng._waiting)):
+                break
+        eng.poll()
+
+    warm_eng = engine_at()
+    warm_eng.submit(warm, params)
+    drain(warm_eng)
+    assert warm_eng.stats()["ssd_offered"] >= 1, "fixture: nothing spilled, so no fetch exists"
+    for _ in range(400):                       # the write is off-tick; wait for the file
+        if warm_eng.stats()["ssd_entries"] >= 1:
+            break
+        time.sleep(0.01)
+
+    cold = engine_at()
+    assert cold.stats()["ssd_recovered"] >= 1, "fixture: the restart recovered no entry"
+    held_id = cold.submit(list(warm) + list(other), params)  # turn 2 = turn 1 plus more
+    plain_id = cold.submit(other, params)                    # no prefetch of its own
+    cold.step()                                              # the tick the hold happens on
+
+    # The hold sets the row aside and keeps going, so the row behind it runs in the SAME
+    # tick. A `break` here would leave both waiting, and this is what tells them apart.
+    waiting_after = {r.req_id for r in cold._waiting}
+    assert plain_id not in waiting_after, (
+        "the row behind the held one was still waiting after the tick: the hold is "
+        "blocking the queue head-of-line instead of setting its own row aside"
+    )
+    assert held_id in waiting_after, (
+        "the row whose fetch was in flight was admitted anyway, so the hold did not fire "
+        "and this test cannot see the bug it exists for"
+    )
+    drain(cold)
+
+    st = cold.stats()
+    assert st["ssd_hits"] >= 1, (
+        f"0 SSD hits with {st['ssd_recovered']} entries recovered and "
+        f"{st.get('ssd_prefetches')} prefetches issued: the row was admitted before its "
+        f"own fetch landed, so lookup declined and the prefill ran instead "
+        f"(fetch_waits={st.get('ssd_fetch_waits')})"
+    )
+    assert not list(cold._waiting) and not list(cold._running), (
+        "the held row never finished: the hold has no release path"
+    )
