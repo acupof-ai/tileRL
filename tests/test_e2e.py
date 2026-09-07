@@ -3204,3 +3204,75 @@ def test_the_break_even_operands_come_from_the_pool_not_a_constant(tmp_path):
         f"an f32 pool reads twice the bytes per token, so its break-even must be higher: "
         f"bf16 {narrow} vs f32 {wide}"
     )
+
+
+def test_the_tier_read_rate_keeps_moving_after_the_first_fetch(tmp_path):
+    """B is cumulative, or a warm page cache over-permits forever.
+
+    On a restart into a warm cache the first read is memory-speed -- measured
+    5.664 GB/s against 0.203 cold on /data00, 28x -- and n* collapses with it, 6 tokens
+    instead of 195 at a 2.7k-token entry. That window closes only because
+    read_bytes_per_s() divides running totals (kv_cache.py:713-714 accumulate, :798
+    divides): the next slow fetch drags B back down. Freeze it at the first fetch and
+    the over-permit becomes permanent at every length, and nothing else here notices.
+    """
+    pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    tier = KvTier(str(tmp_path), "fp-cum", min_tokens=BLOCK_TOKENS)
+    store = PrefixStore(pool, ssd=tier)
+    keys = []
+    for base in (0, 10_000):
+        toks = list(range(base, base + 8 * BLOCK_TOKENS))
+        blocks = [pool.alloc_block() for _ in range(8)]
+        assert store.insert(toks, blocks, (torch.randn(3, 4, 8, 8), None))
+        keys.append((store._hash_all(toks), tuple(toks)))
+    _flushed(tier)
+
+    cold_tier = KvTier(str(tmp_path), "fp-cum", min_tokens=BLOCK_TOKENS)
+    assert cold_tier.recovered == 2, f"fixture: recovered {cold_tier.recovered} of 2 entries"
+
+    def fetched(key, tokens):
+        assert cold_tier.prefetch(key, tokens), "the tier refused a recovered key"
+        for _ in range(500):
+            if not cold_tier.fetch_pending(key):
+                break
+            time.sleep(0.01)
+        assert cold_tier.take(key) is not None, "the fetch never landed"
+
+    fetched(*keys[0])
+    first = cold_tier.read_bytes_per_s()
+    fast_ms, fast_bytes = cold_tier.fetch_ms, cold_tier.fetch_bytes
+    assert first > 0, "no rate after a completed fetch, so this arm measures nothing"
+
+    # The second fetch is the same bytes through a slower read, standing in for the
+    # cold-after-warm case. A frozen B ignores it; a cumulative one drops.
+    real_load = torch.load
+
+    def slow(*a, **k):
+        time.sleep(0.05)
+        return real_load(*a, **k)
+
+    with unittest.mock.patch.object(torch, "load", slow):
+        fetched(*keys[1])
+    second = cold_tier.read_bytes_per_s()
+    assert second < first / 2, (
+        f"B barely moved on a fetch made 50 ms slower ({first / 1e6:.1f} -> "
+        f"{second / 1e6:.1f} MB/s), so it is calibrated once rather than accumulated; a "
+        "warm first read would then permit every prefix for the process's life"
+    )
+
+    # n* is what B controls, so read it at both rates rather than trusting the ratio.
+    # R is DERIVED from the slower B, not borrowed from the test above: that one hand-sets
+    # B to 400 MiB/s, while this fixture's real reads are ~4.7 MB/s (an 8 KiB file through
+    # torch.load), so its 2.5e6 tok/s puts k/B above 1/R and BOTH arms return the 1<<31
+    # sentinel -- two equal sentinels, which compare as "did not rise" for the wrong reason.
+    store._snapshot_bytes = 4 << 20
+    k = 2 * pool.num_layers * pool.num_kv_heads * pool.head_dim * pool.k_pool.element_size()
+    rate = 0.5 * second / k                 # half the slow arm's bandwidth-per-token bound
+    tier.fetch_ms, tier.fetch_bytes = fast_ms, fast_bytes
+    n_warm = store.break_even_tokens(rate)
+    tier.fetch_ms, tier.fetch_bytes = cold_tier.fetch_ms, cold_tier.fetch_bytes
+    n_cold = store.break_even_tokens(rate)
+    assert 0 < n_warm < n_cold < 1 << 31, (
+        f"n* did not rise as B fell ({n_warm} -> {n_cold} at R={rate:.0f}): the warm-start "
+        "over-permit closes only if the later fetches move the estimate"
+    )
