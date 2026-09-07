@@ -3212,7 +3212,7 @@ def test_the_tier_read_rate_keeps_moving_after_the_first_fetch(tmp_path):
     On a restart into a warm cache the first read is memory-speed -- measured
     5.664 GB/s against 0.203 cold on /data00, 28x -- and n* collapses with it, 6 tokens
     instead of 195 at a 2.7k-token entry. That window closes only because
-    read_bytes_per_s() divides running totals (kv_cache.py:713-714 accumulate, :798
+    read_bytes_per_s() divides running totals (`_fetch_loop` accumulates, it
     divides): the next slow fetch drags B back down. Freeze it at the first fetch and
     the over-permit becomes permanent at every length, and nothing else here notices.
     """
@@ -3344,6 +3344,73 @@ def test_a_ragged_prompt_spills_a_prompt_only_entry(tmp_path, extra, back_off):
     )
 
 
+def _drain_clock(eng, secs=10.0):
+    """Step until the queues empty, bounded by the CLOCK: a tick budget bounds how long
+    the engine spins, not how long the reader thread takes."""
+    end = time.time() + secs
+    while time.time() < end:
+        eng.step()
+        if not (list(eng._running) + list(eng._waiting)):
+            break
+    eng.poll()
+
+
+def test_a_prefetched_hit_reads_nothing_on_the_calling_thread(tmp_path):
+    """Both planes come off the reader thread, so a hit costs the tick no disk read.
+
+    Counting `torch.load` by thread, not wall clock: on card 1 the warm arm did not move
+    when the .st came off the tick, because a restart leaves the host page cache warm.
+    """
+    import threading
+
+    from tilerl import kv_cache as kvmod
+
+    calls = {"tick": 0}
+    real = kvmod.torch.load
+
+    def counting(*a, **kw):
+        if threading.current_thread() is threading.main_thread():
+            calls["tick"] += 1
+        return real(*a, **kw)
+
+    cfg = tiny()
+    params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=3)
+    rng = np.random.default_rng(11)
+    conv = rng.integers(3, 320, size=256).astype(np.int64)
+    warm, other = conv[:128], rng.integers(3, 320, size=64).astype(np.int64)
+
+    def engine_at():
+        return build_engine(
+            cfg, build_random(cfg, seed=13), get_backend(), num_blocks=64, num_slots=4,
+            max_batch=4, max_total_tokens=2048, ssd_path=str(tmp_path),
+            ssd_min_tokens=BLOCK_TOKENS,
+        )
+
+    warm_eng = engine_at()
+    warm_eng.submit(warm, params)
+    _drain_clock(warm_eng)
+    for _ in range(400):
+        if warm_eng.stats()["ssd_entries"] >= 1:
+            break
+        time.sleep(0.01)
+
+    kvmod.torch.load = counting          # after recovery: those loads are not a hit
+    try:
+        cold = engine_at()
+        calls["tick"] = 0
+        cold.submit(list(warm) + list(other), params)
+        _drain_clock(cold)
+    finally:
+        kvmod.torch.load = real
+
+    st = cold.stats()
+    assert st["ssd_hits"] >= 1, f"no hit ({st['ssd_recovered']} recovered), so this proves nothing"
+    assert calls["tick"] == 0, (
+        f"{calls['tick']} torch.load on the calling thread while serving a hit: the "
+        f"snapshot read is back on the tick"
+    )
+
+
 def test_a_row_waits_for_its_own_fetch_and_does_not_block_the_queue(tmp_path):
     """Two properties of the hold, in one engine because they trade off.
 
@@ -3355,8 +3422,8 @@ def test_a_row_waits_for_its_own_fetch_and_does_not_block_the_queue(tmp_path):
     The hold must therefore exist, and must NOT be a `break`: head-of-line would stall
     every other row for a read only the held one benefits from.
 
-    `drain` waits on the clock, not on a tick count. A tick budget bounds how long the
-    engine spins, not how long the reader thread takes, so on a slow or loaded box the
+    `_drain_clock` waits on the clock, not on a tick count. A tick budget bounds how long
+    the engine spins, not how long the reader thread takes, so on a slow or loaded box the
     queue empties while the fetch is still in flight and this reads as 0 hits. Reproduce
     with a 50 ms sleep at the top of `KvTier._fetch_loop`: tick-bounded fails 3/3,
     clock-bounded passes 3/3.
@@ -3374,17 +3441,9 @@ def test_a_row_waits_for_its_own_fetch_and_does_not_block_the_queue(tmp_path):
             ssd_min_tokens=BLOCK_TOKENS,
         )
 
-    def drain(eng, secs=10.0):
-        end = time.time() + secs
-        while time.time() < end:
-            eng.step()
-            if not (list(eng._running) + list(eng._waiting)):
-                break
-        eng.poll()
-
     warm_eng = engine_at()
     warm_eng.submit(warm, params)
-    drain(warm_eng)
+    _drain_clock(warm_eng)
     assert warm_eng.stats()["ssd_offered"] >= 1, "fixture: nothing spilled, so no fetch exists"
     for _ in range(400):                       # the write is off-tick; wait for the file
         if warm_eng.stats()["ssd_entries"] >= 1:
@@ -3408,7 +3467,7 @@ def test_a_row_waits_for_its_own_fetch_and_does_not_block_the_queue(tmp_path):
         "the row whose fetch was in flight was admitted anyway, so the hold did not fire "
         "and this test cannot see the bug it exists for"
     )
-    drain(cold)
+    _drain_clock(cold)
 
     st = cold.stats()
     assert st["ssd_hits"] >= 1, (
