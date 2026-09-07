@@ -112,4 +112,37 @@ for script in pod_run.sh pod_sync.sh pod_fan.sh; do
   case "$a" in "/work/tilerl-s-"*) ;; *) fail "$script: the tree can collide with an ad-hoc /work/tilerl-<name>: [$a]";; esac
 done
 
-echo "PASS: two sessions get two trees, neither wipe reaches the other, each runner names its tree and sha, the baseline sits outside both, and all three scripts default per-session"
+# ---- 6: a job's own path defaults follow the session tree -----------------------------
+# The three bench scripts take `--repo` as the server's cwd and defaulted to the pre-split
+# /work/tilerl, so after the split they would have run a peer's tree. They read REMOTE_DIR,
+# which every launcher must therefore EXPORT and not merely cd into.
+for launcher in pod_run.sh pod_sync.sh pod_fan.sh; do
+  grep -qE "(export [^\"']*|[[:space:]])REMOTE_DIR=\\\$?REMOTE_DIR" "$ROOT/scripts/$launcher" \
+    || fail "$launcher does not export REMOTE_DIR; a job resolving its own paths falls back to /work/tilerl"
+done
+for b in bench_ssd_restart bench_write_through bench_tier_wall_clock; do
+  # argparse's own default, not a regex over the source: the first attempt matched to the
+  # first comma and tried to eval `os.environ.get("REMOTE_DIR"`.
+  parser="
+import argparse, pathlib, re
+src = pathlib.Path('$ROOT/scripts/$b.py').read_text()
+m = re.search(r'--repo\", (default=.+?)\)\n', src, re.S)
+assert m, 'no --repo argument'
+import os
+ap = argparse.ArgumentParser()
+exec('ap.add_argument(\"--repo\", ' + m.group(1) + ')')
+"
+  got=$(REMOTE_DIR="$TMP/work/tilerl-s-alpha" python3 -c "$parser
+print(ap.parse_args([]).repo)")
+  [ "$got" = "$TMP/work/tilerl-s-alpha" ] || fail "$b's --repo default is [$got], not the session tree"
+  # With REMOTE_DIR unset the parser must REFUSE. A fallback here is the same trap for a
+  # hand-run job, and it produces a number rather than an error.
+  if out=$(env -u REMOTE_DIR python3 -c "$parser
+print('RESOLVED', ap.parse_args([]).repo)" 2>&1); then
+    fail "$b accepted no --repo with REMOTE_DIR unset: $out"
+  fi
+  case "$out" in *"required"*|*"the following arguments"*) ;;
+    *) fail "$b failed for some reason other than a required --repo: $out";; esac
+done
+
+echo "PASS: two sessions get two trees, neither wipe reaches the other, each runner names its tree and sha, the baseline sits outside both, all three scripts default per-session, and a job's own paths follow REMOTE_DIR"

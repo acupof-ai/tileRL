@@ -156,7 +156,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="qwen38-27b")
     ap.add_argument("--python", default="/work/tl013/bin/python")
-    ap.add_argument("--repo", default="/work/tilerl")
+    ap.add_argument("--repo", default=os.environ.get("REMOTE_DIR"),
+                    required="REMOTE_DIR" not in os.environ,
+                    help="server cwd, one tree per session. No fallback: a wrong tree produces a number, not an error")
     ap.add_argument("--sessions", default="2,8,12",
                     help="comma-separated session counts, served in one process per arm")
     ap.add_argument("--turns", type=int, default=3)

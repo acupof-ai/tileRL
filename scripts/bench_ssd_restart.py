@@ -266,7 +266,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="qwen38-27b")
     ap.add_argument("--python", default="/work/tl013/bin/python")
-    ap.add_argument("--repo", default="/work/tilerl")
+    ap.add_argument("--repo", default=os.environ.get("REMOTE_DIR"),
+                    required="REMOTE_DIR" not in os.environ,
+                    help="server cwd, one tree per session. No fallback: a wrong tree produces a number, not an error")
     ap.add_argument("--spill", default="/work/ssd_tier_bench")
     ap.add_argument("--port", type=int, default=8123)
     ap.add_argument("--tokens", type=int, default=3000, help="target prompt length")
