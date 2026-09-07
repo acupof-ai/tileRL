@@ -1,4 +1,4 @@
-# The DRAM tier is 2.22x on the fixed publisher — H20, 2026-09-08
+# The DRAM tier is 3.57x warm, 2.1x averaged, on the fixed publisher — H20, 2026-09-08
 
 > Status: Shipped (measurement only; no default flips)
 
@@ -99,13 +99,31 @@ put the 3.20–3.82x spread across turns 1–3 inside the noise) or a second mec
 | conv C…L (the other ten) | 126.23 s | 129.22 s | **−2.99 s** |
 | median row | 12.83 s | 13.11 s | −0.28 s |
 
-Rows C–L are a tie with the **tier-off arm 2.3% faster**, and its median row is lower. The entire
+Rows C–L are a tie with the **tier-off arm 2.4% faster**, and its median row is lower. The entire
 turn-0 gap is two rows: off's conv A at 36.84 s and B at 21.52 s, against a tier-on arm whose worst
-row is 14.90 s. A first-arrival transient in one arm, not a property of either configuration.
+row is 14.90 s. A first-arrival transient in one arm — not run-to-run variance, and not
+`--dram-bytes` changing startup geometry, which would move all twelve rows rather than two.
 
-Two consequences. **The variance hypothesis is refuted for the body of the cell** — ten paired rows
-agreeing to 2.3% means the turns 1–3 ratios are not sitting inside a 14% band. And **2.22x is an
-underestimate**, since the transient inflates the off arm's turn 0.
+**Correcting for it lowers the headline, not raises it.** The transient is in the *off* arm, so it
+inflates the numerator: removing it makes off/on smaller. Replacing each arm's turn 0 with twelve
+times its own C–L mean (off 12.62 s, on 12.92 s):
+
+| | off total | on total | ratio |
+|---|---:|---:|---:|
+| as measured | 624.38 s | 281.16 s | **2.221x** |
+| off arm de-transiented | 591.27 s | 281.16 s | 2.103x |
+| both arms de-transiented | 591.27 s | 278.30 s | **2.125x** |
+
+So the honest figure is **2.10–2.13x, and the reported 2.221x is about 4.5% too high** — the
+transient is a windfall to the tier's apparent advantage, not a tax on it. An earlier draft of this
+entry claimed the opposite ("2.22x is an underestimate"), which was a sign error in the direction
+that flattered the result; a reviewer caught it.
+
+**Two smaller readings.** The variance hypothesis is refuted for the body of the cell: ten paired
+rows agreeing to 2.4% means the turns 1–3 ratios of 3.20–3.82x are not sitting inside a ±14% band.
+And the C–L "tie" is not quite a tie in the tier's favour — with the tier on and promotions active,
+the ten steady turn-0 rows are **2.4% slower**, a small standing cost of having the tier enabled that
+is visible only while there is nothing yet to promote.
 
 ## The ratio depends on how many sessions lose the promotion race
 
@@ -118,12 +136,12 @@ Each arm was run once; the count is not established as stable.
 
 ## Rule
 
-**The tier is ~4x once warm, ~1x on the first turn, and ~1x for any session that races promotion.**
-2.22x is the average over a cell that contains all three regimes, and it is the least informative
-way to state the result: turns 1-3 run 3.3-3.7x, turn 0 runs 1.17x with nothing promoted, and within
-turn 1 the two sessions arriving before their prefix is promoted pay the full 10.1 s. A cell measured
-over one turn reports the tier as worthless; a cell quoted as a single mean hides that its benefit is
-gated on promotion having already happened.
+**The tier is ~3.6x once warm, ~1x on the first turn, and ~1x for any session that races promotion.**
+2.1–2.2x is the average over a cell containing all three regimes, and it is the least informative way
+to state the result: turns 1–3 run 3.20–3.82x (3.57x pooled), turn 0 runs at parity with nothing
+promoted, and within turn 1 the two sessions arriving before their prefix is promoted pay the full
+10.1 s. A cell measured over one turn reports the tier as worthless; a cell quoted as a single mean
+hides that its benefit is gated on promotion having already happened.
 
 Corollary that survives the publisher fix: **a tier that absorbs pressure still pays after the
 pressure's source is reduced.** Publishes went from 62 per 31k miss to 2 per row, and the remaining
