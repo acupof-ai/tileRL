@@ -137,32 +137,28 @@ def _entry_bytes(spill: str) -> int:
     return size + (os.path.getsize(st) if os.path.exists(st) else 0)
 
 
-def _matched_tokens(spill: str) -> int:
-    """Tokens covered by the entry that can actually serve, from the spill file sizes.
+def _matched_tokens(spill: str, turn2_ids: int) -> int:
+    """Tokens the longest SERVABLE entry covers -- read from the entries, not inferred.
 
-    Every .kv is a whole number of publish units, so the sizes give the coverage ladder
-    directly, and the LONGEST entry is the one that serves: the measured request is turn 1
-    plus the reply plus a follow-up, so the stored prompt+reply is a strict prefix of it.
+    Previously this divided the largest .kv by the smallest and multiplied by a 512-token
+    unit, which was calibrated when six entries formed a size ladder. With two entries it
+    reported 512 for a hit that covered 2720, and the ceiling built on it said the arm
+    saved 2.8x more than the tokens it matched could explain -- an instrument artifact
+    that reads exactly like a bench measuring its own page cache.
 
-    Since `spill=False` on mid-chunk publishes there is usually exactly ONE .kv on disk,
-    and `sizes[-1] / sizes[0]` is then 1 -- so this reports one unit, not the entry's real
-    coverage. It is a lower bound and the ceiling built on it is conservative; `ssd_hits`
-    is what says a hit happened.
+    Servable means a strict prefix of turn 2: `_match_prefix` treats a full-length match
+    as a miss, and the decode entry (prompt + generated reply) is not a prefix at all.
     """
+    import glob
+
+    import torch
     d = os.path.join(spill, "tilerl_kvtier")
-    sizes = sorted(
-        os.path.getsize(os.path.join(d, f))
-        for f in os.listdir(d) if f.endswith(".kv")
-    ) if os.path.isdir(d) else []
-    if not sizes:
-        return 0
-    return round(sizes[-1] / sizes[0]) * _UNIT_TOKENS
-
-
-#: Tokens per publish unit, derived from the size ladder rather than assumed: the smallest
-#: spill was 33557933 B and the largest 179316717 B = 5.343x it, which lands on the whole
-#: 2729-token prompt (171 blocks x 16 = 2736 slots) only at 512 tokens per unit.
-_UNIT_TOKENS = 512
+    best = 0
+    for f in glob.glob(os.path.join(d, "*.kv")):
+        n = len(torch.load(f, map_location="cpu")["tokens"])
+        if n < turn2_ids:
+            best = max(best, n)
+    return best
 
 
 def _prefix_check(spill: str, args, prompt: str, reply: str) -> dict:
@@ -424,12 +420,14 @@ def main() -> None:
 
     cold, faulted, control = rows[:3]  # the break-even arms append past these three
     # The ceiling: a hit can save at most the prefill of the tokens it actually covered,
-    # at the cold arm's own per-token rate. `matched` is read off the largest SERVABLE
-    # entry, i.e. the second-largest spill -- `_match_prefix` treats a full-length hit as
-    # a miss, so the whole-prompt entry cannot be the one that served.
-    matched = _matched_tokens(main_dir)
+    # at the cold arm's own per-token rate. `matched` is the longest entry that is a
+    # strict prefix of turn 2 -- `_match_prefix` treats a full-length hit as a miss, so
+    # the whole-prompt entry cannot be the one that served.
+    matched = _matched_tokens(main_dir, faulted["prompt_tokens"])
     ceiling_s = matched * cold["ms_per_prompt_token"] / 1000
-    saved = cold["wall_s"] - faulted["wall_s"]
+    saved = control["wall_s"] - faulted["wall_s"]  # vs the empty-tier arm, not vs cold:
+    # cold also pays first-start costs the other two do not, so `cold - faulted` credits
+    # the tier with start order. `control` is the same arm position with an empty tier.
     # The check that caught this bench measuring its own page cache: divide the bytes a
     # fault-in must read by the device's measured bandwidth. If the whole arm is faster
     # than that read, the read did not come from the device.
@@ -524,6 +522,12 @@ def main() -> None:
             f"the control ran at {verdict['control_over_cold']}x cold with an EMPTY tier, "
             "so arm order alone moves the wall clock and neither speedup is the tier's"
         )
+    elif matched and saved > ceiling_s:
+        verdict["INVALID"] = (
+            f"saved {saved:.3f} s against a ceiling of {ceiling_s:.3f} s "
+            f"({matched} matched tokens x cold's {cold['ms_per_prompt_token']} ms/tok) -- "
+            "a hit cannot save more prefill than it covered, so something else moved"
+        )
     elif read_s and faulted["wall_s"] < read_s:
         verdict["SCENARIOS"] = (
             f"restart (host cache warm, the common case): "
@@ -533,12 +537,6 @@ def main() -> None:
             f"host reboot / evicted cache: {verdict['composed_speedup']}x, "
             f"{composed_s:.3f} s composed from a measured {read_s:.3f} s disk read plus "
             f"{tail_s:.3f} s of tail prefill. Both are real; they answer different questions."
-        )
-    elif matched and saved > ceiling_s:
-        verdict["INVALID"] = (
-            f"saved {saved:.3f} s against a ceiling of {ceiling_s:.3f} s "
-            f"({matched} matched tokens x cold's {cold['ms_per_prompt_token']} ms/tok) -- "
-            "a hit cannot save more prefill than it covered, so something else moved"
         )
     print(json.dumps(verdict, indent=2), flush=True)
     # Exit nonzero on INVALID. Printing it and returning 0 makes a bench that measured
