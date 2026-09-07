@@ -340,6 +340,9 @@ def _arm(args, name: str, spill: str, prompt, reply: str = "") -> dict:
         # B for this arm. The faulted arm moved 1.234 -> 1.803 s across two runs of
         # one sha; page-cache state is the candidate and this is what tests it.
         "fetch_ms": d("ssd_fetch_ms"),
+        # the .st read is not prefetched: it runs on the caller at lookup time and
+        # is not in fetch_ms, so a fast B can sit beside a slow arm.
+        "state_load_ms": d("ssd_state_load_ms"),
         "fetch_mib_s": round(d("ssd_fetch_bytes") / 2**20 / (d("ssd_fetch_ms") / 1000), 1)
                        if d("ssd_fetch_ms") > 0 else None,
         "prefill_rate": after.get("prefill_rate"),
