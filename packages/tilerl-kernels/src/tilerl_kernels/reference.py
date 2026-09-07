@@ -587,8 +587,8 @@ def linear_attn_bwd(
     return gdn_backward(grad, q, k, v, g, beta, state, **kw)
 
 
-#: 64: both chunk loops are dispatch-bound, so 4x the chunk costs the same per call
-_GDN_CHUNK = 64
+#: 128: both chunk loops are dispatch-bound, so a larger chunk costs the same per call
+_GDN_CHUNK = 128
 
 
 def _gdn_chunk_fwd(qc, kc, vc, bc, gtc, s):
