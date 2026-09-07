@@ -1,35 +1,86 @@
 /** DOM writing. Everything here takes text and produces nodes; nothing parses the
  * wire format (protocol.ts) and nothing opens a socket (transport.ts). */
 
-/** Markdown, the subset model output actually uses: headings, paragraphs, lists,
- * links, fenced code, inline code, bold, italic. Built with createTextNode and
- * element nodes rather than innerHTML, so no reply can inject markup -- the page
- * once carried a hand-written escaper for exactly this and it is a class of bug
- * not worth keeping alive.
+import { marked } from "marked"
+import type { Token, Tokens } from "marked"
+
+/** Markdown, GFM, rendered as NODES.
  *
- * No parser library: the whole grammar below is ~60 lines and marked/markdown-it
- * are 30-40 KB gzipped against a 3.9 KB page. */
+ * `marked` does the grammar -- the hand-rolled version here covered headings, flat
+ * lists, fences, links and bold, so a table arrived as prose full of pipes and a
+ * nested list flattened (ckl, on the V100 page: "md 组件不全"). What it does NOT do
+ * is produce the HTML string: we walk its token tree and build nodes with
+ * createElement/createTextNode, so no reply can inject markup. marked.parse() +
+ * DOMPurify + innerHTML is the usual shape and costs 23.5 KB gz against 12.8 for
+ * the lexer alone -- and it would put an innerHTML sink back in the page, where the
+ * old string renderer's attribute breakout lived. Absent beats sanitised. */
 export const markdown = (src: string): DocumentFragment => {
   const frag = document.createDocumentFragment()
-  // Fences first, so a `#` or `-` inside a code block is never a heading or a
-  // bullet. `(?:```|$)` is what makes a half-arrived block render while it
-  // streams: an unterminated fence is a code block whose body is what has come
-  // in so far, not a paragraph that turns into one when the closer lands.
-  for (const part of src.split(/(```[\s\S]*?(?:```|$))/)) {
-    if (part === "") continue
-    if (part.startsWith("```")) frag.appendChild(fence(part))
-    else blocks(part, frag)
-  }
+  // An unterminated fence must render as a code block whose body is what has
+  // arrived, not as a paragraph that becomes one when the closer lands; marked's
+  // lexer already ends an open fence at EOF, which is the streaming behaviour the
+  // hand-rolled splitter was written for.
+  for (const tok of marked.lexer(src, { gfm: true })) block(tok, frag)
   return frag
 }
 
-const fence = (part: string): HTMLElement => {
-  const nl = part.indexOf("\n")
-  const body = (nl === -1 ? "" : part.slice(nl + 1)).replace(/```$/, "")
-  const pre = document.createElement("pre")
-  const code = document.createElement("code")
+const el = <K extends keyof HTMLElementTagNameMap>(tag: K): HTMLElementTagNameMap[K] =>
+  document.createElement(tag)
+
+const block = (tok: Token, into: Node): void => {
+  switch (tok.type) {
+    case "space":
+      return
+    case "heading": {
+      const h = document.createElement(`h${(tok as Tokens.Heading).depth}`)
+      inline((tok as Tokens.Heading).tokens, h)
+      into.appendChild(h)
+      return
+    }
+    case "code":
+      into.appendChild(fence(tok as Tokens.Code))
+      return
+    case "table":
+      into.appendChild(table(tok as Tokens.Table))
+      return
+    case "blockquote": {
+      const q = el("blockquote")
+      for (const t of (tok as Tokens.Blockquote).tokens) block(t, q)
+      into.appendChild(q)
+      return
+    }
+    case "list":
+      into.appendChild(list(tok as Tokens.List))
+      return
+    case "hr":
+      into.appendChild(el("hr"))
+      return
+    case "paragraph": {
+      const p = el("p")
+      p.className = "prose"
+      inline((tok as Tokens.Paragraph).tokens, p)
+      into.appendChild(p)
+      return
+    }
+    default: {
+      // text, html, def and anything a future marked adds: rendered as its own
+      // source text. `html` lands here deliberately -- a reply's raw markup is text.
+      const raw = (tok as { text?: string; raw?: string }).text ?? tok.raw ?? ""
+      if (raw.trim() === "") return
+      const p = el("p")
+      p.className = "prose"
+      p.appendChild(document.createTextNode(raw))
+      into.appendChild(p)
+    }
+  }
+}
+
+const fence = (tok: Tokens.Code): HTMLElement => {
+  const body = tok.text
+  const pre = el("pre")
+  const code = el("code")
   code.appendChild(document.createTextNode(body))
-  const copy = document.createElement("button")
+  const copy = el("button")
   copy.className = "copy"
   copy.appendChild(document.createTextNode("Copy"))
   // Outside <code>, so selecting the block or reading its textContent never
@@ -42,53 +93,69 @@ const fence = (part: string): HTMLElement => {
   return pre
 }
 
-/** A bullet or a number, and the space after it. The trailing `\s+` is what
- * keeps `*italic*` at the start of a line from reading as a list item. */
-const ITEM = /^\s*(?:[-*+]|\d+[.)])\s+/
-
-const blocks = (src: string, into: DocumentFragment): void => {
-  const lines = src.split("\n")
-  let i = 0
-  while (i < lines.length) {
-    const line = lines[i] ?? ""
-    if (line.trim() === "") {
-      i++
-      continue
-    }
-    const h = /^(#{1,6})\s+(.*)$/.exec(line)
-    if (h !== null) {
-      const el = document.createElement(`h${(h[1] ?? "").length}`)
-      inline(h[2] ?? "", el)
-      into.appendChild(el)
-      i++
-      continue
-    }
-    if (ITEM.test(line)) {
-      const list = document.createElement(/^\s*\d/.test(line) ? "ol" : "ul")
-      while (i < lines.length && ITEM.test(lines[i] ?? "")) {
-        const li = document.createElement("li")
-        inline((lines[i] ?? "").replace(ITEM, ""), li)
-        list.appendChild(li)
-        i++
-      }
-      into.appendChild(list)
-      continue
-    }
-    const buf: string[] = []
-    while (i < lines.length) {
-      const l = lines[i] ?? ""
-      if (l.trim() === "" || /^#{1,6}\s/.test(l) || ITEM.test(l)) break
-      buf.push(l)
-      i++
-    }
-    const p = document.createElement("p")
-    p.className = "prose"
-    inline(buf.join("\n"), p)
-    into.appendChild(p)
+const table = (tok: Tokens.Table): HTMLElement => {
+  const t = el("table")
+  const thead = el("thead")
+  const hr = el("tr")
+  tok.header.forEach((cell, i) => {
+    const th = el("th")
+    const a = tok.align[i]
+    if (a) th.style.textAlign = a
+    inline(cell.tokens, th)
+    hr.appendChild(th)
+  })
+  thead.appendChild(hr)
+  const tbody = el("tbody")
+  for (const row of tok.rows) {
+    const tr = el("tr")
+    row.forEach((cell, i) => {
+      const td = el("td")
+      const a = tok.align[i]
+      if (a) td.style.textAlign = a
+      inline(cell.tokens, td)
+      tr.appendChild(td)
+    })
+    tbody.appendChild(tr)
   }
+  t.append(thead, tbody)
+  return t
 }
 
-/** A URL we are willing to put in an href, or null.
+const list = (tok: Tokens.List): HTMLElement => {
+  if (tok.ordered) {
+    const ol = el("ol")
+    if (tok.start !== "" && tok.start !== 1) ol.start = Number(tok.start)
+    return items(tok, ol)
+  }
+  return items(tok, el("ul"))
+}
+
+const items = (tok: Tokens.List, l: HTMLElement): HTMLElement => {
+  for (const item of tok.items) {
+    const li = el("li")
+    if (item.task) {
+      const box = el("input")
+      box.type = "checkbox"
+      box.checked = item.checked === true
+      box.disabled = true
+      li.appendChild(box)
+    }
+    // A list item's children are BLOCK tokens (that is how a nested list arrives),
+    // but a tight item's text token holds inline children -- those go through
+    // inline() rather than being flattened into a paragraph.
+    for (const t of item.tokens) {
+      if (t.type === "text" && "tokens" in t && Array.isArray(t.tokens)) {
+        inline(t.tokens as Token[], li)
+      } else {
+        block(t, li)
+      }
+    }
+    l.appendChild(li)
+  }
+  return l
+}
+
+/** A URL we are willing to put in an href or src, or null.
  *
  * createElement closes the attribute-breakout hole the old string renderer had,
  * but it does NOT close this one: `[click](javascript:...)` is a live handler
@@ -99,41 +166,76 @@ const safeHref = (u: string): string | null => {
   return /^(?:https?:\/\/|mailto:)/i.test(s) || /^[/#]/.test(s) ? s : null
 }
 
-const inline = (src: string, into: HTMLElement): void => {
-  // One pass, alternating literal and marked-up runs. `split` with a capturing
-  // group keeps the delimiters, so every character lands in exactly one branch
-  // and nothing can be dropped by a pattern that fails to match.
-  for (const tok of src.split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]*\]\([^)\s]*\))/)) {
-    if (tok === "") continue
-    const link = /^\[([^\]]*)\]\(([^)\s]*)\)$/.exec(tok)
-    if (tok.startsWith("`") && tok.endsWith("`") && tok.length > 1) {
-      const c = document.createElement("code")
-      c.appendChild(document.createTextNode(tok.slice(1, -1)))
-      into.appendChild(c)
-    } else if (tok.startsWith("**") && tok.endsWith("**") && tok.length > 3) {
-      const b = document.createElement("strong")
-      b.appendChild(document.createTextNode(tok.slice(2, -2)))
-      into.appendChild(b)
-    } else if (tok.startsWith("*") && tok.endsWith("*") && tok.length > 2) {
-      const i = document.createElement("em")
-      i.appendChild(document.createTextNode(tok.slice(1, -1)))
-      into.appendChild(i)
-    } else if (link !== null) {
-      const href = safeHref(link[2] ?? "")
-      if (href === null) {
-        into.appendChild(document.createTextNode(tok))
-      } else {
-        const a = document.createElement("a")
+const inline = (toks: Token[], into: HTMLElement): void => {
+  for (const tok of toks) {
+    switch (tok.type) {
+      case "escape":
+      case "text":
+        // A text token can itself carry inline children (a table cell, a list item).
+        if ("tokens" in tok && Array.isArray(tok.tokens)) inline(tok.tokens as Token[], into)
+        else into.appendChild(document.createTextNode((tok as Tokens.Text).text))
+        break
+      case "codespan": {
+        const c = el("code")
+        c.appendChild(document.createTextNode((tok as Tokens.Codespan).text))
+        into.appendChild(c)
+        break
+      }
+      case "strong":
+        into.appendChild(wrap("strong", (tok as Tokens.Strong).tokens))
+        break
+      case "em":
+        into.appendChild(wrap("em", (tok as Tokens.Em).tokens))
+        break
+      case "del":
+        into.appendChild(wrap("del", (tok as Tokens.Del).tokens))
+        break
+      case "br":
+        into.appendChild(el("br"))
+        break
+      case "checkbox":
+        break // already rendered by list(), which owns the item's box
+      case "link": {
+        const lk = tok as Tokens.Link
+        const href = safeHref(lk.href)
+        if (href === null) {
+          into.appendChild(document.createTextNode(lk.raw))
+          break
+        }
+        const a = el("a")
         a.href = href
         a.target = "_blank"
         a.rel = "noopener noreferrer"
-        a.appendChild(document.createTextNode(link[1] ?? ""))
+        inline(lk.tokens, a)
         into.appendChild(a)
+        break
       }
-    } else {
-      into.appendChild(document.createTextNode(tok))
+      case "image": {
+        const im = tok as Tokens.Image
+        const src = safeHref(im.href)
+        // Same policy as a link, for the same reason: `src` fetches, and a
+        // data:/javascript: URL has no business in a reply.
+        if (src === null) {
+          into.appendChild(document.createTextNode(im.raw))
+          break
+        }
+        const img = el("img")
+        img.src = src
+        img.alt = im.text
+        if (im.title !== null) img.title = im.title
+        into.appendChild(img)
+        break
+      }
+      default:
+        into.appendChild(document.createTextNode((tok as { raw: string }).raw))
     }
   }
+}
+
+const wrap = (tag: "strong" | "em" | "del", toks: Token[]): HTMLElement => {
+  const e = el(tag)
+  inline(toks, e)
+  return e
 }
 
 export interface Turn {
