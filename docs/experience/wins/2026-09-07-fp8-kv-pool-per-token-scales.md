@@ -172,6 +172,28 @@ The fixture had to be seeded to say any of this. Unseeded, `bitexact` read false
 run and true on the next, and **the difference was the draw** — neither reading meant
 anything, and I reported the second one as a correction of the first before noticing.
 
+## What the 27B measured
+
+The same flag on `Qwen3.8-27B-NVFP4`, H20 card 0, run
+`tilerl-kvfp8-27b-s3c`. `scripts/probe_kv_fp8_27b.py`, 2048-token prompt, 24 new tokens.
+
+| arm | number |
+|---|---:|
+| next-token agreement, fp8 pool vs bf16, same engine | **24 / 24**, no divergence |
+| bytes per token | 65536 → **33280** = **1.9692x** |
+| K error over row amax, e4m3 per-token | **0.0357** |
+| K error over row amax, e4m3 block_head (not chosen) | **0.0588** |
+| K error over row amax, e5m2 per-token | **0.1111** |
+| elements zeroed, per-token vs block_head | 9.0e-06 vs 1.16e-05 |
+
+Two things carry over from tiny unchanged: the grid gap is **1.65x** here against 1.64x
+there, and e4m3 beats e5m2 by 3.1x. The 27B's real KV has amax p50 5.66 and max 22.9, so
+it sits well inside e4m3's range — the format is not the constraint, the grid is.
+
+Agreement being exactly 24/24 is the accept condition, not a strong result on its own: 24
+greedy tokens is a short window, and this entry claims nothing about quality over a long
+run.
+
 ## Traps, each a rule for the next kernel in this tree
 
 - `T.alloc_fragment((2,), ...)` then `part[1]` is rejected: *"Only fragment[0] access is
@@ -193,6 +215,15 @@ anything, and I reported the second one as a correction of the first before noti
   request). So an over-large batch is admitted as far as it fits and the rest queues.
   A capacity claim of the form "bf16 OOMs and fp8 serves" is therefore unreachable
   through the engine: the observable is how many requests are resident at once.
+- An **uncapped** fit is the other half of the same trap. `_fit_blocks` takes 2/3 of what
+  is free, which on a nearly-empty card is ~54 GiB of KV — and then the prefill
+  transients at B=8 have nowhere to go (OOM with 94.27 GiB in use). The cap has to come
+  from what the batch can address (`max_blocks`, as `cli.py:132` passes), not from what
+  is free. Fixing the 64-block bug is what exposed this: a pool small enough to be wrong
+  was also small enough to leave room.
+- A number known **before** the step that might fail has to be recorded there. The
+  boundary arm's `blocks_ratio` was computed alongside the peak-resident count, so an
+  arm that OOMed in the transients lost the capacity answer it had already measured.
 
 ## The gate, and its negative control
 
@@ -232,25 +263,26 @@ pool each produced a plausible number that would have shipped. Three of them rea
 |---|---|---|---|---|---:|---:|---:|
 | 2026-09-07 | 0d14ab2 | this Mac | cpu | tiny | — | — | — (parity only) |
 | 2026-09-07 | e2d30c3 | H20 card 0 | sm90 | (kernel arms) | — | — | — (correctness only) |
-| pending-remote | | H20 card 0 | sm90 | qwen38-27b | | | |
+| 2026-09-07 | 9497f92 | H20 card 0 | sm90 | qwen38-27b | — | — | — (accuracy + range only) |
+| pending-remote | | H20 card 0 | sm90 | qwen38-27b | | | (rate + capacity) |
 
 The cpu row is parity and byte accounting: 473 tests pass, the fp8 gate green with its
 negative control, no timing claimed — the C backend cannot codegen fp8 at all, so both
 the writers and the readers are card-only.
 
-The sm90 row is the four arms above, run under `tilerl-kvfp8-gate3` … `-read4`. Kernels
-compile, parity is ties-only, and the reader path costs 3.16% of the output amax.
+The sm90 kernel row is the four arms above, run under `tilerl-kvfp8-gate3` … `-read4`.
+Kernels compile, parity is ties-only, and the reader path costs 3.16% of the output amax.
+
+The 27B row is agreement and range (the table above), run under `tilerl-kvfp8-27b-s3c`.
+No rate, because the run OOMed after those two arms for the reason in the traps list.
 
 Still pending, and it needs a card window with the 42 GB checkpoint:
 
-1. **27B agreement + logit error** at 2048 prompt tokens, fp8 pool against bf16 through
-   the same engine. `scripts/probe_kv_fp8_27b.py`, smoke-tested on tiny (agreement 1.0,
-   4/4 tokens) but never run on the 27B.
-2. **27B range, both grids, both dtypes** — from the same script, on the pool a real
-   prefill filled. On tiny-shaped real KV it already reproduces the 1.64x grid gap and
-   the e4m3 verdict.
-3. **decode tok/s at 8k and 32k.** This now has something to measure — the readers move
-   half the bytes — but it is the one number this entry still does not have.
+1. **decode tok/s at B=8 ctx=8k**, whose ceiling is 1.13x. The one number this entry
+   still does not have, and the reason B=1 is not the cell: its ceiling is 1.019x at 8k
+   and 1.072x at 32k, both under run-to-run variance.
+2. **the capacity demonstration** — the two fitted block counts on one card, and how many
+   of a B=32 x 32k batch each pool holds resident.
 
 Raw artifacts: `scripts/probe_kv_fp8_kernels.py` (the four card arms, JSON on stdout)
 and `scripts/probe_kv_fp8_27b.py` (the 27B arms). The append-rule and RoPE-absmax
