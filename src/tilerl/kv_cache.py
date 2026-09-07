@@ -672,9 +672,10 @@ class KvTier:
         if blob.get("tokens") != tuple(tokens):
             return False  # hash collision: these bytes belong to a different prefix
         self._touch_lru(key)
-        for i, b in enumerate(blocks):
-            pool.k_pool[:, b].copy_(blob["k"][i].to(pool.device))
-            pool.v_pool[:, b].copy_(blob["v"][i].to(pool.device))
+        # one index_copy_ per plane: the per-block loop was 3,750 launches at 30k tokens
+        idx = torch.as_tensor(list(blocks), device=pool.device)
+        pool.k_pool.index_copy_(1, idx, blob["k"].permute(1, 0, 2, 3, 4).to(pool.device))
+        pool.v_pool.index_copy_(1, idx, blob["v"].permute(1, 0, 2, 3, 4).to(pool.device))
         return True
 
     def spill_state(self, key: int, tokens: tuple[int, ...], states, windows) -> None:
