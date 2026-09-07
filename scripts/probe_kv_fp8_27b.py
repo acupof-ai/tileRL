@@ -103,11 +103,15 @@ def arm_range(pool, dtypes: dict) -> dict:
     return out
 
 
-def _gen(cfg, model, backend, prompts, n_new, kv_fp8):
+def _gen(cfg, model, backend, prompts, n_new, kv_fp8, step_ms: list | None = None):
     """Run `prompts` (one list, or a list of lists) to n_new tokens each.
 
     Returns (tokens, engine): the token LIST for a single prompt, the total COUNT for a
     batch -- the decode arm wants throughput, the accuracy arm wants the ids.
+
+    `step_ms` collects per-tick wall clock. A whole-generation rate is NOT a decode rate:
+    at B=8 ctx=8k the 65536 prefill tokens chunk into ~128 ticks against 24 decode ticks,
+    so the total is 84% prefill and a decode-tick byte model does not bound it.
     """
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.kv_cache import BLOCK_TOKENS
@@ -134,7 +138,15 @@ def _gen(cfg, model, backend, prompts, n_new, kv_fp8):
         done.update(eng.poll())
         if all(len(done.get(r, ())) >= n_new for r in rids) or time.perf_counter() - t0 > 1800:
             break
+        # A tick that carries ANY prefill row is a prefill tick, and it moves up to
+        # max_num_batched_tokens per row where a decode tick moves one. The engine already
+        # knows -- `_Req.prefilling` (engine.py:235) -- so read that rather than infer it
+        # from finished ids, which only change on FINISH and would call every tick prefill.
+        ts = time.perf_counter()
+        pre = bool(eng._waiting) or any(r.prefilling for r in eng._running)
         eng.step()
+        if step_ms is not None:
+            step_ms.append((pre, (time.perf_counter() - ts) * 1e3))
     if isinstance(prompts[0], list):
         return sum(len(done.get(r, ())) for r in rids), eng
     return list(done.get(rids[0], ())), eng
@@ -187,12 +199,21 @@ def arm_decode(cfg, model, backend, ctx: int, n_new: int, batch: int = 1) -> dic
         # itself into 2/3 of the remainder, so it would be timed at a different pool size.
         bpt = eng._kv.bytes_per_token
         _release(eng)
+        ticks: list = []
         t0 = time.perf_counter()
-        toks2, eng2 = _gen(cfg, model, backend, prompts, n_new, dt)
+        toks2, eng2 = _gen(cfg, model, backend, prompts, n_new, dt, step_ms=ticks)
         dt_s = time.perf_counter() - t0
+        dec = [ms for pre, ms in ticks if not pre]
+        pre_ms = [ms for pre, ms in ticks if pre]
         out[nick] = {
             "tokens": toks2, "seconds": dt_s,
-            "tok_per_s": toks2 / dt_s if dt_s > 0 else 0.0,
+            # whole-generation, kept only to show how little of it is decode
+            "tok_per_s_whole_run": toks2 / dt_s if dt_s > 0 else 0.0,
+            # the number the byte ceiling bounds: one token per row per decode tick
+            "decode_ticks": len(dec), "prefill_ticks": len(pre_ms),
+            "decode_ms_per_tick": sum(dec) / len(dec) if dec else 0.0,
+            "decode_tok_per_s": (batch * 1e3 / (sum(dec) / len(dec))) if dec else 0.0,
+            "prefill_seconds": sum(pre_ms) / 1e3,
             "kv_bytes_per_token": bpt,
             "kv_bytes_at_ctx": bpt * ctx * batch,
             "blocks_total": eng2.usable_blocks,
@@ -205,8 +226,15 @@ def arm_decode(cfg, model, backend, ctx: int, n_new: int, batch: int = 1) -> dic
     out["kv_share_of_tick_bytes_fp8"] = kf / (weight_bytes + kf)
     # the most a pure-bandwidth tick could gain: what the measured ratio must sit under
     out["tok_per_s_ceiling"] = (weight_bytes + kb) / (weight_bytes + kf)
-    out["tok_per_s_ratio"] = (
-        out["fp8"]["tok_per_s"] / out["bf16"]["tok_per_s"] if out["bf16"]["tok_per_s"] else 0.0)
+    # Against the DECODE rate, which is what the ceiling models. The whole-run ratio is
+    # kept beside it because at B=8 ctx=8k the run is ~84% prefill ticks, so the two
+    # differ and only one of them is bounded by a decode tick's byte traffic.
+    out["decode_ratio"] = (
+        out["fp8"]["decode_tok_per_s"] / out["bf16"]["decode_tok_per_s"]
+        if out["bf16"]["decode_tok_per_s"] else 0.0)
+    out["whole_run_ratio"] = (
+        out["fp8"]["tok_per_s_whole_run"] / out["bf16"]["tok_per_s_whole_run"]
+        if out["bf16"]["tok_per_s_whole_run"] else 0.0)
     return out
 
 
@@ -348,11 +376,17 @@ def main() -> int:
                 key = f"decode_{ctx}_b{batch}"
                 results[key] = arm_decode(cfg, model, be, ctx, a.new_tokens, batch)
                 d = results[key]
-                print(f"\n{key}: KV is {d['kv_share_of_tick_bytes_bf16']:.1%} of a tick's "
-                      f"bytes bf16 / {d['kv_share_of_tick_bytes_fp8']:.1%} fp8, so the "
-                      f"CEILING is {d['tok_per_s_ceiling']:.3f}x. Measured "
-                      f"{d['bf16']['tok_per_s']:.2f} -> {d['fp8']['tok_per_s']:.2f} tok/s "
-                      f"= {d['tok_per_s_ratio']:.3f}x", flush=True)
+                print(f"\n{key}: KV is {d['kv_share_of_tick_bytes_bf16']:.1%} of a DECODE "
+                      f"tick's bytes bf16 / {d['kv_share_of_tick_bytes_fp8']:.1%} fp8, so the "
+                      f"CEILING is {d['tok_per_s_ceiling']:.3f}x.\n"
+                      f"  decode ticks: {d['bf16']['decode_ms_per_tick']:.1f} -> "
+                      f"{d['fp8']['decode_ms_per_tick']:.1f} ms, "
+                      f"{d['bf16']['decode_tok_per_s']:.2f} -> "
+                      f"{d['fp8']['decode_tok_per_s']:.2f} tok/s = "
+                      f"{d['decode_ratio']:.3f}x  <- the ceiling bounds THIS\n"
+                      f"  whole run ({d['bf16']['prefill_ticks']} prefill + "
+                      f"{d['bf16']['decode_ticks']} decode ticks): "
+                      f"{d['whole_run_ratio']:.3f}x, not bounded by it", flush=True)
                 print(json.dumps(d, sort_keys=True), flush=True)
         if a.boundary_batch:
             key = f"boundary_{a.boundary_ctx}_b{a.boundary_batch}"
