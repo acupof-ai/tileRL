@@ -35,6 +35,17 @@ def _q_block_head(x: torch.Tensor, dtype: torch.dtype):
     return (xf / s[..., None, None]).to(dtype), s
 
 
+def _release(*engines):
+    """Drop engines and give their pools back. A fitted pool is tens of GiB, so an engine
+    still bound while the next one fits itself takes 2/3 of what the first one left.
+    `gc.collect` because an Engine sits in reference cycles: `del` alone does not free it."""
+    import gc
+    del engines
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def arm_range(pool, dtypes: dict) -> dict:
     """Round-trip error on the REAL KV this pool holds, per grid and dtype."""
     from tilerl_kernels.reference import dequant_kv_fp8, quant_kv_fp8
@@ -45,9 +56,20 @@ def arm_range(pool, dtypes: dict) -> dict:
     if pool.kv_fp8 is not None:
         raise ValueError("arm_range needs the BF16 pool; this one is already quantized")
     out: dict = {}
-    for name, plane in (("K", pool.k_pool), ("V", pool.v_pool)):
+    for name, full in (("K", pool.k_pool), ("V", pool.v_pool)):
+        # Only the blocks the prompt wrote hold anything, and a fitted pool is far larger
+        # than the prompt: upcasting all of it asked for 47.50 GiB and OOMed. Find the live
+        # blocks by a reduction in the pool's own dtype -- `.abs()` would materialize a full
+        # copy, so take amax and amin -- then upcast that slice alone.
+        hi = full.amax((0, 2, 3, 4))
+        lo = full.amin((0, 2, 3, 4))
+        wrote = ((hi != 0) | (lo != 0)).nonzero().flatten()
+        if not wrote.numel():
+            out[name] = {"live_token_heads": 0}
+            continue
+        plane = full[:, wrote].contiguous()
         x = plane.float()
-        live = x.abs().amax(-1) > 0  # only blocks the prompt actually wrote
+        live = x.abs().amax(-1) > 0  # token-heads inside those blocks
         if not bool(live.any()):
             out[name] = {"live_token_heads": 0}
             continue
@@ -56,6 +78,7 @@ def arm_range(pool, dtypes: dict) -> dict:
         rng = (amax[live] / x.abs().clamp_min(1e30).amin(-1)[live].clamp_min(1e-30))
         out[name] = {
             "live_token_heads": int(live.sum()),
+            "live_blocks": int(wrote.numel()), "pool_blocks": int(full.shape[1]),
             "amax_p50": float(amax[live].median()), "amax_max": float(amax[live].max()),
             "in_row_range_p99": float(rng.quantile(0.99)),
         }
@@ -121,6 +144,11 @@ def arm_accuracy(cfg, model, backend, prompt, n_new: int) -> tuple[dict, object]
     want, ref_eng = _gen(cfg, model, backend, prompt, n_new, None)
     got, fp8_eng = _gen(cfg, model, backend, prompt, n_new, torch.float8_e4m3fn)
     agree = sum(a == b for a, b in zip(want, got))
+    # Read the fp8 pool's byte rate, then let that engine go: the range arm runs next against
+    # `ref_eng`'s pool, and two fitted pools alive at once is what OOMed the first card run
+    # (the second fit takes 2/3 of what the first one left).
+    bpt_fp8 = fp8_eng._kv.bytes_per_token
+    _release(fp8_eng)
     return {
         "prompt_tokens": len(prompt), "new_tokens": len(want),
         "tokens_agreeing": agree,
@@ -128,8 +156,8 @@ def arm_accuracy(cfg, model, backend, prompt, n_new: int) -> tuple[dict, object]
         "first_divergence": next((i for i, (a, b) in enumerate(zip(want, got)) if a != b), None),
         "bf16_tokens": want[:16], "fp8_tokens": got[:16],
         "bytes_per_token_bf16": ref_eng._kv.bytes_per_token,
-        "bytes_per_token_fp8": fp8_eng._kv.bytes_per_token,
-        "kv_bytes_saved_ratio": ref_eng._kv.bytes_per_token / fp8_eng._kv.bytes_per_token,
+        "bytes_per_token_fp8": bpt_fp8,
+        "kv_bytes_saved_ratio": ref_eng._kv.bytes_per_token / bpt_fp8,
     }, ref_eng
 
 
@@ -149,16 +177,22 @@ def arm_decode(cfg, model, backend, ctx: int, n_new: int, batch: int = 1) -> dic
     for nick, dt in (("bf16", None), ("fp8", torch.float8_e4m3fn)):
         toks, eng = _gen(cfg, model, backend, prompts, n_new, dt)
         # time a SECOND generation on a fresh engine of the same kind: the first paid any
-        # first-call compile, which is not what a decode rate is
+        # first-call compile, which is not what a decode rate is. Release the warm-up engine
+        # first -- its fitted pool is tens of GiB, and holding it means the timed engine fits
+        # itself into 2/3 of the remainder, so it would be timed at a different pool size.
+        bpt = eng._kv.bytes_per_token
+        _release(eng)
         t0 = time.perf_counter()
-        toks2, _ = _gen(cfg, model, backend, prompts, n_new, dt)
+        toks2, eng2 = _gen(cfg, model, backend, prompts, n_new, dt)
         dt_s = time.perf_counter() - t0
         out[nick] = {
             "tokens": toks2, "seconds": dt_s,
             "tok_per_s": toks2 / dt_s if dt_s > 0 else 0.0,
-            "kv_bytes_per_token": eng._kv.bytes_per_token,
-            "kv_bytes_at_ctx": eng._kv.bytes_per_token * ctx * batch,
+            "kv_bytes_per_token": bpt,
+            "kv_bytes_at_ctx": bpt * ctx * batch,
+            "blocks_total": eng2.usable_blocks,
         }
+        _release(eng2)
     weight_bytes = sum(t.numel() * t.element_size() for t in model.params.values())
     kb, kf = out["bf16"]["kv_bytes_at_ctx"], out["fp8"]["kv_bytes_at_ctx"]
     out["weight_bytes"] = weight_bytes
@@ -189,6 +223,7 @@ def arm_boundary(cfg, model, backend, ctx: int, batch: int, n_new: int) -> dict:
     prompts = [torch.randint(3, cfg.vocab_size - 1, (ctx,)).tolist() for _ in range(batch)]
     out: dict = {"ctx": ctx, "batch": batch}
     for nick, dt in (("bf16", None), ("fp8", torch.float8_e4m3fn)):
+        eng = None
         try:
             eng = build_engine(cfg, model, backend, num_slots=batch, max_batch=batch,
                                num_blocks=0, max_total_tokens=ctx + n_new + 64, kv_fp8=dt)
@@ -209,8 +244,10 @@ def arm_boundary(cfg, model, backend, ctx: int, batch: int, n_new: int) -> dict:
             }
         except Exception as exc:  # noqa: BLE001 -- a raise here is a result, not a crash
             out[nick] = {"raised": f"{type(exc).__name__}: {str(exc)[:200]}"}
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # `empty_cache` alone frees nothing while `eng` is still bound, and the bf16 pool
+        # here is the largest thing either arm allocates.
+        _release(eng)
+        eng = None
     both = [out[k] for k in ("bf16", "fp8")]
     if all("peak_running" in d for d in both):
         out["resident_ratio"] = both[1]["peak_running"] / max(1, both[0]["peak_running"])
