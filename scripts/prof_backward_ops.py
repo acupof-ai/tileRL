@@ -51,15 +51,14 @@ from tilerl import autograd as ag  # noqa: E402
 
 #: Which backward each op resolves to, and whether that is a TileLang kernel or torch-eager.
 #: Read off backend.py, not guessed: rmsnorm_bwd calls rmsnorm_rstd + rmsnorm_bwd_x (:536),
-#: linear_bwd calls gemm_nn (:605), linear_frozen_bwd calls linear_fp4_bwd when the scale
-#: block is 16 (:1107). The rest carry `# ponytail: torch-eager backward`.
+#: linear_bwd calls gemm_nn (:605), linear_frozen_bwd has two kernel arms -- linear_fp4_bwd
+#: when the scale block is 16, linear_fp8_bwd for fp8. The rest carry `# ponytail: torch-eager`.
 KIND = {
     "rmsnorm": "kernel: rmsnorm_rstd + rmsnorm_bwd_x",
     "rmsnorm_f32": "kernel: rmsnorm_rstd + rmsnorm_bwd_x",
     "linear": "kernel: gemm_nn",
     "linear_fp4_frozen": "kernel: linear_fp4_bwd (sm90)",
-    #: the kernel is gated `not fp8` (:1118), so fp8 falls through to the reference at :1136
-    "linear_fp8_frozen": "eager (no fp4_bwd for fp8)",
+    "linear_fp8_frozen": "kernel: linear_fp8_bwd (sm90)",
     "rope": "eager",
     "attention": "eager",
     "paged_attention": "eager",
@@ -412,50 +411,71 @@ def bench_dx_gemms(shapes: dict, sync, reps: int = 12) -> list[dict]:
     return out
 
 
-def bench_fp4_bwd(backend, shapes: dict, sync, reps: int = 12) -> list[dict]:
-    """Time `linear_frozen_bwd` BARE at each fp4 shape, beside the bf16 GEMM at the same shape.
+def bench_frozen_bwd(backend, shapes: dict, sync, reps: int = 12) -> list[dict]:
+    """Time `linear_frozen_bwd` BARE at each frozen shape, beside the bf16 GEMM at the same shape.
 
     This is the denominator any tile claim needs. Without it the row's 13.046 s carries the
     per-handler timer's hooks (~10% on the arms where that was measured), so a ratio against a
     GEMM floor mixes kernel time with instrument cost. Calling the backend method directly pays
     neither the timer nor the tape.
 
-    fp4 only: the fp8 path has no kernel (`linear_frozen_bwd` gates on `not fp8`), so timing it
-    here would re-measure the eager reference the row already reports.
+    Both formats. The fp8 shapes carry a second `eager_median_ms`, timed against
+    `reference.linear_frozen_bwd` in the same process: the kernel-vs-eager ratio for an op only
+    means anything when both arms see one clock state, and the pre-kernel step is not that.
     """
+    from tilerl_kernels import reference
+
     out = []
     for (op, m, n, k), count in sorted(shapes.items(), key=lambda kv: -kv[1] * kv[0][2] * kv[0][3]):
-        if op != "linear_fp4_frozen" or n < 1024:  # the N=48 rows are 21 ms total; skip
-            continue
+        fp8 = op == "linear_fp8_frozen"
+        if op not in ("linear_fp4_frozen", "linear_fp8_frozen") or n < 1024:
+            continue  # the N=48 rows are 21 ms total; skip
         g = torch.randn(m, n, dtype=torch.bfloat16, device=backend.device)
-        # the shipped layout: packed nibbles [N, K/2] with an f32 scale per 16 columns
-        wq = torch.randint(0, 255, (n, k // 2), dtype=torch.uint8, device=backend.device)
-        scale = torch.rand(n, k // 16, dtype=torch.float32, device=backend.device) * 0.01
-        try:
+        if fp8:  # the shipped layout: e4m3 [N,K] with one f32 scale per 128x128 tile
+            wq = torch.randn(n, k, device=backend.device).to(torch.float8_e4m3fn)
+            scale = torch.rand(-(-n // 128), -(-k // 128), device=backend.device) * 0.01
+        else:  # packed nibbles [N, K/2] with an f32 scale per 16 columns
+            wq = torch.randint(0, 255, (n, k // 2), dtype=torch.uint8, device=backend.device)
+            scale = torch.rand(n, k // 16, dtype=torch.float32, device=backend.device) * 0.01
+        row = {"op": op, "M": m, "N": n, "K": k, "calls": count}
+
+        def timed(fn):
             for _ in range(3):
-                backend.linear_frozen_bwd(g, wq, scale)
+                fn()
             sync()
+            ts = []
+            for _ in range(reps):
+                t0 = time.perf_counter()
+                fn()
+                sync()
+                ts.append(time.perf_counter() - t0)
+            ts.sort()
+            return ts
+
+        try:
+            times = timed(lambda g=g, w=wq, s=scale: backend.linear_frozen_bwd(g, w, s, fp8=fp8))
         except Exception as exc:  # a shape the kernel refuses is a finding, not a crash
-            out.append({"op": op, "M": m, "N": n, "K": k, "error": repr(exc)[:200]})
+            out.append({**row, "error": repr(exc)[:200]})
             del g, wq, scale
             continue
-        times = []
-        for _ in range(reps):
-            t0 = time.perf_counter()
-            backend.linear_frozen_bwd(g, wq, scale)
-            sync()
-            times.append(time.perf_counter() - t0)
-        times.sort()
         med = times[len(times) // 2]
         flop = 2 * m * n * k
-        out.append({
-            "op": op, "M": m, "N": n, "K": k, "calls": count,
+        row.update({
             "kernel_median_ms": round(med * 1e3, 4),
             "kernel_min_ms": round(times[0] * 1e3, 4),
             "kernel_max_ms": round(times[-1] * 1e3, 4),
             "kernel_tflops": round(flop / med / 1e12, 2),
             "row_secs_from_kernel": round(med * count, 4),
         })
+        if fp8:
+            et = timed(lambda g=g, w=wq, s=scale: reference.linear_frozen_bwd(g, w, s, fp8=True))
+            emed = et[len(et) // 2]
+            row.update({
+                "eager_median_ms": round(emed * 1e3, 4),
+                "eager_row_secs": round(emed * count, 4),
+                "speedup_vs_eager": round(emed / med, 3),
+            })
+        out.append(row)
         del g, wq, scale
         torch.cuda.empty_cache()
     return out
@@ -634,9 +654,9 @@ def main() -> int:
                 print(f"  {r['op']:<20} {r['M']:7d} {r['N']:7d} {r['K']:7d} "
                       f"{r['median_ms']:8.3f} {r['tflops_median']:8.2f} "
                       f"{r['tflops_min']:7.2f} {r['tflops_max']:7.2f} {r['row_flop_tf']:9.2f}")
-        kern = bench_fp4_bwd(backend, shapes, sync) if cuda else []
+        kern = bench_frozen_bwd(backend, shapes, sync) if cuda else []
         if kern:
-            print("\n# linear_frozen_bwd BARE at the fp4 shapes, no tape and no timer -- the")
+            print("\n# linear_frozen_bwd BARE at the frozen shapes, no tape and no timer -- the")
             print("# denominator for a tile claim. `bf16 ms` repeats the GEMM above for contrast;")
             print("# the kernel dequantizes inside the same launch, so it cannot match it.")
             print(f"# {'M':>7} {'N':>7} {'K':>7} {'kern ms':>8} {'TFLOP/s':>8} {'bf16 ms':>8} "
@@ -659,7 +679,7 @@ def main() -> int:
                 {"rows": rows_out, "backward_secs": bwd,
                  "shapes": [{"op": o, "M": m, "N": n, "K": k, "calls": c}
                             for (o, m, n, k), c in sorted(shapes.items())],
-                 "gemms": gemms, "fp4_kernel": kern}, indent=2, sort_keys=True))
+                 "gemms": gemms, "frozen_kernel": kern}, indent=2, sort_keys=True))
         return 0
     if a.no_instrument:
         # The control: no hooks, so backward_secs is the shipped path's own number and the

@@ -19,11 +19,11 @@ two cells share is only an override when the maker differs:
 | --- | ---: | ---: | ---: | ---: |
 | cpu | 16 | — | — | — |
 | metal | 16 | 3 (`gemm_nn/nt/tn`) | 0 | 13 |
-| sm90 | 42 | 9 | 26 | 7 |
+| sm90 | 43 | 9 | 27 | 7 |
 | sm70 | 24 | 2 (`silu_mul`, `gdn_prep`) | 8 | 14 |
 
-**sm70 reuses the CPU source more than any other accelerated cell**: 13 of its
-23 entries are the same maker object CPU runs, and only `silu_mul` and
+**sm70 reuses the CPU source more than any other accelerated cell**: 14 of its
+24 entries are the same maker object CPU runs, and only `silu_mul` and
 `gdn_prep` are replaced. `gdn_prep` became an override because the CPU source
 loops `T.serial(DK)` in every thread while the launch passes `threads=DK`, so all
 128 threads computed the same 128 columns — measured at T=2048, NVH=48, DK=128,
@@ -35,9 +35,11 @@ Its 8 additions are the sm70-specific decode path — `linear_fp4_gemv`,
 `paged_attention_split_combine`, `gdn_chunk_fused`, `gdn_decode_fused`,
 `rmsnorm_apply_narrow`, `write_tokens`.
 
-Line partition of `kernels*.py` (**4,037** lines: `kernels_linear.py` 1750,
-`kernels_gdn.py` 929, `kernels.py` 911, `kernels_attn.py` 290,
-`kernels_mma.py` 157).
+Line partition of `kernels*.py` (**4,218** lines: `kernels_linear.py` 1813,
+`kernels.py` 1019, `kernels_gdn.py` 939, `kernels_attn.py` 290,
+`kernels_mma.py` 157). Counted with `wc -l`, not carried forward: the previous
+figures (4,037 / 1750 / 929 / 911) were already stale by 181 lines before
+`linear_fp8_bwd` added 63 of them, so three of the five were wrong.
 
 > The partition table that stood here apportioned **1,969** lines, 2.05x under the
 > real count, and every share in it was derived from that figure — including the
@@ -48,8 +50,8 @@ Line partition of `kernels*.py` (**4,037** lines: `kernels_linear.py` 1750,
 > attribute it. Re-deriving it needs a per-function span walk keyed on which
 > `_register` set reaches each maker.
 
-`kernels.py` defines 25 `make_*` functions. cpu and metal reach 15 each, sm70
-reaches 16, sm90 reaches 10 — sm90 is the cell that replaces the most of the
+`kernels.py` defines 26 `make_*` functions. cpu and metal reach 16 each, sm70
+reaches 18, sm90 reaches 12 — sm90 is the cell that replaces the most of the
 shared source, not the one that shares the most.
 
 ## Dispatch model
@@ -88,7 +90,7 @@ sm70 is the served arch (27B NVFP4 on a V100), so its **fwd** column is
 evidenced end to end; **bwd** on sm70 has never been run and is marked
 accordingly rather than inferred from the registry. A cell with no sm70 entry
 resolves through the fallback chain to the CPU maker, which is how sm70 runs 14
-of its 23 entries — reached, not reimplemented.
+of its 24 entries — reached, not reimplemented.
 
 | Op | cpu | sm70 | sm90 | sm100 | metal |
 | --- | --- | --- | --- | --- | --- |
@@ -121,9 +123,10 @@ The sm70 M-ladder kernel is the one entry with no counterpart on any other arch:
 rung ladder instead
 (`wins/2026-09-04-the-rung-step-is-93-percent-gemv.md`).
 
-No cell needs a packed-weight backward kernel: training runs
-`backend.linear(x, master)` on the bf16 master and its ordinary `linear_bwd`
-(STE), so the tape never sees a quantized weight.
+The STE path needs no packed-weight backward: with a master present, training
+runs `backend.linear(x, master)` and its ordinary `linear_bwd`. The frozen-base
+path (LoRA / OPD) has no master, so its dX goes through a quantized weight —
+`linear_fp4_bwd` and `linear_fp8_bwd` on sm90, the eager reference elsewhere.
 
 The rest of the layer (attention, norms, activations) runs the bf16 path.
 
@@ -133,6 +136,7 @@ The rest of the layer (attention, norms, activations) runs the bf16 path.
 | --- | --- | --- | --- | --- | --- |
 | linear_fp8 (native WGMMA, M>1) | dense at load | dense at load | done | pending-remote | dense at load |
 | linear_fp8_gemv (M=1) | dense at load | dense at load | done | pending-remote | dense at load |
+| linear_fp8_bwd (frozen dX) | eager reference | eager reference | done | pending-remote | eager reference |
 | quant_fp8 (per-token e4m3 activation) | — | — | done | pending-remote | — |
 
 There is no `_register("fp8", ...)` cell: fp8 is a weight format inside the

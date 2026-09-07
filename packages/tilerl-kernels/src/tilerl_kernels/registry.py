@@ -91,6 +91,7 @@ _SM90_KERNELS = {  # WGMMA schedules; the backend pads M/N to 16 and K to 32
         target, k_split=8
     ),
     "linear_fp8": kernels_linear.make_linear_fp8_mma,
+    "linear_fp8_bwd": kernels_linear.make_linear_fp8_bwd_mma,
     "linear_fp8_gemv": kernels_linear.make_linear_fp8_gemv,
     "linear_fp8_mma8": kernels_linear.make_linear_fp8_mma8,
     "quant_fp8": kernels_linear.make_quant_fp8_e4m3,

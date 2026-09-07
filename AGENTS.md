@@ -34,10 +34,11 @@ comment density rather than a style rulebook.
   NO `torch.autograd`, NO `torch.optim` in framework code — training runs on
   our own reverse-mode tape.
 - **Hand-written reverse-mode autograd tape**, mirroring
-  `agent-infer/crates/autograd`. Backward kernels: TileLang where SOTA exists
-  (gated-delta); torch-eager reference for the rest on day-1, behind the same
-  op interface, each marked
-  `# ponytail: torch-eager backward, tilelang kernel when perf demands`.
+  `agent-infer/crates/autograd`. Backward kernels: TileLang where the op is hot
+  and measured (gated-delta, frozen fp4/fp8 dX); torch-eager reference for the
+  rest, behind the same op interface and marked
+  `# ponytail: torch-eager backward, tilelang kernel when perf demands`. The
+  reference stays the parity oracle for the ops that got a kernel.
 - **Engine seam = the cost contract**: `submit` / `poll` + `StepLimits`,
   continuous batching, one forward per tick. Same idea as agent-infer's
   `BackendExecutor` — a new target implements the loop, it does not bend the

@@ -23,6 +23,8 @@ from .registry import _arch_for, _resolve, resolve_target, sm70_kvsplit
 __all__ = ["Backend", "get_backend", "resolve_target"]
 
 _THREADS = 64
+#: the fp8 checkpoint's scale granularity: one f32 per 128x128 weight tile
+_FP8_SCALE_BLOCK = 128
 #: chunkwise-WY chunk length. gdn_state_scan and gdn_chunk_o size h by S // chunk, so a T
 #: that is not a whole multiple writes past it.
 _WY_CHUNK = 64
@@ -1135,7 +1137,30 @@ class Backend:
                 bM, bN, thr,
             )[:m, :k]
             return gx.reshape(*grad.shape[:-1], k)
-        # ponytail: torch-eager backward, tilelang dequant only exists for fp4
+        if fp8 and "linear_fp8_bwd" in kset:
+            n, k = wq.shape[0], wq.shape[1]
+            g = self._bf16(grad).reshape(-1, grad.shape[-1])
+            if oscale is not None:  # scales weight row n: fold into [M,N], not [N,K]
+                g = g * self._bf16(oscale).reshape(1, -1)
+            m = g.shape[0]
+            # read off the plane: another scale block would mis-index it silently
+            blk8 = -(-k // scale.shape[1])
+            assert blk8 == _FP8_SCALE_BLOCK, (
+                f"fp8 scale block is {blk8}, kernel bakes {_FP8_SCALE_BLOCK}; "
+                "register a second cell rather than mis-indexing the plane"
+            )
+            bM = _snap_mma_tile(min(128, m), 128)
+            bN = 64
+            thr = 128 if bM == 128 else _THREADS
+            gx = self._kernel("linear_fp8_bwd")(
+                _pad2d(self._c(g), _round_up(m, bM), _round_up(n, _FP8_SCALE_BLOCK)),
+                _pad2d(self._c(wq), _round_up(n, _FP8_SCALE_BLOCK),
+                       _round_up(k, _FP8_SCALE_BLOCK)),
+                self._const_f32(scale),
+                bM, bN, thr,
+            )[:m, :k]
+            return gx.reshape(*grad.shape[:-1], k)
+        # the parity oracle, and the only path off sm90: the C backend has no fp8 type
         return reference.linear_frozen_bwd(grad, wq, scale, oscale=oscale, fp8=fp8)
 
     def attention_bwd(self, grad, q, k, v, scale, q_pos=None, k_pos=None):

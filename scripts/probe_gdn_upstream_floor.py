@@ -1,4 +1,4 @@
-"""What would the GDN backward cost if the upstream tilelang kernels did it? (row 49, with numbers)
+"""What would the GDN backward cost if the upstream tilelang kernels did it?
 
 The GDN row is 7.799 s of a 23.194 s backward at C=128 -- 33.6%, the largest row, and the only
 one with no measured floor. Every other lever is bounded near 1.1x

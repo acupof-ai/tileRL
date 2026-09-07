@@ -1076,3 +1076,39 @@ def test_every_direct_kernel_call_places_its_tensors_on_the_backend_device():
     bad = offenders(pathlib.Path(__file__).read_text())
     assert not bad, "built on the default device, but reach a kernel built for another:\n  " \
         + "\n  ".join(bad)
+
+
+def test_frozen_bwd_fp8_parity(backend):
+    """The fp8 dX kernel equals the eager oracle, sm90 only."""
+    if not backend.has_kernel("linear_fp8_bwd"):
+        pytest.skip("pending-remote: no fp8 kernel off sm90 (C backend has no fp8 type)")
+    torch.manual_seed(11)
+    # the weight and its scale plane reach the kernel unmarshalled, unlike the grad
+    dev = backend.device
+    n, k = 256, 256
+    w8, wscale = reference.quant_fp8(torch.randn(n, k, device=dev))
+    osc = torch.rand(n, device=dev) + 0.5
+    for m in (64, 128, 192):
+        g = torch.randn(m, n, device=dev)
+        for oscale in (None, osc):
+            _assert_close(
+                backend.linear_frozen_bwd(g, w8, wscale, oscale=oscale, fp8=True),
+                reference.linear_frozen_bwd(g, w8, wscale, oscale=oscale, fp8=True),
+                f"linear_frozen_bwd fp8 M={m} oscale={oscale is not None}",
+            )
+
+
+def test_frozen_bwd_fp8_gradcheck():
+    """The eager fp8 dX is the derivative of its forward, and it is the parity oracle."""
+    torch.manual_seed(12)
+    n, k = 128, 256
+    w8, wscale = reference.quant_fp8(torch.randn(n, k))
+    w = reference.dequant_fp8(w8, wscale)
+    osc = torch.rand(n) + 0.5
+    x = torch.randn(6, k)
+    _finite_diff_gradcheck(
+        "linear_frozen_bwd fp8",
+        lambda x: (x @ w.t()) * osc.reshape(1, -1),
+        lambda go, x: (reference.linear_frozen_bwd(go, w8, wscale, oscale=osc, fp8=True),),
+        [x],
+    )
