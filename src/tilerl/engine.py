@@ -1038,15 +1038,12 @@ class Engine:
                 # Only the last boundary reaches disk; ask `_pick` where it is, since a
                 # remaining-length test misreads the backed-off 17-token tail.
                 last = pf.prefill_from == _last_prefill_boundary(len(pf.tokens))
-                # The FIRST interior boundary and the last, never the ones between. A miss
-                # prefills from token 0 and every boundary published one entry, so a 31k prompt
-                # published 62 -- more than a pressured budget holds, which evicted the head
-                # every other row shared and made the next row miss too. This holds a row at 2
-                # publishes whatever the prompt length. No eviction policy fixes that flood:
-                # six were measured and the two best numbers were bugs, see
-                # errors/2026-09-08-the-eviction-policy-was-the-wrong-layer.md. The cost is the
-                # intermediate prefixes a PARTIAL sharer would have matched -- measured -23% of
-                # cross-session partial reuse, a recompute and not a wrong answer.
+                # The FIRST interior boundary and the last, never the ones between: a row's
+                # publishes stay at 2 whatever the prompt length, where per-boundary publishing
+                # emitted 62 at a 31k prompt and outran any budget a pressured card has. Costs a
+                # PARTIAL sharer the intermediate prefixes it would have matched, measured -17%
+                # of cross-session partial reuse -- a recompute, not a wrong answer.
+                # errors/2026-09-08-the-eviction-policy-was-the-wrong-layer.md
                 pf.interior_published += 1
                 if pf.interior_published == 1 or last:
                     self._publish_prefix(pf, pf.prefill_from, spill=last)
