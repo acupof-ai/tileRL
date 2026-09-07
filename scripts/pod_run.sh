@@ -31,8 +31,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/pod_session.sh
+. "$ROOT/scripts/pod_session.sh"
 POD_NAME="${POD_NAME:-sglang-test}"
-REMOTE_DIR="${REMOTE_DIR:-/work/tilerl}"
+# One tree per session; overridable because pod_run_selftest.sh points it at a tempdir.
+REMOTE_DIR="${REMOTE_DIR:-$(pod_session_tree "$ROOT")}"
 AUPAI="${AUPAI:-/work/aupai}"
 ORPHAN_MIB="${ORPHAN_MIB:-64}"
 # seconds to poll for the job's device fd: a 27B load takes minutes to open the card
@@ -59,6 +62,8 @@ pod_exec() {
 read -r -d '' RUNNER <<RUNNER_EOF || true
 set -uo pipefail
 cd $REMOTE_DIR
+# Before anything that can fail: a number is attributed to a sha or visibly \`unknown\`.
+echo "pod_run: tree $REMOTE_DIR sha \$(cat $REMOTE_DIR/.synced_commit 2>/dev/null || echo unknown)"
 [ -d /work/tl013 ] && export PATH=/work/tl013/bin:\$PATH
 export TILELANG_CACHE_DIR=/work/tilelang_cache
 export PYTHONPATH=$REMOTE_DIR/src:$REMOTE_DIR/packages/tilerl-kernels/src

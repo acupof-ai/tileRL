@@ -146,6 +146,15 @@ pid and retries only the device-fd refusal, releases from a trap, and refuses
 a card holding >64 MiB with no claim. After any kill, read `ps -o stat=`:
 `kill -0`, `/proc/<pid>` and `pgrep -f` all call a zombie alive.
 
+**One tree per session on the pod.** `REMOTE_DIR` defaults to
+`/work/tilerl-s-<session>` from this worktree's basename
+(`scripts/pod_session.sh`); `pod_sync.sh --session <name>` overrides it.
+`pod_run.sh`'s first log line is `pod_run: tree <dir> sha <stamp>`, so a number
+is attributed or visibly `unknown`. `bench-baseline.json` lives outside every
+tree at `/work/tilerl-baseline/` and is merged into, not written — why, and why
+the `s-`:
+[errors/2026-09-07-two-sessions-one-pod-tree.md](docs/experience/errors/2026-09-07-two-sessions-one-pod-tree.md).
+
 **Writing `bench-baseline.json`.** Append-mostly and shared, so serialize it
 with `json.dumps(d, indent=2, sort_keys=True)`. Any other form reindents the
 file and a one-row append becomes 196 insertions that every peer's edit then

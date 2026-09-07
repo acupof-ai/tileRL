@@ -9,13 +9,17 @@ stick with `SKIP_BASELINE_PULL=1 scripts/pod_sync.sh`.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 LOCAL = Path(__file__).resolve().parent.parent / "docs/experience/wins/bench-baseline.json"
-REMOTE = "/work/tilerl/docs/experience/wins/bench-baseline.json"
+#: Outside every session tree, which `pod_sync.sh` wipes; `LEGACY` seeds it once.
+BASELINE_DIR = os.environ.get("POD_BASELINE_DIR", "/work/tilerl-baseline")
+REMOTE = f"{BASELINE_DIR}/bench-baseline.json"
+LEGACY = "/work/tilerl/docs/experience/wins/bench-baseline.json"
 
 
 def _load(p: Path) -> dict:
@@ -49,14 +53,38 @@ def _local_is_newer(remote_commit: str | None, local_commit: str | None) -> bool
     ).returncode == 0
 
 
+def merge_into(path: Path, rows: dict) -> int:
+    """Merge `rows` into the baseline at `path`, higher tok/s wins. Returns rows raised.
+
+    Not a write: two sessions each hold a snapshot, so the second write drops the first's
+    rows. Strays pass through; `pull` is where one gets named.
+    """
+    have = _load(path)
+    raised = 0
+    for k, v in rows.items():
+        cur = have.get(k)
+        if cur is None or v.get("tok_s", 0) > cur.get("tok_s", 0):
+            have[k], raised = v, raised + 1
+    path.write_text(json.dumps(have, indent=2, sort_keys=True) + "\n")
+    return raised
+
+
 def pull() -> int:
     launcher = Path.home() / "bin/pod"
     try:
+        # `cp -n` never overwrites, so seeding is a no-op once the shared copy exists.
+        subprocess.run(
+            [str(launcher), f"mkdir -p {BASELINE_DIR} && "
+                            f"[ -s {REMOTE} ] || cp -n {LEGACY} {REMOTE} 2>/dev/null || true"],
+            capture_output=True, text=True,
+        )
         raw = subprocess.run([str(launcher), f"cat {REMOTE}"], capture_output=True, text=True)
     except OSError as e:  # ~/bin/pod is a symlink into another repo: absent when it moves
         print(f"pull: cannot run {launcher}: {e}", file=sys.stderr)
         return 1
     if raw.returncode != 0 or not raw.stdout.strip():
+        # The abort is the guard: pod_sync.sh has no `|| true`, so a missing snapshot
+        # stops the sync rather than letting the tarball overwrite the shared file.
         print("pull: no remote snapshot", raw.stderr.strip()[:200], file=sys.stderr)
         return 1
     remote, local = json.loads(raw.stdout), _load(LOCAL)
@@ -113,6 +141,7 @@ def _selfcheck() -> int:
         finally:
             LOCAL = was
     _check_strays()
+    _check_merge()
     print("selfcheck ok")
     return 0
 
@@ -133,6 +162,21 @@ def _check_strays() -> None:
     assert list(keep) == ["suite/shape/sm90"], keep
     assert skip == [("train/step/sm90", ["commit", "secs_per_step"])], skip
     assert _tok_s_only({}) == ({}, []), "empty stays empty"
+
+
+def _check_merge() -> None:
+    """The shared write MERGES: a plain write drops the row another session raised."""
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "bench-baseline.json"
+        p.write_text(json.dumps({"a/x/sm90": {"tok_s": 1.0}}) + "\n")
+        # session B never saw a/x: a write would delete it, a merge keeps it
+        assert merge_into(p, {"b/y/sm90": {"tok_s": 2.0}}) == 1
+        got = json.loads(p.read_text())
+        assert sorted(got) == ["a/x/sm90", "b/y/sm90"], got
+        assert merge_into(p, {"a/x/sm90": {"tok_s": 0.5}}) == 0, "a slower row must not win"
+        assert json.loads(p.read_text())["a/x/sm90"]["tok_s"] == 1.0
+        assert merge_into(p, {"a/x/sm90": {"tok_s": 3.0}}) == 1, "a faster row must raise"
+        assert json.loads(p.read_text())["a/x/sm90"]["tok_s"] == 3.0
 
 
 if __name__ == "__main__":
