@@ -473,6 +473,9 @@ class Engine:
         self._slots_used = 0
         self._prefix_hits = 0
         self._prefix_misses = 0
+        # Matched tokens, not just hit count: a hit that matches 512 of 30826 is a miss wearing a
+        # hit's label, and the count alone cannot tell the two apart (2026-09-08, #271's 2.03x).
+        self._prefix_hit_tokens = 0
         self._prefix_published = 0
         self._prefill_forwards = 0
         # R in the SSD break-even; the arch seed only covers the first decision
@@ -689,6 +692,7 @@ class Engine:
                 return False
         if matched:
             self._prefix_hits += 1
+            self._prefix_hit_tokens += matched
         else:
             self._prefix_misses += 1
         # Slot first, `blocks` empty: seeding it with hit_blocks made an alloc_slot() failure
@@ -841,6 +845,7 @@ class Engine:
                 "slots_total": self.usable_slots,
                 "prefix_hits": self._prefix_hits,
                 "prefix_misses": self._prefix_misses,
+                "prefix_hit_tokens": self._prefix_hit_tokens,
                 # both operands of the fetch-vs-recompute decision, for a live server
                 "prefill_rate": round(self.prefill_rate, 1),
                 "prefix_break_even_tokens": self._prefix.break_even_tokens(self.prefill_rate),

@@ -181,6 +181,98 @@ apart**. The block axis cannot distinguish publishers.
 A fifth hypothesis, that the eviction difference was an accounting shift into `superseded`, is
 refuted by the table: `superseded` is 36 in both cell357 arms and 46 in both of the others. Flat.
 
+## Resolved: 2.03x at one variable, and the mechanism is hit depth
+
+`169d7bd` (pre-fix) run at cell357's exact flags — same workload, same `--blocks 8192`, same
+`--state-bytes`, tier off — so the commit is the only variable and both numbers come from job logs
+rather than from an entry's prose:
+
+| | wall | mean TTFT | hits | published | evictions | pool peak |
+|---|---:|---:|---:|---:|---:|---:|
+| pre-fix 169d7bd | **198.32 s** | 5.14 s | **24/36** | 876 | 835 | 1999 |
+| post-fix a43a379 | **403.01 s** | 10.83 s | **35/36** | 144 | 103 | 3735 |
+
+**2.03x.** The pre-fix arm reproduces the 09-07 entry's 199.35 s to 0.5%, so that number was always
+sound. Provenance: the pod tree was stamped `169d7bd` before the run and read back from the job log;
+`compiles: clean` in both arms.
+
+**Why every counter here except one is unreadable.** The entry population is what the commit changed —
+876 published against 144 — so `evictions 835 vs 103`, `blocks_freed`, and every per-eviction yield
+carry the commit in numerator *and* denominator. Reaching for `evictions 835 vs 103` as the mechanism
+would have been the fifth withdrawn reading of this session.
+
+**The exception is `hits`, whose denominator is turns, and turns are 36 in both arms.** Post-fix hits
+**more often** (97% vs 67%) and is **twice as slow**. A fixed denominator makes that comparison sound,
+and it forces one conclusion: each hit serves far less. At this pool and budget the deep entry is often
+gone by the next turn, so the surviving match is the shallow one — and post-fix there is nothing
+between 512 tokens and the full prefix, where pre-fix's 61 nested entries meant a row that lost its
+deepest still had a near-deep one.
+
+So #271 raised the hit *rate* and collapsed the hit *depth*, and the net is 2x. Its accept grid
+counted token reuse at an unpressured capacity, where the deep entry never goes missing and the
+intermediate entries look redundant.
+
+**Fix direction: a bounded ladder** — a few spread publishes per row, keeping intermediate fallbacks
+without returning to 62. Publishing only the last boundary is the **worst** available option, since it
+removes the remaining fallback entirely. No revert: the flood was a real defect with a measured
+cascade.
+
+### The regression is entirely prefill, and the post-fix hit costs most of a miss
+
+`mean_ttft × 36` is 185.0 s of pre's 198.32 (93.3%) and 389.9 s of post's 403.01 (96.7%), so the
+deltas are **204.7 s wall against 204.8 s TTFT** — 0.15 s apart. The regression is time-to-first-token
+in full. Nothing in decode, sampling or the tier contributes measurably, which retires every
+mechanism that would have shown up as slower generation.
+
+Split each arm's TTFT into a hit bucket and a miss bucket. Pre has 12 misses, post has 1, turns are 36
+in both:
+
+```
+185.04 = 24·h_pre  + 12·m
+389.88 = 35·h_post +  1·m
+```
+
+Two equations, one free parameter — the mean miss TTFT `m`. Solve at the 09-07 entry's ~14.1 s full
+prefill: **h_pre = 0.66 s, h_post = 10.74 s**, against a miss of 14.1 s. The post-fix hit does **76% of
+a miss's work.**
+
+`m` barely matters, and that is the point:
+
+| assumed miss cost `m` | h_pre | h_post |
+|---:|---:|---:|
+| 5.0 s | 5.21 s | 11.00 s |
+| 10.0 s | 2.71 s | 10.85 s |
+| 14.1 s | 0.66 s | 10.74 s |
+| 15.42 s (ceiling: h_pre → 0) | 0.00 s | 10.70 s |
+
+`h_post` is **10.7–11.0 s across the whole admissible range**, because the post arm has one miss out of
+36 and `m` therefore carries 1/35 of the weight. So `h_post` is effectively measured, not inherited from
+another arm's number — the concern about borrowing 14.1 s applies to `h_pre` and to the ratio, not to
+the post-fix per-hit cost. And `h_post > h_pre` holds for **every** `m > 0`: the inequality reduces to
+`2880.7 > -396·m`.
+
+**A post-fix hit is a miss wearing a hit's label.** It matches, it reports a hit, and it re-prefills
+nearly everything — which is exactly why the hit *rate* rose while the wall clock doubled. Post-fix
+almost always finds the 512-token entry, so it almost never records a miss. Pre-fix's 12 real misses
+were cheaper in aggregate than post-fix's 35 nominal hits.
+
+That also corrects the mechanism as first stated. The claim was "the deep entry is never published"; it
+is published, and found — it is published and then **evicted**, and post-fix the only thing left below
+it is 512 tokens. Pre-fix's 61-entry chain meant the fallback after losing the deepest was still
+near-deep. The defect is neither the publish depth nor the eviction: it is that **first+last leaves no
+rung between 512 and the full prefix**, and every rung matters precisely because eviction is guaranteed
+at this shape. What #271 removed is graceful degradation.
+
+**Limits.** `h` and `m` are bucket averages over each arm's own turn population, and the populations
+differ — prompts grow (`--grow 10`), so pre's 12 miss turns are not post's 1. The split is a two-bucket
+model over measured totals, not an identity. And the depth claim is still inferred from time rather
+than measured: `bench_chat_interleaved.py` does not record matched tokens per hit. That is one field,
+it needs no card window, and it converts this from a model to a measurement — worth adding before the
+ladder is written.
+
+The earlier K-spaced refutation was measured in token-counted reuse on the CPU grid, which is the unit
+that cannot see any of this. It should be re-tested in TTFT.
+
 ## What remains open
 
 199.35 s (pre-fix) against 403.01 s (post-fix) **at the same 8192-block pool** is still a real

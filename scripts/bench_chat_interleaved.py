@@ -219,8 +219,9 @@ def main() -> int:
                 k: after.get(k, 0) - before.get(k, 0)
                 # a publisher retiring its own entry counts as superseded, not eviction,
                 # so an eviction delta alone cannot say whether pressure eased or moved.
-                for k in ("prefix_hits", "prefix_published", "prefix_evictions",
-                          "prefix_superseded", "dram_demotions", "dram_promotions")
+                for k in ("prefix_hits", "prefix_hit_tokens", "prefix_published",
+                          "prefix_evictions", "prefix_superseded",
+                          "dram_demotions", "dram_promotions")
             }
             n = out.get("usage", {}).get("prompt_tokens", 0)
             # Peak, not delta: a pool-bound cell is the TIER's case rather than a confound to
@@ -247,11 +248,15 @@ def main() -> int:
                          "wall_s": round(wall, 2), "ttft_s": round(ttft, 2),
                          "compiles": compiles, **pool, **resident, **d})
             pct = 100.0 * pool["pool_used_blocks"] / max(1, pool["blocks_total"])
+            # depth, not just hits: the count says a match happened, this says how much of the
+            # prompt it spared. 512 of 30826 reports a hit and re-prefills 98% (2026-09-08).
+            depth = 100.0 * d["prefix_hit_tokens"] / max(1, n) if d["prefix_hits"] else 0.0
             print(
                 f"turn {turn} conv {_label(c)}  prompt={n:6d}  wall={wall:8.2f}s  "
                 f"ttft={ttft:7.2f}s  compiles={compiles:2d}  pool={pct:5.1f}%  "
                 f"ent={resident['prefix_entries']}/{resident['prefix_entries_capacity']}  "
-                f"hits={d['prefix_hits']}  demote={d['dram_demotions']}  "
+                f"hits={d['prefix_hits']}  depth={depth:5.1f}%  "
+                f"demote={d['dram_demotions']}  "
                 f"promote={d['dram_promotions']}  evict={d['prefix_evictions']}  "
                 f"super={d['prefix_superseded']}",
                 flush=True,
@@ -282,10 +287,27 @@ def main() -> int:
     peak = max((r["pool_used_blocks"] for r in rows), default=0)
     tot = max((r["blocks_total"] for r in rows), default=0)
     print(f"pool peak: {peak}/{tot} blocks ({100.0 * peak / max(1, tot):.1f}%)", flush=True)
+    # Hit and miss TTFT as two measured buckets, plus the depth that explains them. Without
+    # these the hit rate and the wall clock are the only two numbers, and a rate that rises
+    # while the clock doubles has to be solved for depth instead of read (2026-09-08, #271).
+    hit_rows = [r for r in rows if r["prefix_hits"]]
+    miss_rows = [r for r in rows if not r["prefix_hits"]]
+    depth = {"hit_turns": len(hit_rows), "miss_turns": len(miss_rows),
+             "mean_hit_depth_pct": round(
+                 100.0 * sum(r["prefix_hit_tokens"] for r in hit_rows)
+                 / max(1, sum(r["prompt_tokens"] for r in hit_rows)), 1),
+             "mean_hit_ttft_s": round(
+                 sum(r["ttft_s"] for r in hit_rows) / max(1, len(hit_rows)), 2),
+             "mean_miss_ttft_s": round(
+                 sum(r["ttft_s"] for r in miss_rows) / max(1, len(miss_rows)), 2)}
+    print(f"hit depth: {depth['mean_hit_depth_pct']}% of prompt over {depth['hit_turns']} hit "
+          f"turns; ttft hit {depth['mean_hit_ttft_s']}s vs miss {depth['mean_miss_ttft_s']}s "
+          f"over {depth['miss_turns']} miss turns", flush=True)
     print(json.dumps({"sessions": args.sessions, "turns": args.turns, "rows": rows,
                       "per_session": per_session, "total_wall_s": total,
                       "turns_with_compiles": dirty, "compiles_known": known,
                       "pool_peak_blocks": peak, "blocks_total": tot,
+                      "hit_depth": depth,
                       "final_stats": st}, indent=2))
     return 0
 

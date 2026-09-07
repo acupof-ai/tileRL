@@ -318,6 +318,14 @@ def test_prefix_cache():
 
     assert 1 <= len(out_1) <= 8 and 1 <= len(out_2) <= 8
     assert engine.stats()["prefix_hits"] == 1 and engine.stats()["prefix_misses"] == 1
+    # The DEPTH, not just the count. A hit that matched 512 of 30826 tokens reported a hit and
+    # re-prefilled 98%, and the count could not tell it from a full-prefix hit -- that read as
+    # "#271 raised the hit rate" while the wall clock doubled (2026-09-08). `head` is one full
+    # block, so the only correct match is its 16 tokens; a per-hit counter would say 1.
+    assert engine.stats()["prefix_hit_tokens"] == len(head), (
+        f"prefix_hit_tokens {engine.stats()['prefix_hit_tokens']} != the {len(head)} matched "
+        "tokens; the counter is counting hits, not depth"
+    )
 
 
 def test_generated_prefix_matches_cold_path():
