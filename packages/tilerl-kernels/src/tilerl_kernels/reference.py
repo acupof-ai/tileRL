@@ -166,8 +166,8 @@ _BWD_SLICE_BYTES = 1 << 29
 def linear_frozen_bwd(grad, wq, scale, oscale=None, fp8=False):
     """dX through a frozen quantized weight (LoRA / OPD base), a slice at a
     time. ``oscale`` scales weight row n, so it folds into the [M, N] grad.
-    # ponytail: eager chunked dequant; no tilelang fp8 dequant kernel yet (fp4 has one).
-    # ponytail: eager path; the tilelang dequant kernel only exists for fp4
+
+    The parity oracle for both kernel arms, and the only path off sm90.
     """
     g = _f32(grad).reshape(-1, grad.shape[-1])
     if oscale is not None:

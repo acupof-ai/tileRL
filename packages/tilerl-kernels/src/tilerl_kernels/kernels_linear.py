@@ -1748,3 +1748,39 @@ def make_linear_fp4_bwd_mma(target: str, local_size: int = 8, block: int = 16):
         return C
 
     return linear_fp4_bwd
+
+
+def make_linear_fp8_bwd_mma(target: str, block: int = 128):
+    """gx = grad @ W for a frozen fp8 weight; the scale is per 128x128 tile, so it
+    applies to the accumulator, not to the operand as the fp4 twin's does."""
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs())
+    def linear_fp8_bwd(A, W8, WScale, block_M, block_N, threads):
+        M, N, K = T.const("M, N, K")
+        A: T.Tensor((M, N), "bfloat16")
+        W8: T.Tensor((N, K), "float8_e4m3fn")
+        WScale: T.Tensor((T.ceildiv(N, block), T.ceildiv(K, block)), "float32")
+        C = T.empty((M, K), "float32")
+        with T.Kernel(T.ceildiv(K, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block), "bfloat16")
+            W8_shared = T.alloc_shared((block, block_N), "float8_e4m3fn")
+            W_shared = T.alloc_shared((block, block_N), "bfloat16")
+            C_local = T.alloc_fragment((block_M, block_N), "float32")
+            C_accum = T.alloc_fragment((block_M, block_N), "float32")
+            T.clear(C_accum)
+            T.clear(C_local)
+            # stepping N by the scale block keeps scale_b one value for the whole gemm
+            for n in T.Pipelined(T.ceildiv(N, block), num_stages=3):
+                T.copy(A[by * block_M, n * block], A_shared)
+                T.copy(W8[n * block, bx * block_N], W8_shared)
+                for i, j in T.Parallel(block, block_N):
+                    W_shared[i, j] = W8_shared[i, j].astype("bfloat16")
+                scale_b = WScale[n, bx * block_N // block]
+                T.gemm(A_shared, W_shared, C_local)
+                for i, j in T.Parallel(block_M, block_N):
+                    C_accum[i, j] += C_local[i, j] * scale_b
+                T.clear(C_local)
+            T.copy(C_accum, C[by * block_M, bx * block_N])
+        return C
+
+    return linear_fp8_bwd

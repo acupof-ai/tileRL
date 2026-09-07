@@ -1,6 +1,6 @@
 # Porting the GDN backward to the upstream tilelang kernels — approach, not code
 
-Row 49. Written against the measured floor
+Written against the measured floor
 ([the floor probe's numbers](#the-numbers-this-rests-on)), so every claim below is either a
 measurement or is marked as unmeasured. No code, no PR.
 

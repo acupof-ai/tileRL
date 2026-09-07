@@ -10,7 +10,10 @@ tensor container. Everything above calls backend ops.
 | `kernels.py` | Portable floor. Every kernel here compiles on CPU, and CPU is always the floor target. Holds both gemm schedules: the CPU schedule and the naive FMA fallback (used by targets whose MMA lowering rejects global operands — metal, sm90 pre-MMA). The naive kernels are a permanent fallback, not a placeholder to delete. |
 | `kernels_mma.py` | SOTA copies from the tilelang ecosystem. Arch-specific lowering (sm90 today); a kernel here is allowed to not compile on CPU. Each function carries a provenance header (below). |
 | `reference.py` | torch-eager reference **and** the packed-format definitions (`pack_fp4` / `unpack_fp4`). Single source of the on-disk/in-kernel format — kernels decode it, never redefine it. |
-| `backend.py` | Registry only: `(precision, arch) → kernels dict`. No schedule logic. |
+| `kernels_linear.py` | Linear/GEMM family: the sm90 WGMMA schedules and the sm70 GEMV ladder. Arch-specific, like `kernels_mma.py`. |
+| `kernels_gdn.py` / `kernels_attn.py` | Gated-delta and attention families, same contract. |
+| `registry.py` | The registry: `(precision, arch) → kernels dict`, one `_register()` per cell. No schedule logic. |
+| `backend.py` | Dispatch: picks the cell's kernel for a call and supplies its tile parameters. |
 
 ## Registry rules
 
