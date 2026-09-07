@@ -6,6 +6,7 @@ from __future__ import annotations
 import tilelang
 import tilelang.language as T
 
+from .kernels import _pass_configs as _target_pass_configs
 from .kernels_mma import _pass_configs
 
 
@@ -315,7 +316,10 @@ def make_paged_attention_prefill_sm70(
     """
     accum = "float32"
 
-    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    # The target-aware one: this cell is registered for sm70 and compiled on the
+    # cpu target by the parity gate, and kernels_mma's waives the race check
+    # unconditionally, which is wrong for "c".
+    @tilelang.jit(target=target, pass_configs=_target_pass_configs(target))
     def paged_attention_prefill_sm70(
         Q, KCache, VCache, BlockTable, SeqLens, SeqQLens, scale: T.float32, block_size, threads
     ):
