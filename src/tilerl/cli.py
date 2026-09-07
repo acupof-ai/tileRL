@@ -648,8 +648,12 @@ def _train_adapters(args: argparse.Namespace) -> None:
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
                 f"tied {tied:.2f}  tok {ntok:.0f}  width {width}  {secs:.1f}s  "
                 f"rollout {timings['rollout_secs']:.3f}s  "
-                f"backward {timings['backward_secs']:.3f}s  "
-                f"optimizer {timings['optimizer_secs']:.6f}s", flush=True)
+                # .get: rl_step writes these, and a test or caller that substitutes it
+                # still gets a log line rather than a KeyError mid-run.
+                f"fwd {timings.get('forward_secs', 0.0):.3f}s  "
+                f"bwd {timings.get('backward_only_secs', 0.0):.3f}s  "
+                f"optimizer {timings['optimizer_secs']:.6f}s  "
+                f"other {timings.get('other_secs', 0.0):.3f}s", flush=True)
             if len(hist) >= 5 and not args.allow_short_rollouts:
                 mean = statistics.mean(h[4] for h in hist[-5:])
                 drift.update(value=mean, step=i + 1, skipped=False,

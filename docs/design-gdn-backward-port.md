@@ -8,7 +8,12 @@ measurement or is marked as unmeasured. No code, no PR.
 
 The four upstream kernels sum to **0.986 ms/call** at our shapes against our eager **20.3
 ms/call**. Priced on 384 calls that is 0.379 s against the GDN row's 7.799 s, so
-`backward_secs` 23.194 → 15.774 = **1.470x** on the step.
+`backward_secs` 23.194 → 15.774 = **1.470x** on that BUCKET — not on the step.
+The two were close enough to conflate when the bucket was 54% of the step; measured on
+2026-09-07 the bucket is **26.1%** of an 85.617 s step, so 1.470x on it saves 7.153 s and
+the step ceiling is **1.091x**
+([the split](experience/wins/2026-09-07-the-step-is-74-percent-rollout.md)). The port did not
+change; #229/#234/#240/#263 optimized the backward while this was being designed.
 
 That 1.470x is an **upper bound that will not be reached**, for three reasons that are already
 known and one that is not:
@@ -324,7 +329,8 @@ The rule: a verdict ladder needs a rung for *my own measurement being broken*, a
 | our GDN row | 7.799 s | `--inside-gdn`, instrumented — **upper bound** |
 | the instrument's own cost | 4.025 s | 27.264 instrumented − 23.239 bare, same run (arm 3) |
 | ratio | 20.6x | subset-vs-whole, see caveat 1 |
-| step ceiling | 1.470x | 23.194 → 15.774 s |
+| BUCKET ceiling | 1.470x | 23.194 → 15.774 s |
+| STEP ceiling | **1.091x** | 1.470x on a 22.372 s bucket of an 85.617 s step, 2026-09-07 |
 | upstream kernel vs its own f32 reference | 2.7e-2 | dh/dh0/dv2 only; two seeds, 2.57e-2 and 2.714e-2 |
 | f32-IO cell | does not compile | layout infer conflict at threads=256 (arm 1) |
 | our core adjoint vs fla's | 8.23e-3 | 6 grads, ratio 1.0 ±1.1%, chunk 64 (assertion 1) |

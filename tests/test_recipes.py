@@ -53,7 +53,20 @@ def test_recipe_runs_and_is_recorded(tmp_path, monkeypatch, capsys):
     metrics = saved["metrics"]
     phases = [metrics[k] for k in ("rollout_secs", "backward_secs", "optimizer_secs")]
     assert all(s > 0 for s in phases), metrics
-    assert abs(sum(phases) - metrics["secs_total"]) <= 0.2 * metrics["secs_total"], metrics
+    # The four published phases must reconstruct the step EXACTLY: other_secs is a
+    # derived remainder, so the identity is arithmetic, not a measurement. A percentage
+    # band would be looser than other_secs itself (0.054% of the tiny step) and would
+    # pass with the remainder zeroed -- measured; that is the mutant this arm exists for.
+    parts = phases + [metrics["other_secs"]]
+    assert abs(sum(parts) - metrics["secs_total"]) <= 1e-9 * metrics["steps_completed"], (
+        f"phases do not reconstruct the step: {sum(parts)} vs {metrics['secs_total']}",
+        metrics)
+    # forward_secs is carved out of backward_secs, so it must be a strict part of it,
+    # and backward_only_secs is what remains. A forward timed with no device sync
+    # reads ~0 on cuda and this is the arm that catches it.
+    assert 0 < metrics["forward_secs"] < metrics["backward_secs"], metrics
+    assert abs(metrics["forward_secs"] + metrics["backward_only_secs"]
+               - metrics["backward_secs"]) <= 1e-6, metrics
 
 
 def test_rl_refuses_a_data_file_with_no_rows(tmp_path, monkeypatch):

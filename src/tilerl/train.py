@@ -25,6 +25,13 @@ from .model import save_hf
 _MAX_TICKS = 10000
 
 
+def _sync(backend: Any) -> None:
+    """Wait for the device before reading a clock. A phase timed without this
+    bills its async kernels to whichever later phase happens to synchronize."""
+    if getattr(backend, "device", None) is not None and backend.device.type == "cuda":
+        torch.cuda.synchronize()
+
+
 def _drain(engine: Any, ids: list[int], what: str) -> dict[int, list[int]]:
     """Tick until every id has finished. Accumulates: poll() only returns the
     requests that finished on that tick, so a single assignment loses the rest."""
@@ -152,6 +159,7 @@ def _step(
         n, t = chunk.shape
         kv = _training_kv(model, n, t, device=backend.device)
         tape = Tape()
+        t_fwd = time.perf_counter()
         with torch.no_grad(), tape:
             # A vocab-parallel head keeps its shard here: the gathered row is
             # [B, T, vocab] f32 (1.89 GiB at B=8 T=256 on the 27B) and
@@ -160,6 +168,12 @@ def _step(
                                    RecordingBackend(backend),
                                    sharded_logits=getattr(backend, "tp_world", 1) > 1,
                                    segment="layer" if t > _MLP_SEGMENT_MAX_T else "mlp")
+        # Load-bearing: kernel launches are async, so without this the forward's
+        # GPU time is billed to whatever syncs first -- the backward.
+        _sync(backend)
+        if timings is not None:
+            timings["forward_secs"] = timings.get("forward_secs", 0.0) + (
+                time.perf_counter() - t_fwd)
         loss, grad_logits = grad_fn(logits, chunk, lo)
         if not math.isfinite(loss):
             return loss, {}
@@ -290,6 +304,7 @@ def rl_step(
     t0 = time.perf_counter()
     if timings is not None:
         timings["optimizer_secs"] = 0.0
+        timings["forward_secs"] = 0.0
     ids = np.asarray(input_ids, dtype=np.int64)
     b, t = ids.shape
     adv = torch.as_tensor(np.asarray(advantages, dtype=np.float32))
@@ -316,8 +331,14 @@ def rl_step(
 
     loss = _step(model, ids, backend, optimizer, trainable, grad_fn, micro, timings)
     if timings is not None:
-        # Includes the recorded forward, loss and gradient accumulation.
-        timings["backward_secs"] = time.perf_counter() - t0 - timings["optimizer_secs"]
+        _sync(backend)
+        elapsed = time.perf_counter() - t0
+        # backward_secs keeps its published meaning -- forward + loss + backward --
+        # because manifest["metrics"] readers sum it with rollout and optimizer to
+        # reconstruct the step. backward_only_secs is the new, narrower number.
+        timings["backward_secs"] = elapsed - timings["optimizer_secs"]
+        timings["backward_only_secs"] = (
+            timings["backward_secs"] - timings["forward_secs"])
     return loss
 
 
@@ -422,7 +443,7 @@ def grpo_loop(
             for g in range(group)
         ]
         done = _drain(engine, ids, "grpo_loop rollout")
-        timings = {"rollout_secs": time.perf_counter() - t0}
+        timings = {"rollout_secs": time.perf_counter() - t0, "invalidate_secs": 0.0}
         comps = [done[i] for i in ids]
         rewards = [float(reward_fn(prompt, c)) for c in comps]
         # A binary reward stops producing gradient once the policy clears the task.
@@ -469,10 +490,19 @@ def grpo_loop(
             # After the update, not before the next rollout: a caller that stops
             # iterating must not leave the engine holding graphs traced on weights
             # that no longer exist.
+            t_inval = time.perf_counter()
             engine.invalidate_weights()
+            timings["invalidate_secs"] = time.perf_counter() - t_inval
         # `gen` is the padded width and the mean is the real one: run 2 could not tell
         # "a long tail" from "every completion at the cap" without both.
-        yield (float(np.mean(rewards)), ce, time.perf_counter() - t0, tied,
+        secs = time.perf_counter() - t0
+        # The remainder: reward_fn, tiebreak, advantages, the batch stack. Derived, and
+        # with .get because rl_step is the only writer of its keys -- a caller that
+        # substitutes it must still get a step time, not a KeyError.
+        timings["other_secs"] = secs - sum(
+            timings.get(k, 0.0)
+            for k in ("rollout_secs", "backward_secs", "optimizer_secs"))
+        yield (float(np.mean(rewards)), ce, secs, tied,
                float(np.mean([len(c) for c in comps])), timings, gen)
 
 
