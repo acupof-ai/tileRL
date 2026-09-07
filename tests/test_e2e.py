@@ -3329,11 +3329,16 @@ def test_a_ragged_prompt_spills_a_prompt_only_entry(tmp_path, extra, back_off):
     spilled = sorted(glob.glob(str(tmp_path / "tilerl_kvtier" / "*.kv")))
     assert spilled, f"a {plen}-token prompt spilled nothing at all"
     lengths = sorted(len(torch.load(f, map_location="cpu")["tokens"]) for f in spilled)
-    assert engine.stats()["ssd_offered"] == 1, (
-        f"{engine.stats()['ssd_offered']} offers for one ragged prompt: the cut must add a "
-        "publish POINT, not a second write-through -- each offer is a D2H inside a prefill"
-    )
     assert aligned in lengths, (
         f"spilled {lengths}, none of them the prompt-only entry at {aligned}. The only "
         f"disk entry is prompt+reply, which a replayed turn 2 cannot reproduce"
+    )
+    # The cut adds a publish POINT, not a write-through per boundary: every boundary but
+    # the last is `spill=False`, so nothing SHORTER than the last one reaches disk. Not
+    # `ssd_offered == 1` -- this prompt generates 4 tokens and never crosses a decode
+    # boundary, so a count assertion reads as "one offer per request" where the card
+    # measures 2 (prompt boundary + decode boundary).
+    assert not [n for n in lengths if n < aligned], (
+        f"spilled {lengths}: everything below {aligned} is a mid-prefill boundary the "
+        f"last one supersedes, and each write is a D2H of the whole prefix"
     )
