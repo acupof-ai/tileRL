@@ -566,3 +566,98 @@ def test_a_failed_admission_returns_every_refcount_it_took():
     # And every block it allocated before the failure went back, not just the retained ones.
     assert engine._kv.free_blocks == 64 - sum(1 for n in before.values() if n > 0), (
         f"blocks leaked by the unwind: {engine._kv.free_blocks} free")
+
+
+def test_every_key_the_store_publishes_reaches_health_or_is_named_as_dropped():
+    """`_build_stats` forwards a hand-picked subset, so a new store counter vanishes silently.
+
+    This is asserted by ROUTE, not by name. A name test passes for the wrong reason on
+    `hits`/`misses`: `/health` carries `prefix_hits`, but it comes from the engine's own
+    `_prefix_hits` (`engine.py:652`, counted per admission), not from the store's counter of
+    the same name -- so "the key exists" is true while the store's value goes nowhere.
+    """
+    from tilerl.config import tiny
+    from tilerl.engine import _STORE_STATS_INTERNAL, build_engine
+    from tilerl.kv_cache import PrefixStore
+    from tilerl.model import build_random
+    from tilerl.testing import RefBackend
+
+    cfg = tiny(max_position_embeddings=512)
+    engine = build_engine(cfg, build_random(cfg, seed=3), RefBackend(), num_blocks=16,
+                          num_slots=2, max_batch=1, max_total_tokens=512)
+    assert isinstance(engine._prefix, PrefixStore), "needs a real store, not the null one"
+
+    # Every counter is 0 on a fresh engine, and equal zeros cannot tell a forwarded value from
+    # a hardcoded one -- the value check below would pass against `"prefix_entries": 0`. So
+    # make the store non-trivial first, and assert it is.
+    toks = list(range(1, 33))
+    blks = [engine._kv.alloc_block() for _ in range(PagedKvPool.blocks_for_tokens(len(toks)))]
+    assert engine._prefix.insert(toks, blks, None), "fixture: insert refused"
+    for b in blks:
+        engine._kv.free_block(b)
+    engine._prefix.lookup(toks)                 # moves the store's own hits
+    engine._prefix.clear()                      # moves evictions and blocks_freed
+    st = engine._prefix.stats()
+    assert st["evictions"] and st["blocks_freed"] and st["hits"], (
+        f"fixture left the counters at zero, so the value check cannot discriminate: {st}")
+
+    published = set(engine._prefix.stats())
+    health = engine.stats()
+    # Routing is checked by VALUE, not by name, and the reason is `hits`: `prefix_hits` is in
+    # /health but carries the ENGINE's counter, so `f"prefix_{k}" in health` is true for a
+    # store key nothing forwards. A name check cannot tell those apart -- and it also cannot
+    # tell a forwarded key from a hardcoded zero.
+    store_vals = engine._prefix.stats()
+    unrouted = []
+    for k in sorted(published):
+        if k in _STORE_STATS_INTERNAL or k.startswith(("dram_", "ssd_")):
+            continue
+        wire = f"prefix_{k}"
+        if wire not in health or health[wire] != store_vals[k]:
+            unrouted.append(f"{k}={store_vals[k]} vs {wire}={health.get(wire, '<absent>')}")
+    assert not unrouted, (
+        f"the store publishes {unrouted} and /health does not carry the value; add a "
+        "prefix_<k> entry in _build_stats or name the key in _STORE_STATS_INTERNAL")
+
+    # The drop list may not name a key the store does not publish: a stale entry there would
+    # silence a future key that happens to reuse the name.
+    stale = sorted(set(_STORE_STATS_INTERNAL) - published)
+    assert not stale, f"_STORE_STATS_INTERNAL names keys the store does not publish: {stale}"
+
+
+def test_blocks_freed_moves_on_the_wire_when_the_store_frees_a_block():
+    """The mutation arm: a name check cannot tell a forwarded key from a hardcoded zero.
+
+    Drives a real eviction through `_drop` and asserts `/health`'s value moves with the
+    store's. Without the forwarding line this fails on the KeyError, which is the state the
+    #221 merge shipped.
+    """
+    from tilerl.config import tiny
+    from tilerl.engine import build_engine
+    from tilerl.model import build_random
+    from tilerl.testing import RefBackend
+
+    cfg = tiny(max_position_embeddings=512)
+    engine = build_engine(cfg, build_random(cfg, seed=5), RefBackend(), num_blocks=16,
+                          num_slots=2, max_batch=1, max_total_tokens=512)
+    store = engine._prefix
+    tokens = list(range(1, 65))
+    blocks = [engine._kv.alloc_block()
+              for _ in range(PagedKvPool.blocks_for_tokens(len(tokens)))]
+    assert store.insert(tokens, blocks, None), "fixture: insert refused"
+    for b in blocks:                       # hand the store sole ownership
+        engine._kv.free_block(b)
+
+    # .get, not [...]: a missing key is the defect under test, and it must be REPORTED as
+    # "not on the wire" rather than raising a KeyError that reads as a broken test.
+    health = engine.stats()
+    assert "prefix_blocks_freed" in health, (
+        "prefix_blocks_freed is not on the wire; _build_stats is not forwarding it")
+    before = health["prefix_blocks_freed"]
+    assert before == store.stats()["blocks_freed"], "the wire disagrees with the store"
+    store.clear()                          # goes through _drop, which measures the free list
+    after_store = store.stats()["blocks_freed"]
+    assert after_store > before, f"fixture freed nothing: {before} -> {after_store}"
+    assert engine.stats().get("prefix_blocks_freed") == after_store, (
+        f"/health says {engine.stats().get('prefix_blocks_freed')}, store says {after_store}: "
+        "the counter is not reaching the wire")

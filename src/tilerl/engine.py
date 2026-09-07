@@ -69,6 +69,18 @@ _PHASE_DONE = 3
 
 _HASH_MASK = 0x7FFFFFFF
 
+#: Store stats deliberately NOT on the wire, with the reason each one stays internal. The
+#: seam gate in test_kv.py forbids any other unforwarded key, so a new counter fails loudly
+#: instead of vanishing into `_build_stats`'s hand-picked subset.
+#:
+#: `hits`/`misses`: the store counts LOOKUPS, and since #221 `_match_prefix` runs once per
+#: admission attempt, so a request that waits inflates them. `/health`'s `prefix_hits` is the
+#: engine's own counter and counts ADMISSIONS, which is what "a request hit the prefix" means
+#: to a reader. Exposing both under different names would ship two counters for one concept;
+#: the store's stay internal because they have four in-tree readers, one of them the
+#: `kv-reuse` bench cell whose recorded values are that definition.
+_STORE_STATS_INTERNAL = ("hits", "misses")
+
 
 def _quantize_draft(params: dict[str, torch.Tensor], skip: tuple[str, ...] = (),
                     fp4: bool = False) -> dict[str, torch.Tensor]:
@@ -783,6 +795,14 @@ class Engine:
                 # only recover entries that were actually evicted, and at 144 MiB a 27B
                 # snapshot the sm70 budget (free/4 = 1417 MiB) holds 9 of them.
                 "prefix_evictions": store["evictions"],
+                # Beside evictions because an eviction that frees nothing still counts one:
+                # `free_block` is a refcount decrement, so a live retain makes the pair the
+                # only way to tell a reclaiming store from a stuck one.
+                "prefix_blocks_freed": store.get("blocks_freed", 0),
+                # The fill and the ceiling: without both, a reader cannot tell store pressure
+                # from block pressure.
+                "prefix_entries": store.get("entries", 0),
+                "prefix_capacity": store.get("capacity", 0),
                 "prefix_state_bytes": store["state_bytes"],
                 "prefix_state_bytes_budget": store.get("state_bytes_budget", 0),
                 # Present only with a host tier; a demotion is a prefix the card could not
