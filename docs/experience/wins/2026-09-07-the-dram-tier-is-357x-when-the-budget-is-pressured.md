@@ -82,6 +82,22 @@ This reproduces the serve-path finding
 at a different budget and with the mechanism now attributed to `ssd_save_ms`
 rather than inferred from wall clock.
 
+## Pending: the publisher this was measured against has changed
+
+The 3.57x was measured against a publisher emitting **62 entries per 31k-token miss**, and this
+entry's own mechanism paragraph says the tier does not stop that flood — it gives the flood
+somewhere to go. That publisher is fixed as of
+[wins/2026-09-08-cut-the-prefill-publish-flood.md](2026-09-08-cut-the-prefill-publish-flood.md):
+2 publishes per row at any prompt length. **So 3.57x is provisional** until the same cell runs on
+the fixed publisher, and this section is the flag rather than a revision — a token-count probe on
+CPU cannot rewrite a wall-clock verdict, and the card cell is scoped and pending.
+
+One structural fact from that probe does land here, because it is not a speed claim: **the tier is
+inert below a 4-snapshot budget.** At `--dram-bytes` worth 3 snapshots it demoted nothing and
+changed no cell of a 9-cell grid, under both the flooding and the fixed publisher. It is
+all-or-nothing at these sizes, so a budget that cannot hold ~4 snapshots is not worth wiring at
+all.
+
 ## Deployment: the default does not flip
 
 **The mechanism verdict and the deployment verdict rest on different evidence and
@@ -109,6 +125,15 @@ The 144 MiB is the bf16 snapshot size; this checkpoint's is 149.6 MiB. Two error
 that happened to compose into a plausible 9. The V100 grid is a measurement to
 run, not arithmetic to publish, and there the tier is HBM→SSD with no host layer
 (`kv_cache.py:390-396`) — the arm this entry shows to be the worst of the three.
+
+**A block costs 1.0 MiB here and 2.0 MiB there, and the difference is the dtype.**
+`PagedKvPool` allocates `k_pool` and `v_pool` as two tensors of
+`[planes, blocks, heads, 16, head_dim]`, and the engine passes `Backend.io`:
+`backend.py:359` is `float32 if arch in ("cpu", "metal", "sm70") else bfloat16`. So one
+block is 1.0 MiB for K+V at bf16 on this H20 and **2.0 MiB at f32 on the V100**, both
+measured on a real pool at the 27B's shape. The 12x31k agent shape therefore needs
+24 GiB of blocks on the H20 and **48 GiB on the V100** — which is why it does not fit a
+32 GB card, and why a byte-size claim about this pool is wrong without its dtype.
 
 ## Rule
 

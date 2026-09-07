@@ -212,6 +212,9 @@ class _Req:
     fetch_deadline: float = 0.0
     #: this row's live decode-boundary entry length, retired when the next lands; 0 = none.
     decode_entry: int = 0
+    #: interior prefill boundaries this row has already published. Only the first and the last
+    #: land, so a row's publishes stay at 2 whatever the prompt length -- see `_finish_prefills`.
+    interior_published: int = 0
     output: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     thought_closed: bool = False  # the reasoning block ended (model's or forced)
@@ -1035,7 +1038,18 @@ class Engine:
                 # Only the last boundary reaches disk; ask `_pick` where it is, since a
                 # remaining-length test misreads the backed-off 17-token tail.
                 last = pf.prefill_from == _last_prefill_boundary(len(pf.tokens))
-                self._publish_prefix(pf, pf.prefill_from, spill=last)
+                # The FIRST interior boundary and the last, never the ones between: a row's
+                # publishes stay at 2 whatever the prompt length, where per-boundary publishing
+                # emitted 62 at a 31k prompt and outran any budget a pressured card has. Costs a
+                # PARTIAL sharer the intermediate prefixes it would have matched, and that cost
+                # GROWS with prompt length: this boundary is one chunk in, wherever the prompt
+                # ends, so a long prompt's sharer matches an absolute cap. 83.3% of ideal reuse at
+                # 2048 tokens, 12.5% at 16384. K evenly spaced publishes fixes the axis and gives
+                # back the whole cross-session gain (grid 81408, pure LRU's baseline).
+                # errors/2026-09-08-the-eviction-policy-was-the-wrong-layer.md
+                pf.interior_published += 1
+                if pf.interior_published == 1 or last:
+                    self._publish_prefix(pf, pf.prefill_from, spill=last)
         if not done:
             return
         self._sample_commit(done)
