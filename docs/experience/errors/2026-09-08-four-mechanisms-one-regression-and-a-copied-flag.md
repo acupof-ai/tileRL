@@ -100,22 +100,44 @@ What the cells do show is a flat per-eviction yield:
 robust observation, and it most likely reflects **nesting geometry fixed by the publisher** rather
 than anything about pool pressure.
 
-**And the yield reads against the store-shared explanation.** Under first+last a row has two nested
-entries, 32 and 1926 blocks, so dropping the deep entry while its shallow sibling lives should free
-1926 − 32 = **1894**. The measured yield is **~485**. `_drop` frees by refcount decrement, so a block
-with any other holder contributes zero — meaning ~1409 blocks per eviction were held by something
-that is *not* the sibling and not the store. A live slot is the remaining candidate: the sessions are
-still resident. Which is a capacity story for the block pool at cell357's shape, and one that
-`pub271off` does not contradict, since that arm's 139 evictions are byte-path with the block path
-never firing.
+**The yield settles nothing about who holds the blocks.** Three readings of this one number were
+proposed and all three withdrawn, and the reason is instructive: the number never changed, only the
+population we each thought we were averaging over.
 
-Two regimes, then: cell357 block-path evictions with live rows holding most of the blocks, and
-pub271 byte-path evictions at 8.8% occupancy where capacity is not in play at all. An earlier draft
-of this entry read the same 485 as proving store-only holds dominated — the number was right and the
-denominator was the row's total rather than the evicted entry's outside-held share.
+1. *Store-only holds dominate* — because 485 is a large fraction of a row. Withdrawn: `_drop` frees by
+   refcount decrement, so 485 of 1926 means 74.8% did **not** come back.
+2. *So an outside holder retains that 74.8%, i.e. a live slot* — because under first+last a row's
+   family is `{32, 1926}`, and dropping the deep entry while the shallow sibling lives should free
+   1894, not 485. Withdrawn: the premise is wrong. cell357 published **144** entries over 36
+   session-turns = **4.0 per session-turn**, not 2 — first+last contributes 2 and the rest are
+   decode-boundary publishes (`engine.py:1355-1358`), with `retire` dropping only the immediately
+   previous one (`superseded 36` = one per session-turn). So a family is a nested chain of ~3 live
+   entries, not a pair.
+3. *Therefore the eviction mix explains it* — LRU evicts across all entries, and a family's shallower
+   members free ≈0 while a deeper member lives:
 
-The line that would settle it is neither of the above: at the eviction, count the entry's blocks
-where `refcount[b] > n`. Not logged, so the split stands unmeasured.
+   | share of evictions that drop the family's deepest member | expected yield |
+   |---:|---:|
+   | 100% | 1894 |
+   | 50% | 947 |
+   | **26%** | **492** (measured 485) |
+
+   No outside holder is required. But this is *consistent with* the data, not shown by it: a mix with
+   no live holder and uniform deep drops with a live holder on 75% produce the same average.
+
+So the yield average cannot discriminate, and the flatness has a deflationary reading too — if the
+eviction mix follows the publisher's family geometry, and the publisher is identical in all four arms,
+~25% is expected regardless of pool or pressure path. That makes 452/485/502 an artifact of the
+publisher rather than an invariant across eviction regimes.
+
+The line that would settle it: per eviction, the count of the entry's blocks where `refcount[b] > n`
+for the store's own hold count `n`, **logged with the entry's token length** — the length separates
+last-of-family drops from shallow ones, which the refcount count alone cannot. Not logged; the split
+stands unmeasured.
+
+`pub271off` remains decisive for the one thing it was used for: 139 evictions at **8.8%** pool
+occupancy cannot be capacity, and those are byte-path evictions with the block path never firing. That
+does not depend on the yield.
 
 **So the pool size is the threshold, not the cause, and `cell357on` is net negative against
 `cell357off`**: worse block occupancy, zero promotions, real demotion cost — caused by the tier working
