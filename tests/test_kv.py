@@ -757,3 +757,35 @@ def test_blocks_freed_moves_on_the_wire_when_the_store_frees_a_block():
     assert engine.stats().get("prefix_blocks_freed") == after_store, (
         f"/health says {engine.stats().get('prefix_blocks_freed')}, store says {after_store}: "
         "the counter is not reaching the wire")
+
+
+@pytest.mark.parametrize("n", [65, 129, 513, 1025])
+def test_last_prefill_boundary_is_a_real_chunk_end(n):
+    """`_last_prefill_boundary(n)` must name a position `_pick` actually ends a chunk at.
+
+    When it does not, `last` never fires (engine.py:1045) and NOTHING from that prompt is
+    offered to the disk tier -- no error, no counter, the spill just does not happen. These
+    four lengths did exactly that: at n=65 the 64-alignment lands on 64, so the 1-token tail
+    is a chunk of its own, `short` computes to 0, and the tail back-off cannot run.
+    """
+    from tilerl.config import tiny
+    from tilerl.engine import SamplingParams, _last_prefill_boundary, build_engine
+    from tilerl.model import build_random
+    from tilerl.testing import RefBackend
+
+    cfg = tiny(max_position_embeddings=4096)
+    engine = build_engine(cfg, build_random(cfg, seed=5), RefBackend(), num_blocks=512,
+                          num_slots=2, max_batch=1, max_total_tokens=4096)
+    engine.submit(list(range(n)), SamplingParams(max_new_tokens=1, seed=0))
+    ends, at = [], 0
+    while at < n:                          # drive the planner, the only source of chunk ends
+        _, prefills, chunks = engine._build_plan()
+        assert prefills, f"planner stalled at {at} of {n}"
+        assert chunks[0] > 1, f"1-token chunk at {at}: reaches the kernels with 0 blocks"
+        at += chunks[0]
+        ends.append(at)
+        prefills[0].prefill_from = at      # advance without running a forward
+    lb = _last_prefill_boundary(n)
+    assert lb in ends, (
+        f"n={n}: _last_prefill_boundary says {lb}, but _pick ends chunks at {ends[-4:]} -- "
+        "`last` never fires and nothing reaches the disk tier")
