@@ -82,6 +82,34 @@ This reproduces the serve-path finding
 at a different budget and with the mechanism now attributed to `ssd_save_ms`
 rather than inferred from wall clock.
 
+## Scope: the win is conditional on the tier's block retention, and this entry does not say so
+
+Added 2026-09-08. Demotion frees snapshot bytes and **keeps the entry**, which keeps its blocks alive.
+So enabling the tier moves the same pressure from the byte axis to the block axis, and above a
+workload-dependent pool ceiling that is a worse place for it to be. Measured at this cell's own
+parameters on a later commit, tier off against tier on, same pool and same workload:
+
+| | pool peak | evictions | demotions | promotions |
+|---|---:|---:|---:|---:|
+| tier off | **45.6%** | 103 | 0 | 0 |
+| tier on | **99.1%** | 86 | 103 | **0** |
+
+Enabling the tier raised peak block occupancy from 45.6% to 99.1%. At 99.1% the block path fires, and
+that path — `evict_until_free` (`kv_cache.py:1330`), called from `engine.py:682` and `:950` — is the one
+eviction path with **no demote branch**: it goes straight to `_evict_one` → `_drop` → `_dram.forget`. A
+promotion needs the entry still in the index (`:1252`), so every orphaned host copy is unreachable.
+Result: **103 demotions, 1864 ms of `dram_demote_ms`, 0 promotions**, with 5.9 GiB of tier budget
+unused — net negative against tier-off.
+
+The asymmetry is not a bug to fix in the block path: at `:684` the caller needs blocks *now* and
+demotion frees zero blocks. Demotion is a byte-axis tool.
+
+**So 3.57x holds only where the tier's block retention stays under the pool ceiling, and this entry
+states the win unconditionally.** The `--blocks 8192` in the Context above is doing load-bearing work
+that the text does not acknowledge. Whether the 3.57x itself reproduces is separately open — see the
+Pending section below and
+[errors/2026-09-08-four-mechanisms-one-regression-and-a-copied-flag.md](../errors/2026-09-08-four-mechanisms-one-regression-and-a-copied-flag.md).
+
 ## Pending: the publisher this was measured against has changed
 
 The 3.57x was measured against a publisher emitting **62 entries per 31k-token miss**, and this
