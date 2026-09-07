@@ -58,19 +58,23 @@ entries, none numbered; `b192` is a 0.2B dense run in the separate `/work/aupai`
 The 27B recipe to use is `grpo-gsm8k-27b` (`recipes.py:19-23`), at prompt 256 / gen 1024
 / group 8 / LoRA-16 / micro 1.
 
-## The blocker nobody has hit yet: every rank would bind device 0
+## The blocker, fixed in #266
 
-`LOCAL_RANK` is read **nowhere** in `src/` or `packages/`, and `torch.cuda.set_device`
-is called only in `scripts/nccl_probe.py:17` and `scripts/bench_tp.py:59` — never in
-framework code. `Backend.__init__` binds `torch.cuda.current_device()`
-(`backend.py:328`), which is device 0 for every rank unless the launcher sets
-`CUDA_VISIBLE_DEVICES` per rank. A `torchrun --nproc_per_node=2` of the training path
-today puts both ranks on card 0.
+`LOCAL_RANK` was read **nowhere** in `src/` or `packages/`, and `torch.cuda.set_device`
+only in `scripts/nccl_probe.py:17` and `scripts/bench_tp.py:59` — never in framework
+code. `Backend.__init__` bound `torch.cuda.current_device()`, which is device 0 for every
+rank unless the launcher sets `CUDA_VISIBLE_DEVICES` per rank, so a
+`torchrun --nproc_per_node=2` of the training path put both ranks on card 0. NCCL states
+it itself: `Duplicate GPU detected : rank 1 and rank 0 both on CUDA device`.
+
+Fixed at `backend.py:330` — `LOCAL_RANK` is read and `torch.cuda.set_device` called when
+it is in range, before `self.device` is bound.
 
 This also decides the nccl-vs-gloo selection, which is one line —
 `comm = "nccl" if self.device.type == "cuda" else "gloo"` (`backend.py:177`) — and it
-reads `self.device`, bound before `init_tp` runs. So the device fix is a prerequisite
+reads `self.device`, bound before `init_tp` runs. So the device fix was a prerequisite
 for the backend selection being meaningful, not a separate task.
+
 
 ## What is actually missing
 
@@ -82,11 +86,12 @@ Read off the tree, not inferred:
 | `--tp` flag, mesh, group construction | shipped — `cli.py:1108`, `_shard` at `cli.py:77-108` |
 | sharded CE, TP-global clip, dp mean, Adafactor shard reduce | shipped, each with its own gate and error entry |
 | gloo/CPU world=2 equality gate | shipped and running in CI |
-| **any NCCL code path** | absent — `backend.init_tp` takes whatever `_shard` built; nothing selects nccl vs gloo by device |
+| **the nccl-vs-gloo selection** | shipped at `backend.py:177`, and gated since #266 — `tests/tp_backend_world2.py` asserts the comm matches the device at world=2, which `tests/tp_world2.py` cannot (`RefBackend` hardcodes gloo) |
 | **gradient bucketing** | absent |
 | **compute/comms overlap** | absent |
 | **27B TP config** | absent — no recipe sets `tp>1` |
-| **any test on >1 CUDA device** | absent — the nine gates are all `TILERL_TARGET=cpu`, gloo |
+| **any test on >1 CUDA device** | ten gates run in CI, all `TILERL_TARGET=cpu`/gloo; `tp_backend_world2.py` carries a cuda-only device-index arm that skips below two visible cards and **passed on 0+6 on 2026-09-07** |
+
 
 The gap is narrower than "nothing beyond gloo/CPU". The correctness half is done and
 gated. What is missing is one NCCL run and the numbers.
@@ -109,25 +114,43 @@ so the lever is call count, not message size.
 Do this before any training arm. It is the only step whose output changes decisions
 already made.
 
-**Step 2 — the tiny-model world=2 step over NCCL.** `tests/tp_world2.py`'s own body,
-against `nccl` instead of `gloo`, on cards 0+1. This is the first thing that has ever
-run our collectives on a GPU. Expected failure modes worth naming in advance: gloo
-accepts CPU tensors and nccl does not, so anything that reduces a host-side scalar
-(the clip norm, the loss) surfaces here; and a rank that skips a `new_group` deadlocks
-on first use rather than raising (`cli.py:99`) — on gloo that is a hang, on nccl it is
-a hang plus a watchdog abort.
+**Step 2 — the tiny-model world=2 step over NCCL, DONE.** Not `tests/tp_world2.py`'s body
+as planned: that file drives `RefBackend`, which hardcodes gloo, so it cannot assert the
+comm selection at all. `tests/tp_backend_world2.py` was written against the production
+`Backend` instead, and passed on cards 0+6 at `8e60de3`:
 
-**Step 3 — the 27B TP=2 arm, and its own single-card control in the same session.**
-`grpo-gsm8k-27b` at `group=8, micro=1, lora_rank=16, lr=1e-4`, identical seed and data
-on both arms, `backward_secs` and step time from `prof_backward_ops.py`.
+```
+production Backend world=2 on cuda/nccl: all_reduce [3.0], tp_fork bwd [3.0, 3.0],
+sharded CE loss 2.161235 vs unsharded 2.161235
+```
 
-## The profiler needs one change before it can see any of this
+Of the two failure modes named in advance, the first happened — to the test rather than
+to framework code. The gate's own probes were host tensors, and nccl raised
+`No backend type associated with device type cpu`; every probe now builds on
+`backend.device`. The `new_group` deadlock did not occur.
 
-`scripts/prof_backward_ops.py:517` calls `_build_model(a.model, seed=0, keep_master=False)`
+**Step 3 — the 27B TP=2 arm, and its own single-card control in the same session, DONE.**
+`grpo-gsm8k-27b` at `group=8, micro=1, lora_rank=16`, identical seed and data on both
+arms. `scripts/tp_step_arms.py` runs all four arms (tp=1 and tp=2, each instrumented and
+bare) in one session against one content sha, and refuses when the TP arm times zero
+collectives.
+
+**TP=2 is 0.95x the single-card step** — 10.038 s against 10.596 s, per-card peak 43.97 →
+25.46 GiB. Collectives are 5.95% of the step as an upper bound, and both of the obvious
+readings of that number are wrong: `all_reduce`'s backward communicates nothing, so 99%
+of it is `tp_fork`; and the two ranks differ 3x on `tp_fork`, so part of the figure is
+rank skew absorbed by the collective. Bucketing and overlap are not scheduled off this.
+Details, including the 456 s first-step JIT, in
+[the entry](experience/wins/2026-09-07-tp2-on-two-cards.md).
+
+## The profiler needed one change before it could see any of this — DONE in #264
+
+`scripts/prof_backward_ops.py:517` called `_build_model(a.model, seed=0, keep_master=False)`
 with no `tp=`, and `_shard` returns early at `tp <= 1` (`cli.py:86`). Run it under
 torchrun as-is and you get two processes each doing an identical unsharded step with no
-collective at all — a green run that measures nothing. Thread `tp` and `backend`
-through and add a `--tp` flag.
+collective at all — a green run that measures nothing. `tp` and `backend` are now
+threaded through, behind a `--tp` flag, and `tp_step_arms.py` refuses the whole
+comparison when the TP arm times zero collectives.
 
 Two things it still will not see, which the entry must state rather than leave as a
 silent zero:
@@ -167,12 +190,12 @@ shape (N independent one-card jobs, no rendezvous, no claim) and should not be b
 it. Precedent for the launch itself is `/work/nccl6b.sh`: `CUDA_VISIBLE_DEVICES` plus
 `torchrun --master_port=<free>`.
 
-**Cards 0 and 1 are NVLink, not PCIe** — `nvidia-smi topo -m` reports `NV18` for every
-pair on this box, and 0+1 are both NUMA node 0. Expect NVLink bandwidth.
+**Every pair on this box is NVLink, not PCIe** — `nvidia-smi topo -m` reports `NV18` for
+every GPU pair. Cards 0+1 share NUMA node 0; **the pair actually used is 0+6, which
+straddles NUMA nodes** (CPU affinity 0-89 / node 0 against 90-179 / node 1). The
+GPU-to-GPU path is NV18 either way, so the NUMA split affects host-side staging, not the
+collective. Cards 1-5 and 7 are aupai's by the 09-05 ruling; 0 and 6 are tileRL's.
 
-Current occupancy: card 1 idle, card 0 draining (73.9 → 8.8 GiB over this session) and
-**currently an unclaimed orphan**, which `pod_run.sh:76` will refuse. The 0+1 pair does
-not exist yet.
 
 ## Gates and entry
 
@@ -180,7 +203,7 @@ not exist yet.
   negative controls come along — `--no-fork` deletes the backward collective and must
   fail. It cannot join the CI loop (that loop is CPU/gloo and CI has no cards), so it
   runs on the pod and its output goes in the entry.
-- **The CI-visible gate already exists** and needs no work: nine gates, floor of 9,
+- **The CI-visible gate already exists** and needs no work: ten gates, floor of 10,
   script-run so the 0-item collection is irrelevant. Worth one line in the entry saying
   so, because it has now been reported as broken twice.
 - **Entry**: `docs/experience/wins/` with the world=2 probe table, the TP=2 vs
