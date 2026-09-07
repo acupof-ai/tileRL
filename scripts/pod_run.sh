@@ -4,7 +4,7 @@
 #
 #   scripts/pod_run.sh <name> <card[,card...]> -- <command...>
 #   scripts/pod_run.sh arms 6 -- python3 scripts/recapture_arms.py --steps 6
-#   scripts/pod_run.sh tp2 0,1 -- torchrun --nproc_per_node=2 scripts/x.py
+#   scripts/pod_run.sh tp2 0,6 -- torchrun --nproc_per_node=2 scripts/x.py
 #
 # What it encodes, each line a thing that actually went wrong:
 #   * a bash parent that WAITS, so the job is reaped. `setsid nohup ... &` from a
@@ -88,7 +88,7 @@ trap release EXIT INT TERM
 # A claim names a pid because the card's memory is held by a pid, so it dies when that pid
 # does: a wrapper running N arms has N-1 windows where the claim reads STALE and the card
 # reads ORPHAN while a later arm runs. The rule is therefore that each arm re-claims its own
-# python pid as it starts, never the wrapper's. `pod_run_claim` is that call, exported so a
+# python pid as it starts, never the wrapper's. \`pod_run_claim\` is that call, exported so a
 # multi-arm wrapper can invoke it per arm -- the arms run inside \$CMD, out of reach of the
 # block below.
 pod_run_claim() {  # pod_run_claim <pid> -- claim CARD for it, or kill it and exit 4
