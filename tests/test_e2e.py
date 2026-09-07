@@ -3420,3 +3420,74 @@ def test_a_row_waits_for_its_own_fetch_and_does_not_block_the_queue(tmp_path):
     assert not list(cold._waiting) and not list(cold._running), (
         "the held row never finished: the hold has no release path"
     )
+
+
+def test_one_conversation_holds_one_decode_entry_at_every_point_in_time():
+    """A row's decode publishes REPLACE rather than accumulate, so its live contribution is
+    bounded by the prefill boundaries plus one -- at every tick, not just at the end.
+
+    The bound is checked per tick because the failure it guards is transient: the old
+    behaviour ends with the same store contents once LRU has churned, and only a
+    point-in-time count separates "published 1 entry 40 times" from "held 40 entries".
+    """
+    cfg = tiny()
+    eng = build_engine(cfg, build_random(cfg, seed=11), get_backend(), num_blocks=64,
+                       num_slots=4, max_batch=4, max_total_tokens=512)
+    rid = eng.submit([7] * (4 * BLOCK_TOKENS), SamplingParams(max_new_tokens=96, temperature=0.0))
+    seen, ticks = [], 0
+    while rid not in eng.poll() and ticks < 512:
+        eng.step()
+        ticks += 1
+        seen.append(eng._prefix.stats()["entries"])
+    assert ticks < 512, "the request never finished, so the bound below was never exercised"
+
+    # Non-vacuous first: the run must actually publish, or a store that publishes nothing
+    # satisfies any bound. `superseded` proves the replace path ran, not just that the
+    # count stayed low.
+    st = eng._prefix.stats()
+    assert eng.stats()["prefix_published"] > 1, (
+        f"only {eng.stats()['prefix_published']} publishes, so this run cannot distinguish a "
+        "bounded store from one that never publishes"
+    )
+    assert st["superseded"] > 0, (
+        "no entry was ever superseded, so the replace path never ran and the bound below "
+        "holds for some other reason"
+    )
+
+    # 4 prompt blocks -> at most 4 prefill-boundary entries, plus the one live decode entry.
+    bound = 4 + 1
+    assert max(seen) <= bound, (
+        f"one conversation held {max(seen)} entries at once against a bound of {bound}; "
+        f"per-tick counts were {seen}"
+    )
+
+
+def test_retiring_a_shared_entry_removes_it_for_every_row(tmp_path):
+    """`retire` matches by TOKENS, and `insert` dedups them, so two rows publishing an
+    identical prefix share ONE entry and either row's retire removes it for both.
+
+    Recorded as a bound rather than a bug: a second retire of the same tokens is a no-op
+    returning False, and the entries a row retires are its own decode-tail boundaries. The
+    cost lands on a THIRD session sharing that tail, which is the same trade the fix makes
+    deliberately. Asserted so the day `retire` gains an owner check, this says what changes.
+    """
+    pool = PagedKvPool(64, 1, 4, device=torch.device("cpu"))
+    store = PrefixStore(pool)
+    toks = list(range(2 * BLOCK_TOKENS))
+    snap = (torch.zeros(4, 4, 4), None)
+    for _ in range(2):
+        blocks = [pool.alloc_block() for _ in range(2)]
+        store.insert(toks, blocks, snap)
+        for b in blocks:
+            pool.free_block(b)
+    assert store.stats()["entries"] == 1, "insert did not dedup, so the premise is wrong"
+
+    assert store.retire(toks), "the first retire found nothing to drop"
+    assert store.lookup(toks) is None, "the shared entry survived its own retire"
+    assert not store.retire(toks), (
+        "a second retire of the same tokens returned True, so it is not the no-op that "
+        "bounds this -- a double retire would then corrupt the block refcounts"
+    )
+    assert store.stats()["superseded"] == 1 and store.stats()["evictions"] == 0, (
+        f"a retire was counted as eviction pressure: {store.stats()}"
+    )

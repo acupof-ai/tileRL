@@ -909,6 +909,9 @@ class NoPrefixStore:
                spill: bool = True) -> bool:
         return False
 
+    def retire(self, tokens: Sequence[int]) -> bool:
+        return False
+
     def evict_until_free(self, blocks: int) -> None:
         return None
 
@@ -933,7 +936,7 @@ class NoPrefixStore:
     def stats(self) -> dict[str, int]:
         return {"entries": 0, "capacity": 0, "entries_capacity": 0, "state_bytes": 0,
                 "lookups_matched": 0, "lookups_missed": 0,
-                "evictions": 0, "blocks_freed": 0}
+                "evictions": 0, "blocks_freed": 0, "superseded": 0}
 
 
 class PrefixStore:
@@ -975,6 +978,9 @@ class PrefixStore:
         self.lookups_matched = 0
         self.lookups_missed = 0
         self.evictions = 0
+        # A publisher retiring its own superseded entry. Separate from `evictions` because
+        # it is the absence of pressure, not pressure.
+        self.superseded = 0
         self.blocks_freed = 0
         self.ssd_hits = 0
         self.ssd_faults = 0
@@ -1223,10 +1229,14 @@ class PrefixStore:
         # Per entry, not per block: a growing prefix republishes, so shared blocks sit above 1.
         return sum(1 for b, n in held.items() if self._pool.refcount[b] == n)
 
-    def _drop(self, entry: _Entry) -> None:
+    def _drop(self, entry: _Entry, *, evicted: bool = True) -> None:
         """Remove one entry and release everything it holds. The single teardown path:
         eviction, a promotion that came back empty, and ``clear`` all go through it, so
-        the block frees and the byte accounting cannot drift between them."""
+        the block frees and the byte accounting cannot drift between them.
+
+        ``evicted=False`` for a publisher retiring its OWN superseded entry: the bytes and
+        blocks go back the same way, but it is not eviction pressure, and counting it as
+        one would hide the pressure `/health` exists to show."""
         del self._by_id[entry.eid]
         chain = self._entries[entry.h]
         chain.remove(entry)
@@ -1242,11 +1252,29 @@ class PrefixStore:
             self._state_used -= entry.nbytes
         if self._dram is not None:
             self._dram.forget(entry.eid)
-        self.evictions += 1
+        if evicted:
+            self.evictions += 1
+        else:
+            self.superseded += 1
 
     def _evict_one(self) -> None:
         eid = next(iter(self._by_id))  # least recently used
         self._drop(self._by_id[eid])
+
+    def retire(self, tokens: Sequence[int]) -> bool:
+        """Drop the publisher's own earlier entry for exactly ``tokens``. True if one went.
+
+        A conversation publishes a nested family, each key a prefix of the next, and only
+        the longest can ever serve it again -- so the previous one is dead the moment the
+        next lands. Retiring it here bounds one conversation's live contribution instead of
+        leaving `budget` of them for LRU to churn through.
+        """
+        tokens = tuple(int(t) for t in tokens)
+        for e in self._entries.get(self._hash_all(tokens), ()):
+            if e.tokens == tokens:
+                self._drop(e, evicted=False)
+                return True
+        return False
 
     def _demote_one(self) -> bool:
         """Move the LRU resident snapshot to the DRAM tier, keeping the entry. True when
@@ -1315,6 +1343,7 @@ class PrefixStore:
             "lookups_matched": self.lookups_matched,
             "lookups_missed": self.lookups_missed,
             "evictions": self.evictions,
+            "superseded": self.superseded,
             "blocks_freed": self.blocks_freed,
             "demoted": sum(1 for e in self._by_id.values() if e.demoted),
         }

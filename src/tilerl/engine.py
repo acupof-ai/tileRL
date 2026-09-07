@@ -210,6 +210,8 @@ class _Req:
     own_blocks: int  # blocks the engine allocated (vs adopted from a hit)
     #: perf_counter deadline for an in-flight SSD prefetch; 0 = none outstanding
     fetch_deadline: float = 0.0
+    #: this row's live decode-boundary entry length, retired when the next lands; 0 = none.
+    decode_entry: int = 0
     output: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     thought_closed: bool = False  # the reasoning block ended (model's or forced)
@@ -842,6 +844,7 @@ class Engine:
                 # only recover entries that were actually evicted, and at 144 MiB a 27B
                 # snapshot the sm70 budget (free/4 = 1417 MiB) holds 9 of them.
                 "prefix_evictions": store["evictions"],
+                "prefix_superseded": store["superseded"],
                 # Indexed, not .get(k, 0): a default turns a store that stopped publishing the
                 # key into a healthy-looking 0. Both stores publish these three.
                 "prefix_blocks_freed": store["blocks_freed"],
@@ -1331,15 +1334,21 @@ class Engine:
                 self._finish(req)
                 return
             materialized = req.seq_len - 1
-            if i == last and req.phase == _PHASE_DECODE and materialized % BLOCK_TOKENS == 0:
-                self._publish_prefix(req, materialized)
+            # Replace, not accumulate: only this row's longest decode entry can serve it again.
+            # Retire after the insert -- the entries share blocks -- and only if it succeeded.
+            if (i == last and req.phase == _PHASE_DECODE
+                    and materialized % BLOCK_TOKENS == 0
+                    and self._publish_prefix(req, materialized)):
+                if req.decode_entry:
+                    self._prefix.retire(req.tokens[: req.decode_entry])
+                req.decode_entry = materialized
             if len(req.output) >= p.max_new_tokens:
                 self._finish(req)
                 return
             if tok != raw:  # a forced end-think token: the rest of the chain is stale
                 return
 
-    def _publish_prefix(self, req: _Req, length: int, spill: bool = True) -> None:
+    def _publish_prefix(self, req: _Req, length: int, spill: bool = True) -> bool:
         """Hand tokens[:length], its blocks and the linear-state snapshot at that
         boundary to the store; the store owns and evicts all three together.
 
@@ -1353,9 +1362,11 @@ class Engine:
             self._states.states[req.state_slot].clone(),
             self._states.window_snapshot(req.state_slot),
         )
-        self._prefix_published += self._prefix.insert(
+        published = self._prefix.insert(
             req.tokens[:length], req.blocks[: length // BLOCK_TOKENS], snap, spill=spill
         )
+        self._prefix_published += published
+        return published
 
     def _release(self, req: _Req) -> None:
         """Give back the blocks and the slot. Here, not at poll, so capacity returns now."""
