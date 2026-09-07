@@ -185,8 +185,8 @@ Physics that fixes the design:
   constant state, which is why 256K is feasible at all). 8 KV heads, 8 cards
   ⇒ TP-8 with one KV head per card; it also shards the GDN value heads (48/8)
   and the weights (22.8/8 GB).
-- Decode TP is 10 KB per all-reduce, 128 times per tick; NCCL's ~15 µs floor
-  (21.5 µs measured, CHANGELOG 2026-08-30) is ~2 ms of a ~3 ms TP-8 tick. A
+- Decode TP is 10 KB per all-reduce, 128 times per tick; NCCL's floor
+  (**20.6 µs measured** at world=2 on an idle pair, [entry](experience/wins/2026-09-07-the-nccl-floor-was-measured-a-week-early.md)) is ~2.6 ms of a ~3 ms TP-8 tick. A
   one-shot CUDA-IPC all-reduce as a TileLang kernel is ~3–5 µs and
   graph-capturable; training traffic (grad all-reduce, ZeRO, CP ring) stays
   on NCCL. One `comm.py` seam, crossover measured by microbench, IPC falls

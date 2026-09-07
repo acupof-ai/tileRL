@@ -467,6 +467,9 @@ def main() -> int:
     ap.add_argument("--inside-gdn", action="store_true",
                     help="split reference.gdn_backward instead of the _BWD registry")
     ap.add_argument("--model", default="qwen38-27b")
+    ap.add_argument("--tp", type=int, default=1,
+                    help="tensor-parallel width, as `tilerl train --tp`; at 1 a torchrun "
+                         "launch profiles an unsharded step per rank with no collective")
     ap.add_argument("--gen", type=int, default=1024)
     ap.add_argument("--group", type=int, default=8)
     ap.add_argument("--micro", type=int, default=1)
@@ -514,7 +517,7 @@ def main() -> int:
     cuda = backend.device.type == "cuda"
     sync = torch.cuda.synchronize if cuda else (lambda: None)
 
-    cfg, model = _build_model(a.model, seed=0, keep_master=False)
+    cfg, model = _build_model(a.model, seed=0, keep_master=False, tp=a.tp, backend=backend)
     engine = build_engine(cfg, model, backend, num_blocks=a.blocks, num_slots=a.group,
                           max_batch=a.group, max_total_tokens=a.blocks * 16,
                           decode_graph=False, prefix_store=NoPrefixStore())
