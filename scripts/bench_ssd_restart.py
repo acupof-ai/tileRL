@@ -328,6 +328,12 @@ def _arm(args, name: str, spill: str, prompt, reply: str = "") -> dict:
         "ssd_refusals": d("ssd_refusals"),
         "prefix_hits": d("prefix_hits"),
         "prefix_published": d("prefix_published"),
+        # The two the replace-on-publish change moves. `evictions` is what it aims at
+        # and `superseded` is what proves the path ran -- published alone cannot tell a
+        # bounded store from a churning one, since the fix leaves the publish COUNT alone.
+        "prefix_evictions": d("prefix_evictions"),
+        "prefix_superseded": d("prefix_superseded"),
+        "prefix_entries": int(after.get("prefix_entries", 0)),
         # The async path (row 50 PR B). tick_loads is the one that can refute the
         # claim: a fault served from a torch.load on the calling thread is the
         # synchronous path, whatever the wall clock says.
@@ -353,7 +359,9 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8123)
     ap.add_argument("--tokens", type=int, default=3000, help="target prompt length")
     ap.add_argument("--gen", type=int, default=8, help="tokens to generate; keep small so "
-                    "the wall clock is prefill")
+                    "the wall clock is prefill. NOTE: a decode-boundary publish needs "
+                    "gen >= BLOCK_TOKENS, so the default measures the fetch and says "
+                    "nothing about decode-side churn -- pass --gen 256 for that")
     ap.add_argument("--max-ctx", type=int, default=8192)
     ap.add_argument("--slots", type=int, default=3)
     ap.add_argument("--boot-s", type=float, default=900.0)
@@ -364,6 +372,15 @@ def main() -> None:
                          "scripts/bench_ssd_bandwidth.py one_entry (182.6 MiB/s cold, "
                          "4477.8 warm -- 24x apart, which is why the check works)")
     args = ap.parse_args()
+
+    # A decode-boundary publish needs a chain end landing on a 16-multiple, so below
+    # gen 16 there are ZERO of them and the prefix_evictions/superseded columns are
+    # structurally 0 -- a green row that measured nothing. Printed, not raised: the
+    # default is deliberate (the wall clock stays prefill) and the fetch arms are valid.
+    if args.gen < 16:
+        print(f"# NOTE gen={args.gen} < 16: no decode-boundary publishes are possible, so "
+              f"prefix_evictions and prefix_superseded below are 0 by construction, not by "
+              f"measurement. Use --gen 256 to price decode-side churn.")
 
     prompt = _prompt(args.tokens)
     main_dir, ctrl_dir = args.spill, args.spill + "_control"

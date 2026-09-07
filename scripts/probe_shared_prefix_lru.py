@@ -126,11 +126,14 @@ def main() -> int:
     off = [(b, k) for b, k in rel if k != b - 1]
     assert not off, f"the interval is not budget-1 at {off}; the relation quoted below is wrong"
     slack = rel[-1][1]
+    # 42, not 70: `i == last` means a spec chain skips boundaries it steps over, measured at
+    # 44% on the live server (probe_publish_boundary_skip.py). 6 prefill + ~36 landed.
+    per_convo = 42
     print(f"\nThe tolerated interval is exactly budget-1 at all six budgets, so at the V100's 11 "
-          f"entries a shared\nhead survives a gap of {slack} publishes. One conversation emits 70 "
-          f"at gen 1024, so a second session\nmust arrive inside every {slack} of them -- about "
-          f"{70 // slack} arrivals per conversation. That is the operand:\nnot the sharing RATE "
-          f"but the sharing INTERVAL against the publish rate.")
+          f"entries a shared\nhead survives a gap of {slack} publishes. One conversation emits "
+          f"~{per_convo} at gen 1024, so a second\nsession must arrive inside every {slack} of "
+          f"them -- about {per_convo // slack} arrivals per conversation. That is the\noperand: "
+          f"not the sharing RATE but the sharing INTERVAL against the publish rate.")
     return 0
 
 
