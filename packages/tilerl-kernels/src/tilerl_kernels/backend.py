@@ -33,6 +33,11 @@ _WY_CHUNK = 64
 _MAX_VERIFY_W = 8
 # a whole-chunk verify width would reach _full_rows' host sync, illegal under graph capture
 assert _MAX_VERIFY_W < _WY_CHUNK
+# getattr: an older torch build may have neither, and this is only ever a membership test
+_FP8_DTYPES = frozenset(
+    d for d in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None))
+    if d is not None
+)
 
 
 def _round_up(x: int, m: int) -> int:
@@ -921,20 +926,38 @@ class Backend:
     # ------------------------------------------------------------ attention
 
     def paged_attention(
-        self, q, k_cache, v_cache, block_table, seq_lens, scale, gate=None, seq_q_lens=None
+        self, q, k_cache, v_cache, block_table, seq_lens, scale, gate=None, seq_q_lens=None,
+        k_scale=None, v_scale=None
     ):
         squeeze = q.ndim == 3
         if squeeze:
             q = q.unsqueeze(1)  # [B, H, D] -> [B, 1, H, D]
+        fp8 = k_cache.dtype in _FP8_DTYPES
+        if fp8 and (k_scale is None or v_scale is None):
+            # Without the scale every value reads ~448x too small: finite, plausible, and
+            # passing both the token-agreement and logit gates with the treatment absent.
+            raise TypeError(
+                f"paged_attention got a raw {k_cache.dtype} K plane with no scale. Pass "
+                "k_scale/v_scale, or kv_layer()'s dequantized plane."
+            )
         b, s = q.shape[0], q.shape[1]
         if seq_q_lens is None:
             seq_q_lens = torch.full((b,), s, dtype=torch.int32)
         # the M tile is the GQA group at every chain position: a verify width
         # rides the decode path while g*s still fits it
         chain = s <= _MAX_VERIFY_W and s * (q.shape[2] // k_cache.shape[1]) <= 128
+        if fp8 and not self.has_kernel("paged_attention_fp8"):
+            # Every other arm reaches _f32/_dev, which up-cast the plane and DROP the scale
+            # silently. No CPU/metal/sm70 twin can exist either: tilelang's C backend has no
+            # sub-f32 type. Refuse where the fp8 maker is absent, at one place above the
+            # dispatch, rather than per arm -- the sm70 split arm has the same exposure.
+            raise NotImplementedError(
+                f"fp8 KV attention on arch {self.arch}: this cell registers no fp8 attention "
+                "maker, and casting the plane here would drop the scale"
+            )
         if self.arch == "sm90" and chain and "paged_attention_decode" in _resolve(self.precision, self.arch):
             out = self._paged_attention_decode(
-                q, k_cache, v_cache, block_table, seq_lens, seq_q_lens, scale
+                q, k_cache, v_cache, block_table, seq_lens, seq_q_lens, scale, k_scale, v_scale
             )
         elif self.arch == "sm70" and "paged_attention_split" in _resolve(
             self.precision, self.arch
@@ -972,10 +995,12 @@ class Backend:
             pad = -s % block_m
             if pad:
                 q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad))
-            out = self._kernel("paged_attention")(
+            out = self._kernel("paged_attention" + ("_fp8" if fp8 else ""))(
                 q,
-                self._dev(k_cache, torch.bfloat16),
-                self._dev(v_cache, torch.bfloat16),
+                k_cache if fp8 else self._dev(k_cache, torch.bfloat16),
+                v_cache if fp8 else self._dev(v_cache, torch.bfloat16),
+                *self._kv_scale_args(k_scale, v_scale, fp8, int(k_cache.shape[1]),
+                                     int(k_cache.shape[2])),
                 self._i32(block_table),
                 self._i32(seq_lens),
                 self._i32(seq_q_lens),
@@ -983,6 +1008,8 @@ class Backend:
                 int(k_cache.shape[2]),
                 block_m,
                 128,
+                "float8_e4m3fn" if fp8 else "bfloat16",
+                int(k_cache.shape[0]) if fp8 else 1,
             )[:, :s]
         else:
             q = self._f32(q)
@@ -1009,7 +1036,7 @@ class Backend:
         return out
 
     def _paged_attention_decode(self, q, k_cache, v_cache, block_table, seq_lens, seq_q_lens,
-                                scale):
+                                scale, k_scale=None, v_scale=None):
         b, w, h, d = q.shape
         hkv = k_cache.shape[1]
         g = h // hkv
@@ -1020,6 +1047,9 @@ class Backend:
         max_tokens = block_table.shape[1] * k_cache.shape[2]
         wide = 16 * hkv * b < 2 * self._sms and max_tokens >= 64 * k_cache.shape[2]
         ks, sfx = (64, "_64") if (max_tokens > 65536 or wide) else (16, "")
+        fp8 = k_cache.dtype in _FP8_DTYPES
+        if fp8:
+            sfx += "_fp8"
         key = ("attn_ws", b, hkv, d, ks, block_m)
         ws = self._ones_cache.get(key)
         if ws is None:  # static workspace: graph-capturable
@@ -1031,11 +1061,35 @@ class Backend:
         po, pm, pl = ws
         self._kernel("paged_attention_decode" + sfx)(
             self._dev(self._c(q), torch.bfloat16),
-            self._dev(k_cache, torch.bfloat16), self._dev(v_cache, torch.bfloat16),
+            k_cache if fp8 else self._dev(k_cache, torch.bfloat16),
+            v_cache if fp8 else self._dev(v_cache, torch.bfloat16),
+            *self._kv_scale_args(k_scale, v_scale, fp8, int(k_cache.shape[1]),
+                                 int(k_cache.shape[2])),
             self._i32(block_table), self._i32(seq_lens), self._i32(seq_q_lens),
             po, pm, pl, float(scale), int(k_cache.shape[2]), block_m,
+            "float8_e4m3fn" if fp8 else "bfloat16",
+            int(k_cache.shape[0]) if fp8 else 1,
         )
-        return self._kernel("paged_attention_combine" + sfx)(po, pm, pl, g, w)
+        return self._kernel("paged_attention_combine" + sfx.replace("_fp8", ""))(po, pm, pl, g, w)
+
+    def _kv_scale_args(self, k_scale, v_scale, fp8: bool, hkv: int = 1, block_size: int = 1):
+        """The (KScale, VScale) operand pair. Off fp8 both makers still take them, so the
+        argument list has one shape rather than two kernel variants.
+
+        The off-fp8 dummy is (1, Hkv, block_size), not (1,) or (1,1,1): Hkv and block_size
+        come from T.const, so they are bound from the REAL operands and the dummy must agree
+        or the packed ABI check rejects it."""
+        if not fp8:
+            key = ("kv_scale_dummy", hkv, block_size)
+            d = self._ones_cache.get(key)
+            if d is None:
+                d = self._ones_cache[key] = torch.ones(
+                    1, hkv, block_size, dtype=torch.float32, device=self.device)
+            return d, d
+        if k_scale is None or v_scale is None:
+            raise ValueError("an fp8 KV plane needs its k_scale/v_scale; passing the pool's "
+                             "raw planes without them would read every value ~448x too small")
+        return k_scale.contiguous(), v_scale.contiguous()
 
     def attention(self, q, k, v, scale, gate=None, q_pos=None, k_pos=None):
         """Dense causal GQA attention (training path). q [B,Tq,H,D], k/v [B,Tk,H,D].
@@ -1057,11 +1111,33 @@ class Backend:
             kv.kv_pool.write_tokens(k, v, kv, layer_idx)
             return
         pool = kv.kv_pool
-        k_plane, v_plane = pool.kv_layer(layer_idx)
         b, s = k.shape[0], k.shape[1]
         sql = getattr(kv, "seq_q_lens", None)
         if sql is None:
             sql = torch.full((b,), s, dtype=torch.int32)
+        block_size = int(pool.k_pool.shape[-2])
+        if pool.kv_fp8 is not None:
+            if not self.has_kernel("write_tokens_fp8"):
+                kv.kv_pool.write_tokens(k, v, kv, layer_idx)
+                return
+            plane = pool.plane_of(layer_idx)
+            # the RAW fp8 planes, not kv_layer(): that hands back a dequantized copy, and a
+            # scatter into it is discarded with no error
+            self._kernel("write_tokens_fp8")(
+                self._dev(k, torch.bfloat16).contiguous(),
+                self._dev(v, torch.bfloat16).contiguous(),
+                pool.k_pool[plane],
+                pool.v_pool[plane],
+                pool.k_scale[plane],
+                pool.v_scale[plane],
+                self._i32(kv.block_table).contiguous(),
+                self._i32(kv.seq_len).contiguous(),
+                self._i32(sql).contiguous(),
+                block_size,
+                _THREADS,
+            )
+            return
+        k_plane, v_plane = pool.kv_layer(layer_idx)
         # .contiguous(): a bf16 view sliced from the fused-qkv output survives _dev's no-op cast
         # The pool's dtype is the kernel's: sm70 allocates f32 so attention
         # does not cast the whole plane per call.
@@ -1074,7 +1150,7 @@ class Backend:
             self._i32(kv.block_table).contiguous(),
             self._i32(kv.seq_len).contiguous(),
             self._i32(sql).contiguous(),
-            int(pool.k_pool.shape[-2]),
+            block_size,
             _THREADS,
         )
 
@@ -1084,7 +1160,8 @@ class Backend:
         if "attn_prep" not in _resolve(self.precision, self.arch):
             return None
         pool = kv.kv_pool
-        k_plane, v_plane = pool.kv_layer(layer_idx)
+        if pool.kv_fp8 is not None and not self.has_kernel("attn_prep_fp8"):
+            return None  # unfused path: the pool's own quantizing writer handles it
         b, s = qkv.shape[0], qkv.shape[1]
         sql = getattr(kv, "seq_q_lens", None)
         if sql is None:
@@ -1092,14 +1169,14 @@ class Backend:
         pos = self._i32(positions)
         if pos.ndim == 1:
             pos = pos.unsqueeze(0).expand(b, -1)
-        return self._kernel("attn_prep")(
+        args = (
             self._f32(qkv).contiguous(),
             self._f32(wq).contiguous(),
             self._f32(wk).contiguous(),
             pos.contiguous(),
             self._inv_freq(int(rotary_dim), float(theta)).to(self.device),
-            k_plane,
-            v_plane,
+        )
+        tail = (
             self._i32(kv.block_table).contiguous(),
             self._i32(kv.seq_len).contiguous(),
             self._i32(sql).contiguous(),
@@ -1109,6 +1186,14 @@ class Backend:
             int(pool.k_pool.shape[-2]),
             _THREADS,
         )
+        if pool.kv_fp8 is not None:
+            # raw planes + the scale plane: kv_layer() would hand back a dequantized copy
+            p = pool.plane_of(layer_idx)
+            return self._kernel("attn_prep_fp8")(
+                *args, pool.k_pool[p], pool.v_pool[p], pool.k_scale[p], pool.v_scale[p], *tail
+            )
+        k_plane, v_plane = pool.kv_layer(layer_idx)
+        return self._kernel("attn_prep")(*args, k_plane, v_plane, *tail)
 
     def linear_frozen_bwd(self, grad, wq, scale, oscale=None, fp8=False):
         """dX through a frozen quantized weight, no weight grad. The kernel

@@ -110,7 +110,7 @@ def _shard(cfg, model, tp: int, backend, model_mod):
 
 def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16,
                   blocks=0, max_ctx=0, max_batch=8, ssd_path="", ssd_min_tokens=0,
-                  dram_bytes=0, state_bytes=0, decode=None):
+                  dram_bytes=0, state_bytes=0, kv_fp8="", decode=None):
     """Serving-size engine; ``devices`` replicates it across those CUDA indices.
 
     ``max_ctx`` caps the served context; it still defaults to the model's own limit,
@@ -141,6 +141,10 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
         kw["dram_bytes"] = dram_bytes
     if state_bytes:
         kw["state_bytes"] = state_bytes
+    if kv_fp8:
+        import torch
+
+        kw["kv_fp8"] = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}[kv_fp8]
     # Text stop sequences are matched on decoded ids, so the engine needs the
     # tokenizer's decode; without it `submit` refuses a request that carries one.
     if decode is not None:
@@ -182,7 +186,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            blocks=args.blocks, max_ctx=args.max_ctx,
                            max_batch=args.max_batch, ssd_path=args.ssd_path,
                            ssd_min_tokens=args.ssd_min_tokens, dram_bytes=args.dram_bytes,
-                           state_bytes=args.state_bytes,
+                           state_bytes=args.state_bytes, kv_fp8=args.kv_fp8,
                            decode=tokenizer.decode)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
@@ -1053,6 +1057,17 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "(43 demotions, 0 promotions). Read /health's dram_promotions "
                               "to see whether the workload crossed it, and dram_budget to "
                               "see the tier is on at all")
+    p_serve.add_argument("--kv-fp8", choices=["e4m3", "e5m2"], default="",
+                         help="store the KV planes in fp8: 65536 -> 33280 bytes per token at the "
+                              "27B's 16 planes x 4 heads x 256, a 1.969x saving, the 0.031 being "
+                              "one f32 scale per (plane, block, kv_head, token). Off by default: "
+                              "the pool and the writers are fp8 but the attention kernels still "
+                              "read a dequantized plane, so this is correctness-complete and not "
+                              "yet a bandwidth win, and no decode tok/s figure exists "
+                              "(docs/design-fp8-kv.md). Refused on sm70, whose fused write_tokens "
+                              "has no fp8 twin and would scatter into a dequantized copy. e4m3 is "
+                              "the default choice on measurement, not analogy: it beats e5m2 "
+                              "1.89x on the worst element with nothing underflowing on tiny")
     p_serve.add_argument("--max-batch", type=int, default=8,
                          help="concurrent rows; drop to 2 for a single-user endpoint (a decode "
                               "graph is captured per bucket x chain width, so a lower "

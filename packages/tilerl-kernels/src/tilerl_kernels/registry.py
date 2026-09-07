@@ -97,6 +97,9 @@ _SM90_KERNELS = {  # WGMMA schedules; the backend pads M/N to 16 and K to 32
     "quant_fp8": kernels_linear.make_quant_fp8_e4m3,
     "write_tokens": kernels_mma.make_write_tokens,
     "attn_prep": kernels_mma.make_attn_prep,
+    # fp8 pool twins, selected per call by the pool's dtype, not by the cell
+    "write_tokens_fp8": kernels_mma.make_write_tokens_fp8,
+    "attn_prep_fp8": kernels_mma.make_attn_prep_fp8,
     "gdn_decode_fused": kernels_gdn.make_gdn_decode_fused,
     "gdn_chunk_fused": kernels_gdn.make_gdn_chunk_fused,
     "gdn_prep": kernels_gdn.make_gdn_prep_bf16,
@@ -110,6 +113,12 @@ _SM90_KERNELS = {  # WGMMA schedules; the backend pads M/N to 16 and K to 32
     "gdn_chunk_o": kernels_gdn.make_gdn_chunk_o,
     "paged_attention": kernels_attn.make_paged_attention_mma,
     "paged_attention_decode": kernels_attn.make_paged_attention_decode,
+    # fp8-pool twins: same schedule, one multiply at the gather, bf16 tile
+    "paged_attention_fp8": lambda t: kernels_attn.make_paged_attention_mma(t, kv_fp8=True),
+    "paged_attention_decode_fp8": lambda t: kernels_attn.make_paged_attention_decode(
+        t, kv_fp8=True),
+    "paged_attention_decode_64_fp8": lambda t: kernels_attn.make_paged_attention_decode(
+        t, KVSPLIT=64, kv_fp8=True),
     "paged_attention_combine": kernels_attn.make_paged_attention_combine,
     # long context (>64K): 64 splits keep the per-block scan at <= 4K tokens
     "paged_attention_decode_64": lambda t: kernels_attn.make_paged_attention_decode(t, KVSPLIT=64),

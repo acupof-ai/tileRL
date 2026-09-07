@@ -25,9 +25,10 @@ _MASK64 = (1 << 64) - 1
 
 
 def _blob_bytes(st: dict) -> int:
-    """Bytes of a state snapshot, for the fetch-rate accounting."""
+    """Bytes of a spilled blob, for the fetch-rate accounting: state snapshot or KV+scale."""
     return sum(t.numel() * t.element_size()
-               for t in (st.get("states"), st.get("windows")) if t is not None)
+               for t in (st.get("states"), st.get("windows"), st.get("k"), st.get("v"),
+                         st.get("ks"), st.get("vs")) if t is not None)
 
 
 def _rolling_hash(prev: int, token: int) -> int:
@@ -45,6 +46,14 @@ def _default_device() -> torch.device:
         return torch.device("cpu")
 
 
+def _kv_fp8_ref():
+    # Lazy for the same reason as the backend above, and so a tree without the two
+    # reference functions still imports this module.
+    from tilerl_kernels.reference import dequant_kv_fp8, quant_kv_fp8
+
+    return quant_kv_fp8, dequant_kv_fp8
+
+
 class PagedKvPool:
     """Paged K/V storage with a free-list allocator and per-block refcount.
 
@@ -56,6 +65,11 @@ class PagedKvPool:
     A block with refcount > 1 is shared (a live slot plus the prefix store).
     Only whole blocks are ever published, so a shared block is never appended to
     and no copy-on-write is needed; :meth:`PrefixStore.insert` enforces that.
+
+    ``kv_fp8`` stores the planes in that fp8 dtype with an f32 ``k_scale``/``v_scale``
+    per ``(plane, block, kv_head, token)`` — one scale over head_dim
+    (docs/design-fp8-kv.md). The write paths then QUANTIZE; a plain ``.to(fp8)``
+    would drop the scale and store plausible garbage.
     """
 
     def __init__(
@@ -67,6 +81,7 @@ class PagedKvPool:
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.bfloat16,
         layer_map: tuple[int, ...] | None = None,
+        kv_fp8: torch.dtype | None = None,
     ) -> None:
         self._layer_map = tuple(range(num_layers)) if layer_map is None else tuple(layer_map)
         self._plane = {g: d for d, g in enumerate(self._layer_map)}
@@ -75,15 +90,59 @@ class PagedKvPool:
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.device = _default_device() if device is None else torch.device(device)
+        #: the IO dtype the attention kernel reads, which is the store dtype only off fp8
+        self.dtype = dtype
+        self.kv_fp8 = kv_fp8
         shape = (self.num_layers, num_blocks, num_kv_heads, BLOCK_TOKENS, head_dim)
-        self.k_pool = torch.zeros(shape, dtype=dtype, device=self.device)
-        self.v_pool = torch.zeros(shape, dtype=dtype, device=self.device)
+        self.k_pool = torch.zeros(shape, dtype=kv_fp8 or dtype, device=self.device)
+        self.v_pool = torch.zeros(shape, dtype=kv_fp8 or dtype, device=self.device)
+        sshape = (self.num_layers, num_blocks, num_kv_heads, BLOCK_TOKENS)
+        self.k_scale = None if kv_fp8 is None else torch.ones(sshape, device=self.device)
+        self.v_scale = None if kv_fp8 is None else torch.ones(sshape, device=self.device)
         self._free: list[int] = list(range(num_blocks))
         self.refcount: list[int] = [0] * num_blocks
 
+    def plane_of(self, layer_idx: int) -> int:
+        """Pool plane for a model layer. The fp8 writers need the raw plane, not kv_layer()."""
+        return self._plane[layer_idx]
+
     def kv_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The attention operands for a layer. Off fp8 these are the pool planes themselves.
+
+        Under fp8 this DEQUANTIZES the whole plane, every block, allocating two f32 copies of
+        the entire pool -- 0.1 ms to 87.5 ms per tick at the 27B's shape, measured, because
+        the cost is proportional to num_blocks and not to the sequence. Use
+        :meth:`kv_operands` on any path that has a kernel able to read fp8; this stays for
+        readers that cannot (the CPU cell, whose C backend has no sub-f32 type) and for tests.
+        """
         p = self._plane[layer_idx]
-        return self.k_pool[p], self.v_pool[p]
+        if self.kv_fp8 is None:
+            return self.k_pool[p], self.v_pool[p]
+        _, dequant = _kv_fp8_ref()
+        return (dequant(self.k_pool[p : p + 1], self.k_scale[p : p + 1])[0].to(self.dtype),
+                dequant(self.v_pool[p : p + 1], self.v_scale[p : p + 1])[0].to(self.dtype))
+
+    def kv_operands(self, layer_idx: int) -> tuple[torch.Tensor, ...]:
+        """``(k, v, k_scale, v_scale)`` -- the raw planes, no copy, scales None off fp8."""
+        p = self._plane[layer_idx]
+        if self.kv_fp8 is None:
+            return self.k_pool[p], self.v_pool[p], None, None
+        return self.k_pool[p], self.v_pool[p], self.k_scale[p], self.v_scale[p]
+
+    @property
+    def bytes_per_token(self) -> int:
+        """K+V bytes one token costs across every plane, the fp8 scale plane included.
+
+        At the 27B's 16 full-attn planes x 4 heads x 256: 64 KiB on a bf16 pool, 128 on
+        sm70's f32 one, and 32 KiB + 512 B of scale on fp8 -- 1.969x, not 2.000x, which is
+        what the per-token scale grid costs (see :func:`reference.quant_kv_fp8`).
+        """
+        per_block = (2 * self.num_layers * self.num_kv_heads * BLOCK_TOKENS * self.head_dim
+                     * self.k_pool.element_size())
+        if self.k_scale is not None:
+            per_block += (2 * self.num_layers * self.num_kv_heads * BLOCK_TOKENS
+                          * self.k_scale.element_size())
+        return per_block // BLOCK_TOKENS
 
     def alloc_block(self) -> int:
         if not self._free:
@@ -107,6 +166,22 @@ class PagedKvPool:
     def is_shared(self, block: int) -> bool:
         return self.refcount[block] > 1
 
+    def _store_fp8(self, plane: int, blk: torch.Tensor, off: torch.Tensor,
+                   k: torch.Tensor, v: torch.Tensor) -> None:
+        """Quantize ``k``/``v`` ([n, num_kv_heads, head_dim]) into ``blk``/``off``.
+
+        A write touches only the tokens it writes: the scale is per (block, head, token), so a
+        later token's larger absmax cannot saturate an earlier one and there is nothing to
+        re-round. Quantizing from the stored fp8 instead compounds -- 0.338 vs 0.059 max rel
+        error over 16 appends, worst on the FIRST token written.
+        """
+        quant, _ = _kv_fp8_ref()
+        for pool, scale, x in ((self.k_pool, self.k_scale, k), (self.v_pool, self.v_scale, v)):
+            # [n,H,D] -> [n,H,1,D]: quant reduces over the last axis, one scale per token-head
+            q, s = quant(x.to(self.device, torch.float32).unsqueeze(2), self.kv_fp8)
+            pool[plane, blk, :, off] = q[:, :, 0]
+            scale[plane, blk, :, off] = s[:, :, 0]
+
     def write_block(
         self,
         block: int,
@@ -129,6 +204,15 @@ class PagedKvPool:
                 f"write_block: span [{offset}, {offset + n}) outside block of {BLOCK_TOKENS}"
             )
         layer = self._plane[layer]
+        if self.kv_fp8 is not None:
+            self._store_fp8(
+                layer,
+                torch.full((n,), block, dtype=torch.long, device=self.device),
+                torch.arange(offset, offset + n, device=self.device),
+                k.transpose(0, 1),
+                v.transpose(0, 1),
+            )
+            return
         self.k_pool[layer, block, :, offset : offset + n].copy_(
             k.to(self.device, self.k_pool.dtype)
         )
@@ -157,6 +241,10 @@ class PagedKvPool:
                                device=kv.block_table.device)
             blk = kv.block_table[bi, pos // BLOCK_TOKENS].to(dev)
             off = (pos % BLOCK_TOKENS).to(dev)
+            if self.kv_fp8 is not None:
+                # per row, because rows own disjoint blocks but share none of their spans
+                self._store_fp8(plane, blk.long(), off, k[bi, :sq], v[bi, :sq])
+                continue
             self.k_pool[plane, blk, :, off, :] = k[bi, :sq].to(self.k_pool.dtype)
             self.v_pool[plane, blk, :, off, :] = v[bi, :sq].to(self.v_pool.dtype)
 
@@ -642,6 +730,10 @@ class KvTier:
         # Store tokens too: files are keyed by a 64-bit hash, so a collision would
         # otherwise load a different prefix's KV. load_kv verifies before copying.
         blob = {"k": k, "v": v, "tokens": tuple(tokens)}
+        if pool.k_scale is not None:
+            # fp8 bytes without their scale reload as a different tensor, silently
+            blob["ks"] = pool.k_scale[:, blocks].cpu()
+            blob["vs"] = pool.v_scale[:, blocks].cpu()
         with self._lock:
             self._pending[key] = blob
         self._q.put((key, blob, self._kv(key), [ev_k, ev_v]))
@@ -718,8 +810,7 @@ class KvTier:
                     ts = time.perf_counter()
                     if blob is None:
                         blob = torch.load(self._kv(key), map_location="cpu")
-                        self.fetch_bytes += sum(t.numel() * t.element_size()
-                                                for t in (blob["k"], blob["v"]))
+                        self.fetch_bytes += _blob_bytes(blob)
                     # the .st too: reading it in `load_state` put 157 MiB on the tick
                     if st is None:
                         st = torch.load(self._st(key), map_location="cpu")
@@ -769,8 +860,20 @@ class KvTier:
         idx = torch.as_tensor(list(blocks), device=pool.device)
         k = self._planes_on_device(blob["k"], pool)
         v = self._planes_on_device(blob["v"], pool)
-        pool.k_pool.index_copy_(1, idx, k)
-        pool.v_pool.index_copy_(1, idx, v)
+        if (pool.k_scale is None) != ("ks" not in blob):
+            # Belt to _weight_fingerprint's brace: it now carries kv_fp8, so a flag flip
+            # against the same --ssd-path yields a different fingerprint -- but an explicit
+            # ssd_fingerprint routes around that. Dropping the entry costs a re-prefill; the
+            # dtype-mismatched index_copy_ below raises out of _admit, failing every request.
+            return False
+        if pool.k_scale is None:
+            pool.k_pool.index_copy_(1, idx, k)
+            pool.v_pool.index_copy_(1, idx, v)
+            return True
+        # index assignment, not index_copy_: torch has no index_copy_ for fp8 on CPU
+        pool.k_pool[:, idx], pool.v_pool[:, idx] = k, v
+        pool.k_scale.index_copy_(1, idx, blob["ks"].to(pool.device))
+        pool.v_scale.index_copy_(1, idx, blob["vs"].to(pool.device))
         return True
 
     def _planes_on_device(self, t: torch.Tensor, pool: PagedKvPool) -> torch.Tensor:
@@ -1034,17 +1137,16 @@ class PrefixStore:
         `(S + n*k)/B < n/R`, so `n* = (S/B) / (1/R - k/B)`: S the recurrent snapshot
         (constant at any length), k the KV bytes per token, B the tier's read rate, R
         tokens/s of prefill. Every operand is read here rather than fixed --
-        `k` is 64 KiB on a bf16 pool and 128 KiB on sm70's f32 one, and the two archs'
-        `R` differ by more than an order of magnitude, so a constant would be wrong on
-        one of them (docs/design-ssd-read-path.md).
+        `k` is 64 KiB on a bf16 pool, 128 on sm70's f32 one and 32 KiB + scale on fp8,
+        and the two archs' `R` differ by more than an order of magnitude, so a constant
+        would be wrong on one of them (docs/design-ssd-read-path.md).
 
         Returns 2**31 when `k/B >= 1/R`: the device cannot stream KV as fast as the card
         recomputes it, and no length pays.
         """
         if self._ssd is None or prefill_rate <= 0:
             return 1 << 31
-        k = 2 * self._pool.num_layers * self._pool.num_kv_heads * self._pool.head_dim \
-            * self._pool.k_pool.element_size()
+        k = self._pool.bytes_per_token
         b = self._ssd.read_bytes_per_s()
         s = self._snapshot_bytes or self._ssd.snapshot_bytes
         if b <= 0:

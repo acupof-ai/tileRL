@@ -9,11 +9,16 @@ import tilelang.language as T
 from .kernels_mma import _pass_configs
 
 
-def make_paged_attention_mma(target: str):
+def make_paged_attention_mma(target: str, kv_fp8: bool = False):
     """Paged causal GQA attention (example_mha_fwd_bshd.py + block-table gather).
     block_M 16 for decode, 64 for prefill; the backend pads S to block_M and
     SeqQLens carries the true per-row query length so padding rows are masked.
     D must be a multiple of 16 (WGMMA K).
+
+    ``kv_fp8`` reads an e4m3 pool with a per-(block, head, token) f32 scale. It is one
+    multiply on the right of the gather, and K_shared/V_shared stay bf16, so both gemms,
+    the accumulators and the softmax are untouched -- measured on card: a scalar fp8 load
+    times its scale into a bf16 tile is bit-exact against torch, max_abs_diff 0.0.
     # ponytail: the paged gather lowers to synchronous loads (latency-bound at
     # M=1); pipelined per-block T.copy gathers when decode shows on the profile.
     """
@@ -25,6 +30,8 @@ def make_paged_attention_mma(target: str):
         Q,
         KCache,
         VCache,
+        KScale,
+        VScale,
         BlockTable,
         SeqLens,
         SeqQLens,
@@ -32,14 +39,22 @@ def make_paged_attention_mma(target: str):
         block_size,
         block_M,
         threads,
+        kv_dtype,
+        sc_blocks,
     ):
         B, S, H, D = T.const("B, S, H, D")
         Hkv = T.const("Hkv")
         NB = T.const("NB")
         Mb = T.const("Mb")
         Q: T.Tensor((B, S, H, D), "bfloat16")
-        KCache: T.Tensor((NB, Hkv, block_size, D), "bfloat16")
-        VCache: T.Tensor((NB, Hkv, block_size, D), "bfloat16")
+        # kv_dtype/sc_blocks are jit PARAMETERS, not closure locals: tilelang re-executes
+        # this body with only its own kwargs bound, so a local from the enclosing maker is a
+        # NameError at annotation time. `kv_fp8` below is fine -- that is body control flow,
+        # which the eager builder does see.
+        KCache: T.Tensor((NB, Hkv, block_size, D), kv_dtype)
+        VCache: T.Tensor((NB, Hkv, block_size, D), kv_dtype)
+        KScale: T.Tensor((sc_blocks, Hkv, block_size), "float32")
+        VScale: T.Tensor((sc_blocks, Hkv, block_size), "float32")
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
         SeqQLens: T.Tensor((B,), "int32")
@@ -76,7 +91,13 @@ def make_paged_attention_mma(target: str):
                 for i, d in T.Parallel(block_N, D):
                     p = k * block_N + i
                     bidx = T.min(p // block_size, Mb - 1)
-                    K_shared[i, d] = KCache[BlockTable[bb, bidx], hkv, p % block_size, d]
+                    if kv_fp8:
+                        b_ = BlockTable[bb, bidx]
+                        K_shared[i, d] = T.cast(
+                            T.cast(KCache[b_, hkv, p % block_size, d], "float32")
+                            * KScale[b_, hkv, p % block_size], "bfloat16")
+                    else:
+                        K_shared[i, d] = KCache[BlockTable[bb, bidx], hkv, p % block_size, d]
                 for i, j in T.Parallel(block_M, block_N):
                     acc_s[i, j] = T.if_then_else(
                         k * block_N + j < hist + bx * block_M + i + 1,
@@ -111,7 +132,13 @@ def make_paged_attention_mma(target: str):
                 for i, d in T.Parallel(block_N, D):
                     p = k * block_N + i
                     bidx = T.min(p // block_size, Mb - 1)
-                    V_shared[i, d] = VCache[BlockTable[bb, bidx], hkv, p % block_size, d]
+                    if kv_fp8:
+                        b_ = BlockTable[bb, bidx]
+                        V_shared[i, d] = T.cast(
+                            T.cast(VCache[b_, hkv, p % block_size, d], "float32")
+                            * VScale[b_, hkv, p % block_size], "bfloat16")
+                    else:
+                        V_shared[i, d] = VCache[BlockTable[bb, bidx], hkv, p % block_size, d]
                 T.gemm(acc_s_cast, V_shared, acc_o, policy=policy)
             for i, j in T.Parallel(block_M, D):
                 acc_o[i, j] /= logsum[i]
@@ -121,26 +148,31 @@ def make_paged_attention_mma(target: str):
     return paged_attention
 
 
-def make_paged_attention_decode(target: str, KVSPLIT: int = 16):
+def make_paged_attention_decode(target: str, KVSPLIT: int = 16, kv_fp8: bool = False):
     """Decode split-KV flash-decoding (example_gqa_decode.py + paged gather) for
     W query tokens per row. Grid (KVSPLIT, Hkv, B): the M tile is the GQA group
     crossed with the W chain positions, so one KV slice serves all of them —
     that is what keeps a width-W verify tick at one KV read. Row i is head
     ``i // W`` at chain position ``i % W``, masked causally against
     ``SeqLens - SeqQLens + i % W``. Partials (PO, PM, PL) go to the combine
-    kernel; empty slices emit m=-inf, l=0."""
+    kernel; empty slices emit m=-inf, l=0.
+
+    ``kv_fp8`` as in :func:`make_paged_attention_mma`: one multiply at the gather, bf16 tile.
+    """
     block_N = 64
     accum_dtype = T.float32
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
-    def paged_attention_decode(Q, KCache, VCache, BlockTable, SeqLens, SeqQLens, PO, PM, PL, scale: T.float32, block_size, block_M):
+    def paged_attention_decode(Q, KCache, VCache, KScale, VScale, BlockTable, SeqLens, SeqQLens, PO, PM, PL, scale: T.float32, block_size, block_M, kv_dtype, sc_blocks):
         B, W, H, D = T.const("B, W, H, D")
         Hkv = T.const("Hkv")
         NB = T.const("NB")
         Mb = T.const("Mb")
         Q: T.Tensor((B, W, H, D), "bfloat16")
-        KCache: T.Tensor((NB, Hkv, block_size, D), "bfloat16")
-        VCache: T.Tensor((NB, Hkv, block_size, D), "bfloat16")
+        KCache: T.Tensor((NB, Hkv, block_size, D), kv_dtype)
+        VCache: T.Tensor((NB, Hkv, block_size, D), kv_dtype)
+        KScale: T.Tensor((sc_blocks, Hkv, block_size), "float32")
+        VScale: T.Tensor((sc_blocks, Hkv, block_size), "float32")
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
         SeqQLens: T.Tensor((B,), "int32")
@@ -184,7 +216,13 @@ def make_paged_attention_decode(target: str, KVSPLIT: int = 16):
                 for i, d in T.Parallel(block_N, D):
                     p = (t0 + k) * block_N + i
                     bidx = T.min(p // block_size, Mb - 1)
-                    K_shared[i, d] = KCache[BlockTable[bb, bidx], hkv, p % block_size, d]
+                    if kv_fp8:
+                        b_ = BlockTable[bb, bidx]
+                        K_shared[i, d] = T.cast(
+                            T.cast(KCache[b_, hkv, p % block_size, d], "float32")
+                            * KScale[b_, hkv, p % block_size], "bfloat16")
+                    else:
+                        K_shared[i, d] = KCache[BlockTable[bb, bidx], hkv, p % block_size, d]
                 for i, j in T.Parallel(block_M, block_N):
                     acc_s[i, j] = T.if_then_else(
                         (t0 + k) * block_N + j < hist + i % W + 1, 0, -T.infinity(accum_dtype)
@@ -225,7 +263,13 @@ def make_paged_attention_decode(target: str, KVSPLIT: int = 16):
                 for i, d in T.Parallel(block_N, D):
                     p = (t0 + k) * block_N + i
                     bidx = T.min(p // block_size, Mb - 1)
-                    V_shared[i, d] = VCache[BlockTable[bb, bidx], hkv, p % block_size, d]
+                    if kv_fp8:
+                        b_ = BlockTable[bb, bidx]
+                        V_shared[i, d] = T.cast(
+                            T.cast(VCache[b_, hkv, p % block_size, d], "float32")
+                            * VScale[b_, hkv, p % block_size], "bfloat16")
+                    else:
+                        V_shared[i, d] = VCache[BlockTable[bb, bidx], hkv, p % block_size, d]
                 T.gemm(acc_s_cast, V_shared, acc_o, policy=policy)
             # partials in the scaled-log2 domain: PM = max * scale*log2e, PL = sum
             T.copy(acc_o, PO[bb, hkv, sp, :, :])
