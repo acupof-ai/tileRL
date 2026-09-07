@@ -42,6 +42,29 @@ place the arithmetic had to give way. Refusing on an unknown rate would refuse
 every fetch forever, and nothing would ever measure the rate — so `break_even_tokens`
 returns 0 rather than the never-fetch sentinel, and judges from the first fetch on.
 
+**`B` is a mean over all fetches, warm ones included — deliberately.** On a restart
+the spill is usually still in page cache, so the first fetch calibrates warm: 5.66
+GB/s against 0.20 cold on the V100, 28x apart, which collapses `n*` to single
+digits. The obvious repairs are wrong for the same reason. A running minimum tracks
+the cold rate, but `B`'s job is to predict the *next* fetch, and after a restart the
+next fetch is usually warm too — a minimum would refuse reads that would in fact have
+been fast. Skipping the first fetch only moves the same bias one sample later, since
+every subsequent cached read is warm as well. This is the same concession as the
+unmeasured-tier case above, one step on: both accept a `B` that may be wrong in the
+permissive direction, because refusing is the expensive error.
+
+What makes the permissive direction safe is what a wrong `B` actually costs.
+`lookup` declines a prefix whose fetch is still in flight (`kv_cache.py:1127`) and
+returns a miss, so `_admit` proceeds with `matched=0` and the request prefills on the
+spot. Nothing ever waits on a fetch. An over-optimistic `B` therefore buys one queued
+read on the reader thread — not a slower turn, and not a stalled request. The
+deadline at `engine.py:714` is the second bound, not the first; a change that made
+requests wait on a fetch would move it to first and this reasoning would need redoing.
+
+`/health` publishes `prefix_break_even_tokens` as `null` rather than the
+`NEVER_FETCH` sentinel, so a reader is never handed 2147483648 to compare against a
+prompt length.
+
 ## Off the tick
 
 `submit` issues the prefetch: roll the hash, probe `resident()`, enqueue. It takes

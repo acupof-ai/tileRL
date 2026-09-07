@@ -23,6 +23,10 @@ BLOCK_TOKENS = 16
 
 _MASK64 = (1 << 64) - 1
 
+#: `break_even_tokens` when no prefix length pays. Compared against, not printed:
+#: /health reports it as null so a reader is not left dividing 2**31 by a token count.
+NEVER_FETCH = 1 << 31
+
 
 def _rolling_hash(prev: int, token: int) -> int:
     # +1 so token 0 still perturbs the state; collisions are verified by PrefixStore.
@@ -795,6 +799,8 @@ class KvTier:
     def read_bytes_per_s(self) -> float:
         """B in the break-even, from this tier's own fetches: a hardcoded rate would
         describe whichever box it was written on. 0 before anything has been read."""
+        # cumulative mean: B predicts the next fetch, which after a restart is
+        # page-cache-warm too; a minimum refuses fast reads
         return 0.0 if self.fetch_ms <= 0 else self.fetch_bytes / (self.fetch_ms / 1000.0)
 
     def resident(self, key: int) -> bool:
@@ -908,7 +914,7 @@ class NoPrefixStore:
         return False
 
     def break_even_tokens(self, prefill_rate: float) -> int:
-        return 1 << 31
+        return NEVER_FETCH
 
     def abandon_prefetch(self, tokens: Sequence[int]) -> None:
         return None
@@ -996,11 +1002,11 @@ class PrefixStore:
         `R` differ by more than an order of magnitude, so a constant would be wrong on
         one of them (docs/design-ssd-read-path.md).
 
-        Returns 2**31 when `k/B >= 1/R`: the device cannot stream KV as fast as the card
+        Returns NEVER_FETCH when `k/B >= 1/R`: the device cannot stream KV as fast as the card
         recomputes it, and no length pays.
         """
         if self._ssd is None or prefill_rate <= 0:
-            return 1 << 31
+            return NEVER_FETCH
         k = 2 * self._pool.num_layers * self._pool.num_kv_heads * self._pool.head_dim \
             * self._pool.k_pool.element_size()
         b = self._ssd.read_bytes_per_s()
@@ -1009,9 +1015,9 @@ class PrefixStore:
             # unmeasured tier fetches once and calibrates; a restart is the case it exists for
             return 0
         if s <= 0:
-            return 1 << 31
+            return NEVER_FETCH
         denom = 1.0 / prefill_rate - k / b
-        return (1 << 31) if denom <= 0 else int(s / b / denom)
+        return NEVER_FETCH if denom <= 0 else int(s / b / denom)
 
     def prefetch_if_worth_it(self, tokens: Sequence[int], prefill_rate: float) -> bool:
         """Start reading the longest resident prefix, if fetching beats recomputing.
