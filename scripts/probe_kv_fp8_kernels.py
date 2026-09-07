@@ -161,9 +161,19 @@ def q3_readers() -> dict:
     got = be.paged_attention(q, kq, vq, bt, sl, scale, seq_q_lens=sl, k_scale=ks, v_scale=vs)
     r, g = ref.float(), got.float()
     out["shape"] = list(g.shape)
-    out["max_abs_err"] = float((g - r).abs().max())
-    out["max_rel_err"] = float(((g - r).abs() / r.abs().clamp_min(1e-9)).max())
-    out["err_over_amax"] = float((g - r).abs().max() / r.abs().max())
+    # arm 1: the KERNEL's dequant against the same values dequantized by torch. 0.0 here means
+    # the in-kernel multiply is exact -- it is NOT fp8's accuracy cost, because both arms read
+    # the same rounded numbers.
+    out["kernel_dequant_max_abs_err"] = float((g - r).abs().max())
+    out["kernel_dequant_max_rel_err"] = float(((g - r).abs() / r.abs().clamp_min(1e-9)).max())
+    # arm 2: what fp8 KV actually costs -- the fp8 pool against the ORIGINAL bf16 one. Absolute
+    # error over the output's amax, because per-element relative error on an fp8 grid is
+    # unbounded near zero by construction.
+    true_ref = be.paged_attention(q, kv, vv, bt, sl, scale, seq_q_lens=sl).float()
+    out["fp8_vs_bf16_pool_err_over_amax"] = float(
+        (g - true_ref).abs().max() / true_ref.abs().max())
+    out["fp8_vs_bf16_pool_max_abs_err"] = float((g - true_ref).abs().max())
+    out["bf16_pool_out_amax"] = float(true_ref.abs().max())
     # non-vacuous: a WRONG scale must move the output, or this compares two identical paths
     bad = be.paged_attention(q, kq, vq, bt, sl, scale, seq_q_lens=sl,
                              k_scale=ks.roll(1, 0), v_scale=vs)

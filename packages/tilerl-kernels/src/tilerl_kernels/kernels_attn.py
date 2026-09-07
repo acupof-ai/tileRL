@@ -24,7 +24,6 @@ def make_paged_attention_mma(target: str, kv_fp8: bool = False):
     """
     block_N = 64
     accum_dtype = T.float32
-    kv_dtype = "float8_e4m3fn" if kv_fp8 else "bfloat16"
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def paged_attention(
@@ -40,18 +39,22 @@ def make_paged_attention_mma(target: str, kv_fp8: bool = False):
         block_size,
         block_M,
         threads,
+        kv_dtype,
+        sc_blocks,
     ):
         B, S, H, D = T.const("B, S, H, D")
         Hkv = T.const("Hkv")
         NB = T.const("NB")
         Mb = T.const("Mb")
         Q: T.Tensor((B, S, H, D), "bfloat16")
+        # kv_dtype/sc_blocks are jit PARAMETERS, not closure locals: tilelang re-executes
+        # this body with only its own kwargs bound, so a local from the enclosing maker is a
+        # NameError at annotation time. `kv_fp8` below is fine -- that is body control flow,
+        # which the eager builder does see.
         KCache: T.Tensor((NB, Hkv, block_size, D), kv_dtype)
         VCache: T.Tensor((NB, Hkv, block_size, D), kv_dtype)
-        # one scale per (block, head, token) off fp8; a 1-element dummy otherwise, because
-        # the operand list is the same shape for both variants
-        KScale: T.Tensor((NB, Hkv, block_size) if kv_fp8 else (1,), "float32")
-        VScale: T.Tensor((NB, Hkv, block_size) if kv_fp8 else (1,), "float32")
+        KScale: T.Tensor((sc_blocks, Hkv, block_size), "float32")
+        VScale: T.Tensor((sc_blocks, Hkv, block_size), "float32")
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
         SeqQLens: T.Tensor((B,), "int32")
@@ -158,10 +161,9 @@ def make_paged_attention_decode(target: str, KVSPLIT: int = 16, kv_fp8: bool = F
     """
     block_N = 64
     accum_dtype = T.float32
-    kv_dtype = "float8_e4m3fn" if kv_fp8 else "bfloat16"
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
-    def paged_attention_decode(Q, KCache, VCache, KScale, VScale, BlockTable, SeqLens, SeqQLens, PO, PM, PL, scale: T.float32, block_size, block_M):
+    def paged_attention_decode(Q, KCache, VCache, KScale, VScale, BlockTable, SeqLens, SeqQLens, PO, PM, PL, scale: T.float32, block_size, block_M, kv_dtype, sc_blocks):
         B, W, H, D = T.const("B, W, H, D")
         Hkv = T.const("Hkv")
         NB = T.const("NB")
@@ -169,8 +171,8 @@ def make_paged_attention_decode(target: str, KVSPLIT: int = 16, kv_fp8: bool = F
         Q: T.Tensor((B, W, H, D), "bfloat16")
         KCache: T.Tensor((NB, Hkv, block_size, D), kv_dtype)
         VCache: T.Tensor((NB, Hkv, block_size, D), kv_dtype)
-        KScale: T.Tensor((NB, Hkv, block_size) if kv_fp8 else (1,), "float32")
-        VScale: T.Tensor((NB, Hkv, block_size) if kv_fp8 else (1,), "float32")
+        KScale: T.Tensor((sc_blocks, Hkv, block_size), "float32")
+        VScale: T.Tensor((sc_blocks, Hkv, block_size), "float32")
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
         SeqQLens: T.Tensor((B,), "int32")

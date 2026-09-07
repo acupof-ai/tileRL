@@ -999,7 +999,8 @@ class Backend:
                 q,
                 k_cache if fp8 else self._dev(k_cache, torch.bfloat16),
                 v_cache if fp8 else self._dev(v_cache, torch.bfloat16),
-                *self._kv_scale_args(k_scale, v_scale, fp8),
+                *self._kv_scale_args(k_scale, v_scale, fp8, int(k_cache.shape[1]),
+                                     int(k_cache.shape[2])),
                 self._i32(block_table),
                 self._i32(seq_lens),
                 self._i32(seq_q_lens),
@@ -1007,6 +1008,8 @@ class Backend:
                 int(k_cache.shape[2]),
                 block_m,
                 128,
+                "float8_e4m3fn" if fp8 else "bfloat16",
+                int(k_cache.shape[0]) if fp8 else 1,
             )[:, :s]
         else:
             q = self._f32(q)
@@ -1060,20 +1063,28 @@ class Backend:
             self._dev(self._c(q), torch.bfloat16),
             k_cache if fp8 else self._dev(k_cache, torch.bfloat16),
             v_cache if fp8 else self._dev(v_cache, torch.bfloat16),
-            *self._kv_scale_args(k_scale, v_scale, fp8),
+            *self._kv_scale_args(k_scale, v_scale, fp8, int(k_cache.shape[1]),
+                                 int(k_cache.shape[2])),
             self._i32(block_table), self._i32(seq_lens), self._i32(seq_q_lens),
             po, pm, pl, float(scale), int(k_cache.shape[2]), block_m,
+            "float8_e4m3fn" if fp8 else "bfloat16",
+            int(k_cache.shape[0]) if fp8 else 1,
         )
         return self._kernel("paged_attention_combine" + sfx.replace("_fp8", ""))(po, pm, pl, g, w)
 
-    def _kv_scale_args(self, k_scale, v_scale, fp8: bool):
+    def _kv_scale_args(self, k_scale, v_scale, fp8: bool, hkv: int = 1, block_size: int = 1):
         """The (KScale, VScale) operand pair. Off fp8 both makers still take them, so the
-        argument list has one shape; a 1-element dummy is cheaper than two kernel variants."""
+        argument list has one shape rather than two kernel variants.
+
+        The off-fp8 dummy is (1, Hkv, block_size), not (1,) or (1,1,1): Hkv and block_size
+        come from T.const, so they are bound from the REAL operands and the dummy must agree
+        or the packed ABI check rejects it."""
         if not fp8:
-            d = self._ones_cache.get("kv_scale_dummy")
+            key = ("kv_scale_dummy", hkv, block_size)
+            d = self._ones_cache.get(key)
             if d is None:
-                d = self._ones_cache["kv_scale_dummy"] = torch.ones(
-                    1, dtype=torch.float32, device=self.device)
+                d = self._ones_cache[key] = torch.ones(
+                    1, hkv, block_size, dtype=torch.float32, device=self.device)
             return d, d
         if k_scale is None or v_scale is None:
             raise ValueError("an fp8 KV plane needs its k_scale/v_scale; passing the pool's "
