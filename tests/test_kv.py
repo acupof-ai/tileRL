@@ -12,6 +12,7 @@ from tilerl.kv_cache import (
     LinearStatePool,
     PagedKvPool,
     PrefixStore,
+    _nbytes,
 )
 
 
@@ -299,6 +300,45 @@ def test_a_partial_block_cannot_be_published():
     assert store.insert(list(range(32)), blocks) is True
 
 
+
+
+@pytest.mark.xfail(strict=True, reason="open: LRU evicts the shared prefix first, "
+                   "errors/2026-09-07-a-prompts-own-publishes-evict-its-shared-prefix.md")
+def test_a_prompts_own_publishes_evict_the_prefix_it_shares():
+    """One conversation publishes a nested family of keys -- 6 at prefill chunk ends plus
+    one per 16 generated tokens -- and LRU keeps the LONGEST, evicting the shared header its
+    own tail displaced. strict=True: this goes red the day it is fixed."""
+    def run(entries: int) -> tuple[int | None, int]:
+        pool = PagedKvPool(64, 1, 4, device=torch.device("cpu"))
+        snap = (torch.zeros(8, 8, 8), None)
+        store = PrefixStore(pool, state_bytes=entries * _nbytes(snap))
+        header = list(range(2 * BLOCK_TOKENS))
+        convo = header + list(range(500, 500 + 6 * BLOCK_TOKENS))
+        for i in range(1, 9):                                 # 8 boundary publishes
+            blocks = [pool.alloc_block() for _ in range(i)]
+            store.insert(convo[: i * BLOCK_TOKENS], blocks,
+                         (torch.zeros(8, 8, 8), None))
+            for b in blocks:
+                pool.free_block(b)
+        hit = store.lookup(header + list(range(9000, 9000 + 3 * BLOCK_TOKENS)))
+        return (None if hit is None else hit.length), store.stats()["evictions"]
+
+    # The control first: with room for every publish the second session HITS, so the header
+    # entry is published correctly and the failure below is eviction, not absence.
+    length, evictions = run(99)
+    assert (length, evictions) == (2 * BLOCK_TOKENS, 0), (
+        f"control: an ample budget must serve the shared header, got {length} with "
+        f"{evictions} evictions -- if this fails the probe is wrong, not the store"
+    )
+
+    length, evictions = run(3)
+    assert evictions > 0, "fixture: a 3-entry budget evicted nothing, so nothing is under test"
+    assert length == 2 * BLOCK_TOKENS, (
+        f"a second session sharing the {2 * BLOCK_TOKENS}-token header got "
+        f"{'a miss' if length is None else f'length {length}'} after one conversation's own "
+        f"{evictions} evictions: LRU ranked this prompt's tail above a prefix another "
+        "session can use"
+    )
 
 
 def test_prefix_state_budget_evicts():
