@@ -819,6 +819,8 @@ class Engine:
                 "prefix_blocks_freed": store["blocks_freed"],
                 "prefix_entries": store["entries"],
                 "prefix_capacity": store["capacity"],
+                # `capacity` is the count cap; the byte budget is what binds.
+                "prefix_entries_capacity": store["entries_capacity"],
                 "prefix_state_bytes": store["state_bytes"],
                 "prefix_state_bytes_budget": store.get("state_bytes_budget", 0),
                 # Present only with a host tier; a demotion is a prefix the card could not

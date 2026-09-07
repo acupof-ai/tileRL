@@ -311,6 +311,15 @@ def test_prefix_state_budget_evicts():
     assert store.stats()["entries"] == 2 and store.stats()["state_bytes"] == 800
     assert store.lookup(list(range(16))) is None
     assert store.lookup(list(range(16, 32))).state[0].shape == (100,)
+    # `entries_capacity` must track the byte budget, not restate the count cap.
+    assert store.stats()["entries_capacity"] == 2, (
+        f"1000 B of budget at 400 B per snapshot holds 2, not "
+        f"{store.stats()['entries_capacity']}; the derived cap is not reading the budget"
+    )
+    assert store.stats()["capacity"] > store.stats()["entries_capacity"], (
+        "the fixture's count cap does not exceed its byte cap, so this cannot tell a derived "
+        "value from a restated one"
+    )
 
 
 def test_a_block_costs_2125_kib_at_the_27b_shape():

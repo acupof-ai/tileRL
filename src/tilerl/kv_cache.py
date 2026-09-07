@@ -917,7 +917,7 @@ class NoPrefixStore:
         return None
 
     def stats(self) -> dict[str, int]:
-        return {"entries": 0, "capacity": 0, "state_bytes": 0,
+        return {"entries": 0, "capacity": 0, "entries_capacity": 0, "state_bytes": 0,
                 "lookups_matched": 0, "lookups_missed": 0,
                 "evictions": 0, "blocks_freed": 0}
 
@@ -1264,6 +1264,10 @@ class PrefixStore:
         st = {
             "entries": len(self._by_id),
             "capacity": self.capacity,
+            # A snapshot is a constant size at any prefix length, so `state_bytes` is the
+            # ceiling that binds, not `capacity`.
+            "entries_capacity": (min(self.capacity, self.state_bytes // self._snapshot_bytes)
+                                 if self._snapshot_bytes > 0 else self.capacity),
             "state_bytes": self._state_used,
             # The budget beside the fill, for the reason `dram_budget` exists: `state_bytes`
             # alone cannot say whether the store is at its ceiling, so a reader cannot tell
