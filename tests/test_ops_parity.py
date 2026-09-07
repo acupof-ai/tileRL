@@ -974,6 +974,34 @@ def test_fp4_twiddle_round_trip():
     assert torch.equal(untwiddle_fp4(tw), wq)
 
 
+def test_frozen_bwd_wide_warpgroup_parity(backend):
+    """dX at the M that takes the 128-thread warpgroup, and at an M that does not.
+
+    `linear_frozen_bwd` picks bM=128 + threads=128 only when m >= 128 (backend.py:1126); the
+    wide warpgroup emits wgmma where 64 threads emit the Ampere mma.sync, so the two M ranges
+    run different tensor-core instructions through the same shared-memory dequant. m=64 pins
+    the narrow cell, so widening the threshold later has to break this test rather than pass
+    silently.
+
+    Off a cell with `linear_fp4_bwd` this is a tautology -- both sides are
+    `reference.linear_frozen_bwd` -- and the CPU target is such a cell. It is asserted anyway
+    (the shapes and the oscale fold still have to line up) but the kernel comparison this test
+    is named for happens only on sm90, which is where the sweep behind that dispatch ran.
+    """
+    torch.manual_seed(7)
+    n, k = 256, 128
+    wq, scale = pack_fp4(torch.randn(n, k))
+    osc = torch.rand(n) + 0.5
+    kernel_path = backend.has_kernel("linear_fp4_bwd")
+    for m in (64, 128, 192):
+        g = torch.randn(m, n)
+        _assert_close(
+            backend.linear_frozen_bwd(g, wq, scale, oscale=osc),
+            reference.linear_frozen_bwd(g, wq, scale, oscale=osc),
+            f"linear_frozen_bwd M={m} (kernel={kernel_path})",
+        )
+
+
 def test_frozen_bwd_chunking_matches_whole():
     """Chunked dX equals the one-shot result: a chunk boundary that splits an
     fp8 128-row scale block reads the wrong scale."""
