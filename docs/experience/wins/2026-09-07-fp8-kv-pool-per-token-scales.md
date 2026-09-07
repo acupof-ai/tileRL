@@ -40,6 +40,21 @@ heads x 256 head_dim, measured off a real pool rather than computed:
 bytes. And a decode tick reads the 27B's weights every token regardless, so even a
 fully converted reader path makes this a fraction of the tick, not a halving of it.
 
+The weights are **22.76 GiB resident** (24436981888 bytes, summed off the loaded model),
+not the ~12.6 GiB the NVFP4 checkpoint occupies on disk. Every ceiling below is against
+the measured figure; my first set used the on-disk number and overstated all of them:
+
+| cell | KV share of a decode tick, bf16 | ceiling | I first said |
+|---|---:|---:|---:|
+| B=1 ctx=8k | 2.1% | **1.011x** | 1.019x |
+| B=1 ctx=32k | 8.1% | **1.041x** | 1.072x |
+| B=8 ctx=8k | 14.9% | **1.079x** | 1.13x |
+| B=8 ctx=32k | 41.3% | **1.255x** | 1.380x |
+| B=32 ctx=32k | 73.8% | **1.570x** | 1.699x |
+
+A resident footprint is not a file size, and a ratio built on the wrong denominator is
+wrong in the direction that flatters the change.
+
 A byte figure carries its dtype or it is half an answer: the same expression over the
 same config gives 1.0 MiB on the H20's bf16 pool and 2.0 MiB on the V100's f32 one
 (`Backend.io` is f32 for cpu/metal/sm70). Two sessions each stated one of those as
@@ -278,9 +293,9 @@ No rate, because the run OOMed after those two arms for the reason in the traps 
 
 Still pending, and it needs a card window with the 42 GB checkpoint:
 
-1. **decode tok/s at B=8 ctx=8k**, whose ceiling is 1.13x. The one number this entry
-   still does not have, and the reason B=1 is not the cell: its ceiling is 1.019x at 8k
-   and 1.072x at 32k, both under run-to-run variance.
+1. **decode tok/s at B=8 ctx=8k**, whose ceiling is 1.079x. The one number this entry
+   still does not have, and the reason B=1 is not the cell: its ceiling is 1.011x at 8k
+   and 1.041x at 32k, both under run-to-run variance.
 2. **the capacity demonstration** — the two fitted block counts on one card, and how many
    of a B=32 x 32k batch each pool holds resident.
 

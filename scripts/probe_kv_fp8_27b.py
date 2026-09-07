@@ -183,11 +183,15 @@ def arm_decode(cfg, model, backend, ctx: int, n_new: int, batch: int = 1) -> dic
 
     Reports the KV share of a tick's bytes and the resulting CEILING before the measured
     ratio. A decode tick re-reads the 27B's weights every token regardless, so fp8 KV can
-    only act on the KV part -- and at B=1 that part is small: 3.8% of the tick at 8k, 13.7%
-    at 32k, so the ceilings are 1.019x and 1.072x, under run-to-run variance. KV scales with
-    batch while the weights do not, which is where the win is: 56% of the tick and a 1.38x
-    ceiling at B=8 ctx=32k, 84% and 1.70x at B=32. A ratio quoted without its ceiling reads
-    as though fp8 moved the whole tick.
+    only act on the KV part -- and at B=1 that part is small: 2.1% of the tick at 8k, 8.1%
+    at 32k, so the ceilings are 1.011x and 1.041x, under run-to-run variance. KV scales with
+    batch while the weights do not, which is where the win is: 41% of the tick and a 1.255x
+    ceiling at B=8 ctx=32k, 74% and 1.570x at B=32 ctx=32k. A ratio quoted without its
+    ceiling reads as though fp8 moved the whole tick.
+
+    Every figure here is against the MEASURED weight footprint, 24436981888 bytes = 22.76
+    GiB resident. The NVFP4 checkpoint is ~12.6 GiB on disk and my first ceilings used that,
+    which overstated all of them (1.019x/1.072x/1.38x/1.70x for the cells above).
     """
     prompts = [torch.randint(3, cfg.vocab_size - 1, (ctx,)).tolist() for _ in range(batch)]
     out: dict = {"ctx": ctx, "batch": batch, "new_tokens": n_new}
@@ -331,7 +335,7 @@ def main() -> int:
                          "blocks show as extra resident requests; 0 skips the arm")
     ap.add_argument("--decode-batch", type=int, nargs="*", default=[1, 8],
                     help="batch sizes. KV scales with batch and the weights do not, so B=1 "
-                         "has a 1.019x/1.072x ceiling at 8k/32k while B=8 at 32k has 1.38x "
+                         "has a 1.011x/1.041x ceiling at 8k/32k while B=8 at 32k has 1.255x "
                          "-- B=1 alone cannot show this flag working")
     a = ap.parse_args()
 
