@@ -1,21 +1,30 @@
-# fp8 KV pool, per-token scales — cpu (parity) + sm90 (pending-remote), 2026-09-07
+# fp8 KV pool and fp8 attention readers, per-token scales — sm90 + cpu, 2026-09-07
 
-> Status: Shipped (flag, default off) — **no tok/s claim**; the card arms are pending-remote
+> Status: Shipped (flag, default off) — writers and readers both fp8, gated on card.
+> **No tok/s claim yet**: the 27B decode arms are pending-remote.
 
 ## Context
 
 `--kv-fp8` stores the KV planes in e4m3 instead of bf16. The plane is what a decode
 tick re-reads per token at long context, so halving it is the reason to want this.
 
-**This entry claims no speedup, and the reason is structural rather than pending.**
-The pool and both writers are fp8; the attention *readers* still take a dequantized
-plane, because `kv_layer()` dequantizes the whole plane per call. So the bytes moving
-through the gather on a decode tick are unchanged, and a tok/s number measured today
-would be measuring nothing. Converting the readers is the next PR and is where the
-bandwidth win lives.
+**The pool alone was a regression, not a partial win, and that is what forced the
+readers into the same change.** With the pool fp8 and the attention kernels still
+reading bf16, `kv_layer()` dequantized the *whole plane* per call — every block,
+including ones the request never touches. One tick's 16 calls at the 27B's pool shape:
 
-What this entry does settle is the scale geometry, the append rule, the dtype, and
-four things that were wrong in the design note or the tree.
+| accessor | bf16 pool | fp8 pool |
+|---|---:|---:|
+| `kv_layer()` | 0.01 ms | **64.49 ms** |
+| `kv_operands()` (raw planes + scales) | 0.07 ms | **0.04 ms** |
+
+The cost scaled with `num_blocks`, not with the sequence: 31 / 102 / 491 ms at 128 /
+512 / 2048 blocks, against `kv_operands` flat at 0.020 / 0.018 / 0.021. A capacity flag
+that gets *worse* as the pool grows is backwards, so this entry covers both halves.
+
+What it settles: the scale geometry, the append rule, the dtype, the reader conversion,
+three defects the tree already had, and five claims that were wrong in the design note
+or in my own earlier messages.
 
 ## The bound any later tok/s claim sits under
 
@@ -62,19 +71,36 @@ times, which is the signature that distinguishes compounding from ordinary
 quantization error. Staging fixes it, at 32 KiB per open block per plane. Per-token
 needs neither buffer nor read-modify-write: it is idempotent by construction.
 
-**Accuracy does not separate the grids.** Measured on tiny, both give an identical
-**5.882e-2** worst element — that is e4m3's 3-mantissa-bit floor, not a grid property.
-Per-token moves only the typical element, 2.17e-2 → 2.04e-2, 6%. The design note had
-claimed the coarse grid's accuracy cost was "the number the accuracy gate has to
-produce"; it was not, and the note is corrected. The coarse grid was a write-path
-hazard, not an accuracy one.
+**Accuracy separates the grids too, in the metric that bounds the logit — and an earlier
+draft of this entry said it did not.** Error over the row's amax, measured on the pool a real
+prefill filled:
+
+| grid | K | V |
+|---|---:|---:|
+| per `(block, head, token)` — shipped | 0.0357 | 0.0354 |
+| per `(block, head)` | 0.0585 | 0.0574 |
+
+**1.64x.** The earlier draft read them as identical at 5.882e-2, from a per-element relative
+statistic — and that statistic *cannot* distinguish them, because both grids saturate e4m3's
+near-amax bound, so it reads the same number for any grid. Two lessons, not one: the grid
+choice was already settled by the writer's launch shape, so the wrong number changed no
+decision; but it was quoted to three sessions as evidence, and evidence that cannot come out
+differently is not evidence.
+
+**5.882e-2 is not e4m3's floor**, which an earlier draft also claimed. It is the bound near a
+row's absmax. One e4m3 code is worth up to 100% relative at 3 mantissa bits, so a small
+element in a wide-range row exceeds it: over 8 seeds two fixtures read 0.268 and 0.067.
+Restricted to elements above 1% of their row's amax the worst is back at 0.0586. Per-element
+relative error on an fp8 grid is unbounded near zero by construction, which is why the
+accuracy column here is absolute error over the row's amax.
 
 **e4m3 over e5m2 on measurement.** 1.89x better on the worst element (5.882e-2 vs
 1.111e-1), 2.14x on the typical, and `zeroed_frac` 0.000% in all eight arms at an
 in-block dynamic range up to 3.1e4 — nothing underflowed, so e5m2's extra range buys
-nothing it could be paid for with. The note had left this open on the grounds that
-picking now would be picking by analogy with the weight path; it is now picked by
-measurement, with the 27B gate free to overturn it.
+nothing it could be paid for with. Confirmed on real 27B-shaped KV at both grids: e5m2
+reads 0.0714/0.1094 where e4m3 reads 0.0357/0.0574. The note had left this open on the
+grounds that picking now would be picking by analogy with the weight path; it is picked by
+measurement.
 
 **`attn_prep_fp8` takes its K amax post-RoPE.** RoPE is a rotation: it preserves the
 pairwise norm but not the per-element absmax. Over 2000 random rows at D=256, RD2=64,
@@ -117,13 +143,57 @@ KV bytes are computed in **three** places, not one — `bytes_per_token`, `_fit_
 (which must reimplement it from `cfg`, since it runs before the pool exists), and
 `scripts/probe_block_bytes.py`. They agree by hand-maintained duplication.
 
+## What the card measured
+
+Two writer arms and two reader arms, all on H20 card 0. The reader pair is two numbers
+because the obvious single number was misleading:
+
+| arm | number | what it says |
+|---|---:|---|
+| scalar fp8 load + scale → bf16 tile, vs torch | **0.0** | the reader change lowers at all, exactly |
+| writers vs `reference.quant_kv_fp8`, 8 seeds | byte delta **1** on 7, **0** on 1 | see below |
+| readers: kernel dequant vs torch's, same values | **0.0** | the in-kernel multiply is right |
+| readers: fp8 pool vs **bf16** pool | **3.16%** of output amax | what fp8 KV actually costs |
+
+The first reader number was the whole gate in my first draft, reported as
+`max_abs_err: 0.0`. It is exact and it is nearly meaningless: the oracle read the
+*dequantized* pool, so both arms saw identical numbers, and 0.0 only says the multiply
+is right. The accuracy question needs the original bf16 pool as the reference, which is
+the fourth row — 0.0117 absolute against an output amax of 0.371.
+
+**The writers are not bit-identical, and the difference is measured to be ties.** Byte
+delta is exactly 1 on seven of eight seeds, never 2; the scale agrees to 1.19e-07 (one
+f32 ulp); and every differing element sits **9.5e-07** from the midpoint between its two
+candidate e4m3 codes. So `T.cast` and torch's `.to()` round opposite ways on exact
+midpoints — a tie-break, not a disagreement. That claim needed the midpoint distance:
+"byte delta is 1" alone is equally consistent with a real error.
+
+The fixture had to be seeded to say any of this. Unseeded, `bitexact` read false on one
+run and true on the next, and **the difference was the draw** — neither reading meant
+anything, and I reported the second one as a correction of the first before noticing.
+
+## Traps, each a rule for the next kernel in this tree
+
+- `T.alloc_fragment((2,), ...)` then `part[1]` is rejected: *"Only fragment[0] access is
+  allowed."* A fragment is per-thread, so a two-quantity reduction needs two 1-element
+  fragments, not one of size 2.
+- A **closure local** in a `T.Tensor` annotation is a `NameError` at build time — the
+  eager builder re-executes the body with only its own kwargs bound. A jit **parameter**
+  in the same position works, tested directly, which is what lets one body serve both
+  dtypes instead of the duplication `write_tokens_f32` needed for exactly this reason.
+- The off-fp8 dummy scale must be `(1, Hkv, block_size)`, not `(1,)`: `Hkv` and
+  `block_size` come from `T.const` and are bound from the real operands, so a mismatched
+  dummy fails the packed-ABI check.
+
 ## The gate, and its negative control
 
-`paged_attention` raises `TypeError` on a raw fp8 plane. `_dev` would have up-cast it
-with no scale — 448x too small, finite, and plausible enough that **both** the
-token-agreement and max-logit gates pass with the treatment entirely absent. This is
-the third instance of that class in this work; the first two were the bare
-`.to(fp8)` cast and the fused writers scattering into a dequantized copy.
+`paged_attention` raises on a raw fp8 plane with no scale. `_dev` would have up-cast it
+— 448x too small, finite, and plausible enough that **both** the token-agreement and
+max-logit gates pass with the treatment entirely absent. This is the third instance of
+that class in this work; the first two were the bare `.to(fp8)` cast and the fused
+writers scattering into a dequantized copy. The refusal sits **above** the arm dispatch,
+because the sm70 split arm reached `self._f32(k_cache)` with the same exposure — a
+per-arm guard would have covered the arm I was looking at.
 
 Token agreement cannot see a scale-less cast at all: e4m3 is a float format, and the
 tiny model's KV sits inside its range, so the mutant generates the identical 6 tokens.
@@ -141,33 +211,42 @@ because that error compounds where the round-trip number does not — and check 
 FIRST element written, which is where compounding shows and where a max-over-tensor
 statistic hides it.
 
+Second rule, from four instrument failures in one day: **a control is evidence only if
+you can name the mechanism by which it would fail.** An unseeded fixture, a marker
+written before the seed, the wrong directory, and a range arm handed an already-quantized
+pool each produced a plausible number that would have shipped. Three of them read as a
+*pass*.
+
 ## Results
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
 | 2026-09-07 | 0d14ab2 | this Mac | cpu | tiny | — | — | — (parity only) |
+| 2026-09-07 | e2d30c3 | H20 card 0 | sm90 | (kernel arms) | — | — | — (correctness only) |
 | pending-remote | | H20 card 0 | sm90 | qwen38-27b | | | |
 
-The cpu row is a parity and byte-accounting row: 471 tests pass, the fp8 gate green
-with its negative control, no timing claimed — the C backend cannot codegen fp8 at
-all, so the writers are card-only.
+The cpu row is parity and byte accounting: 473 tests pass, the fp8 gate green with its
+negative control, no timing claimed — the C backend cannot codegen fp8 at all, so both
+the writers and the readers are card-only.
 
-The pending sm90 arms, each its own `pod_run.sh` invocation under its own claim name:
+The sm90 row is the four arms above, run under `tilerl-kvfp8-gate3` … `-read4`. Kernels
+compile, parity is ties-only, and the reader path costs 3.16% of the output amax.
 
-1. **`tilerl-kvfp8-gate`** — the two writers compile and the parity gate passes
-   against the bf16 pool through the same kernels. Nothing else can be believed until
-   this runs; the kernels have never been compiled.
-2. **`tilerl-kvfp8-range`** — the 27B's real per-block dynamic range and round-trip
-   error, both grids, e4m3 and e5m2. Confirms or overturns the tiny-model e4m3 verdict
-   on the model that ships. The coarse column is the record of what was not chosen.
-3. **decode tok/s at 8k and 32k** — deferred to the reader-conversion PR, because with
-   the readers on a dequantized plane there is nothing for it to measure.
+Still pending, and it needs a card window with the 42 GB checkpoint:
 
-Raw artifacts: none yet for sm90. The tiny-model grid and range numbers reproduce with
-`uv run python scripts/probe_kv_fp8_range.py --model tiny --prompt-tokens 256`; the
-append-rule and RoPE-absmax numbers were measured in one-off scripts and are restated
-in the reference self-check and the `attn_prep_fp8` docstring rather than kept as
-files.
+1. **27B agreement + logit error** at 2048 prompt tokens, fp8 pool against bf16 through
+   the same engine. `scripts/probe_kv_fp8_27b.py`, smoke-tested on tiny (agreement 1.0,
+   4/4 tokens) but never run on the 27B.
+2. **27B range, both grids, both dtypes** — from the same script, on the pool a real
+   prefill filled. On tiny-shaped real KV it already reproduces the 1.64x grid gap and
+   the e4m3 verdict.
+3. **decode tok/s at 8k and 32k.** This now has something to measure — the readers move
+   half the bytes — but it is the one number this entry still does not have.
+
+Raw artifacts: `scripts/probe_kv_fp8_kernels.py` (the four card arms, JSON on stdout)
+and `scripts/probe_kv_fp8_27b.py` (the 27B arms). The append-rule and RoPE-absmax
+numbers were measured in one-off scripts and are restated in the reference self-check
+and the `attn_prep_fp8` docstring rather than kept as files.
 
 ## What this does not claim
 

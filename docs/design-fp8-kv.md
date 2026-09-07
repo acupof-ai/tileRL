@@ -96,11 +96,16 @@ is idempotent by construction. `reference.py`'s self-check asserts a
 dequantize-patch-requantize append is **bit-identical** to one-shot quantization, and that
 assert reads False on the coarse grid, which is what makes it non-vacuous.
 
-Accuracy is **not** what separates the grids, against this note's first draft. Measured on
-tiny (`scripts/probe_kv_fp8_range.py`), both grids give the identical worst element,
-5.882e-2 — that is e4m3's 3-mantissa-bit floor, not a grid property. Per-token moves only
-the typical element, 2.17e-2 to 2.04e-2, 6%. So the coarse grid was never the accuracy
-risk the first draft claimed; it was a write-path hazard.
+Accuracy separates the grids too, but only in the right metric, and this note's first
+draft got it wrong twice. In **absolute error over the row's amax** — what bounds the
+attention score — per-token beats per-block **1.64x** on real KV: 0.0357 against 0.0585
+on K, 0.0354 against 0.0574 on V. The first draft reported them as identical at 5.882e-2,
+from a per-element *relative* statistic that cannot distinguish them at all, because both
+grids saturate e4m3's near-amax bound. And 5.882e-2 is not e4m3's floor either: one code
+is worth up to 100% relative at 3 mantissa bits, so a small element in a wide-range row
+exceeds it (0.268 on one of 8 seeds); restricted to elements above 1% of their row's amax
+the worst is 0.0586. Per-element relative error on an fp8 grid is unbounded near zero by
+construction, so it is not the accuracy column.
 
 ## 3. Card-only parity, and what the oracle is
 
@@ -179,14 +184,26 @@ is 0.000% in all eight arms at an in-block dynamic range up to 3.1e4, so nothing
 underflowed and e5m2's extra range buys nothing it could be paid for with. The 27B gate
 can overturn this; e4m3 is the null it has to beat, not an open question.
 
-**Not settled: whether the readers should take fp8 operands at all.** The pool is fp8
-and the writers quantize, but `kv_layer()` still dequantizes the whole plane per call
-(marked ponytail) and the attention makers still read bf16. That is a correctness
-vehicle, not the bandwidth win — the decode tick still moves bf16 bytes out of the
-gather. `paged_attention` raises `TypeError` on a raw fp8 plane rather than up-casting
-it, because `_dev` would produce values ~448x too small: finite, plausible, and passing
-both the token-agreement and logit gates with the scale absent. Converting the readers
-is what makes the tok/s claim, and it is the next PR.
+**Settled since: the readers take fp8 operands.** Both attention makers do the gather as
+one multiply against the scale plane, indexed at the same block-table position, with
+`K_shared`/`V_shared` still bf16 so the gemms, accumulators and softmax are untouched.
+Measured on card first, because nothing in this tree read a *scalar* fp8 element before —
+every prior fp8 use is a GEMM operand going into `T.gemm` or a dequant macro: a scalar fp8
+load times its scale into a bf16 tile is bit-exact against torch, `max_abs_diff` 0.0.
+
+`kv_layer()` is no longer the attention path. It dequantized the whole plane per call —
+**64.49 ms against `kv_operands()`'s 0.04 ms** for one tick's 16 calls, scaling with
+`num_blocks` rather than with the sequence — so the pool-only version was a regression
+behind a flag, not a partial win. It stays for the CPU cell, which has no fp8 twin
+possible, and `_kv_operands` in `model.py` picks per cell.
+
+`paged_attention` refuses a raw fp8 plane with no scale, **above** the arm dispatch:
+`_dev`/`_f32` would up-cast it ~448x too small, finite, and passing both the
+token-agreement and logit gates with the scale absent. Above the dispatch because the sm70
+split arm had the same exposure as the sm90 one.
+
+**Not settled: decode tok/s.** The readers now move half the bytes, so the measurement is
+finally meaningful, but it needs the 27B on a card and has not run.
 
 **Not settled: what the cascade does to a multi-session number.** A miss publishes ~62
 interior entries at a 31k prompt and each evicts another session's shared head
