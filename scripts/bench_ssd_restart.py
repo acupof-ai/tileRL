@@ -250,6 +250,15 @@ def _arm(args, name: str, spill: str, prompt: str) -> dict:
         "ssd_refusals": d("ssd_refusals"),
         "prefix_hits": d("prefix_hits"),
         "prefix_published": d("prefix_published"),
+        # The async path (row 50 PR B). tick_loads is the one that can refute the
+        # claim: a fault served from a torch.load on the calling thread is the
+        # synchronous path, whatever the wall clock says.
+        "ssd_prefetches": d("ssd_prefetches"),
+        "ssd_fetches_ready": d("ssd_fetches_ready"),
+        "ssd_fetch_drops": d("ssd_fetch_drops"),
+        "ssd_tick_loads": d("ssd_tick_loads"),
+        "prefill_rate": after.get("prefill_rate"),
+        "break_even_tokens": after.get("prefix_break_even_tokens"),
     }
 
 
@@ -308,6 +317,23 @@ def main() -> None:
     rows.append(_arm(args, "control", ctrl_dir, turn2))
     print(json.dumps(rows[-1]), flush=True)
 
+    # Below the break-even, on purpose. Without it the bench cannot tell "the threshold
+    # works" from "fetching is always better": every other arm is above n*, so a build
+    # that ignored the threshold entirely would produce the same three rows. This arm's
+    # pass condition is that it does NOT prefetch.
+    short_dir = args.spill + "_short"
+    shutil.rmtree(short_dir, ignore_errors=True)
+    os.makedirs(short_dir, exist_ok=True)
+    n_star = rows[1].get("break_even_tokens") or 0
+    short_tokens = max(16, n_star // 2)   # 16 = BLOCK_TOKENS; this script drives a server
+                                          # over HTTP and does not import the package
+    if 0 < n_star < (1 << 31):
+        short = _prompt(short_tokens)
+        rows.append(_arm(args, "below_break_even", short_dir, short))
+        print(json.dumps(rows[-1]), flush=True)
+        rows.append(_arm(args, "below_break_even_2nd", short_dir, short + " " + _FOLLOWUP))
+        print(json.dumps(rows[-1]), flush=True)
+
     cold, faulted, control = rows
     # The ceiling: a hit can save at most the prefill of the tokens it actually covered,
     # at the cold arm's own per-token rate. `matched` is read off the largest SERVABLE
@@ -361,7 +387,31 @@ def main() -> None:
         "faulted_recovered_entries": faulted["ssd_recovered"],
         "faulted_ssd_hits": faulted["ssd_hits"],
         "control_ssd_hits": control["ssd_hits"],
+        # Row 50 PR B. tick_loads is what says the fetch was asynchronous: a fault served
+        # by a torch.load on the calling thread is the old synchronous path and would show
+        # the same wall clock on this arm, since nothing else is running.
+        "faulted_prefetches": faulted["ssd_prefetches"],
+        "faulted_fetches_ready": faulted["ssd_fetches_ready"],
+        "faulted_tick_loads": faulted["ssd_tick_loads"],
+        "faulted_fetch_drops": faulted["ssd_fetch_drops"],
+        "prefill_rate": faulted.get("prefill_rate"),
+        "break_even_tokens": faulted.get("break_even_tokens"),
     }
+    below = [r for r in rows if r["arm"].startswith("below_break_even")]
+    if below:
+        verdict["below_break_even_prefetches"] = sum(r["ssd_prefetches"] for r in below)
+        verdict["below_break_even_tokens"] = below[0]["prompt_tokens"]
+        if verdict["below_break_even_prefetches"]:
+            verdict["INVALID"] = (
+                f"a {below[0]['prompt_tokens']}-token prompt prefetched with a break-even "
+                f"of {verdict['break_even_tokens']}: the threshold is not gating anything, "
+                "so the other arms measure 'fetching is always on', not 'fetching wins'"
+            )
+    elif verdict["break_even_tokens"] in (None, 1 << 31):
+        verdict["below_break_even"] = (
+            "skipped: no finite break-even was reported, so no prompt can be placed "
+            "below it -- the threshold went untested this run"
+        )
     # The assertions that decide whether the number means anything.
     if any(r["compiles"] for r in rows):
         verdict["INVALID"] = (
