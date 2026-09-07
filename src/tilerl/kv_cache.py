@@ -1300,8 +1300,9 @@ class PrefixStore:
             st.update(self._ssd.stats())
             st["ssd_hits"] = self.ssd_hits
             st["ssd_faults"] = self.ssd_faults
-            # a lookup that declined an in-flight fetch: high with hits at 0 means the
-            # rows are being admitted before their own prefetch lands
+            # lookups that found a fetch still reading. On an engine that holds such a
+            # row this stays 0 -- the row waits before it asks -- so nonzero here with
+            # ssd_hits at 0 means something looked up without going through the hold.
             st["ssd_fetch_waits"] = self.fetch_waits
         return st
 
