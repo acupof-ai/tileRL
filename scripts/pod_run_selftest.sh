@@ -182,4 +182,34 @@ grep -q "^release " "$TMP/a2/claims.txt" || fail "arm 2: release never ran after
 # macOS's launchd reaps. Verified directly on the pod instead: a child whose bash parent exits
 # reads `stat=Zs ppid=1`, the same child under a parent that waits reads reaped. A grep for
 # stat=reaped here would pass against a wrapper with the reaping removed.
-echo "PASS: a wrapper-launched job claims via --wait-for-device, a direct-python one via --require-device, a multi-arm wrapper re-claims per arm, a reused claim is not a refusal, and an unclaimable job exits 4 and releases"
+# ---- arm 6: a multi-word quoted argument must survive into the runner -----------------
+# `CMD="$*"` flattened argv and the runner's unquoted `setsid $CMD` re-split it, so
+# `-- bash -c '<script>'` reached the pod as `bash -c` with no operand: exit 2, card claimed,
+# nothing running, and the caller saw `started` and exit 0 (2026-09-08). The negative control is
+# the point -- this arm passes trivially unless the runner text actually preserves the quoting,
+# so it greps for the SCRIPT BODY, which only appears if the argument survived as one word.
+emitted=$(POD_RUN_EMIT_RUNNER=1 AUPAI="$TMP/aupai" REMOTE_DIR="$TMP/work" \
+  bash "$ROOT/scripts/pod_run.sh" selftest 6 -- bash -c 'echo one two; echo three')
+# `printf %q` escapes rather than quotes, so the body appears as `echo\ one\ two\;\ echo\ three`.
+# Testing for the literal string would test the escaping STYLE; what matters is that re-splitting
+# the line yields one argument, which only execution can show. So: assert the operand is present in
+# some form, then run it.
+grep '^setsid' <<<"$emitted" | grep -q "bash -c" \
+  || fail "arm 6: the setsid line lost 'bash -c': $(grep '^setsid' <<<"$emitted")"
+grep '^setsid' <<<"$emitted" | grep -q "one" \
+  || fail "arm 6: the quoted argument vanished from the runner: $(grep '^setsid' <<<"$emitted")"
+# Execute it, because surviving into the TEXT is not surviving into bash's argv.
+mkdir -p "$TMP/a6"
+printf '%s\n' "$emitted" > "$TMP/a6/runner.sh"
+sed -i.bak -e "s#> /work/#> $TMP/work/#g" "$TMP/a6/runner.sh"
+set +e
+( cd "$TMP/work" && CLAIM_MODE=shell_then_device CLAIM_LOG=$CLAIM_LOG bash "$TMP/a6/runner.sh" \
+    > "$TMP/a6/wrapper.out" 2>&1 )
+echo $? > "$TMP/a6/rc"
+set -e
+grep -q "one two" "$TMP/work/selftest.log" \
+  || fail "arm 6: bash -c did not run the quoted script (this is the 'option requires an argument' bug): $(cat "$TMP/a6/wrapper.out" 2>/dev/null | head -3)"
+grep -q "option requires an argument" "$TMP/a6/wrapper.out" \
+  && fail "arm 6: bash -c reached the pod with no operand: $(cat "$TMP/a6/wrapper.out")"
+
+echo "PASS: a wrapper-launched job claims via --wait-for-device, a direct-python one via --require-device, a multi-arm wrapper re-claims per arm, a reused claim is not a refusal, an unclaimable job exits 4 and releases, and a quoted multi-word command survives argv"
