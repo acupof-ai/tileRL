@@ -168,8 +168,13 @@ B64=$(printf '%s' "$RUNNER" | base64 | tr -d '\n')
 # (`line 73: 0: command not found` from a 76-line file containing no bare 0, 2026-09-08). Both
 # wrappers also share the .out, which is why the pid line came out truncated. Refuse instead:
 # a name is one launch at a time.
-live=$(pod_exec "pgrep -f 'bash /work/pod_run_$NAME.sh' 2>/dev/null | head -3" 2>/dev/null || true)
-[ -z "$live" ] || { echo "$0: a wrapper for '$NAME' is still running (pid $(echo $live | tr '\n' ' '))." >&2
+#
+# `pgrep -f` is NOT usable here: the pattern travels inside the checking command's own argv, so
+# pgrep matches the very shell asking the question and the guard can never pass. Match on the
+# process's own comm+args via ps and drop this pid, so the test is about other processes.
+live=$(pod_exec "ps -eo pid=,args= | awk -v self=\$\$ '\$1 != self && /bash \/work\/pod_run_$NAME\.sh/ {print \$1}' | head -3" 2>/dev/null || true)
+live=$(printf '%s' "$live" | tr -d '\r' | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
+[ -z "$live" ] || { echo "$0: a wrapper for '$NAME' is still running (pid $live)." >&2
                     echo "  Relaunching would rewrite its script under it. Wait, or use another name." >&2
                     exit 5; }
 
