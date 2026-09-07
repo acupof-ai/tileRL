@@ -88,7 +88,7 @@ trap release EXIT INT TERM
 # A claim names a pid because the card's memory is held by a pid, so it dies when that pid
 # does: a wrapper running N arms has N-1 windows where the claim reads STALE and the card
 # reads ORPHAN while a later arm runs. The rule is therefore that each arm re-claims its own
-# python pid as it starts, never the wrapper's. `pod_run_claim` is that call, exported so a
+# python pid as it starts, never the wrapper's. \`pod_run_claim\` is that call, exported so a
 # multi-arm wrapper can invoke it per arm -- the arms run inside \$CMD, out of reach of the
 # block below.
 pod_run_claim() {  # pod_run_claim <pid> -- claim CARD for it, or kill it and exit 4

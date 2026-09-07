@@ -89,6 +89,16 @@ run_arm() {  # run_arm <mode> <outdir> -> writes rc to $2/rc
   cp "$CLAIM_LOG" "$out/claims.txt"
 }
 
+# ---- arm 0: assembling the runner must not RUN anything on the caller ----------------
+# RUNNER_EOF is unquoted, so an unescaped backtick in a runner comment is a command
+# substitution evaluated HERE, on the laptop, at assembly time. One in a comment cost a
+# `pod_run_claim: command not found` on every launch (2026-09-07); the next one could be a
+# word that names a real command. stderr is the only witness -- stdout is still a valid
+# runner -- so this arm is the only place it can be caught.
+emit_err=$(POD_RUN_EMIT_RUNNER=1 AUPAI="$TMP/aupai" REMOTE_DIR="$TMP/work" \
+  bash "$ROOT/scripts/pod_run.sh" selftest 6 -- true 2>&1 >/dev/null)
+[ -z "$emit_err" ] || fail "arm 0: assembling the runner wrote to stderr -- an unescaped \` runs on the caller: $emit_err"
+
 # ---- arm 1: a wrapper-launched job must end up claimed -------------------------------
 run_arm shell_then_device "$TMP/a1"
 grep -q "claimed 6" "$TMP/a1/wrapper.out" || fail "arm 1: a wrapper-launched job was not claimed: $(cat "$TMP/a1/wrapper.out")"
