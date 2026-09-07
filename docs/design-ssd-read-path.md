@@ -31,7 +31,7 @@ n*  =  (S/B) / (1/R − k/B)          # tokens; if k/B ≥ 1/R, fetch never pays
 |---|---|---|
 | `k` | KV bytes/token | `2 · len(full_attn_layers) · num_kv_heads · head_dim · itemsize` off `PagedKvPool`. **Per arch, and it differs by 2x**: the sm70 pool is f32 (`backend.py:353` sets `io`, `engine.py:1527` takes it as the pool dtype), so 16 full-attn layers × 4 kv heads × 256 gives **64.0 KiB on the H20** (bf16) and **128.0 KiB on the V100** (f32) |
 | `S` | recurrent snapshot, fixed per prefix | one `spill_state` blob size, or `snap.numel()·itemsize` at build. **Measured 149.63 MiB**, 4.6 KB spread across four lengths |
-| `B` | tier read B/s | timed read of one resident entry at start, `bytes/elapsed`. **Measured 182.6 MiB/s** (H20 host, 09-05 tier bench) and **191 MB/s = 182.2 MiB/s** (V100, virtio-blk, three reps to 0.07%, block layer confirmed) — the two disks are the same speed to within 0.2% |
+| `B` | tier read B/s | **the cumulative rate over every fetch so far**, not one calibration read: `kv_cache.py:713-714` accumulate `fetch_ms` and `fetch_bytes` on each `_fetch_loop` load and `:798` divides the running totals. **Measured cold 182.6 MiB/s** (H20 host, 09-05 tier bench) and **191 MB/s = 182.2 MiB/s** (V100, virtio-blk, three reps to 0.07%, block layer confirmed) — the two disks are the same speed to within 0.2%. Cold is the rate this table's `n*` uses; the page cache reads **28x faster** (measured 5.664 GB/s warm against 0.203 cold on /data00), so see the warm-start note below |
 | `R` | prefill tok/s, this arch | **Not a scalar on the V100.** sm70 prefill is quadratic in `n` (#213's TTFT fit, `0.56 + 0.00422n + 4.117e-7n²`), so `n/R` becomes that fit: 5.3 ms/token at 2k, **16.6 ms/token at 30k**. On the H20, **measured 2558.6 tok/s** (`prefill/len8192/sm90`, seeded baseline, contended box, top of range) and flat *within the seeded range only* — the note does not extrapolate it to 30k. This operand is what separates the two archs |
 | `n/R` | the fetch deadline | not a fourth constant: the same `n`, `R` as above. A fetch still in flight at `n/R` from issue is **dropped** and the request prefills. It held no blocks, so the drop frees nothing and races nothing; the reader thread's buffer is discarded when it lands, and `insert` is never called |
 
@@ -60,6 +60,33 @@ Sanity on the formula, against the one real fault-in: at n=2560 with the 09-05
 operands it predicts a 309.6 MiB entry against **320.6 MiB measured** (1.035x) and
 1.70 s against **1.756 s measured**. It is 3.5% light on bytes, so no `n*` here is
 worth more than two significant figures.
+
+### A warm first fetch over-permits, for one or two fetches
+
+`B` is measured from this tier's own reads, so whatever the page cache holds at the
+first fetch sets it. On a restart into a warm cache that first read is memory-speed —
+5.664 GB/s measured against 0.203 cold, **28x** — and `n*` collapses with it: at a
+2,700-token entry (337.5 MiB of KV on the V100) it reads **6 tokens** instead of the
+cold **195**, so every prefix is permitted for as long as the estimate stands.
+
+It does not stand, because `B` is cumulative rather than a calibration. One cold fetch
+drags it from 5.664 to 0.392 GB/s and `n*` from 6 to 93; by the twentieth fetch
+`n* = 184`, within 6% of the pure-cold 195:
+
+| fetches (1 warm, rest cold) | `B` (GB/s) | `n*` |
+|---:|---:|---:|
+| 1 | 5.664 | 6 |
+| 2 | 0.392 | 93 |
+| 5 | 0.251 | 152 |
+| 20 | 0.213 | 184 |
+
+So the exposure is the **first fetch or two after a restart**, and the `n/R` deadline
+already bounds what one costs: an over-permitted fetch that cannot finish inside the
+prefill it replaces is dropped at `engine.py:714`, holding no blocks. The cost of the
+whole window is a reader thread and a host buffer, twice. Not worth replacing the
+measurement with a block-layer read — `read_bytes_per_s()`'s docstring says the rate
+must come from this tier's own fetches precisely so it does not describe whichever box
+it was written on, and a `/sys/block` probe reintroduces exactly that.
 
 ### The degenerate case is not reachable
 
