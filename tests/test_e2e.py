@@ -672,7 +672,11 @@ def test_an_intermediate_chunk_publish_stays_out_of_the_disk_tier(tmp_path):
     engine.poll()
 
     st = engine.stats()
-    assert st["prefix_published"] >= 3, (
+    # >= 2, not >= 3: since the publisher was cut to the first interior boundary plus the last,
+    # a row publishes 2 whatever the prompt length. That is still enough to make the offer count
+    # below non-trivial -- one of these two is an intermediate publish, and it is the one that
+    # must not spill. A regression to per-boundary publishing raises this, never lowers it.
+    assert st["prefix_published"] >= 2, (
         f"only {st['prefix_published']} publishes at a {budget}-token budget over {warm_to} "
         "tokens; with no intermediate publish the offer count below is trivially 1"
     )
@@ -745,6 +749,81 @@ def test_the_dram_tier_pays_only_above_its_session_count():
     )
     assert tier_hits > plain_hits, (
         f"the tier bought no hits at 12 sessions: {tier_hits} against {plain_hits}"
+    )
+
+
+def test_a_prompt_publishes_two_entries_whatever_its_length():
+    """The publish COUNT is the cascade's operand, so gate the count, not a victim choice.
+
+    A miss prefills from token 0 and every interior chunk boundary published one entry, so the
+    count grew with prompt length -- 62 at 31k tokens, into a budget holding 6. That flood is what
+    evicted the head every other row shared, and no eviction policy survives it: six were measured
+    and the two best numbers were bugs
+    (errors/2026-09-08-the-eviction-policy-was-the-wrong-layer.md).
+
+    Two lengths, 4x apart, because a count that is small at one length proves nothing -- the defect
+    IS the growth. The second assert is the one that fails on a regression to per-boundary
+    publishing; the first would still pass at a short prompt.
+    """
+    cfg = tiny()
+    counts = []
+    for plen in (2048, 8192):
+        eng = build_engine(cfg, build_random(cfg, seed=15), get_backend(), num_blocks=8192,
+                           num_slots=8, max_batch=1, max_total_tokens=32768)
+        rid = eng.submit([5] * plen, SamplingParams(max_new_tokens=4, temperature=0.0))
+        ticks = 0
+        while rid not in eng.poll() and ticks < 2000:
+            eng.step()
+            ticks += 1
+        assert ticks < 2000, f"plen {plen} never finished"
+        counts.append(eng._prefix.stats()["entries"])
+
+    assert counts[0] <= 3, (
+        f"a 2048-token prompt published {counts[0]} entries; the first interior boundary plus "
+        "the last is 2, and a decode boundary may add one"
+    )
+    assert counts[1] == counts[0], (
+        f"publishes grew with prompt length: {counts[0]} at 2048 tokens, {counts[1]} at 8192. "
+        "That growth is the cascade -- one miss outpublishes the budget and evicts the prefix "
+        "every other row shares."
+    )
+
+    # The other direction, which a count alone cannot see: cutting to the LAST boundary only is
+    # also a constant 1, and it scores better on a fixture whose second turn re-sends its own
+    # whole prompt. It costs every cross-session PARTIAL sharer, so the first boundary has to
+    # stay. Measured: the publish arms differ by -17% of partial reuse here and not at all on a
+    # self-hit fixture, which is why the count gate above is not sufficient on its own.
+    eng = build_engine(cfg, build_random(cfg, seed=15), get_backend(), num_blocks=8192,
+                       num_slots=8, max_batch=1, max_total_tokens=32768)
+    lead = [5] * 2048
+
+    def drive(toks):
+        hit = {"n": 0}
+        real = eng._prefix.lookup
+
+        def spy(t):
+            m = real(t)
+            if not hit["n"]:
+                hit["n"] = 1
+                hit["len"] = 0 if m is None else m.length
+            return m
+
+        eng._prefix.lookup = spy
+        rid = eng.submit(toks, SamplingParams(max_new_tokens=4, temperature=0.0))
+        ticks = 0
+        while rid not in eng.poll() and ticks < 2000:
+            eng.step()
+            ticks += 1
+        eng._prefix.lookup = real
+        assert ticks < 2000
+        return hit.get("len", 0)
+
+    drive(lead)
+    shared = 1024                                  # half the lead prompt, a partial sharer
+    got = drive(lead[:shared] + [700] * (2048 - shared))
+    assert got >= shared // 2, (
+        f"a row sharing {shared} tokens of an earlier prompt reused {got}: the FIRST interior "
+        "boundary is what a partial sharer matches, and publishing only the last drops it to 0"
     )
 
 
