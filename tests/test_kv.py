@@ -371,11 +371,198 @@ def test_a_rejected_submit_does_not_release_the_prefix_stores_blocks():
     longer = base + list(range(100, 116))
     for _ in range(2):  # fill the slots, and hit the prefix while doing it
         engine.submit(longer, SamplingParams(max_new_tokens=8, seed=0))
+    # step() to admit: the prefix match moved from submit to the planner, because a hit found
+    # at submit can be evicted before the request is admitted.
+    engine.step()
+    assert engine.stats()["prefill_forwards"] > 0, "no forward ran; the test is inert"
     assert engine.stats()["prefix_hits"] >= 1, "no prefix hit; the test is inert"
 
     before = {b: n for b, n in enumerate(engine._kv.refcount) if n > 0}
-    with pytest.raises(RuntimeError):
-        engine.submit(longer, SamplingParams(max_new_tokens=1, seed=0))
+    # A third request no longer raises -- it waits for capacity. What must still hold is the
+    # invariant this test is named for: an admission that could not complete releases nothing
+    # the store holds. Asserted on the refcounts, not on an exception.
+    engine.submit(longer, SamplingParams(max_new_tokens=1, seed=0))
+    engine.step()
     after = {b: engine._kv.refcount[b] for b in before}
-    assert after == before, f"the rejected submit released blocks: {before} -> {after}"
+    assert after == before, f"a blocked admission released blocks: {before} -> {after}"
+    assert len(engine._waiting) == 1, "the third request was neither admitted nor queued"
 
+
+
+def test_a_second_client_waits_for_capacity_instead_of_503ing():
+    """A prompt that does not fit YET must wait, not be refused.
+
+    The live defect: a 30,485-token prompt took 1906 of the V100's 2048 blocks (93.1%), and
+    the next request 503-ed with `insufficient KV blocks for request` -- permanently, because
+    `submit` allocated up front and had no later tick to retry on. Eviction was already being
+    called one line above the refusal; what it could not do is reclaim blocks a LIVE request
+    retains, since `free_block` is a refcount decrement. Measured: 2 entries dropped, 0 blocks
+    freed.
+
+    The fixture matches the RATIO, not the absolute size: 60 of 64 blocks is 93.8% against the
+    live 93.1%. A 3/64 fixture cannot express the mechanism at any pool size.
+    """
+    import time
+
+    from tilerl.config import tiny
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.model import build_random
+    from tilerl.testing import RefBackend
+
+    cfg = tiny(max_position_embeddings=4096)
+    engine = build_engine(cfg, build_random(cfg, seed=9), RefBackend(), num_blocks=64,
+                          num_slots=4, max_batch=2, max_total_tokens=4096)
+    big = [1 + (j % 150) for j in range(944)]          # 59 blocks of 64 = 92.2%
+    other = [200 + (j % 100) for j in range(944)]
+    # Wrapped so a drop can be attributed to an admission attempt rather than to the process.
+    admit_drops: list[int] = []
+    _real_admit = engine._admit
+
+    def _watched(req):
+        before = engine._prefix.stats()["evictions"]
+        ok = _real_admit(req)
+        admit_drops.append(engine._prefix.stats()["evictions"] - before)
+        return ok
+
+    engine._admit = _watched
+    a = engine.submit(big, SamplingParams(max_new_tokens=24, seed=0))
+    b = engine.submit(other, SamplingParams(max_new_tokens=4, seed=0))
+    engine.run()
+    try:
+        for _ in range(300):
+            if len(engine._running) >= 1 and engine.stats()["prefill_forwards"] > 0:
+                break
+            time.sleep(0.02)
+        # Ruling 5: a do-nothing engine must not be able to pass this.
+        assert engine.stats()["prefill_forwards"] > 0, "no forward ran; the arm proves nothing"
+        assert len(engine._waiting) == 1, (
+            f"both requests were admitted; the pool is not contended and the arm is vacuous "
+            f"(free_blocks {engine._kv.free_blocks} of 64)")
+        ticks = engine.stats()["prefill_forwards"]
+        for _ in range(200):
+            if engine.stats()["prefill_forwards"] > ticks + 2:
+                break
+            time.sleep(0.02)
+        # The store must be left ALONE by the BLOCKED ADMISSIONS: its blocks are pinned by the
+        # live request, so evicting them frees nothing and would flush every other client's
+        # prefix cache once per planner tick.
+        #
+        # Attributed per admission attempt, not from the global counter. Two earlier forms of
+        # this assert were wrong: `entries >= entries` passed with the guard REMOVED (the count
+        # rises as the live request publishes its own chunk boundaries), and comparing
+        # `evictions` against a baseline was red on CORRECT code, because decode growth at
+        # engine.py:915 evicts legitimately for the running request and `insert` trims at
+        # capacity. Neither is the waiting request's doing.
+        # The BLOCKED attempts, i.e. every one that returned False. The final attempt -- the
+        # one that succeeds after the first request finishes -- legitimately evicts, because by
+        # then the store's blocks ARE reclaimable; measured [0]*26 + [3], and asserting on all
+        # attempts would have called that correct eviction a defect.
+        blocked = admit_drops[:-1] if not engine._waiting else admit_drops
+        assert len(blocked) > 2, f"too few blocked attempts to check: {admit_drops}"
+        assert all(d == 0 for d in blocked), (
+            f"a blocked admission evicted the store: drops per attempt {admit_drops}")
+
+        out = {}
+        for _ in range(3000):
+            out.update(engine.poll())
+            if a in out and b in out:
+                break
+            time.sleep(0.02)
+    finally:
+        engine.shutdown()
+
+    assert a in out, "the first request never finished"
+    assert b in out, "the second request was never served; it waited forever or was refused"
+    # Not `free_blocks == 64`: the prefix store legitimately keeps both prompts' blocks after
+    # they finish, which is the point of the store. What must be zero is what the REQUESTS
+    # hold -- `blocks_used` is net of retains (engine.py:447), so it is the leak test here.
+    assert engine._blocks_used == 0, f"requests leaked blocks: {engine._blocks_used}"
+    assert engine._slots_used == 0, f"requests leaked state slots: {engine._slots_used}"
+    # And the store's blocks must still be reclaimable now that nothing is live.
+    assert engine._prefix.reclaimable_blocks() == engine._kv.used_blocks, (
+        f"{engine._kv.used_blocks} blocks in use but only "
+        f"{engine._prefix.reclaimable_blocks()} reclaimable with nothing running")
+
+
+def test_a_prompt_larger_than_an_empty_pool_still_refuses_at_submit():
+    """Waiting is for a prompt that fits LATER. One that never fits must still 400.
+
+    Ruling 4, and the arm that proves moving allocation to the planner did not lose the
+    `blocks_for_tokens(total + width - 1) > usable_blocks` refusal: without it such a request
+    would sit in `_waiting` until its timeout instead of being told immediately.
+    """
+    from tilerl.config import tiny
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.model import build_random
+    from tilerl.testing import RefBackend
+
+    cfg = tiny(max_position_embeddings=8192)
+    engine = build_engine(cfg, build_random(cfg, seed=11), RefBackend(), num_blocks=16,
+                          num_slots=2, max_batch=1, max_total_tokens=8192)
+    with pytest.raises(ValueError, match="KV pool capacity"):
+        engine.submit(list(range(1, 600)), SamplingParams(max_new_tokens=8, seed=0))
+    assert not engine._waiting, "an impossible prompt was queued instead of refused"
+
+
+def test_a_failed_admission_returns_every_refcount_it_took():
+    """An admission that raises mid-way must leave the store's refcounts exactly as they were.
+
+    The dangerous shape, from the old `submit`: `blocks` seeded with the prefix hit's blocks
+    meant an `alloc_slot` failure ran `free_block` over blocks the PrefixStore still held, and
+    `free_block` cannot tell that from a release -- the store keeps listing a page that has
+    gone back to the free list, and a later request is handed someone else's KV.
+
+    Asserted on the REFCOUNTS, not on "no exception escaped": the unwind can be wrong in both
+    directions (freeing too much, or leaking what it took) and only the counts show which.
+    """
+    import time
+
+    from tilerl.config import tiny
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.model import build_random
+    from tilerl.testing import RefBackend
+
+    cfg = tiny(max_position_embeddings=4096)
+    engine = build_engine(cfg, build_random(cfg, seed=13), RefBackend(), num_blocks=64,
+                          num_slots=4, max_batch=2, max_total_tokens=4096)
+    base = [1 + (j % 150) for j in range(160)]
+    rid = engine.submit(base, SamplingParams(max_new_tokens=2, seed=0))
+    engine.run()
+    try:
+        for _ in range(600):
+            if rid in engine.poll():
+                break
+            time.sleep(0.02)
+        engine.take(rid)
+    finally:
+        engine.shutdown()
+    assert engine.stats()["prefill_forwards"] > 0, "no forward ran; the arm proves nothing"
+    assert engine._prefix.stats()["entries"] > 0, "nothing published; there is no hit to adopt"
+
+    before = {b: n for b, n in enumerate(engine._kv.refcount) if n > 0}
+    slots_before = engine._states.free_slots
+
+    # Fail AFTER the hit blocks are retained: alloc_block is what runs next.
+    calls = {"n": 0}
+    real_alloc = engine._kv.alloc_block
+
+    def boom():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("injected: allocation failed mid-admission")
+        return real_alloc()
+
+    engine._kv.alloc_block = boom
+    longer = base + [200 + (j % 50) for j in range(160)]
+    engine.submit(longer, SamplingParams(max_new_tokens=4, seed=0))
+    with pytest.raises(RuntimeError, match="injected"):
+        engine._admit(engine._waiting[0])
+    engine._kv.alloc_block = real_alloc
+
+    after = {b: engine._kv.refcount[b] for b in before}
+    assert after == before, f"the unwind did not restore the refcounts: {before} -> {after}"
+    assert engine._states.free_slots == slots_before, (
+        f"the unwind leaked a state slot: {slots_before} -> {engine._states.free_slots}")
+    # And every block it allocated before the failure went back, not just the retained ones.
+    assert engine._kv.free_blocks == 64 - sum(1 for n in before.values() if n > 0), (
+        f"blocks leaked by the unwind: {engine._kv.free_blocks} free")

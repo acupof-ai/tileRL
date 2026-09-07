@@ -189,7 +189,7 @@ class _Req:
     params: SamplingParams
     tokens: list[int]  # prompt + generated, in order
     blocks: list[int]  # physical KV block ids, oldest first
-    state_slot: int
+    state_slot: int | None  # None until `_admit` takes one
     seq_len: int  # == len(tokens); the logical materialized length
     phase: int  # _PHASE_PREFILL | _PHASE_DECODE | _PHASE_DONE
     prefill_from: int  # prefix-reuse offset for the prefill forward
@@ -433,8 +433,7 @@ class Engine:
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
-        #: Last published stats dict, swapped in by the loop. `stats()` returns it without
-        #: the lock; None until the loop or a direct caller has built one.
+        #: Published by the loop so `stats()` never takes the lock a forward holds.
         self._stats_snapshot: dict[str, Any] | None = None
 
         self._next_id = 1
@@ -499,8 +498,8 @@ class Engine:
         return max(0, min(by_total, by_pool))
 
     def submit(self, input_ids: Any, params: SamplingParams | None = None) -> int:
-        """Queue a request; returns its opaque id. Prefix lookup, block and
-        state-slot allocation happen here, not at admission."""
+        """Queue a request; returns its opaque id. Blocks and the state slot are taken at
+        admission, not here."""
         if params is None:
             params = SamplingParams()
         tokens = [int(t) for t in input_ids]
@@ -533,58 +532,18 @@ class Engine:
                 self._finished_count += 1
                 return rid
 
-            # The hit carries its snapshot: evict_until_free below can drop the entry.
-            matched, hit_blocks, snap = self._match_prefix(tokens)
-            if matched:
-                self._prefix_hits += 1
-            else:
-                self._prefix_misses += 1
-
-            total_blocks = (len(tokens) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
-            # The slot first, and `blocks` empty: the unwind frees what this request
-            # incremented, and nothing is incremented until retain() runs. Seeding it
-            # with hit_blocks made an alloc_slot() failure decrement refcounts the
-            # PrefixStore still holds -- free_block cannot tell that from a release.
-            slot = self._states.alloc_slot()
-            blocks: list[int] = []
-            try:
-                # Releasing all of `blocks` on the way out is safe because retain
-                # cannot fail here: it raises only at refcount 0, and hit_blocks
-                # came from _match_prefix under the same lock. Everything after
-                # this loop CAN raise, and by then every entry is retained.
-                for b in hit_blocks:
-                    self._kv.retain(b)  # adopt the store's blocks
-                    blocks.append(b)
-                needed = total_blocks - len(blocks)
-                self._prefix.evict_until_free(needed)
-                if self._kv.free_blocks < needed:
-                    raise RuntimeError("insufficient KV blocks for request")
-                while len(blocks) < total_blocks:
-                    blocks.append(self._kv.alloc_block())
-            except Exception:
-                for b in blocks:
-                    self._kv.free_block(b)
-                self._states.free_slot(slot)
-                raise
-            own_blocks = total_blocks - matched // BLOCK_TOKENS
-            self._blocks_used += own_blocks
-            self._slots_used += 1
-            if matched:
-                snap_states, snap_windows = snap
-                self._states.states[slot].copy_(snap_states)
-                if snap_windows is not None:
-                    self._states.window_restore(slot, snap_windows)
-
+            # Unallocated: allocating here refuses permanently, since `submit` has no later
+            # tick to retry on. The prefix match moves to `_admit` with the allocation.
             req = _Req(
                 req_id=rid,
                 params=params,
                 tokens=tokens,
-                blocks=blocks,
-                state_slot=slot,
-                seq_len=matched,  # materialized length (adopted prefix; 0 on a miss)
+                blocks=[],
+                state_slot=None,
+                seq_len=0,
                 phase=_PHASE_PREFILL,
-                prefill_from=matched,
-                own_blocks=own_blocks,
+                prefill_from=0,
+                own_blocks=0,
             )
             self._waiting.append(req)
             return rid
@@ -655,9 +614,8 @@ class Engine:
             decodes, prefills, chunks = self._build_plan()
             if not decodes and not prefills:
                 return
-            # BEFORE the forward, not only after: a snapshot published on the way out leaves
-            # the FIRST forward with none, and `stats()` then falls back to the locking path
-            # and waits for it. Measured by the gate at 106 s against a 2 s sleep.
+            # Before the forward too: without this the FIRST forward has no snapshot and
+            # `stats()` falls back to the locking path.
             self._stats_snapshot = self._build_stats()
             try:
                 self._run_forward(decodes, prefills, chunks)
@@ -666,16 +624,71 @@ class Engine:
                     self._finish(req, error=str(exc))
                 raise
             finally:
-                # And after, because `_loop` stops calling `step` once nothing is running --
-                # so this is the only publish that can carry the state the last tick left,
-                # including the state a failed forward left behind.
+                # `_loop` stops calling `step` once nothing runs, so this carries the last
+                # tick's state -- including a failed forward's, hence `finally`.
                 self._stats_snapshot = self._build_stats()
+
+    def _admit(self, req: _Req) -> bool:
+        """Take the slot and the blocks for one waiting request. False = it does not fit yet."""
+        matched, hit_blocks, snap = self._match_prefix(req.tokens)
+        total_blocks = (len(req.tokens) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+        needed = total_blocks - len(hit_blocks)
+        # By count, not by catching `alloc_slot`'s raise: an exception out of `_admit` reaches
+        # `step`'s handler, which fails EVERY running request.
+        if self._states.free_slots < 1:
+            return False
+        if self._kv.free_blocks < needed:
+            # Guarded: unguarded, a request waiting on a live retain would drop every entry
+            # each tick and free nothing, flushing other clients' prefixes for the whole wait.
+            if self._kv.free_blocks + self._prefix.reclaimable_blocks() < needed:
+                return False
+            self._prefix.evict_until_free(needed)
+            # Re-matched: eviction may have dropped the entry this hit came from.
+            matched, hit_blocks, snap = self._match_prefix(req.tokens)
+            needed = total_blocks - len(hit_blocks)
+            if self._kv.free_blocks < needed:
+                return False
+        if matched:
+            self._prefix_hits += 1
+        else:
+            self._prefix_misses += 1
+        # Slot first, `blocks` empty: seeding it with hit_blocks made an alloc_slot() failure
+        # decrement refcounts the PrefixStore still holds.
+        slot = self._states.alloc_slot()
+        blocks: list[int] = []
+        try:
+            for b in hit_blocks:
+                self._kv.retain(b)  # adopt the store's blocks
+                blocks.append(b)
+            while len(blocks) < total_blocks:
+                blocks.append(self._kv.alloc_block())
+        except Exception:
+            for b in blocks:
+                self._kv.free_block(b)
+            self._states.free_slot(slot)
+            raise
+        req.blocks = blocks
+        req.state_slot = slot
+        req.seq_len = matched  # materialized length (adopted prefix; 0 on a miss)
+        req.prefill_from = matched
+        req.own_blocks = total_blocks - matched // BLOCK_TOKENS
+        self._blocks_used += req.own_blocks
+        self._slots_used += 1
+        if matched:
+            snap_states, snap_windows = snap
+            self._states.states[slot].copy_(snap_states)
+            if snap_windows is not None:
+                self._states.window_restore(slot, snap_windows)
+        return True
 
     def _build_plan(self) -> tuple[list[_Req], list[_Req], list[int]]:
         """Admit the whole waiting queue up to ``max_batch``, then all running
         decodes plus as many prefill rows as the token budget and one width
         bucket allow; a longer prompt stays in PREFILL and chunks across ticks."""
         while self._waiting and len(self._running) < self.limits.max_batch:
+            # break, not continue: head-of-line FIFO, else a blocked large request starves.
+            if not self._admit(self._waiting[0]):
+                break
             self._running.append(self._waiting.popleft())
         decodes = [r for r in self._running if r.phase == _PHASE_DECODE]
         prefills: list[_Req] = []
@@ -740,25 +753,10 @@ class Engine:
             return not self._waiting and not self._running
 
     def stats(self) -> dict[str, Any]:
-        """Lock-free while the loop thread runs; a fresh build when it does not.
-
-        Lock-free on the served path, for the same reason `peek` is: `step()` holds `_lock`
-        across the whole forward, so a reader that took it waits for that forward. Measured
-        on the live V100 during a 21.7k-token prefill, /health median 8.12 s and max
-        87.66 s against 0.002 s idle -- four orders of magnitude, on identical code.
-
-        The dict is only ever REPLACED, never mutated in place, so a reader sees one
-        consistent generation. A stale snapshot is the deliberate trade on that path: it is
-        at most one tick old, and /health's job is liveness, not a transaction.
-
-        **A direct-drive caller gets the live numbers instead.** With no loop thread there is
-        no background forward to wait on, so the snapshot buys nothing and costs correctness:
-        a caller that submits and reads between its own `step()` calls would see the previous
-        tick's counters and conclude, for instance, that a prefix hit it just caused had not
-        happened. `test_a_rejected_submit_does_not_release_the_prefix_stores_blocks` reads
-        exactly that way and caught it.
-        """
+        """Lock-free while the loop thread runs; a fresh build when it does not."""
         if self._thread is None:
+            # Direct-drive: no background forward to wait on, and a caller reading between
+            # its own `step()` calls would get the previous tick's counters.
             return self._build_stats()
         snap = self._stats_snapshot
         if snap is None:
@@ -847,6 +845,12 @@ class Engine:
         )
 
     def _run_forward(self, decodes: list[_Req], prefills: list[_Req], chunks: list[int]) -> None:
+        # Asserted, not branched on: every row comes from `_build_plan`, so an unadmitted one
+        # is a planner bug that would otherwise surface as `free_slot(None)`.
+        for r in (*decodes, *prefills):
+            assert r.state_slot is not None, (
+                f"request {r.req_id} reached the forward unadmitted (no state slot)"
+            )
         # Speculate on pure-decode ticks only: the step-state buffers cannot
         # cover a bucketed prefill width.
         chains = (
@@ -1289,6 +1293,8 @@ class Engine:
     def _release(self, req: _Req) -> None:
         """Give back the blocks and the slot. Here, not at poll, so capacity returns now."""
         req.phase = _PHASE_DONE
+        if req.state_slot is None:
+            return  # never admitted; blocks and slot are taken together in `_admit`
         for b in req.blocks:
             self._kv.free_block(b)
         self._blocks_used -= req.own_blocks

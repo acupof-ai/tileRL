@@ -1727,8 +1727,40 @@ def test_a_cancel_returns_the_blocks_a_disconnected_reader_was_holding():
 
     assert one.cancel(b) is True
     assert b not in [r.req_id for r in one._waiting], "cancel left it waiting"
-    assert one._blocks_used < before, "a waiting request's blocks were never returned"
+    # A waiting request now holds NOTHING: blocks and the state slot are taken together at
+    # admission, so there is nothing to give back and `_blocks_used` must not move. #209
+    # asserted the opposite because `submit` allocated up front; that is the defect the
+    # queue-and-wait change removed, so the assertion inverts with it. What still matters is
+    # that cancelling a waiting request leaves the RUNNING one's accounting untouched -- the
+    # bug this arm exists to catch is a cancel that frees someone else's blocks.
+    assert one._blocks_used == before, (
+        f"cancelling an unadmitted request moved the block count: {before} -> "
+        f"{one._blocks_used}")
     assert any(r.req_id == a for r in one._running), "cancel took the wrong request"
+
+    # --- admitted arm: #209's original behaviour, at the level where it still applies ------
+    # The waiting arm above used to carry this, because `submit` allocated up front. It no
+    # longer can, so the assertion moves rather than disappearing: a disconnected reader's
+    # blocks must still come back once the request HAS been admitted.
+    # `a` still holds the only slot at max_batch=1, so nothing else can be admitted until it
+    # goes -- the vacuity guard below caught exactly that.
+    one.cancel(a)
+    c = one.submit(list(range(1, 40)), params)
+    for _ in range(50):
+        one.step()
+        if any(r.req_id == c for r in one._running):
+            break
+    assert any(r.req_id == c for r in one._running), "c was never admitted; the arm is vacuous"
+    held = one._blocks_used
+    slots = one._slots_used
+    assert held > 0, "the admitted request holds no blocks; the assertion below is vacuous"
+
+    assert one.cancel(c) is True
+    assert not any(r.req_id == c for r in one._running), "cancel left it running"
+    assert one._blocks_used < held, (
+        f"an admitted request's blocks were never returned: {held} -> {one._blocks_used}")
+    assert one._slots_used < slots, (
+        f"an admitted request's state slot was never returned: {slots} -> {one._slots_used}")
 
 
 def test_the_routes_cancel_when_the_client_hangs_up():
