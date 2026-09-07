@@ -271,7 +271,9 @@ def main() -> int:
            "--ssd-path", a.spill]
     if a.min_tokens:
         cmd += ["--ssd-min-tokens", str(a.min_tokens)]
-    env = dict(os.environ, TILELANG_CACHE_DIR="/work/tilelang_cache")
+    # setdefault, not override: a hardcoded /work made the child recompile on any other box.
+    env = dict(os.environ)
+    env.setdefault("TILELANG_CACHE_DIR", "/work/tilelang_cache")
     with open(a.log, "wb") as f:
         proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
     sampler = None

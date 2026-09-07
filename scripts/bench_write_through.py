@@ -102,7 +102,9 @@ def _arm(args, name: str, spill: str, prompt: str) -> dict:
         cmd += ["--ssd-path", spill]
         if args.min_tokens:
             cmd += ["--ssd-min-tokens", str(args.min_tokens)]
-    env = dict(os.environ, TILELANG_CACHE_DIR="/work/tilelang_cache")
+    # setdefault, not override: a hardcoded /work made the child recompile on any other box.
+    env = dict(os.environ)
+    env.setdefault("TILELANG_CACHE_DIR", "/work/tilelang_cache")
     with open(log, "wb") as f:
         proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env,
                                 cwd=args.repo)

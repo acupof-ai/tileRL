@@ -3,13 +3,20 @@
 The SSD tier's whole claim is that after a restart HBM is empty so every returning
 conversation's first turn reaches back to disk. Measuring it as "start, serve, restart,
 serve" does not test that claim: the tilelang JIT cache is shared across starts
-(`TILELANG_CACHE_DIR=/work/tilelang_cache`), the page cache holds the weights, and both
+(inherited `TILELANG_CACHE_DIR`), the page cache holds the weights, and both
 make the SECOND start faster whatever the tier does.
 
 So four server starts. The first is a throwaway whose only job is to fill the shared JIT
-cache at this prompt's shape buckets, because a compile inside a timed window is worth
-more than the tier is: measured, the cold arm paid 6 compiles and the arms after it paid
-0, which alone made an EMPTY-tier control 3.956x faster than cold. Then three arms:
+cache, because a compile inside a timed window is worth more than the tier is: measured,
+the cold arm paid 6 compiles and the arms after it paid 0, which alone made an EMPTY-tier
+control 3.956x faster than cold. It warms EVERY prefill width rather than this prompt's,
+because a tick's kernels take the padded chunk width as a shape and a measured arm chunks
+from wherever its prefix hit landed -- an offset that does not exist until the arm before
+it has run. Warming turn 1 alone reached 512/192/64 while the faulted and control arms met
+320 and 448, 2 compiles each inside the timed window, verdict INVALID (errors/2026-09-07).
+A chunk pads to a 64-multiple and the budget caps it at 512, so there are only 8 reachable
+widths: checked exhaustively over prompt lengths 1..4000 crossed with every 16-aligned
+offset, 0 widths fall outside them, so warming all 8 covers any offset. Then three arms:
 
     cold     empty spill dir            -> the number to beat
     faulted  the dir cold just filled   -> the tier's number
@@ -63,6 +70,37 @@ _FILLER = (
     "including how block tables map logical positions to physical pages. "
 )
 
+#: A prefill chunk pads up to a 64-multiple (engine.py:784) and the token budget caps it
+#: at 512 (engine.py:197), so a tick runs at one of these 8 widths and nothing else.
+_PREFILL_BUCKET, _MAX_WIDTH, _BLOCK_TOKENS = 64, 512, 16
+_WIDTHS = tuple(range(_PREFILL_BUCKET, _MAX_WIDTH + 1, _PREFILL_BUCKET))
+
+
+def _chunk_widths(n: int, start: int = 0) -> list[int]:
+    """Padded widths an ``n``-token prompt prefills at, starting from offset ``start``.
+
+    Mirrors `_build_plan` (engine.py:750-787) at max_batch 1, where no decode row shares
+    the tick and the budget is the whole 512. The kernels take this width as a shape, so
+    it is what a warm-up has to cover -- and `start` is why the measured prompt alone
+    cannot: a prefix hit moves it, and the widths move with it.
+    """
+    out, pf = [], start
+    while pf < n:
+        chunk = min(n - pf, _MAX_WIDTH)
+        aligned = (chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
+        if pf == 0 and aligned and aligned != chunk:
+            chunk = aligned
+        end = pf + chunk
+        short = (end // _BLOCK_TOKENS) * _BLOCK_TOKENS - pf
+        if end == n and end % _BLOCK_TOKENS and short > 0:
+            if end % _BLOCK_TOKENS == 1:
+                short -= _BLOCK_TOKENS
+            if short > 0:
+                chunk = short
+        out.append(-(-chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET if chunk > 1 else chunk)
+        pf += chunk
+    return out
+
 
 def _post(url: str, body: dict, timeout: float) -> dict:
     req = urllib.request.Request(
@@ -106,7 +144,9 @@ def _serve(args, spill: str, log: str):
     ]
     if spill:
         cmd += ["--ssd-path", spill]
-    env = dict(os.environ, TILELANG_CACHE_DIR="/work/tilelang_cache")
+    # setdefault, not override: a hardcoded /work made the child recompile on any other box.
+    env = dict(os.environ)
+    env.setdefault("TILELANG_CACHE_DIR", "/work/tilelang_cache")
     # CUDA_VISIBLE_DEVICES is NOT set here: pod_run.sh already pins the card, and setting
     # it again overrode that -- the first run of this script asked for card 6 through the
     # launcher and landed on card 0, which another team was holding with 28 GB.
@@ -121,6 +161,59 @@ def _compiles(log: str) -> int:
             return sum("begins to compile" in line for line in f)
     except OSError:
         return -1
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=90)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=30)
+
+
+def _jitwarm(args) -> dict:
+    """Fill the shared JIT cache at EVERY prefill width, in one throwaway start.
+
+    A tick's kernels take the padded chunk width as a shape, and a measured arm's widths
+    depend on where its prefix hit lands -- an offset that does not exist until the arm
+    before it has run. So warming the measured prompt does not cover them and warming a
+    synthetic turn 2 does not either: with an empty tier it prefills from 0 and meets the
+    control's widths, not the faulted arm's. Measured 2026-09-07: turn 1 reached 512/192/64
+    and the two arms after it met 320 and 448, 2 compiles each inside the timed window.
+    There are only 8 reachable widths, so all 8 are warmed and no offset can produce a new
+    one. No --ssd-path: this start must leave the tier untouched, and an absent tier writes
+    nothing that has to be discarded afterwards.
+
+    Each prompt carries a distinct leading tag so the in-process prefix store cannot serve
+    one warm request from another: a hit would move `prefill_from` and run a narrower width
+    than the one being asked for, leaving that width cold while the count below says warm.
+    """
+    log = os.path.join(args.logdir, "ssd_restart_jitwarm.log")
+    proc = _serve(args, "", log)
+    tokens, covered, ratio = [], {1}, 1.0
+    try:
+        _wait_up(args.port, proc, args.boot_s)
+        for w in _WIDTHS:
+            # Aim at the middle of [w, w+63], the prompt lengths whose first chunk is w.
+            # `ratio` recalibrates tokens-per-target from the request just served: a
+            # hardcoded factor drifts with the tokenizer and silently misses one bucket
+            # (this filler runs 0.91, which at a fixed guess loses width 384).
+            target = int((w + _PREFILL_BUCKET // 2) / ratio)
+            r = _post(f"http://127.0.0.1:{args.port}/v1/messages",
+                      {"model": args.model, "max_tokens": 8,
+                       "messages": [{"role": "user",
+                                     "content": f"Case {w}. " + _prompt(target)}]},
+                      args.req_s)
+            n = int(r["usage"]["input_tokens"])
+            ratio = n / target
+            tokens.append(n)
+            covered |= set(_chunk_widths(n))
+    finally:
+        _stop(proc)
+    return {"jitwarm_compiles": _compiles(log), "jitwarm_tokens": tokens,
+            "covered_widths": sorted(covered),
+            "uncovered_widths": sorted(set(_WIDTHS) - covered)}
 
 
 def _entry_bytes(spill: str) -> int:
@@ -284,7 +377,7 @@ def _arm(args, name: str, spill: str, prompt, reply: str = "") -> dict:
     reply it generated; a turn 2 that omits the reply is not a prefix of it and cannot
     hit. That is what made every arm read 0 SSD hits (errors/2026-09-07).
     """
-    log = f"/work/ssd_restart_{name}.log"
+    log = os.path.join(args.logdir, f"ssd_restart_{name}.log")
     msgs = [{"role": "user", "content": prompt}]
     if reply:
         msgs += [{"role": "assistant", "content": reply},
@@ -300,12 +393,7 @@ def _arm(args, name: str, spill: str, prompt, reply: str = "") -> dict:
         wall = time.monotonic() - t0
         after = _stats(args.port)
     finally:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=90)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=30)
+        _stop(proc)
     d = lambda k: int(after.get(k, 0)) - int(before.get(k, 0))  # noqa: E731
     return {
         "arm": name,
@@ -357,6 +445,7 @@ def main() -> None:
                     required="REMOTE_DIR" not in os.environ,
                     help="server cwd, one tree per session. No fallback: a wrong tree produces a number, not an error")
     ap.add_argument("--spill", default="/work/ssd_tier_bench")
+    ap.add_argument("--logdir", default="/work", help="per-arm server logs; /work is the H20's")
     ap.add_argument("--port", type=int, default=8123)
     ap.add_argument("--tokens", type=int, default=3000, help="target prompt length")
     ap.add_argument("--gen", type=int, default=8, help="tokens to generate; keep small so "
@@ -367,6 +456,10 @@ def main() -> None:
     ap.add_argument("--slots", type=int, default=3)
     ap.add_argument("--boot-s", type=float, default=900.0)
     ap.add_argument("--req-s", type=float, default=1800.0)
+    ap.add_argument("--skip-short", action="store_true",
+                    help="drop the two below_break_even arms. They test the prefetch "
+                         "threshold, not publish churn, and their spill dir cost 5.1 GiB "
+                         "of the 21.5 GiB one --gen 256 run wrote")
     ap.add_argument("--device-mib-s", type=float, default=182.6,
                     help="measured read bandwidth of the spill device; the verdict's "
                          "bytes/bandwidth check uses it. Default is this pod's, from "
@@ -389,17 +482,11 @@ def main() -> None:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d, exist_ok=True)
 
-    # A throwaway start whose only job is to fill the shared TileLang JIT cache at the
-    # target prompt's shape buckets. Measured 2026-09-05: without it the cold arm paid 6
-    # compiles inside its timed window and the two arms after it paid 0, which by itself
-    # made an EMPTY-tier control 3.956x faster than cold. The compiles are per prefill
-    # shape bucket, so a short warm-up request does not reach them -- it has to be this
-    # prompt. Its spill dir is discarded so it leaves the disk tier untouched.
-    warm_dir = args.spill + "_warmup"
-    shutil.rmtree(warm_dir, ignore_errors=True)
-    os.makedirs(warm_dir, exist_ok=True)
-    _arm(args, "jitwarm", warm_dir, prompt)
-    shutil.rmtree(warm_dir, ignore_errors=True)
+    # Warm every prefill width before any measured arm, in one throwaway start with no
+    # tier: an arm's widths depend on where its prefix hit lands, so the measured prompt
+    # cannot cover them (see _jitwarm).
+    warm = _jitwarm(args)
+    print(json.dumps(warm), flush=True)
 
     # Turn 2 is user, ASSISTANT, user -- a real second turn, not the prompt with more text
     # appended. The engine publishes `req.tokens[:materialized]` during decode, so the entry
@@ -430,12 +517,20 @@ def main() -> None:
     # that ignored the threshold entirely would produce the same three rows. This arm's
     # pass condition is that it does NOT prefetch.
     short_dir = args.spill + "_short"
-    shutil.rmtree(short_dir, ignore_errors=True)
-    os.makedirs(short_dir, exist_ok=True)
     n_star = rows[1].get("break_even_tokens") or 0
     short_tokens = max(16, n_star // 2)   # 16 = BLOCK_TOKENS; this script drives a server
                                           # over HTTP and does not import the package
-    if 0 < n_star < (1 << 31):
+    if args.skip_short:
+        # Remove a previous run's dir too, or the bytes this flag exists to save are
+        # still on the disk it is protecting.
+        shutil.rmtree(short_dir, ignore_errors=True)
+        print(json.dumps({"below_break_even": "SKIPPED", "why": "--skip-short: these two "
+                          "arms test the prefetch threshold, which the publish-churn "
+                          "columns (prefix_evictions, prefix_superseded) do not depend on"}),
+              flush=True)
+    elif 0 < n_star < (1 << 31):
+        shutil.rmtree(short_dir, ignore_errors=True)
+        os.makedirs(short_dir, exist_ok=True)
         short = _prompt(short_tokens)
         rows.append(_arm(args, "below_break_even", short_dir, short))
         print(json.dumps(rows[-1]), flush=True)
@@ -531,11 +626,14 @@ def main() -> None:
             "below it -- the threshold went untested this run"
         )
     # The assertions that decide whether the number means anything.
+    verdict["compiles_per_arm"] = {r["arm"]: r["compiles"] for r in rows}
+    verdict.update(warm)
     if any(r["compiles"] for r in rows):
         verdict["INVALID"] = (
             "TileLang compiled inside a measured window ("
             + ", ".join(f"{r['arm']}={r['compiles']}" for r in rows)
-            + "), so the arms differ by JIT and not by the tier"
+            + "), so the arms differ by JIT and not by the tier. Widths the warm-up "
+            + f"missed: {warm['uncovered_widths']}"
         )
     elif faulted["ssd_hits"] < 1:
         verdict["INVALID"] = (
@@ -577,4 +675,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # The widths the 2026-09-07 INVALID run actually met, from its logged token counts:
+    # turn 1 at 2729 never reaches the 320 a hit at 2720 produces, nor the control's 448.
+    assert _chunk_widths(2729) == [512, 512, 512, 512, 512, 192, 64]
+    assert _chunk_widths(3005, 2720) == [320, 64]
+    assert _chunk_widths(3005) == [512, 512, 512, 512, 512, 448, 64]
+    assert set(_chunk_widths(2729)) | {1} != set(_WIDTHS) | {1}  # why turn 1 is not enough
     main()

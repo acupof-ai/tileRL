@@ -92,7 +92,9 @@ def run_arm(args, arm: str, spill: str, log: str) -> list[dict]:
            "--max-ctx", str(args.max_ctx), "--slots", str(args.slots)]
     if spill:
         cmd += ["--ssd-path", spill]
-    env = dict(os.environ, TILELANG_CACHE_DIR="/work/tilelang_cache")
+    # setdefault, not override: a hardcoded /work made the child recompile on any other box.
+    env = dict(os.environ)
+    env.setdefault("TILELANG_CACHE_DIR", "/work/tilelang_cache")
     rows: list[dict] = []
     with open(log, "wb") as f:
         proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env,
