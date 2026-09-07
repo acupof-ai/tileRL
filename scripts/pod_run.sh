@@ -51,8 +51,10 @@ DEVICE_WAIT="${DEVICE_WAIT:-300}"
 WAIT=0
 [ "${1:-}" = --wait ] && { WAIT=1; shift; }
 [ $# -ge 4 ] || { echo "usage: $0 [--wait] <name> <card[,card...]> -- <command...>" >&2
-                  echo "  Returns as soon as the job is LAUNCHED, not when it finishes: poll" >&2
-                  echo "  /work/pod_run_<name>.out for POD_RUN_DONE_<name>, or pass --wait." >&2
+                  echo "  --wait, as the FIRST argument only. Without it this returns as soon as" >&2
+                  echo "  the job is LAUNCHED, not when it finishes: poll" >&2
+                  echo "  /work/pod_run_<name>.out for POD_RUN_DONE_<name>." >&2
+                  echo "  Exits: 3 orphan card, 4 unclaimable, 5 name already live, 6 --wait timed out." >&2
                   exit 2; }
 NAME=$1 CARD=$2; shift 2
 [ "$1" = "--" ] || { echo "$0: expected -- before the command" >&2; exit 2; }
@@ -189,11 +191,19 @@ echo "pod_run: claim: ${claim:-not reported yet -- check /work/pod_run_$NAME.out
 # card -- two 27B servers on one card and one port, 2026-09-08. Kept as the default because
 # callers rely on it; --wait is the opt-in.
 if [ "$WAIT" = 1 ]; then
-  # capped, so a hung job ends the poll rather than the poll outliving the pod
+  # capped, so a hung job ends the poll rather than the poll outliving the pod. The cap needs its
+  # own exit code: the loop used to fall through on exhaustion into the summary grep, which prints
+  # nothing and exits 0, so `--wait` on a hung job burned the full 2 h and then reported success --
+  # the launcher's rc decoupled from the job's, which is the defect this file was just fixed for.
+  # `set -o pipefail` does not catch it either: the grep|tail runs inside `bash -lc`, which has no
+  # pipefail, so tail's 0 wins. 5 is "refused, still live", 6 is "waited, never finished".
+  done_seen=0
   for _ in $(seq 1 "${WAIT_TICKS:-480}"); do
-    pod_exec "grep -q POD_RUN_DONE_$NAME /work/pod_run_$NAME.out 2>/dev/null" && break
+    pod_exec "grep -q POD_RUN_DONE_$NAME /work/pod_run_$NAME.out 2>/dev/null" && { done_seen=1; break; }
     sleep 15
   done
+  [ "$done_seen" = 1 ] || { echo "$0: --wait gave up after $(( ${WAIT_TICKS:-480} * 15 ))s; $NAME has not written POD_RUN_DONE_$NAME." >&2
+                            exit 6; }
   pod_exec "grep -h 'POD_RUN_DONE_\|pod_run: exit' /work/pod_run_$NAME.out | tail -2"
 fi
 echo "pod_run: $NAME on card $CARD; tail /work/$NAME.log, wrapper /work/pod_run_$NAME.out"
