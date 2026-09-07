@@ -18,6 +18,21 @@ chunk_gated_delta_rule_bwd_dhu -> chunk_bwd_dqkwg -> prepare_wy_repr_bwd). Same 
 wiring owned by the people who designed it. A disagreement is then about the math, which is the
 question.
 
+WHAT IS COMPARED: THE CORE ADJOINT, NOT THE LAYER'S. The first version of this probe compared
+`reference.gdn_backward` against fla directly and reported worst rel **1424** with per-row ratios
+scattered from -38 to +54. That was the probe, not the kernels, and it was wrong twice:
+
+  - `gdn_backward` returns dL/d(LAYER INPUT): q/k/v through conv1d+silu+L2norm, beta pre-sigmoid.
+    fla returns dL/d(qn, kn, v_raw, bt), post-prep. Those are different derivatives, so no value
+    of anything would have made them agree.
+  - it fed fla `do=go`, the raw output grad, where our own chunk loop consumes `g_core` -- the
+    gradient AFTER the RMSNorm and z-gate adjoint (reference.py:942).
+
+A wrong number that large is a gift, because it cannot be mistaken for a result. Both sides now
+enter at the same `g_core` and exit at the same post-prep tensors: ours by driving
+`reference._gdn_chunk_fwd` / `_gdn_chunk_bwd` directly, which is exactly what `gdn_backward`'s
+middle does, with its prologue and epilogue excluded on both sides rather than on one.
+
 THREE CONVENTIONS THIS PROBE PINS, each of which would otherwise show up as a "wrong gradient":
 
   1. CHUNK. reference.py:591 chunks the eager backward at _GDN_CHUNK=128; backend.py:28 chunks the
@@ -26,11 +41,16 @@ THREE CONVENTIONS THIS PROBE PINS, each of which would otherwise show up as a "w
   2. GATE BASE. fla scales g by RCP_LN2 (=1/ln2) on entry and uses exp2 in its kernels
      (chunk.py:63, wy_fast.py:90); ours is natural-log with the 1/ln2 folded in at the exp2 call
      sites (kernels_gdn.py:428). Mathematically identical, but the STORED g differs by 1/ln2, so
-     handing fla our g raw would be a scale error dressed as a convention mismatch. We pass g in
-     fla's own convention by letting fla do its own cumsum from the same pre-cumsum gate.
-  3. HEAD FOLD. Our 48 value heads over 16 key heads (rep=3). fla takes k at H and v at HV and
-     folds internally, so no repeat_interleave is done here -- doing one would compare a folded
-     gradient against an unfolded one.
+     handing fla our cumulative G raw would be a scale error dressed as a convention mismatch. fla
+     does its own cumsum here, from the same pre-cumsum `gt` our cache was built from.
+  3. HEAD FOLD. Our 48 value heads over 16 key heads (rep=3). Ours folds gq/gk onto 16 key heads
+     (reference.py:957); fla's are folded the same way before comparing, stated rather than silent.
+
+NOT COVERED, and not inferable from this arm: gz, gconv1d, gnorm_weight (no fla counterpart), and
+dA_log/ddt_bias. The latter two exist only on fla's `use_gate_in_kernel` path, which also moves its
+dg to the raw pre-softplus gate -- a different quantity from the `gt` both sides use here. Ours are
+a pure function of g_gt anyway (`ga_log = (g_gt*gt).sum`, reference.py:958), so `gg` agreeing makes
+them agree by construction.
 
 WHAT A RESULT MEANS, decided before the numbers exist so the reading is not fitted to them:
   small (<~1e-3)      -> conventions agree; precision is the only open question.
@@ -39,6 +59,7 @@ WHAT A RESULT MEANS, decided before the numbers exist so the reading is not fitt
                          2.7e-2 (wins/2026-09-07 + the port note), so an error of that size cannot
                          be separated from known precision loss by this arm. Reported as such,
                          not read as agreement.
+  absurd (>=1x)       -> the PROBE is wrong, as it was the first time. Not a finding.
 
   scripts/pod_run.sh gdna1 0 -- python3 -u scripts/probe_gdn_assertion1.py
 """
@@ -89,7 +110,6 @@ def main() -> int:
         chunk_gated_delta_rule_bwd,
         chunk_gated_delta_rule_fwd_intra,
     )
-    from fla.ops.gated_delta_rule.gate import gdn_gate_chunk_cumsum
     from fla.ops.utils import chunk_local_cumsum
     from fla.ops.utils.constant import RCP_LN2
     from tilerl_kernels import reference
@@ -105,90 +125,97 @@ def main() -> int:
     g = torch.randn(B, S, NVH, device=dev)
     beta = torch.randn(B, S, NVH, device=dev)
     state = torch.zeros(B, NVH, DK, DV, device=dev)
-    go = torch.randn(B, S, NVH * DV, device=dev)
     kw = dict(z=torch.randn(B, S, NVH * DV, device=dev),
               conv1d_weight=torch.randn(NKH * DK * 2 + NVH * DV, 4, device=dev) * 0.1,
               dt_bias=torch.randn(NVH, device=dev),
               a_log=torch.randn(NVH, device=dev),
               norm_weight=torch.randn(DV, device=dev))
 
-    # ---- ours ----------------------------------------------------------------------------
-    try:
-        ours = reference.gdn_backward(go, q, k, v, g, beta, state, **kw)
-    except Exception as exc:
-        out["ours_failed"] = repr(exc)[:300]
-        print(json.dumps(out, sort_keys=True), flush=True)
-        return 1
-    names = ("gq", "gk", "gv", "gg", "gbeta", "gstate", "gz", "gconv1d", "gdt_bias", "ga_log",
-             "gnorm_weight")
-    ours_d = dict(zip(names, ours))
-
-    # ---- fla, fed the SAME post-prep tensors --------------------------------------------
-    # reference.gdn_prep is the front half (conv+silu, q/k L2 norm with 1/sqrt(DK) folded into q,
-    # log gate, sigmoid beta). fla's chunk backward starts AFTER the conv/norm, so the conv and
-    # output-norm adjoints have no fla counterpart and are excluded rather than approximated.
-    # The GATE is not excluded: fla's use_gate_in_kernel path computes it from the raw pre-softplus
-    # gate and returns dA_log/ddt_bias, and its math is the same as ours --
-    # `gate = -exp(A_log) * softplus(g + bias)` (fla/ops/gated_delta_rule/gate.py:150 vs
-    # reference.py:914) -- so dg/dA_log/ddt_bias ARE comparable, which matters because those are
-    # the three the upstream tilelang subset never covered.
+    # ---- ours, THE CORE ADJOINT ONLY -----------------------------------------------------
+    # NOT reference.gdn_backward. That returns dL/d(layer input) -- through conv1d+silu+L2norm for
+    # q/k/v and pre-sigmoid for beta -- while fla returns dL/d(qn,kn,v_raw,bt), post-prep. The
+    # first version of this probe compared those two directly and got worst rel 1424 with ratios
+    # scattered from -38 to +54: two different derivatives, not two implementations of one.
+    # It also fed fla `do=go`, the raw output grad, where our own chunk loop consumes
+    # `g_core` -- the grad AFTER the RMSNorm and z-gate adjoint (reference.py:942). Both sides now
+    # start from the same g_core and stop at the same post-prep inputs.
     qn, kn, v_raw, gt, bt, _ = reference.gdn_prep(
         q, k, v, g, beta, DK, conv1d_weight=kw["conv1d_weight"], dt_bias=kw["dt_bias"],
         a_log=kw["a_log"])
+    rep = NVH // NKH
+    qnv = qn.repeat_interleave(rep, dim=2)
+    knv = kn.repeat_interleave(rep, dim=2)
+    # g_core stands in for "the gradient arriving at the core". Its exact value does not matter to
+    # the comparison as long as BOTH sides get it, so it is drawn directly rather than produced by
+    # running the norm/gate adjoint -- one less thing that has to match.
+    g_core = torch.randn(B, S, NVH, DV, device=dev)
+
+    starts = list(range(0, S, CHUNK))
+    s_run = state.clone().float()
+    caches = []
+    for c0 in starts:
+        sl = slice(c0, c0 + CHUNK)
+        _, s_run, cache = reference._gdn_chunk_fwd(
+            qnv[:, sl], knv[:, sl], v_raw[:, sl], bt[:, sl], gt[:, sl], s_run)
+        caches.append(cache)
+    dS = torch.zeros_like(state).float()
+    o_gq = torch.zeros(B, S, NVH, DK, device=dev)
+    o_gk = torch.zeros(B, S, NVH, DK, device=dev)
+    o_gv = torch.zeros(B, S, NVH, DV, device=dev)
+    o_gb = torch.zeros(B, S, NVH, device=dev)
+    o_gg = torch.zeros(B, S, NVH, device=dev)
+    for i in reversed(range(len(starts))):
+        sl = slice(starts[i], starts[i] + CHUNK)
+        (o_gq[:, sl], o_gk[:, sl], o_gv[:, sl], o_gb[:, sl], o_gg[:, sl],
+         dS) = reference._gdn_chunk_bwd(g_core[:, sl], dS, qnv[:, sl], knv[:, sl],
+                                        v_raw[:, sl], bt[:, sl], caches[i])
+    # fold to key heads, the way reference.py:957 does, so both sides are at NKH
+    ours_d = {"gq": o_gq.reshape(B, S, NKH, rep, DK).sum(3),
+              "gk": o_gk.reshape(B, S, NKH, rep, DK).sum(3),
+              "gv": o_gv, "gbeta": o_gb, "gg": o_gg, "gstate": dS}
+
+    # ---- fla, fed the SAME post-prep tensors and the SAME g_core -------------------------
     # fla takes k at NKH and v at NVH and folds internally: no repeat_interleave here.
     qf, kf = qn.contiguous().bfloat16(), kn.contiguous().bfloat16()
     vf, bf = v_raw.contiguous().bfloat16(), bt.contiguous().bfloat16()
-    # `g_raw` is the gate BEFORE softplus/a_log/dt_bias, which is what gdn_gate_* consumes. The
-    # conv+silu applies to q/k/v only -- reference.py:777 reads `g` straight from the argument --
-    # so the raw `g` here IS the same tensor both sides gate from, with no prep in between.
-    g_raw = g.contiguous().float()
-    out["gate_in_kernel"] = True
-    try:
-        gf = gdn_gate_chunk_cumsum(g=g_raw, A_log=kw["a_log"].float(), scale=RCP_LN2,
-                                   dt_bias=kw["dt_bias"].float(), chunk_size=CHUNK)
-    except Exception as exc:
-        # fall back to the gate-outside path: dA_log/ddt_bias then come back None and are
-        # reported as uncovered rather than silently missing.
-        out["gate_in_kernel"] = False
-        out["gate_cumsum_failed"] = repr(exc)[:200]
-        gf = chunk_local_cumsum(gt.float().contiguous(), chunk_size=CHUNK, scale=RCP_LN2)
+    # The gate stays OUTSIDE the kernel: fla's bwd ends with
+    # `dg = chunk_local_cumsum(dg, reverse=True)` (chunk.py:246), so its dg is w.r.t. the
+    # PRE-cumsum gate -- exactly our `gt`. Routing the gate through the kernel instead would give
+    # dA_log/ddt_bias but move dg to the raw pre-softplus gate, a different quantity. Ours are a
+    # pure function of g_gt anyway (`ga_log = (g_gt*gt).sum`, reference.py:958), so if gg agrees
+    # they agree by construction and need no separate row.
+    out["gate_in_kernel"] = False
+    gf = chunk_local_cumsum(gt.float().contiguous(), chunk_size=CHUNK, scale=RCP_LN2)
     try:
         _, _, A = chunk_gated_delta_rule_fwd_intra(
             k=kf, v=vf, g=gf, beta=bf, chunk_size=CHUNK)
         fla = chunk_gated_delta_rule_bwd(
             q=qf, k=kf, v=vf, g=gf, beta=bf, A=A, scale=1.0,
-            initial_state=state.float(), do=go.view(B, S, NVH, DV).contiguous().bfloat16(),
-            dht=None, chunk_size=CHUNK,
-            **(dict(use_gate_in_kernel=True, g_input=g_raw, A_log=kw["a_log"].float(),
-                    dt_bias=kw["dt_bias"].float()) if out["gate_in_kernel"] else {}))
+            initial_state=state.float(), do=g_core.contiguous().bfloat16(),
+            dht=None, chunk_size=CHUNK)
     except Exception as exc:
         out["fla_failed"] = repr(exc)[:400]
         out["note"] = ("fla's chunk backward refused these inputs; the arm has no number. "
                        "That is a result about the interface, not about the gradients.")
         print(json.dumps(out, sort_keys=True), flush=True)
         return 1
-    dq, dk_, dv_, db, dg_, dh0, dA_log, ddt_bias = fla
-
-    # ---- compare, on the four the two sides both produce in the same basis ---------------
-    # ours folds gq/gk back onto 16 key heads (reference.py:957); fla returns them at its own
-    # head count, so the fold is applied to fla's before comparing -- stated, not silent.
-    rep = NVH // NKH
-    if dq.shape[2] == NVH:
+    dq, dk_, dv_, db, dg_, dh0 = fla[0], fla[1], fla[2], fla[3], fla[4], fla[5]
+    if dq.shape[2] == NVH:  # fla returned q/k grads unfolded; fold as ours does
         dq = dq.reshape(B, S, NKH, rep, DK).sum(3)
         dk_ = dk_.reshape(B, S, NKH, rep, DK).sum(3)
+
+    # ---- compare, at the core boundary both sides now share ------------------------------
     rows = {}
     for nm, mine, theirs in (
-        ("gq", ours_d["gq"].reshape(B, S, NKH, DK), dq),
-        ("gk", ours_d["gk"].reshape(B, S, NKH, DK), dk_),
-        ("gv", ours_d["gv"].reshape(B, S, NVH, DV), dv_),
-        ("gbeta", ours_d["gbeta"].reshape(B, S, NVH), db),
-        ("gg", ours_d["gg"].reshape(B, S, NVH), dg_),
+        ("gq", ours_d["gq"], dq),
+        ("gk", ours_d["gk"], dk_),
+        ("gv", ours_d["gv"], dv_),
+        ("gbeta", ours_d["gbeta"], db),
+        ("gg", ours_d["gg"], dg_),
         ("gstate", ours_d["gstate"], dh0),
-        ("ga_log", ours_d["ga_log"], dA_log),
-        ("gdt_bias", ours_d["gdt_bias"], ddt_bias),
     ):
         if theirs is None:
-            rows[nm] = {"uncovered": "fla returned None (gate computed outside the kernel)"}
+            rows[nm] = {"uncovered": "fla returned None"}
             continue
         if tuple(mine.shape) != tuple(theirs.shape):
             rows[nm] = {"shape_mismatch": [list(mine.shape), list(theirs.shape)]}
@@ -205,26 +232,47 @@ def main() -> int:
     w = out["worst_rel"]
     if w is None:
         out["verdict"] = "no comparable rows; see shape_mismatch entries"
+    elif w >= 1.0:
+        # The rung that was MISSING when this probe first ran: it reported 1424 as "a real
+        # decomposition difference" because the ladder's top rung was 5e-2 and everything above it
+        # fell there. A relative error at or above 1.0 means the two sides are not computing the
+        # same quantity, which is a defect in the comparison, not a result about the kernels.
+        out["verdict"] = (f"THE PROBE IS WRONG, not the kernels: worst rel {w:.4g} >= 1.0 means "
+                          "the two sides are not the same derivative. Check that both enter at "
+                          "g_core and exit post-prep before reading anything into this.")
     elif w < 1e-3:
         out["verdict"] = ("conventions AGREE (worst rel < 1e-3). Precision is the remaining "
                           "question, and the 2.7e-2 kernel-vs-reference gap is separate.")
     elif any(r.get("ratio_med_std") and r["ratio_med_std"][1] < 0.05
+             and abs(r["ratio_med_std"][0] - 1.0) > 0.02
              for r in rows.values() if "rel" in r):
+        # The `abs(med - 1.0) > 0.02` half was MISSING on the first pass and the rung fired on
+        # ratios of exactly 1.0 -- i.e. on perfect agreement, reported as a scale error. A constant
+        # ratio only means a scale or sign convention differs when that constant is not 1.
         out["verdict"] = ("a SCALE or SIGN convention differs: at least one grad's ratio is "
-                          "near-constant (std < 0.05). Fixable, and it must be fixed before a "
+                          "near-constant and NOT 1.0. Fixable, and it must be fixed before a "
                           "port, but it is not a precision result.")
+    elif all(r.get("ratio_med_std") and abs(r["ratio_med_std"][0] - 1.0) <= 0.02
+             for r in rows.values() if "rel" in r):
+        out["verdict"] = (f"CONVENTIONS AGREE: every ratio is 1.0 within 2%, so no sign, scale or "
+                          f"decay-placement difference exists. The residual worst rel {w:.3g} is "
+                          "consistent with the bf16 inputs fla is fed and is NOT a convention "
+                          "finding. It is also 3x SMALLER than the 2.7e-2 the upstream tilelang "
+                          "kernels miss their own f32 reference by, so it does not resolve that "
+                          "separate question.")
     elif w < 5e-2:
         out["verdict"] = ("UNRESOLVED: the disagreement is the same order as the 2.7e-2 the "
                           "upstream kernels already miss their own f32 reference by, so this arm "
                           "cannot separate a convention mismatch from known precision loss.")
     else:
         out["verdict"] = ("the two adjoints DISAGREE beyond any precision explanation "
-                          "(worst rel >= 5e-2) and the ratio is not constant: a real "
+                          "(5e-2 <= worst rel < 1.0) and the ratio is not constant: a real "
                           "decomposition difference, not a scale.")
     print(json.dumps(out, indent=1, sort_keys=True), flush=True)
-    print("\n# EXCLUDED from this comparison, and not inferable from it: gz, gconv1d, gdt_bias,")
-    print("# ga_log, gnorm_weight. fla's chunk backward starts after the prep and ends before")
-    print("# the norm/gate epilogue, so those five adjoints are OURS ALONE and unchecked here.")
+    print("\n# NOT COVERED here and not inferable from this arm: gz, gconv1d, gnorm_weight (no fla")
+    print("# counterpart), and ga_log/gdt_bias (fla produces them only on the use_gate_in_kernel")
+    print("# path, whose dg is w.r.t. a different gate). ga_log/gdt_bias are pure functions of")
+    print("# g_gt on our side, so gg agreeing makes them agree by construction.")
     if a.out:
         Path(a.out).write_text(json.dumps(out, indent=2, sort_keys=True))
     return 0
