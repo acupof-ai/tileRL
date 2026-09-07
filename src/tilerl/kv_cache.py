@@ -24,6 +24,12 @@ BLOCK_TOKENS = 16
 _MASK64 = (1 << 64) - 1
 
 
+def _blob_bytes(st: dict) -> int:
+    """Bytes of a state snapshot, for the fetch-rate accounting."""
+    return sum(t.numel() * t.element_size()
+               for t in (st.get("states"), st.get("windows")) if t is not None)
+
+
 def _rolling_hash(prev: int, token: int) -> int:
     # +1 so token 0 still perturbs the state; collisions are verified by PrefixStore.
     return ((prev * 1000003) ^ (token + 1)) & _MASK64
@@ -468,7 +474,7 @@ class KvTier:
         self._q: queue.Queue = queue.Queue()
         self._writer = threading.Thread(target=self._flush_loop, daemon=True)
         # read side: the torch.load runs off-tick, not inside step() under the lock
-        self._fetches: dict[int, dict] = {}   # key -> {"blob", "tokens"}, collected by take()
+        self._fetches: dict[int, dict] = {}   # key -> {"blob", "st", "tokens"}, collected by take()
         self._fetching: set[int] = set()      # queued or mid-read
         self._abandoned: set[int] = set()     # deadline fired mid-read; drop on landing
         self.prefetches = 0
@@ -476,8 +482,6 @@ class KvTier:
         self.fetch_drops = 0
         self.fetch_ms = 0.0
         self.fetch_bytes = 0
-        self.state_load_ms = 0.0   # the .st read, on the caller at lookup time
-        self.state_loads = 0
         self.snapshot_bytes = 0
         self.tick_loads = 0
         self._rq: queue.Queue = queue.Queue()
@@ -686,11 +690,12 @@ class KvTier:
             return key in self._fetching
 
     def take(self, key: int):
+        """The prefetched pair, or None. `st` may be absent on an older parked entry."""
         with self._lock:
             done = self._fetches.pop(key, None)
         if done is None or "blob" not in done:
             return None
-        return done["blob"]
+        return done
 
     def discard_fetch(self, key: int) -> None:
         """Give up on a prefetch; a late arrival is dropped rather than parked."""
@@ -705,16 +710,21 @@ class KvTier:
     def _fetch_loop(self) -> None:
         while True:
             key, tokens = self._rq.get()
-            blob = None
             with self._lock:
                 blob = self._pending.get(key)
-            if blob is None:
+                st = self._pending_st.get(key)
+            if blob is None or st is None:
                 try:
                     ts = time.perf_counter()
-                    blob = torch.load(self._kv(key), map_location="cpu")
+                    if blob is None:
+                        blob = torch.load(self._kv(key), map_location="cpu")
+                        self.fetch_bytes += sum(t.numel() * t.element_size()
+                                                for t in (blob["k"], blob["v"]))
+                    # the .st too: reading it in `load_state` put 157 MiB on the tick
+                    if st is None:
+                        st = torch.load(self._st(key), map_location="cpu")
+                        self.fetch_bytes += _blob_bytes(st)
                     self.fetch_ms += (time.perf_counter() - ts) * 1000
-                    self.fetch_bytes += sum(t.numel() * t.element_size()
-                                            for t in (blob["k"], blob["v"]))
                 except Exception:  # noqa: BLE001 - truncated / corrupt / raced eviction
                     self.drop(key)
                     with self._lock:
@@ -727,7 +737,7 @@ class KvTier:
                     # abandoned mid-read: park nothing, or the host buffer is pinned
                     self._abandoned.discard(key)
                     continue
-                self._fetches[key] = {"blob": blob, "tokens": tokens}
+                self._fetches[key] = {"blob": blob, "st": st, "tokens": tokens}
             self.fetches_ready += 1
 
     def load_kv(self, key: int, tokens: tuple[int, ...], blocks: Sequence[int],
@@ -777,20 +787,17 @@ class KvTier:
             self._pending_st[key] = blob
         self._q.put((("st", key), blob, self._st(key), [ev_s, ev_w]))
 
-    def load_state(self, key: int, tokens: tuple[int, ...]):
+    def load_state(self, key: int, tokens: tuple[int, ...], blob: dict | None = None):
         # None = gone or a hash-collision mismatch — caller degrades to a miss.
-        with self._lock:
-            blob = self._pending_st.get(key)
+        if blob is None:
+            with self._lock:
+                blob = self._pending_st.get(key)
         if blob is None:
             if not os.path.exists(self._st(key)):
                 return None
             try:
-                # Timed apart from the kv fetch, which B is built on: this read is not
-                # prefetched and runs on the caller, so B covers the kv plane only.
-                ts = time.perf_counter()
+                # reached only with no prefetch: below the break-even, or no reader
                 blob = torch.load(self._st(key), map_location="cpu")
-                self.state_load_ms += (time.perf_counter() - ts) * 1000
-                self.state_loads += 1
             except Exception:  # noqa: BLE001 - truncated / corrupt spill, same as load_kv
                 self.drop(key)
                 return None
@@ -800,8 +807,7 @@ class KvTier:
         return blob["states"], blob["windows"]
 
     def read_bytes_per_s(self) -> float:
-        """B in the break-even, from this tier's own fetches: a hardcoded rate would
-        describe whichever box it was written on. 0 before anything has been read."""
+        """B in the break-even, over both planes a hit reads. 0 before the first read."""
         return 0.0 if self.fetch_ms <= 0 else self.fetch_bytes / (self.fetch_ms / 1000.0)
 
     def resident(self, key: int) -> bool:
@@ -864,8 +870,9 @@ class KvTier:
             "ssd_fetch_ms": int(self.fetch_ms),
             # with fetch_ms this gives B for the run
             "ssd_fetch_bytes": self.fetch_bytes,
-            "ssd_state_load_ms": int(self.state_load_ms),
-            "ssd_state_loads": self.state_loads,
+            # retained at 0 for readers: the lookup path no longer reads the .st
+            "ssd_state_load_ms": 0,
+            "ssd_state_loads": 0,
         }
 
 
@@ -1163,14 +1170,14 @@ class PrefixStore:
                     # a miss for now: reading it here too puts the 1.7 s back on the tick
                     self.fetch_waits += 1
                     break
-                hit = self._fault_in(key, tokens[:i], blob=self._ssd.take(key))
+                hit = self._fault_in(key, tokens[:i], fetched=self._ssd.take(key))
                 if hit is not None:
                     return hit
         self.lookups_missed += 1
         return None
 
     def _fault_in(self, h: int, tokens: tuple[int, ...],
-                  blob: dict | None = None) -> PrefixHit | None:
+                  fetched: dict | None = None) -> PrefixHit | None:
         """Reload one prefix from the SSD tier into fresh blocks, or None.
 
         The reload allocates from the pool and hands the entry to `insert`, so the faulted
@@ -1178,9 +1185,11 @@ class PrefixStore:
         eviction and the byte accounting. `resident` gated the call, so at most one
         candidate length pays a `torch.load`.
 
-        `blob` is a prefetch the reader thread already read. Passing it makes this the
-        copy-only half; without it the `torch.load` still happens here, on the tick.
+        `fetched` is the reader thread's `{"blob", "st"}`; without it both `torch.load`s
+        happen here, on the tick.
         """
+        blob = None if fetched is None else fetched.get("blob")
+        st = None if fetched is None else fetched.get("st")
         need = PagedKvPool.blocks_for_tokens(len(tokens))
         # Only a whole-block prefix can be adopted: `insert` refuses a partial block,
         # because publishing one shares a page a slot is still appending to. Every publish
@@ -1189,7 +1198,7 @@ class PrefixStore:
             return None
         # Both halves or neither: adopting KV without the snapshot would run the GDN
         # layers from a zero state over KV that is not zero -- wrong, and silent.
-        loaded = self._ssd.load_state(h, tokens)
+        loaded = self._ssd.load_state(h, tokens, blob=st)
         if loaded is None:
             self._ssd.drop(h)
             return None

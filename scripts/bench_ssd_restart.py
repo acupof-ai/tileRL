@@ -328,21 +328,22 @@ def _arm(args, name: str, spill: str, prompt, reply: str = "") -> dict:
         "ssd_refusals": d("ssd_refusals"),
         "prefix_hits": d("prefix_hits"),
         "prefix_published": d("prefix_published"),
-        # The two the replace-on-publish change moves. `evictions` is what it aims at
-        # and `superseded` is what proves the path ran -- published alone cannot tell a
-        # bounded store from a churning one, since the fix leaves the publish COUNT alone.
+        # `evictions` is what replace-on-publish aims at, `superseded` proves it ran
         "prefix_evictions": d("prefix_evictions"),
         "prefix_superseded": d("prefix_superseded"),
         "prefix_entries": int(after.get("prefix_entries", 0)),
-        # The async path (row 50 PR B). tick_loads is the one that can refute the
-        # claim: a fault served from a torch.load on the calling thread is the
-        # synchronous path, whatever the wall clock says.
+        # tick_loads refutes the off-tick claim: a fault served from a torch.load on the
+        # calling thread is synchronous, whatever the wall clock says.
         "ssd_prefetches": d("ssd_prefetches"),
         "ssd_fetches_ready": d("ssd_fetches_ready"),
         "ssd_fetch_drops": d("ssd_fetch_drops"),
         "ssd_tick_loads": d("ssd_tick_loads"),
-        # 0 hits with waits > 0 is the row-58 signature: admitted before its fetch landed
+        # 0 hits with waits > 0 means a row was admitted before its fetch landed
         "ssd_fetch_waits": d("ssd_fetch_waits"),
+        # B for this arm, over both planes: the reader thread fetches the .st with the .kv
+        "fetch_ms": d("ssd_fetch_ms"),
+        "fetch_mib_s": round(d("ssd_fetch_bytes") / 2**20 / (d("ssd_fetch_ms") / 1000), 1)
+                       if d("ssd_fetch_ms") > 0 else None,
         "prefill_rate": after.get("prefill_rate"),
         "break_even_tokens": after.get("prefix_break_even_tokens"),
     }
