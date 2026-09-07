@@ -209,6 +209,30 @@ Agreement being exactly 24/24 is the accept condition, not a strong result on it
 greedy tokens is a short window, and this entry claims nothing about quality over a long
 run.
 
+### The capacity claim, demonstrated — and the throughput it costs
+
+B=32 x 32k on one H20, both pools fitted by `_fit_blocks` on the same free card:
+
+| | bf16 | fp8 |
+|---|---:|---:|
+| blocks fitted | 45294 | **89179** (1.9689x) |
+| peak requests resident of 32 | 22 | **32** |
+| wall clock for the same 32 requests | **702.4 s** | 1215.8 s |
+
+The block ratio matches the byte ratio to four digits — the fit is exactly proportional,
+with no per-block overhead unaccounted for. And bf16 could hold only 22 of the batch, so
+it serialized the rest, which is the shape the capacity claim predicted.
+
+**Then fp8 took 1.73x the wall clock anyway.** More concurrency and half the KV bytes, and
+it still finished the same work slower. So the honest end-to-end reading at this shape is a
+capacity win that does not convert: the readers dequantize at every gather — a cast and a
+multiply per KV element — and at 32k context attention reads enough KV for that ALU cost to
+exceed the bytes it saves.
+
+The two arms did not run at equal concurrency (22 vs 32 rows), so this does not isolate
+per-tick cost; it is a whole-run comparison at equal total work. The per-tick decode split
+that would isolate it is the pending number.
+
 ## Traps, each a rule for the next kernel in this tree
 
 - `T.alloc_fragment((2,), ...)` then `part[1]` is rejected: *"Only fragment[0] access is
@@ -279,7 +303,7 @@ pool each produced a plausible number that would have shipped. Three of them rea
 | 2026-09-07 | 0d14ab2 | this Mac | cpu | tiny | — | — | — (parity only) |
 | 2026-09-07 | e2d30c3 | H20 card 0 | sm90 | (kernel arms) | — | — | — (correctness only) |
 | 2026-09-07 | 9497f92 | H20 card 0 | sm90 | qwen38-27b | — | — | — (accuracy + range only) |
-| pending-remote | | H20 card 0 | sm90 | qwen38-27b | | | (rate + capacity) |
+| 2026-09-07 | 3eed93f | H20 card 0 | sm90 | qwen38-27b | ~7% slower | — | 1492.9 -> 862.4 tok/s over the run (0.578x) |
 
 The cpu row is parity and byte accounting: 473 tests pass, the fp8 gate green with its
 negative control, no timing claimed — the C backend cannot codegen fp8 at all, so both
@@ -291,13 +315,15 @@ Kernels compile, parity is ties-only, and the reader path costs 3.16% of the out
 The 27B row is agreement and range (the table above), run under `tilerl-kvfp8-27b-s3c`.
 No rate, because the run OOMed after those two arms for the reason in the traps list.
 
+The B=32 row is the whole-run rate at equal total work and unequal concurrency (bf16 22
+rows, fp8 32), so it is an end-to-end reading, not a per-tick one.
+
 Still pending, and it needs a card window with the 42 GB checkpoint:
 
-1. **decode tok/s at B=8 ctx=8k**, whose ceiling is 1.079x. The one number this entry
-   still does not have, and the reason B=1 is not the cell: its ceiling is 1.011x at 8k
-   and 1.041x at 32k, both under run-to-run variance.
-2. **the capacity demonstration** — the two fitted block counts on one card, and how many
-   of a B=32 x 32k batch each pool holds resident.
+1. **decode ms/tick at B=8 ctx=8k**, fp8 against bf16 at equal concurrency, whose ceiling
+   is 1.079x. The one number that could still show a gain, and the only one that isolates
+   the readers' per-gather dequant from the writers' quantize-on-write. B=1 is not the
+   cell: its ceiling is 1.011x at 8k and 1.041x at 32k, both under run-to-run variance.
 
 Raw artifacts: `scripts/probe_kv_fp8_kernels.py` (the four card arms, JSON on stdout)
 and `scripts/probe_kv_fp8_27b.py` (the 27B arms). The append-rule and RoPE-absmax
@@ -306,12 +332,14 @@ and the `attn_prep_fp8` docstring rather than kept as files.
 
 ## What this does not claim
 
-- No decode or prefill speedup, at any context length, on any card.
-- The 1.969x is a **capacity** figure — bytes resident per token — not a throughput one.
-  The throughput form it implies is *at saturation*: past the batch that fills the bf16
-  pool, fp8 keeps admitting where bf16 queues. That is a measurement on one card, not
-  arithmetic — the fit table must be the block counts `_fit_blocks` returns, not a
-  hand-derived GiB budget.
+- **No speedup anywhere, and a measured slowdown in both phases.** Prefill ~7% slower at
+  B=8 ctx=8k; the B=32 x 32k run 1.73x slower end to end despite holding 10 more requests
+  resident. A per-tick decode ratio is still unmeasured, and it is the only place a gain
+  could still be.
+- The 1.969x is a **capacity** figure — bytes resident per token, and now also blocks
+  fitted on one card — not a throughput one. The throughput form it implies at saturation
+  did **not** appear: fp8 admitted the whole batch that bf16 had to queue and was still
+  slower. Capacity is what this flag buys; it does not buy speed at these shapes.
 - Multi-session hit rates are not an fp8 measurement. A miss publishes ~62 interior
   entries at a 31k prompt and each evicts another session's shared head (v100's H20
   cell, entry at 541a37c); `_entries_capacity` divides by the GDN snapshot, never KV
