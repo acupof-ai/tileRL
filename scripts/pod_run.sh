@@ -2,9 +2,15 @@
 # Run one job on one H20 card, with every pod gotcha we paid for on 2026-09-05
 # already encoded. Nobody should hand-type this shape again.
 #
-#   scripts/pod_run.sh <name> <card[,card...]> -- <command...>
+#   scripts/pod_run.sh [--wait] <name> <card[,card...]> -- <command...>
 #   scripts/pod_run.sh arms 6 -- python3 scripts/recapture_arms.py --steps 6
 #   scripts/pod_run.sh tp2 0,6 -- torchrun --nproc_per_node=2 scripts/x.py
+#
+# It RETURNS AT LAUNCH, not at completion -- about two seconds in, after `started`. A caller
+# looping over arms must poll /work/pod_run_<name>.out for POD_RUN_DONE_<name> or pass --wait,
+# or the next arm lands on a card the previous one is still using: two 27B servers, one card,
+# one port 8000 (2026-09-08). The waiting bash below is the POD-SIDE one, which is a different
+# bash from the caller's and reaps the job; that is what the next line is about.
 #
 # What it encodes, each line a thing that actually went wrong:
 #   * a bash parent that WAITS, so the job is reaped. `setsid nohup ... &` from a
@@ -42,11 +48,20 @@ ORPHAN_MIB="${ORPHAN_MIB:-64}"
 # seconds to poll for the job's device fd: a 27B load takes minutes to open the card
 DEVICE_WAIT="${DEVICE_WAIT:-300}"
 
-[ $# -ge 4 ] || { echo "usage: $0 <name> <card[,card...]> -- <command...>" >&2; exit 2; }
+WAIT=0
+[ "${1:-}" = --wait ] && { WAIT=1; shift; }
+[ $# -ge 4 ] || { echo "usage: $0 [--wait] <name> <card[,card...]> -- <command...>" >&2
+                  echo "  Returns as soon as the job is LAUNCHED, not when it finishes: poll" >&2
+                  echo "  /work/pod_run_<name>.out for POD_RUN_DONE_<name>, or pass --wait." >&2
+                  exit 2; }
 NAME=$1 CARD=$2; shift 2
 [ "$1" = "--" ] || { echo "$0: expected -- before the command" >&2; exit 2; }
 shift
-CMD="$*"
+# Each argument printf %q'd separately, so a quoted multi-word argument survives. `CMD="$*"`
+# flattened argv and the runner's unquoted `setsid $CMD` re-split it, so
+# `-- bash -c '<script>'` arrived as `bash -c` with no operand: `bash: -c: option requires an
+# argument`, exit 2, card claimed, nothing running, and the caller saw `started` and exit 0.
+CMD=$(printf '%q ' "$@")
 
 # The runner is built by sourcing this file with POD_RUN_EMIT_RUNNER=1, so a selftest gets
 # the shipped text instead of a hand-kept copy: the previous selftest inlined its own
@@ -147,10 +162,33 @@ B64=$(printf '%s' "$RUNNER" | base64 | tr -d '\n')
 # The WRAPPER is still detached through an exiting shell, and so still ends as a
 # zombie under PID 1. That is fine and deliberate: it is a bash, it holds no CUDA
 # context, and it has already reaped the job that did. Only the job must not orphan.
+# A relaunch of a LIVE name corrupts the running one: /work/pod_run_$NAME.sh is a fixed path, and
+# bash reads a script by byte offset, so `base64 -d >` truncating it under a wrapper still parked in
+# pod_run_claim's poll makes that wrapper resume at a stale offset and execute a fragment
+# (`line 73: 0: command not found` from a 76-line file containing no bare 0, 2026-09-08). Both
+# wrappers also share the .out, which is why the pid line came out truncated. Refuse instead:
+# a name is one launch at a time.
+live=$(pod_exec "pgrep -f 'bash /work/pod_run_$NAME.sh' 2>/dev/null | head -3" 2>/dev/null || true)
+[ -z "$live" ] || { echo "$0: a wrapper for '$NAME' is still running (pid $(echo $live | tr '\n' ' '))." >&2
+                    echo "  Relaunching would rewrite its script under it. Wait, or use another name." >&2
+                    exit 5; }
+
 pod_exec "echo $B64 | base64 -d > /work/pod_run_$NAME.sh && setsid bash /work/pod_run_$NAME.sh > /work/pod_run_$NAME.out 2>&1 < /dev/null & sleep 2; echo started"
 # The claim line used to reach only /work/pod_run_<name>.out on the pod, so four launches in
 # one night printed no claim result at all to their caller and a silent success read exactly
 # like a silent failure. Surface it here: the claim decides whether the card is yours.
 claim=$(pod_exec "sed -n 's/^pod_run: \(.*claimed.*\|.*card_claim.*\)/\1/p' /work/pod_run_$NAME.out | head -2" 2>/dev/null || true)
 echo "pod_run: claim: ${claim:-not reported yet -- check /work/pod_run_$NAME.out}"
+# The default is a LAUNCH, not a run: this returns while the job is still going. Callers that
+# loop over arms must poll POD_RUN_DONE_<name> themselves or a second arm lands on the same
+# card -- two 27B servers on one card and one port, 2026-09-08. Kept as the default because
+# callers rely on it; --wait is the opt-in.
+if [ "$WAIT" = 1 ]; then
+  # capped, so a hung job ends the poll rather than the poll outliving the pod
+  for _ in $(seq 1 "${WAIT_TICKS:-480}"); do
+    pod_exec "grep -q POD_RUN_DONE_$NAME /work/pod_run_$NAME.out 2>/dev/null" && break
+    sleep 15
+  done
+  pod_exec "grep -h 'POD_RUN_DONE_\|pod_run: exit' /work/pod_run_$NAME.out | tail -2"
+fi
 echo "pod_run: $NAME on card $CARD; tail /work/$NAME.log, wrapper /work/pod_run_$NAME.out"
