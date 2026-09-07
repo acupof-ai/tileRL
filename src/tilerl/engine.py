@@ -43,6 +43,7 @@ import torch
 from . import precision
 from .kv_cache import (
     BLOCK_TOKENS,
+    NEVER_FETCH,
     BatchKv,
     DramSnapshots,
     KvTier,
@@ -795,6 +796,7 @@ class Engine:
     def _build_stats(self) -> dict[str, Any]:
         with self._lock:
             store = self._prefix.stats()
+            _be = self._prefix.break_even_tokens(self.prefill_rate)
             return {
                 "waiting": len(self._waiting),
                 "running": len(self._running),
@@ -808,7 +810,8 @@ class Engine:
                 "prefix_misses": self._prefix_misses,
                 # both operands of the fetch-vs-recompute decision, for a live server
                 "prefill_rate": round(self.prefill_rate, 1),
-                "prefix_break_even_tokens": self._prefix.break_even_tokens(self.prefill_rate),
+                # null, not the sentinel: no length pays, so this is not a token count
+                "prefix_break_even_tokens": (None if _be >= NEVER_FETCH else _be),
                 "prefix_published": self._prefix_published,
                 # Whether the store is under pressure at all: a DRAM/SSD tier below it can
                 # only recover entries that were actually evicted, and at 144 MiB a 27B

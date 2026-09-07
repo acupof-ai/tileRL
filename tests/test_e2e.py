@@ -3179,6 +3179,19 @@ def test_the_break_even_refuses_a_prefix_below_it_and_the_deadline_drops_a_slow_
     )
 
 
+def test_health_reports_never_prefetch_as_null_not_the_sentinel():
+    """`prefix_break_even_tokens` is a token count or nothing.
+
+    A default engine has no SSD tier, so no length pays and the store answers with
+    the sentinel. Publishing 2147483648 there invites a reader to compare it against
+    a prompt length; null says "never" in the one way that cannot be misread.
+    """
+    eng = _build_engine(seed=7)
+    assert eng.stats()["prefix_break_even_tokens"] is None, (
+        "no tier, so nothing can be fetched, but /health published a token count"
+    )
+
+
 def test_the_break_even_operands_come_from_the_pool_not_a_constant(tmp_path):
     """k must be read from the pool's dtype and shape, not written down.
 
