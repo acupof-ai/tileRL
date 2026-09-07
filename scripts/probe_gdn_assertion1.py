@@ -116,7 +116,13 @@ def main() -> int:
 
     torch.manual_seed(a.seed)
     dev = "cuda"
-    out: dict = {"shape": dict(B=B, S=S, NKH=NKH, NVH=NVH, DK=DK, DV=DV, chunk=CHUNK)}
+    # the versions belong IN the artifact: read from a separate shell they are a claim about a
+    # different process than the one that produced the numbers.
+    import fla
+    import triton
+    out: dict = {"shape": dict(B=B, S=S, NKH=NKH, NVH=NVH, DK=DK, DV=DV, chunk=CHUNK),
+                 "versions": {"fla": fla.__version__, "triton": triton.__version__,
+                              "torch": torch.__version__}}
 
     # ---- the shared inputs, in OUR layout -------------------------------------------------
     q = torch.randn(B, S, NKH * DK, device=dev)
