@@ -107,9 +107,10 @@ serial attention cost by the chain width:
 dense); it is now a win at every context. tok/fwd holds at 2.9-3.3 across the
 whole range, so draft acceptance never degraded with context — attention was
 eating the gain the whole time. Peak throughput is **46.5 tok/s at 1024 ctx**,
-83% of the 56.1 tok/s *dense* weight-bandwidth roofline, and **29-37% of the
-ceiling a speculative rate is bound by** — at 2.9 tok/forward a weight bound on
-forwards permits 124-163 tok/s
+83% of the 56.1 tok/s *dense* weight-bandwidth roofline, and **34.3% of the
+ceiling a speculative rate is bound by** — at 2.9 tok/forward over a 19.24 GB
+depth-3 tick a weight bound on forwards permits 135.7 tok/s. The draft forward's
+1.065 GB was measured 2026-09-06, replacing an earlier 29-37% bracket
 (`errors/2026-09-06-a-spec-rate-over-a-dense-roofline.md`).
 
 Sharing the K/V tile across the GQA group would cut cache traffic another 6×,
