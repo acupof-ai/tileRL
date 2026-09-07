@@ -155,6 +155,12 @@ def _serve(args, spill: str, log: str):
                                 cwd=args.repo)
 
 
+def _arm_log(args, name: str) -> str:
+    """This run's log for one arm; `--run` keeps it from overwriting another run's."""
+    tag = f"{args.run}_" if args.run else ""
+    return os.path.join(args.logdir, f"ssd_restart_{tag}{name}.log")
+
+
 def _compiles(log: str) -> int:
     try:
         with open(log, encoding="utf-8", errors="replace") as f:
@@ -189,7 +195,7 @@ def _jitwarm(args) -> dict:
     one warm request from another: a hit would move `prefill_from` and run a narrower width
     than the one being asked for, leaving that width cold while the count below says warm.
     """
-    log = os.path.join(args.logdir, "ssd_restart_jitwarm.log")
+    log = _arm_log(args, "jitwarm")
     proc = _serve(args, "", log)
     tokens, covered, ratio = [], {1}, 1.0
     try:
@@ -377,7 +383,7 @@ def _arm(args, name: str, spill: str, prompt, reply: str = "") -> dict:
     reply it generated; a turn 2 that omits the reply is not a prefix of it and cannot
     hit. That is what made every arm read 0 SSD hits (errors/2026-09-07).
     """
-    log = os.path.join(args.logdir, f"ssd_restart_{name}.log")
+    log = _arm_log(args, name)
     msgs = [{"role": "user", "content": prompt}]
     if reply:
         msgs += [{"role": "assistant", "content": reply},
@@ -446,6 +452,10 @@ def main() -> None:
                     help="server cwd, one tree per session. No fallback: a wrong tree produces a number, not an error")
     ap.add_argument("--spill", default="/work/ssd_tier_bench")
     ap.add_argument("--logdir", default="/work", help="per-arm server logs; /work is the H20's")
+    ap.add_argument("--run", default="",
+                    help="names this run's arm logs. Without it every run overwrites the last: "
+                         "the six files on the H20 all held the LAST run's startup, so a "
+                         "compiles grep would confirm one run with another's evidence")
     ap.add_argument("--port", type=int, default=8123)
     ap.add_argument("--tokens", type=int, default=3000, help="target prompt length")
     ap.add_argument("--gen", type=int, default=8, help="tokens to generate; keep small so "
@@ -681,4 +691,7 @@ if __name__ == "__main__":
     assert _chunk_widths(3005, 2720) == [320, 64]
     assert _chunk_widths(3005) == [512, 512, 512, 512, 512, 448, 64]
     assert set(_chunk_widths(2729)) | {1} != set(_WIDTHS) | {1}  # why turn 1 is not enough
+    # A warm-up length where both short-prompt rules bite: without the first-chunk 64-cut
+    # this reads [128, 64], without the 1-token backoff it ends on a width of 1.
+    assert _chunk_widths(97) == [64, 64, 64]
     main()

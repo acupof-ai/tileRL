@@ -13,8 +13,16 @@ published verdict swept only the budget, holding sessions at 2. A one-axis sweep
 threshold and a threshold reads like a law; the other axis reversed it, 0/63 -> 24/0 hits.
 Default stays 2 so the published arm reproduces.
 
+`--sys-tokens` adds the shape a real Claude Code session has: one large system prefix --
+tool defs plus instructions -- resent identically on every turn of every session. That
+prefix is the same tokens for all of them, so it is the store's best case and the arm the
+serve path actually cares about; the fillers below still diverge after it, so a session's
+own longer entry stays its own. 0 reproduces the published arm.
+
   python scripts/bench_chat_interleaved.py --turns 4 --grow 40                # published arm
   python scripts/bench_chat_interleaved.py --turns 4 --grow 40 --sessions 12  # the other axis
+  python scripts/bench_chat_interleaved.py --turns 4 --grow 40 --sessions 12 \
+      --sys-tokens 30000 --ttft --server-log /work/serve.log                  # agent shape
 """
 
 from __future__ import annotations
@@ -50,6 +58,30 @@ def _fillers(n: int) -> list[str]:
     return [f"Session {i} of {n}. {_TOPICS[i % len(_TOPICS)]}" for i in range(n)]
 
 
+def _system(target_tokens: int) -> str:
+    """An agent session's shared head: tool definitions and standing instructions.
+
+    Shape, not lorem -- what a Claude Code turn actually resends unchanged: the same tool
+    schemas and rules on every turn of every session.
+
+    1.556 tokens per word is MEASURED on this unit with the 27B's own tokenizer (72 words,
+    112 tokens), not the 1.3 the filler-length scripts assume: identifiers and punctuation
+    split far harder than prose, and 1.3 here would overshoot the request by 16%. Whole units
+    are repeated rather than words sliced, so the count is 112 per rep and lands at -0.84% of
+    30000. The caller still checks the ACHIEVED count from `usage`, since a fixture that asked
+    for 30k and got 8k is not the workload it claims to be.
+    """
+    unit = (
+        "Tool: read_file(path: string, offset: integer, limit: integer) -- returns the file "
+        "with line numbers. Tool: edit_file(path: string, old: string, new: string) -- exact "
+        "string replacement, fails when `old` is not unique. Tool: run(command: string, "
+        "timeout_ms: integer) -- runs in the session shell, working directory persists. "
+        "Rule: read a file before editing it. Rule: prefer the dedicated tool over a shell "
+        "equivalent. Rule: report what the command printed, never what it should have. "
+    )
+    return unit * max(1, round(target_tokens / 112))
+
+
 def _label(i: int) -> str:
     return chr(ord("A") + i) if i < 26 else f"S{i}"
 
@@ -60,6 +92,58 @@ def _post(url: str, body: dict, timeout: float) -> dict:
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
+
+
+def _post_stream(url: str, body: dict, timeout: float) -> tuple[dict, float]:
+    """(response-shaped dict, seconds to the first token).
+
+    Non-streaming cannot yield TTFT at all: the route awaits the whole completion before it
+    builds a reply (server.py:298) and the JSON carries no per-phase timing, so wall clock is
+    the only number available there. A tier hit lands in PREFILL, and at a 30k prefix the
+    decode dominates, so wall clock dilutes the effect this bench exists to measure. Hence
+    the same script streams when asked, rather than a second script existing.
+    """
+    # include_usage or a streamed reply carries no prompt_tokens (server.py:492) and the
+    # achieved system-prefix check below would compare against 0 and pass vacuously.
+    req = urllib.request.Request(
+        url, data=json.dumps({**body, "stream": True,
+                              "stream_options": {"include_usage": True}}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    text, ttft, usage, t0 = [], None, {}, time.perf_counter()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        for raw in r:
+            line = raw.decode().strip()
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            ev = json.loads(line[6:])
+            if "error" in ev:
+                # Without this the frame parses as a turn with no content and the row records
+                # a fast zero-token reply -- a failure that reads as the best wall clock here.
+                raise SystemExit(f"server error mid-stream: {ev['error']}")
+            usage = ev.get("usage") or usage
+            delta = (ev.get("choices") or [{}])[0].get("delta", {})
+            # Reasoning counts: this checkpoint opens <think> in the prompt, so the first
+            # token out is reasoning_content, and timing only `content` would time the
+            # thinking block instead of prefill. First token of EITHER kind is the TTFT.
+            piece = delta.get("content")
+            if piece or delta.get("reasoning_content"):
+                ttft = ttft if ttft is not None else time.perf_counter() - t0
+            if piece:
+                text.append(piece)
+    return ({"choices": [{"message": {"content": "".join(text)}}], "usage": usage},
+            -1.0 if ttft is None else ttft)
+
+
+def _compiles(path: str) -> int:
+    """`begins to compile` lines in the server's own log, or -1 when it was not given."""
+    if not path:
+        return -1
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return sum("begins to compile" in line for line in f)
+    except OSError:
+        return -1
 
 
 def _get(url: str) -> dict:
@@ -75,36 +159,59 @@ def main() -> int:
     ap.add_argument("--turns", type=int, default=4)
     ap.add_argument("--grow", type=int, default=40)
     ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument("--sys-tokens", type=int, default=0,
+                    help="shared system prefix per session, an agent's shape; 0 reproduces "
+                         "the published arm")
     ap.add_argument("--timeout", type=float, default=1800.0)
+    ap.add_argument("--ttft", action="store_true",
+                    help="stream, and time the first token: a prefix hit shows up in prefill, "
+                         "which wall clock dilutes at a 30k prefix")
+    ap.add_argument("--server-log", default="",
+                    help="the server's own stdout, for the compiles count; without it a "
+                         "compile inside a measured turn is invisible and reads as tier cost")
     args = ap.parse_args()
     if args.sessions < 1:
         ap.error("--sessions must be >= 1")
 
     fillers = _fillers(args.sessions)
     # Not an assert: `-O` strips those, and this guard's whole value is firing in someone
-    # else's later edit. Distinct heads, not just distinct strings -- prefixes hash from
-    # token 0, so two fillers agreeing there share one entry however they end.
-    if len({s[:20] for s in fillers}) != args.sessions:
+    # else's later edit. Retargeted for `--sys-tokens`: the shared system head is now WANTED
+    # (it is the entry every session hits), so what must still differ is the body after it --
+    # two fillers agreeing at their own token 0 make one entry serve both bodies, and the hit
+    # rate goes back to measuring the fixture.
+    heads = {s[:20] for s in fillers}
+    if len(heads) != args.sessions:
         raise SystemExit(
-            f"{args.sessions} sessions produced {len({s[:20] for s in fillers})} distinct "
-            "prefixes: the conversations would share cache entries and the hit rate would "
-            "measure the fixture, not the tier"
+            f"{args.sessions} sessions produced {len(heads)} distinct filler heads: past the "
+            "shared system prefix the conversations would still share entries, and the hit "
+            "rate would measure the fixture, not the tier"
         )
-    convs: list[list[dict]] = [[] for _ in fillers]
+    # One system message, one object per conversation: the chat route renders every message's
+    # role as its own ChatML turn (prompt.py:38-39), so a `system` role really does reach the
+    # token stream, first and identically for all sessions -- shared tokens, not a client-side
+    # fiction. Verified: `<|im_start|>system` in the render, 29749 of the 30848 prompt tokens.
+    system = _system(args.sys_tokens) if args.sys_tokens else ""
+    convs: list[list[dict]] = [[{"role": "system", "content": system}] if system else []
+                               for _ in fillers]
     rows = []
+    # Checked against the server's own `usage`, not against `_system`'s arithmetic: the second
+    # would agree with the first by construction and could not catch a rendering that dropped
+    # the system turn.
+    sys_seen = 0
     for turn in range(args.turns):
         for c, filler in enumerate(fillers):
             convs[c].append({"role": "user", "content": filler * args.grow * (turn + 1)})
             before = _get(f"{args.url}/health")
+            c0 = _compiles(args.server_log)
             t0 = time.perf_counter()
-            out = _post(
-                f"{args.url}/v1/chat/completions",
-                {"model": "qwen38-27b", "messages": convs[c],
-                 "max_tokens": args.max_tokens, "temperature": 0.0},
-                args.timeout,
-            )
+            body = {"model": "qwen38-27b", "messages": convs[c],
+                    "max_tokens": args.max_tokens, "temperature": 0.0}
+            url = f"{args.url}/v1/chat/completions"
+            out, ttft = (_post_stream(url, body, args.timeout) if args.ttft
+                         else (_post(url, body, args.timeout), -1.0))
             wall = time.perf_counter() - t0
             after = _get(f"{args.url}/health")
+            compiles = max(0, _compiles(args.server_log) - c0) if c0 >= 0 else -1
             convs[c].append(
                 {"role": "assistant", "content": out["choices"][0]["message"]["content"]}
             )
@@ -116,10 +223,28 @@ def main() -> int:
                           "prefix_superseded", "dram_demotions", "dram_promotions")
             }
             n = out.get("usage", {}).get("prompt_tokens", 0)
+            # Peak, not delta: a pool-bound cell is the TIER's case rather than a confound to
+            # engineer away, so it has to be readable in the row instead of inferred from a
+            # wall clock. The tier-off arm is the one that can exhaust it.
+            pool = {"pool_used_blocks": after.get("pool_used_blocks", 0),
+                    "blocks_total": after.get("blocks_total", 0)}
+            if args.sys_tokens and not sys_seen:
+                sys_seen = n
+                if n < args.sys_tokens * 0.9:
+                    raise SystemExit(
+                        f"--sys-tokens {args.sys_tokens} produced a {n}-token first prompt: "
+                        "the shared head did not reach the token stream (a dropped system "
+                        "turn looks exactly like this) and this is not the agent workload"
+                    )
+                print(f"shared system prefix: asked {args.sys_tokens}, first prompt {n} tokens "
+                      f"({n / args.sys_tokens:.2f}x)", flush=True)
             rows.append({"turn": turn, "conv": _label(c), "prompt_tokens": n,
-                         "wall_s": round(wall, 2), **d})
+                         "wall_s": round(wall, 2), "ttft_s": round(ttft, 2),
+                         "compiles": compiles, **pool, **d})
+            pct = 100.0 * pool["pool_used_blocks"] / max(1, pool["blocks_total"])
             print(
                 f"turn {turn} conv {_label(c)}  prompt={n:6d}  wall={wall:8.2f}s  "
+                f"ttft={ttft:7.2f}s  compiles={compiles:2d}  pool={pct:5.1f}%  "
                 f"hits={d['prefix_hits']}  demote={d['dram_demotions']}  "
                 f"promote={d['dram_promotions']}  evict={d['prefix_evictions']}  "
                 f"super={d['prefix_superseded']}",
@@ -141,8 +266,20 @@ def main() -> int:
     for label, v in per_session.items():
         print(f"session {label}: hits={v['prefix_hits']} promote={v['dram_promotions']} "
               f"demote={v['dram_demotions']}", flush=True)
+    # This script attaches to a server it did not start, so a compile is only visible when the
+    # operator points --server-log at that server's stdout; unknown is reported as unknown
+    # rather than as clean, since a JIT inside a measured turn is charged to the tier.
+    dirty = [(r["turn"], r["conv"], r["compiles"]) for r in rows if r["compiles"] > 0]
+    known = all(r["compiles"] >= 0 for r in rows)
+    verdict = "unknown (no --server-log)" if not known else dirty or "clean"
+    print(f"compiles: {verdict}", flush=True)
+    peak = max((r["pool_used_blocks"] for r in rows), default=0)
+    tot = max((r["blocks_total"] for r in rows), default=0)
+    print(f"pool peak: {peak}/{tot} blocks ({100.0 * peak / max(1, tot):.1f}%)", flush=True)
     print(json.dumps({"sessions": args.sessions, "turns": args.turns, "rows": rows,
                       "per_session": per_session, "total_wall_s": total,
+                      "turns_with_compiles": dirty, "compiles_known": known,
+                      "pool_peak_blocks": peak, "blocks_total": tot,
                       "final_stats": st}, indent=2))
     return 0
 

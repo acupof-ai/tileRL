@@ -12,6 +12,8 @@
 #   * a DIRECT-PYTHON command is claimed as itself -- it has no descendant to follow.
 #   * a multi-arm wrapper re-claims per arm, so no arm runs on an unclaimed card.
 #   * an unclaimable job is KILLED, not left running, and the claim is released even so.
+#   * a re-claim of a pid pod_run already claimed is a no-op, not a refusal -- acquire says
+#     "claim reused, not re-taken" with rc 0 and no "claimed", and a substring test killed the job.
 set -euo pipefail
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
@@ -33,18 +35,30 @@ with open(log, "a") as f:
 # says "no descendant ... opened a GPU device". A mock that granted on the flag alone made
 # --wait-for-device look sufficient for every shape, which it is not.
 mode = os.environ.get("CLAIM_MODE", "shell_then_device")
+# The EXIT CODE is part of the contract the runner reads, so the mock carries it: the real
+# card_claim returns 0 on a grant and 1 on a refusal (`return 0 if ok else 1`), and a mock that
+# exited 0 for both let a refusal message read as a grant.
 if argv.startswith("acquire"):
     if mode == "never":
         print("pid 123 holds no GPU device fd: '/usr/bin/python3 -c ...'")
+        sys.exit(1)
+    elif mode == "reuse":
+        # The pod's real no-op path: pod_run's own block already claimed THIS pid, so an arm's
+        # re-claim is a reuse. rc 0, and the word "claimed" never appears -- which is why the
+        # runner must test rc. Killed a healthy 27B server on 2026-09-07.
+        print("tilerl-selftest already holds 6 for pid 123 "
+              "(same pid, same cards -- claim reused, not re-taken)")
     elif mode == "self_device":       # $CMD is python directly: it IS the pid on the card
         if "--require-device" in argv:
             print("claimed 6 for tilerl-selftest")
         else:
             print("no descendant of pid 123 opened a GPU device in 1s -- TIMEOUT")
+            sys.exit(1)
     elif "--wait-for-device" in argv:  # a wrapper: the python is a descendant
         print("claimed 6 for tilerl-selftest")
     else:
         print("pid 123 is a shell, not the job: 'bash /work/wrapper.sh'")
+        sys.exit(1)
 elif argv.startswith("release"):
     print("released tilerl-selftest: 1 claim(s) on 6")
 PY
@@ -142,6 +156,16 @@ grep -q "claimed 6" "$TMP/a4/wrapper.out" || fail "arm 4: a direct-python job wa
 grep -q -- "--require-device" "$TMP/a4/claims.txt" || fail "arm 4: acquire never tried --require-device: $(cat "$TMP/a4/claims.txt")"
 [ "$(cat "$TMP/a4/rc")" = 0 ] || fail "arm 4: rc $(cat "$TMP/a4/rc"), out: $(cat "$TMP/a4/wrapper.out")"
 
+# ---- arm 5: a re-claim of a pid pod_run ALREADY claimed must not kill the job ---------
+# pod_run's own block resolves the wrapper's claim to the descendant python, so a wrapper that
+# then calls pod_run_claim on that same python gets acquire's no-op path: rc 0, message "claim
+# reused, not re-taken", the word "claimed" absent. A substring test read that as a refusal and
+# killed a healthy 27B server after DEVICE_WAIT -- 6 minutes of card 0, 2026-09-07.
+JOB_SECS=3 DEVICE_WAIT=2 run_arm reuse "$TMP/a5"
+[ "$(cat "$TMP/a5/rc")" = 0 ] || fail "arm 5: a reused claim was treated as a refusal, rc $(cat "$TMP/a5/rc"): $(cat "$TMP/a5/wrapper.out")"
+grep -q "claim reused" "$TMP/a5/wrapper.out" || fail "arm 5: the reuse message was not reported: $(cat "$TMP/a5/wrapper.out")"
+grep -q "job done" "$TMP/work/selftest.log" || fail "arm 5: the job did not run"
+
 # ---- arm 2 (the control): an unclaimable job is killed, not left running -------------
 # Without this arm, arm 1 passes on a runner that ignores the claim result entirely.
 # DEVICE_WAIT=2 with a job that outlives it: the condition is "never claimed while ALIVE",
@@ -158,4 +182,4 @@ grep -q "^release " "$TMP/a2/claims.txt" || fail "arm 2: release never ran after
 # macOS's launchd reaps. Verified directly on the pod instead: a child whose bash parent exits
 # reads `stat=Zs ppid=1`, the same child under a parent that waits reads reaped. A grep for
 # stat=reaped here would pass against a wrapper with the reaping removed.
-echo "PASS: a wrapper-launched job claims via --wait-for-device, a direct-python one via --require-device, a multi-arm wrapper re-claims per arm, and an unclaimable job exits 4 and releases"
+echo "PASS: a wrapper-launched job claims via --wait-for-device, a direct-python one via --require-device, a multi-arm wrapper re-claims per arm, a reused claim is not a refusal, and an unclaimable job exits 4 and releases"
