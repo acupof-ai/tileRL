@@ -1276,9 +1276,6 @@ class PrefixStore:
         st = {
             "entries": len(self._by_id),
             "capacity": self.capacity,
-            # A snapshot is a constant size at any prefix length, so `state_bytes` is the
-            # ceiling that binds, not `capacity` -- plus the host tier, since a demoted
-            # entry stays matchable and `state_bytes=0` with a tier holds entries, not none.
             "entries_capacity": self._entries_capacity(),
             "state_bytes": self._state_used,
             # The budget beside the fill, for the reason `dram_budget` exists: `state_bytes`
