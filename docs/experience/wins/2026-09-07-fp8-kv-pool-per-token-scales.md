@@ -237,8 +237,17 @@ B=32 x 32k on one H20, both pools fitted by `_fit_blocks` on the same free card:
 | wall clock for the same 32 requests | **702.4 s** | 1215.8 s |
 
 The block ratio matches the byte ratio to four digits — the fit is exactly proportional,
-with no per-block overhead unaccounted for. And bf16 could hold only 22 of the batch, so
-it serialized the rest, which is the shape the capacity claim predicted.
+with no per-block overhead unaccounted for. And **blocks are demonstrably what bound the
+bf16 arm**, not the snapshot budget: a 32k request needs 2048 blocks, and 45294 / 2048 = 22,
+which is `peak_running` to the unit. fp8's fit would hold **43** requests, so its 32 resident
+is the batch size rather than its ceiling — `resident_ratio` 1.455x understates the gap and
+the 1.9689x block ratio is the capacity number.
+
+Worth knowing before enabling this elsewhere: `_snapshot_bytes` sums only the GDN state
+tensors, so the snapshot budget is dtype-invariant while the block budget nearly doubles.
+fp8 therefore pushes a cell from block-bound toward snapshot-bound. Here the block axis was
+still binding at 2048 blocks per request; a shorter-context, higher-batch cell would cross
+over, and then the block figure is not what limits it.
 
 **Then fp8 took 1.73x the wall clock anyway.** More concurrency and half the KV bytes, and
 it still finished the same work slower. So the honest end-to-end reading at this shape is a
