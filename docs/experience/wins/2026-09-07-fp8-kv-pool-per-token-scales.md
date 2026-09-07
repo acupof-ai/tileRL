@@ -10,11 +10,15 @@
 > one number this entry does not have (ceiling 1.079x). The verdict — default off — does not
 > depend on which of the two it is, which is what makes the distinction cheap to keep.
 >
-> The direction of that caveat is worth being explicit about, because it is the opposite of
-> what "unequal concurrency" usually implies. More rows per tick means **fewer ticks** for
-> the same total work: fp8 needed 0.688x as many ticks and still spent 1.73x the wall clock,
-> which puts its per-tick cost at roughly **2.5x**. The unequal rows make the measured loss
-> an *understatement* of the per-tick penalty, not an excuse for it.
+> The direction of that caveat is the opposite of what "unequal concurrency" usually
+> implies. More rows per tick means **fewer ticks** for the same total work, so fp8's 32 rows
+> against bf16's 22 predicted a *gain* — and the run went 1.73x the other way. The unequal
+> rows make the measured loss an **understatement** of the per-tick penalty, not an excuse
+> for it. The per-tick cost is therefore **between 1.73x and 2.52x**, and no closer: 2.52x
+> assumes bf16 held 22 rows throughout, but "22 of 32 resident" means the last 10 started as
+> earlier rows retired, so its schedule tapers and its true tick count lies between 32/32 and
+> 32/22 of fp8's. Pinning it needs a decode-tick count per arm, which this arm does not
+> record — `decode_ticks` exists only in the rate arm. Direction certain, magnitude a range.
 
 ## Context
 
