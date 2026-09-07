@@ -1525,10 +1525,7 @@ def build_engine(
     #: 2729-token prompt copy 941 MB of state to serve a single 157 MB entry. Raising this
     #: drops the short publishes, which are the ones a longer prefix supersedes anyway.
     ssd_min_tokens: int = 0,
-    #: HBM budget for resident GDN snapshots; 0 keeps the quarter-of-free rule below. An
-    #: operator could not set it, so the pressure regime the DRAM and SSD tiers exist for
-    #: was unreachable without editing source: on an H20 a quarter of free is 17.9 GiB,
-    #: 116 snapshots at 157 MiB, which no benchable session count reaches.
+    #: HBM budget for resident GDN snapshots; 0 keeps the quarter-of-free rule below.
     state_bytes: int = 0,
     decode_graph: bool | None = None,
     draft: Any = None,
