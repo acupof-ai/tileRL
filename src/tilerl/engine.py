@@ -1041,8 +1041,11 @@ class Engine:
                 # The FIRST interior boundary and the last, never the ones between: a row's
                 # publishes stay at 2 whatever the prompt length, where per-boundary publishing
                 # emitted 62 at a 31k prompt and outran any budget a pressured card has. Costs a
-                # PARTIAL sharer the intermediate prefixes it would have matched, measured -17%
-                # of cross-session partial reuse -- a recompute, not a wrong answer.
+                # PARTIAL sharer the intermediate prefixes it would have matched, and that cost
+                # GROWS with prompt length: this boundary is one chunk in, wherever the prompt
+                # ends, so a long prompt's sharer matches an absolute cap. 83.3% of ideal reuse at
+                # 2048 tokens, 12.5% at 16384. K evenly spaced publishes fixes the axis and gives
+                # back the whole cross-session gain (grid 81408, pure LRU's baseline).
                 # errors/2026-09-08-the-eviction-policy-was-the-wrong-layer.md
                 pf.interior_published += 1
                 if pf.interior_published == 1 or last:
