@@ -913,6 +913,9 @@ class NoPrefixStore:
     def abandon_prefetch(self, tokens: Sequence[int]) -> None:
         return None
 
+    def fetch_in_flight(self, tokens: Sequence[int]) -> bool:
+        return False
+
     def clear(self) -> None:
         return None
 
@@ -973,6 +976,21 @@ class PrefixStore:
         for t in tokens:
             h = self._roll(h, int(t))
         return h
+
+    def fetch_in_flight(self, tokens: Sequence[int]) -> bool:
+        """True while a prefetch for some prefix of ``tokens`` is still reading.
+
+        Same length ladder `prefetch_if_worth_it` queues on, so the engine asks about
+        exactly the fetches it started.
+        """
+        if self._ssd is None:
+            return False
+        h = 0
+        for i, t in enumerate(tokens, 1):
+            h = self._roll(h, int(t))
+            if i % BLOCK_TOKENS == 0 and self._ssd.fetch_pending(h):
+                return True
+        return False
 
     def abandon_prefetch(self, tokens: Sequence[int]) -> None:
         """Walks every length the probe could have queued: which one it took depends on
@@ -1295,6 +1313,9 @@ class PrefixStore:
             st.update(self._ssd.stats())
             st["ssd_hits"] = self.ssd_hits
             st["ssd_faults"] = self.ssd_faults
+            # a lookup that declined an in-flight fetch: high with hits at 0 means the
+            # rows are being admitted before their own prefetch lands
+            st["ssd_fetch_waits"] = self.fetch_waits
         return st
 
 

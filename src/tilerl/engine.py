@@ -708,16 +708,27 @@ class Engine:
         """Admit the whole waiting queue up to ``max_batch``, then all running
         decodes plus as many prefill rows as the token budget and one width
         bucket allow; a longer prompt stays in PREFILL and chunks across ticks."""
+        held: list[_Req] = []
         while self._waiting and len(self._running) < self.limits.max_batch:
             head = self._waiting[0]
             # deadline n/R: a fetch may not cost more than the prefill it replaces
             if head.fetch_deadline and time.perf_counter() > head.fetch_deadline:
                 head.fetch_deadline = 0.0
                 self._prefix.abandon_prefetch(head.tokens)
+            # Hold this row one tick while its OWN prefetch is still reading. `lookup`
+            # declines an in-flight prefix, so admitting now prefills the whole prompt and
+            # the bytes land with nobody to take them -- measured on card 1: every arm 0
+            # SSD hits with the entry recovered. Set aside rather than `break`, or the row
+            # blocks everything behind it for a read only it benefits from; the deadline
+            # above bounds the hold, and a row with no prefetch never enters the branch.
+            elif head.fetch_deadline and self._prefix.fetch_in_flight(head.tokens):
+                held.append(self._waiting.popleft())
+                continue
             # break, not continue: head-of-line FIFO, else a blocked large request starves.
             if not self._admit(head):
                 break
             self._running.append(self._waiting.popleft())
+        self._waiting.extendleft(reversed(held))  # back at the front, order preserved
         decodes = [r for r in self._running if r.phase == _PHASE_DECODE]
         prefills: list[_Req] = []
         chunks: list[int] = []
