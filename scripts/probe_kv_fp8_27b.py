@@ -167,6 +167,42 @@ def arm_decode(cfg, model, backend, ctx: int, n_new: int, batch: int = 1) -> dic
     return out
 
 
+def arm_boundary(cfg, model, backend, ctx: int, batch: int, n_new: int) -> dict:
+    """The configuration bf16 cannot serve and fp8 can: the capacity claim, demonstrated.
+
+    Not a ratio. On a 96 GiB H20 with the engine's 2/3 rule (~64 GiB usable) the 27B's
+    ~12.6 GiB of weights leave room for bf16 KV up to about B=8 x 64k or B=16 x 32k; at
+    B=32 x 32k bf16 needs 76.6 GiB and fp8 45.1. So one arm raises and the other generates,
+    which no reviewer has to take on trust.
+    """
+    prompts = [torch.randint(3, cfg.vocab_size - 1, (ctx,)).tolist() for _ in range(batch)]
+    out: dict = {"ctx": ctx, "batch": batch}
+    for nick, dt in (("bf16", None), ("fp8", torch.float8_e4m3fn)):
+        try:
+            n, eng = _gen(cfg, model, backend, prompts, n_new, dt)
+            out[nick] = {"tokens": n, "kv_bytes_per_token": eng._kv.bytes_per_token,
+                         "num_blocks": eng._kv.num_blocks}
+        except Exception as exc:  # noqa: BLE001 -- the raise IS the result for the bf16 arm
+            out[nick] = {"raised": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    out["fp8_serves_what_bf16_cannot"] = (
+        "raised" in out["bf16"] and "tokens" in out["fp8"] and out["fp8"]["tokens"] > 0)
+    # The arm is only meaningful if the two engines were sized DIFFERENTLY. Both arms raising
+    # is not a negative result: off CUDA `_fit_blocks` returns a fixed floor, so both pools get
+    # the same num_blocks and both exhaust it for a reason unrelated to the dtype. num_blocks
+    # is absent from an arm that raised, so "both raised" and "sized alike" are the same case.
+    nb = [out[k].get("num_blocks") for k in ("bf16", "fp8")]
+    out["blocks_differ"] = None not in nb and nb[0] != nb[1]
+    if not out["fp8_serves_what_bf16_cannot"] and not out["blocks_differ"]:
+        both_raised = "raised" in out["bf16"] and "raised" in out["fp8"]
+        out["inconclusive"] = (
+            "both pools raised, so the limit was not the dtype" if both_raised else
+            f"both pools were sized alike (num_blocks {nb})"
+        ) + " -- this arm needs a CUDA cell where _fit_blocks measures free memory"
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--source", default="/work/Qwen3.8-27B-NVFP4")
@@ -176,6 +212,10 @@ def main() -> int:
     ap.add_argument("--new-tokens", type=int, default=24)
     ap.add_argument("--decode-ctx", type=int, nargs="*", default=[8192, 32768],
                     help="context lengths for the decode arm; [] skips it")
+    ap.add_argument("--boundary-ctx", type=int, default=32768,
+                    help="context for the capacity-boundary arm")
+    ap.add_argument("--boundary-batch", type=int, default=32,
+                    help="batch where bf16 OOMs and fp8 serves; 0 skips the arm")
     ap.add_argument("--decode-batch", type=int, nargs="*", default=[1, 8],
                     help="batch sizes. KV scales with batch and the weights do not, so B=1 "
                          "has a 1.019x/1.072x ceiling at 8k/32k while B=8 at 32k has 1.38x "
@@ -224,6 +264,16 @@ def main() -> int:
                       f"{d['bf16']['tok_per_s']:.2f} -> {d['fp8']['tok_per_s']:.2f} tok/s "
                       f"= {d['tok_per_s_ratio']:.3f}x", flush=True)
                 print(json.dumps(d, sort_keys=True), flush=True)
+        if a.boundary_batch:
+            key = f"boundary_{a.boundary_ctx}_b{a.boundary_batch}"
+            results[key] = arm_boundary(cfg, model, be, a.boundary_ctx, a.boundary_batch,
+                                        a.new_tokens)
+            d = results[key]
+            print(f"\n{key}: bf16 {d['bf16'].get('raised', str(d['bf16'].get('tokens')) + ' tokens')}"
+                  f" | fp8 {d['fp8'].get('raised', str(d['fp8'].get('tokens')) + ' tokens')}"
+                  f" -> fp8 serves what bf16 cannot: {d['fp8_serves_what_bf16_cannot']}",
+                  flush=True)
+            print(json.dumps(d, sort_keys=True), flush=True)
     except Exception as exc:  # noqa: BLE001 -- the failure text is the answer
         results.setdefault("accuracy", {})
         results["failed"] = f"{type(exc).__name__}: {exc}"
