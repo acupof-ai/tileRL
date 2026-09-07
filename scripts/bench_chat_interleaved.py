@@ -228,6 +228,11 @@ def main() -> int:
             # wall clock. The tier-off arm is the one that can exhaust it.
             pool = {"pool_used_blocks": after.get("pool_used_blocks", 0),
                     "blocks_total": after.get("blocks_total", 0)}
+            # Resident entry count per row, not just at the end: the V100 read turn-0 hits on
+            # every other conversation, and a final count cannot say whether the store was
+            # holding the shared head at the moment a given session looked it up.
+            resident = {"prefix_entries": after.get("prefix_entries", 0),
+                        "prefix_entries_capacity": after.get("prefix_entries_capacity", 0)}
             if args.sys_tokens and not sys_seen:
                 sys_seen = n
                 if n < args.sys_tokens * 0.9:
@@ -240,11 +245,12 @@ def main() -> int:
                       f"({n / args.sys_tokens:.2f}x)", flush=True)
             rows.append({"turn": turn, "conv": _label(c), "prompt_tokens": n,
                          "wall_s": round(wall, 2), "ttft_s": round(ttft, 2),
-                         "compiles": compiles, **pool, **d})
+                         "compiles": compiles, **pool, **resident, **d})
             pct = 100.0 * pool["pool_used_blocks"] / max(1, pool["blocks_total"])
             print(
                 f"turn {turn} conv {_label(c)}  prompt={n:6d}  wall={wall:8.2f}s  "
                 f"ttft={ttft:7.2f}s  compiles={compiles:2d}  pool={pct:5.1f}%  "
+                f"ent={resident['prefix_entries']}/{resident['prefix_entries_capacity']}  "
                 f"hits={d['prefix_hits']}  demote={d['dram_demotions']}  "
                 f"promote={d['dram_promotions']}  evict={d['prefix_evictions']}  "
                 f"super={d['prefix_superseded']}",
