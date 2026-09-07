@@ -10,6 +10,7 @@ states a number it did not measure.
 |---|---|
 | [design-engine.md](design-engine.md) | The four layers and the one seam each — frontend, scheduling, model, storage. Why the decode tick is a captured kernel sequence, why prefix sharing is COW, and the physics the design has to satisfy. |
 | [design-kernels.md](design-kernels.md) | The kernel tree's file contracts, the registry rule (arch cell = CPU floor + overrides), the SOTA-copy provenance header, and the precision-before-tiles order a perf campaign follows. |
+| [design-sm70-prefill-cell.md](design-sm70-prefill-cell.md) | Why a Volta prefill chunk runs 29.9x its arithmetic floor, and the query-tiled cell that fixes it: the tile shape and what binds it, why D-blocking is rejected, the four implementation steps and the three gates that accept or reject the result. |
 | [design-rl-stack.md](design-rl-stack.md) | The three pieces of the RL product: the ISO optimizer and merger, the DFlash2 draft head and what keeps it on-policy, and the ledger CLI an agent drives. Marks what is settled and what is not. |
 | [support-matrix.md](support-matrix.md) | Per-op, per-target status — cpu, sm90, sm100, metal — for bf16, fp4 and fp8. A cell is `done` only if it ran, never because it compiled. `registry.py` is the source of truth; this mirrors it. |
 
