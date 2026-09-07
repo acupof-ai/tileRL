@@ -486,16 +486,22 @@ def test_paged_attention_prefill_tiled_vs_naive(backend):
         ("block_N > block_size", 24, 40, 16, 32, 4, 2),
         ("uneven GQA", 20, 44, 16, 8, 6, 3),
     ]
+    # device=backend.device on every input: this calls _kernel directly, so nothing
+    # migrates them the way backend.paged_attention() does (self._dev / self._i32).
+    # On a card that raises "input Q device_type mismatch, expected cuda; expected: 1,
+    # got: 2" -- the words carry the expectation, the two numbers are emitted by a
+    # separate codegen path and their order does not follow the words.
+    dev = backend.device
     for label, s, hist, bm, bn, h, hkv in arms:
         n = hist + s
         nb = (n + block - 1) // block + 1
         b = 2
-        k_cache = torch.randn(nb * b, hkv, block, d)
-        v_cache = torch.randn(nb * b, hkv, block, d)
-        block_table = torch.arange(nb * b, dtype=torch.int32).reshape(b, nb)
-        q = torch.randn(b, s, h, d)
-        seq_lens = torch.tensor([n] * b, dtype=torch.int32)
-        seq_q = torch.tensor([s] * b, dtype=torch.int32)
+        k_cache = torch.randn(nb * b, hkv, block, d, device=dev)
+        v_cache = torch.randn(nb * b, hkv, block, d, device=dev)
+        block_table = torch.arange(nb * b, dtype=torch.int32, device=dev).reshape(b, nb)
+        q = torch.randn(b, s, h, d, device=dev)
+        seq_lens = torch.tensor([n] * b, dtype=torch.int32, device=dev)
+        seq_q = torch.tensor([s] * b, dtype=torch.int32, device=dev)
         got = backend._kernel("paged_attention_prefill", block_M=bm, block_N=bn)(
             q, k_cache, v_cache, block_table, seq_lens, seq_q, scale, block, 32
         )
@@ -1025,3 +1031,48 @@ def test_frozen_bwd_chunking_matches_whole():
         finally:
             ref._BWD_SLICE_BYTES = big
         assert torch.allclose(whole, part, rtol=1e-4, atol=1e-4), f"fp8={fp8}"
+
+
+def test_every_direct_kernel_call_places_its_tensors_on_the_backend_device():
+    """A `backend._kernel(...)` call site must build its inputs on `backend.device`.
+
+    `paged_attention()` and its siblings migrate at the boundary (`self._dev`), so a
+    test going through them can pass cpu tensors and never notice; one calling
+    `_kernel` directly gets no such help and raises a device_type mismatch on a card.
+    A source check, because the failure only exists where this suite does not run.
+    """
+    import ast
+    import pathlib
+
+    MAKERS = ("randn", "zeros", "ones", "empty", "arange", "tensor", "full")
+    MIGRATING = {"_dev", "_f32", "_i32", "_bf16", "i32", "f32", "bf16"}
+
+    def offenders(src: str) -> list[str]:
+        bad = []
+        for fn in [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef)]:
+            nodes = list(ast.walk(fn))
+            calls = [n for n in nodes if isinstance(n, ast.Call)]
+            if not any(getattr(c.func, "attr", None) == "_kernel" for c in calls):
+                continue
+            # `backend._i32(torch.zeros(...))` migrates its argument; two call sites do that
+            wrapped = {id(a) for c in calls for a in c.args
+                       if getattr(c.func, "attr", None) in MIGRATING
+                       or getattr(c.func, "id", None) in MIGRATING}
+            bad += [f"{fn.name}:{n.lineno} torch.{n.func.attr}(...) has no device="
+                    for n in calls
+                    if getattr(getattr(n.func, "value", None), "id", None) == "torch"
+                    and getattr(n.func, "attr", None) in MAKERS
+                    and not any(kw.arg == "device" for kw in n.keywords)
+                    and id(n) not in wrapped]
+        return bad
+
+    # the checker against a known offender first: its silence is the whole result
+    call = "    backend._kernel('k')(q)\n"
+    assert offenders("def t(backend):\n    q = torch.randn(2, 3)\n" + call), "misses a bare maker"
+    assert not offenders("def t(backend):\n    q = backend._i32(torch.zeros(2))\n" + call), (
+        "flags a maker the backend migrates"
+    )
+
+    bad = offenders(pathlib.Path(__file__).read_text())
+    assert not bad, "built on the default device, but reach a kernel built for another:\n  " \
+        + "\n  ".join(bad)
