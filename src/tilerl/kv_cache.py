@@ -476,6 +476,8 @@ class KvTier:
         self.fetch_drops = 0
         self.fetch_ms = 0.0
         self.fetch_bytes = 0
+        self.state_load_ms = 0.0   # the .st read, on the caller at lookup time
+        self.state_loads = 0
         self.snapshot_bytes = 0
         self.tick_loads = 0
         self._rq: queue.Queue = queue.Queue()
@@ -783,7 +785,14 @@ class KvTier:
             if not os.path.exists(self._st(key)):
                 return None
             try:
+                # Timed separately from the kv fetch: this read is NOT prefetched -- it
+                # runs here, on the caller, at lookup time, and the .st is the same order
+                # of magnitude as the .kv (157 MiB against 178 on a 2729-token entry).
+                # B therefore describes the kv half only.
+                ts = time.perf_counter()
                 blob = torch.load(self._st(key), map_location="cpu")
+                self.state_load_ms += (time.perf_counter() - ts) * 1000
+                self.state_loads += 1
             except Exception:  # noqa: BLE001 - truncated / corrupt spill, same as load_kv
                 self.drop(key)
                 return None
@@ -858,6 +867,8 @@ class KvTier:
             # with fetch_ms this gives B for the run: a warm page cache and a cold
             # one differ ~20x here, and that is what moves the faulted arm.
             "ssd_fetch_bytes": self.fetch_bytes,
+            "ssd_state_load_ms": int(self.state_load_ms),
+            "ssd_state_loads": self.state_loads,
         }
 
 
