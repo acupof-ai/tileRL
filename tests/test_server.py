@@ -1811,3 +1811,34 @@ def test_the_routes_cancel_when_the_client_hangs_up():
         "the SSE route needs GeneratorExit: starlette closes the generator when the "
         "client hangs up, and without it an abandoned SSE stream runs to its cap"
     )
+
+
+@pytest.mark.parametrize("state_bytes", [0, 12345678])
+def test_serve_state_bytes_reaches_health(state_bytes, monkeypatch, capsys):
+    """`--state-bytes` must arrive at the store, and `/health` must say so.
+
+    Without it the tiers' pressure regime was unreachable from a command line: the budget
+    came only from `mem_get_info() // 4`, which on an H20 is 17.9 GiB -- 116 snapshots at
+    157 MiB, so no benchable session count evicts anything and every tier arm reads 0
+    demotions. The control arm asserts the default is a DIFFERENT value rather than absent,
+    since `prefix_state_bytes_budget` is published either way.
+    """
+    from tilerl import cli
+
+    served: dict = {}
+    monkeypatch.setattr(
+        "uvicorn.run",
+        lambda app, **kw: served.update(health=TestClient(app).get("/health").json()),
+    )
+    argv = ["serve", "--slots", "2", "--max-batch", "2", "--blocks", "64",
+            "--max-ctx", "512", "--no-warmup"]
+    if state_bytes:
+        argv += ["--state-bytes", str(state_bytes)]
+    cli.cmd_serve(cli._build_parser().parse_args(argv))
+    capsys.readouterr()
+
+    got = served["health"]["stats"].get("prefix_state_bytes_budget")
+    if state_bytes:
+        assert got == state_bytes, f"--state-bytes {state_bytes} did not reach the store: {got}"
+    else:
+        assert got and got != 12345678, f"the default budget is the flag's value: {got}"

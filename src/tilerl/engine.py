@@ -1525,6 +1525,11 @@ def build_engine(
     #: 2729-token prompt copy 941 MB of state to serve a single 157 MB entry. Raising this
     #: drops the short publishes, which are the ones a longer prefix supersedes anyway.
     ssd_min_tokens: int = 0,
+    #: HBM budget for resident GDN snapshots; 0 keeps the quarter-of-free rule below. An
+    #: operator could not set it, so the pressure regime the DRAM and SSD tiers exist for
+    #: was unreachable without editing source: on an H20 a quarter of free is 17.9 GiB,
+    #: 116 snapshots at 157 MiB, which no benchable session count reaches.
+    state_bytes: int = 0,
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
@@ -1601,7 +1606,9 @@ def build_engine(
     # fit the card: the 8 GiB default is most of a 32 GB V100's post-weights headroom.
     # Spend a quarter of what is still free after weights and pools.
     kw = {}
-    if backend.device.type == "cuda":
+    if state_bytes:
+        kw["state_bytes"] = state_bytes
+    elif backend.device.type == "cuda":
         kw["state_bytes"] = int(torch.cuda.mem_get_info()[0] // 4)
     # Host tier for snapshots the card cannot keep resident. Measured on the live V100: 43
     # of 43 evictions happened with 64% of the block pool free, so every one was state

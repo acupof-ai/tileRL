@@ -110,7 +110,7 @@ def _shard(cfg, model, tp: int, backend, model_mod):
 
 def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16,
                   blocks=0, max_ctx=0, max_batch=8, ssd_path="", ssd_min_tokens=0,
-                  dram_bytes=0, decode=None):
+                  dram_bytes=0, state_bytes=0, decode=None):
     """Serving-size engine; ``devices`` replicates it across those CUDA indices.
 
     ``max_ctx`` caps the served context; it still defaults to the model's own limit,
@@ -139,6 +139,8 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
             kw["ssd_min_tokens"] = ssd_min_tokens
     if dram_bytes:
         kw["dram_bytes"] = dram_bytes
+    if state_bytes:
+        kw["state_bytes"] = state_bytes
     # Text stop sequences are matched on decoded ids, so the engine needs the
     # tokenizer's decode; without it `submit` refuses a request that carries one.
     if decode is not None:
@@ -180,6 +182,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            blocks=args.blocks, max_ctx=args.max_ctx,
                            max_batch=args.max_batch, ssd_path=args.ssd_path,
                            ssd_min_tokens=args.ssd_min_tokens, dram_bytes=args.dram_bytes,
+                           state_bytes=args.state_bytes,
                            decode=tokenizer.decode)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
@@ -1029,6 +1032,12 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "constant ~157 MB at any prefix length, so every short "
                               "publish costs as much to spill as a long one; raising this "
                               "drops the publishes a longer prefix supersedes anyway")
+    p_serve.add_argument("--state-bytes", type=int, default=0,
+                         help="HBM budget in bytes for resident GDN snapshots (0 = a quarter "
+                              "of free memory, the default). Without it the tiers' pressure "
+                              "regime is unreachable: a quarter of free on an H20 is 17.9 GiB, "
+                              "116 snapshots at 157 MiB each, so DRAM pressure starts near 115 "
+                              "concurrent agent sessions and no benchable load reaches it")
     p_serve.add_argument("--dram-bytes", type=int, default=0,
                          help="host budget in bytes for demoted GDN snapshots (0 = off, the "
                               "default). Turn it on only when concurrent sessions outnumber "
