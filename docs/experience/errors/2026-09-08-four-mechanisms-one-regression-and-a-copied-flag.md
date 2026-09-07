@@ -81,10 +81,41 @@ a demote branch could do there; the entry has to go. Demotion is a byte-axis too
 where blocks bind. So the fix is not "teach the block path to demote": it is retain fewer blocks, or
 size the pool against the tier's retention.
 
-`reclaimable_blocks` (`:1334`) is the number that would separate "these evictions were unavoidable"
-from "the accounting double-counts shared blocks" — it already deduplicates blocks whose refcount
-equals the store's own hold count, and the admission check at `:682` already consults it. Unread at the
-moment of eviction, so which of the two applies to cell357on's 99.1% is not established here.
+`reclaimable_blocks` (`:1334`) looks like the number that would separate "these evictions were
+unavoidable" from "the accounting double-counts shared blocks", and the admission check at `:682`
+already consults it. **It cannot answer that question.** It counts a block when
+`refcount[b] == n`, where `n` is the store's own hold count *across all its entries* — so a block held
+by two nested entries of the same row counts as reclaimable by construction. It separates
+store-held from outside-held, not store-only from sibling-shared.
+
+What the cells do show is a flat per-eviction yield:
+
+| arm | blocks_freed / evictions | pool peak |
+|---|---:|---:|
+| cell357off | 46578 / 103 = **452** | 45.6% |
+| cell357on | 41749 / 86 = **485** | 99.1% |
+| pub271off | 69842 / 139 = **502** | **8.8%** |
+
+452 / 485 / 502 across three pools and two dominant eviction paths, ±5%. That flatness is the
+robust observation, and it most likely reflects **nesting geometry fixed by the publisher** rather
+than anything about pool pressure.
+
+**And the yield reads against the store-shared explanation.** Under first+last a row has two nested
+entries, 32 and 1926 blocks, so dropping the deep entry while its shallow sibling lives should free
+1926 − 32 = **1894**. The measured yield is **~485**. `_drop` frees by refcount decrement, so a block
+with any other holder contributes zero — meaning ~1409 blocks per eviction were held by something
+that is *not* the sibling and not the store. A live slot is the remaining candidate: the sessions are
+still resident. Which is a capacity story for the block pool at cell357's shape, and one that
+`pub271off` does not contradict, since that arm's 139 evictions are byte-path with the block path
+never firing.
+
+Two regimes, then: cell357 block-path evictions with live rows holding most of the blocks, and
+pub271 byte-path evictions at 8.8% occupancy where capacity is not in play at all. An earlier draft
+of this entry read the same 485 as proving store-only holds dominated — the number was right and the
+denominator was the row's total rather than the evicted entry's outside-held share.
+
+The line that would settle it is neither of the above: at the eviction, count the entry's blocks
+where `refcount[b] > n`. Not logged, so the split stands unmeasured.
 
 **So the pool size is the threshold, not the cause, and `cell357on` is net negative against
 `cell357off`**: worse block occupancy, zero promotions, real demotion cost — caused by the tier working
