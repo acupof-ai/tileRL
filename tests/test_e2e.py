@@ -3354,6 +3354,12 @@ def test_a_row_waits_for_its_own_fetch_and_does_not_block_the_queue(tmp_path):
 
     The hold must therefore exist, and must NOT be a `break`: head-of-line would stall
     every other row for a read only the held one benefits from.
+
+    `drain` waits on the clock, not on a tick count. A tick budget bounds how long the
+    engine spins, not how long the reader thread takes, so on a slow or loaded box the
+    queue empties while the fetch is still in flight and this reads as 0 hits. Reproduce
+    with a 50 ms sleep at the top of `KvTier._fetch_loop`: tick-bounded fails 3/3,
+    clock-bounded passes 3/3.
     """
     cfg = tiny()
     params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=3)
@@ -3368,8 +3374,9 @@ def test_a_row_waits_for_its_own_fetch_and_does_not_block_the_queue(tmp_path):
             ssd_min_tokens=BLOCK_TOKENS,
         )
 
-    def drain(eng, ticks=300):
-        for _ in range(ticks):
+    def drain(eng, secs=10.0):
+        end = time.time() + secs
+        while time.time() < end:
             eng.step()
             if not (list(eng._running) + list(eng._waiting)):
                 break
