@@ -80,21 +80,32 @@ def arm_range(pool, dtypes: dict) -> dict:
     return out
 
 
-def _gen(cfg, model, backend, prompt, n_new, kv_fp8):
+def _gen(cfg, model, backend, prompts, n_new, kv_fp8):
+    """Run `prompts` (one list, or a list of lists) to n_new tokens each.
+
+    Returns (tokens, engine): the token LIST for a single prompt, the total COUNT for a
+    batch -- the decode arm wants throughput, the accuracy arm wants the ids.
+    """
     from tilerl.engine import SamplingParams, build_engine
 
-    eng = build_engine(cfg, model, backend, num_slots=2, max_batch=2,
-                       max_total_tokens=len(prompt) + n_new + 64, kv_fp8=kv_fp8)
-    rid = eng.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=n_new, seed=0))
+    batch = prompts if isinstance(prompts[0], list) else [prompts]
+    longest = max(len(p) for p in batch)
+    eng = build_engine(cfg, model, backend, num_slots=max(2, len(batch)),
+                       max_batch=max(2, len(batch)),
+                       max_total_tokens=longest + n_new + 64, kv_fp8=kv_fp8)
+    rids = [eng.submit(p, SamplingParams(temperature=0.0, max_new_tokens=n_new, seed=0))
+            for p in batch]
     # poll() returns {request_id: token_ids} and DRAINS, so accumulate rather than re-read
     done: dict = {}
     t0 = time.perf_counter()
     for _ in range(4 * n_new + 512):
         done.update(eng.poll())
-        if len(done.get(rid, ())) >= n_new or time.perf_counter() - t0 > 1800:
+        if all(len(done.get(r, ())) >= n_new for r in rids) or time.perf_counter() - t0 > 1800:
             break
         eng.step()
-    return list(done.get(rid, ())), eng
+    if isinstance(prompts[0], list):
+        return sum(len(done.get(r, ())) for r in rids), eng
+    return list(done.get(rids[0], ())), eng
 
 
 def arm_accuracy(cfg, model, backend, prompt, n_new: int) -> tuple[dict, object]:
@@ -118,6 +129,44 @@ def arm_accuracy(cfg, model, backend, prompt, n_new: int) -> tuple[dict, object]
     }, ref_eng
 
 
+def arm_decode(cfg, model, backend, ctx: int, n_new: int, batch: int = 1) -> dict:
+    """Decode tok/s at one (context, batch), fp8 pool against bf16, same engine and prompts.
+
+    Reports the KV share of a tick's bytes and the resulting CEILING before the measured
+    ratio. A decode tick re-reads the 27B's weights every token regardless, so fp8 KV can
+    only act on the KV part -- and at B=1 that part is small: 3.8% of the tick at 8k, 13.7%
+    at 32k, so the ceilings are 1.019x and 1.072x, under run-to-run variance. KV scales with
+    batch while the weights do not, which is where the win is: 56% of the tick and a 1.38x
+    ceiling at B=8 ctx=32k, 84% and 1.70x at B=32. A ratio quoted without its ceiling reads
+    as though fp8 moved the whole tick.
+    """
+    prompts = [torch.randint(3, cfg.vocab_size - 1, (ctx,)).tolist() for _ in range(batch)]
+    out: dict = {"ctx": ctx, "batch": batch, "new_tokens": n_new}
+    for nick, dt in (("bf16", None), ("fp8", torch.float8_e4m3fn)):
+        toks, eng = _gen(cfg, model, backend, prompts, n_new, dt)
+        # time a SECOND generation on a fresh engine of the same kind: the first paid any
+        # first-call compile, which is not what a decode rate is
+        t0 = time.perf_counter()
+        toks2, _ = _gen(cfg, model, backend, prompts, n_new, dt)
+        dt_s = time.perf_counter() - t0
+        out[nick] = {
+            "tokens": toks2, "seconds": dt_s,
+            "tok_per_s": toks2 / dt_s if dt_s > 0 else 0.0,
+            "kv_bytes_per_token": eng._kv.bytes_per_token,
+            "kv_bytes_at_ctx": eng._kv.bytes_per_token * ctx * batch,
+        }
+    weight_bytes = sum(t.numel() * t.element_size() for t in model.params.values())
+    kb, kf = out["bf16"]["kv_bytes_at_ctx"], out["fp8"]["kv_bytes_at_ctx"]
+    out["weight_bytes"] = weight_bytes
+    out["kv_share_of_tick_bytes_bf16"] = kb / (weight_bytes + kb)
+    out["kv_share_of_tick_bytes_fp8"] = kf / (weight_bytes + kf)
+    # the most a pure-bandwidth tick could gain: what the measured ratio must sit under
+    out["tok_per_s_ceiling"] = (weight_bytes + kb) / (weight_bytes + kf)
+    out["tok_per_s_ratio"] = (
+        out["fp8"]["tok_per_s"] / out["bf16"]["tok_per_s"] if out["bf16"]["tok_per_s"] else 0.0)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--source", default="/work/Qwen3.8-27B-NVFP4")
@@ -125,6 +174,12 @@ def main() -> int:
                     help="tiny is for smoke-testing this script's plumbing off the card")
     ap.add_argument("--prompt-tokens", type=int, default=2048)
     ap.add_argument("--new-tokens", type=int, default=24)
+    ap.add_argument("--decode-ctx", type=int, nargs="*", default=[8192, 32768],
+                    help="context lengths for the decode arm; [] skips it")
+    ap.add_argument("--decode-batch", type=int, nargs="*", default=[1, 8],
+                    help="batch sizes. KV scales with batch and the weights do not, so B=1 "
+                         "has a 1.019x/1.072x ceiling at 8k/32k while B=8 at 32k has 1.38x "
+                         "-- B=1 alone cannot show this flag working")
     a = ap.parse_args()
 
     from tilerl_kernels.backend import get_backend
@@ -158,6 +213,17 @@ def main() -> int:
         results["range"] = arm_range(
             bf16_eng._kv, {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2})
         print(f"\nrange: {json.dumps(results['range'], sort_keys=True)}", flush=True)
+        for ctx in a.decode_ctx:
+            for batch in a.decode_batch:
+                key = f"decode_{ctx}_b{batch}"
+                results[key] = arm_decode(cfg, model, be, ctx, a.new_tokens, batch)
+                d = results[key]
+                print(f"\n{key}: KV is {d['kv_share_of_tick_bytes_bf16']:.1%} of a tick's "
+                      f"bytes bf16 / {d['kv_share_of_tick_bytes_fp8']:.1%} fp8, so the "
+                      f"CEILING is {d['tok_per_s_ceiling']:.3f}x. Measured "
+                      f"{d['bf16']['tok_per_s']:.2f} -> {d['fp8']['tok_per_s']:.2f} tok/s "
+                      f"= {d['tok_per_s_ratio']:.3f}x", flush=True)
+                print(json.dumps(d, sort_keys=True), flush=True)
     except Exception as exc:  # noqa: BLE001 -- the failure text is the answer
         results.setdefault("accuracy", {})
         results["failed"] = f"{type(exc).__name__}: {exc}"
