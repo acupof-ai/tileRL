@@ -90,8 +90,12 @@ def _gen(cfg, model, backend, prompts, n_new, kv_fp8):
 
     batch = prompts if isinstance(prompts[0], list) else [prompts]
     longest = max(len(p) for p in batch)
+    # num_blocks=0 is what asks `_fit_blocks` to MEASURE free memory. build_engine's default
+    # is 64 blocks = 1024 tokens, so leaving it out silently caps every arm at a pool no
+    # 2048-token prompt can enter -- and caps both dtypes identically, which is what made the
+    # boundary arm unable to separate them.
     eng = build_engine(cfg, model, backend, num_slots=max(2, len(batch)),
-                       max_batch=max(2, len(batch)),
+                       max_batch=max(2, len(batch)), num_blocks=0,
                        max_total_tokens=longest + n_new + 64, kv_fp8=kv_fp8)
     rids = [eng.submit(p, SamplingParams(temperature=0.0, max_new_tokens=n_new, seed=0))
             for p in batch]
@@ -168,38 +172,67 @@ def arm_decode(cfg, model, backend, ctx: int, n_new: int, batch: int = 1) -> dic
 
 
 def arm_boundary(cfg, model, backend, ctx: int, batch: int, n_new: int) -> dict:
-    """The configuration bf16 cannot serve and fp8 can: the capacity claim, demonstrated.
+    """How many of a batch are RESIDENT at once, bf16 pool against fp8. The capacity claim.
 
-    Not a ratio. On a 96 GiB H20 with the engine's 2/3 rule (~64 GiB usable) the 27B's
-    ~12.6 GiB of weights leave room for bf16 KV up to about B=8 x 64k or B=16 x 32k; at
-    B=32 x 32k bf16 needs 76.6 GiB and fp8 45.1. So one arm raises and the other generates,
-    which no reviewer has to take on trust.
+    Not "bf16 raises and fp8 does not". It was written that way and that was wrong: `_admit`
+    returns False when the pool is short, it does not raise, so an over-large batch is
+    admitted as far as it fits and the rest WAITS. bf16 at B=32 x 32k does not OOM -- it
+    serializes. `submit`'s own refusal cannot fire either, since one 32k request needs 2050
+    blocks against a fitted pool's tens of thousands.
+
+    So the number is concurrency: peak `running` over the generation. 1.969x the tokens per
+    byte means fp8 should hold about 1.97x as many of the same requests resident, and the
+    queue drains in correspondingly fewer passes. That is measurable, and it is the thing
+    capacity actually buys.
     """
+    from tilerl.engine import SamplingParams, build_engine
     prompts = [torch.randint(3, cfg.vocab_size - 1, (ctx,)).tolist() for _ in range(batch)]
     out: dict = {"ctx": ctx, "batch": batch}
     for nick, dt in (("bf16", None), ("fp8", torch.float8_e4m3fn)):
         try:
-            n, eng = _gen(cfg, model, backend, prompts, n_new, dt)
-            out[nick] = {"tokens": n, "kv_bytes_per_token": eng._kv.bytes_per_token,
-                         "num_blocks": eng._kv.num_blocks}
-        except Exception as exc:  # noqa: BLE001 -- the raise IS the result for the bf16 arm
+            eng = build_engine(cfg, model, backend, num_slots=batch, max_batch=batch,
+                               num_blocks=0, max_total_tokens=ctx + n_new + 64, kv_fp8=dt)
+            rids = [eng.submit(p, SamplingParams(temperature=0.0, max_new_tokens=n_new, seed=0))
+                    for p in prompts]
+            done: dict = {}
+            peak, t0 = 0, time.perf_counter()
+            for _ in range(64 * n_new + 4096):
+                done.update(eng.poll())
+                peak = max(peak, eng.stats()["running"])
+                if len(done) >= len(rids) or time.perf_counter() - t0 > 1800:
+                    break
+                eng.step()
+            out[nick] = {
+                "blocks_total": eng.usable_blocks, "peak_running": peak,
+                "finished": len(done), "seconds": time.perf_counter() - t0,
+                "kv_bytes_per_token": eng._kv.bytes_per_token,
+            }
+        except Exception as exc:  # noqa: BLE001 -- a raise here is a result, not a crash
             out[nick] = {"raised": f"{type(exc).__name__}: {str(exc)[:200]}"}
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    out["fp8_serves_what_bf16_cannot"] = (
-        "raised" in out["bf16"] and "tokens" in out["fp8"] and out["fp8"]["tokens"] > 0)
-    # The arm is only meaningful if the two engines were sized DIFFERENTLY. Both arms raising
-    # is not a negative result: off CUDA `_fit_blocks` returns a fixed floor, so both pools get
-    # the same num_blocks and both exhaust it for a reason unrelated to the dtype. num_blocks
-    # is absent from an arm that raised, so "both raised" and "sized alike" are the same case.
-    nb = [out[k].get("num_blocks") for k in ("bf16", "fp8")]
-    out["blocks_differ"] = None not in nb and nb[0] != nb[1]
-    if not out["fp8_serves_what_bf16_cannot"] and not out["blocks_differ"]:
-        both_raised = "raised" in out["bf16"] and "raised" in out["fp8"]
-        out["inconclusive"] = (
-            "both pools raised, so the limit was not the dtype" if both_raised else
-            f"both pools were sized alike (num_blocks {nb})"
-        ) + " -- this arm needs a CUDA cell where _fit_blocks measures free memory"
+    both = [out[k] for k in ("bf16", "fp8")]
+    if all("peak_running" in d for d in both):
+        out["resident_ratio"] = both[1]["peak_running"] / max(1, both[0]["peak_running"])
+        # The unclipped capacity number. `resident_ratio` is bounded by the batch: if fp8
+        # holds all of it, the ratio reads however far bf16 fell short rather than how much
+        # more fp8 could have held. blocks_ratio has no such ceiling and is the headline.
+        out["blocks_ratio"] = both[1]["blocks_total"] / max(1, both[0]["blocks_total"])
+        # The arm separates the dtypes only if the pools were sized differently. Off CUDA
+        # `_fit_blocks` returns a fixed floor for both, so equal block counts mean the fit
+        # never ran -- report that rather than a ratio of 1.0 that looks like a null result.
+        if both[0]["blocks_total"] == both[1]["blocks_total"]:
+            out["inconclusive"] = (
+                f"both pools got {both[0]['blocks_total']} blocks, so _fit_blocks did not "
+                "measure free memory (it returns a floor off CUDA) -- this arm needs a card")
+        elif both[0]["peak_running"] >= batch:
+            out["inconclusive"] = (
+                f"bf16 already held all {batch} requests resident, so the batch cannot show a "
+                "concurrency difference -- raise --boundary-batch or --boundary-ctx")
+        elif both[1]["peak_running"] >= batch:
+            out["resident_ratio_is_clipped"] = (
+                f"fp8 held the whole batch ({batch}), so resident_ratio understates it -- "
+                f"blocks_ratio {out['blocks_ratio']:.3f}x is the capacity number")
     return out
 
 
@@ -269,9 +302,12 @@ def main() -> int:
             results[key] = arm_boundary(cfg, model, be, a.boundary_ctx, a.boundary_batch,
                                         a.new_tokens)
             d = results[key]
-            print(f"\n{key}: bf16 {d['bf16'].get('raised', str(d['bf16'].get('tokens')) + ' tokens')}"
-                  f" | fp8 {d['fp8'].get('raised', str(d['fp8'].get('tokens')) + ' tokens')}"
-                  f" -> fp8 serves what bf16 cannot: {d['fp8_serves_what_bf16_cannot']}",
+            print(f"\n{key}: blocks {d['bf16'].get('blocks_total')} -> "
+                  f"{d['fp8'].get('blocks_total')}, peak resident "
+                  f"{d['bf16'].get('peak_running')} -> {d['fp8'].get('peak_running')} of "
+                  f"{a.boundary_batch}"
+                  + (f" = {d['resident_ratio']:.3f}x" if "resident_ratio" in d else "")
+                  + (f"\n  INCONCLUSIVE: {d['inconclusive']}" if "inconclusive" in d else ""),
                   flush=True)
             print(json.dumps(d, sort_keys=True), flush=True)
     except Exception as exc:  # noqa: BLE001 -- the failure text is the answer
