@@ -69,6 +69,11 @@ _PHASE_DONE = 3
 
 _HASH_MASK = 0x7FFFFFFF
 
+#: Store stats deliberately not on the wire; the seam gate forbids any OTHER unforwarded key.
+#: hits/misses: lookups incl. admission retries, where /health's prefix_hits counts admissions;
+#: 4 in-tree readers, one the kv-reuse bench cell whose recorded values are that definition.
+_STORE_STATS_INTERNAL = ("hits", "misses")
+
 
 def _quantize_draft(params: dict[str, torch.Tensor], skip: tuple[str, ...] = (),
                     fp4: bool = False) -> dict[str, torch.Tensor]:
@@ -783,6 +788,11 @@ class Engine:
                 # only recover entries that were actually evicted, and at 144 MiB a 27B
                 # snapshot the sm70 budget (free/4 = 1417 MiB) holds 9 of them.
                 "prefix_evictions": store["evictions"],
+                # Indexed, not .get(k, 0): a default turns a store that stopped publishing the
+                # key into a healthy-looking 0. Both stores publish these three.
+                "prefix_blocks_freed": store["blocks_freed"],
+                "prefix_entries": store["entries"],
+                "prefix_capacity": store["capacity"],
                 "prefix_state_bytes": store["state_bytes"],
                 "prefix_state_bytes_budget": store.get("state_bytes_budget", 0),
                 # Present only with a host tier; a demotion is a prefix the card could not

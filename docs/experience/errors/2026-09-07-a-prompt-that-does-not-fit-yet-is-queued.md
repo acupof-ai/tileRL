@@ -1,6 +1,45 @@
 # A prompt that does not fit yet is queued, not refused — V100 sm70, 2026-09-07
 
-> Status: fixed
+> Status: fixed — **verified live on the V100 (`3401476`, child 2917009) at the production
+> config, `--max-batch 1`, cold store.** A at 30,000 chars took 1,877 of 2,048 blocks leaving
+> 171 free; B was sized from that live reading to 211 blocks (3,312 tokens), so it could not
+> fit then and fits the pool. Both returned **200** — A in 532.81 s, B in 551.44 s — and
+> `waiting` peaked at **1**, which is the proof B queued rather than being refused: a 200 alone
+> could mean B simply arrived after A finished. **B waited 518.6 s in `_waiting`** (queued at
+> t+14.4 s, admitted at t+533.0 s, within one 2 s sample of A releasing). Before this change
+> the same arm returned `insufficient KV blocks for request`.
+>
+> **The cause-2 signature appeared, and its mechanism is NOT `_admit`.** During B's wait
+> `prefix_evictions` went 0 → 47 while `pool_used_blocks` held at 1,877 and never fell —
+> 47 evictions, zero blocks freed. But those are `insert`'s state-byte trim
+> (`kv_cache.py:910`), not `evict_until_free`: A republishes its prefix every chunk, and
+> `prefix_state_bytes` sat at 1,725,825,024 of a 1,845,067,776 budget — **93.5% full** — with
+> `prefix_published` tracking `prefill_forwards` 1:1. So the trim ran continuously and dropped
+> roughly one entry per chunk, freeing nothing because A retained the blocks. `_admit`'s own
+> eviction never ran: `reclaimable_blocks` stayed short of the 40-block gap on every tick, so
+> the guard left the store alone for the whole 518 s — which is the guard working. **The two
+> readings invert the conclusion and look identical on the counter**; they were told apart by
+> the publish-per-chunk 1:1 ratio and the 93.5% state fill, not by the eviction count.
+>
+> **First measured queued wait.** `messages.py:72` says of the 1800 s cap: "this is the ceiling
+> for a request the scheduler may hold behind a full batch, not the cost of one; nothing has
+> measured that." 518.6 s, 3.5x inside the cap. Two such clients queued would be ~1,037 s,
+> still inside; three would not be.
+
+## One flag moves three quantities, which cost an arm
+
+The second arm was to be `--max-batch 2`, the only configuration that reaches the
+`reclaimable_blocks` guard with two slots free. It could not: **`--max-batch` also resizes the
+KV pool.** `cli.py:133` derives `max_blocks = (ctx * max_batch) // BLOCK_TOKENS` and
+`_fit_blocks` returns `min(fit, cap)`, so at `--max-batch 1` the **cap** binds at exactly 2,048
+(which is what `serve_v100.sh`'s comment means by "32768 keeps CAP the binding one"), and at 2
+the cap rises to 4,096 and the pool becomes fit-bound instead. Measured on that child:
+`blocks_total` **2,048 → 3,494** (+70%) and `prefix_state_bytes_budget` **1,845 MB → 1,087 MB**
+(−41%). B then fit immediately, `waiting` never left 0, and the guard was not reached — so the
+arm shows concurrent admission and nothing else, and its eviction counts are not comparable to
+arm 1's 47 either, since a 41% smaller budget trims earlier per chunk. Same class as one knob
+crossing two thresholds: **before reading a one-flag arm as one variable, ask what else the flag
+derives.** The one-variable arm pins the pool: `--max-batch 2 --blocks 2048`.
 
 ## Context — the cause measurement, which came before any code
 
@@ -71,9 +110,21 @@ tokens share their first 8 blocks, so those sit at refcount 2 with nothing live 
 as an admission test would refuse requests the pool can serve. The test is refcount minus the
 number of store entries holding that block.
 
-`blocks_freed` joins the stats, measured in `_drop` from the free list before and after, so a
-reader can see that eviction is dropping entries without reclaiming anything. `evictions` is
+`blocks_freed` joins the store's stats, measured in `_drop` from the free list before and after,
+so a reader can see that eviction is dropping entries without reclaiming anything. `evictions` is
 left alone: redefining it touches 23 call sites and collides with `ssd_evictions`.
+
+**And that counter reaches no wire, which I claimed it did.** Verified against the live server
+after this was first written: `'blocks_freed' in /health["stats"]` is **False**.
+`Engine._build_stats` does not forward the store's dict — it names four keys (`evictions`,
+`state_bytes`, `state_bytes_budget`, `demoted`) plus one prefix splat,
+`**{k: v for k, v in store.items() if k.startswith(("dram_", "ssd_"))}`. A key matching neither
+rule is dropped silently, so a `dram_*` counter would have arrived automatically and this one did
+not. The counter and its test are correct; only the observability claim was wrong, and I made it
+by reading the module that publishes the field instead of the outermost consumer. One `curl` would
+have caught it. Exposing it is a follow-up PR, not smuggled in here; until then the same
+measurement reads as `prefix_evictions` rising while `pool_used_blocks` does not fall, since
+`pool_used_blocks` is the allocator's own count and independent of the store.
 
 **A fourth defect, found in my own change and the one that would have been worst.**
 `alloc_slot` raising inside `_admit` propagates to `step()`, whose handler **fails every

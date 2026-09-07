@@ -401,9 +401,14 @@ def test_a_second_client_waits_for_capacity_instead_of_503ing():
 
     The fixture matches the RATIO, not the absolute size: 60 of 64 blocks is 93.8% against the
     live 93.1%. A 3/64 fixture cannot express the mechanism at any pool size.
-    """
-    import time
 
+    DRIVEN DIRECTLY, no loop thread. With `engine.run()` this arm raced and went red on
+    macos-14 while ubuntu passed, taking an unrelated PR's CI with it: A can finish and release
+    before the test reads `_waiting`, both are then admitted sequentially, and the vacuity guard
+    fires correctly on a timing the test does not control. `step()` per tick makes contention a
+    property of the pool rather than of the scheduler's speed, and lets the precondition be
+    asserted BEFORE the arm instead of hoped for.
+    """
     from tilerl.config import tiny
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.model import build_random
@@ -427,22 +432,23 @@ def test_a_second_client_waits_for_capacity_instead_of_503ing():
     engine._admit = _watched
     a = engine.submit(big, SamplingParams(max_new_tokens=24, seed=0))
     b = engine.submit(other, SamplingParams(max_new_tokens=4, seed=0))
-    engine.run()
+
+    # One tick admits A and must REFUSE B: the precondition, checked before the arm runs.
+    engine.step()
+    assert engine.stats()["prefill_forwards"] > 0, "no forward ran; the arm proves nothing"
+    assert [r.req_id for r in engine._running] == [a], (
+        f"expected only A admitted, got {[r.req_id for r in engine._running]} "
+        f"(free_blocks {engine._kv.free_blocks} of 64)")
+    assert [r.req_id for r in engine._waiting] == [b], (
+        f"B was not left waiting; the pool is not contended and the arm is vacuous "
+        f"(free_blocks {engine._kv.free_blocks} of 64)")
+
     try:
-        for _ in range(300):
-            if len(engine._running) >= 1 and engine.stats()["prefill_forwards"] > 0:
+        # A's prefill chunks, then its decode, with B refused on every planner tick.
+        for _ in range(400):
+            if not engine._waiting:
                 break
-            time.sleep(0.02)
-        # Ruling 5: a do-nothing engine must not be able to pass this.
-        assert engine.stats()["prefill_forwards"] > 0, "no forward ran; the arm proves nothing"
-        assert len(engine._waiting) == 1, (
-            f"both requests were admitted; the pool is not contended and the arm is vacuous "
-            f"(free_blocks {engine._kv.free_blocks} of 64)")
-        ticks = engine.stats()["prefill_forwards"]
-        for _ in range(200):
-            if engine.stats()["prefill_forwards"] > ticks + 2:
-                break
-            time.sleep(0.02)
+            engine.step()
         # The store must be left ALONE by the BLOCKED ADMISSIONS: its blocks are pinned by the
         # live request, so evicting them frees nothing and would flush every other client's
         # prefix cache once per planner tick.
@@ -463,11 +469,11 @@ def test_a_second_client_waits_for_capacity_instead_of_503ing():
             f"a blocked admission evicted the store: drops per attempt {admit_drops}")
 
         out = {}
-        for _ in range(3000):
+        for _ in range(600):
             out.update(engine.poll())
             if a in out and b in out:
                 break
-            time.sleep(0.02)
+            engine.step()
     finally:
         engine.shutdown()
 
@@ -566,3 +572,94 @@ def test_a_failed_admission_returns_every_refcount_it_took():
     # And every block it allocated before the failure went back, not just the retained ones.
     assert engine._kv.free_blocks == 64 - sum(1 for n in before.values() if n > 0), (
         f"blocks leaked by the unwind: {engine._kv.free_blocks} free")
+
+
+def test_every_key_the_store_publishes_reaches_health_or_is_named_as_dropped():
+    """`_build_stats` forwards a hand-picked subset, so a new store counter vanishes silently.
+
+    This is asserted by ROUTE, not by name. A name test passes for the wrong reason on
+    `hits`/`misses`: `/health` carries `prefix_hits`, but it comes from the engine's own
+    `_prefix_hits` (`engine.py:652`, counted per admission), not from the store's counter of
+    the same name -- so "the key exists" is true while the store's value goes nowhere.
+    """
+    from tilerl.config import tiny
+    from tilerl.engine import _STORE_STATS_INTERNAL, build_engine
+    from tilerl.kv_cache import PrefixStore
+    from tilerl.model import build_random
+    from tilerl.testing import RefBackend
+
+    cfg = tiny(max_position_embeddings=512)
+    engine = build_engine(cfg, build_random(cfg, seed=3), RefBackend(), num_blocks=16,
+                          num_slots=2, max_batch=1, max_total_tokens=512)
+    assert isinstance(engine._prefix, PrefixStore), "needs a real store, not the null one"
+
+    # Non-trivial first: equal zeros cannot tell a forwarded value from a hardcoded one.
+    toks = list(range(1, 33))
+    blks = [engine._kv.alloc_block() for _ in range(PagedKvPool.blocks_for_tokens(len(toks)))]
+    assert engine._prefix.insert(toks, blks, None), "fixture: insert refused"
+    for b in blks:
+        engine._kv.free_block(b)
+    engine._prefix.lookup(toks)                 # moves the store's own hits
+    engine._prefix.clear()                      # moves evictions and blocks_freed
+    st = engine._prefix.stats()
+    assert st["evictions"] and st["blocks_freed"] and st["hits"], (
+        f"fixture left the counters at zero, so the value check cannot discriminate: {st}")
+
+    published = set(engine._prefix.stats())
+    health = engine.stats()
+    # By value, not by name: `prefix_hits` exists but carries the ENGINE's counter, so a name
+    # check is true for a store key nothing forwards -- and cannot see a hardcoded zero either.
+    store_vals = engine._prefix.stats()
+    unrouted = []
+    for k in sorted(published):
+        if k in _STORE_STATS_INTERNAL or k.startswith(("dram_", "ssd_")):
+            continue
+        wire = f"prefix_{k}"
+        if wire not in health or health[wire] != store_vals[k]:
+            unrouted.append(f"{k}={store_vals[k]} vs {wire}={health.get(wire, '<absent>')}")
+    assert not unrouted, (
+        f"the store publishes {unrouted} and /health does not carry the value; add a "
+        "prefix_<k> entry in _build_stats or name the key in _STORE_STATS_INTERNAL")
+
+    # The drop list may not name a key the store does not publish: a stale entry there would
+    # silence a future key that happens to reuse the name.
+    stale = sorted(set(_STORE_STATS_INTERNAL) - published)
+    assert not stale, f"_STORE_STATS_INTERNAL names keys the store does not publish: {stale}"
+
+
+def test_blocks_freed_moves_on_the_wire_when_the_store_frees_a_block():
+    """The mutation arm: a name check cannot tell a forwarded key from a hardcoded zero.
+
+    Drives a real eviction through `_drop` and asserts `/health`'s value moves with the
+    store's. Without the forwarding line this fails on the KeyError, which is the state the
+    #221 merge shipped.
+    """
+    from tilerl.config import tiny
+    from tilerl.engine import build_engine
+    from tilerl.model import build_random
+    from tilerl.testing import RefBackend
+
+    cfg = tiny(max_position_embeddings=512)
+    engine = build_engine(cfg, build_random(cfg, seed=5), RefBackend(), num_blocks=16,
+                          num_slots=2, max_batch=1, max_total_tokens=512)
+    store = engine._prefix
+    tokens = list(range(1, 65))
+    blocks = [engine._kv.alloc_block()
+              for _ in range(PagedKvPool.blocks_for_tokens(len(tokens)))]
+    assert store.insert(tokens, blocks, None), "fixture: insert refused"
+    for b in blocks:                       # hand the store sole ownership
+        engine._kv.free_block(b)
+
+    # Membership first: a missing key must be REPORTED, not raise a KeyError that reads as a
+    # broken test.
+    health = engine.stats()
+    assert "prefix_blocks_freed" in health, (
+        "prefix_blocks_freed is not on the wire; _build_stats is not forwarding it")
+    before = health["prefix_blocks_freed"]
+    assert before == store.stats()["blocks_freed"], "the wire disagrees with the store"
+    store.clear()                          # goes through _drop, which measures the free list
+    after_store = store.stats()["blocks_freed"]
+    assert after_store > before, f"fixture freed nothing: {before} -> {after_store}"
+    assert engine.stats().get("prefix_blocks_freed") == after_store, (
+        f"/health says {engine.stats().get('prefix_blocks_freed')}, store says {after_store}: "
+        "the counter is not reaching the wire")
