@@ -110,7 +110,21 @@ that the text does not acknowledge. Whether the 3.57x itself reproduces is separ
 Pending section below and
 [errors/2026-09-08-four-mechanisms-one-regression-and-a-copied-flag.md](../errors/2026-09-08-four-mechanisms-one-regression-and-a-copied-flag.md).
 
-## Pending: the publisher this was measured against has changed
+## Resolved: the cell reproduces on the pre-fix commit; the number was sound, the precondition was missing
+
+Resolved 2026-09-08, replacing the Pending flag below. Running **this cell's exact parameters** on
+`169d7bd` — the sha this entry names — gives **198.32 s** against the 199.35 s written here, **0.52%**
+apart, from a job log with the tree sha stamped and read back. So nothing in the 3.57x needs
+retracting: the measurement was right.
+
+What was missing is the precondition in the Scope section above. The later commit `a43a379` takes the
+same cell to 403.01 s (2.03x), and that is a publisher regression, not a re-reading of this entry — see
+[errors/2026-09-08-four-mechanisms-one-regression-and-a-copied-flag.md](../errors/2026-09-08-four-mechanisms-one-regression-and-a-copied-flag.md).
+The correction to make here is therefore one sentence and not a withdrawal: **the tier benefit is real
+and conditional on the tier's own block retention staying under the pool ceiling**, which this cell
+satisfies by accident of `--blocks 8192`.
+
+## Superseded flag: the publisher this was measured against has changed
 
 The 3.57x was measured against a publisher emitting **62 entries per 31k-token miss**, and this
 entry's own mechanism paragraph says the tier does not stop that flood — it gives the flood
@@ -119,6 +133,11 @@ somewhere to go. That publisher is fixed as of
 2 publishes per row at any prompt length. **So 3.57x is provisional** until the same cell runs on
 the fixed publisher, and this section is the flag rather than a revision — a token-count probe on
 CPU cannot rewrite a wall-clock verdict, and the card cell is scoped and pending.
+
+Resolved by the section above: the cell was run on `169d7bd` and reproduces to 0.52%. On the **fixed**
+publisher the same cell takes 403.01 s, which is the publisher's regression rather than this entry's
+error — so the 3.57x stands for the publisher it names, and a tier verdict on the fixed publisher needs
+the bounded ladder first.
 
 One structural fact from that probe does land here, because it is not a speed claim: **the tier is
 inert below a 4-snapshot budget.** At `--dram-bytes` worth 3 snapshots it demoted nothing and

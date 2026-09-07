@@ -2,7 +2,13 @@
 
 **Date:** 2026-09-08
 **Machine:** H20 pod card 0 (cells), local CPU target (diagnosis)
-**Status:** open — the cross-commit difference at a fixed pool is unexplained. The confound is found.
+**Status:** open — the mechanism is settled (hit depth, see the Resolved section) and the forward fix, a
+bounded publish ladder, has not landed. Listed in [OPEN.md](../OPEN.md), with the latent
+`_demote_one` count guard as a second line.
+
+> The sections below are in the order they were written, so the four refuted mechanisms and the
+> superseded "what remains open" stand as the record. **The settled reading is
+> [Resolved: 2.03x at one variable](#resolved-203x-at-one-variable-and-the-mechanism-is-hit-depth).**
 
 ## Context
 
@@ -275,14 +281,19 @@ that cannot see any of this. It should be re-tested in TTFT.
 
 ## What remains open
 
-199.35 s (pre-fix) against 403.01 s (post-fix) **at the same 8192-block pool** is still a real
-cross-commit difference. The pool finding explains cell357 versus the other cell, not pre- versus
-post-fix at 8192. What is gone is any ability to attribute it to a publisher mechanism, since both
-arms sit at 99.1% occupancy where block reclaim dominates. The decisive next arm is cell357's workload
-with `--blocks` unset; only if 403 s survives that does the publisher return to scope.
+Superseded, and kept because the reasoning is the fifth refutation. This section read: "no publisher
+fix is justified — last-only, K-spaced and the chunk-size knob were each proposed to fix evictions the
+pool size explains", and the decisive next arm was named as cell357's workload with `--blocks` unset.
+Both were wrong.
 
-Consequently **no publisher fix is justified**: last-only, K-spaced and the chunk-size knob were each
-proposed to fix evictions the pool size explains.
+The `--blocks`-unset arm ran (2560 blocks, not the 48099 intended, because `--max-ctx 40960 --slots 16`
+still bound it): **424.20 s at 78.1% peak against cell357off's 403.01 s at 45.6%**, evictions 104 vs 103.
+Tripling the pool changes nothing, so the pool is a threshold and not the cause. And the single-variable
+commit arm above then put the publisher squarely back in scope. What survives is the narrower claim the
+`pub271off` arm supports on its own: 139 evictions at **8.8%** occupancy cannot be capacity.
+
+Still open: the bounded ladder itself, and the settling measurement for the per-eviction yield — per
+eviction, the count of the entry's blocks where `refcount[b] > n`, logged with the entry's token length.
 
 ## Rule
 
