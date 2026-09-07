@@ -1225,7 +1225,15 @@ class Backend:
         window = kw.get("conv_window")
         qn, kn, vn, gt, bt, new_window = self._gdn_prep(q, k, v, g, beta, state, **kw)
         if "gdn_state_scan" in _resolve(self.precision, self.arch):
-            core, new_state, _ = self._gdn_wy_core(qn, kn, vn, gt, bt, state)
+            core, new_state, saved = self._gdn_wy_core(qn, kn, vn, gt, bt, state)
+            # ponytail: probe-only backward cache for assertion 1 (h/a/w reach no consumer
+            # yet); one writer, one reader, dropped when the ported backward takes them as
+            # arguments. CP calls this per chunk in a loop, so it refuses rather than keep
+            # the last chunk's.
+            if getattr(self, "cp_world", 1) > 1:
+                raise NotImplementedError("_gdn_bwd_cache is single-chunk; CP would keep only "
+                                          "the last chunk's h/a/w")
+            self._gdn_bwd_cache = saved
         else:  # no WY schedule in this cell: the chunkwise reference is the core
             core, new_state = reference.gdn_chunk_core(
                 qn, kn, vn, gt, bt, self._f32(state), chunk=_WY_CHUNK
