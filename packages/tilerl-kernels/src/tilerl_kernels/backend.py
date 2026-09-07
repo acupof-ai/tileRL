@@ -1123,13 +1123,16 @@ class Backend:
             if oscale is not None:  # scales weight row n: fold into [M,N], not [N,K]
                 g = g * self._bf16(oscale).reshape(1, -1)
             m = g.shape[0]
-            bM, bN = _snap_mma_tile(min(64, m), 64), 64  # bN=128 measured 0.962x
+            # 128 threads = a 4-warp consumer, the width wgmma needs; at 64 the compiler emits
+            # mma.sync (wins/2026-09-07-fp4-backward-warpgroup.md). Narrow tiles keep _THREADS.
+            bM, bN = _snap_mma_tile(min(128, m), 128), 64  # bN=128 measured 0.962x
+            thr = 128 if bM == 128 else _THREADS
             gx = self._kernel("linear_fp4_bwd")(
                 _pad2d(self._c(g), _round_up(m, bM), _round_up(n, _MMA_RED)),
                 _pad2d(wq, _round_up(n, _MMA_RED), _round_up(k, bN) // 2),
                 _pad2d(self._const_f32(scale), _round_up(n, _MMA_RED),
                        _round_up(k, bN) // blk),
-                bM, bN, _THREADS,
+                bM, bN, thr,
             )[:m, :k]
             return gx.reshape(*grad.shape[:-1], k)
         # ponytail: torch-eager backward, tilelang dequant only exists for fp4
