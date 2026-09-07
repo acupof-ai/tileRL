@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 import urllib.request
 
@@ -136,14 +137,23 @@ def _post_stream(url: str, body: dict, timeout: float) -> tuple[dict, float]:
 
 
 def _compiles(path: str) -> int:
-    """`begins to compile` lines in the server's own log, or -1 when it was not given."""
+    """`begins to compile` lines in the server's own log, or -1 when it was not given.
+
+    An EMPTY file returns -1, not 0. A `python3` (no `-u`) server redirected to a file
+    block-buffers stdout and the arm's `kill $SRV` is a SIGTERM, so nothing is ever
+    flushed: measured on the pod, a process that had already printed the marker left
+    0 bytes after 3 s and 0 after SIGTERM, while the same process under `python3 -u`
+    left 38 bytes. Every cell of the 2026-09-08 DRAM grid reported `compiles: clean`
+    against a 0-byte log -- a green verdict that could not have gone red.
+    """
     if not path:
         return -1
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            return sum("begins to compile" in line for line in f)
+            n = sum("begins to compile" in line for line in f)
     except OSError:
         return -1
+    return n if n else (-1 if os.path.getsize(path) == 0 else 0)
 
 
 def _get(url: str) -> dict:
@@ -219,8 +229,9 @@ def main() -> int:
                 k: after.get(k, 0) - before.get(k, 0)
                 # a publisher retiring its own entry counts as superseded, not eviction,
                 # so an eviction delta alone cannot say whether pressure eased or moved.
-                for k in ("prefix_hits", "prefix_published", "prefix_evictions",
-                          "prefix_superseded", "dram_demotions", "dram_promotions")
+                for k in ("prefix_hits", "prefix_hit_tokens", "prefix_published",
+                          "prefix_evictions", "prefix_superseded",
+                          "dram_demotions", "dram_promotions")
             }
             n = out.get("usage", {}).get("prompt_tokens", 0)
             # Peak, not delta: a pool-bound cell is the TIER's case rather than a confound to
@@ -247,11 +258,15 @@ def main() -> int:
                          "wall_s": round(wall, 2), "ttft_s": round(ttft, 2),
                          "compiles": compiles, **pool, **resident, **d})
             pct = 100.0 * pool["pool_used_blocks"] / max(1, pool["blocks_total"])
+            # depth, not just hits: the count says a match happened, this says how much of the
+            # prompt it spared. 512 of 30826 reports a hit and re-prefills 98% (2026-09-08).
+            depth = 100.0 * d["prefix_hit_tokens"] / max(1, n) if d["prefix_hits"] else 0.0
             print(
                 f"turn {turn} conv {_label(c)}  prompt={n:6d}  wall={wall:8.2f}s  "
                 f"ttft={ttft:7.2f}s  compiles={compiles:2d}  pool={pct:5.1f}%  "
                 f"ent={resident['prefix_entries']}/{resident['prefix_entries_capacity']}  "
-                f"hits={d['prefix_hits']}  demote={d['dram_demotions']}  "
+                f"hits={d['prefix_hits']}  depth={depth:5.1f}%  "
+                f"demote={d['dram_demotions']}  "
                 f"promote={d['dram_promotions']}  evict={d['prefix_evictions']}  "
                 f"super={d['prefix_superseded']}",
                 flush=True,
@@ -274,18 +289,38 @@ def main() -> int:
               f"demote={v['dram_demotions']}", flush=True)
     # This script attaches to a server it did not start, so a compile is only visible when the
     # operator points --server-log at that server's stdout; unknown is reported as unknown
-    # rather than as clean, since a JIT inside a measured turn is charged to the tier.
+    # rather than as clean, since a JIT inside a measured turn is charged to the tier. An empty
+    # log reads unknown too -- see `_compiles`: a server without `-u` flushes nothing, so
+    # "clean" would be a verdict with no negative branch.
     dirty = [(r["turn"], r["conv"], r["compiles"]) for r in rows if r["compiles"] > 0]
     known = all(r["compiles"] >= 0 for r in rows)
-    verdict = "unknown (no --server-log)" if not known else dirty or "clean"
+    verdict = "unknown (no --server-log, or it is empty -- run serve under python3 -u)" \
+        if not known else dirty or "clean"
     print(f"compiles: {verdict}", flush=True)
     peak = max((r["pool_used_blocks"] for r in rows), default=0)
     tot = max((r["blocks_total"] for r in rows), default=0)
     print(f"pool peak: {peak}/{tot} blocks ({100.0 * peak / max(1, tot):.1f}%)", flush=True)
+    # Hit and miss TTFT as two measured buckets, plus the depth that explains them. Without
+    # these the hit rate and the wall clock are the only two numbers, and a rate that rises
+    # while the clock doubles has to be solved for depth instead of read (2026-09-08, #271).
+    hit_rows = [r for r in rows if r["prefix_hits"]]
+    miss_rows = [r for r in rows if not r["prefix_hits"]]
+    depth = {"hit_turns": len(hit_rows), "miss_turns": len(miss_rows),
+             "mean_hit_depth_pct": round(
+                 100.0 * sum(r["prefix_hit_tokens"] for r in hit_rows)
+                 / max(1, sum(r["prompt_tokens"] for r in hit_rows)), 1),
+             "mean_hit_ttft_s": round(
+                 sum(r["ttft_s"] for r in hit_rows) / max(1, len(hit_rows)), 2),
+             "mean_miss_ttft_s": round(
+                 sum(r["ttft_s"] for r in miss_rows) / max(1, len(miss_rows)), 2)}
+    print(f"hit depth: {depth['mean_hit_depth_pct']}% of prompt over {depth['hit_turns']} hit "
+          f"turns; ttft hit {depth['mean_hit_ttft_s']}s vs miss {depth['mean_miss_ttft_s']}s "
+          f"over {depth['miss_turns']} miss turns", flush=True)
     print(json.dumps({"sessions": args.sessions, "turns": args.turns, "rows": rows,
                       "per_session": per_session, "total_wall_s": total,
                       "turns_with_compiles": dirty, "compiles_known": known,
                       "pool_peak_blocks": peak, "blocks_total": tot,
+                      "hit_depth": depth,
                       "final_stats": st}, indent=2))
     return 0
 

@@ -1,6 +1,9 @@
-# The DRAM tier is 3.57x on wall clock once the state budget is actually pressured — H20, 2026-09-07
+# The DRAM tier is 3.57x on wall clock once the state budget is pressured AND its blocks fit the pool — H20, 2026-09-07
 
-> Status: Shipped (measurement); the DRAM default does NOT flip on this card — see Deployment
+> Status: Shipped (measurement); the DRAM default does NOT flip on this card — see Deployment.
+> **Both conditions in the title are load-bearing.** The block condition was added 2026-09-08 after
+> the same cell went net-negative once the tier's retention crossed the pool ceiling — see Scope. The
+> filename keeps its original slug so links hold.
 
 ## Context
 
@@ -82,7 +85,49 @@ This reproduces the serve-path finding
 at a different budget and with the mechanism now attributed to `ssd_save_ms`
 rather than inferred from wall clock.
 
-## Pending: the publisher this was measured against has changed
+## Scope: the win is conditional on the tier's block retention, and this entry does not say so
+
+Added 2026-09-08. Demotion frees snapshot bytes and **keeps the entry**, which keeps its blocks alive.
+So enabling the tier moves the same pressure from the byte axis to the block axis, and above a
+workload-dependent pool ceiling that is a worse place for it to be. Measured at this cell's own
+parameters on a later commit, tier off against tier on, same pool and same workload:
+
+| | pool peak | evictions | demotions | promotions |
+|---|---:|---:|---:|---:|
+| tier off | **45.6%** | 103 | 0 | 0 |
+| tier on | **99.1%** | 86 | 103 | **0** |
+
+Enabling the tier raised peak block occupancy from 45.6% to 99.1%. At 99.1% the block path fires, and
+that path — `evict_until_free` (`kv_cache.py:1330`), called from `engine.py:682` and `:950` — is the one
+eviction path with **no demote branch**: it goes straight to `_evict_one` → `_drop` → `_dram.forget`. A
+promotion needs the entry still in the index (`:1252`), so every orphaned host copy is unreachable.
+Result: **103 demotions, 1864 ms of `dram_demote_ms`, 0 promotions**, with 5.9 GiB of tier budget
+unused — net negative against tier-off.
+
+The asymmetry is not a bug to fix in the block path: at `:684` the caller needs blocks *now* and
+demotion frees zero blocks. Demotion is a byte-axis tool.
+
+**So 3.57x holds only where the tier's block retention stays under the pool ceiling, and this entry
+states the win unconditionally.** The `--blocks 8192` in the Context above is doing load-bearing work
+that the text does not acknowledge. Whether the 3.57x itself reproduces is separately open — see the
+Pending section below and
+[errors/2026-09-08-four-mechanisms-one-regression-and-a-copied-flag.md](../errors/2026-09-08-four-mechanisms-one-regression-and-a-copied-flag.md).
+
+## Resolved: the cell reproduces on the pre-fix commit; the number was sound, the precondition was missing
+
+Resolved 2026-09-08, replacing the Pending flag below. Running **this cell's exact parameters** on
+`169d7bd` — the sha this entry names — gives **198.32 s** against the 199.35 s written here, **0.52%**
+apart, from a job log with the tree sha stamped and read back. So nothing in the 3.57x needs
+retracting: the measurement was right.
+
+What was missing is the precondition in the Scope section above. The later commit `a43a379` takes the
+same cell to 403.01 s (2.03x), and that is a publisher regression, not a re-reading of this entry — see
+[errors/2026-09-08-four-mechanisms-one-regression-and-a-copied-flag.md](../errors/2026-09-08-four-mechanisms-one-regression-and-a-copied-flag.md).
+The correction to make here is therefore one sentence and not a withdrawal: **the tier benefit is real
+and conditional on the tier's own block retention staying under the pool ceiling**, which this cell
+satisfies by accident of `--blocks 8192`.
+
+## Superseded flag: the publisher this was measured against has changed
 
 The 3.57x was measured against a publisher emitting **62 entries per 31k-token miss**, and this
 entry's own mechanism paragraph says the tier does not stop that flood — it gives the flood
@@ -91,6 +136,11 @@ somewhere to go. That publisher is fixed as of
 2 publishes per row at any prompt length. **So 3.57x is provisional** until the same cell runs on
 the fixed publisher, and this section is the flag rather than a revision — a token-count probe on
 CPU cannot rewrite a wall-clock verdict, and the card cell is scoped and pending.
+
+Resolved by the section above: the cell was run on `169d7bd` and reproduces to 0.52%. On the **fixed**
+publisher the same cell takes 403.01 s, which is the publisher's regression rather than this entry's
+error — so the 3.57x stands for the publisher it names, and a tier verdict on the fixed publisher needs
+the bounded ladder first.
 
 One structural fact from that probe does land here, because it is not a speed claim: **the tier is
 inert below a 4-snapshot budget.** At `--dram-bytes` worth 3 snapshots it demoted nothing and
