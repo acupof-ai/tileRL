@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 import urllib.request
 
@@ -136,14 +137,23 @@ def _post_stream(url: str, body: dict, timeout: float) -> tuple[dict, float]:
 
 
 def _compiles(path: str) -> int:
-    """`begins to compile` lines in the server's own log, or -1 when it was not given."""
+    """`begins to compile` lines in the server's own log, or -1 when it was not given.
+
+    An EMPTY file returns -1, not 0. A `python3` (no `-u`) server redirected to a file
+    block-buffers stdout and the arm's `kill $SRV` is a SIGTERM, so nothing is ever
+    flushed: measured on the pod, a process that had already printed the marker left
+    0 bytes after 3 s and 0 after SIGTERM, while the same process under `python3 -u`
+    left 38 bytes. Every cell of the 2026-09-08 DRAM grid reported `compiles: clean`
+    against a 0-byte log -- a green verdict that could not have gone red.
+    """
     if not path:
         return -1
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            return sum("begins to compile" in line for line in f)
+            n = sum("begins to compile" in line for line in f)
     except OSError:
         return -1
+    return n if n else (-1 if os.path.getsize(path) == 0 else 0)
 
 
 def _get(url: str) -> dict:
@@ -279,10 +289,13 @@ def main() -> int:
               f"demote={v['dram_demotions']}", flush=True)
     # This script attaches to a server it did not start, so a compile is only visible when the
     # operator points --server-log at that server's stdout; unknown is reported as unknown
-    # rather than as clean, since a JIT inside a measured turn is charged to the tier.
+    # rather than as clean, since a JIT inside a measured turn is charged to the tier. An empty
+    # log reads unknown too -- see `_compiles`: a server without `-u` flushes nothing, so
+    # "clean" would be a verdict with no negative branch.
     dirty = [(r["turn"], r["conv"], r["compiles"]) for r in rows if r["compiles"] > 0]
     known = all(r["compiles"] >= 0 for r in rows)
-    verdict = "unknown (no --server-log)" if not known else dirty or "clean"
+    verdict = "unknown (no --server-log, or it is empty -- run serve under python3 -u)" \
+        if not known else dirty or "clean"
     print(f"compiles: {verdict}", flush=True)
     peak = max((r["pool_used_blocks"] for r in rows), default=0)
     tot = max((r["blocks_total"] for r in rows), default=0)

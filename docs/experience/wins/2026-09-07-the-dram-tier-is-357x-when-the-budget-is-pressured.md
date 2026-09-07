@@ -1,6 +1,9 @@
-# The DRAM tier is 3.57x on wall clock once the state budget is actually pressured — H20, 2026-09-07
+# The DRAM tier is 3.57x on wall clock once the state budget is pressured AND its blocks fit the pool — H20, 2026-09-07
 
-> Status: Shipped (measurement); the DRAM default does NOT flip on this card — see Deployment
+> Status: Shipped (measurement); the DRAM default does NOT flip on this card — see Deployment.
+> **Both conditions in the title are load-bearing.** The block condition was added 2026-09-08 after
+> the same cell went net-negative once the tier's retention crossed the pool ceiling — see Scope. The
+> filename keeps its original slug so links hold.
 
 ## Context
 

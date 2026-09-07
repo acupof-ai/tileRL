@@ -2,13 +2,18 @@
 
 **Date:** 2026-09-08
 **Machine:** H20 pod card 0 (cells), local CPU target (diagnosis)
-**Status:** open — the mechanism is settled (hit depth, see the Resolved section) and the forward fix, a
-bounded publish ladder, has not landed. Listed in [OPEN.md](../OPEN.md), with the latent
-`_demote_one` count guard as a second line.
+**Status:** open — the 2.03x reproduces, and its attribution splits. The hit-depth collapse is measured
+and #271-shaped; the cold-prefill doubling has no identified cause and the instrument that would have
+answered it (`compiles`) was vacuous on this grid. Forward fix, a bounded publish ladder, has not
+landed. Listed in [OPEN.md](../OPEN.md), with the latent `_demote_one` count guard and the cold-miss
+question as further lines.
 
 > The sections below are in the order they were written, so the four refuted mechanisms and the
-> superseded "what remains open" stand as the record. **The settled reading is
-> [Resolved: 2.03x at one variable](#resolved-203x-at-one-variable-and-the-mechanism-is-hit-depth).**
+> superseded "what remains open" stand as the record. **The settled reading starts at
+> [Resolved in part](#resolved-in-part-203x-reproduces-and-the-hit-depth-is-the-readable-half),
+> and its two limits are the
+> [7-commit range](#not-one-variable-the-range-is-7-commits-and-the-cold-miss-doubles) and the
+> [vacuous compiles verdict](#the-compiles-clean-on-every-cell-of-this-grid-was-vacuous).**
 
 ## Context
 
@@ -187,11 +192,10 @@ apart**. The block axis cannot distinguish publishers.
 A fifth hypothesis, that the eviction difference was an accounting shift into `superseded`, is
 refuted by the table: `superseded` is 36 in both cell357 arms and 46 in both of the others. Flat.
 
-## Resolved: 2.03x at one variable, and the mechanism is hit depth
+## Resolved in part: 2.03x reproduces, and the hit depth is the readable half
 
 `169d7bd` (pre-fix) run at cell357's exact flags — same workload, same `--blocks 8192`, same
-`--state-bytes`, tier off — so the commit is the only variable and both numbers come from job logs
-rather than from an entry's prose:
+`--state-bytes`, tier off — with both numbers from job logs rather than from an entry's prose:
 
 | | wall | mean TTFT | hits | published | evictions | pool peak |
 |---|---:|---:|---:|---:|---:|---:|
@@ -199,8 +203,10 @@ rather than from an entry's prose:
 | post-fix a43a379 | **403.01 s** | 10.83 s | **35/36** | 144 | 103 | 3735 |
 
 **2.03x.** The pre-fix arm reproduces the 09-07 entry's 199.35 s to 0.5%, so that number was always
-sound. Provenance: the pod tree was stamped `169d7bd` before the run and read back from the job log;
-`compiles: clean` in both arms.
+sound. Provenance: the pod tree was stamped `169d7bd` before the run and read back from the job log.
+
+**Not one variable — see the section below.** The range is 7 commits and the cold miss doubles, so the
+2.03x is real and its attribution splits. What follows here is the half that is readable.
 
 **Why every counter here except one is unreadable.** The entry population is what the commit changed —
 876 published against 144 — so `evictions 835 vs 103`, `blocks_freed`, and every per-eviction yield
@@ -209,13 +215,10 @@ would have been the fifth withdrawn reading of this session.
 
 **The exception is `hits`, whose denominator is turns, and turns are 36 in both arms.** Post-fix hits
 **more often** (97% vs 67%) and is **twice as slow**. A fixed denominator makes that comparison sound,
-and it forces one conclusion: each hit serves far less. At this pool and budget the deep entry is often
-gone by the next turn, so the surviving match is the shallow one — and post-fix there is nothing
-between 512 tokens and the full prefix, where pre-fix's 61 nested entries meant a row that lost its
-deepest still had a near-deep one.
+and it forces one conclusion: each hit serves far less.
 
-So #271 raised the hit *rate* and collapsed the hit *depth*, and the net is 2x. Its accept grid
-counted token reuse at an unpressured capacity, where the deep entry never goes missing and the
+So #271 raised the hit *rate* and collapsed the hit *depth*, and the net on this cell is 2x. Its accept
+grid counted token reuse at an unpressured capacity, where the deep entry never goes missing and the
 intermediate entries look redundant.
 
 **Fix direction: a bounded ladder** — a few spread publishes per row, keeping intermediate fallbacks
@@ -223,44 +226,44 @@ without returning to 62. Publishing only the last boundary is the **worst** avai
 removes the remaining fallback entirely. No revert: the flood was a real defect with a measured
 cascade.
 
-### The regression is entirely prefill, and the post-fix hit costs most of a miss
+### The regression is entirely prefill, and the buckets were in the log all along
 
 `mean_ttft × 36` is 185.0 s of pre's 198.32 (93.3%) and 389.9 s of post's 403.01 (96.7%), so the
 deltas are **204.7 s wall against 204.8 s TTFT** — 0.15 s apart. The regression is time-to-first-token
 in full. Nothing in decode, sampling or the tier contributes measurably, which retires every
 mechanism that would have shown up as slower generation.
 
-Split each arm's TTFT into a hit bucket and a miss bucket. Pre has 12 misses, post has 1, turns are 36
-in both:
+**The hit and miss TTFT are per-turn columns in the bench output.** Read straight off
+`/work/pre357off.out` and `/work/cell357off.out`:
 
-```
-185.04 = 24·h_pre  + 12·m
-389.88 = 35·h_post +  1·m
-```
+| | hit turns | mean hit TTFT | miss turns | mean miss TTFT | mean hit prompt | mean miss prompt |
+|---|---:|---:|---:|---:|---:|---:|
+| pre-fix 169d7bd | 24 | **0.702 s** | 12 | **14.030 s** | 30528 | 31689 |
+| post-fix a43a379 | 35 | **10.342 s** | 1 | **28.050 s** | 30938 | 30115 |
 
-Two equations, one free parameter — the mean miss TTFT `m`. Solve at the 09-07 entry's ~14.1 s full
-prefill: **h_pre = 0.66 s, h_post = 10.74 s**, against a miss of 14.1 s. The post-fix hit does **76% of
-a miss's work.**
+A pre-fix hit costs **5.0%** of a pre-fix miss. A post-fix hit costs **74%** of pre-fix's miss cost.
+The hit got **14.7x more expensive** while the hit *rate* rose from 24/36 to 35/36. Both numbers are
+measured; nothing is solved for.
 
-`m` barely matters, and that is the point:
+**How this was nearly reported instead.** Two of us derived the same buckets algebraically — two
+equations in the one free parameter `m` (the mean miss TTFT), swept over `m`'s admissible range, and
+concluded `h_post` sits at 10.7–11.0 s regardless of `m` because the post arm has 1 miss in 36. The
+conclusion was right, the range for `h_pre` (0.66–7.70 s) was honest and useless, and the whole
+exercise reconstructed columns the instrument had already printed. `m_pre` measured **14.03 s** lands
+on the 14.1 s the 09-07 entry quotes, which is exactly why the model agreed with itself and why
+neither of us looked. **A model that reproduces the authority feels like confirmation and is
+circularity.** Before modelling a quantity, grep the log for it.
 
-| assumed miss cost `m` | h_pre | h_post |
-|---:|---:|---:|
-| 5.0 s | 5.21 s | 11.00 s |
-| 10.0 s | 2.71 s | 10.85 s |
-| 14.1 s | 0.66 s | 10.74 s |
-| 15.42 s (ceiling: h_pre → 0) | 0.00 s | 10.70 s |
+A second withdrawal followed from the same rows. The population objection — prompts grow under
+`--grow 10`, so misses skew early and short, so the true `m_pre` is below 14.1 s, so `h_pre` is higher
+and the collapse softer — has the sign backwards. Misses are the **longer** prompts (31689 against
+30528). The chain was valid and the premise about which turns miss was wrong; only the rows could say.
 
-`h_post` is **10.7–11.0 s across the whole admissible range**, because the post arm has one miss out of
-36 and `m` therefore carries 1/35 of the weight. So `h_post` is effectively measured, not inherited from
-another arm's number — the concern about borrowing 14.1 s applies to `h_pre` and to the ratio, not to
-the post-fix per-hit cost. And `h_post > h_pre` holds for **every** `m > 0`: the inequality reduces to
-`2880.7 > -396·m`.
-
-**A post-fix hit is a miss wearing a hit's label.** It matches, it reports a hit, and it re-prefills
-nearly everything — which is exactly why the hit *rate* rose while the wall clock doubled. Post-fix
-almost always finds the 512-token entry, so it almost never records a miss. Pre-fix's 12 real misses
-were cheaper in aggregate than post-fix's 35 nominal hits.
+**What the depth reading now rests on.** A post-fix hit at 10.342 s against a measured 14.03 s full
+prefill does 74% of a miss's work: it matches, it reports a hit, and it re-prefills most of the prompt.
+That is why the hit rate rose while the wall clock doubled — post-fix almost always finds the
+512-token entry, so it almost never records a miss. Pre-fix's 12 real misses were cheaper in aggregate
+than post-fix's 35 nominal hits.
 
 That also corrects the mechanism as first stated. The claim was "the deep entry is never published"; it
 is published, and found — it is published and then **evicted**, and post-fix the only thing left below
@@ -269,15 +272,69 @@ near-deep. The defect is neither the publish depth nor the eviction: it is that 
 rung between 512 and the full prefix**, and every rung matters precisely because eviction is guaranteed
 at this shape. What #271 removed is graceful degradation.
 
-**Limits.** `h` and `m` are bucket averages over each arm's own turn population, and the populations
-differ — prompts grow (`--grow 10`), so pre's 12 miss turns are not post's 1. The split is a two-bucket
-model over measured totals, not an identity. And the depth claim is still inferred from time rather
-than measured: `bench_chat_interleaved.py` does not record matched tokens per hit. That is one field,
-it needs no card window, and it converts this from a model to a measurement — worth adding before the
-ladder is written.
+**Time is still not depth.** A hit could be slow for a reason other than shallowness, even with none in
+evidence. `bench_chat_interleaved.py` now records `prefix_hit_tokens` per turn and prints
+`depth=` as a fraction of that turn's own prompt, so the next card window settles it directly rather
+than by inference.
 
 The earlier K-spaced refutation was measured in token-counted reuse on the CPU grid, which is the unit
 that cannot see any of this. It should be re-tested in TTFT.
+
+### Not one variable: the range is 7 commits, and the cold miss doubles
+
+`169d7bd..a43a379` contains **7 commits**, not one. The entry and its PR body both said "the commit is
+the only variable"; that is false. #272 (fp8 KV pool and fp8 attention readers) is in the range, and
+the rows show a second effect the publisher cannot reach:
+
+```
+turn 0 conv A, empty store, nothing published yet:
+  pre-fix   ttft 14.02 s
+  post-fix  ttft 28.05 s        2.0x
+```
+
+A cold miss on an empty store is untouched by any publish policy. So the 2.03x wall clock reproduces,
+and **its attribution splits**: the hit-depth collapse is measured and is #271-shaped, the cold-prefill
+doubling is not.
+
+**#272 is ruled out on the default path, by reading it.** `--kv-fp8` defaults to `""`
+(`cli.py:1060`) and neither arm passed it, so `kv_fp8` is None. `_kv_operands` returns
+`pool.kv_operands(layer_idx)` when `pool.kv_fp8 is None`, which returns the raw planes with no copy —
+the 87.5 ms dequantize in its docstring is the fallback branch, reachable only with fp8 on and the fp8
+kernel absent. `_weight_fingerprint` did gain a `-kv{kv_fp8 or 'io'}` suffix, which would invalidate a
+cache, but it is consumed only at `engine.py:1675` under `if ssd_path:` and neither arm passed
+`--ssd-path`.
+
+So the cold doubling has **no identified cause**, and the two candidates a reader would reach for are
+both eliminated by code. The remaining hypothesis is run-to-run warm state — page cache, kernel cache,
+or a JIT inside turn 0 — and the instrument that should have answered it was broken:
+
+### The `compiles: clean` on every cell of this grid was vacuous
+
+All four cells report `compiles: clean`. All four serve logs are **0 bytes**.
+
+`_compiles` counted marker lines and returned that count, so an empty-but-existing file returned 0,
+`known = all(compiles >= 0)` held, `dirty` was empty, and the verdict printed `clean`. The logs are
+empty by construction: the arms run the server as `python3 -c ... > /work/<name>-serve.log` with no
+`-u`, so stdout is block-buffered to a file, and each arm ends with `kill $SRV` — SIGTERM, no flush.
+
+Measured on the pod, same script, same SIGTERM, `-u` as the only variable:
+
+| | bytes after 3 s | bytes after SIGTERM | marker found |
+|---|---:|---:|---:|
+| `python3` | 0 | 0 | no |
+| `python3 -u` | 38 | 38 | yes |
+
+`TILELANG_PRINT_ON_COMPILATION` defaults to `"1"` (tilelang `env.py:371`), so the marker *is* emitted
+on every compile — the empty log is the instrument, not a compile-free run. **A JIT inside a measured
+turn would have been charged to the tier and read as clean**, which is precisely the confound
+`--server-log` exists to exclude, and it makes the cold-miss doubling unresolvable from these logs.
+
+Fixed: `_compiles` returns -1 for an empty file, so the verdict reads
+`unknown (no --server-log, or it is empty -- run serve under python3 -u)`. The distinction that has to
+survive is that a log **with** content and no marker is still genuinely clean, or `clean` becomes
+unreachable and the gate is useless in the other direction — `tests/test_bench_compiles_verdict.py`
+holds both directions and was verified red against the original.
+
 
 ## What remains open
 
@@ -288,12 +345,20 @@ Both were wrong.
 
 The `--blocks`-unset arm ran (2560 blocks, not the 48099 intended, because `--max-ctx 40960 --slots 16`
 still bound it): **424.20 s at 78.1% peak against cell357off's 403.01 s at 45.6%**, evictions 104 vs 103.
-Tripling the pool changes nothing, so the pool is a threshold and not the cause. And the single-variable
-commit arm above then put the publisher squarely back in scope. What survives is the narrower claim the
+Tripling the pool changes nothing, so the pool is a threshold and not the cause. And the cross-commit
+arm above then put the publisher squarely back in scope. What survives is the narrower claim the
 `pub271off` arm supports on its own: 139 evictions at **8.8%** occupancy cannot be capacity.
 
-Still open: the bounded ladder itself, and the settling measurement for the per-eviction yield — per
-eviction, the count of the entry's blocks where `refcount[b] > n`, logged with the entry's token length.
+Still open:
+- **The cold-prefill doubling** (14.02 → 28.05 s on turn 0, empty store). #271 cannot reach it and #272
+  is eliminated on the default path by reading the code. The decisive arm is **`45acd87`** at these
+  flags: against `a43a379` it isolates #271 with fp8 held constant, and against `169d7bd` its own
+  turn-0 cold miss prices whatever else is in the range. One run answers both. Run the server under
+  `python3 -u` so `compiles` can go red.
+- **The bounded ladder**, gated on `prefix_hit_tokens` confirming the depth collapse directly.
+- **The per-eviction yield split** — per eviction, the count of the entry's blocks where
+  `refcount[b] > n`, logged with the entry's token length.
+
 
 ## Rule
 
@@ -310,3 +375,21 @@ Two arms agreeing tells you nothing when both were measured against the wrong op
 
 Operationally: before a number becomes a cause, name the operand it was measured against and check
 that operand matches the failing configuration — not the configuration you meant to reproduce.
+
+Three more, each from a mistake made *after* the four above were written up:
+
+**Before modelling a quantity, grep the log for it.** Two sessions solved a two-equation system for the
+hit and miss TTFT buckets, swept the free parameter, and argued about the bound. Both columns were
+printed on every turn row of both arms. The model agreed with the log because the log is where its one
+constant came from, and a model that reproduces the authority reads as confirmation.
+
+**"One variable" is a claim about a commit range, so count the range.** `169d7bd..a43a379` is 7
+commits. Naming the two endpoints and matching every flag between them makes the *configuration*
+single-variable and says nothing about the code. `git log --oneline A..B | wc -l` is the check, and it
+costs one command.
+
+**A green verdict needs a file that could have made it red.** `compiles: clean` on four cells, four
+0-byte logs: `_compiles` returned 0 for an empty file, and the server ran without `-u` so SIGTERM
+flushed nothing. The negative control is not "does the parser count markers" — it is "can this file
+ever contain one". Check the instrument's input is non-empty before reading its output as a result.
+
