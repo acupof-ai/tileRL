@@ -288,3 +288,115 @@ def make_paged_attention_combine(target: str, KVSPLIT: int = 16):
         return Out
 
     return paged_attention_combine
+
+
+def make_paged_attention_prefill_sm70(
+    target: str, block_M: int = 64, block_N: int = 16, kv_dtype: str = "float32"
+):
+    """Query-tiled paged causal GQA attention for Volta. sm70 cell of the CPU
+    twin `kernels.make_paged_attention_prefill`.
+
+    Volta has no bf16 and `T.gemm` lowers to fp16-only `mma.sync.m8n8k4`, so the
+    sm90 cell's structure is reused and none of its instructions: the QK^T and PV
+    products are hand-tiled `T.Parallel` MACs over shared tiles, f32 accumulators
+    throughout. The online-softmax rescaling is the sm90 cell's, verbatim, which
+    is the part worth copying.
+
+    `kv_dtype` is the shared K/V/Q tile dtype, not the cache dtype: f32 is rung 1
+    and fp16 is rung 2, which doubles residency (2 blocks/SM against 1) and would
+    also unlock `mma.sync.m8n8k4`. Accumulators stay f32 either way, so parity
+    against split is `rtol=1e-2` for both.
+
+    Tile 64x16 is shared-memory-bound, not register-bound: (block_M + 2*block_N)
+    * D * 4 at D=256 is exactly Volta's 96 KiB, and no f32 tile at this D reaches
+    two blocks per SM (wins/2026-09-07-the-sm70-prefill-tile-is-64x16-f32.md).
+    KVSPLIT is gone: 8 query tiles x 24 heads is 192 blocks against 80 SMs, so
+    the card fills without splitting the history.
+    """
+    accum = "float32"
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    def paged_attention_prefill_sm70(
+        Q, KCache, VCache, BlockTable, SeqLens, SeqQLens, scale: T.float32, block_size, threads
+    ):
+        B, S, H, D = T.const("B, S, H, D")
+        Hkv = T.const("Hkv")
+        NB = T.const("NB")
+        Mb = T.const("Mb")
+        Q: T.Tensor((B, S, H, D), "float32")
+        KCache: T.Tensor((NB, Hkv, block_size, D), "float32")
+        VCache: T.Tensor((NB, Hkv, block_size, D), "float32")
+        BlockTable: T.Tensor((B, Mb), "int32")
+        SeqLens: T.Tensor((B,), "int32")
+        SeqQLens: T.Tensor((B,), "int32")
+        Out = T.empty((B, S, H, D), "float32")
+        with T.Kernel(T.ceildiv(S, block_M), H, B, threads=threads) as (bx, hh, bb):
+            hkv = hh * Hkv // H
+            hist = SeqLens[bb] - SeqQLens[bb]
+            Qs = T.alloc_shared((block_M, D), kv_dtype)
+            Ks = T.alloc_shared((block_N, D), kv_dtype)
+            Vs = T.alloc_shared((block_N, D), kv_dtype)
+            acc = T.alloc_fragment((block_M, D), accum)
+            sc = T.alloc_fragment((block_M, block_N), accum)
+            m = T.alloc_fragment((block_M,), accum)
+            mprev = T.alloc_fragment((block_M,), accum)
+            mscale = T.alloc_fragment((block_M,), accum)
+            ssum = T.alloc_fragment((block_M,), accum)
+            logsum = T.alloc_fragment((block_M,), accum)
+            for i, d in T.Parallel(block_M, D):
+                t = bx * block_M + i
+                Qs[i, d] = T.cast(
+                    T.if_then_else(t < S, Q[bb, T.min(t, S - 1), hh, d], 0.0), kv_dtype
+                )
+            T.fill(acc, 0)
+            T.fill(logsum, 0)
+            T.fill(m, -T.infinity(accum))
+            # The tile's K/V range is its LAST row's; each row masks its own cut.
+            last = T.min(bx * block_M + block_M, S) - 1
+            upper = hist + last + 1
+            for k in T.Pipelined(T.ceildiv(upper, block_N), num_stages=1):
+                for j, d in T.Parallel(block_N, D):
+                    # Clamped so an out-of-range lane loads a live address; the
+                    # score is masked to -inf below, so the value never counts.
+                    p = T.min(k * block_N + j, upper - 1)
+                    blk = BlockTable[bb, T.min(p // block_size, Mb - 1)]
+                    Ks[j, d] = T.cast(KCache[blk, hkv, p % block_size, d], kv_dtype)
+                    Vs[j, d] = T.cast(VCache[blk, hkv, p % block_size, d], kv_dtype)
+                for i, j in T.Parallel(block_M, block_N):
+                    dot = T.alloc_fragment((1,), accum)
+                    dot[0] = 0.0
+                    for d in T.serial(D):
+                        dot[0] += T.cast(Qs[i, d], accum) * T.cast(Ks[j, d], accum)
+                    p = k * block_N + j
+                    # The row cut is the one a query tile adds.
+                    sc[i, j] = T.if_then_else(
+                        (p < upper) and (p <= hist + bx * block_M + i),
+                        dot[0] * scale,
+                        -T.infinity(accum),
+                    )
+                T.copy(m, mprev)
+                T.reduce_max(sc, m, dim=1, clear=False)
+                for i in T.Parallel(block_M):
+                    # An all-masked row keeps m = -inf; exp(-inf - -inf) is NaN.
+                    mscale[i] = T.if_then_else(
+                        m[i] == -T.infinity(accum), 0.0, T.exp(mprev[i] - m[i])
+                    )
+                for i, j in T.Parallel(block_M, block_N):
+                    sc[i, j] = T.if_then_else(
+                        m[i] == -T.infinity(accum), 0.0, T.exp(sc[i, j] - m[i])
+                    )
+                T.reduce_sum(sc, ssum, dim=1)
+                for i in T.Parallel(block_M):
+                    logsum[i] = logsum[i] * mscale[i] + ssum[i]
+                for i, d in T.Parallel(block_M, D):
+                    acc[i, d] *= mscale[i]
+                for j in T.serial(block_N):
+                    for i, d in T.Parallel(block_M, D):
+                        acc[i, d] += sc[i, j] * T.cast(Vs[j, d], accum)
+            for i, d in T.Parallel(block_M, D):
+                t = bx * block_M + i
+                if t < S:
+                    Out[bb, t, hh, d] = acc[i, d] / logsum[i]
+        return Out
+
+    return paged_attention_prefill_sm70

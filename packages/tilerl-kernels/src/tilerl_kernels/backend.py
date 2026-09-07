@@ -33,6 +33,35 @@ _MAX_VERIFY_W = 8
 assert _MAX_VERIFY_W < _WY_CHUNK
 
 
+def is_prefill_width(s: int) -> bool:
+    """Does this query width want the tiled prefill cell rather than split?
+
+    One definition, one call site. `paged_attention_split` re-reads K/V once per
+    query row, which is right at s <= 8 and 29.9x the arithmetic floor at 512
+    (wins/2026-09-07-the-sm70-prefill-n2-is-one-kernel-at-30x-its-floor.md).
+    """
+    return s > _MAX_VERIFY_W
+
+
+# The tile is shared-memory-bound: (64 + 2*16) * 256 * 4 is exactly Volta's
+# 96 KiB (wins/2026-09-07-the-sm70-prefill-tile-is-64x16-f32.md).
+_PREFILL_BLOCK_M = 64
+_PREFILL_BLOCK_N = 16
+_PREFILL_THREADS = 256
+
+
+def prefill_kv_dtype() -> str:
+    """Shared K/V/Q tile dtype for the sm70 prefill cell.
+
+    Read per call, not captured at import: a caller that sets the env after
+    importing this module would otherwise get the default silently, which is how
+    a flag parses without arriving. f32 is rung 1; float16 doubles residency to
+    two blocks per SM and is what the acceptance window measures against it.
+    """
+    return "float16" if os.environ.get("TILERL_PREFILL_KV_DTYPE") == "f16" else "float32"
+
+
+
 def _round_up(x: int, m: int) -> int:
     return ((x + m - 1) // m) * m
 
@@ -929,6 +958,29 @@ class Backend:
         if self.arch == "sm90" and chain and "paged_attention_decode" in _resolve(self.precision, self.arch):
             out = self._paged_attention_decode(
                 q, k_cache, v_cache, block_table, seq_lens, seq_q_lens, scale
+            )
+        elif (
+            self.arch == "sm70"
+            and is_prefill_width(s)
+            and "paged_attention_prefill" in _resolve(self.precision, self.arch)
+        ):
+            # A prefill chunk is 512 rows; split reads K/V once per row. The tile
+            # reads it once per 64. Decode and verify keep split below.
+            out = self._kernel(
+                "paged_attention_prefill",
+                block_M=_PREFILL_BLOCK_M,
+                block_N=_PREFILL_BLOCK_N,
+                kv_dtype=prefill_kv_dtype(),
+            )(
+                self._f32(q),
+                self._f32(k_cache),
+                self._f32(v_cache),
+                self._i32(block_table).contiguous(),
+                self._i32(seq_lens).contiguous(),
+                self._i32(seq_q_lens).contiguous(),
+                float(scale),
+                int(k_cache.shape[2]),
+                _PREFILL_THREADS,
             )
         elif self.arch == "sm70" and "paged_attention_split" in _resolve(
             self.precision, self.arch

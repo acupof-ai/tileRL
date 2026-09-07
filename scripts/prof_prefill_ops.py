@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from collections import defaultdict
@@ -268,15 +269,25 @@ def main() -> int:
     ap.add_argument("--json")
     ap.add_argument("--no-reconcile", action="store_true",
                     help="suppress the not-the-27B banner; shares stay unquotable")
+    ap.add_argument("--prefill-kv-dtype", choices=("f32", "f16"), default="f32",
+                    help="sm70 prefill tile dtype; f16 is rung 2 (2 blocks/SM). "
+                         "Sets TILERL_PREFILL_KV_DTYPE before the backend loads.")
     ap.add_argument("--selfcheck", action="store_true",
                     help="CPU gate: assert the instrument sees what it claims to")
     args = ap.parse_args()
 
+    # Before the backend resolves anything: prefill_kv_dtype() reads this per
+    # call, so the window runs both rungs without editing the serving tree.
+    os.environ["TILERL_PREFILL_KV_DTYPE"] = args.prefill_kv_dtype
+
     lengths = [int(x) for x in args.tokens.split(",")]
     backend = get_backend()
     prov = _provenance(getattr(backend, "precision", "bf16"))
+    from tilerl_kernels.backend import prefill_kv_dtype
+
     print(f"arch={backend.arch} target={backend.target} "
-          f"precision={getattr(backend, 'precision', '?')}")
+          f"precision={getattr(backend, 'precision', '?')} "
+          f"prefill_kv={prefill_kv_dtype()}")
     mine = prov.get(backend.arch, {})
     for op in ("paged_attention", "paged_attention_split", "attn_prep", "gdn_chunk_fused"):
         here = mine.get(op)

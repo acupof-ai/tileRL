@@ -20,7 +20,7 @@ two cells share is only an override when the maker differs:
 | cpu | 16 | — | — | — |
 | metal | 16 | 3 (`gemm_nn/nt/tn`) | 0 | 13 |
 | sm90 | 42 | 9 | 26 | 7 |
-| sm70 | 24 | 2 (`silu_mul`, `gdn_prep`) | 8 | 14 |
+| sm70 | 24 | 3 (`silu_mul`, `gdn_prep`, `paged_attention_prefill`) | 8 | 13 |
 
 **sm70 reuses the CPU source more than any other accelerated cell**: 13 of its
 23 entries are the same maker object CPU runs, and only `silu_mul` and

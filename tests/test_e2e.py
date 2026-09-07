@@ -2706,6 +2706,84 @@ def test_the_sm70_split_count_follows_the_query_width():
     assert src.count("KVSPLIT=ks") == 2, "split and combine must agree, or the ABI asserts"
 
 
+def test_the_sm70_prefill_routing_has_exactly_one_predicate():
+    """`s > _MAX_VERIFY_W` splits the tiled prefill cell from split, and it must be
+    written once. A caller that re-derives the comparison is the failure this seam
+    has already had: the constant moves, the copy does not, and a prefill chunk
+    quietly takes the kernel that re-reads K/V once per row.
+
+    Counts CALL SITES, not text: a grep for the expression passes while the copy
+    computes something else. Reads the source because the dispatch is sm70-only
+    and never executes on the CPU target."""
+    import ast
+    from pathlib import Path
+
+    from tilerl_kernels.backend import _MAX_VERIFY_W, is_prefill_width
+
+    # The shipped rule, not a restatement of it.
+    assert not is_prefill_width(1), "decode stays on split"
+    assert not is_prefill_width(_MAX_VERIFY_W), "the widest verify stays on split"
+    assert is_prefill_width(_MAX_VERIFY_W + 1), "one past the verify tile is prefill"
+    assert is_prefill_width(512), "a prefill chunk takes the tiled cell"
+
+    src_path = (
+        Path(__file__).resolve().parent.parent
+        / "packages/tilerl-kernels/src/tilerl_kernels/backend.py"
+    )
+    tree = ast.parse(src_path.read_text())
+    calls = sum(
+        1
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "is_prefill_width"
+    )
+    assert calls == 1, f"is_prefill_width is called {calls} times; the dispatch is the one"
+
+    # And nothing re-derives it. Every comparison against the constant outside the
+    # predicate's own body is a second definition waiting to drift.
+    fn = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "is_prefill_width"
+    )
+    inside = {id(n) for n in ast.walk(fn)}
+    def names(node):
+        return {x.id for x in ast.walk(node) if isinstance(x, ast.Name)}
+
+    rederived = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Compare)
+        and id(n) not in inside
+        and {"_MAX_VERIFY_W", "s"} <= names(n)  # a QUERY WIDTH against the constant
+    ]
+    # The module-level `assert _MAX_VERIFY_W < _WY_CHUNK` is excluded by construction:
+    # it compares two constants and never mentions a query width. What remains is
+    # `chain = s <= _MAX_VERIFY_W and ...`, the sm90 decode tile -- a different
+    # question about the same constant (does the GQA group fit the M tile), on an
+    # arch this cell does not serve.
+    assert len(rederived) == 1, (
+        f"{len(rederived)} query-width comparisons against _MAX_VERIFY_W outside the "
+        f"predicate: {[ast.unparse(n) for n in rederived]}. Expected only the sm90 "
+        "decode-tile check; a second one on the sm70 path is the drift this guards."
+    )
+    # And it is the sm90 one: `chain` is what the sm90 branch tests.
+    chain = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "chain" for t in n.targets)
+        ),
+        None,
+    )
+    assert chain is not None and id(rederived[0]) in {id(x) for x in ast.walk(chain)}, (
+        "the surviving comparison is not the sm90 decode tile's `chain`; a new "
+        "query-width test appeared on the sm70 path"
+    )
+
+
 def test_the_cpu_kv_pool_keeps_mains_dtype_now_that_build_engine_passes_one():
     """``build_engine`` passes ``backend.io`` as the paged KV pool's dtype; origin/main
     passed NOTHING and the pool took ``PagedKvPool``'s bf16 default. So the branch
