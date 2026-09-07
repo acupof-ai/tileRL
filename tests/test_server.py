@@ -429,8 +429,8 @@ def test_usage_in_the_stream_is_opt_in_and_counts_tokens_not_characters(client, 
     assert all(p["choices"] for p in opted[:-1]), "only the last frame may be choices-less"
 
 
-def test_both_api_paths_wait_the_same_wall_clock_for_one_completion():
-    """The two front ends submit to one engine, so a cap that fits one fits both.
+def test_every_api_path_waits_the_same_wall_clock_for_one_completion():
+    """The front ends submit to one engine, so a cap that fits one fits all of them.
 
     They drifted: 5cdbf7e raised the OpenAI path's cap from 600 s to 1800 s and changed
     only server.py, so `/v1/messages` -- what Claude Code speaks -- kept waiting 600 s for
@@ -438,26 +438,54 @@ def test_both_api_paths_wait_the_same_wall_clock_for_one_completion():
     **withdrawn**: that was a B=8 whole-tick cost quoted per request, and a live V100
     measured a 3478-token request at 39.1 s
     (errors/2026-09-05-the-600s-that-justified-1800s-was-a-batch-tick.md). What this gate
-    asserts is unaffected, because it is about the two constants agreeing, not about which
+    asserts is unaffected, because it is about the constants agreeing, not about which
     value they agree on.
 
     Read out of the source rather than by running a 600 s request: the number is a
-    constant, and the defect was two constants that should have been one.
+    constant, and the defect was constants that should have been one.
+
+    Scanned over THREE modules, not just server.py. The earlier version read only
+    server.py, and responses.py held a third and a fourth copy of the literal it could not
+    see -- a gate aimed at two of the three routes that spell the cap. `_await_completion`
+    is the one the live V100 child actually waits on for `/v1/chat/completions`.
+
+    Two assertions, because consolidating has two failure modes: a route that spells its
+    own number (the original drift), and a route that stops referencing the shared constant
+    at all. Numeric literals only -- `[\\d_]+` also matches the leading underscore of
+    `_COMPLETION_TIMEOUT_S`, so the first draft of this gate died in `float("_")`.
     """
     import pathlib
     import re
 
     from tilerl import messages as msg
+    from tilerl import responses as rsp
     from tilerl import server as srv
 
-    text = pathlib.Path(srv.__file__).read_text()
-    caps = {float(m) for m in re.findall(r"time\.monotonic\(\) \+ ([\d_]+\.?\d*)", text)}
-    caps |= {float(m) for m in re.findall(r"timeout_s: float = ([\d_]+\.?\d*)", text)}
-    assert caps, "no wall-clock cap found in server.py; the pattern moved"
-    assert caps == {msg._COMPLETION_TIMEOUT_S}, (
-        f"server.py waits {sorted(caps)} s per completion but messages.py waits "
-        f"{msg._COMPLETION_TIMEOUT_S} s. Both submit to the same engine on the same card, "
-        f"so whichever is shorter times out work the other one tolerates."
+    NUM = r"(\d[\d_]*(?:\.\d*)?)"
+    lits: dict[str, set[float]] = {}
+    refs: dict[str, bool] = {}
+    for mod in (srv, rsp, msg):
+        text = pathlib.Path(mod.__file__).read_text()
+        found = {float(m) for m in re.findall(rf"time\.monotonic\(\) \+ {NUM}", text)}
+        found |= {float(m) for m in re.findall(rf"timeout_s: float = {NUM}", text)}
+        if found:
+            lits[mod.__name__] = found
+        refs[mod.__name__] = "_COMPLETION_TIMEOUT_S" in text
+
+    bad = {n: sorted(v) for n, v in lits.items() if v != {msg._COMPLETION_TIMEOUT_S}}
+    assert not bad, (
+        f"these modules spell their own per-completion cap instead of "
+        f"messages.py's {msg._COMPLETION_TIMEOUT_S} s: {bad}. They all submit to the same "
+        f"engine on the same card, so whichever is shorter times out work the others "
+        f"tolerate."
+    )
+    # The other half: zero literals is the goal, so `bad` is empty both when every route
+    # imports the constant and when a route quietly stopped waiting on one at all.
+    silent = sorted(n for n, ok in refs.items() if not ok)
+    assert not silent, (
+        f"{silent} no longer reference _COMPLETION_TIMEOUT_S; a route that waits on "
+        f"engine.take with no shared cap is the drift this gate exists to catch, and it "
+        f"passes the literal check by having no literal."
     )
 
 

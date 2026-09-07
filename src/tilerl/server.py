@@ -30,7 +30,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from .messages import _parse_tool_calls, mount_messages
+from .messages import _COMPLETION_TIMEOUT_S, _parse_tool_calls, mount_messages
 from .prompt import (
     cut_at_stop,
     refuse_unsupported,
@@ -230,7 +230,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         return (engine.submit(input_ids, params), len(input_ids), params.max_new_tokens,
                 bool(thinking), tools)
 
-    def _await_completion(request_id: int, timeout_s: float = 1800.0) -> list[int]:
+    def _await_completion(request_id: int,
+                          timeout_s: float = _COMPLETION_TIMEOUT_S) -> list[int]:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             # take() pops only this request: poll() would steal other
@@ -376,7 +377,7 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
 
         Blocking, by design -- it is driven from a thread on both routes.
         """
-        deadline = time.monotonic() + 1800.0
+        deadline = time.monotonic() + _COMPLETION_TIMEOUT_S
         sent = 0  # characters of the STRIPPED reply already emitted
         sent_r = 0  # characters of the reasoning already emitted
         seen = 0  # tokens already decoded, so a quiet poll costs nothing
@@ -420,7 +421,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
                         yield "delta", {"content": text[sent:]}, seen
                         sent = len(text)
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"request {request_id} did not finish within 1800.0s")
+                    raise TimeoutError(
+                        f"request {request_id} did not finish within {_COMPLETION_TIMEOUT_S}s")
                 time.sleep(0.02)
             output_ids = _await_completion(request_id)
         except (TimeoutError, RuntimeError) as exc:
