@@ -113,6 +113,12 @@ _SM90_KERNELS = {  # WGMMA schedules; the backend pads M/N to 16 and K to 32
     "gdn_chunk_o": kernels_gdn.make_gdn_chunk_o,
     "paged_attention": kernels_attn.make_paged_attention_mma,
     "paged_attention_decode": kernels_attn.make_paged_attention_decode,
+    # fp8-pool twins: same schedule, one multiply at the gather, bf16 tile
+    "paged_attention_fp8": lambda t: kernels_attn.make_paged_attention_mma(t, kv_fp8=True),
+    "paged_attention_decode_fp8": lambda t: kernels_attn.make_paged_attention_decode(
+        t, kv_fp8=True),
+    "paged_attention_decode_64_fp8": lambda t: kernels_attn.make_paged_attention_decode(
+        t, KVSPLIT=64, kv_fp8=True),
     "paged_attention_combine": kernels_attn.make_paged_attention_combine,
     # long context (>64K): 64 splits keep the per-block scan at <= 4K tokens
     "paged_attention_decode_64": lambda t: kernels_attn.make_paged_attention_decode(t, KVSPLIT=64),

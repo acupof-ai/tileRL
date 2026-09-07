@@ -19,7 +19,7 @@ two cells share is only an override when the maker differs:
 | --- | ---: | ---: | ---: | ---: |
 | cpu | 16 | — | — | — |
 | metal | 16 | 3 (`gemm_nn/nt/tn`) | 0 | 13 |
-| sm90 | 45 | 9 | 29 | 7 |
+| sm90 | 48 | 9 | 32 | 7 |
 | sm70 | 24 | 2 (`silu_mul`, `gdn_prep`) | 8 | 14 |
 
 **sm70 reuses the CPU source more than any other accelerated cell**: 14 of its
@@ -139,6 +139,7 @@ The rest of the layer (attention, norms, activations) runs the bf16 path.
 | linear_fp8_bwd (frozen dX) | eager reference | eager reference | done | pending-remote | eager reference |
 | quant_fp8 (per-token e4m3 activation) | — | — | done | pending-remote | — |
 | write_tokens_fp8 / attn_prep_fp8 (fp8 KV pool write) | torch fallback | refuse | done, card-only parity | pending-remote | torch fallback |
+| paged_attention_fp8 / _decode_fp8 / _decode_64_fp8 (fp8 KV read) | dequant at kv_layer | refuse | done | pending-remote | dequant at kv_layer |
 
 The two fp8 KV writers are the only entries whose selection is **per call, not per
 cell**: both cells register the bf16 and fp8 makers, and the pool's dtype picks one.

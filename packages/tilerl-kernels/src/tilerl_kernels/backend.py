@@ -926,19 +926,19 @@ class Backend:
     # ------------------------------------------------------------ attention
 
     def paged_attention(
-        self, q, k_cache, v_cache, block_table, seq_lens, scale, gate=None, seq_q_lens=None
+        self, q, k_cache, v_cache, block_table, seq_lens, scale, gate=None, seq_q_lens=None,
+        k_scale=None, v_scale=None
     ):
         squeeze = q.ndim == 3
         if squeeze:
             q = q.unsqueeze(1)  # [B, H, D] -> [B, 1, H, D]
-        if k_cache.dtype in _FP8_DTYPES:
-            # No attention kernel takes an fp8 operand yet, and every path below reaches
-            # _dev/_f32, which up-cast a raw fp8 plane with NO scale -- ~448x too small,
-            # finite, and plausible enough that token agreement and the logit gate both pass.
-            # Callers hand over kv_layer()'s dequantized plane; a raw one is a bug.
+        fp8 = k_cache.dtype in _FP8_DTYPES
+        if fp8 and (k_scale is None or v_scale is None):
+            # Without the scale every value reads ~448x too small: finite, plausible, and
+            # passing both the token-agreement and logit gates with the treatment absent.
             raise TypeError(
-                f"paged_attention got a raw {k_cache.dtype} K plane. Pass kv_layer()'s "
-                "dequantized plane: up-casting fp8 without its scale is silent, not an error."
+                f"paged_attention got a raw {k_cache.dtype} K plane with no scale. Pass "
+                "k_scale/v_scale, or kv_layer()'s dequantized plane."
             )
         b, s = q.shape[0], q.shape[1]
         if seq_q_lens is None:
@@ -946,9 +946,18 @@ class Backend:
         # the M tile is the GQA group at every chain position: a verify width
         # rides the decode path while g*s still fits it
         chain = s <= _MAX_VERIFY_W and s * (q.shape[2] // k_cache.shape[1]) <= 128
+        if fp8 and not self.has_kernel("paged_attention_fp8"):
+            # Every other arm reaches _f32/_dev, which up-cast the plane and DROP the scale
+            # silently. No CPU/metal/sm70 twin can exist either: tilelang's C backend has no
+            # sub-f32 type. Refuse where the fp8 maker is absent, at one place above the
+            # dispatch, rather than per arm -- the sm70 split arm has the same exposure.
+            raise NotImplementedError(
+                f"fp8 KV attention on arch {self.arch}: this cell registers no fp8 attention "
+                "maker, and casting the plane here would drop the scale"
+            )
         if self.arch == "sm90" and chain and "paged_attention_decode" in _resolve(self.precision, self.arch):
             out = self._paged_attention_decode(
-                q, k_cache, v_cache, block_table, seq_lens, seq_q_lens, scale
+                q, k_cache, v_cache, block_table, seq_lens, seq_q_lens, scale, k_scale, v_scale
             )
         elif self.arch == "sm70" and "paged_attention_split" in _resolve(
             self.precision, self.arch
@@ -986,10 +995,11 @@ class Backend:
             pad = -s % block_m
             if pad:
                 q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad))
-            out = self._kernel("paged_attention")(
+            out = self._kernel("paged_attention" + ("_fp8" if fp8 else ""))(
                 q,
-                self._dev(k_cache, torch.bfloat16),
-                self._dev(v_cache, torch.bfloat16),
+                k_cache if fp8 else self._dev(k_cache, torch.bfloat16),
+                v_cache if fp8 else self._dev(v_cache, torch.bfloat16),
+                *self._kv_scale_args(k_scale, v_scale, fp8),
                 self._i32(block_table),
                 self._i32(seq_lens),
                 self._i32(seq_q_lens),
@@ -1023,7 +1033,7 @@ class Backend:
         return out
 
     def _paged_attention_decode(self, q, k_cache, v_cache, block_table, seq_lens, seq_q_lens,
-                                scale):
+                                scale, k_scale=None, v_scale=None):
         b, w, h, d = q.shape
         hkv = k_cache.shape[1]
         g = h // hkv
@@ -1034,6 +1044,9 @@ class Backend:
         max_tokens = block_table.shape[1] * k_cache.shape[2]
         wide = 16 * hkv * b < 2 * self._sms and max_tokens >= 64 * k_cache.shape[2]
         ks, sfx = (64, "_64") if (max_tokens > 65536 or wide) else (16, "")
+        fp8 = k_cache.dtype in _FP8_DTYPES
+        if fp8:
+            sfx += "_fp8"
         key = ("attn_ws", b, hkv, d, ks, block_m)
         ws = self._ones_cache.get(key)
         if ws is None:  # static workspace: graph-capturable
@@ -1045,11 +1058,27 @@ class Backend:
         po, pm, pl = ws
         self._kernel("paged_attention_decode" + sfx)(
             self._dev(self._c(q), torch.bfloat16),
-            self._dev(k_cache, torch.bfloat16), self._dev(v_cache, torch.bfloat16),
+            k_cache if fp8 else self._dev(k_cache, torch.bfloat16),
+            v_cache if fp8 else self._dev(v_cache, torch.bfloat16),
+            *self._kv_scale_args(k_scale, v_scale, fp8),
             self._i32(block_table), self._i32(seq_lens), self._i32(seq_q_lens),
             po, pm, pl, float(scale), int(k_cache.shape[2]), block_m,
         )
-        return self._kernel("paged_attention_combine" + sfx)(po, pm, pl, g, w)
+        return self._kernel("paged_attention_combine" + sfx.replace("_fp8", ""))(po, pm, pl, g, w)
+
+    def _kv_scale_args(self, k_scale, v_scale, fp8: bool):
+        """The (KScale, VScale) operand pair. Off fp8 both makers still take them, so the
+        argument list has one shape; a 1-element dummy is cheaper than two kernel variants."""
+        if not fp8:
+            d = self._ones_cache.get("kv_scale_dummy")
+            if d is None:
+                d = self._ones_cache["kv_scale_dummy"] = torch.ones(
+                    1, dtype=torch.float32, device=self.device)
+            return d, d
+        if k_scale is None or v_scale is None:
+            raise ValueError("an fp8 KV plane needs its k_scale/v_scale; passing the pool's "
+                             "raw planes without them would read every value ~448x too small")
+        return k_scale.contiguous(), v_scale.contiguous()
 
     def attention(self, q, k, v, scale, gate=None, q_pos=None, k_pos=None):
         """Dense causal GQA attention (training path). q [B,Tq,H,D], k/v [B,Tk,H,D].

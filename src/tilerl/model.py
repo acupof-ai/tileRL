@@ -196,6 +196,23 @@ def _gdn_cp(backend, cfg, q, k, v, a_proj, b_proj, state, window, kwargs):
     return torch.cat(outs, dim=1), last[1], last[2] if window is not None else None
 
 
+def _kv_operands(backend, kv, layer_idx: int):
+    """(k, v, k_scale, v_scale) for attention: raw fp8 planes where a cell can read them,
+    dequantized ones where it cannot.
+
+    The fallback is not free -- kv_layer() dequantizes every block of the plane, 0.1 ms to
+    87.5 ms per tick at the 27B's shape -- so it is correctness for the CPU cell (whose C
+    backend has no sub-f32 type at all), not a performance path.
+    """
+    pool = kv.kv_pool
+    if pool.kv_fp8 is None or getattr(backend, "has_kernel", lambda _n: False)(
+        "paged_attention_fp8"
+    ):
+        return pool.kv_operands(layer_idx)
+    k, v = pool.kv_layer(layer_idx)
+    return k, v, None, None
+
+
 def _refuse_cp_serving(backend: Backend) -> None:
     """CP is training-only. The paged pool holds whole sequences, so a cp rank
     would attend its own chunk's KV and call it the prefix — a plausible-looking
@@ -288,10 +305,11 @@ class Model:
             if qn is not None:  # sm90: norm+rope+kv-write in one launch
                 gate = autograd.slice(autograd.reshape(
                     autograd.slice(qkv, ..., slice(0, q_rows)), b, t, hq, 2, d), ..., 1, slice(None))
-                k_plane, v_plane = kv.kv_pool.kv_layer(layer_idx)
+                k_plane, v_plane, ks, vs = _kv_operands(backend, kv, layer_idx)
                 out = backend.paged_attention(
                     qn, k_plane, v_plane, kv.block_table, kv.seq_len, 1.0 / math.sqrt(d),
                     gate=gate, seq_q_lens=getattr(kv, "seq_q_lens", None),
+                    k_scale=ks, v_scale=vs,
                 )
                 return self._add_via(backend, kv, x, autograd.reshape(out, b, t, hq * d), f"{p}.o_proj")
             q = autograd.slice(qkv, ..., slice(0, q_rows))
@@ -339,7 +357,7 @@ class Model:
         else:
             _refuse_cp_serving(backend)
             backend.write_tokens(k, v, kv, layer_idx)
-            k_plane, v_plane = kv.kv_pool.kv_layer(layer_idx)
+            k_plane, v_plane, ks, vs = _kv_operands(backend, kv, layer_idx)
             out = backend.paged_attention(
                 q,
                 k_plane,
@@ -349,6 +367,8 @@ class Model:
                 1.0 / math.sqrt(d),
                 gate=gate,
                 seq_q_lens=getattr(kv, "seq_q_lens", None),
+                k_scale=ks,
+                v_scale=vs,
             )
         return self._add_via(backend, kv, x, autograd.reshape(out, b, t, hq * d), f"{p}.o_proj")
 

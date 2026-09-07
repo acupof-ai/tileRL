@@ -107,14 +107,27 @@ class PagedKvPool:
         return self._plane[layer_idx]
 
     def kv_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The attention operands for a layer. Off fp8 these are the pool planes themselves.
+
+        Under fp8 this DEQUANTIZES the whole plane, every block, allocating two f32 copies of
+        the entire pool -- 0.1 ms to 87.5 ms per tick at the 27B's shape, measured, because
+        the cost is proportional to num_blocks and not to the sequence. Use
+        :meth:`kv_operands` on any path that has a kernel able to read fp8; this stays for
+        readers that cannot (the CPU cell, whose C backend has no sub-f32 type) and for tests.
+        """
         p = self._plane[layer_idx]
         if self.kv_fp8 is None:
             return self.k_pool[p], self.v_pool[p]
-        # ponytail: dequantizes the WHOLE plane per call, so the flag is a correctness
-        #   vehicle until the fp8 maker parameter lands and reads the fp8 operand directly
         _, dequant = _kv_fp8_ref()
         return (dequant(self.k_pool[p : p + 1], self.k_scale[p : p + 1])[0].to(self.dtype),
                 dequant(self.v_pool[p : p + 1], self.v_scale[p : p + 1])[0].to(self.dtype))
+
+    def kv_operands(self, layer_idx: int) -> tuple[torch.Tensor, ...]:
+        """``(k, v, k_scale, v_scale)`` -- the raw planes, no copy, scales None off fp8."""
+        p = self._plane[layer_idx]
+        if self.kv_fp8 is None:
+            return self.k_pool[p], self.v_pool[p], None, None
+        return self.k_pool[p], self.v_pool[p], self.k_scale[p], self.v_scale[p]
 
     @property
     def bytes_per_token(self) -> int:

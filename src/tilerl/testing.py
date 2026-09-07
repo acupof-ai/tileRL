@@ -214,8 +214,12 @@ class RefBackend:
         kv.kv_pool.write_tokens(k, v, kv, layer_idx)  # the pool loop is the reference semantics
 
     def paged_attention(
-        self, q, k_pool, v_pool, block_table, seq_lens, scale, gate=None, seq_q_lens=None
+        self, q, k_pool, v_pool, block_table, seq_lens, scale, gate=None, seq_q_lens=None,
+        k_scale=None, v_scale=None
     ):
+        # k_scale/v_scale are accepted and must be None: RefBackend has no has_kernel, so
+        # `_kv_operands` routes it through the dequantizing kv_layer() and never sends raw fp8.
+        assert k_scale is None and v_scale is None, "RefBackend takes dequantized KV planes"
         b, t, hq, d = q.shape
         hkv = k_pool.shape[1]
         rep = hq // hkv

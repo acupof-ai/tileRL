@@ -85,11 +85,39 @@ def q2_writers() -> dict:
     want_k, want_ks = reference.quant_kv_fp8(
         k.permute(0, 2, 1, 3).reshape(B, H, S, D).unsqueeze(0), torch.float8_e4m3fn)
     got = kp[bt[:, 0].long()][:, :, :S]
-    out["kernel_vs_reference_bitexact"] = torch.equal(
-        got.view(torch.uint8).cpu(), want_k[0].view(torch.uint8).cpu())
+    gb, wb = got.view(torch.uint8).cpu(), want_k[0].view(torch.uint8).cpu()
+    out["kernel_vs_reference_bitexact"] = torch.equal(gb, wb)
+    # Not bit-exact is expected if the scale differs by an ulp -- report HOW it differs, so
+    # "false" is a tolerance question rather than a wrong-kernel question. One e4m3 step is
+    # one byte of mantissa, so a differing byte off by 1 is a rounding tie, not a bug.
+    diff = (gb.int() - wb.int()).abs()
+    out["bytes_differing_frac"] = float((diff > 0).float().mean())
+    out["byte_diff_max"] = int(diff.max())
+    # A 1-code difference is only benign if it is a TIE: x/s exactly at the midpoint between
+    # two e4m3 codes, where T.cast and torch .to may round opposite ways. Measure it -- take
+    # the pre-quantization value, find the two codes bracketing it, and check it sits at the
+    # midpoint. Anything not a tie is a real disagreement, however small the byte delta.
+    where = diff > 0
+    if bool(where.any()):
+        s_b = ks[bt[:, 0].long()][:, :, :S]
+        pre = (k.permute(0, 2, 1, 3).float() / s_b[..., None]).cpu()[where].abs()
+        lo = torch.minimum(gb[where], wb[where]).view(torch.float8_e4m3fn).float().abs()
+        hi = torch.maximum(gb[where], wb[where]).view(torch.float8_e4m3fn).float().abs()
+        # relative distance from the midpoint, in units of the gap between the two codes
+        off = (pre - (lo + hi) / 2).abs() / (hi - lo).abs().clamp_min(1e-30)
+        out["tie_offset_max"] = float(off.max())
+        out["all_differences_are_ties"] = bool(off.max() < 1e-3)
+    else:
+        out["tie_offset_max"] = 0.0
+        out["all_differences_are_ties"] = True
     out["scale_max_rel"] = float(
         ((ks[bt[:, 0].long()][:, :, :S] - want_ks[0]).abs()
          / want_ks[0].abs().clamp_min(1e-30)).max())
+    # and the dequantized values against the TRUTH, which is what actually matters
+    deq_k = got.float() * ks[bt[:, 0].long()][:, :, :S, None]
+    ref_deq = want_k[0].float() * want_ks[0][..., None]
+    out["kernel_vs_reference_dequantized_max_rel"] = float(
+        ((deq_k - ref_deq).abs() / ref_deq.abs().clamp_min(1e-9)).max())
     # the append property: token 0 must not be re-rounded by the 7 that follow
     deq = kp[bt[:, 0].long()][:, :, :S].float() * ks[bt[:, 0].long()][:, :, :S, None]
     truth = k.permute(0, 2, 1, 3).float()
@@ -99,18 +127,101 @@ def q2_writers() -> dict:
     return out
 
 
+def q3_readers() -> dict:
+    """The fp8 attention readers against the SAME kernel on a bf16 pool.
+
+    The oracle is the bf16 pool through the bf16 maker, not a reimplementation: same q, same
+    block table, the pool's dtype the only difference. Two numbers, because they fail
+    differently -- max relative logit error, and absolute error over the row's amax, which is
+    what bounds the attention score (per-element relative error on an fp8 grid is unbounded
+    near zero by construction).
+    """
+    from tilerl_kernels import reference
+    from tilerl_kernels.backend import get_backend
+
+    be = get_backend()
+    out: dict = {"arch": be.arch}
+    B, S, Hq, Hkv, D, NB, BS = 1, 64, 8, 2, 64, 8, 16
+    q = torch.randn(B, S, Hq, D, device=be.device, dtype=torch.bfloat16) * 0.1
+    kv = torch.randn(NB, Hkv, BS, D, device=be.device, dtype=torch.bfloat16) * 0.1
+    vv = torch.randn(NB, Hkv, BS, D, device=be.device, dtype=torch.bfloat16) * 0.1
+    bt = torch.arange(NB, device=be.device, dtype=torch.int32).reshape(B, NB)
+    sl = torch.full((B,), S, device=be.device, dtype=torch.int32)
+    scale = 1.0 / (D ** 0.5)
+
+    # the fp8 arm reads the quantized pool; the oracle reads the DEQUANTIZED one, so the only
+    # difference is the rounding, not a different tensor
+    kq, ks = reference.quant_kv_fp8(kv.unsqueeze(0), torch.float8_e4m3fn)
+    vq, vs = reference.quant_kv_fp8(vv.unsqueeze(0), torch.float8_e4m3fn)
+    kq, ks, vq, vs = kq[0], ks[0], vq[0], vs[0]
+    k_deq = (kq.float() * ks[..., None]).to(torch.bfloat16)
+    v_deq = (vq.float() * vs[..., None]).to(torch.bfloat16)
+
+    ref = be.paged_attention(q, k_deq, v_deq, bt, sl, scale, seq_q_lens=sl)
+    got = be.paged_attention(q, kq, vq, bt, sl, scale, seq_q_lens=sl, k_scale=ks, v_scale=vs)
+    r, g = ref.float(), got.float()
+    out["shape"] = list(g.shape)
+    out["max_abs_err"] = float((g - r).abs().max())
+    out["max_rel_err"] = float(((g - r).abs() / r.abs().clamp_min(1e-9)).max())
+    out["err_over_amax"] = float((g - r).abs().max() / r.abs().max())
+    # non-vacuous: a WRONG scale must move the output, or this compares two identical paths
+    bad = be.paged_attention(q, kq, vq, bt, sl, scale, seq_q_lens=sl,
+                             k_scale=ks.roll(1, 0), v_scale=vs)
+    out["scale_roll_moves_output"] = not torch.allclose(bad.float(), g, atol=1e-6)
+    return out
+
+
 def main() -> int:
     print(f"torch {torch.__version__}, cuda {torch.cuda.is_available()}, "
           f"device {torch.cuda.get_device_name(0) if torch.cuda.is_available() else '-'}",
           flush=True)
     results: dict = {}
-    for name, fn in (("q1_scalar_fp8_load", q1_scalar_fp8_load), ("q2_writers", q2_writers)):
+    torch.manual_seed(7)
+    try:
+        results["q1_scalar_fp8_load"] = q1_scalar_fp8_load()
+        print(f"\nq1_scalar_fp8_load: {json.dumps(results['q1_scalar_fp8_load'], sort_keys=True)}",
+              flush=True)
+    except Exception as exc:  # noqa: BLE001 -- the failure text IS the answer here
+        results["q1_scalar_fp8_load"] = {"failed": f"{type(exc).__name__}: {exc}"}
+        print(f"\nq1_scalar_fp8_load FAILED: {type(exc).__name__}: {exc}", flush=True)
+
+    # 8 seeds, because unseeded this arm read bitexact=false on one run and true on the next:
+    # the difference was the DRAW. One seed would only move which answer gets reported, so
+    # the claim is over seeds -- if any draw is not bit-exact, that is a tie-break question
+    # and byte_diff_max says whether it is one e4m3 step or something worse.
+    arms = []
+    for seed in range(8):
+        torch.manual_seed(seed)
         try:
-            results[name] = fn()
-            print(f"\n{name}: {json.dumps(results[name], sort_keys=True)}", flush=True)
-        except Exception as exc:  # noqa: BLE001 -- the failure text IS the answer here
-            results[name] = {"failed": f"{type(exc).__name__}: {exc}"}
-            print(f"\n{name} FAILED: {type(exc).__name__}: {exc}", flush=True)
+            arms.append({"seed": seed, **q2_writers()})
+        except Exception as exc:  # noqa: BLE001
+            arms.append({"seed": seed, "failed": f"{type(exc).__name__}: {exc}"})
+            print(f"\nq2_writers seed={seed} FAILED: {type(exc).__name__}: {exc}", flush=True)
+            break
+    ok = [a for a in arms if "failed" not in a]
+    results["q2_writers"] = {
+        "seeds": len(arms),
+        "bitexact_all_seeds": bool(ok) and all(a["kernel_vs_reference_bitexact"] for a in ok),
+        "byte_diff_max_over_seeds": max((a["byte_diff_max"] for a in ok), default=None),
+        "bytes_differing_frac_max": max((a["bytes_differing_frac"] for a in ok), default=None),
+        "all_differences_are_ties": bool(ok) and all(a["all_differences_are_ties"] for a in ok),
+        "tie_offset_max_over_seeds": max((a["tie_offset_max"] for a in ok), default=None),
+        "scale_max_rel_over_seeds": max((a["scale_max_rel"] for a in ok), default=None),
+        "token0_max_rel_over_seeds": max((a["token0_max_rel"] for a in ok), default=None),
+        "arms": arms,
+    }
+    print(f"\nq2_writers over {len(arms)} seeds: "
+          f"{json.dumps({k: v for k, v in results['q2_writers'].items() if k != 'arms'}, sort_keys=True)}",
+          flush=True)
+
+    torch.manual_seed(11)
+    try:
+        results["q3_readers"] = q3_readers()
+        print(f"\nq3_readers: {json.dumps(results['q3_readers'], sort_keys=True)}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        results["q3_readers"] = {"failed": f"{type(exc).__name__}: {exc}"}
+        print(f"\nq3_readers FAILED: {type(exc).__name__}: {exc}", flush=True)
+
     print("\n" + json.dumps(results, sort_keys=True), flush=True)
     return 0
 

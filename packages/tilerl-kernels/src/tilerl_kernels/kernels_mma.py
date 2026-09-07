@@ -114,30 +114,34 @@ def make_write_tokens_fp8(target: str):
                 off = pos % block_size
                 tid = T.get_thread_binding(0)
                 # strided partials then one shared reduce, not T.serial(D) per thread: the
-                # redundant-loop form cost gdn_prep 4.89x (see registry sm70 notes)
+                # redundant-loop form cost gdn_prep 4.89x (see registry sm70 notes).
+                # Two 1-element fragments, not one of size 2: a fragment is per-thread and
+                # tilelang allows only fragment[0].
                 red = T.alloc_shared((threads, 2), "float32")
-                part = T.alloc_fragment((2,), "float32")
-                part[0] = 0.0
-                part[1] = 0.0
+                pk = T.alloc_fragment((1,), "float32")
+                pv = T.alloc_fragment((1,), "float32")
+                pk[0] = 0.0
+                pv[0] = 0.0
                 for i in T.serial(T.ceildiv(D, threads)):
                     d = tid + i * threads
                     if d < D:
                         kv = T.cast(K[b, t, h, d], "float32")
                         vv = T.cast(V[b, t, h, d], "float32")
-                        part[0] = T.max(part[0], T.max(kv, 0.0 - kv))
-                        part[1] = T.max(part[1], T.max(vv, 0.0 - vv))
-                red[tid, 0] = part[0]
-                red[tid, 1] = part[1]
+                        pk[0] = T.max(pk[0], T.max(kv, 0.0 - kv))
+                        pv[0] = T.max(pv[0], T.max(vv, 0.0 - vv))
+                red[tid, 0] = pk[0]
+                red[tid, 1] = pv[0]
                 T.tvm_storage_sync("shared")
                 if tid == 0:
-                    m = T.alloc_fragment((2,), "float32")
-                    m[0] = 0.0
-                    m[1] = 0.0
+                    mk = T.alloc_fragment((1,), "float32")
+                    mv = T.alloc_fragment((1,), "float32")
+                    mk[0] = 0.0
+                    mv[0] = 0.0
                     for i in T.serial(threads):
-                        m[0] = T.max(m[0], red[i, 0])
-                        m[1] = T.max(m[1], red[i, 1])
-                    red[0, 0] = T.max(m[0], 1e-12) / FP8_MAX
-                    red[0, 1] = T.max(m[1], 1e-12) / FP8_MAX
+                        mk[0] = T.max(mk[0], red[i, 0])
+                        mv[0] = T.max(mv[0], red[i, 1])
+                    red[0, 0] = T.max(mk[0], 1e-12) / FP8_MAX
+                    red[0, 1] = T.max(mv[0], 1e-12) / FP8_MAX
                 T.tvm_storage_sync("shared")
                 ks = red[0, 0]
                 vs = red[0, 1]
@@ -314,27 +318,29 @@ def make_attn_prep_fp8(target: str):
                 T.tvm_storage_sync("shared")
                 tid = T.get_thread_binding(0)
                 red = T.alloc_shared((threads, 2), "float32")
-                part = T.alloc_fragment((2,), "float32")
-                part[0] = 0.0
-                part[1] = 0.0
+                pk = T.alloc_fragment((1,), "float32")
+                pv = T.alloc_fragment((1,), "float32")
+                pk[0] = 0.0
+                pv[0] = 0.0
                 for i in T.serial(T.ceildiv(D, threads)):
                     d = tid + i * threads
                     if d < D:
                         vv = T.cast(QKV[b, t, v0 + d], "float32")
-                        part[0] = T.max(part[0], T.max(Ks[d], 0.0 - Ks[d]))
-                        part[1] = T.max(part[1], T.max(vv, 0.0 - vv))
-                red[tid, 0] = part[0]
-                red[tid, 1] = part[1]
+                        pk[0] = T.max(pk[0], T.max(Ks[d], 0.0 - Ks[d]))
+                        pv[0] = T.max(pv[0], T.max(vv, 0.0 - vv))
+                red[tid, 0] = pk[0]
+                red[tid, 1] = pv[0]
                 T.tvm_storage_sync("shared")
                 if tid == 0:
-                    m = T.alloc_fragment((2,), "float32")
-                    m[0] = 0.0
-                    m[1] = 0.0
+                    mk = T.alloc_fragment((1,), "float32")
+                    mv = T.alloc_fragment((1,), "float32")
+                    mk[0] = 0.0
+                    mv[0] = 0.0
                     for i in T.serial(threads):
-                        m[0] = T.max(m[0], red[i, 0])
-                        m[1] = T.max(m[1], red[i, 1])
-                    red[0, 0] = T.max(m[0], 1e-12) / FP8_MAX
-                    red[0, 1] = T.max(m[1], 1e-12) / FP8_MAX
+                        mk[0] = T.max(mk[0], red[i, 0])
+                        mv[0] = T.max(mv[0], red[i, 1])
+                    red[0, 0] = T.max(mk[0], 1e-12) / FP8_MAX
+                    red[0, 1] = T.max(mv[0], 1e-12) / FP8_MAX
                 T.tvm_storage_sync("shared")
                 ks = red[0, 0]
                 vs = red[0, 1]
