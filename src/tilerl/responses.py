@@ -35,7 +35,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .messages import _parse_tool_calls
+from .messages import _COMPLETION_TIMEOUT_S, _parse_tool_calls
 from .prompt import (
     cut_at_stop,
     refuse_unsupported,
@@ -178,7 +178,7 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
         params = sampling(tokenizer, thinking, max_new,
                           temperature=req.temperature, top_p=req.top_p, stop=req.stop)
         rid = engine.submit(input_ids, params)
-        deadline = time.monotonic() + 1800.0
+        deadline = time.monotonic() + _COMPLETION_TIMEOUT_S
         out = None
         while time.monotonic() < deadline:
             out = engine.take(rid)
@@ -186,7 +186,7 @@ def mount_responses(app: FastAPI, engine: Any, tokenizer: Tokenizer,
                 break
             time.sleep(0.02)
         if out is None:
-            raise TimeoutError(f"request {rid} did not finish within 1800.0s")
+            raise TimeoutError(f"request {rid} did not finish within {_COMPLETION_TIMEOUT_S}s")
         reasoning, text = split_think(tokenizer.decode(out), bool(thinking))
         stopped = engine.stop_text(rid)
         text, calls = _parse_tool_calls(cut_at_stop(text, stopped), tools)

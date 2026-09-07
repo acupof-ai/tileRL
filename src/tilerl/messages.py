@@ -61,14 +61,9 @@ _RECORD_ENV = "TILERL_MESSAGES_RECORD"
 #: The episode tag, set per rollout via ANTHROPIC_CUSTOM_HEADERS.
 _ROLLOUT_HEADER = "x-tilerl-rollout"
 
-#: Wall-clock cap on one completion, shared with server.py's `_await_completion` -- one
-#: policy, and they drifted once already (5cdbf7e raised the OpenAI path only, leaving
-#: this one at 600). The 1800 is not derived from a measurement: 5cdbf7e cited "a 4K
-#: prefill takes ~600 s", and that was a B=8 whole-tick cost quoted per request, withdrawn
-#: after a live V100 measured a 3478-token request at 39.1 s. Kept at 1800 anyway, since
-#: this is the ceiling for a request the scheduler may hold behind a full batch, not the
-#: cost of one; nothing has measured that, so lowering it would trade a known-slack cap
-#: for a guessed one.
+#: Wall-clock cap for every route that waits on `engine.take`; not derived, but one queued
+#: request measured 518.6 s on a 2048-block pool, so two deep fit and three would not
+#: (errors/2026-09-07-a-prompt-that-does-not-fit-yet-is-queued.md).
 _COMPLETION_TIMEOUT_S = 1800.0
 
 
