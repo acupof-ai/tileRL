@@ -80,10 +80,12 @@ With a verify row at 10.7 ms against a 30.9 ms token, depth 3 pays:
 | dialogue | 31.9 | 32.0 | 1.00x |
 | thinking | 32.0 | 30.2 | 0.94x |
 
-52.7 is 94% of the 56.1 tok/s *dense* weight roofline, and **32-42% of the
-ceiling that applies to a speculative rate** — 2.95 tok/forward means a weight
-bound on forwards permits 126-166 tok/s, so the "82% of 64" this entry first
-carried overstated by 2.95x on top of a retired denominator
+52.7 is 94% of the 56.1 tok/s *dense* weight roofline, and **38.2% of the
+ceiling that applies to a speculative rate** — 2.95 tok/forward over a 19.24 GB
+depth-3 tick means a weight bound on forwards permits 138.0 tok/s, so the "82% of
+64" this entry first carried overstated by 2.95x on top of a retired denominator.
+The draft forward's 1.065 GB was measured 2026-09-06, which replaced an earlier
+32-42% bracket with the single figure
 (`errors/2026-09-06-a-spec-rate-over-a-dense-roofline.md`). Counting is also near-zero-entropy
 under greedy decode — coding at 1.33x is the honest headline. A first reading
 of 1.3 tok/s was a warmup artifact in the bench, not the engine
