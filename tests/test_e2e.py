@@ -3276,3 +3276,69 @@ def test_the_tier_read_rate_keeps_moving_after_the_first_fetch(tmp_path):
         f"n* did not rise as B fell ({n_warm} -> {n_cold} at R={rate:.0f}): the warm-start "
         "over-permit closes only if the later fetches move the estimate"
     )
+
+
+@pytest.mark.parametrize(
+    "extra, back_off",
+    [(9, 0), (1, 1)],
+    ids=["tail9", "tail1-backs-off-a-block"],
+)
+def test_a_ragged_prompt_spills_a_prompt_only_entry(tmp_path, extra, back_off):
+    """The DISK entry must be prompt-only, because that is the one a client can replay.
+
+    `spill=False` on mid-chunk publishes (the 8.96% write-through win) means the only
+    entry reaching disk came from the prompt-complete branch, which fired only at
+    `len(prompt) % 16 == 0`. For the other 15 of 16 lengths the sole disk entry was the
+    DECODE one -- prompt PLUS generated text -- which no client can reproduce:
+    `blocks_to_text` strips reasoning from replayed history by design (`prompt.py:65-77`)
+    and the prompt tail contributes `<think>\n`. Measured on card 1: `first_diff` 2727,
+    stored `[248068 '<think>', 198 '\n']`, every bench arm 0 SSD hits.
+
+    Asserted on the SPILLED tokens, not on `prefix_hits`: the HBM store still holds the
+    mid-chunk publishes, so an in-memory hit happens with or without this fix and a test
+    reading `prefix_hits` passes either way (measured -- that was this test's first
+    draft).
+    """
+    import glob
+
+    cfg = tiny()
+    params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=5)
+    rng = np.random.default_rng(23)
+    plen = 9 * BLOCK_TOKENS + extra
+    # tail 1 cannot be its own chunk (T=1 prefill divides by a zero block size), so the
+    # cut backs off one block and the spilled entry is one block shorter.
+    aligned = (plen // BLOCK_TOKENS - back_off) * BLOCK_TOKENS
+    conv = rng.integers(3, 320, size=plen).astype(np.int64)
+
+    engine = build_engine(
+        cfg, build_random(cfg, seed=31), get_backend(), num_blocks=64, num_slots=4,
+        max_batch=4, max_total_tokens=2048, ssd_path=str(tmp_path),
+        ssd_min_tokens=BLOCK_TOKENS,
+    )
+    engine.submit(conv, params)
+    for _ in range(200):
+        engine.step()
+        if not (list(engine._running) + list(engine._waiting)):
+            break
+    engine.poll()
+    for _ in range(400):                       # the write is off-tick
+        if engine.stats()["ssd_entries"] >= 1:
+            break
+        time.sleep(0.01)
+
+    spilled = sorted(glob.glob(str(tmp_path / "tilerl_kvtier" / "*.kv")))
+    assert spilled, f"a {plen}-token prompt spilled nothing at all"
+    lengths = sorted(len(torch.load(f, map_location="cpu")["tokens"]) for f in spilled)
+    assert aligned in lengths, (
+        f"spilled {lengths}, none of them the prompt-only entry at {aligned}. The only "
+        f"disk entry is prompt+reply, which a replayed turn 2 cannot reproduce"
+    )
+    # The cut adds a publish POINT, not a write-through per boundary: every boundary but
+    # the last is `spill=False`, so nothing SHORTER than the last one reaches disk. Not
+    # `ssd_offered == 1` -- this prompt generates 4 tokens and never crosses a decode
+    # boundary, so a count assertion reads as "one offer per request" where the card
+    # measures 2 (prompt boundary + decode boundary).
+    assert not [n for n in lengths if n < aligned], (
+        f"spilled {lengths}: everything below {aligned} is a mid-prefill boundary the "
+        f"last one supersedes, and each write is a D2H of the whole prefix"
+    )

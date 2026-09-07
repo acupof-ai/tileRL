@@ -54,6 +54,15 @@ from .kv_cache import (
 from .spec import _PREFILL_BUCKET, LADDER_WIDTHS
 
 
+def _last_prefill_boundary(n: int) -> int:
+    """Where `_pick` ends the final prefill chunk of an `n`-token prompt, 0 if aligned."""
+    tail = n % BLOCK_TOKENS
+    if not tail:
+        return 0                       # the prompt-complete branch handles it
+    end = (n // BLOCK_TOKENS) * BLOCK_TOKENS
+    return end - BLOCK_TOKENS if tail == 1 else end
+
+
 def _graph_on(backend, decode_graph: bool | None) -> bool:
     """The captured decode tick is on by default on CUDA only. One definition:
     ``build_engine`` sizes the pools for the pad row from the same answer the
@@ -750,6 +759,17 @@ class Engine:
             aligned = (chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
             if r.prefill_from == 0 and aligned and aligned != chunk:
                 chunk = aligned
+            # Cut the last chunk to a block boundary so the prompt-only publish lands at a
+            # real chunk end; slicing an entry below its state snapshot is wrong.
+            end = r.prefill_from + chunk
+            tail = end % BLOCK_TOKENS
+            short = (end // BLOCK_TOKENS) * BLOCK_TOKENS - r.prefill_from
+            if end == len(r.tokens) and tail and short > 0:
+                # A 1-token tail reaches the kernels with a zero block size, so back off.
+                if tail == 1:
+                    short -= BLOCK_TOKENS
+                if short > 0:
+                    chunk = short  # the <=17-token tail becomes one more forward
             # Rows pad to a shared width: pack only within one bucket.
             b = -(-chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
             if prefills and b != bucket:
@@ -998,14 +1018,11 @@ class Engine:
             if pf.prefill_from >= len(pf.tokens):
                 done.append((pf, logits[base + k, min(c, logits.shape[1]) - 1], 0))
             elif pf.prefill_from % BLOCK_TOKENS == 0:
-                # A chunk end IS a state-pool boundary: nothing has been sampled yet, so
-                # the slot holds exactly tokens[:prefill_from]. This is the publish that
-                # makes a ragged prompt shareable -- `_pick` cut the chunk short for it.
-                # An intermediate chunk boundary: the prompt-complete publish below covers
-                # the same tokens and more, so this one is not offered to disk. Measured on
-                # H20 card 6, spilling all six publishes of a 2729-token prompt cost 0.925 s
-                # of a 2.041 s request against 0.180 s for the last one alone.
-                self._publish_prefix(pf, pf.prefill_from, spill=False)
+                # A chunk end is a state-pool boundary, so the snapshot is exact here.
+                # Only the last boundary reaches disk; ask `_pick` where it is, since a
+                # remaining-length test misreads the backed-off 17-token tail.
+                last = pf.prefill_from == _last_prefill_boundary(len(pf.tokens))
+                self._publish_prefix(pf, pf.prefill_from, spill=last)
         if not done:
             return
         self._sample_commit(done)
