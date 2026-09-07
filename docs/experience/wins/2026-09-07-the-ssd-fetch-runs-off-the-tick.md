@@ -65,6 +65,19 @@ requests wait on a fetch would move it to first and this reasoning would need re
 `NEVER_FETCH` sentinel, so a reader is never handed 2147483648 to compare against a
 prompt length.
 
+**And the gate for that first shipped in the shape this entry's own Rule warns
+about.** It asserted only that a tier-less engine publishes `null` — an assertion a
+stats line hardcoded to `None` also satisfies. Measured, not argued: replacing the
+whole expression with a literal `None` leaves the **full suite green, 461 passed**.
+Nothing in the tree could tell "publishes null when the sentinel comes back" from
+"publishes null always".
+
+The arm that fixes it is the finite one: a store answering with a real `n*` must
+reach `/health` as the number, which fails `assert None == 73` on the mutant. So the
+Rule below generalises past thresholds — a gate on a *mapping* needs a case on each
+side of the map, and the side that reads as "nothing to see" is the one that goes
+unwritten.
+
 ## Off the tick
 
 `submit` issues the prefetch: roll the hash, probe `resident()`, enqueue. It takes

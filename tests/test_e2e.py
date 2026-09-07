@@ -33,6 +33,7 @@ from tilerl.engine import (
     build_engine,
 )
 from tilerl.kv_cache import (
+    NEVER_FETCH,
     DramSnapshots,
     KvTier,
     NoPrefixStore,
@@ -3162,7 +3163,7 @@ def test_the_break_even_refuses_a_prefix_below_it_and_the_deadline_drops_a_slow_
     # finite number and the tier fetches into a loss forever.
     k = 2 * pool.num_layers * pool.num_kv_heads * pool.head_dim * pool.k_pool.element_size()
     tier.fetch_ms, tier.fetch_bytes = 1000.0, k          # 1 token/s of bandwidth
-    assert store.break_even_tokens(2.0) == 1 << 31, (
+    assert store.break_even_tokens(2.0) == NEVER_FETCH, (
         "with the device slower per byte than the card is per token, fetching never wins "
         "at any length; a finite break-even here means the k/B term is missing"
     )
@@ -3185,10 +3186,32 @@ def test_health_reports_never_prefetch_as_null_not_the_sentinel():
     A default engine has no SSD tier, so no length pays and the store answers with
     the sentinel. Publishing 2147483648 there invites a reader to compare it against
     a prompt length; null says "never" in the one way that cannot be misread.
+
+    Both directions, because one of them cannot fail on its own: a `stats()` line
+    hardcoded to `None` satisfies the null arm and the whole suite (measured -- the
+    mutant is green), so a null here is only evidence the branch works if a finite
+    n* is also shown to survive it.
     """
     eng = _build_engine(seed=7)
     assert eng.stats()["prefix_break_even_tokens"] is None, (
         "no tier, so nothing can be fetched, but /health published a token count"
+    )
+
+    # The other direction, on the same wire: a store that answers with a finite n*
+    # must reach /health as the number rather than as null.
+    keys = dict.fromkeys(eng._prefix.stats(), 0)   # before the swap: the stub reads no store
+
+    class _Store:
+        def stats(self):
+            return dict(keys)
+
+        def break_even_tokens(self, rate):
+            return 73
+
+    eng._prefix = _Store()
+    assert eng.stats()["prefix_break_even_tokens"] == 73, (
+        "a finite break-even was published as null, so /health cannot distinguish "
+        "'never fetch' from 'fetch above 73 tokens'"
     )
 
 
@@ -3285,7 +3308,7 @@ def test_the_tier_read_rate_keeps_moving_after_the_first_fetch(tmp_path):
     n_warm = store.break_even_tokens(rate)
     tier.fetch_ms, tier.fetch_bytes = cold_tier.fetch_ms, cold_tier.fetch_bytes
     n_cold = store.break_even_tokens(rate)
-    assert 0 < n_warm < n_cold < 1 << 31, (
+    assert 0 < n_warm < n_cold < NEVER_FETCH, (
         f"n* did not rise as B fell ({n_warm} -> {n_cold} at R={rate:.0f}): the warm-start "
         "over-permit closes only if the later fetches move the estimate"
     )
