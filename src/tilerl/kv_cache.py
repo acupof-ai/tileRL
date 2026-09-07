@@ -672,11 +672,7 @@ class KvTier:
         if blob.get("tokens") != tuple(tokens):
             return False  # hash collision: these bytes belong to a different prefix
         self._touch_lru(key)
-        # Two index_copy_ calls, not two per block. The blob is [nblocks, planes, ...] and
-        # the pool is [planes, nblocks, ...], so the permuted view is what index_copy_
-        # reads -- strided on the host side, one launch per plane-major tensor. At 30k
-        # tokens the per-block loop was 3,750 copies of 512 KiB each; the fetch this feeds
-        # runs on a side stream, where launch count is the cost that does not overlap.
+        # one index_copy_ per plane: the per-block loop was 3,750 launches at 30k tokens
         idx = torch.as_tensor(list(blocks), device=pool.device)
         pool.k_pool.index_copy_(1, idx, blob["k"].permute(1, 0, 2, 3, 4).to(pool.device))
         pool.v_pool.index_copy_(1, idx, blob["v"].permute(1, 0, 2, 3, 4).to(pool.device))
