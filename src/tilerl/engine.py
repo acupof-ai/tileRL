@@ -445,7 +445,9 @@ class Engine:
             _serve_draft(draft, backend)
             if backend.arch == "sm70":
                 self._warn_sm70_ladder(limits.max_batch, self._width)
-            draft.attach(backend, kv_pool.num_blocks, dtype=kv_pool.k_pool.dtype)
+            # .dtype, not k_pool.dtype: under kv_fp8 the latter is the fp8 store dtype, and
+            # the draft pool has no scale plane, so it would hold a scale-less cast.
+            draft.attach(backend, kv_pool.num_blocks, dtype=kv_pool.dtype)
 
         self._pin = backend.device.type == "cuda"
         self._lock = threading.RLock()
@@ -1435,7 +1437,8 @@ class Engine:
                 self._wake.wait(0.005)
 
 
-def _fit_blocks(cfg, backend, io, cap: int, draft_layers: int = 0) -> int:
+def _fit_blocks(cfg, backend, io, cap: int, draft_layers: int = 0,
+                kv_fp8: torch.dtype | None = None) -> int:
     """KV blocks that fit the free memory left after the weights and the GDN pools.
 
     Called with the state pool already allocated, so free memory is measured, not
@@ -1458,17 +1461,23 @@ def _fit_blocks(cfg, backend, io, cap: int, draft_layers: int = 0) -> int:
     if backend.device.type != "cuda":
         return cap or 256
     planes = 2 * len(cfg.full_attn_layers)
-    per_block = planes * cfg.num_kv_heads * BLOCK_TOKENS * cfg.head_dim
-    per_block *= torch.tensor([], dtype=io).element_size()
-    # per_block already carries the K+V factor, so one draft layer is per_block over
-    # the PLANE-PAIR count, not over `planes`. Dividing by `planes` charged half a
-    # layer and over-asked by 3.03% on the 27B.
-    per_block += draft_layers * per_block // len(cfg.full_attn_layers)
+    elems = planes * cfg.num_kv_heads * BLOCK_TOKENS * cfg.head_dim
+    per_block = elems * torch.tensor([], dtype=kv_fp8 or io).element_size()
+    if kv_fp8 is not None:
+        # one f32 scale per (plane, block, head, TOKEN) -- 1.56% of the fp8 plane, and the
+        # only grid a single-launch fused writer can reduce (docs/design-fp8-kv.md)
+        per_block += planes * cfg.num_kv_heads * BLOCK_TOKENS * 4
+    # The draft pool is allocated at the pool's IO dtype with no scale plane (DraftHead.attach
+    # via kv_pool.dtype), so it is charged off the bf16/f32 rate even under fp8 -- scaling
+    # per_block would under-ask by ~2x on this term. Divide by the PLANE-PAIR count, not
+    # `planes`: elems already carries the K+V factor, and `planes` charged half a layer.
+    per_block += (draft_layers * elems * torch.tensor([], dtype=io).element_size()
+                  // len(cfg.full_attn_layers))
     fit = max(64, int(torch.cuda.mem_get_info()[0] * 2 / 3) // per_block)
     return min(fit, cap) if cap else fit
 
 
-def _weight_fingerprint(cfg) -> str:
+def _weight_fingerprint(cfg, kv_fp8: torch.dtype | None = None) -> str:
     """What the spilled KV was computed under, as far as the config knows.
 
     EVERY config field, not a hand-picked list of the ones that look load-bearing: a
@@ -1477,13 +1486,17 @@ def _weight_fingerprint(cfg) -> str:
     first draft of this named `cfg.num_heads`, which does not exist -- the real field is
     `num_attention_heads` -- so the list was already wrong when it was written.
 
+    `kv_fp8` is not a config field but IS the store's byte format, so it is appended: a
+    flag flip against the same --ssd-path otherwise adopts blobs of the other format, which
+    is a RuntimeError in one direction and untrustworthy numerics in the other.
+
     It does NOT distinguish two checkpoints of the same architecture. Pass
     `ssd_fingerprint` explicitly when one spill directory serves both.
     """
     import dataclasses
 
     fields = "-".join(f"{f.name}={getattr(cfg, f.name)!r}" for f in dataclasses.fields(cfg))
-    return f"{fields}-block{BLOCK_TOKENS}"
+    return f"{fields}-block{BLOCK_TOKENS}-kv{kv_fp8 or 'io'}"
 
 
 def build_engine(
@@ -1527,6 +1540,12 @@ def build_engine(
     ssd_min_tokens: int = 0,
     #: HBM budget for resident GDN snapshots; 0 keeps the quarter-of-free rule below.
     state_bytes: int = 0,
+    #: fp8 dtype for the KV planes; None is off, the default. 65536 -> 33280 bytes per token
+    #: at the 27B's 16x4x256, a 1.969x saving after one f32 scale per
+    #: (plane, block, kv_head, token) -- the only grid a single-launch fused writer can
+    #: reduce (docs/design-fp8-kv.md). Off because the attention kernels still read a
+    #: dequantized plane, so this is capacity, not yet bandwidth.
+    kv_fp8: torch.dtype | None = None,
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
@@ -1582,9 +1601,23 @@ def build_engine(
     # asking for .arch directly raised AttributeError in 7 tests.
     kv_io = (getattr(backend, "io", torch.bfloat16)
              if getattr(backend, "arch", "").startswith("sm") else torch.bfloat16)
+    if kv_fp8 is not None:
+        # A fused writer scatters into the plane `kv_layer` returns, which under fp8 is a
+        # dequantized copy -- the write is dropped with no error. The fp8 twins take the raw
+        # plane plus the scale, so refuse only where a fused writer has no fp8 twin.
+        has = getattr(backend, "has_kernel", lambda _n: False)
+        blind = [n for n in ("write_tokens", "attn_prep") if has(n) and not has(f"{n}_fp8")]
+        if blind:
+            raise NotImplementedError(
+                f"kv_fp8 with the fused KV writers {blind} on arch "
+                f"{getattr(backend, 'arch', '?')}: they scatter into the plane `kv_layer` "
+                "returns, which is a dequantized copy under fp8, so every K/V write would be "
+                "silently lost, and this cell registers no fp8 twin (docs/design-fp8-kv.md)."
+            )
     if not num_blocks:
         num_blocks = _fit_blocks(cfg, backend, kv_io, max_blocks,
-                                 draft_layers=0 if draft is None else draft.cfg.num_layers)
+                                 draft_layers=0 if draft is None else draft.cfg.num_layers,
+                                 kv_fp8=kv_fp8)
     kv_pool = PagedKvPool(
         num_blocks + pad,
         cfg.num_kv_heads,
@@ -1597,6 +1630,7 @@ def build_engine(
         # context. Same trade the state pool makes below. getattr: test doubles
         # stand in for Backend without declaring an io dtype.
         dtype=kv_io,
+        kv_fp8=kv_fp8,
     )
     # A resident store entry owns a GDN state snapshot in HBM (144 MiB at 27B f32)
     # and a decode publishes one every BLOCK_TOKENS, so the store's byte budget must
@@ -1619,7 +1653,7 @@ def build_engine(
     if ssd_path:
         # Not gated on cuda: the tier is target-independent, and the CPU target is where
         # its parity is checked.
-        kw["ssd"] = KvTier(ssd_path, ssd_fingerprint or _weight_fingerprint(cfg),
+        kw["ssd"] = KvTier(ssd_path, ssd_fingerprint or _weight_fingerprint(cfg, kv_fp8),
                            **({"min_tokens": ssd_min_tokens} if ssd_min_tokens else {}))
     store = PrefixStore(kv_pool, **kw) if prefix_store is None else prefix_store
     return Engine(

@@ -19,7 +19,7 @@ two cells share is only an override when the maker differs:
 | --- | ---: | ---: | ---: | ---: |
 | cpu | 16 | — | — | — |
 | metal | 16 | 3 (`gemm_nn/nt/tn`) | 0 | 13 |
-| sm90 | 43 | 9 | 27 | 7 |
+| sm90 | 45 | 9 | 29 | 7 |
 | sm70 | 24 | 2 (`silu_mul`, `gdn_prep`) | 8 | 14 |
 
 **sm70 reuses the CPU source more than any other accelerated cell**: 14 of its
@@ -138,6 +138,16 @@ The rest of the layer (attention, norms, activations) runs the bf16 path.
 | linear_fp8_gemv (M=1) | dense at load | dense at load | done | pending-remote | dense at load |
 | linear_fp8_bwd (frozen dX) | eager reference | eager reference | done | pending-remote | eager reference |
 | quant_fp8 (per-token e4m3 activation) | — | — | done | pending-remote | — |
+| write_tokens_fp8 / attn_prep_fp8 (fp8 KV pool write) | torch fallback | refuse | done, card-only parity | pending-remote | torch fallback |
+
+The two fp8 KV writers are the only entries whose selection is **per call, not per
+cell**: both cells register the bf16 and fp8 makers, and the pool's dtype picks one.
+The scale is per `(block, head, token)` because the launch shape allows no coarser
+reduction, and `attn_prep_fp8` takes its K amax post-RoPE — a rotation raises the
+per-element absmax up to 1.383x, enough to saturate e4m3 against a pre-RoPE scale
+(`docs/design-fp8-kv.md`). sm70 refuses rather than falling back: its fused
+`write_tokens_f32` has no fp8 twin, so `build_engine` raises instead of dropping
+writes into a dequantized copy.
 
 There is no `_register("fp8", ...)` cell: fp8 is a weight format inside the
 bf16/fp4 cells, exactly like fp4. **dense at load** means `Backend.materialize`

@@ -33,6 +33,11 @@ _WY_CHUNK = 64
 _MAX_VERIFY_W = 8
 # a whole-chunk verify width would reach _full_rows' host sync, illegal under graph capture
 assert _MAX_VERIFY_W < _WY_CHUNK
+# getattr: an older torch build may have neither, and this is only ever a membership test
+_FP8_DTYPES = frozenset(
+    d for d in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None))
+    if d is not None
+)
 
 
 def _round_up(x: int, m: int) -> int:
@@ -926,6 +931,15 @@ class Backend:
         squeeze = q.ndim == 3
         if squeeze:
             q = q.unsqueeze(1)  # [B, H, D] -> [B, 1, H, D]
+        if k_cache.dtype in _FP8_DTYPES:
+            # No attention kernel takes an fp8 operand yet, and every path below reaches
+            # _dev/_f32, which up-cast a raw fp8 plane with NO scale -- ~448x too small,
+            # finite, and plausible enough that token agreement and the logit gate both pass.
+            # Callers hand over kv_layer()'s dequantized plane; a raw one is a bug.
+            raise TypeError(
+                f"paged_attention got a raw {k_cache.dtype} K plane. Pass kv_layer()'s "
+                "dequantized plane: up-casting fp8 without its scale is silent, not an error."
+            )
         b, s = q.shape[0], q.shape[1]
         if seq_q_lens is None:
             seq_q_lens = torch.full((b,), s, dtype=torch.int32)
@@ -1057,11 +1071,33 @@ class Backend:
             kv.kv_pool.write_tokens(k, v, kv, layer_idx)
             return
         pool = kv.kv_pool
-        k_plane, v_plane = pool.kv_layer(layer_idx)
         b, s = k.shape[0], k.shape[1]
         sql = getattr(kv, "seq_q_lens", None)
         if sql is None:
             sql = torch.full((b,), s, dtype=torch.int32)
+        block_size = int(pool.k_pool.shape[-2])
+        if pool.kv_fp8 is not None:
+            if not self.has_kernel("write_tokens_fp8"):
+                kv.kv_pool.write_tokens(k, v, kv, layer_idx)
+                return
+            plane = pool.plane_of(layer_idx)
+            # the RAW fp8 planes, not kv_layer(): that hands back a dequantized copy, and a
+            # scatter into it is discarded with no error
+            self._kernel("write_tokens_fp8")(
+                self._dev(k, torch.bfloat16).contiguous(),
+                self._dev(v, torch.bfloat16).contiguous(),
+                pool.k_pool[plane],
+                pool.v_pool[plane],
+                pool.k_scale[plane],
+                pool.v_scale[plane],
+                self._i32(kv.block_table).contiguous(),
+                self._i32(kv.seq_len).contiguous(),
+                self._i32(sql).contiguous(),
+                block_size,
+                _THREADS,
+            )
+            return
+        k_plane, v_plane = pool.kv_layer(layer_idx)
         # .contiguous(): a bf16 view sliced from the fused-qkv output survives _dev's no-op cast
         # The pool's dtype is the kernel's: sm70 allocates f32 so attention
         # does not cast the whole plane per call.
@@ -1074,7 +1110,7 @@ class Backend:
             self._i32(kv.block_table).contiguous(),
             self._i32(kv.seq_len).contiguous(),
             self._i32(sql).contiguous(),
-            int(pool.k_pool.shape[-2]),
+            block_size,
             _THREADS,
         )
 
@@ -1084,7 +1120,8 @@ class Backend:
         if "attn_prep" not in _resolve(self.precision, self.arch):
             return None
         pool = kv.kv_pool
-        k_plane, v_plane = pool.kv_layer(layer_idx)
+        if pool.kv_fp8 is not None and not self.has_kernel("attn_prep_fp8"):
+            return None  # unfused path: the pool's own quantizing writer handles it
         b, s = qkv.shape[0], qkv.shape[1]
         sql = getattr(kv, "seq_q_lens", None)
         if sql is None:
@@ -1092,14 +1129,14 @@ class Backend:
         pos = self._i32(positions)
         if pos.ndim == 1:
             pos = pos.unsqueeze(0).expand(b, -1)
-        return self._kernel("attn_prep")(
+        args = (
             self._f32(qkv).contiguous(),
             self._f32(wq).contiguous(),
             self._f32(wk).contiguous(),
             pos.contiguous(),
             self._inv_freq(int(rotary_dim), float(theta)).to(self.device),
-            k_plane,
-            v_plane,
+        )
+        tail = (
             self._i32(kv.block_table).contiguous(),
             self._i32(kv.seq_len).contiguous(),
             self._i32(sql).contiguous(),
@@ -1109,6 +1146,14 @@ class Backend:
             int(pool.k_pool.shape[-2]),
             _THREADS,
         )
+        if pool.kv_fp8 is not None:
+            # raw planes + the scale plane: kv_layer() would hand back a dequantized copy
+            p = pool.plane_of(layer_idx)
+            return self._kernel("attn_prep_fp8")(
+                *args, pool.k_pool[p], pool.v_pool[p], pool.k_scale[p], pool.v_scale[p], *tail
+            )
+        k_plane, v_plane = pool.kv_layer(layer_idx)
+        return self._kernel("attn_prep")(*args, k_plane, v_plane, *tail)
 
     def linear_frozen_bwd(self, grad, wq, scale, oscale=None, fp8=False):
         """dX through a frozen quantized weight, no weight grad. The kernel

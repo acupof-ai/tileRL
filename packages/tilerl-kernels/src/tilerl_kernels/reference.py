@@ -367,6 +367,29 @@ def linear_fp8(x, w8, wscale, oscale=None) -> torch.Tensor:
     return y if oscale is None else y * _f32(oscale)
 
 
+def dequant_kv_fp8(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """FP8 KV dequant: q [P,NB,H,T,D] * scale [P,NB,H,T] -> f32, one scale per token-head."""
+    return q.float() * scale.float()[..., None]
+
+
+def quant_kv_fp8(
+    x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inverse of :func:`dequant_kv_fp8`: one absmax/finfo.max scale per (plane, block, head, token).
+
+    The scale is per token, not per block, because that is the only grid an append can write
+    without re-reading its neighbours: a block-wide absmax spans the 16 thread blocks
+    ``make_write_tokens`` launches per pool block, so it needs a second pass or a bf16 staging
+    copy, and quantizing from the stored fp8 instead re-rounds every token already there
+    (measured 0.338 vs 0.059 max rel error on a growing-magnitude block). Costs 16x the scale
+    memory: 1.56% of the fp8 plane against 0.098%, so the saving is 1.969x not 2.000x.
+    """
+    xf = _f32(x)
+    scale = xf.abs().amax(-1).clamp_min(1e-12) / torch.finfo(dtype).max
+    q = xf / scale[..., None]
+    return q.to(dtype).contiguous(), scale.contiguous()
+
+
 def dequant_awq(
     qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor, group_size: int
 ) -> torch.Tensor:
@@ -1284,4 +1307,36 @@ if __name__ == "__main__":  # runnable check: quant_fp8 inverts dequant_fp8
     _rel = (dequant_fp8(_q, _s) - _w.float()).abs().max() / _w.float().abs().max()
     assert _rel < 0.06, _rel
     print("reference: quant_fp8 round-trip OK, rel", float(_rel))
+    # KV pool shape [planes, blocks, heads, BLOCK_TOKENS, head_dim] at the 27B's 4 heads x 256.
+    # One spiked element, because a global-max-normalised error hides the grid's damage: it
+    # reads 4e-4 on this tensor while the spiked token-head's own elements are off by 7e-2.
+    _kv = torch.randn(2, 5, 4, 16, 256, dtype=torch.bfloat16) * 0.1
+    _kv[0, 1, 2, 3, 5] = 40.0
+    _kvf = _kv.float()
+    _big = _kvf.abs() > 1e-3
+    for _dt, _tol in ((torch.float8_e4m3fn, 0.10), (torch.float8_e5m2, 0.20)):
+        _kq, _ks = quant_kv_fp8(_kv, _dt)
+        assert _kq.shape == _kv.shape and _ks.shape == (2, 5, 4, 16), (_kq.shape, _ks.shape)
+        _r = ((dequant_kv_fp8(_kq, _ks) - _kvf).abs() / _kvf.abs().clamp_min(1e-9))[_big].max()
+        assert _r < _tol, (_dt, _r)
+        _rolled = ((dequant_kv_fp8(_kq, _ks.roll(1, dims=1)) - _kvf).abs()
+                   / _kvf.abs().clamp_min(1e-9))[_big].max()
+        assert _rolled > 10 * _r, (_dt, _r, _rolled)  # the scale axis is load-bearing
+        # An append must not re-round the tokens already in the block. Assert on the LAZIEST
+        # append -- dequantize the block, patch one token, requantize -- because per-token
+        # scales make that idempotent, so no staging buffer is needed. The fixture has to grow
+        # in magnitude or nothing compounds; on a per-block scale this reads False (and 0.338
+        # vs 0.059 max rel error), which is what makes the assert non-vacuous.
+        _gk = _kv.clone()
+        for _t in range(16):
+            _gk[..., _t, :] *= 1.0 + _t
+        _one, _os = quant_kv_fp8(_gk, _dt)
+        _pool, _ps = torch.zeros_like(_one), torch.ones_like(_os)
+        for _t in range(16):
+            _buf = dequant_kv_fp8(_pool, _ps)
+            _buf[..., _t, :] = _gk[..., _t, :].float()
+            _pool, _ps = quant_kv_fp8(_buf, _dt)
+        assert torch.equal(_pool.view(torch.uint8), _one.view(torch.uint8)), _dt
+        print(f"reference: quant_kv_fp8 per-element rel {float(_r):.4f}, "
+              f"scale rolled {float(_rolled):.1f}, append idempotent, {_dt}")
     _check_chunk_core()

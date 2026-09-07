@@ -1361,6 +1361,102 @@ def _flushed(tier, tries: int = 500) -> None:
         time.sleep(0.01)
 
 
+def test_the_fp8_kv_pool_generates_what_the_bf16_pool_does():
+    """`kv_fp8` must quantize on the write path, not cast.
+
+    A pool allocated in fp8 whose writers still do `.to(fp8)` stores every K/V with no
+    scale. That is not a crash: e4m3 is a float format, so a bare cast of values already
+    inside its range is plausible-looking and only ~3% wrong -- measured on this fixture,
+    the scale-less mutant generates the SAME 6 tokens, so token agreement alone cannot
+    see the defect this flag's whole design is about. The mutant that does bite is the
+    one the design note names: shifting the scale by one block keeps the bytes and the
+    geometry and produces finite, plausible logits, so it is asserted here too.
+
+    fp8 is checked on the torch side only. The C backend cannot codegen `float8_e4m3fn`
+    at all, so the KERNEL path is card-only; the pool, the scale plane and the
+    quantize/dequantize round-trip are plain torch and run here.
+    """
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("this torch build has no float8_e4m3fn, so no fp8 pool can be allocated")
+    cfg = tiny()
+    backend = get_backend()
+    prompt = np.random.default_rng(4).integers(3, 320, size=40).astype(np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=6, seed=0)
+
+    def gen(kv_fp8, mutate=None):
+        engine = build_engine(cfg, build_random(cfg, seed=12), backend, num_blocks=16,
+                             num_slots=4, max_batch=4, max_total_tokens=512, kv_fp8=kv_fp8)
+        if mutate is not None:
+            mutate(engine._kv)
+        rid = engine.submit(prompt, params)
+        return list(_drain(engine, [rid], 6)[rid]), engine
+
+    want, ref = gen(None)
+    got, eng = gen(torch.float8_e4m3fn)
+    assert eng._kv.k_pool.dtype is torch.float8_e4m3fn, "the flag did not reach the pool"
+    assert eng._kv.k_scale.shape == (
+        len(cfg.full_attn_layers), 16, cfg.num_kv_heads, BLOCK_TOKENS
+    ), (
+        f"scale is {tuple(eng._kv.k_scale.shape)}, not [planes, blocks, kv_heads, tokens]"
+    )
+    assert eng._kv.k_pool.float().abs().sum() > 0, "the fp8 plane is all zero, so this is vacuous"
+    assert got == want, f"fp8 pool generated {got}, the bf16 pool {want}"
+    # Half the plane's bytes is the whole claim; the scale is 4 B per token per head.
+    scale_b = 2 * len(cfg.full_attn_layers) * cfg.num_kv_heads * 4
+    assert eng._kv.bytes_per_token == ref._kv.bytes_per_token // 2 + scale_b, (
+        f"fp8 is {eng._kv.bytes_per_token} B/token against bf16's {ref._kv.bytes_per_token}; "
+        f"expected half plus {scale_b} B of scale"
+    )
+
+    # An append must not re-round the tokens already in the block. The per-token grid makes
+    # the laziest append -- dequantize, patch one token, requantize -- idempotent; on a
+    # per-block grid this is 0.338 max rel error against 0.059, worst on the FIRST token.
+    from tilerl_kernels.reference import dequant_kv_fp8, quant_kv_fp8
+
+    _one = torch.randn(cfg.num_kv_heads, BLOCK_TOKENS, cfg.head_dim, dtype=torch.bfloat16)
+    for _t in range(BLOCK_TOKENS):
+        _one[:, _t] *= 1.0 + _t  # or nothing compounds: the absmax must grow with the append
+    _pool = PagedKvPool(num_blocks=2, num_kv_heads=cfg.num_kv_heads, head_dim=cfg.head_dim,
+                        num_layers=1, device="cpu", kv_fp8=torch.float8_e4m3fn)
+    _b = _pool.alloc_block()
+    for _t in range(BLOCK_TOKENS):
+        _pool.write_block(_b, _t, _one[:, _t : _t + 1], _one[:, _t : _t + 1], layer=0)
+    _wq, _ws = quant_kv_fp8(_one.unsqueeze(0).unsqueeze(0), torch.float8_e4m3fn)
+    assert torch.equal(_pool.k_pool[0, _b].view(torch.uint8), _wq[0, 0].view(torch.uint8)), (
+        "writing 16 tokens one at a time did not match quantizing the block once, so an "
+        "append re-rounds what is already stored"
+    )
+    _rel = ((dequant_kv_fp8(_pool.k_pool[0, _b], _pool.k_scale[0, _b]) - _one.float()).abs()
+            / _one.float().abs().clamp_min(1e-9))
+    assert _rel[:, 0].max() < 0.07, f"token 0 is off by {float(_rel[:, 0].max()):.4f} after 15 "\
+        "further appends, so the write path re-rounds tokens already stored"
+    def shift_scale(pool):
+        store = pool._store_fp8
+
+        def bad(plane, blk, off, k, v):
+            store(plane, blk, off, k, v)
+            pool.k_scale[plane] = pool.k_scale[plane].roll(1, 0)  # dim 0 of [blocks,heads,tokens]
+
+        pool._store_fp8 = bad
+
+    mutant, _ = gen(torch.float8_e4m3fn, shift_scale)
+    assert mutant != want, (
+        "shifting the scale by one block changed nothing, so this gate does not read the "
+        "scale plane at all and would pass with the scales dropped"
+    )
+
+    # `--kv-fp8` goes through cli._build_engine; a flag that parses and is never forwarded
+    # reads exactly like a working one, which is how `dram_bytes` shipped with no CLI entry.
+    from tilerl.cli import _build_engine as cli_build
+
+    cli_cfg, cli_model = _build_model("tiny", seed=11)
+    served = cli_build(cli_cfg, cli_model, backend, slots=2, blocks=64, max_ctx=256,
+                       kv_fp8="e4m3")
+    assert served._kv.k_pool.dtype is torch.float8_e4m3fn, "--kv-fp8 never reached the pool"
+    assert cli_build(cli_cfg, cli_model, backend, slots=2, blocks=64,
+                     max_ctx=256)._kv.kv_fp8 is None, "the flag defaults ON"
+
+
 def test_prefix_hit_survives_evicting_its_own_entry():
     """submit()'s own evict_until_free can evict the entry it just matched;
     the snapshot must be read before that, not after.
