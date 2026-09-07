@@ -29,7 +29,9 @@ sequences: ``decode=`` is the one place ids become text, for ``stop_texts``.
 
 from __future__ import annotations
 
+import contextlib
 import threading
+import time
 import warnings
 from collections import deque
 from dataclasses import dataclass, field
@@ -197,6 +199,8 @@ class _Req:
     phase: int  # _PHASE_PREFILL | _PHASE_DECODE | _PHASE_DONE
     prefill_from: int  # prefix-reuse offset for the prefill forward
     own_blocks: int  # blocks the engine allocated (vs adopted from a hit)
+    #: perf_counter deadline for an in-flight SSD prefetch; 0 = none outstanding
+    fetch_deadline: float = 0.0
     output: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     thought_closed: bool = False  # the reasoning block ended (model's or forced)
@@ -455,6 +459,10 @@ class Engine:
         self._prefix_misses = 0
         self._prefix_published = 0
         self._prefill_forwards = 0
+        # R in the SSD break-even; the arch seed only covers the first decision
+        self._prefill_tokens = 0
+        self._prefill_secs = 0.0
+        self._seed_rate = 2558.6 if getattr(backend, "arch", "") == "sm90" else 75.0
         self._decode_forwards = 0
         self._mixed_forwards = 0
         self._tokens_generated = 0
@@ -549,7 +557,19 @@ class Engine:
                 own_blocks=0,
             )
             self._waiting.append(req)
-            return rid
+        # outside the lock: the enqueue must not sit on step()'s critical path
+        with contextlib.suppress(Exception):  # a tier fault must never fail a submit
+            rate = self.prefill_rate
+            if self._prefix.prefetch_if_worth_it(tokens, rate):
+                req.fetch_deadline = time.perf_counter() + len(tokens) / rate
+        return rid
+
+    @property
+    def prefill_rate(self) -> float:
+        """Prefill tokens/s: this engine's own measurement, or the arch seed before one."""
+        if self._prefill_secs <= 0:
+            return self._seed_rate
+        return self._prefill_tokens / self._prefill_secs
 
     def poll(self) -> dict[int, list[int]]:
         """Return and clear all requests finished since the last poll."""
@@ -689,8 +709,13 @@ class Engine:
         decodes plus as many prefill rows as the token budget and one width
         bucket allow; a longer prompt stays in PREFILL and chunks across ticks."""
         while self._waiting and len(self._running) < self.limits.max_batch:
+            head = self._waiting[0]
+            # deadline n/R: a fetch may not cost more than the prefill it replaces
+            if head.fetch_deadline and time.perf_counter() > head.fetch_deadline:
+                head.fetch_deadline = 0.0
+                self._prefix.abandon_prefetch(head.tokens)
             # break, not continue: head-of-line FIFO, else a blocked large request starves.
-            if not self._admit(self._waiting[0]):
+            if not self._admit(head):
                 break
             self._running.append(self._waiting.popleft())
         decodes = [r for r in self._running if r.phase == _PHASE_DECODE]
@@ -781,6 +806,9 @@ class Engine:
                 "slots_total": self.usable_slots,
                 "prefix_hits": self._prefix_hits,
                 "prefix_misses": self._prefix_misses,
+                # both operands of the fetch-vs-recompute decision, for a live server
+                "prefill_rate": round(self.prefill_rate, 1),
+                "prefix_break_even_tokens": self._prefix.break_even_tokens(self.prefill_rate),
                 "prefix_published": self._prefix_published,
                 # Whether the store is under pressure at all: a DRAM/SSD tier below it can
                 # only recover entries that were actually evicted, and at 144 MiB a 27B
@@ -913,6 +941,7 @@ class Engine:
             input_ids[j, :c] = pf.tokens[start : start + c]
             positions[j, :c] = np.arange(start, start + c)
         hid: list | None = [] if self._draft else None
+        t_fwd = time.perf_counter()
         logits = self._model.forward(
             input_ids, positions, self._make_kv(rows, seq_q, width if chains else 0),
             self._backend, hidden_out=hid, aux_layers=self._aux_layers,
@@ -932,6 +961,9 @@ class Engine:
             self._sample_commit([(r, logits[i, 0], len(r.output)) for i, r in enumerate(decodes)])
         if prefills:
             self._prefill_forwards += 1
+            # mixed ticks included: excluding them reports a rate no request sees
+            self._prefill_tokens += sum(chunks)
+            self._prefill_secs += time.perf_counter() - t_fwd
             self._finish_prefills(prefills, chunks, logits, len(decodes))
         if decodes:
             self._decode_forwards += 1

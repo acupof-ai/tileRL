@@ -467,6 +467,20 @@ class KvTier:
         self._lock = threading.Lock()
         self._q: queue.Queue = queue.Queue()
         self._writer = threading.Thread(target=self._flush_loop, daemon=True)
+        # read side: the torch.load runs off-tick, not inside step() under the lock
+        self._fetches: dict[int, dict] = {}   # key -> {"blob", "tokens"}, collected by take()
+        self._fetching: set[int] = set()      # queued or mid-read
+        self._abandoned: set[int] = set()     # deadline fired mid-read; drop on landing
+        self.prefetches = 0
+        self.fetches_ready = 0
+        self.fetch_drops = 0
+        self.fetch_ms = 0.0
+        self.fetch_bytes = 0
+        self.snapshot_bytes = 0
+        self.tick_loads = 0
+        self._rq: queue.Queue = queue.Queue()
+        self._reader = threading.Thread(target=self._fetch_loop, daemon=True)
+        self._reader.start()
         self._writer.start()
 
     def _recover(self, marker: str, fingerprint: str) -> int:
@@ -514,6 +528,8 @@ class KvTier:
             if kv and st:
                 self._lru[key] = kv + st
                 self._total += kv + st
+                # constant at every length, so any recovered entry's .st size is S
+                self.snapshot_bytes = st
             else:
                 for ext in (".kv", ".st"):
                     with contextlib.suppress(OSError):
@@ -650,13 +666,76 @@ class KvTier:
         self.copy_ms += (time.perf_counter() - tg) * 1000
         return host, ev
 
+    def prefetch(self, key: int, tokens: tuple[int, ...]) -> bool:
+        """True = queued or already in flight. Holds no blocks, so a dropped one costs
+        a host buffer and unwinds nothing."""
+        with self._lock:
+            if key in self._fetches or key in self._fetching:
+                return True
+            if not (key in self._lru or (key in self._pending and key in self._pending_st)):
+                return False
+            self._fetching.add(key)
+        self.prefetches += 1
+        self._rq.put((key, tokens))
+        return True
+
+    def fetch_pending(self, key: int) -> bool:
+        with self._lock:
+            return key in self._fetching
+
+    def take(self, key: int):
+        with self._lock:
+            done = self._fetches.pop(key, None)
+        if done is None or "blob" not in done:
+            return None
+        return done["blob"]
+
+    def discard_fetch(self, key: int) -> None:
+        """Give up on a prefetch; a late arrival is dropped rather than parked."""
+        with self._lock:
+            had = self._fetches.pop(key, None) is not None
+            if not had and key in self._fetching:
+                self._abandoned.add(key)
+                had = True
+        if had:
+            self.fetch_drops += 1
+
+    def _fetch_loop(self) -> None:
+        while True:
+            key, tokens = self._rq.get()
+            blob = None
+            with self._lock:
+                blob = self._pending.get(key)
+            if blob is None:
+                try:
+                    ts = time.perf_counter()
+                    blob = torch.load(self._kv(key), map_location="cpu")
+                    self.fetch_ms += (time.perf_counter() - ts) * 1000
+                    self.fetch_bytes += sum(t.numel() * t.element_size()
+                                            for t in (blob["k"], blob["v"]))
+                except Exception:  # noqa: BLE001 - truncated / corrupt / raced eviction
+                    self.drop(key)
+                    with self._lock:
+                        self._fetching.discard(key)
+                        self._abandoned.discard(key)
+                    continue
+            with self._lock:
+                self._fetching.discard(key)
+                if key in self._abandoned:
+                    # abandoned mid-read: park nothing, or the host buffer is pinned
+                    self._abandoned.discard(key)
+                    continue
+                self._fetches[key] = {"blob": blob, "tokens": tokens}
+            self.fetches_ready += 1
+
     def load_kv(self, key: int, tokens: tuple[int, ...], blocks: Sequence[int],
-                pool: PagedKvPool) -> bool:
+                pool: PagedKvPool, blob: dict | None = None) -> bool:
         # False = data gone (a raced eviction dropped it) OR a hash collision
         # stored a different prefix — caller treats either as a miss. Serves a
         # still-pending blob from memory, closing the resident()/load TOCTOU.
-        with self._lock:
-            blob = self._pending.get(key)
+        if blob is None:
+            with self._lock:
+                blob = self._pending.get(key)
         if blob is None:
             if not os.path.exists(self._kv(key)):
                 return False
@@ -665,6 +744,8 @@ class KvTier:
             # partial blob that `_recover` then adopts by size. Treat an unreadable file as
             # a miss and drop it, rather than raising inside a lookup.
             try:
+                # counted: this is the number that can refute "the fetch became async"
+                self.tick_loads += 1
                 blob = torch.load(self._kv(key), map_location="cpu")
             except Exception:  # noqa: BLE001 - truncated / corrupt spill
                 self.drop(key)
@@ -674,9 +755,17 @@ class KvTier:
         self._touch_lru(key)
         # one index_copy_ per plane: the per-block loop was 3,750 launches at 30k tokens
         idx = torch.as_tensor(list(blocks), device=pool.device)
-        pool.k_pool.index_copy_(1, idx, blob["k"].permute(1, 0, 2, 3, 4).to(pool.device))
-        pool.v_pool.index_copy_(1, idx, blob["v"].permute(1, 0, 2, 3, 4).to(pool.device))
+        k = self._planes_on_device(blob["k"], pool)
+        v = self._planes_on_device(blob["v"], pool)
+        pool.k_pool.index_copy_(1, idx, k)
+        pool.v_pool.index_copy_(1, idx, v)
         return True
+
+    def _planes_on_device(self, t: torch.Tensor, pool: PagedKvPool) -> torch.Tensor:
+        """Permute AFTER the transfer: `.to(cuda)` on a non-contiguous view materialises
+        a host temp of the whole blob first. Same-device is a no-op, so `"c"` cannot see
+        this."""
+        return t.to(pool.device, non_blocking=t.is_pinned()).permute(1, 0, 2, 3, 4)
 
     def spill_state(self, key: int, tokens: tuple[int, ...], states, windows) -> None:
         st, ev_s = self._to_host(states)
@@ -702,6 +791,11 @@ class KvTier:
             return None
         self._touch_lru(key)
         return blob["states"], blob["windows"]
+
+    def read_bytes_per_s(self) -> float:
+        """B in the break-even, from this tier's own fetches: a hardcoded rate would
+        describe whichever box it was written on. 0 before anything has been read."""
+        return 0.0 if self.fetch_ms <= 0 else self.fetch_bytes / (self.fetch_ms / 1000.0)
 
     def resident(self, key: int) -> bool:
         """Whether this key is in the in-memory index, without touching the disk.
@@ -756,6 +850,11 @@ class KvTier:
             "ssd_evictions": self.over_budget,
             "ssd_pending": pending,
             "ssd_healthy": int(self._healthy),
+            "ssd_prefetches": self.prefetches,
+            "ssd_fetches_ready": self.fetches_ready,
+            "ssd_fetch_drops": self.fetch_drops,
+            "ssd_tick_loads": self.tick_loads,
+            "ssd_fetch_ms": int(self.fetch_ms),
         }
 
 
@@ -804,6 +903,15 @@ class NoPrefixStore:
 
     def reclaimable_blocks(self) -> int:
         return 0
+
+    def prefetch_if_worth_it(self, tokens: Sequence[int], prefill_rate: float) -> bool:
+        return False
+
+    def break_even_tokens(self, prefill_rate: float) -> int:
+        return 1 << 31
+
+    def abandon_prefetch(self, tokens: Sequence[int]) -> None:
+        return None
 
     def clear(self) -> None:
         return None
@@ -856,12 +964,70 @@ class PrefixStore:
         self.blocks_freed = 0
         self.ssd_hits = 0
         self.ssd_faults = 0
+        # S: constant at every prefix length, and what puts the break-even above zero
+        self._snapshot_bytes = 0
+        self.fetch_waits = 0
 
     def _hash_all(self, tokens: Sequence[int]) -> int:
         h = 0
         for t in tokens:
             h = self._roll(h, int(t))
         return h
+
+    def abandon_prefetch(self, tokens: Sequence[int]) -> None:
+        """Walks every length the probe could have queued: which one it took depends on
+        what was resident then, and that may have changed."""
+        if self._ssd is None:
+            return
+        h, hashes = 0, []
+        for t in tokens:
+            h = self._roll(h, int(t))
+            hashes.append(h)
+        for i in range(BLOCK_TOKENS, len(tokens) + 1, BLOCK_TOKENS):
+            self._ssd.discard_fetch(hashes[i - 1])
+
+    def break_even_tokens(self, prefill_rate: float) -> int:
+        """Prefix length above which fetching beats recomputing, at this prefill rate.
+
+        `(S + n*k)/B < n/R`, so `n* = (S/B) / (1/R - k/B)`: S the recurrent snapshot
+        (constant at any length), k the KV bytes per token, B the tier's read rate, R
+        tokens/s of prefill. Every operand is read here rather than fixed --
+        `k` is 64 KiB on a bf16 pool and 128 KiB on sm70's f32 one, and the two archs'
+        `R` differ by more than an order of magnitude, so a constant would be wrong on
+        one of them (docs/design-ssd-read-path.md).
+
+        Returns 2**31 when `k/B >= 1/R`: the device cannot stream KV as fast as the card
+        recomputes it, and no length pays.
+        """
+        if self._ssd is None or prefill_rate <= 0:
+            return 1 << 31
+        k = 2 * self._pool.num_layers * self._pool.num_kv_heads * self._pool.head_dim \
+            * self._pool.k_pool.element_size()
+        b = self._ssd.read_bytes_per_s()
+        s = self._snapshot_bytes or self._ssd.snapshot_bytes
+        if b <= 0:
+            # unmeasured tier fetches once and calibrates; a restart is the case it exists for
+            return 0
+        if s <= 0:
+            return 1 << 31
+        denom = 1.0 / prefill_rate - k / b
+        return (1 << 31) if denom <= 0 else int(s / b / denom)
+
+    def prefetch_if_worth_it(self, tokens: Sequence[int], prefill_rate: float) -> bool:
+        """Start reading the longest resident prefix, if fetching beats recomputing.
+        Allocation-free, which is why it can live where the prefix MATCH cannot."""
+        if self._ssd is None:
+            return False
+        if len(tokens) < self.break_even_tokens(prefill_rate):
+            return False
+        h, hashes = 0, []
+        for t in tokens:
+            h = self._roll(h, int(t))
+            hashes.append(h)
+        for i in range(len(tokens) - len(tokens) % BLOCK_TOKENS, 0, -BLOCK_TOKENS):
+            if self._ssd.prefetch(hashes[i - 1], tuple(tokens[:i])):
+                return True
+        return False
 
     def insert(self, tokens: Sequence[int], blocks: Sequence[int], state: Any = None,
                spill: bool = True) -> bool:
@@ -906,6 +1072,9 @@ class PrefixStore:
         # blocking prefill. Both
         # halves go or neither -- a fault-in needs the pair. `resident` skips what is already
         # on disk, without which every fault-in writes back the bytes it just read.
+        if state is not None and self._snapshot_bytes == 0:
+            self._snapshot_bytes = sum(t.numel() * t.element_size()
+                                       for t in state if t is not None)
         if (spill and self._ssd is not None and state is not None and not self._ssd.resident(h)
                 and self._ssd.spill_kv(h, tokens, blocks, self._pool)):
             self._ssd.spill_state(h, tokens, state[0], state[1])
@@ -954,19 +1123,28 @@ class PrefixStore:
             # after a restart HBM is empty, so the LONGEST prefix on disk is what this loop
             # would otherwise walk straight past on its way to a miss.
             if self._ssd is not None and self._ssd.resident(prefix_hashes[i - 1]):
-                hit = self._fault_in(prefix_hashes[i - 1], tokens[:i])
+                key = prefix_hashes[i - 1]
+                if self._ssd.fetch_pending(key):
+                    # a miss for now: reading it here too puts the 1.7 s back on the tick
+                    self.fetch_waits += 1
+                    break
+                hit = self._fault_in(key, tokens[:i], blob=self._ssd.take(key))
                 if hit is not None:
                     return hit
         self.lookups_missed += 1
         return None
 
-    def _fault_in(self, h: int, tokens: tuple[int, ...]) -> PrefixHit | None:
+    def _fault_in(self, h: int, tokens: tuple[int, ...],
+                  blob: dict | None = None) -> PrefixHit | None:
         """Reload one prefix from the SSD tier into fresh blocks, or None.
 
         The reload allocates from the pool and hands the entry to `insert`, so the faulted
         prefix is an ordinary resident entry afterwards -- one code path owns retain,
         eviction and the byte accounting. `resident` gated the call, so at most one
         candidate length pays a `torch.load`.
+
+        `blob` is a prefetch the reader thread already read. Passing it makes this the
+        copy-only half; without it the `torch.load` still happens here, on the tick.
         """
         need = PagedKvPool.blocks_for_tokens(len(tokens))
         # Only a whole-block prefix can be adopted: `insert` refuses a partial block,
@@ -985,7 +1163,7 @@ class PrefixStore:
             return None
         blocks = [self._pool.alloc_block() for _ in range(need)]
         try:
-            if not self._ssd.load_kv(h, tokens, blocks, self._pool):
+            if not self._ssd.load_kv(h, tokens, blocks, self._pool, blob=blob):
                 self.ssd_faults += 1
                 self._ssd.drop(h)
                 return None

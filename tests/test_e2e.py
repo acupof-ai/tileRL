@@ -3004,3 +3004,203 @@ def test_the_draft_prefill_width_is_bucketed_like_the_trunks():
         f"draft block-table widths {sorted(set(tables))} vary: Mb is a compiled-in "
         "dimension, so each width is another kernel"
     )
+
+
+def test_a_prefetched_prefix_is_faulted_in_without_a_read_on_the_tick(tmp_path):
+    """The submit-time probe must do the torch.load, not the lookup.
+
+    Asserts WHICH path served the hit, not just that the bytes are right: without
+    the prefetch the same lookup faults the prefix in synchronously and every
+    output assertion still passes, which is how an async change ships doing
+    nothing.
+    """
+    torch.manual_seed(0)
+    toks = list(range(8 * BLOCK_TOKENS))
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+
+    def store_at():
+        pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+        tier = KvTier(str(tmp_path), "fp-prefetch", min_tokens=BLOCK_TOKENS)
+        return PrefixStore(pool, ssd=tier), pool, tier
+
+    warm, pool, tier = store_at()
+    blocks = [pool.alloc_block() for _ in range(8)]
+    for i, b in enumerate(blocks):
+        pool.k_pool[:, b] = float(i + 1)
+    assert warm.insert(toks, blocks, (state[0].clone(), state[1].clone()))
+    _flushed(tier)
+    assert tier.stats()["ssd_entries"] == 1, "fixture: nothing reached disk"
+
+    cold, cold_pool, cold_tier = store_at()
+    assert cold_tier.recovered == 1, "fixture: recovery adopted nothing"
+
+    # A rate that puts every length above the break-even, so the probe fires.
+    assert cold.prefetch_if_worth_it(toks, 1e-6), "the probe refused a resident prefix"
+    for _ in range(500):
+        if not cold_tier.fetch_pending(cold._hash_all(toks)):
+            break
+        time.sleep(0.01)
+    assert cold_tier.stats()["ssd_fetches_ready"] == 1, (
+        f"the reader thread never completed: {cold_tier.stats()}"
+    )
+
+    hit = cold.lookup(toks)
+    assert hit is not None and cold.stats()["ssd_hits"] == 1, "the faulted prefix did not serve"
+    assert torch.equal(cold_pool.k_pool[:, hit.blocks[3]],
+                       torch.full_like(cold_pool.k_pool[:, hit.blocks[3]], 4.0)), (
+        "block 3 came back wrong, so the prefetched blob was not what got copied"
+    )
+    # The mechanism: the blob came from the reader thread's queue, not from the tick.
+    assert cold_tier.stats()["ssd_prefetches"] == 1
+    assert cold_tier.take(cold._hash_all(toks)) is None, (
+        "the prefetch is still parked, so lookup() did its own read and the fetch was wasted"
+    )
+    assert cold_tier.stats()["ssd_tick_loads"] == 0, (
+        f"lookup() did {cold_tier.stats()['ssd_tick_loads']} torch.load on the calling "
+        "thread; that is the 1.7 s this change exists to move off the tick, and the bytes "
+        "would be right either way"
+    )
+
+
+def test_a_fetch_still_in_flight_is_waited_for_not_re_read_on_the_tick(tmp_path):
+    """The path that only exists while the reader thread is slow.
+
+    The two arms above let the prefetch finish first, so the in-flight branch never
+    ran and a mutation deleting it left them green. Here the load is stalled, so
+    lookup() meets a fetch that has not landed -- and must decline rather than do
+    the 1.7 s read itself under the engine lock.
+    """
+    torch.manual_seed(0)
+    toks = list(range(8 * BLOCK_TOKENS))
+    pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    tier = KvTier(str(tmp_path), "fp-slow", min_tokens=BLOCK_TOKENS)
+    store = PrefixStore(pool, ssd=tier)
+    blocks = [pool.alloc_block() for _ in range(8)]
+    assert store.insert(toks, blocks, (torch.randn(3, 4, 8, 8), None))
+    _flushed(tier)
+
+    cold_pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    cold_tier = KvTier(str(tmp_path), "fp-slow", min_tokens=BLOCK_TOKENS)
+    cold = PrefixStore(cold_pool, ssd=cold_tier)
+    assert cold_tier.recovered == 1, "fixture: nothing recovered, so no fetch can be slow"
+
+    release = threading.Event()
+    real_load = torch.load
+
+    def stalled(*a, **k):
+        release.wait(timeout=10)
+        return real_load(*a, **k)
+
+    with unittest.mock.patch.object(torch, "load", stalled):
+        assert cold.prefetch_if_worth_it(toks, 1e-3), "probe refused"
+        key = cold._hash_all(toks)
+        for _ in range(200):          # wait for the reader thread to be INSIDE the load
+            if cold_tier.fetch_pending(key):
+                break
+            time.sleep(0.005)
+        assert cold_tier.fetch_pending(key), "the fetch finished; this arm needs it in flight"
+
+        assert cold.lookup(toks) is None, (
+            "lookup served a hit while the fetch was still reading, so it did the read "
+            "itself on the calling thread"
+        )
+        assert cold_tier.stats()["ssd_tick_loads"] == 0, (
+            f"{cold_tier.stats()['ssd_tick_loads']} tick-side torch.load during an "
+            "in-flight fetch: the read moved back onto the tick"
+        )
+        assert cold.fetch_waits == 1, "the wait was not counted, so the branch did not run"
+
+        # Abandon it mid-read: the bytes must be dropped when they land, not parked.
+        cold.abandon_prefetch(toks)
+        release.set()
+        for _ in range(500):
+            if not cold_tier.fetch_pending(key):
+                break
+            time.sleep(0.01)
+    assert cold_tier.take(key) is None, (
+        "an abandoned in-flight fetch parked its buffer on arrival; every deadline drop "
+        "would then pin a host copy of the whole prefix"
+    )
+
+
+def test_the_break_even_refuses_a_prefix_below_it_and_the_deadline_drops_a_slow_fetch(tmp_path):
+    """n* gates the probe, and a fetch that misses its deadline is discarded."""
+    pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    tier = KvTier(str(tmp_path), "fp-be", min_tokens=BLOCK_TOKENS)
+    store = PrefixStore(pool, ssd=tier)
+    toks = list(range(8 * BLOCK_TOKENS))
+    blocks = [pool.alloc_block() for _ in range(8)]
+    assert store.insert(toks, blocks, (torch.randn(3, 4, 8, 8), None))
+    _flushed(tier)
+
+    # No fetch has run, so the rate is unmeasured and the answer is 0 -- fetch once and
+    # calibrate. Refusing instead would refuse every fetch after a restart, which is the
+    # only case this feature serves: nothing would ever measure the rate.
+    assert store.break_even_tokens(1000.0) == 0, (
+        "an unmeasured tier refused to calibrate; after a restart nothing would ever fetch"
+    )
+    tier.fetch_ms, tier.fetch_bytes = 1000.0, 182 * 2**20   # 182 MiB/s
+
+    # A slower card makes fetching win SOONER, not later: the V100 recomputes at
+    # 13.3 ms/token against 0.686 of read, so its n* is ~73 where the H20's is ~16,900.
+    slow, fast = store.break_even_tokens(1e2), store.break_even_tokens(1e7)
+    assert fast > slow, f"a faster card should raise the threshold ({fast} vs {slow})"
+    # Rates chosen from the two thresholds, not guessed: this pool's snapshot is a few KB,
+    # so n* here is tens of tokens, not the 27B's tens of thousands.
+    assert slow < len(toks) < fast, (
+        f"the fixture does not straddle the break-even ({slow} < {len(toks)} < {fast} "
+        "is false), so one of the two assertions below cannot discriminate"
+    )
+    assert not store.prefetch_if_worth_it(toks, 1e7), (
+        f"probe fired at n={len(toks)} with a break-even of {fast}: below n*, "
+        "recompute wins and the fetch is pure cost"
+    )
+    assert store.prefetch_if_worth_it(toks, 1e2), "probe refused above the break-even"
+
+    # The k/B term, isolated: at a read rate slower than the card recomputes, NO length
+    # pays and the answer is the sentinel. Without `- k/b` in the denominator this is a
+    # finite number and the tier fetches into a loss forever.
+    k = 2 * pool.num_layers * pool.num_kv_heads * pool.head_dim * pool.k_pool.element_size()
+    tier.fetch_ms, tier.fetch_bytes = 1000.0, k          # 1 token/s of bandwidth
+    assert store.break_even_tokens(2.0) == 1 << 31, (
+        "with the device slower per byte than the card is per token, fetching never wins "
+        "at any length; a finite break-even here means the k/B term is missing"
+    )
+
+    # The deadline: abandon it, and the bytes are dropped rather than parked.
+    store.abandon_prefetch(toks)
+    assert tier.stats()["ssd_fetch_drops"] >= 1, "abandoning counted no drop"
+    for _ in range(500):
+        if not tier.fetch_pending(store._hash_all(toks)):
+            break
+        time.sleep(0.01)
+    assert tier.take(store._hash_all(toks)) is None, (
+        "an abandoned fetch parked its buffer anyway, so a dropped prefetch leaks it"
+    )
+
+
+def test_the_break_even_operands_come_from_the_pool_not_a_constant(tmp_path):
+    """k must be read from the pool's dtype and shape, not written down.
+
+    The 27B's KV is 64 KiB/token on an H20 (bf16 pool) and 128 KiB on the V100
+    (f32, backend.py:353) -- one model, two correct answers, and a constant would
+    be wrong on one card. Two pools differing only in dtype must give thresholds
+    in that 2:1 ratio.
+    """
+    def store_with(dtype):
+        pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,), dtype=dtype)
+        tier = KvTier(str(tmp_path / dtype.__str__()), f"fp-{dtype}", min_tokens=BLOCK_TOKENS)
+        s = PrefixStore(pool, ssd=tier)
+        s._snapshot_bytes = 4 << 20                       # same S on both sides
+        tier.fetch_ms, tier.fetch_bytes = 1000.0, 400 << 20   # same B
+        return s
+
+    # The rate matters: at R=500 the k/B term is ~0.15 us against 2000 us of recompute,
+    # so both dtypes round to the same n* and the test cannot see the operand it exists
+    # to check. 2.5e6 tok/s puts 1/R at 0.4 us, the same order as k/B.
+    narrow = store_with(torch.bfloat16).break_even_tokens(2.5e6)
+    wide = store_with(torch.float32).break_even_tokens(2.5e6)
+    assert 0 < narrow < wide, (
+        f"an f32 pool reads twice the bytes per token, so its break-even must be higher: "
+        f"bf16 {narrow} vs f32 {wide}"
+    )
