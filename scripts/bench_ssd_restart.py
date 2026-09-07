@@ -155,7 +155,10 @@ def _matched_tokens(spill: str, turn2_ids: int) -> int:
     d = os.path.join(spill, "tilerl_kvtier")
     best = 0
     for f in glob.glob(os.path.join(d, "*.kv")):
-        n = len(torch.load(f, map_location="cpu")["tokens"])
+        try:
+            n = len(torch.load(f, map_location="cpu")["tokens"])
+        except Exception:  # noqa: BLE001, PERF203 - written in place, may be mid-save
+            continue
         if n < turn2_ids:
             best = max(best, n)
     return best
@@ -194,7 +197,16 @@ def _prefix_check(spill: str, args, prompt: str, reply: str) -> dict:
             ChatMessage(role="assistant", content=reply),
             ChatMessage(role="user", content=_FOLLOWUP),
         ]))
-        entries = [list(torch.load(f, map_location="cpu")["tokens"]) for f in kvs]
+        # Skip an entry mid-write: the tier saves .kv in place with no temp-and-rename,
+        # so a file the writer thread has not finished raises inside torch.load. Skipping
+        # one is right -- an unfinished entry cannot serve a lookup either -- but aborting
+        # the whole probe on it turns a readable tier into "unavailable" (measured).
+        entries, unreadable = [], []
+        for f in kvs:
+            try:
+                entries.append(list(torch.load(f, map_location="cpu")["tokens"]))
+            except Exception:  # noqa: BLE001, PERF203 - still being written
+                unreadable.append(os.path.basename(f))
     except Exception as e:  # noqa: BLE001 - a probe; the arms still run
         return {"prefix_check": f"unavailable: {type(e).__name__}: {e}"}
 
@@ -207,7 +219,8 @@ def _prefix_check(spill: str, args, prompt: str, reply: str) -> dict:
     per = [diff(e) for e in entries]
     servable = [p["stored_ids"] for p in per if p["prefix"]]
     return {"prefix_check": "MATCH" if servable else "DIVERGES",
-            "turn2_ids": len(turn2), "servable": sorted(servable), "entries": per}
+            "turn2_ids": len(turn2), "servable": sorted(servable), "entries": per,
+            "unreadable": unreadable}
 
 
 def _evict_cache(spill: str) -> str:
