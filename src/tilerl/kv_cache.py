@@ -1260,14 +1260,23 @@ class PrefixStore:
         if self._ssd is not None:
             self._ssd.invalidate()
 
+    def _entries_capacity(self) -> int:
+        """How many entries can be resident at once, from whichever budget binds.
+
+        A snapshot is a constant size at any prefix length, so bytes cap the count. The
+        host tier counts too: `_demote_one` moves a snapshot there and leaves the entry
+        matchable, so a store with `state_bytes=0` and a tier holds entries, not none.
+        """
+        if self._snapshot_bytes <= 0:
+            return self.capacity
+        avail = self.state_bytes + (0 if self._dram is None else self._dram.budget_bytes)
+        return min(self.capacity, avail // self._snapshot_bytes)
+
     def stats(self) -> dict[str, int]:
         st = {
             "entries": len(self._by_id),
             "capacity": self.capacity,
-            # A snapshot is a constant size at any prefix length, so `state_bytes` is the
-            # ceiling that binds, not `capacity`.
-            "entries_capacity": (min(self.capacity, self.state_bytes // self._snapshot_bytes)
-                                 if self._snapshot_bytes > 0 else self.capacity),
+            "entries_capacity": self._entries_capacity(),
             "state_bytes": self._state_used,
             # The budget beside the fill, for the reason `dram_budget` exists: `state_bytes`
             # alone cannot say whether the store is at its ceiling, so a reader cannot tell

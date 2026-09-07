@@ -362,6 +362,51 @@ def test_prefix_state_budget_evicts():
     )
 
 
+def test_entries_capacity_counts_the_host_tier():
+    """A demoted entry stays matchable, so the host tier's bytes are capacity too.
+
+    `state_bytes=0` with a tier is a real config (`_demote_one` moves every snapshot to the
+    host and the entry keeps its tokens and blocks). Reading only `state_bytes` reported 0
+    while the store held 3 entries a lookup could match -- an operator sizing against it
+    would see a store that cannot hold anything.
+    """
+    from tilerl.kv_cache import DramSnapshots
+
+    state = (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16))
+    one = _nbytes(state)
+
+    def run(state_bytes: int, dram_entries: int | None) -> tuple[int, int]:
+        pool = PagedKvPool(256, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+        dram = None if dram_entries is None else DramSnapshots(budget_bytes=dram_entries * one)
+        store = PrefixStore(pool, state_bytes=state_bytes * one, dram=dram)
+        toks = list(range(400))
+        for length in (BLOCK_TOKENS * 2, BLOCK_TOKENS * 4, BLOCK_TOKENS * 6):
+            store.insert(toks[:length],
+                         [pool.alloc_block() for _ in range(length // BLOCK_TOKENS)],
+                         (state[0].clone(), state[1].clone()))
+        st = store.stats()
+        return st["entries"], st["entries_capacity"]
+
+    # HBM holds none, the host holds 5: the entries are all demoted and all matchable.
+    entries, cap = run(0, 5)
+    assert (entries, cap) == (3, 5), (
+        f"state_bytes=0 with a 5-entry host tier: {entries} resident against a reported "
+        f"capacity of {cap}. A capacity below the resident count is not a ceiling"
+    )
+    assert cap >= entries, "capacity below the resident count"
+
+    # The no-tier arm is the control: without it, returning `capacity` unconditionally
+    # would satisfy the assert above and still ignore both budgets.
+    entries, cap = run(2, None)
+    assert (entries, cap) == (2, 2), (
+        f"no tier, 2 entries of budget: expected (2, 2), got ({entries}, {cap})"
+    )
+
+    # Both budgets sum: 2 in HBM + 3 on the host.
+    entries, cap = run(2, 3)
+    assert cap == 5, f"HBM 2 + host 3 should report 5, got {cap}"
+
+
 def test_a_block_costs_2125_kib_at_the_27b_shape():
     """Pin the per-block byte cost the pool-sizing arithmetic is written against.
 

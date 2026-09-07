@@ -17,8 +17,9 @@ into a fixed entry count regardless of how long the prefixes are.
 
 ## What Worked
 
-`entries_capacity = min(capacity, state_bytes // snapshot_bytes)`, published as
-`prefix_entries_capacity`. Against the live server's own numbers:
+`entries_capacity = min(capacity, (state_bytes + dram_budget) // snapshot_bytes)`,
+published as `prefix_entries_capacity`. Against the live server's own numbers
+(no host tier there, so `dram_budget` is 0):
 
 | operand | value |
 |---|---|
@@ -84,3 +85,41 @@ agrees with no observation is arithmetic, not a measurement.
   already covers the new key: dropping the `_build_stats` line fails it at
   `test_kv.py:620`. Confirmed by running that mutant, not by inspection.
 - Suite: 459 passed, 14 skipped.
+
+## Correction: the first version ignored the host tier
+
+The derivation as first shipped read `state_bytes // snapshot_bytes`, and that is
+wrong wherever a DRAM tier exists. `_demote_one` moves a snapshot to the host and
+**leaves the entry matchable** — same tokens, same blocks, still in the index — so
+the host's bytes are capacity too. Measured on the config `tests/test_e2e.py`
+already uses (`state_bytes=0` with a tier):
+
+| | resident entries | reported capacity |
+|---|---:|---:|
+| as shipped | 3 | **0** |
+| corrected | 3 | 5 |
+
+A capacity **below** the resident count is not a ceiling, and an operator sizing
+against it sees a store that cannot hold anything. The V100 numbers above are
+unaffected — that server runs no host tier, so `dram_budget` is 0 and 11 stands.
+
+The gate this needed is a second arm, not a tighter assert on the first:
+`test_entries_capacity_counts_the_host_tier`, three configs (tier only, HBM only,
+both — which must sum). Two mutants, each red on its own assertion: the shipped
+`avail = self.state_bytes` gives `(3, 0) == (3, 5)`, and returning `capacity`
+unconditionally trips both this arm and the older one. Suite 459 → **460 passed,
+14 skipped**.
+
+What let it through: I checked the derivation against the one card in front of me,
+which has no host tier, so the operand that was missing was **zero in every number
+I looked at**. An arithmetic identity holds on a config where a term is 0 whether
+or not the term belongs.
+
+**And the config that would have caught it already existed in the tree.**
+`tests/test_e2e.py:869` builds a `PrefixStore(pool, state_bytes=0, dram=dram)` —
+the exact shape where the missing term is non-zero. It was one assertion away, in a
+file I had already read that day. So the reusable check is not "test more configs";
+it is: **before publishing a derived quantity, grep the suite for a fixture where
+one of its operands is non-default, and read the derivation against that fixture.**
+A term that is zero on the box you are looking at is invisible to every number that
+box produces, and the tree usually already contains the case that exposes it.
