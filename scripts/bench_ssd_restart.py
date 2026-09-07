@@ -337,6 +337,11 @@ def _arm(args, name: str, spill: str, prompt, reply: str = "") -> dict:
         "ssd_tick_loads": d("ssd_tick_loads"),
         # 0 hits with waits > 0 is the row-58 signature: admitted before its fetch landed
         "ssd_fetch_waits": d("ssd_fetch_waits"),
+        # B for this arm. The faulted arm moved 1.234 -> 1.803 s across two runs of
+        # one sha; page-cache state is the candidate and this is what tests it.
+        "fetch_ms": d("ssd_fetch_ms"),
+        "fetch_mib_s": round(d("ssd_fetch_bytes") / 2**20 / (d("ssd_fetch_ms") / 1000), 1)
+                       if d("ssd_fetch_ms") > 0 else None,
         "prefill_rate": after.get("prefill_rate"),
         "break_even_tokens": after.get("prefix_break_even_tokens"),
     }

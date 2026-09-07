@@ -855,6 +855,9 @@ class KvTier:
             "ssd_fetch_drops": self.fetch_drops,
             "ssd_tick_loads": self.tick_loads,
             "ssd_fetch_ms": int(self.fetch_ms),
+            # with fetch_ms this gives B for the run: a warm page cache and a cold
+            # one differ ~20x here, and that is what moves the faulted arm.
+            "ssd_fetch_bytes": self.fetch_bytes,
         }
 
 
