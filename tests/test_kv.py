@@ -457,7 +457,7 @@ def test_a_second_client_waits_for_capacity_instead_of_503ing():
         # this assert were wrong: `entries >= entries` passed with the guard REMOVED (the count
         # rises as the live request publishes its own chunk boundaries), and comparing
         # `evictions` against a baseline was red on CORRECT code, because decode growth at
-        # engine.py:915 evicts legitimately for the running request and `insert` trims at
+        # engine.py:886 evicts legitimately for the running request and `insert` trims at
         # capacity. Neither is the waiting request's doing.
         # The BLOCKED attempts, i.e. every one that returned False. The final attempt -- the
         # one that succeeds after the first request finishes -- legitimately evicts, because by

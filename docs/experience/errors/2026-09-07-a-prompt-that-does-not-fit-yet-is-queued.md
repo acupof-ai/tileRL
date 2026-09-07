@@ -15,11 +15,13 @@
 > (`kv_cache.py:910`), not `evict_until_free`: A republishes its prefix every chunk, and
 > `prefix_state_bytes` sat at 1,725,825,024 of a 1,845,067,776 budget — **93.5% full** — with
 > `prefix_published` tracking `prefill_forwards` 1:1. So the trim ran continuously and dropped
-> roughly one entry per chunk, freeing nothing because A retained the blocks. `_admit`'s own
-> eviction never ran: `reclaimable_blocks` stayed short of the 40-block gap on every tick, so
-> the guard left the store alone for the whole 518 s — which is the guard working. **The two
+> roughly one entry per chunk, freeing nothing because A retained the blocks. **The two
 > readings invert the conclusion and look identical on the counter**; they were told apart by
 > the publish-per-chunk 1:1 ratio and the 93.5% state fill, not by the eviction count.
+>
+> **`_admit` was never called for B in this arm** (`engine.py:693`, the batch cap), so nothing
+> here tests the `reclaimable_blocks` guard; see the five-arm section below, which also corrects
+> the claim this line first made.
 >
 > **First measured queued wait.** `messages.py:72` says of the 1800 s cap: "this is the ceiling
 > for a request the scheduler may hold behind a full batch, not the cost of one; nothing has
@@ -40,6 +42,72 @@ arm shows concurrent admission and nothing else, and its eviction counts are not
 arm 1's 47 either, since a 41% smaller budget trims earlier per chunk. Same class as one knob
 crossing two thresholds: **before reading a one-flag arm as one variable, ask what else the flag
 derives.** The one-variable arm pins the pool: `--max-batch 2 --blocks 2048`.
+
+## Five arms, and what each one could not say
+
+Both of this change's claims are measured: the guard **declines** when eviction cannot help, and
+**permits** when it can. It took five arms because the first four each failed to reach the guard
+for a different reason, and each failure looked like a result.
+
+| arm | config | `_admit` called for B | B fits? | guard | the observable |
+|---|---|---|---|---|---|
+| 1 | mb 1, pool 2048, cold | **never** — batch cap | n/a | untested | B waited **518.6 s**, both 200 |
+| 2 | mb 2, pool **3494** | yes | yes, bigger pool | reached, declined | no wait; A **1.31x** slower |
+| 2b | mb 2, pool 2048 | yes | yes, **prefix hit** | reached, declined | 211 needed, 144 allocated, **67 adopted** |
+| 2c | mb 2, pool 2048, distinct filler | yes | **no** | **negative path** | `pool_used` pinned **1877**, B waited **529.3 s** |
+| 3 | 2c + **72 warm blocks** | yes | **after eviction** | **positive path** | never waited; `pool_used` **2037** where 2,088 was demanded |
+
+**Arm 1 never reached `_admit`.** `engine.py:693` is
+`while self._waiting and len(self._running) < self.limits.max_batch`, so at `--max-batch 1` the
+loop body does not run while A holds the only slot. B waited on the **batch cap**, not on a block
+decision. This entry first claimed the guard "declined on every tick for 518 s"; that was wrong,
+and the queue-and-wait result — which is what the fix claims — does not depend on it.
+
+**Arm 2b's fixture defect: both clients shared one filler.** `"w " * n` for A and B makes B's
+prompt a literal prefix of A's, so B adopted A's published blocks and `needed` fell from 211 to
+144, which fits in 171 free — `_admit` returned before `evict_until_free`. A client sized from
+live state can still be wrong in its **content**. Arm 2c gives B its own filler and a distinct
+leading token, so no block hash can match: the shared chat header `<|im_start|>user\n` is ~3
+tokens against `BLOCK_TOKENS` 16, and `"aa "` vs `"bb "` diverges inside block 0. A hit is
+impossible by construction rather than merely unobserved, and `prefix_hits == 0` is now asserted
+as a postcondition.
+
+**Warming does not widen the guard's window; it moves `free` down.** The positive path needs
+`free < needed <= free + reclaimable`, and **`free + reclaimable` is `pool − A` = 171 whatever is
+warmed**, because a warm block comes out of free 1:1. So the lever is B's size relative to free,
+not the amount warmed: at `warm=0`, `free=171 < B=211 <= 171` is false (that is arm 2c); at
+`warm=72`, `free=99 < B=139 <= 171` holds. Predicted before the run and matched to the block.
+
+**The eviction COUNT is not the discriminator, in either direction.** The signature agreed before
+arm 3 was "one eviction burst above the constant published−evictions gap". Arm 3 shows no burst:
+the gap climbs 3→11 over the first 34 s and then holds at **11** for the remaining 540 s, and arm
+3's *total* evictions (51) are **fewer** than arm 2c's (58) — the arm that freed nothing evicted
+more. Eviction runs continuously in both arms because every finished decode publishes and the
+store is at capacity; whether it *frees* depends on whether the blocks are retained elsewhere,
+which no count on the wire distinguishes. Had the pre-agreed signature been the criterion, arm 3
+would have been scored a failure. The evidence is `pool_used`, and as a **level**, not a delta: B
+needs 139 blocks on top of A's 1,949, `1949 + 139 = 2088` exceeds the 2,048-block pool, so the
+observed 2,037 is only reachable if eviction returned at least **51 blocks** — with `prefix_hits`
+0, none of it adoption. The pool ceiling settles it without sampling. A delta between two polls
+attributes to whatever happened between them: the "2037 → 2013 fall" first written here is a
+24-block move at t+37.6 s, with `running` already 2 at t+5.4 s — it happened *after* both
+requests were admitted and was not B's admission at all.
+
+**Arm 3's positive path is proved by the absence of a wait, and that is why the level matters.**
+`waiting` never left 0 in 324 samples: B was admitted on its **first** `_admit` call, so there is
+no wait window to point at and no eviction burst to time. The only observable is that B got 139
+blocks the free list did not have. Arm 2c is the control that makes this readable — same pool,
+same sizing rule, `waiting` pinned at 1 for **529.3 s** and `pool_used` pinned at 1877 across the
+whole window. One arm waits and frees nothing; the other frees and never waits.
+
+**And two measurement notes, both instrument defects in this window's own tooling.** The gap
+series above is arm 3's, because arm 2c's rows carry **no `published` at all** — 0 of 274 —
+`published` was added to the sampler after the pod already had its copy, so an earlier draft of
+this entry reported a "constant gap of 11 in arm 2c *and* arm 3" when arm 2c could not produce a
+gap: the missing field read as 0 and `0 − evictions` looked like a series. A field added after
+the copy that runs reads as absent, the same shape as `blocks_freed` reaching no wire. Arm 2c's
+independent evidence is its `pool_used`, pinned at 1877. The sampler now asserts its keys are
+present in the first row — written after this defect, so it did not catch this one.
 
 ## Context — the cause measurement, which came before any code
 
@@ -167,7 +235,7 @@ Three controls, each run separately, each red on its own assertion:
 lesson here. The store-untouched check first read `entries >= entries` and **passed with the
 guard removed** — the entry count rises as the live request publishes its own chunk boundaries.
 Comparing the global `evictions` counter was then **red on correct code**, because decode growth
-(`engine.py:915`) evicts legitimately for a running request and `insert` trims at capacity;
+(`engine.py:886`) evicts legitimately for a running request and `insert` trims at capacity;
 neither is the waiting request's doing. It now wraps `_admit` and asserts per attempt:
 `[0]*26 + [3]`, where the 3 is the admission that finally succeeded once the first request
 finished. Asserting on all 27 attempts would have called that correct eviction a defect.
