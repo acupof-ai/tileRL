@@ -587,9 +587,8 @@ def linear_attn_bwd(
     return gdn_backward(grad, q, k, v, g, beta, state, **kw)
 
 
-#: gated-delta backward chunk: 16, not upstream's 64, for precision (worst rel
-#: error vs autograd: C=16 4-12e-7, C=32 1.1-2.3e-6, C=64 1.9-4.9e-6)
-_GDN_CHUNK = 16
+#: 64: both chunk loops are dispatch-bound, so 4x the chunk costs the same per call
+_GDN_CHUNK = 64
 
 
 def _gdn_chunk_fwd(qc, kc, vc, bc, gtc, s):
