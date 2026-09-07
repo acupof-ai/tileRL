@@ -16,7 +16,14 @@ each call. Two things that makes it, and two it does not:
 * NOT a kernel profile. A handler's time includes python, dispatch and allocation; a slow
   line says "look here", not "this kernel is slow".
 * NOT comparable across trees or across box states — one process, one step, and the sync
-  per handler is overhead the shipped path does not pay (reported as its own figure).
+  per handler is overhead the shipped path does not pay. `--no-instrument` is that arm:
+  measured at C=128, 31.339 s bare against 34.717 (`--inside-gdn`) and 35.620 (registry).
+  Each difference bounds ITS OWN arm's instrument; there is no per-call cost across arms,
+  because the two wrappers sit at different depths and their call counts measure different
+  things (fitting one gives -102.8 us/call — the arm with more timed calls is the faster).
+* NOT a claim about what the unattributed remainder is. It is dominated by the ops the
+  chosen arm does not wrap: `--inside-gdn` leaves 26.918 s at C=128, registry mode 4.831 s
+  for the same work.
 
   TILERL_TARGET=cpu python3 scripts/prof_backward_ops.py --selfcheck   # no GPU
   scripts/pod_run.sh bwdops 6 -- python3 -u scripts/prof_backward_ops.py --gen 1024
@@ -331,6 +338,13 @@ def main() -> int:
     ap.add_argument("--count-kernels", action="store_true",
                     help="CUDA launch count for the warm step instead of per-op times; the "
                          "profiler distorts wall time, so never read seconds off this run")
+    #: The control for what the per-op tables cannot see. BOTH instrument() and
+    #: instrument_gdn() sync twice per handler call, so registry mode is not a sync-free arm --
+    #: it only has fewer timed calls. Only this one leaves the shipped path alone, which makes
+    #: each arm's attributed total an upper bound rather than a measurement.
+    ap.add_argument("--no-instrument", action="store_true",
+                    help="time the step with NO per-op hooks: backward_secs only, the "
+                         "shipped path's own number")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     if a.selfcheck:
@@ -363,7 +377,10 @@ def main() -> int:
     vocab = int(getattr(cfg, "vocab_size", 0)) or 1000
     prompt = rng.integers(1, vocab, size=a.prompt_tokens, dtype=np.int64)
 
-    secs, calls = instrument_gdn(sync) if a.inside_gdn else instrument(sync)
+    if a.no_instrument:
+        secs, calls = defaultdict(float), defaultdict(int)
+    else:
+        secs, calls = instrument_gdn(sync) if a.inside_gdn else instrument(sync)
     from tilerl_kernels import reference
     if a.gdn_chunk:
         reference._GDN_CHUNK = a.gdn_chunk
@@ -433,6 +450,11 @@ def main() -> int:
             launches = None
         row = {"step": step + 1, "train_secs": round(time.perf_counter() - t0, 4),
                "backward_secs": round(timings.get("backward_secs", 0.0), 4)}
+        if cuda:
+            # per-arm, because a cross-arm comparison of two arms at very different
+            # footprints cannot rule out memory pressure without it
+            row["peak_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
+            torch.cuda.reset_peak_memory_stats()
         if launches is not None:
             # under the profiler, so train_secs on this row is inflated and not comparable
             row["cuda_launches"] = launches
@@ -443,19 +465,35 @@ def main() -> int:
     attributed = sum(secs.values())
     bwd = rows_out[-1]["backward_secs"]
     table = _rows(secs, calls, attributed)
-    print(f"\n# backward_secs {bwd:.3f} (rl_step's own timing, no per-handler sync)")
+    if a.no_instrument:
+        # The control: no hooks, so backward_secs is the shipped path's own number and the
+        # difference against an instrumented run at the same chunk is the probe's sync cost.
+        print(f"\n# backward_secs {bwd:.3f} -- NO instrumentation, the shipped path")
+        print("# no per-op table: nothing was timed. Against the SAME arm's instrumented run "
+              "this bounds that arm's instrument cost -- per arm only: the registry and "
+              "--inside-gdn wrappers sit at different depths, so their call counts measure "
+              "different things and no per-call cost is recoverable across them (fitting one "
+              "gives -102.8 us/call, since the arm with more timed calls is the faster).")
+        if a.out:
+            Path(a.out).write_text(json.dumps(
+                {"rows": rows_out, "backward_secs": bwd, "instrumented": False},
+                indent=2, sort_keys=True))
+        return 0
+    # `rl_step` times the whole tape.backward call, so this figure CONTAINS the per-handler
+    # syncs -- it is not a sync-free reading. --no-instrument is the arm that is.
+    print(f"\n# backward_secs {bwd:.3f} (rl_step's own timing, syncs included)")
     print(f"# attributed to handlers {attributed:.3f} over {sum(calls.values())} calls")
     # A RESIDUAL, named as one. It was labelled "sync overhead this probe adds" and printed
-    # -4.797 s: a negative overhead is a contradiction, and the sign says the handlers do not
-    # account for all of backward_secs. What is outside them is Tape.backward's own loop --
-    # grads dict arithmetic, the `grads[tid] + g_in` accumulate, _release, entry bookkeeping --
-    # plus whatever the per-handler syncs add on top, which is why this is a net figure and
-    # not a measurement of either term.
+    # -4.797 s: a negative overhead is a contradiction. What is outside the handlers is
+    # dominated by the ops THIS arm does not wrap -- measured: --inside-gdn times three
+    # reference functions and leaves 26.918 s at C=128, where the registry arm times every
+    # op and leaves 4.831 s for the same work (backward_secs 34.717 vs 35.620, within 2.6%).
+    # Tape.backward's own loop is inside it too but was never shown to dominate it.
     resid = bwd - attributed
     print(f"# unattributed: {resid:+.3f} s ({resid / bwd * 100:+.1f}% of backward_secs) -- "
-          f"Tape.backward's own loop and bookkeeping, NET of the per-handler sync overhead "
-          f"this probe adds. Shares are within the attributed total; absolute seconds are not "
-          f"the shipped path's")
+          f"mostly the ops this arm does not wrap, plus Tape.backward's own loop and the "
+          f"per-handler syncs. Shares are within the attributed total; absolute seconds are "
+          f"not the shipped path's -- --no-instrument is that arm")
     print(f"\n# {'op':<20} {'secs':>9} {'share':>7} {'calls':>7} {'ms/call':>9}  kind")
     for r in table:
         print(f"  {r['op']:<20} {r['secs']:9.3f} {r['share']:6.2f}% {r['calls']:7d} "

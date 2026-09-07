@@ -842,13 +842,17 @@ def test_gdn_backward_precision_tracks_the_chunk_size():
         f"{_GDN_GRAD_BAR:.0e} bar (16 -> {e16:.1e}, 64 -> {e64:.1e})")
     # An absolute bar cannot bound the chunk on its own: measured on this fixture the whole
     # f32 family is inside 1e-4 (T=512: C=128 3.9e-5, C=256 9.9e-5), and once chunk >= T
-    # there is one chunk and the error stops moving. So the allow-list is what makes raising
-    # the constant a deliberate act; the bar above only catches a dtype-class regression.
-    assert reference._GDN_CHUNK in (16, 64), (
-        f"_GDN_CHUNK is {reference._GDN_CHUNK}; 51e965e chose 16 and "
-        f"wins/2026-09-07-c64-backward-chunk.md raised it to 64 on a measured step time "
-        f"(here: 16 -> {e16:.1e}, 64 -> {e64:.1e}). Another value is a real tradeoff, not a "
-        "free speedup -- price it in an entry and add it here")
+    # there is one chunk and the error stops moving. At the shipped T=1280 the ordering is
+    # clean and every value still passes (16 4.6e-6, 64 7.5e-6, 128 2.0e-5, 256 2.8e-5), so
+    # the allow-list is what makes raising the constant a deliberate act; the bar above only
+    # catches a dtype-class regression.
+    assert reference._GDN_CHUNK in (16, 64, 128), (
+        f"_GDN_CHUNK is {reference._GDN_CHUNK}; 51e965e chose 16, "
+        f"wins/2026-09-07-c64-backward-chunk.md raised it to 64 (1.935x) and "
+        f"wins/2026-09-07-c128-backward-chunk.md to 128 (a further 1.194x) on measured step "
+        f"times (here: 16 -> {e16:.1e}, 64 -> {e64:.1e}). 256 was measured and refused. "
+        "Another value is a real tradeoff, not a free speedup -- price it in an entry and add "
+        "it here")
 
 
 def test_gdn_bwd():
