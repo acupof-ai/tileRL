@@ -318,12 +318,14 @@ No rate, because the run OOMed after those two arms for the reason in the traps 
 The B=32 row is the whole-run rate at equal total work and unequal concurrency (bf16 22
 rows, fp8 32), so it is an end-to-end reading, not a per-tick one.
 
-Still pending, and it needs a card window with the 42 GB checkpoint:
-
-1. **decode ms/tick at B=8 ctx=8k**, fp8 against bf16 at equal concurrency, whose ceiling
-   is 1.079x. The one number that could still show a gain, and the only one that isolates
-   the readers' per-gather dequant from the writers' quantize-on-write. B=1 is not the
-   cell: its ceiling is 1.011x at 8k and 1.041x at 32k, both under run-to-run variance.
+**One open measurement, deliberately not scheduled.** The per-tick decode ratio at equal
+concurrency — B=8 ctx=8k, fp8 against bf16 at the same row count — is the only number that
+isolates the readers' per-gather dequant from the writers' quantize-on-write, and the only
+place a gain could still be. It is **bounded at 1.079x**, and a 1.079x decode ceiling
+cannot flip a default that is off on a measured 1.73x whole-run slowdown and ~7% prefill
+cost. So it waits for a decode-bound long-context use case to justify the card window,
+rather than being run to complete the table. B=1 is not the cell if it ever is run: its
+ceiling is 1.011x at 8k and 1.041x at 32k, both under run-to-run variance.
 
 Raw artifacts: `scripts/probe_kv_fp8_kernels.py` (the four card arms, JSON on stdout)
 and `scripts/probe_kv_fp8_27b.py` (the 27B arms). The append-rule and RoPE-absmax
