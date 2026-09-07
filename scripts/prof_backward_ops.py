@@ -245,13 +245,33 @@ def _selfcheck() -> int:
     finally:
         ag._BWD.clear()
         ag._BWD.update(saved)
+
+    # --frozen-shapes: fp4's wq is [N, K/2] packed and fp8's is [N, K], so one wrapper reading
+    # both must double only the fp4 width. A recorder that gets K wrong halves or doubles every
+    # FLOP figure derived from it, and nothing downstream would look wrong.
+    saved = dict(ag._BWD)
+    try:
+        ag._BWD.clear()
+        for nm in ("linear_fp4_frozen", "linear_fp8_frozen"):
+            ag._BWD[nm] = lambda backend, g, args, kw: iter(((0, g),))
+        shapes = instrument_shapes()
+        g4 = torch.zeros(2, 3, 8)                     # M = 6 after the reshape, N = 8
+        list(ag._BWD["linear_fp4_frozen"](None, g4, (None, torch.zeros(8, 5)), {}))
+        list(ag._BWD["linear_fp8_frozen"](None, g4, (None, torch.zeros(8, 5)), {}))
+        assert shapes[("linear_fp4_frozen", 6, 8, 10)] == 1, dict(shapes)  # 5 * 2 = 10
+        assert shapes[("linear_fp8_frozen", 6, 8, 5)] == 1, dict(shapes)   # 5 as-is
+        assert len(shapes) == 2, dict(shapes)
+    finally:
+        ag._BWD.clear()
+        ag._BWD.update(saved)
     print(f"selfcheck ok: a drained handler timed {secs['slow']:.3f}s, an undrained call "
           f"{undrained * 1000:.3f}ms; nested {secs2['outer']:.3f}s outer + "
           f"{secs2['inner']:.3f}s inner, exclusive so the shares sum to 100%; "
           f"{len(pairs)} of main()'s imports resolved; --inside-gdn splits a stub into "
           f"{secs3['gdn_backward']:.3f}s remainder + {secs3['_gdn_chunk_fwd']:.3f}s recompute "
           f"+ {secs3['_gdn_chunk_bwd']:.3f}s adjoint, with the M solve "
-          f"({secs3['solve_triangular (in recompute)'] * 1000:.3f}ms) taken OUT of recompute")
+          f"({secs3['solve_triangular (in recompute)'] * 1000:.3f}ms) taken OUT of recompute; "
+          f"the shape recorder doubles fp4's packed K (5 -> 10) and leaves fp8's at 5")
     return 0
 
 
@@ -318,6 +338,129 @@ def instrument_gdn(sync) -> tuple[dict, dict]:
     return secs, calls
 
 
+def instrument_shapes() -> dict:
+    """Count frozen-linear backward calls by (op, M, N, K). Returns the counter.
+
+    `_frozen`'s handler (autograd.py:247-252) gets `g` [.., N] and `args[1]` = wq, whose shape
+    is [N, K/2] for fp4 (packed nibbles) and [N, K] for fp8. M is g's flattened leading extent
+    -- the same reshape `linear_frozen_bwd` does, so M is the row count the GEMM actually sees
+    rather than the step's token total.
+
+    This exists because arithmetic did not reconcile: 8 micro-batches x 56 fp4 layers x 2 fused
+    linears x 2 (checkpoint replays `_mlp_body`) predicts 1792 calls and the measured count is
+    2112. Factoring 2112 produces several decompositions that fit and none that is evidence, so
+    the call sites are asked directly.
+    """
+    shapes: dict = defaultdict(int)
+
+    def wrap(name, fn, fp8):
+        def handler(backend, g, args, kw):
+            wq = args[1]
+            n = wq.shape[0]
+            k = wq.shape[1] if fp8 else wq.shape[1] * 2
+            shapes[(name, int(g.reshape(-1, g.shape[-1]).shape[0]), int(n), int(k))] += 1
+            yield from fn(backend, g, args, kw)
+
+        return handler
+
+    for name, fp8 in (("linear_fp4_frozen", False), ("linear_fp8_frozen", True)):
+        ag._BWD[name] = wrap(name, ag._BWD[name], fp8)
+    return shapes
+
+
+def bench_dx_gemms(shapes: dict, sync, reps: int = 12) -> list[dict]:
+    """Time the dX contraction each frozen row runs -- g [M,N] @ W [N,K] -> [M,K], bf16.
+
+    Not a square GEMM at "the shape": dX is what `linear_frozen_bwd` computes, so a different
+    contraction would floor the wrong quantity. Reports the spread as well as the median,
+    because 13.046 s / (one achieved TFLOP/s) inherits that width.
+
+    CONDITION, reported with the number: this runs after a 27B backward in the same process, so
+    the model is resident (~64 GiB) and the clocks have been under sustained load. That makes
+    it the right place to learn the shapes and a possibly pessimistic place to read peak
+    throughput -- a low floor inflates any gap measured against it, which is the direction to
+    distrust.
+    """
+    out = []
+    for (op, m, n, k), count in sorted(shapes.items(), key=lambda kv: -kv[1] * kv[0][2] * kv[0][3]):
+        g = torch.randn(m, n, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+        for _ in range(3):
+            g @ w
+        sync()
+        times = []
+        for _ in range(reps):
+            t0 = time.perf_counter()
+            g @ w
+            sync()
+            times.append(time.perf_counter() - t0)
+        times.sort()
+        flop = 2 * m * n * k
+        med = times[len(times) // 2]
+        out.append({
+            "op": op, "M": m, "N": n, "K": k, "calls": count,
+            "median_ms": round(med * 1e3, 4),
+            "min_ms": round(times[0] * 1e3, 4),
+            "max_ms": round(times[-1] * 1e3, 4),
+            "tflops_median": round(flop / med / 1e12, 2),
+            "tflops_min": round(flop / times[-1] / 1e12, 2),
+            "tflops_max": round(flop / times[0] / 1e12, 2),
+            "row_flop_tf": round(flop * count / 1e12, 2),
+        })
+        del g, w
+        torch.cuda.empty_cache()
+    return out
+
+
+def bench_fp4_bwd(backend, shapes: dict, sync, reps: int = 12) -> list[dict]:
+    """Time `linear_frozen_bwd` BARE at each fp4 shape, beside the bf16 GEMM at the same shape.
+
+    This is the denominator any tile claim needs. Without it the row's 13.046 s carries the
+    per-handler timer's hooks (~10% on the arms where that was measured), so a ratio against a
+    GEMM floor mixes kernel time with instrument cost. Calling the backend method directly pays
+    neither the timer nor the tape.
+
+    fp4 only: the fp8 path has no kernel (`linear_frozen_bwd` gates on `not fp8`), so timing it
+    here would re-measure the eager reference the row already reports.
+    """
+    out = []
+    for (op, m, n, k), count in sorted(shapes.items(), key=lambda kv: -kv[1] * kv[0][2] * kv[0][3]):
+        if op != "linear_fp4_frozen" or n < 1024:  # the N=48 rows are 21 ms total; skip
+            continue
+        g = torch.randn(m, n, dtype=torch.bfloat16, device=backend.device)
+        # the shipped layout: packed nibbles [N, K/2] with an f32 scale per 16 columns
+        wq = torch.randint(0, 255, (n, k // 2), dtype=torch.uint8, device=backend.device)
+        scale = torch.rand(n, k // 16, dtype=torch.float32, device=backend.device) * 0.01
+        try:
+            for _ in range(3):
+                backend.linear_frozen_bwd(g, wq, scale)
+            sync()
+        except Exception as exc:  # a shape the kernel refuses is a finding, not a crash
+            out.append({"op": op, "M": m, "N": n, "K": k, "error": repr(exc)[:200]})
+            del g, wq, scale
+            continue
+        times = []
+        for _ in range(reps):
+            t0 = time.perf_counter()
+            backend.linear_frozen_bwd(g, wq, scale)
+            sync()
+            times.append(time.perf_counter() - t0)
+        times.sort()
+        med = times[len(times) // 2]
+        flop = 2 * m * n * k
+        out.append({
+            "op": op, "M": m, "N": n, "K": k, "calls": count,
+            "kernel_median_ms": round(med * 1e3, 4),
+            "kernel_min_ms": round(times[0] * 1e3, 4),
+            "kernel_max_ms": round(times[-1] * 1e3, 4),
+            "kernel_tflops": round(flop / med / 1e12, 2),
+            "row_secs_from_kernel": round(med * count, 4),
+        })
+        del g, wq, scale
+        torch.cuda.empty_cache()
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--selfcheck", action="store_true")
@@ -345,6 +488,11 @@ def main() -> int:
     ap.add_argument("--no-instrument", action="store_true",
                     help="time the step with NO per-op hooks: backward_secs only, the "
                          "shipped path's own number")
+    #: names the frozen-linear call sites and then floors them, in one process: the GEMM bench
+    #: needs the shapes the count table reveals, so a separate run would guess them
+    ap.add_argument("--frozen-shapes", action="store_true",
+                    help="count frozen-linear backward calls by (op, M, N, K), then time the "
+                         "bf16 dX GEMM at each shape; implies no per-op timing table")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     if a.selfcheck:
@@ -377,7 +525,11 @@ def main() -> int:
     vocab = int(getattr(cfg, "vocab_size", 0)) or 1000
     prompt = rng.integers(1, vocab, size=a.prompt_tokens, dtype=np.int64)
 
-    if a.no_instrument:
+    shapes = None
+    if a.frozen_shapes:
+        secs, calls = defaultdict(float), defaultdict(int)
+        shapes = instrument_shapes()
+    elif a.no_instrument:
         secs, calls = defaultdict(float), defaultdict(int)
     else:
         secs, calls = instrument_gdn(sync) if a.inside_gdn else instrument(sync)
@@ -465,6 +617,50 @@ def main() -> int:
     attributed = sum(secs.values())
     bwd = rows_out[-1]["backward_secs"]
     table = _rows(secs, calls, attributed)
+    if a.frozen_shapes:
+        total = sum(shapes.values())
+        print(f"\n# backward_secs {bwd:.3f} (shape counting only, no per-op timers)")
+        print(f"# {total} frozen-linear backward calls over {len(shapes)} distinct shapes")
+        print(f"\n# {'op':<20} {'M':>7} {'N':>7} {'K':>7} {'calls':>7}")
+        for (op, m, n, k), c in sorted(shapes.items(), key=lambda kv: (kv[0][0], -kv[1])):
+            print(f"  {op:<20} {m:7d} {n:7d} {k:7d} {c:7d}")
+        gemms = bench_dx_gemms(shapes, sync) if cuda else []
+        if gemms:
+            print("\n# bf16 dX GEMM (g[M,N] @ W[N,K]), 12 reps warm, MODEL RESIDENT so the")
+            print("# clocks are post-backward -- a floor read here is possibly pessimistic")
+            print(f"# {'op':<20} {'M':>7} {'N':>7} {'K':>7} {'med ms':>8} "
+                  f"{'TFLOP/s':>8} {'min':>7} {'max':>7} {'row TF':>9}")
+            for r in gemms:
+                print(f"  {r['op']:<20} {r['M']:7d} {r['N']:7d} {r['K']:7d} "
+                      f"{r['median_ms']:8.3f} {r['tflops_median']:8.2f} "
+                      f"{r['tflops_min']:7.2f} {r['tflops_max']:7.2f} {r['row_flop_tf']:9.2f}")
+        kern = bench_fp4_bwd(backend, shapes, sync) if cuda else []
+        if kern:
+            print("\n# linear_frozen_bwd BARE at the fp4 shapes, no tape and no timer -- the")
+            print("# denominator for a tile claim. `bf16 ms` repeats the GEMM above for contrast;")
+            print("# the kernel dequantizes inside the same launch, so it cannot match it.")
+            print(f"# {'M':>7} {'N':>7} {'K':>7} {'kern ms':>8} {'TFLOP/s':>8} {'bf16 ms':>8} "
+                  f"{'vs bf16':>8} {'row s':>8}")
+            bf = {(r["M"], r["N"], r["K"]): r for r in gemms}
+            for r in kern:
+                if "error" in r:
+                    print(f"  {r['M']:7d} {r['N']:7d} {r['K']:7d}  REFUSED: {r['error']}")
+                    continue
+                b = bf.get((r["M"], r["N"], r["K"]), {}).get("median_ms")
+                ratio = f"{r['kernel_median_ms'] / b:8.2f}" if b else "       -"
+                print(f"  {r['M']:7d} {r['N']:7d} {r['K']:7d} {r['kernel_median_ms']:8.3f} "
+                      f"{r['kernel_tflops']:8.2f} {b if b else 0:8.3f} {ratio} "
+                      f"{r['row_secs_from_kernel']:8.3f}")
+            done = sum(r.get("row_secs_from_kernel", 0.0) for r in kern)
+            print(f"# those shapes' rows from bare kernel time: {done:.3f} s "
+                  f"(the timed arm reported 13.046 s for all three fp4 shapes)")
+        if a.out:
+            Path(a.out).write_text(json.dumps(
+                {"rows": rows_out, "backward_secs": bwd,
+                 "shapes": [{"op": o, "M": m, "N": n, "K": k, "calls": c}
+                            for (o, m, n, k), c in sorted(shapes.items())],
+                 "gemms": gemms, "fp4_kernel": kern}, indent=2, sort_keys=True))
+        return 0
     if a.no_instrument:
         # The control: no hooks, so backward_secs is the shipped path's own number and the
         # difference against an instrumented run at the same chunk is the probe's sync cost.
