@@ -476,6 +476,8 @@ class KvTier:
         self.fetch_drops = 0
         self.fetch_ms = 0.0
         self.fetch_bytes = 0
+        self.state_load_ms = 0.0   # the .st read, on the caller at lookup time
+        self.state_loads = 0
         self.snapshot_bytes = 0
         self.tick_loads = 0
         self._rq: queue.Queue = queue.Queue()
@@ -783,7 +785,12 @@ class KvTier:
             if not os.path.exists(self._st(key)):
                 return None
             try:
+                # Timed apart from the kv fetch, which B is built on: this read is not
+                # prefetched and runs on the caller, so B covers the kv plane only.
+                ts = time.perf_counter()
                 blob = torch.load(self._st(key), map_location="cpu")
+                self.state_load_ms += (time.perf_counter() - ts) * 1000
+                self.state_loads += 1
             except Exception:  # noqa: BLE001 - truncated / corrupt spill, same as load_kv
                 self.drop(key)
                 return None
@@ -855,6 +862,10 @@ class KvTier:
             "ssd_fetch_drops": self.fetch_drops,
             "ssd_tick_loads": self.tick_loads,
             "ssd_fetch_ms": int(self.fetch_ms),
+            # with fetch_ms this gives B for the run
+            "ssd_fetch_bytes": self.fetch_bytes,
+            "ssd_state_load_ms": int(self.state_load_ms),
+            "ssd_state_loads": self.state_loads,
         }
 
 
@@ -912,6 +923,9 @@ class NoPrefixStore:
 
     def abandon_prefetch(self, tokens: Sequence[int]) -> None:
         return None
+
+    def fetch_in_flight(self, tokens: Sequence[int]) -> bool:
+        return False
 
     def clear(self) -> None:
         return None
@@ -973,6 +987,21 @@ class PrefixStore:
         for t in tokens:
             h = self._roll(h, int(t))
         return h
+
+    def fetch_in_flight(self, tokens: Sequence[int]) -> bool:
+        """True while a prefetch for some prefix of ``tokens`` is still reading.
+
+        Same length ladder `prefetch_if_worth_it` queues on, so the engine asks about
+        exactly the fetches it started.
+        """
+        if self._ssd is None:
+            return False
+        h = 0
+        for i, t in enumerate(tokens, 1):
+            h = self._roll(h, int(t))
+            if i % BLOCK_TOKENS == 0 and self._ssd.fetch_pending(h):
+                return True
+        return False
 
     def abandon_prefetch(self, tokens: Sequence[int]) -> None:
         """Walks every length the probe could have queued: which one it took depends on
@@ -1295,6 +1324,8 @@ class PrefixStore:
             st.update(self._ssd.stats())
             st["ssd_hits"] = self.ssd_hits
             st["ssd_faults"] = self.ssd_faults
+            # 0 on an engine that holds the row; nonzero means a lookup bypassed the hold.
+            st["ssd_fetch_waits"] = self.fetch_waits
         return st
 
 

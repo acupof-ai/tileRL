@@ -137,30 +137,90 @@ def _entry_bytes(spill: str) -> int:
     return size + (os.path.getsize(st) if os.path.exists(st) else 0)
 
 
-def _matched_tokens(spill: str) -> int:
-    """Tokens covered by the entry that can actually serve, from the spill file sizes.
+def _matched_tokens(spill: str, turn2_ids: int) -> int:
+    """Tokens the longest SERVABLE entry covers -- read from the entries, not inferred.
 
-    Every .kv is a whole number of publish units, so the sizes give the coverage ladder
-    directly, and the LONGEST entry is the one that serves: the measured request is turn 1
-    plus a follow-up, so turn 1's prompt-complete publish is a strict prefix of it. (When
-    the two requests are identical the longest entry is a full-length match, which
-    `_match_prefix` treats as a miss -- that is a bench artifact, and the fix is the
-    follow-up rather than reading the second-longest here.)
+    Previously this divided the largest .kv by the smallest and multiplied by a 512-token
+    unit, which was calibrated when six entries formed a size ladder. With two entries it
+    reported 512 for a hit that covered 2720, and the ceiling built on it said the arm
+    saved 2.8x more than the tokens it matched could explain -- an instrument artifact
+    that reads exactly like a bench measuring its own page cache.
+
+    Servable means a strict prefix of turn 2: `_match_prefix` treats a full-length match
+    as a miss, and the decode entry (prompt + generated reply) is not a prefix at all.
     """
+    import glob
+
+    import torch
     d = os.path.join(spill, "tilerl_kvtier")
-    sizes = sorted(
-        os.path.getsize(os.path.join(d, f))
-        for f in os.listdir(d) if f.endswith(".kv")
-    ) if os.path.isdir(d) else []
-    if not sizes:
-        return 0
-    return round(sizes[-1] / sizes[0]) * _UNIT_TOKENS
+    best = 0
+    for f in glob.glob(os.path.join(d, "*.kv")):
+        try:
+            n = len(torch.load(f, map_location="cpu")["tokens"])
+        except Exception:  # noqa: BLE001, PERF203 - written in place, may be mid-save
+            continue
+        if n < turn2_ids:
+            best = max(best, n)
+    return best
 
 
-#: Tokens per publish unit, derived from the size ladder rather than assumed: the smallest
-#: spill was 33557933 B and the largest 179316717 B = 5.343x it, which lands on the whole
-#: 2729-token prompt (171 blocks x 16 = 2736 slots) only at 512 tokens per unit.
-_UNIT_TOKENS = 512
+def _prefix_check(spill: str, args, prompt: str, reply: str) -> dict:
+    """Is ANY spilled entry a prefix of what turn 2 tokenizes to?
+
+    Reads the ids the tier stored and the ids the server would build for turn 2, and
+    reports the first index where each diverges. Without this a 0-hit run cannot be told
+    apart from an engine bug -- which is exactly the two days this bench already cost.
+
+    Every entry, not the largest: the largest is the DECODE publish (prompt plus the
+    generated reply), which `blocks_to_text` strips from replayed history by design and
+    which therefore always diverges. Reading only that one reported DIVERGES over a tier
+    holding a perfectly good prompt-only entry (measured, card 1).
+    """
+    import glob
+    d = os.path.join(spill, "tilerl_kvtier")
+    kvs = sorted(glob.glob(os.path.join(d, "*.kv")), key=os.path.getsize)
+    if not kvs:
+        return {"prefix_check": "no spill file"}
+    try:
+        import sys
+        sys.path.insert(0, os.path.join(args.repo, "src"))
+        sys.path.insert(0, os.path.join(args.repo, "packages/tilerl-kernels/src"))
+        import torch
+
+        from tilerl.cli import _qwen38_tokenizer
+        from tilerl.server import ChatMessage, _render_chat
+        from tilerl.tokenizer import get_tokenizer
+        # the CLI's own resolver: a bare hub id 401s, and the server used this one
+        tk = _qwen38_tokenizer() if args.model == "qwen38-27b" else get_tokenizer(None)
+        turn2 = tk.encode(_render_chat([
+            ChatMessage(role="user", content=prompt),
+            ChatMessage(role="assistant", content=reply),
+            ChatMessage(role="user", content=_FOLLOWUP),
+        ]))
+        # Skip an entry mid-write: the tier saves .kv in place with no temp-and-rename,
+        # so a file the writer thread has not finished raises inside torch.load. Skipping
+        # one is right -- an unfinished entry cannot serve a lookup either -- but aborting
+        # the whole probe on it turns a readable tier into "unavailable" (measured).
+        entries, unreadable = [], []
+        for f in kvs:
+            try:
+                entries.append(list(torch.load(f, map_location="cpu")["tokens"]))
+            except Exception:  # noqa: BLE001, PERF203 - still being written
+                unreadable.append(os.path.basename(f))
+    except Exception as e:  # noqa: BLE001 - a probe; the arms still run
+        return {"prefix_check": f"unavailable: {type(e).__name__}: {e}"}
+
+    def diff(stored):
+        n = min(len(stored), len(turn2))
+        at = next((i for i in range(n) if stored[i] != turn2[i]), None)
+        ok = at is None and len(turn2) > len(stored)  # `>`: a full-length match is a miss
+        return {"stored_ids": len(stored), "prefix": ok, "first_diff": at}
+
+    per = [diff(e) for e in entries]
+    servable = [p["stored_ids"] for p in per if p["prefix"]]
+    return {"prefix_check": "MATCH" if servable else "DIVERGES",
+            "turn2_ids": len(turn2), "servable": sorted(servable), "entries": per,
+            "unreadable": unreadable}
 
 
 def _evict_cache(spill: str) -> str:
@@ -215,8 +275,20 @@ def _probe_mib_s(d: str) -> float:
     return (n / 2**20) / el if el else 0.0
 
 
-def _arm(args, name: str, spill: str, prompt: str) -> dict:
+def _arm(args, name: str, spill: str, prompt, reply: str = "") -> dict:
+    """One server start, one request, the counters either side of it.
+
+    ``prompt`` is a string for a single-turn request; ``reply`` makes it a real second
+    turn -- user, assistant, user -- which is what the tier stores. The engine publishes
+    `req.tokens[:materialized]` during DECODE, so the entry on disk is prompt PLUS the
+    reply it generated; a turn 2 that omits the reply is not a prefix of it and cannot
+    hit. That is what made every arm read 0 SSD hits (errors/2026-09-07).
+    """
     log = f"/work/ssd_restart_{name}.log"
+    msgs = [{"role": "user", "content": prompt}]
+    if reply:
+        msgs += [{"role": "assistant", "content": reply},
+                 {"role": "user", "content": _FOLLOWUP}]
     proc = _serve(args, spill, log)
     try:
         _wait_up(args.port, proc, args.boot_s)
@@ -224,7 +296,7 @@ def _arm(args, name: str, spill: str, prompt: str) -> dict:
         t0 = time.monotonic()
         r = _post(f"http://127.0.0.1:{args.port}/v1/messages",
                   {"model": args.model, "max_tokens": args.gen,
-                   "messages": [{"role": "user", "content": prompt}]}, args.req_s)
+                   "messages": msgs}, args.req_s)
         wall = time.monotonic() - t0
         after = _stats(args.port)
     finally:
@@ -242,6 +314,12 @@ def _arm(args, name: str, spill: str, prompt: str) -> dict:
         "prompt_tokens": int(r["usage"]["input_tokens"]),
         "output_tokens": int(r["usage"]["output_tokens"]),
         "ms_per_prompt_token": round(1000 * wall / max(1, r["usage"]["input_tokens"]), 3),
+        # The reply, so a later arm can send a REAL turn 2 (user, assistant, user).
+        # thinking blocks too: at max_tokens=8 the whole reply can land inside one and
+        # a text-only read comes back empty (measured).
+        "reply": "".join(b.get("text") or b.get("thinking") or ""
+                         for b in r.get("content", [])),
+        "reply_blocks": [b.get("type") for b in r.get("content", [])],
         "ssd_hits": d("ssd_hits"),
         "ssd_faults": d("ssd_faults"),
         "ssd_entries": int(after.get("ssd_entries", 0)),
@@ -257,6 +335,8 @@ def _arm(args, name: str, spill: str, prompt: str) -> dict:
         "ssd_fetches_ready": d("ssd_fetches_ready"),
         "ssd_fetch_drops": d("ssd_fetch_drops"),
         "ssd_tick_loads": d("ssd_tick_loads"),
+        # 0 hits with waits > 0 is the row-58 signature: admitted before its fetch landed
+        "ssd_fetch_waits": d("ssd_fetch_waits"),
         "prefill_rate": after.get("prefill_rate"),
         "break_even_tokens": after.get("prefix_break_even_tokens"),
     }
@@ -303,20 +383,28 @@ def main() -> None:
     _arm(args, "jitwarm", warm_dir, prompt)
     shutil.rmtree(warm_dir, ignore_errors=True)
 
-    # Turn 2 is turn 1 plus more text -- that is what a chat client sends, and it is what
-    # makes the tier's LAST publish the entry that serves. Re-sending the IDENTICAL prompt
-    # instead makes the longest stored entry a full-length match, which `_match_prefix`
-    # treats as a miss, so the served entry would be the second-longest and the bench would
-    # disagree with production about which publish matters.
-    turn2 = prompt + " " + _FOLLOWUP
+    # Turn 2 is user, ASSISTANT, user -- a real second turn, not the prompt with more text
+    # appended. The engine publishes `req.tokens[:materialized]` during decode, so the entry
+    # on disk is the prompt plus the reply it generated; a turn 2 that omits the reply
+    # diverges from it at the first generated token and cannot hit at any length. Measured:
+    # every arm 0 SSD hits with 1 entry recovered (errors/2026-09-07).
     rows = [_arm(args, "cold", main_dir, prompt)]
     print(json.dumps(rows[-1]), flush=True)
+    reply = rows[0]["reply"]
+    if not reply:
+        raise SystemExit("cold arm returned no reply text; turn 2 cannot be built from it")
     # The spill was just WRITTEN, so it is in page cache. Evict it, or the faulted arm
     # measures memory and reports it as disk.
     print(json.dumps({"evict": _evict_cache(main_dir)}), flush=True)
-    rows.append(_arm(args, "faulted", main_dir, turn2))
+    # Before the ratio: do turn 2's ids actually START with the spilled entry's ids?
+    # The entry is engine token ids (prompt + generated); turn 2 is that reply rendered
+    # back through the chat template, which re-tokenizes. A thinking block re-renders
+    # with think markup and a boundary token can merge with the followup's first token.
+    # A mismatch here means the BENCH cannot hit, not that the engine misses.
+    print(json.dumps(_prefix_check(main_dir, args, prompt, reply)), flush=True)
+    rows.append(_arm(args, "faulted", main_dir, prompt, reply=reply))
     print(json.dumps(rows[-1]), flush=True)
-    rows.append(_arm(args, "control", ctrl_dir, turn2))
+    rows.append(_arm(args, "control", ctrl_dir, prompt, reply=reply))
     print(json.dumps(rows[-1]), flush=True)
 
     # Below the break-even, on purpose. Without it the bench cannot tell "the threshold
@@ -335,15 +423,24 @@ def main() -> None:
         print(json.dumps(rows[-1]), flush=True)
         rows.append(_arm(args, "below_break_even_2nd", short_dir, short + " " + _FOLLOWUP))
         print(json.dumps(rows[-1]), flush=True)
+    else:
+        # Say it out loud. `n_star == 0` fails `0 < n_star` and used to skip in silence,
+        # so a run that never tested the threshold read exactly like one that passed it.
+        print(json.dumps({"below_break_even": "SKIPPED", "n_star": n_star, "why":
+                          "no prompt can sit below a break-even of 0 (an unmeasured tier "
+                          "answers 0 so the first fetch can calibrate B); the threshold "
+                          "went untested this run"}), flush=True)
 
-    cold, faulted, control = rows
+    cold, faulted, control = rows[:3]  # the break-even arms append past these three
     # The ceiling: a hit can save at most the prefill of the tokens it actually covered,
-    # at the cold arm's own per-token rate. `matched` is read off the largest SERVABLE
-    # entry, i.e. the second-largest spill -- `_match_prefix` treats a full-length hit as
-    # a miss, so the whole-prompt entry cannot be the one that served.
-    matched = _matched_tokens(main_dir)
+    # at the cold arm's own per-token rate. `matched` is the longest entry that is a
+    # strict prefix of turn 2 -- `_match_prefix` treats a full-length hit as a miss, so
+    # the whole-prompt entry cannot be the one that served.
+    matched = _matched_tokens(main_dir, faulted["prompt_tokens"])
     ceiling_s = matched * cold["ms_per_prompt_token"] / 1000
-    saved = cold["wall_s"] - faulted["wall_s"]
+    saved = control["wall_s"] - faulted["wall_s"]  # vs the empty-tier arm, not vs cold:
+    # cold also pays first-start costs the other two do not, so `cold - faulted` credits
+    # the tier with start order. `control` is the same arm position with an empty tier.
     # The check that caught this bench measuring its own page cache: divide the bytes a
     # fault-in must read by the device's measured bandwidth. If the whole arm is faster
     # than that read, the read did not come from the device.
@@ -395,6 +492,7 @@ def main() -> None:
         "faulted_prefetches": faulted["ssd_prefetches"],
         "faulted_fetches_ready": faulted["ssd_fetches_ready"],
         "faulted_tick_loads": faulted["ssd_tick_loads"],
+        "faulted_fetch_waits": faulted["ssd_fetch_waits"],
         "faulted_fetch_drops": faulted["ssd_fetch_drops"],
         "prefill_rate": faulted.get("prefill_rate"),
         "break_even_tokens": faulted.get("break_even_tokens"),
@@ -437,6 +535,12 @@ def main() -> None:
             f"the control ran at {verdict['control_over_cold']}x cold with an EMPTY tier, "
             "so arm order alone moves the wall clock and neither speedup is the tier's"
         )
+    elif matched and saved > ceiling_s:
+        verdict["INVALID"] = (
+            f"saved {saved:.3f} s against a ceiling of {ceiling_s:.3f} s "
+            f"({matched} matched tokens x cold's {cold['ms_per_prompt_token']} ms/tok) -- "
+            "a hit cannot save more prefill than it covered, so something else moved"
+        )
     elif read_s and faulted["wall_s"] < read_s:
         verdict["SCENARIOS"] = (
             f"restart (host cache warm, the common case): "
@@ -447,13 +551,11 @@ def main() -> None:
             f"{composed_s:.3f} s composed from a measured {read_s:.3f} s disk read plus "
             f"{tail_s:.3f} s of tail prefill. Both are real; they answer different questions."
         )
-    elif matched and saved > ceiling_s:
-        verdict["INVALID"] = (
-            f"saved {saved:.3f} s against a ceiling of {ceiling_s:.3f} s "
-            f"({matched} matched tokens x cold's {cold['ms_per_prompt_token']} ms/tok) -- "
-            "a hit cannot save more prefill than it covered, so something else moved"
-        )
     print(json.dumps(verdict, indent=2), flush=True)
+    # Exit nonzero on INVALID. Printing it and returning 0 makes a bench that measured
+    # nothing indistinguishable from one that passed, to a launcher that reads rc.
+    if "INVALID" in verdict:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
