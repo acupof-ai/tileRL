@@ -2,17 +2,26 @@
 
 **Date:** 2026-09-08
 **Machine:** H20 pod card 0 (cells), local CPU target (diagnosis)
-**Status:** open — the regression is settled: **1.88–2.03x across 16 lines of `engine.py`**, 100% TTFT,
-with the hit cost going 0.715 → 9.9–10.3 s, caused by one count-vs-budget tradeoff whose sign flips
-with turn depth. The forward fix has not landed, and at this cell's budget it may not be satisfiable —
-see the sizing criterion. Listed in [OPEN.md](../OPEN.md) with the latent `_demote_one` count guard.
+**Status:** open — the regression is measured: **1.81–2.12x on 16 lines of `engine.py`**, 100% TTFT, and
+a hit costs the full prefill times the fraction it did not match (**median 0.9% error over 35 turns, one
+parameter, nothing fitted**). Depth is a **512×k ratchet in submission order**, so first+last leaves each
+session a match set by its queue position rather than a constant. The forward fix has not landed and may
+not fit this budget — see the sizing criterion. Listed in [OPEN.md](../OPEN.md) with the latent
+`_demote_one` count guard.
 
-> Sections are in the order they were written, so seven withdrawn readings stand as the record.
+> Sections are in the order they were written, so **nine withdrawn readings** stand as the record.
 > **The settled result starts at
-> [Resolved](#resolved-188203x-across-16-lines-and-the-mechanism-is-one-count-vs-budget-tradeoff).**
-> Withdrawn, in order: four mechanisms for the discrepancy, then a solved-for TTFT split, a
-> population-skew objection, a single-variable claim against a 7-commit range, and a cold-prefill
-> doubling that was one noisy row. Every one was self-consistent when written.
+> [Resolved](#resolved-188203x-across-16-lines-and-the-mechanism-is-one-count-vs-budget-tradeoff)
+> and is pinned by
+> [the measured model](#measured-a-hit-costs-the-full-prefill-times-what-it-did-not-match).**
+> Withdrawn, in order: four mechanisms for the discrepancy, a solved-for TTFT split, a
+> population-skew objection, a single-variable claim against a 7-commit range, a cold-prefill doubling
+> that was one noisy row, and — on the measured data itself — a falsification of the mechanism that was
+> an operand error. Every one was self-consistent when written.
+>
+> The first eight fell to arguments. The ninth is the only one where something **true** was withdrawn,
+> and the reason the model survives where seven mechanisms did not is that it is a fit rather than an
+> argument: it predicts out of sample, so it cannot be talked into or out of.
 
 ## Context
 
@@ -208,8 +217,13 @@ the workload, and the prompt tokens row-for-row are identical.
 | parent `45acd87` | **198.47 s** | 24 | **0.715 s** | 12 | 14.031 s |
 | child `a43a379` run 1 | **403.01 s** | 35 | **10.342 s** | 1 | 28.050 s |
 | child `a43a379` run 2 | **373.14 s** | 35 | **9.891 s** | 1 | 13.940 s |
+| child + counter run 3 | **372.92 s** | 35 | **9.880 s** | 1 | 13.960 s |
 
-**1.88–2.03x**, and the hit costs **13.8–14.5x** the parent's. The child hits *more often*
+**1.88–2.03x**, and the hit costs **13.8–14.5x** the parent's. That range prices only the child's
+variance: the parent is a **single draw**, so its own bar is unmeasured, and if it shares the child's
+~8% (three runs: 403.01 / 373.14 / 372.92 s) the honest envelope is **1.81–2.12x**. The two claims do not need the same confidence — a 4.6%
+spread on the child's hit mean against a 14x effect threatens neither its sign nor its size, while an
+8% spread on a wall clock is most of the gap between 1.88 and 2.03. The child hits *more often*
 (35/36 against 24/36) and each hit is an order of magnitude dearer. The regression is
 **100% TTFT**: the three turn deltas sum to 204.47 s against a 204.54 s wall delta on run 1.
 
@@ -254,11 +268,27 @@ with more budget per session, and this cell's answer is that its budget is too s
 K-spaced refutation measured token-counted reuse, the one unit that cannot see either failure;
 it should be re-tested in TTFT at a budget where K ≥ 3 fits.
 
+**The measured model prices K, so this stops being a judgement call — and it adds a second constraint
+that bites harder than the byte one.** A hit costs `2.51 + 10.45 × (1 − depth)`, so a rung lifting a
+row's match from *d* to *d′* saves `10.45 × (d′ − d)` — **0.10 s per percentage point of depth**. But the
+2.51 s fixed term is paid per *hit*, not per rung, so a rung only earns its place if the depth it adds
+saves more than the alternative of matching nothing extra:
+
+**`10.45 × Δdepth > 2.51` → Δdepth > 24.0% of the prompt.**
+
+**Rungs spaced closer than ~24% of the prompt are net negative**, which caps K at about 4 on depth
+grounds before the byte budget is consulted — and the byte budget already says K ≈ 1 here. Both
+constraints point the same way at this cell, from different data.
+
+The ratchet says who needs the rungs: the early sessions in the queue, matching 1.7–8.5%. So the
+arithmetic to run before writing any ladder is `10.45 × Δdepth × hits` against the snapshot bytes the
+rung takes from the store, and it needs no card window.
+
 **No revert.** The flood is a real defect with a measured cascade, and the child is genuinely
 better at turn 2.
 
-**Depth is still inferred from time.** `prefix_hit_tokens` now records it per turn, so the next
-card window settles it directly.
+**Depth is measured**, not inferred — see the section below. A hit's cost is the full prefill times
+the fraction it did not match, to a median of 0.9% over 35 turns.
 
 ### The buckets were per-turn columns in the log, and two of us modelled them instead
 
@@ -289,10 +319,61 @@ then **evicted**, so post-fix the only thing left below it is 512 tokens — whi
 count-vs-budget tradeoff above, stated from the child's side only. The full statement needs both
 sides, because the parent's flood evicts *itself* and that is what turn 2 shows.
 
-**Time is still not depth.** A hit could be slow for a reason other than shallowness, even with none in
-evidence. `bench_chat_interleaved.py` now records `prefix_hit_tokens` per turn and prints
-`depth=` as a fraction of that turn's own prompt, so the next card window settles it directly rather
-than by inference.
+### Measured: a hit costs the full prefill times what it did not match
+
+`prefix_hit_tokens` ran on the child's publisher (branch HEAD = `a43a379` plus the counter,
+`git diff a43a379 HEAD -- src/` is 5 lines). It converts the mechanism from inferred to measured, and
+it corrects the shape of the claim.
+
+**Depth is a ratchet, not a constant.** Cumulative `prefix_hit_tokens` after 35 hits is **322560**,
+which is `512 × 35×36/2` exactly. The k-th hit in submission order matches **512 more tokens than the
+k−1-th**: 512, 1024, 1536 … 11776, i.e. 1.7% → 56.3% of the prompt. The 512 this entry had been
+quoting was **conv B, the first and smallest hit in the run**, read as the typical one.
+
+**And TTFT is linear in the unmatched fraction.** Regressed over all 35 hit turns
+(`err = (pred − obs)/obs` throughout):
+
+| model | R² | residual sd | shallow (<15% depth) | deep (>40%) |
+|---|---:|---:|---:|---:|
+| `miss × (1 − depth)`, no fit | 0.8824 | 6.0% | **+6.6%** | **−8.7%** |
+| `2.51 + 10.45 × (1 − depth)`, OLS | **0.9947** | **1.4%** | +0.6% | +0.4% |
+
+The one-parameter form is good on average (median −0.9%) and its residuals **march monotonically with
+depth**, +6.6% shallow to −8.7% deep — a 15-point trend, which is structure absorbed into an average,
+not noise. Adding an intercept removes the trend entirely and takes the residual sd from 6.0% to 1.4%.
+
+So the measured cost of a hit is **2.51 s fixed plus 10.45 s × the fraction it did not match**, and both
+terms mean something:
+
+- **The 2.51 s is depth-independent** — paid at any match length, and it would be paid at 100%.
+- **The slope is 10.45 s, not the 13.96 s miss.** Unmatched tokens re-prefill *cheaper per token* than a
+  cold miss, which is what a prefill starting with a populated block table and a warm pool should look
+  like.
+
+**Where the 2.51 s does NOT come from.** The obvious candidate is the state restore, since a snapshot is
+a constant size at any prefix length (`kv_cache.py:1434`) and a depth-independent cost is exactly that
+shape. **The arithmetic refuses it**: this checkpoint's snapshot is 156.9 MiB, which is 0.17 ms at HBM
+bandwidth and 82 ms even at a slow 2 GB/s host copy — three to four orders of magnitude short of 2510 ms.
+So the shape fits and the magnitude does not, and the term is **unattributed**. Naming the restore here
+would be the tenth withdrawal.
+
+This closes the honesty limit that mattered: a shallow hit and a deep hit that stalls on something else
+are now distinguishable, because a stall would appear as depth-correlated residual and after the
+intercept there is none (+0.6% shallow, +0.4% deep). What replaces it is a smaller, sharper open
+question — what the 2.51 s is.
+
+**What the ratchet says about the publisher.** 512×k across sessions in submission order is not a
+property of any row's prompt — it is the store serving one more block-chunk to each successive session.
+So under pressure, first+last does not give every row a 512-token match; it gives a row a match whose
+depth is set by its **position in the queue**, with the earliest sessions worst off. That is a sharper
+statement of the same defect and it is what the ladder has to fix.
+
+**One withdrawal on this data, and it is the only one where something true was withdrawn.** The first
+reading of these rows was that the mechanism was falsified: depth rises 22x while TTFT goes 12.80 →
+10.93 s, which looks flat. That compared depth against **absolute** TTFT across turns whose prompts also
+grow. Dividing by what was left to prefill gives the table above. Testing a claim about a ratio by
+looking at its numerator — the same operand error this entry's Rule section names, made on the entry's
+own instrument within the hour.
 
 ### Not one variable at first, and the cold miss was noise: two withdrawals
 
@@ -321,9 +402,13 @@ comparing one row to a 12-row mean, positing a 12-row distribution to explain th
 exactness off the same row — and the 12 rows were in the file every time.
 
 **What the re-run also exposed: the headline had unmeasured spread.** `a43a379` is 403.01 s and
-373.14 s on two runs, 8.0% apart, so the ratio is **1.88–2.03x** rather than 2.03x. Every earlier
-version of this entry quoted a single run's wall clock as the result. One run gives no error bar, and
-a ratio of two single runs hides two.
+373.14 s on two runs, 8.0% apart, so the ratio is **1.88–2.03x** rather than 2.03x — and the parent is
+still a single draw, so even that range is half an envelope. Every earlier version of this entry quoted
+one run as the result.
+
+The cleanest statement of the error is that **the cold row's same-commit spread is 28.05 / 13.94 =
+2.01x**, numerically identical to the cross-commit "effect" a structural argument was built on. A
+signature and a coin flip were the same number, quoted to four digits.
 
 ### The `compiles: clean` on every cell of this grid was vacuous
 
@@ -352,6 +437,27 @@ survive is that a log **with** content and no marker is still genuinely clean, o
 unreachable and the gate is useless in the other direction — `tests/test_bench_compiles_verdict.py`
 holds both directions and was verified red against the original.
 
+**The depth run is the first time this verdict has meant anything on this grid**: `compiles: clean`
+against a **164-byte** log, flushed because serve ran under `python3 -u`. Before the fix the same word
+came from a 0-byte file, so the fix's value would otherwise be invisible in the output.
+
+**And the vacuity is narrower than it first looked, which took two controls to establish.** The 09-07
+cells that licensed 3.57x also report `compiles: clean`, and their logs are **164 bytes** — flushed, 0
+markers. That is a different thing:
+
+- **The marker reaches stdout.** tilelang installs a `TqdmLoggingHandler` on import and raises the
+  `tilelang` logger to INFO (effective level 30 → 20, `propagate` False), so `logger.info` is not
+  dropped by the root logger's WARNING default. Measured: the marker lands on **stdout**, and every arm
+  redirected `> log 2>&1`. A missing marker is not a stream mismatch.
+- **A cold cache does emit it in the same redirect shape.** Same script, same `python3 -u`, same
+  `> log 2>&1`, `TILELANG_CACHE_DIR` as the only variable: cold gives **1 marker / 270 bytes**, warm
+  gives **0 markers / 24 bytes**.
+
+So on the 09-07 cells `compiles: clean` is a real reading — warm cache, zero JIT — and that entry's
+verdict stands. The vacuity is specific to the 09-08 grid, whose logs never flushed. The 0-byte case and
+the warm-cache case print the same word and mean opposite things, which is why the fix separates them
+instead of treating every 0 as suspect.
+
 
 ## What remains open
 
@@ -367,13 +473,18 @@ arm above then put the publisher squarely back in scope. What survives is the na
 `pub271off` arm supports on its own: 139 evictions at **8.8%** occupancy cannot be capacity.
 
 Still open:
-- **The ladder, if this budget admits one.** `K × snapshot_bytes ≤ budget` gives K ≈ 1 at 6 snapshots
-  for 12 sessions, and K = 1 is the child. So the arm to run is the same pair at a budget where K ≥ 3
-  fits, measured in TTFT rather than token-counted reuse.
-- **Depth directly.** `prefix_hit_tokens` is recorded now; one card window converts the mechanism from
-  inferred-from-time to measured.
+- **What the 2.51 s per-hit fixed cost is.** Measured at R² 0.9947 and unattributed. The state restore
+  has exactly the right shape — constant at any prefix length — and is 0.17 ms at HBM bandwidth against
+  2510 ms observed, so it is not that. This is the sharpest open question in the entry and it needs a
+  phase-attributed profile of one hit, not an argument.
+- **The ladder, if any budget admits one.** Two independent constraints now, and they agree:
+  `K × snapshot_bytes ≤ budget` gives K ≈ 1 here, and `10.45 × Δdepth > 2.51` caps useful rung spacing
+  at ~24% of the prompt. The arm is the same pair at a budget where K ≥ 2 fits, measured in TTFT.
 - **The per-eviction yield split** — per eviction, the count of the entry's blocks where
   `refcount[b] > n`, logged with the entry's token length.
+
+Closed by the depth run: whether the mechanism is hit depth (yes, R² 0.9947), and whether `compiles`
+can now go red (yes — 164 bytes, flushed).
 
 
 ## Rule
