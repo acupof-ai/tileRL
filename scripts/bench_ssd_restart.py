@@ -257,6 +257,8 @@ def _arm(args, name: str, spill: str, prompt: str) -> dict:
         "ssd_fetches_ready": d("ssd_fetches_ready"),
         "ssd_fetch_drops": d("ssd_fetch_drops"),
         "ssd_tick_loads": d("ssd_tick_loads"),
+        # 0 hits with waits > 0 is the row-58 signature: admitted before its fetch landed
+        "ssd_fetch_waits": d("ssd_fetch_waits"),
         "prefill_rate": after.get("prefill_rate"),
         "break_even_tokens": after.get("prefix_break_even_tokens"),
     }
@@ -333,6 +335,13 @@ def main() -> None:
         print(json.dumps(rows[-1]), flush=True)
         rows.append(_arm(args, "below_break_even_2nd", short_dir, short + " " + _FOLLOWUP))
         print(json.dumps(rows[-1]), flush=True)
+    else:
+        # Say it out loud. `n_star == 0` fails `0 < n_star` and used to skip in silence,
+        # so a run that never tested the threshold read exactly like one that passed it.
+        print(json.dumps({"below_break_even": "SKIPPED", "n_star": n_star, "why":
+                          "no prompt can sit below a break-even of 0 (an unmeasured tier "
+                          "answers 0 so the first fetch can calibrate B); the threshold "
+                          "went untested this run"}), flush=True)
 
     cold, faulted, control = rows
     # The ceiling: a hit can save at most the prefill of the tokens it actually covered,
@@ -393,6 +402,7 @@ def main() -> None:
         "faulted_prefetches": faulted["ssd_prefetches"],
         "faulted_fetches_ready": faulted["ssd_fetches_ready"],
         "faulted_tick_loads": faulted["ssd_tick_loads"],
+        "faulted_fetch_waits": faulted["ssd_fetch_waits"],
         "faulted_fetch_drops": faulted["ssd_fetch_drops"],
         "prefill_rate": faulted.get("prefill_rate"),
         "break_even_tokens": faulted.get("break_even_tokens"),
