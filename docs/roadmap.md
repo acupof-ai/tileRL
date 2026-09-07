@@ -191,6 +191,19 @@ Physics that fixes the design:
   graph-capturable; training traffic (grad all-reduce, ZeRO, CP ring) stays
   on NCCL. One `comm.py` seam, crossover measured by microbench, IPC falls
   back to NCCL when peers are not mappable.
+- **Training TP costs nothing per step, measured** — 27B TP=2 on cards 0+6 is
+  **0.95x** the single-card step (10.038 s against 10.596 s), per-card peak
+  43.97 → 25.46 GiB, so gradient bucketing and compute/comms overlap are **not
+  scheduled**. Collectives are 5.95% of the step as a loose upper bound, 99% of
+  it in `tp_fork` rather than `all_reduce` (whose backward communicates
+  nothing), and the two ranks differ 3x on that op — part of the figure is rank
+  skew absorbed by the collective, not communication.
+  [entry](experience/wins/2026-09-07-tp2-on-two-cards.md)
+- **A first TP run pays a full JIT rebuild, per rank**: step 1 was 456 s against
+  step 2's 10.0 s, because both ranks compile independently and the shard shapes
+  miss a `tilelang_cache` warm for single-card runs. Warming or sharing a compile
+  cache is a prerequisite for any TP wall-clock claim, and it is paid again on
+  every new shard width.
 - CP for GDN is a scan, not a hand-off: `S_i = A_i S_{i-1} + B_i` composes,
   so each rank computes local (A, B), one all-gather fixes the incoming
   state, a second pass produces outputs; backward is the same scan reversed.
