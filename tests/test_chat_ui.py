@@ -769,3 +769,41 @@ def test_no_style_rules_for_components_that_cannot_render():
         assert f'"{cls}"' in bundle or f'class="{cls}"' in html or f"{cls} " in bundle, (
             f".{cls} is styled but nothing can render it"
         )
+
+
+def test_gfm_tables_nested_lists_and_blockquotes_render():
+    """The GFM constructs a reply actually contains, through the real bundle.
+
+    ckl's report on the V100 page was "md 组件不全" -- the hand-rolled grammar covered
+    headings, flat lists, fences, links and bold, so a table arrived as five lines of
+    prose full of pipes, a nested list flattened to one level, and a blockquote kept its
+    `>` as text. This is the case that was red before `marked`'s lexer replaced that
+    grammar; it asserts the STRUCTURE (nesting, cell tags) rather than the text, because
+    the text was always there -- it was the markup around it that was missing.
+
+    One stream, four constructs, because they interact: a table's pipes must not be read
+    as anything else, and the nested list has to survive the block boundary the table
+    creates.
+    """
+    reply = (
+        "</think>\n"
+        "| op | ms |\n| --- | --- |\n| gemm | 1.2 |\n\n"
+        "- outer\n  - inner\n\n"
+        "> quoted\n\n"
+        "- [x] done\n- [ ] todo\n\n"
+        "~~gone~~ and `code`\n"
+    )
+    got = _page_after(_ws_frames([reply], max_tokens=512))
+    a = got["answer"]
+    for tag in ("<table>", "<thead>", "<th>", "<tbody>", "<td>", "<blockquote>"):
+        assert tag in a, f"{tag} missing; GFM did not render: {a}"
+    assert "<ul><li>" in a.replace(" ", ""), f"no list: {a}"
+    # the nesting itself: an inner <ul> inside an <li>. The old renderer emitted two
+    # flat items instead, which is why the text alone cannot be the assertion.
+    assert re.search(r"<li>.*<ul>.*<li>.*inner", a, re.S), f"list did not nest: {a}"
+    assert "<del>" in a, f"strikethrough missing: {a}"
+    assert "<code>code</code>" in a, f"inline code missing: {a}"
+    assert "gemm" in a and "1.2" in a, a
+    # no marker leaked as text
+    for marker in ("| ---", "~~", "> quoted"):
+        assert marker not in a, f"{marker!r} reached the reader as text: {a}"
