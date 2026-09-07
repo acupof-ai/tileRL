@@ -61,7 +61,9 @@ def main() -> int:
            "--host", "127.0.0.1", "--port", str(PORT), "--max-batch", "1",
            "--max-ctx", str(a.max_ctx), "--slots", str(a.slots),
            "--dram-bytes", str(4 << 30)]
-    env = dict(os.environ, TILELANG_CACHE_DIR="/work/tilelang_cache")
+    # setdefault, not override: a hardcoded /work made the child recompile on any other box.
+    env = dict(os.environ)
+    env.setdefault("TILELANG_CACHE_DIR", "/work/tilelang_cache")
     with open(a.log, "wb") as f:
         proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
     try:
