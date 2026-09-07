@@ -93,21 +93,25 @@ trap release EXIT INT TERM
 # block below.
 pod_run_claim() {  # pod_run_claim <pid> -- claim CARD for it, or kill it and exit 4
   # polled, because the fd opens minutes into a 27B load
-  local pid=\$1 out i
+  local pid=\$1 out i rc
   echo "pod_run: claim pending for \$pid, polling up to ${DEVICE_WAIT}s for a device fd"
   for i in \$(seq 1 $DEVICE_WAIT); do
     kill -0 \$pid 2>/dev/null || break
-    # a wrapper's python is a descendant; a direct python is the pid itself
+    # a wrapper's python is a descendant; a direct python is the pid itself.
+    # Success is the EXIT CODE, not the word "claimed": when pod_run's own block below already
+    # resolved to this same descendant, acquire is a no-op that says "claim reused, not
+    # re-taken" and returns 0. A substring match missed that and killed the job at DEVICE_WAIT
+    # -- 6 minutes of card 0 on 2026-09-07, with the claim held and the server healthy.
     out=\$(python3 $AUPAI/scripts/card_claim.py acquire --name tilerl-$NAME --cards $CARD \\
-            --pid \$pid --wait-for-device 1 2>&1) || true
+            --pid \$pid --wait-for-device 1 2>&1) && rc=0 || rc=\$?
+    [ \$rc -eq 0 ] && { echo "pod_run: \$out"; return 0; }
     case "\$out" in
-      *"claimed"*) echo "pod_run: \$out"; return 0;;
       *ZOMBIE*)    python3 $AUPAI/scripts/card_claim.py release --name tilerl-$NAME >/dev/null 2>&1 || true;;
     esac
     out=\$(python3 $AUPAI/scripts/card_claim.py acquire --name tilerl-$NAME --cards $CARD \\
-            --pid \$pid --require-device 2>&1) || true
+            --pid \$pid --require-device 2>&1) && rc=0 || rc=\$?
+    [ \$rc -eq 0 ] && { echo "pod_run: \$out"; return 0; }
     case "\$out" in
-      *"claimed"*) echo "pod_run: \$out"; return 0;;
       *ZOMBIE*)    python3 $AUPAI/scripts/card_claim.py release --name tilerl-$NAME >/dev/null 2>&1 || true;;
     esac
     sleep 1
