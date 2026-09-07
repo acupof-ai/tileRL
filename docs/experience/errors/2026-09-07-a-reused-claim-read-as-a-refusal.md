@@ -82,13 +82,39 @@ rc 0 and no `claimed`. Negative control run: the new arm against the **old**
 `pod_run.sh` fails with `rc 4` — the same exit code the pod produced — and passes
 against the fix, with all five arms green.
 
+## Which of the success paths the word match killed
+
+Enumerated over every `return True` in `card_claim.py` rather than reasoned about,
+since the question is exactly "what else is there":
+
+| line | outcome | says `claimed`? |
+|---|---|---|
+| `:1085` | granted | **yes** |
+| `:1056-1058` | rebind — new pid is a descendant | falls through to `:1085`, so yes |
+| `:1046` | reuse — same pid, same cards | **no** — the bug above |
+| `:887` | the asking pid's ancestor already holds the card; **no claim written** | **no** |
+| `:639` | `grant-lane` (a different subcommand) | **no** |
+
+So `acquire` has **two** exposed paths, not one. `:887` is the second: a wrapper
+whose ancestor holds the card gets `True` with no claim file written and no
+`claimed` in the sentence, which the word match would also have turned into a
+kill. Raised by tilerl-48 as a question about the rebind branch — rebind is
+genuinely safe, because `os.unlink(mine); continue` sends it back through the
+normal grant, but the enumeration that answered it found `:887`.
+
 ## Rule
 
 **A launcher's success test must read what the tool publishes as its verdict, not
-what its message usually says.** `card_claim.py` has three success sentences and
-only one contains the word `claimed`; a substring match on the common one turns
-the other two into kills. When a wrapper and its arms both claim the same pid by
-design, the reuse path is the *normal* path, not an edge case.
+what its message usually says.** Three of `card_claim.py`'s five success returns
+lack the word `claimed`, and two of them are reachable from `acquire`; a substring
+match on the common one turns the others into kills. When a wrapper and its arms
+both claim the same pid by design, the reuse path is the *normal* path, not an
+edge case.
+
+**"Which other paths look like this" is a question to enumerate, not to answer
+from the paths you can name.** The fix was already correct when the question was
+asked, but the answer "one exposed path" was wrong, and only listing every
+`return True` showed it.
 
 **A mock that returns 0 for both outcomes disables every rc-based assertion built
 on it.** The refusal messages were faithfully copied from the pod and the exit

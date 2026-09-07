@@ -93,11 +93,22 @@ sessions**. No benchable load reaches that, which is exactly why this cell neede
 `--state-bytes` to exist.
 
 So on an H20 at its shipped default, `--dram-bytes` should stay off; nothing here
-changes that. The card where the shipped default IS pressured is the V100: 8 GiB
-free/4 at 144 MiB is **9 snapshots**, under 12 sessions. That measurement is not
-in this entry, and there the tier is HBM→SSD with no host layer
-(`kv_cache.py:397`) — which is the arm this entry shows to be the worst of the
-three.
+changes that. The card where the shipped default IS pressured is the V100, and the
+figure is read off the live child rather than derived: `/health` on pid 3128149
+(`--max-ctx 32768 --max-batch 1`, depth 1) reports
+`prefix_state_bytes_budget: 1845067776` = **1.718 GiB** and
+`prefix_entries_capacity: 11`, with `prefix_state_bytes / prefix_entries` =
+313786368 / 2 = **149.6 MiB** per snapshot. So 11 snapshots against 12 sessions —
+pressured, but by one session rather than by three.
+
+**An earlier draft of this entry said 9 snapshots from 8 GiB at 144 MiB, and both
+operands were wrong.** The 8 GiB is `PrefixStore`'s own default, not what this card
+runs: `build_engine` passes `mem_get_info()[0] // 4` and that quarter is taken
+*after* weights and pools, so on a 32 GB V100 with this config it is 1.718 GiB.
+The 144 MiB is the bf16 snapshot size; this checkpoint's is 149.6 MiB. Two errors
+that happened to compose into a plausible 9. The V100 grid is a measurement to
+run, not arithmetic to publish, and there the tier is HBM→SSD with no host layer
+(`kv_cache.py:390-396`) — the arm this entry shows to be the worst of the three.
 
 ## Rule
 

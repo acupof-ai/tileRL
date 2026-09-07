@@ -23,8 +23,10 @@ therefore measured the unpressured side and read `0` promotions — a true numbe
 about the wrong condition.
 
 The V100 is the opposite case and shows the arithmetic is the point, not the
-card: its quarter-of-free is 8 GiB = **9 snapshots** at 144 MiB, so 12 sessions
-is already past the budget there. Same code, same default, two regimes.
+card. Read off the live child (`/health`, pid 3128149, `--max-ctx 32768`, depth 1):
+`prefix_state_bytes_budget` **1845067776 = 1.718 GiB**, snapshot 149.6 MiB,
+`prefix_entries_capacity` **11** — so 12 sessions is already past the budget there.
+Same code, same default, two regimes.
 
 ## What Worked
 
@@ -79,10 +81,14 @@ list actually reaches the regime the verdict is about: the numbers here are
 | 2026-09-07 | pending | mac (cpu) | cpu | tiny | `--state-bytes 1 GiB` honoured | 1073741824 |
 | 2026-09-07 | pending | mac (cpu) | cpu | tiny | default budget, same run | 8589934592 |
 | 2026-09-07 | pending | H20 | cuda | qwen38-27b | snapshots at the default budget (derived) | 116 |
-| 2026-09-07 | pending | V100 | cuda | qwen38-27b | snapshots at the default budget (derived) | 9 |
+| 2026-09-07 | 1a3930a | V100 | cuda | qwen38-27b | `prefix_entries_capacity`, live child (read) | 11 |
 
-The two H20/V100 rows are **derived**, not timed: `mem_get_info()[0] // 4`
-divided by the measured snapshot size (157 MiB, 144 MiB). They price the regime;
-they are not a wall clock.
+The H20 row is **derived**, not timed: `mem_get_info()[0] // 4` divided by the
+measured 156.9 MiB snapshot. It prices the regime; it is not a wall clock. The V100
+row is **read** from the live child's `/health` — an earlier draft derived it as 9
+from 8 GiB at 144 MiB and both operands were wrong (8 GiB is `PrefixStore`'s own
+default, not the quarter-of-free this card gets after pools; 144 MiB is the bf16
+snapshot, not this checkpoint's 149.6). Two wrong operands composed into a
+plausible number, which is why the row now cites a reading.
 
 Raw artifacts: `tests/test_server.py::test_serve_state_bytes_reaches_health`.
