@@ -248,7 +248,8 @@ def main() -> int:
     ap.add_argument("--boundary-ctx", type=int, default=32768,
                     help="context for the capacity-boundary arm")
     ap.add_argument("--boundary-batch", type=int, default=32,
-                    help="batch where bf16 OOMs and fp8 serves; 0 skips the arm")
+                    help="batch large enough to saturate the bf16 pool, so fp8's extra "
+                         "blocks show as extra resident requests; 0 skips the arm")
     ap.add_argument("--decode-batch", type=int, nargs="*", default=[1, 8],
                     help="batch sizes. KV scales with batch and the weights do not, so B=1 "
                          "has a 1.019x/1.072x ceiling at 8k/32k while B=8 at 32k has 1.38x "

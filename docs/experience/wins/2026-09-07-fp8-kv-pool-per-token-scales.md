@@ -184,6 +184,15 @@ anything, and I reported the second one as a correction of the first before noti
 - The off-fp8 dummy scale must be `(1, Hkv, block_size)`, not `(1,)`: `Hkv` and
   `block_size` come from `T.const` and are bound from the real operands, so a mismatched
   dummy fails the packed-ABI check.
+- `build_engine`'s `num_blocks` defaults to **64**, and `_fit_blocks` runs only
+  `if not num_blocks`. A nonzero default means "measure free memory" never happens
+  unless a caller passes 0 — the 27B probe ran a day of arms against a 64-block,
+  1024-token pool, which refused its own 2048-token prompt before any forward.
+- `_admit` returns **False** when the pool is short; it does not raise, by design
+  (`engine.py:672` — a raise there reaches `step`'s handler and fails every running
+  request). So an over-large batch is admitted as far as it fits and the rest queues.
+  A capacity claim of the form "bf16 OOMs and fp8 serves" is therefore unreachable
+  through the engine: the observable is how many requests are resident at once.
 
 ## The gate, and its negative control
 
@@ -252,6 +261,10 @@ and the `attn_prep_fp8` docstring rather than kept as files.
 
 - No decode or prefill speedup, at any context length, on any card.
 - The 1.969x is a **capacity** figure — bytes resident per token — not a throughput one.
+  The throughput form it implies is *at saturation*: past the batch that fills the bf16
+  pool, fp8 keeps admitting where bf16 queues. That is a measurement on one card, not
+  arithmetic — the fit table must be the block counts `_fit_blocks` returns, not a
+  hand-derived GiB budget.
 - Multi-session hit rates are not an fp8 measurement. A miss publishes ~62 interior
   entries at a 31k prompt and each evicts another session's shared head (v100's H20
   cell, entry at 541a37c); `_entries_capacity` divides by the GDN snapshot, never KV
