@@ -163,12 +163,13 @@ order is:
    ultimately answers "does the error matter", and it is the only arm that measures the thing
    the bar is a proxy for.
 
-**Assertion 1 has a measured problem already, and it is now cheaper to run than this section
-first said.** The upstream kernel disagrees with upstream's *own* f32 reference by **2.7e-2** at
-our shapes — 271x the board's 1e-4 bar, the same order as the 1.09e-2 that got the four-rounding
-arm rejected, and not explainable as output rounding (arm 1). What changed is the cost: assertion
-1 does not need upstream's forward kernels ported, because ours already are — it needs `h`, `a`
-and `w` carried out of `_gdn_wy_core` instead of dropped at `backend.py:1228`.
+**Assertion 1 has since been run — see the section below — and it came back clean, by a route
+this section did not anticipate.** It needed neither upstream's forward kernels nor the `h`/`a`/`w`
+plumbing out of `_gdn_wy_core`: fla recomputes those from `A` itself, so the arm cost one card
+window and no code change. What remains open is the separate **2.7e-2** figure — the upstream
+tilelang kernel against upstream's *own* f32 reference, 271x the board's 1e-4 bar, the same order
+as the 1.09e-2 that got the four-rounding arm rejected, and not explainable as output rounding
+(arm 1). Assertion 1 does not touch it.
 
 ## The three arms that were run, and what each returned
 
@@ -219,6 +220,11 @@ adopt upstream's forward family too. We already have it, and we already compute 
 and it is cheaper than this arm concluded. Recorded both ways because the arm's own output does
 not contain the correction; only the source does.
 
+**And then overturned a second time, by the fla route.** Assertion 1 needed no plumbing either:
+fla recomputes `w`/`u`/`h` from `A` internally, so the arm ran with no code change at all. This
+arm's conclusion — "cannot be run as a gradient diff" — was true only of the route it assumed.
+The Assertion 1 section below has the numbers.
+
 ### Arm 3 — the instrument's cost, measured rather than bounded
 
 ```
@@ -239,6 +245,76 @@ So the row's total is measured and its internal parts are not. **#219's 55/35/10
 (adjoint 55-57%, recompute 31-35%, pre/post 10-13%) stands as the reference for the parts; no
 further card window is spent re-deriving it.
 
+## Assertion 1: run, and the conventions agree
+
+The question this note said gated everything else — does a ported backward compute the *same*
+gradient our tape computes, or a consistent variant that passes its own gradcheck and trains
+differently? **Answered: the same one.**
+
+Not against the four upstream kernels wired by hand. Against **fla 0.5.2's
+`chunk_gated_delta_rule_bwd`**, which returns the whole adjoint and wires the same stages itself
+(`recompute_w_u_fwd` → `chunk_gated_delta_rule_fwd_h` → `chunk_bwd_dv_local` →
+`chunk_gated_delta_rule_bwd_dhu` → `chunk_bwd_dqkwg` → `prepare_wy_repr_bwd`). The reason is
+that a hand-wiring error and a real convention mismatch produce the same symptom, and the
+hand-wirer is the least reliable part of that arm. A third implementation removes the class.
+
+`scripts/probe_gdn_assertion1.py`, card 0, artifact `/work/gdn_a1c.json`.
+B=1, S=1280, NKH=16, NVH=48, DK=DV=128, **chunk 64 on all three sides**.
+Versions as the run recorded them: **fla 0.5.2, Triton 3.6.0, torch 2.11.0+cu129.**
+
+| grad | worst rel | ratio median | ratio std |
+|---|---:|---:|---:|
+| gstate | 2.358e-3 | 1.0 | 0.0035 |
+| gbeta | 4.815e-3 | 1.0 | 0.0112 |
+| gg | 6.111e-3 | 1.0 | 0.0100 |
+| gq | 6.466e-3 | 1.0 | 0.0088 |
+| gk | 7.023e-3 | 1.0 | 0.0082 |
+| gv | **8.230e-3** | 1.0 | 0.0065 |
+
+**Every ratio is 1.0 within 1.1%** — no sign flip, no scale factor, no decay-placement
+difference. Rerun once: the six figures are bit-identical, so they are not seed or scheduling
+noise.
+
+**Where 8.23e-3 sits, stated narrowly.** It is *not* the 2.7e-2 band, so this is not the
+"loose math on their side" outcome. But it does **not resolve** the 2.7e-2 either: that figure is
+the upstream *tilelang* kernels against their own f32 reference, while this one is our eager f32
+core against fla's Triton kernels fed bf16. Different pairs. The residual here is consistent with
+those bf16 inputs. Two separate measurements, and this one says nothing about the other.
+
+**Both sides enter and exit at the same point.** Ours drives `reference._gdn_chunk_fwd` /
+`_gdn_chunk_bwd` directly — the middle of `gdn_backward` — so both start from the same `g_core`
+(the gradient after the RMSNorm and z-gate adjoint) and stop at the same post-prep tensors. The
+prologue and epilogue are excluded on *both* sides rather than on one.
+
+**Not compared, and not inferable from this arm:** `gz`, `gconv1d`, `gnorm_weight` have no fla
+counterpart. `ga_log` and `gdt_bias` exist only on fla's `use_gate_in_kernel` path, which also
+moves its `dg` to the raw pre-softplus gate — a different quantity from the `gt` both sides share
+here, so it was one or the other. Ours are pure functions of `g_gt`
+(`ga_log = (g_gt * gt).sum`, `reference.py:958`), so `gg` agreeing makes them agree by
+construction. Six grads, not eight.
+
+### Three wrong verdicts, and why the numbers were never the problem
+
+This probe printed three false conclusions before it printed a true one, and in every case the
+per-row measurements were correct while the *label* derived from them was wrong. Worth recording
+because the failure mode is a classifier, not an instrument.
+
+1. **`worst rel 1424`, labelled "a real decomposition difference".** It was the probe: it fed fla
+   `do=go`, the raw output gradient, where our chunk loop consumes `g_core`; and it compared
+   `gdn_backward`'s dL/d(layer input) — q/k/v back through conv1d+silu+L2norm, beta pre-sigmoid —
+   against fla's dL/d(post-prep). Different derivatives, so nothing would have made them agree.
+2. **The ladder had no rung above `5e-2`**, so an impossible number fell into the "real
+   difference" bucket by default. A verdict scale whose top rung is open-ended converts the
+   author's own bug into a finding about the code under test. Fixed: `>= 1.0` now reads *the probe
+   is wrong*.
+3. **`8.23e-3` with every ratio at 1.0, labelled "a SCALE or SIGN convention differs".** The rung
+   fired on any near-constant ratio without checking the constant differs from 1 — so perfect
+   agreement was reported as a convention error. Fixed with `abs(median - 1.0) > 0.02` and an
+   explicit agree rung, verified against the measured rows.
+
+The rule: a verdict ladder needs a rung for *my own measurement being broken*, and a
+"constant ratio" test is only evidence of a scale error when the constant is not 1.
+
 ## The numbers this rests on
 
 | quantity | value | how measured |
@@ -250,7 +326,8 @@ further card window is spent re-deriving it.
 | ratio | 20.6x | subset-vs-whole, see caveat 1 |
 | step ceiling | 1.470x | 23.194 → 15.774 s |
 | upstream kernel vs its own f32 reference | 2.7e-2 | dh/dh0/dv2 only; two seeds, 2.57e-2 and 2.714e-2 |
-| f32-IO cell | does not compile | layout infer conflict at threads=256 (arm 3) |
+| f32-IO cell | does not compile | layout infer conflict at threads=256 (arm 1) |
+| our core adjoint vs fla's | 8.23e-3 | 6 grads, ratio 1.0 ±1.1%, chunk 64 (assertion 1) |
 
 **A config caveat that is part of the record**: the cell these numbers come from is the kernel
 functions' *defaults* (block_DV=64, threads=256, num_stages=0). Upstream's own `main()` cell
@@ -269,7 +346,8 @@ per chunk, per call) are not needed on the sm90 path: those three quantities are
 there in kernel layouts by `gdn_state_scan`, `gdn_solve_tril` and `gdn_chunk_wu`, and then
 discarded one line later.
 
-Cost in files, for the plumbing that unblocks assertion 1:
+Cost in files, for the plumbing a **ported backward** needs (assertion 1 itself turned out not to
+need it — fla recomputes those from `A` — so this is the port's cost, not the measurement's):
 
 | file | change |
 |---|---|
@@ -288,15 +366,20 @@ hard gate — has to keep working. That is a rewrite of `reference.py:629-780` p
 backward kernels plus the reverse head-group scatter. Not this tranche.
 
 **The two are not exclusive, and that is the argument for this order.** Plumbing the cache out
-costs two files and makes the measurement possible; if assertion 1 then shows a convention
-mismatch or the 2.7e-2 proves fatal, the rewrite was never started.
+costs two files; the rewrite costs a family of kernels and a reference rewrite. With assertion 1
+now clean, the thing that would have stopped the port before it started — a convention mismatch —
+is ruled out, and what remains is the 2.7e-2 and the unmeasured glue.
 
 ## The one-line recommendation
 
-**Plumb `saved` out of `_gdn_wy_core` (two files), then run assertion 1 — before any kernel is
-written.** The earlier version of this line said assertion 1 "needs no tape change", which was
-wrong in both directions: it does need one, and that change is much smaller than the forward-family
-port arm 2 concluded it needed. A 1.470x ceiling on the largest row in the backward justifies two
-files and one card window; it does not yet justify the rewrite, and the 2.7e-2 is an unresolved
-reason it might never.
+**Assertion 1 is done and clean, so the port is no longer gated on correctness-of-convention — it
+is gated on the 2.7e-2 and on TP's priority.** Two open items remain, in this order: the upstream
+kernels' 2.7e-2 against their own f32 reference (271x the 1e-4 bar, unexplained by rounding, and
+untouched by assertion 1), and the glue cost, which only a prototype produces. A 1.470x ceiling on
+the largest row in the backward justifies keeping the port on the board; it does not outrank TP.
+
+This line has now been rewritten three times as each arm returned — "prototype assertion 1, it
+needs no tape change" → "it needs two files of plumbing" → "it needed neither." Each version was
+wrong about the *route* while the underlying question stayed the same, which is the argument for
+running the cheap arm before pricing the expensive one.
 
