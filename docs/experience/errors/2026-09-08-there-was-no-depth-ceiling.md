@@ -77,6 +77,11 @@ cap is overtaken at a hit count that grows with K:
 (Cumulative matched tokens, flat rung as `r × (N−1)` since the first hit has nothing published, ratchet as
 `Σ min(512k, 29744)`, at 373 µs/token.)
 
+**Why deep K wins is one-hit convergence, not depth per rung.** Row 1 publishes all K rungs in a single
+prefill, so row 2 already matches the deepest in-band one — the climb disappears rather than accelerating.
+The crossover arithmetic above is unchanged, since it already assumes a rung available from hit 2, but the
+mechanism is convergence in one hit.
+
 So a flat rung is *better the deeper it is* over any horizon short of its own crossover, and K=2 is the
 worst choice rather than a free one — it is the only one this fixture's own length would overtake. A first
 version of this table reported a single crossover at 58 for every K, by putting K=2's numbers on all three
@@ -101,8 +106,11 @@ arbitrary constant: it is the block-aligned chunk grid the gate already tests (`
 
 The run gives no evidence either way: `published 144 = 4 × 36` exactly means all 144 inserts were distinct,
 which shows the ratchet never *collides* — `k` advances every hit, so no two hits share a depth — not that
-dedup is unreachable. And the benefit is workload-dependent in the way the depth was not: a fixed rung is
-shared only while it sits below the LCP, which the publisher cannot know.
+dedup is unreachable. **Dedup's benefit is conditional on the workload, in the way the depth was not:** a
+fixed rung is shared only while it sits below the LCP, the publisher cannot know the LCP, and this
+fixture's 98.8% is unusually favourable. A workload diverging at 2000 tokens shares four rungs and the rest
+are per-conversation again, which puts residency back at the per-row model. Nobody has surveyed that
+distribution.
 
 **And an open question on the climb rate.** The step is 512 because the gate fires at the first
 block-aligned chunk end past `prefill_from`, and the chunk is `max_num_batched_tokens` (`engine.py:197`). A
