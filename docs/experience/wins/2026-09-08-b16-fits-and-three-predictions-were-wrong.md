@@ -105,6 +105,28 @@ because 16 rows admit across more ticks, so more ticks carry both phases.
 drop. A per-call rate and a per-token cost are different quantities, and the second is what a
 training step pays.
 
+### Two instruments, compatible to 15%, sharing no code
+
+48 converted their per-call GEMM timings to per-token and weighted the two quantization
+paths by bytes. Recomputed here from their published table rather than accepted:
+
+| | M=8 ms/tok | M=16 ms/tok | ratio |
+|---|---:|---:|---:|
+| fp4 | 0.01000 | 0.00788 | 0.787x |
+| fp8 | 0.01175 | 0.00737 | 0.628x |
+| byte-weighted (11.262 / 10.628 GB) | | | **0.710x** |
+| **this entry's measured decode/token** | | | **0.618x** |
+
+**14.9% apart, and the sign of the gap is explainable**: both of their shapes are ~70 MB
+weights, while a larger one (`gate_up`, 133.8 MB) runs faster at M=8 and amortizes harder, so
+their mix is conservative.
+
+This is **compatible, not agreeing** — 48's own limit is that one shape per dtype extrapolated
+to a whole model is the reconstruction they refused to publish, since rates move 39% across
+shapes. What makes it worth stating is that a whole-step wall clock and a single-kernel timing
+share no code and no assumption, and land inside 15%. Two readings of *different* quantities
+that constrain each other, which is the thing a re-derivation from one source can never be.
+
 **What was not read: `clocks.sm` inside the timed window.** 48 raised this for their own
 microbenchmarks — an idle card sits at 345 MHz against a 1980 MHz maximum, 5.7x — and then
 measured it away (identical 1980 MHz and 0.081 ms from 10 to 20000 warm-ups, the card at full
