@@ -219,9 +219,11 @@ bare question. This run's eval lengths are the first on the production path.
 
 ## Results
 
-**The headline: `steps_to_score` at X=91.0 is `(0, 25]`, and 25 steps against 100 is 3.85x on
+**The headline: `steps_to_score` at X=91.0 is `(0, 25]`, so 25 steps against 100 is **≥3.85x** on
 training seconds — 537.4 s against 2066.7 s.** The project has measured `seconds_per_step` many
-times and this is the first measurement of the left factor.
+times and this is the first measurement of the left factor. **It is a lower bound**: the crossing
+happened somewhere in (0, 25] and 25 is only where it was first observed to have happened, so a
+finer grid replaces 25 with the true step and the ratio can only grow.
 
 | point | score | net vs base | mean tok | tok/correct | cumulative train s | eval s |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -262,7 +264,7 @@ stopped at 50.
 
 | quantity | value | meaning |
 |---|---|---|
-| crossing step at X=91.0 | **(0, 25]**, 537.4 s | when the target is first reached |
+| crossing step at X=91.0 | **(0, 25]**, ≤537.4 s | when the target is first reached; **a lower bound on the ratio** |
 | **best step** | **50**, 93.4%, 1038.6 s | where a run should be stopped |
 
 Stopping at the best step is **1.99x less training time and +2.2 pt better** than running all
@@ -308,5 +310,14 @@ manifest names, not by mtime, **and** confirm a directory is yours before conclu
 contents.
 
 MMLU after reads 75.7% against 75.1% before, so the regression check holds.
+
+**That MMLU pair does not narrow the step-75 mechanism, and reading it as evidence that general
+capability survived is a step-number error.** `evals("after")` runs once, after the loop, so
+75.7% is the **step-100** policy — the one that had already recovered to 91.2%. There is no MMLU
+reading at step 75, the step where GSM8K was 11 points down. To learn whether the dip was
+GSM8K-specific or general, MMLU would have to be scored *inside* the curve, which
+`score_curve` does not do (it calls `gsm8k_accuracy` only). Proposed by `tilerl-27` as a
+narrowing of the candidates and withdrawn on this reading; it is a real experiment, not a
+conclusion available from these numbers.
 
 Points 2-4 pending.
