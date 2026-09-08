@@ -1,8 +1,9 @@
-# B=16 fits the card with 57 GiB spare, and three of my own predictions were wrong — 2026-09-08
+# B=16 is 23.8% cheaper per token and fits with 57 GiB spare, and the first clock said the opposite — 2026-09-08
 
-**Status:** the capacity question is **settled** — B=16 fits. The throughput question this
-probe appeared to answer is **not measurable from it**, and the memory decomposition I gave a
-peer before the run was wrong in a way that mattered.
+**Status:** both questions **settled**. B=16 fits (peak 30.13 GiB of 95.2) and costs **7.930
+ms/token against B=8's 10.409, 23.8% cheaper**, measured with zero JIT inside the timed steps.
+The first attempt reported the opposite sign because 47% of one arm's wall clock was TileLang
+compiling, and the memory bracket I gave a peer before the run did not contain the answer.
 
 ## Context
 
@@ -77,6 +78,43 @@ against 95.2, with 57.24 GiB spare. Even if the unlocated 2.11 GiB doubled again
 the answer would not change.
 
 ## 2. The wall clock says B=16 is slower, and that number is unusable
+
+**Re-measured with the gate, and it reverses: B=16 is a net win.** Same card, same shapes,
+`prof_grpo_step.py --steps 5`, `warm_compiles: 0` in both arms:
+
+| | B=8 | B=16 | ratio |
+|---|---:|---:|---:|
+| sec/step | 85.27 | 129.93 | **1.524x** (net win under 2.000) |
+| **ms/token** | **10.409** | **7.930** | **0.762x — 23.8% cheaper** |
+| rollout/token | 7.690 | 5.226 | 0.680x |
+| decode/token | 7.263 | 4.486 | **0.618x** |
+| train/token | 2.719 | 2.704 | 0.994x |
+
+The contaminated figures were 26.55 and 31.00 ms/token — **2.55x the clean B=8 value, and the
+wrong sign on the comparison.** A JIT-dominated clock did not merely add noise; it inverted
+the verdict.
+
+The decode row is what `tilerl-0a`'s dispatch table predicts: fill goes 50% to 100% at
+wgmma's M granularity of 16, so the ideal is 0.500x per token and **0.618x realizes 76% of
+it**. The other rows check that table's silences: `train/token` is 0.994x because `--micro 1`
+runs one row per backward and cannot benefit, exactly as it should be; `mixed` grew 3.692x
+because 16 rows admit across more ticks, so more ticks carry both phases.
+
+**This does not contradict 48's finding that the per-call rate falls past M=8** (fp4 832.8 to
+531.7 GB/s at M=16). Both hold and they compose: batch amortization beat the per-call rate
+drop. A per-call rate and a per-token cost are different quantities, and the second is what a
+training step pays.
+
+**What was not read: `clocks.sm` inside the timed window.** 48 raised this for their own
+microbenchmarks — an idle card sits at 345 MHz against a 1980 MHz maximum, 5.7x — and then
+measured it away (identical 1980 MHz and 0.081 ms from 10 to 20000 warm-ups, the card at full
+clock as soon as the 27B is resident). It cannot be a first-order term here either: each arm
+runs 184–232 s of step 0 before the timed steps and 85–130 s per step, five orders past a
+sub-second ramp. The honest limit is that a *thermal* excursion over a 130 s step remains
+unmeasured — and it would hit the longer arm harder, understating B=16, so **0.762x is
+conservative under that failure mode** rather than flattered by it.
+
+### The contaminated arm, kept on record
 
 B=8 is 26.55 ms/token, B=16 is **31.00 ms/token — 1.168x worse**, the opposite of the
 dispatch prediction. Reporting that as a refutation would have been wrong.
@@ -156,9 +194,13 @@ flag.
 - **Split a memory delta into pools and transient before attributing it.** `base`,
   `after_build` and `peak` cost three lines and turn "my prediction was 2.36 GiB off" into
   "my pool math was right to 1.05x and the transient is unlocated".
-- **A wall clock that contains a JIT is not a throughput measurement.** Count the compiles
-  before quoting ms/token, and if they differ between arms, the comparison is void — not
-  adjustable.
+- **A wall clock that contains a JIT is not a throughput measurement, and it can invert a
+  verdict rather than blur it.** The contaminated arms said B=16 was 1.168x worse per token;
+  clean they say 0.762x — the wrong sign, not a wide error bar. Count the compiles inside the
+  timed steps and refuse to report when the count is nonzero; subtracting afterwards does not
+  work because compilation and execution interleave in one clock.
+- **Compare per-token cost, never per-step.** sec/step rises with the group whatever the
+  efficiency, so two widths compared on it only show that the wider one did more work.
 - **Sample a pool's occupancy while it is occupied.** A post-drain `stats()` reads 0 and that
   0 looks like a measurement.
 - **A guard belongs where the resource is consumed, not where the flag is parsed.** The CLI
