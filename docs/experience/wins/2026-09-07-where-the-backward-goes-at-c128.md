@@ -85,7 +85,10 @@ doubled while the adjoint's fell 12 points. This arm's 7.188 s total is within 0
 registry arm's 7.249 s row, which is what shows both arms measure the same work.
 
 The general point: a share is not a property of an op. Both terms moved here, and the fp8 row's
-share rose from 6.2% to 14.4% while its seconds fell from 4.298 to 3.162.
+share rose from 6.2% to 15.08% while its seconds fell from 4.298 to 3.144 — this run's figures,
+`15b6cf1`. The 3.162 s / 14.39% pair is a **different sha** (`2cce289`,
+[the fp8 frozen backward kernel](2026-09-07-fp8-frozen-backward-kernel.md)) and the two are not
+interchangeable: quote each with its sha.
 
 ## The lever table
 
@@ -178,7 +181,7 @@ gate. Removing all 1.784 s caps at 1.084x on the backward. Nothing is shipped fo
 
 A share is only meaningful with its denominator's config. Re-read a numerator before scoping work
 against it — the top row here was still being quoted at 65.7% after the shipped tree made it
-33.0%.
+30.48%.
 
 ## Results
 

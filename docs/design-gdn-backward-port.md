@@ -246,9 +246,13 @@ instrument cost instead of an estimated one.
 **The per-op split was not captured, and that is a defect in the probe, not a property of the
 system.** The filter `"gdn" in ln.lower() and ln.startswith("{")` matched only the config header
 line — which happens to contain `gdn_chunk` and `gdn_forward_arm` — and none of the per-op rows.
-So the row's total is measured and its internal parts are not. **#219's 55/35/10 bracket**
-(adjoint 55-57%, recompute 31-35%, pre/post 10-13%) stands as the reference for the parts; no
-further card window is spent re-deriving it.
+So the row's total is measured and its internal parts are not. The parts come from
+[where the backward goes at c128](experience/wins/2026-09-07-where-the-backward-goes-at-c128.md):
+at the shipped C=128, adjoint **43.16%**, recompute 25.94%, prologue/epilogue **24.82%**, solve
+6.09%. **#219's 55/35/10 bracket is superseded** — it was measured at C=16, and the chunk
+increase moved the split: the prologue/epilogue runs once per layer-call either way, so its share
+roughly doubled while the adjoint's fell 12 points. A port priced against 55-57% is priced
+against a split the shipped tree no longer has.
 
 ## Assertion 1: run, and the conventions agree
 
