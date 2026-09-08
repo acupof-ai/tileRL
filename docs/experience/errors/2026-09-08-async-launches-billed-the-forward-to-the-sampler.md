@@ -124,6 +124,19 @@ mentioning ms/token, so which of them inherit this is worth stating rather than 
   after the fact cannot recover the split, while the subtraction makes the number look
   handled.
 
+**Discarding the first step belongs in the third category**, and it is the version
+everyone writes: `pooled = rows[1:]`, the standard warmup convention. It asserts that all
+compilation lands in step 0. 25 measured a B=16 arm whose step 1 compiled 40 kernels and
+steps 2-5 compiled none -- the convention sufficed there by luck, and nothing in the
+summary would have looked different if it had not. A rollout that reaches a new decode
+width partway through compiles partway through. This probe did exactly this and has been
+changed.
+
+So the criterion is: **the numerator has had no compile-time handling of any kind** --
+not subtraction, not dropping leading steps. Only a count of zero establishes a warm
+region, because it is the only statement that does not depend on knowing which step the
+compiling happened in.
+
 The gate is `len(backend._kernels)` before and after the timed region, keyed on
 `(name, args, kw)` so a compile is exactly one new key; a nonzero delta refuses to report
 rather than reporting. Classification here is by how a number was computed, not by how it
