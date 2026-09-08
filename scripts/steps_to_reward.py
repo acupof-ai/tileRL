@@ -50,6 +50,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.autograd import Adafactor
 from tilerl.cli import _build_model
@@ -93,6 +94,9 @@ def _args(argv=None):
     p.add_argument("--sft-lr", type=float, default=DEFAULTS["sft_lr"])
     p.add_argument("--rl-lr", type=float, default=DEFAULTS["rl_lr"])
     p.add_argument("--seed", type=int, default=DEFAULTS["seed"])
+    p.add_argument("--backend", default="auto", choices=("auto", "reference"),
+                   help="auto takes the real backend (TILERL_TARGET); reference is the "
+                        "torch-eager CPU twin, which is CPU no matter what TILERL_TARGET says")
     a = p.parse_args(argv)
     # Before the SFT phase, not inside the first RL arm: a missing --data used to surface
     # after 40 SFT steps had already run.
@@ -159,8 +163,7 @@ def make_reward(cfg, a):
     return correct, prompts
 
 
-def rl_arm(cfg, model, make_opt, a):
-    backend = RefBackend()
+def rl_arm(cfg, model, make_opt, a, backend):
     engine = build_engine(cfg, model, backend, num_blocks=256, num_slots=8,
                           decode_graph=False, prefix_store=NoPrefixStore())
     reward, prompts = make_reward(cfg, a)
@@ -198,8 +201,10 @@ def sigma_verdict(tied: float, ada_max: float) -> str:
 
 def main(argv=None):
     a = _args(argv)
+    # RefBackend is the torch-eager CPU reference (`device = cpu`, hardwired), so a card run
+    # must take the real backend or every arm silently runs on the host.
+    backend = get_backend() if a.backend == "auto" else RefBackend()
     cfg, base = _build_model(a.model, seed=a.seed, keep_master=True)
-    backend = RefBackend()
     torch.manual_seed(a.seed)
     if a.sft_steps:
         sft = sft_base(cfg, base, backend, a)
@@ -208,15 +213,23 @@ def main(argv=None):
     else:
         print("SFT phase skipped (--sft-steps 0): Sigma is the init's, which carries no "
               "information on a random build")
-    print(f"model {a.model}  reward {a.reward}  group {a.group}  "
+    print(f"model {a.model}  reward {a.reward}  group {a.group}  backend {backend.name}  "
           f"max_new_tokens {a.max_new_tokens}  rl_steps {a.rl_steps}\n")
 
     arms = {"Adafactor": lambda: Adafactor(lr=a.rl_lr),
             "ISO(Adafactor)": lambda: ISO(Adafactor(lr=a.rl_lr))}
+    # One arm at a time, and the base's tensors are SNAPSHOTTED rather than kept as a second
+    # live model: `keep_master=True` on the 27B is 65.0 GiB resident
+    # (wins/2026-08-29-full-finetune-fits.md), so base + one clone is 115 GiB against a 95.6
+    # GiB card and the run OOMs before step 1. The snapshot is on the host, where 22 GB of
+    # bf16 costs RAM rather than the card, and each arm restores into the SAME tensors.
+    snapshot = {k: v.detach().to("cpu", copy=True) for k, v in base.params.items()}
     out = {}
     for name, mk in arms.items():
-        model = type(base)(cfg, {k: v.clone() for k, v in base.params.items()})
-        out[name] = rl_arm(cfg, model, mk, a)
+        with torch.no_grad():
+            for k, v in base.params.items():
+                v.copy_(snapshot[k])
+        out[name] = rl_arm(cfg, base, mk, a, backend)
         r, (dmax, dmean), tied = out[name]
         print(f"{name:>16}: reward {r[0]:.3f} -> {r[-1]:.3f}   "
               f"Sigma drift max {100 * dmax:6.2f}%  mean {100 * dmean:5.2f}%  "
