@@ -42,16 +42,17 @@ changed here.
   `params.update`. The length term named as the fourth prerequisite's cause landed
   in #293. **What remains is the pod run, and it is held** until the exit gate below
   lands (ckl, 2026-09-08).
-- **P1's encoded exit gate is looser than this document's, and cannot demonstrate
-  this document's target.** `cli.py:832-835` gates GSM8K on `after > before`, which
-  on a **count** metric (`cli.py:588` writes `c`, while `cli.py:575` writes `c / n`
-  for MMLU) is +1 question in 500 = +0.2 pt against the `>= +5 pt` above; MMLU is
-  allowed −3 pt where this document allows −2. Separately, at `eval_n=500` an
-  **unpaired** test has an 80%-power one-sided MDE of **7.70 pt**, so the +5 pt
-  target sits below the smallest effect the test it is judged by can detect. The
-  failure mode is a miss, not a false pass. Under the paired McNemar the run
-  already writes per-question rows for, +5 pt is resolvable while the discordant
-  rate stays under ~15.9% (80% power, two-sided).
+- **P1's encoded exit gate could not demonstrate this document's target. Half of
+  that is fixed; the half that decides the verdict is not.** The threshold half is
+  closed by #301 (`0197dcc`): GSM8K gated on `after > before` was, on a **count**
+  metric, +1 question in 500 = +0.2 pt against the `>= +5 pt` above, and MMLU allowed
+  −3 pt where this document allows −2. Both now match the document. What remains
+  is the **test**: at `eval_n=500` an **unpaired** comparison has an 80%-power
+  one-sided MDE of **7.70 pt**, so the +5 pt target still sits below the smallest
+  effect the comparison it is judged by can detect. The failure mode is a miss, not
+  a false pass — a real +5 pt run reads as no result. Under the paired McNemar the
+  run already writes per-question rows for, +5 pt is resolvable while the discordant
+  rate stays under ~15.9% (80% power, two-sided); that is #309.
 - **P2.0's mechanism changed and the exit did not.** The text says the captured
   graph is "re-recorded after every optimizer step". The implementation instead
   keeps the graph and refills the f32 cast (`engine.py:1180-1202`), which is sound
