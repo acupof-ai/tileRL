@@ -52,6 +52,9 @@ sys.path[:0] = [f"{os.environ['REMOTE_DIR']}/src",
                 f"{os.environ['REMOTE_DIR']}/packages/tilerl-kernels/src"]
 
 _PROMPTS = "/work/p1_gsm8k_train.jsonl"
+# Seeds are indexed by this, never by the arm's own `group`, so every arm's row g of
+# step s draws the same completion and the arms differ only in width.
+_MAX_GROUP = 64
 
 
 def _idle(lengths: list[int]) -> float:
@@ -123,7 +126,14 @@ def main() -> int:
               f"{'idle%':>6} {'wall s':>7}")
         for step, prompt in enumerate(prompts):
             t0 = time.perf_counter()
-            ids = [engine.submit(prompt, replace(base, seed=step * group + g))
+            # seed indexed by _MAX_GROUP, not `group`: with `step * group + g` the two
+            # arms' seed sets stop overlapping after step 0, so an 8-vs-16 comparison
+            # silently draws different completions from the same prompts and the arms
+            # differ by sampling as well as by width. Measured: mean row 1083 at group 8
+            # against 923 at group 16, which is most of the 2.8-point idle gap, and no
+            # output showed the seeds had diverged. A controlled comparison's random
+            # source has to be orthogonal to the variable under test.
+            ids = [engine.submit(prompt, replace(base, seed=step * _MAX_GROUP + g))
                    for g in range(group)]
             done = _drain(engine, ids, "tail probe")
             wall = time.perf_counter() - t0
@@ -161,4 +171,15 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # The seed indexing, before it costs 1.5 hours of card: at every step the narrow arm's
+    # draws must be the wide arm's first `group` draws, or the arms differ by sampling as
+    # well as by width. `step * group + g` gave 8 of 160 rows the same seed across arms
+    # and only step 0 nested; the run that shipped it put mean row length at 1083 for
+    # group 8 against 923 for group 16, and nothing in its output showed why.
+    def _seeds(step, k, stride):
+        return {step * stride + g for g in range(k)}
+
+    assert all(_seeds(s, 8, _MAX_GROUP) <= _seeds(s, 16, _MAX_GROUP) for s in range(20))
+    assert sum(_seeds(s, 8, 8) <= _seeds(s, 16, 16) for s in range(20)) == 1, \
+        "the old indexing must fail this, or the check passes on anything"
     raise SystemExit(main())
