@@ -15,6 +15,7 @@ reward-vs-step curve needs and which a fixed seed reports as zero.
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -55,24 +56,35 @@ print(f"{len(rows)} prompts x group {a.group}, cap {a.cap}, matcher {a.matcher}\
 seeds = [int(s) for s in a.seeds.split(",")]
 per_seed = []
 for seed in seeds:
-    lens, correct = [], 0
+    # One submit wave, one drain: the first version drained inside the prompt loop, so 8
+    # prompts ran as 8 sequential waves of `group` against an 8-slot engine. A rollout probe
+    # that serializes measures the engine's latency, not the policy's, and takes 8x the wall
+    # clock for the same rows. `submit` queues past the slot count rather than raising
+    # (engine.py:1697's warning), so a wave wider than the pool is correct, just batched.
+    rids, gold_of = [], {}
+    t0 = time.perf_counter()
     for i, r in enumerate(rows):
         ids = tok.encode(r["prompt"])
-        rids = [engine.submit(list(ids), SamplingParams(
-            max_new_tokens=a.cap, temperature=1.0, seed=seed * 10007 + i * a.group + g))
-            for g in range(a.group)]
-        done = _drain(engine, rids, "length probe")
-        for rid in rids:
-            c = done[rid]
-            lens.append(len(c))
-            correct += int(match(tok.decode([int(t) for t in c]), r["answer"]))
+        for g in range(a.group):
+            rid = engine.submit(list(ids), SamplingParams(
+                max_new_tokens=a.cap, temperature=1.0, seed=seed * 10007 + i * a.group + g))
+            rids.append(rid)
+            gold_of[rid] = r["answer"]
+    done = _drain(engine, rids, "length probe")
+    wall = time.perf_counter() - t0
+    lens, correct = [], 0
+    for rid in rids:
+        c = done[rid]
+        lens.append(len(c))
+        correct += int(match(tok.decode([int(t) for t in c]), gold_of[rid]))
     n = len(lens)
     arr = np.array(lens)
     acc = correct / n
     per_seed.append((seed, acc, arr))
     print(f"seed {seed}: accuracy {100*acc:5.2f}%  mean {arr.mean():7.1f}  "
           f"median {np.median(arr):7.1f}  p90 {np.percentile(arr, 90):7.1f}  "
-          f"max {arr.max():5d}  at cap {100*(arr >= a.cap).mean():5.1f}%", flush=True)
+          f"max {arr.max():5d}  at cap {100*(arr >= a.cap).mean():5.1f}%  "
+          f"wall {wall:6.1f} s = {wall/n:5.2f} s/rollout", flush=True)
 
 allarr = np.concatenate([x[2] for x in per_seed])
 accs = np.array([x[1] for x in per_seed])
