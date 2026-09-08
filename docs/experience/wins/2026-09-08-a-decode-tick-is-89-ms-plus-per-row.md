@@ -1,7 +1,52 @@
 # A decode tick costs 8.9 ms plus 3.7–4.5 ms per active row — 2026-09-08
 
-**Status:** measured on card 3, 20 GRPO rollout steps, group 8, cap 6144, real GSM8K
-prompts. Every number here is for that length distribution — see the last two sections.
+**Status:** the tick coefficients stand. **Every length-distribution number below is VOID**
+— the probe that produced them fed the model unrendered prompts. The numbers are kept,
+marked, and explained rather than deleted, because a deleted wrong number gets recomputed
+the same way by the next person.
+
+## The prompts were never rendered
+
+`probe_rollout_tail.py` fed `tok.encode(question)` — the bare document, with no
+`<|im_start|>user`, no open assistant turn, and (thinking off) none of the empty
+`<think></think>` the template closes in the prompt. `grpo_loop`'s prompts come from
+`render_chat` (cli.py:611). A chat-tuned model handed a bare document continues the
+document, so the rows ran long: mean 1083 tokens, 11 of 160 at the 6144 cap. An
+independent measurement of the same dataset through the template read **mean 322, p90 532,
+1.3% at a 1024 cap** — 19x on the mean, at 95.3% accuracy.
+
+Void as a result: the pooled idle 74.5%, `Σmax/Σsum` 0.4908, the refill gain and its
+ceiling, the train padding factor, and the observation that 12 of 18 steps had a row reach
+5000 tokens — which is what prompted a degeneration investigation into a phenomenon the
+probe had manufactured.
+
+**What made it invisible was the part that was done right.** The sampler came from
+`prompt.sampling` through `untruncated()`, exactly as `grpo_loop` builds it, and the probe
+printed it on line two of every run. A correct, prominent, verified parameter set reads as
+evidence that the rest of the input is correct too. The docstring argued at length for
+real prompts over synthetic ones — it defended the data's *source* and never mentioned its
+*format*.
+
+Two things now guard it: the prompts go through `render_chat`, and every row is scored
+with `answer_match`, with the pooled accuracy printed and a warning below 50%. An accuracy
+column would have shown this in the first step.
+
+**A second difference, which is not a defect.** `untruncated()` (train.py:429) drops top-p
+and top-k because `rl_step` differentiates the full softmax, so this probe samples all
+248320 tokens where an eval samples top_p 0.8 / top_k 20. Its lengths should therefore
+exceed an eval's on the same prompts by an unknown factor. The 322 is not a target to
+reproduce; it is a floor.
+
+## What survives
+
+- **`b` and `c`** — fitted against each step's `max` and `sum` whatever produced those
+  lengths. The tick sweep measures them directly and does not use prompts at all.
+- **Throughput 1.325x for group 8 → 16** — both arms drew from the same wrong
+  distribution, so the ratio holds, but it is now a ratio measured in a regime the
+  training path never enters.
+
+The sections below are preserved as written. Read the tick-cost and R² sections; treat
+every occupancy, idle, and refill figure as void.
 
 ## Context
 
@@ -186,4 +231,15 @@ noise moves when the data grows — over eleven more steps, not over one.
 **A measurement's scope has to travel with its number**, and scope is not only "which
 kernel" or "which M". Here it was the dataset, the group size, and whether the cap was
 reached. None of the three is visible in the number.
+
+**A probe that claims to reproduce a shipped path has to enumerate what that path does
+before the step it reproduces.** This one took the sampler from `prompt.sampling` and the
+prompt from nowhere; `render_chat` sits one layer outside the `tok.encode` it copied. List
+the shipped call chain and tick off each stage, rather than checking that the one stage
+you thought about matches.
+
+**A distribution measured with no correctness column cannot tell a tail from garbage.**
+Length is cheap to record and means nothing on its own. Whatever a probe measures about
+generated text, it should also score the text — here one `answer_match` per row would have
+read near zero on the first step and saved the day's four downstream investigations.
 
