@@ -60,12 +60,15 @@ def test_norm_fold_is_per_format(tmp_path):
     trunk = build_random(cfg, seed=0)
 
     nextn = load_draft(trunk, _draft_file(tmp_path, cfg, dspark=False))
-    assert torch.allclose(nextn.params["norm"], torch.full_like(nextn.params["norm"], 1.25)), (
+    # Exact: 1.25 is representable in the stored dtype, so the fold either lands on it or
+    # it is wrong. A band here would pass a fold off by less than the tolerance.
+    assert torch.equal(nextn.params["norm"], torch.full_like(nextn.params["norm"], 1.25)), (
         "NextN norms must carry the folded +1"
     )
 
     dspark = load_draft(trunk, _draft_file(tmp_path, cfg, dspark=True))
-    assert torch.allclose(dspark.params["norm"], torch.full_like(dspark.params["norm"], 0.25)), (
+    # Exact: 0.25 is representable in the stored dtype (see the note at the NextN assert).
+    assert torch.equal(dspark.params["norm"], torch.full_like(dspark.params["norm"], 0.25)), (
         "DSpark norms are plain w*x — folding corrupts them"
     )
     assert "pre_fc_norm_hidden" in dspark.params  # hidden_norm maps onto it

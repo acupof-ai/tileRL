@@ -238,6 +238,10 @@ def test_conv_tap_stops_at_the_block_start(tmp_path):
 
     out = head._conv(x, delta, base)
     tap0 = (base[0] + delta[..., 0, :].repeat_interleave(dc.group_size, -1)) * x
+    # Band kept deliberately: the two sides are independent computations -- head._conv
+    # against the hand-written expansion -- that happen to agree bit-for-bit today.
+    # Tightening would assert determinism across compiler and library bumps, a stronger
+    # claim than intended (audit 2026-09-08).
     assert torch.allclose(out[:, 0], tap0[:, 0], rtol=1e-5, atol=1e-6)
     assert not torch.allclose(out[:, 1], tap0[:, 1], rtol=1e-2)  # tap 1 does reach slot 1
 
@@ -376,13 +380,16 @@ def test_norm_fold_is_per_format(tmp_path):
     none of the anti-correlated logits that made the reverse bug findable.
     """
     head = _tiny_head(tmp_path)
-    assert torch.allclose(head.params["norm"], torch.full_like(head.params["norm"], _NORM))
+    # Exact: _NORM is 0.25, representable in the stored dtype, so the read is either that
+    # value or a defect.
+    assert torch.equal(head.params["norm"], torch.full_like(head.params["norm"], _NORM))
 
     nextn = tmp_path / "nextn.safetensors"
     w = torch.full((8,), _NORM)
     save_file({"mtp.norm.weight": w, "mtp.pre_fc_norm_hidden.weight": w.clone()}, str(nextn))
     folded = read_head_params(nextn, _DRAFT_TOP)
-    assert torch.allclose(folded["norm"], torch.full_like(w, _NORM + 1.0))
+    # Exact: 0.25 + 1.0 = 1.25, representable in the stored dtype.
+    assert torch.equal(folded["norm"], torch.full_like(w, _NORM + 1.0))
 
 
 # --- the block drafter on the engine tick ------------------------------------
