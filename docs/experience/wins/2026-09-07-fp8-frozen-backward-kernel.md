@@ -57,14 +57,20 @@ comparison is real only on sm90; off it the test skips with that reason.
 | quantity | before | after |
 |---|---:|---:|
 | `backward_secs` (`--no-instrument`, warm, C=128) | 23.194 | **22.264** |
-| step speedup | — | **1.042x** |
+| speedup on `backward_secs` | — | **1.042x** |
+| the same saving on the STEP (85.617 s, `73433bb`) | — | **1.011x** |
 | fp8 dX op row, instrumented warm step | — | 3.162 s / 14.39% / 1864 calls / **1.696 ms** |
 | fp8 dX, bare, both arms one process (8 shapes) | 4.260 s/step | **3.018 s/step** |
 | op speedup, measured | — | **1.411x** |
 
-**1.042x on the step, against 1.126x predicted, from a measured 1.411x on the op.** The
-prediction assumed 2.68x on the op and that the step would take the whole saving. Both were
+**1.042x on `backward_secs`, against 1.126x predicted, from a measured 1.411x on the op.** The
+prediction assumed 2.68x on the op and that the bucket would take the whole saving. Both were
 optimistic, and the entry keeps the predicted figures rather than deleting them.
+
+The 0.930 s is **1.09% of a GRPO step** — 1.011x — because `backward_secs` is 26.1% of the
+85.617 s step measured at `73433bb`
+([the step is 74% rollout](2026-09-07-the-step-is-74-percent-rollout.md)). Every ratio above is
+on the bucket; this is the only step-level number in this entry.
 
 **The 133-139 TFLOP/s the prediction used is the bf16 GEMM floor, not the fp4 dX kernel's rate.**
 The same run measures the untouched `linear_fp4_frozen` kernel at **67.0 and 69.6 TFLOP/s** — the

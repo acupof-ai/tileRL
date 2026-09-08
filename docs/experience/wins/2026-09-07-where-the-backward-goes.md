@@ -20,7 +20,17 @@ The two candidates that had been in the air for two days are both nothing:
 | a TileLang full-attention backward to replace the eager one | 0.565 s | **0.8%** |
 
 A TileLang attention backward, if it were **free**, would buy 0.8% of the backward. The GDN
-backward alone is 61.4% of `backward_secs` and roughly **32% of a whole GRPO step**.
+backward alone is 61.4% of `backward_secs`.
+
+Its share of a whole GRPO step is **not computable from this run**: this probe builds with
+`decode_graph=False` (`prof_backward_ops.py:237`), so its rollout is eager and its step time is
+not the shipped path's — the reason stated under Limitations below. An earlier version of this
+line read "roughly 32% of a whole GRPO step", against #192's 133 s step, which those same
+Limitations say is not comparable. On the shipped tree the step is 85.617 s and the whole
+forward+backward bucket is 26.1% of it
+([the step is 74% rollout](2026-09-07-the-step-is-74-percent-rollout.md)), so no single op in
+this table can reach 32% of a step. The **shares of `backward_secs`** are what this entry
+establishes.
 
 Eager handlers are **50.567 s (73.3%)** of attributed against 15.795 s (22.9%) in TileLang
 kernels and 2.616 s (3.8%) in views.

@@ -128,8 +128,15 @@ selfcheck goes red on the counts assertion.
   give no useful spread.
 - **`micro=1` with a LoRA adapter**, so `acc` holds only adapter gradients. A full-parameter
   step is the 50.1 GiB path `train.py:141` describes and is a different measurement.
-- The rollout is the **training** path (`_training_kv` builds a dense pool, no draft plane,
-  no `spec_depth`), so 55.21 ms/tick is not directly comparable to a serving tick.
+- The rollout runs on the **ordinary paged engine** — `engine.submit` plus `_drain`
+  (`train.py:442-445`), the same path serving uses. An earlier version of this line said it was
+  "the training path (`_training_kv` builds a dense pool, no draft plane, no `spec_depth`)", and
+  both halves were wrong: `_training_kv` is called at `train.py:160`, in the forward/backward, not
+  in the rollout, and the serving arm this was contrasted against was itself W=1 no-draft. Two
+  differences that are real: the rollout serves a LoRA-attached model, and it builds with
+  `fuse_projections` defaulting to `False` (`cli.py:44`) where the serving arms pass `True`.
+  Priced, those are ~4% and 2.9% of the 2.4x gap to a serving tick — so **55.21 ms/tick against a
+  serving arm's 23.34 is 93% unexplained**, not explained by the path. Open item, not a caveat.
 - Measured on a16ff9c, **before #188** changed the decode-graph fallback. The changed branch
   was unreachable here — no draft, so `graph_keys` is `{(bucket(rows), 1)}` and every tick is
   a full B=8 W=1, on-grid; the log has 0 capture-failure lines.
