@@ -280,6 +280,20 @@ def main() -> int:
     summary["warm_steps"] = len(warm)
     summary["step0_secs"] = round(rows[0]["step_secs"], 4)
     summary["warm_compiles"] = sum(r["compiles"] for r in warm)
+    # Which quantities this arm can answer, written by the probe rather than discovered by
+    # whoever quotes it. Four measurements today were valid for one quantity and invalid for
+    # another, and all four had that pointed out downstream instead of stated upstream: a
+    # measurement's validity is its pairing with a question, not a property it carries.
+    saturated = all(r["mean_completion_tokens"] == float(a.gen) for r in warm)
+    summary["valid_for"] = ["ms_per_token across --group at a FIXED --gen",
+                            "the phase split (rollout / decode / train) at this width"]
+    summary["invalid_for"] = (
+        ["seconds_per_correct: prompts are random token ids, so the reward is noise"]
+        + (["idle_fraction: no stop_token_ids, so every row runs to --gen and idle is "
+            "identically 0 by construction, not by scheduling",
+            "the price of a REAL run: this is a saturated batch, i.e. a lower bound -- a run "
+            "whose rows finish early pays more per useful token"] if saturated else [])
+        + ["ms_per_token across --gen: unmeasured here, and the tick count scales with --gen"])
     # Per-token, the quantity a batch-width comparison needs: sec/step alone rises with the
     # group whatever the efficiency, so comparing two widths on it says only that the wider
     # one did more work. Group x mean completion, indexed rather than .get -- a missing key
