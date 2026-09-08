@@ -1,6 +1,7 @@
 """A recipe is the defaults; typed flags win; the manifest records the name."""
 
 import json
+import os
 
 import pytest
 
@@ -116,3 +117,60 @@ def test_math_prompts_ask_for_the_box():
     assert r"\\boxed" in text
     # and the matcher it exists to satisfy really does need the box:
     assert not boxed_match("the answer is 2", "2")
+
+
+def test_math_jsonl_reads_every_subject_and_writes_the_level_it_filtered(tmp_path, monkeypatch):
+    """The generator must not ask for a config the dataset does not have, and the file it
+    writes must carry the level it filtered on.
+
+    `EleutherAI/hendrycks_math` has SEVEN configs, one per subject, and no "all" -- so
+    `load_dataset(repo, "all")` raises before reading a row, and this script could never
+    have run. Run 2's files came from a throwaway builder instead, which is how the eval
+    file ended up levels 3-5 under a level-5 name
+    (errors/2026-09-05-the-eval-file-was-not-the-level-it-was-named.md).
+
+    Hermetic: CI has neither `datasets` nor network, so the module is stubbed with the
+    real repo's behaviour -- an unknown config RAISES. That is what makes a revert to
+    "all" fail here rather than only on a machine with the dataset.
+    """
+    import json
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    stub = tmp_path / "datasets.py"
+    stub.write_text(textwrap.dedent('''
+        _SUBJECTS = ["algebra", "geometry"]
+        _ROWS = {
+            "algebra": [("2+2?", "Level 5", r"so \\\\boxed{4}"),
+                        ("1+1?", "Level 3", r"so \\\\boxed{2}")],
+            "geometry": [("area?", "Level 5", r"so \\\\boxed{9}"),
+                         ("nobox?", "Level 5", "no box here")],
+        }
+
+        def get_dataset_config_names(repo):
+            return list(_SUBJECTS)
+
+        def load_dataset(repo, config, split=None):
+            if config not in _SUBJECTS:
+                raise ValueError(
+                    f"BuilderConfig {config!r} not found. Available: {_SUBJECTS}")
+            return [{"problem": p, "level": lv, "solution": s, "type": config}
+                    for p, lv, s in _ROWS[config]]
+    '''))
+    out = tmp_path / "l5.jsonl"
+    env = {**os.environ, "PYTHONPATH": f"{tmp_path}:{root / 'src'}"}
+    r = subprocess.run([sys.executable, str(root / "scripts" / "math_jsonl.py"),
+                        "test", str(out), "--level", "5"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr[-800:]
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    # Both subjects reached, so it did not stop at one config; the Level 3 row is
+    # filtered out; the no-boxed row is DROPPED rather than given an empty answer.
+    assert [r_["answer"] for r_ in rows] == ["4", "9"], rows
+    assert {r_["level"] for r_ in rows} == {"Level 5"}, rows
+    assert "1 dropped" in r.stdout, r.stdout
+    # The histogram prints what was WRITTEN, which is the check the 09-05 defect lacked.
+    assert "levels written: {'Level 5': 2}" in r.stdout, r.stdout

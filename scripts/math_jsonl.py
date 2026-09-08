@@ -26,10 +26,11 @@ import collections
 import json
 import random
 
-from datasets import load_dataset
+from datasets import get_dataset_config_names, load_dataset
 
 from tilerl.math_answer import extract_boxed
 
+_REPO = "EleutherAI/hendrycks_math"
 _INSTRUCTION = "\n\nPut your final answer in \\boxed{}."
 
 
@@ -42,7 +43,15 @@ def main() -> None:
     ap.add_argument("--seed", type=int, help="shuffle before slicing; makes --n unbiased")
     args = ap.parse_args()
 
-    ds = load_dataset("EleutherAI/hendrycks_math", "all", split=args.split)
+    # One config per subject, concatenated: this dataset has NO "all" config. Asking for
+    # one raises `BuilderConfig 'all' not found` before a single row is read, so this
+    # script has never run -- run 2's four files came from the throwaway builder that
+    # errors/2026-09-05-the-eval-file-was-not-the-level-it-was-named.md deleted, and the
+    # `level` column added there was never actually exercised. Enumerated from the repo
+    # rather than hardcoded, so a subject added upstream is included instead of silently
+    # dropped. Verified against source: test 5000 rows (L5 1324), train 7500 (L5 2304).
+    ds = [r for c in get_dataset_config_names(_REPO)
+          for r in load_dataset(_REPO, c, split=args.split)]
     keep = {f"Level {x.strip()}" for x in args.level.split(",") if x.strip()}
     rows = []
     dropped = 0
