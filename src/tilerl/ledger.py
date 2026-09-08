@@ -120,22 +120,53 @@ def time_to_score(m: dict, target: float) -> dict | None:
     # The curve scores a SUBSET, so its score is a different quantity from the run's
     # `gsm8k_after` over `--eval-n` rows -- and at small n the crossing step is set by
     # sampling as much as by the policy: n=20 resolves 5 pt per cell and carries a
-    # binomial SE of 11.2 pt at p=0.5, against P1's +5 pt target. `n` and `se_pt` travel
-    # with the answer so a caller cannot read the step without the width. (tilerl-0a
-    # named the resolution; the SE is the operand that makes it decisive.)
+    # binomial SE of 11.1 pt at that subset's own rate, against P1's +5 pt target. `n`
+    # and `se_pt` travel with the answer so a caller cannot read the step without the
+    # width. (tilerl-0a named the resolution; the SE is the operand that makes it
+    # decisive.)
+    #
+    # `p(1-p)` at the POINT's own rate, not the 0.25 of p=0.5. The rate is in the point
+    # and p=0.5 is its maximum, so the hardcode overstated the width -- 2.0x at the
+    # measured 0.932, which fires `_se_note` at n=50 and n=100 on subsets that do
+    # resolve the effect. The old test could not see it: its fixtures score 0.45 and
+    # 0.60, where p(1-p) is flat and the constant is right to 2%.
+    # This is the width of ONE point against a constant target, which is what this
+    # function answers. Comparing two POINTS is a different question and a wider
+    # interval (x sqrt(2) unpaired, or McNemar over `eval-curve-<step>.jsonl`).
     n = curve.get("n") or (curve["points"][0].get("total") or 0)
-    se = 100.0 * (0.25 / n) ** 0.5 if n else None
-    common = {"target": target, "n": n, "se_pt": None if se is None else round(se, 2)}
+
+    def _se(pt: dict) -> float | None:
+        total = pt.get("total") or n
+        if not total:
+            return None
+        p = (pt.get("correct") or 0) / total
+        return round(100.0 * (p * (1 - p) / total) ** 0.5, 2)
+
     prev = 0
-    for pt in curve["points"]:
+    for i, pt in enumerate(curve["points"]):
         if pt["score"] >= target:
-            return {"reached": True, **common, "step": pt["step"], "after_step": prev,
+            # `held` says whether every LATER point stayed at or above the target, so a
+            # transient crossing is visible instead of being reported as arrival. Not a
+            # precondition on `reached`: requiring it would turn one noisy dip into
+            # "never reached" -- at X=0.91 a 90.8 point is 0.2 pt low against a 1.29 pt
+            # SE, 0.15 sigma -- and that is a false negative on a number later runs are
+            # priced against. Both facts, and the reader decides. `dipped_at` names the
+            # first offender so the check does not need the caller to re-scan.
+            later = curve["points"][i + 1:]
+            below = [q["step"] for q in later if q["score"] < target]
+            return {"reached": True, "target": target, "n": n, "se_pt": _se(pt),
+                    "step": pt["step"], "after_step": prev,
                     "secs": pt["secs"], "score": pt["score"],
-                    "correct": pt["correct"], "total": pt["total"]}
+                    "correct": pt["correct"], "total": pt["total"],
+                    "held": not below, "dipped_at": below[0] if below else None}
         prev = pt["step"]
     last = curve["points"][-1]
-    return {"reached": False, **common, "steps_run": last["step"], "secs": last["secs"],
-            "best": max(pt["score"] for pt in curve["points"])}
+    # The width of the BEST point, since `best` is the number a reader compares to the
+    # target -- not the last point's, which can be a lower score with a different width.
+    best = max(curve["points"], key=lambda pt: pt["score"])
+    return {"reached": False, "target": target, "n": n, "se_pt": _se(best),
+            "steps_run": last["step"], "secs": last["secs"],
+            "best": best["score"]}
 
 
 def format_run(m: dict) -> str:

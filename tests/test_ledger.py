@@ -305,20 +305,55 @@ def test_time_to_score_returns_the_crossing_point_and_never_interpolates():
     assert time_to_score({"eval_curve": {"points": []}}, 0.1) is None
 
     # The subset's width travels with the answer, both when it reached and when it did
-    # not. A curve scores a SUBSET, so its 0.45 is not the run's `gsm8k_after` over
-    # --eval-n rows, and at n=20 the binomial SE is 11.2 pt -- 2.2x P1's own +5 pt
-    # target, which means the crossing STEP is set by which rows are in the subset as
-    # much as by the policy. Asserting the number, not just the key: the whole point is
-    # that a reader sees how wide it is. (tilerl-0a named the resolution.)
+    # not, and it is the POINT's own rate rather than p=0.5's worst case. Asserting the
+    # number, not just the key: the whole point is that a reader sees how wide it is.
+    # (tilerl-0a named the resolution.)
     assert hit["n"] == 20 and hit["total"] == 20 and hit["correct"] == 9
-    assert hit["se_pt"] == 11.18, hit
-    assert miss["n"] == 20 and miss["se_pt"] == 11.18
+    assert hit["se_pt"] == 11.12, hit          # 9/20 = 0.45
+    assert miss["n"] == 20 and miss["se_pt"] == 11.12
     wide = time_to_score({"eval_curve": {"n": 500, "points": [
         {"step": 10, "correct": 300, "total": 500, "score": 0.60, "secs": 9.0}]}}, 0.55)
-    assert wide["se_pt"] == 2.24, wide
-    # 2.24 < 5.0 so the reader stays silent there, and 11.18 >= 5.0 so it warns.
+    assert wide["se_pt"] == 2.19, wide         # 300/500 = 0.60
+    # 2.19 < 5.0 so the reader stays silent there, and 11.12 >= 5.0 so it warns.
     from tilerl.cli import _se_note
     assert _se_note(wide) == "" and "sampling-limited" in _se_note(hit)
+
+    # The fixtures above all sit near p=0.5, where `p(1-p)` is flat -- the old
+    # `0.25/n` hardcode is right to 2% there, so those assertions passed while the
+    # width was computed at the worst case rather than the point's. This one is at the
+    # product's real operating rate, where the two answers differ 2x. Negative control:
+    # putting `0.25` back gives 2.24 here, and this assertion is what catches it.
+    real = time_to_score({"eval_curve": {"n": 500, "points": [
+        {"step": 25, "correct": 466, "total": 500, "score": 0.932, "secs": 537.4}]}}, 0.91)
+    assert real["se_pt"] == 1.13, (real, "466/500 = 0.932, not p=0.5's 2.24")
+    assert _se_note(real) == "", "1.13 pt resolves P1's +5 pt; warning must stay silent"
+
+    # A transient crossing is reported AS a crossing, with `held` False and the step it
+    # fell back at. Not suppressed: requiring every later point to stay above would turn
+    # one noisy dip into "never reached" -- at target 0.90 a 0.89 point is 0.01 below
+    # against an SE of 0.014, well inside noise -- and that is a false negative on a
+    # number later runs are priced against. Both facts, and the reader decides.
+    dip = time_to_score({"eval_curve": {"n": 500, "points": [
+        {"step": 10, "correct": 455, "total": 500, "score": 0.91, "secs": 100.0},
+        {"step": 20, "correct": 440, "total": 500, "score": 0.88, "secs": 200.0},
+        {"step": 30, "correct": 445, "total": 500, "score": 0.89, "secs": 300.0}]}}, 0.90)
+    assert dip["reached"] and dip["step"] == 10, dip
+    assert dip["held"] is False and dip["dipped_at"] == 20, dip
+    held = time_to_score({"eval_curve": {"n": 500, "points": [
+        {"step": 25, "correct": 466, "total": 500, "score": 0.932, "secs": 537.4},
+        {"step": 50, "correct": 467, "total": 500, "score": 0.934, "secs": 1038.6}]}}, 0.91)
+    assert held["reached"] and held["step"] == 25 and held["held"] is True, held
+    assert held["dipped_at"] is None, held
+
+    # `best` and its width come from the BEST point, not the last one: the last can be a
+    # lower score, and a width read off it describes a different number than the one
+    # printed beside it.
+    fell = time_to_score({"eval_curve": {"n": 500, "points": [
+        {"step": 10, "correct": 466, "total": 500, "score": 0.932, "secs": 100.0},
+        {"step": 20, "correct": 250, "total": 500, "score": 0.50, "secs": 200.0}]}}, 0.99)
+    assert fell["reached"] is False and fell["best"] == 0.932, fell
+    assert fell["se_pt"] == 1.13, (fell, "the width of 0.932, not of the last point 0.50")
+    assert fell["secs"] == 200.0, "secs is the run's cost, which is the LAST point's"
 
 
 def test_periodic_rollout_guard_stops_at_first_window_crossing(tmp_path, monkeypatch, capsys):

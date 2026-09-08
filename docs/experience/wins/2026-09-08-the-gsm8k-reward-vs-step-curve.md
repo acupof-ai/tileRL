@@ -219,82 +219,76 @@ bare question. This run's eval lengths are the first on the production path.
 
 ## Results
 
-**Point 1 of 4, step 25: 93.2% (466/500), at 537.4 s cumulative training, scored in 614.3 s.**
-The anchor's **100** steps reached 93.6%, so a quarter of the steps is 0.4 pt short of it.
+| point | score | net vs base | mean tok | tok/correct | cumulative train s | eval s |
+|---:|---:|---:|---:|---:|---:|---:|
+| base | 87.4% (437/500) | — | 346.5 | 396.5 | — | — |
+| step 25 | **93.2%** (466/500) | **+5.80 pt** | 117.8 | 126.4 | 537.4 | 614.3 |
+| step 50 | **93.4%** (467/500) | +6.00 pt | 153.1 | 164.0 | 1038.6 | 741.4 |
+| step 75 | **82.4%** (412/500) | **−5.00 pt** | 122.8 | 149.0 | 1555.7 | 639.3 |
 
-**The main effect is length, not score.** On the same 500 problems:
+All four arms score the same 500 problems, so every comparison below is paired (McNemar over
+`eval-curve-<step>.jsonl`, which #323 puts on disk):
 
-| quantity | base | step 25 | ratio | anchor, at 100 steps |
+| pair | wrong→right | right→wrong | discordant | net | paired SE | σ |
+|---|---:|---:|---:|---:|---:|---:|
+| base → 25 | 40 | 11 | 10.2% | **+5.80 pt** | 1.43 | 4.06 |
+| 25 → 50 | 10 | 9 | 3.8% | **+0.20 pt** | 0.87 | 0.23 |
+| 50 → 75 | 7 | **62** | 13.8% | **−11.00 pt** | 1.66 | **6.62** |
+| base → 75 | 26 | 51 | 15.4% | **−5.00 pt** | 1.75 | 2.85 |
+
+**Saturation is at step 25, on the pre-registered criterion, and it is met exactly.** Adjacent
+points 25 and 50 differ by 0.20 pt — below the registered 1.00 pt — and both are ≥ 90.5. The
+paired SE for that pair is **0.87 pt**, *below* 1.00, so this is not the undecided band the
+step-25 discordance opened up: 3.8% discordance rather than 10.2%. The criterion decided
+cleanly on its own terms.
+
+**Then step 75 collapsed 11 points, and the training reward did not.** Per-step means:
+
+| steps | reward | ce | tied | tok |
 |---|---:|---:|---:|---:|
-| mean completion, tokens | 346.5 | **117.8** | **2.94x shorter** | — |
-| tokens per correct answer | 396.5 | **126.4** | **3.14x** | 2.74x |
-| score | 87.4% | 93.2% | **+5.8 pt** | +5.6 pt |
-| at the 2048 cap | 3/500 | **0/500** | — | — |
+| 1-25 | 0.800 | 3.26 | 0.56 | 161 |
+| 26-50 | 0.900 | 4.09 | 0.68 | 136 |
+| 51-75 | **0.855** | 3.69 | 0.80 | 157 |
 
-**25 steps reach the length compression the anchor took 100 steps for, and exceed it.**
-`--length-penalty 0.0`, so the length term in the GRPO reward is not what did it. Of the 5.8
-points, **4.5 are problems the base could already solve** — the model mostly learned to answer
-the same questions in a third the tokens, and `time_to_score` reads only the score, so it
-records that as the rate of learning to be right. **The mechanism is untested and stays a
-candidate**; nothing here explains why a zero-length-penalty reward shortens completions.
+The rollout reward in the window that lost 11 points of greedy accuracy is 0.855 against the
+previous window's 0.900 — a 5% dip, while the eval fell 11.8%. **62 problems went right→wrong
+against 7 the other way**, so this is a real loss of capability on specific problems, not a
+scoring artefact and not truncation (0/500 at the cap in every arm).
 
-**The paired comparison the restart was for.** `eval-curve-25.jsonl` and `eval-before.jsonl`
-carry all 500 of the same problems (`i` sets identical after filtering the before arm to
-`dataset == "gsm8k"` — it also holds 1000 MMLU rows):
+**The gate that would have caught this cannot see it.** `reward_rises` compares windowed
+rollout reward, which held; `gsm8k_improves` compares before against after, and step 100 has
+yet to land. Nothing in the manifest reads a *curve* for monotonicity. `tilerl-0a` proposed
+exactly this criterion — a crossing requires the target held afterwards, not just reached once —
+half an hour before the data produced the case. It is now in `ledger.time_to_score` as `held`
+and `dipped_at`, reported alongside `reached` rather than suppressing it.
 
-| | count |
-|---|---:|
-| wrong → right | **40** |
-| right → wrong | **11** |
-| unchanged | 449 |
-| discordant | **51/500 = 10.2%** |
+**What this does to the headline.** `steps_to_score` at X=91.0 is 25 or earlier, and the run
+also shows the score does not stay there. Those are two facts and the second is not a correction
+of the first: a policy that reaches 93.2% at step 25 and 82.4% at step 75 has a **best step**,
+which is what a training run should be stopped at, and no early-stopping mechanism exists in
+this tree. **The mechanism of the collapse is unmeasured.** Reward held, so the candidates are
+the policy drifting off the eval's distribution while still satisfying the reward, or an
+instability in the LoRA update; nothing here distinguishes them.
 
-Net **+5.80 pt**, which reproduces the score difference exactly, as it must. **Paired SE
-1.43 pt**, so the move is **4.06σ**. The unpaired SE on these two rates is 1.86 pt — the
-pairing is worth **1.30x**, not the 1.90 pt the pre-registration cited, because that figure was
-computed at the p=0.5 worst case. Same root as `ledger.py:127`, which hardcodes `0.25` and
-therefore overstates its printed SE by **2.04x** at this base.
+**Length is not monotone either.** 346.5 → 117.8 → 153.1 → 122.8. The 2.94x compression at step
+25 is a **minimum, not a trend**: step 50 gives back 30% of it while the score is flat, so
+length and score move independently after step 25. The earlier reading in this entry — that the
+length collapse is "the main effect" — holds for base→25 and does not extend past it.
 
-**The predictions, scored.** `tilerl-27` predicted **≥ 93.0** and was right, from the anchor
-run's tied fraction jumping to 0.87 at steps 21-35 read as the score already topping out. This
-session predicted **[90, 93)** and was wrong, reading a plateau-then-jump as a threshold
-crossing rather than an asymptote.
+**Predictions, scored.** `tilerl-27` predicted step 25 **≥ 93.0** and was right (93.2). This
+session predicted **[90, 93)** and was wrong. Neither prediction covered a collapse.
 
-**The saturation criterion has a third state the registered version did not have.** It reads
-"adjacent points differing by < 1.00 pt", registered at 5% discordance; the run gives 10.2% and
-a paired SE of 1.43 pt. The threshold is **not moved** — it was registered before the data.
-What follows is that a difference between **1.00 and 1.43 pt is undecided**, neither a rise nor
-saturation. A two-state criterion, once the data thins it, reads "undecided" as "saturated".
+**Cost.** Eval is **614-741 s per 500-row point** against 23.3 s/step of training — 114% of the
+training it measures at step 25. Four points cost ~33 min of eval against ~39 min of training.
 
-**And the criterion reads an increment where the question is about a cumulative quantity.**
-Adjacent-point differences are small and individually unresolvable at this SE; differences
-against the 87.4 base are several points and resolve easily. So a fine curve answers **which
-point first crosses 90.5 / 91 / 92**, not where adjacent points stop differing. Same SE, one
-question answerable and the other not. (Defect in the criterion, not in the data; `tilerl-27`,
-which registered it, confirms the reading.)
+**Where the rows are.** The restarted run **reuses the first attempt's id** `86a06dc8c420`,
+because the id hashes the inputs and the inputs are identical — evidenced by that manifest's
+`started` moving 13:05 → 13:50. The newer-looking `0435924d7108` is **another session's
+synthetic run** (`source: tiny`, commit `2ea4a1f`, started and finished at 13:09:12 with a full
+gate set), which I first misread as the killed attempt's leftover. Two predicates: find the run
+by the id its manifest names, not by mtime, **and** confirm a directory is yours before
+concluding from its contents — a shared `runs/` holds other sessions' runs.
 
-**The eval costs more than the training it measures.** `eval_secs` **614.3 s** against 537.4 s
-cumulative — **114%**, or 26.4 training steps per curve point. It is **0.62x** the anchor's
-16.4 min for a 500-row arm, so that estimate was conservative in the right direction. Four
-points cost 41.0 min of eval against 38.8 min of training; the run totals ~80 min.
-
-**Where the rows actually are.** The restarted run **reuses the first attempt's id**
-`86a06dc8c420`, because the id hashes the inputs and the inputs are identical — confirmed by
-that manifest's `started` moving from 13:05 to **13:50**, i.e. rewritten by the second launch,
-with the curve rows landing in the same directory.
-
-**And the directory I first read instead was not what I said it was.** `0435924d7108` sorts
-newer by mtime and I reported it as the killed attempt's leftover. It is not: its manifest is
-`source: tiny`, commit `2ea4a1f`, started *and* finished at 13:09:12 with a full set of gates —
-someone else's synthetic run in the shared tree, nothing to do with this one. Reading `started`
-alone made it look like mine; `inputs.source` is what distinguishes them.
-
-Two separate lessons, and only the first was in the earlier draft: find the run by the id the
-manifest names rather than by mtime, **and** check that a directory is yours before drawing a
-conclusion from its contents — a shared `runs/` holds other sessions' runs, so "newest" and
-"mine" are different predicates.
-
-`time_to_score`'s ratio is **not computed yet**: it needs step 100's `secs` from this same
-curve, and only step 25's exists.
+Step 100 pending.
 
 Points 2-4 pending.

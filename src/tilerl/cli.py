@@ -1294,6 +1294,10 @@ def _se_note(r: dict) -> str:
     5.0 pt is P1's own target effect (`roadmap.md`), so an SE at or above it means the
     crossing step is chosen by which rows are in the subset as much as by the policy.
     Silent below that: a note on every line would be read as boilerplate and skipped.
+
+    The width comes from the point's own rate (`ledger.time_to_score`), so this fires on
+    the subset's real resolution rather than on p=0.5's worst case -- which at n=50 and
+    n=100 warned about subsets that do resolve the effect.
     """
     se = r.get("se_pt")
     if se is None or se < 5.0:
@@ -1321,11 +1325,17 @@ def cmd_ledger(args: argparse.Namespace) -> None:
                 # The interval, not an interpolated step: the target was crossed somewhere
                 # in (after_step, step] and only the right end was measured. `correct/total`
                 # and the SE come along because the curve scores a SUBSET -- 0.61 on 20 rows
-                # is not 0.61 on 500, and at n=20 the SE is 11.2 pt against P1's +5 pt.
+                # is not 0.61 on 500, and the SE is the point's own rate, not p=0.5's.
+                # The dip note is printed, not folded into `reached`: a transient crossing
+                # and a run that held are different facts, and suppressing the step would
+                # turn one noisy point into "never reached".
+                dip = ("" if r.get("held", True) else
+                       f"  [fell below {args.time_to_score:.3g} again at step "
+                       f"{r['dipped_at']}: a transient crossing, not arrival]")
                 print(f"{m['id']}  score {args.time_to_score:.3g} reached at step "
                       f"{r['step']} (in ({r['after_step']}, {r['step']}]), "
                       f"{r['secs']:.1f}s cumulative, scored {r['score']:.3g} "
-                      f"({r['correct']}/{r['total']}){_se_note(r)}")
+                      f"({r['correct']}/{r['total']}){dip}{_se_note(r)}")
             else:
                 print(f"{m['id']}  score {args.time_to_score:.3g} NOT reached in "
                       f"{r['steps_run']} steps / {r['secs']:.1f}s; best "
