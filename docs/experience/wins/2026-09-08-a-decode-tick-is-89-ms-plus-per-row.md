@@ -63,6 +63,28 @@ moves when the data grows; this one does not."* Eleven more steps:
 extra point, which is the range in which any fit looks stable. Two points do not test a
 model's robustness; they test whether the ninth point resembles the eighth.
 
+## R² = 0.943 is also an artifact, and the honest number is 0.759
+
+Fitting `wall` weights each step by its `max`, because a step with 6144 ticks contributes
+a hundred times the sum-of-squares of a step with 313. The long steps are exactly the ones
+with the fewest active rows — 1.19 to 2.5 — so the fit is optimised on the region where
+`c` barely matters, and reports the fit quality of that region.
+
+Regressing the quantity the model actually claims, `ms/tick` against average active rows,
+one point per step, unweighted:
+
+```
+ms/tick = 9.79 + 3.472 × avg_rows        R² = 0.759
+```
+
+**A quarter of the variance is unexplained.** Adding a `rows × context depth` interaction
+takes it to 0.794 and says `c` rises 22% from depth 512 to depth 3072 — real, and far too
+small to reconcile the disagreement in the next section.
+
+So the two-term model is a usable first-order description and not much more. **Everything
+below that extrapolates it to 8 or 16 rows is extrapolating a model that explains 76% of
+its own data over a range it never observed** (1.19 to 4.81 rows).
+
 The refill gain that follows moves much less — 1.67x at n=8, 1.54x at n=19 — because it
 depends on the ratio of the two coefficients and they drift together.
 
