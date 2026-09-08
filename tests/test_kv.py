@@ -757,3 +757,56 @@ def test_blocks_freed_moves_on_the_wire_when_the_store_frees_a_block():
     assert engine.stats().get("prefix_blocks_freed") == after_store, (
         f"/health says {engine.stats().get('prefix_blocks_freed')}, store says {after_store}: "
         "the counter is not reaching the wire")
+
+
+#: (n, budget), the open ones wrapped in a strict xfail. `budget` is
+#: `max_num_batched_tokens - len(decodes)`, so a decode row sharing the tick lowers it and
+#: c14511b's guard -- which gives up one whole block -- stops working: at or below
+#: BLOCK_TOKENS there is no block to give up, and a ragged budget shifts every later chunk
+#: end so the boundary helper (which takes n alone) predicts a different walk.
+#: errors/2026-09-08-a-one-token-chunk-made-last-unreachable.md
+_OPEN = pytest.mark.xfail(strict=True, reason="open: the boundary helper does not take the "
+                          "budget -- n=961 is 944 at 512 and 448 at 511")
+_BOUNDARY_CASES = [
+    (65, 512), (129, 512), (513, 512), (1025, 512),
+    *(pytest.param(n, b, marks=_OPEN)
+      for n, b in ((33, 16), (18, 17), (49, 8), (962, 511), (961, 504))),
+]
+
+
+@pytest.mark.parametrize("n,budget", _BOUNDARY_CASES)
+def test_last_prefill_boundary_is_a_real_chunk_end(n, budget):
+    """`_last_prefill_boundary(n)` must name a position the planner ends a chunk at.
+
+    When it does not, `last` never fires (engine.py:1045) and NOTHING from that prompt is
+    offered to the disk tier -- no error, no counter, the spill just does not happen. The
+    512-budget lengths did exactly that: at n=65 the 64-alignment lands on 64, so the 1-token
+    tail is a chunk of its own, `short` computes to 0, and the tail back-off cannot run.
+
+    strict=True on the open rows: they go RED the day the budget-dependent half is fixed,
+    which a bare `pytest.xfail()` call would not -- that skips unconditionally and can never
+    report the fix.
+    """
+    from tilerl.config import tiny
+    from tilerl.engine import SamplingParams, _last_prefill_boundary, build_engine
+    from tilerl.model import build_random
+    from tilerl.testing import RefBackend
+
+    cfg = tiny(max_position_embeddings=4096)
+    engine = build_engine(cfg, build_random(cfg, seed=5), RefBackend(), num_blocks=512,
+                          num_slots=2, max_batch=1, max_total_tokens=4096,
+                          max_num_batched_tokens=budget)
+    engine.submit(list(range(n)), SamplingParams(max_new_tokens=1, seed=0))
+    ends, at = [], 0
+    while at < n:                          # drive the planner, the only source of chunk ends
+        _, prefills, chunks = engine._build_plan()
+        assert prefills, f"planner stalled at {at} of {n}"
+        assert chunks[0] > 1, f"1-token chunk at {at}: reaches the kernels with 0 blocks"
+        at += chunks[0]
+        ends.append(at)
+        prefills[0].prefill_from = at      # advance without running a forward
+    assert at == n, f"chunks summed to {at}, not {n}"
+    lb = _last_prefill_boundary(n)
+    assert lb in ends, (
+        f"n={n} budget={budget}: _last_prefill_boundary says {lb}, but chunks end at "
+        f"{ends[-4:]} -- `last` never fires and nothing reaches the disk tier")
