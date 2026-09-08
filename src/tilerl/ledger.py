@@ -75,7 +75,28 @@ def lineage(root: str | os.PathLike, id: str) -> list[dict]:
 
 
 def gates_pass(m: dict) -> bool:
+    """Every gate, both classes. UNCHANGED, deliberately: this is the process exit code.
+
+    The verdict/validity split is recorded on each gate (`kind`) and read by
+    `verdict_of`, not enforced here -- a validity failure still exits non-zero, because
+    an uninterpretable run is not a success either. What the split fixes is the
+    CONFLATION: `all(...)` over a flat list let a validity gate PASSING contribute to
+    "P1 passed", and `reward_rises` must never be able to do that -- reward is the
+    quantity GRPO optimizes, so it rising is the optimizer working, not evidence that RL
+    moved a downstream number.
+    """
     return all(g.get("skipped", False) or g["passed"] for g in m["gates"])
+
+
+def verdict_of(m: dict, kind: str = "verdict") -> bool | None:
+    """Did the gates of one class pass? None when that class has none that were scored.
+
+    None is a third state and the caller must not collapse it to False: a run whose
+    verdict gates were all skipped has not failed P1, it has not tested P1.
+    """
+    scored = [g for g in m["gates"]
+              if g.get("kind", "verdict") == kind and not g.get("skipped", False)]
+    return all(g["passed"] for g in scored) if scored else None
 
 
 def format_run(m: dict) -> str:
@@ -100,7 +121,14 @@ def format_run(m: dict) -> str:
         verdict = "skip"
     else:
         verdict = "pass" if gates_pass(m) else "FAIL"
-    return f"{m['id']}  {m['command']:<6} {m['finished'] or 'running':<25} {verdict:<6} {mt}"
+    # Annotated ONLY when the two classes disagree, which is the case one word cannot
+    # say: `FAIL` while the verdict gates passed means a validity gate stopped the run
+    # from being interpretable, not that P1 failed -- `docs/roadmap.md:57-58` already
+    # draws that line ("else the task is too easy ... and the run says nothing"). When
+    # they agree the string is unchanged, so every existing reader of field 3 still works.
+    if verdict == "FAIL" and verdict_of(m, "verdict") is True:
+        verdict = "novalid"
+    return f"{m['id']}  {m['command']:<6} {m['finished'] or 'running':<25} {verdict:<7} {mt}"
 
 
 if __name__ == "__main__":  # runnable check

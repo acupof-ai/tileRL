@@ -365,3 +365,98 @@ def test_ce_falls_is_not_measured_on_the_rl_path(capsys):
     rising = _gate("ce_falls", {"ce_last": 1.90, "ce_first": 1.22})
     assert rising["skipped"] is False and rising["passed"] is False, rising
     capsys.readouterr()
+
+
+def test_mcnemar_is_paired_and_reports_no_discordance_distinctly():
+    """The paired test over per-question rows, and the two ways it can decline.
+
+    `b + c == 0` (both arms agree on every question) is NOT the same as unpairable
+    input: the first is a real result with nothing to resolve, the second is no result.
+    Conflating them would let a broken pairing read as perfect agreement.
+    """
+    from tilerl.cli import _mcnemar
+
+    def rows(flags):
+        return [{"dataset": "gsm8k", "i": i, "correct": c} for i, c in enumerate(flags)]
+
+    # 3 wrong->right, 1 right->wrong, over 8: delta = (3-1)/8, se = sqrt(4)/8
+    before = rows([True, False, False, False, True, True, True, True])
+    after = rows([False, True, True, True, True, True, True, True])
+    r = _mcnemar(before, after)
+    assert (r["n"], r["b"], r["c"]) == (8, 1, 3), r
+    assert r["delta"] == 0.25 and abs(r["se"] - 0.25) < 1e-12, r
+    assert abs(r["z"] - 1.0) < 1e-12, r
+
+    # Identical arms: a result, not a failure -- se and z are None, delta is exactly 0.
+    same = _mcnemar(before, list(before))
+    assert same["b"] == same["c"] == 0 and same["delta"] == 0.0
+    assert same["se"] is None and same["z"] is None, same
+
+    # Unpairable: different question sets. Must be None, not a zero-discordance dict.
+    assert _mcnemar(before, rows([True] * 7)) is None
+    assert _mcnemar([], list(before)) is None
+    # A row without `i` cannot be paired, so it is dropped rather than misaligned.
+    assert _mcnemar([{"dataset": "gsm8k", "correct": True}], list(before)) is None
+
+
+def test_validity_gates_cannot_make_p1_read_pass(capsys):
+    """A validity gate is recorded apart from the verdict, and never contributes to it.
+
+    `reward_rises` is the case: reward is what GRPO optimizes, so it rising is the
+    optimizer working, and it is compatible with a falling eval. Both directions are
+    asserted -- a validity failure must not hide a verdict pass, and a verdict failure
+    must still fail regardless of validity.
+    """
+    from tilerl.ledger import verdict_of
+
+    base = {"gsm8k_before": 181, "gsm8k_before_total": 500, "gsm8k_after_total": 500,
+            "mmlu_before": 0.601, "mmlu_after": 0.60}
+
+    def run(metrics):
+        from tilerl.cli import _finish
+
+        m = new_manifest("train", {"steps": 100, "source": "tiny"}, [])
+        m["metrics"] = dict(metrics)
+        with contextlib.suppress(SystemExit):
+            _finish(m, as_json=True)
+        capsys.readouterr()
+        return m
+
+    # Verdict passes (+25 of 500, MMLU held), validity fails (reward fell, groups tied).
+    m = run({**base, "gsm8k_after": 206, "reward_first": 0.4, "reward_last": 0.3,
+             "tied_group_fraction": 0.9})
+    assert verdict_of(m, "verdict") is True, m["gates"]
+    assert verdict_of(m, "validity") is False, m["gates"]
+    assert not gates_pass(m), "an uninterpretable run still exits non-zero"
+    assert format_run(m).split()[3] == "novalid", format_run(m)
+
+    # Verdict fails (+1 of 500), validity passes. The verdict must not be rescued.
+    m = run({**base, "gsm8k_after": 182, "reward_first": 0.3, "reward_last": 0.4,
+             "tied_group_fraction": 0.1})
+    assert verdict_of(m, "verdict") is False, m["gates"]
+    assert verdict_of(m, "validity") is True, m["gates"]
+    assert format_run(m).split()[3] == "FAIL", format_run(m)
+
+    # None, the third state: verdict gates all SKIPPED is "P1 untested", not "P1 failed".
+    # Mutation-driven -- dropping the `if scored else None` guard survived every case
+    # above, because `all([])` is True and no assertion distinguished it from a pass.
+    # `steps == 0` is the real path there: it skips every gate, which is what a
+    # smoke-test invocation does, and a `None` collapsed to True would report that run as
+    # having passed P1. Note an ABSENT metric is not a skip -- it vacuous-passes by
+    # design (`v is None or t is None`), so the skip has to come from the run's shape.
+    from tilerl.cli import _finish
+
+    m0 = new_manifest("train", {"steps": 0, "source": "tiny"}, [])
+    m0["metrics"] = dict(base, gsm8k_after=206)
+    with contextlib.suppress(SystemExit):
+        _finish(m0, as_json=True)
+    capsys.readouterr()
+    assert all(g["skipped"] for g in m0["gates"]), m0["gates"]
+    assert verdict_of(m0, "verdict") is None, m0["gates"]
+    assert verdict_of(m0, "validity") is None, m0["gates"]
+
+    # Every gate carries a class, so no consumer has to default one.
+    assert all("kind" in g for g in m["gates"]), m["gates"]
+    kinds = {g["name"]: g["kind"] for g in m["gates"]}
+    assert kinds["gsm8k_improves"] == kinds["mmlu_holds"] == "verdict", kinds
+    assert kinds["reward_rises"] == kinds["groups_untied"] == "validity", kinds
