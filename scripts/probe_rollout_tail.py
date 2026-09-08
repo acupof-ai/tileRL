@@ -129,6 +129,13 @@ def main() -> int:
                 gold.append(row.get("answer") or row.get("gold") or row.get("solution"))
     if len(prompts) < args.steps:
         raise SystemExit(f"{args.prompts}: {len(prompts)} usable prompts, need {args.steps}")
+    # Assert the template is in the prompt, rather than noticing afterwards that the
+    # lengths look wrong. The first run's bare `tok.encode(question)` produced completions
+    # that read like a long tail and were the model continuing a document (0a, 2026-09-08).
+    if not all(set(tok.encode("<|im_start|>")) <= set(p) for p in prompts):
+        raise SystemExit("a prompt is missing the <|im_start|> the chat template opens "
+                         "with, so the model is being handed a bare document and its "
+                         "completion lengths are not the rollout's")
     if not args.no_score and not all(gold):
         raise SystemExit(f"{args.prompts} has no answer/gold/solution field, so the accuracy "
                          "column cannot be computed. Pass --no-score only if you accept that "
