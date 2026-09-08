@@ -34,25 +34,30 @@ implied; two of them cost a session each, rebuilding something already built.
 This block corrects the status only — no phase definition or exit criterion is
 changed here.
 
+It is itself hand-maintained, and on the day it was written three of its rows went
+stale inside one afternoon as the PRs they described landed. A reviewer caught each
+one. Treat every claim here as dated to its sha, and prefer the tree.
+
 - **P1's four prerequisites are all closed. P1 is code-complete.** `--eval-gsm8k`
   and `--eval-n` exist (`cli.py:1121-1123`); `grpo_loop` and self-OPD raise on a
   live decode graph or a real prefix store (`train.py:364-371`); the tied-group
   fraction is logged per step and aggregated (`cli.py:641,685`); the self-OPD EMA
   teacher uses `copy_` into the adapter tensors (`train.py:544,550,555`), not
   `params.update`. The length term named as the fourth prerequisite's cause landed
-  in #293. **What remains is the pod run, and it is held** until the exit gate below
-  lands (ckl, 2026-09-08).
-- **P1's encoded exit gate could not demonstrate this document's target. Half of
-  that is fixed; the half that decides the verdict is not.** The threshold half is
+  in #293. **What remains is the pod run**, unblocked once the exit gate landed
+  (`b0d8678`, 2026-09-08).
+- **P1's encoded exit gate could not demonstrate this document's target. Both
+  halves are now fixed.** The threshold half is
   closed by #301 (`0197dcc`): GSM8K gated on `after > before` was, on a **count**
   metric, +1 question in 500 = +0.2 pt against the `>= +5 pt` above, and MMLU allowed
-  −3 pt where this document allows −2. Both now match the document. What remains
-  is the **test**: at `eval_n=500` an **unpaired** comparison has an 80%-power
+  −3 pt where this document allows −2. Both now match the document. The **test**
+  half is closed by #309 (`b0d8678`): at `eval_n=500` an **unpaired** comparison has an 80%-power
   one-sided MDE of **7.70 pt**, so the +5 pt target still sits below the smallest
   effect the comparison it is judged by can detect. The failure mode is a miss, not
   a false pass — a real +5 pt run reads as no result. Under the paired McNemar the
   run already writes per-question rows for, +5 pt is resolvable while the discordant
-  rate stays under ~15.9% (80% power, two-sided); that is #309.
+  rate stays under ~15.9% (80% power, two-sided). The paired result is recorded as
+  `metrics["gsm8k_paired"]` beside the threshold, which stays the gate.
 - **P2.0's mechanism changed and the exit did not.** The text says the captured
   graph is "re-recorded after every optimizer step". The implementation instead
   keeps the graph and refills the f32 cast (`engine.py:1180-1202`), which is sound
