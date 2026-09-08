@@ -1226,6 +1226,10 @@ class PrefixStore:
             # State-byte pressure with a tier is not a reason to lose a prefix: demote the
             # LRU snapshot instead and keep the entry matchable. Only when nothing is left
             # to demote (or there is no tier) does the entry go.
+            # The count test is not a conflated guard: `_demote_one` keeps the entry in
+            # `_by_id`, so a demote cannot make the count term shrink and only eviction can
+            # satisfy it. This reads "the count is not the binding term" — twice mistaken for
+            # code that makes the demote path unreachable (2026-09-08).
             if (
                 self._dram is not None
                 and len(self._by_id) <= self.capacity

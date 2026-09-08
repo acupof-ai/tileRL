@@ -6,8 +6,11 @@
 a hit costs the full prefill times the fraction it did not match (**median 0.9% error over 35 turns, one
 parameter, nothing fitted**). Depth is a **512×k ratchet in submission order**, so first+last leaves each
 session a match set by its queue position rather than a constant. The forward fix has not landed and may
-not fit this budget — see the sizing criterion. Listed in [OPEN.md](../OPEN.md) with the latent
-`_demote_one` count guard.
+not fit this budget — see the sizing criterion. Listed in [OPEN.md](../OPEN.md).
+The `_demote_one` count guard this entry also listed as latent was **withdrawn 2026-09-08**:
+driving the real store shows the demote path reachable under byte-only pressure (4 demotions,
+0 evictions), and the guard is correct because a demote leaves the entry in `_by_id` and so
+cannot satisfy the count term. The three-row table is in [OPEN.md](../OPEN.md) under Struck.
 
 > Sections are in the order they were written, so **nine withdrawn readings** stand as the record.
 > **The settled result starts at
