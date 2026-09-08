@@ -2,12 +2,33 @@
 
 **Date:** 2026-09-08
 **Session:** v100-sm70-fp4-55
-**Card:** H20 card 3, claim `tilerl-curve`, pid 1150334, tree `/work/tilerl-s-v100-sm70-fp4`
-sha `12da5a0`, log `/work/curve.log`
+**Card:** H20 card 3, claim `tilerl-curve2`, pid 1170264, tree `/work/tilerl-s-v100-sm70-fp4`
+sha `fd0c876`, log `/work/curve2.log`
 
 Written **before** the results, because every number below is a precondition or a threshold and
 a threshold decided after the data is not a threshold. The results section is appended when the
 run finishes.
+
+**Restarted at 13:55Z.** The first attempt (pid 1150334, sha `12da5a0`, log `/work/curve.log`)
+ran 24 steps and was killed: `12da5a0` predates #323, so its curve points carried none of the
+per-problem rows the **paired** 1.00 pt threshold below requires, and none of the `mean_len` /
+`at_cap` fields that separate a score from a truncation artefact. The sha had been verified and
+its contents had not —
+[errors/2026-09-08-a-sha-confirmed-and-its-contents-not.md](../errors/2026-09-08-a-sha-confirmed-and-its-contents-not.md).
+Restart cost ~15 min: the before-arm eval is a cache hit, and the 24 completed steps re-run at
+23.3 s each. They did **not** re-run identically — steps 1-3 drew the same rollouts and step 4
+onward diverged, so `--seed 0` fixes the inputs and not the trajectory. Nothing else in this
+document changes — same flags, same criteria — but the two attempts are **two samples of one
+configuration**, not one run continued.
+
+**Three numbers the first attempt did measure**, all of which carry over because the
+configuration is identical:
+
+| quantity | reading | why it matters below |
+|---|---|---|
+| seconds per step | **23.3 s** (n=24, min 15.6, max 35.2) | the anchor's 56.88 is **2.44x** this, so `time_to_score` is read off this run's own `secs` and any plan priced at 56.88 is 2.44x too expensive |
+| GSM8K base, greedy, cap 2048 | **87.4%** (437/500), 396.5 tok/correct | 0.6 pt from the anchor's 88.0, inside the 2.1 pt SE of that difference — **the base end of the anchor is reproduced**. Not re-measured on the restart: the cache serves the same rows, which is why it is a carry-over rather than a second reading |
+| no-gradient steps | **10 of 17 tied**: 7 all-correct, 3 all-at-cap | a flat curve has two readings, and `tied` alone does not separate them; see the fifth branch in [what runs next](2026-09-08-what-runs-next-after-the-curve.md) |
 
 ## What this run answers
 
