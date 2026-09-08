@@ -8,6 +8,7 @@ GiB already held. Before redesigning it, two numbers:
 """
 import os
 import time
+from collections import Counter
 
 import torch
 
@@ -29,7 +30,6 @@ for k, v in rows[:8]:
 print(f"... {len(rows)-8} more, smallest {rows[-1][1].numel()/1e6:.1f} Melem\n")
 
 # Distinct shapes: the cost is per shape class, and a per-class count prices the whole sweep.
-from collections import Counter
 classes = Counter(tuple(v.shape) for v in two_d.values())
 print("distinct 2D shapes and their counts:")
 for shape, n in sorted(classes.items(), key=lambda kv: -kv[0][0]*kv[0][1]):
