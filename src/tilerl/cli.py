@@ -431,6 +431,12 @@ def _paired_delta(run_dir: Path) -> dict | None:
 #: rather than 1.0 because the MEAN fitting exactly means half the rollouts do not.
 _ROLLOUT_HEADROOM = 0.8
 
+#: How many eval prompts the before/after/curve arms submit at once. A constant because
+#: the KV pool is sized for the WIDER of this and the rollout group -- one engine, two
+#: consumers. It was three literal 8s while the rollout width was also 8, so --group 2
+#: sized the pool for 2 rows and the eval arm's 8 exhausted it mid-step.
+_EVAL_CONCURRENCY = 8
+
 
 def _write_rollout_rows(run_id: str, rows: list, written: int = 0) -> int:
     """Append the rows not yet on disk, and return the new count.
@@ -638,9 +644,14 @@ def _train_adapters(args: argparse.Namespace) -> None:
     # The three used to be 8 while --group was a settable flag defaulting to 8, so
     # --group 16 quietly became two waves of 8.
     rollout_batch = max(args.group, 1)
+    # max() over both consumers, not just the rollout: evals submit _EVAL_CONCURRENCY rows
+    # into this same engine, so sizing on the group alone exhausted the pool at --group 2.
+    # Only num_blocks takes the max -- max_batch stays the rollout's width, since widening
+    # it would change how wide the eval batch actually runs, which is a perf change.
+    pool_rows = max(rollout_batch, _EVAL_CONCURRENCY)
     engine = build_engine(cfg, model, backend, num_slots=rollout_batch,
                           max_batch=rollout_batch, draft=draft,
-                          num_blocks=-(-ctx // BLOCK_TOKENS) * rollout_batch + 8,
+                          num_blocks=-(-ctx // BLOCK_TOKENS) * pool_rows + 8,
                           max_total_tokens=max(ctx, 8192),
                           spec_depth=args.depth, decode_graph=True,
                           prefix_store=NoPrefixStore())
@@ -682,7 +693,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             return
         rows_out: list = []
         if args.eval_mmlu:
-            c, n, conc = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=8,
+            c, n, conc = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=_EVAL_CONCURRENCY,
                                        questions=mmlu_set, per_problem=rows_out)
             manifest["metrics"][f"mmlu_{tag}"] = c / n
             manifest["metrics"][f"mmlu_{tag}_concurrency"] = conc
@@ -691,7 +702,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}% (seed 0, concurrency {conc})")
         if eval_rows:
             gsm_rows: list = []
-            c, n, ntok = gsm8k_accuracy(engine, tok, eval_rows, eval_params, concurrency=8,
+            c, n, ntok = gsm8k_accuracy(engine, tok, eval_rows, eval_params, concurrency=_EVAL_CONCURRENCY,
                                         thinking=thinking,
                                         match=MATCHERS[args.reward],
                                         per_problem=gsm_rows)
@@ -794,7 +805,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # batch shape -- and an estimated default is harder to overturn than no default,
             # because it looks calibrated. Same idiom as `eval_{tag}_secs` (#309).
             t_eval = time.perf_counter()
-            c, n, _ = gsm8k_accuracy(engine, tok, curve_rows, eval_params, concurrency=8,
+            c, n, _ = gsm8k_accuracy(engine, tok, curve_rows, eval_params, concurrency=_EVAL_CONCURRENCY,
                                      thinking=thinking, match=MATCHERS[args.reward])
             eval_secs = time.perf_counter() - t_eval
             # The first point compiles the eval's shapes and every later one hits the cache,
