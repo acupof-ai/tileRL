@@ -70,10 +70,16 @@ Run both arms. A breakdown from the un-synced arm alone is not evidence.
 `rows[1:]` and called it warm; that is an assumption about where JIT lands, and 25
 measured an arm on 2026-09-08 whose step 1 compiled 40 kernels -- the convention held by
 luck there, and the summary would have looked identical if it had not. `backend._kernels`
-is keyed on `(name, args, kw)`, so a compile is exactly one new entry, and the count is
-now a gate: any compile after step 0 refuses the run instead of pooling it. A rollout that
-reaches a new decode width mid-run compiles mid-run, which is exactly the case a
-first-step convention cannot see.
+is keyed on `(name, args, kw)` (backend.py:412), so a compile is exactly one new entry,
+and the count is now a gate: any compile after step 0 refuses the run instead of pooling.
+
+Which widths can compile mid-run, read off the two call sites rather than assumed: the
+GEMV branch passes M as a factory argument (`self._kernel(gk, M)`, backend.py:696) so
+every distinct M is its own entry, while the mma8 branch pads to `_MX`=8 and takes no M
+(backend.py:779) so M=2..8 share one. With `_MGEMV`=3 a group=8 rollout draining to empty
+therefore compiles only at M=3 and M=2 -- not at each of 7, 6, 5, 4. Step 0 runs that same
+drain, so it normally exhausts them; the case that breaks is a step whose rows all finish
+together, skipping a width that a later step reaches first.
 
 ONE ARM PER PROCESS. The 2.6x rollout gap was build order inside one process -- two
 engines built in one process, and the second one degraded. This script builds one.
