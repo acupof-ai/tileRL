@@ -15,13 +15,25 @@ the test the +5 pt is judged by cannot resolve +5 pt.
 
 | reading | SE | 80%-power one-sided MDE |
 |---|---|---|
+| **single-arm, p=0.36** | **2.15 pt** | — |
+| **single-arm, p=0.40** | **2.19 pt** | — |
+| **single-arm, p=0.50** | **2.24 pt** | — |
 | unpaired, p=0.36 | 3.04 pt | 7.55 pt |
 | unpaired, p=0.50 | 3.16 pt | 7.86 pt |
 | unpaired, p=0.60 | 3.10 pt | **7.70 pt** |
 | paired, 10% discordant | 1.41 pt | 2.77 pt |
 | paired, 5% discordant | 1.00 pt | 1.96 pt |
 
-**The roadmap's ≈2 pt is neither.** It cites an unpaired magnitude and takes a value below it.
+**The roadmap's ≈2 pt is the single-arm SE** — the SE of ONE measurement, 2.15–2.24 pt across
+p, which is 2 pt to one significant figure. It is not a value picked below an unpaired
+magnitude; it is `sqrt(p(1-p)/n)` written beside a *difference*, and the difference's SE is
+exactly `sqrt(2)` larger (ratio 1.4142 at every p). So the quoted bar understates the error on
+the quantity the gate compares by 29% — equivalently, it makes a 1.6σ effect read as 2.5σ.
+
+Naming it matters because the mistake has a mechanism someone will repeat: compute the
+uncertainty of each arm, then compare two arms using one arm's number. "Neither reading" reads
+as a typo and carries no warning.
+
 Under the unpaired reading the minimum detectable effect at 80% power is **7.70 pt against a
 +5 pt target**, so a real +5 pt improvement fails to register about half the time. An exit
 gate's expensive failure is a **miss**, not a false pass: P1 spends a pod run and records "did

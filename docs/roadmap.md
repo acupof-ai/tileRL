@@ -54,7 +54,11 @@ Run: `tilerl train --recipe grpo-gsm8k-27b --data gsm8k_train.jsonl
 --eval-gsm8k gsm8k_test.jsonl` (the recipe is 100 steps, group 8, 256 tokens,
 LoRA rank 16, no thinking, MMLU 1000, GSM8K 500), one H20, `--seed 0` and `1`.
 
-Exit, both seeds: GSM8K held-out (500 q) after − before ≥ +5 pt (SE ≈ 2 pt);
+Exit, both seeds: GSM8K held-out (500 q) after − before ≥ +5 pt (paired McNemar
+SE 1.00–1.41 pt at 5–10% discordant, so +5 pt is resolvable; the ≈2 pt this
+line used to quote was the SE of ONE arm, and the unpaired difference's is 3.04–
+3.16 pt with a 7.70 pt MDE — a bar the target cannot clear, see
+[errors/2026-09-08-a-gate-too-strict-to-be-met.md](experience/errors/2026-09-08-a-gate-too-strict-to-be-met.md));
 MMLU (1000 q) after ≥ before − 2 pt; tied-group fraction < 50% (else the task
 is too easy for this model and the run says nothing — move to MATH). Then
 self-OPD, same gate. The manifest (P4) records the verdict.
