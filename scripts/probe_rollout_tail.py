@@ -45,6 +45,20 @@ stops.
 **Reported per step and pooled, with the spread.** One step's idle fraction is one draw
 from a distribution over prompts; a single number would read as a property of the loop.
 
+**And scored, because a length distribution says nothing about whether the completions are
+answers.** The first run's rows averaged 1083 tokens with 11 of 160 at the cap and the
+probe reported that as a tail; the prompts were unrendered and the completions were the
+model continuing a bare document. An accuracy column would have read near zero and the
+defect would have been visible in the first step's output. `--score` is on by default and
+costs one `answer_match` per row.
+
+**A caveat on comparing this to an eval.** `untruncated()` (train.py:429) is what
+`grpo_loop` samples under -- temperature 1.0, top_p 1.0, top_k 0 -- because `rl_step`
+differentiates the full softmax. An eval run samples the deployed sampler (top_p 0.8,
+top_k 20). Sampling the whole 248320-token distribution has a heavier length tail, so this
+probe's lengths should exceed an eval's on the same prompts, and by how much is not known.
+The two numbers are not interchangeable in either direction.
+
 This measures only. It changes no scheduling.
 
 Run:
@@ -83,6 +97,10 @@ def main() -> int:
                     help="thinking mode: sets BOTH the prompt's think block and the model "
                          "card's sampler, as render_chat and prompt.sampling do. Default "
                          "non-thinking, which is what the P1 GRPO runs use.")
+    ap.add_argument("--no-score", action="store_true",
+                    help="skip the accuracy column. Only for a dataset with no gold answer: "
+                         "without it nothing in the output distinguishes a tail from "
+                         "completions that are not answers at all.")
     ap.add_argument("--out", default="/work/rollout_tail.json")
     args = ap.parse_args()
 
@@ -90,6 +108,7 @@ def main() -> int:
 
     from tilerl.cli import _build_model, _qwen38_tokenizer
     from tilerl.engine import build_engine
+    from tilerl.eval import answer_match
     from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
     from tilerl.prompt import render_chat
     from tilerl.prompt import sampling as build_sampling
@@ -98,7 +117,7 @@ def main() -> int:
     # The training path's own helper (cli.py:33), which reads the local checkpoint dir.
     # `get_tokenizer("qwen38-27b")` treats the name as a hub id and the pod has no network.
     tok = _qwen38_tokenizer()
-    prompts = []
+    prompts, gold = [], []
     with open(args.prompts) as f:
         for line in f:
             if len(prompts) >= args.steps:
@@ -107,8 +126,13 @@ def main() -> int:
             text = row.get("question") or row.get("prompt") or row.get("text")
             if text:
                 prompts.append(tok.encode(render_chat([("user", text)], args.thinking)))
+                gold.append(row.get("answer") or row.get("gold") or row.get("solution"))
     if len(prompts) < args.steps:
         raise SystemExit(f"{args.prompts}: {len(prompts)} usable prompts, need {args.steps}")
+    if not args.no_score and not all(gold):
+        raise SystemExit(f"{args.prompts} has no answer/gold/solution field, so the accuracy "
+                         "column cannot be computed. Pass --no-score only if you accept that "
+                         "nothing will distinguish a tail from non-answers.")
     print(f"{len(prompts)} real prompts, token lengths "
           f"{min(map(len, prompts))}..{max(map(len, prompts))}")
 
@@ -136,7 +160,7 @@ def main() -> int:
         rows = []
         print(f"\ngroup {group}")
         print(f"  {'step':>4} {'min':>5} {'med':>6} {'max':>5} {'sum':>6} "
-              f"{'idle%':>6} {'wall s':>7}")
+              f"{'idle%':>6} {'acc':>5} {'wall s':>7}")
         for step, prompt in enumerate(prompts):
             t0 = time.perf_counter()
             # seed indexed by _MAX_GROUP, not `group`: with `step * group + g` the two
@@ -152,15 +176,28 @@ def main() -> int:
             wall = time.perf_counter() - t0
             lens = sorted(len(done[i]) for i in ids)
             idle = _idle(lens)
-            rows.append({"step": step, "lengths": lens, "idle": idle, "wall_s": wall})
+            acc = (None if args.no_score else
+                   sum(answer_match(tok.decode(done[i]), gold[step]) for i in ids) / group)
+            rows.append({"step": step, "lengths": lens, "idle": idle, "wall_s": wall,
+                         "accuracy": acc})
             print(f"  {step:>4} {lens[0]:>5} {statistics.median(lens):>6.0f} {lens[-1]:>5} "
-                  f"{sum(lens):>6} {100 * idle:>5.1f}% {wall:>7.2f}")
+                  f"{sum(lens):>6} {100 * idle:>5.1f}% "
+                  f"{'--' if acc is None else f'{100 * acc:4.0f}%'} {wall:>7.2f}")
 
         idles = [r["idle"] for r in rows]
         pooled = 1.0 - sum(sum(r["lengths"]) for r in rows) / sum(
             max(r["lengths"]) * group for r in rows)
         print(f"  pooled idle {100 * pooled:.1f}%   per-step median {100 * statistics.median(idles):.1f}%"
               f"   range {100 * min(idles):.1f}-{100 * max(idles):.1f}%")
+        if not args.no_score:
+            overall = sum(r["accuracy"] for r in rows) / len(rows)
+            print(f"  accuracy {100 * overall:.1f}%")
+            if overall < 0.5:
+                print("  BELOW 50%: the completions are mostly not answers, so these lengths "
+                      "are not the rollout's length distribution. Check the prompt goes "
+                      "through render_chat and the sampler through prompt.sampling before "
+                      "reading any idle figure -- an unrendered prompt read 1083 mean tokens "
+                      "against 322 through the template.")
         out[str(group)] = rows
         # A group whose rows all hit the cap has zero spread and zero idle -- a real
         # reading, but it means the cap truncated the distribution rather than that the
