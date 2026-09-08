@@ -143,7 +143,16 @@ export -f pod_run_claim 2>/dev/null || true
 
 # The job, under THIS shell so it is reaped. setsid detaches it from the exec
 # session's terminal; the & + wait keeps this bash as its parent.
-setsid $CMD > /work/$NAME.log 2>&1 < /dev/null &
+# PYTHONUNBUFFERED rather than a -u spliced into argv: CMD is often
+# bash -c '... python3 ...', so there is no argv position for the flag, and the env var
+# reaches every python in the tree including ones a wrapper spawns. Measured 2026-09-08 on
+# two evals of the same binary: buffered left the log at 0 bytes after 43 MINUTES of a
+# healthy run, unbuffered had 2720 bytes in 30 s. A block-buffered log makes a long job
+# indistinguishable from a hung one for its whole duration -- two sessions nearly declared
+# that run dead. No backticks anywhere in this comment: the heredoc below is UNQUOTED, so a
+# backtick here is command substitution on the CALLER -- writing the flag name in backticks
+# made the assembly run it and print "command not found", and the selftest's arm 0 caught it.
+setsid env PYTHONUNBUFFERED=1 $CMD > /work/$NAME.log 2>&1 < /dev/null &
 JOB=\$!
 echo "pod_run: job pid \$JOB, log /work/$NAME.log"
 

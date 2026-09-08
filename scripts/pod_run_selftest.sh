@@ -212,4 +212,23 @@ grep -q "one two" "$TMP/work/selftest.log" \
 grep -q "option requires an argument" "$TMP/a6/wrapper.out" \
   && fail "arm 6: bash -c reached the pod with no operand: $(cat "$TMP/a6/wrapper.out")"
 
-echo "PASS: a wrapper-launched job claims via --wait-for-device, a direct-python one via --require-device, a multi-arm wrapper re-claims per arm, a reused claim is not a refusal, an unclaimable job exits 4 and releases, and a quoted multi-word command survives argv"
+# The launcher must hand python an unbuffered stdout, because a block-buffered log makes a
+# long job indistinguishable from a hung one: measured 2026-09-08, a healthy 43-minute eval
+# left /work/<name>.log at 0 bytes while an unbuffered twin had 2720 bytes in 30 s. Asserted
+# through a `bash -c` wrapper, which is the case a -u in argv cannot reach, and by reading
+# what PYTHON sees rather than by grepping the runner text -- write_through is the effect,
+# the env var is only the mechanism.
+mkdir -p "$TMP/a7"
+emitted7=$(POD_RUN_EMIT_RUNNER=1 AUPAI="$TMP/aupai" REMOTE_DIR="$TMP/work" \
+  bash "$ROOT/scripts/pod_run.sh" unbuf 6 -- bash -c \
+  'python3 -c "import os,sys;print(\"UNBUF\",os.environ.get(\"PYTHONUNBUFFERED\"),\"WT\",sys.stdout.write_through)"')
+printf '%s\n' "$emitted7" > "$TMP/a7/runner.sh"
+sed -i.bak -e "s#> /work/#> $TMP/work/#g" "$TMP/a7/runner.sh"
+set +e
+( cd "$TMP/work" && CLAIM_MODE=shell_then_device CLAIM_LOG=$CLAIM_LOG bash "$TMP/a7/runner.sh" \
+    > "$TMP/a7/wrapper.out" 2>&1 )
+set -e
+grep -q "UNBUF 1 WT True" "$TMP/work/unbuf.log" \
+  || fail "arm 7: python did not get an unbuffered stdout: $(cat "$TMP/work/unbuf.log" 2>/dev/null | head -2)"
+
+echo "PASS: a wrapper-launched job claims via --wait-for-device, a direct-python one via --require-device, a multi-arm wrapper re-claims per arm, a reused claim is not a refusal, an unclaimable job exits 4 and releases, a quoted multi-word command survives argv, and python's stdout is unbuffered"
