@@ -94,11 +94,29 @@ The contaminated figures were 26.55 and 31.00 ms/token — **2.55x the clean B=8
 wrong sign on the comparison.** A JIT-dominated clock did not merely add noise; it inverted
 the verdict.
 
-The decode row is what `tilerl-0a`'s dispatch table predicts: fill goes 50% to 100% at
-wgmma's M granularity of 16, so the ideal is 0.500x per token and **0.618x realizes 76% of
-it**. The other rows check that table's silences: `train/token` is 0.994x because `--micro 1`
+The decode row is the one `tilerl-0a`'s dispatch table speaks to — fill goes 50% to 100% at
+wgmma's M granularity of 16 — and **0.618x lands between the two available reference points
+rather than achieving a fraction of either**:
+
+| reference | value | what it assumes |
+|---|---:|---|
+| pure fill argument | 0.500x | per-call time does not change with M |
+| 48's per-call timings, byte-weighted | 0.710x | rate degradation counted, one ~70 MB shape per dtype |
+| **measured decode/token** | **0.618x** | |
+
+Both bounds are point estimates dressed as limits, and **they err in opposite directions**:
+0.500x ignores that per-call time actually rises (fp4 0.080 → 0.126 ms, 1.575x), while 0.710x
+takes one shape as the model when weights run from ~1 MB to 1272 MB and larger ones amortize
+better. A measurement inside that interval says both effects are real, and that the model's
+larger weights amortize better than 48's sample. (An earlier draft of this entry said 0.618x
+"realizes 76% of the 0.500x ideal" — **that denominator does not exist**; 48 supplied the
+per-call degradation that rules it out.)
+
+The other rows check the dispatch table's silences: `train/token` is 0.994x because `--micro 1`
 runs one row per backward and cannot benefit, exactly as it should be; `mixed` grew 3.692x
-because 16 rows admit across more ticks, so more ticks carry both phases.
+because 16 rows admit across more ticks, so more ticks carry both phases. And `decode/token`
+contains more than these GEMMs — attention, GDN state, norm, launch — some of it nearly
+M-independent, which pushes the ratio below either reference on its own.
 
 **This does not contradict 48's finding that the per-call rate falls past M=8** (fp4 832.8 to
 531.7 GB/s at M=16). Both hold and they compose: batch amortization beat the per-call rate
