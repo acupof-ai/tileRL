@@ -190,6 +190,17 @@ follow from the survey and cost nothing architecturally:
    bf16 in tokens per millisecond at every M measured (1.2x to 2.8x): it is
    spending its fewer bytes.
 
+   The other half of the weight stream now has a number too. 10.625 of the
+   21.896 GB are fp8 and run through `linear_fp8`, a path nobody had timed. At a
+   matched size (73.5 vs 66.9 MB, 1.10x apart, one process per dtype) fp8 and fp4
+   are within 6% of each other per byte at M=8 — 0.094 ms against 0.080. **So
+   neither path is the hot one.** The target is not "fix the fp4 dequant"; it is
+   that both paths reach only 20-29% of the bandwidth their assumed bytes imply,
+   and the cause is shared. No whole-model figure follows from this: the same
+   dtype measured on `gate_up` (133.8 MB) and `down_proj` (66.9 MB) extrapolates
+   to 9.73 ms and 13.52 ms, **39% apart**, so pricing the full 11 GB needs a
+   per-layer sweep, not a microbenchmark.
+
    Two limits on that reading, both from the arm's own author. The bf16 arm is
    **constant at 0.270 ms from M=2 to M=32** — it pads M exactly as `mma8` does —
    so it is not a control that varies with M, and the same 1.5x bar reads 0.97x
