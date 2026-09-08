@@ -152,9 +152,13 @@ def spectra(params, keys=None):
     4.74 GiB, so a per-shape-class sample necessarily includes it and OOMs anyway. The card
     buys 1.01-1.08x over the host on the large classes (SVD here is algorithm-bound, not
     bandwidth-bound), so `.cpu()` costs ~6% of an already-sampled sweep and zero card memory.
+    ``.cpu()`` comes BEFORE ``.float()`` and the order is the whole fix: ``.float().cpu()``
+    casts on the SOURCE device, so it allocated the f32 embedding on the card and OOMed asking
+    for exactly 4.74 GiB — the same failure the f64 version had, one cast later. Copying the
+    bf16 bytes first moves half as much and casts where there is room.
     """
     sel = params if keys is None else {k: params[k] for k in keys}
-    return {k: torch.linalg.svdvals(v.detach().float().cpu())
+    return {k: torch.linalg.svdvals(v.detach().cpu().float())
             for k, v in sel.items() if v.dim() == 2}
 
 
@@ -398,16 +402,26 @@ if __name__ == "__main__":
     assert sigma_verdict(1.0, 0.0).startswith("NOT TESTED"), "a no-gradient run read as OK"
     assert sigma_verdict(0.4, 0.0).startswith("OK"), "a real run must still reach a verdict"
     assert sigma_verdict(0.4, 0.2).startswith("VOID"), "a moving spectrum must still void"
-    # 4. The gate must not allocate on the card: `materialize` leaves ~3.56 GiB free and one
-    #    f32 embedding is 4.74, so a card-side svdvals OOMs even sampled. Asserted on the
-    #    RESULT's device, which is what `.cpu()` in `spectra` guarantees -- a reading of the
-    #    source line would be satisfied by the comment above it.
-    #    VACUOUS ON A CPU HOST, deliberately stated: `.float()` and `.float().cpu()` are both
-    #    cpu there, so this cannot fail locally and only bites on a card. It is a card-side
-    #    gate that rides along, not a check this machine verifies.
+    # 4. The gate must not allocate on the CARD. `materialize` leaves ~3.5 GiB free and one f32
+    #    embedding is 4.74, so a card-side cast OOMs even sampled. Asserting the RESULT's
+    #    device was not enough and cost a second card run: `.float().cpu()` returns a cpu
+    #    tensor and still allocated 4.74 GiB on the card, because `.float()` runs on the
+    #    source device. The quantity to assert is the card high-water mark across the call.
     _s = spectra(m.params, sigma_keys(m.params, 2))
     assert _s and all(v.device.type == "cpu" for v in _s.values()), \
         f"spectra returned non-CPU tensors: {[str(v.device) for v in _s.values()][:3]}"
-    _where = "verified" if torch.cuda.is_available() else "vacuous on this CPU host"
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        base_alloc = torch.cuda.memory_allocated()
+        spectra(m.params, sigma_keys(m.params, 2))
+        grew = torch.cuda.max_memory_allocated() - base_alloc
+        assert grew < 1 << 20, (
+            f"the drift gate allocated {grew / 2**20:.1f} MiB on the card; it must cast on "
+            f"the host (.cpu() BEFORE .float()), or it OOMs beside a materialized 27B")
+        _where = "verified: 0 card bytes"
+    else:
+        # Stated rather than silently skipped: on a CPU host there is no card allocation to
+        # measure, so neither assert above can fail and this line is not evidence.
+        _where = "vacuous on this CPU host"
     print("self-check: a checkpoint path is refused, the 27B tokenizer resolves by name, "
           f"a 100%-tied run reads NOT TESTED, and the drift gate is host-side ({_where})")
