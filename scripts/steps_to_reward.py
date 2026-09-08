@@ -27,10 +27,14 @@ information, which is what that phase exists to give tiny). `--data` is P1's own
 so this curve is comparable with run 1's:
 
     scripts/pod_run.sh isorl <card> -- env TILERL_TARGET=cuda \\
-      TILERL_QWEN38_SOURCE=<checkpoint dir> \\
+      TILERL_QWEN38_SOURCE=<checkpoint dir> HF_ENDPOINT=https://hf-mirror.com \\
       python scripts/steps_to_reward.py --model qwen38-27b --reward gsm8k \\
       --data /work/p1_gsm8k_train.jsonl --sft-steps 0 --rl-steps N --group 8 \\
       --max-new-tokens 256
+
+`HF_ENDPOINT` because huggingface.co does not resolve from the pod but the mirror does --
+and NOT the offline switches, which would turn a cache miss into a failure instead of a
+fetch. One endpoint being unreachable is not the box being offline.
 
 Read `tied groups` on a short run before choosing `--rl-steps` or the cap: run 2 collapsed
 onto its rollout cap at step 41 with the guard that ran before step 1 satisfied
