@@ -73,10 +73,14 @@ changed here.
   directions. #303 changes the observable instead: 2-D weights moved 17/17 versus
   0/17, which is exact where the loss comparison is only statistical. **That is a
   mechanism check, not the phase's quantity.** Both the old bound and #303's
-  replacement are blind to a step count, and the old bound has a second, separable
+  replacement are blind to a step count. #303 forecloses "the 2-D path does not
+  run"; it does not foreclose "the 2-D path runs and changes nothing", which is
+  what the figure below shows. The old bound has a second, separable
   defect: dispatching the 2-D weights to the base optimizer -- ISO removed, not
-  merely disabled -- gives a drop **0.015%** from real ISO's, indistinguishable
-  at 247x the threshold, so it never watched ISO at all. `test_iso.py:80` then
+  merely disabled -- gives a drop within **0.046%** of real ISO's (24.7703 vs
+  24.7589), at 248x the threshold, so it never watched ISO at all. The percentage
+  is of the drop; on the final loss the two differ by 49.2%, which is why the
+  operand has to be named. `test_iso.py:80` then
   feeds the same 2x32 batch to all 8 steps, so what it did watch was memorization
   of one batch. The exit is restated above as steps-to-a-fixed-loss against
   Adafactor with a fresh batch per step, and it is unmeasured. **P3's merger CPU exit is met
@@ -174,8 +178,9 @@ bf16 — a reason to try it, not a number we own. Mechanism and memory in
   gradient, orthonormality after retraction, spectrum preserved over steps,
   and fewer steps than Adafactor to a fixed loss. The first three hold; the
   fourth is NOT met. It replaces "SFT loss falls", which passed with ISO removed
-  from the 2-D weights entirely (0.015% from real ISO) and fed one 2x32 batch 8
-  times -- neither the optimizer under test nor an optimization trajectory.
+  from the 2-D weights entirely (within 0.046% of real ISO's drop) and fed one
+  2x32 batch 8 times -- neither the optimizer under test nor an optimization
+  trajectory.
 - Optimizer (pod, SFT first): steps to the same loss vs Adafactor on the 27B;
   peak < 96 GB. This is SFT because full-parameter RL has a ceiling:
 - **Per-step re-quantization into the served fp4 bytes** — the first pod item
