@@ -842,6 +842,14 @@ def _train_adapters(args: argparse.Namespace) -> None:
                           "jit": not curve})
             log(f"  curve step {step}: {c}/{n} = {100 * c / max(n, 1):.1f}% "
                 f"at {train_secs:.1f}s cumulative, mean {ntok / max(n, 1):.0f} tok, "
+                # tokens/correct, the ratio the before/after arms already log (`per`, :718).
+                # It separates two things a score cannot: the 2026-09-05 run moved
+                # tokens/correct 394.0 -> 143.8 (2.74x) while accuracy moved 88.0 -> 93.6
+                # (+6%), so most of what that RL bought was shorter answers. A curve read on
+                # score alone records that as "the rate of learning to be right".
+                # Derived, not stored: it is mean_len * total / correct from fields already
+                # in the point, and a second copy in the dict could disagree with them.
+                f"{ntok / c if c else float('nan'):.1f} tok/correct, "
                 f"{at_cap}/{n} at cap, scored in {eval_secs:.1f}s")
 
         hist = []
