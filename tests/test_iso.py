@@ -79,10 +79,29 @@ def test_iso_lowers_loss_on_tiny_model():
     opt = ISO(Adafactor(lr=1e-2))
     ids = np.random.default_rng(0).integers(1, 300, size=(2, 32))
     backend = RefBackend()
+    before = {k: p.clone() for k, p in model.params.items()}
     t0 = time.time()
     losses = [train_step(model, ids, backend, opt) for _ in range(8)]
     dt = (time.time() - t0) / 8
     assert losses[-1] < losses[0] - 0.1, f"ISO did not learn: {losses}"
+    # The loss alone does not gate ISO: the tiny model has 10 one-dimensional params
+    # that `step_one` hands straight to the base (iso.py:101), and they carry the run
+    # on their own. Measured with ISO's whole 2D path stubbed to `return`: the loss
+    # still fell 5.32, passing the bound above by 53x. Pure Adafactor is not the
+    # control either -- it beat ISO's drop on 3 of 4 data seeds, so an "ISO is lower"
+    # assertion would be flaky in both directions. What separates them is whether the
+    # 2D weights moved at all: 17/17 here, 0/17 stubbed.
+    moved = [k for k, p in model.params.items()
+             if p.dim() == 2 and not torch.equal(p, before[k])]
+    two_d = [k for k, p in model.params.items() if p.dim() == 2]
+    assert len(moved) == len(two_d), (
+        f"ISO left {len(two_d) - len(moved)} of {len(two_d)} 2D weights untouched, so the "
+        f"loss above came from the base optimizer's 1D params: {sorted(set(two_d) - set(moved))}"
+    )
+    assert len(opt._frames) == len(two_d), (
+        f"{len(opt._frames)} frames cached for {len(two_d)} 2D weights; the SVD path did "
+        f"not run for all of them"
+    )
     return losses, dt
 
 
