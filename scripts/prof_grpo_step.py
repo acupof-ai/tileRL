@@ -230,6 +230,13 @@ def main() -> int:
                           decode_graph=True, prefix_store=NoPrefixStore())
     trainable = add_lora(model, rank=a.rank)
     optimizer = AdamW(lr=1e-5)
+    # No stop_token_ids, so every rollout runs to --gen exactly and mean_completion_tokens
+    # is the cap. That is DELIBERATE for a batch-width comparison -- both arms then do
+    # identical per-row work and ms/token cannot be confounded by one arm generating
+    # shorter completions -- but it makes step_secs an UPPER bound on a shipped step,
+    # which stops on EOS. A length-distribution question needs the factory sampler
+    # (`prompt.sampling`, which fills stop ids from the tokenizer); this probe answers
+    # the width question and reports the cap so the bound is visible.
     sampling = untruncated(SamplingParams(max_new_tokens=a.gen))
     rng = np.random.default_rng(0)
     # Bounded by the model's own vocab, not a round number: the tiny model has 320 tokens
@@ -275,6 +282,10 @@ def main() -> int:
         a.group * float(np.mean([r["mean_completion_tokens"] for r in warm])), 1)
     summary["mean_ms_per_token"] = round(
         summary["mean_step_secs"] * 1000 / summary["mean_tokens"], 4)
+    # Stated, not assumed: a reader comparing two widths must see whether the rows were
+    # capped, because ms/token is only comparable across arms when they are.
+    summary["completions_hit_the_cap"] = all(
+        r["mean_completion_tokens"] == float(a.gen) for r in warm)
     m = summary
     # The decomposition has to add up, or a bucket is being double-counted.
     parts = (m["mean_rollout_secs"] + m["mean_reward_secs"] + m["mean_train_secs"]
