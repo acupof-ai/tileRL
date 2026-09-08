@@ -85,6 +85,7 @@ def main() -> int:
     from tilerl.cli import _build_model, _qwen38_tokenizer
     from tilerl.engine import build_engine
     from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
+    from tilerl.prompt import render_chat
     from tilerl.prompt import sampling as build_sampling
     from tilerl.train import _drain, untruncated
 
@@ -97,7 +98,10 @@ def main() -> int:
             row = json.loads(line)
             text = row.get("question") or row.get("prompt") or row.get("text")
             if text:
-                prompts.append(tok.encode(text))
+                # Through render_chat, as cli.py:611 does. The tail probe fed the bare
+                # question and the model continued the document to the cap: mean 1083
+                # tokens against 322 measured through the template.
+                prompts.append(tok.encode(render_chat([("user", text)], False)))
     if len(prompts) < args.steps:
         raise SystemExit(f"{args.prompts}: {len(prompts)} usable prompts, need {args.steps}")
 

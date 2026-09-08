@@ -22,6 +22,17 @@ fixed or random prompt set would fabricate it -- the same way a random-normal fi
 top-p's nucleus at 162301/248320 when the real one was 43 (2026-09-08). Reads
 `/work/p1_gsm8k_train.jsonl`.
 
+**Through `render_chat`, which the first run skipped and which cost the whole measurement.**
+That run fed `tok.encode(question)` -- the bare document, no `<|im_start|>user`, no open
+assistant turn, and with thinking off none of the `<think>\n\n</think>` closer the template
+puts in the prompt. `grpo_loop`'s prompts come from `render_chat` (cli.py:611). A chat-tuned
+model handed a bare document continues the document, and it ran to the 6144 cap on 11 of
+160 rows with a mean of 1083 tokens; an independent measurement of the same dataset through
+the template read mean 322, p90 532, 1.3% at a 1024 cap -- 19x apart on the mean. The
+sampler was right (`prompt.sampling` gave temperature 0.7, top_p 0.8, the model card's
+non-thinking values) and the prompt said nothing, so nothing in the output showed the two
+disagreed.
+
 **And the real SamplingParams, for the same reason.** The first run of this probe built
 `SamplingParams(max_new_tokens=1024, seed=...)` directly. `stop_token_ids` defaults to
 `()` (engine.py:149), so no EOS could end a row and all 160 rollouts ran to exactly 1024
@@ -69,8 +80,9 @@ def main() -> int:
     ap.add_argument("--gen", type=int, default=1024)
     ap.add_argument("--prompts", default=_PROMPTS)
     ap.add_argument("--thinking", action="store_true",
-                    help="the model card's thinking-mode sampler; default is non-thinking, "
-                         "which is what the P1 GRPO runs use")
+                    help="thinking mode: sets BOTH the prompt's think block and the model "
+                         "card's sampler, as render_chat and prompt.sampling do. Default "
+                         "non-thinking, which is what the P1 GRPO runs use.")
     ap.add_argument("--out", default="/work/rollout_tail.json")
     args = ap.parse_args()
 
@@ -79,6 +91,7 @@ def main() -> int:
     from tilerl.cli import _build_model, _qwen38_tokenizer
     from tilerl.engine import build_engine
     from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
+    from tilerl.prompt import render_chat
     from tilerl.prompt import sampling as build_sampling
     from tilerl.train import _drain, untruncated
 
@@ -93,7 +106,7 @@ def main() -> int:
             row = json.loads(line)
             text = row.get("question") or row.get("prompt") or row.get("text")
             if text:
-                prompts.append(tok.encode(text))
+                prompts.append(tok.encode(render_chat([("user", text)], args.thinking)))
     if len(prompts) < args.steps:
         raise SystemExit(f"{args.prompts}: {len(prompts)} usable prompts, need {args.steps}")
     print(f"{len(prompts)} real prompts, token lengths "
