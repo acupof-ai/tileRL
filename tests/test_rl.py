@@ -874,3 +874,137 @@ def test_the_rl_reward_closure_carries_the_length_term_and_the_matcher_does_not(
     # the matcher is untouched -- it is what the P1 gate counts through
     assert MATCHERS["number"]("the answer is 42", "42") is True
 
+
+
+def test_prompts_per_step_normalises_each_prompt_separately():
+    """A step of two prompts is two independent groups, not one group of 2*g.
+
+    `reshape(-1, group)` infers the group count from the length, so it accepts
+    16 rewards at group=8 as (2, 8) whether the caller meant two prompts or one
+    prompt whose rollout count doubled -- and normalising two prompts as one
+    prompt's halves degrades GRPO to REINFORCE with no raise. `groups` is the
+    caller's own expectation, which is the only thing that can tell them apart.
+    """
+    import pytest
+
+    from tilerl.train import group_advantages
+
+    # Two prompts of 2: the first disagrees, the second is tied and must stay silent.
+    # A single group of 4 over the same rewards would give all four rows a nonzero
+    # advantage -- which is the bug, so this asserts the shape and not just non-zero.
+    adv = group_advantages([1.0, 0.0, 5.0, 5.0], group=2, groups=2)
+    assert np.allclose(adv, [1.0, -1.0, 0.0, 0.0])
+    flat = group_advantages([1.0, 0.0, 5.0, 5.0], group=4, groups=1)
+    assert not np.allclose(flat[2:], 0.0), "the one-group reading must differ, or the test is blind"
+
+    # The wrong group count raises instead of reshaping into it.
+    with pytest.raises(ValueError, match="averaging across prompts"):
+        group_advantages([1.0] * 16, group=8, groups=1)
+    # And a partial group still raises, which reshape would also have caught.
+    with pytest.raises(ValueError, match="multiple of the group"):
+        group_advantages([1.0] * 7, group=2)
+    # Default groups=None keeps every existing caller working.
+    assert np.allclose(group_advantages([2.0, 2.0], group=2), 0.0)
+
+
+def test_a_step_of_two_prompts_does_not_normalise_across_them(tmp_path):
+    """End to end: two prompts in one step, each centred within its own group.
+
+    The failure this guards is silent. With a per-prompt reward offset (prompt 1
+    scores ~10 higher because it is easier), normalising the step as ONE group of
+    4 gives BOTH of prompt 1's rows a positive advantage -- gradient for being the
+    easy prompt, which is prompt difficulty leaking in. Measured on this fixture:
+    correct [+1, -1, +1, -1] against the bug's [-0.896, -1.095, +1.095, +0.896].
+    So the two readings differ in SIGN on two rows, not just in magnitude.
+    """
+    from tilerl_kernels.backend import get_backend
+
+    import tilerl.train as train_mod
+    from tilerl.cli import _build_model
+    from tilerl.engine import BLOCK_TOKENS, SamplingParams, build_engine
+    from tilerl.kv_cache import NoPrefixStore
+
+    cfg, model = _build_model("tiny", seed=0)
+    backend = get_backend()
+    # Different lengths on purpose: a scalar `plens` (np.full(group, len(prompt)))
+    # would mis-mask every row of the shorter prompt.
+    prompts = [[1, 2, 3], [4, 5, 6, 7, 8, 9]]
+    seen: dict = {}
+
+    def reward(p, c):
+        k = tuple(int(x) for x in p)
+        seen[k] = seen.get(k, 0) + 1
+        return float(seen[k] % 2) + (10.0 if len(k) > 3 else 0.0)
+
+    rows = 4
+    ctx = max(max(map(len, prompts)) + 8 + 64, 128)
+    engine = build_engine(cfg, model, backend, num_slots=rows, max_batch=rows,
+                         num_blocks=-(-ctx // BLOCK_TOKENS) * rows + 8,
+                         max_total_tokens=max(ctx, 512), decode_graph=False,
+                         prefix_store=NoPrefixStore())
+    per: list = []
+    issued: list = []
+    real_submit = engine.submit
+
+    def spy(input_ids, params=None):
+        issued.append(None if params is None else params.seed)
+        return real_submit(input_ids, params)
+
+    engine.submit = spy
+    handed: list = []
+    real_rl_step = train_mod.rl_step
+
+    def rl_spy(model_, batch, adv, plens, *a, **kw):
+        handed.append((list(map(int, plens)), list(map(int, kw["seq_lens"])), batch))
+        return real_rl_step(model_, batch, adv, plens, *a, **kw)
+
+    monkeypatch_target = train_mod
+    monkeypatch_target.rl_step = rl_spy
+    # Two steps, not one: a stride bug is invisible within a single step, since the
+    # step index multiplies it.
+    steps = list(train_mod.grpo_loop(
+        engine, model, prompts, reward, 2, backend, group=2, prompts_per_step=2,
+        sampling=SamplingParams(max_new_tokens=6), seed=0, per_rollout=per))
+
+    assert len(per) == 2 * rows, f"two steps of prompts_per_step * group rows, got {len(per)}"
+    assert sorted({r["p"] for r in per}) == [0, 1], "both prompts must appear"
+    # Each group centred on itself: every prompt's advantages sum to ~0 SEPARATELY.
+    # The whole step summing to 0 is necessary but not sufficient -- the buggy
+    # reading above also sums to 0 across the step.
+    for p in (0, 1):
+        adv = [r["advantage"] for r in per if r["p"] == p and r["step"] == 1]
+        assert abs(sum(adv)) < 1e-9, f"prompt {p} advantages are not centred: {adv}"
+        assert len(adv) == 2 and adv[0] * adv[1] < 0, (
+            f"prompt {p} must have one positive and one negative row, got {adv}")
+    # And the step reported a real tie fraction, not a constant.
+    assert steps[0][3] == 0.0, f"neither group ties on this fixture, got {steps[0][3]}"
+    assert len(issued) == 2 * rows, f"expected {2 * rows} submits, saw {len(issued)}"
+    train_mod.rl_step = real_rl_step
+    assert len(handed) == 2, f"one rl_step per step, saw {len(handed)}"
+
+    # The other two silent failures on this path, which the advantage assertions above
+    # do NOT cover -- both were mutation-tested and survived them.
+    #
+    # (1) The seed must stride by prompts_per_step * group. Striding by `group`, as the
+    #     one-prompt code did, reissues step N-1's seeds to every prompt after the first:
+    #     prompt 1 of step 0 would draw the same completions as prompt 0 of step 1.
+    #     Read off the engine's OWN submits, not recomputed from train.py's formula --
+    #     a test that mirrors the expression it guards passes whatever the expression
+    #     becomes.
+    assert len(set(issued)) == len(issued), f"a seed repeats within two steps: {issued}"
+
+    # (2) Every row's prompt length is its OWN. A scalar plens (np.full(rows,
+    #     len(picks[0]))) masks prompt 1's rows against prompt 0's length -- 3 vs 6 here,
+    #     so three prompt positions of every prompt-1 row enter the scored span and three
+    #     of its completion positions leave it. Caught by reading what rl_step was handed:
+    #     a wrong mask changes the gradient, not the shape, so nothing downstream raises.
+    assert len(prompts[0]) != len(prompts[1]), (
+        "the fixture needs unequal prompt lengths, or (2) cannot fail")
+    for plens, slens, batch in handed:
+        assert sorted(set(plens)) == sorted({len(p) for p in prompts}), (
+            f"plens must carry each row's own prompt length, got {sorted(set(plens))} "
+            f"against prompts of {[len(p) for p in prompts]}")
+        # And the scored span is exactly the completion: every row's prompt sits below
+        # plens and its padding above slens, with nothing of one inside the other.
+        for row, (pl, sl) in enumerate(zip(plens, slens)):
+            assert 0 < pl <= sl <= batch.shape[1], f"row {row}: {pl} .. {sl}"
