@@ -38,6 +38,30 @@ in `_by_id`, so a demote cannot shrink the count term and only eviction can sati
 Removing the guard would demote every entry to the host tier under count pressure, find the
 count unchanged, and evict them anyway: one wasted tier write plus a `forget` per entry.
 
+Reproduced at different constants (800-byte snapshots, 16-token prefixes, a 4096-block pool
+so the block term cannot participate), which adds the row this table was missing — `len == capacity` exactly, the count at which "the guard is always
+false" should hold if it holds anywhere:
+
+| pressure | entries | demoted | evictions |
+|---|---:|---:|---:|
+| boundary — `capacity=9`, `state_bytes=2500`, 9 published | 9 | **6** | **0** |
+
+Same shape at different constants, so the refutation is not an artifact of the numbers chosen.
+
+**The block axis is a third term, and its missing demote branch is also not a defect.**
+`evict_until_free` (`:1330`) calls `_evict_one` directly with no demote branch, which reads
+like the same omission on another axis. The code settles it without a measurement:
+`_demote_one` decrements `_state_used`, sets `entry.state=None, entry.demoted=True`, and
+touches neither the block pool nor `_by_id` — its docstring says the entry "keeps its tokens
+and its blocks and stays in the index". A demote therefore frees **zero** blocks, and there is
+nothing a demote branch could do where blocks bind; the errors entry says the same under
+*The locality: `evict_until_free` is the one eviction path with no demote branch*.
+Confirmed on a run: a forced `_demote_one` moved `dram.demotions` 3→4 and `free_blocks` 58→58. Three terms, one tool — bytes is the only
+axis `_demote_one` can satisfy, and count and blocks each admit only eviction, by the same
+argument. What is open on the block axis is a *sizing* problem, not a missing branch: the tier
+converts byte pressure into block pressure, the block path then evicts already-demoted entries,
+and `_drop` calls `_dram.forget`, orphaning the host copy — 103 demotions for 0 promotions.
+
 The reasoning was self-consistent and no step in it was wrong. It described one branch while
 claiming something about all of them, and nobody ran the store. Two sessions read the shape;
 three rows answered it in minutes.
