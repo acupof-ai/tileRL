@@ -1,6 +1,7 @@
 """The run ledger: ids are a function of the inputs, a finished run is not
 rerun, gates are data in the manifest and an exit code in the CLI."""
 
+import contextlib
 import json
 
 import pytest
@@ -96,8 +97,11 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
     assert [g["name"] for g in m["gates"]] == [
         "rollouts_within_cap", "reward_rises", "mmlu_holds", "gsm8k_improves",
         "groups_untied", "ce_falls"]
-    # ce_falls carries no ce_first on the RL path, so it passes vacuously here.
+    # ce_falls carries no ce_first on the RL path, so it is recorded as not measured
+    # rather than passed -- see test_ce_falls_is_not_measured_on_the_rl_path.
     assert m["metrics"].get("ce_first") is None
+    ce = next(g for g in m["gates"] if g["name"] == "ce_falls")
+    assert ce["skipped"] is True and ce["passed"] is None, ce
     assert code == (0 if gates_pass(m) else 1)
     assert isinstance(m["metrics"]["gsm8k_before"], int)
     assert isinstance(m["metrics"]["gsm8k_after"], int)
@@ -245,3 +249,82 @@ def test_mmlu_score_reports_the_concurrency_it_used():
     call = next(ln for ln in cli.splitlines() if "mmlu_accuracy(" in ln and "import" not in ln)
     assert call.count(",") >= 2 and "conc" in call, f"cli.py drops the concurrency: {call!r}"
     assert '_concurrency"] = conc' in cli, "cli.py must record it in the manifest"
+
+
+def _gate(name, metrics):
+    """Score one gate through `_finish`, the real code path, on a synthetic manifest.
+
+    `_finish` exits non-zero when any gate fails, which is the behaviour under test, so
+    the SystemExit is expected rather than an error -- the manifest it wrote is still on
+    `m`, and that is what carries the verdict.
+    """
+    from tilerl.cli import _finish
+
+    m = new_manifest("train", {"steps": 100, "source": "tiny"}, [])
+    m["metrics"] = dict(metrics)
+    with contextlib.suppress(SystemExit):
+        _finish(m, as_json=True)
+    return next(g for g in m["gates"] if g["name"] == name)
+
+
+def test_p1_exit_thresholds_match_the_roadmap(capsys):
+    """The roadmap's P1 numbers, encoded in the units each metric is actually written in.
+
+    `gsm8k_{tag}` is a COUNT and `mmlu_{tag}` is a fraction (cli.py:588 vs :575), so the
+    same "+5 pt / -2 pt" sentence needs two different encodings. Both arms of each case
+    are asserted: the old `after > before` form passes at +1 question of 500, which is
+    +0.2 pt against the roadmap's own SE of ~2 pt, so a test that only checked the pass
+    case would have gone green on the pre-fix code too.
+    """
+    base = {"gsm8k_before": 181, "gsm8k_before_total": 500,
+            "gsm8k_after_total": 500, "tied_group_fraction": 0.3}
+
+    # +1 of 500 = +0.2 pt: the noise pass this gate accepted before.
+    g = _gate("gsm8k_improves", {**base, "gsm8k_after": 182})
+    assert g["passed"] is False, f"+0.2 pt must not pass P1: {g}"
+    assert g["threshold"] == 181 + 25, g
+    capsys.readouterr()
+
+    # +24 of 500 = +4.8 pt, just under; +25 = +5.0 pt, exactly the bar.
+    assert _gate("gsm8k_improves", {**base, "gsm8k_after": 205})["passed"] is False
+    assert _gate("gsm8k_improves", {**base, "gsm8k_after": 206})["passed"] is True
+    capsys.readouterr()
+
+    # The denominator comes off the manifest: 200 questions makes the bar +10.
+    g = _gate("gsm8k_improves", {**base, "gsm8k_after": 191,
+                                 "gsm8k_after_total": 200, "gsm8k_before_total": 200})
+    assert g["threshold"] == 181 + 10 and g["passed"] is True, g
+    capsys.readouterr()
+
+    # The `or` fallback, which no other case reaches: a guard stop can leave the
+    # after-arm's total unwritten while the before-arm's is on the manifest, and a bar
+    # computed from a missing total would be `None` -- a vacuous pass on the gate that
+    # matters most. Mutation-driven: dropping the fallback survived every case above.
+    g = _gate("gsm8k_improves", {"gsm8k_before": 181, "gsm8k_before_total": 500,
+                                 "gsm8k_after": 182, "tied_group_fraction": 0.3})
+    assert g["threshold"] == 181 + 25 and g["passed"] is False, g
+    capsys.readouterr()
+
+    # MMLU is a fraction and the roadmap allows -2 pt, not -3.
+    mm = {**base, "gsm8k_after": 206, "mmlu_before": 0.601}
+    assert _gate("mmlu_holds", {**mm, "mmlu_after": 0.575})["passed"] is False, "-2.6 pt"
+    assert _gate("mmlu_holds", {**mm, "mmlu_after": 0.582})["passed"] is True, "-1.9 pt"
+    capsys.readouterr()
+
+
+def test_ce_falls_is_not_measured_on_the_rl_path(capsys):
+    """`ce_first` is written by the SFT loop only, so on an RL run the gate has no
+    threshold -- and a missing threshold is a vacuous pass, which recorded `passed` over
+    nothing. `skipped` says what is true. The gate stays live where both values exist,
+    so the rising arm must still fail: a skip that also swallowed a real regression would
+    be the same defect in the other direction.
+    """
+    rl = _gate("ce_falls", {"ce_last": 1.22, "tied_group_fraction": 0.3})
+    assert rl["skipped"] is True and rl["passed"] is None, rl
+    capsys.readouterr()
+
+    assert _gate("ce_falls", {"ce_last": 1.22, "ce_first": 1.90})["passed"] is True
+    capsys.readouterr()
+    rising = _gate("ce_falls", {"ce_last": 1.90, "ce_first": 1.22})
+    assert rising["skipped"] is False and rising["passed"] is False, rising
+    capsys.readouterr()
