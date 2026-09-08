@@ -25,6 +25,28 @@ _NO_WEIGHTS = (
 )
 
 
+def _progress(as_json: bool):
+    """The run's progress printer: stdout normally, STDERR under --json.
+
+    Not a no-op under --json, which is what it used to be. A `--json` eval-only run then
+    printed nothing at all until the manifest at the end, and with the eval arm writing
+    `eval-{tag}.jsonl` only on completion and the run directory holding just the
+    pre-written manifest, the log was the sole progress signal -- so a healthy 67-minute
+    27B eval was indistinguishable from a hung one for its whole duration, and two
+    sessions began treating one as dead (errors/2026-09-08-a-silence-with-no-writer.md).
+
+    stderr, not stdout, because `--json` exists so a caller can parse the manifest:
+    `tests/test_recipes.py:47` reads `out[out.index("{"):]`, so anything containing a
+    brace ahead of the manifest breaks it. stdout is already not a lone object -- the
+    same test records that TileLang writes kernel-cache warnings there from C++ -- which
+    is why the manifest is found by first brace rather than by parsing the whole stream,
+    and why moving OUR lines off stdout is what keeps that workable.
+    """
+    if not as_json:
+        return print
+    return lambda *a, **k: print(*a, **{**k, "file": sys.stderr, "flush": True})
+
+
 def _qwen38_tokenizer():
     """The 27B tokenizer, with the same hint as its weights: a bare hub id 401s."""
     from .tokenizer import get_tokenizer
@@ -239,7 +261,7 @@ def _train_full(args: argparse.Namespace) -> None:
     from .ledger import commit, new_manifest, read_manifest, runs_root
     from .model import drop_quantized
 
-    log = (lambda *a, **k: None) if args.json else print
+    log = _progress(args.json)
     # The ledger is per-RUN, not per-algorithm: sft-iso-27b exists to produce a
     # P3 verdict and had nowhere to record one.
     manifest = new_manifest("train", {
@@ -562,7 +584,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
     from .tokenizer import get_tokenizer
 
     real = args.model == "qwen38-27b"
-    log = (lambda *a, **k: None) if args.json else print
+    log = _progress(args.json)
     tok = _qwen38_tokenizer() if real else get_tokenizer(None)
     rows, eval_rows = _jsonl(args.data), _jsonl(args.eval_gsm8k)[: args.eval_n]
     thinking = (args.max_think_tokens > 0) if real else None

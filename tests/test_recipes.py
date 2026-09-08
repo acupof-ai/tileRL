@@ -174,3 +174,35 @@ def test_math_jsonl_reads_every_subject_and_writes_the_level_it_filtered(tmp_pat
     assert "1 dropped" in r.stdout, r.stdout
     # The histogram prints what was WRITTEN, which is the check the 09-05 defect lacked.
     assert "levels written: {'Level 5': 2}" in r.stdout, r.stdout
+
+
+def test_json_run_reports_progress_on_stderr_and_keeps_stdout_parseable(tmp_path, monkeypatch,
+                                                                        capsys):
+    """--json must still emit progress, and it must not go on stdout.
+
+    It used to emit none: `log` was a no-op under --json, so an eval-only run printed
+    nothing until the manifest at the end. With the eval arm writing its rows only on
+    completion, the log was the sole progress signal, and a healthy 67-minute 27B eval
+    was indistinguishable from a hung one for its whole duration
+    (errors/2026-09-08-a-silence-with-no-writer.md).
+
+    Both halves are asserted, because either alone is satisfied by the defect facing the
+    other way: silence passes "stdout parses", and printing to stdout passes "progress
+    exists" while breaking every --json caller.
+    """
+    from tilerl.cli import main
+
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path))
+    monkeypatch.setattr("sys.argv", ["tilerl", "train", "--recipe", "grpo-tiny-smoke", "--json"])
+    main()
+    cap = capsys.readouterr()
+
+    # Progress exists, and it is on stderr. `step` is the per-step line every RL run emits.
+    assert "step" in cap.err, f"--json emitted no progress on stderr: {cap.err[-400:]!r}"
+    # And stdout still yields the manifest from its first brace, which is how a caller
+    # reads it (TileLang writes cache warnings to stdout from C++, so it is not a lone
+    # object and never was).
+    m = json.loads(cap.out[cap.out.index("{"):])
+    assert m["inputs"]["recipe"] == "grpo-tiny-smoke"
+    # The progress lines must not be the thing that got parsed: no step line on stdout.
+    assert "step " not in cap.out, f"progress leaked to stdout, breaking the parse: {cap.out[:200]!r}"

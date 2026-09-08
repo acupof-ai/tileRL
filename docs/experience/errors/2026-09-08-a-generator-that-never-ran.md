@@ -113,6 +113,19 @@ that has the dataset.
 The second mutant matters separately: a loop that stops at one config would produce a file of
 the right shape with a sixth of the data, which no shape check catches.
 
+## What the file measures, now that it exists
+
+The level-5 base is **91/100 = 91.0%** at a 6144 cap. At the recipe's 2048 it read 64/100, which
+was a lower bound rather than the base: 32 completions hit that cap and 0 of those 32 scored
+correct, and rerunning exactly those 32 at 6144 gives 27 correct, 2 wrong, 3 still at the new cap.
+The full accounting and what it does to P1's target is in
+`errors/2026-09-08-a-cap-reported-as-a-base.md`.
+
+**The 45.8% (11/24) the recipe cites is 45 points low**, not the 18 I first wrote against the 64.0%
+reading. It was a 24-problem hand sample, SE 10.2 pt, so the citation should read "sample too small
+and low; measured 91.0%" wherever it is used as an expectation. It was never a property of the
+dataset.
+
 ## Rule
 
 **A stub that cannot reject is not a test of a call that can be rejected.** The existing check

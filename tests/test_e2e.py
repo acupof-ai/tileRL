@@ -46,6 +46,24 @@ from tilerl.tokenizer import ByteTokenizer
 from tilerl.train import _training_kv, opd_loop, train_step
 
 
+def _fp8_allocatable() -> bool:
+    """Whether the backend's device can hold an fp8 tensor -- allocation, not `hasattr`.
+
+    `hasattr(torch, "float8_e4m3fn")` is a property of the torch BUILD and is true on
+    every target we run. Allocation is a property of the DEVICE: on mps the same build
+    raises `RuntimeError: Undefined type Float8_e4m3fn`, so the dtype-existence guard let
+    the test run and fail on this machine while passing on cpu. A skip has to test the
+    thing that fails.
+    """
+    if not hasattr(torch, "float8_e4m3fn"):
+        return False
+    try:
+        torch.zeros(1, dtype=torch.float8_e4m3fn, device=get_backend().device)
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
 def _build_engine(seed: int, decode=None) -> Engine:
     cfg = tiny()
     model = build_random(cfg, seed=seed)
@@ -1544,8 +1562,8 @@ def test_the_fp8_kv_pool_generates_what_the_bf16_pool_does():
     at all, so the KERNEL path is card-only; the pool, the scale plane and the
     quantize/dequantize round-trip are plain torch and run here.
     """
-    if not hasattr(torch, "float8_e4m3fn"):
-        pytest.skip("this torch build has no float8_e4m3fn, so no fp8 pool can be allocated")
+    if not _fp8_allocatable():
+        pytest.skip("this device cannot allocate float8_e4m3fn, so no fp8 pool can be built")
     cfg = tiny()
     backend = get_backend()
     prompt = np.random.default_rng(4).integers(3, 320, size=40).astype(np.int64)
