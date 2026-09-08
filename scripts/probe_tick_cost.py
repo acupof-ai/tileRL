@@ -106,10 +106,21 @@ def main() -> int:
     ctx = args.gen + len(prompt) + 64
 
     def engine_for(k):
-        return build_engine(cfg, model, backend, num_slots=k, max_batch=k,
-                            num_blocks=-(-ctx // BLOCK_TOKENS) * kmax + kmax,
-                            max_total_tokens=max(ctx, 8192),
-                            decode_graph=True, prefix_store=NoPrefixStore())
+        e = build_engine(cfg, model, backend, num_slots=k, max_batch=k,
+                         num_blocks=-(-ctx // BLOCK_TOKENS) * kmax + kmax,
+                         max_total_tokens=max(ctx, 8192),
+                         decode_graph=True, prefix_store=NoPrefixStore())
+        # Sized from kmax, not k, and checked before any submit: a pool sized for the
+        # narrowest arm lets the first arms finish and looks fine, then the widest one
+        # dies mid-run with "PagedKvPool exhausted" (25 hit exactly this today, and it is
+        # the same defect it had just fixed in cli.py -- one pool, two consumers, sized
+        # for the smaller). Raise here rather than after ten minutes of card time.
+        need = k * -(-ctx // BLOCK_TOKENS)
+        if e.usable_blocks < need:
+            raise SystemExit(f"k={k} needs {need} blocks for {ctx} tokens x {k} rows and the "
+                             f"pool has {e.usable_blocks}: size it from the widest arm "
+                             f"(k={kmax}), not this one")
+        return e
 
     print(f"arm flat: {len(ks)} readings at fixed occupancy, gen {args.gen}")
     print(f"{'k':>3} {'ticks':>6} {'ms/tick':>8} {'ms/token':>9} {'compiles':>8}")
