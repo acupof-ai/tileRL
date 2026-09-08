@@ -847,19 +847,37 @@ def _finish(m: dict, as_json: bool) -> None:
         # .get, not [...]: "a gate whose metric was not evaluated passes
         # vacuously" already covers a metric set that never had the key, which
         # is what an SFT run's manifest is.
-        mmlu_floor = None if g.get("mmlu_before") is None else g["mmlu_before"] - 0.03
+        # UNITS, and they differ 13 lines apart in the writer: `mmlu_{tag}` is a
+        # FRACTION (`c / n`, :575) and `gsm8k_{tag}` is a COUNT (`c`, :588), with the
+        # denominator alongside it as `gsm8k_{tag}_total` (:590). So the roadmap's two
+        # exit numbers encode differently, and a threshold is meaningless without the
+        # units of the quantity it thresholds.
+        mmlu_floor = None if g.get("mmlu_before") is None else g["mmlu_before"] - 0.02
+        # roadmap P1: "GSM8K held-out (500 q) after - before >= +5 pt (SE ~ 2 pt)". The
+        # +5 is that noise floor, not a taste -- `after > before` is +1 question of 500
+        # = +0.2 pt, which a symmetric null passes about half the time. Derived from
+        # `_total`, never hardcoded to 25: `--eval-n` is a flag and the recipe's 500 is
+        # not a constant.
+        gsm_total = g.get("gsm8k_after_total") or g.get("gsm8k_before_total")
+        gsm_floor = (None if g.get("gsm8k_before") is None or not gsm_total
+                     else g["gsm8k_before"] + 0.05 * gsm_total)
         skipped = m["inputs"].get("steps") == 0
         after_skipped = bool(m.pop("gates_skip_after", False))
+        # `ce_falls` has no threshold on the RL path: `ce_first` is written only by the
+        # SFT loop (:281), never by the GRPO branch (:679-690), so the vacuous-pass rule
+        # below made it report `passed` over nothing on every RL run. Not measured is the
+        # honest record, and the gate stays live where the SFT path does write both.
+        unmeasured = frozenset() if g.get("ce_first") is not None else frozenset({"ce_falls"})
         m["gates"] += [
             {"name": n, "value": v, "threshold": t,
-             "skipped": skipped or (after_skipped and n in _AFTER_GATES),
-             "passed": None if skipped or (after_skipped and n in _AFTER_GATES)
+             "skipped": skipped or n in unmeasured or (after_skipped and n in _AFTER_GATES),
+             "passed": None if skipped or n in unmeasured
+             or (after_skipped and n in _AFTER_GATES)
              else v is None or t is None or ok(v, t)}
             for n, v, t, ok in (
                 ("reward_rises", g.get("reward_last"), g.get("reward_first"), lambda v, t: v > t),
                 ("mmlu_holds", g.get("mmlu_after"), mmlu_floor, lambda v, t: v >= t),
-                ("gsm8k_improves", g.get("gsm8k_after"), g.get("gsm8k_before"),
-                 lambda v, t: v > t),
+                ("gsm8k_improves", g.get("gsm8k_after"), gsm_floor, lambda v, t: v >= t),
                 ("groups_untied", g.get("tied_group_fraction"), 0.5, lambda v, t: v < t),
                 ("ce_falls", g.get("ce_last"), g.get("ce_first"), lambda v, t: v < t),
             )]
