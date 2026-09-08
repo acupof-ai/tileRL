@@ -1,6 +1,6 @@
 # The tie is at the ceiling, and level 5 is homogeneous — pass@k, 2026-09-08
 
-> Status: pending-remote (n=100 in flight; figures below are n=34 of 100)
+> Status: final, n=100 of 100.
 
 ## Context
 
@@ -17,33 +17,124 @@ per problem, one row per problem, distribution reported rather than folded into 
 
 ## What Worked
 
-**One run yields three numbers that were being estimated separately.** n=34, k=8, cap 6144,
+**One run yields three numbers that were being estimated separately.** n=100, k=8, cap 6144,
 temperature 1.0, 27B NVFP4 on one H20, sharded across four cards:
 
 | correct of 8 | problems |
 |---:|---:|
-| 0 | **4** |
-| 1 | 1 |
-| 2–3 | 0 |
-| 4 | 3 |
-| 5 | 2 |
-| 6 | 0 |
-| 7 | 5 |
-| 8 | **19** |
+| 0 | **6** |
+| 1 | 4 |
+| 2 | 2 |
+| 3 | 0 |
+| 4 | 5 |
+| 5 | 5 |
+| 6 | 4 |
+| 7 | **15** |
+| 8 | **59** |
 
-- base **210/272 = 77.2%**
-- **tied 23/34 = 67.6%** (19 at the ceiling, 4 at the floor)
-- usable 11/34 = 32.4%
+**And the tied fraction this yields is an interval, not a number.** 65 of 800 samples reached the
+6144 cap (8.1%, across 24 rows), and a truncated sample is unscored rather than wrong — so each
+row's `correct` is a lower bound and `correct + at_cap` an upper one:
 
-**The distribution is bimodal and asymmetric, and that asymmetry is the actionable part.**
-19 problems at 8/8 against 4 at 0/8: the tie is at the **ceiling**. `--prompts-per-step` is the
-lever that reaches it — 8 distinct problems tie with probability ∏pᵢ rather than one problem's
-p⁸ — and it cannot reach the floor, which is a cap or difficulty question. Had the tie been at
-the floor, that change would have been the wrong medicine.
+| reading | base | tied | ceiling | floor |
+|---|---:|---:|---:|---:|
+| as measured (truncation scored wrong) | 81.8% | **65.0%** | 59 | 6 |
+| upper bound (truncation scored right) | — | **82.0%** | 77 | 5 |
+| cap-free subset, n=76 | — | — | — | — |
 
-**32.4% "usable" is the optimistic reading.** 5 of the 11 untied problems sit at 7/8, where the
-group's std is small, the advantage is ≈±1/√7, and one step of learning promotes them to 8/8 and
-out of the usable set permanently. The robust band is 4/8–5/8: **5 problems, 14.7%.**
+The third row is deliberately empty: selecting `at_cap == 0` selects short completions, which
+selects easy problems, which selects 8/8, so that subset is **a third population rather than a
+cleaner read of the first**. On the n=70 partial it read 79.2% against an 80.0% upper bound, and
+that near-agreement is not corroboration — both estimates are biased the same way, so their
+agreement is evidence of the shared bias, not of the value.
+
+The upper bound's precondition was checked rather than assumed: **0 rows have
+`correct + at_cap > k`**, so no capped sample was ever scored correct and truncation does imply
+unscored here. Had that count been non-zero the upper bound would be wrong while still looking
+right. The degeneracy guards are clean too — **0 rows with `distinct == 1`, 0 zero-length
+completions** — so the spread is the sampler's and not an artifact of a seed that failed to vary.
+
+**What survives the 17.0-point width is the direction, and that is what the lever needs.**
+Both ends put the tie at the **ceiling** — 59 against 6, 77 against 5. `--prompts-per-step` reaches
+that end and cannot reach the floor, which is a cap or difficulty question. Had the tie been at the
+floor, that change would have been the wrong medicine, and no reading of the interval moves it
+there. **How it reaches the ceiling is not the obvious way**: the first framing was "8 distinct
+problems tie with probability ∏pᵢ rather than one problem's p⁸", and that needs one sample per
+problem — which GRPO cannot do, since its baseline is the group mean and a one-sample group has no
+defined advantage. The real shape is `group = prompts × completions` with the tie still computed per
+prompt, so fewer completions makes **each group tie more often** and the entire gain comes from a
+step having several groups, only one of which must be untied. Opposite direction, different
+mechanism, same conclusion — see the pricing below.
+
+**And the deeper reason the direction is what matters:** the 8 samples come from *one* problem, so
+a ceiling tie is a statement about **within-group correlation**, not about the task being too easy.
+A harder dataset does not fix it — a hard problem sampled 8 times ties at the *floor* and carries
+no gradient either. Difficulty is a property of the task; tie mass is a property of this model's
+hesitation on it, and the two were being treated as one quantity when level 5 was selected.
+
+**The magnitude does not survive, and a three-band decision criterion consumes the magnitude.**
+65.0% and 82.0% fall in different bands of the criterion a peer built on the first point estimate,
+so this reports the interval rather than a band. The width is systematic, not statistical: n=70 →
+n=100 moved the lower bound 61.4% → 65.0% (+3.6 pt against SE 5.7, z=0.63 — noise) while the width
+barely moved, 18.6 → 17.0. **More problems shrink only the sampling error.** Only a rerun of the 24
+contaminated rows at a higher cap narrows it, and the agreed plan is to fold that into the post-
+`--prompts-per-step` re-measurement at **cap 12288** rather than spend four cards on it now.
+
+**"Usable" is the optimistic reading twice over, and more so at n=100.** 15 of the 35 untied rows
+sit at 7/8, where the group's std is small, the advantage is ≈±1/√7, and one step of learning
+promotes them to 8/8 and out of the usable set permanently. The robust 3/8–5/8 band is **10
+problems, 10%** — against 35% nominal usable.
+
+**The floor is difficulty, not degeneration.** Of the 6 rows at 0/8: **4 have `at_cap = 0`,
+`distinct = 8`, lengths 369–1788** — the model finished and was wrong; **1 is 8/8 capped**
+(6144–6144, the cap's verdict rather than the policy's); **1 is mixed** (i=92, 3 of 8 capped,
+4814–6144). So `--prompts-per-step` genuinely cannot help that end, but nothing there is a loop.
+
+## What the distribution prices: `--prompts-per-step` is 1.21x, not a cure
+
+The lever this measurement was taken to justify can be priced from the same rows, because the 8
+samples of a problem are **exchangeable** — `correct` is a sufficient statistic, so a group of
+`comp < 8` is obtained by drawing `comp` of the real samples without replacement. No model of
+per-problem difficulty is needed.
+
+A step is gradient-free only if **every** prompt's group ties, and prompts are drawn independently,
+so `step_tied = q_comp ^ prompts`:
+
+| split | per-group tie `q_comp` | step gradient-free | steps with gradient | vs 1×8 |
+|---|---:|---:|---:|---:|
+| 1 × 8 (today) | 0.6496 | 0.6496 | **35.0%** | 1.000x |
+| **2 × 4** | 0.7621 | 0.5807 | **41.9%** | **1.197x** |
+| 4 × 2 | 0.8715 | 0.5769 | 42.3% | 1.208x |
+
+**2×4 captures essentially all of it** — per-group tie rises almost as fast as the group count, so
+4×2 buys 0.4 more points. And the ceiling is **1.21x**, an order of magnitude short of what the
+65% tie fraction suggests on sight: removing a tie from a group does not remove it from the step.
+
+**The measured `q_comp` matters, and the first pricing used an interpolated one.** Substituting
+`p_i = correct_i/8` into `E[p^comp + (1-p)^comp]` gives 0.7229 / 0.7955 / 0.8875 — high at every
+`comp`, because a problem observed at 8/8 has a true `p < 1` and the interpolation reads it as 1.
+That was noted as a bias with the argument that a *ratio* would survive it. It does not: the bias
+is **−0.073 / −0.033 / −0.016**, shrinking monotonically in `comp`, so it inflates the numerator
+more than the denominator and the ratio comes out **1.37x instead of 1.21x**. A bias that varies
+with the quantity it biases does not cancel in a ratio, and "all three are high in the same
+direction" is not sufficient for it to. The `comp = 8` row is the control: measured 0.6496 against
+this run's 0.650 tied fraction, agreeing to 0.0004.
+
+`q_comp ^ prompts` was checked rather than assumed — `E[X]^g ≠ E[X^g]` in general, and these
+problems are wildly heterogeneous. An empirical resample of actual problems gives 0.6337 against
+the formula's 0.6328. It holds because prompts are drawn *independently*: heterogeneity inflates
+the variance of the estimate, not its expectation.
+
+**And the re-measurement's prediction is fixed here, before the change lands.** At cap 12288 with
+2 × 4: per-group tie **≈ 0.762**, step gradient-free **≈ 0.581**. A measured per-group tie
+materially above 0.80 means the prompts in a step are not independent (correlated difficulty within
+a batch); between 0.76 and 0.80 is the gap between the measured and interpolated estimators and is
+not a failure. One confound the prediction cannot resolve: raising the cap to 12288 also un-ties
+floor problems (2 of the 6 here have capped samples), which lowers tie for a reason unrelated to
+the split — so the re-measurement must run **1×8 at 12288 as well**, or the two effects arrive as
+one number. **And both arms have to run in one sitting on one revision.** Measuring the 1×8 baseline
+now and the treatment after the change would trade a cap confound for a version confound —
+`group_advantages`, the empty-rollout fix and the pool fix all land in between.
 
 ## Length distribution: level 5 is homogeneous, and GSM8K may not be a fair comparison
 
@@ -52,9 +143,9 @@ waits:
 
 | population | occupancy | pooled idle | backfill ceiling |
 |---|---:|---:|---:|
-| GSM8K (another session's probe, same 6144 cap, k=8) | **0.2547** | 74.5% | 2.17x |
-| **level 5, all problems** | 0.728 | 27.2% | 1.39x |
-| **level 5, no sample at cap (26 of 34)** | **0.696** | 30.4% | **1.42x** |
+| GSM8K (another session's probe, same 6144 cap, k=8) | **0.2547** | 74.5% | 1.89x |
+| **level 5, all problems** | 0.706 | 29.4% | 1.33x |
+| **level 5, no sample at cap (76 of 100)** | **0.679** | 32.1% | **1.34x** |
 
 Both columns are `Σlen / Σ(max_in_group × k)` at k=8, where a group is one problem's k samples —
 the GRPO group itself, so no regrouping was needed. **The first version of this table put 0.696
@@ -65,28 +156,36 @@ not 1.8x**. Occupancy also depends on k: doubling the group roughly halves it, s
 faster than `Σlen`.
 
 The cap-free and all-in figures differ by **0.032**, so clamping is not what makes level 5 look
-homogeneous — the ratio is real. Stable across n=16/23/34, no drift with sample size. Note the
+homogeneous — the ratio is real. Stable across n=16/34/70/100, no drift with sample size. Note the
 sign: here excluding capped problems *lowers* occupancy, because a problem whose every sample hits
 the cap has zero within-group spread (one such problem reads exactly 1.000). On GSM8K the same
 exclusion moves it the other way, since there the capped rows are long *steps* whose idle was
 already high.
 
 **Consequence for two tail levers, both priced on GSM8K.** The ceiling is not `1/occupancy`:
-`wall = a + b·max + c·sum` with measured `b = 8.83 ms/tick`, `c = 3.705 ms/row/tick`, and backfill
-only removes the `max` term — `c·sum` is the per-row KV cost and survives it. So the ceiling is
-`(b·(max/sum) + c)/c`, giving **2.17x on GSM8K** (against 1.67x measured over 20 steps — a 77%
-capture) and **1.42x on level 5 at k=8, 1.21x at k=16**. Backfill on level 5 therefore prices at
-**1.05–1.10x**, and **is not worth doing there**.
+`wall = a + b·max + c·sum`, and backfill only removes the `max` term — `c·sum` is the per-row KV
+cost and survives it. So the ceiling is `(b·(max/sum) + c)/c`, and since `max/sum = 1/(occupancy·k)`,
+a task's occupancy sets it. GSM8K's revised measurement is **1.54x against a 1.89x ceiling** (an
+81% capture), which implies `b/c = 1.813`; the same ratio on level 5's `max/sum = 0.188` gives
+**1.34x**. Backfill on level 5 therefore prices at roughly **1.05–1.10x**, and **is not worth doing
+there**.
+
+The k=16 figure the first version of this entry carried (1.21x) is withdrawn rather than restated.
+It came from "occupancy roughly halves when k doubles", and that shorthand is *exactly* the
+statement that `1/(occupancy·k)` is invariant — so it cannot also move the ceiling. The true
+direction is that group max grows sublinearly in k while `Σlen` grows linearly, so `max/sum` and the
+ceiling both fall; the magnitude needs a k=16 run, which has not been done.
 
 My first estimate of 1.19x was wrong three ways at once: a mid-run 1.53x instead of the final
-1.67x, `1/occupancy` as the ceiling (which assumes tick cost is independent of occupancy, and `c`
+figure, `1/occupancy` as the ceiling (which assumes tick cost is independent of occupancy, and `c`
 is the counterexample), and a capture ratio derived by dividing those two wrong numbers. **The two
 tail-driven levers largely disappear on the candidate task**, leaving batch (1.31x) and kernel
 work — a re-ranking, not a correction.
 
-**And the GSM8K half is pending.** 28 of 272 level-5 samples reached the 6144 cap (10.3%) against
-GSM8K showing a row ≥5000 tokens in 12 of 18 steps (66.7%) — **2.9x more, on the easier task with
-100–150-token reference answers.** That asymmetry rules out "the model is simply verbose at this
+**And the GSM8K half is pending.** 65 of 800 level-5 samples reached the 6144 cap (8.1%) against
+GSM8K showing a row ≥5000 tokens in 12 of 18 steps (66.7%) — **8.2x more, on the easier task with
+100–150-token reference answers.** (n=100; the n=34 partial read 10.3%, so the direction is stable.)
+That asymmetry rules out "the model is simply verbose at this
 cap", since the harder task would then truncate more, not less. Degeneration on GSM8K is under
 test by another session; if confirmed, **0.414 is a defect's fingerprint rather than a task
 property**, and the right move is to drop that half of the comparison rather than reprice it.
@@ -112,8 +211,16 @@ gives 40.7%** — 2.7x from the ordering alone, and sorting by length before gro
 the moment that decides whether GRPO learns is the mass at 0/k and k/k. A dataset labelled harder
 can be tied *more*: level 5 is 91.0% where GSM8K is 88.0%.
 
-**Which end the tie sits at picks the fix.** Ceiling ties yield to more prompts per step; floor
-ties do not, and no amount of regrouping helps a problem the policy cannot solve.
+**Which end the tie sits at picks the fix, but the fix's mechanism is not the obvious one.**
+Ceiling ties yield to more prompts per step; floor ties do not, and no amount of regrouping helps a
+problem the policy cannot solve. And regrouping does not work by making a group harder to tie —
+GRPO's baseline is the group mean, so completions cannot drop to one — it works by putting several
+groups in a step when only one needs to be untied. Each group ties *more*; the step ties less.
+
+**A bias with a consistent sign does not cancel in a ratio unless its magnitude is proportional.**
+The interpolated `q_comp` was high at every `comp` and the ratio was still wrong by 0.16x, because
+the bias shrank monotonically in `comp` — largest on the numerator. "All the terms are biased the
+same way" is an argument about sign; a ratio needs one about magnitude.
 
 **A length-distribution figure is a property of a dataset, not of the model.** Every tail lever
 priced on one task needs its ceiling recomputed on the task it will run on — from the cost model,
@@ -132,7 +239,7 @@ is not a property of the length distribution" is.
 
 | date | commit | machine | target | model | n | k | base | tied | usable | occupancy (cap-free) |
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|
-| 2026-09-08 | 2f25f26 | H20 ×4 | cuda | Qwen3.8-27B NVFP4 | 34 | 8 | 77.2% | 67.6% | 32.4% | 0.696 |
+| 2026-09-08 | 2f25f26 | H20 ×4 | cuda | Qwen3.8-27B NVFP4 | 100 | 8 | 81.8% | 65.0–82.0% | 35.0% | 0.679 |
 
 `occupancy` is `Σlen/Σ(max·k)` over problems with no sample at the cap, k=8, groups being the
 problems themselves.
