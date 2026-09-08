@@ -3841,3 +3841,34 @@ def test_retiring_a_shared_entry_removes_it_for_every_row(tmp_path):
     assert store.stats()["superseded"] == 1 and store.stats()["evictions"] == 0, (
         f"a retire was counted as eviction pressure: {store.stats()}"
     )
+
+
+def test_an_unknown_model_name_is_refused_not_silently_tiny():
+    """``_build_model`` dispatched on the name and fell through to ``tiny`` for anything
+    else, so a typo, a different capitalization, or a checkpoint PATH each built a random
+    64-hidden 2-layer model and the run finished with a table that reads like the 27B.
+
+    Six scripts pass a user-supplied ``--model`` straight to it with no argparse ``choices``
+    (``prof_forward_memory``, ``prof_grpo_step``, ``prof_backward_ops``,
+    ``probe_pad_histogram``, ``recapture_correctness``, ``recapture_arms``), which is why the
+    refusal is at this seam rather than in each of them.
+    """
+    from tilerl.cli import MODEL_NAMES, _build_model
+
+    for bad in ("qwen38_27b", "Qwen38-27B", "/data00/models/Qwen3.8-27B-NVFP4", "27b", ""):
+        with pytest.raises(ValueError, match="unknown model"):
+            _build_model(bad, seed=0)
+
+    # The negative control the refusal needs: every live name still builds, and builds the
+    # config it names. Without it this passes on a `_build_model` that refuses everything,
+    # which is the same defect with the sign flipped.
+    built = {n: _build_model(n, seed=0)[0] for n in MODEL_NAMES if n != "qwen38-27b"}
+    assert built["tiny"].name == "tiny" and built["tiny"].hidden_size == 64
+    assert built["tiny-agent"].name == "tiny-agent"
+    assert built["tiny-agent"].max_position_embeddings == 65536, (
+        "tiny-agent is tiny at a 65536 position budget; if this reads 512 the name resolved "
+        "to plain tiny and the two names are indistinguishable"
+    )
+    # Not built here -- it needs the checkpoint -- but it must be ADMITTED, or the guard
+    # would refuse the only name the pod runs.
+    assert "qwen38-27b" in MODEL_NAMES
