@@ -176,7 +176,11 @@ def test_grpo_length_buckets_preserve_real_token_loss_and_gradients(monkeypatch)
                  for i, n in enumerate((longest, longest // 2))}
         requests = iter(comps)
         engine = SimpleNamespace(
-            _decode_graph_on=False, _prefix=NoPrefixStore(),
+            # usable_slots, not a getattr default in the guard: `_require_group_fits`
+            # refuses an engine narrower than the group, and a default would make it
+            # pass for every stub -- the capability-check trap `_require_on_policy`
+            # documents. 2 is what this stub stands in for, one slot per rollout.
+            _decode_graph_on=False, _prefix=NoPrefixStore(), usable_slots=2,
             submit=lambda p, s: next(requests), step=lambda: None, poll=lambda: comps,
         )
         captured = []

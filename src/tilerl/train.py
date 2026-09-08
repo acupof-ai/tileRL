@@ -373,6 +373,34 @@ def _require_on_policy(
                          "prefix serves KV from the old policy")
 
 
+def _require_group_fits(engine: Any, group: int) -> None:
+    """Refuse an engine narrower than the group it will be handed.
+
+    `grpo_loop` submits the whole group before draining, and an engine with fewer
+    usable slots neither raises nor drops: the excess queues into later ticks
+    (`Engine.__init__` documents this on the max_batch mismatch), so a group of 16
+    into 8 slots is two waves of 8. That halves the rows per tick, and on sm90 the
+    rows per tick are what fill the tensor core -- wgmma's M granularity is 16, so a
+    16-wide group run as two 8s sits at 50% fill and reports the wall clock of a
+    narrow batch.
+
+    This raises rather than warns because the failure fabricates a refutation: an
+    experiment asking "does a wider group help" gets "it does not", with no visible
+    reason. A warning is the wrong instrument for a defect whose symptom is a wrong
+    conclusion. Reads `usable_slots`, not `max_batch`, because the slot is the
+    resource a request holds from submit to finish.
+    """
+    if engine.usable_slots < group:
+        raise ValueError(
+            f"group={group} into an engine with {engine.usable_slots} usable slots: "
+            f"the rollout submits the whole group at once and the excess QUEUES rather "
+            f"than raising, so this would run "
+            f"{-(-group // engine.usable_slots)} waves of at most "
+            f"{engine.usable_slots} and report a narrow batch's wall clock. Pass "
+            f"num_slots >= {group} to build_engine (it adds the decode graph's pad row "
+            f"itself), and size num_blocks for {group} rows, not 8")
+
+
 def untruncated(sampling: Any) -> Any:
     """The sampler the policy gradient is actually taken under. ``rl_step`` scores
     with the full softmax, so a truncated or tempered rollout draws from one
@@ -425,6 +453,7 @@ def grpo_loop(
     on: the advantage is computed within a group on one prompt, so pairing has to
     survive to the row level or prompt difficulty confounds it."""
     _require_on_policy(engine, recapture_graph, clear_prefix)
+    _require_group_fits(engine, group)
     if recapture_graph or clear_prefix:
         # Whatever the engine cached before this loop was built under other weights.
         engine.invalidate_weights()
