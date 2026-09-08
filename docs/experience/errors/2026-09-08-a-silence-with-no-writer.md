@@ -118,3 +118,27 @@ nothing to do with the program's own progress output.
 **Before fixing a silence, find the writer.** I went from "the log is empty" to "stdout must be
 buffered" without checking whether anything writes to it. One grep — `log = (lambda …) if
 args.json` — was the whole answer, and it was upstream of every measurement I then took.
+
+## A second guard that tested the build, not the device
+
+Found while running the suite for this branch, unrelated to it and older than it:
+`test_the_fp8_kv_pool_generates_what_the_bf16_pool_does` has always failed on `metal` with
+`RuntimeError: Undefined type Float8_e4m3fn` at `kv_cache.py:97`. Its skip read
+
+```python
+if not hasattr(torch, "float8_e4m3fn"):
+```
+
+**`hasattr` is a property of the torch BUILD; allocation is a property of the DEVICE.** The
+build has the dtype on every target we run, so the guard passed everywhere, and on mps the
+allocation one line later raises. Confirmed pre-existing: the same test fails on `metal` and
+passes on `cpu` at `ac41db4`, which carries none of this branch's changes.
+
+It was invisible because CI runs `TILERL_TARGET=cpu` only, and the local metal run is the only
+place the difference appears. Now guarded by attempting the allocation on
+`get_backend().device`, which skips on metal and still runs on cpu — checked both ways, because
+a skip guard that is too broad passes by testing nothing.
+
+**Same shape as the entry above.** Both are a check that reads an adjacent property: `hasattr`
+for "can this device hold it", and a log's byte count for "is this process alive". The adjacent
+property was available and cheap, and answering it felt like answering the question.

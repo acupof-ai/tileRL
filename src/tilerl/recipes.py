@@ -35,6 +35,13 @@ RECIPES: dict[str, dict] = {
     # the \boxed{} and 5 of the first 6 steps tied at the FLOOR with reward 0.
     # eval_max_new_tokens is explicit for the same reason gsm8k's is: scoring at the
     # 512 rollout cap would measure the cap (errors/2026-09-04-the-eval-cap-measured-itself.md).
+    # 2048 is STILL measuring the cap on level 5, measured 09-08 on the level-5 file, n=100:
+    # 64/100 = 64.0%, but 32 completions hit 2048 and 0 of those 32 are correct, while 64 of
+    # the 68 that terminated are (94.1%). Longest natural completion 1889, so the gap 1889-2048
+    # is empty and those 32 are truncated mid-derivation, scored wrong. A cap raise is pending
+    # the 6144 rerun of exactly those 32 -- do not set it from a guess, and do not read a
+    # tied-group fraction under 2048: 32% constant all-wrong inflates it by an unattributable
+    # amount (errors/2026-09-08-a-generator-that-never-ran.md).
     "grpo-math-27b": dict(
         model="qwen38-27b", rl=True, steps=100, group=8, max_new_tokens=2048, lora_rank=16,
         micro=1, max_think_tokens=0, reward="boxed", eval_mmlu=1000, eval_n=500, lr=1e-4,
