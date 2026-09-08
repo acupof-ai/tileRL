@@ -111,6 +111,50 @@ def test_the_graphs_padding_row_is_not_taken_from_the_callers_capacity():
     assert len(set(ids)) == n and on.stats()["slots_used"] == n
 
 
+def test_submitting_past_usable_slots_queues_rather_than_raising():
+    """The warning at engine.py:402 must describe what over-subscription does.
+
+    Its text said ``submit raises beyond it``. It does not: ``submit`` checks
+    only the prompt, the stop texts, ``max_total_tokens`` and the KV pool, and
+    the slot is taken in ``_admit``, which returns False on ``free_slots < 1``.
+    So the excess queues. That is the worst of the three possible behaviours for
+    a benchmark arm, because a raise kills the run and a drop shows in the
+    counts, while queuing produces a table that looks finished at half the
+    intended concurrency. Asserted rather than described: the same file's
+    ``slots are taken at admission now, not in submit`` had been true for a
+    while and the warning three hundred lines up still said raise.
+    """
+    cfg, backend = tiny(), get_backend()
+    usable, over = 4, 8
+    prompt = torch.randint(0, cfg.vocab_size, (8,),
+                           generator=torch.Generator().manual_seed(5)).tolist()
+    params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=0)
+
+    def run(num_slots):
+        e = build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=64,
+                         num_slots=num_slots, max_batch=over, max_total_tokens=1024)
+        assert e.usable_slots == num_slots
+        ids = [e.submit(prompt, params) for _ in range(over)]  # no raise past the slots
+        assert len(set(ids)) == over
+        widths, done = [], set()
+        for _ in range(64):
+            e.step()
+            widths.append(e.stats()["slots_used"])
+            done |= set(e.poll())
+            if len(done) == over:
+                break
+        return set(ids), done, max(widths)
+
+    ids, done, peak = run(usable)
+    # Every row ran -- queued, not dropped -- and never more than usable at once.
+    assert done == ids, f"{len(done)} of {over} finished"
+    assert peak == usable, f"peak concurrency {peak} != {usable}"
+    # Negative control: the slot count is what bound it, not the planner or the
+    # prompt. With room for all 8 the same submits run at width 8.
+    _, wide_done, wide_peak = run(over)
+    assert len(wide_done) == over and wide_peak == over, f"control peaked at {wide_peak}"
+
+
 def test_the_kv_guard_measures_usable_capacity_not_the_pool():
     """``submit``'s KV guard must compare against capacity net of the pad row.
 
