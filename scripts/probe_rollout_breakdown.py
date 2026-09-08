@@ -66,6 +66,15 @@ changes. Two outcomes, and they cannot both be true:
 
 Run both arms. A breakdown from the un-synced arm alone is not evidence.
 
+**A warm step is one with zero compiles, not one that is not the first.** This pooled
+`rows[1:]` and called it warm; that is an assumption about where JIT lands, and 25
+measured an arm on 2026-09-08 whose step 1 compiled 40 kernels -- the convention held by
+luck there, and the summary would have looked identical if it had not. `backend._kernels`
+is keyed on `(name, args, kw)`, so a compile is exactly one new entry, and the count is
+now a gate: any compile after step 0 refuses the run instead of pooling it. A rollout that
+reaches a new decode width mid-run compiles mid-run, which is exactly the case a
+first-step convention cannot see.
+
 ONE ARM PER PROCESS. The 2.6x rollout gap was build order inside one process -- two
 engines built in one process, and the second one degraded. This script builds one.
 
@@ -208,6 +217,7 @@ def main() -> int:
     rows = []
     for step in range(args.steps):
         ph = _Phases(engine)
+        k0 = len(backend._kernels)
         t0 = time.perf_counter()
         ids = [engine.submit(prompt, SamplingParams(max_new_tokens=args.gen,
                                                     seed=step * args.group + g))
@@ -227,13 +237,24 @@ def main() -> int:
             f"made exclusive, so _PARENT is missing an edge. inclusive={dict(ph.t)}"
         )
         rows.append({"step": step, "wall_s": wall, "tokens": ntok, "tok_s": ntok / wall,
-                     "phases": acc, "calls": dict(ph.n), "sync_forward": args.sync_forward})
+                     "phases": acc, "calls": dict(ph.n), "sync_forward": args.sync_forward,
+                     "compiles": len(backend._kernels) - k0})
         print(f"step {step}: {wall:8.3f} s  {ntok:6d} tok  {ntok / wall:7.2f} tok/s")
         for k, v in sorted(acc.items(), key=lambda kv: -kv[1]):
             print(f"    {k:<18} {v:8.3f} s  {100 * v / wall:5.1f}%")
 
     # Step 0 carries the capture and the JIT; the pooled row drops it, as #109's arms did.
+    # Dropping the first step is an ASSUMPTION that every compile lands there, not a check:
+    # 25 measured a B=16 arm whose step 1 compiled 40 kernels, where the convention happened
+    # to suffice by luck. The count below is what makes it a check.
     pooled = rows[1:] or rows
+    warm_compiles = sum(r["compiles"] for r in pooled)
+    if warm_compiles:
+        raise SystemExit(
+            f"{warm_compiles} kernels compiled after step 0, so the pooled rate includes "
+            "codegen. Dropping the first step is not evidence that JIT is done -- only a "
+            "zero count is."
+        )
     w = sum(r["wall_s"] for r in pooled)
     tot = sum(r["tokens"] for r in pooled)
     ceiling = _ceiling_tok_s(args.group)
