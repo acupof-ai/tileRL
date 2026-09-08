@@ -74,6 +74,45 @@ tasks — and the gate fails from 1.0 up, where the merge stops moving the weigh
 mutant that survived was inside the parameter's flat region, not outside the gate's
 sensitivity.** #284's claim is right about the direction and wrong to imply a gap.
 
+## The control arm had no gate, and the reason to give it one is not the obvious one
+
+Every verdict above is relative to `average_merge`, which had no gate of its own. Two
+findings from closing that, both refuting the reasoning that motivated it.
+
+**The proposed gate does not work.** "Averaging beats the base on both tasks" is **true**
+for an average that saw only specialist A: A 14.945, B 21.941 against the base's own
+21.990 — ahead by **0.049**. It passes exactly the way the `or` above passed, one layer
+down, and for the same reason: comparing against the base is a low bar.
+
+What separates them is the **balance** of the two gains, not their sign:
+
+| arm | gain A | gain B | ratio |
+|---|---:|---:|---:|
+| avg(A,B) | 3.875 | 4.440 | **1.1x** |
+| avg(A) only | 7.390 | 0.049 | **150.1x** |
+| avg(B) only | 0.044 | 8.425 | **190.4x** |
+
+Two decades between the real average and either degenerate one, so the 3x threshold is a
+wide band rather than a value fitted to these numbers.
+
+**And a broken control does not flatter the treatment.** That was the premise — a
+degenerate control makes ISO's win easier, so the dangerous failure direction is downward.
+Measured with `average_merge` mutated to take the first specialist only, the ISO gate went
+**red**:
+
+| control | A | B | iso ≤ A? | iso ≤ B? | and-gate |
+|---|---:|---:|---|---|---|
+| avg(A,B), correct | 18.460 | 17.550 | yes | yes | pass |
+| avg(A) only | 14.945 | 21.941 | **NO** | yes | **fail** |
+| avg(B) only | 22.291 | 13.565 | yes | **NO** | **fail** |
+
+The direction is **per-task**: a collapsed control is easier to beat on the task it dropped
+and *harder* on the task it kept, because that arm moves all the way to the specialist,
+which beats any merge on its own task. So a broken control turns ISO's gate red on a merge
+that is fine, and the failure reads as an ISO regression. That is a worse outcome than the
+premise, not a milder one — and a one-task reading of the same data gives whichever answer
+the reader's task happened to be.
+
 ## Rule
 
 **A gate quoting a spec must copy the spec's quantifier.** "Each of two" became "either of
@@ -90,4 +129,28 @@ defect. Tightening would have made the gate fail on a working merge.
 **A test that only compares against the base is weaker than it looks.** Both surviving
 degenerate merges beat the base on at least one task; the base is a low bar. Averaging is the
 comparison that has teeth, which is why the roadmap names it, and it only has teeth on both
-tasks at once.
+tasks at once. **The same bar failed twice in one round** — the base admitted the collapsed
+ISO merge, and it also admitted the collapsed *average*, at a margin of 0.049.
+
+**A control arm needs its own gate, and it is not enough for it to move in the right
+direction.** `average_merge` gates ISO's whole verdict and had nothing checking it. What it
+needs is not "better than the base" — a control that lost half its inputs passes that — but
+a property that only a *balanced* control has.
+
+**Name a failure's direction by enumerating it, not by arguing it.** The premise for gating
+the control was that a broken control flatters the treatment. It does the opposite: a
+collapsed control turns ISO's gate red on a merge that is fine, because the direction is
+per-task — easier on the task dropped, harder on the task kept. One task's worth of data
+supports either conclusion, which is how the wrong one got stated confidently. Two arms ×
+two tasks settled it in one run.
+
+**A threshold's credibility is the gap it sits in, not the value.** 3x separates 1.1x from
+150x. Had the degenerate ratios been 4x, the same threshold would be a number fitted to the
+sample, and the honest move would be to say the gate does not separate them.
+
+## Status
+
+The ISO merger's CPU exit criterion is met with the tightened gate: the smoke checks
+(self-merge, Σ₀) pass by construction, and two tiny specialists each keep their task better
+than plain averaging — 15.995 vs 18.460 on A, 14.726 vs 17.550 on B. The pod half (two 27B
+specialists, beat TIES and DARE, MMLU flat) is unaffected and still needs a card.
