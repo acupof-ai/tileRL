@@ -1014,6 +1014,51 @@ def test_the_ssd_flag_reaches_the_store_and_the_fingerprint_covers_the_config(tm
     assert os.path.isdir(os.path.join(str(tmp_path), "tilerl_kvtier"))
     assert tier._fingerprint == _weight_fingerprint(cfg)
 
+    # `ssd_fingerprint` overrides that derivation, and nothing in the tree passes it: it is
+    # the hatch for two checkpoints of ONE architecture sharing a spill dir, where the
+    # shape-derived fingerprint is identical and the tier would serve the other model's KV.
+    # Unexercised is indistinguishable from broken, and the failure it prevents is silent
+    # wrong inference, so the override is asserted to (a) arrive and (b) still separate.
+    from tilerl.engine import build_engine as raw_build
+
+    shared = tmp_path / "shared"
+    pinned = raw_build(cfg, model, get_backend(), num_blocks=64, num_slots=2,
+                       max_total_tokens=256, ssd_path=str(shared),
+                       ssd_fingerprint="checkpoint-a")
+    assert pinned._prefix._ssd._fingerprint == "checkpoint-a", (
+        "ssd_fingerprint did not reach KvTier, so one spill dir serving two checkpoints "
+        "of the same shape has no way to keep them apart"
+    )
+    # The separation below is a NEGATIVE claim, so it needs bytes on disk to be about
+    # anything: with an empty directory `recovered == 0` holds however the fingerprint is
+    # computed. Measured -- with only the assert above neutered, dropping the `or` in
+    # build_engine still passed. So spill one entry, prove it landed, and prove a
+    # same-fingerprint reopen adopts it before asking whether the other name does not.
+    pinned_tier = pinned._prefix._ssd
+    pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
+    toks_fp = list(range(4 * BLOCK_TOKENS))
+    blocks_fp = [pool.alloc_block() for _ in range(4)]
+    assert PrefixStore(pool, ssd=pinned_tier).insert(
+        toks_fp, blocks_fp, (torch.randn(3, 4, 8, 8), torch.randn(3, 2, 16)))
+    _flushed(pinned_tier)
+    assert pinned_tier.stats()["ssd_entries"] == 1, (
+        f"nothing reached disk (offered={pinned_tier.offered} "
+        f"refusals={pinned_tier.refusals}), so both arms below read as a cold start"
+    )
+    # Positive control: the override is what a matching reopen matches ON.
+    assert KvTier(str(shared), "checkpoint-a").recovered == 1, (
+        "a tier reopened under the same override adopted nothing, so the negative arm "
+        "below cannot tell a working fingerprint from an empty directory"
+    )
+    # And it must still be the thing _recover compares: the same directory under the other
+    # checkpoint's name adopts nothing. Same cfg both times, so the derived fingerprint is
+    # equal and only the override can separate them.
+    other = KvTier(str(shared), "checkpoint-b")
+    assert other.recovered == 0, (
+        f"a tier opened as checkpoint-b adopted {other.recovered} entries written under "
+        "checkpoint-a: the override is forwarded but not enforced"
+    )
+
     # The KV STORE FORMAT is in the fingerprint too, and unlike a config field it is not a
     # dataclass field, so the loop above cannot reach it. Two spilled formats in one
     # directory is a live crash: a bf16 pool adopting an fp8 blob reaches `index_copy_` and
@@ -1023,7 +1068,6 @@ def test_the_ssd_flag_reaches_the_store_and_the_fingerprint_covers_the_config(tm
     # returns 0 entries, which is byte-identical to a cold start -- so a silent
     # non-adoption reads as a cache miss, and a bench then reports a cold number with no
     # visible cause. `recovered` and the surviving files are what separate them.
-    from tilerl.kv_cache import KvTier
 
     def _seed(root, fp):
         KvTier(root, fp)  # writes the marker, as the run that spilled would have

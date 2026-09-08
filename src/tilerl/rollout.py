@@ -36,7 +36,7 @@ import time
 from typing import Any
 
 __all__ = ["free_port", "sandbox_settings", "sandbox_available", "serve_app",
-           "serve_background", "run_rollout", "read_records"]
+           "run_rollout", "read_records"]
 
 
 def free_port() -> int:
@@ -117,8 +117,8 @@ def serve_app(app: Any, host: str = "127.0.0.1", port: int | None = None,
               timeout_s: float = 60.0) -> tuple[str, threading.Thread]:
     """Run any ASGI app on a daemon thread; return (base_url, thread) once it accepts.
 
-    Split out from :func:`serve_background` so a test can serve a scripted
-    engine over a real socket -- the launcher's gate must not need weights.
+    A test serves a scripted engine over a real socket through here -- the
+    launcher's gate must not need weights.
     """
     import uvicorn
 
@@ -134,22 +134,6 @@ def serve_app(app: Any, host: str = "127.0.0.1", port: int | None = None,
         except OSError:
             time.sleep(0.05)
     raise TimeoutError(f"server did not accept connections on port {port} within {timeout_s}s")
-
-
-def serve_background(model: str = "tiny-agent", host: str = "127.0.0.1",
-                     port: int | None = None) -> tuple[str, Any, threading.Thread]:
-    """Start the tileRL server on a daemon thread; return (base_url, engine, thread)."""
-    from tilerl_kernels.backend import get_backend
-
-    from .cli import _build_engine, _build_model
-    from .server import create_app, get_tokenizer
-
-    cfg, model_obj = _build_model(model, seed=0, fuse_projections=True)
-    engine = _build_engine(cfg, model_obj, get_backend())
-    app = create_app(engine, get_tokenizer(), model_name=cfg.name)
-    engine.run()
-    base, thread = serve_app(app, host, port)
-    return base, engine, thread
 
 
 def run_rollout(task: str, cwd: str, base_url: str, tag: str, *, sandbox: bool = True,

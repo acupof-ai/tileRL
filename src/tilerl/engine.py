@@ -252,7 +252,6 @@ class _DecodeGraph:
     H2D copies of the inputs plus one replay. Replay mutates the engine's own
     pools like the eager path; warmup writes to block 0 / slot 0 are overwritten
     before any real request reads them.
-    # ponytail: no recapture after training — the graph bakes the f32 embed cast.
     """
 
     def __init__(self, model, backend, kv_pool, state_pool, batch_size, width=1, pool=None,
@@ -828,10 +827,6 @@ class Engine:
         if t is not None:
             t.join(timeout)
         self._thread = None
-
-    def is_idle(self) -> bool:
-        with self._lock:
-            return not self._waiting and not self._running
 
     def stats(self) -> dict[str, Any]:
         """Lock-free while the loop thread runs; a fresh build when it does not."""
