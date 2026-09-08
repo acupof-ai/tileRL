@@ -394,18 +394,28 @@ class Engine:
                 pass  # pools sized without the spare: fall back to exact-size graphs
         self._graph_pool = None
         # A slot is held from submit() to finish, so usable_slots -- not max_batch --
-        # is the real concurrency ceiling: below it, `submit` raises before a row can
-        # ever be admitted, and _build_plan's max_batch is unreachable. Warn rather
-        # than clamp, because a test that submits two rows into a 2-slot pool with the
-        # default max_batch=8 is a legitimate config, not a mistake.
+        # is the real concurrency ceiling, and _build_plan's max_batch is unreachable.
+        # The excess QUEUES: `submit` has no slot check and `_admit` returns False on
+        # `free_slots < 1`, so a B=8 submit into 4 usable slots runs two waves of 4 --
+        # no raise, no drop, a table with twice the ticks and half the rows per tick.
+        # Warn rather than clamp, because a test that submits two rows into a 2-slot
+        # pool with the default max_batch=8 is a legitimate config, not a mistake.
         if self.usable_slots < limits.max_batch:
+            # The remedy names `num_slots`, the parameter the reader passes. Naming the
+            # pool instead is what made the old "+ 1 for the pad row" get applied to a
+            # build_engine call that already adds it -- the misread this message caused.
+            remedy = f"pass num_slots >= {limits.max_batch} to build_engine"
+            if self._pad_slot is not None:
+                remedy += " (it adds the decode graph's pad row itself)"
             warnings.warn(
                 f"{self.usable_slots} usable state slots against max_batch="
                 f"{limits.max_batch}: a slot is held from submit to finish, so "
-                f"concurrency is capped at {self.usable_slots} and submit raises "
-                f"beyond it. Pass num_slots >= max_batch"
-                + (" + 1 for the decode graph's pad row" if self._pad_slot is not None
-                   else ""),
+                f"concurrency is capped at {self.usable_slots} and the excess queues "
+                f"into later ticks rather than raising -- twice the ticks at half the "
+                f"width, not an error. To run {limits.max_batch} rows at once, "
+                f"{remedy}, or size a LinearStatePool for "
+                f"{limits.max_batch + (self._pad_slot is not None)} directly "
+                f"(this one holds {self._states.num_slots})",
                 stacklevel=2,
             )
 

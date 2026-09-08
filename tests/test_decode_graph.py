@@ -13,6 +13,7 @@ Run: TILERL_TARGET=cuda uv run pytest tests/test_decode_graph.py -v
 from __future__ import annotations
 
 import os
+import warnings
 
 # Hermetic default: auto maps to cpu on this Mac; the test skips off-CUDA.
 os.environ.setdefault("TILERL_TARGET", "cpu")
@@ -109,6 +110,80 @@ def test_the_graphs_padding_row_is_not_taken_from_the_callers_capacity():
     ids = [on.submit(prompt, params) for _ in range(n)]  # the N-th used to raise
     on.step()  # slots are taken at admission now, not in submit
     assert len(set(ids)) == n and on.stats()["slots_used"] == n
+
+
+@pytest.mark.parametrize("decode_graph", [False, True], ids=["eager", "graph"])
+def test_submitting_past_usable_slots_queues_rather_than_raising(decode_graph):
+    """The warning at engine.py:402 must describe what over-subscription does.
+
+    Two clauses of it were false, both stale from the pad-row fix, so both are
+    asserted here:
+
+    * ``submit raises beyond it`` -- it does not. ``submit`` checks only the
+      prompt, the stop texts, ``max_total_tokens`` and the KV pool; the slot is
+      taken in ``_admit``, which returns False on ``free_slots < 1``. The excess
+      queues. That is the worst of the three for a benchmark arm: a raise kills
+      the run and a drop shows in the counts, while queuing produces a table
+      that looks finished at half the intended concurrency.
+    * ``Pass num_slots >= max_batch + 1 for the pad row`` -- ``build_engine``
+      already adds it, so ``usable_slots == num_slots`` on both arms and a
+      caller who followed that advice over-allocated.
+
+    ``decode_graph`` is parametrized rather than left to default because
+    ``_graph_on`` resolves None to ``device.type == "cuda"``: on CPU the pad
+    branch would never run, and the second clause -- the one about the pad --
+    would have no coverage on the machine CI uses. The reservation is pure
+    Python in ``build_engine``, so both arms run anywhere; only the capture is
+    CUDA-only.
+    """
+    cfg, backend = tiny(), get_backend()
+    usable, over = 4, 8
+    prompt = torch.randint(0, cfg.vocab_size, (8,),
+                           generator=torch.Generator().manual_seed(5)).tolist()
+    params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=0)
+
+    def run(num_slots):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            e = build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=64,
+                             num_slots=num_slots, max_batch=over,
+                             max_total_tokens=1024, decode_graph=decode_graph)
+        # The pad row is the engine's, so the pool grows by it and usable does not:
+        # num_slots >= max_batch is exact through build_engine on either arm.
+        assert e._states.num_slots == num_slots + decode_graph
+        assert e.usable_slots == num_slots
+        ids = [e.submit(prompt, params) for _ in range(over)]  # no raise past the slots
+        assert len(set(ids)) == over
+        widths, done = [], set()
+        for _ in range(64):
+            e.step()
+            widths.append(e.stats()["slots_used"])
+            done |= set(e.poll())
+            if len(done) == over:
+                break
+        texts = [str(w.message) for w in caught if "usable state slots" in str(w.message)]
+        return set(ids), done, max(widths), texts
+
+    ids, done, peak, texts = run(usable)
+    # Every row ran -- queued, not dropped -- and never more than usable at once.
+    assert done == ids, f"{len(done)} of {over} finished"
+    assert peak == usable, f"peak concurrency {peak} != {usable}"
+    # The message is the artifact that misled two sessions, so assert its text: it
+    # must say queues, and its remedy must name `num_slots` at max_batch exactly --
+    # the old "+ 1" sent build_engine callers one slot over.
+    assert len(texts) == 1, texts
+    assert "queues" in texts[0] and "raise" not in texts[0].replace("raising", "")
+    assert f"num_slots >= {over}" in texts[0], texts[0]
+    # The pad row is named only where one exists, and the direct-pool number carries
+    # it: that half had no coverage while decode_graph defaulted to False on CPU.
+    assert ("pad row" in texts[0]) == decode_graph, texts[0]
+    assert f"LinearStatePool for {over + decode_graph}" in texts[0], texts[0]
+
+    # Negative control: the slot count is what bound it, not the planner or the
+    # prompt. With room for all 8 the same submits run at width 8, and no warning.
+    _, wide_done, wide_peak, wide_texts = run(over)
+    assert len(wide_done) == over and wide_peak == over, f"control peaked at {wide_peak}"
+    assert wide_texts == [], wide_texts
 
 
 def test_the_kv_guard_measures_usable_capacity_not_the_pool():
