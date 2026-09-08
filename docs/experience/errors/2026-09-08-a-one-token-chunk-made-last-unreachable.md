@@ -161,15 +161,17 @@ So candidate 3's extra store method is not incidental surface: a correct fix has
 boundary and spill it later, which means the store must accept a spill for an entry it already holds. That is
 the shape of the real fix, unbuilt.
 
-**That precondition is now pinned by a test rather than by this paragraph.** Driven on the real store with a
-real `KvTier`, a re-offer of tokens the store already holds leaves the tier's `offered` at **0** — the duplicate
-check at `insert`'s top returns before the spill block, so the tier is not offered the entry and does not record
-a refusal either. Nothing distinguishes it from a spill that happened. The control is in the same test: a fresh
-entry with `spill=True` gives `resident=True, offered=1`, so a red second half cannot be the harness failing to
-spill anything. `test_the_store_takes_a_spill_for_an_entry_it_already_holds` asserts today's behaviour, and the
-candidate fix — spill inside the duplicate branch before returning False — turns it red at `offered 1 == 0`,
-verified by applying that mutant and reverting it. So the day the fix lands, the test names itself as the thing
-to update instead of passing silently.
+**That precondition is now built.** `PrefixStore.spill_held(tokens)` offers the tier an entry the store already
+holds and returns what happened — `spilled`, or `no-tier` / `no-entry` / `demoted` / `no-state` / `resident` /
+`refused`. A string rather than a bool because two of those are invisible to a caller that only checks whether the
+entry is present: byte pressure **demotes** it (entry present, blocks retained at refcount 1, `state is None`) and
+count pressure **evicts** it. A caller written as "the entry is still there, so spill it" would do nothing on any
+config with a DRAM tier, which is the same silent no-op this whole path exists to remove. `demoted` deliberately
+does not promote-then-spill: `lookup`'s promote adds the bytes back without re-entering the pressure loop
+(measured 1600 against a 1200 budget, back to 800 after one insert), and nothing guarantees an insert follows a
+DONE-path call. Store side only — **no caller under `src/`** yet, so no served tick reaches it; the engine half
+records the deepest interior publish and calls it at DONE.
+[wins/2026-09-08-spill-held-the-store-side-with-no-caller.md](../wins/2026-09-08-spill-held-the-store-side-with-no-caller.md)
 
 ## Rule
 
