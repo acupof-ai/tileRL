@@ -52,7 +52,77 @@ def test_iso_merge_one_specialist_and_spectrum():
         assert torch.allclose(s, s0, rtol=1e-3), f"{k}: spectrum moved"
 
 
+def test_the_averaging_control_is_balanced_across_both_tasks():
+    """`average_merge` is the control ISO is judged against, so it needs its own gate.
+
+    Every verdict in `test_iso_merge_two_specialists` is relative to this arm, and
+    the reason to gate it is NOT that a broken control flatters ISO -- measured, it
+    does not. A control collapsed to one specialist is easier to beat on the task it
+    dropped and *harder* on the task it kept, because that arm moves all the way to
+    the specialist, which beats any merge on its own task:
+
+        control            A        B    iso <= A?  iso <= B?
+        avg(A,B) correct   18.460   17.550   yes       yes
+        avg(A) only        14.945   21.941   NO        yes
+        avg(B) only        22.291   13.565   yes       NO
+
+    So a degenerate control turns ISO's gate red on a merge that is fine. The gate
+    here is what tells those two apart, and without it the failure reads as an ISO
+    regression.
+
+    The obvious formulation does not work: "average beats the base on both tasks" is
+    TRUE for the A-only average (B=21.941 against the base's own 21.990, ahead by
+    0.049) -- it passes the same way #299's `or` passed, one layer down. What
+    separates them is the BALANCE of the two gains, not their sign:
+
+        arm            gain A   gain B   ratio
+        avg(A,B)        3.875    4.440    1.1x
+        avg(A) only     7.390    0.049  150.1x
+        avg(B) only     0.044    8.425  190.4x
+
+    Two decades between the real average and either degenerate one, so the 3x
+    threshold is a wide band rather than a value fitted to these numbers.
+    """
+    backend = RefBackend()
+    cfg, base = _build_model("tiny", seed=0, keep_master=True)
+    a, b = _sft(BATCH_A, backend), _sft(BATCH_B, backend)
+
+    def gains(specialists):
+        m = Model(cfg, average_merge(base.params, specialists))
+        return (_loss(base, BATCH_A, backend) - _loss(m, BATCH_A, backend),
+                _loss(base, BATCH_B, backend) - _loss(m, BATCH_B, backend))
+
+    def ratio(g):
+        lo, hi = sorted(g)
+        return hi / lo if lo > 1e-9 else float("inf")
+
+    ga, gb = gains([a.params, b.params])
+    assert ga > 0 and gb > 0, f"averaging lost to the base: A {ga:.3f} B {gb:.3f}"
+    assert ratio((ga, gb)) < 3, f"averaging is lopsided: A {ga:.3f} B {gb:.3f}"
+    # Negative controls: an average that saw one specialist must fail, and it is
+    # the ratio that fails it -- both of these still beat the base on both tasks.
+    for name, specs in (("A only", [a.params]), ("B only", [b.params])):
+        one = gains(specs)
+        assert ratio(one) >= 3, f"{name} passed the balance gate: {one}"
+        assert min(one) > 0, f"{name} no longer beats the base, so the gate is not the ratio"
+
+
 def test_iso_merge_two_specialists():
+    """The P3 merger gate: two specialists EACH keep their own task better than
+    plain averaging (`roadmap.md:120-123`), so this is a conjunction.
+
+    It was an `or`, which a merge that ignores one specialist passes on the
+    strength of the other: dropping specialist B scores A=15.660 B=21.954 --
+    0.036 below the base's own 21.990, and 4.4 worse than averaging -- and the
+    `or` admitted it.
+
+    What the `and` does and does not catch, swept rather than assumed. #284 says
+    this loss comparison covers the merge-math constants; it covers them past
+    their knee. `ridge` is monotone with a knee at 1.0 (mean |dW|/|W| 0.0137 at
+    1e-3, 0.0125 at 1e-1, 0.0069 at 1.0, 0.0000 at 1e4), so 1e-1 passing is the
+    parameter still working, not a blind spot -- the gate fails from 1.0 up.
+    `rho_keep` 0.9 -> 0.1 fails at A=21.646 B=21.110.
+    """
     backend = RefBackend()
     cfg, base = _build_model("tiny", seed=0, keep_master=True)
     a, b = _sft(BATCH_A, backend), _sft(BATCH_B, backend)
@@ -64,7 +134,9 @@ def test_iso_merge_two_specialists():
     }
     print({n: f"A={la:.3f} B={lb:.3f}" for n, (la, lb) in out.items()})
     assert out["iso"][0] < out["base"][0] and out["iso"][1] < out["base"][1], out
-    assert out["iso"][0] <= out["avg"][0] or out["iso"][1] <= out["avg"][1], out
+    # EACH task, not either: an `or` here is passed by a merge that lost one specialist.
+    assert out["iso"][0] <= out["avg"][0], f"A regressed against averaging: {out}"
+    assert out["iso"][1] <= out["avg"][1], f"B regressed against averaging: {out}"
 
 
 def test_merge_checkpoints_streams_shards_and_records(tmp_path, monkeypatch):
