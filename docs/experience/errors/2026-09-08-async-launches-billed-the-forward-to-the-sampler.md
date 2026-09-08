@@ -108,6 +108,27 @@ The two sampler-side opportunities that are real: the per-row `Generator`+`multi
 loop is 9.35x a batched draw (0.790 → 0.085 ms) and `topk` beats the full-vocabulary sort
 by 2.26x (0.274 → 0.121 ms). Together **3.2% of the rollout**, not 66%.
 
+## Which wall-clock rates a JIT compile can contaminate
+
+25 measured a GRPO step at 26.55 ms/token with kernels compiling inside the timed region
+and 10.41 ms/token without -- **2.55x**, enough to flip a comparison's sign rather than
+blur it (B=16 read as 1.168x worse, actually 23.8% cheaper). The tree holds 32 files
+mentioning ms/token, so which of them inherit this is worth stating rather than grepping:
+
+- **Wall clock over token count, spanning Python** -- contaminated. The compile happens
+  inside the same `perf_counter` span as the execution.
+- **Per-kernel profiler tables** ("4.71 ms/token over 32 calls") -- not contaminated. The
+  profiler attributes to kernels, and codegen is not a kernel.
+- **Wall clock with a compile estimate subtracted** -- contaminated, and worse than the
+  first: compilation and execution interleave within one span, so subtracting an estimate
+  after the fact cannot recover the split, while the subtraction makes the number look
+  handled.
+
+The gate is `len(backend._kernels)` before and after the timed region, keyed on
+`(name, args, kw)` so a compile is exactly one new key; a nonzero delta refuses to report
+rather than reporting. Classification here is by how a number was computed, not by how it
+looks, so finding the affected ones is an enumeration and not a search.
+
 ## Rule
 
 **A timer on an asynchronous device measures where the queue drains, not where the work
