@@ -810,3 +810,109 @@ def test_last_prefill_boundary_is_a_real_chunk_end(n, budget):
     assert lb in ends, (
         f"n={n} budget={budget}: _last_prefill_boundary says {lb}, but chunks end at "
         f"{ends[-4:]} -- `last` never fires and nothing reaches the disk tier")
+
+
+def test_a_held_entry_reaches_the_tier_through_spill_held_not_insert(tmp_path):
+    """The remaining half of the boundary fix needs a re-offer to reach the disk tier.
+
+    The fix that survived four rejections is: snapshot at the boundary, spill it later. `insert`
+    cannot carry that -- its duplicate check returns before the write-through, so the tier's
+    `offered` stays 0, which is indistinguishable from a spill that happened. `spill_held` is
+    the path that can.
+
+    The control is the first third of this test: a FRESH entry with `spill=True` must land, or
+    the rest would only prove the harness never spills anything.
+    """
+    from tilerl.kv_cache import KvTier
+
+    def store(sub):
+        pool = PagedKvPool(num_blocks=256, num_kv_heads=1, head_dim=8, num_layers=1,
+                           dtype=torch.float32, device="cpu")
+        tier = KvTier(path=str(tmp_path / sub), fingerprint="t", min_tokens=BLOCK_TOKENS)
+        return pool, tier, PrefixStore(pool, capacity=1000, state_bytes=1 << 40, ssd=tier)
+
+    def offer(st, pool, toks, *, spill):
+        blocks = [pool.alloc_block() for _ in range(PagedKvPool.blocks_for_tokens(len(toks)))]
+        snap = (torch.zeros(8), torch.zeros(8))
+        rc = st.insert(list(toks), blocks, state=snap, spill=spill)
+        for b in blocks:
+            pool.free_block(b)
+        return rc
+
+    toks = tuple(range(4 * BLOCK_TOKENS))
+
+    pool, tier, st = store("control")
+    assert offer(st, pool, toks, spill=True)
+    assert tier.resident(st._hash_all(toks)), "control: a fresh spill=True never reached the tier"
+    assert tier.offered == 1
+
+    pool, tier, st = store("respill")
+    assert offer(st, pool, toks, spill=False)
+    assert not tier.resident(st._hash_all(toks)), "spill=False must not reach the tier"
+    assert not offer(st, pool, toks, spill=True), "a duplicate insert must still return False"
+    assert tier.offered == 0, (
+        "insert's duplicate check returns before the write-through, so the tier is not even "
+        "offered the entry -- offered stays 0 rather than counting a refusal")
+
+    # ...which is what `spill_held` exists for: the same entry, now reaching the tier.
+    assert st.spill_held(toks) == "spilled"
+    assert tier.resident(st._hash_all(toks)), "spill_held said spilled but the tier has nothing"
+    assert tier.offered == 1
+    assert st.spill_held(toks) == "resident", "a second call must not re-send the bytes"
+
+
+def test_spill_held_names_every_reason_it_did_not_spill(tmp_path):
+    """A silent no-op is the failure this whole path exists to remove, so each refusal has a
+    distinct name the caller can count. The two that bite live: the DRAM tier took the
+    snapshot (entry present, blocks retained, `state is None`) and pressure evicted the entry.
+
+    `demoted` deliberately does not promote-then-spill: `lookup`'s promote adds the bytes back
+    without re-entering the pressure loop, which measured 1600 against a 1200 budget, and
+    nothing guarantees an insert follows a DONE-path call to rebalance it.
+    """
+    from tilerl.kv_cache import DramSnapshots, KvTier
+
+    def store(sub, *, state_bytes=1 << 40, capacity=1000, dram=False, tier=True):
+        pool = PagedKvPool(num_blocks=512, num_kv_heads=1, head_dim=8, num_layers=1,
+                           dtype=torch.float32, device="cpu")
+        t = KvTier(path=str(tmp_path / sub), fingerprint="t",
+                   min_tokens=BLOCK_TOKENS) if tier else None
+        d = DramSnapshots(budget_bytes=1 << 30) if dram else None
+        return pool, PrefixStore(pool, capacity=capacity, state_bytes=state_bytes,
+                                 dram=d, ssd=t)
+
+    def pub(st, pool, toks, nbytes=800):
+        n = nbytes // 4 // 2
+        snap = (torch.zeros(n, dtype=torch.float32), torch.zeros(n, dtype=torch.float32))
+        blocks = [pool.alloc_block() for _ in range(PagedKvPool.blocks_for_tokens(len(toks)))]
+        st.insert(list(toks), blocks, state=snap, spill=False)
+        for b in blocks:
+            pool.free_block(b)
+
+    a = tuple(range(4 * BLOCK_TOKENS))
+    others = [tuple(range(i * 5000, i * 5000 + 4 * BLOCK_TOKENS)) for i in range(1, 7)]
+
+    pool, st = store("notier", tier=False)
+    pub(st, pool, a)
+    assert st.spill_held(a) == "no-tier"
+
+    pool, st = store("missing")
+    assert st.spill_held(a) == "no-entry", "never published, so there is nothing to spill"
+
+    # the silent one: byte pressure demotes, and the entry stays with its blocks retained
+    pool, st = store("demoted", state_bytes=1200, dram=True)
+    pub(st, pool, a)
+    for o in others[:4]:
+        pub(st, pool, o)
+    entry = next(e for e in st._entries[st._hash_all(a)] if e.tokens == a)
+    assert entry.demoted and entry.state is None, "fixture did not actually demote the entry"
+    assert all(pool.refcount[b] == 1 for b in entry.blocks), "blocks must survive a demote"
+    assert st.spill_held(a) == "demoted"
+
+    # the loud one: count pressure removes the entry between publish and DONE
+    pool, st = store("evicted", capacity=3)
+    pub(st, pool, a)
+    for o in others[:5]:
+        pub(st, pool, o)
+    assert st.spill_held(a) == "no-entry"
+

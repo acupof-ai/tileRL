@@ -1239,6 +1239,48 @@ class PrefixStore:
             self._evict_one()
         return True
 
+    def spill_held(self, tokens: Sequence[int]) -> str:
+        """Offer the disk tier an entry this store already holds. Returns what happened.
+
+        ``insert`` refuses a duplicate before its write-through, so a caller that publishes at
+        a chunk boundary and only learns later that the boundary was the last one has no way
+        to spill it -- the tier's `offered` stays 0, which is indistinguishable from a spill
+        that happened (errors/2026-09-08-a-one-token-chunk-made-last-unreachable.md).
+
+        Every non-``spilled`` return is a reason the caller must count, or it becomes the same
+        silent no-op it exists to fix:
+
+        - ``no-entry``  pressure evicted it between the publish and this call
+        - ``demoted``   the DRAM tier holds the snapshot; deliberately NOT promoted, because
+          the promote path adds the bytes back (`lookup`, below) without re-entering the
+          pressure loop above. `lookup` gets away with it -- the entry is MRU and the next
+          `insert` rebalances (measured: 1600 against a 1200 budget after the promote, back to
+          800 after one insert) -- but nothing guarantees an `insert` follows this call, and a
+          demoted entry is demoted BECAUSE of byte pressure. Spilling it would also write the
+          bytes we just faulted in, a third copy of a snapshot the second turn must promote
+          anyway.
+        - ``resident``  already on disk; the write would re-send bytes just read
+        - ``no-tier`` / ``no-state`` / ``refused``  no tier configured, nothing to spill, or
+          the tier's queue said no
+        """
+        tokens = tuple(int(t) for t in tokens)
+        if self._ssd is None:
+            return "no-tier"
+        h = self._hash_all(tokens)
+        entry = next((e for e in self._entries.get(h, ()) if e.tokens == tokens), None)
+        if entry is None:
+            return "no-entry"
+        if entry.demoted:
+            return "demoted"
+        if entry.state is None:
+            return "no-state"
+        if self._ssd.resident(h):
+            return "resident"
+        if not self._ssd.spill_kv(h, tokens, entry.blocks, self._pool):
+            return "refused"
+        self._ssd.spill_state(h, tokens, entry.state[0], entry.state[1])
+        return "spilled"
+
     def lookup(self, tokens: Sequence[int]) -> PrefixHit | None:
         """Longest stored prefix of ``tokens``, or ``None``."""
         tokens = tuple(int(t) for t in tokens)

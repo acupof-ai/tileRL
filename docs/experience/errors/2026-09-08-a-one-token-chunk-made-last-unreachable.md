@@ -161,6 +161,18 @@ So candidate 3's extra store method is not incidental surface: a correct fix has
 boundary and spill it later, which means the store must accept a spill for an entry it already holds. That is
 the shape of the real fix, unbuilt.
 
+**That precondition is now built.** `PrefixStore.spill_held(tokens)` offers the tier an entry the store already
+holds and returns what happened — `spilled`, or `no-tier` / `no-entry` / `demoted` / `no-state` / `resident` /
+`refused`. A string rather than a bool because two of those are invisible to a caller that only checks whether the
+entry is present: byte pressure **demotes** it (entry present, blocks retained at refcount 1, `state is None`) and
+count pressure **evicts** it. A caller written as "the entry is still there, so spill it" would do nothing on any
+config with a DRAM tier, which is the same silent no-op this whole path exists to remove. `demoted` deliberately
+does not promote-then-spill: `lookup`'s promote adds the bytes back without re-entering the pressure loop
+(measured 1600 against a 1200 budget, back to 800 after one insert), and nothing guarantees an insert follows a
+DONE-path call. Store side only — **no caller under `src/`** yet, so no served tick reaches it; the engine half
+records the deepest interior publish and calls it at DONE.
+[wins/2026-09-08-spill-held-the-store-side-with-no-caller.md](../wins/2026-09-08-spill-held-the-store-side-with-no-caller.md)
+
 ## Rule
 
 **A predicate that predicts another function's behaviour needs a test that runs both.** `_last_prefill_boundary`
