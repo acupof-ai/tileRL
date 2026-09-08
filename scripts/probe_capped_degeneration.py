@@ -29,6 +29,12 @@ duplicated, has to read near 1.0. Without it a metric that always returns ~0 wou
 "no degeneration" for any input, which is exactly the shape of failure this session has
 hit six times today.
 
+**12 steps, not 4.** The first run drew 32 rows and found 1 capped, so it refused: a
+capped-vs-natural ratio on one row is that row's property. The tail probe measured the
+capped rate at 11/160 = 6.9%, which puts 32 rows at an expected 2.2 -- the refusal was the
+design working, and the sample size was chosen without consulting the rate it needed to
+resolve. 12 steps is 96 rows, expected 6.6 capped, and the probe still refuses below 3.
+
 Run:
   scripts/pod_run.sh --wait degen <card> -- python3 scripts/probe_capped_degeneration.py
 """
@@ -63,7 +69,7 @@ def gzip_ratio(text: str) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--steps", type=int, default=4)
+    ap.add_argument("--steps", type=int, default=12)
     ap.add_argument("--group", type=int, default=8)
     ap.add_argument("--gen", type=int, default=6144)
     ap.add_argument("--window", type=int, default=200)
