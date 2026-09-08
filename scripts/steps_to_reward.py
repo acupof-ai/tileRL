@@ -97,6 +97,11 @@ def _args(argv=None):
     p.add_argument("--backend", default="auto", choices=("auto", "reference"),
                    help="auto takes the real backend (TILERL_TARGET); reference is the "
                         "torch-eager CPU twin, which is CPU no matter what TILERL_TARGET says")
+    p.add_argument("--sigma-per-class", type=int, default=2,
+                   help="matrices sampled per 2D shape class for the drift gate; the full "
+                        "census is 1698 s per call on the 27B and 9.47 GiB at f64. Default 2 "
+                        "rather than 1 so the within-class spread can be read at all -- with "
+                        "one member per class the sample cannot audit itself")
     a = p.parse_args(argv)
     # Before the SFT phase, not inside the first RL arm: a missing --data used to surface
     # after 40 SFT steps had already run.
@@ -118,9 +123,31 @@ def sft_base(cfg, model, backend, a):
     return losses
 
 
-def spectra(params):
-    return {k: torch.linalg.svdvals(v.detach().double())
-            for k, v in params.items() if v.dim() == 2}
+def sigma_keys(params, per_class: int = 1):
+    """A FIXED sample of 2D parameter names, ``per_class`` per shape class, sorted.
+
+    The census is unaffordable: measured on the 27B at f32, one svdvals per shape class times
+    the class size is 1698 s per call, so two calls per arm times two arms is 1.9 h of pure
+    instrument (`probe_svd_cost.py`). At f64 it does not even fit -- 9.47 GiB for the
+    248320x5120 embedding against 3.56 GiB free.
+
+    Shape is the sampling unit because both the cost and the conditioning track it. Fixed and
+    sorted matters more than which matrices: two arms sampled differently produce drifts that
+    cannot be compared, and the gate would still print a number.
+    """
+    by_shape = {}
+    for k, v in sorted(params.items()):
+        if v.dim() == 2:
+            by_shape.setdefault(tuple(v.shape), []).append(k)
+    return [k for ks in by_shape.values() for k in ks[:per_class]]
+
+
+def spectra(params, keys=None):
+    """Singular values, f32. The verdict is a threshold on a percentage, so f64 buys nothing
+    and cost 9.47 GiB on the first arm of the first card run."""
+    sel = params if keys is None else {k: params[k] for k in keys}
+    return {k: torch.linalg.svdvals(v.detach().float())
+            for k, v in sel.items() if v.dim() == 2}
 
 
 def drift(before, after):
@@ -163,11 +190,11 @@ def make_reward(cfg, a):
     return correct, prompts
 
 
-def rl_arm(cfg, model, make_opt, a, backend):
+def rl_arm(cfg, model, make_opt, a, backend, keys):
     engine = build_engine(cfg, model, backend, num_blocks=256, num_slots=8,
                           decode_graph=False, prefix_store=NoPrefixStore())
     reward, prompts = make_reward(cfg, a)
-    before = spectra(model.params)
+    before = spectra(model.params, keys)
     hist = list(grpo_loop(engine, model, prompts, reward, a.rl_steps, backend,
                           make_opt(), group=a.group,
                           sampling=SamplingParams(max_new_tokens=a.max_new_tokens),
@@ -178,7 +205,18 @@ def rl_arm(cfg, model, make_opt, a, backend):
     # Sigma at 0.00% because nothing was applied, and the drift gate then reads OK -- "the
     # spectrum is preserved" said about a model that was never trained.
     tied = sum(h[3] for h in hist) / len(hist)
-    return rewards, drift(before, spectra(model.params)), tied
+    after = spectra(model.params, keys)
+    d = drift(before, after)
+    # Whether a per-class sample carries the census verdict cannot be settled on tiny: its
+    # census argmax is `layers.0.o_proj`, the sole member of its shape class, so no sample can
+    # exclude it and both a naive and an adversarial check came back unable to fail. So the
+    # sample audits itself HERE, on the first arm, where the classes have 3-144 members: the
+    # per-class spread of the drift says whether one member represents its class.
+    spread = {}
+    for k in before:
+        spread.setdefault(tuple(model.params[k].shape), []).append(
+            float(((after[k] - before[k]).abs() / before[k].clamp_min(1e-12)).max()))
+    return rewards, d, tied, spread
 
 
 def steps_to(rewards, target):
@@ -224,13 +262,17 @@ def main(argv=None):
     # GiB card and the run OOMs before step 1. The snapshot is on the host, where 22 GB of
     # bf16 costs RAM rather than the card, and each arm restores into the SAME tensors.
     snapshot = {k: v.detach().to("cpu", copy=True) for k, v in base.params.items()}
+    keys = sigma_keys(base.params, a.sigma_per_class)
+    print(f"Sigma sample: {len(keys)} of "
+          f"{sum(1 for v in base.params.values() if v.dim() == 2)} 2D params, "
+          f"{a.sigma_per_class} per shape class, fixed and identical across arms")
     out = {}
     for name, mk in arms.items():
         with torch.no_grad():
             for k, v in base.params.items():
                 v.copy_(snapshot[k])
-        out[name] = rl_arm(cfg, base, mk, a, backend)
-        r, (dmax, dmean), tied = out[name]
+        out[name] = rl_arm(cfg, base, mk, a, backend, keys)
+        r, (dmax, dmean), tied, _ = out[name]
         print(f"{name:>16}: reward {r[0]:.3f} -> {r[-1]:.3f}   "
               f"Sigma drift max {100 * dmax:6.2f}%  mean {100 * dmean:5.2f}%  "
               f"tied groups {100 * tied:5.1f}%")
@@ -279,6 +321,24 @@ def main(argv=None):
           " tested by the FREE arm:")
     print(f"  Adafactor (free spectrum) drift max {100 * ada_max:.2f}% mean {100 * ada_mean:.2f}%")
     print(f"  {sigma_verdict(ada_tied, ada_max)} (threshold 5% max relative movement)")
+
+    # The sample auditing itself, on the free arm, where the shape classes have 3-144 members.
+    # tiny cannot answer this: its census argmax is the sole member of its class, so a sample
+    # there is a no-op and both a naive and an adversarial check came back unable to fail. A
+    # class whose members disagree by more than the threshold means one member does not
+    # represent it, and --sigma-per-class must go up before the verdict is trusted.
+    spread = out["Adafactor"][3]
+    worst = max(((max(v) - min(v), s, len(v)) for s, v in spread.items() if len(v) > 1),
+                default=(0.0, None, 0))
+    if worst[1] is None:
+        print("  sample audit: every shape class has one member, so the sample IS the census")
+    else:
+        gap, shape, n = worst
+        print(f"  sample audit: widest within-class drift spread {100 * gap:.2f}% on {shape} "
+              f"({n} members sampled)")
+        if gap > 0.05:
+            print("    ABOVE the 5% threshold, so one member does not represent its class -- "
+                  "raise --sigma-per-class and re-read the verdict")
 
 
 if __name__ == "__main__":
