@@ -33,6 +33,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "packages",
@@ -56,10 +57,11 @@ def main() -> int:
     from tilerl_kernels.backend import get_backend
 
     from tilerl.cli import _build_model, _qwen38_tokenizer
-    from tilerl.engine import BLOCK_TOKENS, SamplingParams, build_engine
+    from tilerl.engine import BLOCK_TOKENS, build_engine
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.math_answer import boxed_match
     from tilerl.prompt import render_chat
+    from tilerl.prompt import sampling as sampling_of
     from tilerl.tokenizer import get_tokenizer
 
     with open(args.data) as f:
@@ -80,7 +82,7 @@ def main() -> int:
                           prefix_store=NoPrefixStore())
 
     t0 = time.perf_counter()
-    total_correct = total_tokens = distinct_1 = 0
+    total_correct = total_tokens = distinct_1 = all_at_cap = 0
     hist = {j: 0 for j in range(args.k + 1)}
     with open(args.out, "w") as fh:
         for i, (row, prompt) in enumerate(zip(rows, prompts)):
@@ -92,8 +94,14 @@ def main() -> int:
             ids_of = {}
             pid = tok.encode(prompt)
             for g in range(args.k):
-                sp = SamplingParams(max_new_tokens=args.max_new_tokens,
-                                    temperature=args.temperature, seed=i * args.k + g)
+                # Built through `prompt.sampling`, not SamplingParams(...) directly: the
+                # constructor's stop_token_ids default is EMPTY, so a hand-built params
+                # object lets nothing end a completion and every sample runs to the cap.
+                # Measured: the first version did exactly that -- 64 of 64 samples at 6144,
+                # against 3 of 32 on the same problems through the eval path -- so the
+                # distribution was a property of the cap and the whole run was void.
+                sp = replace(sampling_of(tok, None, args.max_new_tokens, seed=i * args.k + g),
+                             temperature=args.temperature)
                 ids_of[engine.submit(pid, sp)] = g
             done: dict[int, list[int]] = {}
             while len(done) < args.k:
@@ -122,6 +130,8 @@ def main() -> int:
             # trip it.
             if rec["distinct"] == 1:
                 distinct_1 += 1
+            if rec["at_cap"] == args.k:
+                all_at_cap += 1
             fh.write(json.dumps(rec) + "\n")
             fh.flush()   # a long run must be readable while it runs, not only after
             print(f"  {args.offset + i:4d}: {c}/{args.k}  "
@@ -141,6 +151,22 @@ def main() -> int:
     print(f"  histogram       {json.dumps(hist)}")
     print(f"  tokens          {total_tokens} in {time.perf_counter() - t0:.0f}s = "
           f"{total_tokens / max(time.perf_counter() - t0, 1e-9):.1f} tok/s")
+    # A problem whose every sample hit the cap has not been scored -- it has been prevented
+    # from being scored, so its 0/k is the cap's verdict and not the policy's. The first
+    # version of this script set stop_token_ids to the SamplingParams default (empty), so
+    # nothing could end a completion and this was 100%: the tie fraction it reported was a
+    # property of the cap (errors/2026-09-08-a-cap-reported-as-a-base.md is the same defect
+    # one level up). Refuses rather than warns above half, because a distribution measuring
+    # the cap is not a weaker version of the measurement, it is a different one.
+    if all_at_cap:
+        pct = 100 * all_at_cap / max(n, 1)
+        line = (f"  {'REFUSING' if pct > 50 else 'WARNING'}: {all_at_cap} of {n} problems had "
+                f"ALL {args.k} samples hit the {args.max_new_tokens} cap. Those rows measure "
+                f"the cap, not the problem -- a truncated completion is unscored, not wrong. "
+                f"Raise --max-new-tokens, or check that stop_token_ids reached the sampler.")
+        print(line)
+        if pct > 50:
+            return 1
     if distinct_1:
         print(f"  WARNING: {distinct_1} of {n} problems produced {args.k} IDENTICAL "
               f"samples. The tie fraction above is then a property of the "
