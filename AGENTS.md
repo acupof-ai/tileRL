@@ -261,7 +261,8 @@ target py311 (see `pyproject.toml [tool.ruff]`). Day-1 baseline: 11 categories
 (E501/E702/E731/E741/F401/F541/I001/SIM108/UP006/UP035/UP037) are `ignore`d
 because in-flight `src/`/`tests/` code violates them — re-enable one by one as
 the tree is cleaned, never grow the list. F821 stays on globally, suppressed
-per-file only for `autograd.py` and `ops/reference.py` (known in-flight spots).
+per-file only for `src/tilerl/autograd.py` (selfcheck helpers); `reference.py`'s
+suppression was retired by importing `Any`.
 
 **CI.** `.github/workflows/ci.yml` gates on `ubuntu-latest` + `macos-14`:
 `uv sync --dev` → `ruff check` → `TILERL_TARGET=cpu uv run pytest -v`. Only
