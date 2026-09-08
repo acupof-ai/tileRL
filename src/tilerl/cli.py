@@ -745,6 +745,37 @@ def _train_adapters(args: argparse.Namespace) -> None:
 
         tiebreak = _judge_tiebreak(engine, tok, params) if args.judge else None
 
+        # `steps_to_score x seconds_per_step` needs the step at which a score was crossed,
+        # and gsm8k_before/after cannot say which step that was. So: score a fixed held-out
+        # subset every `--eval-every` steps and keep (step, score, cumulative_secs).
+        # cumulative_secs is summed rather than `secs_per_step_median x step` because the
+        # step length is not constant within a run -- it changes once a run hits the rollout
+        # cap. The threshold stays at the READING end: the curve records the scores, and
+        # which one counts as "the score" is not the ledger's business.
+        #
+        # `secs` is TRAINING time and excludes this scoring: grpo_loop stops its clock
+        # at `train.py:496`, before the yield, so the probe's own cost is outside every
+        # point. That is the quantity `time_to_score` wants -- production does not pay the
+        # probe -- but it means the curve's last point is `secs_total`, not wall clock.
+        # Scoring at the yield is also the only correct place: grpo_loop calls
+        # `invalidate_weights()` before yielding (`:492`), so the eval sees the policy the
+        # step just produced, with the decode graph already dropped.
+        curve_rows = eval_rows[: args.eval_curve_n]
+        curve: list[dict] = []
+        # `train_secs`, not `elapsed`: the timings loop below rebinds `elapsed` on every
+        # step, so an accumulator by that name silently became the last timing value --
+        # measured, the curve read 0.143 s at step 4 against 0.148 at step 2, a
+        # cumulative figure going DOWN.
+        train_secs = 0.0
+
+        def score_curve(step: int) -> None:
+            c, n, _ = gsm8k_accuracy(engine, tok, curve_rows, eval_params, concurrency=8,
+                                     thinking=thinking, match=MATCHERS[args.reward])
+            curve.append({"step": step, "correct": c, "total": n, "score": c / max(n, 1),
+                          "secs": round(train_secs, 3)})
+            log(f"  curve step {step}: {c}/{n} = {100 * c / max(n, 1):.1f}% "
+                f"at {train_secs:.1f}s cumulative")
+
         hist = []
         rollouts: list = []
         written = 0
@@ -755,7 +786,10 @@ def _train_adapters(args: argparse.Namespace) -> None:
                                     tiebreak=tiebreak, recapture_graph=True,
                                     per_rollout=rollouts)):
             hist.append((r, ce, secs, tied, ntok))
+            train_secs += secs
             written = _write_rollout_rows(manifest["id"], rollouts, written)
+            if curve_rows and args.eval_every and (i + 1) % args.eval_every == 0:
+                score_curve(i + 1)
             for phase, elapsed in timings.items():
                 manifest["metrics"][phase] = manifest["metrics"].get(phase, 0.0) + elapsed
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
@@ -798,6 +832,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
             tokens_first=statistics.mean(h[4] for h in hist[:w]),
             tokens_last=statistics.mean(h[4] for h in hist[-w:]))
         manifest["metrics"]["length_reward_r"] = _within_group_r(rollouts)
+        # Its own top-level key, not a metric: `format_run` prints every metric inline on
+        # one `tilerl ledger` row, so a curve in there would push the row past a screen.
+        if curve:
+            manifest["eval_curve"] = {"n": len(curve_rows), "every": args.eval_every,
+                                      "points": curve}
     else:
         losses = train_mod.opd_loop(engine, model, prompts, args.steps, backend, optimizer,
                                     seed=args.seed, trainable=trainable, sampling=params,
@@ -1283,6 +1322,14 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_train.add_argument("--eval-gsm8k", help="JSONL {prompt, answer}: greedy exact-match "
                          "accuracy before and after")
     p_train.add_argument("--eval-n", type=int, default=100, help="rows of --eval-gsm8k to score")
+    # 0 = off, so no existing invocation changes. The subset must be FIXED ACROSS RUNS or
+    # two runs' curves are not comparable, which is why it is the first --eval-curve-n rows
+    # of --eval-gsm8k rather than a sample.
+    p_train.add_argument("--eval-every", type=int, default=0,
+                         help="score the held-out curve subset every N steps (0 = off)")
+    p_train.add_argument("--eval-curve-n", type=int, default=20,
+                         help="rows of --eval-gsm8k in the curve subset; keep the scoring "
+                              "under 5%% of a step")
     p_train.add_argument("--judge", action="store_true",
                          help="let the policy rank rollouts the binary reward ties "
                               "(judge.py: tests decide first, order only)")

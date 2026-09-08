@@ -116,6 +116,47 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
     assert [r["id"] for r in json.loads(capsys.readouterr().out)] == [m["id"]]
 
 
+def test_the_eval_curve_records_the_step_a_score_was_reached_at(tmp_path, monkeypatch):
+    """`time_to_score = steps_to_score x seconds_per_step` needs the STEP, and
+    gsm8k_before/after cannot say which step a score was crossed at.
+
+    Three assertions, because the triple is only useful whole. `step` is the
+    numerator's operand, `secs` is the product, and `score` is what lets the
+    threshold live at the reading end -- the ledger records scores and never
+    decides which one counts.
+
+    `secs` is asserted MONOTONE and equal to `secs_total` at the last point, not
+    merely present. The first version of this accumulated into a local named
+    `elapsed`, which the timings loop 8 lines below rebinds every step, so the
+    curve reported 0.143 s at step 4 against 0.148 at step 2 -- a cumulative
+    figure going down, which a presence check passes.
+    """
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
+    data = tmp_path / "d.jsonl"
+    data.write_text('{"prompt": "1+1?", "answer": "2"}\n{"prompt": "2+2?", "answer": "4"}\n')
+    argv = ["--rl", "--data", str(data), "--eval-gsm8k", str(data), "--steps", "4",
+            "--group", "2", "--max-new-tokens", "4", "--lora-rank", "4",
+            "--allow-short-rollouts", "--eval-max-new-tokens", "4"]
+    _train([*argv, "--eval-every", "2", "--eval-curve-n", "2"])
+    (m,) = list_runs(tmp_path / "runs")
+    curve = m["eval_curve"]
+    assert curve["every"] == 2 and curve["n"] == 2
+    assert [p["step"] for p in curve["points"]] == [2, 4], curve
+    secs = [p["secs"] for p in curve["points"]]
+    assert secs == sorted(secs), f"cumulative seconds are not monotone: {secs}"
+    assert secs[-1] == pytest.approx(m["metrics"]["secs_total"], abs=0.01), (
+        f"the last point's {secs[-1]} s should be the run's own "
+        f"{m['metrics']['secs_total']} s")
+    for p in curve["points"]:
+        assert 0.0 <= p["score"] <= 1.0 and p["correct"] <= p["total"] == 2
+
+    # Off by default, so no existing invocation changes shape.
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs2"))
+    _train(argv)
+    (off,) = list_runs(tmp_path / "runs2")
+    assert "eval_curve" not in off
+
+
 def test_periodic_rollout_guard_stops_at_first_window_crossing(tmp_path, monkeypatch, capsys):
     from contextlib import suppress
 
