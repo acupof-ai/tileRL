@@ -38,6 +38,24 @@ conclusion needed**:
 So a review that checks the instrumentation finds none of them. The timing is the part
 that was never wrong.
 
+## This refutes the default performance-review checklist
+
+The standard questions asked of a perf number — is the warmup long enough, where is the
+synchronize, did the clock ramp, are the iterations sufficient — have a hit rate of
+**0 of 8** here. Every one of those was already right. And one of the eight left the
+session and was quoted in an architecture survey, so the checklist's miss rate is not
+academic.
+
+The checklist needs a line, and it belongs **above** the timing questions because it is
+cheaper and catches more:
+
+> **For every ratio, write one line for the numerator and one for the denominator: what
+> quantity it is, and where it came from — read / derived / assumed.**
+
+A number already carrying its provenance looks like `1144.7 GB/s = assumed bytes
+(numel × itemsize, derived) / measured time (read)`, which states in the same breath that
+it is not a measured bandwidth.
+
 ## Fix
 
 Before writing any ratio, write one line for the numerator and one for the denominator:
