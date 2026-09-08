@@ -764,6 +764,11 @@ class Backend:
             kernel, Mp, Np, Kp, bM, bN = plan
             wq, scale = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
             # M=1 stays on the GEMV: mma8 measured 2.2x slower there (39.9 vs 87 tok/s)
+            # This branch RETURNS, so it wins over the `plan` kernel above it: at
+            # 2 <= M <= 8 the call never reaches `linear_fp4_fp8_decode`, whatever
+            # `_CUDA_PLAN[("linear_fp4", "decode")]` names. Reading the table alone says
+            # decode is wgmma, and it is not below M=9 -- that inference was published in
+            # #240's entry ("prefill and decode fp4 both dispatch to linear_fp4_fp8").
             if 2 <= M <= _MX and "linear_fp4_mma8" in _resolve(self.precision, self.arch):
                 Np32 = _round_up(N, 32)
                 # _fit_rows, not _pad2d: Np32 can be NARROWER than the Np the line
