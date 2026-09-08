@@ -265,7 +265,7 @@ stopped at 50.
 | quantity | value | meaning |
 |---|---|---|
 | crossing step at X=91.0 | **(0, 25]**, ≤537.4 s | when the target is first reached; **a lower bound on the ratio** |
-| **best step** | **50**, 93.4%, 1038.6 s | where a run should be stopped |
+| **best step** | **25 or 50** — 93.2% / 93.4%, 537.4 / 1038.6 s | where a run should be stopped; the two differ by 1 problem, which is the eval's own cross-process floor, so **which is not decided** |
 
 Stopping at the best step is **1.99x less training time and +2.2 pt better** than running all
 100. There is **no early stopping in this tree**, and no gate can see the difference:
@@ -273,6 +273,33 @@ Stopping at the best step is **1.99x less training time and +2.2 pt better** tha
 nothing in the manifest reads a curve for monotonicity. That is worth more than the 3.85x —
 3.85x says less training saves time, this says more training damages the result while every gate
 reports normal.
+
+**Which of 25 and 50 is the peak is undecided, measured after the fact.** The fine-curve run
+re-ran the base arm in a fresh process — same weights, same 500 rows, same greedy parameters,
+`temperature=0.0` — and read **438/500 = 87.6%** against this run's **437/500 = 87.4%**
+(174426 tokens against 173249, +0.68%). A greedy eval on identical inputs is supposed to be
+reproducible; it moved by **1 problem = 0.2 pt** across processes.
+
+Step 50 (467) beats step 25 (466) by **1 problem**, which is exactly that floor. The paired
+comparison already said so — net +0.20 pt at 0.23σ — but it read as "the two are equal and 50 is
+nominally higher", and 50 was reported as the best step on that nominal ordering. It should not
+have been:
+
+| candidate peak | cumulative train s | ratio vs full run |
+|---|---:|---:|
+| step 25 | 537.4 | **3.85x** |
+| step 50 | 1038.6 | 1.99x |
+
+**The choice between them changes the headline by 1.93x**, and the data does not support making
+it. What *is* decided is unaffected: both 25 and 50 beat step 100 (456) by 10-11 problems, both
+clear the 462 gate step 100 fails, and both are far outside the 0.2 pt floor. So "stop before
+step 75" holds and "stop at 50" does not.
+
+This also bounds every other number here from below. The floor is ≥0.2 pt on a 500-row greedy
+eval across processes, so of the four adjacent comparisons only 25→50 (+0.20 pt) sits at it; the
+others (+5.80, −11.00, +8.80) clear it by 29x, 55x and 44x. **The mechanism of the eval floor is
+unmeasured** — the same fp4 reduction non-determinism that made the training trajectories diverge
+is the obvious candidate and has not been tested.
 
 **The training reward did not follow the eval.** Per-step means:
 
@@ -309,7 +336,8 @@ I first misread as the killed attempt's leftover. Two predicates: find the run b
 manifest names, not by mtime, **and** confirm a directory is yours before concluding from its
 contents.
 
-**P1's own exit criterion failed on this run, and it passes at step 50.** The manifest's verdict
+**P1's own exit criterion failed on this run, and it passes at both step 25 and step 50.** The
+manifest's verdict
 is FAIL, on `gsm8k_improves`: threshold **462** (base 437 + 25 correct = +5.0 pt on 500 rows),
 value **456** — the step-100 policy, 6 short. Against every curve point:
 
@@ -320,7 +348,8 @@ value **456** — the step-100 policy, 6 short. Against every curve point:
 | step 75 | 412 | FAIL (−50) |
 | step 100 | **456** | **FAIL** (−6) |
 
-**The run failed P1 by training 50 steps too long.** The gate reads the after-arm, which is the
+**The run failed P1 by training at least 50 steps too long** — 75 if step 25 is the peak, which
+the eval floor above leaves open. The gate reads the after-arm, which is the
 last step, and the last step is not the best step. This is the same fact as the best-step row
 above, arriving through the project's actual exit criterion rather than through a curve nobody's
 gate reads: a policy that satisfies P1 existed at step 50, was trained past, and the manifest
