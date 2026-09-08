@@ -55,6 +55,9 @@ from tilerl.train import group_advantages, rl_step, untruncated  # noqa: E402
 
 _MAX_TICKS = 10000
 _PHASES = ("prefill_forwards", "decode_forwards", "mixed_forwards")
+#: Seed stride per step. A constant, so two arms of a --group sweep draw nested samples --
+#: the narrow arm's rollouts are the wide arm's first `group`. Must exceed any --group used.
+_SEED_STRIDE = 64
 
 
 def _sync():
@@ -120,7 +123,14 @@ def one_step(engine, model, prompt, reward_fn, backend, optimizer, trainable, *,
     t_step = time.perf_counter()
     # `replace`, the same call `grpo_loop` makes: reconstructing from __dict__ would
     # diverge the moment a field gains a default_factory or an init=False.
-    ids = [engine.submit(prompt.tolist(), replace(sampling, seed=seed + step * group + g))
+    # Strided by _SEED_STRIDE, not by `group`: `group` is the variable a width sweep
+    # compares, so `step * group + g` makes the two arms sample DIFFERENT completions from
+    # step 1 on (only step 0 nests), and a length difference then reads as a batch-width
+    # effect. `tilerl-48` measured that on a tail probe -- 1083 vs 923 mean tokens, and the
+    # resampling test refused the very hypothesis it was built to test. This probe's arms
+    # are saturated so lengths cannot move, but the stride costs nothing and the next
+    # caller may pass stop ids.
+    ids = [engine.submit(prompt.tolist(), replace(sampling, seed=seed + step * _SEED_STRIDE + g))
            for g in range(group)]
     t_submit = time.perf_counter()
     done, buckets, counts, sync_secs, ticks = _drain_attributed(engine, ids, engine.stats)
@@ -224,6 +234,18 @@ def main() -> int:
 
     backend = get_backend()
     cfg, model = _build_model(a.model, seed=0, keep_master=False)
+    # The pool must hold every row's whole sequence, and the rollout submits all --group at
+    # once, so a --blocks sized for a narrower arm dies mid-drain rather than at build:
+    # measured, `--group 16 --gen 6144 --blocks 3700` (the group-8 size) exhausted 3701
+    # blocks partway through step 1, after the wider arm had already been billed a build.
+    # Refuse before the engine, since the number is knowable from the flags alone.
+    need = -(-(a.prompt_tokens + a.gen) // 16) * a.group
+    if a.blocks < need:
+        print(f"REFUSED: --blocks {a.blocks} holds {a.blocks * 16} tokens, but --group "
+              f"{a.group} x (--prompt-tokens {a.prompt_tokens} + --gen {a.gen}) needs "
+              f"{need} blocks. A pool sized for a narrower arm exhausts mid-drain, so a "
+              f"multi-arm sweep sizes it for its WIDEST arm.", file=sys.stderr)
+        return 1
     engine = build_engine(cfg, model, backend, num_blocks=a.blocks,
                           num_slots=a.group, max_batch=a.group,
                           max_total_tokens=a.blocks * 16,
@@ -438,10 +460,25 @@ def _selfcheck() -> int:
     per_tok = lambda step_s, grp, comp: step_s * 1000 / (grp * comp)  # noqa: E731
     assert per_tok(1.0, 8, 32) == 3.90625 and per_tok(1.0, 16, 32) == 1.953125
     assert per_tok(1.0, 16, 32) < per_tok(1.0, 8, 32), "ms/token must reward the wider group"
+    # The --blocks precondition, on the arithmetic. Both directions, because a guard that
+    # only ever passes is what let `--group 16 --blocks 3700` reach the card: the second
+    # assert is the one that fails if the formula loses its dependence on --group.
+    need = lambda ptok, gen, grp: -(-(ptok + gen) // 16) * grp  # noqa: E731
+    assert need(256, 6144, 8) == 3200 <= 3700, "the group-8 arm fits 3700 blocks"
+    assert need(256, 6144, 16) == 6400 > 3700, "the group-16 arm must NOT fit the same pool"
+    # Seeds must NEST across a width sweep, or the arms sample different completions and a
+    # length difference reads as a batch-width effect. Both directions: the second assert
+    # is what fails if the stride goes back to `group`, and without it any formula passes.
+    nest = lambda stride, grp, step: [step * stride + g for g in range(grp)]  # noqa: E731
+    assert nest(_SEED_STRIDE, 8, 3) == nest(_SEED_STRIDE, 16, 3)[:8], "arms must nest"
+    assert nest(8, 8, 3) != nest(16, 16, 3)[:8], "a group-strided seed must NOT nest"
+    assert _SEED_STRIDE >= 16, "the stride must exceed every --group a sweep uses"
     print(f"selfcheck ok: 5 ticks -> {counts}; a two-counter tick is mixed, "
           f"an unexplained tick is its own bucket; --invalidate calls the engine "
           f"({on_e.calls}) and off does not ({off_e.calls}); a compile is a new "
-          f"_kernels key and ms/token falls as the group widens")
+          f"_kernels key, ms/token falls as the group widens, --blocks 3700 "
+          f"admits group 8 ({need(256, 6144, 8)}) and refuses group 16 "
+          f"({need(256, 6144, 16)}), and seeds nest across widths")
     return 0
 
 

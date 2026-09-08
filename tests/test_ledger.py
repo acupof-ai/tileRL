@@ -137,24 +137,31 @@ def test_the_manifest_records_the_engine_config_the_wall_clock_depends_on(tmp_pa
     on it and report 520 blocks each. Written with 200 first, and the pair-assert is
     what caught it -- a key-presence check would have passed on two identical pools.
 
-    Run at TWO group widths, one on each side of `_EVAL_CONCURRENCY`. One engine has two
-    consumers -- the rollout submits `--group` rows and the eval arms submit
-    `_EVAL_CONCURRENCY` -- and sizing on the group alone exhausted the pool at --group 2
-    (137 blocks in use, main red). The wide arm is 16, not 8: `max(8, _EVAL_CONCURRENCY)`
-    is the constant either way, so at 8 the group branch of that max() never executes and
-    a fix that dropped the max() for a plain 8 would still pass every arm here.
+    The pool must cover the eval arms, which submit into this same engine. #320 asserted
+    that on the ROW axis (`max(group, _EVAL_CONCURRENCY)`) and was wrong: only `num_slots`
+    rows hold blocks at once, and the axis that was actually short is per-row LENGTH, since
+    `ctx` used the rollout's cap while the eval arms run at `--eval-max-new-tokens`
+    (default 2048). Both arms of that pair pass with the row assertion deleted, so the
+    length arms below are what carry this test now.
+
+    `--eval-max-new-tokens` is passed EXPLICITLY in the length arms and left DEFAULT in the
+    last one. Every arm in the #320 version overrode it, which is why a green suite shipped
+    a pool that exhausts under `tilerl train --rl` as a user runs it: branch coverage and
+    configuration coverage are different things, and that suite had the first.
     """
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
     data = tmp_path / "d.jsonl"
     data.write_text('{"prompt": "1+1?", "answer": "2"}\n')
     seen = {}
-    # (2, 4000) is also the only arm above the 1024 `ctx` floor, so it is what moves if
-    # that floor changes; the other two sit on it.
-    for group, new in ((2, 4), (2, 4000), (16, 4)):
+    # (2, 4000) is the only arm above the 1024 `ctx` floor on the rollout's cap, so it is
+    # what moves if that floor changes; the others sit on it or are raised by the eval cap.
+    for group, new, ecap in ((2, 4, 4), (2, 4000, 4), (16, 4, 4), (2, 4, 2048)):
         _train(["--rl", "--data", str(data), "--steps", "0", "--group", str(group),
-                "--max-new-tokens", str(new), "--lora-rank", "4"])
+                "--max-new-tokens", str(new), "--lora-rank", "4",
+                "--eval-max-new-tokens", str(ecap)])
         (m,) = [r for r in list_runs(tmp_path / "runs")
-                if r["inputs"]["max_new_tokens"] == new and r["inputs"]["group"] == group]
+                if r["inputs"]["max_new_tokens"] == new and r["inputs"]["group"] == group
+                and r["inputs"]["eval_max_new_tokens"] == ecap]
         assert m["engine"].keys() == {
             "blocks", "slots", "max_batch", "max_total_tokens",
             "max_num_batched_tokens", "decode_graph", "prefix_store", "spec_width"}
@@ -162,16 +169,21 @@ def test_the_manifest_records_the_engine_config_the_wall_clock_depends_on(tmp_pa
         # frozen 8 here would pass while production computed something else.
         assert m["engine"]["slots"] == group == m["engine"]["max_batch"]
         assert m["engine"]["prefix_store"] == "NoPrefixStore"
-        # The pool covers the WIDER consumer. Written against _EVAL_CONCURRENCY rather
-        # than a number, so it fails if the pool goes back to sizing on the group alone.
-        assert m["engine"]["blocks"] >= -(-1024 // BLOCK_TOKENS) * max(group, _EVAL_CONCURRENCY)
-        seen[group, new] = m["engine"]["blocks"]
+        # Every in-flight row's whole sequence, priced per consumer and maxed -- the same
+        # shape as production, not a re-derivation of it, so it moves with the defaults.
+        # min(group, 8) on the eval side because a submit past num_slots queues.
+        need = max(group * -(-(new + 64 + 8) // BLOCK_TOKENS),
+                   min(group, _EVAL_CONCURRENCY) * -(-(ecap + 64 + 8) // BLOCK_TOKENS))
+        assert m["engine"]["blocks"] >= need, (group, new, ecap, m["engine"]["blocks"], need)
+        seen[group, new, ecap] = m["engine"]["blocks"]
         # Not in `inputs`: the id hashes inputs, so a pool field there would make
         # every pool change a new run instead of a rerun.
         assert "blocks" not in m["inputs"]
-    assert seen[2, 4000] > seen[2, 4], f"blocks did not track the context: {seen}"
-    # Same ctx, group past the eval width: this is the arm a constant-8 pool fails.
-    assert seen[16, 4] > seen[2, 4], f"blocks did not track the group: {seen}"
+    assert seen[2, 4000, 4] > seen[2, 4, 4], f"blocks did not track the context: {seen}"
+    # Same group, same rollout cap, longer EVAL cap: the axis #320 left out.
+    assert seen[2, 4, 2048] > seen[2, 4, 4], f"blocks did not track the eval cap: {seen}"
+    # Same ctx, wider group: the pool must still grow with the rows.
+    assert seen[16, 4, 4] > seen[2, 4, 4], f"blocks did not track the group: {seen}"
 
 
 def test_the_eval_curve_records_the_step_a_score_was_reached_at(tmp_path, monkeypatch):
