@@ -274,13 +274,28 @@ def train_step(
     return _step(model, input_ids, backend, optimizer, trainable, grad_fn, micro)
 
 
-def group_advantages(rewards: Any, group: int) -> np.ndarray:
+def group_advantages(rewards: Any, group: int, live: Any = None) -> np.ndarray:
     """``(r - mean) / std`` within each group of ``group`` consecutive rollouts;
-    a tied group yields zeros (no signal, no division by ~0)."""
+    a tied group yields zeros (no signal, no division by ~0).
+
+    ``live`` is a per-rollout bool mask of the rows that can carry gradient;
+    rows outside it set neither the mean nor the std and get advantage 0. A
+    zero-length completion is the case: ``rl_step``'s mask scores 0 positions
+    for it (``slen == plen``), so its own advantage reaches nothing, but as a
+    reward=0 group member it shifts everyone else's. Worst at 8-of-8 correct,
+    the most common group at a 91% base: the group should be tied and silent,
+    and one empty row turns it into +0.378 on all seven live rows -- gradient
+    for being unlike an empty string, which is not a learnable property. It
+    also depresses ``tied``, which is P1's criterion.
+    """
     r = np.asarray(rewards, dtype=np.float64).reshape(-1, group)
-    std = r.std(axis=1, keepdims=True)
-    adv = (r - r.mean(axis=1, keepdims=True)) / np.where(std > 1e-8, std, 1.0)
-    return np.where(std > 1e-8, adv, 0.0).reshape(-1)
+    m = (np.ones(r.shape, dtype=bool) if live is None
+         else np.asarray(live, dtype=bool).reshape(-1, group))
+    n = np.maximum(m.sum(axis=1, keepdims=True), 1)
+    mean = (r * m).sum(axis=1, keepdims=True) / n
+    std = np.sqrt((((r - mean) * m) ** 2).sum(axis=1, keepdims=True) / n)
+    adv = (r - mean) / np.where(std > 1e-8, std, 1.0)
+    return np.where((std > 1e-8) & m, adv, 0.0).reshape(-1)
 
 
 def rl_step(
@@ -483,7 +498,7 @@ def grpo_loop(
         # right one.
         if tiebreak is not None:
             rewards = tiebreak(prompt, comps, [r > 0.5 for r in rewards])
-        adv = group_advantages(rewards, group)
+        adv = group_advantages(rewards, group, live=[len(c) > 0 for c in comps])
         tied = float((adv.reshape(-1, group) == 0).all(axis=1).mean())
         if per_rollout is not None:
             # Per rollout, not the group means: length and reward are paired only

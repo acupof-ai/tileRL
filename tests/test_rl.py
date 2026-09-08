@@ -112,6 +112,24 @@ def test_group_advantages():
     assert np.allclose(group_advantages([2.0, 2.0], group=2), 0.0)
 
 
+def test_an_empty_rollout_injects_no_gradient():
+    """A zero-length completion scores 0 positions in `rl_step`, so its own
+    advantage reaches nothing -- but as a reward=0 group member it moved every
+    other row. The worst case is the most common one: 8-of-8 correct should be
+    tied and silent, and one empty row made all seven live rows +0.378."""
+    live = [True] * 7 + [False]
+    assert np.allclose(group_advantages([1.0] * 7 + [0.0], 8, live=live), 0.0)
+    # Without the mask, that is the bug this test exists for.
+    assert not np.allclose(group_advantages([1.0] * 7 + [0.0], 8), 0.0)
+    # Real signal among the live rows survives, and the dead row stays at 0.
+    adv = group_advantages([1.0] * 4 + [0.0] * 3 + [0.0], 8, live=live)
+    assert adv[7] == 0.0 and (adv[:4] > 0).all() and (adv[4:7] < 0).all(), adv
+    # Every row dead, and one live row: no mean, no std, nothing to divide by.
+    assert np.allclose(group_advantages([0.0] * 4, 4, live=[False] * 4), 0.0)
+    assert np.allclose(group_advantages([1.0, 0.0, 0.0, 0.0], 4,
+                                        live=[True, False, False, False]), 0.0)
+
+
 def test_rl_step_matches_sft_at_unit_advantage():
     """A=1 on every row with no prompt is exactly the SFT gradient: the RL step
     must not be a second training path, only a reweighting of this one."""
