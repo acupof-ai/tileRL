@@ -26,6 +26,63 @@ head, the ledger); TP, CP and the 128K–256K budget are under P6 below.
 | sm70 (V100) | fp4 inference runs: decode 37.6 tok/s at 4096 ctx against a 56.1 tok/s weight-bandwidth ceiling, prefill 7.89 ms/prompt token, GEMV 746 GB/s = 83% of peak | `docs/experience/LOG-v100-sm70.md` |
 | Ledger | human-written `docs/experience/`; per-run manifests landing 2026-09-02 (P4). A run killed mid-training used to report `pass` — gates are written at the end and `all([])` is true — and now reports `killed` | `wins/2026-09-06-an-interrupted-run-reported-pass.md` |
 
+## Verified against the tree, 2026-09-08
+
+The table above is dated and hand-maintained. Every row below was read from
+`origin/main` at `debf6b3` on 2026-09-08 and disagreed with what the phase text
+implied; two of them cost a session each, rebuilding something already built.
+This block corrects the status only — no phase definition or exit criterion is
+changed here.
+
+- **P1's four prerequisites are all closed. P1 is code-complete.** `--eval-gsm8k`
+  and `--eval-n` exist (`cli.py:1121-1123`); `grpo_loop` and self-OPD raise on a
+  live decode graph or a real prefix store (`train.py:364-371`); the tied-group
+  fraction is logged per step and aggregated (`cli.py:641,685`); the self-OPD EMA
+  teacher uses `copy_` into the adapter tensors (`train.py:544,550,555`), not
+  `params.update`. The length term named as the fourth prerequisite's cause landed
+  in #293. **What remains is the pod run, and it is held** until the exit gate below
+  lands (ckl, 2026-09-08).
+- **P1's encoded exit gate is looser than this document's, and cannot demonstrate
+  this document's target.** `cli.py:832-835` gates GSM8K on `after > before`, which
+  on a **count** metric (`cli.py:588` writes `c`, while `cli.py:575` writes `c / n`
+  for MMLU) is +1 question in 500 = +0.2 pt against the `>= +5 pt` above; MMLU is
+  allowed −3 pt where this document allows −2. Separately, at `eval_n=500` an
+  **unpaired** test has an 80%-power one-sided MDE of **7.70 pt**, so the +5 pt
+  target sits below the smallest effect the test it is judged by can detect. The
+  failure mode is a miss, not a false pass. Under the paired McNemar the run
+  already writes per-question rows for, +5 pt is resolvable while the discordant
+  rate stays under ~15.9% (80% power, two-sided).
+- **P2.0's mechanism changed and the exit did not.** The text says the captured
+  graph is "re-recorded after every optimizer step". The implementation instead
+  keeps the graph and refills the f32 cast (`engine.py:1180-1202`), which is sound
+  because **all three** `step_one` implementations end in place — `AdamW`
+  (`autograd.py:463-486`), `Adafactor` (`:565-623`) and `ISO` (`iso.py:85-113`) —
+  so the addresses a capture baked survive an update. `train.py:345-373` already
+  treats `recapture_graph=True` as a formal waiver. The exit criterion is
+  unaffected and still card-bound.
+- **P3's optimizer CPU exit is met — three terms had teeth, the fourth did not
+  until #303.** Gradcheck (`tests/test_iso.py:27`, a Stiefel tangent against a
+  central difference through the retraction), orthonormality after retraction
+  (`:47`) and spectrum preserved over steps (`:59`) all discriminate. "SFT loss
+  falls" was encoded as `losses[-1] < losses[0] - 0.1` against the run's own start,
+  and **an ISO with its entire 2-D path disabled clears that bound by 53x** (drop
+  5.32, because 10 of the tiny model's 27 params are 1-D and delegate to Adafactor
+  through `iso.py:101`). The natural control cannot fix it — plain Adafactor over
+  8 steps beats ISO on 3 of 4 seeds, so "ISO's loss is lower" is flaky in both
+  directions. #303 changes the observable instead: 2-D weights moved 17/17 versus
+  0/17, which is exact where the loss comparison is only statistical. **P3's merger CPU exit is met
+  by #299**, which also corrects a gate that read `iso[0] <= avg[0] or iso[1] <= avg[1]`
+  where this document says *each*.
+- **P4 is not complete.** The manifest's id block (`cli.py:494-509`) records no
+  engine configuration — not `num_blocks`, `max_total_tokens`, `num_slots` or
+  `decode_graph`. Six card sessions on 2026-09-08 spent most of their cost
+  recovering two runs' pool sizes out of probe-script log lines, because no
+  manifest held them; and the effect that arm finally isolated was **build order
+  inside one process**, which is not expressible as a field at all. Both say the
+  same thing about P5: a run record that does not pin the engine it ran cannot
+  support the run-to-run wall-clock comparison P5 is made of.
+
+
 ## P1 — RL moves a number on the 27B — needs the pod
 
 Everything below is built on this claim, and it is unproven.
