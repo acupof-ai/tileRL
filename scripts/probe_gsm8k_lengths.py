@@ -120,8 +120,16 @@ print(f"  mean {allarr.mean():.1f}  median {np.median(allarr):.1f}  "
       f"max {allarr.max()}")
 print(f"  at cap: {100*(allarr >= a.cap).mean():.1f}%  "
       f"-> a cap of {a.cap} {'BINDS' if (allarr >= a.cap).mean() > 0.05 else 'does not bind'}")
-print(f"\nreward across seeds at FIXED weights: {', '.join(f'{100*x:.2f}%' for x in accs)}")
+print(f"\ntemperature-1.0 group accuracy across seeds at FIXED weights: "
+      f"{', '.join(f'{100*x:.2f}%' for x in accs)}")
 print(f"  sd {100*accs.std(ddof=1):.2f} pt over {len(accs)} seeds, n={len(allarr)//len(seeds)} "
       f"rollouts each")
-print("  This is the error bar the reward-vs-step curve needs. A fixed eval seed reports 0")
-print("  and then every wiggle on the curve reads as signal (cli.py:570-572 uses args.seed).")
+# What this sd is NOT: the reward-vs-step curve's error bar. `gsm8k_accuracy` replaces the
+# sampling with `temperature=0.0` (eval.py:147), so the eval is deterministic given weights and
+# repeating it at another seed returns the identical number -- the curve's width is binomial on
+# its subset size, which ledger.py:127 already reports as se_pt.
+# What it IS: the noise on the quantity GRPO differences within a group. A step whose reward
+# signal is smaller than this sd is fitting sampling noise, so it prices the group size.
+print("  This is the rollout reward's own noise, not the curve's error bar: the curve evals")
+print("  greedily (eval.py:147) and its width is the binomial SE on the subset (ledger.py:127).")
+print("  It prices --group: a per-step reward move under this sd is sampling noise.")
