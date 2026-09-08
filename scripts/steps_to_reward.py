@@ -143,10 +143,18 @@ def sigma_keys(params, per_class: int = 1):
 
 
 def spectra(params, keys=None):
-    """Singular values, f32. The verdict is a threshold on a percentage, so f64 buys nothing
-    and cost 9.47 GiB on the first arm of the first card run."""
+    """Singular values, f32, computed on the HOST.
+
+    Three measurements pin every part of this. The verdict is a threshold on a percentage, so
+    f64 buys nothing and cost 9.47 GiB on the first card run. Sampling is forced: a full sweep
+    is ~1700 s per call. And the host is forced -- `materialize` has moved the params to the
+    card by the time the gate reads them, leaving 3.56 GiB free, while ONE f32 embedding is
+    4.74 GiB, so a per-shape-class sample necessarily includes it and OOMs anyway. The card
+    buys 1.01-1.08x over the host on the large classes (SVD here is algorithm-bound, not
+    bandwidth-bound), so `.cpu()` costs ~6% of an already-sampled sweep and zero card memory.
+    """
     sel = params if keys is None else {k: params[k] for k in keys}
-    return {k: torch.linalg.svdvals(v.detach().float())
+    return {k: torch.linalg.svdvals(v.detach().float().cpu())
             for k, v in sel.items() if v.dim() == 2}
 
 
@@ -390,5 +398,16 @@ if __name__ == "__main__":
     assert sigma_verdict(1.0, 0.0).startswith("NOT TESTED"), "a no-gradient run read as OK"
     assert sigma_verdict(0.4, 0.0).startswith("OK"), "a real run must still reach a verdict"
     assert sigma_verdict(0.4, 0.2).startswith("VOID"), "a moving spectrum must still void"
+    # 4. The gate must not allocate on the card: `materialize` leaves ~3.56 GiB free and one
+    #    f32 embedding is 4.74, so a card-side svdvals OOMs even sampled. Asserted on the
+    #    RESULT's device, which is what `.cpu()` in `spectra` guarantees -- a reading of the
+    #    source line would be satisfied by the comment above it.
+    #    VACUOUS ON A CPU HOST, deliberately stated: `.float()` and `.float().cpu()` are both
+    #    cpu there, so this cannot fail locally and only bites on a card. It is a card-side
+    #    gate that rides along, not a check this machine verifies.
+    _s = spectra(m.params, sigma_keys(m.params, 2))
+    assert _s and all(v.device.type == "cpu" for v in _s.values()), \
+        f"spectra returned non-CPU tensors: {[str(v.device) for v in _s.values()][:3]}"
+    _where = "verified" if torch.cuda.is_available() else "vacuous on this CPU host"
     print("self-check: a checkpoint path is refused, the 27B tokenizer resolves by name, "
-          "and a 100%-tied run reads NOT TESTED")
+          f"a 100%-tied run reads NOT TESTED, and the drift gate is host-side ({_where})")
