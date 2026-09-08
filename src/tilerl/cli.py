@@ -627,31 +627,48 @@ def _train_adapters(args: argparse.Namespace) -> None:
     # unreachable however the recipe was written. Size the pool from the ask instead.
     from .kv_cache import BLOCK_TOKENS
 
-    # 1024 floor = the old flat 512 blocks. evals submit prompts this function never
-    # sees -- MMLU reaches 515 tokens against GSM8K's 183 -- so a short
-    # --max-new-tokens must not shrink the pool under them. max_total_tokens only
-    # guards one request and costs no memory, so it never drops below the 8192 default.
+    # 1024 floor = the old flat 512 blocks. max_total_tokens only guards one request and
+    # costs no memory, so it never drops below the 8192 default.
     # Hand-computed, so `_fit_blocks` never runs here: passing num_blocks truthy is what
     # skips it (engine.py:1645), and it is the only path that measures free memory instead
     # of deriving a pool from context. That is deliberate for now -- training also holds
     # gradients, the tape and the optimizer state, which `_fit_blocks` does not model, so
     # its two-thirds rule is calibrated for serve. Whether training should use it is a
     # card-pending question, not an oversight.
-    ctx = max(max(map(len, prompts)) + args.max_new_tokens + 64, 1024)
+    #
+    # Two consumers, each priced on its OWN rows and its OWN length, then max(). Crossing
+    # the axes instead -- widest rows x longest sequence -- costs `--group 16` twice the
+    # blocks the eval needs, and over-allocation here is not slack: this path also holds the
+    # gradients, the tape and the optimizer state.
+    #
+    # #320 took the max on the ROW axis alone and left per-row length at the rollout's cap,
+    # which still exhausted at the default --eval-max-new-tokens 2048 (measured: `--group 8`,
+    # 520 blocks, needs 1099). Its arms passed only because `max(2, 8)` handed the narrow
+    # group 4x the rows it used, absorbing the length shortfall on the wrong axis.
+    rollout_ctx = max(map(len, prompts)) + args.max_new_tokens + 64
+    # 515: MMLU's longest rendered prompt, the figure the 1024 floor was chosen for. GSM8K's
+    # 183 sits under any floor, so the MMLU arm is the only eval prompt that can exceed the
+    # training prompts -- and this function never sees either.
+    eval_ctx = max(max(map(len, prompts)), 515 if args.eval_mmlu else 0) \
+        + args.eval_max_new_tokens + 64
     # Sized from --group, not a literal 8: grpo_loop submits the whole group at once
     # (train.py, one submit per g), so a group wider than the engine runs in waves and
     # every rollout in the second wave decodes at a batch the tensor core underfills.
     # The three used to be 8 while --group was a settable flag defaulting to 8, so
     # --group 16 quietly became two waves of 8.
     rollout_batch = max(args.group, 1)
-    # max() over both consumers, not just the rollout: evals submit _EVAL_CONCURRENCY rows
-    # into this same engine, so sizing on the group alone exhausted the pool at --group 2.
-    # Only num_blocks takes the max -- max_batch stays the rollout's width, since widening
-    # it would change how wide the eval batch actually runs, which is a perf change.
-    pool_rows = max(rollout_batch, _EVAL_CONCURRENCY)
+    # min(), not _EVAL_CONCURRENCY: the eval arms ask for _EVAL_CONCURRENCY rows but only
+    # num_slots of them hold blocks at once, since a submit past the slots queues inside the
+    # engine. Measured on the discriminating case -- `--group 4`, 520 blocks, eval cap 1500:
+    # 4 rows need 384 and pass, 8 would need 768 -- and `tilerl-0a` predicted the group-16
+    # exhaustion (1033 blocks) from the same model before `tilerl-48` hit it.
+    eval_rows_in_flight = min(rollout_batch, _EVAL_CONCURRENCY)
+    blocks = max(rollout_batch * -(-rollout_ctx // BLOCK_TOKENS),
+                 eval_rows_in_flight * -(-eval_ctx // BLOCK_TOKENS)) + 8
+    ctx = max(rollout_ctx, eval_ctx, 1024)
     engine = build_engine(cfg, model, backend, num_slots=rollout_batch,
                           max_batch=rollout_batch, draft=draft,
-                          num_blocks=-(-ctx // BLOCK_TOKENS) * pool_rows + 8,
+                          num_blocks=blocks,
                           max_total_tokens=max(ctx, 8192),
                           spec_depth=args.depth, decode_graph=True,
                           prefix_store=NoPrefixStore())
