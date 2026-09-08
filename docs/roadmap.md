@@ -26,6 +26,82 @@ head, the ledger); TP, CP and the 128K–256K budget are under P6 below.
 | sm70 (V100) | fp4 inference runs: decode 37.6 tok/s at 4096 ctx against a 56.1 tok/s weight-bandwidth ceiling, prefill 7.89 ms/prompt token, GEMV 746 GB/s = 83% of peak | `docs/experience/LOG-v100-sm70.md` |
 | Ledger | human-written `docs/experience/`; per-run manifests landing 2026-09-02 (P4). A run killed mid-training used to report `pass` — gates are written at the end and `all([])` is true — and now reports `killed` | `wins/2026-09-06-an-interrupted-run-reported-pass.md` |
 
+## Verified against the tree, 2026-09-08
+
+The table above is dated and hand-maintained. Every row below was read from
+`origin/main` at `debf6b3` on 2026-09-08 and disagreed with what the phase text
+implied; two of them cost a session each, rebuilding something already built.
+This block corrects the status only — no phase definition or exit criterion is
+changed here.
+
+It is itself hand-maintained, and on the day it was written three of its rows went
+stale inside one afternoon as the PRs they described landed. A reviewer caught each
+one. Treat every claim here as dated to its sha, and prefer the tree.
+
+- **P1's four prerequisites are all closed. P1 is code-complete.** `--eval-gsm8k`
+  and `--eval-n` exist (`cli.py:1121-1123`); `grpo_loop` and self-OPD raise on a
+  live decode graph or a real prefix store (`train.py:364-371`); the tied-group
+  fraction is logged per step and aggregated (`cli.py:641,685`); the self-OPD EMA
+  teacher uses `copy_` into the adapter tensors (`train.py:544,550,555`), not
+  `params.update`. The length term named as the fourth prerequisite's cause landed
+  in #293. **What remains is the pod run**, unblocked once the exit gate landed
+  (`b0d8678`, 2026-09-08).
+- **P1's encoded exit gate could not demonstrate this document's target. Both
+  halves are now fixed.** The threshold half is
+  closed by #301 (`0197dcc`): GSM8K gated on `after > before` was, on a **count**
+  metric, +1 question in 500 = +0.2 pt against the `>= +5 pt` above, and MMLU allowed
+  −3 pt where this document allows −2. Both now match the document. The **test**
+  half is closed by #309 (`b0d8678`): at `eval_n=500` an **unpaired** comparison has an 80%-power
+  one-sided MDE of **7.70 pt**, so the +5 pt target still sits below the smallest
+  effect the comparison it is judged by can detect. The failure mode is a miss, not
+  a false pass — a real +5 pt run reads as no result. Under the paired McNemar the
+  run already writes per-question rows for, +5 pt is resolvable while the discordant
+  rate stays under ~15.9% (80% power, two-sided). The paired result is recorded as
+  `metrics["gsm8k_paired"]` beside the threshold, which stays the gate.
+- **P2.0's mechanism changed and the exit did not.** The text says the captured
+  graph is "re-recorded after every optimizer step". The implementation instead
+  keeps the graph and refills the f32 cast (`engine.py:1180-1202`), which is sound
+  because **all three** `step_one` implementations end in place — `AdamW`
+  (`autograd.py:463-486`), `Adafactor` (`:565-623`) and `ISO` (`iso.py:85-113`) —
+  so the addresses a capture baked survive an update. `train.py:345-373` already
+  treats `recapture_graph=True` as a formal waiver. The exit criterion is
+  unaffected and still card-bound.
+- **P3's optimizer CPU exit is NOT met — three terms had teeth, and the fourth
+  never measured what the phase is about.** Gradcheck (`tests/test_iso.py:27`, a
+  Stiefel tangent against a central difference through the retraction),
+  orthonormality after retraction
+  (`:47`) and spectrum preserved over steps (`:59`) all discriminate. "SFT loss
+  falls" was encoded as `losses[-1] < losses[0] - 0.1` against the run's own start,
+  and **an ISO with its entire 2-D path disabled clears that bound by 53x** (drop
+  5.32, because 10 of the tiny model's 27 params are 1-D and delegate to Adafactor
+  through `iso.py:101`). The natural control cannot fix it — plain Adafactor over
+  8 steps beats ISO on 3 of 4 seeds, so "ISO's loss is lower" is flaky in both
+  directions. #303 changes the observable instead: 2-D weights moved 17/17 versus
+  0/17, which is exact where the loss comparison is only statistical. **That is a
+  mechanism check, not the phase's quantity.** Both the old bound and #303's
+  replacement are blind to a step count. #303 forecloses "the 2-D path does not
+  run"; it does not foreclose "the 2-D path runs and changes nothing", which is
+  what the figure below shows. The old bound has a second, separable
+  defect: dispatching the 2-D weights to the base optimizer -- ISO removed, not
+  merely disabled -- gives a drop within **0.046%** of real ISO's (24.7703 vs
+  24.7589), at 248x the threshold, so it never watched ISO at all. The percentage
+  is of the drop; on the final loss the two differ by 49.2%, which is why the
+  operand has to be named. `test_iso.py:80` then
+  feeds the same 2x32 batch to all 8 steps, so what it did watch was memorization
+  of one batch. The exit is restated above as steps-to-a-fixed-loss against
+  Adafactor with a fresh batch per step, and it is unmeasured. **P3's merger CPU exit is met
+  by #299**, which also corrects a gate that read `iso[0] <= avg[0] or iso[1] <= avg[1]`
+  where this document says *each*.
+- **P4 is not complete.** The manifest's id block (`cli.py:494-509`) records no
+  engine configuration — not `num_blocks`, `max_total_tokens`, `num_slots` or
+  `decode_graph`. Six card sessions on 2026-09-08 spent most of their cost
+  recovering two runs' pool sizes out of probe-script log lines, because no
+  manifest held them; and the effect that arm finally isolated was **build order
+  inside one process**, which is not expressible as a field at all. Both say the
+  same thing about P5: a run record that does not pin the engine it ran cannot
+  support the run-to-run wall-clock comparison P5 is made of.
+
+
 ## P1 — RL moves a number on the 27B — needs the pod
 
 Everything below is built on this claim, and it is unproven.
@@ -110,7 +186,11 @@ bf16 — a reason to try it, not a number we own. Mechanism and memory in
 - Optimizer (CPU, today): frame gradients from `dW`, Newton-Schulz polar,
   Adafactor base, streamed updates. Exit: tiny-model gradcheck of the frame
   gradient, orthonormality after retraction, spectrum preserved over steps,
-  SFT loss falls.
+  and fewer steps than Adafactor to a fixed loss. The first three hold; the
+  fourth is NOT met. It replaces "SFT loss falls", which passed with ISO removed
+  from the 2-D weights entirely (within 0.046% of real ISO's drop) and fed one
+  2x32 batch 8 times -- neither the optimizer under test nor an optimization
+  trajectory.
 - Optimizer (pod, SFT first): steps to the same loss vs Adafactor on the 27B;
   peak < 96 GB. This is SFT because full-parameter RL has a ceiling:
 - **Per-step re-quantization into the served fp4 bytes** — the first pod item
