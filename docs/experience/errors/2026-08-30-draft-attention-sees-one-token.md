@@ -1,9 +1,12 @@
 # The draft head's attention sees one token in the loop, the whole prefix in the probe — 2026-08-30
 
-> Status: **fixed 2026-08-30** (alignment CPU-verified, acceptance rate
-> `pending-remote`). It reopens the speculation verdict in
+> Status: **fixed 2026-08-30** (alignment CPU-verified; in-loop acceptance measured
+> **78.0% / 75.0%** at ctx 2048/1024, backed out of the 09-04 depth sweep's `tok/fwd` —
+> see the end of "The fix"). It reopened the speculation verdict in
 > [wins/2026-08-29-spec-decode-net-win.md](../wins/2026-08-29-spec-decode-net-win.md),
-> whose break-even is `p >= 66%` against a measured 55.8%.
+> whose break-even is `p >= 66%` against a measured 55.8%; the fixed head clears that
+> break-even by 9–12 points. Depth 1 still wins on tick cost
+> ([wins/2026-09-04](../wins/2026-09-04-depth-1-wins-and-block-parallel-is-rejected.md)).
 
 ## Context
 
@@ -127,7 +130,35 @@ where the probe re-derives it with a dense forward; those differ by
 the fix the two drafts were unrelated vectors (argmax 46 against 232).
 
 Whether in-loop acceptance now reaches the probe's 84.4%, and whether that
-clears the 66% break-even, is `pending-remote`.
+clears the 66% break-even, was `pending-remote` until 2026-09-08 — **answered
+from a run that already existed.** The 09-04 depth sweep
+([wins/2026-09-04-depth-1-wins-and-block-parallel-is-rejected.md](../wins/2026-09-04-depth-1-wins-and-block-parallel-is-rejected.md))
+reports `tok/fwd` per depth on the V100, and a verify tick of width `W` commits one token
+plus however many of its `W-1` drafts were accepted, so `tok/fwd - 1` is the accepted count.
+At **depth 1 there is exactly one draft**, so that difference *is* its acceptance rate:
+
+| ctx | tok/fwd at depth 1 | first-draft acceptance | vs the probe's 84.4% | vs the 66% break-even |
+|---:|---:|---:|---:|---|
+| 2048 | 1.78 | **78.0%** | 0.92x | clears by 12.0 pts |
+| 1024 | 1.75 | **75.0%** | 0.89x | clears by 9.0 pts |
+
+So the fix holds in the loop: in-loop acceptance is 0.89–0.92x of the probe's, not the
+55.8% that reopened the verdict, and it clears the break-even at both contexts.
+
+**Only depth 1 answers this.** A chain is sequential — draft 2 is reached only if draft 1
+was accepted — so `tok/fwd - 1` at depth > 1 is a total, not any position's rate; and the
+sweep's `rungs` column shows deeper rows mixing tick shapes (depth 2 at ctx 2048 is
+`r2 x5 + r4 x161`), so their `tok/fwd` averages two widths. Depth 1 is one draft on one rung
+(`r2 x215`), unmixed.
+
+The identity was checked against the run's own totals rather than assumed: `215 ticks ×
+1.78 = 383` tokens against the `--tokens 128 × 3` passes the entry header declares, **0.3%
+apart**. Applying it to depth 2 backs out a second-position rate of 69.2% / 54.7%, below
+first position, which is the shape a sequential drafter must show.
+
+**This does not reopen 09-04's verdict.** Acceptance clearing 66% was the 08-29 break-even
+for speculation *existing*; 09-04 measured that entering rung 4 costs 60% of a tick against
+the 23–30% acceptance buys, so depth 1 still wins and block-parallel drafting stays rejected.
 
 ## The gate
 
