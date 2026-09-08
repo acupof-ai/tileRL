@@ -117,13 +117,26 @@ timed on H20 with a peaked logits fixture (nucleus 39 of 248320):
 | **all sampling operators** | **1.065 ms** | ~40 ms |
 
 **Sampling is 3.6% of a 29.71 ms tick.** The other 28.64 ms is the forward, which
-puts it at 4.91x the 5.83 ms floor — **20.4% of HBM bandwidth**. Measured directly,
-the fp4 GEMM at M=8 reaches 1144.7 GB/s, **28.6% of nominal**; at that achieved
-rate the weight stream would take 20.39 ms, so **8.25 ms of the forward is not
-explained even by the rate the GEMM actually runs at**. Those are two separate
-statements — 4.91x is against the hardware, 8.25 ms is against the kernel's own
-speed — and they must not be composed into one ratio, because a denominator taken
-from the measurement carries the same inefficiency as its numerator. That is the
+puts it at 4.91x the 5.83 ms floor — **20.4% of HBM bandwidth**. Both terms are
+measured: the 28.64 ms on the card, the 23.337 GB from a per-key dump. Nothing in
+that ratio passes through a kernel's achieved rate, which is why it is the one
+figure here that survived the day.
+
+An earlier version of this paragraph said the weight stream explained two thirds
+of the forward, arriving there by dividing 21.896 GB by the fp4 GEMM's measured
+1144.7 GB/s. It is withdrawn twice over. The rate is measured at M=8 and so
+already contains whatever makes M=8 slow, which makes the ratio close to an
+identity; and 10.625 of those 21.896 GB are **fp8** weights that run through
+`linear_fp8`, a kernel whose rate has never been measured — the numerator carried
+bytes the denominator has no path for.
+
+The fp4 GEMM's own figure needs its premise stated too: 1144.7 GB/s at M=8 is
+`numel * itemsize` divided by measured time, so it reads as 28.6% of nominal only
+**under the assumption that each weight is read exactly once per tick**. If the
+kernel reuses a tile across output blocks it moves fewer bytes and the real
+utilisation is higher. Separating those needs DRAM counters from outside the
+process (`ncu --metrics dram__bytes_read.sum`); until then it is an estimate with
+a premise, not a measured bandwidth. That is the
 number this project should be optimising, and it is inside the decode kernel:
 occupancy, KV traffic, GDN state. Not the sampler, and not a new process
 topology.
