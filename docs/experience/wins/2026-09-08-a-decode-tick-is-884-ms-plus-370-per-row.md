@@ -66,13 +66,44 @@ pooled figure**, because the expensive steps are the emptiest and a per-step mea
 step-0 rows at cap 2048 would have shown at most 63.7% idle, so the figure moves ~16
 points with the cap and must never be quoted without it.
 
-## Why the refill upside is not `1/(1-idle)`
+## What refilling the idle slots is worth: 1.53x, ceiling 1.99x
 
-At 75.4% idle that formula gives 4.07x. Dividing by the occupancy penalty (a 1-row tick
-is 12.54 ms, an 8-row tick 38.44 ms, **3.07x**) gives ~1.33x.
+The two terms behave differently under refill, and that is the whole answer:
 
-**Neither number is trustworthy, and the second one is offered only to show the first is
-wrong.** Three reasons:
+```
+today:     wall = a + b·max        + c·sum
+refilled:  wall = a + b·(sum/slots) + c·sum
+```
+
+**`c·sum` is unchanged.** The tokens still have to be generated; refilling rearranges them
+across ticks and removes none of the KV work. Only `b·max` shrinks, to `b·sum/slots`.
+
+```
+gain = (b·max/sum + c) / (b/slots + c)
+```
+
+Per step over ten steps, pooled on Σmax/Σsum = 0.414:
+
+| pooled gain (slots=8) | **1.53x** |
+| ceiling (slots→∞, denominator falls to `c`) | **1.99x** |
+
+Per-step it ranges 1.15x to 2.06x, tracking each step's `max/sum`.
+
+**Two wrong answers were computed on the way, and both are instructive.** `1/(1-idle)` =
+4.07x assumes tick cost is occupancy-independent, which `c` refutes. Dividing that by the
+3.07x occupancy penalty gives 1.33x, and is also wrong: it applies the penalty to the
+whole wall clock including `c·sum`, the part refill cannot touch. A third figure, 1.70x,
+came from converting a pooled *idle* back into a max/sum ratio — but per-step `max/sum`
+ranges 0.208 to 0.703, and the mean of a ratio is not the ratio of the means, which is the
+same error this entry documents elsewhere.
+
+**So `idle` overstates what is recoverable.** Its denominator is slot-ticks; the quantity
+that matters has a denominator of cost. They agree only when a tick's cost is independent
+of occupancy — and `c` is exactly the measure of how much it is not. In step 1, 79.6% idle
+corresponds to 55% of the variable cost being recoverable.
+
+The three limits below still apply to the coefficients, though note the 1.99x ceiling
+depends only on `c` and does not use the extrapolated 8-row tick:
 
 1. **8 rows is 1.7x outside the observed range** (1.42 to 4.81 average active rows).
 2. **The regressor is wrong for the counterfactual.** `sum` counts row-ticks, but KV
