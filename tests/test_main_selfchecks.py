@@ -30,11 +30,25 @@ from pathlib import Path
 import pytest
 
 _SRC = Path(__file__).resolve().parents[1] / "src" / "tilerl"
+_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 
 # A ratchet, not a constant. Ten modules carry an asserting block today; if one
 # legitimately loses its block, lower this deliberately and let that edit be the
 # review point. A gate whose coverage can shrink in silence is the hole this closes.
 _MIN_MODULES = 10
+
+# Same ratchet for scripts/. Two are hermetic today; the rest import torch or a
+# backend and belong to the card, not to CI.
+_MIN_SCRIPTS = 2
+
+
+def _asserting_main(path: Path) -> bool:
+    """Does this file's ``if __name__ == "__main__"`` block contain an assert?"""
+    for node in ast.parse(path.read_text()).body:
+        if (isinstance(node, ast.If) and "__main__" in ast.unparse(node.test)
+                and any(isinstance(n, ast.Assert) for n in ast.walk(node))):
+            return True
+    return False
 
 
 def _asserting_main_modules() -> list[str]:
@@ -47,14 +61,26 @@ def _asserting_main_modules() -> list[str]:
     its block only calls main(), and pulling a CLI entry point into a self-check
     gate would run the real command line.
     """
+    return [p.stem for p in sorted(_SRC.glob("*.py")) if _asserting_main(p)]
+
+
+def _hermetic_scripts() -> list[str]:
+    """`scripts/*.py` whose asserting `__main__` needs no torch, backend or card.
+
+    Same hole as the modules above, one directory over: an assert nothing invokes
+    cannot even go green. Filtered rather than listed, and the filter is the import
+    surface -- a script that touches torch or a backend is a card instrument whose
+    self-check belongs to a pod run, not to a GPU-less CI host.
+    """
     out = []
-    for path in sorted(_SRC.glob("*.py")):
-        tree = ast.parse(path.read_text())
-        for node in tree.body:
-            if not (isinstance(node, ast.If) and "__main__" in ast.unparse(node.test)):
-                continue
-            if any(isinstance(n, ast.Assert) for n in ast.walk(node)):
-                out.append(path.stem)
+    for p in sorted(_SCRIPTS.glob("*.py")):
+        try:
+            hermetic = not any(k in p.read_text() for k in
+                               ("import torch", "get_backend", "build_engine"))
+        except SyntaxError:  # pragma: no cover - unparsable script
+            continue
+        if hermetic and _asserting_main(p):
+            out.append(p.name)
     return out
 
 
@@ -100,7 +126,35 @@ def test_main_selfcheck_passes(module):
     )
 
 
+def test_the_script_list_is_derived_and_has_not_shrunk():
+    scripts = _hermetic_scripts()
+    assert len(scripts) >= _MIN_SCRIPTS, (
+        f"only {len(scripts)} hermetic script(s) carry an asserting __main__, expected "
+        f">= {_MIN_SCRIPTS}: {scripts}."
+    )
+
+
+@pytest.mark.parametrize("script", _hermetic_scripts())
+def test_script_selfcheck_passes(script):
+    """`python3 scripts/<name>.py` exits 0. Same env discipline as the modules above."""
+    repo = _SRC.parents[1]
+    roots = [str(_SRC.parent), str(repo / "packages" / "tilerl-kernels" / "src")]
+    env = {**os.environ, "TILERL_TARGET": "cpu"}
+    env["PYTHONPATH"] = os.pathsep.join([*roots, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+    proc = subprocess.run(
+        [sys.executable, str(_SCRIPTS / script)],
+        capture_output=True, text=True, timeout=300, env=env, cwd=repo,
+    )
+    assert proc.returncode == 0, (
+        f"scripts/{script} self-check failed (rc={proc.returncode})\n"
+        f"--- stdout ---\n{proc.stdout[-2000:]}\n--- stderr ---\n{proc.stderr[-2000:]}"
+    )
+
+
 if __name__ == "__main__":  # runnable check
     mods = _asserting_main_modules()
     assert len(mods) >= _MIN_MODULES, mods
-    print(f"selfcheck gate: {len(mods)} modules derived -> {', '.join(mods)}")
+    scripts = _hermetic_scripts()
+    assert len(scripts) >= _MIN_SCRIPTS, scripts
+    print(f"selfcheck gate: {len(mods)} modules -> {', '.join(mods)}")
+    print(f"               {len(scripts)} scripts -> {', '.join(scripts)}")
