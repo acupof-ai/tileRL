@@ -153,6 +153,112 @@ def test_the_manifest_records_the_engine_config_the_wall_clock_depends_on(tmp_pa
     assert seen[4000] > seen[4], f"blocks did not track the context: {seen}"
 
 
+def test_the_eval_curve_records_the_step_a_score_was_reached_at(tmp_path, monkeypatch):
+    """`time_to_score = steps_to_score x seconds_per_step` needs the STEP, and
+    gsm8k_before/after cannot say which step a score was crossed at.
+
+    Three assertions, because the triple is only useful whole. `step` is the
+    numerator's operand, `secs` is the product, and `score` is what lets the
+    threshold live at the reading end -- the ledger records scores and never
+    decides which one counts.
+
+    `secs` is asserted MONOTONE and equal to `secs_total` at the last point, not
+    merely present. The first version of this accumulated into a local named
+    `elapsed`, which the timings loop 8 lines below rebinds every step, so the
+    curve reported 0.143 s at step 4 against 0.148 at step 2 -- a cumulative
+    figure going down, which a presence check passes.
+    """
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
+    data = tmp_path / "d.jsonl"
+    data.write_text('{"prompt": "1+1?", "answer": "2"}\n{"prompt": "2+2?", "answer": "4"}\n')
+    argv = ["--rl", "--data", str(data), "--eval-gsm8k", str(data), "--steps", "4",
+            "--group", "2", "--max-new-tokens", "4", "--lora-rank", "4",
+            "--allow-short-rollouts", "--eval-max-new-tokens", "4"]
+    _train([*argv, "--eval-every", "2", "--eval-curve-n", "2"])
+    (m,) = list_runs(tmp_path / "runs")
+    curve = m["eval_curve"]
+    assert curve["every"] == 2 and curve["n"] == 2
+    assert [p["step"] for p in curve["points"]] == [2, 4], curve
+    secs = [p["secs"] for p in curve["points"]]
+    assert secs == sorted(secs), f"cumulative seconds are not monotone: {secs}"
+    assert secs[-1] == pytest.approx(m["metrics"]["secs_total"], abs=0.01), (
+        f"the last point's {secs[-1]} s should be the run's own "
+        f"{m['metrics']['secs_total']} s")
+    for p in curve["points"]:
+        assert 0.0 <= p["score"] <= 1.0 and p["correct"] <= p["total"] == 2
+        # Each point prices its own scoring, so "keep the eval under 5% of a step" is
+        # checkable after a run instead of estimated before one. Asserted > 0 rather
+        # than merely present: a zero would mean the clock never ran.
+        assert p["eval_secs"] > 0.0, p
+
+    # Off by default, so no existing invocation changes shape.
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs2"))
+    _train(argv)
+    (off,) = list_runs(tmp_path / "runs2")
+    assert "eval_curve" not in off
+
+
+def test_time_to_score_returns_the_crossing_point_and_never_interpolates():
+    """`time_to_score = steps_to_score x seconds_per_step` read off a synthetic curve.
+
+    Synthetic, not a training run: the reader is arithmetic over recorded points and
+    a real run would make the SCORES the variable under test instead of the reading.
+    Three distinct answers, because collapsing any two of them loses information a
+    reader needs:
+
+    * reached -- the point that crossed, plus the interval `(after_step, step]` it was
+      crossed in. NOT an interpolated step: the target sits between two scoring points
+      and only the right end was measured, and this figure is the project's headline
+      metric. A fitted headline is exactly what the curve exists to prevent.
+    * instrumented but never reached -- `reached=False` with the best score, so nobody
+      reads the last point as if it were the target.
+    * no curve at all -- None. "Not instrumented" and "instrumented and fell short"
+      are different facts about a run and a single falsy answer conflates them.
+    """
+    from tilerl.ledger import time_to_score
+
+    curve = {"n": 20, "every": 10, "points": [
+        {"step": 10, "correct": 1, "total": 20, "score": 0.05, "secs": 100.0},
+        {"step": 20, "correct": 4, "total": 20, "score": 0.20, "secs": 210.0},
+        {"step": 30, "correct": 9, "total": 20, "score": 0.45, "secs": 320.0},
+    ]}
+    m = {"eval_curve": curve}
+
+    hit = time_to_score(m, 0.30)
+    assert hit["reached"] and hit["step"] == 30 and hit["after_step"] == 20, hit
+    assert hit["secs"] == 320.0 and hit["score"] == 0.45
+    # The interval is the whole point: 0.30 was crossed somewhere in (20, 30] and the
+    # reader must not be handed a step nobody scored at.
+    assert hit["step"] != 24 and 20 < hit["step"] <= 30
+
+    # An exact hit at the first point still reports after_step 0, not a missing key.
+    first = time_to_score(m, 0.05)
+    assert first["step"] == 10 and first["after_step"] == 0
+
+    miss = time_to_score(m, 0.90)
+    assert miss["reached"] is False and miss["steps_run"] == 30
+    assert miss["best"] == 0.45 and miss["secs"] == 320.0
+
+    assert time_to_score({}, 0.1) is None, "no curve is None, not a miss"
+    assert time_to_score({"eval_curve": {"points": []}}, 0.1) is None
+
+    # The subset's width travels with the answer, both when it reached and when it did
+    # not. A curve scores a SUBSET, so its 0.45 is not the run's `gsm8k_after` over
+    # --eval-n rows, and at n=20 the binomial SE is 11.2 pt -- 2.2x P1's own +5 pt
+    # target, which means the crossing STEP is set by which rows are in the subset as
+    # much as by the policy. Asserting the number, not just the key: the whole point is
+    # that a reader sees how wide it is. (tilerl-0a named the resolution.)
+    assert hit["n"] == 20 and hit["total"] == 20 and hit["correct"] == 9
+    assert hit["se_pt"] == 11.18, hit
+    assert miss["n"] == 20 and miss["se_pt"] == 11.18
+    wide = time_to_score({"eval_curve": {"n": 500, "points": [
+        {"step": 10, "correct": 300, "total": 500, "score": 0.60, "secs": 9.0}]}}, 0.55)
+    assert wide["se_pt"] == 2.24, wide
+    # 2.24 < 5.0 so the reader stays silent there, and 11.18 >= 5.0 so it warns.
+    from tilerl.cli import _se_note
+    assert _se_note(wide) == "" and "sampling-limited" in _se_note(hit)
+
+
 def test_periodic_rollout_guard_stops_at_first_window_crossing(tmp_path, monkeypatch, capsys):
     from contextlib import suppress
 

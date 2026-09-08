@@ -99,6 +99,45 @@ def verdict_of(m: dict, kind: str = "verdict") -> bool | None:
     return all(g["passed"] for g in scored) if scored else None
 
 
+def time_to_score(m: dict, target: float) -> dict | None:
+    """When this run first scored >= ``target``, as a MEASUREMENT not a fit.
+
+    The objective is ``time_to_score = steps_to_score x seconds_per_step``, and the
+    curve is the only record that carries the step. Returns None when the run has no
+    curve at all -- distinct from a curve that never reached the target, which returns
+    ``reached=False``, because "not instrumented" and "instrumented and did not get
+    there" are different facts about a run.
+
+    The target usually falls BETWEEN two scoring points, so the answer is the point
+    that crossed it plus the interval it was crossed in: ``step 50``, ``after 40``. No
+    interpolation. An interpolated step is a number nobody measured, and this one is
+    the project's headline metric -- a fitted headline is the failure mode the whole
+    curve exists to avoid.
+    """
+    curve = m.get("eval_curve")
+    if not curve or not curve.get("points"):
+        return None
+    # The curve scores a SUBSET, so its score is a different quantity from the run's
+    # `gsm8k_after` over `--eval-n` rows -- and at small n the crossing step is set by
+    # sampling as much as by the policy: n=20 resolves 5 pt per cell and carries a
+    # binomial SE of 11.2 pt at p=0.5, against P1's +5 pt target. `n` and `se_pt` travel
+    # with the answer so a caller cannot read the step without the width. (tilerl-0a
+    # named the resolution; the SE is the operand that makes it decisive.)
+    n = curve.get("n") or (curve["points"][0].get("total") or 0)
+    se = 100.0 * (0.25 / n) ** 0.5 if n else None
+    common = {"target": target, "n": n, "se_pt": None if se is None else round(se, 2)}
+    prev = 0
+    for pt in curve["points"]:
+        if pt["score"] >= target:
+            return {"reached": True, **common, "step": pt["step"], "after_step": prev,
+                    "secs": pt["secs"], "score": pt["score"],
+                    "correct": pt["correct"], "total": pt["total"]}
+        prev = pt["step"]
+    last = curve["points"][-1]
+    return {"reached": False, **common, "steps_run": last["step"], "secs": last["secs"],
+            "best": max(pt["score"] for pt in curve["points"])}
+
+
 def format_run(m: dict) -> str:
     mt = " ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
                   for k, v in m["metrics"].items() if v is not None)
