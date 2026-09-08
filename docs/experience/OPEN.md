@@ -6,7 +6,6 @@ and no line here is the same defect this file exists to stop. Reviewers check a 
 
 | entry | path | fix |
 |---|---|---|
-| [the training rollout tick is 2.6x serving](errors/2026-09-08-the-training-rollout-tick-is-2.6x-serving.md) | `src/tilerl/train.py:442-445` rollout vs `build_engine` config | two full-27B B=8 decode measurements disagree **2.64x** with the slower one on the *shorter* context — 55.21 and 61.68 ms/tick training (two shas, two cards, agreeing to 1.12x) against 23.34 serving, all graph-on, all `wall / decode_forwards`. Worth **45.9% of a GRPO step** if it closed and **93% unattributed**: LoRA is ≤4% of the gap (0.537 GFLOP/tick is 0.054 ms even at 10 TFLOP/s; 768 launches inside a captured graph is 1.54 ms) and `fuse_projections` 2.9%. The reason on record was false — `_training_kv` is at `train.py:160` in the forward/backward, not the rollout, and the serving arm was itself W=1 no-draft. Arm: one process, one card, two engines, config the only variable — a reproduction there **localizes to the bundle, not a mechanism** |
 | [a miss self-reinforces](errors/2026-09-07-a-miss-self-reinforces.md) | `src/tilerl/engine.py:1031` `_finish_prefills` | one 31k-token miss published 62 chunk entries into a 6-snapshot budget and evicted every other session's shared head, so 11 of 12 sessions missed in sequence at 14.1 s each. **Fixed at the publisher** — the first interior boundary plus the last, a constant 2 publishes at any prompt length ([wins/2026-09-08](wins/2026-09-08-cut-the-prefill-publish-flood.md)). The remaining open half is the **V100 alternation** the cell was run to check: turn-0 hits on every other conversation, which did not reproduce on the H20 and needs the V100 grid with the per-row instrument |
 | [the rollouts grew into the cap](errors/2026-09-06-the-rollouts-grew-into-the-cap.md) | `src/tilerl/eval.py` `MATCHERS`, GRPO advantage | a length term in the reward or a length-aware advantage — `boxed_match` is correctness-only, so nothing prefers the shorter of two correct answers and the policy lengthens until it truncates |
 | [entries-per-row against the snapshot budget](errors/2026-09-08-four-mechanisms-one-regression-and-a-copied-flag.md) | `src/tilerl/engine.py:1044` `_finish_prefills` publish gate | #271 traded 62 nested entries for 2 and costs the DRAM-tier cell **1.81–2.12x** on the parent-child pair `45acd87`→`a43a379` (16 lines). Measured: TTFT is **linear in the tokens a hit did not match**, R² 0.998, predicting the unfitted miss row to −6.8%; and depth is a **512×k ratchet in submission order**, so each session's match is set by its queue position, earliest worst at 1.7%. Sign flips with turn depth (+259 s at turns 0–1, −54 s at turn 2), so **both endpoints of the count axis lose**. The two sizing constraints **conflict**: `K × snapshot_bytes ≤ budget` gives K ≈ 1 here while the depth threshold admits K ≈ 4–11. Arm: same pair at a budget where K ≥ 2 fits, in TTFT — after the fixed term is pinned |
@@ -37,6 +36,28 @@ evictions is impossible. The guard is also not conservative — `_demote_one` le
 in `_by_id`, so a demote cannot shrink the count term and only eviction can satisfy it.
 Removing the guard would demote every entry to the host tier under count pressure, find the
 count unchanged, and evict them anyway: one wasted tier write plus a `forget` per entry.
+
+Independently reproduced by another session with different constants (800-byte snapshots,
+16-token prefixes, a 4096-block pool so the block term cannot participate), which adds the row
+this table was missing — `len == capacity` exactly, the count at which "the guard is always
+false" should hold if it holds anywhere:
+
+| pressure | entries | demoted | evictions |
+|---|---:|---:|---:|
+| boundary — `capacity=9`, `state_bytes=2500`, 9 published | 9 | **6** | **0** |
+
+Same shape at different constants, so the refutation is not an artifact of the numbers chosen.
+
+**The block axis is a third term, and its missing demote branch is also not a defect.**
+`evict_until_free` (`:1330`) calls `_evict_one` directly with no demote branch, which reads
+like the same omission on another axis. It is deliberate and the errors entry says so at
+`:105`: a demote frees snapshot *bytes* and keeps the blocks, so it frees **zero** blocks and
+there is nothing a demote branch could do where blocks bind. Measured: a forced `_demote_one`
+moved `dram.demotions` 3→4 and `free_blocks` 58→58. Three terms, one tool — bytes is the only
+axis `_demote_one` can satisfy, and count and blocks each admit only eviction, by the same
+argument. What is open on the block axis is a *sizing* problem, not a missing branch: the tier
+converts byte pressure into block pressure, the block path then evicts already-demoted entries,
+and `_drop` calls `_dram.forget`, orphaning the host copy — 103 demotions for 0 promotions.
 
 The reasoning was self-consistent and no step in it was wrong. It described one branch while
 claiming something about all of them, and nobody ran the store. Two sessions read the shape;
