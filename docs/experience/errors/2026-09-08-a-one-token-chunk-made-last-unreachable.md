@@ -161,6 +161,17 @@ So candidate 3's extra store method is not incidental surface: a correct fix has
 boundary and spill it later, which means the store must accept a spill for an entry it already holds. That is
 the shape of the real fix, unbuilt.
 
+**That precondition was built, measured, and NOT landed — because the 2448 above is the wrong operand.** It comes
+from a chunk-arithmetic replay with no store, no tier and no pressure, so it counts boundary positions that are
+*schedulable*, not spills that would *happen*. A boundary entry has to survive to DONE while every other row in
+the batch publishes, and it usually does not: `spillable = clamp(snapshot_slots − batch, 0, batch)`, which is
+**12.5%** at the V100 default (9 resident snapshots against `max_batch = 8`). Worse, the spill's destination is
+the SSD tier, which is under a recorded REJECT on the serve path and defaults off; and for a second-turn hit the
+DRAM tier already reaches 100% on its own. So candidate 3 fixes *the boundary position is mispredicted* while the
+binding constraint is *the boundary entry does not live to DONE* — capacity, not the publisher. The store-side
+interface is kept as a design conclusion, not as code.
+[errors/2026-09-08-the-boundary-spill-measured-at-the-wrong-layer.md](2026-09-08-the-boundary-spill-measured-at-the-wrong-layer.md)
+
 ## Rule
 
 **A predicate that predicts another function's behaviour needs a test that runs both.** `_last_prefill_boundary`
