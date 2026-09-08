@@ -140,11 +140,11 @@ conservative under that failure mode** rather than flattered by it.
 
 `tilerl-0a` raised the limit that matters for the next decision: the tensor core does not care
 *which* 16 rows it has, so 0.762x holds identically for 16 = 2 prompts × 8 completions and for
-16 = 1 × 16. **A measurement that returns the same value for both options cannot choose between
-them** — and the choice is real, because their tie behaviour differs by an order of magnitude
-(one prompt sixteen times ties whenever that prompt is all-right or all-wrong; two independent
-eights need both to tie). The `--prompts-per-step` decision belongs to gradient signal, not to
-this axis, and quoting 23.8% in support of any particular decomposition is a misuse of it.
+16 = 1 × 16. **This figure is indistinguishable across the prompt/completion split, so it does
+not constrain that choice** — which is a real one, since tie behaviour differs by an order of
+magnitude between them (one prompt sixteen times ties whenever that prompt is all-right or
+all-wrong; two independent eights need both to tie). `--prompts-per-step` is decided on
+gradient signal, on a different axis from this one.
 
 **And the step time here must never be converted into seconds-per-correct.** The arms prompt
 with random token ids, so every completion is meaningless by construction and the reward is
@@ -250,6 +250,12 @@ flag.
   0 looks like a measurement.
 - **A guard belongs where the resource is consumed, not where the flag is parsed.** The CLI
   is one caller.
+- **State the axis a measurement is indistinguishable along, next to what it shows.** This one
+  settles the width and is silent on the prompt/completion split. The number is not weaker for
+  that — the failure mode is a reader with only the headline applying it off-axis.
+- **A measurement that can only confirm a bound whose sign is already argued has zero
+  information.** Cheap is not a reason to run one, and recording it as a verification
+  retroactively implies the conclusion was in doubt.
 - **Satisfy a new precondition in the stub, never with a default inside the guard.** A
   `getattr` fallback makes the guard pass for everyone, which is the same as not having it.
 - **A literal in a test is only safe while production also has a literal.** When the value
