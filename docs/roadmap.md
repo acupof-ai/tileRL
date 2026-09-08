@@ -60,9 +60,10 @@ changed here.
   so the addresses a capture baked survive an update. `train.py:345-373` already
   treats `recapture_graph=True` as a formal waiver. The exit criterion is
   unaffected and still card-bound.
-- **P3's optimizer CPU exit is met — three terms had teeth, the fourth did not
-  until #303.** Gradcheck (`tests/test_iso.py:27`, a Stiefel tangent against a
-  central difference through the retraction), orthonormality after retraction
+- **P3's optimizer CPU exit is NOT met — three terms had teeth, and the fourth
+  never measured what the phase is about.** Gradcheck (`tests/test_iso.py:27`, a
+  Stiefel tangent against a central difference through the retraction),
+  orthonormality after retraction
   (`:47`) and spectrum preserved over steps (`:59`) all discriminate. "SFT loss
   falls" was encoded as `losses[-1] < losses[0] - 0.1` against the run's own start,
   and **an ISO with its entire 2-D path disabled clears that bound by 53x** (drop
@@ -70,7 +71,12 @@ changed here.
   through `iso.py:101`). The natural control cannot fix it — plain Adafactor over
   8 steps beats ISO on 3 of 4 seeds, so "ISO's loss is lower" is flaky in both
   directions. #303 changes the observable instead: 2-D weights moved 17/17 versus
-  0/17, which is exact where the loss comparison is only statistical. **P3's merger CPU exit is met
+  0/17, which is exact where the loss comparison is only statistical. **That is a
+  mechanism check, not the phase's quantity.** Both the old bound and #303's
+  replacement are blind to a step count, and `test_iso.py:80` feeds the same 2x32
+  batch to all 8 steps, so what the criterion has always watched is memorization
+  of one batch. The exit is restated above as steps-to-a-fixed-loss against
+  Adafactor with a fresh batch per step, and it is unmeasured. **P3's merger CPU exit is met
   by #299**, which also corrects a gate that read `iso[0] <= avg[0] or iso[1] <= avg[1]`
   where this document says *each*.
 - **P4 is not complete.** The manifest's id block (`cli.py:494-509`) records no
@@ -163,7 +169,11 @@ bf16 — a reason to try it, not a number we own. Mechanism and memory in
 - Optimizer (CPU, today): frame gradients from `dW`, Newton-Schulz polar,
   Adafactor base, streamed updates. Exit: tiny-model gradcheck of the frame
   gradient, orthonormality after retraction, spectrum preserved over steps,
-  SFT loss falls.
+  and fewer steps than Adafactor to a fixed loss. The first three hold; the
+  fourth is NOT met. It replaces "SFT loss falls", which `test_iso.py:80`
+  passed by feeding one 2x32 batch 8 times -- that measures memorization of a
+  fixed batch, not an optimization trajectory, so it cannot see a step count
+  move in either direction.
 - Optimizer (pod, SFT first): steps to the same loss vs Adafactor on the 27B;
   peak < 96 GB. This is SFT because full-parameter RL has a ceiling:
 - **Per-step re-quantization into the served fp4 bytes** — the first pod item
