@@ -202,6 +202,12 @@ def test_before_eval_cache_reuses_rows_and_invalidates_length(tmp_path, monkeypa
     saved = json.loads((root / "eval-cache" / f"{key}.json").read_text())
     assert saved["rows"] == [json.loads(line) for line in rows.splitlines()]
     assert all(second["metrics"][k] == v for k, v in saved["metrics"].items())
+    # A duration is not a cacheable result. `eval_before_secs` matches the `_before` filter
+    # the payload is built with, so it lands in the cache unless kept out on purpose, and a
+    # hit would then report the miss's cost as its own. Assert both halves: absent from the
+    # payload, and each run recording the time it actually paid.
+    assert not [k for k in saved["metrics"] if k.endswith("_secs")]
+    assert second["metrics"]["eval_before_secs"] < first["metrics"]["eval_before_secs"]
     third, _, third_calls = run(0.002, 8)
     assert third_calls == 4 and not third["eval_before_cache"]["cache_hit"]
     assert third["eval_before_cache"]["key"] != key

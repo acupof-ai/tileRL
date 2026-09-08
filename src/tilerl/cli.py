@@ -373,6 +373,60 @@ def _write_eval_rows(run_id: str, tag: str, rows: list) -> float:
     return sum(r["tokens"] for r in rows) / max(1, len(rows))
 
 
+def _mcnemar(before: list, after: list, dataset: str = "gsm8k") -> dict | None:
+    """Paired significance on the per-question rows both arms wrote, or None.
+
+    The comparison IS paired: `cli.py` scores one `eval_rows` list in both arms and
+    `gsm8k_accuracy` forces temperature 0, so question i is the same question on both
+    sides. Keeping only the two totals threw that away and left the unpaired interval,
+    whose 80%-power one-sided MDE at n=500 is 7.70 pt -- ABOVE the roadmap's +5 pt
+    target, so a real effect at the standard would have failed to register. The paired
+    SE is `sqrt(b + c) / n` over the discordant counts, 1.00-1.41 pt at a 5-10% flip
+    rate, which puts +5 pt at 3.5-5 SE instead.
+
+    None when the arms cannot be paired -- different lengths, a missing `i`, or no
+    discordant pairs at all. `b + c == 0` is not a failure: it means the two arms
+    agreed on every question, so there is nothing for a paired test to resolve.
+    """
+    def by_i(rows):
+        out = {}
+        for r in rows:
+            if r.get("dataset", dataset) == dataset and "i" in r:
+                out[r["i"]] = bool(r["correct"])
+        return out
+
+    lo, hi = by_i(before), by_i(after)
+    if not lo or lo.keys() != hi.keys():
+        return None
+    b = sum(1 for i in lo if lo[i] and not hi[i])   # was right, now wrong
+    c = sum(1 for i in lo if not lo[i] and hi[i])   # was wrong, now right
+    n = len(lo)
+    if b + c == 0:
+        return {"n": n, "b": b, "c": c, "delta": 0.0, "se": None, "z": None}
+    se = (b + c) ** 0.5 / n
+    return {"n": n, "b": b, "c": c, "delta": (c - b) / n, "se": se,
+            "z": ((c - b) / n) / se}
+
+
+def _paired_delta(run_dir: Path) -> dict | None:
+    """`_mcnemar` over the two arms' `eval-{before,after}.jsonl`, or None if either is absent.
+
+    Reads the record rather than in-memory state so it works on the cache-hit path too:
+    a cached before-arm goes through `_write_eval_rows` like a fresh one, so the file
+    exists either way.
+    """
+    def rows(tag):
+        f = run_dir / f"eval-{tag}.jsonl"
+        if not f.is_file():
+            return None
+        return [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
+
+    before, after = rows("before"), rows("after")
+    if before is None or after is None:
+        return None
+    return _mcnemar(before, after)
+
+
 #: the before-arm's mean completion must leave headroom under the rollout cap. 0.8
 #: rather than 1.0 because the MEAN fitting exactly means half the rollouts do not.
 _ROLLOUT_HEADROOM = 0.8
@@ -435,6 +489,10 @@ def _within_group_r(rows: list) -> float | None:
     contributes zero deviation in reward and so cannot move r -- which is correct,
     it carries no signal, and it is also why r is None on a run where every group
     tied.
+
+    Recorded, never gated: the consumer is a person reading a finished P1 run, not code.
+    The sign says whether the length term is doing what run 2's diagnosis said it would,
+    and that reading needs the number together with the run's context.
     """
     import collections
 
@@ -527,7 +585,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
         "tp": args.tp,
         "reward": args.reward,
         # In the id: it changes what the reward MEANS, so two runs differing only here are
-        # not the same run and the second must not be handed the first's manifest.
+        # not the same run and the second must not be handed the first's manifest. Stays a
+        # float although the help calls it a switch -- narrowing the type would change every
+        # already-recorded id and orphan those runs' manifests.
         "length_penalty": args.length_penalty,
         "eval_max_new_tokens": args.eval_max_new_tokens,
         "load_adapter": file_hash(args.load_adapter) if args.load_adapter else None,
@@ -565,6 +625,12 @@ def _train_adapters(args: argparse.Namespace) -> None:
     # sees -- MMLU reaches 515 tokens against GSM8K's 183 -- so a short
     # --max-new-tokens must not shrink the pool under them. max_total_tokens only
     # guards one request and costs no memory, so it never drops below the 8192 default.
+    # Hand-computed, so `_fit_blocks` never runs here: passing num_blocks truthy is what
+    # skips it (engine.py:1645), and it is the only path that measures free memory instead
+    # of deriving a pool from context. That is deliberate for now -- training also holds
+    # gradients, the tape and the optimizer state, which `_fit_blocks` does not model, so
+    # its two-thirds rule is calibrated for serve. Whether training should use it is a
+    # card-pending question, not an oversight.
     ctx = max(max(map(len, prompts)) + args.max_new_tokens + 64, 1024)
     engine = build_engine(cfg, model, backend, num_slots=8, max_batch=8, draft=draft,
                           num_blocks=-(-ctx // BLOCK_TOKENS) * 8 + 8,
@@ -587,12 +653,19 @@ def _train_adapters(args: argparse.Namespace) -> None:
             manifest["eval_before_cache"] = {"key": key, "cache_hit": cache.is_file()}
 
     def evals(tag):
+        # Timed on BOTH paths, so the cache's payoff is a recorded number rather than an
+        # argument: a hit writes ~0 s here and a miss writes what the arm cost, and the
+        # difference is what wins/2026-09-05-before-eval-cache.md has owed since it landed
+        # `pending-remote` -- 55 lines of mechanism plus 129 of test is worth it at 15 min
+        # per hit and is not at 40 s.
+        t_eval = time.perf_counter()
         if tag == "before" and cache is not None and cache.is_file():
             saved = json.loads(cache.read_text())
             manifest["metrics"].update(saved["metrics"])
             _write_eval_rows(manifest["id"], tag, saved["rows"])
             mean_len[tag] = saved["mean_len"]
             manifest["eval_before_cache"]["cache_hit"] = True
+            manifest["metrics"][f"eval_{tag}_secs"] = time.perf_counter() - t_eval
             log(f"eval before: cache hit {cache.stem}")
             return
         rows_out: list = []
@@ -621,6 +694,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
             log(f"gsm8k greedy {c}/{n} = {100 * c / n:.1f}%{per}")
         if rows_out:
             _write_eval_rows(manifest["id"], tag, rows_out)
+        # Read before the cache write so a hit's cost excludes the write only a miss pays,
+        # but stored after it, because a duration is not a cacheable result: it belongs to
+        # the run that paid it. Inside the payload it would replay a past cost onto a hit
+        # -- 0.74 s where 0.0013 s was spent -- and `_secs` matches the `_before` filter.
+        elapsed = time.perf_counter() - t_eval
         if tag == "before" and cache is not None:
             saved = {"metrics": {k: v for k, v in manifest["metrics"].items() if "_before" in k},
                      "rows": rows_out, "mean_len": mean_len.get(tag)}
@@ -628,9 +706,13 @@ def _train_adapters(args: argparse.Namespace) -> None:
             with tempfile.NamedTemporaryFile("w", dir=cache.parent, delete=False) as f:
                 json.dump(saved, f)
             os.replace(f.name, cache)
+        manifest["metrics"][f"eval_{tag}_secs"] = elapsed
 
     drift = {"name": "rollouts_within_cap", "value": None,
              "threshold": _ROLLOUT_HEADROOM * args.max_new_tokens,
+             # Pre-seeded rather than built in `_finish`, so it carries its own `kind`:
+             # a gate without one would read as `verdict` to any consumer that defaults.
+             "kind": "validity",
              "skipped": True, "passed": None}
     if args.rl:
         manifest["gates"].append(drift)
@@ -836,6 +918,23 @@ def _timing_snapshot(m: dict) -> None:
 #: are "not measured" rather than passed -- `_finish` scores a None value as True.
 _AFTER_GATES = frozenset({"mmlu_holds", "gsm8k_improves"})
 
+#: The two classes a gate can belong to, recorded on the gate itself.
+#:
+#: VERDICT answers "did P1 pass": the two exit criteria `docs/roadmap.md:57-58` states.
+#: VALIDITY answers "is this run interpretable at all", and the roadmap already draws
+#: that line -- the tied-group criterion reads "< 50% (else the task is too easy for
+#: this model and the run says nothing)". Saying nothing is not failing.
+#:
+#: `reward_rises` is the reason this split matters. Reward is the quantity GRPO
+#: optimizes, so it rising is the definition of the optimizer working, not evidence for
+#: P1's claim that RL moves a DOWNSTREAM number -- and rising reward is fully
+#: compatible with a falling eval, which is what reward hacking looks like. So it must
+#: never be able to make P1 read `pass`. Reward NOT rising is informative (run 2
+#: collapsed that way), and that failure is coarse enough for a zero threshold to
+#: catch, which is why this needs no invented number.
+_VALIDITY_GATES = frozenset({"groups_untied", "reward_rises", "ce_falls",
+                             "rollouts_within_cap"})
+
 
 def _finish(m: dict, as_json: bool) -> None:
     """Gate, write the manifest, print it, exit non-zero on a failed gate.
@@ -861,6 +960,15 @@ def _finish(m: dict, as_json: bool) -> None:
         gsm_total = g.get("gsm8k_after_total") or g.get("gsm8k_before_total")
         gsm_floor = (None if g.get("gsm8k_before") is None or not gsm_total
                      else g["gsm8k_before"] + 0.05 * gsm_total)
+        # The paired test, RECORDED beside the threshold rather than replacing it. The
+        # threshold is the roadmap's exit criterion and stays the gate; McNemar says
+        # whether the observed move is resolvable at all, which the threshold cannot --
+        # an unpaired read of n=500 has an 80%-power MDE of 7.70 pt, above the +5 pt the
+        # gate asks for. Falls back silently to threshold-only when the per-question rows
+        # are absent, which is what P1 did once already for want of them.
+        paired = _paired_delta(Path(runs_root()) / m["id"])
+        if paired is not None:
+            m["metrics"]["gsm8k_paired"] = paired
         skipped = m["inputs"].get("steps") == 0
         after_skipped = bool(m.pop("gates_skip_after", False))
         # `ce_falls` has no threshold on the RL path: `ce_first` is written only by the
@@ -870,6 +978,7 @@ def _finish(m: dict, as_json: bool) -> None:
         unmeasured = frozenset() if g.get("ce_first") is not None else frozenset({"ce_falls"})
         m["gates"] += [
             {"name": n, "value": v, "threshold": t,
+             "kind": "validity" if n in _VALIDITY_GATES else "verdict",
              "skipped": skipped or n in unmeasured or (after_skipped and n in _AFTER_GATES),
              "passed": None if skipped or n in unmeasured
              or (after_skipped and n in _AFTER_GATES)
