@@ -69,9 +69,13 @@ followed the advice over-allocated a slot. Measured across four configs:
 | 4 | 8 | on | 5 | 4 | yes |
 
 Row 2 is the refutation: `num_slots == max_batch` with the graph on is already exact. The
-`+ 1` is real only for a caller constructing `Engine(...)` directly and sizing its own pool
-— `scripts/probe_verify_ceiling.py:197` does, as `B + 2`. So the message now reports the
-pool it actually holds (`this one holds 5`) instead of advising an argument it cannot see.
+`+ 1` is real only for code sizing a `LinearStatePool` itself —
+`scripts/probe_verify_ceiling.py:197` does, as `B + 2`. The message now names `num_slots` for
+the `build_engine` path and gives the direct-pool number separately, because **a remedy has to
+be phrased in the parameter the reader passes.** "Size the state pool for max_batch + 1" is
+not a remedy anyone can apply: nobody passes a state pool to `build_engine`, so the reader
+applies the `+ 1` to `num_slots` and reproduces the exact misread this message already caused,
+one layer down. That fix is `tilerl-27`'s.
 
 It was all true once. `tests/test_decode_graph.py:110` carries the comment **"slots are taken
 at admission now, not in submit"** — from the pad-row fix, in the same file, 300 lines below
@@ -80,6 +84,29 @@ both halves of the warning described the world before it. The test recorded the 
 warning did not.
 
 **A comment is not covered by the test that changed the thing it describes.**
+
+## The test for two clauses reached one of them
+
+The first version of the test called `build_engine` without `decode_graph`. `_graph_on`
+(`engine.py:64-69`) resolves `None` to `backend.device.type == "cuda"`, so **on CPU — the
+machine CI runs on — the pad was never reserved**:
+
+- `assert e.usable_slots == num_slots` held whether the pad accounting was right or wrong,
+  because `pad = 0`;
+- the message's pad branch never rendered, so the clause found *second* had **no coverage at
+  all**.
+
+Parametrizing `decode_graph` over `[False, True]` fixes it and costs nothing to run anywhere:
+the reservation is pure Python in `build_engine`, and only the capture is CUDA-only (the graph
+arm falls back to eager with a warning on CPU, which does not touch slot accounting). The
+mutant proves the coverage is asymmetric in the right way — sizing the pool `num_slots`
+instead of `num_slots + pad` leaves the `eager` arm **green** and turns the `graph` arm
+**red** with `assert 4 == (4 + True)`.
+
+Found by `tilerl-27`. The rule this entry already states — *when a stale description is found,
+the unit to re-check is everything that commit moved* — applies to the test as much as to the
+code: **I wrote one test for two clauses and it could only reach one.** A default parameter
+silently excluded the half I had discovered ten minutes earlier.
 
 ## The reasoning failure: a disagreement impersonated a check
 
@@ -114,13 +141,24 @@ about itself.
 **A comment stating a consequence needs a test that asserts the consequence.** The
 mechanism half of this warning (`usable_slots` is the ceiling) had a test. The consequence
 half (what happens past it) had none, so it drifted silently through the fix that changed it.
-The new test asserts all three properties that distinguish the possibilities: every row
+The test asserts all three properties that distinguish the possibilities: every row
 finishes (not dropped), no submit raises (not a raise), and peak width equals the slot count
 (not full concurrency) — with a negative control at `num_slots=8` that peaks at 8, so the
-slot count is shown to be what bound it rather than the planner or the prompt. Two mutants,
+slot count is shown to be what bound it rather than the planner or the prompt. Three mutants,
 one per wrong answer: `_admit` raising instead of returning False makes it red with
-`RuntimeError`, and dropping the queued request instead of breaking makes it red with
-`4 of 8 finished`.
+`RuntimeError`, dropping the queued request instead of breaking makes it red with
+`4 of 8 finished`, and taking the pad from the caller's `num_slots` makes the `graph` arm red
+with `assert 4 == (4 + True)` while the `eager` arm stays green.
+
+**A message is an artifact, so assert its text.** Two sessions read this warning and neither
+ran it. The test now pins the words: it must say `queues`, must not say `raise`, must name
+`num_slots >= max_batch`, and must mention the pad row only on the arm that has one. A string
+that misleads for a week is a defect with no failing test until someone asserts the string.
+
+**Check a fix's own coverage against the same commit-wide unit.** The rule above about
+re-checking everything a stale commit moved applies to the test written to close it. Mine
+covered two clauses on paper and one in fact, because a default parameter (`decode_graph=None`
+→ False on CPU) excluded the half I had found last.
 
 **Fixing the clause I was told about did not make me read the rest of the message.** The
 `+ 1` clause was equally false and sat one line below, and I only found it because I ran the

@@ -402,17 +402,21 @@ class Engine:
         # Warn rather than clamp, because a test that submits two rows into a 2-slot
         # pool with the default max_batch=8 is a legitimate config, not a mistake.
         if self.usable_slots < limits.max_batch:
-            # No pad advice: build_engine already adds it (`num_slots + pad`), so
-            # num_slots >= max_batch is exact there, and a caller sizing its own pool
-            # sees the pool count in this message rather than its own argument.
+            # The remedy names `num_slots`, the parameter the reader passes. Naming the
+            # pool instead is what made the old "+ 1 for the pad row" get applied to a
+            # build_engine call that already adds it -- the misread this message caused.
+            remedy = f"pass num_slots >= {limits.max_batch} to build_engine"
+            if self._pad_slot is not None:
+                remedy += " (it adds the decode graph's pad row itself)"
             warnings.warn(
                 f"{self.usable_slots} usable state slots against max_batch="
                 f"{limits.max_batch}: a slot is held from submit to finish, so "
                 f"concurrency is capped at {self.usable_slots} and the excess queues "
                 f"into later ticks rather than raising -- twice the ticks at half the "
-                f"width, not an error. Size the state pool for max_batch"
-                + (f" + 1 (this one holds {self._states.num_slots}, one of them the "
-                   "decode graph's pad row)" if self._pad_slot is not None else ""),
+                f"width, not an error. To run {limits.max_batch} rows at once, "
+                f"{remedy}, or size a LinearStatePool for "
+                f"{limits.max_batch + (self._pad_slot is not None)} directly "
+                f"(this one holds {self._states.num_slots})",
                 stacklevel=2,
             )
 
