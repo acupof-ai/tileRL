@@ -127,8 +127,10 @@ def test_the_manifest_records_the_engine_config_the_wall_clock_depends_on(tmp_pa
     Two things are asserted, not one. The keys must be present AND `blocks` must
     track the pool -- a key list alone goes green over a hardcoded dict, and
     `--max-new-tokens` is what sizes the training pool
-    (`num_blocks = ceil(ctx/16)*8 + 8`, `cli.py:570`), so two runs differing only
-    there must report different pools.
+    (`num_blocks = ceil(ctx/16)*group + 8`), so two runs differing only there must
+    report different pools. `slots` and `max_batch` are asserted against --group
+    rather than a literal 8: they used to BE literal 8 while --group was settable,
+    which made `--group 16` queue into two waves of 8 with nothing raising.
 
     4000, not 200: `ctx` has a 1024 floor (`cli.py:568`), and at 200 both arms land
     on it and report 520 blocks each. Written with 200 first, and the pair-assert is
@@ -145,7 +147,10 @@ def test_the_manifest_records_the_engine_config_the_wall_clock_depends_on(tmp_pa
         assert m["engine"].keys() == {
             "blocks", "slots", "max_batch", "max_total_tokens",
             "max_num_batched_tokens", "decode_graph", "prefix_store", "spec_width"}
-        assert m["engine"]["slots"] == 8 and m["engine"]["prefix_store"] == "NoPrefixStore"
+        # Tracks --group, not a literal: the training engine is sized from it, so a
+        # frozen 8 here would pass while production computed something else.
+        assert m["engine"]["slots"] == 2 == m["engine"]["max_batch"]
+        assert m["engine"]["prefix_store"] == "NoPrefixStore"
         seen[new] = m["engine"]["blocks"]
         # Not in `inputs`: the id hashes inputs, so a pool field there would make
         # every pool change a new run instead of a rerun.

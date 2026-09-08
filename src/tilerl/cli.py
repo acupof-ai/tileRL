@@ -632,8 +632,15 @@ def _train_adapters(args: argparse.Namespace) -> None:
     # its two-thirds rule is calibrated for serve. Whether training should use it is a
     # card-pending question, not an oversight.
     ctx = max(max(map(len, prompts)) + args.max_new_tokens + 64, 1024)
-    engine = build_engine(cfg, model, backend, num_slots=8, max_batch=8, draft=draft,
-                          num_blocks=-(-ctx // BLOCK_TOKENS) * 8 + 8,
+    # Sized from --group, not a literal 8: grpo_loop submits the whole group at once
+    # (train.py, one submit per g), so a group wider than the engine runs in waves and
+    # every rollout in the second wave decodes at a batch the tensor core underfills.
+    # The three used to be 8 while --group was a settable flag defaulting to 8, so
+    # --group 16 quietly became two waves of 8.
+    rollout_batch = max(args.group, 1)
+    engine = build_engine(cfg, model, backend, num_slots=rollout_batch,
+                          max_batch=rollout_batch, draft=draft,
+                          num_blocks=-(-ctx // BLOCK_TOKENS) * rollout_batch + 8,
                           max_total_tokens=max(ctx, 8192),
                           spec_depth=args.depth, decode_graph=True,
                           prefix_store=NoPrefixStore())
