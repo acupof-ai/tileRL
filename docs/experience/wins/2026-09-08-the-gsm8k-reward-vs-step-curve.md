@@ -2,12 +2,33 @@
 
 **Date:** 2026-09-08
 **Session:** v100-sm70-fp4-55
-**Card:** H20 card 3, claim `tilerl-curve`, pid 1150334, tree `/work/tilerl-s-v100-sm70-fp4`
-sha `12da5a0`, log `/work/curve.log`
+**Card:** H20 card 3, claim `tilerl-curve2`, pid 1170264, tree `/work/tilerl-s-v100-sm70-fp4`
+sha `fd0c876`, log `/work/curve2.log`
 
 Written **before** the results, because every number below is a precondition or a threshold and
 a threshold decided after the data is not a threshold. The results section is appended when the
 run finishes.
+
+**Restarted at 13:55Z.** The first attempt (pid 1150334, sha `12da5a0`, log `/work/curve.log`)
+ran 24 steps and was killed: `12da5a0` predates #323, so its curve points carried none of the
+per-problem rows the **paired** 1.00 pt threshold below requires, and none of the `mean_len` /
+`at_cap` fields that separate a score from a truncation artefact. The sha had been verified and
+its contents had not —
+[errors/2026-09-08-a-sha-confirmed-and-its-contents-not.md](../errors/2026-09-08-a-sha-confirmed-and-its-contents-not.md).
+Restart cost ~15 min: the before-arm eval is a cache hit, and the 24 completed steps re-run at
+23.3 s each. They did **not** re-run identically — steps 1-3 drew the same rollouts and step 4
+onward diverged, so `--seed 0` fixes the inputs and not the trajectory. Nothing else in this
+document changes — same flags, same criteria — but the two attempts are **two samples of one
+configuration**, not one run continued.
+
+**Three numbers the first attempt did measure**, all of which carry over because the
+configuration is identical:
+
+| quantity | reading | why it matters below |
+|---|---|---|
+| seconds per step | **23.3 s** (n=24, min 15.6, max 35.2) | the anchor's 56.88 is **2.44x** this, so `time_to_score` is read off this run's own `secs` and any plan priced at 56.88 is 2.44x too expensive |
+| GSM8K base, greedy, cap 2048 | **87.4%** (437/500), 396.5 tok/correct | 0.6 pt from the anchor's 88.0, inside the 2.1 pt SE of that difference — **the base end of the anchor is reproduced**. Not re-measured on the restart: the cache serves the same rows, which is why it is a carry-over rather than a second reading |
+| no-gradient steps | **10 of 17 tied**: 7 all-correct, 3 all-at-cap | a flat curve has two readings, and `tied` alone does not separate them; see the fifth branch in [what runs next](2026-09-08-what-runs-next-after-the-curve.md) |
 
 ## What this run answers
 
@@ -133,8 +154,32 @@ the per-request limit.
 **Anchor check, which takes precedence over reading the curve at all.** Step 100 must land in
 **[90.5, 96.7]**: SE at p=0.936, n=500 is **1.09 pt** (not 2.24 — that is the p=0.5 worst case),
 and the band is `± 2 × 1.09 × √2` for the difference of two independent measurements. Outside
-the band, the first three points have no referent and are not read; difference 3 above is the
-first suspect.
+the band, the first three points have no referent and are not read.
+
+**The band contains eval sampling noise only, and that is now known to be incomplete.** Its
+derivation assumes two runs of one configuration at one seed land on the same score, with the
+difference coming from which 500 rows were scored. The restart refuted that assumption
+directly: two attempts of this exact configuration at `--seed 0` agreed on the first three
+steps' rollouts and diverged from step 4. So a step-100 score carries a **trajectory variance
+term whose magnitude is unmeasured**, and the band is therefore too narrow by an unknown amount.
+
+The band is **not widened** — a threshold moved after the data is not a threshold, and there is
+no measurement to widen it by. What changes is the disposition when a point falls outside, which
+now has a fourth candidate ranked first:
+
+| | candidate | evidence today |
+|---|---|---|
+| **0** | trajectory divergence between two runs of one configuration; magnitude unknown | **the two logs** — direct, and the only one with any |
+| 1 | a replayed decode graph served stale weights | none; tested by re-running the after-arm from the saved adapter at `decode_graph=False` |
+| 2 | data order — the anchor ran a different `--data` file | none; check the two files' `file_hash` and level histograms |
+| 3 | GPU non-determinism | none; smallest term, well under a point on a 500-row greedy eval |
+
+Quantifying candidate 0 needs three repeats of one configuration, ~2 hours, and is **not being
+run**: tonight's object is the first curve, not a curve with error bars. The consequence is that
+an out-of-band step 100 is **not evidence of a defect** until candidate 0 is excluded, and
+candidate 1's check is what excludes the one mechanism that would be.
+
+Ranking proposed by `tilerl-27`, which set the original band and revised it on this reading.
 
 **Saturation.** Adjacent points differing by **< 1.00 pt** and both ≥ 90.5. That is the
 **paired** width — every point scores the same `curve_rows`, so the comparison is paired
@@ -174,4 +219,76 @@ bare question. This run's eval lengths are the first on the production path.
 
 ## Results
 
-Appended when the run finishes.
+| point | score | net vs base | mean tok | tok/correct | cumulative train s | eval s |
+|---:|---:|---:|---:|---:|---:|---:|
+| base | 87.4% (437/500) | — | 346.5 | 396.5 | — | — |
+| step 25 | **93.2%** (466/500) | **+5.80 pt** | 117.8 | 126.4 | 537.4 | 614.3 |
+| step 50 | **93.4%** (467/500) | +6.00 pt | 153.1 | 164.0 | 1038.6 | 741.4 |
+| step 75 | **82.4%** (412/500) | **−5.00 pt** | 122.8 | 149.0 | 1555.7 | 639.3 |
+
+All four arms score the same 500 problems, so every comparison below is paired (McNemar over
+`eval-curve-<step>.jsonl`, which #323 puts on disk):
+
+| pair | wrong→right | right→wrong | discordant | net | paired SE | σ |
+|---|---:|---:|---:|---:|---:|---:|
+| base → 25 | 40 | 11 | 10.2% | **+5.80 pt** | 1.43 | 4.06 |
+| 25 → 50 | 10 | 9 | 3.8% | **+0.20 pt** | 0.87 | 0.23 |
+| 50 → 75 | 7 | **62** | 13.8% | **−11.00 pt** | 1.66 | **6.62** |
+| base → 75 | 26 | 51 | 15.4% | **−5.00 pt** | 1.75 | 2.85 |
+
+**Saturation is at step 25, on the pre-registered criterion, and it is met exactly.** Adjacent
+points 25 and 50 differ by 0.20 pt — below the registered 1.00 pt — and both are ≥ 90.5. The
+paired SE for that pair is **0.87 pt**, *below* 1.00, so this is not the undecided band the
+step-25 discordance opened up: 3.8% discordance rather than 10.2%. The criterion decided
+cleanly on its own terms.
+
+**Then step 75 collapsed 11 points, and the training reward did not.** Per-step means:
+
+| steps | reward | ce | tied | tok |
+|---|---:|---:|---:|---:|
+| 1-25 | 0.800 | 3.26 | 0.56 | 161 |
+| 26-50 | 0.900 | 4.09 | 0.68 | 136 |
+| 51-75 | **0.855** | 3.69 | 0.80 | 157 |
+
+The rollout reward in the window that lost 11 points of greedy accuracy is 0.855 against the
+previous window's 0.900 — a 5% dip, while the eval fell 11.8%. **62 problems went right→wrong
+against 7 the other way**, so this is a real loss of capability on specific problems, not a
+scoring artefact and not truncation (0/500 at the cap in every arm).
+
+**The gate that would have caught this cannot see it.** `reward_rises` compares windowed
+rollout reward, which held; `gsm8k_improves` compares before against after, and step 100 has
+yet to land. Nothing in the manifest reads a *curve* for monotonicity. `tilerl-0a` proposed
+exactly this criterion — a crossing requires the target held afterwards, not just reached once —
+half an hour before the data produced the case. It is now in `ledger.time_to_score` as `held`
+and `dipped_at`, reported alongside `reached` rather than suppressing it.
+
+**What this does to the headline.** `steps_to_score` at X=91.0 is 25 or earlier, and the run
+also shows the score does not stay there. Those are two facts and the second is not a correction
+of the first: a policy that reaches 93.2% at step 25 and 82.4% at step 75 has a **best step**,
+which is what a training run should be stopped at, and no early-stopping mechanism exists in
+this tree. **The mechanism of the collapse is unmeasured.** Reward held, so the candidates are
+the policy drifting off the eval's distribution while still satisfying the reward, or an
+instability in the LoRA update; nothing here distinguishes them.
+
+**Length is not monotone either.** 346.5 → 117.8 → 153.1 → 122.8. The 2.94x compression at step
+25 is a **minimum, not a trend**: step 50 gives back 30% of it while the score is flat, so
+length and score move independently after step 25. The earlier reading in this entry — that the
+length collapse is "the main effect" — holds for base→25 and does not extend past it.
+
+**Predictions, scored.** `tilerl-27` predicted step 25 **≥ 93.0** and was right (93.2). This
+session predicted **[90, 93)** and was wrong. Neither prediction covered a collapse.
+
+**Cost.** Eval is **614-741 s per 500-row point** against 23.3 s/step of training — 114% of the
+training it measures at step 25. Four points cost ~33 min of eval against ~39 min of training.
+
+**Where the rows are.** The restarted run **reuses the first attempt's id** `86a06dc8c420`,
+because the id hashes the inputs and the inputs are identical — evidenced by that manifest's
+`started` moving 13:05 → 13:50. The newer-looking `0435924d7108` is **another session's
+synthetic run** (`source: tiny`, commit `2ea4a1f`, started and finished at 13:09:12 with a full
+gate set), which I first misread as the killed attempt's leftover. Two predicates: find the run
+by the id its manifest names, not by mtime, **and** confirm a directory is yours before
+concluding from its contents — a shared `runs/` holds other sessions' runs.
+
+Step 100 pending.
+
+Points 2-4 pending.
