@@ -136,6 +136,22 @@ sub-second ramp. The honest limit is that a *thermal* excursion over a 130 s ste
 unmeasured — and it would hit the longer arm harder, understating B=16, so **0.762x is
 conservative under that failure mode** rather than flattered by it.
 
+### What this number cannot decide
+
+`tilerl-0a` raised the limit that matters for the next decision: the tensor core does not care
+*which* 16 rows it has, so 0.762x holds identically for 16 = 2 prompts × 8 completions and for
+16 = 1 × 16. **A measurement that returns the same value for both options cannot choose between
+them** — and the choice is real, because their tie behaviour differs by an order of magnitude
+(one prompt sixteen times ties whenever that prompt is all-right or all-wrong; two independent
+eights need both to tie). The `--prompts-per-step` decision belongs to gradient signal, not to
+this axis, and quoting 23.8% in support of any particular decomposition is a misuse of it.
+
+**And the step time here must never be converted into seconds-per-correct.** The arms prompt
+with random token ids, so every completion is meaningless by construction and the reward is
+noise — a stronger version of 0a's finding that 32 of 100 level-5 rollouts hit the 2048 cap and
+scored zero. The per-token ratio survives that (cost does not depend on correctness, and both
+arms generate exactly 1024 per row); anything multiplied by an accuracy does not.
+
 ### The contaminated arm, kept on record
 
 B=8 is 26.55 ms/token, B=16 is **31.00 ms/token — 1.168x worse**, the opposite of the
