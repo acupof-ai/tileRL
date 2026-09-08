@@ -115,32 +115,16 @@ the right shape with a sixth of the data, which no shape check catches.
 
 ## What the file measures, now that it exists
 
-The level-5 base, n=100 on card 0: **64/100 = 64.0%**. Two things about that number.
+The level-5 base is **91/100 = 91.0%** at a 6144 cap. At the recipe's 2048 it read 64/100, which
+was a lower bound rather than the base: 32 completions hit that cap and 0 of those 32 scored
+correct, and rerunning exactly those 32 at 6144 gives 27 correct, 2 wrong, 3 still at the new cap.
+The full accounting and what it does to P1's target is in
+`errors/2026-09-08-a-cap-reported-as-a-base.md`.
 
-**The 45.8% (11/24) the recipe cites is 18.2 pt low.** It was a 24-problem hand sample, SE 10.2
-pt, so 64.0 sits 1.8 SE above it — not a contradiction, but the citation should read "sample too
-small and low; measured 64.0%" wherever it is used as an expectation. It was never a property of
-the dataset.
-
-**64.0% is itself a ceiling artifact, not the model's accuracy.** Of the 100 completions, **32
-hit the 2048-token cap and 0 of those 32 are correct**; of the 68 that terminated naturally, 64
-are correct — **94.1%**. The histogram is a cliff, not a gradient:
-
-| tokens | n | correct |
-|---|---:|---:|
-| 0–500 | 7 | 6 (86%) |
-| 500–1000 | 24 | 22 (92%) |
-| 1000–1500 | 21 | 21 (100%) |
-| 1500–1800 | 13 | 12 (92%) |
-| 1800–2047 | 3 | 3 (100%) |
-| **≥2048** | **32** | **0 (0%)** |
-
-Longest natural completion: 1889. So nothing between 1889 and 2048 exists, and the 32 at the cap
-are truncated mid-derivation rather than wrong. **A truncated correct answer scores as wrong**,
-which both depresses the reward and pins those 32 to a constant all-wrong outcome in any group —
-so they inflate a tied-group fraction by a known amount that cannot be attributed. Reading
-`tied_fraction` under this cap measures the cap. Whether raising it recovers them is a separate
-measurement, running at 6144 on the same 32 problems.
+**The 45.8% (11/24) the recipe cites is 45 points low**, not the 18 I first wrote against the 64.0%
+reading. It was a 24-problem hand sample, SE 10.2 pt, so the citation should read "sample too small
+and low; measured 91.0%" wherever it is used as an expectation. It was never a property of the
+dataset.
 
 ## Rule
 

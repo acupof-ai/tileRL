@@ -35,13 +35,23 @@ RECIPES: dict[str, dict] = {
     # the \boxed{} and 5 of the first 6 steps tied at the FLOOR with reward 0.
     # eval_max_new_tokens is explicit for the same reason gsm8k's is: scoring at the
     # 512 rollout cap would measure the cap (errors/2026-09-04-the-eval-cap-measured-itself.md).
-    # 2048 is STILL measuring the cap on level 5, measured 09-08 on the level-5 file, n=100:
-    # 64/100 = 64.0%, but 32 completions hit 2048 and 0 of those 32 are correct, while 64 of
-    # the 68 that terminated are (94.1%). Longest natural completion 1889, so the gap 1889-2048
-    # is empty and those 32 are truncated mid-derivation, scored wrong. A cap raise is pending
-    # the 6144 rerun of exactly those 32 -- do not set it from a guess, and do not read a
-    # tied-group fraction under 2048: 32% constant all-wrong inflates it by an unattributable
-    # amount (errors/2026-09-08-a-generator-that-never-ran.md).
+    # 2048 was MEASURING the cap on level 5, and the correction is 27 points. Measured 09-08 on
+    # the level-5 file, n=100: 64/100 at cap 2048, but 32 completions hit 2048 and 0 of those 32
+    # were correct, while 64 of the 68 that terminated were. Longest natural completion 1889, so
+    # 1889-2048 is empty and those 32 were truncated mid-derivation, not wrong. Rerunning exactly
+    # those 32 at 6144 (runs-l5c/2898b40d2130): 27 correct, 2 wrong, 3 still at the new cap. So
+    # the base is 91/100 = 91.0% and the interval is [91%, 94%], not the 64.0% first reported --
+    # a cap that scores truncation as wrong yields a LOWER bound, never the value
+    # (errors/2026-09-08-a-cap-reported-as-a-base.md).
+    #
+    # Two consequences, both open and neither a cap question:
+    # * P1 wants base+5 = 96%, which is 2 pt ABOVE the 94% this cap can produce, so no `after`
+    #   value passes at 6144. Raise the cap, or change the criterion.
+    # * level 5 was chosen for being harder than GSM8K, which failed P1 by being solved at 88.0%.
+    #   At 91.0% it is EASIER. The 24-pt difficulty gap was the cap.
+    # And the cap is not free: mean generation 1386 -> 3331 tokens, 2.40x, on the denominator of
+    # the throughput target. Do not read a tied-group fraction under 2048 either -- 32% constant
+    # all-wrong inflates it by an unattributable amount.
     "grpo-math-27b": dict(
         model="qwen38-27b", rl=True, steps=100, group=8, max_new_tokens=2048, lora_rank=16,
         micro=1, max_think_tokens=0, reward="boxed", eval_mmlu=1000, eval_n=500, lr=1e-4,
