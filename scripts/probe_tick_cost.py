@@ -217,10 +217,28 @@ def main() -> int:
     print(f"       mine {_MINE[0]:>8.2f} {_MINE[1]:>8.3f}      --  {_MINE[0] / floor:>8.2f}x")
     print(f"       25's {_ARM25[0]:>8.2f} {_ARM25[1]:>8.3f}      --  {_ARM25[0] / floor:>8.2f}x")
     print(f"\nweight-stream floor {_WEIGHT_GB} GB / {_HBM_TBS} TB/s = {floor:.2f} ms/tick")
-    if out["flat"]["b_ms"] < floor:
-        raise SystemExit(f"flat b = {out['flat']['b_ms']:.2f} ms is below the {floor:.2f} ms "
-                         "weight-stream floor, so the timed region is not reading the "
-                         "weights once per tick")
+    # Both arms, not just flat. The first version checked flat only, on the reasoning that
+    # `b + c*k` is exact there by construction -- which is precisely why flat's b cannot
+    # go below the floor and the gate could never fire. stair's b came out at 5.97, 0.91x
+    # the floor, physically impossible, and the gate was installed on the arm that cannot
+    # produce it. A check placed only where the model holds never fires (27, 2026-09-08).
+    #
+    # A sub-floor b on stair is not a timing bug: every tick reads the weights there too.
+    # It reports that `b + c*rows` is the wrong form for an arm whose rows differ in
+    # depth, because the spread's cost has nowhere to go but c, which then drags b down.
+    for name in ("flat", "stair"):
+        b = out[name]["b_ms"]
+        if b < floor:
+            print(f"\nGATE: {name} b = {b:.2f} ms is {b / floor:.2f}x the {floor:.2f} ms "
+                  f"weight-stream floor, which no per-tick constant can be.")
+            if name == "flat":
+                raise SystemExit("flat holds occupancy fixed, so b + c*k is exact there and "
+                                 "a sub-floor b means the timed region is not reading the "
+                                 "weights once per tick. That is a measurement fault.")
+            print(f"     stair's rows differ in depth and `b + c*rows` has no term for "
+                  f"that, so the spread's cost lands in c ({out[name]['c_ms']:.3f} ms, "
+                  f"{out[name]['c_ms'] / out['flat']['c_ms']:.1f}x flat's) and drags b under "
+                  "the floor. Read stair's per-row times, not its fit.")
 
     print(f"\n{'k':>3} {'flat':>8} {'stair':>8} {'mine':>8} {'arm25':>8}")
     smap = {r["rows"]: r["ms_per_tick"] for r in stair}
