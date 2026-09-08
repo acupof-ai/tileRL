@@ -659,8 +659,15 @@ def _train_adapters(args: argparse.Namespace) -> None:
     blocks = max(-(-rollout_ctx // BLOCK_TOKENS) * rollout_batch,
                  -(-eval_ctx // BLOCK_TOKENS) * eval_batch) + 8
     ctx = max(rollout_ctx, 1024)
-    engine = build_engine(cfg, model, backend, num_slots=max(rollout_batch, eval_batch),
-                          max_batch=max(rollout_batch, eval_batch), draft=draft,
+    # ONLY num_blocks takes the max. num_slots and max_batch stay the rollout's width:
+    # num_slots feeds `usable_slots`, which `train.py:393`'s `_require_group_fits` compares
+    # against `--group`, so raising it to 8 makes that guard vacuous for every group in
+    # 2..8 -- trading a real correctness guard for a slow path that appears only in a test.
+    # The eval's 8 rows then queue into later ticks rather than raising (`engine.py:707`
+    # returns False on `free_slots < 1`), which is slower and correct. Rejected by
+    # tilerl-25 on #320 and confirmed here.
+    engine = build_engine(cfg, model, backend, num_slots=rollout_batch,
+                          max_batch=rollout_batch, draft=draft,
                           num_blocks=blocks,
                           max_total_tokens=max(ctx, eval_ctx, 8192),
                           spec_depth=args.depth, decode_graph=True,

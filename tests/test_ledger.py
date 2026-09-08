@@ -196,7 +196,11 @@ def test_the_pool_is_sized_for_the_eval_arm_not_only_the_rollout(tmp_path, monke
     assert m["engine"]["blocks"] >= eval_blocks, (
         f"pool {m['engine']['blocks']} is under the eval's {eval_blocks}: sized from the "
         f"rollout alone")
-    assert m["engine"]["slots"] >= _EVAL_CONCURRENCY, m["engine"]
+    # slots stay at the ROLLOUT's width, asserted so a later "fix" cannot widen them:
+    # num_slots feeds `usable_slots`, which train.py:393's `_require_group_fits` compares
+    # against --group, so 8 here makes that guard vacuous for every group in 2..8. The
+    # eval's rows queue into later ticks instead, which is slower and correct.
+    assert m["engine"]["slots"] == 2, m["engine"]
 
 
 def test_the_eval_curve_records_the_step_a_score_was_reached_at(tmp_path, monkeypatch):
