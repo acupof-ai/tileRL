@@ -436,3 +436,44 @@ def test_a_dead_parameter_leaves_no_entry_behind():
     del w
     backend.refill_const_f32()
     assert len(backend._const_f32_cache) < n, "the entry outlived its parameter"
+
+
+def test_a_live_drafted_tick_keys_on_a_width_precapture_built():
+    """The W a real tick asks for comes from `len(chains[0])`, not from `_graph_bucket`.
+
+    Every other test here derives the key the way `graph_keys` does, so all of them agree
+    with `graph_keys` by construction. This one runs the drafter, lets it leave whatever
+    chain its confidences produce, and checks the key `_run_decode_graph` actually looks
+    up. That is the one path from the draft's own output to a graph key, and a width off
+    the grid captures inside a live request (~14 s on the 27B) after warming reported
+    success.
+    """
+    cfg, backend = tiny(), get_backend()
+    trunk = build_random(cfg, seed=21)
+    e = build_engine(cfg, trunk, backend, num_blocks=32, num_slots=3, max_batch=2,
+                     max_total_tokens=256, draft=_draft(cfg, trunk), spec_depth=3,
+                     decode_graph=True)
+    keys = e.graph_keys()
+    asked: list[tuple[int, int]] = []
+    real = e._graph_for
+    e._graph_for = lambda B, W, keep: (asked.append((B, W)), real(B, W, keep))[1]
+
+    e.submit(list(range(1, 24)), SamplingParams(max_new_tokens=6, seed=0))
+    for _ in range(40):
+        e.step()
+        if e.poll():
+            break
+    # Off CUDA the first capture fails and `_decode_graph_on` goes False, so exactly one
+    # key is ever asked for. Assert the count: a bare `assert asked` would pass on that one
+    # ask and could never see a width the drafter chose on a later tick.
+    assert len(asked) >= 1, "no tick reached the graph path; the test proves nothing"
+    off = [k for k in asked if k not in keys]
+    assert not off, (
+        f"a live tick keyed on {off}, which precapture never builds — widths in "
+        f"graph_keys: {sorted({k[1] for k in keys})}, asked: {sorted(set(asked))}"
+    )
+    # The width came from the drafter's chain, not from `_graph_bucket`: a plain (B, 1)
+    # would mean the draft left nothing and the verify path never ran.
+    assert max(w for _, w in asked) > 1, (
+        f"every ask was width 1, so no chain reached the graph key: {asked}"
+    )
