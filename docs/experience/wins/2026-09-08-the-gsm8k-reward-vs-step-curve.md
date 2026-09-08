@@ -219,11 +219,99 @@ bare question. This run's eval lengths are the first on the production path.
 
 ## Results
 
-**The headline: `steps_to_score` at X=91.0 is `(0, 25]`, so 25 steps against 100 is **≥3.85x** on
-training seconds — 537.4 s against 2066.7 s.** The project has measured `seconds_per_step` many
+**The headline: `steps_to_score` at X=91.0 is `(0, 5]`, so 5 steps against 100 is **≥17.4x** on
+training seconds — 119.0 s against 2066.7 s.** The project has measured `seconds_per_step` many
 times and this is the first measurement of the left factor. **It is a lower bound**: the crossing
-happened somewhere in (0, 25] and 25 is only where it was first observed to have happened, so a
-finer grid replaces 25 with the true step and the ratio can only grow.
+happened somewhere in (0, 5] and 5 is only the first point measured, so a finer grid can only
+raise it.
+
+That it is a bound and not an estimate is the load-bearing part. The same X on the same run read
+**≥3.85x** an hour earlier, from the coarse grid's step 25; the fine grid replaced 25 with 5 and
+the figure moved **4.5x** without any measurement being wrong. A crossing read off a grid is
+always an upper bound on the step and therefore a lower bound on the ratio.
+
+### The fine curve, `--eval-every 5` to step 20
+
+Its own run (`30f3186c48f8`, sha `bd72288`), so its base arm is re-measured rather than shared:
+
+| point | score | mean tok | at cap | train s | eval s |
+|---:|---:|---:|---:|---:|---:|
+| base | 87.6% (438/500) | 348.9 | 3 | — | — |
+| **step 5** | **94.2%** (471/500) | 250.2 | 5 | **119.0** | 1103.6 |
+| step 10 | 94.2% (471/500) | 261.3 | 8 | 217.9 | 1134.8 |
+| step 15 | **94.6%** (473/500) | 213.9 | 4 | 334.8 | 942.4 |
+| step 20 | 92.8% (464/500) | 203.7 | 6 | 459.4 | 924.6 |
+
+| pair | wrong→right | right→wrong | net | paired SE | σ |
+|---|---:|---:|---:|---:|---:|
+| base → 5 | 38 | 5 | **+6.60 pt** | 1.31 | **5.03** |
+| 5 → 10 | 5 | 5 | **+0.00 pt** | 0.63 | 0.00 |
+| 10 → 15 | 6 | 4 | +0.40 pt | 0.63 | 0.63 |
+| 15 → 20 | 8 | 17 | −1.80 pt | 1.00 | 1.80 |
+| base → 20 | 37 | 11 | +5.20 pt | 1.39 | 3.75 |
+
+**Steps 5 through 20 are one plateau.** Under the 2×SE rule (a new point counts as better only
+if it beats the incumbent by twice the paired SE) no adjacent pair is distinguishable: +0.00
+against 1.26, +0.40 against 1.26, −1.80 against 2.00. **The whole +6.60 pt arrives by step 5**,
+and steps 5-20 add nothing measurable.
+
+**s5 → s10 is net exactly zero on different problems** — 5 right→wrong and 5 wrong→right, 2.0%
+discordant. The same 471 count is not the same 471 problems. A score-only reader sees a flat line
+and concludes "nothing happened"; the rows say ten problems changed hands. Worth recording
+because it bounds what a repeated score can tell you: **equal scores are not evidence of equal
+policies**, and only the per-problem rows separate them.
+
+### Two axes, and they must not be folded together
+
+| step | score | train s | tok/correct |
+|---:|---:|---:|---:|
+| **5** | 94.2% | **119.0** | 265.6 |
+| 25 (coarse run) | 93.2% | 537.4 | **126.4** |
+
+Training is **4.5x cheaper** at step 5; inference is **2.1x more expensive**. `time_to_score` is
+defined on the score alone, so the headline takes step 5 and `tok/correct` is recorded beside it
+rather than folded in — a composite objective nobody defined is the thing that gets decomposed
+wrongly next time. Same form as reporting `held`/`dipped_at` next to `reached` instead of
+choosing between them. (`tilerl-27` set this split; the caveat that "cheapest wins on a tie" needs
+*other things equal*, and here they are not, is why the two tables are separate.)
+
+### The score and the length are two processes, separated in time
+
+| step | mean tok | at cap |
+|---:|---:|---:|
+| base | 348.9 | 3 |
+| 5 | 250.2 | 5 |
+| 10 | 261.3 | 8 |
+| 15 | 213.9 | 4 |
+| 20 | 203.7 | 6 |
+| 25 (coarse) | 117.8 | 0 |
+
+**The score is finished by step 5 and the length compression has barely started.** At step 5 the
+policy still answers at 250 tokens against the base's 349 (1.4x), and only by step 25 is it at
+117.8 (2.9x). `at_cap` tracks it: base 3, still 4-8 through step 20, and 0 at step 25 — the policy
+has not yet learned to be short enough to stop being truncated.
+
+So the two effects are **not two faces of one process**. An earlier draft of this entry called the
+length collapse "the main effect" of base→25 because both appeared in that one interval; the fine
+grid separates them. Score: steps 1-5. Length: steps 5-25.
+
+### The eval cost is linear in generated tokens
+
+| point | eval s | mean tok | s/tok |
+|---|---:|---:|---:|
+| coarse s25 | 614.3 | 117.8 | 5.21 |
+| coarse s50 | 741.4 | 153.1 | 4.84 |
+| coarse s75 | 639.3 | 122.8 | 5.21 |
+| coarse s100 | 753.6 | 150.7 | 5.00 |
+| fine s5 | 1103.6 | 250.2 | 4.41 |
+
+**1.18x spread across a 2.1x range of lengths**, so a curve point's cost is set by how long the
+policy answers, not by the row count. That inverts the intuition about which grid is cheap: the
+fine curve's points are the *most* expensive ones on the whole curve, because early-step policies
+answer longest. Its four points cost **68 min of eval against 7.7 min of training — 90%
+instrument**.
+
+### The coarse curve, `--eval-every 25` to step 100
 
 | point | score | net vs base | mean tok | tok/correct | cumulative train s | eval s |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -264,19 +352,19 @@ stopped at 50.
 
 | quantity | value | meaning |
 |---|---|---|
-| crossing step at X=91.0 | **(0, 25]**, ≤537.4 s | when the target is first reached; **a lower bound on the ratio** |
-| **best step** | **25 or 50** — 93.2% / 93.4%, 537.4 / 1038.6 s | where a run should be stopped; the two differ by 1 problem, which is the eval's own cross-process floor, so **which is not decided** |
+| crossing step at X=91.0 | **(0, 5]**, ≤119.0 s | when the target is first reached; **a lower bound on the ratio** — the coarse grid read (0, 25] and the fine grid moved it 4.5x |
+| **best step** | **anywhere in 5..50** — 94.2% / 94.2% / 94.6% / 93.2% / 93.4% at 119.0 / 217.9 / 334.8 / 537.4 / 1038.6 s | where a run should be stopped; no adjacent pair clears 2×SE, so **which is not decided** and the cheapest point on the plateau is step 5 |
 
-Stopping at the best step is **1.99x less training time and +2.2 pt better** than running all
-100. There is **no early stopping in this tree**, and no gate can see the difference:
-`reward_rises` reads windowed rollout reward, `gsm8k_improves` reads before against after, and
-nothing in the manifest reads a curve for monotonicity. That is worth more than the 3.85x —
-3.85x says less training saves time, this says more training damages the result while every gate
-reports normal.
+Stopping anywhere on the plateau instead of running all 100 is **2.0–17.4x less training time and
++1.6 to +3.4 pt better**. There is **no early stopping in this tree**, and no gate can see the
+difference: `reward_rises` reads windowed rollout reward, `gsm8k_improves` reads before against
+after, and nothing in the manifest reads a curve for monotonicity. That is worth more than the
+17.4x — 17.4x says less training saves time, this says more training damages the result while
+every gate reports normal.
 
-**Which of 25 and 50 is the peak is undecided, measured after the fact.** The fine-curve run
-re-ran the base arm in a fresh process — same weights, same 500 rows, same greedy parameters,
-`temperature=0.0` — and read **438/500 = 87.6%** against this run's **437/500 = 87.4%**
+**Where the peak is, is undecided, and the reason was measured after the fact.** The fine-curve
+run re-ran the base arm in a fresh process — same weights, same 500 rows, same greedy parameters,
+`temperature=0.0` — and read **438/500 = 87.6%** against the coarse run's **437/500 = 87.4%**
 (174426 tokens against 173249, +0.68%). A greedy eval on identical inputs is supposed to be
 reproducible; it moved by **1 problem = 0.2 pt** across processes.
 
@@ -287,19 +375,23 @@ have been:
 
 | candidate peak | cumulative train s | ratio vs full run |
 |---|---:|---:|
-| step 25 | 537.4 | **3.85x** |
+| step 25 | 537.4 | 3.85x |
 | step 50 | 1038.6 | 1.99x |
+| **step 5** | **119.0** | **17.4x** |
 
-**The choice between them changes the headline by 1.93x**, and the data does not support making
-it. What *is* decided is unaffected: both 25 and 50 beat step 100 (456) by 10-11 problems, both
-clear the 462 gate step 100 fails, and both are far outside the 0.2 pt floor. So "stop before
-step 75" holds and "stop at 50" does not.
+**The choice changes the headline by up to 8.7x**, and the data does not support making it — the
+fine grid put three more indistinguishable points on the plateau below 25. What *is* decided is
+unaffected: every point from 5 to 50 beats step 100 (456) by 8-17 problems, all of them clear the
+462 gate step 100 fails, and all are far outside the 0.2 pt floor. So **"stop before step 75"
+holds and "stop at 50" does not** — and by the tie-break rule (equal within resolution, take the
+cheaper) the plateau's cheapest point is **step 5 at 119.0 s**.
 
 This also bounds every other number here from below. The floor is ≥0.2 pt on a 500-row greedy
-eval across processes, so of the four adjacent comparisons only 25→50 (+0.20 pt) sits at it; the
-others (+5.80, −11.00, +8.80) clear it by 29x, 55x and 44x. **The mechanism of the eval floor is
-unmeasured** — the same fp4 reduction non-determinism that made the training trajectories diverge
-is the obvious candidate and has not been tested.
+eval across processes, so of the coarse curve's adjacent comparisons only 25→50 (+0.20 pt) sits at
+it; the others (+5.80, −11.00, +8.80) clear it by 29x, 55x and 44x, and on the fine curve
+base→5 (+6.60) clears it by 33x while 5→10, 10→15 and 15→20 do not clear 2×SE at all. **The
+mechanism of the eval floor is unmeasured** — the same fp4 reduction non-determinism that made the
+training trajectories diverge is the obvious candidate and has not been tested.
 
 **The training reward did not follow the eval.** Per-step means:
 
