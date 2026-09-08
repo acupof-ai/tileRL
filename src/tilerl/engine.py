@@ -24,7 +24,7 @@ without a snapshot can never be adopted. Full-length hits are misses.
 Sampling is seeded per (request, position), so same seed + input => same
 output. The engine is tokenizer-free unless a caller asks for text stop
 sequences: ``decode=`` is the one place ids become text, for ``stop_texts``.
-# ponytail: no preemption/swap — admission is capped at ``max_batch``.
+# ponytail: no preemption/swap — a row holds its slot from submit to finish.
 """
 
 from __future__ import annotations

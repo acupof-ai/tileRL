@@ -480,8 +480,7 @@ class KvTier:
     32 GB V100 with a full host there is no DRAM residency tier, so it is
     HBM→SSD.
 
-    # ponytail: sync reload (torch.load), pinned-ring async prefetch when hit
-    #   latency bites; raw bf16 spill, fp8 tier-quant is 2x capacity if SSD fills
+    # ponytail: raw bf16 spill, fp8 tier-quant is 2x capacity if SSD fills
     """
 
     def __init__(self, path: str, fingerprint: str, min_tokens: int = 4 * BLOCK_TOKENS,
@@ -492,19 +491,9 @@ class KvTier:
         # One chunk (4 blocks = 64 tokens), not the 2048 the eviction-driven version used:
         # write-through spills at chunk boundaries, so a 2048 floor refuses every publish.
         self.min_tokens = min_tokens
-        # bound in-flight writes: bursty publishes can enqueue faster than the drain.
-        # Over the cap, spill refuses and counts it -- `refusals` over `offered` is the rate
-        # that says whether the drain keeps up. Measured 2026-09-06 on H20 card 6, 12
-        # sessions served serially: arrival 0.93-0.95 offers/s at 585.0 MiB each, peak
-        # `_pending` of 4 against this cap of 32, 0 refusals. The cap does not bind and is
-        # not what protects the host. What empties `_pending` is `torch.save` RETURNING --
-        # a page-cache accept at ~1784 MiB/s, 7.4x the device's 106.5 MiB/s -- so the queue
-        # drains 3x faster than this workload fills it, and the 240 MiB/s durable figure
-        # describes the device, never the queue's service rate. The real oversubscription is
-        # 5.08x at the device, absorbed by 386 GiB of allowed dirty pages (dirty_ratio=20 of
-        # 1928 GiB); a full queue is 18.3 GiB, 4.7% of that. What would bind first is
-        # `max_bytes` (37 of 72 offers were evicted in that run), not this
-        # (errors/2026-09-06-the-max-pending-cap-is-not-the-queue-that-binds.md).
+        # Bounds in-flight writes; measured not to bind (peak `_pending` 4 against 32, 0
+        # refusals) and never set to a non-default anywhere in the tree, so `max_bytes` is
+        # what protects the host: errors/2026-09-06-the-max-pending-cap-is-not-the-queue-that-binds.md.
         self._max_pending = max_pending
         self.offered = 0
         self.refusals = 0

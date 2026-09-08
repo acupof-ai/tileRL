@@ -4,7 +4,7 @@
 > larger than it needs to be** — not dead code, which was audited separately (net −37 lines
 > across 65,768). Scope: `src/tilerl/kv_cache.py` (1483 lines) and `src/tilerl/engine.py`
 > (1712 lines), reviewed in `git log --reverse` order over 27 commits.
-> **Nothing changed. This is the list.**
+> **Net −13 lines: two stale `ponytail:` clauses and one nine-line comment.**
 
 ## Authorship caveat, first
 
@@ -49,8 +49,9 @@ The async prefetch **shipped** in `22ece27` (#243): `_fetch_loop` on a reader th
 for the handoff. The marker still describes the pre-#243 world and names the thing that
 exists as a future option.
 
-- **Delete/merge:** rewrite the marker, ~2 lines. The remaining true half is the second
-  clause (raw bf16 spill; fp8 tier-quant not done).
+- **Fixed here:** the stale clause is dropped, leaving
+  `# ponytail: raw bf16 spill, fp8 tier-quant is 2x capacity if SSD fills`. That half is
+  still live — checked, no tier-side quantization exists anywhere in the file.
 - **What is lost:** nothing. The stale half actively misleads — it invites someone to
   "add" a prefetch that is already there, and AGENTS.md's rule is that a `ponytail:` names
   a *live* ceiling.
@@ -68,14 +69,16 @@ scripts mention it in prose only (`probe_ssd_arrival_rate.py:3`, `probe_save_fsy
 Contrast `max_bytes`, which a test (`test_e2e.py:1488`) and a probe
 (`probe_save_ms.py:39`) both drive, and `min_tokens`, which has a CLI flag.
 
-- **Delete/merge:** ~4 lines (the parameter, the assignment, the guard's second clause at
-  `:714`). The nine-line comment becomes a one-line note on `max_bytes`.
-- **What is lost:** the refusal path it guards. `spill_kv` refuses when
-  `len(self._pending) >= self._max_pending`, and `self.refusals` counts that. If the queue
-  is ever the wrong shape on a different device, this is the knob that would be reached
-  for — and the measurement that retired it was **one card, one workload**. This is a
-  judgment call, not an obvious deletion: I would keep it and shorten the comment, because
-  a constant that a future card might need is cheaper than re-deriving the bound.
+- **Fixed here, partly:** the parameter stays and the nine-line comment becomes three,
+  keeping the two facts that make retiring it cheap later — it was measured not to bind
+  (peak `_pending` 4 against 32, 0 refusals) and it is **never set to a non-default
+  anywhere in the tree**. That enumeration is a reason retirement is cheap, not a reason to
+  delete now. Not made a module constant: the LOC delta is zero.
+- **What is lost by deleting it, which is why it stays:** the refusal path. `spill_kv` refuses
+  when `len(self._pending) >= self._max_pending` and `self.refusals` counts that. If the queue
+  is ever the wrong shape on a different device, this is the knob that would be reached for —
+  and the measurement that retired it was **one card, one workload**. A constant a future card
+  might need is cheaper than re-deriving the bound.
 
 ### 3. A module-level marker the same file contradicts 370 lines down — `engine.py:27`
 
@@ -95,8 +98,8 @@ Both are in the tree. Admission is capped at `usable_slots` (`_admit` returns `F
 exists to say is unreachable when the slot pool is smaller. The first half of the marker
 (no preemption/swap) is true and is the ceiling that matters.
 
-- **Delete/merge:** ~1 line — drop the "capped at `max_batch`" clause, keep the
-  preemption/swap ceiling.
+- **Fixed here:** now `# ponytail: no preemption/swap — a row holds its slot from submit
+  to finish.` The preemption/swap ceiling is the true one and is what the marker is for.
 - **What is lost:** nothing, and this is the same defect class as #296 itself: **a
   consequence stated in prose, in a file whose behaviour moved under it.** I found #296's
   version because a peer hit the warning; this one because I was reading for something else.
@@ -127,30 +130,47 @@ hour: **the parallel path is real, and it is the guarded remainder, not the old 
 costs". Checked against the code: the fp8 branch adds the scale plane's bytes, so the
 docstring's number is derived from the same expression the code evaluates. No divergence.
 
-## What I did not review
+## The `engine.py` gap, named rather than left as a caveat
 
-`engine.py`'s 1712 lines got the `ponytail:` sweep (9 markers; finding 3 is the one that
-does not hold, and three others were spot-checked against the code that would have retired
-them — `:452` adopted-prefix rebuild, `:623` TTL sweep, `:1443` `_failed` TTL — all name
-upgrades nobody has built) and the fp8 call-site trace, not a line-by-line read. The three largest recent
-engine diffs — `3401476` queue-a-prompt (+106/−77), `6053f44` keep-the-graphs, `a43a379` the
-publish gate — each carry a bench entry or an errors entry and were reviewed against those
-rather than fresh. **A second pass on `engine.py` alone is worth someone's time**, and it
-should not be mine: I touched `debf6b3` and reviewed `a43a379`/`f33b0b8` earlier tonight, so
-I am not adversarial on that file's recent history.
+**Status: known gap, deliberately not filled.** `tilerl-27` ruled it stays open, and the
+reason is worth recording because it is a change of standard: ckl reset the project's target
+to the wall clock to reach a given score, `steps_to_score × seconds_per_step`. Code review is
+hygiene and is not on that product. A rule stated and then not applied the first time it costs
+something is decoration, so this gap is the first application.
+
+What **was** covered in `engine.py`:
+
+- the `ponytail:` sweep, all 9 markers. Finding 3 is the one that does not hold. Three more
+  were spot-checked against the code that would have retired them — `:452` adopted-prefix
+  rebuild, `:623` logprob TTL sweep, `:1443` `_failed` TTL — and all name upgrades nobody has
+  built.
+- the fp8 call-site trace, which is what answered the review's named suspicion.
+
+What was **not**:
+
+- a line-by-line read of the file. The three largest recent diffs — `3401476` queue-a-prompt
+  (+106/−77), `6053f44` keep-the-graphs, `a43a379` the publish gate — were read against their
+  bench or errors entries rather than fresh.
+- any adversarial reading of the parts I am the author or reviewer of. I wrote `debf6b3` and
+  reviewed `a43a379` and `f33b0b8` the same night, so on that history I am not an adversary,
+  and a review that says otherwise is worth less than one that says nothing.
+
+Whoever picks this up should start from `_build_plan` and `_finish_prefills`, which carry the
+most recent behaviour changes and the most prose describing consequences — the class that
+produced both of this review's fixable findings.
 
 ## Summary
 
 | # | item | `file:line` | lines saved | verdict |
 |---|---|---|---:|---|
-| 1 | stale `ponytail:` half | `kv_cache.py:483` | ~2 | **fix** — the upgrade landed in #243 |
-| 2 | `max_pending` knob | `kv_cache.py:488` | ~4 | **keep, shorten the comment** — retired on one card |
-| 3 | `ponytail:` contradicted by the same file | `engine.py:27` | ~1 | **fix** — `usable_slots`, not `max_batch` |
+| 1 | stale `ponytail:` half | `kv_cache.py:483` | −2 | **fixed** — the upgrade landed in #243 |
+| 2 | `max_pending` knob | `kv_cache.py:488` | −11 | **kept, comment 9 lines → 3** — retired on one card |
+| 3 | `ponytail:` contradicted by the same file | `engine.py:27` | ±1 | **fixed** — the slot, not `max_batch` |
 | 4 | sync `torch.load` beside the async fetch | `kv_cache.py:848` | — | not a defect, counter-asserted at 0 |
 | 5 | `bytes_per_token` docstring | `kv_cache.py:134` | — | not a defect |
 
-**Two items to fix, ~3 lines.** That is the answer to "how big is this": the two files are not
-carrying an over-design problem, and the fp8 diff that looked like the biggest risk is the
+**Two markers fixed, one comment cut from 9 lines to 3, net −13 lines.** That is the answer to
+"how big is this": the two files are not carrying an over-design problem, and the fp8 diff that looked like the biggest risk is the
 mechanism's own size. The largest single artifact in my area — `KvTier`, ~460 of
 `kv_cache.py`'s 1483 lines — is off by default and under a REJECT, but the reject is narrow
 by its own words ("on the serve path **at this session count**", one card, one commit
