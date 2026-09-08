@@ -21,6 +21,21 @@ frames -- so ISO freezes Sigma from the base. Two consequences for any small-sca
 That gate is the difference between a number and a number that measures what it claims.
 
 Run: TILERL_TARGET=cpu uv run python scripts/steps_to_reward.py
+
+On a card, against the 27B (no SFT phase -- a pretrained spectrum already carries
+information, which is what that phase exists to give tiny). `--data` is P1's own train file
+so this curve is comparable with run 1's:
+
+    scripts/pod_run.sh isorl <card> -- env TILERL_TARGET=cuda \\
+      TILERL_QWEN38_SOURCE=<checkpoint dir> \\
+      python scripts/steps_to_reward.py --model qwen38-27b --reward gsm8k \\
+      --data /work/p1_gsm8k_train.jsonl --sft-steps 0 --rl-steps N --group 8 \\
+      --max-new-tokens 256
+
+Read `tied groups` on a short run before choosing `--rl-steps` or the cap: run 2 collapsed
+onto its rollout cap at step 41 with the guard that ran before step 1 satisfied
+(errors/2026-09-06-the-rollouts-grew-into-the-cap.md), so a cap that clears at step 1 is not
+a cap that holds. High ties mean the cap or the reward, not ISO.
 """
 
 from __future__ import annotations
@@ -48,11 +63,18 @@ from tilerl.train import grpo_loop, train_step
 DEFAULTS = dict(model="tiny", sft_steps=40, rl_steps=24, group=6, max_new_tokens=6,
                 sft_lr=3e-2, rl_lr=1e-2, seed=0)
 
+#: `_build_model` dispatches on the NAME and falls through to `tiny` for anything it does
+#: not recognise (`cli.py:56,71`) -- so `--model /path/to/checkpoint` silently builds a
+#: random 64-hidden 2-layer tiny and the whole run reads real. A local checkpoint arrives
+#: through `TILERL_QWEN38_SOURCE`, which is what `--model qwen38-27b` already reads.
+MODELS = ("tiny", "tiny-agent", "qwen38-27b")
+
 
 def _args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--model", default=DEFAULTS["model"],
-                   help="passed to _build_model: 'tiny', or a real checkpoint name")
+    p.add_argument("--model", default=DEFAULTS["model"], choices=MODELS,
+                   help="a name _build_model dispatches on; point qwen38-27b at a local "
+                        "checkpoint with TILERL_QWEN38_SOURCE=<dir>")
     p.add_argument("--reward", default="token-rate", choices=("token-rate", "gsm8k"),
                    help="token-rate is the CPU fixture and saturates in 4 steps; gsm8k "
                         "needs --data and a tokenizer, which means a real model")
@@ -112,9 +134,12 @@ def make_reward(cfg, a):
     # gsm8k: correctness, which has the headroom a token rate lacks. It needs a tokenizer,
     # so it needs a real model -- refused rather than faked, because a stub tokenizer would
     # produce a curve of the stub. `--data` is validated in `_args`, before the SFT phase.
+    # `get_tokenizer` takes a hub id or a DIRECTORY, not a model name: "qwen38-27b" is not a
+    # repo and 401s, so the name resolves only through `cli._qwen38_tokenizer`.
+    from tilerl.cli import _qwen38_tokenizer
     from tilerl.tokenizer import get_tokenizer
 
-    tok = get_tokenizer(None if a.model == "tiny" else a.model)
+    tok = _qwen38_tokenizer() if a.model == "qwen38-27b" else get_tokenizer(None)
     rows = [json.loads(ln) for ln in Path(a.data).read_text().splitlines() if ln.strip()]
     match = MATCHERS[a.matcher]
     gold, prompts = {}, []
@@ -141,7 +166,12 @@ def rl_arm(cfg, model, make_opt, a):
                           sampling=SamplingParams(max_new_tokens=a.max_new_tokens),
                           seed=a.seed))
     rewards = [h[0] for h in hist]
-    return rewards, drift(before, spectra(model.params))
+    # `tied` (h[3]) is the fraction of groups whose advantages are ALL zero, i.e. steps that
+    # produced no gradient. It gates the Sigma reading: a run where every group ties leaves
+    # Sigma at 0.00% because nothing was applied, and the drift gate then reads OK -- "the
+    # spectrum is preserved" said about a model that was never trained.
+    tied = sum(h[3] for h in hist) / len(hist)
+    return rewards, drift(before, spectra(model.params)), tied
 
 
 def steps_to(rewards, target):
@@ -149,6 +179,17 @@ def steps_to(rewards, target):
         if r >= target:
             return i
     return None
+
+
+def sigma_verdict(tied: float, ada_max: float) -> str:
+    """The drift gate's three outcomes. `tied` comes first because it invalidates the other
+    two: with every advantage zero no step was applied, so a 0% drift is arithmetic rather
+    than a reading, and calling that OK is the gate answering a question it never tested."""
+    if tied > 0.99:
+        return "NOT TESTED: no gradient was applied, so a 0% drift says nothing"
+    if ada_max > 0.05:
+        return "VOID: a free optimizer moves the spectrum, so RLVR does not preserve it here"
+    return "OK: the free arm holds the spectrum, so the paper's condition is reproduced"
 
 
 def main(argv=None):
@@ -172,9 +213,10 @@ def main(argv=None):
     for name, mk in arms.items():
         model = type(base)(cfg, {k: v.clone() for k, v in base.params.items()})
         out[name] = rl_arm(cfg, model, mk, a)
-        r, (dmax, dmean) = out[name]
+        r, (dmax, dmean), tied = out[name]
         print(f"{name:>16}: reward {r[0]:.3f} -> {r[-1]:.3f}   "
-              f"Sigma drift max {100 * dmax:6.2f}%  mean {100 * dmean:5.2f}%")
+              f"Sigma drift max {100 * dmax:6.2f}%  mean {100 * dmean:5.2f}%  "
+              f"tied groups {100 * tied:5.1f}%")
 
     print(f"\n{'target reward':>16} " + "  ".join(f"{n:>14}" for n in arms))
     base_r = out["Adafactor"][0]
@@ -182,6 +224,18 @@ def main(argv=None):
         cells = [steps_to(out[n][0], target) for n in arms]
         print(f"{target:>16.3f} " + "  ".join(
             f"{(str(c) + ' steps') if c else 'not reached':>14}" for c in cells))
+
+    # Void 0, and it comes FIRST because it invalidates the other two: if every group tied,
+    # no gradient was applied, so Sigma cannot have moved and the drift gate reads OK about
+    # a model that was never trained. Measured on tiny + gsm8k: tied 100%, drift 0.0000%,
+    # gate "OK". A gate whose green is produced by the absence of the thing it measures.
+    ada_tied = out["Adafactor"][2]
+    if ada_tied > 0.99:
+        print(f"\nVOID: {100 * ada_tied:.0f}% of groups tied -- every advantage in the group "
+              f"was zero, so no step changed a weight. Reward, Sigma drift and every number "
+              f"above describe the INIT, not a trajectory. A binary reward on a model that "
+              f"never scores gives one group value and GRPO's within-group normalization "
+              f"then yields zero: the reward needs a scale the policy can already move on.")
 
     # Void 2, checked before the ratio is read: a saturated reward makes the targets
     # cluster, since every one of them lands in the pre-plateau steps. It does not
@@ -207,10 +261,7 @@ def main(argv=None):
           " measurement's\n  precision, not evidence about the premise. The premise is"
           " tested by the FREE arm:")
     print(f"  Adafactor (free spectrum) drift max {100 * ada_max:.2f}% mean {100 * ada_mean:.2f}%")
-    verdict = ("VOID: a free optimizer moves the spectrum, so RLVR does not preserve it here"
-               if ada_max > 0.05 else
-               "OK: the free arm holds the spectrum, so the paper's condition is reproduced")
-    print(f"  {verdict} (threshold 5% max relative movement)")
+    print(f"  {sigma_verdict(ada_tied, ada_max)} (threshold 5% max relative movement)")
 
 
 if __name__ == "__main__":
@@ -227,3 +278,40 @@ if __name__ == "__main__":
     dmax, _ = drift(s0, spectra(m.params))
     assert dmax < 5e-2, f"ISO moved its frozen spectrum by {100 * dmax:.2f}%"
     print(f"\nself-check: ISO holds Sigma to {100 * dmax:.3f}% over 3 steps at lr=0.1")
+
+    # The three real-model defects, each asserted where it was measured rather than read.
+    # 1. `--model <path>` used to fall through to a random tiny (cfg.vocab_size 320 against
+    #    the checkpoint's 248320) and every number read real.
+    assert "/" not in "".join(MODELS), "MODELS must be names _build_model dispatches on"
+    try:
+        _args(["--model", "/data00/models/Qwen3.8-27B-NVFP4"])
+        raise AssertionError("a checkpoint PATH was accepted and would build a random tiny")
+    except SystemExit:
+        pass
+    # 2. `get_tokenizer("qwen38-27b")` is a hub lookup that 401s; the name resolves only
+    #    through `cli._qwen38_tokenizer`. Checked by WHICH function the qwen branch calls --
+    #    an earlier version of this assert grepped `make_reward`'s source for the name and
+    #    the comment above satisfied it, so the reverted call passed.
+    from tilerl import cli as _cli
+    from tilerl import tokenizer as _tokmod
+    from tilerl.tokenizer import ByteTokenizer
+
+    called = []
+    _real_q, _real_g = _cli._qwen38_tokenizer, _tokmod.get_tokenizer
+    _cli._qwen38_tokenizer = lambda: (called.append("by-name"), ByteTokenizer())[1]
+    _tokmod.get_tokenizer = lambda src=None: (called.append(f"hub:{src}"), ByteTokenizer())[1]
+    try:
+        _probe = Path("/tmp/_str_selfcheck.jsonl")
+        _probe.write_text('{"prompt": "2+3=?", "answer": "5"}\n')
+        make_reward(None, _args(["--model", "qwen38-27b", "--reward", "gsm8k",
+                                 "--data", str(_probe)]))
+    finally:
+        _cli._qwen38_tokenizer, _tokmod.get_tokenizer = _real_q, _real_g
+    assert called == ["by-name"], \
+        f"the 27B tokenizer must resolve through cli._qwen38_tokenizer, got {called}"
+    # 3. Every group tying leaves Sigma at 0.00%, which the drift gate used to call OK.
+    assert sigma_verdict(1.0, 0.0).startswith("NOT TESTED"), "a no-gradient run read as OK"
+    assert sigma_verdict(0.4, 0.0).startswith("OK"), "a real run must still reach a verdict"
+    assert sigma_verdict(0.4, 0.2).startswith("VOID"), "a moving spectrum must still void"
+    print("self-check: a checkpoint path is refused, the 27B tokenizer resolves by name, "
+          "and a 100%-tied run reads NOT TESTED")
