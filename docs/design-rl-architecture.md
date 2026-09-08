@@ -162,13 +162,30 @@ follow from the survey and cost nothing architecturally:
    the engine does not need to idle: a finished row's slot should take the next
    prompt's rollout rather than wait.
 
-3. **Attack the decode kernel's bandwidth utilisation.** It is 20.4% of the
-   floor and it is 96% of the rollout tick. Whether that is a small-M ceiling or
-   an fp4 dequant cost is one measurement away: the same shape in bf16. The sampler, which the first
-   breakdown named, is 3.6%.
+3. **Attack the decode kernel's bandwidth utilisation** — but rank it below (1)
+   and (2). It is 20.4% of the floor and 96% of the rollout tick. The sampler,
+   which the first breakdown named, is 3.6%.
 
-**A third method result, and the reason the number above is 19.1% rather than the
-21.8% this document carried an hour earlier.** Two sessions derived the weight
+   The bf16 control arm ran on the same shape (`layers.0.gate_up`, N=34816,
+   K=5120) to separate "the fp4 dequant path is slow" from "M=8 has too little
+   arithmetic intensity". At M=8 fp4 reaches **28.9% of nominal** and bf16
+   **33.1%** — a ratio of 1.14x, against a 1.5x bar fixed before the run. So the
+   dequant path is not the bottleneck at the shape rollout actually uses, and
+   adding batch is the lever rather than rewriting the kernel. fp4 also beats
+   bf16 in tokens per millisecond at every M measured (1.2x to 2.8x): it is
+   spending its fewer bytes.
+
+   Two limits on that reading, both from the arm's own author. The bf16 arm is
+   **constant at 0.270 ms from M=2 to M=32** — it pads M exactly as `mma8` does —
+   so it is not a control that varies with M, and the same 1.5x bar reads 0.97x
+   at M=2 and 2.20x at M=32. The comparison supports "the M=8 gap is too small to
+   blame fp4"; it does not support "both arms hit one physical ceiling." The only
+   clean point is **M=1: bf16 88.4%, fp4 45.8%** — there both paths take GEMV and
+   fp4 gets half the bandwidth. Evidence of an fp4 path cost exists, at a shape
+   rollout never runs.
+
+**A third method result, and the reason the utilisation figure above moved twice
+in one afternoon (21.8%, then 19.1%, now 20.4%).** Two sessions derived the weight
 bytes from shape independently and landed **1.9% apart** (18.23 and 18.58 GB)
 against a measured 24.44 GB. The agreement read as confirmation. It was not: both
 started from `fp4_param_keys` and both encoded "every quantised linear is fp4",
