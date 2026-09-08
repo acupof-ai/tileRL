@@ -120,7 +120,38 @@ that produced it.
 | date | commit | machine | target | model | change | 1×8 | 2×4 | note |
 |---|---|---|---|---|---|---|---|---|
 | 2026-09-08 | pending | — | cpu | tiny | correctness + 3 mutants | pass | pass | 513 passed, ruff clean |
+| 2026-09-08 | 1a49186 | H20 card 1 | cuda | Qwen3.8-27B NVFP4 | **shapes only** | rc=0 | rc=0 | 60.93 / 53.07 s/step, peak 45.38 / 45.33 GiB |
 | pending-remote | — | H20 | cuda | Qwen3.8-27B NVFP4 | gradient-bearing steps | — | — | predicted 35.0% → 41.9% |
+
+**The card row is two separate claims and they are not both established.**
+
+*Shapes:* `prompts_per_step` 1 and 2 both run on 27B + NVFP4 + `decode_graph=True`; the
+engine sizes correctly and the two splits reach different branches at the same peak
+(45.38 vs 45.33 GiB, 5 steps each, rc=0).
+
+*Values:* **not executed.** That run used `--max-new-tokens 512` against a base policy whose
+mean completion on this file is 1029 tokens, so every rollout truncated, every reward was
+−0.1, `tied_group_fraction` was **1.00 in both arms**, and every advantage was therefore
+zero. Per-prompt normalisation, the seed stride and the per-row prompt mask all executed with
+no effect on any gradient. The run proves the shapes and says nothing about the values.
+
+*What a value run has to satisfy, and why the assertion exists:* the cap-512 run returned
+rc=0 on five gradient-free steps, so rc is not the signal. A value run is **VOID unless at
+least one step per arm has `tied < 1.0`**, checked by a script that exits 1. And a VOID run
+has to say which of the two ties it hit, because the remedies are opposite: `tied 1.00` with
+reward at the floor and `tok` at the cap is truncation (raise the cap), `tied 1.00` with
+reward at the ceiling is saturation (harder task) — 55's curve had 3 of the first and 7 of the
+second in one run, and the `tied` field alone cannot separate them. **Even a passing value run
+only shows the paths executed with effect and did not crash**; a wrong seed stride or a wrong
+mask trains worse without going red on a card. Correctness rests on the three CPU mutants.
+
+*Two failures before the first value step, both costing a full attempt:* the bare hub id
+`Qwen/Qwen3-27B` cannot resolve on this pod (no network — the weights are at
+`/work/Qwen3.8-27B-NVFP4`), and the fp4 GEMM does not codegen under the pod's default
+`python3` (tilelang 0.1.8): 8 × `no instance of overloaded function "tl::tma_load"`. Both are
+environment, not this change; the working peer runs put `/work/tl013/bin` (0.1.13) on `PATH`
+and set `TILERL_QWEN38_SOURCE`. A one-step smoke test costs 4 minutes and would have caught
+both.
 
 The card arm needs the training engine sized for `prompts_per_step × group` rows. That sizing's
 length axis was a separate open defect when this was written and landed meanwhile (#322, per
