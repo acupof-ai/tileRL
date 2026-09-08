@@ -24,6 +24,9 @@ sys.path.insert(0, "packages/tilerl-kernels/src")
 from tilerl_kernels.backend import Backend  # noqa: E402
 from tilerl_kernels.registry import _resolve  # noqa: E402
 
+# The sm70 override this probe exists to prove is NOT in the tree yet: all three cells
+# resolve to kernels.make_paged_attention_prefill. So a bare run exits 1 by design --
+# that is the target, not a routing fault. Pass --expect to score against what ships.
 _EXPECT = "kernels_attn.make_paged_attention_prefill_sm70"
 
 

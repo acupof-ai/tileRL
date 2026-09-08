@@ -139,6 +139,11 @@ a merge or a hand-off is the channel, not the runner, and a review sent to it
 goes to the wrong desk. Name the runner. (2026-09-05: a MoE-bench review
 reached `tilerl-27` because a grant commit read "via tilerl-27".)
 
+**The claim table says who is using a card, not whose it is.** An idle card with no
+claim reads as available to every session, and `pod_run.sh` grants it — allocation lives
+outside the table, so ask before taking a card nobody told you was yours. 2026-09-08: a
+microbench ran on card 7, which belongs to another team, because the table was empty.
+
 **Pod jobs go through `scripts/pod_run.sh <name> <card> -- <cmd>`.** Never
 hand-type the launcher: it reaps the job (a `setsid nohup` from an exiting
 shell orphans to a PID 1 that is `sleep infinity` and never `wait()`s), logs
@@ -261,7 +266,8 @@ target py311 (see `pyproject.toml [tool.ruff]`). Day-1 baseline: 11 categories
 (E501/E702/E731/E741/F401/F541/I001/SIM108/UP006/UP035/UP037) are `ignore`d
 because in-flight `src/`/`tests/` code violates them — re-enable one by one as
 the tree is cleaned, never grow the list. F821 stays on globally, suppressed
-per-file only for `autograd.py` and `ops/reference.py` (known in-flight spots).
+per-file only for `src/tilerl/autograd.py` (selfcheck helpers); `reference.py`'s
+suppression was retired by importing `Any`.
 
 **CI.** `.github/workflows/ci.yml` gates on `ubuntu-latest` + `macos-14`:
 `uv sync --dev` → `ruff check` → `TILERL_TARGET=cpu uv run pytest -v`. Only

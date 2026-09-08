@@ -773,9 +773,6 @@ def make_paged_attention_prefill(target: str, block_M: int = 64, block_N: int = 
     shared memory: (block_M + 2*block_N) * D * 4 at D=256 is exactly Volta's
     96 KiB. See scripts/sm70_tile_occupancy.py.
 
-    ``kv_dtype`` is a maker parameter rather than f32 throughout so the fp16-tile
-    variant is one instantiation and not a second kernel; the accumulators stay
-    f32 either way.
     # ponytail: CPU cell, f32 tiles; the sm70 schedule is a per-arch override.
     """
 

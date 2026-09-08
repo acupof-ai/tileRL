@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""How much of a GRPO rollout is slots idling because one row in the group runs long?
+
+`grpo_loop` (train.py:435-443) submits one prompt's `group` rollouts together and drains
+until the last finishes. Nothing else is queued behind them, so a row that stops early
+leaves its slot empty for the rest of the step: the step costs `max(len)` ticks while the
+work is `sum(len)` tokens.
+
+    idle_fraction = 1 - sum(len) / (max(len) * group)
+
+That is the ceiling on what tail-aware packing or partial rollout could return -- an upper
+bound, not a forecast, because a scheduler that refills a slot pays for the refill and
+because the freed capacity is only useful if there is work to put in it.
+
+**The bound is only real if a finished row's slot actually idles**, so that was checked in
+the code rather than assumed: `grpo_loop` builds `ids` from one prompt (train.py:439-442)
+and hands exactly those to `_drain` (`:443`), which ticks `engine.step()` until every id
+is done (`:35-44`) and submits nothing. No other request can occupy the slot.
+
+**Real prompts, not synthetic.** Length distribution is the quantity under test, and a
+fixed or random prompt set would fabricate it -- the same way a random-normal fixture put
+top-p's nucleus at 162301/248320 when the real one was 43 (2026-09-08). Reads
+`/work/p1_gsm8k_train.jsonl`.
+
+**Through `render_chat`, which the first run skipped and which cost the whole measurement.**
+That run fed `tok.encode(question)` -- the bare document, no `<|im_start|>user`, no open
+assistant turn, and with thinking off none of the `<think>\n\n</think>` closer the template
+puts in the prompt. `grpo_loop`'s prompts come from `render_chat` (cli.py:611). A chat-tuned
+model handed a bare document continues the document, and it ran to the 6144 cap on 11 of
+160 rows with a mean of 1083 tokens; an independent measurement of the same dataset through
+the template read mean 322, p90 532, 1.3% at a 1024 cap -- 19x apart on the mean. The
+sampler was right (`prompt.sampling` gave temperature 0.7, top_p 0.8, the model card's
+non-thinking values) and the prompt said nothing, so nothing in the output showed the two
+disagreed.
+
+**And the real SamplingParams, for the same reason.** The first run of this probe built
+`SamplingParams(max_new_tokens=1024, seed=...)` directly. `stop_token_ids` defaults to
+`()` (engine.py:149), so no EOS could end a row and all 160 rollouts ran to exactly 1024
+tokens: idle 0.0% on every step, a number produced entirely by the probe's own arguments.
+The shipped path builds params through `prompt.sampling(tok, thinking, ...)`
+(prompt.py:56-62), which fills `stop_token_ids` from the tokenizer, and `grpo_loop` then
+applies `untruncated()` (train.py:376). This does both, so a row can stop when the model
+stops.
+
+**Reported per step and pooled, with the spread.** One step's idle fraction is one draw
+from a distribution over prompts; a single number would read as a property of the loop.
+
+**And scored, because a length distribution says nothing about whether the completions are
+answers.** The first run's rows averaged 1083 tokens with 11 of 160 at the cap and the
+probe reported that as a tail; the prompts were unrendered and the completions were the
+model continuing a bare document. An accuracy column would have read near zero and the
+defect would have been visible in the first step's output. `--score` is on by default and
+costs one `answer_match` per row.
+
+**A caveat on comparing this to an eval.** `untruncated()` (train.py:429) is what
+`grpo_loop` samples under -- temperature 1.0, top_p 1.0, top_k 0 -- because `rl_step`
+differentiates the full softmax. An eval run samples the deployed sampler (top_p 0.8,
+top_k 20). Sampling the whole 248320-token distribution has a heavier length tail, so this
+probe's lengths should exceed an eval's on the same prompts, and by how much is not known.
+The two numbers are not interchangeable in either direction.
+
+This measures only. It changes no scheduling.
+
+Run:
+  scripts/pod_run.sh --wait tail <card> -- python3 scripts/probe_rollout_tail.py \\
+      --steps 20 --groups 8,16
+"""
+import argparse
+import json
+import os
+import statistics
+import sys
+import time
+from dataclasses import replace
+
+sys.path[:0] = [f"{os.environ['REMOTE_DIR']}/src",
+                f"{os.environ['REMOTE_DIR']}/packages/tilerl-kernels/src"]
+
+_PROMPTS = "/work/p1_gsm8k_train.jsonl"
+# Seeds are indexed by this, never by the arm's own `group`, so every arm's row g of
+# step s draws the same completion and the arms differ only in width.
+_MAX_GROUP = 64
+
+
+def _idle(lengths: list[int]) -> float:
+    """Fraction of slot-ticks spent on a finished row, 0 when every row is equal."""
+    return 1.0 - sum(lengths) / (max(lengths) * len(lengths))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--steps", type=int, default=20)
+    ap.add_argument("--groups", default="8,16")
+    ap.add_argument("--gen", type=int, default=1024)
+    ap.add_argument("--prompts", default=_PROMPTS)
+    ap.add_argument("--thinking", action="store_true",
+                    help="thinking mode: sets BOTH the prompt's think block and the model "
+                         "card's sampler, as render_chat and prompt.sampling do. Default "
+                         "non-thinking, which is what the P1 GRPO runs use.")
+    ap.add_argument("--no-score", action="store_true",
+                    help="skip the accuracy column. Only for a dataset with no gold answer: "
+                         "without it nothing in the output distinguishes a tail from "
+                         "completions that are not answers at all.")
+    ap.add_argument("--out", default="/work/rollout_tail.json")
+    args = ap.parse_args()
+
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl.cli import _build_model, _qwen38_tokenizer
+    from tilerl.engine import build_engine
+    from tilerl.eval import answer_match
+    from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
+    from tilerl.prompt import render_chat
+    from tilerl.prompt import sampling as build_sampling
+    from tilerl.train import _drain, untruncated
+
+    # The training path's own helper (cli.py:33), which reads the local checkpoint dir.
+    # `get_tokenizer("qwen38-27b")` treats the name as a hub id and the pod has no network.
+    tok = _qwen38_tokenizer()
+    prompts, gold = [], []
+    with open(args.prompts) as f:
+        for line in f:
+            if len(prompts) >= args.steps:
+                break
+            row = json.loads(line)
+            text = row.get("question") or row.get("prompt") or row.get("text")
+            if text:
+                prompts.append(tok.encode(render_chat([("user", text)], args.thinking)))
+                gold.append(row.get("answer") or row.get("gold") or row.get("solution"))
+    if len(prompts) < args.steps:
+        raise SystemExit(f"{args.prompts}: {len(prompts)} usable prompts, need {args.steps}")
+    # Assert the template is in the prompt, rather than noticing afterwards that the
+    # lengths look wrong. The first run's bare `tok.encode(question)` produced completions
+    # that read like a long tail and were the model continuing a document (0a, 2026-09-08).
+    if not all(set(tok.encode("<|im_start|>")) <= set(p) for p in prompts):
+        raise SystemExit("a prompt is missing the <|im_start|> the chat template opens "
+                         "with, so the model is being handed a bare document and its "
+                         "completion lengths are not the rollout's")
+    if not args.no_score and not all(gold):
+        raise SystemExit(f"{args.prompts} has no answer/gold/solution field, so the accuracy "
+                         "column cannot be computed. Pass --no-score only if you accept that "
+                         "nothing will distinguish a tail from non-answers.")
+    print(f"{len(prompts)} real prompts, token lengths "
+          f"{min(map(len, prompts))}..{max(map(len, prompts))}")
+
+    # The rollout sampler as grpo_loop builds it, not a hand-rolled one.
+    base = untruncated(build_sampling(tok, args.thinking, args.gen, seed=0))
+    if not base.stop_token_ids:
+        raise SystemExit(
+            "stop_token_ids is empty, so no row can stop before the cap and every idle "
+            "fraction would be 0 by construction -- which is what the first run measured"
+        )
+    print(f"stop_token_ids {base.stop_token_ids}  temperature {base.temperature} "
+          f"top_p {base.top_p} top_k {base.top_k}")
+
+    backend = get_backend()
+    cfg, model = _build_model("qwen38-27b", seed=0, keep_master=True)
+    groups = [int(g) for g in args.groups.split(",")]
+    ctx = args.gen + max(map(len, prompts)) + 64
+    out: dict[str, list] = {}
+
+    for group in groups:
+        engine = build_engine(cfg, model, backend, num_slots=group, max_batch=group,
+                              num_blocks=-(-ctx // BLOCK_TOKENS) * group + group,
+                              max_total_tokens=max(ctx, 8192),
+                              decode_graph=True, prefix_store=NoPrefixStore())
+        rows = []
+        print(f"\ngroup {group}")
+        print(f"  {'step':>4} {'min':>5} {'med':>6} {'max':>5} {'sum':>6} "
+              f"{'idle%':>6} {'acc':>5} {'wall s':>7}")
+        for step, prompt in enumerate(prompts):
+            t0 = time.perf_counter()
+            # seed indexed by _MAX_GROUP, not `group`: with `step * group + g` the two
+            # arms' seed sets stop overlapping after step 0, so an 8-vs-16 comparison
+            # silently draws different completions from the same prompts and the arms
+            # differ by sampling as well as by width. Measured: mean row 1083 at group 8
+            # against 923 at group 16, which is most of the 2.8-point idle gap, and no
+            # output showed the seeds had diverged. A controlled comparison's random
+            # source has to be orthogonal to the variable under test.
+            ids = [engine.submit(prompt, replace(base, seed=step * _MAX_GROUP + g))
+                   for g in range(group)]
+            done = _drain(engine, ids, "tail probe")
+            wall = time.perf_counter() - t0
+            lens = sorted(len(done[i]) for i in ids)
+            idle = _idle(lens)
+            acc = (None if args.no_score else
+                   sum(answer_match(tok.decode(done[i]), gold[step]) for i in ids) / group)
+            rows.append({"step": step, "lengths": lens, "idle": idle, "wall_s": wall,
+                         "accuracy": acc})
+            print(f"  {step:>4} {lens[0]:>5} {statistics.median(lens):>6.0f} {lens[-1]:>5} "
+                  f"{sum(lens):>6} {100 * idle:>5.1f}% "
+                  f"{'--' if acc is None else f'{100 * acc:4.0f}%'} {wall:>7.2f}")
+
+        idles = [r["idle"] for r in rows]
+        pooled = 1.0 - sum(sum(r["lengths"]) for r in rows) / sum(
+            max(r["lengths"]) * group for r in rows)
+        print(f"  pooled idle {100 * pooled:.1f}%   per-step median {100 * statistics.median(idles):.1f}%"
+              f"   range {100 * min(idles):.1f}-{100 * max(idles):.1f}%")
+        if not args.no_score:
+            overall = sum(r["accuracy"] for r in rows) / len(rows)
+            print(f"  accuracy {100 * overall:.1f}%")
+            if overall < 0.5:
+                print("  BELOW 50%: the completions are mostly not answers, so these lengths "
+                      "are not the rollout's length distribution. Check the prompt goes "
+                      "through render_chat and the sampler through prompt.sampling before "
+                      "reading any idle figure -- an unrendered prompt read 1083 mean tokens "
+                      "against 322 through the template.")
+        out[str(group)] = rows
+        # A group whose rows all hit the cap has zero spread and zero idle -- a real
+        # reading, but it means the cap truncated the distribution rather than that the
+        # tail is absent, so say which one this is.
+        capped = sum(1 for r in rows if r["lengths"][0] >= args.gen)
+        if capped:
+            print(f"  {capped}/{len(rows)} steps had every row at the {args.gen} cap: "
+                  "their 0% idle is truncation, not balance")
+
+    if len(groups) > 1:
+        print("\ngroup   pooled idle")
+        for g in groups:
+            rs = out[str(g)]
+            p = 1.0 - sum(sum(r["lengths"]) for r in rs) / sum(max(r["lengths"]) * g for r in rs)
+            print(f"{g:>5}   {100 * p:>10.1f}%")
+
+    with open(args.out, "w") as f:
+        json.dump({"gen_cap": args.gen, "steps": args.steps, "by_group": out}, f, indent=1)
+    print(f"\nwrote {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    # The seed indexing, before it costs 1.5 hours of card: at every step the narrow arm's
+    # draws must be the wide arm's first `group` draws, or the arms differ by sampling as
+    # well as by width. `step * group + g` gave 8 of 160 rows the same seed across arms
+    # and only step 0 nested; the run that shipped it put mean row length at 1083 for
+    # group 8 against 923 for group 16, and nothing in its output showed why.
+    def _seeds(step, k, stride):
+        return {step * stride + g for g in range(k)}
+
+    assert all(_seeds(s, 8, _MAX_GROUP) <= _seeds(s, 16, _MAX_GROUP) for s in range(20))
+    assert sum(_seeds(s, 8, 8) <= _seeds(s, 16, 16) for s in range(20)) == 1, \
+        "the old indexing must fail this, or the check passes on anything"
+    raise SystemExit(main())
