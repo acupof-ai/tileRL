@@ -72,19 +72,52 @@ complete in half the time needed to read the weights it multiplies.
 
 I tried to derive that floor independently from `config.py:114`, and could not:
 
-| term | GB |
-|---|---:|
-| fp4 nibbles (0.5 B/param, incl. `lm_head`) | 12.55 |
-| f32 block scales (one per 32 elements, `pack_fp4` block=32) | 3.14 |
-| embedding table (bf16; a row lookup on decode, not streamed) | 2.54 |
-| **my total** | **18.23** |
-| **measured resident** (`wins/2026-09-03-grpo-27b-fits-the-card.md:49`) | **24.93** |
+Every row labelled with where it came from, because that is what a reader cannot recover
+later: 3.14 GB and 3.746 GB have the same unit, the same magnitude and the same number of
+decimals, and nothing in the digits says which one is a dump.
+
+| term | GB | source |
+|---|---:|---|
+| fp4 nibbles (0.5 B/param, incl. `lm_head`) | 12.55 | **derived** from param count |
+| f32 block scales (one per 32 elements, `pack_fp4` block=32) | 3.14 | **derived** from block size |
+| embedding table (bf16; a row lookup on decode, not streamed) | 2.54 | **derived** from vocab × hidden |
+| **my total** | **18.23** | derived |
+| **measured resident** (`wins/2026-09-03-grpo-27b-fits-the-card.md:49`) | **24.93** | **read** |
 
 **0.73x, 6.7 GB unaccounted.** My first attempt was worse — 13.18–17.00 GB, having omitted
 the block scales entirely. Had I judged 3.07 ms against *that*, I would have got 0.93x:
 "close to the floor but not violating it", and **passed over a real instrument defect**.
 
 The floor stands because the measured footprint is read, not derived. My derivation does not.
+
+### The gap is located, and it is a term my derivation has no line for
+
+`tilerl-48`'s per-key dump on card 1 (**read**, not derived — 24.433 GB against 24.437
+resident):
+
+| key | GB | what |
+|---|---:|---|
+| `wq` | 7.499 | fp4 nibbles |
+| `scale` | 3.746 | fp4 block scales |
+| `oscale` | 0.017 | |
+| `w8` | 10.625 | **fp8 weights** |
+| `wscale` | 0.003 | fp8 scales |
+| `embed` | 2.543 | one row read on decode |
+
+**Not every weight is fp4.** I assumed 0.5 B/param throughout and got 12.55 GB of nibbles;
+measured is 7.499 GB of fp4 plus **10.625 GB of fp8 at 1 B/param — a row my table does not
+have**. That single term is 159% of the 6.7 GB gap, and the remainder is my 5.05 GB nibble
+over-count less a 0.61 GB scale under-count. So the gap was not a missing fraction of a term
+I had; it was a whole quantization tier I did not know was there.
+
+Two corrections that change nothing downstream, recorded because "it was wrong" and "it
+mattered" are different claims. My 3.14 GB scale figure is **derived** and the measured value
+is 3.746 — but that figure was an intermediate in this failed derivation, and the floor table
+below takes its weight bytes from the dump, so correcting it moves no number. And 48's
+`block=16` reading was itself back-derived from a 133.8/111.6 byte ratio rather than read off
+`scale.shape`; measured 3.746 GB matches neither block=32's 3.14 nor a doubled 6.28, so the
+shape is still unknown. **I nearly re-derived bytes on that unverified shape — the same error
+a third time, arriving from another session.**
 
 Two premises I could not verify, which bound how hard the 0.50x claim is: 4 TB/s is the
 nominal bandwidth and achieved rates are typically 0.7–0.9 of it (which makes the violation
@@ -97,33 +130,56 @@ physically impossible".
 
 `tilerl-27` asked the right follow-up: the 6.11 ms floor counts weights only, so if state,
 KV and activations add enough traffic the utilization conclusion changes and the kernels are
-already near the roof rather than 4x under it. Derived per decode tick at B=8, from the model
-shape in `config.py:114`:
+already near the roof rather than 4x under it. Per decode tick at B=8:
 
-| term | GB/tick | share |
-|---|---:|---:|
-| weights (fp4 nibbles + f32 block scales + `lm_head`) | 24.440 | 94.4% |
-| gated-delta recurrent state, read + write | 1.208 | 4.7% |
-| paged KV, mean over the run | 0.136 | 0.5% |
-| conv state | 0.047 | 0.2% |
-| activations | 0.042 | 0.2% |
-| logits | 0.008 | 0.0% |
-| **total** | **25.88** | |
+Sources marked, per the rule above. The weight row is 48's per-key dump minus the embedding
+(a decode reads one row, it does not stream the table); the rest is derived from the model
+shape, since no dump exists for a transient.
 
-Floor **6.47 ms** at 4.00 TB/s nominal, **7.73 ms** at 3.35 TB/s achieved — 1.06x the
+| term | GB/tick | share | source |
+|---|---:|---:|---|
+| weights (fp4 + fp8 + scales, `lm_head` included, embedding excluded) | 21.896 | 93.8% | **read** (48's dump) |
+| gated-delta recurrent state, read + write | 1.208 | 5.2% | derived |
+| paged KV, mean over the run | 0.136 | 0.6% | derived |
+| conv state | 0.047 | 0.2% | derived |
+| activations | 0.042 | 0.2% | derived |
+| logits | 0.008 | 0.0% | derived |
+| **total** | **23.337** | | |
+
+Floor **5.83 ms** at 4.00 TB/s nominal, **6.97 ms** at 3.35 TB/s achieved — 1.07x the
 weights-only figure, not 3x. The KV term is small because GQA gives 4 kv heads, not 24. So
-no flip: utilization is 21.8%/26.1% and the headroom is 3.84–4.59x. 27's alternative
-reading — a floor near 20 ms, i.e. already at 70% of the roof — is refuted by the same table.
+no flip: utilization is 20.4% and the headroom is **4.91x**. 27's alternative reading — a
+floor near 20 ms, i.e. already at 70% of the roof — is refuted by the same table.
+
+**The weights row is one addend of this total, not a competing estimate of it.** 48 proposed
+substituting 21.896 for the total and withdrew it: doing so asserts a decode tick streams no
+KV and no recurrent state, and at gen 1024 the KV plainly crosses the bus.
+
+**A separate figure, and it must not be folded into this one.** 48 measured fp4 GEMM at
+**1144.7 GB/s at M=8, 28.6% of nominal**. Dividing the same 23.337 GB by that rate gives
+20.39 ms against a 28.64 ms measured forward — 71.2%. That is not "two thirds of the forward
+is weight streaming": the rate is *itself* measured at M=8, so it already contains whatever
+makes M=8 inefficient, and the ratio is close to an identity. The two rows answer different
+questions and stay separate — how much hardware is left (nominal denominator: 20.4%,
+**4.91x**), and how much the achieved rate fails to explain (measured denominator: 8.25 ms
+unaccounted).
+
+And the achieved-rate row has a further defect that the fp8 tier above exposes: **1144.7 GB/s
+is fp4 GEMM's rate, while 10.625 GB of the 21.896 goes through `linear_fp8`** — a different
+kernel with its own achieved rate, unmeasured. Dividing a total that spans two quantization
+paths by one path's bandwidth is not a floor for either. The nominal-denominator row is
+unaffected: 4.00 TB/s is the bus, whatever kernel drives it.
 
 A weights-dominated model is the general case for a 27B at B=8, so "weights only" is a good
 approximation here. That it *is* an approximation was worth checking rather than assuming,
 because the check costs one table and the wrong answer costs a work programme.
 
 The same table prices `tilerl-0a`'s B=16 finding, and the answer is that bandwidth does not
-object. Only the per-batch terms double, so **25.88 → 27.32 GB, +5.6%, floor 6.47 → 6.83 ms**
-— while the tokens produced double, i.e. **1.89x cheaper per token**. The KV doubling that
-looks alarming is 0.136 GB on a 24.44 GB weight stream. So the cost of B=16 is the memory
-pool, not the bandwidth, and the pool is a card measurement rather than a static assertion.
+object. Only the per-batch terms double, so **23.337 → 24.778 GB, +6.2%, floor 5.83 → 6.19 ms**
+— while the tokens produced double, i.e. **1.88x cheaper per token**. The KV doubling that
+looks alarming is 0.136 GB on a 21.90 GB weight stream. So the cost of B=16 is the memory
+pool, not the bandwidth, and the pool is a card measurement rather than a static assertion —
+[measured, and it fits with 57 GiB spare](../wins/2026-09-08-b16-fits-and-three-predictions-were-wrong.md).
 
 ## 5. A self-consistent decomposition is not a correct one
 
@@ -175,6 +231,15 @@ measures. Recorded rather than treated as clean.
   from outside the partition.
 - **Two agents reading one source are one evidence chain.** An independent check has to be
   able to fail differently.
+- **Label every number as read or derived at the moment it is written.** 3.14 GB and 3.746 GB
+  share a unit, a magnitude and a decimal count; nothing in the digits says which came from a
+  dump. Provenance is unrecoverable later and it is what a reader needs first — twice today a
+  derived byte count was 1.2x the measured one (48's 111.6 vs 133.8, my 3.14 vs 3.746), and a
+  third instance was avoided only because its author noticed in the same sentence.
+- **A rate measured at the operating point cannot explain that operating point.** Dividing by
+  an achieved bandwidth prices the same inefficiency on both sides of the ratio, which lands
+  near an identity. Nominal answers "how much hardware is left"; achieved answers "what does
+  the achieved rate fail to explain". Never combine them into one figure.
 
 ## What is not rejected
 

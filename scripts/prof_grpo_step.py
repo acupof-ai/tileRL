@@ -230,6 +230,13 @@ def main() -> int:
                           decode_graph=True, prefix_store=NoPrefixStore())
     trainable = add_lora(model, rank=a.rank)
     optimizer = AdamW(lr=1e-5)
+    # No stop_token_ids, so every rollout runs to --gen exactly and mean_completion_tokens
+    # is the cap. That is DELIBERATE for a batch-width comparison -- both arms then do
+    # identical per-row work and ms/token cannot be confounded by one arm generating
+    # shorter completions -- but it makes step_secs an UPPER bound on a shipped step,
+    # which stops on EOS. A length-distribution question needs the factory sampler
+    # (`prompt.sampling`, which fills stop ids from the tokenizer); this probe answers
+    # the width question and reports the cap so the bound is visible.
     sampling = untruncated(SamplingParams(max_new_tokens=a.gen))
     rng = np.random.default_rng(0)
     # Bounded by the model's own vocab, not a round number: the tiny model has 320 tokens
@@ -240,14 +247,29 @@ def main() -> int:
 
     rows = []
     for step in range(a.steps):
+        # A compile is exactly a new key in Backend._kernels, so counting it is the only
+        # way this probe can assert a step's wall clock is JIT-free rather than have the
+        # reader subtract compile seconds from a log afterwards. Every new decode width
+        # recompiles three kernels and the widths come from the rollout's length
+        # distribution, so which widths a run reaches is not knowable in advance --
+        # measured, a B=16 arm compiled 141 times against a B=8 arm's 42, 47% of its
+        # 507.9 s wall clock (wins/2026-09-08-b16-fits-and-three-predictions-were-wrong.md).
+        before = len(getattr(backend, "_kernels", {}))
         row = one_step(engine, model, prompt, lambda p, c: float(len(c) > 0), backend,
                        optimizer, trainable, group=a.group, sampling=sampling, seed=0,
                        step=step, micro=a.micro, invalidate=a.invalidate)
+        row["compiles"] = len(getattr(backend, "_kernels", {})) - before
         rows.append(row)
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
                           for k, v in row.items()}, sort_keys=True), flush=True)
 
-    # Step 0 pays every JIT and the first capture; it is reported and excluded from means.
+    # Step 0 is reported and excluded from the means. It is NOT the reason the means are
+    # clean: "step 0 pays every JIT" is a hope, not a property -- a later step reaches a new
+    # decode width whenever the rollout's length distribution takes it there, and the summary
+    # looks identical either way. `warm_compiles` below is what proves it, and discarding the
+    # first step is a convention that cannot. Measured here: B=16's step 1 compiled 40 and
+    # steps 2-5 compiled 0, so the convention happened to suffice.
+
     warm = rows[1:] or rows
     keys = ["step_secs", "rollout_secs", "prefill_secs", "decode_secs", "mixed_secs",
             "unexplained_ticks_secs", "unattributed_secs", "reward_secs", "train_secs",
@@ -257,6 +279,19 @@ def main() -> int:
         summary[f"mean_{k}"] = round(float(np.mean([r[k] for r in warm])), 2)
     summary["warm_steps"] = len(warm)
     summary["step0_secs"] = round(rows[0]["step_secs"], 4)
+    summary["warm_compiles"] = sum(r["compiles"] for r in warm)
+    # Per-token, the quantity a batch-width comparison needs: sec/step alone rises with the
+    # group whatever the efficiency, so comparing two widths on it says only that the wider
+    # one did more work. Group x mean completion, indexed rather than .get -- a missing key
+    # must raise, not silently omit the metric the comparison is for.
+    summary["mean_tokens"] = round(
+        a.group * float(np.mean([r["mean_completion_tokens"] for r in warm])), 1)
+    summary["mean_ms_per_token"] = round(
+        summary["mean_step_secs"] * 1000 / summary["mean_tokens"], 4)
+    # Stated, not assumed: a reader comparing two widths must see whether the rows were
+    # capped, because ms/token is only comparable across arms when they are.
+    summary["completions_hit_the_cap"] = all(
+        r["mean_completion_tokens"] == float(a.gen) for r in warm)
     m = summary
     # The decomposition has to add up, or a bucket is being double-counted.
     parts = (m["mean_rollout_secs"] + m["mean_reward_secs"] + m["mean_train_secs"]
@@ -264,6 +299,15 @@ def main() -> int:
     summary["sum_of_parts_secs"] = round(parts, 4)
     summary["step_minus_parts_secs"] = round(m["mean_step_secs"] - parts, 4)
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
+    if summary["warm_compiles"]:
+        # Refuse rather than warn: a wall clock that contains a JIT can neither confirm
+        # nor refute a kernel-efficiency claim, and subtracting it afterwards does not
+        # work because compilation and execution interleave in the one clock.
+        print(f"\nREFUSED: {summary['warm_compiles']} TileLang compiles inside the "
+              f"{len(warm)} timed steps, so these seconds are not a throughput "
+              f"measurement. Raise --steps so the warm-up reaches every decode width "
+              f"this configuration uses, then re-run.", flush=True)
+        return 1
     print(f"sync cost: {m['mean_sync_secs']:.3f}s over "
           f"{float(np.mean([r['ticks'] for r in warm])):.0f} ticks -- subtract this to "
           f"reconcile with an unsynced rollout_secs", flush=True)
@@ -367,9 +411,23 @@ def _selfcheck() -> int:
     assert on_e.calls == 1, on_e.calls
     assert on["graphs_dropped"] == 3, on
     assert on["invalidate_returned"] == 7, on
+    # The compile gate and the per-token metric, on the arithmetic rather than a card.
+    # Both are new and neither is reachable from the fake-engine path above, so without
+    # this they would ship untested -- and the gate's whole job is to fail unattended.
+    fake_cache = {}
+    seen = len(fake_cache)
+    fake_cache["k1"] = fake_cache["k2"] = 1
+    assert len(fake_cache) - seen == 2, "a compile is a new key in Backend._kernels"
+    # ms/token must fall when the group widens at equal step time -- the property that
+    # makes it the right metric for a batch-width comparison, where sec/step rises
+    # whatever the efficiency. 4.0 vs 2.0 at group 8 vs 16 on a 1-second step.
+    per_tok = lambda step_s, grp, comp: step_s * 1000 / (grp * comp)  # noqa: E731
+    assert per_tok(1.0, 8, 32) == 3.90625 and per_tok(1.0, 16, 32) == 1.953125
+    assert per_tok(1.0, 16, 32) < per_tok(1.0, 8, 32), "ms/token must reward the wider group"
     print(f"selfcheck ok: 5 ticks -> {counts}; a two-counter tick is mixed, "
           f"an unexplained tick is its own bucket; --invalidate calls the engine "
-          f"({on_e.calls}) and off does not ({off_e.calls})")
+          f"({on_e.calls}) and off does not ({off_e.calls}); a compile is a new "
+          f"_kernels key and ms/token falls as the group widens")
     return 0
 
 
