@@ -113,6 +113,29 @@ that would license it. The first treats two sources as one population; the secon
 search as the whole tree. Neither announces itself, because in both cases every component
 statement is true.
 
+## The truncation is measured, not a risk
+
+Added 2026-09-08 evening, from the live curve run (55, `12da5a0`), which trains at the same
+cap 256:
+
+- **GSM8K rollouts at cap 256 average 322 tokens.** The cap sits below the mean, not above
+  it.
+- **3 of the first 17 steps had all eight rollouts at 256** — reward 0.0, tied 1.00, floor
+  ties. **18% of steps.**
+
+So the entry's "brevity pressure comes from the cap" is not a mechanism argument any more;
+it is the observed rate at which the cap wins outright. A group that ties at the floor
+contributes no gradient for the same reason a group that ties at the ceiling does not, and
+the two are indistinguishable in `tied_group_fraction` alone — 10 of those 17 steps read
+`tied 1.00`, 7 at the ceiling (reward 1.0, saturated) and 3 at the floor (reward 0.0,
+truncated). Telling them apart needs `at_cap`, which #323 added; before it, "the curve went
+flat" had two readings with opposite remedies.
+
+**The second curve point reproduces the 2.74x.** At step 25: 346.5 → 117.8 tokens, **2.94x**,
+with 0 of 500 eval completions at the 2048 cap. Same training cap, same length collapse,
+independent run. That is confirmation of the scope claim, not a counterexample to it —
+both runs train at 256.
+
 ## Rule
 
 **A measurement's scope includes the configuration that produced it, and a training cap is
