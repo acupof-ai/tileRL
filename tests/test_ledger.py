@@ -112,6 +112,43 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
     assert [r["id"] for r in json.loads(capsys.readouterr().out)] == [m["id"]]
 
 
+def test_the_manifest_records_the_engine_config_the_wall_clock_depends_on(tmp_path, monkeypatch):
+    """A run's wall clock cannot be compared against another run's without these.
+
+    Six card sessions on the 2.6x rollout tick recovered their two pool sizes only
+    because the probe script logged its own flags; the manifest recorded none of the
+    bundle. Per-forward device time moves with it, so P5 (against verl+sglang) is
+    exactly the comparison a record without it cannot support.
+
+    Two things are asserted, not one. The keys must be present AND `blocks` must
+    track the pool -- a key list alone goes green over a hardcoded dict, and
+    `--max-new-tokens` is what sizes the training pool
+    (`num_blocks = ceil(ctx/16)*8 + 8`, `cli.py:570`), so two runs differing only
+    there must report different pools.
+
+    4000, not 200: `ctx` has a 1024 floor (`cli.py:568`), and at 200 both arms land
+    on it and report 520 blocks each. Written with 200 first, and the pair-assert is
+    what caught it -- a key-presence check would have passed on two identical pools.
+    """
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
+    data = tmp_path / "d.jsonl"
+    data.write_text('{"prompt": "1+1?", "answer": "2"}\n')
+    seen = {}
+    for new in (4, 4000):
+        _train(["--rl", "--data", str(data), "--steps", "0", "--group", "2",
+                "--max-new-tokens", str(new), "--lora-rank", "4"])
+        (m,) = [r for r in list_runs(tmp_path / "runs") if r["inputs"]["max_new_tokens"] == new]
+        assert m["engine"].keys() == {
+            "blocks", "slots", "max_batch", "max_total_tokens",
+            "max_num_batched_tokens", "decode_graph", "prefix_store", "spec_width"}
+        assert m["engine"]["slots"] == 8 and m["engine"]["prefix_store"] == "NoPrefixStore"
+        seen[new] = m["engine"]["blocks"]
+        # Not in `inputs`: the id hashes inputs, so a pool field there would make
+        # every pool change a new run instead of a rerun.
+        assert "blocks" not in m["inputs"]
+    assert seen[4000] > seen[4], f"blocks did not track the context: {seen}"
+
+
 def test_periodic_rollout_guard_stops_at_first_window_crossing(tmp_path, monkeypatch, capsys):
     from contextlib import suppress
 

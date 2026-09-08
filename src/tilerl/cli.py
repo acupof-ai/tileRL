@@ -571,6 +571,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
                           max_total_tokens=max(ctx, 8192),
                           spec_depth=args.depth, decode_graph=True,
                           prefix_store=NoPrefixStore())
+    # Not in `inputs`: the id is a hash of it, so recording the pool there would make
+    # every pool change a different run and hand nothing back on a rerun. It is beside
+    # `metrics` because it is a property of the run, and read off the built engine
+    # because the kwargs and the pool disagree (max_blocks clamps, the graph adds a row).
+    manifest["engine"] = engine.config
     # After build_engine: it materializes the params an adapter must point at.
     trainable = add_lora(model, rank=args.lora_rank)
     if args.load_adapter:
@@ -643,6 +648,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
     evals("before")  # LoRA B is zero at init: the base model's score
     if args.steps == 0:
         evals("after")
+        manifest["engine"] = engine.config  # re-read: see the comment at the other _finish
         return _finish(manifest, args.json)
     _refuse_short_rollouts(mean_len.get("before"), args.max_new_tokens,
                            args.allow_short_rollouts)
@@ -745,6 +751,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
         # `_finish`'s `v is None or ...` would score both gates PASS on a run that
         # measured neither. Mark them skipped so the manifest says "not measured".
         manifest["gates_skip_after"] = True
+    # Re-read, not the build-time copy: `_graph_for` sets `_decode_graph_on = False`
+    # on a capture failure (`engine.py:1120`), so a snapshot taken at build time can
+    # record graph-on for a run that decoded eagerly -- and the whole point of this
+    # block is that a wall clock is read against it.
+    manifest["engine"] = engine.config
     return _finish(manifest, args.json)
 
 
