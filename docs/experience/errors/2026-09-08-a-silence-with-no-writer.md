@@ -59,6 +59,14 @@ position for a flag on the inner interpreter.
 - progress that does not route through `log` — `gsm8k_accuracy` writing a row per N problems, or
 - `--json` writing progress to **stderr** while keeping stdout a single parseable object.
 
+The second one ships here: `_progress(as_json)` returns `print` normally and a stderr-and-flush
+printer under `--json`, replacing the no-op at both call sites. stderr rather than stdout because
+`--json` exists so a caller can parse the manifest, and a caller finds it by first brace
+(`tests/test_recipes.py:47`) — stdout already carries TileLang's C++ cache warnings, so it was
+never a lone object, and keeping *our* lines off it is what leaves that parse workable. The test
+asserts both halves, because either alone passes with the defect facing the other way: silence
+satisfies "stdout parses", and printing to stdout satisfies "progress exists".
+
 The second is smaller and preserves the reason `--json` silences `log` at all: stdout must stay
 one JSON document. Filed rather than done here, because the run this was diagnosed from is still
 on the card and the change touches the eval arm.
