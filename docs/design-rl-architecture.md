@@ -88,10 +88,12 @@ key off the loaded model and closing to 0.002 GB against the resident total:
 | `embed_tokens` | 2.543 |
 | everything else | 0.026 |
 | **total resident** | **24.439** |
-| **streamed per decode tick** (embedding is one row, not the table) | **21.896** |
+| **weights streamed per decode tick** (embedding is one row, not the table) | **21.896** |
+| GDN state, KV at gen 1024, conv window, activations | 1.441 |
+| **total streamed per decode tick** | **23.337** |
 
-At 4.0 TB/s that is **5.47 ms/tick**. Long-tail idle explains roughly a factor of
-two of the rollout gap.
+At 4.0 TB/s that is **5.83 ms/tick**; at the 3.35 TB/s this link measures, 6.97 ms.
+Long-tail idle explains roughly a factor of two of the rollout gap.
 
 **The rest is the model forward, and it runs at a fifth of bandwidth.** A first
 breakdown on card 6 (2026-09-08, 27B, group 8, gen 1024) attributed 89.5% of the
@@ -115,7 +117,13 @@ timed on H20 with a peaked logits fixture (nucleus 39 of 248320):
 | **all sampling operators** | **1.065 ms** | ~40 ms |
 
 **Sampling is 3.6% of a 29.71 ms tick.** The other 28.64 ms is the forward, which
-puts it at 5.23x the 5.47 ms floor — **19.1% of HBM bandwidth**. That is the
+puts it at 4.91x the 5.83 ms floor — **20.4% of HBM bandwidth**. Measured directly,
+the fp4 GEMM at M=8 reaches 1144.7 GB/s, **28.6% of nominal**; at that achieved
+rate the weight stream would take 20.39 ms, so **8.25 ms of the forward is not
+explained even by the rate the GEMM actually runs at**. Those are two separate
+statements — 4.91x is against the hardware, 8.25 ms is against the kernel's own
+speed — and they must not be composed into one ratio, because a denominator taken
+from the measurement carries the same inefficiency as its numerator. That is the
 number this project should be optimising, and it is inside the decode kernel:
 occupancy, KV traffic, GDN state. Not the sampler, and not a new process
 topology.
@@ -154,8 +162,9 @@ follow from the survey and cost nothing architecturally:
    the engine does not need to idle: a finished row's slot should take the next
    prompt's rollout rather than wait.
 
-3. **Attack the decode kernel's bandwidth utilisation.** It is 19.1% of the
-   floor and it is 96% of the rollout tick. The sampler, which the first
+3. **Attack the decode kernel's bandwidth utilisation.** It is 20.4% of the
+   floor and it is 96% of the rollout tick. Whether that is a small-M ceiling or
+   an fp4 dequant cost is one measurement away: the same shape in bf16. The sampler, which the first
    breakdown named, is 3.6%.
 
 **A third method result, and the reason the number above is 19.1% rather than the
