@@ -220,13 +220,23 @@ bare question. This run's eval lengths are the first on the production path.
 ## Results
 
 **Point 1 of 4, step 25: 93.2% (466/500), at 537.4 s cumulative training, scored in 614.3 s.**
+The anchor's **100** steps reached 93.6%, so a quarter of the steps is 0.4 pt short of it.
 
-The pre-registered predictions, scored before anything else is read: `tilerl-27` predicted
-**≥ 93.0** and was right; this session predicted **[90, 93)** and was wrong. 27's reasoning was
-the anchor run's segmented tied fraction jumping to 0.87 at steps 21-35, read as the score
-already topping out. Mine was that a plateau-then-jump reads as a threshold crossing rather
-than an asymptote. The reading that decided it is that the jump is real *and* it is already
-above the anchor's endpoint at a quarter of the steps.
+**The main effect is length, not score.** On the same 500 problems:
+
+| quantity | base | step 25 | ratio | anchor, at 100 steps |
+|---|---:|---:|---:|---:|
+| mean completion, tokens | 346.5 | **117.8** | **2.94x shorter** | — |
+| tokens per correct answer | 396.5 | **126.4** | **3.14x** | 2.74x |
+| score | 87.4% | 93.2% | **+5.8 pt** | +5.6 pt |
+| at the 2048 cap | 3/500 | **0/500** | — | — |
+
+**25 steps reach the length compression the anchor took 100 steps for, and exceed it.**
+`--length-penalty 0.0`, so the length term in the GRPO reward is not what did it. Of the 5.8
+points, **4.5 are problems the base could already solve** — the model mostly learned to answer
+the same questions in a third the tokens, and `time_to_score` reads only the score, so it
+records that as the rate of learning to be right. **The mechanism is untested and stays a
+candidate**; nothing here explains why a zero-length-penalty reward shortens completions.
 
 **The paired comparison the restart was for.** `eval-curve-25.jsonl` and `eval-before.jsonl`
 carry all 500 of the same problems (`i` sets identical after filtering the before arm to
@@ -239,33 +249,42 @@ carry all 500 of the same problems (`i` sets identical after filtering the befor
 | unchanged | 449 |
 | discordant | **51/500 = 10.2%** |
 
-Net **+5.80 pt**, which reproduces the score difference (87.4 → 93.2) exactly, as it must.
-**Paired SE 1.43 pt**, so the move is **4.06σ**. The unpaired SE on the same two numbers is
-1.86 pt — the pairing is worth 1.30x here, less than the 1.90 pt the pre-registration cited
-because that figure was computed at the p=0.5 worst case rather than at these two rates.
+Net **+5.80 pt**, which reproduces the score difference exactly, as it must. **Paired SE
+1.43 pt**, so the move is **4.06σ**. The unpaired SE on these two rates is 1.86 pt — the
+pairing is worth **1.30x**, not the 1.90 pt the pre-registration cited, because that figure was
+computed at the p=0.5 worst case. Same root as `ledger.py:127`, which hardcodes `0.25` and
+therefore overstates its printed SE by **2.04x** at this base.
 
-**The saturation criterion is 1.00 pt and the measured discordance gives 1.43 pt**, so the
-pre-registered threshold was optimistic by 1.43x: it assumed 5% discordant and the run gives
-10.2%. The threshold is **not moved** — it was registered before the data. What it means is
-that a genuine 1.0-1.4 pt step-to-step rise will read as noise, so a saturation verdict from
-adjacent points is only safe when the difference is *below* 1.00 pt, and a difference between
-1.00 and 1.43 pt is **undecided** rather than saturated. That third state was not in the
-criterion.
+**The predictions, scored.** `tilerl-27` predicted **≥ 93.0** and was right, from the anchor
+run's tied fraction jumping to 0.87 at steps 21-35 read as the score already topping out. This
+session predicted **[90, 93)** and was wrong, reading a plateau-then-jump as a threshold
+crossing rather than an asymptote.
 
-**Length collapsed, and this is the larger effect.** Mean completion **346.5 → 117.8 tokens
-(2.94x shorter)** on the same 500 problems, tok/correct **396.5 → 126.4 (3.14x)**. The anchor
-moved tok/correct 394.0 → 143.8 (2.74x) over **100** steps; this run reaches 3.14x at **25**.
-Also **0/500 at the 2048 cap** (3 at the base), so no part of either number is the cap.
+**The saturation criterion has a third state the registered version did not have.** It reads
+"adjacent points differing by < 1.00 pt", registered at 5% discordance; the run gives 10.2% and
+a paired SE of 1.43 pt. The threshold is **not moved** — it was registered before the data.
+What follows is that a difference between **1.00 and 1.43 pt is undecided**, neither a rise nor
+saturation. A two-state criterion, once the data thins it, reads "undecided" as "saturated".
 
-A score-only curve would record this as "the rate of learning to be right". 4.5 points of the
-5.8 are problems that were already solvable, since the model answers a third as long — the
-length term is doing the work, and `--length-penalty 0.0` means it is not doing it through the
-reward. The mechanism is untested and stays a candidate.
+**And the criterion reads an increment where the question is about a cumulative quantity.**
+Adjacent-point differences are small and individually unresolvable at this SE; differences
+against the 87.4 base are several points and resolve easily. So a fine curve answers **which
+point first crosses 90.5 / 91 / 92**, not where adjacent points stop differing. Same SE, one
+question answerable and the other not. (Defect in the criterion, not in the data; `tilerl-27`,
+which registered it, confirms the reading.)
 
 **The eval costs more than the training it measures.** `eval_secs` **614.3 s** against 537.4 s
-of cumulative training — **114%**, or 26.4 training steps per curve point. It is **0.62x** the
-anchor's 16.4 min for a 500-row arm, so the anchor estimate was conservative in the right
-direction, and every follow-up plan priced against it is re-priced below. The four points cost
-41.0 min of eval against 38.8 min of training; the run totals ~80 min.
+cumulative — **114%**, or 26.4 training steps per curve point. It is **0.62x** the anchor's
+16.4 min for a 500-row arm, so that estimate was conservative in the right direction. Four
+points cost 41.0 min of eval against 38.8 min of training; the run totals ~80 min.
+
+**Where the rows actually are.** The restarted run **reuses the first attempt's id**
+`86a06dc8c420`, because the id is a hash of the inputs and the inputs are identical. The
+newer-looking `0435924d7108` is an **empty directory the killed first attempt left behind** —
+manifest only, `eval_curve: None`. Sorting `runs/` by mtime finds the wrong one; the id hash
+finds the right one. Read the run directory the manifest names, not the newest.
+
+`time_to_score`'s 4x-style ratio is **not computed yet**: it needs step 100's `secs` from this
+same curve, and only step 25's exists.
 
 Points 2-4 pending.
