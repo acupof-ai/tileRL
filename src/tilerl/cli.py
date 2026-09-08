@@ -751,6 +751,50 @@ def _train_adapters(args: argparse.Namespace) -> None:
 
         tiebreak = _judge_tiebreak(engine, tok, params) if args.judge else None
 
+        # `steps_to_score x seconds_per_step` needs the step at which a score was crossed,
+        # and gsm8k_before/after cannot say which step that was. So: score a fixed held-out
+        # subset every `--eval-every` steps and keep (step, score, cumulative_secs).
+        # cumulative_secs is summed rather than `secs_per_step_median x step` because the
+        # step length is not constant within a run -- it changes once a run hits the rollout
+        # cap. The threshold stays at the READING end: the curve records the scores, and
+        # which one counts as "the score" is not the ledger's business.
+        #
+        # `secs` is TRAINING time and excludes this scoring: grpo_loop stops its clock
+        # at `train.py:496`, before the yield, so the probe's own cost is outside every
+        # point. That is the quantity `time_to_score` wants -- production does not pay the
+        # probe -- but it means the curve's last point is `secs_total`, not wall clock.
+        # Scoring at the yield is also the only correct place: grpo_loop calls
+        # `invalidate_weights()` before yielding (`:492`), so the eval sees the policy the
+        # step just produced, with the decode graph already dropped.
+        # Sliced from `eval_rows`, which `--eval-n` has already capped, so asking for more
+        # curve rows than eval rows quietly scores fewer. `curve["n"]` records the real
+        # size, but a reader looking at the run WHILE it happens sees only this line.
+        curve_rows = eval_rows[: args.eval_curve_n]
+        if curve_rows and args.eval_every and len(curve_rows) < args.eval_curve_n:
+            log(f"curve subset is {len(curve_rows)} rows, not the {args.eval_curve_n} asked "
+                f"for: --eval-n {args.eval_n} caps it")
+        curve: list[dict] = []
+        # `train_secs`, not `elapsed`: the timings loop below rebinds `elapsed` on every
+        # step, so an accumulator by that name silently became the last timing value --
+        # measured, the curve read 0.143 s at step 4 against 0.148 at step 2, a
+        # cumulative figure going DOWN.
+        train_secs = 0.0
+
+        def score_curve(step: int) -> None:
+            # `eval_secs` per point, so the "keep the scoring under 5% of a step" criterion
+            # is a fact checkable AFTER a run rather than a guess before one. Estimating it
+            # from another config's eval would extrapolate across n, generation length and
+            # batch shape -- and an estimated default is harder to overturn than no default,
+            # because it looks calibrated. Same idiom as `eval_{tag}_secs` (#309).
+            t_eval = time.perf_counter()
+            c, n, _ = gsm8k_accuracy(engine, tok, curve_rows, eval_params, concurrency=8,
+                                     thinking=thinking, match=MATCHERS[args.reward])
+            eval_secs = time.perf_counter() - t_eval
+            curve.append({"step": step, "correct": c, "total": n, "score": c / max(n, 1),
+                          "secs": round(train_secs, 3), "eval_secs": round(eval_secs, 3)})
+            log(f"  curve step {step}: {c}/{n} = {100 * c / max(n, 1):.1f}% "
+                f"at {train_secs:.1f}s cumulative, scored in {eval_secs:.1f}s")
+
         hist = []
         rollouts: list = []
         written = 0
@@ -761,7 +805,10 @@ def _train_adapters(args: argparse.Namespace) -> None:
                                     tiebreak=tiebreak, recapture_graph=True,
                                     per_rollout=rollouts)):
             hist.append((r, ce, secs, tied, ntok))
+            train_secs += secs
             written = _write_rollout_rows(manifest["id"], rollouts, written)
+            if curve_rows and args.eval_every and (i + 1) % args.eval_every == 0:
+                score_curve(i + 1)
             for phase, elapsed in timings.items():
                 manifest["metrics"][phase] = manifest["metrics"].get(phase, 0.0) + elapsed
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
@@ -804,6 +851,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
             tokens_first=statistics.mean(h[4] for h in hist[:w]),
             tokens_last=statistics.mean(h[4] for h in hist[-w:]))
         manifest["metrics"]["length_reward_r"] = _within_group_r(rollouts)
+        # Its own top-level key, not a metric: `format_run` prints every metric inline on
+        # one `tilerl ledger` row, so a curve in there would push the row past a screen.
+        if curve:
+            manifest["eval_curve"] = {"n": len(curve_rows), "every": args.eval_every,
+                                      "points": curve}
     else:
         losses = train_mod.opd_loop(engine, model, prompts, args.steps, backend, optimizer,
                                     seed=args.seed, trainable=trainable, sampling=params,
@@ -834,7 +886,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
         # measured neither. Mark them skipped so the manifest says "not measured".
         manifest["gates_skip_after"] = True
     # Re-read, not the build-time copy: `_graph_for` sets `_decode_graph_on = False`
-    # on a capture failure (`engine.py:1120`), so a snapshot taken at build time can
+    # in its `except` on a capture failure, so a snapshot taken at build time can
     # record graph-on for a run that decoded eagerly -- and the whole point of this
     # block is that a wall clock is read against it.
     manifest["engine"] = engine.config
@@ -1148,10 +1200,49 @@ def cmd_merge(args: argparse.Namespace) -> None:
     print(f"merged {len(args.specialists)} specialists ({args.method}) -> {args.out}  run {m['id']}")
 
 
+def _se_note(r: dict) -> str:
+    """The subset's sampling width, when it is wide enough to set the answer.
+
+    5.0 pt is P1's own target effect (`roadmap.md`), so an SE at or above it means the
+    crossing step is chosen by which rows are in the subset as much as by the policy.
+    Silent below that: a note on every line would be read as boilerplate and skipped.
+    """
+    se = r.get("se_pt")
+    if se is None or se < 5.0:
+        return ""
+    return (f"  [subset n={r['n']}, binomial SE {se:.1f} pt >= P1's +5 pt target: the "
+            f"crossing step is sampling-limited, raise --eval-curve-n to narrow it]")
+
+
 def cmd_ledger(args: argparse.Namespace) -> None:
-    from .ledger import format_run, lineage, list_runs, runs_root
+    from .ledger import format_run, lineage, list_runs, runs_root, time_to_score
 
     runs = lineage(runs_root(), args.lineage) if args.lineage else list_runs(runs_root())
+    if args.time_to_score is not None:
+        # A row per run, because the answer is per run: the target's step, the interval it
+        # was crossed in, and the cumulative training seconds at that point.
+        rows = [(m, time_to_score(m, args.time_to_score)) for m in runs]
+        if args.json:
+            print(json.dumps([{"id": m["id"], **(r or {"reached": None})}
+                              for m, r in rows], indent=1))
+            return
+        for m, r in rows:
+            if r is None:
+                print(f"{m['id']}  no eval_curve (run with --eval-every N to record one)")
+            elif r["reached"]:
+                # The interval, not an interpolated step: the target was crossed somewhere
+                # in (after_step, step] and only the right end was measured. `correct/total`
+                # and the SE come along because the curve scores a SUBSET -- 0.61 on 20 rows
+                # is not 0.61 on 500, and at n=20 the SE is 11.2 pt against P1's +5 pt.
+                print(f"{m['id']}  score {args.time_to_score:.3g} reached at step "
+                      f"{r['step']} (in ({r['after_step']}, {r['step']}]), "
+                      f"{r['secs']:.1f}s cumulative, scored {r['score']:.3g} "
+                      f"({r['correct']}/{r['total']}){_se_note(r)}")
+            else:
+                print(f"{m['id']}  score {args.time_to_score:.3g} NOT reached in "
+                      f"{r['steps_run']} steps / {r['secs']:.1f}s; best "
+                      f"{r['best']:.3g} on {r['n']} rows{_se_note(r)}")
+        return
     print(json.dumps(runs, indent=1) if args.json else "\n".join(map(format_run, runs)))
 
 
@@ -1294,6 +1385,14 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_train.add_argument("--eval-gsm8k", help="JSONL {prompt, answer}: greedy exact-match "
                          "accuracy before and after")
     p_train.add_argument("--eval-n", type=int, default=100, help="rows of --eval-gsm8k to score")
+    # 0 = off, so no existing invocation changes. The subset must be FIXED ACROSS RUNS or
+    # two runs' curves are not comparable, which is why it is the first --eval-curve-n rows
+    # of --eval-gsm8k rather than a sample.
+    p_train.add_argument("--eval-every", type=int, default=0,
+                         help="score the held-out curve subset every N steps (0 = off)")
+    p_train.add_argument("--eval-curve-n", type=int, default=20,
+                         help="rows of --eval-gsm8k in the curve subset; keep the scoring "
+                              "under 5%% of a step")
     p_train.add_argument("--judge", action="store_true",
                          help="let the policy rank rollouts the binary reward ties "
                               "(judge.py: tests decide first, order only)")
@@ -1372,6 +1471,10 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
 
     p_ledger = sub.add_parser("ledger", help="list runs ($TILERL_RUNS, default ./runs)")
     p_ledger.add_argument("--lineage", metavar="ID", help="this run and what it descends from")
+    p_ledger.add_argument("--time-to-score", type=float, metavar="SCORE",
+                          help="read time_to_score off each run's eval_curve: the step that "
+                               "first scored >= SCORE, the interval it was crossed in, and "
+                               "the cumulative training seconds there")
     p_ledger.add_argument("--json", action="store_true")
     p_ledger.set_defaults(func=cmd_ledger)
 
