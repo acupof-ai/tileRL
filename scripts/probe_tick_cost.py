@@ -121,8 +121,12 @@ def main() -> int:
             engine.step()
         backend.synchronize()
         before = len(backend._kernels)
+        # `while engine._running`, not `while engine.stats()["running"]`: stats() takes
+        # the lock and builds a ~20-key dict including the prefix store's, once per tick,
+        # inside the timed region. A fixed tick count is not usable either -- prefill
+        # consumes an unknown number of ticks before the first decode.
         t0, ticks = time.perf_counter(), 0
-        while engine.stats()["running"]:
+        while engine._running:
             engine.step()
             ticks += 1
         backend.synchronize()
