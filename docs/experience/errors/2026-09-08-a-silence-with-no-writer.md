@@ -67,10 +67,6 @@ never a lone object, and keeping *our* lines off it is what leaves that parse wo
 asserts both halves, because either alone passes with the defect facing the other way: silence
 satisfies "stdout parses", and printing to stdout satisfies "progress exists".
 
-The second is smaller and preserves the reason `--json` silences `log` at all: stdout must stay
-one JSON document. Filed rather than done here, because the run this was diagnosed from is still
-on the card and the change touches the eval arm.
-
 ## Verification of what did land
 
 Selftest **arm 7** asserts the launcher hands python an unbuffered stdout **through** a `bash -c`
