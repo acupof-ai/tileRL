@@ -164,6 +164,12 @@ questions and stay separate — how much hardware is left (nominal denominator: 
 **4.91x**), and how much the achieved rate fails to explain (measured denominator: 8.25 ms
 unaccounted).
 
+And the achieved-rate row has a further defect that the fp8 tier above exposes: **1144.7 GB/s
+is fp4 GEMM's rate, while 10.625 GB of the 21.896 goes through `linear_fp8`** — a different
+kernel with its own achieved rate, unmeasured. Dividing a total that spans two quantization
+paths by one path's bandwidth is not a floor for either. The nominal-denominator row is
+unaffected: 4.00 TB/s is the bus, whatever kernel drives it.
+
 A weights-dominated model is the general case for a 27B at B=8, so "weights only" is a good
 approximation here. That it *is* an approximation was worth checking rather than assuming,
 because the check costs one table and the wrong answer costs a work programme.
