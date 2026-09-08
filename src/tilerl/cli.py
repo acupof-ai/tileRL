@@ -24,6 +24,10 @@ _NO_WEIGHTS = (
     "      local safetensors directory), or use --model tiny."
 )
 
+#: Every name `_build_model` builds. The single source for the argparse `choices` below, so
+#: a new model cannot be added to one and missed in the other.
+MODEL_NAMES = ("tiny", "tiny-agent", "qwen38-27b")
+
 
 def _progress(as_json: bool):
     """The run's progress printer: stdout normally, STDERR under --json.
@@ -75,6 +79,17 @@ def _build_model(
     from . import config as config_mod
     from . import model as model_mod
 
+    # The fall-through below used to accept anything: a typo (`qwen38_27b`), a different
+    # capitalization, or a checkpoint PATH all returned a random 64-hidden 2-layer tiny
+    # without raising, and the run finished with a table that reads like the 27B. Six
+    # scripts pass a user-supplied `--model` here with no argparse `choices`, so the
+    # refusal belongs at this seam rather than in each of them.
+    if model_name not in MODEL_NAMES:
+        raise ValueError(
+            f"unknown model {model_name!r}; expected one of {', '.join(MODEL_NAMES)}. "
+            f"A local 27B checkpoint is selected with --model qwen38-27b plus "
+            f"TILERL_QWEN38_SOURCE=<dir>, not by passing its path here"
+        )
     if model_name == "qwen38-27b":
         cfg = config_mod.qwen38_27b()
         try:
@@ -1315,7 +1330,7 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_serve = sub.add_parser("serve", help="start the OpenAI-compatible HTTP server")
-    p_serve.add_argument("--model", choices=["tiny", "tiny-agent", "qwen38-27b"], default="tiny")
+    p_serve.add_argument("--model", choices=MODEL_NAMES, default="tiny")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--devices", default="",
@@ -1396,7 +1411,7 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.set_defaults(func=cmd_serve)
 
     p_train = sub.add_parser("train", help="SFT, --rl (GRPO) or --opd; --recipe for a gated flag set")
-    p_train.add_argument("--model", choices=["tiny", "tiny-agent", "qwen38-27b"], default="tiny")
+    p_train.add_argument("--model", choices=MODEL_NAMES, default="tiny")
     p_train.add_argument("--steps", type=int, default=20)
     p_train.add_argument("--seed", type=int, default=0)
     p_train.add_argument("--opd", action="store_true",
