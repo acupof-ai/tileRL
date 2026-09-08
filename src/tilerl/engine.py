@@ -778,6 +778,20 @@ class Engine:
             aligned = (chunk // _PREFILL_BUCKET) * _PREFILL_BUCKET
             if r.prefill_from == 0 and aligned and aligned != chunk:
                 chunk = aligned
+            # Give up a block NOW when this chunk would leave a 1-token remainder, because
+            # the back-off below only fires on the chunk that carries the tail. At n=65 the
+            # 64-alignment above lands exactly on 64, so the tail is a chunk of its own:
+            # `end == n` holds with `short = 64 - 64 = 0`, `short > 0` is False, and the
+            # 1-token chunk ships. 14 lengths under 4000 hit this (65, 129, ... 2561, one per
+            # `budget × k + 1` and per `_PREFILL_BUCKET × k + 1`), and on every one of them
+            # `_last_prefill_boundary` names a position no chunk ends at, so `last` never
+            # fires and NOTHING from that prompt is offered to the disk tier. Costs no extra
+            # forward: measured over n=2..4000 at budget 512, 21606 chunks before and after.
+            # Covers this budget only -- `budget` is `max_num_batched_tokens - len(decodes)`
+            # and the boundary helper takes `n` alone, so a shared tick still loses the spill.
+            # errors/2026-09-08-a-one-token-chunk-made-last-unreachable.md
+            if len(r.tokens) - (r.prefill_from + chunk) == 1 and chunk > BLOCK_TOKENS:
+                chunk -= BLOCK_TOKENS
             # Cut the last chunk to a block boundary so the prompt-only publish lands at a
             # real chunk end; slicing an entry below its state snapshot is wrong.
             end = r.prefill_from + chunk
