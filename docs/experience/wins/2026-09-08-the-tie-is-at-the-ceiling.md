@@ -143,7 +143,7 @@ waits:
 
 | population | occupancy | pooled idle | backfill ceiling |
 |---|---:|---:|---:|
-| GSM8K (another session's probe, same 6144 cap, k=8) | **0.2547** | 74.5% | 1.89x |
+| ~~GSM8K (another session's probe, same 6144 cap, k=8)~~ | ~~0.2547~~ | ~~74.5%~~ | **withdrawn** |
 | **level 5, all problems** | 0.706 | 29.4% | 1.33x |
 | **level 5, no sample at cap (76 of 100)** | **0.679** | 32.1% | **1.34x** |
 
@@ -151,8 +151,14 @@ Both columns are `Σlen / Σ(max_in_group × k)` at k=8, where a group is one pr
 the GRPO group itself, so no regrouping was needed. **The first version of this table put 0.696
 beside 0.414, which is `Σmax / Σsum`** — the same data inverted and missing the group factor, so
 the two differed by 8x. `1/(0.4908 × 8) = 0.2547`. Both quantities are dimensionless and land near
-0.5, so nothing about reading them says they are not the same measure. The corrected gap is **2.8x,
-not 1.8x**. Occupancy also depends on k: doubling the group roughly halves it, since `max × k` grows
+0.5, so nothing about reading them says they are not the same measure. The GSM8K row is **withdrawn**, and not
+because of that: its probe called `tok.encode(text)` instead of `render_chat`, so the model was
+given a bare document and ran to the cap on prompts a chat template would have ended. Every GSM8K
+tail figure from that path goes with it — pooled idle 74.5%, backfill 1.54x, 12 of 18 steps at the
+cap. The number is not repriced, it is removed: a measurement taken off the production path is not
+evidence with a wider error bar. **So the cross-dataset gap this table existed to state is
+unmeasured**, and level 5's 0.679 is the only occupancy here on a correct path. Occupancy also
+depends on k: doubling the group roughly halves it, since `max × k` grows
 faster than `Σlen`.
 
 The cap-free and all-in figures differ by **0.032**, so clamping is not what makes level 5 look
@@ -162,13 +168,14 @@ the cap has zero within-group spread (one such problem reads exactly 1.000). On 
 exclusion moves it the other way, since there the capped rows are long *steps* whose idle was
 already high.
 
-**Consequence for two tail levers, both priced on GSM8K.** The ceiling is not `1/occupancy`:
-`wall = a + b·max + c·sum`, and backfill only removes the `max` term — `c·sum` is the per-row KV
-cost and survives it. So the ceiling is `(b·(max/sum) + c)/c`, and since `max/sum = 1/(occupancy·k)`,
-a task's occupancy sets it. GSM8K's revised measurement is **1.54x against a 1.89x ceiling** (an
-81% capture), which implies `b/c = 1.813`; the same ratio on level 5's `max/sum = 0.188` gives
-**1.34x**. Backfill on level 5 therefore prices at roughly **1.05–1.10x**, and **is not worth doing
-there**.
+**The cost model still holds; the coefficient it was calibrated on does not.** The ceiling is not
+`1/occupancy`: `wall = a + b·max + c·sum`, and backfill only removes the `max` term — `c·sum` is the
+per-row KV cost and survives it. So the ceiling is `(b·(max/sum) + c)/c`, and since
+`max/sum = 1/(occupancy·k)`, a task's occupancy sets it. **The 1.34x this gave for level 5 is
+withdrawn along with it**: `b/c = 1.813` was back-solved from the GSM8K arm, so it inherits that
+arm's defect. What survives is the *shape* — that the terms a lever cannot remove set the floor of
+what it can buy, and that a lever priced on one task needs its ceiling recomputed on the task it
+will run on. Backfill on level 5 is **not priced** until a correct-path GSM8K run recovers `b/c`.
 
 The k=16 figure the first version of this entry carried (1.21x) is withdrawn rather than restated.
 It came from "occupancy roughly halves when k doubles", and that shorthand is *exactly* the
@@ -178,17 +185,26 @@ ceiling both fall; the magnitude needs a k=16 run, which has not been done.
 
 My first estimate of 1.19x was wrong three ways at once: a mid-run 1.53x instead of the final
 figure, `1/occupancy` as the ceiling (which assumes tick cost is independent of occupancy, and `c`
-is the counterexample), and a capture ratio derived by dividing those two wrong numbers. **The two
-tail-driven levers largely disappear on the candidate task**, leaving batch (1.31x) and kernel
-work — a re-ranking, not a correction.
+is the counterexample), and a capture ratio derived by dividing those two wrong numbers. That estimate is superseded twice over now, so no
+number from it stands.
 
-**And the GSM8K half is pending.** 65 of 800 level-5 samples reached the 6144 cap (8.1%) against
-GSM8K showing a row ≥5000 tokens in 12 of 18 steps (66.7%) — **8.2x more, on the easier task with
-100–150-token reference answers.** (n=100; the n=34 partial read 10.3%, so the direction is stable.)
-That asymmetry rules out "the model is simply verbose at this
-cap", since the harder task would then truncate more, not less. Degeneration on GSM8K is under
-test by another session; if confirmed, **0.414 is a defect's fingerprint rather than a task
-property**, and the right move is to drop that half of the comparison rather than reprice it.
+**And the third defect is the one worth carrying.** The first estimate was wrong by arithmetic; the
+GSM8K arm is wrong by *instrument*, and no amount of care in the arithmetic would have caught it.
+The sampler had no chat template, exactly as this run's first attempt had no `stop_token_ids` —
+both produced completions that looked like completions, in the right units, in the plausible range.
+Five void figures came out of those two defects in one day across four sessions, and **none of them
+resembled each other**, so no one's number served as anyone else's alarm.
+
+**The asymmetry that flagged it, and what it turned out to be.** 65 of 800 level-5 samples reached
+the 6144 cap (8.1%) against GSM8K showing a row ≥5000 tokens in 12 of 18 steps (66.7%) — 8.2x more,
+on the *easier* task with 100–150-token reference answers. That ruled out "the model is simply
+verbose at this cap", since the harder task would then truncate more, not less, and this entry
+predicted the GSM8K figure was a defect's fingerprint rather than a task property. **It was, and it
+was not degeneration**: the probe called `tok.encode(text)` where the production path calls
+`render_chat`, so the model received a bare document with no turn to end and wrote until the cap.
+The prediction was right about the conclusion and wrong about the mechanism — worth recording,
+because "the model loops" was the hypothesis being tested and a missing template produces the same
+histogram.
 
 ## Two instrument defects this measurement had first
 
