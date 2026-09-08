@@ -219,14 +219,19 @@ bare question. This run's eval lengths are the first on the production path.
 
 ## Results
 
+**The headline: `steps_to_score` at X=91.0 is `(0, 25]`, and 25 steps against 100 is 3.85x on
+training seconds — 537.4 s against 2066.7 s.** The project has measured `seconds_per_step` many
+times and this is the first measurement of the left factor.
+
 | point | score | net vs base | mean tok | tok/correct | cumulative train s | eval s |
 |---:|---:|---:|---:|---:|---:|---:|
 | base | 87.4% (437/500) | — | 346.5 | 396.5 | — | — |
 | step 25 | **93.2%** (466/500) | **+5.80 pt** | 117.8 | 126.4 | 537.4 | 614.3 |
 | step 50 | **93.4%** (467/500) | +6.00 pt | 153.1 | 164.0 | 1038.6 | 741.4 |
 | step 75 | **82.4%** (412/500) | **−5.00 pt** | 122.8 | 149.0 | 1555.7 | 639.3 |
+| step 100 | **91.2%** (456/500) | +3.80 pt | 151.4 | 165.3 | 2066.7 | 753.6 |
 
-All four arms score the same 500 problems, so every comparison below is paired (McNemar over
+All five arms score the same 500 problems, so every comparison is paired (McNemar over
 `eval-curve-<step>.jsonl`, which #323 puts on disk):
 
 | pair | wrong→right | right→wrong | discordant | net | paired SE | σ |
@@ -234,15 +239,40 @@ All four arms score the same 500 problems, so every comparison below is paired (
 | base → 25 | 40 | 11 | 10.2% | **+5.80 pt** | 1.43 | 4.06 |
 | 25 → 50 | 10 | 9 | 3.8% | **+0.20 pt** | 0.87 | 0.23 |
 | 50 → 75 | 7 | **62** | 13.8% | **−11.00 pt** | 1.66 | **6.62** |
-| base → 75 | 26 | 51 | 15.4% | **−5.00 pt** | 1.75 | 2.85 |
+| 75 → 100 | **56** | 12 | 13.6% | **+8.80 pt** | 1.65 | **5.34** |
+| 25 → 100 | 10 | 20 | 6.0% | −2.00 pt | 1.10 | 1.83 |
+| 50 → 100 | 13 | 24 | 7.4% | −2.20 pt | 1.22 | 1.81 |
+| base → 100 | 26 | 7 | 6.6% | **+3.80 pt** | 1.15 | 3.31 |
 
-**Saturation is at step 25, on the pre-registered criterion, and it is met exactly.** Adjacent
-points 25 and 50 differ by 0.20 pt — below the registered 1.00 pt — and both are ≥ 90.5. The
-paired SE for that pair is **0.87 pt**, *below* 1.00, so this is not the undecided band the
-step-25 discordance opened up: 3.8% discordance rather than 10.2%. The criterion decided
-cleanly on its own terms.
+**The anchor check passes.** Step 100 is 91.2%, inside the pre-registered [90.5, 96.7], so the
+first three points have a referent and none of the four candidate explanations is needed.
 
-**Then step 75 collapsed 11 points, and the training reward did not.** Per-step means:
+**Saturation is at step 25 and the criterion decided it cleanly.** Points 25 and 50 differ by
+0.20 pt against the registered 1.00 pt, both ≥ 90.5, and that pair's own paired SE is **0.87 pt**
+— *below* 1.00, at 3.8% discordance rather than the 10.2% of the base→25 pair. The criterion was
+not in its own undecided band.
+
+**But the score does not stay there, and the criterion had no way to say so.** Step 75 loses
+11.00 pt at 6.62σ, step 100 recovers 8.80 pt at 5.34σ, and 100 still sits 2.0–2.2 pt below
+25 and 50 (1.8σ each — individually inconclusive, jointly consistent with 25/50 being the peak).
+So step 75 is a **dip, not a permanent collapse**, and a run of 100 steps ends *worse* than one
+stopped at 50.
+
+**Two numbers, not one.**
+
+| quantity | value | meaning |
+|---|---|---|
+| crossing step at X=91.0 | **(0, 25]**, 537.4 s | when the target is first reached |
+| **best step** | **50**, 93.4%, 1038.6 s | where a run should be stopped |
+
+Stopping at the best step is **1.99x less training time and +2.2 pt better** than running all
+100. There is **no early stopping in this tree**, and no gate can see the difference:
+`reward_rises` reads windowed rollout reward, `gsm8k_improves` reads before against after, and
+nothing in the manifest reads a curve for monotonicity. That is worth more than the 3.85x —
+3.85x says less training saves time, this says more training damages the result while every gate
+reports normal.
+
+**The training reward did not follow the eval.** Per-step means:
 
 | steps | reward | ce | tied | tok |
 |---|---:|---:|---:|---:|
@@ -250,45 +280,33 @@ cleanly on its own terms.
 | 26-50 | 0.900 | 4.09 | 0.68 | 136 |
 | 51-75 | **0.855** | 3.69 | 0.80 | 157 |
 
-The rollout reward in the window that lost 11 points of greedy accuracy is 0.855 against the
-previous window's 0.900 — a 5% dip, while the eval fell 11.8%. **62 problems went right→wrong
-against 7 the other way**, so this is a real loss of capability on specific problems, not a
-scoring artefact and not truncation (0/500 at the cap in every arm).
+Reward fell 5% over the window that lost 11.8% of greedy accuracy, and 62 problems went
+right→wrong against 7 the other way. Not a scoring artefact and not truncation — 0/500 at the
+2048 cap in every arm except step 100's 1/500. **The mechanism is unmeasured**: reward held, so
+the candidates are the policy drifting off the eval distribution while still satisfying the
+reward, or LoRA update instability, and nothing here separates them.
 
-**The gate that would have caught this cannot see it.** `reward_rises` compares windowed
-rollout reward, which held; `gsm8k_improves` compares before against after, and step 100 has
-yet to land. Nothing in the manifest reads a *curve* for monotonicity. `tilerl-0a` proposed
-exactly this criterion — a crossing requires the target held afterwards, not just reached once —
-half an hour before the data produced the case. It is now in `ledger.time_to_score` as `held`
-and `dipped_at`, reported alongside `reached` rather than suppressing it.
-
-**What this does to the headline.** `steps_to_score` at X=91.0 is 25 or earlier, and the run
-also shows the score does not stay there. Those are two facts and the second is not a correction
-of the first: a policy that reaches 93.2% at step 25 and 82.4% at step 75 has a **best step**,
-which is what a training run should be stopped at, and no early-stopping mechanism exists in
-this tree. **The mechanism of the collapse is unmeasured.** Reward held, so the candidates are
-the policy drifting off the eval's distribution while still satisfying the reward, or an
-instability in the LoRA update; nothing here distinguishes them.
-
-**Length is not monotone either.** 346.5 → 117.8 → 153.1 → 122.8. The 2.94x compression at step
-25 is a **minimum, not a trend**: step 50 gives back 30% of it while the score is flat, so
-length and score move independently after step 25. The earlier reading in this entry — that the
-length collapse is "the main effect" — holds for base→25 and does not extend past it.
+**Length is not monotone.** 346.5 → 117.8 → 153.1 → 122.8 → 151.4. The 2.94x compression at
+step 25 is a **minimum, not a trend**; step 50 gives back 30% of it at a flat score. An earlier
+draft of this entry called the length collapse "the main effect" — that holds for base→25 and
+does not extend past it.
 
 **Predictions, scored.** `tilerl-27` predicted step 25 **≥ 93.0** and was right (93.2). This
-session predicted **[90, 93)** and was wrong. Neither prediction covered a collapse.
+session predicted **[90, 93)** and was wrong. Neither prediction covered non-monotonicity, and
+the four-point grid is the reason it was seen at all.
 
-**Cost.** Eval is **614-741 s per 500-row point** against 23.3 s/step of training — 114% of the
-training it measures at step 25. Four points cost ~33 min of eval against ~39 min of training.
+**Cost.** Eval is **614–754 s per 500-row point**, 114% of the training it measures at step 25.
+Four points cost 45.8 min of eval against 34.4 min of training. Peak allocated 39.27 GiB;
+adapter 124.8M params.
 
-**Where the rows are.** The restarted run **reuses the first attempt's id** `86a06dc8c420`,
-because the id hashes the inputs and the inputs are identical — evidenced by that manifest's
-`started` moving 13:05 → 13:50. The newer-looking `0435924d7108` is **another session's
-synthetic run** (`source: tiny`, commit `2ea4a1f`, started and finished at 13:09:12 with a full
-gate set), which I first misread as the killed attempt's leftover. Two predicates: find the run
-by the id its manifest names, not by mtime, **and** confirm a directory is yours before
-concluding from its contents — a shared `runs/` holds other sessions' runs.
+**Where the rows are.** The restarted run **reuses the first attempt's id** `86a06dc8c420` —
+the id hashes the inputs and the inputs are identical, evidenced by that manifest's `started`
+moving 13:05 → 13:50. The newer-looking `0435924d7108` is **another session's synthetic run**
+(`source: tiny`, commit `2ea4a1f`, started and finished at 13:09:12 with a full gate set), which
+I first misread as the killed attempt's leftover. Two predicates: find the run by the id its
+manifest names, not by mtime, **and** confirm a directory is yours before concluding from its
+contents.
 
-Step 100 pending.
+MMLU after reads 75.7% against 75.1% before, so the regression check holds.
 
 Points 2-4 pending.
