@@ -833,6 +833,15 @@ def _train_adapters(args: argparse.Namespace) -> None:
                                         match=MATCHERS[args.reward], per_problem=per)
             eval_secs = time.perf_counter() - t_eval
             at_cap = sum(p["tokens"] >= args.eval_max_new_tokens for p in per)
+            # The rows go to disk, because the whole point of the curve is comparing its
+            # points to each other and that comparison is PAIRED: every point scores the
+            # same `curve_rows`. Unpaired, adjacent points carry a 1.90 pt difference SE at
+            # n=500; paired at 5% discordant it is 1.00 pt, and "has it stopped rising" is
+            # exactly a question about a difference smaller than the arms. P1 fell back to
+            # the unpaired interval for want of these rows (`_write_eval_rows`'s docstring),
+            # and `per` was being built here and dropped.
+            _write_eval_rows(manifest["id"], f"curve-{step}",
+                             [dict(r, dataset="gsm8k") for r in per])
             # The first point compiles the eval's shapes and every later one hits the cache,
             # so its eval_secs is 5.6x the steady state and --eval-curve-n is calibrated off
             # point two -- recorded, because the curve is a list of equal-looking dicts.

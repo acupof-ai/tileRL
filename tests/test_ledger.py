@@ -235,6 +235,24 @@ def test_the_eval_curve_records_the_step_a_score_was_reached_at(tmp_path, monkey
     # reader of the manifest cannot tell which point was first.
     assert [p["jit"] for p in curve["points"]] == [True, False], curve
 
+    # The per-problem rows reach disk, one file per point, because comparing the curve's
+    # points to each other is PAIRED -- every point scores the same `curve_rows`. Unpaired,
+    # adjacent points carry a 1.90 pt difference SE at n=500; paired at 5% discordant it is
+    # 1.00 pt, and "has the score stopped rising" is a question about a difference smaller
+    # than either arm. P1 fell back to the unpaired interval for want of exactly these rows.
+    #
+    # Asserted on CONTENT, not on the file existing: `i` must identify the row so two points
+    # can be joined, and the set of `i` must be identical across points or the join is over
+    # different problems.
+    seen_i = []
+    for p in curve["points"]:
+        f = tmp_path / "runs" / m["id"] / f"eval-curve-{p['step']}.jsonl"
+        rows = [json.loads(ln) for ln in f.read_text().splitlines() if ln.strip()]
+        assert len(rows) == p["total"], (f, len(rows), p)
+        assert all({"i", "correct", "tokens"} <= r.keys() for r in rows), rows[:1]
+        seen_i.append(sorted(r["i"] for r in rows))
+    assert seen_i[0] == seen_i[1], f"points scored different problems: {seen_i}"
+
     # Off by default, so no existing invocation changes shape.
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs2"))
     _train(argv)
