@@ -50,20 +50,39 @@ out of the usable set permanently. The robust band is 4/8–5/8: **5 problems, 1
 `Σlen / Σ(max_in_group × k)` — 1.0 means every sample in a group is the same length, so nothing
 waits:
 
-| population | ratio | pooled idle | backfill ceiling 1/ratio |
+| population | occupancy | pooled idle | backfill ceiling |
 |---|---:|---:|---:|
-| GSM8K (48's probe, same 6144 cap) | 0.414 | 0.586 | 2.42x |
-| **level 5, all problems** | **0.728** | 0.272 | 1.37x |
-| **level 5, no sample at cap (26 of 34)** | **0.696** | 0.304 | **1.44x** |
+| GSM8K (another session's probe, same 6144 cap, k=8) | **0.2547** | 74.5% | 2.17x |
+| **level 5, all problems** | 0.728 | 27.2% | 1.39x |
+| **level 5, no sample at cap (26 of 34)** | **0.696** | 30.4% | **1.42x** |
+
+Both columns are `Σlen / Σ(max_in_group × k)` at k=8, where a group is one problem's k samples —
+the GRPO group itself, so no regrouping was needed. **The first version of this table put 0.696
+beside 0.414, which is `Σmax / Σsum`** — the same data inverted and missing the group factor, so
+the two differed by 8x. `1/(0.4908 × 8) = 0.2547`. Both quantities are dimensionless and land near
+0.5, so nothing about reading them says they are not the same measure. The corrected gap is **2.8x,
+not 1.8x**. Occupancy also depends on k: doubling the group roughly halves it, since `max × k` grows
+faster than `Σlen`.
 
 The cap-free and all-in figures differ by **0.032**, so clamping is not what makes level 5 look
-homogeneous — the ratio is real. Stable across n=16/23/34, no drift with sample size.
+homogeneous — the ratio is real. Stable across n=16/23/34, no drift with sample size. Note the
+sign: here excluding capped problems *lowers* occupancy, because a problem whose every sample hits
+the cap has zero within-group spread (one such problem reads exactly 1.000). On GSM8K the same
+exclusion moves it the other way, since there the capped rows are long *steps* whose idle was
+already high.
 
-**Consequence for two tail levers, both priced on GSM8K.** Backfill measured 1.53x end-to-end
-against its own 2.42x ceiling, a 37% capture; the same capture on level 5's 1.44x ceiling is
-**1.19x — derived, not measured** (capture ratio 0.374 from GSM8K, level-5 cap-free ratio 0.696,
-n=26). Train padding moves the same way. **The two tail-driven levers largely disappear on the
-candidate task**, leaving batch (1.31x) and kernel work. That is a re-ranking, not a correction.
+**Consequence for two tail levers, both priced on GSM8K.** The ceiling is not `1/occupancy`:
+`wall = a + b·max + c·sum` with measured `b = 8.83 ms/tick`, `c = 3.705 ms/row/tick`, and backfill
+only removes the `max` term — `c·sum` is the per-row KV cost and survives it. So the ceiling is
+`(b·(max/sum) + c)/c`, giving **2.17x on GSM8K** (against 1.67x measured over 20 steps — a 77%
+capture) and **1.42x on level 5 at k=8, 1.21x at k=16**. Backfill on level 5 therefore prices at
+**1.05–1.10x**, and **is not worth doing there**.
+
+My first estimate of 1.19x was wrong three ways at once: a mid-run 1.53x instead of the final
+1.67x, `1/occupancy` as the ceiling (which assumes tick cost is independent of occupancy, and `c`
+is the counterexample), and a capture ratio derived by dividing those two wrong numbers. **The two
+tail-driven levers largely disappear on the candidate task**, leaving batch (1.31x) and kernel
+work — a re-ranking, not a correction.
 
 **And the GSM8K half is pending.** 28 of 272 level-5 samples reached the 6144 cap (10.3%) against
 GSM8K showing a row ≥5000 tokens in 12 of 18 steps (66.7%) — **2.9x more, on the easier task with
@@ -97,14 +116,26 @@ can be tied *more*: level 5 is 91.0% where GSM8K is 88.0%.
 ties do not, and no amount of regrouping helps a problem the policy cannot solve.
 
 **A length-distribution figure is a property of a dataset, not of the model.** Every tail lever
-priced on one task needs `1/ratio` recomputed on the task it will run on — and the ratio needs
-its population stated, since a cap flattens it toward 1.
+priced on one task needs its ceiling recomputed on the task it will run on — from the cost model,
+not from `1/occupancy`, since the terms a lever cannot remove set the floor of what it can buy.
+
+**And an occupancy figure needs its direction, its k, and its population.** `Σmax/Σsum` and
+`Σlen/Σ(max·k)` are the same data and differ by a factor of k; both are dimensionless and land near
+0.5, so a comparison of the two survives inspection. Occupancy falls as k rises. And a cap
+contaminates it in *either* direction, measured the same day: on level 5, clamping the samples of
+one problem flattens within-group spread and lowers idle by 3 points; on GSM8K, clamping the long
+steps preserves their already-high idle and raises it by 11.6 — same mechanism, two levels, two
+signs. So "a cap pushes the ratio toward 1" is not a rule; "a ratio computed over capped samples
+is not a property of the length distribution" is.
 
 ## Results
 
-| date | commit | machine | target | model | n | k | base | tied | usable | ratio (cap-free) |
+| date | commit | machine | target | model | n | k | base | tied | usable | occupancy (cap-free) |
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|
 | 2026-09-08 | 2f25f26 | H20 ×4 | cuda | Qwen3.8-27B NVFP4 | 34 | 8 | 77.2% | 67.6% | 32.4% | 0.696 |
+
+`occupancy` is `Σlen/Σ(max·k)` over problems with no sample at the cap, k=8, groups being the
+problems themselves.
 
 Raw artifacts: `/work/pk_{0,25,50,75}.jsonl` (one JSON row per problem: `correct`, `tokens` per
 sample, `at_cap`, `distinct`), `/work/pk{A,B,C,D}.log`.
