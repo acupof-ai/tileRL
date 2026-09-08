@@ -309,6 +309,34 @@ I first misread as the killed attempt's leftover. Two predicates: find the run b
 manifest names, not by mtime, **and** confirm a directory is yours before concluding from its
 contents.
 
+**P1's own exit criterion failed on this run, and it passes at step 50.** The manifest's verdict
+is FAIL, on `gsm8k_improves`: threshold **462** (base 437 + 25 correct = +5.0 pt on 500 rows),
+value **456** — the step-100 policy, 6 short. Against every curve point:
+
+| point | correct | vs 462 |
+|---:|---:|---|
+| step 25 | 466 | **PASS** (+4) |
+| step 50 | 467 | **PASS** (+5) |
+| step 75 | 412 | FAIL (−50) |
+| step 100 | **456** | **FAIL** (−6) |
+
+**The run failed P1 by training 50 steps too long.** The gate reads the after-arm, which is the
+last step, and the last step is not the best step. This is the same fact as the best-step row
+above, arriving through the project's actual exit criterion rather than through a curve nobody's
+gate reads: a policy that satisfies P1 existed at step 50, was trained past, and the manifest
+records FAIL.
+
+The other five gates: `mmlu_holds` PASS (0.757 against 0.731); `rollouts_within_cap`,
+`reward_rises`, `groups_untied` and `ce_falls` all FAIL, and all four are `validity` rather than
+`verdict` — expected here, since `--allow-short-rollouts` makes the cap deliberate and
+`--length-penalty 0.0` on an already-solved task drives ties to 0.68. They say the run is hard to
+interpret, not that P1 failed; `gsm8k_improves` is the one that says that.
+
+**The manifest computes the paired comparison independently and it agrees with mine.**
+`gsm8k_paired={'n': 500, 'b': 7, 'c': 26, 'delta': 0.038, 'se': 0.0115, 'z': 3.307}` against my
+base→100 of +3.80 pt at 3.31σ from the same rows through different code. Two readings of one
+quantity, not one derivation twice.
+
 MMLU after reads 75.7% against 75.1% before, so the regression check holds.
 
 **That MMLU pair does not narrow the step-75 mechanism, and reading it as evidence that general
