@@ -263,7 +263,13 @@ def main() -> int:
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
                           for k, v in row.items()}, sort_keys=True), flush=True)
 
-    # Step 0 pays every JIT and the first capture; it is reported and excluded from means.
+    # Step 0 is reported and excluded from the means. It is NOT the reason the means are
+    # clean: "step 0 pays every JIT" is a hope, not a property -- a later step reaches a new
+    # decode width whenever the rollout's length distribution takes it there, and the summary
+    # looks identical either way. `warm_compiles` below is what proves it, and discarding the
+    # first step is a convention that cannot. Measured here: B=16's step 1 compiled 40 and
+    # steps 2-5 compiled 0, so the convention happened to suffice.
+
     warm = rows[1:] or rows
     keys = ["step_secs", "rollout_secs", "prefill_secs", "decode_secs", "mixed_secs",
             "unexplained_ticks_secs", "unattributed_secs", "reward_secs", "train_secs",

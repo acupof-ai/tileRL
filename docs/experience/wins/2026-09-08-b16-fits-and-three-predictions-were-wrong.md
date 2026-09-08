@@ -216,6 +216,13 @@ flag.
 - **Split a memory delta into pools and transient before attributing it.** `base`,
   `after_build` and `peak` cost three lines and turn "my prediction was 2.36 GiB off" into
   "my pool math was right to 1.05x and the transient is unlocated".
+- **Discarding the first step does not make a measurement JIT-free; counting does.** "Step 0
+  pays every JIT" is a hope: a later step reaches a new decode width whenever the rollout's
+  length distribution takes it there, and the summary looks identical either way. Here B=16's
+  step 1 compiled 40 and steps 2–5 compiled 0, so the usual warm-up convention happened to
+  suffice — which is luck, not a property. Only a count of zero inside the timed steps is a
+  statement that does not depend on *where* the compiles landed, and that makes subtracting an
+  estimate or dropping a head step the same class of unclean as doing nothing.
 - **A wall clock that contains a JIT is not a throughput measurement, and it can invert a
   verdict rather than blur it.** The contaminated arms said B=16 was 1.168x worse per token;
   clean they say 0.762x — the wrong sign, not a wide error bar. Count the compiles inside the
