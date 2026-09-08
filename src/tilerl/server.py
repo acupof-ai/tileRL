@@ -102,14 +102,6 @@ def _ws_body(ask: dict) -> dict:
     return body
 
 
-def _unsupported_choice(choice: Any) -> bool:
-    """`tool_choice` beyond auto/none, or None when it is honourable as given."""
-    if choice is None:
-        return None
-    name = choice if isinstance(choice, str) else (choice or {}).get("type")
-    return name not in ("auto", "none", None)
-
-
 def _flatten_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
     """OpenAI's ``{type, function: {name, description, parameters}}`` as the flat
     ``{name, description, input_schema}`` the template renders and
@@ -209,7 +201,12 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
         # We render tools into the prompt and cannot force or forbid a call, so a
         # tool_choice stronger than a hint is refused rather than echoed.
         unknown_fields(req)  # warns; this route has no recorder, so the warn is all there is
-        refuse_unsupported(tool_choice=_unsupported_choice(req.tool_choice))
+        # `auto`/`none` are honourable as given; anything stronger is refused. Both the
+        # str form and the `{"type": ...}` form reach here, and an absent field lands on
+        # `None`, which is in the honourable set -- so no separate guard for it.
+        choice = req.tool_choice
+        named = choice if isinstance(choice, str) else (choice or {}).get("type")
+        refuse_unsupported(tool_choice=named not in ("auto", "none", None))
         tools = _flatten_tools(req.tools)
         input_ids = tokenizer.encode(_render_chat(
             req.messages, thinking, kw.get("reasoning_effort") or req.reasoning_effort, tools

@@ -95,10 +95,8 @@ def run_arm(a, name: str, tp: int, ranks: int, instrument: bool, outdir: Path) -
         # max, not rank 0: the step's wall clock is the slowest rank's
         "train_secs": max(r["train_secs"] for r in last),
         "backward_secs": max(r["backward_secs"] for r in last),
-        "rank_train_secs": [r["train_secs"] for r in last],
         "coll_secs": sum(r["secs"] for r in coll),
         "coll_calls": sum(r["calls"] for r in coll),
-        "coll_rows": coll,
     }
 
 
@@ -107,8 +105,10 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="CPU tiny model end to end: the whole flow with no GPU")
     ap.add_argument("--print-pod", action="store_true", help="print the pod commands and exit")
+    # No --ranks: world == tp by construction. prof_backward_ops.py takes only --tp
+    # (`:490`) and threads it into _build_model, so it has no dp axis at all -- a world
+    # wider than tp would profile a (dp, tp) mesh nothing under this script can build.
     ap.add_argument("--tp", type=int, default=2, help="the arm's shard width")
-    ap.add_argument("--ranks", type=int, default=0, help="the arm's world size (default: --tp)")
     ap.add_argument("--model", default="")
     ap.add_argument("--gen", type=int, default=0)
     ap.add_argument("--group", type=int, default=0)
@@ -120,14 +120,13 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=7200, help="seconds per arm")
     a = ap.parse_args()
     tiny = a.dry_run
-    a.ranks = a.ranks or a.tp
     a.model = a.model or ("tiny" if tiny else "qwen38-27b")
     a.gen = a.gen or (8 if tiny else 256)
     a.group = a.group or (2 if tiny else 8)
     a.prompt_tokens = a.prompt_tokens or (8 if tiny else 256)
     a.blocks = a.blocks or (64 if tiny else 4096)
 
-    arm = f"tp{a.tp}x{a.ranks}"
+    arm = f"tp{a.tp}x{a.tp}"
     if a.print_pod:
         driver = shlex.join(["python3", "-u", "scripts/tp_step_arms.py",
                              "--out-dir", "/work/tpstep", "--tp", str(a.tp)])
@@ -141,7 +140,7 @@ def main() -> int:
     outdir = Path(a.out_dir)
     outdir.mkdir(parents=True, exist_ok=True)
     runs: dict[tuple[str, bool], dict] = {}
-    for name, tp, ranks in (("control", 1, 1), (arm, a.tp, a.ranks)):
+    for name, tp, ranks in (("control", 1, 1), (arm, a.tp, a.tp)):
         for instr in (True, False):
             runs[(name, instr)] = run_arm(
                 a, f"{name}-{'instr' if instr else 'bare'}", tp, ranks, instr, outdir)
@@ -162,10 +161,6 @@ def main() -> int:
     if ctl["train_secs"]:
         print(f"# {arm}/control step {tpa['train_secs'] / ctl['train_secs']:.2f}x, "
               f"backward {tpa['backward_secs'] / max(ctl['backward_secs'], 1e-9):.2f}x")
-    for name in ("control", arm):
-        b, i = runs[(name, False)], runs[(name, True)]
-        print(f"# {name} per-rank step_s {b['rank_train_secs']}, instrument cost "
-              f"{i['train_secs'] - b['train_secs']:+.3f} s")
     print("# opt_s is DERIVED as train_secs - backward_secs: rl_step subtracts optimizer_secs "
           "from backward_secs (train.py:320) and prof_backward_ops emits neither the key nor a "
           "table row for it, so TP's optimizer all_reduce (train.py:174) is ONLY here. On CUDA "
@@ -174,12 +169,6 @@ def main() -> int:
     print("# i-coll_s and coll% are UPPER BOUNDS from the instrumented arm: instrument() syncs "
           "before and after each handler and removes the overlap the shipped path gets. step_s "
           "and bwd_s are the bare arm's, which is the honest wall clock.")
-    if runs[(arm, True)]["coll_rows"]:
-        print(f"\n# {arm} collective rows, instrumented")
-        print(f"# {'op':<14} {'secs':>9} {'calls':>7} {'ms/call':>9}")
-        for r in runs[(arm, True)]["coll_rows"]:
-            print(f"  {r['op']:<14} {r['secs']:9.4f} {r['calls']:7d} {r['ms_per_call']:9.3f}")
-
     bad = []
     trees = {r["tree"] for r in runs.values()}
     if len(trees) > 1:
