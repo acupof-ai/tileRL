@@ -23,10 +23,13 @@ RECIPES: dict[str, dict] = {
         status="pending-remote: roadmap P1"),
     # GSM8K is solved: 88.0% uncapped base, so 81% of groups tie at the ceiling
     # (wins/2026-09-05-p1-grpo-27b-run.md). TRAINING data is level 5 only (2304 rows,
-    # verified against the parquet shards). The EVAL file is levels 3-5 mixed
-    # (165/157/178), so its 80.0% base is not a level-5 number -- both arms score the
-    # same file so the delta holds, it is just measured on an easier set than the one
-    # trained on. A level-5-only eval is a separate run.
+    # verified against the parquet shards -- and re-verified 09-08 by reading the source's
+    # own level histogram, which gives 2304 for train Level 5 exactly). The EVAL file used
+    # by run 2 is levels 3-5 mixed (165/157/178), so its 80.0% base is not a level-5
+    # number -- both arms score the same file so the delta holds, it is just measured on
+    # an easier set than the one trained on. A level-5-only eval file can now be built
+    # (`--level 5`), which it could not before: the generator asked for a config the
+    # dataset does not have (errors/2026-09-08-a-generator-that-never-ran.md).
     # max_new_tokens 2048, not 512: the base policy's mean completion is 1029 tokens
     # (measured on that mixed file, n=500), so a 512 cap truncates every rollout before
     # the \boxed{} and 5 of the first 6 steps tied at the FLOOR with reward 0.
