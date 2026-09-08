@@ -103,6 +103,13 @@ It changes nothing and adds a case.
 
 ## The real defect is the signature
 
+> **Priced 2026-09-08 and it is not worth fixing.** The signature is wrong, and the cost on the
+> live path is 2 lost publishes out of 266 unaligned lengths (both at budget 504) — because
+> `interior_published == 1` publishes the first interior boundary unconditionally and absorbs
+> almost every `last` failure. Two sessions argued the fix independently, on two different
+> grounds, and both grounds were wrong:
+> [errors/2026-09-08-a-disjunction-reasoned-one-term-at-a-time.md](2026-09-08-a-disjunction-reasoned-one-term-at-a-time.md).
+
 ```
 _last_prefill_boundary(n)                       -> one argument
 the actual last interior boundary = f(n, budget) -> two
