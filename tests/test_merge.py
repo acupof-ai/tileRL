@@ -53,6 +53,21 @@ def test_iso_merge_one_specialist_and_spectrum():
 
 
 def test_iso_merge_two_specialists():
+    """The P3 merger gate: two specialists EACH keep their own task better than
+    plain averaging (`roadmap.md:120-123`), so this is a conjunction.
+
+    It was an `or`, which a merge that ignores one specialist passes on the
+    strength of the other: dropping specialist B scores A=15.660 B=21.954 --
+    0.036 below the base's own 21.990, and 4.4 worse than averaging -- and the
+    `or` admitted it.
+
+    What the `and` does and does not catch, swept rather than assumed. #284 says
+    this loss comparison covers the merge-math constants; it covers them past
+    their knee. `ridge` is monotone with a knee at 1.0 (mean |dW|/|W| 0.0137 at
+    1e-3, 0.0125 at 1e-1, 0.0069 at 1.0, 0.0000 at 1e4), so 1e-1 passing is the
+    parameter still working, not a blind spot -- the gate fails from 1.0 up.
+    `rho_keep` 0.9 -> 0.1 fails at A=21.646 B=21.110.
+    """
     backend = RefBackend()
     cfg, base = _build_model("tiny", seed=0, keep_master=True)
     a, b = _sft(BATCH_A, backend), _sft(BATCH_B, backend)
@@ -64,7 +79,9 @@ def test_iso_merge_two_specialists():
     }
     print({n: f"A={la:.3f} B={lb:.3f}" for n, (la, lb) in out.items()})
     assert out["iso"][0] < out["base"][0] and out["iso"][1] < out["base"][1], out
-    assert out["iso"][0] <= out["avg"][0] or out["iso"][1] <= out["avg"][1], out
+    # EACH task, not either: an `or` here is passed by a merge that lost one specialist.
+    assert out["iso"][0] <= out["avg"][0], f"A regressed against averaging: {out}"
+    assert out["iso"][1] <= out["avg"][1], f"B regressed against averaging: {out}"
 
 
 def test_merge_checkpoints_streams_shards_and_records(tmp_path, monkeypatch):
