@@ -126,10 +126,15 @@ def sft_base(cfg, model, backend, a):
 def sigma_keys(params, per_class: int = 1):
     """A FIXED sample of 2D parameter names, ``per_class`` per shape class, sorted.
 
-    The census is unaffordable: measured on the 27B at f32, one svdvals per shape class times
-    the class size is 1698 s per call, so two calls per arm times two arms is 1.9 h of pure
-    instrument (`probe_svd_cost.py`). At f64 it does not even fit -- 9.47 GiB for the
-    248320x5120 embedding against 3.56 GiB free.
+    Only bf16/f32 masters are eligible. Before `drop_quantized` the 2D set held 1540 names of
+    which 994 were served bytes and scales, and `.float()` makes `svdvals` accept a uint8
+    tensor without complaint -- so the gate would have reported the singular spectrum of
+    QUANTIZED BYTE PATTERNS as a weight spectrum. Filtering on dtype rather than trusting the
+    caller to have dropped them, because the failure is silent either way.
+
+    The census is unaffordable: measured on the 27B, one svdvals per shape class times the
+    class size is ~1700 s per call, so two calls per arm times two arms is 1.9 h of pure
+    instrument. At f64 it does not even fit -- 9.47 GiB for the 248320x5120 embedding.
 
     Shape is the sampling unit because both the cost and the conditioning track it. Fixed and
     sorted matters more than which matrices: two arms sampled differently produce drifts that
@@ -137,7 +142,7 @@ def sigma_keys(params, per_class: int = 1):
     """
     by_shape = {}
     for k, v in sorted(params.items()):
-        if v.dim() == 2:
+        if v.dim() == 2 and v.dtype in (torch.bfloat16, torch.float32, torch.float16):
             by_shape.setdefault(tuple(v.shape), []).append(k)
     return [k for ks in by_shape.values() for k in ks[:per_class]]
 
@@ -432,5 +437,14 @@ if __name__ == "__main__":
         # Stated rather than silently skipped: on a CPU host there is no card allocation to
         # measure, so neither assert above can fail and this line is not evidence.
         _where = "vacuous on this CPU host"
+    # 5. The gate must not read quantized bytes as weights. `.float()` makes svdvals accept a
+    #    uint8 tensor silently, so a spectrum over fp4 byte patterns would have printed as a
+    #    weight spectrum -- 994 of the 27B's 1540 2D params were served bytes before
+    #    drop_quantized. Driven with a fake uint8 param rather than asserted on the filter.
+    _fake = dict(m.params)
+    _fake["bogus.wq"] = torch.zeros(64, 64, dtype=torch.uint8)
+    assert "bogus.wq" not in sigma_keys(_fake, 2), \
+        "sigma_keys admitted a uint8 served-bytes tensor; its spectrum is not a weight spectrum"
     print("self-check: a checkpoint path is refused, the 27B tokenizer resolves by name, "
-          f"a 100%-tied run reads NOT TESTED, and the drift gate is host-side ({_where})")
+          f"a 100%-tied run reads NOT TESTED, quantized bytes are excluded, and the drift "
+          f"gate is host-side ({_where})")
