@@ -154,14 +154,13 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
 
     from tilerl_kernels.backend import Backend, resolve_target
 
-    from .model import load_hf
     from .parallel import DataParallelEngine
 
     def make(d, **kwargs):
-        # A Backend binds the current CUDA device: each replica loads its own copy there.
+        # One Backend per replica: it binds the current CUDA device, so building it here is
+        # what puts each replica's pools on its own card.
         b = Backend(resolve_target())
-        m = load_hf(cfg, _QWEN38_SOURCE, fuse_projections=True) if model is None else model
-        return engine_mod.build_engine(cfg, m, b, **kwargs)
+        return engine_mod.build_engine(cfg, model, b, **kwargs)
 
     return DataParallelEngine.build(devices, make, **kw)
 

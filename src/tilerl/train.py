@@ -423,9 +423,7 @@ def grpo_loop(
     (``step``, ``g``, ``tokens``, ``reward``, ``advantage``). The yielded tuple
     carries only means, which is the axis a length-vs-reward claim cannot be made
     on: the advantage is computed within a group on one prompt, so pairing has to
-    survive to the row level or prompt difficulty confounds it.
-    # ponytail: recapture the graph and drop the prefix entries after each
-    # update instead of disabling both, once a rollout's decode cost matters."""
+    survive to the row level or prompt difficulty confounds it."""
     _require_on_policy(engine, recapture_graph, clear_prefix)
     if recapture_graph or clear_prefix:
         # Whatever the engine cached before this loop was built under other weights.

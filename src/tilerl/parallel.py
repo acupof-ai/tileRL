@@ -108,9 +108,6 @@ class DataParallelEngine:
         total["running_per_replica"] = [s["running"] for s in per]
         return total
 
-    def is_idle(self) -> bool:
-        return all(e.is_idle() for e in self._engines)
-
     def precapture(self) -> int:
         total = 0
         for i, e in enumerate(self._engines):
