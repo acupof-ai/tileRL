@@ -223,6 +223,12 @@ def test_the_eval_curve_records_the_step_a_score_was_reached_at(tmp_path, monkey
         # checkable after a run instead of estimated before one. Asserted > 0 rather
         # than merely present: a zero would mean the clock never ran.
         assert p["eval_secs"] > 0.0, p
+        # `mean_len` and `at_cap` travel with the score because a score alone cannot say
+        # whether it is the policy's or the cap's: 2026-09-04 shipped 39.0% that was the
+        # latter (mean completion 238.7 against a 256 cap, ~82.5% uncapped). Asserted as
+        # a RANGE, not presence -- mean_len must lie in (0, cap] and at_cap in [0, total].
+        assert 0 < p["mean_len"] <= 4, p          # --eval-max-new-tokens 4 in this argv
+        assert 0 <= p["at_cap"] <= p["total"], p
     # Exactly one point carries the JIT, and it is the first: on a real 27B run
     # tilerl-0a measured 2.801 s against 0.500 s at identical n, so eval_secs is not
     # comparable across that boundary. The flag is a field and not a comment because a

@@ -822,17 +822,27 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # batch shape -- and an estimated default is harder to overturn than no default,
             # because it looks calibrated. Same idiom as `eval_{tag}_secs` (#309).
             t_eval = time.perf_counter()
-            c, n, _ = gsm8k_accuracy(engine, tok, curve_rows, eval_params, concurrency=_EVAL_CONCURRENCY,
-                                     thinking=thinking, match=MATCHERS[args.reward])
+            # `per_problem` for the LENGTHS, not just the count. A score is not
+            # interpretable without them: the same 60% can be a policy answering in 300
+            # tokens or one being cut off, and 2026-09-04 shipped a 39.0% that was the
+            # cap's number rather than the policy's. `at_cap` is the reading that
+            # distinguishes them, so it travels with every point.
+            per: list = []
+            c, n, ntok = gsm8k_accuracy(engine, tok, curve_rows, eval_params,
+                                        concurrency=_EVAL_CONCURRENCY, thinking=thinking,
+                                        match=MATCHERS[args.reward], per_problem=per)
             eval_secs = time.perf_counter() - t_eval
+            at_cap = sum(p["tokens"] >= args.eval_max_new_tokens for p in per)
             # The first point compiles the eval's shapes and every later one hits the cache,
             # so its eval_secs is 5.6x the steady state and --eval-curve-n is calibrated off
             # point two -- recorded, because the curve is a list of equal-looking dicts.
             curve.append({"step": step, "correct": c, "total": n, "score": c / max(n, 1),
                           "secs": round(train_secs, 3), "eval_secs": round(eval_secs, 3),
+                          "mean_len": round(ntok / max(n, 1), 1), "at_cap": at_cap,
                           "jit": not curve})
             log(f"  curve step {step}: {c}/{n} = {100 * c / max(n, 1):.1f}% "
-                f"at {train_secs:.1f}s cumulative, scored in {eval_secs:.1f}s")
+                f"at {train_secs:.1f}s cumulative, mean {ntok / max(n, 1):.0f} tok, "
+                f"{at_cap}/{n} at cap, scored in {eval_secs:.1f}s")
 
         hist = []
         rollouts: list = []
