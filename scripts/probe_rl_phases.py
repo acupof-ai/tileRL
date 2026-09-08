@@ -35,6 +35,9 @@ ap.add_argument("--max-new-tokens", type=int, default=128)
 ap.add_argument("--prompt-tokens", type=int, default=64)
 ap.add_argument("--micro", default="0,1,2", help="comma list; 0 = whole group at once")
 ap.add_argument("--blocks", type=int, default=256)
+ap.add_argument("--drop-quantized", action="store_true",
+                help="free the served bytes the way cli.py:275 does at the training entry "
+                     "points; 16.88 GiB on the 27B, and full fine-tuning never reads them")
 a = ap.parse_args()
 
 
@@ -47,6 +50,12 @@ def mark(tag):
 
 
 cfg, model = _build_model("qwen38-27b", seed=0, keep_master=True)
+if a.drop_quantized:
+    from tilerl.model import drop_quantized
+
+    n_before = len(model.params)
+    drop_quantized(model)
+    print(f"drop_quantized: {n_before} -> {len(model.params)} tensors", flush=True)
 backend = get_backend()
 engine = build_engine(cfg, model, backend, num_blocks=a.blocks, num_slots=8,
                       decode_graph=False, prefix_store=NoPrefixStore())

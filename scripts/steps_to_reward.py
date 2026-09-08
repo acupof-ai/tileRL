@@ -255,6 +255,15 @@ def main(argv=None):
     # must take the real backend or every arm silently runs on the host.
     backend = get_backend() if a.backend == "auto" else RefBackend()
     cfg, base = _build_model(a.model, seed=a.seed, keep_master=True)
+    # Full fine-tuning never reads the served bytes -- the tape routes every linear through
+    # `master_linear` once a bf16 master exists -- and they are 16.88 GiB on the 27B (9.90 fp8
+    # + 6.98 uint8, measured). `cli.py:275` and `:1094` do this at the training entry points;
+    # this script builds its engine directly and so has to do it itself. Not calling it is
+    # what left the arm 4.74 GiB short in step_one.
+    if a.model == "qwen38-27b":
+        from tilerl.model import drop_quantized
+
+        drop_quantized(base)
     torch.manual_seed(a.seed)
     if a.sft_steps:
         sft = sft_base(cfg, base, backend, a)
