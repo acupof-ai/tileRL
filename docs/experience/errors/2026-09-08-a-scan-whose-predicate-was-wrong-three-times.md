@@ -134,6 +134,22 @@ That is what makes +5 pt look like 2.5 sigma when it is 1.6 — and 1.6 sigma is
 7.70 pt an 80%-power test needs (PR #297).
 The paired test fixes this by making the SE genuinely smaller rather than by mis-labelling it.
 
+The figure is **identifiably** the single-arm SE, not an unsourceable value: 2.15 pt at
+p=0.36, 2.19 at 0.40, 2.24 at 0.50 — the whole plausible range rounds to 2. So the mistake has
+a name — *someone computed the SE of one measurement and wrote it beside a difference* — which
+is what makes it repeatable and worth recording. (`tilerl-0a` reached the same numbers
+independently on #301 and read them as "a value between the paired and unpaired readings";
+they are one of the two readings applied to the wrong quantity, which is the sharper statement
+and the one that stops a repeat.)
+
+**The consequence for the tightened gate, stated rather than left implicit.** #301 now demands
+`after ≥ before + 0.05 × total`, i.e. 25 questions, which is the right encoding. But against
+the *unpaired* test the gate applies today, an 80%-power detection needs 7.70 pt — so **a run
+with a genuine +5 pt improvement fails that gate more often than it passes.** That is the
+correct trade on a north-star gate (a false reject beats a false accept), and it is a known
+cost that has to be written down, or the first red runs get read as regressions rather than as
+the gate working at its stated power.
+
 ## Rule
 
 **A scan's predicate has to be checked against a known positive before its output is
