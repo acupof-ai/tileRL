@@ -141,7 +141,14 @@ card does not sit idle waiting for a plan that was never going to exist.
 ### D — the anchor fails: step 100 ∉ [90.5, 96.7]
 
 Not a run. A checklist, in the pre-registered order, each item with the reading that settles
-it rather than the hypothesis it tests:
+it rather than the hypothesis it tests.
+
+**Candidate 0 comes first, and it is the only one with evidence.** Two attempts of this exact
+configuration at `--seed 0` diverged from step 4 (the two logs), so a step-100 score carries a
+trajectory variance term the band does not contain — the band is eval sampling noise only. Its
+magnitude is unmeasured and is **not being measured**: three repeats of one configuration is
+~2 hours. So an out-of-band step 100 is **not evidence of a defect** until this is excluded,
+and item 1 is what excludes the one mechanism that would be.
 
 1. **`decode_graph=True`, the known non-alignment.** Its wall-clock effect is now measured
    (23.3 vs 56.88 s/step) and its score effect is meant to be nil. The check is not "is the

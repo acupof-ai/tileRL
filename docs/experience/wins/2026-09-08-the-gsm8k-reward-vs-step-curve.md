@@ -154,8 +154,32 @@ the per-request limit.
 **Anchor check, which takes precedence over reading the curve at all.** Step 100 must land in
 **[90.5, 96.7]**: SE at p=0.936, n=500 is **1.09 pt** (not 2.24 — that is the p=0.5 worst case),
 and the band is `± 2 × 1.09 × √2` for the difference of two independent measurements. Outside
-the band, the first three points have no referent and are not read; difference 3 above is the
-first suspect.
+the band, the first three points have no referent and are not read.
+
+**The band contains eval sampling noise only, and that is now known to be incomplete.** Its
+derivation assumes two runs of one configuration at one seed land on the same score, with the
+difference coming from which 500 rows were scored. The restart refuted that assumption
+directly: two attempts of this exact configuration at `--seed 0` agreed on the first three
+steps' rollouts and diverged from step 4. So a step-100 score carries a **trajectory variance
+term whose magnitude is unmeasured**, and the band is therefore too narrow by an unknown amount.
+
+The band is **not widened** — a threshold moved after the data is not a threshold, and there is
+no measurement to widen it by. What changes is the disposition when a point falls outside, which
+now has a fourth candidate ranked first:
+
+| | candidate | evidence today |
+|---|---|---|
+| **0** | trajectory divergence between two runs of one configuration; magnitude unknown | **the two logs** — direct, and the only one with any |
+| 1 | a replayed decode graph served stale weights | none; tested by re-running the after-arm from the saved adapter at `decode_graph=False` |
+| 2 | data order — the anchor ran a different `--data` file | none; check the two files' `file_hash` and level histograms |
+| 3 | GPU non-determinism | none; smallest term, well under a point on a 500-row greedy eval |
+
+Quantifying candidate 0 needs three repeats of one configuration, ~2 hours, and is **not being
+run**: tonight's object is the first curve, not a curve with error bars. The consequence is that
+an out-of-band step 100 is **not evidence of a defect** until candidate 0 is excluded, and
+candidate 1's check is what excludes the one mechanism that would be.
+
+Ranking proposed by `tilerl-27`, which set the original band and revised it on this reading.
 
 **Saturation.** Adjacent points differing by **< 1.00 pt** and both ≥ 90.5. That is the
 **paired** width — every point scores the same `curve_rows`, so the comparison is paired
