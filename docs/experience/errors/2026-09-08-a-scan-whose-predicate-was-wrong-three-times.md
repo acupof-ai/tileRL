@@ -9,10 +9,9 @@
 
 Three gates were fixed or found weak today, and they looked like one class:
 
-- `iso[0] <= avg[0] **or** iso[1] <= avg[1]` — a disjunction where the spec says each ([the
-  merger entry](2026-09-08-the-merger-gate-was-an-or.md)).
+- `iso[0] <= avg[0] **or** iso[1] <= avg[1]` — a disjunction where the spec says each (PR #299).
 - "average beats the base on both tasks" — true for an average that dropped a specialist.
-- `gsm8k_after > gsm8k_before` — passes 48.7% of the time on noise ([the gate entry](2026-09-08-p1s-gates-cannot-see-p1s-target.md)).
+- `gsm8k_after > gsm8k_before` — passes 48.7% of the time on noise (PR #297).
 
 The hypothesis: gates that compare a mechanism against its own starting point, with no
 second implementation, are a class. Scan the tree for the shape.
@@ -132,7 +131,7 @@ this adds that the word appears three more times with no number at all.)
 `SE ≈ 2 pt` is the SE of **one** evaluation. The gate compares two, so its noise is larger by
 √2, and quoting the single-arm figure understates the spread on the compared quantity by 42%.
 That is what makes +5 pt look like 2.5 sigma when it is 1.6 — and 1.6 sigma is below the
-7.70 pt an 80%-power test needs ([the gate entry](2026-09-08-p1s-gates-cannot-see-p1s-target.md)).
+7.70 pt an 80%-power test needs (PR #297).
 The paired test fixes this by making the SE genuinely smaller rather than by mis-labelling it.
 
 ## Rule
