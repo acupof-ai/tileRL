@@ -117,9 +117,49 @@ the actual last interior boundary = f(n, budget) -> two
 
 A ragged budget (not a multiple of `_PREFILL_BUCKET`) leaves the cursor off-bucket after the first chunk, and
 every later chunk end shifts with it. One argument cannot express a two-argument function, so no per-chunk
-guard fixes this — the helper has to take the budget, or `_finish_prefills` has to stop predicting and decide
-`spill` from the remaining length it already has. The 30k prompts the bench runs are unaffected, which is why
-this never showed up in a measurement.
+guard fixes this. The 30k prompts the bench runs are unaffected, which is why this never showed up in a
+measurement.
+
+## Four candidate fixes, all rejected, and the last one for a reason worth keeping
+
+**1. A budget-free predicate.** Scored against the real walk over budgets 2..599 × lengths 2..799, counting
+only prompts that had a publishable interior boundary:
+
+| predicate | no spill (default 504–512) | no spill (all budgets) | double spill |
+|---|---:|---:|---:|
+| today, `x == LB(n)` | 2448 (6.8%) | 37500 (8.2%) | 0 |
+| `n - x <= BLOCK_TOKENS` | 4560 (12.8%) | 60652 (13.2%) | 0 |
+| `x == ((n-1)//16)*16` | 4560 (12.8%) | 60652 (13.2%) | 0 |
+| `n - x <= 2*BLOCK_TOKENS` | 2300 (6.4%) | 30164 (6.6%) | **41962** |
+
+The narrow forms miss twice as often as what shipped; the wide one double-spills. Rejected.
+
+**2. Pass the budget — `LB(n, budget)` replays the walk.** Exact (0 misses, 0 double-spills, every budget) and
+cheap: a 30k prefill costs 0.59 ms of Python against 59 GPU forwards. **Rejected as unsound.** The walk depends
+on the budget *history*, not the current budget, since `budget` is recomputed every tick and decode rows join
+and leave mid-prefill. Sweeping schedules against a constant 512 over lengths 2..5999, the deepest interior
+boundary moves on **352–414 lengths** (n=1018: 1008 at a constant 512, 512 under 512/504 alternating). A
+replay from 0 cannot see the budgets the earlier chunks used. One length agreed on three schedules, which is
+what made this look safe before the sweep.
+
+**3. Retro-spill at DONE.** Publish every interior boundary `spill=False`, remember the deepest, spill it once
+the walk finishes. Schedule-independent by construction: **15 unspillable prompts at every realistic budget
+against today's 2448**, 0 double-spills. Needs a new `PrefixStore` method, since `insert` refuses a duplicate.
+
+**4. Deferred publish, no store change.** Same idea at the existing call site, suppressed for block-aligned
+prompts so `:1076` does not double-spill. Scored exact on every schedule: 0 double-spills, 15 unspillable, 2
+publishes per prompt unchanged.
+
+**Rejected, and this is the one worth recording: the snapshot is positional.** `_publish_prefix` clones the
+state slot *as it is when called*, and a hit copies it straight back (`engine.py:722`
+`self._states.states[slot].copy_(snap_states)`). Publishing position `p` at DONE would pair `tokens[:p]` with
+the state of the **whole prompt**. Every future hit on that entry would restore a GDN state from further along
+than its tokens, and nothing would raise — the blocks are right, the lengths are consistent, the request
+succeeds. Silent wrong inference, which is worse than the silent missing spill it was meant to fix.
+
+So candidate 3's extra store method is not incidental surface: a correct fix has to capture the snapshot at the
+boundary and spill it later, which means the store must accept a spill for an entry it already holds. That is
+the shape of the real fix, unbuilt.
 
 ## Rule
 
@@ -144,3 +184,13 @@ code as the fix, so it could not have disagreed with it.
 **Counting only the case you are fixing hides the case you are creating.** The first sweep checked whether the
 *final* chunk was 1 token, because that was the bug. The widened guard produces 1-token chunks *mid*-prefill,
 and three parametrized tests caught in one run what 1198 swept lengths had missed.
+
+**One length agreeing on three schedules is not schedule-independence.** The budget-replay fix was checked at
+n=30113 against three varying budget schedules, all agreed, and it looked sound. Sweeping 5998 lengths found
+352–414 that disagree. A single point cannot distinguish "invariant" from "invariant here".
+
+**A cache entry is a (tokens, state) pair, and a fix that moves one without the other is worse than the bug.**
+The deferred publish scored perfectly on every count that mattered — one spill per prompt, every schedule, no
+extra publishes — and would have paired each entry's tokens with a later prefix's GDN state. The missing spill
+it replaced is a lost optimization; a mispaired snapshot is wrong output that nothing raises on. Score a cache
+fix on what it stores, not only on when it fires.
