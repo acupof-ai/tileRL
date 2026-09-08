@@ -26,6 +26,16 @@ and 1855 -- 2.4x slower purely from sharing a process with the fp8 arm. So the a
 picked to match in bytes, and `--only` runs one dtype per process with the other's number
 taken from a separate run.
 
+**Neither an ideal ratio nor this probe's ratio bounds a whole-decode measurement.** A
+pure-occupancy argument gives 0.500x per token for B=8->16, assuming per-call time does
+not change with M; measured here it does (fp4 1.575x, fp8 1.255x), which puts the
+GEMM-side figure at 0.710x. 25 then measured decode/token at 0.618x -- between the two,
+and 115% of this probe's number. Above 100% means this is not a bound: it comes from one
+~70 MB shape per dtype, the model spans ~1 MB to 1272 MB, larger weights amortize better,
+and decode carries attention, GDN state and launches that scale differently again. Both
+"ideals" are point estimates dressed as bounds, wrong in opposite directions. Report the
+pair as an interval and say what each end assumes.
+
 **A "GB/s" here is assumed bytes over measured time.** The numerator is
 `numel * itemsize`, never measured: if a kernel's tiling keeps a weight resident across
 output blocks, it moves fewer bytes than that and the shortfall is reported as a lower
