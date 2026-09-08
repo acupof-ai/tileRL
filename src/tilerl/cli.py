@@ -404,6 +404,30 @@ def _write_rollout_rows(run_id: str, rows: list, written: int = 0) -> int:
     return len(rows)
 
 
+def _length_aware(match, gold, tok, lam: float, cap: int):
+    """The RL reward: correctness minus ``lam`` times the completion's fraction of the cap.
+
+    A correctness-only reward is indifferent between two right answers of any two lengths, so
+    an all-right group ties at zero advantage and produces no gradient -- run 2 collapsed that
+    way at step 41 of 100 (errors/2026-09-06-the-rollouts-grew-into-the-cap.md).
+
+    Here and NOT in `match`: `MATCHERS` also feeds `gsm8k_accuracy`, whose count becomes
+    `manifest["metrics"]["gsm8k_*"]`, the number P1's exit criterion reads. A length term in
+    the matcher contract would sit inside the gate.
+
+    `lam` is a switch, not a dial. In an all-right group it cancels exactly -- the advantage
+    divides by the group std, so `-(L_i - Lbar)/std(L)` has no `lam` in it -- and in a mixed
+    group `lam <= cap/(cap-1)` keeps a short wrong answer from outranking a long right one
+    (2048/2047 = 1.000488520, measured).
+    """
+    def reward(prompt, completion):
+        text = tok.decode([int(t) for t in completion])
+        r = float(match(text, gold[tuple(int(t) for t in prompt)]))
+        return r - lam * (len(completion) / cap)
+
+    return reward
+
+
 def _within_group_r(rows: list) -> float | None:
     """Pearson r of (tokens, reward) POOLED over within-group deviations.
 
@@ -503,6 +527,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
         # would be handed the first's finished manifest and never train.
         "tp": args.tp,
         "reward": args.reward,
+        # In the id: it changes what the reward MEANS, so two runs differing only here are
+        # not the same run and the second must not be handed the first's manifest.
+        "length_penalty": args.length_penalty,
         "eval_max_new_tokens": args.eval_max_new_tokens,
         "load_adapter": file_hash(args.load_adapter) if args.load_adapter else None,
         "eval_gsm8k": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
@@ -623,12 +650,13 @@ def _train_adapters(args: argparse.Namespace) -> None:
     if args.rl:
         if rows:
             gold = {tuple(p): r["answer"] for p, r in zip(prompts, rows)}
-            match = MATCHERS[args.reward]
-
-            def reward(prompt, completion):
-                text = tok.decode([int(t) for t in completion])
-                return float(match(text, gold[tuple(int(t) for t in prompt)]))
+            reward = _length_aware(MATCHERS[args.reward], gold, tok, args.length_penalty,
+                                   max(int(args.max_new_tokens), 1))
         else:
+            # No length term: this reward is a RATE, so its expectation does not grow with
+            # length and the defect above is absent by construction -- a longer completion
+            # earns no more, so nothing pressures the policy to lengthen. True even if this
+            # path stops being the smoke-test one.
             half = cfg.vocab_size // 2
 
             def reward(prompt, completion):
@@ -1101,6 +1129,13 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_train.add_argument("--reward", choices=["number", "boxed"], default="number",
                          help="how --data's answer is matched: last number (GSM8K) or the "
                               "last \\boxed{} (MATH, scripts/math_jsonl.py)")
+    p_train.add_argument("--length-penalty", type=float, default=0.1,
+                         help="RL reward subtracts this times completion/cap, so an all-right "
+                              "group is ordered by length instead of tying at zero advantage. "
+                              "A switch, not a dial: it CANCELS exactly in an all-right group "
+                              "(the advantage divides by the group std), and above "
+                              "cap/(cap-1) a short wrong answer can outrank a long right one. "
+                              "Set 0 to disable")
     p_train.add_argument("--temperature", type=float, default=None,
                          help="rollout temperature (default: the model card's, per thinking mode)")
     p_train.add_argument("--max-think-tokens", type=int, default=0,

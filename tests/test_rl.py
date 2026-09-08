@@ -761,3 +761,94 @@ def test_the_training_engine_keeps_its_decode_graph(tmp_path, monkeypatch):
     assert seen.get("recapture_graph") is True, (
         "grpo_loop was not told to recapture, so a kept graph would replay the "
         "weights it was traced on")
+
+
+def test_a_length_term_breaks_an_all_right_group_and_lambda_cancels_there():
+    """Two correct answers of any two lengths are indistinguishable under a correctness-only
+    reward, so an all-right group ties at zero advantage and produces no gradient. Run 2
+    collapsed that way at step 41 of 100.
+
+    The negative control is in here on purpose: a MIXED group must still return nonzero
+    advantages, or "all zero" would mean `group_advantages` is broken rather than indifferent.
+
+    And the lambda assertion, because the first instinct on reading this fix is to tune it:
+    in an all-right group lambda CANCELS. `r_i = 1 - lam*L_i` gives `r_i - mean =
+    -lam*(L_i - Lbar)` and `std = lam*std(L)`, so the ratio is `-(L_i - Lbar)/std(L)` with no
+    lam in it. Sweeping lam against the tie fraction measures a quantity that does not vary.
+    """
+    cap, group = 2048, 8
+    lens = [412, 1893, 655, 1204, 988, 1560, 301, 2048]
+
+    def shaped(correct, lam):
+        return [(1.0 if c else 0.0) - lam * (n / cap) for c, n in zip(correct, lens)]
+
+    # today's behaviour: every rollout right, no length term -> no gradient at all
+    assert np.allclose(group_advantages([1.0] * group, group), 0.0)
+    # negative control: correctness varies, so the function does produce signal
+    mixed = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    assert np.abs(group_advantages(mixed, group)).min() > 0.5, (
+        "a mixed group must carry signal, or the all-right zeros above prove nothing")
+
+    # with the term, the all-right group is ordered by length, shortest first
+    adv = group_advantages(shaped([True] * group, 0.1), group)
+    assert not np.allclose(adv, 0.0), "the length term did not break the tie"
+    assert list(np.argsort(-adv)) == list(np.argsort(lens)), (
+        f"advantage order {np.argsort(-adv)} is not shortest-first {np.argsort(lens)}")
+
+    # lambda cancels: four orders of magnitude, and against the closed form
+    ref = group_advantages(shaped([True] * group, 1e-4), group)
+    for lam in (1e-2, 0.1, 0.5, 1.0):
+        got = group_advantages(shaped([True] * group, lam), group)
+        assert np.abs(got - ref).max() < 1e-9, f"lam={lam} moved an all-right group"
+    closed = -(np.asarray(lens, dtype=float) - np.mean(lens)) / np.std(lens)
+    assert np.abs(ref - closed).max() < 1e-9
+
+    # but in a MIXED group lambda is a real dial -- so it is bounded, not free
+    lo = group_advantages(shaped(mixed_c := [True] * 4 + [False] * 4, 1e-4), group)
+    hi = group_advantages(shaped(mixed_c, 1.0), group)
+    assert np.abs(hi - lo).max() > 0.1, "lam must matter where correctness varies"
+
+    # the bound: at lam <= cap/(cap-1) a short wrong answer never outranks a long right one
+    worst = [cap] + [1] * (group - 1)
+    for lam, inverted in ((1.0, False), (1.001, True)):
+        r = [1.0 - lam * (worst[0] / cap)] + [-lam * (n / cap) for n in worst[1:]]
+        assert (max(r[1:]) > r[0]) is inverted, f"lam={lam} inversion != {inverted}"
+
+    # the case a length term provably cannot reach: every rollout at the cap
+    for lam in (0.1, 1.0):
+        at_cap = [(1.0 if c else 0.0) - lam * (cap / cap) for c in [True] * group]
+        assert np.allclose(group_advantages(at_cap, group), 0.0), (
+            "steps 41 and 44 sat exactly at the cap; any function of length is constant "
+            "within the group there and only a bigger cap recovers them")
+
+
+def test_the_rl_reward_closure_carries_the_length_term_and_the_matcher_does_not():
+    """The term belongs in the RL reward and NOT in `MATCHERS`: the same matcher feeds
+    `gsm8k_accuracy`, whose count becomes `manifest["metrics"]["gsm8k_*"]` -- the number P1's
+    exit criterion reads. This drives the real closure rather than a copy of its arithmetic.
+    """
+    from tilerl.cli import _length_aware
+    from tilerl.eval import MATCHERS
+
+    class Tok:
+        def decode(self, ids):
+            return "the answer is 42" if 42 in ids else "the answer is 7"
+
+    prompt, cap = (1, 2, 3), 100
+    gold = {prompt: "42"}
+    short, long_ = [42], [42] + [9] * 79        # same answer, 80x the tokens
+
+    r = _length_aware(MATCHERS["number"], gold, Tok(), 0.1, cap)
+    assert r(prompt, short) > r(prompt, long_), "the length term is not reaching the reward"
+    assert abs((r(prompt, short) - r(prompt, long_)) - 0.1 * 79 / cap) < 1e-12
+
+    # lam=0 reproduces the old behaviour exactly, so the flag can disable the term
+    off = _length_aware(MATCHERS["number"], gold, Tok(), 0.0, cap)
+    assert off(prompt, short) == off(prompt, long_) == 1.0
+
+    # correctness still dominates: a short wrong answer stays below a long right one
+    assert r(prompt, long_) > r(prompt, [7])
+
+    # the matcher is untouched -- it is what the P1 gate counts through
+    assert MATCHERS["number"]("the answer is 42", "42") is True
+
