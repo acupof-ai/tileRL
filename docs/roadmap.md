@@ -139,9 +139,16 @@ MMLU (1000 q) after ≥ before − 2 pt; tied-group fraction < 50% (else the tas
 is too easy for this model and the run says nothing — move to MATH). Then
 self-OPD, same gate. The manifest (P4) records the verdict.
 
-The move to MATH has happened and level 5 clears the tied-group bar — 0.34 tied
-at step 35, where GSM8K sat at 0.87 — so difficulty is no longer what blocks
-this phase. What blocks it is the reward: at a 2048 cap the run costs 229.2
+The move to MATH has happened. Whether it cleared the tied-group bar is weaker than
+it read: the **0.34 tied at step 35** was measured at a 2048 rollout cap, where 32 of
+100 completions hit the cap and **none of those 32 was judged correct** — all five of
+that run's floor ties were its five longest steps and two sat exactly on 2048, so
+part of that 0.34 is "the answer was cut off, so every rollout scored zero, so the
+group tied". At cap 6144 the base policy's tied fraction is **0.650** (n=100, k=8,
+118 of 130 ties at the ceiling), against GSM8K's 0.87. Level 5 is better than GSM8K
+on this axis and not by the margin 0.34 suggested, so **difficulty is no longer the
+whole of what blocks this phase, but it is not settled either.** What blocks it is
+the reward: at a 2048 cap the run costs 229.2
 s/step and the backward is cap-bound rather than token-bound, and the policy
 drifts into the cap before 100 steps
 (`errors/2026-09-06-the-rollouts-grew-into-the-cap.md`).
