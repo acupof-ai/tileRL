@@ -94,7 +94,14 @@ def test_merge_checkpoints_streams_shards_and_records(tmp_path, monkeypatch):
     want = iso_merge(params[0], params[1:])
     for k, w in want.items():
         if w.dim() == 2:
-            assert torch.allclose(got[k].float(), w.float(), atol=2e-2, rtol=2e-2), k
+            # Exact, not a tolerance: both sides reach iso_merge_weight (merge.py:79 and
+            # :144), so the merge math cancels and only the shard write plus load_hf round
+            # trip is under test. That path has no dtype conversion, so the old atol=rtol=2e-2
+            # guarded a difference measured at 0 over 17 tensors. The detection floor is
+            # bf16's mantissa step, not this assertion: scaling the shard by 1.001 still
+            # rounds to the same value, 1.01 is caught. The merge math itself is covered by
+            # test_iso_merge_two_specialists' loss comparison, not here.
+            assert torch.equal(got[k], w), k
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
     monkeypatch.setattr(sys, "argv", ["tilerl", "merge", "--base", dirs[0], "--specialists",
                                       ",".join(dirs[1:]), "--out", str(tmp_path / "out2")])
