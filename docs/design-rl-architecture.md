@@ -168,8 +168,10 @@ follow from the survey and cost nothing architecturally:
 
    The bf16 control arm ran on the same shape (`layers.0.gate_up`, N=34816,
    K=5120) to separate "the fp4 dequant path is slow" from "M=8 has too little
-   arithmetic intensity". At M=8 fp4 reaches **28.9% of nominal** and bf16
-   **33.1%** — a ratio of 1.14x, against a 1.5x bar fixed before the run. So the
+   arithmetic intensity". Its fp4 leg is a second, independent run of the shape
+   the roofline paragraph above already measured: 1157.9 GB/s here against
+   1144.7 GB/s there, 1.2% apart on different days in different sessions. At M=8
+   fp4 reaches **28.9% of nominal** and bf16 **33.1%** — a ratio of 1.14x, against a 1.5x bar fixed before the run. So the
    dequant path is not the bottleneck at the shape rollout actually uses, and
    adding batch is the lever rather than rewriting the kernel. fp4 also beats
    bf16 in tokens per millisecond at every M measured (1.2x to 2.8x): it is
@@ -195,10 +197,11 @@ their shared premise, not their conclusion.** A cross-validation has to differ i
 kind — a measurement against a derivation — and the measurement here was one dump
 of `numel * itemsize` per key.
 
-**What this document cannot yet decide.** Why the decode forward sits at 19.1%
-of bandwidth rather than near it. Occupancy, KV traffic and the GDN state are the
-candidates and none has been measured. Until one is, "the forward is 4.69x the
-floor" is a bound, not a diagnosis.
+**What this document cannot yet decide.** Why the decode forward sits so far below
+the bandwidth floor. Occupancy, KV traffic and the GDN state are the candidates
+and none has been measured. The figure is stated once, above; it is a bound, not
+a diagnosis, and repeating it here is how the stale version of it survived an
+afternoon of corrections in this very paragraph.
 
 ## Sources
 
