@@ -80,6 +80,8 @@ def iso_merge(
     return out
 
 
+# Not the tail of the file: a function is defined below this block and is unavailable to
+# it. Gated by tests/test_main_selfchecks.py.
 if __name__ == "__main__":  # runnable check: one specialist comes back, spectrum kept
     torch.manual_seed(0)
     w0 = torch.randn(96, 64)

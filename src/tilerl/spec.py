@@ -93,6 +93,10 @@ def verify_lens(
     return out
 
 
+# This block is NOT the tail of the file: a class and three functions are defined below
+# it, so they do not exist while it runs. Anything added here can only use what precedes
+# this block. Gated by tests/test_main_selfchecks.py since 2026-09-08 -- before that, the
+# #22 block-parallel reject and the staircase constants below ran only when typed.
 if __name__ == "__main__":  # runnable check
     assert survival([0.9, 0.8, 0.5]) == [0.9, 0.9 * 0.8, 0.9 * 0.8 * 0.5]
     assert verify_lens([[0.99, 0.98, 0.97]], bias_ms=1.0, row_ms=0.1) == [3]
