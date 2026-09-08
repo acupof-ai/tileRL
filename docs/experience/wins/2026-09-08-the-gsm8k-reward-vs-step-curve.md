@@ -279,12 +279,22 @@ cumulative — **114%**, or 26.4 training steps per curve point. It is **0.62x**
 points cost 41.0 min of eval against 38.8 min of training; the run totals ~80 min.
 
 **Where the rows actually are.** The restarted run **reuses the first attempt's id**
-`86a06dc8c420`, because the id is a hash of the inputs and the inputs are identical. The
-newer-looking `0435924d7108` is an **empty directory the killed first attempt left behind** —
-manifest only, `eval_curve: None`. Sorting `runs/` by mtime finds the wrong one; the id hash
-finds the right one. Read the run directory the manifest names, not the newest.
+`86a06dc8c420`, because the id hashes the inputs and the inputs are identical — confirmed by
+that manifest's `started` moving from 13:05 to **13:50**, i.e. rewritten by the second launch,
+with the curve rows landing in the same directory.
 
-`time_to_score`'s 4x-style ratio is **not computed yet**: it needs step 100's `secs` from this
-same curve, and only step 25's exists.
+**And the directory I first read instead was not what I said it was.** `0435924d7108` sorts
+newer by mtime and I reported it as the killed attempt's leftover. It is not: its manifest is
+`source: tiny`, commit `2ea4a1f`, started *and* finished at 13:09:12 with a full set of gates —
+someone else's synthetic run in the shared tree, nothing to do with this one. Reading `started`
+alone made it look like mine; `inputs.source` is what distinguishes them.
+
+Two separate lessons, and only the first was in the earlier draft: find the run by the id the
+manifest names rather than by mtime, **and** check that a directory is yours before drawing a
+conclusion from its contents — a shared `runs/` holds other sessions' runs, so "newest" and
+"mine" are different predicates.
+
+`time_to_score`'s ratio is **not computed yet**: it needs step 100's `secs` from this same
+curve, and only step 25's exists.
 
 Points 2-4 pending.
