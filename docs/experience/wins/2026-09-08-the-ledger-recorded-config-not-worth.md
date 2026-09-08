@@ -77,6 +77,14 @@ So the GRPO loop now scores a fixed held-out subset every `--eval-every` steps a
   overturn than no default, because it looks calibrated.** Recording the per-point cost makes
   the criterion a fact checkable after the first run, and one that tracks the model and `n`
   without maintenance. (`tilerl-27` stopped the estimate.)
+- **The first point is flagged `jit`, because its `eval_secs` is not comparable to the rest.**
+  `tilerl-0a` ran the curve on `06b16ea` and got **2.801 s at step 2 against 0.500 s at step
+  4 with identical `n`** — 5.6x, all of it TileLang compiling the eval's kernel shapes, which
+  every later point then hits warm. Two consequences. The subset size must be calibrated off
+  point two, not point one; and point one is the only point a short run produces, so a reader
+  looking at a 2-step run sees exactly the unrepresentative number. A field rather than a
+  comment: once the curve is a list of equal-looking dicts, nothing in the manifest says
+  which point was first.
 
 Off by default (`--eval-every 0`), so no existing invocation changes shape.
 

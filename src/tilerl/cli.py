@@ -790,8 +790,15 @@ def _train_adapters(args: argparse.Namespace) -> None:
             c, n, _ = gsm8k_accuracy(engine, tok, curve_rows, eval_params, concurrency=8,
                                      thinking=thinking, match=MATCHERS[args.reward])
             eval_secs = time.perf_counter() - t_eval
+            # `jit`: the FIRST point compiles the eval's kernel shapes and every later one
+            # hits the cache, so its eval_secs overstates the steady-state cost -- measured
+            # 2.801 s against 0.500 s at identical n, 5.6x (tilerl-0a). It is also the only
+            # point a short run ever produces, so calibrate --eval-curve-n off point two.
+            # A field, not a comment: a reader of the manifest cannot see which point was
+            # first once the curve is a list of equals.
             curve.append({"step": step, "correct": c, "total": n, "score": c / max(n, 1),
-                          "secs": round(train_secs, 3), "eval_secs": round(eval_secs, 3)})
+                          "secs": round(train_secs, 3), "eval_secs": round(eval_secs, 3),
+                          "jit": not curve})
             log(f"  curve step {step}: {c}/{n} = {100 * c / max(n, 1):.1f}% "
                 f"at {train_secs:.1f}s cumulative, scored in {eval_secs:.1f}s")
 
