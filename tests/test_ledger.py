@@ -158,6 +158,47 @@ def test_the_manifest_records_the_engine_config_the_wall_clock_depends_on(tmp_pa
     assert seen[4000] > seen[4], f"blocks did not track the context: {seen}"
 
 
+def test_the_pool_is_sized_for_the_eval_arm_not_only_the_rollout(tmp_path, monkeypatch):
+    """The eval submits at its OWN cap and its own width, and the pool must cover it.
+
+    `--eval-max-new-tokens` defaults to 2048 against a 4-token rollout cap, and the eval
+    arms submit `_EVAL_CONCURRENCY` rows where the rollout submits `--group`. Sizing the
+    pool from the rollout terms alone raised "PagedKvPool exhausted: all 521 blocks in use"
+    inside the before-arm at every group size once 8 eval rows were scored -- the
+    arithmetic was right for the term it modelled and the other term was not in it.
+
+    8 rows, not 2: at 2 the eval fits under the rollout's own pool at group >= 4 and the
+    test goes green over the bug. This is the shape that fails.
+
+    Asserted on the RECORDED pool, not merely on the run completing: `engine.config` is
+    read off the built engine, so a pool that happens to be large enough for this tiny
+    model would pass a completion check while the sizing rule stayed wrong.
+    """
+    from tilerl.cli import _EVAL_CONCURRENCY
+    from tilerl.kv_cache import BLOCK_TOKENS
+
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
+    data = tmp_path / "d.jsonl"
+    data.write_text('{"prompt": "1+1?", "answer": "2"}\n' * 8)
+    eval_cap = 64
+    code = _train(["--rl", "--data", str(data), "--eval-gsm8k", str(data), "--eval-n", "8",
+                   "--steps", "1", "--group", "2", "--max-new-tokens", "4",
+                   "--eval-max-new-tokens", str(eval_cap), "--lora-rank", "4",
+                   "--allow-short-rollouts"])
+    (m,) = list_runs(tmp_path / "runs")
+    # The eval ran at all: an exhausted pool raises rather than scoring, so a recorded
+    # count is what says the arm completed.
+    assert m["metrics"]["gsm8k_before"] is not None, m["metrics"]
+    assert code in (0, 1)  # gates may fail on a 1-step tiny run; that is not the question
+    # The eval's demand, from the same flags production reads. `>=`, since the rollout
+    # term or the +8 graph row can exceed it.
+    eval_blocks = -(-(eval_cap + 64 + len("1+1?")) // BLOCK_TOKENS) * _EVAL_CONCURRENCY
+    assert m["engine"]["blocks"] >= eval_blocks, (
+        f"pool {m['engine']['blocks']} is under the eval's {eval_blocks}: sized from the "
+        f"rollout alone")
+    assert m["engine"]["slots"] >= _EVAL_CONCURRENCY, m["engine"]
+
+
 def test_the_eval_curve_records_the_step_a_score_was_reached_at(tmp_path, monkeypatch):
     """`time_to_score = steps_to_score x seconds_per_step` needs the STEP, and
     gsm8k_before/after cannot say which step a score was crossed at.

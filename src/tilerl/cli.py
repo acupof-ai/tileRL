@@ -24,6 +24,14 @@ _NO_WEIGHTS = (
     "      local safetensors directory), or use --model tiny."
 )
 
+# Rows the eval arms submit at once. A constant because the KV pool must be sized from the
+# same number the evals use: it was a literal 8 at three call sites while the pool was
+# derived from --group alone, and the eval then exhausted the pool it was never counted in.
+# It is also part of the SCORE, not of how the score was obtained -- concurrency sets the
+# batch, the batch picks the fp4 linear arm, and two concurrencies can run two kernels on
+# the same question (eval.py:94).
+_EVAL_CONCURRENCY = 8
+
 
 def _qwen38_tokenizer():
     """The 27B tokenizer, with the same hint as its weights: a bare hub id 401s."""
@@ -621,27 +629,40 @@ def _train_adapters(args: argparse.Namespace) -> None:
     # unreachable however the recipe was written. Size the pool from the ask instead.
     from .kv_cache import BLOCK_TOKENS
 
-    # 1024 floor = the old flat 512 blocks. evals submit prompts this function never
-    # sees -- MMLU reaches 515 tokens against GSM8K's 183 -- so a short
-    # --max-new-tokens must not shrink the pool under them. max_total_tokens only
-    # guards one request and costs no memory, so it never drops below the 8192 default.
+    # 1024 floor = the old flat 512 blocks. max_total_tokens only guards one request and
+    # costs no memory, so it never drops below the 8192 default.
     # Hand-computed, so `_fit_blocks` never runs here: passing num_blocks truthy is what
     # skips it (engine.py:1645), and it is the only path that measures free memory instead
     # of deriving a pool from context. That is deliberate for now -- training also holds
     # gradients, the tape and the optimizer state, which `_fit_blocks` does not model, so
     # its two-thirds rule is calibrated for serve. Whether training should use it is a
     # card-pending question, not an oversight.
-    ctx = max(max(map(len, prompts)) + args.max_new_tokens + 64, 1024)
+    #
+    # TWO consumers, so the pool is the max over both. The rollout submits `--group` rows
+    # at `--max-new-tokens`; the eval submits `_EVAL_CONCURRENCY` rows at
+    # `--eval-max-new-tokens` (2048 by default, 512x the rollout cap this test uses), and
+    # the eval's own prompts are longer -- MMLU reaches 515 tokens against GSM8K's 183.
+    # Sizing from the rollout alone is what raised "PagedKvPool exhausted: all 137 blocks
+    # in use" in the eval arm: the arithmetic was right for the term it modelled and the
+    # other term was not in it. `--group 2` merely lowered the pool far enough for the
+    # 2-row test to hit a boundary that 8 eval rows crossed at every group size.
+    rollout_batch = max(args.group, 1)
     # Sized from --group, not a literal 8: grpo_loop submits the whole group at once
     # (train.py, one submit per g), so a group wider than the engine runs in waves and
     # every rollout in the second wave decodes at a batch the tensor core underfills.
-    # The three used to be 8 while --group was a settable flag defaulting to 8, so
-    # --group 16 quietly became two waves of 8.
-    rollout_batch = max(args.group, 1)
-    engine = build_engine(cfg, model, backend, num_slots=rollout_batch,
-                          max_batch=rollout_batch, draft=draft,
-                          num_blocks=-(-ctx // BLOCK_TOKENS) * rollout_batch + 8,
-                          max_total_tokens=max(ctx, 8192),
+    prompt_max = max(map(len, prompts))
+    rollout_ctx = prompt_max + args.max_new_tokens + 64
+    # The eval's prompts are not in `prompts`, so bound them by the rollout's longest and
+    # the 515-token MMLU worst case rather than pretending they are known here.
+    eval_ctx = max(prompt_max, 515 if args.eval_mmlu else 0) + args.eval_max_new_tokens + 64
+    eval_batch = _EVAL_CONCURRENCY if (eval_rows or args.eval_mmlu) else 0
+    blocks = max(-(-rollout_ctx // BLOCK_TOKENS) * rollout_batch,
+                 -(-eval_ctx // BLOCK_TOKENS) * eval_batch) + 8
+    ctx = max(rollout_ctx, 1024)
+    engine = build_engine(cfg, model, backend, num_slots=max(rollout_batch, eval_batch),
+                          max_batch=max(rollout_batch, eval_batch), draft=draft,
+                          num_blocks=blocks,
+                          max_total_tokens=max(ctx, eval_ctx, 8192),
                           spec_depth=args.depth, decode_graph=True,
                           prefix_store=NoPrefixStore())
     # Not in `inputs`: the id is a hash of it, so recording the pool there would make
@@ -682,7 +703,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             return
         rows_out: list = []
         if args.eval_mmlu:
-            c, n, conc = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=8,
+            c, n, conc = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=_EVAL_CONCURRENCY,
                                        questions=mmlu_set, per_problem=rows_out)
             manifest["metrics"][f"mmlu_{tag}"] = c / n
             manifest["metrics"][f"mmlu_{tag}_concurrency"] = conc
@@ -691,7 +712,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}% (seed 0, concurrency {conc})")
         if eval_rows:
             gsm_rows: list = []
-            c, n, ntok = gsm8k_accuracy(engine, tok, eval_rows, eval_params, concurrency=8,
+            c, n, ntok = gsm8k_accuracy(engine, tok, eval_rows, eval_params, concurrency=_EVAL_CONCURRENCY,
                                         thinking=thinking,
                                         match=MATCHERS[args.reward],
                                         per_problem=gsm_rows)
@@ -794,7 +815,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # batch shape -- and an estimated default is harder to overturn than no default,
             # because it looks calibrated. Same idiom as `eval_{tag}_secs` (#309).
             t_eval = time.perf_counter()
-            c, n, _ = gsm8k_accuracy(engine, tok, curve_rows, eval_params, concurrency=8,
+            c, n, _ = gsm8k_accuracy(engine, tok, curve_rows, eval_params, concurrency=_EVAL_CONCURRENCY,
                                      thinking=thinking, match=MATCHERS[args.reward])
             eval_secs = time.perf_counter() - t_eval
             # The first point compiles the eval's shapes and every later one hits the cache,
