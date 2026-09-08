@@ -523,6 +523,24 @@ class Engine:
     def usable_slots(self) -> int:
         return self._states.num_slots - (self._pad_slot is not None)
 
+    @property
+    def config(self) -> dict[str, Any]:
+        """The fields a wall-clock number cannot be compared across runs without.
+
+        Read off the built engine rather than the call's kwargs: `num_blocks` is
+        clamped by `max_blocks` and both pools carry the graph's pad row, so the
+        argument and the pool disagree. Six card sessions on the 2.6x rollout tick
+        recovered their two pool sizes only because the probe logged its own flags
+        (errors/2026-09-08-six-card-sessions-and-the-defect-did-not-move.md).
+        """
+        return {"blocks": self.usable_blocks, "slots": self.usable_slots,
+                "max_batch": self.limits.max_batch,
+                "max_total_tokens": self.limits.max_total_tokens,
+                "max_num_batched_tokens": self.limits.max_num_batched_tokens,
+                "decode_graph": self._decode_graph_on,
+                "prefix_store": type(self._prefix).__name__,
+                "spec_width": self._width}
+
     def room_for(self, prompt_tokens: int) -> int:
         """Largest ``max_new_tokens`` this prompt can ask for and still be admitted.
 
