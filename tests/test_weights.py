@@ -402,6 +402,8 @@ def test_fused_projections_parity(tmp_path):
     # The fusion, on the served backend. NOT torch.equal: one fused gemm and two
     # separate ones reduce in a different order, which is bit-identical on cpu and
     # 9.5e-06 apart on metal. A broken fusion is off by orders of magnitude.
+    # Band kept deliberately: measured 0 on the CPU target, but this test names cuda/metal/
+    # sm90 and the band is what covers those arms, which do not run here (audit 2026-09-08).
     assert torch.allclose(y2, y3, rtol=0, atol=1e-4), (y2 - y3).abs().max()
     if not tl.target.startswith("cuda"):
         # sm90 sends these 32 rows to w4a8, whose e4m3 activations sit 19.8% off the

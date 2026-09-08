@@ -69,6 +69,8 @@ def test_fused_fp8_qkvz_parity():
     with torch.no_grad():
         y0 = model.forward(batch, positions, _training_kv(model, 2, 16, device=d), backend)
         y1 = fused.forward(batch, positions, _training_kv(fused, 2, 16, device=d), backend)
+    # Band kept deliberately: measured 0 on the CPU target, but the sm90 arm is unmeasured
+    # here and the band is what covers its rounding (audit 2026-09-08).
     assert torch.allclose(y0, y1, rtol=1e-2, atol=1e-2), (y0 - y1).abs().max()
 
 

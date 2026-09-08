@@ -2063,6 +2063,8 @@ def test_recording_uses_master_weight_and_consumes_tape():
     tape = Tape()
     with tape:
         y = recording.linear_fp4(x, wq, scale, master=master)
+    # Band kept deliberately: recording.linear_fp4 against RefBackend.linear are
+    # independent paths agreeing bit-for-bit today; exact would be a determinism claim.
     assert torch.allclose(y, backend.linear(x, master))
     grads = tape.backward(torch.ones_like(y))
     assert id(master) in grads and not tape._entries
@@ -2114,7 +2116,10 @@ def test_clip_grad_norm():
     assert abs(grads[0].norm().item() - 1.0) < 1e-6
     grads = {0: torch.full((4,), 0.1)}
     pre = clip_grad_norm(grads, 1.0)
-    assert abs(pre - 0.2) < 1e-6 and torch.allclose(grads[0], torch.full((4,), 0.1))
+    # Exact, and NOT because 0.1 is representable -- it is not (f32 stores 0.10000000149).
+    # Both sides come from the same `torch.full(..., 0.1)`, so they carry the identical
+    # rounded value; a norm below the clip must leave the tensor untouched, bit for bit.
+    assert abs(pre - 0.2) < 1e-6 and torch.equal(grads[0], torch.full((4,), 0.1))
     grads = {0: torch.tensor([float("nan"), 1.0])}
     assert not math.isfinite(clip_grad_norm(grads, 1.0))
 
@@ -2368,6 +2373,8 @@ def test_frozen_fp4_base_gives_dx_only():
     g = torch.randn_like(y)
     grads = tape.backward(g)
     assert set(grads) == {id(x)}
+    # Band kept deliberately: the tape gradient against an independent dequant-then-matmul
+    # agree bit-for-bit today; exact would be a determinism claim (audit 2026-09-08).
     assert torch.allclose(grads[id(x)], g @ dequant_fp4(wq, scale), atol=1e-4)
 
 
@@ -2381,7 +2388,9 @@ def test_lora_train_step_on_frozen_fp4_base():
     new = add_lora(model, rank=4, seed=1)
     assert new and all(k.endswith((".lora_a", ".lora_b")) for k in new)
     after = model.forward(ids, np.arange(ids.shape[1]), _training_kv(model, 1, ids.shape[1]), backend)
-    assert torch.allclose(base_logits, after)  # B = 0
+    # Exact: same forward, same inputs, and LoRA B is zero-initialised, so `after` is
+    # `base_logits` by construction rather than to within a tolerance.
+    assert torch.equal(base_logits, after)  # B = 0
 
     before = {k: v.clone() for k, v in model.params.items()}
     assert math.isfinite(train_step(model, ids, backend, AdamW(lr=1e-2), trainable=new))
