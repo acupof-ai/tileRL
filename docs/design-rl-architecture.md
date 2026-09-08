@@ -83,23 +83,46 @@ has a ceiling of 1309 tok/s. Measured rollout is 8192 tokens in 63.156 s =
 **130 tok/s, 0.099 of the ceiling**. Long-tail idle explains roughly a factor of
 two of that.
 
-**The rest is not the model.** A first breakdown on card 6 (2026-09-08, 27B,
-group 8, gen 1024, two pooled steps) puts `_run_forward` at 99.9% of the rollout
-wall and `_sample_commit` — nested inside it — at **89.5%**: 27.2 s of a 30.4 s
-step. The model forward is the remaining ~3.1 s. Sampling, a host-side
-logits-to-token path, is the largest single block in the step, and folded back
-into the 85.617 s profile it is on the order of two thirds of the whole GRPO
-step. Nothing in the roadmap, the design docs or six card-sessions of rollout
-work had this as a candidate.
+**The rest is the model forward, and it runs at a fifth of bandwidth.** A first
+breakdown on card 6 (2026-09-08, 27B, group 8, gen 1024) attributed 89.5% of the
+rollout wall to `_sample_commit` and left the forward at 3.07 ms/tick. That
+attribution was wrong, and the discriminator was the floor: **3.07 ms is half of
+the 6.11 ms it takes to read the weights once.** A forward cannot finish in half
+the time needed to stream the weights it multiplies. The decode path contains no
+synchronisation between `_model.forward` and the `.tolist()` that reads the
+sampled tokens back, so CUDA launches asynchronously, the forward timer stops at
+the last kernel *enqueue*, and the whole forward's drain is billed to the first
+host read — which is the sampler.
 
-Two caveats hold this number below a verdict. The probe's conservation assertion
-was vacuous — the remainder was *defined* as `wall - sum(parts)` and then
-asserted to close, so a **negative** remainder of -27.2 s printed as data instead
-of raising. And the probe's aggregate rate (270 tok/s) is 2x the profile's
-(130 tok/s), unexplained, so its absolute seconds cannot yet be aligned with the
-85.617 s table. The nesting does not threaten the headline — a child at 89.5% of
-a parent that is 99.9% of the wall is a valid share either way — but the entry
-that records it must come from the fixed instrument.
+Direct microbenchmarks on the card settle it. Every operator inside sampling,
+timed on H20 with a peaked logits fixture (nucleus 39 of 248320):
+
+| operator | H20 | same on CPU |
+|---|---:|---:|
+| `sort` over V, descending | 0.274 ms | 20.53 ms |
+| per-row Generator + `multinomial` x8 | 0.790 ms | 18.69 ms |
+| `log_softmax(B,V)` | 0.055 ms | 0.52 ms |
+| **all sampling operators** | **1.065 ms** | ~40 ms |
+
+**Sampling is 3.6% of a 29.71 ms tick.** The other 28.64 ms is the forward, which
+puts it at 4.69x the 6.11 ms floor — **21.3% of HBM bandwidth**. That is the
+number this project should be optimising, and it is inside the decode kernel:
+occupancy, KV traffic, GDN state. Not the sampler, and not a new process
+topology.
+
+**Two method results worth more than the number.** First, the CPU could not have
+priced this: the logits are 8 x 248320 x 4 B = 7.95 MB, a radix sort moves about
+0.16 GB, and at 4 TB/s that is ~40 us — so the CPU's 20.53 ms is **517x** the
+GPU's bandwidth floor. An O(V) mechanism whose V is only a few megabytes is
+compute-bound on CPU and bandwidth-bound on GPU; measuring it on CPU is wrong by
+orders of magnitude, not by a constant. Second, the finding that survived was the
+one whose author wrote down its own falsifier: "if `sort` over V is 1-2 ms on the
+card, this is not the mechanism." It measured 0.274 ms.
+
+The sampler does hold two real but small wins — batching the per-row
+`multinomial` loop (9.35x on that operator, 2.6% of the rollout) and topk in
+place of the full sort (0.6%). Together 3.2%, and they wait until
+`steps_to_score` exists to price them.
 
 ## The choice
 
@@ -121,17 +144,14 @@ follow from the survey and cost nothing architecturally:
    the engine does not need to idle: a finished row's slot should take the next
    prompt's rollout rather than wait.
 
-3. **Attack the sampler before any kernel.** On the first breakdown it is the
-   largest block in the step by a wide margin, and it is host-side Python and
-   tensor plumbing rather than a scheduled kernel — the cheapest class of thing
-   to fix. This displaces the kernel and KV work that six card-sessions went to.
+3. **Attack the decode kernel's bandwidth utilisation.** It is 21.3% of the
+   floor and it is 96% of the rollout tick. The sampler, which the first
+   breakdown named, is 3.6%.
 
-**What this document cannot yet decide.** What is *inside* the 27.2 s: a host
-sync, a per-row `.cpu()`, a Python loop over the batch, or genuine compute. That
-bucket needs its own decomposition, and until it has one, "sampling is 89.5%" is
-a name standing in for a mechanism — the same shape as `backward_secs` being
-19.7% forward, which is the error this document's own headline number exists to
-correct.
+**What this document cannot yet decide.** Why the decode forward sits at 21.3%
+of bandwidth rather than near it. Occupancy, KV traffic and the GDN state are the
+candidates and none has been measured. Until one is, "the forward is 4.69x the
+floor" is a bound, not a diagnosis.
 
 ## Sources
 
