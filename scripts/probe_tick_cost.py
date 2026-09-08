@@ -43,8 +43,9 @@ equal afterwards regardless.
 (measured, R2 0.794 with a rows x depth interaction). A sweep that moved both would
 reproduce the confound it exists to remove.
 
-Per-tick timing is honest without an added sync: the decode path ends in `toks.tolist()`
-(engine.py:1347), which blocks on the tick it just issued.
+The timed region is bracketed by a device sync at each end, and needs no per-tick sync:
+the decode path ends in `toks.tolist()` (engine.py:1347), which blocks on the tick it
+just issued, so no work escapes past the loop's own last tick.
 
 Compile gate (25, #318): a kernel compiled inside a timed region means the number includes
 codegen, and the probe refuses rather than reporting it.
@@ -63,6 +64,7 @@ sys.path[:0] = [f"{os.environ['REMOTE_DIR']}/src",
                 f"{os.environ['REMOTE_DIR']}/packages/tilerl-kernels/src"]
 
 import numpy as np  # noqa: E402
+import torch  # noqa: E402
 
 _WEIGHT_GB = 21.896
 _HBM_TBS = 3.35
@@ -102,6 +104,13 @@ def main() -> int:
     assert not base.stop_token_ids, "a stoppable row breaks the equal-length invariant"
 
     backend = get_backend()
+
+    def sync():
+        # backend has no synchronize(); train.py:28 does exactly this, gated on the
+        # device so a CPU run does not touch torch.cuda.
+        if getattr(backend, "device", None) is not None and backend.device.type == "cuda":
+            torch.cuda.synchronize()
+
     cfg, model = _build_model("qwen38-27b", seed=0, keep_master=True)
     ctx = args.gen + len(prompt) + 64
 
@@ -130,7 +139,7 @@ def main() -> int:
         ids = [engine.submit(prompt, replace(base, seed=g)) for g in range(k)]
         for _ in range(args.warmup):
             engine.step()
-        backend.synchronize()
+        sync()
         before = len(backend._kernels)
         # `while engine._running`, not `while engine.stats()["running"]`: stats() takes
         # the lock and builds a ~20-key dict including the prefix store's, once per tick,
@@ -140,7 +149,7 @@ def main() -> int:
         while engine._running:
             engine.step()
             ticks += 1
-        backend.synchronize()
+        sync()
         dt = time.perf_counter() - t0
         lens = [len(engine._finished[i]) for i in ids]
         if len(set(lens)) != 1:
@@ -170,7 +179,7 @@ def main() -> int:
         engine.submit(prompt, replace(base, max_new_tokens=n, seed=100 + g))
     for _ in range(args.warmup):
         engine.step()
-    backend.synchronize()
+    sync()
     before = len(backend._kernels)
     per_tick = []
     while engine.stats()["running"]:
