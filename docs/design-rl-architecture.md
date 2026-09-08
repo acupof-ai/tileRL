@@ -77,11 +77,21 @@ the longest completion's length by construction.
 Run 2's recorded means — 890, 1122, 1198, 1277, 1923 tokens across steps — put
 the within-step spread in the range where this costs a factor near two.
 
-The roofline says the gap is larger than that. 27B NVFP4 weights are 24.44 GB;
-at 4.0 TB/s a decode tick that reads them once takes 6.11 ms, so a group of 8
-has a ceiling of 1309 tok/s. Measured rollout is 8192 tokens in 63.156 s =
-**130 tok/s, 0.099 of the ceiling**. Long-tail idle explains roughly a factor of
-two of that.
+The roofline says the gap is larger than that. The per-tick stream, dumped per
+key off the loaded model and closing to 0.002 GB against the resident total:
+
+| what | GB |
+|---|---:|
+| `w8` (fp8 weights) | 10.625 |
+| `wq` (fp4 nibbles) | 7.499 |
+| `scale` (block scales) | 3.746 |
+| `embed_tokens` | 2.543 |
+| everything else | 0.026 |
+| **total resident** | **24.439** |
+| **streamed per decode tick** (embedding is one row, not the table) | **21.896** |
+
+At 4.0 TB/s that is **5.47 ms/tick**. Long-tail idle explains roughly a factor of
+two of the rollout gap.
 
 **The rest is the model forward, and it runs at a fifth of bandwidth.** A first
 breakdown on card 6 (2026-09-08, 27B, group 8, gen 1024) attributed 89.5% of the
@@ -105,7 +115,7 @@ timed on H20 with a peaked logits fixture (nucleus 39 of 248320):
 | **all sampling operators** | **1.065 ms** | ~40 ms |
 
 **Sampling is 3.6% of a 29.71 ms tick.** The other 28.64 ms is the forward, which
-puts it at 4.69x the 6.11 ms floor — **21.3% of HBM bandwidth**. That is the
+puts it at 5.23x the 5.47 ms floor — **19.1% of HBM bandwidth**. That is the
 number this project should be optimising, and it is inside the decode kernel:
 occupancy, KV traffic, GDN state. Not the sampler, and not a new process
 topology.
@@ -144,11 +154,22 @@ follow from the survey and cost nothing architecturally:
    the engine does not need to idle: a finished row's slot should take the next
    prompt's rollout rather than wait.
 
-3. **Attack the decode kernel's bandwidth utilisation.** It is 21.3% of the
+3. **Attack the decode kernel's bandwidth utilisation.** It is 19.1% of the
    floor and it is 96% of the rollout tick. The sampler, which the first
    breakdown named, is 3.6%.
 
-**What this document cannot yet decide.** Why the decode forward sits at 21.3%
+**A third method result, and the reason the number above is 19.1% rather than the
+21.8% this document carried an hour earlier.** Two sessions derived the weight
+bytes from shape independently and landed **1.9% apart** (18.23 and 18.58 GB)
+against a measured 24.44 GB. The agreement read as confirmation. It was not: both
+started from `fp4_param_keys` and both encoded "every quantised linear is fp4",
+and the missing 5.86 GB was `w8` — the checkpoint is mixed precision and its fp8
+weights carry more bytes than its fp4 ones. **Two derivations agreeing measure
+their shared premise, not their conclusion.** A cross-validation has to differ in
+kind — a measurement against a derivation — and the measurement here was one dump
+of `numel * itemsize` per key.
+
+**What this document cannot yet decide.** Why the decode forward sits at 19.1%
 of bandwidth rather than near it. Occupancy, KV traffic and the GDN state are the
 candidates and none has been measured. Until one is, "the forward is 4.69x the
 floor" is a bound, not a diagnosis.
