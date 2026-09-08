@@ -27,6 +27,7 @@ import argparse
 import json
 import random
 import statistics
+import sys
 
 
 def occupancy(steps: list[list[int]], k: int) -> float:
@@ -94,4 +95,13 @@ if __name__ == "__main__":
     assert _lo <= 1 - occupancy(_wide, 16) <= _hi, "same distribution must confirm"
     _heavy = [[_r.randrange(100, 8000) for _ in range(16)] for _ in range(20)]
     assert not (_lo <= 1 - occupancy(_heavy, 16) <= _hi), "a heavier tail must refute"
+    print("self-check: 2 asserts passed (a same-distribution arm confirms, "
+          "a heavier-tailed one refutes)")
+    # The analysis runs only when invoked with arguments. Bare `python3 <this>` is how
+    # CI runs a script's self-check, and a CI host has no /work, so reaching main()
+    # there failed the gate on a missing pod path. This is not a skip: the asserts above
+    # ran and can fail. An explicit `--tail X` still runs main() and still raises if X
+    # is absent, so a typo on the pod is not swallowed.
+    if len(sys.argv) == 1:
+        raise SystemExit(0)
     raise SystemExit(main())
