@@ -790,8 +790,12 @@ def _train_adapters(args: argparse.Namespace) -> None:
             c, n, _ = gsm8k_accuracy(engine, tok, curve_rows, eval_params, concurrency=8,
                                      thinking=thinking, match=MATCHERS[args.reward])
             eval_secs = time.perf_counter() - t_eval
+            # The first point compiles the eval's shapes and every later one hits the cache,
+            # so its eval_secs is 5.6x the steady state and --eval-curve-n is calibrated off
+            # point two -- recorded, because the curve is a list of equal-looking dicts.
             curve.append({"step": step, "correct": c, "total": n, "score": c / max(n, 1),
-                          "secs": round(train_secs, 3), "eval_secs": round(eval_secs, 3)})
+                          "secs": round(train_secs, 3), "eval_secs": round(eval_secs, 3),
+                          "jit": not curve})
             log(f"  curve step {step}: {c}/{n} = {100 * c / max(n, 1):.1f}% "
                 f"at {train_secs:.1f}s cumulative, scored in {eval_secs:.1f}s")
 
