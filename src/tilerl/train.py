@@ -274,7 +274,8 @@ def train_step(
     return _step(model, input_ids, backend, optimizer, trainable, grad_fn, micro)
 
 
-def group_advantages(rewards: Any, group: int, live: Any = None) -> np.ndarray:
+def group_advantages(rewards: Any, group: int, live: Any = None,
+                     groups: int | None = None) -> np.ndarray:
     """``(r - mean) / std`` within each group of ``group`` consecutive rollouts;
     a tied group yields zeros (no signal, no division by ~0).
 
@@ -287,11 +288,37 @@ def group_advantages(rewards: Any, group: int, live: Any = None) -> np.ndarray:
     and one empty row turns it into +0.378 on all seven live rows -- gradient
     for being unlike an empty string, which is not a learnable property. It
     also depresses ``tied``, which is P1's criterion.
+
+    ``groups``, when given, is how many groups the caller believes it is passing,
+    and is checked against ``len(rewards) // group``. That check is the point:
+    ``reshape(-1, group)`` infers the group count from the length, so 16 rewards
+    at ``group=8`` become ``(2, 8)`` whether the caller meant two prompts or one
+    prompt whose rollout count doubled. Both are now legal shapes here, so the
+    length alone cannot tell them apart -- only the caller's own expectation can,
+    and normalising two prompts as one prompt's halves degrades GRPO to REINFORCE
+    with no raise.
     """
-    r = np.asarray(rewards, dtype=np.float64).reshape(-1, group)
+    r = np.asarray(rewards, dtype=np.float64)
+    if group < 1 or r.size % group:
+        raise ValueError(
+            f"group_advantages got {r.size} rewards for group={group}: every group must "
+            f"be whole, so the count has to be a multiple of the group. reshape would "
+            f"have raised here too, but only because the remainder is nonzero -- it "
+            f"cannot see a wrong group COUNT.")
+    if groups is not None and r.size // group != groups:
+        raise ValueError(
+            f"group_advantages got {r.size} rewards for {groups} group(s) of {group}, "
+            f"which is {r.size // group}: an advantage is normalised within ONE prompt's "
+            f"rollouts, and reshape(-1, group) would have silently made "
+            f"{r.size // group} groups instead, averaging across prompts.")
+    r = r.reshape(-1, group)
     m = (np.ones(r.shape, dtype=bool) if live is None
          else np.asarray(live, dtype=bool).reshape(-1, group))
     n = np.maximum(m.sum(axis=1, keepdims=True), 1)
+    mean = (r * m).sum(axis=1, keepdims=True) / n
+    std = np.sqrt((((r - mean) * m) ** 2).sum(axis=1, keepdims=True) / n)
+    adv = (r - mean) / np.where(std > 1e-8, std, 1.0)
+    return np.where((std > 1e-8) & m, adv, 0.0).reshape(-1)
     mean = (r * m).sum(axis=1, keepdims=True) / n
     std = np.sqrt((((r - mean) * m) ** 2).sum(axis=1, keepdims=True) / n)
     adv = (r - mean) / np.where(std > 1e-8, std, 1.0)
@@ -447,6 +474,7 @@ def grpo_loop(
     recapture_graph: bool = False,
     clear_prefix: bool = False,
     per_rollout: list | None = None,
+    prompts_per_step: int = 1,
 ) -> Iterator[tuple[float, float, float, float, float, dict[str, float]]]:
     """GRPO: sample ``group`` completions per prompt in one engine batch, score
     them with ``reward_fn(prompt_ids, completion_ids) -> float``, take one
@@ -462,13 +490,26 @@ def grpo_loop(
     construction, so it drives ties toward 0 whether or not it ranks anything real.
     Length is the independent signal that separates the two.
 
+    ``prompts_per_step`` puts several prompts in one step, each still normalised
+    within its own ``group``. A step is gradient-free only when EVERY group ties,
+    so the tie fraction that matters falls as ``q ** prompts_per_step`` even
+    though each group ties MORE at a smaller ``group`` -- measured on 100 MATH
+    level-5 problems, 2 prompts x 4 completions raises gradient-bearing steps
+    from 35.0% to 41.9%, a 1.21x ceiling that 4x2 does not improve on
+    (wins/2026-09-08-the-tie-is-at-the-ceiling.md). It is the only lever on
+    steps-to-score rather than seconds-per-step. The batch is
+    ``prompts_per_step * group`` rows, so the engine has to be sized for that.
+
     ``per_rollout``, when given, is extended with one dict per completion
     (``step``, ``g``, ``tokens``, ``reward``, ``advantage``). The yielded tuple
     carries only means, which is the axis a length-vs-reward claim cannot be made
     on: the advantage is computed within a group on one prompt, so pairing has to
     survive to the row level or prompt difficulty confounds it."""
     _require_on_policy(engine, recapture_graph, clear_prefix)
-    _require_group_fits(engine, group)
+    if prompts_per_step < 1:
+        raise ValueError(f"prompts_per_step must be >= 1, got {prompts_per_step}")
+    rows = prompts_per_step * group
+    _require_group_fits(engine, rows)
     if recapture_graph or clear_prefix:
         # Whatever the engine cached before this loop was built under other weights.
         engine.invalidate_weights()
@@ -478,16 +519,28 @@ def grpo_loop(
                            else SamplingParams(max_new_tokens=32))
     for step in range(steps):
         t0 = time.perf_counter()
-        prompt = np.asarray(prompts[step % len(prompts)], dtype=np.int64)
+        # Consecutive prompts, so a step's prompts differ from each other -- the whole
+        # point of the lever is several INDEPENDENT groups. Wrapping by len(prompts) as
+        # before, so a prompt list shorter than prompts_per_step repeats within a step
+        # rather than raising; every group is then the same prompt and the step is worth
+        # one, which the `distinct_prompts` yield field reports.
+        picks = [np.asarray(prompts[(step * prompts_per_step + p) % len(prompts)],
+                            dtype=np.int64) for p in range(prompts_per_step)]
         # Identical seeds would make the group one sample repeated, every advantage zero.
-        ids = [
-            engine.submit(prompt.tolist(), replace(sampling, seed=seed + step * group + g))
-            for g in range(group)
-        ]
+        # Offset by `rows`, not `group`: at prompts_per_step > 1 a step consumes
+        # prompts_per_step * group seeds, and striding by `group` would reissue the
+        # previous step's seeds to every prompt after the first.
+        ids, owner = [], []
+        for p, prompt in enumerate(picks):
+            for g in range(group):
+                ids.append(engine.submit(
+                    prompt.tolist(),
+                    replace(sampling, seed=seed + step * rows + p * group + g)))
+                owner.append(p)
         done = _drain(engine, ids, "grpo_loop rollout")
         timings = {"rollout_secs": time.perf_counter() - t0, "invalidate_secs": 0.0}
         comps = [done[i] for i in ids]
-        rewards = [float(reward_fn(prompt, c)) for c in comps]
+        rewards = [float(reward_fn(picks[owner[i]], c)) for i, c in enumerate(comps)]
         # A binary reward stops producing gradient once the policy clears the task.
         # `tied` is that fraction and is the run's health metric: 72% at the 256 cap,
         # 88.7% at 2048. Do not predict it with p**group -- a tie is all-SAME, not
@@ -497,8 +550,21 @@ def grpo_loop(
         # never crosses the two, so nothing it says can lift a wrong answer over a
         # right one.
         if tiebreak is not None:
-            rewards = tiebreak(prompt, comps, [r > 0.5 for r in rewards])
-        adv = group_advantages(rewards, group, live=[len(c) > 0 for c in comps])
+            # Per prompt: tiebreak ranks completions of ONE prompt against each other,
+            # so handing it a step's whole batch would rank across prompts.
+            rewards = [
+                r
+                for p, prompt in enumerate(picks)
+                for r in tiebreak(prompt, comps[p * group:(p + 1) * group],
+                                  [x > 0.5 for x in rewards[p * group:(p + 1) * group]])
+            ]
+        adv = group_advantages(rewards, group, live=[len(c) > 0 for c in comps],
+                               groups=prompts_per_step)
+        # Per GROUP, then averaged: `tied` has always meant "the fraction of groups with
+        # no signal", and at prompts_per_step > 1 a step holds several. The step-level
+        # quantity -- was this step gradient-free at all -- is `tied == 1.0`, which a
+        # reader recovers from this; recording the mean keeps it comparable across runs
+        # with different prompts_per_step.
         tied = float((adv.reshape(-1, group) == 0).all(axis=1).mean())
         if per_rollout is not None:
             # Per rollout, not the group means: length and reward are paired only
@@ -506,10 +572,13 @@ def grpo_loop(
             # so a cross-step correlation is confounded by prompt difficulty and
             # cannot support a claim about the advantage
             # (wins/2026-09-06-what-a-length-term-can-recover.md).
+            # `p` is the prompt within the step and `g` the completion within its group,
+            # so a reader can still group rows by prompt at prompts_per_step > 1 -- a
+            # flat index would make two prompts' rows look like one group of 16.
             per_rollout.extend(
-                {"step": step + 1, "g": g, "tokens": len(c), "reward": r,
-                 "advantage": float(a)}
-                for g, (c, r, a) in enumerate(zip(comps, rewards, adv))
+                {"step": step + 1, "p": owner[i], "g": i % group, "tokens": len(c),
+                 "reward": r, "advantage": float(a)}
+                for i, (c, r, a) in enumerate(zip(comps, rewards, adv))
             )
         # Power-of-two buckets bound shape JITs (tiny: 37.7 s new width, 71 ms repeat).
         # Clamped to the cap: an odd cap would otherwise round PAST it (1500 -> 2048, a
@@ -519,13 +588,23 @@ def grpo_loop(
         floor = min(256, int(sampling.max_new_tokens))
         gen = min(int(sampling.max_new_tokens),
                   1 << (max(floor, max(len(c) for c in comps), 1) - 1).bit_length())
+        # Rows are left-aligned at their OWN prompt length with the padding all at the
+        # end, so `plens` differs per row and each row's scored span `plen-1 .. slen-1`
+        # is exactly its own completion. Not padded between prompt and completion (which
+        # would put pad INSIDE the scored span) and not left-padded (which would put pad
+        # tokens where causal attention lets them reach the prompt -- there is no
+        # attention mask here). At prompts_per_step 1 every row has the same prompt and
+        # this is the old batch exactly.
+        pmax = max(len(p) for p in picks)
+        width = pmax + gen
         batch = np.stack([
-            np.concatenate([prompt, np.asarray(c, dtype=np.int64),
-                            np.zeros(gen - len(c), dtype=np.int64)])
-            for c in comps
+            np.concatenate([picks[owner[i]], np.asarray(c, dtype=np.int64),
+                            np.zeros(width - len(picks[owner[i]]) - len(c), dtype=np.int64)])
+            for i, c in enumerate(comps)
         ])
-        plens = np.full(group, len(prompt), dtype=np.int64)
-        slens = np.array([len(prompt) + len(c) for c in comps], dtype=np.int64)
+        plens = np.array([len(picks[owner[i]]) for i in range(len(comps))], dtype=np.int64)
+        slens = np.array([len(picks[owner[i]]) + len(c) for i, c in enumerate(comps)],
+                         dtype=np.int64)
         ce = rl_step(model, batch, adv, plens, backend, optimizer, trainable=trainable,
                      seq_lens=slens, micro=micro, timings=timings)
         if recapture_graph or clear_prefix:

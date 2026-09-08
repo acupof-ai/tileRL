@@ -619,7 +619,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
         "model": args.model, "recipe": args.recipe, "source": _QWEN38_SOURCE if real else "tiny",
         "commit": commit(), "algo": "grpo" if args.rl else "opd",
         "data": file_hash(args.data) if args.data else None, "steps": args.steps,
-        "group": args.group, "max_new_tokens": args.max_new_tokens,
+        "group": args.group, "prompts_per_step": args.prompts_per_step,
+        "max_new_tokens": args.max_new_tokens,
         "allow_short_rollouts": args.allow_short_rollouts,
         "temperature": params.temperature, "max_think_tokens": args.max_think_tokens,
         "lr": args.lr, "lora_rank": args.lora_rank, "seed": args.seed, "eval_mmlu": args.eval_mmlu,
@@ -693,7 +694,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
     # every rollout in the second wave decodes at a batch the tensor core underfills.
     # The three used to be 8 while --group was a settable flag defaulting to 8, so
     # --group 16 quietly became two waves of 8.
-    rollout_batch = max(args.group, 1)
+    # A step is --prompts-per-step groups, all submitted at once, so the rollout's width is
+    # their product, not --group. At the default 1 this is `max(args.group, 1)` exactly.
+    rollout_batch = max(args.group, 1) * max(args.prompts_per_step, 1)
     # min(), not _EVAL_CONCURRENCY: the eval arms ask for _EVAL_CONCURRENCY rows but only
     # num_slots of them hold blocks at once, since a submit past the slots queues inside the
     # engine. Measured on the discriminating case -- `--group 4`, 520 blocks, eval cap 1500:
@@ -882,11 +885,22 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # The first point compiles the eval's shapes and every later one hits the cache,
             # so its eval_secs is 5.6x the steady state and --eval-curve-n is calibrated off
             # point two -- recorded, because the curve is a list of equal-looking dicts.
+            #
+            # `tied` is the RUN's tie fraction over the steps since the previous point, not
+            # anything about the eval. It is the only way to tell a plateau where the policy
+            # stopped improving from one where its groups stopped disagreeing: score flat
+            # with tied rising is the usable set self-consuming, both flat is another cause.
+            # A whole-run mean cannot separate them -- the 2026-09-05 P1 run went 0.50 ->
+            # 0.87 across its own steps while reward rose with it, so the two are confounded
+            # in any single aggregate.
+            since = [h[3] for h in hist[curve[-1]["step"] if curve else 0:]]
             curve.append({"step": step, "correct": c, "total": n, "score": c / max(n, 1),
                           "secs": round(train_secs, 3), "eval_secs": round(eval_secs, 3),
                           "mean_len": round(ntok / max(n, 1), 1), "at_cap": at_cap,
+                          "tied": round(statistics.mean(since), 4) if since else None,
                           "jit": not curve})
             log(f"  curve step {step}: {c}/{n} = {100 * c / max(n, 1):.1f}% "
+                f"tied {curve[-1]['tied']} "
                 f"at {train_secs:.1f}s cumulative, mean {ntok / max(n, 1):.0f} tok, "
                 # tokens/correct, the ratio the before/after arms already log (`per`, :718).
                 # It separates two things a score cannot: the 2026-09-05 run moved
@@ -903,7 +917,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
         written = 0
         for i, (r, ce, secs, tied, ntok, timings, width) in enumerate(
                 train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
-                                    group=args.group, sampling=params, seed=args.seed,
+                                    group=args.group, prompts_per_step=args.prompts_per_step,
+                                    sampling=params, seed=args.seed,
                                     trainable=trainable, micro=args.micro,
                                     tiebreak=tiebreak, recapture_graph=True,
                                     per_rollout=rollouts)):
@@ -1447,6 +1462,14 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="GRPO: the engine samples a group per prompt, a reward scores "
                               "them, the group mean is the baseline (no critic)")
     p_train.add_argument("--group", type=int, default=8, help="rollouts per prompt (--rl)")
+    p_train.add_argument("--prompts-per-step", type=int, default=1,
+                         help="--rl: prompts in one step, each normalised within its own "
+                              "--group. A step is gradient-free only when EVERY group "
+                              "ties, so 2x4 beats 1x8 at the same 8 rows: measured 1.21x "
+                              "more gradient-bearing steps on MATH level 5, 1.34x on "
+                              "GSM8K's 0.81 tie fraction. The step is "
+                              "--prompts-per-step x --group rows, which is what the "
+                              "engine is sized for.")
     p_train.add_argument("--micro", type=int, default=1,
                          help="--rl: rows per backward, gradients accumulated to one "
                               "update (0 = the whole group). The normalizer stays the "
