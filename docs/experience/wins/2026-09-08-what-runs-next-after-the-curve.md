@@ -65,16 +65,18 @@ The step time is **strongly length-dependent** — 15.6 s at 86 tokens, 25.0 s a
 follow-up whose rollouts run longer costs more per step than this run's mean. Rollout is
 6.2-15.4 s of the 15.6-25.0 s, and the rest (fwd 2.6, bwd 6.7, optimizer 0.08) is flat.
 
-**Eval cost per curve point is not yet measured.** It is the quantity `eval_secs` records
-(#309) and it lands with the first curve point at step 25. The before-arm was a cache MISS on
-the first attempt (`eval_before_cache.cache_hit: false`, read from the manifest) and covers
-MMLU 1000 + GSM8K 500, so it prices neither a curve point nor a GSM8K-500-only arm. **Every
-eval figure below is therefore an estimate, marked as one**, from the 09-05 anchor's 16.4 min
-for a 500-row GSM8K arm.
+**The eval is now measured: 614.3 s per 500-row curve point**, read from step 25's `eval_secs`.
+That is **0.62x** the anchor's 16.4 min, so the estimates below were conservative in the right
+direction, and each is re-priced from the measured figure at its branch. It is also **114% of
+the training it measures** (614.3 s against 537.4 s cumulative at step 25), i.e. 26.4 steps per
+point — which is why a finer grid is expensive in a way the training cost does not show.
+
+The before-arm cost is separate and not measured on this run: it was a cache miss on the first
+attempt only, and it covers MMLU 1000 + GSM8K 500 rather than a curve point's 500.
 
 ## The four branches
 
-### A — step 25 ≥ 93.0: saturation is inside 25 steps
+### A — step 25 ≥ 93.0: saturation is inside 25 steps — **THIS IS THE BRANCH. Step 25 = 93.2%.**
 
 Narrow "≤25" to a specific step. `--eval-every 5`, stop at 25.
 
@@ -87,10 +89,24 @@ scripts/pod_run.sh curve5 3 -- python3 -u -m tilerl.cli train \
   --seed 0 --force
 ```
 
-Cost: 25 × 23.3 s = **9.7 min training** + 5 curve points + 2 arm evals. At the anchor's
-16.4 min per 500-row eval that is ~115 min of eval against 10 min of training, so **this run
-is ~92% instrument** and its real cost is decided by a number the `curve2` run is about to
-measure. Re-price it from step 25's `eval_secs` before launching.
+**Cost, on the measured eval rather than the anchor's estimate: 60.9 min** — 25 × 23.3 s =
+9.7 min training plus 5 × 614.3 s = 51.2 min eval, so **84% instrument**. The estimate this
+replaced was ~125 min.
+
+**One caveat that the step-25 result adds, and it may disqualify this branch.** The measured
+discordance is **10.2%**, giving a paired SE of **1.43 pt** — above the 1.00 pt saturation
+threshold. Five points spaced 5 steps apart on a curve that covers 5.8 pt in total means
+adjacent differences near **1.2 pt**, which is *inside* the noise. So the fine curve would very
+likely return five points whose adjacent differences are individually undecidable, and the
+saturation step would not be located after all.
+
+**What resolves it instead**: the crossing is a **monotone** question, not a difference
+question. The score at step 5 or 10 against the 87.4 base is a difference of several points,
+which the same SE resolves easily. So the fine curve answers "which point first clears
+90.5/91/92" rather than "where do adjacent points stop differing" — and read that way,
+5 × 614 s buys a real answer. **Read the fine curve against the base, not against its own
+neighbours.** That reframing is a consequence of the data and is recorded as such; the original
+saturation criterion stays where it was registered.
 
 `--eval-mmlu 0` is the one deliberate change from `curve2`'s configuration: MMLU is a
 regression check on the after-arm and this run's question is entirely about the GSM8K curve's
@@ -119,8 +135,9 @@ scripts/pod_run.sh curve10 3 -- python3 -u -m tilerl.cli train \
   --seed 0 --force
 ```
 
-Cost: 50 × 23.3 s = **19.4 min training** + 5 curve points. Same eval-dominance as A. Its step
-25 and 50 are independent samples, not reproductions, for the reason given under A.
+Cost on the measured eval: 50 × 23.3 s = 19.4 min training + 5 × 614.3 s = 51.2 min eval =
+**70.6 min**, 73% instrument. Its step 25 and 50 are independent samples, not reproductions,
+for the reason given under A.
 
 ### C — the four points are near-linear: no saturation inside 100 steps
 

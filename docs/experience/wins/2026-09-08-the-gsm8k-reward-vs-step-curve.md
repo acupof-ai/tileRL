@@ -219,4 +219,53 @@ bare question. This run's eval lengths are the first on the production path.
 
 ## Results
 
-Appended when the run finishes.
+**Point 1 of 4, step 25: 93.2% (466/500), at 537.4 s cumulative training, scored in 614.3 s.**
+
+The pre-registered predictions, scored before anything else is read: `tilerl-27` predicted
+**≥ 93.0** and was right; this session predicted **[90, 93)** and was wrong. 27's reasoning was
+the anchor run's segmented tied fraction jumping to 0.87 at steps 21-35, read as the score
+already topping out. Mine was that a plateau-then-jump reads as a threshold crossing rather
+than an asymptote. The reading that decided it is that the jump is real *and* it is already
+above the anchor's endpoint at a quarter of the steps.
+
+**The paired comparison the restart was for.** `eval-curve-25.jsonl` and `eval-before.jsonl`
+carry all 500 of the same problems (`i` sets identical after filtering the before arm to
+`dataset == "gsm8k"` — it also holds 1000 MMLU rows):
+
+| | count |
+|---|---:|
+| wrong → right | **40** |
+| right → wrong | **11** |
+| unchanged | 449 |
+| discordant | **51/500 = 10.2%** |
+
+Net **+5.80 pt**, which reproduces the score difference (87.4 → 93.2) exactly, as it must.
+**Paired SE 1.43 pt**, so the move is **4.06σ**. The unpaired SE on the same two numbers is
+1.86 pt — the pairing is worth 1.30x here, less than the 1.90 pt the pre-registration cited
+because that figure was computed at the p=0.5 worst case rather than at these two rates.
+
+**The saturation criterion is 1.00 pt and the measured discordance gives 1.43 pt**, so the
+pre-registered threshold was optimistic by 1.43x: it assumed 5% discordant and the run gives
+10.2%. The threshold is **not moved** — it was registered before the data. What it means is
+that a genuine 1.0-1.4 pt step-to-step rise will read as noise, so a saturation verdict from
+adjacent points is only safe when the difference is *below* 1.00 pt, and a difference between
+1.00 and 1.43 pt is **undecided** rather than saturated. That third state was not in the
+criterion.
+
+**Length collapsed, and this is the larger effect.** Mean completion **346.5 → 117.8 tokens
+(2.94x shorter)** on the same 500 problems, tok/correct **396.5 → 126.4 (3.14x)**. The anchor
+moved tok/correct 394.0 → 143.8 (2.74x) over **100** steps; this run reaches 3.14x at **25**.
+Also **0/500 at the 2048 cap** (3 at the base), so no part of either number is the cap.
+
+A score-only curve would record this as "the rate of learning to be right". 4.5 points of the
+5.8 are problems that were already solvable, since the model answers a third as long — the
+length term is doing the work, and `--length-penalty 0.0` means it is not doing it through the
+reward. The mechanism is untested and stays a candidate.
+
+**The eval costs more than the training it measures.** `eval_secs` **614.3 s** against 537.4 s
+of cumulative training — **114%**, or 26.4 training steps per curve point. It is **0.62x** the
+anchor's 16.4 min for a 500-row arm, so the anchor estimate was conservative in the right
+direction, and every follow-up plan priced against it is re-priced below. The four points cost
+41.0 min of eval against 38.8 min of training; the run totals ~80 min.
+
+Points 2-4 pending.
