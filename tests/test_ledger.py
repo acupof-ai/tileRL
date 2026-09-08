@@ -190,6 +190,11 @@ def test_the_eval_curve_records_the_step_a_score_was_reached_at(tmp_path, monkey
         # checkable after a run instead of estimated before one. Asserted > 0 rather
         # than merely present: a zero would mean the clock never ran.
         assert p["eval_secs"] > 0.0, p
+    # Exactly one point carries the JIT, and it is the first: on a real 27B run
+    # tilerl-0a measured 2.801 s against 0.500 s at identical n, so eval_secs is not
+    # comparable across that boundary. The flag is a field and not a comment because a
+    # reader of the manifest cannot tell which point was first.
+    assert [p["jit"] for p in curve["points"]] == [True, False], curve
 
     # Off by default, so no existing invocation changes shape.
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs2"))
