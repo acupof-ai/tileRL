@@ -142,6 +142,27 @@ readings now bound the net floor at 0.4 pt, the cross-batch gross flip rate
 is 10.4%, and the same-batch gross flip rate is bounded by 15-16 pending the
 point estimate.
 
+## Pairing across runs: row position is not identity
+
+The per-problem files' `i` field is the row's **position in the curve file**,
+not a question identifier. Pre-#329 runs scored the file prefix, so position
+happened to equal question identity; post-#329 runs score a fixed-seed
+shuffle, so position `i` holds eval-file row `perm[i]`. The same field name
+means two different things in the two runs — a field carries its value, not
+the code version that produced it. Cross-run pairing must recover identity
+through the shuffle (`scripts/curve_table.py`'s `file_row_perm`), never by
+position.
+
+The gold tripwire and the z-score guard different failure sizes. The tripwire
+is strong against coarse errors — a wrong eval file or a wrong permutation
+mismatches gold on most rows (493 of 500, when the wrong `gsm8k_test.jsonl`
+copy was used here) and goes red. It is blind to fine errors: GSM8K has 195
+distinct golds in 500 rows, so a permutation that only swaps same-gold rows
+passes the tripwire by construction (the same-gold negative control drops z
+from +12.4 to +2.4 with every tripwire green). The z collapse is what exposes
+that class. The tripwire does not guarantee the pairing is correct; it
+guarantees the file and the permutation are not wholly wrong.
+
 ## The economics turn on the stop point
 
 A fine grid looks expensive — eval-every 5 implies 20 evals — but patience=1
@@ -182,6 +203,10 @@ earns the default flip.
 - **The eval bill is set by the stop point, not the budget.** A dense grid is
   affordable when early stop makes most of its points never run; price the
   grid and the stop as one mechanism.
+- **A field carries its value, not the code version that produced it.** The
+  same `i` field is question identity in pre-shuffle runs and file position
+  in post-shuffle runs; pairing by the field name across versions scrambles
+  the comparison. Recover identity through the producing code, not the name.
 - **A floor has as many numbers as batch compositions.** Cross-batch: 52
   flips, net 2. Same-batch: ≤15-16 (upper bound), point estimate pending.
   Quoting one as "the floor" lets a per-question conclusion borrow a caliber
