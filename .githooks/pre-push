@@ -1,0 +1,8 @@
+#!/bin/sh
+# Block a push when ruff lint fails. The 30s local check has burned a full CI
+# round three times in one day (I001 x3, E401+I001, I001+F401). --no-verify
+# overrides; pytest stays out of it (20 min, not runnable on every push).
+uv run ruff check || {
+  echo "ruff failed — push aborted (--no-verify to override)"
+  exit 1
+}
