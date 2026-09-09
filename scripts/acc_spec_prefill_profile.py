@@ -37,6 +37,11 @@ from pathlib import Path
 
 import torch
 
+# Provenance: the pod is a tarball, not a clone, and a 2026-09-09 baseline run
+# read HEAD's engine.py off a tree labelled 09657c0 (byte-identical trees).
+# benchrec reads .synced_commit (stamped by pod_sync) when git is absent.
+from benchrec import git_commit, git_dirty
+
 from tilerl import engine as engine_mod
 from tilerl.config import qwen38_27b
 from tilerl.engine import build_engine
@@ -87,6 +92,9 @@ def main() -> None:
     p.add_argument("--draft", default=None,
                    help="draft head path: run the spec arm (W=8) and time draft.step")
     args = p.parse_args()
+
+    sha, dirty = git_commit(), git_dirty()
+    print(f"=== acc_spec_prefill_profile  sha={sha}  dirty={dirty}  draft={'yes' if args.draft else 'no'} ===")
 
     from tilerl_kernels.backend import get_backend
 
@@ -164,6 +172,7 @@ def main() -> None:
                     if getattr(engine, "_draft_ms", None) else None)
 
     report = {
+        "provenance": {"git_commit": sha, "git_dirty": dirty},
         "wall": wall,
         "buckets": {
             "prefill_host": prefill_s,
