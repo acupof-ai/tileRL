@@ -145,19 +145,22 @@ def test_every_registered_required_flag_exists_in_its_collector():
                     f"{name}: {c['script']} has no {a}")
 
 
-def test_a_query_view_never_writes_the_store():
+def test_a_query_view_never_writes_the_store(tmp_path):
     """--collectors is a read-only query. A fall-through past the view branch once
     ran the training suite and appended two rows to the permanent store (2026-09-09;
-    the cmd field was the only tell). The store file must be byte-identical after
-    any query view runs."""
+    the cmd field was the only tell). The store is redirected to tmp_path via
+    TILERL_BENCH_STORE so the failure path can never touch the real store -- the
+    first self-check of this test wrote it and needed a manual restore; a test whose
+    failure path needs a human to undo it is not safe to fail."""
+    import os
     import subprocess
-    import sys
 
     root = Path(__file__).resolve().parents[1]
-    store = root / "docs" / "experience" / "bench" / "measurements.jsonl"
-    before = store.read_bytes()
+    store = tmp_path / "measurements.jsonl"
+    store.write_bytes(b"")
+    env = {**os.environ, "TILERL_BENCH_STORE": str(store)}
     r = subprocess.run(
         [sys.executable, str(root / "scripts" / "bench_harness.py"), "--collectors"],
-        capture_output=True, text=True, timeout=120)
+        env=env, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr
-    assert store.read_bytes() == before
+    assert store.read_bytes() == b""

@@ -19,13 +19,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
 import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-STORE = _ROOT / "docs/experience/bench/measurements.jsonl"
+# Env override exists so a test subprocess can point writers at a throwaway store;
+# a test whose failure path writes the real store is a test that needs the override.
+STORE = Path(os.environ.get("TILERL_BENCH_STORE", _ROOT / "docs/experience/bench/measurements.jsonl"))
 REGISTRY = _ROOT / "docs/bench-metrics.json"
 
 TARGETS = ("cpu", "metal", "sm90", "sm70")
