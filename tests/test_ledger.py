@@ -6,7 +6,13 @@ import json
 
 import pytest
 
-from tilerl.cli import _EVAL_CONCURRENCY, _build_parser, cmd_ledger, cmd_train
+from tilerl.cli import (
+    _EVAL_CONCURRENCY,
+    _build_parser,
+    _curve_rows,
+    cmd_ledger,
+    cmd_train,
+)
 from tilerl.kv_cache import BLOCK_TOKENS
 from tilerl.ledger import (
     format_run,
@@ -25,6 +31,22 @@ def test_run_id_is_canonical():
     assert run_id({"a": 1, "b": [2, 3]}) == run_id({"b": [2, 3], "a": 1})
     assert run_id({"a": 1}) != run_id({"a": 2})
     assert len(run_id({})) == 12
+
+
+def test_curve_subset_is_fixed_seed_and_unbiased_prefix():
+    """The curve subset is a fixed-seed shuffle's prefix, not the file's: the eval
+    file is ordered (its first 200 rows run 5 pt low), so a plain prefix would bias
+    the curve by the size of the effect it measures. Same seed -> same rows, so a
+    curve point is paired across steps and runs."""
+    rows = [{"i": i} for i in range(500)]
+    first = _curve_rows(rows, 200, seed=0)
+    again = _curve_rows(rows, 200, seed=0)
+    assert [r["i"] for r in first] == [r["i"] for r in again]
+    # A shuffle, not a prefix: the subset spans the whole file.
+    assert min(r["i"] for r in first) < 50 and max(r["i"] for r in first) > 450
+    # Different seed -> different subset (a no-op shuffle would fail here).
+    other = _curve_rows(rows, 200, seed=1)
+    assert {r["i"] for r in first} != {r["i"] for r in other}
 
 
 def test_manifest_round_trip_and_lineage(tmp_path):
