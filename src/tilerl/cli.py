@@ -955,8 +955,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # and `per` was being built here and dropped.
             _write_eval_rows(manifest["id"], f"curve-{step}",
                              [dict(r, dataset="gsm8k") for r in per])
-            # Churn vs the previous point: the run's own noise floor, recorded per point
-            # so a "these two points differ by N questions" claim has N's instrument
+            # Churn vs the previous point: the run's own instrument reading, recorded per
+            # point so a "these two points differ by N questions" claim has N's measurement
             # beside it. Zero new evals -- these rows were just written and the previous
             # point's are in the same run dir. First point: null, not 0.
             churn = churn_dir = None
@@ -1007,7 +1007,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # fall back to the conservative width, marked in `se_kind` so nobody reads a
             # conservative "not greater" as "the two points are the same". With --patience
             # on, a missing width refuses instead: stopping on a width-less curve decides
-            # on noise, and the unpaired fallback is too wide to ever fire -- both silent.
+            # without a sampling width, and the unpaired fallback is too wide to ever fire -- both silent.
             if best:
                 rows = _read_eval_rows(manifest["id"], f"curve-{best['step']}")
                 se = paired_se(rows, per)
@@ -1287,8 +1287,9 @@ def _finish(m: dict, as_json: bool) -> None:
         # units of the quantity it thresholds.
         mmlu_floor = None if g.get("mmlu_before") is None else g["mmlu_before"] - 0.02
         # roadmap P1: "GSM8K held-out (500 q) after - before >= +5 pt (SE ~ 2 pt)". The
-        # +5 is that noise floor, not a taste -- `after > before` is +1 question of 500
-        # = +0.2 pt, which a symmetric null passes about half the time. Derived from
+        # +5 is a sampling margin, not a taste -- the same-batch instrument is exact, so
+        # `after > before` is a real +0.2 pt, but +1 question of 500 is a gain a
+        # symmetric null passes about half the time on a different set. Derived from
         # `_total`, never hardcoded to 25: `--eval-n` is a flag and the recipe's 500 is
         # not a constant.
         gsm_total = g.get("gsm8k_after_total") or g.get("gsm8k_before_total")
