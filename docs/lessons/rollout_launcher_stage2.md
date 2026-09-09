@@ -1,3 +1,7 @@
+> **SUPERSEDED (2026-09-10):** The launcher is built and gated by `tests/test_rollout.py`.
+> Kept because CHANGELOG:477 cites it as evidence for the phase-exit verdict.
+> Current answer: `rollout.py` and the test gate.
+
 ---
 question: What does it take to run one Claude Code episode against tileRL's own server, and does the sandbox that isolates it actually isolate anything?
 status: measured

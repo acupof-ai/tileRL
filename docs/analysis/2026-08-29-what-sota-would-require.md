@@ -1,3 +1,7 @@
+> **SUPERSEDED (2026-09-10):** The prefill numbers below (2109.7 tok/s, 970.7 ms for 2048
+> tokens) are from 08-29 and predate later measurements. The analysis of what closing the
+> gap would require is still relevant as method, but the specific figures are stale.
+
 # What closing the prefill gap would actually require — 2026-08-29
 
 Prefill ends the day at **2109.7 tok/s** (GPU-busy 970.7 ms for 2048 tokens,
