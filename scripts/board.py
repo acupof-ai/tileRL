@@ -40,11 +40,31 @@ KINDS = ("find", "rule", "block", "done", "ask", "note", "open")
 NEEDS_ARTIFACT = {"find", "rule", "done"}
 
 
+def _norm(r):
+    # ponytail: migration shim for 13 hand-written rows (2026-09-08/09) that used
+    # {from,title,body,epoch-ts} instead of {who,topic,text,str-ts}. Delete when
+    # those rows age out of the board's active window.
+    if "who" in r:
+        return r
+    ts = r.get("ts", 0)
+    if isinstance(ts, (int, float)):
+        ts = time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(ts))
+    return {
+        "ts": ts,
+        "who": r.get("from", "?"),
+        "topic": "coord",
+        "kind": r.get("kind", "note"),
+        "text": r.get("body") or r.get("title", ""),
+        "artifact": r.get("artifact", ""),
+        **({"owner": r["owner"]} if r.get("owner") else {}),
+    }
+
+
 def rows():
     if not os.path.exists(BOARD):
         return []
     with open(BOARD, encoding="utf-8") as fh:
-        return [json.loads(ln) for ln in fh if ln.strip()]
+        return [_norm(json.loads(ln)) for ln in fh if ln.strip()]
 
 
 def load(path):
