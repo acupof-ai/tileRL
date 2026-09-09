@@ -48,6 +48,16 @@ machine cannot check, so review must: **every new `floor.derivation` is
 recomputed by its reviewer** — the arithmetic, not just the prose
 (`wins/2026-09-09-the-first-floor-derivation-failed-its-own-check.md`).
 
+## Staleness
+
+Records carry `date` (automatic), but no view rejects an old baseline:
+`--regress` is advisory, and comparability lives in the population key — same
+key means same thing measured, however far apart. **If `--regress` ever becomes
+an automated gate, add `asserted_at` and make the gate reject stale facts** —
+an automated gate reading an expired fact and deciding anyway is the aupai
+failure mode; an advisory print is not it. A freshness cutoff before that would
+hide long-horizon regressions, which are the view's purpose.
+
 A flag that changes a metric's meaning is a population field, not prose: add
 it to the metric's registry `shape` keys (spec `depth`, SSD `arm`) so the key
 names the condition — `tied@lam=0.1` in the record, never `tied` with the
@@ -94,8 +104,8 @@ bill of health.
 
 - `tilerl bench --table` — four-target matrix; an empty cell says so, never a silent skip; the gap column carries its floor kind (`roof`/`bw`/`compute`/`base` = headroom, `best` = vs our own best)
 - `tilerl bench --readme` — the generated README rows (reuse, SSD restart); coverage as an HTML comment so the table stays paste-safe
-- `tilerl bench --regress` — two sections: newest vs previous per key (`n>=2` only, no dispersion, no regression claim), and every `measured-best` row standing below its population's best (FAIL past 1.05x)
-- `tilerl bench --questions` — headroom against **physical floors only**, by `gap × weight` desc; above it, `no measurement at all` (declared in the registry, never measured) and below it `no physical floor — needs a derivation` (measured, no physical floor) — both sorted by weight, both louder than any ranked row
+- `tilerl bench --regress` — two sections: newest vs previous per key (`n>=2` only, no dispersion, no regression claim), and every `measured-best` row standing below its population's best (FAIL past 1.05x). The symmetric side: a new best that jumps more than 1.2x beyond the previous best is `IMPLAUSIBLE — explain or reject` (1.2x is ~10x the 1.7% run-to-run spread; a real jump gets the explain line it deserves)
+- `tilerl bench --questions` — headroom against **physical floors only**, by `gap × weight` desc; above it, `no measurement at all` (declared in the registry, never measured) and below it `no physical floor — needs a derivation` (measured, no physical floor) — both sorted by weight, both louder than any ranked row. A value that **beats a hard physical floor** (bandwidth/compute/roofline, not baseline — the null is meant to be beaten) is `IMPLAUSIBLE — explain or reject`, printed before everything else: a too-good number is the most common shape of bad measurement (a cost missed, the wrong population, a gate reading an always-true field), and the only alarm a first measurement has
 
 ## Selftest
 

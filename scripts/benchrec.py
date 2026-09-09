@@ -36,6 +36,11 @@ FLOOR_KINDS = ("bandwidth", "compute", "roofline", "measured-best", "baseline")
 #: --regress. The two must not share a sorted column: 4.99x of headroom and a
 #: 1.02x regression are not the same kind of number.
 PHYSICAL_FLOOR_KINDS = ("bandwidth", "compute", "roofline", "baseline")
+#: Hard physical limits. A value that beats one is a measurement error, not a
+#: result — 135.5 tok/s against a 129 roofline sailed through every "is it good
+#: enough" gate for three days. Baseline is excluded: the null is meant to be
+#: beaten.
+HARD_FLOOR_KINDS = ("bandwidth", "compute", "roofline")
 #: A baseline floor must name the null it is measured against.
 _BASELINE_NULL = re.compile(r"=")
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -71,8 +76,10 @@ def git_commit() -> str:
 def git_dirty() -> bool:
     """True when the tree has uncommitted changes: a sha cannot fully identify
     a dirty tree (9b's 267-line analysis tool lived in untracked files). The
-    pod tarball carries ``.synced_dirty``, stamped by pod_sync; absent both
-    git and the marker, say clean."""
+    pod tarball carries ``.synced_dirty``, stamped by pod_sync. No fallback:
+    unknown must not render as clean — git_commit() rejects the same state, so
+    this branch is unreachable through append(); a default here is the one
+    place that would stay silent if that check were ever loosened."""
     try:
         import subprocess
 
@@ -83,7 +90,9 @@ def git_dirty() -> bool:
         return bool(out.strip())
     except Exception:
         marker = _ROOT / ".synced_dirty"
-        return marker.exists() and marker.read_text().strip() == "1"
+        if marker.exists():
+            return marker.read_text().strip() == "1"
+        raise RuntimeError("git_dirty: no git repo and no .synced_dirty marker")
 
 
 def _commit_exists(commit: str) -> bool | None:
@@ -107,6 +116,21 @@ def _commit_exists(commit: str) -> bool | None:
         return True
     except Exception:
         return False
+
+
+def previous_best(record: dict, lower_is_better: bool) -> float | None:
+    """Best value among non-superseded rows with this record's population key,
+    excluding the record itself; None on first sight. The other half of the
+    symmetric gate: a new best that beats the old one by a wide margin is
+    implausible until explained — a 135.5 with a prior 78.4."""
+    rid = record.get("id")
+    k = key(record)
+    superseded = {r["supersedes"] for r in load_all() if r.get("supersedes")}
+    vals = [r["value"] for r in load_all()
+            if key(r) == k and r.get("id") != rid and r["id"] not in superseded]
+    if not vals:
+        return None
+    return min(vals) if lower_is_better else max(vals)
 
 
 def _canon(record: dict) -> str:
@@ -414,8 +438,11 @@ if __name__ == "__main__":
         better["value"] = 120.0
         append(better)
         assert measured_best_floor(dict(good), lower_is_better=False)["value"] == 120.0
+        # previous_best: None on first sight, the prior best once rows exist
+        assert previous_best(fresh, lower_is_better=False) is None
+        assert previous_best(current(load_all())[key(good)], lower_is_better=False) == 95.0
     finally:
         STORE = old_store
 
-    print("benchrec: schema selftest OK (good accepts, bad worlds reject (missing commit, unknown commit, missing dirty,, n=1 fenced out of regression, "
+    print("benchrec: schema selftest OK (good accepts, bad worlds reject (missing commit, unknown commit, missing dirty, previous_best, n=1 fenced out of regression, "
           "append path rejects and a supersedes rerun replaces)")
