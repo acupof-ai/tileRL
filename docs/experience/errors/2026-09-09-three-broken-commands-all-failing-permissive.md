@@ -74,6 +74,25 @@ deletion, and hunk-boundary interaction. A negative is the claim that most
 needs a positive control, and the five shapes were that control: each shape
 was constructed to produce a drop if one were possible.
 
+## The broader pattern: field semantics that are not what they appear
+
+Three times today, a field's apparent meaning was not its actual behavior:
+
+1. `git status: clean` — means no uncommitted changes, not "up to date with
+   the remote." A branch can be clean and hours behind.
+2. `mergeStateStatus: CLEAN` — means no merge conflicts on GitHub's merge
+   preview, not "CI passed." A PR with zero checks reports CLEAN.
+3. `cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}` — the
+   expression likely stringifies to `"false"` (truthy) in the concurrency
+   block, so main runs were still cancelled.
+
+The shared fix shape: do not debug how the ambiguous field is interpreted —
+replace it with a mechanism that has no ambiguity. For the concurrency case,
+make main's group unique per SHA (`group: ci-${{ github.ref }}${{ github.sha }}`)
+so there is nothing to cancel, rather than arguing with boolean coercion.
+`group` is a string field; expression interpolation into a string is its
+normal semantics.
+
 ## Rule
 
 A reading that returns "0 / empty / doesn't exist" must pass a positive
