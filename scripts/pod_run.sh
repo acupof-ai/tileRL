@@ -105,10 +105,13 @@ export REMOTE_DIR=$REMOTE_DIR
 # Fail closed: a missing/unreadable file or classifier refuses every card.
 for c in ${CARD//,/ }; do
   if [ -z "$LEND_REF" ]; then
-    owner=\$(python3 $REMOTE_DIR/scripts/card_owner.py \$c "$CARD_ASSIGNMENT_JSON" 2>/dev/null || echo unknown)
+    owner=\$(python3 $REMOTE_DIR/scripts/card_owner.py \$c "$CARD_ASSIGNMENT_JSON" 2>/dev/null || echo nofile)
     case "\$owner" in
       ours) ;;
       theirs) echo "pod_run: card \$c is granted to another team per card_assignment.json; a lend needs a ledger record (--lend-ref)" >&2; exit 7;;
+      nofile) echo "pod_run: card_assignment.json not readable at $CARD_ASSIGNMENT_JSON" >&2
+              echo "  tileRL's grant is 0,1,3,6 (ckl 2026-09-08). If that grant still holds, bypass with --lend-ref <ledger record>" >&2
+              exit 7;;
       *) echo "pod_run: card \$c has no tileRL ownership in card_assignment.json (unclassified -> refuse); a lend needs a ledger record (--lend-ref)" >&2; exit 7;;
     esac
   else

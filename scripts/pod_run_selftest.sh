@@ -294,4 +294,24 @@ set -e
 grep -q "lend ref: aupai-lend-0909" "$TMP/a8/wrapper_b.out" \
   || fail "arm 8: lend ref not echoed: $(cat "$TMP/a8/wrapper_b.out")"
 
-echo "PASS: a wrapper-launched job claims via --wait-for-device, a direct-python one via --require-device, a multi-arm wrapper re-claims per arm, a reused claim is not a refusal, an unclaimable job exits 4 and releases, a quoted multi-word command survives argv, python's stdout is unbuffered, and a card not recorded as tileRL's exits 7 without a lend-ref (theirs or unclassified) and proceeds with one"
+# a missing card_assignment.json fails closed, loudly: the path, the grant, and the bypass.
+# Without this the team's launch capability hangs on a file in another team's tree with no
+# way to tell whether the grant still holds (tilerl-27, 2026-09-09).
+emit8m=$(CARD_ASSIGNMENT_JSON="$TMP/nonexistent.json" POD_RUN_EMIT_RUNNER=1 AUPAI="$TMP/aupai" REMOTE_DIR="$TMP/work" \
+  bash "$ROOT/scripts/pod_run.sh" selftest 6 -- true 2>/dev/null)
+printf '%s\n' "$emit8m" > "$TMP/a8/runner_m.sh"
+sed -i.bak -e "s#> /work/#> $TMP/work/#g" "$TMP/a8/runner_m.sh"
+set +e
+( cd "$TMP/work" && CLAIM_MODE=shell_then_device CLAIM_LOG=$CLAIM_LOG bash "$TMP/a8/runner_m.sh" \
+    > "$TMP/a8/wrapper_m.out" 2>&1 )
+rc8m=$?
+set -e
+[ "$rc8m" = 7 ] || fail "arm 8: a missing card_assignment.json must exit 7, got $rc8m: $(cat "$TMP/a8/wrapper_m.out")"
+grep -q "$TMP/nonexistent.json" "$TMP/a8/wrapper_m.out" \
+  || fail "arm 8: missing-file error must name the path: $(cat "$TMP/a8/wrapper_m.out")"
+grep -q "0,1,3,6" "$TMP/a8/wrapper_m.out" \
+  || fail "arm 8: missing-file error must state the grant: $(cat "$TMP/a8/wrapper_m.out")"
+grep -q -- "--lend-ref" "$TMP/a8/wrapper_m.out" \
+  || fail "arm 8: missing-file error must state the bypass: $(cat "$TMP/a8/wrapper_m.out")"
+
+echo "PASS: a wrapper-launched job claims via --wait-for-device, a direct-python one via --require-device, a multi-arm wrapper re-claims per arm, a reused claim is not a refusal, an unclaimable job exits 4 and releases, a quoted multi-word command survives argv, python's stdout is unbuffered, a card not recorded as tileRL's exits 7 without a lend-ref (theirs or unclassified) and proceeds with one, and a missing card_assignment.json fails loud with the path, the grant, and the bypass"
