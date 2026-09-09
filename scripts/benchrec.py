@@ -377,11 +377,15 @@ def record_common(args, *, build: str | None = None) -> dict:
         device_name = args.target
     if (getattr(args, "_benchrec_client_side", False)
             and not getattr(args, "new_device", False)
-            and device_name not in known_devices()):
+            and device_name not in (known := known_devices())):
+        # The check stays case-sensitive (the store groups by exact string), but
+        # a near-miss hint costs one line and most rejections are case/space typos.
+        hint = f" Did you mean {lower[device_name.lower()]!r}?" if (
+            lower := {k.lower(): k for k in known}).get(device_name.lower()) else ""
         raise SystemExit(
             f"--device-name {device_name!r} has never appeared in the store. "
-            f"Known: {sorted(known_devices())}. A typo here silently splits a "
-            "population; if this is genuinely a new card, pass --new-device once.")
+            f"Known: {sorted(known)}. A typo here silently splits a "
+            f"population; if this is genuinely a new card, pass --new-device once.{hint}")
     return {"target": args.target, "build": build, "model": args.model_name,
             "device": {"name": device_name, "card": args.card},
             "commit": git_commit(), "dirty": git_dirty(), "cmd": " ".join(sys.argv)}
@@ -529,8 +533,13 @@ if __name__ == "__main__":
         assert record_common(client_args("NVIDIA X999-FAKE", new_device=True))[
             "device"]["name"] == "NVIDIA X999-FAKE"
         assert record_common(client_args("H20"))["device"]["name"] == "H20"
+        try:
+            record_common(client_args("h20"))
+            raise AssertionError("case-different --device-name must reject")
+        except SystemExit as e:
+            assert "Did you mean 'H20'?" in str(e), str(e)
     finally:
         STORE = old_store
 
     print("benchrec: schema selftest OK (good accepts, bad worlds reject (missing commit, unknown commit, missing dirty, previous_best, n=1 fenced out of regression, "
-          "append path rejects and a supersedes rerun replaces, unknown --device-name rejects without --new-device)")
+          "append path rejects and a supersedes rerun replaces, unknown --device-name rejects without --new-device, case-different name suggests the right spelling)")
