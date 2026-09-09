@@ -162,6 +162,74 @@ def new_best_point(pt: dict, best: dict | None, se: float | None = None) -> bool
     return pt["score"] - best["score"] > 2 * se / 100.0
 
 
+def significant_decline(pt: dict, best: dict | None, se: float | None) -> bool:
+    """Whether ``pt`` is significantly BELOW ``best`` -- the 2xSE ruler of
+    `new_best_point`, pointed down.
+
+    A collapse is not a slow day: seed 0's step 75 was -11.00 pt (6.62 sigma), and
+    under patience alone it would cost `patience` more points before the run reacted
+    -- the one event this feature exists for. Stopping never loses anything, because
+    the best snapshot is kept; and seed 0's recovery (412 -> 456) still ended below
+    the peak (467), so waiting for it bought less than keeping the peak. Never fires
+    without the paired width -- an unpaired guess at a decline is not a verdict.
+    """
+    return bool(best) and se is not None and best["score"] - pt["score"] > 2 * se / 100.0
+
+
+class EarlyStop:
+    """Patience over CURVE POINTS, not steps: the curve samples every `--eval-every`
+    steps, so one patience unit is one eval interval, and the same patience means
+    different things at eval-every 25 and 5.
+
+    A point that does not significantly improve on the best adds one to the count; a
+    new best resets it. Stop when the count reaches `patience`, or immediately on a
+    `significant_decline` -- the collapse is the event this feature exists for, not a
+    slow day to be patient with. `patience=0` never stops on either path; it is the
+    default, and flipping it on needs the seed-1 verdict, not this code.
+    """
+
+    def __init__(self, patience: int):
+        self.patience = patience
+        self.stale = 0
+        self.reason: str | None = None
+
+    def update(self, replaced: bool, declined: bool = False) -> str | None:
+        """Record the point; return the stop reason (``"patience"``/``"decline"``) or
+        None to continue. A decline is a veto: it spends no patience. ``patience=0``
+        disables BOTH paths -- the default is fully off, decline veto included."""
+        if self.reason is not None:
+            return self.reason
+        if not self.patience:
+            return None
+        if declined:
+            self.reason = "decline"
+            return "decline"
+        self.stale = 0 if replaced else self.stale + 1
+        if self.stale >= self.patience:
+            self.reason = "patience"
+            return "patience"
+        return None
+
+
+def require_paired_width(se: float | None, patience: int, kept_step: int | None = None) -> None:
+    """Early stopping is a paired verdict: it compares each point to the best over the
+    same rows. A missing width with ``patience > 0`` is a broken environment, not a
+    fallback -- refusing loudly beats the two silent failures, a guard that never fires
+    (unpaired width too wide to ever cross) and a stop decided on noise (no width at
+    all). ``patience=0`` never asks, so it never refuses. ``kept_step`` names the best
+    snapshot already on disk, so a reader meeting this exit mid-run knows it loses
+    nothing -- the run is not wasted, the switch just cannot work on these records."""
+    if patience and se is None:
+        saved = (f" The best snapshot through step {kept_step} is already saved at "
+                 "adapter-best.safetensors -- this exit loses nothing but the steps "
+                 "a width-less stop would have decided on noise.") if kept_step is not None else ""
+        raise SystemExit(
+            "--patience needs the paired per-problem rows: the best point's "
+            "eval-curve-<step>.jsonl is missing or does not join this point's rows, so "
+            "no paired width exists and early stopping cannot fire. Fix the run's "
+            "records; do not run to --steps behind a switch that cannot work." + saved)
+
+
 def time_to_score(m: dict, target: float) -> dict | None:
     """When this run first scored >= ``target``, as a MEASUREMENT not a fit.
 
@@ -302,4 +370,48 @@ if __name__ == "__main__":  # runnable check
     b3 = {"step": 50, "correct": 450, "total": 500, "score": 0.90}
     assert new_best_point(b3, a3, paired_se(va, vb))
     assert not new_best_point(b3, a3)
+    # Early stopping. Patience is in POINTS, not steps: one unit is one eval interval.
+    # Cell A: a plateau from the start -- the fine curve's shape, no adjacent pair
+    # crossing 2xSE. patience=1 stops at the second point and keeps the first.
+    es = EarlyStop(1)
+    assert [es.update(rep) for rep in (True, False, False, False)] == \
+        [None, "patience", "patience", "patience"]
+    # Cell B: plateau then rise. patience=3 lets the rise arrive before the stop;
+    # patience=2 stops one point earlier. A stub that never refuses fails cell A; one
+    # that always refuses fails this one -- both must be able to fail.
+    es = EarlyStop(3)
+    assert [es.update(rep) for rep in (True, False, False, True, False)] == \
+        [None, None, None, None, None]
+    es = EarlyStop(2)
+    assert [es.update(rep) for rep in (True, False, False, True)] == \
+        [None, None, "patience", "patience"]
+    # patience=0 is the default and never stops -- not even on a decline, so the
+    # default is fully off.
+    assert not any(EarlyStop(0).update(rep) for rep in (False, False, False, False))
+    assert EarlyStop(0).update(False, declined=True) is None
+    # Cell C: a significant decline stops immediately, spending no patience, and keeps
+    # the pre-decline best. seed 0's shape: plateau at 93.4, then -11.00 pt (6.62
+    # sigma) at step 75 -- under patience=2 it would otherwise have trained two more
+    # points (50 steps at --eval-every 25) past the collapse.
+    es = EarlyStop(2)
+    assert [es.update(rep, dec) for rep, dec in
+            ((True, False), (False, False), (False, True))] == [None, None, "decline"]
+    assert es.stale == 1  # the decline did not add to the patience count
+    # The decline ruler itself: 11.0 pt against a 1.66 pt paired SE (6.62 sigma) is a
+    # decline; 0.2 pt is inside the floor; and no paired width means no verdict.
+    peak = {"step": 50, "correct": 467, "total": 500, "score": 0.934}
+    assert significant_decline({"score": 0.824}, peak, 1.66)
+    assert not significant_decline({"score": 0.932}, peak, 1.66)
+    assert not significant_decline({"score": 0.824}, peak, None)
+    # Cell D: patience > 0 with no paired width REFUSES -- never the silent fallbacks
+    # (a guard that never fires, or a stop decided on noise). patience=0 never asks.
+    # With a kept step the message says the snapshot is already saved: a mid-run exit
+    # must not read as a wasted run.
+    try:
+        require_paired_width(None, 2, kept_step=50)
+        raise AssertionError("no raise")
+    except SystemExit as exc:
+        assert "paired" in str(exc) and "step 50" in str(exc)
+    require_paired_width(1.31, 2)
+    require_paired_width(None, 0)
     print("ledger: ids + best-point selection OK")
