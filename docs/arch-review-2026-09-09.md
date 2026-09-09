@@ -1,6 +1,6 @@
 # 架构评审：删什么、建什么、什么叫 AI friendly
 
-数字基准：origin/main @ `fa1bcec`（2026-09-09）。scripts/ = 236 个 .py / 35,367 行；src+kernels = 20,707 行；tests = 18,344 行。验证装置（scripts + tests）= 53,711 行，是系统的 2.6 倍。
+数字基准：origin/main @ `fa1bcec`（2026-09-09）。scripts/ = 236 个 .py / 35,367 行；src+kernels = 20,707 行；tests = 18,344 行。验证装置（scripts + tests）= 53,711 行，是系统的 2.6 倍。装置自己也遵守这条规律：xdist 把 pytest 段加速 6.4x，job wall 只快 1.77x（2 个落地前 run 对 9 个落地后 run 的中位数，27 实测）——加速一个环节，瓶颈就换人（uv sync、ruff、串行分布式 gates 不在 xdist 手里）。
 
 ## 开头：产生速度大于删除速度
 
