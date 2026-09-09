@@ -31,6 +31,22 @@ same step (82%)**. Only 16 of the 88 overlap seed 1's wrong set. The dip's
 main body is not "problems hard for both seeds". This statement needs no
 baseline and no calibration; it stands on its own.
 
+Same-caliber flip counts (same run, same curve order, same batch composition)
+size the dip against the plateau's own jitter:
+
+| pair | seed 0 gross flips | seed 1 plateau flips | multiple |
+|---|---|---|---|
+| 50→75 | 69 (62 ✓→✗, 7 ✗→✓) | 15 | 4.6x |
+| 75→100 | 68 (12 ✓→✗, 56 ✗→✓) | 16 | 4.25x |
+| 50→100 | 37 | 17 | 2.2x |
+
+The 50→100 headline (37 swapped) is the **most conservative of the three**:
+the longer the span, the more the net compresses and the closer the gross
+flips get to the noise, as back-and-forth in the middle cancels the two
+ends' differences. The recovery is real signal too — 68 problems genuinely
+flipped at 75→100 (56 to right, 12 to wrong) — it just landed on a
+different, slightly worse set: step 100 still sits 11 below step 50.
+
 **3. The z instrument was NOT APPLIED.** The three-band verdict
 (problem nature / bad update / inconclusive) was calibrated on
 **healthy–healthy** overlaps: two healthy seeds' wrong sets intersecting,
@@ -57,15 +73,24 @@ So the deferred application is trustworthy when it comes:
   not a measurement — a true-random-pairing control would be needed to measure
   it, and it changes no verdict.
 
-**Resolution floor.** A same-policy retest flips 10.4% of per-problem
-outcomes: 52/500 between two greedy evals of the same step-100 weights,
-differing only in batch composition, with a net score difference of 2
-(measured in [the companion entry](2026-09-09-the-collapse-did-not-replicate-the-plateau-did.md)).
-The healthy–healthy z@25 = +12.4 carries this noise on both sides, so it
-remains a valid baseline, but the instrument cannot resolve per-problem
-structure below the ~10% flip rate. In the plateau this binds: the cross-step
-policy difference (50 flips over 25 steps) is the same size as the
-same-policy retest noise (52).
+**Resolution floor, three calibers.**
+
+- **Cross-batch-composition** — 52/500 = 10.4% flip between two greedy evals
+  of the same step-100 weights differing only in batch composition (net 2;
+  [companion entry](2026-09-09-the-collapse-did-not-replicate-the-plateau-did.md)).
+- **Same-batch-composition** — 15-16 flips between adjacent plateau curve
+  points on seed 1 (17 over 50→100, 24 over 25→100), nets within noise.
+  Policy drift included; this is the measured same-batch jitter.
+- **Point estimate (same weights, same batch, retest)** — not measured. The
+  run designed to measure it was cut: its question is already bounded by the
+  same-batch numbers above, and the in-flight churn field will make every
+  future run self-report it at zero cost.
+
+The healthy–healthy z@25 = +12.4 carries the cross-batch noise on both
+sides, so it remains a valid baseline, but the instrument cannot resolve
+per-problem structure below the ~10% flip rate. In the plateau the
+per-problem signal sits at the floor: same-batch cross-step flips (15-16)
+are jitter-sized.
 
 ## What this does NOT establish
 
