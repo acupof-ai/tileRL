@@ -341,7 +341,7 @@ def main() -> None:
             else:
                 srec = {
                     "metric": "spec_goodput_ratio", "value": round(tps / dense_best, 3),
-                    "unit": "ratio", "shape": {"batch": args.batch, "depth": args.depth},
+                    "unit": "ratio", "shape": {"batch": args.batch, "ctx": ctx, "depth": args.depth},
                     "warm": {"state": "warm", "compiles": 0},
                     "n": 1, "spread": 0.0, **common,
                 }
