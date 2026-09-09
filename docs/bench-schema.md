@@ -55,6 +55,24 @@ machine cannot check, so review must: **every new `floor.derivation` is
 recomputed by its reviewer** — the arithmetic, not just the prose
 (`wins/2026-09-09-the-first-floor-derivation-failed-its-own-check.md`).
 
+## Collector registry
+
+`docs/bench-metrics.json` carries, per metric, an optional `collector` field:
+`{"script": "scripts/…", "required": [...]}`. `tilerl bench <name>` dispatches
+to the script, passing remaining args through; `tilerl bench --collectors`
+prints the whole map.
+
+`required` lists what the script demands: a `--` prefix names a flag
+(`--source`), a bare name a positional (`source`). The distinction matters —
+a flag and a positional are different argparse calls, and the existence check
+only covers flags.
+
+Two absence states, deliberately different shapes: `collector: null` with
+`why_no_collector` is a **recorded deferral** (gsm8k_pct: no `tilerl eval`
+subcommand); the field absent is a **gap nobody has ruled on** (mmlu_pct,
+kernel_ms). The `--collectors` view prints the first as `-- (none: …)` and the
+second as `MISSING`.
+
 ## Staleness
 
 Records carry `date` (automatic), but no view rejects an old baseline:

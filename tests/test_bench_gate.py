@@ -117,3 +117,50 @@ def test_every_registered_collector_exists_and_the_094_metrics_have_one():
             assert m.get("collector") or m.get("why_no_collector"), (
                 f"{name} has weight {m['weight']} and neither a collector nor a "
                 "why_no_collector -- it is neither runnable nor a recorded deferral")
+
+
+def test_every_registered_required_flag_exists_in_its_collector():
+    """The registry's `required` list must name flags the script actually accepts:
+    a typo (--sorce) or a renamed flag leaves `tilerl bench <name>` failing at runtime
+    while CI stays green. Positionals are skipped -- a bare name need not match the
+    add_argument string -- and a flag is matched as a quoted literal, which is the
+    argparse form. This is an existence check, not a parse: it cannot see a flag the
+    script accepts but the registry omits."""
+    import json
+
+    root = Path(__file__).resolve().parents[1]
+    reg = json.loads((root / "docs" / "bench-metrics.json").read_text())["metrics"]
+    # add_record_args adds --build/--target/--device-name/--card/--model-name to every
+    # collector, so a required flag the script does not declare itself may come from
+    # the shared helper instead.
+    helper = (root / "scripts" / "benchrec.py").read_text()
+    for name, m in reg.items():
+        c = m.get("collector")
+        if not c:
+            continue
+        src = (root / c["script"]).read_text()
+        for a in c["required"]:
+            if a.startswith("--"):
+                assert f'"{a}"' in src or f"'{a}" in src or f'"{a}"' in helper, (
+                    f"{name}: {c['script']} has no {a}")
+
+
+def test_a_query_view_never_writes_the_store(tmp_path):
+    """--collectors is a read-only query. A fall-through past the view branch once
+    ran the training suite and appended two rows to the permanent store (2026-09-09;
+    the cmd field was the only tell). The store is redirected to tmp_path via
+    TILERL_BENCH_STORE so the failure path can never touch the real store -- the
+    first self-check of this test wrote it and needed a manual restore; a test whose
+    failure path needs a human to undo it is not safe to fail."""
+    import os
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    store = tmp_path / "measurements.jsonl"
+    store.write_bytes(b"")
+    env = {**os.environ, "TILERL_BENCH_STORE": str(store)}
+    r = subprocess.run(
+        [sys.executable, str(root / "scripts" / "bench_harness.py"), "--collectors"],
+        env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    assert store.read_bytes() == b""
