@@ -40,6 +40,7 @@ executed here (no card on this machine).
 | `bench_decode_b8.py` | B=8 aggregate tok/s, continuous batching | cuda sm70 | decode B=8 |
 | `bench_b1_decode.py` | B=1 decode via the server, two-point slope (prefill cancels) | server | decode B=1 (low weight) |
 | `bench_workloads.py` | decode tok/s + spec tokens per trunk forward across coding/dialogue/thinking/long-context | cuda | decode + spec |
+| `bench_batch_decode.py` | decode vs B on slice4, `--draft`/`--depth` — the runner behind the H20 B=1 spec decode table (#349) | cuda | decode + spec |
 | `bench_chat_reuse.py` | multi-turn prefix reuse vs a live server, store hit counters | server | prefix reuse (the 19x) |
 | `bench_chat_cold_warm.py` | one prompt, cold vs warm arm, one restart per arm | server | prefix reuse |
 | `bench_ssd_restart.py` | restart faults the prefix off disk vs second-run warmth | server + SSD | SSD restart (the 2.041x) |
@@ -58,6 +59,16 @@ executed here (no card on this machine).
 | `bench_pin_cost.py` | where a DRAM demotion's time goes: pin vs copy |
 | `bench_prefix_state.py` | prefix-boundary snapshot cost and survival count, both store kinds |
 
+## Conditional verdicts — keep until the named change lands
+
+A verdict that hangs on a condition we plan to change is not settled: the
+moment the condition moves, these scripts rerun first.
+
+| File | Conditional verdict |
+|---|---|
+| `bench_tp.py` | TP loses to DP **until a capturable all-reduce exists** — a named, planned change |
+| `ab_draft_depth.py` + `ab_w1_baseline.py` | spec depth verdict has flipped three times (V100 depth 1 wins, H20 every depth loses, eager build every depth wins 1.8x) — a live question, not a verdict |
+
 ## One-shot, verdict in the tree (deletion candidates)
 
 | File | Verdict already recorded |
@@ -71,15 +82,11 @@ executed here (no card on this machine).
 | `bench_gemv_gap.py` | direct-vs-backend roof gap — `errors/2026-08-27-decode-latency-bound-not-bandwidth.md` |
 | `bench_paged_attn.py` | naive vs FlashAttention — shipped, 83x (CHANGELOG 2026-08-24) |
 | `bench_qwen38_baseline.py` | 27B serving baseline — superseded by harness decode-kv/prefill suites |
-| `bench_batch_decode.py` | decode vs B on slice4 — harness decode-kv covers it at engine level |
-| `bench_tp.py` | TP throughput — verdict: TP loses to DP until a capturable all-reduce (CHANGELOG 2026-08-30) |
-| `bench_smoke.py` | benchkit smoke check — not a measurement; belongs in CI or deleted |
+| `bench_smoke.py` | benchkit's own smoke check — moves into CI, not a measurement |
 | `ab_fp8_gemv.py` | flat vs grouped prefetch — `wins/2026-08-25-native-fp8-weights.md` |
 | `ab_smallm_gemv.py` | small-M GEMV — `wins/2026-08-26-batch-decode-h2.md` |
-| `ab_batch_decode.py` | batched-decode arms — `wins/2026-08-26-batch-decode-h2.md` |
 | `ab_prefill_ncols.py` | in-process ncols A/B — `wins/2026-09-03-ncols2-is-1.5x-on-the-verify-path.md` |
 | `ab_scale_f16.py` | f16 scale plane — `wins/2026-09-02-f16-block-scales.md` |
-| `ab_draft_depth.py` + `ab_w1_baseline.py` | spec draft cost / W=1 baseline — verdict: depth winner flips with corpus, spec loses (CHANGELOG 2026-09-04) |
 | `_sweep_gemv.py`, `_sweep_gemv3.py`, `_sweep_fp8_prefill.py`, `_matrix_gemv.py` | parameter sweeps whose settings shipped |
 
 ## Investigation series — keep until the sm70 prefill work closes
@@ -105,12 +112,18 @@ at 16k). These are its tools, not one-shots:
 
 ## Tally
 
-- Keep: 3 infra + 13 table feeders + 5 SSD support + 6 sm70 series + 1 launcher = **28**
-- Delete candidates: **24** (12 bench, 7 ab + 1 baseline pair, 4 sweep/matrix, 4 launchers)
-- `bench_smoke.py` moves to CI or is deleted; it is not a measurement.
+- Keep: 3 infra + 14 table feeders + 5 SSD support + 7 sm70 series + 3 conditional verdicts + 1 launcher = **33**
+- Delete candidates: **22** (10 bench incl. `bench_smoke.py` to CI, 4 ab, 4 sweep/matrix, 4 launchers)
+- `bench_smoke.py` moves to CI; it is benchkit's own self-check, not a measurement.
 
 Deletions are listed, not done — each verdict above is checkable against the
 CHANGELOG line cited.
+
+One correction to the first draft, worth its own line: `bench_batch_decode.py`
+was listed as "superseded by harness decode-kv" and is not — the harness suite
+has no `--draft`, and #349's H20 B=1 spec decode table ran this script on the
+same day. "Script X is covered by Y" is a claim that needs a run, not a
+reading of two docstrings.
 
 ## Deferred (not this round)
 

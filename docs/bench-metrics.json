@@ -1,0 +1,65 @@
+{
+  "denominator": {
+    "turn_s": 314.33,
+    "prefill_s": 294,
+    "decode_s": 20,
+    "source": "CHANGELOG 2026-09-07, wins/2026-09-07-a-claude-code-turn-is-314-seconds-of-prefill.md"
+  },
+  "metrics": {
+    "prefill_tok_s": {
+      "unit": "tok/s", "direction": "+", "weight": 0.94,
+      "shape": ["ctx"],
+      "why": "prefill is 294/314.33 s of a real agent turn"
+    },
+    "decode_tok_s": {
+      "unit": "tok/s", "direction": "+", "weight": 0.06,
+      "shape": ["batch", "ctx"],
+      "why": "decode is 20/314.33 s of a real agent turn"
+    },
+    "decode_agg_tok_s": {
+      "unit": "tok/s", "direction": "+", "weight": 0.06,
+      "shape": ["batch", "ctx"],
+      "why": "decode is 20/314.33 s of a real agent turn"
+    },
+    "chat_turn_wall_s": {
+      "unit": "s", "direction": "-", "weight": 0.94,
+      "shape": ["turn", "prompt_tokens"],
+      "why": "the turn wall is the 314.33 s denominator itself; reuse moves it 19x"
+    },
+    "prefix_hits": {
+      "unit": "hits", "direction": "+", "weight": 0.0,
+      "shape": ["turn"],
+      "why": "instrument row for the reuse view, not a lever itself"
+    },
+    "ssd_restart_speedup": {
+      "unit": "ratio", "direction": "+", "weight": 0.94,
+      "shape": ["prompt_tokens"],
+      "why": "a restart re-pays the prefill 94%; the tier is what avoids it"
+    },
+    "train_step_tok_s": {
+      "unit": "tok/s", "direction": "+", "weight": 0.5,
+      "shape": ["batch", "ctx"],
+      "why": "seconds_per_step of time_to_score = steps x seconds; the split is unmeasured, so 0.5 until it is"
+    },
+    "mmlu_pct": {
+      "unit": "%", "direction": "+", "weight": 0.0,
+      "shape": ["n"],
+      "why": "correctness floor, not a speed lever"
+    },
+    "spec_goodput_ratio": {
+      "unit": "ratio", "direction": "+", "weight": 0.06,
+      "shape": ["batch", "depth"],
+      "why": "decode-family; a guard row after the verdict flipped three times"
+    },
+    "kernel_ms": {
+      "unit": "ms", "direction": "-", "weight": 0.0,
+      "shape": ["kernel"],
+      "why": "feeds the engine-level rows; micro, not a lever itself"
+    },
+    "ppl": {
+      "unit": "ppl", "direction": "-", "weight": 0.0,
+      "shape": ["n"],
+      "why": "quality signal beside mmlu_pct"
+    }
+  }
+}
