@@ -299,7 +299,7 @@ def current(records: list[dict]) -> dict:
 
 
 def add_record_args(
-    ap, *, default_target: str = "sm90", default_device: str | None = "H20",
+    ap, *, default_target: str = "sm90", default_device: str | None = None,
     client_side: bool = False,
 ):
     """The population flags every collector carries. --build stays argparse-optional
@@ -311,7 +311,12 @@ def add_record_args(
     attributes. Rule: a client-side collector must not default any field describing
     the server -- the default would be a value the client cannot know, and it would
     look correctly set. --device-name then has no default and record_common raises
-    without it. Defaults are only for things the collector itself knows."""
+    without it. Defaults are only for things the collector itself knows.
+
+    default_device is None, not a card name: a collector that knows its device passes
+    the name explicitly; everything else falls through to torch.cuda.get_device_name
+    in record_common. A hardcoded "H20" default made that fallback dead code and
+    mislabeled every non-H20 run (2026-09-09, eight rows)."""
     ap.add_argument("--build", choices=list(BUILDS),
                     help="the build under test (required when the script cannot see it)")
     ap.add_argument("--target", default=default_target, choices=list(TARGETS))

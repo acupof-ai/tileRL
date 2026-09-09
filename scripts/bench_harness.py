@@ -667,6 +667,25 @@ def suite_train(gate, backend, source, full=False):
         benchrec.append(rec)
 
 
+def _view_collectors() -> None:
+    """The metric -> collector map, and the gaps. A metric with no collector is a
+    measurement nobody can reproduce by name; weight 0.94 rows with none are the
+    batch queue."""
+    import benchrec
+
+    reg = benchrec.load_registry()["metrics"]
+    print(f"{'metric':22s} {'w':>5s}  collector")
+    for name, m in sorted(reg.items(), key=lambda kv: -kv[1]["weight"]):
+        c = m.get("collector")
+        if c:
+            req = (" " + " ".join(c["required"])) if c["required"] else ""
+            print(f"{name:22s} {m['weight']:5.2f}  {c['script']}{req}")
+        elif c is None and "why_no_collector" in m:
+            print(f"{name:22s} {m['weight']:5.2f}  -- (none: {m['why_no_collector']})")
+        else:
+            print(f"{name:22s} {m['weight']:5.2f}  MISSING")
+
+
 def main() -> int:
     import argparse
 
@@ -691,9 +710,10 @@ def main() -> int:
     ap.add_argument("--readme", action="store_true", help="render the README rows (reuse, SSD restart) and exit")
     ap.add_argument("--regress", action="store_true", help="regression diff vs previous per population and exit")
     ap.add_argument("--questions", action="store_true", help="rows by gap x weight desc and exit")
+    ap.add_argument("--collectors", action="store_true", help="metric -> collector script map and exit")
     args = ap.parse_args()
 
-    if args.table or args.readme or args.regress or args.questions:
+    if args.table or args.readme or args.regress or args.questions or args.collectors:
         if args.table:
             _view_table()
         if args.readme:
@@ -702,6 +722,8 @@ def main() -> int:
             _view_regress()
         if args.questions:
             _view_questions()
+        if args.collectors:
+            _view_collectors()
         return 0
 
     import os
