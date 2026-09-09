@@ -674,7 +674,13 @@ def _train_adapters(args: argparse.Namespace) -> None:
         "eval_n": args.eval_n,
         # In the id: it selects which problems the curve scores, so two runs differing
         # only here are not the same run.
-        "eval_curve_seed": args.eval_curve_seed})
+        "eval_curve_seed": args.eval_curve_seed,
+        # In the id: they decide which problems the curve scores, how dense it is, and
+        # where the run stops. A patience on/off pair sharing an id would hand the
+        # second run the first's finished manifest -- silent, and the pair is the
+        # evidence for the default-flip decision.
+        "eval_every": args.eval_every, "eval_curve_n": args.eval_curve_n,
+        "patience": args.patience, "patience_mode": args.patience_mode})
     prev = read_manifest(runs_root(), manifest["id"])
     if prev and prev["finished"] and not args.force:
         log(f"run {prev['id']} already finished; --force reruns")
