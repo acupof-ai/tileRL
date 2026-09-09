@@ -93,9 +93,12 @@ def verdict_of(m: dict, kind: str = "verdict") -> bool | None:
 
     None is a third state and the caller must not collapse it to False: a run whose
     verdict gates were all skipped has not failed P1, it has not tested P1.
+    A gate with passed=None (not measured) is not scored: only gates with a real
+    True/False contribute to the verdict.
     """
     scored = [g for g in m["gates"]
-              if g.get("kind", "verdict") == kind and not g.get("skipped", False)]
+              if g.get("kind", "verdict") == kind and not g.get("skipped", False)
+              and g.get("passed") is not None]
     return all(g["passed"] for g in scored) if scored else None
 
 

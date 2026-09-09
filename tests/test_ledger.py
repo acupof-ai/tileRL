@@ -676,8 +676,8 @@ def test_validity_gates_cannot_make_p1_read_pass(capsys):
     # above, because `all([])` is True and no assertion distinguished it from a pass.
     # `steps == 0` is the real path there: it skips every gate, which is what a
     # smoke-test invocation does, and a `None` collapsed to True would report that run as
-    # having passed P1. Note an ABSENT metric is not a skip -- it vacuous-passes by
-    # design (`v is None or t is None`), so the skip has to come from the run's shape.
+    # having passed P1. An absent metric now reports passed=None (not-measured), and
+    # verdict_of filters those from the scored set -- see the cases below.
     from tilerl.cli import _finish
 
     m0 = new_manifest("train", {"steps": 0, "source": "tiny"}, [])
@@ -694,3 +694,17 @@ def test_validity_gates_cannot_make_p1_read_pass(capsys):
     kinds = {g["name"]: g["kind"] for g in m["gates"]}
     assert kinds["gsm8k_improves"] == kinds["mmlu_holds"] == "verdict", kinds
     assert kinds["reward_rises"] == kinds["groups_untied"] == "validity", kinds
+
+    # A gate with passed=None (not measured) and skipped=False is not scored:
+    # verdict_of must not collapse it to False. Found when #92's clean-arm run
+    # reported mmlu/gsm8k=pass(None) and verdict_of read it as a verdict failure.
+    m_none = {"gates": [
+        {"name": "mmlu_holds", "kind": "verdict", "passed": None, "skipped": False},
+        {"name": "gsm8k_improves", "kind": "verdict", "passed": True, "skipped": False},
+    ]}
+    assert verdict_of(m_none, "verdict") is True, m_none["gates"]
+    m_all_none = {"gates": [
+        {"name": "mmlu_holds", "kind": "verdict", "passed": None, "skipped": False},
+        {"name": "gsm8k_improves", "kind": "verdict", "passed": None, "skipped": False},
+    ]}
+    assert verdict_of(m_all_none, "verdict") is None, m_all_none["gates"]
