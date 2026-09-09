@@ -32,6 +32,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 DOCS = Path(__file__).parent.parent / "docs"
 ROOT = DOCS.parent
 
@@ -46,6 +48,11 @@ _BARE = re.compile(r"`(20\d\d-\d\d-\d\d-[\w.-]+\.md)`")
 #: undated name: requiring `20\d\d` in _TICK also dropped three real hits on
 #: `TEMPLATE-bench.md`, which the gate should keep checking.
 _PLACEHOLDER = re.compile(r"\bYYYY-MM-DD\b")
+
+#: Pod tarballs have no .git — six tests here shell out to git and would fail with
+#: exit 128. Skip them there rather than fail; CI and dev machines always have .git.
+_HAS_GIT = (ROOT / ".git").exists()
+_skip_no_git = pytest.mark.skipif(not _HAS_GIT, reason="pod tarball has no .git")
 
 
 def _tracked() -> set[str]:
@@ -111,11 +118,13 @@ def _dead() -> list[str]:
     return out
 
 
+@_skip_no_git
 def test_every_docs_reference_resolves():
     dead = _dead()
     assert not dead, "unresolved markdown references:\n  " + "\n  ".join(dead)
 
 
+@_skip_no_git
 def test_the_resolver_reports_a_reference_that_does_not_exist():
     """The base list tries six directories, so it could match almost anything.
 
@@ -139,6 +148,7 @@ def test_the_resolver_reports_a_reference_that_does_not_exist():
     )
 
 
+@_skip_no_git
 def test_a_root_level_md_is_scanned():
     """CHANGELOG.md was outside the scan, and it is the file most likely to carry one.
 
@@ -165,6 +175,7 @@ def test_a_root_level_md_is_scanned():
     assert any(rel in d for d in dead), f"a dead link in a root-level .md was not reported: {dead}"
 
 
+@_skip_no_git
 def test_the_placeholder_exemption_does_not_swallow_a_real_dead_link():
     """`YYYY-MM-DD` is exempt because AGENTS.md documents the entry skeleton with it.
 
@@ -190,6 +201,7 @@ def test_the_placeholder_exemption_does_not_swallow_a_real_dead_link():
     assert "2026-01-01" in hits[0], f"the reported link is not the dated one: {hits[0]}"
 
 
+@_skip_no_git
 def test_no_doc_invokes_a_flag_the_cli_does_not_have():
     """A doc that writes `tilerl serve --x` must mean a flag `serve` accepts.
 
@@ -408,6 +420,7 @@ def test_cli_surface_is_frozen():
             "edit _EXPECTED_CLI_FLAGS in the same PR")
 
 
+@_skip_no_git
 def test_no_readme_number_is_absent_from_every_dated_entry():
     """README:89 says every number above it sits in a dated entry. Hold it to that.
 
