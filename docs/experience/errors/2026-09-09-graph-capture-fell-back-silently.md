@@ -30,6 +30,14 @@ and stays — the fallback stays, it must not raise. Test:
 `test_stats_reports_the_eager_fallback_after_a_capture_failure` (CPU, where capture
 always fails, asserts the flag flips into `stats()`).
 
+The test's first version asserted the fallback with `max_new_tokens=1` and passed
+while exercising nothing: a one-token request completes inside the prefill step
+(the prefill's last-position logit samples the token directly), so no decode tick
+ever ran and the capture path was never reached. The test was green and the
+fallback warning was unverified. `max_new_tokens=2` forces a decode tick and the
+assertion then fails when the wiring is broken. A test that does not execute the
+path it guards is the vacuous-green shape; confirm it can go red before trusting it.
+
 ## Rule
 
 A fallback that keeps correctness and throws away 6x of performance must be louder
