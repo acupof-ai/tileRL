@@ -49,6 +49,12 @@ executed here (no card on this machine).
 | `bench_c4_ppl.py` | wikitext-103 perplexity, teacher-forced | cuda, 27B | quality (second point after MMLU) |
 | `bench_api_routes.py` | per-request HTTP+render+parse cost over a scripted engine | cpu (real number pending-remote) | serving overhead |
 
+Emitter coverage (2026-09-09): every metric with weight > 0 has a collector.
+`mmlu_pct` and `kernel_ms` have none **by design** — both are weight 0.0, so an
+unmeasured weight-0 metric is correct prioritization, not debt; do not build
+emitters for them before a weight > 0 metric needs one. The debt line is
+"weight > 0 and no emitter"; there is none as of this date.
+
 ## SSD/tier support measurements (keep while the tier is shipped)
 
 | File | Quantity |
