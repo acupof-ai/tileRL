@@ -41,6 +41,11 @@
       "shape": ["batch", "ctx"],
       "why": "seconds_per_step of time_to_score = steps x seconds; the split is unmeasured, so 0.5 until it is"
     },
+    "gsm8k_pct": {
+      "unit": "%", "direction": "+", "weight": 0.94,
+      "shape": ["steps"],
+      "why": "the RL line's acceptance verdict; the README's headline training number (89.6 to 94.8)"
+    },
     "mmlu_pct": {
       "unit": "%", "direction": "+", "weight": 0.0,
       "shape": ["n"],
