@@ -57,6 +57,16 @@ So the deferred application is trustworthy when it comes:
   not a measurement — a true-random-pairing control would be needed to measure
   it, and it changes no verdict.
 
+**Resolution floor.** A same-policy retest flips 10.4% of per-problem
+outcomes: 52/500 between two greedy evals of the same step-100 weights,
+differing only in batch composition, with a net score difference of 2
+(measured in [the companion entry](2026-09-09-the-collapse-did-not-replicate-the-plateau-did.md)).
+The healthy–healthy z@25 = +12.4 carries this noise on both sides, so it
+remains a valid baseline, but the instrument cannot resolve per-problem
+structure below the ~10% flip rate. In the plateau this binds: the cross-step
+policy difference (50 flips over 25 steps) is the same size as the
+same-policy retest noise (52).
+
 ## What this does NOT establish
 
 - **The dip's occurrence rate is unmeasured and unmeasurable** at current
