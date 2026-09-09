@@ -108,30 +108,39 @@ Selling early stop without best-weight keeping loses the margin.
 measured 925-1135 s per n=500 eval (avg 1026 s), 28% above the 800 s model.
 Real prices at n=100 are ~205 s/eval, not 160 s.
 
-## The eval floor, measured twice
+## The eval floor, three calibers
 
-The score-level floor is ±2 questions (0.4 pt): the after-arm and the
+The floor has been read three ways; keep them separate.
+
+**Cross-batch, measured: 52 flips, net 2 (0.4 pt).** The after-arm and the
 step-100 curve point scored the same step-100 adapter on the same 500
-questions, both greedy, and got 472 vs 474. The net hides the gross — **52 of
-the 500 questions (10.4%) flipped between the two passes**, 27 one way and 25
-the other. Completion lengths diverged (median ratio 1.66x, max 9.9x; 18 of 52
-by more than 2x), in both directions. This is not a fixed set of boundary
-questions; it is batch-composition non-determinism (the after-arm batches in
-file order alongside MMLU; the curve point shuffles and batches GSM8K
-alone). Pinning the questions does not fix it; pinning the batch composition
-would reduce it, with JIT and numeric noise still left.
+questions, both greedy, and got 472 vs 474. The net hides the gross — 52 of
+the 500 questions (10.4%) flipped, 27 one way and 25 the other. Completion
+lengths diverged (median ratio 1.66x, max 9.9x; 18 of 52 by more than 2x), in
+both directions. This is not a fixed set of boundary questions; it is
+batch-composition non-determinism (the after-arm batches in file order
+alongside MMLU; the curve point shuffles and batches GSM8K alone).
 
-The sharp consequence: the same adapter re-evaluated flips 52 questions; the
-step-75 and step-100 adapters, 25 training steps apart, flip 50. **On this
-instrument, same-policy re-eval noise equals the apparent per-question
-difference between policies 25 steps apart.** Per-question plateau signal is
-entirely inside the eval noise; only net scores (stable to ±0.4 pt) carry
-signal. Every cross-run per-question comparison — the overlap instrument
-included — sits on this 10% flip rate.
+**Same-batch, upper bound: ≤15-16 flips.** The seed-1 plateau's adjacent
+curve points (25→50, 50→75, 75→100 — same shuffled order, same concurrency,
+GSM8K-only, so the same batch composition) flip 15 / 15 / 16 questions gross
+with nets of −1 / +3 / 0. These points are *different weights* 25 training
+steps apart, so each count is instrument noise plus real drift, both
+non-negative — the instrument's same-batch noise is at most 15-16. This bound
+already settles the headline it threatened: the 37-question step-50-vs-100
+difference (b78ae28) is 2.5x the bound, so it is signal, not noise.
+
+**Same-batch, point estimate: pending.** Two identical after-arms of the
+step-100 adapter (same weights, same order, same concurrency), plus two
+identical before-arms of the zero-init LoRA (the base, same weights twice),
+turn the bound into a number. The 0.2 pt floor currently cited in `ledger.py`
+rests on one net-difference reading; the point estimate is what the tie rule
+and the raw-patience risk note should quote.
 
 The earlier floor reading (1 question, 0.2 pt) was a single measurement; two
-readings now bound the net floor at 0.4 pt, and the gross flip rate is
-measured for the first time.
+readings now bound the net floor at 0.4 pt, the cross-batch gross flip rate
+is 10.4%, and the same-batch gross flip rate is bounded by 15-16 pending the
+point estimate.
 
 ## The economics turn on the stop point
 
@@ -173,10 +182,10 @@ earns the default flip.
 - **The eval bill is set by the stop point, not the budget.** A dense grid is
   affordable when early stop makes most of its points never run; price the
   grid and the stop as one mechanism.
-- **A net floor and a per-question floor are two instruments.** The net score
-  is stable to ±0.4 pt while 10.4% of questions flip between two passes of
-  the same adapter; quoting the net as "the floor" hides the noise every
-  per-question comparison sits on.
+- **A floor has as many numbers as batch compositions.** Cross-batch: 52
+  flips, net 2. Same-batch: ≤15-16 (upper bound), point estimate pending.
+  Quoting one as "the floor" lets a per-question conclusion borrow a caliber
+  it was not measured in.
 - **A retained score belongs to the n=500 anchor, not the curve subset.**
   Small subsets run ±1.6 pt off the full score; reading the retained score
   off the curve would over-credit the cheap configuration.
