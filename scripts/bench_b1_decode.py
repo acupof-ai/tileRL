@@ -4,7 +4,7 @@ Streaming is not incremental (server._stream emits one delta at the end), and a
 small delta (1 vs 65) is swamped by prefill variance. So: run the same prompt at
 two max_tokens values far apart and take the slope — the prefill term cancels.
 
-  python3 scripts/bench_b1_decode.py --build fused+graph --card 6 [--ctx 1024] [--lo 32] [--hi 288]
+  python3 scripts/bench_b1_decode.py --build fused+graph --card 6 --device-name "NVIDIA H20" [--ctx 1024] [--lo 32] [--hi 288]
 
 Emits one decode_tok_s record to docs/experience/bench/measurements.jsonl
 (schema: docs/bench-schema.md). --build is required: a client cannot see the
@@ -52,11 +52,11 @@ def main() -> None:
     ap.add_argument("--lo", type=int, default=32)
     ap.add_argument("--hi", type=int, default=288)
     ap.add_argument("--repeat", type=int, default=3, help="slope repetitions for spread")
-    ap.add_argument("--build", required=True, choices=list(benchrec.BUILDS))
-    ap.add_argument("--target", default="sm90", choices=list(benchrec.TARGETS))
-    ap.add_argument("--device-name", default="H20")
-    ap.add_argument("--card", type=int, required=True, help="GPU card the server runs on")
-    ap.add_argument("--model-name", default="27B-nvfp4")
+    # Client-side: this script measures a remote server over HTTP and cannot see its
+    # attributes, so no server-describing field gets a default here. The hand-copied
+    # args this replaces had --device-name defaulting to "H20", a string that splits
+    # the store's population from the engine-direct "NVIDIA H20" rows.
+    benchrec.add_record_args(ap, client_side=True)
     args = ap.parse_args()
 
     prompt = (FILLER * max(1, args.ctx // 10) + "\n" + TASK) if args.ctx else TASK
@@ -80,14 +80,13 @@ def main() -> None:
     print(f"prompt_tok={pt}  {glo}tok vs {ghi}tok  x{args.repeat}")
     print(f"decode={rate:.1f} tok/s  ({1000 / rate:.0f} ms/tok)  spread {100 * spread:.1f}%")
 
+    common = benchrec.record_common(args)
     rid = benchrec.append({
         "metric": "decode_tok_s", "value": round(rate, 2), "unit": "tok/s",
-        "target": args.target, "build": args.build, "model": args.model_name,
         "shape": {"batch": 1, "ctx": pt},
         "warm": {"state": "warm", "compiles": 0},
         "n": args.repeat, "spread": round(spread, 4),
-        "device": {"name": args.device_name, "card": args.card},
-        "commit": benchrec.git_commit(), "dirty": benchrec.git_dirty(), "cmd": " ".join(sys.argv),
+        **common,
         "floor": {"value": 129.0, "unit": "tok/s", "kind": "roofline",
                   "derivation": "129 tok/s = 30.9 GB weights / 4 TB/s H20 HBM "
                                 "(wins/2026-08-24-sota-all-levers.md)"},

@@ -248,7 +248,11 @@ def main() -> None:
                          "--max-ctx 1024 costs 236 MB more pool than 512 and stalled the "
                          "ctx=512 step that reads 88.5 tok/s on its own. Pair the two to "
                          "measure ONE context at its own pool size")
-    benchrec.add_record_args(ap, default_target="sm70", default_device=None)
+    # No default_target override: this is the registered spec_goodput_ratio collector
+    # and runs on the H20 (sm90, the helper default). It was written for the V100, so
+    # a V100 run passes --target sm70 explicitly -- the old sm70 default silently
+    # mislabeled every H20 row that forgot the flag.
+    benchrec.add_record_args(ap, default_device=None)
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
     # cli binds _QWEN38_SOURCE from the env at import, which already happened.
