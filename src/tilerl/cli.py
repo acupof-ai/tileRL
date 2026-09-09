@@ -411,6 +411,14 @@ def _write_eval_rows(run_id: str, tag: str, rows: list) -> float:
     return sum(r["tokens"] for r in rows) / max(1, len(rows))
 
 
+def _read_eval_rows(run_id: str, tag: str) -> list:
+    """Per-problem rows of one eval arm, or [] if the arm was not written."""
+    from .ledger import runs_root
+
+    f = Path(runs_root()) / run_id / f"eval-{tag}.jsonl"
+    return [json.loads(l) for l in f.read_text().splitlines() if l.strip()] if f.is_file() else []
+
+
 def _mcnemar(before: list, after: list, dataset: str = "gsm8k") -> dict | None:
     """Paired significance on the per-question rows both arms wrote, or None.
 
@@ -610,6 +618,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
     from .ledger import (
         EarlyStop,
         commit,
+        curve_churn,
         file_hash,
         new_best_point,
         new_manifest,
@@ -940,6 +949,19 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # and `per` was being built here and dropped.
             _write_eval_rows(manifest["id"], f"curve-{step}",
                              [dict(r, dataset="gsm8k") for r in per])
+            # Churn vs the previous point: the run's own noise floor, recorded per point
+            # so a "these two points differ by N questions" claim has N's instrument
+            # beside it. Zero new evals -- these rows were just written and the previous
+            # point's are in the same run dir. First point: null, not 0.
+            churn = churn_dir = None
+            if curve:
+                prev_rows = _read_eval_rows(manifest["id"], f"curve-{curve[-1]['step']}")
+                pair = curve_churn(prev_rows, per)
+                if pair is None:
+                    log(f"  curve step {step}: churn null -- {len(prev_rows)} rows at step "
+                        f"{curve[-1]['step']} vs {len(per)} now, not comparable")
+                else:
+                    churn, churn_dir = pair[0] + pair[1], list(pair)
             # The first point compiles the eval's shapes and every later one hits the cache,
             # so its eval_secs is 5.6x the steady state and --eval-curve-n is calibrated off
             # point two -- recorded, because the curve is a list of equal-looking dicts.
@@ -956,6 +978,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
                           "secs": round(train_secs, 3), "eval_secs": round(eval_secs, 3),
                           "mean_len": round(ntok / max(n, 1), 1), "at_cap": at_cap,
                           "tied": round(statistics.mean(since), 4) if since else None,
+                          "churn": churn, "churn_dir": churn_dir,
                           "jit": not curve})
             # SIGNIFICANTLY greater, not merely greater. Measured 2026-09-08: re-scoring
             # one fixed set of weights across processes at temperature 0.0 moved 438/500
@@ -980,9 +1003,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # on, a missing width refuses instead: stopping on a width-less curve decides
             # on noise, and the unpaired fallback is too wide to ever fire -- both silent.
             if best:
-                f = runs_root() / manifest["id"] / f"eval-curve-{best['step']}.jsonl"
-                rows = ([json.loads(l) for l in f.read_text().splitlines() if l.strip()]
-                        if f.is_file() else [])
+                rows = _read_eval_rows(manifest["id"], f"curve-{best['step']}")
                 se = paired_se(rows, per)
                 se_kind = "paired" if se is not None else "unpaired (conservative)"
                 require_paired_width(se, args.patience, best["step"])
