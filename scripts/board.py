@@ -28,10 +28,14 @@ import subprocess
 import sys
 import time
 
-_common = subprocess.run(
-    ["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True, check=True
-).stdout.strip()
-ROOT = os.path.dirname(os.path.abspath(_common))
+try:
+    _common = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    ROOT = os.path.dirname(os.path.abspath(_common))
+except (subprocess.CalledProcessError, FileNotFoundError):
+    # pod tarballs ship without .git; the board lives under <root>/runs next to scripts/
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNS = os.path.join(ROOT, "runs")
 BOARD = os.path.join(RUNS, "board.jsonl")
 ROSTER = os.path.join(RUNS, "roster.json")

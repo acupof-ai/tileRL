@@ -79,6 +79,8 @@ if [ "${1:-}" = run ]; then
   done
 fi
 
-tar czf - --exclude=.venv --exclude=__pycache__ --exclude=.git \
+# COPYFILE_DISABLE: without it macOS bsdtar writes AppleDouble ._* entries from xattrs,
+# which land on the pod as binary ._*.py files and break test collection
+COPYFILE_DISABLE=1 tar czf - --exclude=.venv --exclude=__pycache__ --exclude=.git \
     --exclude='*.pyc' --exclude='*.egg-info' -C "$ROOT" . \
   | tn exec "$remote"
