@@ -120,9 +120,11 @@ def paired_se(rows_a: list[dict], rows_b: list[dict], key: str = "i") -> float |
     Curve points are a paired quantity -- every point scores the same subset -- so the
     width of a difference between two points is this, not a binomial width: measured
     2026-09-08, 1.9x narrower than the two-arm unpaired one at an 8.6% discordant rate.
-    ``b + c == 0`` gives 0.0: the points agreed on every row, so there is no noise to
-    measure and the difference is exactly 0. No `dataset` filter: one side is the live
-    in-memory rows, which never carry that key.
+    It is a SAMPLING width -- would the difference survive a different set of problems --
+    not an instrument width: under fixed weights the same-batch instrument is exact (see
+    `curve_churn`). ``b + c == 0`` gives 0.0: the points agreed on every row, so the
+    difference is exactly 0 and no sampling width exists to estimate. No `dataset`
+    filter: one side is the live in-memory rows, which never carry that key.
     """
     ja = {r[key]: bool(r["correct"]) for r in rows_a if key in r}
     jb = {r[key]: bool(r["correct"]) for r in rows_b if key in r}
@@ -145,11 +147,13 @@ def new_best_point(pt: dict, best: dict | None, se: float | None = None,
                    mode: str = "significant") -> bool:
     """Whether ``pt`` replaces the incumbent best curve point.
 
-    SIGNIFICANTLY greater, not merely greater: the eval's own floor is 0.2 pt
-    (measured 2026-09-08 -- one fixed set of weights, re-scored across processes,
-    moved one question in 500), and a one-question lead has bought extra training
-    for a reading inside the instrument. A tie keeps the earlier point:
-    `time_to_score` is the objective, so at equal score the cheaper point wins.
+    SIGNIFICANTLY greater, not merely greater -- two independent judgments. The 2xSE
+    ruler is a SAMPLING question: would the gain survive a different set of problems?
+    It is not an instrument question -- the same-batch instrument is exact (fixed
+    weights, same rows and order, bit-identical on re-score; GSM8K 500, 2026-09-09),
+    so a one-question lead is a real gain, not jitter. Whether a real gain is worth
+    more training is a second, separate judgment: `time_to_score` is the objective,
+    and a tie keeps the earlier point because at equal score the cheaper point wins.
 
     ``se`` is the PAIRED width of ``pt - best`` in points, from `paired_se` over the
     per-problem rows. None falls back to the conservative unpaired width -- the caller
@@ -163,20 +167,23 @@ def new_best_point(pt: dict, best: dict | None, se: float | None = None,
     curve, a guard that always fires. Three risks, the whole of why raw is not the
     default:
 
-    1. It can fire on a difference below the instrument floor -- the eval's
-       cross-process floor is 0.2 pt (1 question / 500). Seed 1 in raw mode stops at
-       step 50 on 94.2 <= 94.4, one question.
+    1. It can fire on a one-question gain -- and under the same-batch instrument that
+       gain is REAL, not jitter, so raw is sounder here than it first looks. The risk
+       is the hair trigger: any strict gain, however small, resets patience and buys
+       more training, even a gain too small to be worth the next five steps. Seed 1 in
+       raw mode stops at step 50 on 94.2 <= 94.4, one question.
     2. It is safe only on curves whose gain is concentrated in the first point -- a
        step, then flat -- where "stop at the first non-improving point" loses nothing.
-       On a noisy rise it follows the noise: best drifts up on sub-floor gains, and
-       the decline veto is then measured against a noise-inflated peak (cell F). A
+       On a gradual rise it follows the small gains: best drifts up on one-question
+       gains -- real on this set, unproven on another -- and the decline veto is then
+       measured against that inflated peak (cell F). A
        flat point stops BOTH modes under patience=1 -- the mode-specific hazard is
        the drift, not the stop.
     3. It is coupled to the adapter-best snapshot: stopping early loses only "might
        improve later", never what was -- the only reason raw is acceptable. Without
        the snapshot, raw is a net loss.
-    4. It ships the expensive twin: `adapter-best` follows `best`, so a sub-floor gain
-       does not just reset patience -- it makes the SNAPSHOT, the weights that get
+    4. It ships the expensive twin: `adapter-best` follows `best`, so a one-question
+       gain does not just reset patience -- it makes the SNAPSHOT, the weights that get
        delivered, a one-question choice. p@25 = 94.0, p@50 = 94.2: significant calls
        it a tie and keeps step 25, raw keeps step 50 -- 25 more training steps for a
        pair statistics cannot separate. Raw knowingly waives the tie-keeps-the-
@@ -193,8 +200,14 @@ def new_best_point(pt: dict, best: dict | None, se: float | None = None,
 
 def curve_churn(prev: list[dict] | None, cur: list[dict]) -> tuple[int, int] | None:
     """Per-question flips between two adjacent curve points, paired by row position:
-    ``(right->wrong, wrong->right)``. The run's own noise floor, recorded per point,
-    so a "these two points differ by N questions" claim has N's instrument beside it.
+    ``(right->wrong, wrong->right)``. The run's own instrument reading, recorded per
+    point, so a "these two points differ by N questions" claim has N's measurement
+    beside it. The same-batch instrument floor is 0 -- fixed weights re-scored on the
+    same rows in the same order are bit-identical (GSM8K 500, 2026-09-09) -- so every
+    flip between two points of one run is a real policy change, not jitter. The only
+    operating floor is CROSS-batch: 52 flips / 500 = 10.4%, and it applies only when
+    the two evals batched the problems differently (an after-arm against a curve
+    point, or two runs) -- never quote it inside one run.
 
     Comparable ONLY within one run: ``curve_rows`` is sliced once outside the loop
     and ``per_problem`` is written in input order, so position pairs the same
@@ -263,14 +276,14 @@ def require_paired_width(se: float | None, patience: int, kept_step: int | None 
     """Early stopping is a paired verdict: it compares each point to the best over the
     same rows. A missing width with ``patience > 0`` is a broken environment, not a
     fallback -- refusing loudly beats the two silent failures, a guard that never fires
-    (unpaired width too wide to ever cross) and a stop decided on noise (no width at
-    all). ``patience=0`` never asks, so it never refuses. ``kept_step`` names the best
+    (unpaired width too wide to ever cross) and a stop decided without a sampling width
+    at all). ``patience=0`` never asks, so it never refuses. ``kept_step`` names the best
     snapshot already on disk, so a reader meeting this exit mid-run knows it loses
     nothing -- the run is not wasted, the switch just cannot work on these records."""
     if patience and se is None:
         saved = (f" The best snapshot through step {kept_step} is already saved at "
                  "adapter-best.safetensors -- this exit loses nothing but the steps "
-                 "a width-less stop would have decided on noise.") if kept_step is not None else ""
+                 "a width-less stop would have spent on a difference it could not place.") if kept_step is not None else ""
         raise SystemExit(
             "--patience needs the paired per-problem rows: the best point's "
             "eval-curve-<step>.jsonl is missing or does not join this point's rows, so "
@@ -452,7 +465,7 @@ if __name__ == "__main__":  # runnable check
     assert not significant_decline({"score": 0.932}, peak, 1.66)
     assert not significant_decline({"score": 0.824}, peak, None)
     # Cell D: patience > 0 with no paired width REFUSES -- never the silent fallbacks
-    # (a guard that never fires, or a stop decided on noise). patience=0 never asks.
+    # (a guard that never fires, or a stop decided without a sampling width). patience=0 never asks.
     # With a kept step the message says the snapshot is already saved: a mid-run exit
     # must not read as a wasted run.
     try:
@@ -496,7 +509,7 @@ if __name__ == "__main__":  # runnable check
     p3 = {"step": 15, "score": .820}
     assert significant_decline(p3, p2, 6.0)       # vs the drifted raw peak: -13.0 pt
     assert not significant_decline(p3, p1, 6.0)   # vs the significant peak: -12.0 pt, not > 2xSE
-    # Curve churn: the run's own noise floor, recorded per point. Adjacent points pair
+    # Curve churn: the run's own instrument reading, recorded per point. Adjacent points pair
     # by position within one run; across runs the positions mean different questions.
     # The first point has no predecessor: null, not 0 -- 0 means "no flips", null means
     # "no comparable point". Different lengths are null too, not a partial count.
