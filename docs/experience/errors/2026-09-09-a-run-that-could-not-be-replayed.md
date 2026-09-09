@@ -28,8 +28,8 @@ final step-100 adapter survived, so intermediate policies cannot be replayed
 either.
 
 This is not data lost. It is data the instrument was built not to keep — the
-same family as [a citation to an artifact the tree lacks](2026-09-08-a-citation-to-an-artifact-the-tree-lacks.md):
-a question the apparatus cannot answer, discovered when the answer mattered.
+same family as a citation to an artifact the tree lacks: a question the
+apparatus cannot answer, discovered when the answer mattered.
 
 ## Fix
 
