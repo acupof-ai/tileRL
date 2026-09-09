@@ -32,12 +32,23 @@ the identity `tok/s = (tok/decode-fwd) / tick × (decode_s/wall_s)` closes to 0.
 | 09657c0 (first main sha that can run B=1) | 11.77 ms | 43.52 ms | 131.7 | 0.936 |
 | f80e894 (current) | 11.56 ms | 41.96 ms | 126.5 | 0.860 |
 
-The W=8 tick is 3.6% *faster* on the current sha. The reverse-derived 48.9 ms was an
-artifact: decode forwards are only 86% of the arm wall, and the derivation spread the
-other 14% across them. The whole 6.6% throughput gap is the ratio: non-decode time grew
-from 31.6 s to 71.9 s per 200-question run (0.158 s to 0.360 s per question) — a 2.3x
-growth in scheduling/eval overhead, with prefill only ~0.04 s/question of it. The decode
-kernels are innocent; the regression lives in the host path around the tick.
+The W=8 tick is 3.6% *faster* on the current sha — an **unattributed improvement**:
+no commit claims it, and an unexplained gain is as suspicious as an unexplained
+regression (it may be a real optimization or a changed measurement boundary). It is
+recorded here so it does not silently become the new baseline.
+
+The reverse-derived 48.9 ms was an artifact: decode forwards are only 86% of the arm
+wall, and the derivation spread the other 14% across them. The throughput gap is two
+gaps with different causes:
+
+| segment | size | explained? |
+|---|---:|---|
+| 135.5 (f49e006, never on main) → 131.7 (09657c0) | −2.8% | **unexplained, possibly unknowable** — that tree's number cannot be re-run |
+| 131.7 (09657c0) → 126.5 (current) | −3.9% | **explained**: decode_s/wall_s fell 0.936 → 0.860, non-decode time grew 31.6s → 71.9s per 200-question run (0.158s → 0.360s per question, 2.3x) |
+
+The second segment is the fixable one. The regression lives in the host path around the
+tick — scheduling/eval overhead — not the decode kernels; prefill is ~0.04 s/question of
+it, a rounding error. The decomposition of the 71.9s is the next measurement.
 
 **135.5 has never run on a main sha.** 09657c0 is the first commit on main whose
 `acc_spec_arms.py` can run B=1 at all (the `--concurrency` flag landed in #58; the recorded
@@ -54,9 +65,12 @@ the verify logic is correct. The two paths' logits differ by ~1e-1 (max 2.27), n
 ~1e-6 last-mile tile rounding first guessed — the target model computes 8 positions per
 forward in the spec path and 1 in the base path, different kernels down the whole path,
 and the argmax flips at near-ties (top-2 gap as small as 0.002). `_verify`'s docstring
-already states bit-identity is not guaranteed off the CPU reference. The noise-band
-observation this adds: on 200 greedy problems, run-to-run score Δ = 0 (n=1, greedy only;
-the graph-replay nondeterminism cc measured is on sampled paths).
+already states bit-identity is not guaranteed off the CPU reference. This completes the
+picture of the three "different" numbers, each with its own cause and none a bug:
+same-sha run-to-run is 0/200 (the noise floor, n=1 greedy); cross-sha is 167/200 at
+09657c0 vs 168/200 at the current sha — deterministic within each sha, so a 1-question
+drift between shas, not noise; and base-vs-spec is the 38/200 logit drift above. (The
+graph-replay nondeterminism cc measured is on sampled paths, not greedy argmax.)
 
 ## Rule
 
