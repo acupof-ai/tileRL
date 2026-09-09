@@ -41,7 +41,7 @@ jobs:
         continue-on-error: true
         run: uv run ruff format --check
       - name: CPU test suite
-        run: uv run pytest -v --durations=25
+        run: uv run pytest -v -n auto --durations=25
         env:
           TILERL_TARGET: cpu
       - name: Distributed gates (gloo, world=2)
