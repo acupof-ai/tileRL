@@ -33,12 +33,14 @@ def main() -> None:
 
     from tilerl.autograd import AdamW
     from tilerl.config import qwen38_27b
+    from tilerl.engine import card_guard
     from tilerl.model import add_lora, load_hf
     from tilerl.train import train_step
 
     backend = get_backend()
     cfg = qwen38_27b()
     model = load_hf(cfg, args.source, fuse_projections=False, num_layers=args.layers)
+    card_guard()
     model.params = backend.materialize(model.params)
     trainable = add_lora(model, rank=16)
     opt = AdamW(lr=1e-3)

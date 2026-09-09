@@ -1,10 +1,11 @@
 """Card guard: refuse a card not granted to tileRL when a grant ledger exists."""
 
 import json
+from pathlib import Path
 
 import pytest
 
-from tilerl.engine import _card_guard
+from tilerl.engine import card_guard
 
 
 def _assignment(tmp_path, cards: dict, note: str = "") -> str:
@@ -23,14 +24,14 @@ def test_refuses_a_card_granted_to_another_team(tmp_path, monkeypatch):
     monkeypatch.setenv("CARD_ASSIGNMENT_JSON", _assignment(tmp_path, {"2": "granted to b0"}))
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
     with pytest.raises(SystemExit, match="theirs"):
-        _card_guard()
+        card_guard()
 
 
 def test_refuses_an_unclassified_card(tmp_path, monkeypatch):
     monkeypatch.setenv("CARD_ASSIGNMENT_JSON", _assignment(tmp_path, {"2": "LANE 2026-09-09"}))
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
     with pytest.raises(SystemExit, match="unclassified"):
-        _card_guard()
+        card_guard()
 
 
 def test_allows_our_own_card(tmp_path, monkeypatch):
@@ -39,7 +40,7 @@ def test_allows_our_own_card(tmp_path, monkeypatch):
         _assignment(tmp_path, {"1": "tileRL, by the user directly"}),
     )
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
-    _card_guard()
+    card_guard()
 
 
 def test_refuses_our_card_when_note_records_a_lend(tmp_path, monkeypatch):
@@ -54,7 +55,7 @@ def test_refuses_our_card_when_note_records_a_lend(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
     with pytest.raises(SystemExit, match="lent out"):
-        _card_guard()
+        card_guard()
 
 
 def test_allows_our_card_when_note_lends_a_different_card(tmp_path, monkeypatch):
@@ -68,32 +69,59 @@ def test_allows_our_card_when_note_lends_a_different_card(tmp_path, monkeypatch)
         ),
     )
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6")
-    _card_guard()
+    card_guard()
 
 
 def test_refuses_when_cuda_visible_devices_unset(tmp_path, monkeypatch):
     """On a machine with a grant ledger, unset CUDA_VISIBLE_DEVICES = all cards visible → refuse."""
     monkeypatch.setenv("CARD_ASSIGNMENT_JSON", _assignment(tmp_path, {"2": "granted to b0"}))
     with pytest.raises(SystemExit, match="unset"):
-        _card_guard()
+        card_guard()
 
 
 def test_allows_when_cuda_visible_devices_explicitly_empty(tmp_path, monkeypatch):
     """Explicitly empty = no cards = CPU only → pass."""
     monkeypatch.setenv("CARD_ASSIGNMENT_JSON", _assignment(tmp_path, {"2": "granted to b0"}))
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    _card_guard()
+    card_guard()
 
 
 def test_allows_when_no_grant_ledger_exists(tmp_path, monkeypatch):
     monkeypatch.setenv("CARD_ASSIGNMENT_JSON", str(tmp_path / "nonexistent.json"))
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
-    _card_guard()
+    card_guard()
 
 
 def test_lend_env_var_bypasses_with_a_log_line(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("CARD_ASSIGNMENT_JSON", _assignment(tmp_path, {"2": "granted to b0"}))
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
     monkeypatch.setenv("TILERL_CARD_LEND", "lends/2026-09-10-p1.md")
-    _card_guard()
+    card_guard()
     assert "lend recorded" in capsys.readouterr().err
+
+
+def test_every_materialize_call_site_has_a_guard():
+    """Every file that calls backend.materialize() must also contain card_guard()
+    or build_engine() (which calls card_guard internally).
+
+    This is a file-level string check, NOT an order check: it asserts the guard
+    is present in the file, not that it runs before materialize. The pre-fix
+    probe_kv_ceiling.py would pass this gate (it had build_engine in the file
+    but called materialize first). Order is human-readable at the current ~15
+    call sites; an AST-level order check is over-engineering until that grows.
+
+    Coverage: scripts/ and src/ — a new materialize call site in either tree
+    must have the guard. Fails when someone adds one without it."""
+    root = Path(__file__).resolve().parent.parent
+    unguarded = []
+    for dirname in ("scripts", "src"):
+        for path in sorted((root / dirname).rglob("*.py")):
+            text = path.read_text()
+            if ".materialize(" not in text:
+                continue
+            if "card_guard" not in text and "build_engine" not in text:
+                unguarded.append(str(path.relative_to(root)))
+    assert not unguarded, (
+        f"files calling backend.materialize() without card_guard or build_engine: "
+        f"{unguarded}. Add card_guard() before the materialize call."
+    )

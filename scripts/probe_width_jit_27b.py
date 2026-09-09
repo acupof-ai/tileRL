@@ -46,6 +46,7 @@ from tilerl_kernels.backend import get_backend
 
 from tilerl.autograd import AdamW
 from tilerl.config import qwen38_27b
+from tilerl.engine import card_guard
 from tilerl.model import add_lora, load_hf
 from tilerl.train import rl_step
 
@@ -101,6 +102,7 @@ def main() -> None:
     # attached first point at tensors the forward never reads -- the tape then
     # records no parameter gradient and _step's `assert acc, _NO_GRAD` fires.
     # _train_adapters gets this ordering from build_engine; here it is explicit.
+    card_guard()
     model.params = be.materialize(model.params)
     trainable = add_lora(model, rank=16)
     opt = AdamW(lr=1e-4)

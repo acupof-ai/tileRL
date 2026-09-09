@@ -24,7 +24,7 @@ import torch
 from tilerl_kernels.backend import get_backend
 
 from tilerl.config import qwen38_27b
-from tilerl.engine import BatchKv
+from tilerl.engine import BatchKv, card_guard
 from tilerl.kv_cache import BLOCK_TOKENS, LinearStatePool, PagedKvPool
 from tilerl.model import load_hf
 from tilerl.server import get_tokenizer
@@ -50,6 +50,7 @@ def main() -> None:
     cfg = qwen38_27b()
     backend = get_backend()
     model = load_hf(cfg, args.source, fuse_projections=True)
+    card_guard()
     model.params = backend.materialize(model.params)
     tok = get_tokenizer(args.source)
     draft = load_draft(model, args.draft)

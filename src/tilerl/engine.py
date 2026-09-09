@@ -1564,6 +1564,7 @@ def _weight_fingerprint(cfg, kv_fp8: torch.dtype | None = None) -> str:
 
 
 #: Card ownership prefix rules — same as scripts/card_owner.py on the pod.
+#: If you change these, change card_owner.py too (and vice versa).
 _OURS = re.compile(r"^\s*(tile[_-]?rl|rl[_-]?team)\b", re.IGNORECASE)
 _THEIRS = re.compile(r"^\s*(granted\b|\d{4}-\d{2}-\d{2})", re.IGNORECASE)
 
@@ -1588,7 +1589,17 @@ def _is_lent(note, card: str) -> bool:
     return False
 
 
-def _card_guard() -> None:
+def _stale_context(path: Path, note: str) -> str:
+    """One-line context for a refusal: note excerpt + file mtime, so a stale
+    assignment file is visible in the error instead of silently trusted."""
+    import datetime
+
+    mtime = datetime.datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="minutes")
+    excerpt = (note or "")[:120].replace("\n", " ")
+    return f"\n  note[0:120]: {excerpt!r}\n  file mtime:  {mtime}"
+
+
+def card_guard() -> None:
     """Refuse to build an engine on a card not granted to tileRL, when a grant ledger exists.
 
     Two conditions, both must pass:
@@ -1627,11 +1638,13 @@ def _card_guard() -> None:
             sys.exit(
                 f"card_guard: card {card} is {kind} per {path}; "
                 f"a lend needs TILERL_CARD_LEND=<ledger ref>"
+                f"{_stale_context(path, note)}"
             )
         if _is_lent(note, card):
             sys.exit(
                 f"card_guard: card {card} is ours but lent out per {path}; "
                 f"a lend needs TILERL_CARD_LEND=<ledger ref>"
+                f"{_stale_context(path, note)}"
             )
 
 
@@ -1691,7 +1704,7 @@ def build_engine(
     ``decode_graph`` None auto-enables the captured decode tick on CUDA.
     ``num_blocks`` 0 fits the KV pool to free memory, capped at ``max_blocks``."""
     if backend.device.type == "cuda":
-        _card_guard()
+        card_guard()
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
     if draft is not None:
         draft.set_depth(spec_depth)  # the state pool is sized by the width it settles on
