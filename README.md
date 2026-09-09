@@ -2,31 +2,38 @@
 
 **Serve and RL-train Qwen3.8-27B (NVFP4) on one Hopper card, in one process.**
 
-sglang refuses this checkpoint on Hopper. tileRL runs it in its own TileLang kernels —
-**92.4 tok/s single-stream against sglang's 54.2 on the same shape** — and the engine
-that samples is the model that trains.
+sglang refuses this checkpoint on Hopper. tileRL runs it in its own TileLang kernels.
+A served agent turn is 94% prefill — 294 of 314.33 s in the measured Claude Code
+turn ([wins/2026-09-07](docs/experience/wins/2026-09-07-a-claude-code-turn-is-314-seconds-of-prefill.md)) —
+so the table leads with prefill, not decode:
 
-| one H20, Qwen3.8-27B | workload | B=1 decode tok/s | prefill tok/s |
+| one H20, Qwen3.8-27B | workload | decode tok/s | prefill tok/s |
 |---|---|---:|---:|
-| **tileRL**, NVFP4 + FP8 | d512, 64 out | **92.4** | **2689.8** |
+| **tileRL**, NVFP4 + FP8 | d512, 64 out | 92.4 | **2689.8** |
 | sglang, bf16 (cannot load NVFP4 on Hopper) | d512, 64 out | 54.2 | 2512 |
 | sglang, online fp8 | d512, 64 out | 39.9 | **4022** |
 | **tileRL**, W=8 block speculation | 200 GSM8K, 512 out | **126.5** | — |
 | **tileRL**, same arm, speculation off | 200 GSM8K, 512 out | 79.5 | — |
 
-B=1 decode is the target because that is the shape a rollout has. sglang's fp8 arm still
-wins prefill; its bf16 arm no longer does. Weights are fp4 against **bf16** activations
-at B=1 — the fp8-activation path is the M > 1 kernel, so it carries prefill and batched
-decode, not the single-stream number this table leads with.
+On the 94% quantity, prefill, tileRL beats sglang's bf16 arm (2689.8 vs 2512) and
+loses to its online-fp8 arm (4022). On the 6% remainder, decode, tileRL leads
+92.4 to 54.2. B=1 decode is the rollout shape — that is why it is the training
+target — but it is not the serving bottleneck. Weights are fp4 against **bf16**
+activations at B=1 — the fp8-activation path is the M > 1 kernel, so it carries
+prefill and batched decode, not the single-stream number.
 
-Accuracy is not a decode workload and is not in that table: these weights score **74.6%
-MMLU 0-shot**. Both sglang arms run a dequantized bf16 checkpoint that emits garbage, so
-there is no accuracy number to compare them on — the rows above are a kernel comparison
-only.
+Accuracy is not a decode workload and is not in that table: these weights score
+**74.6% MMLU 0-shot** — 746/1000, sample-draw, `fuse_projections=True` via
+`scripts/mmlu.py`, measured 2026-09-03. The number is build-dependent: the
+unfused arm scores 74.2%
+([errors/2026-09-03](docs/experience/errors/2026-09-03-mmlu-score-depends-on-concurrency.md)).
+Both sglang arms run a dequantized bf16 checkpoint that emits garbage, so there
+is no accuracy number to compare them on — the rows above are a kernel
+comparison only.
 
 **Read the workload column before comparing rows.** Only the first three are the same
 shape, and only they are comparable to sglang. The speculation pair ran 200 real GSM8K
-problems, so 126.5 is read against its own 79.5 base (**1.591x**) and never against
+problems, so 126.5 is read against its own 79.5 base (**1.591x**, derived) and never against
 54.2. Speculation is a B=1 lever: at B=8 it lands at 0.928x.
 
 This table read **135.5** for the speculation row until 2026-09-09. That number was
@@ -122,8 +129,15 @@ uv run tilerl ledger
 [`docs/experience/`](docs/experience/) — every measurement, win and dead end, dated ·
 [`AGENTS.md`](AGENTS.md) — the gates a change clears
 
-Every number above sits in a dated entry under `docs/experience/`. The decode, prefill,
-KV-reuse and training rows are additionally held by `bench` against
-[`bench-baseline.json`](docs/experience/wins/bench-baseline.json) at ≥ 0.97×; the sglang
-comparison, the V100 arm and the GSM8K results have no baseline key and rest on their
-entries alone. `uv run pytest` is the suite that gates every commit.
+Every number above sits in a dated entry under `docs/experience/`. The prefill,
+KV-reuse, training and batched-decode rows are additionally held by `bench`
+against [`bench-baseline.json`](docs/experience/wins/bench-baseline.json) at
+≥ 0.97×; the single-stream decode rows (92.4 among them) lost their baseline
+key on 2026-09-09, when five rows whose commit could not be recovered were
+deleted rather than guessed — a guessed sha is forged provenance. The sglang
+comparison, the V100 arm and the GSM8K results have no baseline key and rest
+on their entries alone. As collectors land, measurements append to the store
+(`docs/experience/bench/measurements.jsonl`, validated by `scripts/benchrec.py`);
+a metric without a store row rests on its entry, never on a blank. A headline
+number must be generable from the store, or it is not a headline.
+`uv run pytest` is the suite that gates every commit.
