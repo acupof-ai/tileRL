@@ -34,9 +34,18 @@ _DIRECTION = {
 }
 
 
-def load_manifests(runs_dir: Path) -> list[dict]:
-    return [json.loads(p.read_text())
+def load_manifests(runs_dir: Path) -> list[tuple[dict, Path]]:
+    return [(json.loads(p.read_text()), p.parent)
             for p in sorted(runs_dir.glob("*/manifest.json"))]
+
+
+def is_synthetic(run_dir: Path) -> bool:
+    """A run dir with only manifest.json is a test fixture, not a training run.
+
+    Real runs write eval data, rollouts, or other artifacts alongside the
+    manifest. A dir containing only the manifest was hand-constructed.
+    """
+    return all(p.name == "manifest.json" for p in run_dir.iterdir())
 
 
 def gate_margins(manifests: list[dict]) -> dict[str, list[tuple[float, float]]]:
@@ -77,6 +86,8 @@ def report(manifests: list[dict]) -> str:
 
 if __name__ == "__main__":
     runs_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "runs")
-    manifests = load_manifests(runs_dir)
-    print(f"runs: {len(manifests)} from {runs_dir}")
-    print(report(manifests))
+    loaded = load_manifests(runs_dir)
+    real = [(m, d) for m, d in loaded if not is_synthetic(d)]
+    excluded = len(loaded) - len(real)
+    print(f"scanned {len(loaded)} manifests, {excluded} excluded as synthetic (no eval data)")
+    print(report([m for m, _ in real]))
