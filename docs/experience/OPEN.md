@@ -59,3 +59,23 @@ at length, in
 The reasoning was self-consistent and no step in it was wrong. It described one branch while
 claiming something about all of them, and nobody ran the store. Two sessions read the shape;
 three rows answered it in minutes.
+
+**`test_submit_rollback_and_terminal_failure` DID NOT RAISE on CUDA** —
+`tests/test_e2e.py`, struck 2026-09-10. The reading was that a path which should fail did
+not: the test patches `engine._model.forward` to raise, and the pod run saw
+`DID NOT RAISE RuntimeError` where CPU raised — an engine error-path defect, CUDA-specific.
+Driving the test with entry counters on card 1, tree `73e095cb`:
+
+| | `_model.forward` entered | `_run_decode_graph` entered | `step()` | `take(1)` | blocks/slots |
+|---|---:|---:|---|---|---:|
+| CUDA | 0 | 1 | no raise | None | 1/1 |
+| CPU | 1 | 0 | raise | RequestFailed | 0/0 |
+
+The patched seam is entered 0 times on the card: a CUDA pure-decode tick replays a captured
+graph through `_run_decode_graph` and never calls `_model.forward`, so the failure was never
+injected. The engine's handler was never reached — no engine line changed; the fix landed in
+the test, which now patches both seams. The red was loud by construction: `pytest.raises`
+fails when the seam it patches stops being called, unlike an "output changed" assertion,
+which goes green in the same situation — 9b's fp8 seam, the same root, was silent. Why, at
+length, in
+[a test patched a seam the CUDA tick never crosses](errors/2026-09-10-a-test-patched-a-seam-the-cuda-tick-never-crosses.md).
