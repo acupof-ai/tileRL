@@ -112,6 +112,20 @@ Real prices at n=100 are ~205 s/eval, not 160 s.
 
 The floor has been read three ways; keep them separate.
 
+**Same-batch, measured: 0 flips.** Two identical arms of the step-5 adapter in
+one process (same weights, order, concurrency; run `76a17ea6e10a`) came out
+bit-identical: 471/500 both arms, 125100 total tokens both arms, 265.6
+tokens/correct both arms. The same-batch instrument noise is zero.
+
+**The 15-16 was never the floor — it is policy movement.** The seed-1
+plateau's adjacent curve points (25→50, 50→75, 75→100) flip 15/15/16 questions
+gross, but those points are *different weights* 25 training steps apart, so the
+counts are instrument noise plus real drift. With the noise now measured at 0,
+the 15-16 stands as the plateau's per-step policy movement, not a bound on the
+instrument. It still settles the headline it was used for: the 37-question
+step-50-vs-100 difference (b78ae28) is 2.5x the plateau's movement, so it is
+signal, not noise.
+
 **Cross-batch, measured: 52 flips, net 2 (0.4 pt).** The after-arm and the
 step-100 curve point scored the same step-100 adapter on the same 500
 questions, both greedy, and got 472 vs 474. The net hides the gross — 52 of
@@ -119,28 +133,14 @@ the 500 questions (10.4%) flipped, 27 one way and 25 the other. Completion
 lengths diverged (median ratio 1.66x, max 9.9x; 18 of 52 by more than 2x), in
 both directions. This is not a fixed set of boundary questions; it is
 batch-composition non-determinism (the after-arm batches in file order
-alongside MMLU; the curve point shuffles and batches GSM8K alone).
+alongside MMLU; the curve point shuffles and batches GSM8K alone). **This is
+the only caliber that counts as a floor** — the 0.2 pt figure cited in
+`ledger.py` (438 vs 437 across processes) is a cross-batch comparison too; it
+was mislabeled "cross-process". Same-process same-batch is 0.
 
-**Same-batch, upper bound: ≤15-16 flips.** The seed-1 plateau's adjacent
-curve points (25→50, 50→75, 75→100 — same shuffled order, same concurrency,
-GSM8K-only, so the same batch composition) flip 15 / 15 / 16 questions gross
-with nets of −1 / +3 / 0. These points are *different weights* 25 training
-steps apart, so each count is instrument noise plus real drift, both
-non-negative — the instrument's same-batch noise is at most 15-16. This bound
-already settles the headline it threatened: the 37-question step-50-vs-100
-difference (b78ae28) is 2.5x the bound, so it is signal, not noise.
-
-**Same-batch, point estimate: pending.** Two identical after-arms of the
-step-100 adapter (same weights, same order, same concurrency), plus two
-identical before-arms of the zero-init LoRA (the base, same weights twice),
-turn the bound into a number. The 0.2 pt floor currently cited in `ledger.py`
-rests on one net-difference reading; the point estimate is what the tie rule
-and the raw-patience risk note should quote.
-
-The earlier floor reading (1 question, 0.2 pt) was a single measurement; two
-readings now bound the net floor at 0.4 pt, the cross-batch gross flip rate
-is 10.4%, and the same-batch gross flip rate is bounded by 15-16 pending the
-point estimate.
+The earlier floor reading (1 question, 0.2 pt) was a single measurement; the
+calibers now stand: same-batch 0, cross-batch 52 flips / 0.4 pt net, and the
+plateau's 15-16 is policy movement, not floor.
 
 ## Pairing across runs: row position is not identity
 
@@ -207,10 +207,12 @@ earns the default flip.
   same `i` field is question identity in pre-shuffle runs and file position
   in post-shuffle runs; pairing by the field name across versions scrambles
   the comparison. Recover identity through the producing code, not the name.
-- **A floor has as many numbers as batch compositions.** Cross-batch: 52
-  flips, net 2. Same-batch: ≤15-16 (upper bound), point estimate pending.
-  Quoting one as "the floor" lets a per-question conclusion borrow a caliber
-  it was not measured in.
+- **A floor has as many numbers as batch compositions, and one of them is
+  zero.** Same-batch same-process: 0 flips (two arms bit-identical, run
+  `76a17ea6e10a`). Cross-batch: 52 flips, net 2. The plateau's 15-16 is
+  policy movement across training steps, not instrument noise. Quoting one as
+  "the floor" lets a per-question conclusion borrow a caliber it was not
+  measured in.
 - **A retained score belongs to the n=500 anchor, not the curve subset.**
   Small subsets run ±1.6 pt off the full score; reading the retained score
   off the curve would over-credit the cheap configuration.
