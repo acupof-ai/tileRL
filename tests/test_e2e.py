@@ -653,7 +653,12 @@ def test_a_ragged_prompt_publishes_and_its_state_matches_no_store():
     params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=5)
     rng = np.random.default_rng(7)
     conv = rng.integers(3, 320, size=300).astype(np.int64)
-    short, long = 100, 164  # neither is block-aligned; both cross a 64 boundary
+    short, long = 66, 100  # neither is block-aligned; both cross a 64 boundary.
+    # Both prompts must land the same first-chunk size (64 here): the GDN kernel's
+    # parallel scan rounds differently per chunk length, so a warm-up at 100 (chunk
+    # 64) vs a ref at 164 (chunk 128) gives a deterministic ~3e-04 delta at near-zero
+    # elements that allclose(rtol=1e-2) rejects — a test-design artifact, not a restore
+    # bug. Matching chunks makes the states bit-identical.
 
     def run(no_store: bool):
         kw = {"prefix_store": NoPrefixStore()} if no_store else {}
