@@ -40,7 +40,8 @@ def _self_check() -> None:
         a, b = f"{d}/a.jsonl", f"{d}/b.jsonl"
         write(a, [1, 1, 0, 0, 1])
         write(b, [1, 0, 0, 1, 1])  # flips at 1 (r2w) and 3 (w2r), net 0
-        import contextlib, io
+        import contextlib
+        import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             diff(a, b)
