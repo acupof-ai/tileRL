@@ -30,11 +30,16 @@ sequences: ``decode=`` is the one place ids become text, for ``stop_texts``.
 from __future__ import annotations
 
 import contextlib
+import json
+import os
+import re
+import sys
 import threading
 import time
 import warnings
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -1558,6 +1563,78 @@ def _weight_fingerprint(cfg, kv_fp8: torch.dtype | None = None) -> str:
     return f"{fields}-block{BLOCK_TOKENS}-kv{kv_fp8 or 'io'}"
 
 
+#: Card ownership prefix rules — same as scripts/card_owner.py on the pod.
+_OURS = re.compile(r"^\s*(tile[_-]?rl|rl[_-]?team)\b", re.IGNORECASE)
+_THEIRS = re.compile(r"^\s*(granted\b|\d{4}-\d{2}-\d{2})", re.IGNORECASE)
+
+
+def _is_lent(note, card: str) -> bool:
+    """Whether the note records this card as lent out.
+
+    The note is prose; lends are recorded as e.g. "cards 1 and 3 are lent to b0".
+    Conservative: unparseable note → assume lent (refuse).  Empty/missing → allow.
+    """
+    # ponytail: lends live in prose because aupai's schema has no lend field;
+    # delete this when cards[] records the lend structurally
+    if not isinstance(note, str):
+        return True
+    if not note:
+        return False
+    for sentence in re.split(r"[.!?]", note):
+        if re.search(r"\blent\b|\blending\b|\blend\b", sentence, re.IGNORECASE) and re.search(
+            rf"\b{re.escape(card)}\b", sentence
+        ):
+            return True
+    return False
+
+
+def _card_guard() -> None:
+    """Refuse to build an engine on a card not granted to tileRL, when a grant ledger exists.
+
+    Two conditions, both must pass:
+    1. ``cards[card]`` classifies as ours (same prefix rules as card_owner.py)
+    2. The ``note`` field has no lend record for this card
+
+    No card_assignment.json → no grant system on this machine → pass.
+    TILERL_CARD_LEND=<ref> is the explicit escape hatch, echoed to stderr.
+    """
+    path = Path(os.environ.get("CARD_ASSIGNMENT_JSON", "/work/aupai/runs/card_assignment.json"))
+    if not path.exists():
+        return
+    lend = os.environ.get("TILERL_CARD_LEND")
+    if lend:
+        print(f"card_guard: lend recorded — {lend}", file=sys.stderr)
+        return
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        sys.exit(
+            "card_guard: CUDA_VISIBLE_DEVICES is unset — all cards visible. "
+            "Set it to the card(s) you intend to use, or TILERL_CARD_LEND=<ref>."
+        )
+    visible = visible.strip()
+    if not visible:
+        return  # explicitly empty → no cards → CPU only → pass
+    data = json.loads(path.read_text())
+    cards = data.get("cards", {})
+    note = data.get("note", "")
+    for card in visible.split(","):
+        card = card.strip()
+        if not card:
+            continue
+        card_note = cards.get(card, "")
+        if not _OURS.match(card_note):
+            kind = "theirs" if _THEIRS.match(card_note) else "unclassified"
+            sys.exit(
+                f"card_guard: card {card} is {kind} per {path}; "
+                f"a lend needs TILERL_CARD_LEND=<ledger ref>"
+            )
+        if _is_lent(note, card):
+            sys.exit(
+                f"card_guard: card {card} is ours but lent out per {path}; "
+                f"a lend needs TILERL_CARD_LEND=<ledger ref>"
+            )
+
+
 def build_engine(
     cfg,
     model: Any,
@@ -1613,6 +1690,8 @@ def build_engine(
     """Wire a model + backend into an Engine; pool shapes come from ``cfg``.
     ``decode_graph`` None auto-enables the captured decode tick on CUDA.
     ``num_blocks`` 0 fits the KV pool to free memory, capped at ``max_blocks``."""
+    if backend.device.type == "cuda":
+        _card_guard()
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
     if draft is not None:
         draft.set_depth(spec_depth)  # the state pool is sized by the width it settles on
