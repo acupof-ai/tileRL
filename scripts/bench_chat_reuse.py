@@ -61,7 +61,7 @@ def main() -> int:
 
     common = {"target": args.target, "build": args.build, "model": args.model_name,
               "device": {"name": args.device_name, "card": args.card},
-              "sha": benchrec.git_sha(), "cmd": " ".join(sys.argv)}
+              "commit": benchrec.git_commit(), "dirty": benchrec.git_dirty(), "cmd": " ".join(sys.argv)}
     msgs: list[dict] = []
     for turn in range(args.turns):
         msgs.append({"role": "user", "content": _FILLER * args.grow * (turn + 1)})

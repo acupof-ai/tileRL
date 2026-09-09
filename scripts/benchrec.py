@@ -38,29 +38,75 @@ FLOOR_KINDS = ("bandwidth", "compute", "roofline", "measured-best", "baseline")
 PHYSICAL_FLOOR_KINDS = ("bandwidth", "compute", "roofline", "baseline")
 #: A baseline floor must name the null it is measured against.
 _BASELINE_NULL = re.compile(r"=")
-_SHA = re.compile(r"^[0-9a-f]{7,40}$")
+_COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 REQUIRED = ("metric", "value", "unit", "target", "build", "model", "shape",
-            "warm", "n", "spread", "device", "sha", "cmd", "floor")
+            "warm", "n", "spread", "device", "commit", "dirty", "cmd", "floor")
 
 
 def load_registry() -> dict:
     return json.loads(REGISTRY.read_text())
 
 
-def git_sha() -> str:
-    """Code sha under test. The pod is a tarball, not a clone: pod_sync stamps
-    ``.synced_commit`` at the repo root, and a record without either is rejected."""
+def git_commit() -> str:
+    """Full 40-char sha of the tree under test, self-collected. A record's
+    commit is never hand-filled: a written-down sha is the nib of main at
+    entry-writing time, not the tree that produced the number
+    (wins/2026-09-03-batched-selector-walk.md:80 — 40bc83c cannot produce its
+    own row; B=1 landed in #58). The pod is a tarball, not a clone: pod_sync
+    stamps ``.synced_commit`` at the repo root, and a record without either is
+    rejected."""
     try:
         import subprocess
 
         return subprocess.check_output(
-            ["git", "-C", str(_ROOT), "rev-parse", "--short", "HEAD"],
+            ["git", "-C", str(_ROOT), "rev-parse", "HEAD"],
             text=True, stderr=subprocess.DEVNULL,
         ).strip()
     except Exception:
         stamp = _ROOT / ".synced_commit"
         return stamp.read_text().strip() if stamp.exists() else "unknown"
+
+
+def git_dirty() -> bool:
+    """True when the tree has uncommitted changes: a sha cannot fully identify
+    a dirty tree (9b's 267-line analysis tool lived in untracked files). The
+    pod tarball carries ``.synced_dirty``, stamped by pod_sync; absent both
+    git and the marker, say clean."""
+    try:
+        import subprocess
+
+        out = subprocess.check_output(
+            ["git", "-C", str(_ROOT), "status", "--porcelain"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        return bool(out.strip())
+    except Exception:
+        marker = _ROOT / ".synced_dirty"
+        return marker.exists() and marker.read_text().strip() == "1"
+
+
+def _commit_exists(commit: str) -> bool | None:
+    """Existence check catches typos, not wrong-tree shas (a real sha from
+    another tree passes). The real guard is git_commit() self-collection.
+    None when not in a git repo (pod tarball): nothing to check against."""
+    import subprocess
+
+    try:
+        subprocess.check_output(
+            ["git", "-C", str(_ROOT), "rev-parse", "--git-dir"],
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    try:
+        subprocess.check_call(
+            ["git", "-C", str(_ROOT), "cat-file", "-e", commit + "^{commit}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _canon(record: dict) -> str:
@@ -139,8 +185,14 @@ def validate(record: dict, registry: dict, existing_ids: set) -> list[str]:
     if record["target"] in ("sm90", "sm70") and dev.get("card") is None:
         errs.append(f"device.card required on target {record['target']}")
 
-    if not _SHA.match(str(record["sha"])):
-        errs.append(f"sha {record['sha']!r} not a git sha")
+    commit = record.get("commit", "")
+    if not _COMMIT_SHA.match(str(commit)):
+        errs.append(f"commit {commit!r} must be the full 40-hex sha, self-collected "
+                    "(git rev-parse HEAD in the tree that produced the number)")
+    elif _commit_exists(commit) is False:
+        errs.append(f"commit {commit[:12]} not in this repo — a typo or a sha from another tree")
+    if not isinstance(record.get("dirty"), bool):
+        errs.append("dirty must be a bool (git status --porcelain non-empty)")
 
     floor = record["floor"]
     if not isinstance(floor, dict):
@@ -245,7 +297,7 @@ def record_common(args, *, build: str | None = None) -> dict:
         device_name = args.target
     return {"target": args.target, "build": build, "model": args.model_name,
             "device": {"name": device_name, "card": args.card},
-            "sha": git_sha(), "cmd": " ".join(sys.argv)}
+            "commit": git_commit(), "dirty": git_dirty(), "cmd": " ".join(sys.argv)}
 
 
 def measured_best(record: dict, lower_is_better: bool) -> tuple[float | None, str | None]:
@@ -286,15 +338,24 @@ if __name__ == "__main__":
         "warm": {"state": "warm", "compiles": 0},
         "n": 30, "spread": 0.017,
         "device": {"name": "H20", "card": 6},
-        "sha": "90f308a", "cmd": "python3 scripts/bench_b1_decode.py --build fused+graph",
+        "commit": git_commit(), "dirty": git_dirty(),
+        "cmd": "python3 scripts/bench_b1_decode.py --build fused+graph",
         "floor": {"value": 129.0, "unit": "tok/s", "kind": "roofline",
                   "derivation": "129 tok/s = 30.9 GB weights / 4 TB/s H20 HBM (wins/2026-08-24-sota-all-levers.md)"},
     }
     assert validate(good, reg, set()) == [], validate(good, reg, set())
 
     bad = dict(good)
-    del bad["sha"]
-    assert validate(bad, reg, set()), "missing sha must reject"
+    del bad["commit"]
+    assert validate(bad, reg, set()), "missing commit must reject"
+
+    bad = json.loads(json.dumps(good))
+    bad["commit"] = "0" * 40
+    assert validate(bad, reg, set()), "commit not in this repo must reject (typo or wrong tree)"
+
+    bad = json.loads(json.dumps(good))
+    del bad["dirty"]
+    assert validate(bad, reg, set()), "missing dirty must reject"
 
     bad = json.loads(json.dumps(good))
     del bad["warm"]["compiles"]
@@ -327,7 +388,7 @@ if __name__ == "__main__":
         rid = append(good)
         assert rid in STORE.read_text()
         bad = dict(good)
-        del bad["sha"]
+        del bad["commit"]
         try:
             append(bad)
             raise AssertionError("append must reject a record missing sha")
@@ -356,5 +417,5 @@ if __name__ == "__main__":
     finally:
         STORE = old_store
 
-    print("benchrec: schema selftest OK (good accepts, 3 bad worlds reject, n=1 fenced out of regression, "
+    print("benchrec: schema selftest OK (good accepts, bad worlds reject (missing commit, unknown commit, missing dirty,, n=1 fenced out of regression, "
           "append path rejects and a supersedes rerun replaces)")

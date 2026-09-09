@@ -13,6 +13,14 @@ written down: a build (eager 14.7 vs fused+graph 94.6, 6.4x), a length cap
 compiles), a sha, a type. A point estimate without its population answers a
 different question every time someone reads it.
 
+A hand-written `commit` is the same failure in the provenance field:
+`wins/2026-09-03-batched-selector-walk.md:80` cites `40bc83c` for a B=1 row
+that commit cannot produce (B=1 landed in #58) — the sha was main's nib at
+entry-writing time, not the tree that produced the number. It lay for three
+days, was cited by the README, and was handed out as a repro baseline. So the
+collector takes the sha itself, in the tree it ran in, and `dirty` says
+whether that sha fully names the tree.
+
 ## Required fields
 
 | Field | Type | Rule |
@@ -28,7 +36,8 @@ different question every time someone reads it.
 | `n` | int | ≥ 1, the number of timed windows |
 | `spread` | number | relative dispersion (sd/mean or (max−min)/median); 0.0 when `n=1` |
 | `device` | object | `name` (GPU model); `card` int, required on sm90/sm70 |
-| `sha` | str | git sha of the code under test (pod: stamped from `.synced_commit`) |
+| `commit` | str | full 40-hex git sha of the code under test, **self-collected** (`git rev-parse HEAD` in the tree that produced the number) — never hand-filled; validated to exist in the repo (pod: stamped from `.synced_commit`) |
+| `dirty` | bool | the tree had uncommitted changes (`git status --porcelain` non-empty); a sha cannot fully identify a dirty tree (pod: `.synced_dirty`) |
 | `cmd` | str | the exact command that produced the row |
 | `floor` | object | `value` > 0, `unit` (must equal the record's unit — a floor in other units is a forged floor), `kind` ∈ `bandwidth`/`compute`/`roofline`/`measured-best`/`baseline`, `derivation` non-empty |
 
@@ -84,7 +93,7 @@ bill of health.
 
 ## Selftest
 
-`python3 scripts/benchrec.py` — a good world accepts; three bad worlds
-(missing field, `warm` without `compiles`, forged floor) reject; a legal
-`n=1` row accepts but is fenced out of the regression view. The system proves
-it goes red.
+`python3 scripts/benchrec.py` — a good world accepts; bad worlds reject
+(missing field, `warm` without `compiles`, forged floor, missing `commit`,
+a `commit` not in this repo, missing `dirty`); a legal `n=1` row accepts but
+is fenced out of the regression view. The system proves it goes red.

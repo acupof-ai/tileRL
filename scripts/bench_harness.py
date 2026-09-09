@@ -300,7 +300,8 @@ def suite_prefill(gate, cfg, model, backend, lengths, build, model_name, device)
             "shape": {"ctx": length},
             "warm": {"state": "warm", "compiles": 0},
             "n": 3, "spread": round(spread, 4),
-            "device": device, "sha": _git_commit(), "cmd": " ".join(sys.argv),
+            "device": device, "commit": benchrec.git_commit(), "dirty": benchrec.git_dirty(),
+            "cmd": " ".join(sys.argv),
             "floor": floor,
         })
 
