@@ -475,6 +475,7 @@ def grpo_loop(
     clear_prefix: bool = False,
     per_rollout: list | None = None,
     prompts_per_step: int = 1,
+    decode: Any = None,
 ) -> Iterator[tuple[float, float, float, float, float, dict[str, float]]]:
     """GRPO: sample ``group`` completions per prompt in one engine batch, score
     them with ``reward_fn(prompt_ids, completion_ids) -> float``, take one
@@ -501,7 +502,8 @@ def grpo_loop(
     ``prompts_per_step * group`` rows, so the engine has to be sized for that.
 
     ``per_rollout``, when given, is extended with one dict per completion
-    (``step``, ``g``, ``tokens``, ``reward``, ``advantage``). The yielded tuple
+    (``step``, ``g``, ``tokens``, ``reward``, ``advantage``, and ``text`` when
+    ``decode`` is given). The yielded tuple
     carries only means, which is the axis a length-vs-reward claim cannot be made
     on: the advantage is computed within a group on one prompt, so pairing has to
     survive to the row level or prompt difficulty confounds it."""
@@ -577,7 +579,11 @@ def grpo_loop(
             # flat index would make two prompts' rows look like one group of 16.
             per_rollout.extend(
                 {"step": step + 1, "p": owner[i], "g": i % group, "tokens": len(c),
-                 "reward": r, "advantage": float(a)}
+                 "reward": r, "advantage": float(a),
+                 # ~0.5 MB per run (150 tok x 8 x 100 steps): cheap, and the only record
+                 # of what the policy wrote -- run 86a06dc8c420 saved no text, so its
+                 # step-75 collapse can never be replayed.
+                 "text": decode([int(t) for t in c]) if decode is not None else ""}
                 for i, (c, r, a) in enumerate(zip(comps, rewards, adv))
             )
         # Power-of-two buckets bound shape JITs (tiny: 37.7 s new width, 71 ms repeat).
