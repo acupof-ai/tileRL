@@ -961,6 +961,10 @@ def _train_adapters(args: argparse.Namespace) -> None:
     # run left 12 rollout rows and no manifest; the same kill on an opd run left no
     # run DIRECTORY at all. `_finish` overwrites this with the finished manifest.
     write_manifest(runs_root(), manifest)
+    # No eval configured: the eval gates have nothing to measure and must be
+    # explicitly skipped, not left to the vacuous-pass rule.
+    if not args.eval_mmlu and not args.eval_gsm8k:
+        manifest["gates_skip_after"] = True
     evals("before")  # LoRA B is zero at init: the base model's score
     if args.steps == 0:
         evals("after")
@@ -1384,14 +1388,13 @@ _VALIDITY_GATES = frozenset({"groups_untied", "reward_rises", "ce_falls",
 
 def _finish(m: dict, as_json: bool) -> None:
     """Gate, write the manifest, print it, exit non-zero on a failed gate.
-    A gate whose metric was not evaluated passes vacuously (value null)."""
+    A gate whose metric was not evaluated reports passed=None (not measured)."""
     from .ledger import format_run, gates_pass, now, runs_root, write_manifest
 
     if not m["finished"]:
         g = m["metrics"]
-        # .get, not [...]: "a gate whose metric was not evaluated passes
-        # vacuously" already covers a metric set that never had the key, which
-        # is what an SFT run's manifest is.
+        # .get, not [...]: a metric set that never had the key (an SFT run's
+        # manifest) reads as None, which the gate below records as not-measured.
         # UNITS, and they differ 13 lines apart in the writer: `mmlu_{tag}` is a
         # FRACTION (`c / n`, :575) and `gsm8k_{tag}` is a COUNT (`c`, :588), with the
         # denominator alongside it as `gsm8k_{tag}_total` (:590). So the roadmap's two
@@ -1423,13 +1426,17 @@ def _finish(m: dict, as_json: bool) -> None:
         # below made it report `passed` over nothing on every RL run. Not measured is the
         # honest record, and the gate stays live where the SFT path does write both.
         unmeasured = frozenset() if g.get("ce_first") is not None else frozenset({"ce_falls"})
+        # Symmetric: RL gates have no metrics on the SFT path.
+        if g.get("reward_first") is None:
+            unmeasured |= frozenset({"reward_rises", "groups_untied"})
         m["gates"] += [
             {"name": n, "value": v, "threshold": t,
              "kind": "validity" if n in _VALIDITY_GATES else "verdict",
              "skipped": skipped or n in unmeasured or (after_skipped and n in _AFTER_GATES),
              "passed": None if skipped or n in unmeasured
              or (after_skipped and n in _AFTER_GATES)
-             else v is None or t is None or ok(v, t)}
+             or v is None or t is None
+             else ok(v, t)}
             for n, v, t, ok in (
                 ("reward_rises", g.get("reward_last"), g.get("reward_first"), lambda v, t: v > t),
                 ("mmlu_holds", g.get("mmlu_after"), mmlu_floor, lambda v, t: v >= t),

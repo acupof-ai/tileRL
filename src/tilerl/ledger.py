@@ -84,6 +84,11 @@ def gates_pass(m: dict) -> bool:
     "P1 passed", and `reward_rises` must never be able to do that -- reward is the
     quantity GRPO optimizes, so it rising is the optimizer working, not evidence that RL
     moved a downstream number.
+
+    A gate with passed=None (not measured) and skipped=False is falsy here: the exit
+    code is the safety net, and a run that produced no measurement is not a success.
+    `verdict_of` reads the same None differently -- as "not tested", not "failed" --
+    because the exit code and the verdict answer different questions.
     """
     return all(g.get("skipped", False) or g["passed"] for g in m["gates"])
 
@@ -93,9 +98,14 @@ def verdict_of(m: dict, kind: str = "verdict") -> bool | None:
 
     None is a third state and the caller must not collapse it to False: a run whose
     verdict gates were all skipped has not failed P1, it has not tested P1.
+    A gate with passed=None (not measured) is not scored: only gates with a real
+    True/False contribute to the verdict. This is the other side of `gates_pass`,
+    which treats the same None as falsy for the exit code -- the exit code is the
+    safety net (fail-loud), the verdict is the interpretation (not-tested ≠ failed).
     """
     scored = [g for g in m["gates"]
-              if g.get("kind", "verdict") == kind and not g.get("skipped", False)]
+              if g.get("kind", "verdict") == kind and not g.get("skipped", False)
+              and g.get("passed") is not None]
     return all(g["passed"] for g in scored) if scored else None
 
 
