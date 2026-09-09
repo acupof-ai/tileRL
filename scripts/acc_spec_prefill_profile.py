@@ -67,9 +67,9 @@ def _timed_run_forward(self, decodes, prefills, chunks):
     return r
 
 
-def _timed_draft_step(self, rows):
+def _timed_draft_step(orig, rows):
     t0 = time.perf_counter()
-    r = _orig_draft_step(self, rows)
+    r = orig(rows)  # orig is the bound draft.step
     _buckets["draft"] += time.perf_counter() - t0
     _counts["draft_calls"] += 1
     return r
@@ -119,7 +119,7 @@ def main() -> None:
     if draft is not None:
         global _orig_draft_step
         _orig_draft_step = draft.step
-        draft.step = lambda rows: _timed_draft_step(draft, rows)
+        draft.step = lambda rows: _timed_draft_step(_orig_draft_step, rows)
         if hasattr(engine, "_draft_ms"):
             engine._draft_ms = []  # HEAD: enable the engine's own event timing as a cross-check
 
