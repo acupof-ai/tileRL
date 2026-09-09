@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sync + run a bench command on the pod, quiet-gated.
-# Usage: scripts/_pod_bench.sh 'PYTHONPATH=src python3 scripts/bench_smoke.py'
+# Usage: scripts/_pod_bench.sh 'PYTHONPATH=src python3 scripts/bench_b1_decode.py --build fused+graph --card 6'
 # Parallel runs: BENCH_GPUS=6 scripts/_pod_bench.sh '...' — gate + pin one GPU.
 set -euo pipefail
 BENCH_GPUS="${BENCH_GPUS:-6,7}"

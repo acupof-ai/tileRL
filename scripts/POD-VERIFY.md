@@ -207,7 +207,7 @@ that number was borrowed from. Matching Marlin's wall time needs 1.72 TB/s in
 tileRL units.
 
 Every older sweep in `scripts/` (`_sweep_gemv{,2,3}.py`, `_matrix_gemv.py`,
-`bench_gemv_gap.py` before this pass) declared block-**32** scales and still
+`bench_gemv_gap.py` — all deleted 2026-09-09, verdicts in `docs/experience`) declared block-**32** scales and still
 scored against 0.75 B/elem — a 1.2x overstatement that puts the *baseline* arm
 above a 1.30 TB/s bar before anything is tested. `bench_gemv_micro.py` builds
 block-16 weights and computes bytes from the tensors.
@@ -446,13 +446,11 @@ Close that in this order, cheapest first:
    per-op number in `docs/` is a 4-layer slice that was all-fp4, block-32 and
    epilogue-free, a mix that no longer exists. ~20 min on the already-loaded
    model, same detached-launch pattern.
-2. **fp8 GEMV roofline.** `scripts/bench_fp4_gemv.py` now prints an fp8 arm
-   beside the fp4 one (`bench_fp8_shapes`). The fp8 path is ~47% of the decode
-   weight stream and has no `%roof` number in any entry. Both arms now compute
-   bytes from the tensors instead of a per-elem constant — the old fp4 `%roof`
-   figures in `docs/experience` assumed 0.75 B/elem against block-32 weights
-   and are ~20% too high. Ratios (PRMT 0.851x, 55.4-vs-57) are unaffected;
-   absolute `%roof` across the two scales is not comparable.
+2. **fp8 GEMV roofline — vehicle deleted.** `scripts/bench_fp4_gemv.py` was
+   deleted with the one-shots (2026-09-09); the fp8 `%roof` number is still
+   unmeasured and needs a new collector if wanted. The old fp4 `%roof` figures
+   in `docs/experience` assumed 0.75 B/elem against block-32 weights and are
+   ~20% too high; ratios (PRMT 0.851x, 55.4-vs-57) are unaffected.
 3. **`.oscale` cost.** ~257 new epilogue nodes per decode tick, ~2-3% of the
    tick at ~2 µs/node. One timing pass with `oscale` forced to `None`
    (numerically wrong, perf-only) prices it in 2 minutes.
