@@ -27,6 +27,7 @@ from tilerl.engine import (
     BLOCK_TOKENS,
     BatchKv,
     Engine,
+    RequestFailed,
     SamplingParams,
     _restrict,
     _step_seed,
@@ -43,7 +44,15 @@ from tilerl.model import add_lora, build_random, fp4_param_keys, param_specs
 from tilerl.spec import DraftHead
 from tilerl.testing import RefBackend
 from tilerl.tokenizer import ByteTokenizer
-from tilerl.train import _training_kv, opd_loop, train_step
+from tilerl.train import (
+    _drain as _train_drain,
+)
+from tilerl.train import (
+    _training_kv,
+    group_advantages,
+    opd_loop,
+    train_step,
+)
 
 
 def _fp8_allocatable() -> bool:
@@ -155,6 +164,104 @@ def test_generate():
     assert 1 <= len(toks_a) <= 16
     assert toks_a == toks_b, "same seed must produce identical tokens"
     assert toks_a != toks_c, "different seed must produce different tokens"
+
+
+class _ScriptedEngine:
+    """Minimal engine for `_drain`: `poll` raises one scripted failure, then
+    reports every id finished with a one-token completion."""
+
+    def __init__(self, ids, dead_id=None, dead_reason=None):
+        self._ids = list(ids)
+        self._dead_id = dead_id
+        self._dead_reason = dead_reason
+        self._raised = False
+
+    def step(self):
+        pass
+
+    def poll(self):
+        if self._dead_id is not None and not self._raised:
+            self._raised = True
+            raise RequestFailed(self._dead_id, self._dead_reason, "scripted failure")
+        # The dead id never finishes: a failed request goes to _failed, not _finished.
+        out = {i: [100 + i] for i in self._ids if i != self._dead_id}
+        self._ids = []
+        return out
+
+
+def test_pool_exhaustion_fails_one_row_not_the_batch():
+    """6 blocks, two 33-token prompts: each prefill takes 3, so the pool is empty
+    when both rows need their 4th block at decode token 15. The row that cannot
+    allocate fails ALONE (reason=pool_exhausted); the other decodes its full 20
+    tokens, and a request admitted afterwards runs -- the engine and the pool
+    survived the row death.
+
+    Red before the fix: the allocation raised inside `_run_forward`, step()'s
+    handler failed EVERY running request, and the crash surfaced as a plain
+    RuntimeError out of step().
+    """
+    cfg = tiny()
+    engine = build_engine(
+        cfg, build_random(cfg, seed=7), get_backend(),
+        num_blocks=6, num_slots=4, max_batch=4, max_total_tokens=512,
+        prefix_store=NoPrefixStore(),
+    )
+    try:
+        prompt = np.random.default_rng(0).integers(3, 320, size=33).astype(np.int64)
+        id_a = engine.submit(prompt, SamplingParams(max_new_tokens=20, temperature=0.0, seed=1))
+        id_b = engine.submit(prompt, SamplingParams(max_new_tokens=20, temperature=0.0, seed=2))
+        done, failures = {}, []
+        for _ in range(512):
+            try:
+                engine.step()
+                done.update(engine.poll())
+            except RequestFailed as exc:
+                failures.append(exc)
+            if failures and id_b in done:
+                break
+        assert len(failures) == 1
+        assert failures[0].request_id == id_a
+        assert failures[0].reason == "pool_exhausted"
+        assert len(done[id_b]) == 20, "the survivor kept decoding after the row death"
+        # The dead row's blocks came back to the pool: a fresh request admits and runs.
+        id_c = engine.submit(prompt, SamplingParams(max_new_tokens=4, temperature=0.0, seed=3))
+        for _ in range(512):
+            engine.step()
+            done.update(engine.poll())
+            if id_c in done:
+                break
+        assert len(done[id_c]) == 4
+    finally:
+        engine.shutdown()
+
+
+def test_drain_marks_a_pool_dead_rollout_empty_and_the_live_mask_drops_it():
+    """A pool-exhaustion failure ends one rollout, not the step: `_drain` records
+    the dead id with an empty completion, `len(c) > 0` drops it from the live
+    mask, and `group_advantages` still produces signal on the three live rows.
+
+    Red before the fix: `_drain` had no catch, so poll()'s raise crashed the
+    whole training step -- the engine half of the fix alone only moved the crash.
+    """
+    ids = [0, 1, 2, 3]
+    done = _train_drain(_ScriptedEngine(ids, dead_id=1, dead_reason="pool_exhausted"), ids, "stub")
+    assert done[1] == []
+    assert all(len(done[i]) == 1 for i in (0, 2, 3))
+    comps = [done[i] for i in ids]
+    live = [len(c) > 0 for c in comps]
+    assert live == [True, False, True, True]
+    adv = group_advantages([1.0, 0.0, 0.0, 1.0], 4, live=live)
+    assert adv[1] == 0.0
+    assert np.count_nonzero(adv) == 3
+
+
+def test_drain_reraises_every_failure_class_but_pool_exhaustion():
+    """The catch is narrow by construction: a failure with any other reason
+    propagates. A broad catch (`except RequestFailed`) makes this red -- that is
+    the vacuous-pass shape, a real bug becoming a silently missing row."""
+    with pytest.raises(RequestFailed) as ei:
+        _train_drain(_ScriptedEngine([0, 1], dead_id=0, dead_reason="oom_kill"), [0, 1], "stub")
+    assert ei.value.reason == "oom_kill"
 
 
 def test_tokens_generated_equals_the_tokens_poll_returned():
