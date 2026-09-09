@@ -47,7 +47,7 @@ git grep -l "DataParallelEngine\|serve --devices" origin/main -- docs/experience
 
 删掉失去什么：多卡 serving。为什么不值：项目形状是一卡一进程（CLAUDE.md），README 头条数字全部单卡；一个手写转发层的成本是每个 seam 方法一次静默 400，而它的收益从来没被量过。
 
-删法：serve/gen 的 `--devices`（cli.py:1607、cli.py:1821）、parallel.py 的 DP 类、tests/dp_world4.py 一起删。**多卡若要回来，门槛是一个表面全等测试**：枚举 Engine 的方法集，断言 wrapper 全部转发，漏一个 CI 就红。没有这个测试，不要重建。
+删法：serve 的 `--devices`、parallel.py 的 DP 类一起删。**两个同名的东西不删**：`generate --devices` 是每卡一进程的 fan-out（替代路径本身，不是 wrapper）；`tests/dp_world4.py` 的 "dp" 是训练侧梯度平均（`cli._shard` + `train.train_step` + `Backend.dp_reduce`），守的是训练侧的门（mean 不是 sum、reduce 在 clip 之前、各 rank apply 顺序一致），和服务端副本的 DataParallelEngine 是两个机制——删掉它一个活着的机制就没有门了。**多卡 serving 若要回来，门槛是一个表面全等测试**：枚举 Engine 的方法集，断言 wrapper 全部转发，漏一个 CI 就红。没有这个测试，不要重建。
 
 ### D4 — `--patience-mode` raw（成本：零，9b 在删）
 

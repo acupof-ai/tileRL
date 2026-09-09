@@ -272,7 +272,6 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
     'serve': frozenset({
         '--blocks',
         '--depth',
-        '--devices',
         '--draft',
         '--dram-bytes',
         '--help',

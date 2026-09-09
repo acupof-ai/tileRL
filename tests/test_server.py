@@ -1043,55 +1043,6 @@ def test_max_tokens_is_clamped_not_refused(client, tmp_path, monkeypatch):
     assert r.json()["stop_reason"] in ("end_turn", "max_tokens", "tool_use")
 
 
-def test_the_clamp_survives_the_data_parallel_wrapper(tmp_path, monkeypatch):
-    """Same engine, same limits, wrapped and unwrapped — the answers must agree.
-
-    `messages.py` clamps max_tokens against `engine.limits.max_total_tokens` through
-    `getattr(engine, "limits", None)`. DataParallelEngine had no `limits`, so the
-    default 0 fired, the clamp went dead and the request went to the engine at its
-    asked-for 32000. Measured before the fix, one engine and one request:
-    plain Engine 200, DataParallelEngine 400 "request (32060 tokens) exceeds
-    max_total_tokens (512)" — `serve --devices` 400-ed every Claude Code turn.
-
-    Both arms, not just the wrapped one: a fix that broke the clamp everywhere would
-    make a one-arm test pass by making both 400.
-    """
-    import torch
-
-    from tilerl.parallel import DataParallelEngine
-
-    monkeypatch.setenv("TILERL_MESSAGES_RECORD", str(tmp_path / "dp.jsonl"))
-    body = {"model": "tiny", "max_tokens": 32000,
-            "messages": [{"role": "user", "content": "hi"}]}
-    #: The omitted-cap default calls `engine.room_for`, the second seam attribute the
-    #: wrapper has to forward. Without it `serve --devices` 500-ed on every request
-    #: that left max_tokens out -- the same defect as the missing `limits`, one route later.
-    omitted = {"model": "tiny", "stream": False,
-               "messages": [{"role": "user", "content": "hi"}]}
-    codes = {}
-    for arm in ("plain", "wrapped"):
-        e = _build_engine(seed=41)
-        engine = e if arm == "plain" else DataParallelEngine([e], [torch.device("cpu")])
-        e.run()
-        try:
-            with TestClient(create_app(engine, _ByteTokenizer(), model_name="tiny"),
-                            raise_server_exceptions=False) as c:
-                codes[arm] = c.post("/v1/messages", json=body).status_code
-                codes[f"{arm}/omitted"] = c.post("/v1/chat/completions",
-                                                 json=omitted).status_code
-        finally:
-            e.shutdown()
-    assert codes["plain"] == codes["wrapped"], (
-        f"the wrapper changed the answer: plain {codes['plain']}, wrapped "
-        f"{codes['wrapped']} — an engine attribute the shim reads is missing from "
-        f"DataParallelEngine, the shape of the `peek` gap")
-    assert codes["plain"] == 200, (
-        f"a clamped max_tokens must not 400: got {codes['plain']} on both arms, so "
-        f"the clamp is broken for every caller rather than only under --devices")
-    assert codes["plain/omitted"] == codes["wrapped/omitted"] == 200, (
-        f"an omitted max_tokens must be admitted through both: {codes}")
-
-
 def test_the_messages_clamp_honours_the_pool_not_only_the_context(tmp_path, monkeypatch):
     """A pool-bound engine must admit a 32000-token ask, the way Claude Code sends it.
 
@@ -1214,13 +1165,16 @@ def test_every_engine_the_routes_accept_implements_what_they_call():
     for and nothing else, so this enumerates instead — the names are read out of the route
     modules' own source, so a route that starts calling `engine.foo()` extends the required
     set without anyone remembering to add an arm here.
+
+    DataParallelEngine was deleted 2026-09-09 (its hand-written forwarding seam silently
+    missed a method six times in ten days). This gate stays: it enumerates the seam, and
+    any multi-card wrapper that comes back must be added to the instances below and pass —
+    that is the rebuild gate, written here so it is not re-litigated in a review.
     """
     import inspect
     import re
 
-    import torch
-
-    from tilerl import messages, parallel, responses, server
+    from tilerl import messages, responses, server
 
     called: set[str] = set()
     for mod in (server, messages, responses):
@@ -1241,8 +1195,8 @@ def test_every_engine_the_routes_accept_implements_what_they_call():
 
     # Instances, not classes: `Engine.limits` is assigned in __init__, so `hasattr` on the
     # class reports it missing and this gate would fail on a correct engine.
-    plain = _build_engine(seed=61)
-    for impl in (plain, parallel.DataParallelEngine([plain], [torch.device("cpu")])):
+    instances = [_build_engine(seed=61)]
+    for impl in instances:
         missing = sorted(n for n in called if not hasattr(impl, n))
         assert not missing, (
             f"{type(impl).__name__} is accepted by the routes but does not implement "
@@ -1287,42 +1241,6 @@ def test_serve_sizes_its_pools_from_the_flags_not_the_context():
         "model's 2048 blocks would report less, and that is a real capacity limit "
         "rather than a bug in the sizing"
     )
-
-
-def test_a_data_parallel_engine_can_stream():
-    """`serve --devices 0,1` wraps the engines in DataParallelEngine, which had no
-    `peek` -- and `_stream` calls `engine.peek(request_id)` unconditionally, while its
-    handler catches only (TimeoutError, RuntimeError). The SSE 200 header is already
-    sent by then, so the client got HTTP 200 with an empty body: measured before the
-    fix, 0 frames. Asserting frames rather than the status, because the status passes
-    against the bug; asserting behaviour rather than hasattr, because a `peek` that
-    returned the wrong thing would satisfy that.
-    """
-    import torch
-
-    from tilerl.parallel import DataParallelEngine
-
-    dev = torch.device("cpu")
-    engines = [_build_engine(seed=11), _build_engine(seed=12)]
-    dp = DataParallelEngine(engines, [dev, dev])
-    for e in engines:
-        e.run()
-    try:
-        app = create_app(dp, _ByteTokenizer())
-        with TestClient(app, raise_server_exceptions=False) as c:
-            body = {"model": "tiny", "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 8}
-            # submit/take are shared with the stream path, so a failure here is
-            # something other than the peek gap.
-            assert c.post("/v1/chat/completions", json={**body, "stream": False}).status_code == 200
-            r = c.post("/v1/chat/completions", json={**body, "stream": True})
-            assert r.text.count("data:") > 0, (
-                f"no SSE frames from a DataParallelEngine (status {r.status_code}, "
-                f"body {r.text[:200]!r}) -- the stream died mid-response")
-            assert "[DONE]" in r.text, f"stream never terminated: {r.text[-200:]!r}"
-    finally:
-        for e in engines:
-            e.shutdown()
 
 
 def test_a_stream_that_dies_mid_decode_does_not_look_like_success():

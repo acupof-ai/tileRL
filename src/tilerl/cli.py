@@ -147,11 +147,15 @@ def _shard(cfg, model, tp: int, backend, model_mod):
         tp_config(cfg, tp), shard_params(model.params, cfg, mesh.tp_rank, tp))
 
 
-def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16,
+def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
                   blocks=0, max_ctx=0, max_batch=8, ssd_path="", ssd_min_tokens=0,
                   dram_bytes=0, state_bytes=0, kv_fp8="", decode=None,
                   max_batched_tokens=0):
-    """Serving-size engine; ``devices`` replicates it across those CUDA indices.
+    """Serving-size engine on one card. Multi-card serving is one process per card
+    under CUDA_VISIBLE_DEVICES (see generate.py for the process-per-device pattern);
+    the in-process DataParallelEngine wrapper was deleted 2026-09-09 — its hand-written
+    forwarding seam silently missed a method six times in ten days (errors/2026-09-05
+    through 2026-09-07).
 
     ``max_ctx`` caps the served context; it still defaults to the model's own limit,
     which for the 27B is 262144 tokens = 275 GB of f32 KV, so it is now a CAP on the
@@ -191,20 +195,7 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
         kw["decode"] = decode
     if max_batched_tokens:
         kw["max_num_batched_tokens"] = max_batched_tokens
-    if not devices:
-        return engine_mod.build_engine(cfg, model, backend, **kw)
-
-    from tilerl_kernels.backend import Backend, resolve_target
-
-    from .parallel import DataParallelEngine
-
-    def make(d, **kwargs):
-        # One Backend per replica: it binds the current CUDA device, so building it here is
-        # what puts each replica's pools on its own card.
-        b = Backend(resolve_target())
-        return engine_mod.build_engine(cfg, model, b, **kwargs)
-
-    return DataParallelEngine.build(devices, make, **kw)
+    return engine_mod.build_engine(cfg, model, backend, **kw)
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -222,7 +213,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         draft = load_draft(model, args.draft)
     # Before the engine: it takes the decode for stop sequences.
     tokenizer = _qwen38_tokenizer() if args.model == "qwen38-27b" else get_tokenizer(None)
-    engine = _build_engine(cfg, model, backend, devices=args.devices,
+    engine = _build_engine(cfg, model, backend,
                            draft=draft, depth=args.depth, slots=args.slots,
                            blocks=args.blocks, max_ctx=args.max_ctx,
                            max_batch=args.max_batch, ssd_path=args.ssd_path,
@@ -1664,12 +1655,6 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.add_argument("--model", choices=MODEL_NAMES, default="tiny")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
-    p_serve.add_argument("--devices", default="",
-                         help="replicate inside ONE process across these CUDA indices, e.g. 0,1,2,3 or 0-3. "
-                              "A CUDA fault in one replica is sticky for the whole process and takes "
-                              "the others down while HTTP keeps answering; for independent endpoints "
-                              "run one process per card under CUDA_VISIBLE_DEVICES instead.",
-                         type=lambda v: _devices(v) if v else [])
     p_serve.add_argument("--draft", help="MTP/NextN head safetensors: speculative decode. For "
                                         "Qwen3.8-27B-NVFP4 the mtp.* keys all live in "
                                         "model-00018-of-00018.safetensors, so pass that shard.")
