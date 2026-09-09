@@ -242,10 +242,8 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
     @app.get("/health")
     def health() -> dict:
         # "ok" was a literal, so an engine whose stats() raises answered the same as a
-        # healthy one. Loop liveness is deliberately NOT checked: it would need
-        # engine._thread, which DataParallelEngine lacks, so the check would pass
-        # vacuously on --devices -- the shape of the peek gap. That wants a liveness
-        # method on the engine.
+        # healthy one. Loop liveness is deliberately NOT checked via engine._thread:
+        # that wants a liveness method on the engine, not a private attribute read.
         try:
             stats = engine.stats()
         except Exception as exc:
@@ -429,9 +427,10 @@ def create_app(engine: Any, tokenizer: Tokenizer, model_name: str = "tilerl") ->
             # The 200 header left before this generator ran, so an escaping exception
             # reaches the client as 200 with zero frames and no [DONE] -- a success
             # status over a failed request, which reads as an empty reply. Measured:
-            # DataParallelEngine had no `peek`, and `serve --devices` returned exactly
-            # that. Logged as well as framed, because a tidy error frame is easier to
-            # ignore than silence and this branch means a defect, not a busy engine.
+            # an engine without `peek` returned exactly that
+            # (errors/2026-09-05-the-sse-handler-covered-two-of-six). Logged as well as
+            # framed, because a tidy error frame is easier to ignore than silence and
+            # this branch means a defect, not a busy engine.
             logging.exception("stream for request %s died", request_id)
             yield "error", {"message": f"{type(exc).__name__}: {exc}",
                             "type": "internal_error"}, seen

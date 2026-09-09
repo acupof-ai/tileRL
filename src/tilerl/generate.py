@@ -1,8 +1,8 @@
 """Offline batch generation across N devices, one PROCESS per device.
 
-A process per device, not :class:`~tilerl.parallel.DataParallelEngine`: that
-wrapper runs N CUDA contexts in one interpreter and the Python half of every
-tick serialises on the GIL. Eight processes measured 7.54x on 8 H20s
+One process per device: an in-process wrapper over N CUDA contexts serialises
+the Python half of every tick on the GIL (the deleted DataParallelEngine,
+2026-09-09). Eight processes measured 7.54x on 8 H20s
 (wins/2026-08-29-data-parallel-scales.md). Each worker owns a disjoint slice
 of the prompts and writes its own file: no queue, no shared state.
 
