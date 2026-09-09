@@ -1580,8 +1580,10 @@ def test_the_fp8_kv_pool_generates_what_the_bf16_pool_does():
     want, ref = gen(None)
     got, eng = gen(torch.float8_e4m3fn)
     assert eng._kv.k_pool.dtype is torch.float8_e4m3fn, "the flag did not reach the pool"
+    # read the pool's own count: build_engine adds a pad block when the decode
+    # graph is on, so 16 asked becomes 17 built
     assert eng._kv.k_scale.shape == (
-        len(cfg.full_attn_layers), 16, cfg.num_kv_heads, BLOCK_TOKENS
+        len(cfg.full_attn_layers), eng._kv.num_blocks, cfg.num_kv_heads, BLOCK_TOKENS
     ), (
         f"scale is {tuple(eng._kv.k_scale.shape)}, not [planes, blocks, kv_heads, tokens]"
     )
