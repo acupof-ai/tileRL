@@ -66,6 +66,7 @@ dev = [
     "websockets>=17.1",
     "openai>=3.8.0",
     "anthropic>=1.4.0",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.ruff]
