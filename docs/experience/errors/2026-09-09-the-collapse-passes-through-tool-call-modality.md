@@ -1,7 +1,7 @@
 # The collapse passes through tool-call modality before going empty
 
 Date: 2026-09-09
-Status: closed (observation; no fix)
+Status: open (next: the trigger — first empty completions at step 32; the mask below explains absorption, not onset)
 
 ## Context
 
@@ -25,20 +25,47 @@ The modality drift is a one-step transition state between "mixed empty"
 
 ## Root cause
 
-Hypothesis, not measured: the policy under RL pressure drifts into a mode the
-base model knows (Qwen3.8's chat template has tool-call modes; `<tool_call>`
-is single token 248058). The reward matcher only reads boxed answers, so
-malformed tool-call text scores 0; those rollouts draw negative advantage,
-which reinforces the drift toward the zero-reward absorbing state (empty
-output). The step-28 row shows the matcher is not fully blind to the modality
-— a well-formed wrapper around a boxed answer still scores — so the
-self-reinforcement claim needs the advantage signs, which were not checked.
+The absorption into empty outputs is the advantage mask, measured and
+code-verified. The trigger is still open.
+
+`group_advantages` masks zero-length completions out of the group statistic:
+they set neither the mean nor the std and get advantage 0 (the `live` mask,
+`train.py:282`; call site passes `live=[len(c) > 0 for c in comps]`). The
+measured signs, steps 28-36:
+
+- **step 32** — 2 empty, 4 wrong-text, 2 correct. Empties +0.000, wrong-text
+  -0.707, correct +1.414. **Empty beats wrong-text at the margin**: the
+  objective ranks producing nothing above producing a wrong answer.
+- **step 33** — 7 empty, 1 correct. The correct row is the only live one, so
+  the live std is 0 and its advantage is +0.000 too. A mixed-reward group is
+  silent because the mask isolated the one row that could carry signal.
+- **step 35** — 5 tool-call fragments (live, all reward 0) + 3 empty. All
+  +0.000: zero variance among the live rows.
+
+So every step that produces some empties makes "produce nothing" the
+best-advantaged action in hindsight, and the group goes silent once empties
+dominate. The mask is the absorbing state.
+
+What this does not explain is the **onset**. The first empties appear at step
+32, and the mask is identical in the surviving run. Why this trajectory
+started producing empties is the open question — the step-3 divergence (same
+seed, different sha, diverging before any eval) and the check-3 / A-B
+experiments address it.
+
+The positive-reinforcement path — a tool-call row scoring 1.0 through the
+modality-blind matcher and then drawing positive advantage — never fired
+after step 28. Step 28's tool-call row sat in an all-correct group (advantage
+0); every later fragment scored 0.
 
 ## Fix
 
 None. Diagnostic value: tool-call fragments in rollouts are an early-warning
 signature of an in-progress empty-output collapse, appearing one step before
 the curve moves (step 35 fragments, curve 68 at step 35 vs 86 at step 30).
+They are cheap to detect in rollout token ids: `<tool_call>` is a single
+token, id 248058 (checked on the pod with
+`AutoTokenizer.from_pretrained(TILERL_QWEN38_SOURCE).encode("<tool_call>")`
+→ `[248058]`).
 
 ## Rule
 
