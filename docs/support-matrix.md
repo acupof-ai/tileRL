@@ -146,7 +146,7 @@ cell**: both cells register the bf16 and fp8 makers, and the pool's dtype picks 
 The scale is per `(block, head, token)` because the launch shape allows no coarser
 reduction, and `attn_prep_fp8` takes its K amax post-RoPE — a rotation raises the
 per-element absmax up to 1.383x, enough to saturate e4m3 against a pre-RoPE scale
-(`docs/design-fp8-kv.md`). sm70 refuses rather than falling back: its fused
+(`docs/experience/wins/2026-09-07-fp8-kv-pool-per-token-scales.md`). sm70 refuses rather than falling back: its fused
 `write_tokens_f32` has no fp8 twin, so `build_engine` raises instead of dropping
 writes into a dequantized copy.
 

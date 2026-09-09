@@ -66,7 +66,7 @@ re-reading against 26.1%, not 54.4%.
 
 ### The GDN port's ceiling moved because the backward was optimized out from under it
 
-`docs/design-gdn-backward-port.md:11` prices the port as `backward_secs` 23.194 → 15.774,
+the GDN backward port design prices the port as `backward_secs` 23.194 → 15.774,
 **1.470x**, and calls that "on the step". It is a ratio on the **bucket** — the two were
 close enough to conflate when the bucket was 54% of the step, and are not now.
 

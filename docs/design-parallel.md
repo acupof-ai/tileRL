@@ -12,7 +12,7 @@ Not greenfield, and the design has to say what it is *adding*:
 | weight sharding, column/row split tables, fp4/fp8 alignment checks | `tensor_parallel.py` |
 | `pad_vocab`, `kv_replicas`, `tp_config` | `tensor_parallel.py:59`, `:65`, `:79` |
 | row-parallel all-reduce in the forward | `model.py:191` (`_add_via`) |
-| data-parallel engines, one per card | `parallel.py` |
+| data-parallel engines, one per card | deleted in #399 (`DataParallelEngine` / `parallel.py`) — this page is about training-side TP/CP/SP, not the serving wrapper |
 | NCCL cost: **20.6 µs per call, flat 20 KB → 1.3 MB** | [measured](experience/wins/2026-09-07-the-nccl-floor-was-measured-a-week-early.md) |
 
 **The backward landed in #115.** `_BWD` (`autograd.py:245`) now registers

@@ -257,8 +257,8 @@
     that simply does not predict. Acceptance is 3.34 tokens per forward, and drafted-token rank
     inside the trunk's own ordering is top-1 96.8%.</p>
     <p><b>Structurally, the tick is 88% GPU-bound, so there is little for the host to give
-    back.</b> <code>_draft_step</code> does run outside the captured graph
-    (<code>engine.py:836</code>), but per-kernel attribution puts <b>58.5 ms of GPU-busy in a
+    back.</b> <code>_draft_step_timed</code> does run outside the captured graph,
+    but per-kernel attribution puts <b>58.5 ms of GPU-busy in a
     66.46 ms tick</b> — capturing <em>every</em> remaining launch caps at 1.14×, and 71% of that
     GPU time is a single kernel (<code>linear_fp4_gemv_sm70_m</code>, 332 launches × 125 µs =
     41.49 ms) which a graph replays at the same speed. Rejected.</p>
@@ -326,7 +326,7 @@
     launch-overhead one. The 332 launches are ~305 for the trunk's verify plus ~9 per draft
     forward &times; 3.</p>
     <p class="fine">Second-largest is not model math: 252 launches of torch&rsquo;s
-    <code>index_elementwise</code>, the chain bookkeeping in <code>_draft_step</code> and
+    <code>index_elementwise</code>, the chain bookkeeping in <code>_draft_step_timed</code> and
     <code>_verify</code>. Smaller than the GEMV work but larger than the GDN scan, and removable
     without restructuring anything.</p>
     <p class="fine">The profiler that produced this table reads 121.5 ms/tick where the real tick

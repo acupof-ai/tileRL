@@ -1,5 +1,10 @@
 # Row 50 — SSD read path: approach
 
+> **SUPERSEDED 2026-09-09.** The async-with-deadline design proposed here was not
+> implemented as designed. The read path that shipped runs the `torch.load` off-tick
+> in a daemon reader thread (`kv_cache.py`), not inside `step()` under the lock.
+> See [errors/2026-09-09-ssd-read-path-proposed-vs-landed.md](experience/errors/2026-09-09-ssd-read-path-proposed-vs-landed.md).
+
 From `origin/main` at `d4fc973`. No code. Numbers marked **measured** are read off
 an entry; the rest are derived and named as such.
 

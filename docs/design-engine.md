@@ -10,7 +10,7 @@ unchanged — they are the contract.
 | Frontend | `server.py` | OpenAI HTTP/SSE → `Engine.submit` / `Engine.poll`. Knows tokens, not tensors. |
 | Scheduling | `engine.py` | `submit(input_ids, params) -> req_id`, `poll() -> {req_id: tokens}`, `StepLimits`. Continuous batching, one forward per tick. |
 | Model | `model.py` | `load_hf` (every checkpoint format) + forward. Calls backend ops only. |
-| Adapter | `ops/backend.py` | `(precision, arch) → kernels` registry — see [design-kernels.md](design-kernels.md). |
+| Adapter | `packages/tilerl-kernels/src/tilerl_kernels/backend.py` | `(precision, arch) → kernels` registry — see [design-kernels.md](design-kernels.md). |
 | Storage | `kv_cache.py` | `PagedKvPool` (paged blocks, COW on shared prefix) + `LinearStatePool` (GDN recurrent state) + rolling-hash prefix cache. |
 
 Training shares the stack: `train.py` drives the same `model.py` forward
@@ -36,8 +36,9 @@ through the hand-written tape (`autograd.py`), same backend ops. One runtime.
 - **Storage owns three things**: paged KV, GDN state, prefix cache. The engine
   asks for prefix hits and block tables; it never touches KV memory directly.
 - **The model is backend-neutral**: no TileLang/torch calls above `ops/`.
-- **Prefix sharing is COW, not copy**: shared blocks are read-only until a
-  sequence diverges (`cow_for_append`).
+- **Prefix sharing is read-only, not COW**: shared blocks are never modified
+  after publishing; `PrefixStore.insert` enforces that no block is written
+  after sharing.
 
 ## Physics (what the design must satisfy)
 
