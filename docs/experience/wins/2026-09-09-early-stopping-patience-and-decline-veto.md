@@ -42,9 +42,18 @@ for the seed-1 verdict on whether the collapse reproduces.
    1.9x wider and never fires on a slow rise, and stopping with no width at all decides on
    noise. `patience=0` never asks, so it never refuses.
 
-## Patience mode raw (PR following cd06b2a)
+## Patience mode raw
 
-`--patience-mode raw` compares raw scores (strict >) instead of the 2xSE ruler. It exists
+`--patience-mode raw` was removed on 2026-09-09. `significant` (the 2xSE paired
+width ruler) is the only mode. The raw-mode risks documented below are the reason
+for the removal: at λ>0 the training reward is length-aware, and a raw-score ruler
+on a noisy small-n curve resets patience on sub-floor gains. The historical
+measurements are retained below for the record.
+
+<details>
+<summary>Original raw-mode documentation (removed 2026-09-09)</summary>
+
+`--patience-mode raw` compared raw scores (strict >) instead of the 2xSE ruler. It existed
 because the eval is 62% of the run's wall time (seed 1: 3280s of 5249.7s across four curve
 evals), and shrinking the curve subset to make finer grids affordable breaks the
 significant ruler: at n=100 the paired 2xSE is **5.6-7.4 pt** (subsampled, measured)
@@ -72,6 +81,8 @@ The decline veto and the startup/mid-run refusal are unchanged in raw mode: raw 
 veto, the veto needs the paired width, and a run that cannot produce it silently loses
 collapse protection — the exact failure the refusal exists for.
 
+</details>
+
 ## Correctness evidence: negative controls
 
 `python -m tilerl.ledger` — four cells (plateau / plateau-then-rise / collapse /
@@ -83,19 +94,13 @@ missing-width refusal), each with a mutation verified red and reverted green:
 | 2 | stops on every new best | red — the plateau-then-rise cell stops before the rise |
 | 3 | patience never counts (`stale` frozen) | red — the plateau cell never stops |
 | 4 | refusal never raises (`if False: raise SystemExit`) | red — the missing-width cell runs to completion instead of refusing |
-| 5 | raw ruler degraded to significant (`mode == "raw" and False`) | red — the gradual-rise cell stops early in raw too; the modes no longer differ |
 
 The cells pin all three cases: the stop-worthy stops, the not-stop-worthy does not, and
-the immediately-stop-worthy is not slow. Cells E/F pin the modes: a gradual rise at small
-n stops in significant and runs on in raw (why raw exists), and a one-question gain resets
-patience and drifts best in raw but not significant (raw's risk, executable).
+the immediately-stop-worthy is not slow.
 
 ## What the pod must show
 
 A run with `--patience 1 --eval-every 5` on the GSM8K recipe stops at step 10 (the first
 non-improving point after the step-5 peak), ships `adapter-best.safetensors` at step 5,
 and the manifest's `early_stopped.reason` is `"patience"`. A collapse-shaped run stops at
-the collapse point with `reason: "decline"` and `kept_step` at the pre-collapse peak. A
-small-curve run (`--eval-curve-n 100 --patience 1 --patience-mode raw`) stops at the first
-flat point keeping the step-5 peak, where the same run in significant mode stops at the
-second point regardless of shape.
+the collapse point with `reason: "decline"` and `kept_step` at the pre-collapse peak.
