@@ -121,6 +121,14 @@ accepted value, or this measurement on first sight. A script that derives its
 build from its own flags passes it to `record_common`; a script that cannot see
 it leaves `--build` required.
 
+`add_record_args(ap, client_side=True)` marks a collector that measures a
+remote server over HTTP. `--device-name` then has no default and
+`record_common` raises without it: a client cannot see the server's device, and
+a default here is a population lie — a cpu run labeled H20 enters every
+device-grouped view and every measured-best comparison
+(`errors/2026-09-09-client-collector-defaulted-server-device.md`). Defaults are
+only for things the collector itself knows.
+
 ## Views
 
 Every view prints a coverage line (`N metrics declared, M measured`; `--table`
