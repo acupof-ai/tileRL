@@ -8,6 +8,7 @@ import json
 import re
 import sys
 
+#: Same rules as src/tilerl/engine.py — if you change these, change both.
 OURS = re.compile(r"^\s*(tile[_-]?rl|rl[_-]?team)\b", re.IGNORECASE)
 THEIRS = re.compile(r"^\s*(granted\b|\d{4}-\d{2}-\d{2})", re.IGNORECASE)
 

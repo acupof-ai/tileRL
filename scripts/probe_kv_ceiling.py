@@ -31,7 +31,7 @@ from tilerl_kernels.backend import get_backend
 
 from tilerl import cli
 from tilerl.cli import _build_model
-from tilerl.engine import SamplingParams, build_engine
+from tilerl.engine import SamplingParams, build_engine, card_guard
 from tilerl.kv_cache import BLOCK_TOKENS
 from tilerl.spec import load_draft
 
@@ -68,6 +68,7 @@ def main() -> None:
     # Draft BEFORE materialize, the order cli.py serves in: materialize rewrites the
     # fp4 lm_head into wq/scale/oscale, and read_head_params then rejects all three.
     draft = load_draft(model, args.draft) if args.draft else None
+    card_guard()
     model.params = backend.materialize(model.params)
     mem("after load")
     if args.reclaim:

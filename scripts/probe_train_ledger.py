@@ -17,6 +17,7 @@ from tilerl_kernels.backend import get_backend
 
 from tilerl.autograd import Adafactor, AdamW, RecordingBackend, Tape
 from tilerl.config import qwen38_27b
+from tilerl.engine import card_guard
 from tilerl.model import add_lora, drop_quantized, load_hf
 from tilerl.train import _training_kv
 
@@ -126,6 +127,7 @@ def main() -> None:
     if args.full:
         drop_quantized(model)
     p = mark("load_hf", p)
+    card_guard()
     model.params = b.materialize(model.params)
     p = mark("materialize", p)
     trainable = None if args.full else add_lora(model, rank=16)

@@ -45,6 +45,7 @@ def main() -> None:
 
     from tilerl import autograd
     from tilerl.autograd import AdamW
+    from tilerl.engine import card_guard
     from tilerl.train import rl_step
 
     if args.no_recompute:
@@ -58,6 +59,7 @@ def main() -> None:
 
         cfg = qwen38_27b()
         model = load_hf(cfg, args.source, fuse_projections=False, num_layers=args.layers)
+        card_guard()
         model.params = backend.materialize(model.params)
         trainable = add_lora(model, rank=args.lora_rank)
     else:

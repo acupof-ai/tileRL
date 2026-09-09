@@ -15,6 +15,7 @@ import torch.distributed as dist
 from tilerl_kernels.backend import Backend, resolve_target
 
 from tilerl.config import tiny
+from tilerl.engine import card_guard
 from tilerl.model import build_random
 from tilerl.tensor_parallel import shard_params, tp_config
 
@@ -24,6 +25,7 @@ def _logits(cfg, params, backend, ids):
     from tilerl.train import _training_kv
 
     model = Model(cfg, params)
+    card_guard()
     model.params = backend.materialize(model.params)
     kv = _training_kv(model, 1, len(ids), device=backend.device)
     return model.forward([ids], torch.arange(len(ids)), kv, backend)

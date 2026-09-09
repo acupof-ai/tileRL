@@ -16,6 +16,7 @@ import torch
 from tilerl_kernels.backend import Backend, resolve_target
 
 from tilerl.config import qwen38_27b
+from tilerl.engine import card_guard
 from tilerl.model import load_hf
 from tilerl.prompt import render_chat
 from tilerl.spec import load_draft
@@ -36,6 +37,7 @@ PROMPTS = [
 def main() -> int:
     backend = Backend(resolve_target())
     model = load_hf(qwen38_27b(), SRC, fuse_projections=True)
+    card_guard()
     model.params = backend.materialize(model.params)
     head = load_draft(model, os.path.join(DRAFT, "model.safetensors"))
     head.params = backend.materialize(head.params)
