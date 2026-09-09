@@ -7,74 +7,192 @@
   },
   "metrics": {
     "prefill_tok_s": {
-      "unit": "tok/s", "direction": "+", "weight": 0.94,
-      "shape": ["ctx"],
-      "why": "prefill is 294/314.33 s of a real agent turn"
+      "unit": "tok/s",
+      "direction": "+",
+      "weight": 0.94,
+      "shape": [
+        "ctx"
+      ],
+      "why": "prefill is 294/314.33 s of a real agent turn",
+      "collector": {
+        "script": "scripts/bench_prefill.py",
+        "required": [
+          "--source"
+        ]
+      }
     },
     "decode_tok_s": {
-      "unit": "tok/s", "direction": "+", "weight": 0.06,
-      "shape": ["batch", "ctx"],
-      "why": "decode is 20/314.33 s of a real agent turn"
+      "unit": "tok/s",
+      "direction": "+",
+      "weight": 0.06,
+      "shape": [
+        "batch",
+        "ctx"
+      ],
+      "why": "decode is 20/314.33 s of a real agent turn",
+      "collector": {
+        "script": "scripts/bench_b1_decode.py",
+        "required": [
+          "--build",
+          "--card"
+        ]
+      }
     },
     "decode_agg_tok_s": {
-      "unit": "tok/s", "direction": "+", "weight": 0.06,
-      "shape": ["batch", "ctx"],
-      "why": "decode is 20/314.33 s of a real agent turn"
+      "unit": "tok/s",
+      "direction": "+",
+      "weight": 0.06,
+      "shape": [
+        "batch",
+        "ctx"
+      ],
+      "why": "decode is 20/314.33 s of a real agent turn",
+      "collector": {
+        "script": "scripts/bench_batch_decode.py",
+        "required": [
+          "source"
+        ]
+      }
     },
     "chat_turn_wall_s": {
-      "unit": "s", "direction": "-", "weight": 0.94,
-      "shape": ["turn", "prompt_tokens"],
-      "why": "the turn wall is the 314.33 s denominator itself; reuse moves it 19x"
+      "unit": "s",
+      "direction": "-",
+      "weight": 0.94,
+      "shape": [
+        "turn",
+        "prompt_tokens"
+      ],
+      "why": "the turn wall is the 314.33 s denominator itself; reuse moves it 19x",
+      "collector": {
+        "script": "scripts/bench_chat_cold_warm.py",
+        "required": [
+          "--arm",
+          "--build",
+          "--device-name"
+        ]
+      }
     },
     "prefix_hits": {
-      "unit": "hits", "direction": "+", "weight": 0.0,
-      "shape": ["turn"],
-      "why": "instrument row for the reuse view, not a lever itself"
+      "unit": "hits",
+      "direction": "+",
+      "weight": 0.0,
+      "shape": [
+        "turn"
+      ],
+      "why": "instrument row for the reuse view, not a lever itself",
+      "collector": {
+        "script": "scripts/bench_chat_cold_warm.py",
+        "required": [
+          "--arm",
+          "--build",
+          "--device-name"
+        ]
+      }
     },
     "ssd_restart_speedup": {
-      "unit": "ratio", "direction": "+", "weight": 0.94,
-      "shape": ["prompt_tokens"],
-      "why": "a restart re-pays the prefill 94%; the tier is what avoids it"
+      "unit": "ratio",
+      "direction": "+",
+      "weight": 0.94,
+      "shape": [
+        "prompt_tokens"
+      ],
+      "why": "a restart re-pays the prefill 94%; the tier is what avoids it",
+      "collector": {
+        "script": "scripts/bench_ssd_restart.py",
+        "required": []
+      }
     },
     "train_step_tok_s": {
-      "unit": "tok/s", "direction": "+", "weight": 0.5,
-      "shape": ["batch", "ctx"],
+      "unit": "tok/s",
+      "direction": "+",
+      "weight": 0.5,
+      "shape": [
+        "batch",
+        "ctx"
+      ],
       "why": "seconds_per_step of time_to_score = steps x seconds; the split is unmeasured, so 0.5 until it is"
     },
     "gsm8k_pct": {
-      "unit": "%", "direction": "+", "weight": 0.94,
-      "shape": ["steps"],
-      "why": "the RL line's acceptance verdict; the README's headline training number (89.6 to 94.8)"
+      "unit": "%",
+      "direction": "+",
+      "weight": 0.94,
+      "shape": [
+        "steps"
+      ],
+      "why": "the RL line's acceptance verdict; the README's headline training number (89.6 to 94.8)",
+      "collector": null,
+      "why_no_collector": "no `tilerl eval` subcommand; only observable as a training side product (_train_adapters). Deferred until the standalone eval arm exists"
     },
     "rollout_tokens": {
-      "unit": "tokens", "direction": "-", "weight": 0.5,
-      "shape": ["steps"],
-      "why": "mean completion tokens per GSM8K problem — the sample-efficiency operand, n-independent by construction. tokens/correct is the view rollout_tokens / gsm8k_pct, never stored"
+      "unit": "tokens",
+      "direction": "-",
+      "weight": 0.5,
+      "shape": [
+        "steps"
+      ],
+      "why": "mean completion tokens per GSM8K problem \u2014 the sample-efficiency operand, n-independent by construction. tokens/correct is the view rollout_tokens / gsm8k_pct, never stored"
     },
     "mmlu_pct": {
-      "unit": "%", "direction": "+", "weight": 0.0,
-      "shape": ["n"],
+      "unit": "%",
+      "direction": "+",
+      "weight": 0.0,
+      "shape": [
+        "n"
+      ],
       "why": "correctness floor, not a speed lever"
     },
     "spec_goodput_ratio": {
-      "unit": "ratio", "direction": "+", "weight": 0.06,
-      "shape": ["batch", "depth"],
-      "why": "decode-family; a guard row after the verdict flipped three times"
+      "unit": "ratio",
+      "direction": "+",
+      "weight": 0.06,
+      "shape": [
+        "batch",
+        "depth"
+      ],
+      "why": "decode-family; a guard row after the verdict flipped three times",
+      "collector": {
+        "script": "scripts/bench_ctx_decode.py",
+        "required": [
+          "--source"
+        ]
+      }
     },
     "kernel_ms": {
-      "unit": "ms", "direction": "-", "weight": 0.0,
-      "shape": ["kernel"],
+      "unit": "ms",
+      "direction": "-",
+      "weight": 0.0,
+      "shape": [
+        "kernel"
+      ],
       "why": "feeds the engine-level rows; micro, not a lever itself"
     },
     "ppl": {
-      "unit": "ppl", "direction": "-", "weight": 0.0,
-      "shape": ["n"],
-      "why": "quality signal beside mmlu_pct"
+      "unit": "ppl",
+      "direction": "-",
+      "weight": 0.0,
+      "shape": [
+        "n"
+      ],
+      "why": "quality signal beside mmlu_pct",
+      "collector": {
+        "script": "scripts/bench_c4_ppl.py",
+        "required": [
+          "--source"
+        ]
+      }
     },
     "request_overhead_ms": {
-      "unit": "ms", "direction": "-", "weight": 0.0,
-      "shape": ["route"],
-      "why": "per-request HTTP+render+parse over a canned engine; not the agent-turn wall clock (that is chat_turn_wall_s), so weight 0 until it is shown to move the turn"
+      "unit": "ms",
+      "direction": "-",
+      "weight": 0.0,
+      "shape": [
+        "route"
+      ],
+      "why": "per-request HTTP+render+parse over a canned engine; not the agent-turn wall clock (that is chat_turn_wall_s), so weight 0 until it is shown to move the turn",
+      "collector": {
+        "script": "scripts/bench_api_routes.py",
+        "required": []
+      }
     }
   }
 }

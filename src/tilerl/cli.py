@@ -1504,7 +1504,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 
 def cmd_bench(args: argparse.Namespace) -> None:
-    views = [f"--{v}" for v in ("table", "readme", "regress", "questions")
+    views = [f"--{v}" for v in ("table", "readme", "regress", "questions", "collectors")
              if getattr(args, v, False)]
     if views or args.suite:
         import subprocess
@@ -1520,6 +1520,20 @@ def cmd_bench(args: argparse.Namespace) -> None:
         if args.batches:
             cmd += ["--batches", args.batches]
         sys.exit(subprocess.call(cmd))
+
+    if args.name:
+        import json
+        import subprocess
+
+        root = Path(__file__).resolve().parent.parent.parent
+        reg = json.loads((root / "docs" / "bench-metrics.json").read_text())
+        m = reg["metrics"].get(args.name)
+        c = (m or {}).get("collector")
+        if not c:
+            why = (m or {}).get("why_no_collector", "no collector registered")
+            raise SystemExit(f"no collector for {args.name!r}: {why}")
+        sys.exit(subprocess.call(
+            [sys.executable, str(root / c["script"]), *args.collector_args]))
 
     import torch
     from tilerl_kernels.backend import get_backend
@@ -1854,9 +1868,13 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_bench.add_argument("--source", default=None, help="27B checkpoint dir (harness GPU suites)")
     p_bench.add_argument("--gpu", type=int, default=None, help="GPU index (harness)")
     p_bench.add_argument("--batches", default=None, help="harness decode batch sizes, e.g. 1,8")
-    for v in ("table", "readme", "regress", "questions"):
+    for v in ("table", "readme", "regress", "questions", "collectors"):
         p_bench.add_argument(f"--{v}", action="store_true",
                              help=f"bench view: {v} from the bench store, no GPU")
+    p_bench.add_argument("name", nargs="?",
+                         help="metric name: run its registered collector "
+                              "(docs/bench-metrics.json), remaining args pass through")
+    p_bench.add_argument("collector_args", nargs=argparse.REMAINDER)
     p_bench.set_defaults(func=cmd_bench)
 
     p_gen = sub.add_parser(

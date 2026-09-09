@@ -95,3 +95,25 @@ def test_client_side_collector_cannot_default_the_server_device():
 
     ok = ap.parse_args(["--build", "eager", "--target", "cpu", "--device-name", "CPU"])
     assert benchrec.record_common(ok)["device"]["name"] == "CPU"
+
+
+def test_every_registered_collector_exists_and_the_094_metrics_have_one():
+    """The collector field is the metric -> script map `tilerl bench <name>` dispatches
+    on. A renamed script must fail CI, and a weight-0.94 metric with no collector is
+    the batch queue, not an oversight -- gsm8k_pct excepted, with its deferral recorded
+    in why_no_collector."""
+    import json
+
+    root = Path(__file__).resolve().parents[1]
+    reg = json.loads((root / "docs" / "bench-metrics.json").read_text())["metrics"]
+    for name, m in reg.items():
+        c = m.get("collector")
+        if c is None:
+            continue
+        assert (root / c["script"]).is_file(), (
+            f"{name} points at {c['script']}, which does not exist")
+    for name, m in reg.items():
+        if m["weight"] >= 0.94:
+            assert m.get("collector") or m.get("why_no_collector"), (
+                f"{name} has weight {m['weight']} and neither a collector nor a "
+                "why_no_collector -- it is neither runnable nor a recorded deferral")
