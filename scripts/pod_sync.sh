@@ -23,6 +23,9 @@ POD_NAME="${POD_NAME:-sglang-test}"
 # this tree's copy, so a failed pull silently drops any row the pod raised. No `|| true`:
 # the sync aborts instead. SKIP_BASELINE_PULL=1 stays the deliberate overwrite.
 [ "${SKIP_BASELINE_PULL:-0}" = 1 ] || python3 "$ROOT/scripts/baseline.py" pull >/dev/null
+# Side effect: pull leaves bench-baseline.json modified in this tree, so the next
+# benchrec record is stamped dirty=true. Do not commit that file -- it is other
+# sessions' data; restore it with git checkout after the run.
 # the pod is not a git repo: stamp HEAD so bench rows carry provenance. Write only when
 # git succeeded: `git ... > stamp || true` truncates the file before git runs, so a
 # failure left it empty and bench_harness read empty as a blank commit, not "unknown".
