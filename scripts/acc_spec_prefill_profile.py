@@ -17,9 +17,12 @@ _draft_ms — two independent instruments that must agree.
 Cross-validation (must hold at BOTH shas or the instrument is fixed first):
   1. wall (one sync pair around generate)
   2. prefill + draft + decode + enc + detok buckets close to wall within 5%
-  3. decode / decode_forwards vs the directly-timed W=8 tick
-     (43.52 ms at 09657c0, 41.96 at HEAD) within 5% — a remainder-derived
-     number only stands with a direct-measurement control.
+  3. decode / decode_ticks is the direct W=8 tick measurement (host span of
+     _run_forward on decode ticks, GPU drained by the graph replay)
+
+Provenance: benchrec git_commit/git_dirty print in the header, so a run's tree
+is checkable at a glance (the 2026-09-09 contamination: a tree labelled
+09657c0 was byte-identical to HEAD).
 
     CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/acc_spec_prefill_profile.py \
@@ -162,9 +165,10 @@ def main() -> None:
 
     # Reading 2 vs 1: the buckets must close to wall.
     closure = (prefill_s + decode_s + draft_s + encode_t + detok_t) / wall
-    # Reading 3: decode per forward vs the directly-timed W=8 tick.
+    # decode per tick is itself the direct W=8 tick measurement (host span of
+    # _run_forward on decode ticks); the 43.52/41.96 constants were voided with
+    # the contaminated 09657c0 tree and must be re-measured before reuse.
     dec_per_fwd = (decode_s / _counts["decode_ticks"]) if _counts["decode_ticks"] else 0.0
-    tick_096, tick_head = 43.52, 41.96
 
     # HEAD-only cross-check: the engine's own hooks vs the wraps.
     engine_prefill = getattr(engine, "_prefill_secs", None)
@@ -186,7 +190,6 @@ def main() -> None:
         "prefill_forwards": pre_fwds,
         "decode_forwards": dec_fwds,
         "decode_ms_per_decode_tick": dec_per_fwd * 1000,
-        "tick_direct_ms": {"09657c0": tick_096, "HEAD": tick_head},
         "tokens_generated": tok_gen,
         "tok_per_decode_fwd": (tok_gen / dec_fwds) if dec_fwds else 0.0,
         "spec_accepted": spec_acc,
@@ -210,8 +213,8 @@ def main() -> None:
     print(f"prefill_ticks {_counts['prefill_ticks']} (fwds {pre_fwds})  "
           f"decode_ticks {_counts['decode_ticks']} (fwds {dec_fwds})  "
           f"draft_calls {_counts['draft_calls']}")
-    print(f"decode {dec_per_fwd*1000:.2f} ms/tick  (direct tick: {tick_096} at 09657c0, "
-          f"{tick_head} at HEAD)")
+    print(f"decode {dec_per_fwd*1000:.2f} ms/tick  (direct W=8 tick; the 43.52/41.96 "
+          f"constants were voided with the contaminated 09657c0 tree)")
     print(f"tokens_generated {tok_gen}  tok/decode_fwd {report['tok_per_decode_fwd']:.2f}  "
           f"spec_accepted {spec_acc}  spec_drafted {spec_drafted}  "
           f"accept_rate {report['spec_accept_rate']}")
