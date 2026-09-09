@@ -27,6 +27,12 @@ jobs:
     runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # merge-base needs full history
+      - name: Merge completeness self-test
+        run: bash scripts/test_merge_completeness.sh
+      - name: Merge completeness check
+        run: bash scripts/check_merge_completeness.sh
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
