@@ -1,4 +1,5 @@
-"""The training run's gsm8k_pct emission: one arm = one validated store row."""
+"""The training run's eval-arm emission: one arm = two validated store rows
+(gsm8k_pct and rollout_tokens; tokens/correct is a view, never stored)."""
 
 from __future__ import annotations
 
@@ -24,19 +25,26 @@ def tmp_store(tmp_path, monkeypatch):
     return benchrec
 
 
-def test_emit_gsm8k_record(tmp_store, monkeypatch):
+def test_emit_eval_records(tmp_store, monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6")
-    cli._emit_gsm8k_record(190, 200, 0, _Backend())
-    cli._emit_gsm8k_record(196, 200, 100, _Backend())
+    lens = list(range(200))  # mean 99.5, nonzero spread
+    cli._emit_eval_records(190, 200, sum(lens), lens, 0, _Backend())
+    cli._emit_eval_records(196, 200, 20000, [100] * 200, 100, _Backend())
+    # A worse rerun of the same arm: direction - means the floor stays at the lowest.
+    cli._emit_eval_records(190, 200, 22000, [110] * 200, 100, _Backend())
     rows = [json.loads(l) for l in tmp_store.STORE.read_text().splitlines()]
-    assert len(rows) == 2
+    assert len(rows) == 6
+    by = {(r["metric"], r["shape"]["steps"], r["value"]): r for r in rows}
+    assert by[("gsm8k_pct", 0, 95.0)]["spread"] > 0
+    assert by[("gsm8k_pct", 100, 98.0)]["n"] == 200
+    assert by[("rollout_tokens", 0, 99.5)]["spread"] > 0
+    assert by[("rollout_tokens", 100, 100.0)]["spread"] == 0.0
     # steps is the population: before and after must not collapse into one row
-    assert len(tmp_store.current(rows)) == 2
-    by_steps = {r["shape"]["steps"]: r for r in rows}
-    assert by_steps[0]["value"] == 95.0 and by_steps[100]["value"] == 98.0
+    assert len({r["shape"]["steps"] for r in rows}) == 2
+    worse = by[("rollout_tokens", 100, 110.0)]
+    assert worse["floor"]["value"] == 100.0  # anchored at the best (lowest) prior value
     for r in rows:
-        assert r["metric"] == "gsm8k_pct" and r["unit"] == "%"
         assert r["target"] == "sm90" and r["device"] == {"name": "H20", "card": 6}
         assert r["floor"]["kind"] == "measured-best"
-        assert r["n"] == 200 and r["spread"] > 0
+        assert r["n"] == 200 and r["spread"] >= 0
         assert len(r["commit"]) == 40 and isinstance(r["dirty"], bool)
