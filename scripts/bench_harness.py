@@ -270,9 +270,10 @@ def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
             base[b] = agg
 
 
-def suite_prefill(gate, cfg, model, backend, lengths):
+def suite_prefill(gate, cfg, model, backend, lengths, build, model_name, device):
     import benchkit as bk
 
+    import benchrec
     from tilerl.engine import build_engine
 
     cap = min(8192, cfg.max_position_embeddings)
@@ -281,12 +282,27 @@ def suite_prefill(gate, cfg, model, backend, lengths):
     print("\n=== prefill-vs-length (tok/s) ===")
     print(f"  {'len':>7} {'ms/tok':>10} {'tok/s':>10} {'spread':>8}")
     for length in sorted({min(x, cap) for x in lengths}):
-        bk.time_prefill(engine, backend, cfg, length, 1.0)  # JIT for this length
+        bk.time_prefill(engine, backend, cfg, length, 1.0)  # JIT for this length, outside the window
         runs = [bk.time_prefill(engine, backend, cfg, length, 1.0) for _ in range(3)]
         ms, tps = sorted(runs, key=lambda r: r[1])[1]
         spread = (max(r[1] for r in runs) - min(r[1] for r in runs)) / tps
         print(f"  {length:>7} {ms / length:>10.4f} {tps:>10.1f} {100 * spread:>7.1f}%")
         gate.check("prefill", f"len{length}", tps, spread=spread)
+        floor = ({"value": 3835.0, "unit": "tok/s", "kind": "roofline",
+                  "derivation": "3835 tok/s = mixed-dtype prefill roofline, fp4 attn 148 TFLOPS + "
+                                "fp8 MLP 296 TFLOPS (wins/2026-08-24-sota-all-levers.md)"}
+                 if device["name"] == "H20"
+                 else {"value": round(tps, 1), "unit": "tok/s", "kind": "measured-best",
+                       "derivation": "first accepted row for this population; floor = this measurement"})
+        benchrec.append({
+            "metric": "prefill_tok_s", "value": round(tps, 1), "unit": "tok/s",
+            "target": backend.arch, "build": build, "model": model_name,
+            "shape": {"ctx": length},
+            "warm": {"state": "warm", "compiles": 0},
+            "n": 3, "spread": round(spread, 4),
+            "device": device, "sha": _git_commit(), "cmd": " ".join(sys.argv),
+            "floor": floor,
+        })
 
 
 def suite_kv_reuse(gate, cfg, model, backend):
@@ -336,6 +352,110 @@ def suite_accuracy(gate, source, n):
     pct = 100.0 * correct / total
     print(f"  {correct}/{total} = {pct:.1f}%")
     gate.check("accuracy", f"mmlu-{total}", pct, unit="%")
+
+
+def _gap(record: dict, registry: dict) -> float | None:
+    """floor/value for higher-is-better, value/floor for lower-is-better.
+
+    None when the value is 0 (a ratio has no floor there) -- such rows are
+    instruments, not questions."""
+    v = record["value"]
+    if v <= 0:
+        return None
+    f = record["floor"]["value"]
+    return f / v if registry[record["metric"]]["direction"] == "+" else v / f
+
+
+def _view_table() -> None:
+    """Four-target matrix; an empty cell says so, never a silent skip."""
+    import benchrec
+
+    reg = benchrec.load_registry()
+    metrics, denom = reg["metrics"], reg["denominator"]
+    cur = benchrec.current(benchrec.load_all())
+    groups: dict = {}
+    for r in cur.values():
+        g = (r["metric"], tuple(sorted(r["shape"].items())), r["build"])
+        groups.setdefault(g, {})[r["target"]] = r
+    print(f"=== bench table — denominator: a {denom['turn_s']}s agent turn = "
+          f"{denom['prefill_s']}s prefill + {denom['decode_s']}s decode ({denom['source']}) ===")
+    print(f"  {'metric (shape) [build]':<46} {'weight':>6} "
+          f"{'cpu':>8} {'metal':>8} {'sm90':>8} {'sm70':>8} {'gap x w':>8}")
+    missing = []
+    for (metric, shape, build), cells in sorted(groups.items()):
+        vals = []
+        for t in benchrec.TARGETS:
+            cell = cells.get(t)
+            vals.append(f"{cell['value']:.1f}" if cell else "—")
+            if cell is None:
+                missing.append(f"{metric}{dict(shape)}/{t}")
+        gaps = [g for t in benchrec.TARGETS if (c := cells.get(t)) and (g := _gap(c, metrics))]
+        gw = f"{max(gaps) * metrics[metric]['weight']:.3f}" if gaps else "—"
+        print(f"  {metric + ' ' + str(dict(shape)) + ' [' + build + ']':<46} "
+              f"{metrics[metric]['weight']:>6.2f} {vals[0]:>8} {vals[1]:>8} {vals[2]:>8} {vals[3]:>8} {gw:>8}")
+    if missing:
+        print("  empty cells (no accepted row): " + ", ".join(sorted(missing)))
+
+
+def _view_readme() -> None:
+    """The generated README rows: reuse speedup (turn 1 / turn 2 wall) and SSD restart."""
+    import benchrec
+
+    cur = benchrec.current(benchrec.load_all())
+    runs: dict = {}
+    for r in cur.values():
+        if r["metric"] != "chat_turn_wall_s":
+            continue
+        k = (r["cmd"], r["device"]["name"], r["build"], r["model"])
+        runs.setdefault(k, {})[r["shape"].get("turn")] = r
+    for turns in runs.values():
+        if 0 in turns and 1 in turns:
+            v1, v2 = turns[0]["value"], turns[1]["value"]
+            print(f"| Cross-turn prefix reuse, turn 2 vs turn 1 | {v1 / v2:.1f}x "
+                  f"| {turns[1]['device']['name']}, {turns[1]['build']}, record {turns[1]['id']} |")
+    for r in cur.values():
+        if r["metric"] == "ssd_restart_speedup":
+            print(f"| SSD tier restart, warm vs cold | {r['value']:.3f}x "
+                  f"| {r['device']['name']}, record {r['id']} |")
+
+
+def _view_regress() -> None:
+    """Newest vs previous per population; n=1 rows are excluded (no dispersion,
+    no regression claim)."""
+    import benchrec
+
+    reg = benchrec.load_registry()["metrics"]
+    by_key: dict = {}
+    for r in benchrec.load_all():
+        if not benchrec.is_regressable(r):
+            continue
+        by_key.setdefault(benchrec.key(r), []).append(r)
+    print("=== regression (newest vs previous, n>=2; PASS at >= 0.97x) ===")
+    for k, rows in sorted(by_key.items()):
+        if len(rows) < 2:
+            continue
+        prev, last = rows[-2], rows[-1]
+        d = reg[last["metric"]]["direction"]
+        ratio = last["value"] / prev["value"] if d == "+" else prev["value"] / last["value"]
+        print(f"  {'PASS' if ratio >= 0.97 else 'FAIL'} {last['metric']} {dict(last['shape'])} "
+              f"{last['target']}/{last['build']}: {last['value']} vs {prev['value']} ({ratio:.3f}x)")
+
+
+def _view_questions(limit: int = 20) -> None:
+    """All current rows by gap x weight desc — the 'what to fix next' order."""
+    import benchrec
+
+    reg = benchrec.load_registry()["metrics"]
+    q = []
+    for r in benchrec.current(benchrec.load_all()).values():
+        g = _gap(r, reg)
+        if g is not None:
+            q.append((g * reg[r["metric"]]["weight"], g, r))
+    q.sort(key=lambda x: x[0], reverse=True)
+    print(f"=== questions (gap x weight, top {limit}) ===")
+    for score, g, r in q[:limit]:
+        print(f"  {score:.3f}  {r['metric']} {r['target']} {dict(r['shape'])}: "
+              f"{r['value']} vs floor {r['floor']['value']} ({g:.2f}x) x {reg[r['metric']]['weight']}")
 
 
 def torch_oom():
@@ -438,7 +558,22 @@ def main() -> int:
     ap.add_argument("--spec-depth", type=int, default=2, help="drafts per row per tick")
     ap.add_argument("--mmlu-n", type=int, default=200, help="accuracy suite question count")
     ap.add_argument("--reseed", action="store_true", help="record every row as the new baseline (no gate)")
+    ap.add_argument("--table", action="store_true", help="render the four-target table from the bench store and exit")
+    ap.add_argument("--readme", action="store_true", help="render the README rows (reuse, SSD restart) and exit")
+    ap.add_argument("--regress", action="store_true", help="regression diff vs previous per population and exit")
+    ap.add_argument("--questions", action="store_true", help="rows by gap x weight desc and exit")
     args = ap.parse_args()
+
+    if args.table or args.readme or args.regress or args.questions:
+        if args.table:
+            _view_table()
+        if args.readme:
+            _view_readme()
+        if args.regress:
+            _view_regress()
+        if args.questions:
+            _view_questions()
+        return 0
 
     import os
 
@@ -456,6 +591,17 @@ def main() -> int:
     print(f"host loadavg {os.getloadavg()[0]:.1f} / {os.cpu_count()} cpus, target {target}")
     gate = Gate(target, update_only=args.reseed)
     batches = [int(x) for x in args.batches.split(",")]
+
+    # Record population for the bench store: load_hf fuses projections with a
+    # --source, and prefill is not graph-captured (the graph is decode-only).
+    if target in ("sm90", "sm70"):
+        import torch
+
+        bench_device = {"name": torch.cuda.get_device_name(0), "card": args.gpu}
+    else:
+        bench_device = {"name": target, "card": None}
+    bench_build = "fused" if args.source else "eager"
+    bench_model = "27B-nvfp4" if args.source else "tiny"
 
     gpu_suites = {"decode-kv", "prefill", "kv-reuse", "spec"}
     default = (["train"] if args.source is None
@@ -478,7 +624,7 @@ def main() -> int:
         if s == "decode-kv":
             suite_decode_kv(gate, cfg, model, backend, batches, [int(x) for x in args.depths.split(",")], args.ticks)
         elif s == "prefill":
-            suite_prefill(gate, cfg, model, backend, _KV_DEPTHS)
+            suite_prefill(gate, cfg, model, backend, _KV_DEPTHS, bench_build, bench_model, bench_device)
         elif s == "kv-reuse":
             suite_kv_reuse(gate, cfg, model, backend)
         elif s == "spec":
