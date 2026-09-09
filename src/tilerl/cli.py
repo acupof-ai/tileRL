@@ -585,6 +585,14 @@ def _length_aware(match, gold, tok, lam: float, cap: int):
     return reward
 
 
+def _correctness(match, gold, tok):
+    """Binary correctness before the length term — the tied_correctness input."""
+    def fn(prompt, completion):
+        text = tok.decode([int(t) for t in completion])
+        return float(match(text, gold[tuple(int(t) for t in prompt)]))
+    return fn
+
+
 def _within_group_r(rows: list) -> float | None:
     """Pearson r of (tokens, reward) POOLED over within-group deviations.
 
@@ -793,8 +801,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
                           max_batch=rollout_batch, draft=draft,
                           num_blocks=blocks,
                           max_total_tokens=max(ctx, 8192),
-                          spec_depth=args.depth,
-                          decode_graph=not args.deterministic,
+                          spec_depth=args.depth, decode_graph=True,
                           prefix_store=NoPrefixStore())
     # Not in `inputs`: the id is a hash of it, so recording the pool there would make
     # every pool change a different run and hand nothing back on a rerun. It is beside
@@ -920,8 +927,10 @@ def _train_adapters(args: argparse.Namespace) -> None:
     if args.rl:
         if rows:
             gold = {tuple(p): r["answer"] for p, r in zip(prompts, rows)}
-            reward = _length_aware(MATCHERS[args.reward], gold, tok, args.length_penalty,
+            match = MATCHERS[args.reward]
+            reward = _length_aware(match, gold, tok, args.length_penalty,
                                    max(int(args.max_new_tokens), 1))
+            correctness = _correctness(match, gold, tok)
         else:
             # No length term: this reward is a RATE, so its expectation does not grow with
             # length and the defect above is absent by construction -- a longer completion
@@ -1102,14 +1111,15 @@ def _train_adapters(args: argparse.Namespace) -> None:
         hist = []
         rollouts: list = []
         written = 0
-        for i, (r, ce, secs, tied, ntok, timings, width) in enumerate(
+        for i, (r, ce, secs, tied, ntok, timings, width, tied_c) in enumerate(
                 train_mod.grpo_loop(engine, model, prompts, reward, args.steps, backend, optimizer,
                                     group=args.group, prompts_per_step=args.prompts_per_step,
                                     sampling=params, seed=args.seed,
                                     trainable=trainable, micro=args.micro,
                                     tiebreak=tiebreak, recapture_graph=True,
-                                    per_rollout=rollouts, decode=tok.decode)):
-            hist.append((r, ce, secs, tied, ntok))
+                                    per_rollout=rollouts, decode=tok.decode,
+                                    correctness_fn=correctness if rows else None)):
+            hist.append((r, ce, secs, tied, ntok, tied_c))
             train_secs += secs
             written = _write_rollout_rows(manifest["id"], rollouts, written)
             if (curve_rows and args.eval_every and (i + 1) % args.eval_every == 0
@@ -1117,8 +1127,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
                 break
             for phase, elapsed in timings.items():
                 manifest["metrics"][phase] = manifest["metrics"].get(phase, 0.0) + elapsed
+            tied_c_str = f"  tied_c {tied_c:.2f}" if tied_c is not None else ""
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
-                f"tied {tied:.2f}  tok {ntok:.0f}  width {width}  {secs:.1f}s  "
+                f"tied {tied:.2f}{tied_c_str}  tok {ntok:.0f}  width {width}  {secs:.1f}s  "
                 f"rollout {timings['rollout_secs']:.3f}s  "
                 # .get: rl_step writes these, and a test or caller that substitutes it
                 # still gets a log line rather than a KeyError mid-run.
@@ -1144,6 +1155,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
         # sampled prompt, so two single steps compare two draws, not two policies
         # (tests/test_rl.py::test_grpo_loop_raises_reward uses the same windows).
         w = max(1, len(hist) // 4)
+        tc = [h[5] for h in hist if h[5] is not None]
         manifest["metrics"].update(
             steps_completed=len(hist),
             reward_first=statistics.mean(h[0] for h in hist[:w]),
@@ -1152,6 +1164,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
             secs_per_step_median=statistics.median(h[2] for h in hist),
             secs_total=sum(h[2] for h in hist),
             tied_group_fraction=statistics.mean(h[3] for h in hist),
+            # Binary-correctness tie fraction, pre-length-term. `tied` is structurally
+            # 0 at lam>0; this is the validity gate's real input.
+            tied_correctness=statistics.mean(tc) if tc else None,
             # --judge drives tied_group_fraction toward 0 by construction, so it
             # cannot report a bad judge. Length is the signal that can.
             tokens_first=statistics.mean(h[4] for h in hist[:w]),
@@ -1718,9 +1733,6 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="bypass the before-eval and periodic rollout-length guards; "
                               "the smoke recipes want the "
                               "truncation, a real run almost never does")
-    p_train.add_argument("--deterministic", action="store_true",
-                         help="decode eager (no captured graph): bitwise reproducible "
-                              "rollouts across processes, at a rollout throughput cost")
     p_train.add_argument("--eval-max-new-tokens", type=int, default=2048,
                          help="eval generation length; independent of --max-new-tokens, "
                          "which caps the ROLLOUTS. Scoring at the training cap measures "

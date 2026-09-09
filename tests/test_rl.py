@@ -354,8 +354,41 @@ def test_grpo_loop_reports_a_step_before_the_run_ends():
     gen = grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(len(c)), 3, backend,
                     AdamW(lr=1e-3), group=2, sampling=SamplingParams(max_new_tokens=4))
     first = next(gen)
-    assert len(first) == 7, first  # reward, ce, secs, tied, mean tokens, timings, bucket width
+    assert len(first) == 8, first  # reward, ce, secs, tied, mean tokens, timings, bucket width, tied_correctness
     assert sum(1 for _ in gen) == 2, "every step must be yielded, not just the first"
+
+
+def test_tied_is_structurally_zero_at_positive_lam():
+    """At lam>0, rewards are continuous and never exactly match, so tied==0.0
+    even for an all-correct group. The validity gate must read tied_correctness.
+    """
+    from tilerl.train import group_advantages
+
+    rewards = np.array([1.0 - 0.1 * L / 6144 for L in [100, 200, 300, 400, 500, 600, 700, 800]])
+    adv = group_advantages(rewards, 8)
+    tied = float((adv.reshape(-1, 8) == 0).all(axis=1).mean())
+    assert tied == 0.0, f"continuous rewards should never tie, got {tied}"
+    corr = np.ones(8)
+    tied_correctness = float((corr.reshape(-1, 8) == corr.reshape(-1, 8)[:, :1]).all(axis=1).mean())
+    assert tied_correctness == 1.0
+
+
+def test_grpo_loop_yields_tied_correctness():
+    """grpo_loop yields tied_correctness as the 8th element when correctness_fn is given."""
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.kv_cache import NoPrefixStore
+    from tilerl.train import grpo_loop
+
+    cfg, model = _build_model("tiny", seed=0, keep_master=True)
+    backend = RefBackend()
+    engine = build_engine(cfg, model, backend, num_blocks=128, num_slots=4,
+                          decode_graph=False, prefix_store=NoPrefixStore())
+    gen = grpo_loop(engine, model, [[1, 2, 3, 4]], lambda p, c: float(len(c)), 1, backend,
+                    AdamW(lr=1e-3), group=2, sampling=SamplingParams(max_new_tokens=4),
+                    correctness_fn=lambda p, c: 1.0)
+    first = next(gen)
+    assert len(first) == 8
+    assert first[7] == 1.0, f"all-correct group should have tied_correctness=1.0, got {first[7]}"
 
 
 def test_grpo_rollouts_are_drawn_untruncated():
