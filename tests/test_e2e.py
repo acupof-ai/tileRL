@@ -3506,6 +3506,10 @@ def test_the_tier_read_rate_keeps_moving_after_the_first_fetch(tmp_path):
     read_bytes_per_s() divides running totals (`_fetch_loop` accumulates, it
     divides): the next slow fetch drags B back down. Freeze it at the first fetch and
     the over-permit becomes permanent at every length, and nothing else here notices.
+
+    The property is algebraic, not temporal: the counters accumulate and B divides
+    the running totals. A rate-ratio assertion (B dropped by 2x) depends on the
+    disk's natural speed, which xdist contention moves; the algebra does not.
     """
     pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
     tier = KvTier(str(tmp_path), "fp-cum", min_tokens=BLOCK_TOKENS)
@@ -3535,7 +3539,7 @@ def test_the_tier_read_rate_keeps_moving_after_the_first_fetch(tmp_path):
     assert first > 0, "no rate after a completed fetch, so this arm measures nothing"
 
     # The second fetch is the same bytes through a slower read, standing in for the
-    # cold-after-warm case. A frozen B ignores it; a cumulative one drops.
+    # cold-after-warm case.
     real_load = torch.load
 
     def slow(*a, **k):
@@ -3544,11 +3548,22 @@ def test_the_tier_read_rate_keeps_moving_after_the_first_fetch(tmp_path):
 
     with unittest.mock.patch.object(torch, "load", slow):
         fetched(*keys[1])
+
+    # Algebraic: the counters accumulated, B divides the running totals, and B
+    # dropped because the second fetch was slower. A frozen counter fails the
+    # inequality; a frozen B fails the drop. Neither depends on the disk's
+    # natural speed — the 50 ms delay guarantees the second fetch is slower
+    # than the first regardless of xdist contention.
+    assert cold_tier.fetch_ms > fast_ms, "fetch_ms did not accumulate across fetches"
+    assert cold_tier.fetch_bytes > fast_bytes, "fetch_bytes did not accumulate across fetches"
     second = cold_tier.read_bytes_per_s()
-    assert second < first / 2, (
-        f"B barely moved on a fetch made 50 ms slower ({first / 1e6:.1f} -> "
+    assert second < first, (
+        f"B did not drop on a fetch made 50 ms slower ({first / 1e6:.1f} -> "
         f"{second / 1e6:.1f} MB/s), so it is calibrated once rather than accumulated; a "
         "warm first read would then permit every prefix for the process's life"
+    )
+    assert second == cold_tier.fetch_bytes / (cold_tier.fetch_ms / 1000.0), (
+        "B is not computed from the running totals"
     )
 
     # n* is what B controls, so read it at both rates rather than trusting the ratio.
