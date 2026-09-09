@@ -34,6 +34,7 @@ from tilerl.eval import generate
 from tilerl.kv_cache import NoPrefixStore
 from tilerl.model import Model, load_hf
 from tilerl.prompt import render_chat, sampling
+from tilerl.spec import load_draft
 from tilerl.tokenizer import get_tokenizer
 
 _state = {"pf_step": False}
@@ -144,6 +145,8 @@ def main() -> None:
     p.add_argument("--gsm8k", required=True)
     p.add_argument("--n", type=int, default=50)
     p.add_argument("--out", required=True)
+    p.add_argument("--draft", default=None,
+                   help="draft head path: run the spec arm (W=8) and time draft.step on prefill steps")
     args = p.parse_args()
 
     from tilerl_kernels.backend import get_backend
@@ -175,8 +178,28 @@ def main() -> None:
         return r
 
     tok.encode = _enc
+    draft = load_draft(model, args.draft) if args.draft else None
     engine = build_engine(cfg, model, backend, num_blocks=512, num_slots=1, max_batch=1,
+                          draft=draft, spec_depth=max(1, 8 - 1) if draft else 0,
                           decode_graph=True, prefix_store=NoPrefixStore())
+
+    if draft is not None:
+        _orig_draft_step = draft.step
+
+        def _timed_draft_step(rows):
+            # Sync on prefill steps only: draft.step launches the drafter's own GPU work,
+            # and without a sync it leaks into the next tick's bracket (the boundary move
+            # this profile is hunting). Same graph-capture caveat as the kernel wrap.
+            if not _state["pf_step"]:
+                return _orig_draft_step(rows)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            r = _orig_draft_step(rows)
+            torch.cuda.synchronize()
+            _add("draft_step", time.perf_counter() - t0)
+            return r
+
+        draft.step = _timed_draft_step
 
     store_t = 0.0
     store = engine._prefix
@@ -216,12 +239,14 @@ def main() -> None:
             "4a. plan excl admit": (plan - admit) / n,
             "4b. forward host": (forward - kernel) / n,
             "4c. step remainder": (step_total - plan - forward) / n,
+            "5. draft.step": _pf.get("draft_step", 0.0) / n,
         },
         "totals_50q": {
             "1. tokenize+render": encode_t + render_t,
             "2. admit": admit,
             "3. kernel": kernel,
             "4. scheduling": (step_total - kernel - admit),
+            "5. draft_step": _pf.get("draft_step", 0.0),
             "step_total": step_total,
             "wall": wall,
         },
