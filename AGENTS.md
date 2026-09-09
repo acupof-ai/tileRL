@@ -245,6 +245,7 @@ Fix / Rule; `wins/…` = Context / What Worked / Rule. Bench snapshots use
 ## Build & run
 
 ```bash
+scripts/setup.sh                 # one-time: uv sync --dev + enable .githooks (pre-push runs ruff)
 uv sync                          # install deps into .venv (never pip install)
 uv run tilerl serve              # OpenAI-compatible server
 uv run tilerl train --recipe X   # SFT / --rl / --opd from a gated flag set; runs/<id>/manifest.json
