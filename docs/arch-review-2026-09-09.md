@@ -33,6 +33,29 @@ fa1bcec 上输出 9 个：probe_fla_hostcost、probe_fla_parity、probe_group16_
 
 「近 30 天有 commit 碰过」可跑，但对 probe_ 无效——89 个全部本周碰过，它一个都删不掉。「主线工具」是形容词，不能跑。上面的判据能失败：它输出了 9 个名字。每个候选仍须过 D1 的三条件；判据只产生名单，不做判决。
 
+**2026-09-09 更正 — 上面这条判据漏掉了 CI 实际执行脚本的那条路径，先跑下面这条。** 它按脚本名 `git grep`，而 `tests/test_main_selfchecks.py` 的 `_hermetic_scripts()` 用 `glob("*.py")` 加 AST 收集 `scripts/`：一个 hermetic 且 `__main__` 里带 assert 的脚本会被 CI 跑，而树里任何地方都不出现它的名字。名字搜索看不见模式引用，且正对照救不了这一类——换一个脚本名去搜同样是 0，对照会和错误答案一起点头。
+
+`origin/main` 上被 CI 跑的三个：`gate_noise_floor.py`、`probe_group16_mechanism.py`、`sm70_tile_occupancy.py`。第二个就在上面那份 9 人名单里。
+
+所以候选先过这一条，它一票否决：
+
+```bash
+python3 - <<'EOF'
+import ast, pathlib
+def asserting_main(p):
+    try: tree = ast.parse(p.read_text())
+    except SyntaxError: return False
+    return any(isinstance(n, ast.If) and "__main__" in ast.unparse(n.test)
+               and any(isinstance(x, ast.Assert) for x in ast.walk(n)) for n in tree.body)
+for p in sorted(pathlib.Path("scripts").glob("*.py")):
+    if not any(k in p.read_text() for k in ("import torch", "get_backend", "build_engine")) \
+       and asserting_main(p):
+        print(p.name)
+EOF
+```
+
+一般形式：**判断一个文件有没有被用到，先问消费者是怎么命名它的输入的。** 按名字引用才能用名字搜索；glob、动态 import、`getattr`、字符串拼出来的键、按文件名约定收集——每一种都是名字搜索找不到的引用。唯一可靠的读法是跑一遍消费者自己的过滤器，或者读它的运行日志（CI 日志把十个 gate 逐个打印了名字）。同一天 `ci.yml:59` 的 `tests/*_world[0-9].py` 也是这样被漏掉的，代价是一个 PR 差点删掉训练侧梯度平均的唯一门。
+
 ### D3 — `--devices` / DataParallelEngine（成本：中；论据是错误类，不是性能）
 
 **不要用性能论据。** 7.54x（wins/2026-08-29-data-parallel-scales）量的是 8 个独立进程对一张卡的聚合，从来没有量过 `--devices`——27 已撤回这个用法。
