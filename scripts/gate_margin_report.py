@@ -7,6 +7,11 @@ comparator is correct (test_gate_comparators.py proves that) but the gate
 cannot object in production. This is the empty-gate detector that reads
 values the system actually produced, not imagined failures.
 
+Verdict (hardcoded):
+  n_scored == 0                      → NEVER SCORED
+  all margins > 20% of their threshold → NEVER NEAR
+  otherwise                          → LIVE
+
 Usage: python scripts/gate_margin_report.py [runs_dir]
   (default: runs/)
 """
@@ -34,9 +39,9 @@ def load_manifests(runs_dir: Path) -> list[dict]:
             for p in sorted(runs_dir.glob("*/manifest.json"))]
 
 
-def gate_margins(manifests: list[dict]) -> dict[str, list[float]]:
-    """Per-gate list of margins (only scored, non-skipped, non-None values)."""
-    out: dict[str, list[float]] = {}
+def gate_margins(manifests: list[dict]) -> dict[str, list[tuple[float, float]]]:
+    """Per-gate list of (margin, threshold) for scored, non-skipped gates."""
+    out: dict[str, list[tuple[float, float]]] = {}
     for m in manifests:
         for g in m.get("gates", []):
             name = g["name"]
@@ -47,26 +52,26 @@ def gate_margins(manifests: list[dict]) -> dict[str, list[float]]:
                 continue
             v, t = g["value"], g["threshold"]
             margin = v - t if direction == "gt" else t - v
-            out.setdefault(name, []).append(margin)
+            out.setdefault(name, []).append((margin, t))
     return out
+
+
+def verdict(entries: list[tuple[float, float]]) -> str:
+    if not entries:
+        return "NEVER SCORED"
+    if all(m > 0.2 * abs(t) for m, t in entries):
+        return "NEVER NEAR"
+    return "LIVE"
 
 
 def report(manifests: list[dict]) -> str:
     margins = gate_margins(manifests)
-    lines = [f"{'gate':<22} {'n':>3}  {'min':>8}  {'max':>8}  {'mean':>8}  note"]
+    lines = [f"{'gate':<22} {'n':>3}  {'min_margin':>10}  {'verdict':<12}"]
     for name in sorted(_DIRECTION):
-        vals = margins.get(name, [])
-        if not vals:
-            lines.append(f"{name:<22} {'0':>3}  {'—':>8}  {'—':>8}  {'—':>8}  never scored")
-            continue
-        mn, mx = min(vals), max(vals)
-        mean = sum(vals) / len(vals)
-        note = ""
-        if mn <= 0:
-            note = "← FAILED or at threshold"
-        elif all(v > 0.1 * abs(mx) for v in vals):
-            note = "← never close to red"
-        lines.append(f"{name:<22} {len(vals):>3}  {mn:>8.4f}  {mx:>8.4f}  {mean:>8.4f}  {note}")
+        entries = margins.get(name, [])
+        v = verdict(entries)
+        mn = f"{min(m for m, _ in entries):>10.4f}" if entries else f"{'—':>10}"
+        lines.append(f"{name:<22} {len(entries):>3}  {mn}  {v:<12}")
     return "\n".join(lines)
 
 
