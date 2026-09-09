@@ -92,6 +92,39 @@ per-problem structure below the ~10% flip rate. In the plateau the
 per-problem signal sits at the floor: same-batch cross-step flips (15-16)
 are jitter-sized.
 
+## Correction, same day (2026-09-09): the same-batch floor is 0, not 15-16
+
+The "Same-batch-composition" bullet above, the flip table's "jitter"
+framing, and the "most conservative of the three" headline are wrong.
+New evidence (run 76a17ea6e10a, the adapter-best n=500 rescoring): its
+before and after arms score the SAME step-5 weights on the SAME 500
+questions in the SAME order at the SAME concurrency, and the two arms are
+bit-identical — 471/500, 125100 tokens, 265.6 tokens/correct, all three
+equal. Under same weights, same order, same concurrency the eval is
+deterministic. The same-batch floor is **0**.
+
+What changes:
+
+- The seed-1 plateau's 15-16 flips are NOT jitter. They are policy
+  movement between weights 25 steps apart, measured with a zero-noise
+  instrument. The table's "multiple" column divides signal by signal;
+  4.6x / 4.25x / 2.2x compare the dip's per-problem movement to the
+  plateau's, not to a noise floor.
+- The dip's counts (69 / 68 / 37, with the 62/7 and 12/56 splits) are
+  pure signal — no floor divides them. The "most conservative of the
+  three" framing for the 50→100 headline is withdrawn: a same-batch
+  comparison has no floor to be conservative against.
+- The point estimate is no longer pending. It is 0, measured.
+- The only floor that applies to any number here is the cross-batch
+  52/500 = 10.4%, and only across different batch compositions.
+- The conclusion strengthens: the dip moved 4.6x more per-problem
+  structure than the plateau, and every per-problem count is signal.
+
+The companion entry's same-batch bounds ("≤15-16", "point estimate
+pending") carry the same correction. Its 0.2 pt "cross-process floor"
+(438 vs 437) is reclassified: a same-batch retest flips nothing, so that
+gap is a cross-batch comparison.
+
 ## What this does NOT establish
 
 - **The dip's occurrence rate is unmeasured and unmeasurable** at current
