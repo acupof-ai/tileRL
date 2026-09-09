@@ -62,8 +62,8 @@ here, not explained.
 
 The README's 135.5 tok/s and 1.728x do not reproduce on the current sha: the W=8 block
 drafter at B=1 measures 126.5 tok/s and 1.59x, with the drafter's acceptance and
-forward-reduction intact and only the spec tick slower. The headline number changes in a
-separate PR. A spec arm's equality claim must be checked per completion — 38/200
+forward-reduction intact and only the spec tick slower. The headline was taken down in
+#354; 135.5 stands in its dated 2026-09-03 entry, not the README. A spec arm's equality claim must be checked per completion — 38/200
 divergences at unchanged accuracy is invisible to the accuracy row.
 
 ## Results
