@@ -28,10 +28,16 @@ decoding, and the dead row's blocks return to the pool.
 
 Failures are now structured: `RequestFailed(request_id, reason, message)`
 carries a stable reason tag through `poll()`/`take()` instead of a bare
-RuntimeError. `_drain` catches **only** `reason="pool_exhaustion"`: the dead
+RuntimeError. `_drain` catches **only** `reason="pool_exhausted"`: the dead
 rollout gets an empty completion, `len(c) > 0` drops it from the live mask, and
 the group trains on the rest. Every other failure class propagates — a broad
 catch would turn any bug into a silently missing row.
+
+The boundary: a row that hits exhaustion loses its own rollout — it is not
+preempted and re-run. Requeue is still unimplemented; this change shrinks the
+failure surface from the batch to the row, which is the opposite of the OPEN
+row's complaint, but the scheduling policy that row named as correct
+(preemption or requeue) does not exist yet.
 
 Which row dies: **the row allocating when exhaustion hit**, in decode order —
 NOT the row holding the most blocks. The pool is shared, so which request trips
