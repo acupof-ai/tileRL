@@ -228,6 +228,7 @@ def main() -> None:
     kernel = _pf.get("kernel", 0.0)
     step_total = _pf.get("step_total", 0.0)
     rest = _kernel_steps[1:] if len(_kernel_steps) > 1 else _kernel_steps
+    _stats = engine.stats()
     report = {
         "wall": wall,
         "per_question": {
@@ -255,8 +256,11 @@ def main() -> None:
         "kernel_rest_max": max(rest) if rest else None,
         "pf_steps": _counts["pf_steps"],
         "dec_steps": _counts["dec_steps"],
+        "tokens_generated": _stats.get("tokens_generated"),
+        "spec_accepted": _stats.get("spec_accepted"),
     }
     print(f"wall {wall:.1f}s  pf_steps {_counts['pf_steps']}  dec_steps {_counts['dec_steps']}")
+    print(f"tokens_generated {_stats.get('tokens_generated')}  spec_accepted {_stats.get('spec_accepted')}")
     for k, v in report["per_question"].items():
         print(f"  {k:30s} {v*1000:8.1f} ms/q")
     print(f"  kernel first step {(_first_kernel[0] if _first_kernel else 0)*1000:.1f} ms, "
