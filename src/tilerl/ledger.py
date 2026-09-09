@@ -145,10 +145,12 @@ def new_best_point(pt: dict, best: dict | None, se: float | None = None,
                    mode: str = "significant") -> bool:
     """Whether ``pt`` replaces the incumbent best curve point.
 
-    SIGNIFICANTLY greater, not merely greater: the eval's own floor is 0.2 pt
-    (measured 2026-09-08 -- one fixed set of weights, re-scored across processes,
-    moved one question in 500), and a one-question lead has bought extra training
-    for a reading inside the instrument. A tie keeps the earlier point:
+    SIGNIFICANTLY greater, not merely greater: the eval's NET-difference floor is
+    0.2-0.4 pt (two readings: 1 and 2 questions in 500, 2026-09-08/09;
+    errors/2026-09-09-the-dip-hit-problems-a-healthy-seed-solves.md), and a
+    one-question lead has bought extra training for a reading inside the instrument.
+    The gross-flip floor is a different number -- 15-16/500, see `curve_churn` -- and
+    the two must not be mixed. A tie keeps the earlier point:
     `time_to_score` is the objective, so at equal score the cheaper point wins.
 
     ``se`` is the PAIRED width of ``pt - best`` in points, from `paired_se` over the
@@ -164,8 +166,8 @@ def new_best_point(pt: dict, best: dict | None, se: float | None = None,
     default:
 
     1. It can fire on a difference below the instrument floor -- the eval's
-       cross-process floor is 0.2 pt (1 question / 500). Seed 1 in raw mode stops at
-       step 50 on 94.2 <= 94.4, one question.
+       net-difference floor is 0.2-0.4 pt (1-2 questions / 500). Seed 1 in raw mode
+       stops at step 50 on 94.2 <= 94.4, one question.
     2. It is safe only on curves whose gain is concentrated in the first point -- a
        step, then flat -- where "stop at the first non-improving point" loses nothing.
        On a noisy rise it follows the noise: best drifts up on sub-floor gains, and
@@ -202,6 +204,14 @@ def curve_churn(prev: list[dict] | None, cur: list[dict]) -> tuple[int, int] | N
     never subtract two runs' churn. None when there is no predecessor (the first
     point) or the rows do not pair (different lengths): null, not 0, because 0 means
     "no flips" and null means "no comparable point".
+
+    The same-batch-composition GROSS-flip floor is 15-16 questions/500 (measured
+    2026-09-09 on adjacent plateau points; errors/2026-09-09-the-dip-hit-problems-
+    a-healthy-seed-solves.md): a churn at or below that is the instrument's own
+    jitter, not a policy difference. The cross-batch-composition rate is a different
+    caliber -- 52/500 = 10.4% with only the batch composition changed -- and the two
+    must never be compared. Gross flip and net difference are also different
+    calibers: the net-difference floor is 0.2-0.4 pt (see `new_best_point`).
     """
     if not prev or len(prev) != len(cur):
         return None
@@ -393,11 +403,11 @@ if __name__ == "__main__":  # runnable check
         if new_best_point(pt, best):
             best = pt
     assert best["step"] == 5 and best["score"] == 0.942, best
-    # Two points one question apart (0.2 pt at n=500): inside the floor, the earlier one
-    # keeps it. This is the error the run actually made -- step 50 led step 25 by exactly
-    # one question, and taking the numerically higher point bought 501.2 s of extra
-    # training for a reading inside the instrument. Negative control: with the criterion
-    # as plain `>` this assertion goes red.
+    # Two points one question apart (0.2 pt at n=500): inside the 0.2-0.4 pt net floor,
+    # the earlier one keeps it. This is the error the run actually made -- step 50 led
+    # step 25 by exactly one question, and taking the numerically higher point bought
+    # 501.2 s of extra training for a reading inside the instrument. Negative control:
+    # with the criterion as plain `>` this assertion goes red.
     a = {"step": 25, "correct": 470, "total": 500, "score": 0.94}
     b = {"step": 50, "correct": 471, "total": 500, "score": 0.942}
     assert new_best_point(a, None)
@@ -446,7 +456,8 @@ if __name__ == "__main__":  # runnable check
             ((True, False), (False, False), (False, True))] == [None, None, "decline"]
     assert es.stale == 1  # the decline did not add to the patience count
     # The decline ruler itself: 11.0 pt against a 1.66 pt paired SE (6.62 sigma) is a
-    # decline; 0.2 pt is inside the floor; and no paired width means no verdict.
+    # decline; 0.2 pt is inside the 0.2-0.4 pt net floor; and no paired width means no
+    # verdict.
     peak = {"step": 50, "correct": 467, "total": 500, "score": 0.934}
     assert significant_decline({"score": 0.824}, peak, 1.66)
     assert not significant_decline({"score": 0.932}, peak, 1.66)
