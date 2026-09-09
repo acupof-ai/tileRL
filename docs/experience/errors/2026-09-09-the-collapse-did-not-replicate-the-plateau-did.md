@@ -81,7 +81,7 @@ flat), so "stop at the first non-improving point" never gives anything back.
 On a gradually-rising curve the same rule stops at the second point and
 discards every later gain. Worse, its trigger is below the instrument's own
 floor: seed 1's n=500 stop fired on 94.2% ≤ 94.4% — a one-question difference,
-smaller than the 0.2 pt floor this eval can resolve. It is acceptable here
+smaller than the 0.4 pt net floor measured below. It is acceptable here
 only by asymmetry — with best-weight keeping, stopping early risks future
 gains, never the score already in hand. That asymmetry is a property of this
 task, not of the rule.
@@ -107,6 +107,31 @@ Selling early stop without best-weight keeping loses the margin.
 **The eval-cost model is optimistic for the fine grid.** The fine-grid run
 measured 925-1135 s per n=500 eval (avg 1026 s), 28% above the 800 s model.
 Real prices at n=100 are ~205 s/eval, not 160 s.
+
+## The eval floor, measured twice
+
+The score-level floor is ±2 questions (0.4 pt): the after-arm and the
+step-100 curve point scored the same step-100 adapter on the same 500
+questions, both greedy, and got 472 vs 474. The net hides the gross — **52 of
+the 500 questions (10.4%) flipped between the two passes**, 27 one way and 25
+the other. Completion lengths diverged (median ratio 1.66x, max 9.9x; 18 of 52
+by more than 2x), in both directions. This is not a fixed set of boundary
+questions; it is batch-composition non-determinism (the after-arm batches in
+file order alongside MMLU; the curve point shuffles and batches GSM8K
+alone). Pinning the questions does not fix it; pinning the batch composition
+would reduce it, with JIT and numeric noise still left.
+
+The sharp consequence: the same adapter re-evaluated flips 52 questions; the
+step-75 and step-100 adapters, 25 training steps apart, flip 50. **On this
+instrument, same-policy re-eval noise equals the apparent per-question
+difference between policies 25 steps apart.** Per-question plateau signal is
+entirely inside the eval noise; only net scores (stable to ±0.4 pt) carry
+signal. Every cross-run per-question comparison — the overlap instrument
+included — sits on this 10% flip rate.
+
+The earlier floor reading (1 question, 0.2 pt) was a single measurement; two
+readings now bound the net floor at 0.4 pt, and the gross flip rate is
+measured for the first time.
 
 ## The economics turn on the stop point
 
@@ -148,6 +173,10 @@ earns the default flip.
 - **The eval bill is set by the stop point, not the budget.** A dense grid is
   affordable when early stop makes most of its points never run; price the
   grid and the stop as one mechanism.
+- **A net floor and a per-question floor are two instruments.** The net score
+  is stable to ±0.4 pt while 10.4% of questions flip between two passes of
+  the same adapter; quoting the net as "the floor" hides the noise every
+  per-question comparison sits on.
 - **A retained score belongs to the n=500 anchor, not the curve subset.**
   Small subsets run ±1.6 pt off the full score; reading the retained score
   off the curve would over-credit the cheap configuration.
