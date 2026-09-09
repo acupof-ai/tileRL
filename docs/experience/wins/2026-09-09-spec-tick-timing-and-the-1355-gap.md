@@ -1,4 +1,19 @@
-# The 135.5 gap is not the decode tick, not the base arm, and not the prefill kernel — what remains is spec-arm-specific and unlocated
+# The 135.5 gap: the 09657c0 baseline was void — the tick/prefill/base-arm comparisons are unmeasured
+
+> **VOID — 2026-09-09 correction.** Every 09657c0 number in this entry was
+> measured on a pod tree that was byte-identical to HEAD (see
+> [the contamination error entry](../errors/2026-09-09-pod-09657c0-tree-was-head-contaminated.md)).
+> The "09657c0 vs HEAD" differences below were run-to-run noise between
+> identical-code runs. The tick improvement, the flat prefill kernel, the flat
+> base-arm wall, the 4% spec regression, and the fp8 dispatch audit are all
+> **unmeasured** — there was no valid 09657c0 baseline. The only conclusion
+> that survives is that 135.5 has never run on a main sha (a provenance fact
+> about the recorded number, not a measurement). The 09657c0 columns are kept
+> and marked VOID rather than deleted, so the evidence of the mistake stays
+> checkable. The line below is preserved as it stood: the mechanism of the
+> two-instrument disagreement was never explained from the code, and no story
+> was invented for it — that stance was correct even though the disagreement
+> itself is now known to be noise.
 
 **Date:** 2026-09-09
 **Arch:** H20 (sm90) card 6, 27B NVFP4 + DFlash2 block drafter, per-tick wall timing with
@@ -7,7 +22,8 @@ sync on both sides, `scripts/acc_spec_tick_timing.py` / `scripts/acc_spec_diverg
 **Task:** locate the 6.6% throughput gap between the recorded 135.5 tok/s B=1 W=8 arm
 (2026-09-03 entry) and the current sha's 126.5
 
-> Status: Shipped
+> Status: **Corrected — the 09657c0 baseline was void; the tick/prefill/base-arm
+> comparisons are unmeasured. See the VOID banner above.**
 
 ## Context
 
@@ -30,13 +46,11 @@ the identity `tok/s = (tok/decode-fwd) / tick × (decode_s/wall_s)` closes to 0.
 
 | sha | W=1 tick mean | W=8 tick mean | spec tok/s | decode_s/wall_s |
 |---|---:|---:|---:|---:|
-| 09657c0 (first main sha that can run B=1) | 11.77 ms | 43.52 ms | 131.7 | 0.936 |
+| 09657c0 (first main sha that can run B=1) | **VOID** 11.77 ms | **VOID** 43.52 ms | **VOID** 131.7 | **VOID** 0.936 |
 | f80e894 (current) | 11.56 ms | 41.96 ms | 126.5 | 0.860 |
 
-The W=8 tick is 3.6% *faster* on the current sha — an **unattributed improvement**:
-no commit claims it, and an unexplained gain is as suspicious as an unexplained
-regression (it may be a real optimization or a changed measurement boundary). It is
-recorded here so it does not silently become the new baseline.
+The W=8 tick "3.6% faster" claim is **VOID** — both rows ran on HEAD. The
+"unattributed improvement" framing is moot: there was no second sha to compare.
 
 The reverse-derived 48.9 ms was an artifact: decode forwards are only 86% of the arm
 wall, and the derivation spread the other 14% across them. The throughput gap is two
@@ -44,61 +58,66 @@ gaps with different causes:
 
 | segment | size | explained? |
 |---|---:|---|
-| 135.5 (f49e006, never on main) → 131.7 (09657c0) | −2.8% | **unexplained, possibly unknowable** — that tree's number cannot be re-run |
-| 131.7 (09657c0) → 126.5 (current) | −3.9% | **partially excluded, see below** |
+| 135.5 (f49e006, never on main) → 131.7 (09657c0) | −2.8% | **VOID** — 131.7 was HEAD, not 09657c0; the segment is noise |
+| 131.7 (09657c0) → 126.5 (current) | −3.9% | **VOID** — both endpoints were HEAD; the "4% regression" was noise |
 
-**The prefill kernel is flat — the 2.1x "prefill growth" was a timing-boundary move.**
-A five-bucket profile (`scripts/acc_spec_prefill_profile.py`, same instrument at both
+**The prefill kernel is flat — VOID.** A five-bucket profile
+(`scripts/acc_spec_prefill_profile.py`, same instrument at both
 shas, B=1, 50 questions, sync on both sides of `Model.forward`, 0 compiles, no graph
 fallback at either sha):
 
 | per question | 09657c0 | current |
 |---|---:|---:|
-| 1. tokenize + render | 0.4 ms | 0.4 ms |
-| 2. admit (block alloc) | 0.1 ms | 0.1 ms |
-| **3. kernel (Model.forward, synced)** | **290.9 ms** | **288.0 ms** |
-| 4a. plan excl admit | 0.0 ms | 0.0 ms |
-| 4b. forward host | 2.8 ms | 2.7 ms |
-| 4c. step remainder | 0.1 ms | 0.1 ms |
-| wall | 211.0 s | 209.9 s |
-| kernel first step | 629 ms | 613 ms |
-| kernel rest median per chunk | 123.8 ms | 118.4 ms |
+| 1. tokenize + render | **VOID** 0.4 ms | 0.4 ms |
+| 2. admit (block alloc) | **VOID** 0.1 ms | 0.1 ms |
+| **3. kernel (Model.forward, synced)** | **VOID 290.9 ms** | **288.0 ms** |
+| 4a. plan excl admit | **VOID** 0.0 ms | 0.0 ms |
+| 4b. forward host | **VOID** 2.8 ms | 2.7 ms |
+| 4c. step remainder | **VOID** 0.1 ms | 0.1 ms |
+| wall | **VOID 211.0 s** | 209.9 s |
+| kernel first step | **VOID** 629 ms | 613 ms |
+| kernel rest median per chunk | **VOID** 123.8 ms | 118.4 ms |
 
-The kernel is 1% faster per question and 4% faster per chunk at HEAD. The base-arm wall
-is flat. An earlier decomposition (a synced wrap of `Engine._run_forward`,
-`scripts/acc_spec_overhead.py`) had put prefill at 0.143s → 0.298s per question (2.1x)
-and named it the regression. The two instruments **agree at HEAD** (14.7 vs 14.4 s per
-50 questions) and **disagree 2x at 09657c0** (7.2-9.1 vs 14.55 s) — same sha, same
-workload, same engine parameters, both sync-wrapped, differing only in whether the sync
-sits outside `_run_forward` or inside `Model.forward`. The 09657c0 overhead reading is
-the outlier; the per-chunk direct measurement (123.8 ms) is the number that cannot be
-argued with, and it says HEAD is faster. The mechanism of the disagreement is not
-explained from the code — it is recorded here as an open question, not a conclusion.
-What changed between the shas is *where the prefill GPU time gets charged* (the
-decode_s/wall_s fall 0.936 → 0.860 is the same boundary move seen from the decode
-side), not how long it takes.
+The "kernel is 1% faster per question and 4% faster per chunk at HEAD" claim is
+**VOID** — the 09657c0 column was HEAD. The base-arm wall "flat" claim is VOID
+for the same reason. An earlier decomposition (a synced wrap of
+`Engine._run_forward`, `scripts/acc_spec_overhead.py`) had put prefill at
+0.143s → 0.298s per question (2.1x) and named it the regression. The two
+instruments **agree at HEAD** (14.7 vs 14.4 s per 50 questions) and **disagree
+2x at "09657c0"** (7.2-9.1 vs 14.55 s) — but the "09657c0" tree was HEAD, so
+the disagreement was HEAD-vs-HEAD noise, not a timing-boundary move. The
+mechanism of the disagreement was never explained from the code — it is
+recorded here as an open question, not a conclusion, and no story was invented
+for it. That stance was correct even though the phenomenon itself is now known
+to be noise.
 
-**The fp8→bf16 hypothesis is dead.** A proposed explanation was that the prefill
-activation path fell back from fp8 to bf16 kernels (~2x). Runtime dispatch at 09657c0
+**The fp8→bf16 hypothesis is untested — VOID test.** A proposed explanation was that the prefill
+activation path fell back from fp8 to bf16 kernels (~2x). Runtime dispatch at "09657c0"
 is all-fp8 (`linear_fp4` → `linear_fp4_fp8`, `linear_fp8` → `linear_fp8` /
 `linear_fp8_gemv`, zero bf16), and the phase derivation (`m==1` gemv / `m<=16` decode /
 else prefill), the `_MX=8` / `_MGEMV=3` thresholds, and the `_CUDA_PLAN` table are
-byte-identical at the two shas. The hypothesis predicted a ~2x kernel at HEAD; the
-measurement is −1%.
+byte-identical at the two shas. **But both trees were HEAD**, so "all-fp8 at both shas"
+was trivially true and proved nothing about 09657c0. The hypothesis is neither
+confirmed nor refuted; it is untested. The hypothesis predicted a ~2x kernel at HEAD;
+the measurement is −1% — but the measurement's baseline was void.
 
-**What remains is spec-arm-specific, ~4% of wall, and unlocated.** The apples-to-apples
-comparison is 09657c0 → current: 131.7 → 126.5 tok/s on 200 questions (−3.9%), and
-123.1s → 128.4s on the 50-question overhead harness (+4.3% wall). The tick improved,
-the base-arm wall is flat, so the regression lives in the spec arm's non-decode path —
-the draft-coupled prefill steps (`hidden_out` / `aux_layers` / `draft.step`), which the
-base-arm profile above does not see. The next instrument is a spec-arm prefill profile.
+**What remains is unmeasured — the "spec-arm-specific ~4%" was noise.** The
+apples-to-apples comparison was 09657c0 → current: 131.7 → 126.5 tok/s on 200
+questions (−3.9%), and 123.1s → 128.4s on the 50-question overhead harness
+(+4.3% wall). **Both endpoints were HEAD** — the 4% was run-to-run noise
+between identical-code runs. There is no evidence for a spec-arm regression,
+and no evidence against one; the question is unmeasured pending a true 09657c0
+baseline. The draft-coupled prefill path (`hidden_out` / `aux_layers` /
+`draft.step`) remains the right place to look *if* a real gap reappears once a
+valid baseline exists.
 
-**The 09657c0 arm gap is an arm-order artifact.** Base prefill (9.1s) exceeded spec
-(7.2s) at 09657c0; a reversed-order run (spec first) flips it — spec 10.2s, base 7.1s.
-Whichever arm runs first pays a ~2-3s one-time cost in its prefill bucket (warm JIT
-cache, 0 compiles — not compilation). The comparable second-arm numbers are 7.1-7.2s
-per 50 questions at 09657c0 vs 14.9s at the current sha in the overhead harness — but
-per the instrument disagreement above, that 2.1x is a boundary move, not a cost.
+**The 09657c0 arm gap is an arm-order artifact — survives as a HEAD conclusion.**
+Base prefill (9.1s) exceeded spec (7.2s) at "09657c0"; a reversed-order run
+(spec first) flips it — spec 10.2s, base 7.1s. Whichever arm runs first pays a
+~2-3s one-time cost in its prefill bucket (warm JIT cache, 0 compiles — not
+compilation). This is a within-tree comparison, so it is real — but it is a
+conclusion about HEAD, not about 09657c0, since both trees were HEAD. The
+comparable second-arm numbers are 7.1-7.2s vs 14.9s, but both are HEAD.
 
 **The prefix-reuse hypothesis is dead by construction.** A proposed explanation for
 the convergence was that prefix reuse broke: GSM8K prompts share a chat-template
@@ -164,9 +183,9 @@ measurement.
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
 | 2026-09-09 | f80e894 | H20 card 6 | cuda/sm90 decode-graph | Qwen3.8-27B-NVFP4 + DFlash2 | — | W=1 11.56 / W=8 41.96 | 126.5 spec / 79.5 base (B=1, 200 GSM8K, 512 cap) |
-| 2026-09-09 | 09657c0 | H20 card 6 | cuda/sm90 decode-graph | Qwen3.8-27B-NVFP4 + DFlash2 | — | W=1 11.77 / W=8 43.52 | 131.7 spec / 81.9 base (B=1, 200 GSM8K, 512 cap) |
+| 2026-09-09 | 09657c0 | H20 card 6 | cuda/sm90 decode-graph | Qwen3.8-27B-NVFP4 + DFlash2 | — | **VOID** W=1 11.77 / W=8 43.52 | **VOID** 131.7 spec / 81.9 base — tree was HEAD |
 | 2026-09-09 | f80e894 | H20 card 6 | cuda/sm90 decode-graph | Qwen3.8-27B-NVFP4 | 288.0 ms/q kernel | — | base wall 209.9 s / 50q (five-bucket profile) |
-| 2026-09-09 | 09657c0 | H20 card 6 | cuda/sm90 decode-graph | Qwen3.8-27B-NVFP4 | 290.9 ms/q kernel | — | base wall 211.0 s / 50q (five-bucket profile) |
+| 2026-09-09 | 09657c0 | H20 card 6 | cuda/sm90 decode-graph | Qwen3.8-27B-NVFP4 | **VOID** 290.9 ms/q kernel | — | **VOID** base wall 211.0 s — tree was HEAD |
 
 Raw artifacts: `/work/acctick.log` (current sha) and `/work/acctick0.log` (09657c0) on
 the pod, both 0-compile; per-arm JSONs under `/work/accspec_tick/` and `/work/accspec_tick0/`;
