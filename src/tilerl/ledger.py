@@ -199,7 +199,7 @@ def new_best_point(pt: dict, best: dict | None, se: float | None = None,
 
 
 def curve_churn(prev: list[dict] | None, cur: list[dict]) -> tuple[int, int] | None:
-    """Per-question flips between two adjacent curve points, paired by row position:
+    """Per-question flips between two adjacent curve points, paired by the ``i`` key:
     ``(right->wrong, wrong->right)``. The run's own instrument reading, recorded per
     point, so a "these two points differ by N questions" claim has N's measurement
     beside it. The same-batch instrument floor is 0 -- fixed weights re-scored on the
@@ -209,17 +209,22 @@ def curve_churn(prev: list[dict] | None, cur: list[dict]) -> tuple[int, int] | N
     the two evals batched the problems differently (an after-arm against a curve
     point, or two runs) -- never quote it inside one run.
 
-    Comparable ONLY within one run: ``curve_rows`` is sliced once outside the loop
-    and ``per_problem`` is written in input order, so position pairs the same
-    question at both points. Across runs the positions mean different questions --
-    never subtract two runs' churn. None when there is no predecessor (the first
-    point) or the rows do not pair (different lengths): null, not 0, because 0 means
-    "no flips" and null means "no comparable point".
+    Comparable ONLY within one run: ``curve_rows`` is sliced once outside the loop,
+    so the same ``i`` is the same question at both points. (Rows land in COMPLETION
+    order since the eval arm writes incrementally -- that is why pairing is by ``i``,
+    not position.) Across runs the keys mean different questions -- never subtract
+    two runs' churn. None when there is no predecessor (the first point), the rows
+    do not pair (different lengths or ``i`` sets), or a row lacks ``i``: null, not 0,
+    because 0 means "no flips" and null means "no comparable point".
     """
-    if not prev or len(prev) != len(cur):
+    if not prev or len(prev) != len(cur) or any("i" not in r for r in prev + cur):
         return None
-    rb = sum(1 for a, b in zip(prev, cur) if a["correct"] and not b["correct"])
-    br = sum(1 for a, b in zip(prev, cur) if not a["correct"] and b["correct"])
+    pb = {r["i"]: r for r in prev}
+    cb = {r["i"]: r for r in cur}
+    if pb.keys() != cb.keys():
+        return None
+    rb = sum(1 for k in pb if pb[k]["correct"] and not cb[k]["correct"])
+    br = sum(1 for k in pb if not pb[k]["correct"] and cb[k]["correct"])
     return rb, br
 
 
@@ -509,13 +514,17 @@ if __name__ == "__main__":  # runnable check
     p3 = {"step": 15, "score": .820}
     assert significant_decline(p3, p2, 6.0)       # vs the drifted raw peak: -13.0 pt
     assert not significant_decline(p3, p1, 6.0)   # vs the significant peak: -12.0 pt, not > 2xSE
-    # Curve churn: the run's own instrument reading, recorded per point. Adjacent points pair
-    # by position within one run; across runs the positions mean different questions.
-    # The first point has no predecessor: null, not 0 -- 0 means "no flips", null means
-    # "no comparable point". Different lengths are null too, not a partial count.
+    # Curve churn: the run's own instrument reading, recorded per point. Adjacent
+    # points pair by the ``i`` key within one run (rows land in completion order
+    # since the eval arm writes incrementally); across runs the keys mean different
+    # questions. The first point has no predecessor: null, not 0 -- 0 means "no
+    # flips", null means "no comparable point". Different lengths or i sets are
+    # null too, not a partial count.
     rows = [{"i": i, "correct": bool(c)} for i, c in enumerate((1, 1, 0, 0))]
     flipped = [{"i": i, "correct": bool(c)} for i, c in enumerate((1, 0, 0, 1))]
     assert curve_churn(rows, flipped) == (1, 1)  # one right->wrong, one wrong->right
+    assert curve_churn(rows, flipped[::-1]) == (1, 1)  # completion order: pairs by i
     assert curve_churn(None, rows) is None       # first point: no predecessor
     assert curve_churn(rows, rows[:3]) is None   # different n: not comparable
+    assert curve_churn(rows, [{"i": i + 1, "correct": True} for i in range(4)]) is None
     print("ledger: ids + best-point selection OK")
