@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -90,6 +91,21 @@ def _timed_draft_step(orig, rows):
 engine_mod.Engine._run_forward = _timed_run_forward
 
 
+def _gpu_state():
+    # Who else is on the card at run start is part of this measurement's
+    # population (27, 2026-09-09: a card shared with a 100%-util job produces
+    # mixed tok/s that voids the 3.4% criterion).
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.used,utilization.gpu",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return out
+    except Exception:
+        return "nvidia-smi unavailable"
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", required=True)
@@ -102,7 +118,9 @@ def main() -> None:
 
     sha, dirty = git_commit(), git_dirty()
     card = os.environ.get("CUDA_VISIBLE_DEVICES", "?")
-    print(f"=== acc_spec_prefill_profile  sha={sha}  dirty={dirty}  card={card}  draft={'yes' if args.draft else 'no'} ===")
+    gpu = _gpu_state()
+    print(f"=== acc_spec_prefill_profile  sha={sha}  dirty={dirty}  card={card}  "
+          f"gpu_at_start[{gpu}]  draft={'yes' if args.draft else 'no'} ===")
 
     from tilerl_kernels.backend import get_backend
 
@@ -185,7 +203,8 @@ def main() -> None:
     engine_prefill = getattr(engine, "_prefill_secs", None)
 
     report = {
-        "provenance": {"git_commit": sha, "git_dirty": dirty, "card": card},
+        "provenance": {"git_commit": sha, "git_dirty": dirty, "card": card,
+                       "gpu_at_start": gpu},
         "wall": wall,
         "tok_s": (tok_gen / wall) if wall else 0.0,
         "buckets": {
