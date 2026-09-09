@@ -1,6 +1,8 @@
 # Speculative decode in the engine — H20, 2026-08-29
 
-> Status: pending-remote
+> Status: Shipped — the 27B goodput question is answered as of 2026-09-09; see
+> [`2026-09-09-spec-decode-h20-b1-loses-on-the-serving-build.md`](2026-09-09-spec-decode-h20-b1-loses-on-the-serving-build.md).
+> On the H20 serving build, B=1 spec is a net loss at every depth (depth 1: 0.986x).
 
 ## Context
 
@@ -35,6 +37,7 @@ mis-indexing either half of the rewind (state or conv window) fails that gate,
 and so does writing the step planes at full pool width instead of the tick's.
 
 Unmeasured here: acceptance rate and ms/tick on the 27B. No GPU on this host.
+Measured 2026-09-09 on H20 card 6 — see the entry linked at the top.
 
     CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src TILERL_TARGET=cuda \
       python3 scripts/bench_batch_decode.py /data00/Qwen3.8-27B-NVFP4 \
@@ -49,10 +52,15 @@ baseline arm.
 Pending. Nothing about spec-decode goodput on the 27B is settled until the
 command above runs on GPU 7.
 
+Settled 2026-09-09 on H20 card 6: on the serving build, B=1 spec loses at every
+depth (depth 1: 0.986x baseline). The machinery works; the H20's rung prices do
+not pay for it at B=1. Full table in the 2026-09-09 entry linked at the top.
+
 ## Results
 
 | date | commit | machine | target | model | prefill ms/tok | decode ms/tok | throughput tok/s |
 |---|---|---|---|---|---:|---:|---:|
-| | | | | | | | |
+| 2026-09-09 | 53d349a | H20 card 6 | cuda/sm90 fused+graph | Qwen3.8-27B-NVFP4 | — | 10.569 baseline / 20.718 d1 | 94.6 / 93.3 (B=1) |
 
-Raw artifacts: pending-remote.
+Raw artifacts: `/work/specg2{base,d1,d2,d3}.log` on the pod; full table in the
+2026-09-09 entry.
