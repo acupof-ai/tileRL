@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import torch
 
 from tilerl import cli
 
@@ -18,6 +19,13 @@ class _Backend:
         name = "H20"
 
 
+class _CPUBackend:
+    arch = "cpu"
+
+    class device:
+        type = "cpu"
+
+
 @pytest.fixture
 def tmp_store(tmp_path, monkeypatch):
     benchrec = cli._benchrec()
@@ -27,6 +35,8 @@ def tmp_store(tmp_path, monkeypatch):
 
 def test_emit_eval_records(tmp_store, monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda d: "NVIDIA H20")
     lens = list(range(200))  # mean 99.5, nonzero spread
     cli._emit_eval_records(190, 200, sum(lens), lens, 0, _Backend())
     cli._emit_eval_records(196, 200, 20000, [100] * 200, 100, _Backend())
@@ -44,7 +54,18 @@ def test_emit_eval_records(tmp_store, monkeypatch):
     worse = by[("rollout_tokens", 100, 110.0)]
     assert worse["floor"]["value"] == 100.0  # anchored at the best (lowest) prior value
     for r in rows:
-        assert r["target"] == "sm90" and r["device"] == {"name": "H20", "card": 6}
+        assert r["target"] == "sm90" and r["device"] == {"name": "NVIDIA H20", "card": 6}
         assert r["floor"]["kind"] == "measured-best"
         assert r["n"] == 200 and r["spread"] >= 0
         assert len(r["commit"]) == 40 and isinstance(r["dirty"], bool)
+
+
+def test_emit_eval_records_cpu(tmp_store, monkeypatch):
+    """No CUDA: no card, name falls back to the backend or 'cpu'."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    cli._emit_eval_records(190, 200, 20000, [100] * 200, 0, _CPUBackend())
+    rows = [json.loads(l) for l in tmp_store.STORE.read_text().splitlines()]
+    assert len(rows) == 2
+    for r in rows:
+        assert r["device"] == {"name": "cpu"}
+        assert "card" not in r["device"]
