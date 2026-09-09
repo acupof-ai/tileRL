@@ -187,7 +187,7 @@ def measure(e, ctx: int, tokens: int, batch: int = 1, vocab: int = 0) -> tuple[f
 
 
 def timed(e, ctx: int, tokens: int, batch: int = 1, vocab: int = 0,
-          repeats: int = 2) -> tuple[float, float, float, float, str]:
+          repeats: int = 2, backend=None) -> tuple[float, float, float, float, str, int]:
     """Warm this context, then measure it ``repeats`` times, and report the spread.
 
     A speculative run captures a CUDA graph per (batch, chain width), and a
@@ -209,7 +209,8 @@ def timed(e, ctx: int, tokens: int, batch: int = 1, vocab: int = 0,
     whole card, and the orphan is invisible until the next run OOMs.
     """
     measure(e, ctx, tokens, batch, vocab)  # JIT + capture absorber, never timed
-    draws = [measure(e, ctx, tokens, batch, vocab)[:2] for _ in range(max(2, repeats))]
+    with benchrec.compiles_window(backend) as cw:
+        draws = [measure(e, ctx, tokens, batch, vocab)[:2] for _ in range(max(2, repeats))]
     tps = [d[0] for d in draws]
     pf = [d[1] for d in draws]
     mean_tps, mean_pf = sum(tps) / len(tps), sum(pf) / len(pf)
@@ -218,7 +219,8 @@ def timed(e, ctx: int, tokens: int, batch: int = 1, vocab: int = 0,
     # with one draw against another and no third opinion.
     return (mean_tps, mean_pf, (max(tps) - min(tps)) / mean_tps,
             (max(pf) - min(pf)) / mean_pf,
-            " UNWARMED" if max(tps) > 2 * min(tps) else "")
+            " UNWARMED" if max(tps) > 2 * min(tps) else "",
+            cw["compiles"])
 
 
 def main() -> None:
@@ -319,8 +321,8 @@ def main() -> None:
     print(f"\n{label} B={args.batch} ({rows} rows/tick), {args.repeats} timed draws/point: "
           f"{'ctx':>6} {'tok/s':>8} {'ms/tok':>8} {'tok/fwd':>8} {'s_tps':>7} {'s_tpf':>7}")
     for ctx in ctxs:
-        tps, per_fwd, s_tps, s_pf, flag = timed(
-            e, ctx, args.tokens, args.batch, cfg.vocab_size, args.repeats)
+        tps, per_fwd, s_tps, s_pf, flag, compiles = timed(
+            e, ctx, args.tokens, args.batch, cfg.vocab_size, args.repeats, backend)
         print(f"{ctx:>6} {tps:>8.1f} {1000 / tps:>8.1f} {per_fwd:>8.2f} "
               f"{s_tps:>6.1%} {s_pf:>6.1%}{flag}")
         if flag:
@@ -331,7 +333,7 @@ def main() -> None:
         rec = {
             "metric": metric, "value": round(tps, 1), "unit": "tok/s",
             "shape": {"batch": args.batch, "ctx": ctx},
-            "warm": {"state": "warm", "compiles": 0},
+            "warm": {"state": "warm", "compiles": compiles},
             "n": max(2, args.repeats), "spread": round(s_tps, 4), **common,
         }
         rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=False)
@@ -346,7 +348,7 @@ def main() -> None:
                 srec = {
                     "metric": "spec_goodput_ratio", "value": round(tps / dense_best, 3),
                     "unit": "ratio", "shape": {"batch": args.batch, "ctx": ctx, "depth": args.depth},
-                    "warm": {"state": "warm", "compiles": 0},
+                    "warm": {"state": "warm", "compiles": compiles},
                     "n": 1, "spread": 0.0, **common,
                 }
                 srec["floor"] = {

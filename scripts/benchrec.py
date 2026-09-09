@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -200,9 +201,10 @@ def validate(record: dict, registry: dict, existing_ids: set) -> list[str]:
 
     warm = record["warm"]
     if not isinstance(warm, dict) or "compiles" not in warm:
-        errs.append("warm.compiles missing (0 is an assertion; absent is unmeasured)")
-    elif not isinstance(warm["compiles"], int) or warm["compiles"] < 0:
-        errs.append("warm.compiles must be an int >= 0")
+        errs.append("warm.compiles missing (null = unmeasured; the field is never omitted)")
+    elif warm["compiles"] is not None and (
+            not isinstance(warm["compiles"], int) or warm["compiles"] < 0):
+        errs.append("warm.compiles must be an int >= 0 or null (unmeasured)")
     if not isinstance(warm, dict) or warm.get("state") not in ("cold", "warm"):
         errs.append("warm.state must be 'cold' or 'warm'")
 
@@ -345,6 +347,18 @@ def add_record_args(
                         help="allow a --device-name not yet seen in the store")
 
 
+@contextmanager
+def compiles_window(backend):
+    """The window's compile count as a measured value: len(backend._kernels) at
+    exit minus entry. `_kernel` (backend.py) is the only compile path, so the
+    difference counts JIT entries exactly. A measured 0 and an unmeasured null
+    are different values in the store -- this is the measured side."""
+    before = len(backend._kernels)
+    holder: dict = {}
+    yield holder
+    holder["compiles"] = len(backend._kernels) - before
+
+
 def known_devices() -> set[str]:
     """device.name values already in the store — the self-maintaining known set.
     A hand-typed --device-name is checked against this, not a hand-maintained
@@ -467,6 +481,10 @@ if __name__ == "__main__":
     del bad["warm"]["compiles"]
     assert validate(bad, reg, set()), "warm without compiles must reject"
 
+    nullc = json.loads(json.dumps(good))
+    nullc["warm"]["compiles"] = None
+    assert validate(nullc, reg, set()) == [], validate(nullc, reg, set())
+
     bad = json.loads(json.dumps(good))
     bad["floor"] = {"value": 1.0, "unit": "%", "kind": "baseline", "derivation": "no known floor"}
     assert validate(bad, reg, set()), "forged floor must reject"
@@ -552,6 +570,16 @@ if __name__ == "__main__":
             raise AssertionError("client-side record_common must reject without --target")
         except SystemExit:
             pass
+
+        import types
+
+        fb = types.SimpleNamespace(_kernels={})
+        with compiles_window(fb) as w:
+            fb._kernels["x"] = 1
+        assert w["compiles"] == 1, w
+        with compiles_window(fb) as w:
+            pass
+        assert w["compiles"] == 0, w
     finally:
         STORE = old_store
 

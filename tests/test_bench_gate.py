@@ -176,3 +176,24 @@ def test_a_query_view_never_writes_the_store(tmp_path):
         env=env, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr
     assert store.read_bytes() == b""
+
+
+def test_compiles_window_counts_a_real_compile():
+    """warm.compiles is a measured value, not an asserted 0: a compile in the window
+    must register as > 0 through the same expression the engine-direct collectors use.
+    2026-09-10: every store row carried compiles=0 hand-filled, and a B=1 arm's 756
+    compiles in the timed window was invisible because the field could not say it."""
+    import benchrec
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl.config import tiny
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.model import build_random
+
+    backend = get_backend()
+    engine = build_engine(tiny(), build_random(tiny(), seed=7), backend,
+                          num_blocks=8, num_slots=2)
+    with benchrec.compiles_window(backend) as w:
+        engine.submit([1, 2, 3], SamplingParams(max_new_tokens=4, temperature=0.0))
+        engine.step()
+    assert w["compiles"] > 0, "the first tick compiles kernels; a 0 here means the field is blind"

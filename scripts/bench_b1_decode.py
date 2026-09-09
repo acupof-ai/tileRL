@@ -84,7 +84,7 @@ def main() -> None:
     rid = benchrec.append({
         "metric": "decode_tok_s", "value": round(rate, 2), "unit": "tok/s",
         "shape": {"batch": 1, "ctx": pt},
-        "warm": {"state": "warm", "compiles": 0},
+        "warm": {"state": "warm", "compiles": None},
         "n": args.repeat, "spread": round(spread, 4),
         **common,
         "floor": {"value": 129.0, "unit": "tok/s", "kind": "roofline",

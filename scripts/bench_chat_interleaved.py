@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 import urllib.request
@@ -146,23 +145,27 @@ def _post_stream(url: str, body: dict, timeout: float) -> tuple[dict, float]:
 
 
 def _compiles(path: str) -> int:
-    """`begins to compile` lines in the server's own log, or -1 when it was not given.
+    """`begins to compile` lines in the server's own log, or -1 when unmeasured.
 
-    An EMPTY file returns -1, not 0. A `python3` (no `-u`) server redirected to a file
-    block-buffers stdout and the arm's `kill $SRV` is a SIGTERM, so nothing is ever
-    flushed: measured on the pod, a process that had already printed the marker left
-    0 bytes after 3 s and 0 after SIGTERM, while the same process under `python3 -u`
-    left 38 bytes. Every cell of the 2026-09-08 DRAM grid reported `compiles: clean`
-    against a 0-byte log -- a green verdict that could not have gone red.
+    Positive control: the log must contain `tilerl serve: http` -- the line
+    `cmd_serve` prints on startup. Reword it there and this control silently
+    stops matching, every row goes null, so change both together. It prints
+    once at startup, right before uvicorn.run. A log without it is the wrong file,
+    a rotated file, or a buffered file that never flushed -- and a grep that finds
+    no pattern there returns 0, the one value that reads as "everything clean".
+    Measured on the pod: a `python3` (no `-u`) server redirected to a file leaves
+    0 bytes after SIGTERM, and every cell of the 2026-09-08 DRAM grid reported
+    `compiles: clean` against such a log -- a verdict that could not have gone red.
     """
     if not path:
         return -1
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            n = sum("begins to compile" in line for line in f)
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return -1
-    return n if n else (-1 if os.path.getsize(path) == 0 else 0)
+    if "tilerl serve: http" not in text:
+        return -1
+    return sum("begins to compile" in line for line in text.splitlines())
 
 
 def _get(url: str) -> dict:
@@ -218,7 +221,6 @@ def main() -> int:
     # would agree with the first by construction and could not catch a rendering that dropped
     # the system turn.
     sys_seen = 0
-    n_skipped = 0
     for turn in range(args.turns):
         for c, filler in enumerate(fillers):
             convs[c].append({"role": "user", "content": filler * args.grow * (turn + 1)})
@@ -268,21 +270,18 @@ def main() -> int:
             rows.append({"turn": turn, "conv": _label(c), "prompt_tokens": n,
                          "wall_s": round(wall, 2), "ttft_s": round(ttft, 2),
                          "compiles": compiles, **pool, **resident, **d})
-            # compiles is this turn's own delta; -1 means unknown (no --server-log).
-            # A turn that compiled, or whose compile status is unknown, is not a record:
-            # warm.compiles=0 is an assertion, and absent is unmeasured, not 0.
-            if compiles == 0:
-                rec = {
-                    "metric": "chat_turn_wall_s", "value": round(wall, 3), "unit": "s",
-                    "shape": {"turn": turn, "prompt_tokens": n,
-                              "sessions": args.sessions, "conv": _label(c)},
-                    "warm": {"state": "warm", "compiles": 0},
-                    "n": 1, "spread": 0.0, **benchrec.record_common(args),
-                }
-                rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=True)
-                print(f"  record {benchrec.append(rec)} appended", flush=True)
-            else:
-                n_skipped += 1
+            # compiles is this turn's measured delta from the server log; None when
+            # the log is missing or fails the startup-line positive control.
+            rec = {
+                "metric": "chat_turn_wall_s", "value": round(wall, 3), "unit": "s",
+                "shape": {"turn": turn, "prompt_tokens": n,
+                          "sessions": args.sessions, "conv": _label(c)},
+                "warm": {"state": "warm",
+                         "compiles": None if compiles < 0 else compiles},
+                "n": 1, "spread": 0.0, **benchrec.record_common(args),
+            }
+            rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=True)
+            print(f"  record {benchrec.append(rec)} appended", flush=True)
             pct = 100.0 * pool["pool_used_blocks"] / max(1, pool["blocks_total"])
             # depth, not just hits: the count says a match happened, this says how much of the
             # prompt it spared. 512 of 30826 reports a hit and re-prefills 98% (2026-09-08).
@@ -323,9 +322,6 @@ def main() -> int:
     verdict = "unknown (no --server-log, or it is empty -- run serve under python3 -u)" \
         if not known else dirty or "clean"
     print(f"compiles: {verdict}", flush=True)
-    if n_skipped:
-        print(f"records skipped: {n_skipped} turns compiled or had unknown compile status "
-              f"(pass --server-log under python3 -u to make them records)", flush=True)
     peak = max((r["pool_used_blocks"] for r in rows), default=0)
     tot = max((r["blocks_total"] for r in rows), default=0)
     print(f"pool peak: {peak}/{tot} blocks ({100.0 * peak / max(1, tot):.1f}%)", flush=True)

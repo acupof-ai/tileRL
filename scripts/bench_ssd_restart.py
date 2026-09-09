@@ -167,11 +167,22 @@ def _arm_log(args, name: str) -> str:
 
 
 def _compiles(log: str) -> int:
+    """`begins to compile` lines in this arm's server log, or -1 when unmeasured.
+
+    Positive control: the log must contain `tilerl serve: http` -- the line
+    `cmd_serve` prints on startup. Reword it there and this control silently
+    stops matching, every row goes null, so change both together. It prints
+    once at startup. A log without it is the wrong file or a buffered file that
+    never flushed -- a grep finding no pattern there returns 0, the one value that
+    reads as "everything clean"."""
     try:
         with open(log, encoding="utf-8", errors="replace") as f:
-            return sum("begins to compile" in line for line in f)
+            text = f.read()
     except OSError:
         return -1
+    if "tilerl serve: http" not in text:
+        return -1
+    return sum("begins to compile" in line for line in text.splitlines())
 
 
 def _stop(proc: subprocess.Popen) -> None:
@@ -695,7 +706,7 @@ def main() -> None:
             rec = {
                 "metric": "ssd_restart_speedup", "value": val, "unit": "ratio",
                 "shape": {"prompt_tokens": faulted["prompt_tokens"], "arm": arm},
-                "warm": {"state": "warm", "compiles": 0},
+                "warm": {"state": "warm", "compiles": None},
                 "n": 1, "spread": 0.0, **common,
             }
             rec["floor"] = {
@@ -708,7 +719,7 @@ def main() -> None:
                 "metric": "ssd_restart_speedup", "value": verdict["composed_speedup"],
                 "unit": "ratio",
                 "shape": {"prompt_tokens": faulted["prompt_tokens"], "arm": "reboot-evicted"},
-                "warm": {"state": "warm", "compiles": 0},
+                "warm": {"state": "warm", "compiles": None},
                 "n": 1, "spread": 0.0, **common,
             }
             rec["floor"] = {

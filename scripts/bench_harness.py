@@ -283,7 +283,8 @@ def suite_prefill(gate, cfg, model, backend, lengths, build, model_name, device)
     print(f"  {'len':>7} {'ms/tok':>10} {'tok/s':>10} {'spread':>8}")
     for length in sorted({min(x, cap) for x in lengths}):
         bk.time_prefill(engine, backend, cfg, length, 1.0)  # JIT for this length, outside the window
-        runs = [bk.time_prefill(engine, backend, cfg, length, 1.0) for _ in range(3)]
+        with benchrec.compiles_window(backend) as cw:
+            runs = [bk.time_prefill(engine, backend, cfg, length, 1.0) for _ in range(3)]
         ms, tps = sorted(runs, key=lambda r: r[1])[1]
         spread = (max(r[1] for r in runs) - min(r[1] for r in runs)) / tps
         print(f"  {length:>7} {ms / length:>10.4f} {tps:>10.1f} {100 * spread:>7.1f}%")
@@ -298,7 +299,7 @@ def suite_prefill(gate, cfg, model, backend, lengths, build, model_name, device)
             "metric": "prefill_tok_s", "value": round(tps, 1), "unit": "tok/s",
             "target": backend.arch, "build": build, "model": model_name,
             "shape": {"ctx": length},
-            "warm": {"state": "warm", "compiles": 0},
+            "warm": {"state": "warm", "compiles": cw["compiles"]},
             "n": 3, "spread": round(spread, 4),
             "device": device, "commit": benchrec.git_commit(), "dirty": benchrec.git_dirty(),
             "cmd": " ".join(sys.argv),
@@ -631,12 +632,13 @@ def suite_train(gate, backend, source, full=False):
             _free(backend)
             continue
         samples = []
-        for _ in range(3):
-            sync()
-            s = time.perf_counter()
-            train_step(mdl, ids, backend, opt, trainable=trainable)
-            sync()
-            samples.append(time.perf_counter() - s)
+        with benchrec.compiles_window(backend) as cw:
+            for _ in range(3):
+                sync()
+                s = time.perf_counter()
+                train_step(mdl, ids, backend, opt, trainable=trainable)
+                sync()
+                samples.append(time.perf_counter() - s)
         ms = statistics.median(samples) * 1e3
         spread = (max(samples) - min(samples)) / statistics.median(samples)
         tok_s = b * t / (ms / 1e3)
@@ -650,7 +652,7 @@ def suite_train(gate, backend, source, full=False):
         gate.check("train", f"{model_name}-b{b}t{t}", tok_s, spread=spread)
         # Ruler record. Training engines never capture a graph or draft, so
         # build is "eager" by construction; the warmup step above covers JIT +
-        # tape shapes, so compiles=0 in the timed window is an assertion.
+        # tape shapes, and compiles is the measured window delta (0 = clean).
         vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
         ns = types.SimpleNamespace(
             build="eager", target=backend.arch, device_name="",
@@ -659,7 +661,7 @@ def suite_train(gate, backend, source, full=False):
         rec = {
             "metric": "train_step_tok_s", "value": round(tok_s, 1), "unit": "tok/s",
             "shape": {"batch": b, "ctx": t},
-            "warm": {"state": "warm", "compiles": 0},
+            "warm": {"state": "warm", "compiles": cw["compiles"]},
             "n": 3, "spread": round(spread, 4),
             **benchrec.record_common(ns),
         }

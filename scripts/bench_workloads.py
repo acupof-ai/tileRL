@@ -205,7 +205,7 @@ def main() -> None:
         rec = {
             "metric": "decode_tok_s", "value": round(rate, 1), "unit": "tok/s",
             "shape": {"batch": 1, "ctx": pt, "workload": name},
-            "warm": {"state": "warm", "compiles": 0},
+            "warm": {"state": "warm", "compiles": None},
             "n": 1, "spread": 0.0, **common,
         }
         rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=False)
