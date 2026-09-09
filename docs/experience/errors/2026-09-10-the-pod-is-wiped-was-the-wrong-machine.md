@@ -62,9 +62,10 @@ boundary.
 
 ## Rule
 
-"东西不见了"和"我在别处找"在终端里长得完全一样，而后者远比前者常见。
-在得出"X 没了"之前，先证明你在对的地方——用一个必须存在的东西做正对照。
-报缺失、报占用、报归属，一律先给机器和路径的原文，再给结论。
+"X is gone" and "I looked in the wrong place" look identical in a terminal,
+and the latter is far more common. Before concluding X is missing, prove you
+are in the right place with a thing that must exist. Report absence, occupancy,
+or ownership with the machine and path verbatim before the conclusion.
 
 This is the same family as `a-negative-grep-needs-a-positive-control`:
 a negative reading needs a positive control. The control here is not a
@@ -98,7 +99,7 @@ as the pod).
 rerun might still be running: card 3 at 0 MiB means the run finished or
 died, but which one is unanswered. Deleting the claim would strip a
 possibly-live job's claim — the exact failure the team spent an hour
-chasing that night, with the加害方 being us this time.
+chasing that night, with us being the offending party this time.
 
 **The `.get()` default does not cover an explicit `null`.**
 `int(c.get("pid", -1))` returns `-1` when the key is absent, but when
@@ -111,9 +112,10 @@ is a denial of service. (The fix belongs to aupai, not us:
 
 ## Rule (second incident)
 
-归属读文件名前缀，不读 note。一个字段的权威答案在它自己的字段里，
-不在相邻字段的叙述里。删任何 claim 之前，先确认它不是一个活着的作业的——
-卡上 0 MiB 只说明进程不在了，不说明 run 结束了。
+Read ownership from the filename prefix, not the note. A field's authoritative
+answer lives in its own field, not in an adjacent field's narrative. Before
+deleting a claim, confirm it does not belong to a live job — 0 MiB on the card
+means the process is gone, not that the run ended.
 
 ### Zombie pids: three probes, three answers
 
