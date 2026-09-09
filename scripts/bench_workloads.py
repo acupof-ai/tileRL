@@ -141,7 +141,7 @@ def main() -> None:
     ap.add_argument("--hi", type=int, default=288)
     ap.add_argument("--url", default="http://localhost:8000")
     ap.add_argument("--only", help="run one workload by name")
-    benchrec.add_record_args(ap)
+    benchrec.add_record_args(ap, client_side=True)
     args = ap.parse_args()
 
     rows = []

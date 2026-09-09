@@ -59,7 +59,7 @@ def main() -> int:
     ap.add_argument("--grow", type=int, default=40)
     ap.add_argument("--max-tokens", type=int, default=16)
     ap.add_argument("--timeout", type=float, default=1800.0)
-    benchrec.add_record_args(ap)
+    benchrec.add_record_args(ap, client_side=True)
     args = ap.parse_args()
 
     head = {"role": "user", "content": _FILLER * args.grow}

@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import bench_harness as bh  # noqa: E402
+import benchrec  # noqa: E402
 
 
 def _gate(monkeypatch, tmp_path, rows):
@@ -74,3 +75,23 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_client_side_collector_cannot_default_the_server_device():
+    """A client-side collector measures a remote server it cannot see, so it must not
+    default any field describing that server. 2026-09-09: bench_chat_cold_warm and two
+    siblings defaulted --device-name to H20, and cpu runs landed in the store labeled
+    H20 -- a mislabeled row is worse than a missing one, because it enters every
+    device-grouped view and every measured-best comparison."""
+    import argparse
+
+    import pytest
+
+    ap = argparse.ArgumentParser()
+    benchrec.add_record_args(ap, client_side=True)
+    args = ap.parse_args(["--build", "eager", "--target", "cpu"])
+    with pytest.raises(SystemExit, match="--device-name required"):
+        benchrec.record_common(args)
+
+    ok = ap.parse_args(["--build", "eager", "--target", "cpu", "--device-name", "CPU"])
+    assert benchrec.record_common(ok)["device"]["name"] == "CPU"
