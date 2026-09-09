@@ -15,11 +15,21 @@ def _run(monkeypatch, texts, rows, match):
     row bookkeeping only. ids[i] is i repeated i+1 times, so token counts differ
     per problem and a row that copied the wrong length would show.
 
+    The fake drives ``on_row`` in prompt order -- the real engine fires in
+    completion order, which the eval.py selftest covers.
+
     `render_chat` is patched where it is DEFINED, not on tilerl.eval: gsm8k_accuracy
     imports it inside the function body, so an attribute set on the eval module is
     never read."""
     ids = [[i] * (i + 1) for i, _ in enumerate(texts)]
-    monkeypatch.setattr("tilerl.eval.generate_ids", lambda *a, **k: ids)
+
+    def _fake_generate_ids(engine, tok, prompts, sp, concurrency, on_row=None):
+        if on_row is not None:
+            for i, ids_i in enumerate(ids):
+                on_row(i, ids_i)
+        return ids
+
+    monkeypatch.setattr("tilerl.eval.generate_ids", _fake_generate_ids)
     monkeypatch.setattr("tilerl.prompt.render_chat", lambda *a, **k: "")
     tok = type("T", (), {"decode": staticmethod(lambda i: texts[i[0]])})()
     out: list = []

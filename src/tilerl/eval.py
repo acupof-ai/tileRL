@@ -27,13 +27,18 @@ def answer_match(text: str | None, answer: str) -> bool:
 
 
 def generate_ids(engine: Any, tok: Any, prompts: list[str], sp: Any,
-                 concurrency: int) -> list[list[int]]:
+                 concurrency: int, on_row: Any = None) -> list[list[int]]:
     """One completion per prompt, as the ids the engine emitted.
 
     Split out from ``generate`` because the token COUNT is a result, not
     bookkeeping: output tokens are the serving bill, and length is the one signal
     ``--judge`` cannot fake. Re-encoding the decoded text would answer a slightly
     different question -- decode/encode is not always a round trip.
+
+    ``on_row(i, ids)`` fires per completion as it lands, in COMPLETION order, so a
+    killed eval arm keeps what finished instead of all of it (the MATH before-arm
+    died at 1h40m with zero rows on disk). Rows carry ``i`` because completion
+    order is not prompt order.
     """
     out: list = [None] * len(prompts)
     pending, todo = {}, list(enumerate(prompts))
@@ -43,7 +48,10 @@ def generate_ids(engine: Any, tok: Any, prompts: list[str], sp: Any,
             pending[engine.submit(tok.encode(p), sp)] = i
         engine.step()
         for wid, ids in engine.poll().items():
-            out[pending.pop(wid)] = ids
+            i = pending.pop(wid)
+            out[i] = ids
+            if on_row is not None:
+                on_row(i, ids)
     return out
 
 
@@ -117,7 +125,7 @@ MATCHERS = {"number": answer_match, "boxed": boxed_match}
 def gsm8k_accuracy(engine: Any, tok: Any, rows: list[dict], sampling: Any,
                    concurrency: int = 8, thinking: bool | None = None,
                    match: Any = None, per_problem: list | None = None,
-                   ) -> tuple[int, int, int]:
+                   on_row: Any = None) -> tuple[int, int, int]:
     """(correct, total, completion tokens) on ``rows`` ({prompt, answer}), greedy
     under ``sampling``.
 
@@ -126,9 +134,13 @@ def gsm8k_accuracy(engine: Any, tok: Any, rows: list[dict], sampling: Any,
     as the same answer, 2, so a wrong rollout scores correct -- measured. The
     training reward already switched on ``--reward boxed`` while this did not.
 
-    ``per_problem`` receives one dict per row. Two arms over the same problems can
-    only get a paired interval if which problem went which way was written down;
-    P1's GSM8K comparison fell back to the wider unpaired one for want of it.
+    ``per_problem`` receives one dict per row, in prompt order. Two arms over the
+    same problems can only get a paired interval if which problem went which way
+    was written down; P1's GSM8K comparison fell back to the wider unpaired one
+    for want of it.
+
+    ``on_row(row)`` fires per scored row in COMPLETION order, so the caller can
+    write rows as they land; ``per_problem`` stays in prompt order regardless.
 
     ``sampling`` must NOT be the rollout's: at the training cap this scores the cap
     rather than the policy (38.4% with mean completion 238.7 against a 256 cap, and
@@ -144,11 +156,66 @@ def gsm8k_accuracy(engine: Any, tok: Any, rows: list[dict], sampling: Any,
 
     scorer = match or answer_match
     prompts = [render_chat([("user", r["prompt"])], thinking) for r in rows]
-    ids = generate_ids(engine, tok, prompts, replace(sampling, temperature=0.0), concurrency)
-    texts = [tok.decode(i) for i in ids]
-    hits = [bool(scorer(t, r["answer"])) for t, r in zip(texts, rows)]
+    scored: list[dict] = []
+
+    def _row(i: int, ids: list[int]) -> None:
+        row = {"i": i, "correct": bool(scorer(tok.decode(ids), rows[i]["answer"])),
+               "tokens": len(ids), "answer": rows[i]["answer"]}
+        scored.append(row)
+        if on_row is not None:
+            on_row(row)
+
+    generate_ids(engine, tok, prompts, replace(sampling, temperature=0.0), concurrency,
+                 on_row=_row)
+    scored.sort(key=lambda r: r["i"])
     if per_problem is not None:
-        per_problem.extend(
-            {"i": i, "correct": h, "tokens": len(d), "answer": r["answer"]}
-            for i, (h, d, r) in enumerate(zip(hits, ids, rows)))
-    return sum(hits), len(rows), sum(len(i) for i in ids)
+        per_problem.extend(scored)
+    return sum(r["correct"] for r in scored), len(rows), sum(r["tokens"] for r in scored)
+
+
+if __name__ == "__main__":
+    # Self-check: on_row fires per completion in COMPLETION order, and out[i] is the
+    # completion for prompt i -- an index-by-completion bug goes red here. The fake
+    # completes in reverse prompt order on purpose.
+    n = 12
+
+    class _Tok:
+        def encode(self, p):
+            return [int(p.rsplit("p", 1)[1])]
+
+        def decode(self, ids):
+            return f"p{ids[0]}"
+
+    class _ReverseEngine:
+        """Echoes the prompt ids; completes each in-flight batch in reverse prompt
+        order, so completion order is never prompt order."""
+
+        def __init__(self):
+            self.pending: dict = {}
+
+        def submit(self, input_ids, params):
+            wid = len(self.pending)
+            self.pending[wid] = list(input_ids)
+            return wid
+
+        def step(self):
+            pass
+
+        def poll(self):
+            if not self.pending:
+                return {}
+            done = {wid: ids for wid, ids in sorted(self.pending.items(), reverse=True)}
+            self.pending = {}
+            return done
+
+    seen: list = []
+    out = generate_ids(_ReverseEngine(), _Tok(), [f"p{i}" for i in range(n)],
+                       None, concurrency=4, on_row=lambda i, ids: seen.append((i, ids)))
+    assert len(seen) == n, (len(seen), n)
+    order = [i for i, _ in seen]
+    assert order != list(range(n)), "completion order must differ from prompt order"
+    assert sorted(order) == list(range(n)), "every prompt exactly once"
+    for i, ids in seen:
+        assert out[i] == ids == [i], (i, ids, out[i])
+    assert out == [[i] for i in range(n)]
+    print("eval: generate_ids on_row ordering OK")

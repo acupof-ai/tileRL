@@ -411,6 +411,29 @@ def _write_eval_rows(run_id: str, tag: str, rows: list) -> float:
     return sum(r["tokens"] for r in rows) / max(1, len(rows))
 
 
+def _eval_row_appender(run_id: str, tag: str):
+    """Append scored rows to eval-<tag>.jsonl as they land: a killed eval arm keeps
+    what finished -- the MATH before-arm died at 1h40m with zero rows on disk,
+    because the write happened only after the whole arm (errors/2026-09-09-the-
+    killed-eval-arm-kept-nothing.md). One open/close per row, so a kill loses at
+    most the row in flight.
+
+    Coverage is the GSM8K arm and the curve points: gsm8k_accuracy streams rows
+    through on_row. The MMLU arm still lands whole -- mmlu_accuracy has no
+    on_row -- so a kill mid-MMLU still loses that arm (about 12% of before/after
+    wall time)."""
+    from .ledger import runs_root
+
+    path = Path(runs_root()) / run_id / f"eval-{tag}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(row: dict) -> None:
+        with path.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+
+    return append
+
+
 def _read_eval_rows(run_id: str, tag: str) -> list:
     """Per-problem rows of one eval arm, or [] if the arm was not written."""
     from .ledger import runs_root
@@ -809,6 +832,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
             log(f"eval before: cache hit {cache.stem}")
             return
         rows_out: list = []
+        append = _eval_row_appender(manifest["id"], tag)
         if args.eval_mmlu:
             # Per-arm, because `eval_{tag}_secs` is the SUM of both arms and no historical run
             # can be decomposed into them -- not even by subtraction, since the gsm8k arm was
@@ -817,6 +841,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
             t_mmlu = time.perf_counter()
             c, n, conc = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=_EVAL_CONCURRENCY,
                                        questions=mmlu_set, per_problem=rows_out)
+            for r in rows_out:
+                append(r)  # mmlu first, then the gsm8k stream: same order the cache replays
             manifest["metrics"][f"mmlu_{tag}_secs"] = time.perf_counter() - t_mmlu
             manifest["metrics"][f"mmlu_{tag}"] = c / n
             manifest["metrics"][f"mmlu_{tag}_concurrency"] = conc
@@ -830,7 +856,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
             c, n, ntok = gsm8k_accuracy(engine, tok, eval_rows, eval_params, concurrency=_EVAL_CONCURRENCY,
                                         thinking=thinking,
                                         match=MATCHERS[args.reward],
-                                        per_problem=gsm_rows)
+                                        per_problem=gsm_rows,
+                                        on_row=lambda r: append(dict(r, dataset="gsm8k")))
             manifest["metrics"][f"gsm8k_{tag}_secs"] = time.perf_counter() - t_gsm
             mean_len[tag] = sum(r["tokens"] for r in gsm_rows) / max(1, len(gsm_rows))
             rows_out.extend(dict(r, dataset="gsm8k") for r in gsm_rows)
@@ -841,8 +868,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # on, and it cannot be improved by getting fewer questions right.
             per = f"  {ntok} tokens ({ntok / c:.1f}/correct)" if c else f"  {ntok} tokens"
             log(f"gsm8k greedy {c}/{n} = {100 * c / n:.1f}%{per}")
-        if rows_out:
-            _write_eval_rows(manifest["id"], tag, rows_out)
+        # rows_out (mmlu + gsm8k, prompt order) feeds the before-arm cache payload;
+        # the file itself was streamed above, mmlu rows in-block and gsm8k per row.
         # Read before the cache write so a hit's cost excludes the write only a miss pays,
         # but stored after it, because a duration is not a cacheable result: it belongs to
         # the run that paid it. Inside the payload it would replay a past cost onto a hit
@@ -957,20 +984,22 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # cap's number rather than the policy's. `at_cap` is the reading that
             # distinguishes them, so it travels with every point.
             per: list = []
+            append = _eval_row_appender(manifest["id"], f"curve-{step}")
             c, n, ntok = gsm8k_accuracy(engine, tok, curve_rows, eval_params,
                                         concurrency=_EVAL_CONCURRENCY, thinking=thinking,
-                                        match=MATCHERS[args.reward], per_problem=per)
+                                        match=MATCHERS[args.reward], per_problem=per,
+                                        on_row=lambda r: append(dict(r, dataset="gsm8k")))
             eval_secs = time.perf_counter() - t_eval
             at_cap = sum(p["tokens"] >= args.eval_max_new_tokens for p in per)
-            # The rows go to disk, because the whole point of the curve is comparing its
-            # points to each other and that comparison is PAIRED: every point scores the
-            # same `curve_rows`. Unpaired, adjacent points carry a 1.90 pt difference SE at
-            # n=500; paired at 5% discordant it is 1.00 pt, and "has it stopped rising" is
-            # exactly a question about a difference smaller than the arms. P1 fell back to
-            # the unpaired interval for want of these rows (`_write_eval_rows`'s docstring),
-            # and `per` was being built here and dropped.
-            _write_eval_rows(manifest["id"], f"curve-{step}",
-                             [dict(r, dataset="gsm8k") for r in per])
+            # The rows stream to disk as they land (on_row above), because the whole
+            # point of the curve is comparing its points to each other and that
+            # comparison is PAIRED: every point scores the same `curve_rows`. Unpaired,
+            # adjacent points carry a 1.90 pt difference SE at n=500; paired at 5%
+            # discordant it is 1.00 pt, and "has it stopped rising" is exactly a
+            # question about a difference smaller than the arms. P1 fell back to the
+            # unpaired interval for want of these rows, and `per` was being built here
+            # and dropped. Streaming also means a killed run keeps the points that
+            # finished.
             # Churn vs the previous point: the run's own instrument reading, recorded per
             # point so a "these two points differ by N questions" claim has N's measurement
             # beside it. Zero new evals -- these rows were just written and the previous
