@@ -1,7 +1,7 @@
 # The collapse passes through tool-call modality before going empty
 
 Date: 2026-09-09
-Status: open (next: advantage signs on mixed groups, steps 33-35)
+Status: open (next: the trigger — first empty completions at step 32; the mask below explains absorption, not onset)
 
 ## Context
 
@@ -25,26 +25,37 @@ The modality drift is a one-step transition state between "mixed empty"
 
 ## Root cause
 
-Not established. What the run does and does not say:
+The absorption into empty outputs is the advantage mask, measured and
+code-verified. The trigger is still open.
 
-- **λ=0, so an all-wrong group yields zero advantage, not negative** — the
-  group-advantages guard zeroes a zero-variance group. In the all-wrong steps
-  (34, 36+) the objective gives no signal at all, neither toward nor away from
-  the tool-call modality.
-- **In a mixed group, a 0-score row gets negative advantage, which pushes the
-  policy *away* from that output.** If that were the dominant force here, the
-  fragments would be suppressed; they instead reached 5/8 at step 35. The
-  driver is elsewhere.
-- **The reward matcher is modality-blind.** The step-28 row — a full
-  `<tool_call>` wrapper around correct arithmetic — scored 1.0 because the
-  boxed answer was present. The reward surface never distinguishes "wrong
-  math" from "wrong modality": a malformed fragment scores 0 for lacking a
-  boxed answer, same as any wrong plain-text rollout. Modality drift is
-  therefore unpunished as long as it stays well-formed. That is a statement
-  about the reward surface, not yet a mechanism for why the drift starts.
+`group_advantages` masks zero-length completions out of the group statistic:
+they set neither the mean nor the std and get advantage 0 (the `live` mask,
+`train.py:282`; call site passes `live=[len(c) > 0 for c in comps]`). The
+measured signs, steps 28-36:
 
-Missing measurement: the advantage signs on the mixed groups at steps 33-35.
-Those rows are in the run's rollouts.jsonl; the signs were not checked.
+- **step 32** — 2 empty, 4 wrong-text, 2 correct. Empties +0.000, wrong-text
+  -0.707, correct +1.414. **Empty beats wrong-text at the margin**: the
+  objective ranks producing nothing above producing a wrong answer.
+- **step 33** — 7 empty, 1 correct. The correct row is the only live one, so
+  the live std is 0 and its advantage is +0.000 too. A mixed-reward group is
+  silent because the mask isolated the one row that could carry signal.
+- **step 35** — 5 tool-call fragments (live, all reward 0) + 3 empty. All
+  +0.000: zero variance among the live rows.
+
+So every step that produces some empties makes "produce nothing" the
+best-advantaged action in hindsight, and the group goes silent once empties
+dominate. The mask is the absorbing state.
+
+What this does not explain is the **onset**. The first empties appear at step
+32, and the mask is identical in the surviving run. Why this trajectory
+started producing empties is the open question — the step-3 divergence (same
+seed, different sha, diverging before any eval) and the check-3 / A-B
+experiments address it.
+
+The positive-reinforcement path — a tool-call row scoring 1.0 through the
+modality-blind matcher and then drawing positive advantage — never fired
+after step 28. Step 28's tool-call row sat in an all-correct group (advantage
+0); every later fragment scored 0.
 
 ## Fix
 
