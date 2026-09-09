@@ -476,7 +476,8 @@ def grpo_loop(
     per_rollout: list | None = None,
     prompts_per_step: int = 1,
     decode: Any = None,
-) -> Iterator[tuple[float, float, float, float, float, dict[str, float]]]:
+    correctness_fn: Any = None,
+) -> Iterator[tuple[float, float, float, float, float, dict[str, float], int, float | None]]:
     """GRPO: sample ``group`` completions per prompt in one engine batch, score
     them with ``reward_fn(prompt_ids, completion_ids) -> float``, take one
     policy-gradient step on the group-normalized advantages, in ``micro`` rows
@@ -543,6 +544,15 @@ def grpo_loop(
         timings = {"rollout_secs": time.perf_counter() - t0, "invalidate_secs": 0.0}
         comps = [done[i] for i in ids]
         rewards = [float(reward_fn(picks[owner[i]], c)) for i, c in enumerate(comps)]
+        # Binary correctness BEFORE the length term, tiebreak, and live mask: the
+        # quantity comparable to a lambda=0 run's tied fraction. At lam>0 `tied`
+        # above is structurally 0 (continuous rewards never exactly match), so the
+        # validity gate needs this to see whether a group carries gradient signal.
+        if correctness_fn is not None:
+            corr = np.array([float(correctness_fn(picks[owner[i]], c)) for i, c in enumerate(comps)])
+            tied_correctness = float((corr.reshape(-1, group) == corr.reshape(-1, group)[:, :1]).all(axis=1).mean())
+        else:
+            tied_correctness = None
         # A binary reward stops producing gradient once the policy clears the task.
         # `tied` is that fraction and is the run's health metric: 72% at the 256 cap,
         # 88.7% at 2048. Do not predict it with p**group -- a tie is all-SAME, not
@@ -630,7 +640,7 @@ def grpo_loop(
             timings.get(k, 0.0)
             for k in ("rollout_secs", "backward_secs", "optimizer_secs"))
         yield (float(np.mean(rewards)), ce, secs, tied,
-               float(np.mean([len(c) for c in comps])), timings, gen)
+               float(np.mean([len(c) for c in comps])), timings, gen, tied_correctness)
 
 
 def opd_loop(
