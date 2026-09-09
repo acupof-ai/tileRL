@@ -3,6 +3,7 @@
 **Date:** 2026-09-09
 **Arch:** H20 (sm90) card 6, 27B NVFP4 + DFlash2 block drafter, per-tick wall timing with
 sync on both sides, `scripts/acc_spec_tick_timing.py` / `scripts/acc_spec_divergence_logits.py`
+/ `scripts/acc_spec_overhead.py`
 **Task:** locate the 6.6% throughput gap between the recorded 135.5 tok/s B=1 W=8 arm
 (2026-09-03 entry) and the current sha's 126.5
 
@@ -46,9 +47,22 @@ gaps with different causes:
 | 135.5 (f49e006, never on main) → 131.7 (09657c0) | −2.8% | **unexplained, possibly unknowable** — that tree's number cannot be re-run |
 | 131.7 (09657c0) → 126.5 (current) | −3.9% | **explained**: decode_s/wall_s fell 0.936 → 0.860, non-decode time grew 31.6s → 71.9s per 200-question run (0.158s → 0.360s per question, 2.3x) |
 
-The second segment is the fixable one. The regression lives in the host path around the
-tick — scheduling/eval overhead — not the decode kernels; prefill is ~0.04 s/question of
-it, a rounding error. The decomposition of the 71.9s is the next measurement.
+The second segment is the fixable one. The regression is not in the decode kernels —
+the tick improved — and a direct decomposition of the non-decode wall (50 questions,
+same instrument at both shas, `scripts/acc_spec_overhead.py`) names the bucket:
+
+| per 50 questions | 09657c0 base | current base | 09657c0 spec | current spec |
+|---|---:|---:|---:|---:|
+| wall | 208.1s | 212.0s | 123.1s | 126.5s |
+| decode | 198.7 | 196.7 | 115.8 | 111.6 |
+| **prefill** | **9.1** | **14.7** | **7.2** | **14.7** |
+| encode/detokenize | 0.0 | 0.0 | 0.0 | 0.0 |
+| scheduling (remainder) | 0.3 | 0.6 | 0.1 | 0.1 |
+
+**Prefill per question grew 1.6-2.0x (0.14-0.18s → 0.29s) and accounts for essentially
+all the non-decode growth**; scheduling is noise. (An earlier guess that prefill was
+~0.04 s/question was wrong by 7x — GSM8K prompts with the chat template run to hundreds
+of tokens.) The bisect target is the prefill path between 09657c0 and the current sha.
 
 **135.5 has never run on a main sha.** 09657c0 is the first commit on main whose
 `acc_spec_arms.py` can run B=1 at all (the `--concurrency` flag landed in #58; the recorded
@@ -77,10 +91,11 @@ graph-replay nondeterminism cc measured is on sampled paths, not greedy argmax.)
 A throughput gap between two spec runs is not a tick gap until the tick is timed
 directly. The identity `tok/s = (tok/decode-fwd) / tick × (decode_s/wall_s)` has three
 factors; a reverse derivation that defaults the unmeasured one to a constant invents the
-regression (it did, twice: 8.1% and 45.2 ms). Here the tick improved 3.6% and the
-scheduling overhead around it grew 2.3x — the regression to bisect is in the host path,
-not the kernels. And a bench number whose recorded sha cannot produce it is a provenance
-bug first and a performance question second: 135.5's sha pointed at a B=8-hardwired tree.
+regression (it did, twice: 8.1% and 45.2 ms). Here the tick improved 3.6% and prefill
+per question grew 1.6-2.0x — the regression to bisect is the prefill path, not the
+decode kernels and not the scheduler. And a bench number whose recorded sha cannot
+produce it is a provenance bug first and a performance question second: 135.5's sha
+pointed at a B=8-hardwired tree.
 
 ## Results
 
