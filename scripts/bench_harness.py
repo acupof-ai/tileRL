@@ -370,6 +370,11 @@ def _gap(record: dict, registry: dict) -> float | None:
 _KIND_SHORT = {"bandwidth": "bw", "compute": "compute", "roofline": "roof",
                "measured-best": "best", "baseline": "base"}
 
+#: A new best this far beyond the previous one is implausible until explained.
+#: Run-to-run spread is ~1.7% (_RAISE), so 1.2x is ~10x noise: a real jump
+#: gets an "explain" line, which is the right response to a real jump too.
+_NEW_BEST_ALARM = 1.2
+
 
 def _coverage(metrics: dict, rows) -> str:
     """One line every view prints: an empty store must make noise, not read as
@@ -477,12 +482,26 @@ def _view_regress() -> None:
         if r["floor"]["kind"] != "measured-best":
             continue
         g = _gap(r, reg)
-        if g is None or g <= 1.0:
-            continue  # gap == 1.0: this row IS the population's best (first sight or tie)
-        shown += 1
-        print(f"  {'FAIL' if g > 1.05 else 'PASS'} {r['metric']} {dict(r['shape'])} "
-              f"{r['target']}/{r['build']}: {r['value']} vs best {r['floor']['value']} "
-              f"({g:.3f}x, n={r['n']})")
+        if g is None:
+            continue
+        if g > 1.0:
+            shown += 1
+            print(f"  {'FAIL' if g > 1.05 else 'PASS'} {r['metric']} {dict(r['shape'])} "
+                  f"{r['target']}/{r['build']}: {r['value']} vs best {r['floor']['value']} "
+                  f"({g:.3f}x, n={r['n']})")
+            continue
+        # gap == 1.0: this row IS the best. First sight has no prior; a new best
+        # that jumps far beyond the previous one is the other implausible shape
+        # (too good, not too bad) — the symmetric half of the gate.
+        prev = benchrec.previous_best(r, lower_is_better=reg[r["metric"]]["direction"] == "-")
+        if prev is None:
+            continue
+        jump = prev / r["value"] if reg[r["metric"]]["direction"] == "-" else r["value"] / prev
+        if jump > _NEW_BEST_ALARM:
+            shown += 1
+            print(f"  IMPLAUSIBLE {r['metric']} {dict(r['shape'])} "
+                  f"{r['target']}/{r['build']}: {r['value']} vs previous best {prev} "
+                  f"({jump:.2f}x, n={r['n']}) — explain or reject")
     if not shown:
         print("  (none — every measured-best row stands at its population's best)")
 
@@ -500,6 +519,11 @@ def _view_questions(limit: int = 20) -> None:
     cur = list(benchrec.current(benchrec.load_all()).values())
     print(f"=== questions (headroom vs physical floor, gap x weight, top {limit}) ===")
     print(f"  coverage: {_coverage(reg, cur)}")
+    # The loudest alarm first: a value that beats a hard physical floor is a
+    # measurement error, not a result (135.5 tok/s vs a 129 roofline passed
+    # every "good enough" gate for three days). Baseline floors are exempt —
+    # the null is meant to be beaten.
+    implausible = []
     unmeasured = sorted(
         ((reg[m]["weight"], m) for m in reg.keys() - {r["metric"] for r in cur}),
         reverse=True,
@@ -511,12 +535,23 @@ def _view_questions(limit: int = 20) -> None:
     q = []
     floored: set = set()
     for r in cur:
-        if r["floor"]["kind"] not in benchrec.PHYSICAL_FLOOR_KINDS:
+        kind = r["floor"]["kind"]
+        if kind not in benchrec.PHYSICAL_FLOOR_KINDS:
             continue
         floored.add(r["metric"])
         g = _gap(r, reg)
-        if g is not None:
+        if g is None:
+            continue
+        if g < 1.0 and kind in benchrec.HARD_FLOOR_KINDS:
+            implausible.append((g, r))
+        else:
             q.append((g * reg[r["metric"]]["weight"], g, r))
+    if implausible:
+        print("=== IMPLAUSIBLE — beat a physical floor: explain or reject ===")
+        for g, r in sorted(implausible):
+            print(f"  {r['metric']} {r['target']} {dict(r['shape'])}: "
+                  f"{r['value']} vs {r['floor']['kind']} floor {r['floor']['value']} "
+                  f"(gap {g:.3f}, record {r['id']})")
     q.sort(key=lambda x: x[0], reverse=True)
     for score, g, r in q[:limit]:
         print(f"  {score:.3f}  {r['metric']} {r['target']} {dict(r['shape'])} "
