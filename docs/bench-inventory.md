@@ -74,6 +74,7 @@ moment the condition moves, these scripts rerun first.
 |---|---|
 | `bench_tp.py` | TP loses to DP **until a capturable all-reduce exists** — a named, planned change |
 | `ab_draft_depth.py` + `ab_w1_baseline.py` | spec depth verdict has flipped three times (V100 depth 1 wins, H20 every depth loses, eager build every depth wins 1.8x) — a live question, not a verdict |
+| `_sweep_fp8_prefill.py` | sole source for `_FP4_BLOCK_N = 64` in `kernels_linear.py:146` — keep until the prefill tile size is retuned |
 
 ## One-shot, verdict in the tree (deletion candidates)
 
@@ -88,12 +89,12 @@ moment the condition moves, these scripts rerun first.
 | `bench_gemv_gap.py` | direct-vs-backend roof gap — `errors/2026-08-27-decode-latency-bound-not-bandwidth.md` |
 | `bench_paged_attn.py` | naive vs FlashAttention — shipped, 83x (CHANGELOG 2026-08-24) |
 | `bench_qwen38_baseline.py` | 27B serving baseline — superseded by harness decode-kv/prefill suites |
-| `bench_smoke.py` | benchkit's own smoke check — moves into CI, not a measurement |
+| `bench_smoke.py` | benchkit's own smoke check — CUDA-only, cannot move to CI (CI forbids perf steps); deleted, parity gated by the CPU twin tests |
 | `ab_fp8_gemv.py` | flat vs grouped prefetch — `wins/2026-08-25-native-fp8-weights.md` |
 | `ab_smallm_gemv.py` | small-M GEMV — `wins/2026-08-26-batch-decode-h2.md` |
 | `ab_prefill_ncols.py` | in-process ncols A/B — `wins/2026-09-03-ncols2-is-1.5x-on-the-verify-path.md` |
 | `ab_scale_f16.py` | f16 scale plane — `wins/2026-09-02-f16-block-scales.md` |
-| `_sweep_gemv.py`, `_sweep_gemv3.py`, `_sweep_fp8_prefill.py`, `_matrix_gemv.py` | parameter sweeps whose settings shipped |
+| `_sweep_gemv.py`, `_sweep_gemv3.py`, `_matrix_gemv.py` | parameter sweeps whose settings shipped |
 
 ## Investigation series — keep until the sm70 prefill work closes
 
@@ -118,12 +119,15 @@ at 16k). These are its tools, not one-shots:
 
 ## Tally
 
-- Keep: 3 infra + 14 table feeders + 5 SSD support + 7 sm70 series + 3 conditional verdicts + 1 launcher = **33**
-- Delete candidates: **22** (10 bench incl. `bench_smoke.py` to CI, 4 ab, 4 sweep/matrix, 4 launchers)
-- `bench_smoke.py` moves to CI; it is benchkit's own self-check, not a measurement.
+- Keep: 3 infra + 14 table feeders + 5 SSD support + 7 sm70 series + 4 conditional verdicts + 1 launcher = **34**
+- Delete candidates: **21** (10 bench, 4 ab, 3 sweep/matrix, 4 launchers)
 
-Deletions are listed, not done — each verdict above is checkable against the
-CHANGELOG line cited.
+Deletions executed in the step-5 PR: the 21 files below are gone. Each verdict
+above stays checkable against the CHANGELOG line cited — the scripts were the
+runners, the entries are the record. `bench_smoke.py` was listed as "moves to
+CI" and does not: it is CUDA-only and CI policy forbids perf steps
+(`.github/workflows/ci.yml` header); its kernel's parity has been gated by the
+CPU twin tests since the kernel landed. `_sweep_fp8_prefill.py` was listed for deletion and stays: it is the sole source for `_FP4_BLOCK_N = 64` in `kernels_linear.py:146` — a published kernel constant explaining itself by a deleted file is a comment nobody can recompute.
 
 One correction to the first draft, worth its own line: `bench_batch_decode.py`
 was listed as "superseded by harness decode-kv" and is not — the harness suite

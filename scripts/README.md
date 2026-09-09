@@ -24,7 +24,7 @@ same commit.
 
 "Nothing references it" is not that test, and grepping the script's name is not
 that test either. Three ways a live script looks dead: an entry cites the *log*
-it wrote and never names it (`bench_smoke.py` — `/work/bench_smoke.log`); it is
+it wrote and never names it (`bench_smoke.py`, deleted 2026-09-09 — its entry cited `/work/bench_smoke.log`); it is
 a launcher, which by definition nothing imports (`_pod_*.sh`, which carry the
 setsid/CUDA_VISIBLE_DEVICES/redirect combination that took real failures to get
 right); or it is the only producer of an artifact something else consumes. Check
