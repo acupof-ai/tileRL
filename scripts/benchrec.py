@@ -163,6 +163,13 @@ def validate(record: dict, registry: dict, existing_ids: set) -> list[str]:
     for f in REQUIRED:
         if f not in record:
             errs.append(f"missing field {f!r}")
+        elif record[f] is None:
+            # A required field's null is not a value: card_claim.py:478 died on
+            # {"pid": null} because .get's default only fires on a missing key.
+            # The per-field type checks below also reject None, but only by
+            # accident -- this makes the invariant structural for any future
+            # REQUIRED field.
+            errs.append(f"field {f!r} is null (a required field's null is not a value)")
     if errs:
         return errs  # nothing below is safe to check
 
@@ -420,6 +427,14 @@ if __name__ == "__main__":
     bad = json.loads(json.dumps(good))
     del bad["dirty"]
     assert validate(bad, reg, set()), "missing dirty must reject"
+
+    bad = json.loads(json.dumps(good))
+    bad["value"] = None
+    # Assert on the message, not just non-empty: the value type check below
+    # rejects None too ("value must be a number"), so a weaker assertion stays
+    # green with this elif deleted and proves nothing.
+    null_errs = validate(bad, reg, set())
+    assert any("is null" in e for e in null_errs), null_errs
 
     bad = json.loads(json.dumps(good))
     del bad["warm"]["compiles"]
