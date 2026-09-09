@@ -1,9 +1,9 @@
-# The 135.5 gap is prefill growth, not the decode tick — and 135.5 never ran on main
+# The 135.5 gap is not the decode tick, not the base arm, and not the prefill kernel — what remains is spec-arm-specific and unlocated
 
 **Date:** 2026-09-09
 **Arch:** H20 (sm90) card 6, 27B NVFP4 + DFlash2 block drafter, per-tick wall timing with
 sync on both sides, `scripts/acc_spec_tick_timing.py` / `scripts/acc_spec_divergence_logits.py`
-/ `scripts/acc_spec_overhead.py`
+/ `scripts/acc_spec_overhead.py` / `scripts/acc_spec_prefill_profile.py`
 **Task:** locate the 6.6% throughput gap between the recorded 135.5 tok/s B=1 W=8 arm
 (2026-09-03 entry) and the current sha's 126.5
 
@@ -45,49 +45,76 @@ gaps with different causes:
 | segment | size | explained? |
 |---|---:|---|
 | 135.5 (f49e006, never on main) → 131.7 (09657c0) | −2.8% | **unexplained, possibly unknowable** — that tree's number cannot be re-run |
-| 131.7 (09657c0) → 126.5 (current) | −3.9% | **explained**: decode_s/wall_s fell 0.936 → 0.860, non-decode time grew 31.6s → 71.9s per 200-question run (0.158s → 0.360s per question, 2.3x) |
+| 131.7 (09657c0) → 126.5 (current) | −3.9% | **partially excluded, see below** |
 
-The second segment is the fixable one. The regression is not in the decode kernels —
-the tick improved — and a direct decomposition of the non-decode wall (50 questions,
-same instrument at both shas, `scripts/acc_spec_overhead.py`) names the bucket:
+**The prefill kernel is flat — the 2.1x "prefill growth" was a timing-boundary move.**
+A five-bucket profile (`scripts/acc_spec_prefill_profile.py`, same instrument at both
+shas, B=1, 50 questions, sync on both sides of `Model.forward`, 0 compiles, no graph
+fallback at either sha):
 
-| per 50 questions | 09657c0 base | current base | 09657c0 spec | current spec |
-|---|---:|---:|---:|---:|
-| wall | 208.1s | 211.2s | 123.1s | 128.4s |
-| decode | 198.7 | 195.7 | 115.8 | 113.3 |
-| **prefill** | **9.1** | **14.9** | **7.2** | **14.9** |
-| encode/detokenize | 0.019/0.012s | 0.020/0.004s | 0.017/0.009s | 0.016/0.003s |
-| scheduling (remainder) | 0.3 | 0.5 | 0.1 | 0.1 |
+| per question | 09657c0 | current |
+|---|---:|---:|
+| 1. tokenize + render | 0.4 ms | 0.4 ms |
+| 2. admit (block alloc) | 0.1 ms | 0.1 ms |
+| **3. kernel (Model.forward, synced)** | **290.9 ms** | **288.0 ms** |
+| 4a. plan excl admit | 0.0 ms | 0.0 ms |
+| 4b. forward host | 2.8 ms | 2.7 ms |
+| 4c. step remainder | 0.1 ms | 0.1 ms |
+| wall | 211.0 s | 209.9 s |
+| kernel first step | 629 ms | 613 ms |
+| kernel rest median per chunk | 123.8 ms | 118.4 ms |
 
-**Prefill per question grew 2.1x (0.143s → 0.298s) and accounts for essentially all the
-non-decode growth**; scheduling is noise. (An earlier guess that prefill was ~0.04
-s/question was wrong by 7x — GSM8K prompts with the chat template run to hundreds of
-tokens.) Two follow-ups sharpened this:
+The kernel is 1% faster per question and 4% faster per chunk at HEAD. The base-arm wall
+is flat. An earlier decomposition (a synced wrap of `Engine._run_forward`,
+`scripts/acc_spec_overhead.py`) had put prefill at 0.143s → 0.298s per question (2.1x)
+and named it the regression. The two instruments **agree at HEAD** (14.7 vs 14.4 s per
+50 questions) and **disagree 2x at 09657c0** (7.2-9.1 vs 14.55 s) — same sha, same
+workload, same engine parameters, both sync-wrapped, differing only in whether the sync
+sits outside `_run_forward` or inside `Model.forward`. The 09657c0 overhead reading is
+the outlier; the per-chunk direct measurement (123.8 ms) is the number that cannot be
+argued with, and it says HEAD is faster. The mechanism of the disagreement is not
+explained from the code — it is recorded here as an open question, not a conclusion.
+What changed between the shas is *where the prefill GPU time gets charged* (the
+decode_s/wall_s fall 0.936 → 0.860 is the same boundary move seen from the decode
+side), not how long it takes.
 
-- **The 09657c0 arm gap is an arm-order artifact.** Base prefill (9.1s) exceeded spec
-  (7.2s) at 09657c0; a reversed-order run (spec first) flips it — spec 10.2s, base 7.1s.
-  Whichever arm runs first pays a ~2-3s one-time cost in its prefill bucket (warm JIT
-  cache, 0 compiles — not compilation). The comparable second-arm numbers are 7.1-7.2s
-  per 50 questions at 09657c0 vs 14.9s at the current sha. At the current sha both arms
-  are equal (14.9/14.9, reproduced 14.7/14.7), so the one-time cost has moved out of the
-  timed region or disappeared; the 2.1x growth itself is not an artifact.
-- **The prefix-reuse hypothesis is dead by construction.** A proposed explanation for
-  the convergence was that prefix reuse broke: GSM8K prompts share a chat-template
-  prefix, so hits would both lower prefill and make arms unequal. It cannot be tested
-  in this harness because prefix reuse is off at both shas by construction — the engine
-  raises on `draft.aux_layers` with a real prefix store (engine.py:445, identical at
-  09657c0's engine.py:333) and both shas' harnesses pass `NoPrefixStore`
-  (acc_spec_arms.py:103 at 09657c0). A stats() run confirms `prefix_hits = 0` at both
-  arms. The serving path's prefix reuse — a README flagship (19x cross-turn) — has
-  never been exercised by any of this; `bench_chat_reuse.py --turns 6` is the
-  instrument for that question.
+**The fp8→bf16 hypothesis is dead.** A proposed explanation was that the prefill
+activation path fell back from fp8 to bf16 kernels (~2x). Runtime dispatch at 09657c0
+is all-fp8 (`linear_fp4` → `linear_fp4_fp8`, `linear_fp8` → `linear_fp8` /
+`linear_fp8_gemv`, zero bf16), and the phase derivation (`m==1` gemv / `m<=16` decode /
+else prefill), the `_MX=8` / `_MGEMV=3` thresholds, and the `_CUDA_PLAN` table are
+byte-identical at the two shas. The hypothesis predicted a ~2x kernel at HEAD; the
+measurement is −1%.
+
+**What remains is spec-arm-specific, ~4% of wall, and unlocated.** The apples-to-apples
+comparison is 09657c0 → current: 131.7 → 126.5 tok/s on 200 questions (−3.9%), and
+123.1s → 128.4s on the 50-question overhead harness (+4.3% wall). The tick improved,
+the base-arm wall is flat, so the regression lives in the spec arm's non-decode path —
+the draft-coupled prefill steps (`hidden_out` / `aux_layers` / `draft.step`), which the
+base-arm profile above does not see. The next instrument is a spec-arm prefill profile.
+
+**The 09657c0 arm gap is an arm-order artifact.** Base prefill (9.1s) exceeded spec
+(7.2s) at 09657c0; a reversed-order run (spec first) flips it — spec 10.2s, base 7.1s.
+Whichever arm runs first pays a ~2-3s one-time cost in its prefill bucket (warm JIT
+cache, 0 compiles — not compilation). The comparable second-arm numbers are 7.1-7.2s
+per 50 questions at 09657c0 vs 14.9s at the current sha in the overhead harness — but
+per the instrument disagreement above, that 2.1x is a boundary move, not a cost.
+
+**The prefix-reuse hypothesis is dead by construction.** A proposed explanation for
+the convergence was that prefix reuse broke: GSM8K prompts share a chat-template
+prefix, so hits would both lower prefill and make arms unequal. It cannot be tested
+in this harness because prefix reuse is off at both shas by construction — the engine
+raises on `draft.aux_layers` with a real prefix store (engine.py:445, identical at
+09657c0's engine.py:333) and both shas' harnesses pass `NoPrefixStore`
+(acc_spec_arms.py:103 at 09657c0). A stats() run confirms `prefix_hits = 0` at both
+arms. The serving path's prefix reuse — a README flagship (19x cross-turn) — has
+never been exercised by any of this; `bench_chat_reuse.py --turns 6` is the
+instrument for that question.
 
 encode/detokenize is genuinely negligible, not unmeasured: the wrappers fire exactly
 50+50 times per arm (once per prompt each, eval.py:48/60), totaling 0.016-0.020s encode
 and 0.003-0.012s detokenize per 50 questions — the 0.0 in earlier tables was one-decimal
 rounding.
-
-The bisect target is the prefill path between 09657c0 and the current sha.
 
 **135.5 has never run on a main sha.** 09657c0 is the first commit on main whose
 `acc_spec_arms.py` can run B=1 at all (the `--concurrency` flag landed in #58; the recorded
@@ -104,27 +131,33 @@ the verify logic is correct. The two paths' logits differ by ~1e-1 (max 2.27), n
 ~1e-6 last-mile tile rounding first guessed — the target model computes 8 positions per
 forward in the spec path and 1 in the base path, different kernels down the whole path,
 and the argmax flips at near-ties (top-2 gap as small as 0.002). `_verify`'s docstring
-already states bit-identity is not guaranteed off the CPU reference. This completes the
-picture of the three "different" numbers, each with its own cause and none a bug:
-same-sha run-to-run is 0/200 (the noise floor, n=1 greedy); cross-sha is 167/200 at
-09657c0 vs 168/200 at the current sha — deterministic within each sha, so a 1-question
-drift between shas, not noise; and base-vs-spec is the 38/200 logit drift above. (The
-graph-replay nondeterminism cc measured is on sampled paths, not greedy argmax.)
+already states bit-identity is not guaranteed off the CPU reference. Same-sha
+run-to-run is 0/200 (the noise floor, n=1 greedy); cross-sha is 167/200 at 09657c0 vs
+168/200 at the current sha — deterministic within each sha, a 1-question drift between
+shas, not noise.
 
 ## Rule
+
+A wall bucket is not a measurement of the thing in the bucket. A bucket is "wall minus
+the parts I accounted for", so any unaccounted time falls into some bucket, and the
+bucket does not tell you it over-collected. The 09657c0 prefill bucket under-counted by
+half and nothing would have found it for two months — except a second instrument
+measuring the same quantity. **Any number derived from a remainder must have a
+direct-measurement control.** The per-chunk line in the table above was that control
+this time, and it was worth the whole profile.
 
 A throughput gap between two spec runs is not a tick gap until the tick is timed
 directly. The identity `tok/s = (tok/decode-fwd) / tick × (decode_s/wall_s)` has three
 factors; a reverse derivation that defaults the unmeasured one to a constant invents the
-regression (it did, twice: 8.1% and 45.2 ms). Here the tick improved 3.6% and prefill
-per question grew 2.1x — the regression to bisect is the prefill path, not the decode
-kernels and not the scheduler. An arm gap that flips when the arm order flips is a
-first-use cost charged to the first arm, not a difference between the arms — run the
-reversed order before explaining a two-arm difference (it killed the 9.1-vs-7.2 here).
-And a hypothesis about prefix reuse is untestable in a harness that builds with
-`NoPrefixStore` — check the construction before proposing the counter run. And a bench
+regression (it did, twice: 8.1% and 45.2 ms). An arm gap that flips when the arm order
+flips is a first-use cost charged to the first arm, not a difference between the arms —
+run the reversed order before explaining a two-arm difference (it killed the 9.1-vs-7.2
+here). A hypothesis about prefix reuse is untestable in a harness that builds with
+`NoPrefixStore` — check the construction before proposing the counter run. A bench
 number whose recorded sha cannot produce it is a provenance bug first and a performance
-question second: 135.5's sha pointed at a B=8-hardwired tree.
+question second: 135.5's sha pointed at a B=8-hardwired tree. And a hypothesis priced on
+"this file changed 765 lines" is not evidence — the fp8→bf16 guess died on the first
+measurement.
 
 ## Results
 
@@ -132,6 +165,10 @@ question second: 135.5's sha pointed at a B=8-hardwired tree.
 |---|---|---|---|---|---:|---:|---:|
 | 2026-09-09 | f80e894 | H20 card 6 | cuda/sm90 decode-graph | Qwen3.8-27B-NVFP4 + DFlash2 | — | W=1 11.56 / W=8 41.96 | 126.5 spec / 79.5 base (B=1, 200 GSM8K, 512 cap) |
 | 2026-09-09 | 09657c0 | H20 card 6 | cuda/sm90 decode-graph | Qwen3.8-27B-NVFP4 + DFlash2 | — | W=1 11.77 / W=8 43.52 | 131.7 spec / 81.9 base (B=1, 200 GSM8K, 512 cap) |
+| 2026-09-09 | f80e894 | H20 card 6 | cuda/sm90 decode-graph | Qwen3.8-27B-NVFP4 | 288.0 ms/q kernel | — | base wall 209.9 s / 50q (five-bucket profile) |
+| 2026-09-09 | 09657c0 | H20 card 6 | cuda/sm90 decode-graph | Qwen3.8-27B-NVFP4 | 290.9 ms/q kernel | — | base wall 211.0 s / 50q (five-bucket profile) |
 
 Raw artifacts: `/work/acctick.log` (current sha) and `/work/acctick0.log` (09657c0) on
-the pod, both 0-compile; per-arm JSONs under `/work/accspec_tick/` and `/work/accspec_tick0/`.
+the pod, both 0-compile; per-arm JSONs under `/work/accspec_tick/` and `/work/accspec_tick0/`;
+five-bucket profiles under `/work/accpf3/` (current) and `/work/accpf0/` (09657c0),
+logs `/work/accpf3.log` / `/work/accpf0.log`.
