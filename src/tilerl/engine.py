@@ -144,6 +144,17 @@ def _step_seed(seed: int, generated: int) -> int:
     return ((int(seed) * 2_654_435_761) ^ (generated * 2_246_822_519)) & _HASH_MASK
 
 
+class RequestFailed(RuntimeError):
+    """A request ended in failure. ``reason`` is a stable tag for the failure
+    class (None = untagged); a caller that tolerates one class catches on it.
+    ``poll``/``take`` raise this instead of handing the failure back as data."""
+
+    def __init__(self, request_id: int, reason: str | None, message: str):
+        super().__init__(f"request {request_id} failed: {message}")
+        self.request_id = request_id
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class SamplingParams:
     temperature: float = 1.0
@@ -480,7 +491,7 @@ class Engine:
         #: rid -> the stop sequence that ended it. Not popped with the tokens: the
         #: routes read it after `take`, and only a matched request has an entry.
         self._finished_stop: dict[int, str] = {}
-        self._failed: dict[int, str] = {}
+        self._failed: dict[int, tuple[str | None, str]] = {}
         self._finished_count = 0
 
         self._blocks_used = 0  # engine allocations outstanding (retains excluded)
@@ -626,8 +637,8 @@ class Engine:
         """Return and clear all requests finished since the last poll."""
         with self._lock:
             if self._failed:
-                rid, message = self._failed.popitem()
-                raise RuntimeError(f"request {rid} failed: {message}")
+                rid, (reason, message) = self._failed.popitem()
+                raise RequestFailed(rid, reason, message)
             out = dict(self._finished)
             self._finished.clear()
             return out
@@ -677,9 +688,10 @@ class Engine:
     def take(self, request_id: int) -> list[int] | None:
         """Pop one finished request's output, or None if not finished yet."""
         with self._lock:
-            message = self._failed.pop(request_id, None)
-            if message is not None:
-                raise RuntimeError(f"request {request_id} failed: {message}")
+            failed = self._failed.pop(request_id, None)
+            if failed is not None:
+                reason, message = failed
+                raise RequestFailed(request_id, reason, message)
             return self._finished.pop(request_id, None)
 
     def step(self) -> None:
@@ -998,12 +1010,33 @@ class Engine:
         )
         if growth:
             self._prefix.evict_until_free(growth)
-        for r, q in zip(decodes, q_dec):
-            # Cover the chain's last position; exhaustion raises and step() fails the batch.
+        dead: set[int] = set()
+        for i, (r, q) in enumerate(zip(decodes, q_dec)):
+            # Cover the chain's last position. By count, not by catching alloc_block's
+            # raise: `_admit` does the same for the same reason -- its comment says an
+            # exception out of here reaches step()'s handler and fails EVERY running
+            # request. A row that does not fit fails alone and leaves the batch.
+            need = max(0, (r.seq_len + q - 1 + BLOCK_TOKENS) // BLOCK_TOKENS - len(r.blocks))
+            if need > self._kv.free_blocks:
+                self._finish(
+                    r,
+                    error=f"PagedKvPool exhausted: need {need} block(s), "
+                          f"{self._kv.free_blocks} free",
+                    reason="pool_exhausted",
+                )
+                dead.add(i)
+                continue
             while len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 1 + q:
                 r.blocks.append(self._kv.alloc_block())
                 r.own_blocks += 1
                 self._blocks_used += 1
+        if dead:
+            decodes = [r for i, r in enumerate(decodes) if i not in dead]
+            q_dec = [q for i, q in enumerate(q_dec) if i not in dead]
+            if chains is not None:
+                chains = [c for i, c in enumerate(chains) if i not in dead]
+            if not decodes and not prefills:
+                return
         if (
             not prefills
             and decodes
@@ -1445,7 +1478,8 @@ class Engine:
         self._states.free_slot(req.state_slot)
         self._slots_used -= 1
 
-    def _finish(self, req: _Req, error: str | None = None) -> None:
+    def _finish(self, req: _Req, error: str | None = None,
+                reason: str | None = None) -> None:
         self._release(req)
         if error is None:
             self._finished[req.req_id] = req.output
@@ -1454,7 +1488,7 @@ class Engine:
             if req.params.logprobs:
                 self._finished_logprobs[req.req_id] = req.logprobs
         else:
-            self._failed[req.req_id] = error
+            self._failed[req.req_id] = (reason, error)
         self._finished_count += 1
         self._running.remove(req)
 
@@ -1472,7 +1506,7 @@ class Engine:
                 req = next((r for r in queue if r.req_id == request_id), None)
                 if req is not None:
                     self._release(req)
-                    self._failed[request_id] = "cancelled: the reader disconnected"
+                    self._failed[request_id] = (None, "cancelled: the reader disconnected")
                     self._finished_count += 1
                     queue.remove(req)
                     return True

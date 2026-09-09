@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from .autograd import AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
-from .engine import SamplingParams
+from .engine import RequestFailed, SamplingParams
 from .kv_cache import LinearStatePool, NoPrefixStore
 from .model import save_hf
 
@@ -34,11 +34,22 @@ def _sync(backend: Any) -> None:
 
 def _drain(engine: Any, ids: list[int], what: str) -> dict[int, list[int]]:
     """Tick until every id has finished. Accumulates: poll() only returns the
-    requests that finished on that tick, so a single assignment loses the rest."""
+    requests that finished on that tick, so a single assignment loses the rest.
+
+    A pool-exhaustion failure ends ONE rollout, not the step: the dead id gets an
+    empty completion, which the live mask (``len(c) > 0`` in grpo_loop) drops, and
+    the group trains on the rest. Every other failure class propagates -- catching
+    it here would turn any bug into a silently missing row.
+    """
     done: dict[int, list[int]] = {}
     for _ in range(_MAX_TICKS):
         engine.step()
-        done.update(engine.poll())
+        try:
+            done.update(engine.poll())
+        except RequestFailed as exc:
+            if exc.reason != "pool_exhausted":
+                raise
+            done[exc.request_id] = []
         if all(i in done for i in ids):
             return done
     raise RuntimeError(f"{what}: did not finish within {_MAX_TICKS} ticks")
