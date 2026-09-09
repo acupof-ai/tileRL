@@ -61,11 +61,15 @@ def test_emit_eval_records(tmp_store, monkeypatch):
 
 
 def test_emit_eval_records_cpu(tmp_store, monkeypatch):
-    """No CUDA: no card, name falls back to the backend or 'cpu'."""
+    """No CUDA: card is null, name falls back to the backend's target 'cpu'.
+
+    The shape is record_common's (card always present, null when absent) -- the
+    store's existing cpu rows are all {"card": null, "name": "cpu"}, and the
+    grouping key reads .get("card"), so missing-key and null are one population.
+    """
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     cli._emit_eval_records(190, 200, 20000, [100] * 200, 0, _CPUBackend())
     rows = [json.loads(l) for l in tmp_store.STORE.read_text().splitlines()]
     assert len(rows) == 2
     for r in rows:
-        assert r["device"] == {"name": "cpu"}
-        assert "card" not in r["device"]
+        assert r["device"] == {"name": "cpu", "card": None}
