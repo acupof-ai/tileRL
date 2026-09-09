@@ -1,7 +1,7 @@
 # The collapse passes through tool-call modality before going empty
 
 Date: 2026-09-09
-Status: closed (observation; no fix)
+Status: open (next: advantage signs on mixed groups, steps 33-35)
 
 ## Context
 
@@ -25,20 +25,36 @@ The modality drift is a one-step transition state between "mixed empty"
 
 ## Root cause
 
-Hypothesis, not measured: the policy under RL pressure drifts into a mode the
-base model knows (Qwen3.8's chat template has tool-call modes; `<tool_call>`
-is single token 248058). The reward matcher only reads boxed answers, so
-malformed tool-call text scores 0; those rollouts draw negative advantage,
-which reinforces the drift toward the zero-reward absorbing state (empty
-output). The step-28 row shows the matcher is not fully blind to the modality
-— a well-formed wrapper around a boxed answer still scores — so the
-self-reinforcement claim needs the advantage signs, which were not checked.
+Not established. What the run does and does not say:
+
+- **λ=0, so an all-wrong group yields zero advantage, not negative** — the
+  group-advantages guard zeroes a zero-variance group. In the all-wrong steps
+  (34, 36+) the objective gives no signal at all, neither toward nor away from
+  the tool-call modality.
+- **In a mixed group, a 0-score row gets negative advantage, which pushes the
+  policy *away* from that output.** If that were the dominant force here, the
+  fragments would be suppressed; they instead reached 5/8 at step 35. The
+  driver is elsewhere.
+- **The reward matcher is modality-blind.** The step-28 row — a full
+  `<tool_call>` wrapper around correct arithmetic — scored 1.0 because the
+  boxed answer was present. The reward surface never distinguishes "wrong
+  math" from "wrong modality": a malformed fragment scores 0 for lacking a
+  boxed answer, same as any wrong plain-text rollout. Modality drift is
+  therefore unpunished as long as it stays well-formed. That is a statement
+  about the reward surface, not yet a mechanism for why the drift starts.
+
+Missing measurement: the advantage signs on the mixed groups at steps 33-35.
+Those rows are in the run's rollouts.jsonl; the signs were not checked.
 
 ## Fix
 
 None. Diagnostic value: tool-call fragments in rollouts are an early-warning
 signature of an in-progress empty-output collapse, appearing one step before
 the curve moves (step 35 fragments, curve 68 at step 35 vs 86 at step 30).
+They are cheap to detect in rollout token ids: `<tool_call>` is a single
+token, id 248058 (checked on the pod with
+`AutoTokenizer.from_pretrained(TILERL_QWEN38_SOURCE).encode("<tool_call>")`
+→ `[248058]`).
 
 ## Rule
 
