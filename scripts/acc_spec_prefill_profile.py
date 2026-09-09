@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -100,7 +101,8 @@ def main() -> None:
     args = p.parse_args()
 
     sha, dirty = git_commit(), git_dirty()
-    print(f"=== acc_spec_prefill_profile  sha={sha}  dirty={dirty}  draft={'yes' if args.draft else 'no'} ===")
+    card = os.environ.get("CUDA_VISIBLE_DEVICES", "?")
+    print(f"=== acc_spec_prefill_profile  sha={sha}  dirty={dirty}  card={card}  draft={'yes' if args.draft else 'no'} ===")
 
     from tilerl_kernels.backend import get_backend
 
@@ -183,7 +185,7 @@ def main() -> None:
     engine_prefill = getattr(engine, "_prefill_secs", None)
 
     report = {
-        "provenance": {"git_commit": sha, "git_dirty": dirty},
+        "provenance": {"git_commit": sha, "git_dirty": dirty, "card": card},
         "wall": wall,
         "tok_s": (tok_gen / wall) if wall else 0.0,
         "buckets": {
