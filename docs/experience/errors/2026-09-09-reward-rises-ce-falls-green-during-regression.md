@@ -6,40 +6,50 @@ correctness was flat-to-down. `ce_falls` did not object either — it is
 skipped on every RL run. These are the second and third empty gates,
 after `tied` (see [the three-defects entry](2026-09-09-math-l5-run-three-defects.md)).
 `reward_rises` is worse than `tied`: `tied` is always green and says
-nothing, while `reward_rises` is green *because the training batch moved
-the wrong way*, which reads as a pass signal.
+nothing, while `reward_rises` is green *because the training batch
+improved* — which is the default state of any non-collapsed run, and
+carries no information about eval correctness.
 
 ## Context
 
 The gate compares `reward_last > reward_first` (cli.py:1368), where both
 are means of the per-step training reward over the first and last
-`--patience-window` steps. The training reward is the length-aware
-quantity GRPO optimizes: `correctness − λ·tokens/cap` (cli.py:580-583),
-averaged over 8 completions per step on the MATH L5 training batch.
+`max(1, steps//4)` steps (cli.py:1146). The training reward is the
+length-aware quantity GRPO optimizes: `correctness − λ·tokens/cap`
+(cli.py:580-583), averaged over 8 completions per step on the MATH L5
+training batch.
 
 On this run:
 
 | step | mean reward | mean tokens | n |
 |---|---|---|---|
-| 1 | 0.7460 | 246 | 8 |
+| 1 | 0.7460 | 246.0 | 8 |
+| 2 | 0.8515 | 1442.5 | 8 |
+| 9 | 0.9861 | 855.6 | 8 |
 | 10 | 0.9941 | 363.5 | 8 |
 
-`reward_rises`: 0.9941 > 0.7460 → green.
+The gate windows first and last `max(1, steps//4)` = 2 steps
+(cli.py:1146): `reward_first` = mean(0.7460, 0.8515) = 0.7988,
+`reward_last` = mean(0.9861, 0.9941) = 0.9901. `reward_rises`:
+0.9901 > 0.7988 → green.
 
 Over the same run, GSM8K eval correctness on the same 100 problems
 (curve subset, evaluated at base, step 5, step 10):
 
 | point | correctness | mean tokens |
 |---|---|---|
-| base (500-row batch) | 0.880 | 1925.7 |
+| base (curve subset, from 500-row batch) | 0.880 | 1925.7 |
 | step 5 | 0.790 | 1353.3 |
 | step 10 | 0.800 | 1252.8 |
 
-Step 5→10 is noise (r2w=4, w2r=5, McNemar p=0.180). Base→step 10 is −8
-pt, but base and curve are different batch compositions, so the net sits
-inside the cross-batch floor (Defect 3 in the three-defects entry). The
-honest read: eval correctness was flat across the training steps and
-down from base, and the gate was green throughout.
+The base row is the 100 curve problems scored inside the 500-row
+eval-before batch (the full 500-row GSM8K base is 0.850); the curve rows
+are the same 100 problems scored alone. Base and curve are different
+batch compositions. Step 5→10 is noise (r2w=4, w2r=5, McNemar p=0.180).
+Base→step 10 is −8 pt, but the cross-batch floor (Defect 3 in the
+three-defects entry) means the net is uninterpretable without a paired
+test. The honest read: eval correctness was flat across the training
+steps and down from base, and the gate was green throughout.
 
 ## Root cause
 
@@ -52,15 +62,17 @@ guard eval correctness. Three layers of removal:
    generalization gap, and the gate cannot see it.
 2. **Length-confounded.** At λ=0.1 the reward rises when completions
    shorten, independent of correctness. Eval tokens fell 1925.7→1252.8
-   across this run; the length term alone improved reward by +0.014,
-   enough to mask a correctness drop of 1.4 pt. On the training batch
-   tokens rose (246→363.5), so the reward rise there was
-   correctness-driven — but the gate's *green state* is still
-   uninformative about eval correctness, because the gate reads the
-   training batch and the length term can inflate either side.
-3. **Underpowered.** Eight completions per step. Step-to-step swings are
-   large (step 6: 0.2165, step 7: 0.9880). Comparing step-1 and step-10
-   means, each n=8, is a coin flip on any real signal.
+   across this run; the length term alone improved reward by
+   0.1·(1925.7−1252.8)/6144 ≈ +0.011, enough to mask a correctness drop
+   of 1.1 pt. On the training batch tokens rose (246→363.5), so the
+   reward rise there was correctness-driven — but the gate's *green
+   state* is still uninformative about eval correctness, because the
+   gate reads the training batch and the length term can inflate either
+   side.
+3. **Underpowered.** Eight completions per step, and the gate windows
+   two steps per side (n=16). Step-to-step swings are large
+   (step 6: 0.2165, step 7: 0.9880). A two-step mean on either side of a
+   swing this size is a coin flip on any real signal.
 
 The design comment (cli.py:1308-1314) is explicit that `reward_rises`
 must never *make* P1 pass — it is validity-only, and "reward not rising
