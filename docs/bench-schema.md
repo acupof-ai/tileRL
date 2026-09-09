@@ -34,7 +34,10 @@ different question every time someone reads it.
 
 `floor.derivation` must state the computation with numbers. A `baseline`
 floor (random-guess 25%, no-reuse 1.0x) must name the null it is measured
-against — "no known floor" is rejected.
+against — "no known floor" is rejected. The derivation is the one field the
+machine cannot check, so review must: **every new `floor.derivation` is
+recomputed by its reviewer** — the arithmetic, not just the prose
+(`wins/2026-09-09-the-first-floor-derivation-failed-its-own-check.md`).
 
 ## Reruns
 

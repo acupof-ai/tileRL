@@ -89,7 +89,7 @@ def main() -> None:
         "device": {"name": args.device_name, "card": args.card},
         "sha": benchrec.git_sha(), "cmd": " ".join(sys.argv),
         "floor": {"value": 129.0, "unit": "tok/s", "kind": "roofline",
-                  "derivation": "129 tok/s = 30.9 GiB weights / 4 TB/s H20 HBM "
+                  "derivation": "129 tok/s = 30.9 GB weights / 4 TB/s H20 HBM "
                                 "(wins/2026-08-24-sota-all-levers.md)"},
     })
     print(f"record {rid} appended")

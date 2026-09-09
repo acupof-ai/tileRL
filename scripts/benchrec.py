@@ -216,7 +216,7 @@ if __name__ == "__main__":
         "device": {"name": "H20", "card": 6},
         "sha": "90f308a", "cmd": "python3 scripts/bench_b1_decode.py --build fused+graph",
         "floor": {"value": 129.0, "unit": "tok/s", "kind": "roofline",
-                  "derivation": "129 tok/s = 30.9 GiB weights / 4 TB/s H20 HBM (wins/2026-08-24-sota-all-levers.md)"},
+                  "derivation": "129 tok/s = 30.9 GB weights / 4 TB/s H20 HBM (wins/2026-08-24-sota-all-levers.md)"},
     }
     assert validate(good, reg, set()) == [], validate(good, reg, set())
 
