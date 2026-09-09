@@ -13,18 +13,21 @@ TREE=${TREE:-$(cd "$(dirname "$0")/.." && pwd)}
 DATA=${DATA:-/work/p1_gsm8k_train.jsonl}
 EVAL=${EVAL:-/work/p1_gsm8k_test.jsonl}
 cd "$TREE"
+# Fresh runs dir per gate invocation: the run id is a hash of the config, so without
+# this the arm-A run id collides with any same-config run already in ./runs and the
+# code refuses to rerun a finished run. A fresh dir also guarantees arm B's before-arm
+# cache misses (a hit would skip the eval and make B the clean path again).
+export TILERL_RUNS=$(mktemp -d /tmp/gate_ds_runs.XXXXXX)
 COMMON="--recipe grpo-gsm8k-27b --data $DATA --steps 3 --eval-mmlu 0 --eval-every 0 \
   --length-penalty 0.0 --allow-short-rollouts"
 
 python -m tilerl.cli train $COMMON > /tmp/gate_ds_a.log 2>&1 || {
   echo "arm A (clean) failed"; tail -5 /tmp/gate_ds_a.log; exit 1; }
-A_DIR=$(ls -td runs/*/ | head -1)
+A_DIR=$(ls -td "$TILERL_RUNS"/*/ | head -1)
 
-# Arm B must MISS the cache (a hit skips the before arm and is the clean path again).
-rm -f runs/eval-cache/*.json
 python -m tilerl.cli train $COMMON --eval-gsm8k "$EVAL" --eval-n 100 > /tmp/gate_ds_b.log 2>&1 || {
   echo "arm B (prewarmed) failed"; tail -5 /tmp/gate_ds_b.log; exit 1; }
-B_DIR=$(ls -td runs/*/ | head -1)
+B_DIR=$(ls -td "$TILERL_RUNS"/*/ | head -1)
 
 echo "A_DIR=$A_DIR"
 echo "B_DIR=$B_DIR"
