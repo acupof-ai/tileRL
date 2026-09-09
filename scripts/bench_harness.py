@@ -713,6 +713,9 @@ def main() -> int:
     ap.add_argument("--collectors", action="store_true", help="metric -> collector script map and exit")
     args = ap.parse_args()
 
+    # Views are an explicit branch, never a fall-through: a query flag that misses
+    # this list runs the training suite below and appends rows to the permanent store
+    # (2026-09-09, --collectors did exactly that; the cmd field was the only tell).
     if args.table or args.readme or args.regress or args.questions or args.collectors:
         if args.table:
             _view_table()
