@@ -16,7 +16,7 @@ git ls-files 'scripts/probe_*.py' | xargs -I{} git log -1 --format=%ad --date=sh
 
 ### D1 — step 5 的 22 个脚本（成本：接近零）
 
-`docs/bench-inventory.md` 已判定：Keep 33，Delete 22（10 bench 含 `bench_smoke.py` 移 CI、4 ab、4 sweep/matrix、4 launcher）。判定已记录，这是执行不是评审。
+`docs/bench-inventory.md` 已判定：Keep 34，Delete 21（10 bench 含 `bench_smoke.py` 移 CI、4 ab、3 sweep/matrix、4 launcher）。判定已记录，这是执行不是评审。21 项已全部在 #378 删除（2026-09-10 逐项核对，映射 exact）；#379 删的 4 个 `probe_` 脚本属 D2 家族，不在这份清单上。inventory 的分诊表已消费，只留 registry 装不下的残渣（conditional verdicts、sm70 系列、SSD 支持）。
 
 规则（写进 step 5 PR 描述）：**先迁移唯一出处的值，再删**。三条件全过才删：判定已记录 + 不是任何在用值的唯一出处 + 可复现或不再测量。
 
