@@ -212,10 +212,14 @@ drifted into their 256 cap. `mean_len` does **not** substitute for it: that is t
 different quantity. The rollout trajectory is recoverable after the run from
 `_write_rollout_rows`' per-completion rows, which the flag does not affect.
 
-Also: GSM8K has no rollout length distribution on the correct code path in this tree. The one
-measured earlier today is at temperature 1.0 through `render_chat` (mean 322.0, p90 532, 1.3% at
-a 1024 cap, 384 rollouts over 3 seeds) and a peer's long-tail probe was voided for encoding the
-bare question. This run's eval lengths are the first on the production path.
+Also: ~~GSM8K has no rollout length distribution on the correct code path in this tree.~~
+`probe_gsm8k_lengths.py` measured it on the serving path (temperature 1.0, `render_chat`,
+384 rollouts over 3 seeds): mean 322.0, p90 532, 1.3% at a 1024 cap. The 1029.1-token mean
+cited elsewhere is MATH's before-arm, not GSM8K's — a cap chosen from the wrong task is
+what made the first ISO-RL arm read `tied 100%` at 128 tokens. The training rollout path
+(`grpo_loop`'s group sampling) is still unmeasured; the serving-path numbers above are the
+closest on record. A peer's long-tail probe was voided for encoding the bare question.
+This run's eval lengths are the first on the production path.
 
 ## Results
 

@@ -242,6 +242,15 @@ from `--group` and the test would have kept passing against a frozen 8 while mea
 nothing. Now asserted as `slots == 2 == max_batch` under `--group 2`, so it moves with the
 flag.
 
+## The group16 idle probe is superseded by the slot mismatch
+
+`probe_group16_mechanism.py` measured group 8 at 74.4% idle and group 16 at 77.3% (+2.9
+points, 17 matched prompts, card 3) and tried to explain the gap by resampling 16 draws
+from group-8's row lengths. That analysis is moot: the coupling defect above means
+`--group 16` ran as two waves of 8, so the +2.9 points is the wave effect, not the group
+size. The probe's methodology — fit on one arm, test on an arm it never saw — is the
+durable part; its conclusion is not.
+
 ## Rules
 
 - **A "worst case" derived by scaling every term linearly is not an upper bound.** Something

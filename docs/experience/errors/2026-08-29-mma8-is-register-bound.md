@@ -254,6 +254,10 @@ value — the decode graph or the pools did not survive the rebuild. So B=8 rest
 on two separate runs, which is weaker evidence than B=4's, and is recorded as
 such rather than quietly averaged in.
 
+The 1.18x isolated and the B=4 e2e 1.037x are same-tree comparisons: one process, same
+weights, W8 toggled via the registry factory. The 09657c0 contamination voided cross-sha
+comparisons, not in-tree ones — these numbers survive.
+
 ## Rule
 
 A correlation is not a diagnosis, and the counter that settles it is usually
