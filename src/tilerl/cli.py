@@ -750,19 +750,28 @@ def _train_adapters(args: argparse.Namespace) -> None:
             return
         rows_out: list = []
         if args.eval_mmlu:
+            # Per-arm, because `eval_{tag}_secs` is the SUM of both arms and no historical run
+            # can be decomposed into them -- not even by subtraction, since the gsm8k arm was
+            # never timed either. MMLU is prefill-dominated (1000 questions x ~515 prompt
+            # tokens, 1 token generated), so its cost does not follow from any decode figure.
+            t_mmlu = time.perf_counter()
             c, n, conc = mmlu_accuracy(engine, tok, args.eval_mmlu, concurrency=_EVAL_CONCURRENCY,
                                        questions=mmlu_set, per_problem=rows_out)
+            manifest["metrics"][f"mmlu_{tag}_secs"] = time.perf_counter() - t_mmlu
             manifest["metrics"][f"mmlu_{tag}"] = c / n
             manifest["metrics"][f"mmlu_{tag}_concurrency"] = conc
             manifest["metrics"][f"mmlu_{tag}_correct"] = c
             manifest["metrics"][f"mmlu_{tag}_total"] = n
-            log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}% (seed 0, concurrency {conc})")
+            log(f"mmlu 0-shot {c}/{n} = {100 * c / n:.1f}% (seed 0, concurrency {conc}) "
+                f"in {manifest['metrics'][f'mmlu_{tag}_secs']:.1f}s")
         if eval_rows:
             gsm_rows: list = []
+            t_gsm = time.perf_counter()
             c, n, ntok = gsm8k_accuracy(engine, tok, eval_rows, eval_params, concurrency=_EVAL_CONCURRENCY,
                                         thinking=thinking,
                                         match=MATCHERS[args.reward],
                                         per_problem=gsm_rows)
+            manifest["metrics"][f"gsm8k_{tag}_secs"] = time.perf_counter() - t_gsm
             mean_len[tag] = sum(r["tokens"] for r in gsm_rows) / max(1, len(gsm_rows))
             rows_out.extend(dict(r, dataset="gsm8k") for r in gsm_rows)
             manifest["metrics"][f"gsm8k_{tag}"] = c
@@ -780,7 +789,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
         # -- 0.74 s where 0.0013 s was spent -- and `_secs` matches the `_before` filter.
         elapsed = time.perf_counter() - t_eval
         if tag == "before" and cache is not None:
-            saved = {"metrics": {k: v for k, v in manifest["metrics"].items() if "_before" in k},
+            # `_secs` excluded, not just `eval_before_secs` by ordering: a duration belongs to
+            # the run that paid it, and the per-arm timings added beside the scores DO match
+            # the `_before` filter, so caching them would replay a miss's minutes onto a hit.
+            saved = {"metrics": {k: v for k, v in manifest["metrics"].items()
+                                 if "_before" in k and not k.endswith("_secs")},
                      "rows": rows_out, "mean_len": mean_len.get(tag)}
             cache.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile("w", dir=cache.parent, delete=False) as f:
