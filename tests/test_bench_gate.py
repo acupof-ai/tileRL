@@ -109,6 +109,28 @@ def test_client_side_collector_cannot_default_the_server_device(monkeypatch, tmp
         benchrec.record_common(typo)
 
 
+def test_a_cpu_target_never_takes_the_cuda_name(monkeypatch, tmp_path):
+    """A server-side write with target=cpu on a machine that HAS a GPU must still
+    label the row 'cpu': the probe asks the machine, not the target. 2026-09-10:
+    #434 moved `_emit_eval_records` onto `record_common`, whose torch probe ran for
+    every target, so a cpu run on the pod labeled itself NVIDIA H20 -- a population
+    lie the client-side gate cannot see, since this path is server-side."""
+    import argparse
+
+    import torch
+
+    store = tmp_path / "measurements.jsonl"
+    store.write_text(json.dumps({"device": {"name": "cpu"}}) + "\n")
+    monkeypatch.setattr(benchrec, "STORE", store)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _d: "NVIDIA H20")
+
+    ap = argparse.ArgumentParser()
+    benchrec.add_record_args(ap)
+    args = ap.parse_args(["--build", "eager", "--target", "cpu"])
+    assert benchrec.record_common(args)["device"]["name"] == "cpu"
+
+
 def test_every_registered_collector_exists_and_the_094_metrics_have_one():
     """The collector field is the metric -> script map `tilerl bench <name>` dispatches
     on. A renamed script must fail CI, and a weight-0.94 metric with no collector is
