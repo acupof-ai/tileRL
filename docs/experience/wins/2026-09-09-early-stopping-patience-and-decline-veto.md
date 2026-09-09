@@ -42,7 +42,37 @@ for the seed-1 verdict on whether the collapse reproduces.
    1.9x wider and never fires on a slow rise, and stopping with no width at all decides on
    noise. `patience=0` never asks, so it never refuses.
 
-## Correctness evidence: three negative controls
+## Patience mode raw (PR following cd06b2a)
+
+`--patience-mode raw` compares raw scores (strict >) instead of the 2xSE ruler. It exists
+because the eval is 62% of the run's wall time (seed 1: 3280s of 5249.7s across four curve
+evals), and shrinking the curve subset to make finer grids affordable breaks the
+significant ruler: at n=100 the paired 2xSE is **5.6-7.4 pt** (subsampled, measured)
+against a **+6.0 pt** step gain, so `new_best_point` almost never fires and patience=1
+stops at the second point on every curve — a guard that always fires.
+
+The three risks, documented in `new_best_point`'s docstring:
+
+1. **It can fire below the instrument floor** — seed 1 in raw mode stops at step 50 on
+   94.2 ≤ 94.4, one question.
+2. **It is safe only on step-shaped curves** (gain concentrated in the first point, then
+   flat). On a noisy rise it follows the noise: best drifts up on sub-floor gains, and the
+   decline veto is then measured against the noise-inflated peak — same curve, raw vetoes
+   a point that significant, whose best never moved, does not. A flat point stops both
+   modes under patience=1; the mode-specific hazard is the drift, not the stop.
+3. **It is coupled to the adapter-best snapshot** — stopping early loses only "might
+   improve later", never what was. Without the snapshot, raw is a net loss.
+4. **It ships the expensive twin** — `adapter-best` follows `best`, so a sub-floor gain
+   makes the delivered weights a one-question choice: p@25 = 94.0, p@50 94.2 keeps step
+   50 in raw where significant keeps step 25 — 25 more training steps for a pair
+   statistics cannot separate. Raw knowingly waives the tie-keeps-the-earlier-point
+   rule, in exchange for a guard that still works at small n.
+
+The decline veto and the startup/mid-run refusal are unchanged in raw mode: raw keeps the
+veto, the veto needs the paired width, and a run that cannot produce it silently loses
+collapse protection — the exact failure the refusal exists for.
+
+## Correctness evidence: negative controls
 
 `python -m tilerl.ledger` — four cells (plateau / plateau-then-rise / collapse /
 missing-width refusal), each with a mutation verified red and reverted green:
@@ -53,13 +83,19 @@ missing-width refusal), each with a mutation verified red and reverted green:
 | 2 | stops on every new best | red — the plateau-then-rise cell stops before the rise |
 | 3 | patience never counts (`stale` frozen) | red — the plateau cell never stops |
 | 4 | refusal never raises (`if False: raise SystemExit`) | red — the missing-width cell runs to completion instead of refusing |
+| 5 | raw ruler degraded to significant (`mode == "raw" and False`) | red — the gradual-rise cell stops early in raw too; the modes no longer differ |
 
 The cells pin all three cases: the stop-worthy stops, the not-stop-worthy does not, and
-the immediately-stop-worthy is not slow.
+the immediately-stop-worthy is not slow. Cells E/F pin the modes: a gradual rise at small
+n stops in significant and runs on in raw (why raw exists), and a one-question gain resets
+patience and drifts best in raw but not significant (raw's risk, executable).
 
 ## What the pod must show
 
 A run with `--patience 1 --eval-every 5` on the GSM8K recipe stops at step 10 (the first
 non-improving point after the step-5 peak), ships `adapter-best.safetensors` at step 5,
 and the manifest's `early_stopped.reason` is `"patience"`. A collapse-shaped run stops at
-the collapse point with `reason: "decline"` and `kept_step` at the pre-collapse peak.
+the collapse point with `reason: "decline"` and `kept_step` at the pre-collapse peak. A
+small-curve run (`--eval-curve-n 100 --patience 1 --patience-mode raw`) stops at the first
+flat point keeping the step-5 peak, where the same run in significant mode stops at the
+second point regardless of shape.

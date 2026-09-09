@@ -988,7 +988,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
                 require_paired_width(se, args.patience, best["step"])
             else:
                 se = se_kind = None  # first point: no comparison installed it
-            replaced = new_best_point(curve[-1], best or None, se)
+            replaced = new_best_point(curve[-1], best or None, se, mode=args.patience_mode)
             if replaced:
                 # `mean_len` and `tok_per_correct` ride with the snapshot so a downstream
                 # consumer can trade score against answer cost -- the 2026-09-05 run bought
@@ -1657,6 +1657,11 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="early-stop after N curve POINTS without a significant score "
                               "gain -- a point is --eval-every steps, not one -- or "
                               "immediately on a significant decline; 0 = never stop")
+    p_train.add_argument("--patience-mode", choices=["significant", "raw"], default="significant",
+                         help="ruler for --patience: significant (2xSE paired width) or raw "
+                              "(strict raw-score gain, for small curve subsets where the "
+                              "width exceeds the signal -- the three risks are documented "
+                              "in ledger.new_best_point)")
     p_train.add_argument("--eval-curve-n", type=int, default=20,
                          help="rows of --eval-gsm8k in the curve subset; keep the scoring "
                               "under 5%% of a step")
