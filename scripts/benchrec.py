@@ -386,7 +386,7 @@ def record_common(args, *, build: str | None = None) -> dict:
                          "device, and a default here is a population lie -- a cpu run "
                          "labeled H20 enters every device-grouped view and every "
                          "measured-best comparison")
-    if not device_name:
+    if not device_name and args.target in ("sm90", "sm70"):
         try:
             import torch
 
