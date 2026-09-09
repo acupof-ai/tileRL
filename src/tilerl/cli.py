@@ -1437,11 +1437,15 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 
 def cmd_bench(args: argparse.Namespace) -> None:
-    if args.suite:
+    views = [f"--{v}" for v in ("table", "readme", "regress", "questions")
+             if getattr(args, v, False)]
+    if views or args.suite:
         import subprocess
 
         script = Path(__file__).resolve().parent.parent.parent / "scripts/bench_harness.py"
-        cmd = [sys.executable, str(script), "--suite", args.suite]
+        cmd = [sys.executable, str(script), *views]
+        if args.suite:
+            cmd += ["--suite", args.suite]
         if args.source:
             cmd += ["--source", args.source]
         if args.gpu is not None:
@@ -1788,6 +1792,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_bench.add_argument("--source", default=None, help="27B checkpoint dir (harness GPU suites)")
     p_bench.add_argument("--gpu", type=int, default=None, help="GPU index (harness)")
     p_bench.add_argument("--batches", default=None, help="harness decode batch sizes, e.g. 1,8")
+    for v in ("table", "readme", "regress", "questions"):
+        p_bench.add_argument(f"--{v}", action="store_true",
+                             help=f"bench view: {v} from the bench store, no GPU")
     p_bench.set_defaults(func=cmd_bench)
 
     p_gen = sub.add_parser(

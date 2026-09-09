@@ -5,15 +5,26 @@ A chat client resends the whole conversation each turn, so turn N's prompt is tu
 N-1's prompt plus the assistant reply plus the new user text. That shared span is
 what the prefix store exists for. Run it against a live `tilerl serve`:
 
-  python scripts/bench_chat_reuse.py --url http://localhost:8000 --turns 6
+  python scripts/bench_chat_reuse.py --url http://localhost:8000 --turns 6 \
+      --build fused+graph --card 6
+
+Emits one chat_turn_wall_s record per turn plus prefix_hits rows to
+docs/experience/bench/measurements.jsonl (schema: docs/bench-schema.md). The
+reuse speedup (turn 1 / turn 2 wall) is a view, not a record -- a measurement
+is one turn.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import benchrec  # noqa: E402
 
 _FILLER = (
     "Explain in detail how a paged key-value cache serves a transformer decode step, "
@@ -34,6 +45,20 @@ def _get(url: str, timeout: float = 10.0) -> dict:
         return json.loads(r.read())
 
 
+def _measured_best(metric: str, shape: dict, lower_is_better: bool) -> tuple[float, str]:
+    """Best accepted row for this population so far; the row itself on first sight."""
+    cur = benchrec.current(benchrec.load_all())
+    best, best_id = None, None
+    for k, r in cur.items():
+        if k[0] != metric or tuple(sorted(r["shape"].items())) != tuple(sorted(shape.items())):
+            continue
+        if best is None or (lower_is_better and r["value"] < best) or (
+            not lower_is_better and r["value"] > best
+        ):
+            best, best_id = r["value"], r["id"]
+    return best, best_id
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://localhost:8000")
@@ -41,22 +66,25 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=24)
     ap.add_argument("--grow", type=int, default=3, help="filler sentences added per turn")
     ap.add_argument("--timeout", type=float, default=1800.0)
+    ap.add_argument("--build", required=True, choices=list(benchrec.BUILDS))
+    ap.add_argument("--target", default="sm90", choices=list(benchrec.TARGETS))
+    ap.add_argument("--device-name", default="H20")
+    ap.add_argument("--card", type=int, required=True)
+    ap.add_argument("--model-name", default="27B-nvfp4")
     args = ap.parse_args()
 
+    common = {"target": args.target, "build": args.build, "model": args.model_name,
+              "device": {"name": args.device_name, "card": args.card},
+              "sha": benchrec.git_sha(), "cmd": " ".join(sys.argv)}
     msgs: list[dict] = []
-    rows = []
     for turn in range(args.turns):
         msgs.append({"role": "user", "content": _FILLER * args.grow * (turn + 1)})
         before = _get(f"{args.url}/health")["stats"]
         t0 = time.perf_counter()
         out = _post(
             f"{args.url}/v1/chat/completions",
-            {
-                "model": "qwen38-27b",
-                "messages": msgs,
-                "max_tokens": args.max_tokens,
-                "temperature": 0.0,
-            },
+            {"model": "qwen38-27b", "messages": msgs,
+             "max_tokens": args.max_tokens, "temperature": 0.0},
             args.timeout,
         )
         wall = time.perf_counter() - t0
@@ -64,26 +92,35 @@ def main() -> int:
         reply = out["choices"][0]["message"]["content"]
         msgs.append({"role": "assistant", "content": reply})
         usage = out.get("usage", {})
-        rows.append(
-            {
-                "turn": turn,
-                "prompt_tokens": usage.get("prompt_tokens"),
-                "wall_s": round(wall, 2),
-                "hits": after["prefix_hits"] - before["prefix_hits"],
-                "published": after["prefix_published"] - before["prefix_published"],
-                "prefill_forwards": after["prefill_forwards"] - before["prefill_forwards"],
-            }
-        )
-        r = rows[-1]
-        print(
-            f"turn {turn}  prompt={r['prompt_tokens']:6}  wall={r['wall_s']:8.2f}s  "
-            f"hits={r['hits']}  published={r['published']}  "
-            f"prefills={r['prefill_forwards']}",
-            flush=True,
-        )
+        pt = usage.get("prompt_tokens")
+        hits = after["prefix_hits"] - before["prefix_hits"]
+        print(f"turn {turn}  prompt={pt:6}  wall={wall:8.2f}s  hits={hits}  "
+              f"prefills={after['prefill_forwards'] - before['prefill_forwards']}", flush=True)
 
-    st = _get(f"{args.url}/health")["stats"]
-    print(json.dumps({"rows": rows, "final_stats": st}, indent=2))
+        shape = {"turn": turn, "prompt_tokens": pt}
+        best, best_id = _measured_best("chat_turn_wall_s", shape, lower_is_better=True)
+        floor_v = min(best, wall) if best is not None else wall
+        deriv = (f"min accepted wall for this population (row {best_id})" if best_id
+                 else "first accepted row for this population; floor = this measurement")
+        rid = benchrec.append({
+            "metric": "chat_turn_wall_s", "value": round(wall, 3), "unit": "s",
+            "shape": shape, "warm": {"state": "warm", "compiles": 0},
+            "n": 1, "spread": 0.0,
+            "floor": {"value": round(floor_v, 3), "unit": "s", "kind": "measured-best", "derivation": deriv},
+            **common,
+        })
+        if hits > 0:
+            benchrec.append({
+                "metric": "prefix_hits", "value": hits, "unit": "hits",
+                "shape": {"turn": turn}, "warm": {"state": "warm", "compiles": 0},
+                "n": 1, "spread": 0.0,
+                "floor": {"value": 1.0, "unit": "hits", "kind": "baseline",
+                          "derivation": "1.0 = one block-boundary hit is the smallest nonzero reuse; "
+                                        "0 hits means no reuse"},
+                **common,
+            })
+        print(f"  record {rid} appended", flush=True)
+
     return 0
 
 
