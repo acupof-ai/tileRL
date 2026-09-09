@@ -90,6 +90,10 @@ pod_exec() {
 read -r -d '' RUNNER <<RUNNER_EOF || true
 set -uo pipefail
 cd $REMOTE_DIR
+# Mark the tree in use so a pod_sync wipe refuses while this job runs (the check is in
+# pod_sync.sh). release() drops the line; a SIGKILL leaves it stale, and the check's
+# start-time comparison clears it.
+echo "\$\$ \$(ps -o lstart= -p \$\$ | tr -s ' ')" >> $REMOTE_DIR/.pod_running
 # Before anything that can fail: a number is attributed to a sha or visibly \`unknown\`.
 echo "pod_run: tree $REMOTE_DIR sha \$(cat $REMOTE_DIR/.synced_commit 2>/dev/null || echo unknown)"
 [ -d /work/tl013 ] && export PATH=/work/tl013/bin:\$PATH
@@ -134,7 +138,8 @@ for c in ${CARD//,/ }; do
   fi
 done
 
-release() { python3 $AUPAI/scripts/card_claim.py release --name tilerl-$NAME >/dev/null 2>&1 || true; }
+release() { python3 $AUPAI/scripts/card_claim.py release --name tilerl-$NAME >/dev/null 2>&1 || true
+            sed -i.bak "/^\$\$ /d" $REMOTE_DIR/.pod_running 2>/dev/null; rm -f $REMOTE_DIR/.pod_running.bak; }
 trap release EXIT INT TERM
 
 # A claim names a pid because the card's memory is held by a pid, so it dies when that pid
