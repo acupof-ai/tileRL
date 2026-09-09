@@ -98,16 +98,19 @@ def _timed_run_forward(self, decodes, prefills, chunks):
 
 
 def _timed_model_forward(self, *a, **kw):
+    # Sync only on prefill steps: a synchronize during decode-graph capture is
+    # illegal and silently flips the engine to eager decode for every tick.
+    if not _state["pf_step"]:
+        return _orig_model_forward(self, *a, **kw)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     r = _orig_model_forward(self, *a, **kw)
     torch.cuda.synchronize()
-    if _state["pf_step"]:
-        dt = time.perf_counter() - t0
-        _add("kernel", dt)
-        _kernel_steps.append(dt)
-        if not _first_kernel:
-            _first_kernel.append(dt)
+    dt = time.perf_counter() - t0
+    _add("kernel", dt)
+    _kernel_steps.append(dt)
+    if not _first_kernel:
+        _first_kernel.append(dt)
     return r
 
 
