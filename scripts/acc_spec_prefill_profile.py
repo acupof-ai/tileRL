@@ -20,10 +20,12 @@ import argparse
 import json
 import statistics
 import time
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
 import torch
+from tilerl_kernels.backend import Backend
 
 from tilerl import engine as engine_mod
 from tilerl.config import qwen38_27b
@@ -39,6 +41,7 @@ _pf: dict = {}
 _kernel_steps: list = []
 _first_kernel: list = []
 _counts = {"pf_steps": 0, "dec_steps": 0}
+_plan_sel: Counter = Counter()
 
 
 def _add(bucket: str, dt: float) -> None:
@@ -121,6 +124,18 @@ if hasattr(engine_mod.Engine, "_admit"):  # 09657c0 admits inline in _build_plan
 engine_mod.Engine._match_prefix = _timed_match_prefix
 engine_mod.Engine._run_forward = _timed_run_forward
 Model.forward = _timed_model_forward
+
+_orig_plan = Backend._plan
+
+
+def _rec_plan(self, op, m, n, k):
+    r = _orig_plan(self, op, m, n, k)
+    if _state["pf_step"]:
+        _plan_sel[(op, m, str(r))] += 1
+    return r
+
+
+Backend._plan = _rec_plan
 
 
 def main() -> None:
@@ -222,6 +237,12 @@ def main() -> None:
     print(f"  kernel first step {(_first_kernel[0] if _first_kernel else 0)*1000:.1f} ms, "
           f"rest median {statistics.median(rest)*1000 if rest else 0:.1f} ms, "
           f"rest max {max(rest)*1000 if rest else 0:.1f} ms")
+    print("linear dispatch during prefill (op, M -> plan): count")
+    for (op, m, plan), c in sorted(_plan_sel.items()):
+        print(f"  {op} M={m}: {plan} x{c}")
+    report["linear_dispatch"] = {
+        f"{op} M={m} -> {plan}": c for (op, m, plan), c in sorted(_plan_sel.items())
+    }
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "prefill_profile.json").write_text(json.dumps(report, indent=2))
