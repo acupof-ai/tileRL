@@ -29,6 +29,10 @@ shape, and only they are comparable to sglang. The speculation pair ran 200 real
 problems, so 126.5 is read against its own 79.5 base (**1.591x**) and never against
 54.2. Speculation is a B=1 lever: at B=8 it lands at 0.928x.
 
+Speculation and the prefix cache cannot both be on: the engine rejects a drafter
+that taps the trunk's aux layers behind a real prefix store at build time, since
+an adopted prefix skips the positions the draft's context was built from.
+
 This table read **135.5** for the speculation row until 2026-09-09. That number was
 measured 2026-09-03 on H20 gpu7; re-measured today on the current sha, same workload, on
 a different H20 (card 6), the arm reads **126.5** warm and 122.4 cold. The base arm reproduces (79.5 warm, 78.2 cold,
