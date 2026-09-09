@@ -84,6 +84,13 @@ def _prompt(target_tokens: int) -> str:
 
 
 def _compiles(log: str) -> int:
+    """`begins to compile` lines in the arm's server log, or -1 on OSError.
+
+    Lower bound, not a count: only kernels TileLang logs at INFO are counted, so
+    the true JIT count is >= this and the gap is undefined (16 vs 2 on the first
+    real comparison, 2026-09-09). Console-only -- this script writes no store
+    record, and the count never enters one elsewhere.
+    """
     try:
         with open(log, encoding="utf-8", errors="replace") as f:
             return sum("begins to compile" in line for line in f)

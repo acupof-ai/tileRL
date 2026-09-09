@@ -9,8 +9,10 @@ inside a measured turn would have been charged to the tier and read as clean.
 
 The distinction the fix has to keep: a log without the server's own startup line
 (empty, buffered-to-death, or the wrong file) is unknown; a log WITH the startup line
-and no marker is genuinely clean. Collapsing both to -1 would make the verdict
-unreachable.
+and no marker reads 0. This is a **lower bound** -- only INFO-logged kernels are
+counted, so the true JIT count is >= this and the gap is undefined (16 vs 2 on the
+first real comparison, 2026-09-09). The count is console-only; the store records null.
+Collapsing both to -1 would make the console verdict unreachable.
 """
 
 from __future__ import annotations

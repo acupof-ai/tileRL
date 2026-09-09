@@ -55,6 +55,12 @@ def _stats(port: int) -> dict:
 
 
 def _compiles(log: str) -> int:
+    """`begins to compile` lines in the arm's server log, or -1 on OSError.
+
+    Lower bound, not a count: only kernels TileLang logs at INFO are counted, so
+    the true JIT count is >= this and the gap is undefined (16 vs 2 on the first
+    real comparison, 2026-09-09). Console-only -- the store records null.
+    """
     try:
         with open(log, encoding="utf-8", errors="replace") as f:
             return sum("begins to compile" in line for line in f)
@@ -158,7 +164,7 @@ def run_arm(args, arm: str, spill: str, log: str) -> list[dict]:
                             "shape": {"turn": row["turn"], "prompt_tokens": row["prompt_tokens"],
                                       "arm": row["arm"], "sessions": row["sessions"],
                                       "conv": row["conv"]},
-                            "warm": {"state": "warm", "compiles": 0},
+                            "warm": {"state": "warm", "compiles": None},
                             "n": 1, "spread": 0.0, **benchrec.record_common(args),
                         }
                         rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=True)
