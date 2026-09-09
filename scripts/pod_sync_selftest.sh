@@ -8,6 +8,7 @@
 #   * live pid, matching start   -> REFUSES (exit 1, "refusing to wipe", marker kept)
 #   * dead pid                   -> proceeds, marker removed
 #   * live pid, stale start time -> treated as stale (pid reused), proceeds, marker removed
+#   * ps unavailable -> REFUSES (a guard that cannot decide must not pass silently)
 set -euo pipefail
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
@@ -40,6 +41,18 @@ sleep 30 & live=$!
 echo "$live Wed Dec 31 23:59:59 1969" > .pod_running
 bash -c "$CHECK" || { echo "FAIL: a reused pid with old start time should pass" >&2; exit 1; }
 [ ! -f .pod_running ] || { echo "FAIL: marker not removed after stale line" >&2; exit 1; }
+disown "$live" 2>/dev/null || true; kill "$live" 2>/dev/null || true
+
+# 5. ps unavailable -> refuses loud (stat="" must not read as "stale")
+mkdir -p "$TMP/nops"
+printf '#!/bin/sh\necho ps: command not found >&2\nexit 127\n' > "$TMP/nops/ps"
+chmod +x "$TMP/nops/ps"
+sleep 30 & live=$!
+echo "$live $(ps -o lstart= -p "$live" | tr -s ' ')" > .pod_running
+if PATH="$TMP/nops:$PATH" bash -c "$CHECK" 2>err; then
+  echo "FAIL: ps unavailable should refuse" >&2; exit 1
+fi
+grep -q "ps unavailable" err || { echo "FAIL: ps-unavailable message missing" >&2; exit 1; }
 disown "$live" 2>/dev/null || true; kill "$live" 2>/dev/null || true
 
 echo "PASS: pod_sync tree-in-use check"

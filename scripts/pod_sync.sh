@@ -27,6 +27,13 @@ POD_NAME="${POD_NAME:-sglang-test}"
 # reused one is stale. Without it a second sync wipes the tree under a running job.
 read -r -d '' POD_TREE_CHECK <<'CHECK' || true
 if [ -f .pod_running ]; then
+  # A guard that cannot decide must refuse, not pass: stat="" below conflates "pid not
+  # found" (stale, correct) with "ps itself is gone" (cannot tell). $$ is always alive,
+  # so this probe fails only when ps is missing or unexecutable.
+  ps -o pid= -p $$ >/dev/null 2>&1 || {
+    echo "pod_sync: ps unavailable — cannot decide whether the tree is in use; refusing" >&2
+    exit 1
+  }
   while read -r pid started || [ -n "$pid" ]; do
     [ -n "$pid" ] || continue
     stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ') || stat=""
