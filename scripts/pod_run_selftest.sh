@@ -71,6 +71,22 @@ SH
 chmod +x "$TMP/bin/nvidia-smi"
 export PATH="$TMP/bin:$PATH" CLAIM_LOG="$TMP/claims.txt"
 
+# card_owner.py reads aupai's card_assignment.json (read-only); the selftest's fixture stands
+# in for it: card 6 ours, 5 theirs, 7 unclassified. Every arm inherits this so the quota check
+# passes for the card they all use (6).
+mkdir -p "$TMP/work/scripts"
+cp "$ROOT/scripts/card_owner.py" "$TMP/work/scripts/card_owner.py"
+cat > "$TMP/card_assignment.json" <<'JSON'
+{
+  "cards": {
+    "6": "tileRL, granted 2026-09-05",
+    "5": "GRANTED 2026-09-09 to aupai",
+    "7": "HELD BY ANOTHER CONTAINER, UNCLASSIFIED, refuses"
+  }
+}
+JSON
+export CARD_ASSIGNMENT_JSON="$TMP/card_assignment.json"
+
 # A wrapper script as the command: the shape whose claim was refused and never retried.
 cat > "$TMP/work/wrapper.sh" <<'SH'
 python3 -c "import time; time.sleep(${JOB_SECS:-1}); print('job done')"
@@ -231,4 +247,71 @@ set -e
 grep -q "UNBUF 1 WT True" "$TMP/work/unbuf.log" \
   || fail "arm 7: python did not get an unbuffered stdout: $(cat "$TMP/work/unbuf.log" 2>/dev/null | head -2)"
 
-echo "PASS: a wrapper-launched job claims via --wait-for-device, a direct-python one via --require-device, a multi-arm wrapper re-claims per arm, a reused claim is not a refusal, an unclaimable job exits 4 and releases, a quoted multi-word command survives argv, and python's stdout is unbuffered"
+# ---- arm 8: a card not recorded as tileRL's is refused without a lend, allowed with one ----
+# pod_run claims any free card, so without a quota check it silently takes another team's
+# (2026-09-09: card 5 is aupai's, used for an hour before anyone noticed). Ownership comes
+# from aupai's card_assignment.json, classified by prose prefix (fixture above): 5 is
+# theirs, 7 unclassified. --lend-ref is the recorded escape hatch, echoed so the lend is auditable.
+mkdir -p "$TMP/a8"
+emit8=$(POD_RUN_EMIT_RUNNER=1 AUPAI="$TMP/aupai" REMOTE_DIR="$TMP/work" \
+  bash "$ROOT/scripts/pod_run.sh" selftest 5 -- true 2>/dev/null)
+printf '%s\n' "$emit8" > "$TMP/a8/runner.sh"
+sed -i.bak -e "s#> /work/#> $TMP/work/#g" "$TMP/a8/runner.sh"
+set +e
+( cd "$TMP/work" && CLAIM_MODE=shell_then_device CLAIM_LOG=$CLAIM_LOG bash "$TMP/a8/runner.sh" \
+    > "$TMP/a8/wrapper.out" 2>&1 )
+rc8=$?
+set -e
+[ "$rc8" = 7 ] || fail "arm 8: card 5 granted to another team must exit 7, got $rc8: $(cat "$TMP/a8/wrapper.out")"
+grep -q "granted to another team" "$TMP/a8/wrapper.out" \
+  || fail "arm 8: refusal message missing: $(cat "$TMP/a8/wrapper.out")"
+
+# an unclassified card is refused too -- the classifier's third state, fail-closed.
+emit8u=$(POD_RUN_EMIT_RUNNER=1 AUPAI="$TMP/aupai" REMOTE_DIR="$TMP/work" \
+  bash "$ROOT/scripts/pod_run.sh" selftest 7 -- true 2>/dev/null)
+printf '%s\n' "$emit8u" > "$TMP/a8/runner_u.sh"
+sed -i.bak -e "s#> /work/#> $TMP/work/#g" "$TMP/a8/runner_u.sh"
+set +e
+( cd "$TMP/work" && CLAIM_MODE=shell_then_device CLAIM_LOG=$CLAIM_LOG bash "$TMP/a8/runner_u.sh" \
+    > "$TMP/a8/wrapper_u.out" 2>&1 )
+rc8u=$?
+set -e
+[ "$rc8u" = 7 ] || fail "arm 8: an unclassified card must exit 7, got $rc8u: $(cat "$TMP/a8/wrapper_u.out")"
+grep -q "unclassified -> refuse" "$TMP/a8/wrapper_u.out" \
+  || fail "arm 8: unclassified refusal message missing: $(cat "$TMP/a8/wrapper_u.out")"
+
+# with --lend-ref the quota check passes and the job proceeds to claim.
+emit8b=$(POD_RUN_EMIT_RUNNER=1 AUPAI="$TMP/aupai" REMOTE_DIR="$TMP/work" \
+  bash "$ROOT/scripts/pod_run.sh" --lend-ref "aupai-lend-0909" selftest 5 -- true 2>/dev/null)
+printf '%s\n' "$emit8b" > "$TMP/a8/runner_b.sh"
+sed -i.bak -e "s#> /work/#> $TMP/work/#g" "$TMP/a8/runner_b.sh"
+set +e
+( cd "$TMP/work" && CLAIM_MODE=shell_then_device CLAIM_LOG=$CLAIM_LOG bash "$TMP/a8/runner_b.sh" \
+    > "$TMP/a8/wrapper_b.out" 2>&1 )
+rc8b=$?
+set -e
+[ "$rc8b" = 0 ] || fail "arm 8: --lend-ref must let the job proceed, got rc $rc8b: $(cat "$TMP/a8/wrapper_b.out")"
+grep -q "lend ref: aupai-lend-0909" "$TMP/a8/wrapper_b.out" \
+  || fail "arm 8: lend ref not echoed: $(cat "$TMP/a8/wrapper_b.out")"
+
+# a missing card_assignment.json fails closed, loudly: the path, the grant, and the bypass.
+# Without this the team's launch capability hangs on a file in another team's tree with no
+# way to tell whether the grant still holds (tilerl-27, 2026-09-09).
+emit8m=$(CARD_ASSIGNMENT_JSON="$TMP/nonexistent.json" POD_RUN_EMIT_RUNNER=1 AUPAI="$TMP/aupai" REMOTE_DIR="$TMP/work" \
+  bash "$ROOT/scripts/pod_run.sh" selftest 6 -- true 2>/dev/null)
+printf '%s\n' "$emit8m" > "$TMP/a8/runner_m.sh"
+sed -i.bak -e "s#> /work/#> $TMP/work/#g" "$TMP/a8/runner_m.sh"
+set +e
+( cd "$TMP/work" && CLAIM_MODE=shell_then_device CLAIM_LOG=$CLAIM_LOG bash "$TMP/a8/runner_m.sh" \
+    > "$TMP/a8/wrapper_m.out" 2>&1 )
+rc8m=$?
+set -e
+[ "$rc8m" = 7 ] || fail "arm 8: a missing card_assignment.json must exit 7, got $rc8m: $(cat "$TMP/a8/wrapper_m.out")"
+grep -q "$TMP/nonexistent.json" "$TMP/a8/wrapper_m.out" \
+  || fail "arm 8: missing-file error must name the path: $(cat "$TMP/a8/wrapper_m.out")"
+grep -q "0,1,3,6" "$TMP/a8/wrapper_m.out" \
+  || fail "arm 8: missing-file error must state the grant: $(cat "$TMP/a8/wrapper_m.out")"
+grep -q -- "--lend-ref" "$TMP/a8/wrapper_m.out" \
+  || fail "arm 8: missing-file error must state the bypass: $(cat "$TMP/a8/wrapper_m.out")"
+
+echo "PASS: a wrapper-launched job claims via --wait-for-device, a direct-python one via --require-device, a multi-arm wrapper re-claims per arm, a reused claim is not a refusal, an unclaimable job exits 4 and releases, a quoted multi-word command survives argv, python's stdout is unbuffered, a card not recorded as tileRL's exits 7 without a lend-ref (theirs or unclassified) and proceeds with one, and a missing card_assignment.json fails loud with the path, the grant, and the bypass"

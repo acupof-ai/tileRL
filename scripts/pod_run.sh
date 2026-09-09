@@ -44,17 +44,27 @@ POD_NAME="${POD_NAME:-sglang-test}"
 # One tree per session; overridable because pod_run_selftest.sh points it at a tempdir.
 REMOTE_DIR="${REMOTE_DIR:-$(pod_session_tree "$ROOT")}"
 AUPAI="${AUPAI:-/work/aupai}"
+# Card ownership comes from aupai's card_assignment.json (read-only), not a
+# local quota file: two files drift, and the drift is silent. pod_run claims
+# any free card, so without this gate it takes another team's
+# (2026-09-09: card 5 is aupai's, used for an hour before anyone noticed).
+CARD_ASSIGNMENT_JSON="${CARD_ASSIGNMENT_JSON:-/work/aupai/runs/card_assignment.json}"
 ORPHAN_MIB="${ORPHAN_MIB:-64}"
 # seconds to poll for the job's device fd: a 27B load takes minutes to open the card
 DEVICE_WAIT="${DEVICE_WAIT:-300}"
 
 WAIT=0
 [ "${1:-}" = --wait ] && { WAIT=1; shift; }
-[ $# -ge 4 ] || { echo "usage: $0 [--wait] <name> <card[,card...]> -- <command...>" >&2
+LEND_REF=""
+[ "${1:-}" = --lend-ref ] && { LEND_REF="${2:-}"; shift 2; }
+[ $# -ge 4 ] || { echo "usage: $0 [--wait] [--lend-ref <ref>] <name> <card[,card...]> -- <command...>" >&2
                   echo "  --wait, as the FIRST argument only. Without it this returns as soon as" >&2
                   echo "  the job is LAUNCHED, not when it finishes: poll" >&2
                   echo "  /work/pod_run_<name>.out for POD_RUN_DONE_<name>." >&2
-                  echo "  Exits: 3 orphan card, 4 unclaimable, 5 name already live, 6 --wait timed out." >&2
+                  echo "  --lend-ref <ref>: run a card not recorded as tileRL's in" >&2
+                  echo "  card_assignment.json; the ref is a ledger record of a lend, echoed into the log." >&2
+                  echo "  Exits: 3 orphan card, 4 unclaimable, 5 name already live, 6 --wait timed out," >&2
+                  echo "         7 card outside grant with no --lend-ref." >&2
                   exit 2; }
 NAME=$1 CARD=$2; shift 2
 [ "$1" = "--" ] || { echo "$0: expected -- before the command" >&2; exit 2; }
@@ -88,6 +98,26 @@ export PYTHONPATH=$REMOTE_DIR/src:$REMOTE_DIR/packages/tilerl-kernels/src
 export TILERL_TARGET=\${TILERL_TARGET:-cuda} CUDA_VISIBLE_DEVICES=$CARD
 export TILERL_QWEN38_SOURCE=\${TILERL_QWEN38_SOURCE:-/work/Qwen3.8-27B-NVFP4}
 export REMOTE_DIR=$REMOTE_DIR
+
+# Quota: refuse a card not recorded as tileRL's in aupai's card_assignment.json
+# (read-only). pod_run claims any free card, so without this it silently takes
+# another team's. --lend-ref is the escape hatch, echoed so the lend is auditable.
+# Fail closed: a missing/unreadable file or classifier refuses every card.
+for c in ${CARD//,/ }; do
+  if [ -z "$LEND_REF" ]; then
+    owner=\$(python3 $REMOTE_DIR/scripts/card_owner.py \$c "$CARD_ASSIGNMENT_JSON" 2>/dev/null || echo nofile)
+    case "\$owner" in
+      ours) ;;
+      theirs) echo "pod_run: card \$c is granted to another team per card_assignment.json; a lend needs a ledger record (--lend-ref)" >&2; exit 7;;
+      nofile) echo "pod_run: card_assignment.json not readable at $CARD_ASSIGNMENT_JSON" >&2
+              echo "  tileRL's grant is 0,1,3,6 (ckl 2026-09-08). If that grant still holds, bypass with --lend-ref <ledger record>" >&2
+              exit 7;;
+      *) echo "pod_run: card \$c has no tileRL ownership in card_assignment.json (unclassified -> refuse); a lend needs a ledger record (--lend-ref)" >&2; exit 7;;
+    esac
+  else
+    echo "pod_run: card \$c not recorded as tileRL's; lend ref: $LEND_REF"
+  fi
+done
 
 # per card, because \`-i 0,1\` returns a line per card and the -gt test needs one integer
 for c in ${CARD//,/ }; do
