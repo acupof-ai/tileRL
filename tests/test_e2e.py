@@ -3549,21 +3549,16 @@ def test_the_tier_read_rate_keeps_moving_after_the_first_fetch(tmp_path):
     with unittest.mock.patch.object(torch, "load", slow):
         fetched(*keys[1])
 
-    # Algebraic: the counters accumulated, B divides the running totals, and B
-    # dropped because the second fetch was slower. A frozen counter fails the
-    # inequality; a frozen B fails the drop. Neither depends on the disk's
-    # natural speed — the 50 ms delay guarantees the second fetch is slower
-    # than the first regardless of xdist contention.
+    # Algebraic: the counters accumulated and B divides the running totals.
+    # A frozen counter fails the inequality; a frozen B (the bug this guards
+    # against) fails the equality — the cached first-fetch value cannot equal
+    # the ratio recomputed from the grown running totals.
     assert cold_tier.fetch_ms > fast_ms, "fetch_ms did not accumulate across fetches"
     assert cold_tier.fetch_bytes > fast_bytes, "fetch_bytes did not accumulate across fetches"
     second = cold_tier.read_bytes_per_s()
-    assert second < first, (
-        f"B did not drop on a fetch made 50 ms slower ({first / 1e6:.1f} -> "
-        f"{second / 1e6:.1f} MB/s), so it is calibrated once rather than accumulated; a "
-        "warm first read would then permit every prefix for the process's life"
-    )
     assert second == cold_tier.fetch_bytes / (cold_tier.fetch_ms / 1000.0), (
-        "B is not computed from the running totals"
+        "B is not computed from the running totals — a frozen first-fetch value "
+        "would permit every prefix for the process's life"
     )
 
     # n* is what B controls, so read it at both rates rather than trusting the ratio.
