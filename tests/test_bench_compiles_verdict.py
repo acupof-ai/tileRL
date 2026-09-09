@@ -7,8 +7,10 @@ Measured on the pod with the marker already printed -- buffered left 0 bytes aft
 0 after SIGTERM, `python3 -u` left 38 -- so the verdict had no negative branch and a JIT
 inside a measured turn would have been charged to the tier and read as clean.
 
-The distinction the fix has to keep: an EMPTY log is unknown, a log WITH content and no
-marker is genuinely clean. Collapsing both to -1 would make the verdict unreachable.
+The distinction the fix has to keep: a log without the server's own startup line
+(empty, buffered-to-death, or the wrong file) is unknown; a log WITH the startup line
+and no marker is genuinely clean. Collapsing both to -1 would make the verdict
+unreachable.
 """
 
 from __future__ import annotations
@@ -29,15 +31,23 @@ def test_an_empty_serve_log_is_unknown_not_clean(tmp_path):
         "whose stdout was never flushed -- the green verdict of 2026-09-08"
     )
 
-    # The control: content but no marker IS clean, and must stay distinguishable. A fix that
-    # returned -1 for both would make `clean` unreachable and the gate useless in the other
+    # The control: the startup line makes this a real server log; with it and no marker
+    # the log IS clean, and must stay distinguishable from unknown. A fix that returned
+    # -1 for both would make `clean` unreachable and the gate useless in the other
     # direction.
     quiet = tmp_path / "quiet.log"
-    quiet.write_text("Using CPython 3.11.15\nserver listening on 8000\n")
+    quiet.write_text(
+        "Using CPython 3.11.15\n"
+        "tilerl serve: http://127.0.0.1:8000  (Ctrl+C to stop)\n"
+        "server listening on 8000\n"
+    )
     assert bci._compiles(str(quiet)) == 0, "a populated log with no marker is genuinely clean"
 
     hot = tmp_path / "hot.log"
-    hot.write_text("TileLang begins to compile kernel `fused_gemv` with `out_idx=[2]`\n")
+    hot.write_text(
+        "tilerl serve: http://127.0.0.1:8000  (Ctrl+C to stop)\n"
+        "TileLang begins to compile kernel `fused_gemv` with `out_idx=[2]`\n"
+    )
     assert bci._compiles(str(hot)) == 1
 
     assert bci._compiles(str(tmp_path / "absent.log")) == -1
