@@ -481,10 +481,10 @@ def test_sft_writes_a_manifest_and_gates_on_the_loss_falling(tmp_path, monkeypat
     ce = m["metrics"]
     assert ce["ce_first"] is not None and ce["ce_last"] is not None
     assert ce["secs_per_step_median"] is not None
-    # The RL gates have no metrics on this path and must pass vacuously.
+    # The RL gates have no metrics on this path and must report not-measured.
     for g in m["gates"]:
         if g["name"] != "ce_falls":
-            assert g["passed"] and g["value"] is None, g
+            assert g["passed"] is None and g["value"] is None, g
 
     capsys.readouterr()
     assert _train(argv + ["--json"]) == code

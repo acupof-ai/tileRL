@@ -52,7 +52,9 @@ def _gate(m: dict, name: str) -> dict:
     # More than half the groups tied. At lambda=0 (binary rewards) this is
     # common when the task is too easy or too hard. At lambda>0 tied is 0 by
     # construction -- the comparator is correct, the operand is the problem.
-    ("groups_untied", {"tied_group_fraction": 0.7}),
+    # reward_first/last set so the RL gates are measured, not unmeasured.
+    ("groups_untied", {"reward_first": 0.5, "reward_last": 0.6,
+                       "tied_group_fraction": 0.7}),
     # Cross-entropy rose (divergence).
     ("ce_falls", {"ce_first": 2.0, "ce_last": 2.5}),
 ])
@@ -84,6 +86,27 @@ def test_reward_rises_operand_does_not_contain_eval_correctness(tmp_path, monkey
     # reward_rises is green (reward rose) while gsm8k_improves is red (eval fell).
     assert _gate(m, "reward_rises")["passed"] is True
     assert _gate(m, "gsm8k_improves")["passed"] is False
+
+
+def test_none_value_does_not_pass_gate(tmp_path, monkeypatch):
+    """A gate whose value is None (eval skipped, metric never written) must not
+    report passed=True. None means not-measured, and an unmeasured gate that is
+    not explicitly skipped should fail loud, not pass quiet. Found when #92's
+    clean-arm run reported mmlu/gsm8k=pass(None) — eval was skipped, the gates
+    had no value, and the vacuous-pass rule rendered them as passed."""
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path))
+    m = _manifest({
+        "reward_first": 0.5, "reward_last": 0.8,
+        "mmlu_before": 0.6, "mmlu_after": 0.6,
+        "gsm8k_before": 400, "gsm8k_before_total": 500,
+        # gsm8k_after intentionally absent — eval was skipped
+        "tied_group_fraction": 0.17,
+    })
+    with pytest.raises(SystemExit):
+        cli._finish(m, as_json=False)
+    g = _gate(m, "gsm8k_improves")
+    assert g["passed"] is None, f"None value must not pass; got {g['passed']}"
+    assert not g["skipped"], "unmeasured is not the same as explicitly skipped"
 
 
 def test_rollouts_within_cap_drift_rejects():
