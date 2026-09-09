@@ -169,11 +169,15 @@ class PagedKvPool:
     def reset(self) -> None:
         # A previous tenant (the before-arm eval) leaves its K/V in freed blocks and the
         # free list in LIFO free order, so two same-config runs differing only in whether
-        # eval ran start training from different pool states. Zero the planes and return
-        # the free list to ascending order. The engine's pad block is not in `_free`.
-        self.k_pool.zero_()
-        self.v_pool.zero_()
-        self._free.sort()
+        # eval ran start training from different pool states. TILERL_POOL_RESET attributes
+        # the fix across the 2026-09-09 A/B: "zero" (stale K/V read), "sort" (free-list
+        # order), "both" (default). The engine's pad block is not in `_free`.
+        mode = os.environ.get("TILERL_POOL_RESET", "both")
+        if mode in ("zero", "both"):
+            self.k_pool.zero_()
+            self.v_pool.zero_()
+        if mode in ("sort", "both"):
+            self._free.sort()
 
     def _store_fp8(self, plane: int, blk: torch.Tensor, off: torch.Tensor,
                    k: torch.Tensor, v: torch.Tensor) -> None:
