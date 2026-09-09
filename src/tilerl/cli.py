@@ -560,6 +560,22 @@ def _length_aware(match, gold, tok, lam: float, cap: int):
     divides by the group std, so `-(L_i - Lbar)/std(L)` has no `lam` in it -- and in a mixed
     group `lam <= cap/(cap-1)` keeps a short wrong answer from outranking a long right one
     (2048/2047 = 1.000488520, measured).
+
+    An all-wrong group is the third case: every match is 0, so `r_i = -lam * L_i / cap` and
+    the normalized advantage is again `-(L_i - Lbar) / std(L)` -- `lam` cancels for every
+    lam > 0, so its magnitude does not tune this gradient and only lam = 0 turns it off (zero
+    reward spread, and `group_advantages` zeroes a tied group). The difference is what the
+    gradient says: length is the only signal, the shortest wrong answer gets the highest
+    advantage, and on a problem the model cannot solve it learns "answer shorter" and nothing
+    else. That buys seconds_per_step and cannot outrank a right answer (the bound above still
+    holds). What neither covers is the direction itself: this pressure points at empty
+    outputs, and `_refuse_short_rollouts` only reads the BASE policy's length before training
+    -- `--allow-short-rollouts` disables it and the in-loop drift check, and it cannot see a
+    policy that shortens mid-training -- while the `live` mask in `group_advantages` only
+    keeps an empty row from polluting its group's normalization, not the live rows' gradient
+    toward shorter. A 2026-09-09 run collapsed to all-empty outputs (GSM8K 0/500) with both
+    guards in place; that run had lam=0, so it is not this gradient's doing, but it shows the
+    path is reachable on this model.
     """
     def reward(prompt, completion):
         text = tok.decode([int(t) for t in completion])
