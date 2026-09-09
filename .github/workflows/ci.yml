@@ -12,10 +12,12 @@ on:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.ref }}
-  # PR branches cancel superseded runs; main never cancels — a completed main
-  # run is the only CI that verifies the actual merged state.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # Main: group includes the SHA, so each push is its own group — nothing to
+  # cancel. PR branches: the SHA segment evaluates to '', so consecutive pushes
+  # share a group and cancel superseded runs. group is a string field, so
+  # expression interpolation has no boolean-coercion ambiguity.
+  group: ci-${{ github.ref }}${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: true
 
 jobs:
   gate:
