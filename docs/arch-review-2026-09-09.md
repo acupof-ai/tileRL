@@ -79,4 +79,6 @@ git grep -l "DataParallelEngine\|serve --devices" origin/main -- docs/experience
 2. **commit sha 手填 → 校验器**（已落地）：benchrec.validate() 查 40-hex + `git cat-file -e`；`git_dirty()` 对未知状态 raise——从不把 unknown 渲染成 clean。纪律「别填错 sha」变成写时拒绝。
 3. **README 可复现 → 生成**（进行中）：README 每个数字必须映射到注册表 metric，否则标 external；映射是生成的，不是手抄的。今天的逆向审计抓到一个单位错误（351.8 被映射成秒，实为 tokens/correct）——手抄的映射会漂移，生成的不会。
 
+4. **绿不是评审：「合并前必须读 diff」→ 冻结表面测试。** 2026-09-09 晚上，一个删除 `--deterministic` 的 PR 双绿、CLEAN、无冲突地合入——删除明明白白写在 diff 里，合并者只看了绿勾。纪律在一晚合 20 个 PR 时必然失效。结构替代：**一个测试枚举 CLI 的全部 flag（`--help` 输出），删掉任何一个都会让 CI 红，除非同一个 PR 显式修改期望集合**——删除于是变成一个 deliberate、可见的动作。它和接线测试是一对：接线测试保证 flag 做事（`--deterministic` 复活时补的那个），冻结表面保证 flag 不会无声消失。边界：挡得住表面删除，挡不住 flag 还在但语义漂移——那是接线测试的活。
+
 评审纪律本身同构：不说「建议考虑」；每个论断带 file:line 或可跑命令；驳论先于立论——这份文档的 H4 就是被驳掉的删项，流程起作用了。
