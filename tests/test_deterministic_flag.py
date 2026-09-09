@@ -1,6 +1,6 @@
 """--deterministic must wire decode_graph=False: the captured decode graph is
 the cross-process nondeterminism source
-(errors/2026-09-09-a-flag-reverted-by-a-stale-branch.md)."""
+(errors/2026-09-09-a-flag-deleted-in-plain-sight.md)."""
 import inspect
 
 from tilerl import cli
