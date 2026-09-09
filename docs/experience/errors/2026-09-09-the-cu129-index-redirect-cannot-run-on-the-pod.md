@@ -8,8 +8,8 @@ Status: open (partial revert pending)
 #342 pinned `torch==2.13.0` as a direct dependency and redirected linux
 to the cu129 index (`download.pytorch.org/whl/cu129`). The motivation
 was sound: PyPI's torch 2.13.0 is built for CUDA 13.0, and the pod
-driver (535.161.08) only supports CUDA 12.9. The cu129 index has
-torch 2.13.0+cu129, which should match the driver.
+driver (535.161.08) supports up to CUDA 12.9, not 13.0. The cu129
+index has torch 2.13.0+cu129, which should match the driver.
 
 The pod acceptance failed. Three independent findings, each sufficient
 to block the change:
