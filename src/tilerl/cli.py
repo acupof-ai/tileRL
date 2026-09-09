@@ -608,13 +608,16 @@ def _train_adapters(args: argparse.Namespace) -> None:
     from .eval import gsm8k_accuracy, mmlu_accuracy, mmlu_questions
     from .kv_cache import NoPrefixStore
     from .ledger import (
+        EarlyStop,
         commit,
         file_hash,
         new_best_point,
         new_manifest,
         paired_se,
         read_manifest,
+        require_paired_width,
         runs_root,
+        significant_decline,
         write_manifest,
     )
     from .model import add_lora
@@ -894,14 +897,22 @@ def _train_adapters(args: argparse.Namespace) -> None:
         if curve_rows and args.eval_every and len(curve_rows) < args.eval_curve_n:
             log(f"curve subset is {len(curve_rows)} rows, not the {args.eval_curve_n} asked "
                 f"for: --eval-n {args.eval_n} caps it")
+        # Early stopping is a verdict about the curve: with no curve points the switch can
+        # never fire, so refuse at startup instead of running to --steps behind dead code.
+        if args.patience and not (args.eval_every and curve_rows):
+            sys.exit("--patience early-stops on the eval curve, but this run produces no "
+                     "curve points: pass --eval-every and an eval set (--eval-curve-n rows).")
         curve: list[dict] = []
         # `train_secs`, not `elapsed`: the timings loop below rebinds `elapsed` on every
         # step, so an accumulator by that name silently became the last timing value --
         # measured, the curve read 0.143 s at step 4 against 0.148 at step 2, a
         # cumulative figure going DOWN.
         train_secs = 0.0
+        # Patience is in curve POINTS, not steps: one unit is one `--eval-every` interval.
+        # 0 never stops -- the default; flipping it on needs the seed-1 verdict.
+        early = EarlyStop(args.patience)
 
-        def score_curve(step: int) -> None:
+        def score_curve(step: int) -> bool:
             nonlocal best
             # `eval_secs` per point, so the "keep the scoring under 5% of a step" criterion
             # is a fact checkable AFTER a run rather than a guess before one. Estimating it
@@ -965,16 +976,20 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # it would make this criterion never fire on a slow rise -- a selection that
             # always keeps the first point and does not say so. Rows missing (old runs)
             # fall back to the conservative width, marked in `se_kind` so nobody reads a
-            # conservative "not greater" as "the two points are the same".
+            # conservative "not greater" as "the two points are the same". With --patience
+            # on, a missing width refuses instead: stopping on a width-less curve decides
+            # on noise, and the unpaired fallback is too wide to ever fire -- both silent.
             if best:
                 f = runs_root() / manifest["id"] / f"eval-curve-{best['step']}.jsonl"
                 rows = ([json.loads(l) for l in f.read_text().splitlines() if l.strip()]
                         if f.is_file() else [])
                 se = paired_se(rows, per)
                 se_kind = "paired" if se is not None else "unpaired (conservative)"
+                require_paired_width(se, args.patience, best["step"])
             else:
                 se = se_kind = None  # first point: no comparison installed it
-            if new_best_point(curve[-1], best or None, se):
+            replaced = new_best_point(curve[-1], best or None, se)
+            if replaced:
                 # `mean_len` and `tok_per_correct` ride with the snapshot so a downstream
                 # consumer can trade score against answer cost -- the 2026-09-05 run bought
                 # most of its +6% as 2.74x shorter answers, and score alone cannot show that.
@@ -984,6 +999,19 @@ def _train_adapters(args: argparse.Namespace) -> None:
                         "se_kind": se_kind,
                         "tensors": {k: v.detach().to("cpu", copy=True)
                                     for k, v in trainable.items()}}
+            # A significant decline stops immediately and spends no patience: the collapse
+            # is the event this feature exists for, and stopping never loses anything --
+            # the best snapshot is kept either way. seed 0's recovery (412 -> 456) still
+            # ended below the peak (467), so waiting for it bought less than keeping it.
+            reason = early.update(replaced, significant_decline(curve[-1], best, se))
+            if reason:
+                manifest["early_stopped"] = {"at_step": step, "kept_step": best["step"],
+                                             "patience": args.patience, "reason": reason}
+                why = ("a significant decline" if reason == "decline"
+                       else f"{args.patience} curve points without a significant gain")
+                log(f"  early stop ({reason}) at step {step}: {why}; keeping step "
+                    f"{best['step']} ({100 * best['score']:.1f}%)")
+                return True
             log(f"  curve step {step}: {c}/{n} = {100 * c / max(n, 1):.1f}% "
                 f"tied {curve[-1]['tied']} "
                 f"at {train_secs:.1f}s cumulative, mean {ntok / max(n, 1):.0f} tok, "
@@ -996,6 +1024,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
                 # in the point, and a second copy in the dict could disagree with them.
                 f"{ntok / c if c else float('nan'):.1f} tok/correct, "
                 f"{at_cap}/{n} at cap, scored in {eval_secs:.1f}s")
+            return False
 
         hist = []
         rollouts: list = []
@@ -1010,8 +1039,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
             hist.append((r, ce, secs, tied, ntok))
             train_secs += secs
             written = _write_rollout_rows(manifest["id"], rollouts, written)
-            if curve_rows and args.eval_every and (i + 1) % args.eval_every == 0:
-                score_curve(i + 1)
+            if (curve_rows and args.eval_every and (i + 1) % args.eval_every == 0
+                    and score_curve(i + 1)):
+                break
             for phase, elapsed in timings.items():
                 manifest["metrics"][phase] = manifest["metrics"].get(phase, 0.0) + elapsed
             log(f"step {i + 1:4d}/{args.steps}  reward {r:.4f}  ce {ce:.4f}  "
@@ -1623,6 +1653,10 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     # paired across steps and comparable across runs to the historical anchor.
     p_train.add_argument("--eval-every", type=int, default=0,
                          help="score the held-out curve subset every N steps (0 = off)")
+    p_train.add_argument("--patience", type=int, default=0,
+                         help="early-stop after N curve POINTS without a significant score "
+                              "gain -- a point is --eval-every steps, not one -- or "
+                              "immediately on a significant decline; 0 = never stop")
     p_train.add_argument("--eval-curve-n", type=int, default=20,
                          help="rows of --eval-gsm8k in the curve subset; keep the scoring "
                               "under 5%% of a step")
