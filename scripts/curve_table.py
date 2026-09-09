@@ -116,7 +116,7 @@ def single_table(run_dir: Path, steps: list[int]) -> None:
 
 
 def cross(run0: Path, run1: Path, from_step: int, to_step: int, eval_file: Path,
-          perm0: list[int] | None, perm1: list[int] | None) -> None:
+          perm0: list[int] | None, perm1: list[int] | None, negctl: str | None = None) -> None:
     gold = [json.loads(l)["answer"] for l in eval_file.open()]
     print(f"gold distinct: {len(set(gold))} of {len(gold)} (collision rows are blind to the check below)")
     steps = [from_step, to_step]
@@ -126,6 +126,9 @@ def cross(run0: Path, run1: Path, from_step: int, to_step: int, eval_file: Path,
     c1 = {s: load_curve(run1, s) for s in steps}
     p0 = perm0 or file_row_perm(run0, len(c0[from_step]))
     p1 = perm1 or file_row_perm(run1, len(c1[from_step]))
+    if negctl == "same-gold":
+        p1 = same_gold_perturb(p1, gold)
+        print("negctl same-gold: run1 pairing remapped within same-gold groups (seed 0)")
     check_perm_against_gold(c0[from_step], p0, gold, "run0")
     check_perm_against_gold(c1[from_step], p1, gold, "run1")
     # map file row -> correctness per run per step
@@ -142,7 +145,7 @@ def cross(run0: Path, run1: Path, from_step: int, to_step: int, eval_file: Path,
 
 
 def baseline(run0: Path, run1: Path, step: int, eval_file: Path,
-             perm0: list[int] | None, perm1: list[int] | None) -> None:
+             perm0: list[int] | None, perm1: list[int] | None, negctl: str | None = None) -> None:
     """The null hypothesis for a dip overlap: how much two HEALTHY policies'
     wrong sets overlap anyway (hard problems are hard for both). At a step
     before either curve dipped, the overlap is pure problem difficulty."""
@@ -152,6 +155,9 @@ def baseline(run0: Path, run1: Path, step: int, eval_file: Path,
     r1 = load_curve(run1, step)
     p0 = perm0 or file_row_perm(run0, len(r0))
     p1 = perm1 or file_row_perm(run1, len(r1))
+    if negctl == "same-gold":
+        p1 = same_gold_perturb(p1, gold)
+        print("negctl same-gold: run1 pairing remapped within same-gold groups (seed 0)")
     check_perm_against_gold(r0, p0, gold, "run0")
     check_perm_against_gold(r1, p1, gold, "run1")
     w0 = {p0[i] for i, r in enumerate(r0) if not r["correct"]}
@@ -172,6 +178,18 @@ def baseline(run0: Path, run1: Path, step: int, eval_file: Path,
           f"run1-right/run0-wrong = {r1_right_r0_wrong}")
 
 
+def same_gold_perturb(perm: list[int], gold: list[str], seed: int = 0) -> list[int]:
+    """Negative control: remap each position to a random file row with the
+    SAME gold, so the gold tripwire stays green while problem identity is
+    destroyed. Unique-gold rows map to themselves. Shows whether the z can
+    see a pairing error the tripwire is blind to."""
+    rng = random.Random(seed)
+    by_gold: dict[str, list[int]] = {}
+    for fr, g in enumerate(gold):
+        by_gold.setdefault(g, []).append(fr)
+    return [rng.choice(by_gold[gold[fr]]) for fr in perm]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("run_dir", nargs="?")
@@ -182,19 +200,22 @@ def main() -> None:
     ap.add_argument("--perm0", type=Path, help="JSON list: run0 curve position -> eval-file row "
                         "(produced by the run's own _curve_rows; overrides local shuffle)")
     ap.add_argument("--perm1", type=Path)
+    ap.add_argument("--negctl", choices=["same-gold"],
+                    help="negative control: remap run1's pairing within same-gold rows "
+                         "(passes the gold tripwire by construction; z must drop)")
     args = ap.parse_args()
     if args.cross:
         r0, r1, f, t = args.cross
         assert args.eval_file, "--cross needs --eval-file"
         p0 = json.loads(args.perm0.read_text()) if args.perm0 else None
         p1 = json.loads(args.perm1.read_text()) if args.perm1 else None
-        cross(Path(r0), Path(r1), int(f), int(t), Path(args.eval_file), p0, p1)
+        cross(Path(r0), Path(r1), int(f), int(t), Path(args.eval_file), p0, p1, args.negctl)
     elif args.baseline:
         r0, r1, s = args.baseline
         assert args.eval_file, "--baseline needs --eval-file"
         p0 = json.loads(args.perm0.read_text()) if args.perm0 else None
         p1 = json.loads(args.perm1.read_text()) if args.perm1 else None
-        baseline(Path(r0), Path(r1), int(s), Path(args.eval_file), p0, p1)
+        baseline(Path(r0), Path(r1), int(s), Path(args.eval_file), p0, p1, args.negctl)
     else:
         assert args.run_dir and args.steps, "need <run_dir> <step> ..."
         single_table(Path(args.run_dir), args.steps)
