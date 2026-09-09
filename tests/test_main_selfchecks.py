@@ -32,14 +32,14 @@ import pytest
 _SRC = Path(__file__).resolve().parents[1] / "src" / "tilerl"
 _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 
-# A ratchet, not a constant. Ten modules carry an asserting block today; if one
+# A ratchet, not a constant. Eleven modules carry an asserting block today; if one
 # legitimately loses its block, lower this deliberately and let that edit be the
 # review point. A gate whose coverage can shrink in silence is the hole this closes.
-_MIN_MODULES = 10
+_MIN_MODULES = 11
 
-# Same ratchet for scripts/. Two are hermetic today; the rest import torch or a
+# Same ratchet for scripts/. Three are hermetic today; the rest import torch or a
 # backend and belong to the card, not to CI.
-_MIN_SCRIPTS = 2
+_MIN_SCRIPTS = 3
 
 
 def _asserting_main(path: Path) -> bool:

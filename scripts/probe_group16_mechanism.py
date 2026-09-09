@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Run by CI: tests/test_main_selfchecks.py collects hermetic scripts with an
+# asserting __main__ by glob, and _MIN_SCRIPTS is at the floor -- deleting this
+# drops coverage without turning anything red.
 """Does drawing 16 samples instead of 8 explain group 16's higher idle?
 
 Measured on card 3: at 17 matched prompts, group 8 pools to 74.4% idle and group 16 to
