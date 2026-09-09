@@ -54,15 +54,22 @@ weights — LoRA on the frozen fp4 base, no weight sync, no second stack.
 `train --recipe` → `ledger` → `merge` → `serve`, every run writing a manifest with its
 inputs and its gates.
 
-**The thinking cap: training under a tight token budget buys accuracy *and* economy.**
+**The thinking cap buys economy. Whether it buys accuracy is unsettled.**
 Cap the rollout at 256 tokens, score correctness only, then measure uncapped — the
 policy finds the shorter path to the same answer.
 
-| GSM8K, uncapped, n=500 | accuracy | total tokens | tokens / correct |
+| GSM8K, uncapped, n=500 — measured 2026-09-04, one run | accuracy | total tokens | tokens / correct |
 |---|---:|---:|---:|
 | base | 89.6% | 157,601 | 351.8 |
 | after 100 GRPO steps | **94.8%** | **121,642** | **256.6** |
 | | +5.2 pts, p=0.002 | **−22.8%** | **−27.1%** |
+
+**These rows have not been reproduced since.** A MATH level-5 run on 2026-09-09
+reproduced the token cut and not the accuracy: **−27% tokens, −5 points** over ten
+GRPO steps, and the paired flips were 7 right→wrong against 2 wrong→right
+(McNemar p=0.18 — indistinguishable from no change). One run each, different task,
+different cap; the two are not a controlled pair. What they jointly support is the
+economy claim; what they do not support is the accuracy claim in either direction.
 
 It transfers to tasks the adapter never saw — tokens fall 22.0% on MMLU, 18.9% on
 ARC-Easy, 22.9% on PIQA, with no measurable accuracy change at n=100. Output tokens
