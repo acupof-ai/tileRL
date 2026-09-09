@@ -138,5 +138,6 @@ deleted rather than guessed — a guessed sha is forged provenance. The sglang
 comparison, the V100 arm and the GSM8K results have no baseline key and rest
 on their entries alone. As collectors land, measurements append to the store
 (`docs/experience/bench/measurements.jsonl`, validated by `scripts/benchrec.py`);
-a metric without a store row rests on its entry, never on a blank.
+a metric without a store row rests on its entry, never on a blank. A headline
+number must be generable from the store, or it is not a headline.
 `uv run pytest` is the suite that gates every commit.
