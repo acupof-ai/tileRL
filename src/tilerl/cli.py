@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -652,6 +653,57 @@ def _refuse_short_rollouts(mean_len: float | None, cap: int, allow: bool = False
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _benchrec():
+    """The ruler's validator/store, loaded from scripts/ (same bridge as cmd_bench)."""
+    import importlib.util
+
+    p = Path(__file__).resolve().parents[2] / "scripts" / "benchrec.py"
+    spec = importlib.util.spec_from_file_location("benchrec", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _emit_eval_records(correct: int, total: int, ntok: int, token_lens: list,
+                       steps: int, backend) -> None:
+    """Append the arm's two operands to the bench store. A training run with
+    eval arms IS the collector — the numbers exist here and nowhere else.
+
+    tokens/correct is the view rollout_tokens / gsm8k_pct, never stored: a
+    stored ratio gets one chance to drift from its operands."""
+    import math
+
+    benchrec = _benchrec()
+    p = correct / total
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    cuda = backend.device.type == "cuda"
+    common = {
+        "shape": {"steps": steps},
+        # Accuracy and greedy length are compile-invariant: JIT time can enter a
+        # seconds figure, not a proportion or a token count, so compiles=0 is exact.
+        "warm": {"state": "warm", "compiles": 0},
+        "n": total,
+        "target": backend.arch, "build": "eager", "model": "27B-nvfp4",
+        "device": ({"name": "H20", "card": int(vis.split(",")[0])} if cuda and vis
+                   else {"name": getattr(backend.device, "name", None) or "cpu"}),
+        "commit": benchrec.git_commit(), "dirty": benchrec.git_dirty(),
+        "cmd": " ".join(sys.argv),
+    }
+    acc = {
+        "metric": "gsm8k_pct", "value": round(100 * p, 1), "unit": "%",
+        "spread": round(100 * math.sqrt(p * (1 - p) / total), 2), **common,
+    }
+    acc["floor"] = benchrec.measured_best_floor(acc, lower_is_better=False)
+    benchrec.append(acc)
+    tok = {
+        "metric": "rollout_tokens", "value": round(ntok / total, 1), "unit": "tokens",
+        "spread": round(statistics.stdev(token_lens), 1) if total >= 2 else 0.0, **common,
+    }
+    tok["floor"] = benchrec.measured_best_floor(tok, lower_is_better=True)
+    benchrec.append(tok)
+
+
 def _train_adapters(args: argparse.Namespace) -> None:
     """GRPO or OPD: LoRA on the frozen base, the engine samples, the ledger gates."""
     import torch
@@ -876,6 +928,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
             # on, and it cannot be improved by getting fewer questions right.
             per = f"  {ntok} tokens ({ntok / c:.1f}/correct)" if c else f"  {ntok} tokens"
             log(f"gsm8k greedy {c}/{n} = {100 * c / n:.1f}%{per}")
+            if real:
+                _emit_eval_records(c, n, ntok, [r["tokens"] for r in gsm_rows],
+                                   0 if tag == "before" else args.steps, backend)
         # rows_out (mmlu + gsm8k, prompt order) feeds the before-arm cache payload;
         # the file itself was streamed above, mmlu rows in-block and gsm8k per row.
         # Read before the cache write so a hit's cost excludes the write only a miss pays,
