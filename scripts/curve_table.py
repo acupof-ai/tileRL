@@ -41,7 +41,12 @@ def eval_n(run_dir: Path) -> int:
 
 
 def file_row_perm(run_dir: Path, n_rows: int) -> list[int]:
-    """Curve position -> eval-file row index."""
+    """Curve position -> eval-file row index.
+
+    Post-#329 runs reproduce the shuffle locally; CPython's shuffle is an
+    implementation detail, so a --perm* map produced by the run's own
+    ``_curve_rows`` on the pod overrides this.
+    """
     seed = curve_seed(run_dir)
     n = eval_n(run_dir) or n_rows
     if seed is None:
@@ -49,6 +54,18 @@ def file_row_perm(run_dir: Path, n_rows: int) -> list[int]:
     p = list(range(n))
     random.Random(seed).shuffle(p)
     return p[:n_rows]
+
+
+def check_perm_against_gold(rows: list[dict], perm: list[int], gold: list[str],
+                            tag: str) -> None:
+    """Tripwire: a wrong permutation mismatches gold on most rows.
+
+    NOT a proof of identity: GSM8K golds collide (195 distinct of 500), so a
+    same-gold wrong row passes silently. The exact checks are the eval-file
+    hash and a --perm* map from the run's own code.
+    """
+    bad = [pos for pos, fr in enumerate(perm) if rows[pos]["answer"] != gold[fr]]
+    assert not bad, f"{tag}: {len(bad)} rows' gold disagrees with the permutation (first: {bad[:3]})"
 
 
 def assert_aligned(run_dir: Path, steps: list[int]) -> None:
@@ -79,25 +96,18 @@ def single_table(run_dir: Path, steps: list[int]) -> None:
 
 
 def cross(run0: Path, run1: Path, from_step: int, to_step: int, eval_file: Path,
-          seed0: int | None, seed1: int | None) -> None:
+          perm0: list[int] | None, perm1: list[int] | None) -> None:
     gold = [json.loads(l)["answer"] for l in eval_file.open()]
+    print(f"gold distinct: {len(set(gold))} of {len(gold)} (collision rows are blind to the check below)")
     steps = [from_step, to_step]
     assert_aligned(run0, steps)
     assert_aligned(run1, steps)
     c0 = {s: load_curve(run0, s) for s in steps}
     c1 = {s: load_curve(run1, s) for s in steps}
-    p0 = file_row_perm(run0, len(c0[from_step]))
-    p1 = file_row_perm(run1, len(c1[from_step]))
-    # explicit seeds override the manifests (the manifests are the default)
-    if seed0 is not None:
-        p0 = list(range(eval_n(run0) or len(p0))); random.Random(seed0).shuffle(p0); p0 = p0[:len(c0[from_step])]
-    if seed1 is not None:
-        p1 = list(range(eval_n(run1) or len(p1))); random.Random(seed1).shuffle(p1); p1 = p1[:len(c1[from_step])]
-    # pairing check: gold answer at curve position must equal the file row's
-    for pos, fr in enumerate(p0):
-        assert c0[from_step][pos]["answer"] == gold[fr], f"run0 row {pos} != file row {fr}"
-    for pos, fr in enumerate(p1):
-        assert c1[from_step][pos]["answer"] == gold[fr], f"run1 row {pos} != file row {fr}"
+    p0 = perm0 or file_row_perm(run0, len(c0[from_step]))
+    p1 = perm1 or file_row_perm(run1, len(c1[from_step]))
+    check_perm_against_gold(c0[from_step], p0, gold, "run0")
+    check_perm_against_gold(c1[from_step], p1, gold, "run1")
     # map file row -> correctness per run per step
     m0 = {s: {fr: bool(c0[s][pos]["correct"]) for pos, fr in enumerate(p0)} for s in steps}
     m1 = {s: {fr: bool(c1[s][pos]["correct"]) for pos, fr in enumerate(p1)} for s in steps}
@@ -116,14 +126,16 @@ def main() -> None:
     ap.add_argument("steps", nargs="*", type=int)
     ap.add_argument("--cross", nargs=4, metavar=("RUN0", "RUN1", "FROM", "TO"))
     ap.add_argument("--eval-file")
-    ap.add_argument("--curve-seed0", type=int)
-    ap.add_argument("--curve-seed1", type=int)
+    ap.add_argument("--perm0", type=Path, help="JSON list: run0 curve position -> eval-file row "
+                        "(produced by the run's own _curve_rows; overrides local shuffle)")
+    ap.add_argument("--perm1", type=Path)
     args = ap.parse_args()
     if args.cross:
         r0, r1, f, t = args.cross
         assert args.eval_file, "--cross needs --eval-file"
-        cross(Path(r0), Path(r1), int(f), int(t), Path(args.eval_file),
-              args.curve_seed0, args.curve_seed1)
+        p0 = json.loads(args.perm0.read_text()) if args.perm0 else None
+        p1 = json.loads(args.perm1.read_text()) if args.perm1 else None
+        cross(Path(r0), Path(r1), int(f), int(t), Path(args.eval_file), p0, p1)
     else:
         assert args.run_dir and args.steps, "need <run_dir> <step> ..."
         single_table(Path(args.run_dir), args.steps)
