@@ -876,6 +876,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
     # run DIRECTORY at all. `_finish` overwrites this with the finished manifest.
     write_manifest(runs_root(), manifest)
     evals("before")  # LoRA B is zero at init: the base model's score
+    if (stats_path := os.environ.get("TILERL_DUMP_STATS")):
+        Path(stats_path).write_text(json.dumps(engine.stats(), indent=2, sort_keys=True))
     if args.steps == 0:
         evals("after")
         manifest["engine"] = engine.config  # re-read: see the comment at the other _finish
