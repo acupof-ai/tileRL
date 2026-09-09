@@ -1676,12 +1676,15 @@ def test_the_fp8_kv_pool_generates_what_the_bf16_pool_does():
     prompt = np.random.default_rng(4).integers(3, 320, size=40).astype(np.int64)
     params = SamplingParams(temperature=0.0, max_new_tokens=6, seed=0)
 
-    def gen(kv_fp8, mutate=None):
+    def gen(kv_fp8, mutate_after_prefill=None):
         engine = build_engine(cfg, build_random(cfg, seed=12), backend, num_blocks=16,
                              num_slots=4, max_batch=4, max_total_tokens=512, kv_fp8=kv_fp8)
-        if mutate is not None:
-            mutate(engine._kv)
         rid = engine.submit(prompt, params)
+        if mutate_after_prefill is not None:
+            # the 40-token prompt prefills in one tick (_PREFILL_BUCKET=64), so the scales
+            # are written before this runs and every decode reads them after it
+            engine.step()
+            mutate_after_prefill(engine._kv)
         return list(_drain(engine, [rid], 6)[rid]), engine
 
     want, ref = gen(None)
@@ -1726,13 +1729,16 @@ def test_the_fp8_kv_pool_generates_what_the_bf16_pool_does():
     assert _rel[:, 0].max() < 0.07, f"token 0 is off by {float(_rel[:, 0].max()):.4f} after 15 "\
         "further appends, so the write path re-rounds tokens already stored"
     def shift_scale(pool):
-        store = pool._store_fp8
-
-        def bad(plane, blk, off, k, v):
-            store(plane, blk, off, k, v)
-            pool.k_scale[plane] = pool.k_scale[plane].roll(1, 0)  # dim 0 of [blocks,heads,tokens]
-
-        pool._store_fp8 = bad
+        # data mutation, not path mutation: the old mutant monkeypatched _store_fp8, a
+        # CPU-path seam the CUDA store never calls, so it never ran (calls=0, 2026-09-10)
+        # and the assertion passed on a mutation that did not happen. Rolling the plane
+        # itself is backend-agnostic: it asks only whether reads look at k_scale.
+        before = pool.k_scale.clone()
+        pool.k_scale.copy_(pool.k_scale.roll(1, 1))  # dim 1 = blocks
+        assert not torch.equal(before, pool.k_scale), (
+            "rolling the scale plane changed nothing — the fixture's scales are uniform, "
+            "so this mutant cannot bite on any backend"
+        )
 
     mutant, _ = gen(torch.float8_e4m3fn, shift_scale)
     assert mutant != want, (
