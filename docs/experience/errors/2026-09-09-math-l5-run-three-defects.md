@@ -95,6 +95,23 @@ the training rectangle is the next power-of-two of the group's longest
 completion, clamped to the cap, so a 6144 cap only costs 3× when the
 completions actually fill it.
 
+## Token reduction without accuracy gain
+
+The run cut mean tokens 1720 → 1253 (−27%) while the score fell 85 → 80 (−5).
+The README's thinking-cap result (GSM8K, cap 256, λ=0) reports +5.2 pts with
+−22.8% tokens. The token reduction reproduced; the accuracy direction reversed.
+
+The two runs differ in four ways — task (GSM8K vs MATH L5), cap (256 vs 6144),
+reward (correctness-only vs length-aware λ=0.1), and measurement (trained
+tight / measured uncapped vs trained and measured at 6144) — so this is not a
+controlled contradiction. But it is a data point where token economy arrived
+without accuracy gain, which the README's "buys accuracy *and* economy" framing
+does not predict. The two may be separable: the length penalty buys the token
+cut on its own, and the accuracy gain in the GSM8K run may come from the tight
+cap's gradient effect (the control arm at 2048 reached 96.4% anyway — README
+L71-77), not from the token cut itself. This run cannot settle that; it adds
+one observation to the question.
+
 ## See also
 
 - [The collapse did not replicate; the plateau did](2026-09-09-the-collapse-did-not-replicate-the-plateau-did.md)
