@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import statistics
 import sys
 import tempfile
@@ -475,6 +476,19 @@ _ROLLOUT_HEADROOM = 0.8
 _EVAL_CONCURRENCY = 8
 
 
+def _curve_rows(eval_rows: list, n: int, seed: int) -> list:
+    """The curve subset: a fixed-seed shuffle's first ``n`` rows, not the file's.
+
+    ``gsm8k_test.jsonl`` is ordered -- its first 200 rows run 5 pt low (z=3.05,
+    errors/2026-09-04-the-eval-cap-measured-itself.md) -- and a 5 pt bias is the
+    size of the effect the curve measures. The seed is fixed across runs so a
+    curve point is paired across steps and comparable to the historical anchor.
+    """
+    pool = list(eval_rows)
+    random.Random(seed).shuffle(pool)
+    return pool[:n]
+
+
 def _write_rollout_rows(run_id: str, rows: list, written: int = 0) -> int:
     """Append the rows not yet on disk, and return the new count.
 
@@ -636,7 +650,10 @@ def _train_adapters(args: argparse.Namespace) -> None:
         "eval_max_new_tokens": args.eval_max_new_tokens,
         "load_adapter": file_hash(args.load_adapter) if args.load_adapter else None,
         "eval_gsm8k": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,
-        "eval_n": args.eval_n})
+        "eval_n": args.eval_n,
+        # In the id: it selects which problems the curve scores, so two runs differing
+        # only here are not the same run.
+        "eval_curve_seed": args.eval_curve_seed})
     prev = read_manifest(runs_root(), manifest["id"])
     if prev and prev["finished"] and not args.force:
         log(f"run {prev['id']} already finished; --force reruns")
@@ -857,7 +874,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
         # Sliced from `eval_rows`, which `--eval-n` has already capped, so asking for more
         # curve rows than eval rows quietly scores fewer. `curve["n"]` records the real
         # size, but a reader looking at the run WHILE it happens sees only this line.
-        curve_rows = eval_rows[: args.eval_curve_n]
+        curve_rows = _curve_rows(eval_rows, args.eval_curve_n, args.eval_curve_seed)
         if curve_rows and args.eval_every and len(curve_rows) < args.eval_curve_n:
             log(f"curve subset is {len(curve_rows)} rows, not the {args.eval_curve_n} asked "
                 f"for: --eval-n {args.eval_n} caps it")
@@ -1534,14 +1551,18 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_train.add_argument("--eval-gsm8k", help="JSONL {prompt, answer}: greedy exact-match "
                          "accuracy before and after")
     p_train.add_argument("--eval-n", type=int, default=100, help="rows of --eval-gsm8k to score")
-    # 0 = off, so no existing invocation changes. The subset must be FIXED ACROSS RUNS or
-    # two runs' curves are not comparable, which is why it is the first --eval-curve-n rows
-    # of --eval-gsm8k rather than a sample.
+    # 0 = off, so no existing invocation changes. The subset is a fixed-seed shuffle
+    # (_curve_rows): the file is ordered, so a prefix would run 5 pt low -- a bias the
+    # size of the effect the curve measures. One seed for every run, so a curve point is
+    # paired across steps and comparable across runs to the historical anchor.
     p_train.add_argument("--eval-every", type=int, default=0,
                          help="score the held-out curve subset every N steps (0 = off)")
     p_train.add_argument("--eval-curve-n", type=int, default=20,
                          help="rows of --eval-gsm8k in the curve subset; keep the scoring "
                               "under 5%% of a step")
+    p_train.add_argument("--eval-curve-seed", type=int, default=0,
+                         help="shuffle seed selecting the curve subset; fixed across runs "
+                              "so points stay paired and comparable")
     p_train.add_argument("--judge", action="store_true",
                          help="let the policy rank rollouts the binary reward ties "
                               "(judge.py: tests decide first, order only)")
