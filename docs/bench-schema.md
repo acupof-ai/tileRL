@@ -59,6 +59,18 @@ lower-is-better. A gap's meaning depends on its floor kind: physical floors
 number (how far the limit is), `measured-best` makes gap a **regression**
 number (how far below our own best). The two never share a sorted column.
 
+## Collector helpers
+
+`benchrec.add_record_args(ap)` adds the population flags (`--build` /
+`--target` / `--device-name` / `--card` / `--model-name`);
+`benchrec.record_common(args, build=...)` builds the shared fields, demanding
+`--build` when the script cannot see the build (every server client) and
+`--card` on sm90/sm70. `benchrec.measured_best_floor(record, lower_is_better)`
+is the floor for a metric with no computed roofline yet: the population's best
+accepted value, or this measurement on first sight. A script that derives its
+build from its own flags passes it to `record_common`; a script that cannot see
+it leaves `--build` required.
+
 ## Views
 
 Every view prints a coverage line (`N metrics declared, M measured`; `--table`

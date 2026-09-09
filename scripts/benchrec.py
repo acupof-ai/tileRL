@@ -207,6 +207,73 @@ def current(records: list[dict]) -> dict:
     return out
 
 
+def add_record_args(ap, *, default_target: str = "sm90", default_device: str | None = "H20"):
+    """The population flags every collector carries. --build stays optional here:
+    a server client cannot see the server's build and must demand it (eager vs
+    fused+graph is 6.4x on decode), while an engine-direct script derives the
+    build from its own flags and passes it to ``record_common``."""
+    ap.add_argument("--build", choices=list(BUILDS),
+                    help="the build under test (required when the script cannot see it)")
+    ap.add_argument("--target", default=default_target, choices=list(TARGETS))
+    ap.add_argument("--device-name", default=default_device,
+                    help="GPU model; engine scripts default to torch.cuda.get_device_name")
+    ap.add_argument("--card", type=int, help="physical GPU card; required on sm90/sm70")
+    ap.add_argument("--model-name", default="27B-nvfp4")
+
+
+def record_common(args, *, build: str | None = None) -> dict:
+    """The fields every record shares, from add_record_args + the build."""
+    build = build or args.build
+    if not build:
+        raise SystemExit("--build required: a client cannot see the server's build, "
+                         "and eager vs fused+graph is 6.4x on decode")
+    if build not in BUILDS:
+        raise SystemExit(f"build {build!r} not in {BUILDS}")
+    if args.target in ("sm90", "sm70") and args.card is None:
+        raise SystemExit(f"--card required on target {args.target}")
+    device_name = args.device_name
+    if not device_name:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                device_name = torch.cuda.get_device_name(0)
+        except ImportError:
+            pass
+    if not device_name:
+        device_name = args.target
+    return {"target": args.target, "build": build, "model": args.model_name,
+            "device": {"name": device_name, "card": args.card},
+            "sha": git_sha(), "cmd": " ".join(sys.argv)}
+
+
+def measured_best(record: dict, lower_is_better: bool) -> tuple[float | None, str | None]:
+    """Best accepted value for this record's population, across the whole
+    non-superseded history; (None, None) on first sight. Superseded rows were
+    bad runs (a cold run that warmed the engine) — their values never anchor a floor."""
+    records = load_all()
+    superseded = {r["supersedes"] for r in records if r.get("supersedes")}
+    k = key(record)
+    rows = [r for r in records if key(r) == k and r["id"] not in superseded]
+    if not rows:
+        return None, None
+    best = (min(rows, key=lambda r: r["value"]) if lower_is_better
+            else max(rows, key=lambda r: r["value"]))
+    return best["value"], best["id"]
+
+
+def measured_best_floor(record: dict, lower_is_better: bool) -> dict:
+    """A measured-best floor for a record about to be appended: the population's
+    best accepted value, or this measurement on first sight."""
+    best, best_id = measured_best(record, lower_is_better)
+    if best is None:
+        v, deriv = record["value"], "first accepted row for this population; floor = this measurement"
+    else:
+        v = min(best, record["value"]) if lower_is_better else max(best, record["value"])
+        deriv = f"best accepted value for this population (row {best_id})"
+    return {"value": v, "unit": record["unit"], "kind": "measured-best", "derivation": deriv}
+
+
 if __name__ == "__main__":
     # Selftest: the system must prove it goes red. A good world accepts; four
     # bad worlds each reject (or, for n=1, accept but stay out of regression).
@@ -275,6 +342,16 @@ if __name__ == "__main__":
         assert len(STORE.read_text().splitlines()) == 2, "superseded rows stay in the file"
         cur = current(load_all())
         assert cur[key(good)]["value"] == 95.0, "current() must take the rerun"
+
+        # measured_best_floor: first sight floors at the measurement; a later
+        # better row moves the floor; a superseded row never anchors it.
+        fresh = dict(good)
+        fresh["shape"] = {"batch": 1, "ctx": 2048}
+        assert measured_best_floor(fresh, lower_is_better=False)["value"] == fresh["value"]
+        better = dict(good)
+        better["value"] = 120.0
+        append(better)
+        assert measured_best_floor(dict(good), lower_is_better=False)["value"] == 120.0
     finally:
         STORE = old_store
 
