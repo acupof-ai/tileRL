@@ -270,7 +270,21 @@ def _lines() -> list[str]:
 
 
 def load_all() -> list[dict]:
-    return [json.loads(line) for line in _lines() if line.strip()]
+    """Parse the store. A torn final line (a writer mid-append) is skipped with a
+    count — 1 skipped line is a torn tail the next read completes, many mean the
+    file is corrupted — so a concurrent reader never takes a view down."""
+    rows, skipped = [], 0
+    for line in _lines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            skipped += 1
+    if skipped:
+        print(f"benchrec: WARNING skipped {skipped} unparseable line(s) "
+              f"(1 = a torn append, re-read; many = the store is corrupted)", file=sys.stderr)
+    return rows
 
 
 def current(records: list[dict]) -> dict:
