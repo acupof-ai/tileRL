@@ -112,6 +112,20 @@ became the step-25 length compression (2.1x cheaper tok/correct) in one part of 
 and the step-75 −11 pt collapse in another. The premise of every flatness counter — that a
 flat score names a stable policy — is false on the only curve fine enough to test it.
 
+**The full per-question table (run 86a06dc8c420, 500 questions, steps 50/75/100, all three
+marginals closing) puts a number on it: between step 50 and step 100, 37 questions changed
+hands — 7.4% of the set — while the scores differ by only 11, 2.2%.** The ratio is 3.4x and
+it does not depend on the collapse: even on a smooth curve, two checkpoints scoring close
+are not the same policy. This is the evidence behind the score-level wording in the
+snapshot, not just a caution — `best_curve_point` selects the best-scoring eval point on the
+curve, and equal scores do not name equal policies.
+
+The same table gives the patience question half an answer. Of the 62 questions the collapse
+lost (right at 50, wrong at 75), 49 were right again at 100 — dips mostly recovered here. But
+11 other questions went right at 50, right at 75, wrong at 100: training past the optimum
+kept losing questions at the same scale as the collapse's permanent damage (13). Early
+stopping's value is not just avoiding the dip; the run after the peak is itself destructive.
+
 **Decision: ship no patience. Ship best-point selection instead**, which is well-defined on
 this data (the peak is step 50, unambiguously) and does not require predicting the future.
 Patience becomes answerable after N runs show whether a dip typically recovers; that is a
