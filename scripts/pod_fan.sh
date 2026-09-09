@@ -21,6 +21,10 @@ pod_exec() {
 }
 
 script="set -x"$'\n'
+# Mark the tree in use so a pod_sync wipe refuses while the arms run (the check is in
+# pod_sync.sh); the trap drops the line, a SIGKILL leaves it stale and the check clears it.
+script+="echo \"\$\$ \$(ps -o lstart= -p \$\$ | tr -s ' ')\" >> $REMOTE_DIR/.pod_running"$'\n'
+script+="trap \"sed -i.bak /^\$\$[[:space:]]/d $REMOTE_DIR/.pod_running 2>/dev/null; rm -f $REMOTE_DIR/.pod_running.bak\" EXIT"$'\n'
 i=0
 for cmd in "$@"; do
   # Exported, not just cd'd into: a job resolving its own paths needs it in the env.

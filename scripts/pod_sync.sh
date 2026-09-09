@@ -7,6 +7,8 @@
 # `run` detaches under setsid and polls the log: the connection drops before a 27B bench
 # finishes. The script goes over as base64 because a heredoc through `tn exec` arrives empty.
 # The wipe below is confined to $REMOTE_DIR, one tree per session (scripts/pod_session.sh).
+# Detached jobs (`run`, pod_run.sh, pod_fan.sh) mark the tree in .pod_running; a sync
+# refuses to wipe while a job's pid is alive, so a second sync cannot kill a running job.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -18,6 +20,26 @@ fi
 SESSION="$(pod_session_name "$ROOT")"
 REMOTE_DIR="${REMOTE_DIR:-$(pod_session_tree "$ROOT")}"
 POD_NAME="${POD_NAME:-sglang-test}"
+
+# The tree-in-use check, shipped verbatim into the remote shell and emitted for the
+# selftest. .pod_running holds "pid start-time" lines from detached jobs (run mode,
+# pod_run.sh); a live pid with the same start time refuses the wipe, a dead, zombie or
+# reused one is stale. Without it a second sync wipes the tree under a running job.
+read -r -d '' POD_TREE_CHECK <<'CHECK' || true
+if [ -f .pod_running ]; then
+  while read -r pid started || [ -n "$pid" ]; do
+    [ -n "$pid" ] || continue
+    stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ') || stat=""
+    case "$stat" in
+      Z*|"") ;;
+      *) [ "$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')" = "$(printf '%s' "$started" | tr -s ' ' | sed 's/^ //;s/ $//')" ] \
+           && { echo "pod_sync: tree in use by pid $pid (started $started) -- refusing to wipe" >&2; exit 1; } ;;
+    esac
+  done < .pod_running
+  rm -f .pod_running
+fi
+CHECK
+[ "${POD_SYNC_EMIT_CHECK:-0}" = 1 ] && { printf '%s\n' "$POD_TREE_CHECK"; exit 0; }
 
 # the remote checkout is wiped below and the tarball overwrites bench-baseline.json with
 # this tree's copy, so a failed pull silently drops any row the pod raised. No `|| true`:
@@ -56,7 +78,7 @@ POD_ENV+=" TILERL_TARGET=cuda REMOTE_DIR=$REMOTE_DIR"
 # and deletes runs/ silently, so it reads as protection on a Mac
 # (errors/2026-09-06-the-oom-was-micro-zero.md).
 wipe="find . -mindepth 1 \\! -path './runs' \\! -path './runs/*' -delete"
-inner="cat > /tmp/tilerl-sync.tgz && mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && $wipe && tar xzf /tmp/tilerl-sync.tgz && $POD_ENV${1:+ && $1}"
+inner="cat > /tmp/tilerl-sync.tgz && mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && $POD_TREE_CHECK && $wipe && tar xzf /tmp/tilerl-sync.tgz && $POD_ENV${1:+ && $1}"
 remote="cid=\$(crictl ps -q --name $POD_NAME --state Running 2>/dev/null | head -1); "
 remote+="if [ -z \"\$cid\" ]; then echo 'pod: container not Running' >&2; exit 1; fi; "
 remote+="crictl exec -i \$cid bash -lc $(printf '%q' "$inner")"
@@ -64,8 +86,9 @@ remote+="crictl exec -i \$cid bash -lc $(printf '%q' "$inner")"
 if [ "${1:-}" = run ]; then
   name="$2"; shift 2
   POD_SESSION="$SESSION" "$0" >/dev/null   # sync this checkout first; the job runs against it
-  script=$(printf 'set -x\ncd %s\n%s\necho "pod_sync: tree %s sha %s"\n%s\necho DONE_%s\n' \
-                  "$REMOTE_DIR" "$POD_ENV" "$REMOTE_DIR" "$(cat "$ROOT/.synced_commit" 2>/dev/null || echo unknown)" \
+  script=$(printf 'set -x\ncd %s\necho "$$ $(ps -o lstart= -p $$ | tr -s " ")" >> %s/.pod_running\ntrap "sed -i.bak /^$$[[:space:]]/d %s/.pod_running 2>/dev/null; rm -f %s/.pod_running.bak" EXIT\n%s\necho "pod_sync: tree %s sha %s"\n%s\necho DONE_%s\n' \
+                  "$REMOTE_DIR" "$REMOTE_DIR" "$REMOTE_DIR" "$REMOTE_DIR" "$POD_ENV" "$REMOTE_DIR" \
+                  "$(cat "$ROOT/.synced_commit" 2>/dev/null || echo unknown)" \
                   "$1" "$name" | base64 | tr -d '\n')
   pod_exec() {
     tn exec "cid=\$(crictl ps -q --name $POD_NAME --state Running | head -1); crictl exec \$cid bash -lc $(printf '%q' "$1")"
