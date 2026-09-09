@@ -329,7 +329,10 @@ def add_record_args(
     mislabeled every non-H20 run (2026-09-09, eight rows)."""
     ap.add_argument("--build", choices=list(BUILDS),
                     help="the build under test (required when the script cannot see it)")
-    ap.add_argument("--target", default=default_target, choices=list(TARGETS))
+    ap.add_argument("--target", default=None if client_side else default_target,
+                    choices=list(TARGETS),
+                    help="server target; required for client-side collectors, which "
+                         "cannot see it")
     ap.add_argument("--device-name", default=None if client_side else default_device,
                     help="GPU model of the server under test; required for client-side "
                          "collectors, which cannot see it. Engine scripts default to "
@@ -357,6 +360,10 @@ def record_common(args, *, build: str | None = None) -> dict:
                          "and eager vs fused+graph is 6.4x on decode")
     if build not in BUILDS:
         raise SystemExit(f"build {build!r} not in {BUILDS}")
+    if not args.target and getattr(args, "_benchrec_client_side", False):
+        raise SystemExit("--target required: a client cannot see the server's target, "
+                         "and a default here is a population lie -- a V100 run labeled "
+                         "sm90 enters every target-grouped view")
     if args.target in ("sm90", "sm70") and args.card is None:
         raise SystemExit(f"--card required on target {args.target}")
     device_name = args.device_name
@@ -538,8 +545,16 @@ if __name__ == "__main__":
             raise AssertionError("case-different --device-name must reject")
         except SystemExit as e:
             assert "Did you mean 'H20'?" in str(e), str(e)
+        try:
+            no_target = client_args("H20")
+            no_target.target = None
+            record_common(no_target)
+            raise AssertionError("client-side record_common must reject without --target")
+        except SystemExit:
+            pass
     finally:
         STORE = old_store
 
     print("benchrec: schema selftest OK (good accepts, bad worlds reject (missing commit, unknown commit, missing dirty, previous_best, n=1 fenced out of regression, "
-          "append path rejects and a supersedes rerun replaces, unknown --device-name rejects without --new-device, case-different name suggests the right spelling)")
+          "append path rejects and a supersedes rerun replaces, unknown --device-name rejects without --new-device, "
+          "case-different name suggests the right spelling, client-side record_common rejects without --target)")

@@ -23,6 +23,9 @@ own longer entry stays its own. 0 reproduces the published arm.
   python scripts/bench_chat_interleaved.py --turns 4 --grow 40 --sessions 12  # the other axis
   python scripts/bench_chat_interleaved.py --turns 4 --grow 40 --sessions 12 \
       --sys-tokens 30000 --ttft --server-log /work/serve.log                  # agent shape
+
+All invocations also need the client-side record flags:
+`--build fused+graph --target sm90 --card 6 --device-name <name>`.
 """
 
 from __future__ import annotations

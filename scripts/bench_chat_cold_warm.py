@@ -10,9 +10,9 @@ after it matches its own earlier self and reports the speedup of re-sending an
 identical prompt (measured: 10.3x) rather than of multi-turn reuse.
 
   python scripts/bench_chat_cold_warm.py --arm cold --grow 40 \
-      --build fused+graph --card 6   # restart, then
+      --build fused+graph --target sm90 --card 6   # restart, then
   python scripts/bench_chat_cold_warm.py --arm warm --grow 40 \
-      --build fused+graph --card 6
+      --build fused+graph --target sm90 --card 6
 
 Emits one chat_turn_wall_s record per arm (plus a prefix_hits row when the
 warm arm hit) to docs/experience/bench/measurements.jsonl (schema:

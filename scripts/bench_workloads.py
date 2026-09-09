@@ -14,7 +14,7 @@ head is in fact being rejected. tok/fwd cannot be gamed that way: truncating a
 chain lowers it. Baseline is exactly 1.00 (speculation off); ceiling is
 1 + spec_depth. Read it beside tok/s — a wider verify tick also costs more.
 
-  python3 scripts/bench_workloads.py [--lo 32] [--hi 288] [--only coding]
+  python3 scripts/bench_workloads.py --build fused+graph --target sm90 --card 6 --device-name <name> [--lo 32] [--hi 288] [--only coding]
 """
 
 from __future__ import annotations

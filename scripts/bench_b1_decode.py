@@ -4,7 +4,7 @@ Streaming is not incremental (server._stream emits one delta at the end), and a
 small delta (1 vs 65) is swamped by prefill variance. So: run the same prompt at
 two max_tokens values far apart and take the slope — the prefill term cancels.
 
-  python3 scripts/bench_b1_decode.py --build fused+graph --card 6 --device-name "NVIDIA H20" [--ctx 1024] [--lo 32] [--hi 288]
+  python3 scripts/bench_b1_decode.py --build fused+graph --target sm90 --card 6 --device-name "NVIDIA H20" [--ctx 1024] [--lo 32] [--hi 288]
 
 Emits one decode_tok_s record to docs/experience/bench/measurements.jsonl
 (schema: docs/bench-schema.md). --build is required: a client cannot see the
