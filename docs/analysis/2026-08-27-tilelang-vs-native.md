@@ -1,3 +1,7 @@
+> **SUPERSEDED (2026-09-10):** The conclusion (the gap is not the language) is recorded in
+> the wins/errors entries. The specific measurements below are from 08-27 and predate the
+> 09-03→09-09 measurement campaign; read them as historical, not current.
+
 # Is the 1.6x gap to Arle the price of TileLang? — evidence, 2026-08-27
 
 > Status: Answered — no. Three corrections to the premise, one lever identified.

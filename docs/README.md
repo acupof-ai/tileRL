@@ -39,15 +39,22 @@ picks the ~24 that carry the findings the rest of the repo rests on.
 of the whole system rather than one change: the [sglang
 comparison](analysis/2026-08-28-vs-sglang-h20.md), [is the gap to Arle the price
 of TileLang?](analysis/2026-08-27-tilelang-vs-native.md), the [adversarial
-defect audit](analysis/2026-08-27-defect-audit.md), the [method record behind
-decode 52.6 → 90.9](analysis/2026-08-28-decode-52-to-84.md), the [pod
-verification](analysis/2026-08-27-pod-verification.md), and [what closing the
+defect audit](analysis/2026-08-27-defect-audit.md) (historical), the [method record behind
+decode 52.6 → 90.9](analysis/2026-08-28-decode-52-to-84.md) (historical), the [pod
+verification](analysis/2026-08-27-pod-verification.md) (historical), and [what closing the
 prefill gap would actually require](analysis/2026-08-29-what-sota-would-require.md).
+
+**Docs cited by CHANGELOG cannot be deleted.** CHANGELOG is the central record;
+each line points to its evidence. Deleting the evidence leaves the verdict as a
+bare assertion. Mark stale docs SUPERSEDED at the top of the file instead — the
+mark says what replaced it, why it still exists, and where the current answer
+lives. Checkable: `git grep -c "<doc-path>" origin/main -- CHANGELOG.md` —
+non-zero means SUPERSEDED, not delete.
 
 ## Operations
 
 | Doc | Answers |
 |---|---|
 | [serve-v100.md](serve-v100.md) | Running the 27B on the pod with the chat UI on a laptop — the SSH tunnel, the exact server command, and why warmup captures the decode graphs up front. |
-| [lessons/](lessons/) | Two measured Q&A notes on driving Claude Code against tileRL's own server: the Messages shim, and the rollout launcher's sandbox. |
+| [lessons/](lessons/) | Two measured Q&A notes on driving Claude Code against tileRL's own server: the Messages shim, and the rollout launcher's sandbox. (historical — both shims are built and gated by tests) |
 | [tick-anatomy.html](tick-anatomy.html) | A rendered page: every layer of one V100 speculative decode tick against its byte floor. |

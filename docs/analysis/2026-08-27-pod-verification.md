@@ -1,3 +1,8 @@
+> **SUPERSEDED (2026-09-10):** The #1 blocker (wrong logits from zero-centered RMSNorm)
+> was found and fixed the same day — fold `+1` at load, `−1` at save. Kept because
+> CHANGELOG:564 cites it as evidence for the phase-exit verdict. Current answer:
+> `wins/2026-08-27-zero-centered-rmsnorm.md`.
+
 # Pod verification 2026-08-27 — where the 27B stands, and the #1 blocker
 
 > **RESOLVED 2026-08-27 evening: check 2 is GREEN.** The wrong-logits root cause

@@ -1,3 +1,9 @@
+> **SUPERSEDED (2026-09-10):** The audit's 24 defects were triaged; the landed fixes
+> (four `_validate_hf_config` cross-checks, `_prefix_state` snapshot cleanup) are in
+> the code. Kept because CHANGELOG:566 cites it as evidence for the phase-exit verdict.
+> Current state: the fixes are in `model.py` / `engine.py`; the remaining ~2.65 ms of
+> findings are OPEN-board items.
+
 # tileRL audit briefing — format/redundancy/residency defects
 **HEAD `1a5d8d5`** (audits ran at `10f0b95`; the two commits since touch only `linear()`'s bias device and the fp4 save/load round-trip — **no finding below is stale**). Baseline under attack: **19.03 ms/tick, 52.6 tok/s** at B=1 vs Arle **84.5 tok/s = 11.83 ms/tick**; **20.3 GiB** serving weights on a 96 GiB H20.
 
