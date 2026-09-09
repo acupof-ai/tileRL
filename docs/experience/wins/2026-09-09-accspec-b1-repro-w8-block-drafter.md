@@ -8,6 +8,11 @@ the 94.6 measured for B=1 decode on the serving build
 
 > Status: Shipped
 
+> **Superseded on the tick claim (2026-09-09):** the "W=8 verify tick is 7.3% slower"
+> claim below was reverse-derived from wall tok/s; directly timed, the W=8 tick improved
+> 3.6% (43.52 → 41.96 ms). See [the tick-timing entry](2026-09-09-spec-tick-timing-and-the-1355-gap.md).
+> The reproduction numbers below stand.
+
 ## Context
 
 `2026-09-03-batched-selector-walk.md` recorded B=1 base 78.4 tok/s and B=1 spec W=8
