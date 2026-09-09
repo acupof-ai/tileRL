@@ -169,9 +169,10 @@ def _arm_log(args, name: str) -> str:
 def _compiles(log: str) -> int:
     """`begins to compile` lines in this arm's server log, or -1 when unmeasured.
 
-    Positive control: the log must contain `tilerl serve: http` (the serve
-    startup print at src/tilerl/cli.py:240 -- if that line's wording changes,
-    this check goes null, so change both together; it prints once at startup). A log without it is the wrong file or a buffered file that
+    Positive control: the log must contain `tilerl serve: http` -- the line
+    `cmd_serve` prints on startup. Reword it there and this control silently
+    stops matching, every row goes null, so change both together. It prints
+    once at startup. A log without it is the wrong file or a buffered file that
     never flushed -- a grep finding no pattern there returns 0, the one value that
     reads as "everything clean"."""
     try:

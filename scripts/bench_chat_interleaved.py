@@ -147,10 +147,10 @@ def _post_stream(url: str, body: dict, timeout: float) -> tuple[dict, float]:
 def _compiles(path: str) -> int:
     """`begins to compile` lines in the server's own log, or -1 when unmeasured.
 
-    Positive control: the log must contain `tilerl serve: http` (the serve
-    startup print at src/tilerl/cli.py:240 -- if that line's wording changes,
-    this check goes null, so change both together). It prints once at startup,
-    right before uvicorn.run. A log without it is the wrong file,
+    Positive control: the log must contain `tilerl serve: http` -- the line
+    `cmd_serve` prints on startup. Reword it there and this control silently
+    stops matching, every row goes null, so change both together. It prints
+    once at startup, right before uvicorn.run. A log without it is the wrong file,
     a rotated file, or a buffered file that never flushed -- and a grep that finds
     no pattern there returns 0, the one value that reads as "everything clean".
     Measured on the pod: a `python3` (no `-u`) server redirected to a file leaves
