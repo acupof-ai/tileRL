@@ -20,9 +20,9 @@ at B=1 — the fp8-activation path is the M > 1 kernel, so it carries prefill an
 decode, not the single-stream number this table leads with.
 
 Accuracy is not a decode workload and is not in that table: these weights score **74.6%
-MMLU 0-shot**, and speculation leaves it bit-identical. Both sglang arms run a
-dequantized bf16 checkpoint that emits garbage, so there is no accuracy number to
-compare them on — the rows above are a kernel comparison only.
+MMLU 0-shot**. Both sglang arms run a dequantized bf16 checkpoint that emits garbage, so
+there is no accuracy number to compare them on — the rows above are a kernel comparison
+only.
 
 **Read the workload column before comparing rows.** Only the first three are the same
 shape, and only they are comparable to sglang. The speculation pair ran 200 real GSM8K
@@ -30,8 +30,8 @@ problems, so 126.5 is read against its own 79.5 base (**1.591x**) and never agai
 54.2. Speculation is a B=1 lever: at B=8 it lands at 0.928x.
 
 This table read **135.5** for the speculation row until 2026-09-09. That number was
-measured 2026-09-03; re-measured today on the current sha, same card, same workload, the
-arm reads **126.5** warm and 122.4 cold. The base arm reproduces (79.5 warm, 78.2 cold,
+measured 2026-09-03 on H20 gpu7; re-measured today on the current sha, same workload, on
+a different H20 (card 6), the arm reads **126.5** warm and 122.4 cold. The base arm reproduces (79.5 warm, 78.2 cold,
 against 78.4 recorded) and so does the drafter (6.19 of 8 blocks accepted, against
 6.14) — what did not reproduce is throughput, with the algorithm unchanged. We publish
 what we can reproduce today; 135.5 stands in its dated entry, not here.
