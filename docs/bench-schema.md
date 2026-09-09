@@ -21,6 +21,13 @@ days, was cited by the README, and was handed out as a repro baseline. So the
 collector takes the sha itself, in the tree it ran in, and `dirty` says
 whether that sha fully names the tree.
 
+A first measurement has no history: `--regress` is silent on both sides, so
+the physical floor is its **only** alarm. That is why beating a hard floor is
+`IMPLAUSIBLE` rather than a win — the too-good number is the most common shape
+of bad measurement (a cost missed, the wrong population, a gate reading an
+always-true field), and the first measurement is exactly when nobody is
+watching.
+
 ## Required fields
 
 | Field | Type | Rule |
