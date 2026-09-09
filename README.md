@@ -3,27 +3,39 @@
 **Serve and RL-train Qwen3.8-27B (NVFP4) on one Hopper card, in one process.**
 
 sglang refuses this checkpoint on Hopper. tileRL runs it in its own TileLang kernels —
-**135.5 tok/s single-stream against sglang's 54.2** — and the engine that samples is the
-model that trains.
+**92.4 tok/s single-stream against sglang's 54.2 on the same shape** — and the engine
+that samples is the model that trains.
 
-| one H20, Qwen3.8-27B | B=1 decode tok/s | prefill tok/s | MMLU 0-shot |
-|---|---:|---:|---:|
-| **tileRL**, NVFP4 + FP8, speculation on | **135.5** | — | — |
-| **tileRL**, NVFP4 + FP8 | **92.4** | **2689.8** | 74.6% |
-| sglang, bf16 (cannot load NVFP4 on Hopper) | 54.2 | 2512 | — |
-| sglang, online fp8 | 39.9 | **4022** | — |
+| one H20, Qwen3.8-27B | workload | B=1 decode tok/s | prefill tok/s |
+|---|---|---:|---:|
+| **tileRL**, NVFP4 + FP8 | d512, 64 out | **92.4** | **2689.8** |
+| sglang, bf16 (cannot load NVFP4 on Hopper) | d512, 64 out | 54.2 | 2512 |
+| sglang, online fp8 | d512, 64 out | 39.9 | **4022** |
+| **tileRL**, W=8 block speculation | 200 GSM8K, 512 out | **126.5** | — |
+| **tileRL**, same arm, speculation off | 200 GSM8K, 512 out | 79.5 | — |
 
 B=1 decode is the target because that is the shape a rollout has. sglang's fp8 arm still
-wins prefill; its bf16 arm no longer does. Both its arms run a dequantized bf16
-checkpoint that emits garbage, which is why their MMLU column is empty. Speculation is a
-B=1 lever only — at B=8 it lands at 0.928x, and it leaves MMLU bit-identical, so the two
-tileRL rows share one accuracy number.
+wins prefill; its bf16 arm no longer does. Weights are fp4 against **bf16** activations
+at B=1 — the fp8-activation path is the M > 1 kernel, so it carries prefill and batched
+decode, not the single-stream number this table leads with.
 
-The two decode rows are different experiments, not a before/after: 135.5's own base arm
-read 78.4 on that workload (1.728x), while 92.4 is the committed `d512-b1` baseline.
-Weights are fp4 against **bf16** activations at B=1 — the fp8-activation path is the
-M > 1 kernel, so it carries prefill and batched decode, not the single-stream number
-this table leads with.
+Accuracy is not a decode workload and is not in that table: these weights score **74.6%
+MMLU 0-shot**, and speculation leaves it bit-identical. Both sglang arms run a
+dequantized bf16 checkpoint that emits garbage, so there is no accuracy number to
+compare them on — the rows above are a kernel comparison only.
+
+**Read the workload column before comparing rows.** Only the first three are the same
+shape, and only they are comparable to sglang. The speculation pair ran 200 real GSM8K
+problems, so 126.5 is read against its own 79.5 base (**1.591x**) and never against
+54.2. Speculation is a B=1 lever: at B=8 it lands at 0.928x.
+
+This table read **135.5** for the speculation row until 2026-09-09. That number was
+measured 2026-09-03; re-measured today on the current sha, same card, same workload, the
+arm reads **126.5** warm and 122.4 cold. The base arm reproduces (79.5 warm, 78.2 cold,
+against 78.4 recorded) and so does the drafter (6.19 of 8 blocks accepted, against
+6.14) — what did not reproduce is throughput, with the algorithm unchanged. We publish
+what we can reproduce today; 135.5 stands in its dated entry, not here.
+[The 2026-09-03 arm](docs/experience/wins/2026-09-03-batched-selector-walk.md)
 
 **The same checkpoint also runs on a V100** — sm70, no bf16, no fp8 hardware path, two
 generations before NVFP4 existed. 50.0 tok/s decode-only, 46.3 wall measured from the
