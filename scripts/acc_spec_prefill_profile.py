@@ -38,6 +38,7 @@ import os
 import subprocess
 import time
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import torch
@@ -119,8 +120,9 @@ def main() -> None:
     sha, dirty = git_commit(), git_dirty()
     card = os.environ.get("CUDA_VISIBLE_DEVICES", "?")
     gpu = _gpu_state()
+    ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"=== acc_spec_prefill_profile  sha={sha}  dirty={dirty}  card={card}  "
-          f"gpu_at_start[{gpu}]  draft={'yes' if args.draft else 'no'} ===")
+          f"gpu_at_start[{gpu}]  ts={ts}  draft={'yes' if args.draft else 'no'} ===")
 
     from tilerl_kernels.backend import get_backend
 
@@ -204,7 +206,7 @@ def main() -> None:
 
     report = {
         "provenance": {"git_commit": sha, "git_dirty": dirty, "card": card,
-                       "gpu_at_start": gpu},
+                       "gpu_at_start": gpu, "timestamp_utc": ts},
         "wall": wall,
         "tok_s": (tok_gen / wall) if wall else 0.0,
         "buckets": {
