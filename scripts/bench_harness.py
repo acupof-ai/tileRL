@@ -370,6 +370,13 @@ _KIND_SHORT = {"bandwidth": "bw", "compute": "compute", "roofline": "roof",
                "measured-best": "best", "baseline": "base"}
 
 
+def _coverage(metrics: dict, rows) -> str:
+    """One line every view prints: an empty store must make noise, not read as
+    a clean bill of health."""
+    measured = {r["metric"] for r in rows}
+    return f"{len(metrics)} metrics declared, {len(measured)} measured"
+
+
 def _view_table() -> None:
     """Four-target matrix; an empty cell says so, never a silent skip. The gap
     column carries its floor kind: roof/bw/compute/base are headroom against a
@@ -385,6 +392,8 @@ def _view_table() -> None:
         groups.setdefault(g, {})[r["target"]] = r
     print(f"=== bench table — denominator: a {denom['turn_s']}s agent turn = "
           f"{denom['prefill_s']}s prefill + {denom['decode_s']}s decode ({denom['source']}) ===")
+    print(f"  coverage: {_coverage(metrics, cur.values())}, "
+          f"{len({r['target'] for r in cur.values()})}/{len(benchrec.TARGETS)} targets covered")
     print(f"  {'metric (shape) [build]':<46} {'weight':>6} "
           f"{'cpu':>8} {'metal':>8} {'sm90':>8} {'sm70':>8} {'gap x w':>12}")
     missing = []
@@ -399,7 +408,7 @@ def _view_table() -> None:
                    if (c := cells.get(t)) and (g := _gap(c, metrics))]
         if labeled:
             g, kind = max(labeled)
-            gw = f"{g * metrics[metric]['weight']:.3f} {_KIND_SHORT[kind]}"
+            gw = f"{g * metrics[metric]['weight']:.3f} {_KIND_SHORT.get(kind, kind)}"
         else:
             gw = "—"
         print(f"  {metric + ' ' + str(dict(shape)) + ' [' + build + ']':<46} "
@@ -414,7 +423,10 @@ def _view_readme() -> None:
     """The generated README rows: reuse speedup (turn 1 / turn 2 wall) and SSD restart."""
     import benchrec
 
+    reg = benchrec.load_registry()["metrics"]
     cur = benchrec.current(benchrec.load_all())
+    # HTML comment: paste-safe, but an empty store still makes noise.
+    print(f"<!-- coverage: {_coverage(reg, cur.values())} -->")
     runs: dict = {}
     for r in cur.values():
         if r["metric"] != "chat_turn_wall_s":
@@ -441,12 +453,14 @@ def _view_regress() -> None:
     import benchrec
 
     reg = benchrec.load_registry()["metrics"]
+    cur = benchrec.current(benchrec.load_all())
     by_key: dict = {}
     for r in benchrec.load_all():
         if not benchrec.is_regressable(r):
             continue
         by_key.setdefault(benchrec.key(r), []).append(r)
     print("=== regression (newest vs previous, n>=2; PASS at >= 0.97x) ===")
+    print(f"  coverage: {_coverage(reg, cur.values())}")
     for k, rows in sorted(by_key.items()):
         if len(rows) < 2:
             continue
@@ -475,13 +489,24 @@ def _view_regress() -> None:
 def _view_questions(limit: int = 20) -> None:
     """Headroom against physical floors only, by gap x weight desc. A
     measured-best gap is a regression, not headroom — see --regress; the two
-    must not share a sorted column. A metric with rows but no physical floor is
-    not silently fine: the missing derivation is itself a todo, listed by
-    weight."""
+    must not share a sorted column. Two louder todos rank above the list: a
+    metric the registry declares but nobody has measured (worse than an
+    unmeasured floor), and a metric with rows but no physical floor — the
+    missing derivation is itself a todo. Both sorted by weight."""
     import benchrec
 
     reg = benchrec.load_registry()["metrics"]
     cur = list(benchrec.current(benchrec.load_all()).values())
+    print(f"=== questions (headroom vs physical floor, gap x weight, top {limit}) ===")
+    print(f"  coverage: {_coverage(reg, cur)}")
+    unmeasured = sorted(
+        ((reg[m]["weight"], m) for m in reg.keys() - {r["metric"] for r in cur}),
+        reverse=True,
+    )
+    if unmeasured:
+        print("=== no measurement at all ===")
+        for w, m in unmeasured:
+            print(f"  {m} (weight {w})")
     q = []
     floored: set = set()
     for r in cur:
@@ -492,7 +517,6 @@ def _view_questions(limit: int = 20) -> None:
         if g is not None:
             q.append((g * reg[r["metric"]]["weight"], g, r))
     q.sort(key=lambda x: x[0], reverse=True)
-    print(f"=== questions (headroom vs physical floor, gap x weight, top {limit}) ===")
     for score, g, r in q[:limit]:
         print(f"  {score:.3f}  {r['metric']} {r['target']} {dict(r['shape'])} "
               f"[{r['floor']['kind']}]: {r['value']} vs floor {r['floor']['value']} "

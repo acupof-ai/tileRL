@@ -61,10 +61,14 @@ number (how far below our own best). The two never share a sorted column.
 
 ## Views
 
+Every view prints a coverage line (`N metrics declared, M measured`; `--table`
+adds targets covered) — an empty store must make noise, not read as a clean
+bill of health.
+
 - `tilerl bench --table` — four-target matrix; an empty cell says so, never a silent skip; the gap column carries its floor kind (`roof`/`bw`/`compute`/`base` = headroom, `best` = vs our own best)
-- `tilerl bench --readme` — the generated README rows (reuse, SSD restart)
+- `tilerl bench --readme` — the generated README rows (reuse, SSD restart); coverage as an HTML comment so the table stays paste-safe
 - `tilerl bench --regress` — two sections: newest vs previous per key (`n>=2` only, no dispersion, no regression claim), and every `measured-best` row standing below its population's best (FAIL past 1.05x)
-- `tilerl bench --questions` — headroom against **physical floors only**, by `gap × weight` desc; a metric with rows but no physical floor gets a `no physical floor — needs a derivation` line, sorted by weight — the missing derivation is itself a todo
+- `tilerl bench --questions` — headroom against **physical floors only**, by `gap × weight` desc; above it, `no measurement at all` (declared in the registry, never measured) and below it `no physical floor — needs a derivation` (measured, no physical floor) — both sorted by weight, both louder than any ranked row
 
 ## Selftest
 
