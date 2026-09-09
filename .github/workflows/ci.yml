@@ -13,7 +13,9 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # PR branches cancel superseded runs; main never cancels — a completed main
+  # run is the only CI that verifies the actual merged state.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   gate:
