@@ -151,9 +151,15 @@ def test_every_materialize_call_site_has_a_guard():
     unguarded = sorted(sites - guarded)
     # Lower bound against silent empty enumeration (a broken git query above
     # would make `unguarded` vacuously empty). 15 tracked sites on 2026-09-10;
-    # this is not a coverage requirement.
+    # this is not a coverage requirement. The sha distinguishes a broken query
+    # from a tree behind main (an old tree legitimately has fewer sites).
+    head = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"], cwd=root,
+        capture_output=True, text=True,
+    ).stdout.strip()
     assert len(sites) >= 12, (
-        f"only {len(sites)} tracked materialize sites found — broken enumeration?"
+        f"only {len(sites)} tracked materialize sites found at {head} — "
+        f"broken enumeration, or a tree behind main?"
     )
     assert not unguarded, (
         f"files calling backend.materialize() without card_guard or build_engine: "
