@@ -107,6 +107,17 @@ def _gpu_state():
         return "nvidia-smi unavailable"
 
 
+# Deviation of the pod tree from its stamped sha, printed next to the number:
+# the 09657c0 baseline predates two pod/dev tools the wrapper and this instrument
+# import, so they were copied in from HEAD. Neither is imported by src/ or
+# packages/ (verified: grep -rl 'card_owner\|benchrec' src/ packages/ -> 0 hits).
+_TREE_DELTA = {
+    "96aed09e": "09657c0 + scripts/card_owner.py + scripts/benchrec.py copied from HEAD "
+                "(pod/dev tools absent at 09657c0; not imported by src/ or packages/; "
+                "verified: grep -rl 'card_owner|benchrec' src/ packages/ -> 0 hits)",
+}
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source", required=True)
@@ -118,11 +129,13 @@ def main() -> None:
     args = p.parse_args()
 
     sha, dirty = git_commit(), git_dirty()
+    delta = _TREE_DELTA.get(sha[:8], "none")
     card = os.environ.get("CUDA_VISIBLE_DEVICES", "?")
     gpu = _gpu_state()
     ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"=== acc_spec_prefill_profile  sha={sha}  dirty={dirty}  card={card}  "
           f"gpu_at_start[{gpu}]  ts={ts}  draft={'yes' if args.draft else 'no'} ===")
+    print(f"=== tree_delta[{sha[:8]}]: {delta} ===")
 
     from tilerl_kernels.backend import get_backend
 
@@ -206,7 +219,7 @@ def main() -> None:
 
     report = {
         "provenance": {"git_commit": sha, "git_dirty": dirty, "card": card,
-                       "gpu_at_start": gpu, "timestamp_utc": ts},
+                       "gpu_at_start": gpu, "timestamp_utc": ts, "tree_delta": delta},
         "wall": wall,
         "tok_s": (tok_gen / wall) if wall else 0.0,
         "buckets": {
