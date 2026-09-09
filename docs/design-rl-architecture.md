@@ -61,7 +61,7 @@ steps. The published responses are partial/interruptible rollouts (AReaL),
 tail-aware packing (RollPacker), active partial rollouts (APRIL) and per-request
 load balancing (slime).
 
-Our code has this in its purest form. `train.py:209`:
+Our code has this in its purest form, in `grpo_loop`:
 
 ```python
 prompt = np.asarray(prompts[step % len(prompts)], dtype=np.int64)

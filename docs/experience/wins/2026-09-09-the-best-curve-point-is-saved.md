@@ -10,9 +10,8 @@ The 2026-09-08 GRPO run scored 87.4 / 93.2 / 93.4 / 82.4 / 91.2 and **shipped 91
 last point, 2.2 below the peak it had reached 50 steps earlier. The peak weights were
 unrecoverable: `AdamW.step_one` ends in `p.copy_()`, in place, so every intermediate
 policy is destroyed by the next step (the same property that lets the engine keep its
-captured graphs). The early-stopping design doc ([Q4](../../design-early-stopping.md))
-concluded that a snapshot is the prerequisite for any stopping rule, and that it should
-land first, independent of one.
+captured graphs). The early-stopping design doc (Q4: snapshot first) concluded that a snapshot is the
+prerequisite for any stopping rule, and that it should land first, independent of one.
 
 ## What changed
 
