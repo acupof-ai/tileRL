@@ -793,7 +793,8 @@ def _train_adapters(args: argparse.Namespace) -> None:
                           max_batch=rollout_batch, draft=draft,
                           num_blocks=blocks,
                           max_total_tokens=max(ctx, 8192),
-                          spec_depth=args.depth, decode_graph=True,
+                          spec_depth=args.depth,
+                          decode_graph=not args.deterministic,
                           prefix_store=NoPrefixStore())
     # Not in `inputs`: the id is a hash of it, so recording the pool there would make
     # every pool change a different run and hand nothing back on a rerun. It is beside
@@ -1713,6 +1714,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="bypass the before-eval and periodic rollout-length guards; "
                               "the smoke recipes want the "
                               "truncation, a real run almost never does")
+    p_train.add_argument("--deterministic", action="store_true",
+                         help="decode eager (no captured graph): bitwise reproducible "
+                              "rollouts across processes, at a rollout throughput cost")
     p_train.add_argument("--eval-max-new-tokens", type=int, default=2048,
                          help="eval generation length; independent of --max-new-tokens, "
                          "which caps the ROLLOUTS. Scoring at the training cap measures "
