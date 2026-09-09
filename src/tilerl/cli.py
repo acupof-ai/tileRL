@@ -672,16 +672,20 @@ def _emit_eval_records(correct: int, total: int, ntok: int, token_lens: list,
     benchrec = _benchrec()
     p = correct / total
     vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    cuda = backend.device.type == "cuda"
+    import torch
+    cuda = backend.device.type == "cuda" and torch.cuda.is_available()
+    dev_name = (torch.cuda.get_device_name(backend.device) if cuda
+                else getattr(backend.device, "name", None) or "cpu")
     common = {
         "shape": {"steps": steps},
-        # Accuracy and greedy length are compile-invariant: JIT time can enter a
-        # seconds figure, not a proportion or a token count, so compiles=0 is exact.
+        # compiles=0 means "not applicable": accuracy and greedy length are
+        # compile-invariant (JIT time enters a seconds figure, not a proportion
+        # or token count), not "measured zero compiles in the window".
         "warm": {"state": "warm", "compiles": 0},
         "n": total,
         "target": backend.arch, "build": "eager", "model": "27B-nvfp4",
-        "device": ({"name": "H20", "card": int(vis.split(",")[0])} if cuda and vis
-                   else {"name": getattr(backend.device, "name", None) or "cpu"}),
+        "device": ({"name": dev_name, "card": int(vis.split(",")[0])} if cuda and vis
+                   else {"name": dev_name}),
         "commit": benchrec.git_commit(), "dirty": benchrec.git_dirty(),
         "cmd": " ".join(sys.argv),
     }

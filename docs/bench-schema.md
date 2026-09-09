@@ -39,7 +39,7 @@ watching.
 | `build` | str | `eager` / `fused` / `fused+graph` / `fused+graph+draft` |
 | `model` | str | config name, e.g. `27B-nvfp4`, `tiny` |
 | `shape` | object | non-empty; must contain the metric's registry-declared keys (decode → `batch`,`ctx`; eval → `cap`; reuse → `turn`) |
-| `warm` | object | `state` ∈ `cold`,`warm`; `compiles` int ≥ 0 or null — JIT compiles in the timed window. **The only legal source is the `len(backend._kernels)` delta** (engine-direct collectors). A server-log grep counts only INFO-logged kernels — an undefined lower bound, off by 8x on the first real comparison (16 vs 2) — so log-reading collectors record null and keep the count as a console-only lower bound. **null = unmeasured, never omitted** |
+| `warm` | object | `state` ∈ `cold`,`warm`; `compiles` int ≥ 0 or null — JIT compiles in the timed window. **The only legal source is the `len(backend._kernels)` delta** (engine-direct collectors). A server-log grep counts only INFO-logged kernels — an undefined lower bound, off by 8x on the first real comparison (16 vs 2) — so log-reading collectors record null and keep the count as a console-only lower bound. **null = unmeasured, never omitted**. Exception: metrics compile-invariant by construction (proportions, token counts) record 0 as "not applicable", not a measured count |
 | `n` | int | ≥ 1, the number of timed windows |
 | `spread` | number | relative dispersion (sd/mean or (max−min)/median); 0.0 when `n=1` |
 | `device` | object | `name` (GPU model); `card` int, required on sm90/sm70 |

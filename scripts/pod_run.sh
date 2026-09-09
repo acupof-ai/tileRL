@@ -98,6 +98,11 @@ export PYTHONPATH=$REMOTE_DIR/src:$REMOTE_DIR/packages/tilerl-kernels/src
 export TILERL_TARGET=\${TILERL_TARGET:-cuda} CUDA_VISIBLE_DEVICES=$CARD
 export TILERL_QWEN38_SOURCE=\${TILERL_QWEN38_SOURCE:-/work/Qwen3.8-27B-NVFP4}
 export REMOTE_DIR=$REMOTE_DIR
+# pod_sync.sh overwrites the tracked store on every sync; keep the live one outside the tree.
+export TILERL_BENCH_STORE=/work/tilerl-bench/measurements.jsonl
+mkdir -p "\$(dirname "\$TILERL_BENCH_STORE")" && touch "\$TILERL_BENCH_STORE"
+# Merge tracked rows the pod store lacks: seed-once drifts as main lands new rows.
+python3 -c "import json;have={json.loads(l)['id'] for l in open('\$TILERL_BENCH_STORE') if l.strip()};open('\$TILERL_BENCH_STORE','a').writelines(l for l in open('$REMOTE_DIR/docs/experience/bench/measurements.jsonl') if l.strip() and json.loads(l)['id'] not in have)"
 
 # Quota: refuse a card not recorded as tileRL's in aupai's card_assignment.json
 # (read-only). pod_run claims any free card, so without this it silently takes
