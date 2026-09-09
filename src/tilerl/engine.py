@@ -856,6 +856,11 @@ class Engine:
             t.join(timeout)
         self._thread = None
 
+    def reset_pool(self) -> None:
+        """Canonicalize the KV pool for a deterministic training start. Direct-drive
+        only: call before the first training rollout, with no requests in flight."""
+        self._kv.reset()
+
     def stats(self) -> dict[str, Any]:
         """Lock-free while the loop thread runs; a fresh build when it does not."""
         if self._thread is None:

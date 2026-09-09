@@ -882,6 +882,11 @@ def _train_adapters(args: argparse.Namespace) -> None:
         evals("after")
         manifest["engine"] = engine.config  # re-read: see the comment at the other _finish
         return _finish(manifest, args.json)
+    # Deterministic training start: a cache miss in the before arm leaves the pool
+    # holding eval K/V in freed blocks and the free list in free order, so the first
+    # rollout's numerics depend on whether eval ran (measured: 17/24 rows differ).
+    # The state pool zeroes on alloc; the KV pool does not, so canonicalize it here.
+    engine.reset_pool()
     _refuse_short_rollouts(mean_len.get("before"), args.max_new_tokens,
                            args.allow_short_rollouts)
     # The weights behind the best curve point. Every intermediate policy is otherwise

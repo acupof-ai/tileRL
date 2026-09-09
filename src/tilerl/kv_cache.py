@@ -166,6 +166,15 @@ class PagedKvPool:
     def is_shared(self, block: int) -> bool:
         return self.refcount[block] > 1
 
+    def reset(self) -> None:
+        # A previous tenant (the before-arm eval) leaves its K/V in freed blocks and the
+        # free list in LIFO free order, so two same-config runs differing only in whether
+        # eval ran start training from different pool states. Zero the planes and return
+        # the free list to ascending order. The engine's pad block is not in `_free`.
+        self.k_pool.zero_()
+        self.v_pool.zero_()
+        self._free.sort()
+
     def _store_fp8(self, plane: int, blk: torch.Tensor, off: torch.Tensor,
                    k: torch.Tensor, v: torch.Tensor) -> None:
         """Quantize ``k``/``v`` ([n, num_kv_heads, head_dim]) into ``blk``/``off``.
