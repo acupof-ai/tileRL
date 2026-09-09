@@ -1,4 +1,4 @@
-# The 135.5 gap is scheduling overhead, not the decode tick — and 135.5 never ran on main
+# The 135.5 gap is prefill growth, not the decode tick — and 135.5 never ran on main
 
 **Date:** 2026-09-09
 **Arch:** H20 (sm90) card 6, 27B NVFP4 + DFlash2 block drafter, per-tick wall timing with
@@ -53,16 +53,41 @@ same instrument at both shas, `scripts/acc_spec_overhead.py`) names the bucket:
 
 | per 50 questions | 09657c0 base | current base | 09657c0 spec | current spec |
 |---|---:|---:|---:|---:|
-| wall | 208.1s | 212.0s | 123.1s | 126.5s |
-| decode | 198.7 | 196.7 | 115.8 | 111.6 |
-| **prefill** | **9.1** | **14.7** | **7.2** | **14.7** |
-| encode/detokenize | 0.0 | 0.0 | 0.0 | 0.0 |
-| scheduling (remainder) | 0.3 | 0.6 | 0.1 | 0.1 |
+| wall | 208.1s | 211.2s | 123.1s | 128.4s |
+| decode | 198.7 | 195.7 | 115.8 | 113.3 |
+| **prefill** | **9.1** | **14.9** | **7.2** | **14.9** |
+| encode/detokenize | 0.019/0.012s | 0.020/0.004s | 0.017/0.009s | 0.016/0.003s |
+| scheduling (remainder) | 0.3 | 0.5 | 0.1 | 0.1 |
 
-**Prefill per question grew 1.6-2.0x (0.14-0.18s → 0.29s) and accounts for essentially
-all the non-decode growth**; scheduling is noise. (An earlier guess that prefill was
-~0.04 s/question was wrong by 7x — GSM8K prompts with the chat template run to hundreds
-of tokens.) The bisect target is the prefill path between 09657c0 and the current sha.
+**Prefill per question grew 2.1x (0.143s → 0.298s) and accounts for essentially all the
+non-decode growth**; scheduling is noise. (An earlier guess that prefill was ~0.04
+s/question was wrong by 7x — GSM8K prompts with the chat template run to hundreds of
+tokens.) Two follow-ups sharpened this:
+
+- **The 09657c0 arm gap is an arm-order artifact.** Base prefill (9.1s) exceeded spec
+  (7.2s) at 09657c0; a reversed-order run (spec first) flips it — spec 10.2s, base 7.1s.
+  Whichever arm runs first pays a ~2-3s one-time cost in its prefill bucket (warm JIT
+  cache, 0 compiles — not compilation). The comparable second-arm numbers are 7.1-7.2s
+  per 50 questions at 09657c0 vs 14.9s at the current sha. At the current sha both arms
+  are equal (14.9/14.9, reproduced 14.7/14.7), so the one-time cost has moved out of the
+  timed region or disappeared; the 2.1x growth itself is not an artifact.
+- **The prefix-reuse hypothesis is dead by construction.** A proposed explanation for
+  the convergence was that prefix reuse broke: GSM8K prompts share a chat-template
+  prefix, so hits would both lower prefill and make arms unequal. It cannot be tested
+  in this harness because prefix reuse is off at both shas by construction — the engine
+  raises on `draft.aux_layers` with a real prefix store (engine.py:445, identical at
+  09657c0's engine.py:333) and both shas' harnesses pass `NoPrefixStore`
+  (acc_spec_arms.py:103 at 09657c0). A stats() run confirms `prefix_hits = 0` at both
+  arms. The serving path's prefix reuse — a README flagship (19x cross-turn) — has
+  never been exercised by any of this; `bench_chat_reuse.py --turns 6` is the
+  instrument for that question.
+
+encode/detokenize is genuinely negligible, not unmeasured: the wrappers fire exactly
+50+50 times per arm (once per prompt each, eval.py:48/60), totaling 0.016-0.020s encode
+and 0.003-0.012s detokenize per 50 questions — the 0.0 in earlier tables was one-decimal
+rounding.
+
+The bisect target is the prefill path between 09657c0 and the current sha.
 
 **135.5 has never run on a main sha.** 09657c0 is the first commit on main whose
 `acc_spec_arms.py` can run B=1 at all (the `--concurrency` flag landed in #58; the recorded
@@ -92,10 +117,14 @@ A throughput gap between two spec runs is not a tick gap until the tick is timed
 directly. The identity `tok/s = (tok/decode-fwd) / tick × (decode_s/wall_s)` has three
 factors; a reverse derivation that defaults the unmeasured one to a constant invents the
 regression (it did, twice: 8.1% and 45.2 ms). Here the tick improved 3.6% and prefill
-per question grew 1.6-2.0x — the regression to bisect is the prefill path, not the
-decode kernels and not the scheduler. And a bench number whose recorded sha cannot
-produce it is a provenance bug first and a performance question second: 135.5's sha
-pointed at a B=8-hardwired tree.
+per question grew 2.1x — the regression to bisect is the prefill path, not the decode
+kernels and not the scheduler. An arm gap that flips when the arm order flips is a
+first-use cost charged to the first arm, not a difference between the arms — run the
+reversed order before explaining a two-arm difference (it killed the 9.1-vs-7.2 here).
+And a hypothesis about prefix reuse is untestable in a harness that builds with
+`NoPrefixStore` — check the construction before proposing the counter run. And a bench
+number whose recorded sha cannot produce it is a provenance bug first and a performance
+question second: 135.5's sha pointed at a B=8-hardwired tree.
 
 ## Results
 
