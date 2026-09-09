@@ -9,9 +9,15 @@ and reports steady-state ms/tick + tok/s. Also asserts the decode is correct
   PATH=/usr/local/cuda-12.4/bin:$PATH TILELANG_CACHE_DIR=/tmp/tl_sm70f16 \
     TILERL_TARGET=cuda TILERL_QWEN38_SOURCE=/work/Qwen3.8-27B-NVFP4 \
     PYTHONPATH=packages/tilerl-kernels/src:src CUDA_VISIBLE_DEVICES=0 \
-    python3 scripts/bench_decode_steady.py
+    python3 scripts/bench_decode_steady.py --card 0
+
+Emits one decode_tok_s record (n=1: one steady-state window) to
+docs/experience/bench/measurements.jsonl (schema: docs/bench-schema.md).
+Build is derived: fused projections, and the graph-capture assertion below
+makes it fused+graph.
 """
 
+import argparse
 import os
 import sys
 import time
@@ -20,12 +26,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "packages" / "tilerl-kernels" / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import benchrec  # noqa: E402
 
 from tilerl import config as config_mod  # noqa: E402
 from tilerl import model as model_mod  # noqa: E402
 from tilerl.engine import SamplingParams, build_engine  # noqa: E402
 from tilerl.server import get_tokenizer  # noqa: E402
+
+ap = argparse.ArgumentParser()
+benchrec.add_record_args(ap, default_target="sm70", default_device=None)
+args = ap.parse_args()
 
 src = os.environ["TILERL_QWEN38_SOURCE"]
 cfg = config_mod.qwen38_27b()
@@ -65,4 +77,11 @@ steady = ticks[3:]
 ms = sum(steady) / len(steady) * 1e3
 print(f"ticks={len(ticks)} steady={len(steady)}  {ms:.1f} ms/tick  {1e3 / ms:.1f} tok/s", flush=True)
 print(f"first 3 ticks: {[f'{t * 1e3:.0f}ms' for t in ticks[:3]]}", flush=True)
+rec = {
+    "metric": "decode_tok_s", "value": round(1e3 / ms, 1), "unit": "tok/s",
+    "shape": {"batch": 1, "ctx": len(ids)}, "warm": {"state": "warm", "compiles": 0},
+    "n": 1, "spread": 0.0, **benchrec.record_common(args, build="fused+graph"),
+}
+rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=False)
+print(f"record {benchrec.append(rec)} appended", flush=True)
 print("STEADY OK", flush=True)

@@ -2,7 +2,10 @@
 
 C4 isn't cached on the pod; wikitext-103-raw-v1 test is the standard substitute.
 
-  python3 scripts/bench_c4_ppl.py --source /work/Qwen3.8-27B-NVFP4 --gpu 7 --n 50
+  python3 scripts/bench_c4_ppl.py --source /work/Qwen3.8-27B-NVFP4 --card 7 --n 50
+
+Emits one ppl record to docs/experience/bench/measurements.jsonl (schema:
+docs/bench-schema.md). Build is derived (fused projections, no graph).
 """
 
 from __future__ import annotations
@@ -14,7 +17,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import benchrec  # noqa: E402
 import torch
 from tilerl_kernels.backend import get_backend
 
@@ -28,11 +33,11 @@ from tilerl.server import get_tokenizer
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True)
-    ap.add_argument("--gpu", type=int, default=7)
     ap.add_argument("--n", type=int, default=50, help="num C4 docs")
     ap.add_argument("--seq-len", type=int, default=512)
+    benchrec.add_record_args(ap, default_device=None)
     args = ap.parse_args()
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.card)
     os.environ.setdefault("TILERL_TARGET", "cuda")
 
     cfg = qwen38_27b()
@@ -110,6 +115,13 @@ def main() -> None:
 
     ppl = math.exp(total_loss / total_tokens)
     print(f"Wikitext-103 perplexity: {ppl:.2f} ({total_tokens} tokens, {n_docs} chunks)")
+    rec = {
+        "metric": "ppl", "value": round(ppl, 2), "unit": "ppl",
+        "shape": {"n": n_docs}, "warm": {"state": "warm", "compiles": 0},
+        "n": 1, "spread": 0.0, **benchrec.record_common(args, build="fused"),
+    }
+    rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=True)
+    print(f"record {benchrec.append(rec)} appended", flush=True)
 
 
 if __name__ == "__main__":

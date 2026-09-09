@@ -1,14 +1,24 @@
 """Decode throughput vs batch size on the NVFP4 slice: B concurrent requests, timed once all decode.
 
-Usage: CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src TILERL_TARGET=cuda python3 scripts/bench_batch_decode.py /host/tc27-nvfp4-slice4 --layers 4
+Usage: CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src TILERL_TARGET=cuda python3 scripts/bench_batch_decode.py /host/tc27-nvfp4-slice4 --layers 4 --card 0
+
+Emits one decode_agg_tok_s record per B (plus spec_goodput_ratio rows with
+--draft, against the store's dense row for the same population) to
+docs/experience/bench/measurements.jsonl (schema: docs/bench-schema.md).
+Build is derived from --fuse/--decode-graph/--draft.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from dataclasses import replace
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import benchrec  # noqa: E402
 import torch
 from tilerl_kernels.backend import get_backend
 
@@ -33,7 +43,9 @@ def main() -> None:
     p.add_argument("--slots", type=int, help="state slots / max_batch (default: max batch swept)")
     p.add_argument("--draft", help="draft head safetensors: speculative decode")
     p.add_argument("--depth", type=int, default=4, help="drafts per row per tick")
+    benchrec.add_record_args(p, default_device=None)
     args = p.parse_args()
+    args.model_name = f"27B-nvfp4-slice{args.layers}"
 
     backend = get_backend()
     assert backend.device.type == "cuda", "needs TILERL_TARGET=cuda"
@@ -53,6 +65,10 @@ def main() -> None:
     )
 
     gen = torch.Generator().manual_seed(7)
+    build = (("fused" if args.fuse else "eager")
+             + ("+graph" if args.decode_graph else "")
+             + ("+draft" if args.draft else ""))
+    common = benchrec.record_common(args, build=build)
     print(
         f"\n=== decode throughput vs batch "
         f"(slice {args.layers} layers, {'graph' if args.decode_graph else 'eager'}) ==="
@@ -87,6 +103,33 @@ def main() -> None:
         acc = (s1["spec_accepted"] - s0["spec_accepted"]) / max(drafted, 1)
         print(f"  {B:>3} {ms:>9.3f} {per_tick:>9.2f} {100 * acc:>6.1f}% "
               f"{1000 * per_tick / ms:>18.1f} {1000 * B * per_tick / ms:>17.1f}")
+        agg = 1000 * B * per_tick / ms
+        rec = {
+            "metric": "decode_agg_tok_s", "value": round(agg, 1), "unit": "tok/s",
+            "shape": {"batch": B, "ctx": 16},
+            "warm": {"state": "warm", "compiles": 0},
+            "n": 1, "spread": 0.0, **common,
+        }
+        rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=False)
+        print(f"  record {benchrec.append(rec)} appended", flush=True)
+        if args.draft:
+            dense_rec = {**rec, "build": build.replace("+draft", "")}
+            dense_best, dense_id = benchrec.measured_best(dense_rec, lower_is_better=False)
+            if dense_id is None:
+                print(f"  spec_goodput_ratio skipped: no dense row for B={B} yet", flush=True)
+            else:
+                srec = {
+                    "metric": "spec_goodput_ratio", "value": round(agg / dense_best, 3),
+                    "unit": "ratio", "shape": {"batch": B, "depth": args.depth},
+                    "warm": {"state": "warm", "compiles": 0},
+                    "n": 1, "spread": 0.0, **common,
+                }
+                srec["floor"] = {
+                    "value": 1.0, "unit": "ratio", "kind": "baseline",
+                    "derivation": f"1.0 = spec matches dense ({dense_best:.1f} tok/s, "
+                                  f"row {dense_id}); below is a loss",
+                }
+                print(f"  record {benchrec.append(srec)} appended", flush=True)
         # Drain fully: the next B reuses the same slot pool.
         done: dict = {}
         while not all(w in done for w in wids):

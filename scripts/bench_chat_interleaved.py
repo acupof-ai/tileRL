@@ -30,8 +30,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import benchrec  # noqa: E402
 
 _TOPICS = (
     "Explain in detail how a paged key-value cache serves a transformer decode step, "
@@ -179,6 +185,7 @@ def main() -> int:
     ap.add_argument("--server-log", default="",
                     help="the server's own stdout, for the compiles count; without it a "
                          "compile inside a measured turn is invisible and reads as tier cost")
+    benchrec.add_record_args(ap)
     args = ap.parse_args()
     if args.sessions < 1:
         ap.error("--sessions must be >= 1")
@@ -208,6 +215,7 @@ def main() -> int:
     # would agree with the first by construction and could not catch a rendering that dropped
     # the system turn.
     sys_seen = 0
+    n_skipped = 0
     for turn in range(args.turns):
         for c, filler in enumerate(fillers):
             convs[c].append({"role": "user", "content": filler * args.grow * (turn + 1)})
@@ -257,6 +265,21 @@ def main() -> int:
             rows.append({"turn": turn, "conv": _label(c), "prompt_tokens": n,
                          "wall_s": round(wall, 2), "ttft_s": round(ttft, 2),
                          "compiles": compiles, **pool, **resident, **d})
+            # compiles is this turn's own delta; -1 means unknown (no --server-log).
+            # A turn that compiled, or whose compile status is unknown, is not a record:
+            # warm.compiles=0 is an assertion, and absent is unmeasured, not 0.
+            if compiles == 0:
+                rec = {
+                    "metric": "chat_turn_wall_s", "value": round(wall, 3), "unit": "s",
+                    "shape": {"turn": turn, "prompt_tokens": n,
+                              "sessions": args.sessions, "conv": _label(c)},
+                    "warm": {"state": "warm", "compiles": 0},
+                    "n": 1, "spread": 0.0, **benchrec.record_common(args),
+                }
+                rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=True)
+                print(f"  record {benchrec.append(rec)} appended", flush=True)
+            else:
+                n_skipped += 1
             pct = 100.0 * pool["pool_used_blocks"] / max(1, pool["blocks_total"])
             # depth, not just hits: the count says a match happened, this says how much of the
             # prompt it spared. 512 of 30826 reports a hit and re-prefills 98% (2026-09-08).
@@ -297,6 +320,9 @@ def main() -> int:
     verdict = "unknown (no --server-log, or it is empty -- run serve under python3 -u)" \
         if not known else dirty or "clean"
     print(f"compiles: {verdict}", flush=True)
+    if n_skipped:
+        print(f"records skipped: {n_skipped} turns compiled or had unknown compile status "
+              f"(pass --server-log under python3 -u to make them records)", flush=True)
     peak = max((r["pool_used_blocks"] for r in rows), default=0)
     tot = max((r["blocks_total"] for r in rows), default=0)
     print(f"pool peak: {peak}/{tot} blocks ({100.0 * peak / max(1, tot):.1f}%)", flush=True)
