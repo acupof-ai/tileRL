@@ -27,6 +27,12 @@ guaranteed. Whether a run pre-warms its engine is decided by the **tree's
 history**, not by any recorded config field — the manifests differ only in
 `eval_before_cache.cache_hit`.
 
+Worse: with one-run-one-worktree and the worktree cap, trees are constantly
+created and deleted, so **worktree age decides the training trajectory** —
+new tree → miss → pre-warmed engine; old tree → hit → clean engine. The
+trajectory depends on a pure ops variable that appears in no manifest, no log
+line, and no entry.
+
 For a day the divergence was attributed to the sha gap between the runs. The
 gap contains no training-computation change (every commit diffed: #324 is
 timing/logs only, #328/#329/#330/#334/#336 touch eval plumbing and rollout
@@ -48,7 +54,22 @@ collapse directly. This entry is about the cache, not the collapse verdict.
 
 ## Fix
 
-None shipped. Options, loudest first:
+None shipped. The first three options below are mitigation: they change the
+cache, but the cache is not the broken half. The cached value is legitimately
+reusable — the before-arm measures the *base* policy on a fixed problem set,
+which does not change with training code; keying on sha would only re-pay
+~1661 s per commit and would not fix same-sha reruns (the second run still
+hits, still starts clean, still diverges from the first).
+
+The broken half is that **training's start state depends on whether eval ran**.
+A correct implementation gives step 1 an engine independent of prior history:
+
+- **(a) Unconditional fixed warmup before training** — same shape and count,
+  cache hit or miss, so both paths converge to the same engine state.
+- **(b) Separate engine instances for eval and training** (or rebuild/reset
+  the engine between them). Priciest, cleanest semantics.
+
+Mitigations, if (a)/(b) are too expensive right now:
 
 1. Refuse to train on a cache hit when the sha differs from the one that paid
    it (record the paying sha in the cache file).
@@ -62,4 +83,5 @@ None shipped. Options, loudest first:
 A result cache without a code version lets two "same-config" runs experience
 different pre-states, and the log's only witness is one `cache hit` line. When
 two same-config runs diverge, check cache state — in every tree they ran in —
-before suspecting code.
+before suspecting code. And when a run's start state depends on cache state,
+it depends on worktree age: an ops variable recorded nowhere.
