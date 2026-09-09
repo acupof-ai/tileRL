@@ -55,30 +55,33 @@ from tilerl.prompt import render_chat, sampling
 from tilerl.spec import load_draft
 from tilerl.tokenizer import get_tokenizer
 
-_buckets = {"prefill": 0.0, "decode": 0.0, "draft": 0.0}
+_buckets = {"prefill_incl_draft": 0.0, "decode_incl_draft": 0.0, "draft": 0.0,
+            "draft_prefill": 0.0, "draft_decode": 0.0}
 _counts = {"prefill_ticks": 0, "decode_ticks": 0, "draft_calls": 0}
+_state = {"tick": None}
 
 _orig_run_forward = engine_mod.Engine._run_forward
 _orig_draft_step = None
 
 
 def _timed_run_forward(self, decodes, prefills, chunks):
+    _state["tick"] = "prefill" if prefills else "decode"
     t0 = time.perf_counter()
     r = _orig_run_forward(self, decodes, prefills, chunks)
     dt = time.perf_counter() - t0
-    if prefills:
-        _buckets["prefill"] += dt
-        _counts["prefill_ticks"] += 1
-    else:
-        _buckets["decode"] += dt
-        _counts["decode_ticks"] += 1
+    # draft.step runs INSIDE _run_forward (engine.py), so this span includes it;
+    # the draft wrap splits it out by tick type below.
+    _buckets[f"{_state['tick']}_incl_draft"] += dt
+    _counts[f"{_state['tick']}_ticks"] += 1
     return r
 
 
 def _timed_draft_step(orig, rows):
     t0 = time.perf_counter()
     r = orig(rows)  # orig is the bound draft.step
-    _buckets["draft"] += time.perf_counter() - t0
+    dt = time.perf_counter() - t0
+    _buckets["draft"] += dt
+    _buckets[f"draft_{_state['tick']}"] += dt
     _counts["draft_calls"] += 1
     return r
 
@@ -131,8 +134,9 @@ def main() -> None:
         global _orig_draft_step
         _orig_draft_step = draft.step
         draft.step = lambda rows: _timed_draft_step(_orig_draft_step, rows)
-        if hasattr(engine, "_draft_ms"):
-            engine._draft_ms = []  # HEAD: enable the engine's own event timing as a cross-check
+        # NB: do NOT enable engine._draft_ms here — its event sync per draft step
+        # perturbed the spec arm +40% wall (128 -> 179 s). The host-span wrap
+        # above is sync-free; the .tolist() drain in draft.step charges the GPU.
 
     detok_t = 0.0
     dec_orig = tok.decode
@@ -153,9 +157,14 @@ def main() -> None:
     wall = time.perf_counter() - t0
 
     n = args.n
-    prefill_s = _buckets["prefill"]
-    decode_s = _buckets["decode"]
+    prefill_incl = _buckets["prefill_incl_draft"]
+    decode_incl = _buckets["decode_incl_draft"]
     draft_s = _buckets["draft"]
+    draft_pf = _buckets["draft_prefill"]
+    draft_dec = _buckets["draft_decode"]
+    # draft.step runs inside _run_forward, so subtract it to get trunk-only spans.
+    prefill_s = prefill_incl - draft_pf
+    decode_s = decode_incl - draft_dec
     stats = engine.stats()
     dec_fwds = stats["decode_forwards"]
     pre_fwds = stats["prefill_forwards"]
@@ -164,24 +173,23 @@ def main() -> None:
     spec_drafted = stats.get("spec_drafted")
 
     # Reading 2 vs 1: the buckets must close to wall.
-    closure = (prefill_s + decode_s + draft_s + encode_t + detok_t) / wall
-    # decode per tick is itself the direct W=8 tick measurement (host span of
-    # _run_forward on decode ticks); the 43.52/41.96 constants were voided with
-    # the contaminated 09657c0 tree and must be re-measured before reuse.
+    closure = (prefill_s + draft_s + decode_s + encode_t + detok_t) / wall
+    # decode per tick is the trunk-only W=8 tick (draft subtracted); the
+    # 43.52/41.96 constants were voided with the contaminated 09657c0 tree.
     dec_per_fwd = (decode_s / _counts["decode_ticks"]) if _counts["decode_ticks"] else 0.0
 
-    # HEAD-only cross-check: the engine's own hooks vs the wraps.
+    # HEAD-only cross-check: the engine's own _prefill_secs (excludes draft by
+    # construction) vs the wrap's prefill_excl_draft.
     engine_prefill = getattr(engine, "_prefill_secs", None)
-    engine_draft = (sum(ms for _, ms in engine._draft_ms) / 1000.0
-                    if getattr(engine, "_draft_ms", None) else None)
 
     report = {
         "provenance": {"git_commit": sha, "git_dirty": dirty},
         "wall": wall,
+        "tok_s": (tok_gen / wall) if wall else 0.0,
         "buckets": {
-            "prefill_host": prefill_s,
-            "draft_host": draft_s,
-            "decode_host": decode_s,
+            "prefill_excl_draft": prefill_s,
+            "draft": draft_s,
+            "decode_excl_draft": decode_s,
             "encode": encode_t,
             "detok": detok_t,
         },
@@ -195,32 +203,26 @@ def main() -> None:
         "spec_accepted": spec_acc,
         "spec_drafted": spec_drafted,
         "spec_accept_rate": (spec_acc / spec_drafted) if spec_drafted else None,
-        "engine_hooks_cross_check": {
-            "prefill_secs": engine_prefill,
-            "draft_ms": engine_draft,
-            "prefill_wrap_minus_engine": prefill_s - engine_prefill if engine_prefill is not None else None,
-            "draft_wrap_minus_engine": draft_s - engine_draft if engine_draft is not None else None,
-        },
+        "engine_prefill_secs_cross_check": engine_prefill,
         "per_question": {
             "prefill": prefill_s / n,
             "draft": draft_s / n,
             "decode": decode_s / n,
         },
     }
-    print(f"wall {wall:.1f}s  prefill {prefill_s:.1f}s  draft {draft_s:.1f}s  "
-          f"decode {decode_s:.1f}s  enc {encode_t:.3f}s  detok {detok_t:.3f}s")
+    print(f"wall {wall:.1f}s  tok/s {report['tok_s']:.1f}  prefill {prefill_s:.1f}s  "
+          f"draft {draft_s:.1f}s  decode {decode_s:.1f}s  enc {encode_t:.3f}s  detok {detok_t:.3f}s")
     print(f"closure {closure:.4f} (reading 2 vs 1; must be ~1.000, within 5%)")
     print(f"prefill_ticks {_counts['prefill_ticks']} (fwds {pre_fwds})  "
           f"decode_ticks {_counts['decode_ticks']} (fwds {dec_fwds})  "
-          f"draft_calls {_counts['draft_calls']}")
-    print(f"decode {dec_per_fwd*1000:.2f} ms/tick  (direct W=8 tick; the 43.52/41.96 "
+          f"draft_calls {_counts['draft_calls']}  (draft_pf {draft_pf:.1f}s  draft_dec {draft_dec:.1f}s)")
+    print(f"decode {dec_per_fwd*1000:.2f} ms/tick  (trunk-only W=8 tick; the 43.52/41.96 "
           f"constants were voided with the contaminated 09657c0 tree)")
     print(f"tokens_generated {tok_gen}  tok/decode_fwd {report['tok_per_decode_fwd']:.2f}  "
           f"spec_accepted {spec_acc}  spec_drafted {spec_drafted}  "
           f"accept_rate {report['spec_accept_rate']}")
     if engine_prefill is not None:
-        print(f"engine hooks: prefill_secs {engine_prefill:.1f}s (wrap {prefill_s:.1f})  "
-              f"draft_ms {engine_draft:.1f}s (wrap {draft_s:.1f})")
+        print(f"engine _prefill_secs {engine_prefill:.1f}s (wrap prefill_excl_draft {prefill_s:.1f}s)")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "prefill_profile.json").write_text(json.dumps(report, indent=2))
