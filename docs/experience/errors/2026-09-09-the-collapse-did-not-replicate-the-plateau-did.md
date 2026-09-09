@@ -151,3 +151,10 @@ earns the default flip.
 - **A retained score belongs to the n=500 anchor, not the curve subset.**
   Small subsets run ±1.6 pt off the full score; reading the retained score
   off the curve would over-credit the cheap configuration.
+
+## See also
+
+[The step-75 dip hit problems a second seed solved at the same step](2026-09-09-the-dip-hit-problems-a-healthy-seed-solves.md)
+— the dip's mechanism (72 of seed 0's 88 step-75 wrongs are solved by seed 1)
+and the hypergeometric overlap instrument, deferred for a dip that
+reproduces. This entry is what the plateau buys; that one is what the dip was.
