@@ -93,6 +93,11 @@ so there is nothing to cancel, rather than arguing with boolean coercion.
 `group` is a string field; expression interpolation into a string is its
 normal semantics.
 
+One run (`5766bedf`, #384) survived three subsequent pushes and completed,
+while the runs before and after it were cancelled. All four commits carried
+the same workflow file. This inconsistency is unexplained — the per-SHA group
+fix bypasses it by eliminating intra-group competition, not by solving it.
+
 ## Rule
 
 A reading that returns "0 / empty / doesn't exist" must pass a positive
