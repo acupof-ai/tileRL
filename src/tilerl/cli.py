@@ -1670,8 +1670,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--draft", help="MTP/NextN head safetensors: speculative decode. For "
-                                        "Qwen3.8-27B-NVFP4 the mtp.* keys all live in "
-                                        "model-00018-of-00018.safetensors, so pass that shard.")
+                                        "Qwen3.8-27B-NVFP4 the mtp.* keys live in "
+                                        "model_mtp.safetensors, so pass that file.")
     p_serve.add_argument("--depth", type=int, default=3,
                          help="drafts per row per tick; 3 fills the sm70 verify ladder's "
                               "4-row rung exactly (spec.LADDER_WIDTHS) — 4 spills to the "
