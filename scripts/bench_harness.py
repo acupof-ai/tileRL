@@ -300,7 +300,8 @@ def suite_prefill(gate, cfg, model, backend, lengths, build, model_name, device)
             "shape": {"ctx": length},
             "warm": {"state": "warm", "compiles": 0},
             "n": 3, "spread": round(spread, 4),
-            "device": device, "sha": _git_commit(), "cmd": " ".join(sys.argv),
+            "device": device, "commit": benchrec.git_commit(), "dirty": benchrec.git_dirty(),
+            "cmd": " ".join(sys.argv),
             "floor": floor,
         })
 
@@ -548,6 +549,9 @@ def _free(backend) -> None:
 
 
 def suite_train(gate, backend, source, full=False):
+    import types
+
+    import benchrec
     import numpy as np
 
     from tilerl.autograd import Adafactor, AdamW
@@ -609,6 +613,23 @@ def suite_train(gate, backend, source, full=False):
             torch.cuda.reset_peak_memory_stats()
         print(f"  {f'{b}x{t}':>10} {ms:>10.2f} {tok_s:>12.1f}{peak}  +-{100 * spread:.1f}%")
         gate.check("train", f"{model_name}-b{b}t{t}", tok_s, spread=spread)
+        # Ruler record. Training engines never capture a graph or draft, so
+        # build is "eager" by construction; the warmup step above covers JIT +
+        # tape shapes, so compiles=0 in the timed window is an assertion.
+        vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        ns = types.SimpleNamespace(
+            build="eager", target=backend.arch, device_name="",
+            card=int(vis.split(",")[0]) if vis and backend.device.type == "cuda" else None,
+            model_name=model_name)
+        rec = {
+            "metric": "train_step_tok_s", "value": round(tok_s, 1), "unit": "tok/s",
+            "shape": {"batch": b, "ctx": t},
+            "warm": {"state": "warm", "compiles": 0},
+            "n": 3, "spread": round(spread, 4),
+            **benchrec.record_common(ns),
+        }
+        rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=False)
+        benchrec.append(rec)
 
 
 def main() -> int:

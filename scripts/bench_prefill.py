@@ -9,19 +9,25 @@ Times the submit-to-first-token span with a cold prefix cache, which is prefill
 plus one decode tick. Reports ms per prompt token so contexts are comparable.
 
   scripts/v100.sh run pp 'CKPT=...; /usr/bin/python3 -u scripts/bench_prefill.py \
-      --source $CKPT'
+      --source $CKPT --card 0'
+
+Emits one prefill_tok_s record per context to docs/experience/bench/measurements.jsonl
+(schema: docs/bench-schema.md). Build is derived (fused projections, no graph).
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import statistics
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import benchrec  # noqa: E402
 import torch
 from tilerl_kernels.backend import get_backend
 
@@ -36,6 +42,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True)
     ap.add_argument("--reps", type=int, default=2)
+    benchrec.add_record_args(ap, default_target="sm70", default_device=None)
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
     cli._QWEN38_SOURCE = args.source
@@ -47,7 +54,7 @@ def main() -> None:
 
     print(f"# prefill to first token, {'ctx':>6} {'ms':>9} {'ms/tok':>8} {'ticks':>6}")
     for ctx in CTXS:
-        best = None
+        ms_list = []
         for rep in range(args.reps + 1):
             # Distinct tokens per rep: the prefix cache would serve a repeat from
             # HBM and time a lookup instead of a prefill.
@@ -68,9 +75,18 @@ def main() -> None:
             while e.poll().get(rid) is None:  # drain so the slot frees
                 e.step()
             if rep:  # rep 0 is JIT + graph capture
-                best = (ms, ticks) if best is None or ms < best[0] else best
-        ms, ticks = best
+                ms_list.append(ms)
+        ms = min(ms_list)
         print(f"{'':>24} {ctx:>6} {ms:>9.0f} {ms / ctx:>8.2f} {ticks:>6}")
+        rec = {
+            "metric": "prefill_tok_s", "value": round(ctx / ms * 1000, 1), "unit": "tok/s",
+            "shape": {"ctx": ctx}, "warm": {"state": "warm", "compiles": 0},
+            "n": args.reps,
+            "spread": round((max(ms_list) - min(ms_list)) / statistics.median(ms_list), 4),
+            **benchrec.record_common(args, build="fused"),
+        }
+        rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=False)
+        print(f"  record {benchrec.append(rec)} appended", flush=True)
 
 
 if __name__ == "__main__":

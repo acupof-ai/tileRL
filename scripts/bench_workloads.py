@@ -21,8 +21,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import benchrec  # noqa: E402
 
 MODEL = "qwen38-27b"
 FILLER = "The quick brown fox jumps over the lazy dog. "
@@ -135,6 +141,7 @@ def main() -> None:
     ap.add_argument("--hi", type=int, default=288)
     ap.add_argument("--url", default="http://localhost:8000")
     ap.add_argument("--only", help="run one workload by name")
+    benchrec.add_record_args(ap)
     args = ap.parse_args()
 
     rows = []
@@ -192,8 +199,17 @@ def main() -> None:
     if not rows:
         raise SystemExit(f"no workload named {args.only!r}")
     print(f"\n{'workload':<10} {'prompt_tok':>10} {'tok/s':>8} {'tok/fwd':>8}")
+    common = benchrec.record_common(args)
     for name, pt, rate, per_fwd in rows:
         print(f"{name:<10} {pt:>10} {rate:>8.1f} {per_fwd:>8.2f}")
+        rec = {
+            "metric": "decode_tok_s", "value": round(rate, 1), "unit": "tok/s",
+            "shape": {"batch": 1, "ctx": pt, "workload": name},
+            "warm": {"state": "warm", "compiles": 0},
+            "n": 1, "spread": 0.0, **common,
+        }
+        rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=False)
+        print(f"  record {benchrec.append(rec)} appended", flush=True)
     print("tok/fwd: 1.00 = no speculation, ceiling 1 + spec_depth.")
 
 

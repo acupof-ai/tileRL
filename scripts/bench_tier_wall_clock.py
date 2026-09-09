@@ -42,6 +42,7 @@ import urllib.request
 import numpy as np
 
 sys.path.insert(0, "scripts")
+import benchrec  # noqa: E402
 from bench_chat_interleaved import _fillers  # noqa: E402
 
 PORT = 8129
@@ -148,6 +149,23 @@ def run_arm(args, arm: str, spill: str, log: str) -> list[dict]:
                     }
                     rows.append(row)
                     print(json.dumps(row, sort_keys=True), flush=True)
+                    # The jitwarm arm exists to absorb compiles, not to be measured.
+                    # row compiles are arm-cumulative, so once an arm compiled every
+                    # later cell is suspect too: those walls are not records.
+                    if arm != "jitwarm" and row["compiles"] == 0:
+                        rec = {
+                            "metric": "chat_turn_wall_s", "value": row["wall_s"], "unit": "s",
+                            "shape": {"turn": row["turn"], "prompt_tokens": row["prompt_tokens"],
+                                      "arm": row["arm"], "sessions": row["sessions"],
+                                      "conv": row["conv"]},
+                            "warm": {"state": "warm", "compiles": 0},
+                            "n": 1, "spread": 0.0, **benchrec.record_common(args),
+                        }
+                        rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=True)
+                        print(f"  record {benchrec.append(rec)} appended", flush=True)
+                    elif arm != "jitwarm":
+                        print(f"  record skipped: arm {arm} compiled during measurement",
+                              flush=True)
     finally:
         proc.send_signal(signal.SIGTERM)
         try:
@@ -176,6 +194,7 @@ def main() -> int:
     ap.add_argument("--spill", default=SPILL)
     ap.add_argument("--skip-warmup", action="store_true")
     ap.add_argument("--out", default="/work/tier_wall.json")
+    benchrec.add_record_args(ap)
     a = ap.parse_args()
     a.sessions = [int(x) for x in a.sessions.split(",") if x.strip()]
 

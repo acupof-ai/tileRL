@@ -26,8 +26,14 @@ POD_NAME="${POD_NAME:-sglang-test}"
 # the pod is not a git repo: stamp HEAD so bench rows carry provenance. Write only when
 # git succeeded: `git ... > stamp || true` truncates the file before git runs, so a
 # failure left it empty and bench_harness read empty as a blank commit, not "unknown".
-if sha=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null); then
+if sha=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null); then
   printf '%s\n' "$sha" > "$ROOT/.synced_commit"
+  # stamped from the same tree state the sha names; the marker is gitignored
+  if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+    printf '1\n' > "$ROOT/.synced_dirty"
+  else
+    rm -f "$ROOT/.synced_dirty"
+  fi
 fi
 
 # ONE prelude for both entry points. It used to live inside the `run` branch only, so a

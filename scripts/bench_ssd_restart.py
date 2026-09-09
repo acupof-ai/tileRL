@@ -56,9 +56,14 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import benchrec  # noqa: E402
 
 #: Turn 2's extra text. Short on purpose: it must extend the prompt past turn 1 (so the
 #: stored entry is a strict prefix and therefore servable) without adding enough tokens to
@@ -475,6 +480,7 @@ def main() -> None:
                          "bytes/bandwidth check uses it. Default is this pod's, from "
                          "scripts/bench_ssd_bandwidth.py one_entry (182.6 MiB/s cold, "
                          "4477.8 warm -- 24x apart, which is why the check works)")
+    benchrec.add_record_args(ap)
     args = ap.parse_args()
 
     # A decode-boundary publish needs a chain end landing on a 16-multiple, so below
@@ -678,6 +684,38 @@ def main() -> None:
             f"{tail_s:.3f} s of tail prefill. Both are real; they answer different questions."
         )
     print(json.dumps(verdict, indent=2), flush=True)
+    if "INVALID" not in verdict:
+        # The compiles gate above makes warm.compiles=0 an assertion here: any
+        # compile in a measured arm already made this verdict INVALID.
+        common = benchrec.record_common(args)
+        for arm, val in (
+            ("faulted-vs-control", verdict["speedup_faulted_over_control"]),
+            ("faulted-vs-cold", verdict["speedup_faulted_over_cold"]),
+        ):
+            rec = {
+                "metric": "ssd_restart_speedup", "value": val, "unit": "ratio",
+                "shape": {"prompt_tokens": faulted["prompt_tokens"], "arm": arm},
+                "warm": {"state": "warm", "compiles": 0},
+                "n": 1, "spread": 0.0, **common,
+            }
+            rec["floor"] = {
+                "value": 1.0, "unit": "ratio", "kind": "baseline",
+                "derivation": "1.0 = the tier adds nothing over the empty-tier arm",
+            }
+            print(f"record {benchrec.append(rec)} appended ({arm})", flush=True)
+        if verdict["composed_speedup"] is not None:
+            rec = {
+                "metric": "ssd_restart_speedup", "value": verdict["composed_speedup"],
+                "unit": "ratio",
+                "shape": {"prompt_tokens": faulted["prompt_tokens"], "arm": "reboot-evicted"},
+                "warm": {"state": "warm", "compiles": 0},
+                "n": 1, "spread": 0.0, **common,
+            }
+            rec["floor"] = {
+                "value": 1.0, "unit": "ratio", "kind": "baseline",
+                "derivation": "1.0 = the tier adds nothing over the empty-tier arm",
+            }
+            print(f"record {benchrec.append(rec)} appended (reboot-evicted)", flush=True)
     # Exit nonzero on INVALID. Printing it and returning 0 makes a bench that measured
     # nothing indistinguishable from one that passed, to a launcher that reads rc.
     if "INVALID" in verdict:

@@ -23,7 +23,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import benchrec  # noqa: E402
 import torch
 from tilerl_kernels.backend import get_backend
 
@@ -246,6 +248,7 @@ def main() -> None:
                          "--max-ctx 1024 costs 236 MB more pool than 512 and stalled the "
                          "ctx=512 step that reads 88.5 tok/s on its own. Pair the two to "
                          "measure ONE context at its own pool size")
+    benchrec.add_record_args(ap, default_target="sm70", default_device=None)
     args = ap.parse_args()
     os.environ.setdefault("TILERL_TARGET", "cuda")
     # cli binds _QWEN38_SOURCE from the env at import, which already happened.
@@ -307,6 +310,8 @@ def main() -> None:
     label = f"spec d{args.depth}" if draft else "dense"
     w = 1 + args.depth if draft else 1
     rows = args.batch * w
+    build = "fused+graph+draft" if draft else "fused+graph"
+    common = benchrec.record_common(args, build=build)
     print(f"\n{label} B={args.batch} ({rows} rows/tick), {args.repeats} timed draws/point: "
           f"{'ctx':>6} {'tok/s':>8} {'ms/tok':>8} {'tok/fwd':>8} {'s_tps':>7} {'s_tpf':>7}")
     for ctx in ctxs:
@@ -314,6 +319,38 @@ def main() -> None:
             e, ctx, args.tokens, args.batch, cfg.vocab_size, args.repeats)
         print(f"{ctx:>6} {tps:>8.1f} {1000 / tps:>8.1f} {per_fwd:>8.2f} "
               f"{s_tps:>6.1%} {s_pf:>6.1%}{flag}")
+        if flag:
+            print(f"  ctx={ctx}: UNWARMED — not recorded (a compile landed in the window)",
+                  flush=True)
+            continue
+        metric = "decode_agg_tok_s" if args.batch > 1 else "decode_tok_s"
+        rec = {
+            "metric": metric, "value": round(tps, 1), "unit": "tok/s",
+            "shape": {"batch": args.batch, "ctx": ctx},
+            "warm": {"state": "warm", "compiles": 0},
+            "n": max(2, args.repeats), "spread": round(s_tps, 4), **common,
+        }
+        rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=False)
+        print(f"  record {benchrec.append(rec)} appended", flush=True)
+        if draft:
+            dense_rec = {**rec, "build": "fused+graph"}
+            dense_best, dense_id = benchrec.measured_best(dense_rec, lower_is_better=False)
+            if dense_id is None:
+                print(f"  spec_goodput_ratio skipped: no dense {metric} row for this "
+                      f"population yet", flush=True)
+            else:
+                srec = {
+                    "metric": "spec_goodput_ratio", "value": round(tps / dense_best, 3),
+                    "unit": "ratio", "shape": {"batch": args.batch, "depth": args.depth},
+                    "warm": {"state": "warm", "compiles": 0},
+                    "n": 1, "spread": 0.0, **common,
+                }
+                srec["floor"] = {
+                    "value": 1.0, "unit": "ratio", "kind": "baseline",
+                    "derivation": f"1.0 = spec matches dense ({dense_best:.1f} tok/s, "
+                                  f"row {dense_id}); below is a loss",
+                }
+                print(f"  record {benchrec.append(srec)} appended", flush=True)
 
 
 def _self_check() -> None:

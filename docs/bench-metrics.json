@@ -60,6 +60,11 @@
       "unit": "ppl", "direction": "-", "weight": 0.0,
       "shape": ["n"],
       "why": "quality signal beside mmlu_pct"
+    },
+    "request_overhead_ms": {
+      "unit": "ms", "direction": "-", "weight": 0.0,
+      "shape": ["route"],
+      "why": "per-request HTTP+render+parse over a canned engine; not the agent-turn wall clock (that is chat_turn_wall_s), so weight 0 until it is shown to move the turn"
     }
   }
 }

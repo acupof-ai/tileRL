@@ -4,18 +4,25 @@ The engine is canned, so this measures the HTTP+render+parse path only -- which
 is exactly what tranche (b) changed. A real number needs the V100 (pending-remote).
 
     TILERL_TARGET=cpu uv run python3 scripts/bench_api_routes.py
+
+Emits one request_overhead_ms record per route to
+docs/experience/bench/measurements.jsonl (schema: docs/bench-schema.md).
 """
 
 from __future__ import annotations
 
+import argparse
 import socket
 import statistics
 import sys
 import threading
 import time
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path[:0] = ["src", "packages/tilerl-kernels/src", "tests"]
 
+import benchrec  # noqa: E402
 import uvicorn  # noqa: E402
 from test_server import _ByteTokenizer, _ScriptedEngine  # noqa: E402
 
@@ -54,7 +61,7 @@ def _serve():
     raise RuntimeError("uvicorn did not start")
 
 
-def timed(label: str, fn) -> None:
+def timed(label: str, fn, common: dict) -> None:
     fn()  # warm the connection and the route's first-call imports
     ms = []
     for _ in range(N):
@@ -64,9 +71,24 @@ def timed(label: str, fn) -> None:
     ms.sort()
     print(f"{label:<34} median {statistics.median(ms):6.2f} ms   "
           f"p90 {ms[int(0.9 * len(ms))]:6.2f}   min {ms[0]:6.2f}")
+    rec = {
+        "metric": "request_overhead_ms", "value": round(statistics.median(ms), 2),
+        "unit": "ms", "shape": {"route": label},
+        "warm": {"state": "warm", "compiles": 0},
+        "n": N, "spread": round((ms[-1] - ms[0]) / statistics.median(ms), 4),
+        **common,
+    }
+    rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=True)
+    print(f"  record {benchrec.append(rec)} appended", flush=True)
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser()
+    benchrec.add_record_args(ap, default_target="cpu", default_device="cpu")
+    args = ap.parse_args()
+    args.model_name = "scripted"
+    common = benchrec.record_common(args, build="eager")
+
     import anthropic
     import openai
 
@@ -78,26 +100,26 @@ def main() -> int:
 
     print(f"n={N} per row, canned engine (no weights): HTTP + render + parse only\n")
     timed("chat non-stream", lambda: oa.chat.completions.create(
-        model="tilerl", messages=msg, extra_body=think))
+        model="tilerl", messages=msg, extra_body=think), common)
     timed("chat non-stream + tools", lambda: oa.chat.completions.create(
         model="tilerl", messages=[{"role": "user", "content": "run ls"}],
-        tools=TOOLS, extra_body=think))
+        tools=TOOLS, extra_body=think), common)
     timed("chat stream (drain)", lambda: [
         c for c in oa.chat.completions.create(
-            model="tilerl", messages=msg, stream=True, extra_body=think)])
+            model="tilerl", messages=msg, stream=True, extra_body=think)], common)
     timed("messages non-stream", lambda: an.messages.create(
-        model="tilerl", max_tokens=64, messages=msg))
+        model="tilerl", max_tokens=64, messages=msg), common)
     timed("messages non-stream + thinking", lambda: an.messages.create(
         model="tilerl", max_tokens=64, messages=msg,
-        thinking={"type": "enabled", "budget_tokens": 32}))
+        thinking={"type": "enabled", "budget_tokens": 32}), common)
     timed("messages stream (drain)", lambda: [
         e for e in an.messages.create(model="tilerl", max_tokens=64, messages=msg,
-                                      stream=True)])
+                                      stream=True)], common)
     timed("responses non-stream", lambda: oa.responses.create(
-        model="tilerl", input="hi", extra_body=think))
+        model="tilerl", input="hi", extra_body=think), common)
     timed("responses stream (drain)", lambda: [
         e for e in oa.responses.create(model="tilerl", input="hi", stream=True,
-                                       extra_body=think)])
+                                       extra_body=think)], common)
     srv.should_exit = True
     return 0
 

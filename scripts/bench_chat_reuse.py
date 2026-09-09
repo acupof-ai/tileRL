@@ -45,20 +45,6 @@ def _get(url: str, timeout: float = 10.0) -> dict:
         return json.loads(r.read())
 
 
-def _measured_best(metric: str, shape: dict, lower_is_better: bool) -> tuple[float, str]:
-    """Best accepted row for this population so far; the row itself on first sight."""
-    cur = benchrec.current(benchrec.load_all())
-    best, best_id = None, None
-    for k, r in cur.items():
-        if k[0] != metric or tuple(sorted(r["shape"].items())) != tuple(sorted(shape.items())):
-            continue
-        if best is None or (lower_is_better and r["value"] < best) or (
-            not lower_is_better and r["value"] > best
-        ):
-            best, best_id = r["value"], r["id"]
-    return best, best_id
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://localhost:8000")
@@ -75,7 +61,7 @@ def main() -> int:
 
     common = {"target": args.target, "build": args.build, "model": args.model_name,
               "device": {"name": args.device_name, "card": args.card},
-              "sha": benchrec.git_sha(), "cmd": " ".join(sys.argv)}
+              "commit": benchrec.git_commit(), "dirty": benchrec.git_dirty(), "cmd": " ".join(sys.argv)}
     msgs: list[dict] = []
     for turn in range(args.turns):
         msgs.append({"role": "user", "content": _FILLER * args.grow * (turn + 1)})
@@ -98,17 +84,13 @@ def main() -> int:
               f"prefills={after['prefill_forwards'] - before['prefill_forwards']}", flush=True)
 
         shape = {"turn": turn, "prompt_tokens": pt}
-        best, best_id = _measured_best("chat_turn_wall_s", shape, lower_is_better=True)
-        floor_v = min(best, wall) if best is not None else wall
-        deriv = (f"min accepted wall for this population (row {best_id})" if best_id
-                 else "first accepted row for this population; floor = this measurement")
-        rid = benchrec.append({
+        rec = {
             "metric": "chat_turn_wall_s", "value": round(wall, 3), "unit": "s",
             "shape": shape, "warm": {"state": "warm", "compiles": 0},
-            "n": 1, "spread": 0.0,
-            "floor": {"value": round(floor_v, 3), "unit": "s", "kind": "measured-best", "derivation": deriv},
-            **common,
-        })
+            "n": 1, "spread": 0.0, **common,
+        }
+        rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=True)
+        rid = benchrec.append(rec)
         if hits > 0:
             benchrec.append({
                 "metric": "prefix_hits", "value": hits, "unit": "hits",
