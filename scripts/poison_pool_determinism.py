@@ -21,11 +21,11 @@ os.environ.setdefault("TILERL_QWEN38_SOURCE", "/work/Qwen3.8-27B-NVFP4")
 sys.path.insert(0, "/work/tilerl-s-probestats/src")
 
 import torch
+from tilerl_kernels.backend import get_backend
 
 from tilerl.cli import _build_model
 from tilerl.engine import build_engine
 from tilerl.kv_cache import BLOCK_TOKENS, BatchKv, NoPrefixStore
-from tilerl_kernels.backend import get_backend
 
 dev = "cuda"
 backend = get_backend()

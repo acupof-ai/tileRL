@@ -51,7 +51,10 @@ intermediates reuse the freed block (within-capture free+reuse is 1.0000;
 cross-capture reuse is 0.0000, per `scripts/pool_reuse_probe.py`) — and
 compares replay logits: 0/8 diff, max abs 0.000e+00. The forward reads no
 uninitialized pool memory. The cross-process source is unlocated; it is not a
-read-before-write in the decode forward.
+read-before-write in the decode forward. Investigation is stopped here — the
+candidate mechanisms are exhausted (forward kernels bitwise deterministic,
+in-process capture deterministic, uninitialized pool read ruled out) and
+`--deterministic` is a working workaround.
 
 The collapse is not explained by this. The graph is the proven source of
 trajectory divergence (on → 16/24, off → 0/24), but the mechanism is
