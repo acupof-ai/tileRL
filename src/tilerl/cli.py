@@ -1006,7 +1006,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
                                     sampling=params, seed=args.seed,
                                     trainable=trainable, micro=args.micro,
                                     tiebreak=tiebreak, recapture_graph=True,
-                                    per_rollout=rollouts)):
+                                    per_rollout=rollouts, decode=tok.decode)):
             hist.append((r, ce, secs, tied, ntok))
             train_secs += secs
             written = _write_rollout_rows(manifest["id"], rollouts, written)

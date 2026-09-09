@@ -130,6 +130,15 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
     assert isinstance(m["metrics"]["gsm8k_after"], int)
     assert m["metrics"]["mmlu_before"] is None and m["inputs"]["source"] == "tiny"
 
+    # Completion text is the only record of what the policy wrote: run 86a06dc8c420 saved
+    # tokens/reward only, so its step-75 collapse can never be replayed.
+    rollout_rows = [
+        json.loads(line)
+        for line in (tmp_path / "runs" / m["id"] / "rollouts.jsonl").read_text().splitlines()
+    ]
+    assert len(rollout_rows) == 4
+    assert all(row["text"].strip() for row in rollout_rows), rollout_rows
+
     capsys.readouterr()
     assert _train(argv + ["--json"]) == code
     again = json.loads(capsys.readouterr().out)
