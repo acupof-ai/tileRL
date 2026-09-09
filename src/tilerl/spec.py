@@ -278,6 +278,11 @@ if __name__ == "__main__":  # runnable check
           f"break-even retention {1 / b4_ceiling:.1%}")
 
 
+# Chain MTP head. It loses to the block drafter on GPU-bound serving builds
+# (H20 d1-d3: 0.986x/0.863x/0.572x, wins/2026-09-09-spec-decode-h20-b1-loses-on-the-serving-build.md)
+# but wins 1.76-1.82x on the eager build, where a ~56 ms/tick fixed host cost
+# dominates and the chain amortizes it. sm70 is host-bound the same way; do not
+# delete without sm70 numbers showing it loses there too.
 class DraftHead:
     """NextN / DSpark draft head: ``fc([norm(embed(t)), norm(h_trunk)])`` into a
     short full-attention stack, read out through the trunk's lm_head. The layers
