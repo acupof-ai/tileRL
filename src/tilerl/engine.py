@@ -875,6 +875,9 @@ class Engine:
                 "waiting": len(self._waiting),
                 "running": len(self._running),
                 "finished": self._finished_count,
+                # Runtime state, not the build setting: a failed capture flips this off and
+                # /health reads stats(), so a silent eager fallback stays invisible without it.
+                "decode_graph": self._decode_graph_on,
                 "blocks_used": self._blocks_used,
                 "blocks_total": self.usable_blocks,
                 "pool_used_blocks": self._kv.used_blocks,

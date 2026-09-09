@@ -74,9 +74,26 @@ def test_decode_graph_matches_eager(spec):
             # the verify width require the wide one, not just the W=1 fallback.
             widths = {w for _, w in captured._decode_graphs}
             assert captured._decode_graph_on and widths, "decode graph capture fell back to eager"
+            assert captured.stats()["decode_graph"], "stats() must report the runtime state /health reads"
             assert not spec or max(widths) > 1, f"no verify-width graph captured: {widths}"
             return
     raise AssertionError("requests did not finish")
+
+
+@pytest.mark.skipif(torch.cuda.is_available(), reason="CPU is the target where capture always fails")
+def test_stats_reports_the_eager_fallback_after_a_capture_failure():
+    """A failed capture must flip stats()["decode_graph"] to False: /health reads
+    stats(), and a silent eager fallback cost 6x wall before anyone saw it
+    (errors/2026-09-09-graph-capture-fell-back-silently.md)."""
+    cfg, backend = tiny(), get_backend()
+    engine = build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=8,
+                          num_slots=1, decode_graph=True)
+    engine.submit([1, 2, 3], SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the warn is the loud part; keep the test run quiet
+        for _ in range(16):
+            engine.step()
+    assert engine.stats()["decode_graph"] is False
 
 
 def test_the_graphs_padding_row_is_not_taken_from_the_callers_capacity():
