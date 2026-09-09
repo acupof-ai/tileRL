@@ -219,14 +219,109 @@ bare question. This run's eval lengths are the first on the production path.
 
 ## Results
 
+**The headline: `steps_to_score` at X=91.0 is `(0, 5]`, so 5 steps against 100 is **≥17.4x** on
+training seconds — 119.0 s against 2066.7 s.** The project has measured `seconds_per_step` many
+times and this is the first measurement of the left factor. **It is a lower bound**: the crossing
+happened somewhere in (0, 5] and 5 is only the first point measured, so a finer grid can only
+raise it.
+
+That it is a bound and not an estimate is the load-bearing part. The same X on the same run read
+**≥3.85x** an hour earlier, from the coarse grid's step 25; the fine grid replaced 25 with 5 and
+the figure moved **4.5x** without any measurement being wrong. A crossing read off a grid is
+always an upper bound on the step and therefore a lower bound on the ratio.
+
+### The fine curve, `--eval-every 5` to step 20
+
+Its own run (`30f3186c48f8`, sha `bd72288`), so its base arm is re-measured rather than shared:
+
+| point | score | mean tok | at cap | train s | eval s |
+|---:|---:|---:|---:|---:|---:|
+| base | 87.6% (438/500) | 348.9 | 3 | — | — |
+| **step 5** | **94.2%** (471/500) | 250.2 | 5 | **119.0** | 1103.6 |
+| step 10 | 94.2% (471/500) | 261.3 | 8 | 217.9 | 1134.8 |
+| step 15 | **94.6%** (473/500) | 213.9 | 4 | 334.8 | 942.4 |
+| step 20 | 92.8% (464/500) | 203.7 | 6 | 459.4 | 924.6 |
+
+| pair | wrong→right | right→wrong | net | paired SE | σ |
+|---|---:|---:|---:|---:|---:|
+| base → 5 | 38 | 5 | **+6.60 pt** | 1.31 | **5.03** |
+| 5 → 10 | 5 | 5 | **+0.00 pt** | 0.63 | 0.00 |
+| 10 → 15 | 6 | 4 | +0.40 pt | 0.63 | 0.63 |
+| 15 → 20 | 8 | 17 | −1.80 pt | 1.00 | 1.80 |
+| base → 20 | 37 | 11 | +5.20 pt | 1.39 | 3.75 |
+
+**Steps 5 through 20 are one plateau.** Under the 2×SE rule (a new point counts as better only
+if it beats the incumbent by twice the paired SE) no adjacent pair is distinguishable: +0.00
+against 1.26, +0.40 against 1.26, −1.80 against 2.00. **The whole +6.60 pt arrives by step 5**,
+and steps 5-20 add nothing measurable.
+
+**s5 → s10 is net exactly zero on different problems** — 5 right→wrong and 5 wrong→right, 2.0%
+discordant. The same 471 count is not the same 471 problems. A score-only reader sees a flat line
+and concludes "nothing happened"; the rows say ten problems changed hands. Worth recording
+because it bounds what a repeated score can tell you: **equal scores are not evidence of equal
+policies**, and only the per-problem rows separate them.
+
+### Two axes, and they must not be folded together
+
+| step | score | train s | tok/correct |
+|---:|---:|---:|---:|
+| **5** | 94.2% | **119.0** | 265.6 |
+| 25 (coarse run) | 93.2% | 537.4 | **126.4** |
+
+Training is **4.5x cheaper** at step 5; inference is **2.1x more expensive**. `time_to_score` is
+defined on the score alone, so the headline takes step 5 and `tok/correct` is recorded beside it
+rather than folded in — a composite objective nobody defined is the thing that gets decomposed
+wrongly next time. Same form as reporting `held`/`dipped_at` next to `reached` instead of
+choosing between them. (`tilerl-27` set this split; the caveat that "cheapest wins on a tie" needs
+*other things equal*, and here they are not, is why the two tables are separate.)
+
+### The score and the length are two processes, separated in time
+
+| step | mean tok | at cap |
+|---:|---:|---:|
+| base | 348.9 | 3 |
+| 5 | 250.2 | 5 |
+| 10 | 261.3 | 8 |
+| 15 | 213.9 | 4 |
+| 20 | 203.7 | 6 |
+| 25 (coarse) | 117.8 | 0 |
+
+**The score is finished by step 5 and the length compression has barely started.** At step 5 the
+policy still answers at 250 tokens against the base's 349 (1.4x), and only by step 25 is it at
+117.8 (2.9x). `at_cap` tracks it: base 3, still 4-8 through step 20, and 0 at step 25 — the policy
+has not yet learned to be short enough to stop being truncated.
+
+So the two effects are **not two faces of one process**. An earlier draft of this entry called the
+length collapse "the main effect" of base→25 because both appeared in that one interval; the fine
+grid separates them. Score: steps 1-5. Length: steps 5-25.
+
+### The eval cost is linear in generated tokens
+
+| point | eval s | mean tok | s/tok |
+|---|---:|---:|---:|
+| coarse s25 | 614.3 | 117.8 | 5.21 |
+| coarse s50 | 741.4 | 153.1 | 4.84 |
+| coarse s75 | 639.3 | 122.8 | 5.21 |
+| coarse s100 | 753.6 | 150.7 | 5.00 |
+| fine s5 | 1103.6 | 250.2 | 4.41 |
+
+**1.18x spread across a 2.1x range of lengths**, so a curve point's cost is set by how long the
+policy answers, not by the row count. That inverts the intuition about which grid is cheap: the
+fine curve's points are the *most* expensive ones on the whole curve, because early-step policies
+answer longest. Its four points cost **68 min of eval against 7.7 min of training — 90%
+instrument**.
+
+### The coarse curve, `--eval-every 25` to step 100
+
 | point | score | net vs base | mean tok | tok/correct | cumulative train s | eval s |
 |---:|---:|---:|---:|---:|---:|---:|
 | base | 87.4% (437/500) | — | 346.5 | 396.5 | — | — |
 | step 25 | **93.2%** (466/500) | **+5.80 pt** | 117.8 | 126.4 | 537.4 | 614.3 |
 | step 50 | **93.4%** (467/500) | +6.00 pt | 153.1 | 164.0 | 1038.6 | 741.4 |
 | step 75 | **82.4%** (412/500) | **−5.00 pt** | 122.8 | 149.0 | 1555.7 | 639.3 |
+| step 100 | **91.2%** (456/500) | +3.80 pt | 151.4 | 165.3 | 2066.7 | 753.6 |
 
-All four arms score the same 500 problems, so every comparison below is paired (McNemar over
+All five arms score the same 500 problems, so every comparison is paired (McNemar over
 `eval-curve-<step>.jsonl`, which #323 puts on disk):
 
 | pair | wrong→right | right→wrong | discordant | net | paired SE | σ |
@@ -234,15 +329,71 @@ All four arms score the same 500 problems, so every comparison below is paired (
 | base → 25 | 40 | 11 | 10.2% | **+5.80 pt** | 1.43 | 4.06 |
 | 25 → 50 | 10 | 9 | 3.8% | **+0.20 pt** | 0.87 | 0.23 |
 | 50 → 75 | 7 | **62** | 13.8% | **−11.00 pt** | 1.66 | **6.62** |
-| base → 75 | 26 | 51 | 15.4% | **−5.00 pt** | 1.75 | 2.85 |
+| 75 → 100 | **56** | 12 | 13.6% | **+8.80 pt** | 1.65 | **5.34** |
+| 25 → 100 | 10 | 20 | 6.0% | −2.00 pt | 1.10 | 1.83 |
+| 50 → 100 | 13 | 24 | 7.4% | −2.20 pt | 1.22 | 1.81 |
+| base → 100 | 26 | 7 | 6.6% | **+3.80 pt** | 1.15 | 3.31 |
 
-**Saturation is at step 25, on the pre-registered criterion, and it is met exactly.** Adjacent
-points 25 and 50 differ by 0.20 pt — below the registered 1.00 pt — and both are ≥ 90.5. The
-paired SE for that pair is **0.87 pt**, *below* 1.00, so this is not the undecided band the
-step-25 discordance opened up: 3.8% discordance rather than 10.2%. The criterion decided
-cleanly on its own terms.
+**The anchor check passes.** Step 100 is 91.2%, inside the pre-registered [90.5, 96.7], so the
+first three points have a referent and none of the four candidate explanations is needed.
 
-**Then step 75 collapsed 11 points, and the training reward did not.** Per-step means:
+**Saturation is at step 25 and the criterion decided it cleanly.** Points 25 and 50 differ by
+0.20 pt against the registered 1.00 pt, both ≥ 90.5, and that pair's own paired SE is **0.87 pt**
+— *below* 1.00, at 3.8% discordance rather than the 10.2% of the base→25 pair. The criterion was
+not in its own undecided band.
+
+**But the score does not stay there, and the criterion had no way to say so.** Step 75 loses
+11.00 pt at 6.62σ, step 100 recovers 8.80 pt at 5.34σ, and 100 still sits 2.0–2.2 pt below
+25 and 50 (1.8σ each — individually inconclusive, jointly consistent with 25/50 being the peak).
+So step 75 is a **dip, not a permanent collapse**, and a run of 100 steps ends *worse* than one
+stopped at 50.
+
+**Two numbers, not one.**
+
+| quantity | value | meaning |
+|---|---|---|
+| crossing step at X=91.0 | **(0, 5]**, ≤119.0 s | when the target is first reached; **a lower bound on the ratio** — the coarse grid read (0, 25] and the fine grid moved it 4.5x |
+| **best step** | **anywhere in 5..50** — 94.2% / 94.2% / 94.6% / 93.2% / 93.4% at 119.0 / 217.9 / 334.8 / 537.4 / 1038.6 s | where a run should be stopped; no adjacent pair clears 2×SE, so **which is not decided** and the cheapest point on the plateau is step 5 |
+
+Stopping anywhere on the plateau instead of running all 100 is **2.0–17.4x less training time and
++1.6 to +3.4 pt better**. There is **no early stopping in this tree**, and no gate can see the
+difference: `reward_rises` reads windowed rollout reward, `gsm8k_improves` reads before against
+after, and nothing in the manifest reads a curve for monotonicity. That is worth more than the
+17.4x — 17.4x says less training saves time, this says more training damages the result while
+every gate reports normal.
+
+**Where the peak is, is undecided, and the reason was measured after the fact.** The fine-curve
+run re-ran the base arm in a fresh process — same weights, same 500 rows, same greedy parameters,
+`temperature=0.0` — and read **438/500 = 87.6%** against the coarse run's **437/500 = 87.4%**
+(174426 tokens against 173249, +0.68%). A greedy eval on identical inputs is supposed to be
+reproducible; it moved by **1 problem = 0.2 pt** across processes.
+
+Step 50 (467) beats step 25 (466) by **1 problem**, which is exactly that floor. The paired
+comparison already said so — net +0.20 pt at 0.23σ — but it read as "the two are equal and 50 is
+nominally higher", and 50 was reported as the best step on that nominal ordering. It should not
+have been:
+
+| candidate peak | cumulative train s | ratio vs full run |
+|---|---:|---:|
+| step 25 | 537.4 | 3.85x |
+| step 50 | 1038.6 | 1.99x |
+| **step 5** | **119.0** | **17.4x** |
+
+**The choice changes the headline by up to 8.7x**, and the data does not support making it — the
+fine grid put three more indistinguishable points on the plateau below 25. What *is* decided is
+unaffected: every point from 5 to 50 beats step 100 (456) by 8-17 problems, all of them clear the
+462 gate step 100 fails, and all are far outside the 0.2 pt floor. So **"stop before step 75"
+holds and "stop at 50" does not** — and by the tie-break rule (equal within resolution, take the
+cheaper) the plateau's cheapest point is **step 5 at 119.0 s**.
+
+This also bounds every other number here from below. The floor is ≥0.2 pt on a 500-row greedy
+eval across processes, so of the coarse curve's adjacent comparisons only 25→50 (+0.20 pt) sits at
+it; the others (+5.80, −11.00, +8.80) clear it by 29x, 55x and 44x, and on the fine curve
+base→5 (+6.60) clears it by 33x while 5→10, 10→15 and 15→20 do not clear 2×SE at all. **The
+mechanism of the eval floor is unmeasured** — the same fp4 reduction non-determinism that made the
+training trajectories diverge is the obvious candidate and has not been tested.
+
+**The training reward did not follow the eval.** Per-step means:
 
 | steps | reward | ce | tied | tok |
 |---|---:|---:|---:|---:|
@@ -250,45 +401,72 @@ cleanly on its own terms.
 | 26-50 | 0.900 | 4.09 | 0.68 | 136 |
 | 51-75 | **0.855** | 3.69 | 0.80 | 157 |
 
-The rollout reward in the window that lost 11 points of greedy accuracy is 0.855 against the
-previous window's 0.900 — a 5% dip, while the eval fell 11.8%. **62 problems went right→wrong
-against 7 the other way**, so this is a real loss of capability on specific problems, not a
-scoring artefact and not truncation (0/500 at the cap in every arm).
+Reward fell 5% over the window that lost 11.8% of greedy accuracy, and 62 problems went
+right→wrong against 7 the other way. Not a scoring artefact and not truncation — 0/500 at the
+2048 cap in every arm except step 100's 1/500. **The mechanism is unmeasured**: reward held, so
+the candidates are the policy drifting off the eval distribution while still satisfying the
+reward, or LoRA update instability, and nothing here separates them.
 
-**The gate that would have caught this cannot see it.** `reward_rises` compares windowed
-rollout reward, which held; `gsm8k_improves` compares before against after, and step 100 has
-yet to land. Nothing in the manifest reads a *curve* for monotonicity. `tilerl-0a` proposed
-exactly this criterion — a crossing requires the target held afterwards, not just reached once —
-half an hour before the data produced the case. It is now in `ledger.time_to_score` as `held`
-and `dipped_at`, reported alongside `reached` rather than suppressing it.
-
-**What this does to the headline.** `steps_to_score` at X=91.0 is 25 or earlier, and the run
-also shows the score does not stay there. Those are two facts and the second is not a correction
-of the first: a policy that reaches 93.2% at step 25 and 82.4% at step 75 has a **best step**,
-which is what a training run should be stopped at, and no early-stopping mechanism exists in
-this tree. **The mechanism of the collapse is unmeasured.** Reward held, so the candidates are
-the policy drifting off the eval's distribution while still satisfying the reward, or an
-instability in the LoRA update; nothing here distinguishes them.
-
-**Length is not monotone either.** 346.5 → 117.8 → 153.1 → 122.8. The 2.94x compression at step
-25 is a **minimum, not a trend**: step 50 gives back 30% of it while the score is flat, so
-length and score move independently after step 25. The earlier reading in this entry — that the
-length collapse is "the main effect" — holds for base→25 and does not extend past it.
+**Length is not monotone.** 346.5 → 117.8 → 153.1 → 122.8 → 151.4. The 2.94x compression at
+step 25 is a **minimum, not a trend**; step 50 gives back 30% of it at a flat score. An earlier
+draft of this entry called the length collapse "the main effect" — that holds for base→25 and
+does not extend past it.
 
 **Predictions, scored.** `tilerl-27` predicted step 25 **≥ 93.0** and was right (93.2). This
-session predicted **[90, 93)** and was wrong. Neither prediction covered a collapse.
+session predicted **[90, 93)** and was wrong. Neither prediction covered non-monotonicity, and
+the four-point grid is the reason it was seen at all.
 
-**Cost.** Eval is **614-741 s per 500-row point** against 23.3 s/step of training — 114% of the
-training it measures at step 25. Four points cost ~33 min of eval against ~39 min of training.
+**Cost.** Eval is **614–754 s per 500-row point**, 114% of the training it measures at step 25.
+Four points cost 45.8 min of eval against 34.4 min of training. Peak allocated 39.27 GiB;
+adapter 124.8M params.
 
-**Where the rows are.** The restarted run **reuses the first attempt's id** `86a06dc8c420`,
-because the id hashes the inputs and the inputs are identical — evidenced by that manifest's
-`started` moving 13:05 → 13:50. The newer-looking `0435924d7108` is **another session's
-synthetic run** (`source: tiny`, commit `2ea4a1f`, started and finished at 13:09:12 with a full
-gate set), which I first misread as the killed attempt's leftover. Two predicates: find the run
-by the id its manifest names, not by mtime, **and** confirm a directory is yours before
-concluding from its contents — a shared `runs/` holds other sessions' runs.
+**Where the rows are.** The restarted run **reuses the first attempt's id** `86a06dc8c420` —
+the id hashes the inputs and the inputs are identical, evidenced by that manifest's `started`
+moving 13:05 → 13:50. The newer-looking `0435924d7108` is **another session's synthetic run**
+(`source: tiny`, commit `2ea4a1f`, started and finished at 13:09:12 with a full gate set), which
+I first misread as the killed attempt's leftover. Two predicates: find the run by the id its
+manifest names, not by mtime, **and** confirm a directory is yours before concluding from its
+contents.
 
-Step 100 pending.
+**P1's own exit criterion failed on this run, and it passes at both step 25 and step 50.** The
+manifest's verdict
+is FAIL, on `gsm8k_improves`: threshold **462** (base 437 + 25 correct = +5.0 pt on 500 rows),
+value **456** — the step-100 policy, 6 short. Against every curve point:
+
+| point | correct | vs 462 |
+|---:|---:|---|
+| step 25 | 466 | **PASS** (+4) |
+| step 50 | 467 | **PASS** (+5) |
+| step 75 | 412 | FAIL (−50) |
+| step 100 | **456** | **FAIL** (−6) |
+
+**The run failed P1 by training at least 50 steps too long** — 75 if step 25 is the peak, which
+the eval floor above leaves open. The gate reads the after-arm, which is the
+last step, and the last step is not the best step. This is the same fact as the best-step row
+above, arriving through the project's actual exit criterion rather than through a curve nobody's
+gate reads: a policy that satisfies P1 existed at step 50, was trained past, and the manifest
+records FAIL.
+
+The other five gates: `mmlu_holds` PASS (0.757 against 0.731); `rollouts_within_cap`,
+`reward_rises`, `groups_untied` and `ce_falls` all FAIL, and all four are `validity` rather than
+`verdict` — expected here, since `--allow-short-rollouts` makes the cap deliberate and
+`--length-penalty 0.0` on an already-solved task drives ties to 0.68. They say the run is hard to
+interpret, not that P1 failed; `gsm8k_improves` is the one that says that.
+
+**The manifest computes the paired comparison independently and it agrees with mine.**
+`gsm8k_paired={'n': 500, 'b': 7, 'c': 26, 'delta': 0.038, 'se': 0.0115, 'z': 3.307}` against my
+base→100 of +3.80 pt at 3.31σ from the same rows through different code. Two readings of one
+quantity, not one derivation twice.
+
+MMLU after reads 75.7% against 75.1% before, so the regression check holds.
+
+**That MMLU pair does not narrow the step-75 mechanism, and reading it as evidence that general
+capability survived is a step-number error.** `evals("after")` runs once, after the loop, so
+75.7% is the **step-100** policy — the one that had already recovered to 91.2%. There is no MMLU
+reading at step 75, the step where GSM8K was 11 points down. To learn whether the dip was
+GSM8K-specific or general, MMLU would have to be scored *inside* the curve, which
+`score_curve` does not do (it calls `gsm8k_accuracy` only). Proposed by `tilerl-27` as a
+narrowing of the candidates and withdrawn on this reading; it is a real experiment, not a
+conclusion available from these numbers.
 
 Points 2-4 pending.
