@@ -99,6 +99,69 @@ def verdict_of(m: dict, kind: str = "verdict") -> bool | None:
     return all(g["passed"] for g in scored) if scored else None
 
 
+def curve_point_se(pt: dict, n: int = 0) -> float | None:
+    """Binomial SE of one curve point, in POINTS, at the point's own rate.
+
+    The width of ONE point against a constant target -- what `time_to_score` answers.
+    Comparing two points is a different question: `paired_se` over the per-problem rows,
+    or `unpaired_diff_se` when the rows are absent.
+    """
+    total = pt.get("total") or n
+    if not total:
+        return None
+    p = (pt.get("correct") or 0) / total
+    return round(100.0 * (p * (1 - p) / total) ** 0.5, 2)
+
+
+def paired_se(rows_a: list[dict], rows_b: list[dict], key: str = "i") -> float | None:
+    """Paired SE (points) of the difference between two points scored on the SAME rows:
+    ``100 x sqrt(b + c) / n`` over the discordant pairs. None when the rows do not join.
+
+    Curve points are a paired quantity -- every point scores the same subset -- so the
+    width of a difference between two points is this, not a binomial width: measured
+    2026-09-08, 1.9x narrower than the two-arm unpaired one at an 8.6% discordant rate.
+    ``b + c == 0`` gives 0.0: the points agreed on every row, so there is no noise to
+    measure and the difference is exactly 0. No `dataset` filter: one side is the live
+    in-memory rows, which never carry that key.
+    """
+    ja = {r[key]: bool(r["correct"]) for r in rows_a if key in r}
+    jb = {r[key]: bool(r["correct"]) for r in rows_b if key in r}
+    if not ja or ja.keys() != jb.keys():
+        return None
+    disc = sum(ja[k] != jb[k] for k in ja)
+    return round(100.0 * (disc / len(ja) ** 2) ** 0.5, 2)
+
+
+def unpaired_diff_se(pt_a: dict, pt_b: dict) -> float:
+    """Two-arm unpaired SE (points) of a score difference -- the CONSERVATIVE fallback
+    when the per-problem rows that would make it paired are absent. Wider than the paired
+    width by construction, so a caller that used it must mark the result as conservative."""
+    na, nb = pt_a["total"], pt_b["total"]
+    pa, pb = pt_a["correct"] / na, pt_b["correct"] / nb
+    return round(100.0 * (pa * (1 - pa) / na + pb * (1 - pb) / nb) ** 0.5, 2)
+
+
+def new_best_point(pt: dict, best: dict | None, se: float | None = None) -> bool:
+    """Whether ``pt`` replaces the incumbent best curve point.
+
+    SIGNIFICANTLY greater, not merely greater: the eval's own floor is 0.2 pt
+    (measured 2026-09-08 -- one fixed set of weights, re-scored across processes,
+    moved one question in 500), and a one-question lead has bought extra training
+    for a reading inside the instrument. A tie keeps the earlier point:
+    `time_to_score` is the objective, so at equal score the cheaper point wins.
+
+    ``se`` is the PAIRED width of ``pt - best`` in points, from `paired_se` over the
+    per-problem rows. None falls back to the conservative unpaired width -- the caller
+    must mark that result, because a conservative "not significantly greater" must not
+    be read as "the two points are the same".
+    """
+    if best is None:
+        return True
+    if se is None:
+        se = unpaired_diff_se(pt, best)
+    return pt["score"] - best["score"] > 2 * se / 100.0
+
+
 def time_to_score(m: dict, target: float) -> dict | None:
     """When this run first scored >= ``target``, as a MEASUREMENT not a fit.
 
@@ -136,11 +199,7 @@ def time_to_score(m: dict, target: float) -> dict | None:
     n = curve.get("n") or (curve["points"][0].get("total") or 0)
 
     def _se(pt: dict) -> float | None:
-        total = pt.get("total") or n
-        if not total:
-            return None
-        p = (pt.get("correct") or 0) / total
-        return round(100.0 * (p * (1 - p) / total) ** 0.5, 2)
+        return curve_point_se(pt, n)
 
     prev = 0
     for i, pt in enumerate(curve["points"]):
@@ -204,4 +263,43 @@ def format_run(m: dict) -> str:
 if __name__ == "__main__":  # runnable check
     assert run_id({"a": 1, "b": [2]}) == run_id({"b": [2], "a": 1})
     assert run_id({"a": 1}) != run_id({"a": 2})
-    print("ledger: ids OK")
+    # Best-point selection on the run's FINE curve (n=500): 94.2/94.2/94.6/92.8/93.2/
+    # 82.4/91.2. The run shipped the last point (91.2); the snapshot must keep a top one.
+    # It keeps step 5, not the numerical peak at step 15: the peak led by 0.4 pt, inside
+    # the 2.0 pt floor, so the earliest top point wins. Negative control: with the rule
+    # replaced by "every point wins" (take the last) this assertion goes red -- the last
+    # point is exactly the 91.2 the run shipped without a snapshot.
+    pts = [{"step": s, "correct": c, "total": 500, "score": c / 500}
+           for s, c in ((5, 471), (10, 471), (15, 473), (25, 464),
+                        (50, 466), (75, 412), (100, 456))]
+    best = None
+    for pt in pts:
+        if new_best_point(pt, best):
+            best = pt
+    assert best["step"] == 5 and best["score"] == 0.942, best
+    # Two points one question apart (0.2 pt at n=500): inside the floor, the earlier one
+    # keeps it. This is the error the run actually made -- step 50 led step 25 by exactly
+    # one question, and taking the numerically higher point bought 501.2 s of extra
+    # training for a reading inside the instrument. Negative control: with the criterion
+    # as plain `>` this assertion goes red.
+    a = {"step": 25, "correct": 470, "total": 500, "score": 0.94}
+    b = {"step": 50, "correct": 471, "total": 500, "score": 0.942}
+    assert new_best_point(a, None)
+    assert not new_best_point(b, a), (a["score"], b["score"])
+    # Cell 3 proves WHICH SE the criterion uses -- cells 1-2 cannot, both widths give
+    # the same answer on them. Two points 3.0 pt apart (435 -> 450 of 500) with 43
+    # discordant pairs: paired SE = 100 x sqrt(43)/500 = 1.31 pt, so 2x = 2.6 < 3.0 and
+    # the point replaces; the unpaired two-arm width is 2.02 pt, so 2x = 4.0 > 3.0 and
+    # it does not. A criterion that silently used the unpaired width goes red here.
+    va = [{"i": i, "correct": i < 435} for i in range(500)]
+    vb = [dict(r) for r in va]
+    for i in range(14):  # was right, now wrong
+        vb[i]["correct"] = False
+    for i in range(435, 464):  # was wrong, now right (29)
+        vb[i]["correct"] = True
+    assert paired_se(va, vb) == 1.31
+    a3 = {"step": 25, "correct": 435, "total": 500, "score": 0.87}
+    b3 = {"step": 50, "correct": 450, "total": 500, "score": 0.90}
+    assert new_best_point(b3, a3, paired_se(va, vb))
+    assert not new_best_point(b3, a3)
+    print("ledger: ids + best-point selection OK")

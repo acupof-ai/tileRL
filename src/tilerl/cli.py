@@ -593,7 +593,16 @@ def _train_adapters(args: argparse.Namespace) -> None:
     from .engine import build_engine
     from .eval import gsm8k_accuracy, mmlu_accuracy, mmlu_questions
     from .kv_cache import NoPrefixStore
-    from .ledger import commit, file_hash, new_manifest, read_manifest, runs_root, write_manifest
+    from .ledger import (
+        commit,
+        file_hash,
+        new_best_point,
+        new_manifest,
+        paired_se,
+        read_manifest,
+        runs_root,
+        write_manifest,
+    )
     from .model import add_lora
     from .prompt import render_chat, sampling
     from .tokenizer import get_tokenizer
@@ -809,6 +818,13 @@ def _train_adapters(args: argparse.Namespace) -> None:
         return _finish(manifest, args.json)
     _refuse_short_rollouts(mean_len.get("before"), args.max_new_tokens,
                            args.allow_short_rollouts)
+    # The weights behind the best curve point. Every intermediate policy is otherwise
+    # destroyed: `AdamW.step_one` ends in `p.copy_()` (in place, which is what lets the
+    # engine keep its captured graphs), so a run that peaks mid-way can neither stop there
+    # nor roll back to it. Measured 2026-09-08: score 87.4 -> 93.2 -> 93.4 -> 82.4 -> 91.2,
+    # so the run shipped 91.2 and the 93.4 it had reached was gone. Out here, not in the RL
+    # branch, because the save site below is shared with opd.
+    best: dict = {}
     if args.rl:
         if rows:
             gold = {tuple(p): r["answer"] for p, r in zip(prompts, rows)}
@@ -856,6 +872,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
         train_secs = 0.0
 
         def score_curve(step: int) -> None:
+            nonlocal best
             # `eval_secs` per point, so the "keep the scoring under 5% of a step" criterion
             # is a fact checkable AFTER a run rather than a guess before one. Estimating it
             # from another config's eval would extrapolate across n, generation length and
@@ -899,6 +916,44 @@ def _train_adapters(args: argparse.Namespace) -> None:
                           "mean_len": round(ntok / max(n, 1), 1), "at_cap": at_cap,
                           "tied": round(statistics.mean(since), 4) if since else None,
                           "jit": not curve})
+            # SIGNIFICANTLY greater, not merely greater. Measured 2026-09-08: re-scoring
+            # one fixed set of weights across processes at temperature 0.0 moved 438/500
+            # to 437/500, so this eval's own floor is 0.2 pt -- and the run's step-50 point
+            # led step 25 by exactly one question. Taking the numerically higher point
+            # would have bought 501.2 s of extra training for a reading inside the
+            # instrument. A tie goes to the earlier point, which is not an arbitrary
+            # tie-break: `time_to_score` is the objective, so when two options are the same
+            # score the cheaper one wins, and "the same" is defined by the measured floor.
+            # The criterion lives in `ledger.new_best_point` next to the SE formulas, so
+            # the run and its post-hoc readers cannot drift apart -- its `__main__` check
+            # runs this exact curve, plus the one-question case, the paired-vs-unpaired
+            # case, and each one's negative control.
+            #
+            # The width is PAIRED: every curve point scores the same `curve_rows`, and the
+            # best point's per-problem rows are on disk from when it was scored. The
+            # unpaired width is 1.9x wider here (8.6% discordant, measured 2026-09-08), so
+            # it would make this criterion never fire on a slow rise -- a selection that
+            # always keeps the first point and does not say so. Rows missing (old runs)
+            # fall back to the conservative width, marked in `se_kind` so nobody reads a
+            # conservative "not greater" as "the two points are the same".
+            if best:
+                f = runs_root() / manifest["id"] / f"eval-curve-{best['step']}.jsonl"
+                rows = ([json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+                        if f.is_file() else [])
+                se = paired_se(rows, per)
+                se_kind = "paired" if se is not None else "unpaired (conservative)"
+            else:
+                se = se_kind = None  # first point: no comparison installed it
+            if new_best_point(curve[-1], best or None, se):
+                # `mean_len` and `tok_per_correct` ride with the snapshot so a downstream
+                # consumer can trade score against answer cost -- the 2026-09-05 run bought
+                # most of its +6% as 2.74x shorter answers, and score alone cannot show that.
+                best = {"step": step, "score": curve[-1]["score"],
+                        "mean_len": curve[-1]["mean_len"],
+                        "tok_per_correct": round(ntok / c, 1) if c else None,
+                        "se_kind": se_kind,
+                        "tensors": {k: v.detach().to("cpu", copy=True)
+                                    for k, v in trainable.items()}}
             log(f"  curve step {step}: {c}/{n} = {100 * c / max(n, 1):.1f}% "
                 f"tied {curve[-1]['tied']} "
                 f"at {train_secs:.1f}s cumulative, mean {ntok / max(n, 1):.0f} tok, "
@@ -996,6 +1051,17 @@ def _train_adapters(args: argparse.Namespace) -> None:
               str(d / "adapter.safetensors"))
     manifest["artifacts"]["adapter"] = "adapter.safetensors"
     log(f"adapter {sum(v.numel() for v in trainable.values()) / 1e6:.1f}M params -> {d}")
+    # `best_curve_point`, never `best_step`: the snapshot is taken inside `score_curve`, so
+    # its resolution is `--eval-every`. At 25 a true peak at 40 is recorded as 50. This is
+    # the best point we LOOKED AT, and a name promising the best step would be read as an
+    # optimum.
+    if args.rl and best:
+        save_file({k: v.contiguous() for k, v in best.pop("tensors").items()},
+                  str(d / "adapter-best.safetensors"))
+        manifest["artifacts"]["adapter_best"] = "adapter-best.safetensors"
+        manifest["best_curve_point"] = {**best, "every": args.eval_every}
+        log(f"adapter-best step {best['step']} score {100 * best['score']:.1f}% "
+            f"(best of {len(curve)} curve points, resolution {args.eval_every} steps)")
     if drift["passed"] is not False:
         evals("after")
     else:
