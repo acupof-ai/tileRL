@@ -330,10 +330,6 @@ def group_advantages(rewards: Any, group: int, live: Any = None,
     std = np.sqrt((((r - mean) * m) ** 2).sum(axis=1, keepdims=True) / n)
     adv = (r - mean) / np.where(std > 1e-8, std, 1.0)
     return np.where((std > 1e-8) & m, adv, 0.0).reshape(-1)
-    mean = (r * m).sum(axis=1, keepdims=True) / n
-    std = np.sqrt((((r - mean) * m) ** 2).sum(axis=1, keepdims=True) / n)
-    adv = (r - mean) / np.where(std > 1e-8, std, 1.0)
-    return np.where((std > 1e-8) & m, adv, 0.0).reshape(-1)
 
 
 def rl_step(
