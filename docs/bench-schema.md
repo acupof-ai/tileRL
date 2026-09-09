@@ -39,7 +39,7 @@ watching.
 | `build` | str | `eager` / `fused` / `fused+graph` / `fused+graph+draft` |
 | `model` | str | config name, e.g. `27B-nvfp4`, `tiny` |
 | `shape` | object | non-empty; must contain the metric's registry-declared keys (decode → `batch`,`ctx`; eval → `cap`; reuse → `turn`) |
-| `warm` | object | `state` ∈ `cold`,`warm`; `compiles` int ≥ 0 — **absent is rejected** (0 is an assertion, absent is unmeasured) |
+| `warm` | object | `state` ∈ `cold`,`warm`; `compiles` int ≥ 0 or null — JIT compiles in the timed window, measured (`len(backend._kernels)` delta for engine-direct, server-log count under a startup-line positive control for log-reading clients); **null = unmeasured, never omitted** |
 | `n` | int | ≥ 1, the number of timed windows |
 | `spread` | number | relative dispersion (sd/mean or (max−min)/median); 0.0 when `n=1` |
 | `device` | object | `name` (GPU model); `card` int, required on sm90/sm70 |

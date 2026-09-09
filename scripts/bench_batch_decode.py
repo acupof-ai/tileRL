@@ -92,10 +92,11 @@ def main() -> None:
             engine.step()
         torch.cuda.synchronize()
         s0 = engine.stats()
-        t0 = time.perf_counter()
-        for _ in range(args.ticks):
-            engine.step()
-        torch.cuda.synchronize()
+        with benchrec.compiles_window(backend) as cw:
+            t0 = time.perf_counter()
+            for _ in range(args.ticks):
+                engine.step()
+            torch.cuda.synchronize()
         ms = (time.perf_counter() - t0) / args.ticks * 1e3
         s1 = engine.stats()
         per_tick = (s1["tokens_generated"] - s0["tokens_generated"]) / args.ticks / B
@@ -107,7 +108,7 @@ def main() -> None:
         rec = {
             "metric": "decode_agg_tok_s", "value": round(agg, 1), "unit": "tok/s",
             "shape": {"batch": B, "ctx": 16},
-            "warm": {"state": "warm", "compiles": 0},
+            "warm": {"state": "warm", "compiles": cw["compiles"]},
             "n": 1, "spread": 0.0, **common,
         }
         rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=False)
@@ -121,7 +122,7 @@ def main() -> None:
                 srec = {
                     "metric": "spec_goodput_ratio", "value": round(agg / dense_best, 3),
                     "unit": "ratio", "shape": {"batch": B, "depth": args.depth},
-                    "warm": {"state": "warm", "compiles": 0},
+                    "warm": {"state": "warm", "compiles": cw["compiles"]},
                     "n": 1, "spread": 0.0, **common,
                 }
                 srec["floor"] = {

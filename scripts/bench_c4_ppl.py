@@ -83,6 +83,7 @@ def main() -> None:
     # Wikitext is line-per-row; concatenate and chunk into seq_len pieces.
     ids_all = tok.encode(text)
     n_docs = 0
+    _k0 = len(backend._kernels)
     for start in range(0, len(ids_all) - 16, args.seq_len):
         if n_docs >= args.n:
             break
@@ -118,7 +119,8 @@ def main() -> None:
     print(f"Wikitext-103 perplexity: {ppl:.2f} ({total_tokens} tokens, {n_docs} chunks)")
     rec = {
         "metric": "ppl", "value": round(ppl, 2), "unit": "ppl",
-        "shape": {"n": n_docs}, "warm": {"state": "warm", "compiles": 0},
+        "shape": {"n": n_docs}, "warm": {"state": "warm",
+                                          "compiles": len(backend._kernels) - _k0},
         "n": 1, "spread": 0.0, **benchrec.record_common(args, build="fused"),
     }
     rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=True)

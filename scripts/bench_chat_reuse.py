@@ -86,7 +86,7 @@ def main() -> int:
         shape = {"turn": turn, "prompt_tokens": pt}
         rec = {
             "metric": "chat_turn_wall_s", "value": round(wall, 3), "unit": "s",
-            "shape": shape, "warm": {"state": "warm", "compiles": 0},
+            "shape": shape, "warm": {"state": "warm", "compiles": None},
             "n": 1, "spread": 0.0, **common,
         }
         rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=True)
@@ -94,7 +94,7 @@ def main() -> int:
         if hits > 0:
             benchrec.append({
                 "metric": "prefix_hits", "value": hits, "unit": "hits",
-                "shape": {"turn": turn}, "warm": {"state": "warm", "compiles": 0},
+                "shape": {"turn": turn}, "warm": {"state": "warm", "compiles": None},
                 "n": 1, "spread": 0.0,
                 "floor": {"value": 1.0, "unit": "hits", "kind": "baseline",
                           "derivation": "1.0 = one block-boundary hit is the smallest nonzero reuse; "

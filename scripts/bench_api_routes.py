@@ -74,7 +74,7 @@ def timed(label: str, fn, common: dict) -> None:
     rec = {
         "metric": "request_overhead_ms", "value": round(statistics.median(ms), 2),
         "unit": "ms", "shape": {"route": label},
-        "warm": {"state": "warm", "compiles": 0},
+        "warm": {"state": "warm", "compiles": None},
         "n": N, "spread": round((ms[-1] - ms[0]) / statistics.median(ms), 4),
         **common,
     }

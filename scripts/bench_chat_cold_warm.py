@@ -99,7 +99,7 @@ def main() -> int:
     rec = {
         "metric": "chat_turn_wall_s", "value": round(wall, 3), "unit": "s",
         "shape": {"turn": 0, "prompt_tokens": n, "arm": args.arm},
-        "warm": {"state": args.arm, "compiles": 0},
+        "warm": {"state": args.arm, "compiles": None},
         "n": 1, "spread": 0.0, **common,
     }
     rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=True)
@@ -108,7 +108,7 @@ def main() -> int:
         hrec = {
             "metric": "prefix_hits", "value": d["prefix_hits"], "unit": "hits",
             "shape": {"turn": 0, "arm": args.arm},
-            "warm": {"state": "warm", "compiles": 0},
+            "warm": {"state": "warm", "compiles": None},
             "n": 1, "spread": 0.0, **common,
         }
         hrec["floor"] = {
