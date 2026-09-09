@@ -1,6 +1,7 @@
 """Card guard: refuse a card not granted to tileRL when a grant ledger exists."""
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -100,6 +101,25 @@ def test_lend_env_var_bypasses_with_a_log_line(tmp_path, monkeypatch, capsys):
     assert "lend recorded" in capsys.readouterr().err
 
 
+def _tracked_paths(root: Path, *pattern_args: str) -> set[str]:
+    """Tracked .py files under scripts/ and src/ whose HEAD content matches.
+
+    Pattern type is pinned by the caller's flag (-F/-E), never git's default:
+    grep.patternType is a global config, and an extended default inverts both
+    the gate and the broken-pattern regression test.
+
+    The caller confirms the repo exists first, so rc>1 here is a broken pattern
+    or a git failure — never 'no repo' — and must raise: a skip would pass a
+    gate that had stopped judging anything (the unbalanced-pattern bug)."""
+    proc = subprocess.run(
+        ["git", "grep", "-l", *pattern_args, "HEAD", "--", "scripts", "src"],
+        cwd=root, capture_output=True, text=True,
+    )
+    if proc.returncode > 1:
+        raise RuntimeError(f"git grep failed rc={proc.returncode}: {proc.stderr.strip()}")
+    return {p.removeprefix("HEAD:") for p in proc.stdout.splitlines() if p.endswith(".py")}
+
+
 def test_every_materialize_call_site_has_a_guard():
     """Every file that calls backend.materialize() must also contain card_guard()
     or build_engine() (which calls card_guard internally).
@@ -111,17 +131,46 @@ def test_every_materialize_call_site_has_a_guard():
     call sites; an AST-level order check is over-engineering until that grows.
 
     Coverage: scripts/ and src/ — a new materialize call site in either tree
-    must have the guard. Fails when someone adds one without it."""
+    must have the guard. Fails when someone adds one without it.
+
+    Both the site list and the guard check read the HEAD commit (git grep),
+    not the working tree: the gate judges the committed code a reviewer sees,
+    so a tracked file deleted or edited locally neither breaks it nor slips
+    past it, and an untracked probe cannot move the verdict."""
     root = Path(__file__).resolve().parent.parent
-    unguarded = []
-    for dirname in ("scripts", "src"):
-        for path in sorted((root / dirname).rglob("*.py")):
-            text = path.read_text()
-            if ".materialize(" not in text:
-                continue
-            if "card_guard" not in text and "build_engine" not in text:
-                unguarded.append(str(path.relative_to(root)))
+    try:
+        in_repo = subprocess.run(
+            ["git", "rev-parse", "--git-dir"], cwd=root, capture_output=True
+        ).returncode == 0
+    except OSError:
+        in_repo = False
+    if not in_repo:
+        pytest.skip("no .git — tracked-file enumeration unavailable")
+    sites = _tracked_paths(root, "-F", ".materialize(")
+    guarded = _tracked_paths(root, "-E", "card_guard|build_engine")
+    unguarded = sorted(sites - guarded)
+    # Lower bound against silent empty enumeration (a broken git query above
+    # would make `unguarded` vacuously empty). 15 tracked sites on 2026-09-10;
+    # this is not a coverage requirement. The sha distinguishes a broken query
+    # from a tree behind main (an old tree legitimately has fewer sites).
+    head = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"], cwd=root,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert len(sites) >= 12, (
+        f"only {len(sites)} tracked materialize sites found at {head} — "
+        f"broken enumeration, or a tree behind main?"
+    )
     assert not unguarded, (
         f"files calling backend.materialize() without card_guard or build_engine: "
         f"{unguarded}. Add card_guard() before the materialize call."
     )
+
+
+def test_tracked_paths_raises_on_a_broken_pattern():
+    """A fatal git pattern must raise, not skip: an unbalanced group once made
+    git grep return rc=128, which the skip branch ate — the gate went green
+    while judging nothing. The repo check and the grep rc are asked separately."""
+    root = Path(__file__).resolve().parent.parent
+    with pytest.raises(RuntimeError, match="git grep failed"):
+        _tracked_paths(root, "-E", ".materialize(")
