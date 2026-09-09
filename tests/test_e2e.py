@@ -576,7 +576,10 @@ def test_submit_rollback_and_terminal_failure():
     assert len(engine._waiting) == 1, "the second request was not left waiting"
     assert engine._kv.free_blocks == free_blocks, "a request that did not fit took blocks"
 
+    # The failure must land on the seam the tick crosses: a CUDA pure-decode tick
+    # replays a captured graph and never calls `_model.forward` (errors/2026-09-10).
     engine._model.forward = lambda *_, **__: (_ for _ in ()).throw(RuntimeError("boom"))
+    engine._run_decode_graph = lambda *_, **__: (_ for _ in ()).throw(RuntimeError("boom"))
     with pytest.raises(RuntimeError, match="boom"):
         engine.step()
     with pytest.raises(RuntimeError, match="boom"):
