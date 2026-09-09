@@ -54,14 +54,17 @@ separate commit with the derivation in its body** — it reorders
 `--questions`, which is a default flip.
 
 `gap = floor/value` for higher-is-better metrics, `value/floor` for
-lower-is-better. The question list sorts by `gap × weight`.
+lower-is-better. A gap's meaning depends on its floor kind: physical floors
+(`bandwidth` / `compute` / `roofline` / `baseline`) make gap a **headroom**
+number (how far the limit is), `measured-best` makes gap a **regression**
+number (how far below our own best). The two never share a sorted column.
 
 ## Views
 
-- `tilerl bench --table` — four-target matrix; an empty cell says so, never a silent skip
+- `tilerl bench --table` — four-target matrix; an empty cell says so, never a silent skip; the gap column carries its floor kind (`roof`/`bw`/`compute`/`base` = headroom, `best` = vs our own best)
 - `tilerl bench --readme` — the generated README rows (reuse, SSD restart)
-- `tilerl bench --regress` — newest vs previous per key; rows with `n=1` are excluded (no dispersion, no regression claim)
-- `tilerl bench --questions` — all current rows by `gap × weight` desc
+- `tilerl bench --regress` — two sections: newest vs previous per key (`n>=2` only, no dispersion, no regression claim), and every `measured-best` row standing below its population's best (FAIL past 1.05x)
+- `tilerl bench --questions` — headroom against **physical floors only**, by `gap × weight` desc; a metric with rows but no physical floor gets a `no physical floor — needs a derivation` line, sorted by weight — the missing derivation is itself a todo
 
 ## Selftest
 

@@ -366,8 +366,14 @@ def _gap(record: dict, registry: dict) -> float | None:
     return f / v if registry[record["metric"]]["direction"] == "+" else v / f
 
 
+_KIND_SHORT = {"bandwidth": "bw", "compute": "compute", "roofline": "roof",
+               "measured-best": "best", "baseline": "base"}
+
+
 def _view_table() -> None:
-    """Four-target matrix; an empty cell says so, never a silent skip."""
+    """Four-target matrix; an empty cell says so, never a silent skip. The gap
+    column carries its floor kind: roof/bw/compute/base are headroom against a
+    physical limit, best is standing against our own (see --regress)."""
     import benchrec
 
     reg = benchrec.load_registry()
@@ -380,7 +386,7 @@ def _view_table() -> None:
     print(f"=== bench table — denominator: a {denom['turn_s']}s agent turn = "
           f"{denom['prefill_s']}s prefill + {denom['decode_s']}s decode ({denom['source']}) ===")
     print(f"  {'metric (shape) [build]':<46} {'weight':>6} "
-          f"{'cpu':>8} {'metal':>8} {'sm90':>8} {'sm70':>8} {'gap x w':>8}")
+          f"{'cpu':>8} {'metal':>8} {'sm90':>8} {'sm70':>8} {'gap x w':>12}")
     missing = []
     for (metric, shape, build), cells in sorted(groups.items()):
         vals = []
@@ -389,12 +395,19 @@ def _view_table() -> None:
             vals.append(f"{cell['value']:.1f}" if cell else "—")
             if cell is None:
                 missing.append(f"{metric}{dict(shape)}/{t}")
-        gaps = [g for t in benchrec.TARGETS if (c := cells.get(t)) and (g := _gap(c, metrics))]
-        gw = f"{max(gaps) * metrics[metric]['weight']:.3f}" if gaps else "—"
+        labeled = [(g, c["floor"]["kind"]) for t in benchrec.TARGETS
+                   if (c := cells.get(t)) and (g := _gap(c, metrics))]
+        if labeled:
+            g, kind = max(labeled)
+            gw = f"{g * metrics[metric]['weight']:.3f} {_KIND_SHORT[kind]}"
+        else:
+            gw = "—"
         print(f"  {metric + ' ' + str(dict(shape)) + ' [' + build + ']':<46} "
-              f"{metrics[metric]['weight']:>6.2f} {vals[0]:>8} {vals[1]:>8} {vals[2]:>8} {vals[3]:>8} {gw:>8}")
+              f"{metrics[metric]['weight']:>6.2f} {vals[0]:>8} {vals[1]:>8} {vals[2]:>8} {vals[3]:>8} {gw:>12}")
     if missing:
         print("  empty cells (no accepted row): " + ", ".join(sorted(missing)))
+    print("  gap kinds: roof/bw/compute/base = headroom vs a physical floor; "
+          "best = vs our own best (a regression number, see --regress)")
 
 
 def _view_readme() -> None:
@@ -420,8 +433,11 @@ def _view_readme() -> None:
 
 
 def _view_regress() -> None:
-    """Newest vs previous per population; n=1 rows are excluded (no dispersion,
-    no regression claim)."""
+    """Two regression questions, kept apart: newest vs previous per population
+    (n>=2 only — a point estimate with no dispersion makes no regression claim),
+    and current rows standing below their population's best (floor.kind ==
+    'measured-best'; gap > 1.0 means a better measurement exists in the store,
+    FAIL past 1.05)."""
     import benchrec
 
     reg = benchrec.load_registry()["metrics"]
@@ -440,22 +456,55 @@ def _view_regress() -> None:
         print(f"  {'PASS' if ratio >= 0.97 else 'FAIL'} {last['metric']} {dict(last['shape'])} "
               f"{last['target']}/{last['build']}: {last['value']} vs {prev['value']} ({ratio:.3f}x)")
 
+    print("=== vs our own best (measured-best floors; FAIL > 1.05x below best) ===")
+    shown = 0
+    for r in benchrec.current(benchrec.load_all()).values():
+        if r["floor"]["kind"] != "measured-best":
+            continue
+        g = _gap(r, reg)
+        if g is None or g <= 1.0:
+            continue  # gap == 1.0: this row IS the population's best (first sight or tie)
+        shown += 1
+        print(f"  {'FAIL' if g > 1.05 else 'PASS'} {r['metric']} {dict(r['shape'])} "
+              f"{r['target']}/{r['build']}: {r['value']} vs best {r['floor']['value']} "
+              f"({g:.3f}x, n={r['n']})")
+    if not shown:
+        print("  (none — every measured-best row stands at its population's best)")
+
 
 def _view_questions(limit: int = 20) -> None:
-    """All current rows by gap x weight desc — the 'what to fix next' order."""
+    """Headroom against physical floors only, by gap x weight desc. A
+    measured-best gap is a regression, not headroom — see --regress; the two
+    must not share a sorted column. A metric with rows but no physical floor is
+    not silently fine: the missing derivation is itself a todo, listed by
+    weight."""
     import benchrec
 
     reg = benchrec.load_registry()["metrics"]
+    cur = list(benchrec.current(benchrec.load_all()).values())
     q = []
-    for r in benchrec.current(benchrec.load_all()).values():
+    floored: set = set()
+    for r in cur:
+        if r["floor"]["kind"] not in benchrec.PHYSICAL_FLOOR_KINDS:
+            continue
+        floored.add(r["metric"])
         g = _gap(r, reg)
         if g is not None:
             q.append((g * reg[r["metric"]]["weight"], g, r))
     q.sort(key=lambda x: x[0], reverse=True)
-    print(f"=== questions (gap x weight, top {limit}) ===")
+    print(f"=== questions (headroom vs physical floor, gap x weight, top {limit}) ===")
     for score, g, r in q[:limit]:
-        print(f"  {score:.3f}  {r['metric']} {r['target']} {dict(r['shape'])}: "
-              f"{r['value']} vs floor {r['floor']['value']} ({g:.2f}x) x {reg[r['metric']]['weight']}")
+        print(f"  {score:.3f}  {r['metric']} {r['target']} {dict(r['shape'])} "
+              f"[{r['floor']['kind']}]: {r['value']} vs floor {r['floor']['value']} "
+              f"({g:.2f}x) x {reg[r['metric']]['weight']}")
+    missing = sorted(
+        ((reg[m]["weight"], m) for m in {r["metric"] for r in cur} - floored),
+        reverse=True,
+    )
+    if missing:
+        print("=== no physical floor — needs a derivation ===")
+        for w, m in missing:
+            print(f"  {m} (weight {w})")
 
 
 def torch_oom():

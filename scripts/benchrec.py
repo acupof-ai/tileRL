@@ -30,6 +30,11 @@ REGISTRY = _ROOT / "docs/bench-metrics.json"
 TARGETS = ("cpu", "metal", "sm90", "sm70")
 BUILDS = ("eager", "fused", "fused+graph", "fused+graph+draft")
 FLOOR_KINDS = ("bandwidth", "compute", "roofline", "measured-best", "baseline")
+#: Floor kinds that state a physical limit. --questions ranks headroom against
+#: these; measured-best is a regression quantity (vs our own best) and lives in
+#: --regress. The two must not share a sorted column: 4.99x of headroom and a
+#: 1.02x regression are not the same kind of number.
+PHYSICAL_FLOOR_KINDS = ("bandwidth", "compute", "roofline", "baseline")
 #: A baseline floor must name the null it is measured against.
 _BASELINE_NULL = re.compile(r"=")
 _SHA = re.compile(r"^[0-9a-f]{7,40}$")
