@@ -1,7 +1,7 @@
 # The cu129 index redirect cannot run on the pod
 
 Date: 2026-09-09
-Status: open (partial revert pending)
+Status: closed (partial revert in PR #404)
 
 ## Context
 
