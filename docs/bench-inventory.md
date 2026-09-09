@@ -2,8 +2,10 @@
 
 **SUPERSEDED:** the metric→collector map and the Keep/Delete triage this doc once
 held are consumed. The collector map lives in `docs/bench-metrics.json`
-(`tilerl bench --collectors`); the 21 deletion candidates were deleted in
-#378/#379. What remains is the residue the registry cannot hold: why the
+(`tilerl bench --collectors`); the 21 deletion candidates were deleted in #378 —
+the mapping is exact, verified 2026-09-10 by name-level comparison of the two
+lists. #379 deleted 4 `probe_` scripts from the D2 family, which were never on
+this list. What remains is the residue the registry cannot hold: why the
 non-metric scripts must not be deleted.
 
 ## Infrastructure — the ruler itself
