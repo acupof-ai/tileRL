@@ -1469,4 +1469,40 @@ class BatchKv:
     seq_q_lens: torch.Tensor | None = None  # [B] valid query tokens per row
     keep_steps: int = 0  # verify: keep the recurrent state after each of the first N chain tokens
 
+    def inputs_for(self, ids, pos, row: int) -> dict:
+        """Clone of every tensor the forward reads for row ``row``.
+
+        Tools call this instead of guessing what counts as an input: the token
+        ids, positions, block table, the K/V (and fp8 scales) it names, the
+        recurrent state, conv window and window parity for its slot. The
+        recurrent state does not route through the block table, so every
+        ad-hoc dump kept missing it
+        (errors/2026-09-09-decode-graph-run-to-run-nondeterminism.md).
+        """
+        ids_t = ids if isinstance(ids, torch.Tensor) else torch.as_tensor(ids)
+        pos_t = pos if isinstance(pos, torch.Tensor) else torch.as_tensor(pos)
+        n = (int(self.seq_len[row]) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+        blocks = self.block_table[row, :n]
+        slot = int(self.state_slot[row])
+        pool, state = self.kv_pool, self.state_pool
+        d = {
+            "ids": ids_t[row].clone(),
+            "pos": pos_t[row].clone(),
+            "block_table": blocks.clone(),
+            "seq_len": self.seq_len[row].clone(),
+            "state_slot": self.state_slot[row].clone(),
+            "k": pool.k_pool[:, blocks, ...].clone(),
+            "v": pool.v_pool[:, blocks, ...].clone(),
+            "states": state.states[slot].clone(),
+            "win_parity": state.win_parity[slot].clone(),
+        }
+        if self.seq_q_lens is not None:
+            d["seq_q_lens"] = self.seq_q_lens[row].clone()
+        if pool.k_scale is not None:
+            d["k_scale"] = pool.k_scale[:, blocks, ...].clone()
+            d["v_scale"] = pool.v_scale[:, blocks, ...].clone()
+        if state.conv_windows is not None:
+            d["conv_windows"] = state.conv_windows[slot].clone()
+        return d
+
 

@@ -9,6 +9,7 @@ import torch
 
 from tilerl.kv_cache import (
     BLOCK_TOKENS,
+    BatchKv,
     LinearStatePool,
     PagedKvPool,
     PrefixStore,
@@ -810,3 +811,67 @@ def test_last_prefill_boundary_is_a_real_chunk_end(n, budget):
     assert lb in ends, (
         f"n={n} budget={budget}: _last_prefill_boundary says {lb}, but chunks end at "
         f"{ends[-4:]} -- `last` never fires and nothing reaches the disk tier")
+
+
+# --------------------------------------------------------------- inputs_for
+
+
+def test_batchkv_inputs_for_covers_every_forward_input():
+    """inputs_for clones every tensor the forward reads for a row. The key set
+    is the enumeration; the mutation loop proves each source reaches the
+    snapshot. A new forward input not added to inputs_for leaves the key set
+    assertion as the only thing standing between it and a silent gap."""
+    pool = PagedKvPool(4, 2, 8, num_layers=3, device="cpu")
+    state = LinearStatePool(2, 2, 2, 4, device="cpu", conv_window=4, conv_dim=16)
+    kv = BatchKv(
+        block_table=torch.tensor([[1, 2, 0, 0], [3, 0, 0, 0]]),
+        seq_len=torch.tensor([100, 40]),
+        state_slot=torch.tensor([0, 1]),
+        kv_pool=pool,
+        state_pool=state,
+        seq_q_lens=torch.tensor([1, 1]),
+    )
+    ids = torch.tensor([[5], [7]])
+    pos = torch.tensor([[99], [39]])
+    snap = kv.inputs_for(ids, pos, 0)
+    assert set(snap) == {
+        "ids", "pos", "block_table", "seq_len", "state_slot", "seq_q_lens",
+        "k", "v", "states", "conv_windows", "win_parity",
+    }
+    # clones: mutating a return leaves the source untouched
+    snap["k"].fill_(999)
+    assert not torch.any(pool.k_pool[:, [1, 2]] == 999)
+    # coverage: each source the forward reads, when mutated, reaches the snapshot
+    pool.k_pool[:, [1, 2]] = 1
+    assert torch.any(kv.inputs_for(ids, pos, 0)["k"] == 1)
+    pool.v_pool[:, [1, 2]] = 2
+    assert torch.any(kv.inputs_for(ids, pos, 0)["v"] == 2)
+    state.states[0].fill_(3)
+    assert torch.any(kv.inputs_for(ids, pos, 0)["states"] == 3)
+    state.conv_windows[0].fill_(4)
+    assert torch.any(kv.inputs_for(ids, pos, 0)["conv_windows"] == 4)
+    state.win_parity[0] = 1
+    assert kv.inputs_for(ids, pos, 0)["win_parity"].item() == 1
+    ids[0, 0] = 11
+    assert kv.inputs_for(ids, pos, 0)["ids"].item() == 11
+    pos[0, 0] = 12
+    assert kv.inputs_for(ids, pos, 0)["pos"].item() == 12
+
+
+def test_batchkv_inputs_for_fp8_scales():
+    """An fp8 pool's scales are read by the forward and must be in the snapshot."""
+    pool = PagedKvPool(4, 2, 8, num_layers=2, device="cpu", kv_fp8=torch.float8_e4m3fn)
+    state = LinearStatePool(1, 1, 1, 4, device="cpu")
+    kv = BatchKv(
+        block_table=torch.tensor([[1, 0, 0, 0]]),
+        seq_len=torch.tensor([20]),
+        state_slot=torch.tensor([0]),
+        kv_pool=pool,
+        state_pool=state,
+    )
+    snap = kv.inputs_for(torch.tensor([[5]]), torch.tensor([[19]]), 0)
+    assert "k_scale" in snap and "v_scale" in snap
+    pool.k_scale[:, [1]] = 7
+    assert torch.any(
+        kv.inputs_for(torch.tensor([[5]]), torch.tensor([[19]]), 0)["k_scale"] == 7
+    )
