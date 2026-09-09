@@ -1,24 +1,25 @@
-"""Spec-arm prefill profile using the engine's OWN timing hooks — no added device
-syncs. The previous double-sync bracket instrument (Model.forward + draft.step,
-synced on both sides) perturbed the spec arm +44% wall (178.9 vs 128.4 s at
-HEAD) and disagreed with the overhead harness >5% at both shas, so per the
-2026-09-09 review gate it produced no reportable numbers. This version reads
-fields the engine already maintains:
+"""Spec-arm prefill profile with a ZERO-added-sync instrument. The previous
+double-sync bracket instrument perturbed the spec arm +44% wall (178.9 vs
+128.4 s at HEAD) and disagreed with the overhead harness >5% at 09657c0, so per
+the 2026-09-09 review gate it produced no reportable numbers.
 
-  _prefill_secs   host span of every prefill tick (engine.py:1046), sync-free —
-                  the sample step's logits drain drains the GPU implicitly
-  _draft_ms       CUDA events around each draft step (engine.py:1295), the
-                  engine's own sanctioned draft instrument (one event sync per
-                  tick, priced in the tick-timing bench)
+This version wraps two calls with plain host spans (perf_counter, NO sync):
+  _run_forward  on prefill ticks (prefills nonempty) — the host span includes
+                GPU time because the sample step reads logits to host (.item())
+  draft.step    on every tick — the host span includes GPU time because the
+                draft returns tokens via .tolist() (dflash2.py), which drains
 
-Cross-validation, two independent readings that must agree within 5% at BOTH
-shas or the instrument is fixed before any number is reported:
+Same instrument code at both shas (no engine hooks required), so the ratio is
+trustworthy even though the absolute spans include host launch overhead. At
+HEAD the wraps are cross-checked against the engine's own _prefill_secs and
+_draft_ms — two independent instruments that must agree.
 
+Cross-validation (must hold at BOTH shas or the instrument is fixed first):
   1. wall (one sync pair around generate)
-  2. prefill_secs + draft_ms + decode_remainder (+ encode/detok, ~0.02 s)
-  3. decode_remainder / decode_forwards vs the directly-timed W=8 tick
-     (43.52 ms at 09657c0, 41.96 at HEAD) — a remainder-derived number only
-     stands with a direct-measurement control.
+  2. prefill + draft + decode + enc + detok buckets close to wall within 5%
+  3. decode / decode_forwards vs the directly-timed W=8 tick
+     (43.52 ms at 09657c0, 41.96 at HEAD) within 5% — a remainder-derived
+     number only stands with a direct-measurement control.
 
     CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src:packages/tilerl-kernels/src \
     TILERL_TARGET=cuda python3 scripts/acc_spec_prefill_profile.py \
@@ -36,6 +37,7 @@ from pathlib import Path
 
 import torch
 
+from tilerl import engine as engine_mod
 from tilerl.config import qwen38_27b
 from tilerl.engine import build_engine
 from tilerl.eval import generate
@@ -44,6 +46,36 @@ from tilerl.model import load_hf
 from tilerl.prompt import render_chat, sampling
 from tilerl.spec import load_draft
 from tilerl.tokenizer import get_tokenizer
+
+_buckets = {"prefill": 0.0, "decode": 0.0, "draft": 0.0}
+_counts = {"prefill_ticks": 0, "decode_ticks": 0, "draft_calls": 0}
+
+_orig_run_forward = engine_mod.Engine._run_forward
+_orig_draft_step = None
+
+
+def _timed_run_forward(self, decodes, prefills, chunks):
+    t0 = time.perf_counter()
+    r = _orig_run_forward(self, decodes, prefills, chunks)
+    dt = time.perf_counter() - t0
+    if prefills:
+        _buckets["prefill"] += dt
+        _counts["prefill_ticks"] += 1
+    else:
+        _buckets["decode"] += dt
+        _counts["decode_ticks"] += 1
+    return r
+
+
+def _timed_draft_step(self, rows):
+    t0 = time.perf_counter()
+    r = _orig_draft_step(self, rows)
+    _buckets["draft"] += time.perf_counter() - t0
+    _counts["draft_calls"] += 1
+    return r
+
+
+engine_mod.Engine._run_forward = _timed_run_forward
 
 
 def main() -> None:
@@ -85,7 +117,11 @@ def main() -> None:
                           draft=draft, spec_depth=max(1, 8 - 1) if draft else 0,
                           decode_graph=True, prefix_store=NoPrefixStore())
     if draft is not None:
-        engine._draft_ms = []  # enable the engine's own event-sync draft timing
+        global _orig_draft_step
+        _orig_draft_step = draft.step
+        draft.step = lambda rows: _timed_draft_step(draft, rows)
+        if hasattr(engine, "_draft_ms"):
+            engine._draft_ms = []  # HEAD: enable the engine's own event timing as a cross-check
 
     detok_t = 0.0
     dec_orig = tok.decode
@@ -106,50 +142,53 @@ def main() -> None:
     wall = time.perf_counter() - t0
 
     n = args.n
-    prefill_s = engine._prefill_secs
-    prefill_tokens = engine._prefill_tokens
-    prefill_fwds = engine._prefill_forwards
-    draft_ev = list(engine._draft_ms or [])
-    draft_s = sum(ms for _, ms in draft_ev) / 1000.0
-    draft_fwds = sum(f for f, _ in draft_ev)
+    prefill_s = _buckets["prefill"]
+    decode_s = _buckets["decode"]
+    draft_s = _buckets["draft"]
     stats = engine.stats()
     dec_fwds = stats["decode_forwards"]
+    pre_fwds = stats["prefill_forwards"]
     tok_gen = stats["tokens_generated"]
     spec_acc = stats.get("spec_accepted")
     spec_drafted = stats.get("spec_drafted")
 
-    decode_s = wall - prefill_s - draft_s - encode_t - detok_t
-    dec_per_fwd = decode_s / dec_fwds if dec_fwds else 0.0
-    accept = (tok_gen / dec_fwds) if dec_fwds else 0.0
-    spec_rate = (spec_acc / spec_drafted) if spec_drafted else None
-
-    # Cross-validation reading 2 vs 1: the buckets must close to wall.
-    closure = (prefill_s + draft_s + decode_s + encode_t + detok_t) / wall
+    # Reading 2 vs 1: the buckets must close to wall.
+    closure = (prefill_s + decode_s + draft_s + encode_t + detok_t) / wall
     # Reading 3: decode per forward vs the directly-timed W=8 tick.
-    tick_096 = 43.52
-    tick_head = 41.96
+    dec_per_fwd = (decode_s / _counts["decode_ticks"]) if _counts["decode_ticks"] else 0.0
+    tick_096, tick_head = 43.52, 41.96
+
+    # HEAD-only cross-check: the engine's own hooks vs the wraps.
+    engine_prefill = getattr(engine, "_prefill_secs", None)
+    engine_draft = (sum(ms for _, ms in engine._draft_ms) / 1000.0
+                    if getattr(engine, "_draft_ms", None) else None)
 
     report = {
         "wall": wall,
         "buckets": {
-            "prefill_secs": prefill_s,
-            "draft_ms": draft_s,
-            "decode_remainder": decode_s,
+            "prefill_host": prefill_s,
+            "draft_host": draft_s,
+            "decode_host": decode_s,
             "encode": encode_t,
             "detok": detok_t,
         },
         "closure_buckets_over_wall": closure,
-        "prefill_tokens": prefill_tokens,
-        "prefill_forwards": prefill_fwds,
+        "counts": _counts,
+        "prefill_forwards": pre_fwds,
         "decode_forwards": dec_fwds,
-        "draft_forwards": draft_fwds,
-        "decode_s_per_decode_fwd_ms": dec_per_fwd * 1000,
+        "decode_ms_per_decode_tick": dec_per_fwd * 1000,
         "tick_direct_ms": {"09657c0": tick_096, "HEAD": tick_head},
         "tokens_generated": tok_gen,
-        "tok_per_decode_fwd": accept,
+        "tok_per_decode_fwd": (tok_gen / dec_fwds) if dec_fwds else 0.0,
         "spec_accepted": spec_acc,
         "spec_drafted": spec_drafted,
-        "spec_accept_rate": spec_rate,
+        "spec_accept_rate": (spec_acc / spec_drafted) if spec_drafted else None,
+        "engine_hooks_cross_check": {
+            "prefill_secs": engine_prefill,
+            "draft_ms": engine_draft,
+            "prefill_wrap_minus_engine": prefill_s - engine_prefill if engine_prefill is not None else None,
+            "draft_wrap_minus_engine": draft_s - engine_draft if engine_draft is not None else None,
+        },
         "per_question": {
             "prefill": prefill_s / n,
             "draft": draft_s / n,
@@ -157,14 +196,19 @@ def main() -> None:
         },
     }
     print(f"wall {wall:.1f}s  prefill {prefill_s:.1f}s  draft {draft_s:.1f}s  "
-          f"decode_rem {decode_s:.1f}s  enc {encode_t:.3f}s  detok {detok_t:.3f}s")
-    print(f"closure {closure:.4f} (reading 2 vs 1; must be ~1.000)")
-    print(f"prefill_fwds {prefill_fwds}  decode_fwds {dec_fwds}  draft_fwds {draft_fwds}")
-    print(f"decode {dec_per_fwd*1000:.2f} ms/fwd  (direct tick: {tick_096} at 09657c0, "
+          f"decode {decode_s:.1f}s  enc {encode_t:.3f}s  detok {detok_t:.3f}s")
+    print(f"closure {closure:.4f} (reading 2 vs 1; must be ~1.000, within 5%)")
+    print(f"prefill_ticks {_counts['prefill_ticks']} (fwds {pre_fwds})  "
+          f"decode_ticks {_counts['decode_ticks']} (fwds {dec_fwds})  "
+          f"draft_calls {_counts['draft_calls']}")
+    print(f"decode {dec_per_fwd*1000:.2f} ms/tick  (direct tick: {tick_096} at 09657c0, "
           f"{tick_head} at HEAD)")
-    print(f"tokens_generated {tok_gen}  tok/decode_fwd {accept:.2f}  "
+    print(f"tokens_generated {tok_gen}  tok/decode_fwd {report['tok_per_decode_fwd']:.2f}  "
           f"spec_accepted {spec_acc}  spec_drafted {spec_drafted}  "
-          f"accept_rate {spec_rate}")
+          f"accept_rate {report['spec_accept_rate']}")
+    if engine_prefill is not None:
+        print(f"engine hooks: prefill_secs {engine_prefill:.1f}s (wrap {prefill_s:.1f})  "
+              f"draft_ms {engine_draft:.1f}s (wrap {draft_s:.1f})")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "prefill_profile.json").write_text(json.dumps(report, indent=2))
