@@ -52,7 +52,8 @@ policy, 500 rows):
 | shuffle(0) prefix 200 (new) | 88.0% | +0.60 pt (2×SE of the diff = 5.55 pt) |
 
 The old prefix is low on this policy too; the shuffled subset is unbiased
-within noise.
+within noise. (The −2.40 pt here is a different policy and measurement from the
+−5 pt / z=3.05 recorded in 2026-09-04 — same direction, not a replication.)
 
 ## The price of the cut, stated plainly
 
