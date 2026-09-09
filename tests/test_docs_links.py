@@ -217,19 +217,7 @@ def test_no_doc_invokes_a_flag_the_cli_does_not_have():
     one. What the gate covers is the copy-pasteable form: a command someone will run. Prose
     recommending a flag stays a reading problem.
     """
-    import sys
-
-    sys.path.insert(0, str(ROOT / "src"))
-    from tilerl import cli
-
-    parser = cli._build_parser()
-    accepted: dict[str, set[str]] = {}
-    for action in parser._actions:
-        if action.dest == "cmd" and getattr(action, "choices", None):
-            for name, sp in action.choices.items():
-                accepted[name] = {o for a in sp._actions for o in a.option_strings
-                                  if o.startswith("--")}
-    assert accepted, "could not read subcommands off the parser"
+    accepted = _cli_flags()
 
     invoke = re.compile(r"\btilerl\s+(" + "|".join(sorted(accepted)) + r")\b")
     flag = re.compile(r"(--[a-z][a-z0-9-]{2,})")
@@ -254,6 +242,170 @@ def test_no_doc_invokes_a_flag_the_cli_does_not_have():
     assert not bad, (
         "docs invoke flags the CLI does not accept (mark a deliberate proposal with "
         "NOT IMPLEMENTED on the same line):\n  " + "\n  ".join(bad))
+
+
+def _cli_flags() -> dict[str, set[str]]:
+    """Every --flag each subcommand accepts, read off the parser in-process.
+
+    Shelling out to --help seven times measured 0.55s against 0.01s for this, and
+    the two agree exactly on all seven subcommands.
+    """
+    import sys
+
+    sys.path.insert(0, str(ROOT / "src"))
+    from tilerl import cli
+
+    parser = cli._build_parser()
+    accepted: dict[str, set[str]] = {}
+    for action in parser._actions:
+        if action.dest == "cmd" and getattr(action, "choices", None):
+            for name, sp in action.choices.items():
+                accepted[name] = {o for a in sp._actions for o in a.option_strings
+                                  if o.startswith("--")}
+    assert accepted, "could not read subcommands off the parser"
+    return accepted
+
+
+#: The CLI surface as of 2026-09-09. Any change to it fails test_cli_surface_is_frozen
+#: until this set is edited in the same PR, so a surface change is deliberate and visible.
+_EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
+    'serve': frozenset({
+        '--blocks',
+        '--depth',
+        '--devices',
+        '--draft',
+        '--dram-bytes',
+        '--help',
+        '--host',
+        '--kv-fp8',
+        '--max-batch',
+        '--max-batched-tokens',
+        '--max-ctx',
+        '--model',
+        '--no-warmup',
+        '--port',
+        '--slots',
+        '--ssd-min-tokens',
+        '--ssd-path',
+        '--state-bytes',
+    }),
+    'train': frozenset({
+        '--allow-short-rollouts',
+        '--data',
+        '--depth',
+        '--deterministic',
+        '--draft',
+        '--eval-curve-n',
+        '--eval-curve-seed',
+        '--eval-every',
+        '--eval-gsm8k',
+        '--eval-max-new-tokens',
+        '--eval-mmlu',
+        '--eval-n',
+        '--force',
+        '--group',
+        '--help',
+        '--json',
+        '--judge',
+        '--length-penalty',
+        '--load-adapter',
+        '--lora-rank',
+        '--lr',
+        '--max-new-tokens',
+        '--max-think-tokens',
+        '--micro',
+        '--model',
+        '--opd',
+        '--optim',
+        '--patience',
+        '--prompts-per-step',
+        '--recipe',
+        '--reward',
+        '--rl',
+        '--seed',
+        '--steps',
+        '--temperature',
+        '--tp',
+    }),
+    'pretrain': frozenset({
+        '--ckpt-dir',
+        '--ckpt-every',
+        '--data',
+        '--help',
+        '--lr',
+        '--model',
+        '--seed',
+        '--seq-len',
+        '--steps',
+        '--warmup',
+    }),
+    'bench': frozenset({
+        '--batches',
+        '--gen',
+        '--gpu',
+        '--help',
+        '--model',
+        '--prompt-len',
+        '--questions',
+        '--readme',
+        '--regress',
+        '--source',
+        '--suite',
+        '--table',
+    }),
+    'generate': frozenset({
+        '--devices',
+        '--help',
+        '--max-batch',
+        '--max-new-tokens',
+        '--out',
+        '--seed',
+        '--source',
+        '--temperature',
+        '--top-p',
+    }),
+    'merge': frozenset({
+        '--base',
+        '--help',
+        '--method',
+        '--out',
+        '--specialists',
+    }),
+    'ledger': frozenset({
+        '--help',
+        '--json',
+        '--lineage',
+        '--time-to-score',
+    }),}
+
+
+def test_cli_surface_is_frozen():
+    """A flag must not disappear from the CLI silently.
+
+    2026-09-09: a PR deleting --deterministic landed green, CLEAN, conflict-free --
+    the deletion was plain in the diff and the merger read only the green checks.
+    "Read the diff before merging" is discipline and fails on a night of 20 PRs;
+    this makes the deletion itself fail CI.
+
+    Boundary: a wiring test proves a flag does something; this test proves a flag
+    does not vanish silently; neither catches semantic drift behind a flag that
+    stays present -- that is the wiring test's job.
+
+    Self-checked: with --no-warmup removed from p_serve this fails naming the lost
+    flag; restored, it passes. A guard never seen red is not a guard.
+    """
+    actual = _cli_flags()
+    assert set(actual) == set(_EXPECTED_CLI_FLAGS), (
+        "subcommands changed: "
+        f"new {sorted(set(actual) - set(_EXPECTED_CLI_FLAGS))}, "
+        f"removed {sorted(set(_EXPECTED_CLI_FLAGS) - set(actual))}; "
+        "edit _EXPECTED_CLI_FLAGS in the same PR")
+    for sub, expected in _EXPECTED_CLI_FLAGS.items():
+        lost = sorted(expected - actual[sub])
+        gained = sorted(actual[sub] - expected)
+        assert not lost and not gained, (
+            f"{sub} surface changed: lost {lost}, gained {gained}; "
+            "edit _EXPECTED_CLI_FLAGS in the same PR")
 
 
 def test_no_readme_number_is_absent_from_every_dated_entry():
