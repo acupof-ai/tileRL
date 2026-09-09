@@ -120,11 +120,42 @@ def cross(run0: Path, run1: Path, from_step: int, to_step: int, eval_file: Path,
     print(f"  |L0 \\ L1| = {len(L0 - L1)}   |L1 \\ L0| = {len(L1 - L0)}")
 
 
+def baseline(run0: Path, run1: Path, step: int, eval_file: Path,
+             perm0: list[int] | None, perm1: list[int] | None) -> None:
+    """The null hypothesis for a dip overlap: how much two HEALTHY policies'
+    wrong sets overlap anyway (hard problems are hard for both). At a step
+    before either curve dipped, the overlap is pure problem difficulty."""
+    gold = [json.loads(l)["answer"] for l in eval_file.open()]
+    print(f"gold distinct: {len(set(gold))} of {len(gold)} (collision rows are blind to the check below)")
+    r0 = load_curve(run0, step)
+    r1 = load_curve(run1, step)
+    p0 = perm0 or file_row_perm(run0, len(r0))
+    p1 = perm1 or file_row_perm(run1, len(r1))
+    check_perm_against_gold(r0, p0, gold, "run0")
+    check_perm_against_gold(r1, p1, gold, "run1")
+    w0 = {p0[i] for i, r in enumerate(r0) if not r["correct"]}
+    w1 = {p1[i] for i, r in enumerate(r1) if not r["correct"]}
+    m0 = {p0[i]: bool(r["correct"]) for i, r in enumerate(r0)}
+    m1 = {p1[i]: bool(r["correct"]) for i, r in enumerate(r1)}
+    print(f"runs {run0.name} x {run1.name}  step {step}  paired={len(set(p0) & set(p1))}")
+    print(f"  |A| (run0 wrong) = {len(w0)}   |B| (run1 wrong) = {len(w1)}")
+    print(f"  |A ∩ B| = {len(w0 & w1)}   |A \\ B| = {len(w0 - w1)}   |B \\ A| = {len(w1 - w0)}")
+    # the net score difference as a swap, not a margin
+    common = sorted(set(m0) & set(m1))
+    r0_right_r1_wrong = sum(m0[fr] and not m1[fr] for fr in common)
+    r1_right_r0_wrong = sum(m1[fr] and not m0[fr] for fr in common)
+    s0, s1 = sum(r["correct"] for r in r0), sum(r["correct"] for r in r1)
+    print(f"  scores {s0} vs {s1} (net {s1 - s0:+d}); "
+          f"run0-right/run1-wrong = {r0_right_r1_wrong}, "
+          f"run1-right/run0-wrong = {r1_right_r0_wrong}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("run_dir", nargs="?")
     ap.add_argument("steps", nargs="*", type=int)
     ap.add_argument("--cross", nargs=4, metavar=("RUN0", "RUN1", "FROM", "TO"))
+    ap.add_argument("--baseline", nargs=3, metavar=("RUN0", "RUN1", "STEP"))
     ap.add_argument("--eval-file")
     ap.add_argument("--perm0", type=Path, help="JSON list: run0 curve position -> eval-file row "
                         "(produced by the run's own _curve_rows; overrides local shuffle)")
@@ -136,6 +167,12 @@ def main() -> None:
         p0 = json.loads(args.perm0.read_text()) if args.perm0 else None
         p1 = json.loads(args.perm1.read_text()) if args.perm1 else None
         cross(Path(r0), Path(r1), int(f), int(t), Path(args.eval_file), p0, p1)
+    elif args.baseline:
+        r0, r1, s = args.baseline
+        assert args.eval_file, "--baseline needs --eval-file"
+        p0 = json.loads(args.perm0.read_text()) if args.perm0 else None
+        p1 = json.loads(args.perm1.read_text()) if args.perm1 else None
+        baseline(Path(r0), Path(r1), int(s), Path(args.eval_file), p0, p1)
     else:
         assert args.run_dir and args.steps, "need <run_dir> <step> ..."
         single_table(Path(args.run_dir), args.steps)
