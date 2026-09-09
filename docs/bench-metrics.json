@@ -147,6 +147,7 @@
       "weight": 0.06,
       "shape": [
         "batch",
+        "ctx",
         "depth"
       ],
       "why": "decode-family; a guard row after the verdict flipped three times",
