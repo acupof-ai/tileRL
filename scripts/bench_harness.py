@@ -272,8 +272,8 @@ def suite_spec(gate, cfg, model, backend, batches, source, ticks, depth):
 
 def suite_prefill(gate, cfg, model, backend, lengths, build, model_name, device):
     import benchkit as bk
-
     import benchrec
+
     from tilerl.engine import build_engine
 
     cap = min(8192, cfg.max_position_embeddings)
