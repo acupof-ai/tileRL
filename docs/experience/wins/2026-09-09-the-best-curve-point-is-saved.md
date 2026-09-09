@@ -63,3 +63,12 @@ same rows get a paired SE, and an eval's floor is measured on the instrument its
 assumed. A check that can always return the same answer — the unpaired criterion on a slow
 rise — is not a check; the negative control that proves it can fire is the important part
 of the change, not the implementation.
+
+## Open dependency
+
+Whether this snapshot is "rescue one accident" or "a prerequisite for this recipe" is not
+yet known: a second curve (`--seed 1`, otherwise identical, run by tilerl-9b) decides
+whether the step-75 collapse reproduces. Also note no run in this tree has ever stored
+completion text (`train.py:578-582` keeps step/p/g/tokens/reward/advantage only), so the
+2026-09-08 collapse can never be replayed at the text level — #328 closes that. This entry
+describes the mechanism; the population question belongs to the seed-1 run.
