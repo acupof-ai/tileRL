@@ -156,6 +156,10 @@ def _compiles(path: str) -> int:
     Measured on the pod: a `python3` (no `-u`) server redirected to a file leaves
     0 bytes after SIGTERM, and every cell of the 2026-09-08 DRAM grid reported
     `compiles: clean` against such a log -- a verdict that could not have gone red.
+
+    Lower bound, not a count: only kernels TileLang logs at INFO are counted, so
+    the true JIT count is >= this and the gap is undefined (16 vs 2 on the first
+    real comparison, 2026-09-09). Console-only -- the store records null.
     """
     if not path:
         return -1
@@ -276,8 +280,7 @@ def main() -> int:
                 "metric": "chat_turn_wall_s", "value": round(wall, 3), "unit": "s",
                 "shape": {"turn": turn, "prompt_tokens": n,
                           "sessions": args.sessions, "conv": _label(c)},
-                "warm": {"state": "warm",
-                         "compiles": None if compiles < 0 else compiles},
+                "warm": {"state": "warm", "compiles": None},
                 "n": 1, "spread": 0.0, **benchrec.record_common(args),
             }
             rec["floor"] = benchrec.measured_best_floor(rec, lower_is_better=True)
@@ -321,7 +324,7 @@ def main() -> int:
     known = all(r["compiles"] >= 0 for r in rows)
     verdict = "unknown (no --server-log, or it is empty -- run serve under python3 -u)" \
         if not known else dirty or "clean"
-    print(f"compiles: {verdict}", flush=True)
+    print(f"compiles (log lower bound): {verdict}", flush=True)
     peak = max((r["pool_used_blocks"] for r in rows), default=0)
     tot = max((r["blocks_total"] for r in rows), default=0)
     print(f"pool peak: {peak}/{tot} blocks ({100.0 * peak / max(1, tot):.1f}%)", flush=True)

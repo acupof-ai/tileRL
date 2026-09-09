@@ -174,7 +174,11 @@ def _compiles(log: str) -> int:
     stops matching, every row goes null, so change both together. It prints
     once at startup. A log without it is the wrong file or a buffered file that
     never flushed -- a grep finding no pattern there returns 0, the one value that
-    reads as "everything clean"."""
+    reads as "everything clean".
+
+    Lower bound, not a count: only kernels TileLang logs at INFO are counted, so
+    the true JIT count is >= this and the gap is undefined (16 vs 2 on the first
+    real comparison, 2026-09-09). Console-only -- the store records null."""
     try:
         with open(log, encoding="utf-8", errors="replace") as f:
             text = f.read()
