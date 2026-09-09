@@ -56,6 +56,26 @@ def file_row_perm(run_dir: Path, n_rows: int) -> list[int]:
     return p[:n_rows]
 
 
+def hypergeom_z(obs: int, x: int, y: int, n: int) -> tuple[float, float]:
+    """Standard score of an overlap against the independent-draw null.
+
+    Raw overlaps (and their ratios) are not comparable across steps: the
+    ceiling moves with the set sizes (62/62 on 500 caps the ratio at 8.06x,
+    below a healthy step's measured 9.45x). The z eats the marginals.
+    Returns (E, z); var is E-adjacent so callers print both.
+    """
+    e = x * y / n
+    var = y * (x / n) * (1 - x / n) * (n - y) / (n - 1)
+    return e, (obs - e) / (var ** 0.5)
+
+
+def print_overlap(name: str, obs: int, x: int, y: int, n: int) -> None:
+    """The four numbers a reader needs to recompute the judgement: obs, E,
+    z, and the ceiling (max). When max sits on obs the z is distorted too."""
+    e, z = hypergeom_z(obs, x, y, n)
+    print(f"  {name}: obs={obs}  E={e:.2f}  max={min(x, y)}  z={z:+.1f}")
+
+
 def check_perm_against_gold(rows: list[dict], perm: list[int], gold: list[str],
                             tag: str) -> None:
     """Tripwire: a wrong permutation mismatches gold on most rows.
@@ -118,6 +138,7 @@ def cross(run0: Path, run1: Path, from_step: int, to_step: int, eval_file: Path,
     print(f"  |L0| = {len(L0)}   |L1| = {len(L1)}")
     print(f"  |L0 ∩ L1| = {len(L0 & L1)}")
     print(f"  |L0 \\ L1| = {len(L0 - L1)}   |L1 \\ L0| = {len(L1 - L0)}")
+    print_overlap("L0∩L1 vs difficulty null", len(L0 & L1), len(L0), len(L1), len(common))
 
 
 def baseline(run0: Path, run1: Path, step: int, eval_file: Path,
@@ -140,6 +161,7 @@ def baseline(run0: Path, run1: Path, step: int, eval_file: Path,
     print(f"runs {run0.name} x {run1.name}  step {step}  paired={len(set(p0) & set(p1))}")
     print(f"  |A| (run0 wrong) = {len(w0)}   |B| (run1 wrong) = {len(w1)}")
     print(f"  |A ∩ B| = {len(w0 & w1)}   |A \\ B| = {len(w0 - w1)}   |B \\ A| = {len(w1 - w0)}")
+    print_overlap("A∩B vs difficulty null", len(w0 & w1), len(w0), len(w1), len(set(p0) & set(p1)))
     # the net score difference as a swap, not a margin
     common = sorted(set(m0) & set(m1))
     r0_right_r1_wrong = sum(m0[fr] and not m1[fr] for fr in common)
