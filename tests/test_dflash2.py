@@ -536,3 +536,31 @@ def test_engine_block_equals_the_full_context_block(tmp_path):
                       backend, hidden_out=hid, aux_layers=taps)
         want = head.draft(torch.cat(hid[:-1], -1), pos, tokens[-1], backend)
         assert drafts == want, (len(ctx), drafts, want)
+
+
+def test_spec_draft_rejected_behind_a_real_prefix_store(tmp_path):
+    """The build-time gate (engine.py): a drafter tapping the trunk's aux layers
+    cannot serve behind a prefix cache — an adopted prefix skips the positions
+    the draft's context was built from, so the failure would look like a weak
+    drafter, not a bug. The negative arm raises; the positive control
+    (NoPrefixStore) must build, or the test can't tell the gate from an
+    always-raise bug.
+    """
+    from tilerl.engine import build_engine
+    from tilerl.kv_cache import NoPrefixStore
+
+    head = _tiny_head(tmp_path)
+    assert head.aux_layers  # the gate's precondition
+
+    with pytest.raises(ValueError, match="look like a weak drafter, not a bug"):
+        build_engine(
+            tiny(), head.trunk, get_backend(), num_blocks=64, num_slots=4, max_batch=4,
+            max_total_tokens=256, draft=head, decode_graph=False, prefix_store=None,
+        )
+
+    # Positive control: the same draft builds behind NoPrefixStore.
+    engine = build_engine(
+        tiny(), head.trunk, get_backend(), num_blocks=64, num_slots=4, max_batch=4,
+        max_total_tokens=256, draft=head, decode_graph=False, prefix_store=NoPrefixStore(),
+    )
+    assert engine is not None
