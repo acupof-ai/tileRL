@@ -143,8 +143,7 @@ def unpaired_diff_se(pt_a: dict, pt_b: dict) -> float:
     return round(100.0 * (pa * (1 - pa) / na + pb * (1 - pb) / nb) ** 0.5, 2)
 
 
-def new_best_point(pt: dict, best: dict | None, se: float | None = None,
-                   mode: str = "significant") -> bool:
+def new_best_point(pt: dict, best: dict | None, se: float | None = None) -> bool:
     """Whether ``pt`` replaces the incumbent best curve point.
 
     SIGNIFICANTLY greater, not merely greater -- two independent judgments. The 2xSE
@@ -159,40 +158,9 @@ def new_best_point(pt: dict, best: dict | None, se: float | None = None,
     per-problem rows. None falls back to the conservative unpaired width -- the caller
     must mark that result, because a conservative "not significantly greater" must not
     be read as "the two points are the same".
-
-    ``mode="raw"`` compares raw scores (strict >) instead of the 2xSE ruler. It exists
-    for small curve subsets, where the paired width is wider than the signal -- at
-    n=100 the paired 2xSE is 5.6-7.4 pt against a +6.0 pt step gain -- so the
-    significant ruler never fires and patience stops at the second point on every
-    curve, a guard that always fires. Three risks, the whole of why raw is not the
-    default:
-
-    1. It can fire on a one-question gain -- and under the same-batch instrument that
-       gain is REAL, not jitter, so raw is sounder here than it first looks. The risk
-       is the hair trigger: any strict gain, however small, resets patience and buys
-       more training, even a gain too small to be worth the next five steps. Seed 1 in
-       raw mode stops at step 50 on 94.2 <= 94.4, one question.
-    2. It is safe only on curves whose gain is concentrated in the first point -- a
-       step, then flat -- where "stop at the first non-improving point" loses nothing.
-       On a gradual rise it follows the small gains: best drifts up on one-question
-       gains -- real on this set, unproven on another -- and the decline veto is then
-       measured against that inflated peak (cell F). A
-       flat point stops BOTH modes under patience=1 -- the mode-specific hazard is
-       the drift, not the stop.
-    3. It is coupled to the adapter-best snapshot: stopping early loses only "might
-       improve later", never what was -- the only reason raw is acceptable. Without
-       the snapshot, raw is a net loss.
-    4. It ships the expensive twin: `adapter-best` follows `best`, so a one-question
-       gain does not just reset patience -- it makes the SNAPSHOT, the weights that get
-       delivered, a one-question choice. p@25 = 94.0, p@50 = 94.2: significant calls
-       it a tie and keeps step 25, raw keeps step 50 -- 25 more training steps for a
-       pair statistics cannot separate. Raw knowingly waives the tie-keeps-the-
-       earlier-point rule above, in exchange for a guard that still works at small n.
     """
     if best is None:
         return True
-    if mode == "raw":
-        return pt["score"] > best["score"]
     if se is None:
         se = unpaired_diff_se(pt, best)
     return pt["score"] - best["score"] > 2 * se / 100.0
@@ -480,40 +448,14 @@ if __name__ == "__main__":  # runnable check
         assert "paired" in str(exc) and "step 50" in str(exc)
     require_paired_width(1.31, 2)
     require_paired_width(None, 0)
-    # Patience mode raw. The paired width at n=100 is 5.6-7.4 pt against a +6.0 pt
-    # step gain, so the significant ruler never fires there; raw compares raw scores.
-    # Cell E: a gradual rise at small n. Significant stops at the third point and
-    # keeps the first -- the guard that always fires. Raw follows the rise and never
-    # stops. This is why raw exists, and the proof the modes differ.
-    rise = [{"step": s, "score": x} for s, x in ((5, .940), (10, .950), (15, .960), (20, .970))]
-    es_sig, es_raw, best_sig, best_raw = EarlyStop(2), EarlyStop(2), None, None
-    for p in rise:
-        rep_s = new_best_point(p, best_sig, 6.0)
-        rep_r = new_best_point(p, best_raw, 6.0, mode="raw")
-        if rep_s:
-            best_sig = p
-        if rep_r:
-            best_raw = p
-        es_sig.update(rep_s)
-        es_raw.update(rep_r)
-    assert es_sig.reason == "patience" and best_sig["step"] == 5
-    assert es_raw.reason is None and best_raw["step"] == 20
-    # Cell F: raw's risk, pinned. A one-question gain at n=100 (1.0 pt, under the
-    # 6.0 pt width) resets patience and drifts best up in raw; significant does
-    # neither. The drift has two consequences. It feeds the decline veto: measured
-    # against the drifted peak, a later point vetoes in raw where significant --
-    # whose best never moved -- sees no decline. And it ships the expensive twin:
-    # significant keeps the earlier point (the tie rule), raw the later one -- more
-    # training for a pair statistics cannot separate. Same curve, different kept
-    # point and different verdict.
+    # Significant-decline veto against two peaks: the same later point vetoes
+    # against the higher peak but not the lower one, at the same width.
     p1, p2 = {"step": 5, "score": .940}, {"step": 10, "score": .950}
-    assert not new_best_point(p2, p1, 6.0)       # significant: tie, keeps step 5
-    assert new_best_point(p2, p1, 6.0, mode="raw")  # raw: keeps step 10
     assert EarlyStop(1).update(False) == "patience"
     assert EarlyStop(1).update(True) is None
     p3 = {"step": 15, "score": .820}
-    assert significant_decline(p3, p2, 6.0)       # vs the drifted raw peak: -13.0 pt
-    assert not significant_decline(p3, p1, 6.0)   # vs the significant peak: -12.0 pt, not > 2xSE
+    assert significant_decline(p3, p2, 6.0)       # vs step-10 peak: -13.0 pt, > 2xSE
+    assert not significant_decline(p3, p1, 6.0)   # vs step-5 peak: -12.0 pt, not > 2xSE
     # Curve churn: the run's own instrument reading, recorded per point. Adjacent
     # points pair by the ``i`` key within one run (rows land in completion order
     # since the eval arm writes incrementally); across runs the keys mean different
