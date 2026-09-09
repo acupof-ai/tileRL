@@ -112,6 +112,28 @@ def test_group_advantages():
     assert np.allclose(group_advantages([2.0, 2.0], group=2), 0.0)
 
 
+def test_all_wrong_group_ranks_advantages_by_length():
+    """Every match is 0, so the length term is the whole reward: r_i = -lam*L_i/cap
+    normalizes to -(L_i - Lbar)/std(L) -- shortest first, lam-independent for lam > 0,
+    and silent at lam = 0."""
+    from tilerl.cli import _length_aware
+
+    class Tok:
+        def decode(self, ids):
+            return "x" * len(ids)
+
+    lengths = [3, 7, 1, 9, 5, 2, 8, 4]
+
+    def adv_at(lam):
+        reward = _length_aware(lambda text, gold: 0.0, {(): ""}, Tok(), lam, 32)
+        return group_advantages([reward((), [0] * L) for L in lengths], group=8)
+
+    a = adv_at(0.1)
+    assert np.all(np.diff(a[np.argsort(lengths)]) < 0), a  # shortest first, strictly
+    assert np.allclose(a, adv_at(1.0))  # lam cancels: its magnitude is not a dial
+    assert np.allclose(adv_at(0.0), 0.0)  # lam = 0 ties the group, and a tie is silent
+
+
 def test_an_empty_rollout_injects_no_gradient():
     """A zero-length completion scores 0 positions in `rl_step`, so its own
     advantage reaches nothing -- but as a reward=0 group member it moved every
