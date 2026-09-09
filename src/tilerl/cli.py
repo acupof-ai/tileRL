@@ -149,7 +149,8 @@ def _shard(cfg, model, tp: int, backend, model_mod):
 
 def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=16,
                   blocks=0, max_ctx=0, max_batch=8, ssd_path="", ssd_min_tokens=0,
-                  dram_bytes=0, state_bytes=0, kv_fp8="", decode=None):
+                  dram_bytes=0, state_bytes=0, kv_fp8="", decode=None,
+                  max_batched_tokens=0):
     """Serving-size engine; ``devices`` replicates it across those CUDA indices.
 
     ``max_ctx`` caps the served context; it still defaults to the model's own limit,
@@ -188,6 +189,8 @@ def _build_engine(cfg, model, backend, devices=None, draft=None, depth=2, slots=
     # tokenizer's decode; without it `submit` refuses a request that carries one.
     if decode is not None:
         kw["decode"] = decode
+    if max_batched_tokens:
+        kw["max_num_batched_tokens"] = max_batched_tokens
     if not devices:
         return engine_mod.build_engine(cfg, model, backend, **kw)
 
@@ -225,7 +228,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            max_batch=args.max_batch, ssd_path=args.ssd_path,
                            ssd_min_tokens=args.ssd_min_tokens, dram_bytes=args.dram_bytes,
                            state_bytes=args.state_bytes, kv_fp8=args.kv_fp8,
-                           decode=tokenizer.decode)
+                           decode=tokenizer.decode,
+                           max_batched_tokens=args.max_batched_tokens)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
     # Print the pool: with --blocks 0 it is fitted to the card, so this is the served
@@ -1731,6 +1735,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="concurrent rows; drop to 2 for a single-user endpoint (a decode "
                               "graph is captured per bucket x chain width, so a lower "
                               "ceiling is fewer captures)")
+    p_serve.add_argument("--max-batched-tokens", type=int, default=0,
+                         help="token budget for one tick's chunked prefill; raise for "
+                              "faster prefill at decode's expense (default: engine's 512)")
     p_serve.add_argument("--no-warmup", dest="warmup", action="store_false",
                          help="skip precapturing the decode graphs; the first real messages "
                               "then pay for them (1088 ms/token falling to 26 over six "
