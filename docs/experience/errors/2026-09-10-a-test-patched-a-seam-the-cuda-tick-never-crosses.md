@@ -28,9 +28,22 @@ The test patches both seams. Each backend crosses exactly one: the eager path
 calls `_model.forward`, the graph path calls `_run_decode_graph`. The
 assertions (raise, `take(1)` raises, rollback to zero) are unchanged.
 
+A tree-wide grep (`git grep -n "_model\.forward *=" origin/main -- tests/`)
+finds this one site — the fix covers the class, not an instance.
+
 ## Rule
+
+`decode_graph` swaps the whole execution path: a CUDA pure-decode tick replays
+a captured graph and never touches the eager forward. Any test hook on the
+eager path is dead on the card by default — a future hook must hang on the
+graph seam too, or count its own entries on the card. This predicts the next
+instance: 9b's fp8 write-path seam was the same root, a hook the card never
+calls.
 
 A test that injects a failure must inject it at the seam every backend it runs
 on crosses — count the injection on the card, not only on CPU. A mutant that is
 never entered is the same shape as one that is ignored: the test stays green
-while the behavior it claims to gate is untested.
+while the behavior it claims to gate is untested. The assertion decides whether
+that silence is loud: `pytest.raises` goes red when the seam dies, an
+"output changed" assertion goes green — the latter needs an entry counter, the
+former does not.
