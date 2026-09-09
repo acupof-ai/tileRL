@@ -1,8 +1,10 @@
 # Early stopping for the GRPO curve: four decisions — 2026-09-08
 
 **Asked by:** tilerl-27, after the four-point curve landed (base 87.4 / step 25 93.2 /
-step 50 **93.4** / step 75 82.4 / step 100 91.2). Stopping at the peak is worth **1.99x wall
-clock and +2.2 points** against running to 100.
+step 50 **93.4** / step 75 82.4 / step 100 91.2). Stopping at the peak is worth **+2.2
+points** against running to 100. The fine curve (eval-every 5, landed the same day) puts
+`steps_to_score(X=91.0)` at **≤ 5 steps / ≤ 119.0 s → ≥ 17.4x** wall clock — a lower
+bound, because a grid always overstates the crossing step and understates the ratio.
 
 **Read Q4 first. It changes what the other three are worth.**
 
@@ -44,6 +46,13 @@ Training reward is out, and this run is the proof: **through the 11-point collap
 75 the reward fell about 5% and held.** A signal that does not move when the thing you care
 about drops 11 points is not a signal.
 
+It is not just reward — **every training-side metric was perfect at the collapse.** On the
+replay of the same run (86a06dc8c420), train reward was 1.000 on the collapse day and the
+whole 51–75 window only drifted 0.900 → 0.855; all six gates stayed silent; MMLU was flat
+(75.1 → 75.7), so it was not a capability loss either. The eval drop was 11.0 pt, paired
+6.62σ. Training-side metrics cannot be a stopping signal, full stop — the stop decision has
+to hang on the eval curve, the quantity the steps-to-score instrument prices.
+
 That leaves the curve, and its price is the design problem:
 
 | `--eval-every` | points | eval wall | train wall | eval share |
@@ -71,6 +80,13 @@ proxy.** A cheaper signal that disagrees with the curve is worse than no signal,
 cheap signal available (training reward) is already known to have missed the event this
 feature exists for.
 
+**Price "measure finer" in tokens, not points.** The fine curve (four points at eval-every 5)
+cost **68 min of eval against 7.7 min of training — a 90% instrument** — because eval cost is
+linear in *generated tokens*, not rows: early policies answer long, so the points that would
+justify stopping early are the most expensive ones to score. The coarse table above understates
+the share at fine cadence for this reason. A denser grid is a token-cost proposal first and a
+statistical-power proposal second.
+
 ---
 
 ## Q2 — Patience is not determinable from this run, and I will not invent a number
@@ -87,14 +103,24 @@ and recover" from "this run hit one bad update." Fitting a patience to it would 
 the `f = 0.3` failure — a parameter with a real derivation from a curve that happens to be
 the only one we have.
 
+**The fine curve adds a second, independent refusal: a plateau is not a stationary policy.**
+From step 5 to step 10 the score moved by exactly 0.00 — and ten questions changed hands,
+five each way. Two points at the same score are different policies, so "the score has been
+flat for N points" does not mean "the policy has stopped moving," and a patience rule would
+stop the run in the middle of motion whose direction it cannot see: that motion is what
+became the step-25 length compression (2.1x cheaper tok/correct) in one part of this curve
+and the step-75 −11 pt collapse in another. The premise of every flatness counter — that a
+flat score names a stable policy — is false on the only curve fine enough to test it.
+
 **Decision: ship no patience. Ship best-point selection instead**, which is well-defined on
 this data (the peak is step 50, unambiguously) and does not require predicting the future.
 Patience becomes answerable after N runs show whether a dip typically recovers; that is a
 question for a population of curves, not for this curve.
 
 **What this costs, stated plainly:** best-point selection alone saves **zero wall clock**. It
-buys the +2.2 points, not the 1.99x. The 1.99x needs a stopping rule, and a stopping rule
-needs data we do not have.
+buys the +2.2 points, not the wall clock. The wall clock is real — the fine curve puts
+`steps_to_score(X=91.0)` at ≤ 5 steps / ≤ 119.0 s, a ≥ 17.4x lower bound — but it needs a
+stopping rule, and a stopping rule needs data we do not have.
 
 ---
 
