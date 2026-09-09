@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -55,6 +56,7 @@ def _run_arm(cfg, model, backend, tok, rows, sp, draft_path, width):
 
     for name in ("encode", "detok"):
         _cur[name] = 0.0
+    _cur["encode_n"] = _cur["detok_n"] = 0
     enc, dec_t = tok.encode, tok.decode
     tok.encode = lambda s: _wrap(enc, s, "encode")
     tok.decode = lambda ids: _wrap(dec_t, ids, "detok")
@@ -68,16 +70,18 @@ def _run_arm(cfg, model, backend, tok, rows, sp, draft_path, width):
     generate(engine, tok, prompts, sp, 1)
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
+    stats = engine.stats()
     tok.encode, tok.decode = enc, dec_t
     engine = draft = None
     torch.cuda.empty_cache()
-    return wall, dict(_cur)
+    return wall, dict(_cur), stats
 
 
 def _wrap(fn, arg, name):
     t0 = time.perf_counter()
     r = fn(arg)
     _cur[name] = _cur.get(name, 0.0) + (time.perf_counter() - t0)
+    _cur[f"{name}_n"] = _cur.get(f"{name}_n", 0) + 1
     return r
 
 
@@ -104,9 +108,12 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     report = {}
-    for name, draft_path, width in (("base", None, 1), ("spec-w8", args.draft, 8)):
+    order = (("base", None, 1), ("spec-w8", args.draft, 8))
+    if os.environ.get("OH_REVERSE"):
+        order = tuple(reversed(order))
+    for name, draft_path, width in order:
         _cur.clear()
-        wall, parts = _run_arm(cfg, model, backend, tok, rows, sp, draft_path, width)
+        wall, parts, stats = _run_arm(cfg, model, backend, tok, rows, sp, draft_path, width)
         dec, pre = parts.get("decode", 0.0), parts.get("prefill", 0.0)
         enc, det = parts.get("encode", 0.0), parts.get("detok", 0.0)
         sched = wall - dec - pre - enc - det
@@ -114,9 +121,14 @@ def main() -> None:
                  (("wall", wall), ("decode", dec), ("prefill", pre), ("encode", enc),
                   ("detok", det), ("scheduling", sched))}
         report[name] = {"wall": wall, "decode": dec, "prefill": pre, "encode": enc,
-                        "detok": det, "scheduling": sched, "per_question": per_q}
+                        "detok": det, "scheduling": sched, "per_question": per_q,
+                        "encode_n": parts.get("encode_n", 0), "detok_n": parts.get("detok_n", 0),
+                        "prefix_hits": stats.get("prefix_hits"),
+                        "prefix_misses": stats.get("prefix_misses")}
         print(f"[{name}] wall {wall:.1f}s  decode {dec:.1f}  prefill {pre:.1f}  "
-              f"encode {enc:.1f}  detok {det:.1f}  scheduling {sched:.1f}  "
+              f"encode {enc:.4f}s x{parts.get('encode_n', 0)}  "
+              f"detok {det:.4f}s x{parts.get('detok_n', 0)}  "
+              f"scheduling {sched:.1f}  prefix_hits {stats.get('prefix_hits')}  "
               f"(per-q: sched {per_q['scheduling']*1000:.0f}ms)", flush=True)
 
     (out / "overhead.json").write_text(json.dumps(report))
