@@ -298,18 +298,31 @@ def current(records: list[dict]) -> dict:
     return out
 
 
-def add_record_args(ap, *, default_target: str = "sm90", default_device: str | None = "H20"):
-    """The population flags every collector carries. --build stays optional here:
-    a server client cannot see the server's build and must demand it (eager vs
-    fused+graph is 6.4x on decode), while an engine-direct script derives the
-    build from its own flags and passes it to ``record_common``."""
+def add_record_args(
+    ap, *, default_target: str = "sm90", default_device: str | None = "H20",
+    client_side: bool = False,
+):
+    """The population flags every collector carries. --build stays argparse-optional
+    here but record_common raises without it: a server client cannot see the server's
+    build (eager vs fused+graph is 6.4x on decode), while an engine-direct script
+    derives the build from its own flags and passes it to ``record_common``.
+
+    client_side: the script measures a remote server over HTTP and cannot see its
+    attributes. Rule: a client-side collector must not default any field describing
+    the server -- the default would be a value the client cannot know, and it would
+    look correctly set. --device-name then has no default and record_common raises
+    without it. Defaults are only for things the collector itself knows."""
     ap.add_argument("--build", choices=list(BUILDS),
                     help="the build under test (required when the script cannot see it)")
     ap.add_argument("--target", default=default_target, choices=list(TARGETS))
-    ap.add_argument("--device-name", default=default_device,
-                    help="GPU model; engine scripts default to torch.cuda.get_device_name")
+    ap.add_argument("--device-name", default=None if client_side else default_device,
+                    help="GPU model of the server under test; required for client-side "
+                         "collectors, which cannot see it. Engine scripts default to "
+                         "torch.cuda.get_device_name")
     ap.add_argument("--card", type=int, help="physical GPU card; required on sm90/sm70")
     ap.add_argument("--model-name", default="27B-nvfp4")
+    if client_side:
+        ap.set_defaults(_benchrec_client_side=True)
 
 
 def record_common(args, *, build: str | None = None) -> dict:
@@ -323,6 +336,11 @@ def record_common(args, *, build: str | None = None) -> dict:
     if args.target in ("sm90", "sm70") and args.card is None:
         raise SystemExit(f"--card required on target {args.target}")
     device_name = args.device_name
+    if not device_name and getattr(args, "_benchrec_client_side", False):
+        raise SystemExit("--device-name required: a client cannot see the server's "
+                         "device, and a default here is a population lie -- a cpu run "
+                         "labeled H20 enters every device-grouped view and every "
+                         "measured-best comparison")
     if not device_name:
         try:
             import torch

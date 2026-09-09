@@ -185,7 +185,7 @@ def main() -> int:
     ap.add_argument("--server-log", default="",
                     help="the server's own stdout, for the compiles count; without it a "
                          "compile inside a measured turn is invisible and reads as tier cost")
-    benchrec.add_record_args(ap)
+    benchrec.add_record_args(ap, client_side=True)
     args = ap.parse_args()
     if args.sessions < 1:
         ap.error("--sessions must be >= 1")
