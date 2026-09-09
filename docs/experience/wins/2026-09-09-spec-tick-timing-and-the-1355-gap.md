@@ -91,7 +91,7 @@ recorded here as an open question, not a conclusion, and no story was invented
 for it. That stance was correct even though the phenomenon itself is now known
 to be noise.
 
-**The fp8→bf16 hypothesis is dead — VOID test.** A proposed explanation was that the prefill
+**The fp8→bf16 hypothesis is untested — VOID test.** A proposed explanation was that the prefill
 activation path fell back from fp8 to bf16 kernels (~2x). Runtime dispatch at "09657c0"
 is all-fp8 (`linear_fp4` → `linear_fp4_fp8`, `linear_fp8` → `linear_fp8` /
 `linear_fp8_gemv`, zero bf16), and the phase derivation (`m==1` gemv / `m<=16` decode /
