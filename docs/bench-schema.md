@@ -48,6 +48,12 @@ machine cannot check, so review must: **every new `floor.derivation` is
 recomputed by its reviewer** — the arithmetic, not just the prose
 (`wins/2026-09-09-the-first-floor-derivation-failed-its-own-check.md`).
 
+A flag that changes a metric's meaning is a population field, not prose: add
+it to the metric's registry `shape` keys (spec `depth`, SSD `arm`) so the key
+names the condition — `tied@lam=0.1` in the record, never `tied` with the
+lambda in a comment. A value whose condition lives outside the key is not
+falsifiable from the store.
+
 ## Reruns
 
 A rerun of the same population appends a new row with `supersedes` (the old
