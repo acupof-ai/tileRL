@@ -20,11 +20,12 @@ dependencies = [
     "huggingface-hub>=1.28.0",
     "safetensors>=0.8.0",
     "tokenizers>=0.23.1",
-    # Pinned and direct so [tool.uv.sources] can move linux to the cu129 index:
-    # source overrides do not apply to transitive deps (uv#9446), and torch was
-    # only transitive via tilelang. Direct also states the truth: the framework
-    # imports torch everywhere.
-    "torch==2.13.0",
+    # Direct because the framework imports torch everywhere (was transitive
+    # via tilelang). >=2.11.0: the pod's working env (tl013) has 2.11.0+cu129;
+    # PyPI's latest works on Mac/CI. The cu129 index redirect was removed:
+    # torch 2.13.0+cu129 needs nccl>=2.29 and that index has max 2.19.3.
+    # See errors/2026-09-09-the-cu129-index-redirect-cannot-run-on-the-pod.md
+    "torch>=2.11.0",
 ]
 
 [project.optional-dependencies]
@@ -49,15 +50,6 @@ members = ["packages/*"]
 
 [tool.uv.sources]
 tilerl-kernels = { workspace = true }
-# torch on linux must come from the CUDA 12.9 index: pypi's 2.13.0+cu130 cannot
-# run on the pod driver (535.161.08), and `uv run` builds its own venv, bypassing
-# the hand-built /work/tl013 on PATH. See errors/2026-09-09-uv-run-builds-a-venv-the-pod-cannot-run.md
-torch = [{ index = "pytorch-cu129", marker = "sys_platform == 'linux'" }]
-
-[[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
-explicit = true
 
 [build-system]
 requires = ["uv_build>=0.9.24,<0.10.0"]

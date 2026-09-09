@@ -3,6 +3,11 @@
 Date: 2026-09-09
 Status: closed (workaround: launch with the tl013 interpreter; AGENTS.md unchanged pending ckl)
 
+#342 attempted to fix the root cause (pin torch, redirect linux to the cu129
+index) but the redirect cannot work: torch 2.13.0+cu129 needs nccl>=2.29 and
+that index has max 2.19.3. See
+[the-cu129-index-redirect-cannot-run-on-the-pod](2026-09-09-the-cu129-index-redirect-cannot-run-on-the-pod.md).
+
 ## Context
 
 A training launch on the GPU pod died at `torch.cuda.init` with
