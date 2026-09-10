@@ -76,8 +76,7 @@ attention is therefore explicit: the pool is `num_blocks x per_block` with the
 fp8 scale plane inside `per_block` (no separate scale row), and a request's
 occupancy is `blocks_used x per_block`. A prefix entry on the device is pool
 blocks and a state slot already counted; it becomes a row only when demoted to
-`host` or `ssd`, where the copy is new bytes. The trainer's tape is outside
-`plan` until training shares it.
+`host` or `ssd`, where the copy is new bytes.
 
 `stats()["memory"]` returns the same rows with a measured column: on cuda the
 `memory_allocated` difference around each owner's allocation, on cpu the storage
@@ -85,8 +84,17 @@ sum, and `transient = max_memory_allocated - sum(static rows)`. A dry-run mode o
 `tilerl serve` prints the plan as JSON without a card; `--dry-run --checkpoint DIR`
 builds nothing and prices the weights row from `model.checkpoint_weight_faces(cfg, DIR)`
 (the served faces, headers only — non-serving tensors dropped and bf16 fp4 keys repacked
-block 32), fitting blocks arithmetically, so the 27B ledger runs on a GPU-less machine. The gate is
-`derived == measured` for `weights` and `kv_pool` on the tiny model; a nonzero
+block 32), fitting blocks arithmetically, so the 27B ledger runs on a GPU-less machine.
+The training engine is a separate `memory.train_plan` over the same `nbytes`:
+`adapter` (bf16), AdamW `optimizer_state` (2 f32 per trained param), ISO `frame`
+(host-tier f32 U,S,V per 2-D weight, with Adafactor factors on the frames), and
+the `tape` row — what RecordingBackend keeps after one layer-segmented forward
+(embedding, one boundary hidden per layer, final norm, head output; +adapter
+head entries); `tilerl train --dry-run --recipe X` prints those rows without a
+build. The gate is
+`derived == measured` for `weights` and `kv_pool` on the tiny model; the
+training rows equal the live adapter / optimizer / frame tensor storage and a
+counted tiny tape (`tests/test_train_plan.py`); a nonzero
 delta on a static row on the 27B is an error entry, not a tolerance. Nothing here
 runs in the tick: `plan` is arithmetic at build time, `stats` reads counters.
 

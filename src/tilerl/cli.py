@@ -335,7 +335,35 @@ def cmd_serve(args: argparse.Namespace) -> None:
         engine.shutdown()
 
 
+def _train_dry_run(args: argparse.Namespace) -> None:
+    """--dry-run on `train`: print the training rows (adapter, optimizer state,
+    ISO frames, the layer-segment tape) without building anything. B is the
+    micro-batch rows (--micro, else the RL group), S is the max token length the
+    tape segments against (--train-seq-len, else the recipe's max_new_tokens)."""
+    from . import config as config_mod
+    from .memory import train_plan
+
+    cfg = {"tiny": config_mod.tiny, "tiny-agent": lambda: config_mod.tiny(65536),
+           "qwen38-27b": config_mod.qwen38_27b}[args.model]()
+    b = args.batch or args.micro or args.group
+    s = args.train_seq_len or args.max_new_tokens
+    is_lora = args.rl or args.opd
+    rows = train_plan(cfg, b, s, lora_rank=args.lora_rank if is_lora else None,
+                      optim=args.optim)
+    out = [{"tier": r.tier, "owner": r.owner, "bytes": r.n, "note": r.note,
+            "measured": None, "delta": None} for r in rows]
+    if args.json:
+        print(json.dumps(out, indent=1))
+    else:
+        algo = f"LoRA r{args.lora_rank} + AdamW" if is_lora else f"full SFT {args.optim}"
+        print(f"tilerl train --dry-run: model={cfg.name} {algo} B={b} S={s}")
+        for r in out:
+            print(f"  {r['tier']:<6} {r['owner']:<18} {r['bytes']/1e6:12.3f} MiB {r['note']}")
+
+
 def cmd_train(args: argparse.Namespace) -> None:
+    if getattr(args, "dry_run", False):
+        return _train_dry_run(args)
     if args.rl or args.opd:
         if not args.data and not (args.recipe == "grpo-tiny-smoke" and args.model == "tiny"):
             sys.exit("error: --data is required for RL/OPD training")
@@ -2081,6 +2109,15 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          "head's own (chain: 2; block: its checkpoint's block minus the anchor)")
     p_train.add_argument("--recipe", choices=sorted(RECIPES),
                          help="a flag set that passed a gate (recipes.py); flags override it")
+    p_train.add_argument("--dry-run", action="store_true",
+                         help="print the training memory rows (adapter/optimizer/frame/tape) "
+                              "and stop; no model, no engine, no card")
+    p_train.add_argument("--batch", type=int, default=0,
+                         help="--dry-run: micro-batch rows B for the tape row (default: "
+                              "--micro, else --group)")
+    p_train.add_argument("--train-seq-len", type=int, default=0, metavar="S",
+                         help="--dry-run: token rows per batch for the layer-segment tape "
+                              "(default: --max-new-tokens)")
     # The recipe is the subparser's defaults, so anything typed still wins.
     p_train.set_defaults(func=cmd_train, **(flags(recipe) if recipe else {}))
 
