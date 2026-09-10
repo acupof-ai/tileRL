@@ -152,6 +152,48 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
     assert [r["id"] for r in json.loads(capsys.readouterr().out)] == [m["id"]]
 
 
+def test_ledger_renders_each_runs_engine_memory_table(tmp_path, monkeypatch, capsys):
+    """P5 reads occupancy next to secs/step without opening manifest.json: the text
+    ledger appends the manifest's engine memory block (#475) rendered through the
+    same format_memory_table serve --dry-run uses; --json stays the raw manifests.
+    A run without the field prints only its one line."""
+    from tilerl.memory import format_memory_table
+
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
+    data = tmp_path / "d.jsonl"
+    data.write_text('{"prompt": "1+1?", "answer": "2"}\n')
+    assert _train(["--rl", "--data", str(data), "--steps", "0", "--group", "2",
+                   "--max-new-tokens", "4", "--lora-rank", "4"]) == 0
+    (m,) = list_runs(tmp_path / "runs")
+    capsys.readouterr()  # discard cmd_train's own stdout; only cmd_ledger is under test
+
+    cmd_ledger(_build_parser().parse_args(["ledger"]))
+    out = capsys.readouterr().out
+    first, _, block = out.partition("\n")
+    assert first == format_run(m)
+    # The rendered block is format_memory_table over the manifest's rows, indented.
+    expect = "\n".join("    " + ln for ln in
+                       format_memory_table(m["engine"]["memory"]).splitlines())
+    assert block.rstrip("\n") == expect.rstrip("\n")
+
+    # An older manifest without engine.memory prints the line and nothing after it.
+    old = new_manifest("merge", {"x": 1})
+    old["finished"] = now()
+    write_manifest(tmp_path / "runs", old)
+    cmd_ledger(_build_parser().parse_args(["ledger"]))
+    lines = capsys.readouterr().out.rstrip("\n").splitlines()
+    i = lines.index(format_run(old))
+    # no memory block follows the field-less run: the next line, if any, is another
+    # top-level run (not indented table output)
+    assert i == len(lines) - 1 or not lines[i + 1].startswith("    "), lines
+    assert "MiB" not in lines[i], lines
+
+    # --json stays the raw manifests: the rows ride along unchanged, no rendered text.
+    cmd_ledger(_build_parser().parse_args(["ledger", "--json"]))
+    got = {r["id"]: r for r in json.loads(capsys.readouterr().out)}
+    assert got[m["id"]]["engine"]["memory"] == m["engine"]["memory"]
+
+
 def test_load_adapter_run_links_its_parent(tmp_path, monkeypatch):
     """A continued adapter run records the run that produced the loaded adapter as its
     parent, so `tilerl ledger --lineage` walks the GRPO continuation chain. The
