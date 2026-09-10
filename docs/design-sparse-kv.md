@@ -12,8 +12,12 @@ selection through the same engine.
 
 16 full-attention layers, 4 KV heads x 256, fp8 KV: `kv_format(256)` gives
 33,280 B per token (32 planes x 4 x 256 + 512 B of f32 scales). Index keys per
-token: 16 layers x (128 B fp8 + 4 B f32 scale) = 2,112 B, 15.8x smaller. Top-k
-= 2048 tokens per layer per row: 2048 x 2 planes x 4 x 260 B x 16 = 65 MiB.
+token: 16 layers x (128 B fp8 + 4 B f32 scale) = 2,112 B, 15.8x smaller; one
+key per token per layer, shared by the index query heads as in V3.2. Selection
+is top-k **pages**, k_pages = 128 (2048 tokens) per layer per row: 128 pages x
+2 planes x 4 x 16 x 260 B x 16 layers = 65 MiB. Selecting top-k tokens instead
+would pin between 128 and 2048 pages (up to 1,040 MiB per row), so the unit of
+selection is the page and the hot budget is fixed by k_pages.
 Weights stay 22.759 GiB (served faces), so the smallest card is 32 GB.
 
 | 256k context | dense fp8 KV on device | sparse: index + hot pages | cold KV (host / SSD) |
@@ -25,17 +29,18 @@ Derived from `nbytes`; nothing above is measured yet. The dense column is the
 P6 ledger's row (`2026-09-11-p6-long-context-budget-on-one-h20.md`).
 
 Per decode step at 256k, B=1: the indexer reads 528 MiB of keys (0.13 ms at
-4 TB/s) and 4.3 GFLOP (4 index heads); the tick's weight read is 22.36 GB
-(5.6 ms at 4 TB/s), so scoring is 2% of the tick. Fetching hot pages from the
-host is 65 MiB per row worst case (1.3 ms at 50 GB/s PCIe) and only the delta
-in practice: the selected set of a row changes by a few pages per token. The
+4 TB/s) and 4.3 GFLOP (4 index query heads against the one shared key per
+token); the tick's weight read is 22.36 GB (5.6 ms at 4 TB/s), so scoring is
+2% of the tick. Fetching hot pages from the host is 65 MiB per row worst case
+(1.3 ms at 50 GB/s PCIe); that the per-token delta is a few pages is a
+prediction to be measured on the card, not a property of the design. The
 bound is in `kernel_cost` as two more rows, priced by the same rule as every
 other kernel (bytes per HBM direction crossed, PCIe bytes as their own column).
 
 ## Selection is page-granular
 
-`BLOCK_TOKENS = 16`. The indexer scores tokens; the selector takes the top-k
-tokens and returns the set of blocks that contain them. The page table gains
+`BLOCK_TOKENS = 16`. The indexer scores tokens; the selector max-pools scores
+over each page and returns the top-k_pages blocks. The page table gains
 one field, `location in {device, host, ssd}`, and the block ids in a
 `block_table` row are the selected pages. `paged_attention` does not change:
 it receives a block table whose length is the selected set, not the context.
@@ -58,7 +63,7 @@ ends. The union of a chunk's selected sets is fetched once, not per query.
 
 ```
 index_keys  device  count = tokens_resident, fmt = Format(bits=8, scales=((128, f32),)), shape [layers, 128]
-kv_hot      device  count = rows x k_pages,  per_kv_block_bytes
+kv_hot      device  count = rows x k_pages x full-attn layers, per_kv_block_bytes / planes x 2  (k_pages = 128)
 kv_cold     host|ssd count = pages_written - pages_on_device, per_kv_block_bytes
 ```
 
