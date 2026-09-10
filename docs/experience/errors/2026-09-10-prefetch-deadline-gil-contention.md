@@ -89,15 +89,24 @@ speed. When the fetch runs in a different thread, GIL contention can make
 it 175x slower. Measure the fetch time in the actual threading environment,
 not in isolation.
 
-## Open: CPU deadline margin too thin (second instance of the same shape)
+## CPU deadline margin too thin (second instance of the same shape)
 
-Status: open. The fix above landed the GIL yield, but on CPU the deadline is
-still thin: `tokens / seed_rate` = 2.56 s at 192 tokens, while the
-GIL-starved fetch takes 1.2–2.4 s on a loaded box. The e2e test
-`test_a_prefetched_hit_reads_nothing_on_the_calling_thread` flakes (3/16 on
-a dev machine, clean main — pre-existing, not introduced by the fix). The
-test's clock was hardened (`_drain_clock`) but the engine's deadline was
-not — the same shape as the original bug, second instance.
+Status: fixed 2026-09-10 by the spin-until-ready loop (72d83303,
+[wins entry](../wins/2026-09-10-spin-until-ready-fixes-cpu-prefetch-flake.md)):
+the e2e flake went 3/16 → 0/20. The fix spins `sleep(0)` while a fetch is in
+flight instead of yielding a fixed N times per tick — the sweep below shows N
+is a distribution tail, and the spin is N=∞ with an early exit plus a 50 ms
+wall-clock bound as a safety valve. Open remainder (carried in OPEN.md): the
+spin's cost on 27B is unmeasured (the 144 MiB snapshot needs many windows, so
+the spin actually runs there), and `any_fetching()` is global, not per-request.
+
+The fix above landed the GIL yield, but on CPU the deadline was still thin:
+`tokens / seed_rate` = 2.56 s at 192 tokens, while the GIL-starved fetch took
+1.2–2.4 s on a loaded box. The e2e test
+`test_a_prefetched_hit_reads_nothing_on_the_calling_thread` flaked (3/16 on a
+dev machine, clean main — pre-existing, not introduced by the fix). The test's
+clock was hardened (`_drain_clock`) but the engine's deadline was not — the
+same shape as the original bug, second instance.
 
 Length sweep (192/384/768, 4 runs each): deadline 2.56/5.12/10.24 s, fetch
 1.2–2.4 / 0.8–3.3 / 2.0–6.6 s. Margin grows 1.05x → 1.55x then plateaus,
@@ -109,5 +118,6 @@ N-sweep (yields per tick vs `fetch_ms`, 192 tokens, 2 runs each): N=1 →
 fetch reaches the uncontended floor (2 ms) at N≥10. The reader misses most
 `sleep(0)` windows (it is mid-I/O, not GIL-blocked, when the yield fires),
 so N=1 catches a window only ~once per 14 ticks; N=20 catches one within
-~1 tick. Fix direction: yield N times per tick while a fetch is in flight
-(steady state stays at 1 yield), N from this sweep, pending approval.
+~1 tick. The sweep could not price a fixed N (2 runs per cell, and the tail
+decides the flake), so the shipped fix spins until the fetch parks with a
+50 ms wall-clock bound — N=∞ with an early exit, no tuned parameter.
