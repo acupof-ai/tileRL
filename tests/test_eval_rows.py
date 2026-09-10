@@ -117,6 +117,39 @@ def test_the_rollout_cap_must_clear_the_measured_completion_length():
         _refuse_short_rollouts(_ROLLOUT_HEADROOM * 1000 + 1, 1000)
 
 
+def test_eval_gsm8k_must_be_held_out_from_training(tmp_path, monkeypatch):
+    """A held-out eval that overlaps the training file is contamination, not eval.
+
+    Before this guard every CLI plumbing test passed the SAME file to --data and
+    --eval-gsm8k, so the before/after gate could be green at a contamination
+    fraction of 1.0. The guard counts overlap against the FULL eval file, before
+    --eval-n slices it.
+    """
+    import pytest
+
+    from tilerl.cli import _build_parser, cmd_train
+
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
+    data = tmp_path / "d.jsonl"
+    data.write_text('{"prompt": "1+1?", "answer": "2"}\n{"prompt": "2+2?", "answer": "4"}\n')
+    overlap = tmp_path / "ov.jsonl"
+    overlap.write_text('{"prompt": "2+2?", "answer": "4"}\n{"prompt": "9+9?", "answer": "18"}\n')
+    with pytest.raises(SystemExit, match="held out"):
+        cmd_train(_build_parser().parse_args(
+            ["train", "--rl", "--data", str(data), "--eval-gsm8k", str(overlap),
+             "--steps", "1", "--group", "2", "--max-new-tokens", "4",
+             "--lora-rank", "4", "--allow-short-rollouts"]))
+    # Disjoint files do not trip it (it must not refuse every tiny smoke run).
+    import contextlib
+    held = tmp_path / "held.jsonl"
+    held.write_text('{"prompt": "9+9?", "answer": "18"}\n')
+    with contextlib.suppress(SystemExit):
+        cmd_train(_build_parser().parse_args(
+            ["train", "--rl", "--data", str(data), "--eval-gsm8k", str(held),
+             "--steps", "1", "--group", "2", "--max-new-tokens", "4",
+             "--lora-rank", "4", "--allow-short-rollouts"]))
+
+
 def test_training_stops_on_a_cap_the_policy_cannot_answer_in(tmp_path, monkeypatch):
     """The guard through the CLI, because everything above it passes with the call
     site deleted -- a guard that exists and never runs.
@@ -131,7 +164,9 @@ def test_training_stops_on_a_cap_the_policy_cannot_answer_in(tmp_path, monkeypat
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
     data = tmp_path / "d.jsonl"
     data.write_text('{"prompt": "1+1?", "answer": "2"}\n{"prompt": "2+2?", "answer": "4"}\n')
-    argv = ["train", "--rl", "--data", str(data), "--eval-gsm8k", str(data), "--steps", "1",
+    held = tmp_path / "held.jsonl"
+    held.write_text('{"prompt": "3+3?", "answer": "6"}\n{"prompt": "4+4?", "answer": "8"}\n')
+    argv = ["train", "--rl", "--data", str(data), "--eval-gsm8k", str(held), "--steps", "1",
             "--group", "2", "--max-new-tokens", "4", "--lora-rank", "4",
             "--eval-max-new-tokens", "32"]
 
@@ -176,6 +211,8 @@ def test_before_eval_cache_reuses_rows_and_invalidates_length(tmp_path, monkeypa
     monkeypatch.setenv("TILERL_RUNS", str(root))
     data = tmp_path / "eval.jsonl"
     data.write_text('{"prompt": "1+1?", "answer": "2"}\n')
+    held = tmp_path / "held.jsonl"
+    held.write_text('{"prompt": "3+3?", "answer": "6"}\n')
     monkeypatch.setattr(eval_mod, "mmlu_questions", lambda *a: (["1+1? A. 2 B. 3"], ["A"], ["math"]))
     calls = []
     generate = eval_mod.generate_ids
@@ -191,7 +228,7 @@ def test_before_eval_cache_reuses_rows_and_invalidates_length(tmp_path, monkeypa
         calls.clear()
         argv = [
             "train", "--rl", "--model", "tiny", "--steps", "1", "--group", "2",
-            "--data", str(data), "--eval-gsm8k", str(data), "--eval-mmlu", "1",
+            "--data", str(data), "--eval-gsm8k", str(held), "--eval-mmlu", "1",
             "--max-new-tokens", "4", "--eval-max-new-tokens", str(cap),
             "--lora-rank", "2", "--lr", str(lr), "--allow-short-rollouts"]
         args = cli._build_parser().parse_args(argv + (["--load-adapter", str(load)] if load else []))
