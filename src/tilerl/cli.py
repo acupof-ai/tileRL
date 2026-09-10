@@ -316,6 +316,15 @@ def _train_full(args: argparse.Namespace) -> None:
         secs_per_step_median=statistics.median(secs))
     if torch.cuda.is_available():
         manifest["metrics"]["peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
+    # Save the trained bf16 model: full SFT is the producer `tilerl merge` consumes as a
+    # specialist, and without an artifact its run could never be linked as a merge parent
+    # (find_run_for_artifact resolves the specialist dir back through artifacts.out). The
+    # LoRA paths record their adapter separately.
+    from .model import save_hf
+
+    out_dir = Path(runs_root()) / manifest["id"] / "model"
+    save_hf(model, out_dir)
+    manifest["artifacts"]["out"] = str(out_dir)
     return _finish(manifest, args.json)
 
 
@@ -728,6 +737,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
         commit,
         curve_churn,
         file_hash,
+        find_run_for_artifact,
         new_best_point,
         new_manifest,
         paired_se,
@@ -793,6 +803,13 @@ def _train_adapters(args: argparse.Namespace) -> None:
     if prev and prev["finished"] and not args.force:
         log(f"run {prev['id']} already finished; --force reruns")
         return _finish(prev, args.json)
+    # Lineage: a continued adapter run descends from the run that produced the file
+    # loaded through --load-adapter. Resolved before this manifest is written, so the
+    # search can never match the current run; an unlinked file contributes no parent.
+    if args.load_adapter:
+        parent = find_run_for_artifact(runs_root(), args.load_adapter)
+        if parent is not None:
+            manifest["parents"] = [parent]
     manifest["metrics"] = dict.fromkeys((
         "mmlu_before", "mmlu_after", "gsm8k_before", "gsm8k_after",
         "gsm8k_before_tokens", "gsm8k_after_tokens", "peak_gib"))
@@ -1614,15 +1631,39 @@ def cmd_bench(args: argparse.Namespace) -> None:
 
 
 def cmd_merge(args: argparse.Namespace) -> None:
-    from .ledger import commit, new_manifest, now, runs_root, write_manifest
+    from .ledger import (
+        commit,
+        find_run_for_artifact,
+        new_manifest,
+        now,
+        read_manifest,
+        runs_root,
+        write_manifest,
+    )
     from .merge import merge_checkpoints
 
-    n = merge_checkpoints(args.base, args.specialists, args.out, method=args.method)
+    # `out` is deliberately not in the id: merging the same inputs is the same run
+    # whether the bytes land here or there, so a repeat returns the recorded run.
     m = new_manifest("merge", {"base": args.base, "specialists": list(args.specialists),
                                "method": args.method, "commit": commit()})
+    prev = read_manifest(runs_root(), m["id"])
+    if prev and prev["finished"] and not args.force:
+        print(json.dumps(prev, indent=1) if args.json
+              else f"run {prev['id']} already finished; --force reruns")
+        return
+    # Link lineage through the run that WROTE each checkpoint: the dir carries no run
+    # id, only the producing manifest's artifacts. An unlinked dir simply contributes no
+    # parent; ids are never guessed from a path component.
+    paths = [args.base, *args.specialists]
+    m["parents"] = [pid for pid in (find_run_for_artifact(runs_root(), p) for p in paths)
+                    if pid is not None]
+    n = merge_checkpoints(args.base, args.specialists, args.out, method=args.method)
     m["metrics"], m["artifacts"], m["finished"] = {"tensors": n}, {"out": args.out}, now()
     write_manifest(runs_root(), m)
-    print(f"merged {len(args.specialists)} specialists ({args.method}) -> {args.out}  run {m['id']}")
+    if args.json:
+        print(json.dumps(m, indent=1))
+    else:
+        print(f"merged {len(args.specialists)} specialists ({args.method}) -> {args.out}  run {m['id']}")
 
 
 def _se_note(r: dict) -> str:
@@ -1925,6 +1966,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     )
     p_merge.add_argument("--out", required=True, help="merged checkpoint dir")
     p_merge.add_argument("--method", choices=["iso", "average"], default="iso")
+    p_merge.add_argument("--force", action="store_true",
+                         help="re-merge even if a finished run with these inputs exists")
+    p_merge.add_argument("--json", action="store_true", help="print the manifest as JSON")
     p_merge.set_defaults(func=cmd_merge)
 
     p_ledger = sub.add_parser("ledger", help="list runs ($TILERL_RUNS, default ./runs)")

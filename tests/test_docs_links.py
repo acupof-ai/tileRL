@@ -378,7 +378,9 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
     }),
     'merge': frozenset({
         '--base',
+        '--force',
         '--help',
+        '--json',
         '--method',
         '--out',
         '--specialists',

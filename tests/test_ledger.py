@@ -148,6 +148,31 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
     assert [r["id"] for r in json.loads(capsys.readouterr().out)] == [m["id"]]
 
 
+def test_load_adapter_run_links_its_parent(tmp_path, monkeypatch):
+    """A continued adapter run records the run that produced the loaded adapter as its
+    parent, so `tilerl ledger --lineage` walks the GRPO continuation chain. The
+    producing run is found through its artifact (adapter.safetensors), not the path."""
+
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
+    data = tmp_path / "d.jsonl"
+    data.write_text('{"prompt": "1+1?", "answer": "2"}\n')
+    base = ["--rl", "--data", str(data), "--steps", "1", "--group", "2",
+            "--max-new-tokens", "4", "--lora-rank", "4", "--allow-short-rollouts"]
+    _train(base)
+    runs = [p for p in (tmp_path / "runs").iterdir() if (p / "manifest.json").exists()]
+    assert len(runs) == 1
+    first = runs[0]
+    adapter = first / "adapter.safetensors"
+    assert adapter.exists(), "the first run saved no adapter to link"
+    first_id = json.loads((first / "manifest.json").read_text())["id"]
+
+    _train(base + ["--load-adapter", str(adapter)])
+    manifests = {p.name: json.loads((p / "manifest.json").read_text())
+                 for p in (tmp_path / "runs").iterdir() if (p / "manifest.json").exists()}
+    continued = [m for m in manifests.values()
+                 if m["inputs"].get("load_adapter") and m["id"] != first_id]
+    assert len(continued) == 1, manifests.keys()
+    assert continued[0]["parents"] == [first_id], continued[0]["parents"]
 def test_the_manifest_records_the_engine_config_the_wall_clock_depends_on(tmp_path, monkeypatch):
     """A run's wall clock cannot be compared against another run's without these.
 
