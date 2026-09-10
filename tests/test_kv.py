@@ -882,12 +882,15 @@ def test_batchkv_inputs_for_fp8_scales():
 
 
 def test_a_yielded_gil_runs_a_background_load_promptly(tmp_path):
-    """The SSD prefetch fix's premise: sleep(0) in the step loop lets the reader
-    thread run torch.load at uncontended speed.
+    """The SSD prefetch fix's premise: yielding the GIL hands the reader thread a
+    prompt time slice, so a background torch.load runs at near-uncontended speed.
 
-    Red when a CPython/torch upgrade changes GIL behavior so a yielded tick no
-    longer hands the reader a prompt slice -- the prefetch deadline then expires
-    on fast cards again
+    Guards the premise itself, not the once-per-tick yield #444 shipped: N=1
+    leaves the reader starving on slow ticks (1.5s on CPU), and the
+    spin-until-ready fix that closes that is a separate change. What must not
+    silently break is the environmental assumption -- that sleep(0) in a busy
+    loop lets a bg load finish promptly. Red when a CPython/torch upgrade
+    changes GIL behavior so it stops holding
     (docs/experience/errors/2026-09-10-prefetch-deadline-gil-contention.md).
     """
     if sysconfig.get_config_var("Py_GIL_DISABLED"):
@@ -925,4 +928,8 @@ def test_a_yielded_gil_runs_a_background_load_promptly(tmp_path):
     # a mutant. Under a loaded CI box both arms slow together and the ratio holds;
     # if load ever pushes the ratio below 10x, that is flake, not regression.
     assert busy > yielded * 10, f"no contention visible: busy={busy:.1f}ms yielded={yielded:.1f}ms"
+    # Absolute ceiling on the yielded arm (14x the measured 0.7ms): the ratio alone
+    # passes when both arms slow together, so this catches a yielded arm that is
+    # slow in absolute terms. If this is red while the ratio above is green, that
+    # is machine load, not regression.
     assert yielded < 10.0, f"yielded load too slow: {yielded:.1f}ms"
