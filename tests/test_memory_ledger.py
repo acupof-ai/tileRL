@@ -292,7 +292,7 @@ def test_peak_equals_static_plus_transient_exactly():
                 if r["kind"] == "allocation" and r.get("measured") is not None
                 and r["owner"] != "transient"}
     peak = eng._measured_peak_bytes()
-    table, totals = memory_table(rows, measured, peak)
+    table = memory_table(rows, measured, peak)
     by = {r["owner"]: r["derived"] for r in table}
 
     static_sum = sum(r.n for r in static_rows(rows))
@@ -300,7 +300,7 @@ def test_peak_equals_static_plus_transient_exactly():
     assert static_sum + by["transient"] == peak
     # CPU tiny cell: no allocator scratch beyond the named rows.
     assert by["transient"] == 0
-    assert totals["device"] == peak
+    assert by["device_total"] == peak
 
 
 def test_transient_zero_on_tiny_and_red_under_a_dropped_static_row():
@@ -325,13 +325,13 @@ def test_transient_zero_on_tiny_and_red_under_a_dropped_static_row():
     # static allocation, not scratch.
     scratch_bound = nbytes(f32, (1, cfg.hidden_size))  # one activation-sized allowance
 
-    good, _ = memory_table(rows, measured, peak)
+    good = memory_table(rows, measured, peak)
     good_transient = next(r["derived"] for r in good if r["owner"] == "transient")
     assert good_transient < scratch_bound, good_transient
 
     # Mutant: drop the kv_pool static row but keep measured + peak (the pool is still held).
     dropped = [r for r in rows if r.owner != "kv_pool"]
-    mutated, _ = memory_table(dropped, measured, peak)
+    mutated = memory_table(dropped, measured, peak)
     absorbed = next(r["derived"] for r in mutated if r["owner"] == "transient")
     dropped_bytes = next(r.n for r in static_rows(rows) if r.owner == "kv_pool")
     assert absorbed == peak - sum(r.n for r in static_rows(dropped))
@@ -361,7 +361,7 @@ def test_residency_row_roundtrips_through_benchrec(tmp_path):
     # A card-less sm90 row is refused at append: residency must not fabricate target/card.
     import pytest
 
-    fake = residency_row("H20", None, 500, 450, 50, target="sm90")
+    fake = residency_row("H20", None, 500, 450, 50, target="sm90", model="27B-nvfp4")
     with pytest.raises(Exception):
         append_residency(fake, tmp_path / "sm.jsonl")
 

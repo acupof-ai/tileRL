@@ -75,8 +75,7 @@ def test_calibration_returns_both_floors(tmp_path):
     p = _store(tmp_path, [_row(cal.BW_METRIC, 4000.0, "GB/s", H20),
                           _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20)])
     got = cal.calibration(cal.load_rows(p), H20)
-    assert got == {"bw_gbs": 4000.0, "peak_tflops": 989.0,
-                   "bw_commit": None, "peak_commit": None}
+    assert got == {"bw_gbs": 4000.0, "peak_tflops": 989.0}
 
 
 def test_calibrate_refuses_off_cuda(monkeypatch):

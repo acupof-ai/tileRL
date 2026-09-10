@@ -1,21 +1,15 @@
 """Device calibration for the kernel roofline: measured HBM bandwidth and bf16 peak,
-appended to the same store the bench views read (``docs/experience/bench/
-measurements.jsonl``; ``$TILERL_BENCH_STORE`` overrides it for tests).
+appended to the same store the bench views read (``$TILERL_BENCH_STORE`` overrides it).
 
 The roofline divides declared bytes and flops by a MEASURED floor, never a datasheet:
 the floor is what THIS card actually does for a large device-to-device copy (HBM
 bandwidth) and one big bf16 GEMM (tensor peak), timed with CUDA events. The CPU side of
 this module is the ledger read and the bound arithmetic, which is exactly what the gate
-asserts; the measurement itself is cuda-only and renders pending-remote off a card.
-
-Row metric names are ``hbm_bw_gbs`` and ``bf16_peak_tflops``; their ``floor.kind`` is
-``measured-best`` (the device's own measured ceiling for that population)."""
+asserts; the measurement itself is cuda-only and renders pending-remote off a card."""
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
@@ -33,49 +27,19 @@ def store_path() -> Path:
     )
 
 
-def git_commit() -> str:
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=str(_ROOT), capture_output=True, text=True, check=True
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        stamp = _ROOT / ".synced_commit"
-        return stamp.read_text().strip() if stamp.exists() else "unknown"
-
-
-def git_dirty() -> bool:
-    try:
-        out = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=str(_ROOT),
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-        return bool(out.strip())
-    except (OSError, subprocess.CalledProcessError):
-        marker = _ROOT / ".synced_dirty"
-        if marker.exists():
-            return marker.read_text().strip() == "1"
-        raise
-
-
 def load_rows(path: str | os.PathLike | None = None) -> list[dict]:
-    """Newest last; a torn final line is skipped (same rule as scripts/benchrec)."""
-    p = Path(path) if path is not None else store_path()
-    if not p.exists():
-        return []
-    rows, skipped = [], 0
-    for line in p.read_text().splitlines():
-        if not line.strip():
-            continue
-        try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError:
-            skipped += 1
-    if skipped:
-        print(f"calibration: WARNING skipped {skipped} unparseable ledger line(s)", flush=True)
-    return rows
+    """The ledger's rows via scripts/benchrec (the one reader/writer); a torn tail is
+    skipped there. ``path`` swaps benchrec.STORE for the read, so a test store works."""
+    from .cli import _benchrec
+
+    br = _benchrec()
+    old = br.STORE
+    if path is not None:
+        br.STORE = Path(path)
+    try:
+        return br.load_all()
+    finally:
+        br.STORE = old
 
 
 def latest_floor(rows: list[dict], metric: str, device_name: str) -> dict | None:
@@ -103,8 +67,6 @@ def calibration(rows: list[dict], device_name: str) -> dict | None:
     return {
         "bw_gbs": float(bw["value"]),
         "peak_tflops": float(peak["value"]),
-        "bw_commit": bw.get("commit"),
-        "peak_commit": peak.get("commit"),
     }
 
 
@@ -161,6 +123,9 @@ def measure_bf16_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> fl
 
 
 def _row(metric: str, value: float, unit: str, device_name: str, card: int, derivation: str):
+    from .cli import _benchrec
+
+    br = _benchrec()
     return {
         "metric": metric,
         "value": float(value),
@@ -173,8 +138,8 @@ def _row(metric: str, value: float, unit: str, device_name: str, card: int, deri
         "n": 1,
         "spread": 0,
         "device": {"name": device_name, "card": card},
-        "commit": git_commit(),
-        "dirty": git_dirty(),
+        "commit": br.git_commit(),
+        "dirty": br.git_dirty(),
         "cmd": f"tilerl bench --calibrate --card {card}",
         "floor": {
             "value": float(value),
@@ -213,23 +178,12 @@ def calibrate_rows(card: int) -> list[dict]:
     ]
 
 
-def _benchrec():
-    """The single schema writer for the bench store. ``scripts/`` is not a packaged
-    module, so load it by path from the repo root; calibration rows must pass the SAME
-    validate/append every collector satisfies — there must not be a second writer."""
-    import importlib.util
-
-    br_path = _ROOT / "scripts" / "benchrec.py"
-    spec = importlib.util.spec_from_file_location("tilerl_benchrec", br_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def append_rows(rows: list[dict], path: str | os.PathLike | None = None) -> list[str]:
-    """Validate and append through ``scripts/benchrec`` (the tree's one schema writer).
-    A row that fails its REQUIRED/unit/target/device/floor checks is rejected before the
-    file is opened — calibration is not a second, unvalidated writer. Returns the ids."""
+    """Validate and append through scripts/benchrec via cli._benchrec, the tree's one
+    schema-writer loader. A row failing REQUIRED/unit/target/device/floor checks is
+    rejected before the file is opened — calibration is not a second writer. Returns ids."""
+    from .cli import _benchrec
+
     br = _benchrec()
     old = br.STORE
     if path is not None:
@@ -287,21 +241,6 @@ def _pack_for(face, w_bf16):
     return (w8, wscale), {}
 
 
-def _event_ms(fn) -> float:
-    import torch
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    for _ in range(5):
-        fn()
-    torch.cuda.synchronize()
-    start.record()
-    fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end)
-
-
 def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     """ms of the registry kernel the row's face DECLARES, or None to render
     pending-remote. Inputs are packed to that kernel's weight face, so the measured ms
@@ -324,4 +263,4 @@ def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     # identity assertion: the thing we time is the kernel object the row's face
     # declared, not a substitute. resolve_row_kernel is the single resolution point.
     assert fn is resolve_row_kernel(backend, row)
-    return _event_ms(lambda: fn(x, *wargs, **wkw))
+    return _event_seconds(lambda: fn(x, *wargs, **wkw), 1) * 1000.0
