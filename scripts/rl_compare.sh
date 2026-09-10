@@ -20,13 +20,14 @@ CUDA_VISIBLE_DEVICES=$GPU TILERL_QWEN38_SOURCE=$SRC python3 -m tilerl.cli train 
   --max-new-tokens "$LEN" --eval-mmlu "$MMLU" | tee /work/rl_compare_tilerl.log
 # Read the manifest, not the log: the step line gained phase timings and no longer
 # ends in "<n>s", so the old trailing-number regex matched nothing and reported a
-# crash-length median of zero. The manifest is where secs_per_step_median is defined.
+# crash-length median of zero. Bind THIS run by its id (the last tee'd line is the
+# ledger summary, whose first field is the run id), not "newest manifest" -- the
+# script runs on a shared card where another run may finish in the same window.
 python3 - "$RUNS" <<'PY'
 import json, pathlib, sys
-manifests = list(pathlib.Path(sys.argv[1]).glob("*/manifest.json"))
-if not manifests:
-    sys.exit(f"no manifest under {sys.argv[1]}; set TILERL_RUNS to the run dir")
-m = json.loads(max(manifests, key=lambda p: p.stat().st_mtime).read_text())
+runs_dir, log_path = sys.argv[1], "/work/rl_compare_tilerl.log"
+rid = pathlib.Path(log_path).read_text().strip().splitlines()[-1].split()[0]
+m = json.loads((pathlib.Path(runs_dir) / rid / "manifest.json").read_text())
 g = m["metrics"]
 print(f"tilerl run {m['id']}: {g.get('steps_completed')} steps, "
       f"median {g['secs_per_step_median']:.1f}s/step, total {g['secs_total']:.0f}s")
