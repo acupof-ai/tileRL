@@ -662,6 +662,53 @@ def test_gdn_chunkwise_matches_serial():
             _assert_close(a, b_, f"gdn chunkwise({chunk}) {name}")
 
 
+def test_gdn_chunk_rounding_bound():
+    """No chunk-size pair pushes the GDN state out of the e2e parity tolerance.
+
+    The consumer is the prefix-store test, which compares two engines' states with
+    ``torch.allclose(rtol=1e-2, atol=1e-5)`` (tests/test_e2e.py). On CUDA a
+    64-vs-128 chunk difference broke that gate on a near-zero element (ratio ~2.0,
+    errors/2026-09-10-gdn-state-chunk-size-rounding). This test measures, for every
+    chunk pair over a seq_len grid, the worst per-element violation ratio
+    ``|delta| / (atol + rtol*|ref|)`` — ratio > 1 breaks parity. Unlike the backward
+    gate (test_gdn_backward_precision_tracks_the_chunk_size), which asserts ordering
+    because no consumer bounds the gradient error, this one has a consumer, so an
+    absolute bound is meaningful. Re-measured with scripts/gdn_chunk_rounding_sweep.py.
+    """
+    # the consumer's tolerance: torch.allclose(rtol=1e-2, atol=1e-5) in tests/test_e2e.py
+    rtol, atol = 1e-2, 1e-5
+    chunks = (16, 32, 64, 128)
+    seqs = (64, 100, 128, 164, 256)
+    q, k, v, g, beta, z, state, kw = _gdn_inputs(2, max(seqs), 2, 6, 16, 16, 4, 31, scale=10.0)
+
+    def _state(t, chunk):
+        return reference.gdn_forward(
+            q[:, :t],
+            k[:, :t],
+            v[:, :t],
+            g[:, :t],
+            beta[:, :t],
+            state,
+            z=z[:, :t],
+            chunkwise=chunk,
+            **kw,
+        )[1]
+
+    worst = 0.0
+    for t in seqs:
+        s = {c: _state(t, c) for c in chunks}
+        for ca in chunks:
+            for cb in chunks:
+                if ca == cb:
+                    continue
+                ratio = ((s[ca] - s[cb]).abs() / (atol + rtol * s[cb].abs())).max().item()
+                worst = max(worst, ratio)
+    # measured 8.5e-3 on CPU / 8.1e-3 on metal (this grid, scale=10.0, 2026-09-10);
+    # x2 margin covers device and torch-version drift; still ~60x inside the parity
+    # failure threshold (ratio 1.0). Negative control: bound 8e-3 fails (measured 8.5e-3).
+    assert worst <= 1.7e-2, f"gdn chunk rounding violation ratio {worst:.3e} exceeds bound 1.7e-2"
+
+
 @pytest.mark.parametrize("t", [1, 4])
 def test_gdn_chunk_matches_decode(backend, t):
     """The chunk kernel equals the in-place decode kernel, per-chain-step planes
