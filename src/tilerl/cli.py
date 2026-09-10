@@ -2007,7 +2007,7 @@ def _format_device_ledger(sections: list[dict]) -> str:
 
 
 def cmd_ledger(args: argparse.Namespace) -> None:
-    from .ledger import format_run, lineage, list_runs, runs_root, time_to_score
+    from .ledger import lineage, list_runs, runs_root, time_to_score
 
     if args.devices:
         sections = _device_ledger_rows()
@@ -2046,7 +2046,22 @@ def cmd_ledger(args: argparse.Namespace) -> None:
                       f"{r['steps_run']} steps / {r['secs']:.1f}s; best "
                       f"{r['best']:.3g} on {r['n']} rows{_se_note(r)}")
         return
-    print(json.dumps(runs, indent=1) if args.json else "\n".join(map(format_run, runs)))
+    text = "\n".join(_format_ledger_run(m) for m in runs)
+    print(json.dumps(runs, indent=1) if args.json else text)
+
+
+def _format_ledger_run(m: dict) -> str:
+    """The one-line run, then its engine occupancy table when the manifest carries
+    one (#475), indented under the row; older/manifest-less runs print only the line."""
+    from .ledger import format_run
+    from .memory import format_memory_table
+
+    line = format_run(m)
+    mem = (m.get("engine") or {}).get("memory")
+    if not mem:
+        return line
+    block = "\n".join("    " + ln for ln in format_memory_table(mem).splitlines())
+    return f"{line}\n{block}"
 
 
 def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
