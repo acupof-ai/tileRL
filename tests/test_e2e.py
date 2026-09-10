@@ -3828,6 +3828,7 @@ def test_a_prefetched_hit_reads_nothing_on_the_calling_thread(tmp_path):
         kvmod.torch.load = real
 
     st = cold.stats()
+    assert st["ssd_prefetches"] >= 1, "no prefetch queued: the submit->prefetch wiring broke"
     assert st["ssd_hits"] >= 1, f"no hit ({st['ssd_recovered']} recovered), so this proves nothing"
     assert calls["tick"] == 0, (
         f"{calls['tick']} torch.load on the calling thread while serving a hit: the "
