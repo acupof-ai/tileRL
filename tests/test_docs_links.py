@@ -360,6 +360,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--help',
         '--kernels',
         '--model',
+        '--prefill',
         '--prompt-len',
         '--questions',
         '--readme',
