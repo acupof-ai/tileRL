@@ -2,8 +2,15 @@
 
 One primitive prices every byte and every kernel. Occupancy on the card, in host
 RAM and on the SSD is derived from it, and the allocator consumes that derivation
-instead of recomputing it, so the derived number and the measured number can only
-differ by torch's own overhead.
+instead of recomputing it. The invariant is
+
+```
+peak = sum(static rows, derived) + transient
+```
+
+with `derived == measured` on every static row; `transient` (attention partials,
+kernel workspace, graph pools, allocator slack) is measured as the remainder and
+reported as its own row, never folded into a tolerance.
 
 ## Format
 
@@ -51,9 +58,11 @@ block list plus one `state_slots` row at the tier it currently lives in.
 
 `stats()["memory"]` returns the same rows with a measured column: on cuda the
 `memory_allocated` difference around each owner's allocation, on cpu the storage
-sum. A dry-run mode of `tilerl serve` prints the plan as JSON without a card. The gate is
+sum, and `transient = max_memory_allocated - sum(static rows)`. A dry-run mode of
+`tilerl serve` prints the plan as JSON without a card. The gate is
 `derived == measured` for `weights` and `kv_pool` on the tiny model; a nonzero
-delta on the 27B is an error entry, not a tolerance.
+delta on a static row on the 27B is an error entry, not a tolerance. Nothing here
+runs in the tick: `plan` is arithmetic at build time, `stats` reads counters.
 
 ## Kernel cost
 
