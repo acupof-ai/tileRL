@@ -298,6 +298,17 @@ class Backend:
         return reference.affine_prefix_scan(a, b, self._cp_pg, self.cp_rank,
                                             self.cp_world, chunk_ids)
 
+    def gdn_cp(self, q, k, v, g, beta, state, *, conv_windows, chunk_ids, **kw):
+        """One GDN layer on a cp rank (affine-scan start states) — one tape op."""
+        return reference.gdn_cp(
+            q, k, v, g, beta, state, pg=self._cp_pg, rank=self.cp_rank,
+            world=self.cp_world, conv_windows=conv_windows, chunk_ids=chunk_ids, **kw)
+
+    def gdn_cp_bwd(self, grad, q, k, v, g, beta, state, *, conv_windows, chunk_ids, **kw):
+        return reference.gdn_cp_bwd(
+            grad, q, k, v, g, beta, state, pg=self._cp_pg, rank=self.cp_rank,
+            world=self.cp_world, conv_windows=conv_windows, chunk_ids=chunk_ids, **kw)
+
     def cp_halo(self, x: torch.Tensor, ids_by_rank: list[list[int]], width: int):
         """The last ``width`` rows of the chunk BEFORE each of this rank's chunks.
 
