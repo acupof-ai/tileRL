@@ -86,7 +86,7 @@ def _global_loss(A, Bb, GT, HT):
     for c in range(NCHUNK):
         total = total + (GT[c] * pa).sum() + (HT[c] * pc).sum()
         pa, pc = A[c] @ pa, A[c] @ pc + Bb[c]
-    return total
+    return float(total)
 
 
 def _decay_pairs(A):
@@ -147,7 +147,8 @@ def _rank(rank: int, decay_a: bool, no_compose: bool) -> dict:
                 f_minus = _global_loss(args_a, args_b, GT, HT)
                 num = (f_plus - f_minus) / (2 * STEP)
                 an = an_t.reshape(-1)[j].item()
-                rel[kind] = max(rel[kind], abs(num - an) / max(abs(num), abs(an), 1e-9))
+                rel[kind] = max(rel[kind],
+                               float(abs(num - an) / max(abs(num), abs(an), 1e-9)))
     dist.barrier()
     return rel
 
