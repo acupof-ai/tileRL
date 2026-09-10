@@ -87,19 +87,25 @@ def main():
         dev = "mps"
     print(f"device: {dev}  (parity tolerance rtol={RTOL}, atol={ATOL})")
 
-    b, nkh, nvh, kd, vd, ker, seed = 2, 2, 6, 16, 16, 4, 31
+    b, nkh, nvh, kd, vd, ker = 2, 2, 6, 16, 16, 4
     t_max = 256
-    q, k, v, g, beta, z, state, kw = _inputs(b, t_max, nkh, nvh, kd, vd, ker, seed)
-    q, k, v, g, beta, z, state = (x.to(dev) for x in (q, k, v, g, beta, z, state))
-    kw = {kk: vv.to(dev) for kk, vv in kw.items()}
-
     chunks = [16, 32, 64, 128]
     seqs = [64, 100, 128, 164, 256]
+    seeds = (0, 1, 2)
 
-    # states[t][chunk]
-    states = {t: {c: _state(t, c, q, k, v, g, beta, z, state, kw) for c in chunks} for t in seqs}
+    # states[seed][t][chunk]
+    states = {}
+    for seed in seeds:
+        q, k, v, g, beta, z, state, kw = _inputs(b, t_max, nkh, nvh, kd, vd, ker, seed)
+        q, k, v, g, beta, z, state = (x.to(dev) for x in (q, k, v, g, beta, z, state))
+        kw = {kk: vv.to(dev) for kk, vv in kw.items()}
+        states[seed] = {
+            t: {c: _state(t, c, q, k, v, g, beta, z, state, kw) for c in chunks} for t in seqs
+        }
 
-    print("\nchunk-vs-chunk: worst parity-violation ratio over seq_lens (ratio > 1 breaks parity)")
+    print(
+        "\nchunk-vs-chunk: worst parity-violation ratio over seq_lens and 3 seeds (ratio > 1 breaks parity)"
+    )
     header = "      " + "".join(f"{f'{cB:>4}':>12}" for cB in chunks)
     print(header)
     worst_overall = 0.0
@@ -111,10 +117,11 @@ def main():
                 cells.append(f"{'-':>12}")
                 continue
             r_max, ref_v, delta, tol = 0.0, 0.0, 0.0, 0.0
-            for t in seqs:
-                r, rv, d, tv = _worst_ratio(states[t][cA], states[t][cB])
-                if r > r_max:
-                    r_max, ref_v, delta, tol = r, rv, d, tv
+            for seed in seeds:
+                for t in seqs:
+                    r, rv, d, tv = _worst_ratio(states[seed][t][cA], states[seed][t][cB])
+                    if r > r_max:
+                        r_max, ref_v, delta, tol = r, rv, d, tv
             if r_max > worst_overall:
                 worst_overall = r_max
                 worst_detail = (cA, cB, ref_v, delta, tol)
@@ -127,14 +134,18 @@ def main():
         f"|ref|={abs(ref_v):.3e}  delta={delta:.3e}  tol={tol:.3e}"
     )
 
-    print("\nchunkwise vs serial: worst parity-violation ratio over seq_lens")
-    for c in chunks:
-        r_max = 0.0
-        for t in seqs:
-            s_ref = _state(t, 0, q, k, v, g, beta, z, state, kw)
-            r, *_ = _worst_ratio(states[t][c], s_ref)
-            r_max = max(r_max, r)
-        print(f"  c={c:>3} vs serial: {r_max:.3e}")
+    print("\nchunkwise vs serial: worst parity-violation ratio over seq_lens and 3 seeds")
+    for seed in seeds:
+        q, k, v, g, beta, z, state, kw = _inputs(b, t_max, nkh, nvh, kd, vd, ker, seed)
+        q, k, v, g, beta, z, state = (x.to(dev) for x in (q, k, v, g, beta, z, state))
+        kw = {kk: vv.to(dev) for kk, vv in kw.items()}
+        for c in chunks:
+            r_max = 0.0
+            for t in seqs:
+                s_ref = _state(t, 0, q, k, v, g, beta, z, state, kw)
+                r, *_ = _worst_ratio(states[seed][t][c], s_ref)
+                r_max = max(r_max, r)
+            print(f"  seed={seed} c={c:>3} vs serial: {r_max:.3e}")
 
 
 if __name__ == "__main__":
