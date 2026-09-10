@@ -1560,7 +1560,38 @@ def cmd_generate(args: argparse.Namespace) -> None:
     print(json.dumps(stats))
 
 
+def cmd_bench_kernels(args: argparse.Namespace) -> None:
+    """Print the per-kernel roofline table for one decode tick, no GPU required.
+
+    Bytes/flops render from the declarations at every batch; the measured ms and
+    %bound columns read pending-remote until a card returns a calibration row,
+    because bandwidth and peak are measured, never datasheet.
+    """
+    from . import config as config_mod
+    from . import kernel_cost
+    from .precision import kv_format, nvfp4
+
+    cfg = config_mod.qwen38_27b() if args.model == "qwen38-27b" else config_mod.tiny()
+    batches = tuple(int(x) for x in args.batches.split(",")) if args.batches else (1, 8)
+    print(f"# {cfg.name} decode tick, context s={args.context} tokens, fp8 KV, nvfp4 weights")
+    print(f"{'kernel':<26} {'count':>5} {'shape':>22} {'bytes':>12} {'flops':>10} "
+          f"{'ms':>11} {'%bound':>11}")
+    for b in batches:
+        tick = kernel_cost.TickShape(b=b, s=args.context, kv=kv_format(cfg.head_dim),
+                                     weight=nvfp4)
+        print(f"-- batch B={b} --")
+        for r in kernel_cost.tick_rows(cfg, tick):
+            print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} "
+                  f"{r['bytes'] * r['count']:>12,} {r['flops'] * r['count']:>10,} "
+                  f"{'pending':>11} {'pending':>11}")
+        tb, tf = kernel_cost.tick_totals(cfg, tick)
+        print(f"{'TICK TOTAL':<26} {'':>5} {'':>22} {tb:>12,} {tf:>10,}")
+
+
 def cmd_bench(args: argparse.Namespace) -> None:
+    if getattr(args, "kernels", False):
+        cmd_bench_kernels(args)
+        return
     views = [f"--{v}" for v in ("table", "readme", "regress", "questions", "collectors")
              if getattr(args, v, False)]
     if views or args.suite:
@@ -1941,7 +1972,7 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_pretrain.set_defaults(func=cmd_pretrain)
 
     p_bench = sub.add_parser("bench", help="benchmark prefill/decode throughput")
-    p_bench.add_argument("--model", choices=["tiny"], default="tiny")
+    p_bench.add_argument("--model", choices=MODEL_NAMES, default="tiny")
     p_bench.add_argument("--prompt-len", type=int, default=128)
     p_bench.add_argument("--gen", type=int, default=32)
     p_bench.add_argument(
@@ -1953,6 +1984,10 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_bench.add_argument("--source", default=None, help="27B checkpoint dir (harness GPU suites)")
     p_bench.add_argument("--gpu", type=int, default=None, help="GPU index (harness)")
     p_bench.add_argument("--batches", default=None, help="harness decode batch sizes, e.g. 1,8")
+    p_bench.add_argument("--kernels", action="store_true",
+                         help="print the per-kernel roofline table (bytes/flops), no GPU")
+    p_bench.add_argument("--context", type=int, default=4096,
+                         help="pooled context tokens the --kernels decode reads against")
     for v in ("table", "readme", "regress", "questions", "collectors"):
         p_bench.add_argument(f"--{v}", action="store_true",
                              help=f"bench view: {v} from the bench store, no GPU")
