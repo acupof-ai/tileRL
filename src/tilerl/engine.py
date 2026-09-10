@@ -548,6 +548,10 @@ class Engine:
         argument and the pool disagree. Six card sessions on the 2.6x rollout tick
         recovered their two pool sizes only because the probe logged its own flags
         (errors/2026-09-08-six-card-sessions-and-the-defect-did-not-move.md).
+
+        ``memory`` is memory_table's rows for THIS build, the same table serve
+        --dry-run prints and stats()["memory"] serves, so a run manifest and a
+        dry-run report the identical occupancy surface (P5 reads it for free).
         """
         return {"blocks": self.usable_blocks, "slots": self.usable_slots,
                 "max_batch": self.limits.max_batch,
@@ -555,7 +559,8 @@ class Engine:
                 "max_num_batched_tokens": self.limits.max_num_batched_tokens,
                 "decode_graph": self._decode_graph_on,
                 "prefix_store": type(self._prefix).__name__,
-                "spec_width": self._width}
+                "spec_width": self._width,
+                "memory": self._memory_rows()}
 
     def room_for(self, prompt_tokens: int) -> int:
         """Largest ``max_new_tokens`` this prompt can ask for and still be admitted.
