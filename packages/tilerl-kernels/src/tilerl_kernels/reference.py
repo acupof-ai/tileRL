@@ -543,10 +543,11 @@ def gdn_span_ab_raw(q, k, v, g, beta, state_shape, *, conv1d_weight, dt_bias, a_
 def _scan_gather_pairs(a, b, pg, rank: int, world: int, chunk_ids=None):
     """Every rank's affine pairs, all-gathered and folded to SEQUENCE order.
 
-    The reverse scan must multiply the same pairs in the same order the forward
-    folded them, so both share this. Returns ``(ca, cb, ids, want, entries)``:
-    ``ca[k]/cb[k]`` is the pair at sequence position k (chunk id ``ids[k]``),
-    ``want`` maps this rank's chunk id -> its local stacking index.
+    The forward scan and its reverse must multiply the same pairs in the same
+    order, so both call this — two copies of the gather+sort would let one drift
+    silently. Returns ``(ca, cb, seq_ids, want)``: ``ca[k]/cb[k]`` is the pair at
+    sequence position k (chunk id ``seq_ids[k]``), ``want`` maps this rank's
+    chunk id -> its local stacking index.
     """
     import torch.distributed as dist
 
@@ -567,7 +568,7 @@ def _scan_gather_pairs(a, b, pg, rank: int, world: int, chunk_ids=None):
     ca = torch.stack([flat[j, :na].reshape(a[0].shape) for j in order]).to(a.dtype)
     cb = torch.stack([flat[j, na:na + nb].reshape(b[0].shape) for j in order]).to(b.dtype)
     want = {c: i for i, c in enumerate(ids)}
-    return ca, cb, seq_ids, want, entries
+    return ca, cb, seq_ids, want
 
 
 def affine_prefix_scan(a, b, pg, rank: int, world: int, chunk_ids=None):
@@ -591,34 +592,15 @@ def affine_prefix_scan(a, b, pg, rank: int, world: int, chunk_ids=None):
     needs irregular point-to-point across a zigzag layout, and buys 4.5 ms on a
     step that runs to hundreds. Revisit past cp=8 if a measurement asks.
     """
-    import torch.distributed as dist
-
-    entries = a.shape[0]
-    ids = list(range(rank * entries, (rank + 1) * entries)) if chunk_ids is None \
-        else [int(c) for c in chunk_ids]
-    ids_t = torch.tensor(ids, dtype=torch.float64)
-    payload = torch.cat([a.reshape(entries, -1).double(), b.reshape(entries, -1).double(),
-                         ids_t.unsqueeze(1)], dim=1).contiguous()
-    parts = [torch.empty_like(payload) for _ in range(world)]
-    dist.all_gather(parts, payload, group=pg)
-
-    na, nb = a[0].numel(), b[0].numel()
-    flat = torch.cat(parts, dim=0)
-    # Sort by the shipped chunk id: the gather returns rank order, and only the
-    # ids say what the sequence order is.
-    order = sorted(range(flat.shape[0]), key=lambda j: flat[j, -1].item())
-    want = {c: i for i, c in enumerate(ids)}
+    ca, cb, seq_ids, want = _scan_gather_pairs(a, b, pg, rank, world, chunk_ids)
 
     acc_a = torch.eye(a.shape[-1], dtype=a.dtype, device=a.device).expand_as(a[0]).contiguous()
     acc_b = torch.zeros_like(b[0])
     out_a, out_b = torch.empty_like(a), torch.empty_like(b)
-    for j in order:
-        c = int(flat[j, -1].item())
-        if c in want:  # exclusive: what stands before this chunk
-            out_a[want[c]], out_b[want[c]] = acc_a, acc_b
-        c_a = flat[j, :na].reshape(a[0].shape).to(a.dtype)
-        c_b = flat[j, na:na + nb].reshape(b[0].shape).to(b.dtype)
-        acc_a, acc_b = c_a @ acc_a, c_a @ acc_b + c_b
+    for k, cid in enumerate(seq_ids):
+        if cid in want:  # exclusive: what stands before this chunk
+            out_a[want[cid]], out_b[want[cid]] = acc_a, acc_b
+        acc_a, acc_b = ca[k] @ acc_a, ca[k] @ acc_b + cb[k]
     return out_a, out_b
 
 
@@ -640,12 +622,12 @@ def affine_prefix_scan_bwd(goa, gob, a, b, pg, rank: int, world: int, chunk_ids=
     never consumed through the scan (it is the last state's update, graded
     through the chunk kernel, not here), so its scan-side gradient is zero.
     """
-    ca, cb, seq_ids, want, _ = _scan_gather_pairs(a, b, pg, rank, world, chunk_ids)
+    ca, cb, seq_ids, want = _scan_gather_pairs(a, b, pg, rank, world, chunk_ids)
     # The OUTPUT cotangents share the pairs' per-rank layout, so gather and sort
     # them with the identical call. This is required, not symmetric: a pair shapes
     # every LATER prefix, including prefixes returned on other ranks, so gradients
     # would miss cross-rank terms if each rank saw only its own cotangents.
-    gpa, gpb, _, _, _ = _scan_gather_pairs(goa, gob, pg, rank, world, chunk_ids)
+    gpa, gpb, _, _ = _scan_gather_pairs(goa, gob, pg, rank, world, chunk_ids)
     kl = ca.shape[0]
     dev, dt = a.device, a.dtype
 

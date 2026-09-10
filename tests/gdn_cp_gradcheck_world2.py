@@ -165,8 +165,8 @@ def _entry(rank: int, decay_a: bool, no_compose: bool, q) -> None:
 
 def _wrong_scalar_reverse(reference, loc_a, loc_b, goa, gob, pg, rank, mine):
     """dA/dB as if A were the decay scalar I — drops the operator dependence."""
-    ca, cb, seq_ids, want, _ = reference._scan_gather_pairs(loc_a, loc_b, pg, rank, CP, mine)
-    gpa, gpb, _, _, _ = reference._scan_gather_pairs(goa, gob, pg, rank, CP, mine)
+    ca, cb, seq_ids, want = reference._scan_gather_pairs(loc_a, loc_b, pg, rank, CP, mine)
+    gpa, gpb, _, _ = reference._scan_gather_pairs(goa, gob, pg, rank, CP, mine)
     sa = _decay_pairs(ca)  # the wrong model used ONLY inside the reverse
     eye = torch.eye(DK).expand(B, HV, DK, DK).contiguous()
     pa, pc = eye, torch.zeros_like(cb[0])
@@ -193,7 +193,7 @@ def _wrong_scalar_reverse(reference, loc_a, loc_b, goa, gob, pg, rank, mine):
 def _wrong_no_compose_reverse(reference, loc_a, loc_b, goa, gob, pg, rank, mine):
     """No prefix (P=I, C=0) and rank-local cotangents only — the two omissions
     that 'start every chunk from zero' implies on the reverse."""
-    ca, cb, seq_ids, want, _ = reference._scan_gather_pairs(loc_a, loc_b, pg, rank, CP, mine)
+    ca, cb, seq_ids, want = reference._scan_gather_pairs(loc_a, loc_b, pg, rank, CP, mine)
     # local-only cotangents placed by id, everything else zero
     gpa = torch.zeros_like(ca)
     gpb = torch.zeros_like(cb)
