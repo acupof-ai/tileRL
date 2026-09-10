@@ -112,10 +112,12 @@ def test_group_advantages():
     assert np.allclose(group_advantages([2.0, 2.0], group=2), 0.0)
 
 
-def test_all_wrong_group_ranks_advantages_by_length():
-    """Every match is 0, so the length term is the whole reward: r_i = -lam*L_i/cap
-    normalizes to -(L_i - Lbar)/std(L) -- shortest first, lam-independent for lam > 0,
-    and silent at lam = 0."""
+def test_an_all_wrong_group_is_silent_not_length_ranked():
+    """Every match is 0: the length term was the whole reward, and the normalized
+    advantage ranked shortest-first -- lam cancels, so no lambda could tune it and
+    only lam=0 turned it off. That gradient was the 2026-09-10 P1 collapse (length
+    term 1.3x the correctness term at step 1, 2.1x+ after): a group with no
+    correctness signal carries no information, so its advantages are zero."""
     from tilerl.cli import _length_aware
 
     class Tok:
@@ -126,12 +128,57 @@ def test_all_wrong_group_ranks_advantages_by_length():
 
     def adv_at(lam):
         reward = _length_aware(lambda text, gold: 0.0, {(): ""}, Tok(), lam, 32)
-        return group_advantages([reward((), [0] * L) for L in lengths], group=8)
+        return group_advantages([reward((), [0] * L) for L in lengths], group=8,
+                                signal=[0.0] * 8)
 
-    a = adv_at(0.1)
-    assert np.all(np.diff(a[np.argsort(lengths)]) < 0), a  # shortest first, strictly
-    assert np.allclose(a, adv_at(1.0))  # lam cancels: its magnitude is not a dial
-    assert np.allclose(adv_at(0.0), 0.0)  # lam = 0 ties the group, and a tie is silent
+    assert np.allclose(adv_at(0.1), 0.0)
+    assert np.allclose(adv_at(1.0), 0.0)  # lam was never the dial; silence is
+    # Without the signal the function still reports what the rewards say: the
+    # zeroing is the caller's choice, not a property of the rewards.
+    reward = _length_aware(lambda text, gold: 0.0, {(): ""}, Tok(), 0.1, 32)
+    assert not np.allclose(
+        group_advantages([reward((), [0] * L) for L in lengths], group=8), 0.0)
+
+
+def test_a_constant_signal_group_yields_zero_but_a_mixed_group_judges():
+    """The zeroing's control pair: groups whose non-length signal is constant go
+    silent while a mixed group in the same call still judges with the right
+    direction. Without the third assertion, a bug that zeroed EVERY group would
+    pass -- training would quietly learn nothing (2026-09-10, the shape that bit
+    four times that night)."""
+    lengths = [3, 7, 1, 9, 5, 2, 8, 4]
+    # All correct, lengths vary: without the rule, length ranks the advantages.
+    rewards = [1.0 - 0.1 * L for L in lengths]
+    assert np.allclose(group_advantages(rewards, 8, signal=[1.0] * 8), 0.0)
+    # All wrong, lengths vary: same silence.
+    assert np.allclose(group_advantages([-0.1 * L for L in lengths], 8,
+                                        signal=[0.0] * 8), 0.0)
+    # Control: a mixed group still judges -- correct rows on top.
+    mixed = [1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]
+    adv = group_advantages(mixed, 8, signal=mixed)
+    assert not np.allclose(adv, 0.0)
+    assert (adv[np.array(mixed) == 1.0] > 0).all(), adv
+    assert (adv[np.array(mixed) == 0.0] < 0).all(), adv
+    # A failed rollout is not a wrong answer: 7 live-correct + 1 failed is constant
+    # over the live rows, so the live rows go silent too.
+    live = [True] * 7 + [False]
+    assert np.allclose(group_advantages([1.0] * 7 + [0.0], 8, live=live,
+                                        signal=[1.0] * 8), 0.0)
+
+
+def test_a_judge_that_separates_an_all_pass_group_keeps_its_signal():
+    """Stage 4(b) regression: in an all-pass group the binary signal is constant,
+    but the judge scores ARE the non-length signal. A judge that separates the
+    rollouts must keep its ordering -- the zeroing targets length-only gradients,
+    not judge-provided ones. And a judge that cannot separate stays silent."""
+    judge_scores = [1.0, 0.5, 0.0, -0.5, 1.0, 0.5, 0.0, -0.5]
+    adv = group_advantages(judge_scores, 8, signal=judge_scores)
+    assert not np.allclose(adv, 0.0), "a separating judge was zeroed"
+    assert adv[0] > adv[2], adv  # the judge's ordering survives
+    # Judge cannot separate: constant signal, zeroed -- the B-hole case (the std
+    # gate does not catch it: length keeps the reward spread non-zero).
+    assert np.allclose(group_advantages([1.0 - 0.1 * L for L in [3, 7, 1, 9, 5, 2, 8, 4]],
+                                        8, signal=[0.5] * 8), 0.0)
 
 
 def test_an_empty_rollout_injects_no_gradient():
@@ -358,16 +405,22 @@ def test_grpo_loop_reports_a_step_before_the_run_ends():
     assert sum(1 for _ in gen) == 2, "every step must be yielded, not just the first"
 
 
-def test_tied_is_structurally_zero_at_positive_lam():
-    """At lam>0, rewards are continuous and never exactly match, so tied==0.0
-    even for an all-correct group. The validity gate must read tied_correctness.
+def test_an_all_correct_group_is_tied_once_more():
+    """An all-correct group's rewards vary only by the length term, so its
+    non-length signal is constant and the group falls silent: tied reads 1.0.
+
+    The length term once made rewards continuous, so `tied` could never see an
+    all-correct group and `tied_correctness` was added to measure it directly.
+    Constant-signal zeroing makes the two coincide; tied_correctness stays
+    because it measures the fact instead of inferring it from advantage sparsity.
     """
     from tilerl.train import group_advantages
 
     rewards = np.array([1.0 - 0.1 * L / 6144 for L in [100, 200, 300, 400, 500, 600, 700, 800]])
-    adv = group_advantages(rewards, 8)
+    signal = np.ones(8)  # corr = reward + 0.1*L/6144 = 1.0 for every row
+    adv = group_advantages(rewards, 8, signal=signal)
     tied = float((adv.reshape(-1, 8) == 0).all(axis=1).mean())
-    assert tied == 0.0, f"continuous rewards should never tie, got {tied}"
+    assert tied == 1.0, f"a constant-signal group must be silent, got {tied}"
     corr = np.ones(8)
     tied_correctness = float((corr.reshape(-1, 8) == corr.reshape(-1, 8)[:, :1]).all(axis=1).mean())
     assert tied_correctness == 1.0
@@ -840,18 +893,18 @@ def test_the_training_engine_keeps_its_decode_graph(tmp_path, monkeypatch):
         "weights it was traced on")
 
 
-def test_a_length_term_breaks_an_all_right_group_and_lambda_cancels_there():
-    """Two correct answers of any two lengths are indistinguishable under a correctness-only
-    reward, so an all-right group ties at zero advantage and produces no gradient. Run 2
-    collapsed that way at step 41 of 100.
+def test_an_all_right_group_is_silent_and_lambda_matters_only_in_mixed_groups():
+    """The length term's stated purpose was breaking all-right ties (run 2 collapsed
+    in one at step 41). That half is now void: a group whose non-length signal is
+    constant carries no learnable ordering, so its advantages are zero -- a
+    length-only gradient was the 2026-09-10 P1 collapse. The judge (stage 4b)
+    breaks a tie when it can separate the rollouts; without it, a tie is not
+    broken.
 
-    The negative control is in here on purpose: a MIXED group must still return nonzero
-    advantages, or "all zero" would mean `group_advantages` is broken rather than indifferent.
-
-    And the lambda assertion, because the first instinct on reading this fix is to tune it:
-    in an all-right group lambda CANCELS. `r_i = 1 - lam*L_i` gives `r_i - mean =
-    -lam*(L_i - Lbar)` and `std = lam*std(L)`, so the ratio is `-(L_i - Lbar)/std(L)` with no
-    lam in it. Sweeping lam against the tie fraction measures a quantity that does not vary.
+    The kept half: in a MIXED group lambda is a real dial, and the reward-level
+    bound still holds. The negative control stays: a mixed group must carry
+    signal, or "all zero" would mean `group_advantages` is broken rather than
+    indifferent.
     """
     cap, group = 2048, 8
     lens = [412, 1893, 655, 1204, 988, 1560, 301, 2048]
@@ -866,19 +919,12 @@ def test_a_length_term_breaks_an_all_right_group_and_lambda_cancels_there():
     assert np.abs(group_advantages(mixed, group)).min() > 0.5, (
         "a mixed group must carry signal, or the all-right zeros above prove nothing")
 
-    # with the term, the all-right group is ordered by length, shortest first
-    adv = group_advantages(shaped([True] * group, 0.1), group)
-    assert not np.allclose(adv, 0.0), "the length term did not break the tie"
-    assert list(np.argsort(-adv)) == list(np.argsort(lens)), (
-        f"advantage order {np.argsort(-adv)} is not shortest-first {np.argsort(lens)}")
-
-    # lambda cancels: four orders of magnitude, and against the closed form
-    ref = group_advantages(shaped([True] * group, 1e-4), group)
-    for lam in (1e-2, 0.1, 0.5, 1.0):
-        got = group_advantages(shaped([True] * group, lam), group)
-        assert np.abs(got - ref).max() < 1e-9, f"lam={lam} moved an all-right group"
-    closed = -(np.asarray(lens, dtype=float) - np.mean(lens)) / np.std(lens)
-    assert np.abs(ref - closed).max() < 1e-9
+    # with the term, an all-right group is STILL silent: the signal is constant, so
+    # the length term no longer decides the gradient -- for every lambda. It was
+    # never a dial here: the ratio -(L-Lbar)/std(L) has no lam in it.
+    for lam in (1e-4, 1e-2, 0.1, 0.5, 1.0):
+        assert np.allclose(group_advantages(shaped([True] * group, lam), group,
+                                            signal=[1.0] * group), 0.0), lam
 
     # but in a MIXED group lambda is a real dial -- so it is bounded, not free
     lo = group_advantages(shaped(mixed_c := [True] * 4 + [False] * 4, 1e-4), group)
