@@ -224,11 +224,20 @@ def test_the_manifest_records_the_engine_config_the_wall_clock_depends_on(tmp_pa
                 and r["inputs"]["eval_max_new_tokens"] == ecap]
         assert m["engine"].keys() == {
             "blocks", "slots", "max_batch", "max_total_tokens",
-            "max_num_batched_tokens", "decode_graph", "prefix_store", "spec_width"}
+            "max_num_batched_tokens", "decode_graph", "prefix_store", "spec_width",
+            "memory"}
         # Tracks --group, not a literal: the training engine is sized from it, so a
         # frozen 8 here would pass while production computed something else.
         assert m["engine"]["slots"] == group == m["engine"]["max_batch"]
         assert m["engine"]["prefix_store"] == "NoPrefixStore"
+        # The occupancy table is the same surface serve --dry-run and /health emit:
+        # rows carry tier/owner/derived, the held static owners + transient closure,
+        # and no budget rows (the built engine fits with device_free=0).
+        mem = m["engine"]["memory"]
+        owners = {r["owner"] for r in mem}
+        assert {"weights", "state_slots", "kv_pool", "transient", "device_total"} <= owners
+        assert not any(r["kind"] == "budget" for r in mem)
+        assert all({"tier", "owner", "kind", "derived"} <= r.keys() for r in mem)
         # Every in-flight row's whole sequence, priced per consumer and maxed -- the same
         # shape as production, not a re-derivation of it, so it moves with the defaults.
         # min(group, 8) on the eval side because a submit past num_slots queues.
