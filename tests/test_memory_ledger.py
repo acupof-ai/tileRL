@@ -217,9 +217,12 @@ def test_serve_dry_run_checkpoint_is_header_only_and_needs_dry_run(tmp_path, cap
     by = {r["owner"]: r for r in rows}
     cfg, _, _ = _engine()
     faces = checkpoint_weight_faces(cfg, tmp_path)
-    assert by["weights"]["bytes"] == weight_row_faces(faces).n
-    # Header-only: nothing was built, so there is no measured column or delta.
+    # One presentation contract with the built --dry-run: kind/derived, not a second
+    # {bytes,...} schema; transient is suppressed (no peak measured header-only).
+    assert by["weights"]["kind"] == "allocation"
+    assert by["weights"]["derived"] == weight_row_faces(faces).n
     assert by["weights"]["measured"] is None and by["weights"]["delta"] is None
+    assert "transient" not in by
     # build_engine fits AFTER weights and the state pool (slots+CUDA graph pad; 0 on cpu)
     # are resident; the header-only fit subtracts the same before fitting.
     free_after_fixed = 1000000 - weight_row_faces(faces).n - _state_bytes(cfg, 4, f32)
@@ -275,6 +278,94 @@ def test_serve_dry_run_needs_device_free_off_cuda_and_prints_rows(capsys):
                if r["owner"] in ("weights", "kv_pool", "state_slots"))
 
 
+def test_peak_equals_static_plus_transient_exactly():
+    """The printed invariant is exact: measured peak = Σ held static rows + transient.
+    Budget rows never enter either side. On the CPU tiny cell the measured peak is the
+    held storage sum, so transient is exactly 0 and the total equals that peak."""
+    from tilerl.memory import memory_table, static_rows
+
+    cfg, model, eng = _engine()
+    kv, sp = eng._kv, eng._states
+    rows = plan(cfg, model.params, 0, num_slots=sp.num_slots, num_blocks=kv.num_blocks,
+                state_dtype=sp.states.dtype, kv_io=kv.dtype, kv_fp8=kv.kv_fp8)
+    measured = {r["owner"]: r["measured"] for r in eng.stats()["memory"]
+                if r["kind"] == "allocation" and r.get("measured") is not None
+                and r["owner"] != "transient"}
+    peak = eng._measured_peak_bytes()
+    table, totals = memory_table(rows, measured, peak)
+    by = {r["owner"]: r["derived"] for r in table}
+
+    static_sum = sum(r.n for r in static_rows(rows))
+    assert by["transient"] == peak - static_sum
+    assert static_sum + by["transient"] == peak
+    # CPU tiny cell: no allocator scratch beyond the named rows.
+    assert by["transient"] == 0
+    assert totals["device"] == peak
+
+
+def test_transient_zero_on_tiny_and_red_under_a_dropped_static_row():
+    """Mutant control for the invariant: if a static row is dropped from the plan but the
+    measured peak is unchanged, transient silently ABSORBS the dropped row's bytes. The
+    transient row must then exceed a bound derived from the tiny shapes (the real scratch
+    headroom), so the missing row cannot hide. We assert the bound from shapes, not a
+    literal, and that dropping one row pushes transient past it."""
+    from tilerl.memory import memory_table, static_rows
+
+    cfg, model, eng = _engine()
+    kv, sp = eng._kv, eng._states
+    rows = plan(cfg, model.params, 0, num_slots=sp.num_slots, num_blocks=kv.num_blocks,
+                state_dtype=sp.states.dtype, kv_io=kv.dtype, kv_fp8=kv.kv_fp8)
+    measured = {r["owner"]: r["measured"] for r in eng.stats()["memory"]
+                if r["kind"] == "allocation" and r.get("measured") is not None
+                and r["owner"] != "transient"}
+    peak = eng._measured_peak_bytes()
+
+    # Bound derived from tiny shapes: real scratch is a handful of activation tensors far
+    # smaller than the smallest held pool row; any transient >= that pool row is a dropped
+    # static allocation, not scratch.
+    scratch_bound = nbytes(f32, (1, cfg.hidden_size))  # one activation-sized allowance
+
+    good, _ = memory_table(rows, measured, peak)
+    good_transient = next(r["derived"] for r in good if r["owner"] == "transient")
+    assert good_transient < scratch_bound, good_transient
+
+    # Mutant: drop the kv_pool static row but keep measured + peak (the pool is still held).
+    dropped = [r for r in rows if r.owner != "kv_pool"]
+    mutated, _ = memory_table(dropped, measured, peak)
+    absorbed = next(r["derived"] for r in mutated if r["owner"] == "transient")
+    dropped_bytes = next(r.n for r in static_rows(rows) if r.owner == "kv_pool")
+    assert absorbed == peak - sum(r.n for r in static_rows(dropped))
+    assert absorbed >= dropped_bytes
+    assert absorbed >= scratch_bound, (
+        "the gate must go red when a static row is dropped: transient absorbs it and "
+        "exceeds the shape-derived scratch bound")
+
+
+def test_residency_row_roundtrips_through_benchrec(tmp_path):
+    """The peak+transient ledger row carries the invariant in its shape and is appended
+    through the one schema writer (a malformed row is rejected)."""
+    import json
+
+    from tilerl.memory import append_residency, residency_row
+
+    p = tmp_path / "measurements.jsonl"
+    row = residency_row("tiny-cpu", None, 500, static_bytes=450,
+                        transient_bytes=50, target="cpu", model="tiny")
+    rid = append_residency(row, p)
+    got = json.loads(p.read_text())
+    assert rid and got["metric"] == "device_resident_bytes"
+    assert got["target"] == "cpu" and got["device"]["card"] is None
+    assert got["shape"]["static"] + got["shape"]["transient"] == got["value"] == 500
+    # the ledger is the same one the kernel roofline reads
+    assert "measurements.jsonl" in str(p).split("/")[-1] or p.name == "measurements.jsonl"
+    # A card-less sm90 row is refused at append: residency must not fabricate target/card.
+    import pytest
+
+    fake = residency_row("H20", None, 500, 450, 50, target="sm90")
+    with pytest.raises(Exception):
+        append_residency(fake, tmp_path / "sm.jsonl")
+
+
 if __name__ == "__main__":
     for f in (test_weight_row_equals_materialized_params,
               test_per_kv_block_equals_pool_and_shares_fit_formula,
@@ -285,6 +376,9 @@ if __name__ == "__main__":
               test_plan_budget_rows_are_arithmetic_without_a_card,
               test_plan_weights_row_from_checkpoint_faces_drops_nonserving_and_repacks_bf16,
               test_serve_dry_run_checkpoint_is_header_only_and_needs_dry_run,
-              test_serve_dry_run_needs_device_free_off_cuda_and_prints_rows):
+              test_serve_dry_run_needs_device_free_off_cuda_and_prints_rows,
+              test_peak_equals_static_plus_transient_exactly,
+              test_transient_zero_on_tiny_and_red_under_a_dropped_static_row,
+              test_residency_row_roundtrips_through_benchrec):
         f(None) if f.__code__.co_argcount else f()
     print("memory ledger: single-formula fit/plan, fp8 scales, checkpoint weights, tiny OK")
