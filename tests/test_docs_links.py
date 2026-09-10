@@ -284,10 +284,13 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
     'serve': frozenset({
         '--blocks',
         '--depth',
+        '--device-free',
         '--draft',
         '--dram-bytes',
+        '--dry-run',
         '--help',
         '--host',
+        '--json',
         '--kv-fp8',
         '--max-batch',
         '--max-batched-tokens',
