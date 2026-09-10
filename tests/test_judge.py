@@ -92,3 +92,54 @@ def test_the_judge_is_never_shown_a_pair_tests_can_separate():
 def test_mismatched_outcome_length_is_refused():
     with pytest.raises(ValueError, match="rollouts but"):
         judge_rewards(["a", "b"], [True], lambda a, b: ("A", "A"))
+
+
+def test_tiebreak_generates_all_56_judgements_in_one_batched_call():
+    """The P1 entry claims one judged group of 8 issues C(8,2)x2 = 56 one-token
+    generations in ONE batched generate call (28 pairs, both prompt orders for the
+    position-bias control). A per-pair loop costs 28 round trips per group and
+    silently costs more than the training step. This gate counts the calls and the
+    batch width at the generate seam; a per-pair loop goes red.
+
+    The tiebreaker closes over eval.generate, so it is stubbed here — what is under
+    test is the batching in cli._judge_tiebreak, not the engine.
+    """
+    from tilerl.cli import _judge_tiebreak
+
+    calls = []
+
+    def fake_generate(engine, tok, prompts, sp, concurrency):
+        calls.append(list(prompts))
+        # one-token answers; mix A/B/tie so the verdicts are usable downstream
+        ans = ["A", "B", "tie"]
+        return [ans[k % 3] for k in range(len(prompts))]
+
+    import tilerl.eval as eval_mod
+
+    from tilerl.engine import SamplingParams
+    from tilerl.tokenizer import ByteTokenizer
+
+    orig = eval_mod.generate
+    eval_mod.generate = fake_generate
+    try:
+        params = SamplingParams(temperature=1.0, max_new_tokens=8, max_think_tokens=0)
+        tok = ByteTokenizer()
+        tiebreak = _judge_tiebreak(engine=None, tok=tok, params=params)
+        prompt = list(range(3, 32))  # any token ids; decoded to the question text
+        comps = [list(range(20 + i, 26 + i)) for i in range(8)]  # 8 distinct completions
+        passed = [False] * 8  # all-fail band -> every pair judged
+        tiebreak(prompt, comps, passed)
+    finally:
+        eval_mod.generate = orig
+
+    # Exactly ONE generate call for the whole group.
+    assert len(calls) == 1, f"expected 1 batched judge call, got {len(calls)} (per-pair loop?)"
+    batch = calls[0]
+    # C(8,2) pairs x 2 orders = 56 one-token generations.
+    assert len(batch) == 56, f"expected 56 judge prompts, got {len(batch)}"
+    # Both orders are present: the 56 prompts are 28 ab + 28 ba prompts, every one of
+    # the 56 names both solution slots, and each pair's two orders differ (A/B swap).
+    assert all("[A]" in p and "[B]" in p for p in batch)
+    ab, ba = batch[:28], batch[28:]
+    assert len(set(ab)) == 28 and len(set(ba)) == 28
+    assert ab != ba and not set(ab) & set(ba), "the order halves must be distinct prompts"
