@@ -1111,3 +1111,82 @@ def test_a_step_of_two_prompts_does_not_normalise_across_them(tmp_path):
         # plens and its padding above slens, with nothing of one inside the other.
         for row, (pl, sl) in enumerate(zip(plens, slens)):
             assert 0 < pl <= sl <= batch.shape[1], f"row {row}: {pl} .. {sl}"
+
+
+def test_clearing_the_prefix_after_update_keeps_rollouts_token_for_token_eager(monkeypatch):
+    """On-policy after an update with a live PrefixStore: the second step reuses the first
+    prompt's cached KV. clear_prefix=True (engine.invalidate_weights after every update)
+    must make those completions token-for-token identical to a store-free (always-eager)
+    engine under the same seeds; a loop that SKIPS the clear serves the old policy's KV and
+    must diverge.
+
+    CPU can only gate the prefix half -- the graph half needs cuda graph capture (a CPU
+    graph replays eager, so a graph comparison here would pass against anything); the
+    graph token-equality and the within-5% wall clock are pending-remote on sm90:
+
+        TILERL_TARGET=cuda python scripts/<recapture bench>   # graph == eager, >=0.95 speed
+    """
+    import tilerl.train as train_mod
+    from tilerl.autograd import AdamW
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.kv_cache import BLOCK_TOKENS, NoPrefixStore
+
+    # Step 1 caches a 256-token prefix (16 blocks); step 2 submits a 336-token extension so
+    # it takes a genuine PARTIAL hit (a full-length hit is treated as a miss and recomputed).
+    base = list(np.random.RandomState(7).randint(3, 320, size=16 * BLOCK_TOKENS))
+    longer = base + list(np.random.RandomState(8).randint(3, 320, size=5 * BLOCK_TOKENS))
+    prompts = [base, longer]
+
+    # Content (not length) reward: group members that sampled different tokens must get
+    # different advantages or the step carries zero gradient and no update moves weights.
+    def reward(prompt, completion):
+        return float(sum(int(t) % 7 for t in completion))
+
+    # Capture completions per step without changing the loop under test.
+    real_drain = train_mod._drain
+    captured = {}
+
+    def spy_drain(engine, ids, what):
+        done = real_drain(engine, ids, what)
+        captured[len(captured)] = [tuple(done[i]) for i in ids]
+        return done
+
+    monkeypatch.setattr(train_mod, "_drain", spy_drain)
+    monkeypatch.setattr(train_mod, "_require_on_policy", lambda *a, **k: None)
+
+    def run(*, no_store, clear_prefix):
+        captured.clear()
+        torch.manual_seed(123)
+        cfg, model = _build_model("tiny", seed=0, keep_master=True)
+        engine = build_engine(
+            cfg, model, RefBackend(), num_blocks=64, num_slots=4, max_batch=4,
+            max_total_tokens=4096,
+            prefix_store=NoPrefixStore() if no_store else None)  # default live PrefixStore
+        optimizer = AdamW(lr=0.1)
+        for _ in train_mod.grpo_loop(
+                engine, model, prompts, reward, 2, RefBackend(), optimizer=optimizer,
+                group=2, prompts_per_step=1,
+                sampling=SamplingParams(max_new_tokens=6), seed=100,
+                clear_prefix=clear_prefix):
+            pass
+        return captured[1], engine.stats()  # post-update (second-step) completions + store
+
+    reference, _ = run(no_store=True, clear_prefix=False)  # no store: KV always recomputed
+    cleared, clr_stats = run(no_store=False, clear_prefix=True)  # live store, cleared per update
+    stale, hit_stats = run(no_store=False, clear_prefix=False)  # stale KV survives update
+
+    assert cleared == reference, (
+        "after an update a cleared prefix store must sample exactly what a store-free "
+        "engine does; the invalidation let old-policy KV survive")
+    # The clear must empty the store before step 2: the 256-token prefix published in
+    # step 1 is gone, so the extension admits as a miss. A clear that fails to call
+    # PrefixStore.clear() leaves a hit here AND (above) stale KV in the completions.
+    assert clr_stats["prefix_hits"] == 0, clr_stats
+    # Positive proof the 256/336 partial hit actually happens on the live store; without
+    # it the stale-vs-reference gap below is unattributable and a _match_prefix
+    # threshold change turns both live runs into eager runs that stay green.
+    assert hit_stats["prefix_hits"] >= 1, hit_stats
+    assert hit_stats["prefix_hit_tokens"] >= 16 * BLOCK_TOKENS, hit_stats
+    assert stale != reference, (
+        "skipping invalidate_weights did not change the post-update samples -- the gate "
+        "cannot see a stale prefix; the partial-hit/nonzero-advantage fixture is vacuous")
