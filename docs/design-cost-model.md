@@ -74,10 +74,11 @@ a sum over allocations skips them. `build_engine` allocates from the rows:
 occupancy is `blocks_used x per_block`. A device prefix entry is pool blocks
 plus a state slot already counted — a row only when demoted to `host`/`ssd`.
 
-`memory.memory_table` adds a measured column and closes the peak: on cuda each
-held owner gets its `memory_allocated` delta, and a final `transient` row is
-`measured_peak - sum(static rows)`, so `peak = sum(static) + transient` to the
-integer; transient is suppressed without the peak measurement.
+`memory.memory_table` adds a measured column and closes the peak: the measured
+column is each owner's materialized tensor-storage sum on every target; on cuda
+the peak is `torch.cuda.max_memory_allocated` and a final `transient` row is
+`peak − Σ static`, so `peak = sum(static) + transient` to the integer;
+transient is suppressed without the peak measurement.
 `tilerl serve --dry-run` prints the table cardless; `--checkpoint DIR` prices
 the weights row header-only from `checkpoint_weight_faces` (off cuda pass
 `--device-free`); `--record-residency` (cuda) adds measured residency. Gate:
@@ -87,12 +88,11 @@ tick — `plan` is build-time arithmetic, the table reads counters.
 
 ## Kernel cost
 
-Each launched kernel declares two pure functions next to its registry entry:
+Each launched kernel declares a pure helper next to its registry entry:
 
 ```
-bytes_moved(shape) -> int      # in terms of nbytes(fmt, ...) of its operands
-flops(shape)       -> int
-bound(shape) = max(bytes_moved / bandwidth, flops / peak)
+(cfg, tick) -> (bytes, flops)   # per kernel; bytes via nbytes(fmt, ...), row keys "bytes"/"flops"
+bound = max(bytes / bandwidth, flops / peak)
 ```
 
 `bandwidth` and `peak` are one measured calibration row per card —
