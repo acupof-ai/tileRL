@@ -55,10 +55,11 @@ real f32/row); `load_hf`'s plain `.weight_scale` branch stores that row. The
 is nvfp4_dev like the other 264; `checkpoint_weight_faces` applies that
 loader transform rather than reporting the disk face.
 
-Cross-check against the 2026-09-03 loader measurement: weight+activation stream
-21.907 GB at B=1; the measured streamed weight set was 21.89 GB (24.44 GB
-resident less the 2.54 GB embed gather). The two agree within the gather and
-the per-tick activations this table adds.
+Cross-checks against the 2026-09-03 loader measurement: the table's weight-only
+stream (GEMV activation terms stripped) is **21.892 GB**, measured 21.89 GB;
+and all served faces summed — including the embed gather, which the tick table
+does not stream — give **24.440 GB** resident, measured 24.44 GB. Both
+agreements are under 0.1% with no fitted terms.
 
 ## Rule
 
