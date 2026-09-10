@@ -3,6 +3,10 @@
 One line per event — phase exit, default flip, accept-or-reject verdict — with
 its `docs/experience/` entry. Newest first.
 
+## 2026-09-11
+
+- **phase exit (CPU)** — the GDN context-parallel tape is exact on the 27B's conv kernel 4. Two PRs on one lineage: the affine state transfer runs through the tape as one `gdn_cp` op (#464, kernel-1 gradcheck), and the cross-rank conv-halo gradient now routes by a keyed all-gather/sum onto each predecessor chunk's raw qkv tail — including the LOCAL predecessor zigzag gives rank 1 (chunks 1,2). Window-aware prep reverse + `cp_halo_bwd`; world2 tape gradcheck through the real exchange at kernel 4 (all leaves ≤2.3e-3, no-halo control q/k/v red 0.46–0.76). Before these, CP training's state and halo gradients were silently dropped. — [wins/2026-09-11-gdn-cp-halo-adjoint.md](docs/experience/wins/2026-09-11-gdn-cp-halo-adjoint.md) · [affine transfer](docs/experience/wins/2026-09-11-gdn-cp-tape-end-to-end.md)
+
 ## 2026-09-10
 
 - **default flip (pending-remote)** — the P1 retry recipe `grpo-gsm8k-27b` turns the self-judge on (`judge=True`) and raises the rollout cap 256 → 512. Under `--judge` tests split pass/fail first and the policy's pairwise ordering only ranks inside those bands, so the ~60% correctness-saturated groups carry gradient again without a wrong answer ever outranking a right one; the length term never reaches the advantage on that path (and #443 already zeroes constant-signal groups off it). Also: `judge` enters the manifest id, and `--eval-gsm8k` now refuses prompts shared with `--data` (the held-out gate was green at 100% contamination). Mechanism prediction is **flat / no collapse** (the judge rescues all-correct groups' style gradient; the missed questions sit in mixed groups the binary reward already penalizes), so clearing +25/500 rests on the unmeasured transfer hypothesis — the +25/500 gate stays the verdict, flat-non-collapsed is the success bar. Acceptance is a two-seed pod pair. — [wins/2026-09-10-the-p1-retry-recipe-turns-the-self-judge-on.md](docs/experience/wins/2026-09-10-the-p1-retry-recipe-turns-the-self-judge-on.md)
