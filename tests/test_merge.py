@@ -5,6 +5,8 @@ both the base and plain task-vector averaging on their own batches.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -187,6 +189,78 @@ def test_merge_checkpoints_streams_shards_and_records(tmp_path, monkeypatch):
 
     assert m["gates"] == [] and m["finished"], m
     assert format_run(m).split()[3] == "none", format_run(m)
+
+
+def _sft_run(model_dir_arg: str, seed: int):
+    """One full-SFT tiny run via the CLI with --save-model; returns (run_id, model dir).
+
+    The saved model is the producer artifact a merge specialist links back through.
+    The run is selected by its seed, not directory order: two runs coexist and APFS
+    readdir order made an unfiltered scan return seed=0 twice (an id_a==id_b failure
+    that CI's runner order hid).
+    """
+    import json as _json
+
+    from tilerl import cli
+    from tilerl.ledger import runs_root
+
+    argv = ["train", "--model", "tiny", "--steps", "1", "--seed", str(seed),
+            "--save-model"]
+    if model_dir_arg == "json":
+        argv.append("--json")
+    import contextlib
+
+    with contextlib.suppress(SystemExit):  # steps=1 cannot satisfy ce_falls; manifest still lands
+        cli.cmd_train(cli._build_parser().parse_args(argv))
+    for d in Path(runs_root()).iterdir():
+        m = _json.loads((d / "manifest.json").read_text())
+        if m.get("artifacts", {}).get("out") and m["inputs"].get("seed") == seed:
+            return m["id"], m["artifacts"]["out"]
+    raise AssertionError(f"seed={seed} SFT run wrote no artifacts.out")
+
+
+def test_merge_lineage_idempotency_and_json(tmp_path, monkeypatch, capsys):
+    """A merge records the runs that wrote its inputs, a repeat is a no-op, and
+    --json prints the manifest — the P4 lineage chain end to end through the CLI."""
+    import json as _json
+
+    from tilerl import cli
+    from tilerl import merge as merge_mod
+    from tilerl.ledger import lineage, list_runs, read_manifest, runs_root
+
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
+    id_a, dir_a = _sft_run("json", 0)
+    id_b, dir_b = _sft_run("", 1)
+    assert id_a != id_b
+    # The SFT artifact is a mergeable bf16 checkpoint dir, not an adapter.
+    assert list(Path(dir_a).glob("*.safetensors"))
+
+    out = str(tmp_path / "merged")
+    args = ["merge", "--base", dir_a, "--specialists", dir_b, "--out", out, "--json"]
+    capsys.readouterr()  # discard the two SFT runs' output
+    cli.cmd_merge(cli._build_parser().parse_args(args))
+    (mm,) = [r for r in list_runs(runs_root()) if r["command"] == "merge"]
+    assert mm["parents"] == [id_a, id_b], mm["parents"]
+    assert _json.loads(capsys.readouterr().out)["id"] == mm["id"]  # --json prints the manifest
+    # The two-node (here three-node) walk reaches both producers.
+    assert [r["id"] for r in lineage(runs_root(), mm["id"])] == [mm["id"], id_a, id_b]
+
+    # A repeat with the same inputs is a no-op: merge_checkpoints is never called again
+    # and no new manifest appears.
+    calls = 0
+    real = merge_mod.merge_checkpoints
+
+    def _count(*a, **k):
+        nonlocal calls
+        calls += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(merge_mod, "merge_checkpoints", _count)
+    cli.cmd_merge(cli._build_parser().parse_args(
+        ["merge", "--base", dir_a, "--specialists", dir_b, "--out", out]))
+    assert calls == 0
+    assert len(list(Path(runs_root()).iterdir())) == 3
+    assert read_manifest(runs_root(), mm["id"])["finished"]
 
 
 if __name__ == "__main__":  # runnable check

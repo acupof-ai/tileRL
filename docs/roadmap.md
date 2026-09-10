@@ -222,7 +222,9 @@ The agent's surface. `runs/<id>/manifest.json` per run: inputs (including
 checkpoint path, commit, seed), data hash, parents, metrics, gates with
 pass/fail, artifacts. `id = hash(inputs)`, so a rerun is a no-op; a failed
 gate is a non-zero exit; `--json` everywhere. Command names stay `train`,
-`merge`, `eval`, `serve`, `ledger`; there is no rename.
+`merge`, `serve`, `ledger`; there is no rename. There is no standalone `eval`
+command: scoring runs as the before/after arms of `tilerl train`, not as its
+own run, so it writes no manifest of its own.
 
 - Exit: `tilerl train` and `tilerl merge` write manifests; `tilerl ledger`
   lists runs and lineage; an identical rerun does nothing; a test chains

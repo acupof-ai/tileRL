@@ -333,6 +333,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--recipe',
         '--reward',
         '--rl',
+        '--save-model',
         '--seed',
         '--steps',
         '--temperature',
@@ -378,7 +379,9 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
     }),
     'merge': frozenset({
         '--base',
+        '--force',
         '--help',
+        '--json',
         '--method',
         '--out',
         '--specialists',

@@ -62,6 +62,26 @@ def list_runs(root: str | os.PathLike) -> list[dict]:
     return sorted(ms, key=lambda m: m["finished"] or m["started"], reverse=True)
 
 
+def find_run_for_artifact(root: str | os.PathLike, path: str | os.PathLike) -> str | None:
+    """The run id whose manifest artifact resolves to ``path`` (file or dir), or None.
+
+    A merge input specialist or a ``--load-adapter`` file carries no run id itself —
+    only the producing run's manifest names it in ``artifacts``. Relative artifact
+    values (``adapter.safetensors``) resolve against the run directory; absolute ones
+    (a merge ``out``) are used as given. An unlinked path contributes no parent.
+    """
+    target = Path(path).resolve()
+    for m in list_runs(root):
+        rd = Path(root) / m["id"]
+        for v in m.get("artifacts", {}).values():
+            ap = Path(v)
+            if not ap.is_absolute():
+                ap = rd / ap
+            if ap.resolve() == target:
+                return m["id"]
+    return None
+
+
 def lineage(root: str | os.PathLike, id: str) -> list[dict]:
     """The run, then its parents, breadth first."""
     out: list[dict] = []
