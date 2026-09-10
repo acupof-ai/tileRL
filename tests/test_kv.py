@@ -918,9 +918,9 @@ def test_a_yielded_gil_runs_a_background_load_promptly(tmp_path):
         load_ms = (time.perf_counter() - t0) * 1000
         if load_ms >= target_ms:
             break
-        n *= 2
-        if n > 1_000_000:
+        if n > 500_000:
             pytest.fail(f"load of {n} tensors is {load_ms:.1f}ms, still < {target_ms:.1f}ms")
+        n *= 2
 
     def bg_load(out):
         t0 = time.perf_counter()
@@ -944,13 +944,15 @@ def test_a_yielded_gil_runs_a_background_load_promptly(tmp_path):
 
     busy = measure(yield_each=False)
     yielded = measure(yield_each=True)
-    # Ratio threshold: the busy arm pays one GIL re-acquisition wait per storage
-    # read. CI macos-14 observed 0.15ms per acquisition under a busy main
-    # (1.318ms vs 0.442ms at 2 storages, 2026-09-10); at the calibrated n>=2048
-    # storages that projects busy >= 6x yielded (local Mac, torch 2.13: 29x).
-    # 3x takes half the projected CI margin. Under a loaded box both arms slow
-    # together and the ratio holds; if load ever pushes it below 3x, that is
-    # flake, not regression.
+    # Ratio threshold (derivation, not measurement): the busy arm pays one GIL
+    # re-acquisition wait per storage read. The chain starts from a CI run that
+    # judged "no contention visible" (macos-14, 2026-09-10: 1.318ms vs 0.442ms
+    # at 2 storages, ~0.15ms per acquisition), so extrapolating a contention
+    # SIZE from it runs in the wrong direction -- treat the projection as a
+    # lower bound. At the calibrated n>=2048 storages it gives busy >= 6x
+    # yielded (local Mac, torch 2.13: 29x measured). 3x takes half that. If
+    # this goes red, first check the per-storage-linearity assumption, not
+    # "flaky". Under a loaded box both arms slow together and the ratio holds.
     assert busy > yielded * 3, f"no contention visible: busy={busy:.1f}ms yielded={yielded:.1f}ms"
     # Absolute ceiling on the yielded arm: calibration lands the load in
     # [target, 2x target), so 4x target leaves 2x for machine load. The ratio

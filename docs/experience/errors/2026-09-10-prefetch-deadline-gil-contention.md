@@ -89,6 +89,14 @@ speed. When the fetch runs in a different thread, GIL contention can make
 it 175x slower. Measure the fetch time in the actual threading environment,
 not in isolation.
 
+A GIL-contention test's background workload must produce GIL handoff points.
+One big tensor's `torch.load` is a single `read()` with the GIL released,
+which a busy main thread cannot slow — the control arm sees no contention
+(CI macos-14, 2026-09-10: busy 1.3 ms vs yielded 0.4 ms, the negative control
+correctly refused to sign). Many small storages churn the GIL once per file;
+that is also the real reader's workload shape — the 27B snapshot is many
+per-window files, not one blob.
+
 ## CPU deadline margin too thin (second instance of the same shape)
 
 Status: fixed 2026-09-10 by the spin-until-ready loop (72d83303,
