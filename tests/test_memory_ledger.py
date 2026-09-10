@@ -156,6 +156,101 @@ def test_plan_budget_rows_are_arithmetic_without_a_card():
     assert by["prefix_entries_budget"] == 1000 // 4
 
 
+def test_plan_weights_row_from_checkpoint_faces_drops_nonserving_and_repacks_bf16(tmp_path):
+    """The header-only weights row sums the SERVED faces checkpoint_weight_faces returns:
+    a non-serving tensor (MTP) is dropped, and a bf16-shipped fp4_param_keys linear is
+    priced at the block-32 repack face load_hf serves — not its disk bf16. The raw
+    checkpoint_weight_specs path is wrong on both, so this goes red on the old code."""
+    from dataclasses import replace
+
+    import torch
+    from safetensors.torch import save_file
+
+    from tilerl.config import tiny
+    from tilerl.memory import plan, weight_row_faces
+    from tilerl.model import checkpoint_weight_faces, param_specs
+    from tilerl.precision import nbytes, nvfp4_dev_b32
+
+    cfg = replace(tiny(), fp4=True)
+    specs = param_specs(cfg)
+    n, k = specs["layers.0.q_proj"]           # an fp4_param_keys linear, shipped bf16
+    ve, h = specs["embed_tokens"]
+    save_file({
+        # bf16 on disk; load_hf repacks it with pack_fp4 block 32 -> nvfp4_dev_b32
+        "model.layers.0.self_attn.q_proj.weight": torch.zeros((n, k), dtype=torch.bfloat16),
+        "model.embed_tokens.weight": torch.zeros((ve, h), dtype=torch.bfloat16),
+        # a non-serving tensor (MTP/visual): _param_key_for -> None, must be dropped
+        "model.mtp.0.enhance.weight": torch.zeros((16, k), dtype=torch.bfloat16),
+    }, str(tmp_path / "model.safetensors"))
+    faces = checkpoint_weight_faces(cfg, tmp_path)
+    assert "layers.0.q_proj" in faces and len(faces) == 2  # q_proj + embed; MTP dropped
+    assert faces["layers.0.q_proj"][1] == nvfp4_dev_b32
+    # Exact served bytes: repacked q_proj (b32) plus the bf16 embed table; no MTP row.
+    want = nbytes(nvfp4_dev_b32, (n, k)) + 2 * ve * h
+    assert weight_row_faces(faces).n == want
+    rows = plan(cfg, None, 0, num_slots=1, num_blocks=8, ckpt_faces=faces)
+    assert sum(r.n for r in rows if r.owner == "weights") == want
+
+
+def test_serve_dry_run_checkpoint_is_header_only_and_needs_dry_run(tmp_path, capsys):
+    """--dry-run --checkpoint DIR prices from served faces (no load, no engine, measured/delta
+    null); --checkpoint without --dry-run refuses; blocks are fitted after fixed bytes."""
+    import json
+
+    import torch
+    from safetensors.torch import save_file
+
+    from tilerl import cli
+    from tilerl.memory import _state_bytes, fit_num_blocks, weight_row_faces
+    from tilerl.model import checkpoint_weight_faces
+
+    save_file({"model.embed_tokens.weight": torch.zeros((100, 64), dtype=torch.bfloat16)},
+              str(tmp_path / "model.safetensors"))
+
+    with pytest.raises(SystemExit, match="--dry-run"):
+        cli.cmd_serve(cli._build_parser().parse_args(
+            ["serve", "--model", "tiny", "--checkpoint", str(tmp_path)]))
+    cli.cmd_serve(cli._build_parser().parse_args(
+        ["serve", "--model", "tiny", "--dry-run", "--checkpoint", str(tmp_path),
+         "--json", "--device-free", "1000000", "--slots", "4"]))
+    rows = json.loads(capsys.readouterr().out)
+    by = {r["owner"]: r for r in rows}
+    cfg, _, _ = _engine()
+    faces = checkpoint_weight_faces(cfg, tmp_path)
+    assert by["weights"]["bytes"] == weight_row_faces(faces).n
+    # Header-only: nothing was built, so there is no measured column or delta.
+    assert by["weights"]["measured"] is None and by["weights"]["delta"] is None
+    # build_engine fits AFTER weights and the state pool (slots+CUDA graph pad; 0 on cpu)
+    # are resident; the header-only fit subtracts the same before fitting.
+    free_after_fixed = 1000000 - weight_row_faces(faces).n - _state_bytes(cfg, 4, f32)
+    want_blocks = fit_num_blocks(cfg, free_after_fixed, torch.bfloat16)
+    assert by["kv_pool"]["note"] == f"{want_blocks} blocks"
+
+
+def test_27b_checkpoint_weights_row_matches_load_hf_resident_exact():
+    """Pending-remote: the header-only weights row on the real 27B equals BOTH load_hf's
+    resident bytes and its live materialized storage, to the integer cc recorded
+    (1845 tensors). Headers only for the sum; the live equality is run once on the pod.
+
+        TILERL_27B_CKPT=/work/Qwen3.8-27B-NVFP4 \\
+        uv run tilerl serve --model qwen38-27b --dry-run --checkpoint \"$TILERL_27B_CKPT\" \\
+            --device-free 60000000000
+    """
+    import os
+
+    ckpt = os.environ.get("TILERL_27B_CKPT")
+    if not ckpt:
+        pytest.skip("set TILERL_27B_CKPT to the 27B NVFP4 dir; headers only, no weights")
+    from tilerl.config import qwen38_27b
+    from tilerl.memory import weight_row_faces
+    from tilerl.model import checkpoint_weight_faces, load_hf
+
+    cfg = qwen38_27b()
+    total = weight_row_faces(checkpoint_weight_faces(cfg, ckpt)).n
+    assert total == 24_436_981_888, f"served weights {total} != load_hf resident 24,436,981,888"
+    assert sum(t.numel() * t.element_size() for t in load_hf(cfg, ckpt).params.values()) == total
+
+
 def test_serve_dry_run_needs_device_free_off_cuda_and_prints_rows(capsys):
     """--dry-run --json builds, reconciles derived vs measured, and emits the budget rows
     from --device-free; off CUDA the flag is required (no mem_get_info to invent a number)."""
@@ -188,6 +283,8 @@ if __name__ == "__main__":
               test_plan_fp8_pool_row_includes_scale_planes,
               test_draft_pool_is_separate_not_folded_into_kv_pool,
               test_plan_budget_rows_are_arithmetic_without_a_card,
+              test_plan_weights_row_from_checkpoint_faces_drops_nonserving_and_repacks_bf16,
+              test_serve_dry_run_checkpoint_is_header_only_and_needs_dry_run,
               test_serve_dry_run_needs_device_free_off_cuda_and_prints_rows):
         f(None) if f.__code__.co_argcount else f()
-    print("memory ledger: single-formula fit/plan, fp8 scales, budget rows, tiny OK")
+    print("memory ledger: single-formula fit/plan, fp8 scales, checkpoint weights, tiny OK")
