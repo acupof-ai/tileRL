@@ -747,6 +747,8 @@ def test_the_eval_is_not_scored_at_the_rollout_cap(tmp_path, monkeypatch):
 
     data = tmp_path / "d.jsonl"
     data.write_text(json.dumps({"prompt": "2+2?", "answer": "4"}) + "\n")
+    held = tmp_path / "held.jsonl"
+    held.write_text(json.dumps({"prompt": "3+3?", "answer": "6"}) + "\n")
     seen = {}
     real = eval_mod.gsm8k_accuracy
 
@@ -762,7 +764,7 @@ def test_the_eval_is_not_scored_at_the_rollout_cap(tmp_path, monkeypatch):
         cli.cmd_train(cli._build_parser().parse_args(
             ["train", "--rl", "--steps", "1", "--group", "2", "--lora-rank", "2",
              "--max-new-tokens", "4", "--eval-max-new-tokens", "64",
-             "--data", str(data), "--eval-gsm8k", str(data)]))
+             "--data", str(data), "--eval-gsm8k", str(held)]))
     assert seen, "gsm8k_accuracy was never called"
     assert seen["eval_cap"] == 64, (
         f"the eval ran at max_new_tokens={seen['eval_cap']}, the ROLLOUT cap; "

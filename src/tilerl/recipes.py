@@ -21,9 +21,16 @@ RECIPES: dict[str, dict] = {
     # it cancels (wins/2026-09-08-the-274x-is-a-cap-256-result.md). The 66 minutes saved
     # buys an artifact the curve itself cannot reveal.
     "grpo-gsm8k-27b": dict(
-        model="qwen38-27b", rl=True, steps=100, group=8, max_new_tokens=256, lora_rank=16,
+        model="qwen38-27b", rl=True, steps=100, group=8, max_new_tokens=512, lora_rank=16,
         micro=1, max_think_tokens=0, eval_mmlu=1000, eval_n=500, lr=1e-4,
         eval_max_new_tokens=2048,
+        # At the 91% base ~60% of groups are all-correct or all-wrong. The self-judge
+        # orders inside those two bands so they carry gradient again, while the band
+        # split keeps a wrong answer below every right one (judge.py). Under --judge
+        # the length term never reaches the advantage (grpo_loop replaces rewards with
+        # judge scores), so the 2026-09-10 length-gradient collapse is inert here.
+        # Judge quality on the 27B is unmeasured, so the P1 retry is its acceptance.
+        judge=True,
         status="pending-remote: roadmap P1"),
     # GSM8K is solved: 88.0% uncapped base, so 81% of groups tie at the ceiling
     # (wins/2026-09-05-p1-grpo-27b-run.md). TRAINING data is level 5 only (2304 rows,
