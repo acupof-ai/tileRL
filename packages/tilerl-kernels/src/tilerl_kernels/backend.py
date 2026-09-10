@@ -916,7 +916,8 @@ class Backend:
         # here, not lazily in _served_fp4, because it allocates a same-size
         # scratch and by the first forward the KV cache + activations have left no
         # room on a 32GB card. Tagged so a train step's re-materialize skips it.
-        _twiddle = {"sm90": reference.twiddle_fp4, "sm70": reference.twiddle_fp4_f16}.get(self.arch)
+        tag = reference.arch_fp4_layout(self.arch)
+        _twiddle = reference.FP4_LAYOUT_TWIDDLE.get(tag)
         served = _twiddle is not None and "linear_fp4_gemv" in _resolve(self.precision, self.arch)
         narrow = served and self.scale_io != torch.float32
         # The embedding table rides the same trick as the scale plane, and for a
@@ -939,7 +940,7 @@ class Backend:
             for k in moved:
                 if k.endswith(".wq") and getattr(moved[k], "_tl_layout", "natural") == "natural":
                     moved[k].copy_(_twiddle(moved[k]))
-                    moved[k]._tl_layout = "tw-bf16" if self.arch == "sm90" else "tw-f16"
+                    moved[k]._tl_layout = tag
         return moved
 
     # ------------------------------------------------------------ attention

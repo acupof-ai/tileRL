@@ -274,6 +274,18 @@ def twiddle_fp4_f16(wq: torch.Tensor) -> torch.Tensor:
     return _twiddle_fp4(wq, _TW_POS_F16)
 
 
+#: ``_tl_layout`` tag -> the natural -> arch byte rewrite. ``materialize`` applies
+#: it once at build and tags the served ``.wq``; a per-step re-quant re-packs
+#: natural nibbles and must re-apply the SAME function by the slot's tag before
+#: copying in, or a twiddled-layout decode kernel reads natural bytes.
+FP4_LAYOUT_TWIDDLE = {"tw-bf16": twiddle_fp4, "tw-f16": twiddle_fp4_f16}
+
+
+def arch_fp4_layout(arch: str) -> str:
+    """The ``_tl_layout`` tag an arch's materialize stamps, or "natural"."""
+    return {"sm90": "tw-bf16", "sm70": "tw-f16"}.get(arch, "natural")
+
+
 def untwiddle_fp4(wq: torch.Tensor) -> torch.Tensor:
     """Inverse of :func:`twiddle_fp4`."""
     return _untwiddle_fp4(wq, _TW_POS)
