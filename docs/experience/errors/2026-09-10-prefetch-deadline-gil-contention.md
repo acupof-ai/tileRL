@@ -60,6 +60,18 @@ fetch when the deadline expires — the 70 ms is already paid, and the result
 is useful for the next request with the same prefix. The deadline should
 govern whether to *start* a fetch, not whether to *discard finished work*.
 
+A `fetch_ms` upper bound was measured and rejected as a guard: on CPU the
+fetch takes 1185 ms even with the yield (the slow CPU forward gives the
+reader one 5 ms window per tick), so it cannot discriminate yield from
+no-yield in the only environment CI runs. A guard that is always green in
+the only environment that runs it is worse than none.
+
+Reproducible apparatus: `scripts/probe_prefetch_hit.py` (the three counters
+in the test scenario) and `scripts/probe_torch_load_overhead.py` (the
+four-scenario GIL table). One permanent guard came out of them:
+`test_a_yielded_gil_runs_a_background_load_promptly` in `tests/test_kv.py`
+(the sleep(0) premise itself, red on a CPython/torch GIL behavior change).
+
 ## General finding
 
 Any Python background thread in this engine is silently starved by the

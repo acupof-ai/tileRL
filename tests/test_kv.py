@@ -4,6 +4,10 @@ Covers: roundtrip, prefix hit/miss incl. hash-collision, refcount/CoW,
 state pool, pool exhaustion, and the shared-prefix fork lifecycle.
 """
 
+import sysconfig
+import threading
+import time
+
 import pytest
 import torch
 
@@ -875,3 +879,50 @@ def test_batchkv_inputs_for_fp8_scales():
     assert torch.any(
         kv.inputs_for(torch.tensor([[5]]), torch.tensor([[19]]), 0)["k_scale"] == 7
     )
+
+
+def test_a_yielded_gil_runs_a_background_load_promptly(tmp_path):
+    """The SSD prefetch fix's premise: sleep(0) in the step loop lets the reader
+    thread run torch.load at uncontended speed.
+
+    Red when a CPython/torch upgrade changes GIL behavior so a yielded tick no
+    longer hands the reader a prompt slice -- the prefetch deadline then expires
+    on fast cards again
+    (docs/experience/errors/2026-09-10-prefetch-deadline-gil-contention.md).
+    """
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        pytest.skip("no GIL to contend")
+
+    blob = {"states": torch.randn(2, 4, 8, 8, 8), "windows": torch.randn(2, 4, 8, 8)}
+    path = tmp_path / "load.kv"
+    torch.save(blob, path)
+    torch.load(path, map_location="cpu")  # warmup: first call pays lazy init
+
+    def bg_load(out):
+        t0 = time.perf_counter()
+        torch.load(path, map_location="cpu")
+        out.append((time.perf_counter() - t0) * 1000)
+
+    def measure(yield_each: bool, n: int = 5) -> float:
+        times = []
+        for _ in range(n):
+            out: list = []
+            t = threading.Thread(target=bg_load, args=(out,))
+            t.start()
+            end = time.perf_counter() + 2.0
+            while time.perf_counter() < end and t.is_alive():
+                if yield_each:
+                    time.sleep(0)
+            t.join()
+            times.append(out[0])
+        times.sort()
+        return times[len(times) // 2]
+
+    busy = measure(yield_each=False)
+    yielded = measure(yield_each=True)
+    # Thresholds from the measured gap (Mac, torch 2.13, 2026-09-10): busy 137.5 ms
+    # vs yielded 0.7 ms, a 200x gap. 10x takes 1/20th of that margin, not tuned to
+    # a mutant. Under a loaded CI box both arms slow together and the ratio holds;
+    # if load ever pushes the ratio below 10x, that is flake, not regression.
+    assert busy > yielded * 10, f"no contention visible: busy={busy:.1f}ms yielded={yielded:.1f}ms"
+    assert yielded < 10.0, f"yielded load too slow: {yielded:.1f}ms"
