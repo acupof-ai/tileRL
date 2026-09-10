@@ -45,6 +45,12 @@ the attention-decode byte gate (tests/test_kernel_cost.py) pins the declaration
 to what the KV pool actually allocates. Measured roofline waits for a card
 calibration row (a copy kernel + a large GEMM), never a datasheet number.
 
+An operand is charged per HBM direction it actually crosses; kernel-internal
+recomputation is free. The in-place GDN state is read and written (151 MB/seq is
+3x the H100/H20 L2, so the update cannot stay resident and both directions hit
+HBM); W/R/U recomputed inside the kernel from the f32 activations move nothing
+and are not charged.
+
 ## Results
 
 | date | commit | machine | target | model | bytes B=1 | bytes B=8 | flops B=8 |
