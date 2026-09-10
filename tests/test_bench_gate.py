@@ -131,6 +131,53 @@ def test_a_cpu_target_never_takes_the_cuda_name(monkeypatch, tmp_path):
     assert benchrec.record_common(args)["device"]["name"] == "cpu"
 
 
+def test_a_directionless_metric_is_never_judged_and_a_directional_one_still_fails(
+        monkeypatch, tmp_path, capsys):
+    """rollout_tokens has no monotonic direction: a 13.9-then-347 population (the
+    2026-09-10 P1 collapse shape) must draw no PASS/FAIL in either regression
+    section. The decode_tok_s pair is the control: an obvious regression there
+    must still FAIL -- the first assertion alone is indistinguishable from the
+    whole judgment being switched off."""
+    def row(metric, value, date, floor_kind, floor_value):
+        r = {
+            "build": "eager", "cmd": "test", "commit": "0" * 40, "date": date,
+            "device": {"card": None, "name": "cpu"}, "dirty": False,
+            "floor": {"derivation": "test", "kind": floor_kind, "unit": "x",
+                      "value": floor_value},
+            "metric": metric, "model": "tiny", "n": 2, "shape": {"steps": 100},
+            "spread": 0.0, "target": "cpu", "unit": "x", "value": value,
+            "warm": {"state": "warm"},
+        }
+        r["id"] = benchrec.new_id(r)
+        return r
+
+    store = tmp_path / "measurements.jsonl"
+    store.write_text("\n".join(json.dumps(r) for r in [
+        row("rollout_tokens", 13.9, "2026-09-09", "measured-best", 13.9),
+        row("rollout_tokens", 346.8, "2026-09-10", "reference", 346.8),
+        row("decode_tok_s", 100.0, "2026-09-09", "measured-best", 100.0),
+        row("decode_tok_s", 50.0, "2026-09-10", "measured-best", 100.0),
+    ]) + "\n")
+    monkeypatch.setattr(benchrec, "STORE", store)
+
+    reg = benchrec.load_registry()["metrics"]
+    assert reg["rollout_tokens"]["direction"] == "none"
+    assert bh._gap([r for r in benchrec.load_all()
+                    if r["metric"] == "rollout_tokens"][-1], reg) is None
+    assert bh._gap([r for r in benchrec.load_all()
+                    if r["metric"] == "decode_tok_s"][-1], reg) == 2.0
+
+    bh._view_regress()
+    out = capsys.readouterr().out
+    assert "rollout_tokens" not in out, "a directionless metric drew a judgment"
+    assert "FAIL decode_tok_s" in out, "the control stopped judging -- the skip is too wide"
+
+    bh._view_questions()
+    out = capsys.readouterr().out
+    assert "rollout_tokens" not in out, (
+        "a reference floor is a deliberate non-physical floor, not a missing derivation")
+
+
 def test_every_registered_collector_exists_and_the_094_metrics_have_one():
     """The collector field is the metric -> script map `tilerl bench <name>` dispatches
     on. A renamed script must fail CI, and a weight-0.94 metric with no collector is

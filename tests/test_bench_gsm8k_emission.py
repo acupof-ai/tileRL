@@ -40,7 +40,8 @@ def test_emit_eval_records(tmp_store, monkeypatch):
     lens = list(range(200))  # mean 99.5, nonzero spread
     cli._emit_eval_records(190, 200, sum(lens), lens, 0, _Backend())
     cli._emit_eval_records(196, 200, 20000, [100] * 200, 100, _Backend())
-    # A worse rerun of the same arm: direction - means the floor stays at the lowest.
+    # A rerun of the same arm: rollout_tokens has no monotonic direction, so its
+    # floor is the measurement itself (reference), never the population's best.
     cli._emit_eval_records(190, 200, 22000, [110] * 200, 100, _Backend())
     rows = [json.loads(l) for l in tmp_store.STORE.read_text().splitlines()]
     assert len(rows) == 6
@@ -52,10 +53,11 @@ def test_emit_eval_records(tmp_store, monkeypatch):
     # steps is the population: before and after must not collapse into one row
     assert len({r["shape"]["steps"] for r in rows}) == 2
     worse = by[("rollout_tokens", 100, 110.0)]
-    assert worse["floor"]["value"] == 100.0  # anchored at the best (lowest) prior value
+    assert worse["floor"]["value"] == 110.0  # the measurement itself, not the prior best
     for r in rows:
         assert r["target"] == "sm90" and r["device"] == {"name": "NVIDIA H20", "card": 6}
-        assert r["floor"]["kind"] == "measured-best"
+        assert r["floor"]["kind"] == (
+            "reference" if r["metric"] == "rollout_tokens" else "measured-best")
         assert r["n"] == 200 and r["spread"] >= 0
         assert len(r["commit"]) == 40 and isinstance(r["dirty"], bool)
 
