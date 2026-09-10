@@ -11,9 +11,9 @@ separate calibration; without a card the measured columns render
 reads is caught by the attention-decode byte gate.
 
 Scope: the kernels one 27B DECODE tick launches. The nvfp4 linears are
-enumerated from param_specs, not listed by hand. Prefill/backward are later
-rows; a kernel without a grounded shape is left undeclared rather than costed
-against one it does not see.
+enumerated from param_specs, not listed by hand. Prefill rows live next to them
+(``prefill_rows``); backward is a later row. A kernel without a grounded shape is
+left undeclared rather than costed against one it does not see.
 """
 
 from __future__ import annotations
@@ -89,6 +89,162 @@ def _silu_mul(cfg, t: TickShape) -> tuple[int, int]:
     """SiLU(gate) * up over the MLP intermediate: gate+up read, product write."""
     inter = cfg.intermediate_size
     return 3 * nbytes(P.bf16, (t.b, inter)), t.b * inter
+
+
+#: chunkwise-WY prefill chunk length — mirrors backend._WY_CHUNK, grounded here so
+#: a declaration never imports a backend scheduling constant.
+_PREFILL_CHUNK = 64
+
+#: (M, N, K) of the eight batched matmuls in kernels.reference._gdn_chunk_fwd, per
+#: (value head, chunk): the prefill recurrence's flop structure.
+_GDN_CHUNK_MATMULS = (
+    (64, 64, 128),    # KK^T
+    (64, 128, 64),    # M @ bV
+    (64, 128, 64),    # M @ beK
+    (64, 128, 128),   # W @ S
+    (64, 64, 128),    # QK^T
+    (64, 128, 128),   # P @ S
+    (64, 128, 64),    # A @ d
+    (128, 128, 64),   # R^T @ d
+)
+
+
+def _linear_prefill(spec: tuple[int, int], t: TickShape) -> tuple[int, int]:
+    """Prefill linear y[m,out] = x[m,in] @ W^T over m = b*S token rows: weight
+    streamed once for the whole chunk, plus the m-row input and output."""
+    out, inn = spec
+    m = t.b * t.s
+    bytes_ = nbytes(t.weight, spec) + nbytes(P.bf16, (m, inn)) + nbytes(P.bf16, (m, out))
+    return bytes_, 2 * m * out * inn
+
+
+def prefill_kv_write_bytes(cfg, t: TickShape) -> int:
+    """K and V one prefill writes to the paged pool for ``b`` sequences of ``s``
+    tokens, across every full-attention plane, priced in the pool's own format
+    (fp8 plane + its per-head_dim f32 scale). This is the byte gate's side."""
+    return 2 * nbytes(t.kv, (t.b, cfg.num_kv_heads, t.s, cfg.head_dim)) * len(
+        cfg.full_attn_layers
+    )
+
+
+def _paged_attention_prefill(cfg, t: TickShape) -> tuple[int, int]:
+    """One full-attn layer's causal prefill attention over s tokens.
+
+    Charged per HBM direction crossed: K and V are WRITTEN to the paged pool for
+    the first time and READ back as the attention's operands (the write half is
+    what :func:`prefill_kv_write_bytes` pins to the pool). Q is read and O written
+    once. Causal masking halves the pairs, not the loaded K/V blocks, so bytes are
+    the full K/V both directions while flops count only the lower triangle.
+    """
+    hq, d = cfg.num_attention_heads, cfg.head_dim
+    kv_one_way = nbytes(t.kv, (t.b, cfg.num_kv_heads, t.s, d))  # K xor V
+    kv_bytes = 4 * kv_one_way  # write K+V, read K+V
+    qo = nbytes(P.bf16, (t.b, hq, t.s, d)) * 2
+    pairs = t.s * (t.s + 1) // 2  # lower triangle including the diagonal
+    flops = 4 * t.b * hq * pairs * d
+    return kv_bytes + qo, flops
+
+
+def _gdn_chunk_forward(cfg, t: TickShape) -> tuple[int, int]:
+    """The GDN chunked-forward recurrence over a prefill of s tokens, one layer.
+
+    Flops are the eight batched matmuls of ``reference._gdn_chunk_fwd`` over every
+    ``_PREFILL_CHUNK``-token chunk and every value head. Bytes charge only what
+    crosses HBM: the f32 activations the in_proj linears hand in and the bf16
+    output, plus the recurrent state carried chunk-to-chunk (written by every
+    chunk, read by every chunk but the first). The per-chunk M/W/U intermediates
+    are in-kernel recomputation and move nothing.
+    """
+    nvh, dk, dv = cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
+    rows = t.b * t.s
+    nchunks = -(-rows // _PREFILL_CHUNK)
+    flops_per_chunk_head = sum(2 * m * n * k for m, n, k in _GDN_CHUNK_MATMULS)
+    flops = nchunks * nvh * flops_per_chunk_head
+    state = nbytes(P.f32, (t.b, nvh, dk, dv))
+    act = nbytes(P.f32, (t.b * nvh, t.s, 3 * dk + dv + 2))
+    out = nbytes(P.bf16, (t.b, nvh, t.s, dv))
+    bytes_ = state * (2 * nchunks - 1) + act + out
+    return bytes_, flops
+
+
+def _rmsnorm_prefill(cfg, t: TickShape, width: int) -> tuple[int, int]:
+    m = t.b * t.s
+    x = nbytes(P.bf16, (m, width))
+    return x + x + nbytes(P.f32, (width,)), 4 * m * width
+
+
+def _silu_mul_prefill(cfg, t: TickShape) -> tuple[int, int]:
+    m = t.b * t.s
+    inter = cfg.intermediate_size
+    return 3 * nbytes(P.bf16, (m, inter)), m * inter
+
+
+def prefill_rows(cfg, t: TickShape) -> list[dict]:
+    """Every kernel one prefill of ``b`` sequences of ``s`` tokens launches.
+
+    Linears process all ``b*s`` token rows in one GEMM (weight streamed once);
+    ``lm_head`` scores only the last token per sequence (m=b), since prefill
+    hidden states are not all projected. Same row schema as :func:`tick_rows`.
+    """
+    from .model import param_specs
+
+    specs = param_specs(cfg)
+    n_full = len(cfg.full_attn_layers)
+    n_gdn = cfg.num_layers - n_full
+    gdn_layer = next(
+        (f"layers.{i}" for i in range(cfg.num_layers) if i not in set(cfg.full_attn_layers)), None
+    )
+    rows: list[dict] = []
+
+    def add(name: str, shape: str, count: int, by: int, fl: int) -> None:
+        rows.append(dict(name=name, shape=shape, count=count, bytes=by, flops=fl))
+
+    groups = [
+        (n_full, f"layers.{cfg.full_attn_layers[0]}",
+         ("q_proj", "k_proj", "v_proj", "o_proj")),
+        (n_gdn, gdn_layer,
+         ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")),
+        (cfg.num_layers, gdn_layer, ("gate_proj", "up_proj", "down_proj")),
+    ]
+    for count, layer, keys in groups:
+        if not count or layer is None:
+            continue
+        for k in keys:
+            spec = tuple(specs[f"{layer}.{k}"])
+            by, fl = _linear_prefill(spec, t)
+            add(k, f"M{t.b*t.s} {spec[0]}x{spec[1]}", count, by, fl)
+
+    if "lm_head" in specs:
+        spec = tuple(specs["lm_head"])
+        last = TickShape(b=t.b, s=1, kv=t.kv, weight=t.weight)
+        by, fl = _linear_prefill(spec, last)
+        add("lm_head", f"M{t.b} {spec[0]}x{spec[1]}", 1, by, fl)
+
+    ab, af = _paged_attention_prefill(cfg, t)
+    add(
+        "paged_attention_prefill",
+        f"b{t.b} s{t.s} kv{cfg.num_kv_heads} d{cfg.head_dim} causal",
+        n_full, ab, af,
+    )
+    gb, gf = _gdn_chunk_forward(cfg, t)
+    add(
+        "gdn_chunk_forward",
+        f"b{t.b} s{t.s} nvh{cfg.linear_num_value_heads} chunk{_PREFILL_CHUNK}",
+        n_gdn, gb, gf,
+    )
+    rb, rf = _rmsnorm_prefill(cfg, t, cfg.hidden_size)
+    add("rmsnorm", f"M{t.b*t.s} h{cfg.hidden_size}", 2 * cfg.num_layers + 1, rb, rf)
+    sb, sf = _silu_mul_prefill(cfg, t)
+    add("silu_mul", f"M{t.b*t.s} inter{cfg.intermediate_size}", cfg.num_layers, sb, sf)
+    return rows
+
+
+def prefill_totals(cfg, t: TickShape) -> tuple[int, int]:
+    """(bytes, flops) summed over every kernel launch in one prefill."""
+    return (
+        sum(r["bytes"] * r["count"] for r in prefill_rows(cfg, t)),
+        sum(r["flops"] * r["count"] for r in prefill_rows(cfg, t)),
+    )
 
 
 def tick_rows(cfg, t: TickShape) -> list[dict]:

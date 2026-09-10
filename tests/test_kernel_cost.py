@@ -20,7 +20,15 @@ import pytest
 import torch
 
 from tilerl.config import tiny
-from tilerl.kernel_cost import TickShape, _paged_attention_decode, tick_rows, tick_totals
+from tilerl.kernel_cost import (
+    TickShape,
+    _paged_attention_decode,
+    prefill_kv_write_bytes,
+    prefill_rows,
+    prefill_totals,
+    tick_rows,
+    tick_totals,
+)
 from tilerl.kv_cache import PagedKvPool
 from tilerl.precision import bf16, kv_format, nbytes
 
@@ -85,6 +93,60 @@ def test_pool_bytes_per_token_matches_nbytes_formula():
     assert pool.bytes_per_token == nbytes(kv_format(cfg.head_dim), (elt_per_token,))
 
 
+@pytest.mark.parametrize("use_fp8", [False, True])
+def test_attn_prefill_kv_write_bytes_equal_pool_kv_write(use_fp8):
+    """The prefill declaration's K/V WRITE half equals what the pool stores for
+    b sequences of s tokens across every full-attn plane — the prefill twin of
+    the decode byte gate, priced from the real tensors independently."""
+    cfg = tiny()
+    kv_dtype = torch.float8_e4m3fn if use_fp8 else None
+    kv_fmt = kv_format(cfg.head_dim) if use_fp8 else bf16
+    b, s = 2, 53
+    pool = _pool(cfg, kv_dtype)
+
+    declared = prefill_kv_write_bytes(cfg, TickShape(b=b, s=s, kv=kv_fmt, weight=bf16))
+
+    # Independent truth: per token the pool stores _pool_kv_bytes_per_token
+    # (K+V across all planes); prefill writes b*s fresh tokens, all planes.
+    actual = _pool_kv_bytes_per_token(pool) * b * s
+
+    assert declared == actual, (
+        f"prefill declares {declared} KV-write bytes but the pool stores {actual} "
+        f"for b={b} s={s}"
+    )
+
+
+def test_prefill_rows_weight_streamed_once_and_lm_head_scores_last_token():
+    """Each prefill linear streams its WEIGHT once (that term is M-independent);
+    the M-row input/output activations grow with M and flops scale with M. lm_head
+    costs only the b last tokens, not b*s."""
+    cfg = tiny()
+    t32 = TickShape(b=1, s=32, kv=bf16, weight=bf16)
+    t64 = TickShape(b=1, s=64, kv=bf16, weight=bf16)
+    rows32 = {r["name"]: r for r in prefill_rows(cfg, t32)}
+    rows64 = {r["name"]: r for r in prefill_rows(cfg, t64)}
+
+    # down_proj bytes at s=64 minus s=32 equals ONLY the added activation bytes
+    # (weight streamed once, unchanged), and flops double.
+    from tilerl.model import param_specs
+    from tilerl.precision import nbytes as _nb
+    gdn_layer = next(f"layers.{i}" for i in range(cfg.num_layers)
+                     if i not in set(cfg.full_attn_layers))
+    out, inn = tuple(param_specs(cfg)[f"{gdn_layer}.down_proj"])
+    added_act = _nb(bf16, (32, inn)) + _nb(bf16, (32, out))
+    d32, d64 = rows32["down_proj"], rows64["down_proj"]
+    assert d64["bytes"] - d32["bytes"] == added_act
+    assert d64["flops"] == 2 * d32["flops"]
+
+    # lm_head, when untied, is independent of s: only the last token/sequence scored.
+    if "lm_head" in rows32:
+        assert rows32["lm_head"]["bytes"] == rows64["lm_head"]["bytes"]
+        assert rows32["lm_head"]["flops"] == rows64["lm_head"]["flops"]
+    else:
+        # tied embed_tokens model: lm_head row is absent by construction.
+        assert "lm_head" not in rows64
+
+
 def test_tick_rows_cover_the_launched_set_and_total_is_positive():
     cfg = tiny()
     tick = TickShape(b=1, s=64, kv=bf16, weight=bf16)
@@ -94,3 +156,7 @@ def test_tick_rows_cover_the_launched_set_and_total_is_positive():
     assert bytes_ > 0 and flops > 0
     for r in tick_rows(cfg, tick):
         assert r["count"] >= 1 and r["bytes"] > 0 and r["flops"] >= 0
+    pnames = {r["name"] for r in prefill_rows(cfg, tick)}
+    assert {"paged_attention_prefill", "gdn_chunk_forward"} <= pnames
+    pb, pf = prefill_totals(cfg, tick)
+    assert pb > 0 and pf > 0

@@ -1572,13 +1572,28 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
     from .precision import kv_format, nvfp4
 
     cfg = config_mod.qwen38_27b() if args.model == "qwen38-27b" else config_mod.tiny()
-    batches = tuple(int(x) for x in args.batches.split(",")) if args.batches else (1, 8)
-    print(f"# {cfg.name} decode tick, context s={args.context} tokens, fp8 KV, nvfp4 weights")
+    # ponytail: weights are priced with the DISK nvfp4 Format (e4m3 per-16, 0.5625
+    # B/elem); the device face after renorm_fp4_scale is f32-per-block (0.65625) and
+    # the disk/device split land in cc's Format PR.
+    weight = nvfp4
     print(f"{'kernel':<26} {'count':>5} {'shape':>22} {'bytes':>12} {'flops':>10} "
           f"{'ms':>11} {'%bound':>11}")
+    if args.prefill:
+        pre = kernel_cost.TickShape(b=1, s=args.prefill, kv=kv_format(cfg.head_dim),
+                                    weight=weight)
+        print(f"# {cfg.name} prefill, S={args.prefill} tokens, fp8 KV, nvfp4 weights")
+        for r in kernel_cost.prefill_rows(cfg, pre):
+            print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} "
+                  f"{r['bytes'] * r['count']:>12,} {r['flops'] * r['count']:>10,} "
+                  f"{'pending':>11} {'pending':>11}")
+        tb, tf = kernel_cost.prefill_totals(cfg, pre)
+        print(f"{'PREFILL TOTAL':<26} {'':>5} {'':>22} {tb:>12,} {tf:>10,}")
+        return
+    batches = tuple(int(x) for x in args.batches.split(",")) if args.batches else (1, 8)
+    print(f"# {cfg.name} decode tick, context s={args.context} tokens, fp8 KV, nvfp4 weights")
     for b in batches:
         tick = kernel_cost.TickShape(b=b, s=args.context, kv=kv_format(cfg.head_dim),
-                                     weight=nvfp4)
+                                     weight=weight)
         print(f"-- batch B={b} --")
         for r in kernel_cost.tick_rows(cfg, tick):
             print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} "
@@ -1988,6 +2003,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="print the per-kernel roofline table (bytes/flops), no GPU")
     p_bench.add_argument("--context", type=int, default=4096,
                          help="pooled context tokens the --kernels decode reads against")
+    p_bench.add_argument("--prefill", type=int, default=0, metavar="S",
+                         help="print the prefill roofline table for S tokens instead of decode")
     for v in ("table", "readme", "regress", "questions", "collectors"):
         p_bench.add_argument(f"--{v}", action="store_true",
                              help=f"bench view: {v} from the bench store, no GPU")
