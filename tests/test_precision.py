@@ -28,14 +28,16 @@ def test_nbytes_derived_pool_equals_allocated_storage_bf16_and_fp8():
         ("bf16", {}, torch.bfloat16),
         ("fp8", {"kv_fp8": torch.float8_e4m3fn}, torch.float8_e4m3fn),
     ):
-        pool = PagedKvPool(blocks, heads, head_dim, num_layers=layers,
-                           device="cpu", **kw)
+        pool = PagedKvPool(blocks, heads, head_dim, num_layers=layers, device="cpu", **kw)
         shape = (2 * layers, blocks, heads, 16, head_dim)
-        fmt = kv_format(head_dim) if pool.kv_fp8 is not None else precision.Format(
-            store.itemsize * 8)
-        measured = sum(t.numel() * t.element_size() for t in
-                       (pool.k_pool, pool.v_pool, pool.k_scale, pool.v_scale)
-                       if t is not None)
+        fmt = (
+            kv_format(head_dim) if pool.kv_fp8 is not None else precision.Format(store.itemsize * 8)
+        )
+        measured = sum(
+            t.numel() * t.element_size()
+            for t in (pool.k_pool, pool.v_pool, pool.k_scale, pool.v_scale)
+            if t is not None
+        )
         assert nbytes(fmt, shape) == measured, label
         assert pool.bytes_per_token * 16 * blocks == measured, label
 
@@ -51,13 +53,162 @@ def test_nbytes_nvfp4_matches_checkpoint_loader_packing():
     from tilerl.precision import nbytes, nvfp4
 
     n, k = 8, 64
-    packed = torch.zeros((n, k // 2), dtype=torch.uint8)            # nibbles, 2/byte
+    packed = torch.zeros((n, k // 2), dtype=torch.uint8)  # nibbles, 2/byte
     block_scale = torch.zeros((n, k // 16), dtype=torch.float8_e4m3fn)
     global_scale = torch.zeros(1, dtype=torch.float32)
-    measured = sum(t.numel() * t.element_size()
-                   for t in (packed, block_scale, global_scale))
+    measured = sum(t.numel() * t.element_size() for t in (packed, block_scale, global_scale))
     assert nbytes(nvfp4, (n, k)) == measured
     assert nbytes(nvfp4, (n, k)) == 256 + 32 + 4  # nibbles + e4m3 blocks + one f32
+
+
+def test_device_faces_equal_the_served_tensor_storage():
+    """nvfp4_dev / fp8_dev price exactly what the loader puts on the card.
+
+    nvfp4_dev: nibbles + f32 scale per block + one f32 per output row. The block is
+    whatever the served scale shape says (32 from build_random's pack_fp4, 16 from a
+    ModelOpt checkpoint); both checked. fp8_dev: e4m3 weight + the [N/128,K/128] f32
+    grid + one f32 per row.
+    """
+    from tilerl_kernels.reference import pack_fp4, renorm_fp4_scale
+
+    from tilerl.precision import fp8_block_dev, fp8_dev, nbytes, nvfp4_dev
+
+    n, k = 64, 128
+    w = torch.randn(n, k)
+    for blk in (16, 32):
+        wq, scale = pack_fp4(w, block=blk)
+        scale, osc = renorm_fp4_scale(scale)  # served device tensors, both f32
+        fmt = precision.Format(4, ((blk, "f32"), ((None,), "f32")))
+        measured = wq.numel() + scale.numel() * 4 + osc.numel() * 4  # wq is uint8
+        assert nbytes(fmt, (n, k)) == measured
+    # The named constant is the block-16 ModelOpt face.
+    assert nbytes(nvfp4_dev, (n, k)) == n * k // 2 + n * (k // 16) * 4 + n * 4
+
+    # fp8 block-only face (weight_scale_inv): e4m3 weight + f32 block grid, NO row scale.
+    w8 = torch.zeros((n, k), dtype=torch.float8_e4m3fn)
+    grid = torch.zeros((-(-n // 128), -(-k // 128)), dtype=torch.float32)
+    assert nbytes(fp8_block_dev, (n, k)) == sum(
+        t.numel() * t.element_size() for t in (w8, grid))
+    # fp8 face with a resident per-row scale (plain .weight_scale branch).
+    row = torch.zeros(n, dtype=torch.float32)
+    assert nbytes(fp8_dev, (n, k)) == sum(
+        t.numel() * t.element_size() for t in (w8, grid, row))
+
+
+def test_weight_specs_classifies_a_checkpoint_header_without_weight_bytes():
+    """The three loader branches and activation-quant sidecars, one row per base weight."""
+    from tilerl.precision import weight_specs
+
+    header = {
+        "a.weight_packed": {"shape": (17408, 2560), "dtype": "U8"},  # nvfp4 logical 17408x5120
+        "a.weight_scale": {"shape": (17408, 320), "dtype": "F8_E4M3FN"},
+        "a.weight_global_scale": {"shape": (1,), "dtype": "F32"},
+        "b.weight": {"shape": (48, 5120), "dtype": "F8_E4M3FN"},  # weight_scale_inv: grid only
+        "b.weight_scale_inv": {"shape": (1, 40), "dtype": "F32"},
+        "c.weight": {"shape": (64, 5120), "dtype": "F8_E4M3FN"},  # plain scale: grid + row
+        "c.weight_scale": {"shape": (64,), "dtype": "F32"},
+        "embed.weight": {"shape": (248320, 5120), "dtype": "BF16"},
+        "norm.weight": {"shape": (5120,), "dtype": "BF16"},
+        # activation quantization: never a priced resident-weight row
+        "c.input_scale": {"shape": (1,), "dtype": "F32"},
+        "c.input_global_scale": {"shape": (1,), "dtype": "F32"},
+    }
+    rows = {name: (shape, fmt) for name, shape, fmt in weight_specs(header)}
+    assert set(rows) == {"a.weight_packed", "b.weight", "c.weight",
+                        "embed.weight", "norm.weight"}
+    assert rows["a.weight_packed"][0] == (17408, 5120)
+    assert rows["a.weight_packed"][1] == precision.nvfp4_dev
+    assert rows["b.weight"][1] == precision.fp8_block_dev
+    assert rows["c.weight"][1] == precision.fp8_dev
+    assert rows["embed.weight"][1].bits == 16
+
+
+def test_checkpoint_weight_specs_round_trips_a_real_mixed_safetensors(tmp_path):
+    """Write a mixed fp4/fp8-block/fp8-row/bf16 checkpoint and read it back header-only."""
+    from safetensors.torch import save_file
+
+    from tilerl.precision import (
+        checkpoint_weight_specs,
+        fp8_block_dev,
+        fp8_dev,
+        nbytes,
+        nvfp4_dev,
+    )
+
+    N, K = 128, 64
+    tensors = {
+        # nvfp4 (ModelOpt naming): packed nibbles + e4m3 scale + global
+        "m.weight_packed": torch.zeros((N, K // 2), dtype=torch.uint8),
+        "m.weight_scale": torch.zeros((N, K // 16), dtype=torch.float8_e4m3fn),
+        "m.weight_global_scale": torch.zeros(1, dtype=torch.float32),
+        # fp8 block-only: w8 + grid inv, no row
+        "b.weight": torch.zeros((N, K), dtype=torch.float8_e4m3fn),
+        "b.weight_scale_inv": torch.zeros((1, 1), dtype=torch.float32),
+        # fp8 with a plain per-channel scale: w8 + row (grid is ones at load)
+        "c.weight": torch.zeros((N, K), dtype=torch.float8_e4m3fn),
+        "c.weight_scale": torch.zeros((N,), dtype=torch.float32),
+        "c.input_scale": torch.zeros(1, dtype=torch.float32),  # must be excluded
+        "embed.weight": torch.zeros((100, K), dtype=torch.bfloat16),
+    }
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+
+    rows = {name: (shape, fmt) for name, shape, fmt in checkpoint_weight_specs(tmp_path)}
+    assert set(rows) == {"m.weight_packed", "b.weight", "c.weight", "embed.weight"}
+    assert rows["m.weight_packed"] == ((N, K), nvfp4_dev)
+    assert rows["b.weight"] == ((N, K), fp8_block_dev)
+    assert rows["c.weight"] == ((N, K), fp8_dev)
+    # Derived total is the exact sum of the three device faces plus bf16 embed.
+    expected = (nbytes(nvfp4_dev, (N, K)) + nbytes(fp8_block_dev, (N, K))
+                + nbytes(fp8_dev, (N, K)) + 100 * K * 2)
+    single_total = sum(nbytes(fmt, shape) for shape, fmt in rows.values())
+    assert single_total == expected
+
+    # Same population split across TWO shards with an index.json weight_map -- the only
+    # layout the sharded 27B takes. Classification and byte total must be identical.
+    import json
+
+    shard1 = {k: tensors[k] for k in
+              ("m.weight_packed", "m.weight_scale", "m.weight_global_scale", "b.weight",
+               "b.weight_scale_inv")}
+    shard2 = {k: tensors[k] for k in
+              ("c.weight", "c.weight_scale", "c.input_scale", "embed.weight")}
+    save_file(shard1, str(tmp_path / "model-00001.safetensors"))
+    save_file(shard2, str(tmp_path / "model-00002.safetensors"))
+    (tmp_path / "model.safetensors").unlink()
+    weight_map = {name: "model-00001.safetensors" for name in shard1}
+    weight_map.update({name: "model-00002.safetensors" for name in shard2})
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+    srows = {name: (shape, fmt) for name, shape, fmt in checkpoint_weight_specs(tmp_path)}
+    assert srows == rows
+    assert sum(nbytes(fmt, shape) for shape, fmt in srows.values()) == single_total
+
+
+def test_27b_resident_weight_bytes_match_the_measured_24_44gb(tmp_path):
+    """The checkpoint-derived resident total equals the 24.44 GB measured on H20.
+
+    Pending-remote: needs the Qwen3.8-27B-NVFP4 checkpoint's safetensors headers (no
+    weight bytes are read). Point TILERL_27B_CKPT at the dir to run it. The oracle is
+    errors/2026-09-03-fp4-param-keys-is-not-the-fp4-tensors.md: 24.44 GB resident from a
+    MIXED population (264 nvfp4 + 233 fp8), which config alone cannot reproduce.
+    """
+    import os
+
+    ckpt = os.environ.get("TILERL_27B_CKPT")
+    if not ckpt:
+        import pytest
+
+        pytest.skip("set TILERL_27B_CKPT to the 27B NVFP4 dir; headers only, no weights")
+    from tilerl.precision import checkpoint_weight_specs, nbytes
+
+    rows = checkpoint_weight_specs(ckpt)
+    by_face: dict[str, int] = {}
+    for _, shape, fmt in rows:
+        by_face[fmt] = by_face.get(fmt, 0) + nbytes(fmt, shape)
+    total = sum(by_face.values())
+    # The errors entry records 24.44 GB = 22.76 GiB (decimal GB). Assert to the measured
+    # 0.01 GB: header-derived bytes must equal what memory_allocated read on H20.
+    assert abs(total - int(24.44e9)) < int(0.01e9), f"resident {total / 1e9:.3f} GB != 24.44 GB"
 
 
 def test_iso_frames_follow_the_policy():
@@ -97,12 +248,18 @@ def test_on_policy_guard_refuses_cached_engines():
 
     # graph on, prefix off — decode_graph=True is honoured on cpu, so this is testable
     # here and not a CUDA-only path.
-    graphed = build_engine(cfg, model, RefBackend(), num_blocks=32, num_slots=4,
-                           decode_graph=True, prefix_store=NoPrefixStore())
+    graphed = build_engine(
+        cfg,
+        model,
+        RefBackend(),
+        num_blocks=32,
+        num_slots=4,
+        decode_graph=True,
+        prefix_store=NoPrefixStore(),
+    )
     assert graphed._decode_graph_on is True, "decode_graph=True was not honoured"
     with pytest.raises(ValueError, match="on-policy"):
         run(graphed)
-
 
 
 def test_opd_refuses_a_cached_engine_with_no_adapters_too():
@@ -203,8 +360,14 @@ def test_kernel_io_is_keyed_on_arch_not_on_being_cuda():
     import ast
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parent.parent / "packages" / "tilerl-kernels"
-           / "src" / "tilerl_kernels" / "backend.py").read_text()
+    src = (
+        Path(__file__).resolve().parent.parent
+        / "packages"
+        / "tilerl-kernels"
+        / "src"
+        / "tilerl_kernels"
+        / "backend.py"
+    ).read_text()
     bad = []
     for node in ast.walk(ast.parse(src)):
         # An `x = <bf16/f16> if <...cuda...> else <...>` anywhere: the dtype is the
