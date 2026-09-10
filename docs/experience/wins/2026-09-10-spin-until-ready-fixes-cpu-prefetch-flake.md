@@ -51,11 +51,11 @@ check itself, not the spin. The slice's `.st` is 9.8 MB (the 18 KB was the
 fetch was running, so the bench cannot answer whether the spin exits promptly
 on the slice either.
 
-**On the full 27B model the spin will actually run.** The snapshot is 155.2
-MiB (states 144.0 + conv_window 11.25), and a 155.2 MiB `torch.load` needs many
-GIL windows, not one. Each tick will spin for a meaningful fraction of the 50
-ms bound instead of exiting immediately. The slice bench cannot price this;
-it needs a 27B measurement with SSD on.
+**On the full 27B model the spin runs and hits its bound.** Measured 2026-09-10
+(H20 card 0, `scripts/probe_spin_cost_27b.py`): the spin hits the 50 ms bound
+on 3/3 spin ticks, and the 157.6 MiB fetch (117 ms) exceeds the 75 ms deadline,
+so it drops. See
+[errors/2026-09-10-the-27b-snapshot-fetch-exceeds-the-prefetch-deadline](../errors/2026-09-10-the-27b-snapshot-fetch-exceeds-the-prefetch-deadline.md).
 
 The N-sweep that sized the spin (yields per tick vs `fetch_ms`, 4-layer slice,
 `.st` 9.8 MB):

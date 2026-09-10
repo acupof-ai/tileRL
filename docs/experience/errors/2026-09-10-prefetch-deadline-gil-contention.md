@@ -104,9 +104,11 @@ Status: fixed 2026-09-10 by the spin-until-ready loop (72d83303,
 the e2e flake went 3/16 → 0/20. The fix spins `sleep(0)` while a fetch is in
 flight instead of yielding a fixed N times per tick — the sweep below shows N
 is a distribution tail, and the spin is N=∞ with an early exit plus a 50 ms
-wall-clock bound as a safety valve. Open remainder (carried in OPEN.md): the
-spin's cost on 27B is unmeasured (the 155.2 MiB snapshot needs many windows, so
-the spin actually runs there), and `any_fetching()` is global, not per-request.
+wall-clock bound as a safety valve. The 27B remainder is now measured
+([errors/2026-09-10-the-27b-snapshot-fetch-exceeds-the-prefetch-deadline](2026-09-10-the-27b-snapshot-fetch-exceeds-the-prefetch-deadline.md)):
+the spin hits the 50 ms bound on 3/3 spin ticks, and the 157.6 MiB fetch
+(117 ms) exceeds the 75 ms deadline, so it drops. `any_fetching()` is global,
+not per-request.
 
 The fix above landed the GIL yield, but on CPU the deadline was still thin:
 `tokens / seed_rate` = 2.56 s at 192 tokens, while the GIL-starved fetch took
