@@ -44,17 +44,19 @@ that lays the memory out before anything is allocated:
 ```
 Row(tier, owner, fmt, shape, count)      # bytes = count * nbytes(fmt, shape)
 tier  in {device, host, ssd}
-owner in {weights, kv_pool, kv_scale, draft_pool, state_slots, prefix_entries,
-          graph_pad, tape, staging}
+owner in {weights, kv_pool, draft_pool, state_slots, prefix_entries, graph_pad, staging}
 ```
 
 The budget rules that exist today (`free * 2/3` for the pool, `free / 4` for
 `state_bytes`, `dram_bytes`, `BLOCK_TOKENS`) live in `plan`, each as the row it
 produces, so no constant is unnamed. `build_engine` allocates from the plan's
 rows: `num_blocks` is `plan`'s answer, not a second computation of it. Paged
-attention is therefore explicit: the pool is `num_blocks x per_block`, a
-request's occupancy is `blocks_used x per_block`, and a prefix entry is its
-block list plus one `state_slots` row at the tier it currently lives in.
+attention is therefore explicit: the pool is `num_blocks x per_block` with the
+fp8 scale plane inside `per_block` (no separate scale row), and a request's
+occupancy is `blocks_used x per_block`. A prefix entry on the device is pool
+blocks and a state slot already counted; it becomes a row only when demoted to
+`host` or `ssd`, where the copy is new bytes. The trainer's tape is outside
+`plan` until training shares it.
 
 `stats()["memory"]` returns the same rows with a measured column: on cuda the
 `memory_allocated` difference around each owner's allocation, on cpu the storage
