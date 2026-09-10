@@ -399,6 +399,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--specialists',
     }),
     'ledger': frozenset({
+        '--devices',
         '--help',
         '--json',
         '--lineage',

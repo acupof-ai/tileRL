@@ -208,3 +208,69 @@ def test_kernels_table_pending_when_no_calibration(tmp_path, monkeypatch, capsys
     out = capsys.readouterr().out
     assert "pending-remote" in out
     assert "TICK TOTAL" in out
+
+
+def _cal_row(rid, metric, value, name, card, date, supersedes=None):
+    r = {"metric": metric, "value": value, "unit": "GB/s" if "gbs" in metric else "TFLOP/s",
+         "id": rid, "commit": _HEAD_SHA, "date": date,
+         "device": {"name": name, "card": card}}
+    if supersedes:
+        r["supersedes"] = supersedes
+    return r
+
+
+def _resident_row(rid, name, card, peak, static, transient, date, supersedes=None):
+    r = {"metric": cal.RESIDENT_METRIC, "value": peak, "unit": "bytes", "id": rid,
+         "commit": _HEAD_SHA, "date": date, "device": {"name": name, "card": card},
+         "shape": {"card": card, "static": static, "transient": transient}}
+    if supersedes:
+        r["supersedes"] = supersedes
+    return r
+
+
+def test_device_section_picks_newest_pair_and_residency_per_device(tmp_path):
+    """Two devices, a superseded calibration row and a superseded residency row: each
+    section reports the newest non-superseded pair keyed on the exact device name, and a
+    device with no residency renders that sub-field None (pending, never a zero)."""
+    rows = [
+        # H20: old bw superseded by a newer row; peak present.
+        _cal_row("h20-bw-old", cal.BW_METRIC, 3900.0, H20, 6, "2026-09-01T00:00Z"),
+        _cal_row("h20-bw-new", cal.BW_METRIC, 4000.0, H20, 6, "2026-09-10T00:00Z",
+                 supersedes="h20-bw-old"),
+        _cal_row("h20-peak", cal.PEAK_METRIC, 148.0, H20, 6, "2026-09-10T00:00Z"),
+        # H20 residency: old superseded.
+        _resident_row("h20-res-old", H20, 6, 30_000, 29_000, 1_000, "2026-09-02T00:00Z"),
+        _resident_row("h20-res-new", H20, 6, 32_000, 30_500, 1_500, "2026-09-11T00:00Z",
+                      supersedes="h20-res-old"),
+        # V100: calibrated but residency never recorded.
+        _cal_row("v100-bw", cal.BW_METRIC, 900.0, V100, 1, "2026-09-03T00:00Z"),
+        _cal_row("v100-peak", cal.PEAK_METRIC, 125.0, V100, 1, "2026-09-03T00:00Z"),
+        # A device that appears ONLY in an unrelated bench metric: it must not create an
+        # all-pending section (the old enumerate-every-name code rendered one).
+        _cal_row("cpu-decode", "decode_tok_s", 94.0, "tiny-cpu", 0,
+                 "2026-09-04T00:00Z"),
+    ]
+    p = _store(tmp_path, rows)
+    loaded = cal.load_rows(p)
+    sections = cal.device_sections(loaded)
+    assert [s["device"] for s in sections] == [H20, V100]
+    by = {s["device"]: s for s in sections}
+    h20 = by[H20]
+    assert h20["hbm_bw_gbs"]["value"] == 4000.0  # superseded 3900 skipped
+    assert h20["hbm_bw_gbs"]["date"] == "2026-09-10T00:00Z"
+    assert h20["bf16_peak_tflops"]["value"] == 148.0
+    assert h20["residency"]["peak"] == 32_000   # superseded residency skipped
+    assert h20["residency"]["static"] + h20["residency"]["transient"] == 32_000
+    # the V100 has floors but no residency -> pending None, shape stays complete.
+    v100 = by[V100]
+    assert v100["hbm_bw_gbs"]["value"] == 900.0
+    assert v100["residency"] is None
+    # JSON shape the CLI pins.
+    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "residency"}
+    assert set(h20["hbm_bw_gbs"]) == {"value", "commit", "date"}
+    assert set(h20["residency"]) == {"peak", "static", "transient", "commit", "date"}
+
+
+def test_device_sections_empty_store_is_all_pending(tmp_path):
+    p = _store(tmp_path, [])
+    assert cal.device_sections(cal.load_rows(p)) == []
