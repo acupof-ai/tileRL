@@ -24,11 +24,11 @@ import tempfile
 import time
 
 import numpy as np
+from tilerl_kernels.backend import get_backend
 
 from tilerl.config import qwen38_27b
 from tilerl.engine import BLOCK_TOKENS, SamplingParams, build_engine
 from tilerl.model import load_hf
-from tilerl_kernels.backend import get_backend
 
 CKPT = os.environ.get("TILERL_27B_CKPT", "/work/Qwen3.8-27B-NVFP4")
 SPIN_BOUND_MS = 50.0
