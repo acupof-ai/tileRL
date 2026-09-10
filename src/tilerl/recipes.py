@@ -66,7 +66,7 @@ RECIPES: dict[str, dict] = {
         eval_mmlu=1000, eval_n=500, eval_max_new_tokens=2048,
         status="pending-remote: roadmap P1"),
     # docs/roadmap.md P3, the SFT half: full-parameter ISO vs Adafactor.
-    "sft-iso-27b": dict(model="qwen38-27b", optim="iso", steps=100,
+    "sft-iso-27b": dict(model="qwen38-27b", optim="iso", steps=100, save_model=True,
                         status="pending-remote: roadmap P3"),
 }
 

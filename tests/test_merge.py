@@ -192,16 +192,20 @@ def test_merge_checkpoints_streams_shards_and_records(tmp_path, monkeypatch):
 
 
 def _sft_run(model_dir_arg: str, seed: int):
-    """One full-SFT tiny run via the CLI; returns (run_id, saved-model dir).
+    """One full-SFT tiny run via the CLI with --save-model; returns (run_id, model dir).
 
     The saved model is the producer artifact a merge specialist links back through.
+    The run is selected by its seed, not directory order: two runs coexist and APFS
+    readdir order made an unfiltered scan return seed=0 twice (an id_a==id_b failure
+    that CI's runner order hid).
     """
     import json as _json
 
     from tilerl import cli
     from tilerl.ledger import runs_root
 
-    argv = ["train", "--model", "tiny", "--steps", "1", "--seed", str(seed)]
+    argv = ["train", "--model", "tiny", "--steps", "1", "--seed", str(seed),
+            "--save-model"]
     if model_dir_arg == "json":
         argv.append("--json")
     import contextlib
@@ -210,9 +214,9 @@ def _sft_run(model_dir_arg: str, seed: int):
         cli.cmd_train(cli._build_parser().parse_args(argv))
     for d in Path(runs_root()).iterdir():
         m = _json.loads((d / "manifest.json").read_text())
-        if m.get("artifacts", {}).get("out"):
+        if m.get("artifacts", {}).get("out") and m["inputs"].get("seed") == seed:
             return m["id"], m["artifacts"]["out"]
-    raise AssertionError("SFT run wrote no artifacts.out")
+    raise AssertionError(f"seed={seed} SFT run wrote no artifacts.out")
 
 
 def test_merge_lineage_idempotency_and_json(tmp_path, monkeypatch, capsys):

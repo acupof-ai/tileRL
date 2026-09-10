@@ -333,6 +333,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--recipe',
         '--reward',
         '--rl',
+        '--save-model',
         '--seed',
         '--steps',
         '--temperature',

@@ -316,15 +316,16 @@ def _train_full(args: argparse.Namespace) -> None:
         secs_per_step_median=statistics.median(secs))
     if torch.cuda.is_available():
         manifest["metrics"]["peak_gib"] = torch.cuda.max_memory_allocated() / 2**30
-    # Save the trained bf16 model: full SFT is the producer `tilerl merge` consumes as a
-    # specialist, and without an artifact its run could never be linked as a merge parent
-    # (find_run_for_artifact resolves the specialist dir back through artifacts.out). The
-    # LoRA paths record their adapter separately.
-    from .model import save_hf
+    # Save the trained bf16 model only on request: on 27B this writes ~54 GiB and does
+    # a per-tensor .cpu().contiguous() sync, and save_hf over the fused/master keys is
+    # only exercised on GPU. The merge path needs bf16 masters (merge refuses fp4), so
+    # --save-model is the producer flag for a merge specialist (set by sft-iso-27b).
+    if args.save_model:
+        from .model import save_hf
 
-    out_dir = Path(runs_root()) / manifest["id"] / "model"
-    save_hf(model, out_dir)
-    manifest["artifacts"]["out"] = str(out_dir)
+        out_dir = Path(runs_root()) / manifest["id"] / "model"
+        save_hf(model, out_dir)
+        manifest["artifacts"]["out"] = str(out_dir)
     return _finish(manifest, args.json)
 
 
@@ -1895,6 +1896,10 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_train.add_argument("--lr", type=float, default=1e-3)
     p_train.add_argument("--optim", choices=["adafactor", "iso"], default="adafactor",
                          help="full-parameter SFT optimizer; --rl/--opd train LoRA and ignore it")
+    p_train.add_argument("--save-model", action="store_true",
+                         help="full-parameter SFT only: save the trained bf16 model under the "
+                              "run dir and record it as artifacts.out, so it can be a "
+                              "`tilerl merge` specialist (merge needs bf16 masters, not fp4)")
     p_train.add_argument("--lora-rank", type=int, default=16)
     p_train.add_argument("--tp", type=int, default=1,
                          help="tensor-parallel width; dp is WORLD_SIZE//tp, cp is 1. "
