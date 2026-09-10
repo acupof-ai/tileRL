@@ -18,6 +18,8 @@ from typing import Any
 
 import torch
 
+from .precision import Format, kv_format, nbytes
+
 #: Tokens per physical KV block (paged-attention page size).
 BLOCK_TOKENS = 16
 
@@ -131,18 +133,11 @@ class PagedKvPool:
 
     @property
     def bytes_per_token(self) -> int:
-        """K+V bytes one token costs across every plane, the fp8 scale plane included.
-
-        At the 27B's 16 full-attn planes x 4 heads x 256: 64 KiB on a bf16 pool, 128 on
-        sm70's f32 one, and 32 KiB + 512 B of scale on fp8 -- 1.969x, not 2.000x, which is
-        what the per-token scale grid costs (see :func:`reference.quant_kv_fp8`).
-        """
-        per_block = (2 * self.num_layers * self.num_kv_heads * BLOCK_TOKENS * self.head_dim
-                     * self.k_pool.element_size())
-        if self.k_scale is not None:
-            per_block += (2 * self.num_layers * self.num_kv_heads * BLOCK_TOKENS
-                          * self.k_scale.element_size())
-        return per_block // BLOCK_TOKENS
+        """K+V bytes one token costs across every plane, the fp8 scale plane included."""
+        shape = (2 * self.num_layers, self.num_kv_heads, BLOCK_TOKENS, self.head_dim)
+        plain = Format(self.k_pool.dtype.itemsize * 8)
+        fmt = kv_format(self.head_dim) if self.kv_fp8 is not None else plain
+        return nbytes(fmt, shape) // BLOCK_TOKENS
 
     def alloc_block(self) -> int:
         if not self._free:

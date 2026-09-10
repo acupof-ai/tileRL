@@ -13,6 +13,53 @@ def test_policy_is_total_and_device_aware():
     assert precision.dtype("optimizer_state") == torch.float32
 
 
+def test_nbytes_derived_pool_equals_allocated_storage_bf16_and_fp8():
+    """nbytes over the whole pool shape equals every tensor torch allocated, to the byte.
+
+    Includes num_blocks (5f's kernel_cost gate prices only a gathered span, so it cannot
+    catch a wrong block factor). Measured by summing storage of k_pool/v_pool and the two
+    scale planes; bf16 (no scale) and fp8 (per-head_dim f32 scales) both checked.
+    """
+    from tilerl.kv_cache import PagedKvPool
+    from tilerl.precision import kv_format, nbytes
+
+    blocks, layers, heads, head_dim = 7, 3, 2, 16
+    for label, kw, store in (
+        ("bf16", {}, torch.bfloat16),
+        ("fp8", {"kv_fp8": torch.float8_e4m3fn}, torch.float8_e4m3fn),
+    ):
+        pool = PagedKvPool(blocks, heads, head_dim, num_layers=layers,
+                           device="cpu", **kw)
+        shape = (2 * layers, blocks, heads, 16, head_dim)
+        fmt = kv_format(head_dim) if pool.kv_fp8 is not None else precision.Format(
+            store.itemsize * 8)
+        measured = sum(t.numel() * t.element_size() for t in
+                       (pool.k_pool, pool.v_pool, pool.k_scale, pool.v_scale)
+                       if t is not None)
+        assert nbytes(fmt, shape) == measured, label
+        assert pool.bytes_per_token * 16 * blocks == measured, label
+
+
+def test_nbytes_nvfp4_matches_checkpoint_loader_packing():
+    """nvfp4 formula == the ModelOpt tensors the loader consumes.
+
+    No CPU path PRODUCES ModelOpt nvfp4 (only the external checkpoint does; the local
+    pack_fp4 makes a different e2m1/block-32 layout), so this pins the loader layout
+    (model.py weight_packed / weight_scale / weight_global_scale; _native_fp4 reshape(1),
+    renorm reduces dim=1 -> one e4m3 scale per 16 along K, one f32 per tensor).
+    """
+    from tilerl.precision import nbytes, nvfp4
+
+    n, k = 8, 64
+    packed = torch.zeros((n, k // 2), dtype=torch.uint8)            # nibbles, 2/byte
+    block_scale = torch.zeros((n, k // 16), dtype=torch.float8_e4m3fn)
+    global_scale = torch.zeros(1, dtype=torch.float32)
+    measured = sum(t.numel() * t.element_size()
+                   for t in (packed, block_scale, global_scale))
+    assert nbytes(nvfp4, (n, k)) == measured
+    assert nbytes(nvfp4, (n, k)) == 256 + 32 + 4  # nibbles + e4m3 blocks + one f32
+
+
 def test_iso_frames_follow_the_policy():
     from tilerl.iso import ISO
 

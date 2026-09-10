@@ -1591,18 +1591,12 @@ def _fit_blocks(cfg, backend, io, cap: int, draft_layers: int = 0,
     if backend.device.type != "cuda":
         return cap or 256
     planes = 2 * len(cfg.full_attn_layers)
-    elems = planes * cfg.num_kv_heads * BLOCK_TOKENS * cfg.head_dim
-    per_block = elems * torch.tensor([], dtype=kv_fp8 or io).element_size()
-    if kv_fp8 is not None:
-        # one f32 scale per (plane, block, head, TOKEN) -- 1.56% of the fp8 plane, and the
-        # only grid a single-launch fused writer can reduce (docs/design-fp8-kv.md)
-        per_block += planes * cfg.num_kv_heads * BLOCK_TOKENS * 4
-    # The draft pool is allocated at the pool's IO dtype with no scale plane (DraftHead.attach
-    # via kv_pool.dtype), so it is charged off the bf16/f32 rate even under fp8 -- scaling
-    # per_block would under-ask by ~2x on this term. Divide by the PLANE-PAIR count, not
-    # `planes`: elems already carries the K+V factor, and `planes` charged half a layer.
-    per_block += (draft_layers * elems * torch.tensor([], dtype=io).element_size()
-                  // len(cfg.full_attn_layers))
+    pair_shape = (2, cfg.num_kv_heads, BLOCK_TOKENS, cfg.head_dim)
+    io_fmt = precision.Format(io.itemsize * 8)
+    kv_fmt = precision.kv_format(cfg.head_dim) if kv_fp8 is not None else io_fmt
+    # Draft pool is plain IO dtype with no scale plane (DraftHead.attach): one K+V pair/layer.
+    per_block = (precision.nbytes(kv_fmt, (planes, cfg.num_kv_heads, BLOCK_TOKENS, cfg.head_dim))
+                 + draft_layers * precision.nbytes(io_fmt, pair_shape))
     fit = max(64, int(torch.cuda.mem_get_info()[0] * 2 / 3) // per_block)
     return min(fit, cap) if cap else fit
 
