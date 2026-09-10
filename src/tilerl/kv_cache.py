@@ -770,6 +770,10 @@ class KvTier:
         with self._lock:
             return key in self._fetching
 
+    def any_fetching(self) -> bool:
+        with self._lock:
+            return bool(self._fetching)
+
     def take(self, key: int):
         """The prefetched pair, or None. `st` may be absent on an older parked entry."""
         with self._lock:
@@ -1027,6 +1031,9 @@ class NoPrefixStore:
     def has_ssd(self) -> bool:
         return False
 
+    def any_fetching(self) -> bool:
+        return False
+
     def clear(self) -> None:
         return None
 
@@ -1088,6 +1095,9 @@ class PrefixStore:
     @property
     def has_ssd(self) -> bool:
         return self._ssd is not None
+
+    def any_fetching(self) -> bool:
+        return self._ssd is not None and self._ssd.any_fetching()
 
     def _hash_all(self, tokens: Sequence[int]) -> int:
         h = 0

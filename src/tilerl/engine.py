@@ -720,6 +720,18 @@ class Engine:
         # Outside the lock: a reader that ever takes _lock during a load would block on it.
         if self._prefix.has_ssd:
             time.sleep(0)
+            # One yield per tick leaves the reader starving on slow ticks: it misses most
+            # windows (mid-I/O when the yield fires), so a fetch takes ~14 ticks on CPU
+            # (1.5s vs 0.4ms uncontended). While a fetch is in flight, spin until it
+            # parks or the bound expires. The bound is a safety valve for a stuck reader,
+            # not a tuned parameter: 50ms is 10x the healthy case (~5ms, one switch
+            # interval) and 2/3 of the CUDA deadline (75ms). Worst-case tick inflation
+            # is 50ms (40x on a 1.25ms CUDA B=1 tick), and it fires only when the reader
+            # is stuck.
+            if self._prefix.any_fetching():
+                spin_end = time.perf_counter() + 0.050
+                while time.perf_counter() < spin_end and self._prefix.any_fetching():
+                    time.sleep(0)
         if idle:
             return
 
