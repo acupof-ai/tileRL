@@ -223,6 +223,43 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            max_batched_tokens=args.max_batched_tokens)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
+    # --dry-run: build (which materializes and fits) then print the memory ledger and stop,
+    # never bind the HTTP port. --json prints the rows for the cost-model tooling. The budget
+    # rows need device_free: the card's free on CUDA, else --device-free (bytes) is required.
+    if args.dry_run:
+        import torch as _torch
+
+        from .memory import plan
+
+        if args.device_free is not None:
+            device_free = args.device_free
+        elif backend.device.type == "cuda":
+            device_free = int(_torch.cuda.mem_get_info()[0])
+        else:
+            sys.exit("error: --dry-run budget rows need --device-free BYTES off CUDA "
+                     "(there is no card to read mem_get_info from)")
+        kv, sp = engine._kv, engine._states
+        draft_layers = (engine._draft.cfg.num_layers
+                        if getattr(engine._draft, "kv", None) is not None else 0)
+        rows = plan(cfg, model.params, device_free, num_slots=sp.num_slots,
+                    num_blocks=kv.num_blocks, state_dtype=sp.states.dtype,
+                    kv_io=kv.dtype, kv_fp8=kv.kv_fp8, draft_layers=draft_layers)
+        # Attach the measured column from the built engine so dry-run reconciles too.
+        measured = {r["owner"]: r.get("measured") for r in engine.stats()["memory"]}
+        out = [{"tier": r.tier, "owner": r.owner, "bytes": r.n, "note": r.note,
+                "measured": measured.get(r.owner),
+                "delta": (r.n - measured[r.owner]) if measured.get(r.owner) is not None else None}
+               for r in rows]
+        if args.json:
+            print(json.dumps(out, indent=1))
+        else:
+            print(f"tilerl serve --dry-run: model={cfg.name} target={backend.target} "
+                  f"device_free {device_free/1e6:.0f} MiB")
+            for r in out:
+                m = f" measured {r['measured']/1e6:.2f} delta {r['delta']}" \
+                    if r["measured"] is not None else ""
+                print(f"  {r['owner']:<24} {r['bytes']/1e6:10.2f} MiB{m} {r['note']}")
+        return
     # Print the pool: with --blocks 0 it is fitted to the card, so this is the served
     # context ceiling and the one number a 32 GB card gets wrong silently.
     from .kv_cache import BLOCK_TOKENS
@@ -1779,6 +1816,14 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
 
     p_serve = sub.add_parser("serve", help="start the OpenAI-compatible HTTP server")
     p_serve.add_argument("--model", choices=MODEL_NAMES, default="tiny")
+    p_serve.add_argument("--dry-run", action="store_true",
+                         help="build the engine, print the memory ledger (derived vs measured "
+                              "occupancy + budget rows), and exit without starting the HTTP server")
+    p_serve.add_argument("--device-free", type=int, default=None,
+                         help="free device bytes for --dry-run budget rows; required off CUDA "
+                              "(defaults to mem_get_info on CUDA)")
+    p_serve.add_argument("--json", action="store_true",
+                         help="with --dry-run, print the memory rows as JSON")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--draft", help="MTP/NextN head safetensors: speculative decode. For "

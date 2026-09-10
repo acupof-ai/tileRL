@@ -964,7 +964,59 @@ class Engine:
                 "tokens_generated": self._tokens_generated,
                 "spec_drafted": self._spec_drafted,
                 "spec_accepted": self._spec_accepted,
+                "memory": self._memory_rows(),
             }
+
+    def _memory_rows(self) -> list[dict]:
+        """Derived occupancy per owner with a measured byte column
+        (docs/design-cost-model.md). Derived is tilerl.memory.plan (cfg + flags); measured
+        is the storage sum of the tensors the owner holds. On the CPU tiny cell they are
+        equal to the byte (gated in test_memory_ledger); GPU nvfp4/fp8 and a
+        memory_allocated-delta measurement land when a card runs.
+        """
+        from .memory import plan
+
+        cfg = self._model.cfg
+        kv, sp = self._kv, self._states
+        # Only the MTP DraftHead attaches a separate PagedKvPool; DFlash2 has no .kv pool.
+        draft_pool = getattr(self._draft, "kv", None)
+        draft_layers = 0 if draft_pool is None else self._draft.cfg.num_layers
+
+        def _pool_bytes(pool) -> int:
+            # Every plane the row derives: K/V data plus both fp8 scale grids. Dropping
+            # the scales makes derived != measured on the fp8 27B path by two planes.
+            return sum(t.numel() * t.element_size() for t in
+                       (pool.k_pool, pool.v_pool, pool.k_scale, pool.v_scale)
+                       if t is not None)
+
+        # device_free drives the budget rows; the built engine reconciles allocations only,
+        # so pass 0 here (the fit happened at build). The dry-run path passes the real free.
+        derived = plan(cfg, self._model.params, 0, num_slots=sp.num_slots,
+                       num_blocks=kv.num_blocks, spec_steps=0,
+                       state_dtype=sp.states.dtype, kv_io=kv.dtype, kv_fp8=kv.kv_fp8,
+                       draft_layers=draft_layers)
+        measured = {
+            "weights": sum(t.numel() * t.element_size() for t in self._model.params.values()),
+            "kv_pool": _pool_bytes(kv),
+            "state_slots": sum(
+                t.numel() * t.element_size() for t in
+                (sp.states, sp.conv_windows, sp.step_states, sp.step_windows, sp.win_parity)
+                if t is not None),
+        }
+        if draft_pool is not None:
+            measured["draft_pool"] = _pool_bytes(draft_pool)
+        agg: dict[str, dict] = {}
+        for r in derived:
+            a = agg.setdefault(r.owner, {"tier": r.tier, "owner": r.owner, "bytes": 0,
+                                         "parts": []})
+            a["bytes"] += r.n
+            if r.note:
+                a["parts"].append(r.note)
+        return [{"tier": a["tier"], "owner": a["owner"], "bytes": a["bytes"],
+                 "parts": a["parts"], "measured": measured.get(a["owner"]),
+                 "delta": (a["bytes"] - measured[a["owner"]]) if a["owner"] in measured else None}
+                for a in agg.values()]
+
 
     # -------------------------------------------------------------- internals
 
@@ -1590,15 +1642,13 @@ def _fit_blocks(cfg, backend, io, cap: int, draft_layers: int = 0,
     """
     if backend.device.type != "cuda":
         return cap or 256
-    planes = 2 * len(cfg.full_attn_layers)
-    pair_shape = (2, cfg.num_kv_heads, BLOCK_TOKENS, cfg.head_dim)
-    io_fmt = precision.Format(io.itemsize * 8)
-    kv_fmt = precision.kv_format(cfg.head_dim) if kv_fp8 is not None else io_fmt
-    # Draft pool is plain IO dtype with no scale plane (DraftHead.attach): one K+V pair/layer.
-    per_block = (precision.nbytes(kv_fmt, (planes, cfg.num_kv_heads, BLOCK_TOKENS, cfg.head_dim))
-                 + draft_layers * precision.nbytes(io_fmt, pair_shape))
-    fit = max(64, int(torch.cuda.mem_get_info()[0] * 2 / 3) // per_block)
-    return min(fit, cap) if cap else fit
+    # The single block-size formula and the free*2/3 rule live in tilerl.memory: the fit
+    # here and the plan's kv_pool row must not each rederive per-block bytes.
+    from .memory import fit_num_blocks
+
+    return fit_num_blocks(
+        cfg, torch.cuda.mem_get_info()[0], io, kv_fp8,
+        draft_layers=draft_layers, cap=cap)
 
 
 def _weight_fingerprint(cfg, kv_fp8: torch.dtype | None = None) -> str:
