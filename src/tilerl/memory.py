@@ -266,12 +266,17 @@ def residency_row(
     peak_bytes: int,
     static_bytes: int,
     transient_bytes: int,
+    target: str,
+    model: str = "27B-nvfp4",
     build: str = "eager",
 ):
     """One ledger row recording steady-state device residency and its static/transient
     split, so occupancy lives in the same measurements.jsonl as the kernel roofline.
-    The shape carries both halves of ``peak = static + transient``. Appended through
-    scripts/benchrec (the one schema writer), never written directly here."""
+    The shape carries both halves of ``peak = static + transient``. ``target`` is the
+    benchrec target (sm90/sm70/cpu/metal = backend.arch) and ``card`` the physical GPU;
+    a card-less sm* row is benchrec-rejected, so the CLI refuses --record-residency
+    off cuda rather than fabricating one. Appended through scripts/benchrec (the one
+    schema writer), never written directly here."""
 
     def _git(args):
         try:
@@ -287,9 +292,9 @@ def residency_row(
         "metric": "device_resident_bytes",
         "value": int(peak_bytes),
         "unit": "bytes",
-        "target": "sm90",
+        "target": target,
         "build": build,
-        "model": "27B-nvfp4",
+        "model": model,
         "shape": {
             "card": card if card is not None else 0,
             "static": int(static_bytes),
@@ -298,7 +303,7 @@ def residency_row(
         "warm": {"state": "warm", "compiles": None},
         "n": 1,
         "spread": 0,
-        "device": {"name": device_name, "card": card if card is not None else 0},
+        "device": {"name": device_name, "card": card},
         "commit": commit,
         "dirty": dirty,
         "cmd": "tilerl serve --dry-run --record-residency",

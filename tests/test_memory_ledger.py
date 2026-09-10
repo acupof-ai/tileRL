@@ -217,9 +217,12 @@ def test_serve_dry_run_checkpoint_is_header_only_and_needs_dry_run(tmp_path, cap
     by = {r["owner"]: r for r in rows}
     cfg, _, _ = _engine()
     faces = checkpoint_weight_faces(cfg, tmp_path)
-    assert by["weights"]["bytes"] == weight_row_faces(faces).n
-    # Header-only: nothing was built, so there is no measured column or delta.
+    # One presentation contract with the built --dry-run: kind/derived, not a second
+    # {bytes,...} schema; transient is suppressed (no peak measured header-only).
+    assert by["weights"]["kind"] == "allocation"
+    assert by["weights"]["derived"] == weight_row_faces(faces).n
     assert by["weights"]["measured"] is None and by["weights"]["delta"] is None
+    assert "transient" not in by
     # build_engine fits AFTER weights and the state pool (slots+CUDA graph pad; 0 on cpu)
     # are resident; the header-only fit subtracts the same before fitting.
     free_after_fixed = 1000000 - weight_row_faces(faces).n - _state_bytes(cfg, 4, f32)
@@ -346,13 +349,21 @@ def test_residency_row_roundtrips_through_benchrec(tmp_path):
     from tilerl.memory import append_residency, residency_row
 
     p = tmp_path / "measurements.jsonl"
-    row = residency_row("tiny-cpu", None, 500, static_bytes=450, transient_bytes=50)
+    row = residency_row("tiny-cpu", None, 500, static_bytes=450,
+                        transient_bytes=50, target="cpu", model="tiny")
     rid = append_residency(row, p)
     got = json.loads(p.read_text())
     assert rid and got["metric"] == "device_resident_bytes"
+    assert got["target"] == "cpu" and got["device"]["card"] is None
     assert got["shape"]["static"] + got["shape"]["transient"] == got["value"] == 500
     # the ledger is the same one the kernel roofline reads
     assert "measurements.jsonl" in str(p).split("/")[-1] or p.name == "measurements.jsonl"
+    # A card-less sm90 row is refused at append: residency must not fabricate target/card.
+    import pytest
+
+    fake = residency_row("H20", None, 500, 450, 50, target="sm90")
+    with pytest.raises(Exception):
+        append_residency(fake, tmp_path / "sm.jsonl")
 
 
 if __name__ == "__main__":
