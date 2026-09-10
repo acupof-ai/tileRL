@@ -17,6 +17,7 @@ comment density rather than a style rulebook.
 | Kernel file layout, registry rules, SOTA iteration loop | [`docs/design-kernels.md`](docs/design-kernels.md) |
 | Engine layering and seams (frontend/schedule/storage) | [`docs/design-engine.md`](docs/design-engine.md) |
 | Byte accounting and kernel cost (Format, plan, roofline) | [`docs/design-cost-model.md`](docs/design-cost-model.md) |
+| Sparse KV selection: index keys, hot/cold pages, indexer training | [`docs/design-sparse-kv.md`](docs/design-sparse-kv.md) |
 
 `AGENTS.md` is canonical; `CLAUDE.md` is a symlink to it.
 
