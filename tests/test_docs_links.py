@@ -299,6 +299,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--model',
         '--no-warmup',
         '--port',
+        '--record-residency',
         '--slots',
         '--ssd-min-tokens',
         '--ssd-path',

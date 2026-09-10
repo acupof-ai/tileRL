@@ -298,21 +298,38 @@ def cmd_serve(args: argparse.Namespace) -> None:
         rows = plan(cfg, model.params, device_free, num_slots=sp.num_slots,
                     num_blocks=kv.num_blocks, state_dtype=sp.states.dtype,
                     kv_io=kv.dtype, kv_fp8=kv.kv_fp8, draft_layers=draft_layers)
-        # Attach the measured column from the built engine so dry-run reconciles too.
-        measured = {r["owner"]: r.get("measured") for r in engine.stats()["memory"]}
-        out = [{"tier": r.tier, "owner": r.owner, "bytes": r.n, "note": r.note,
-                "measured": measured.get(r.owner),
-                "delta": (r.n - measured[r.owner]) if measured.get(r.owner) is not None else None}
-               for r in rows]
+        # One presentation surface: the same table (incl. transient + totals) the running
+        # server's /health serves from engine.stats()["memory"]. Reuse the engine's measured
+        # owner map and its measured peak rather than recomputing either.
+        from .memory import format_memory_table, memory_table
+
+        stats_rows = engine.stats()["memory"]
+        measured = {r["owner"]: r.get("measured") for r in stats_rows
+                    if r.get("measured") is not None and r["kind"] == "allocation"}
+        peak = engine._measured_peak_bytes()
+        table, _totals = memory_table(rows, measured, peak)
         if args.json:
-            print(json.dumps(out, indent=1))
+            print(json.dumps(table, indent=1))
         else:
             print(f"tilerl serve --dry-run: model={cfg.name} target={backend.target} "
                   f"device_free {device_free/1e6:.0f} MiB")
-            for r in out:
-                m = f" measured {r['measured']/1e6:.2f} delta {r['delta']}" \
-                    if r["measured"] is not None else ""
-                print(f"  {r['owner']:<24} {r['bytes']/1e6:10.2f} MiB{m} {r['note']}")
+            print(format_memory_table(table))
+        if getattr(args, "record_residency", False):
+            # Append peak + its static/transient split to the same ledger the kernel
+            # roofline (%bound) lives in, through benchrec's single schema writer.
+            from .memory import append_residency, residency_row
+
+            by = {r["owner"]: r["derived"] for r in table if r["kind"] == "allocation"}
+            static = sum(v for k, v in by.items() if k != "transient")
+            transient = by["transient"]
+            import torch as _torch2
+
+            name = (_torch2.cuda.get_device_name(0) if _torch2.cuda.is_available()
+                    else f"{cfg.name}-cpu")
+            card = getattr(args, "card", None)
+            rid = append_residency(residency_row(name, card, peak, static, transient))
+            print(f"appended device_resident_bytes peak {peak:,} = static {static:,} + "
+                  f"transient {transient:,} ({name}) -> {rid}")
         return
     # Print the pool: with --blocks 0 it is fitted to the card, so this is the served
     # context ceiling and the one number a 32 GB card gets wrong silently.
@@ -1980,6 +1997,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "from the real nvfp4/fp8 tensor names, not config")
     p_serve.add_argument("--json", action="store_true",
                          help="with --dry-run, print the memory rows as JSON")
+    p_serve.add_argument("--record-residency", action="store_true",
+                         help="with --dry-run, append the measured resident peak and its "
+                              "static/transient split to the bench ledger (benchrec)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--draft", help="MTP/NextN head safetensors: speculative decode. For "

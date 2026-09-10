@@ -967,14 +967,37 @@ class Engine:
                 "memory": self._memory_rows(),
             }
 
+    def _measured_peak_bytes(self) -> int | None:
+        """The resident-device byte peak the table closes against. On cuda this is the
+        torch allocator's high-water mark (reset at build); off cuda there is no allocator
+        peak, so the CPU tiny cell uses the storage sum of the held tensors — which equals
+        Σ static there and keeps transient exactly zero, the gate the ledger prints."""
+        import torch
+
+        if torch.cuda.is_available():
+            return int(torch.cuda.max_memory_allocated(self.device))
+        held = sum(t.numel() * t.element_size() for t in self._model.params.values())
+        kv, sp, draft = self._kv, self._states, getattr(self._draft, "kv", None)
+        held += sum(t.numel() * t.element_size() for t in
+                    (kv.k_pool, kv.v_pool, kv.k_scale, kv.v_scale) if t is not None)
+        held += sum(t.numel() * t.element_size() for t in
+                    (sp.states, sp.conv_windows, sp.step_states, sp.step_windows,
+                     sp.win_parity) if t is not None)
+        if draft is not None:
+            held += sum(t.numel() * t.element_size() for t in
+                        (draft.k_pool, draft.v_pool, draft.k_scale, draft.v_scale)
+                        if t is not None)
+        return held
+
     def _memory_rows(self) -> list[dict]:
-        """Derived occupancy per owner with a measured byte column
-        (docs/design-cost-model.md). Derived is tilerl.memory.plan (cfg + flags); measured
-        is the storage sum of the tensors the owner holds. On the CPU tiny cell they are
-        equal to the byte (gated in test_memory_ledger); GPU nvfp4/fp8 and a
-        memory_allocated-delta measurement land when a card runs.
+        """The unified device ledger (docs/design-cost-model.md, tilerl.memory.memory_table):
+        every held allocation (static) plus the transient residual, so the invariant
+        ``measured peak = Σ static + transient`` is printed, not implied. Derived is
+        tilerl.memory.plan; measured is the storage each owner holds. On the CPU tiny cell
+        static equals measured and transient is zero; GPU nvfp4/fp8 reconciles to storage,
+        transient captures allocator scratch/peak above the named rows.
         """
-        from .memory import plan
+        from .memory import memory_table, plan
 
         cfg = self._model.cfg
         kv, sp = self._kv, self._states
@@ -1005,17 +1028,8 @@ class Engine:
         }
         if draft_pool is not None:
             measured["draft_pool"] = _pool_bytes(draft_pool)
-        agg: dict[str, dict] = {}
-        for r in derived:
-            a = agg.setdefault(r.owner, {"tier": r.tier, "owner": r.owner, "bytes": 0,
-                                         "parts": []})
-            a["bytes"] += r.n
-            if r.note:
-                a["parts"].append(r.note)
-        return [{"tier": a["tier"], "owner": a["owner"], "bytes": a["bytes"],
-                 "parts": a["parts"], "measured": measured.get(a["owner"]),
-                 "delta": (a["bytes"] - measured[a["owner"]]) if a["owner"] in measured else None}
-                for a in agg.values()]
+        rows, _totals = memory_table(derived, measured, self._measured_peak_bytes())
+        return rows
 
 
     # -------------------------------------------------------------- internals
