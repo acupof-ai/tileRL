@@ -720,17 +720,27 @@ class Engine:
         # Outside the lock: a reader that ever takes _lock during a load would block on it.
         if self._prefix.has_ssd:
             time.sleep(0)
-            # One yield per tick leaves the reader starving on slow ticks: it misses most
-            # windows (mid-I/O when the yield fires), so a fetch takes ~14 ticks on CPU
-            # (1.5s vs 0.4ms uncontended). While a fetch is in flight, spin until it
-            # parks or the bound expires. The bound is a safety valve for a stuck reader,
-            # not a tuned parameter: 50ms is 10x the healthy case (~5ms, one switch
-            # interval) and 2/3 of the CUDA deadline (75ms). Worst-case tick inflation
-            # is 50ms (40x on a 1.25ms CUDA B=1 tick), and it fires only when the reader
-            # is stuck.
-            if self._prefix.any_fetching():
-                spin_end = time.perf_counter() + 0.050
-                while time.perf_counter() < spin_end and self._prefix.any_fetching():
+            # Spin only for a row still WAITING on its OWN fetch. The old gate was the
+            # tier-global any_fetching(), so an unrelated fetch -- or one whose requester
+            # had already recomputed past its deadline -- made every tick burn the whole
+            # bound. Key sets replace fetch_in_flight()'s O(tokens) scan in this loop.
+            # Bound: the shortest remaining live deadline, capped at 50 ms -- a stuck
+            # reader's safety valve, never more than the caller still owes it.
+            now = time.perf_counter()
+            waiting = [(r, self._prefix.boundary_keys(r.tokens))
+                       for r in self._waiting if r.fetch_deadline > now]
+            if waiting:
+                spin_end = now + min(0.050, min(r.fetch_deadline - now for r, _ in waiting))
+                while True:
+                    now = time.perf_counter()
+                    if now >= spin_end:
+                        break
+                    keys = self._prefix.fetching_keys()
+                    if not any(
+                        r.fetch_deadline > now and bkeys & keys
+                        for r, bkeys in waiting
+                    ):
+                        break
                     time.sleep(0)
         if idle:
             return
@@ -796,10 +806,11 @@ class Engine:
         held: list[_Req] = []
         while self._waiting and len(self._running) < self.limits.max_batch:
             head = self._waiting[0]
-            # deadline n/R: a fetch may not cost more than the prefill it replaces
+            # Deadline expired: stop WAITING and admit with a full prefill. The fetch is
+            # not abandoned -- it keeps reading and parks, so the next same-prefix request
+            # faults it in from memory (27B: 157 MiB/117 ms per read, never discarded).
             if head.fetch_deadline and time.perf_counter() > head.fetch_deadline:
                 head.fetch_deadline = 0.0
-                self._prefix.abandon_prefetch(head.tokens)
             # Hold the row while its own prefetch reads: `lookup` declines an in-flight
             # prefix, so admitting now prefills what the fetch is already fetching. Set
             # aside rather than `break`, which would stall the rows behind it.

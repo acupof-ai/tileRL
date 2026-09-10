@@ -3482,7 +3482,9 @@ def test_a_fetch_still_in_flight_is_waited_for_not_re_read_on_the_tick(tmp_path)
     The two arms above let the prefetch finish first, so the in-flight branch never
     ran and a mutation deleting it left them green. Here the load is stalled, so
     lookup() meets a fetch that has not landed -- and must decline rather than do
-    the 1.7 s read itself under the engine lock.
+    the 1.7 s read itself under the engine lock. When the slow read lands it must
+    PARK anyway: a fetch that lost the deadline race still serves the next lookup
+    of the same prefix (the read is already paid for -- never discard it).
     """
     torch.manual_seed(0)
     toks = list(range(8 * BLOCK_TOKENS))
@@ -3524,21 +3526,28 @@ def test_a_fetch_still_in_flight_is_waited_for_not_re_read_on_the_tick(tmp_path)
         )
         assert cold.fetch_waits == 1, "the wait was not counted, so the branch did not run"
 
-        # Abandon it mid-read: the bytes must be dropped when they land, not parked.
-        cold.abandon_prefetch(toks)
+        # Let the slow read finish. No deadline mechanism touches it: it parks anyway.
         release.set()
         for _ in range(500):
             if not cold_tier.fetch_pending(key):
                 break
             time.sleep(0.01)
-    assert cold_tier.take(key) is None, (
-        "an abandoned in-flight fetch parked its buffer on arrival; every deadline drop "
-        "would then pin a host copy of the whole prefix"
+
+    assert cold_tier.stats()["ssd_fetches_ready"] >= 1, "the finished read did not park"
+    assert cold_tier.stats()["ssd_fetch_drops"] == 0, (
+        "a finished fetch was dropped: the next same-prefix request would re-read the "
+        "whole snapshot from disk"
     )
+    # The next request for the same prefix faults the parked pair IN from memory --
+    # zero tick-side disk reads -- instead of paying the fetch a second time.
+    hit = cold.lookup(toks)
+    assert hit is not None and hit.length == len(toks), "the parked fetch did not hit"
+    assert cold.ssd_hits >= 1, "the parked pair was not adopted as an ssd hit"
+    assert cold_tier.stats()["ssd_tick_loads"] == 0, "the next request re-read on the tick"
 
 
-def test_the_break_even_refuses_a_prefix_below_it_and_the_deadline_drops_a_slow_fetch(tmp_path):
-    """n* gates the probe, and a fetch that misses its deadline is discarded."""
+def test_the_break_even_refuses_a_prefix_below_it_and_a_fetch_parks(tmp_path):
+    """n* gates the probe, and a finished fetch is parked, never discarded."""
     pool = PagedKvPool(64, 2, 8, device=torch.device("cpu"), layer_map=(0,))
     tier = KvTier(str(tmp_path), "fp-be", min_tokens=BLOCK_TOKENS)
     store = PrefixStore(pool, ssd=tier)
@@ -3581,16 +3590,18 @@ def test_the_break_even_refuses_a_prefix_below_it_and_the_deadline_drops_a_slow_
         "at any length; a finite break-even here means the k/B term is missing"
     )
 
-    # The deadline: abandon it, and the bytes are dropped rather than parked.
-    store.abandon_prefetch(toks)
-    assert tier.stats()["ssd_fetch_drops"] >= 1, "abandoning counted no drop"
+    # A fetch is never discarded: once the read finishes it parks, regardless of the
+    # requester's deadline (which lives on the engine's _Req, not here). The deadline
+    # decides whether the row WAITS, not whether finished work is kept.
+    key = store._hash_all(toks)
     for _ in range(500):
-        if not tier.fetch_pending(store._hash_all(toks)):
+        if not tier.fetch_pending(key) and tier.take(key) is not None:
             break
         time.sleep(0.01)
-    assert tier.take(store._hash_all(toks)) is None, (
-        "an abandoned fetch parked its buffer anyway, so a dropped prefetch leaks it"
+    assert tier.stats()["ssd_fetch_drops"] == 0, (
+        "a finished, readable fetch was counted dropped"
     )
+    assert tier.stats()["ssd_fetches_ready"] >= 1, "the fetch never parked"
 
 
 def test_the_break_even_operands_come_from_the_pool_not_a_constant(tmp_path):
@@ -3833,6 +3844,106 @@ def test_a_prefetched_hit_reads_nothing_on_the_calling_thread(tmp_path):
     assert calls["tick"] == 0, (
         f"{calls['tick']} torch.load on the calling thread while serving a hit: the "
         f"snapshot read is back on the tick"
+    )
+
+
+def test_a_fetch_that_misses_its_deadline_parks_and_the_next_same_prefix_request_hits(tmp_path):
+    """The deadline decides whether a row WAITS, never whether finished work is discarded.
+
+    A slow fetch outlives the row's deadline: the row admits and prefills while the read
+    is still running. When the read lands it still parks, and the NEXT request with the
+    same prefix faults the parked pair in from memory -- zero tick-side disk reads.
+    Before the fix _build_plan called abandon_prefetch(), so the 157 MiB/117 ms fetch on
+    27B landed in the discard and every same-prefix request re-read from disk.
+    """
+    import threading
+
+    from tilerl import kv_cache as kvmod
+
+    cfg = tiny()
+    params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=3)
+    rng = np.random.default_rng(11)
+    conv = rng.integers(3, 320, size=256).astype(np.int64)
+    warm, other = conv[:128], rng.integers(3, 320, size=64).astype(np.int64)
+    prompt = list(warm) + list(other)
+
+    def engine_at():
+        return build_engine(
+            cfg, build_random(cfg, seed=13), get_backend(), num_blocks=64, num_slots=4,
+            max_batch=4, max_total_tokens=2048, ssd_path=str(tmp_path),
+            ssd_min_tokens=BLOCK_TOKENS,
+        )
+
+    warm_eng = engine_at()
+    warm_eng.submit(warm, params)
+    _drain_clock(warm_eng)
+    for _ in range(400):
+        if warm_eng.stats()["ssd_entries"] >= 1:
+            break
+        time.sleep(0.01)
+
+    release = threading.Event()
+    real_load = kvmod.torch.load
+    tick_loads = {"n": 0}
+
+    def stalled(*a, **k):
+        release.wait(timeout=10)
+        if threading.current_thread() is threading.main_thread():
+            tick_loads["n"] += 1
+        return real_load(*a, **k)
+
+    cold = engine_at()
+    assert cold.stats()["ssd_recovered"] >= 1, "fixture: the restart recovered no entry"
+    tier = cold._prefix._ssd
+    key = cold._prefix._hash_all(warm)
+
+    kvmod.torch.load = stalled
+    try:
+        cold.submit(prompt, params)
+        cold.step()                       # first tick: the row is held on its in-flight fetch
+        assert key in tier._fetching, "the fetch is not queued/in-flight at the hold tick"
+
+        # Deadline expires mid-read. The next tick must ADMIT, not abandon the fetch.
+        req = cold._waiting[0]
+        req.fetch_deadline = time.perf_counter()
+        cold.step()
+        assert key in tier._fetching, (
+            "the fetch was abandoned when the deadline expired: its read would land in "
+            "the discard instead of parking"
+        )
+        assert not any(r.req_id == req.req_id for r in cold._waiting), (
+            "the timed-out row is still held: expiry must admit it for a full prefill"
+        )
+
+        release.set()                     # let the slow read finish -- it must park
+        for _ in range(500):
+            if not tier.fetch_pending(key) and key in tier._fetches:
+                break
+            time.sleep(0.01)
+        assert key in tier._fetches, "the finished fetch did not park"
+        assert tier.stats()["ssd_fetch_drops"] == 0, "the finished fetch was dropped"
+
+        # Remove the HBM entry the first row's own prefill published, so the next lookup
+        # can only be served by the parked SSD pair -- not a republished HBM hit.
+        for e in list(cold._prefix._entries.get(key, ())):
+            cold._prefix._drop(e)
+        assert not cold._prefix._entries.get(key), "fixture: HBM entry did not clear"
+
+        hits_before = cold.stats()["ssd_hits"]
+        # The next request is the exact prefix the parked pair covers (the first row's
+        # matched boundary was warm, 128 tokens).
+        cold.submit(list(warm), params)
+        _drain_clock(cold)
+    finally:
+        kvmod.torch.load = real_load
+
+    st = cold.stats()
+    assert st["ssd_hits"] > hits_before, (
+        "the next same-prefix request did not fault in the parked pair"
+    )
+    assert tick_loads["n"] == 0, (
+        f"{tick_loads['n']} torch.load on the calling thread: the parked fetch was not "
+        "served from memory"
     )
 
 
