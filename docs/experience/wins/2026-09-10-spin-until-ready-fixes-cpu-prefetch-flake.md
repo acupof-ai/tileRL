@@ -21,9 +21,10 @@ wall-clock bound expires. The unconditional once-per-tick yield stays (it feeds
 the writer thread). The spin is strictly additive on the fetch path.
 
 The bound is a safety valve for a stuck reader, not a tuned parameter: 50 ms is
-10x the healthy case (~5 ms, one switch interval) and 2/3 of the CUDA deadline
-(75 ms). Worst-case tick inflation is 50 ms (40x on a 1.25 ms CUDA B=1 tick),
-and it fires only when the reader is stuck.
+10x the healthy case for a small fetch (~5 ms, one switch interval) and 2/3 of
+the CUDA deadline (75 ms). Worst-case tick inflation is 50 ms (40x on a 1.25 ms
+CUDA B=1 tick). On the slice the bound never fires (fetch completes in one
+window); on 27B it will fire regularly — see Behavioral changes.
 
 ## Measurements
 
@@ -34,20 +35,51 @@ Flake rate, 192 tokens, the two prefetch e2e tests, 20 runs each:
 | Before spin (clean main) | 3/16 |
 | After spin | **0/20** |
 
-Decode throughput (slice 4 layers, fused+graph, SSD on — the spin executes only
-while a fetch is in flight, which is no ticks in this bench; the numbers confirm
-the spin exits immediately and costs nothing on CUDA):
+Decode throughput (slice 4 layers, fused+graph, SSD on, H20 card 3):
 
 | B | Before spin (tok/s) | After spin (tok/s) | Delta |
 |---|---|---|---|
 | 1 | 799.9 | 799.1 | −0.1% (noise) |
 | 8 | 3082.4 | 3076.8 | −0.2% (noise) |
 
-The spin's cost is zero on CUDA by construction: the fetch completes in one GIL
-window (~1 ms), the loop sees `any_fetching()` go false, and exits. The N-sweep
-that sized this (yields per tick vs `fetch_ms`): N=1 → 1.5–1.7 s, N=10 → 2–96 ms,
-N=20 → 2–189 ms, N=50 → 2 ms. The spin is N=∞ with an early exit, so it takes
-the fast path of the N≥10 cells without the per-tick cost of a fixed N.
+**These numbers hold only for fetches that complete in one GIL window.** The
+slice's spill files are 18 KB, so `torch.load` finishes in ~1 ms and the spin
+exits immediately — the mechanism does not run on this path. The "cost
+unchanged" claim is about that config, not the CUDA path in general.
+
+**On the full 27B model the spin will actually run.** The snapshot is 144 MiB
+(OPEN row 14), and a 144 MiB `torch.load` needs many GIL windows, not one.
+Each tick will spin for a meaningful fraction of the 50 ms bound instead of
+exiting immediately. The slice bench cannot price this; it needs a 27B
+measurement with SSD on.
+
+The N-sweep that sized the spin (yields per tick vs `fetch_ms`, 18 KB slice):
+N=1 → 1.5–1.7 s, N=10 → 2–96 ms, N=20 → 2–189 ms, N=50 → 2 ms. The spin is
+N=∞ with an early exit, so it takes the fast path of the N≥10 cells without
+the per-tick cost of a fixed N.
+
+## Behavioral changes (not cost)
+
+**The spin's time counts against the fetch's own deadline.** The CUDA deadline
+is 75 ms and the spin bound is 50 ms, so the first tick's spin eats 2/3 of it.
+A fetch that does not complete in the first tick's spin is abandoned at the
+second tick. This is fast-fail — the row prefills from scratch instead of
+waiting — but it changes the deadline's meaning from "time to start a fetch"
+to "time to finish one, spin included".
+
+**`any_fetching()` is global, not per-request.** It is true when ANY fetch is
+in flight, not just the one this tick's held row is waiting for. Under
+concurrency, an unrelated fetch makes every tick spin. The B=8 −0.2% above
+cannot answer this — it was measured with no fetch in flight during decode.
+
+## Known edges
+
+The spin calls `any_fetching()` once per iteration, each taking the KvTier
+`_lock` — thousands of acquisitions in a 50 ms spin. The reader's
+`_fetching.discard(key)` at fetch completion needs the same lock. The 0/20
+flake run is empirical evidence this does not deadlock or stall, but if the
+spin ever fails to exit on the real model, lock contention between the spin
+loop and the reader's completion path is the first thing to check.
 
 ## Rule
 
