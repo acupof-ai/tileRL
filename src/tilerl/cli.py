@@ -1651,13 +1651,38 @@ def cmd_generate(args: argparse.Namespace) -> None:
     print(json.dumps(stats))
 
 
+def cmd_bench_calibrate(args: argparse.Namespace) -> None:
+    """Measure one card's HBM bandwidth and bf16 peak and append BOTH rows to the bench
+    ledger. Cuda-only: off a card there is nothing to measure, and the roofline then
+    stays pending-remote (a datasheet number is refused, not substituted)."""
+    from . import calibration as cal
+
+    if args.card is None:
+        sys.exit("error: --calibrate needs --card N (the physical GPU to measure)")
+    import torch
+
+    if not torch.cuda.is_available():
+        sys.exit(
+            "error: --calibrate is cuda-only (large D2D copy + bf16 GEMM, CUDA events); "
+            "run on the card: TILERL_TARGET=cuda tilerl bench --calibrate --card N. "
+            "Off cuda the roofline prints pending-remote, never a datasheet number.")
+    rows = cal.calibrate_rows(args.card)
+    cal.append_rows(rows)
+    for r in rows:
+        print(f"appended {r['metric']:<18} {r['value']:10.2f} {r['unit']:<8} "
+              f"{r['device']['name']} card {r['device']['card']} -> {cal.store_path()}")
+
+
 def cmd_bench_kernels(args: argparse.Namespace) -> None:
     """Print the per-kernel roofline table for one decode tick, no GPU required.
 
-    Bytes/flops render from the declarations at every batch; the measured ms and
-    %bound columns read pending-remote until a card returns a calibration row,
-    because bandwidth and peak are measured, never datasheet.
+    Bytes/flops render from the declarations at every batch; when a calibration row for
+    this device is in the ledger, ``bound`` is the measured roofline lower bound
+    (max(bytes/bw, flops/peak)) and the actual registry kernel's ms fills on cuda.
+    Without a row the measured columns print pending-remote — bandwidth and peak are
+    measured, never datasheet.
     """
+    from . import calibration as cal
     from . import config as config_mod
     from . import kernel_cost
     from .model import checkpoint_weight_faces
@@ -1674,34 +1699,85 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
     def face_cell(r):
         return face_label.get(r.get("face"), "bf16")
 
-    def print_rows(rows):
+    # The device name the floors are keyed on. Cuda reads the real card; off cuda there
+    # is no measured floor (a --device-name override exists only for debugging the join).
+    device_name = args.device_name
+    on_cuda = False
+    if device_name is None:
+        import torch
+
+        on_cuda = torch.cuda.is_available()
+        device_name = torch.cuda.get_device_name(0) if on_cuda else f"{cfg.name}-cpu"
+    floors = cal.calibration(cal.load_rows(), device_name)
+    # On cuda, time the actual registry GEMM kernel per row so %bound is measured; the
+    # backend is built once. Off cuda (or for non-GEMM rows) ms/%bound stay pending.
+    # Spec dims come from the config (quant face does not change a linear's dims); the
+    # timed kernel itself is resolved per row from the row's face in time_row_ms, so a
+    # collapsed name split by face (some layers fp8, some nvfp4) times the right kernel.
+    backend = None
+    spec_by_name: dict[str, tuple] = {}
+    if on_cuda and floors is not None:
+        from tilerl_kernels.backend import get_backend
+
+        from .model import param_specs
+
+        backend = get_backend()
+        spec_by_name = {k.split(".")[-1]: tuple(v) for k, v in param_specs(cfg).items()}
+
+    def render(rows: list[dict], label: str, b: int, s: int) -> tuple[int, int]:
+        print(f"# {cfg.name} {label}, fp8 KV, {src}, floor device={device_name}")
+        if floors is None:
+            print("# (no calibration row for this device: ms/bound/%bound pending-remote)")
+        tb_sum = tf_sum = 0
         for r in rows:
-            print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face_cell(r):>7} "
-                  f"{r['bytes'] * r['count']:>12,} {r['flops'] * r['count']:>10,} "
-                  f"{'pending':>11} {'pending':>11}")
+            by = r["bytes"] * r["count"]
+            fl = r["flops"] * r["count"]
+            tb_sum += by
+            tf_sum += fl
+            face = f"{face_cell(r):>7}"
+            if floors is None:
+                print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
+                      f"{by:>12,} {fl:>10,} {'pending':>11} {'pending':>11} {'pending':>11}")
+                continue
+            bound_s = cal.bound_seconds(by, fl, floors["bw_gbs"], floors["peak_tflops"])
+            bnd_col = f"{bound_s * 1e3:9.3f}ms"
+            # The measured ms of the real registry kernel is cuda-only; off cuda (or for
+            # a non-GEMM row with no linear timing fixture) it stays pending.
+            ms = None
+            if backend is not None and r["name"] in spec_by_name:
+                ms = cal.time_row_ms(
+                    {**r, "_spec": spec_by_name[r["name"]]}, backend, b, s)
+            if ms is None:
+                print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
+                      f"{by:>12,} {fl:>10,} {'pending':>11} {bnd_col:>11} {'pending':>11}")
+            else:
+                print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
+                      f"{by:>12,} {fl:>10,} {ms:>9.3f}ms {bnd_col:>11} "
+                      f"{bound_s / (ms / 1000.0) * 100.0:>10.1f}%")
+        return tb_sum, tf_sum
 
     print(f"{'kernel':<26} {'count':>5} {'shape':>22} {'face':>7} {'bytes':>12} "
-          f"{'flops':>10} {'ms':>11} {'%bound':>11}")
+          f"{'flops':>10} {'ms':>11} {'bound':>11} {'%bound':>11}")
     if args.prefill:
         pre = kernel_cost.TickShape(b=1, s=args.prefill, kv=kv_format(cfg.head_dim),
                                     weight=nvfp4, faces=faces)
-        print(f"# {cfg.name} prefill, S={args.prefill} tokens, fp8 KV, {src}")
-        print_rows(kernel_cost.prefill_rows(cfg, pre))
-        tb, tf = kernel_cost.prefill_totals(cfg, pre)
+        tb, tf = render(kernel_cost.prefill_rows(cfg, pre),
+                        f"prefill S={args.prefill}", 1, args.prefill)
         print(f"{'PREFILL TOTAL':<26} {'':>5} {'':>22} {'':>7} {tb:>12,} {tf:>10,}")
         return
     batches = tuple(int(x) for x in args.batches.split(",")) if args.batches else (1, 8)
-    print(f"# {cfg.name} decode tick, context s={args.context} tokens, fp8 KV, {src}")
     for b in batches:
         tick = kernel_cost.TickShape(b=b, s=args.context, kv=kv_format(cfg.head_dim),
                                      weight=nvfp4, faces=faces)
-        print(f"-- batch B={b} --")
-        print_rows(kernel_cost.tick_rows(cfg, tick))
-        tb, tf = kernel_cost.tick_totals(cfg, tick)
+        tb, tf = render(kernel_cost.tick_rows(cfg, tick),
+                        f"decode tick B={b} s={args.context}", b, args.context)
         print(f"{'TICK TOTAL':<26} {'':>5} {'':>22} {'':>7} {tb:>12,} {tf:>10,}")
 
 
 def cmd_bench(args: argparse.Namespace) -> None:
+    if getattr(args, "calibrate", False):
+        cmd_bench_calibrate(args)
+        return
     if getattr(args, "kernels", False):
         cmd_bench_kernels(args)
         return
@@ -2118,6 +2194,14 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_bench.add_argument("--checkpoint", default=None,
                          help="--kernels: price weights from this checkpoint dir's actual "
                               "nvfp4/fp8 device faces instead of the all-nvfp4 config face")
+    p_bench.add_argument("--calibrate", action="store_true",
+                         help="measure this card's HBM bandwidth + bf16 peak and append "
+                              "two rows to the bench ledger (cuda-only)")
+    p_bench.add_argument("--card", type=int, default=None,
+                         help="physical GPU card for --calibrate")
+    p_bench.add_argument("--device-name", default=None,
+                         help="device name the --kernels floor lookup keys on (default: "
+                              "the cuda card; off cuda there is no floor)")
     for v in ("table", "readme", "regress", "questions", "collectors"):
         p_bench.add_argument(f"--{v}", action="store_true",
                              help=f"bench view: {v} from the bench store, no GPU")
