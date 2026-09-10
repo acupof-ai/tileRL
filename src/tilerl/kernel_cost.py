@@ -125,6 +125,14 @@ def tick_rows(cfg, t: TickShape) -> list[dict]:
             by, fl = _gemv(spec, t)
             add(k, f"{spec[0]}x{spec[1]}", count, by, fl)
 
+    # The lm_head multiplies the full [vocab, hidden] matrix EVERY decode step
+    # (the sampled row is the embedding lookup, a separate smaller op). Untied on
+    # the 27B and nvfp4-packed; ~0.64 GB, a larger stream than the fp8 KV scale.
+    if "lm_head" in specs:
+        spec = tuple(specs["lm_head"])
+        by, fl = _gemv(spec, t)
+        add("lm_head", f"{spec[0]}x{spec[1]}", 1, by, fl)
+
     ab, af = _paged_attention_decode(cfg, t)
     add(
         "paged_attention_decode",
