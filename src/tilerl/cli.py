@@ -223,6 +223,19 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            max_batched_tokens=args.max_batched_tokens)
 
     app = create_app(engine, tokenizer, model_name=cfg.name)
+    # --dry-run: build (which materializes and fits) then print the memory ledger and stop,
+    # never bind the HTTP port. --json prints the rows for the cost-model tooling.
+    if args.dry_run:
+        if args.json:
+            print(json.dumps(engine.stats()["memory"], indent=1))
+        else:
+            tot = sum(r["bytes"] for r in engine.stats()["memory"])
+            print(f"tilerl serve --dry-run: model={cfg.name} target={backend.target} "
+                  f"derived {tot/1e6:.1f} MiB device")
+            for r in engine.stats()["memory"]:
+                m = f" measured {r['measured']/1e6:.1f} delta {r['delta']}" if r["measured"] is not None else ""
+                print(f"  {r['owner']:<13} {r['bytes']/1e6:9.1f} MiB{m} {','.join(r['parts'])}")
+        return
     # Print the pool: with --blocks 0 it is fitted to the card, so this is the served
     # context ceiling and the one number a 32 GB card gets wrong silently.
     from .kv_cache import BLOCK_TOKENS
@@ -1779,6 +1792,11 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
 
     p_serve = sub.add_parser("serve", help="start the OpenAI-compatible HTTP server")
     p_serve.add_argument("--model", choices=MODEL_NAMES, default="tiny")
+    p_serve.add_argument("--dry-run", action="store_true",
+                         help="build the engine, print the memory ledger (derived vs measured "
+                              "occupancy), and exit without starting the HTTP server")
+    p_serve.add_argument("--json", action="store_true",
+                         help="with --dry-run, print the memory rows as JSON")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--draft", help="MTP/NextN head safetensors: speculative decode. For "
