@@ -545,6 +545,8 @@ class KvTier:
         self._pending_st: dict[int, dict] = {}
         self._lock = threading.Lock()
         self._q: queue.Queue = queue.Queue()
+        # A daemon thread here is starved by Engine.step()'s GIL hold unless step()
+        # yields; see errors/2026-09-10-prefetch-deadline-gil-contention.md
         self._writer = threading.Thread(target=self._flush_loop, daemon=True)
         # read side: the torch.load runs off-tick, not inside step() under the lock
         self._fetches: dict[int, dict] = {}   # key -> {"blob", "st", "tokens"}, collected by take()
@@ -558,6 +560,8 @@ class KvTier:
         self.snapshot_bytes = 0
         self.tick_loads = 0
         self._rq: queue.Queue = queue.Queue()
+        # Same starvation as _writer above; the GIL yield in step() is what lets
+        # torch.load finish inside the prefetch deadline
         self._reader = threading.Thread(target=self._fetch_loop, daemon=True)
         self._reader.start()
         self._writer.start()

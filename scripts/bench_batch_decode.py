@@ -43,6 +43,7 @@ def main() -> None:
     p.add_argument("--slots", type=int, help="state slots / max_batch (default: max batch swept)")
     p.add_argument("--draft", help="draft head safetensors: speculative decode")
     p.add_argument("--depth", type=int, default=4, help="drafts per row per tick")
+    p.add_argument("--ssd-path", default="", help="SSD prefix tier directory; enables the GIL yield per tick")
     benchrec.add_record_args(p, default_device=None)
     args = p.parse_args()
     args.model_name = f"27B-nvfp4-slice{args.layers}"
@@ -62,6 +63,7 @@ def main() -> None:
         cfg, model, backend, num_blocks=16 * bmax, num_slots=bmax, max_batch=bmax,
         max_total_tokens=256 * bmax, decode_graph=args.decode_graph,
         draft=load_draft(model, args.draft) if args.draft else None, spec_depth=args.depth,
+        ssd_path=args.ssd_path,
     )
 
     gen = torch.Generator().manual_seed(7)

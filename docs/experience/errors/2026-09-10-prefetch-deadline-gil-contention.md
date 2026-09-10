@@ -8,6 +8,14 @@ was loaded from disk at startup but no request used it. CPU passed.
 
 First observed ≤ 2026-09-10.
 
+**Scope caveat**: the SSD tier is off by default (`--ssd-path` empty) and has
+a recorded REJECT on the serve path (1.65x worse per turn at 12 sessions,
+0 hits, [errors/2026-09-06](2026-09-06-the-ssd-tier-is-165x-worse-at-12-sessions.md)).
+This fix repairs a feature that is disabled by default and was judged worse
+in its only measured serving configuration. The defect is real — the prefetch
+mechanism never worked on fast cards — but the fix does not make serving
+faster in any default configuration.
+
 ## Root Cause
 
 The prefetch was triggered (`ssd_prefetches=1`) but never completed
@@ -51,6 +59,16 @@ An alternative safety net (not the root fix): do not abandon an in-flight
 fetch when the deadline expires — the 70 ms is already paid, and the result
 is useful for the next request with the same prefix. The deadline should
 govern whether to *start* a fetch, not whether to *discard finished work*.
+
+## General finding
+
+Any Python background thread in this engine is silently starved by the
+`step()` loop's GIL hold. The SSD tier's `_writer` (flush) and `_reader`
+(prefetch) both suffer; the `_reader` was visible because its deadline
+fires. The `_writer` has no deadline, so its starvation was invisible.
+The GIL yield in `step()` covers both, and comments at both `Thread(...)`
+creation points in `kv_cache.py` point here. The next background thread
+added to the engine needs the same yield.
 
 ## Rule
 
