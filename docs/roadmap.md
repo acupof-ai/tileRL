@@ -336,6 +336,12 @@ TP-8 hides it — today's 1.8k tok/s at 8K says nothing about 256K; CP-8 +
 activation checkpointing is the only way a 256K sample trains (without
 recompute the activations are ~1.6 TB).
 
+**Derived status (2026-09-11, header-only ledger; measured pending the cards):**
+256K single card fits in bf16 at B=1 (16.0 GiB KV vs the 47.9 GiB fitted pool);
+128K prefix cache fits trivially single-stream, and 8×128K fits only with fp8
+KV (65,536 ≤ 95,160 blocks). 8×256K misses on one card under either dtype.
+See [P6 long-context budget on one H20](experience/wins/2026-09-11-p6-long-context-budget-on-one-h20.md).
+
 ## Dependencies
 
 ```
