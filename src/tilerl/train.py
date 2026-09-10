@@ -131,6 +131,7 @@ def _step(
     grad_fn: Any,
     micro: int = 0,
     timings: dict[str, float] | None = None,
+    post_step: Any = None,
 ) -> float:
     """Forward under a tape, ``grad_fn(logits, rows, offset)`` for the logit
     gradient, backward, clip, update. ``micro`` > 0 runs that many rows at a time
@@ -227,6 +228,8 @@ def _step(
 
         loss, _ = run(0, _apply)
         assert seen or not math.isfinite(loss), _NO_GRAD
+        if seen and post_step is not None:
+            post_step()  # optimizer.step_one copied in place; refresh served weight faces
         if dp_reduce is not None and _CHECK_DP_ORDER:
             _order_agrees(order, backend)
         return loss
@@ -261,6 +264,8 @@ def _step(
     norm = clip_grad_norm(acc, 1.0, sharded_ids, backend)
     if math.isfinite(norm):
         optimizer.step(params.values(), acc)
+        if post_step is not None:
+            post_step()  # refresh served weight faces after the in-place copies
     if timings is not None:
         timings["optimizer_secs"] += time.perf_counter() - t_update
     return total
@@ -273,8 +278,12 @@ def train_step(
     optimizer: AdamW,
     trainable: dict[str, Any] | None = None,
     micro: int = 0,
+    post_step: Any = None,
 ) -> float:
-    """One SFT step: causal cross-entropy on ``input_ids``. Returns the loss."""
+    """One SFT step: causal cross-entropy on ``input_ids``. Returns the loss.
+
+    ``post_step`` runs once after a finite optimizer update (e.g. re-packing
+    served fp4 faces from the trained bf16 masters)."""
     b = np.asarray(input_ids).shape[0]
 
     def grad_fn(logits, chunk, lo):
@@ -282,7 +291,8 @@ def train_step(
         # CE averages over this chunk's rows; rescale to the batch's.
         return loss, grad.mul_(len(chunk) / b)
 
-    return _step(model, input_ids, backend, optimizer, trainable, grad_fn, micro)
+    return _step(model, input_ids, backend, optimizer, trainable, grad_fn, micro,
+                 post_step=post_step)
 
 
 def group_advantages(rewards: Any, group: int, live: Any = None,

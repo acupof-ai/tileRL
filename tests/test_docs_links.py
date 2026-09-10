@@ -342,6 +342,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--rl',
         '--save-model',
         '--seed',
+        '--served-fp4',
         '--steps',
         '--temperature',
         '--tp',

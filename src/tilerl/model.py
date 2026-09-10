@@ -1095,6 +1095,35 @@ def drop_quantized(model: Model) -> Model:
     return model
 
 
+def requantize_fp4(model: Model) -> int:
+    """Re-pack every trained bf16 fp4 master into its EXISTING served slots
+    (``.wq/.scale/.oscale``), in place, after an optimizer step. ``copy_`` keeps
+    each tensor's address, so a captured decode graph keeps serving the step's
+    weights without a recapture. Caller keeps the served slots (no
+    drop_quantized) and the masters. Returns the number of re-packed linears.
+    # ponytail: full SFT repacks all fp4 keys each step; a touched-key set when
+    # that cost shows up.
+    """
+    n = 0
+    with torch.no_grad():
+        for key in fp4_param_keys(model.cfg):
+            master = model.params.get(key)
+            wq0 = model.params.get(key + ".wq")
+            if master is None or wq0 is None:
+                continue
+            # The slot's block size is fixed at load: 32 for a bf16 linear
+            # repacked by pack_fp4, 16 for on-disk NVFP4. Re-pack at that same
+            # block or the scale shape copy_ below cannot fit.
+            block = master.shape[1] // model.params[key + ".scale"].shape[1]
+            wq, scale = pack_fp4(master, block=block)
+            scale, oscale = renorm_fp4_scale(scale)
+            wq0.copy_(wq)
+            model.params[key + ".scale"].copy_(scale)
+            model.params[key + ".oscale"].copy_(oscale)
+            n += 1
+    return n
+
+
 def save_hf(model: Model, path: str | Path) -> None:
     """HF safetensors + config.json: a bf16 master is saved as the weight, else
     the served fp4 bytes verbatim, so ``load_hf(save_hf(m))`` is bit-identical.
