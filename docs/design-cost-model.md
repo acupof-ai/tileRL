@@ -45,8 +45,8 @@ depends on its tensor names; `precision.checkpoint_weight_specs(dir)` classifies
 the safetensors headers (shapes only, no weight bytes). The SERVED map is
 `model.checkpoint_weight_faces(cfg, dir)`: it maps names through load_hf's key
 rules (dropping vision/MTP tensors the engine never loads) and reports a bf16
-linear in `fp4_param_keys` as `nvfp4_dev` under cfg.fp4, because load_hf packs
-those at load time.
+linear in `fp4_param_keys` as `nvfp4_dev_b32` under cfg.fp4 — load_hf repacks it
+with pack_fp4's block 32, not the on-disk block-16 `nvfp4_dev`.
 
 Checks: on the tiny model the derived pool bytes equal the storage bytes of
 `k_pool/v_pool/k_scale/v_scale` to the byte, under bf16 and under fp8; the
@@ -82,7 +82,10 @@ blocks and a state slot already counted; it becomes a row only when demoted to
 `stats()["memory"]` returns the same rows with a measured column: on cuda the
 `memory_allocated` difference around each owner's allocation, on cpu the storage
 sum, and `transient = max_memory_allocated - sum(static rows)`. A dry-run mode of
-`tilerl serve` prints the plan as JSON without a card. The gate is
+`tilerl serve` prints the plan as JSON without a card; `--dry-run --checkpoint DIR`
+builds nothing and prices the weights row from `model.checkpoint_weight_faces(cfg, DIR)`
+(the served faces, headers only — non-serving tensors dropped and bf16 fp4 keys repacked
+block 32), fitting blocks arithmetically, so the 27B ledger runs on a GPU-less machine. The gate is
 `derived == measured` for `weights` and `kv_pool` on the tiny model; a nonzero
 delta on a static row on the 27B is an error entry, not a tolerance. Nothing here
 runs in the tick: `plan` is arithmetic at build time, `stats` reads counters.

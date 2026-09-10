@@ -283,6 +283,7 @@ def _cli_flags() -> dict[str, set[str]]:
 _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
     'serve': frozenset({
         '--blocks',
+        '--checkpoint',
         '--depth',
         '--device-free',
         '--draft',

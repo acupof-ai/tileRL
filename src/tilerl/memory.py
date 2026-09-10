@@ -98,16 +98,27 @@ def weight_row(params: dict) -> Row:
     return Row("device", "weights", sum(t.numel() * t.element_size() for t in params.values()))
 
 
+def weight_row_faces(faces: dict) -> Row:
+    """The weights row from :func:`model.checkpoint_weight_faces` — every served key's
+    (shape, device face), names mapped and bf16 fp4-keys repacked exactly as load_hf.
+    This equals load_hf's resident bytes to the integer (27B gate), which the raw
+    headers cannot: they include non-served tensors and price the repacked keys on disk."""
+    return Row("device", "weights", sum(nbytes(fmt, shape) for shape, fmt in faces.values()))
+
+
 def plan(cfg, params: dict | None, device_free: int, *, num_slots: int, num_blocks: int,
          spec_steps: int = 0, state_dtype=f32, kv_io=bf16, kv_fp8=None,
          explicit_state_budget: int = 0, dram_budget: int = 0,
-         draft_layers: int = 0) -> list[Row]:
+         draft_layers: int = 0, ckpt_faces=None) -> list[Row]:
     """The device rows the engine holds plus the budget rules. ``num_blocks`` is what
-    build_engine built (fitted via fit_num_blocks or explicit). Weights need the
-    materialized params; None leaves them pending. ``draft_layers>0`` adds the draft pool
-    row (its share of every KV block, priced in the block formula)."""
+    build_engine built (fitted via fit_num_blocks or explicit). Weights come from the
+    materialized ``params`` or, for a header-only ``--dry-run --checkpoint`` query, from
+    ``ckpt_faces`` (model.checkpoint_weight_faces); both None leaves them pending.
+    ``draft_layers>0`` adds the draft pool row (its share of every KV block)."""
     rows: list[Row] = []
-    if params is not None:
+    if ckpt_faces is not None:
+        rows.append(weight_row_faces(ckpt_faces))
+    elif params is not None:
         rows.append(weight_row(params))
     rows.append(Row("device", "state_slots",
                     _state_bytes(cfg, num_slots, _dtype_fmt(state_dtype), spec_steps)))
