@@ -34,7 +34,11 @@ REGISTRY = _ROOT / "docs/bench-metrics.json"
 
 TARGETS = ("cpu", "metal", "sm90", "sm70")
 BUILDS = ("eager", "fused", "fused+graph", "fused+graph+draft")
-FLOOR_KINDS = ("bandwidth", "compute", "roofline", "measured-best", "baseline")
+#: reference: the floor equals the measurement itself, for metrics with no
+#: monotonic direction (rollout_tokens — meaningful only alongside gsm8k_pct).
+#: It is documentation, never a comparator: no gap, no regression judgment.
+FLOOR_KINDS = ("bandwidth", "compute", "roofline", "measured-best", "baseline",
+               "reference")
 #: Floor kinds that state a physical limit. --questions ranks headroom against
 #: these; measured-best is a regression quantity (vs our own best) and lives in
 #: --regress. The two must not share a sorted column: 4.99x of headroom and a
@@ -54,7 +58,14 @@ REQUIRED = ("metric", "value", "unit", "target", "build", "model", "shape",
 
 
 def load_registry() -> dict:
-    return json.loads(REGISTRY.read_text())
+    reg = json.loads(REGISTRY.read_text())
+    # "none" is an explicit declaration (no monotonic direction), distinct from
+    # a missing key: every view skips directionless metrics, so a typo here would
+    # silently judge nothing for that metric.
+    for name, m in reg["metrics"].items():
+        if m["direction"] not in ("+", "-", "none"):
+            raise ValueError(f"{name}: direction must be '+', '-', or 'none'")
+    return reg
 
 
 def git_commit() -> str:

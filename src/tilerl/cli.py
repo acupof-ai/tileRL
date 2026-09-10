@@ -703,7 +703,13 @@ def _emit_eval_records(correct: int, total: int, ntok: int, token_lens: list,
         "metric": "rollout_tokens", "value": round(ntok / total, 1), "unit": "tokens",
         "spread": round(statistics.stdev(token_lens), 1) if total >= 2 else 0.0, **common,
     }
-    tok["floor"] = benchrec.measured_best_floor(tok, lower_is_better=True)
+    # rollout_tokens has no monotonic direction (a shorter rollout can be a
+    # better policy or a collapsed one): the floor is the measurement itself,
+    # judged only alongside gsm8k_pct.
+    tok["floor"] = {
+        "kind": "reference", "value": tok["value"], "unit": tok["unit"],
+        "derivation": "no monotonic direction; read alongside gsm8k_pct",
+    }
     benchrec.append(tok)
 
 

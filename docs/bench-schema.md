@@ -46,13 +46,17 @@ watching.
 | `commit` | str | full 40-hex git sha of the code under test, **self-collected** (`git rev-parse HEAD` in the tree that produced the number) — never hand-filled; validated to exist in the repo (pod: stamped from `.synced_commit`) |
 | `dirty` | bool | the tree had uncommitted changes (`git status --porcelain` non-empty); a sha cannot fully identify a dirty tree (pod: `.synced_dirty`) |
 | `cmd` | str | the exact command that produced the row |
-| `floor` | object | `value` > 0, `unit` (must equal the record's unit — a floor in other units is a forged floor), `kind` ∈ `bandwidth`/`compute`/`roofline`/`measured-best`/`baseline`, `derivation` non-empty |
+| `floor` | object | `value` > 0, `unit` (must equal the record's unit — a floor in other units is a forged floor), `kind` ∈ `bandwidth`/`compute`/`roofline`/`measured-best`/`baseline`/`reference`, `derivation` non-empty |
 
 `floor.derivation` must state the computation with numbers. A `baseline`
 floor (random-guess 25%, no-reuse 1.0x) must name the null it is measured
-against — "no known floor" is rejected. The derivation is the one field the
-machine cannot check, so review must: **every new `floor.derivation` is
-recomputed by its reviewer** — the arithmetic, not just the prose
+against — "no known floor" is rejected. A `reference` floor (value = the
+measurement itself) is for metrics with no monotonic direction: it is
+documentation, never a comparator — no gap, no regression judgment, and it
+does not raise the "no physical floor" alarm. The derivation is the one
+field the machine cannot check, so review must: **every new
+`floor.derivation` is recomputed by its reviewer** — the arithmetic, not
+just the prose
 (`wins/2026-09-09-the-first-floor-derivation-failed-its-own-check.md`).
 
 ## Collector registry
@@ -101,10 +105,14 @@ is the point of append-only.
 `id` (content hash), `date`, `direction`, `weight`, `gap`. Weights live in
 `docs/bench-metrics.json` with their derivation; **changing a weight is a
 separate commit with the derivation in its body** — it reorders
-`--questions`, which is a default flip.
+`--questions`, which is a default flip. `direction` is `+` (higher is
+better), `-` (lower is better), or `none` (no monotonic direction — an
+explicit declaration, not a missing value; every view skips directionless
+metrics rather than guess).
 
 `gap = floor/value` for higher-is-better metrics, `value/floor` for
-lower-is-better. A gap's meaning depends on its floor kind: physical floors
+lower-is-better, and no gap at all for `direction: "none"` metrics. A gap's
+meaning depends on its floor kind: physical floors
 (`bandwidth` / `compute` / `roofline` / `baseline`) make gap a **headroom**
 number (how far the limit is), `measured-best` makes gap a **regression**
 number (how far below our own best). The two never share a sorted column.

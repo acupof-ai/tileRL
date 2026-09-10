@@ -360,9 +360,12 @@ def _gap(record: dict, registry: dict) -> float | None:
     """floor/value for higher-is-better, value/floor for lower-is-better.
 
     None when the value is 0 (a ratio has no floor there) -- such rows are
-    instruments, not questions."""
+    instruments, not questions -- and for directionless metrics (direction
+    "none"): a metric with no monotonic direction has no floor to gap."""
     v = record["value"]
     if v <= 0:
+        return None
+    if registry[record["metric"]]["direction"] == "none":
         return None
     f = record["floor"]["value"]
     return f / v if registry[record["metric"]]["direction"] == "+" else v / f
@@ -473,6 +476,8 @@ def _view_regress() -> None:
             continue
         prev, last = rows[-2], rows[-1]
         d = reg[last["metric"]]["direction"]
+        if d == "none":
+            continue  # no monotonic direction: newest-vs-previous is not a regression
         ratio = last["value"] / prev["value"] if d == "+" else prev["value"] / last["value"]
         print(f"  {'PASS' if ratio >= 0.97 else 'FAIL'} {last['metric']} {dict(last['shape'])} "
               f"{last['target']}/{last['build']}: {last['value']} vs {prev['value']} ({ratio:.3f}x)")
@@ -482,6 +487,8 @@ def _view_regress() -> None:
     for r in benchrec.current(benchrec.load_all()).values():
         if r["floor"]["kind"] != "measured-best":
             continue
+        if reg[r["metric"]]["direction"] == "none":
+            continue  # a directionless metric has no "best" to stand below
         g = _gap(r, reg)
         if g is None:
             continue
@@ -558,8 +565,11 @@ def _view_questions(limit: int = 20) -> None:
         print(f"  {score:.3f}  {r['metric']} {r['target']} {dict(r['shape'])} "
               f"[{r['floor']['kind']}]: {r['value']} vs floor {r['floor']['value']} "
               f"({g:.2f}x) x {reg[r['metric']]['weight']}")
+    # A reference floor states "no physical floor, deliberately" -- it is not
+    # the missing derivation this alarm lists.
+    deliberate = {r["metric"] for r in cur if r["floor"]["kind"] == "reference"}
     missing = sorted(
-        ((reg[m]["weight"], m) for m in {r["metric"] for r in cur} - floored),
+        ((reg[m]["weight"], m) for m in {r["metric"] for r in cur} - floored - deliberate),
         reverse=True,
     )
     if missing:

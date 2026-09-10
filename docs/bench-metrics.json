@@ -125,12 +125,12 @@
     },
     "rollout_tokens": {
       "unit": "tokens",
-      "direction": "-",
+      "direction": "none",
       "weight": 0.5,
       "shape": [
         "steps"
       ],
-      "why": "mean completion tokens per GSM8K problem \u2014 the sample-efficiency operand, n-independent by construction. tokens/correct is the view rollout_tokens / gsm8k_pct, never stored"
+      "why": "mean completion tokens per GSM8K problem \u2014 the sample-efficiency operand, n-independent by construction. No monotonic direction: a shorter rollout can be a better policy or a collapsed one (2026-09-10, 347 to 13.9 tokens while gsm8k_pct fell 91.6 to 78.2), so it is never judged against a floor \u2014 read it alongside gsm8k_pct. tokens/correct is the view rollout_tokens / gsm8k_pct, never stored"
     },
     "mmlu_pct": {
       "unit": "%",
