@@ -105,7 +105,7 @@ the e2e flake went 3/16 → 0/20. The fix spins `sleep(0)` while a fetch is in
 flight instead of yielding a fixed N times per tick — the sweep below shows N
 is a distribution tail, and the spin is N=∞ with an early exit plus a 50 ms
 wall-clock bound as a safety valve. Open remainder (carried in OPEN.md): the
-spin's cost on 27B is unmeasured (the 144 MiB snapshot needs many windows, so
+spin's cost on 27B is unmeasured (the 155.2 MiB snapshot needs many windows, so
 the spin actually runs there), and `any_fetching()` is global, not per-request.
 
 The fix above landed the GIL yield, but on CPU the deadline was still thin:

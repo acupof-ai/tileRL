@@ -23,8 +23,9 @@ the writer thread). The spin is strictly additive on the fetch path.
 The bound is a safety valve for a stuck reader, not a tuned parameter: 50 ms is
 10x the healthy case for a small fetch (~5 ms, one switch interval) and 2/3 of
 the CUDA deadline (75 ms). Worst-case tick inflation is 50 ms (40x on a 1.25 ms
-CUDA B=1 tick). On the slice the bound never fires (fetch completes in one
-window); on 27B it will fire regularly — see Behavioral changes.
+CUDA B=1 tick). Whether the bound fires on the slice is unmeasured (the bench
+below had no fetch in flight during decode); on 27B it will fire regularly —
+see Behavioral changes.
 
 ## Measurements
 
@@ -42,18 +43,22 @@ Decode throughput (slice 4 layers, fused+graph, SSD on, H20 card 3):
 | 1 | 799.9 | 799.1 | −0.1% (noise) |
 | 8 | 3082.4 | 3076.8 | −0.2% (noise) |
 
-**These numbers hold only for fetches that complete in one GIL window.** The
-slice's spill files are 18 KB, so `torch.load` finishes in ~1 ms and the spin
-exits immediately — the mechanism does not run on this path. The "cost
-unchanged" claim is about that config, not the CUDA path in general.
+**These numbers are tautological — the spin never ran in that bench.** The
+decode arm had no fetch in flight, so `any_fetching()` was false at every tick
+and the spin body never executed. −0.1%/−0.2% prices the `any_fetching()`
+check itself, not the spin. The slice's `.st` is 9.8 MB (the 18 KB was the
+`.kv`), so a fetch on the slice would not complete in one GIL window — but no
+fetch was running, so the bench cannot answer whether the spin exits promptly
+on the slice either.
 
-**On the full 27B model the spin will actually run.** The snapshot is 144 MiB
-(OPEN row 14), and a 144 MiB `torch.load` needs many GIL windows, not one.
-Each tick will spin for a meaningful fraction of the 50 ms bound instead of
-exiting immediately. The slice bench cannot price this; it needs a 27B
-measurement with SSD on.
+**On the full 27B model the spin will actually run.** The snapshot is 155.2
+MiB (states 144.0 + conv_window 11.25), and a 155.2 MiB `torch.load` needs many
+GIL windows, not one. Each tick will spin for a meaningful fraction of the 50
+ms bound instead of exiting immediately. The slice bench cannot price this;
+it needs a 27B measurement with SSD on.
 
-The N-sweep that sized the spin (yields per tick vs `fetch_ms`, 18 KB slice):
+The N-sweep that sized the spin (yields per tick vs `fetch_ms`, 4-layer slice,
+`.st` 9.8 MB):
 N=1 → 1.5–1.7 s, N=10 → 2–96 ms, N=20 → 2–189 ms, N=50 → 2 ms. The spin is
 N=∞ with an early exit, so it takes the fast path of the N≥10 cells without
 the per-tick cost of a fixed N.
