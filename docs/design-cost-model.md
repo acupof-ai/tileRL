@@ -27,7 +27,8 @@ f32       = Format(bits=32)
 fp8_kv    = Format(bits=8,  scales=((head_dim, f32),))         # one f32 per plane x head x token
 nvfp4     = Format(bits=4,  scales=((16, e4m3), (None, f32)))  # disk: ModelOpt packing
 nvfp4_dev = Format(bits=4,  scales=((16, f32), ((None,), f32)))# device: f32 scales, f32/row
-fp8_dev   = Format(bits=8,  scales=(((128,128), f32), ((None,), f32)))  # device fp8 weight
+fp8_block_dev = Format(bits=8, scales=(((128,128), f32),))               # fp8 block grid, no row scale
+fp8_dev   = Format(bits=8,  scales=(((128,128), f32), ((None,), f32)))  # fp8 grid + f32/row
 nbytes(fmt, shape) = numel * bits // 8 + sum(scale_count * itemsize for each plane)
 ```
 

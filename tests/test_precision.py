@@ -71,7 +71,7 @@ def test_device_faces_equal_the_served_tensor_storage():
     """
     from tilerl_kernels.reference import pack_fp4, renorm_fp4_scale
 
-    from tilerl.precision import fp8_dev, nbytes, nvfp4_dev
+    from tilerl.precision import fp8_block_dev, fp8_dev, nbytes, nvfp4_dev
 
     n, k = 64, 128
     w = torch.randn(n, k)
@@ -84,32 +84,83 @@ def test_device_faces_equal_the_served_tensor_storage():
     # The named constant is the block-16 ModelOpt face.
     assert nbytes(nvfp4_dev, (n, k)) == n * k // 2 + n * (k // 16) * 4 + n * 4
 
-    # fp8 device face: e4m3 weight + ceil-dim f32 block grid + f32 row scale.
+    # fp8 block-only face (weight_scale_inv): e4m3 weight + f32 block grid, NO row scale.
     w8 = torch.zeros((n, k), dtype=torch.float8_e4m3fn)
     grid = torch.zeros((-(-n // 128), -(-k // 128)), dtype=torch.float32)
+    assert nbytes(fp8_block_dev, (n, k)) == sum(
+        t.numel() * t.element_size() for t in (w8, grid))
+    # fp8 face with a resident per-row scale (plain .weight_scale branch).
     row = torch.zeros(n, dtype=torch.float32)
-    assert nbytes(fp8_dev, (n, k)) == sum(t.numel() * t.element_size() for t in (w8, grid, row))
+    assert nbytes(fp8_dev, (n, k)) == sum(
+        t.numel() * t.element_size() for t in (w8, grid, row))
 
 
 def test_weight_specs_classifies_a_checkpoint_header_without_weight_bytes():
-    """The fp4/fp8 split comes from tensor names, not config; one row per base weight."""
+    """The three loader branches and activation-quant sidecars, one row per base weight."""
     from tilerl.precision import weight_specs
 
     header = {
-        "a.weight_packed": {"shape": (17408, 2560), "dtype": "U8"},  # fp4 logical 17408x5120
+        "a.weight_packed": {"shape": (17408, 2560), "dtype": "U8"},  # nvfp4 logical 17408x5120
         "a.weight_scale": {"shape": (17408, 320), "dtype": "F8_E4M3FN"},
         "a.weight_global_scale": {"shape": (1,), "dtype": "F32"},
-        "b.weight": {"shape": (48, 5120), "dtype": "F8_E4M3FN"},  # fp8 block
+        "b.weight": {"shape": (48, 5120), "dtype": "F8_E4M3FN"},  # weight_scale_inv: grid only
         "b.weight_scale_inv": {"shape": (1, 40), "dtype": "F32"},
-        "embed.weight": {"shape": (248320, 5120), "dtype": "BF16"},  # plain bf16
+        "c.weight": {"shape": (64, 5120), "dtype": "F8_E4M3FN"},  # plain scale: grid + row
+        "c.weight_scale": {"shape": (64,), "dtype": "F32"},
+        "embed.weight": {"shape": (248320, 5120), "dtype": "BF16"},
         "norm.weight": {"shape": (5120,), "dtype": "BF16"},
+        # activation quantization: never a priced resident-weight row
+        "c.input_scale": {"shape": (1,), "dtype": "F32"},
+        "c.input_global_scale": {"shape": (1,), "dtype": "F32"},
     }
     rows = {name: (shape, fmt) for name, shape, fmt in weight_specs(header)}
-    assert set(rows) == {"a.weight_packed", "b.weight", "embed.weight", "norm.weight"}
+    assert set(rows) == {"a.weight_packed", "b.weight", "c.weight",
+                        "embed.weight", "norm.weight"}
     assert rows["a.weight_packed"][0] == (17408, 5120)
     assert rows["a.weight_packed"][1] == precision.nvfp4_dev
-    assert rows["b.weight"][1] == precision.fp8_dev
+    assert rows["b.weight"][1] == precision.fp8_block_dev
+    assert rows["c.weight"][1] == precision.fp8_dev
     assert rows["embed.weight"][1].bits == 16
+
+
+def test_checkpoint_weight_specs_round_trips_a_real_mixed_safetensors(tmp_path):
+    """Write a mixed fp4/fp8-block/fp8-row/bf16 checkpoint and read it back header-only."""
+    from safetensors.torch import save_file
+
+    from tilerl.precision import (
+        checkpoint_weight_specs,
+        fp8_block_dev,
+        fp8_dev,
+        nbytes,
+        nvfp4_dev,
+    )
+
+    N, K = 128, 64
+    tensors = {
+        # nvfp4 (ModelOpt naming): packed nibbles + e4m3 scale + global
+        "m.weight_packed": torch.zeros((N, K // 2), dtype=torch.uint8),
+        "m.weight_scale": torch.zeros((N, K // 16), dtype=torch.float8_e4m3fn),
+        "m.weight_global_scale": torch.zeros(1, dtype=torch.float32),
+        # fp8 block-only: w8 + grid inv, no row
+        "b.weight": torch.zeros((N, K), dtype=torch.float8_e4m3fn),
+        "b.weight_scale_inv": torch.zeros((1, 1), dtype=torch.float32),
+        # fp8 with a plain per-channel scale: w8 + row (grid is ones at load)
+        "c.weight": torch.zeros((N, K), dtype=torch.float8_e4m3fn),
+        "c.weight_scale": torch.zeros((N,), dtype=torch.float32),
+        "c.input_scale": torch.zeros(1, dtype=torch.float32),  # must be excluded
+        "embed.weight": torch.zeros((100, K), dtype=torch.bfloat16),
+    }
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+
+    rows = {name: (shape, fmt) for name, shape, fmt in checkpoint_weight_specs(tmp_path)}
+    assert set(rows) == {"m.weight_packed", "b.weight", "c.weight", "embed.weight"}
+    assert rows["m.weight_packed"] == ((N, K), nvfp4_dev)
+    assert rows["b.weight"] == ((N, K), fp8_block_dev)
+    assert rows["c.weight"] == ((N, K), fp8_dev)
+    # Derived total is the exact sum of the three device faces plus bf16 embed.
+    expected = (nbytes(nvfp4_dev, (N, K)) + nbytes(fp8_block_dev, (N, K))
+                + nbytes(fp8_dev, (N, K)) + 100 * K * 2)
+    assert sum(nbytes(fmt, shape) for shape, fmt in rows.values()) == expected
 
 
 def test_27b_resident_weight_bytes_match_the_measured_24_44gb(tmp_path):

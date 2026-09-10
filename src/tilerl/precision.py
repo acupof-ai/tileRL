@@ -63,8 +63,11 @@ nvfp4 = Format(bits=4, scales=((16, "e4m3"), (None, "f32")))
 #: Device face of an NVFP4 linear after renorm_fp4_scale: f32 scale per 16 along K
 #: and one f32 per output row (the global scale split into a per-row epilogue).
 nvfp4_dev = Format(bits=4, scales=((16, "f32"), ((None,), "f32")))
-#: Device face of an fp8-e4m3 linear: 1 B/elem plus an f32 [N/128,K/128] block grid
-#: and one f32 per output row.
+#: Device face of an fp8-e4m3 weight with ONLY the f32 [N/128,K/128] block grid:
+#: the weight_scale_inv branch stores no row scale (oscale=None), synthesized per launch.
+fp8_block_dev = Format(bits=8, scales=(((128, 128), "f32"),))
+#: Device face of an fp8-e4m3 weight with the block grid PLUS a real f32 per-row scale
+#: (the plain .weight_scale branch: per-channel scale rides .oscale over a ones grid).
 fp8_dev = Format(bits=8, scales=(((128, 128), "f32"), ((None,), "f32")))
 
 
@@ -85,24 +88,30 @@ def nbytes(fmt: Format, shape: tuple[int, ...]) -> int:
     return total
 
 
-#: Safetensors suffixes that are a weight's scale sidecars (never standalone rows).
-_SCALE_SUFFIX = (".weight_scale", ".weight_global_scale", ".weight_scale_inv", ".weight_scale_2")
+#: Safetensors suffixes consumed with a weight (quant scale sidecars and activation
+#: quant inputs) -- never a standalone priced row. Mirrors load_hf's skip list.
+_SCALE_SUFFIX = (
+    ".weight_scale", ".weight_scale_inv", ".weight_scale_2", ".weight_global_scale",
+    ".input_scale", ".input_global_scale", ".scales", ".qzeros",
+)
 
 
 def weight_specs(header: dict) -> list[tuple[str, tuple[int, ...], Format]]:
     """Classify a safetensors shard header into the served weights and their device faces.
 
     ``header`` maps tensor name -> {"shape", ...}; no weight bytes are read. The
-    fp4/fp8 split is checkpoint-specific -- a config cannot derive it -- so the
-    classification follows the loader's (model.py) dispatch on the tensor names:
+    fp4/fp8 population and the exact scale face are checkpoint-specific, so the
+    classification follows load_hf's branches on the tensor names:
 
-    - ``X.weight_packed`` (ModelOpt) or ``X.weight`` + ``X.weight_scale_2``
-      (official NVFP4): :data:`nvfp4_dev`, logical shape [N, K] from the [N, K/2]
-      packed nibbles.
-    - ``X.weight`` + ``X.weight_scale_inv`` (ModelOpt FP8): :data:`fp8_dev`.
-    - any other ``X.weight`` / plain tensor: its stored dtype (bf16 on 27B).
+    - ``X.weight_packed`` (ModelOpt) or ``X.weight`` + ``.weight_scale_2`` (official
+      NVFP4): :data:`nvfp4_dev` (nibbles + f32/16 + f32 per row).
+    - ``X.weight`` + ``.weight_scale_inv`` (ModelOpt FP8 block): :data:`fp8_block_dev`
+      -- the block grid only, no resident row scale (oscale=None, ones per launch).
+    - ``X.weight`` + plain ``.weight_scale`` (per-tensor/channel FP8): :data:`fp8_dev`
+      -- a ones block grid plus a real f32 per-row scale.
+    - any other weight/tensor: its stored dtype.
 
-    The scale sidecars are priced by the Format and are not separate rows.
+    Quant scale sidecars and activation-quant ``.input_*`` tensors are skipped.
     """
     names = set(header) - {"__metadata__"}
     out: list[tuple[str, tuple[int, ...], Format]] = []
@@ -110,24 +119,15 @@ def weight_specs(header: dict) -> list[tuple[str, tuple[int, ...], Format]]:
     def plain(name: str) -> tuple[str, tuple[int, ...], Format]:
         dt = str(header[name].get("dtype", "BF16")).upper()
         bits = {
-            "F64": 64,
-            "F32": 32,
-            "F16": 16,
-            "BF16": 16,
-            "F8_E4M3FN": 8,
-            "I64": 64,
-            "I32": 32,
-            "I16": 16,
-            "I8": 8,
-            "U8": 8,
-            "BOOL": 1,
+            "F64": 64, "F32": 32, "F16": 16, "BF16": 16, "F8_E4M3FN": 8,
+            "I64": 64, "I32": 32, "I16": 16, "I8": 8, "U8": 8, "BOOL": 1,
         }.get(dt, 16)
         return name, tuple(header[name]["shape"]), Format(bits)
 
     for name in sorted(names):
-        stem = name.removesuffix(".weight") if name.endswith(".weight") else name
         if name.endswith(_SCALE_SUFFIX):
             continue
+        stem = name.removesuffix(".weight") if name.endswith(".weight") else name
         if name.endswith(".weight_packed"):
             n, k2 = header[name]["shape"]
             out.append((name, (n, k2 * 2), nvfp4_dev))
@@ -135,6 +135,8 @@ def weight_specs(header: dict) -> list[tuple[str, tuple[int, ...], Format]]:
             if f"{stem}.weight_scale_2" in names:
                 out.append((name, tuple(header[name]["shape"]), nvfp4_dev))
             elif f"{stem}.weight_scale_inv" in names:
+                out.append((name, tuple(header[name]["shape"]), fp8_block_dev))
+            elif f"{stem}.weight_scale" in names:
                 out.append((name, tuple(header[name]["shape"]), fp8_dev))
             else:
                 out.append(plain(name))
