@@ -1,6 +1,6 @@
 # The GDN context-parallel tape runs end to end (conv kernel 1) — CPU, 2026-09-11
 
-> Status: Shipped for the affine state transfer; cross-rank conv-halo adjoint pending (next PR).
+> Status: Shipped. Affine transfer kernel 1 in this PR; cross-rank conv-halo adjoint (kernel 4) in the follow-up, both on one branch lineage.
 
 ## Context
 
@@ -38,12 +38,11 @@ The world2 oracle is a single-process virtual CP that runs the four chunks from 
 sequential exclusive prefixes and differentiates the GLOBAL loss summed over ranks;
 replicated leaves (state, params) sum both ranks' tape grads.
 
-**Not yet covered:** the tiny fixture is conv kernel 1, so every chunk starts from a
-zero halo and only the affine transfer is cross-rank. The 27B runs kernel 4; under it a
-chunk's prep mixes the prior chunk's last 3 raw qkv rows exchanged by `cp_halo`.
-`gdn_cp_bwd` raises on a nonzero window rather than guess, so q/k/v under kernel 4 are
-NOT gradchecked until the follow-up: a window-aware prep reverse plus a `cp_halo`
-reduce-scatter that adds the window grad onto the other rank's q/k/v.
+**Kernel 4 (the 27B) is now covered** — see
+[2026-09-11-gdn-cp-halo-adjoint.md](2026-09-11-gdn-cp-halo-adjoint.md): the window-aware
+prep reverse and the `cp_halo` reverse route the conv-halo gradient, including rank 1's
+local predecessor under zigzag. This entry's kernel-1 fixture remains the minimal gate for
+the affine transfer alone.
 
 ## Rule
 
