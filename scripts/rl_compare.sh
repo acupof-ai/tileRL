@@ -8,18 +8,28 @@
 # bf16 conversion (docs/experience/errors/2026-08-28-sglang-bf16-checkpoint-garbage.md).
 set -euo pipefail
 SRC=${TILERL_QWEN38_SOURCE:-/work/Qwen3.8-27B-NVFP4}
-GPU=${GPU:-7} STEPS=${STEPS:-20} GROUP=${GROUP:-8} LEN=${LEN:-256} MMLU=${MMLU:-200}
+# Card 0 is tileRL's grant; the previous default 7 belongs to aupai. Override with GPU=.
+GPU=${GPU:-0} STEPS=${STEPS:-20} GROUP=${GROUP:-8} LEN=${LEN:-256} MMLU=${MMLU:-200}
 DATA=${DATA:-/work/gsm8k_train.jsonl}
+RUNS=${TILERL_RUNS:-runs}
 [ -f "$DATA" ] || HF_ENDPOINT=https://hf-mirror.com python3 scripts/gsm8k_jsonl.py train "$DATA" --n 512
 
 # A: tileRL
 CUDA_VISIBLE_DEVICES=$GPU TILERL_QWEN38_SOURCE=$SRC python3 -m tilerl.cli train \
   --model qwen38-27b --rl --data "$DATA" --steps "$STEPS" --group "$GROUP" \
   --max-new-tokens "$LEN" --eval-mmlu "$MMLU" | tee /work/rl_compare_tilerl.log
-python3 - <<'PY'
-import re
-secs = [float(m) for m in re.findall(r"  ([\d.]+)s$", open("/work/rl_compare_tilerl.log").read(), re.M)]
-print(f"tilerl: {len(secs)} steps, median {sorted(secs)[len(secs)//2]:.1f}s/step, total {sum(secs):.0f}s")
+# Read the manifest, not the log: the step line gained phase timings and no longer
+# ends in "<n>s", so the old trailing-number regex matched nothing and reported a
+# crash-length median of zero. The manifest is where secs_per_step_median is defined.
+python3 - "$RUNS" <<'PY'
+import json, pathlib, sys
+manifests = list(pathlib.Path(sys.argv[1]).glob("*/manifest.json"))
+if not manifests:
+    sys.exit(f"no manifest under {sys.argv[1]}; set TILERL_RUNS to the run dir")
+m = json.loads(max(manifests, key=lambda p: p.stat().st_mtime).read_text())
+g = m["metrics"]
+print(f"tilerl run {m['id']}: {g.get('steps_completed')} steps, "
+      f"median {g['secs_per_step_median']:.1f}s/step, total {g['secs_total']:.0f}s")
 PY
 
 # B: verl GRPO, FSDP actor + sglang rollout. Same group/length/steps, one card.
