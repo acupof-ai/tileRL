@@ -1169,15 +1169,24 @@ def test_clearing_the_prefix_after_update_keeps_rollouts_token_for_token_eager(m
                 sampling=SamplingParams(max_new_tokens=6), seed=100,
                 clear_prefix=clear_prefix):
             pass
-        return captured[1]  # post-update (second-step) completions
+        return captured[1], engine.stats()  # post-update (second-step) completions + store
 
-    reference = run(no_store=True, clear_prefix=False)  # no store: KV always recomputed
-    cleared = run(no_store=False, clear_prefix=True)    # live store, invalidated per update
-    stale = run(no_store=False, clear_prefix=False)     # mutant: stale KV survives update
+    reference, _ = run(no_store=True, clear_prefix=False)  # no store: KV always recomputed
+    cleared, clr_stats = run(no_store=False, clear_prefix=True)  # live store, cleared per update
+    stale, hit_stats = run(no_store=False, clear_prefix=False)  # stale KV survives update
 
     assert cleared == reference, (
         "after an update a cleared prefix store must sample exactly what a store-free "
         "engine does; the invalidation let old-policy KV survive")
+    # The clear must empty the store before step 2: the 256-token prefix published in
+    # step 1 is gone, so the extension admits as a miss. A clear that fails to call
+    # PrefixStore.clear() leaves a hit here AND (above) stale KV in the completions.
+    assert clr_stats["prefix_hits"] == 0, clr_stats
+    # Positive proof the 256/336 partial hit actually happens on the live store; without
+    # it the stale-vs-reference gap below is unattributable and a _match_prefix
+    # threshold change turns both live runs into eager runs that stay green.
+    assert hit_stats["prefix_hits"] >= 1, hit_stats
+    assert hit_stats["prefix_hit_tokens"] >= 16 * BLOCK_TOKENS, hit_stats
     assert stale != reference, (
         "skipping invalidate_weights did not change the post-update samples -- the gate "
         "cannot see a stale prefix; the partial-hit/nonzero-advantage fixture is vacuous")

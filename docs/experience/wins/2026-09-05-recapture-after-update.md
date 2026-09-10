@@ -137,10 +137,23 @@ completions with `clear_prefix=True` are token-for-token identical to a
 store-free `NoPrefixStore` engine under the same seeds; a loop that skips the
 invalidation serves the old policy's KV and the completions diverge. The gate is
 red both when the flag is ignored and when `invalidate_weights` stops calling
-`PrefixStore.clear()`. Two fixture details make it non-vacuous: a full-length
+`PrefixStore.clear()`. The partial hit is asserted from the live store, not
+constructed: the stale-KV run reports `prefix_hits >= 1` and
+`prefix_hit_tokens >= 256` from `engine.stats()`, and the cleared run reports
+zero hits (the clear emptied the store before step 2); without those counters
+a `_match_prefix` threshold change makes both live runs eager and the token
+comparison stays green. Two fixture details make it non-vacuous: a full-length
 prefix hit is recomputed (the submission must be longer than the cached entry),
 and a length-only reward with one survivor ties the group to zero advantage so
 no weight moves at all.
+
+The tiny gate's observed hit does not contradict the recorded 27B
+`prefix_published: 739, prefix_hits: 0`. This fixture deliberately re-submits a
+block-aligned shared prefix across two steps of the same loop; the 27B GRPO
+benchmark publishes only at decode-phase block boundaries and the eight
+rollouts of a group never share a prefill, so its serving workload produced no
+eligible lookup (the block-granular store is P2). The gate builds the condition
+the 27B workload happened to lack; it does not claim the 27B run hit.
 
 The **graph** half cannot be gated on CPU — capture calls
 `torch.cuda.graph_pool_handle()` and the handler falls back to eager, so a
