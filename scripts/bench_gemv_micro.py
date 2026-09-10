@@ -1,7 +1,8 @@
 """Time the fp4 decode GEMV's (micro_size_k, GROUP) grid on a GPU, no model load. micro sets the
 load width (8/16/32 -> LDG.32/.64/.128), micro*GROUP the register footprint; six arms because
-equal-footprint points form ladders, with (16,2) as the control on that argument. Block-16
-scales (the checkpoint's); bytes come from the tensors, never a constant.
+equal-footprint points form ladders, with (16,2) as the control on that argument. The TB/s
+column prices weight bytes through precision.nbytes(nvfp4_dev) — the device face after
+renorm_fp4_scale (nibbles + f32/16 + one f32/output row), not a hand product.
 
     CUDA_VISIBLE_DEVICES=6 PYTHONPATH=src TILERL_TARGET=cuda python3 -u scripts/bench_gemv_micro.py [--compile-only]
 
@@ -18,6 +19,8 @@ import torch
 sys.path.insert(0, "scripts")
 from benchkit import ab, relerr  # noqa: E402
 from tilerl_kernels import kernels_linear, reference  # noqa: E402
+
+from tilerl.precision import nbytes, nvfp4_dev  # noqa: E402
 
 ARMS = ((8, 4), (32, 1), (32, 2), (32, 4), (16, 1), (16, 2))
 SHAPES = (("down", 5120, 17408), ("gate_up", 34816, 5120))
@@ -58,22 +61,27 @@ def main() -> None:
     down_us: dict[str, float] = {}
     for label, n, k in SHAPES:
         x, wq, scale, ref = inputs(n, k)
-        nbytes = wq.numel() + scale.numel() * 4 + 2 * k
+        # Weight bytes come from the device-face Format (nibbles + f32/16 + one f32
+        # per output row), not a hand product; +2*k adds the streamed M=1 input and
+        # output activations. nvfp4_dev is the face linear_fp4 streams after
+        # renorm_fp4_scale.
+        weight_bytes = nbytes(nvfp4_dev, (n, k))
+        stream_bytes = weight_bytes + 2 * k
         arms = [(f"micro={m} GROUP={g}", arm(m, g, x, wq, scale)) for m, g in ARMS]
         if args.compile_only:
             for name, fn in arms:
                 print(f"{label} {name}: rel-err {relerr(fn()[0], ref):.2e}", flush=True)
             continue
-        rows = ab(f"{label} N={n} K={k} — {nbytes / 2**20:.0f} MiB, block {BLOCK}",
+        rows = ab(f"{label} N={n} K={k} — {stream_bytes / 2**20:.0f} MiB, block {BLOCK}",
                   arms, (ref,), args.iters)
         base = rows[0][1]
-        print("\n| arm | ms | TB/s (0.75 B/elem) | vs (8,4) |")
+        print("\n| arm | ms | TB/s (nvfp4_dev) | vs (8,4) |")
         print("|---|---:|---:|---:|")
         for name, ms, _, ok in rows:
             ratios.setdefault(name, []).append(base / ms if ok else 0.0)
             if label == "down":
                 down_us[name] = ms * 1e3
-            print(f"| {name} | {ms:.4f} | {nbytes / ms * 1e-9:.3f} | {base / ms:.3f}x |")
+            print(f"| {name} | {ms:.4f} | {stream_bytes / ms * 1e-9:.3f} | {base / ms:.3f}x |")
     if args.compile_only:
         return
 

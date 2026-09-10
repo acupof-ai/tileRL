@@ -59,6 +59,15 @@ read on the live card 2026-09-08) gives 6.11 ms, and 23.22 GiB (24.93 GB,
 `wins/2026-09-03-grpo-27b-fits-the-card.md:49`) gives 6.23 ms. The probe uses the lower,
 which is the conservative choice for this argument. 3.07 ms violates both.
 
+> **Re-derived 2026-09-11 (cost model):** the 24.44 GB denominator is no longer a
+> live-card read in the probe — `probe_rollout_breakdown --checkpoint DIR` derives it
+> from `model.checkpoint_weight_faces` (the plan weights row), which sums to exactly
+> **24,436,981,888 B = 24.437 GB** on this checkpoint. Delta vs the 2026-09-08
+> measured 24.44 GB is under 0.01%, so the floor 6.11 ms, the 1309 tok/s B=8 ceiling
+> and the measured **0.099 of ceiling** are unchanged (verdict stands). This is the
+> resident served face (incl. embed/norm); the tick table's 22.36 GB is linears-only
+> and is a different, smaller quantity.
+
 The floor's two assumptions, since it was load-bearing before the control existed: the
 nameplate bandwidth (real achieved rates run 0.7–0.9 of it, which would raise the floor
 and strengthen the violation) and one read per parameter per tick (cache hits or fusion
