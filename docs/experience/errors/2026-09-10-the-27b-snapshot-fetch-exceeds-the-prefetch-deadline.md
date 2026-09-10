@@ -1,5 +1,7 @@
 # The 27B snapshot fetch exceeds the prefetch deadline: the spin hits its 50 ms bound on every tick and the fetch drops
 
+> Status: fixed 2026-09-10 — an in-flight fetch is never discarded; the deadline gates the wait, not the read. A/B on 27B: 0 drops (was 1), request 1 pays 0 tick-side reads (was one blocking ~80 ms read), the next same-prefix request adds 0 prefetches and hits from the parked pair. See [wins/2026-09-10-never-discard-an-inflight-fetch](../wins/2026-09-10-never-discard-an-inflight-fetch.md). The snapshot-size deadline (Fix 1) remains unbuilt; Fix 2 shipped because it also closes the global-`any_fetching()` spin cost.
+
 ## Context
 
 OPEN row 17's remainder asked for the spin's cost on the full 27B with SSD on.
@@ -42,28 +44,27 @@ it had no fetch in flight.
 
 ## Fix
 
-Not fixed in this PR — this is a measurement PR. Two directions, both named in
-the original errors entry:
+Direction 2 shipped 2026-09-10: **do not abandon an in-flight fetch.** The
+deadline governs whether a row *waits*, never whether finished work is kept.
+On expiry the row admits and full-prefills while the read keeps going and
+parks; the next same-prefix request faults the parked pair in from memory.
+This also closes the global-`any_fetching()` spin cost — the spin now runs
+only for a waiting row whose own fetch is in flight with a live deadline.
+See [wins/2026-09-10-never-discard-an-inflight-fetch](../wins/2026-09-10-never-discard-an-inflight-fetch.md).
 
-1. **Account for the snapshot size in the deadline.** The deadline should be
-   `max(len(tokens) / seed_rate, snapshot_load_ms + margin)`. The snapshot
-   load time is measurable (`ssd_fetch_ms` / `ssd_fetch_bytes` gives MiB/s).
-2. **Do not abandon an in-flight fetch when the deadline expires** (the
-   "alternative safety net" from
-   [errors/2026-09-10-prefetch-deadline-gil-contention](2026-09-10-prefetch-deadline-gil-contention.md)):
-   the 117 ms is already paid, and the result is useful for the next request
-   with the same prefix. The deadline should govern whether to *start* a fetch,
-   not whether to *discard finished work*.
-
-Direction 2 is the cheaper fix and also closes the global-`any_fetching()`
-cost: a fetch that is not abandoned completes, and the next tick stops spinning.
+Direction 1 (size the deadline for the snapshot) remains unbuilt. It would make
+the *first* request wait for and take the fetch instead of full-prefilling —
+worth doing only if 80–117 ms for a 192-token prefix beats the full prefill,
+which the seed-rate formula says it does not. The parked-pair fix already
+captures the value (the read is paid once and reused) without holding a row.
 
 ## Rule
 
 A deadline computed from token count assumes the fetch time scales with tokens.
-When the fetch loads a constant-size snapshot, the deadline must account for
-the snapshot size — or the fetch always drops on a model where the snapshot is
-large. The seed rate prices the forward, not the load.
+When the fetch loads a constant-size snapshot, either size the deadline for the
+snapshot (Fix 1, unbuilt) or stop treating the deadline as a reason to discard
+the finished read (Fix 2, shipped): the load is paid for regardless, and the
+cache — not the requester that left — is the result's owner.
 
 ## Results
 
