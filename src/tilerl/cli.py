@@ -1606,38 +1606,45 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
     """
     from . import config as config_mod
     from . import kernel_cost
-    from .precision import kv_format, nvfp4
+    from .model import checkpoint_weight_faces
+    from .precision import fp8_block_dev, fp8_dev, kv_format, nvfp4, nvfp4_dev, nvfp4_dev_b32
 
     cfg = config_mod.qwen38_27b() if args.model == "qwen38-27b" else config_mod.tiny()
-    # ponytail: weights are priced with the DISK nvfp4 Format (e4m3 per-16, 0.5625
-    # B/elem); the device face after renorm_fp4_scale is f32-per-block (0.65625) and
-    # the disk/device split land in cc's Format PR.
-    weight = nvfp4
-    print(f"{'kernel':<26} {'count':>5} {'shape':>22} {'bytes':>12} {'flops':>10} "
-          f"{'ms':>11} {'%bound':>11}")
+    faces = checkpoint_weight_faces(cfg, args.checkpoint) if args.checkpoint else None
+    face_label = {
+        nvfp4: "nvfp4", nvfp4_dev: "nvfp4", nvfp4_dev_b32: "nvfp4",
+        fp8_block_dev: "fp8blk", fp8_dev: "fp8",
+    }
+    src = f"checkpoint {args.checkpoint}" if faces is not None else "nvfp4 weights (config face)"
+
+    def face_cell(r):
+        return face_label.get(r.get("face"), "bf16")
+
+    def print_rows(rows):
+        for r in rows:
+            print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face_cell(r):>7} "
+                  f"{r['bytes'] * r['count']:>12,} {r['flops'] * r['count']:>10,} "
+                  f"{'pending':>11} {'pending':>11}")
+
+    print(f"{'kernel':<26} {'count':>5} {'shape':>22} {'face':>7} {'bytes':>12} "
+          f"{'flops':>10} {'ms':>11} {'%bound':>11}")
     if args.prefill:
         pre = kernel_cost.TickShape(b=1, s=args.prefill, kv=kv_format(cfg.head_dim),
-                                    weight=weight)
-        print(f"# {cfg.name} prefill, S={args.prefill} tokens, fp8 KV, nvfp4 weights")
-        for r in kernel_cost.prefill_rows(cfg, pre):
-            print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} "
-                  f"{r['bytes'] * r['count']:>12,} {r['flops'] * r['count']:>10,} "
-                  f"{'pending':>11} {'pending':>11}")
+                                    weight=nvfp4, faces=faces)
+        print(f"# {cfg.name} prefill, S={args.prefill} tokens, fp8 KV, {src}")
+        print_rows(kernel_cost.prefill_rows(cfg, pre))
         tb, tf = kernel_cost.prefill_totals(cfg, pre)
-        print(f"{'PREFILL TOTAL':<26} {'':>5} {'':>22} {tb:>12,} {tf:>10,}")
+        print(f"{'PREFILL TOTAL':<26} {'':>5} {'':>22} {'':>7} {tb:>12,} {tf:>10,}")
         return
     batches = tuple(int(x) for x in args.batches.split(",")) if args.batches else (1, 8)
-    print(f"# {cfg.name} decode tick, context s={args.context} tokens, fp8 KV, nvfp4 weights")
+    print(f"# {cfg.name} decode tick, context s={args.context} tokens, fp8 KV, {src}")
     for b in batches:
         tick = kernel_cost.TickShape(b=b, s=args.context, kv=kv_format(cfg.head_dim),
-                                     weight=weight)
+                                     weight=nvfp4, faces=faces)
         print(f"-- batch B={b} --")
-        for r in kernel_cost.tick_rows(cfg, tick):
-            print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} "
-                  f"{r['bytes'] * r['count']:>12,} {r['flops'] * r['count']:>10,} "
-                  f"{'pending':>11} {'pending':>11}")
+        print_rows(kernel_cost.tick_rows(cfg, tick))
         tb, tf = kernel_cost.tick_totals(cfg, tick)
-        print(f"{'TICK TOTAL':<26} {'':>5} {'':>22} {tb:>12,} {tf:>10,}")
+        print(f"{'TICK TOTAL':<26} {'':>5} {'':>22} {'':>7} {tb:>12,} {tf:>10,}")
 
 
 def cmd_bench(args: argparse.Namespace) -> None:
@@ -2050,6 +2057,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="pooled context tokens the --kernels decode reads against")
     p_bench.add_argument("--prefill", type=int, default=0, metavar="S",
                          help="print the prefill roofline table for S tokens instead of decode")
+    p_bench.add_argument("--checkpoint", default=None,
+                         help="--kernels: price weights from this checkpoint dir's actual "
+                              "nvfp4/fp8 device faces instead of the all-nvfp4 config face")
     for v in ("table", "readme", "regress", "questions", "collectors"):
         p_bench.add_argument(f"--{v}", action="store_true",
                              help=f"bench view: {v} from the bench store, no GPU")

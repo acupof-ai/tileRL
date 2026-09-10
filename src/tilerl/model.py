@@ -93,6 +93,41 @@ def fp4_param_keys(cfg: ModelConfig) -> set[str]:
     return keys
 
 
+def checkpoint_weight_faces(
+    cfg: ModelConfig, ckpt_dir: str
+) -> dict[str, tuple[tuple[int, ...], precision.Format]]:
+    """Every served weight's param key -> (served shape, device face) from headers.
+
+    The fp4/fp8 split is a property of the checkpoint, not the config
+    (the 27B mixes both), so a byte total reads it here. Names map through
+    :func:`_param_key_for` exactly as :func:`load_hf` does; non-served tensors
+    (vision/MTP) are excluded. A bf16 linear in :func:`fp4_param_keys` is
+    reported as :data:`nvfp4_dev_b32` when ``cfg.fp4`` -- load_hf repacks those
+    with pack_fp4's block 32, wider than on-disk NVFP4's 16. A 3-D conv1d is
+    flattened to its served [C,K] shape exactly as load_hf reshapes it. The map
+    covers every served rank (linears, embed, norms, biases), so its nbytes sum
+    equals load_hf's resident bytes to the integer; the tick table reads only
+    its 2-D linear keys.
+    """
+    from .precision import checkpoint_weight_specs, nvfp4_dev_b32
+
+    fp4_keys = fp4_param_keys(cfg) if cfg.fp4 else set()
+    served = param_specs(cfg)
+    out: dict[str, tuple[tuple[int, ...], precision.Format]] = {}
+    for hf_name, shape, fmt in checkpoint_weight_specs(ckpt_dir):
+        for cand in (hf_name, hf_name.removesuffix(".weight_packed") + ".weight"):
+            key = _param_key_for(cand)
+            if key is None or key not in served:
+                continue
+            if len(shape) == 3 and key.endswith("conv1d"):
+                shape = (shape[0], shape[1] * shape[2])  # [C,1,K] -> [C,K]
+            if key in fp4_keys and len(shape) == 2 and fmt.scales == () and fmt.bits == 16:
+                fmt = nvfp4_dev_b32  # pack_fp4(block=32) at load: nibbles + f32/32 + f32/row
+            out[key] = (tuple(shape), fmt)
+            break
+    return out
+
+
 def _quantized(params: dict[str, torch.Tensor], key: str) -> bool:
     return f"{key}.wq" in params or f"{key}.w8" in params
 

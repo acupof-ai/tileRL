@@ -5,7 +5,7 @@ its `docs/experience/` entry. Newest first.
 
 ## 2026-09-11
 
-- **phase exit (CPU)** — the GDN context-parallel tape is exact on the 27B's conv kernel 4. Two PRs on one lineage: the affine state transfer runs through the tape as one `gdn_cp` op (#464, kernel-1 gradcheck), and the cross-rank conv-halo gradient now routes by a keyed all-gather/sum onto each predecessor chunk's raw qkv tail — including the LOCAL predecessor zigzag gives rank 1 (chunks 1,2). Window-aware prep reverse + `cp_halo_bwd`; world2 tape gradcheck through the real exchange at kernel 4 (all leaves ≤2.3e-3, no-halo control q/k/v red 0.46–0.76). Before these, CP training's state and halo gradients were silently dropped. — [wins/2026-09-11-gdn-cp-halo-adjoint.md](docs/experience/wins/2026-09-11-gdn-cp-halo-adjoint.md) · [affine transfer](docs/experience/wins/2026-09-11-gdn-cp-tape-end-to-end.md)
+- **verdict** — the decode tick's weight stream is **22.36 GB at B=1 / 25.63 GB at B=8**, not the 14.88/18.16 GB the 09-10 ledger derived from the all-nvfp4 config face. The shipped checkpoint mixes 168 on-disk block-16 nvfp4, 233 fp8 and 96 bf16 in_proj_a/b that load_hf repacks with pack_fp4 block 32; `bench --kernels --checkpoint DIR` now prices each linear from its served device face via the single shared `model.checkpoint_weight_faces(cfg, dir)`. The +7.477 GB delta is batch-invariant (weights stream once); the served face sum equals a live load_hf's resident bytes to the integer, 24,436,981,888 B, asserted `==` not within a band. Header-only, no GPU; measured ms columns stay pending-remote. — [wins/2026-09-11-decode-tick-weight-bytes-come-from-the-checkpoint.md](docs/experience/wins/2026-09-11-decode-tick-weight-bytes-come-from-the-checkpoint.md)
 
 ## 2026-09-10
 

@@ -184,13 +184,16 @@ def test_checkpoint_weight_specs_round_trips_a_real_mixed_safetensors(tmp_path):
     assert sum(nbytes(fmt, shape) for shape, fmt in srows.values()) == single_total
 
 
-def test_27b_resident_weight_bytes_match_the_measured_24_44gb(tmp_path):
-    """The checkpoint-derived resident total equals the 24.44 GB measured on H20.
+def test_27b_header_weight_bytes_match_the_recorded_exact_integer():
+    """The RAW header classification sums to the exact integer recorded from this
+    checkpoint — asserted with ==, no tolerance band: a tolerance sized to a
+    headline's rounding cannot guard a per-tensor formula.
 
-    Pending-remote: needs the Qwen3.8-27B-NVFP4 checkpoint's safetensors headers (no
-    weight bytes are read). Point TILERL_27B_CKPT at the dir to run it. The oracle is
-    errors/2026-09-03-fp4-param-keys-is-not-the-fp4-tensors.md: 24.44 GB resident from a
-    MIXED population (264 nvfp4 + 233 fp8), which config alone cannot reproduce.
+    Pending-remote: needs the Qwen3.8-27B-NVFP4 safetensors headers (no weight
+    bytes are read). Point TILERL_27B_CKPT at the dir. This is the ON-DISK total
+    including the 1.77 GB of vision/MTP tensors load_hf never serves; the SERVED
+    resident total (24,436,981,888) is
+    tests/test_kernel_cost.py::test_27b_served_weight_faces_equal_load_hf_resident_exact.
     """
     import os
 
@@ -201,14 +204,8 @@ def test_27b_resident_weight_bytes_match_the_measured_24_44gb(tmp_path):
         pytest.skip("set TILERL_27B_CKPT to the 27B NVFP4 dir; headers only, no weights")
     from tilerl.precision import checkpoint_weight_specs, nbytes
 
-    rows = checkpoint_weight_specs(ckpt)
-    by_face: dict[str, int] = {}
-    for _, shape, fmt in rows:
-        by_face[fmt] = by_face.get(fmt, 0) + nbytes(fmt, shape)
-    total = sum(by_face.values())
-    # The errors entry records 24.44 GB = 22.76 GiB (decimal GB). Assert to the measured
-    # 0.01 GB: header-derived bytes must equal what memory_allocated read on H20.
-    assert abs(total - int(24.44e9)) < int(0.01e9), f"resident {total / 1e9:.3f} GB != 24.44 GB"
+    total = sum(nbytes(fmt, shape) for _, shape, fmt in checkpoint_weight_specs(ckpt))
+    assert total == 26_240_262_816, f"raw header bytes {total} != recorded 26,240,262,816"
 
 
 def test_iso_frames_follow_the_policy():
