@@ -684,10 +684,13 @@ def test_gdn_chunk_rounding_bound(device):
     this replaces a line of text with a red-capable assertion: the day a runner
     lands, it reports itself. The CUDA tight bound is unset: the errors entry
     records ``max|delta|=3.586e-4`` from the KERNEL path (e2e test, sm90, H20 card 1,
-    a single observation), not the reference path's per-element ratio this test
-    measures, so the entry's number does not transfer. A CUDA run of this reference
-    test is needed to set the tight bound; until then the CUDA tier gates at the
-    parity threshold (ratio < 1.0). Re-measured with scripts/gdn_chunk_rounding_sweep.py.
+    a single observation), and the kernel path's measured ratio against this same
+    tolerance is 2.017 (OPEN.md struck-section table: ref=-9.560e-03, hit=-9.773e-03,
+    delta=2.130e-04, tol=1.056e-04) — a known, recomputable number, but it cannot
+    set the reference tier's bound because the path differs (same structure,
+    different arithmetic); more searching won't help, only a CUDA run of this
+    reference test. Until then the CUDA tier gates at the parity threshold
+    (ratio < 1.0). Re-measured with scripts/gdn_chunk_rounding_sweep.py.
     """
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA not available")
@@ -696,8 +699,9 @@ def test_gdn_chunk_rounding_bound(device):
     chunks = (16, 32, 64, 128)
     seqs = (64, 100, 128, 164, 256)
     # CPU: three seeds, max — one seed put the worst pair 2x below another (5.8e-3 vs
-    # 1.2e-2), the same noise the backward gate's docstring documents. CUDA: one seed,
-    # matching the errors entry's single observation.
+    # 1.2e-2), the same noise the backward gate's docstring documents. CUDA: one seed —
+    # the gate is at 1.0, 83x above CPU's measured worst, so seed spread (2.1x) cannot
+    # move the verdict; 3x card time is a real cost.
     seeds = (0, 1, 2) if device == "cpu" else (0,)
     worst = 0.0
     for seed in seeds:
