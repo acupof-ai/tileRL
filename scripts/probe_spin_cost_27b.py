@@ -138,6 +138,7 @@ def main():
         # in from the parked host copy (zero tick-side disk read), instead of paying the
         # 117 ms read again -- which the pre-fix code discarded, so there was nothing to take.
         key = cold._prefix._hash_all(list(warm))
+        tier = cold._prefix._ssd
         n_dropped_hbm = 0
         for e in list(cold._prefix._entries.get(key, ())):
             cold._prefix._drop(e)
@@ -153,24 +154,40 @@ def main():
                 tick_loads["n"] += 1
             return real_load(*a, **k)
 
+        # The discriminating signals are timing-independent. In the fixed code the parked
+        # pair survives request 1, so request 2's submit DEDUPS against it: no new fetch is
+        # queued (ssd_prefetches unchanged) and the row faults it in on its first admit.
+        # In the pre-fix code request 1's fetch was discarded, so submit queues a FRESH
+        # 117 ms read (ssd_prefetches increments); with fetch_ms > the 75 ms deadline it
+        # loses again and full-prefills. A warm page cache can let the fresh fetch win by
+        # jitter -- which is why "hit + 0 tick reads" alone is NOT the verdict; the prefetch
+        # count and parked membership are.
+        pref_before = cold.stats()["ssd_prefetches"]
         hits_before = cold.stats()["ssd_hits"]
         kvmod.torch.load = counting
         t2 = time.perf_counter()
         cold.submit(list(warm), params)
+        parked_at_submit = key in tier._fetches
         drain(cold)
         req2_wall = time.perf_counter() - t2
         kvmod.torch.load = real_load
 
         cst2 = cold.stats()
-        print(f"cold(request 2 same-prefix): ssd_hits={cst2['ssd_hits']} "
-              f"(+{cst2['ssd_hits'] - hits_before}) "
-              f"tick_loads={tick_loads['n']} wall={req2_wall:.2f}s "
-              f"prefill_from reuse expected: matched via parked pair", flush=True)
+        pref_delta = cst2["ssd_prefetches"] - pref_before
+        hit_delta = cst2["ssd_hits"] - hits_before
+        print(f"cold(request 2 same-prefix): ssd_hits+{hit_delta} "
+              f"new_prefetches={pref_delta} parked_at_submit={parked_at_submit} "
+              f"tick_loads={tick_loads['n']} wall={req2_wall:.2f}s", flush=True)
         print("VERDICT:", end=" ", flush=True)
-        if cst2["ssd_hits"] > hits_before and tick_loads["n"] == 0:
-            print("PARKED PAIR SERVED (fetches_ready>0, 0 tick reads)", flush=True)
+        if pref_delta == 0 and hit_delta >= 1 and tick_loads["n"] == 0 and parked_at_submit:
+            print("PARKED PAIR SERVED (deduped, no new fetch, 0 tick reads)", flush=True)
         else:
-            print("NOT SERVED FROM PARK -- re-read or recomputed", flush=True)
+            print(
+                "RE-FETCHED/RECOMPUTED "
+                f"(new_prefetches={pref_delta}, hits+{hit_delta}, "
+                f"tick_loads={tick_loads['n']}, parked={parked_at_submit})",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":
