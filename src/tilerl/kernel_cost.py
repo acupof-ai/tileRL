@@ -66,16 +66,18 @@ def _gdn_decode_fused(cfg, t: TickShape) -> tuple[int, int]:
     """The delta-recurrence kernel for one GDN layer at decode (chunk n=1).
 
     Carries state ``s [b, nvh, dk, dv]``: ``d = U - W s`` and
-    ``s' = decay s + R^T d``. At n=1, ``W`` and ``R`` are the per-token
-    ``[b, nvh, dk, dv]`` gate-weighted key projections read once each; the state
-    is read and written. Projections themselves are the nvfp4 linears costed
-    separately, so this is only the recurrence sweep.
+    ``s' = decay s + R^T d``. The state plane is updated in place, so it is read
+    and written (2x). ``W``/``R``/``U`` are in-kernel intermediates recomputed
+    from the f32 q/k/v/z/g/beta activations — NOT HBM reads (the projections'
+    weights are the nvfp4 in_proj linears costed separately); only those
+    activations are streamed in.
     """
     nvh, dk, dv = cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
-    state = nbytes(P.f32, (t.b, nvh, dk, dv))
-    wr = 2 * nbytes(P.bf16, (t.b, nvh, dk, dv))  # W and R
-    flops = 4 * t.b * nvh * dk * dk * dv  # W s and R^T d, each [dk,dk]@[dk,dv]-ish
-    return 2 * state + wr, flops
+    state = nbytes(P.f32, (t.b, nvh, dk, dv))  # one [dk,dv] state buffer
+    # q,k,z [nvh,dk], v [nvh,dv], g,beta [nvh], all f32
+    act = nbytes(P.f32, (t.b, nvh, 3 * dk + dv + 2))
+    flops = 4 * t.b * nvh * dk * dk * dv  # W s and R^T d, two [dk,dk]@[dk,dv]
+    return 2 * state + act, flops
 
 
 def _rmsnorm(cfg, t: TickShape, width: int) -> tuple[int, int]:

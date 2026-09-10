@@ -26,12 +26,16 @@ Derived totals (s=4096, fp8 KV, nvfp4 weights; include the lm_head GEMV —
 
 | batch | bytes / tick | flops / tick |
 |---|---:|---:|
-| B=1 | 15.03 GB | 0.072 T |
-| B=8 | 19.33 GB | 0.577 T |
+| B=1 | 14.88 GB | 0.072 T |
+| B=8 | 18.16 GB | 0.577 T |
 
-The B=1 tick is overwhelmingly the nvfp4 weight stream (~14.4 GB linears of the 15.0 GB,
+The B=1 tick is overwhelmingly the nvfp4 weight stream (~14.4 GB linears of the 14.9 GB,
 i.e. bandwidth-bound — the physics the roadmap states — with attention KV and
 the GDN recurrence growing with B and s.
+
+Per added sequence at B beyond 1 (s=4096): 468 MB = fp8 KV read 137 MB +
+GDN state read+write 307 MB (the in-place state plane is touched twice; W/R/U are
+in-kernel intermediates, not HBM reads) + 24 MB norms/activations.
 
 ## Rule
 
@@ -45,7 +49,7 @@ calibration row (a copy kernel + a large GEMM), never a datasheet number.
 
 | date | commit | machine | target | model | bytes B=1 | bytes B=8 | flops B=8 |
 |---|---|---|---|---|---:|---:|---:|
-| 2026-09-10 | pending | CPU (derived) | cpu | qwen38-27b | 15.03 GB | 19.33 GB | 0.577 T |
+| 2026-09-10 | pending | CPU (derived) | cpu | qwen38-27b | 14.88 GB | 18.16 GB | 0.577 T |
 
 Raw artifact: `tilerl bench --kernels --model qwen38-27b --batches 1,8`
 (measured columns print `pending-remote`).
