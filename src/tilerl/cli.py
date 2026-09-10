@@ -235,15 +235,17 @@ def _dry_run_checkpoint(args, backend) -> None:
                 state_dtype=_torch.float32, kv_io=_torch.bfloat16, kv_fp8=kv_fp8,
                 explicit_state_budget=args.state_bytes, dram_budget=args.dram_bytes,
                 ckpt_faces=faces)
-    out = [{"tier": r.tier, "owner": r.owner, "bytes": r.n, "note": r.note,
-            "measured": None, "delta": None} for r in rows]
+    # Header-only: nothing is built, so no measured peak — memory_table suppresses the
+    # transient row and totals; this is the same surface the built --dry-run renders.
+    from .memory import format_memory_table, memory_table
+
+    table, _totals = memory_table(rows, {}, None)
     if args.json:
-        print(json.dumps(out, indent=1))
+        print(json.dumps(table, indent=1))
     else:
         print(f"tilerl serve --dry-run: model={cfg.name} checkpoint={args.checkpoint} "
               f"target={backend.target} device_free {device_free/1e6:.0f} MiB")
-        for r in out:
-            print(f"  {r['owner']:<24} {r['bytes']/1e6:10.2f} MiB {r['note']}")
+        print(format_memory_table(table))
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -316,18 +318,26 @@ def cmd_serve(args: argparse.Namespace) -> None:
             print(format_memory_table(table))
         if getattr(args, "record_residency", False):
             # Append peak + its static/transient split to the same ledger the kernel
-            # roofline (%bound) lives in, through benchrec's single schema writer.
+            # roofline (%bound) lives in, through benchrec's single schema writer. A
+            # card-less sm* row is rejected by benchrec, so refuse off cuda instead of
+            # recording a residency row with a fabricated target/card.
+            import torch as _torch2
+
+            if not _torch2.cuda.is_available():
+                sys.exit(
+                    "error: --record-residency is cuda-only (device residency belongs to "
+                    "the card; the CPU tiny cell has no measured peak). Run on the card: "
+                    "TILERL_TARGET=cuda tilerl serve --dry-run --record-residency")
             from .memory import append_residency, residency_row
 
             by = {r["owner"]: r["derived"] for r in table if r["kind"] == "allocation"}
             static = sum(v for k, v in by.items() if k != "transient")
             transient = by["transient"]
-            import torch as _torch2
-
-            name = (_torch2.cuda.get_device_name(0) if _torch2.cuda.is_available()
-                    else f"{cfg.name}-cpu")
-            card = getattr(args, "card", None)
-            rid = append_residency(residency_row(name, card, peak, static, transient))
+            card = _torch2.cuda.current_device()
+            name = _torch2.cuda.get_device_name(card)
+            rid = append_residency(
+                residency_row(name, card, peak, static, transient, backend.arch,
+                              model=cfg.name))
             print(f"appended device_resident_bytes peak {peak:,} = static {static:,} + "
                   f"transient {transient:,} ({name}) -> {rid}")
         return
