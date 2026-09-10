@@ -5,6 +5,8 @@ its `docs/experience/` entry. Newest first.
 
 ## 2026-09-11
 
+- **phase exit** — the cost model is in place: one `precision.Format`/`nbytes` prices every byte, `memory.plan` is the allocator's input, and per-kernel `bytes_moved`/`flops` plus measured card calibration price every tick. Served 27B weights are an exact header-derived **24,436,981,888 B**, and the checkpoint-faced decode tick streams **22.36/25.63 GB at B=1/B=8**. GPU measured columns stay pending-remote until the cards return. — [docs/design-cost-model.md](docs/design-cost-model.md) (#456, #457, #458, #460, #461, #462, #463, #465, #466, #468, #469, #470)
+
 - **verdict** — the decode tick's weight stream is **22.36 GB at B=1 / 25.63 GB at B=8**, not the 14.88/18.16 GB the 09-10 ledger derived from the all-nvfp4 config face. The shipped checkpoint mixes 168 on-disk block-16 nvfp4, 233 fp8 and 96 bf16 in_proj_a/b that load_hf repacks with pack_fp4 block 32; `bench --kernels --checkpoint DIR` now prices each linear from its served device face via the single shared `model.checkpoint_weight_faces(cfg, dir)`. The +7.477 GB delta is batch-invariant (weights stream once); the served face sum equals a live load_hf's resident bytes to the integer, 24,436,981,888 B, asserted `==` not within a band. Header-only, no GPU; measured ms columns stay pending-remote. — [wins/2026-09-11-decode-tick-weight-bytes-come-from-the-checkpoint.md](docs/experience/wins/2026-09-11-decode-tick-weight-bytes-come-from-the-checkpoint.md)
 
 ## 2026-09-10
