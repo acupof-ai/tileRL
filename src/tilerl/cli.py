@@ -755,7 +755,20 @@ def _train_adapters(args: argparse.Namespace) -> None:
     real = args.model == "qwen38-27b"
     log = _progress(args.json)
     tok = _qwen38_tokenizer() if real else get_tokenizer(None)
-    rows, eval_rows = _jsonl(args.data), _jsonl(args.eval_gsm8k)[: args.eval_n]
+    rows = _jsonl(args.data)
+    _eval_all = _jsonl(args.eval_gsm8k)
+    # Held-out means held-out: every CLI gate test once passed the SAME file to
+    # --data and --eval-gsm8k, so the encoded gate was green at a contamination
+    # fraction of 1.0 and no check asserted the eval was a distinct slice. Check
+    # the FULL eval file, not the eval_n slice: a prompt scored later must not be
+    # a prompt the policy trained on, whichever row --eval-n kept.
+    if rows and _eval_all:
+        train_q = {r.get("prompt") for r in rows}
+        overlap = sum(1 for r in _eval_all if r.get("prompt") in train_q)
+        if overlap:
+            sys.exit(f"error: --eval-gsm8k shares {overlap} prompts with --data; "
+                     "the eval arm must be held out from training")
+    eval_rows = _eval_all[: args.eval_n]
     thinking = (args.max_think_tokens > 0) if real else None
     params = sampling(tok, thinking, args.max_new_tokens, temperature=args.temperature,
                       max_think_tokens=args.max_think_tokens, seed=args.seed)
@@ -787,6 +800,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
         # float although the help calls it a switch -- narrowing the type would change every
         # already-recorded id and orphan those runs' manifests.
         "length_penalty": args.length_penalty,
+        # In the id: with the judge on, judged ordering replaces the length-shaped
+        # reward inside saturated groups, so a judge run is a different reward.
+        "judge": args.judge,
         "eval_max_new_tokens": args.eval_max_new_tokens,
         "load_adapter": file_hash(args.load_adapter) if args.load_adapter else None,
         "eval_gsm8k": file_hash(args.eval_gsm8k) if args.eval_gsm8k else None,

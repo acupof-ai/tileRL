@@ -89,8 +89,10 @@ def test_zero_steps_writes_eval_manifest(tmp_path, monkeypatch, mode):
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
     data = tmp_path / "eval.jsonl"
     data.write_text('{"prompt": "1+1?", "answer": "2"}\n')
+    held = tmp_path / "held.jsonl"
+    held.write_text('{"prompt": "3+3?", "answer": "6"}\n')
     assert _train([mode, "--model", "tiny", "--steps", "0", "--data", str(data),
-                   "--eval-gsm8k", str(data), "--eval-max-new-tokens", "4"]) == 0
+                   "--eval-gsm8k", str(held), "--eval-max-new-tokens", "4"]) == 0
     (m,) = list_runs(tmp_path / "runs")
     assert m["finished"] and isinstance(m["metrics"]["gsm8k_after"], int)
     assert m["metrics"]["gsm8k_after_tokens"] > 0
@@ -110,9 +112,11 @@ def test_train_cli_writes_manifest_and_is_idempotent(tmp_path, monkeypatch, caps
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
     data = tmp_path / "d.jsonl"
     data.write_text('{"prompt": "1+1?", "answer": "2"}\n{"prompt": "2+2?", "answer": "4"}\n')
+    held = tmp_path / "held.jsonl"
+    held.write_text('{"prompt": "3+3?", "answer": "6"}\n{"prompt": "4+4?", "answer": "8"}\n')
     # --allow-short-rollouts: max_new_tokens 4 is deliberately below any real
     # completion here, which is exactly what the length guard refuses.
-    argv = ["--rl", "--data", str(data), "--eval-gsm8k", str(data), "--steps", "2",
+    argv = ["--rl", "--data", str(data), "--eval-gsm8k", str(held), "--steps", "2",
             "--group", "2", "--max-new-tokens", "4", "--lora-rank", "4",
             "--allow-short-rollouts"]
     code = _train(argv)
@@ -260,7 +264,9 @@ def test_the_eval_curve_records_the_step_a_score_was_reached_at(tmp_path, monkey
     monkeypatch.setenv("TILERL_RUNS", str(tmp_path / "runs"))
     data = tmp_path / "d.jsonl"
     data.write_text('{"prompt": "1+1?", "answer": "2"}\n{"prompt": "2+2?", "answer": "4"}\n')
-    argv = ["--rl", "--data", str(data), "--eval-gsm8k", str(data), "--steps", "4",
+    held = tmp_path / "held.jsonl"
+    held.write_text('{"prompt": "3+3?", "answer": "6"}\n{"prompt": "4+4?", "answer": "8"}\n')
+    argv = ["--rl", "--data", str(data), "--eval-gsm8k", str(held), "--steps", "4",
             "--group", "2", "--max-new-tokens", "4", "--lora-rank", "4",
             "--allow-short-rollouts", "--eval-max-new-tokens", "4"]
     _train([*argv, "--eval-every", "2", "--eval-curve-n", "2"])
