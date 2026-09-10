@@ -178,7 +178,20 @@ def arm_accuracy(cfg, model, backend, prompt, n_new: int) -> tuple[dict, object]
     }, ref_eng
 
 
-def arm_decode(cfg, model, backend, ctx: int, n_new: int, batch: int = 1) -> dict:
+def _served_weight_bytes(cfg, model, checkpoint: str | None) -> int:
+    """Served weight bytes across every device face (the ceiling's W). From the
+    checkpoint headers via model.checkpoint_weight_faces (the plan weights row);
+    falls back to summing the loaded params' storage when no path is given."""
+    if checkpoint:
+        from tilerl.model import checkpoint_weight_faces
+        from tilerl.precision import nbytes
+        return sum(nbytes(fmt, shape)
+                   for shape, fmt in checkpoint_weight_faces(cfg, checkpoint).values())
+    return sum(t.numel() * t.element_size() for t in model.params.values())
+
+
+def arm_decode(cfg, model, backend, ctx: int, n_new: int, batch: int = 1,
+               checkpoint: str | None = None) -> dict:
     """Decode tok/s at one (context, batch), fp8 pool against bf16, same engine and prompts.
 
     Reports the KV share of a tick's bytes and the resulting CEILING before the measured
@@ -223,7 +236,7 @@ def arm_decode(cfg, model, backend, ctx: int, n_new: int, batch: int = 1) -> dic
             "blocks_total": eng2.usable_blocks,
         }
         _release(eng2)
-    weight_bytes = sum(t.numel() * t.element_size() for t in model.params.values())
+    weight_bytes = _served_weight_bytes(cfg, model, checkpoint)
     kb, kf = out["bf16"]["kv_bytes_at_ctx"], out["fp8"]["kv_bytes_at_ctx"]
     out["weight_bytes"] = weight_bytes
     out["kv_share_of_tick_bytes_bf16"] = kb / (weight_bytes + kb)
@@ -378,7 +391,8 @@ def main() -> int:
         for ctx in a.decode_ctx:
             for batch in a.decode_batch:
                 key = f"decode_{ctx}_b{batch}"
-                results[key] = arm_decode(cfg, model, be, ctx, a.new_tokens, batch)
+                results[key] = arm_decode(cfg, model, be, ctx, a.new_tokens, batch,
+                                          checkpoint=a.source)
                 d = results[key]
                 print(f"\n{key}: KV is {d['kv_share_of_tick_bytes_bf16']:.1%} of a DECODE "
                       f"tick's bytes bf16 / {d['kv_share_of_tick_bytes_fp8']:.1%} fp8, so the "

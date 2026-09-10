@@ -24,6 +24,13 @@ on **both** shapes.
 | micro=32 GROUP=1 | 0.972 | 0.66× | 1.051 | 0.62× |
 | micro=32 GROUP=4 | 0.981 | 0.66× | 1.055 | 0.62× |
 
+> **Re-derived 2026-09-11 (cost model):** the TB/s numerator was a hand product
+> (nibbles + f32/16, omitting the per-output-row scale). The probe now prices
+> weight bytes through `precision.nbytes(nvfp4_dev)`, which adds one f32/output row:
+> weight bytes rise ~0.03% (down 63.76 vs 63.74 MiB/stream), moving every TB/s
+> value by that same negligible amount — the vs-(8,4) ratios and both FAIL verdicts
+> are unchanged. The values above are the original hand-numerator run.
+
 - **Gate A: FAIL.** No arm beats the shipped (8,4) on either shape. Wider loads
   are monotonically **slower**: micro=16 loses ~10%, micro=32 loses ~35%.
 - **Gate B: FAIL.** Best down_proj (the shipped arm) is 45.1 µs vs Marlin's

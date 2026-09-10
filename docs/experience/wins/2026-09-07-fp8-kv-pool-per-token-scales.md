@@ -69,6 +69,13 @@ the measured figure; my first set used the on-disk number and overstated all of 
 | B=8 ctx=32k | 41.3% | **1.255x** | 1.380x |
 | B=32 ctx=32k | 73.8% | **1.570x** | 1.699x |
 
+> **Re-derived 2026-09-11 (cost model):** the weight denominator is now produced by
+> `model.checkpoint_weight_faces` (plan weights row), which the probe reads with
+> `--source`; it sums to exactly **24,436,981,888 B** — the same number the
+> model-storage sum gave — so every ceiling above (1.011/1.041/1.079/1.255/1.570x)
+> is unchanged (delta <0.01%); only the source moved from a tensor sum to the
+> single Format-derived face map. The `(W+kv_bf)/(W+kv_fp8)` formula is unchanged.
+
 A resident footprint is not a file size, and a ratio built on the wrong denominator is
 wrong in the direction that flatters the change.
 

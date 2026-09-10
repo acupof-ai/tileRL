@@ -100,14 +100,33 @@ sys.path[:0] = [f"{os.environ['REMOTE_DIR']}/src",
 
 import numpy as np  # noqa: E402
 
-#: measured 2026-09-08 on the live card: 24436981888 bytes resident after load, which is
-#: the served NVFP4 weights plus their scale planes -- not the ~12.6 GiB on disk.
-_WEIGHT_GIB = 22.76
+#: measured 2026-09-08 on the live card: 24436981888 bytes resident after load. Fallback
+#: for the ceiling denominator; with --checkpoint the bytes come from
+#: model.checkpoint_weight_faces (plan's weights row), which equals this on the 27B.
+#: Bytes are the served DEVICE faces (incl. embed/norm), not the ~12.6 GiB on disk.
+_WEIGHT_GIB_FALLBACK = 22.76
+_WEIGHT_BYTES_MEASURED = 24_436_981_888
 #: H20 HBM3 nameplate. A nameplate, so the ceiling it gives is optimistic by design.
 _HBM_TBS = 4.0
 
 
-def _ceiling_tok_s(batch: int) -> float:
+def _weight_bytes(cfg, checkpoint: str | None) -> int:
+    """Served weight bytes across every device face (incl. embed/norm), the ceiling's
+    denominator. From checkpoint headers (the plan weights row) when a path is given,
+    else the measured constant."""
+    if not checkpoint:
+        return int(_WEIGHT_GIB_FALLBACK * 1024**3)
+    from tilerl.model import checkpoint_weight_faces
+    from tilerl.precision import nbytes
+    total = sum(nbytes(fmt, shape)
+                for shape, fmt in checkpoint_weight_faces(cfg, checkpoint).values())
+    assert total == _WEIGHT_BYTES_MEASURED, (
+        f"served weight bytes {total} != measured {_WEIGHT_BYTES_MEASURED}; the checkpoint "
+        "face map changed — re-derive the ceiling, do not reuse the constant")
+    return total
+
+
+def _ceiling_tok_s(batch: int, weight_bytes: int) -> float:
     """Aggregate tok/s if the only cost were streaming the weights once per TICK.
 
     Once per tick, not once per token: a decode tick reads the weight set one time and
@@ -115,7 +134,7 @@ def _ceiling_tok_s(batch: int) -> float:
     by the batch instead of multiplying gives the B=1 figure and understates the ceiling
     8-fold at B=8.
     """
-    gb = _WEIGHT_GIB * 1024 ** 3 / 1e9
+    gb = weight_bytes / 1e9
     return batch / (gb / (_HBM_TBS * 1000))
 
 
@@ -184,6 +203,10 @@ def main() -> int:
                          "time; without this the async launch bills the forward to "
                          "whichever phase first reads a tensor on the host")
     ap.add_argument("--out", default="/work/rollout_breakdown.json")
+    ap.add_argument("--checkpoint", default=None,
+                    help="27B checkpoint dir: derive the weight denominator from its "
+                         "served device faces (plan weights row); without it the measured "
+                         "24.44 GB constant is used")
     args = ap.parse_args()
 
     from tilerl_kernels.backend import get_backend
@@ -195,6 +218,8 @@ def main() -> int:
 
     backend = get_backend()
     cfg, model = _build_model("qwen38-27b", seed=0, keep_master=True)
+    weight_bytes = _weight_bytes(cfg, args.checkpoint)
+    weight_gib = weight_bytes / 1024**3
     ctx = args.gen + 512
     # The shipped training shape (cli.py:570-574), not a probe-specific one: a different
     # engine config is a different measurement, and this one is meant to explain a
@@ -263,7 +288,7 @@ def main() -> int:
         )
     w = sum(r["wall_s"] for r in pooled)
     tot = sum(r["tokens"] for r in pooled)
-    ceiling = _ceiling_tok_s(args.group)
+    ceiling = _ceiling_tok_s(args.group, weight_bytes)
     agg = tot / w
     print(f"\npooled over {len(pooled)} steps: {agg:.2f} tok/s aggregate")
     print(f"weight-stream ceiling at B={args.group}: {ceiling:.2f} tok/s"
@@ -286,19 +311,19 @@ def main() -> int:
     # rather than letting a self-consistent table stand.
     ticks = sum(r["calls"].get("_run_forward", 0) for r in pooled)
     fwd_ms = 1000 * sum(r["phases"].get("_run_forward", 0.0) for r in pooled) / max(ticks, 1)
-    floor_ms = _WEIGHT_GIB * 1024 ** 3 / 1e9 / (_HBM_TBS * 1000) * 1000
+    floor_ms = weight_bytes / 1e9 / (_HBM_TBS * 1000) * 1000
     print(f"\nforward {fwd_ms:.2f} ms/tick vs weight-stream floor {floor_ms:.2f} ms/tick")
     if args.sync_forward:
         assert fwd_ms >= floor_ms, (
             f"forward billed {fwd_ms:.2f} ms/tick, below the {floor_ms:.2f} ms needed to "
-            f"read {_WEIGHT_GIB:.2f} GiB at {_HBM_TBS} TB/s -- impossible, so the timer is "
+            f"read {weight_gib:.2f} GiB at {_HBM_TBS} TB/s -- impossible, so the timer is "
             "still not measuring the forward even with the sync in place"
         )
 
     with open(args.out, "w") as f:
         json.dump({"rows": rows, "aggregate_tok_s": agg, "ceiling_tok_s": ceiling,
                    "ratio_to_ceiling": agg / ceiling, "share": share,
-                   "weight_gib": _WEIGHT_GIB, "hbm_tbs": _HBM_TBS}, f, indent=1)
+                   "weight_bytes": weight_bytes, "weight_gib": weight_gib, "hbm_tbs": _HBM_TBS}, f, indent=1)
     print(f"\nwrote {args.out}")
     return 0
 
