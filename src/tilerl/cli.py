@@ -198,6 +198,50 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
     return engine_mod.build_engine(cfg, model, backend, **kw)
 
 
+def _dry_run_checkpoint(args, backend) -> None:
+    """--dry-run --checkpoint DIR: price the ledger from the safetensors HEADERS alone.
+    No model load, no engine, no card — the 27B query runs on a GPU-less Mac. Weights are
+    the device-face bytes precision.checkpoint_weight_specs derives (the only source that
+    sees the mixed nvfp4/fp8 population); blocks are fitted arithmetically from
+    --device-free, so there is no measured column to reconcile against."""
+    import torch as _torch
+
+    from . import config as config_mod
+    from .memory import _state_bytes, fit_num_blocks, plan, weight_row_specs
+    from .precision import checkpoint_weight_specs, f32
+
+    cfg = {"tiny": config_mod.tiny, "tiny-agent": lambda: config_mod.tiny(65536),
+           "qwen38-27b": config_mod.qwen38_27b}[args.model]()
+    specs = checkpoint_weight_specs(args.checkpoint)
+    if args.device_free is not None:
+        device_free = args.device_free
+    elif backend.device.type == "cuda":
+        device_free = int(_torch.cuda.mem_get_info()[0])
+    else:
+        sys.exit("error: --dry-run budget rows need --device-free BYTES off CUDA "
+                 "(there is no card to read mem_get_info from)")
+    # build_engine fits the KV pool from mem_get_info AFTER the weights and GDN state pool
+    # are resident; subtract both so the arithmetic fit sees the same free. spec_steps=0:
+    # a header-only query prices no draft.
+    fixed = weight_row_specs(specs).n + _state_bytes(cfg, args.slots, f32)
+    free_after_fixed = max(0, device_free - fixed)
+    kv_fp8 = {"e4m3": _torch.float8_e4m3fn, "e5m2": _torch.float8_e5m2}.get(args.kv_fp8)
+    num_blocks = args.blocks or fit_num_blocks(cfg, free_after_fixed, _torch.bfloat16, kv_fp8)
+    rows = plan(cfg, None, free_after_fixed, num_slots=args.slots, num_blocks=num_blocks,
+                state_dtype=_torch.float32, kv_io=_torch.bfloat16, kv_fp8=kv_fp8,
+                explicit_state_budget=args.state_bytes, dram_budget=args.dram_bytes,
+                ckpt_specs=specs)
+    out = [{"tier": r.tier, "owner": r.owner, "bytes": r.n, "note": r.note,
+            "measured": None, "delta": None} for r in rows]
+    if args.json:
+        print(json.dumps(out, indent=1))
+    else:
+        print(f"tilerl serve --dry-run: model={cfg.name} checkpoint={args.checkpoint} "
+              f"target={backend.target} device_free {device_free/1e6:.0f} MiB")
+        for r in out:
+            print(f"  {r['owner']:<24} {r['bytes']/1e6:10.2f} MiB {r['note']}")
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     import uvicorn
     from tilerl_kernels.backend import get_backend
@@ -205,6 +249,12 @@ def cmd_serve(args: argparse.Namespace) -> None:
     from .server import create_app, get_tokenizer
 
     backend = get_backend()
+    if args.checkpoint:
+        if not args.dry_run:
+            sys.exit("error: --checkpoint is a --dry-run header-only query; "
+                     "drop --checkpoint to serve a built-in model")
+        _dry_run_checkpoint(args, backend)
+        return
     cfg, model = _build_model(args.model, seed=0, fuse_projections=True)
     draft = None
     if args.draft:
@@ -1822,6 +1872,10 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_serve.add_argument("--device-free", type=int, default=None,
                          help="free device bytes for --dry-run budget rows; required off CUDA "
                               "(defaults to mem_get_info on CUDA)")
+    p_serve.add_argument("--checkpoint", default="", metavar="DIR",
+                         help="with --dry-run: price the ledger from this checkpoint's "
+                              "safetensors headers only (no load, no card); weights come "
+                              "from the real nvfp4/fp8 tensor names, not config")
     p_serve.add_argument("--json", action="store_true",
                          help="with --dry-run, print the memory rows as JSON")
     p_serve.add_argument("--host", default="127.0.0.1")

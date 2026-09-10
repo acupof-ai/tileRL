@@ -156,6 +156,89 @@ def test_plan_budget_rows_are_arithmetic_without_a_card():
     assert by["prefix_entries_budget"] == 1000 // 4
 
 
+def test_plan_weights_row_from_checkpoint_specs_matches_header_bytes(tmp_path):
+    """The header-only weights row prices the real device-face population (nvfp4 packed
+    + fp8-block + bf16) through nbytes — no model load, no params dict."""
+    import torch
+    from safetensors.torch import save_file
+
+    from tilerl.memory import plan, weight_row_specs
+    from tilerl.precision import checkpoint_weight_specs, fp8_block_dev, nbytes, nvfp4_dev
+
+    N, K = 128, 64
+    save_file({
+        "m.weight_packed": torch.zeros((N, K // 2), dtype=torch.uint8),
+        "m.weight_scale": torch.zeros((N, K // 16), dtype=torch.float8_e4m3fn),
+        "m.weight_global_scale": torch.zeros(1, dtype=torch.float32),
+        "b.weight": torch.zeros((N, K), dtype=torch.float8_e4m3fn),
+        "b.weight_scale_inv": torch.zeros((1, 1), dtype=torch.float32),
+        "embed.weight": torch.zeros((100, K), dtype=torch.bfloat16),
+    }, str(tmp_path / "model.safetensors"))
+    specs = checkpoint_weight_specs(tmp_path)
+    want = (nbytes(nvfp4_dev, (N, K)) + nbytes(fp8_block_dev, (N, K)) + 100 * K * 2)
+    assert weight_row_specs(specs).n == want
+    cfg, _, _ = _engine()
+    rows = plan(cfg, None, 0, num_slots=1, num_blocks=8, ckpt_specs=specs)
+    assert sum(r.n for r in rows if r.owner == "weights") == want
+
+
+def test_serve_dry_run_checkpoint_is_header_only_and_needs_dry_run(tmp_path, capsys):
+    """--dry-run --checkpoint DIR prices from headers (no load, no engine, measured/delta
+    null); --checkpoint without --dry-run refuses; blocks are fitted, not built."""
+    import json
+
+    import torch
+    from safetensors.torch import save_file
+
+    from tilerl import cli
+    from tilerl.memory import fit_num_blocks, weight_row_specs
+    from tilerl.precision import checkpoint_weight_specs
+
+    save_file({"embed.weight": torch.zeros((100, 64), dtype=torch.bfloat16)},
+              str(tmp_path / "model.safetensors"))
+
+    with pytest.raises(SystemExit, match="--dry-run"):
+        cli.cmd_serve(cli._build_parser().parse_args(
+            ["serve", "--model", "tiny", "--checkpoint", str(tmp_path)]))
+    cli.cmd_serve(cli._build_parser().parse_args(
+        ["serve", "--model", "tiny", "--dry-run", "--checkpoint", str(tmp_path),
+         "--json", "--device-free", "1000000", "--slots", "4"]))
+    rows = json.loads(capsys.readouterr().out)
+    by = {r["owner"]: r for r in rows}
+    cfg, _, _ = _engine()
+    specs = checkpoint_weight_specs(tmp_path)
+    assert by["weights"]["bytes"] == weight_row_specs(specs).n
+    # Header-only: nothing was built, so there is no measured column or delta.
+    assert by["weights"]["measured"] is None and by["weights"]["delta"] is None
+    # build_engine fits AFTER weights and the state pool are resident; the header-only fit
+    # must subtract both before fitting, or it prices blocks the card cannot hold.
+    from tilerl.memory import _state_bytes
+    free_after_fixed = 1000000 - weight_row_specs(specs).n - _state_bytes(cfg, 4, f32)
+    want_blocks = fit_num_blocks(cfg, free_after_fixed, torch.bfloat16)
+    assert by["kv_pool"]["note"] == f"{want_blocks} blocks"
+
+
+def test_27b_checkpoint_weights_row_matches_24_44gb():
+    """Pending-remote: the header-derived weights row on the real 27B equals the measured
+    24.44 GB (errors/2026-09-03-...: 264 nvfp4 + 233 fp8, config cannot see the split).
+    Headers only, no weight bytes. The header-only CLI is exercised the same way:
+
+        TILERL_27B_CKPT=/data00/Qwen3.8-27B-NVFP4 \\
+        uv run tilerl serve --model qwen38-27b --dry-run --checkpoint \"$TILERL_27B_CKPT\" \\
+            --device-free 60000000000
+    """
+    import os
+
+    ckpt = os.environ.get("TILERL_27B_CKPT")
+    if not ckpt:
+        pytest.skip("set TILERL_27B_CKPT to the 27B NVFP4 dir; headers only, no weights")
+    from tilerl.memory import weight_row_specs
+    from tilerl.precision import checkpoint_weight_specs
+
+    total = weight_row_specs(checkpoint_weight_specs(ckpt)).n
+    assert abs(total - int(24.44e9)) < int(0.01e9), f"weights {total / 1e9:.3f} GB != 24.44 GB"
+
+
 def test_serve_dry_run_needs_device_free_off_cuda_and_prints_rows(capsys):
     """--dry-run --json builds, reconciles derived vs measured, and emits the budget rows
     from --device-free; off CUDA the flag is required (no mem_get_info to invent a number)."""
@@ -188,6 +271,8 @@ if __name__ == "__main__":
               test_plan_fp8_pool_row_includes_scale_planes,
               test_draft_pool_is_separate_not_folded_into_kv_pool,
               test_plan_budget_rows_are_arithmetic_without_a_card,
+              test_plan_weights_row_from_checkpoint_specs_matches_header_bytes,
+              test_serve_dry_run_checkpoint_is_header_only_and_needs_dry_run,
               test_serve_dry_run_needs_device_free_off_cuda_and_prints_rows):
         f(None) if f.__code__.co_argcount else f()
-    print("memory ledger: single-formula fit/plan, fp8 scales, budget rows, tiny OK")
+    print("memory ledger: single-formula fit/plan, fp8 scales, checkpoint weights, tiny OK")

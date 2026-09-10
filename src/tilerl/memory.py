@@ -98,16 +98,26 @@ def weight_row(params: dict) -> Row:
     return Row("device", "weights", sum(t.numel() * t.element_size() for t in params.values()))
 
 
+def weight_row_specs(specs: list[tuple[str, tuple, Format]]) -> Row:
+    """The weights row from :func:`precision.checkpoint_weight_specs` (device-face
+    Formats read off safetensors headers) — the only source that sees the 27B's mixed
+    nvfp4/fp8 population, which config and the materialized tiny params cannot."""
+    return Row("device", "weights", sum(nbytes(fmt, shape) for _, shape, fmt in specs))
+
+
 def plan(cfg, params: dict | None, device_free: int, *, num_slots: int, num_blocks: int,
          spec_steps: int = 0, state_dtype=f32, kv_io=bf16, kv_fp8=None,
          explicit_state_budget: int = 0, dram_budget: int = 0,
-         draft_layers: int = 0) -> list[Row]:
+         draft_layers: int = 0, ckpt_specs=None) -> list[Row]:
     """The device rows the engine holds plus the budget rules. ``num_blocks`` is what
-    build_engine built (fitted via fit_num_blocks or explicit). Weights need the
-    materialized params; None leaves them pending. ``draft_layers>0`` adds the draft pool
-    row (its share of every KV block, priced in the block formula)."""
+    build_engine built (fitted via fit_num_blocks or explicit). Weights come from the
+    materialized ``params`` or, for a header-only ``--dry-run --checkpoint`` query, from
+    ``ckpt_specs`` (precision.checkpoint_weight_specs); both None leaves them pending.
+    ``draft_layers>0`` adds the draft pool row (its share of every KV block)."""
     rows: list[Row] = []
-    if params is not None:
+    if ckpt_specs is not None:
+        rows.append(weight_row_specs(ckpt_specs))
+    elif params is not None:
         rows.append(weight_row(params))
     rows.append(Row("device", "state_slots",
                     _state_bytes(cfg, num_slots, _dtype_fmt(state_dtype), spec_steps)))

@@ -76,7 +76,10 @@ blocks and a state slot already counted; it becomes a row only when demoted to
 `stats()["memory"]` returns the same rows with a measured column: on cuda the
 `memory_allocated` difference around each owner's allocation, on cpu the storage
 sum, and `transient = max_memory_allocated - sum(static rows)`. A dry-run mode of
-`tilerl serve` prints the plan as JSON without a card. The gate is
+`tilerl serve` prints the plan as JSON without a card; `--dry-run --checkpoint DIR`
+builds nothing and prices the weights row from `checkpoint_weight_specs(DIR)` (the
+headers, no weight bytes), fitting blocks arithmetically, so the 27B ledger runs on
+a GPU-less machine. The gate is
 `derived == measured` for `weights` and `kv_pool` on the tiny model; a nonzero
 delta on a static row on the 27B is an error entry, not a tolerance. Nothing here
 runs in the tick: `plan` is arithmetic at build time, `stats` reads counters.
