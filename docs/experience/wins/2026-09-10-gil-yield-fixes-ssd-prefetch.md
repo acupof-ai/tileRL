@@ -49,6 +49,15 @@ The SSD-off delta is noise by construction: `has_ssd` is False, so the yield
 never executes. The −2.3% at B=1 is system jitter on a 1.2 ms tick, not the
 fix.
 
+The yield's isolated cost, measured SSD off with the yield forced on vs
+patched out (same tree, same card, everything else equal, raw log
+`/work/bench-gil.log`):
+
+| B | Yield off (tok/s) | Yield forced (tok/s) | Delta | µs/tick |
+|---|---|---|---|---:|
+| 1 | 860.4 | 806.7 | −6.2% | 78 |
+| 8 | 3176.4 | 3103.7 | −2.3% | 59 |
+
 Decode throughput (same slice, **SSD on** — yield executes every tick):
 
 | B | SSD off (tok/s) | SSD on (tok/s) | Delta |
@@ -56,9 +65,21 @@ Decode throughput (same slice, **SSD on** — yield executes every tick):
 | 1 | 860.4 | 799.9 | −7.0% |
 | 8 | 3176.4 | 3082.4 | −3.0% |
 
-The yield costs ~80 µs/tick. On the full 27B model (10–24 ms ticks) this
-extrapolates to ~0.3–0.8%. The SSD-on arm also pays spill writes and tier
-bookkeeping, so the delta is the tier's total cost, not the yield alone.
+The SSD-on delta (88 µs at B=1) is an **upper bound** on the yield: that arm
+also pays spill writes and tier bookkeeping. The isolated measurement above
+is the yield alone.
+
+The 78 µs is not dead overhead. `sleep(0)` itself is 1–5 µs; the remainder
+is the scheduler giving the tier's threads a turn. In the prefetch scenario
+that turn is what lets the reader finish `torch.load` inside the deadline —
+without the yield the cost is 0 µs, and the fetch never completes, so the
+prefetch mechanism consumes no time and delivers no value. The 78 µs is the
+price of the feature running, not a tax paid for nothing; removing the yield
+does not save 7%, it disables prefetch.
+
+On the full 27B model (10–24 ms ticks) the isolated 78 µs extrapolates to
+**≤0.8%, estimated, not measured on 27B** — reader contention may differ
+there (larger snapshots, longer loads).
 
 ## Rule
 
