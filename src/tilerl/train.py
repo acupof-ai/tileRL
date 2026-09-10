@@ -286,7 +286,8 @@ def train_step(
 
 
 def group_advantages(rewards: Any, group: int, live: Any = None,
-                     groups: int | None = None) -> np.ndarray:
+                     groups: int | None = None,
+                     signal: Any = None) -> np.ndarray:
     """``(r - mean) / std`` within each group of ``group`` consecutive rollouts;
     a tied group yields zeros (no signal, no division by ~0).
 
@@ -299,6 +300,18 @@ def group_advantages(rewards: Any, group: int, live: Any = None,
     and one empty row turns it into +0.378 on all seven live rows -- gradient
     for being unlike an empty string, which is not a learnable property. It
     also depresses ``tied``, which is P1's criterion.
+
+    ``signal`` is the reward with the length term removed -- the component that
+    can carry within-group ordering. A group whose signal is constant has no
+    ordering left except length, and a length-only gradient is what collapsed
+    the 2026-09-10 P1 run (the length term ran 1.3x the correctness term at
+    step 1 and 2.1x+ after; normalisation cancels the penalty's weight, so the
+    length spread fills the whole advantage). Such a group yields zeros.
+    Constancy is taken over live rows: a failed rollout is not a wrong answer.
+    When the judge (``tiebreak``) is on, the judge scores ARE the signal --
+    correctness is constant in an all-pass group, but a judge that separates
+    the rollouts is exactly the ordering GRPO should learn from. Defaults to
+    ``rewards`` (no zeroing beyond the tie case).
 
     ``groups``, when given, is how many groups the caller believes it is passing,
     and is checked against ``len(rewards) // group``. That check is the point:
@@ -329,7 +342,12 @@ def group_advantages(rewards: Any, group: int, live: Any = None,
     mean = (r * m).sum(axis=1, keepdims=True) / n
     std = np.sqrt((((r - mean) * m) ** 2).sum(axis=1, keepdims=True) / n)
     adv = (r - mean) / np.where(std > 1e-8, std, 1.0)
-    return np.where((std > 1e-8) & m, adv, 0.0).reshape(-1)
+    out = np.where((std > 1e-8) & m, adv, 0.0)
+    s = r if signal is None else np.asarray(signal, dtype=np.float64).reshape(-1, group)
+    hi = np.where(m, s, -np.inf).max(axis=1, keepdims=True)
+    lo = np.where(m, s, np.inf).min(axis=1, keepdims=True)
+    constant = (hi == lo) & (m.sum(axis=1, keepdims=True) > 0)
+    return np.where(constant & m, 0.0, out).reshape(-1)
 
 
 def rl_step(
@@ -484,6 +502,8 @@ def grpo_loop(
     prompts_per_step: int = 1,
     decode: Any = None,
     correctness_fn: Any = None,
+    length_penalty: float = 0.0,
+    length_cap: int = 1,
 ) -> Iterator[tuple[float, float, float, float, float, dict[str, float], int, float | None]]:
     """GRPO: sample ``group`` completions per prompt in one engine batch, score
     them with ``reward_fn(prompt_ids, completion_ids) -> float``, take one
@@ -551,6 +571,7 @@ def grpo_loop(
         timings = {"rollout_secs": time.perf_counter() - t0, "invalidate_secs": 0.0}
         comps = [done[i] for i in ids]
         rewards = [float(reward_fn(picks[owner[i]], c)) for i, c in enumerate(comps)]
+        rew0 = rewards
         # Binary correctness BEFORE the length term, tiebreak, and live mask: the
         # quantity comparable to a lambda=0 run's tied fraction. At lam>0 `tied`
         # above is structurally 0 (continuous rewards never exactly match), so the
@@ -559,6 +580,7 @@ def grpo_loop(
             corr = np.array([float(correctness_fn(picks[owner[i]], c)) for i, c in enumerate(comps)])
             tied_correctness = float((corr.reshape(-1, group) == corr.reshape(-1, group)[:, :1]).all(axis=1).mean())
         else:
+            corr = None
             tied_correctness = None
         # A binary reward stops producing gradient once the policy clears the task.
         # `tied` is that fraction and is the run's health metric: 72% at the 256 cap,
@@ -577,8 +599,19 @@ def grpo_loop(
                 for r in tiebreak(prompt, comps[p * group:(p + 1) * group],
                                   [x > 0.5 for x in rewards[p * group:(p + 1) * group]])
             ]
+        # The non-length component of the reward: what can carry within-group
+        # ordering. With the judge, the scores ARE the signal (a judge that
+        # separates an all-pass group is the ordering to learn); without it,
+        # strip the known length term. A group whose signal is constant is
+        # zeroed inside group_advantages -- a length-only gradient is the P1
+        # collapse (errors/2026-09-10).
+        if tiebreak is not None:
+            signal = rewards
+        else:
+            signal = [r - length_penalty * len(c) / length_cap
+                      for r, c in zip(rew0, comps)]
         adv = group_advantages(rewards, group, live=[len(c) > 0 for c in comps],
-                               groups=prompts_per_step)
+                               groups=prompts_per_step, signal=signal)
         # Per GROUP, then averaged: `tied` has always meant "the fraction of groups with
         # no signal", and at prompts_per_step > 1 a step holds several. The step-level
         # quantity -- was this step gradient-free at all -- is `tied == 1.0`, which a

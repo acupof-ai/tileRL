@@ -1187,7 +1187,9 @@ def _train_adapters(args: argparse.Namespace) -> None:
                                     trainable=trainable, micro=args.micro,
                                     tiebreak=tiebreak, recapture_graph=True,
                                     per_rollout=rollouts, decode=tok.decode,
-                                    correctness_fn=correctness if rows else None)):
+                                    correctness_fn=correctness if rows else None,
+                                    length_penalty=args.length_penalty,
+                                    length_cap=max(int(args.max_new_tokens), 1))):
             hist.append((r, ce, secs, tied, ntok, tied_c))
             train_secs += secs
             written = _write_rollout_rows(manifest["id"], rollouts, written)
