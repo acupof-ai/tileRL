@@ -70,6 +70,40 @@ def calibration(rows: list[dict], device_name: str) -> dict | None:
     }
 
 
+RESIDENT_METRIC = "device_resident_bytes"
+
+
+def device_sections(rows: list[dict]) -> list[dict]:
+    """One ledger section per device named in the store, first-seen order: its newest
+    calibration pair and newest residency row, each via :func:`latest_floor` (exact device
+    name, superseded skipped). A never-recorded sub-field is None so a half-populated card
+    renders pending-remote. Render-only; it never divides by the floor."""
+    names, seen = [], set()
+    for r in rows:
+        name = r.get("device", {}).get("name")
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+
+    def pair(r) -> dict | None:
+        return None if r is None else {
+            "value": r["value"], "commit": r.get("commit"), "date": r.get("date")}
+
+    out = []
+    for name in names:
+        res = latest_floor(rows, RESIDENT_METRIC, name)
+        out.append({
+            "device": name,
+            "hbm_bw_gbs": pair(latest_floor(rows, BW_METRIC, name)),
+            "bf16_peak_tflops": pair(latest_floor(rows, PEAK_METRIC, name)),
+            "residency": None if res is None else {
+                "peak": res["value"], "static": res["shape"]["static"],
+                "transient": res["shape"]["transient"],
+                "commit": res.get("commit"), "date": res.get("date")},
+        })
+    return out
+
+
 def bound_seconds(bytes_: int, flops: int, bw_gbs: float, peak_tflops: float) -> float:
     """The roofline lower bound in seconds: max of the byte time and the flop time.
     Pure arithmetic — the one column the CPU gate pins to an exact number."""
