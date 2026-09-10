@@ -3,6 +3,10 @@
 One line per event — phase exit, default flip, accept-or-reject verdict — with
 its `docs/experience/` entry. Newest first.
 
+## 2026-09-11
+
+- **phase exit (CPU)** — the GDN context-parallel layer now has a tape gradient: the span `(A,B)`, the affine prefix scan and the `a_pre @ state + b_pre` start run as one `gdn_cp` op with a matching reverse, so CP training's state gradient is no longer silently dropped. World2 numerical gradcheck through the real Tape vs a single-process sequential oracle: all 11 leaves ≤4.3e-4, with decay-a and no-scan wrong-reverse controls going red. Scope is conv kernel 1 (zero halo); the 27B's kernel-4 cross-rank conv-halo adjoint is the next PR and q/k/v under it are not yet gradchecked (`gdn_cp_bwd` raises on a nonzero window). — [wins/2026-09-11-gdn-cp-tape-end-to-end.md](docs/experience/wins/2026-09-11-gdn-cp-tape-end-to-end.md)
+
 ## 2026-09-10
 
 - **default flip (pending-remote)** — the P1 retry recipe `grpo-gsm8k-27b` turns the self-judge on (`judge=True`) and raises the rollout cap 256 → 512. Under `--judge` tests split pass/fail first and the policy's pairwise ordering only ranks inside those bands, so the ~60% correctness-saturated groups carry gradient again without a wrong answer ever outranking a right one; the length term never reaches the advantage on that path (and #443 already zeroes constant-signal groups off it). Also: `judge` enters the manifest id, and `--eval-gsm8k` now refuses prompts shared with `--data` (the held-out gate was green at 100% contamination). Mechanism prediction is **flat / no collapse** (the judge rescues all-correct groups' style gradient; the missed questions sit in mixed groups the binary reward already penalizes), so clearing +25/500 rests on the unmeasured transfer hypothesis — the +25/500 gate stays the verdict, flat-non-collapsed is the success bar. Acceptance is a two-seed pod pair. — [wins/2026-09-10-the-p1-retry-recipe-turns-the-self-judge-on.md](docs/experience/wins/2026-09-10-the-p1-retry-recipe-turns-the-self-judge-on.md)

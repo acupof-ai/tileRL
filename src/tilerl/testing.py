@@ -159,6 +159,20 @@ class RefBackend:
         return [None if c == 0 else parts[owner[c - 1][0]][owner[c - 1][1]]
                 for c in ids_by_rank[self.cp_rank]]
 
+    def gdn_cp(self, q, k, v, g, beta, state, *, conv_windows, chunk_ids, **kw):
+        from tilerl_kernels import reference
+
+        return reference.gdn_cp(
+            q, k, v, g, beta, state, pg=self._cp_pg, rank=self.cp_rank,
+            world=self.cp_world, conv_windows=conv_windows, chunk_ids=chunk_ids, **kw)
+
+    def gdn_cp_bwd(self, grad, q, k, v, g, beta, state, *, conv_windows, chunk_ids, **kw):
+        from tilerl_kernels import reference
+
+        return reference.gdn_cp_bwd(
+            grad, q, k, v, g, beta, state, pg=self._cp_pg, rank=self.cp_rank,
+            world=self.cp_world, conv_windows=conv_windows, chunk_ids=chunk_ids, **kw)
+
     def __getattr__(self, name):
         if name in _REF_OPS:
             from tilerl_kernels import reference

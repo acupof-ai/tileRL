@@ -540,6 +540,72 @@ def gdn_span_ab_raw(q, k, v, g, beta, state_shape, *, conv1d_weight, dt_bias, a_
     return gdn_span_ab(qn, kn, v_raw, bt, gt, chunk=chunk)
 
 
+def gdn_span_ab_bwd(ga, gb, qc, kc, vc, bc, gtc, chunk: int = 64):
+    """Reverse of :func:`gdn_span_ab`: cotangents of the whole span's composed
+    ``(A, B)`` -> cotangents of its prepped inputs ``(qc, kc, vc, bc, gtc)``.
+
+    A span is a chain of affine pairs composed ``(a_i A, a_i B + B_i)``, where chunk
+    i's pair is read off a ZERO-state run (the span runs ``B`` from zero). Replay those
+    runs to save each cache and its exclusive prefix ``(A, C)``; walk back with
+    ``ga_i = ga A^T + gb C^T``, ``gb_i = gb``, feeding ``gb_i`` as the chunk's state-out
+    cotangent (``B_i = s_next`` at zero state) and ``ga_i`` as its span-operator
+    cotangent, then propagate ``(ga, gb) <- a_i^T (ga, gb)``.
+    """
+    b, t, hv, dk = qc.shape
+    dv = vc.shape[-1]
+    dev, dt = qc.device, qc.dtype
+    eye = torch.eye(dk, dtype=dt, device=dev).expand(b, hv, dk, dk).contiguous()
+
+    caches, ais, pref = [], [], []
+    A, C = eye, torch.zeros(b, hv, dk, dv, dtype=dt, device=dev)
+    for c0 in range(0, t, chunk):
+        sl = slice(c0, min(c0 + chunk, t))
+        z = torch.zeros(b, hv, dk, dv, dtype=dt, device=dev)
+        _, Bi, cache = _gdn_chunk_fwd(qc[:, sl], kc[:, sl], vc[:, sl],
+                                      bc[:, sl], gtc[:, sl], z)  # s_next at s=0 is B_i
+        ai = torch.exp(cache["glast"]).unsqueeze(-1).unsqueeze(-1) * eye \
+            - cache["R"].transpose(-1, -2) @ cache["W"]
+        caches.append((sl, cache))
+        ais.append(ai)
+        pref.append((A, C))
+        A, C = ai @ A, ai @ C + Bi
+
+    gqc = torch.zeros_like(qc)
+    gkc = torch.zeros_like(kc)
+    gvc = torch.zeros_like(vc)
+    gbc = torch.zeros_like(bc)
+    ggtc = torch.zeros_like(gtc)
+    for i in range(len(caches) - 1, -1, -1):
+        sl, cache = caches[i]
+        pA, pC = pref[i]
+        gai = ga @ pA.mT + gb @ pC.mT
+        dq, dk_, dv_, db_, dg_, _ = _gdn_chunk_bwd(
+            torch.zeros_like(vc[:, sl]), gb, qc[:, sl], kc[:, sl], vc[:, sl],
+            bc[:, sl], cache, d_ai=gai)
+        gqc[:, sl] += dq
+        gkc[:, sl] += dk_
+        gvc[:, sl] += dv_
+        gbc[:, sl] += db_
+        ggtc[:, sl] += dg_
+        ga, gb = ais[i].mT @ ga, ais[i].mT @ gb
+    return gqc, gkc, gvc, gbc, ggtc
+
+
+def gdn_span_ab_raw_bwd(ga, gb, q, k, v, g, beta, state_shape, *, conv1d_weight,
+                        dt_bias, a_log, chunk: int = 64):
+    """Reverse of :func:`gdn_span_ab_raw`: cotangents of the span's ``(A, B)`` back
+    onto the RAW projections and the prep params. Exact for a zero conv window only
+    (the path training starts from). Returns (gq, gk, gv, gg, gbeta, gconv1d,
+    gdt_bias, ga_log)."""
+    key_dim = state_shape[2]
+    sv = _gdn_prep_save(q, k, v, g, beta, key_dim, conv1d_weight, dt_bias, a_log)
+    # gdn_span_ab runs on the KEY-head prepped tensors (no repeat_interleave; it ignores
+    # the q/value pairing the token output needs), so its cotangents are already nkh-headed.
+    g_qn, g_kn, g_v, g_bt, g_gt = gdn_span_ab_bwd(
+        ga, gb, sv["qn"], sv["kn"], sv["v_raw"], sv["bt"], sv["gt"], chunk=chunk)
+    return _gdn_prep_backward(sv, g_qn, g_kn, g_v, g_bt, g_gt)
+
+
 def _scan_gather_pairs(a, b, pg, rank: int, world: int, chunk_ids=None):
     """Every rank's affine pairs, all-gathered and folded to SEQUENCE order.
 
@@ -659,6 +725,100 @@ def affine_prefix_scan_bwd(goa, gob, a, b, pg, rank: int, world: int, chunk_ids=
     return ga, gb
 
 
+def gdn_cp(q, k, v, g, beta, state, *, z, conv1d_weight, dt_bias, a_log, norm_weight,
+           conv_windows, pg, rank, world, chunk_ids, chunk=64):
+    """One GDN layer on a context-parallel rank: the affine-scan forward in one op so
+    the whole thing records as a single tape entry. Mirrors the layout the model
+    builds: each of this rank's chunks starts from the exclusive prefix
+    ``s_in = a_pre @ state + b_pre`` (zigzag assignment given by ``chunk_ids``).
+
+    Returns the local outputs re-joined in this rank's order, and the (state, window)
+    of its LAST chunk in sequence order. The chunk token outputs run through the
+    ordinary :func:`gdn_forward`; only the incoming state is CP-specific."""
+    state = _f32(state)
+    half = q.shape[1] // len(chunk_ids)
+    parts = [slice(i * half, (i + 1) * half) for i in range(len(chunk_ids))]
+    ab = [gdn_span_ab_raw(
+              q[:, s], k[:, s], v[:, s], g[:, s], beta[:, s], state.shape,
+              conv1d_weight=conv1d_weight, dt_bias=dt_bias, a_log=a_log,
+              conv_window=conv_windows[i], chunk=chunk)
+          for i, s in enumerate(parts)]
+    a_pre, b_pre = affine_prefix_scan(
+        torch.stack([x[0] for x in ab]), torch.stack([x[1] for x in ab]),
+        pg, rank, world, chunk_ids)
+    outs, last = [], None
+    s_in = []
+    for i, s in enumerate(parts):
+        si = a_pre[i] @ state + b_pre[i]
+        s_in.append(si)
+        o, st, win = gdn_forward(
+            q[:, s], k[:, s], v[:, s], g[:, s], beta[:, s], si, z=z[:, s],
+            conv1d_weight=conv1d_weight, dt_bias=dt_bias, a_log=a_log,
+            norm_weight=norm_weight, conv_window=conv_windows[i])
+        outs.append(o)
+        if last is None or chunk_ids[i] > last[0]:
+            last = (chunk_ids[i], st, win)
+    return torch.cat(outs, dim=1), last[1], last[2]
+
+
+def gdn_cp_bwd(grad, q, k, v, g, beta, state, *, z, conv1d_weight, dt_bias, a_log,
+               norm_weight, conv_windows, pg, rank, world, chunk_ids, chunk=64):
+    """Reverse of :func:`gdn_cp`. Each chunk's token-output cotangent runs the ordinary
+    :func:`gdn_backward` from its scanned start state, yielding ``dS_in``. The incoming
+    state ``s_in = a_pre state + b_pre`` sends cotangent onto the scanned pair
+    (``dA = dS_in @ state^T``, ``dB = dS_in``); :func:`affine_prefix_scan_bwd` carries
+    those across ranks to each span's pair, and :func:`gdn_span_ab_raw_bwd` carries them
+    onto the raw projections. The two paths add on the shared inputs/prep params. The
+    11-tuple order matches :func:`gdn_backward` so the tape maps it with the same kwargs.
+
+    # ponytail: exact only for conv_window == 0; cross-rank halo adjoint (prep reverse
+    # + cp_halo reduce-scatter) is the upgrade — the 27B runs conv kernel 4.
+    """
+    if conv_windows is not None and any(w is not None and bool(w.any()) for w in conv_windows):
+        raise NotImplementedError("gdn_cp_bwd does not support a non-zero conv window yet")
+    state = _f32(state)
+    half = q.shape[1] // len(chunk_ids)
+    parts = [slice(i * half, (i + 1) * half) for i in range(len(chunk_ids))]
+    ab = [gdn_span_ab_raw(
+              q[:, s], k[:, s], v[:, s], g[:, s], beta[:, s], state.shape,
+              conv1d_weight=conv1d_weight, dt_bias=dt_bias, a_log=a_log,
+              conv_window=None, chunk=chunk)
+          for i, s in enumerate(parts)]
+    a_stack = torch.stack([x[0] for x in ab])
+    b_stack = torch.stack([x[1] for x in ab])
+    a_pre, b_pre = affine_prefix_scan(a_stack, b_stack, pg, rank, world, chunk_ids)
+
+    zero = lambda t: torch.zeros_like(t)
+    gq = zero(q); gk = zero(k); gv = zero(v); gg = zero(g); gb = zero(beta)
+    gz = zero(z)
+    g_conv = zero(conv1d_weight); g_dt = zero(dt_bias); g_al = zero(a_log)
+    g_nw = zero(norm_weight)
+    d_state = zero(state)
+    dA_pre, dB_pre = [], []
+    for i, s in enumerate(parts):
+        r = gdn_backward(
+            grad[:, s], q[:, s], k[:, s], v[:, s], g[:, s], beta[:, s],
+            a_pre[i] @ state + b_pre[i], z=z[:, s], conv1d_weight=conv1d_weight,
+            dt_bias=dt_bias, a_log=a_log, norm_weight=norm_weight, conv_window=None)
+        (tq, tk, tv, tg, tb, dS_in, tz, tc, tdt, tal, tnw) = r
+        gq[:, s] += tq; gk[:, s] += tk; gv[:, s] += tv; gg[:, s] += tg; gb[:, s] += tb
+        gz[:, s] += tz
+        g_conv += tc; g_dt += tdt; g_al += tal; g_nw += tnw
+        d_state += a_pre[i].mT @ dS_in
+        dA_pre.append(dS_in @ state.mT)
+        dB_pre.append(dS_in)
+    dA_span, dB_span = affine_prefix_scan_bwd(
+        torch.stack(dA_pre), torch.stack(dB_pre), a_stack, b_stack, pg, rank, world, chunk_ids)
+    for i, s in enumerate(parts):
+        r = gdn_span_ab_raw_bwd(
+            dA_span[i], dB_span[i], q[:, s], k[:, s], v[:, s], g[:, s], beta[:, s],
+            state.shape, conv1d_weight=conv1d_weight, dt_bias=dt_bias, a_log=a_log, chunk=chunk)
+        (sq, sk, sv, sg, sb, sc, sdt, sal) = r
+        gq[:, s] += sq; gk[:, s] += sk; gv[:, s] += sv; gg[:, s] += sg; gb[:, s] += sb
+        g_conv += sc; g_dt += sdt; g_al += sal
+    return gq, gk, gv, gg, gb, d_state, gz, g_conv, g_dt, g_al, g_nw
+
+
 def linear_attn_bwd(
     grad: torch.Tensor,
     q: torch.Tensor,
@@ -715,8 +875,14 @@ def _gdn_chunk_fwd(qc, kc, vc, bc, gtc, s):
                              glast=glast, s=s)
 
 
-def _gdn_chunk_bwd(dout, dS_next, qc, kc, vc, bc, c):
-    """Adjoint of :func:`_gdn_chunk_fwd`: (dq, dk, dv, dbeta, dgt, dS_start) in [B,n,HV,*]."""
+def _gdn_chunk_bwd(dout, dS_next, qc, kc, vc, bc, c, d_ai=None):
+    """Adjoint of :func:`_gdn_chunk_fwd`: (dq, dk, dv, dbeta, dgt, dS_start) in [B,n,HV,*].
+
+    ``d_ai`` (optional) is the cotangent of this chunk's span operator
+    ``a_i = exp(glast) I - R^T W`` (see :func:`gdn_span_ab`). At a zero start state
+    ``s_next = R^T U = B_i``, so the ``dS_next`` path already carries the cotangent of
+    ``B_i``; ``d_ai`` only adds three terms — the ``exp(glast) I`` diagonal and the
+    ``R^T W`` product."""
     e, D, low, tri = c["e"], c["D"], c["low"], c["tri"]
     KK, bp, M, W, d, QK, s = c["KK"], c["bp"], c["M"], c["W"], c["d"], c["QK"], c["s"]
     dOc = dout.permute(0, 2, 1, 3)
@@ -732,8 +898,13 @@ def _gdn_chunk_bwd(dout, dS_next, qc, kc, vc, bc, c):
     dR = d @ dS_next.transpose(-1, -2)
     dd = dd + c["R"] @ dS_next
     d_en = (s * dS_next).sum(dim=(-1, -2))
+    if d_ai is not None:  # a_i = e_n I - R^T W: add its diagonal and R^T W cotangents
+        dR = dR - W @ d_ai.mT
+        d_en = d_en + torch.diagonal(d_ai, dim1=-2, dim2=-1).sum(-1)
     # d = U - W s
     dW = -dd @ s.transpose(-1, -2)
+    if d_ai is not None:
+        dW = dW - c["R"] @ d_ai
     dS = dS - W.transpose(-1, -2) @ dd
     # U = M (b*V), W = M (b*e*K)
     dM = dd @ c["bV"].transpose(-1, -2) + dW @ c["beK"].transpose(-1, -2)
@@ -944,6 +1115,81 @@ def gdn_forward(
 linear_attn_chunk = gdn_forward  # the op name in the backend contract
 
 
+def _gdn_prep_save(q, k, v, g, beta, key_dim, conv1d_weight, dt_bias, a_log):
+    """Prep forward of :func:`gdn_forward` with zero left padding, returning every
+    intermediate the chunk core and the prep adjoint need. Shared by
+    :func:`gdn_backward` and :func:`gdn_cp_bwd` so there is one prep reverse.
+    Keyed dict rather than positional locals: the CP backward calls this per chunk."""
+    b, t, _ = q.shape
+    nvh = g.shape[-1]
+    val_dim = v.shape[-1] // nvh
+    nkh = q.shape[-1] // key_dim
+    kernel = conv1d_weight.shape[1]
+    qkv = torch.cat([q, k, v], dim=-1)
+    preact = torch.zeros_like(qkv)
+    for tap in range(kernel):
+        pad_left = kernel - 1 - tap
+        padded = torch.nn.functional.pad(qkv, (0, 0, pad_left, tap))
+        preact = preact + padded[:, :t, :] * conv1d_weight[:, tap]
+    silu = lambda x: x * torch.sigmoid(x)
+    q_raw = silu(preact[..., : nkh * key_dim]).view(b, t, nkh, key_dim)
+    k_raw = silu(preact[..., nkh * key_dim : 2 * nkh * key_dim]).view(b, t, nkh, key_dim)
+    v_raw = silu(preact[..., 2 * nkh * key_dim :]).view(b, t, nvh, val_dim)
+    rq = torch.rsqrt(q_raw.pow(2).sum(-1, keepdim=True) + 1e-12)
+    rk = torch.rsqrt(k_raw.pow(2).sum(-1, keepdim=True) + 1e-12)
+    qn = q_raw * rq / math.sqrt(key_dim)
+    kn = k_raw * rk
+    bt = torch.sigmoid(beta).view(b, t, nvh)
+    sp_in = g + dt_bias
+    gt = -torch.exp(a_log) * torch.nn.functional.softplus(sp_in)
+    return dict(qkv=qkv, preact=preact, q_raw=q_raw, k_raw=k_raw, v_raw=v_raw, rq=rq, rk=rk,
+                qn=qn, kn=kn, bt=bt, gt=gt, sp_in=sp_in, cw=conv1d_weight, a_log=a_log,
+                nkh=nkh, nvh=nvh, key_dim=key_dim, val_dim=val_dim, kernel=kernel)
+
+
+def _gdn_prep_backward(sv, g_qn, g_kn, g_v_raw, g_bt, g_gt):
+    """Adjoint of :func:`_gdn_prep_save`: prepped-input cotangents ->
+    (gq, gk, gv, gg, gbeta, gconv1d, gdt_bias, ga_log). Zero left-padding path."""
+    qkv, preact, cw, a_log = sv["qkv"], sv["preact"], sv["cw"], sv["a_log"]
+    q_raw, k_raw = sv["q_raw"], sv["k_raw"]
+    rq, rk = sv["rq"], sv["rk"]
+    bt, gt, sp_in = sv["bt"], sv["gt"], sv["sp_in"]
+    nkh, nvh, key_dim, val_dim, kernel = (
+        sv["nkh"], sv["nvh"], sv["key_dim"], sv["val_dim"], sv["kernel"])
+    b, t = qkv.shape[0], qkv.shape[1]
+    g_a_log = (g_gt * gt).sum(dim=(0, 1))
+    g_sp_in = g_gt * (-torch.exp(a_log)) * torch.sigmoid(sp_in)
+    g_g = g_sp_in.reshape(b, t, nvh)
+    g_dt_bias = g_sp_in.sum(dim=(0, 1))
+    g_beta = (g_bt * bt * (1.0 - bt)).reshape(b, t, nvh)
+
+    def _norm_bwd(g_in, x, r, s):  # y = x * r * s, r = rsqrt(sum x^2 + eps)
+        return r * s * g_in - (r**3) * s * x * (g_in * x).sum(-1, keepdim=True)
+
+    g_q_raw = _norm_bwd(g_qn, q_raw, rq, 1.0 / math.sqrt(key_dim))
+    g_k_raw = _norm_bwd(g_kn, k_raw, rk, 1.0)
+    dsilu = torch.sigmoid(preact) * (1.0 + preact * (1.0 - torch.sigmoid(preact)))
+    g_preact = torch.zeros_like(preact)
+    g_preact[..., : nkh * key_dim] = (
+        g_q_raw.reshape(b, t, nkh * key_dim) * dsilu[..., : nkh * key_dim])
+    g_preact[..., nkh * key_dim : 2 * nkh * key_dim] = (
+        g_k_raw.reshape(b, t, nkh * key_dim) * dsilu[..., nkh * key_dim : 2 * nkh * key_dim])
+    g_preact[..., 2 * nkh * key_dim :] = (
+        g_v_raw.reshape(b, t, nvh * val_dim) * dsilu[..., 2 * nkh * key_dim :])
+    g_qkv = torch.zeros_like(qkv)
+    g_conv = torch.zeros_like(cw)
+    for tap in range(kernel):
+        shift = tap - (kernel - 1)
+        lo_q, hi_q = max(0, shift), shift + t
+        lo_g, hi_g = max(0, -shift), t
+        g_qkv[:, lo_q:hi_q, :] += cw[:, tap] * g_preact[:, lo_g:hi_g, :]
+        g_conv[:, tap] = (qkv[:, lo_q:hi_q, :] * g_preact[:, lo_g:hi_g, :]).sum(dim=(0, 1))
+    g_q = g_qkv[..., : nkh * key_dim]
+    g_k = g_qkv[..., nkh * key_dim : 2 * nkh * key_dim]
+    g_v = g_qkv[..., 2 * nkh * key_dim :]
+    return g_q, g_k, g_v, g_g, g_beta, g_conv, g_dt_bias, g_a_log
+
+
 def gdn_backward(
     grad: torch.Tensor,
     q: torch.Tensor,
@@ -981,26 +1227,10 @@ def gdn_backward(
     b, t, _ = q.shape
     nvh, key_dim, val_dim = state.shape[1], state.shape[2], state.shape[3]
     nkh = q.shape[-1] // key_dim
-    kernel = conv1d_weight.shape[1]
 
-    # ---- forward (save intermediates) ----
-    qkv = torch.cat([q, k, v], dim=-1)
-    preact = torch.zeros_like(qkv)
-    for tap in range(kernel):
-        pad_left = kernel - 1 - tap
-        padded = torch.nn.functional.pad(qkv, (0, 0, pad_left, tap))
-        preact = preact + padded[:, :t, :] * conv1d_weight[:, tap]
-    silu = lambda x: x * torch.sigmoid(x)
-    q_raw = silu(preact[..., : nkh * key_dim]).view(b, t, nkh, key_dim)
-    k_raw = silu(preact[..., nkh * key_dim : 2 * nkh * key_dim]).view(b, t, nkh, key_dim)
-    v_raw = silu(preact[..., 2 * nkh * key_dim :]).view(b, t, nvh, val_dim)
-    rq = torch.rsqrt(q_raw.pow(2).sum(-1, keepdim=True) + 1e-12)
-    rk = torch.rsqrt(k_raw.pow(2).sum(-1, keepdim=True) + 1e-12)
-    qn = q_raw * rq / math.sqrt(key_dim)
-    kn = k_raw * rk
-    bt = torch.sigmoid(beta).view(b, t, nvh)
-    sp_in = g + dt_bias
-    gt = -torch.exp(a_log) * torch.nn.functional.softplus(sp_in)
+    # ---- forward (prep shared, then the chunkwise recurrence) ----
+    sv = _gdn_prep_save(q, k, v, g, beta, key_dim, conv1d_weight, dt_bias, a_log)
+    qn, kn, v_raw, bt, gt = sv["qn"], sv["kn"], sv["v_raw"], sv["bt"], sv["gt"]
     rep = nvh // nkh
     assert nkh * rep == nvh, (nkh, nvh)
     knv = kn.repeat_interleave(rep, dim=2)
@@ -1022,7 +1252,7 @@ def gdn_backward(
     z4 = z.view(b, t, nvh, val_dim)
     sz = torch.sigmoid(z4)
 
-    # ---- backward ----
+    # ---- backward: output gating, the chunk recurrence, then the shared prep ----
     go4 = go.reshape(b, t, nvh, val_dim)
     g_normed = go4 * (z4 * sz)
     g_z = (go4 * normed * sz * (1.0 + z4 * (1.0 - sz))).reshape(b, t, nvh * val_dim)
@@ -1045,40 +1275,8 @@ def gdn_backward(
     # value-head grads fold back onto contiguous key-head groups
     g_qn = g_qnv.reshape(b, t, nkh, rep, key_dim).sum(3)
     g_kn = g_knv.reshape(b, t, nkh, rep, key_dim).sum(3)
-    g_a_log = (g_gt * gt).sum(dim=(0, 1))
-    g_sp_in = g_gt * (-torch.exp(a_log)) * torch.sigmoid(sp_in)
-    g_g = g_sp_in.reshape(b, t, nvh)
-    g_dt_bias = g_sp_in.sum(dim=(0, 1))
-    g_beta = (g_bt * bt * (1.0 - bt)).reshape(b, t, nvh)
-
-    def _norm_bwd(g_in, x, r, s):  # y = x * r * s, r = rsqrt(sum(x^2) + eps)
-        return r * s * g_in - (r**3) * s * x * (g_in * x).sum(-1, keepdim=True)
-
-    g_q_raw = _norm_bwd(g_qn, q_raw, rq, 1.0 / math.sqrt(key_dim))
-    g_k_raw = _norm_bwd(g_kn, k_raw, rk, 1.0)
-    sig = torch.sigmoid(preact)
-    dsilu = sig * (1.0 + preact * (1.0 - sig))
-    g_preact = torch.zeros_like(preact)
-    g_preact[..., : nkh * key_dim] = (
-        g_q_raw.reshape(b, t, nkh * key_dim) * dsilu[..., : nkh * key_dim]
-    )
-    g_preact[..., nkh * key_dim : 2 * nkh * key_dim] = (
-        g_k_raw.reshape(b, t, nkh * key_dim) * dsilu[..., nkh * key_dim : 2 * nkh * key_dim]
-    )
-    g_preact[..., 2 * nkh * key_dim :] = (
-        g_v_raw.reshape(b, t, nvh * val_dim) * dsilu[..., 2 * nkh * key_dim :]
-    )
-    g_qkv = torch.zeros_like(qkv)
-    g_conv = torch.zeros_like(conv1d_weight)
-    for tap in range(kernel):
-        shift = tap - (kernel - 1)
-        lo_q, hi_q = max(0, shift), shift + t
-        lo_g, hi_g = max(0, -shift), t
-        g_qkv[:, lo_q:hi_q, :] += conv1d_weight[:, tap] * g_preact[:, lo_g:hi_g, :]
-        g_conv[:, tap] = (qkv[:, lo_q:hi_q, :] * g_preact[:, lo_g:hi_g, :]).sum(dim=(0, 1))
-    g_q = g_qkv[..., : q.shape[-1]]
-    g_k = g_qkv[..., q.shape[-1] : q.shape[-1] + k.shape[-1]]
-    g_v = g_qkv[..., q.shape[-1] + k.shape[-1] :]
+    g_q, g_k, g_v, g_g, g_beta, g_conv, g_dt_bias, g_a_log = _gdn_prep_backward(
+        sv, g_qn, g_kn, g_v_raw, g_bt, g_gt)
     return g_q, g_k, g_v, g_g, g_beta, dS, g_z, g_conv, g_dt_bias, g_a_log, g_norm_weight
 
 

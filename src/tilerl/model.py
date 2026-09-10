@@ -150,13 +150,17 @@ def _gdn_cp(backend, cfg, q, k, v, a_proj, b_proj, state, window, kwargs):
     from a chunk another rank holds.
 
     Under zigzag a rank's tensor is **not one span** — rank 0 of 2 holds chunks 0
-    and 3, so it must be split and each half handled at its own sequence position.
-    Two cross-rank dependencies, both keyed by chunk and not by rank:
+    and 3, so it is split and each half handled at its own sequence position. Two
+    cross-rank dependencies, both keyed by chunk and not by rank:
 
     * the **conv halo**, kernel-1 rows of the chunk before this one. Dropping it
       corrupts the whole chunk rather than its first rows, because the bad k/v
       feed the recurrence (measured 0.61 after the boundary against 0.79 on it).
     * the **incoming state**, from the affine prefix scan over ``(A, B)``.
+
+    The span, scan and per-chunk forwards run as ONE backend op (``gdn_cp``) so the
+    whole affine transfer records as a single tape entry with a matching reverse;
+    only the halo exchange stays outside (forward-only until the halo reverse lands).
 
     Returns this rank's outputs re-joined in its own tensor order, plus the state
     and window of its LAST chunk in sequence order — what the pool should carry.
@@ -170,30 +174,15 @@ def _gdn_cp(backend, cfg, q, k, v, a_proj, b_proj, state, window, kwargs):
     stack = torch.stack([torch.cat([q[:, s], k[:, s], v[:, s]], dim=-1) for s in parts])
     halos = backend.cp_halo(stack, ids_by_rank, cfg.linear_conv_kernel_dim - 1)
 
-    ab = [backend.gdn_span_ab_raw(
-              q[:, s], k[:, s], v[:, s], a_proj[:, s], b_proj[:, s], state.shape,
-              conv1d_weight=kwargs["conv1d_weight"], dt_bias=kwargs["dt_bias"],
-              a_log=kwargs["a_log"], conv_window=halos[i])
-          for i, s in enumerate(parts)]
-    a_pre, b_pre = backend.cp_prefix_scan(
-        torch.stack([x[0] for x in ab]), torch.stack([x[1] for x in ab]), chunk_ids=mine)
-
-    outs, last = [], None
-    for i, s in enumerate(parts):
-        # each backend arm marshals its own operand; rounding here diverged from the
-        # sequential path (rel 3.0e-05 against 8.8e-07)
-        s_in = a_pre[i] @ state.float() + b_pre[i]
-        o, st, win = backend.linear_attn_chunk(
-            q[:, s], k[:, s], v[:, s], a_proj[:, s], b_proj[:, s], s_in,
-            conv_window=halos[i],
-            **{n: (t[:, s] if n == "z" else t) for n, t in kwargs.items()})
-        outs.append(o)
-        if last is None or mine[i] > last[0]:
-            last = (mine[i], st, win)
-    # The window goes back to the pool only if the pool tracks one. Training
-    # pools do not (state_gather returns None), and CP is training-only, so
-    # returning the halo-derived window here would scatter into None.
-    return torch.cat(outs, dim=1), last[1], last[2] if window is not None else None
+    out, st, win = backend.gdn_cp(
+        q, k, v, a_proj, b_proj, state, z=kwargs["z"],
+        conv1d_weight=kwargs["conv1d_weight"], dt_bias=kwargs["dt_bias"],
+        a_log=kwargs["a_log"], norm_weight=kwargs["norm_weight"],
+        conv_windows=halos, chunk_ids=mine)
+    # The window goes back to the pool only if the pool tracks one. Training pools do
+    # not (state_gather returns None), and CP is training-only, so returning the
+    # halo-derived window here would scatter into None.
+    return out, st, win if window is not None else None
 
 
 def _kv_operands(backend, kv, layer_idx: int):
