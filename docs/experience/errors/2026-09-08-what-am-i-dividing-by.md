@@ -19,6 +19,11 @@ retracted.
 | 7 | weight stream = 67% of forward | 21.890 GB divided by an fp4-only rate; 49% of those bytes take `linear_fp8` |
 | 8 | fp8 1.65x fp4 utilization | arms 9.5x apart in size, and interleaved in one process |
 
+> **Provenance (2026-09-10 cleanup):** the one-off probes behind these rows were deleted; rerun by hand:
+> - `scripts/probe_tick_cost.py` — `scripts/pod_run.sh --wait ticks <card> -- python3 scripts/probe_tick_cost.py`. Tick-cost fits are card measurements from the deleted probe; this entry is the record.
+> - `scripts/probe_fp4_decode_gemm.py` — `scripts/pod_run.sh --wait fp4gemm <card> -- python3 scripts/probe_fp4_decode_gemm.py`. Weight bytes now come from kernel_cost.py nvfp4 rows; achieved GB/s is a card measurement recorded here.
+> - `scripts/probe_fp8_decode_gemm.py` — `scripts/pod_run.sh --wait fp8rate <card> -- python3 scripts/probe_fp8_decode_gemm.py`. The byte split is nbytes-derived; the rate rows are card measurements recorded here.
+
 ## Root cause
 
 **Not one of the eight is a mistimed measurement.** The `perf_counter` placement, the

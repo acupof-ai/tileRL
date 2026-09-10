@@ -122,6 +122,8 @@ one point per step, unweighted:
 ms/tick = 9.79 + 3.472 × avg_rows        R² = 0.759
 ```
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/probe_tick_cost.py` was deleted here; rerun it by hand with `scripts/pod_run.sh --wait ticks <card> -- python3 scripts/probe_tick_cost.py`. No code replaces the instrument: the ms/tick vs active-rows fits are card measurements; this entry is the record, rebuild on a card from the command.
+
 **A quarter of the variance is unexplained.** Adding a `rows × context depth` interaction
 takes it to 0.794 and says `c` rises 22% from depth 512 to depth 3072 — real, and far too
 small to reconcile the disagreement in the next section.

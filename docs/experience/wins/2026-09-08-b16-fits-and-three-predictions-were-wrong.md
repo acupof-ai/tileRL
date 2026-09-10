@@ -135,6 +135,8 @@ paths by bytes. Recomputed here from their published table rather than accepted:
 | byte-weighted (11.262 / 10.628 GB) | | | **0.710x** |
 | **this entry's measured decode/token** | | | **0.618x** |
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/probe_fp8_decode_gemm.py` was deleted here; rerun it by hand with `scripts/pod_run.sh --wait fp8rate <card> -- python3 scripts/probe_fp8_decode_gemm.py`. The byte split is reproducible from precision.nbytes over .w8; the achieved rates and ratios are card measurements recorded here.
+
 **14.9% apart, and the sign of the gap is explainable**: both of their shapes are ~70 MB
 weights, while a larger one (`gate_up`, 133.8 MB) runs faster at M=8 and amortizes harder, so
 their mix is conservative.

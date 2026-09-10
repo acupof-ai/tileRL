@@ -23,7 +23,6 @@ non-metric scripts must not be deleted.
 |---|---|
 | `bench_ssd_bandwidth.py` | spill read bandwidth — settles the 198.9 MiB/s vs 548.9 MiB/s contradiction |
 | `bench_write_through.py` | write-through cost inside the publishing prefill (the 45.3% → 8.96% fix) |
-| `bench_h2d.py` | pinned H2D/D2H bandwidth at the real GDN snapshot size (149.6 MiB) |
 | `bench_pin_cost.py` | where a DRAM demotion's time goes: pin vs copy |
 | `bench_prefix_state.py` | prefix-boundary snapshot cost and survival count, both store kinds |
 

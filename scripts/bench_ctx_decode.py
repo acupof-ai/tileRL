@@ -280,8 +280,9 @@ def main() -> None:
     # costs 2.125 MiB on sm70: 2.000 trunk (16 full-attn planes x 4 kv heads x 16 tokens
     # x 256 head_dim x 4 B, k and v) + 0.125 for the draft's plane, which mirrors
     # num_blocks. f32 because sm70's attention IO is f32 (engine.py:1202); a bf16 card
-    # pays half. Measured by scripts/probe_block_bytes.py -- the 0.92 MB this comment
-    # used to claim was 2.42x low, bf16 and without the draft plane.
+    # pays half. Derived through precision.nbytes (PagedKvPool.bytes_per_token *
+    # BLOCK_TOKENS, trunk plus the 1-layer draft plane) -- the 0.92 MB the old
+    # probe refuted was 2.42x low, bf16 and without the draft plane.
     # The +32 is slack for block-boundary rounding, not for one more request.
     ctxs = [c for c in CTXS if args.min_ctx <= c <= args.max_ctx]
     if not ctxs:

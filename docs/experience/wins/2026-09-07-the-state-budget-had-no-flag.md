@@ -28,6 +28,8 @@ card. Read off the live child (`/health`, pid 3128149, `--max-ctx 32768`, depth 
 `prefix_entries_capacity` **11** — so 12 sessions is already past the budget there.
 Same code, same default, two regimes.
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/bench_h2d.py` was deleted here; rerun it by hand with `TILERL_TARGET=cuda python3 scripts/bench_h2d.py`. The 149.6 MiB size is now derived through precision.nbytes (144 MiB GDN state + 5.6 MiB conv window).
+
 ## What Worked
 
 `--state-bytes` end to end: `cli.py:1035` (argparse) → `_build_engine`'s kwarg

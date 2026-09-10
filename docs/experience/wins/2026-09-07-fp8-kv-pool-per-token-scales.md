@@ -171,9 +171,11 @@ low. Folded into `_blob_bytes` so there is one formula, not two.
 **`_fit_blocks` charged the draft pool at fp8+scale rates** while `spec.py` allocates
 it at the IO dtype with no scale plane, under-asking ~2x on that term.
 
-KV bytes are computed in **three** places, not one — `bytes_per_token`, `_fit_blocks`
+KV bytes were then computed in **three** places, not one — `bytes_per_token`, `_fit_blocks`
 (which must reimplement it from `cfg`, since it runs before the pool exists), and
-`scripts/probe_block_bytes.py`. They agree by hand-maintained duplication.
+`scripts/probe_block_bytes.py`. They agreed by hand-maintained duplication.
+
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/probe_block_bytes.py` was deleted here; rerun it by hand with `TILERL_TARGET=cpu python3 scripts/probe_block_bytes.py` — the three hand-maintained sites are one now: precision.nbytes via PagedKvPool.bytes_per_token and the _fit_blocks fit (task A, #458). The one-off `scripts/probe_kv_fp8_range.py` was deleted here; rerun it by hand with `TILERL_TARGET=cpu python3 scripts/probe_kv_fp8_range.py --model tiny --prompt-tokens 64` — the 33280 bytes/token and one-f32-per-head_dim scale are now reproduced by precision.kv_format(head_dim) + nbytes; the real-KV dynamic-range distribution was a card measurement recorded here.
 
 ## What the card measured
 

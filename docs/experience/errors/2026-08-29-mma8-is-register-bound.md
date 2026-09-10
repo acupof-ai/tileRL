@@ -21,6 +21,8 @@ the model (kernel time from the CUDA profiler, not wall time):
 | 10240 | 5120 | 32.8 | 320 | 16.7 | 50.3 | 3.01 |
 | 6144 | 5120 | 19.7 | 192 | 11.0 | 29.7 | 2.70 |
 
+> **Provenance (2026-09-10 cleanup):** the one-off probes were deleted here; rerun any by hand with `CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src TILERL_TARGET=cuda python3 scripts/<probe_mma8_bw|probe_mma8_regs|probe_mma8_tiles>.py` — `probe_mma8_bw.py` made this M=1-GEMV vs M=8-mma8 table, `probe_mma8_regs.py` the 128-reg/21.8%-occupancy table below, `probe_mma8_tiles.py` the NG/KW/G sweep (69.6 us / 800 GB/s). No code replaces the instruments: register count, per-schedule timings and achieved bandwidth are card profiler measurements; this entry is the record, rebuild from the commands when a card is available.
+
 Flat across a 3.4x span of block counts, so it is not occupancy-through-grid.
 
 ## The hypothesis that was wrong

@@ -12,6 +12,8 @@ conv window `[48, 3, 10240]` f32 adds 5.63 MiB. The 74.81 MiB figure is the
 bf16 number CPU and metal see; `precision.dtype("recurrent_state", cuda)`
 returns f32 because the sm90 fused GDN kernel is f32-IO.
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/bench_h2d.py` was deleted here; rerun it by hand with `TILERL_TARGET=cuda python3 scripts/bench_h2d.py`. The 149.6 MiB size is now derived through precision.nbytes (144 MiB GDN state + 5.6 MiB conv window).
+
 Before this change the snapshots lived in `Engine._prefix_state`, a dict keyed
 by token tuple, released only through the store's `on_evict` hook. Two
 consequences:

@@ -32,6 +32,8 @@ than the margin they decide.**
 | `S` snapshot | one spilled blob, constant at any length | 149.63 MiB | 149.63 MiB |
 | `B` tier read rate | the tier's own fetches | 182.6 MiB/s | 182.2 MiB/s |
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/bench_h2d.py` was deleted here; rerun it by hand with `TILERL_TARGET=cuda python3 scripts/bench_h2d.py`. The ~149.6 MiB size is now derived through precision.nbytes (144 MiB GDN state + 5.6 MiB conv window).
+
 A constant `k` would be wrong by 2x on one of the two cards; a constant `R`
 wrong by 34x. `n*` lands near 16,900 tokens on the H20 and ~73 on the V100 —
 same model, same disk, opposite answers.

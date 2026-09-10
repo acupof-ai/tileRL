@@ -172,6 +172,8 @@ Two levers, both named with costs rather than guessed at, neither measured:
    copies both halves — 476 MiB of copies at 7×512 on top of the 476 MiB output. Having the
    fused GEMV write `[2, M, I]` makes each half contiguous and removes both copies; the weight
    permutation is load-time, so the runtime cost is zero. Confined to the MLP.
+
+   > **Provenance (2026-09-10 cleanup):** the one-off `scripts/probe_silu_copy_bytes.py` was deleted here; rerun it by hand with `TILERL_TARGET=cpu python3 scripts/probe_silu_copy_bytes.py`. The 476 MiB figure is the probe's rows=3584 measurement; silu_mul byte arithmetic now lives in `src/tilerl/kernel_cost.py`.
 2. **The padding.** Stop inflating decode rows — either don't mix decode and prefill in one
    tick, or bound `rows × width` the way `max_num_batched_tokens` bounds summed chunk length
    (verified at `engine.py:563` and `:580`: it does **not** bound the product). This removes the

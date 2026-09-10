@@ -100,6 +100,8 @@ decoded tokens at the measured 50.0 tok/s, over 11019 tokens), against the 8.92
 ms/token the bench table records at ctx 4096. Prefill cost per token grows with
 context; this entry does not claim the shape of that curve, only the two endpoints.
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/bench_h2d.py` was deleted here; rerun it by hand with `TILERL_TARGET=cuda python3 scripts/bench_h2d.py` — the 163 s was a served-run timing; size arithmetic is nbytes-derived now. The one-off `scripts/probe_block_bytes.py` was deleted here; rerun it by hand with `TILERL_TARGET=cpu python3 scripts/probe_block_bytes.py` — the 2.125 MiB block is derived through precision.nbytes (PagedKvPool.bytes_per_token * BLOCK_TOKENS) and pinned by tests/test_kv.py::test_a_block_costs_2125_kib_at_the_27b_shape.
+
 **19.4 s is the `kv_tier` cold-start baseline**, and it is small — which matters for
 `kv_tier`: an offload tier has to beat re-prefilling, and re-prefilling this prompt
 costs 163 s while the JIT it avoids is worth 19.

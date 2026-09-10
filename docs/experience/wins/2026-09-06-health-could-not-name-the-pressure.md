@@ -76,6 +76,8 @@ before the pool runs out of blocks. One half is measured: the budget holds
 **17.68 GiB / 149.6 MiB = 121 snapshots**, where 149.6 MiB per entry matches the design
 page's constant-snapshot finding.
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/bench_h2d.py` was deleted here; rerun it by hand with `TILERL_TARGET=cuda python3 scripts/bench_h2d.py`. The 149.6 MiB size is now derived through precision.nbytes (144 MiB GDN state + 5.6 MiB conv window).
+
 The other half has no single value. Blocks per entry is **not a rate**:
 
 | turn | prompt tokens | free-block drop | entries | blocks/entry |

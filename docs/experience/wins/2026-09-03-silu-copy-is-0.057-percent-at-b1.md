@@ -12,7 +12,7 @@
 and `backend.silu_mul` (`backend.py:1021-1022`) calls `_c()` on each, materialising both.
 `I = 17408`, f32.
 
-Measured with `scripts/probe_silu_copy_bytes.py` on the real 27B shape:
+The rows below were measured with `scripts/probe_silu_copy_bytes.py` on the real 27B shape:
 
 | rows | gate contiguous | up contiguous | `gu` | copied |
 |---:|---|---|---:|---:|
@@ -23,6 +23,8 @@ Measured with `scripts/probe_silu_copy_bytes.py` on the real 27B shape:
 | 32 | False | False | 4.2 MiB | 4.2 MiB |
 | 512 | False | False | 68.0 MiB | 68.0 MiB |
 | **3584** | False | False | 476.0 MiB | **476.0 MiB** |
+
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/probe_silu_copy_bytes.py` was deleted here; rerun it by hand with `TILERL_TARGET=cpu python3 scripts/probe_silu_copy_bytes.py`. The copy bytes now correspond to the silu_mul row of `src/tilerl/kernel_cost.py` (`tilerl bench --kernels`); the per-rows table and the 0.057% verdict stay here as the record.
 
 Two corrections to the note:
 

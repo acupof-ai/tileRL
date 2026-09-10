@@ -63,6 +63,8 @@ as the CPU twin.
 | ms per prompt token, end to end | 14.68 | **9.00** | |
 | peak VRAM | 27036 MiB | 26668 MiB | |
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/bench_h2d.py` was deleted here; rerun it by hand with `TILERL_TARGET=cuda python3 scripts/bench_h2d.py`. The 163.1 s was a served-run timing the probe quoted; the size arithmetic is nbytes-derived now, the timing stays here as the record.
+
 Parity on sm70 against `reference.gdn_prep`, all six outputs:
 `max|delta|` **1.192e-07** worst (Ko), `allclose(rtol=1e-2)` True. Against the old
 kernel: **1.907e-06** worst. Same math, so they must agree, and they do.

@@ -41,6 +41,8 @@ before   entries [2736]        2736 diverges at 2727     servable: none
 after    entries [2720, 2736]  2720 prefix true          servable: [2720]
 ```
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/probe_ssd_read_miss.py` was deleted here; rerun it by hand with `scripts/pod_run.sh ssdprobe 1 -- /work/tl013/bin/python -u scripts/probe_ssd_read_miss.py`. No code replaces the instrument; this entry is the record, rebuild on a card from the command.
+
 Cost: one extra boundary spill per prefill on top of the decode spill
 (`ssd_offered` 1 → 2 on this prompt), plus one forward for the ≤17-token tail.
 **The wall-clock cost is not isolated** — the long arms differ in what they recover

@@ -54,6 +54,8 @@ The 128-register allocation is the compiler's, not the arrays' — ptxas
 register control (maxrregcount / launch bounds through tilelang) is the
 experiment left.
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/probe_mma8_regs.py` was deleted here; rerun it by hand with `CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src TILERL_TARGET=cuda python3 scripts/probe_mma8_regs.py`. Register/occupancy figures came from the deleted probe; this entry is the record, rebuild from the command on a card. The one-off `scripts/probe_mma8_tiles.py` was deleted here; rerun it by hand with `CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src TILERL_TARGET=cuda python3 scripts/probe_mma8_tiles.py`. Per-schedule timings came from the deleted probe; this entry is the record.
+
 ## f16 path for e4m3 (same day, later)
 
 The e4m3→bf16x2 bit placement cost 7 ops per pair; sm90's

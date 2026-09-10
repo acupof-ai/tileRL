@@ -170,6 +170,11 @@ kernel with its own achieved rate, unmeasured. Dividing a total that spans two q
 paths by one path's bandwidth is not a floor for either. The nominal-denominator row is
 unaffected: 4.00 TB/s is the bus, whatever kernel drives it.
 
+> **Provenance (2026-09-10 cleanup):** the one-off probes were deleted; rerun each by hand.
+> `probe_tick_cost.py`: `scripts/pod_run.sh --wait ticks <card> -- python3 scripts/probe_tick_cost.py` — the fits (incl. the 91.31 ms/tick in §5) are card measurements; this entry is the record.
+> `probe_fp4_decode_gemm.py`: `scripts/pod_run.sh --wait fp4gemm <card> -- python3 scripts/probe_fp4_decode_gemm.py` — weight bytes are now the nvfp4 linear rows of `src/tilerl/kernel_cost.py`; the achieved 1144.7 GB/s is a card calibration, not reproduced without a card, recorded here.
+> `probe_fp8_decode_gemm.py`: `scripts/pod_run.sh --wait fp8rate <card> -- python3 scripts/probe_fp8_decode_gemm.py` — the fp8 byte split is reproducible from `precision.nbytes` over the `.w8` tensors; the achieved rate was a card measurement recorded here.
+
 A weights-dominated model is the general case for a 27B at B=8, so "weights only" is a good
 approximation here. That it *is* an approximation was worth checking rather than assuming,
 because the check costs one table and the wrong answer costs a work programme.

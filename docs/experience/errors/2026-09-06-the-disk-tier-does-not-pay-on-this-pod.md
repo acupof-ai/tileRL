@@ -23,6 +23,8 @@ numbers below are measured, not assumed.
 | host RAM | **31 GiB total, 25 available** | `free -g` |
 | both block devices | **`ROTA 1`** — no NVMe | `lsblk -d -o NAME,SIZE,ROTA` |
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/bench_h2d.py` was deleted here; rerun it by hand with `TILERL_TARGET=cuda python3 scripts/bench_h2d.py`. The 149.6 MiB snapshot size is now derived through precision.nbytes (48 GDN layers x 48 heads x 128x128 f32 = 144 MiB plus the 5.6 MiB conv window). The measured copy rates need a card and stay here as the record.
+
 Pinning is worth 1.88x on H2D and 2.76x on D2H.
 
 An 11019-token prompt re-prefills in **163 s** (14.68 ms/token) — that is what any
