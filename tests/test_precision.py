@@ -70,6 +70,7 @@ def test_device_faces_equal_the_served_tensor_storage():
     grid + one f32 per row.
     """
     from tilerl_kernels.reference import pack_fp4, renorm_fp4_scale
+
     from tilerl.precision import fp8_dev, nbytes, nvfp4_dev
 
     n, k = 64, 128
