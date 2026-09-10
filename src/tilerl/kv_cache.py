@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Sequence
@@ -481,7 +482,6 @@ class KvTier:
     def __init__(self, path: str, fingerprint: str, min_tokens: int = 4 * BLOCK_TOKENS,
                  max_pending: int = 32, max_bytes: int = 20 * 2**30) -> None:
         import queue
-        import threading
 
         # One chunk (4 blocks = 64 tokens), not the 2048 the eviction-driven version used:
         # write-through spills at chunk boundaries, so a 2048 floor refuses every publish.
@@ -564,11 +564,28 @@ class KvTier:
         self.snapshot_bytes = 0
         self.tick_loads = 0
         self._rq: queue.Queue = queue.Queue()
+        # Test seam for the fetch-hold gate: ``_fetch_started`` fires once a dequeued read
+        # has registered its key in ``_fetching`` (fetch_in_flight is provably true), and
+        # the reader blocks on ``_fetch_gate`` until the test clears it. Both are
+        # always-set/no-op in production -- a sleep cannot make the in-flight precondition
+        # deterministic.
+        self._fetch_started = threading.Event()
+        self._fetch_gate = threading.Event()
+        self._fetch_gate.set()
         # Same starvation as _writer above; the GIL yield in step() is what lets
         # torch.load finish inside the prefetch deadline
         self._reader = threading.Thread(target=self._fetch_loop, daemon=True)
         self._reader.start()
         self._writer.start()
+
+    def hold_fetches_for_test(self) -> tuple[threading.Event, threading.Event]:
+        """Park the reader mid-fetch and return (started, gate). A dequeued read signals
+        ``started`` with the key already in ``_fetching`` and waits on ``gate``; ``set()``
+        releases it. Test-only: makes the hold's in-flight precondition a controlled state
+        instead of a race the runner speed decides."""
+        self._fetch_started.clear()
+        self._fetch_gate.clear()
+        return self._fetch_started, self._fetch_gate
 
     def _recover(self, marker: str, fingerprint: str) -> int:
         """Adopt the spill files already on disk, or wipe them. Returns entries adopted.
@@ -795,6 +812,10 @@ class KvTier:
     def _fetch_loop(self) -> None:
         while True:
             key, tokens = self._rq.get()
+            # The key is already in _fetching (prefetch registered it before enqueue); the
+            # gate lets a test hold the read here so the in-flight window is deterministic.
+            self._fetch_started.set()
+            self._fetch_gate.wait()
             with self._lock:
                 blob = self._pending.get(key)
                 st = self._pending_st.get(key)
