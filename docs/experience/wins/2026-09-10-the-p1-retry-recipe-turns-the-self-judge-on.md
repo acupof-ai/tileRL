@@ -55,10 +55,30 @@ A matched seed-0/seed-1 pair of `grpo-gsm8k-27b` on card 0/1/3/6, each passing
 - no rollout-length collapse: `tokens_last` not below `tokens_first` by the
   2026-09-10 margin (329 → 14).
 
-Cost to watch: the judge issues C(8,2)×2 = 56 one-token generations per step
-in two batched calls. Record `secs_per_step_median` against the 34.09 s
-recapture baseline; a judge overhead above the rollout saving is its own reject
-signal.
+Cost to watch: the judge issues C(8,2)×2 = 56 one-token generations per step,
+both prompt orders concatenated into ONE batched `generate` call. Record
+`secs_per_step_median` against the 34.09 s recapture baseline; a judge overhead
+above the rollout saving is its own reject signal.
+
+## What this run is predicted to show — and what it is not
+
+Read this before the number comes back, so the verdict is not taken off the
+wrong target. At a 91.6% base the groups the judge rescues are almost entirely
+ALL-CORRECT (p^8 ≈ 0.50); the all-wrong fraction is negligible. The 8% of
+questions the model misses live in MIXED groups (7 right / 1 wrong), where the
+binary reward already gives the wrong rollout a negative advantage and the
+judge's band gap does not sharpen it. The judge restores a reasoning-STYLE
+gradient inside groups that were already right; it does not add a gradient that
+flips wrong answers to right ones.
+
+So the mechanism-level prediction is **flat / no collapse** — GSM8K held flat
+instead of the 91.6% → 78.2% length-term regression, and rollout length held
+instead of 329 → 14 tokens. Clearing the roadmap's +25/500 gate would require
+the extra, UNMEASURED hypothesis that ranking better reasoning inside correct
+groups transfers onto the harder questions the model currently misses; nothing
+in the mechanism guarantees that. The +25/500 gate stays the recorded verdict
+(the roadmap criterion is not pre-softened), but a flat, non-collapsed result
+is this recipe's success condition even if that gate does not clear.
 
 ## Rule
 
