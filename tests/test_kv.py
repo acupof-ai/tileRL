@@ -944,16 +944,24 @@ def test_a_yielded_gil_runs_a_background_load_promptly(tmp_path):
 
     busy = measure(yield_each=False)
     yielded = measure(yield_each=True)
-    # Ratio threshold (derivation, not measurement): the busy arm pays one GIL
-    # re-acquisition wait per storage read. The chain starts from a CI run that
-    # judged "no contention visible" (macos-14, 2026-09-10: 1.318ms vs 0.442ms
-    # at 2 storages, ~0.15ms per acquisition), so extrapolating a contention
-    # SIZE from it runs in the wrong direction -- treat the projection as a
-    # lower bound. At the calibrated n>=2048 storages it gives busy >= 6x
-    # yielded (local Mac, torch 2.13: 29x measured). 3x takes half that. If
-    # this goes red, first check the per-storage-linearity assumption, not
-    # "flaky". Under a loaded box both arms slow together and the ratio holds.
-    assert busy > yielded * 3, f"no contention visible: busy={busy:.1f}ms yielded={yielded:.1f}ms"
+    # Record the population on every run, green or red: a gate that prints its
+    # reading only when red stays green until it grazes the edge. CI's -v
+    # carries this into the log.
+    print(
+        f"gil yield ratio {busy / yielded:.2f}x (busy={busy:.1f}ms "
+        f"yielded={yielded:.1f}ms, target={target_ms:.1f}ms, n={n})"
+    )
+    # The gate is the null hypothesis, not the effect size. The failure this
+    # catches is "sleep(0) no longer yields the GIL": then both arms are the
+    # same and the ratio is 1.0 -- on every machine. The observed effect size
+    # is not machine-independent: 29x on a loaded Mac, 2.92x on CI macos-14,
+    # >=3x on CI ubuntu-latest (2026-09-10; green runs did not record their
+    # ratio, which the print above fixes) -- a 10x spread, so a threshold
+    # taken from any one observation has to move with the machine. 1.5x is
+    # "far enough from 1.0": 1.95x margin under the smallest observed ratio,
+    # and a no-op yield reads ~1.0 and goes red. The measured ratios are this
+    # gate's population, not its standard.
+    assert busy > yielded * 1.5, f"no contention visible: busy={busy:.1f}ms yielded={yielded:.1f}ms"
     # Absolute ceiling on the yielded arm: calibration lands the load in
     # [target, 2x target), so 4x target leaves 2x for machine load. The ratio
     # alone passes when both arms slow together, so this catches a yielded arm
