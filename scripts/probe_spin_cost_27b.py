@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import time
 
 import numpy as np
 from tilerl_kernels.backend import get_backend
 
+from tilerl import kv_cache as kvmod
 from tilerl.config import qwen38_27b
 from tilerl.engine import BLOCK_TOKENS, SamplingParams, build_engine
 from tilerl.model import load_hf
@@ -94,7 +96,6 @@ def main():
         # Time each step, bucketed by any_fetching() sampled right before it.
         spin_ticks, quiet_ticks = [], []
         bound_fires = 0
-        t_decode0 = time.perf_counter()
         for _ in range(2000):
             fetching = cold._prefix.any_fetching()
             t0 = time.perf_counter()
@@ -108,7 +109,6 @@ def main():
                 quiet_ticks.append(dt)
             if not (list(cold._running) + list(cold._waiting)):
                 break
-        decode_wall = time.perf_counter() - t_decode0
         cold.poll()
 
         def dist(name, xs):
@@ -125,14 +125,52 @@ def main():
         dist("quiet (no spin)     ", quiet_ticks)
         print(f"50ms bound fired on {bound_fires}/{len(spin_ticks)} spin ticks", flush=True)
 
-        cst2 = cold.stats()
-        print(f"cold(after): ssd_prefetches={cst2['ssd_prefetches']} "
-              f"fetches_ready={cst2['ssd_fetches_ready']} "
-              f"fetch_drops={cst2['ssd_fetch_drops']} "
-              f"fetch_ms={cst2['ssd_fetch_ms']} fetch_bytes={cst2['ssd_fetch_bytes']} "
-              f"tick_loads={cst2['ssd_tick_loads']} hits={cst2['ssd_hits']}", flush=True)
-        print(f"decode wall={decode_wall:.2f}s tok/s={params.max_new_tokens / decode_wall:.1f}",
+        cst1 = cold.stats()
+        print(f"cold(after request 1): ssd_prefetches={cst1['ssd_prefetches']} "
+              f"fetches_ready={cst1['ssd_fetches_ready']} "
+              f"fetch_drops={cst1['ssd_fetch_drops']} "
+              f"fetch_ms={cst1['ssd_fetch_ms']} fetch_bytes={cst1['ssd_fetch_bytes']} "
+              f"tick_loads={cst1['ssd_tick_loads']} hits={cst1['ssd_hits']}", flush=True)
+
+        # --- request 2: the same prefix, with its HBM entry evicted so ONLY the parked
+        # SSD pair can serve it. This is the fix's payoff: a fetch whose requester missed
+        # its deadline finished in the background; the next same-prefix request faults it
+        # in from the parked host copy (zero tick-side disk read), instead of paying the
+        # 117 ms read again -- which the pre-fix code discarded, so there was nothing to take.
+        key = cold._prefix._hash_all(list(warm))
+        n_dropped_hbm = 0
+        for e in list(cold._prefix._entries.get(key, ())):
+            cold._prefix._drop(e)
+            n_dropped_hbm += 1
+        print(f"dropped {n_dropped_hbm} resident HBM entry at the matched boundary",
               flush=True)
+
+        tick_loads = {"n": 0}
+        real_load = kvmod.torch.load
+
+        def counting(*a, **k):
+            if threading.current_thread() is threading.main_thread():
+                tick_loads["n"] += 1
+            return real_load(*a, **k)
+
+        hits_before = cold.stats()["ssd_hits"]
+        kvmod.torch.load = counting
+        t2 = time.perf_counter()
+        cold.submit(list(warm), params)
+        drain(cold)
+        req2_wall = time.perf_counter() - t2
+        kvmod.torch.load = real_load
+
+        cst2 = cold.stats()
+        print(f"cold(request 2 same-prefix): ssd_hits={cst2['ssd_hits']} "
+              f"(+{cst2['ssd_hits'] - hits_before}) "
+              f"tick_loads={tick_loads['n']} wall={req2_wall:.2f}s "
+              f"prefill_from reuse expected: matched via parked pair", flush=True)
+        print("VERDICT:", end=" ", flush=True)
+        if cst2["ssd_hits"] > hits_before and tick_loads["n"] == 0:
+            print("PARKED PAIR SERVED (fetches_ready>0, 0 tick reads)", flush=True)
+        else:
+            print("NOT SERVED FROM PARK -- re-read or recomputed", flush=True)
 
 
 if __name__ == "__main__":

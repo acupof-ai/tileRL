@@ -11,7 +11,7 @@ from __future__ import annotations
 import contextlib
 import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -551,9 +551,18 @@ class KvTier:
         # read side: the torch.load runs off-tick, not inside step() under the lock
         self._fetches: dict[int, dict] = {}   # key -> {"blob", "st", "tokens"}, collected by take()
         self._fetching: set[int] = set()      # queued or mid-read
-        self._abandoned: set[int] = set()     # deadline fired mid-read; drop on landing
+        # A fetched read ALWAYS parks: a fetch that lost the deadline race still serves
+        # the next same-prefix request, and the read it did is already paid for. The cap
+        # bounds parked buffers that nothing follows (27B: ~157 MiB each): without it a
+        # flood of prefetch-and-recompute rows pins host RAM forever.
+        self._park_keys: deque[int] = deque()
+        self._max_parked = 2
         self.prefetches = 0
         self.fetches_ready = 0
+        # Loads that failed (unreadable / truncated / raced-eviction spill). A fetch that
+        # finishes is never dropped: it parks even if its deadline expired, and eviction
+        # from the parked-fetch FIFO below only sheds the warm memory copy -- the entry is
+        # still on disk, so a later lookup faults it in like any resident entry.
         self.fetch_drops = 0
         self.fetch_ms = 0.0
         self.fetch_bytes = 0
@@ -770,6 +779,11 @@ class KvTier:
         with self._lock:
             return key in self._fetching
 
+    def fetching_keys(self) -> frozenset[int]:
+        """Snapshot of every fetch mid-read; cheap to intersect inside a spin."""
+        with self._lock:
+            return frozenset(self._fetching)
+
     def any_fetching(self) -> bool:
         with self._lock:
             return bool(self._fetching)
@@ -778,19 +792,10 @@ class KvTier:
         """The prefetched pair, or None. `st` may be absent on an older parked entry."""
         with self._lock:
             done = self._fetches.pop(key, None)
+            self._park_keys = deque(k for k in self._park_keys if k != key)
         if done is None or "blob" not in done:
             return None
         return done
-
-    def discard_fetch(self, key: int) -> None:
-        """Give up on a prefetch; a late arrival is dropped rather than parked."""
-        with self._lock:
-            had = self._fetches.pop(key, None) is not None
-            if not had and key in self._fetching:
-                self._abandoned.add(key)
-                had = True
-        if had:
-            self.fetch_drops += 1
 
     def _fetch_loop(self) -> None:
         while True:
@@ -811,17 +816,21 @@ class KvTier:
                     self.fetch_ms += (time.perf_counter() - ts) * 1000
                 except Exception:  # noqa: BLE001 - truncated / corrupt / raced eviction
                     self.drop(key)
+                    self.fetch_drops += 1
                     with self._lock:
                         self._fetching.discard(key)
-                        self._abandoned.discard(key)
                     continue
             with self._lock:
                 self._fetching.discard(key)
-                if key in self._abandoned:
-                    # abandoned mid-read: park nothing, or the host buffer is pinned
-                    self._abandoned.discard(key)
-                    continue
+                # Always park: the deadline gates whether a row WAITS, not whether a
+                # finished read is kept -- the load is paid for either way, and the next
+                # request with this prefix faults it in from memory instead of disk.
                 self._fetches[key] = {"blob": blob, "st": st, "tokens": tokens}
+                if key not in self._park_keys:
+                    self._park_keys.append(key)
+                while len(self._park_keys) > self._max_parked:
+                    victim = self._park_keys.popleft()
+                    self._fetches.pop(victim, None)
             self.fetches_ready += 1
 
     def load_kv(self, key: int, tokens: tuple[int, ...], blocks: Sequence[int],
@@ -1021,11 +1030,14 @@ class NoPrefixStore:
     def break_even_tokens(self, prefill_rate: float) -> int:
         return 1 << 31
 
-    def abandon_prefetch(self, tokens: Sequence[int]) -> None:
-        return None
-
     def fetch_in_flight(self, tokens: Sequence[int]) -> bool:
         return False
+
+    def fetching_keys(self) -> frozenset[int]:
+        return frozenset()
+
+    def boundary_keys(self, tokens: Sequence[int]) -> frozenset[int]:
+        return frozenset()
 
     @property
     def has_ssd(self) -> bool:
@@ -1099,6 +1111,22 @@ class PrefixStore:
     def any_fetching(self) -> bool:
         return self._ssd is not None and self._ssd.any_fetching()
 
+    def fetching_keys(self) -> frozenset[int]:
+        """Snapshot of tier keys mid-read, for a spin loop's cheap membership test."""
+        return frozenset() if self._ssd is None else self._ssd.fetching_keys()
+
+    def boundary_keys(self, tokens: Sequence[int]) -> frozenset[int]:
+        """The hashes at every whole-block boundary of ``tokens`` -- the keys the
+        prefetch ladder can have queued for this prompt."""
+        if self._ssd is None:
+            return frozenset()
+        h, keys = 0, set()
+        for i, t in enumerate(tokens, 1):
+            h = self._roll(h, int(t))
+            if i % BLOCK_TOKENS == 0:
+                keys.add(h)
+        return frozenset(keys)
+
     def _hash_all(self, tokens: Sequence[int]) -> int:
         h = 0
         for t in tokens:
@@ -1119,18 +1147,6 @@ class PrefixStore:
             if i % BLOCK_TOKENS == 0 and self._ssd.fetch_pending(h):
                 return True
         return False
-
-    def abandon_prefetch(self, tokens: Sequence[int]) -> None:
-        """Walks every length the probe could have queued: which one it took depends on
-        what was resident then, and that may have changed."""
-        if self._ssd is None:
-            return
-        h, hashes = 0, []
-        for t in tokens:
-            h = self._roll(h, int(t))
-            hashes.append(h)
-        for i in range(BLOCK_TOKENS, len(tokens) + 1, BLOCK_TOKENS):
-            self._ssd.discard_fetch(hashes[i - 1])
 
     def break_even_tokens(self, prefill_rate: float) -> int:
         """Prefix length above which fetching beats recomputing, at this prefill rate.
