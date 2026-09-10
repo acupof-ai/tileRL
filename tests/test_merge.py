@@ -292,7 +292,8 @@ def test_merge_checkpoints_ties_and_dare_equal_dict_level(tmp_path):
         f = next((tmp_path / d).glob("model-*.safetensors"), None) \
             or (tmp_path / d / "model.safetensors")
         h = safe_open(str(f), "pt")
-        return {k: h.get_tensor(k) for k in h.keys()}
+        keys = h.keys()  # noqa: SIM118 — safe_open handle is not directly iterable
+        return {k: h.get_tensor(k) for k in keys}
 
     r0, r1 = raw("mc0"), raw("mc1")
     for method, weight_fn in (("ties", ties_merge_weight), ("dare", dare_merge_weight)):
@@ -306,12 +307,7 @@ def test_merge_checkpoints_ties_and_dare_equal_dict_level(tmp_path):
                 assert torch.equal(got[k], want.contiguous()), (method, k)
     # A re-run of DARE is byte-identical: the mask comes from the key, not clock randomness.
     merge_checkpoints(dirs[0], dirs[1:], tmp_path / "o-dare2", method="dare")
-    def only(d):
-        f = next((tmp_path / d).glob("model-*.safetensors"), None) \
-            or (tmp_path / d / "model.safetensors")
-        h = safe_open(str(f), "pt")
-        return {k: h.get_tensor(k) for k in h.keys()}
-    a, b = only("o-dare"), only("o-dare2")
+    a, b = raw("o-dare"), raw("o-dare2")
     assert all(torch.equal(a[k], b[k]) for k in a)
 
 
