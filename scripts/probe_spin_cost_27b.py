@@ -13,8 +13,8 @@ difference between the two buckets. Prints: arch + seed_rate (the deadline's
 inputs), tick-time distribution by bucket, whether the 50 ms bound fired, the
 fetch outcome (ready/drops/fetch_ms), and decode tok/s.
 
-Usage (pod): TILERL_27B_CKPT=/host/ThinkingCap-Qwen3.6-27B-FP8-fixed \
-    uv run python scripts/probe_spin_cost_27b.py
+Usage (pod): uv run python scripts/probe_spin_cost_27b.py
+Defaults to /work/Qwen3.8-27B-NVFP4; override with TILERL_27B_CKPT.
 """
 
 from __future__ import annotations
@@ -25,12 +25,12 @@ import time
 
 import numpy as np
 
-from tilerl.config import qwen36_27b
+from tilerl.config import qwen38_27b
 from tilerl.engine import BLOCK_TOKENS, SamplingParams, build_engine
 from tilerl.model import load_hf
 from tilerl_kernels.backend import get_backend
 
-CKPT = os.environ.get("TILERL_27B_CKPT", "/host/ThinkingCap-Qwen3.6-27B-FP8-fixed")
+CKPT = os.environ.get("TILERL_27B_CKPT", "/work/Qwen3.8-27B-NVFP4")
 SPIN_BOUND_MS = 50.0
 
 
@@ -49,7 +49,7 @@ def main():
     arch = getattr(be, "arch", "")
     print(f"device={be.device} arch={arch}", flush=True)
 
-    cfg = qwen36_27b()
+    cfg = qwen38_27b()
     model = load_hf(cfg, CKPT, keep_master=False)
     model.params = be.materialize(model.params)
     print(f"27B loaded from {CKPT}", flush=True)
