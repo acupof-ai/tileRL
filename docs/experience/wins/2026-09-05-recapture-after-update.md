@@ -121,3 +121,38 @@ four on cpu.
 
 **And a speed number for a cache needs a staleness check beside it.** "Faster"
 and "wrong" are the same measurement until something proves the cache resamples.
+
+## 2026-09-11: the CPU gate lands (the mechanism was already on main)
+
+The mechanism this entry measures — `Engine.invalidate_weights()` refilling the
+cached f32 casts and `PrefixStore.clear()`, driven from `grpo_loop` after every
+update behind the `recapture_graph` / `clear_prefix` waivers (#94) — was already
+on main; what arrived on 2026-09-11 was the deterministic gate.
+
+`test_clearing_the_prefix_after_update_keeps_rollouts_token_for_token_eager`
+(tests/test_rl.py) pins the **prefix** half on CPU: step 1 caches a 256-token
+prefix, step 2 submits a 336-token extension so it takes a genuine partial hit,
+and under a content reward (so the group has nonzero advantage) the post-update
+completions with `clear_prefix=True` are token-for-token identical to a
+store-free `NoPrefixStore` engine under the same seeds; a loop that skips the
+invalidation serves the old policy's KV and the completions diverge. The gate is
+red both when the flag is ignored and when `invalidate_weights` stops calling
+`PrefixStore.clear()`. Two fixture details make it non-vacuous: a full-length
+prefix hit is recomputed (the submission must be longer than the cached entry),
+and a length-only reward with one survivor ties the group to zero advantage so
+no weight moves at all.
+
+The **graph** half cannot be gated on CPU — capture calls
+`torch.cuda.graph_pool_handle()` and the handler falls back to eager, so a
+captured-vs-eager comparison there is eager-vs-eager and passes against any
+implementation. Its token-equality and the within-5% wall-clock stay
+pending-remote on sm90:
+
+```
+# token-equality: graph-replayed completions equal eager, same seeds
+TILERL_TARGET=cuda python scripts/recapture_correctness.py
+# wall clock: kept-graph arm stays >= 0.95x graphs-off (measured 2.16x on H20 here;
+# both arms run in forward and reverse order)
+TILERL_TARGET=cuda python scripts/recapture_arms.py --model qwen38-27b \
+    --arms baseline,prefix,graph,both --out /work/recapture_arms.json
+```
