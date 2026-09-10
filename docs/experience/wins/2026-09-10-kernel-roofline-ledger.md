@@ -3,6 +3,13 @@
 > Status: pending-remote. The byte/flop declarations and `tilerl bench --kernels`
 > table ship now; the measured ms / %-of-bound columns and the per-card
 > calibration row land when the cards return from the aupai V4.1 block.
+>
+> **Superseded for the real checkpoint (2026-09-11):** the 14.88/18.16 GB rows
+> below price every linear at the all-nvfp4 CONFIG face; the shipped checkpoint
+> mixes 264 nvfp4 / 233 fp8 linears, and `bench --kernels --checkpoint DIR`
+> prices that population at 22.36/25.63 GB — see
+> [2026-09-11-decode-tick-weight-bytes-come-from-the-checkpoint.md](2026-09-11-decode-tick-weight-bytes-come-from-the-checkpoint.md).
+> The rows below remain the config-face answer and the flagless table output.
 
 ## Context
 

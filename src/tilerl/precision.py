@@ -63,6 +63,9 @@ nvfp4 = Format(bits=4, scales=((16, "e4m3"), (None, "f32")))
 #: Device face of an NVFP4 linear after renorm_fp4_scale: f32 scale per 16 along K
 #: and one f32 per output row (the global scale split into a per-row epilogue).
 nvfp4_dev = Format(bits=4, scales=((16, "f32"), ((None,), "f32")))
+#: Device face of a bf16 linear REPACKED at load time: pack_fp4's default block is
+#: 32 (not the on-disk 16), then the same f32 widening and per-row epilogue.
+nvfp4_dev_b32 = Format(bits=4, scales=((32, "f32"), ((None,), "f32")))
 #: Device face of an fp8-e4m3 weight with ONLY the f32 [N/128,K/128] block grid:
 #: the weight_scale_inv branch stores no row scale (oscale=None), synthesized per launch.
 fp8_block_dev = Format(bits=8, scales=(((128, 128), "f32"),))

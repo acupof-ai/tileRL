@@ -356,6 +356,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
     }),
     'bench': frozenset({
         '--batches',
+        '--checkpoint',
         '--collectors',
         '--context',
         '--gen',

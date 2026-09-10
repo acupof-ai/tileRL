@@ -592,13 +592,13 @@ def gdn_span_ab_bwd(ga, gb, qc, kc, vc, bc, gtc, chunk: int = 64):
 
 
 def gdn_span_ab_raw_bwd(ga, gb, q, k, v, g, beta, state_shape, *, conv1d_weight,
-                        dt_bias, a_log, conv_window=None, chunk: int = 64):
+                        dt_bias, a_log, chunk: int = 64):
     """Reverse of :func:`gdn_span_ab_raw`: cotangents of the span's ``(A, B)`` back
-    onto the RAW projections, the prep params and the conv window. Returns
-    (gq, gk, gv, gg, gbeta, gconv1d, gdt_bias, ga_log, gwindow)."""
+    onto the RAW projections and the prep params. Exact for a zero conv window only
+    (the path training starts from). Returns (gq, gk, gv, gg, gbeta, gconv1d,
+    gdt_bias, ga_log)."""
     key_dim = state_shape[2]
-    sv = _gdn_prep_save(q, k, v, g, beta, key_dim, conv1d_weight, dt_bias, a_log,
-                        conv_window=conv_window)
+    sv = _gdn_prep_save(q, k, v, g, beta, key_dim, conv1d_weight, dt_bias, a_log)
     # gdn_span_ab runs on the KEY-head prepped tensors (no repeat_interleave; it ignores
     # the q/value pairing the token output needs), so its cotangents are already nkh-headed.
     g_qn, g_kn, g_v, g_bt, g_gt = gdn_span_ab_bwd(
@@ -761,52 +761,6 @@ def gdn_cp(q, k, v, g, beta, state, *, z, conv1d_weight, dt_bias, a_log, norm_we
     return torch.cat(outs, dim=1), last[1], last[2]
 
 
-def cp_halo_bwd(g_windows, qkv, pg, rank, world, chunk_ids, width):
-    """Reverse of the ``cp_halo`` forward: route each chunk's conv-window cotangent onto
-    the predecessor chunk's last ``width`` RAW-qkv rows.
-
-    The forward all-gathers tails and hands chunk ``c`` the tail of chunk ``c-1`` (which
-    lives on whatever rank holds it). So the window grad of every non-zero chunk adds onto
-    the tail of ``c-1``. A predecessor can be LOCAL — under zigzag cp=2 rank 1 holds chunks
-    1 and 2, so chunk 2's window is rank 1's own chunk-1 tail — which is why this is a
-    keyed all-gather + SUM by chunk id, not a reduce_scatter (that assumes every source is
-    remote). Returns this rank's stacked qkv tail grad, in its local chunk order; chunk 0
-    and any width-0 tail contribute zero.
-    """
-    import torch.distributed as dist
-
-    entries = len(chunk_ids)
-    B, D = qkv.shape[1], qkv.shape[3]  # qkv stacked [entries, B, T, D]
-    dev, dt = qkv.device, qkv.dtype
-    width = max(0, width)
-    # Per local entry: the window grad keyed by the chunk whose TAIL it is (predecessor
-    # chunk id), -1 for chunk 0 or a width-0 tail.
-    keys = torch.full((entries,), -1.0, device=dev)
-    buf = torch.zeros(entries, B, max(1, width), D, dtype=torch.float32, device=dev)
-    for i, cid in enumerate(chunk_ids):
-        gw = g_windows[i]
-        if gw is not None and cid - 1 >= 0 and width:
-            keys[i] = float(cid - 1)
-            buf[i] = gw.float()
-    payload = torch.cat([buf.reshape(entries, -1), keys.unsqueeze(1)], dim=1).contiguous()
-    pl = [torch.empty_like(payload) for _ in range(world)]
-    dist.all_gather(pl, payload, group=pg)
-    # Each gathered row is one entry: flat [B,width,D] window grad + its predecessor key.
-    tail_grad: dict[int, torch.Tensor] = {}
-    for pmat in pl:
-        for j in range(entries):
-            src = int(round(pmat[j, -1].item()))
-            if src < 0 or width == 0:
-                continue
-            wg = pmat[j, :-1].reshape(B, width, D)
-            tail_grad[src] = wg if src not in tail_grad else tail_grad[src] + wg
-    out = torch.zeros(entries, B, width, D, dtype=dt, device=dev)
-    for i, cid in enumerate(chunk_ids):
-        if cid in tail_grad:
-            out[i] = tail_grad[cid].to(dt)
-    return out
-
-
 def gdn_cp_bwd(grad, q, k, v, g, beta, state, *, z, conv1d_weight, dt_bias, a_log,
                norm_weight, conv_windows, pg, rank, world, chunk_ids, chunk=64):
     """Reverse of :func:`gdn_cp`. Each chunk's token-output cotangent runs the ordinary
@@ -817,18 +771,18 @@ def gdn_cp_bwd(grad, q, k, v, g, beta, state, *, z, conv1d_weight, dt_bias, a_lo
     onto the raw projections. The two paths add on the shared inputs/prep params. The
     11-tuple order matches :func:`gdn_backward` so the tape maps it with the same kwargs.
 
-    A chunk's prep also reads its predecessor's last K-1 raw qkv rows (the cp_halo);
-    their cotangent is routed back to whichever rank holds that tail by
-    :func:`cp_halo_bwd` and added onto this rank's q/k/v — including the LOCAL predecessor
-    zigzag gives rank 1 (its chunk 2 reads its own chunk 1).
+    # ponytail: exact only for conv_window == 0; cross-rank halo adjoint (prep reverse
+    # + cp_halo reduce-scatter) is the upgrade — the 27B runs conv kernel 4.
     """
+    if conv_windows is not None and any(w is not None and bool(w.any()) for w in conv_windows):
+        raise NotImplementedError("gdn_cp_bwd does not support a non-zero conv window yet")
     state = _f32(state)
     half = q.shape[1] // len(chunk_ids)
     parts = [slice(i * half, (i + 1) * half) for i in range(len(chunk_ids))]
     ab = [gdn_span_ab_raw(
               q[:, s], k[:, s], v[:, s], g[:, s], beta[:, s], state.shape,
               conv1d_weight=conv1d_weight, dt_bias=dt_bias, a_log=a_log,
-              conv_window=conv_windows[i], chunk=chunk)
+              conv_window=None, chunk=chunk)
           for i, s in enumerate(parts)]
     a_stack = torch.stack([x[0] for x in ab])
     b_stack = torch.stack([x[1] for x in ab])
@@ -841,18 +795,15 @@ def gdn_cp_bwd(grad, q, k, v, g, beta, state, *, z, conv1d_weight, dt_bias, a_lo
     g_nw = zero(norm_weight)
     d_state = zero(state)
     dA_pre, dB_pre = [], []
-    g_windows: list = [None] * len(parts)
     for i, s in enumerate(parts):
-        r = _gdn_backward_window(
+        r = gdn_backward(
             grad[:, s], q[:, s], k[:, s], v[:, s], g[:, s], beta[:, s],
             a_pre[i] @ state + b_pre[i], z=z[:, s], conv1d_weight=conv1d_weight,
-            dt_bias=dt_bias, a_log=a_log, norm_weight=norm_weight,
-            conv_window=conv_windows[i])
-        (tq, tk, tv, tg, tb, dS_in, tz, tc, tdt, tal, tnw, tw) = r
+            dt_bias=dt_bias, a_log=a_log, norm_weight=norm_weight, conv_window=None)
+        (tq, tk, tv, tg, tb, dS_in, tz, tc, tdt, tal, tnw) = r
         gq[:, s] += tq; gk[:, s] += tk; gv[:, s] += tv; gg[:, s] += tg; gb[:, s] += tb
         gz[:, s] += tz
         g_conv += tc; g_dt += tdt; g_al += tal; g_nw += tnw
-        g_windows[i] = tw
         d_state += a_pre[i].mT @ dS_in
         dA_pre.append(dS_in @ state.mT)
         dB_pre.append(dS_in)
@@ -861,27 +812,10 @@ def gdn_cp_bwd(grad, q, k, v, g, beta, state, *, z, conv1d_weight, dt_bias, a_lo
     for i, s in enumerate(parts):
         r = gdn_span_ab_raw_bwd(
             dA_span[i], dB_span[i], q[:, s], k[:, s], v[:, s], g[:, s], beta[:, s],
-            state.shape, conv1d_weight=conv1d_weight, dt_bias=dt_bias, a_log=a_log,
-            conv_window=conv_windows[i], chunk=chunk)
-        (sq, sk, sv, sg, sb, sc, sdt, sal, sw) = r
+            state.shape, conv1d_weight=conv1d_weight, dt_bias=dt_bias, a_log=a_log, chunk=chunk)
+        (sq, sk, sv, sg, sb, sc, sdt, sal) = r
         gq[:, s] += sq; gk[:, s] += sk; gv[:, s] += sv; gg[:, s] += sg; gb[:, s] += sb
         g_conv += sc; g_dt += sdt; g_al += sal
-        if sw is not None:
-            g_windows[i] = sw if g_windows[i] is None else g_windows[i] + sw
-    # Route window cotangents (token + span paths) onto the predecessor chunks' tails.
-    # width is the halo size every non-first chunk gets; conv_windows[0] is None (chunk 0),
-    # so derive it from any present window, not from index 0.
-    present = [w for w in conv_windows if w is not None]
-    width = present[0].shape[1] if present else 0
-    if width:
-        qkv = torch.stack([torch.cat([q[:, s], k[:, s], v[:, s]], dim=-1) for s in parts])
-        tail = cp_halo_bwd(g_windows, qkv, pg, rank, world, chunk_ids, width)
-        qd, kd = q.shape[-1], k.shape[-1]
-        for i, s in enumerate(parts):
-            if tail[i].abs().sum() > 0:
-                gq[:, s][:, -width:] += tail[i][..., :qd]
-                gk[:, s][:, -width:] += tail[i][..., qd:qd + kd]
-                gv[:, s][:, -width:] += tail[i][..., qd + kd:]
     return gq, gk, gv, gg, gb, d_state, gz, g_conv, g_dt, g_al, g_nw
 
 
@@ -1181,12 +1115,10 @@ def gdn_forward(
 linear_attn_chunk = gdn_forward  # the op name in the backend contract
 
 
-def _gdn_prep_save(q, k, v, g, beta, key_dim, conv1d_weight, dt_bias, a_log,
-                   conv_window=None):
-    """Prep forward of :func:`gdn_forward`, returning every intermediate the chunk core
-    and the prep adjoint need. Shared by :func:`gdn_backward` and :func:`gdn_cp_bwd` so
-    there is one prep reverse. With a ``conv_window`` the convolution reads
-    ``full = [window; qkv]`` (width K-1); output row j is ``sum_tap w_tap full[j+tap]``.
+def _gdn_prep_save(q, k, v, g, beta, key_dim, conv1d_weight, dt_bias, a_log):
+    """Prep forward of :func:`gdn_forward` with zero left padding, returning every
+    intermediate the chunk core and the prep adjoint need. Shared by
+    :func:`gdn_backward` and :func:`gdn_cp_bwd` so there is one prep reverse.
     Keyed dict rather than positional locals: the CP backward calls this per chunk."""
     b, t, _ = q.shape
     nvh = g.shape[-1]
@@ -1194,16 +1126,11 @@ def _gdn_prep_save(q, k, v, g, beta, key_dim, conv1d_weight, dt_bias, a_log,
     nkh = q.shape[-1] // key_dim
     kernel = conv1d_weight.shape[1]
     qkv = torch.cat([q, k, v], dim=-1)
-    # Mirror gdn_prep's depthwise conv exactly (window prepended, left-padded, the carried
-    # positions sliced off the front): a second conv expression here would risk a forward
-    # whose window rows the production path never produces.
-    src = qkv if conv_window is None else torch.cat([_f32(conv_window), qkv], dim=1)
-    pre_pad = torch.zeros_like(src)
+    preact = torch.zeros_like(qkv)
     for tap in range(kernel):
         pad_left = kernel - 1 - tap
-        padded = torch.nn.functional.pad(src, (0, 0, pad_left, tap))
-        pre_pad = pre_pad + padded[:, : src.shape[1], :] * conv1d_weight[:, tap]
-    preact = pre_pad[:, -t:]  # drop the carried window positions
+        padded = torch.nn.functional.pad(qkv, (0, 0, pad_left, tap))
+        preact = preact + padded[:, :t, :] * conv1d_weight[:, tap]
     silu = lambda x: x * torch.sigmoid(x)
     q_raw = silu(preact[..., : nkh * key_dim]).view(b, t, nkh, key_dim)
     k_raw = silu(preact[..., nkh * key_dim : 2 * nkh * key_dim]).view(b, t, nkh, key_dim)
@@ -1215,23 +1142,21 @@ def _gdn_prep_save(q, k, v, g, beta, key_dim, conv1d_weight, dt_bias, a_log,
     bt = torch.sigmoid(beta).view(b, t, nvh)
     sp_in = g + dt_bias
     gt = -torch.exp(a_log) * torch.nn.functional.softplus(sp_in)
-    return dict(qkv=qkv, src=src, preact=preact, q_raw=q_raw, k_raw=k_raw, v_raw=v_raw,
-                rq=rq, rk=rk, qn=qn, kn=kn, bt=bt, gt=gt, sp_in=sp_in, cw=conv1d_weight,
-                a_log=a_log, nkh=nkh, nvh=nvh, key_dim=key_dim, val_dim=val_dim,
-                kernel=kernel, width=0 if conv_window is None else conv_window.shape[1])
+    return dict(qkv=qkv, preact=preact, q_raw=q_raw, k_raw=k_raw, v_raw=v_raw, rq=rq, rk=rk,
+                qn=qn, kn=kn, bt=bt, gt=gt, sp_in=sp_in, cw=conv1d_weight, a_log=a_log,
+                nkh=nkh, nvh=nvh, key_dim=key_dim, val_dim=val_dim, kernel=kernel)
 
 
 def _gdn_prep_backward(sv, g_qn, g_kn, g_v_raw, g_bt, g_gt):
     """Adjoint of :func:`_gdn_prep_save`: prepped-input cotangents ->
-    (gq, gk, gv, gg, gbeta, gconv1d, gdt_bias, ga_log, gwindow). ``gwindow`` is the
-    conv-window cotangent (None on the zero-window path)."""
-    full, preact, cw, a_log = sv["src"], sv["preact"], sv["cw"], sv["a_log"]
+    (gq, gk, gv, gg, gbeta, gconv1d, gdt_bias, ga_log). Zero left-padding path."""
+    qkv, preact, cw, a_log = sv["qkv"], sv["preact"], sv["cw"], sv["a_log"]
     q_raw, k_raw = sv["q_raw"], sv["k_raw"]
     rq, rk = sv["rq"], sv["rk"]
     bt, gt, sp_in = sv["bt"], sv["gt"], sv["sp_in"]
-    nkh, nvh, key_dim, val_dim, kernel, width = (
-        sv["nkh"], sv["nvh"], sv["key_dim"], sv["val_dim"], sv["kernel"], sv["width"])
-    b, t = preact.shape[0], preact.shape[1]
+    nkh, nvh, key_dim, val_dim, kernel = (
+        sv["nkh"], sv["nvh"], sv["key_dim"], sv["val_dim"], sv["kernel"])
+    b, t = qkv.shape[0], qkv.shape[1]
     g_a_log = (g_gt * gt).sum(dim=(0, 1))
     g_sp_in = g_gt * (-torch.exp(a_log)) * torch.sigmoid(sp_in)
     g_g = g_sp_in.reshape(b, t, nvh)
@@ -1251,26 +1176,18 @@ def _gdn_prep_backward(sv, g_qn, g_kn, g_v_raw, g_bt, g_gt):
         g_k_raw.reshape(b, t, nkh * key_dim) * dsilu[..., nkh * key_dim : 2 * nkh * key_dim])
     g_preact[..., 2 * nkh * key_dim :] = (
         g_v_raw.reshape(b, t, nvh * val_dim) * dsilu[..., 2 * nkh * key_dim :])
-    # Adjoint of the depthwise conv. Forward: preact[r] = sum_tap w_tap src[w+r+tap-(K-1)]
-    # with src = qkv (w=0) or [window; qkv] (w=K-1). Walk the same index map, so the
-    # window rows collect their own cotangent; the carried/padded positions get nothing.
-    g_src = torch.zeros_like(full)
+    g_qkv = torch.zeros_like(qkv)
     g_conv = torch.zeros_like(cw)
     for tap in range(kernel):
-        rlo = max(0, kernel - 1 - tap - width)
-        rhi = min(t, t + kernel - 1 - tap)
-        if rhi <= rlo:
-            continue
-        ridx = torch.arange(rlo, rhi, device=full.device)
-        iidx = width + ridx + tap - (kernel - 1)
-        g_src[:, iidx] += cw[:, tap] * g_preact[:, ridx]
-        g_conv[:, tap] = (full[:, iidx] * g_preact[:, ridx]).sum(dim=(0, 1))
-    g_window = g_src[:, :width] if width else None
-    g_qkv = g_src[:, width:]
+        shift = tap - (kernel - 1)
+        lo_q, hi_q = max(0, shift), shift + t
+        lo_g, hi_g = max(0, -shift), t
+        g_qkv[:, lo_q:hi_q, :] += cw[:, tap] * g_preact[:, lo_g:hi_g, :]
+        g_conv[:, tap] = (qkv[:, lo_q:hi_q, :] * g_preact[:, lo_g:hi_g, :]).sum(dim=(0, 1))
     g_q = g_qkv[..., : nkh * key_dim]
     g_k = g_qkv[..., nkh * key_dim : 2 * nkh * key_dim]
     g_v = g_qkv[..., 2 * nkh * key_dim :]
-    return g_q, g_k, g_v, g_g, g_beta, g_conv, g_dt_bias, g_a_log, g_window
+    return g_q, g_k, g_v, g_g, g_beta, g_conv, g_dt_bias, g_a_log
 
 
 def gdn_backward(
@@ -1290,24 +1207,10 @@ def gdn_backward(
     conv_window: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Backward of :func:`gdn_forward`: (gq,gk,gv,gg,gbeta,gstate,gz,gconv1d,
-    gdt_bias,ga_log,gnorm_weight). Only a zero ``conv_window`` is exact through this
-    public entry (non-CP training starts from one); the CP path with a real window calls
-    :func:`_gdn_backward_window` and routes the window grad across ranks."""
+    gdt_bias,ga_log,gnorm_weight). Only a zero ``conv_window`` is exact
+    (training forwards start from one); a non-zero window raises."""
     if conv_window is not None and bool(conv_window.any()):
         raise NotImplementedError("gdn_backward does not support a non-zero conv_window")
-    out = _gdn_backward_window(
-        grad, q, k, v, g, beta, state, z=z, conv1d_weight=conv1d_weight, dt_bias=dt_bias,
-        a_log=a_log, norm_weight=norm_weight, conv_window=conv_window)
-    return out[:11]
-
-
-def _gdn_backward_window(
-    grad, q, k, v, g, beta, state, *, z, conv1d_weight, dt_bias, a_log,
-    norm_weight, conv_window=None,
-):
-    """Same as :func:`gdn_backward` but carries the conv window and returns its grad last:
-    ``(…11…, g_window)``. Used by :func:`gdn_cp_bwd`, where each chunk starts from a
-    halo exchanged from another rank."""
     dev = q.device
     q = _f32(q)
     k = _f32(k)
@@ -1320,16 +1223,13 @@ def _gdn_backward_window(
     dt_bias = _f32(dt_bias).to(dev)
     a_log = _f32(a_log).to(dev)
     norm_weight = _f32(norm_weight).to(dev)
-    if conv_window is not None:
-        conv_window = _f32(conv_window).to(dev)
     go = _f32(grad)
     b, t, _ = q.shape
     nvh, key_dim, val_dim = state.shape[1], state.shape[2], state.shape[3]
     nkh = q.shape[-1] // key_dim
 
-    # ---- forward (prep shared, folding the carried window, then the recurrence) ----
-    sv = _gdn_prep_save(q, k, v, g, beta, key_dim, conv1d_weight, dt_bias, a_log,
-                        conv_window=conv_window)
+    # ---- forward (prep shared, then the chunkwise recurrence) ----
+    sv = _gdn_prep_save(q, k, v, g, beta, key_dim, conv1d_weight, dt_bias, a_log)
     qn, kn, v_raw, bt, gt = sv["qn"], sv["kn"], sv["v_raw"], sv["bt"], sv["gt"]
     rep = nvh // nkh
     assert nkh * rep == nvh, (nkh, nvh)
@@ -1375,9 +1275,9 @@ def _gdn_backward_window(
     # value-head grads fold back onto contiguous key-head groups
     g_qn = g_qnv.reshape(b, t, nkh, rep, key_dim).sum(3)
     g_kn = g_knv.reshape(b, t, nkh, rep, key_dim).sum(3)
-    g_q, g_k, g_v, g_g, g_beta, g_conv, g_dt_bias, g_a_log, g_window = _gdn_prep_backward(
+    g_q, g_k, g_v, g_g, g_beta, g_conv, g_dt_bias, g_a_log = _gdn_prep_backward(
         sv, g_qn, g_kn, g_v_raw, g_bt, g_gt)
-    return g_q, g_k, g_v, g_g, g_beta, dS, g_z, g_conv, g_dt_bias, g_a_log, g_norm_weight, g_window
+    return g_q, g_k, g_v, g_g, g_beta, dS, g_z, g_conv, g_dt_bias, g_a_log, g_norm_weight
 
 
 # ---------------------------------------------------------------- silu mul

@@ -150,8 +150,6 @@ class RefBackend:
         """See ``Backend.cp_halo``: left context for the depthwise conv."""
         if self.cp_world == 1:
             return [None] * len(ids_by_rank[self.cp_rank])
-        if width <= 0:
-            return [None] * len(ids_by_rank[self.cp_rank])
         import torch.distributed as dist
 
         tails = x[:, :, -width:].contiguous()

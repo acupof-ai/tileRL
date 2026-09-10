@@ -27,6 +27,7 @@ f32       = Format(bits=32)
 fp8_kv    = Format(bits=8,  scales=((head_dim, f32),))         # one f32 per plane x head x token
 nvfp4     = Format(bits=4,  scales=((16, e4m3), (None, f32)))  # disk: ModelOpt packing
 nvfp4_dev = Format(bits=4,  scales=((16, f32), ((None,), f32)))# device: f32 scales, f32/row
+nvfp4_dev_b32 = Format(bits=4, scales=((32, f32), ((None,), f32)))  # bf16 repacked at load (pack_fp4 block 32)
 fp8_block_dev = Format(bits=8, scales=(((128,128), f32),))               # fp8 block grid, no row scale
 fp8_dev   = Format(bits=8,  scales=(((128,128), f32), ((None,), f32)))  # fp8 grid + f32/row
 nbytes(fmt, shape) = numel * bits // 8 + sum(scale_count * itemsize for each plane)
@@ -38,9 +39,14 @@ budget call it; none of them carries an `element_size()` product of its own.
 The device faces differ from disk: `renorm_fp4_scale` widens the block scale to
 f32 and splits the global into a per-row epilogue, and the fp8 block grid is
 `[N/128,K/128]`. The **weights row comes from the checkpoint index, not config**
-— a 27B checkpoint mixes nvfp4 and fp8 linears (264/233), and which a key is
+— a 27B checkpoint mixes nvfp4 and fp8 linears (264/233; 96 of the 264 ship
+bf16 and are repacked at load block 32), and which a key is
 depends on its tensor names; `precision.checkpoint_weight_specs(dir)` classifies
-the safetensors headers (shapes only, no weight bytes).
+the safetensors headers (shapes only, no weight bytes). The SERVED map is
+`model.checkpoint_weight_faces(cfg, dir)`: it maps names through load_hf's key
+rules (dropping vision/MTP tensors the engine never loads) and reports a bf16
+linear in `fp4_param_keys` as `nvfp4_dev` under cfg.fp4, because load_hf packs
+those at load time.
 
 Checks: on the tiny model the derived pool bytes equal the storage bytes of
 `k_pool/v_pool/k_scale/v_scale` to the byte, under bf16 and under fp8; the
@@ -93,11 +99,18 @@ bound(shape) = max(bytes_moved / bandwidth, flops / peak)
 
 `bandwidth` and `peak` are one calibration row per card in the bench ledger (a
 copy kernel and a large GEMM), never a datasheet number. A kernels mode of `tilerl bench`
-prints `kernel / shape / bytes / flops / bound / ms / % of bound` for the kernels
-one 27B tick launches, and the tick's cost is their sum. Without a card the
-table prints from the declarations alone and the measured columns read
-`pending-remote`. The gate is that the attention decode kernel's `bytes_moved`
-equals the KV bytes the pool hands it, derived through the same `nbytes`.
+prints `kernel / shape / face / bytes / flops / bound / ms / % of bound` for the kernels
+one 27B tick launches, and the tick's cost is their sum. `--checkpoint DIR` prices every
+linear at the face `model.checkpoint_weight_faces(cfg, DIR)` derives from the headers
+(including load_hf's bf16→fp4 packing under cfg.fp4 at pack_fp4's block 32);
+without it all linears take the config's nvfp4 face. The 27B checkpoint is
+mixed (264 nvfp4 / 233 fp8 served faces), so the checkpoint-priced tick is
+22.36/25.63 GB at B=1/B=8 against 14.88/18.16 GB all-nvfp4.
+Without a card the table prints from the declarations alone and the measured columns read
+`pending-remote`. The gates are that the attention decode kernel's `bytes_moved`
+equals the KV bytes the pool hands it, derived through the same `nbytes`, and that a
+mixed tiny checkpoint reaches the table per linear at its own device face
+(`tests/test_kernel_cost.py`).
 
 ## What this replaces
 
