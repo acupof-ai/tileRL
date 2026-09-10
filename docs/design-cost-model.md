@@ -1,25 +1,22 @@
 # Cost model
 
-One primitive prices every byte and every kernel. Occupancy on the card, in host
-RAM and on the SSD is derived from it, and the allocator consumes that derivation
-instead of recomputing it. The invariant is
+One primitive prices every byte and kernel; card, host and SSD occupancy
+derives from it, consumed by the allocator. The invariant is
 
 ```
 peak = sum(static rows, derived) + transient
 ```
 
-with `derived == measured` on every static row; `transient` (attention partials,
-kernel workspace, graph pools, allocator slack) is measured as the remainder and
-reported as its own row, never folded into a tolerance.
+`derived == measured` on every static row; `transient` (partials, workspace,
+graph pools, slack) is the measured remainder, its own row, never a tolerance.
 
 ## Format
 
-`precision.Format` is the storage format of a tensor: bits per element plus zero
-or more scale planes. A scale plane is `(group, dtype)`: `group` is an int for
-one scale per that many elements along the last axis, or a tuple over the
-trailing axes (`None` = that whole axis); a bare `None` is one per tensor.
-Count = leading dims × Π ceil(trailing/group), so per-16 is `(16,)`, per-row
-`((None,),)`, and a 2-D `[N/128,K/128]` grid is `(128,128)`.
+`precision.Format` is bits per element plus scale planes `(group, dtype)`:
+`group` is an int for one scale per that many elements on the last axis, a
+tuple over trailing axes (`None` = that whole axis), or bare `None` for one per
+tensor. Count = leading dims × Π ceil(trailing/group): per-16 `(16,)`, per-row
+`((None,),)`, an `[N/128,K/128]` grid `(128,128)`.
 
 ```
 bf16      = Format(bits=16)
@@ -33,104 +30,106 @@ fp8_dev   = Format(bits=8,  scales=(((128,128), f32), ((None,), f32)))  # fp8 gr
 nbytes(fmt, shape) = numel * bits // 8 + sum(scale_count * itemsize for each plane)
 ```
 
-`nbytes` is the only byte arithmetic in the tree. `kv_cache.bytes_per_token`,
-the `num_blocks` fit in `build_engine`, the draft pool charge and the ISO frame
-budget call it; none of them carries an `element_size()` product of its own.
-The device faces differ from disk: `renorm_fp4_scale` widens the block scale to
-f32 and splits the global into a per-row epilogue, and the fp8 block grid is
-`[N/128,K/128]`. The **weights row comes from the checkpoint index, not config**
-— a 27B checkpoint mixes nvfp4 and fp8 linears (264/233; 96 of the 264 ship
-bf16 and are repacked at load block 32), and which a key is
-depends on its tensor names; `precision.checkpoint_weight_specs(dir)` classifies
-the safetensors headers (shapes only, no weight bytes). The SERVED map is
-`model.checkpoint_weight_faces(cfg, dir)`: it maps names through load_hf's key
-rules (dropping vision/MTP tensors the engine never loads) and reports a bf16
-linear in `fp4_param_keys` as `nvfp4_dev_b32` under cfg.fp4 — load_hf repacks it
-with pack_fp4's block 32, not the on-disk block-16 `nvfp4_dev`.
+`nbytes` is the only byte arithmetic in the tree: `kv_cache.bytes_per_token`,
+the `num_blocks` fit, the draft pool charge and the ISO frame budget call it;
+none carries its own `element_size()` product. Device faces differ from disk:
+`renorm_fp4_scale` widens the block scale to f32 and splits the global into a
+per-row epilogue; the fp8 block grid is `[N/128,K/128]`. The **weights row comes
+from the checkpoint index, not config** — the 27B checkpoint is 168 on-disk
+block-16 nvfp4 + 96 bf16 repacked at load block 32 = 264 served nvfp4 faces,
+plus 233 fp8, and a key's face depends on its tensor name.
+`precision.checkpoint_weight_specs(dir)` classifies the safetensors headers
+(shapes only); the SERVED map `model.checkpoint_weight_faces(cfg, dir)` applies
+load_hf's key rules (vision/MTP dropped) and maps a bf16 `fp4_param_keys` linear
+to `nvfp4_dev_b32` under cfg.fp4.
 
-Checks: on the tiny model the derived pool bytes equal the storage bytes of
-`k_pool/v_pool/k_scale/v_scale` to the byte, under bf16 and under fp8; the
-device-face Formats equal the served tensor storage (`pack_fp4`+renorm for
-nvfp4, the fp8 GEMV operands). At the 27B's 16 planes x 4 heads x 256 the
-formula gives 64 KiB per token on bf16 and 32 KiB + 512 B on fp8. The 27B
-resident weight total is 24.44 GB via `checkpoint_weight_specs` (pending-remote,
-`TILERL_27B_CKPT`); an all-fp4 derivation from config gives ~20.3 GB and is
-known-wrong because it cannot see the fp8 population.
+Checks: tiny-model derived pool bytes equal `k_pool/v_pool/k_scale/v_scale`
+storage to the byte under bf16 and fp8; device-face Formats equal served tensor
+storage (`pack_fp4`+renorm for nvfp4, fp8 GEMM operands). At 16 planes x 4
+heads x 256: 64 KiB/token bf16, 32 KiB + 512 B fp8. The 27B resident total is
+**24,436,981,888 B (24.44 GB)** — the exact header-only
+`memory.weight_row_faces(checkpoint_weight_faces(cfg, dir))` sum (raw
+`checkpoint_weight_specs` over-counts non-served tensors); no GPU needed. An
+all-fp4 config derivation gives ~15 GB and is known-wrong: it misses the fp8
+population.
 
 ## Plan
 
-`engine.plan(cfg, device_free, **engine_kw) -> list[Row]` is a pure function
-that lays the memory out before anything is allocated:
+`memory.plan(cfg, params, device_free, *, num_slots, num_blocks, ...) -> list[Row]`
+is a pure function laying the device rows out before anything is allocated:
 
 ```
-Row(tier, owner, fmt, shape, count)      # bytes = count * nbytes(fmt, shape)
+Row(tier, owner, bytes, note="")        # bytes already computed through nbytes
 tier  in {device, host, ssd}
-owner in {weights, kv_pool, draft_pool, state_slots, prefix_entries, graph_pad, staging}
+owner: weights, state_slots, kv_pool, draft_pool (held), plus *_budget rules
 ```
 
-The budget rules that exist today (`free * 2/3` for the pool, `free / 4` for
-`state_bytes`, `dram_bytes`, `BLOCK_TOKENS`) live in `plan`, each as the row it
-produces, so no constant is unnamed. `build_engine` allocates from the plan's
-rows: `num_blocks` is `plan`'s answer, not a second computation of it. Paged
-attention is therefore explicit: the pool is `num_blocks x per_block` with the
-fp8 scale plane inside `per_block` (no separate scale row), and a request's
-occupancy is `blocks_used x per_block`. A prefix entry on the device is pool
-blocks and a state slot already counted; it becomes a row only when demoted to
-`host` or `ssd`, where the copy is new bytes. The trainer's tape is outside
-`plan` until training shares it.
+The Row carries the byte total, not fmt/shape/count — those feed the `nbytes`
+call. Budget rules (`free*2/3` pool, `free/4` for `state_bytes`, `dram_bytes`,
+`BLOCK_TOKENS`) emit their own `kv_pool_budget`/`prefix_entries_budget` rows so
+a sum over allocations skips them. `build_engine` allocates from the rows:
+`fit_num_blocks` fits `num_blocks`; the draft pool is its OWN row
+(`per_kv_block_bytes` excludes it, no double count). The pool is
+`num_blocks x per_block`, the fp8 scale plane inside `per_block`; a request's
+occupancy is `blocks_used x per_block`. A device prefix entry is pool blocks
+plus a state slot already counted — a row only when demoted to `host`/`ssd`.
 
-`stats()["memory"]` returns the same rows with a measured column: on cuda the
-`memory_allocated` difference around each owner's allocation, on cpu the storage
-sum, and `transient = max_memory_allocated - sum(static rows)`. A dry-run mode of
-`tilerl serve` prints the plan as JSON without a card; `--dry-run --checkpoint DIR`
-builds nothing and prices the weights row from `model.checkpoint_weight_faces(cfg, DIR)`
-(the served faces, headers only — non-serving tensors dropped and bf16 fp4 keys repacked
-block 32), fitting blocks arithmetically, so the 27B ledger runs on a GPU-less machine. The gate is
+`memory.memory_table` adds a measured column and closes the peak: the measured
+column is each owner's materialized tensor-storage sum on every target; on cuda
+the peak is `torch.cuda.max_memory_allocated` and a final `transient` row is
+`peak − Σ static`, so `peak = sum(static) + transient` to the integer;
+transient is suppressed without the peak measurement.
+`tilerl serve --dry-run` prints the table cardless; `--checkpoint DIR` prices
+the weights row header-only from `checkpoint_weight_faces` (off cuda pass
+`--device-free`); `--record-residency` (cuda) adds measured residency. Gate:
 `derived == measured` for `weights` and `kv_pool` on the tiny model; a nonzero
-delta on a static row on the 27B is an error entry, not a tolerance. Nothing here
-runs in the tick: `plan` is arithmetic at build time, `stats` reads counters.
+static-row delta on 27B is an error entry, not a tolerance. Nothing runs in the
+tick — `plan` is build-time arithmetic, the table reads counters.
 
 ## Kernel cost
 
-Each launched kernel declares two pure functions next to its registry entry:
+Each launched kernel declares a pure helper next to its registry entry:
 
 ```
-bytes_moved(shape) -> int      # in terms of nbytes(fmt, ...) of its operands
-flops(shape)       -> int
-bound(shape) = max(bytes_moved / bandwidth, flops / peak)
+(cfg, tick) -> (bytes, flops)   # per kernel; bytes via nbytes(fmt, ...), row keys "bytes"/"flops"
+bound = max(bytes / bandwidth, flops / peak)
 ```
 
-`bandwidth` and `peak` are one calibration row per card in the bench ledger (a
-copy kernel and a large GEMM), never a datasheet number. A kernels mode of `tilerl bench`
-prints `kernel / shape / face / bytes / flops / bound / ms / % of bound` for the kernels
-one 27B tick launches, and the tick's cost is their sum. `--checkpoint DIR` prices every
-linear at the face `model.checkpoint_weight_faces(cfg, DIR)` derives from the headers
-(including load_hf's bf16→fp4 packing under cfg.fp4 at pack_fp4's block 32);
-without it all linears take the config's nvfp4 face. The 27B checkpoint is
-mixed (264 nvfp4 / 233 fp8 served faces), so the checkpoint-priced tick is
-22.36/25.63 GB at B=1/B=8 against 14.88/18.16 GB all-nvfp4.
-Without a card the table prints from the declarations alone and the measured columns read
-`pending-remote`. The gates are that the attention decode kernel's `bytes_moved`
-equals the KV bytes the pool hands it, derived through the same `nbytes`, and that a
-mixed tiny checkpoint reaches the table per linear at its own device face
-(`tests/test_kernel_cost.py`).
+`bandwidth` and `peak` are one measured calibration row per card —
+`hbm_bw_gbs` (D2D copy, read+write) and `bf16_peak_tflops` (one big GEMM),
+written by `tilerl bench --calibrate --card N` through the benchrec validator;
+never a datasheet number. A kernels mode of `tilerl bench` prints
+`kernel / shape / face / bytes / flops / bound / ms / % of bound` for one 27B
+tick's kernels; the tick's cost is their sum. `--checkpoint DIR` prices every
+linear at the face `checkpoint_weight_faces` derives (including load_hf's
+bf16→fp4 repacking at pack_fp4 block 32); without it all linears take the
+config nvfp4 face. The mixed checkpoint makes the checkpoint-priced tick
+22.36/25.63 GB at B=1/B=8 against 14.88/18.16 GB all-nvfp4. Each GEMM's ms is
+timed through the kernel its OWN face resolves to (linear_fp4/linear_fp8),
+never a bf16 surrogate; `--prefill S` adds the prefill rows (one GEMM over
+M=S tokens, K/V written and read, chunked GDN forward; S=4096 = 155.26 GB /
+204.5 TFLOP). Without a card or calibration row, measured columns read
+`pending-remote` and only the bound is shown. Gates: decode K/V read and
+prefill K/V write each equal pool bytes through the same `nbytes`; GDN chunk
+matmul dims are cfg-derived; a mixed tiny checkpoint reaches the table per
+linear at its own device face (`tests/test_kernel_cost.py`,
+`tests/test_calibration.py`).
 
-## What this replaces
+## What this replaced
 
-The three hand-rolled byte products (`kv_cache.py`, `engine.py` twice), the
-bandwidth arithmetic inside the `bench_*/probe_*/profile_*` scripts, and the
-percent-of-HBM claims that live only in `docs/experience/`. A number in a wins
-or errors entry that the model cannot reproduce is corrected or marked stale.
+The three hand-rolled byte products (`kv_cache.py`, `engine.py` twice) moved to
+`nbytes`/`memory` (#458); 17 superseded probes deleted, three re-derived on
+device-face denominators (#461, #470); roofline/prefill/checkpoint faces/
+calibration in #457/#463/#466/#468; plan, checkpoint dry-run and the
+transient-peak close in #460/#465/#469. Percent-of-HBM claims the model cannot
+reproduce are corrected or stale; surviving card-only measurements stay in
+their wins/errors entries with a one-line rerun command.
 
 ## Ownership
 
-| Unit | Owner | Depends on |
-|------|-------|------------|
-| `Format`, `nbytes`, three call sites, byte-equality gate | cc | — |
-| `plan`, `build_engine` consumes it, serve dry-run, `stats()["memory"]` | 52 | Format |
-| `bytes_moved` / `flops` per kernel, bench kernels mode, calibration row | 5f | Format |
-| Recompute the recorded numbers, delete superseded probes | fourth executor | all three |
-
-Each unit is one PR, reviewed by a non-author on goal fit, entropy (fewest
-lines, no field without a consumer, reuse of `stats()` and the ledger schema) and
-the 27B path. GPU columns stay `pending-remote` until the cards return.
+| Unit | Owner | PRs |
+|------|-------|-----|
+| `Format`/`nbytes`, call sites, checkpoint faces, byte gate | cc | #458, #462 |
+| `plan`, dry-run, residency, transient peak | 52 | #460, #465, #469 |
+| kernel roofline, prefill rows, calibration | 5f | #457, #463, #466, #468 |
+| recompute recorded numbers, delete superseded probes | 65 | #461, #470 |
