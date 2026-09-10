@@ -194,6 +194,17 @@
         "script": "scripts/bench_api_routes.py",
         "required": []
       }
+    },
+    "device_resident_bytes": {
+      "unit": "bytes",
+      "direction": "none",
+      "weight": 0.0,
+      "shape": [
+        "card",
+        "static",
+        "transient"
+      ],
+      "why": "steady-state device residency peak and its split into named static allocations and transient scratch; closes peak = \u03a3 static + transient"
     }
   }
 }
