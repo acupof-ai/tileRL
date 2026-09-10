@@ -188,6 +188,17 @@ def _linear_attn_chunk(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
             yield ("kw", _GDN_KW[i - len(args)]), gi
 
 
+def _gdn_cp(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
+    # Same 11-grad order as _linear_attn_chunk; conv_windows/chunk_ids carry no grad
+    # (the halo reverse is the follow-up op, not part of this entry).
+    results = backend.gdn_cp_bwd(g, *args, **kw)
+    for i, gi in enumerate(results):
+        if i < len(args):
+            yield i, gi
+        else:
+            yield ("kw", _GDN_KW[i - len(args)]), gi
+
+
 def _checkpoint(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
     sub = Tape()
     sub.bwd_backend = backend
@@ -266,6 +277,7 @@ _BWD: dict[str, _Handler] = {
     "attention": _attention,
     "paged_attention": _paged_attention,
     "linear_attn_chunk": _linear_attn_chunk,
+    "gdn_cp": _gdn_cp,
     "silu_mul": _default("silu_mul"),
     "embedding": _embedding,
     "reshape": _reshape,
