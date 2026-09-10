@@ -93,6 +93,33 @@ def fp4_param_keys(cfg: ModelConfig) -> set[str]:
     return keys
 
 
+def checkpoint_weight_faces(
+    cfg: ModelConfig, ckpt_dir: str
+) -> dict[str, tuple[tuple[int, ...], precision.Format]]:
+    """Every served linear's param key -> (shape, device face) from checkpoint headers.
+
+    The fp4/fp8 split is a property of the checkpoint, not the config
+    (the 27B mixes both), so a tick's weight stream reads it here. Names map
+    through :func:`_param_key_for` exactly as :func:`load_hf` does; non-served
+    tensors and non-weights (norms, embeddings) are excluded. A bf16 linear in
+    :func:`fp4_param_keys` is reported as :data:`nvfp4_dev` when ``cfg.fp4`` --
+    load_hf packs those at load time, so their SERVED face is not their disk face.
+    """
+    from .precision import checkpoint_weight_specs, nvfp4_dev
+
+    fp4_keys = fp4_param_keys(cfg) if cfg.fp4 else set()
+    out: dict[str, tuple[tuple[int, ...], precision.Format]] = {}
+    for hf_name, shape, fmt in checkpoint_weight_specs(ckpt_dir):
+        for cand in (hf_name, hf_name.removesuffix(".weight_packed") + ".weight"):
+            key = _param_key_for(cand)
+            if key is not None and key in param_specs(cfg) and len(shape) == 2:
+                if key in fp4_keys and fmt.scales == () and fmt.bits == 16:
+                    fmt = nvfp4_dev  # pack_fp4 at load: nibbles + f32/16 + f32/row
+                out[key] = (shape, fmt)
+                break
+    return out
+
+
 def _quantized(params: dict[str, torch.Tensor], key: str) -> bool:
     return f"{key}.wq" in params or f"{key}.w8" in params
 

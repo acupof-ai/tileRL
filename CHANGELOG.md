@@ -3,6 +3,10 @@
 One line per event — phase exit, default flip, accept-or-reject verdict — with
 its `docs/experience/` entry. Newest first.
 
+## 2026-09-11
+
+- **verdict** — the decode tick's weight stream is **22.36 GB at B=1 / 25.64 GB at B=8**, not the 14.88/18.16 GB the 09-10 ledger derived from the all-nvfp4 config face. The shipped checkpoint mixes 264 nvfp4 and 233 fp8 linears (96 bf16 in_proj_a/b are packed to nvfp4 at load); `bench --kernels --checkpoint DIR` now prices each linear from its checkpoint device face via the single shared `model.checkpoint_weight_faces(cfg, dir)`. The +7.48 GB delta is batch-invariant (weights stream once); weight-only 21.91 GB agrees with the 2026-09-03 measured 21.89 GB. Header-only, no GPU; measured ms columns stay pending-remote. — [wins/2026-09-11-decode-tick-weight-bytes-come-from-the-checkpoint.md](docs/experience/wins/2026-09-11-decode-tick-weight-bytes-come-from-the-checkpoint.md)
+
 ## 2026-09-10
 
 - **default flip (pending-remote)** — the P1 retry recipe `grpo-gsm8k-27b` turns the self-judge on (`judge=True`) and raises the rollout cap 256 → 512. Under `--judge` tests split pass/fail first and the policy's pairwise ordering only ranks inside those bands, so the ~60% correctness-saturated groups carry gradient again without a wrong answer ever outranking a right one; the length term never reaches the advantage on that path (and #443 already zeroes constant-signal groups off it). Also: `judge` enters the manifest id, and `--eval-gsm8k` now refuses prompts shared with `--data` (the held-out gate was green at 100% contamination). Mechanism prediction is **flat / no collapse** (the judge rescues all-correct groups' style gradient; the missed questions sit in mixed groups the binary reward already penalizes), so clearing +25/500 rests on the unmeasured transfer hypothesis — the +25/500 gate stays the verdict, flat-non-collapsed is the success bar. Acceptance is a two-seed pod pair. — [wins/2026-09-10-the-p1-retry-recipe-turns-the-self-judge-on.md](docs/experience/wins/2026-09-10-the-p1-retry-recipe-turns-the-self-judge-on.md)

@@ -1606,23 +1606,28 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
     """
     from . import config as config_mod
     from . import kernel_cost
-    from .precision import kv_format, nvfp4
+    from .model import checkpoint_weight_faces
+    from .precision import fp8_block_dev, fp8_dev, kv_format, nvfp4, nvfp4_dev
 
     cfg = config_mod.qwen38_27b() if args.model == "qwen38-27b" else config_mod.tiny()
     batches = tuple(int(x) for x in args.batches.split(",")) if args.batches else (1, 8)
-    print(f"# {cfg.name} decode tick, context s={args.context} tokens, fp8 KV, nvfp4 weights")
-    print(f"{'kernel':<26} {'count':>5} {'shape':>22} {'bytes':>12} {'flops':>10} "
+    faces = checkpoint_weight_faces(cfg, args.checkpoint) if args.checkpoint else None
+    face_label = {nvfp4: "nvfp4", nvfp4_dev: "nvfp4", fp8_block_dev: "fp8blk", fp8_dev: "fp8"}
+    src = f"checkpoint {args.checkpoint}" if faces is not None else "nvfp4 weights (config face)"
+    print(f"# {cfg.name} decode tick, context s={args.context} tokens, fp8 KV, {src}")
+    print(f"{'kernel':<26} {'count':>5} {'shape':>22} {'face':>7} {'bytes':>12} {'flops':>10} "
           f"{'ms':>11} {'%bound':>11}")
     for b in batches:
         tick = kernel_cost.TickShape(b=b, s=args.context, kv=kv_format(cfg.head_dim),
-                                     weight=nvfp4)
+                                     weight=nvfp4, faces=faces)
         print(f"-- batch B={b} --")
         for r in kernel_cost.tick_rows(cfg, tick):
             print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} "
+                  f"{face_label.get(r['face'], 'bf16'):>7} "
                   f"{r['bytes'] * r['count']:>12,} {r['flops'] * r['count']:>10,} "
                   f"{'pending':>11} {'pending':>11}")
         tb, tf = kernel_cost.tick_totals(cfg, tick)
-        print(f"{'TICK TOTAL':<26} {'':>5} {'':>22} {tb:>12,} {tf:>10,}")
+        print(f"{'TICK TOTAL':<26} {'':>5} {'':>22} {'':>7} {tb:>12,} {tf:>10,}")
 
 
 def cmd_bench(args: argparse.Namespace) -> None:
@@ -2033,6 +2038,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="print the per-kernel roofline table (bytes/flops), no GPU")
     p_bench.add_argument("--context", type=int, default=4096,
                          help="pooled context tokens the --kernels decode reads against")
+    p_bench.add_argument("--checkpoint", default=None,
+                         help="--kernels: price weights from this checkpoint dir's actual "
+                              "nvfp4/fp8 device faces instead of the all-nvfp4 config face")
     for v in ("table", "readme", "regress", "questions", "collectors"):
         p_bench.add_argument(f"--{v}", action="store_true",
                              help=f"bench view: {v} from the bench store, no GPU")

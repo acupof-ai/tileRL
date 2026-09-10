@@ -3,7 +3,8 @@
 Each launched kernel declares the bytes it moves and the flops it performs at a
 concrete shape, priced through :func:`tilerl.precision.nbytes` — the ONLY byte
 arithmetic (docs/design-cost-model.md, "Kernel cost"). Weight bytes come from
-:func:`tilerl.model.param_specs`, so a declaration never restates a matrix dim.
+:func:`tilerl.model.param_specs`, or per linear from the checkpoint's device
+faces (``TickShape.faces``), so a declaration never restates a matrix dim.
 
 The table is the ground-truth side of ``tilerl bench --kernels``. GPU timing is a
 separate calibration; without a card the measured columns render
@@ -37,13 +38,16 @@ class TickShape:
     s: int
     kv: Format
     weight: Format
+    #: param key -> (shape, device face) from a real checkpoint; when present every
+    #: linear is priced at its OWN face (the 27B mixes nvfp4 and fp8 linears).
+    faces: dict | None = None
 
 
-def _gemv(spec: tuple[int, int], t: TickShape) -> tuple[int, int]:
+def _gemv(spec: tuple[int, int], fmt: Format, t: TickShape) -> tuple[int, int]:
     """Decode linear y[b,out] = x[b,in] @ W^T[out,in]: weight streamed once,
     plus the b-row input/output."""
     out, inn = spec
-    bytes_ = nbytes(t.weight, spec) + nbytes(P.bf16, (t.b, inn)) + nbytes(P.bf16, (t.b, out))
+    bytes_ = nbytes(fmt, spec) + nbytes(P.bf16, (t.b, inn)) + nbytes(P.bf16, (t.b, out))
     return bytes_, 2 * t.b * out * inn
 
 
@@ -97,43 +101,55 @@ def tick_rows(cfg, t: TickShape) -> list[dict]:
     row per distinct weight shape); the fused kernels one per layer they appear
     on. Sums over rows times ``count`` are the tick's cost.
 
-    Each row: ``name, shape, count, bytes, flops`` (bytes/flops PER launch).
+    Each row: ``name, shape, count, bytes, flops, face`` (bytes/flops PER launch).
     """
     from .model import param_specs
 
     specs = param_specs(cfg)
     n_full = len(cfg.full_attn_layers)
     n_gdn = cfg.num_layers - n_full
-    full_layer = f"layers.{cfg.full_attn_layers[0]}" if n_full else None
-    gdn_layer = next(
-        (f"layers.{i}" for i in range(cfg.num_layers) if i not in set(cfg.full_attn_layers)), None
-    )
     rows: list[dict] = []
 
-    def add(name: str, shape: str, count: int, by: int, fl: int) -> None:
-        rows.append(dict(name=name, shape=shape, count=count, bytes=by, flops=fl))
+    def add(name: str, shape: str, count: int, by: int, fl: int,
+            face: Format | None = None) -> None:
+        rows.append(dict(name=name, shape=shape, count=count, bytes=by, flops=fl, face=face))
 
-    # nvfp4 linears, streamed once per launch; weight bytes priced through nbytes.
-    groups = [
-        (n_full, full_layer, ("q_proj", "k_proj", "v_proj", "o_proj")),
-        (n_gdn, gdn_layer, ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")),
-        (cfg.num_layers, gdn_layer, ("gate_proj", "up_proj", "down_proj")),
-    ]
-    for count, layer, keys in groups:
-        if not count or layer is None:
-            continue
+    # Enumerate every layer's actual launches, then collapse equal
+    # (key, shape, face) GEMVs to one row with the launch count. Without t.faces
+    # every launch takes t.weight, so the collapse yields one representative row
+    # per linear (e.g. gate_proj x 64); with faces each layer is priced at the
+    # face its OWN checkpoint weights carry (the 27B mixes nvfp4 and fp8).
+    faces = t.faces or {}
+    full_layers = set(cfg.full_attn_layers)
+    launches: list[tuple[str, tuple, Format]] = []
+    for i in range(cfg.num_layers):
+        keys = (
+            ("q_proj", "k_proj", "v_proj", "o_proj")
+            if i in full_layers
+            else ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")
+        )
+        keys += ("gate_proj", "up_proj", "down_proj")
         for k in keys:
-            spec = tuple(specs[f"{layer}.{k}"])
-            by, fl = _gemv(spec, t)
-            add(k, f"{spec[0]}x{spec[1]}", count, by, fl)
+            full = f"layers.{i}.{k}"
+            shape, fmt = faces.get(full, (tuple(specs[full]), t.weight))
+            launches.append((k, tuple(shape), fmt))
+    grouped: dict[tuple, int] = {}
+    order: list[tuple] = []
+    for sig in launches:
+        if sig not in grouped:
+            grouped[sig] = 0
+            order.append(sig)
+        grouped[sig] += 1
+    for k, shape, fmt in order:
+        by, fl = _gemv(shape, fmt, t)
+        add(k, f"{shape[0]}x{shape[1]}", grouped[(k, shape, fmt)], by, fl, fmt)
 
     # The lm_head multiplies the full [vocab, hidden] matrix EVERY decode step
-    # (the sampled row is the embedding lookup, a separate smaller op). Untied on
-    # the 27B and nvfp4-packed; ~0.64 GB, a larger stream than the fp8 KV scale.
+    # (the sampled row is the embedding lookup, a separate smaller op).
     if "lm_head" in specs:
-        spec = tuple(specs["lm_head"])
-        by, fl = _gemv(spec, t)
-        add("lm_head", f"{spec[0]}x{spec[1]}", 1, by, fl)
+        shape, fmt = faces.get("lm_head", (tuple(specs["lm_head"]), t.weight))
+        by, fl = _gemv(shape, fmt, t)
+        add("lm_head", f"{shape[0]}x{shape[1]}", 1, by, fl, fmt)
 
     ab, af = _paged_attention_decode(cfg, t)
     add(
