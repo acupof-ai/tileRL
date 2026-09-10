@@ -9,6 +9,7 @@ half calibration renders pending-remote rather than a datasheet number.
 from __future__ import annotations
 
 import json
+import subprocess
 
 import pytest
 
@@ -16,6 +17,9 @@ from tilerl import calibration as cal
 
 H20 = "NVIDIA H20"
 V100 = "Tesla V100-SXM2-16GB"
+#: a commit that exists in this repo so benchrec's commit-exists validator accepts it
+_HEAD_SHA = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                           text=True, check=True).stdout.strip()
 
 
 def _row(metric, value, unit, name, card=0):
@@ -95,12 +99,100 @@ def test_calibrate_refuses_off_cuda(monkeypatch):
         cli.cmd_bench_calibrate(args)
 
 
-def test_append_rows_roundtrip(tmp_path):
-    p = tmp_path / "sub" / "measurements.jsonl"
-    rows = [_row(cal.BW_METRIC, 4000.0, "GB/s", H20)]
-    cal.append_rows(rows, p)
-    got = cal.load_rows(p)
-    assert len(got) == 1 and got[0]["metric"] == cal.BW_METRIC and got[0]["id"]
+def _valid_row(metric, value, unit, name=H20, card=0):
+    """A row satisfying scripts/benchrec's full REQUIRED schema."""
+    return {
+        "metric": metric, "value": value, "unit": unit, "target": "sm90",
+        "build": "eager", "model": "device", "shape": {"card": card},
+        "warm": {"state": "warm", "compiles": None}, "n": 1, "spread": 0,
+        "device": {"name": name, "card": card},
+        "commit": _HEAD_SHA, "dirty": False,
+        "cmd": f"tilerl bench --calibrate --card {card}",
+        "floor": {"value": value, "unit": unit, "kind": "measured-best",
+                  "derivation": "test row; floor = this measurement"},
+    }
+
+
+def test_append_rows_goes_through_benchrec_validator(tmp_path):
+    """calibration.append_rows must route through scripts/benchrec.validate — a malformed
+    row is rejected and never reaches the file (no second, unvalidated writer)."""
+    p = tmp_path / "measurements.jsonl"
+    ids = cal.append_rows([_valid_row(cal.BW_METRIC, 4000.0, "GB/s")], p)
+    assert len(ids) == 1 and p.read_text().count("\n") == 1
+    # a row missing required fields / with a bogus unit is rejected by benchrec, not us.
+    bad = _valid_row(cal.BW_METRIC, 4000.0, "GB/s")
+    del bad["commit"]
+    with pytest.raises(Exception):  # benchrec.ValueError via append
+        cal.append_rows([bad], p)
+    assert p.read_text().count("\n") == 1, "rejected row must not reach the store"
+    bad_unit = _valid_row(cal.BW_METRIC, 4000.0, "TB/s")
+    with pytest.raises(Exception):
+        cal.append_rows([bad_unit], p)
+
+
+def test_resolve_row_kernel_is_the_declared_kernel_not_linear():
+    """The timing seam resolves the kernel by the row's weight FACE: nvfp4 faces ->
+    linear_fp4, fp8 faces -> linear_fp8, never the bf16 backend.linear — timing the
+    latter would divide packed bytes by a 2 B/weight kernel. A fake backend with
+    sentinels proves both resolutions and that fused rows, bf16 rows and unknown faces
+    resolve to None (pending), not a surrogate. The same row NAME split across faces
+    (the 27B's 233 fp8 linears among nvfp4 tiers) must resolve per face."""
+    from tilerl import precision as P
+
+    fp4_sentinel = lambda *a, **k: None  # noqa: E731
+    fp8_sentinel = lambda *a, **k: None  # noqa: E731
+
+    class FakeBackend:
+        linear_fp4 = staticmethod(fp4_sentinel)
+        linear_fp8 = staticmethod(fp8_sentinel)
+
+        def linear(self, *a, **k):  # the wrong-face kernel must never be chosen
+            raise AssertionError("bf16 linear must never time a quantized row")
+
+    fb = FakeBackend()
+    # every nvfp4 face the face map emits resolves the fp4 kernel
+    for face in (P.nvfp4, P.nvfp4_dev, P.nvfp4_dev_b32):
+        assert cal.resolve_row_kernel(fb, {"name": "down_proj", "face": face}) is fp4_sentinel
+    # both fp8 device faces resolve the fp8 kernel — the old name->linear_fp4 map
+    # sent every fp8 row to the wrong kernel
+    for face in (P.fp8_block_dev, P.fp8_dev):
+        assert cal.resolve_row_kernel(fb, {"name": "down_proj", "face": face}) is fp8_sentinel
+    # same row name, opposite face, opposite kernel: resolution is per face, not per name
+    assert cal.resolve_row_kernel(fb, {"name": "q_proj", "face": P.nvfp4_dev}) is fp4_sentinel
+    assert cal.resolve_row_kernel(fb, {"name": "q_proj", "face": P.fp8_dev}) is fp8_sentinel
+    # bf16 / faceless / fused rows have no declared timing kernel -> pending
+    assert cal.resolve_row_kernel(fb, {"name": "down_proj", "face": P.bf16}) is None
+    assert cal.resolve_row_kernel(fb, {"name": "down_proj"}) is None
+    assert cal.resolve_row_kernel(fb, {"name": "paged_attention_decode", "face": P.f32}) is None
+    assert cal.resolve_row_kernel(fb, {"name": "gdn_decode_fused"}) is None
+
+
+def test_pack_for_matches_the_resolved_face():
+    """The weight tensors _pack_for builds must match the kernel the face resolves to:
+    fp4 -> (wq nibbles, scale, oscale) for linear_fp4; fp8 -> (w8, wscale) for
+    linear_fp8. A wrong branch feeds linear_fp8 packed nibbles or linear_fp4 fp8
+    tensors — this gate pins the pairing without a card."""
+    import torch
+
+    from tilerl import precision as P
+
+    w = torch.randn(16, 32, dtype=torch.bfloat16)
+    (wq, scale4), kw4 = cal._pack_for(P.nvfp4_dev, w)
+    assert wq.dtype == torch.uint8 and tuple(wq.shape) == (16, 16)
+    assert set(kw4) == {"oscale"} and kw4["oscale"].shape == (16,)
+    # quant_fp8 pads to its 128x128 block grid
+    (w8, _wscale), kw8 = cal._pack_for(P.fp8_block_dev, torch.randn(128, 128, dtype=torch.bfloat16))
+    assert w8.dtype == torch.float8_e4m3fn and w8.shape == (128, 128)
+    assert kw8 == {}  # linear_fp8 synthesizes its ones grid/row
+
+
+def test_time_row_ms_pending_off_cuda_or_unknown_row(monkeypatch):
+    """Off cuda every row is pending; on cuda a row with no declared kernel still is."""
+    import torch
+
+    monkeypatch.setattr(torch, "cuda", type("C", (), {"is_available": lambda self: False})())
+    assert cal.time_row_ms(
+        {"name": "down_proj", "_spec": (4, 4), "face": None}, object(), 1, 8) is None
 
 
 def test_kernels_table_pending_when_no_calibration(tmp_path, monkeypatch, capsys):
@@ -112,7 +204,7 @@ def test_kernels_table_pending_when_no_calibration(tmp_path, monkeypatch, capsys
     from tilerl import cli
 
     args = argparse.Namespace(model="tiny", batches=None, context=4096, prefill=0,
-                              device_name="tiny-cpu-no-cal")
+                              checkpoint=None, device_name="tiny-cpu-no-cal")
     cli.cmd_bench_kernels(args)
     out = capsys.readouterr().out
     assert "pending-remote" in out

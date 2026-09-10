@@ -16,10 +16,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import time
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
+_ROOT = Path(__file__).resolve().parent.parent.parent
 
 #: one calibration row per (metric, device name) pair
 BW_METRIC = "hbm_bw_gbs"
@@ -214,51 +213,115 @@ def calibrate_rows(card: int) -> list[dict]:
     ]
 
 
-def append_rows(rows: list[dict], path: str | os.PathLike | None = None) -> None:
-    """Append calibration rows; reuse scripts/benchrec's validator when importable so a
-    malformed row is rejected by the same schema the other collectors satisfy."""
-    p = Path(path) if path is not None else store_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a") as f:
-        for r in rows:
-            r = dict(r)
-            r.setdefault("id", f"cal-{r['metric']}-{r['device']['card']}-{int(time.time())}")
-            r.setdefault("date", time.strftime("%Y-%m-%d"))
-            f.write(json.dumps(r, sort_keys=True) + "\n")
+def _benchrec():
+    """The single schema writer for the bench store. ``scripts/`` is not a packaged
+    module, so load it by path from the repo root; calibration rows must pass the SAME
+    validate/append every collector satisfies — there must not be a second writer."""
+    import importlib.util
+
+    br_path = _ROOT / "scripts" / "benchrec.py"
+    spec = importlib.util.spec_from_file_location("tilerl_benchrec", br_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def _linear_ms(backend, spec: tuple[int, int], m: int) -> float | None:
-    """CUDA-event ms of the actual registry linear kernel for an [m,K] x [K,N] GEMM,
-    weight streamed from HBM. Returns None off cuda — never a guessed number."""
+def append_rows(rows: list[dict], path: str | os.PathLike | None = None) -> list[str]:
+    """Validate and append through ``scripts/benchrec`` (the tree's one schema writer).
+    A row that fails its REQUIRED/unit/target/device/floor checks is rejected before the
+    file is opened — calibration is not a second, unvalidated writer. Returns the ids."""
+    br = _benchrec()
+    old = br.STORE
+    if path is not None:
+        br.STORE = Path(path)
+    try:
+        return [br.append(r) for r in rows]
+    finally:
+        br.STORE = old
+
+
+#: row weight face -> the backend kernel that serves it. The 27B mixes nvfp4 and
+#: fp8 linears, so the timed kernel is resolved from the row's OWN face — timing an
+#: fp8 row with linear_fp4 would divide fp8 bytes by a different kernel. A face
+#: absent here (bf16, fused ops) stays pending rather than running a surrogate.
+_FACE_KERNEL = {
+    "linear_fp4": ("nvfp4", "nvfp4_dev", "nvfp4_dev_b32"),
+    "linear_fp8": ("fp8_block_dev", "fp8_dev"),
+}
+
+
+def resolve_row_kernel(backend, row: dict):
+    """The callable serving this roofline row's weight face, or None when the row is
+    not a directly-timed quantized GEMM (bf16 row, fused attention/GDN/norms). The
+    kernel is chosen by the row's face Format so an fp8 row resolves linear_fp8 and
+    an nvfp4 row linear_fp4; never backend.linear (the bf16 surrogate)."""
+    from . import precision as P
+
+    face = row.get("face")
+    if face is None:
+        return None
+    kname = next(
+        (k for k, names in _FACE_KERNEL.items()
+         if any(getattr(P, n) == face for n in names)),
+        None,
+    )
+    if kname is None:
+        return None
+    fn = getattr(backend, kname, None)
+    return fn if callable(fn) else None
+
+
+def _pack_for(face, w_bf16):
+    """(args, kwargs) weight tensors for the kernel the face resolves to. fp4 gets the
+    block-32 pack + renorm split (scale + per-row oscale); fp8 gets the [128,128]
+    block grid and no oscale (the backend synthesizes its ones grid/row)."""
+    from tilerl_kernels import reference
+
+    from . import precision as P
+
+    if face in (P.nvfp4, P.nvfp4_dev, P.nvfp4_dev_b32):
+        wq, scale = reference.pack_fp4(w_bf16)
+        scale, oscale = reference.renorm_fp4_scale(scale)
+        return (wq, scale), {"oscale": oscale}
+    w8, wscale = reference.quant_fp8(w_bf16)
+    return (w8, wscale), {}
+
+
+def _event_ms(fn) -> float:
     import torch
 
-    if not torch.cuda.is_available():
-        return None
-    out_n, inn = spec
-    dev = f"cuda:{getattr(backend, 'device', torch.device('cuda:0')).index or 0}"
-    x = torch.randn(m, inn, dtype=torch.bfloat16, device=dev)
-    w = torch.randn(out_n, inn, dtype=torch.bfloat16, device=dev)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     for _ in range(5):
-        backend.linear(x, w)
+        fn()
     torch.cuda.synchronize()
     start.record()
-    backend.linear(x, w)
+    fn()
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end)
 
 
 def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
-    """ms of the ACTUAL registry kernel for one roofline row, or None to render
-    pending-remote. The GEMM rows (linears, lm_head) time the real ``backend.linear``
-    with the row's own shape and m; fused attention/GDN/SIMT kernels need engine-shaped
-    inputs and stay pending rather than being timed with a surrogate — their timing
-    fixtures are the card-only probes, not a fabricated microbench."""
-    name = row["name"]
-    spec = row.get("_spec")
-    if spec is None:
+    """ms of the registry kernel the row's face DECLARES, or None to render
+    pending-remote. Inputs are packed to that kernel's weight face, so the measured ms
+    divides by the same packed bytes the roofline row declares — never a bf16
+    surrogate for an nvfp4/fp8 row, and never linear_fp4 for an fp8 row. Fused
+    kernels needing engine-shaped inputs return None (card-only probes)."""
+    import torch
+
+    if not torch.cuda.is_available():
         return None
-    m = b if name == "lm_head" else b * s
-    return _linear_ms(backend, tuple(spec), m)
+    fn = resolve_row_kernel(backend, row)
+    if fn is None or row.get("_spec") is None:
+        return None
+    out_n, inn = tuple(row["_spec"])
+    m = b if row["name"] == "lm_head" else b * s
+    dev = backend.device
+    x = torch.randn(m, inn, dtype=torch.bfloat16, device=dev)
+    w_bf16 = torch.randn(out_n, inn, dtype=torch.bfloat16, device=dev)
+    wargs, wkw = _pack_for(row["face"], w_bf16)
+    # identity assertion: the thing we time is the kernel object the row's face
+    # declared, not a substitute. resolve_row_kernel is the single resolution point.
+    assert fn is resolve_row_kernel(backend, row)
+    return _event_ms(lambda: fn(x, *wargs, **wkw))
