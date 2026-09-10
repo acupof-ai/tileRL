@@ -3958,11 +3958,11 @@ def test_a_row_waits_for_its_own_fetch_and_does_not_block_the_queue(tmp_path):
     The hold must therefore exist, and must NOT be a `break`: head-of-line would stall
     every other row for a read only the held one benefits from.
 
-    `_drain_clock` waits on the clock, not on a tick count. A tick budget bounds how long
-    the engine spins, not how long the reader thread takes, so on a slow or loaded box the
-    queue empties while the fetch is still in flight and this reads as 0 hits. Reproduce
-    with a 50 ms sleep at the top of `KvTier._fetch_loop`: tick-bounded fails 3/3,
-    clock-bounded passes 3/3.
+    Determinism: the in-flight precondition used to be a thread race -- the read could
+    finish before the first tick on a fast box, so the hold never fired and the test went
+    red (or passed by speed). `KvTier.hold_fetches_for_test` parks the reader with the key
+    already in ``_fetching`` (an Event the test waits on, not a sleep), so the first tick
+    is guaranteed to observe the in-flight fetch; releasing the gate lets it land.
     """
     cfg = tiny()
     params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=3)
@@ -3988,21 +3988,30 @@ def test_a_row_waits_for_its_own_fetch_and_does_not_block_the_queue(tmp_path):
 
     cold = engine_at()
     assert cold.stats()["ssd_recovered"] >= 1, "fixture: the restart recovered no entry"
-    held_id = cold.submit(list(warm) + list(other), params)  # turn 2 = turn 1 plus more
-    plain_id = cold.submit(other, params)                    # no prefetch of its own
-    cold.step()                                              # the tick the hold happens on
+    # Park the reader with any dequeued fetch registered in _fetching BEFORE submit, so the
+    # prefetch this submit enqueues is provably in flight at the first tick on any runner.
+    started, gate = cold._prefix._ssd.hold_fetches_for_test()
+    try:
+        held_id = cold.submit(list(warm) + list(other), params)  # turn 2 = turn 1 + more
+        assert started.wait(5.0), "the queued fetch never reached the reader"
+        assert cold._prefix.fetch_in_flight(list(warm) + list(other)), \
+            "fixture: the parked fetch is not observed in flight"
+        plain_id = cold.submit(other, params)                # no prefetch of its own
+        cold.step()                                        # the tick the hold happens on
 
-    # The hold sets the row aside and keeps going, so the row behind it runs in the SAME
-    # tick. A `break` here would leave both waiting, and this is what tells them apart.
-    waiting_after = {r.req_id for r in cold._waiting}
-    assert plain_id not in waiting_after, (
-        "the row behind the held one was still waiting after the tick: the hold is "
-        "blocking the queue head-of-line instead of setting its own row aside"
-    )
-    assert held_id in waiting_after, (
-        "the row whose fetch was in flight was admitted anyway, so the hold did not fire "
-        "and this test cannot see the bug it exists for"
-    )
+        # The hold sets the row aside and keeps going, so the row behind it runs in the SAME
+        # tick. A `break` here would leave both waiting, and this is what tells them apart.
+        waiting_after = {r.req_id for r in cold._waiting}
+        assert plain_id not in waiting_after, (
+            "the row behind the held one was still waiting after the tick: the hold is "
+            "blocking the queue head-of-line instead of setting its own row aside"
+        )
+        assert held_id in waiting_after, (
+            "the row whose fetch was in flight was admitted anyway, so the hold did not fire "
+            "and this test cannot see the bug it exists for"
+        )
+    finally:
+        gate.set()                                        # always release the parked read
     _drain_clock(cold)
 
     st = cold.stats()
