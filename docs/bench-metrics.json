@@ -194,6 +194,24 @@
         "script": "scripts/bench_api_routes.py",
         "required": []
       }
+    },
+    "hbm_bw_gbs": {
+      "unit": "GB/s",
+      "direction": "+",
+      "weight": 0.0,
+      "shape": [
+        "card"
+      ],
+      "why": "measured HBM ceiling from a >=1GiB D2D copy (read+write); the roofline byte floor"
+    },
+    "bf16_peak_tflops": {
+      "unit": "TFLOP/s",
+      "direction": "+",
+      "weight": 0.0,
+      "shape": [
+        "card"
+      ],
+      "why": "measured bf16 tensor peak from one large GEMM; the roofline flop floor"
     }
   }
 }
