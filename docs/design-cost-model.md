@@ -15,26 +15,40 @@ reported as its own row, never folded into a tolerance.
 ## Format
 
 `precision.Format` is the storage format of a tensor: bits per element plus zero
-or more scale planes. A scale plane is `(group, dtype)`: one scale of `dtype` per
-`group` elements along the last axis, `group=None` meaning one per tensor.
+or more scale planes. A scale plane is `(group, dtype)`: `group` is an int for
+one scale per that many elements along the last axis, or a tuple over the
+trailing axes (`None` = that whole axis); a bare `None` is one per tensor.
+Count = leading dims × Π ceil(trailing/group), so per-16 is `(16,)`, per-row
+`((None,),)`, and a 2-D `[N/128,K/128]` grid is `(128,128)`.
 
 ```
-bf16    = Format(bits=16)
-f32     = Format(bits=32)
-fp8_kv  = Format(bits=8,  scales=((head_dim, f32),))          # one f32 per plane x head x token
-nvfp4   = Format(bits=4,  scales=((16, e4m3), (None, f32)))   # ModelOpt packing
-nbytes(fmt, shape) = numel * bits // 8 + sum(numel // group * itemsize for each plane)
+bf16      = Format(bits=16)
+f32       = Format(bits=32)
+fp8_kv    = Format(bits=8,  scales=((head_dim, f32),))         # one f32 per plane x head x token
+nvfp4     = Format(bits=4,  scales=((16, e4m3), (None, f32)))  # disk: ModelOpt packing
+nvfp4_dev = Format(bits=4,  scales=((16, f32), ((None,), f32)))# device: f32 scales, f32/row
+fp8_dev   = Format(bits=8,  scales=(((128,128), f32), ((None,), f32)))  # device fp8 weight
+nbytes(fmt, shape) = numel * bits // 8 + sum(scale_count * itemsize for each plane)
 ```
 
 `nbytes` is the only byte arithmetic in the tree. `kv_cache.bytes_per_token`,
 the `num_blocks` fit in `build_engine`, the draft pool charge and the ISO frame
 budget call it; none of them carries an `element_size()` product of its own.
+The device faces differ from disk: `renorm_fp4_scale` widens the block scale to
+f32 and splits the global into a per-row epilogue, and the fp8 block grid is
+`[N/128,K/128]`. The **weights row comes from the checkpoint index, not config**
+— a 27B checkpoint mixes nvfp4 and fp8 linears (264/233), and which a key is
+depends on its tensor names; `precision.checkpoint_weight_specs(dir)` classifies
+the safetensors headers (shapes only, no weight bytes).
 
 Checks: on the tiny model the derived pool bytes equal the storage bytes of
-`k_pool/v_pool/k_scale/v_scale` to the byte, under bf16 and under fp8; the nvfp4
-formula equals the byte size a quantized tiny weight actually occupies. At the
-27B's 16 planes x 4 heads x 256 the formula gives 64 KiB per token on bf16 and
-32 KiB + 512 B on fp8, the numbers the docstrings state today.
+`k_pool/v_pool/k_scale/v_scale` to the byte, under bf16 and under fp8; the
+device-face Formats equal the served tensor storage (`pack_fp4`+renorm for
+nvfp4, the fp8 GEMV operands). At the 27B's 16 planes x 4 heads x 256 the
+formula gives 64 KiB per token on bf16 and 32 KiB + 512 B on fp8. The 27B
+resident weight total is 24.44 GB via `checkpoint_weight_specs` (pending-remote,
+`TILERL_27B_CKPT`); an all-fp4 derivation from config gives ~20.3 GB and is
+known-wrong because it cannot see the fp8 population.
 
 ## Plan
 
