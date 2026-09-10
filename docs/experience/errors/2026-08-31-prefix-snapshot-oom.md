@@ -30,6 +30,8 @@ long-context run had also passed — it generated only 33 tokens.
 
 144.00 MiB matches the failed allocation byte-for-byte.
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/bench_h2d.py` was deleted here; rerun it by hand with `TILERL_TARGET=cuda python3 scripts/bench_h2d.py`. The 149.6 MiB size is now derived through precision.nbytes (144 MiB GDN state + 5.6 MiB conv window).
+
 `_commit` publishes one every `BLOCK_TOKENS` (16) decode tokens. The dict is
 bounded only indirectly: `PrefixStore.on_evict` pops the snapshot when the
 store drops an entry, and the store evicts at `capacity`. But **`capacity`

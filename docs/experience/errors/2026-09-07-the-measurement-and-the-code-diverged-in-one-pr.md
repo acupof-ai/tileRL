@@ -13,6 +13,8 @@ faulted  wall 2.070s  ssd_hits 0  entries 1  recovered 1  prefetches 0
 "INVALID": "the faulted arm took 0 SSD hits with 1 entries recovered"
 ```
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/probe_ssd_read_miss.py` was deleted here; rerun it by hand with `scripts/pod_run.sh ssdprobe 1 -- /work/tl013/bin/python -u scripts/probe_ssd_read_miss.py`. No code replaces the instrument; this entry is the record, rebuild on a card from the command.
+
 Re-running at the merged baseline `0356a67` gave the same thing: 0 hits.
 
 ## What actually happened

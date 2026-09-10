@@ -8,9 +8,15 @@
 
 ## The measurement
 
-`scripts/probe_block_bytes.py` builds the two pools the way `build_engine` does
-(`engine.py:1191` for the trunk, `:358` for the draft's mirrored plane) and divides by
-`num_blocks`:
+Originally measured by the one-off `scripts/probe_block_bytes.py`, deleted in the
+2026-09-10 cost-model cleanup (its byte arithmetic is `precision.nbytes` now).
+Original run line, kept so the probe can be rebuilt by hand:
+`TILERL_TARGET=cpu python3 scripts/probe_block_bytes.py` — it built both pools as
+`build_engine` does (`engine.py:1191` for the trunk, `:358` for the draft plane)
+and divided by `num_blocks`. The same values are now derived through
+`precision.nbytes` (`PagedKvPool.bytes_per_token * BLOCK_TOKENS`, trunk plus the
+1-layer draft plane) and pinned by
+`tests/test_kv.py::test_a_block_costs_2125_kib_at_the_27b_shape`:
 
 | IO dtype | trunk | draft plane | per block |
 |---|---:|---:|---:|

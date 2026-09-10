@@ -93,9 +93,10 @@ Both mutations were run and both fail it: reverting the width rounding, and reve
 `nb = self.kv.num_blocks` widens a per-tick H2D copy, and `spec.py` builds its table with
 plain `torch.zeros` where `engine.py:667` pins its own. The draft's `step` runs on every
 decode tick (124 against 5 prefills in one served request), so this is ~25 copies per
-request, not one. Measured with `scripts/probe_bt_copy.py`, 200 reps, against the 5.54 ms
+request, not one. These numbers were measured with `scripts/probe_bt_copy.py`, 200 reps, against the 5.54 ms
 draft forward — both `nb` arms at both `n`, because comparing an n=8 row against the n=1
-pre-fix row read `+101 us` of "widening cost" that was mostly eight rows instead of one:
+pre-fix row read `+101 us` of "widening cost" that was mostly eight rows instead of one
+(**Provenance, 2026-09-10 cleanup:** the one-off `scripts/probe_bt_copy.py` was deleted here; rerun it by hand with `TILERL_TARGET=cuda python3 scripts/probe_bt_copy.py` — the byte counts are nbytes-derivable (n x nb x 8 for an int64 block table; shipped copy 2 KiB, worst case 259 KiB); the measured pageable/pinned microseconds are a card measurement and stay here as the record)
 
 | n | nb 6 → 256 | nb 6 → 4146 |
 |---:|---:|---:|

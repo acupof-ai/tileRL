@@ -210,6 +210,14 @@ follow from the survey and cost nothing architecturally:
    fp4 gets half the bandwidth. Evidence of an fp4 path cost exists, at a shape
    rollout never runs.
 
+   > **Provenance (2026-09-10 cleanup):** the 1157.9 / 33.1% / per-M ratios came
+   > from the one-off `scripts/probe_fp4_vs_bf16.py` and the 1144.7 GB/s from
+   > `scripts/probe_fp4_decode_gemm.py`; the matched-pair 73.5 vs 66.9 MB rates
+   > came from `scripts/probe_fp8_decode_gemm.py`. All three were deleted when
+   > their byte arithmetic moved to `precision.nbytes` / `kernel_cost.py`; the
+   > achieved rates are card measurements with no code replacement. Rerun by
+   > hand: `scripts/pod_run.sh --wait bf16cmp|fp4gemm|fp8rate <card> -- python3 scripts/<name>.py`.
+
 **A third method result, and the reason the utilisation figure above moved twice
 in one afternoon (21.8%, then 19.1%, now 20.4%).** Two sessions derived the weight
 bytes from shape independently and landed **1.9% apart** (18.23 and 18.58 GB)

@@ -70,6 +70,8 @@ the GDN backward port design prices the port as `backward_secs` 23.194 → 15.77
 **1.470x**, and calls that "on the step". It is a ratio on the **bucket** — the two were
 close enough to conflate when the bucket was 54% of the step, and are not now.
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/probe_gdn_upstream_floor.py` was deleted here; rerun it by hand with `scripts/pod_run.sh gdnfloor 6 -- python3 -u scripts/probe_gdn_upstream_floor.py`. No code replaces the instrument: the upstream-floor timing is a card measurement; this entry is the record, rebuild on a card from the command.
+
 Re-priced on the measured step: 1.470x on a 22.372 s bucket saves 7.153 s of 85.617, so
 the ceiling is **1.091x on the step**. Against a16ff9c's 54.4% bucket the same 1.470x
 would have read **1.211x**. Nothing about the port changed; the denominator did, because

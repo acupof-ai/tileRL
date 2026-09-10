@@ -167,6 +167,8 @@ figure is read off the live child rather than derived: `/health` on pid 3128149
 313786368 / 2 = **149.6 MiB** per snapshot. So 11 snapshots against 12 sessions —
 pressured, but by one session rather than by three.
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/bench_h2d.py` was deleted here; rerun it by hand with `TILERL_TARGET=cuda python3 scripts/bench_h2d.py`. The 149.6 MiB size is now derived through precision.nbytes (144 MiB GDN state + 5.6 MiB conv window).
+
 **An earlier draft of this entry said 9 snapshots from 8 GiB at 144 MiB, and both
 operands were wrong.** The 8 GiB is `PrefixStore`'s own default, not what this card
 runs: `build_engine` passes `mem_get_info()[0] // 4` and that quarter is taken

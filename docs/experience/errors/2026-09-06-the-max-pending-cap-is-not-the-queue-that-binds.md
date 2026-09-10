@@ -45,6 +45,8 @@ entries, `.st` a constant **149.6 MiB**, so **585.0 MiB per offer — 1.82x** th
 microbenchmark's entry. An entries-per-second drain rate cannot be carried between
 workloads when the quantity that binds is bytes.
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/bench_h2d.py` was deleted here; rerun it by hand with `TILERL_TARGET=cuda python3 scripts/bench_h2d.py`. The 149.6 MiB size is now derived through precision.nbytes (144 MiB GDN state + 5.6 MiB conv window).
+
 **2. What empties `_pending` is not the device.** `_flush_loop` pops an entry, calls
 `torch.save`, and removes it from `_pending` on return — and that return is a page-cache
 accept, not a durable write. Measured: `ssd_save_ms` 23611 ms over 144 saves = **164 ms per

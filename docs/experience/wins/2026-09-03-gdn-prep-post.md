@@ -84,6 +84,8 @@ the window. The WY numbers reproduce an earlier session to 0.15% / 0.06% /
 | GDN launches per layer | derived from the row above | 14 | 75 | 16 |
 | WY core, us/layer (fla 145.5) | measured | ~1400 | 137.4 | 121.8 |
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/profile_prefill.py` was deleted here; rerun it by hand with `CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src:packages/tilerl-kernels/src TILERL_TARGET=cuda python3 scripts/profile_prefill.py /work/Qwen3.8-27B-NVFP4`. Per-kernel prefill timings came from the deleted CUDA profiler; this entry is the record.
+
 **The prediction landed, and where it missed.** The launch-count argument
 rested on ~3875. Actual 3925 — **+50, +1.3%**, or 16 launches a layer where 15
 was predicted: one call a layer unaccounted. The 1.77x launch inflation that

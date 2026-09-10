@@ -16,6 +16,8 @@ faulted  wall 2.070s  ssd_hits 0  entries 1  recovered 1  prefetches 0
             so whatever it measured was not the tier"
 ```
 
+> **Provenance (2026-09-10 cleanup):** the one-off `scripts/probe_ssd_read_miss.py` was deleted here; rerun it by hand with `scripts/pod_run.sh ssdprobe 1 -- /work/tl013/bin/python -u scripts/probe_ssd_read_miss.py`. No code replaces the instrument: it drove the live tier and printed key/hashes; this entry is the record, rebuild on a card from the command.
+
 ## Root cause
 
 **A request looks up its prefix exactly once, at admission, and that is the one
