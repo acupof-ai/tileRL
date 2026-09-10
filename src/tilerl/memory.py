@@ -14,14 +14,10 @@ the weights, KV pool and state rows are exact (tests/test_memory_ledger.py).
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 
 from .kv_cache import BLOCK_TOKENS
 from .precision import Format, bf16, f32, kv_format, nbytes
-
-_ROOT = Path(__file__).resolve().parent.parent.parent
 
 #: budget rules build_engine uses (docs/design-cost-model.md); each is the row it makes.
 POOL_FRACTION = 2 / 3  # the KV pool takes 2/3 of post-weights free
@@ -177,8 +173,7 @@ STATIC_OWNERS = ("weights", "state_slots", "kv_pool", "draft_pool")
 
 
 def static_rows(rows: list[Row]) -> list[Row]:
-    """The held allocations in ``rows`` (budget rows excluded). Summed with transient
-    they equal the measured peak."""
+    """Held allocations; budget rows are excluded from peak = Σ static + transient."""
     return [r for r in rows if r.owner in STATIC_OWNERS]
 
 
@@ -200,21 +195,18 @@ def transient_bytes(rows: list[Row], peak_bytes: int) -> int:
 def memory_table(plan_rows: list[Row], measured: dict[str, int], peak_bytes: int | None):
     """ONE presentation of the device ledger, shared by ``serve --dry-run`` and /health.
 
-    Returns (rows, totals): one dict per static allocation and budget rule, in plan order,
-    with tier / owner / derived / measured / delta, followed by a final ``transient`` row
-    so ``sum(static) + transient == measured peak``, and per-tier totals over the HELD
-    allocations (static + transient; budget rows are excluded from the total).
+    One dict per static allocation and budget rule, in plan order, with tier / owner /
+    kind / derived / measured / delta, followed by a final ``transient`` row so
+    ``sum(static) + transient == measured peak``, and a ``{tier}_total`` row per tier
+    over the HELD allocations (budget rows excluded from the total).
 
     ``peak_bytes`` None (never measured — no forward has run, or off cuda with no peak)
-    suppresses the transient row rather than printing a guess.
+    suppresses the transient row and totals rather than printing a guess.
     """
     out: list[dict] = []
-    held_total = 0
     for r in plan_rows:
         held = r.owner in STATIC_OWNERS
         m = measured.get(r.owner)
-        if held:
-            held_total += r.n
         out.append(
             {
                 "tier": r.tier,
@@ -226,22 +218,22 @@ def memory_table(plan_rows: list[Row], measured: dict[str, int], peak_bytes: int
                 "delta": (r.n - m) if m is not None else None,
             }
         )
+    if peak_bytes is None:
+        return out
+    transient = transient_bytes(plan_rows, peak_bytes)
+    out.append(
+        {
+            "tier": "device",
+            "owner": "transient",
+            "kind": "allocation",
+            "derived": transient,
+            "note": "peak - Σ static",
+            "measured": transient,
+            "delta": 0,
+        }
+    )
+    # per-tier total over held allocations (static + transient), budget rows excluded
     totals: dict[str, int] = {}
-    if peak_bytes is not None:
-        transient = transient_bytes(plan_rows, peak_bytes)
-        out.append(
-            {
-                "tier": "device",
-                "owner": "transient",
-                "kind": "allocation",
-                "derived": transient,
-                "note": "peak - Σ static",
-                "measured": transient,
-                "delta": 0,
-            }
-        )
-        held_total += transient
-    # per-tier total over held allocations only
     for r in out:
         if r["kind"] == "allocation":
             totals[r["tier"]] = totals.get(r["tier"], 0) + r["derived"]
@@ -257,7 +249,7 @@ def memory_table(plan_rows: list[Row], measured: dict[str, int], peak_bytes: int
                 "delta": None,
             }
         )
-    return out, totals
+    return out
 
 
 def residency_row(
@@ -267,27 +259,19 @@ def residency_row(
     static_bytes: int,
     transient_bytes: int,
     target: str,
-    model: str = "27B-nvfp4",
+    model: str,
     build: str = "eager",
 ):
     """One ledger row recording steady-state device residency and its static/transient
     split, so occupancy lives in the same measurements.jsonl as the kernel roofline.
     The shape carries both halves of ``peak = static + transient``. ``target`` is the
-    benchrec target (sm90/sm70/cpu/metal = backend.arch) and ``card`` the physical GPU;
-    a card-less sm* row is benchrec-rejected, so the CLI refuses --record-residency
-    off cuda rather than fabricating one. Appended through scripts/benchrec (the one
-    schema writer), never written directly here."""
+    benchrec target (sm90/sm70/cpu/metal = backend.arch), ``model`` the served model
+    name, ``card`` the physical GPU; a card-less sm* row is benchrec-rejected, so the
+    CLI refuses --record-residency off cuda. Appended through scripts/benchrec via
+    cli._benchrec, never written directly here."""
+    from .cli import _benchrec
 
-    def _git(args):
-        try:
-            return subprocess.run(
-                ["git", *args], cwd=str(_ROOT), capture_output=True, text=True, check=True
-            ).stdout.strip()
-        except (OSError, subprocess.CalledProcessError):
-            return None
-
-    commit = _git(["rev-parse", "HEAD"]) or "unknown"
-    dirty = bool(_git(["status", "--porcelain"]))
+    br = _benchrec()
     return {
         "metric": "device_resident_bytes",
         "value": int(peak_bytes),
@@ -296,7 +280,7 @@ def residency_row(
         "build": build,
         "model": model,
         "shape": {
-            "card": card if card is not None else 0,
+            "card": card,
             "static": int(static_bytes),
             "transient": int(transient_bytes),
         },
@@ -304,8 +288,8 @@ def residency_row(
         "n": 1,
         "spread": 0,
         "device": {"name": device_name, "card": card},
-        "commit": commit,
-        "dirty": dirty,
+        "commit": br.git_commit(),
+        "dirty": br.git_dirty(),
         "cmd": "tilerl serve --dry-run --record-residency",
         "floor": {
             "value": int(peak_bytes),
@@ -318,16 +302,20 @@ def residency_row(
 
 
 def append_residency(row: dict, path: str | None = None) -> str:
-    """Validate + append through scripts/benchrec (the tree's one schema writer)."""
-    import importlib.util
+    """Validate + append through scripts/benchrec via cli._benchrec, the one
+    schema-writer loader."""
+    from pathlib import Path as _Path
 
-    br_path = _ROOT / "scripts" / "benchrec.py"
-    spec = importlib.util.spec_from_file_location("tilerl_benchrec", br_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    from .cli import _benchrec
+
+    br = _benchrec()
+    old = br.STORE
     if path is not None:
-        mod.STORE = Path(path)
-    return mod.append(row)
+        br.STORE = _Path(path)
+    try:
+        return br.append(row)
+    finally:
+        br.STORE = old
 
 
 def format_memory_table(rows: list[dict]) -> str:

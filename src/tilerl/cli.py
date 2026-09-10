@@ -18,7 +18,6 @@ from pathlib import Path
 from .eval import MATCHERS
 from .recipes import RECIPES, flags
 
-# ponytail: placeholder hub id; pin the real Qwen3-27B repo when weights land.
 _QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")
 
 _NO_WEIGHTS = (
@@ -186,9 +185,7 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
     if state_bytes:
         kw["state_bytes"] = state_bytes
     if kv_fp8:
-        import torch
-
-        kw["kv_fp8"] = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}[kv_fp8]
+        kw["kv_fp8"] = _kv_fp8(kv_fp8)
     # Text stop sequences are matched on decoded ids, so the engine needs the
     # tokenizer's decode; without it `submit` refuses a request that carries one.
     if decode is not None:
@@ -198,48 +195,63 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
     return engine_mod.build_engine(cfg, model, backend, **kw)
 
 
+def _device_free(args, backend) -> int:
+    """--device-free bytes, or the CUDA card's free; off cuda without the flag refuse."""
+    import torch
+
+    if args.device_free is not None:
+        return args.device_free
+    if backend.device.type == "cuda":
+        return int(torch.cuda.mem_get_info()[0])
+    sys.exit("error: --dry-run budget rows need --device-free BYTES off CUDA "
+             "(there is no card to read mem_get_info from)")
+
+
+def _kv_fp8(name: str | None):
+    """The --kv-fp8 flag value as a torch dtype (None when unset)."""
+    if not name:
+        return None
+    import torch
+
+    return {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}[name]
+
+
 def _dry_run_checkpoint(args, backend) -> None:
-    """--dry-run --checkpoint DIR: price the ledger from the safetensors HEADERS alone.
-    No model load, no engine, no card — the 27B query runs on a GPU-less Mac. Weights are
-    the served bytes model.checkpoint_weight_faces derives (load_hf's names and repacks;
-    the raw headers over-count non-served tensors); blocks are fitted arithmetically from
-    --device-free, so there is no measured column to reconcile against."""
+    """--dry-run --checkpoint DIR: price the ledger from safetensors HEADERS alone
+    (the served faces model.checkpoint_weight_faces derives), blocks fitted
+    arithmetically after the fixed weights + state-pool bytes. Same table as the built
+    --dry-run; peak is None so transient/totals are suppressed."""
     import torch as _torch
 
     from . import config as config_mod
     from .engine import _graph_on
-    from .memory import _state_bytes, fit_num_blocks, plan, weight_row_faces
+    from .memory import (
+        _state_bytes,
+        fit_num_blocks,
+        format_memory_table,
+        memory_table,
+        plan,
+        weight_row_faces,
+    )
     from .model import checkpoint_weight_faces
     from .precision import f32
 
     cfg = {"tiny": config_mod.tiny, "tiny-agent": lambda: config_mod.tiny(65536),
            "qwen38-27b": config_mod.qwen38_27b}[args.model]()
     faces = checkpoint_weight_faces(cfg, args.checkpoint)
-    if args.device_free is not None:
-        device_free = args.device_free
-    elif backend.device.type == "cuda":
-        device_free = int(_torch.cuda.mem_get_info()[0])
-    else:
-        sys.exit("error: --dry-run budget rows need --device-free BYTES off CUDA "
-                 "(there is no card to read mem_get_info from)")
-    # build_engine allocates LinearStatePool(num_slots + pad) and fits the KV pool from
-    # mem_get_info AFTER weights and that pool are resident; pad is the decode graph's
-    # replay row on CUDA (auto-on). Subtract the same fixed bytes and price the same slot
-    # count so the arithmetic fit sees what the card measures. spec_steps=0: no draft.
+    device_free = _device_free(args, backend)
+    # state slots add the decode-graph replay row on cuda (auto-on); the fit happens
+    # after weights and that pool are resident, so subtract the same fixed bytes.
     state_slots = args.slots + int(_graph_on(backend, None))
-    fixed = weight_row_faces(faces).n + _state_bytes(cfg, state_slots, f32)
-    free_after_fixed = max(0, device_free - fixed)
-    kv_fp8 = {"e4m3": _torch.float8_e4m3fn, "e5m2": _torch.float8_e5m2}.get(args.kv_fp8)
+    free_after_fixed = max(
+        0, device_free - weight_row_faces(faces).n - _state_bytes(cfg, state_slots, f32))
+    kv_fp8 = _kv_fp8(args.kv_fp8)
     num_blocks = args.blocks or fit_num_blocks(cfg, free_after_fixed, _torch.bfloat16, kv_fp8)
     rows = plan(cfg, None, free_after_fixed, num_slots=state_slots, num_blocks=num_blocks,
                 state_dtype=_torch.float32, kv_io=_torch.bfloat16, kv_fp8=kv_fp8,
                 explicit_state_budget=args.state_bytes, dram_budget=args.dram_bytes,
                 ckpt_faces=faces)
-    # Header-only: nothing is built, so no measured peak — memory_table suppresses the
-    # transient row and totals; this is the same surface the built --dry-run renders.
-    from .memory import format_memory_table, memory_table
-
-    table, _totals = memory_table(rows, {}, None)
+    table = memory_table(rows, {}, None)
     if args.json:
         print(json.dumps(table, indent=1))
     else:
@@ -283,33 +295,20 @@ def cmd_serve(args: argparse.Namespace) -> None:
     # never bind the HTTP port. --json prints the rows for the cost-model tooling. The budget
     # rows need device_free: the card's free on CUDA, else --device-free (bytes) is required.
     if args.dry_run:
-        import torch as _torch
+        from .memory import format_memory_table, memory_table, plan
 
-        from .memory import plan
-
-        if args.device_free is not None:
-            device_free = args.device_free
-        elif backend.device.type == "cuda":
-            device_free = int(_torch.cuda.mem_get_info()[0])
-        else:
-            sys.exit("error: --dry-run budget rows need --device-free BYTES off CUDA "
-                     "(there is no card to read mem_get_info from)")
+        device_free = _device_free(args, backend)
         kv, sp = engine._kv, engine._states
         draft_layers = (engine._draft.cfg.num_layers
                         if getattr(engine._draft, "kv", None) is not None else 0)
         rows = plan(cfg, model.params, device_free, num_slots=sp.num_slots,
                     num_blocks=kv.num_blocks, state_dtype=sp.states.dtype,
                     kv_io=kv.dtype, kv_fp8=kv.kv_fp8, draft_layers=draft_layers)
-        # One presentation surface: the same table (incl. transient + totals) the running
-        # server's /health serves from engine.stats()["memory"]. Reuse the engine's measured
-        # owner map and its measured peak rather than recomputing either.
-        from .memory import format_memory_table, memory_table
-
-        stats_rows = engine.stats()["memory"]
-        measured = {r["owner"]: r.get("measured") for r in stats_rows
+        # Same table (incl. transient + totals) /health serves from engine.stats()["memory"].
+        measured = {r["owner"]: r.get("measured") for r in engine.stats()["memory"]
                     if r.get("measured") is not None and r["kind"] == "allocation"}
         peak = engine._measured_peak_bytes()
-        table, _totals = memory_table(rows, measured, peak)
+        table = memory_table(rows, measured, peak)
         if args.json:
             print(json.dumps(table, indent=1))
         else:

@@ -967,69 +967,54 @@ class Engine:
                 "memory": self._memory_rows(),
             }
 
-    def _measured_peak_bytes(self) -> int | None:
-        """The resident-device byte peak the table closes against. On cuda this is the
-        torch allocator's high-water mark (reset at build); off cuda there is no allocator
-        peak, so the CPU tiny cell uses the storage sum of the held tensors — which equals
-        Σ static there and keeps transient exactly zero, the gate the ledger prints."""
-        import torch
-
-        if torch.cuda.is_available():
-            return int(torch.cuda.max_memory_allocated(self.device))
-        held = sum(t.numel() * t.element_size() for t in self._model.params.values())
+    def _held_storage(self) -> dict[str, int]:
+        """Measured bytes of each static owner from materialized tensor storage. This is
+        both the ledger's measured column and the CPU peak (off cuda there is no torch
+        allocator high-water). Pool sums include both fp8 scale grids: dropping them
+        makes derived != measured on the fp8 27B path by two planes."""
         kv, sp, draft = self._kv, self._states, getattr(self._draft, "kv", None)
-        held += sum(t.numel() * t.element_size() for t in
-                    (kv.k_pool, kv.v_pool, kv.k_scale, kv.v_scale) if t is not None)
-        held += sum(t.numel() * t.element_size() for t in
-                    (sp.states, sp.conv_windows, sp.step_states, sp.step_windows,
-                     sp.win_parity) if t is not None)
-        if draft is not None:
-            held += sum(t.numel() * t.element_size() for t in
-                        (draft.k_pool, draft.v_pool, draft.k_scale, draft.v_scale)
-                        if t is not None)
-        return held
 
-    def _memory_rows(self) -> list[dict]:
-        """The unified device ledger (docs/design-cost-model.md, tilerl.memory.memory_table):
-        every held allocation (static) plus the transient residual, so the invariant
-        ``measured peak = Σ static + transient`` is printed, not implied. Derived is
-        tilerl.memory.plan; measured is the storage each owner holds. On the CPU tiny cell
-        static equals measured and transient is zero; GPU nvfp4/fp8 reconciles to storage,
-        transient captures allocator scratch/peak above the named rows.
-        """
-        from .memory import memory_table, plan
-
-        cfg = self._model.cfg
-        kv, sp = self._kv, self._states
-        # Only the MTP DraftHead attaches a separate PagedKvPool; DFlash2 has no .kv pool.
-        draft_pool = getattr(self._draft, "kv", None)
-        draft_layers = 0 if draft_pool is None else self._draft.cfg.num_layers
-
-        def _pool_bytes(pool) -> int:
-            # Every plane the row derives: K/V data plus both fp8 scale grids. Dropping
-            # the scales makes derived != measured on the fp8 27B path by two planes.
+        def pool(p) -> int:
             return sum(t.numel() * t.element_size() for t in
-                       (pool.k_pool, pool.v_pool, pool.k_scale, pool.v_scale)
-                       if t is not None)
+                       (p.k_pool, p.v_pool, p.k_scale, p.v_scale) if t is not None)
 
-        # device_free drives the budget rows; the built engine reconciles allocations only,
-        # so pass 0 here (the fit happened at build). The dry-run path passes the real free.
-        derived = plan(cfg, self._model.params, 0, num_slots=sp.num_slots,
-                       num_blocks=kv.num_blocks, spec_steps=0,
-                       state_dtype=sp.states.dtype, kv_io=kv.dtype, kv_fp8=kv.kv_fp8,
-                       draft_layers=draft_layers)
         measured = {
             "weights": sum(t.numel() * t.element_size() for t in self._model.params.values()),
-            "kv_pool": _pool_bytes(kv),
+            "kv_pool": pool(kv),
             "state_slots": sum(
                 t.numel() * t.element_size() for t in
                 (sp.states, sp.conv_windows, sp.step_states, sp.step_windows, sp.win_parity)
                 if t is not None),
         }
-        if draft_pool is not None:
-            measured["draft_pool"] = _pool_bytes(draft_pool)
-        rows, _totals = memory_table(derived, measured, self._measured_peak_bytes())
-        return rows
+        if draft is not None:
+            measured["draft_pool"] = pool(draft)
+        return measured
+
+    def _measured_peak_bytes(self) -> int | None:
+        """The resident-device byte peak the table closes against. On cuda this is the
+        torch allocator's high-water mark (reset at build); off cuda the held-storage
+        sum — which equals Σ static there and keeps transient exactly zero."""
+        import torch
+
+        if torch.cuda.is_available():
+            return int(torch.cuda.max_memory_allocated(self.device))
+        return sum(self._held_storage().values())
+
+    def _memory_rows(self) -> list[dict]:
+        """The unified device ledger (memory.memory_table): every held allocation plus
+        the transient residual, so ``measured peak = Σ static + transient`` is printed."""
+        from .memory import memory_table, plan
+
+        kv, sp = self._kv, self._states
+        # Only the MTP DraftHead attaches a separate PagedKvPool; DFlash2 has no .kv pool.
+        draft_pool = getattr(self._draft, "kv", None)
+        draft_layers = 0 if draft_pool is None else self._draft.cfg.num_layers
+        # device_free=0: budget rows are the dry-run path's business; the fit is done here.
+        derived = plan(self._model.cfg, self._model.params, 0, num_slots=sp.num_slots,
+                       num_blocks=kv.num_blocks, spec_steps=0,
+                       state_dtype=sp.states.dtype, kv_io=kv.dtype, kv_fp8=kv.kv_fp8,
+                       draft_layers=draft_layers)
+        return memory_table(derived, self._held_storage(), self._measured_peak_bytes())
 
 
     # -------------------------------------------------------------- internals
