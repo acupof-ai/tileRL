@@ -52,6 +52,17 @@ def test_latest_floor_keys_on_exact_device_name(tmp_path):
     assert cal.latest_floor(loaded, cal.BW_METRIC, "nvidia h20") is None
 
 
+def test_latest_floor_rejects_a_near_prefix_device_name(tmp_path):
+    """Case-insensitivity and an exact-name typo are already covered; a PREFIX match
+    is a third, distinct leak: an H200 row sharing the 'NVIDIA H20' prefix would key
+    the H20 roofline to the wrong card's floor. Mutation caught: '==' replaced with a
+    4-char-prefix startswith left the exact-name gate green."""
+    h200 = "NVIDIA H200"
+    p = _store(tmp_path, [_row(cal.BW_METRIC, 5000.0, "GB/s", h200, card=2)])
+    got = cal.latest_floor(cal.load_rows(p), cal.BW_METRIC, H20)
+    assert got is None, f"a prefix-near card ({h200}) must not satisfy the {H20} floor"
+
+
 def test_newest_row_wins_and_superseded_skipped(tmp_path):
     old = _row(cal.BW_METRIC, 3900.0, "GB/s", H20)
     old["id"] = "old"
@@ -59,6 +70,23 @@ def test_newest_row_wins_and_superseded_skipped(tmp_path):
     new["id"] = "new"
     new["supersedes"] = "old"
     p = _store(tmp_path, [old, new])
+    cur = cal.latest_floor(cal.load_rows(p), cal.BW_METRIC, H20)
+    assert cur["id"] == "new" and cur["value"] == 4100.0
+
+
+def test_a_superseded_row_is_skipped_even_when_appended_last(tmp_path):
+    """Append order is not measurement time across harvests (pod_harvest merges store
+    files). When the superseded row lands LAST in the file, newest-by-position returns
+    the stale value; only the supersedes id set excludes it. Mutation caught with the
+    rows in natural order nothing fails (newest wins anyway): emptying the supersedes
+    set left newest_row_wins green. Here the stale row is appended after its replacer."""
+    new = _row(cal.BW_METRIC, 4100.0, "GB/s", H20)
+    new["id"] = "new"
+    new["supersedes"] = "old"
+    old = _row(cal.BW_METRIC, 3900.0, "GB/s", H20)
+    old["id"] = "old"
+    # replacer appended first, the retired row re-harvested into the file afterwards
+    p = _store(tmp_path, [new, old])
     cur = cal.latest_floor(cal.load_rows(p), cal.BW_METRIC, H20)
     assert cur["id"] == "new" and cur["value"] == 4100.0
 

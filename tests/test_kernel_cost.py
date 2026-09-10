@@ -118,6 +118,32 @@ def test_attn_prefill_kv_write_bytes_equal_pool_kv_write(use_fp8):
     )
 
 
+@pytest.mark.parametrize("use_fp8", [False, True])
+def test_attn_prefill_reads_kv_back_once_per_token(use_fp8):
+    """The prefill attention row charges K/V in BOTH HBM directions: the write half
+    is prefill_kv_write_bytes; the attention reads the same bytes back once, so the
+    row's KV total is 2x the write. Mutation caught: 4x->2x (dropping the read-back)
+    stays green under the write-only gate, so the factor is pinned here independently
+    against the q/o terms, exactly as the decode gate isolates its KV read."""
+    from tilerl.kernel_cost import _paged_attention_prefill
+
+    cfg = tiny()
+    kv_dtype = torch.float8_e4m3fn if use_fp8 else None
+    kv_fmt = kv_format(cfg.head_dim) if use_fp8 else bf16
+    b, s = 2, 53
+    pool = _pool(cfg, kv_dtype)
+
+    tick = TickShape(b=b, s=s, kv=kv_fmt, weight=bf16)
+    declared, _ = _paged_attention_prefill(cfg, tick)
+    qo = 2 * nbytes(bf16, (b, cfg.num_attention_heads, s, cfg.head_dim))
+    declared_kv = declared - qo
+
+    written_kv = _pool_kv_bytes_per_token(pool) * b * s
+    # write K+V once + read K+V once: exactly 2x the pool write, never 1x.
+    assert declared_kv == 2 * written_kv
+    assert declared_kv > written_kv
+
+
 def test_prefill_rows_weight_streamed_once_and_lm_head_scores_last_token():
     """Each prefill linear streams its WEIGHT once (that term is M-independent);
     the M-row input/output activations grow with M and flops scale with M. lm_head
@@ -147,6 +173,38 @@ def test_prefill_rows_weight_streamed_once_and_lm_head_scores_last_token():
     else:
         # tied embed_tokens model: lm_head row is absent by construction.
         assert "lm_head" not in rows64
+
+
+def test_prefill_lm_head_scores_one_token_per_sequence_on_an_untied_model():
+    """tiny is tied, so the last-token lm_head branch never executes under the
+    coverage gate. An UNTIED cfg (the 27B has tie_word_embeddings=False) must price
+    lm_head at m=b for any s: weight streamed once, one [b,vocab] projection, flops
+    independent of s. Mutation caught: m=b*s (m=1,s=32 -> 32x bytes/flops) stayed
+    green while the branch was dead, so a real 27B prefill was over-priced."""
+    from dataclasses import replace
+
+    from tilerl.model import param_specs
+    from tilerl.precision import nbytes as _nb
+
+    cfg = replace(tiny(), tie_word_embeddings=False)
+    assert "lm_head" in param_specs(cfg), "untied cfg must expose lm_head"
+    out_v, inn = tuple(param_specs(cfg)["lm_head"])
+    b = 2
+    rows_s16 = {r["name"]: r for r in prefill_rows(
+        cfg, TickShape(b=b, s=16, kv=bf16, weight=bf16))}
+    rows_s64 = {r["name"]: r for r in prefill_rows(
+        cfg, TickShape(b=b, s=64, kv=bf16, weight=bf16))}
+    h16, h64 = rows_s16["lm_head"], rows_s64["lm_head"]
+    # s changes nothing: the last token of each of the b sequences only.
+    assert h16["bytes"] == h64["bytes"] and h16["flops"] == h64["flops"]
+    # Independent arithmetic: weight streamed once + b input/output rows.
+    want_bytes = _nb(bf16, (out_v, inn)) + _nb(bf16, (b, inn)) + _nb(bf16, (b, out_v))
+    want_flops = 2 * b * out_v * inn
+    assert h16["bytes"] == want_bytes
+    assert h16["flops"] == want_flops
+    # Explicitly the b*s mutant's value: must differ, so a 32x over-price is caught.
+    wrong = _nb(bf16, (b * 16, inn)) + _nb(bf16, (b * 16, out_v)) + _nb(bf16, (out_v, inn))
+    assert h16["bytes"] != wrong
 
 
 def test_gdn_prefill_flops_derived_from_cfg_on_tiny():
@@ -215,6 +273,30 @@ def test_tick_rows_cover_the_launched_set_and_total_is_positive():
     assert {"paged_attention_prefill", "gdn_chunk_forward"} <= pnames
     pb, pf = prefill_totals(cfg, tick)
     assert pb > 0 and pf > 0
+
+
+def test_gdn_decode_state_is_read_and_written_independently_priced():
+    """The fused GDN decode row carries the recurrent state [b,nvh,dk,dv] read AND
+    written in place (2x), its biggest constant per-sequence charge. Positivity alone
+    cannot see a dropped state plane: the row stays >0 on activations. Mutation caught:
+    2*state+act -> act (state plane deleted) was green under the coverage gate."""
+    from tilerl.kernel_cost import _gdn_decode_fused
+    from tilerl.precision import f32
+    from tilerl.precision import nbytes as _nb
+
+    cfg = tiny()
+    t = TickShape(b=1, s=64, kv=bf16, weight=bf16)
+    b, fl = _gdn_decode_fused(cfg, t)
+    nvh, dk, dv = cfg.linear_num_value_heads, cfg.linear_key_head_dim, cfg.linear_value_head_dim
+    state_one_way = _nb(f32, (1, nvh, dk, dv))
+    act = _nb(f32, (1, nvh, 3 * dk + dv + 2))
+    # Independent decomposition: state crosses HBM twice, activations once.
+    assert b == 2 * state_one_way + act
+    assert fl == 4 * nvh * dk * dk * dv
+    # And it must be per-sequence: b rows scale the state linearly.
+    t2 = TickShape(b=2, s=64, kv=bf16, weight=bf16)
+    b2, _ = _gdn_decode_fused(cfg, t2)
+    assert b2 - 2 * _nb(f32, (1, nvh, 3 * dk + dv + 2)) == 2 * 2 * state_one_way
 
 
 # --- checkpoint device faces ------------------------------------------------
