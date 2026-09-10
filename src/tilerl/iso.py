@@ -46,7 +46,8 @@ class ISO(_Optimizer):
         self.base = Adafactor() if base is None else base
         self.frame_dtype = precision.dtype("frame")
         self.polar_iters = polar_iters
-        # fp32 frames of the 27B are 200 GiB: host-resident, staged one matrix per update.
+        # fp32 frames of the 27B are derived 136.5 GiB (memory.iso_frame_row):
+        # host-resident, staged one matrix per update.
         # Trained variables stay fp32: storage must resolve a 1e-6 relative update.
         self.offload = offload
         self._frames: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
