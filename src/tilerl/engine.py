@@ -699,6 +699,10 @@ class Engine:
         with self._lock:
             decodes, prefills, chunks = self._build_plan()
             if not decodes and not prefills:
+                # Yield the GIL: a tight step loop starves the SSD reader thread,
+                # making torch.load take 71.7ms instead of 0.4ms (H20, 2026-09-10).
+                if self._prefix.has_ssd:
+                    time.sleep(0)
                 return
             # Before the forward too: without this the FIRST forward has no snapshot and
             # `stats()` falls back to the locking path.
@@ -713,6 +717,10 @@ class Engine:
                 # `_loop` stops calling `step` once nothing runs, so this carries the last
                 # tick's state -- including a failed forward's, hence `finally`.
                 self._stats_snapshot = self._build_stats()
+        # Yield the GIL once per tick so the SSD reader thread can run torch.load
+        # without contending with the step loop (71.7ms → 0.5ms, H20, 2026-09-10).
+        if self._prefix.has_ssd:
+            time.sleep(0)
 
     def _admit(self, req: _Req) -> bool:
         """Take the slot and the blocks for one waiting request. False = it does not fit yet."""

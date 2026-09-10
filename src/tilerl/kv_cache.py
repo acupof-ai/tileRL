@@ -1019,6 +1019,10 @@ class NoPrefixStore:
     def fetch_in_flight(self, tokens: Sequence[int]) -> bool:
         return False
 
+    @property
+    def has_ssd(self) -> bool:
+        return False
+
     def clear(self) -> None:
         return None
 
@@ -1076,6 +1080,10 @@ class PrefixStore:
         # S: constant at every prefix length, and what puts the break-even above zero
         self._snapshot_bytes = 0
         self.fetch_waits = 0
+
+    @property
+    def has_ssd(self) -> bool:
+        return self._ssd is not None
 
     def _hash_all(self, tokens: Sequence[int]) -> int:
         h = 0
