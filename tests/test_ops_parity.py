@@ -662,13 +662,14 @@ def test_gdn_chunkwise_matches_serial():
             _assert_close(a, b_, f"gdn chunkwise({chunk}) {name}")
 
 
-def test_gdn_chunk_rounding_bound():
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_gdn_chunk_rounding_bound(device):
     """No chunk-size pair pushes the GDN reference state out of the e2e parity tolerance.
 
     The consumer is the prefix-store test, which compares two engines' states with
     ``torch.allclose(rtol=1e-2, atol=1e-5)`` (tests/test_e2e.py). On CUDA a
-    64-vs-128 chunk difference broke that gate on a near-zero element (ratio ~2.0,
-    errors/2026-09-10-gdn-state-chunk-size-rounding). This test measures, for every
+    64-vs-128 chunk difference broke that gate on a near-zero element
+    (errors/2026-09-10-gdn-state-chunk-size-rounding). This test measures, for every
     chunk pair over a seq_len grid, the worst per-element violation ratio
     ``|delta| / (atol + rtol*|ref|)`` — ratio > 1 breaks parity. Unlike the backward
     gate (test_gdn_backward_precision_tracks_the_chunk_size), which asserts ordering
@@ -676,20 +677,35 @@ def test_gdn_chunk_rounding_bound():
     absolute bound is meaningful.
 
     This bounds the torch reference (``reference.gdn_forward``), not the sm90 kernel:
-    same structure, different arithmetic. The kernel path is unbounded. Re-measured
-    with scripts/gdn_chunk_rounding_sweep.py.
+    same structure, different arithmetic. The kernel path is unbounded.
+
+    Device tiers: CPU runs always, three seeds, tight bound. CUDA runs only with a
+    card (default skip) and joins OPEN row 19's "CUDA tests with no runner" set —
+    this replaces a line of text with a red-capable assertion: the day a runner
+    lands, it reports itself. The CUDA tight bound is unset: the errors entry
+    records ``max|delta|=3.586e-4`` from the KERNEL path (e2e test, sm90, H20 card 1,
+    a single observation), not the reference path's per-element ratio this test
+    measures, so the entry's number does not transfer. A CUDA run of this reference
+    test is needed to set the tight bound; until then the CUDA tier gates at the
+    parity threshold (ratio < 1.0). Re-measured with scripts/gdn_chunk_rounding_sweep.py.
     """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
     # the consumer's tolerance: torch.allclose(rtol=1e-2, atol=1e-5) in tests/test_e2e.py
     rtol, atol = 1e-2, 1e-5
     chunks = (16, 32, 64, 128)
     seqs = (64, 100, 128, 164, 256)
-    # three seeds, max: one seed put the worst pair 2x below another (5.8e-3 vs 1.2e-2),
-    # the same noise the backward gate's docstring documents
+    # CPU: three seeds, max — one seed put the worst pair 2x below another (5.8e-3 vs
+    # 1.2e-2), the same noise the backward gate's docstring documents. CUDA: one seed,
+    # matching the errors entry's single observation.
+    seeds = (0, 1, 2) if device == "cpu" else (0,)
     worst = 0.0
-    for seed in (0, 1, 2):
+    for seed in seeds:
         q, k, v, g, beta, z, state, kw = _gdn_inputs(
             2, max(seqs), 2, 6, 16, 16, 4, seed, scale=10.0
         )
+        q, k, v, g, beta, z, state = (x.to(device) for x in (q, k, v, g, beta, z, state))
+        kw = {kk: vv.to(device) for kk, vv in kw.items()}
 
         def _state(t, chunk):
             return reference.gdn_forward(
@@ -712,10 +728,15 @@ def test_gdn_chunk_rounding_bound():
                         continue
                     ratio = ((s[ca] - s[cb]).abs() / (atol + rtol * s[cb].abs())).max().item()
                     worst = max(worst, ratio)
-    # measured 1.20e-2 on CPU (three-seed max, seeds 0/1/2, scale=10.0, 2026-09-10);
-    # x2 margin covers torch-version drift; still ~40x inside the parity failure
-    # threshold (ratio 1.0). Negative control: bound 1e-2 fails (seed 1 measures 1.20e-2).
-    assert worst <= 2.4e-2, f"gdn chunk rounding violation ratio {worst:.3e} exceeds bound 2.4e-2"
+    if device == "cpu":
+        # measured 1.20e-2 (three-seed max, seeds 0/1/2, scale=10.0, 2026-09-10);
+        # x2 margin covers torch-version drift; still ~40x inside the parity failure
+        # threshold (ratio 1.0). Negative control: bound 1e-2 fails (seed 1 measures 1.20e-2).
+        assert worst <= 2.4e-2, f"gdn chunk rounding violation ratio {worst:.3e} exceeds bound 2.4e-2"
+    else:
+        # CUDA tight bound unset (see docstring): gate at the parity threshold.
+        # Negative control: UNVERIFIED — no card to confirm a value that goes red.
+        assert worst < 1.0, f"gdn chunk rounding breaks parity on {device}: ratio {worst:.3e}"
 
 
 @pytest.mark.parametrize("t", [1, 4])
