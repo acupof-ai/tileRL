@@ -2368,7 +2368,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
         help="comma-separated specialist checkpoint dirs",
     )
     p_merge.add_argument("--out", required=True, help="merged checkpoint dir")
-    p_merge.add_argument("--method", choices=["iso", "average"], default="iso")
+    p_merge.add_argument("--method", choices=["iso", "average", "ties", "dare"],
+                         default="iso")
     p_merge.add_argument("--force", action="store_true",
                          help="re-merge even if a finished run with these inputs exists")
     p_merge.add_argument("--json", action="store_true", help="print the manifest as JSON")

@@ -12,7 +12,14 @@ import torch
 
 from tilerl.autograd import AdamW
 from tilerl.cli import _build_model
-from tilerl.merge import average_merge, iso_merge
+from tilerl.merge import (
+    average_merge,
+    dare_merge,
+    dare_merge_weight,
+    iso_merge,
+    ties_merge,
+    ties_merge_weight,
+)
 from tilerl.model import Model
 from tilerl.testing import RefBackend
 from tilerl.train import train_step
@@ -109,6 +116,49 @@ def test_the_averaging_control_is_balanced_across_both_tasks():
         assert min(one) > 0, f"{name} no longer beats the base, so the gate is not the ratio"
 
 
+def test_ties_arithmetic_pinned_on_hand_matrices():
+    """TIES: per-row top-keep trim, sign election from the trimmed sum, disjoint
+    mean of agreeing specialists. Numbers hand-computed, not re-derived."""
+    w0 = torch.zeros(2, 3)
+    # Row 0 task vectors: s1 [-5,1,0], s2 [4,1,0]. Row 1: s1 [0,3,10], s2 [0,1,10].
+    w1 = torch.tensor([[-5.0, 1.0, 0.0], [0.0, 3.0, 10.0]])
+    w2 = torch.tensor([[4.0, 1.0, 0.0], [0.0, 1.0, 10.0]])
+    # keep=1/3 keeps one entry per row per specialist: col 0 both rows' top in the
+    # column each specialist dominates, so row0 col1's +1 votes trim away (without
+    # the trim they survive and col1 would add +1), and row1 col1's 3/1 trim away.
+    # Row 0 col0: trimmed sum -1 elects -, only s1 agrees -> -5 (not a -1 vote sum).
+    # Row 1 col2: both agree +, disjoint MEAN (10+10)/2 = 10, not the 20 sum.
+    out = ties_merge_weight(w0, [w1, w2], keep=1 / 3)
+    assert torch.allclose(out, torch.tensor([[-5.0, 0.0, 0.0], [0.0, 0.0, 10.0]]))
+    # K=1 with keep=1 trims nothing and returns the specialist (f32 roundoff only).
+    w0s, ws = torch.randn(3, 4), torch.randn(3, 4)
+    assert torch.allclose(ties_merge_weight(w0s, [ws], keep=1.0), ws, atol=1e-6)
+    # Non-float tensors pass through untouched (task vectors need float math).
+    wi = torch.tensor([[1, 2], [3, 4]])
+    assert torch.equal(ties_merge({"k": wi}, [{"k": wi}, {"k": wi}])["k"], wi)
+
+
+def test_dare_arithmetic_pinned_on_hand_matrices():
+    """DARE: Bernoulli drop per specialist, survivors rescaled 1/(1-p), averaged.
+    The seed masks are explicit torch.Generator draws, pinned here."""
+    z = torch.zeros(4)
+    s1, s2 = torch.full((4,), 10.0), torch.full((4,), 20.0)
+    # seed 0: mask [0,1,0,0]; seed 1 draws [0.7576,0.2793,0.4031,0.7347] -> [1,0,0,1].
+    # survivors rescaled x2 then averaged: col0 s2 40/2=20, col1 s1 20/2=10,
+    # col2 neither -> 0, col3 s2 40/2=20.
+    out = dare_merge_weight(z, [s1, s2], drop=0.5, seed=0)
+    assert torch.allclose(out, torch.tensor([20.0, 10.0, 0.0, 20.0]))
+    # drop=0 is plain averaging; the same seed reproduces the same mask, a different
+    # seed changes it.
+    assert torch.allclose(dare_merge_weight(z, [s1, s2], drop=0.0, seed=0),
+                          torch.full((4,), 15.0))
+    a = dare_merge_weight(z, [s1, s2], drop=0.5, seed=7)
+    assert torch.equal(a, dare_merge_weight(z, [s1, s2], drop=0.5, seed=7))
+    assert not torch.equal(a, dare_merge_weight(z, [s1, s2], drop=0.5, seed=8))
+    wi = torch.tensor([1, 2, 3])
+    assert torch.equal(dare_merge({"k": wi}, [{"k": wi}, {"k": wi}])["k"], wi)
+
+
 def test_iso_merge_two_specialists():
     """The P3 merger gate: two specialists EACH keep their own task better than
     plain averaging (`roadmap.md:120-123`), so this is a conjunction.
@@ -139,6 +189,30 @@ def test_iso_merge_two_specialists():
     # EACH task, not either: an `or` here is passed by a merge that lost one specialist.
     assert out["iso"][0] <= out["avg"][0], f"A regressed against averaging: {out}"
     assert out["iso"][1] <= out["avg"][1], f"B regressed against averaging: {out}"
+
+
+def test_ties_and_dare_keep_both_tasks_and_iso_beats_them():
+    """The two task-vector baselines each keep BOTH tasks (beat the base), and on
+    the tiny harness ISO already ranks ahead of both — the shape of the pending
+    27B verdict that ISO must beat TIES/DARE. Measured at this tree:
+    avg 18.46/17.55, ties 18.02/16.45, dare 18.45/17.55, iso 16.00/14.73, base 22.34/21.99."""
+    backend = RefBackend()
+    cfg, base = _build_model("tiny", seed=0, keep_master=True)
+    a, b = _sft(BATCH_A, backend), _sft(BATCH_B, backend)
+    arms = {
+        name: Model(cfg, fn(base.params, [a.params, b.params]))
+        for name, fn in (("ties", ties_merge), ("dare", dare_merge))
+    }
+    iso = Model(cfg, iso_merge(base.params, [a.params, b.params]))
+    loss = {n: (_loss(m, BATCH_A, backend), _loss(m, BATCH_B, backend))
+            for n, m in arms.items()}
+    base_l = (_loss(base, BATCH_A, backend), _loss(base, BATCH_B, backend))
+    iso_l = (_loss(iso, BATCH_A, backend), _loss(iso, BATCH_B, backend))
+    print({n: f"A={la:.3f} B={lb:.3f}" for n, (la, lb) in loss.items()},
+          f"iso A={iso_l[0]:.3f} B={iso_l[1]:.3f}", f"base A={base_l[0]:.3f} B={base_l[1]:.3f}")
+    for n, (la, lb) in loss.items():
+        assert la < base_l[0] and lb < base_l[1], f"{n} dropped a task: {n} {la}/{lb} vs {base_l}"
+        assert iso_l[0] <= la and iso_l[1] <= lb, f"ISO did not beat {n} on tiny: {iso_l} vs {la}/{lb}"
 
 
 def test_merge_checkpoints_streams_shards_and_records(tmp_path, monkeypatch):
@@ -189,6 +263,56 @@ def test_merge_checkpoints_streams_shards_and_records(tmp_path, monkeypatch):
 
     assert m["gates"] == [] and m["finished"], m
     assert format_run(m).split()[3] == "none", format_run(m)
+
+
+def test_merge_checkpoints_ties_and_dare_equal_dict_level(tmp_path):
+    """The streaming path dispatches ties/dare to the per-weight math over the raw
+    checkpoint keys (HF names), exactly like iso does. The DARE salt is the raw
+    key, so the reference here merges the raw tensors under those same keys —
+    internal load_hf keys would salt a different mask."""
+    import zlib
+
+    from safetensors import safe_open
+
+    from tilerl.merge import dare_merge_weight, merge_checkpoints, ties_merge_weight
+    from tilerl.model import save_hf
+
+    backend = RefBackend()
+    dirs = []
+    for seed in (0, 1):
+        cfg, model = _build_model("tiny", seed=0, keep_master=True)
+        if seed:
+            for _ in range(3):
+                train_step(model, torch.randint(1, cfg.vocab_size, (2, 16)).numpy(),
+                           backend, AdamW(lr=1e-3))
+        save_hf(model, tmp_path / f"mc{seed}")
+        dirs.append(str(tmp_path / f"mc{seed}"))
+
+    def raw(d):
+        f = next((tmp_path / d).glob("model-*.safetensors"), None) \
+            or (tmp_path / d / "model.safetensors")
+        h = safe_open(str(f), "pt")
+        return {k: h.get_tensor(k) for k in h.keys()}
+
+    r0, r1 = raw("mc0"), raw("mc1")
+    for method, weight_fn in (("ties", ties_merge_weight), ("dare", dare_merge_weight)):
+        merge_checkpoints(dirs[0], dirs[1:], tmp_path / f"o-{method}", method=method)
+        got = raw(f"o-{method}")
+        for k, w0 in r0.items():
+            if w0.is_floating_point():
+                seed = zlib.crc32(k.encode()) if method == "dare" else None
+                want = weight_fn(w0, [r1[k]], seed=seed) if method == "dare" \
+                    else weight_fn(w0, [r1[k]])
+                assert torch.equal(got[k], want.contiguous()), (method, k)
+    # A re-run of DARE is byte-identical: the mask comes from the key, not clock randomness.
+    merge_checkpoints(dirs[0], dirs[1:], tmp_path / "o-dare2", method="dare")
+    def only(d):
+        f = next((tmp_path / d).glob("model-*.safetensors"), None) \
+            or (tmp_path / d / "model.safetensors")
+        h = safe_open(str(f), "pt")
+        return {k: h.get_tensor(k) for k in h.keys()}
+    a, b = only("o-dare"), only("o-dare2")
+    assert all(torch.equal(a[k], b[k]) for k in a)
 
 
 def _sft_run(model_dir_arg: str, seed: int):

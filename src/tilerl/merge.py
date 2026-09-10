@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import zlib
 from pathlib import Path
 
 import torch
@@ -64,6 +65,60 @@ def average_merge(base: dict[str, Tensor], specialists: list[dict[str, Tensor]])
         k: torch.stack([s[k].float() for s in specialists]).mean(0).to(v.dtype)
         for k, v in base.items()
     }
+
+
+def _task_vectors(w0: Tensor, ws: list[Tensor]) -> Tensor:
+    return torch.stack([w.float() - w0.float() for w in ws])  # (K, ...)
+
+
+def ties_merge_weight(w0: Tensor, ws: list[Tensor], keep: float = 0.8) -> Tensor:
+    """TIES (trim, elect sign, disjoint mean) on one weight. Each specialist's
+    rows keep their ``keep`` fraction of entries by magnitude; the elected sign
+    is sign(Σ kept), and each position averages only the specialists agreeing
+    with it. Computed in f32, returned in ``w0.dtype``."""
+    tvs = _task_vectors(w0, ws)
+    k = max(1, round(keep * tvs.shape[-1]))
+    cutoff = tvs.abs().topk(k, dim=-1).values[..., -1:]
+    trimmed = tvs * (tvs.abs() >= cutoff)
+    sign = torch.sign(trimmed.sum(0))
+    agree = torch.sign(trimmed) == sign
+    disjoint = (trimmed * agree).sum(0) / agree.sum(0).clamp(min=1)
+    return (w0.float() + disjoint).to(w0.dtype)
+
+
+def dare_merge_weight(w0: Tensor, ws: list[Tensor], drop: float = 0.5,
+                      seed: int | None = None) -> Tensor:
+    """DARE on one weight: each specialist's task vector has a ``drop`` fraction
+    of entries zeroed by a deterministic Bernoulli mask and the survivors
+    rescaled by 1/(1-drop), then averaged. ``seed`` salts the per-weight mask so
+    distinct tensors and runs diverge reproducibly."""
+    tvs = _task_vectors(w0, ws)
+    if seed is None:
+        seed = zlib.crc32(str(w0.numel()).encode())
+    mask = torch.empty_like(tvs)
+    for i in range(tvs.shape[0]):
+        g = torch.Generator(device="cpu").manual_seed(seed + i)
+        mask[i] = (torch.rand(tvs.shape[1:], generator=g) >= drop)
+    kept = tvs * mask / (1 - drop)
+    return (w0.float() + kept.mean(0)).to(w0.dtype)
+
+
+def ties_merge(base: dict[str, Tensor], specialists: list[dict[str, Tensor]],
+               keep: float = 0.8) -> dict[str, Tensor]:
+    """Merge ``model.params``-style dicts with TIES on every float tensor."""
+    return {k: ties_merge_weight(w, [s[k] for s in specialists], keep)
+            if w.is_floating_point() else w for k, w in base.items()}
+
+
+def dare_merge(base: dict[str, Tensor], specialists: list[dict[str, Tensor]],
+               drop: float = 0.5, seed: int | None = None) -> dict[str, Tensor]:
+    """Merge ``model.params``-style dicts with DARE on every float tensor."""
+    out = {}
+    for i, (k, w) in enumerate(base.items()):
+        salt = zlib.crc32(k.encode()) if seed is None else seed + i
+        out[k] = dare_merge_weight(w, [s[k] for s in specialists], drop, salt) \
+            if w.is_floating_point() else w
+    return out
 
 
 def iso_merge(
@@ -142,8 +197,14 @@ def merge_checkpoints(
 
     for k in keys:
         w0, ws = get(srcs[0], k), [get(s, k) for s in srcs[1:]]
-        if method == "iso" and w0.dim() == 2 and all(w.shape == w0.shape for w in ws):
+        same_shape = all(w.shape == w0.shape for w in ws)
+        if method == "iso" and w0.dim() == 2 and same_shape:
             m = iso_merge_weight(w0, ws, **kw)
+        elif method == "ties" and w0.is_floating_point() and same_shape:
+            m = ties_merge_weight(w0, ws, **kw)
+        elif method == "dare" and w0.is_floating_point() and same_shape:
+            # Key-salted seed: two runs over the same checkpoints drop the same entries.
+            m = dare_merge_weight(w0, ws, seed=zlib.crc32(k.encode()), **kw)
         else:
             m = torch.stack([w.float() for w in ws]).mean(0).to(w0.dtype)
         shard[k] = m.contiguous()
