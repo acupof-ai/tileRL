@@ -14,7 +14,8 @@ import torch
 
 _TABLE = {
     "optimizer_state": torch.float32,
-    # ISO frames: fp32 is 200 GiB on the 27B; bf16 flips only once Newton-Schulz
+    # ISO frames are f32 and host-resident: derived 146,521 MB (~136.5 GiB) on the
+    # 27B (U+S+V over every 2-D weight); bf16 flips only once Newton-Schulz
     # is measured to keep them orthonormal there.
     "frame": torch.float32,
     "adapter": torch.bfloat16,

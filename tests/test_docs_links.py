@@ -307,10 +307,12 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
     }),
     'train': frozenset({
         '--allow-short-rollouts',
+        '--batch',
         '--data',
         '--depth',
         '--deterministic',
         '--draft',
+        '--dry-run',
         '--eval-curve-n',
         '--eval-curve-seed',
         '--eval-every',
@@ -343,6 +345,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--steps',
         '--temperature',
         '--tp',
+        '--train-seq-len',
     }),
     'pretrain': frozenset({
         '--ckpt-dir',

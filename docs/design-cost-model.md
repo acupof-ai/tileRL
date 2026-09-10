@@ -74,6 +74,14 @@ a sum over allocations skips them. `build_engine` allocates from the rows:
 occupancy is `blocks_used x per_block`. A device prefix entry is pool blocks
 plus a state slot already counted — a row only when demoted to `host`/`ssd`.
 
+The training engine is a separate `memory.train_plan` over the same `nbytes`:
+`adapter` (bf16), AdamW `optimizer_state` (2 f32 per trained param), ISO `frame`
+(host-tier f32 U,S,V per 2-D weight, with Adafactor factors on the frames), and
+the `tape` row — what RecordingBackend keeps after one layer-segmented forward
+(embedding, one boundary hidden per layer, final norm, head output; +adapter
+head entries); `tilerl train --dry-run --recipe X` prints those rows through
+the same `memory_table` renderer without a build.
+
 `memory.memory_table` adds a measured column and closes the peak: the measured
 column is each owner's materialized tensor-storage sum on every target; on cuda
 the peak is `torch.cuda.max_memory_allocated` and a final `transient` row is
@@ -82,9 +90,11 @@ transient is suppressed without the peak measurement.
 `tilerl serve --dry-run` prints the table cardless; `--checkpoint DIR` prices
 the weights row header-only from `checkpoint_weight_faces` (off cuda pass
 `--device-free`); `--record-residency` (cuda) adds measured residency. Gate:
-`derived == measured` for `weights` and `kv_pool` on the tiny model; a nonzero
-static-row delta on 27B is an error entry, not a tolerance. Nothing runs in the
-tick — `plan` is build-time arithmetic, the table reads counters.
+`derived == measured` for `weights` and `kv_pool` on the tiny model; the
+training rows equal the live adapter / optimizer / frame tensor storage and a
+counted tiny tape (`tests/test_train_plan.py`); a nonzero static-row delta on
+27B is an error entry, not a tolerance. Nothing runs in the tick — `plan` is
+build-time arithmetic, the table reads counters.
 
 ## Kernel cost
 

@@ -23,6 +23,10 @@ from .precision import Format, bf16, f32, kv_format, nbytes
 POOL_FRACTION = 2 / 3  # the KV pool takes 2/3 of post-weights free
 STATE_FRACTION = 1 / 4  # the resident-snapshot store takes 1/4 of what remains
 
+#: A training micro-step segments every layer once its rows are longer than this;
+#: mirrors train._MLP_SEGMENT_MAX_T so the plan and _step pick the same tape shape.
+MLP_SEGMENT_MAX_T = 1280
+
 _DTYPE_FMT = {16: bf16, 32: f32}
 
 
@@ -111,6 +115,127 @@ def weight_row_faces(faces: dict) -> Row:
     return Row("device", "weights", sum(nbytes(fmt, shape) for shape, fmt in faces.values()))
 
 
+# --- training rows ----------------------------------------------------------
+def lora_shapes(specs: dict, rank: int) -> list[tuple]:
+    """The [rank,K] A / [N,rank] B adapter pair for every base linear add_lora
+    attaches to. Mirrors model.add_lora's attachment rule: a 2-D served linear,
+    excluding conv1d (the canonical param_specs keys carry no quant sidecars)."""
+    out = []
+    for key, shape in specs.items():
+        if len(shape) != 2 or key.endswith("conv1d"):
+            continue
+        n, k = shape
+        out.append((rank, k))
+        out.append((n, rank))
+    return out
+
+
+def adapter_row(specs: dict, rank: int, fmt: Format = bf16) -> Row:
+    """The LoRA adapter tensors (precision role 'adapter', bf16)."""
+    return Row("device", "adapter", sum(nbytes(fmt, shp) for shp in lora_shapes(specs, rank)),
+               f"rank {rank}")
+
+
+def adamw_state_row(specs: dict, rank: int | None = None, *, adapter: bool,
+                    fmt: Format = f32) -> Row:
+    """AdamW moments: two f32 tensors the shape of every trained param. With
+    ``adapter`` the trained set is the LoRA pairs; otherwise it is every param."""
+    shapes = lora_shapes(specs, rank) if adapter else list(specs.values())
+    return Row("device", "optimizer_state", 2 * sum(nbytes(fmt, shp) for shp in shapes),
+               "adamw m+v")
+
+
+def adafactor_state_row(specs: dict, fmt: Format = f32, *, iso: bool = False) -> Row:
+    """Adafactor's factored state per 2-D trained param (one f32 row + one f32
+    column) plus one full f32 state per non-2-D param. beta1=0 so there is no
+    first-moment tensor.
+
+    Under ISO the 2-D trained tensors are the FRAMES U [N,r] and V [K,r], not
+    the weights: Adafactor holds a factored (row+column) pair per frame, so each
+    2-D weight contributes N+r + K+r factors."""
+    total = 0
+    for shp in specs.values():
+        if len(shp) != 2:
+            total += nbytes(fmt, shp)
+            continue
+        n, k = shp
+        if iso:
+            r = min(n, k)
+            total += nbytes(fmt, (n,)) + nbytes(fmt, (r,)) + nbytes(fmt, (k,)) + nbytes(fmt, (r,))
+        else:
+            total += nbytes(fmt, (n,)) + nbytes(fmt, (k,))
+    return Row("device", "optimizer_state", total,
+               "adafactor factored v over ISO frames" if iso else "adafactor factored v")
+
+
+def iso_frame_row(specs: dict, fmt: Format = f32) -> Row:
+    """The ISO frames of every 2-D trained param: U [N,r], S [r], V [K,r] f32
+    (r=min(N,K)). Full-parameter SFT wraps Adafactor, whose own state is a
+    separate optimizer_state row; on CUDA these frames are host-resident."""
+    total = 0
+    for n, k in (s for s in specs.values() if len(s) == 2):
+        r = min(n, k)
+        total += nbytes(fmt, (n, r)) + nbytes(fmt, (r,)) + nbytes(fmt, (k, r))
+    return Row("host", "frame", total, "ISO U,S,V per 2-D weight")
+
+
+def _tape_segments(cfg, b: int, s: int) -> int:
+    """One segment boundary row per layer when the rows are long (segment='layer'
+    in train._step); below the threshold MLPs alone are checkpointed and their
+    live activations stay on the tape (not priced by this boundary formula)."""
+    return cfg.num_layers if s > MLP_SEGMENT_MAX_T else 0
+
+
+def tape_row(cfg, b: int, s: int, *, lora_rank: int | None) -> Row:
+    """What one recorded train step's tape holds after the forward, in the
+    segment='layer' mode the 27B uses (B*S > 1280): the bf16 embedding lookup,
+    one f32 boundary hidden per layer, the final-norm hidden, and the head output
+    [b,s,v] (the logits fed to the loss grad) — always present in training since
+    the head is scored even when its weight is tied to the embedding. With an
+    adapter the head also keeps two more [b,s,v] tensors (frozen-base output,
+    residual add) plus its A delta [b,s,r].
+
+    Derived from counting RecordingBackend's real entries on the tiny model
+    (tests pin it); nothing else stays live — every in-layer activation is
+    recomputed from its segment input during backward."""
+    h, v = cfg.hidden_size, cfg.vocab_size
+    total = nbytes(bf16, (b, s, h))  # embedding lookup
+    # f32 h-rows that survive the layer segments: one boundary per layer, plus the
+    # final norm output (the 2-mlp-ckpt rows at short S do not exist in this mode).
+    total += (_tape_segments(cfg, b, s) + 1) * nbytes(f32, (b, s, h))
+    total += nbytes(f32, (b, s, v))  # head output / logits (training always scores it)
+    if lora_rank is not None:
+        # the head adapter keeps its A delta [b,s,r], its B output, the frozen-base
+        # output and the residual add — 3 [b,s,v] total with the logits above.
+        # True on a tied head too: add_lora attaches at the shared embed/head base.
+        total += 2 * nbytes(f32, (b, s, v)) + nbytes(f32, (b, s, lora_rank))
+    return Row("device", "tape", total, f"B{b} x S{s} layer-segment activations")
+
+
+def train_plan(cfg, b: int, s: int, *, lora_rank: int | None = None,
+               optim: str = "adamw") -> list[Row]:
+    """The rows the TRAINING engine holds for one step, separate from the serving
+    :func:`plan` (weights plus the rows here). ``lora_rank`` set = LoRA RL/OPD:
+    adapter bf16 + AdamW moments over the adapter pairs. None = full SFT: every
+    param is trainable, ``optim`` selects adamw, adafactor, or iso (adafactor
+    state plus host-resident f32 frames)."""
+    from .model import param_specs
+
+    specs = param_specs(cfg)
+    rows: list[Row] = []
+    if lora_rank is not None:
+        rows.append(adapter_row(specs, lora_rank))
+        rows.append(adamw_state_row(specs, lora_rank, adapter=True))
+    elif optim == "adamw":
+        rows.append(adamw_state_row(specs, adapter=False))
+    else:
+        rows.append(adafactor_state_row(specs, iso=optim == "iso"))
+        if optim == "iso":
+            rows.append(iso_frame_row(specs))
+    rows.append(tape_row(cfg, b, s, lora_rank=lora_rank))
+    return rows
+
+
 def plan(cfg, params: dict | None, device_free: int, *, num_slots: int, num_blocks: int,
          spec_steps: int = 0, state_dtype=f32, kv_io=bf16, kv_fp8=None,
          explicit_state_budget: int = 0, dram_budget: int = 0,
@@ -168,8 +293,12 @@ def plan(cfg, params: dict | None, device_free: int, *, num_slots: int, num_bloc
 
 
 #: owners that are held allocations (in peak = Σ static + transient). Budget-rule rows
-#: are not allocations and never enter the invariant.
-STATIC_OWNERS = ("weights", "state_slots", "kv_pool", "draft_pool")
+#: are not allocations and never enter the invariant. The training rows are held too;
+#: they never appear in a serving :func:`plan`, so they cannot enter its peak residual.
+STATIC_OWNERS = (
+    "weights", "state_slots", "kv_pool", "draft_pool",
+    "adapter", "optimizer_state", "frame", "tape",
+)
 
 
 def static_rows(rows: list[Row]) -> list[Row]:
