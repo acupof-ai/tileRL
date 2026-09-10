@@ -160,7 +160,28 @@ def test_checkpoint_weight_specs_round_trips_a_real_mixed_safetensors(tmp_path):
     # Derived total is the exact sum of the three device faces plus bf16 embed.
     expected = (nbytes(nvfp4_dev, (N, K)) + nbytes(fp8_block_dev, (N, K))
                 + nbytes(fp8_dev, (N, K)) + 100 * K * 2)
-    assert sum(nbytes(fmt, shape) for shape, fmt in rows.values()) == expected
+    single_total = sum(nbytes(fmt, shape) for shape, fmt in rows.values())
+    assert single_total == expected
+
+    # Same population split across TWO shards with an index.json weight_map -- the only
+    # layout the sharded 27B takes. Classification and byte total must be identical.
+    import json
+
+    shard1 = {k: tensors[k] for k in
+              ("m.weight_packed", "m.weight_scale", "m.weight_global_scale", "b.weight",
+               "b.weight_scale_inv")}
+    shard2 = {k: tensors[k] for k in
+              ("c.weight", "c.weight_scale", "c.input_scale", "embed.weight")}
+    save_file(shard1, str(tmp_path / "model-00001.safetensors"))
+    save_file(shard2, str(tmp_path / "model-00002.safetensors"))
+    (tmp_path / "model.safetensors").unlink()
+    weight_map = {name: "model-00001.safetensors" for name in shard1}
+    weight_map.update({name: "model-00002.safetensors" for name in shard2})
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+    srows = {name: (shape, fmt) for name, shape, fmt in checkpoint_weight_specs(tmp_path)}
+    assert srows == rows
+    assert sum(nbytes(fmt, shape) for shape, fmt in srows.values()) == single_total
 
 
 def test_27b_resident_weight_bytes_match_the_measured_24_44gb(tmp_path):
