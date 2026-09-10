@@ -9,6 +9,7 @@ half calibration renders pending-remote rather than a datasheet number.
 from __future__ import annotations
 
 import json
+import subprocess
 
 import pytest
 
@@ -16,6 +17,9 @@ from tilerl import calibration as cal
 
 H20 = "NVIDIA H20"
 V100 = "Tesla V100-SXM2-16GB"
+#: a commit that exists in this repo so benchrec's commit-exists validator accepts it
+_HEAD_SHA = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                           text=True, check=True).stdout.strip()
 
 
 def _row(metric, value, unit, name, card=0):
@@ -95,12 +99,66 @@ def test_calibrate_refuses_off_cuda(monkeypatch):
         cli.cmd_bench_calibrate(args)
 
 
-def test_append_rows_roundtrip(tmp_path):
-    p = tmp_path / "sub" / "measurements.jsonl"
-    rows = [_row(cal.BW_METRIC, 4000.0, "GB/s", H20)]
-    cal.append_rows(rows, p)
-    got = cal.load_rows(p)
-    assert len(got) == 1 and got[0]["metric"] == cal.BW_METRIC and got[0]["id"]
+def _valid_row(metric, value, unit, name=H20, card=0):
+    """A row satisfying scripts/benchrec's full REQUIRED schema."""
+    return {
+        "metric": metric, "value": value, "unit": unit, "target": "sm90",
+        "build": "eager", "model": "device", "shape": {"card": card},
+        "warm": {"state": "warm", "compiles": None}, "n": 1, "spread": 0,
+        "device": {"name": name, "card": card},
+        "commit": _HEAD_SHA, "dirty": False,
+        "cmd": f"tilerl bench --calibrate --card {card}",
+        "floor": {"value": value, "unit": unit, "kind": "measured-best",
+                  "derivation": "test row; floor = this measurement"},
+    }
+
+
+def test_append_rows_goes_through_benchrec_validator(tmp_path):
+    """calibration.append_rows must route through scripts/benchrec.validate — a malformed
+    row is rejected and never reaches the file (no second, unvalidated writer)."""
+    p = tmp_path / "measurements.jsonl"
+    ids = cal.append_rows([_valid_row(cal.BW_METRIC, 4000.0, "GB/s")], p)
+    assert len(ids) == 1 and p.read_text().count("\n") == 1
+    # a row missing required fields / with a bogus unit is rejected by benchrec, not us.
+    bad = _valid_row(cal.BW_METRIC, 4000.0, "GB/s")
+    del bad["commit"]
+    with pytest.raises(Exception):  # benchrec.ValueError via append
+        cal.append_rows([bad], p)
+    assert p.read_text().count("\n") == 1, "rejected row must not reach the store"
+    bad_unit = _valid_row(cal.BW_METRIC, 4000.0, "TB/s")
+    with pytest.raises(Exception):
+        cal.append_rows([bad_unit], p)
+
+
+def test_resolve_row_kernel_is_the_declared_kernel_not_linear():
+    """The timing seam resolves the kernel the row DECLARES (linear_fp4), never the bf16
+    backend.linear — timing the latter would divide nvfp4 packed bytes by a 2 B/weight
+    kernel. A fake backend with a sentinel proves the resolution and that fused rows and
+    unknown rows resolve to None (pending), not a surrogate."""
+    sentinel = lambda *a, **k: None
+
+    class FakeBackend:
+        linear_fp4 = staticmethod(sentinel)
+
+        def linear(self, *a, **k):  # the wrong-face kernel must never be chosen
+            raise AssertionError("bf16 linear must not time an nvfp4 row")
+
+    fb = FakeBackend()
+    assert cal.resolve_row_kernel(fb, "down_proj") is sentinel
+    assert cal.resolve_row_kernel(fb, "lm_head") is sentinel
+    # non-GEMM / fused rows have no declared timing kernel -> pending, not a substitute
+    assert cal.resolve_row_kernel(fb, "paged_attention_decode") is None
+    assert cal.resolve_row_kernel(fb, "gdn_decode_fused") is None
+    assert cal.resolve_row_kernel(fb, "rmsnorm") is None
+    assert cal.resolve_row_kernel(fb, "no_such_row") is None
+
+
+def test_time_row_ms_pending_off_cuda_or_unknown_row(monkeypatch):
+    """Off cuda every row is pending; on cuda a row with no declared kernel still is."""
+    import torch
+
+    monkeypatch.setattr(torch, "cuda", type("C", (), {"is_available": lambda self: False})())
+    assert cal.time_row_ms({"name": "down_proj", "_spec": (4, 4)}, object(), 1, 8) is None
 
 
 def test_kernels_table_pending_when_no_calibration(tmp_path, monkeypatch, capsys):
