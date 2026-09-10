@@ -114,6 +114,16 @@
     "date": "2026-08-27",
     "tok_s": 1.0
   },
+  "prefill/11k-ctx32k/sm70": {
+    "commit": "5bfbfe9",
+    "date": "2026-09-05",
+    "tok_s": 111.1
+  },
+  "prefill/chat-reuse-3265/sm70": {
+    "commit": "b197b67",
+    "date": "2026-09-05",
+    "tok_s": 230.1
+  },
   "prefill/len2048/sm90": {
     "commit": "9e3836b",
     "date": "2026-09-03",
