@@ -4,6 +4,11 @@ Covers: roundtrip, prefix hit/miss incl. hash-collision, refcount/CoW,
 state pool, pool exhaustion, and the shared-prefix fork lifecycle.
 """
 
+import sys
+import sysconfig
+import threading
+import time
+
 import pytest
 import torch
 
@@ -875,3 +880,91 @@ def test_batchkv_inputs_for_fp8_scales():
     assert torch.any(
         kv.inputs_for(torch.tensor([[5]]), torch.tensor([[19]]), 0)["k_scale"] == 7
     )
+
+
+def test_a_yielded_gil_runs_a_background_load_promptly(tmp_path):
+    """The SSD prefetch fix's premise: yielding the GIL hands the reader thread a
+    prompt time slice, so a background torch.load runs at near-uncontended speed.
+
+    Guards the premise itself, not the once-per-tick yield #444 shipped: N=1
+    leaves the reader starving on slow ticks (1.5s on CPU), closed by the
+    spin-until-ready loop (72d83303). What must not silently break is the
+    environmental assumption -- that sleep(0) in a busy loop lets a bg load
+    finish promptly. Red when a CPython/torch upgrade changes GIL behavior so
+    it stops holding
+    (docs/experience/errors/2026-09-10-prefetch-deadline-gil-contention.md).
+    """
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        pytest.skip("no GIL to contend")
+
+    # Size the blob from the switch interval: CPython hands a GIL-waiting thread
+    # the GIL every switch interval, so a load that finishes inside one window
+    # sees no difference between the arms (CI macos-14, 2026-09-10: busy 1.3ms
+    # vs yielded 0.4ms -- no contention visible). The uncontended load must span
+    # >= 10 windows. A dict of small tensors, not one big one: a big tensor's
+    # load is one read() with the GIL released, which a busy main thread does
+    # not slow, and the per-storage churn mirrors the real reader (the 27B
+    # snapshot is many per-window files).
+    window_ms = sys.getswitchinterval() * 1000
+    target_ms = 10 * window_ms
+    path = tmp_path / "load.kv"
+    n = 64
+    while True:
+        blob = {f"t{i}": torch.randn(4, 8, 8, 8) for i in range(n)}
+        torch.save(blob, path)
+        torch.load(path, map_location="cpu")  # warmup: first call pays lazy init
+        t0 = time.perf_counter()
+        torch.load(path, map_location="cpu")
+        load_ms = (time.perf_counter() - t0) * 1000
+        if load_ms >= target_ms:
+            break
+        if n > 500_000:
+            pytest.fail(f"load of {n} tensors is {load_ms:.1f}ms, still < {target_ms:.1f}ms")
+        n *= 2
+
+    def bg_load(out):
+        t0 = time.perf_counter()
+        torch.load(path, map_location="cpu")
+        out.append((time.perf_counter() - t0) * 1000)
+
+    def measure(yield_each: bool, runs: int = 5) -> float:
+        times = []
+        for _ in range(runs):
+            out: list = []
+            t = threading.Thread(target=bg_load, args=(out,))
+            t.start()
+            end = time.perf_counter() + 10.0
+            while time.perf_counter() < end and t.is_alive():
+                if yield_each:
+                    time.sleep(0)
+            t.join()
+            times.append(out[0])
+        times.sort()
+        return times[len(times) // 2]
+
+    busy = measure(yield_each=False)
+    yielded = measure(yield_each=True)
+    # Record the population on every run, green or red: a gate that prints its
+    # reading only when red stays green until it grazes the edge. CI's -v
+    # carries this into the log.
+    print(
+        f"gil yield ratio {busy / yielded:.2f}x (busy={busy:.1f}ms "
+        f"yielded={yielded:.1f}ms, target={target_ms:.1f}ms, n={n})"
+    )
+    # The gate is the null hypothesis, not the effect size. The failure this
+    # catches is "sleep(0) no longer yields the GIL": then both arms are the
+    # same and the ratio is 1.0 -- on every machine. The observed effect size
+    # is not machine-independent: 29x on a loaded Mac, 2.92x on CI macos-14,
+    # >=3x on CI ubuntu-latest (2026-09-10; green runs did not record their
+    # ratio, which the print above fixes) -- a 10x spread, so a threshold
+    # taken from any one observation has to move with the machine. 1.5x is
+    # "far enough from 1.0": 1.95x margin under the smallest observed ratio,
+    # and a no-op yield reads ~1.0 and goes red. The measured ratios are this
+    # gate's population, not its standard.
+    assert busy > yielded * 1.5, f"no contention visible: busy={busy:.1f}ms yielded={yielded:.1f}ms"
+    # Absolute ceiling on the yielded arm: calibration lands the load in
+    # [target, 2x target), so 4x target leaves 2x for machine load. The ratio
+    # alone passes when both arms slow together, so this catches a yielded arm
+    # that is slow in absolute terms. If this is red while the ratio above is
+    # green, that is machine load, not regression.
+    assert yielded < target_ms * 4, f"yielded load too slow: {yielded:.1f}ms"
