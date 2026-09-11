@@ -343,6 +343,8 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--optim',
         '--patience',
         '--prompts-per-step',
+        '--q-min-pos',
+        '--q-samples',
         '--recipe',
         '--recall-threshold',
         '--reward',
