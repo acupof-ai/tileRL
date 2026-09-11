@@ -85,12 +85,18 @@ class PagedKvPool:
         dtype: torch.dtype = torch.bfloat16,
         layer_map: tuple[int, ...] | None = None,
         kv_fp8: torch.dtype | None = None,
+        cold_dtype: torch.dtype | None = None,
     ) -> None:
         self._layer_map = tuple(range(num_layers)) if layer_map is None else tuple(layer_map)
         self._plane = {g: d for d, g in enumerate(self._layer_map)}
         self.num_blocks = num_blocks
         self.num_layers = len(self._layer_map)
         self.num_kv_heads = num_kv_heads
+        #: dtype a demoted page's K/V are stored in on the host tier; None keeps the
+        #: native pool dtype. sm70's pool is f32 (no f16 attention path on Volta) and
+        #: the host has half the room, so its cold pages narrow to f16 on the D2H copy
+        #: and widen back on promote. The fp8 scale planes always stay native.
+        self.cold_dtype = cold_dtype
         self.head_dim = head_dim
         self.device = _default_device() if device is None else torch.device(device)
         #: the IO dtype the attention kernel reads, which is the store dtype only off fp8
@@ -173,13 +179,23 @@ class PagedKvPool:
         per-token scale planes. Pinned when the pool is on a card so the promote
         H2D is async-capable; on the CPU cell it is a plain clone."""
         cuda = self.k_pool.is_cuda
-        planes = [("k", self.k_pool[:, block]), ("v", self.v_pool[:, block])]
+        #: K/V narrow on the host copy when a cold dtype is set; the f32 fp8 scale
+        #: planes stay their native dtype.
+        cold_dtype = self.cold_dtype
+        planes = [
+            ("k", self.k_pool[:, block], cold_dtype),
+            ("v", self.v_pool[:, block], cold_dtype),
+        ]
         if self.k_scale is not None:
-            planes += [("ks", self.k_scale[:, block]), ("vs", self.v_scale[:, block])]
+            planes += [("ks", self.k_scale[:, block], None),
+                       ("vs", self.v_scale[:, block], None)]
         blob = {}
         n = 0
-        for key, t in planes:
-            host = torch.empty_like(t, device="cpu", pin_memory=cuda)
+        for key, t, cast_dtype in planes:
+            # A pinned cross-dtype copy_ narrows on the D2H path directly; no extra
+            # device cast tensor is allocated.
+            host = torch.empty(t.shape, dtype=(cast_dtype or t.dtype),
+                               device="cpu", pin_memory=cuda)
             host.copy_(t)
             blob[key] = host
             n += host.numel() * host.element_size()

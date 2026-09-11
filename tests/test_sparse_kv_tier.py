@@ -84,6 +84,64 @@ def test_fp8_scale_planes_round_trip_with_the_page():
     assert torch.equal(pool.v_scale[:, nb], snap[3]), "v_scale plane lost"
 
 
+def test_narrow_cold_f16_round_trips_exactly_for_f16_values():
+    """sm70's f32 pool narrows a demoted page's K/V to f16 on the host (the host has
+    half the room); values that ARE f16-representable must return byte-identical, and
+    the held blob is half the f32 size. The fp8 scale planes stay f32."""
+    p, hkv, d = 4, 2, 8
+    pool = PagedKvPool(p + 1, hkv, d, num_layers=2, device=_device(),
+                       dtype=torch.float32, cold_dtype=torch.float16)
+    pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
+    # powers of two and small integers are exact in f16
+    k = torch.arange(p * hkv * BLOCK_TOKENS * d, dtype=torch.float32).reshape(
+        p, hkv, BLOCK_TOKENS, d) * 0.25
+    v = -torch.arange(p * hkv * BLOCK_TOKENS * d, dtype=torch.float32).reshape(
+        p, hkv, BLOCK_TOKENS, d) * 0.25
+    b = pool.alloc_block()
+    for plane in range(2):
+        pool.write_block(b, 0, k[0].float(), v[0].float(), layer=plane)
+    before = (pool.k_pool[:, b].clone(), pool.v_pool[:, b].clone())
+
+    n = pool.demote_page(b)
+    blob = pool.cold.take(b)
+    # re-hold it so promote_page has a blob
+    assert pool.cold.hold(b, blob, n)
+    assert blob["k"].dtype == torch.float16 and blob["v"].dtype == torch.float16
+    f32_bytes = before[0].numel() * 4 + before[1].numel() * 4
+    held_bytes = blob["k"].numel() * 2 + blob["v"].numel() * 2
+    assert held_bytes * 2 == f32_bytes, (held_bytes, f32_bytes)
+    assert n == held_bytes
+
+    nb = pool.promote_page(b)
+    assert torch.equal(pool.k_pool[:, nb], before[0]), "f16-exact K values changed"
+    assert torch.equal(pool.v_pool[:, nb], before[1]), "f16-exact V values changed"
+
+
+def test_cold_byte_row_matches_held_blob_for_every_width():
+    """per_cold_kv_block_bytes must equal the bytes demote actually holds, for every
+    width. The fp8 case is the one that was wrong: kv_format already prices the
+    per-token f32 scales, so adding a scale term double-counted them (1792 derived
+    vs 1280 held)."""
+    from tilerl.config import tiny
+    from tilerl.memory import per_cold_kv_block_bytes
+    cfg = tiny()
+    H, D = cfg.num_kv_heads, cfg.head_dim
+    L = len(cfg.full_attn_layers)
+
+    def held(fp8, cold):
+        pool = PagedKvPool(8, H, D, num_layers=L, device=_device(),
+                           dtype=torch.float32, kv_fp8=fp8, cold_dtype=cold)
+        pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
+        b = pool.alloc_block()
+        return pool.demote_page(b)
+
+    assert per_cold_kv_block_bytes(cfg, torch.float32, None, None) == held(None, None)
+    assert per_cold_kv_block_bytes(
+        cfg, torch.float32, None, torch.float16) == held(None, torch.float16)
+    assert per_cold_kv_block_bytes(
+        cfg, torch.float32, torch.float8_e4m3fn, None) == held(torch.float8_e4m3fn, None)
+
+
 def test_a_prefix_shared_page_cannot_be_demoted():
     """A page retained by the prefix store is read-only wherever it lives; moving
     its device frame away would corrupt every other request sharing it."""
@@ -180,12 +238,13 @@ def test_engine_decode_tokens_equal_across_a_full_demote_promote_round_trip():
     from tilerl.kv_cache import NoPrefixStore
     from tilerl.model import build_random
 
-    def engine(cold_bytes):
+    def engine(cold_bytes, cold_format="native"):
         cfg = tiny()
         return build_engine(
             cfg, build_random(cfg, seed=11), RefBackend(), num_blocks=64,
             num_slots=4, max_batch=1, max_total_tokens=2048,
-            prefix_store=NoPrefixStore(), kv_cold_bytes=cold_bytes), cfg
+            prefix_store=NoPrefixStore(), kv_cold_bytes=cold_bytes,
+            cold_format=cold_format), cfg
 
     import numpy as np
 
@@ -231,6 +290,62 @@ def test_engine_decode_tokens_equal_across_a_full_demote_promote_round_trip():
     assert st["kv_cold_pages"] == 0 and st["kv_cold_promotions"] == 6
     mem = [r for r in st["memory"] if r["owner"] == "kv_cold"]
     assert not mem, "a fully promoted tier leaves no host row"
+    dense.shutdown(); cold.shutdown()
+
+
+def test_narrow_f16_path_prices_half_and_decodes_like_dense():
+    """The sm70 path end to end on the f32 CPU cell: an engine whose cold tier stores
+    f16 (cold_format='f16') demotes every unselected page through the narrow D2H cast,
+    promotes it, and decodes. The held kv_cold row is priced at the f16 width and its
+    derived bytes equal the measured pinned bytes; greedy tokens equal the dense
+    continuation on this model (f16 holds the attention values to greedy precision).
+
+    CPU-only for the same reason as the native engine gate; the card runs the pool's
+    pinned f16 cast gate above."""
+    if _device().type != "cpu":
+        import pytest
+
+        pytest.skip("model-forward parity gate is the CPU cell; card runs the pool gates")
+    from tilerl.config import tiny
+    from tilerl.engine import SamplingParams, build_engine
+    from tilerl.kv_cache import NoPrefixStore
+    from tilerl.memory import per_cold_kv_block_bytes
+    from tilerl.model import build_random
+
+    cfg = tiny()
+    dense = build_engine(cfg, build_random(cfg, seed=11), RefBackend(), num_blocks=64,
+                         num_slots=4, max_batch=1, max_total_tokens=2048,
+                         prefix_store=NoPrefixStore())
+    cold = build_engine(cfg, build_random(cfg, seed=11), RefBackend(), num_blocks=64,
+                        num_slots=4, max_batch=1, max_total_tokens=2048,
+                        prefix_store=NoPrefixStore(), kv_cold_bytes=1 << 30,
+                        cold_format="f16")
+    import numpy as np
+
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=6, seed=0)
+    tok_d = _drain(dense, dense.submit(prompt, params), 6)
+
+    rid = cold.submit(prompt, params)
+    req = None
+    for _ in range(64):
+        for r in cold._running:
+            if r.req_id == rid and r.phase == 2:
+                req = r
+        if req is not None:
+            break
+        cold.step()
+    d, p = cold.sparse_retier(frozenset())
+    assert d == 6 and p == 0
+    # the held row is priced at the f16 cold width and matches the bytes actually held
+    mid = cold.stats()
+    row = [r for r in mid["memory"] if r["owner"] == "kv_cold"][0]
+    expected = 6 * per_cold_kv_block_bytes(cfg, torch.float32, None, torch.float16)
+    assert row["derived"] == expected == row["measured"], (row, expected)
+    cold_pages = {b for _, b in req.cold_pages}
+    cold.sparse_retier(frozenset(cold_pages))
+    tok_c = _drain(cold, rid, 6)
+    assert tok_c == tok_d, f"f16-narrow decode {tok_c} != dense {tok_d}"
     dense.shutdown(); cold.shutdown()
 
 

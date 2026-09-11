@@ -1032,12 +1032,21 @@ class Engine:
         # The sparse-KV cold tier lives in pinned host RAM and is not part of plan()
         # (Unit A derives the budgeted --sparse-k row; this is what is HELD now).
         # Emitted only while pages are demoted, so a dense engine shows no host row.
+        # Derived from the priced cold format (per_cold_kv_block_bytes x pages), not
+        # from the tier's own byte counter: delta then catches a D2H copy that stored
+        # a different width than the plan priced (the f16 narrowing).
         cold = getattr(kv, "cold", None)
         if cold is not None and cold.bytes_held:
+            pages = cold.stats()["kv_cold_pages"]
+            from .memory import per_cold_kv_block_bytes
+
+            expected = pages * per_cold_kv_block_bytes(
+                self._model.cfg, kv.dtype, kv.kv_fp8, kv.cold_dtype)
             rows.append({"tier": "host", "owner": "kv_cold", "kind": "allocation",
-                         "derived": cold.bytes_held,
-                         "note": f"{cold.stats()['kv_cold_pages']} demoted pages",
-                         "measured": cold.bytes_held, "delta": 0})
+                         "derived": expected,
+                         "note": f"{pages} demoted pages",
+                         "measured": cold.bytes_held,
+                         "delta": expected - cold.bytes_held})
         return rows
 
     def sparse_retier(self, keep: frozenset[int]) -> tuple[int, int]:
@@ -1867,6 +1876,12 @@ def build_engine(
     #: of one block id, fp8 scales included) through a HostKvPages tier and the
     #: freed device block goes back to the SAME pool — there is no second pool.
     kv_cold_bytes: int = 0,
+    #: dtype for a demoted page's K/V in the host/SSD tier: "native" keeps the pool
+    #: dtype, "f16" narrows an f32 pool (sm70, which has no f16 attention path) to
+    #: f16 on the D2H copy and widens back on promote. "" picks f16 on an f32 pool
+    #: and native everywhere else — sm70's host has half the room and needs it,
+    #: sm90's bf16 already is 16-bit. The fp8 scale planes stay f32 either way.
+    cold_format: str = "",
     #: directory for the SSD prefix tier; "" is off. Unlike the DRAM tier this one does
     #: not need concurrent sessions to pay: after a restart HBM is empty, so the first
     #: lookup of every returning conversation reaches back and the disk is what answers.
@@ -1966,6 +1981,17 @@ def build_engine(
         num_blocks = _fit_blocks(cfg, backend, kv_io, max_blocks,
                                  draft_layers=0 if draft is None else draft.cfg.num_layers,
                                  kv_fp8=kv_fp8)
+    # The narrow host-copy dtype. Auto ("") narrows an f32 pool (sm70) to f16 and
+    # leaves every other pool native; --cold-format forces it. "native" explicitly
+    # keeps the pool dtype even on sm70.
+    if cold_format == "native":
+        cold_dtype = None
+    elif cold_format == "f16":
+        cold_dtype = torch.float16
+    elif cold_format == "":
+        cold_dtype = torch.float16 if kv_io == torch.float32 else None
+    else:
+        raise ValueError(f"unknown --cold-format {cold_format!r}; expected f16|native")
     kv_pool = PagedKvPool(
         num_blocks + pad,
         cfg.num_kv_heads,
@@ -1979,6 +2005,7 @@ def build_engine(
         # stand in for Backend without declaring an io dtype.
         dtype=kv_io,
         kv_fp8=kv_fp8,
+        cold_dtype=cold_dtype,
     )
     # A resident store entry owns a GDN state snapshot in HBM (144 MiB at 27B f32)
     # and a decode publishes one every BLOCK_TOKENS, so the store's byte budget must

@@ -149,7 +149,7 @@ def _shard(cfg, model, tp: int, backend, model_mod):
 def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
                   blocks=0, max_ctx=0, max_batch=8, ssd_path="", ssd_min_tokens=0,
                   dram_bytes=0, state_bytes=0, kv_fp8="", decode=None,
-                  max_batched_tokens=0):
+                  max_batched_tokens=0, kv_cold_bytes=0, cold_format=""):
     """Serving-size engine on one card. Multi-card serving is one process per card
     under CUDA_VISIBLE_DEVICES (see generate.py for the process-per-device pattern);
     the in-process DataParallelEngine wrapper was deleted 2026-09-09 — its hand-written
@@ -186,6 +186,10 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
         kw["state_bytes"] = state_bytes
     if kv_fp8:
         kw["kv_fp8"] = _kv_fp8(kv_fp8)
+    if kv_cold_bytes:
+        kw["kv_cold_bytes"] = kv_cold_bytes
+    if cold_format:
+        kw["cold_format"] = cold_format
     # Text stop sequences are matched on decoded ids, so the engine needs the
     # tokenizer's decode; without it `submit` refuses a request that carries one.
     if decode is not None:
@@ -301,6 +305,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            max_batch=args.max_batch, ssd_path=args.ssd_path,
                            ssd_min_tokens=args.ssd_min_tokens, dram_bytes=args.dram_bytes,
                            state_bytes=args.state_bytes, kv_fp8=args.kv_fp8,
+                           cold_format=getattr(args, "cold_format", ""),
                            decode=tokenizer.decode,
                            max_batched_tokens=args.max_batched_tokens)
 
@@ -2257,6 +2262,12 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "has no fp8 twin and would scatter into a dequantized copy. e4m3 is "
                               "the default choice on measurement, not analogy: it beats e5m2 "
                               "1.89x on the worst element with nothing underflowing on tiny")
+    p_serve.add_argument("--cold-format", choices=["f16", "native"], default="",
+                         help="dtype of a demoted KV page in the host/SSD tier. Default "
+                              "(unset): f16 on an f32 pool (sm70, whose host has half the "
+                              "room and has no f16 attention path), native elsewhere. f16 "
+                              "narrows K/V on the D2H copy and widens back on promote; "
+                              "native keeps the pool dtype. fp8 scale planes stay f32.")
     p_serve.add_argument("--max-batch", type=int, default=8,
                          help="concurrent rows; drop to 2 for a single-user endpoint (a decode "
                               "graph is captured per bucket x chain width, so a lower "
