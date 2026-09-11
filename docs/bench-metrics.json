@@ -66,6 +66,15 @@
       "weight": 0.06,
       "why": "decode is 20/314.33 s of a real agent turn"
     },
+    "pcie_h2d_gbs": {
+      "unit": "GB/s",
+      "direction": "+",
+      "weight": 0.0,
+      "shape": [
+        "card"
+      ],
+      "why": "measured one-way pinned host->device PCIe bandwidth from a >=1GiB copy; the sparse cold-page fetch floor"
+    },
     "device_resident_bytes": {
       "direction": "none",
       "shape": [
