@@ -174,6 +174,25 @@ per-call-launch bound, not MAC bound); decode far under 8.5 tok/s means the cold
 page fetch stalls the decode tick; an OOM host kill means the cold budget
 under-counts the non-hot pages.
 
+### Measured vs the pre-registration (overnight V100)
+
+| run (head) | prefill s / ms·tok | decode tok/s / ms/tok | promotions per dec tick |
+|---|---|---|---|
+| **ladder 256k** (#533 f0a45485, pre-#524) | 4806.9 / 18.34 (80.1 min, 512 ticks) | 0.957 / 1045 | 274.4 (+274.5 demote) |
+| **hot-pin 32k** (#534 dc19c3d1) | 208.8 / 6.37 | **5.653 / 176.9** | **0.0** (0.1 demote) |
+| **M-tile 256k** (main fadb2726, +#524) | _running_ | _running_ | — |
+
+The 28-min prefill prediction is tested by the M-tile row only; the ladder row
+is its pre-#524 control (18.34 ms/tok carries the slow M=32 GEMM ladder), so
+80 min there is expected, not a miss. The decode 8.5 tok/s prediction was made
+for the **hot-pin** engine and 32k is its first check: 5.653 tok/s. Hot-pin
+eliminates the fetch exactly (0 promotions, 0.1 demotions per steady tick) and
+recovers 4.5x over demote-all (1.252 tok/s) but is still 0.68x the dense-eager
+8.28 tok/s — the residual is sm70 per-tick Quest scoring over all candidate
+pages (compute, not memory), distinct from the sm90 graph gap. The ladder 256k
+decode shows why pin matters: 274 promote + 274 demote per tick, each a
+synchronous ~1 MiB PCIe copy → 1045 ms/tok.
+
 ## Rule
 
 Pre-register the long-context sparse prediction as a sum of a measured flat
