@@ -171,27 +171,42 @@ def test_serve_build_path_wires_the_sparse_engine(tmp_path, capsys):
     assert "kv_pool" not in owners, owners
 
 
-def test_sparse_engine_runs_with_the_default_prefix_store():
-    """Regression (5f CHANGE-REQ): build_engine's DEFAULT store is the real
-    PrefixStore, which publishes req.blocks[:N] at prefill boundaries. Sparse
-    demotes pages out of req.blocks, so without forcing NoPrefixStore a
-    >=64-token (4-page, first publish boundary) request died
-    ``64 tokens need 4 blocks, got 0``. The default store must be coerced and a
-    long request run through prefill AND decode."""
-    from tilerl.kv_cache import PrefixStore  # noqa: F401  (documents the default)
+def test_sparse_engine_publishes_and_a_same_prefix_follower_matches_dense():
+    """Sparse keeps prefix caching via the host-blob-backed SparsePrefixCache
+    (replaces the NoPrefixStore stopgap that fixed the 88e53e5e crash). A request
+    past the first 64-token publish boundary completes with published>0, and a
+    second request sharing its prefix HITS (prefills only the tail) and emits the
+    same greedy tokens as a dense engine on the identical prompt."""
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)  # 83 tokens
+    follow = np.concatenate([prompt, [100, 101]])
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
 
-    # No prefix_store arg: build_engine would normally build PrefixStore.
-    engine = build_engine(
+    dense = build_engine(
         cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
         num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-        max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore())
+    td = _drain(dense, dense.submit(follow, params), 8)
+    dense.shutdown()
+
+    # No prefix_store arg -> the sparse prefix index is enabled (sharing on).
+    sparse = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=6, scorer="bounds",
         kv_cold_bytes=1 << 30)
-    # First publish boundary is at 64 tokens; use a longer prompt to cross it.
-    prompt = np.arange(3, 3 + 5 * BLOCK_TOKENS, dtype=np.int64)  # 80 tokens, 5 pages
-    rid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
-    tok = _drain(engine, rid, 4)
-    engine.shutdown()
-    assert len(tok) == 4 and all(isinstance(t, int) for t in tok)
+    r1 = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
+    _drain(sparse, r1, 8)
+    assert sparse._sparse.prefix.published > 0  # crossed the 64-token boundary
+    r2 = sparse.submit(follow, params)
+    # one step admits: the follower must adopt the 80-token prefix
+    sparse.step()
+    req = next(x for x in sparse._running if x.req_id == r2)
+    # adopted the 80-token prefix; after one step the 5-token tail already prefetched
+    assert req.sparse_matched == 80, req.sparse_matched
+    assert req.prefill_from <= 85 and req.prefill_from >= 80, req.prefill_from
+    ts = _drain(sparse, r2, 8)
+    sparse.shutdown()
+    assert ts == td, f"sparse follower {ts} != dense {td}"
 
 
 def test_cold_tier_spills_past_the_host_budget_and_the_ledger_splits_tiers(tmp_path):

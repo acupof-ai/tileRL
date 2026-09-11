@@ -5,6 +5,9 @@ its `docs/experience/` entry. Newest first.
 
 ## 2026-09-12
 
+- **phase exit (tiny CPU)** — **sparse prefix sharing restored:** a sparse engine no longer forces NoPrefixStore; SparsePrefixCache shares demoted page host blobs + Quest bounds + the GDN snapshot by content hash, so a same-prefix follower prefills only the tail and matches dense tokens. Replaces the #518 stopgap (5f CHANGE-REQ). — [wins/2026-09-12-sparse-prefix-cache.md](docs/experience/wins/2026-09-12-sparse-prefix-cache.md)
+
+
 - **phase exit (tiny CPU)** — **cold-KV SSD spill:** HostKvPages gains a host-RAM budget and spills evicted pages to one mmap'd file (`--cold-ssd-path`), fixed-stride block-id slots with no on-disk index and in-memory presence; promote reads the same demote/promote path byte-equal. The ledger splits kv_cold into host (`kv_cold`) and file (`kv_cold_ssd`) rows. Distinct from --ssd-path (prefix boot). — [wins/2026-09-12-cold-tier-ssd-spill.md](docs/experience/wins/2026-09-12-cold-tier-ssd-spill.md)
 
 ## 2026-09-11
