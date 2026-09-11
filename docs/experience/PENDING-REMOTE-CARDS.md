@@ -7,7 +7,10 @@ command was run on 2026-09-11 and quoted below, so a card run whose shape
 differs is a regression, not an environment quirk.
 
 Run on the pod against the committed tree (`scripts/POD-VERIFY.md` covers
-sync/commit discipline), with `/work/Qwen3.8-27B-NVFP4` present (found on host
+sync/commit discipline), with the checkpoint present at the tileRL-owned
+`/work/tilerl-ckpt/Qwen3.8-27B-NVFP4` (the earlier shared `/work/Qwen3.8-27B-NVFP4` was
+deleted by a cross-project dedup on 2026-09-11; see the 2026-09-11 checkpoint-deleted
+error entry; the host copy is on
 `iv-yeozpb5g5cbw80bls64e`, container `sglang-test`, 2026-09-11 — name the host
 and `ls -l` before calling it absent).
 
@@ -74,7 +77,7 @@ resolves each row's kernel **by its weight face** (nvfp4 → linear_fp4,
 fp8 → linear_fp8; fused attention/GDN/norms have no timing fixture).
 
 ```bash
-CKPT=/work/Qwen3.8-27B-NVFP4
+CKPT=/work/tilerl-ckpt/Qwen3.8-27B-NVFP4  # tileRL-owned copy; see 2026-09-11 dedup error
 CUDA_VISIBLE_DEVICES=0 TILERL_TARGET=cuda uv run tilerl bench --kernels \
   --checkpoint "$CKPT" --batches 1,8
 CUDA_VISIBLE_DEVICES=0 TILERL_TARGET=cuda uv run tilerl bench --kernels \
@@ -100,7 +103,7 @@ Run pytest from one invocation with both files as args (a `file -k` pair is not
 valid pytest syntax):
 
 ```bash
-export TILERL_27B_CKPT=/work/Qwen3.8-27B-NVFP4
+export TILERL_27B_CKPT=/work/tilerl-ckpt/Qwen3.8-27B-NVFP4  # tileRL-owned copy; see 2026-09-11 dedup error
 TILERL_TARGET=cuda uv run pytest tests/test_kernel_cost.py tests/test_memory_ledger.py \
   -k "faces or checkpoint or 27b" -q
 # header-only dry-run, integer table against a free budget:
