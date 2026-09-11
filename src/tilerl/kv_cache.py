@@ -328,7 +328,10 @@ class PagedKvPool:
             # another (CPU table + mps pool is the metal parity path).
             pos = torch.arange(int(ends[bi]) - sq, int(ends[bi]),
                                device=kv.block_table.device)
-            blk = kv.block_table[bi, pos // BLOCK_TOKENS].to(dev)
+            # Sparse path: the table holds only this row's OWN span, whose first
+            # column is logical page ``page_base[bi]`` (default 0 = dense table).
+            base = int(kv.page_base[bi]) if getattr(kv, "page_base", None) is not None else 0
+            blk = kv.block_table[bi, (pos // BLOCK_TOKENS - base).clamp_min(0)].to(dev)
             off = (pos % BLOCK_TOKENS).to(dev)
             if self.kv_fp8 is not None:
                 # per row, because rows own disjoint blocks but share none of their spans
@@ -1690,6 +1693,10 @@ class BatchKv:
     state_pool: Any
     seq_q_lens: torch.Tensor | None = None  # [B] valid query tokens per row
     keep_steps: int = 0  # verify: keep the recurrent state after each of the first N chain tokens
+    #: sparse engine only: [B] logical page index of block_table column 0 (dense: 0/None)
+    page_base: torch.Tensor | None = None
+    #: sparse engine only: the per-tick SparseForward selection descriptor
+    sparse: Any = None
 
     def inputs_for(self, ids, pos, row: int) -> dict:
         """Clone of every tensor the forward reads for row ``row``.
