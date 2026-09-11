@@ -216,6 +216,19 @@ def _kv_fp8(name: str | None):
     return {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}[name]
 
 
+def _require_checkpoint_matches(cfg, model_name: str, checkpoint: str) -> None:
+    """Refuse before loading a checkpoint whose config.json is not this model's.
+    Ground truth is the checkpoint's own config.json: pricing/timing it on a different
+    cfg (e.g. --checkpoint <27B> left on the default --model tiny) silently mixed tiny
+    shapes with 27B rows — the 5,967% roofline table. Both --dry-run and
+    bench --kernels --checkpoint load safetensors, so both call this one guard."""
+    from .model import checkpoint_matches_config
+
+    ok, reason = checkpoint_matches_config(cfg, checkpoint)
+    if not ok:
+        sys.exit(f"error: --checkpoint {checkpoint} is not a {model_name} checkpoint: {reason}")
+
+
 def _dry_run_checkpoint(args, backend) -> None:
     """--dry-run --checkpoint DIR: price the ledger from safetensors HEADERS alone
     (the served faces model.checkpoint_weight_faces derives), blocks fitted
@@ -238,6 +251,7 @@ def _dry_run_checkpoint(args, backend) -> None:
 
     cfg = {"tiny": config_mod.tiny, "tiny-agent": lambda: config_mod.tiny(65536),
            "qwen38-27b": config_mod.qwen38_27b}[args.model]()
+    _require_checkpoint_matches(cfg, args.model, args.checkpoint)
     faces = checkpoint_weight_faces(cfg, args.checkpoint)
     device_free = _device_free(args, backend)
     # state slots add the decode-graph replay row on cuda (auto-on); the fit happens
@@ -1802,6 +1816,8 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
     from .precision import fp8_block_dev, fp8_dev, kv_format, nvfp4, nvfp4_dev, nvfp4_dev_b32
 
     cfg = config_mod.qwen38_27b() if args.model == "qwen38-27b" else config_mod.tiny()
+    if args.checkpoint:
+        _require_checkpoint_matches(cfg, args.model, args.checkpoint)
     faces = checkpoint_weight_faces(cfg, args.checkpoint) if args.checkpoint else None
     face_label = {
         nvfp4: "nvfp4", nvfp4_dev: "nvfp4", nvfp4_dev_b32: "nvfp4",
@@ -1837,14 +1853,21 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
         backend = get_backend()
         spec_by_name = {k.split(".")[-1]: tuple(v) for k, v in param_specs(cfg).items()}
 
-    def render(rows: list[dict], label: str, b: int, s: int) -> tuple[int, int]:
+    def render(rows: list[dict], label: str, b: int, s: int, timed_s: int):
+        """``b,s`` name the PRICED tick (bytes/flops rows); ``timed_s`` is the token
+        rows per launch the timed GEMM actually runs — s on prefill, 1 on a decode
+        tick (decode streams one new token per row, not s; timing b*s timed a fat
+        prefill GEMM and printed a fictional ~10x decode tick)."""
         print(f"# {cfg.name} {label}, fp8 KV, {src}, floor device={device_name}")
         if floors is None:
             print("# (no calibration row for this device: ms/bound/%bound pending-remote)")
         tb_sum = tf_sum = 0
+        # measured tick totals: Σ count × per-launch ms/bound. Only timed rows enter.
+        ms_sum = bound_sum = 0.0
+        timed_launches = 0
         for r in rows:
-            by = r["bytes"] * r["count"]
-            fl = r["flops"] * r["count"]
+            by_one, fl_one = r["bytes"], r["flops"]          # ONE launch
+            by, fl = by_one * r["count"], fl_one * r["count"]  # whole tick
             tb_sum += by
             tf_sum += fl
             face = f"{face_cell(r):>7}"
@@ -1852,21 +1875,43 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {'pending':>11} {'pending':>11} {'pending':>11}")
                 continue
-            bound_s = cal.bound_seconds(by, fl, floors["bw_gbs"], floors["peak_tflops"])
-            bnd_col = f"{bound_s * 1e3:9.3f}ms"
-            # The measured ms of the real registry kernel is cuda-only; off cuda (or for
-            # a non-GEMM row with no linear timing fixture) it stays pending.
+            peak = cal.row_peak_tflops(floors, r, b, timed_s)
+            # Per-launch bound: the timed kernel is ONE launch at the row's exact shape,
+            # so its roofline floor must be for one launch too. count scales the TOTAL
+            # columns below, never the per-row ratio (bound and ms are the same workload).
+            bound_one = (cal.bound_seconds(by_one, fl_one, floors["bw_gbs"], peak)
+                         if peak is not None else None)
             ms = None
             if backend is not None and r["name"] in spec_by_name:
                 ms = cal.time_row_ms(
-                    {**r, "_spec": spec_by_name[r["name"]]}, backend, b, s)
+                    {**r, "_spec": spec_by_name[r["name"]]}, backend, b, timed_s)
+            if bound_one is None:
+                bnd_col = f"{'pending':>9}ms"
+            else:
+                bnd_col = f"{bound_one * 1e3:9.3f}ms"
             if ms is None:
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {'pending':>11} {bnd_col:>11} {'pending':>11}")
             else:
+                pct = (bound_one / (ms / 1000.0) * 100.0) if bound_one is not None else float("nan")
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
-                      f"{by:>12,} {fl:>10,} {ms:>9.3f}ms {bnd_col:>11} "
-                      f"{bound_s / (ms / 1000.0) * 100.0:>10.1f}%")
+                      f"{by:>12,} {fl:>10,} {ms:>9.3f}ms {bnd_col:>11} {pct:>10.1f}%")
+                if bound_one is not None:
+                    # A kernel cannot beat its own measured ceiling: bound/ms > 100 with
+                    # a non-cuda async/short-circuit bug is an instrument error, not data.
+                    if pct > 100.0 + 1.0:
+                        raise SystemExit(
+                            f"bench --kernels: {r['name']} {face_cell(r).strip()} achieved "
+                            f"{pct:.1f}% of its roofline floor (>100) — the timed kernel "
+                            f"({ms:.3f} ms) did less work than the priced row "
+                            f"({bound_one*1e3:.3f} ms/launch); instrument error, not a result.")
+                    ms_sum += ms * r["count"]
+                    bound_sum += bound_one * 1e3 * r["count"]
+                    timed_launches += r["count"]
+        if floors is not None and timed_launches:
+            print(f"{'TIMED TOTAL':<26} {timed_launches:>5} {'':>22} {'':>7} "
+                  f"{'':>12} {'':>10} {ms_sum:>8.1f}ms {bound_sum:>8.1f}ms "
+                  f"{bound_sum / ms_sum * 100.0:>10.1f}%")
         return tb_sum, tf_sum
 
     print(f"{'kernel':<26} {'count':>5} {'shape':>22} {'face':>7} {'bytes':>12} "
@@ -1875,7 +1920,7 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
         pre = kernel_cost.TickShape(b=1, s=args.prefill, kv=kv_format(cfg.head_dim),
                                     weight=nvfp4, faces=faces)
         tb, tf = render(kernel_cost.prefill_rows(cfg, pre),
-                        f"prefill S={args.prefill}", 1, args.prefill)
+                        f"prefill S={args.prefill}", 1, args.prefill, args.prefill)
         print(f"{'PREFILL TOTAL':<26} {'':>5} {'':>22} {'':>7} {tb:>12,} {tf:>10,}")
         return
     batches = tuple(int(x) for x in args.batches.split(",")) if args.batches else (1, 8)
@@ -1883,7 +1928,7 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
         tick = kernel_cost.TickShape(b=b, s=args.context, kv=kv_format(cfg.head_dim),
                                      weight=nvfp4, faces=faces)
         tb, tf = render(kernel_cost.tick_rows(cfg, tick),
-                        f"decode tick B={b} s={args.context}", b, args.context)
+                        f"decode tick B={b} s={args.context}", b, args.context, 1)
         print(f"{'TICK TOTAL':<26} {'':>5} {'':>22} {'':>7} {tb:>12,} {tf:>10,}")
 
 

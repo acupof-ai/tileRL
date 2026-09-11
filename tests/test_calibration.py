@@ -103,7 +103,45 @@ def test_calibration_returns_both_floors(tmp_path):
     p = _store(tmp_path, [_row(cal.BW_METRIC, 4000.0, "GB/s", H20),
                           _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20)])
     got = cal.calibration(cal.load_rows(p), H20)
-    assert got == {"bw_gbs": 4000.0, "peak_tflops": 989.0}
+    # bf16 pair present; fp8 peak absent -> None (fp8 rows render pending, never bf16)
+    assert got == {"bw_gbs": 4000.0, "peak_tflops": 989.0, "fp8_peak_tflops": None}
+
+
+def test_calibration_returns_fp8_peak_when_present(tmp_path):
+    p = _store(tmp_path, [_row(cal.BW_METRIC, 4000.0, "GB/s", H20),
+                          _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20),
+                          _row(cal.FP8_PEAK_METRIC, 1970.0, "TFLOP/s", H20)])
+    assert cal.calibration(cal.load_rows(p), H20) == {
+        "bw_gbs": 4000.0, "peak_tflops": 989.0, "fp8_peak_tflops": 1970.0}
+
+
+def test_row_peak_keys_by_face(tmp_path):
+    """The ceiling is the MMA dtype's peak at the launch M: fp8-weight rows on e4m3
+    WGMMA (M>=9) use the fp8 ceiling, on bf16 decode (M<=8) the bf16 ceiling; an
+    nvfp4 prefill GEMM is w4a8 and takes fp8 too; missing fp8 floor -> None."""
+    from tilerl import precision as P
+
+    bf = {"bw_gbs": 4000.0, "peak_tflops": 100.0, "fp8_peak_tflops": 200.0}
+
+    def row(face, name="q_proj"):
+        return {"name": name, "face": face}
+
+    # fp8 weights: prefill M>=9 on fp8 peak, decode M<=8 on bf16
+    assert cal.row_peak_tflops(bf, row(P.fp8_dev), 1, 4096) == 200.0
+    assert cal.row_peak_tflops(bf, row(P.fp8_block_dev), 1, 4096) == 200.0
+    assert cal.row_peak_tflops(bf, row(P.fp8_dev), 1, 1) == 100.0
+    assert cal.row_peak_tflops(bf, row(P.fp8_dev), 8, 1) == 100.0
+    # nvfp4 weights: w4a8 prefill on fp8 peak (the 133.8% class), decode on bf16
+    assert cal.row_peak_tflops(bf, row(P.nvfp4_dev), 1, 4096) == 200.0
+    assert cal.row_peak_tflops(bf, row(P.nvfp4_dev_b32), 1, 4096) == 200.0
+    assert cal.row_peak_tflops(bf, row(P.nvfp4_dev), 1, 1) == 100.0
+    # lm_head prices one vector per row: b=1 decode is M=1 -> bf16 even under prefill b,s
+    assert cal.row_peak_tflops(bf, row(P.fp8_dev, "lm_head"), 1, 4096) == 100.0
+    # bf16 face never resolves a quant kernel
+    assert cal.row_peak_tflops(bf, row(P.bf16), 1, 4096) == 100.0
+    missing = {"bw_gbs": 4000.0, "peak_tflops": 100.0, "fp8_peak_tflops": None}
+    assert cal.row_peak_tflops(missing, row(P.fp8_dev), 1, 4096) is None
+    assert cal.row_peak_tflops(missing, row(P.nvfp4_dev), 1, 4096) is None
 
 
 def test_calibrate_refuses_off_cuda(monkeypatch):
@@ -222,6 +260,82 @@ def test_time_row_ms_pending_off_cuda_or_unknown_row(monkeypatch):
         {"name": "down_proj", "_spec": (4, 4), "face": None}, object(), 1, 8) is None
 
 
+def test_time_row_ms_identity_assert_survives_bound_methods(monkeypatch):
+    """time_row_ms asserts the kernel it resolves twice is the same. A real backend's
+    linear_fp4 is a BOUND method, and two getattr calls hand back distinct wrapper
+    objects, so a plain `is` always failed — the first card run of bench --kernels
+    crashed with AssertionError. Drive time_row_ms with faked cuda and a stubbed event
+    timer so the identity assertion runs without a GPU; the bound kernel returns None.
+    Mutant: replace the __func__ comparison in time_row_ms with `fn is
+    resolve_row_kernel(...)` — this gate goes red."""
+    import torch
+
+    monkeypatch.setattr(torch, "cuda", type("C", (), {"is_available": lambda self: True})())
+    monkeypatch.setattr(cal, "_event_seconds", lambda fn, iters=20: 0.001)
+
+    from tilerl import precision as P
+
+    class BoundBackend:
+        device = torch.device("cpu")
+
+        def linear_fp4(self, x, wq, scale, oscale=None):
+            return None
+
+    row = {"name": "down_proj", "_spec": (32, 32), "face": P.nvfp4_dev}  # inn 32 packs
+    assert cal.time_row_ms(row, BoundBackend(), 1, 1) == 1.0
+
+
+def test_time_row_ms_shape_matches_priced_flops_decode_and_prefill(monkeypatch):
+    """The timed GEMM is the priced launch: a linear row's per-launch flops are
+    2*M*N*K, so the row's declared flops pin M for both ticks (b*s) and prefill
+    (b=1,s=S); lm_head prices b vectors. Mutant: row_launch_m returns 1 for every
+    row — the prefill/decode rows here go red (the 5,967% table class)."""
+    import torch
+
+    monkeypatch.setattr(torch, "cuda", type("C", (), {"is_available": lambda self: True})())
+    monkeypatch.setattr(cal, "_event_seconds", lambda fn, iters=20: 0.001)
+
+    from tilerl import precision as P
+
+    class Backend:
+        device = torch.device("cpu")
+
+        def linear_fp8(self, x, wq, wscale):
+            return None
+
+    n, k = 32, 16
+    for name, b, s, m in (("q_proj", 1, 8, 8), ("q_proj", 1, 4096, 4096),
+                          ("q_proj", 8, 1, 8), ("lm_head", 8, 1, 8)):
+        row = {"name": name, "_spec": (n, k), "face": P.fp8_dev,
+               "flops": 2 * m * n * k}
+        assert cal.time_row_ms(row, Backend(), b, s) == 1.0
+
+    bad = {"name": "q_proj", "_spec": (n, k), "face": P.fp8_dev,
+           "flops": 2 * 4096 * n * k}  # prices a 4096-token prefill launch
+    with pytest.raises(AssertionError):
+        cal.time_row_ms(bad, Backend(), 1, 1)  # timed at m=1 — the m=1 mutant
+
+
+def test_kernels_checkpoint_guard_refuses_model_mismatch(tmp_path, monkeypatch):
+    """bench --kernels --checkpoint is the command that printed the 5,967% table
+    (27B checkpoint on tiny cfg); the shared guard must refuse it before any
+    safetensors header is read."""
+    import json
+
+    (tmp_path / "config.json").write_text(json.dumps({
+        "num_hidden_layers": 48, "hidden_size": 5120, "num_attention_heads": 40,
+        "num_key_value_heads": 4, "head_dim": 256}))
+    import argparse
+
+    from tilerl import cli
+
+    args = argparse.Namespace(model="tiny", batches=None, context=4096, prefill=0,
+                              checkpoint=str(tmp_path), device_name="x",
+                              kv_fp8=False)
+    with pytest.raises(SystemExit, match="not a tiny checkpoint"):
+        cli.cmd_bench_kernels(args)
+
+
 def test_kernels_table_pending_when_no_calibration(tmp_path, monkeypatch, capsys):
     """With no ledger row the roofline columns render pending-remote, not a datasheet
     number, even though bytes/flops always print."""
@@ -236,6 +350,50 @@ def test_kernels_table_pending_when_no_calibration(tmp_path, monkeypatch, capsys
     out = capsys.readouterr().out
     assert "pending-remote" in out
     assert "TICK TOTAL" in out
+
+
+def test_bench_kernels_decode_times_one_token_launch(monkeypatch):
+    """A decode tick prices b*s against the pooled context but the timed GEMM is a
+    one-token launch (M=b for linears): passing s=4096 into the timer timed a fat
+    prefill GEMM and printed a fictional ~10x decode tick (pod 2026-09-11).
+    Mutant: render(..., b, args.context) on the decode call -> timed_s=4096."""
+    import torch
+
+    seen: list[tuple[str, int, int]] = []
+
+    def fake_time(row, backend, b, s):
+        seen.append((row["name"], b, s))
+        return None  # suppress ms columns; M only needs to be observed
+
+    monkeypatch.setattr(cal, "time_row_ms", fake_time)
+    monkeypatch.setattr(cal, "load_rows", lambda: [])
+    monkeypatch.setattr(
+        cal, "calibration",
+        lambda rows, name: {"bw_gbs": 4000.0, "peak_tflops": 100.0,
+                            "fp8_peak_tflops": 200.0})
+    fake_cuda = type("C", (), {
+        "is_available": lambda self: True,
+        "get_device_name": lambda self, i: "stub",
+        "_is_compiled": staticmethod(lambda: False)})()
+    monkeypatch.setattr(torch, "cuda", fake_cuda)
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    import tilerl_kernels.backend as kb
+    monkeypatch.setattr(kb, "get_backend", lambda: object())
+    import argparse
+
+    from tilerl import cli
+
+    args = argparse.Namespace(model="tiny", batches="1", context=512, prefill=0,
+                              checkpoint=None, device_name=None)
+    cli.cmd_bench_kernels(args)
+    assert seen and all(s == 1 for _, _, s in seen), seen
+
+    seen.clear()
+    args2 = argparse.Namespace(model="tiny", batches=None, context=512, prefill=256,
+                               checkpoint=None, device_name=None)
+    cli.cmd_bench_kernels(args2)
+    assert seen and all(s == 256 for _, _, s in seen), seen
+
 
 
 def _cal_row(rid, metric, value, name, card, date, supersedes=None):
@@ -294,7 +452,9 @@ def test_device_section_picks_newest_pair_and_residency_per_device(tmp_path):
     assert v100["hbm_bw_gbs"]["value"] == 900.0
     assert v100["residency"] is None
     # JSON shape the CLI pins.
-    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "residency"}
+    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "fp8_peak_tflops",
+                        "residency"}
+    assert h20["fp8_peak_tflops"] is None  # no fp8 row recorded in this fixture
     assert set(h20["hbm_bw_gbs"]) == {"value", "commit", "date"}
     assert set(h20["residency"]) == {"peak", "static", "transient", "commit", "date"}
 

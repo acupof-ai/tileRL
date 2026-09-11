@@ -17,6 +17,7 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 #: one calibration row per (metric, device name) pair
 BW_METRIC = "hbm_bw_gbs"
 PEAK_METRIC = "bf16_peak_tflops"
+FP8_PEAK_METRIC = "fp8_peak_tflops"
 
 
 def store_path() -> Path:
@@ -58,15 +59,19 @@ def latest_floor(rows: list[dict], metric: str, device_name: str) -> dict | None
 
 
 def calibration(rows: list[dict], device_name: str) -> dict | None:
-    """Both floors for a device, or None when either is missing (then the renderer prints
-    pending-remote rather than dividing by a half-calibration)."""
+    """The floors for a device, or None when the required bf16 pair is missing (then
+    the renderer prints pending-remote rather than dividing by a half-calibration).
+    The fp8 peak is optional: absent → None, and fp8 GEMM rows render pending rather
+    than borrow the bf16 ceiling (which would read ~200% on a healthy fp8 kernel)."""
     bw = latest_floor(rows, BW_METRIC, device_name)
     peak = latest_floor(rows, PEAK_METRIC, device_name)
     if bw is None or peak is None:
         return None
+    fp8 = latest_floor(rows, FP8_PEAK_METRIC, device_name)
     return {
         "bw_gbs": float(bw["value"]),
         "peak_tflops": float(peak["value"]),
+        "fp8_peak_tflops": None if fp8 is None else float(fp8["value"]),
     }
 
 
@@ -74,7 +79,7 @@ RESIDENT_METRIC = "device_resident_bytes"
 #: the metrics this section renders — a device appears only if it has at least one of
 #: these, so an unrelated bench row (e.g. a cpu decode_tok_s) never makes an all-pending
 #: section that implies a calibrated card.
-_SECTION_METRICS = (BW_METRIC, PEAK_METRIC, RESIDENT_METRIC)
+_SECTION_METRICS = (BW_METRIC, PEAK_METRIC, FP8_PEAK_METRIC, RESIDENT_METRIC)
 
 
 def device_sections(rows: list[dict]) -> list[dict]:
@@ -103,6 +108,7 @@ def device_sections(rows: list[dict]) -> list[dict]:
             "device": name,
             "hbm_bw_gbs": pair(latest_floor(rows, BW_METRIC, name)),
             "bf16_peak_tflops": pair(latest_floor(rows, PEAK_METRIC, name)),
+            "fp8_peak_tflops": pair(latest_floor(rows, FP8_PEAK_METRIC, name)),
             "residency": None if res is None else {
                 "peak": res["value"], "static": res["shape"]["static"],
                 "transient": res["shape"]["transient"],
@@ -117,6 +123,33 @@ def bound_seconds(bytes_: int, flops: int, bw_gbs: float, peak_tflops: float) ->
     byte_s = bytes_ / (bw_gbs * 1e9)
     flop_s = flops / (peak_tflops * 1e12)
     return max(byte_s, flop_s)
+
+
+#: faces whose GEMM accumulates on a quant tensor path. The actual MMA dtype is
+#: resolved from the kernel registry by launch M (w4a8 fp8 prefill vs bf16 decode);
+#: a face here names only that such a resolution is needed.
+_QUANT_FACE_NAMES = ("fp8_block_dev", "fp8_dev", "nvfp4", "nvfp4_dev", "nvfp4_dev_b32")
+
+
+def row_peak_tflops(floors: dict, row: dict, b: int, s: int) -> float | None:
+    """The compute ceiling this row's kernel runs AGAINST: the measured peak of the
+    MMA dtype the registry kernel issues at this launch's M, not the weight face's.
+    nvfp4/fp8 rows with M >= 9 run e4m3 WGMMA (~2x bf16) and use fp8_peak_tflops;
+    decode (M<=8) dequants to bf16 and stays on the bf16 peak; nvfp4 uses bf16
+    peak. None when the needed floor is absent — the row renders pending rather
+    than dividing by the wrong ceiling (a missing fp8 floor on a prefill nvfp4 row
+    once read 133.8% against bf16)."""
+    from tilerl_kernels.registry import linear_mma_dtype
+
+    from . import precision as P
+
+    face = row.get("face")
+    if face is not None and any(getattr(P, n) == face for n in _QUANT_FACE_NAMES):
+        op = "linear_fp4" if any(getattr(P, n) == face
+                                 for n in ("nvfp4", "nvfp4_dev", "nvfp4_dev_b32")) else "linear_fp8"
+        if linear_mma_dtype(op, row_launch_m(row, b, s)) == "fp8":
+            return floors.get("fp8_peak_tflops")
+    return floors["peak_tflops"]
 
 
 def _event_seconds(fn, iters: int) -> float:
@@ -163,6 +196,30 @@ def measure_bf16_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> fl
     return (2 * n**3) / secs / 1e12
 
 
+def measure_fp8_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> float:
+    """Sustained fp8 tensor peak from one large square GEMM through torch's own fp8
+    matmul (scaled e4m3 x e4m3 -> bf16): 2*n^3 flops / event sec. fp8 GEMM rows must
+    divide by THIS ceiling, not bf16 peak — fp8 sustains ~2x the bf16 rate, so keying
+    an fp8 row to the bf16 floor makes %bound read ~200% on a healthy kernel."""
+    import torch
+
+    with torch.cuda.device(card):
+        dt = torch.float8_e4m3fn
+        a = torch.randn(n, n, dtype=torch.bfloat16, device=f"cuda:{card}").to(dt)
+        b = torch.randn(n, n, dtype=torch.bfloat16, device=f"cuda:{card}").to(dt)
+        # TensorWise scaling: two singleton f32 scales (this torch build rejects 1-D
+        # rowwise vectors — it wants [M,1]/[1,N]; the peak GEMM needs only unit scale).
+        sa = torch.tensor(1.0, dtype=torch.float32, device=f"cuda:{card}")
+        sb = torch.tensor(1.0, dtype=torch.float32, device=f"cuda:{card}")
+
+        def gemm():
+            return torch._scaled_mm(a, b.t(), scale_a=sa, scale_b=sb,
+                                    out_dtype=torch.bfloat16)
+
+        secs = _event_seconds(gemm, iters)
+    return (2 * n**3) / secs / 1e12
+
+
 def _row(metric: str, value: float, unit: str, device_name: str, card: int, derivation: str):
     from .cli import _benchrec
 
@@ -199,6 +256,7 @@ def calibrate_rows(card: int) -> list[dict]:
     device_name = torch.cuda.get_device_name(card)
     bw = measure_hbm_bw_gbs(card)
     peak = measure_bf16_peak_tflops(card)
+    fp8_peak = measure_fp8_peak_tflops(card)
     return [
         _row(
             BW_METRIC,
@@ -215,6 +273,15 @@ def calibrate_rows(card: int) -> list[dict]:
             device_name,
             card,
             "one large bf16 square GEMM (2n^3 flops), CUDA-event median; floor = this measurement",
+        ),
+        _row(
+            FP8_PEAK_METRIC,
+            fp8_peak,
+            "TFLOP/s",
+            device_name,
+            card,
+            "one large fp8 (e4m3) scaled square GEMM (2n^3 flops) through torch._scaled_mm, "
+            "CUDA-event median; the ceiling for fp8 GEMM rows",
         ),
     ]
 
@@ -282,6 +349,15 @@ def _pack_for(face, w_bf16):
     return (w8, wscale), {}
 
 
+def row_launch_m(row: dict, b: int, s: int) -> int:
+    """The M (token rows) of ONE timed launch: decode rows price b*s tokens, lm_head
+    prices one vector per sequence (its s=1 weight math repeats per token but it runs
+    once after the gather). A decode tick (b rows, s=B per row) and a prefill row
+    (b=1, s=S) differ ONLY here — pinning it is what keeps a 1-token GEMM from being
+    timed against a full-prefill row."""
+    return b if row["name"] == "lm_head" else b * s
+
+
 def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     """ms of the registry kernel the row's face DECLARES, or None to render
     pending-remote. Inputs are packed to that kernel's weight face, so the measured ms
@@ -296,12 +372,22 @@ def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     if fn is None or row.get("_spec") is None:
         return None
     out_n, inn = tuple(row["_spec"])
-    m = b if row["name"] == "lm_head" else b * s
+    m = row_launch_m(row, b, s)
     dev = backend.device
     x = torch.randn(m, inn, dtype=torch.bfloat16, device=dev)
     w_bf16 = torch.randn(out_n, inn, dtype=torch.bfloat16, device=dev)
+    # Shape gate: the built GEMM is exactly the priced launch. flops on a linear row
+    # are 2*M*N*K per launch, so the row's declared flops pin M. An m=1 mutant then
+    # fails here on a prefill/decode row instead of timing a 1-token GEMM against a
+    # full-shape row and printing %bound in the thousands (all timing tests green).
+    if row.get("flops") is not None:
+        assert row["flops"] == 2 * m * out_n * inn, (
+            f"timed M={m} but row prices {row['flops'] // (2 * out_n * inn)} token rows")
     wargs, wkw = _pack_for(row["face"], w_bf16)
-    # identity assertion: the thing we time is the kernel object the row's face
-    # declared, not a substitute. resolve_row_kernel is the single resolution point.
-    assert fn is resolve_row_kernel(backend, row)
+    # identity assertion: the thing we time is the kernel the row's face declared,
+    # not a substitute. resolve_row_kernel is the single resolution point. A bound
+    # method (CUDABackend.linear_fp4) forms a NEW wrapper on every getattr, so `is`
+    # always fails; compare the underlying function for both bound and static.
+    again = resolve_row_kernel(backend, row)
+    assert getattr(fn, "__func__", fn) is getattr(again, "__func__", again)
     return _event_seconds(lambda: fn(x, *wargs, **wkw), 1) * 1000.0

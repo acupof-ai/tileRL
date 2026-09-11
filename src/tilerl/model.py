@@ -94,6 +94,32 @@ def fp4_param_keys(cfg: ModelConfig) -> set[str]:
     return keys
 
 
+def checkpoint_matches_config(cfg: ModelConfig, ckpt_dir: str) -> tuple[bool, str]:
+    """Whether a checkpoint dir's config.json is the model ``cfg`` names. Compares the
+    structural scalars the weights and the dry-run fit derive from (layer count, hidden,
+    heads, head dim). The checkpoint's config is ground truth; a --checkpoint path under
+    the wrong --model silently priced one model's faces on another cfg's shapes (the
+    tiny-cfg/27B-faces roofline bug). Returns (ok, reason)."""
+    cp = Path(ckpt_dir) / "config.json"
+    if not cp.exists():
+        return False, f"config.json not found at {cp}"
+    hf = json.loads(cp.read_text())
+    want = {
+        "num_hidden_layers": cfg.num_layers,
+        "hidden_size": cfg.hidden_size,
+        "num_attention_heads": cfg.num_attention_heads,
+        "num_key_value_heads": cfg.num_kv_heads,
+    }
+    if "head_dim" in hf:  # the 27B names head_dim explicitly; compare it when present
+        want["head_dim"] = cfg.head_dim
+    for field, expected in want.items():
+        actual = hf.get(field)
+        if actual is None or actual != expected:
+            return False, (f"{field}={actual} in {cp} but --model cfg expects {expected}; "
+                           f"pass the --model this checkpoint belongs to")
+    return True, ""
+
+
 def checkpoint_weight_faces(
     cfg: ModelConfig, ckpt_dir: str
 ) -> dict[str, tuple[tuple[int, ...], precision.Format]]:

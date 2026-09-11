@@ -12,5 +12,5 @@ scripts/_portcheck_corpus/
 portcheck_results.md
 portcheck_errors.log
 .synced_commit
+.synced_dirty
 web/node_modules/
-\n.synced_dirty\n
