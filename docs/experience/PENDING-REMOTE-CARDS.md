@@ -94,6 +94,17 @@ CUDA_VISIBLE_DEVICES=0 TILERL_TARGET=cuda uv run tilerl bench --kernels \
   `fp8` (block grid + per-row scale), `bf16` — with `--checkpoint` the 27B
   shows all four populations (168/96/233); without it every GEMM is nvfp4.
   Decode ends in `TICK TOTAL` per batch, prefill in `PREFILL TOTAL`.
+- **The `ms` column is eager per-launch, not the served tick.** Every one of
+  the 497 timed kernels is dispatched separately, so each row carries a
+  ~0.1 ms launch overhead its roofline `bound` does not. Measured in the engine
+  loop with the CUDA decode graph captured (32 decode-only ticks, s=4096,
+  card 6 2026-09-11): B=1 graph **11.68 ms** vs eager **47.99 ms** (4.11×,
+  57% of the 6.6 ms bound); B=8 graph **25.98 ms** vs eager **64.69 ms**
+  (2.49×, 30% of the 7.74 ms bound). Cite the engine-loop graph tick for
+  served decode latency; use this table only to rank kernels by `ms − bound`
+  (excess = launch overhead plus the kernel's own gap — at B=8 the excess is
+  the M≤8 mma8 GEMV band, not dispatch). See
+  `wins/2026-09-11-decode-tick-graph-vs-eager-roofline-gap.md`.
 - **Writes:** nothing — a view over step 1/2 rows; copy the tables into the
   dated wins entry by hand.
 
