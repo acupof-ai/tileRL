@@ -117,6 +117,31 @@ def test_narrow_cold_f16_round_trips_exactly_for_f16_values():
     assert torch.equal(pool.v_pool[:, nb], before[1]), "f16-exact V values changed"
 
 
+def test_cold_byte_row_matches_held_blob_for_every_width():
+    """per_cold_kv_block_bytes must equal the bytes demote actually holds, for every
+    width. The fp8 case is the one that was wrong: kv_format already prices the
+    per-token f32 scales, so adding a scale term double-counted them (1792 derived
+    vs 1280 held)."""
+    from tilerl.config import tiny
+    from tilerl.memory import per_cold_kv_block_bytes
+    cfg = tiny()
+    H, D = cfg.num_kv_heads, cfg.head_dim
+    L = len(cfg.full_attn_layers)
+
+    def held(fp8, cold):
+        pool = PagedKvPool(8, H, D, num_layers=L, device=_device(),
+                           dtype=torch.float32, kv_fp8=fp8, cold_dtype=cold)
+        pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
+        b = pool.alloc_block()
+        return pool.demote_page(b)
+
+    assert per_cold_kv_block_bytes(cfg, torch.float32, None, None) == held(None, None)
+    assert per_cold_kv_block_bytes(
+        cfg, torch.float32, None, torch.float16) == held(None, torch.float16)
+    assert per_cold_kv_block_bytes(
+        cfg, torch.float32, torch.float8_e4m3fn, None) == held(torch.float8_e4m3fn, None)
+
+
 def test_a_prefix_shared_page_cannot_be_demoted():
     """A page retained by the prefix store is read-only wherever it lives; moving
     its device frame away would corrupt every other request sharing it."""
