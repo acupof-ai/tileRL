@@ -238,6 +238,14 @@ def _dry_run_checkpoint(args, backend) -> None:
 
     cfg = {"tiny": config_mod.tiny, "tiny-agent": lambda: config_mod.tiny(65536),
            "qwen38-27b": config_mod.qwen38_27b}[args.model]()
+    # Ground truth is the checkpoint's own config.json: pricing its faces on a different
+    # cfg (e.g. --checkpoint <27B> left on the default --model tiny) silently times tiny
+    # shapes against 27B rows. Refuse rather than mix the two.
+    from .model import checkpoint_matches_config
+
+    ok, reason = checkpoint_matches_config(cfg, args.checkpoint)
+    if not ok:
+        sys.exit(f"error: --checkpoint {args.checkpoint} is not a {args.model} checkpoint: {reason}")
     faces = checkpoint_weight_faces(cfg, args.checkpoint)
     device_free = _device_free(args, backend)
     # state slots add the decode-graph replay row on cuda (auto-on); the fit happens
@@ -1793,9 +1801,12 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
         if floors is None:
             print("# (no calibration row for this device: ms/bound/%bound pending-remote)")
         tb_sum = tf_sum = 0
+        # measured tick totals: Σ count × per-launch ms/bound. Only timed rows enter.
+        ms_sum = bound_sum = 0.0
+        timed_launches = 0
         for r in rows:
-            by = r["bytes"] * r["count"]
-            fl = r["flops"] * r["count"]
+            by_one, fl_one = r["bytes"], r["flops"]          # ONE launch
+            by, fl = by_one * r["count"], fl_one * r["count"]  # whole tick
             tb_sum += by
             tf_sum += fl
             face = f"{face_cell(r):>7}"
@@ -1803,21 +1814,43 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {'pending':>11} {'pending':>11} {'pending':>11}")
                 continue
-            bound_s = cal.bound_seconds(by, fl, floors["bw_gbs"], floors["peak_tflops"])
-            bnd_col = f"{bound_s * 1e3:9.3f}ms"
-            # The measured ms of the real registry kernel is cuda-only; off cuda (or for
-            # a non-GEMM row with no linear timing fixture) it stays pending.
+            peak = cal.row_peak_tflops(floors, r.get("face"))
+            # Per-launch bound: the timed kernel is ONE launch at the row's exact shape,
+            # so its roofline floor must be for one launch too. count scales the TOTAL
+            # columns below, never the per-row ratio (bound and ms are the same workload).
+            bound_one = (cal.bound_seconds(by_one, fl_one, floors["bw_gbs"], peak)
+                         if peak is not None else None)
             ms = None
             if backend is not None and r["name"] in spec_by_name:
                 ms = cal.time_row_ms(
                     {**r, "_spec": spec_by_name[r["name"]]}, backend, b, s)
+            if bound_one is None:
+                bnd_col = f"{'pending':>9}ms"
+            else:
+                bnd_col = f"{bound_one * 1e3:9.3f}ms"
             if ms is None:
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {'pending':>11} {bnd_col:>11} {'pending':>11}")
             else:
+                pct = (bound_one / (ms / 1000.0) * 100.0) if bound_one is not None else float("nan")
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
-                      f"{by:>12,} {fl:>10,} {ms:>9.3f}ms {bnd_col:>11} "
-                      f"{bound_s / (ms / 1000.0) * 100.0:>10.1f}%")
+                      f"{by:>12,} {fl:>10,} {ms:>9.3f}ms {bnd_col:>11} {pct:>10.1f}%")
+                if bound_one is not None:
+                    # A kernel cannot beat its own measured ceiling: bound/ms > 100 with
+                    # a non-cuda async/short-circuit bug is an instrument error, not data.
+                    if pct > 100.0 + 1.0:
+                        raise SystemExit(
+                            f"bench --kernels: {r['name']} {face_cell(r).strip()} achieved "
+                            f"{pct:.1f}% of its roofline floor (>100) — the timed kernel "
+                            f"({ms:.3f} ms) did less work than the priced row "
+                            f"({bound_one*1e3:.3f} ms/launch); instrument error, not a result.")
+                    ms_sum += ms * r["count"]
+                    bound_sum += bound_one * 1e3 * r["count"]
+                    timed_launches += r["count"]
+        if floors is not None and timed_launches:
+            print(f"{'TIMED TOTAL':<26} {timed_launches:>5} {'':>22} {'':>7} "
+                  f"{'':>12} {'':>10} {ms_sum:>8.1f}ms {bound_sum:>8.1f}ms "
+                  f"{bound_sum / ms_sum * 100.0:>10.1f}%")
         return tb_sum, tf_sum
 
     print(f"{'kernel':<26} {'count':>5} {'shape':>22} {'face':>7} {'bytes':>12} "

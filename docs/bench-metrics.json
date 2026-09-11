@@ -1,228 +1,237 @@
 {
   "denominator": {
-    "turn_s": 314.33,
-    "prefill_s": 294,
     "decode_s": 20,
-    "source": "CHANGELOG 2026-09-07, wins/2026-09-07-a-claude-code-turn-is-314-seconds-of-prefill.md"
+    "prefill_s": 294,
+    "source": "CHANGELOG 2026-09-07, wins/2026-09-07-a-claude-code-turn-is-314-seconds-of-prefill.md",
+    "turn_s": 314.33
   },
   "metrics": {
-    "prefill_tok_s": {
-      "unit": "tok/s",
+    "bf16_peak_tflops": {
       "direction": "+",
-      "weight": 0.94,
       "shape": [
-        "ctx"
+        "card"
       ],
-      "why": "prefill is 294/314.33 s of a real agent turn",
-      "collector": {
-        "script": "scripts/bench_prefill.py",
-        "required": [
-          "--source"
-        ]
-      }
-    },
-    "decode_tok_s": {
-      "unit": "tok/s",
-      "direction": "+",
-      "weight": 0.06,
-      "shape": [
-        "batch",
-        "ctx"
-      ],
-      "why": "decode is 20/314.33 s of a real agent turn",
-      "collector": {
-        "script": "scripts/bench_b1_decode.py",
-        "required": [
-          "--build",
-          "--card"
-        ]
-      }
-    },
-    "decode_agg_tok_s": {
-      "unit": "tok/s",
-      "direction": "+",
-      "weight": 0.06,
-      "shape": [
-        "batch",
-        "ctx"
-      ],
-      "why": "decode is 20/314.33 s of a real agent turn",
-      "collector": {
-        "script": "scripts/bench_batch_decode.py",
-        "required": [
-          "source"
-        ]
-      }
+      "unit": "TFLOP/s",
+      "weight": 0.0,
+      "why": "measured bf16 tensor peak from one large GEMM; the roofline flop floor"
     },
     "chat_turn_wall_s": {
-      "unit": "s",
+      "collector": {
+        "required": [
+          "--arm",
+          "--build",
+          "--device-name"
+        ],
+        "script": "scripts/bench_chat_cold_warm.py"
+      },
       "direction": "-",
-      "weight": 0.94,
       "shape": [
         "turn",
         "prompt_tokens"
       ],
-      "why": "the turn wall is the 314.33 s denominator itself; reuse moves it 19x",
-      "collector": {
-        "script": "scripts/bench_chat_cold_warm.py",
-        "required": [
-          "--arm",
-          "--build",
-          "--device-name"
-        ]
-      }
-    },
-    "prefix_hits": {
-      "unit": "hits",
-      "direction": "+",
-      "weight": 0.0,
-      "shape": [
-        "turn"
-      ],
-      "why": "instrument row for the reuse view, not a lever itself",
-      "collector": {
-        "script": "scripts/bench_chat_cold_warm.py",
-        "required": [
-          "--arm",
-          "--build",
-          "--device-name"
-        ]
-      }
-    },
-    "ssd_restart_speedup": {
-      "unit": "ratio",
-      "direction": "+",
+      "unit": "s",
       "weight": 0.94,
-      "shape": [
-        "prompt_tokens"
-      ],
-      "why": "a restart re-pays the prefill 94%; the tier is what avoids it",
-      "collector": {
-        "script": "scripts/bench_ssd_restart.py",
-        "required": []
-      }
+      "why": "the turn wall is the 314.33 s denominator itself; reuse moves it 19x"
     },
-    "train_step_tok_s": {
-      "unit": "tok/s",
+    "decode_agg_tok_s": {
+      "collector": {
+        "required": [
+          "source"
+        ],
+        "script": "scripts/bench_batch_decode.py"
+      },
       "direction": "+",
-      "weight": 0.5,
       "shape": [
         "batch",
         "ctx"
       ],
-      "why": "seconds_per_step of time_to_score = steps x seconds; the split is unmeasured, so 0.5 until it is"
-    },
-    "gsm8k_pct": {
-      "unit": "%",
-      "direction": "+",
-      "weight": 0.94,
-      "shape": [
-        "steps"
-      ],
-      "why": "the RL line's acceptance verdict; the README's headline training number (89.6 to 94.8)",
-      "collector": null,
-      "why_no_collector": "no `tilerl eval` subcommand; only observable as a training side product (_train_adapters). Deferred until the standalone eval arm exists"
-    },
-    "rollout_tokens": {
-      "unit": "tokens",
-      "direction": "none",
-      "weight": 0.5,
-      "shape": [
-        "steps"
-      ],
-      "why": "mean completion tokens per GSM8K problem — the sample-efficiency operand, n-independent by construction. No monotonic direction: a shorter rollout can be a better policy or a collapsed one (2026-09-10, 347 to 13.9 tokens while gsm8k_pct fell 91.6 to 78.2), so it is never judged against a floor — read it alongside gsm8k_pct. tokens/correct is the view rollout_tokens / gsm8k_pct, never stored"
-    },
-    "mmlu_pct": {
-      "unit": "%",
-      "direction": "+",
-      "weight": 0.0,
-      "shape": [
-        "n"
-      ],
-      "why": "correctness floor, not a speed lever"
-    },
-    "spec_goodput_ratio": {
-      "unit": "ratio",
-      "direction": "+",
+      "unit": "tok/s",
       "weight": 0.06,
+      "why": "decode is 20/314.33 s of a real agent turn"
+    },
+    "decode_tok_s": {
+      "collector": {
+        "required": [
+          "--build",
+          "--card"
+        ],
+        "script": "scripts/bench_b1_decode.py"
+      },
+      "direction": "+",
       "shape": [
         "batch",
-        "ctx",
-        "depth"
+        "ctx"
       ],
-      "why": "decode-family; a guard row after the verdict flipped three times",
-      "collector": {
-        "script": "scripts/bench_ctx_decode.py",
-        "required": [
-          "--source"
-        ]
-      }
-    },
-    "kernel_ms": {
-      "unit": "ms",
-      "direction": "-",
-      "weight": 0.0,
-      "shape": [
-        "kernel"
-      ],
-      "why": "feeds the engine-level rows; micro, not a lever itself"
-    },
-    "ppl": {
-      "unit": "ppl",
-      "direction": "-",
-      "weight": 0.0,
-      "shape": [
-        "n"
-      ],
-      "why": "quality signal beside mmlu_pct",
-      "collector": {
-        "script": "scripts/bench_c4_ppl.py",
-        "required": [
-          "--source"
-        ]
-      }
-    },
-    "request_overhead_ms": {
-      "unit": "ms",
-      "direction": "-",
-      "weight": 0.0,
-      "shape": [
-        "route"
-      ],
-      "why": "per-request HTTP+render+parse over a canned engine; not the agent-turn wall clock (that is chat_turn_wall_s), so weight 0 until it is shown to move the turn",
-      "collector": {
-        "script": "scripts/bench_api_routes.py",
-        "required": []
-      }
-    },
-    "hbm_bw_gbs": {
-      "unit": "GB/s",
-      "direction": "+",
-      "weight": 0.0,
-      "shape": [
-        "card"
-      ],
-      "why": "measured HBM ceiling from a >=1GiB D2D copy (read+write); the roofline byte floor"
-    },
-    "bf16_peak_tflops": {
-      "unit": "TFLOP/s",
-      "direction": "+",
-      "weight": 0.0,
-      "shape": [
-        "card"
-      ],
-      "why": "measured bf16 tensor peak from one large GEMM; the roofline flop floor"
+      "unit": "tok/s",
+      "weight": 0.06,
+      "why": "decode is 20/314.33 s of a real agent turn"
     },
     "device_resident_bytes": {
-      "unit": "bytes",
       "direction": "none",
-      "weight": 0.0,
       "shape": [
         "card",
         "static",
         "transient"
       ],
-      "why": "steady-state device residency peak and its split into named static allocations and transient scratch; closes peak = Σ static + transient"
+      "unit": "bytes",
+      "weight": 0.0,
+      "why": "steady-state device residency peak and its split into named static allocations and transient scratch; closes peak = \u03a3 static + transient"
+    },
+    "fp8_peak_tflops": {
+      "direction": "+",
+      "shape": [
+        "card"
+      ],
+      "unit": "TFLOP/s",
+      "weight": 0.0,
+      "why": "measured fp8 (e4m3 scaled) tensor peak from one large GEMM; the roofline flop floor for fp8 GEMM rows (not bf16 peak)"
+    },
+    "gsm8k_pct": {
+      "collector": null,
+      "direction": "+",
+      "shape": [
+        "steps"
+      ],
+      "unit": "%",
+      "weight": 0.94,
+      "why": "the RL line's acceptance verdict; the README's headline training number (89.6 to 94.8)",
+      "why_no_collector": "no `tilerl eval` subcommand; only observable as a training side product (_train_adapters). Deferred until the standalone eval arm exists"
+    },
+    "hbm_bw_gbs": {
+      "direction": "+",
+      "shape": [
+        "card"
+      ],
+      "unit": "GB/s",
+      "weight": 0.0,
+      "why": "measured HBM ceiling from a >=1GiB D2D copy (read+write); the roofline byte floor"
+    },
+    "kernel_ms": {
+      "direction": "-",
+      "shape": [
+        "kernel"
+      ],
+      "unit": "ms",
+      "weight": 0.0,
+      "why": "feeds the engine-level rows; micro, not a lever itself"
+    },
+    "mmlu_pct": {
+      "direction": "+",
+      "shape": [
+        "n"
+      ],
+      "unit": "%",
+      "weight": 0.0,
+      "why": "correctness floor, not a speed lever"
+    },
+    "ppl": {
+      "collector": {
+        "required": [
+          "--source"
+        ],
+        "script": "scripts/bench_c4_ppl.py"
+      },
+      "direction": "-",
+      "shape": [
+        "n"
+      ],
+      "unit": "ppl",
+      "weight": 0.0,
+      "why": "quality signal beside mmlu_pct"
+    },
+    "prefill_tok_s": {
+      "collector": {
+        "required": [
+          "--source"
+        ],
+        "script": "scripts/bench_prefill.py"
+      },
+      "direction": "+",
+      "shape": [
+        "ctx"
+      ],
+      "unit": "tok/s",
+      "weight": 0.94,
+      "why": "prefill is 294/314.33 s of a real agent turn"
+    },
+    "prefix_hits": {
+      "collector": {
+        "required": [
+          "--arm",
+          "--build",
+          "--device-name"
+        ],
+        "script": "scripts/bench_chat_cold_warm.py"
+      },
+      "direction": "+",
+      "shape": [
+        "turn"
+      ],
+      "unit": "hits",
+      "weight": 0.0,
+      "why": "instrument row for the reuse view, not a lever itself"
+    },
+    "request_overhead_ms": {
+      "collector": {
+        "required": [],
+        "script": "scripts/bench_api_routes.py"
+      },
+      "direction": "-",
+      "shape": [
+        "route"
+      ],
+      "unit": "ms",
+      "weight": 0.0,
+      "why": "per-request HTTP+render+parse over a canned engine; not the agent-turn wall clock (that is chat_turn_wall_s), so weight 0 until it is shown to move the turn"
+    },
+    "rollout_tokens": {
+      "direction": "none",
+      "shape": [
+        "steps"
+      ],
+      "unit": "tokens",
+      "weight": 0.5,
+      "why": "mean completion tokens per GSM8K problem \u2014 the sample-efficiency operand, n-independent by construction. No monotonic direction: a shorter rollout can be a better policy or a collapsed one (2026-09-10, 347 to 13.9 tokens while gsm8k_pct fell 91.6 to 78.2), so it is never judged against a floor \u2014 read it alongside gsm8k_pct. tokens/correct is the view rollout_tokens / gsm8k_pct, never stored"
+    },
+    "spec_goodput_ratio": {
+      "collector": {
+        "required": [
+          "--source"
+        ],
+        "script": "scripts/bench_ctx_decode.py"
+      },
+      "direction": "+",
+      "shape": [
+        "batch",
+        "ctx",
+        "depth"
+      ],
+      "unit": "ratio",
+      "weight": 0.06,
+      "why": "decode-family; a guard row after the verdict flipped three times"
+    },
+    "ssd_restart_speedup": {
+      "collector": {
+        "required": [],
+        "script": "scripts/bench_ssd_restart.py"
+      },
+      "direction": "+",
+      "shape": [
+        "prompt_tokens"
+      ],
+      "unit": "ratio",
+      "weight": 0.94,
+      "why": "a restart re-pays the prefill 94%; the tier is what avoids it"
+    },
+    "train_step_tok_s": {
+      "direction": "+",
+      "shape": [
+        "batch",
+        "ctx"
+      ],
+      "unit": "tok/s",
+      "weight": 0.5,
+      "why": "seconds_per_step of time_to_score = steps x seconds; the split is unmeasured, so 0.5 until it is"
     }
   }
 }
