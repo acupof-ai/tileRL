@@ -266,7 +266,7 @@ def test_27b_checkpoint_weights_row_matches_load_hf_resident_exact():
     resident bytes and its live materialized storage, to the integer cc recorded
     (1845 tensors). Headers only for the sum; the live equality is run once on the pod.
 
-        TILERL_27B_CKPT=/work/Qwen3.8-27B-NVFP4 \\
+        TILERL_27B_CKPT=/work/tilerl-ckpt/Qwen3.8-27B-NVFP4 \\
         uv run tilerl serve --model qwen38-27b --dry-run --checkpoint \"$TILERL_27B_CKPT\" \\
             --device-free 60000000000
     """

@@ -8,7 +8,7 @@
 _TREE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="$_TREE/src:$_TREE/packages/tilerl-kernels/src${PYTHONPATH:+:$PYTHONPATH}"
 export TILERL_TARGET="${TILERL_TARGET:-cuda}"
-export TILERL_QWEN38_SOURCE="${TILERL_QWEN38_SOURCE:-/work/Qwen3.8-27B-NVFP4}"
+export TILERL_QWEN38_SOURCE="${TILERL_QWEN38_SOURCE:-/work/tilerl-ckpt/Qwen3.8-27B-NVFP4}"
 export TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR:-/work/tilelang_cache}"
 unset _TREE
 

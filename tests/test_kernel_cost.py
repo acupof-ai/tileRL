@@ -447,7 +447,7 @@ def test_27b_served_weight_faces_equal_load_hf_resident_exact():
     param_specs and its nbytes sum equals, to the integer, BOTH the recorded
     load_hf resident total AND a live load_hf model's tensor storage.
 
-        TILERL_27B_CKPT=/work/Qwen3.8-27B-NVFP4 pytest tests/test_kernel_cost.py -k 27b
+        TILERL_27B_CKPT=/work/tilerl-ckpt/Qwen3.8-27B-NVFP4 pytest tests/test_kernel_cost.py -k 27b
 
     Recorded by running load_hf on the pod (1845 tensors): 24,436,981,888 B.
     """

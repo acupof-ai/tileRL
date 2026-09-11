@@ -23,7 +23,9 @@ from tilerl.spec import load_draft
 from tilerl.tokenizer import get_tokenizer
 from tilerl.train import _training_kv
 
-SRC = os.environ.get("TILERL_QWEN38_SOURCE", "/work/Qwen3.8-27B-NVFP4")
+# tileRL-owned checkpoint; the shared /work/Qwen3.8-27B-NVFP4 was deleted by a
+# cross-project dedup on 2026-09-11 (see errors/2026-09-11-shared-pod-...).
+SRC = os.environ.get("TILERL_QWEN38_SOURCE", "/work/tilerl-ckpt/Qwen3.8-27B-NVFP4")
 DRAFT = os.environ.get("TILERL_DFLASH2_SOURCE", "/work/Qwen3.8-27B-DFlash2")
 PROMPTS = [
     "What is 17 * 23? Answer with just the number.",
