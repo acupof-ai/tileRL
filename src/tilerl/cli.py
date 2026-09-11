@@ -1995,10 +1995,11 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
         spec_by_name = {k.split(".")[-1]: tuple(v) for k, v in param_specs(cfg).items()}
 
     def render(rows: list[dict], label: str, b: int, s: int, timed_s: int):
-        """``b,s`` name the PRICED tick (bytes/flops rows); ``timed_s`` is the token
-        rows per launch the timed GEMM actually runs — s on prefill, 1 on a decode
-        tick (decode streams one new token per row, not s; timing b*s timed a fat
-        prefill GEMM and printed a fictional ~10x decode tick)."""
+        """``b,s`` name the PRICED tick (bytes/flops rows); ``timed_s`` is the query
+        rows per launch the timed GEMM runs on — s on prefill, 1 per request on a
+        decode tick (decode streams one new token per row, not s; timing b*s timed a
+        fat prefill GEMM and printed a fictional ~10x decode tick). lm_head runs once
+        per request, so it times at M=b even when timed_s=1."""
         print(f"# {cfg.name} {label}, fp8 KV, {src}, floor device={device_name}")
         if floors is None:
             print("# (no calibration row for this device: ms/bound/%bound pending-remote)")
@@ -2024,8 +2025,10 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
                          if peak is not None else None)
             ms = None
             if backend is not None and r["name"] in spec_by_name:
+                # lm_head samples once per request (M=b); other rows at timed_s.
+                mm = b if r["name"] == "lm_head" else timed_s
                 ms = cal.time_row_ms(
-                    {**r, "_spec": spec_by_name[r["name"]]}, backend, b, timed_s)
+                    {**r, "_spec": spec_by_name[r["name"]]}, backend, mm)
             if bound_one is None:
                 bnd_col = f"{'pending':>9}ms"
             else:
