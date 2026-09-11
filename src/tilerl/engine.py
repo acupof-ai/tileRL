@@ -423,6 +423,7 @@ class Engine:
         sparse_tracker: Any = None,
         sparse_k: int = 0,
         boot_store: Any = None,
+        sparse_device_select: bool = False,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -435,6 +436,13 @@ class Engine:
         self._states = state_pool
         self._sparse = sparse_tracker
         self._sparse_k = sparse_k
+        #: decode ticks build the packed table with pure device selection (no host
+        #: sync) — the capture-ready path; valid only with the pin steady state.
+        self._sparse_device_select = sparse_device_select and sparse_tracker is not None
+        #: decode ticks since the last eager full-candidate refresh; device ticks
+        #: score only resident candidates, so every R-th decode tick goes eager to
+        #: score ALL candidates and promote the ones the hot set is missing.
+        self._sparse_ticks_since_refresh = 0
         self._prefix = prefix_store
         #: KvBootStore for cold-start KV (--kv-store); None = no on-disk boot context.
         self._boot = boot_store
@@ -1381,7 +1389,24 @@ class Engine:
                               q_start=q_lo, q_hi=q_hi, decoding=decoding, tq=tq,
                               cand=cand, force_window=force_window, resolve=resolve,
                               reserved=reserved))
-        return SparseForward(tr, srows, self._backend.device)
+        # Pure-decode ticks run the device (resident-only) path except every
+        # SPARSE_REFRESH_TICKS-th, which goes eager to re-score ALL candidates and
+        # promote the ones the resident hot set is missing. Prefill/mixed ticks are
+        # always eager (chunks force the window and grow the candidate set).
+        from .sparse_engine import SPARSE_REFRESH_TICKS
+
+        pure_decode = bool(decodes) and len(decodes) == len(rows)
+        if self._sparse_device_select and pure_decode:
+            self._sparse_ticks_since_refresh += 1
+            do_refresh = self._sparse_ticks_since_refresh >= SPARSE_REFRESH_TICKS
+        else:
+            do_refresh = False
+        device_select = (
+            self._sparse_device_select and pure_decode and not do_refresh)
+        if do_refresh:
+            self._sparse_ticks_since_refresh = 0
+        return SparseForward(
+            tr, srows, self._backend.device, device_select=device_select)
 
     def _sparse_evict_victim(self, r: _Req, reserved: set[int]) -> None:
         """Free one frame this tick does NOT need, so a promotion can allocate.
@@ -1398,6 +1423,7 @@ class Engine:
             self._kv.demote_page(phys, key=(r.req_id, p))
             r.cold_pages.append(p)
             r.blocks.remove(phys)
+            self._sparse.map_evict(r.req_id, p)
             del live[p]
             return
         raise RuntimeError("sparse: no unreserved resident page to evict for a "
@@ -1432,6 +1458,7 @@ class Engine:
             new = self._kv.alloc_block()
         live[page] = new
         r.blocks.append(new)
+        tr.map_resident(r.req_id, page, new)
         return new
 
     @staticmethod
@@ -1517,11 +1544,15 @@ class Engine:
                                           scales.to(pool.k_pool.device))
                 kept = sf.selected_pages(bi)
                 kept_live: dict[int, int] = {}
-                for p, phys in list(live.items()):
-                    if p in kept:
-                        kept_live[p] = phys                 # pin across ticks
-                        continue
+                # ``dropped`` = complete resident pages LEAVING this tick's union
+                # (own + every group's choice). One definition consumed by the
+                # demote/evict loop and any resident->cold hook (sparse prefix
+                # publish keys off the same transition).
+                dropped = [p for p in live if p not in kept]
+                for p in dropped:
+                    phys = live[p]
                     pool.demote_page(phys, key=(rid, p))
+                    tr.map_evict(rid, p)
                     r.blocks.remove(phys)
                     r.cold_pages.append(p)
                     if (tr.scorer == "bounds" and tr.prefix is not None and p < complete
@@ -1530,6 +1561,9 @@ class Engine:
                         if clone is not None:
                             clone["bounds"] = tr.bounds_one(rid, p)
                             publish_blobs[p] = clone
+                for p, phys in live.items():
+                    if p in kept:
+                        kept_live[p] = phys                 # pin across ticks
                 # r.blocks mirrors the live frames in LOGICAL page order (paged_attention
                 # derives causal positions from the order), so sort the pinned set.
                 r.blocks = [kept_live[p] for p in sorted(kept_live)]
@@ -2404,6 +2438,7 @@ def build_engine(
     #: training-free Quest path (Unit F); "index" is a later PR. Requires kv_cold_bytes.
     sparse_k: int = 0,
     scorer: str = "bounds",
+    sparse_device_select: bool = False,
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
@@ -2611,4 +2646,5 @@ def build_engine(
         sparse_tracker=sparse_tracker,
         sparse_k=sparse_k,
         boot_store=boot_store,
+        sparse_device_select=sparse_device_select,
     )
