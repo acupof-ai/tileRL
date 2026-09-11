@@ -377,21 +377,23 @@ def indexer_warmup_step(
 
     captured: list = []
     model.index_capture = captured
+    model.index_capture_layers = source_set
     try:
         kv = _training_kv(model, b, t, device=backend.device)
         with torch.no_grad():
             model.forward(ids, torch.arange(t, device=backend.device), kv, backend)
     finally:
         model.index_capture = None
+        model.index_capture_layers = frozenset()
 
     hkv, d_kv = model.cfg.num_kv_heads, model.cfg.head_dim
     ih = weights["ik"].shape[0]
     if ih != hkv:
-        raise ValueError(f"index heads {ih} must equal KV heads {hkv} on the tiny warm-up")
+        raise ValueError(f"index heads {ih} must equal KV heads {hkv} on the warm-up")
     n_pages = torch.full((b,), n_pages_tok, dtype=torch.long)
 
-    # Stack captured SOURCE layers on the L_src axis (one entry per source layer).
-    cap = [c for c in captured if c[0] in source_set]
+    # One captured entry per source layer, already filtered by the forward.
+    cap = captured
     cap.sort(key=lambda c: c[0])
     H = torch.stack([c[1][:, :n_pages_tok * block] for c in cap], dim=1)   # [b,L,t,hid]
     K = torch.stack([c[3] for c in cap], dim=1)                            # [b,L,t,hkv,d]
