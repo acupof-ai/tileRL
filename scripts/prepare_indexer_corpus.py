@@ -43,10 +43,16 @@ def main(wiki_glob: str, out_dir: str, tok_path: str) -> None:
     files = sorted(glob.glob(wiki_glob))
     if not files:
         sys.exit(f"no wiki parquet under {wiki_glob}")
+    # Only ~4.7M tokens are needed for the full train+held span demand; stop
+    # reading files once each split's stream has that much (plus the skip head),
+    # so prep does not tokenize all ~1.6M corpus articles.
+    needed = SKIP + sum(N_HELD[str(c)] * c for c in CONTEXTS)
+    needed_train = SKIP + sum(N_TRAIN[str(c)] * c for c in CONTEXTS)
     streams = {"held": [], "train": []}
     held_ids: list[str] = []
     n_articles = {"held": 0, "train": 0}
     char_hist: dict[str, int] = {}
+    done = False
     for f in files:
         table = pq.read_table(f, columns=["id", "text"])
         ids = table.column("id").to_pylist()
@@ -56,12 +62,17 @@ def main(wiki_glob: str, out_dir: str, tok_path: str) -> None:
             n_articles[split] += 1
             if split == "held":
                 held_ids.append(str(aid))
-            streams[split].extend(tok.encode(text).ids)
             b = len(text) // 1000
             char_hist[b] = char_hist.get(b, 0) + 1
+            streams[split].extend(tok.encode(text).ids)
+        if len(streams["held"]) >= needed and len(streams["train"]) >= needed_train:
+            done = True
+            break
+    if not done:
+        sys.exit("not enough corpus tokens for the requested spans")
     os.makedirs(out_dir, exist_ok=True)
-    summary = {"seed": SEED, "files": files, "contexts": list(CONTEXTS),
-               "n_articles": n_articles, "held_ids": held_ids,
+    summary = {"seed": SEED, "files_used": files[: 1 + files.index(f)],
+               "contexts": list(CONTEXTS), "n_articles": n_articles, "held_ids": held_ids,
                "stream_tokens": {k: len(v) for k, v in streams.items()}}
     for split, want in (("held", N_HELD), ("train", N_TRAIN)):
         pos = SKIP
