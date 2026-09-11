@@ -50,6 +50,7 @@ from .kv_cache import (
     BLOCK_TOKENS,
     BatchKv,
     DramSnapshots,
+    HostKvPages,
     KvTier,
     LinearStatePool,
     NoPrefixStore,
@@ -242,6 +243,11 @@ class _Req:
     hidden_from: int = 0
     draft_pos: int = 0  # highest position whose draft KV belongs to a committed token
     drafts: list[int] = field(default_factory=list)  # next tick's chain, minus its first token
+    #: sparse-KV: demoted pages as ``(logical page index, old host block id)`` kept
+    #: in ascending logical order. ``blocks`` stays the LIVE pages in order; the two
+    #: merge back into the full page sequence on a promotion, so a promoted page is
+    #: spliced at its immutable logical position, not appended.
+    cold_pages: list[tuple[int, int]] = field(default_factory=list)
     #: block drafter: the trunk's aux-layer taps over the same positions as ``hidden``,
     #: [1,w,len(target_layers)*H]. Tick-scoped — ``_draft_block`` consumes it and it dies.
     aux: torch.Tensor | None = None
@@ -962,6 +968,9 @@ class Engine:
                 # keep but did not have to lose.
                 **{k: v for k, v in store.items()
                    if k.startswith(("dram_", "ssd_"))},
+                # sparse-KV cold page tier (absent when kv_cold_bytes=0)
+                **(self._kv.cold.stats()
+                   if getattr(self._kv, "cold", None) is not None else {}),
                 "prefix_demoted": store.get("demoted", 0),
                 "prefill_forwards": self._prefill_forwards,
                 "decode_forwards": self._decode_forwards,
@@ -1019,7 +1028,70 @@ class Engine:
                        num_blocks=kv.num_blocks, spec_steps=0,
                        state_dtype=sp.states.dtype, kv_io=kv.dtype, kv_fp8=kv.kv_fp8,
                        draft_layers=draft_layers)
-        return memory_table(derived, self._held_storage(), self._measured_peak_bytes())
+        rows = memory_table(derived, self._held_storage(), self._measured_peak_bytes())
+        # The sparse-KV cold tier lives in pinned host RAM and is not part of plan()
+        # (Unit A derives the budgeted --sparse-k row; this is what is HELD now).
+        # Emitted only while pages are demoted, so a dense engine shows no host row.
+        cold = getattr(kv, "cold", None)
+        if cold is not None and cold.bytes_held:
+            rows.append({"tier": "host", "owner": "kv_cold", "kind": "allocation",
+                         "derived": cold.bytes_held,
+                         "note": f"{cold.stats()['kv_cold_pages']} demoted pages",
+                         "measured": cold.bytes_held, "delta": 0})
+        return rows
+
+    def sparse_retier(self, keep: frozenset[int]) -> tuple[int, int]:
+        """Apply one selector decision to the live pages. ``keep`` names the
+        physical block ids this tick selects; the caller passes the UNION of the
+        chunk's selected sets (a V4.1 index source shares one selection across its
+        group of 4 full-attn layers, and a block id is one physical page moved
+        across all its planes in a single host fetch) and never names the last 8
+        pages (the 128-token window).
+
+        A private page not selected demotes to the pinned host tier (prefix-shared
+        pages are refused by the pool); a selected host page promotes into a FRESH
+        device block. Either way the page keeps its immutable logical index, so the
+        rebuilt block list stays in sequence order — paged_attention derives
+        causal positions from that order. Returns ``(demoted, promoted)``.
+        """
+        pool = self._kv
+        cold = pool.cold
+        if cold is None:
+            raise RuntimeError("sparse_retier: engine built without a cold page tier")
+        d0, p0 = cold.demotions, cold.promotions
+        remap: dict[int, int] = {}
+        reqs = list(self._running) + list(self._waiting)
+        for r in reqs:
+            cold_map = dict(r.cold_pages)  # logical index -> host block id
+            live = iter(r.blocks)
+            n = len(r.blocks) + len(cold_map)
+            ordered: list[tuple[int, int, bool]] = []
+            for idx in range(n):
+                ordered.append(
+                    (idx, cold_map[idx], True) if idx in cold_map
+                    else (idx, next(live), False))
+            new_live: list[int] = []
+            new_cold: list[tuple[int, int]] = []
+            for idx, b, was_cold in ordered:
+                if b in keep:
+                    if was_cold:  # selected host page -> one fetch, a fresh block
+                        if b not in remap:
+                            remap[b] = pool.promote_page(b)
+                        new_live.append(remap[b])
+                    else:
+                        new_live.append(b)  # selected device page, untouched
+                elif was_cold:
+                    new_cold.append((idx, b))  # still unselected on the host
+                elif pool.is_shared(b):
+                    new_live.append(b)  # prefix-shared: read-only, never demoted
+                else:
+                    pool.demote_page(b)
+                    new_cold.append((idx, b))
+            # Both lists were appended in ascending logical idx, so the live block
+            # table is in sequence order and cold pages keep their absolute index.
+            r.blocks = new_live
+            r.cold_pages = new_cold
+        return cold.demotions - d0, cold.promotions - p0
 
 
     # -------------------------------------------------------------- internals
@@ -1790,6 +1862,11 @@ def build_engine(
     #: the multi-session case at all. `/health`'s `dram_promotions` is what says the
     #: workload crossed the threshold; `dram_budget` says the tier is on.
     dram_bytes: int = 0,
+    #: pinned-host budget for the sparse-KV cold page tier; 0 is off (dense pool).
+    #: When set, PagedKvPool.demote_page/promote_page move whole pages (every plane
+    #: of one block id, fp8 scales included) through a HostKvPages tier and the
+    #: freed device block goes back to the SAME pool — there is no second pool.
+    kv_cold_bytes: int = 0,
     #: directory for the SSD prefix tier; "" is off. Unlike the DRAM tier this one does
     #: not need concurrent sessions to pay: after a restart HBM is empty, so the first
     #: lookup of every returning conversation reaches back and the disk is what answers.
@@ -1921,6 +1998,8 @@ def build_engine(
     # host-to-host is a real demote/promote, and the CPU target is where that is checked.
     if dram_bytes:
         kw["dram"] = DramSnapshots(budget_bytes=dram_bytes)
+    if kv_cold_bytes:
+        kv_pool.attach_cold(HostKvPages(budget_bytes=kv_cold_bytes))
     if ssd_path:
         # Not gated on cuda: the tier is target-independent, and the CPU target is where
         # its parity is checked.
