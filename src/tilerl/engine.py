@@ -1746,7 +1746,13 @@ def card_guard() -> None:
         card = card.strip()
         if not card:
             continue
-        card_note = cards.get(card, "")
+        entry = cards.get(card, "")
+        # The ledger's per-card value is either the old free-form string or the
+        # current {"owner", "note"} dict. Classify by owner on a dict; the
+        # per-card note and the top-level note remain lend records. A dict whose
+        # owner matches neither ours nor theirs falls through to unclassified
+        # (refuse), so an unknown owner never defaults to ours.
+        card_note = str(entry.get("owner", "")) if isinstance(entry, dict) else entry
         if not _OURS.match(card_note):
             kind = "theirs" if _THEIRS.match(card_note) else "unclassified"
             sys.exit(
