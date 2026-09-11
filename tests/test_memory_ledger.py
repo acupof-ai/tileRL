@@ -506,3 +506,34 @@ def test_sparse_dry_run_checkpoint_prints_three_rows(tmp_path, capsys):
     assert "kv_pool" not in owners
     # 256 tokens = 16 pages; 4 indexed + 8 window = 12 hot; cold tier on host
     assert owners["kv_hot"]["tier"] == "device" and owners["kv_cold"]["tier"] == "host"
+
+
+def test_sparse_kv_cold_excluded_from_device_peak_but_in_host_total():
+    """Invariant: transient = peak − Σ DEVICE-tier static rows. Host kv_cold is a held
+    allocation (kind=allocation, host_total) but must NOT subtract from the device peak;
+    the device scorer + kv_hot rows do. A device peak built as weights+state+hot+scratch
+    (excluding cold) reconciles exactly, and host_total carries cold alone.
+    Mutant reds: put kv_cold in STATIC_OWNERS, or sum static_rows unfiltered by tier."""
+    import torch
+
+    from tilerl.config import qwen38_27b
+    from tilerl.memory import memory_table, sparse_rows
+
+    cfg = qwen38_27b()
+    rows = sparse_rows(
+        cfg, num_rows=1, context_tokens=262_144, k_pages=128, scorer="index",
+        kv_io=torch.bfloat16, kv_fp8=torch.float8_e4m3fn)
+    device_static = sum(r.n for r in rows if r.tier == "device")
+    cold = sum(r.n for r in rows if r.owner == "kv_cold")
+    assert cold > 0
+    scratch = 5_000_000
+    peak = device_static + scratch  # the device holds NO cold pages
+    table = memory_table(rows, {}, peak)
+    by = {r["owner"]: r for r in table}
+    # transient is the device residual — cold did not shrink it
+    assert by["transient"]["derived"] == scratch
+    # kv_cold renders a held host allocation, not a budget row
+    assert by["kv_cold"]["kind"] == "allocation" and by["kv_cold"]["tier"] == "host"
+    assert by["host_total"]["derived"] == cold
+    # device total reconciles to the measured peak exactly (cold absent)
+    assert by["device_total"]["derived"] == peak

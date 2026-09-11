@@ -399,7 +399,7 @@ def plan(cfg, params: dict | None, device_free: int, *, num_slots: int, num_bloc
 #: they never appear in a serving :func:`plan`, so they cannot enter its peak residual.
 STATIC_OWNERS = (
     "weights", "state_slots", "kv_pool", "draft_pool",
-    "index_keys", "page_bounds", "kv_hot", "kv_cold",
+    "index_keys", "page_bounds", "kv_hot",
     "adapter", "optimizer_state", "frame", "tape",
 )
 
@@ -418,9 +418,9 @@ def transient_bytes(rows: list[Row], peak_bytes: int) -> int:
     """The resident bytes that are NOT one of the named static allocations — activation
     scratch, fragmented allocator blocks, captured-graph side buffers. The invariant the
     ledger prints is ``peak = sum(static) + transient``; transient is derived as the
-    residual, never allocated here. ``peak_bytes`` is DEVICE residency, so only device-tier
-    static rows subtract — host/ssd owners (kv_cold, ISO frames) are not on the card."""
-    held = sum(r.n for r in static_rows(rows) if r.tier == "device")
+    residual, never allocated here. STATIC_OWNERS is device-tier only; a host/ssd held
+    owner (HELD_HOST_OWNERS: kv_cold) is not on the card and does not subtract."""
+    held = sum(r.n for r in static_rows(rows))
     t = int(peak_bytes) - held
     if t < 0:
         raise ValueError(
