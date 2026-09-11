@@ -1137,36 +1137,40 @@ class Engine:
         d0, p0 = cold.demotions, cold.promotions
         remap: dict[int, int] = {}
         reqs = list(self._running) + list(self._waiting)
-        for r in reqs:
-            cold_map = dict(r.cold_pages)  # logical index -> host block id
-            live = iter(r.blocks)
-            n = len(r.blocks) + len(cold_map)
-            ordered: list[tuple[int, int, bool]] = []
-            for idx in range(n):
-                ordered.append(
-                    (idx, cold_map[idx], True) if idx in cold_map
-                    else (idx, next(live), False))
-            new_live: list[int] = []
-            new_cold: list[tuple[int, int]] = []
-            for idx, b, was_cold in ordered:
-                if b in keep:
-                    if was_cold:  # selected host page -> one fetch, a fresh block
-                        if b not in remap:
-                            remap[b] = pool.promote_page(b)
-                        new_live.append(remap[b])
+        # Batch this retier's D2Hs: demoted frames stay live until the single
+        # end sync, so an interleaved promote's alloc_block cannot recycle a
+        # frame a non-blocking D2H is still reading.
+        with pool.demotions():
+            for r in reqs:
+                cold_map = dict(r.cold_pages)  # logical index -> host block id
+                live = iter(r.blocks)
+                n = len(r.blocks) + len(cold_map)
+                ordered: list[tuple[int, int, bool]] = []
+                for idx in range(n):
+                    ordered.append(
+                        (idx, cold_map[idx], True) if idx in cold_map
+                        else (idx, next(live), False))
+                new_live: list[int] = []
+                new_cold: list[tuple[int, int]] = []
+                for idx, b, was_cold in ordered:
+                    if b in keep:
+                        if was_cold:  # selected host page -> one fetch, a fresh block
+                            if b not in remap:
+                                remap[b] = pool.promote_page(b)
+                            new_live.append(remap[b])
+                        else:
+                            new_live.append(b)  # selected device page, untouched
+                    elif was_cold:
+                        new_cold.append((idx, b))  # still unselected on the host
+                    elif pool.is_shared(b):
+                        new_live.append(b)  # prefix-shared: read-only, never demoted
                     else:
-                        new_live.append(b)  # selected device page, untouched
-                elif was_cold:
-                    new_cold.append((idx, b))  # still unselected on the host
-                elif pool.is_shared(b):
-                    new_live.append(b)  # prefix-shared: read-only, never demoted
-                else:
-                    pool.demote_page(b)
-                    new_cold.append((idx, b))
-            # Both lists were appended in ascending logical idx, so the live block
-            # table is in sequence order and cold pages keep their absolute index.
-            r.blocks = new_live
-            r.cold_pages = new_cold
+                        pool.demote_page(b)
+                        new_cold.append((idx, b))
+                # Both lists were appended in ascending logical idx, so the live block
+                # table is in sequence order and cold pages keep their absolute index.
+                r.blocks = new_live
+                r.cold_pages = new_cold
         return cold.demotions - d0, cold.promotions - p0
 
 
@@ -1275,36 +1279,40 @@ class Engine:
         Bounds stay device-resident regardless, so scoring a cold page needs no K."""
         tr = self._sparse
         pool = self._kv
-        for bi, r in enumerate(rows):
-            rid = r.req_id
-            live = tr.resident[rid]
-            q_hi = sf.rows[bi]["q_hi"]
-            complete = q_hi // BLOCK_TOKENS
-            for p in range(len(tr.bounds[rid]), complete):
-                if p not in live:
-                    continue                       # selected candidate promoted with bounds
-                phys = live[p]
-                if pool.kv_fp8 is not None:
-                    raise NotImplementedError("sparse bounds over an fp8 pool: card PR")
-                b = torch.stack([
-                    torch.stack((
-                        pool.k_pool[plane, phys].amin(dim=1),
-                        pool.k_pool[plane, phys].amax(dim=1)), dim=1)
-                    for plane in range(pool.num_layers)]).to(torch.float16)
-                tr.set_bounds(rid, p, b)
-            kept = sf.selected_pages(bi)
-            kept_live: dict[int, int] = {}
-            for p, phys in list(live.items()):
-                if p in kept:
-                    kept_live[p] = phys                 # pin across ticks
-                    continue
-                pool.demote_page(phys, key=(rid, p))
-                r.cold_pages.append(p)
-            # r.blocks mirrors the live frames in LOGICAL page order (paged_attention
-            # derives causal positions from the order), so sort the pinned set.
-            r.blocks = [kept_live[p] for p in sorted(kept_live)]
-            live.clear()
-            live.update(kept_live)
+        # One batched D2H for the tick's departing pages across every row: each
+        # demote launches non-blocking into pinned staging while its frame stays
+        # live; the context syncs once before the frames return to the pool.
+        with pool.demotions():
+            for bi, r in enumerate(rows):
+                rid = r.req_id
+                live = tr.resident[rid]
+                q_hi = sf.rows[bi]["q_hi"]
+                complete = q_hi // BLOCK_TOKENS
+                for p in range(len(tr.bounds[rid]), complete):
+                    if p not in live:
+                        continue                       # selected candidate promoted with bounds
+                    phys = live[p]
+                    if pool.kv_fp8 is not None:
+                        raise NotImplementedError("sparse bounds over an fp8 pool: card PR")
+                    b = torch.stack([
+                        torch.stack((
+                            pool.k_pool[plane, phys].amin(dim=1),
+                            pool.k_pool[plane, phys].amax(dim=1)), dim=1)
+                        for plane in range(pool.num_layers)]).to(torch.float16)
+                    tr.set_bounds(rid, p, b)
+                kept = sf.selected_pages(bi)
+                kept_live: dict[int, int] = {}
+                for p, phys in list(live.items()):
+                    if p in kept:
+                        kept_live[p] = phys                 # pin across ticks
+                        continue
+                    pool.demote_page(phys, key=(rid, p))
+                    r.cold_pages.append(p)
+                # r.blocks mirrors the live frames in LOGICAL page order (paged_attention
+                # derives causal positions from the order), so sort the pinned set.
+                r.blocks = [kept_live[p] for p in sorted(kept_live)]
+                live.clear()
+                live.update(kept_live)
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0,
                  sf=None) -> BatchKv:
