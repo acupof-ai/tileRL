@@ -348,7 +348,9 @@ def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     x = torch.randn(m, inn, dtype=torch.bfloat16, device=dev)
     w_bf16 = torch.randn(out_n, inn, dtype=torch.bfloat16, device=dev)
     wargs, wkw = _pack_for(row["face"], w_bf16)
-    # identity assertion: the thing we time is the kernel object the row's face
-    # declared, not a substitute. resolve_row_kernel is the single resolution point.
-    assert fn is resolve_row_kernel(backend, row)
+    # identity assertion: the thing we time is the kernel the row's face declared,
+    # not a substitute. Compare the underlying functions — getattr builds a fresh
+    # bound-method wrapper each time, so the wrappers themselves are never `is`.
+    again = resolve_row_kernel(backend, row)
+    assert getattr(fn, "__func__", fn) is getattr(again, "__func__", again)
     return _event_seconds(lambda: fn(x, *wargs, **wkw), 1) * 1000.0
