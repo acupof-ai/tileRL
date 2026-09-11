@@ -143,6 +143,10 @@ _SM70_KERNELS = {
     # 2-row verify does not pay for 8. Rounding X to f16 once outside the kernel
     # took 127 us/row flat down to 24-45 us/row.
     "linear_fp4_gemv_sm70_m": kernels_linear.make_linear_fp4_gemv_sm70_m,
+    # prefill (M>8): one M-tiled block GEMM dequantizes the fp4 weight tile to f16
+    # once and sweeps bM query rows through m8n8k4, instead of re-reading the whole
+    # weight per M=32 GEMV chunk. 0.0048 ms/row at M=256 vs the ladder's 0.0093.
+    "linear_fp4_f16_mma": kernels_linear.make_linear_fp4_f16_mma_sm70,
     # gdn_decode_fused and write_tokens fix graph capture: their eager fallbacks
     # host-sync on int(device_tensor) per token.
     "gdn_decode_fused": lambda t: kernels_gdn.make_gdn_decode_fused(t, out_dtype="float32"),

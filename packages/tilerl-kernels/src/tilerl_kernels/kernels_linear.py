@@ -909,6 +909,15 @@ __device__ __forceinline__ void tl_fp4_gemv_tiles_f16_m(
     }
   }
 }
+// Packed-pointer twin for the block dequant macro: one uint8 word -> 8 contiguous
+// f16 halves (tl_fp4_decode8_f16 already writes them as 4 x f16x2 in order).
+__device__ __forceinline__ void tl_fp4_decode8_p_f16(const void *wq, void *out) {
+  unsigned o[4];
+  tl_fp4_decode8_f16(*(const unsigned *)wq, o);
+  // o[i] already holds two contiguous f16 lanes; copy the 8 halves out.
+#pragma unroll
+  for (int i = 0; i < 4; ++i) ((unsigned *)out)[i] = o[i];
+}
 """
 
 
@@ -1672,6 +1681,94 @@ def make_linear_fp4_fp8_mma(target: str, k_split: int = 1):
                 T.atomic_add(Y[by * block_M + i, bx * block_N + j], C_local[i, j])
 
     return linear_fp4_fp8_split
+
+
+# ---------------------------------------------------------------- sm70 w4a16 prefill GEMM
+
+
+def _dequant_fp4_f16_macro(local_size, block):
+    """Like _dequant_fp4_macro but fills f16 from the sm70 fp16-twiddled bytes
+    (tl_fp4_decode8_p_f16). sm70 has no bf16 MMA, so the prefill GEMM dequantizes
+    weights to f16 and runs m8n8k4 (T.gemm f16->f32)."""
+    local_compress = local_size // 2
+    assert local_size % 8 == 0 and block % local_size == 0, (local_size, block)
+
+    @T.macro
+    def dequant(WQ_shared, Scale_shared, W_shared, block_N, block_K):
+        T.import_source(_FP4_TWIDDLE_SRC_F16)
+        for i in T.Parallel(block_N * block_K // local_size):
+            WQ_local = T.alloc_local((local_compress,), "uint8")
+            W_local = T.alloc_local((local_size,), "float16")
+            cbase = i * local_compress
+            nbase = i * local_size
+            for v in T.vectorized(local_compress):
+                WQ_local[v] = WQ_shared[(cbase + v) // (block_K // 2), (cbase + v) % (block_K // 2)]
+            s = Scale_shared[nbase // block_K, (nbase % block_K) // block]
+            D_local = T.alloc_local((local_size,), "float16")
+            for wi in T.unroll(local_compress // 4):
+                T.call_extern(
+                    "tl_fp4_decode8_p_f16", T.access_ptr(WQ_local[4 * wi], "r"),
+                    T.access_ptr(D_local[8 * wi], "w"), dtype="void",
+                )
+            for v in T.unroll(local_size):
+                W_local[v] = T.cast(T.cast(D_local[v], "float32") * s, "float16")
+            for v in T.vectorized(local_size):
+                W_shared[(nbase + v) // block_K, (nbase + v) % block_K] = W_local[v]
+
+    return dequant
+
+
+def make_linear_fp4_f16_mma_sm70(target: str):
+    """w4a16 prefill GEMM for sm70 (V100): X [M,K] f16, WQ fp16-TWIDDLED uint8,
+    Scale [N,K//block] f32, OScale [N] f32 -> Y [M,N] f32. Each bN x bK weight
+    tile is dequantized to f16 in shared memory ONCE and reused across bM query
+    rows by m8n8k4 (T.gemm f16,f16->f32), replacing the M=32 GEMV ladder that
+    re-read the whole weight per chunk. CPU twin is reference.linear_fp4 (natural
+    nibbles); the served tw-f16 layout is the dequant's input.
+
+    OScale (per-row epilogue) is applied on f32 output. M is a runtime dimension;
+    bM is a launch arg so one compiled kernel covers prefill and wide verify.
+    """
+    bK = _FP4_BLOCK_K
+
+    @tilelang.jit(
+        target=target,
+        pass_configs={
+            "tl.disable_data_race_check": True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        },
+    )
+    def linear_fp4_f16(X, WQ, Scale, OScale, block_M, block_N, block, threads):
+        # The 64x64 f16 mma tile needs a 128-thread block; the backend's default
+        # _THREADS is 64 (sized for the GEMV), so force it here.
+        threads = 128
+        M, N, K = T.const("M, N, K")
+        X: T.Tensor((M, K), "float16")
+        WQ: T.Tensor((N, K // 2), "uint8")
+        Scale: T.Tensor((N, K // block), "float32")
+        OScale: T.Tensor((N,), "float32")
+        Y = T.empty((M, N), "float32")
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            X_shared = T.alloc_shared((block_M, bK), "float16")
+            WQ_shared = T.alloc_shared((block_N, bK // 2), "uint8")
+            W_shared = T.alloc_shared((block_N, bK), "float16")
+            Scale_shared = T.alloc_shared((block_N, bK // block), "float32")
+            C_local = T.alloc_fragment((block_M, block_N), "float32")
+            T.clear(C_local)
+            for k in T.Pipelined(K // bK, num_stages=3):
+                T.copy(X[by * block_M, k * bK], X_shared)
+                T.copy(WQ[bx * block_N, k * bK // 2], WQ_shared)
+                T.copy(Scale[bx * block_N, k * bK // block], Scale_shared)
+                _dequant_fp4_f16_macro(8, block)(
+                    WQ_shared, Scale_shared, W_shared, block_N, bK
+                )
+                T.gemm(X_shared, W_shared, C_local, transpose_B=True)
+            for i, j in T.Parallel(block_M, block_N):
+                C_local[i, j] = C_local[i, j] * OScale[bx * block_N + j]
+            T.copy(C_local, Y[by * block_M, bx * block_N])
+        return Y
+
+    return linear_fp4_f16
 
 
 # ---------------------------------------------------------------- linear fp8 (native MMA)
