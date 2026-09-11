@@ -51,7 +51,14 @@ physical card per run.
   read+write, CUDA-event median of 20) and `bf16_peak_tflops` (8192² bf16
   GEMM, 2n³ flops), `floor.kind=measured-best`, full 40-hex commit.
 
-## 2 — Record steady-state residency and its static/transient split
+## 2 — Record steady-state residency and its static/transient split  ✅ on H20 card 2 (2026-09-11)
+
+Shipped — 27B built-engine `--record-residency` on card 2, every derived row
+equal measured to the byte: peak 76,451,655,680 = static 76,338,610,340 +
+transient 113,045,340 (row `edb5d8328af3`), in
+[wins/2026-09-11-h20-kernel-roofline-step3.md](../wins/2026-09-11-h20-kernel-roofline-step3.md).
+That entry pins the 314-vs-315 cause: the captured decode graph reserves one
+pad slot+block, so pool num_blocks is one more than usable_blocks.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 TILERL_TARGET=cuda uv run tilerl serve \
@@ -70,10 +77,18 @@ CUDA_VISIBLE_DEVICES=0 TILERL_TARGET=cuda uv run tilerl serve \
   (`--checkpoint DIR`) renders the table but writes nothing — residency needs a
   built engine.
 
-## 3 — Kernel roofline with measured ms / bound / %bound
+## 3 — Kernel roofline with measured ms / bound / %bound  ✅ shuffled on H20 card 2 (2026-09-11)
 
-Pending-remote until step 1 rows exist for that exact device name. Timing
-resolves each row's kernel **by its weight face** (nvfp4 → linear_fp4,
+Shipped — every timed row in (0,100] on sm90 card 2, decode B=1/B=8 and
+prefill S=4096, against measured bw/bf16/**fp8** floors. See
+[wins/2026-09-11-h20-kernel-roofline-step3.md](../wins/2026-09-11-h20-kernel-roofline-step3.md).
+Two rules that run established: the ceiling is the kernel's MMA-dtype peak
+(w4a8 prefill rides the fp8 peak, decode the bf16 one), and the timer times the
+priced launch M (decode M=b, not b·s). Still pending: timing fixtures for the
+fused attention/GDN/norm rows (ms `pending`; bounds already print) and a B=8
+prefill column.
+
+Timing resolves each row's kernel **by its weight face** (nvfp4 → linear_fp4,
 fp8 → linear_fp8; fused attention/GDN/norms have no timing fixture).
 
 ```bash
@@ -108,7 +123,15 @@ CUDA_VISIBLE_DEVICES=0 TILERL_TARGET=cuda uv run tilerl bench --kernels \
 - **Writes:** nothing — a view over step 1/2 rows; copy the tables into the
   dated wins entry by hand.
 
-## 4 — The 27B byte oracles (integer-exact; headers or live load_hf)
+## 4 — The 27B byte oracles (integer-exact; headers or live load_hf)  ✅ on H20 card 2 (2026-09-11)
+
+Both env-gated exact-byte gates pass live on card 2 against
+`/work/Qwen3.8-27B-NVFP4`: served-face bytes == header-derived == LIVE
+`load_hf` tensor storage = **24,436,981,888 B over 1845 tensors**, including
+both fp8 scale planes. `2 passed` (the two named gates run explicitly). One
+adjacent test bug surfaced and is fixed in #510: the header dry-run block
+expectation derived the decode-graph pad from a CPU RefBackend instead of the
+built CUDA backend (305 vs 306). The gates remain integer-exact, no tolerance.
 
 Run pytest from one invocation with both files as args (a `file -k` pair is not
 valid pytest syntax):
