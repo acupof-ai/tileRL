@@ -36,10 +36,11 @@ brackets):
 
 Roofline bounds (s=4096, measured 3312.71 GB/s floor): **6.6 ms at B=1**
 (22.36 GB) and **7.74 ms at B=8** (25.63 GB). The graph tick is at **57% of
-bound (1.77× over) at B=1** and **30% (3.36× over) at B=8** — batching 8 rows
-2.22× the bytes costs 2.22× the graph time (11.68 → 25.98 ms), so graph
-decode scales with bytes even though the per-bucket launch count does not
-change; the gap to the bound widens with B.
+bound (1.77× over) at B=1** and **30% (3.36× over) at B=8** — batching 8
+rows raises streamed bytes only 1.15× (22.36 → 25.63 GB) but graph time
+2.22× (11.68 → 25.98 ms), so graph decode scales with rows over a
+near-constant weight stream — the M=8 GEMV band, not bytes; the gap to the
+bound widens with B.
 
 Two apparatus bugs the first runs hit — both measured before the number was
 trusted:
@@ -80,8 +81,9 @@ dispatch. The mechanism is the MMA band boundary: M≤8 decode GEMVs dispatch on
 `linear_fp4_mma8` bf16, while M≥9 prefill uses the e4m3 WGMMA fp8 band
 (`LINEAR_MMA_BANDS`). B=8 decode sits exactly on the wrong side of that
 boundary — eight rows are still eight M=1-style mma8 GEMVs batched, not one
-WGMMA GEMM. Batching to B=1 → B=8 moves bytes and graph time proportionally
-(2.22×) but does not move the kernels to the fast MMA shape. Closing the 30%
+WGMMA GEMM. Batching B=1 → B=8 nearly doubles graph time (2.22×) over a
+weight stream that grows only 1.15×, and does not move the kernels to the
+fast MMA shape. Closing the 30%
 number means serving decode through the M≥9 band (a fused batched GEMM, or
 spec decode's wider verify tick), not a cheaper launch.
 
