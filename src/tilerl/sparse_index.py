@@ -116,6 +116,33 @@ def page_scores_for_selector(iq: Tensor, ik: Tensor,
     return scores
 
 
+def topk_page_recall(selector_scores: Tensor, target_page_mass: Tensor,
+                     n_pages: Tensor, k_pages: int,
+                     n_win_pages: int = WINDOW_PAGES) -> Tensor:
+    """Top-k recall of dense page mass — the warm-up's science metric.
+
+    ``selector_scores`` [rows, L_src, pages] from :func:`page_scores_for_selector`
+    (window/invalid already -inf); ``target_page_mass`` [rows, L_src, q, pages]
+    from :func:`page_mass_target` (L1-normalised over indexable pages). The
+    selector picks at most ``k_pages`` indexable pages per row/layer (shared
+    across that layer's queries — a page hot for ANY query is taken); recall is
+    the target mass sitting on picked pages, averaged over rows, source layers
+    and queries. ``k_pages`` >= the number of indexable pages is dense
+    selection and recall is 1 by construction.
+    """
+    r, l, pages = selector_scores.shape
+    indexable = _indexable_mask(n_pages, pages, n_win_pages, selector_scores.device)
+    # Pick per row/layer among indexable pages; mask non-indexable below the
+    # finite scores so topk never returns the window.
+    pick = selector_scores.masked_fill(~indexable[:, None, :], float("-inf")).topk(
+        min(k_pages, pages), dim=-1).indices                        # [r,l,k]
+    chosen = torch.zeros(r, l, pages, dtype=torch.bool, device=selector_scores.device)
+    chosen.scatter_(-1, pick, True)
+    chosen &= indexable[:, None, :]                                  # belt and braces
+    mass_on = torch.einsum("rlp,rlqp->rlq", chosen.float(), target_page_mass)
+    return mass_on.mean()
+
+
 def page_mass_target(attn_mass: Tensor, n_pages: Tensor,
                      block_tokens: int = BLOCK_TOKENS,
                      n_win_pages: int = WINDOW_PAGES) -> Tensor:
