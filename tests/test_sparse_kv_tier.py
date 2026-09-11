@@ -12,10 +12,18 @@ Two end-to-end properties, selector-agnostic:
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from tilerl.kv_cache import BLOCK_TOKENS, HostKvPages, PagedKvPool
 from tilerl.testing import RefBackend
+
+#: cpu by default (the hermetic gate); TILERL_TARGET=cuda puts the pools on the
+#: card so demote/promote exercise the real pinned D2H/H2D copies. RefBackend's
+#: torch paged_attention runs on whatever device the pools are on.
+def _device() -> torch.device:
+    return torch.device("cuda") if os.environ.get("TILERL_TARGET") == "cuda" else torch.device("cpu")
 
 
 def _kv(seed: int, p: int, hkv: int, d: int):
@@ -27,7 +35,7 @@ def _kv(seed: int, p: int, hkv: int, d: int):
 def test_a_demoted_page_promotes_byte_equal_across_every_plane():
     """bf16 pool, two layers: the K and V of BOTH planes must come back identical."""
     p, hkv, d = 4, 2, 8
-    pool = PagedKvPool(p + 1, hkv, d, num_layers=2, device=torch.device("cpu"))
+    pool = PagedKvPool(p + 1, hkv, d, num_layers=2, device=_device())
     pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
     kk, vv = _kv(0, p, hkv, d)
     b = pool.alloc_block()
@@ -57,7 +65,7 @@ def test_fp8_scale_planes_round_trip_with_the_page():
     """The fp8 K/V are 1 B/value; without their f32 per-token scale planes the
     promoted page reloads plausible garbage. All four tensors must be byte-equal."""
     p, hkv, d = 4, 2, 16
-    pool = PagedKvPool(p + 1, hkv, d, num_layers=2, device=torch.device("cpu"),
+    pool = PagedKvPool(p + 1, hkv, d, num_layers=2, device=_device(),
                        kv_fp8=torch.float8_e4m3fn)
     pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
     kk, vv = _kv(1, p, hkv, d)
@@ -78,7 +86,7 @@ def test_fp8_scale_planes_round_trip_with_the_page():
 def test_a_prefix_shared_page_cannot_be_demoted():
     """A page retained by the prefix store is read-only wherever it lives; moving
     its device frame away would corrupt every other request sharing it."""
-    pool = PagedKvPool(4, 2, 8, num_layers=1, device=torch.device("cpu"))
+    pool = PagedKvPool(4, 2, 8, num_layers=1, device=_device())
     pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
     b = pool.alloc_block()
     pool.retain(b)  # a second owner (prefix store)
@@ -101,22 +109,23 @@ def test_demoting_every_unselected_page_leaves_decode_identical():
     torch.manual_seed(5)
     p, hkv, d = 4, 2, 16
     hq = 4
-    pool = PagedKvPool(p + 5, hkv, d, num_layers=1, device=torch.device("cpu"))
+    pool = PagedKvPool(p + 5, hkv, d, num_layers=1, device=_device())
     pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
     blocks = [pool.alloc_block() for _ in range(p)]
     pages = [_kv(10 + i, 1, hkv, d) for i in blocks]
     for i, b in enumerate(blocks):
         kk, vv = pages[i]
         pool.write_block(b, 0, kk[0], vv[0])
-    q = torch.randn(1, 1, hq, d)
+    dev = _device()
+    q = torch.randn(1, 1, hq, d, device=dev)
     scale = 1.0 / d ** 0.5
-    seq_len = torch.tensor([p * BLOCK_TOKENS])
+    seq_len = torch.tensor([p * BLOCK_TOKENS], device=dev)
 
     def run(table):
         return RefBackend().paged_attention(
-            q, pool.k_pool[0], pool.v_pool[0], table, seq_len, scale)
+            q, pool.k_pool[0], pool.v_pool[0], table.to(dev), seq_len, scale)
 
-    dense_table = torch.tensor([blocks])
+    dense_table = torch.tensor([blocks], device=dev)
     y_dense = run(dense_table)
 
     # selector picks page 2 only; demote the other three (their device frames leave)
@@ -156,7 +165,15 @@ def test_engine_decode_tokens_equal_across_a_full_demote_promote_round_trip():
     prompt; an identical engine, after prefill, moves EVERY private page to the
     host (keep empty) and then selects the whole context again (every cold page
     promoted to a fresh block at its logical index) before decoding. The rebuild
-    must be lossless even though the device block ids all changed."""
+    must be lossless even though the device block ids all changed.
+
+    CPU-only by construction: it builds through RefBackend, the model-forward
+    parity cell. The pinned D2H/H2D transfer path on a real card is the four pool
+    gates above run with TILERL_TARGET=cuda."""
+    if _device().type != "cpu":
+        import pytest
+
+        pytest.skip("model-forward parity gate is the CPU cell; card runs the pool gates")
     from tilerl.config import tiny
     from tilerl.engine import SamplingParams, build_engine
     from tilerl.kv_cache import NoPrefixStore

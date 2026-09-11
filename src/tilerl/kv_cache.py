@@ -221,6 +221,11 @@ class PagedKvPool:
         if self.k_scale is not None:
             self.k_scale[:, new].copy_(blob["ks"], non_blocking=nb)
             self.v_scale[:, new].copy_(blob["vs"], non_blocking=nb)
+        # The pinned blob is released when this call returns; a non_blocking H2D
+        # still in flight would then read a buffer the host allocator may reuse.
+        # Synchronous contract: a batched/prefetched promote is the later perf job.
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
         return new
 
     def page_location(self, block: int) -> str:
