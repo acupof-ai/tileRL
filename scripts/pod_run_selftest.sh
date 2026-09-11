@@ -280,17 +280,24 @@ set -e
 grep -q "unclassified -> refuse" "$TMP/a8/wrapper_u.out" \
   || fail "arm 8: unclassified refusal message missing: $(cat "$TMP/a8/wrapper_u.out")"
 
-# with --lend-ref the quota check passes and the job proceeds to claim.
+# with --lend-ref the quota check passes, the ref is echoed, AND it reaches the job's
+# environment: the in-python card_guard reads TILERL_CARD_LEND, and an escaped
+# \${LEND_REF} in the unquoted heredoc expands empty inside the pod runner, so a job of
+# `true` passed while every real card_guard refused. The job below fails rc nonzero if
+# the env is absent, which is what `true` could not see.
 emit8b=$(POD_RUN_EMIT_RUNNER=1 AUPAI="$TMP/aupai" REMOTE_DIR="$TMP/work" \
-  bash "$ROOT/scripts/pod_run.sh" --lend-ref "aupai-lend-0909" selftest 5 -- true 2>/dev/null)
+  bash "$ROOT/scripts/pod_run.sh" --lend-ref "aupai-lend-0909" selftest 5 \
+  -- sh -c 'test "$TILERL_CARD_LEND" = aupai-lend-0909' 2>/dev/null)
 printf '%s\n' "$emit8b" > "$TMP/a8/runner_b.sh"
 sed -i.bak -e "s#> /work/#> $TMP/work/#g" "$TMP/a8/runner_b.sh"
+grep -q "export TILERL_CARD_LEND=aupai-lend-0909" "$TMP/a8/runner_b.sh" \
+  || fail "arm 8: runner does not export the lend ref to the job env"
 set +e
 ( cd "$TMP/work" && CLAIM_MODE=shell_then_device CLAIM_LOG=$CLAIM_LOG bash "$TMP/a8/runner_b.sh" \
     > "$TMP/a8/wrapper_b.out" 2>&1 )
 rc8b=$?
 set -e
-[ "$rc8b" = 0 ] || fail "arm 8: --lend-ref must let the job proceed, got rc $rc8b: $(cat "$TMP/a8/wrapper_b.out")"
+[ "$rc8b" = 0 ] || fail "arm 8: --lend-ref must let the job proceed with TILERL_CARD_LEND set, got rc $rc8b: $(cat "$TMP/a8/wrapper_b.out")"
 grep -q "lend ref: aupai-lend-0909" "$TMP/a8/wrapper_b.out" \
   || fail "arm 8: lend ref not echoed: $(cat "$TMP/a8/wrapper_b.out")"
 

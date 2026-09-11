@@ -103,8 +103,11 @@ export TILERL_TARGET=\${TILERL_TARGET:-cuda} CUDA_VISIBLE_DEVICES=$CARD
 export TILERL_QWEN38_SOURCE=\${TILERL_QWEN38_SOURCE:-/work/Qwen3.8-27B-NVFP4}
 export REMOTE_DIR=$REMOTE_DIR
 # Forward --lend-ref to the in-process card_guard (#491): it reads this env, and a
-# job on an unclassified card exits before touching the GPU without it.
-[ -n "\${LEND_REF:-}" ] && export TILERL_CARD_LEND=\$LEND_REF
+# job on an unclassified card exits before touching the GPU without it. The value is
+# expanded HERE, on the caller: the pod runner never receives LEND_REF, so an escaped
+# \${LEND_REF:-} there is always empty (a3's first fix shipped that and every in-python
+# card_guard still refused; only a bash -c 'export …' workaround ran).
+[ -n "$LEND_REF" ] && export TILERL_CARD_LEND=$(printf '%q' "$LEND_REF")
 # pod_sync.sh overwrites the tracked store on every sync; keep the live one outside the tree.
 export TILERL_BENCH_STORE=/work/tilerl-bench/measurements.jsonl
 mkdir -p "\$(dirname "\$TILERL_BENCH_STORE")" && touch "\$TILERL_BENCH_STORE"
