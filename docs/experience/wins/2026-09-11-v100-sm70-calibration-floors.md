@@ -47,7 +47,19 @@ The f16 number sits at 71% of the 125 TFLOP/s datasheet tensor peak — the
 sustained, shareable floor the roofline should divide by, not the spec
 maximum, consistent with the H20 measuring 136 vs its nominal ~148.
 
-PENDING: decode B=1/8, residency.
+RESIDENCY measured: 27B resident peak **28.58 GiB = 28.33 static + 0.25
+transient** on the V100, 4.9 GiB free — dense long-context cannot exceed ~32k
+f32 there; 128k/256k on the V100 are sparse/cold-tier by construction. Decode
+B=1/8 roofline captured in the same run (GEMVs 0.23-0.43 ms/call, 7-22% bound).
+
+## 27B residency (serve --dry-run --record-residency)
+
+| metric | value |
+|---|---:|
+| device_resident_bytes peak | **28,575,371,264** (26.61 GiB) |
+| static | 28,326,046,756 (26.38 GiB) |
+| transient | 249,324,508 (0.23 GiB) |
+| free of 32 GiB | ~4.9 GiB |
 
 ## 27B prefill roofline (S=4096, B=1, fp8 KV)
 
@@ -87,3 +99,5 @@ off the card when only the kernel call is timed.
 | date | machine | target | result |
 |---|---|---|---|
 | 2026-09-11 | V100-SXM2-32GB | cuda sm70 | HBM 778.2 GB/s, f16 peak 88.8 TFLOP/s appended |
+| 2026-09-11 | V100-SXM2-32GB | cuda sm70 | 27B residency peak 28.58 GiB (28.33 static + 0.25 transient), 4.9 free |
+| 2026-09-11 | V100-SXM2-32GB | cuda sm70 | dense 32k prefill 604.0 s (18.43 ms/tok, eager), decode tok/s pending |
