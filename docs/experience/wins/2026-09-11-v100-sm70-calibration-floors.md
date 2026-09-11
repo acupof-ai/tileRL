@@ -27,7 +27,9 @@ bf16 and ignores any f16 row. The row's `target` is the measured arch
 fixture packs a random weight through `pack_fp4`, whose nearest-grid LUT
 materializes ~8x the weight: a 17408x5120 layer asked for 37.9 GiB. That
 fit the 95 GB H20 where the fixture was written, so nothing caught it. Packing
-is untimed prep; it now runs on CPU and moves the packed faces to the card.
+is untimed prep; `_pack_fp4_chunked` now packs and renorms in 2048-row chunks
+on the weight's device — slices never leave the GPU, and pack/renorm are
+per-row so the chunked result is bit-identical while the transient is bounded.
 
 The same run also fixed the `%bound` column: it divided the COUNT-scaled bound
 (all 48 GDN layers) by ONE call's ms, printing impossible 553-867%. The
@@ -91,8 +93,9 @@ lm_head at M=1 is the one tight GEMV: 79% bound.
 
 A roofline floor is per-arch-specific in dtype as well as number: sm70's only
 tensor peak is f16, and a bf16 GEMM there times the wrong (CUDA-core) path.
-A fixture sized for a 95 GB card is a latent OOM on a 32 GB card — pack prep
-off the card when only the kernel call is timed.
+A fixture sized for a 95 GB card is a latent OOM on a 32 GB card — when an
+untimed prep step builds an oversized scratch, chunk it on-device rather than
+round-trip the weight through host.
 
 ## Results
 
