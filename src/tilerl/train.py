@@ -385,16 +385,19 @@ def dense_causal_page_mass(q: torch.Tensor, k: torch.Tensor, block: int = 16,
     return page_mass
 
 
-def sample_query_positions(t: int, n: int, seed: int, min_pos: int) -> torch.Tensor:
+def sample_query_positions(t: int, n: int, seed: int, min_pos: int,
+                           device: torch.device | str = "cpu") -> torch.Tensor:
     """``n`` distinct uniform query positions in [min_pos, t), fixed by seed.
     The 27B recall teacher scores these only: positions past 2048 leave pages the
     selector can miss. n>=t-min_pos returns every eligible position."""
     if t <= min_pos:
         raise ValueError(f"need T>{min_pos} sampled-query positions, got {t}")
     pool = t - min_pos
+    # CPU RNG (not the device's): the seed reproduces the same positions on every
+    # machine regardless of the CUDA RNG version; the result is small (256 ints).
     gen = torch.Generator().manual_seed(seed)
     perm = torch.randperm(pool, generator=gen)[: min(n, pool)]
-    return (perm + min_pos).sort().values
+    return (perm + min_pos).sort().values.to(torch.long).to(device)
 
 
 def indexer_capture(model: Any, ids: torch.Tensor, backend: Any, block: int,
@@ -560,7 +563,8 @@ def indexer_warmup_run(model: Any, backend: Any, train_batches: list,
     def qpos(ids, span_seed):
         if q_samples <= 0:
             return None
-        return sample_query_positions(int(ids.shape[1]), q_samples, span_seed, q_min_pos)
+        return sample_query_positions(int(ids.shape[1]), q_samples, span_seed,
+                                      q_min_pos, backend.device)
 
     def eval_group(batches, span_seed0):
         vals = [indexer_recall(model, ids, backend, weights, k_pages_pick,
@@ -620,7 +624,8 @@ def indexer_held_recall(model: Any, backend: Any, cdir: Any,
         vals = []
         for k, ids in enumerate(batches):
             qp = (sample_query_positions(int(ids.shape[1]), q_samples,
-                                         seed + 100003 * j + k, q_min_pos)
+                                         seed + 100003 * j + k, q_min_pos,
+                                         backend.device)
                   if q_samples > 0 else None)
             vals.append(indexer_recall(model, ids, backend, weights, k_pages_pick,
                                        q_positions=qp))
