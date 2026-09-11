@@ -1208,7 +1208,7 @@ class Engine:
                 force_window = _WP                    # force the 8 pre-chunk pages
             own = list(range(own_first, own_last + 1))
             own_len = q_hi - own_first * BLOCK_TOKENS
-            cand = [p for p in range(0, own_first) if p in tr.bounds[r.req_id]]
+            cand = [p for p in range(0, own_first) if tr.has_bounds(r.req_id, p)]
 
             def resolve(p, r=r, reserved=reserved):
                 return self._sparse_resolve(r, p, reserved)
@@ -1280,7 +1280,7 @@ class Engine:
             live = tr.resident[rid]
             q_hi = sf.rows[bi]["q_hi"]
             complete = q_hi // BLOCK_TOKENS
-            for p in range(len(tr.bounds[rid]), complete):
+            for p in range(tr.bounds_count[rid], complete):
                 if p not in live:
                     continue                       # selected candidate promoted with bounds
                 phys = live[p]
