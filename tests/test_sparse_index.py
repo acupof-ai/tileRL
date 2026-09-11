@@ -271,3 +271,59 @@ def test_indexer_warmup_recipe_runs_one_step_on_tiny(tmp_path, monkeypatch, caps
     assert gate["name"] == "indexer_warmup_step_runs" and gate["passed"] is True
     import math
     assert math.isfinite(m["metrics"]["kl_first"])
+
+
+# ---------------- science metric: top-k recall of dense page mass ----------------
+
+def test_topk_recall_is_one_when_k_covers_every_indexable_page():
+    from tilerl.sparse_index import topk_page_recall
+    iq, k_pages = _qk(PAGES)
+    n_pages = torch.full((R,), PAGES, dtype=torch.long)
+    ik = project_page_keys(k_pages, _proj())
+    scores = page_scores_for_selector(iq, ik, n_pages)
+    mass = torch.softmax(torch.randn(R, L_SRC, 3, PAGES * 16), -1)
+    target = page_mass_target(mass, n_pages)
+    # only 12-8 = 4 indexable pages here, so k=4 is dense selection
+    rec = topk_page_recall(scores, target, n_pages, k_pages=PAGES - WINDOW_PAGES)
+    assert torch.allclose(rec, torch.ones(()), atol=1e-6), rec
+
+
+def test_topk_recall_counts_mass_on_picked_pages_and_never_the_window():
+    from tilerl.sparse_index import topk_page_recall
+    # one source layer, one query; put a known score order on 4 indexable pages
+    n_pages = torch.full((R,), PAGES, dtype=torch.long)
+    scores = torch.full((R, 1, PAGES), float("-inf"))
+    # indexable pages 0..3: page 2 hottest, then 0, then 3, then 1
+    order = {2: 4.0, 0: 3.0, 3: 2.0, 1: 1.0}
+    for pg, v in order.items():
+        scores[:, :, pg] = v
+    target = torch.zeros(R, 1, 1, PAGES)
+    # teacher mass 0.6 on page 2, 0.4 on page 1
+    target[:, :, :, 2] = 0.6
+    target[:, :, :, 1] = 0.4
+    # k=1 picks only page 2 -> recall 0.6; k=3 picks {2,0,3} -> still 0.6;
+    # k=4 adds page 1 -> recall 1.0
+    r1 = topk_page_recall(scores, target, n_pages, k_pages=1).item()
+    r3 = topk_page_recall(scores, target, n_pages, k_pages=3).item()
+    r4 = topk_page_recall(scores, target, n_pages, k_pages=4).item()
+    assert abs(r1 - 0.6) < 1e-6 and abs(r3 - 0.6) < 1e-6 and abs(r4 - 1.0) < 1e-6
+    # window pages carry no teacher mass and are masked out of the pick itself,
+    # so even a corrupt selector that emits a finite, hotter window score cannot
+    # steal a slot: recall stays 0.6 (page 2), not 0.
+    corrupt = scores.clone()
+    corrupt[:, :, -1] = 100.0  # window page hotter than everything
+    rc = topk_page_recall(corrupt, target, n_pages, k_pages=1).item()
+    assert abs(rc - 0.6) < 1e-6, rc
+
+
+def test_topk_recall_partial_row_masks_its_tail():
+    from tilerl.sparse_index import topk_page_recall
+    iq, k_pages = _qk(PAGES)
+    n_pages = torch.tensor([PAGES - 2, PAGES])  # row 0 has 2 fewer pages
+    ik = project_page_keys(k_pages, _proj())
+    scores = page_scores_for_selector(iq, ik, n_pages)
+    mass = torch.softmax(torch.randn(R, L_SRC, 3, PAGES * 16), -1)
+    target = page_mass_target(mass, n_pages)
+    # finite recall in [0,1] for a ragged page count, no NaN from the tail
+    rec = topk_page_recall(scores, target, n_pages, k_pages=2)
+    assert 0.0 <= rec.item() <= 1.0 and torch.isfinite(rec)
