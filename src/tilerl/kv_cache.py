@@ -280,6 +280,22 @@ class PagedKvPool:
             return "device"
         return "free"
 
+    def shared_promote(self, blob: dict) -> int:
+        """Copy a SHARED prefix-page blob (K/V + fp8 scales) into a fresh PRIVATE
+        block. The shared blob stays read-only with the store; the new block is the
+        adopting request's own. The promoted K/V use the pool dtype (cold narrowing
+        widened here, same as promote_page)."""
+        new = self.alloc_block()
+        nb = blob["k"].is_pinned()
+        self.k_pool[:, new].copy_(blob["k"], non_blocking=nb)
+        self.v_pool[:, new].copy_(blob["v"], non_blocking=nb)
+        if self.k_scale is not None and "ks" in blob:
+            self.k_scale[:, new].copy_(blob["ks"], non_blocking=nb)
+            self.v_scale[:, new].copy_(blob["vs"], non_blocking=nb)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return new
+
     def _store_fp8(self, plane: int, blk: torch.Tensor, off: torch.Tensor,
                    k: torch.Tensor, v: torch.Tensor) -> None:
         """Quantize ``k``/``v`` ([n, num_kv_heads, head_dim]) into ``blk``/``off``.
@@ -527,6 +543,12 @@ class HostKvPages:
         self._ssd_bytes = 0
         self._ssd_page_bytes: dict = {}
         self._staging: dict | None = None  # one reused pinned promote buffer
+        #: SHARED prefix pages, content-addressed by the page-token rolling hash,
+        #: held on behalf of a PrefixStore entry (sparse path). key -> [blob, n, refs].
+        #: A private block-id blob is per-request and freed when the page is freed; a
+        #: shared blob survives the publishing request and is refcounted by every store
+        #: entry whose prefix covers that page. Bounds ride alongside as blob["bounds"].
+        self._shared: dict[int, list] = {}
 
     @property
     def bytes_held(self) -> int:
@@ -610,6 +632,11 @@ class HostKvPages:
             return blob
         return None
 
+    def peek(self, key) -> dict | None:
+        """A held RAM blob WITHOUT removing it (clone source for the shared index).
+        Does not reach SSD: a page cloned for sharing must still be host-resident."""
+        return self._blobs.get(key)
+
     def forget(self, key) -> None:
         n = self._held.pop(key, None)
         self._blobs.pop(key, None)
@@ -635,6 +662,36 @@ class HostKvPages:
         if self._ssd is not None:
             self._ssd.close()
             self._ssd = None
+
+    # ----- shared, content-addressed prefix pages (sparse PrefixStore seam) -----
+    def share_hold(self, key: int, blob: dict, nbytes: int) -> None:
+        """Hold (or refcount) one published prefix page's blob under ``key``. The
+        store retains the blob, not a device block: sparse frees the device frame on
+        demote, so a prefix entry cannot name a physical id the way the dense store
+        does. Bounds ride in ``blob['bounds']`` when present. Idempotent on key."""
+        rec = self._shared.get(key)
+        if rec is not None:
+            rec[2] += 1
+            return
+        self._shared[key] = [blob, nbytes, 1]
+
+    def share_take(self, key: int) -> dict | None:
+        """A read-only REFERENCE to a shared page blob (promotion copies it into a
+        private fresh block; the shared blob is never mutated). None when absent."""
+        rec = self._shared.get(key)
+        return None if rec is None else rec[0]
+
+    def share_release(self, key: int) -> None:
+        """Drop one store reference; the blob is deleted at the last reference."""
+        rec = self._shared.get(key)
+        if rec is None:
+            return
+        rec[2] -= 1
+        if rec[2] <= 0:
+            self._shared.pop(key, None)
+
+    def share_keys(self) -> frozenset[int]:
+        return frozenset(self._shared)
 
 
 class LinearStatePool:

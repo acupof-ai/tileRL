@@ -250,6 +250,8 @@ class _Req:
     #: ``(logical page, phys)`` in ascending order. ``blocks`` holds the LIVE pages
     #: in sequence order either way; a promotion splices back at logical position.
     cold_pages: list = field(default_factory=list)
+    #: sparse prefix hit: token length adopted from the shared index (0 = full miss)
+    sparse_matched: int = 0
     #: block drafter: the trunk's aux-layer taps over the same positions as ``hidden``,
     #: [1,w,len(target_layers)*H]. Tick-scoped — ``_draft_block`` consumes it and it dies.
     aux: torch.Tensor | None = None
@@ -871,6 +873,22 @@ class Engine:
         self._slots_used += 1
         if sparse:
             self._sparse.attach(req.req_id)
+            # Sparse prefix hit: adopt bounds + GDN snapshot + page content keys
+            # WITHOUT blocks — the pages live as shared host blobs and promote
+            # lazily on selection (_sparse_resolve). seq_len/prefill_from already
+            # carry the matched length, so the engine prefills only the tail.
+            entry = self._sparse.prefix.lookup(req.tokens) if self._sparse.prefix else None
+            if entry is not None:
+                matched = len(entry["tokens"])
+                req.seq_len = req.prefill_from = matched
+                self._sparse.shared[req.req_id] = dict(enumerate(entry["keys"]))
+                self._sparse.bounds[req.req_id] = dict(entry["bounds"])
+                snap_states, snap_windows = entry["state"]
+                self._states.states[slot].copy_(snap_states)
+                if snap_windows is not None:
+                    self._states.window_restore(slot, snap_windows)
+                self._prefix_hits += 1
+                req.sparse_matched = matched
         if matched and not sparse:
             if boot_loaded:
                 self._states.states[slot].copy_(
@@ -990,6 +1008,8 @@ class Engine:
         if t is not None:
             t.join(timeout)
         self._thread = None
+        if self._sparse is not None and self._sparse.prefix is not None:
+            self._sparse.prefix.clear()  # release shared prefix blobs to the cold tier
 
     def stats(self) -> dict[str, Any]:
         """Lock-free while the loop thread runs; a fresh build when it does not."""
@@ -1294,21 +1314,58 @@ class Engine:
         return SparseForward(tr, srows, self._backend.device)
 
     def _sparse_resolve(self, r: _Req, page: int) -> int:
-        """Physical block for a resident-or-cold private logical page, allocating a
-        fresh block for a never-written-before own page or promoting the host blob."""
+        """Physical block for a resident, private-cold, or shared-prefix logical
+        page. A shared prefix page promotes its read-only host blob into a fresh
+        PRIVATE block (the blob stays with the store entry); promoting it makes
+        the page private to this request, so it is unlinked from the shared key."""
         tr = self._sparse
         live = tr.resident[r.req_id]
         if page in live:
             return live[page]
         # Automatic path: cold_pages are bare logical ints, blob keyed (req, page).
+        shared_keys = tr.shared.get(r.req_id, {})
         if page in r.cold_pages:
             new = self._kv.promote_keyed((r.req_id, page))
             r.cold_pages.remove(page)
+        elif page in shared_keys:
+            blob = self._kv.cold.share_take(shared_keys[page])
+            if blob is None:
+                raise RuntimeError(f"sparse prefix page {page} missing its shared blob")
+            new = self._kv.shared_promote(blob)
+            shared_keys.pop(page)  # now private; the store keeps the original blob
         else:
             new = self._kv.alloc_block()
         live[page] = new
         r.blocks.append(new)
         return new
+
+    @staticmethod
+    def _sparse_clone_cold(pool, phys: int) -> dict | None:
+        """A tensor-clone of a demoted page's PRIVATE host blob, without removing
+        it from private storage (the page stays the request's; the clone feeds the
+        shared prefix index)."""
+        src = pool.cold.peek(phys)
+        if src is None:
+            return None
+        return {k: v.clone() for k, v in src.items() if torch.is_tensor(v)}
+
+    def _sparse_publish(self, r: _Req, n_pages: int, page_blobs: dict) -> None:
+        """Publish the sparse prefix entry for the whole pages in ``page_blobs``.
+
+        The index is the single share_hold owner: each page blob (bounds already
+        attached) gets one store reference under its content key, and the entry
+        carries the exact GDN snapshot at the boundary. The returned key map is
+        recorded on the request so _sparse_resolve promotes its own prefix pages
+        lazily through the same shared blobs (a second same-prefix request shares
+        the keys -> a second reference, no copy)."""
+        sp = self._states
+        state = (sp.states[r.state_slot].clone(), sp.window_snapshot(r.state_slot))
+        length = min(n_pages, len(r.tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
+        bounds = {p: b["bounds"] for p, b in page_blobs.items() if "bounds" in b}
+        key_by_page = self._sparse.prefix.publish(
+            r.tokens[:length], page_blobs, bounds, state)
+        if key_by_page:
+            self._sparse.shared.setdefault(r.req_id, {}).update(key_by_page)
 
     def _sparse_finalize(self, sf, rows: list[_Req]) -> None:
         """After the forward: store Quest bounds of every now-complete page, then
@@ -1324,6 +1381,11 @@ class Engine:
             live = tr.resident[rid]
             q_hi = sf.rows[bi]["q_hi"]
             complete = q_hi // BLOCK_TOKENS
+            # Whole pages eligible for the block-aligned prefix stay in the
+            # REQUEST's private cold tier (the publisher's continuation is
+            # untouched by sharing), AND a clone is handed to the prefix index so
+            # a same-prefix follower can adopt it. Bounds ride on the clone.
+            publish_blobs: dict[int, dict] = {}
             for p in range(len(tr.bounds[rid]), complete):
                 if p not in live:
                     continue                       # selected candidate promoted with bounds
@@ -1340,9 +1402,18 @@ class Engine:
                 # Key the host blob by (req, logical page), not the recycled phys:
                 # the frame is freed now and reissued to a later page.
                 pool.demote_page(phys, key=(rid, p))
-                r.cold_pages.append(p)
                 r.blocks.remove(phys)
+                r.cold_pages.append(p)
+                if (tr.prefix is not None and p < complete
+                        and (p + 1) * BLOCK_TOKENS <= len(r.tokens)):
+                    clone = self._sparse_clone_cold(pool, (rid, p))
+                    if clone is not None:
+                        clone["bounds"] = tr.bounds[rid][p]
+                        publish_blobs[p] = clone
             live.clear()
+
+            if tr.prefix is not None and publish_blobs:
+                self._sparse_publish(r, complete, publish_blobs)
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0,
                  sf=None) -> BatchKv:
@@ -2222,6 +2293,9 @@ def build_engine(
         # memory; a captured decode graph cannot hold that. Eager only until cc's cells.
         decode_graph = False
         sparse_tracker = SparseTracker(cfg, sparse_k, scorer)
+        # An explicitly-passed NoPrefixStore means "sharing off" (training/old tests);
+        # otherwise the sparse prefix index is attached once the cold tier exists.
+        sparse_tracker.sharing_enabled = not isinstance(prefix_store, NoPrefixStore)
     if draft is not None:
         draft.set_depth(spec_depth)  # the state pool is sized by the width it settles on
     model.params = backend.materialize(model.params)
@@ -2359,10 +2433,8 @@ def build_engine(
     if prefix_store is not None:
         store = prefix_store
     elif sparse_k:
-        # ponytail: no prefix cache under sparse until the host-tier publish path
-        # lands. _sparse_finalize demotes pages out of req.blocks, so the real
-        # PrefixStore.insert(req.blocks[:N]) would get an empty list and fail every
-        # >=64-token request (5f's CHANGE-REQ).
+        # Sparse cannot use the block-retaining PrefixStore (finalize frees the
+        # device pages); sharing is the tracker's SparsePrefixCache, attached now.
         store = NoPrefixStore()
     else:
         store = PrefixStore(kv_pool, **kw)
@@ -2371,6 +2443,10 @@ def build_engine(
         # Same fingerprint as the SSD prefix tier: a context computed under other
         # weights or a different kv_fp8 flag must not be bootable.
         boot_store = KvBootStore(kv_store, ssd_fingerprint or _weight_fingerprint(cfg, kv_fp8))
+    if sparse_tracker is not None and sparse_tracker.sharing_enabled:
+        from .sparse_engine import SparsePrefixCache
+
+        sparse_tracker.prefix = SparsePrefixCache(kv_pool.cold, state_pool)
     return Engine(
         model,
         backend,
