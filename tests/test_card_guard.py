@@ -35,6 +35,26 @@ def test_refuses_an_unclassified_card(tmp_path, monkeypatch):
         card_guard()
 
 
+def test_dict_owner_entry_is_classified_by_owner(tmp_path, monkeypatch):
+    """The live ledger stores each card as {"owner", "note"}, not a free-form
+    string. The dict form must not crash and must classify by owner: a tileRL
+    owner passes, another/unknown owner refuses (unclassified, never ours by
+    default); the dict's note is not a lend record."""
+    monkeypatch.setenv(
+        "CARD_ASSIGNMENT_JSON",
+        _assignment(tmp_path, {"2": {"owner": "tileRL", "note": "all 8 ours 2026-09-11"}}),
+    )
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    card_guard()
+
+    monkeypatch.setenv(
+        "CARD_ASSIGNMENT_JSON",
+        _assignment(tmp_path, {"2": {"owner": "aupai", "note": "idle is not free"}}),
+    )
+    with pytest.raises(SystemExit, match="unclassified"):
+        card_guard()
+
+
 def test_allows_our_own_card(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "CARD_ASSIGNMENT_JSON",
