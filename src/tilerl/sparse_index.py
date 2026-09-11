@@ -1,16 +1,25 @@
-"""Learned KV indexer for sparse attention (DeepSeek V3.2 lightning indexer).
+"""DeepSeek-V4.1 CSA2 learned page indexer (sparse-KV unit D, CPU f32 twin).
 
-The indexer scores context pages for selection. Per full-attention layer it
-holds one shared fp8 index key per token (128 B, shared by the index query
-heads); the query side has a few heads. Token logits are the summed-head dot
-of index query against the shared key; the selector max-pools token logits
-over each page (``kv_cache.BLOCK_TOKENS``) and takes the top pages.
+The unit of indexing is the PAGE, not the token (ckl ruling 2026-09-11):
 
-Shapes use the contract shared with the bounds scorer: page scores are
-``[rows, L, q, pages]`` f32 (``L`` = full-attention layers only), so a single
-selector consumes either scorer. This module is f32 torch math — the CPU twin
-of the registry op; the sm90 indexer is a later unit. Nothing here touches the
-paged pool yet.
+- an **indexer-K** is projected per page from that page's K — one key per
+  16-token block per source layer (V4.1 projects from an m-token entry);
+- an **indexer-Q** is projected from the layer input H with ``ih`` heads of
+  dim ``di`` (a distinct projection from the attention Q);
+- a page's score is ``sum_h ReLU(q_h . k_h) / sqrt(di)``;
+- selection is computed at a few INDEX SOURCE layers and reused by the layers
+  in each group, so one hot set serves a group and a cold-page fetch is paid
+  once;
+- the local window (last ``n_win`` tokens, ``n_win_pages`` pages) is attended
+  regardless, so its pages are EXCLUDED from the indexer scores and KL target;
+- one softmax runs over [selected pages ; window] in sparse attention.
+
+This module is the scorer only: pure f32 torch math (the CPU twin of the
+registry op). It emits ``[rows, L_src, pages]`` — exactly ``select_pages``'s
+input — and the per-query-per-page attention mass pooled per page for the
+warm-up KL. Selection, the window union and the sparse softmax live in the
+bounds/selector unit; entry compression, cross-layer KV reuse and the
+hierarchical candidate pool are deferred from V4.1.
 """
 
 from __future__ import annotations
@@ -20,71 +29,138 @@ from torch import Tensor
 
 from .kv_cache import BLOCK_TOKENS
 
-#: The shared per-token index key width (bytes on device: fp8 + one f32 scale).
-INDEX_KEY_DIM = 128
-#: Number of index query heads per layer (V3.2 uses a small head count).
-INDEX_QUERY_HEADS = 4
+#: Index query heads and per-head dim (V4.1-Flash releases 32/128; one H20
+#: holds 4/128 per the sparse-KV design). Kept as module constants for the
+#: derived byte rows; tiny gates use small values.
+INDEX_HEADS = 4
+INDEX_HEAD_DIM = 128
+#: Number of index SOURCE layers over the 16 full-attention layers: one source
+#: per group of four, selection reused by the group's other three.
+INDEX_SOURCE_LAYERS = 4
+#: Local window always attended: 128 tokens = 8 pages.
+WINDOW_TOKENS = 128
+WINDOW_PAGES = WINDOW_TOKENS // BLOCK_TOKENS
 
 
-def index_token_logits(iq: Tensor, ikey: Tensor) -> Tensor:
-    """Per-token index logits: summed-head dot of index queries vs the shared key.
+def index_source_groups(n_full_layers: int,
+                        n_sources: int = INDEX_SOURCE_LAYERS) -> tuple[list[int], list[list[int]]]:
+    """The layer -> source-group map. ``n_sources`` source layers each serve a
+    contiguous group of full-attention layers; source s is the first layer of
+    group s and selection is reused for the rest. Returns ``(source_layer_ids,
+    groups)``.
 
-    ``iq``   [rows, L, q, H, D] — the query-side index heads (one row per query token)
-    ``ikey`` [rows, L, k, D]    — the one shared key per context token
-
-    Returns [rows, L, q, k] f32, scaled by 1/sqrt(D) like an attention score,
-    summed over heads so the selector and the KL target see one mass per token.
+    16 layers / 4 sources -> sources [0,4,8,12], groups [[0,1,2,3],[4,5,6,7],...].
     """
-    d = iq.shape[-1]
-    # No dtype cast: the CPU twin is called with f32 in production and f64 in
-    # gradcheck; a .float() here would silently defeat numerical gradcheck.
-    # [rows,L,q,H,k] -> sum H -> [rows,L,q,k]
-    return torch.einsum("rlqhd,rlkd->rlqk", iq, ikey) * (d ** -0.5)
+    if n_full_layers % n_sources:
+        raise ValueError(
+            f"{n_full_layers} full-attn layers must divide into {n_sources} sources")
+    groups: list[list[int]] = [[] for _ in range(n_sources)]
+    for layer in range(n_full_layers):
+        groups[layer * n_sources // n_full_layers].append(layer)
+    source_layers = [g[0] for g in groups]
+    return source_layers, groups
 
 
-def page_maxpool(token_scores: Tensor, block_tokens: int = BLOCK_TOKENS) -> Tensor:
-    """Max-pool per-token scores into per-page scores.
+def project_page_keys(k_pages: Tensor, ik_weight: Tensor) -> Tensor:
+    """Project indexer-K per page from the page's K (V4.1 ik_weight).
 
-    ``token_scores`` [..., k] -> [..., pages], one page per ``block_tokens``
-    context tokens; a short final page is padded with -inf so it cannot win
-    unless it is the only content. Max, not mean: a page is selectable if ANY
-    token in it is hot, which is the attention bound the selector approximates.
+    ``k_pages``   [rows, L_src, pages, h_attn, d_attn] — one K summary per page
+                    (the mean over the page's tokens; V4.1 uses a learned combine
+                    over its m entries, deferred)
+    ``ik_weight`` [ih, d_attn, di]
+
+    Groups attention heads into the ``ih`` index heads (mean of the group), then
+    projects: returns [rows, L_src, pages, ih, di].
     """
-    *lead, k = token_scores.shape
-    pad = (-k) % block_tokens
+    r, l, p, h, d = k_pages.shape
+    ih = ik_weight.shape[0]
+    if h % ih:
+        raise ValueError(f"{h} attention heads do not divide into {ih} index heads")
+    grouped = k_pages.reshape(r, l, p, ih, h // ih, d).mean(dim=4)  # mean of group
+    # weight is per index head [ih, d_attn, di]; contract only that head's dims
+    return torch.einsum("rlphd,hde->rlphe", grouped, ik_weight)
+
+
+def page_index_scores(iq: Tensor, ik: Tensor) -> Tensor:
+    """The V4.1 page score: sum_h ReLU(q_h . k_h) / sqrt(di).
+
+    ``iq`` [rows, L_src, q, ih, di] — indexer-Q projected from the layer input
+    ``ik`` [rows, L_src, pages, ih, di] — projected page indexer-K
+
+    Returns [rows, L_src, q, pages]. The ReLU is the indexer's gating product;
+    heads are merged inside the op (the selector sees no head axis). The
+    selector-facing form max-pools the query axis in
+    :func:`page_scores_for_selector`.
+    """
+    di = iq.shape[-1]
+    dots = torch.einsum("rlqhd,rlphd->rlqhp", iq, ik) * (di ** -0.5)
+    return torch.relu(dots).sum(dim=3)
+
+
+def page_scores_for_selector(iq: Tensor, ik: Tensor,
+                             n_pages: Tensor, n_win_pages: int = WINDOW_PAGES) -> Tensor:
+    """The exact ``select_pages`` input: [rows, L_src, pages] f32.
+
+    Max over query positions (a page hot for any query is selectable), with the
+    local window's last ``n_win_pages`` and every page >= ``n_pages`` masked to
+    -inf — the window is always attended separately, so it is never indexed.
+    """
+    r, l, q, ih, di = iq.shape
+    pages = ik.shape[2]
+    scores = page_index_scores(iq, ik).amax(dim=2)  # max over queries
+    page_id = torch.arange(pages, device=iq.device)
+    valid = page_id[None, None, :] < n_pages.to(iq.device)[:, None, None]
+    not_window = page_id[None, None, :] < (n_pages.to(iq.device)[:, None, None]
+                                           - n_win_pages)
+    scores = scores.masked_fill(~(valid & not_window), float("-inf"))
+    return scores
+
+
+def page_mass_target(attn_mass: Tensor, n_pages: Tensor,
+                     block_tokens: int = BLOCK_TOKENS,
+                     n_win_pages: int = WINDOW_PAGES) -> Tensor:
+    """The warm-up KL target per source layer: dense attention mass pooled per
+    PAGE, excluding the always-attended window.
+
+    ``attn_mass`` [rows, L_src, q, tokens] — dense softmax mass summed over
+    attention heads, L1-normalised per query. Returns
+    [rows, L_src, q, pages]: the mass of each indexable page (token masses
+    summed within the block; window pages zeroed), re-normalised over the
+    indexable pages so KL is over the selection decision, not the window.
+    """
+    r, l, q, t = attn_mass.shape
+    pad = (-t) % block_tokens
     if pad:
-        token_scores = torch.cat(
-            [token_scores, token_scores.new_full((*lead, pad), float("-inf"))], dim=-1)
-    pages = token_scores.shape[-1] // block_tokens
-    return token_scores.reshape(*lead, pages, block_tokens).amax(dim=-1)
+        attn_mass = torch.cat([attn_mass, torch.zeros(r, l, q, pad,
+                                                      device=attn_mass.device)], dim=-1)
+    pages = attn_mass.shape[-1] // block_tokens
+    pooled = attn_mass.reshape(r, l, q, pages, block_tokens).sum(dim=-1)
+    valid = torch.arange(pages, device=attn_mass.device)[None, None, None, :] \
+        < n_pages.to(attn_mass.device)[:, None, None, None]
+    indexable = valid & (torch.arange(pages, device=attn_mass.device)[None, None, None, :]
+                         < (n_pages[:, None, None, None] - n_win_pages))
+    pooled = pooled * indexable
+    return pooled / pooled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
-def index_page_scores(iq: Tensor, ikey: Tensor,
-                      block_tokens: int = BLOCK_TOKENS) -> Tensor:
-    """The scorer contract: token logits -> per-page ``[rows, L, q, pages]`` f32."""
-    return page_maxpool(index_token_logits(iq, ikey), block_tokens)
+def indexer_kl(iq: Tensor, ik: Tensor, target_page_mass: Tensor,
+               n_pages: Tensor, n_win_pages: int = WINDOW_PAGES) -> Tensor:
+    """Mean KL(dense page mass || softmax(indexer page logits)) over queries.
 
-
-def dense_mass_target(attn_scores: Tensor) -> Tensor:
-    """The warm-up KL target: full attention's softmax mass, summed over heads,
-    L1-normalised per query.
-
-    ``attn_scores`` [rows, L, H, q, k] (pre-softmax logits). Returns
-    [rows, L, q, k] — a per-token probability distribution the indexer softmax
-    is fit to. Summing per-head softmax vectors (not logits) is the dense mass
-    the page recall acceptance measures against.
+    Logits and target are both masked to the indexable (non-window) pages, so
+    the softmax the indexer learns is exactly the selection distribution; the
+    target is detached by the caller. Gradients flow into ``iq``/``ik``.
     """
-    mass = torch.softmax(attn_scores.float(), dim=-1).sum(dim=2)  # sum heads
-    return mass / mass.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-
-def indexer_kl(iq: Tensor, ikey: Tensor, target_mass: Tensor) -> Tensor:
-    """Mean KL(target_mass || softmax(index logits)) over queries.
-
-    Target is detached by the caller (it comes from the frozen dense forward);
-    gradients flow only into ``iq``/``ikey``. The cross-entropy of the target
-    distribution under the indexer logits is KL up to target entropy.
-    """
-    logits = index_token_logits(iq, ikey)
+    pages = ik.shape[2]
+    page_id = torch.arange(pages, device=iq.device)
+    upper = n_pages.to(iq.device) - n_win_pages  # first indexable page boundary
+    indexable = (page_id[None, :] < n_pages.to(iq.device)[:, None]) & \
+        (page_id[None, :] < upper[:, None])    # [rows, pages]
+    indexable4 = indexable[:, None, None, :]   # broadcast [rows,1,q,pages]
+    # The SELECTOR masks with true -inf (a masked page is never picked), but the
+    # KL softmax uses a large finite sentinel: log_softmax(-inf) has no finite
+    # numerical derivative, so central-differences gradcheck returns NaN, and the
+    # target puts zero mass there anyway, making ~-1e9 and -inf equivalent.
+    logits = page_index_scores(iq, ik).masked_fill(~indexable4, -1e9)
     logp = torch.log_softmax(logits, dim=-1)
-    return -(target_mass * logp).sum(dim=-1).mean()
+    return -(target_page_mass * logp).sum(dim=-1).mean()
