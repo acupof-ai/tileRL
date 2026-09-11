@@ -459,9 +459,3 @@ class SparseForward:
         sl = nsel * BLOCK_TOKENS + self.own_len_t
         return table, sl
 
-    def chosen(self, bi: int) -> set[int]:
-        """Union of the row's group selections (kept for diagnostics)."""
-        out: set[int] = set()
-        for g in range(self.n_groups):
-            out.update(self._chosen.get((bi, g), ()))
-        return out
