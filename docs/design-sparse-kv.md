@@ -11,28 +11,33 @@ selection through the same engine.
 ## The account on the 27B
 
 16 full-attention layers, 4 KV heads x 256, fp8 KV: `kv_format(256)` gives
-33,280 B per token (32 planes x 4 x 256 + 512 B of f32 scales). Index keys per
-token: 16 layers x (128 B fp8 + 4 B f32 scale) = 2,112 B, 15.8x smaller; one
-key per token per layer, shared by the index query heads as in V3.2. Selection
-is top-k **pages**, k_pages = 128 (2048 tokens) per layer per row: 128 pages x
-2 planes x 4 x 16 x 260 B x 16 layers = 65 MiB. Selecting top-k tokens instead
+33,280 B per token (32 planes x 4 x 256 + 512 B of f32 scales); one page of
+`BLOCK_TOKENS` = 16 is 532,480 B across all layers. Selection is top-k
+**pages**, k_pages = 128 (2048 tokens) plus the 8-page window, computed at 4
+index source layers and shared by each layer's group of 4, so the hot set of a
+row is (128 + 8) pages x 532,480 B = 69.1 MiB. Selecting top-k tokens instead
 would pin between 128 and 2048 pages (up to 1,040 MiB per row), so the unit of
-selection is the page and the hot budget is fixed by k_pages.
-Weights stay 22.759 GiB (served faces), so the smallest card is 32 GB.
+selection is the page and the hot budget is fixed by k_pages. Index keys (the
+learned indexer, V4.1 form): per page, per source layer, 4 index heads x
+`Format(bits=8, scales=((128, f32),))` = 4 x 132 B = 528 B; 4 source layers =
+2,112 B per page = 132 B per token, 33.0 MiB at 256k (16,384 pages). The
+training-free bounds scorer instead holds 4 KiB per token fp16 (1 GiB at
+256k). Weights stay 22.759 GiB (served faces), so the smallest card is 32 GB.
 
-| 256k context | dense fp8 KV on device | sparse: index + hot pages | cold KV (host / SSD) |
-|---|---|---|---|
-| B=1 | 8.125 GiB | 528 MiB + 65 MiB = 0.58 GiB | 8.125 GiB |
-| B=8 | 65.0 GiB (does not fit an H20) | 4.63 GiB | 65.0 GiB |
+| 256k context | dense fp8 KV on device | sparse, learned indexer: keys + hot pages | sparse, bounds scorer | cold KV (host / SSD) |
+|---|---|---|---|---|
+| B=1 | 8.125 GiB | 33 MiB + 69 MiB = 0.10 GiB | 1 GiB + 69 MiB = 1.07 GiB | 8.125 GiB |
+| B=8 | 65.0 GiB (does not fit an H20) | 0.80 GiB | 8.5 GiB | 65.0 GiB |
 
 Derived from `nbytes`; nothing above is measured yet. The dense column is the
 P6 ledger's row (`2026-09-11-p6-long-context-budget-on-one-h20.md`).
 
-Per decode step at 256k, B=1: the indexer reads 528 MiB of keys (0.13 ms at
-4 TB/s) and 4.3 GFLOP (4 index query heads against the one shared key per
-token); the tick's weight read is 22.36 GB (5.6 ms at 4 TB/s), so scoring is
-2% of the tick. Fetching hot pages from the host is 65 MiB per row worst case
-(1.3 ms at 50 GB/s PCIe); that the per-token delta is a few pages is a
+Per decode step at 256k, B=1: the learned indexer reads 33 MiB of keys at the
+4 source layers (0.01 ms at 4 TB/s) and 0.07 GFLOP; the bounds scorer reads
+1 GiB (0.26 ms); the tick's weight read is 22.36 GB (5.6 ms at 4 TB/s), so
+scoring is under 5% of the tick either way. Fetching hot pages from the host
+is 69 MiB per row worst case (1.4 ms at 50 GB/s PCIe), once per group, not per
+layer; that the per-token delta is a few pages is a
 prediction to be measured on the card, not a property of the design. The
 bound is in `kernel_cost` as two more rows, priced by the same rule as every
 other kernel (bytes per HBM direction crossed, PCIe bytes as their own column).
@@ -49,10 +54,22 @@ the top-k_pages block table. Two scorers produce them:
    written once at append time from the K the pool already holds; no weights,
    no training. This is
    what runs the dense checkpoint at 256k on the V100 without changing it.
-2. **Learned index keys (the V3.2 indexer).** One shared 128-B key per token
-   per layer, scored against index query heads, trained as below. Half the
-   bytes of fp16 bounds, better recall at the same k, and the model is trained
-   with the selection it serves.
+2. **Learned indexer, in DeepSeek-V4.1's form (ckl, 2026-09-11).** The unit
+   of indexing is the page, not the token: an indexer-K is projected from each
+   page's K (V4.1 projects it from the m-token entry; `candidate_block_size`
+   8 there, `BLOCK_TOKENS` 16 here), an indexer-Q is projected from the layer
+   input H with `ih` index heads of dim `di`, the score of a page is
+   `sum_h ReLU(q_h . k_h)` and top-k pages follow. Selection is computed at
+   index source layers and reused by the layers after them (V4.1
+   `index_source_layer_ids` every 4-6 layers; here 4 sources over the 16
+   full-attention layers, groups of 4), so one hot set serves a group and the
+   cold-page fetch is paid once per group. The local window is always
+   attended: the last `n_win` = 128 tokens (8 pages) join the selected set and
+   one softmax runs over [selected pages ; window]. Bytes with `ih` 4, `di`
+   128, fp8: 512 B per page per source layer, 4 source layers = 2 KiB per page
+   = 128 B per token, 32 MiB at 256k; scoring reads 32 MiB per step. Deferred
+   from V4.1: learned entry compression (attention over entries instead of
+   tokens), cross-layer KV reuse, the hierarchical 16k candidate pool.
 
 Both keep the same rows, the same tiering and the same `k >= context` gate;
 `serve --scorer bounds|index`. The V100 (sm70, 32 GB, f32 IO, eager decode)
@@ -87,8 +104,8 @@ ends. The union of a chunk's selected sets is fetched once, not per query.
 `memory.plan` adds three owners, priced by `nbytes` like every other row:
 
 ```
-index_keys  device  count = tokens_resident, fmt = Format(bits=8, scales=((128, f32),)), shape [layers, 128]
-kv_hot      device  count = rows x k_pages x full-attn layers, per_kv_block_bytes / planes x 2  (k_pages = 128)
+index_keys  device  count = pages_resident x 4 source layers x 4 heads, fmt = Format(bits=8, scales=((128, f32),)), shape [128]   (learned indexer; bounds scorer: pages x 16 layers x [2, 4, 256] bf16)
+kv_hot      device  count = rows x (k_pages + 8 window) x 4 groups, bytes = per_kv_block_bytes / 4  (a group is 4 of the 16 layers' planes)
 kv_cold     host|ssd count = pages_written - pages_on_device, per_kv_block_bytes
 ```
 
@@ -104,11 +121,13 @@ Converting a dense model is two stages, both through the tape, both through
 `train --recipe`:
 
 1. **Warm-up.** Every weight frozen, dense attention. The indexer's softmax over
-   the context is fit with KL to the dense attention mass summed over heads and
-   L1-normalised per query. Only the indexer's parameters carry gradients, so
-   the tape holds one small op per full-attention layer; the target is computed
-   chunk by chunk from the dense scores the frozen forward already produces.
-   V3.2 reports 2.1B tokens for this stage.
+   pages is fit with KL to the dense attention mass summed over heads and
+   pooled per page, L1-normalised per query. Only the indexer's parameters
+   carry gradients, so the tape holds one small op per source layer; the
+   target is computed chunk by chunk from the dense scores the frozen forward
+   already produces. V3.2 reports 2.1B tokens for this stage; V4.1's report
+   does not state how its indexer learns, so a straight-through softmax on the
+   selection (aupai's CSA2 choice) is the alternative to A/B against KL.
 2. **Sparse fine-tune.** Selection on, every weight trained, the indexer loss
    restricted to the selected set. The backward is the sparse attention
    backward plus the indexer backward, both in TileLang's
@@ -147,7 +166,7 @@ API, `paged_attention`'s signature, the prefix store's read-only rule, and the
 | A. `plan` rows `index_keys`/`kv_hot`/`kv_cold`, `--sparse-k` dry-run, `kernel_cost` indexer rows | 52 | derived == storage bytes on tiny |
 | B. page-bounds scorer + selector, CPU twins, `k >= context` equals dense; then the sm70 cell and the V100 256k bench | cc | `test_sparse_equals_dense_at_full_k`; V100 tokens/s + device bytes table at 128k/256k |
 | C. page `location`, demote/promote of KV blocks on `DramSnapshots`' path | 5f | a demoted page promoted reads back byte-equal; decode tokens equal with and without demotion |
-| D. learned indexer: op, KL warm-up recipe, indexer backward, sparse attention backward | 65 | gradcheck on tiny; warm-up recipe runs one step on tiny |
+| D. learned indexer in V4.1 form (page keys, source layers, window), KL warm-up recipe, indexer backward, sparse attention backward | 65 | gradcheck on tiny; warm-up recipe runs one step on tiny |
 | E. sm90 cell: indexer + selector from `deepseek_v32`, bench rows with `%bound` | after the runbook, cards 0-7 | roofline table in the wins entry |
 
 A-D start now in parallel and need no card; B's V100 half follows its CPU half. Each unit is one PR with a non-author review on goal fit,
