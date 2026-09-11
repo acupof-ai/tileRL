@@ -37,6 +37,31 @@ prediction to be measured on the card, not a property of the design. The
 bound is in `kernel_cost` as two more rows, priced by the same rule as every
 other kernel (bytes per HBM direction crossed, PCIe bytes as their own column).
 
+## Two scorers, one selector
+
+The selector consumes per-page scores `[rows, pages]` per layer and returns
+the top-k_pages block table. Two scorers produce them:
+
+1. **Page bounds, training-free (day 1).** Per page, per layer, per KV head,
+   the elementwise min and max of K over its 16 tokens (Quest). The score is
+   the upper bound `sum(max(q*kmin, q*kmax))`. Bytes: 2 x 4 heads x 256 x 16
+   layers x 2 B = 64 KiB per page in fp16, 4 KiB per token (2 KiB in fp8),
+   written once at append time from the K the pool already holds; no weights,
+   no training. This is
+   what runs the dense checkpoint at 256k on the V100 without changing it.
+2. **Learned index keys (the V3.2 indexer).** One shared 128-B key per token
+   per layer, scored against index query heads, trained as below. Half the
+   bytes of fp16 bounds, better recall at the same k, and the model is trained
+   with the selection it serves.
+
+Both keep the same rows, the same tiering and the same `k >= context` gate;
+`serve --scorer bounds|index`. The V100 (sm70, 32 GB, f32 IO, eager decode)
+is the first card target: weights 22.759 GiB leave ~8 GiB, so dense fp16 KV
+stops at 64k tokens for one row; with bounds selection the device holds
+1 GiB of bounds plus 128 MiB of fp16 hot pages at 256k, and the cold KV sits
+in host RAM (16 GiB per row in fp16) behind PCIe Gen3 (~12 GB/s, so a full
+128 MiB refetch is 11 ms; the delta is what the bench must show).
+
 ## Selection is page-granular
 
 `BLOCK_TOKENS = 16`. The indexer scores tokens; the selector max-pools scores
@@ -120,10 +145,10 @@ API, `paged_attention`'s signature, the prefix store's read-only rule, and the
 | Unit | Owner | Gate |
 |------|-------|------|
 | A. `plan` rows `index_keys`/`kv_hot`/`kv_cold`, `--sparse-k` dry-run, `kernel_cost` indexer rows | 52 | derived == storage bytes on tiny |
-| B. indexer op + page selector, CPU twins, `k >= context` equals dense | cc | `test_sparse_equals_dense_at_full_k` |
+| B. page-bounds scorer + selector, CPU twins, `k >= context` equals dense; then the sm70 cell and the V100 256k bench | cc | `test_sparse_equals_dense_at_full_k`; V100 tokens/s + device bytes table at 128k/256k |
 | C. page `location`, demote/promote of KV blocks on `DramSnapshots`' path | 5f | a demoted page promoted reads back byte-equal; decode tokens equal with and without demotion |
-| D. tape: indexer KL warm-up recipe, indexer backward, sparse attention backward | 65 | gradcheck on tiny; warm-up recipe runs one step on tiny |
+| D. learned indexer: op, KL warm-up recipe, indexer backward, sparse attention backward | 65 | gradcheck on tiny; warm-up recipe runs one step on tiny |
 | E. sm90 cell: indexer + selector from `deepseek_v32`, bench rows with `%bound` | after the runbook, cards 0-7 | roofline table in the wins entry |
 
-A-D need no card. Each unit is one PR with a non-author review on goal fit,
+A-D start now in parallel and need no card; B's V100 half follows its CPU half. Each unit is one PR with a non-author review on goal fit,
 entropy (no second KV mechanism, no field without a consumer) and the 27B path.
