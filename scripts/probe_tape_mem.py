@@ -61,6 +61,7 @@ def main() -> None:
         model = load_hf(cfg, args.source, fuse_projections=False, num_layers=args.layers)
         card_guard()
         model.params = backend.materialize(model.params)
+        model.materialized = True
         trainable = add_lora(model, rank=args.lora_rank)
     else:
         from tilerl.cli import _build_model

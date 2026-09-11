@@ -31,6 +31,7 @@ def main() -> None:
     model = load_hf(cfg, args.source, fuse_projections=False, num_layers=args.layers)
     card_guard()
     model.params = b.materialize(model.params)
+    model.materialized = True
     trainable = add_lora(model, rank=16)
     opt = AdamW(lr=1e-3)
     base = torch.cuda.memory_allocated() / 2**30

@@ -622,6 +622,7 @@ def suite_train(gate, backend, source, full=False):
         if full:
             drop_quantized(mdl)
         mdl.params = backend.materialize(mdl.params)
+        mdl.materialized = True
         if not full:
             trainable = add_lora(mdl, rank=16)
         # A slope in T (peak GB/token decides recompute) and in B (the step is launch-bound, ~491K kernels).

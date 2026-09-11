@@ -368,7 +368,8 @@ if __name__ == "__main__":  # runnable check: the rules, not the plumbing
     _model_mod.add_lora(_one, rank=4)
     _loc = _model_mod.Model(tp_config(_cfg, 2),
                             shard_params(_model_mod.build_random(
-                                _cfg, seed=0, keep_master=True).params, _cfg, 0, 2))
+                                _cfg, seed=0, keep_master=True).params, _cfg, 0, 2),
+                            materialized=True)
     _model_mod.add_lora(_loc, rank=4)
     _n = 0
     for _k, _full in _one.params.items():
