@@ -415,6 +415,72 @@ def dequant_awq(
     return ((q - z) * scales.float()).t().to(torch.bfloat16)
 
 
+# ---------------------------------------------------------------- sparse KV (Quest bounds)
+
+
+def page_bounds(k: torch.Tensor) -> torch.Tensor:
+    """Quest page bounds from one layer's K page stack: elementwise min and max
+    over a page's BLOCK_TOKENS tokens, per KV head.
+
+    ``k`` is the gathered pages for a row/layer ``[pages, Hkv, BLOCK, D]`` (the
+    same layout paged_attention gathers). Returns ``[pages, Hkv, 2, D]``
+    (stacked kmin, kmax) in the input's dtype — fp16 on the cards, f32 on the
+    CPU cell. Written once at append time from the K the pool already holds.
+    """
+    kmin, kmax = k.amin(dim=2), k.amax(dim=2)  # [pages,Hkv,D]
+    return torch.stack((kmin, kmax), dim=2)
+
+
+def page_bound_scores(q: torch.Tensor, bounds: torch.Tensor) -> torch.Tensor:
+    """Quest UPPER bound on attention logit for each page, per KV head:
+    ``sum_d max(q*kmin, q*kmax)``. ``q`` is a row/layer decode query
+    ``[Tq, Hkv, D]`` (already the one index query head group), ``bounds`` is
+    ``[pages, Hkv, 2, D]``. Returns ``[pages, Hkv]``: the score each page can be
+    worth at best, summed over the query positions (Tq=1 on the decode tick).
+    """
+    kmin, kmax = bounds.unbind(dim=2)  # each [pages,Hkv,D]
+    q = q.unsqueeze(0)  # [1,Tq,Hkv,D]
+    # [pages,Tq,Hkv,D] -> [pages,Hkv]
+    return torch.maximum(q * kmin.unsqueeze(1), q * kmax.unsqueeze(1)).sum(dim=(1, 3))
+
+
+def select_pages(
+    block_table: torch.Tensor,
+    n_pages: torch.Tensor,
+    scores: torch.Tensor,
+    k_pages: int,
+) -> torch.Tensor:
+    """Top-``k_pages`` page SELECTION per row per layer, returned in sequence
+    order.
+
+    ``block_table`` ``[B, max_pages]`` long (page ids in sequence order, padded
+    0), ``n_pages`` ``[B]`` the valid page count per row, ``scores``
+    ``[B, layers, max_pages]`` (per-page bound scores; padding ignored). The
+    score determines the SET (the top-k), but the returned ids are sorted back
+    to their ORIGINAL page position: paged_attention names the absolute token
+    position from the block table's order and applies a causal mask, so a
+    score-descended table would mis-position every page. Returns a shorter
+    block table ``[B, layers, min(k_pages, max_pages)]`` — paged_attention
+    reads it as an ordinary page set. With ``k_pages >= n_pages`` the valid set
+    is every page, so the output is the dense table in sequence order.
+    """
+    b, layers, maxp = scores.shape
+    k = min(k_pages, maxp)
+    valid = torch.arange(maxp, device=scores.device).unsqueeze(0) < n_pages.to(
+        scores.device
+    ).unsqueeze(1)
+    valid = valid.unsqueeze(1).expand(b, layers, maxp)
+    neg = torch.zeros_like(scores).masked_fill(~valid, float("-inf"))
+    # Top-k by score chooses the set (stable, deterministic on ties); argsort of
+    # those positions puts them back in sequence order.
+    topk = torch.topk(scores + neg, k, dim=2).indices  # [B,layers,k]
+    topk, _ = torch.sort(topk, dim=2)
+    ids = torch.gather(
+        block_table.unsqueeze(1).expand(b, layers, maxp), 2, topk
+    )
+    return ids.contiguous()
+
+
 # ---------------------------------------------------------------- full attention (training)
 
 
