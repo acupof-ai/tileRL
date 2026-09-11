@@ -17,6 +17,8 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 #: one calibration row per (metric, device name) pair
 BW_METRIC = "hbm_bw_gbs"
 PEAK_METRIC = "bf16_peak_tflops"
+#: Pre-Ampere tensor cores (sm70 V100) have no bf16 MMA path; their peak is fp16.
+F16_PEAK_METRIC = "f16_peak_tflops"
 
 
 def store_path() -> Path:
@@ -59,14 +61,21 @@ def latest_floor(rows: list[dict], metric: str, device_name: str) -> dict | None
 
 def calibration(rows: list[dict], device_name: str) -> dict | None:
     """Both floors for a device, or None when either is missing (then the renderer prints
-    pending-remote rather than dividing by a half-calibration)."""
+    pending-remote rather than dividing by a half-calibration). The tensor peak is
+    bf16 where the arch has it and f16 on pre-Ampere cards (sm70 V100); the roofline
+    only needs one flop ceiling."""
     bw = latest_floor(rows, BW_METRIC, device_name)
     peak = latest_floor(rows, PEAK_METRIC, device_name)
+    peak_metric = PEAK_METRIC
+    if peak is None:
+        peak = latest_floor(rows, F16_PEAK_METRIC, device_name)
+        peak_metric = F16_PEAK_METRIC
     if bw is None or peak is None:
         return None
     return {
         "bw_gbs": float(bw["value"]),
         "peak_tflops": float(peak["value"]),
+        "peak_metric": peak_metric,
     }
 
 
@@ -74,7 +83,7 @@ RESIDENT_METRIC = "device_resident_bytes"
 #: the metrics this section renders — a device appears only if it has at least one of
 #: these, so an unrelated bench row (e.g. a cpu decode_tok_s) never makes an all-pending
 #: section that implies a calibrated card.
-_SECTION_METRICS = (BW_METRIC, PEAK_METRIC, RESIDENT_METRIC)
+_SECTION_METRICS = (BW_METRIC, PEAK_METRIC, F16_PEAK_METRIC, RESIDENT_METRIC)
 
 
 def device_sections(rows: list[dict]) -> list[dict]:
@@ -103,6 +112,7 @@ def device_sections(rows: list[dict]) -> list[dict]:
             "device": name,
             "hbm_bw_gbs": pair(latest_floor(rows, BW_METRIC, name)),
             "bf16_peak_tflops": pair(latest_floor(rows, PEAK_METRIC, name)),
+            "f16_peak_tflops": pair(latest_floor(rows, F16_PEAK_METRIC, name)),
             "residency": None if res is None else {
                 "peak": res["value"], "static": res["shape"]["static"],
                 "transient": res["shape"]["transient"],
@@ -153,7 +163,8 @@ def measure_hbm_bw_gbs(card: int, *, bytes_n: int = 1 << 30, iters: int = 20) ->
 
 
 def measure_bf16_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> float:
-    """Sustained bf16 tensor peak from one large square GEMM: 2*n^3 flops / event sec."""
+    """Sustained bf16 tensor peak from one large square GEMM: 2*n^3 flops / event sec.
+    sm70 (V100) has no bf16 tensor path — use measure_f16_peak_tflops there."""
     import torch
 
     with torch.cuda.device(card):
@@ -163,7 +174,20 @@ def measure_bf16_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> fl
     return (2 * n**3) / secs / 1e12
 
 
-def _row(metric: str, value: float, unit: str, device_name: str, card: int, derivation: str):
+def measure_f16_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> float:
+    """Sustained fp16 tensor peak from one large square GEMM. The floor for pre-Ampere
+    arches whose only tensor-core path is fp16 (sm70 Volta)."""
+    import torch
+
+    with torch.cuda.device(card):
+        a = torch.randn(n, n, dtype=torch.float16, device=f"cuda:{card}")
+        b = torch.randn(n, n, dtype=torch.float16, device=f"cuda:{card}")
+        secs = _event_seconds(lambda: torch.matmul(a, b), iters)
+    return (2 * n**3) / secs / 1e12
+
+
+def _row(metric: str, value: float, unit: str, device_name: str, card: int,
+         derivation: str, target: str = "sm90"):
     from .cli import _benchrec
 
     br = _benchrec()
@@ -171,7 +195,7 @@ def _row(metric: str, value: float, unit: str, device_name: str, card: int, deri
         "metric": metric,
         "value": float(value),
         "unit": unit,
-        "target": "sm90",
+        "target": target,
         "build": "eager",
         "model": "device",
         "shape": {"card": card},
@@ -191,14 +215,35 @@ def _row(metric: str, value: float, unit: str, device_name: str, card: int, deri
     }
 
 
+def _arch(card: int) -> str:
+    """sm-tag of the card (sm70 V100, sm90 H20, ...)."""
+    import torch
+
+    major, minor = torch.cuda.get_device_capability(card)
+    return f"sm{major}{minor}"
+
+
 def calibrate_rows(card: int) -> list[dict]:
-    """Measure both floors on one card and return the two (un-appended) ledger rows.
-    Cuda-only; the CLI refuses before calling this off a card."""
+    """Measure the HBM floor and the tensor peak on one card and return the rows
+    (un-appended). The peak is bf16 on sm80+ and fp16 on sm70 (no bf16 tensor path);
+    cuda-only, the CLI refuses off a card."""
     import torch
 
     device_name = torch.cuda.get_device_name(card)
+    arch = _arch(card)
     bw = measure_hbm_bw_gbs(card)
-    peak = measure_bf16_peak_tflops(card)
+    if arch == "sm70":
+        peak_metric, peak, why = (
+            F16_PEAK_METRIC,
+            measure_f16_peak_tflops(card),
+            "one large fp16 square GEMM (2n^3 flops), CUDA-event median; sm70 has no bf16 tensor path",
+        )
+    else:
+        peak_metric, peak, why = (
+            PEAK_METRIC,
+            measure_bf16_peak_tflops(card),
+            "one large bf16 square GEMM (2n^3 flops), CUDA-event median; floor = this measurement",
+        )
     return [
         _row(
             BW_METRIC,
@@ -207,14 +252,16 @@ def calibrate_rows(card: int) -> list[dict]:
             device_name,
             card,
             "sustained D2D copy >=1 GiB, read+write, CUDA-event median; floor = this measurement",
+            target=arch,
         ),
         _row(
-            PEAK_METRIC,
+            peak_metric,
             peak,
             "TFLOP/s",
             device_name,
             card,
-            "one large bf16 square GEMM (2n^3 flops), CUDA-event median; floor = this measurement",
+            why,
+            target=arch,
         ),
     ]
 

@@ -103,7 +103,8 @@ def test_calibration_returns_both_floors(tmp_path):
     p = _store(tmp_path, [_row(cal.BW_METRIC, 4000.0, "GB/s", H20),
                           _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20)])
     got = cal.calibration(cal.load_rows(p), H20)
-    assert got == {"bw_gbs": 4000.0, "peak_tflops": 989.0}
+    assert got == {"bw_gbs": 4000.0, "peak_tflops": 989.0,
+                   "peak_metric": cal.PEAK_METRIC}
 
 
 def test_calibrate_refuses_off_cuda(monkeypatch):
@@ -294,9 +295,31 @@ def test_device_section_picks_newest_pair_and_residency_per_device(tmp_path):
     assert v100["hbm_bw_gbs"]["value"] == 900.0
     assert v100["residency"] is None
     # JSON shape the CLI pins.
-    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "residency"}
+    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "f16_peak_tflops",
+                        "residency"}
     assert set(h20["hbm_bw_gbs"]) == {"value", "commit", "date"}
     assert set(h20["residency"]) == {"peak", "static", "transient", "commit", "date"}
+
+
+def test_calibration_uses_f16_peak_for_a_bf16_less_card(tmp_path):
+    """A device with an f16 peak but no bf16 peak (sm70 V100) still resolves a roofline
+    floor, through the f16 metric; bf16-present devices keep bf16 and ignore f16."""
+    rows = [
+        _cal_row("v-bw", cal.BW_METRIC, 900.0, V100, 0, "2026-09-11T00:00Z"),
+        _cal_row("v-f16", cal.F16_PEAK_METRIC, 125.0, V100, 0, "2026-09-11T00:00Z"),
+        _cal_row("h-bw", cal.BW_METRIC, 3292.0, H20, 0, "2026-09-11T00:00Z"),
+        _cal_row("h-bf", cal.PEAK_METRIC, 137.0, H20, 0, "2026-09-11T00:00Z"),
+        _cal_row("h-f16", cal.F16_PEAK_METRIC, 140.0, H20, 0, "2026-09-11T01:00Z"),
+    ]
+    p = _store(tmp_path, rows)
+    loaded = cal.load_rows(p)
+    v = cal.calibration(loaded, V100)
+    h = cal.calibration(loaded, H20)
+    assert v == {"bw_gbs": 900.0, "peak_tflops": 125.0, "peak_metric": cal.F16_PEAK_METRIC}
+    assert h["bw_gbs"] == 3292.0 and h["peak_tflops"] == 137.0
+    assert h["peak_metric"] == cal.PEAK_METRIC  # bf16 wins where present
+    by = {s["device"]: s for s in cal.device_sections(loaded)}
+    assert by[V100]["bf16_peak_tflops"] is None and by[V100]["f16_peak_tflops"]["value"] == 125.0
 
 
 def test_device_sections_empty_store_is_all_pending(tmp_path):
