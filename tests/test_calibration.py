@@ -331,7 +331,7 @@ def test_time_row_ms_identity_assert_survives_bound_methods(monkeypatch):
             return None
 
     row = {"name": "down_proj", "_spec": (32, 32), "face": P.nvfp4_dev}  # inn 32 packs
-    assert cal.time_row_ms(row, BoundBackend(), 1, 1) == 1.0
+    assert cal.time_row_ms(row, BoundBackend(), 1) == 1.0
 
 
 def test_time_row_ms_shape_matches_priced_flops_decode_and_prefill(monkeypatch):
@@ -353,16 +353,15 @@ def test_time_row_ms_shape_matches_priced_flops_decode_and_prefill(monkeypatch):
             return None
 
     n, k = 32, 16
-    for name, b, s, m in (("q_proj", 1, 8, 8), ("q_proj", 1, 4096, 4096),
-                          ("q_proj", 8, 1, 8), ("lm_head", 8, 1, 8)):
+    for name, m in (("q_proj", 8), ("q_proj", 4096)):
         row = {"name": name, "_spec": (n, k), "face": P.fp8_dev,
                "flops": 2 * m * n * k}
-        assert cal.time_row_ms(row, Backend(), b, s) == 1.0
+        assert cal.time_row_ms(row, Backend(), m) == 1.0
 
     bad = {"name": "q_proj", "_spec": (n, k), "face": P.fp8_dev,
            "flops": 2 * 4096 * n * k}  # prices a 4096-token prefill launch
     with pytest.raises(AssertionError):
-        cal.time_row_ms(bad, Backend(), 1, 1)  # timed at m=1 — the m=1 mutant
+        cal.time_row_ms(bad, Backend(), 1)  # timed at m=1 — the m=1 mutant
 
 
 def test_kernels_checkpoint_guard_refuses_model_mismatch(tmp_path, monkeypatch):
@@ -410,8 +409,8 @@ def test_bench_kernels_decode_times_one_token_launch(monkeypatch):
 
     seen: list[tuple[str, int, int]] = []
 
-    def fake_time(row, backend, b, s):
-        seen.append((row["name"], b, s))
+    def fake_time(row, backend, m):
+        seen.append((row["name"], m))
         return None  # suppress ms columns; M only needs to be observed
 
     monkeypatch.setattr(cal, "time_row_ms", fake_time)
@@ -439,13 +438,15 @@ def test_bench_kernels_decode_times_one_token_launch(monkeypatch):
     args = argparse.Namespace(model="tiny", batches="1", context=512, prefill=0,
                               checkpoint=None, device_name=None)
     cli.cmd_bench_kernels(args)
-    assert seen and all(s == 1 for _, _, s in seen), seen
+    assert seen and all(m == 1 for _, m in seen), seen
 
     seen.clear()
     args2 = argparse.Namespace(model="tiny", batches=None, context=512, prefill=256,
                                checkpoint=None, device_name=None)
     cli.cmd_bench_kernels(args2)
-    assert seen and all(s == 256 for _, _, s in seen), seen
+    # prefill early-returns after the prefill table, so only prefill linear rows
+    # are timed here (lm_head renders in the non-prefill path) — all at M=256.
+    assert seen and all(m == 256 for _, m in seen), seen
 
 
 
