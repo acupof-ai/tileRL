@@ -30,7 +30,7 @@ Dense rows measured; sparse rows are blanks until the runs below return.
 | machine | mode | ctx | prefill s | ms/tok | decode tok/s | device KV GiB | cold host GiB |
 |---|---|---:|---:|---:|---:|---:|---:|
 | H20 | dense | 131072 | **88.6** | 0.676 | **58.28** | **8.02** | 0 |
-| H20 | sparse k=128 | 131072 | _pending_ | | _pending_ | | 12.0 |
+| H20 | sparse k=128 | 131072 | **108.0** | 0.824 | **19.16** | 0.55 | 0 at finish |
 | V100 | dense (f32) | 32768 | **594.6** | 18.15 | **8.28** | **4.04** | 0 |
 | V100 | sparse k=128 | 32768 | **341.3** | 10.42 | **1.252** | 1.16 | 0 at finish |
 | V100 | sparse k=128 | 131072 | _pending_ (no dense pair — dense cannot fit) | | _pending_ | | 20.0 |
@@ -56,6 +56,20 @@ used was a hot-resident measure, not this demote-all state, so the decode
 prediction missed by ~10x. The remedy is a pinned cross-tick hot set (the hot-pin
 PR 52 is implementing), not the selector; this V100 point re-runs on that head
 when it lands.
+
+**H20 128k sparse loses both phases** (head f0a45485, card 6, 256 prefill ticks,
+KV_DEVICE 0.55 GiB = the 1107-block hot pool in bf16): prefill 107.988 s =
+0.824 ms/tok (**1.22x slower** than dense 0.676), decode 19.160 tok/s =
+52.2 ms/tok (**3.0x slower** than dense 17.2). Dense attention on the H20 runs
+bf16 WGMMA and is not the bottleneck it is on the V100, so selection scoring
+plus the demote-all page fetches cost more than the attention they remove —
+sparse does not pay for itself on a fast interconnect when dense already fits.
+The decode penalty is smaller in relative terms than the V100 (3.0x vs 6.6x),
+consistent with H20's faster host path. The sparse value at 128k on an H20 is
+capacity for contexts past what 8.6 GiB of bf16 KV allows, not latency; at
+128k it fits, so dense is the right choice. This is the same demote-all merge
+state, so the hot-pin PR should recover most of the decode loss but the prefill
+net is likely still negative on sm90 where dense attention is cheap.
 
 ## Sparse launch commands
 
