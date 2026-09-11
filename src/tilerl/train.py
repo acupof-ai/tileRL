@@ -19,7 +19,7 @@ import torch
 
 from .autograd import AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
 from .engine import RequestFailed, SamplingParams
-from .kv_cache import LinearStatePool, NoPrefixStore
+from .kv_cache import BLOCK_TOKENS, LinearStatePool, NoPrefixStore, PagedKvPool
 from .model import save_hf
 
 _MAX_TICKS = 10000
@@ -70,6 +70,37 @@ def _training_kv(model: Any, batch_size: int, seq_len: int, device: Any = None):
     )
     kv.state_slot = torch.arange(batch_size, dtype=torch.long)
     return kv
+
+
+def _capture_kv(model: Any, seq_len: int, backend: Any):
+    """A one-row PAGED pool for the frozen-base capture forward. The dense path
+    materialises a [hq,t,t] score matrix (24 GiB at t=32k on the 27B); the
+    serving prefill path streams key pages through PagedKvPool and keeps only
+    the resident K/V (~2 GiB). Capture is a no-grad single prefill, so the tape
+    does not need dense identity — paged is exact dense-causal attention."""
+    cfg = model.cfg
+    n_pages = (seq_len + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+    pool = PagedKvPool(
+        n_pages, cfg.num_kv_heads, cfg.head_dim,
+        device=backend.device, layer_map=cfg.full_attn_layers,
+        dtype=getattr(backend, "io", torch.bfloat16))
+    blocks = torch.tensor([[pool.alloc_block() for _ in range(n_pages)]],
+                          dtype=torch.long, device=backend.device)
+    return SimpleNamespace(
+        dense=False,
+        kv_pool=pool,
+        block_table=blocks,
+        seq_len=torch.tensor([seq_len], dtype=torch.long, device=backend.device),
+        seq_q_lens=torch.tensor([seq_len], dtype=torch.long, device=backend.device),
+        state_pool=LinearStatePool(
+            num_slots=1,
+            num_linear_layers=cfg.num_linear_layers,
+            num_heads=cfg.linear_num_value_heads,
+            head_dim=cfg.linear_value_head_dim,
+            device=backend.device,
+        ),
+        state_slot=torch.zeros(1, dtype=torch.long),
+    )
 
 
 _NO_GRAD = (
@@ -369,7 +400,7 @@ def indexer_capture(model: Any, ids: torch.Tensor, backend: Any, block: int,
     model.index_capture = captured
     model.index_capture_layers = source_set
     try:
-        kv = _training_kv(model, b, t, device=backend.device)
+        kv = _capture_kv(model, t, backend)
         with torch.no_grad():
             model.forward(ids, torch.arange(t, device=backend.device), kv, backend)
     finally:
