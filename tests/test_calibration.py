@@ -103,7 +103,7 @@ def test_calibration_returns_both_floors(tmp_path):
     p = _store(tmp_path, [_row(cal.BW_METRIC, 4000.0, "GB/s", H20),
                           _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20)])
     got = cal.calibration(cal.load_rows(p), H20)
-    assert got == {"bw_gbs": 4000.0, "peak_tflops": 989.0}
+    assert got == {"bw_gbs": 4000.0, "peak_tflops": 989.0, "pcie_gbs": None}
 
 
 def test_calibrate_refuses_off_cuda(monkeypatch):
@@ -294,7 +294,8 @@ def test_device_section_picks_newest_pair_and_residency_per_device(tmp_path):
     assert v100["hbm_bw_gbs"]["value"] == 900.0
     assert v100["residency"] is None
     # JSON shape the CLI pins.
-    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "residency"}
+    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "pcie_h2d_gbs", "residency"}
+    assert h20["pcie_h2d_gbs"] is None
     assert set(h20["hbm_bw_gbs"]) == {"value", "commit", "date"}
     assert set(h20["residency"]) == {"peak", "static", "transient", "commit", "date"}
 
@@ -302,3 +303,48 @@ def test_device_section_picks_newest_pair_and_residency_per_device(tmp_path):
 def test_device_sections_empty_store_is_all_pending(tmp_path):
     p = _store(tmp_path, [])
     assert cal.device_sections(cal.load_rows(p)) == []
+
+
+def test_calibration_pcie_floor_is_optional_and_named(tmp_path):
+    """The sparse PCIe H2D floor resolves when a pcie_h2d_gbs row exists and stays None
+    otherwise (bw/bf16 still required); same exact device-name keying as the others."""
+    p = _store(tmp_path, [_row(cal.BW_METRIC, 4000.0, "GB/s", H20),
+                          _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20),
+                          _row(cal.PCIE_METRIC, 24.0, "GB/s", H20)])
+    assert cal.calibration(cal.load_rows(p), H20) == {
+        "bw_gbs": 4000.0, "peak_tflops": 989.0, "pcie_gbs": 24.0}
+    # wrong device name does not pick up the pcie floor either
+    assert cal.calibration(cal.load_rows(p), V100) is None
+
+
+def test_kernels_sparse_table_renders_derived_hbm_and_pcie_bounds(tmp_path, monkeypatch, capsys):
+    """--sparse-k renders the selection table: the scorer HBM bound from bw/peak and the
+    cold-fetch PCIe bound from the pcie_h2d floor; both are DERIVED (ms not measured).
+    With no pcie row the PCIe column is pending while HBM still resolves."""
+    import argparse
+
+    from tilerl import cli
+
+    def ns(pcie_name):
+        return argparse.Namespace(
+            model="tiny", batches="1", context=256, prefill=0, checkpoint=None,
+            device_name=pcie_name, sparse_k=4, scorer="index", kv_fp8="")
+
+    # Force the floors (a cached benchrec singleton from another test can shadow a
+    # setenv, so patch the lookup rather than rely on the store path).
+    monkeypatch.setattr(cal, "load_rows", lambda *a, **k: [
+        _row(cal.BW_METRIC, 4000.0, "GB/s", "tiny-cpu-floor"),
+        _row(cal.PEAK_METRIC, 100.0, "TFLOP/s", "tiny-cpu-floor"),
+        _row(cal.PCIE_METRIC, 24.0, "GB/s", "tiny-cpu-floor")])
+    cli.cmd_bench_kernels(ns("tiny-cpu-floor"))
+    out = capsys.readouterr().out
+    assert "sparse_indexer_score" in out and "sparse_cold_fetch" in out
+    assert "sparse selection k_pages=4 scorer=index" in out
+    assert "HBM bound" in out and "PCIe bound" in out
+    # The scorer moves bytes over HBM only (one HBM bound, its PCIe bound pending);
+    # the fetch moves bytes over PCIe only and its bound is derived (not pending).
+    score_l = next(l for l in out.splitlines() if "sparse_indexer_score" in l)
+    fetch_l = next(l for l in out.splitlines() if "sparse_cold_fetch" in l)
+    assert score_l.count("ms") == 1 and "pending" in score_l
+    assert fetch_l.count("ms") == 2 and "pending" not in fetch_l
+    assert "24,576" in fetch_l  # tiny: 12 hot pages x 2048 B bf16 block

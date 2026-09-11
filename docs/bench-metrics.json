@@ -213,6 +213,15 @@
       ],
       "why": "measured bf16 tensor peak from one large GEMM; the roofline flop floor"
     },
+    "pcie_h2d_gbs": {
+      "unit": "GB/s",
+      "direction": "+",
+      "weight": 0.0,
+      "shape": [
+        "card"
+      ],
+      "why": "measured one-way pinned host->device PCIe bandwidth from a >=1GiB copy; the sparse cold-page fetch floor"
+    },
     "device_resident_bytes": {
       "unit": "bytes",
       "direction": "none",
