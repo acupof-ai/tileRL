@@ -408,7 +408,7 @@ STATIC_OWNERS = (
 #: HELD allocations on the host/SSD tier. They enter a {tier}_total but never the
 #: device ``peak = Σ static + transient`` invariant (that equation is device-only;
 #: kv_cold lives in pinned host RAM while its device frame is freed).
-HELD_HOST_OWNERS = frozenset({"kv_cold"})
+HELD_HOST_OWNERS = frozenset({"kv_cold", "kv_cold_ssd"})
 
 
 def static_rows(rows: list[Row]) -> list[Row]:
