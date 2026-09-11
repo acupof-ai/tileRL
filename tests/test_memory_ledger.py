@@ -224,8 +224,15 @@ def test_serve_dry_run_checkpoint_is_header_only_and_needs_dry_run(tmp_path, cap
     assert by["weights"]["measured"] is None and by["weights"]["delta"] is None
     assert "transient" not in by
     # build_engine fits AFTER weights and the state pool (slots+CUDA graph pad; 0 on cpu)
-    # are resident; the header-only fit subtracts the same before fitting.
-    free_after_fixed = 1000000 - weight_row_faces(faces).n - _state_bytes(cfg, 4, f32)
+    # are resident; the header-only fit subtracts the same before fitting. Recompute the
+    # pad from the SAME backend cmd_serve builds (get_backend) — not a RefBackend, which
+    # is always CPU and undercounts the pad slot on a CUDA card (305 vs 306 blocks).
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl.engine import _graph_on
+
+    pad = int(_graph_on(get_backend(), None))
+    free_after_fixed = 1000000 - weight_row_faces(faces).n - _state_bytes(cfg, 4 + pad, f32)
     want_blocks = fit_num_blocks(cfg, free_after_fixed, torch.bfloat16)
     assert by["kv_pool"]["note"] == f"{want_blocks} blocks"
 
