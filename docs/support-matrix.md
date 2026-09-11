@@ -19,7 +19,7 @@ two cells share is only an override when the maker differs:
 | --- | ---: | ---: | ---: | ---: |
 | cpu | 16 | — | — | — |
 | metal | 16 | 3 (`gemm_nn/nt/tn`) | 0 | 13 |
-| sm90 | 48 | 9 | 32 | 7 |
+| sm90 | 50 | 9 | 34 | 7 |
 | sm70 | 26 | 2 (`silu_mul`, `gdn_prep`) | 10 | 14 |
 
 **sm70 reuses the CPU source more than any other accelerated cell**: 14 of its
@@ -54,8 +54,9 @@ figures (4,037 / 1750 / 929 / 911) were already stale by 181 lines before
 > `_register` set reaches each maker.
 
 `kernels.py` defines 26 `make_*` functions. cpu and metal reach 16 each, sm70
-reaches 18, sm90 reaches 12 — sm90 is the cell that replaces the most of the
-shared source, not the one that shares the most.
+reaches 18, sm90 reaches 14 — sm90 is still the cell that replaces the most of
+the shared source, not the one that shares the most. Its newest two reaches are
+the sparse-KV pair (bf16 bounds, f32 scorer), the same makers sm70 runs at f16.
 
 ## Dispatch model
 
