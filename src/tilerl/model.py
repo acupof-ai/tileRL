@@ -421,12 +421,19 @@ class Model:
             _refuse_cp_serving(backend)
             backend.write_tokens(k, v, kv, layer_idx)
             k_plane, v_plane, ks, vs = _kv_operands(backend, kv, layer_idx)
+            sf = getattr(kv, "sparse", None)
+            block_table, seq_len = kv.block_table, kv.seq_len
+            if sf is not None:
+                # packed [selected earlier ; own] table + packed seq_len; the slot-causal
+                # kernel masks it correctly (selected pages are complete earlier pages).
+                block_table, seq_len = sf.attention_args(
+                    kv.kv_pool.plane_of(layer_idx), q)
             out = backend.paged_attention(
                 q,
                 k_plane,
                 v_plane,
-                kv.block_table,
-                kv.seq_len,
+                block_table,
+                seq_len,
                 1.0 / math.sqrt(d),
                 gate=gate,
                 seq_q_lens=getattr(kv, "seq_q_lens", None),

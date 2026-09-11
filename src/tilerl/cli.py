@@ -149,7 +149,8 @@ def _shard(cfg, model, tp: int, backend, model_mod):
 def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
                   blocks=0, max_ctx=0, max_batch=8, ssd_path="", ssd_min_tokens=0,
                   dram_bytes=0, state_bytes=0, kv_fp8="", decode=None,
-                  max_batched_tokens=0, kv_cold_bytes=0, cold_format=""):
+                  max_batched_tokens=0, kv_cold_bytes=0, cold_format="",
+                  sparse_k=0, scorer="bounds"):
     """Serving-size engine on one card. Multi-card serving is one process per card
     under CUDA_VISIBLE_DEVICES (see generate.py for the process-per-device pattern);
     the in-process DataParallelEngine wrapper was deleted 2026-09-09 — its hand-written
@@ -196,6 +197,19 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
         kw["decode"] = decode
     if max_batched_tokens:
         kw["max_num_batched_tokens"] = max_batched_tokens
+    if sparse_k:
+        import torch
+
+        from . import memory as _mem
+
+        kw["sparse_k"] = sparse_k
+        kw["scorer"] = scorer
+        # Cold pages need somewhere to demote: default the pinned host tier to the whole
+        # written context at its per-block bytes if the caller gave no budget.
+        kw["kv_cold_bytes"] = kv_cold_bytes or (
+            (ctx * max_batch) // BLOCK_TOKENS
+            * _mem.per_kv_block_bytes(cfg, torch.bfloat16,
+                                      _kv_fp8(kv_fp8) if kv_fp8 else None))
     return engine_mod.build_engine(cfg, model, backend, **kw)
 
 
@@ -322,8 +336,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            state_bytes=args.state_bytes, kv_fp8=args.kv_fp8,
                            cold_format=getattr(args, "cold_format", ""),
                            decode=tokenizer.decode,
-                           max_batched_tokens=args.max_batched_tokens)
-
+                           max_batched_tokens=args.max_batched_tokens,
+                           sparse_k=getattr(args, "sparse_k", 0),
+                           scorer=getattr(args, "scorer", "bounds"),
+                           kv_cold_bytes=getattr(args, "kv_cold_bytes", 0))
     app = create_app(engine, tokenizer, model_name=cfg.name)
     # --dry-run: build (which materializes and fits) then print the memory ledger and stop,
     # never bind the HTTP port. --json prints the rows for the cost-model tooling. The budget
@@ -331,24 +347,29 @@ def cmd_serve(args: argparse.Namespace) -> None:
     if args.dry_run:
         from .memory import format_memory_table, memory_table, plan
 
-        if getattr(args, "sparse_k", 0):
-            # Sparse ledger is derived-only (peak=None): the engine still builds a dense
-            # pool, so its measured residency cannot reconcile with sparse rows. Price
-            # sparse through --checkpoint (header-only, no engine).
-            sys.exit("error: --sparse-k is a derived ledger: use --dry-run --checkpoint DIR "
-                     "(no engine is built) until a sparse pool exists")
+        if getattr(args, "sparse_k", 0) and getattr(args, "checkpoint", ""):
+            # Header-only --checkpoint prices the derived ledger; a built sparse engine
+            # shows its LIVE rows instead, so the two are mutually exclusive.
+            sys.exit("error: --sparse-k with a built engine prints the live sparse ledger; "
+                     "the derived --checkpoint table is a separate path — drop --checkpoint "
+                     "to run the sparse engine, or drop --sparse-k for the header-only table")
         device_free = _device_free(args, backend)
         kv, sp = engine._kv, engine._states
-        draft_layers = (engine._draft.cfg.num_layers
-                        if getattr(engine._draft, "kv", None) is not None else 0)
-        rows = plan(cfg, model.params, device_free, num_slots=sp.num_slots,
-                    num_blocks=kv.num_blocks, state_dtype=sp.states.dtype,
-                    kv_io=kv.dtype, kv_fp8=kv.kv_fp8, draft_layers=draft_layers)
-        # Same table (incl. transient + totals) /health serves from engine.stats()["memory"].
-        measured = {r["owner"]: r.get("measured") for r in engine.stats()["memory"]
-                    if r.get("measured") is not None and r["kind"] == "allocation"}
-        peak = engine._measured_peak_bytes()
-        table = memory_table(rows, measured, peak)
+        if getattr(engine, "_sparse", None) is not None:
+            # A built sparse engine reports its LIVE rows (bounds/hot/cold from actual
+            # pages); the dense plan() below would price a kv_pool that isn't allocated.
+            table = engine.stats()["memory"]
+        else:
+            draft_layers = (engine._draft.cfg.num_layers
+                            if getattr(engine._draft, "kv", None) is not None else 0)
+            rows = plan(cfg, model.params, device_free, num_slots=sp.num_slots,
+                        num_blocks=kv.num_blocks, state_dtype=sp.states.dtype,
+                        kv_io=kv.dtype, kv_fp8=kv.kv_fp8, draft_layers=draft_layers)
+            # Same table (incl. transient + totals) /health serves from engine.stats()["memory"].
+            measured = {r["owner"]: r.get("measured") for r in engine.stats()["memory"]
+                        if r.get("measured") is not None and r["kind"] == "allocation"}
+            peak = engine._measured_peak_bytes()
+            table = memory_table(rows, measured, peak)
         if args.json:
             print(json.dumps(table, indent=1))
         else:
@@ -2393,6 +2414,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "(43 demotions, 0 promotions). Read /health's dram_promotions "
                               "to see whether the workload crossed it, and dram_budget to "
                               "see the tier is on at all")
+    p_serve.add_argument("--kv-cold-bytes", type=int, default=0,
+                         help="pinned-host budget for sparse-KV cold pages. Auto-sized to the "
+                              "whole context when --sparse-k is set and this is 0")
     p_serve.add_argument("--kv-fp8", choices=["e4m3", "e5m2"], default="",
                          help="store the KV planes in fp8: 65536 -> 33280 bytes per token at the "
                               "27B's 16 planes x 4 heads x 256, a 1.969x saving, the 0.031 being "
