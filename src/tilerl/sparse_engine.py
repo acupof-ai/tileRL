@@ -178,11 +178,21 @@ class SparseForward:
                 table, torch.tensor([len(cand)], device=self.device),
                 scores, self.tracker.k_pages, n_window=r["force_window"])[0, 0]
             chosen = [int(x) - _SENTINEL for x in sel.tolist() if int(x) != 0]
+        r["reserved"].update(chosen)  # protect this tick's picks from pin eviction
         phys = torch.tensor(
             [r["resolve"](p) for p in chosen], dtype=torch.long, device=self.device)
         self._chosen[key] = chosen
         self._phys[key] = phys
         return phys
+
+    def selected_pages(self, bi: int) -> set[int]:
+        """Union of this row's logical pages chosen across ALL source groups this
+        tick, plus the own span. Every group's choice co-resides until finalize, so
+        the cross-tick pin keeps this exact set and demotes only what left it."""
+        pages = set(self.rows[bi]["own"])
+        for g in range(self.n_groups):
+            pages.update(self._chosen.get((bi, g), ()))
+        return pages
 
     def attention_args(self, plane: int, q: Tensor) -> tuple[Tensor, Tensor]:
         """Packed ``[selected ; own]`` table ``[B,W]`` and per-row packed
