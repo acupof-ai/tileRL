@@ -92,8 +92,12 @@ def main():
                     agg[f"{name}_xwin"].append(cap(tgt_x[l][None], pages, False))
                     agg[f"{name}_iwin"].append(
                         cap(tgt_i[l][None], pages + winpages, True))
+            del H, k_pages, target, raw, q_eval, bounds, tgt_x, tgt_i
+            if backend.device.type == "cuda":
+                torch.cuda.empty_cache()
         out[str(ctx)] = {k: round(sum(v) / len(v), 4) for k, v in agg.items()}
         print(ctx, out[str(ctx)], flush=True)
+        backend.device.type == "cuda" and torch.cuda.empty_cache()
     print("RESULT", json.dumps(out))
 
 
