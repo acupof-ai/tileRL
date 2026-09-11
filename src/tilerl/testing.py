@@ -258,3 +258,20 @@ class RefBackend:
                 ob = ob * torch.sigmoid(gate[bi, :sq].float())
             out[bi, :sq] = ob.to(q.dtype)
         return out
+
+    # --- sparse KV (Quest page bounds); the CPU cell is the parity oracle ---
+
+    def page_bounds(self, k):
+        from tilerl_kernels import reference
+
+        return reference.page_bounds(k)
+
+    def page_bound_scores(self, q, bounds):
+        from tilerl_kernels import reference
+
+        return reference.page_bound_scores(q, bounds)
+
+    def select_pages(self, block_table, n_pages, scores, k_pages):
+        from tilerl_kernels import reference
+
+        return reference.select_pages(block_table, n_pages, scores, k_pages)
