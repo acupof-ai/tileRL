@@ -552,6 +552,72 @@ def make_linear_fp4(target: str):
     return linear_fp4
 
 
+# ---------------------------------------------------------------- sparse KV (Quest bounds)
+
+
+def make_page_bounds(target: str, out_dtype: str = "float32"):
+    """Per page/KV-head elementwise min and max of K over its 16 tokens.
+
+    K ``[P, Hkv, 16, D]`` f32 in -> Bounds ``[P, Hkv, 2, D]`` (kmin, kmax).
+    One program per (page, kv head); D lanes parallel, the 16-token min/max a
+    serial scalar reduction. Output dtype is set by the factory (f16 bounds on
+    sm70 to halve the index, f32 on the CPU cell).
+    """
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    def page_bounds(K, threads):
+        P, H, BLK, D = T.const("P, H, BLK, D")
+        K: T.Tensor((P, H, BLK, D), "float32")
+        Bnd = T.empty((P, H, 2, D), out_dtype)
+        with T.Kernel(P, H, threads=threads) as (pp, hh):
+            for d in T.Parallel(D):
+                lo = T.alloc_fragment((1,), "float32")
+                hi = T.alloc_fragment((1,), "float32")
+                lo[0] = K[pp, hh, 0, d]
+                hi[0] = K[pp, hh, 0, d]
+                for t in T.serial(1, T.ceildiv(BLK, 1)):
+                    x = K[pp, hh, t, d]
+                    lo[0] = T.min(lo[0], x)
+                    hi[0] = T.max(hi[0], x)
+                Bnd[pp, hh, 0, d] = T.cast(lo[0], out_dtype)
+                Bnd[pp, hh, 1, d] = T.cast(hi[0], out_dtype)
+        return Bnd
+
+    return page_bounds
+
+
+def make_page_bound_scores(target: str):
+    """Quest upper-bound score ``sum_d max(q*kmin, q*kmax)`` per page per KV head.
+
+    Q ``[Tq, Hkv, D]`` f32, Bounds ``[P, Hkv, 2, D]`` (f16/f32) ->
+    ``[P, Hkv]`` f32, summed over the Tq query positions. One program per
+    (page, kv head); D lanes accumulate, Tq serial.
+    """
+
+    @tilelang.jit(target=target, pass_configs=_pass_configs(target))
+    def page_bound_scores(Q, Bounds, threads):
+        P, H, D = T.const("P, H, D")
+        Tq = T.const("Tq")
+        Q: T.Tensor((Tq, H, D), "float32")
+        Bounds: T.Tensor((P, H, 2, D), "float32")
+        Scores = T.empty((P, H), "float32")
+        with T.Kernel(P, H, threads=threads) as (pp, hh):
+            # Sum over query positions AND d in one serial loop: this is a true
+            # cross-lane reduction, so D cannot be T.Parallel (a scalar fragment
+            # in a Parallel nest does not reduce across lanes in C/sm70). The
+            # (page,head) programs are the parallel axis; the scorer is cheap.
+            acc = T.alloc_fragment((1,), "float32")
+            acc[0] = 0.0
+            for t in T.serial(Tq):
+                for d in T.serial(D):
+                    q = Q[t, hh, d]
+                    acc[0] += T.max(q * Bounds[pp, hh, 0, d], q * Bounds[pp, hh, 1, d])
+            Scores[pp, hh] = acc[0]
+        return Scores
+
+    return page_bound_scores
+
+
 # ---------------------------------------------------------------- paged attention
 
 
