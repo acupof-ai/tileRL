@@ -243,11 +243,12 @@ class _Req:
     hidden_from: int = 0
     draft_pos: int = 0  # highest position whose draft KV belongs to a committed token
     drafts: list[int] = field(default_factory=list)  # next tick's chain, minus its first token
-    #: sparse-KV: demoted pages as ``(logical page index, old host block id)`` kept
-    #: in ascending logical order. ``blocks`` stays the LIVE pages in order; the two
-    #: merge back into the full page sequence on a promotion, so a promoted page is
-    #: spliced at its immutable logical position, not appended.
-    cold_pages: list[tuple[int, int]] = field(default_factory=list)
+    #: sparse-KV demoted pages. Two flows, two shapes: the automatic path stores
+    #: bare logical-page ints (the host blob is keyed (req_id, logical page), so
+    #: no phys is carried); the #500 sparse_retier seam stores
+    #: ``(logical page, phys)`` in ascending order. ``blocks`` holds the LIVE pages
+    #: in sequence order either way; a promotion splices back at logical position.
+    cold_pages: list = field(default_factory=list)
     #: block drafter: the trunk's aux-layer taps over the same positions as ``hidden``,
     #: [1,w,len(target_layers)*H]. Tick-scoped — ``_draft_block`` consumes it and it dies.
     aux: torch.Tensor | None = None
@@ -546,6 +547,18 @@ class Engine:
         return self._kv.num_blocks - (self._pad_block is not None)
 
     @property
+    def _logical_capacity_blocks(self) -> int:
+        """Admission capacity in logical pages. Dense: device blocks. Sparse: the
+        device hot pool plus the pages the host cold tier can hold — older pages
+        demote there, so a request far longer than the device pool still admits.
+        ponytail: sparse+spec (a DENSE draft pool on device) is still rejected in
+        build_engine; when that lands, min this with the draft pool's blocks."""
+        cap = self.usable_blocks
+        if self._sparse is not None:
+            cap += self._kv.cold_capacity_blocks()
+        return cap
+
+    @property
     def usable_slots(self) -> int:
         return self._states.num_slots - (self._pad_slot is not None)
 
@@ -582,7 +595,7 @@ class Engine:
         `submit` refuses that case with a message naming which bound it hit.
         """
         by_total = self.limits.max_total_tokens - prompt_tokens
-        by_pool = BLOCK_TOKENS * self.usable_blocks - prompt_tokens - self._width + 1
+        by_pool = BLOCK_TOKENS * self._logical_capacity_blocks - prompt_tokens - self._width + 1
         return max(0, min(by_total, by_pool))
 
     def submit(self, input_ids: Any, params: SamplingParams | None = None) -> int:
@@ -610,7 +623,7 @@ class Engine:
                     f"({self.limits.max_total_tokens})"
                 )
             # +depth: a verify tick materializes the drafts past the last token
-            if self._kv.blocks_for_tokens(total + self._width - 1) > self.usable_blocks:
+            if self._kv.blocks_for_tokens(total + self._width - 1) > self._logical_capacity_blocks:
                 raise ValueError(f"request ({total} tokens) exceeds KV pool capacity")
         with self._lock:
             rid = self._next_id
@@ -764,12 +777,16 @@ class Engine:
         """Take the slot and the blocks for one waiting request. False = it does not fit yet."""
         matched, hit_blocks, snap = self._match_prefix(req.tokens)
         total_blocks = (len(req.tokens) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
-        needed = total_blocks - len(hit_blocks)
+        sparse = self._sparse is not None
+        # Sparse pre-allocates NOTHING: blocks grow lazily per own span and older
+        # pages demote to host, so admit needs a slot, not the whole context in
+        # device blocks. The hot pool is built to hold k+window+one chunk per slot.
+        needed = 0 if sparse else total_blocks - len(hit_blocks)
         # By count, not by catching `alloc_slot`'s raise: an exception out of `_admit` reaches
         # `step`'s handler, which fails EVERY running request.
         if self._states.free_slots < 1:
             return False
-        if self._kv.free_blocks < needed:
+        if not sparse and self._kv.free_blocks < needed:
             # Guarded: unguarded, a request waiting on a live retain would drop every entry
             # each tick and free nothing, flushing other clients' prefixes for the whole wait.
             if self._kv.free_blocks + self._prefix.reclaimable_blocks() < needed:
@@ -789,7 +806,6 @@ class Engine:
         # decrement refcounts the PrefixStore still holds.
         slot = self._states.alloc_slot()
         blocks: list[int] = []
-        sparse = self._sparse is not None
         # Sparse: blocks grow lazily per own span, never pre-allocate the whole context;
         # the prefix-block reuse is likewise skipped on the first cut (cold pages live in
         # this request's own host tier, not in the shared store).
@@ -1210,10 +1226,10 @@ class Engine:
         live = tr.resident[r.req_id]
         if page in live:
             return live[page]
-        cold = dict(r.cold_pages)
-        if page in cold:
-            new = self._kv.promote_page(cold[page])
-            r.cold_pages = [(i, b) for (i, b) in r.cold_pages if i != page]
+        # Automatic path: cold_pages are bare logical ints, blob keyed (req, page).
+        if page in r.cold_pages:
+            new = self._kv.promote_keyed((r.req_id, page))
+            r.cold_pages.remove(page)
         else:
             new = self._kv.alloc_block()
         live[page] = new
@@ -1247,11 +1263,12 @@ class Engine:
                     for plane in range(pool.num_layers)]).to(torch.float16)
                 tr.set_bounds(rid, p, b)
             for p, phys in list(live.items()):
-                n = pool.demote_page(phys)
-                r.cold_pages.append((p, phys))
+                # Key the host blob by (req, logical page), not the recycled phys:
+                # the frame is freed now and reissued to a later page.
+                pool.demote_page(phys, key=(rid, p))
+                r.cold_pages.append(p)
                 r.blocks.remove(phys)
             live.clear()
-            del n
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0,
                  sf=None) -> BatchKv:
@@ -1798,12 +1815,12 @@ class Engine:
         if req.state_slot is None:
             return  # never admitted; blocks and slot are taken together in `_admit`
         if self._sparse is not None:
-            # Sparse: also drop this request's host-held cold pages (their old device ids
-            # are tier keys, never in req.blocks) and its bounds store.
+            # Sparse: drop this request's host-held cold blobs, keyed (req, logical
+            # page) and never present in req.blocks, plus its bounds store.
             cold = self._kv.cold
-            for _idx, b in req.cold_pages:
-                if cold is not None and b in cold:
-                    cold.forget(b)
+            if cold is not None:
+                for p in req.cold_pages:
+                    cold.forget((req.req_id, p))
             self._sparse.drop(req.req_id)
         for b in req.blocks:
             self._kv.free_block(b)

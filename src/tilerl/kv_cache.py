@@ -116,6 +116,22 @@ class PagedKvPool:
     def attach_cold(self, tier: HostKvPages) -> None:
         self.cold = tier
 
+    def cold_page_nbytes(self) -> int:
+        """Host bytes one demoted page occupies — same sum ``_page_blob`` builds:
+        K+V in the cold dtype across every plane, plus the native fp8 scales."""
+        store = self.cold_dtype or self.kv_fp8 or self.dtype
+        es = torch.empty((), dtype=store).element_size()
+        per = 2 * self.num_kv_heads * BLOCK_TOKENS * self.head_dim * es
+        if self.kv_fp8 is not None:  # f32 k_scale/v_scale over head_dim
+            per += 2 * self.num_kv_heads * BLOCK_TOKENS * 4
+        return self.num_layers * per
+
+    def cold_capacity_blocks(self) -> int:
+        """Whole demoted pages the host cold tier can hold (0 without one)."""
+        if self.cold is None:
+            return 0
+        return self.cold.budget_bytes // self.cold_page_nbytes()
+
     def plane_of(self, layer_idx: int) -> int:
         """Pool plane for a model layer. The fp8 writers need the raw plane, not kv_layer()."""
         return self._plane[layer_idx]
@@ -201,13 +217,18 @@ class PagedKvPool:
             n += host.numel() * host.element_size()
         return blob, n
 
-    def demote_page(self, block: int) -> int:
+    def demote_page(self, block: int, key=None) -> int:
         """Move one page (all planes of one block id, fp8 scales included) to the
         pinned host tier and release its device block back to THIS pool — no
         second pool. Returns the held byte count. A prefix-shared page is
         read-only wherever it lives and must not be demoted; a pool without a
         cold tier cannot demote; the block has to be live. The caller removes the
-        freed id from its block tables (promotion allocates a different block)."""
+        freed id from its block tables (promotion allocates a different block).
+
+        ``key`` names the host blob independently of the physical id: a frame is
+        recycled (LIFO) while an older page's blob is still cold, so keying on
+        the block id collides. The sparse engine keys on (req, logical page);
+        the #500 demote-all/promote-all seam leaves it the physical id."""
         if self.cold is None:
             raise RuntimeError("demote_page: no host page tier attached")
         if self.refcount[block] <= 0:
@@ -215,21 +236,20 @@ class PagedKvPool:
         if self.is_shared(block):
             raise RuntimeError(f"demote_page: block {block} is prefix-shared (refcount>1)")
         blob, n = self._page_blob(block)
-        if not self.cold.hold(block, blob, n):
+        if not self.cold.hold(block if key is None else key, blob, n):
             raise RuntimeError(f"demote_page: host tier dropped block {block}")
         self.free_block(block)  # sole owner -> back to the same pool
         return n
 
-    def promote_page(self, old_block: int) -> int:
-        """Reload a demoted page into a FRESH block allocated from this pool and
-        return its new id. The device block id changes across a round trip; the
-        caller splices the new id into the block table. Raises if the host tier
-        never held it or byte-LRU evicted it (the selector must not name it)."""
+    def promote_keyed(self, key) -> int:
+        """Reload a blob held under ``demote_page(key=...)`` into a FRESH block
+        and return its new id. Raises if it was never held or byte-LRU evicted
+        (the selector must not name it)."""
         if self.cold is None:
-            raise RuntimeError("promote_page: no host page tier attached")
-        blob = self.cold.take(old_block)
+            raise RuntimeError("promote_keyed: no host page tier attached")
+        blob = self.cold.take(key)
         if blob is None:
-            raise RuntimeError(f"promote_page: block {old_block} is not held on the host")
+            raise RuntimeError(f"promote_keyed: {key!r} is not held on the host")
         new = self.alloc_block()
         nb = blob["k"].is_pinned()
         self.k_pool[:, new].copy_(blob["k"], non_blocking=nb)
@@ -243,6 +263,11 @@ class PagedKvPool:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         return new
+
+    def promote_page(self, old_block: int) -> int:
+        """Promote a blob keyed by its old physical block (#500 seam). The device
+        block id changes across a round trip; the caller splices the new id in."""
+        return self.promote_keyed(old_block)
 
     def page_location(self, block: int) -> str:
         """Where the logical page named by an id currently lives. A demoted id is
