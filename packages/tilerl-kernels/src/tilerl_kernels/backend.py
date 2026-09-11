@@ -968,7 +968,8 @@ class Backend:
 
     def paged_attention(
         self, q, k_cache, v_cache, block_table, seq_lens, scale, gate=None, seq_q_lens=None,
-        k_scale=None, v_scale=None
+        k_scale=None, v_scale=None,
+        page_sel=None, n_sel=None, own_lens=None, own_offsets=None, q_start=None,
     ):
         squeeze = q.ndim == 3
         if squeeze:
@@ -984,6 +985,22 @@ class Backend:
         b, s = q.shape[0], q.shape[1]
         if seq_q_lens is None:
             seq_q_lens = torch.full((b,), s, dtype=torch.int32)
+        if page_sel is not None:
+            # Sparse (Quest): the row's effective key sequence is [n_sel selected
+            # complete pages, unmasked] ++ [own span, causal]. Every GPU cell masks
+            # purely by packed slot position against (seq_lens - seq_q_lens), so no
+            # kernel changes: build one concat table per row with the own span packed
+            # right AFTER that row's selected blocks, and set seq_lens = n_sel*16 +
+            # own_lens. Selected slots precede every query (unmasked); own slot j maps
+            # to global own_offsets+j and is visible iff <= q_start+t, which reduces
+            # to the slot test because own_lens-S == q_start-own_offsets. n_sel is the
+            # sole pad marker: a real selected block may be physical id 0, so padding
+            # is excluded only by the seq_lens bound, never by id equality. Eager-only
+            # first cut (per-row .item); the engine forces graph off for sparse.
+            block = int(k_cache.shape[2])
+            block_table, seq_lens = self._sparse_attn_table(
+                block_table, page_sel, n_sel, own_lens, own_offsets, q_start, seq_q_lens,
+                block)
         # the M tile is the GQA group at every chain position: a verify width
         # rides the decode path while g*s still fits it
         chain = s <= _MAX_VERIFY_W and s * (q.shape[2] // k_cache.shape[1]) <= 128
@@ -1075,6 +1092,44 @@ class Backend:
         if gate is not None:
             out = out * torch.sigmoid(self._dev(gate, out.dtype))
         return out
+
+    def _sparse_attn_table(self, own_table, page_sel, n_sel, own_lens,
+                           own_offsets, q_start, seq_q_lens, block: int = 16):
+        """Remap sparse selection to the dense slot-causal cells' (block_table,
+        seq_lens): concat [page_sel selected pages ; own span] per row, with the own
+        span packed right AFTER that row's n_sel (rows differ, so the own start is
+        ragged), and seq_lens = n_sel*block + own_lens. The cells key the mask only
+        on packed slot position, which is why own_offsets/q_start do not enter the
+        kernel — but only while own_len-seq_q == q_start-own_offsets: that identity
+        folds the global causal mask onto the slot test, so guard it rather than
+        silently mis-attend. n_sel is the sole pad marker: a real selected block may
+        be physical id 0, so padding is excluded only by the seq_lens bound, never by
+        id equality. Columns past a row's concat width stay 0 but lie beyond its bound.
+        Eager-only (per-row .item); the engine builds sparse with graph capture off."""
+        dev = page_sel.device
+        ns_list = [int(x) for x in n_sel.tolist()]
+        ol_list = [int(x) for x in own_lens.tolist()]
+        oo_list = [int(x) for x in own_offsets.tolist()]
+        qs_list = [int(x) for x in q_start.tolist()]
+        sq_list = [int(x) for x in seq_q_lens.tolist()]
+        width = max(ns + (ol + block - 1) // block for ns, ol in zip(ns_list, ol_list))
+        cat = torch.zeros((page_sel.shape[0], width), dtype=torch.int32, device=dev)
+        eff = torch.empty((page_sel.shape[0],), dtype=torch.int32, device=dev)
+        for bi, (ns, ol, oo, qs, sq) in enumerate(
+            zip(ns_list, ol_list, oo_list, qs_list, sq_list)
+        ):
+            if ol - sq != qs - oo:
+                raise ValueError(
+                    f"sparse paged_attention row {bi}: own_len-seq_q ({ol-sq}) != "
+                    f"q_start-own_offsets ({qs-oo}); the slot-causal remap needs the "
+                    "own span to start exactly seq_q tokens before the first query")
+            nob = (ol + block - 1) // block
+            if ns:
+                cat[bi, :ns] = page_sel[bi, :ns].to(torch.int32)
+            if nob:
+                cat[bi, ns : ns + nob] = own_table[bi, :nob].to(torch.int32)
+            eff[bi] = ns * block + ol
+        return cat, eff
 
     def _paged_attention_decode(self, q, k_cache, v_cache, block_table, seq_lens, seq_q_lens,
                                 scale, k_scale=None, v_scale=None):
