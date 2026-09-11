@@ -190,10 +190,14 @@ class PagedKvPool:
         return self.refcount[block] > 1
 
     # ----------------------------------------------------- sparse-KV page tiering
-    def _page_blob(self, block: int) -> tuple[dict, int]:
+    def _page_blob(self, block: int, *, non_blocking: bool = False) -> tuple[dict, int]:
         """A host copy of one page across every plane: K, V, and (under fp8) both
         per-token scale planes. Pinned when the pool is on a card so the promote
-        H2D is async-capable; on the CPU cell it is a plain clone."""
+        H2D is async-capable; on the CPU cell it is a plain clone.
+
+        ``non_blocking`` launches the D2H into the pinned host buffers without a
+        per-page sync; a ``demotions()`` batch must synchronize before the device
+        frame or these host buffers are reused/freed."""
         cuda = self.k_pool.is_cuda
         #: K/V narrow on the host copy when a cold dtype is set; the f32 fp8 scale
         #: planes stay their native dtype.
@@ -212,10 +216,16 @@ class PagedKvPool:
             # device cast tensor is allocated.
             host = torch.empty(t.shape, dtype=(cast_dtype or t.dtype),
                                device="cpu", pin_memory=cuda)
-            host.copy_(t)
+            host.copy_(t, non_blocking=(non_blocking and cuda))
             blob[key] = host
             n += host.numel() * host.element_size()
         return blob, n
+
+    def _sync_cold(self) -> None:
+        """One device sync before reused frames/host buffers are touched. This is
+        the spy point the batched-demote gate counts (mock torch.cuda.synchronize)."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
     def demote_page(self, block: int, key=None) -> int:
         """Move one page (all planes of one block id, fp8 scales included) to the
@@ -228,18 +238,58 @@ class PagedKvPool:
         ``key`` names the host blob independently of the physical id: a frame is
         recycled (LIFO) while an older page's blob is still cold, so keying on
         the block id collides. The sparse engine keys on (req, logical page);
-        the #500 demote-all/promote-all seam leaves it the physical id."""
+        the #500 demote-all/promote-all seam leaves it the physical id.
+
+        Inside a ``with pool.demotions()`` batch the D2H copies launch
+        non-blocking into pinned staging and the frame is NOT freed here — it is
+        retained until the batch's single end sync, then held + freed. Reusing a
+        frame before that sync would overwrite data an in-flight D2H reads."""
         if self.cold is None:
             raise RuntimeError("demote_page: no host page tier attached")
         if self.refcount[block] <= 0:
             raise RuntimeError(f"demote_page: block {block} is not live")
         if self.is_shared(block):
             raise RuntimeError(f"demote_page: block {block} is prefix-shared (refcount>1)")
+        store_key = block if key is None else key
+        if getattr(self, "_demote_batching", False):
+            # Launch the D2H non-blocking; the batch owns the frame until sync.
+            blob, n = self._page_blob(block, non_blocking=True)
+            self._pending_demotes.append((block, store_key, blob, n))
+            return n
         blob, n = self._page_blob(block)
-        if not self.cold.hold(block if key is None else key, blob, n):
+        if not self.cold.hold(store_key, blob, n):
             raise RuntimeError(f"demote_page: host tier dropped block {block}")
         self.free_block(block)  # sole owner -> back to the same pool
         return n
+
+    @contextlib.contextmanager
+    def demotions(self):
+        """Batch the D2H copies of a tick's departing pages into ONE device sync
+        before any frame is reused. Each demote_page launches its copies
+        non-blocking into its own pinned blob and the frame stays live (so a
+        recycled allocation cannot overwrite it); at exit we synchronize once,
+        then hold every blob in the cold tier and return all frames to the pool.
+        Off cuda the copies are plain synchronous clones, so this only changes
+        bookkeeping there. The demote half of ``promotions``."""
+        pending = getattr(self, "_pending_demotes", [])
+        held_before = len(pending)
+        self._pending_demotes = pending
+        self._demote_batching = True
+        try:
+            yield self
+        finally:
+            self._demote_batching = False
+            batch = pending[held_before:]
+            if batch:
+                # Wait once for every in-flight non-blocking D2H; only now are the
+                # pinned blobs valid and the frames safe to reuse.
+                self._sync_cold()
+                for block, store_key, blob, n in batch:
+                    if not self.cold.hold(store_key, blob, n):
+                        raise RuntimeError(
+                            f"demotions: host tier dropped block {block}")
+                    self.free_block(block)
+            del pending[held_before:]
 
     def promote_keyed(self, key) -> int:
         """Reload a blob held under ``demote_page(key=...)`` into a FRESH block
