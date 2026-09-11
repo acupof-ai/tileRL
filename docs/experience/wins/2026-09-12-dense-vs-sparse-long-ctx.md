@@ -29,10 +29,10 @@ Dense rows measured; sparse rows are blanks until the runs below return.
 
 | machine | mode | ctx | prefill s | ms/tok | decode tok/s | device KV GiB | cold host GiB |
 |---|---|---:|---:|---:|---:|---:|---:|
-| H20 | dense | 131072 | **88.6** | 0.676 | **58.28** | **8.02** | 0 |
-| H20 | sparse k=128 | 131072 | **108.0** | 0.824 | **19.16** | 0.55 | 0 at finish |
-| V100 | dense (f32) | 32768 | **594.6** | 18.15 | **8.28** | **4.04** | 0 |
-| V100 | sparse k=128 | 32768 | **341.3** | 10.42 | **1.252** | 1.16 | 0 at finish |
+| H20 | dense (graph) | 131072 | **88.6** | 0.676 | **58.28** | **8.02** | 0 |
+| H20 | sparse k=128 (eager) | 131072 | **108.0** | 0.824 | **19.16** | 0.55 | 0 at finish |
+| V100 | dense f32 (eager) | 32768 | **594.6** | 18.15 | **8.28** | **4.04** | 0 |
+| V100 | sparse k=128 (eager) | 32768 | **341.3** | 10.42 | **1.252** | 1.16 | 0 at finish |
 | V100 | sparse k=128 | 131072 | _pending_ (no dense pair — dense cannot fit) | | _pending_ | | 20.0 |
 
 Dense controls: H20 128k prefill 88.621 s / decode 58.279 tok/s (17.2 ms/tok) /
@@ -42,7 +42,9 @@ KV 8612478976 B; V100 32k prefill 594.578 s / decode 8.278 tok/s
 **V100 32k sparse — prefill wins, decode loses** (head 95f69fe7, eager,
 64 prefill ticks, 64 decode tokens skip 16): prefill 341.335 s =
 10.417 ms/tok (**1.74x faster than dense**); decode 1.252 tok/s =
-**798.4 ms/tok, 6.6x SLOWER than dense**; device KV 1.16 GiB (1107-block hot
+**798.4 ms/tok, 6.6x SLOWER than dense** (both arms `--eager`, so unlike the
+H20 rows this is an apples-to-apples eager-vs-eager gap — real, fetch-bound on
+PCIe, not a graph artifact); device KV 1.16 GiB (1107-block hot
 pool = 4 Quest groups × 128 + window + chunk). Cold host reads 0 at finish
 because `_release` forgets the request's cold blobs; the tier cycles pages
 every tick while running. The asymmetry is unit F's merge state:
@@ -57,19 +59,29 @@ prediction missed by ~10x. The remedy is a pinned cross-tick hot set (the hot-pi
 PR 52 is implementing), not the selector; this V100 point re-runs on that head
 when it lands.
 
-**H20 128k sparse loses both phases** (head f0a45485, card 6, 256 prefill ticks,
-KV_DEVICE 0.55 GiB = the 1107-block hot pool in bf16): prefill 107.988 s =
-0.824 ms/tok (**1.22x slower** than dense 0.676), decode 19.160 tok/s =
-52.2 ms/tok (**3.0x slower** than dense 17.2). Dense attention on the H20 runs
-bf16 WGMMA and is not the bottleneck it is on the V100, so selection scoring
-plus the demote-all page fetches cost more than the attention they remove —
-sparse does not pay for itself on a fast interconnect when dense already fits.
-The decode penalty is smaller in relative terms than the V100 (3.0x vs 6.6x),
-consistent with H20's faster host path. The sparse value at 128k on an H20 is
-capacity for contexts past what 8.6 GiB of bf16 KV allows, not latency; at
-128k it fits, so dense is the right choice. This is the same demote-all merge
-state, so the hot-pin PR should recover most of the decode loss but the prefill
-net is likely still negative on sm90 where dense attention is cheap.
+**H20 128k sparse (EAGER) is slower on prefill and decode** (head f0a45485,
+card 6, 256 prefill ticks, KV_DEVICE 0.55 GiB = the 1107-block hot pool in
+bf16): prefill 107.988 s = 0.824 ms/tok (**1.22x slower** than dense 0.676),
+decode 19.160 tok/s = 52.2 ms/tok vs dense 17.2. **The decode rows are not
+apples-to-apples: this sparse tick is the "first cut eager" path (no CUDA
+graph); the dense 17.2 ms row is graph-on. Dense eager on H20 is ~48 ms
+(#523, 11.68 graph vs 47.99 eager), so 52.2 ms sparse-eager ≈ dense-eager —
+the decode gap is the missing graph, not sparsity or page fetches.** Mark the
+sparse row eager pending a graph-captured sparse decode. On prefill, dense
+bf16 WGMMA attention is cheap, so selection plus fetch overhead exceeds the
+attention it removes; sparse at 128k on an H20 buys capacity past the 8.6 GiB
+bf16 KV fit, not prefill latency, and at 128k it fits so dense is the choice.
+
+**Hot-pin 32k on H20** (head 5b8df74d, card 6, eager): cross-tick residency
+works — per steady decode tick **promotions = 0** (sum 0), demotions 0.1/tick,
+so a stable selection moves no pages; decode 21.783 tok/s = 45.9 ms/tok. With
+zero fetches the tick is still ~46 ms, which matches dense-eager ~48 ms, not
+dense-graph 11.7 ms: this confirms the decode lever for sm90 is **graph-
+capturing the sparse tick** (fixed-width packed table, selection as device
+ops with no host sync, contiguous bounds), not batching more H2D and not
+incremental page scoring (the Quest bound is ~0.07 GFLOP/tick). The 1.22x
+prefill net is a separate, eager-independent question.
+
 
 ## Sparse launch commands
 
