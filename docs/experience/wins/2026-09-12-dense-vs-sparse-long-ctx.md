@@ -180,3 +180,10 @@ Pre-register the long-context sparse prediction as a sum of a measured flat
 linear term and an attention term capped at the *selected* key count, then run
 it: sparse KV is only interesting if that attention term actually stops scaling
 with history, and a number written before the run is the one that can be missed.
+
+Operational: a chained remote run must pin the git ref it syncs — a chain whose
+`v100.sh` syncs "the worktree" shipped the docs branch (no scorer/group fixes)
+after the worktree switched mid-session, and the 256k run refused at submit
+(pool=339) instead of running. Checkout the pinned sha and verify the fix
+markers are present before the sync, or the chain runs the wrong tree silently.
+
