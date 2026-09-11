@@ -51,6 +51,7 @@ from .kv_cache import (
     BatchKv,
     DramSnapshots,
     HostKvPages,
+    KvBootStore,
     KvTier,
     LinearStatePool,
     NoPrefixStore,
@@ -389,6 +390,7 @@ class Engine:
         decode: Any = None,
         sparse_tracker: Any = None,
         sparse_k: int = 0,
+        boot_store: Any = None,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -402,6 +404,8 @@ class Engine:
         self._sparse = sparse_tracker
         self._sparse_k = sparse_k
         self._prefix = prefix_store
+        #: KvBootStore for cold-start KV (--kv-store); None = no on-disk boot context.
+        self._boot = boot_store
         self.limits = limits
 
         self._decode_graph_on = _graph_on(backend, decode_graph)
@@ -509,6 +513,8 @@ class Engine:
         self._slots_used = 0
         self._prefix_hits = 0
         self._prefix_misses = 0
+        #: cold-start KV boot store: contexts loaded from --kv-store, and load calls.
+        self._boot_hits = 0
         # Matched tokens, not just hit count: a hit that matches 512 of 30826 is a miss wearing a
         # hit's label, and the count alone cannot tell the two apart (2026-09-08, #271's 2.03x).
         self._prefix_hit_tokens = 0
@@ -775,46 +781,68 @@ class Engine:
 
     def _admit(self, req: _Req) -> bool:
         """Take the slot and the blocks for one waiting request. False = it does not fit yet."""
-        matched, hit_blocks, snap = self._match_prefix(req.tokens)
-        total_blocks = (len(req.tokens) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
         sparse = self._sparse is not None
-        # Sparse pre-allocates NOTHING: blocks grow lazily per own span and older
-        # pages demote to host, so admit needs a slot, not the whole context in
-        # device blocks. The hot pool is built to hold k+window+one chunk per slot.
-        needed = 0 if sparse else total_blocks - len(hit_blocks)
-        # By count, not by catching `alloc_slot`'s raise: an exception out of `_admit` reaches
-        # `step`'s handler, which fails EVERY running request.
+        # Slot checked before any block allocation: a bulk boot load allocates all
+        # its blocks up front, so admitting with no free slot would have to roll them back.
         if self._states.free_slots < 1:
             return False
-        if not sparse and self._kv.free_blocks < needed:
+        total_blocks = (len(req.tokens) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+        matched, hit_blocks, snap = self._match_prefix(req.tokens)
+        boot_len = 0
+        # A bulk boot allocates EVERY context block against the device pool up
+        # front; the sparse hot pool holds only k+window+chunk per slot and grows
+        # pages lazily, so that combination is refused at build time and the boot
+        # lookup is skipped here for a sparse build as well.
+        if not sparse and self._boot is not None:
+            boot_len = (len(req.tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
+            if boot_len == 0 or not self._boot.exists(req.tokens[:boot_len]):
+                boot_len = 0
+        # Sparse pre-allocates NOTHING: needed 0. A boot hit needs the whole
+        # request; a prefix hit only the residual past the store's blocks.
+        # By count, not by catching `alloc_slot`'s raise: an exception out of
+        # `_admit` reaches `step`'s handler, which fails EVERY running request.
+        needed = 0 if sparse else (
+            total_blocks if boot_len else total_blocks - len(hit_blocks))
+        if self._kv.free_blocks < needed:
             # Guarded: unguarded, a request waiting on a live retain would drop every entry
             # each tick and free nothing, flushing other clients' prefixes for the whole wait.
             if self._kv.free_blocks + self._prefix.reclaimable_blocks() < needed:
                 return False
             self._prefix.evict_until_free(needed)
-            # Re-matched: eviction may have dropped the entry this hit came from.
-            matched, hit_blocks, snap = self._match_prefix(req.tokens)
-            needed = total_blocks - len(hit_blocks)
+            if not boot_len:
+                # Re-matched: eviction may have dropped the entry this hit came from.
+                matched, hit_blocks, snap = self._match_prefix(req.tokens)
+                needed = total_blocks - len(hit_blocks)
             if self._kv.free_blocks < needed:
                 return False
+        boot_state: Any = None
+        boot_loaded = False
+        if boot_len:
+            loaded = self._boot.boot(req.tokens[:boot_len], self._kv)
+            if loaded is None:
+                return False  # corrupt/vanished between exists() and load: admit as miss next tick
+            hit_blocks, boot_state = loaded["blocks"], loaded["state"]
+            matched, boot_loaded = loaded["length"], True
         if matched:
-            self._prefix_hits += 1
-            self._prefix_hit_tokens += matched
+            if boot_loaded:
+                self._boot_hits += 1
+            else:
+                self._prefix_hits += 1
+                self._prefix_hit_tokens += matched
         else:
             self._prefix_misses += 1
-        # Slot first, `blocks` empty: seeding it with hit_blocks made an alloc_slot() failure
-        # decrement refcounts the PrefixStore still holds.
         slot = self._states.alloc_slot()
-        blocks: list[int] = []
-        # Sparse: blocks grow lazily per own span, never pre-allocate the whole context;
-        # the prefix-block reuse is likewise skipped on the first cut (cold pages live in
-        # this request's own host tier, not in the shared store).
-        alloc_blocks = 0 if sparse else total_blocks
+        # Sparse: blocks grow lazily per own span, never pre-allocate the whole
+        # context; prefix-block reuse is likewise skipped (cold pages live in this
+        # request's own host tier, not in the shared store).
+        blocks: list[int] = [] if sparse else (list(hit_blocks) if boot_loaded else [])
         try:
-            for b in hit_blocks:
-                self._kv.retain(b)  # adopt the store's blocks
-                blocks.append(b)
-            while len(blocks) < alloc_blocks:
+            if not sparse and not boot_loaded:
+                for b in hit_blocks:
+                    self._kv.retain(b)  # adopt the store's blocks
+                    blocks.append(b)
+            target = 0 if sparse else total_blocks
+            while len(blocks) < target:
                 blocks.append(self._kv.alloc_block())
         except Exception:
             for b in blocks:
@@ -825,16 +853,27 @@ class Engine:
         req.state_slot = slot
         req.seq_len = matched  # materialized length (adopted prefix; 0 on a miss)
         req.prefill_from = matched
-        req.own_blocks = (alloc_blocks - matched // BLOCK_TOKENS) if not sparse else 0
+        if sparse:
+            req.own_blocks = 0
+        else:
+            # A boot load is all own blocks; a prefix hit's blocks belong to the store.
+            req.own_blocks = total_blocks if boot_loaded else total_blocks - matched // BLOCK_TOKENS
         self._blocks_used += req.own_blocks
         self._slots_used += 1
         if sparse:
             self._sparse.attach(req.req_id)
         if matched and not sparse:
-            snap_states, snap_windows = snap
-            self._states.states[slot].copy_(snap_states)
-            if snap_windows is not None:
-                self._states.window_restore(slot, snap_windows)
+            if boot_loaded:
+                self._states.states[slot].copy_(
+                    boot_state["states"].to(self._states.states.device))
+                if boot_state["window"] is not None:
+                    self._states.window_restore(slot, boot_state["window"])
+                self._states.win_parity[slot] = boot_state["parity"]
+            elif snap is not None:
+                snap_states, snap_windows = snap
+                self._states.states[slot].copy_(snap_states)
+                if snap_windows is not None:
+                    self._states.window_restore(slot, snap_windows)
         return True
 
     def _build_plan(self) -> tuple[list[_Req], list[_Req], list[int]]:
@@ -999,6 +1038,8 @@ class Engine:
                 **(self._kv.cold.stats()
                    if getattr(self._kv, "cold", None) is not None else {}),
                 "prefix_demoted": store.get("demoted", 0),
+                # cold-start KV boots from --kv-store (not a prefix-cache hit)
+                "boot_hits": self._boot_hits,
                 "prefill_forwards": self._prefill_forwards,
                 "decode_forwards": self._decode_forwards,
                 "mixed_forwards": self._mixed_forwards,
@@ -1114,6 +1155,15 @@ class Engine:
                          "note": f"{pages} demoted pages",
                          "measured": cold.bytes_held,
                          "delta": expected - cold.bytes_held})
+        # The cold-start boot store on disk: its derived == measured bytes (one
+        # kv_cold(ssd) allocation per saved entry), so the plan and the filesystem agree.
+        if self._boot is not None:
+            ssd_bytes = self._boot.bytes_total()
+            if ssd_bytes:
+                rows.append({"tier": "ssd", "owner": "kv_cold", "kind": "allocation",
+                             "derived": ssd_bytes,
+                             "note": f"{self._boot.entries()} saved boot entries",
+                             "measured": ssd_bytes, "delta": 0})
         return rows
 
     def sparse_retier(self, keep: frozenset[int]) -> tuple[int, int]:
@@ -1789,6 +1839,25 @@ class Engine:
             if tok != raw:  # a forced end-think token: the rest of the chain is stale
                 return
 
+    def save_boot(self, req: _Req) -> int:
+        """Persist this request's whole block-aligned context and its recurrent snapshot to
+        the --kv-store, so a later cold start boots from it instead of prefilling. Returns
+        bytes written. Raises if the engine has no kv_store or the row is not block-aligned
+        at the prefill/decode boundary."""
+        if self._boot is None:
+            raise RuntimeError("save_boot: engine built without --kv-store")
+        n = (req.seq_len // BLOCK_TOKENS) * BLOCK_TOKENS
+        if n == 0:
+            raise RuntimeError("save_boot: nothing block-aligned to save yet")
+        blocks = req.blocks[: n // BLOCK_TOKENS]
+        state = {
+            "states": self._states.states[req.state_slot].clone().cpu(),
+            "window": (None if self._states.conv_windows is None
+                       else self._states.window_snapshot(req.state_slot)),
+            "parity": int(self._states.win_parity[req.state_slot]),
+        }
+        return self._boot.save(req.tokens[:n], self._kv, blocks, state)
+
     def _publish_prefix(self, req: _Req, length: int, spill: bool = True) -> bool:
         """Hand tokens[:length], its blocks and the linear-state snapshot at that
         boundary to the store; the store owns and evicts all three together.
@@ -2063,6 +2132,11 @@ def build_engine(
     #: and native everywhere else — sm70's host has half the room and needs it,
     #: sm90's bf16 already is 16-bit. The fp8 scale planes stay f32 either way.
     cold_format: str = "",
+    #: directory for the cold-start KV boot store ("" = off). A context saved there
+    #: via Engine.save_boot is bulk-reloaded on a later serve whose request prefix
+    #: matches exactly, skipping its prefill. Keyed by the same rolling prefix hash,
+    #: gated by the weight fingerprint and a per-page checksum.
+    kv_store: str = "",
     #: directory for the SSD prefix tier; "" is off. Unlike the DRAM tier this one does
     #: not need concurrent sessions to pay: after a restart HBM is empty, so the first
     #: lookup of every returning conversation reaches back and the disk is what answers.
@@ -2248,16 +2322,27 @@ def build_engine(
         # its parity is checked.
         kw["ssd"] = KvTier(ssd_path, ssd_fingerprint or _weight_fingerprint(cfg, kv_fp8),
                            **({"min_tokens": ssd_min_tokens} if ssd_min_tokens else {}))
+    if sparse_k and kv_store:
+        raise NotImplementedError(
+            "dense bulk boot (--kv-store) with sparse_k>0 is not supported: a boot "
+            "load allocates every context block against the device hot pool, which "
+            "under sparsity holds only k+window+chunk per slot. Save/boot a dense "
+            "build; a sparse-aware boot is a later PR.")
     if prefix_store is not None:
         store = prefix_store
     elif sparse_k:
-        # ponytail: no prefix cache under sparse; upgrade = publish from the host tier
-        # before demotion. _sparse_finalize demotes pages out of req.blocks, so the real
+        # ponytail: no prefix cache under sparse until the host-tier publish path
+        # lands. _sparse_finalize demotes pages out of req.blocks, so the real
         # PrefixStore.insert(req.blocks[:N]) would get an empty list and fail every
         # >=64-token request (5f's CHANGE-REQ).
         store = NoPrefixStore()
     else:
         store = PrefixStore(kv_pool, **kw)
+    boot_store = None
+    if kv_store:
+        # Same fingerprint as the SSD prefix tier: a context computed under other
+        # weights or a different kv_fp8 flag must not be bootable.
+        boot_store = KvBootStore(kv_store, ssd_fingerprint or _weight_fingerprint(cfg, kv_fp8))
     return Engine(
         model,
         backend,
@@ -2275,4 +2360,5 @@ def build_engine(
         decode=decode,
         sparse_tracker=sparse_tracker,
         sparse_k=sparse_k,
+        boot_store=boot_store,
     )

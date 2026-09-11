@@ -1193,10 +1193,289 @@ class KvTier:
         }
 
 
+def _crc32(data: bytes) -> int:
+    import zlib
+
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+class KvBootStore:
+    """Cold-start KV store on a local filesystem: a fully prefilled context saved
+    once is reloaded into fresh blocks on a later `serve --kv-store DIR` whose
+    request prefix matches, skipping the (2.25 h at 256k on a V100) prefill.
+
+    It is the third source a promoted page can come from — host RAM
+    (:class:`HostKvPages`) and SSD (:class:`KvTier` prefix spill) are the other
+    two — but unlike the prefix spill a boot entry's pages are written for the
+    WHOLE context deliberately, in one fixed-stride file per tensor so a page is
+    one ``pread``. Layout under ``<dir>/<hash>/`` (≤5 files):
+
+      * ``manifest.json`` — tokens, plane/block/token/head shape, dtypes, fp8 flag,
+        and a per-page CRC32 over K+V+scales. A hash collision is rejected by the
+        token list; a flipped page is rejected by its CRC.
+      * ``k.bin`` / ``v.bin`` — all planes' pages, fixed ``page_bytes`` stride,
+        stored in the cold dtype (f16 on sm70).
+      * ``scale.bin`` — fp8 k/v per-token scales (f32); absent off fp8.
+      * ``aux.pt`` — the recurrent GDN snapshot (states + conv window + parity)
+        at the prefix boundary; the attention pages without it run the GDN layers
+        from a zero state over nonzero KV, silently wrong.
+
+    This rung bulk-loads the whole context into HBM at admit, which already skips
+    the prefill — the point. Per-page lazy SSD promote and the eager Quest-bounds
+    load (the selector needs them without recomputing over resident K) are the
+    sparse follow-up.
+    """
+
+    AUX = "aux.pt"
+    MANIFEST = "manifest.json"
+
+    def __init__(self, path: str, fingerprint: str) -> None:
+        import json
+
+        self._json = json
+        self._fingerprint = fingerprint
+        # Own a subdir, like KvTier: never write directly into a caller's directory.
+        self._root = os.path.join(os.fspath(path), "tilerl_kvboot")
+        self._marker = os.path.join(self._root, ".kvboot")
+        if os.path.exists(self._root) and not os.path.exists(self._marker):
+            raise RuntimeError(f"{self._root} exists but is not a KvBootStore dir")
+        os.makedirs(self._root, exist_ok=True)
+        with open(self._marker, "w") as f:
+            f.write(fingerprint)
+
+    # ----------------------------------------------------------------- key / layout
+    def _entry_dir(self, h: int) -> str:
+        return os.path.join(self._root, f"{h & _MASK64:016x}")
+
+    @staticmethod
+    def hash_tokens(tokens: Sequence[int]) -> int:
+        h = 0
+        for t in tokens:
+            h = _rolling_hash(h, int(t))
+        return h
+
+    def exists(self, tokens: Sequence[int]) -> bool:
+        h = self.hash_tokens(tokens)
+        mf = os.path.join(self._entry_dir(h), self.MANIFEST)
+        if not os.path.exists(mf):
+            return False
+        try:
+            m = self._read_manifest(h)
+            return (m["tokens"] == [int(t) for t in tokens]
+                    and m.get("fingerprint") == self._fingerprint)
+        except (OSError, ValueError, KeyError):
+            return False
+
+    def _read_manifest(self, h: int) -> dict:
+        with open(os.path.join(self._entry_dir(h), self.MANIFEST)) as f:
+            return self._json.load(f)
+
+    def bytes_total(self) -> int:
+        """On-disk bytes across every saved entry's K/V/scales/aux (manifest excluded).
+        The ledger's kv_cold(ssd) row is priced against this."""
+        total = 0
+        if not os.path.isdir(self._root):
+            return 0
+        for name in os.listdir(self._root):
+            p = os.path.join(self._root, name)
+            if os.path.isdir(p):
+                total += sum(os.path.getsize(os.path.join(p, f))
+                             for f in os.listdir(p) if f != self.MANIFEST)
+        return total
+
+    def entries(self) -> int:
+        return sum(1 for n in os.listdir(self._root)
+                   if os.path.isdir(os.path.join(self._root, n))) if os.path.isdir(self._root) else 0
+
+    @staticmethod
+    def _dt(name: str):
+        return getattr(torch, name)
+
+    # ------------------------------------------------------------------ save
+    def save(self, tokens: Sequence[int], pool: PagedKvPool, blocks: Sequence[int],
+             state: Any) -> int:
+        """Write one full context (the pages named by ``blocks`` in sequence order) and
+        its recurrent snapshot. Pages are gathered to the host in the pool's cold dtype.
+        Returns bytes written. Atomic: the manifest is written last, so a crash leaves
+        no entry ``exists`` returns True for."""
+        import tempfile
+
+        tokens = [int(t) for t in tokens]
+        h = self.hash_tokens(tokens)
+        d = self._entry_dir(h)
+        os.makedirs(d, exist_ok=True)
+        cold = pool.cold_dtype
+        # Boot save is a deliberate one-time offline write, never on a decode tick:
+        # plain .cpu() is fine (the KvTier pinned path exists for write-through).
+        k = torch.stack([pool.k_pool[:, b] for b in blocks]).cpu()
+        v = torch.stack([pool.v_pool[:, b] for b in blocks]).cpu()
+        if cold is not None:
+            k, v = k.to(cold), v.to(cold)
+        k, v = k.contiguous(), v.contiguous()
+        nblk, nplanes = k.shape[0], k.shape[1]
+
+        def raw(t: torch.Tensor) -> bytes:
+            return t.view(torch.uint8).numpy().tobytes()
+
+        kb, vb = raw(k), raw(v)
+        kstep, vstep = len(kb) // nblk, len(vb) // nblk
+        scale_bytes = b""
+        sstep = 0
+        if pool.k_scale is not None:
+            ks = torch.stack([pool.k_scale[:, b] for b in blocks]).cpu().contiguous()
+            vs = torch.stack([pool.v_scale[:, b] for b in blocks]).cpu().contiguous()
+            ksb, vsb = raw(ks), raw(vs)
+            ssk, ssv = len(ksb) // nblk, len(vsb) // nblk
+            # interleave per page so one page's CRC/checksum covers its K, V, k_scale
+            # AND v_scale contiguously.
+            scale_bytes = b"".join(
+                ksb[i * ssk:(i + 1) * ssk] + vsb[i * ssv:(i + 1) * ssv]
+                for i in range(nblk))
+            sstep = ssk + ssv
+        written = 0
+        tmp = tempfile.mkdtemp(prefix=".kvboot-", dir=d)
+        try:
+            with open(os.path.join(tmp, "k.bin"), "wb") as f:
+                f.write(kb); written += len(kb)
+            with open(os.path.join(tmp, "v.bin"), "wb") as f:
+                f.write(vb); written += len(vb)
+            if scale_bytes:
+                with open(os.path.join(tmp, "scale.bin"), "wb") as f:
+                    f.write(scale_bytes); written += len(scale_bytes)
+            crcs = [
+                _crc32(kb[i * kstep:(i + 1) * kstep]
+                       + vb[i * vstep:(i + 1) * vstep]
+                       + (scale_bytes[i * sstep:(i + 1) * sstep] if sstep else b""))
+                for i in range(nblk)
+            ]
+            if state is not None:
+                torch.save(state, os.path.join(tmp, self.AUX))
+                written += os.path.getsize(os.path.join(tmp, self.AUX))
+            manifest = {
+                "tokens": tokens,
+                "fingerprint": self._fingerprint,
+                "n_blocks": nblk,
+                "n_planes": nplanes,
+                "n_kv_heads": pool.num_kv_heads,
+                "head_dim": pool.head_dim,
+                "block_tokens": BLOCK_TOKENS,
+                "k_dtype": str(k.dtype).replace("torch.", ""),
+                "v_dtype": str(v.dtype).replace("torch.", ""),
+                "kv_fp8": str(pool.kv_fp8).replace("torch.", "") if pool.kv_fp8 else None,
+                "shape": list(k.shape),  # [blocks, planes, heads, tokens, head_dim]
+                "page_kv_bytes": kstep,  # K bytes of one page (V equal)
+                "page_crc32": crcs,
+                "has_state": state is not None,
+            }
+            with open(os.path.join(tmp, self.MANIFEST), "w") as f:
+                self._json.dump(manifest, f)
+            # Move data files first, the manifest last: a crash between leaves a
+            # half-written dir that no `exists` (which reads the manifest) adopts.
+            for fn in sorted(os.listdir(tmp)):
+                if fn != self.MANIFEST:
+                    os.replace(os.path.join(tmp, fn), os.path.join(d, fn))
+            os.replace(os.path.join(tmp, self.MANIFEST),
+                       os.path.join(d, self.MANIFEST))
+        finally:
+            with contextlib.suppress(OSError):
+                os.rmdir(tmp)
+        return written
+
+    # ------------------------------------------------------------------ load
+    def boot(self, tokens: Sequence[int], pool: PagedKvPool) -> dict | None:
+        """Load a matching full context into FRESH device blocks, restoring pages through
+        the same promote widening (cold dtype -> pool dtype). Returns
+        ``{blocks, state, length}`` or None on no-match/hash-mismatch/CRC failure.
+        ``state`` is None when the entry was saved without one; ``length`` is the
+        block-aligned token count. The caller splices ``blocks`` into the request,
+        copies ``state`` into its slot, and sets its materialized length."""
+        tokens = [int(t) for t in tokens]
+        h = self.hash_tokens(tokens)
+        d = self._entry_dir(h)
+        try:
+            mf = self._read_manifest(h)
+        except (OSError, ValueError, KeyError):
+            return None
+        if mf["tokens"] != tokens:
+            return None  # hash collision: different prefix
+        try:
+            nblk = mf["n_blocks"]
+            shape = tuple(mf["shape"])
+
+            def read_raw(name):
+                with open(os.path.join(d, name), "rb") as f:
+                    return f.read()
+
+            kb, vb = read_raw("k.bin"), read_raw("v.bin")
+            kstep = mf["page_kv_bytes"]
+            vstep = len(vb) // nblk
+            sb = read_raw("scale.bin") if mf.get("kv_fp8") else b""
+            sstep = len(sb) // nblk if nblk else 0
+            for i, want in enumerate(mf["page_crc32"]):
+                seg = (kb[i * kstep:(i + 1) * kstep]
+                       + vb[i * vstep:(i + 1) * vstep]
+                       + (sb[i * sstep:(i + 1) * sstep] if sstep else b""))
+                if _crc32(seg) != want:
+                    raise ValueError(f"page {i} checksum mismatch")
+
+            def as_tensor(rawb, shape_, dtype):
+                u = torch.frombuffer(bytearray(rawb), dtype=torch.uint8)
+                return u.view(dtype).reshape(shape_)
+
+            k = as_tensor(kb, shape, self._dt(mf["k_dtype"]))
+            v = as_tensor(vb, shape, self._dt(mf["v_dtype"]))
+            scales = None
+            if sb:
+                nh = mf["n_kv_heads"]
+                npl = mf["n_planes"]
+                # one scale page = [plane, head, token] for k then v, f32
+                per = npl * nh * BLOCK_TOKENS * 4
+                ksf = b"".join(sb[i * sstep:i * sstep + per] for i in range(nblk))
+                vsf = b"".join(sb[i * sstep + per:(i + 1) * sstep] for i in range(nblk))
+                sshape = (nblk, npl, nh, BLOCK_TOKENS)
+                ks = as_tensor(ksf, sshape, torch.float32)
+                vs = as_tensor(vsf, sshape, torch.float32)
+                scales = (ks, vs)
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            raise RuntimeError(f"corrupt or unreadable boot entry {h:016x}: {exc}") from exc
+
+        out_blocks: list[int] = []
+        try:
+            for _ in range(nblk):
+                out_blocks.append(pool.alloc_block())
+            idx = torch.as_tensor(out_blocks, device=pool.device)
+            dev = pool.device
+            nb = pool.k_pool.is_cuda
+            # block-major [B,plane,H,T,D] -> plane-major [plane,B,H,T,D], widening the
+            # narrow cold dtype to the pool dtype via copy_ (same as promote_page).
+            def copy_pages(host, dst, fp8: bool):
+                x = host.permute(1, 0, 2, 3, 4).to(dev, non_blocking=nb)
+                if fp8:
+                    dst[:, idx] = x  # no index_copy_ for fp8 on CPU
+                else:
+                    dst.index_copy_(1, idx, x.to(dst.dtype))
+            copy_pages(k, pool.k_pool, pool.kv_fp8 is not None)
+            copy_pages(v, pool.v_pool, pool.kv_fp8 is not None)
+            if scales is not None:
+                ks, vs = scales
+                pool.k_scale.index_copy_(1, idx, ks.permute(1, 0, 2, 3).to(dev, non_blocking=nb))
+                pool.v_scale.index_copy_(1, idx, vs.permute(1, 0, 2, 3).to(dev, non_blocking=nb))
+        except Exception:
+            for b in out_blocks:
+                pool.free_block(b)
+            raise
+        if pool.k_pool.is_cuda:
+            torch.cuda.synchronize(pool.device)
+        state = None
+        if mf.get("has_state"):
+            state = torch.load(os.path.join(d, self.AUX), map_location="cpu")
+        return {"blocks": out_blocks, "state": state, "length": len(tokens)}
+
+
 @dataclass(frozen=True)
 class PrefixHit:
-    """Matched token count, the store-retained blocks covering ``[0, length)``
-    and the recurrent-state snapshot taken at that boundary."""
+    """Matched token count, the store-retained blocks covering [0, length) and the
+    recurrent-state snapshot taken at that boundary."""
 
     length: int
     blocks: tuple[int, ...]
