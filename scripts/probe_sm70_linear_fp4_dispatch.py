@@ -37,13 +37,16 @@ def main():
     # proven GEMV ladder; this harness feeds f32 scale, which that path's sh-detection
     # treats differently from production and would mis-compare. The block-GEMM path is
     # validated directly against the natural-pack reference.
-    for M in (64, 256):
-        x = (torch.randn(M, K, dtype=torch.float32, device="cuda") * 0.3)
-        y = be.linear_fp4(x, wq_tw, scale, oscale=oscale)
-        ref = x @ wref.t()
-        rel = (y - ref).abs().max().item() / ref.abs().max().item()
-        print(f"M={M}: shape {tuple(y.shape)} max rel {rel:.3e}")
-        assert rel < 5e-2, (M, rel)
+    # Production hands sm70 an f16 scale AND f16 X; check both scale dtypes so the
+    # block-GEMM's f32 Scale ABI (widened in the wrapper) is covered.
+    for scale_in in (scale, scale.half()):
+        for M in (64, 256):
+            x = (torch.randn(M, K, dtype=torch.float32, device="cuda") * 0.3)
+            y = be.linear_fp4(x, wq_tw, scale_in, oscale=oscale)
+            ref = x @ wref.t()
+            rel = (y - ref).abs().max().item() / ref.abs().max().item()
+            print(f"scale={scale_in.dtype} M={M}: shape {tuple(y.shape)} max rel {rel:.3e}")
+            assert rel < 5e-2, (scale_in.dtype, M, rel)
     print("PROBE_OK")
 
 

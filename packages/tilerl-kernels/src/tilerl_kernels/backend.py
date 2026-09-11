@@ -736,7 +736,10 @@ class Backend:
                 bM = min(64, M)
                 Np2 = ((N + 63) // 64) * 64
                 Kp2 = ((K + BK - 1) // BK) * BK
-                wq2, sc2 = _pad2d(wq, Np2, Kp2 // 2), _pad2d(scale, Np2, Kp2 // blk)
+                # The block GEMM's Scale ABI is f32 (the GEMV ladder takes f16);
+                # production materialize hands sm70 an f16 scale, so widen here.
+                scf = scale if scale.dtype == torch.float32 else scale.float()
+                wq2, sc2 = _pad2d(wq, Np2, Kp2 // 2), _pad2d(scf, Np2, Kp2 // blk)
                 osc2 = self._ones(Np2) if oscale is None else self._const_f32(oscale, Np2)
                 xf = x2 if x2.dtype == torch.float16 else x2.to(torch.float16)
                 y2 = self._kernel("linear_fp4_f16_mma")(
