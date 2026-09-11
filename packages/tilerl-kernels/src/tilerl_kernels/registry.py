@@ -174,6 +174,26 @@ for _arch in ("sm100", "sm120"):
     _register("bf16", _arch, {})  # pending-remote slot
 
 
+#: MMA compute dtype a quantized linear issues, by launch M (backend.linear_fp4/
+#: linear_fp8 dispatch). M below the threshold runs on bf16 tensor cores (GEMV, or
+#: mma8 which takes bf16 X and dequants nibbles to bf16x2); at/above it the kernel
+#: issues e4m3 WGMMA (fp4 prefill quantizes X per token first, w4a8). The roofline
+#: ceiling is THIS dtype's measured peak, never the weight face's: an nvfp4 prefill
+#: GEMM is fp8 MMA and cannot be bounded by the bf16 number (133.8% was that error).
+LINEAR_MMA_BANDS: dict[str, tuple[tuple[int, str], ...]] = {
+    "linear_fp4": ((9, "fp8"),),
+    "linear_fp8": ((9, "fp8"),),
+}
+
+
+def linear_mma_dtype(op: str, m: int) -> str:
+    """The MMA dtype ``op`` issues at launch M: ``"fp8"`` (e4m3 WGMMA) or ``"bf16"``."""
+    for threshold, dtype in LINEAR_MMA_BANDS.get(op, ()):  # pragma: no branch
+        if m >= threshold:
+            return dtype
+    return "bf16"
+
+
 def _arch_for(target: str) -> str:
     if target == "c":
         return "cpu"
