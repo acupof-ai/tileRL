@@ -18,6 +18,7 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 BW_METRIC = "hbm_bw_gbs"
 PEAK_METRIC = "bf16_peak_tflops"
 FP8_PEAK_METRIC = "fp8_peak_tflops"
+PCIE_METRIC = "pcie_h2d_gbs"
 
 
 def store_path() -> Path:
@@ -61,17 +62,19 @@ def latest_floor(rows: list[dict], metric: str, device_name: str) -> dict | None
 def calibration(rows: list[dict], device_name: str) -> dict | None:
     """The floors for a device, or None when the required bf16 pair is missing (then
     the renderer prints pending-remote rather than dividing by a half-calibration).
-    The fp8 peak is optional: absent → None, and fp8 GEMM rows render pending rather
-    than borrow the bf16 ceiling (which would read ~200% on a healthy fp8 kernel)."""
+    The fp8 peak and the sparse ``pcie_gbs`` floor are both optional: absent → None,
+    so fp8/pcie columns render pending rather than borrow the bf16 ceiling."""
     bw = latest_floor(rows, BW_METRIC, device_name)
     peak = latest_floor(rows, PEAK_METRIC, device_name)
     if bw is None or peak is None:
         return None
     fp8 = latest_floor(rows, FP8_PEAK_METRIC, device_name)
+    pcie = latest_floor(rows, PCIE_METRIC, device_name)
     return {
         "bw_gbs": float(bw["value"]),
         "peak_tflops": float(peak["value"]),
         "fp8_peak_tflops": None if fp8 is None else float(fp8["value"]),
+        "pcie_gbs": float(pcie["value"]) if pcie else None,
     }
 
 
@@ -79,7 +82,7 @@ RESIDENT_METRIC = "device_resident_bytes"
 #: the metrics this section renders — a device appears only if it has at least one of
 #: these, so an unrelated bench row (e.g. a cpu decode_tok_s) never makes an all-pending
 #: section that implies a calibrated card.
-_SECTION_METRICS = (BW_METRIC, PEAK_METRIC, FP8_PEAK_METRIC, RESIDENT_METRIC)
+_SECTION_METRICS = (BW_METRIC, PEAK_METRIC, FP8_PEAK_METRIC, PCIE_METRIC, RESIDENT_METRIC)
 
 
 def device_sections(rows: list[dict]) -> list[dict]:
@@ -109,6 +112,7 @@ def device_sections(rows: list[dict]) -> list[dict]:
             "hbm_bw_gbs": pair(latest_floor(rows, BW_METRIC, name)),
             "bf16_peak_tflops": pair(latest_floor(rows, PEAK_METRIC, name)),
             "fp8_peak_tflops": pair(latest_floor(rows, FP8_PEAK_METRIC, name)),
+            "pcie_h2d_gbs": pair(latest_floor(rows, PCIE_METRIC, name)),
             "residency": None if res is None else {
                 "peak": res["value"], "static": res["shape"]["static"],
                 "transient": res["shape"]["transient"],
@@ -185,6 +189,20 @@ def measure_hbm_bw_gbs(card: int, *, bytes_n: int = 1 << 30, iters: int = 20) ->
     return (2 * bytes_n) / secs / 1e9
 
 
+def measure_pcie_h2d_gbs(card: int, *, bytes_n: int = 1 << 30, iters: int = 20) -> float:
+    """Sustained ONE-WAY host→device bandwidth over PCIe, from a >=1 GiB PINNED host
+    tensor copied to the device (the sparse cold-page fetch's path: pageable staging is
+    slower, and the fetch uses pinned RAM per #500). Bytes move one way, so divide
+    bytes (not 2*bytes) by the event time."""
+    import torch
+
+    with torch.cuda.device(card):
+        host = torch.empty(bytes_n, dtype=torch.uint8, pin_memory=True)
+        dev = torch.empty(bytes_n, dtype=torch.uint8, device=f"cuda:{card}")
+        secs = _event_seconds(lambda: dev.copy_(host, non_blocking=True), iters)
+    return bytes_n / secs / 1e9
+
+
 def measure_bf16_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> float:
     """Sustained bf16 tensor peak from one large square GEMM: 2*n^3 flops / event sec."""
     import torch
@@ -249,7 +267,7 @@ def _row(metric: str, value: float, unit: str, device_name: str, card: int, deri
 
 
 def calibrate_rows(card: int) -> list[dict]:
-    """Measure both floors on one card and return the two (un-appended) ledger rows.
+    """Measure the floors on one card and return the (un-appended) ledger rows.
     Cuda-only; the CLI refuses before calling this off a card."""
     import torch
 
@@ -257,6 +275,7 @@ def calibrate_rows(card: int) -> list[dict]:
     bw = measure_hbm_bw_gbs(card)
     peak = measure_bf16_peak_tflops(card)
     fp8_peak = measure_fp8_peak_tflops(card)
+    pcie = measure_pcie_h2d_gbs(card)
     return [
         _row(
             BW_METRIC,
@@ -282,6 +301,15 @@ def calibrate_rows(card: int) -> list[dict]:
             card,
             "one large fp8 (e4m3) scaled square GEMM (2n^3 flops) through torch._scaled_mm, "
             "CUDA-event median; the ceiling for fp8 GEMM rows",
+        ),
+        _row(
+            PCIE_METRIC,
+            pcie,
+            "GB/s",
+            device_name,
+            card,
+            "sustained pinned host->device copy >=1 GiB (one-way), CUDA-event median; "
+            "the sparse cold-page PCIe fetch floor",
         ),
     ]
 

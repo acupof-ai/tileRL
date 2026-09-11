@@ -2045,6 +2045,39 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
                         f"decode tick B={b} s={args.context}", b, args.context, 1)
         print(f"{'TICK TOTAL':<26} {'':>5} {'':>22} {'':>7} {tb:>12,} {tf:>10,}")
 
+    k_pages = getattr(args, "sparse_k", 0)
+    if k_pages:
+        # Sparse selection kernels (unit A derived rows): the scorer reads index keys
+        # from HBM; the cold-page fetch rides PCIe. ms is pending until a sparse timing
+        # fixture exists; the bounds are derived here. Rendered per B so the scorer read
+        # scales with rows.
+        import torch
+
+        kv_fp8 = getattr(args, "kv_fp8", None)
+        for b in batches:
+            st = kernel_cost.TickShape(b=b, s=args.context, kv=kv_format(cfg.head_dim),
+                                       weight=nvfp4, faces=faces)
+            srows = kernel_cost.sparse_indexer_rows(
+                cfg, st, k_pages=k_pages,
+                kv_fp8=torch.float8_e4m3fn if kv_fp8 == "e4m3" else None)
+            print(f"# sparse selection k_pages={k_pages} scorer={args.scorer} "
+                  f"B={b}, floor device={device_name}")
+            print(f"{'kernel':<26} {'count':>5} {'shape':>30} "
+                  f"{'HBM bytes':>14} {'HBM bound':>11} {'PCIe bytes':>12} {'PCIe bound':>11}")
+            for r in srows:
+                hbm_b = r["bytes"] * r["count"]
+                pcie_b = r.get("pcie_bytes", 0) * r["count"]
+                hbm_bnd = (cal.bound_seconds(hbm_b, r["flops"] * r["count"],
+                                             floors["bw_gbs"], floors["peak_tflops"]) * 1e3
+                           if floors is not None else None)
+                pcie_gbs = floors.get("pcie_gbs") if floors else None
+                pcie_bnd = (pcie_b / (pcie_gbs * 1e9) * 1e3 if pcie_gbs and pcie_b else None)
+                print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>30} "
+                      f"{hbm_b:>14,} "
+                      f"{(f'{hbm_bnd:8.3f}ms' if hbm_bnd is not None else 'pending'):>11} "
+                      f"{pcie_b:>12,} "
+                      f"{(f'{pcie_bnd:8.3f}ms' if pcie_bnd is not None else 'pending'):>11}")
+
 
 def cmd_bench(args: argparse.Namespace) -> None:
     if getattr(args, "calibrate", False):
@@ -2564,13 +2597,20 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="--kernels: price weights from this checkpoint dir's actual "
                               "nvfp4/fp8 device faces instead of the all-nvfp4 config face")
     p_bench.add_argument("--calibrate", action="store_true",
-                         help="measure this card's HBM bandwidth + bf16 peak and append "
-                              "two rows to the bench ledger (cuda-only)")
+                         help="measure this card's HBM bandwidth, bf16 peak and PCIe H2D "
+                              "bandwidth and append three rows to the bench ledger (cuda-only)")
     p_bench.add_argument("--card", type=int, default=None,
                          help="physical GPU card for --calibrate")
     p_bench.add_argument("--device-name", default=None,
                          help="device name the --kernels floor lookup keys on (default: "
                               "the cuda card; off cuda there is no floor)")
+    p_bench.add_argument("--sparse-k", type=int, default=0, metavar="PAGES",
+                         help="--kernels: also render the sparse-KV selection table with "
+                              "this many indexed pages per row (derived HBM/PCIe bounds)")
+    p_bench.add_argument("--scorer", choices=["index", "bounds"], default="index",
+                         help="sparse scorer for --sparse-k (default index)")
+    p_bench.add_argument("--kv-fp8", default="", choices=["", "e4m3", "e5m2"],
+                         help="--sparse-k: price the cold/hot pages in fp8 KV (e4m3)")
     for v in ("table", "readme", "regress", "questions", "collectors"):
         p_bench.add_argument(f"--{v}", action="store_true",
                              help=f"bench view: {v} from the bench store, no GPU")
