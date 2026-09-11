@@ -103,7 +103,11 @@ def checkpoint_matches_config(cfg: ModelConfig, ckpt_dir: str) -> tuple[bool, st
     cp = Path(ckpt_dir) / "config.json"
     if not cp.exists():
         return False, f"config.json not found at {cp}"
-    hf = json.loads(cp.read_text())
+    hf_all = json.loads(cp.read_text())
+    # Qwen3.5 nests the text model under text_config; flat exports do not. Use the same
+    # resolution load_hf validates against (model.py), or the 27B NVFP4 checkpoint —
+    # which carries the scalars only inside text_config — is refused by its own guard.
+    hf = hf_all.get("text_config", hf_all)
     want = {
         "num_hidden_layers": cfg.num_layers,
         "hidden_size": cfg.hidden_size,

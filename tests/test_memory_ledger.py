@@ -260,6 +260,26 @@ def test_dry_run_refuses_checkpoint_that_does_not_match_model(tmp_path, monkeypa
             ["serve", "--model", "tiny", "--dry-run", "--checkpoint", str(tmp_path)]))
 
 
+def test_checkpoint_guard_reads_nested_text_config(tmp_path):
+    """The 27B NVFP4 checkpoint carries the structural scalars under text_config
+    (num_attention_heads duplicated at top level); a flat-only read refuses the
+    real checkpoint with num_hidden_layers=None. The guard resolves text_config the
+    same way load_hf does. Mutant: read hf directly instead of hf.get('text_config')."""
+    import json
+
+    from tilerl.config import qwen38_27b
+    from tilerl.model import checkpoint_matches_config
+
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "qwen3_5",
+        "num_attention_heads": 24, "num_key_value_heads": 4, "head_dim": 256,
+        "text_config": {
+            "num_hidden_layers": 64, "hidden_size": 5120,
+            "num_attention_heads": 24, "num_key_value_heads": 4, "head_dim": 256}}))
+    ok, reason = checkpoint_matches_config(qwen38_27b(), str(tmp_path))
+    assert ok, reason
+
+
 def test_27b_checkpoint_weights_row_matches_load_hf_resident_exact():
     """Pending-remote: the header-only weights row on the real 27B equals BOTH load_hf's
     resident bytes and its live materialized storage, to the integer cc recorded
