@@ -143,6 +143,15 @@ def page_mass_target(attn_mass: Tensor, n_pages: Tensor,
     return pooled / pooled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
+def _indexable_mask(n_pages: Tensor, pages: int, n_win_pages: int,
+                    device) -> Tensor:
+    """[rows, pages] bool: a valid page strictly before the last ``n_win_pages``
+    (the window). The selector and the KL softmax mask the same set."""
+    n = n_pages.to(device)
+    page_id = torch.arange(pages, device=device)
+    return (page_id[None, :] < n[:, None]) & (page_id[None, :] < n[:, None] - n_win_pages)
+
+
 def indexer_kl(iq: Tensor, ik: Tensor, target_page_mass: Tensor,
                n_pages: Tensor, n_win_pages: int = WINDOW_PAGES) -> Tensor:
     """Mean KL(dense page mass || softmax(indexer page logits)) over queries.
@@ -152,11 +161,7 @@ def indexer_kl(iq: Tensor, ik: Tensor, target_page_mass: Tensor,
     target is detached by the caller. Gradients flow into ``iq``/``ik``.
     """
     pages = ik.shape[2]
-    page_id = torch.arange(pages, device=iq.device)
-    upper = n_pages.to(iq.device) - n_win_pages  # first indexable page boundary
-    indexable = (page_id[None, :] < n_pages.to(iq.device)[:, None]) & \
-        (page_id[None, :] < upper[:, None])    # [rows, pages]
-    indexable4 = indexable[:, None, None, :]   # broadcast [rows,1,q,pages]
+    indexable4 = _indexable_mask(n_pages, pages, n_win_pages, iq.device)[:, None, None, :]
     # The SELECTOR masks with true -inf (a masked page is never picked), but the
     # KL softmax uses a large finite sentinel: log_softmax(-inf) has no finite
     # numerical derivative, so central-differences gradcheck returns NaN, and the
@@ -164,3 +169,75 @@ def indexer_kl(iq: Tensor, ik: Tensor, target_page_mass: Tensor,
     logits = page_index_scores(iq, ik).masked_fill(~indexable4, -1e9)
     logp = torch.log_softmax(logits, dim=-1)
     return -(target_page_mass * logp).sum(dim=-1).mean()
+
+
+def project_indexer_queries(h: Tensor, iq_weight: Tensor) -> Tensor:
+    """Project indexer-Q per query from the layer input H (V4.1 indexer_q):
+    ``h`` [rows, L_src, q, d_hidden], ``iq_weight`` [ih, d_hidden, di] ->
+    [rows, L_src, q, ih, di]. Distinct from the attention-Q projection."""
+    return torch.einsum("rlqd,hde->rlqhe", h, iq_weight)
+
+
+def indexer_warmup_loss(h: Tensor, k_pages: Tensor, iq_weight: Tensor,
+                        ik_weight: Tensor, target_page_mass: Tensor,
+                        n_pages: Tensor, n_win_pages: int = WINDOW_PAGES) -> Tensor:
+    """The warm-up objective as ONE differentiable function of the two indexer
+    projection weights (the frozen base's H and page-K carry no gradient):
+
+        iq = H @ iq_weight ; ik = page-K head-grouped @ ik_weight
+        loss = KL(dense page mass || softmax(indexer page scores))
+
+    Recorded as the single tape op ``indexer_warmup`` whose reverse is
+    :func:`indexer_warmup_bwd`; the warm-up trains these two weights only.
+    """
+    from .autograd import maybe_record
+
+    iq = project_indexer_queries(h, iq_weight)
+    ik = project_page_keys(k_pages, ik_weight)
+    loss = indexer_kl(iq, ik, target_page_mass, n_pages, n_win_pages)
+    maybe_record("indexer_warmup", loss, iq_weight, ik_weight, h=h, k_pages=k_pages,
+                 target_page_mass=target_page_mass, n_pages=n_pages,
+                 n_win_pages=n_win_pages)
+    return loss
+
+
+def indexer_warmup_bwd(grad: Tensor, iq_weight: Tensor, ik_weight: Tensor,
+                       h: Tensor, k_pages: Tensor, target_page_mass: Tensor,
+                       n_pages: Tensor, n_win_pages: int = WINDOW_PAGES
+                       ) -> tuple[Tensor, Tensor]:
+    """Hand-written reverse of :func:`indexer_warmup_loss` (no torch.autograd):
+    softmax-CE delta -> ReLU gate -> the two projection einsums. Returns
+    ``(d iq_weight, d ik_weight)``; H and page-K are frozen and get nothing.
+
+    The forward activations are recomputed from the saved inputs, matching the
+    tape's recompute-instead-of-store convention. ``grad`` is the scalar upstream
+    (ones for a standalone loss); the mean already carries the 1/N factor.
+    """
+    del grad  # scalar mean: upstream is 1
+    r, l, p, ha, da = k_pages.shape
+    ih = ik_weight.shape[0]
+    m = ha // ih
+    if ha % ih:
+        raise ValueError(f"{ha} attention heads do not divide into {ih} index heads")
+    scale = iq_weight.shape[-1] ** -0.5
+
+    iq = project_indexer_queries(h, iq_weight)              # [r,L,q,ih,di]
+    grouped = k_pages.reshape(r, l, p, ih, m, da).mean(4)  # [r,L,p,ih,da]
+    ik = torch.einsum("rlphd,hde->rlphe", grouped, ik_weight)
+    dots = torch.einsum("rlqhe,rlphe->rlqhp", iq, ik) * scale
+    # softmax-CE delta against the SAME -1e9 sentinel and indexable mask as fwd.
+    logits = torch.relu(dots).sum(3)
+    mask = _indexable_mask(n_pages, p, n_win_pages, h.device)
+    probs = torch.softmax(logits.masked_fill(~mask[:, None, None, :], -1e9), dim=-1)
+    n = r * l * iq.shape[2]
+    # probs is already ~0 at masked pages (exp(-1e9) underflows) and the target
+    # is exactly 0 there (page_mass_target), so (probs-target) needs no re-mask.
+    delta = (probs - target_page_mass) / n              # [r,L,q,p]
+    # score = sum_h relu(dots); gate on the pre-ReLU sign.
+    ddots = (delta[:, :, :, None, :] * (dots > 0))         # [r,L,q,ih,p]
+    diq = scale * torch.einsum("rlqhp,rlphe->rlqhe", ddots, ik)
+    dik = scale * torch.einsum("rlqhp,rlqhe->rlphe", ddots, iq)
+    d_iq_weight = torch.einsum("rlqhe,rlqd->hde", diq, h)
+    d_ik_weight = torch.einsum("rlphe,rlphd->hde", dik, grouped)
+    return d_iq_weight, d_ik_weight
+

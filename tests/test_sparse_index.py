@@ -15,6 +15,8 @@ from tilerl.sparse_index import (
     WINDOW_PAGES,
     index_source_groups,
     indexer_kl,
+    indexer_warmup_bwd,
+    indexer_warmup_loss,
     page_index_scores,
     page_mass_target,
     page_scores_for_selector,
@@ -23,6 +25,7 @@ from tilerl.sparse_index import (
 
 R, L_SRC = 2, 4
 IH, DI = 4, 32
+DH = 16
 H_ATT, D_ATT = 8, 16
 PAGES = 12
 
@@ -152,3 +155,119 @@ def test_warmup_drives_kl_down_on_a_fixed_batch():
         opt.step()
     k1 = kl_now()
     assert k1 < k0 * 0.5, f"KL did not fall by half on the fixed batch: {k0:.4f} -> {k1:.4f}"
+
+
+# ---------------- part 2: warm-up tape op and its hand-written reverse ----------------
+
+def _warmup_inputs(dtype=torch.float32, seed=7, q=3):
+    torch.manual_seed(seed)
+    h = torch.randn(R, L_SRC, q, DH, dtype=dtype)
+    k_pages = torch.randn(R, L_SRC, PAGES, H_ATT, D_ATT, dtype=dtype)
+    iq_w = torch.randn(IH, DH, DI, dtype=dtype)
+    ik_w = torch.randn(IH, D_ATT, DI, dtype=dtype)
+    n_pages = torch.full((R,), PAGES, dtype=torch.long)
+    mass = torch.softmax(torch.randn(R, L_SRC, q, PAGES * 16, dtype=dtype), -1)
+    target = page_mass_target(mass, n_pages, 16, WINDOW_PAGES)
+    return h, k_pages, iq_w, ik_w, target, n_pages
+
+
+def test_warmup_bwd_gradcheck_on_both_projection_weights():
+    """The tape reverse is hand-written, so its two weight gradients are checked
+    against f64 central differences. H and page-K are frozen and intentionally
+    receive no gradient."""
+    h, k_pages, iq_w, ik_w, target, n_pages = (
+        t.to(torch.float64) if torch.is_tensor(t) else t
+        for t in _warmup_inputs(torch.float64))
+    iq_w.requires_grad_()
+    ik_w.requires_grad_()
+    kw = dict(n_pages=n_pages, n_win_pages=WINDOW_PAGES)
+
+    def loss(iw, kw_):
+        return indexer_warmup_loss(h, k_pages, iw, kw_, target, **kw)
+
+    d_iq, d_ik = indexer_warmup_bwd(
+        torch.ones((), dtype=torch.float64), iq_w, ik_w, h, k_pages, target, **kw)
+    assert torch.autograd.gradcheck(lambda a, b: loss(a, b), (iq_w, ik_w),
+                                    eps=1e-6, atol=1e-4)
+    # independent finite-difference check of the hand-written reverse itself;
+    # perturb raw values, no autograd graph
+    iq_w.requires_grad_(False)
+    ik_w.requires_grad_(False)
+    for w, ana in ((iq_w, d_iq), (ik_w, d_ik)):
+        num = torch.zeros_like(w)
+        idxs = torch.randperm(w.numel())[:24]
+        flat = w.reshape(-1)
+        for j in idxs:
+            old = flat[j].item()
+            flat[j] = old + 1e-6
+            fp = indexer_warmup_loss(h, k_pages, iq_w, ik_w, target, **kw).item()
+            flat[j] = old - 1e-6
+            fm = indexer_warmup_loss(h, k_pages, iq_w, ik_w, target, **kw).item()
+            flat[j] = old
+            num.reshape(-1)[j] = (fp - fm) / 2e-6
+        a = ana.reshape(-1)[idxs]
+        n_ = num.reshape(-1)[idxs]
+        rel = ((a - n_).norm() / a.norm()).item()
+        assert rel < 1e-5, f"warmup bwd rel err {rel:.3e} for {tuple(w.shape)}"
+
+
+def test_warmup_records_one_tape_entry_and_only_the_two_weights_are_leaves():
+    from tilerl import autograd
+
+    h, k_pages, iq_w, ik_w, target, n_pages = _warmup_inputs()
+    with autograd.Tape() as tape:
+        l = indexer_warmup_loss(h, k_pages, iq_w, ik_w, target, n_pages)
+    assert len(tape._entries) == 1
+    assert tape._entries[0].op_name == "indexer_warmup"
+    assert l.shape == ()  # scalar mean loss seeds the reverse with ones
+    grads = tape.backward(torch.ones(()))
+    assert set(grads) == {id(iq_w), id(ik_w)}
+    assert grads[id(iq_w)].shape == iq_w.shape
+    assert grads[id(ik_w)].shape == ik_w.shape
+    assert torch.isfinite(grads[id(iq_w)]).all()
+    assert torch.isfinite(grads[id(ik_w)]).all()
+
+
+def test_warmup_tape_step_lowers_the_loss():
+    """One optimizer step driven by the tape reverse must lower the frozen-batch
+    loss (the recipe's unit of progress); only the two weights change."""
+    from tilerl import autograd
+
+    h, k_pages, iq_w, ik_w, target, n_pages = _warmup_inputs()
+    params = [iq_w, ik_w]
+    opt = autograd.AdamW(lr=0.05)
+
+    def loss_now():
+        return indexer_warmup_loss(h, k_pages, iq_w, ik_w, target, n_pages).item()
+
+    l0 = loss_now()
+    with autograd.Tape() as tape:
+        indexer_warmup_loss(h, k_pages, iq_w, ik_w, target, n_pages)
+    grads = tape.backward(torch.ones(()), needs={id(p) for p in params})
+    opt.step(params, grads)
+    l1 = loss_now()
+    assert l1 < l0, f"one warm-up step raised the loss: {l0:.4f} -> {l1:.4f}"
+
+
+def test_indexer_warmup_recipe_runs_one_step_on_tiny(tmp_path, monkeypatch, capsys):
+    """Design acceptance (design-sparse-kv.md): the warm-up recipe runs one step
+    on tiny and the manifest gate passes. The frozen base -> capture -> page pool
+    -> tape backward -> AdamW chain is exercised through the real CLI."""
+    import json
+
+    from tilerl import cli
+    from tilerl.ledger import gates_pass
+
+    monkeypatch.setenv("TILERL_RUNS", str(tmp_path))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["tilerl", "train", "--recipe", "indexer-warmup", "--steps", "1", "--json"])
+    cli.main()
+    out = capsys.readouterr().out
+    m = json.loads(out[out.index("{"):])
+    assert m["inputs"]["algo"] == "indexer-warmup"
+    assert gates_pass(m), m["gates"]
+    gate = m["gates"][0]
+    assert gate["name"] == "indexer_warmup_step_runs" and gate["passed"] is True
+    import math
+    assert math.isfinite(m["metrics"]["kl_first"])

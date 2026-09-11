@@ -385,9 +385,58 @@ def _train_dry_run(args: argparse.Namespace) -> None:
         print(format_memory_table(table))
 
 
+def _train_indexer_warmup(args: argparse.Namespace) -> None:
+    """Learned-indexer KL warm-up on the frozen base (sparse-KV unit D). Tiny/CPU
+    gate path: the recipe proves one step runs through capture -> page pool ->
+    tape backward -> optimizer; the 27B card run is pending-remote."""
+    import math
+    import time
+
+    from tilerl_kernels.backend import get_backend
+
+    from . import train as train_mod
+    from .ledger import commit, format_run, gates_pass, new_manifest, now, runs_root, write_manifest
+
+    manifest = new_manifest("train", {
+        "model": args.model, "recipe": args.recipe, "source": "tiny",
+        "commit": commit(), "algo": "indexer-warmup", "steps": args.steps,
+        "lr": args.lr, "seed": args.seed})
+    if args.steps == 0:
+        manifest["gates"] = []
+        manifest["finished"] = now()
+        write_manifest(runs_root(), manifest)
+        print(json.dumps(manifest, indent=1) if args.json else format_run(manifest))
+        return
+    backend = get_backend()
+    cfg, model = _build_model(args.model, seed=args.seed, keep_master=False)
+    log = _progress(args.json)
+    log(f"tilerl train: indexer warm-up model={cfg.name} steps={args.steps}")
+    t0 = time.perf_counter()
+    losses = train_mod.indexer_warmup(model, backend, args.steps, seed=args.seed, lr=args.lr)
+    for i, v in enumerate(losses):
+        log(f"step {i + 1:4d}/{args.steps}  kl {v:.4f}")
+    finite = all(math.isfinite(v) for v in losses)
+    manifest["metrics"] = {"kl_first": losses[0], "kl_last": losses[-1],
+                          "secs_total": time.perf_counter() - t0}
+    # The tiny teacher (random QK) is near-uniform, so the CPU gate is that the
+    # chain RUNS a step with a finite loss, not that KL halves -- learnability on
+    # a real teacher is pinned separately in test_sparse_index's KL-halving gate.
+    manifest["gates"] = [{
+        "name": "indexer_warmup_step_runs", "value": args.steps if finite else None,
+        "threshold": args.steps, "kind": "validity", "skipped": False,
+        "passed": finite}]
+    manifest["finished"] = now()
+    write_manifest(runs_root(), manifest)
+    print(json.dumps(manifest, indent=1) if args.json else format_run(manifest))
+    if not gates_pass(manifest):
+        sys.exit(1)
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     if getattr(args, "dry_run", False):
         return _train_dry_run(args)
+    if getattr(args, "indexer_warmup", False):
+        return _train_indexer_warmup(args)
     if args.rl or args.opd:
         if getattr(args, "served_fp4", False):
             sys.exit("error: --served-fp4 is full-parameter SFT only; LoRA keeps the frozen served faces")
@@ -2182,6 +2231,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
     p_train.add_argument("--seed", type=int, default=0)
     p_train.add_argument("--opd", action="store_true",
                          help="on-policy distillation: the engine rolls out, LoRA adapters train")
+    p_train.add_argument("--indexer-warmup", action="store_true",
+                         help="learned-indexer KL warm-up on the frozen sparse-KV base (unit D)")
     p_train.add_argument("--rl", action="store_true",
                          help="GRPO: the engine samples a group per prompt, a reward scores "
                               "them, the group mean is the baseline (no critic)")

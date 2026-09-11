@@ -271,6 +271,105 @@ def _step(
     return total
 
 
+def _dense_causal_mass(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """Teacher for the indexer warm-up: causal softmax attention mass averaged
+    over query heads (GQA: K heads repeat). ``q`` [b,t,hq,d], ``k`` [b,t,hkv,d]
+    -> [b,t,t], each query row L1-normalised."""
+    b, t, hq, d = q.shape
+    rep = hq // k.shape[2]
+    k_exp = k.repeat_interleave(rep, dim=2)                       # [b,t,hq,d]
+    scores = torch.einsum("bqhd,bkhd->bhqk", q, k_exp) / math.sqrt(d)
+    causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=q.device))
+    scores = scores.masked_fill(~causal[None, None], float("-inf"))
+    return torch.softmax(scores, dim=-1).mean(dim=1)             # avg over heads
+
+
+def indexer_warmup_step(
+    model: Any,
+    input_ids: Any,
+    backend: Any,
+    weights: dict[str, torch.Tensor],
+    optimizer: AdamW,
+    block: int = 16,
+) -> float:
+    """One indexer warm-up step. The frozen base supplies the teacher: a
+    no-grad dense forward captures each source layer's input H and post-rope
+    Q/K. Dense causal attention mass is pooled per page and the two indexer
+    projection weights (``iq`` [ih,hidden,di], ``ik`` [ih,d_kv,di]) learn to
+    match it via the ``indexer_warmup`` tape op. Returns the scalar KL."""
+    from .sparse_index import (
+        WINDOW_PAGES,
+        index_source_groups,
+        indexer_warmup_loss,
+        page_mass_target,
+    )
+
+    ids = torch.as_tensor(input_ids, dtype=torch.long, device=backend.device)
+    b, t = ids.shape
+    n_pages_tok = t // block
+    if n_pages_tok <= WINDOW_PAGES:
+        raise ValueError(f"warm-up needs > {WINDOW_PAGES} pages, got {n_pages_tok} from T={t}")
+
+    full_layers = list(model.cfg.full_attn_layers)
+    sources, _groups = index_source_groups(len(full_layers)) if len(full_layers) >= 4 \
+        else (list(range(len(full_layers))), None)
+    source_set = {full_layers[s] for s in sources}
+
+    captured: list = []
+    model.index_capture = captured
+    try:
+        kv = _training_kv(model, b, t, device=backend.device)
+        with torch.no_grad():
+            model.forward(ids, torch.arange(t, device=backend.device), kv, backend)
+    finally:
+        model.index_capture = None
+
+    hkv, d_kv = model.cfg.num_kv_heads, model.cfg.head_dim
+    ih = weights["ik"].shape[0]
+    if ih != hkv:
+        raise ValueError(f"index heads {ih} must equal KV heads {hkv} on the tiny warm-up")
+    n_pages = torch.full((b,), n_pages_tok, dtype=torch.long)
+
+    # Stack captured SOURCE layers on the L_src axis (one entry per source layer).
+    cap = [c for c in captured if c[0] in source_set]
+    cap.sort(key=lambda c: c[0])
+    H = torch.stack([c[1][:, :n_pages_tok * block] for c in cap], dim=1)   # [b,L,t,hid]
+    K = torch.stack([c[3] for c in cap], dim=1)                            # [b,L,t,hkv,d]
+    mass = torch.stack([_dense_causal_mass(c[2], c[3]) for c in cap], dim=1)  # [b,L,t,t]
+
+    # Per-page K = mean of the block's token Ks: [b,L,pages,hkv,d].
+    k_pages = K.reshape(b, len(cap), n_pages_tok, block, hkv, d_kv).mean(dim=3)
+    target = page_mass_target(mass, n_pages, block, WINDOW_PAGES)
+
+    iq_w, ik_w = weights["iq"], weights["ik"]
+    with Tape() as tape:
+        loss = indexer_warmup_loss(H, k_pages, iq_w, ik_w, target, n_pages, WINDOW_PAGES)
+    grads = tape.backward(torch.ones((), device=backend.device),
+                          needs={id(iq_w), id(ik_w)})
+    optimizer.step([iq_w, ik_w], grads)
+    return float(loss.detach())
+
+
+def indexer_warmup(model: Any, backend: Any, steps: int, seed: int = 0,
+                   seq_len: int = 256, batch: int = 1, lr: float = 0.02) -> list[float]:
+    """Run the learned-indexer KL warm-up on the frozen base for ``steps`` and
+    return the per-step loss. Tiny/CPU path; the 27B card run is pending-remote."""
+    gen = torch.Generator(device=backend.device).manual_seed(seed)
+    hkv, d_kv, hidden = model.cfg.num_kv_heads, model.cfg.head_dim, model.cfg.hidden_size
+    di = min(16, d_kv)  # small indexer head on tiny
+    weights = {
+        "iq": (0.1 * torch.randn(hkv, hidden, di, generator=gen, device=backend.device)),
+        "ik": (0.1 * torch.randn(hkv, d_kv, di, generator=gen, device=backend.device)),
+    }
+    opt = AdamW(lr=lr)
+    losses = []
+    for _ in range(steps):
+        ids = torch.randint(0, model.cfg.vocab_size, (batch, seq_len),
+                            generator=gen, device=backend.device)
+        losses.append(indexer_warmup_step(model, ids, backend, weights, opt))
+    return losses
+
+
 def train_step(
     model: Any,
     input_ids: Any,
