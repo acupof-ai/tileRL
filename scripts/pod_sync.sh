@@ -64,7 +64,10 @@ if sha=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null); then
   if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
     printf '1\n' > "$ROOT/.synced_dirty"
   else
-    rm -f "$ROOT/.synced_dirty"
+    # Write 0, do not remove: the pod is a tarball with no git repo, and
+    # benchrec.git_dirty() deliberately raises on a missing marker rather than
+    # guessing clean, so an absent file makes every CLEAN pod bench fail to record.
+    printf '0\n' > "$ROOT/.synced_dirty"
   fi
 fi
 
