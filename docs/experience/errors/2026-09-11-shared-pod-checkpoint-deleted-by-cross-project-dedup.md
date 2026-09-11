@@ -46,6 +46,10 @@ container that mounts only `/work`.
   `/work/tilerl-ckpt/Qwen3.8-27B-NVFP4`, copied from the host `/data00`
   rather than relying on a shared, un-namespaced top-level dir another project
   may judge redundant. Point `TILERL_QWEN38_SOURCE` / `TILERL_27B_CKPT` there.
+  The copy is bit-exact with the deleted `/work` file: sha256
+  `c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05`
+  (`/work/tilerl-ckpt/model.sha256`), identical to the hash aupai-2b recorded
+  for the deleted copy.
 - Before deleting a "duplicate" on a shared host, verify the file is visible
   at the SAME path in every container that mounts the volume — redundancy on
   the host is not redundancy inside a container with a narrower mount set.
