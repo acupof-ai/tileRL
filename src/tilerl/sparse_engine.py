@@ -24,6 +24,8 @@ Bounds scorer, the training-free day-1 path:
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import torch
 from torch import Tensor
 
@@ -100,15 +102,23 @@ class SparseTracker:
         self.bounds: dict[int, dict[int, Tensor]] = {}
         #: resident private pages: req_id -> {logical page: physical block}
         self.resident: dict[int, dict[int, int]] = {}
+        #: logical pages adopted from a shared prefix entry: req_id -> {page: content key}
+        self.shared: dict[int, dict[int, int]] = {}
         self.bytes_per_page = 0
+        #: host-blob-backed prefix index (None = the NoPrefixStore stopgap)
+        self.prefix: SparsePrefixCache | None = None
+        #: False when the caller explicitly chose NoPrefixStore (sharing disabled)
+        self.sharing_enabled = True
 
     def attach(self, req_id: int) -> None:
         self.bounds.setdefault(req_id, {})
         self.resident.setdefault(req_id, {})
+        self.shared.setdefault(req_id, {})
 
     def drop(self, req_id: int) -> None:
         self.bounds.pop(req_id, None)
         self.resident.pop(req_id, None)
+        self.shared.pop(req_id, None)
 
     def set_bounds(self, req_id: int, page: int, b: Tensor) -> None:
         b = b.contiguous().to(torch.float16)
@@ -205,3 +215,136 @@ class SparseForward:
         for g in range(self.n_groups):
             out.update(self._chosen.get((bi, g), ()))
         return out
+
+
+# --- sparse prefix cache (host-blob backed; replaces the NoPrefixStore stopgap) ---
+_MASK64 = (1 << 64) - 1
+
+
+def _page_hash(prev: int, token: int) -> int:
+    """Same rolling hash as kv_cache._rolling_hash: a page is keyed by the hash of
+    its token span's prefix, so page p's key = hash(tokens[: (p+1)*16])."""
+    return ((prev * 1_000_003) ^ (token + 1)) & _MASK64
+
+
+def page_key(tokens, page: int) -> int:
+    """Content key of whole page ``page`` (tokens [page*16, (page+1)*16))."""
+    h = 0
+    for t in tokens[: (page + 1) * BLOCK_TOKENS]:
+        h = _page_hash(h, int(t))
+    return h
+
+
+class SparsePrefixCache:
+    """Prefix sharing for the sparse engine, backed by SHARED host blobs.
+
+    The dense PrefixStore retains live device blocks; sparse frees the device
+    frame on demote, so this index instead retains each published page's HOST
+    blob through :meth:`HostKvPages.share_hold` (keyed by the page content hash)
+    plus the page's Quest bounds and, per whole-prefix entry, the GDN snapshot.
+
+    An entry covers a block-aligned prefix: ``length`` tokens, ``keys[p]`` the
+    content hash of page p, ``bounds[p]`` its fp16 bounds tensor, and one GDN
+    ``state`` snapshot taken at the boundary. On a hit the engine adopts the
+    bounds (zero recompute), restores the state, and promotes a page's K/V into
+    a private fresh block only when the selector names it (lazy).
+    """
+
+    def __init__(self, cold, states, capacity: int = 4096):
+        self._cold = cold
+        self._states = states
+        self._entries: dict[int, list[dict]] = {}  # hash -> verified entries
+        #: LRU over entries by id, like the dense PrefixStore; a hit moves to end.
+        self._by_id: OrderedDict[int, dict] = OrderedDict()
+        self._next_id = 0
+        self.capacity = capacity
+        self.published = 0
+        self.hits = 0
+        self.evictions = 0
+
+    def publish(self, tokens, page_blobs, bounds, state) -> bool:
+        """Publish one block-aligned prefix.
+
+        ``page_blobs``: {logical page: host blob} for every whole page in the
+        prefix (the sparse finalize already demoted them to host blobs).
+        ``bounds``: {page: bounds tensor}. ``state``: (states, windows) snapshot.
+        Each blob is share_held under its content key; duplicate prefixes no-op.
+        """
+        tokens = tuple(int(t) for t in tokens)
+        n_pages = len(tokens) // BLOCK_TOKENS
+        if n_pages == 0:
+            return False
+        h = page_key(tokens, n_pages - 1)
+        for e in self._entries.get(h, ()):
+            if e["tokens"] == tokens:
+                return False
+        keys, key_by_page, kept_bounds = [], {}, {}
+        for p in range(n_pages):
+            if p not in page_blobs:
+                continue  # a selected-candidate page with no own blob: not publishable
+            blob = dict(page_blobs[p])
+            if p in bounds:
+                blob["bounds"] = bounds[p]
+            key = page_key(tokens, p)
+            self._cold.share_hold(key, blob, _blob_nbytes(blob))
+            keys.append(key)
+            key_by_page[p] = key
+            kept_bounds[p] = bounds[p]
+        eid = self._next_id
+        self._next_id += 1
+        entry = {"eid": eid, "tokens": tokens, "keys": keys,
+                 "bounds": kept_bounds, "state": state}
+        self._entries.setdefault(h, []).append(entry)
+        self._by_id[eid] = entry
+        self.published += 1
+        while len(self._by_id) > self.capacity:
+            self._evict_one()
+        return key_by_page  # {page: content key} for the publisher's own resolve
+
+    def _evict_one(self) -> None:
+        _, entry = next(iter(self._by_id.items()))
+        self._drop(entry)
+        self.evictions += 1
+
+    def _drop(self, entry: dict) -> None:
+        """Remove one entry and release every shared page blob it references. A
+        page shared with a surviving entry keeps its blob (share refcount)."""
+        self._by_id.pop(entry["eid"], None)
+        chain = self._entries.get(self._entry_hash(entry["tokens"]))
+        if chain is not None:
+            chain.remove(entry)
+        for key in entry["keys"]:
+            self._cold.share_release(key)
+
+    @staticmethod
+    def _entry_hash(tokens) -> int:
+        return page_key(tokens, len(tokens) // BLOCK_TOKENS - 1)
+
+    def lookup(self, tokens):
+        """Longest block-aligned published prefix of ``tokens`` -> entry dict or None."""
+        tokens = tuple(int(t) for t in tokens)
+        h = 0
+        hashes = []
+        for t in tokens:
+            h = _page_hash(h, int(t))
+            hashes.append(h)
+        for i in range(len(tokens) // BLOCK_TOKENS, 0, -1):
+            for e in self._entries.get(hashes[i * BLOCK_TOKENS - 1], ()):
+                if e["tokens"] == tokens[: i * BLOCK_TOKENS]:
+                    self.hits += 1
+                    self._by_id.move_to_end(e["eid"])  # LRU
+                    return e
+        return None
+
+    def drop_request(self, *_):
+        """Shared blobs are owned by PREFIX entries, not requests; nothing per-request."""
+
+    def clear(self) -> None:
+        for entry in list(self._by_id.values()):
+            self._drop(entry)
+        self.evictions = 0
+
+
+def _blob_nbytes(blob: dict) -> int:
+    return sum(t.numel() * t.element_size() for t in blob.values()
+               if torch.is_tensor(t))
