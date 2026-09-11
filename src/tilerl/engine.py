@@ -2181,11 +2181,17 @@ def build_engine(
                 "silently lost, and this cell registers no fp8 twin (docs/design-fp8-kv.md)."
             )
     if sparse_k:
-        # The device pool IS the per-slot hot set (k_pages selection + 8-page window) plus
-        # one prefill chunk's OWN pages resident until that chunk ends; beyond it pages
-        # demote to the host. max_num_batched_tokens/16 is the chunk ceiling; +1 a partial.
+        # Per-tick resident peak per slot. Quest selects independently per source
+        # group (groups of 4 full-attn layers), and each group's chosen pages
+        # co-reside in one shared live map through the forward before finalize
+        # demotes them — so selections are a UNION of up to n_groups*k pages, not
+        # one k. resolve is idempotent by logical page, so the forced 8-page window
+        # and one prefill chunk's own pages add once each even though every group
+        # names them. chunk_pages = max_num_batched_tokens/16 ceiling + 1 partial.
+        from .sparse_engine import group_map
+        n_groups = len(group_map(cfg)[0])
         chunk_pages = max_num_batched_tokens // BLOCK_TOKENS + 1
-        per_row = sparse_k + WINDOW_PAGES + chunk_pages
+        per_row = n_groups * sparse_k + WINDOW_PAGES + chunk_pages
         num_blocks = num_slots * per_row + 1
     elif not num_blocks:
         num_blocks = _fit_blocks(cfg, backend, kv_io, max_blocks,

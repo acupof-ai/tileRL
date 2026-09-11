@@ -1,4 +1,4 @@
-# Sparse long-context could never run: two device-only assumptions past a short-prompt test — 2026-09-12
+# Sparse long-context could never run: three device-only assumptions past a short-prompt test — 2026-09-12
 
 > Status: **fixed on `fix/sparse-longctx-capacity`** (capacity guard + stable
 > cold keys). CPU gates green; the 27B H20/V100 points are the remote proof.
@@ -34,6 +34,15 @@ showed in CI.
    the engine's automatic path stores bare logical pages in `cold_pages`. The
    #500 `sparse_retier` demote-all/promote-all seam keeps physical keys and is
    untouched.
+
+3. **The hot pool sized one selection, but a tick holds every group's union.**
+   Quest selects independently per source group (groups of 4 full-attn layers;
+   the 27B has 4 groups), and all chosen pages co-reside in one shared live map
+   through the forward before finalize demotes them. The pool was sized
+   `k+window+chunk` for a single group (339 blocks), so the first long decode
+   exhausted it promoting the 4-group union. Fix: `n_groups*k + window + chunk`
+   per slot (1107 blocks on the 27B). The tiny model has one full-attn layer /
+   one group, so only the remote 27B run exercises the multi-group peak.
 
 ## Why CI stayed green
 
