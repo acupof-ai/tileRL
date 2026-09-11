@@ -45,21 +45,22 @@ the top-k_pages block table. Two scorers produce them:
 1. **Page bounds, training-free (day 1).** Per page, per layer, per KV head,
    the elementwise min and max of K over its 16 tokens (Quest). The score is
    the upper bound `sum(max(q*kmin, q*kmax))`. Bytes: 2 x 4 heads x 256 x 16
-   layers = 32 KiB per page in fp16, 2 KiB per token, written once at append
-   time from the K the pool already holds; no weights, no training. This is
+   layers x 2 B = 64 KiB per page in fp16, 4 KiB per token (2 KiB in fp8),
+   written once at append time from the K the pool already holds; no weights,
+   no training. This is
    what runs the dense checkpoint at 256k on the V100 without changing it.
 2. **Learned index keys (the V3.2 indexer).** One shared 128-B key per token
-   per layer, scored against index query heads, trained as below. Same bytes
-   per token as the bounds, better recall at the same k, and the model is
-   trained with the selection it serves.
+   per layer, scored against index query heads, trained as below. Half the
+   bytes of fp16 bounds, better recall at the same k, and the model is trained
+   with the selection it serves.
 
 Both keep the same rows, the same tiering and the same `k >= context` gate;
 `serve --scorer bounds|index`. The V100 (sm70, 32 GB, f32 IO, eager decode)
 is the first card target: weights 22.759 GiB leave ~8 GiB, so dense fp16 KV
 stops at 64k tokens for one row; with bounds selection the device holds
-528 MiB of bounds plus 130 MiB of fp16 hot pages at 256k, and the cold KV
-sits in host RAM (16 GiB per row in fp16) behind PCIe Gen3 (~12 GB/s, so a
-full 130 MiB refetch is 11 ms; the delta is what the bench must show).
+1 GiB of bounds plus 128 MiB of fp16 hot pages at 256k, and the cold KV sits
+in host RAM (16 GiB per row in fp16) behind PCIe Gen3 (~12 GB/s, so a full
+128 MiB refetch is 11 ms; the delta is what the bench must show).
 
 ## Selection is page-granular
 
