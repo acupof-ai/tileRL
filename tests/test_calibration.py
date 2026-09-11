@@ -222,6 +222,31 @@ def test_time_row_ms_pending_off_cuda_or_unknown_row(monkeypatch):
         {"name": "down_proj", "_spec": (4, 4), "face": None}, object(), 1, 8) is None
 
 
+def test_time_row_ms_identity_assert_survives_bound_methods(monkeypatch):
+    """time_row_ms asserts the kernel it resolves twice is the same. A real backend's
+    linear_fp4 is a BOUND method, and two getattr calls hand back distinct wrapper
+    objects, so a plain `is` always failed — the first card run of bench --kernels
+    crashed with AssertionError. Drive time_row_ms with faked cuda and a stubbed event
+    timer so the identity assertion runs without a GPU; the bound kernel returns None.
+    Mutant: replace the __func__ comparison in time_row_ms with `fn is
+    resolve_row_kernel(...)` — this gate goes red."""
+    import torch
+
+    monkeypatch.setattr(torch, "cuda", type("C", (), {"is_available": lambda self: True})())
+    monkeypatch.setattr(cal, "_event_seconds", lambda fn, iters=20: 0.001)
+
+    from tilerl import precision as P
+
+    class BoundBackend:
+        device = torch.device("cpu")
+
+        def linear_fp4(self, x, wq, scale, oscale=None):
+            return None
+
+    row = {"name": "down_proj", "_spec": (32, 32), "face": P.nvfp4_dev}  # inn 32 packs
+    assert cal.time_row_ms(row, BoundBackend(), 1, 1) == 1.0
+
+
 def test_kernels_table_pending_when_no_calibration(tmp_path, monkeypatch, capsys):
     """With no ledger row the roofline columns render pending-remote, not a datasheet
     number, even though bytes/flops always print."""
