@@ -2265,13 +2265,16 @@ def _format_device_ledger(sections: list[dict]) -> str:
     lines = ["devices (newest measured floor + residency per card):"]
     for s in sections:
         bw, pk, res = s["hbm_bw_gbs"], s["bf16_peak_tflops"], s["residency"]
+        pk_name = "bf16_peak_tflops"
+        if pk is None:  # pre-Ampere cards are calibrated at f16 (no bf16 tensor path)
+            pk, pk_name = s["f16_peak_tflops"], "f16_peak_tflops"
         lines.append(f"  {s['device']}")
         if bw is None or pk is None:
-            lines.append("    hbm_bw / bf16_peak: pending-remote (run bench --calibrate)")
+            lines.append("    hbm_bw / tensor peak: pending-remote (run bench --calibrate)")
         else:
             lines.append(
                 f"    hbm_bw_gbs {bw['value']:.1f} (commit {str(bw['commit'])[:8]}, "
-                f"{bw['date']})  bf16_peak_tflops {pk['value']:.1f} "
+                f"{bw['date']})  {pk_name} {pk['value']:.1f} "
                 f"(commit {str(pk['commit'])[:8]}, {pk['date']})")
         if res is None:
             lines.append("    residency: pending-remote (run serve --dry-run --record-residency)")
