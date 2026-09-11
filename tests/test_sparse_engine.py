@@ -302,3 +302,126 @@ def test_select_tensor_op_count_is_constant_in_candidate_count():
     ops_8 = select_ops(8)
     ops_64 = select_ops(64)
     assert ops_64 == ops_8, f"ops grow with candidates: {ops_8} @8 -> {ops_64} @64"
+
+
+# ---------------------------------------------------------------- graph-capturable decode tick
+
+
+def _resident_forward(B, device_select, n_pages=20, k=4):
+    """A SparseForward over B rows where every page is RESIDENT (the cross-tick
+    pin steady state a captured decode tick requires): k selection from
+    n_pages-2 candidate pages plus a trailing 2-page own window."""
+    import torch
+
+    from tilerl.sparse_engine import SparseForward, SparseTracker
+
+    cfg = tiny()
+    torch.manual_seed(0)
+    tr = SparseTracker(cfg, k, "bounds")
+    rows = []
+    for bi in range(B):
+        tr.attach(bi)
+        own = [n_pages - 2, n_pages - 1]
+        cand = list(range(n_pages - 2))
+        b = torch.randn(tr.n_full, tr.hkv, 2, tr.dim, dtype=torch.float16)
+        for p in cand:
+            tr.set_bounds(bi, p, b)
+        phys = {}
+        for p in cand + own:
+            pm = 1000 + bi * 1000 + p
+            phys[p] = pm
+            tr.map_resident(bi, p, pm)
+        tr.resident[bi] = phys
+        rows.append(dict(
+            req_id=bi, own=own, own_len=2 * BLOCK_TOKENS + 5, q_start=0, q_hi=0,
+            decoding=True, tq=1, cand=cand, force_window=0,
+            resolve=lambda p, rid=bi: tr.resident[rid][p], reserved=set()))
+    sf = SparseForward(tr, rows, torch.device("cpu"), device_select=device_select)
+    return cfg, sf
+
+
+def test_device_select_packs_a_fixed_width_table_with_no_host_sync_at_b1_and_b8():
+    """The captured decode tick's structural gate at B=1 and B=8:
+
+    - the packed table is a FIXED ``min(k,cand)+own_window`` width for the tick
+      (a captured graph replays one shape), never the eager dynamic width;
+    - building it through attention_args issues NO host-syncing scalar read
+      (``aten._local_scalar_dense`` is what ``.item()``/``bool(tensor)`` lower
+      to — one of those inside the replay breaks capture).
+    """
+    import torch
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class _NoScalarSync(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            assert "_local_scalar_dense" not in str(func), f"host sync in tick: {func}"
+            return func(*args, **(kwargs or {}))
+
+    for B in (1, 8):
+        cfg, sf = _resident_forward(B, True, k=4)
+        q = torch.randn(B, 1, cfg.num_attention_heads, cfg.head_dim)
+        with _NoScalarSync():
+            table, sl = sf.attention_args(0, q)
+        assert table.shape == (B, 4 + 2), table.shape   # fixed k + trailing own window
+        assert sl.shape == (B,)
+        # seq_len excludes the padded tail: each row selected exactly k here.
+        assert torch.equal(sl, torch.full((B,), 4 * BLOCK_TOKENS + 2 * BLOCK_TOKENS + 5))
+
+
+def test_device_select_packed_table_matches_eager_at_b1_and_b8():
+    """Token-equality to eager sparse at the SparseForward level: the device
+    path's leading compact physical columns and seq_len must equal the eager
+    path's packed table at B=1 and B=8 (same selection, same own pages)."""
+    import torch
+
+    for B in (1, 8):
+        cfg, eager = _resident_forward(B, False, k=4)
+        _, device = _resident_forward(B, True, k=4)
+        # identical bounds/phys seeds: _resident_forward reseeds torch each call
+        g = torch.Generator().manual_seed(0)
+        q = torch.randn(B, 1, cfg.num_attention_heads, cfg.head_dim, generator=g)
+        g2 = torch.Generator().manual_seed(0)
+        q2 = torch.randn(B, 1, cfg.num_attention_heads, cfg.head_dim, generator=g2)
+        te, sle = eager.attention_args(0, q)
+        td, sld = device.attention_args(0, q2)
+        for bi in range(B):
+            n = int((te[bi] != 0).sum())
+            assert te[bi, :n].tolist() == td[bi, :n].tolist(), (B, bi)
+            assert int(sle[bi]) == int(sld[bi]), (B, bi)
+
+
+def test_device_select_engine_tokens_equal_eager_sparse_at_full_k():
+    """End-to-end gate: through the real Engine the device-selection decode tick
+    is token-for-token equal to the eager sparse engine at full k (B=1)."""
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    def run(devsel):
+        kw = dict(
+            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+            sparse_k=6, scorer="bounds", kv_cold_bytes=1 << 30,
+            sparse_device_select=devsel)
+        e = build_engine(**kw)
+        tok = _drain(e, e.submit(prompt, params), 8)
+        e.shutdown()
+        return tok
+
+    assert run(True) == run(False)
+
+
+def test_quest_scores_batched_matches_single_row_bit_for_bit():
+    """The captured tick scores all B rows with quest_scores_batched; it must be
+    bit-identical to applying the single-row quest_scores per row (the page chunk
+    split commutes over rows exactly as it does over pages)."""
+    import torch
+
+    from tilerl.sparse_engine import quest_scores, quest_scores_batched
+
+    B, tq, hq, hkv, d, cp = 4, 3, 8, 4, 16, 33
+    q = torch.randn(B, tq, hq, d)
+    bounds = torch.randn(B, cp, hkv, 2, d) * 0.3
+    batched = quest_scores_batched(q, bounds)
+    for bi in range(B):
+        assert torch.equal(batched[bi], quest_scores(q[bi], bounds[bi]))

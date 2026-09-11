@@ -83,6 +83,68 @@ def quest_scores(q: Tensor, bounds: Tensor) -> Tensor:
     return out
 
 
+def quest_scores_batched(q: Tensor, bounds: Tensor) -> Tensor:
+    """Batched form of :func:`quest_scores` for the captured decode tick:
+    ``q`` [B,Tq,hq,D], ``bounds`` [B,Cp,Hkv,2,D] -> scores [B,Cp], chunked over
+    pages exactly like the single-row form (same split, same commute)."""
+    b, t, hq, d = q.shape
+    hkv = bounds.shape[2]
+    qi = q.float().reshape(b, t, hkv, hq // hkv, d).mean(3)      # [B,Tq,Hkv,D]
+    kmin, kmax = bounds.unbind(dim=3)                            # each [B,Cp,Hkv,D]
+    cp = bounds.shape[1]
+    out = q.new_empty(b, cp)
+    for c0 in range(0, cp, _SCORE_PAGE_CHUNK):
+        sl = slice(c0, c0 + _SCORE_PAGE_CHUNK)
+        qb = qi[:, :, None, :, :]                                # [B,Tq,1,Hkv,D]
+        per = torch.maximum(qb * kmin[:, None, sl], qb * kmax[:, None, sl]).sum(-1)
+        out[:, sl] = per.amax(dim=1).sum(dim=-1)                 # [B,b]
+    return out
+
+
+def select_members(scores: Tensor, n_cand: Tensor, k_pages: int,
+                   n_window: Tensor) -> Tensor:
+    """Top-k UNION forced-window membership, pure device ops (no host sync —
+    this runs inside the captured decode tick).
+
+    ``scores`` [B,Cp] with padding positions already -inf-able, ``n_cand`` [B]
+    valid candidate count, ``n_window`` [B] forced trailing pages per row.
+    Returns bool member [B,Cp] (sequence positions kept, in candidate order)."""
+    b, cp = scores.shape
+    pos = torch.arange(cp, device=scores.device)
+    valid = pos[None, :] < n_cand[:, None]
+    k = min(k_pages, cp)
+    member = torch.zeros_like(scores, dtype=torch.bool)
+    member.scatter_(
+        1, torch.topk(scores.masked_fill(~valid, float("-inf")), k, dim=1).indices,
+        True)
+    member &= valid  # a row with <k valid candidates must not mark padding
+    # forced trailing window; decode rows carry n_window=0 so their mask is empty
+    # (unconditional tensor OR — no host branch, this runs under capture).
+    window = pos[None, :] >= (n_cand[:, None] - n_window[:, None]).clamp_min(0)
+    member |= window & valid & (n_window[:, None] > 0)
+    return member
+
+
+def order_members(member: Tensor, k_pages: int) -> tuple[Tensor, Tensor]:
+    """Compact member POSITIONS (into the candidate axis) to a FIXED width k in
+    sequence order, with no host read: returns ``(positions [B,k] padded to cp,
+    n_sel [B])``. cumsum gives each member's output slot (the same compaction
+    ``reference.select_pages`` uses). ``select_members`` never marks more than k
+    members, so every member rank is a valid slot; padded slots hold ``cp`` and
+    the gather caller masks them."""
+    b, cp = member.shape
+    k = min(k_pages, cp)
+    n_sel = member.sum(dim=1)
+    # Fixed-shape stable sort: members (key 0) before padding (key 1), ties keep
+    # candidate order, so the first k columns are the chosen positions in sequence
+    # order. argsort has a static [B,cp] output shape (unlike nonzero), so this is
+    # graph-capture-safe; padded slots hold cp and the caller masks them.
+    order = torch.sort(member.long(), dim=1, stable=True, descending=True).indices
+    idx = torch.arange(cp, device=member.device).expand(b, cp)
+    positions = idx.gather(1, order[:, :k])
+    return positions, n_sel
+
+
 class SparseTracker:
     """Engine-scoped bounds store, living independently of the KV pool so a
     page's bounds survive its demotion to the host: one preallocated fp16
@@ -112,6 +174,11 @@ class SparseTracker:
         self.bounds_t: dict[int, Tensor] = {}
         self.bounds_valid: dict[int, Tensor] = {}
         self.bounds_count: dict[int, int] = {}
+        #: device twin of ``resident``: logical page -> physical block, -1 if not
+        #: resident. The captured decode tick gathers selected blocks with one
+        #: index_select instead of a host resolve loop; the dict stays the owner
+        #: of residency and this mirrors it one scalar write per resolve/demote.
+        self.l2p_t: dict[int, Tensor] = {}
         #: resident private pages: req_id -> {logical page: physical block}
         self.resident: dict[int, dict[int, int]] = {}
         self.bytes_per_page = 0
@@ -127,12 +194,15 @@ class SparseTracker:
             (self.INIT_CAP, self.n_full, self.hkv, 2, self.dim),
             dtype=torch.float16, device=dev)
         self.bounds_valid[req_id] = torch.zeros(self.INIT_CAP, dtype=torch.bool, device=dev)
+        self.l2p_t[req_id] = torch.full(
+            (self.INIT_CAP,), -1, dtype=torch.long, device=dev)
         self.bounds_count[req_id] = 0
         self.resident.setdefault(req_id, {})
 
     def drop(self, req_id: int) -> None:
         self.bounds_t.pop(req_id, None)
         self.bounds_valid.pop(req_id, None)
+        self.l2p_t.pop(req_id, None)
         self.bounds_count.pop(req_id, None)
         self.resident.pop(req_id, None)
 
@@ -144,8 +214,21 @@ class SparseTracker:
         nt[:cap] = t
         nv = torch.zeros(new_cap, dtype=torch.bool, device=t.device)
         nv[:cap] = self.bounds_valid[rid]
+        nl = torch.full((new_cap,), -1, dtype=torch.long, device=t.device)
+        nl[:cap] = self.l2p_t[rid]
         self.bounds_t[rid] = nt
         self.bounds_valid[rid] = nv
+        self.l2p_t[rid] = nl
+
+    def map_resident(self, rid: int, page: int, phys: int) -> None:
+        """Mirror a resolve into the device l2p (grows if a new own page passed
+        the bounds tensor's capacity)."""
+        if page >= self.l2p_t[rid].shape[0]:
+            self._grow(rid, page + 1)
+        self.l2p_t[rid][page] = phys
+
+    def map_evict(self, rid: int, page: int) -> None:
+        self.l2p_t[rid][page] = -1
 
     def set_bounds(self, req_id: int, page: int, b: Tensor) -> None:
         b = b.contiguous().to(torch.float16)
@@ -192,21 +275,53 @@ class SparseForward:
     the last N candidates (8 for a prefill chunk, 0 on decode where the window
     IS the own span); ``own`` the own span's logical pages."""
 
-    def __init__(self, tracker: SparseTracker, rows: list[dict], device):
+    def __init__(self, tracker: SparseTracker, rows: list[dict], device,
+                 device_select: bool = False):
         self.tracker = tracker
         self.device = device
         self.rows = rows
         self.b = len(rows)
         self.n_groups = len(tracker.src_planes)
+        self.device_select = device_select
         self._chosen: dict[tuple[int, int], list[int]] = {}
         self._phys: dict[tuple[int, int], Tensor] = {}
         own_w = max(len(r["own"]) for r in rows)
+        self.own_w = own_w
         self.page_base = torch.zeros(self.b, dtype=torch.long, device=device)
         self.own_table = torch.zeros(self.b, own_w, dtype=torch.long, device=device)
         for i, r in enumerate(rows):
             self.page_base[i] = r["own"][0]
             self.own_table[i, : len(r["own"])] = torch.tensor(
                 [r["resolve"](p) for p in r["own"]])
+        if device_select:
+            self._init_device_tables()
+
+    def _init_device_tables(self) -> None:
+        """Fixed-width, capture-ready per-tick buffers (built once pre-forward;
+        replay copies into them). Candidate/own logical indices and the packed
+        own_len are static for the tick; only KV contents and q move."""
+        cmax = max((len(r["cand"]) for r in self.rows), default=0)
+        self.cmax = cmax
+        self.cand_idx = torch.zeros(self.b, cmax, dtype=torch.long, device=self.device)
+        self.own_log = torch.zeros(self.b, self.own_w, dtype=torch.long, device=self.device)
+        self.own_valid = torch.zeros(self.b, self.own_w, dtype=torch.bool, device=self.device)
+        self.n_cand = torch.zeros(self.b, dtype=torch.long, device=self.device)
+        self.win = torch.zeros(self.b, dtype=torch.long, device=self.device)
+        self.own_len_t = torch.zeros(self.b, dtype=torch.long, device=self.device)
+        for bi, r in enumerate(self.rows):
+            nc = len(r["cand"])
+            if nc:
+                self.cand_idx[bi, :nc] = torch.tensor(r["cand"], device=self.device)
+            no = len(r["own"])
+            self.own_log[bi, :no] = torch.tensor(r["own"], device=self.device)
+            self.own_valid[bi, :no] = True
+            self.n_cand[bi] = nc
+            self.win[bi] = r["force_window"]
+            self.own_len_t[bi] = r["own_len"]
+        #: cached per-group device outputs: phys [B,k] (0 pad), chosen logical [B,k]
+        self._dphys: dict[int, Tensor] = {}
+        self._dchosen: dict[int, Tensor] = {}
+        self._dnsel: dict[int, Tensor] = {}
 
     def _select(self, bi: int, plane: int, q: Tensor) -> Tensor:
         """Physical selected-block table [n] for row bi at this plane; a source
@@ -239,18 +354,77 @@ class SparseForward:
         self._phys[key] = phys
         return phys
 
+    def _select_device(self, plane: int, q: Tensor):
+        """Whole-batch selection for one source GROUP as pure device ops — no
+        ``.tolist()``/``.item()``, no per-row ``torch.tensor``, no host sync (the
+        captured decode tick). Gathers bounds once, scores all B rows, top-k UNION
+        window membership, compacts to a FIXED k width in sequence order, and maps
+        chosen logical pages to physical blocks via the device l2p. A gathered
+        -1 (a cold, non-resident pick) is masked to pad 0: the engine must only
+        reach here with the selection RESIDENT (the pin steady state); a tick that
+        would promote runs the eager path instead. Group-mates reuse the cache."""
+        g = self.tracker.group_of[plane]
+        if g in self._dphys:
+            return self._dphys[g], self._dnsel[g]
+        k = min(self.tracker.k_pages, self.cmax)
+        if self.cmax == 0:
+            phys = torch.zeros(self.b, 0, dtype=torch.long, device=self.device)
+            nsel = torch.zeros(self.b, dtype=torch.long, device=self.device)
+            chosen = torch.zeros(self.b, 0, dtype=torch.long, device=self.device)
+            self._dphys[g] = phys
+            self._dnsel[g] = nsel
+            self._dchosen[g] = chosen
+            return phys, nsel
+        # gather candidate bounds per row (B fixed index_selects — constant in the
+        # context length), then this plane's slice: [B,Cmax,Hkv,2,D].
+        br = [
+            self.tracker.bounds_rows(self.rows[bi]["req_id"], self.rows[bi]["cand"])
+            [:, plane]
+            for bi in range(self.b)]
+        # rows have equal Cmax candidate slots; pad short rows' bounds along axis 1.
+        bounds = torch.stack([
+            torch.nn.functional.pad(x, (0, 0, 0, 0, 0, 0, 0, self.cmax - x.shape[0]))
+            for x in br])
+        scores = quest_scores_batched(q, bounds)            # [B,Cmax]
+        member = select_members(scores, self.n_cand, self.tracker.k_pages, self.win)
+        positions, nsel = order_members(member, self.tracker.k_pages)  # [B,k]
+        valid = torch.arange(k, device=self.device)[None, :] < nsel[:, None]
+        safe_pos = positions.clamp_max(self.cmax - 1)
+        chosen = self.cand_idx.gather(1, safe_pos)          # logical pages [B,k]
+        chosen = torch.where(valid, chosen, torch.zeros_like(chosen))
+        phys = torch.stack([
+            self.tracker.l2p_t[self.rows[bi]["req_id"]].index_select(0, chosen[bi])
+            for bi in range(self.b)])                       # [B,k], -1 if cold
+        # A gathered -1 (cold pick) maps to pad 0 here. The captured gather cannot
+        # promote, so the ENGINE routes a tick here only in the pin steady state
+        # with every pick resident; that residency check runs on the host before
+        # capture, never in this tensor-only path.
+        phys = torch.where(valid, phys.clamp_min(0), torch.zeros_like(phys))
+        self._dphys[g] = phys
+        self._dnsel[g] = nsel
+        self._dchosen[g] = chosen
+        return phys, nsel
+
     def selected_pages(self, bi: int) -> set[int]:
         """Union of this row's logical pages chosen across ALL source groups this
         tick, plus the own span. Every group's choice co-resides until finalize, so
         the cross-tick pin keeps this exact set and demotes only what left it."""
         pages = set(self.rows[bi]["own"])
-        for g in range(self.n_groups):
-            pages.update(self._chosen.get((bi, g), ()))
+        if self.device_select:
+            for g in range(self.n_groups):
+                ch, ns = self._dchosen.get(g), self._dnsel.get(g)
+                if ch is not None:
+                    pages.update(int(x) for x in ch[bi, : int(ns[bi])].tolist())
+        else:
+            for g in range(self.n_groups):
+                pages.update(self._chosen.get((bi, g), ()))
         return pages
 
     def attention_args(self, plane: int, q: Tensor) -> tuple[Tensor, Tensor]:
         """Packed ``[selected ; own]`` table ``[B,W]`` and per-row packed
         ``seq_len = n_sel*16 + own_len`` for this plane's paged_attention."""
+        if self.device_select:
+            return self._attention_args_device(plane, q)
         packed, sl = [], []
         for bi, r in enumerate(self.rows):
             sel = self._select(bi, plane, q[bi, : r["tq"]])
@@ -262,6 +436,28 @@ class SparseForward:
         for i, t in enumerate(packed):
             table[i, : t.shape[0]] = t
         return table, torch.tensor(sl, dtype=torch.long, device=self.device)
+
+    def _attention_args_device(self, plane: int, q: Tensor) -> tuple[Tensor, Tensor]:
+        """Fixed-width ``[selected k ; own window]`` table ``[B,k+own_w]`` and
+        packed seq_len, both device tensors, one shape for the tick's life (the
+        graph captures one bucket). Selected pages occupy the compact leading
+        columns (padded 0 at the tail); each row's OWN follows at its own
+        ``nsel`` offset, so the packed physical order is causal. Zero host syncs;
+        seq_len already excludes the padding columns."""
+        sel, nsel = self._select_device(plane, q)
+        k = sel.shape[1]
+        # own physical blocks via the device l2p (own was resolved pre-forward).
+        own_phys = torch.stack([
+            self.tracker.l2p_t[self.rows[bi]["req_id"]].index_select(0, self.own_log[bi])
+            for bi in range(self.b)])
+        table = torch.zeros(self.b, k + self.own_w, dtype=torch.long, device=self.device)
+        table[:, :k] = sel
+        col = nsel[:, None] + torch.arange(self.own_w, device=self.device)[None, :]
+        # own_valid zeroes the physical pad beyond each row's own pages before scatter.
+        own_phys = own_phys.masked_fill(~self.own_valid, 0)
+        table.scatter_(1, col, own_phys)
+        sl = nsel * BLOCK_TOKENS + self.own_len_t
+        return table, sl
 
     def chosen(self, bi: int) -> set[int]:
         """Union of the row's group selections (kept for diagnostics)."""

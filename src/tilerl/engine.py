@@ -389,6 +389,7 @@ class Engine:
         decode: Any = None,
         sparse_tracker: Any = None,
         sparse_k: int = 0,
+        sparse_device_select: bool = False,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -401,6 +402,9 @@ class Engine:
         self._states = state_pool
         self._sparse = sparse_tracker
         self._sparse_k = sparse_k
+        #: decode ticks build the packed table with pure device selection (no host
+        #: sync) — the capture-ready path; valid only with the pin steady state.
+        self._sparse_device_select = sparse_device_select and sparse_tracker is not None
         self._prefix = prefix_store
         self.limits = limits
 
@@ -1220,7 +1224,10 @@ class Engine:
                               q_start=q_lo, q_hi=q_hi, decoding=decoding, tq=tq,
                               cand=cand, force_window=force_window, resolve=resolve,
                               reserved=reserved))
-        return SparseForward(tr, srows, self._backend.device)
+        return SparseForward(
+            tr, srows, self._backend.device,
+            device_select=self._sparse_device_select and bool(decodes)
+            and len(decodes) == len(rows))
 
     def _sparse_evict_victim(self, r: _Req, reserved: set[int]) -> None:
         """Free one frame this tick does NOT need, so a promotion can allocate.
@@ -1237,6 +1244,7 @@ class Engine:
             self._kv.demote_page(phys, key=(r.req_id, p))
             r.cold_pages.append(p)
             r.blocks.remove(phys)
+            self._sparse.map_evict(r.req_id, p)
             del live[p]
             return
         raise RuntimeError("sparse: no unreserved resident page to evict for a "
@@ -1261,6 +1269,7 @@ class Engine:
             new = self._kv.alloc_block()
         live[page] = new
         r.blocks.append(new)
+        tr.map_resident(r.req_id, page, new)
         return new
 
     def _sparse_finalize(self, sf, rows: list[_Req]) -> None:
@@ -1299,6 +1308,7 @@ class Engine:
                     kept_live[p] = phys                 # pin across ticks
                     continue
                 pool.demote_page(phys, key=(rid, p))
+                tr.map_evict(rid, p)
                 r.cold_pages.append(p)
             # r.blocks mirrors the live frames in LOGICAL page order (paged_attention
             # derives causal positions from the order), so sort the pinned set.
@@ -2136,6 +2146,7 @@ def build_engine(
     #: training-free Quest path (Unit F); "index" is a later PR. Requires kv_cold_bytes.
     sparse_k: int = 0,
     scorer: str = "bounds",
+    sparse_device_select: bool = False,
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
@@ -2317,4 +2328,5 @@ def build_engine(
         decode=decode,
         sparse_tracker=sparse_tracker,
         sparse_k=sparse_k,
+        sparse_device_select=sparse_device_select,
     )
