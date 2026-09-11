@@ -458,20 +458,31 @@ def _train_indexer_recall(args: argparse.Namespace, backend, model, log) -> dict
 
     cdir = Path(args.indexer_corpus)
 
-    def load(split: str, max_per_ctx: int = 0):
+    def load(split: str, max_total: int = 0):
         groups = {}
         for path in sorted(cdir.glob(f"{split}_*.jsonl")):
             rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
             ctx = rows[0]["ctx"]
-            if max_per_ctx:
-                rows = rows[:max_per_ctx]
             groups[str(ctx)] = [
                 torch.tensor(r["ids"], dtype=torch.long, device=backend.device).unsqueeze(0)
                 for r in rows]
-            log(f"{split} ctx={ctx}: {len(groups[str(ctx)])} prompts")
+        labels = sorted(groups)
+        for ctx in labels:
+            log(f"{split} ctx={ctx}: {len(groups[ctx])} prompts available")
+        if max_total:
+            # balanced round-robin across the sorted lengths: 16 over 3 -> 6/5/5,
+            # so the cut run is not weighted to cheap 8k spans.
+            import itertools
+            picked: dict[str, int] = {ctx: 0 for ctx in labels}
+            for ctx in itertools.islice(itertools.cycle(labels), max_total):
+                if picked[ctx] < len(groups[ctx]):
+                    picked[ctx] += 1
+            groups = {ctx: groups[ctx][: picked[ctx]] for ctx in labels}
+            for ctx in labels:
+                log(f"{split} ctx={ctx}: using {picked[ctx]} spans (balanced cut)")
         return groups
 
-    held = load("held", getattr(args, "held_per_ctx", 0))
+    held = load("held", getattr(args, "held_spans", 0))
     train_groups = load("train")
     # cycle training prompts across lengths in an interleaved order
     train_batches = [b for grp in zip_longest_flat(train_groups) for b in [grp] if b is not None]
@@ -2503,8 +2514,9 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "positions per span (256 -> O(256*T) instead of O(T^2)); 0 = all")
     p_train.add_argument("--q-min-pos", type=int, default=2048,
                          help="27B recall: sampled query positions are >= this (leaves missable pages)")
-    p_train.add_argument("--held-per-ctx", type=int, default=0,
-                         help="27B recall: cap held spans per length (balanced subset); 0 = all")
+    p_train.add_argument("--held-spans", type=int, default=0,
+                         help="27B recall: use a balanced round-robin subset of this many "
+                              "held spans across lengths (16 over 8k/16k/32k -> 6/5/5); 0 = all")
     p_train.add_argument("--rl", action="store_true",
                          help="GRPO: the engine samples a group per prompt, a reward scores "
                               "them, the group mean is the baseline (no critic)")
