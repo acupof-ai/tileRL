@@ -44,10 +44,16 @@ def load_rows(path: str | os.PathLike | None = None) -> list[dict]:
         br.STORE = old
 
 
-def latest_floor(rows: list[dict], metric: str, device_name: str) -> dict | None:
+def latest_floor(rows: list[dict], metric: str, device_name: str,
+                 uuid: str | None = None) -> dict | None:
     """The newest non-superseded calibration ``metric`` row for exactly this device
     name. A row for a different card name is refused by the caller (a V100's bandwidth
-    is not an H20's floor) — that is why the match is on the full name, not a prefix."""
+    is not an H20's floor) — that is why the match is on the full name, not a prefix.
+
+    Same-name cards are not equally fast (one H20 die measured 8% low at a 1830 vs
+    1980 MHz cap), so ``uuid`` (the physical GPU UUID, visible-index independent)
+    narrows to that card's own newest row when one exists. When no uuid row exists
+    the lookup falls back to the name pool, so pre-uuid rows stay valid floors."""
     superseded = {r["supersedes"] for r in rows if r.get("supersedes")}
     matches = [
         r
@@ -56,19 +62,25 @@ def latest_floor(rows: list[dict], metric: str, device_name: str) -> dict | None
         and r.get("device", {}).get("name") == device_name
         and r.get("id") not in superseded
     ]
+    if uuid is not None:
+        own = [r for r in matches if r.get("device", {}).get("uuid") == uuid]
+        if own:
+            matches = own
     return matches[-1] if matches else None
 
 
-def calibration(rows: list[dict], device_name: str) -> dict | None:
+def calibration(rows: list[dict], device_name: str,
+                uuid: str | None = None) -> dict | None:
     """The floors for a device, or None when the required bf16 pair is missing (then
     the renderer prints pending-remote rather than dividing by a half-calibration).
     The fp8 peak and the sparse ``pcie_gbs`` floor are both optional: absent → None,
-    so fp8/pcie columns render pending rather than borrow the bf16 ceiling."""
-    bw = latest_floor(rows, BW_METRIC, device_name)
-    peak = latest_floor(rows, PEAK_METRIC, device_name)
+    so fp8/pcie columns render pending rather than borrow the bf16 ceiling. A
+    physical ``uuid`` picks that card's own floors when a uuid row exists."""
+    bw = latest_floor(rows, BW_METRIC, device_name, uuid)
+    peak = latest_floor(rows, PEAK_METRIC, device_name, uuid)
     if bw is None or peak is None:
         return None
-    fp8 = latest_floor(rows, FP8_PEAK_METRIC, device_name)
+    fp8 = latest_floor(rows, FP8_PEAK_METRIC, device_name, uuid)
     pcie = latest_floor(rows, PCIE_METRIC, device_name)
     return {
         "bw_gbs": float(bw["value"]),
@@ -238,10 +250,14 @@ def measure_fp8_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> flo
     return (2 * n**3) / secs / 1e12
 
 
-def _row(metric: str, value: float, unit: str, device_name: str, card: int, derivation: str):
+def _row(metric: str, value: float, unit: str, device_name: str, card: int,
+         derivation: str, uuid: str | None = None):
     from .cli import _benchrec
 
     br = _benchrec()
+    device = {"name": device_name, "card": card}
+    if uuid is not None:
+        device["uuid"] = uuid
     return {
         "metric": metric,
         "value": float(value),
@@ -253,7 +269,7 @@ def _row(metric: str, value: float, unit: str, device_name: str, card: int, deri
         "warm": {"state": "warm", "compiles": None},
         "n": 1,
         "spread": 0,
-        "device": {"name": device_name, "card": card},
+        "device": device,
         "commit": br.git_commit(),
         "dirty": br.git_dirty(),
         "cmd": f"tilerl bench --calibrate --card {card}",
@@ -266,12 +282,22 @@ def _row(metric: str, value: float, unit: str, device_name: str, card: int, deri
     }
 
 
+def device_uuid(card: int) -> str:
+    """The physical GPU UUID in nvidia-smi's dashed form, independent of the visible
+    ordinal (CUDA_VISIBLE_DEVICES renumbers cards to 0); ties measured rows to the
+    die, not to whichever card happened to be masked in."""
+    import torch
+
+    return str(torch.cuda.get_device_properties(card).uuid)
+
+
 def calibrate_rows(card: int) -> list[dict]:
     """Measure the floors on one card and return the (un-appended) ledger rows.
     Cuda-only; the CLI refuses before calling this off a card."""
     import torch
 
     device_name = torch.cuda.get_device_name(card)
+    uuid = device_uuid(card)
     bw = measure_hbm_bw_gbs(card)
     peak = measure_bf16_peak_tflops(card)
     fp8_peak = measure_fp8_peak_tflops(card)
@@ -284,6 +310,7 @@ def calibrate_rows(card: int) -> list[dict]:
             device_name,
             card,
             "sustained D2D copy >=1 GiB, read+write, CUDA-event median; floor = this measurement",
+            uuid,
         ),
         _row(
             PEAK_METRIC,
@@ -292,6 +319,7 @@ def calibrate_rows(card: int) -> list[dict]:
             device_name,
             card,
             "one large bf16 square GEMM (2n^3 flops), CUDA-event median; floor = this measurement",
+            uuid,
         ),
         _row(
             FP8_PEAK_METRIC,
@@ -301,6 +329,7 @@ def calibrate_rows(card: int) -> list[dict]:
             card,
             "one large fp8 (e4m3) scaled square GEMM (2n^3 flops) through torch._scaled_mm, "
             "CUDA-event median; the ceiling for fp8 GEMM rows",
+            uuid,
         ),
         _row(
             PCIE_METRIC,
@@ -310,6 +339,7 @@ def calibrate_rows(card: int) -> list[dict]:
             card,
             "sustained pinned host->device copy >=1 GiB (one-way), CUDA-event median; "
             "the sparse cold-page PCIe fetch floor",
+            uuid,
         ),
     ]
 
