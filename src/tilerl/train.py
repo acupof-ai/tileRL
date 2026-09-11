@@ -401,7 +401,8 @@ def sample_query_positions(t: int, n: int, seed: int, min_pos: int,
 
 
 def indexer_capture(model: Any, ids: torch.Tensor, backend: Any, block: int,
-                    n_win_pages: int, q_positions: torch.Tensor | None = None):
+                    n_win_pages: int, q_positions: torch.Tensor | None = None,
+                    return_raw: bool = False):
     """Run the frozen base once (no grad) and build the indexer warm-up inputs
     from its four source layers. Returns
     ``(H, k_pages, target, n_pages, q_eval, bounds)``:
@@ -410,7 +411,9 @@ def indexer_capture(model: Any, ids: torch.Tensor, backend: Any, block: int,
     with the window excluded, the per-row page count, sampled post-rope queries
     [b,L,nq,hq,d], and per-page Quest bounds [b,L,pages,hkv,2,d] (kmin/kmax over
     the page's real tokens) for the training-free bounds recall. Shared by the
-    train step and the recall eval (one forward feeds both scorers)."""
+    train step and the recall eval (one forward feeds both scorers). When
+    ``return_raw`` the tuple ends with the PRE-renorm page mass (window still in,
+    rows sum to 1) for window-included recall controls."""
     from .sparse_index import exclude_window_renorm, index_source_groups
 
     b, t = ids.shape
@@ -475,7 +478,11 @@ def indexer_capture(model: Any, ids: torch.Tensor, backend: Any, block: int,
         k_pages = k_blocks.mean(dim=3)
         bounds = _page_bounds(k_blocks)
     target = exclude_window_renorm(mass, n_pages, n_win_pages)
-    return H, k_pages, target, n_pages, q_eval, bounds
+    base = (H, k_pages, target, n_pages, q_eval, bounds)
+    if return_raw:
+        # pre-renorm page mass still includes the window; rows sum to 1.
+        return (*base, mass)
+    return base
 
 
 def quest_bounds_scores(q_eval: torch.Tensor, bounds: torch.Tensor) -> torch.Tensor:
@@ -486,15 +493,33 @@ def quest_bounds_scores(q_eval: torch.Tensor, bounds: torch.Tensor) -> torch.Ten
     attention heads. A page hot for ANY sampled query is selectable. Bounds are
     stored fp16 exactly as the engine's page_bounds_one, so the scored selection
     is the served one (kmin/kmax rounded before the products)."""
+    return _quest(q_eval, bounds, pool_heads=True)
+
+
+def quest_bounds_scores_per_head(q_eval: torch.Tensor,
+                                 bounds: torch.Tensor) -> torch.Tensor:
+    """Same as :func:`quest_bounds_scores` but WITHOUT the GQA head mean: score
+    per attention head (repeat KV bounds over the group), max over queries, sum
+    over ALL heads. The #518 item-3 unpooled variant; [b,L,p]."""
+    return _quest(q_eval, bounds, pool_heads=False)
+
+
+def _quest(q_eval: torch.Tensor, bounds: torch.Tensor,
+           pool_heads: bool) -> torch.Tensor:
     b, l, nq, hq, d = q_eval.shape
     hkv = bounds.shape[3]
-    m = hq // hkv
-    qi = q_eval.float().reshape(b, l, nq, hkv, m, d).mean(dim=4)   # [b,L,nq,hkv,d]
-    kmin, kmax = bounds.to(torch.float16).float().unbind(dim=4)   # engine face
+    kmin, kmax = bounds.to(torch.float16).float().unbind(dim=4)   # [b,L,p,hkv,d]
+    if pool_heads:
+        qi = q_eval.float().reshape(b, l, nq, hkv, hq // hkv, d).mean(dim=4)
+    else:
+        qi = q_eval.float()                                        # [b,L,nq,hq,d]
+        rep = hq // hkv
+        kmin = kmin.repeat_interleave(rep, dim=3)
+        kmax = kmax.repeat_interleave(rep, dim=3)
     per = torch.maximum(
         qi[:, :, :, None, :, :] * kmin[:, :, None, :, :, :],
         qi[:, :, :, None, :, :] * kmax[:, :, None, :, :, :],
-    ).sum(dim=-1)                                                  # [b,L,nq,p,hkv]
+    ).sum(dim=-1)                                                  # [b,L,nq,p,kh]
     return per.amax(dim=2).sum(dim=-1)                             # [b,L,p]
 
 
