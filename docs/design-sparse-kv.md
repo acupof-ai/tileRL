@@ -79,6 +79,69 @@ stops at 64k tokens for one row; with bounds selection the device holds
 in host RAM (16 GiB per row in fp16) behind PCIe Gen3 (~12 GB/s, so a full
 128 MiB refetch is 11 ms; the delta is what the bench must show).
 
+## Measured on the 27B
+
+The account above was a prediction; the numbers below are measured on the
+Qwen3.8-27B held Chinese-wiki spans (256 seeded sampled query positions per
+span, 2026-09-11/12). Source entries:
+[wins/2026-09-11-learned-indexer-on-the-tape.md](experience/wins/2026-09-11-learned-indexer-on-the-tape.md)
+(recall, warm-up),
+[wins/2026-09-12-indexer-learns-concentrated-teacher-cpu.md](experience/wins/2026-09-12-indexer-learns-concentrated-teacher-cpu.md)
+(learnability).
+
+**Recall of dense attention mass vs k (window included).** random / bounds /
+oracle top-k over 256 positions:
+
+| ctx | k | random | bounds | oracle |
+|---|---:|---:|---:|---:|
+| 16384 | 128 | 0.136 | 0.235 | 0.370 |
+| 16384 | 256 | 0.252 | 0.400 | 0.571 |
+| 16384 | 512 | 0.503 | 0.668 | 0.815 |
+| 32768 | 128 | 0.064 | 0.158 | 0.296 |
+| 32768 | 256 | 0.133 | 0.263 | 0.455 |
+| 32768 | 512 | 0.248 | 0.433 | 0.652 |
+| 32768 | 1024 | 0.507 | 0.687 | 0.858 |
+
+At 32k even the oracle top-128 holds only 0.30 of mass and the oracle does not
+reach 0.9 until k ≈ 1100–1200; bounds tracks ~0.17–0.22 below the oracle. The
+full-attention mass is diffuse — this is the property that sets k, not the
+scorer (random/bounds/oracle differ only by a constant gap).
+
+**The 16 full-attn layers are genuinely global.** At sampled queries ≥ 2048,
+page-0 sink mass is 0.005 / 0.002 and the last-8-page window is 0.001 / 0.004
+of total mass at 16k / 32k. Locality lives in the GDN layers; including the
+window in recall adds ~0, so the recall numbers are not a window artifact.
+
+**The warm-up recipe is sound; the 27B teacher is the limit.** The learned
+warm-up made 27B recall worse (0.28 → 0.10) toward the diffuse teacher, but a
+card-free CPU-tiny control that drives the real page-mass KL, tape backward
+and AdamW against a concentrated, exactly-representable fixed teacher fits
+and generalizes on held batches across 3 seeds (n=1024 points each): KL
+4.02 ≈ ln(56) uniform → 0.73–0.82 at lr 0.02 and → 2.38–2.43 at lr/10,
+recall@4 0.08 → 0.18–0.24 both LRs. The loss and heads-pooled target learn;
+diffuse mass gives them little to recover. The indexer unit parks until k and
+output fidelity settle.
+
+**The SLO changes from mass to output fidelity.** The pre-registered
+"recall ≥ 0.9 at k=2048" mass gate is replaced by output fidelity — per-token
+KL(dense‖sparse), top-1 agreement and greedy-continuation agreement vs the
+dense forward (`scripts/output_fidelity.py`,
+`scripts/fidelity_checks.py`): diffuse mass can still yield token-equal
+outputs, so mass fraction is the wrong acceptance quantity. The chosen k is
+pending the sm70 full-k continuity row (k = pages−8 must be KL ≈ 0 / top1 ≈ 1)
+and the multi-span dense-vs-sparse table; no k above 128 is the default yet.
+
+**k > 128 also needs an engine/ledger change, not just a flag.** The hot pool
+is sized `slots × (n_groups·k + WINDOW_PAGES + chunk) + 1` — the four source
+groups each reserve their own k pages (no cross-group union). Measured on the
+V100 (#539 review): k=128 → 1107 blocks / 1.08 GiB; k=1024 → 4137 pages per
+slot ≈ 4.0 GiB f32 K (≈ 8 GiB K+V) at one slot and 33,097 blocks ≈ 32 GiB K at
+the default 8 slots, which does not fit with the 27B weights on a 32 GB sm70
+card. Any k decision above 128 requires the per-tick resident set to hold the
+cross-group union (engine change), and the ledger `kv_hot` row must count
+`n_groups·k` rather than `k`. See the [#539](https://github.com/acupof-ai/tileRL/pull/539)
+review thread.
+
 ## Selection is page-granular
 
 `BLOCK_TOKENS = 16`. The indexer scores tokens; the selector max-pools scores
@@ -140,6 +203,10 @@ attention mass at k=2048 >= 0.9 on 128k held-out prompts after warm-up, and
 the P1 eval delta between sparse and dense <= the run-to-run noise measured by
 two dense seeds. A miss on recall is a science result (the single-card token
 budget was not enough), recorded in `errors/` with the token count.
+
+> 2026-09-12: the 27B measurements below supersede this mass gate — the SLO is
+> now output fidelity vs dense, and k=128 is not the default. See
+> [Measured on the 27B](#measured-on-the-27b).
 
 ## Kernels
 
