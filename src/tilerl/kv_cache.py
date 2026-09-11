@@ -378,79 +378,263 @@ class PagedKvPool:
         return (tokens + BLOCK_TOKENS - 1) // BLOCK_TOKENS
 
 
+class ColdSsdFile:
+    """One mmap'd spill file for cold pages past the host-RAM budget.
+
+    Fixed-stride slots; the caller keys a page by an OPAQUE stable key (the
+    sparse engine passes ``(req_id, logical page)``) and this file maps it to a
+    monotonic slot whose offset is ``header + slot*stride``. Keys cannot be
+    slots: a physical frame is recycled while an older page stays cold, so
+    numbering slots by the key would alias two pages. Freed slots return to a
+    LIFO free list. Presence is the in-memory key->slot map — this is the
+    *serving* spill for one process, not boot (KvBootStore keys by prefix and
+    has its own manifest). The file grows on a new slot; the mapping is
+    remapped on growth.
+    """
+
+    HEADER = 4096
+
+    def __init__(self, path: str, spec: list[tuple[str, tuple, str, int]]) -> None:
+        import json
+        import mmap
+
+        import numpy as np
+
+        self._np = np
+        self._mmap = mmap
+        self._path = path
+        self._spec = spec
+        self.stride = sum(n for *_k, n in spec)
+        self._slot_of: dict = {}
+        self._free_slots: list = []
+        self._next_slot = 0
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        new = not os.path.exists(path) or os.path.getsize(path) == 0
+        if new:
+            with open(path, "wb") as create:
+                create.close()  # create so the seekable r+b handle can open it
+        self._f = open(path, "r+b")  # noqa: SIM115 — long-lived mmap-backed handle, closed in close()
+        if new:
+            self._f.write(json.dumps(spec).encode().ljust(self.HEADER, b"\0"))
+            self._f.flush()
+        self._map = None
+        self._slots = 0
+        self._remap()
+
+    def _remap(self) -> None:
+        if self._map is not None:
+            self._map.close()
+        self._slots = (os.path.getsize(self._path) - self.HEADER) // self.stride
+        if self._slots:
+            self._map = self._mmap.mmap(self._f.fileno(), 0)
+        else:
+            self._map = None
+
+    def _alloc_slot(self) -> int:
+        if self._free_slots:
+            return self._free_slots.pop()
+        slot = self._next_slot
+        self._next_slot += 1
+        if slot >= self._slots:
+            size = self.HEADER + (slot + 1) * self.stride
+            # ftruncate alone is not visible in this process's Python-side file size;
+            # flush to disk, seek to the new end and write a byte so getsize()/the
+            # next remap see the grown size before re-mapping.
+            self._f.flush()
+            self._f.seek(size - 1)
+            self._f.write(b"\0")
+            self._f.flush()
+            self._remap()
+        return slot
+
+    def write(self, key, blob: dict) -> None:
+        slot = self._alloc_slot()
+        off = self.HEADER + slot * self.stride
+        for k, _shape, _dt, n in self._spec:
+            self._map[off: off + n] = blob[k].contiguous().view(torch.uint8).numpy().tobytes()
+            off += n
+        self._slot_of[key] = slot
+        # No per-page flush: the page cache writes this back; the serving spill
+        # is an in-process capacity tier, not a durability log (KvBootStore is).
+
+    def read(self, key, pin: bool) -> dict:
+        slot = self._slot_of[key]
+        off = self.HEADER + slot * self.stride
+        blob = {}
+        for k, shape, dt, n in self._spec:
+            t = torch.empty(shape, dtype=getattr(torch, dt), device="cpu",
+                            pin_memory=pin)
+            # flat byte views: view(uint8) changes the trailing dim, never numel,
+            # so both sides flatten first. A numpy view of the WHOLE writable mmap
+            # (offset, not a read-only bytes slice) feeds copy_ with zero copies.
+            src = torch.from_numpy(
+                self._np.frombuffer(self._map, dtype=self._np.uint8,
+                                    count=n, offset=off))
+            t.view(torch.uint8).reshape(-1).copy_(src)
+            blob[k] = t
+            off += n
+        return blob
+
+    def forget(self, key) -> None:
+        slot = self._slot_of.pop(key, None)
+        if slot is not None:
+            self._free_slots.append(slot)
+
+    def __contains__(self, key) -> bool:
+        return key in self._slot_of
+
+    def __len__(self) -> int:
+        return len(self._slot_of)
+
+    def close(self) -> None:
+        if self._map is not None:
+            self._map.close()
+        self._f.close()
+
+
+def _blob_spec(blob: dict) -> list[tuple[str, tuple, str, int]]:
+    """The deterministic per-slot layout: key, shape, dtype name, bytes."""
+    return [(k, tuple(t.shape), str(t.dtype).replace("torch.", ""),
+             t.numel() * t.element_size()) for k, t in blob.items()]
+
+
 class HostKvPages:
     """Pinned-host tier for DEMOTED KV pages (the sparse-KV cold set), the block
     counterpart of :class:`DramSnapshots` for state. Holds one blob per demoted
-    block id: every plane's K/V and the fp8 ``k_scale``/``v_scale`` planes.
+    key (an int physical block on the #500 seam, a (req, page) tuple on the
+    sparse path): every plane's K/V and the fp8 ``k_scale``/``v_scale`` planes.
 
     Lifecycle mirrors the state tier but the pool frees the device frame on
     :meth:`PagedKvPool.demote_page` and promotion ALLOCATES A NEW block from the
-    same pool — a demoted id is a tier key, not a live device block. Byte-LRU
+    same pool — a cold key is a tier key, not a live device block. Byte-LRU
     evicts when the pinned budget binds. Prefix-shared pages are never demoted
     (they stay read-only wherever they live); :meth:`demote_page` refuses them.
     """
 
-    def __init__(self, budget_bytes: int = 4 << 30) -> None:
+    def __init__(self, budget_bytes: int = 4 << 30, ssd_path: str = "") -> None:
         self.budget_bytes = budget_bytes
-        self._held: OrderedDict[int, int] = OrderedDict()
-        self._blobs: dict[int, dict] = {}
+        #: opaque cold key -> held bytes / blob (int block on #500, (req,page) tuple on sparse)
+        self._held: OrderedDict[Any, int] = OrderedDict()
+        self._blobs: dict[Any, dict] = {}
         self._used = 0
         self.demotions = 0
         self.promotions = 0
         self.drops = 0
+        #: pages evicted past the host budget live here, under the opaque cold
+        #: key (int phys for #500, (req, page) tuple for sparse); "" = SSD off.
+        self._ssd_path = ssd_path
+        self._ssd = None
+        self._ssd_bytes = 0
+        self._ssd_page_bytes: dict = {}
+        self._staging: dict | None = None  # one reused pinned promote buffer
 
-    def __contains__(self, block_id: int) -> bool:
-        return block_id in self._held
+    @property
+    def bytes_held(self) -> int:
+        """Bytes in host RAM (the pinned budget this tier caps). SSD is separate."""
+        return self._used
 
-    def hold(self, block_id: int, blob: dict, nbytes: int) -> bool:
-        """Pin one page blob; True when held. A page larger than the whole budget is
-        dropped, and LRU pages are evicted to fit (a demotion that evicts itself is a
-        drop, not a hold)."""
-        if not nbytes or nbytes > self.budget_bytes or block_id in self._held:
+    @property
+    def ssd_bytes(self) -> int:
+        return self._ssd_bytes
+
+    def _evict_to_ssd(self, victim: int) -> bool:
+        """Move one host-resident page to the spill file. False (drop) when no file."""
+        blob = self._blobs.pop(victim, None)
+        n = self._held.pop(victim, 0)
+        if not self._ssd_path:
             self.drops += 1
             return False
-        self._blobs[block_id] = blob
-        self._held[block_id] = nbytes
+        if self._ssd is None:
+            self._ssd = ColdSsdFile(self._ssd_path, _blob_spec(blob))  # first spill fixes layout
+        self._ssd.write(victim, blob)
+        self._ssd_bytes += n
+        self._used -= n
+        return True
+
+    def __contains__(self, key) -> bool:
+        return key in self._held or (self._ssd is not None and key in self._ssd)
+
+    def hold(self, key, blob: dict, nbytes: int) -> bool:
+        """Pin one page blob; True when held (in host RAM or spilled to SSD).
+
+        A page larger than the whole host budget demotes straight to the spill
+        file when one is attached. Over-budget pages evict LRU to SSD; without a
+        spill file an LRU/self eviction is a drop, as before. ``key`` is opaque:
+        an int physical id (#500 retier seam) or a (req, page) tuple (sparse)."""
+        if not nbytes or key in self:
+            self.drops += 1
+            return False
+        if nbytes > self.budget_bytes:
+            if not self._ssd_path:
+                self.drops += 1
+                return False
+            self._write_ssd(key, blob, nbytes)
+            return True
+        self._blobs[key] = blob
+        self._held[key] = nbytes
         self._used += nbytes
         self.demotions += 1
         while self._used > self.budget_bytes:
             victim, dropped = self._held.popitem(last=False)
-            self._blobs.pop(victim, None)
+            vblob = self._blobs.pop(victim)
             self._used -= dropped
-            self.drops += 1
-            if victim == block_id:
-                self._blobs.pop(block_id, None)
-                return False
+            if self._ssd_path:
+                self._write_ssd(victim, vblob, dropped)
+            else:
+                self.drops += 1
         return True
 
-    def take(self, block_id: int) -> dict | None:
-        """Remove and return the page blob, or None if it was never held or evicted."""
-        n = self._held.pop(block_id, None)
-        blob = self._blobs.pop(block_id, None)
-        if n is None or blob is None:
-            return None
-        self._used -= n
-        self.promotions += 1
-        return blob
+    def _write_ssd(self, key, blob: dict, nbytes: int) -> None:
+        """Move a page already removed from host accounting onto the spill file."""
+        if self._ssd is None:
+            self._ssd = ColdSsdFile(self._ssd_path, _blob_spec(blob))
+        self._ssd.write(key, blob)
+        self._ssd_bytes += nbytes
+        self._ssd_page_bytes[key] = nbytes
 
-    def forget(self, block_id: int) -> None:
-        n = self._held.pop(block_id, None)
-        self._blobs.pop(block_id, None)
+    def take(self, key) -> dict | None:
+        """Remove and return the page blob — from host RAM, or read back through
+        the SSD spill path — or None if neither tier has it."""
+        n = self._held.pop(key, None)
+        blob = self._blobs.pop(key, None)
+        if blob is not None:
+            self._used -= n
+            self.promotions += 1
+            return blob
+        if self._ssd is not None and key in self._ssd:
+            pin = torch.cuda.is_available()  # promote H2D wants a pinned source
+            blob = self._ssd.read(key, pin)
+            self._ssd.forget(key)
+            self._ssd_bytes -= self._ssd_page_bytes.pop(key, self._ssd.stride)
+            self.promotions += 1
+            return blob
+        return None
+
+    def forget(self, key) -> None:
+        n = self._held.pop(key, None)
+        self._blobs.pop(key, None)
         if n is not None:
             self._used -= n
-
-    @property
-    def bytes_held(self) -> int:
-        return self._used
+        elif self._ssd is not None and key in self._ssd:
+            self._ssd.forget(key)
+            self._ssd_bytes -= self._ssd_page_bytes.pop(key, self._ssd.stride)
 
     def stats(self) -> dict[str, int]:
         return {
             "kv_cold_pages": len(self._held),
             "kv_cold_bytes": self._used,
+            "kv_cold_ssd_pages": 0 if self._ssd is None else len(self._ssd),
+            "kv_cold_ssd_bytes": self._ssd_bytes,
             "kv_cold_demotions": self.demotions,
             "kv_cold_promotions": self.promotions,
             "kv_cold_drops": self.drops,
         }
+
+    def close(self) -> None:
+        """Release the spill file's mmap and handle (host RAM is GC'd with the blobs)."""
+        if self._ssd is not None:
+            self._ssd.close()
+            self._ssd = None
 
 
 class LinearStatePool:
