@@ -92,7 +92,8 @@ def test_latest_floor_keys_on_the_physical_uuid_when_uuid_rows_exist(tmp_path):
     p2.parent.mkdir()
     p2.write_text("".join(json.dumps(r) + "\n" for r in (ra, rb, bw)))
     got = cal.calibration(cal.load_rows(p2), H20, ua)
-    assert got == {"bw_gbs": 3312.0, "peak_tflops": 136.5}
+    assert got == {"bw_gbs": 3312.0, "peak_tflops": 136.5,
+                   "peak_metric": cal.PEAK_METRIC}
 
 
 def test_newest_row_wins_and_superseded_skipped(tmp_path):
