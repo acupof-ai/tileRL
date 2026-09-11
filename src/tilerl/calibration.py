@@ -444,7 +444,6 @@ def _pack_fp4_chunked(w, row_chunk: int = 2048):
     lm_head wants ~100 GiB whole. Both pack and renorm are per-row, so chunking
     is bit-identical while bounding the transient to row_chunk*K*8 bytes."""
     import torch
-
     from tilerl_kernels import reference
 
     wqs, scales, oscales = [], [], []
