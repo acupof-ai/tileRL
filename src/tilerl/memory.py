@@ -63,6 +63,25 @@ def draft_per_block_bytes(cfg, kv_io, draft_layers: int) -> int:
     )
 
 
+def per_cold_kv_block_bytes(cfg, kv_io, kv_fp8=None, cold_dtype=None) -> int:
+    """Bytes ONE demoted page occupies in the host/SSD tier, mirroring
+    ``PagedKvPool._page_blob`` plane for plane. K/V take the narrow cold dtype when
+    set (sm70 narrows its f32 pool to f16); otherwise the pool's own storage dtype
+    (fp8 payload when kv_fp8 is on, else kv_io). The fp8 per-head_dim scale planes
+    always stay f32."""
+    planes = 2 * len(cfg.full_attn_layers)
+    shape = (planes, cfg.num_kv_heads, BLOCK_TOKENS, cfg.head_dim)
+    if cold_dtype is not None:
+        total = nbytes(_dtype_fmt(cold_dtype), shape)
+    elif kv_fp8 is not None:
+        total = nbytes(kv_format(cfg.head_dim), shape)
+    else:
+        total = nbytes(_dtype_fmt(kv_io), shape)
+    if kv_fp8 is not None:
+        total += 2 * planes * cfg.num_kv_heads * BLOCK_TOKENS * 4
+    return total
+
+
 def fit_num_blocks(
     cfg, device_free: int, kv_io, kv_fp8=None, draft_layers: int = 0, cap: int = 0, floor: int = 64
 ) -> int:
