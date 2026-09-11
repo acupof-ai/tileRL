@@ -503,8 +503,35 @@ def indexer_warmup_run(model: Any, backend: Any, train_batches: list,
         tokens_seen += int(ids.numel())
     after = recalls()
     return {"recall_before": before, "recall_after": after, "kl_curve": curve,
-            "tokens_seen": tokens_seen, "steps": steps,
+            "tokens_seen": tokens_seen, "steps": steps, "weights": weights,
             "k_pages": k_pages_pick, "di": weights["iq"].shape[-1]}
+
+
+def load_span_corpus(cdir: Any, device) -> dict:
+    """Load a prepared span dir (scripts/prepare_indexer_corpus) into
+    ``{length_label: [id tensors]}``, split prefix as given by the filenames."""
+    import json
+    from pathlib import Path
+
+    groups: dict = {}
+    for path in sorted(Path(cdir).glob("*_*.jsonl")):
+        split, ctx = path.stem.split("_", 1)
+        if split != "held":
+            continue
+        rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+        groups[ctx] = [torch.tensor(r["ids"], dtype=torch.long, device=device).unsqueeze(0)
+                       for r in rows]
+    return groups
+
+
+def indexer_held_recall(model: Any, backend: Any, cdir: Any,
+                        weights: dict[str, torch.Tensor], k_pages_pick: int) -> dict:
+    """Gradient-free mean recall per span length over a held-only span dir, under
+    the supplied (already-trained) weights — the cross-corpus control."""
+    groups = load_span_corpus(cdir, backend.device)
+    return {label: sum(indexer_recall(model, ids, backend, weights, k_pages_pick)
+                       for ids in batches) / len(batches)
+            for label, batches in groups.items()}
 
 
 def train_step(

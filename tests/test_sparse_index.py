@@ -412,3 +412,28 @@ def test_warmup_capture_handles_a_non_block_divisible_sequence():
     assert 0.0 <= train.indexer_recall(m, ids, be, w, 2) <= 1.0
     loss = train.indexer_warmup_step(m, ids, be, w, train.AdamW(lr=0.02))
     assert loss == loss  # not NaN
+
+
+def test_indexer_held_recall_from_a_prepared_dir(tmp_path):
+    """The cross-corpus control loader must read held-only spans from a prep dir
+    and return a finite recall per length under given weights."""
+    import json
+
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl import config, model, train
+
+    be = get_backend()
+    m = model.build_random(config.tiny(), seed=0)
+    gen = torch.Generator().manual_seed(0)
+    w = train.init_indexer_weights(m.cfg, gen, be.device, 16)
+    d = tmp_path / "corpus"
+    d.mkdir()
+    for split, n in (("held", 2), ("train", 3)):  # train spans must be ignored
+        with open(d / f"{split}_256.jsonl", "w") as fh:
+            for _ in range(n):
+                fh.write(json.dumps({"ctx": 256,
+                                     "ids": torch.randint(0, m.cfg.vocab_size, (256,)).tolist()}) + "\n")
+    rec = train.indexer_held_recall(m, be, d, w, k_pages_pick=2)
+    assert set(rec) == {"256"}
+    assert 0.0 <= rec["256"] <= 1.0 and rec["256"] == rec["256"]  # finite

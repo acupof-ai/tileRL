@@ -437,6 +437,15 @@ def _train_indexer_recall(args: argparse.Namespace, backend, model, log) -> dict
         seed=args.seed, di=args.indexer_di)
     out["secs_total"] = time.perf_counter() - t0
     out["corpus"] = file_hash(str(cdir / "manifest.json")) if (cdir / "manifest.json").exists() else None
+    # Optional cross-corpus control: held-only recall before/after under the SAME
+    # trained weights (e.g. English cosmo 8k after training on Chinese wiki),
+    # showing recall is not a tokenization/language artifact.
+    if args.indexer_control_corpus:
+        cdir2 = Path(args.indexer_control_corpus)
+        out["control"] = train_mod.indexer_held_recall(
+            model, backend, cdir2, out["weights"], args.k_pages)
+        out["control_corpus"] = file_hash(str(cdir2 / "manifest.json")) \
+            if (cdir2 / "manifest.json").exists() else None
     for i, v in enumerate(out["kl_curve"]):
         if (i + 1) % max(1, args.steps // 20) == 0 or i == 0:
             log(f"step {i + 1:4d}/{args.steps}  kl {v:.4f}")
@@ -468,7 +477,8 @@ def _train_indexer_warmup(args: argparse.Namespace) -> None:
         "lr": args.lr, "seed": args.seed,
         "k_pages": getattr(args, "k_pages", None),
         "indexer_di": getattr(args, "indexer_di", None),
-        "indexer_corpus": args.indexer_corpus})
+        "indexer_corpus": args.indexer_corpus,
+        "indexer_control_corpus": args.indexer_control_corpus})
     if args.steps == 0:
         manifest["gates"] = []
         manifest["finished"] = now()
@@ -483,12 +493,17 @@ def _train_indexer_warmup(args: argparse.Namespace) -> None:
     if args.indexer_corpus:
         out = _train_indexer_recall(args, backend, model, log)
         acc = args.recall_threshold
-        manifest["metrics"] = {
+        metrics = {
             "tokens_seen": out["tokens_seen"], "k_pages": out["k_pages"], "di": out["di"],
             "kl_first": out["kl_curve"][0], "kl_last": out["kl_curve"][-1],
-            "secs_total": out["secs_total"],
+            "secs_total": out["secs_total"], "corpus": out.get("corpus"),
             **{f"recall_before_{k}": v for k, v in out["recall_before"].items()},
             **{f"recall_after_{k}": v for k, v in out["recall_after"].items()}}
+        if "control" in out:
+            metrics["control_corpus"] = out.get("control_corpus")
+            metrics.update({f"control_recall_{k}": v
+                           for k, v in out["control"].items()})
+        manifest["metrics"] = metrics
         # Accept: mean after-recall across held-out lengths clears the threshold;
         # per-length recall is recorded (the pre-registered mixture scope).
         afters = list(out["recall_after"].values())
@@ -2370,6 +2385,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="indexer head dim (V4.1 releases 128)")
     p_train.add_argument("--recall-threshold", type=float, default=0.9,
                          help="27B indexer recall acceptance: mean recall@k_pages after warm-up")
+    p_train.add_argument("--indexer-control-corpus",
+                         help="held-only span dir: cross-corpus control recall under the trained weights")
     p_train.add_argument("--rl", action="store_true",
                          help="GRPO: the engine samples a group per prompt, a reward scores "
                               "them, the group mean is the baseline (no critic)")
