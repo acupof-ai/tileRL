@@ -121,9 +121,12 @@ The verdict report must split held-out accuracy **by truncated vs finished**:
 a row that ends at the cap scores 0 and is reported as truncated, so a
 cap-bound batch cannot print headroom it does not have.
 
-Launch: seed 0 on card 6 and seed 1 on card 7 **in parallel**, each
-`--max-new-tokens 768` (~2.7 h/seed), disjoint remote trees; pre-rollout
-baselines are re-measured in each process and reported per seed.
+Relaunch (record, not a plan): both seeds started 2026-09-11 02:54Z at tree
+5e2e5794, `--max-new-tokens 768`, on disjoint remote trees — **seed 0 on card
+6 = run `0622261a06f9`** (cwd `/work/tilerl-65`) and **seed 1 on card 7 = run
+`fcf91735cf1c`** (cwd `/work/tilerl-65b`), in parallel; each process
+re-measured the pre-rollout baselines. Both finished 100 steps; the verdict
+is appended above and in the linked errors entry.
 
 
 ## Verdict 2026-09-11: REJECTED — the two-seed run

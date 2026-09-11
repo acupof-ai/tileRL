@@ -17,14 +17,19 @@ rollout-length collapse.
 
 ## The two seeds
 
-| seed | run | GSM8K before→after | paired flips b/c (wrong→right / right→wrong) | McNemar z | MMLU before→after | tied | tokens first→last |
+| seed | run | GSM8K before→after | paired flips b/c (right→wrong / wrong→right) | McNemar z | MMLU before→after | tied | tokens first→last |
 |---:|---|---:|---|---:|---:|---:|---:|
 | 0 | 0622261a06f9 | 458 → 448 (−10) | 34 / 24 | −1.31 | 0.751 → 0.817 | 0.21 | 266.8 → 281.2 |
 | 1 | fcf91735cf1c | 456 → 482 (+26) | 6 / 32 | +4.22 | 0.751 → 0.739 | 0.41 | 298.0 → 242.2 |
 
+`b`/`c` are the manifest's `_mcnemar` fields: `b` = right→wrong, `c` =
+wrong→right (`delta = (c - b)/n`). Seed 0 loses because 34 answers went right
+to wrong and only 24 reversed; seed 1 gains because 32 flipped wrong to right
+against 6 lost.
+
 The paired test (manifest `gsm8k_paired`) confirms what the counts say: seed 1
-is a real gain (32 questions flipped right vs 6 wrong, z ≈ 4.2), seed 0 is a
-non-significant loss (34/24, |z| 1.3).
+is a real gain (32 wrong→right vs 6 right→wrong, z ≈ 4.2), seed 0 is a
+non-significant loss (34 right→wrong vs 24 wrong→right, |z| 1.3).
 
 ## The gate is "both seeds"; one pass is a reject
 
