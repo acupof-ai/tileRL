@@ -22,12 +22,14 @@ from tilerl_kernels.reference import (
 )
 
 from tilerl import config as config_mod
+from tilerl.engine import card_guard
 from tilerl.model import fp4_param_keys, load_hf, requantize_fp4
 
 
 def main():
     ck = os.environ.get("TILERL_27B_CKPT")
     assert ck, "set TILERL_27B_CKPT"
+    card_guard()  # materialize touches the card: refuse before touching an ungranted one
     backend = get_backend()
     print("arch", backend.arch, "device", torch.cuda.get_device_name(0))
     cfg = config_mod.qwen38_27b()
