@@ -32,12 +32,29 @@ Dense rows measured; sparse rows are blanks until the runs below return.
 | H20 | dense | 131072 | **88.6** | 0.676 | **58.28** | **8.02** | 0 |
 | H20 | sparse k=128 | 131072 | _pending_ | | _pending_ | | 12.0 |
 | V100 | dense (f32) | 32768 | **594.6** | 18.15 | **8.28** | **4.04** | 0 |
-| V100 | sparse k=128 | 32768 | _pending_ | | _pending_ | | 16.0 |
+| V100 | sparse k=128 | 32768 | **341.3** | 10.42 | **1.252** | 1.16 | 0 at finish |
 | V100 | sparse k=128 | 131072 | _pending_ (no dense pair — dense cannot fit) | | _pending_ | | 20.0 |
 
 Dense controls: H20 128k prefill 88.621 s / decode 58.279 tok/s (17.2 ms/tok) /
 KV 8612478976 B; V100 32k prefill 594.578 s / decode 8.278 tok/s
 (120.8 ms/tok) / KV 4339007488 B.
+
+**V100 32k sparse — prefill wins, decode loses** (head 95f69fe7, eager,
+64 prefill ticks, 64 decode tokens skip 16): prefill 341.335 s =
+10.417 ms/tok (**1.74x faster than dense**); decode 1.252 tok/s =
+**798.4 ms/tok, 6.6x SLOWER than dense**; device KV 1.16 GiB (1107-block hot
+pool = 4 Quest groups × 128 + window + chunk). Cold host reads 0 at finish
+because `_release` forgets the request's cold blobs; the tier cycles pages
+every tick while running. The asymmetry is unit F's merge state:
+`_sparse_finalize` demotes every resident page after each tick ("the
+cross-tick hot set is the later perf PR"), so prefill amortizes each fetched
+page across a 512-query chunk while decode re-fetches, per token, the union of
+all four source groups — up to 512 pages, each `promote_keyed` ending in a
+full `cuda.synchronize`, i.e. up to 512 serial ~1 MiB pinned H2D copies per
+token. The 0.37–0.43 ms sparse-attention decode figure the prediction below
+used was a hot-resident measure, not this demote-all state, so the decode
+prediction missed by ~10x. The remedy is a pinned cross-tick hot set, not the
+selector.
 
 ## Sparse launch commands
 
