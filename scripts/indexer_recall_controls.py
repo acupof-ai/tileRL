@@ -45,8 +45,8 @@ def cap(mass, pages, include_window):
 
 def main():
     backend = get_backend()
-    model = _build_model("qwen38-27b", seed=SEED, keep_master=False,
-                         backend=backend)
+    _cfg, model = _build_model("qwen38-27b", seed=SEED, keep_master=False,
+                               backend=backend)
     gen = torch.Generator(device=backend.device).manual_seed(SEED)
     w = init_indexer_weights(model.cfg, gen, backend.device, 128)
     out = {}
