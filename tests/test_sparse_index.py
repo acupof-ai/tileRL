@@ -352,3 +352,29 @@ def test_streaming_long_sequence_teacher_matches_naive_dense_pooling():
     l1 = got.sum(-1)
     late = l1[0, block:]
     assert torch.allclose(late, torch.ones_like(late), atol=1e-4)
+
+
+def test_indexer_recall_wires_to_the_trained_weights_on_tiny():
+    """The runtime recall wrapper must read the SAME iq/ik weights the warm-up
+    step updates: training on a frozen batch must not leave recall unchanged in
+    the improving direction (guards a detached/rebound weight, the id()-class
+    failure the tape docs warn about). Random tiny teacher is near-uniform, so
+    this asserts a strict rise, not the 27B 0.9 level."""
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl import config, model, train
+
+    be = get_backend()
+    m = model.build_random(config.tiny(), seed=0)
+    gen = torch.Generator().manual_seed(0)
+    hkv, dk, hid, di = m.cfg.num_kv_heads, m.cfg.head_dim, m.cfg.hidden_size, 16
+    w = {"iq": 0.1 * torch.randn(hkv, hid, di, generator=gen),
+         "ik": 0.1 * torch.randn(hkv, dk, di, generator=gen)}
+    ids = torch.randint(0, m.cfg.vocab_size, (1, 256), generator=gen)
+    before = train.indexer_recall(m, ids, be, w, k_pages_pick=2)
+    opt = train.AdamW(lr=0.02)
+    for _ in range(20):
+        train.indexer_warmup_step(m, ids, be, w, opt)
+    after = train.indexer_recall(m, ids, be, w, k_pages_pick=2)
+    assert after > before, f"recall did not improve with training: {before:.3f} -> {after:.3f}"
+    assert 0.0 <= before <= 1.0 and 0.0 <= after <= 1.0
