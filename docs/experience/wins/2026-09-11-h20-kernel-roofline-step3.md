@@ -14,6 +14,18 @@ tilerl bench --model qwen38-27b --kernels --checkpoint /work/Qwen3.8-27B-NVFP4 -
 Floors (same card, [card-2 rows PR] / measurements.jsonl, ids below):
 hbm 3312.71 GB/s, bf16 136.45 TFLOP/s, **fp8 276.58 TFLOP/s** (2.03x bf16).
 
+## The headline: decode is memory-latency bound at 7–12% of the HBM roofline
+
+The measured decode tick is **53.2 ms (B=1) / 91.0 ms (B=8)** against a
+Σ-launch HBM+compute bound of **6.6 ms** — **12.4% / 7.3% of the roofline**.
+Prefill GEMMs by contrast already sit at **70–78%** of their ceiling. An
+M=1 decode GEMV streams one token per row against a 22.4 GB weight read, so it
+is not bandwidth-saturated (one narrow launch cannot issue enough concurrent
+loads) and not compute-bound; the 8x gap between decode and the prefill rows is
+the next performance target (batch-shaped decode / spec verify W-wide), not a
+measurement footnote. The bound is a floor the kernel cannot beat, not a
+saturation target — decode's room above it is real headroom.
+
 ## Result: every timed row is physically in range
 
 | tick | TIMED ms | Σ bound ms | TIMED %bound | TICK bytes | TICK flops |
