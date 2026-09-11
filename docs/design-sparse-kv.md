@@ -49,10 +49,22 @@ the top-k_pages block table. Two scorers produce them:
    written once at append time from the K the pool already holds; no weights,
    no training. This is
    what runs the dense checkpoint at 256k on the V100 without changing it.
-2. **Learned index keys (the V3.2 indexer).** One shared 128-B key per token
-   per layer, scored against index query heads, trained as below. Half the
-   bytes of fp16 bounds, better recall at the same k, and the model is trained
-   with the selection it serves.
+2. **Learned indexer, in DeepSeek-V4.1's form (ckl, 2026-09-11).** The unit
+   of indexing is the page, not the token: an indexer-K is projected from each
+   page's K (V4.1 projects it from the m-token entry; `candidate_block_size`
+   8 there, `BLOCK_TOKENS` 16 here), an indexer-Q is projected from the layer
+   input H with `ih` index heads of dim `di`, the score of a page is
+   `sum_h ReLU(q_h . k_h)` and top-k pages follow. Selection is computed at
+   index source layers and reused by the layers after them (V4.1
+   `index_source_layer_ids` every 4-6 layers; here 4 sources over the 16
+   full-attention layers, groups of 4), so one hot set serves a group and the
+   cold-page fetch is paid once per group. The local window is always
+   attended: the last `n_win` = 128 tokens (8 pages) join the selected set and
+   one softmax runs over [selected pages ; window]. Bytes with `ih` 4, `di`
+   128, fp8: 512 B per page per source layer, 4 source layers = 2 KiB per page
+   = 128 B per token, 32 MiB at 256k; scoring reads 32 MiB per step. Deferred
+   from V4.1: learned entry compression (attention over entries instead of
+   tokens), cross-layer KV reuse, the hierarchical 16k candidate pool.
 
 Both keep the same rows, the same tiering and the same `k >= context` gate;
 `serve --scorer bounds|index`. The V100 (sm70, 32 GB, f32 IO, eager decode)
@@ -104,11 +116,13 @@ Converting a dense model is two stages, both through the tape, both through
 `train --recipe`:
 
 1. **Warm-up.** Every weight frozen, dense attention. The indexer's softmax over
-   the context is fit with KL to the dense attention mass summed over heads and
-   L1-normalised per query. Only the indexer's parameters carry gradients, so
-   the tape holds one small op per full-attention layer; the target is computed
-   chunk by chunk from the dense scores the frozen forward already produces.
-   V3.2 reports 2.1B tokens for this stage.
+   pages is fit with KL to the dense attention mass summed over heads and
+   pooled per page, L1-normalised per query. Only the indexer's parameters
+   carry gradients, so the tape holds one small op per source layer; the
+   target is computed chunk by chunk from the dense scores the frozen forward
+   already produces. V3.2 reports 2.1B tokens for this stage; V4.1's report
+   does not state how its indexer learns, so a straight-through softmax on the
+   selection (aupai's CSA2 choice) is the alternative to A/B against KL.
 2. **Sparse fine-tune.** Selection on, every weight trained, the indexer loss
    restricted to the selected set. The backward is the sparse attention
    backward plus the indexer backward, both in TileLang's
@@ -147,7 +161,7 @@ API, `paged_attention`'s signature, the prefix store's read-only rule, and the
 | A. `plan` rows `index_keys`/`kv_hot`/`kv_cold`, `--sparse-k` dry-run, `kernel_cost` indexer rows | 52 | derived == storage bytes on tiny |
 | B. page-bounds scorer + selector, CPU twins, `k >= context` equals dense; then the sm70 cell and the V100 256k bench | cc | `test_sparse_equals_dense_at_full_k`; V100 tokens/s + device bytes table at 128k/256k |
 | C. page `location`, demote/promote of KV blocks on `DramSnapshots`' path | 5f | a demoted page promoted reads back byte-equal; decode tokens equal with and without demotion |
-| D. learned indexer: op, KL warm-up recipe, indexer backward, sparse attention backward | 65 | gradcheck on tiny; warm-up recipe runs one step on tiny |
+| D. learned indexer in V4.1 form (page keys, source layers, window), KL warm-up recipe, indexer backward, sparse attention backward | 65 | gradcheck on tiny; warm-up recipe runs one step on tiny |
 | E. sm90 cell: indexer + selector from `deepseek_v32`, bench rows with `%bound` | after the runbook, cards 0-7 | roofline table in the wins entry |
 
 A-D start now in parallel and need no card; B's V100 half follows its CPU half. Each unit is one PR with a non-author review on goal fit,
