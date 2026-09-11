@@ -151,3 +151,36 @@ Chinese wiki; this is the pre-registered science result, no gate moved and no
 rerun. Next attempt needs a different objective/init (the harness — sampled
 teacher, both scorers, live-selection recall on the engine scorer="index"
 path — is what carries forward).
+
+## Recall vs k and the window (2026-09-12, H20; same spans/positions)
+
+Captured dense mass (window INCLUDED in numerator+denominator, the design-doc
+quantity) for random / bounds / oracle over k∈{128,256,512,1024,2048}+8:
+
+| ctx | k | random | bounds | oracle |
+|---|---:|---:|---:|---:|
+| 16384 | 128 | 0.136 | 0.235 | 0.370 |
+| 16384 | 256 | 0.252 | 0.400 | 0.571 |
+| 16384 | 512 | 0.503 | 0.668 | 0.815 |
+| 16384 | ≥1024 | 1.000 | 1.000 | 1.000 |
+| 32768 | 128 | 0.064 | 0.158 | 0.296 |
+| 32768 | 256 | 0.133 | 0.263 | 0.455 |
+| 32768 | 512 | 0.248 | 0.433 | 0.652 |
+| 32768 | 1024 | 0.507 | 0.687 | 0.858 |
+| 32768 | 2048 | 1.000 | 1.000 | 1.000 |
+
+At 32k even the ORACLE top-128 holds only 0.30 of mass and the oracle does not
+reach 0.9 until k≈1100-1200; bounds tracks ~0.17-0.22 below the oracle (its
+0.9 crossing is later). The 16k rows saturate at 1.0 by k=1024 only because
+there are just ~1016 indexable pages (every page is selected, i.e. dense).
+Window/sink sanity (first span, first source plane, sampled queries ≥2048):
+page-0 sink 0.005/0.002 and the last 8 window pages 0.001/0.004 of total mass
+at 16k/32k — the 16 full-attn layers are genuinely GLOBAL (locality is in the
+GDN layers), so window inclusion correctly adds ~0; the included numbers are
+right and the FAIL is not a window artifact.
+
+Decision: k=128 cannot be the default for a 0.9-mass guarantee on real
+long-context Chinese wiki; the achievable default is much larger (oracle needs
+~1.1-1.2k at 32k) and bounds needs more still. The scorer is not the lever;
+the hot-set size (and whether 0.9 mass is the right SLO vs token-equal MMLU)
+is. Raw scripts: `scripts/recall_vs_k.py`, `scripts/indexer_recall_controls.py`.
