@@ -57,7 +57,7 @@ def test_decode_graph_matches_eager(spec):
         model = build_random(cfg, seed=7)
         return build_engine(
             cfg, model, backend, num_blocks=8, num_slots=2, decode_graph=decode_graph,
-            draft=_draft(cfg, model) if spec else None, spec_depth=1,
+            draft=_draft(cfg, model) if spec else None, spec_depth=1, sparse_k=0,
         )
 
     eager, captured = engine(False), engine(True)
@@ -87,7 +87,7 @@ def test_stats_reports_the_eager_fallback_after_a_capture_failure():
     (errors/2026-09-09-graph-capture-fell-back-silently.md)."""
     cfg, backend = tiny(), get_backend()
     engine = build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=8,
-                          num_slots=1, decode_graph=True)
+                          num_slots=1, decode_graph=True, sparse_k=0)
     engine.submit([1, 2, 3], SamplingParams(temperature=0.0, max_new_tokens=2, seed=0))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # the warn is the loud part; keep the test run quiet
@@ -110,7 +110,7 @@ def test_the_graphs_padding_row_is_not_taken_from_the_callers_capacity():
 
     def engine(decode_graph):
         return build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=16,
-                            num_slots=n, max_batch=n, decode_graph=decode_graph)
+                            num_slots=n, max_batch=n, decode_graph=decode_graph, sparse_k=0)
 
     on, off = engine(True), engine(False)
     # The pad row is engine overhead: the pool grows by it, the reported capacity does not.
@@ -164,7 +164,7 @@ def test_submitting_past_usable_slots_queues_rather_than_raising(decode_graph):
             warnings.simplefilter("always")
             e = build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=64,
                              num_slots=num_slots, max_batch=over,
-                             max_total_tokens=1024, decode_graph=decode_graph)
+                             max_total_tokens=1024, decode_graph=decode_graph, sparse_k=0)
         # The pad row is the engine's, so the pool grows by it and usable does not:
         # num_slots >= max_batch is exact through build_engine on either arm.
         assert e._states.num_slots == num_slots + decode_graph
@@ -217,7 +217,7 @@ def test_the_kv_guard_measures_usable_capacity_not_the_pool():
     def engine(decode_graph):
         return build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=nb,
                             num_slots=2, max_batch=2, max_total_tokens=512,
-                            decode_graph=decode_graph)
+                            decode_graph=decode_graph, sparse_k=0)
 
     on, off = engine(True), engine(False)
     assert on.usable_blocks == nb and on._kv.num_blocks == nb + 1
@@ -314,7 +314,7 @@ def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
     monkeypatch.setattr(eng_mod, "_quantize_draft", spy_quant)
     cfg = tiny()
     e = build_engine(cfg, build_random(cfg, seed=7), get_backend(), num_blocks=0,
-                     num_slots=2, max_batch=2, max_total_tokens=512, max_blocks=16)
+                     num_slots=2, max_batch=2, max_total_tokens=512, max_blocks=16, sparse_k=0)
     assert seen == ["state", "fit"], f"the KV fit ran before the state pool: {seen}"
     assert e.usable_blocks == 16, f"max_blocks must cap the fit, got {e.usable_blocks}"
 
@@ -328,7 +328,7 @@ def test_fitting_the_kv_pool_happens_after_the_state_pool(monkeypatch):
     seen.clear()
     trunk = build_random(cfg, seed=7)
     build_engine(cfg, trunk, get_backend(), num_blocks=0, num_slots=3, max_batch=2,
-                 max_total_tokens=512, max_blocks=16,
+                 max_total_tokens=512, max_blocks=16, sparse_k=0,
                  draft=_draft(cfg, trunk), spec_depth=3)
     assert seen[:3] == ["draft", "state", "fit"], (
         f"the draft's weights must be served before the state pool and the fit: {seen}")
@@ -352,7 +352,7 @@ def test_a_tick_with_no_pad_row_runs_eager_instead_of_capturing_mid_request():
     """
     cfg, backend = tiny(), get_backend()
     e = build_engine(cfg, build_random(cfg, seed=7), backend, num_blocks=16,
-                     num_slots=4, max_batch=4, decode_graph=True)
+                     num_slots=4, max_batch=4, decode_graph=True, sparse_k=0)
     asked: list[tuple[int, int]] = []
     e._graph_for = lambda B, W, keep: asked.append((B, W))  # None => caller runs eager
 
@@ -390,7 +390,7 @@ def test_graph_keys_covers_what_a_decode_tick_keys_on():
     for max_batch in (1, 2, 4, 8):
         e = build_engine(cfg, build_random(cfg, seed=21), backend, num_blocks=16,
                          num_slots=max_batch + 1, max_batch=max_batch,
-                         max_total_tokens=256)
+                         max_total_tokens=256, sparse_k=0)
         keys = e.graph_keys()
         for rows in range(1, max_batch + 1):
             assert (e._graph_bucket(rows), 1) in keys, (
@@ -405,7 +405,7 @@ def test_graph_keys_covers_what_a_decode_tick_keys_on():
     # above builds a dense engine and takes the `(1,)` path.
     trunk = build_random(cfg, seed=21)
     e = build_engine(cfg, trunk, backend, num_blocks=16, num_slots=3, max_batch=2,
-                     max_total_tokens=256, draft=_draft(cfg, trunk), spec_depth=3)
+                     max_total_tokens=256, draft=_draft(cfg, trunk), spec_depth=3, sparse_k=0)
     keys = e.graph_keys()
     for w in range(1, e._width + 1):
         assert (e._graph_bucket(1), w) in keys, (
@@ -434,7 +434,7 @@ def test_the_engines_verify_width_is_reachable_from_outside():
     trunk = build_random(cfg, seed=21)
     head = _draft(cfg, trunk)
     e = build_engine(cfg, trunk, backend, num_blocks=16, num_slots=3, max_batch=2,
-                     max_total_tokens=256, draft=head, spec_depth=3)
+                     max_total_tokens=256, draft=head, spec_depth=3, sparse_k=0)
     assert e._width == 4, f"spec_depth=3 must build width 4, got {e._width}"
     for depth in (2, 1, 3):
         head.set_depth(depth)
@@ -544,7 +544,7 @@ def test_a_live_drafted_tick_keys_on_a_width_precapture_built():
     trunk = build_random(cfg, seed=21)
     e = build_engine(cfg, trunk, backend, num_blocks=32, num_slots=3, max_batch=2,
                      max_total_tokens=256, draft=_draft(cfg, trunk), spec_depth=3,
-                     decode_graph=True)
+                     decode_graph=True, sparse_k=0)
     keys = e.graph_keys()
     asked: list[tuple[int, int]] = []
     real = e._graph_for
