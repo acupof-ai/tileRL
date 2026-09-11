@@ -12,6 +12,14 @@ RECIPES: dict[str, dict] = {
         model="tiny", rl=True, steps=12, group=6, max_new_tokens=8, lora_rank=4,
         # 8 tokens is below any real completion; the length guard is for real runs.
         lr=0.05, allow_short_rollouts=True, status="cpu: tests/test_recipes.py"),
+    # sparse-KV unit D: the learned page indexer's KL warm-up on the frozen base.
+    # CPU proves one step runs through capture -> page pool -> tape backward ->
+    # optimizer (test_sparse_index); the teacher on a random tiny model is
+    # near-uniform so learnability is gated there, not by this recipe's KL. The
+    # 27B card run is pending-remote.
+    "indexer-warmup": dict(
+        model="tiny", indexer_warmup=True, steps=4, lr=0.02,
+        status="cpu: tests/test_sparse_index.py"),
     # docs/roadmap.md P1. Pass --data gsm8k_train.jsonl --eval-gsm8k gsm8k_test.jsonl.
     # lr: the CLI default of 1e-3 flattens the reward from step 9 on; 1e-4 does not.
     # eval_max_new_tokens 2048 is NOT a tunable. At cap 256 the base arm reads 38.4%

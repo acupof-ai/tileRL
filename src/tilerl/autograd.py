@@ -263,6 +263,17 @@ def _frozen(fp8: bool) -> _Handler:
     return handler
 
 
+def _indexer_warmup(backend: Any, g: torch.Tensor, args: tuple, kw: dict):
+    # Pure f32 torch reverse living beside the scorer (sparse_index), not a
+    # backend kernel op; only the two projection weights learn. H, page-K and
+    # the dense-mass target are frozen inputs, so they get no slots.
+    from .sparse_index import indexer_warmup_bwd
+
+    d_iq, d_ik = indexer_warmup_bwd(g, *args, **kw)
+    yield 0, d_iq
+    yield 1, d_ik
+
+
 _BWD: dict[str, _Handler] = {
     "linear_fp4_frozen": _frozen(False),
     "linear_fp8_frozen": _frozen(True),
@@ -288,6 +299,7 @@ _BWD: dict[str, _Handler] = {
     "cp_gather": _cp_gather,
     "tp_fork": _tp_fork,
     "checkpoint": _checkpoint,
+    "indexer_warmup": _indexer_warmup,
 }
 
 
