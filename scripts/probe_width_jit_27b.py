@@ -104,6 +104,7 @@ def main() -> None:
     # _train_adapters gets this ordering from build_engine; here it is explicit.
     card_guard()
     model.params = be.materialize(model.params)
+    model.materialized = True
     trainable = add_lora(model, rank=16)
     opt = AdamW(lr=1e-4)
     print(f"27B loaded, {len(trainable)} LoRA tensors, group {a.group}, "
