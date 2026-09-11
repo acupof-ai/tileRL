@@ -83,7 +83,7 @@ context lines are derived from the same ledger, not measured on a card yet:
 ([docs/design-sparse-kv.md](docs/design-sparse-kv.md)) selects 16-token pages
 per tick — top-128 pages plus an 8-page window, one softmax over both — so the
 device holds 0.10 GiB of KV at 256k B=1 with the learned V4.1-form indexer
-(1.07 GiB with the training-free Quest bounds scorer) against 8.125 GiB dense;
+(1.07 GiB with the training-free Quest bounds scorer) against the dense fp8 KV that fills the card;
 the rest lives on host RAM or SSD. Merged so far: the bounds scorer and
 selector with `k >= pages` byte-equal to dense on CPU and the sm70 cell
 ([entry](docs/experience/wins/2026-09-11-sparse-kv-page-bounds-cpu.md)), and
