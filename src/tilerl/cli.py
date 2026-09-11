@@ -389,6 +389,8 @@ def cmd_train(args: argparse.Namespace) -> None:
     if getattr(args, "dry_run", False):
         return _train_dry_run(args)
     if args.rl or args.opd:
+        if getattr(args, "served_fp4", False):
+            sys.exit("error: --served-fp4 is full-parameter SFT only; LoRA keeps the frozen served faces")
         if not args.data and not (args.recipe == "grpo-tiny-smoke" and args.model == "tiny"):
             sys.exit("error: --data is required for RL/OPD training")
         return _train_adapters(args)
@@ -434,7 +436,17 @@ def _train_full(args: argparse.Namespace) -> None:
 
     backend = get_backend()
     cfg, model = _build_model(args.model, seed=args.seed, keep_master=True)
-    drop_quantized(model)
+    post_step = None
+    if args.served_fp4:
+        # Keep the served .wq/.scale/.oscale slots beside the bf16 masters and
+        # refresh them after every step; otherwise full SFT frees them on sight.
+        from .model import requantize_fp4
+
+        if not cfg.fp4:
+            sys.exit("error: --served-fp4 needs an fp4 config (qwen38-27b)")
+        post_step = lambda: requantize_fp4(model)  # noqa: E731
+    else:
+        drop_quantized(model)
     # Adam's m+v on the 27B is 200.4 GiB; Adafactor is 0.03 GiB and streams its updates.
     optimizer = Adafactor(lr=args.lr, weight_decay=0.1)
     if args.optim == "iso":
@@ -450,7 +462,7 @@ def _train_full(args: argparse.Namespace) -> None:
         input_ids = torch.randint(0, cfg.vocab_size, (2, 64), generator=gen)
         optimizer.lr = cosine_warmup(step, args.steps, 5, args.lr)
         t0 = time.perf_counter()
-        loss = train_mod.train_step(model, input_ids, backend, optimizer)
+        loss = train_mod.train_step(model, input_ids, backend, optimizer, post_step=post_step)
         secs.append(time.perf_counter() - t0)
         losses.append(loss)
         log(f"step {step + 1:4d}/{args.steps}  loss {loss:.4f}  {secs[-1]:.1f}s")
@@ -2256,6 +2268,10 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="full-parameter SFT only: save the trained bf16 model under the "
                               "run dir and record it as artifacts.out, so it can be a "
                               "`tilerl merge` specialist (merge needs bf16 masters, not fp4)")
+    p_train.add_argument("--served-fp4", action="store_true",
+                         help="full-parameter SFT only: keep the served fp4 faces beside the "
+                              "bf16 masters and re-pack them after every optimizer step, so a "
+                              "shared serving engine decodes trained weights without a reload.")
     p_train.add_argument("--lora-rank", type=int, default=16)
     p_train.add_argument("--tp", type=int, default=1,
                          help="tensor-parallel width; dp is WORLD_SIZE//tp, cp is 1. "

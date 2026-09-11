@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from tilerl_kernels.reference import (
+    FP4_LAYOUT_TWIDDLE,
     dequant_awq,
     dequant_fp8,
     dequant_nvfp4,
@@ -1093,6 +1094,49 @@ def drop_quantized(model: Model) -> Model:
         for suffix in (".wq", ".scale", ".oscale", ".w8", ".wscale"):
             model.params.pop(key + suffix, None)
     return model
+
+
+def requantize_fp4(model: Model) -> int:
+    """Re-pack every trained bf16 fp4 master into its EXISTING served slots
+    (``.wq/.scale/.oscale``), in place, after an optimizer step. ``copy_`` keeps
+    each tensor's address, so a captured decode graph keeps serving the step's
+    weights without a recapture. Caller keeps the served slots (no
+    drop_quantized) and the masters. Returns the number of re-packed linears.
+
+    A card's ``materialize`` rewrites a ``.wq`` into its arch layout once and
+    tags it (``_tl_layout`` = ``tw-bf16`` on sm90, ``tw-f16`` on sm70); sm70 also
+    narrows the scale plane to f16. The fresh ``pack_fp4`` output is NATURAL, so
+    it is run through the SAME reference rewrite the slot's tag names before the
+    copy — feeding natural nibbles to a twiddled-layout decode kernel is silent.
+    # ponytail: full SFT repacks all fp4 keys each step; a touched-key set when
+    # that cost shows up.
+    """
+    n = 0
+    with torch.no_grad():
+        for key in fp4_param_keys(model.cfg):
+            master = model.params.get(key)
+            wq0 = model.params.get(key + ".wq")
+            if master is None or wq0 is None:
+                continue
+            # The slot's block size is fixed at load: 32 for a bf16 linear
+            # repacked by pack_fp4, 16 for on-disk NVFP4. Re-pack at that same
+            # block or the scale shape copy_ below cannot fit.
+            block = master.shape[1] // model.params[key + ".scale"].shape[1]
+            wq, scale = pack_fp4(master, block=block)
+            scale, oscale = renorm_fp4_scale(scale)
+            rewrite = FP4_LAYOUT_TWIDDLE.get(getattr(wq0, "_tl_layout", "natural"))
+            if rewrite is not None:
+                wq = rewrite(wq)  # the materialize arch layout the kernel reads
+            wq0.copy_(wq)
+            # sm70 materializes the plane at scale_io=f16; copy into the slot's dtype.
+            model.params[key + ".scale"].copy_(scale.to(wq0.device, model.params[key + ".scale"].dtype))
+            model.params[key + ".oscale"].copy_(oscale.to(wq0.device, model.params[key + ".oscale"].dtype))
+            n += 1
+    if n == 0:
+        raise RuntimeError(
+            "requantize_fp4 re-packed nothing: no fp4 master has a served .wq slot "
+            "(did full SFT call drop_quantized, or is this a non-fp4 config?)")
+    return n
 
 
 def save_hf(model: Model, path: str | Path) -> None:
