@@ -53,8 +53,9 @@ all four source groups — up to 512 pages, each `promote_keyed` ending in a
 full `cuda.synchronize`, i.e. up to 512 serial ~1 MiB pinned H2D copies per
 token. The 0.37–0.43 ms sparse-attention decode figure the prediction below
 used was a hot-resident measure, not this demote-all state, so the decode
-prediction missed by ~10x. The remedy is a pinned cross-tick hot set, not the
-selector.
+prediction missed by ~10x. The remedy is a pinned cross-tick hot set (the hot-pin
+PR 52 is implementing), not the selector; this V100 point re-runs on that head
+when it lands.
 
 ## Sparse launch commands
 
