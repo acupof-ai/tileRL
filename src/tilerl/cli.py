@@ -2034,6 +2034,7 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {'pending':>11} {bnd_col:>11} {'pending':>11}")
             else:
+
                 pct = (bound_one / (ms / 1000.0) * 100.0) if bound_one is not None else float("nan")
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {ms:>9.3f}ms {bnd_col:>11} {pct:>10.1f}%")
@@ -2053,6 +2054,7 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
             print(f"{'TIMED TOTAL':<26} {timed_launches:>5} {'':>22} {'':>7} "
                   f"{'':>12} {'':>10} {ms_sum:>8.1f}ms {bound_sum:>8.1f}ms "
                   f"{bound_sum / ms_sum * 100.0:>10.1f}%")
+
         return tb_sum, tf_sum
 
     print(f"{'kernel':<26} {'count':>5} {'shape':>22} {'face':>7} {'bytes':>12} "
