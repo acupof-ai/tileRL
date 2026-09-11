@@ -295,6 +295,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--json',
         '--kv-cold-bytes',
         '--kv-fp8',
+        '--kv-store',
         '--max-batch',
         '--max-batched-tokens',
         '--max-ctx',
