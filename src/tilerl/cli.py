@@ -233,6 +233,21 @@ def _require_checkpoint_matches(cfg, model_name: str, checkpoint: str) -> None:
         sys.exit(f"error: --checkpoint {checkpoint} is not a {model_name} checkpoint: {reason}")
 
 
+def _sparse_spec(args, cfg) -> dict | None:
+    """--sparse-k K: price the sparse-KV ledger. Concurrent rows = --max-batch, context
+    per row = --max-ctx or the model ceiling; scorer picks learned index keys vs Quest
+    bounds."""
+    k = getattr(args, "sparse_k", 0)
+    if not k:
+        return None
+    return {
+        "num_rows": args.max_batch,
+        "context": int(args.max_ctx or cfg.max_position_embeddings),
+        "k_pages": k,
+        "scorer": getattr(args, "scorer", "index"),
+    }
+
+
 def _dry_run_checkpoint(args, backend) -> None:
     """--dry-run --checkpoint DIR: price the ledger from safetensors HEADERS alone
     (the served faces model.checkpoint_weight_faces derives), blocks fitted
@@ -268,7 +283,7 @@ def _dry_run_checkpoint(args, backend) -> None:
     rows = plan(cfg, None, free_after_fixed, num_slots=state_slots, num_blocks=num_blocks,
                 state_dtype=_torch.float32, kv_io=_torch.bfloat16, kv_fp8=kv_fp8,
                 explicit_state_budget=args.state_bytes, dram_budget=args.dram_bytes,
-                ckpt_faces=faces)
+                ckpt_faces=faces, sparse=_sparse_spec(args, cfg))
     table = memory_table(rows, {}, None)
     if args.json:
         print(json.dumps(table, indent=1))
@@ -316,6 +331,12 @@ def cmd_serve(args: argparse.Namespace) -> None:
     if args.dry_run:
         from .memory import format_memory_table, memory_table, plan
 
+        if getattr(args, "sparse_k", 0):
+            # Sparse ledger is derived-only (peak=None): the engine still builds a dense
+            # pool, so its measured residency cannot reconcile with sparse rows. Price
+            # sparse through --checkpoint (header-only, no engine).
+            sys.exit("error: --sparse-k is a derived ledger: use --dry-run --checkpoint DIR "
+                     "(no engine is built) until a sparse pool exists")
         device_free = _device_free(args, backend)
         kv, sp = engine._kv, engine._states
         draft_layers = (engine._draft.cfg.num_layers
@@ -2356,6 +2377,16 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "room and has no f16 attention path), native elsewhere. f16 "
                               "narrows K/V on the D2H copy and widens back on promote; "
                               "native keeps the pool dtype. fp8 scale planes stay f32.")
+
+
+    p_serve.add_argument("--sparse-k", type=int, default=0, metavar="PAGES",
+                         help="with --dry-run --checkpoint: price the sparse-KV ledger "
+                              "(scorer keys/bounds + hot device pages + cold host pages) "
+                              "with this many indexed pages per row (the 8-page window is "
+                              "always added). docs/design-sparse-kv.md")
+    p_serve.add_argument("--scorer", choices=["index", "bounds"], default="index",
+                         help="sparse-KV page scorer: learned V4.1 indexer keys (default) "
+                              "or training-free Quest page bounds")
     p_serve.add_argument("--max-batch", type=int, default=8,
                          help="concurrent rows; drop to 2 for a single-user endpoint (a decode "
                               "graph is captured per bucket x chain width, so a lower "
