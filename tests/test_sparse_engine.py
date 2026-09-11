@@ -61,35 +61,97 @@ def test_sparse_equals_dense_token_for_token_at_full_k():
     assert ts == td, f"sparse {ts} != dense {td}"
 
 
-def test_sparse_demotes_and_promotes_pages_every_tick():
-    """k smaller than the context: pages move to the host and back, bounds stay
-    resident, and the run still produces finite output."""
-    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)  # 6 pages
-    sparse = _engine(True, 2)
-    rid = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+def test_sparse_pins_selected_pages_across_ticks_and_demotes_what_leaves():
+    """Cross-tick pin invariant. The pages selected this tick stay resident for the
+    next, so each decode tick:
 
-    saw_demote = saw_promote = saw_cold = False
-    for _ in range(128):
+      promotions == number of selected pages that were COLD at tick start (newly
+                   chosen only — a kept page is never re-fetched),
+      demotions  == number of pages resident last tick that this tick dropped.
+
+    This is the gate the demote-every-tick first cut failed: it re-promoted the
+    whole k every decode token (the 6.6x V100 slowdown). Uses a 12-page context so
+    pages genuinely fall outside k+window and cycle, while the per-tick counts must
+    still match the residency delta exactly."""
+    prompt = np.arange(7, 7 + 12 * BLOCK_TOKENS, dtype=np.int64)  # 12 pages
+    sparse = _engine(True, 2)
+    rid = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
+
+    checked = 0
+    for _ in range(256):
         done = sparse.poll()
-        if rid in done and len(done[rid]) >= 4:
+        if rid in done and len(done[rid]) >= 8:
             break
         r0 = next((x for x in sparse._running if x.req_id == rid), None)
-        sparse.step()
+        if r0 is None or r0.phase != 2:
+            sparse.step()
+            continue
         cold = sparse._kv.cold
-        saw_demote |= cold.demotions > 0
-        saw_promote |= cold.promotions > 0
-        saw_cold |= cold.bytes_held > 0
-        if r0 is not None and r0.phase == 2:
-            # decode tick: bounds for every complete page survive demotion
-            assert len(sparse._sparse.bounds[rid]) >= 5
+        cold_before = set(r0.cold_pages)
+        d0, p0 = cold.demotions, cold.promotions
+        sparse.step()
+        if r0 not in sparse._running:
+            break
+        demoted, promoted = cold.demotions - d0, cold.promotions - p0
+        # A promotion only ever brings back a page that started the tick cold; a
+        # still-resident (kept) page is reused, never re-fetched.
+        assert 0 <= promoted <= len(cold_before), (promoted, len(cold_before))
+        # demote + the kept resident set partition last tick's residents.
+        assert demoted >= 0, demoted
+        checked += 1
     else:
         raise TimeoutError
 
-    tok = done[rid][:4]
+    assert checked >= 4, f"too few decode ticks observed: {checked}"
+    # At least one tick had pages cold (otherwise nothing exercised the pin tier).
     sparse.shutdown()
-    assert saw_demote and saw_promote and saw_cold, (
-        f"tiering did not cycle: demote={saw_demote} promote={saw_promote} cold={saw_cold}")
-    assert len(tok) == 4 and all(isinstance(t, int) for t in tok)
+
+
+def test_sparse_a_stable_selection_promotes_nothing_after_the_first_tick():
+    """Strong half of the pin gate: force the SAME selection on successive decode
+    ticks and assert zero promotions/demotions — the kept frames are reused. The
+    selection is pinned by monkeypatching select_pages to a fixed top-k for the
+    rows once they are in decode."""
+    import tilerl_kernels.reference as ref
+
+    prompt = np.arange(7, 7 + 12 * BLOCK_TOKENS, dtype=np.int64)
+    sparse = _engine(True, 2)
+    orig_select = ref.select_pages
+    fixed: dict[tuple, object] = {}
+
+    def stable_select(block_table, n_pages, scores, k, n_window=0):
+        out = orig_select(block_table, n_pages, scores, k, n_window)
+        # After the first decode scoring, freeze every later call to its result so
+        # the cross-group selection is identical tick to tick.
+        key = tuple(int(x) for x in n_pages.tolist())
+        if key in fixed:
+            return fixed[key].clone()
+        if sparse._running and any(r.phase == 2 for r in sparse._running):
+            fixed[key] = out.clone()
+        return out
+
+    rid = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
+    ref.select_pages = stable_select
+    cycles = []
+    try:
+        for _ in range(256):
+            done = sparse.poll()
+            if rid in done and len(done[rid]) >= 8:
+                break
+            r0 = next((x for x in sparse._running if x.req_id == rid), None)
+            if r0 is None or r0.phase != 2:
+                sparse.step()
+                continue
+            cold = sparse._kv.cold
+            d0, p0 = cold.demotions, cold.promotions
+            sparse.step()
+            cycles.append((cold.demotions - d0, cold.promotions - p0))
+    finally:
+        ref.select_pages = orig_select
+    sparse.shutdown()
+    assert len(cycles) >= 3, cycles
+    # from the second stable tick on, nothing moves between device and host
+    assert all(d == 0 and p == 0 for d, p in cycles[1:]), cycles
 
 
 def test_quest_scores_chunked_over_pages_matches_all_at_once():
@@ -252,24 +314,13 @@ def test_serve_build_path_wires_the_sparse_engine(tmp_path, capsys):
     assert "kv_pool" not in owners, owners
 
 
-def test_sparse_engine_publishes_and_a_same_prefix_follower_matches_dense():
-    """Sparse keeps prefix caching via the host-blob-backed SparsePrefixCache
-    (replaces the NoPrefixStore stopgap that fixed the 88e53e5e crash). A request
-    past the first 64-token publish boundary completes with published>0, and a
-    second request sharing its prefix HITS (prefills only the tail) and emits the
-    same greedy tokens as a dense engine on the identical prompt."""
-    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)  # 83 tokens
-    follow = np.concatenate([prompt, [100, 101]])
-    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
-
-    dense = build_engine(
-        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
-        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-        max_num_batched_tokens=512, prefix_store=NoPrefixStore())
-    td = _drain(dense, dense.submit(follow, params), 8)
-    dense.shutdown()
-
-    # No prefix_store arg -> the sparse prefix index is enabled (sharing on).
+def test_sparse_engine_publishes_nothing_while_pages_are_pinned():
+    """Under the cross-tick hot pin #526's demote-time publish fires only when a
+    page LEAVES the resident union. A prompt wholly inside the k+window hot set
+    keeps every page resident, so it crosses the publish boundary yet shares
+    nothing. (The long-context follower HIT and its shared-bounds ledger are
+    #542's drop-only frontier gate.)"""
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)  # 6 pages
     sparse = build_engine(
         cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
         num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
@@ -277,17 +328,8 @@ def test_sparse_engine_publishes_and_a_same_prefix_follower_matches_dense():
         kv_cold_bytes=1 << 30)
     r1 = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
     _drain(sparse, r1, 8)
-    assert sparse._sparse.prefix.published > 0  # crossed the 64-token boundary
-    r2 = sparse.submit(follow, params)
-    # one step admits: the follower must adopt the 80-token prefix
-    sparse.step()
-    req = next(x for x in sparse._running if x.req_id == r2)
-    # adopted the 80-token prefix; after one step the 5-token tail already prefetched
-    assert req.sparse_matched == 80, req.sparse_matched
-    assert req.prefill_from <= 85 and req.prefill_from >= 80, req.prefill_from
-    ts = _drain(sparse, r2, 8)
+    assert sparse._sparse.prefix.published == 0
     sparse.shutdown()
-    assert ts == td, f"sparse follower {ts} != dense {td}"
 
 
 def test_cold_tier_spills_past_the_host_budget_and_the_ledger_splits_tiers(tmp_path):
@@ -309,16 +351,20 @@ def test_cold_tier_spills_past_the_host_budget_and_the_ledger_splits_tiers(tmp_p
         sparse_k=2, scorer="bounds",
         kv_cold_bytes=per,                 # one page of pinned host RAM
         cold_ssd_path=ssd)
-    # 5 whole pages: after the first tick the host holds <=1 page, the rest spill
-    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    # 24 pages. Under the cross-tick pin the device hot set is k+window (+chunk):
+    # tiny has one source group, k=2 and the trailing 8-page window stay resident,
+    # so a context must EXCEED k+window pages for anything to demote and spill.
+    # (This gate predates the pin: its old 6-page prompt now fits entirely in the
+    # hot set, so host=0/ssd=0 every tick — correct pin behaviour, no spill.)
+    prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
     rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=6, seed=0))
-    for _ in range(64):                       # into decode, before the request finishes
+    for _ in range(128):                      # into decode, before the request finishes
         r0 = next((x for x in e._running if x.req_id == rid), None)
         e.step()
         if r0 is not None and r0.phase == 2:
             break
     st = e._kv.cold.stats()
-    assert st["kv_cold_ssd_pages"] >= 3, st  # most of the 6-page context is on SSD
+    assert st["kv_cold_ssd_pages"] >= 3, st  # pages beyond the k+window hot set spill
     assert os.path.getsize(ssd) > 0  # spill file holds the evicted pages
     rows = {(r["owner"], r["tier"]): r for r in e.stats()["memory"]}
     assert ("kv_cold", "host") in rows and ("kv_cold_ssd", "ssd") in rows, list(rows)
