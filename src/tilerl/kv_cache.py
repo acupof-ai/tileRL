@@ -244,7 +244,8 @@ class PagedKvPool:
     def promote_keyed(self, key) -> int:
         """Reload a blob held under ``demote_page(key=...)`` into a FRESH block
         and return its new id. Raises if it was never held or byte-LRU evicted
-        (the selector must not name it)."""
+        (the selector must not name it). Inside a ``with pool.promotions()`` the
+        H2D is non-blocking with one sync at batch end; otherwise it syncs here."""
         if self.cold is None:
             raise RuntimeError("promote_keyed: no host page tier attached")
         blob = self.cold.take(key)
@@ -252,17 +253,41 @@ class PagedKvPool:
             raise RuntimeError(f"promote_keyed: {key!r} is not held on the host")
         new = self.alloc_block()
         nb = blob["k"].is_pinned()
+        batched = getattr(self, "_promote_batching", False)
         self.k_pool[:, new].copy_(blob["k"], non_blocking=nb)
         self.v_pool[:, new].copy_(blob["v"], non_blocking=nb)
         if self.k_scale is not None:
             self.k_scale[:, new].copy_(blob["ks"], non_blocking=nb)
             self.v_scale[:, new].copy_(blob["vs"], non_blocking=nb)
-        # The pinned blob is released when this call returns; a non_blocking H2D
-        # still in flight would then read a buffer the host allocator may reuse.
-        # Synchronous contract: a batched/prefetched promote is the later perf job.
-        if self.device.type == "cuda":
+        if batched:
+            # Retained by the promotions() context until its single end-of-batch
+            # sync; no per-page wait here.
+            self._pending_promote_blobs.append(blob)
+        elif self.device.type == "cuda":
+            # The pinned blob is released when this call returns; a non_blocking
+            # H2D still in flight would then read a buffer the host allocator may
+            # reuse.
             torch.cuda.synchronize(self.device)
         return new
+
+    @contextlib.contextmanager
+    def promotions(self):
+        """Batch the H2D copies of several promote_keyed calls into ONE device
+        sync at exit. Each promote still allocates its frame and launches its
+        copies non-blocking; the source blobs are retained here until the single
+        end-of-batch synchronization, so a tick that fetches N pages pays one
+        sync, not N. Off cuda the copies are plain synchronous clones, so this
+        only changes bookkeeping there."""
+        self._pending_promote_blobs = getattr(self, "_pending_promote_blobs", [])
+        held_before = len(self._pending_promote_blobs)
+        self._promote_batching = True
+        try:
+            yield self
+        finally:
+            self._promote_batching = False
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            del self._pending_promote_blobs[held_before:]
 
     def promote_page(self, old_block: int) -> int:
         """Promote a blob keyed by its old physical block (#500 seam). The device
