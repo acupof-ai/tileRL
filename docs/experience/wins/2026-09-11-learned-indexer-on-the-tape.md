@@ -122,3 +122,32 @@ silently substituted.)
 - **Accept: mean learned-indexer recall@128 after warm-up >= 0.9.** Below 0.9 is
   a science result, written down with the token count — no tolerance change, no
   rerun with a moved gate. Bounds recall is a reported baseline, not the gate.
+
+## Result (2026-09-12, H20 card 6): REJECTED — recall 0.102, far below 0.9
+
+Cut run per the amendment: 100 warm-up steps, balanced 16 held spans (6/5/5
+across 16k/32k/8k), 256 seeded query positions/span (seed 0), k=128 + 8
+window, di=128, lr 0.02, frozen 27B NVFP4 at
+`/work/tilerl-ckpt/Qwen3.8-27B-NVFP4` (sha c473512c…), Chinese-wiki held
+spans. 1745 s. Manifest
+`/work/tilerl-65c/runs/662bc7606836/manifest.json` sha256
+e80a168098880f80730ab74378ea4e218d0e56e53834424f99108269871293a5.
+
+| length | index before | index after | index worst span | bounds (train-free) |
+|---|---:|---:|---:|---:|
+| 8192  | 0.283 | 0.147 | 0.105 | 0.385 |
+| 16384 | 0.126 | 0.104 | 0.071 | 0.233 |
+| 32768 | 0.061 | 0.056 | 0.050 | 0.157 |
+| **mean** | 0.157 | **0.102** | — | **0.258** |
+
+KL collapsed 49.9 → 6.9 ≈ ln(~500 indexable pages): at lr 0.02 the 100-step
+warm-up drove the page distribution toward uniform rather than sharp, and
+recall did not rise — the untrained indexer already selects near-randomly at
+k=128 (≈128/indexable for 32k ≈ 0.027) and training moved it with/down, not
+up. The training-free Quest bounds scorer is also far short (mean 0.258;
+invariant before/after as expected). Neither the current KL-on-dense-mass
+recipe nor the bounds scorer selects real long-context pages at k=128 on
+Chinese wiki; this is the pre-registered science result, no gate moved and no
+rerun. Next attempt needs a different objective/init (the harness — sampled
+teacher, both scorers, live-selection recall on the engine scorer="index"
+path — is what carries forward).
