@@ -76,6 +76,9 @@ def project_page_keys(k_pages: Tensor, ik_weight: Tensor) -> Tensor:
     ih = ik_weight.shape[0]
     if h % ih:
         raise ValueError(f"{h} attention heads do not divide into {ih} index heads")
+    # The indexer is an f32 head over bf16 frozen-base activations (GPU): cast at
+    # the projection boundary. f32->f32 (CPU tiny) is a no-op.
+    k_pages = k_pages.to(ik_weight.dtype)
     grouped = k_pages.reshape(r, l, p, ih, h // ih, d).mean(dim=4)  # mean of group
     # weight is per index head [ih, d_attn, di]; contract only that head's dims
     return torch.einsum("rlphd,hde->rlphe", grouped, ik_weight)
@@ -207,8 +210,9 @@ def indexer_kl(iq: Tensor, ik: Tensor, target_page_mass: Tensor,
 def project_indexer_queries(h: Tensor, iq_weight: Tensor) -> Tensor:
     """Project indexer-Q per query from the layer input H (V4.1 indexer_q):
     ``h`` [rows, L_src, q, d_hidden], ``iq_weight`` [ih, d_hidden, di] ->
-    [rows, L_src, q, ih, di]. Distinct from the attention-Q projection."""
-    return torch.einsum("rlqd,hde->rlqhe", h, iq_weight)
+    [rows, L_src, q, ih, di]. Distinct from the attention-Q projection. Casts
+    bf16 frozen activations to the f32 indexer weight dtype at the boundary."""
+    return torch.einsum("rlqd,hde->rlqhe", h.to(iq_weight.dtype), iq_weight)
 
 
 def indexer_warmup_loss(h: Tensor, k_pages: Tensor, iq_weight: Tensor,
@@ -255,6 +259,9 @@ def indexer_warmup_bwd(grad: Tensor, iq_weight: Tensor, ik_weight: Tensor,
     scale = iq_weight.shape[-1] ** -0.5
 
     iq = project_indexer_queries(h, iq_weight)              # [r,L,q,ih,di]
+    # f32 head over bf16 frozen activations (GPU); same boundary cast as fwd.
+    k_pages = k_pages.to(ik_weight.dtype)
+    h = h.to(iq_weight.dtype)
     grouped = k_pages.reshape(r, l, p, ih, m, da).mean(4)  # [r,L,p,ih,da]
     ik = torch.einsum("rlphd,hde->rlphe", grouped, ik_weight)
     dots = torch.einsum("rlqhe,rlphe->rlqhp", iq, ik) * scale

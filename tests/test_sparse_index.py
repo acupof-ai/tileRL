@@ -20,6 +20,7 @@ from tilerl.sparse_index import (
     page_index_scores,
     page_mass_target,
     page_scores_for_selector,
+    project_indexer_queries,
     project_page_keys,
 )
 
@@ -437,3 +438,30 @@ def test_indexer_held_recall_from_a_prepared_dir(tmp_path):
     rec = train.indexer_held_recall(m, be, d, w, k_pages_pick=2)
     assert set(rec) == {"256"}
     assert 0.0 <= rec["256"] <= 1.0 and rec["256"] == rec["256"]  # finite
+
+
+def test_indexer_projections_take_bf16_activations_with_f32_weights():
+    """GPU feeds bf16 frozen-base H/K but the indexer head is f32 (the smoke
+    failed 'expected BFloat16 but got Float' before the boundary cast). Both
+    projections and the full warm-up loss must accept the dtype mix on a
+    bf16-capable device (CPU torch supports bf16 compute)."""
+    torch.manual_seed(0)
+    r, l, pages, ih, m, da, dh, di, win = 1, 1, 6, 2, 2, 8, 16, 8, 1
+    hk = ih * m
+    h = torch.randn(r, l, 4, dh, dtype=torch.bfloat16)
+    k_pages = torch.randn(r, l, pages, hk, da, dtype=torch.bfloat16)
+    iq_w = 0.1 * torch.randn(ih, dh, di)
+    ik_w = 0.1 * torch.randn(ih, da, di)
+    iq = project_indexer_queries(h, iq_w)
+    ik = project_page_keys(k_pages, ik_w)
+    assert iq.dtype == torch.float32 and ik.dtype == torch.float32
+    n_pages = torch.full((r,), pages, dtype=torch.long)
+    mass = torch.softmax(torch.randn(r, l, 4, pages * 16), -1)
+    target = page_mass_target(mass, n_pages, n_win_pages=win)
+    loss = indexer_warmup_loss(h, k_pages, iq_w, ik_w, target, n_pages,
+                               n_win_pages=win)
+    assert loss.dtype == torch.float32 and torch.isfinite(loss)
+    diq, dik = indexer_warmup_bwd(None, iq_w, ik_w, h, k_pages, target, n_pages,
+                                 n_win_pages=win)
+    assert diq.dtype == torch.float32 and dik.dtype == torch.float32
+    assert torch.isfinite(diq).all() and torch.isfinite(dik).all()
