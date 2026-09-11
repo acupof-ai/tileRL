@@ -91,6 +91,25 @@ def test_sparse_demotes_and_promotes_pages_every_tick():
     assert len(tok) == 4 and all(isinstance(t, int) for t in tok)
 
 
+def test_quest_scores_chunked_over_pages_matches_all_at_once():
+    """Scoring splits candidate pages to bound the f32 intermediate (the unchunked
+    [Tq,Cp,Hkv,D] is 4.2 GiB at Cp=2048 and OOMs a V100). max-over-query and
+    sum-over-head/dim commute with the page split, so the chunked score must be
+    bit-identical; Cp is a non-multiple of the chunk to cover the tail."""
+    import torch
+
+    from tilerl.sparse_engine import quest_scores
+
+    tq, hq, hkv, d, cp = 37, 8, 4, 256, 201
+    q = torch.randn(tq, hq, d)
+    bounds = torch.randn(cp, hkv, 2, d) * 0.3
+    qi = q.float().reshape(tq, hkv, hq // hkv, d).mean(2)
+    kmin, kmax = bounds.unbind(dim=2)
+    ref = torch.maximum(qi[:, None] * kmin[None], qi[:, None] * kmax[None]).sum(-1)
+    ref = ref.amax(0).sum(-1)
+    assert torch.equal(quest_scores(q, bounds), ref)
+
+
 def test_sparse_prompt_longer_than_device_hot_pool_admits_via_cold():
     """The admission guard must count host-cold pages, not only the device hot
     pool. The device pool is the per-slot hot set (k+window+chunk); with k=2,
