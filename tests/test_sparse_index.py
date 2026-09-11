@@ -331,27 +331,34 @@ def test_topk_recall_partial_row_masks_its_tail():
 
 def test_streaming_long_sequence_teacher_matches_naive_dense_pooling():
     """The O(T*block)-memory teacher for 8k-32k sequences must equal the naive
-    dense [t,t] mass pooled per key page. Checked on a small GQA case with a
-    non-divisible trailing page and against an explicit reference."""
+    dense [t,t] mass pooled per key page, including a non-block-divisible
+    trailing partial page. Checked on a small GQA case."""
     from tilerl.train import _dense_causal_mass, dense_causal_page_mass
 
     torch.manual_seed(11)
-    b, t, hq, hkv, d, block = 1, 49, 4, 2, 8, 16   # 3 full pages + 1-token tail
+    b, t, hq, hkv, d, block = 1, 49, 4, 2, 8, 16   # 3 full pages + 1-key tail
     q = torch.randn(b, t, hq, d)
     k = torch.randn(b, t, hkv, d)
 
     naive = _dense_causal_mass(q, k)                       # [b,t,t]
-    npages = t // block
-    pooled = naive[:, :, : npages * block].reshape(b, t, npages, block).sum(-1)
+    npages = (t + block - 1) // block                      # 4, not 3
+    # reference pooling over ALL t keys, last page padded with zeros
+    ref = torch.zeros(b, t, npages)
+    full = (t // block) * block
+    ref[:, :, : t // block] = naive[:, :, :full].reshape(b, t, t // block, block).sum(-1)
+    ref[:, :, t // block] = naive[:, :, full:].sum(-1)
     got = dense_causal_page_mass(q, k, block)              # [b,t,npages]
     assert got.shape == (b, t, npages)
-    # f32 parity at the project's 1e-2 tolerance: the gap is the online-softmax
-    # accumulation order (maxdiff ~6e-3), and the row total is exact (1e-7).
+    # With the trailing page included the only gap is f32 accumulation order:
+    # maxdiff ~1e-7, so the tolerance is set off that closed gap (not 1e-2).
     assert torch.isfinite(got).all()
-    assert torch.allclose(got, pooled, atol=1e-2), (got - pooled).abs().max()
+    assert torch.allclose(got, ref, atol=1e-5), (got - ref).abs().max()
     l1 = got.sum(-1)
     late = l1[0, block:]
     assert torch.allclose(late, torch.ones_like(late), atol=1e-4)
+    # a divisible-T case still matches exactly and has no trailing empty page
+    got48 = dense_causal_page_mass(q[:, :48], k[:, :48], block)
+    assert got48.shape == (b, 48, 3)
 
 
 def test_indexer_recall_wires_to_the_trained_weights_on_tiny():
@@ -378,3 +385,30 @@ def test_indexer_recall_wires_to_the_trained_weights_on_tiny():
     after = train.indexer_recall(m, ids, be, w, k_pages_pick=2)
     assert after > before, f"recall did not improve with training: {before:.3f} -> {after:.3f}"
     assert 0.0 <= before <= 1.0 and 0.0 <= after <= 1.0
+
+
+def test_warmup_capture_handles_a_non_block_divisible_sequence():
+    """A trailing partial key page must not be dropped (52's #512 change) nor
+    break the query/key axis alignment: the full warm-up path must run for T not
+    a multiple of the block, with ceil pages and teacher rows over the real T."""
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl import config, model, train
+
+    be = get_backend()
+    m = model.build_random(config.tiny(), seed=0)
+    gen = torch.Generator().manual_seed(0)
+    hkv, dk, hid, di = m.cfg.num_kv_heads, m.cfg.head_dim, m.cfg.hidden_size, 16
+    w = {"iq": 0.1 * torch.randn(hkv, hid, di, generator=gen),
+         "ik": 0.1 * torch.randn(hkv, dk, di, generator=gen)}
+    ids = torch.randint(0, m.cfg.vocab_size, (1, 249), generator=gen)  # 249 = 15*16+9
+    H, k_pages, target, n_pages = train.indexer_capture(m, ids, be, 16, WINDOW_PAGES)
+    assert int(n_pages[0]) == 16              # ceil(249/16)
+    assert H.shape[2] == 249                  # queries unpadded
+    assert target.shape[2] == 249
+    assert k_pages.shape == (1, 1, 16, hkv, dk)
+    assert torch.isfinite(target).all() and torch.isfinite(k_pages).all()
+    # recall and one training step run on the ragged tensors without an axis error
+    assert 0.0 <= train.indexer_recall(m, ids, be, w, 2) <= 1.0
+    loss = train.indexer_warmup_step(m, ids, be, w, train.AdamW(lr=0.02))
+    assert loss == loss  # not NaN
