@@ -255,6 +255,10 @@ class SparseForward:
         self.rows = rows
         self.b = len(rows)
         self.n_groups = len(tracker.src_planes)
+        #: bounds scores post-rope q only; index scoring also needs the
+        #: full-precision post-input-norm hidden (model.py runs the extra norm
+        #: only when this is true, so bounds pays no second rmsnorm).
+        self.index_scorer = tracker.scorer == "index"
         self._chosen: dict[tuple[int, int], list[int]] = {}
         self._phys: dict[tuple[int, int], Tensor] = {}
         own_w = max(len(r["own"]) for r in rows)

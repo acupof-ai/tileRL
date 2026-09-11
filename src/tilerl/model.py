@@ -426,8 +426,17 @@ class Model:
             if sf is not None:
                 # packed [selected earlier ; own] table + packed seq_len; the slot-causal
                 # kernel masks it correctly (selected pages are complete earlier pages).
+                # The index scorer projects Q from the post-input-norm hidden (the same
+                # H indexer training captures), but it must be a FULL-precision norm:
+                # h above is narrow=True f16 for the quantized qkv linear, and feeding it
+                # into index_scores would be an unguarded f32->f16->f32 round trip. The
+                # bounds scorer does not read H, so it passes None (no extra norm).
+                h_idx = None
+                if getattr(sf, "index_scorer", False):
+                    h_idx = backend.rmsnorm(
+                        x, self.params[f"{p}.input_norm"], cfg.rms_eps)
                 block_table, seq_len = sf.attention_args(
-                    kv.kv_pool.plane_of(layer_idx), q, h)
+                    kv.kv_pool.plane_of(layer_idx), q, h_idx)
             out = backend.paged_attention(
                 q,
                 k_plane,
