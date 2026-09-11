@@ -40,6 +40,10 @@ INDEX_SOURCE_LAYERS = 4
 #: Local window always attended: 128 tokens = 8 pages.
 WINDOW_TOKENS = 128
 WINDOW_PAGES = WINDOW_TOKENS // BLOCK_TOKENS
+#: Default selected hot pages per row for serve/build_engine. The shipped value
+#: tracks the output-fidelity-vs-k table (27B recall at 32k: bounds 0.158 / oracle
+#: 0.296 at k=128); bump the one constant when the table picks a larger k.
+DEFAULT_SPARSE_K = 128
 
 
 def index_source_groups(n_full_layers: int,

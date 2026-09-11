@@ -243,7 +243,7 @@ def test_engine_decode_tokens_equal_across_a_full_demote_promote_round_trip():
         return build_engine(
             cfg, build_random(cfg, seed=11), RefBackend(), num_blocks=64,
             num_slots=4, max_batch=1, max_total_tokens=2048,
-            prefix_store=NoPrefixStore(), kv_cold_bytes=cold_bytes,
+            prefix_store=NoPrefixStore(), sparse_k=0, kv_cold_bytes=cold_bytes,
             cold_format=cold_format), cfg
 
     import numpy as np
@@ -315,10 +315,10 @@ def test_narrow_f16_path_prices_half_and_decodes_like_dense():
     cfg = tiny()
     dense = build_engine(cfg, build_random(cfg, seed=11), RefBackend(), num_blocks=64,
                          num_slots=4, max_batch=1, max_total_tokens=2048,
-                         prefix_store=NoPrefixStore())
+                         prefix_store=NoPrefixStore(), sparse_k=0)
     cold = build_engine(cfg, build_random(cfg, seed=11), RefBackend(), num_blocks=64,
                         num_slots=4, max_batch=1, max_total_tokens=2048,
-                        prefix_store=NoPrefixStore(), kv_cold_bytes=1 << 30,
+                        prefix_store=NoPrefixStore(), sparse_k=0, kv_cold_bytes=1 << 30,
                         cold_format="f16")
     import numpy as np
 

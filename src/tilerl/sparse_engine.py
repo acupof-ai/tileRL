@@ -25,10 +25,11 @@ Bounds scorer, the training-free day-1 path:
 from __future__ import annotations
 
 import torch
+from tilerl_kernels.reference import select_pages
 from torch import Tensor
 
 from .kv_cache import BLOCK_TOKENS
-from .sparse_index import index_source_groups
+from .sparse_index import WINDOW_PAGES, index_source_groups
 
 #: block-table ids are logical+1 so selected logical page 0 is not the 0 pad.
 _SENTINEL = 1
@@ -126,7 +127,12 @@ class SparseForward:
 
     Per row: ``cand`` earlier complete candidate pages; ``force_window`` forces
     the last N candidates (8 for a prefill chunk, 0 on decode where the window
-    IS the own span); ``own`` the own span's logical pages."""
+    IS the own span); ``own`` the own span's logical pages.
+
+    The packed table is ONE fixed-width tensor, ``k_pages + force_window + own``
+    per row at most, allocated at construction and refilled each tick: a CUDA
+    graph bakes the shape in, so the width is a tick constant (unselected slots
+    stay 0; paged_attention derives the live count from per-row seq_len)."""
 
     def __init__(self, tracker: SparseTracker, rows: list[dict], device):
         self.tracker = tracker
@@ -139,6 +145,22 @@ class SparseForward:
         own_w = max(len(r["own"]) for r in rows)
         self.page_base = torch.zeros(self.b, dtype=torch.long, device=device)
         self.own_table = torch.zeros(self.b, own_w, dtype=torch.long, device=device)
+        # The graph-captured width is constant PER VERIFY WIDTH, never per context:
+        # a plain decode row (tq=1) is k_pages + 8-window; a verify row's chain can
+        # cross one page boundary (W-1 <= 15), so pad its own region to 9. Unused
+        # own slots sit after sel+own; attention derives the page count from
+        # seq_len, so the trailing pad ids are never read. Prefill rows run eager
+        # and take their actual own width.
+        def own_bound(r) -> int:
+            if not r["decoding"]:
+                return len(r["own"])
+            return WINDOW_PAGES + (1 if r["tq"] > 1 else 0)
+
+        sel_w = max(
+            tracker.k_pages + r["force_window"] + own_bound(r) for r in rows
+        )
+        self.table = torch.zeros(self.b, sel_w, dtype=torch.long, device=device)
+        self.seq_len = torch.zeros(self.b, dtype=torch.long, device=device)
         for i, r in enumerate(rows):
             self.page_base[i] = r["own"][0]
             self.own_table[i, : len(r["own"])] = torch.tensor(
@@ -161,8 +183,6 @@ class SparseForward:
             # logical+1 ids keep real page 0 distinct from the right-pad 0.
             table = (torch.tensor(cand, device=self.device) + _SENTINEL
                      ).reshape(1, -1)
-            from tilerl_kernels.reference import select_pages
-
             sel = select_pages(
                 table, torch.tensor([len(cand)], device=self.device),
                 scores, self.tracker.k_pages, n_window=r["force_window"])[0, 0]
@@ -175,22 +195,13 @@ class SparseForward:
 
     def attention_args(self, plane: int, q: Tensor) -> tuple[Tensor, Tensor]:
         """Packed ``[selected ; own]`` table ``[B,W]`` and per-row packed
-        ``seq_len = n_sel*16 + own_len`` for this plane's paged_attention."""
-        packed, sl = [], []
+        ``seq_len = n_sel*16 + own_len`` for this plane's paged_attention. The
+        table is the construction-width buffer refilled in place (graph-safe)."""
         for bi, r in enumerate(self.rows):
             sel = self._select(bi, plane, q[bi, : r["tq"]])
             own_n = len(r["own"])
-            packed.append(torch.cat((sel, self.own_table[bi, :own_n])))
-            sl.append(sel.shape[0] * BLOCK_TOKENS + int(r["own_len"]))
-        width = max(t.shape[0] for t in packed)
-        table = torch.zeros(self.b, width, dtype=torch.long, device=self.device)
-        for i, t in enumerate(packed):
-            table[i, : t.shape[0]] = t
-        return table, torch.tensor(sl, dtype=torch.long, device=self.device)
-
-    def chosen(self, bi: int) -> set[int]:
-        """Union of the row's group selections (kept for diagnostics)."""
-        out: set[int] = set()
-        for g in range(self.n_groups):
-            out.update(self._chosen.get((bi, g), ()))
-        return out
+            self.table[bi].zero_()
+            self.table[bi, : sel.shape[0]] = sel
+            self.table[bi, sel.shape[0] : sel.shape[0] + own_n] = self.own_table[bi, :own_n]
+            self.seq_len[bi] = sel.shape[0] * BLOCK_TOKENS + int(r["own_len"])
+        return self.table, self.seq_len

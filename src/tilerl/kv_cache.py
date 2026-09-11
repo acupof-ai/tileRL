@@ -201,13 +201,18 @@ class PagedKvPool:
             n += host.numel() * host.element_size()
         return blob, n
 
-    def demote_page(self, block: int) -> int:
+    def demote_page(self, block: int, key=None) -> int:
         """Move one page (all planes of one block id, fp8 scales included) to the
         pinned host tier and release its device block back to THIS pool — no
         second pool. Returns the held byte count. A prefix-shared page is
         read-only wherever it lives and must not be demoted; a pool without a
         cold tier cannot demote; the block has to be live. The caller removes the
-        freed id from its block tables (promotion allocates a different block)."""
+        freed id from its block tables (promotion allocates a different block).
+
+        ``key`` names the host blob independently of the physical id: a frame is
+        recycled (LIFO) while an older page's blob is still cold, so keying on the
+        block id collides. The sparse engine keys on (req, logical page); the
+        #500 seam leaves it the physical id (single demote-all/promote-all cycle)."""
         if self.cold is None:
             raise RuntimeError("demote_page: no host page tier attached")
         if self.refcount[block] <= 0:
@@ -215,10 +220,30 @@ class PagedKvPool:
         if self.is_shared(block):
             raise RuntimeError(f"demote_page: block {block} is prefix-shared (refcount>1)")
         blob, n = self._page_blob(block)
-        if not self.cold.hold(block, blob, n):
+        if not self.cold.hold(block if key is None else key, blob, n):
             raise RuntimeError(f"demote_page: host tier dropped block {block}")
         self.free_block(block)  # sole owner -> back to the same pool
         return n
+
+    def promote_keyed(self, key) -> int:
+        """Promote a blob held under a caller-supplied ``demote_page(key=...)`` key
+        into a fresh block. The keyed counterpart of :meth:`promote_page` for the
+        sparse engine, whose host key is the logical page, not the recycled frame."""
+        if self.cold is None:
+            raise RuntimeError("promote_keyed: no host page tier attached")
+        blob = self.cold.take(key)
+        if blob is None:
+            raise RuntimeError(f"promote_keyed: {key!r} is not held on the host")
+        new = self.alloc_block()
+        nb = blob["k"].is_pinned()
+        self.k_pool[:, new].copy_(blob["k"], non_blocking=nb)
+        self.v_pool[:, new].copy_(blob["v"], non_blocking=nb)
+        if self.k_scale is not None:
+            self.k_scale[:, new].copy_(blob["ks"], non_blocking=nb)
+            self.v_scale[:, new].copy_(blob["vs"], non_blocking=nb)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return new
 
     def promote_page(self, old_block: int) -> int:
         """Reload a demoted page into a FRESH block allocated from this pool and
