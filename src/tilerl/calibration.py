@@ -19,6 +19,8 @@ BW_METRIC = "hbm_bw_gbs"
 PEAK_METRIC = "bf16_peak_tflops"
 FP8_PEAK_METRIC = "fp8_peak_tflops"
 PCIE_METRIC = "pcie_h2d_gbs"
+#: Pre-Ampere tensor cores (sm70 V100) have no bf16 MMA path; their peak is fp16.
+F16_PEAK_METRIC = "f16_peak_tflops"
 
 
 def store_path() -> Path:
@@ -75,9 +77,15 @@ def calibration(rows: list[dict], device_name: str,
     the renderer prints pending-remote rather than dividing by a half-calibration).
     The fp8 peak and the sparse ``pcie_gbs`` floor are both optional: absent → None,
     so fp8/pcie columns render pending rather than borrow the bf16 ceiling. A
-    physical ``uuid`` picks that card's own floors when a uuid row exists."""
+    physical ``uuid`` picks that card's own floors when a uuid row exists. The
+    tensor peak is bf16 where the arch has it and f16 on pre-Ampere cards (sm70
+    V100, no bf16 tensor path); ``peak_metric`` says which one the roofline used."""
     bw = latest_floor(rows, BW_METRIC, device_name, uuid)
     peak = latest_floor(rows, PEAK_METRIC, device_name, uuid)
+    peak_metric = PEAK_METRIC
+    if peak is None:
+        peak = latest_floor(rows, F16_PEAK_METRIC, device_name, uuid)
+        peak_metric = F16_PEAK_METRIC
     if bw is None or peak is None:
         return None
     fp8 = latest_floor(rows, FP8_PEAK_METRIC, device_name, uuid)
@@ -85,6 +93,7 @@ def calibration(rows: list[dict], device_name: str,
     return {
         "bw_gbs": float(bw["value"]),
         "peak_tflops": float(peak["value"]),
+        "peak_metric": peak_metric,
         "fp8_peak_tflops": None if fp8 is None else float(fp8["value"]),
         "pcie_gbs": float(pcie["value"]) if pcie else None,
     }
@@ -94,7 +103,8 @@ RESIDENT_METRIC = "device_resident_bytes"
 #: the metrics this section renders — a device appears only if it has at least one of
 #: these, so an unrelated bench row (e.g. a cpu decode_tok_s) never makes an all-pending
 #: section that implies a calibrated card.
-_SECTION_METRICS = (BW_METRIC, PEAK_METRIC, FP8_PEAK_METRIC, PCIE_METRIC, RESIDENT_METRIC)
+_SECTION_METRICS = (BW_METRIC, PEAK_METRIC, FP8_PEAK_METRIC, F16_PEAK_METRIC,
+                    PCIE_METRIC, RESIDENT_METRIC)
 
 
 def device_sections(rows: list[dict]) -> list[dict]:
@@ -123,6 +133,7 @@ def device_sections(rows: list[dict]) -> list[dict]:
             "device": name,
             "hbm_bw_gbs": pair(latest_floor(rows, BW_METRIC, name)),
             "bf16_peak_tflops": pair(latest_floor(rows, PEAK_METRIC, name)),
+            "f16_peak_tflops": pair(latest_floor(rows, F16_PEAK_METRIC, name)),
             "fp8_peak_tflops": pair(latest_floor(rows, FP8_PEAK_METRIC, name)),
             "pcie_h2d_gbs": pair(latest_floor(rows, PCIE_METRIC, name)),
             "residency": None if res is None else {
@@ -216,12 +227,25 @@ def measure_pcie_h2d_gbs(card: int, *, bytes_n: int = 1 << 30, iters: int = 20) 
 
 
 def measure_bf16_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> float:
-    """Sustained bf16 tensor peak from one large square GEMM: 2*n^3 flops / event sec."""
+    """Sustained bf16 tensor peak from one large square GEMM: 2*n^3 flops / event sec.
+    sm70 (V100) has no bf16 tensor path — use measure_f16_peak_tflops there."""
     import torch
 
     with torch.cuda.device(card):
         a = torch.randn(n, n, dtype=torch.bfloat16, device=f"cuda:{card}")
         b = torch.randn(n, n, dtype=torch.bfloat16, device=f"cuda:{card}")
+        secs = _event_seconds(lambda: torch.matmul(a, b), iters)
+    return (2 * n**3) / secs / 1e12
+
+
+def measure_f16_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> float:
+    """Sustained fp16 tensor peak from one large square GEMM. The floor for pre-Ampere
+    arches whose only tensor-core path is fp16 (sm70 Volta)."""
+    import torch
+
+    with torch.cuda.device(card):
+        a = torch.randn(n, n, dtype=torch.float16, device=f"cuda:{card}")
+        b = torch.randn(n, n, dtype=torch.float16, device=f"cuda:{card}")
         secs = _event_seconds(lambda: torch.matmul(a, b), iters)
     return (2 * n**3) / secs / 1e12
 
@@ -251,7 +275,7 @@ def measure_fp8_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> flo
 
 
 def _row(metric: str, value: float, unit: str, device_name: str, card: int,
-         derivation: str, uuid: str | None = None):
+         derivation: str, uuid: str | None = None, target: str = "sm90"):
     from .cli import _benchrec
 
     br = _benchrec()
@@ -291,18 +315,27 @@ def device_uuid(card: int) -> str:
     return str(torch.cuda.get_device_properties(card).uuid)
 
 
+def _arch(card: int) -> str:
+    """sm-tag of the card (sm70 V100, sm90 H20, ...)."""
+    import torch
+
+    major, minor = torch.cuda.get_device_capability(card)
+    return f"sm{major}{minor}"
+
+
 def calibrate_rows(card: int) -> list[dict]:
     """Measure the floors on one card and return the (un-appended) ledger rows.
+    sm90+: HBM, bf16 peak, fp8 peak, pinned H2D PCIe. sm70 (V100) has no bf16
+    tensor path and no fp8 _scaled_mm path, so it records HBM + the fp16 peak
+    only; its fp8/pcie columns render pending rather than a borrowed ceiling.
     Cuda-only; the CLI refuses before calling this off a card."""
     import torch
 
     device_name = torch.cuda.get_device_name(card)
     uuid = device_uuid(card)
+    arch = _arch(card)
     bw = measure_hbm_bw_gbs(card)
-    peak = measure_bf16_peak_tflops(card)
-    fp8_peak = measure_fp8_peak_tflops(card)
-    pcie = measure_pcie_h2d_gbs(card)
-    return [
+    rows = [
         _row(
             BW_METRIC,
             bw,
@@ -311,37 +344,51 @@ def calibrate_rows(card: int) -> list[dict]:
             card,
             "sustained D2D copy >=1 GiB, read+write, CUDA-event median; floor = this measurement",
             uuid,
-        ),
+            target=arch,
+        )]
+    if arch == "sm70":
+        rows.append(_row(
+            F16_PEAK_METRIC,
+            measure_f16_peak_tflops(card),
+            "TFLOP/s",
+            device_name,
+            card,
+            "one large fp16 square GEMM (2n^3 flops), CUDA-event median; sm70 has no bf16 tensor path",
+            uuid,
+            target=arch))
+        return rows
+    rows += [
         _row(
             PEAK_METRIC,
-            peak,
+            measure_bf16_peak_tflops(card),
             "TFLOP/s",
             device_name,
             card,
             "one large bf16 square GEMM (2n^3 flops), CUDA-event median; floor = this measurement",
             uuid,
-        ),
+            target=arch),
         _row(
             FP8_PEAK_METRIC,
-            fp8_peak,
+            measure_fp8_peak_tflops(card),
             "TFLOP/s",
             device_name,
             card,
             "one large fp8 (e4m3) scaled square GEMM (2n^3 flops) through torch._scaled_mm, "
             "CUDA-event median; the ceiling for fp8 GEMM rows",
             uuid,
-        ),
+            target=arch),
         _row(
             PCIE_METRIC,
-            pcie,
+            measure_pcie_h2d_gbs(card),
             "GB/s",
             device_name,
             card,
             "sustained pinned host->device copy >=1 GiB (one-way), CUDA-event median; "
             "the sparse cold-page PCIe fetch floor",
             uuid,
-        ),
+            target=arch),
     ]
+    return rows
 
 
 def append_rows(rows: list[dict], path: str | os.PathLike | None = None) -> list[str]:
