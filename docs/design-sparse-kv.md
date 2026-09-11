@@ -152,12 +152,52 @@ table already gathers pages, and the selected set is a shorter block table.
 The indexer and selector are new ops with CPU twins first, under the same
 registry rules as every other kernel.
 
+## Prefix sharing under sparsity (stopgap, then the host-tier publish)
+
+The first sparse engine ships with prefix caching **off for sparse builds**
+(`build_engine(sparse_k>0)` forces `NoPrefixStore`). The dense publish path
+hands `req.blocks[:length//16]` — live device blocks — to `PrefixStore.insert`,
+but sparse finalize demotes every private page to the host tier each tick, so
+at a publish boundary that slice is empty and the store raises
+("64 tokens need 4 blocks, got 0"). Building the default store anyway crashed
+the first request whose prompt crossed one interior chunk boundary (≥ 64
+tokens), which is why the refusal is enforced in `build_engine`, not left as a
+documentation warning.
+
+The upgrade that restores prefix sharing for sparse builds:
+
+1. **Publish at the boundary before demotion.** Finalize publishes the
+   chunk-boundary pages while they are still live, then demotes; the cold tier
+   already keeps each blob keyed by its old block id after the device block is
+   freed, so a published entry names host-held pages rather than device blocks.
+2. **Store entries carry the bounds snapshot with the blocks.** The selector's
+   `SparseTracker.bounds` are request-private in the first cut; a prefix entry
+   must adopt the published pages' Quest bounds (device-resident, small — the
+   `page_bounds` cost row: 64 KiB/page on the 27B) exactly as a dense entry
+   carries the GDN state snapshot. A hit then restores bounds and cold blobs
+   with zero host copies: the page stays cold until the selector names it, and
+   promotion goes through the existing `promote_page` path.
+3. **Hit adoption promotes lazily.** `_admit`'s retain-and-refcount path
+   assumes live device blocks; the sparse hit adopts bounds + cold blob ids
+   without promotion, and `_sparse_resolve` promotes a selected shared page on
+   first use. The store's read-only rule is unchanged — promoted pages are
+   private copies of shared cold blobs.
+4. **Eviction is three-way coherent.** Dropping a prefix entry must forget the
+   cold blobs, the bounds, and any device promotion together; the store already
+   owns block lifetime for the dense case, and the host tier's `forget` is the
+   third handle.
+
+Until this lands, sparse serving pays a full prefill per distinct prompt; the
+dense engine keeps prefix caching unchanged.
+
 ## What does not change
 
 `submit`/`poll`, `StepLimits`, the one-forward-per-tick loop, the captured
 decode tick (the selector runs inside it at a fixed k), `PagedKvPool`'s block
 API, `paged_attention`'s signature, the prefix store's read-only rule, and the
 `peak = static + transient` invariant, which now has three more static rows.
+The one first-cut exception is the bullet above: a sparse build runs with
+`NoPrefixStore` until host-tier publishing lands.
 
 ## Ownership
 
