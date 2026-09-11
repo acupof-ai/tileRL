@@ -40,9 +40,10 @@ The f16 tensor-core prefill GEMM attacks the 4.3 ms/token linear bucket
 (~18 min at 256k). Dense sparse-prefill attention over the selected ~136
 pages (unit F's chunked prefill) attacks the bucket that already dominates
 and is the only one whose share grows: at 256k dense attention extrapolates
-to ~73 min vs the GEMMs' ~18. The decode-time measurement agrees: sparse
-attention was 0.37 ms flat vs 3.46 ms dense at 64k per call (9.3x),
-[2026-09-11-sparse-kv-v100-dense-vs-sparse.md](2026-09-11-sparse-kv-v100-dense-vs-sparse.md).
+to ~73 min vs the GEMMs' ~18. The decode-time attention kernel alone measured
+0.37 ms on the packed selected table vs 3.46 ms dense at 64k per call (9.3x),
+with K hot-resident — a lower bound that excludes the demote/fetch cost the
+serving engine actually pays per decode token.
 
 ## Addendum — f16 M-tiled block GEMM halves the linear bucket
 
