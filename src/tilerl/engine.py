@@ -824,7 +824,16 @@ class Engine:
         req.blocks = blocks
         req.state_slot = slot
         req.seq_len = matched  # materialized length (adopted prefix; 0 on a miss)
-        req.prefill_from = matched
+        # A bulk boot that covers the WHOLE prompt leaves zero residual tokens, so
+        # no prefill chunk forwards and the row would stick in PREFILL with no
+        # first-token logits. Re-forward the last loaded page: the boot blocks are
+        # the row's OWN fresh allocations (unlike a prefix-hit's shared store
+        # blocks, which must not be re-written), so overwriting the last page's
+        # K/V with the same values is safe and the tail logits appear. One page at
+        # cold start, the same cost as any <16-token tail.
+        req.prefill_from = (max(0, matched - BLOCK_TOKENS)
+                            if boot_loaded and matched == len(req.tokens)
+                            else matched)
         # A boot load is all own blocks; a prefix hit's blocks belong to the store.
         req.own_blocks = total_blocks if boot_loaded else total_blocks - matched // BLOCK_TOKENS
         self._blocks_used += req.own_blocks

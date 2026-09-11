@@ -82,6 +82,36 @@ def test_saved_context_boots_a_fresh_engine_and_continues_identically(tmp_path):
     booter.shutdown()
 
 
+def test_a_page_aligned_prompt_boots_and_continues_identically(tmp_path):
+    """A whole-page prompt (no <16-token tail) used to stick in PREFILL: the boot
+    covered every token, no residual forwarded, so no first-token logits existed.
+    The admit re-forwards the last loaded page once; the continuation must still
+    equal the in-process one with a single boot hit."""
+    from tilerl.config import tiny
+    from tilerl.engine import SamplingParams
+
+    cfg = tiny()
+    import numpy as np
+
+    prompt = np.arange(7, 7 + 4 * BLOCK_TOKENS, dtype=np.int64)  # exactly 4 pages
+    params = SamplingParams(temperature=0.0, max_new_tokens=6, seed=0)
+
+    writer = _engine(cfg, tmp_path, store=True)
+    rid = writer.submit(prompt, params)
+    writer.save_boot(_decode_req(writer, rid))
+    tok_inproc = _drain(writer, rid, 6)
+    writer.shutdown()
+
+    booter = _engine(cfg, tmp_path, store=True)
+    rid2 = booter.submit(prompt, params)
+    tok_boot = _drain(booter, rid2, 6)
+    st = booter.stats()
+    assert st["boot_hits"] == 1, st
+    assert st["prefill_forwards"] == 1, st  # one last-page re-forward only
+    assert tok_boot == tok_inproc, (tok_boot, tok_inproc)
+    booter.shutdown()
+
+
 def test_store_byte_count_matches_the_priced_cold_rows(tmp_path):
     """The on-disk K/V+scale bytes equal the ledger's per-cold-page price x pages."""
     from tilerl.config import tiny
