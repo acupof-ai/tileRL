@@ -91,6 +91,44 @@ def test_sparse_demotes_and_promotes_pages_every_tick():
     assert len(tok) == 4 and all(isinstance(t, int) for t in tok)
 
 
+def test_sparse_prompt_longer_than_device_hot_pool_admits_via_cold():
+    """The admission guard must count host-cold pages, not only the device hot
+    pool. The device pool is the per-slot hot set (k+window+chunk); with k=2,
+    slots=1, chunk=16 tokens it holds 13 blocks = 208 tokens, so a 512-token
+    request must admit by demoting older pages to the host. The old guard
+    compared against device blocks only and raised 'exceeds KV pool capacity'
+    before sparse allocation ran. Full-selection token equality is the prior
+    gate; k>=pages makes the pool wider than the context, so it cannot exercise
+    this crossing."""
+    cfg = tiny()
+    common = dict(cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+                  num_slots=1, max_batch=1, max_total_tokens=1024,
+                  max_num_batched_tokens=16, prefix_store=NoPrefixStore())
+    sparse = build_engine(num_blocks=0, sparse_k=2, scorer="bounds",
+                          kv_cold_bytes=1 << 30, **common)
+    assert sparse._kv.num_blocks == 13  # 1*(k2 + window8 + chunk2) + 1
+    assert sparse.room_for(512) > 0
+    prompt = (np.arange(32 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7  # 512 tok, in tiny vocab
+
+    rid = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+    for _ in range(512):
+        done = sparse.poll()
+        if rid in done and len(done[rid]) >= 4:
+            break
+        sparse.step()
+    else:
+        raise TimeoutError
+    tok = done[rid][:4]
+    ndemote = sparse._kv.cold.demotions
+    nframes = sparse._kv.num_blocks
+    sparse.shutdown()
+    # 32 pages cycled through a 13-frame pool: demotions far exceed the frame
+    # count, so physical ids recycled while a prior blob stayed cold — the exact
+    # phys-key collision. Stable (req, page) keys are what let this finish.
+    assert ndemote > nframes, (ndemote, nframes)
+    assert len(tok) == 4 and all(isinstance(t, int) for t in tok)
+
+
 def test_serve_build_path_wires_the_sparse_engine(tmp_path, capsys):
     """The live arm must run through SERVE's own build path (_build_engine ->
     build_engine), not only a hand-built engine in the other gates. A non-
