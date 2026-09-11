@@ -162,11 +162,17 @@ def page_mass_target(attn_mass: Tensor, n_pages: Tensor,
                                                       device=attn_mass.device)], dim=-1)
     pages = attn_mass.shape[-1] // block_tokens
     pooled = attn_mass.reshape(r, l, q, pages, block_tokens).sum(dim=-1)
-    valid = torch.arange(pages, device=attn_mass.device)[None, None, None, :] \
-        < n_pages.to(attn_mass.device)[:, None, None, None]
-    indexable = valid & (torch.arange(pages, device=attn_mass.device)[None, None, None, :]
-                         < (n_pages[:, None, None, None] - n_win_pages))
-    pooled = pooled * indexable
+    return exclude_window_renorm(pooled, n_pages, n_win_pages)
+
+
+def exclude_window_renorm(pooled: Tensor, n_pages: Tensor,
+                          n_win_pages: int = WINDOW_PAGES) -> Tensor:
+    """Zero window/invalid pages in an already-pooled ``[r,L,q,pages]`` mass and
+    L1-normalise over the indexable pages. Shared by the token-pooling target and
+    the long-sequence teacher that streams page masses directly."""
+    r, l, q, pages = pooled.shape
+    indexable = _indexable_mask(n_pages, pages, n_win_pages, pooled.device)
+    pooled = pooled * indexable[:, None, None, :]
     return pooled / pooled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 

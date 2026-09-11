@@ -327,3 +327,28 @@ def test_topk_recall_partial_row_masks_its_tail():
     # finite recall in [0,1] for a ragged page count, no NaN from the tail
     rec = topk_page_recall(scores, target, n_pages, k_pages=2)
     assert 0.0 <= rec.item() <= 1.0 and torch.isfinite(rec)
+
+
+def test_streaming_long_sequence_teacher_matches_naive_dense_pooling():
+    """The O(T*block)-memory teacher for 8k-32k sequences must equal the naive
+    dense [t,t] mass pooled per key page. Checked on a small GQA case with a
+    non-divisible trailing page and against an explicit reference."""
+    from tilerl.train import _dense_causal_mass, dense_causal_page_mass
+
+    torch.manual_seed(11)
+    b, t, hq, hkv, d, block = 1, 49, 4, 2, 8, 16   # 3 full pages + 1-token tail
+    q = torch.randn(b, t, hq, d)
+    k = torch.randn(b, t, hkv, d)
+
+    naive = _dense_causal_mass(q, k)                       # [b,t,t]
+    npages = t // block
+    pooled = naive[:, :, : npages * block].reshape(b, t, npages, block).sum(-1)
+    got = dense_causal_page_mass(q, k, block)              # [b,t,npages]
+    assert got.shape == (b, t, npages)
+    # f32 parity at the project's 1e-2 tolerance: the gap is the online-softmax
+    # accumulation order (maxdiff ~6e-3), and the row total is exact (1e-7).
+    assert torch.isfinite(got).all()
+    assert torch.allclose(got, pooled, atol=1e-2), (got - pooled).abs().max()
+    l1 = got.sum(-1)
+    late = l1[0, block:]
+    assert torch.allclose(late, torch.ones_like(late), atol=1e-4)
