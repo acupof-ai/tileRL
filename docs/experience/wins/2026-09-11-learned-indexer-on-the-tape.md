@@ -67,3 +67,21 @@ near-uniform teacher cannot demonstrate learning; gate "the step runs" and
 
 Raw artifacts: `tests/test_sparse_index.py`; recipe manifest via
 `tilerl train --recipe indexer-warmup`.
+
+## Pre-registered 27B science run (H20, cards 6/7) — before launch
+
+Fixed before the run; a miss is recorded with the token count, not retuned.
+
+- Base Qwen3.8-27B-NVFP4 fully frozen; trained tensors are ONLY the four
+  source layers' two indexer projection weights (V4.1 form: page indexer-K,
+  `sum_h ReLU(q·k)/sqrt(di)`, 128-token/8-page window excluded).
+- Prompts of 8k–32k tokens drawn from the eval corpus; a few hundred warm-up
+  steps.
+- Teacher: dense attention mass pooled per 16-token page at each source layer
+  (`page_mass_target`).
+- Metric: `topk_page_recall` (this PR, tested f32) at `k_pages=128`, measured
+  BEFORE warm-up and AFTER, on held-out prompts; plus the KL curve and total
+  tokens seen.
+- **Accept: mean recall@128 after warm-up >= 0.9.** Below 0.9 is a science
+  result, written down with the token count — no tolerance change, no rerun with
+  a moved gate.
