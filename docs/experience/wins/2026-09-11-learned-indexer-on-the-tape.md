@@ -72,16 +72,34 @@ Raw artifacts: `tests/test_sparse_index.py`; recipe manifest via
 
 Fixed before the run; a miss is recorded with the token count, not retuned.
 
-- Base Qwen3.8-27B-NVFP4 fully frozen; trained tensors are ONLY the four
+**Scope (corpus).** Prompts are 8192/16384/32768-token spans cut from the
+pod's **Chinese Wikipedia** parquet (`/work/newdata/wiki/zh.parquet`). The
+corpus has almost no single 8k+ document (token p50 ≈405, p99 ≈9.4k), so
+consecutive articles are concatenated into a token stream and cut into
+disjoint fixed-length spans (`scripts/prepare_indexer_corpus.py`, the
+`scripts.corpus.long_doc_spans` construction). Articles are hashed into a
+seeded train/held split BEFORE tokenising (10% held: 22,819 of 230,792
+articles), so no held-out article token appears in a training span; span
+counts held 32/16/8 and train 160/80/40 at 8k/16k/32k, held-out article ids
+kept in the corpus manifest. Chinese is the relevant distribution (Qwen3.8 is
+bilingual and ckl's traffic is Chinese-heavy), not a weaker claim; a 32k span
+crosses article boundaries, so dense attention within a span concentrates on
+the current article — the ≥0.9 number is the indexer on this mixture, not on
+one coherent 32k document. Recall is reported separately per span length.
+(An English-cosmo 8k cross-corpus control was planned but its raw source was
+removed in the same /work cleanup that took the checkpoint; recorded, not
+silently substituted.)
+
+- Base Qwen3.8-27B-NVFP4 fully frozen (checkpoint at the tileRL-owned
+  `/work/tilerl-ckpt`, sha256 c473512c…); trained tensors are ONLY the four
   source layers' two indexer projection weights (V4.1 form: page indexer-K,
   `sum_h ReLU(q·k)/sqrt(di)`, 128-token/8-page window excluded).
-- Prompts of 8k–32k tokens drawn from the eval corpus; a few hundred warm-up
-  steps.
-- Teacher: dense attention mass pooled per 16-token page at each source layer
-  (`page_mass_target`).
+- A few hundred warm-up steps over the prepared train spans.
+- Teacher: dense attention mass pooled per 16-token page at each source layer,
+  streamed in O(T·block) (`dense_causal_page_mass`), never a [T,T] matrix.
 - Metric: `topk_page_recall` (this PR, tested f32) at `k_pages=128`, measured
-  BEFORE warm-up and AFTER, on held-out prompts; plus the KL curve and total
-  tokens seen.
+  BEFORE warm-up and AFTER, on held-out prompts, per span length; plus the KL
+  curve and total tokens seen.
 - **Accept: mean recall@128 after warm-up >= 0.9.** Below 0.9 is a science
   result, written down with the token count — no tolerance change, no rerun with
   a moved gate.
