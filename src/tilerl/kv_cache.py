@@ -104,6 +104,11 @@ class PagedKvPool:
         self.v_scale = None if kv_fp8 is None else torch.ones(sshape, device=self.device)
         self._free: list[int] = list(range(num_blocks))
         self.refcount: list[int] = [0] * num_blocks
+        #: HostKvPages tier when sparse KV demotion is enabled; None = dense pool.
+        self.cold: HostKvPages | None = None
+
+    def attach_cold(self, tier: HostKvPages) -> None:
+        self.cold = tier
 
     def plane_of(self, layer_idx: int) -> int:
         """Pool plane for a model layer. The fp8 writers need the raw plane, not kv_layer()."""
@@ -161,6 +166,73 @@ class PagedKvPool:
 
     def is_shared(self, block: int) -> bool:
         return self.refcount[block] > 1
+
+    # ----------------------------------------------------- sparse-KV page tiering
+    def _page_blob(self, block: int) -> tuple[dict, int]:
+        """A host copy of one page across every plane: K, V, and (under fp8) both
+        per-token scale planes. Pinned when the pool is on a card so the promote
+        H2D is async-capable; on the CPU cell it is a plain clone."""
+        cuda = self.k_pool.is_cuda
+        planes = [("k", self.k_pool[:, block]), ("v", self.v_pool[:, block])]
+        if self.k_scale is not None:
+            planes += [("ks", self.k_scale[:, block]), ("vs", self.v_scale[:, block])]
+        blob = {}
+        n = 0
+        for key, t in planes:
+            host = torch.empty_like(t, device="cpu", pin_memory=cuda)
+            host.copy_(t)
+            blob[key] = host
+            n += host.numel() * host.element_size()
+        return blob, n
+
+    def demote_page(self, block: int) -> int:
+        """Move one page (all planes of one block id, fp8 scales included) to the
+        pinned host tier and release its device block back to THIS pool — no
+        second pool. Returns the held byte count. A prefix-shared page is
+        read-only wherever it lives and must not be demoted; a pool without a
+        cold tier cannot demote; the block has to be live. The caller removes the
+        freed id from its block tables (promotion allocates a different block)."""
+        if self.cold is None:
+            raise RuntimeError("demote_page: no host page tier attached")
+        if self.refcount[block] <= 0:
+            raise RuntimeError(f"demote_page: block {block} is not live")
+        if self.is_shared(block):
+            raise RuntimeError(f"demote_page: block {block} is prefix-shared (refcount>1)")
+        blob, n = self._page_blob(block)
+        if not self.cold.hold(block, blob, n):
+            raise RuntimeError(f"demote_page: host tier dropped block {block}")
+        self.free_block(block)  # sole owner -> back to the same pool
+        return n
+
+    def promote_page(self, old_block: int) -> int:
+        """Reload a demoted page into a FRESH block allocated from this pool and
+        return its new id. The device block id changes across a round trip; the
+        caller splices the new id into the block table. Raises if the host tier
+        never held it or byte-LRU evicted it (the selector must not name it)."""
+        if self.cold is None:
+            raise RuntimeError("promote_page: no host page tier attached")
+        blob = self.cold.take(old_block)
+        if blob is None:
+            raise RuntimeError(f"promote_page: block {old_block} is not held on the host")
+        new = self.alloc_block()
+        nb = blob["k"].is_pinned()
+        self.k_pool[:, new].copy_(blob["k"], non_blocking=nb)
+        self.v_pool[:, new].copy_(blob["v"], non_blocking=nb)
+        if self.k_scale is not None:
+            self.k_scale[:, new].copy_(blob["ks"], non_blocking=nb)
+            self.v_scale[:, new].copy_(blob["vs"], non_blocking=nb)
+        return new
+
+    def page_location(self, block: int) -> str:
+        """Where the logical page named by an id currently lives. A demoted id is
+        no longer a live device block, so this must be asked before treating an id
+        as a physical frame: 'device' (live refcount), 'host' (in the cold tier),
+        or 'free'."""
+        if self.cold is not None and block in self.cold:
+            return "host"
+        if 0 <= block < self.num_blocks and self.refcount[block] > 0:
+            return "device"
+        return "free"
 
     def _store_fp8(self, plane: int, blk: torch.Tensor, off: torch.Tensor,
                    k: torch.Tensor, v: torch.Tensor) -> None:
@@ -255,6 +327,81 @@ class PagedKvPool:
     @staticmethod
     def blocks_for_tokens(tokens: int) -> int:
         return (tokens + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+
+
+class HostKvPages:
+    """Pinned-host tier for DEMOTED KV pages (the sparse-KV cold set), the block
+    counterpart of :class:`DramSnapshots` for state. Holds one blob per demoted
+    block id: every plane's K/V and the fp8 ``k_scale``/``v_scale`` planes.
+
+    Lifecycle mirrors the state tier but the pool frees the device frame on
+    :meth:`PagedKvPool.demote_page` and promotion ALLOCATES A NEW block from the
+    same pool — a demoted id is a tier key, not a live device block. Byte-LRU
+    evicts when the pinned budget binds. Prefix-shared pages are never demoted
+    (they stay read-only wherever they live); :meth:`demote_page` refuses them.
+    """
+
+    def __init__(self, budget_bytes: int = 4 << 30) -> None:
+        self.budget_bytes = budget_bytes
+        self._held: OrderedDict[int, int] = OrderedDict()
+        self._blobs: dict[int, dict] = {}
+        self._used = 0
+        self.demotions = 0
+        self.promotions = 0
+        self.drops = 0
+
+    def __contains__(self, block_id: int) -> bool:
+        return block_id in self._held
+
+    def hold(self, block_id: int, blob: dict, nbytes: int) -> bool:
+        """Pin one page blob; True when held. A page larger than the whole budget is
+        dropped, and LRU pages are evicted to fit (a demotion that evicts itself is a
+        drop, not a hold)."""
+        if not nbytes or nbytes > self.budget_bytes or block_id in self._held:
+            self.drops += 1
+            return False
+        self._blobs[block_id] = blob
+        self._held[block_id] = nbytes
+        self._used += nbytes
+        self.demotions += 1
+        while self._used > self.budget_bytes:
+            victim, dropped = self._held.popitem(last=False)
+            self._blobs.pop(victim, None)
+            self._used -= dropped
+            self.drops += 1
+            if victim == block_id:
+                self._blobs.pop(block_id, None)
+                return False
+        return True
+
+    def take(self, block_id: int) -> dict | None:
+        """Remove and return the page blob, or None if it was never held or evicted."""
+        n = self._held.pop(block_id, None)
+        blob = self._blobs.pop(block_id, None)
+        if n is None or blob is None:
+            return None
+        self._used -= n
+        self.promotions += 1
+        return blob
+
+    def forget(self, block_id: int) -> None:
+        n = self._held.pop(block_id, None)
+        self._blobs.pop(block_id, None)
+        if n is not None:
+            self._used -= n
+
+    @property
+    def bytes_held(self) -> int:
+        return self._used
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "kv_cold_pages": len(self._held),
+            "kv_cold_bytes": self._used,
+            "kv_cold_demotions": self.demotions,
+            "kv_cold_promotions": self.promotions,
+            "kv_cold_drops": self.drops,
+        }
 
 
 class LinearStatePool:
