@@ -79,6 +79,26 @@ context lines are derived from the same ledger, not measured on a card yet:
 **256K B=1 fits in bf16; 8×128K fits only with fp8 KV; 8×256K misses one card**
 ([entry](docs/experience/wins/2026-09-11-p6-long-context-budget-on-one-h20.md)).
 
+**Sparse KV is the long-context lever, and it is in flight.** The design
+([docs/design-sparse-kv.md](docs/design-sparse-kv.md)) selects 16-token pages
+per tick — top-128 pages plus an 8-page window, one softmax over both — so the
+device holds 0.10 GiB of KV at 256k B=1 with the learned V4.1-form indexer
+(1.07 GiB with the training-free Quest bounds scorer) against the dense fp8 KV that fills the card;
+the rest lives on host RAM or SSD. Merged so far: the bounds scorer and
+selector with `k >= pages` byte-equal to dense on CPU and the sm70 cell
+([entry](docs/experience/wins/2026-09-11-sparse-kv-page-bounds-cpu.md)), and
+page demote/promote through the pinned-host path
+([entry](docs/experience/wins/2026-09-11-sparse-kv-page-tier-cpu.md)). No
+attention kernel changed: the sparse tick is a packed block table. Selection
+inside the engine, the ledger rows, the learned indexer and the V100 128k/256k
+runs are open PRs; until they merge the numbers above are derived, not
+measured.
+
+**The self-judge retry recipe (P1) is rejected**: across two matched seeds the
+held-out GSM8K gain has opposite signs (458 → 448 and 456 → 482), so it does not
+ship on the winning seed
+([verdict](docs/experience/errors/2026-09-11-p1-judge-recipe-two-seed-rejected.md)).
+
 **The thinking cap buys economy. Whether it buys accuracy is unsettled.**
 Cap the rollout at 256 tokens, score correctness only, then measure uncapped — the
 policy finds the shorter path to the same answer.
