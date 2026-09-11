@@ -59,6 +59,22 @@ once and sweeps a 64-row M tile through m8n8k4. Measured on the largest layer
 | 128 | 0.0058 |
 | 256 (new block GEMM) | **0.0048** (1.94x) |
 
+Whole-prefill A/B on the 27B V100, same tree toggled at the dispatch
+(`scripts/bench_dense_point.py`, eager, ctx 8192, 16 prefill ticks, warm):
+
+| | prefill s | ms/token | decode tok/s |
+|---|---:|---:|---:|
+| M=32 GEMV ladder | 95.3 | 11.64 | 8.63 |
+| f16 block GEMM | **35.7** | **4.36** | 8.63 |
+| speedup | **2.67x** | | (unchanged — decode stays on the M≤8 ladder) |
+
+The whole-tick speedup (2.67x) exceeds the isolated-kernel row speedup (1.94x):
+the block GEMM also cuts launch count and removes the ladder's per-chunk weight
+re-read from the forward. At 8k the linear bucket is a large share of prefill
+(attention grows to dominate only past ~32k), so this lands hard. At 256k
+attention still dominates — that is unit F's sparse attention — but the f16
+block GEMM takes the linear bucket from 4.3 toward ~1.6 ms/tok regardless.
+
 Parity vs the natural-pack f32 reference: 1.7-1.8e-3 end-to-end through
 `Backend.linear_fp4` at M=64/256, and 3.2e-4/1.9e-4 on the standalone kernel
 (M=32..256). M<=8 keeps the GEMV ladder (a single vector is bandwidth-bound).
@@ -83,3 +99,4 @@ M-ladder) and flat per token; the quadratic attention phase carried the gap.
 |---|---|---|---|
 | 2026-09-11 | V100-SXM2-32GB | cuda sm70 | prefill attn 74%@32k / 86%@64k; linear 4.3 ms/tok flat; 593 s / 2144 s total |
 | 2026-09-12 | V100-SXM2-32GB | cuda sm70 | f16 block GEMM 0.0093→0.0048 ms/row at M256 (1.94x); end-to-end rel 1.8e-3 |
+| 2026-09-12 | V100-SXM2-32GB | cuda sm70 | whole 8k prefill 95.3→35.7 s (2.67x); 11.64→4.36 ms/tok; decode unchanged |
