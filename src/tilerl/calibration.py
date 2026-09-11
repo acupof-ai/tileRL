@@ -125,19 +125,30 @@ def bound_seconds(bytes_: int, flops: int, bw_gbs: float, peak_tflops: float) ->
     return max(byte_s, flop_s)
 
 
-#: faces whose GEMM accumulates at fp8 tensor-core rate; everything with a timing
-#: fixture (nvfp4) is bounded by the bf16 peak.
-_FP8_FACE_NAMES = ("fp8_block_dev", "fp8_dev")
+#: faces whose GEMM accumulates on a quant tensor path. The actual MMA dtype is
+#: resolved from the kernel registry by launch M (w4a8 fp8 prefill vs bf16 decode);
+#: a face here names only that such a resolution is needed.
+_QUANT_FACE_NAMES = ("fp8_block_dev", "fp8_dev", "nvfp4", "nvfp4_dev", "nvfp4_dev_b32")
 
 
-def row_peak_tflops(floors: dict, face) -> float | None:
-    """The compute ceiling this row's kernel runs against: fp8 faces use the measured
-    fp8 peak (~2x bf16); nvfp4 uses bf16 peak. None when the needed floor is absent —
-    the row then renders pending rather than dividing by the wrong ceiling."""
+def row_peak_tflops(floors: dict, row: dict, b: int, s: int) -> float | None:
+    """The compute ceiling this row's kernel runs AGAINST: the measured peak of the
+    MMA dtype the registry kernel issues at this launch's M, not the weight face's.
+    nvfp4/fp8 rows with M >= 9 run e4m3 WGMMA (~2x bf16) and use fp8_peak_tflops;
+    decode (M<=8) dequants to bf16 and stays on the bf16 peak; nvfp4 uses bf16
+    peak. None when the needed floor is absent — the row renders pending rather
+    than dividing by the wrong ceiling (a missing fp8 floor on a prefill nvfp4 row
+    once read 133.8% against bf16)."""
+    from tilerl_kernels.registry import linear_mma_dtype
+
     from . import precision as P
 
-    if face is not None and any(getattr(P, n) == face for n in _FP8_FACE_NAMES):
-        return floors.get("fp8_peak_tflops")
+    face = row.get("face")
+    if face is not None and any(getattr(P, n) == face for n in _QUANT_FACE_NAMES):
+        op = "linear_fp4" if any(getattr(P, n) == face
+                                 for n in ("nvfp4", "nvfp4_dev", "nvfp4_dev_b32")) else "linear_fp8"
+        if linear_mma_dtype(op, row_launch_m(row, b, s)) == "fp8":
+            return floors.get("fp8_peak_tflops")
     return floors["peak_tflops"]
 
 

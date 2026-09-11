@@ -1804,7 +1804,11 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
         backend = get_backend()
         spec_by_name = {k.split(".")[-1]: tuple(v) for k, v in param_specs(cfg).items()}
 
-    def render(rows: list[dict], label: str, b: int, s: int) -> tuple[int, int]:
+    def render(rows: list[dict], label: str, b: int, s: int, timed_s: int):
+        """``b,s`` name the PRICED tick (bytes/flops rows); ``timed_s`` is the token
+        rows per launch the timed GEMM actually runs — s on prefill, 1 on a decode
+        tick (decode streams one new token per row, not s; timing b*s timed a fat
+        prefill GEMM and printed a fictional ~10x decode tick)."""
         print(f"# {cfg.name} {label}, fp8 KV, {src}, floor device={device_name}")
         if floors is None:
             print("# (no calibration row for this device: ms/bound/%bound pending-remote)")
@@ -1822,7 +1826,7 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {'pending':>11} {'pending':>11} {'pending':>11}")
                 continue
-            peak = cal.row_peak_tflops(floors, r.get("face"))
+            peak = cal.row_peak_tflops(floors, r, b, timed_s)
             # Per-launch bound: the timed kernel is ONE launch at the row's exact shape,
             # so its roofline floor must be for one launch too. count scales the TOTAL
             # columns below, never the per-row ratio (bound and ms are the same workload).
@@ -1831,7 +1835,7 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
             ms = None
             if backend is not None and r["name"] in spec_by_name:
                 ms = cal.time_row_ms(
-                    {**r, "_spec": spec_by_name[r["name"]]}, backend, b, s)
+                    {**r, "_spec": spec_by_name[r["name"]]}, backend, b, timed_s)
             if bound_one is None:
                 bnd_col = f"{'pending':>9}ms"
             else:
@@ -1867,7 +1871,7 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
         pre = kernel_cost.TickShape(b=1, s=args.prefill, kv=kv_format(cfg.head_dim),
                                     weight=nvfp4, faces=faces)
         tb, tf = render(kernel_cost.prefill_rows(cfg, pre),
-                        f"prefill S={args.prefill}", 1, args.prefill)
+                        f"prefill S={args.prefill}", 1, args.prefill, args.prefill)
         print(f"{'PREFILL TOTAL':<26} {'':>5} {'':>22} {'':>7} {tb:>12,} {tf:>10,}")
         return
     batches = tuple(int(x) for x in args.batches.split(",")) if args.batches else (1, 8)
@@ -1875,7 +1879,7 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
         tick = kernel_cost.TickShape(b=b, s=args.context, kv=kv_format(cfg.head_dim),
                                      weight=nvfp4, faces=faces)
         tb, tf = render(kernel_cost.tick_rows(cfg, tick),
-                        f"decode tick B={b} s={args.context}", b, args.context)
+                        f"decode tick B={b} s={args.context}", b, args.context, 1)
         print(f"{'TICK TOTAL':<26} {'':>5} {'':>22} {'':>7} {tb:>12,} {tf:>10,}")
 
 
