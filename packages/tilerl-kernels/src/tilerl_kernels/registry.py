@@ -167,6 +167,10 @@ _SM70_KERNELS = {
     # compile cache on it.
     "paged_attention_split": kernels.make_paged_attention_split,
     "paged_attention_split_combine": kernels.make_paged_attention_split_combine,
+    # sparse KV (Quest): f16 bounds halve the index; the score stays f32 (sm70
+    # is f32-IO). top-k selection is a torch gather beside the kernels.
+    "page_bounds": lambda t: kernels.make_page_bounds(t, out_dtype="float16"),
+    "page_bound_scores": kernels.make_page_bound_scores,
 }
 _register("bf16", "sm70", _SM70_KERNELS)
 _register("fp4", "sm70", _SM70_KERNELS)
