@@ -449,35 +449,52 @@ def select_pages(
     n_pages: torch.Tensor,
     scores: torch.Tensor,
     k_pages: int,
+    n_window: int = 0,
 ) -> torch.Tensor:
-    """Top-``k_pages`` page SELECTION per row per layer, returned in sequence
-    order.
+    """Selected pages per row per layer, returned in sequence order.
 
     ``block_table`` ``[B, max_pages]`` long (page ids in sequence order, padded
     0), ``n_pages`` ``[B]`` the valid page count per row, ``scores``
     ``[B, layers, max_pages]`` (per-page bound scores; padding ignored). The
-    score determines the SET (the top-k), but the returned ids are sorted back
-    to their ORIGINAL page position: paged_attention names the absolute token
-    position from the block table's order and applies a causal mask, so a
-    score-descended table would mis-position every page. Returns a shorter
-    block table ``[B, layers, min(k_pages, max_pages)]`` — paged_attention
-    reads it as an ordinary page set. With ``k_pages >= n_pages`` the valid set
-    is every page, so the output is the dense table in sequence order.
+    selected SET is the top-``k_pages`` by score UNION the last ``n_window``
+    valid pages — DeepSeek-V4.1 always attends the 128-token local window
+    (8 pages of 16) under the same softmax, so those pages are forced in even
+    when not top-k. The score and window choose the SET; the ids return in
+    ORIGINAL page position (paged_attention names the absolute token position
+    from the block table's order and applies a causal mask, so a score-descended
+    table would mis-position every page). Output ``[B, layers, width]`` where
+    width is the largest union; rows with fewer members right-pad id 0, which
+    paged_attention ignores (it derives block count from seq_len). With the
+    union covering every valid page the output is the dense table in order.
     """
     b, layers, maxp = scores.shape
-    k = min(k_pages, maxp)
-    valid = torch.arange(maxp, device=scores.device).unsqueeze(0) < n_pages.to(
-        scores.device
-    ).unsqueeze(1)
+    device = scores.device
+    n_pages = n_pages.to(device)
+    valid = torch.arange(maxp, device=device).unsqueeze(0) < n_pages.unsqueeze(1)
     valid = valid.unsqueeze(1).expand(b, layers, maxp)
+    k = min(k_pages, maxp)
     neg = torch.zeros_like(scores).masked_fill(~valid, float("-inf"))
-    # Top-k by score chooses the set (stable, deterministic on ties); argsort of
-    # those positions puts them back in sequence order.
-    topk = torch.topk(scores + neg, k, dim=2).indices  # [B,layers,k]
-    topk, _ = torch.sort(topk, dim=2)
-    ids = torch.gather(
-        block_table.unsqueeze(1).expand(b, layers, maxp), 2, topk
+    # Membership: top-k score set per row/layer (stable, deterministic on ties).
+    member = torch.zeros_like(scores, dtype=torch.bool)
+    member.scatter_(2, torch.topk(scores + neg, k, dim=2).indices, True)
+    # Force in the local window: the last n_window positions of each row's prefix.
+    if n_window > 0:
+        wpos = torch.arange(maxp, device=device).unsqueeze(0)
+        window = wpos >= (n_pages.unsqueeze(1) - n_window).clamp_min(0)
+        member |= window & valid
+    # Compact member page ids in sequence order, vectorized: each member's output
+    # slot is its running count-1 within the (row, layer); width is the max union.
+    width = int(member.sum(2).max().item())
+    rank = (torch.cumsum(member, dim=2) - 1).clamp_min(0)
+    ids = torch.zeros(b, layers, width, dtype=block_table.dtype, device=device)
+    flat_tbl = block_table.unsqueeze(1).expand(b, layers, maxp)
+    sel = member & (rank < width)
+    out_idx = (
+        torch.arange(b, device=device)[:, None, None] * layers * width
+        + torch.arange(layers, device=device)[None, :, None] * width
+        + rank
     )
+    ids.reshape(-1)[out_idx[sel]] = flat_tbl[sel]
     return ids.contiguous()
 
 

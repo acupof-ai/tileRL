@@ -945,6 +945,27 @@ class Backend:
 
     # ------------------------------------------------------------ attention
 
+    def page_bounds(self, k):
+        """Per page/KV-head elementwise min/max of K (Quest). f16 bounds on the
+        sm70 cell (the registered kernel narrows), f32 elsewhere."""
+        if "page_bounds" not in _resolve(self.precision, self.arch):
+            return reference.page_bounds(k)
+        return self._kernel("page_bounds")(self._dev(k, torch.float32).contiguous(), threads=_THREADS)
+
+    def page_bound_scores(self, q, bounds):
+        """Quest upper-bound score per page/KV head; f32 accumulator. The kernel
+        reads bounds (f16 on sm70) widened to f32."""
+        if "page_bound_scores" not in _resolve(self.precision, self.arch):
+            return reference.page_bound_scores(q, bounds)
+        b = bounds
+        if b.dtype != torch.float32:
+            b = b.float()
+        return self._kernel("page_bound_scores")(
+            self._dev(q, torch.float32).contiguous(),
+            self._dev(b, torch.float32).contiguous(),
+            threads=_THREADS,
+        )
+
     def paged_attention(
         self, q, k_cache, v_cache, block_table, seq_lens, scale, gate=None, seq_q_lens=None,
         k_scale=None, v_scale=None

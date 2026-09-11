@@ -51,6 +51,33 @@ def test_select_at_full_k_is_the_dense_table_in_sequence_order():
     assert torch.equal(sel[0, 0], want[0, 0])
 
 
+def test_local_window_pages_are_forced_in_under_top_k():
+    """V4.1 attends the 128-token local window (8 pages) under the same softmax,
+    so select_pages unions the last n_window valid pages with the top-k set even
+    when they are not top-scoring; the union stays in sequence order."""
+    p, win = 12, 8
+    # page 0 highest, window pages deliberately near-zero; only top 2 scored.
+    scores = torch.zeros(1, 1, p)
+    scores[0, 0, 0] = 0.9
+    scores[0, 0, 1] = 0.8
+    block_table = (torch.arange(p) + 100).reshape(1, p)
+    n = torch.tensor([p])
+
+    top_only = select_pages(block_table, n, scores, k_pages=2, n_window=0)[0, 0]
+    assert top_only.tolist() == [100, 101]  # score order would be wrong; seq order kept
+
+    sel = select_pages(block_table, n, scores, k_pages=2, n_window=win)[0, 0]
+    # drop the id-0 padding, get valid page positions
+    valid_ids = [int(x) for x in sel.tolist() if int(x) != 0]
+    positions = [i - 100 for i in valid_ids]
+    window_pages = set(range(p - win, p))
+    assert window_pages.issubset(set(positions)), positions
+    assert 0 in positions and 1 in positions  # the two top-scored pages too
+    assert positions == sorted(positions), "union must be in sequence order"
+    # width = min(k + win, p) = 10
+    assert len(valid_ids) == 2 + win, positions
+
+
 def test_sparse_attention_equals_dense_at_full_k():
     """The paged gather kernel fed the full-k selected table produces the same
     output and argmax as the dense table — paged_attention itself is unchanged,
