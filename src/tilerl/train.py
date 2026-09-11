@@ -433,17 +433,26 @@ def indexer_warmup_step(
     return float(loss.detach())
 
 
+def init_indexer_weights(cfg: Any, gen: torch.Generator, device,
+                         di: int | None = None) -> dict[str, torch.Tensor]:
+    """The two trainable indexer projection weights: ``iq`` [hkv,hidden,di] and
+    ``ik`` [hkv,head_dim,di], small random (V4.1 releases di=128; tiny uses 16)."""
+    hkv, d_kv, hidden = cfg.num_kv_heads, cfg.head_dim, cfg.hidden_size
+    di = min(16, d_kv) if di is None else di
+    scale = 0.1
+    return {
+        "iq": scale * torch.randn(hkv, hidden, di, generator=gen, device=device),
+        "ik": scale * torch.randn(hkv, d_kv, di, generator=gen, device=device),
+    }
+
+
 def indexer_warmup(model: Any, backend: Any, steps: int, seed: int = 0,
                    seq_len: int = 256, batch: int = 1, lr: float = 0.02) -> list[float]:
-    """Run the learned-indexer KL warm-up on the frozen base for ``steps`` and
-    return the per-step loss. Tiny/CPU path; the 27B card run is pending-remote."""
+    """Run the learned-indexer KL warm-up on the frozen base for ``steps`` over
+    random ids and return the per-step loss. Tiny/CPU path; the 27B card run
+    drives :func:`indexer_warmup_step` directly over real corpus spans."""
     gen = torch.Generator(device=backend.device).manual_seed(seed)
-    hkv, d_kv, hidden = model.cfg.num_kv_heads, model.cfg.head_dim, model.cfg.hidden_size
-    di = min(16, d_kv)  # small indexer head on tiny
-    weights = {
-        "iq": (0.1 * torch.randn(hkv, hidden, di, generator=gen, device=backend.device)),
-        "ik": (0.1 * torch.randn(hkv, d_kv, di, generator=gen, device=backend.device)),
-    }
+    weights = init_indexer_weights(model.cfg, gen, backend.device)
     opt = AdamW(lr=lr)
     losses = []
     for _ in range(steps):
@@ -451,6 +460,34 @@ def indexer_warmup(model: Any, backend: Any, steps: int, seed: int = 0,
                             generator=gen, device=backend.device)
         losses.append(indexer_warmup_step(model, ids, backend, weights, opt))
     return losses
+
+
+def indexer_warmup_run(model: Any, backend: Any, train_batches: list,
+                       held_batches: dict, k_pages_pick: int, steps: int,
+                       lr: float, seed: int = 0, di: int | None = None) -> dict:
+    """The science run over real long-text spans. ``train_batches`` is a list of
+    id tensors cycled for ``steps``; ``held_batches`` maps a length label to id
+    tensors used for gradient-free recall before and after. Returns recall
+    before/after per held-out length, the KL curve and tokens seen."""
+    gen = torch.Generator(device=backend.device).manual_seed(seed)
+    weights = init_indexer_weights(model.cfg, gen, backend.device, di)
+
+    def recalls() -> dict:
+        return {label: sum(indexer_recall(model, ids, backend, weights, k_pages_pick)
+                           for ids in batches) / len(batches)
+                for label, batches in held_batches.items()}
+
+    before = recalls()
+    opt = AdamW(lr=lr)
+    curve, tokens_seen = [], 0
+    for i in range(steps):
+        ids = train_batches[i % len(train_batches)]
+        curve.append(indexer_warmup_step(model, ids, backend, weights, opt))
+        tokens_seen += int(ids.numel())
+    after = recalls()
+    return {"recall_before": before, "recall_after": after, "kl_curve": curve,
+            "tokens_seen": tokens_seen, "steps": steps,
+            "k_pages": k_pages_pick, "di": weights["iq"].shape[-1]}
 
 
 def train_step(
