@@ -269,6 +269,57 @@ def test_time_row_ms_identity_assert_survives_bound_methods(monkeypatch):
     assert cal.time_row_ms(row, BoundBackend(), 1, 1) == 1.0
 
 
+def test_time_row_ms_shape_matches_priced_flops_decode_and_prefill(monkeypatch):
+    """The timed GEMM is the priced launch: a linear row's per-launch flops are
+    2*M*N*K, so the row's declared flops pin M for both ticks (b*s) and prefill
+    (b=1,s=S); lm_head prices b vectors. Mutant: row_launch_m returns 1 for every
+    row — the prefill/decode rows here go red (the 5,967% table class)."""
+    import torch
+
+    monkeypatch.setattr(torch, "cuda", type("C", (), {"is_available": lambda self: True})())
+    monkeypatch.setattr(cal, "_event_seconds", lambda fn, iters=20: 0.001)
+
+    from tilerl import precision as P
+
+    class Backend:
+        device = torch.device("cpu")
+
+        def linear_fp8(self, x, wq, wscale):
+            return None
+
+    n, k = 32, 16
+    for name, b, s, m in (("q_proj", 1, 8, 8), ("q_proj", 1, 4096, 4096),
+                          ("q_proj", 8, 1, 8), ("lm_head", 8, 1, 8)):
+        row = {"name": name, "_spec": (n, k), "face": P.fp8_dev,
+               "flops": 2 * m * n * k}
+        assert cal.time_row_ms(row, Backend(), b, s) == 1.0
+
+    bad = {"name": "q_proj", "_spec": (n, k), "face": P.fp8_dev,
+           "flops": 2 * 4096 * n * k}  # prices a 4096-token prefill launch
+    with pytest.raises(AssertionError):
+        cal.time_row_ms(bad, Backend(), 1, 1)  # timed at m=1 — the m=1 mutant
+
+
+def test_kernels_checkpoint_guard_refuses_model_mismatch(tmp_path, monkeypatch):
+    """bench --kernels --checkpoint is the command that printed the 5,967% table
+    (27B checkpoint on tiny cfg); the shared guard must refuse it before any
+    safetensors header is read."""
+    import json
+
+    (tmp_path / "config.json").write_text(json.dumps({
+        "num_hidden_layers": 48, "hidden_size": 5120, "num_attention_heads": 40,
+        "num_key_value_heads": 4, "head_dim": 256}))
+    import argparse
+
+    from tilerl import cli
+
+    args = argparse.Namespace(model="tiny", batches=None, context=4096, prefill=0,
+                              checkpoint=str(tmp_path), device_name="x",
+                              kv_fp8=False)
+    with pytest.raises(SystemExit, match="not a tiny checkpoint"):
+        cli.cmd_bench_kernels(args)
+
+
 def test_kernels_table_pending_when_no_calibration(tmp_path, monkeypatch, capsys):
     """With no ledger row the roofline columns render pending-remote, not a datasheet
     number, even though bytes/flops always print."""

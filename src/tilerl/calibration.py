@@ -338,6 +338,15 @@ def _pack_for(face, w_bf16):
     return (w8, wscale), {}
 
 
+def row_launch_m(row: dict, b: int, s: int) -> int:
+    """The M (token rows) of ONE timed launch: decode rows price b*s tokens, lm_head
+    prices one vector per sequence (its s=1 weight math repeats per token but it runs
+    once after the gather). A decode tick (b rows, s=B per row) and a prefill row
+    (b=1, s=S) differ ONLY here — pinning it is what keeps a 1-token GEMM from being
+    timed against a full-prefill row."""
+    return b if row["name"] == "lm_head" else b * s
+
+
 def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     """ms of the registry kernel the row's face DECLARES, or None to render
     pending-remote. Inputs are packed to that kernel's weight face, so the measured ms
@@ -352,10 +361,17 @@ def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     if fn is None or row.get("_spec") is None:
         return None
     out_n, inn = tuple(row["_spec"])
-    m = b if row["name"] == "lm_head" else b * s
+    m = row_launch_m(row, b, s)
     dev = backend.device
     x = torch.randn(m, inn, dtype=torch.bfloat16, device=dev)
     w_bf16 = torch.randn(out_n, inn, dtype=torch.bfloat16, device=dev)
+    # Shape gate: the built GEMM is exactly the priced launch. flops on a linear row
+    # are 2*M*N*K per launch, so the row's declared flops pin M. An m=1 mutant then
+    # fails here on a prefill/decode row instead of timing a 1-token GEMM against a
+    # full-shape row and printing %bound in the thousands (all timing tests green).
+    if row.get("flops") is not None:
+        assert row["flops"] == 2 * m * out_n * inn, (
+            f"timed M={m} but row prices {row['flops'] // (2 * out_n * inn)} token rows")
     wargs, wkw = _pack_for(row["face"], w_bf16)
     # identity assertion: the thing we time is the kernel the row's face declared,
     # not a substitute. resolve_row_kernel is the single resolution point. A bound

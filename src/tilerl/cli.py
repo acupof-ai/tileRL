@@ -216,6 +216,19 @@ def _kv_fp8(name: str | None):
     return {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}[name]
 
 
+def _require_checkpoint_matches(cfg, model_name: str, checkpoint: str) -> None:
+    """Refuse before loading a checkpoint whose config.json is not this model's.
+    Ground truth is the checkpoint's own config.json: pricing/timing it on a different
+    cfg (e.g. --checkpoint <27B> left on the default --model tiny) silently mixed tiny
+    shapes with 27B rows — the 5,967% roofline table. Both --dry-run and
+    bench --kernels --checkpoint load safetensors, so both call this one guard."""
+    from .model import checkpoint_matches_config
+
+    ok, reason = checkpoint_matches_config(cfg, checkpoint)
+    if not ok:
+        sys.exit(f"error: --checkpoint {checkpoint} is not a {model_name} checkpoint: {reason}")
+
+
 def _dry_run_checkpoint(args, backend) -> None:
     """--dry-run --checkpoint DIR: price the ledger from safetensors HEADERS alone
     (the served faces model.checkpoint_weight_faces derives), blocks fitted
@@ -238,14 +251,7 @@ def _dry_run_checkpoint(args, backend) -> None:
 
     cfg = {"tiny": config_mod.tiny, "tiny-agent": lambda: config_mod.tiny(65536),
            "qwen38-27b": config_mod.qwen38_27b}[args.model]()
-    # Ground truth is the checkpoint's own config.json: pricing its faces on a different
-    # cfg (e.g. --checkpoint <27B> left on the default --model tiny) silently times tiny
-    # shapes against 27B rows. Refuse rather than mix the two.
-    from .model import checkpoint_matches_config
-
-    ok, reason = checkpoint_matches_config(cfg, args.checkpoint)
-    if not ok:
-        sys.exit(f"error: --checkpoint {args.checkpoint} is not a {args.model} checkpoint: {reason}")
+    _require_checkpoint_matches(cfg, args.model, args.checkpoint)
     faces = checkpoint_weight_faces(cfg, args.checkpoint)
     device_free = _device_free(args, backend)
     # state slots add the decode-graph replay row on cuda (auto-on); the fit happens
@@ -1810,6 +1816,8 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
     from .precision import fp8_block_dev, fp8_dev, kv_format, nvfp4, nvfp4_dev, nvfp4_dev_b32
 
     cfg = config_mod.qwen38_27b() if args.model == "qwen38-27b" else config_mod.tiny()
+    if args.checkpoint:
+        _require_checkpoint_matches(cfg, args.model, args.checkpoint)
     faces = checkpoint_weight_faces(cfg, args.checkpoint) if args.checkpoint else None
     face_label = {
         nvfp4: "nvfp4", nvfp4_dev: "nvfp4", nvfp4_dev_b32: "nvfp4",
