@@ -1002,7 +1002,7 @@ class Engine:
         import torch
 
         if torch.cuda.is_available():
-            return int(torch.cuda.max_memory_allocated(self.device))
+            return int(torch.cuda.max_memory_allocated(self._backend.device))
         return sum(self._held_storage().values())
 
     def _memory_rows(self) -> list[dict]:
