@@ -1194,6 +1194,7 @@ class Engine:
         srows = []
         for r, tq in zip(rows, seq_q):
             decoding = r in decodes
+            reserved: set[int] = set()
             q_hi = int(r.seq_len) if decoding else int(r.prefill_from + tq)
             q_lo = q_hi - tq
             if decoding:
@@ -1209,23 +1210,49 @@ class Engine:
             own_len = q_hi - own_first * BLOCK_TOKENS
             cand = [p for p in range(0, own_first) if p in tr.bounds[r.req_id]]
 
-            def resolve(p, r=r):
-                return self._sparse_resolve(r, p)
+            def resolve(p, r=r, reserved=reserved):
+                return self._sparse_resolve(r, p, reserved)
 
             for p in own:
+                reserved.add(p)
                 resolve(p)
             srows.append(dict(req_id=r.req_id, own=own, own_len=own_len,
                               q_start=q_lo, q_hi=q_hi, decoding=decoding, tq=tq,
-                              cand=cand, force_window=force_window, resolve=resolve))
+                              cand=cand, force_window=force_window, resolve=resolve,
+                              reserved=reserved))
         return SparseForward(tr, srows, self._backend.device)
 
-    def _sparse_resolve(self, r: _Req, page: int) -> int:
+    def _sparse_evict_victim(self, r: _Req, reserved: set[int]) -> None:
+        """Free one frame this tick does NOT need, so a promotion can allocate.
+
+        Cross-tick pin leaves last tick's selected pages resident; when this tick's
+        selection differs, a newly named page needs that frame. Demote any resident
+        page of this row outside the tick's reserved set (own span + this tick's
+        picks across groups). Raises if every resident page is reserved — that would
+        mean the pool was undersized below the pin ceiling, a build_engine bug."""
+        live = self._sparse.resident[r.req_id]
+        for p, phys in live.items():
+            if p in reserved:
+                continue
+            self._kv.demote_page(phys, key=(r.req_id, p))
+            r.cold_pages.append(p)
+            r.blocks.remove(phys)
+            del live[p]
+            return
+        raise RuntimeError("sparse: no unreserved resident page to evict for a "
+                           "promotion; hot pool undersized below the pin ceiling")
+
+    def _sparse_resolve(self, r: _Req, page: int, reserved: set[int] | None = None) -> int:
         """Physical block for a resident-or-cold private logical page, allocating a
-        fresh block for a never-written-before own page or promoting the host blob."""
+        fresh block for a never-written-before own page or promoting the host blob.
+        Under cross-tick pin the pool is full of last tick's pages, so evict one
+        unreserved frame first when no block is free."""
         tr = self._sparse
         live = tr.resident[r.req_id]
         if page in live:
             return live[page]
+        if self._kv.free_blocks == 0 and reserved is not None:
+            self._sparse_evict_victim(r, reserved)
         # Automatic path: cold_pages are bare logical ints, blob keyed (req, page).
         if page in r.cold_pages:
             new = self._kv.promote_keyed((r.req_id, page))
@@ -1238,11 +1265,14 @@ class Engine:
 
     def _sparse_finalize(self, sf, rows: list[_Req]) -> None:
         """After the forward: store Quest bounds of every now-complete page, then
-        demote ALL resident private pages to the host tier (the device pool holds a
-        page only during the tick that reads it; the cross-tick hot set is the later
-        perf PR). Bounds stay device-resident, so scoring never reads cold K.
-        # ponytail: every selected page re-fetches next tick (worst-case 69 MiB/tick
-        # in the design); pin the deltas when the card bench justifies it."""
+        keep resident the pages selected THIS tick (the union of the source groups
+        plus the own span) and demote only resident pages that LEFT that set.
+
+        Cross-tick pin: a stable selection keeps the same physical frames pinned,
+        so the next tick promotes nothing; a changed selection demotes only the
+        dropped pages and promotes the newly named ones. The device pool is sized
+        n_groups*k + window + chunk per slot, i.e. exactly this pin ceiling.
+        Bounds stay device-resident regardless, so scoring a cold page needs no K."""
         tr = self._sparse
         pool = self._kv
         for bi, r in enumerate(rows):
@@ -1262,13 +1292,19 @@ class Engine:
                         pool.k_pool[plane, phys].amax(dim=1)), dim=1)
                     for plane in range(pool.num_layers)]).to(torch.float16)
                 tr.set_bounds(rid, p, b)
+            kept = sf.selected_pages(bi)
+            kept_live: dict[int, int] = {}
             for p, phys in list(live.items()):
-                # Key the host blob by (req, logical page), not the recycled phys:
-                # the frame is freed now and reissued to a later page.
+                if p in kept:
+                    kept_live[p] = phys                 # pin across ticks
+                    continue
                 pool.demote_page(phys, key=(rid, p))
                 r.cold_pages.append(p)
-                r.blocks.remove(phys)
+            # r.blocks mirrors the live frames in LOGICAL page order (paged_attention
+            # derives causal positions from the order), so sort the pinned set.
+            r.blocks = [kept_live[p] for p in sorted(kept_live)]
             live.clear()
+            live.update(kept_live)
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0,
                  sf=None) -> BatchKv:
@@ -1384,7 +1420,12 @@ class Engine:
         if sparse:
             # Sparse grows blocks lazily inside selection, so skip the dense pre-allocation
             # of the chain's tail (pages are promoted/allocated by _sparse_rows).
+            # One batched H2D for the tick's promotions: own-span resolves below and the
+            # selected pages resolve inside the model forward; the context retains their
+            # blobs and synchronizes once, instead of one cuda sync per promoted page.
+            promote_ctx = self._kv.promotions()
             sf = self._sparse_rows(rows, seq_q, decodes)
+            promote_ctx.__enter__()
         # Bucket a prefill width: kernels specialize per shape (MMLU compiled
         # 662 variants). A verify width is exact, at most 1+depth.
         chunk = max(chunks, default=0)
@@ -1409,6 +1450,7 @@ class Engine:
             last_only=False if chains else seq_q,  # a verify tick needs every chain position
         )
         if sparse:
+            promote_ctx.__exit__(None, None, None)
             self._sparse_finalize(sf, rows)
         if hid is not None:
             n_aux = len(self._aux_layers)

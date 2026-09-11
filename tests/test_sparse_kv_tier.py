@@ -349,6 +349,45 @@ def test_narrow_f16_path_prices_half_and_decodes_like_dense():
     dense.shutdown(); cold.shutdown()
 
 
+def test_batched_promotions_copy_many_pages_but_sync_once():
+    """A decode tick that fetches N cold pages must pay ONE device sync, not N —
+    the per-page cuda.synchronize inside promote was the 6.6x decode slowdown.
+    Demote three pages, then promote all three inside pool.promotions() on a pool
+    whose device we pretend is cuda: exactly one synchronize must be observed and
+    every page must come back byte-equal."""
+    import unittest.mock as mock
+
+    p, hkv, d = 4, 2, 8
+    pool = PagedKvPool(p + 8, hkv, d, num_layers=2, device=_device())
+    pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
+    snaps = {}
+    for i in range(3):
+        b = pool.alloc_block()
+        kk, vv = _kv(100 + i, 1, hkv, d)
+        for plane in range(2):
+            pool.write_block(b, 0, kk[0], vv[0], layer=plane)
+        snaps[i] = (pool.k_pool[:, b].clone(), pool.v_pool[:, b].clone())  # keyed logical i
+        pool.demote_page(b, key=("r", i))
+
+    # On the CPU cell copies are synchronous clones, so drive the cuda branch by
+    # pretending the device is cuda and counting synchronize calls.
+    real_device = pool.device
+    pool.device = torch.device("cuda")
+    try:
+        with mock.patch("tilerl.kv_cache.torch.cuda.synchronize") as sync_fn, \
+             pool.promotions():
+            new_blocks = [pool.promote_keyed(("r", i)) for i in range(3)]
+            # still inside the batch: the single sync happens only at context exit
+            assert sync_fn.call_count == 0, sync_fn.call_count
+        assert sync_fn.call_count == 1, (
+            f"expected one batched sync, got {sync_fn.call_count}")
+    finally:
+        pool.device = real_device
+    for i, nb in enumerate(new_blocks):
+        assert torch.equal(pool.k_pool[:, nb], snaps[i][0])
+        assert torch.equal(pool.v_pool[:, nb], snaps[i][1])
+
+
 if __name__ == "__main__":
     import sys
 
