@@ -58,3 +58,21 @@ container that mounts only `/work`.
 The 27B indexer recall run (unit D, PR #512) could not smoke or run without
 the checkpoint; all CPU-gated code and the prepared 8k/16k/32k Chinese-wiki
 corpus were ready and unaffected. No fabricated path was substituted.
+
+## Known tail
+
+The two launchers every pod run sources (`scripts/pod_env.sh`,
+`scripts/pod_run.sh`) now default `TILERL_QWEN38_SOURCE` to the tileRL-owned
+path. Other scripts still spell the old `/work/Qwen3.8-27B-NVFP4` path in one
+of two ways, and are deliberately left on a follow-up rather than swept into
+this docs PR:
+
+- Dated probes whose path is inside a recorded invocation/usage string
+  (~50 files) — historical record, like the wins/errors entries; changing them
+  falsifies how those past probes ran.
+- A handful of standalone probes with their OWN executable default
+  (`probe_spin_cost_27b.py`, `verify_h20_fp4.py`, `capture_determinism.py`,
+  `fwd_determinism.py`, `poison_pool_determinism.py`, `probe_kv_fp8_27b.py`,
+  `rl_compare.sh`); these are not sourced by `pod_run`, so they do not affect
+  a standard launch, but they should be repointed the next time each is run.
+  `serve_v100.sh` correctly keeps a V100-box-local path.

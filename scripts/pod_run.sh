@@ -100,7 +100,7 @@ echo "pod_run: tree $REMOTE_DIR sha \$(cat $REMOTE_DIR/.synced_commit 2>/dev/nul
 export TILELANG_CACHE_DIR=/work/tilelang_cache
 export PYTHONPATH=$REMOTE_DIR/src:$REMOTE_DIR/packages/tilerl-kernels/src
 export TILERL_TARGET=\${TILERL_TARGET:-cuda} CUDA_VISIBLE_DEVICES=$CARD
-export TILERL_QWEN38_SOURCE=\${TILERL_QWEN38_SOURCE:-/work/Qwen3.8-27B-NVFP4}
+export TILERL_QWEN38_SOURCE=\${TILERL_QWEN38_SOURCE:-/work/tilerl-ckpt/Qwen3.8-27B-NVFP4}
 export REMOTE_DIR=$REMOTE_DIR
 # Forward --lend-ref to the in-process card_guard (#491): it reads this env, and a
 # job on an unclassified card exits before touching the GPU without it. The value is
