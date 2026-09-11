@@ -725,6 +725,25 @@ class Backend:
             _, _, Np, Kp, _, bN = self._plan("linear_fp4", 1, N, K)
             wq1, sc1 = _pad2d(wq, Np, Kp // 2), _pad2d(scale, Np, Kp // blk)
             osc1 = self._ones(Np) if oscale is None else self._const_f32(oscale, Np)
+            # PREFILL (M>8): one M-tiled f16 block GEMM dequantizes each weight
+            # tile once and sweeps all M rows through m8n8k4, instead of the M=32
+            # GEMV ladder that re-reads the whole weight per chunk. Keep the ladder
+            # for M<=8 (decode/verify), where a single vector is bandwidth-bound and
+            # ncols=2 GEMV wins. bK=64 is the dequant tile; bN=64 matches the f16
+            # kernel. Padded wq/scale decode to 0 and the output is sliced to N.
+            if M > 8 and "linear_fp4_f16_mma" in _resolve(self.precision, self.arch):
+                BK = 64
+                bM = min(64, M)
+                Np2 = ((N + 63) // 64) * 64
+                Kp2 = ((K + BK - 1) // BK) * BK
+                wq2, sc2 = _pad2d(wq, Np2, Kp2 // 2), _pad2d(scale, Np2, Kp2 // blk)
+                osc2 = self._ones(Np2) if oscale is None else self._const_f32(oscale, Np2)
+                xf = x2 if x2.dtype == torch.float16 else x2.to(torch.float16)
+                y2 = self._kernel("linear_fp4_f16_mma")(
+                    _pad2d(xf, M, Kp2), wq2, sc2, osc2, bM, 64, blk, _THREADS,
+                )[:M, :N]
+                y = self._epilogue(y2, None, lead, N)
+                return y if residual is None else y + residual
             # Round M up the compiled ladder, and hand the kernel X pre-packed as
             # f16: otherwise it re-reads X per block and converts inside the tile
             # loop (78% of the M=8 bytes, 32 of ~49 per-row instructions). Packing
