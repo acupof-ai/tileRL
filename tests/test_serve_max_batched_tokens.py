@@ -28,13 +28,13 @@ def _captured_kw(fake_cfg, **kwargs):
 
 
 def test_max_batched_tokens_threaded(fake_cfg):
-    kw = _captured_kw(fake_cfg, max_batched_tokens=2048)
+    kw = _captured_kw(fake_cfg, max_batched_tokens=2048, sparse_k=0)
     assert kw["max_num_batched_tokens"] == 2048
 
 
 def test_default_leaves_engine_default(fake_cfg):
     # 0 means "do not pass it": StepLimits' own 512 stays the default.
-    kw = _captured_kw(fake_cfg)
+    kw = _captured_kw(fake_cfg, sparse_k=0)
     assert "max_num_batched_tokens" not in kw
 
 
