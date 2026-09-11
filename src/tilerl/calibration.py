@@ -17,6 +17,7 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 #: one calibration row per (metric, device name) pair
 BW_METRIC = "hbm_bw_gbs"
 PEAK_METRIC = "bf16_peak_tflops"
+FP8_PEAK_METRIC = "fp8_peak_tflops"
 
 
 def store_path() -> Path:
@@ -58,15 +59,19 @@ def latest_floor(rows: list[dict], metric: str, device_name: str) -> dict | None
 
 
 def calibration(rows: list[dict], device_name: str) -> dict | None:
-    """Both floors for a device, or None when either is missing (then the renderer prints
-    pending-remote rather than dividing by a half-calibration)."""
+    """The floors for a device, or None when the required bf16 pair is missing (then
+    the renderer prints pending-remote rather than dividing by a half-calibration).
+    The fp8 peak is optional: absent → None, and fp8 GEMM rows render pending rather
+    than borrow the bf16 ceiling (which would read ~200% on a healthy fp8 kernel)."""
     bw = latest_floor(rows, BW_METRIC, device_name)
     peak = latest_floor(rows, PEAK_METRIC, device_name)
     if bw is None or peak is None:
         return None
+    fp8 = latest_floor(rows, FP8_PEAK_METRIC, device_name)
     return {
         "bw_gbs": float(bw["value"]),
         "peak_tflops": float(peak["value"]),
+        "fp8_peak_tflops": None if fp8 is None else float(fp8["value"]),
     }
 
 
@@ -74,7 +79,7 @@ RESIDENT_METRIC = "device_resident_bytes"
 #: the metrics this section renders — a device appears only if it has at least one of
 #: these, so an unrelated bench row (e.g. a cpu decode_tok_s) never makes an all-pending
 #: section that implies a calibrated card.
-_SECTION_METRICS = (BW_METRIC, PEAK_METRIC, RESIDENT_METRIC)
+_SECTION_METRICS = (BW_METRIC, PEAK_METRIC, FP8_PEAK_METRIC, RESIDENT_METRIC)
 
 
 def device_sections(rows: list[dict]) -> list[dict]:
@@ -103,6 +108,7 @@ def device_sections(rows: list[dict]) -> list[dict]:
             "device": name,
             "hbm_bw_gbs": pair(latest_floor(rows, BW_METRIC, name)),
             "bf16_peak_tflops": pair(latest_floor(rows, PEAK_METRIC, name)),
+            "fp8_peak_tflops": pair(latest_floor(rows, FP8_PEAK_METRIC, name)),
             "residency": None if res is None else {
                 "peak": res["value"], "static": res["shape"]["static"],
                 "transient": res["shape"]["transient"],
@@ -117,6 +123,22 @@ def bound_seconds(bytes_: int, flops: int, bw_gbs: float, peak_tflops: float) ->
     byte_s = bytes_ / (bw_gbs * 1e9)
     flop_s = flops / (peak_tflops * 1e12)
     return max(byte_s, flop_s)
+
+
+#: faces whose GEMM accumulates at fp8 tensor-core rate; everything with a timing
+#: fixture (nvfp4) is bounded by the bf16 peak.
+_FP8_FACE_NAMES = ("fp8_block_dev", "fp8_dev")
+
+
+def row_peak_tflops(floors: dict, face) -> float | None:
+    """The compute ceiling this row's kernel runs against: fp8 faces use the measured
+    fp8 peak (~2x bf16); nvfp4 uses bf16 peak. None when the needed floor is absent —
+    the row then renders pending rather than dividing by the wrong ceiling."""
+    from . import precision as P
+
+    if face is not None and any(getattr(P, n) == face for n in _FP8_FACE_NAMES):
+        return floors.get("fp8_peak_tflops")
+    return floors["peak_tflops"]
 
 
 def _event_seconds(fn, iters: int) -> float:
@@ -163,6 +185,30 @@ def measure_bf16_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> fl
     return (2 * n**3) / secs / 1e12
 
 
+def measure_fp8_peak_tflops(card: int, *, n: int = 8192, iters: int = 20) -> float:
+    """Sustained fp8 tensor peak from one large square GEMM through torch's own fp8
+    matmul (scaled e4m3 x e4m3 -> bf16): 2*n^3 flops / event sec. fp8 GEMM rows must
+    divide by THIS ceiling, not bf16 peak — fp8 sustains ~2x the bf16 rate, so keying
+    an fp8 row to the bf16 floor makes %bound read ~200% on a healthy kernel."""
+    import torch
+
+    with torch.cuda.device(card):
+        dt = torch.float8_e4m3fn
+        a = torch.randn(n, n, dtype=torch.bfloat16, device=f"cuda:{card}").to(dt)
+        b = torch.randn(n, n, dtype=torch.bfloat16, device=f"cuda:{card}").to(dt)
+        # TensorWise scaling: two singleton f32 scales (this torch build rejects 1-D
+        # rowwise vectors — it wants [M,1]/[1,N]; the peak GEMM needs only unit scale).
+        sa = torch.tensor(1.0, dtype=torch.float32, device=f"cuda:{card}")
+        sb = torch.tensor(1.0, dtype=torch.float32, device=f"cuda:{card}")
+
+        def gemm():
+            return torch._scaled_mm(a, b.t(), scale_a=sa, scale_b=sb,
+                                    out_dtype=torch.bfloat16)
+
+        secs = _event_seconds(gemm, iters)
+    return (2 * n**3) / secs / 1e12
+
+
 def _row(metric: str, value: float, unit: str, device_name: str, card: int, derivation: str):
     from .cli import _benchrec
 
@@ -199,6 +245,7 @@ def calibrate_rows(card: int) -> list[dict]:
     device_name = torch.cuda.get_device_name(card)
     bw = measure_hbm_bw_gbs(card)
     peak = measure_bf16_peak_tflops(card)
+    fp8_peak = measure_fp8_peak_tflops(card)
     return [
         _row(
             BW_METRIC,
@@ -215,6 +262,15 @@ def calibrate_rows(card: int) -> list[dict]:
             device_name,
             card,
             "one large bf16 square GEMM (2n^3 flops), CUDA-event median; floor = this measurement",
+        ),
+        _row(
+            FP8_PEAK_METRIC,
+            fp8_peak,
+            "TFLOP/s",
+            device_name,
+            card,
+            "one large fp8 (e4m3) scaled square GEMM (2n^3 flops) through torch._scaled_mm, "
+            "CUDA-event median; the ceiling for fp8 GEMM rows",
         ),
     ]
 

@@ -103,7 +103,29 @@ def test_calibration_returns_both_floors(tmp_path):
     p = _store(tmp_path, [_row(cal.BW_METRIC, 4000.0, "GB/s", H20),
                           _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20)])
     got = cal.calibration(cal.load_rows(p), H20)
-    assert got == {"bw_gbs": 4000.0, "peak_tflops": 989.0}
+    # bf16 pair present; fp8 peak absent -> None (fp8 rows render pending, never bf16)
+    assert got == {"bw_gbs": 4000.0, "peak_tflops": 989.0, "fp8_peak_tflops": None}
+
+
+def test_calibration_returns_fp8_peak_when_present(tmp_path):
+    p = _store(tmp_path, [_row(cal.BW_METRIC, 4000.0, "GB/s", H20),
+                          _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20),
+                          _row(cal.FP8_PEAK_METRIC, 1970.0, "TFLOP/s", H20)])
+    assert cal.calibration(cal.load_rows(p), H20) == {
+        "bw_gbs": 4000.0, "peak_tflops": 989.0, "fp8_peak_tflops": 1970.0}
+
+
+def test_row_peak_keys_by_face(tmp_path):
+    """fp8 faces bound against the fp8 ceiling; nvfp4 against bf16; missing fp8 -> None."""
+    from tilerl import precision as P
+
+    bf = {"bw_gbs": 4000.0, "peak_tflops": 100.0, "fp8_peak_tflops": 200.0}
+    assert cal.row_peak_tflops(bf, P.nvfp4_dev) == 100.0
+    assert cal.row_peak_tflops(bf, P.nvfp4_dev_b32) == 100.0
+    assert cal.row_peak_tflops(bf, P.fp8_block_dev) == 200.0
+    assert cal.row_peak_tflops(bf, P.fp8_dev) == 200.0
+    missing = {"bw_gbs": 4000.0, "peak_tflops": 100.0, "fp8_peak_tflops": None}
+    assert cal.row_peak_tflops(missing, P.fp8_dev) is None
 
 
 def test_calibrate_refuses_off_cuda(monkeypatch):
@@ -319,7 +341,9 @@ def test_device_section_picks_newest_pair_and_residency_per_device(tmp_path):
     assert v100["hbm_bw_gbs"]["value"] == 900.0
     assert v100["residency"] is None
     # JSON shape the CLI pins.
-    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "residency"}
+    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "fp8_peak_tflops",
+                        "residency"}
+    assert h20["fp8_peak_tflops"] is None  # no fp8 row recorded in this fixture
     assert set(h20["hbm_bw_gbs"]) == {"value", "commit", "date"}
     assert set(h20["residency"]) == {"peak", "static", "transient", "commit", "date"}
 

@@ -204,7 +204,12 @@ def test_serve_dry_run_checkpoint_is_header_only_and_needs_dry_run(tmp_path, cap
     from tilerl.memory import _state_bytes, fit_num_blocks, weight_row_faces
     from tilerl.model import checkpoint_weight_faces
 
-    save_file({"model.embed_tokens.weight": torch.zeros((100, 64), dtype=torch.bfloat16)},
+    # config.json must match the --model cfg or the new model/checkpoint guard refuses
+    # (pricing one checkpoint's faces on another cfg's shapes is the 27B/tiny bug).
+    (tmp_path / "config.json").write_text(json.dumps({
+        "num_hidden_layers": 2, "hidden_size": 64, "num_attention_heads": 4,
+        "num_key_value_heads": 2, "head_dim": 16}))
+    save_file({"model.embed_tokens.weight": torch.zeros((320, 64), dtype=torch.bfloat16)},
               str(tmp_path / "model.safetensors"))
 
     with pytest.raises(SystemExit, match="--dry-run"):
@@ -235,6 +240,25 @@ def test_serve_dry_run_checkpoint_is_header_only_and_needs_dry_run(tmp_path, cap
     free_after_fixed = 1000000 - weight_row_faces(faces).n - _state_bytes(cfg, 4 + pad, f32)
     want_blocks = fit_num_blocks(cfg, free_after_fixed, torch.bfloat16)
     assert by["kv_pool"]["note"] == f"{want_blocks} blocks"
+
+
+def test_dry_run_refuses_checkpoint_that_does_not_match_model(tmp_path, monkeypatch, capsys):
+    """--checkpoint <27B> left on the default --model tiny priced 27B faces on tiny cfg
+    shapes (the roofline timing bug). The checkpoint's own config.json is ground truth:
+    a structural mismatch must refuse, not silently mix models."""
+    import json
+
+    import pytest
+
+    from tilerl import cli
+
+    (tmp_path / "config.json").write_text(json.dumps({
+        "num_hidden_layers": 48, "hidden_size": 5120, "num_attention_heads": 40,
+        "num_key_value_heads": 4, "head_dim": 256}))
+    (tmp_path / "model.safetensors").write_bytes(b"x")
+    with pytest.raises(SystemExit, match="not a tiny checkpoint"):
+        cli.cmd_serve(cli._build_parser().parse_args(
+            ["serve", "--model", "tiny", "--dry-run", "--checkpoint", str(tmp_path)]))
 
 
 def test_27b_checkpoint_weights_row_matches_load_hf_resident_exact():
