@@ -1,0 +1,78 @@
+===CALIBRATE===
+appended hbm_bw_gbs            3312.71 GB/s     NVIDIA H20 card 0 -> /work/tilerl-s-wt-pod/docs/experience/bench/measurements.jsonl
+appended bf16_peak_tflops       136.45 TFLOP/s  NVIDIA H20 card 0 -> /work/tilerl-s-wt-pod/docs/experience/bench/measurements.jsonl
+appended fp8_peak_tflops        276.58 TFLOP/s  NVIDIA H20 card 0 -> /work/tilerl-s-wt-pod/docs/experience/bench/measurements.jsonl
+===DECODE===
+kernel                     count                  shape    face        bytes      flops          ms       bound      %bound
+# qwen38-27b decode tick B=1 s=4096, fp8 KV, checkpoint /work/Qwen3.8-27B-NVFP4, floor device=NVIDIA H20
+in_proj_qkv                   48             10240x5120     fp8 2,520,637,440 5,033,164,800     0.093ms     0.016ms       17.0%
+in_proj_z                     48              6144x5120     fp8 1,512,579,072 3,019,898,880     0.089ms     0.010ms       10.6%
+in_proj_b                     48                48x5120   nvfp4    7,878,144 23,592,960     0.111ms     0.000ms        0.0%
+in_proj_a                     48                48x5120   nvfp4    7,878,144 23,592,960     0.107ms     0.000ms        0.0%
+out_proj                      48              5120x6144     fp8 1,512,382,464 3,019,898,880     0.106ms     0.010ms        9.0%
+gate_proj                     56             17408x5120   nvfp4 3,749,838,848 9,982,443,520     0.110ms     0.020ms       18.3%
+up_proj                       56             17408x5120   nvfp4 3,749,838,848 9,982,443,520     0.135ms     0.020ms       15.0%
+down_proj                     56             5120x17408   nvfp4 3,747,086,336 9,982,443,520     0.095ms     0.020ms       21.4%
+q_proj                        16             12288x5120     fp8 1,008,222,208 2,013,265,920     0.119ms     0.019ms       16.0%
+k_proj                        16              1024x5120     fp8   84,168,704 167,772,160     0.114ms     0.002ms        1.4%
+v_proj                        16              1024x5120     fp8   84,168,704 167,772,160     0.099ms     0.002ms        1.6%
+o_proj                        16              5120x6144     fp8  504,127,488 1,006,632,960     0.100ms     0.010ms        9.5%
+gate_proj                      8             17408x5120     fp8  714,123,264 1,426,063,360     0.093ms     0.027ms       29.0%
+up_proj                        8             17408x5120     fp8  714,123,264 1,426,063,360     0.105ms     0.027ms       25.7%
+down_proj                      8             5120x17408     fp8  713,730,048 1,426,063,360     0.116ms     0.027ms       23.2%
+lm_head                        1            248320x5120     fp8 1,273,208,960 2,542,796,800     0.499ms     0.384ms       77.0%
+paged_attention_decode        16      b1 kv4 s4096 d256    bf16  136,708,096 1,610,612,736     pending     0.003ms     pending
+gdn_decode_fused              48         b1 nvh48 dk128    bf16  306,726,912 19,327,352,832     pending     0.003ms     pending
+rmsnorm                      129               b1 h5120    bf16    5,283,840  2,641,920     pending     0.000ms     pending
+silu_mul                      64          b1 inter17408    bf16    6,684,672  1,114,112     pending     0.000ms     pending
+TIMED TOTAL                  497                                                            53.2ms      6.6ms       12.4%
+TICK TOTAL                                                      22,359,395,456 72,185,630,720
+# qwen38-27b decode tick B=8 s=4096, fp8 KV, checkpoint /work/Qwen3.8-27B-NVFP4, floor device=NVIDIA H20
+in_proj_qkv                   48             10240x5120     fp8 2,530,959,360 40,265,318,400     0.133ms     0.016ms       11.9%
+in_proj_z                     48              6144x5120     fp8 1,520,148,480 24,159,191,040     0.116ms     0.010ms        8.2%
+in_proj_b                     48                48x5120   nvfp4   11,351,040 188,743,680     0.135ms     0.000ms        0.1%
+in_proj_a                     48                48x5120   nvfp4   11,351,040 188,743,680     0.135ms     0.000ms        0.1%
+out_proj                      48              5120x6144     fp8 1,519,951,872 24,159,191,040     0.274ms     0.010ms        3.5%
+gate_proj                     56             17408x5120   nvfp4 3,767,500,800 79,859,548,160     0.167ms     0.020ms       12.2%
+up_proj                       56             17408x5120   nvfp4 3,767,500,800 79,859,548,160     0.332ms     0.020ms        6.1%
+down_proj                     56             5120x17408   nvfp4 3,764,748,288 79,859,548,160     0.184ms     0.020ms       11.0%
+q_proj                        16             12288x5120     fp8 1,012,121,600 16,106,127,360     0.149ms     0.019ms       12.8%
+k_proj                        16              1024x5120     fp8   85,544,960 1,342,177,280     0.135ms     0.002ms        1.2%
+v_proj                        16              1024x5120     fp8   85,544,960 1,342,177,280     0.126ms     0.002ms        1.3%
+o_proj                        16              5120x6144     fp8  506,650,624 8,053,063,680     0.141ms     0.010ms        6.8%
+gate_proj                      8             17408x5120     fp8  716,646,400 11,408,506,880     0.155ms     0.027ms       17.5%
+up_proj                        8             17408x5120     fp8  716,646,400 11,408,506,880     0.247ms     0.027ms       10.9%
+down_proj                      8             5120x17408     fp8  716,253,184 11,408,506,880     0.211ms     0.027ms       12.8%
+lm_head                        1            248320x5120     fp8 1,276,757,120 20,342,374,400     0.889ms     0.385ms       43.3%
+paged_attention_decode        16      b8 kv4 s4096 d256    bf16 1,093,664,768 12,884,901,888     pending     0.021ms     pending
+gdn_decode_fused              48         b8 nvh48 dk128    bf16 2,453,815,296 154,618,822,656     pending     0.024ms     pending
+rmsnorm                      129               b8 h5120    bf16   23,777,280 21,135,360     pending     0.000ms     pending
+silu_mul                      64          b8 inter17408    bf16   53,477,376  8,912,896     pending     0.000ms     pending
+TIMED TOTAL                  497                                                            91.0ms      6.6ms        7.3%
+TICK TOTAL                                                      25,634,411,648 577,485,045,760
+===PREFILL===
+kernel                     count                  shape    face        bytes      flops          ms       bound      %bound
+# qwen38-27b prefill S=4096, fp8 KV, checkpoint /work/Qwen3.8-27B-NVFP4, floor device=NVIDIA H20
+in_proj_qkv                   48       M4096 10240x5120     fp8 8,558,960,640 20,615,843,020,800     2.406ms     1.553ms       64.5%
+in_proj_z                     48        M4096 6144x5120     fp8 5,940,682,752 12,369,505,812,480     1.492ms     0.932ms       62.5%
+in_proj_b                     48          M4096 48x5120   nvfp4 2,039,522,304 96,636,764,160     0.210ms     0.013ms        6.1%
+in_proj_a                     48          M4096 48x5120   nvfp4 2,039,522,304 96,636,764,160     0.192ms     0.013ms        6.7%
+out_proj                      48        M4096 5120x6144     fp8 5,940,486,144 12,369,505,812,480     1.469ms     0.932ms       63.4%
+gate_proj                     56       M4096 17408x5120   nvfp4 14,082,080,768 40,888,088,657,920     3.739ms     2.640ms       70.6%
+up_proj                       56       M4096 17408x5120   nvfp4 14,082,080,768 40,888,088,657,920     3.708ms     2.640ms       71.2%
+down_proj                     56       M4096 5120x17408   nvfp4 14,079,328,256 40,888,088,657,920     3.448ms     2.640ms       76.6%
+q_proj                        16       M4096 12288x5120     fp8 3,289,366,528 8,246,337,208,320     2.780ms     1.863ms       67.0%
+k_proj                        16        M4096 1024x5120     fp8  889,278,464 687,194,767,360     0.370ms     0.155ms       41.9%
+v_proj                        16        M4096 1024x5120     fp8  889,278,464 687,194,767,360     0.367ms     0.155ms       42.3%
+o_proj                        16        M4096 5120x6144     fp8 1,980,162,048 4,123,168,604,160     1.437ms     0.932ms       64.8%
+gate_proj                      8       M4096 17408x5120     fp8 2,190,157,824 5,841,155,522,560     3.939ms     2.640ms       67.0%
+up_proj                        8       M4096 17408x5120     fp8 2,190,157,824 5,841,155,522,560     3.896ms     2.640ms       67.8%
+down_proj                      8       M4096 5120x17408     fp8 2,189,764,608 5,841,155,522,560     3.741ms     2.640ms       70.6%
+lm_head                        1         M1 248320x5120     fp8 1,273,208,960 2,542,796,800     0.494ms     0.384ms       77.7%
+paged_attention_prefill       16 b1 s4096 kv4 d256 causal    bf16 1,883,242,496 3,299,340,189,696     pending     1.511ms     pending
+gdn_chunk_forward             48 b1 s4096 nvh48 chunk64    bf16 40,995,127,296 1,700,807,049,216     pending     0.260ms     pending
+rmsnorm                      129            M4096 h5120    bf16 10,823,946,240 10,821,304,320     pending     0.025ms     pending
+silu_mul                      64       M4096 inter17408    bf16 27,380,416,512 4,563,402,752     pending     0.129ms     pending
+TIMED TOTAL                  497                                                          1059.5ms    722.1ms       68.2%
+PREFILL TOTAL                                                   162,736,771,200 204,497,830,805,504
+DONE_roof6

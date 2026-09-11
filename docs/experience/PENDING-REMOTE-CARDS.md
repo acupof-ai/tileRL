@@ -70,10 +70,18 @@ CUDA_VISIBLE_DEVICES=0 TILERL_TARGET=cuda uv run tilerl serve \
   (`--checkpoint DIR`) renders the table but writes nothing — residency needs a
   built engine.
 
-## 3 — Kernel roofline with measured ms / bound / %bound
+## 3 — Kernel roofline with measured ms / bound / %bound  ✅ shuffled on H20 card 2 (2026-09-11)
 
-Pending-remote until step 1 rows exist for that exact device name. Timing
-resolves each row's kernel **by its weight face** (nvfp4 → linear_fp4,
+Shipped — every timed row in (0,100] on sm90 card 2, decode B=1/B=8 and
+prefill S=4096, against measured bw/bf16/**fp8** floors. See
+[wins/2026-09-11-h20-kernel-roofline-step3.md](../wins/2026-09-11-h20-kernel-roofline-step3.md).
+Two rules that run established: the ceiling is the kernel's MMA-dtype peak
+(w4a8 prefill rides the fp8 peak, decode the bf16 one), and the timer times the
+priced launch M (decode M=b, not b·s). Still pending: timing fixtures for the
+fused attention/GDN/norm rows (ms `pending`; bounds already print) and a B=8
+prefill column.
+
+Timing resolves each row's kernel **by its weight face** (nvfp4 → linear_fp4,
 fp8 → linear_fp8; fused attention/GDN/norms have no timing fixture).
 
 ```bash
