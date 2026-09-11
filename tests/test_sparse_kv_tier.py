@@ -19,6 +19,7 @@ import torch
 from tilerl.kv_cache import BLOCK_TOKENS, HostKvPages, PagedKvPool
 from tilerl.testing import RefBackend
 
+
 #: cpu by default (the hermetic gate); TILERL_TARGET=cuda puts the pools on the
 #: card so demote/promote exercise the real pinned D2H/H2D copies. RefBackend's
 #: torch paged_attention runs on whatever device the pools are on.
