@@ -379,11 +379,13 @@ def test_indexer_recall_wires_to_the_trained_weights_on_tiny():
     w = {"iq": 0.1 * torch.randn(hkv, hid, di, generator=gen),
          "ik": 0.1 * torch.randn(hkv, dk, di, generator=gen)}
     ids = torch.randint(0, m.cfg.vocab_size, (1, 256), generator=gen)
-    before = train.indexer_recall(m, ids, be, w, k_pages_pick=2)
+    before = train.indexer_recall(m, ids, be, w, k_pages_pick=2)["index"]
     opt = train.AdamW(lr=0.02)
     for _ in range(20):
         train.indexer_warmup_step(m, ids, be, w, opt)
-    after = train.indexer_recall(m, ids, be, w, k_pages_pick=2)
+    rec = train.indexer_recall(m, ids, be, w, k_pages_pick=2)
+    after = rec["index"]
+    assert set(rec) == {"index", "bounds"} and 0.0 <= rec["bounds"] <= 1.0
     assert after > before, f"recall did not improve with training: {before:.3f} -> {after:.3f}"
     assert 0.0 <= before <= 1.0 and 0.0 <= after <= 1.0
 
@@ -403,14 +405,17 @@ def test_warmup_capture_handles_a_non_block_divisible_sequence():
     w = {"iq": 0.1 * torch.randn(hkv, hid, di, generator=gen),
          "ik": 0.1 * torch.randn(hkv, dk, di, generator=gen)}
     ids = torch.randint(0, m.cfg.vocab_size, (1, 249), generator=gen)  # 249 = 15*16+9
-    H, k_pages, target, n_pages = train.indexer_capture(m, ids, be, 16, WINDOW_PAGES)
+    H, k_pages, target, n_pages, q_eval, bounds = train.indexer_capture(
+        m, ids, be, 16, WINDOW_PAGES)
     assert int(n_pages[0]) == 16              # ceil(249/16)
     assert H.shape[2] == 249                  # queries unpadded
     assert target.shape[2] == 249
     assert k_pages.shape == (1, 1, 16, hkv, dk)
+    assert bounds.shape == (1, 1, 16, hkv, 2, dk) and q_eval.shape[2] == 249
     assert torch.isfinite(target).all() and torch.isfinite(k_pages).all()
+    assert torch.isfinite(bounds).all()
     # recall and one training step run on the ragged tensors without an axis error
-    assert 0.0 <= train.indexer_recall(m, ids, be, w, 2) <= 1.0
+    assert 0.0 <= train.indexer_recall(m, ids, be, w, 2)["index"] <= 1.0
     loss = train.indexer_warmup_step(m, ids, be, w, train.AdamW(lr=0.02))
     assert loss == loss  # not NaN
 
@@ -438,8 +443,33 @@ def test_indexer_held_recall_from_a_prepared_dir(tmp_path):
     rec = train.indexer_held_recall(m, be, d, w, k_pages_pick=2)
     assert set(rec) == {"256"}
     r = rec["256"]
-    assert set(r) == {"mean", "min", "per_span"} and len(r["per_span"]) == 2
-    assert 0.0 <= r["mean"] <= 1.0 and r["mean"] == r["mean"]  # finite
+    assert set(r) == {"index", "bounds"}
+    for sc in ("index", "bounds"):
+        st = r[sc]
+        assert set(st) == {"mean", "min", "per_span"} and len(st["per_span"]) == 2
+        assert 0.0 <= st["mean"] <= 1.0 and st["mean"] == st["mean"]  # finite
+
+
+def test_bounds_scorer_recall_is_one_at_full_k_and_self_consistent():
+    """The training-free Quest scorer uses the SAME selector/teacher as the
+    learned scorer, so with k covering every indexable page its recall must be 1
+    (every earlier page selected), matching the engine's full-k==dense
+    equivalence; and bounds recall must lie in [0,1] at a partial k."""
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl import config, model, train
+    from tilerl.sparse_index import WINDOW_PAGES
+
+    be = get_backend()
+    m = model.build_random(config.tiny(), seed=0)
+    gen = torch.Generator().manual_seed(0)
+    w = train.init_indexer_weights(m.cfg, gen, be.device, 16)
+    ids = torch.randint(0, m.cfg.vocab_size, (1, 256), generator=gen)
+    n_indexable = 256 // 16 - WINDOW_PAGES      # 16 - 8 = 8
+    full = train.indexer_recall(m, ids, be, w, k_pages_pick=n_indexable)
+    assert abs(full["bounds"] - 1.0) < 1e-6, full
+    part = train.indexer_recall(m, ids, be, w, k_pages_pick=2)
+    assert 0.0 <= part["bounds"] <= 1.0
 
 
 def test_indexer_projections_take_bf16_activations_with_f32_weights():
