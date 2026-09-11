@@ -4,6 +4,7 @@ Covers: roundtrip, prefix hit/miss incl. hash-collision, refcount/CoW,
 state pool, pool exhaustion, and the shared-prefix fork lifecycle.
 """
 
+import os
 import sys
 import sysconfig
 import threading
@@ -882,6 +883,13 @@ def test_batchkv_inputs_for_fp8_scales():
     )
 
 
+@pytest.mark.skipif(
+    os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="wall-duration ratio of a GIL yield is machine load, not code: measured "
+    "29x/2.92x/1.47x across runners and went red at 1.47 on a healthy macos-14 CI "
+    "(errors/2026-09-11-flaky-wallclock-test-inventory.md). Run locally/dedicated; "
+    "the SSD reader uses the Event-controlled hold_fetches_for_test seam in CI.",
+)
 def test_a_yielded_gil_runs_a_background_load_promptly(tmp_path):
     """The SSD prefetch fix's premise: yielding the GIL hands the reader thread a
     prompt time slice, so a background torch.load runs at near-uncontended speed.
