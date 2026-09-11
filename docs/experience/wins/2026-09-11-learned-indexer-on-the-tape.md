@@ -97,9 +97,18 @@ silently substituted.)
 - A few hundred warm-up steps over the prepared train spans.
 - Teacher: dense attention mass pooled per 16-token page at each source layer,
   streamed in O(T·block) (`dense_causal_page_mass`), never a [T,T] matrix.
+  **Amendment 2026-09-11 (a3):** the full-position teacher is ~T² over 8k–32k
+  spans and did not finish the held-before pass in an hour. The teacher now
+  evaluates **256 seeded query positions per span** (`--q-samples 256
+  --q-min-pos 2048`), uniform over positions ≥ 2048 so the selector has
+  missable pages, positions fixed per span by `seed + 100003*group + index` so
+  before/after and warm-up reuse the same rows. The sampled teacher equals the
+  full teacher's rows at those positions (CPU gate, atol 1e-6); cost is
+  O(256·T) per span. Threshold unchanged.
 - Metric: `topk_page_recall` (this PR, tested f32) at `k_pages=128`, measured
   BEFORE warm-up and AFTER, on held-out prompts, per span length; plus the KL
-  curve and total tokens seen.
+  curve and total tokens seen. Reported per length: the mean over spans AND the
+  per-span min (manifest `recall_detail`); the verdict gate stays the mean.
 - **Accept: mean recall@128 after warm-up >= 0.9.** Below 0.9 is a science
   result, written down with the token count — no tolerance change, no rerun with
   a moved gate.
