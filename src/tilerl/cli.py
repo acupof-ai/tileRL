@@ -416,18 +416,20 @@ def _train_indexer_recall(args: argparse.Namespace, backend, model, log) -> dict
 
     cdir = Path(args.indexer_corpus)
 
-    def load(split: str):
+    def load(split: str, max_per_ctx: int = 0):
         groups = {}
         for path in sorted(cdir.glob(f"{split}_*.jsonl")):
             rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
             ctx = rows[0]["ctx"]
+            if max_per_ctx:
+                rows = rows[:max_per_ctx]
             groups[str(ctx)] = [
                 torch.tensor(r["ids"], dtype=torch.long, device=backend.device).unsqueeze(0)
                 for r in rows]
             log(f"{split} ctx={ctx}: {len(groups[str(ctx)])} prompts")
         return groups
 
-    held = load("held")
+    held = load("held", getattr(args, "held_per_ctx", 0))
     train_groups = load("train")
     # cycle training prompts across lengths in an interleaved order
     train_batches = [b for grp in zip_longest_flat(train_groups) for b in [grp] if b is not None]
@@ -499,27 +501,39 @@ def _train_indexer_warmup(args: argparse.Namespace) -> None:
             "tokens_seen": out["tokens_seen"], "k_pages": out["k_pages"], "di": out["di"],
             "kl_first": out["kl_curve"][0], "kl_last": out["kl_curve"][-1],
             "secs_total": out["secs_total"], "corpus": out.get("corpus"),
-            "q_samples": out.get("q_samples", 0), "q_min_pos": out.get("q_min_pos"),
-            **{f"recall_before_{k}": v["mean"] for k, v in out["recall_before"].items()},
-            **{f"recall_after_{k}": v["mean"] for k, v in out["recall_after"].items()},
-            **{f"recall_after_min_{k}": v["min"] for k, v in out["recall_after"].items()}}
+            "q_samples": out.get("q_samples", 0), "q_min_pos": out.get("q_min_pos")}
+
+        def flatten(tag, book):
+            # book: {ctx: {"index"|"bounds": {mean,min,per_span}}}
+            for ctx, scorers in book.items():
+                for sc, st in scorers.items():
+                    metrics[f"recall_{tag}_{sc}_{ctx}"] = st["mean"]
+                    if tag in ("before", "after"):
+                        metrics[f"recall_{tag}_{sc}_min_{ctx}"] = st["min"]
+
+        flatten("before", out["recall_before"])
+        flatten("after", out["recall_after"])
         if "control" in out:
             metrics["control_corpus"] = out.get("control_corpus")
-            metrics.update({f"control_recall_{k}": v["mean"]
-                           for k, v in out["control"].items()})
+            for ctx, scorers in out["control"].items():
+                for sc, st in scorers.items():
+                    metrics[f"control_recall_{sc}_{ctx}"] = st["mean"]
         manifest["recall_detail"] = {
             "before": out["recall_before"], "after": out["recall_after"]}
         manifest["metrics"] = metrics
-        # Accept: mean after-recall across held-out lengths clears the threshold;
-        # per-length mean, per-span min and per-span values are all recorded (the
-        # pre-registered mixture scope).
-        afters = [v["mean"] for v in out["recall_after"].values()]
+        # Accept: mean LEARNED-indexer after-recall over held lengths clears the
+        # threshold; the training-free bounds recall is a reported baseline, not a
+        # gate. Per-length mean, per-span min and per-span values are recorded.
+        afters = [v["index"]["mean"] for v in out["recall_after"].values()]
         mean_after = sum(afters) / len(afters)
-        worst_span = min(v["min"] for v in out["recall_after"].values())
+        worst_span = min(v["index"]["min"] for v in out["recall_after"].values())
+        bounds_after = [v["bounds"]["mean"] for v in out["recall_before"].values()]
+        bounds_mean = sum(bounds_after) / len(bounds_after)
         manifest["gates"] = [{
             "name": "indexer_recall_at_k", "value": mean_after, "threshold": acc,
             "kind": "verdict", "skipped": False, "passed": mean_after >= acc,
-            "per_span_min": worst_span}]
+            "per_span_min": worst_span,
+            "training_free_bounds_recall_mean": bounds_mean}]
         manifest["finished"] = now()
         write_manifest(runs_root(), manifest)
         print(json.dumps(manifest, indent=1) if args.json else format_run(manifest))
@@ -2401,6 +2415,8 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "positions per span (256 -> O(256*T) instead of O(T^2)); 0 = all")
     p_train.add_argument("--q-min-pos", type=int, default=2048,
                          help="27B recall: sampled query positions are >= this (leaves missable pages)")
+    p_train.add_argument("--held-per-ctx", type=int, default=0,
+                         help="27B recall: cap held spans per length (balanced subset); 0 = all")
     p_train.add_argument("--rl", action="store_true",
                          help="GRPO: the engine samples a group per prompt, a reward scores "
                               "them, the group mean is the baseline (no critic)")

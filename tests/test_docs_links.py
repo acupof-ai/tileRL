@@ -323,6 +323,7 @@ _EXPECTED_CLI_FLAGS: dict[str, frozenset[str]] = {
         '--eval-n',
         '--force',
         '--group',
+        '--held-per-ctx',
         '--help',
         '--indexer-control-corpus',
         '--indexer-corpus',
