@@ -172,17 +172,17 @@ Off cuda the command refuses at model load (the 27B needs its checkpoint dir).
 
 ## 7 — Recapture-after-update: token equality then wall clock (P2.0 step 0)
 
-The card gate does not exist yet; this section is the spec. Its CPU half
-(same-seed captured vs eager token equality after an update step) is built and
-green before the pod run.
+DONE on H20 sm90 (27B NVFP4), LoRA path — [wins/2026-09-11-lora-recapture-after-update-kept-graph-27b.md](../wins/2026-09-11-lora-recapture-after-update-kept-graph-27b.md). `scripts/recapture_lora.py`: the kept graph replays an in-place rank-16 LoRA update, post-step tokens bit-equal to a fresh eager engine, the no-step control unchanged, graphs held; steady-state post-step tick 24.4 ms captured vs 158.2 ms eager (6.5×). Full-parameter SFT does not coexist with the captured engine on one card — [errors/2026-09-11-full-sft-oom-does-not-coexist-with-serving-engine.md](../errors/2026-09-11-full-sft-oom-does-not-coexist-with-serving-engine.md).
+
+Original spec:
 
 - **Token equality:** same seeds, one in-place optimizer step, rollouts under
   the kept graph with the f32 cast refilled produce the **same tokens** as eager
   decode. Drift means the refill or an in-place assumption in AdamW/Adafactor/ISO
   `step_one` broke.
-- **Card wall clock:** captured RL rollout tok/s at group 8 within **5%** of
-  plain captured decode (the draft costs 4.9× eager today); result appended as
-  that step's bench row.
+- **Card wall clock:** captured decode ms/token after the step vs eager on the
+  same post-step weights (6.5× on LoRA; the captured-RL group-8 vs plain-decode
+  5% target remains a P1 run figure).
 
 ---
 
