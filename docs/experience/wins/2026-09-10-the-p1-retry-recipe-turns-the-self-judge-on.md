@@ -125,3 +125,22 @@ Launch: seed 0 on card 6 and seed 1 on card 7 **in parallel**, each
 `--max-new-tokens 768` (~2.7 h/seed), disjoint remote trees; pre-rollout
 baselines are re-measured in each process and reported per seed.
 
+
+## Verdict 2026-09-11: REJECTED — the two-seed run
+
+Both seeds finished 100 steps under cap 768 (guard silent). The pre-registered
+gate was GSM8K +25/500 on BOTH seeds; only one cleared.
+
+- seed 0 (`0622261a06f9`): GSM8K 458 → 448 (−10; McNemar b=34/c=24, z −1.31),
+  MMLU 0.751 → 0.817, tied 0.21, tokens 266.8 → 281.2.
+- seed 1 (`fcf91735cf1c`): GSM8K 456 → 482 (+26; b=6/c=32, z +4.22, clears
+  481 by one), MMLU 0.751 → 0.739, tied 0.41, tokens 298.0 → 242.2.
+
+MMLU held on both, tied fraction stayed under 0.5 on both, and neither seed
+collapsed in length — so the judge did its mechanism job (broke saturated
+groups open, no length regression). What failed is the downstream claim: the
+held-out GSM8K sign flips between matched seeds. Truncated/finished split at
+the 2048 eval cap: seed 1's gain is in finished answers (after: 2 truncated,
+1 correct; 498 finished at 0.966), seed 0's after arm has 0 truncations yet
+loses 10, so neither arm is a cap-composition artifact. Full table and
+analysis: [errors/2026-09-11-p1-judge-recipe-two-seed-rejected.md](../errors/2026-09-11-p1-judge-recipe-two-seed-rejected.md).
