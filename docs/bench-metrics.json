@@ -213,6 +213,15 @@
       ],
       "why": "measured bf16 tensor peak from one large GEMM; the roofline flop floor"
     },
+    "f16_peak_tflops": {
+      "unit": "TFLOP/s",
+      "direction": "+",
+      "weight": 0.0,
+      "shape": [
+        "card"
+      ],
+      "why": "measured fp16 tensor peak from one large GEMM; the roofline flop floor on pre-Ampere arches (sm70 V100) that have no bf16 MMA path"
+    },
     "device_resident_bytes": {
       "unit": "bytes",
       "direction": "none",
