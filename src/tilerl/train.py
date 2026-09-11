@@ -301,7 +301,10 @@ def dense_causal_page_mass(q: torch.Tensor, k: torch.Tensor, block: int = 16
     rep = hq // k.shape[2]
     k_exp = k.repeat_interleave(rep, dim=2)
     scale = d ** -0.5
-    n_pages = t // block
+    # ceil, not floor: a non-block-divisible T still has a trailing partial page
+    # (T=49, block=16 -> pages 0,1,2,3 with page 3 holding key 48); dropping it
+    # renormalises that key's mass onto the included pages.
+    n_pages = (t + block - 1) // block
     q_idx = torch.arange(t, device=q.device)
     neg_inf = torch.finfo(q.dtype).min
 
@@ -354,7 +357,7 @@ def indexer_capture(model: Any, ids: torch.Tensor, backend: Any, block: int,
     from .sparse_index import exclude_window_renorm, index_source_groups
 
     b, t = ids.shape
-    n_pages_tok = t // block
+    n_pages_tok = (t + block - 1) // block      # ceil: a tail key gets its own page
     if n_pages_tok <= n_win_pages:
         raise ValueError(f"warm-up needs > {n_win_pages} pages, got {n_pages_tok} from T={t}")
     full_layers = list(model.cfg.full_attn_layers)
@@ -374,12 +377,26 @@ def indexer_capture(model: Any, ids: torch.Tensor, backend: Any, block: int,
         model.index_capture_layers = frozenset()
 
     hkv, d_kv = model.cfg.num_kv_heads, model.cfg.head_dim
+    # The true number of valid pages per row (a trailing partial page is valid).
     n_pages = torch.full((b,), n_pages_tok, dtype=torch.long)
+    pad_tok = n_pages_tok * block - t
     captured.sort(key=lambda c: c[0])
-    H = torch.stack([c[1][:, :n_pages_tok * block] for c in captured], dim=1)
+    # Indexer-Q and the teacher are over the real T query positions (no pad); only
+    # KEYS are padded to a whole page so the page reshape is legal.
+    H = torch.stack([c[1] for c in captured], dim=1)
     K = torch.stack([c[3] for c in captured], dim=1)
+    if pad_tok:
+        K = torch.nn.functional.pad(K, (0, 0, 0, 0, 0, pad_tok))
     mass = torch.stack([dense_causal_page_mass(c[2], c[3], block) for c in captured], dim=1)
-    k_pages = K.reshape(b, len(captured), n_pages_tok, block, hkv, d_kv).mean(dim=3)
+    k_blocks = K.reshape(b, len(captured), n_pages_tok, block, hkv, d_kv)
+    if pad_tok:
+        # trailing page has fewer real keys: divide each page's sum by its real
+        # key count so the partial page is not underweighted by zero padding.
+        counts = torch.full((n_pages_tok,), float(block), device=K.device)
+        counts[-1] = block - pad_tok
+        k_pages = k_blocks.sum(3) / counts[None, None, :, None, None]
+    else:
+        k_pages = k_blocks.mean(dim=3)
     target = exclude_window_renorm(mass, n_pages, n_win_pages)
     return H, k_pages, target, n_pages
 
