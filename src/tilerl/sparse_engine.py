@@ -32,6 +32,8 @@ from .sparse_index import index_source_groups
 
 #: block-table ids are logical+1 so selected logical page 0 is not the 0 pad.
 _SENTINEL = 1
+#: candidate pages scored per chunk so the f32 scoring intermediates stay bounded
+_SCORE_PAGE_CHUNK = 64
 
 
 def group_map(cfg) -> tuple[list[int], dict[int, int]]:
@@ -60,16 +62,25 @@ def quest_scores(q: Tensor, bounds: Tensor) -> Tensor:
     ``q`` [Tq,hq,D] one row's post-rope queries, ``bounds`` [Cp,Hkv,2,D] for
     that plane. Returns [Cp]: ``sum_h max_t sum_d max(q*kmin, q*kmax)`` — a page
     hot for ANY query in the chunk is selectable (the same query max-pool
-    ``page_scores_for_selector`` uses). f32 on the CPU oracle."""
+    ``page_scores_for_selector`` uses). f32 on the CPU oracle.
+
+    Candidate pages are scored in chunks: the unchunked f32 intermediates are
+    Tq*Cp*Hkv*D each for kmin and kmax — 4.2 GiB at Tq=512, Cp=2048 on a V100
+    whose whole headroom is ~4 GiB, and it grows with context. max-over-query
+    and sum-over-head/dim commute with a split over pages, so chunking is exact;
+    64 pages keeps the two operands under ~270 MiB regardless of context."""
     t, hq, d = q.shape
     hkv = bounds.shape[1]
     qi = q.float().reshape(t, hkv, hq // hkv, d).mean(2)        # [Tq,Hkv,D]
     kmin, kmax = bounds.unbind(dim=2)                            # each [Cp,Hkv,D]
-    per = torch.maximum(
-        qi[:, None, :, :] * kmin[None, :, :, :],
-        qi[:, None, :, :] * kmax[None, :, :, :],
-    ).sum(dim=-1)                                                # [Tq,Cp,Hkv]
-    return per.amax(dim=0).sum(dim=-1)                           # [Cp], heads merged
+    cp = bounds.shape[0]
+    out = qi.new_empty(cp)
+    for c0 in range(0, cp, _SCORE_PAGE_CHUNK):
+        sl = slice(c0, c0 + _SCORE_PAGE_CHUNK)
+        qb = qi[:, None, :, :]                                   # [Tq,1,Hkv,D]
+        per = torch.maximum(qb * kmin[None, sl], qb * kmax[None, sl]).sum(dim=-1)
+        out[sl] = per.amax(dim=0).sum(dim=-1)                    # [b], heads merged
+    return out
 
 
 class SparseTracker:
