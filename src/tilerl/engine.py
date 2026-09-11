@@ -1140,12 +1140,17 @@ class Engine:
                 pages_total += complete
                 hot_n += len(r.blocks) * block_n
             bounds_n = page_bounds_bytes(cfg, pages_total)
-            cold_n = getattr(kv, "cold", None).bytes_held if getattr(kv, "cold", None) else 0
+            cold_n = ssd_n = 0
+            if getattr(kv, "cold", None) is not None:
+                cold_n = kv.cold.bytes_held
+                ssd_n = kv.cold.ssd_bytes
             derived.append(Row("device", "page_bounds", bounds_n,
                                f"{pages_total} complete pages, bounds scorer"))
             derived.append(Row("device", "kv_hot", hot_n, "resident private blocks this tick"))
             if cold_n:
-                derived.append(Row("host", "kv_cold", cold_n, "demoted pages on the host"))
+                derived.append(Row("host", "kv_cold", cold_n, "demoted pages in pinned host RAM"))
+            if ssd_n:
+                derived.append(Row("ssd", "kv_cold_ssd", ssd_n, "demoted pages spilled past the host budget"))
         rows = memory_table(derived, self._held_storage(), self._measured_peak_bytes())
         # Dense engine with a cold tier driven by the manual sparse_retier seam (#500):
         # its host pages are not in plan(), so append the held allocation explicitly.
@@ -1153,17 +1158,27 @@ class Engine:
         # cold format (per_cold_kv_block_bytes x pages), so delta catches a D2H copy of a
         # different width than the plan priced (the sm70 f16 narrowing).
         cold = getattr(kv, "cold", None)
-        if self._sparse is None and cold is not None and cold.bytes_held:
-            pages = cold.stats()["kv_cold_pages"]
+        if self._sparse is None and cold is not None and (
+                cold.bytes_held or cold.ssd_bytes):
             from .memory import per_cold_kv_block_bytes
 
-            expected = pages * per_cold_kv_block_bytes(
+            per = per_cold_kv_block_bytes(
                 self._model.cfg, kv.dtype, kv.kv_fp8, kv.cold_dtype)
-            rows.append({"tier": "host", "owner": "kv_cold", "kind": "allocation",
-                         "derived": expected,
-                         "note": f"{pages} demoted pages",
-                         "measured": cold.bytes_held,
-                         "delta": expected - cold.bytes_held})
+            st = cold.stats()
+            if cold.bytes_held:
+                pages = st["kv_cold_pages"]
+                rows.append({"tier": "host", "owner": "kv_cold", "kind": "allocation",
+                             "derived": pages * per,
+                             "note": f"{pages} demoted pages in host RAM",
+                             "measured": cold.bytes_held,
+                             "delta": pages * per - cold.bytes_held})
+            if cold.ssd_bytes:
+                pages = st["kv_cold_ssd_pages"]
+                rows.append({"tier": "ssd", "owner": "kv_cold_ssd", "kind": "allocation",
+                             "derived": pages * per,
+                             "note": f"{pages} demoted pages spilled to SSD",
+                             "measured": cold.ssd_bytes,
+                             "delta": pages * per - cold.ssd_bytes})
         # The cold-start boot store on disk: its derived == measured bytes (one
         # kv_cold(ssd) allocation per saved entry), so the plan and the filesystem agree.
         if self._boot is not None:
@@ -2135,6 +2150,9 @@ def build_engine(
     #: of one block id, fp8 scales included) through a HostKvPages tier and the
     #: freed device block goes back to the SAME pool — there is no second pool.
     kv_cold_bytes: int = 0,
+    #: cold pages past the pinned host budget spill to this one mmap'd file (serving
+    #: spill, block-id keyed; distinct from ssd_path which is the prefix-boot store).
+    cold_ssd_path: str = "",
     #: dtype for a demoted page's K/V in the host/SSD tier: "native" keeps the pool
     #: dtype, "f16" narrows an f32 pool (sm70, which has no f16 attention path) to
     #: f16 on the D2H copy and widens back on promote. "" picks f16 on an f32 pool
@@ -2325,7 +2343,8 @@ def build_engine(
     if dram_bytes:
         kw["dram"] = DramSnapshots(budget_bytes=dram_bytes)
     if kv_cold_bytes:
-        kv_pool.attach_cold(HostKvPages(budget_bytes=kv_cold_bytes))
+        kv_pool.attach_cold(
+            HostKvPages(budget_bytes=kv_cold_bytes, ssd_path=cold_ssd_path))
     if ssd_path:
         # Not gated on cuda: the tier is target-independent, and the CPU target is where
         # its parity is checked.

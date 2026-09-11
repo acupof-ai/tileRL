@@ -3,6 +3,10 @@
 One line per event — phase exit, default flip, accept-or-reject verdict — with
 its `docs/experience/` entry. Newest first.
 
+## 2026-09-12
+
+- **phase exit (tiny CPU)** — **cold-KV SSD spill:** HostKvPages gains a host-RAM budget and spills evicted pages to one mmap'd file (`--cold-ssd-path`), fixed-stride block-id slots with no on-disk index and in-memory presence; promote reads the same demote/promote path byte-equal. The ledger splits kv_cold into host (`kv_cold`) and file (`kv_cold_ssd`) rows. Distinct from --ssd-path (prefix boot). — [wins/2026-09-12-cold-tier-ssd-spill.md](docs/experience/wins/2026-09-12-cold-tier-ssd-spill.md)
+
 ## 2026-09-11
 
 - **rejected (two-seed verdict)** — **the P1 self-judge retry recipe (`grpo-gsm8k-27b --judge`, cap 768) fails its two-seed acceptance: held-out GSM8K moves opposite ways across matched seeds.** Seed 0 458 → 448 (−10; McNemar 34 right→wrong / 24 wrong→right, z −1.31), seed 1 456 → 482 (+26; 6 right→wrong / 32 wrong→right, z +4.22, clears the +25 gate by one); both were required. MMLU held on both (0.817 / 0.739 vs the 0.731 floor), tied fraction 0.21 / 0.41 stayed < 0.5, and no seed collapsed in rollout length (267→281, 298→242; the 768 cap kept the guard silent all 100 steps). The judge fixed exactly the failure it was built for — saturated groups opened, no length regression — yet the held-out gain's sign is seed-dependent, so the recipe is rejected rather than shipped on the winning seed. The truncated/finished split at the 2048 eval cap shows seed 1's gain sits in finished answers and seed 0's loss occurs with zero truncations, ruling out a cap-composition artifact. — [errors/2026-09-11-p1-judge-recipe-two-seed-rejected.md](docs/experience/errors/2026-09-11-p1-judge-recipe-two-seed-rejected.md)

@@ -150,6 +150,7 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
                   blocks=0, max_ctx=0, max_batch=8, ssd_path="", ssd_min_tokens=0,
                   dram_bytes=0, state_bytes=0, kv_fp8="", decode=None,
                   max_batched_tokens=0, kv_cold_bytes=0, cold_format="",
+                  cold_ssd_path="",
                   sparse_k=0, scorer="bounds", kv_store=""):
     """Serving-size engine on one card. Multi-card serving is one process per card
     under CUDA_VISIBLE_DEVICES (see generate.py for the process-per-device pattern);
@@ -193,6 +194,8 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
         kw["cold_format"] = cold_format
     if kv_store:
         kw["kv_store"] = kv_store
+    if cold_ssd_path:
+        kw["cold_ssd_path"] = cold_ssd_path
     # Text stop sequences are matched on decoded ids, so the engine needs the
     # tokenizer's decode; without it `submit` refuses a request that carries one.
     if decode is not None:
@@ -338,6 +341,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                            state_bytes=args.state_bytes, kv_fp8=args.kv_fp8,
                            cold_format=getattr(args, "cold_format", ""),
                            kv_store=getattr(args, "kv_store", ""),
+                           cold_ssd_path=getattr(args, "cold_ssd_path", ""),
                            decode=tokenizer.decode,
                            max_batched_tokens=args.max_batched_tokens,
                            sparse_k=getattr(args, "sparse_k", 0),
@@ -2477,6 +2481,11 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "room and has no f16 attention path), native elsewhere. f16 "
                               "narrows K/V on the D2H copy and widens back on promote; "
                               "native keeps the pool dtype. fp8 scale planes stay f32.")
+    p_serve.add_argument("--cold-ssd-path", default="", metavar="FILE",
+                         help="cold KV pages past the --kv-cold-bytes host budget spill to "
+                              "this one mmap'd file (block-id keyed, no index); promote "
+                              "reads them back through the same path. Serving spill for one "
+                              "process; --ssd-path is the separate prefix-boot store.")
 
 
     p_serve.add_argument("--sparse-k", type=int, default=0, metavar="PAGES",

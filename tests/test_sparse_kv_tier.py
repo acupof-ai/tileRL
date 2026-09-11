@@ -349,6 +349,96 @@ def test_narrow_f16_path_prices_half_and_decodes_like_dense():
     dense.shutdown(); cold.shutdown()
 
 
+def test_pages_past_the_host_budget_spill_to_ssd_and_promote_byte_equal(tmp_path):
+    """Cold-tier SSD spill: a host budget that holds only two pages pushes the
+    third demotion to one mmap'd file (opaque key -> file slot, no on-disk
+    index). Every spilled page promotes back through the SAME demote/promote
+    seam byte-equal across all planes, and the tier reports host and SSD bytes
+    separately."""
+    p, hkv, d, layers = 5, 2, 8, 2
+    pool = PagedKvPool(p + 1, hkv, d, num_layers=layers, device=_device())
+    per = sum(pool.k_pool[0, 0].numel() * pool.k_pool.element_size()
+              for _ in (0,)) * layers  # K planes only; the tier also holds V below
+    per = (pool.k_pool[0, 0].numel() * pool.k_pool.element_size()
+           + pool.v_pool[0, 0].numel() * pool.v_pool.element_size()) * layers
+    ssd = str(tmp_path / "cold_spill.bin")
+    pool.attach_cold(HostKvPages(budget_bytes=per * 2, ssd_path=ssd))
+    blocks = [pool.alloc_block() for _ in range(4)]  # hold all so frames are distinct
+    pages = {}
+    for b in blocks:
+        kk, vv = _kv(b, p, hkv, d)
+        for plane in range(layers):
+            pool.write_block(b, 0, kk[0], vv[0], layer=plane)
+        pages[b] = (pool.k_pool[:, b].clone(), pool.v_pool[:, b].clone())
+        pool.demote_page(b)
+    st = pool.cold.stats()
+    assert st["kv_cold_pages"] == 2 and st["kv_cold_ssd_pages"] == 2, st
+    assert pool.cold.bytes_held == per * 2 and pool.cold.ssd_bytes == per * 2, st
+    # the file holds one stride-sized slot per spilled key, plus the header
+    assert os.path.getsize(ssd) == pool.cold._ssd.HEADER + per * len(pool.cold._ssd), \
+        os.path.getsize(ssd)
+    for b in blocks:
+        nb = pool.promote_page(b)
+        assert torch.equal(pool.k_pool[:, nb], pages[b][0]), f"K page {b}"
+        assert torch.equal(pool.v_pool[:, nb], pages[b][1]), f"V page {b}"
+    assert pool.cold.bytes_held == 0 and pool.cold.ssd_bytes == 0
+
+
+def test_a_recycled_frame_spills_two_pages_to_ssd_under_distinct_keys(tmp_path):
+    """The phys-id collision on the spill file: a pool of two frames reissues
+    the freed id while the first page's blob is still cold, so a slot keyed by
+    the physical id aliases the two pages (#528 fixes the same class one tier
+    up). Both pages demote under their own opaque (req, page) keys, land in
+    DISTINCT file slots, and promote back byte-equal. budget=0 forces the SSD
+    path directly so this cannot pass via host RAM."""
+    hkv, d, layers = 2, 8, 2
+    pool = PagedKvPool(2, hkv, d, num_layers=layers, device=_device())
+    per = (pool.k_pool[0, 0].numel() * pool.k_pool.element_size()
+           + pool.v_pool[0, 0].numel() * pool.v_pool.element_size()) * layers
+    ssd = str(tmp_path / "recycle.bin")
+    pool.attach_cold(HostKvPages(budget_bytes=0, ssd_path=ssd))
+
+    saved = {}
+
+    def write_page(key, seed):
+        b = pool.alloc_block()
+        kk, vv = _kv(seed, 1, hkv, d)
+        for plane in range(layers):
+            pool.write_block(b, 0, kk[0], vv[0], layer=plane)
+        saved[key] = (pool.k_pool[:, b].clone(), pool.v_pool[:, b].clone())
+        pool.demote_page(b, key=key)
+        return b
+
+    b0 = write_page((0, 0), 11)
+    b1 = write_page((0, 1), 22)
+    assert b1 == b0, "the freed physical frame must be recycled for the collision to bite"
+    st = pool.cold.stats()
+    assert st["kv_cold_ssd_pages"] == 2, st
+    assert os.path.getsize(ssd) == pool.cold._ssd.HEADER + per * 2
+
+    for key in ((0, 0), (0, 1)):
+        nb = pool.promote_keyed(key)
+        assert torch.equal(pool.k_pool[:, nb], saved[key][0]), f"K {key}"
+        assert torch.equal(pool.v_pool[:, nb], saved[key][1]), f"V {key}"
+
+
+def test_a_spill_file_is_one_process_not_boot(tmp_path):
+    """The serving spill keys presence in memory: a reopened tier over the same
+    file does NOT resurrect pages (that is KvBootStore's prefix-keyed job)."""
+    p, hkv, d = 1, 2, 8
+    pool = PagedKvPool(p + 1, hkv, d, num_layers=1, device=_device())
+    per = 2 * pool.k_pool[0, 0].numel() * pool.k_pool.element_size()
+    ssd = str(tmp_path / "c.bin")
+    pool.attach_cold(HostKvPages(budget_bytes=0, ssd_path=ssd))
+    kk, vv = _kv(0, p, hkv, d)
+    b = pool.alloc_block()
+    pool.write_block(b, 0, kk[0], vv[0], layer=0)
+    pool.demote_page(b)
+    assert pool.cold.ssd_bytes == per
+    reopened = HostKvPages(budget_bytes=0, ssd_path=ssd)
+    assert reopened.take(b) is None
+
+
 if __name__ == "__main__":
     import sys
 
