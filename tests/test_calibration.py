@@ -91,6 +91,7 @@ def test_latest_floor_keys_on_the_physical_uuid_when_uuid_rows_exist(tmp_path):
                    "peak_metric": cal.PEAK_METRIC,
                    "fp8_peak_tflops": None, "pcie_gbs": None}
 
+
 def test_newest_row_wins_and_superseded_skipped(tmp_path):
     old = _row(cal.BW_METRIC, 3900.0, "GB/s", H20)
     old["id"] = "old"
