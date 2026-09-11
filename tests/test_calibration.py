@@ -116,16 +116,32 @@ def test_calibration_returns_fp8_peak_when_present(tmp_path):
 
 
 def test_row_peak_keys_by_face(tmp_path):
-    """fp8 faces bound against the fp8 ceiling; nvfp4 against bf16; missing fp8 -> None."""
+    """The ceiling is the MMA dtype's peak at the launch M: fp8-weight rows on e4m3
+    WGMMA (M>=9) use the fp8 ceiling, on bf16 decode (M<=8) the bf16 ceiling; an
+    nvfp4 prefill GEMM is w4a8 and takes fp8 too; missing fp8 floor -> None."""
     from tilerl import precision as P
 
     bf = {"bw_gbs": 4000.0, "peak_tflops": 100.0, "fp8_peak_tflops": 200.0}
-    assert cal.row_peak_tflops(bf, P.nvfp4_dev) == 100.0
-    assert cal.row_peak_tflops(bf, P.nvfp4_dev_b32) == 100.0
-    assert cal.row_peak_tflops(bf, P.fp8_block_dev) == 200.0
-    assert cal.row_peak_tflops(bf, P.fp8_dev) == 200.0
+
+    def row(face, name="q_proj"):
+        return {"name": name, "face": face}
+
+    # fp8 weights: prefill M>=9 on fp8 peak, decode M<=8 on bf16
+    assert cal.row_peak_tflops(bf, row(P.fp8_dev), 1, 4096) == 200.0
+    assert cal.row_peak_tflops(bf, row(P.fp8_block_dev), 1, 4096) == 200.0
+    assert cal.row_peak_tflops(bf, row(P.fp8_dev), 1, 1) == 100.0
+    assert cal.row_peak_tflops(bf, row(P.fp8_dev), 8, 1) == 100.0
+    # nvfp4 weights: w4a8 prefill on fp8 peak (the 133.8% class), decode on bf16
+    assert cal.row_peak_tflops(bf, row(P.nvfp4_dev), 1, 4096) == 200.0
+    assert cal.row_peak_tflops(bf, row(P.nvfp4_dev_b32), 1, 4096) == 200.0
+    assert cal.row_peak_tflops(bf, row(P.nvfp4_dev), 1, 1) == 100.0
+    # lm_head prices one vector per row: b=1 decode is M=1 -> bf16 even under prefill b,s
+    assert cal.row_peak_tflops(bf, row(P.fp8_dev, "lm_head"), 1, 4096) == 100.0
+    # bf16 face never resolves a quant kernel
+    assert cal.row_peak_tflops(bf, row(P.bf16), 1, 4096) == 100.0
     missing = {"bw_gbs": 4000.0, "peak_tflops": 100.0, "fp8_peak_tflops": None}
-    assert cal.row_peak_tflops(missing, P.fp8_dev) is None
+    assert cal.row_peak_tflops(missing, row(P.fp8_dev), 1, 4096) is None
+    assert cal.row_peak_tflops(missing, row(P.nvfp4_dev), 1, 4096) is None
 
 
 def test_calibrate_refuses_off_cuda(monkeypatch):
@@ -334,6 +350,50 @@ def test_kernels_table_pending_when_no_calibration(tmp_path, monkeypatch, capsys
     out = capsys.readouterr().out
     assert "pending-remote" in out
     assert "TICK TOTAL" in out
+
+
+def test_bench_kernels_decode_times_one_token_launch(monkeypatch):
+    """A decode tick prices b*s against the pooled context but the timed GEMM is a
+    one-token launch (M=b for linears): passing s=4096 into the timer timed a fat
+    prefill GEMM and printed a fictional ~10x decode tick (pod 2026-09-11).
+    Mutant: render(..., b, args.context) on the decode call -> timed_s=4096."""
+    import torch
+
+    seen: list[tuple[str, int, int]] = []
+
+    def fake_time(row, backend, b, s):
+        seen.append((row["name"], b, s))
+        return None  # suppress ms columns; M only needs to be observed
+
+    monkeypatch.setattr(cal, "time_row_ms", fake_time)
+    monkeypatch.setattr(cal, "load_rows", lambda: [])
+    monkeypatch.setattr(
+        cal, "calibration",
+        lambda rows, name: {"bw_gbs": 4000.0, "peak_tflops": 100.0,
+                            "fp8_peak_tflops": 200.0})
+    fake_cuda = type("C", (), {
+        "is_available": lambda self: True,
+        "get_device_name": lambda self, i: "stub",
+        "_is_compiled": staticmethod(lambda: False)})()
+    monkeypatch.setattr(torch, "cuda", fake_cuda)
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    import tilerl_kernels.backend as kb
+    monkeypatch.setattr(kb, "get_backend", lambda: object())
+    import argparse
+
+    from tilerl import cli
+
+    args = argparse.Namespace(model="tiny", batches="1", context=512, prefill=0,
+                              checkpoint=None, device_name=None)
+    cli.cmd_bench_kernels(args)
+    assert seen and all(s == 1 for _, _, s in seen), seen
+
+    seen.clear()
+    args2 = argparse.Namespace(model="tiny", batches=None, context=512, prefill=256,
+                               checkpoint=None, device_name=None)
+    cli.cmd_bench_kernels(args2)
+    assert seen and all(s == 256 for _, _, s in seen), seen
+
 
 
 def _cal_row(rid, metric, value, name, card, date, supersedes=None):
