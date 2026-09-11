@@ -437,7 +437,9 @@ def test_indexer_held_recall_from_a_prepared_dir(tmp_path):
                                      "ids": torch.randint(0, m.cfg.vocab_size, (256,)).tolist()}) + "\n")
     rec = train.indexer_held_recall(m, be, d, w, k_pages_pick=2)
     assert set(rec) == {"256"}
-    assert 0.0 <= rec["256"] <= 1.0 and rec["256"] == rec["256"]  # finite
+    r = rec["256"]
+    assert set(r) == {"mean", "min", "per_span"} and len(r["per_span"]) == 2
+    assert 0.0 <= r["mean"] <= 1.0 and r["mean"] == r["mean"]  # finite
 
 
 def test_indexer_projections_take_bf16_activations_with_f32_weights():
@@ -465,3 +467,27 @@ def test_indexer_projections_take_bf16_activations_with_f32_weights():
                                  n_win_pages=win)
     assert diq.dtype == torch.float32 and dik.dtype == torch.float32
     assert torch.isfinite(diq).all() and torch.isfinite(dik).all()
+
+
+def test_sampled_query_teacher_matches_full_rows():
+    """The 27B amendment: dense_causal_page_mass at q_positions must equal the
+    full teacher's rows at exactly those positions (subsample is O(nq*T), not a
+    different teacher). sample_query_positions is seeded, distinct and >= min."""
+    from tilerl.train import dense_causal_page_mass, sample_query_positions
+
+    torch.manual_seed(12)
+    b, t, hq, hkv, d, block = 1, 97, 4, 2, 8, 16
+    q = torch.randn(b, t, hq, d)
+    k = torch.randn(b, t, hkv, d)
+    full = dense_causal_page_mass(q, k, block)
+    qp = sample_query_positions(t, 23, seed=7, min_pos=40)
+    assert qp.shape == (23,) and qp.unique().numel() == 23
+    assert int(qp.min()) >= 40 and bool((qp[1:] >= qp[:-1]).all())
+    sub = dense_causal_page_mass(q, k, block, qp)
+    assert torch.allclose(sub, full.index_select(1, qp), atol=1e-6)
+    # the same seed gives the same positions; a different seed differs
+    assert torch.equal(qp, sample_query_positions(t, 23, 7, 40))
+    assert not torch.equal(qp, sample_query_positions(t, 23, 8, 40))
+    # asking for more positions than the pool yields every eligible position
+    allpos = sample_query_positions(t, 10000, 7, 40)
+    assert int(allpos[0]) == 40 and int(allpos[-1]) == t - 1 and allpos.numel() == t - 40

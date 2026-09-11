@@ -434,7 +434,8 @@ def _train_indexer_recall(args: argparse.Namespace, backend, model, log) -> dict
     t0 = time.perf_counter()
     out = train_mod.indexer_warmup_run(
         model, backend, train_batches, held, args.k_pages, args.steps, args.lr,
-        seed=args.seed, di=args.indexer_di)
+        seed=args.seed, di=args.indexer_di,
+        q_samples=args.q_samples, q_min_pos=args.q_min_pos)
     out["secs_total"] = time.perf_counter() - t0
     out["corpus"] = file_hash(str(cdir / "manifest.json")) if (cdir / "manifest.json").exists() else None
     # Optional cross-corpus control: held-only recall before/after under the SAME
@@ -443,7 +444,8 @@ def _train_indexer_recall(args: argparse.Namespace, backend, model, log) -> dict
     if args.indexer_control_corpus:
         cdir2 = Path(args.indexer_control_corpus)
         out["control"] = train_mod.indexer_held_recall(
-            model, backend, cdir2, out["weights"], args.k_pages)
+            model, backend, cdir2, out["weights"], args.k_pages,
+            q_samples=args.q_samples, q_min_pos=args.q_min_pos, seed=args.seed)
         out["control_corpus"] = file_hash(str(cdir2 / "manifest.json")) \
             if (cdir2 / "manifest.json").exists() else None
     for i, v in enumerate(out["kl_curve"]):
@@ -497,20 +499,27 @@ def _train_indexer_warmup(args: argparse.Namespace) -> None:
             "tokens_seen": out["tokens_seen"], "k_pages": out["k_pages"], "di": out["di"],
             "kl_first": out["kl_curve"][0], "kl_last": out["kl_curve"][-1],
             "secs_total": out["secs_total"], "corpus": out.get("corpus"),
-            **{f"recall_before_{k}": v for k, v in out["recall_before"].items()},
-            **{f"recall_after_{k}": v for k, v in out["recall_after"].items()}}
+            "q_samples": out.get("q_samples", 0), "q_min_pos": out.get("q_min_pos"),
+            **{f"recall_before_{k}": v["mean"] for k, v in out["recall_before"].items()},
+            **{f"recall_after_{k}": v["mean"] for k, v in out["recall_after"].items()},
+            **{f"recall_after_min_{k}": v["min"] for k, v in out["recall_after"].items()}}
         if "control" in out:
             metrics["control_corpus"] = out.get("control_corpus")
-            metrics.update({f"control_recall_{k}": v
+            metrics.update({f"control_recall_{k}": v["mean"]
                            for k, v in out["control"].items()})
+        manifest["recall_detail"] = {
+            "before": out["recall_before"], "after": out["recall_after"]}
         manifest["metrics"] = metrics
         # Accept: mean after-recall across held-out lengths clears the threshold;
-        # per-length recall is recorded (the pre-registered mixture scope).
-        afters = list(out["recall_after"].values())
+        # per-length mean, per-span min and per-span values are all recorded (the
+        # pre-registered mixture scope).
+        afters = [v["mean"] for v in out["recall_after"].values()]
         mean_after = sum(afters) / len(afters)
+        worst_span = min(v["min"] for v in out["recall_after"].values())
         manifest["gates"] = [{
             "name": "indexer_recall_at_k", "value": mean_after, "threshold": acc,
-            "kind": "verdict", "skipped": False, "passed": mean_after >= acc}]
+            "kind": "verdict", "skipped": False, "passed": mean_after >= acc,
+            "per_span_min": worst_span}]
         manifest["finished"] = now()
         write_manifest(runs_root(), manifest)
         print(json.dumps(manifest, indent=1) if args.json else format_run(manifest))
@@ -2387,6 +2396,11 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="27B indexer recall acceptance: mean recall@k_pages after warm-up")
     p_train.add_argument("--indexer-control-corpus",
                          help="held-only span dir: cross-corpus control recall under the trained weights")
+    p_train.add_argument("--q-samples", type=int, default=0,
+                         help="27B recall: evaluate the dense teacher at this many seeded query "
+                              "positions per span (256 -> O(256*T) instead of O(T^2)); 0 = all")
+    p_train.add_argument("--q-min-pos", type=int, default=2048,
+                         help="27B recall: sampled query positions are >= this (leaves missable pages)")
     p_train.add_argument("--rl", action="store_true",
                          help="GRPO: the engine samples a group per prompt, a reward scores "
                               "them, the group mean is the baseline (no critic)")
