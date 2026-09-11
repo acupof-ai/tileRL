@@ -74,11 +74,12 @@ def per_cold_kv_block_bytes(cfg, kv_io, kv_fp8=None, cold_dtype=None) -> int:
     if cold_dtype is not None:
         total = nbytes(_dtype_fmt(cold_dtype), shape)
     elif kv_fp8 is not None:
+        # kv_format(bits=8, one f32 scale per head_dim) already prices BOTH the
+        # fp8 payload and the per-token scale planes — adding scales again doubled
+        # them (derived 1792 vs 1280 held).
         total = nbytes(kv_format(cfg.head_dim), shape)
     else:
         total = nbytes(_dtype_fmt(kv_io), shape)
-    if kv_fp8 is not None:
-        total += 2 * planes * cfg.num_kv_heads * BLOCK_TOKENS * 4
     return total
 
 
