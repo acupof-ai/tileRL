@@ -19,7 +19,7 @@ import torch
 
 from .autograd import AdamW, RecordingBackend, Tape, clip_grad_norm, cosine_warmup
 from .engine import RequestFailed, SamplingParams
-from .kv_cache import LinearStatePool, NoPrefixStore
+from .kv_cache import BLOCK_TOKENS, LinearStatePool, NoPrefixStore, PagedKvPool
 from .model import save_hf
 
 _MAX_TICKS = 10000
@@ -70,6 +70,37 @@ def _training_kv(model: Any, batch_size: int, seq_len: int, device: Any = None):
     )
     kv.state_slot = torch.arange(batch_size, dtype=torch.long)
     return kv
+
+
+def _capture_kv(model: Any, seq_len: int, backend: Any):
+    """A one-row PAGED pool for the frozen-base capture forward. The dense path
+    materialises a [hq,t,t] score matrix (24 GiB at t=32k on the 27B); the
+    serving prefill path streams key pages through PagedKvPool and keeps only
+    the resident K/V (~2 GiB). Capture is a no-grad single prefill, so the tape
+    does not need dense identity — paged is exact dense-causal attention."""
+    cfg = model.cfg
+    n_pages = (seq_len + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+    pool = PagedKvPool(
+        n_pages, cfg.num_kv_heads, cfg.head_dim,
+        device=backend.device, layer_map=cfg.full_attn_layers,
+        dtype=getattr(backend, "io", torch.bfloat16))
+    blocks = torch.tensor([[pool.alloc_block() for _ in range(n_pages)]],
+                          dtype=torch.long, device=backend.device)
+    return SimpleNamespace(
+        dense=False,
+        kv_pool=pool,
+        block_table=blocks,
+        seq_len=torch.tensor([seq_len], dtype=torch.long, device=backend.device),
+        seq_q_lens=torch.tensor([seq_len], dtype=torch.long, device=backend.device),
+        state_pool=LinearStatePool(
+            num_slots=1,
+            num_linear_layers=cfg.num_linear_layers,
+            num_heads=cfg.linear_num_value_heads,
+            head_dim=cfg.linear_value_head_dim,
+            device=backend.device,
+        ),
+        state_slot=torch.zeros(1, dtype=torch.long),
+    )
 
 
 _NO_GRAD = (
@@ -272,9 +303,10 @@ def _step(
 
 
 def _dense_causal_mass(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-    """Teacher for the indexer warm-up: causal softmax attention mass averaged
-    over query heads (GQA: K heads repeat). ``q`` [b,t,hq,d], ``k`` [b,t,hkv,d]
-    -> [b,t,t], each query row L1-normalised."""
+    """Naive dense teacher O(t^2): causal softmax attention mass averaged over
+    query heads (GQA: K heads repeat). ``q`` [b,t,hq,d], ``k`` [b,t,hkv,d] ->
+    [b,t,t], each query row L1-normalised. The f32 parity oracle for
+    :func:`dense_causal_page_mass`; never used on a long real sequence."""
     b, t, hq, d = q.shape
     rep = hq // k.shape[2]
     k_exp = k.repeat_interleave(rep, dim=2)                       # [b,t,hq,d]
@@ -282,6 +314,150 @@ def _dense_causal_mass(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=q.device))
     scores = scores.masked_fill(~causal[None, None], float("-inf"))
     return torch.softmax(scores, dim=-1).mean(dim=1)             # avg over heads
+
+
+def dense_causal_page_mass(q: torch.Tensor, k: torch.Tensor, block: int = 16
+                           ) -> torch.Tensor:
+    """Dense causal attention mass pooled per key PAGE, averaged over query
+    heads — the warm-up teacher for a LONG sequence (8k-32k), where the naive
+    [t,t] score matrix will not fit. Streams key pages one at a time: an online
+    softmax pass gets each query's log-sum-exp, a second pass normalises each
+    page's numerator. Memory O(t*block), compute the same GEMM as attention.
+
+    ``q`` [b,t,hq,d], ``k`` [b,t,hkv,d] -> [b, t, t//block], each query row
+    L1-normalised over pages strictly before it (window excluded later by
+    :func:`page_mass_target`). Mathematically identical to
+    ``_dense_causal_mass`` pooled by block, which is its CPU gate."""
+    b, t, hq, d = q.shape
+    rep = hq // k.shape[2]
+    k_exp = k.repeat_interleave(rep, dim=2)
+    scale = d ** -0.5
+    # ceil, not floor: a non-block-divisible T still has a trailing partial page
+    # (T=49, block=16 -> pages 0,1,2,3 with page 3 holding key 48); dropping it
+    # renormalises that key's mass onto the included pages.
+    n_pages = (t + block - 1) // block
+    q_idx = torch.arange(t, device=q.device)
+    neg_inf = torch.finfo(q.dtype).min
+
+    def _page_scores(p):
+        sl = slice(p * block, min((p + 1) * block, t))
+        kj = q_idx[sl]
+        s = torch.einsum("bqhd,bkhd->bhqk", q, k_exp[:, sl]) * scale  # [b,hq,t,blk]
+        valid = q_idx[None, None, :, None] >= kj[None, None, None, :]
+        return s.masked_fill(~valid, float("-inf")), valid
+
+    # Pass 1: online softmax -> per-(b,hq,q) running max and log-sum-exp.
+    neg_inf = torch.finfo(q.dtype).min
+    run_max = torch.full((b, hq, t), neg_inf, dtype=torch.float32, device=q.device)
+    run_sum = torch.zeros((b, hq, t), dtype=torch.float32, device=q.device)
+    for p in range(n_pages):
+        s, valid = _page_scores(p)
+        anyv = valid.any(dim=-1)                              # [b,hq,t]
+        bmax = torch.where(anyv, s.amax(dim=-1), torch.zeros_like(run_max))
+        # exp only over valid keys; a page with no key <= query contributes 0.
+        bsum = torch.where(
+            anyv,
+            torch.where(valid, torch.exp(s - bmax[..., None]), 0.0).sum(dim=-1),
+            torch.zeros_like(run_max))
+        new_max = torch.maximum(run_max, torch.where(anyv, bmax, run_max))
+        old = torch.where(run_max > neg_inf / 2,
+                          run_sum * torch.exp(run_max - new_max), torch.zeros_like(run_sum))
+        add = torch.where(anyv, bsum * torch.exp(
+            torch.where(anyv, bmax, new_max) - new_max), torch.zeros_like(run_sum))
+        run_sum, run_max = old + add, new_max
+    lse = torch.where(run_max > neg_inf / 2,
+                      run_max + run_sum.clamp_min(1e-30).log(), run_max)  # [b,hq,t]
+
+    # Pass 2: normalised causal mass landing on each key page, mean over heads.
+    page_mass = torch.zeros(b, t, n_pages, dtype=torch.float32, device=q.device)
+    lse_safe = torch.where(lse > neg_inf / 2, lse, torch.zeros_like(lse))
+    for p in range(n_pages):
+        s, valid = _page_scores(p)
+        mass_h = torch.where(valid, torch.exp(s - lse_safe[..., None]), 0.0).sum(dim=-1)
+        page_mass[:, :, p] = mass_h.mean(dim=1)
+    return page_mass
+
+
+def indexer_capture(model: Any, ids: torch.Tensor, backend: Any, block: int,
+                    n_win_pages: int):
+    """Run the frozen base once (no grad) and build the indexer warm-up inputs
+    from its four source layers. Returns ``(H, k_pages, target, n_pages)``:
+    H [b,L,t,hidden], per-page K [b,L,pages,hkv,d], the streamed dense page-mass
+    teacher [b,L,t,pages] with the window excluded, and the per-row page count.
+    Shared by the train step and the recall eval (no optimizer in the eval)."""
+    from .sparse_index import exclude_window_renorm, index_source_groups
+
+    b, t = ids.shape
+    n_pages_tok = (t + block - 1) // block      # ceil: a tail key gets its own page
+    if n_pages_tok <= n_win_pages:
+        raise ValueError(f"warm-up needs > {n_win_pages} pages, got {n_pages_tok} from T={t}")
+    full_layers = list(model.cfg.full_attn_layers)
+    sources, _groups = index_source_groups(len(full_layers)) if len(full_layers) >= 4 \
+        else (list(range(len(full_layers))), None)
+    source_set = {full_layers[s] for s in sources}
+
+    captured: list = []
+    model.index_capture = captured
+    model.index_capture_layers = source_set
+    try:
+        kv = _capture_kv(model, t, backend)
+        with torch.no_grad():
+            # last_only: the capture reads H/Q/K inside the layer loop, so the
+            # lm_head only needs the last position — at t=32k a full [t,vocab]
+            # head (plus its fp8 GEMM workspace) asks ~30 GiB and OOMs the 27B.
+            model.forward(ids, torch.arange(t, device=backend.device), kv, backend,
+                          last_only=True)
+    finally:
+        model.index_capture = None
+        model.index_capture_layers = frozenset()
+
+    hkv, d_kv = model.cfg.num_kv_heads, model.cfg.head_dim
+    # The true number of valid pages per row (a trailing partial page is valid).
+    n_pages = torch.full((b,), n_pages_tok, dtype=torch.long)
+    pad_tok = n_pages_tok * block - t
+    captured.sort(key=lambda c: c[0])
+    # Indexer-Q and the teacher are over the real T query positions (no pad); only
+    # KEYS are padded to a whole page so the page reshape is legal.
+    H = torch.stack([c[1] for c in captured], dim=1)
+    K = torch.stack([c[3] for c in captured], dim=1)
+    if pad_tok:
+        K = torch.nn.functional.pad(K, (0, 0, 0, 0, 0, pad_tok))
+    mass = torch.stack([dense_causal_page_mass(c[2], c[3], block) for c in captured], dim=1)
+    k_blocks = K.reshape(b, len(captured), n_pages_tok, block, hkv, d_kv)
+    if pad_tok:
+        # trailing page has fewer real keys: divide each page's sum by its real
+        # key count so the partial page is not underweighted by zero padding.
+        counts = torch.full((n_pages_tok,), float(block), device=K.device)
+        counts[-1] = block - pad_tok
+        k_pages = k_blocks.sum(3) / counts[None, None, :, None, None]
+    else:
+        k_pages = k_blocks.mean(dim=3)
+    target = exclude_window_renorm(mass, n_pages, n_win_pages)
+    return H, k_pages, target, n_pages
+
+
+def indexer_recall(model: Any, ids: torch.Tensor, backend: Any,
+                   weights: dict[str, torch.Tensor], k_pages_pick: int,
+                   block: int = 16) -> float:
+    """Mean top-k recall of dense page mass for one batch under the current
+    indexer weights, no gradient. The science metric's runtime wrapper."""
+    from .sparse_index import (
+        WINDOW_PAGES,
+        page_scores_for_selector,
+        project_indexer_queries,
+        project_page_keys,
+        topk_page_recall,
+    )
+
+    H, k_pages, target, n_pages = indexer_capture(
+        model, ids, backend, block, WINDOW_PAGES)
+    if weights["ik"].shape[0] != model.cfg.num_kv_heads:
+        raise ValueError("index heads must equal KV heads")
+    with torch.no_grad():
+        iq = project_indexer_queries(H, weights["iq"])
+        ik = project_page_keys(k_pages, weights["ik"])
+        scores = page_scores_for_selector(iq, ik, n_pages, WINDOW_PAGES)
+        return float(topk_page_recall(scores, target, n_pages, k_pages_pick, WINDOW_PAGES))
 
 
 def indexer_warmup_step(
@@ -292,55 +468,14 @@ def indexer_warmup_step(
     optimizer: AdamW,
     block: int = 16,
 ) -> float:
-    """One indexer warm-up step. The frozen base supplies the teacher: a
-    no-grad dense forward captures each source layer's input H and post-rope
-    Q/K. Dense causal attention mass is pooled per page and the two indexer
+    """One indexer warm-up step on captured frozen-base inputs: the two indexer
     projection weights (``iq`` [ih,hidden,di], ``ik`` [ih,d_kv,di]) learn to
-    match it via the ``indexer_warmup`` tape op. Returns the scalar KL."""
-    from .sparse_index import (
-        WINDOW_PAGES,
-        index_source_groups,
-        indexer_warmup_loss,
-        page_mass_target,
-    )
+    match the dense page-mass teacher via the ``indexer_warmup`` tape op."""
+    from .sparse_index import WINDOW_PAGES, indexer_warmup_loss
 
     ids = torch.as_tensor(input_ids, dtype=torch.long, device=backend.device)
-    b, t = ids.shape
-    n_pages_tok = t // block
-    if n_pages_tok <= WINDOW_PAGES:
-        raise ValueError(f"warm-up needs > {WINDOW_PAGES} pages, got {n_pages_tok} from T={t}")
-
-    full_layers = list(model.cfg.full_attn_layers)
-    sources, _groups = index_source_groups(len(full_layers)) if len(full_layers) >= 4 \
-        else (list(range(len(full_layers))), None)
-    source_set = {full_layers[s] for s in sources}
-
-    captured: list = []
-    model.index_capture = captured
-    try:
-        kv = _training_kv(model, b, t, device=backend.device)
-        with torch.no_grad():
-            model.forward(ids, torch.arange(t, device=backend.device), kv, backend)
-    finally:
-        model.index_capture = None
-
-    hkv, d_kv = model.cfg.num_kv_heads, model.cfg.head_dim
-    ih = weights["ik"].shape[0]
-    if ih != hkv:
-        raise ValueError(f"index heads {ih} must equal KV heads {hkv} on the tiny warm-up")
-    n_pages = torch.full((b,), n_pages_tok, dtype=torch.long)
-
-    # Stack captured SOURCE layers on the L_src axis (one entry per source layer).
-    cap = [c for c in captured if c[0] in source_set]
-    cap.sort(key=lambda c: c[0])
-    H = torch.stack([c[1][:, :n_pages_tok * block] for c in cap], dim=1)   # [b,L,t,hid]
-    K = torch.stack([c[3] for c in cap], dim=1)                            # [b,L,t,hkv,d]
-    mass = torch.stack([_dense_causal_mass(c[2], c[3]) for c in cap], dim=1)  # [b,L,t,t]
-
-    # Per-page K = mean of the block's token Ks: [b,L,pages,hkv,d].
-    k_pages = K.reshape(b, len(cap), n_pages_tok, block, hkv, d_kv).mean(dim=3)
-    target = page_mass_target(mass, n_pages, block, WINDOW_PAGES)
-
+    H, k_pages, target, n_pages = indexer_capture(
+        model, ids, backend, block, WINDOW_PAGES)
     iq_w, ik_w = weights["iq"], weights["ik"]
     with Tape() as tape:
         loss = indexer_warmup_loss(H, k_pages, iq_w, ik_w, target, n_pages, WINDOW_PAGES)
@@ -350,17 +485,26 @@ def indexer_warmup_step(
     return float(loss.detach())
 
 
+def init_indexer_weights(cfg: Any, gen: torch.Generator, device,
+                         di: int | None = None) -> dict[str, torch.Tensor]:
+    """The two trainable indexer projection weights: ``iq`` [hkv,hidden,di] and
+    ``ik`` [hkv,head_dim,di], small random (V4.1 releases di=128; tiny uses 16)."""
+    hkv, d_kv, hidden = cfg.num_kv_heads, cfg.head_dim, cfg.hidden_size
+    di = min(16, d_kv) if di is None else di
+    scale = 0.1
+    return {
+        "iq": scale * torch.randn(hkv, hidden, di, generator=gen, device=device),
+        "ik": scale * torch.randn(hkv, d_kv, di, generator=gen, device=device),
+    }
+
+
 def indexer_warmup(model: Any, backend: Any, steps: int, seed: int = 0,
                    seq_len: int = 256, batch: int = 1, lr: float = 0.02) -> list[float]:
-    """Run the learned-indexer KL warm-up on the frozen base for ``steps`` and
-    return the per-step loss. Tiny/CPU path; the 27B card run is pending-remote."""
+    """Run the learned-indexer KL warm-up on the frozen base for ``steps`` over
+    random ids and return the per-step loss. Tiny/CPU path; the 27B card run
+    drives :func:`indexer_warmup_step` directly over real corpus spans."""
     gen = torch.Generator(device=backend.device).manual_seed(seed)
-    hkv, d_kv, hidden = model.cfg.num_kv_heads, model.cfg.head_dim, model.cfg.hidden_size
-    di = min(16, d_kv)  # small indexer head on tiny
-    weights = {
-        "iq": (0.1 * torch.randn(hkv, hidden, di, generator=gen, device=backend.device)),
-        "ik": (0.1 * torch.randn(hkv, d_kv, di, generator=gen, device=backend.device)),
-    }
+    weights = init_indexer_weights(model.cfg, gen, backend.device)
     opt = AdamW(lr=lr)
     losses = []
     for _ in range(steps):
@@ -368,6 +512,61 @@ def indexer_warmup(model: Any, backend: Any, steps: int, seed: int = 0,
                             generator=gen, device=backend.device)
         losses.append(indexer_warmup_step(model, ids, backend, weights, opt))
     return losses
+
+
+def indexer_warmup_run(model: Any, backend: Any, train_batches: list,
+                       held_batches: dict, k_pages_pick: int, steps: int,
+                       lr: float, seed: int = 0, di: int | None = None) -> dict:
+    """The science run over real long-text spans. ``train_batches`` is a list of
+    id tensors cycled for ``steps``; ``held_batches`` maps a length label to id
+    tensors used for gradient-free recall before and after. Returns recall
+    before/after per held-out length, the KL curve and tokens seen."""
+    gen = torch.Generator(device=backend.device).manual_seed(seed)
+    weights = init_indexer_weights(model.cfg, gen, backend.device, di)
+
+    def recalls() -> dict:
+        return {label: sum(indexer_recall(model, ids, backend, weights, k_pages_pick)
+                           for ids in batches) / len(batches)
+                for label, batches in held_batches.items()}
+
+    before = recalls()
+    opt = AdamW(lr=lr)
+    curve, tokens_seen = [], 0
+    for i in range(steps):
+        ids = train_batches[i % len(train_batches)]
+        curve.append(indexer_warmup_step(model, ids, backend, weights, opt))
+        tokens_seen += int(ids.numel())
+    after = recalls()
+    return {"recall_before": before, "recall_after": after, "kl_curve": curve,
+            "tokens_seen": tokens_seen, "steps": steps, "weights": weights,
+            "k_pages": k_pages_pick, "di": weights["iq"].shape[-1]}
+
+
+def load_span_corpus(cdir: Any, device) -> dict:
+    """Load a prepared span dir (scripts/prepare_indexer_corpus) into
+    ``{length_label: [id tensors]}``, split prefix as given by the filenames."""
+    import json
+    from pathlib import Path
+
+    groups: dict = {}
+    for path in sorted(Path(cdir).glob("*_*.jsonl")):
+        split, ctx = path.stem.split("_", 1)
+        if split != "held":
+            continue
+        rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+        groups[ctx] = [torch.tensor(r["ids"], dtype=torch.long, device=device).unsqueeze(0)
+                       for r in rows]
+    return groups
+
+
+def indexer_held_recall(model: Any, backend: Any, cdir: Any,
+                        weights: dict[str, torch.Tensor], k_pages_pick: int) -> dict:
+    """Gradient-free mean recall per span length over a held-only span dir, under
+    the supplied (already-trained) weights — the cross-corpus control."""
+    groups = load_span_corpus(cdir, backend.device)
+    return {label: sum(indexer_recall(model, ids, backend, weights, k_pages_pick)
+                       for ids in batches) / len(batches)
+            for label, batches in groups.items()}
 
 
 def train_step(

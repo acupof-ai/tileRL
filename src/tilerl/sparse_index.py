@@ -76,6 +76,9 @@ def project_page_keys(k_pages: Tensor, ik_weight: Tensor) -> Tensor:
     ih = ik_weight.shape[0]
     if h % ih:
         raise ValueError(f"{h} attention heads do not divide into {ih} index heads")
+    # The indexer is an f32 head over bf16 frozen-base activations (GPU): cast at
+    # the projection boundary. f32->f32 (CPU tiny) is a no-op.
+    k_pages = k_pages.to(ik_weight.dtype)
     grouped = k_pages.reshape(r, l, p, ih, h // ih, d).mean(dim=4)  # mean of group
     # weight is per index head [ih, d_attn, di]; contract only that head's dims
     return torch.einsum("rlphd,hde->rlphe", grouped, ik_weight)
@@ -116,6 +119,33 @@ def page_scores_for_selector(iq: Tensor, ik: Tensor,
     return scores
 
 
+def topk_page_recall(selector_scores: Tensor, target_page_mass: Tensor,
+                     n_pages: Tensor, k_pages: int,
+                     n_win_pages: int = WINDOW_PAGES) -> Tensor:
+    """Top-k recall of dense page mass — the warm-up's science metric.
+
+    ``selector_scores`` [rows, L_src, pages] from :func:`page_scores_for_selector`
+    (window/invalid already -inf); ``target_page_mass`` [rows, L_src, q, pages]
+    from :func:`page_mass_target` (L1-normalised over indexable pages). The
+    selector picks at most ``k_pages`` indexable pages per row/layer (shared
+    across that layer's queries — a page hot for ANY query is taken); recall is
+    the target mass sitting on picked pages, averaged over rows, source layers
+    and queries. ``k_pages`` >= the number of indexable pages is dense
+    selection and recall is 1 by construction.
+    """
+    r, l, pages = selector_scores.shape
+    indexable = _indexable_mask(n_pages, pages, n_win_pages, selector_scores.device)
+    # Pick per row/layer among indexable pages; mask non-indexable below the
+    # finite scores so topk never returns the window.
+    pick = selector_scores.masked_fill(~indexable[:, None, :], float("-inf")).topk(
+        min(k_pages, pages), dim=-1).indices                        # [r,l,k]
+    chosen = torch.zeros(r, l, pages, dtype=torch.bool, device=selector_scores.device)
+    chosen.scatter_(-1, pick, True)
+    chosen &= indexable[:, None, :]                                  # belt and braces
+    mass_on = torch.einsum("rlp,rlqp->rlq", chosen.float(), target_page_mass)
+    return mass_on.mean()
+
+
 def page_mass_target(attn_mass: Tensor, n_pages: Tensor,
                      block_tokens: int = BLOCK_TOKENS,
                      n_win_pages: int = WINDOW_PAGES) -> Tensor:
@@ -135,11 +165,17 @@ def page_mass_target(attn_mass: Tensor, n_pages: Tensor,
                                                       device=attn_mass.device)], dim=-1)
     pages = attn_mass.shape[-1] // block_tokens
     pooled = attn_mass.reshape(r, l, q, pages, block_tokens).sum(dim=-1)
-    valid = torch.arange(pages, device=attn_mass.device)[None, None, None, :] \
-        < n_pages.to(attn_mass.device)[:, None, None, None]
-    indexable = valid & (torch.arange(pages, device=attn_mass.device)[None, None, None, :]
-                         < (n_pages[:, None, None, None] - n_win_pages))
-    pooled = pooled * indexable
+    return exclude_window_renorm(pooled, n_pages, n_win_pages)
+
+
+def exclude_window_renorm(pooled: Tensor, n_pages: Tensor,
+                          n_win_pages: int = WINDOW_PAGES) -> Tensor:
+    """Zero window/invalid pages in an already-pooled ``[r,L,q,pages]`` mass and
+    L1-normalise over the indexable pages. Shared by the token-pooling target and
+    the long-sequence teacher that streams page masses directly."""
+    r, l, q, pages = pooled.shape
+    indexable = _indexable_mask(n_pages, pages, n_win_pages, pooled.device)
+    pooled = pooled * indexable[:, None, None, :]
     return pooled / pooled.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
@@ -174,8 +210,9 @@ def indexer_kl(iq: Tensor, ik: Tensor, target_page_mass: Tensor,
 def project_indexer_queries(h: Tensor, iq_weight: Tensor) -> Tensor:
     """Project indexer-Q per query from the layer input H (V4.1 indexer_q):
     ``h`` [rows, L_src, q, d_hidden], ``iq_weight`` [ih, d_hidden, di] ->
-    [rows, L_src, q, ih, di]. Distinct from the attention-Q projection."""
-    return torch.einsum("rlqd,hde->rlqhe", h, iq_weight)
+    [rows, L_src, q, ih, di]. Distinct from the attention-Q projection. Casts
+    bf16 frozen activations to the f32 indexer weight dtype at the boundary."""
+    return torch.einsum("rlqd,hde->rlqhe", h.to(iq_weight.dtype), iq_weight)
 
 
 def indexer_warmup_loss(h: Tensor, k_pages: Tensor, iq_weight: Tensor,
@@ -222,6 +259,9 @@ def indexer_warmup_bwd(grad: Tensor, iq_weight: Tensor, ik_weight: Tensor,
     scale = iq_weight.shape[-1] ** -0.5
 
     iq = project_indexer_queries(h, iq_weight)              # [r,L,q,ih,di]
+    # f32 head over bf16 frozen activations (GPU); same boundary cast as fwd.
+    k_pages = k_pages.to(ik_weight.dtype)
+    h = h.to(iq_weight.dtype)
     grouped = k_pages.reshape(r, l, p, ih, m, da).mean(4)  # [r,L,p,ih,da]
     ik = torch.einsum("rlphd,hde->rlphe", grouped, ik_weight)
     dots = torch.einsum("rlqhe,rlphe->rlqhp", iq, ik) * scale

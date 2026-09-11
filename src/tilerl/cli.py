@@ -404,10 +404,64 @@ def _train_dry_run(args: argparse.Namespace) -> None:
         print(format_memory_table(table))
 
 
+def _train_indexer_recall(args: argparse.Namespace, backend, model, log) -> dict:
+    """27B science run over prepared corpus spans (scripts/prepare_indexer_corpus):
+    recall@k_pages before/after per span length, KL curve, tokens seen."""
+    import time
+
+    import torch
+
+    from . import train as train_mod
+    from .ledger import file_hash
+
+    cdir = Path(args.indexer_corpus)
+
+    def load(split: str):
+        groups = {}
+        for path in sorted(cdir.glob(f"{split}_*.jsonl")):
+            rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+            ctx = rows[0]["ctx"]
+            groups[str(ctx)] = [
+                torch.tensor(r["ids"], dtype=torch.long, device=backend.device).unsqueeze(0)
+                for r in rows]
+            log(f"{split} ctx={ctx}: {len(groups[str(ctx)])} prompts")
+        return groups
+
+    held = load("held")
+    train_groups = load("train")
+    # cycle training prompts across lengths in an interleaved order
+    train_batches = [b for grp in zip_longest_flat(train_groups) for b in [grp] if b is not None]
+    t0 = time.perf_counter()
+    out = train_mod.indexer_warmup_run(
+        model, backend, train_batches, held, args.k_pages, args.steps, args.lr,
+        seed=args.seed, di=args.indexer_di)
+    out["secs_total"] = time.perf_counter() - t0
+    out["corpus"] = file_hash(str(cdir / "manifest.json")) if (cdir / "manifest.json").exists() else None
+    # Optional cross-corpus control: held-only recall before/after under the SAME
+    # trained weights (e.g. English cosmo 8k after training on Chinese wiki),
+    # showing recall is not a tokenization/language artifact.
+    if args.indexer_control_corpus:
+        cdir2 = Path(args.indexer_control_corpus)
+        out["control"] = train_mod.indexer_held_recall(
+            model, backend, cdir2, out["weights"], args.k_pages)
+        out["control_corpus"] = file_hash(str(cdir2 / "manifest.json")) \
+            if (cdir2 / "manifest.json").exists() else None
+    for i, v in enumerate(out["kl_curve"]):
+        if (i + 1) % max(1, args.steps // 20) == 0 or i == 0:
+            log(f"step {i + 1:4d}/{args.steps}  kl {v:.4f}")
+    return out
+
+
+def zip_longest_flat(groups: dict) -> list:
+    import itertools
+    return [b for row in itertools.zip_longest(*groups.values()) for b in row if b is not None]
+
+
 def _train_indexer_warmup(args: argparse.Namespace) -> None:
-    """Learned-indexer KL warm-up on the frozen base (sparse-KV unit D). Tiny/CPU
-    gate path: the recipe proves one step runs through capture -> page pool ->
-    tape backward -> optimizer; the 27B card run is pending-remote."""
+    """Learned-indexer KL warm-up on the frozen base (sparse-KV unit D). With
+    --indexer-corpus DIR this is the 27B recall science run (recall@k_pages
+    before/after per 8k/16k/32k held-out length); without it, the tiny/CPU
+    one-step gate path."""
     import math
     import time
 
@@ -417,9 +471,14 @@ def _train_indexer_warmup(args: argparse.Namespace) -> None:
     from .ledger import commit, format_run, gates_pass, new_manifest, now, runs_root, write_manifest
 
     manifest = new_manifest("train", {
-        "model": args.model, "recipe": args.recipe, "source": "tiny",
+        "model": args.model, "recipe": args.recipe,
+        "source": _QWEN38_SOURCE if args.model == "qwen38-27b" else "tiny",
         "commit": commit(), "algo": "indexer-warmup", "steps": args.steps,
-        "lr": args.lr, "seed": args.seed})
+        "lr": args.lr, "seed": args.seed,
+        "k_pages": getattr(args, "k_pages", None),
+        "indexer_di": getattr(args, "indexer_di", None),
+        "indexer_corpus": args.indexer_corpus,
+        "indexer_control_corpus": args.indexer_control_corpus})
     if args.steps == 0:
         manifest["gates"] = []
         manifest["finished"] = now()
@@ -430,6 +489,35 @@ def _train_indexer_warmup(args: argparse.Namespace) -> None:
     cfg, model = _build_model(args.model, seed=args.seed, keep_master=False)
     log = _progress(args.json)
     log(f"tilerl train: indexer warm-up model={cfg.name} steps={args.steps}")
+
+    if args.indexer_corpus:
+        out = _train_indexer_recall(args, backend, model, log)
+        acc = args.recall_threshold
+        metrics = {
+            "tokens_seen": out["tokens_seen"], "k_pages": out["k_pages"], "di": out["di"],
+            "kl_first": out["kl_curve"][0], "kl_last": out["kl_curve"][-1],
+            "secs_total": out["secs_total"], "corpus": out.get("corpus"),
+            **{f"recall_before_{k}": v for k, v in out["recall_before"].items()},
+            **{f"recall_after_{k}": v for k, v in out["recall_after"].items()}}
+        if "control" in out:
+            metrics["control_corpus"] = out.get("control_corpus")
+            metrics.update({f"control_recall_{k}": v
+                           for k, v in out["control"].items()})
+        manifest["metrics"] = metrics
+        # Accept: mean after-recall across held-out lengths clears the threshold;
+        # per-length recall is recorded (the pre-registered mixture scope).
+        afters = list(out["recall_after"].values())
+        mean_after = sum(afters) / len(afters)
+        manifest["gates"] = [{
+            "name": "indexer_recall_at_k", "value": mean_after, "threshold": acc,
+            "kind": "verdict", "skipped": False, "passed": mean_after >= acc}]
+        manifest["finished"] = now()
+        write_manifest(runs_root(), manifest)
+        print(json.dumps(manifest, indent=1) if args.json else format_run(manifest))
+        if not gates_pass(manifest):
+            sys.exit(1)
+        return
+
     t0 = time.perf_counter()
     losses = train_mod.indexer_warmup(model, backend, args.steps, seed=args.seed, lr=args.lr)
     for i, v in enumerate(losses):
@@ -2289,6 +2377,16 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="on-policy distillation: the engine rolls out, LoRA adapters train")
     p_train.add_argument("--indexer-warmup", action="store_true",
                          help="learned-indexer KL warm-up on the frozen sparse-KV base (unit D)")
+    p_train.add_argument("--indexer-corpus",
+                         help="prepared span dir (scripts/prepare_indexer_corpus): 27B recall run")
+    p_train.add_argument("--k-pages", type=int, default=128,
+                         help="indexer recall: pages selected per row/source layer")
+    p_train.add_argument("--indexer-di", type=int, default=128,
+                         help="indexer head dim (V4.1 releases 128)")
+    p_train.add_argument("--recall-threshold", type=float, default=0.9,
+                         help="27B indexer recall acceptance: mean recall@k_pages after warm-up")
+    p_train.add_argument("--indexer-control-corpus",
+                         help="held-only span dir: cross-corpus control recall under the trained weights")
     p_train.add_argument("--rl", action="store_true",
                          help="GRPO: the engine samples a group per prompt, a reward scores "
                               "them, the group mean is the baseline (no critic)")

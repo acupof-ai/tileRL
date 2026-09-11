@@ -295,10 +295,12 @@ class Model:
     def __init__(self, cfg: ModelConfig, params: dict[str, torch.Tensor]):
         self.cfg = cfg
         self.params = params
-        # When set to a list, each full-attn layer's indexer warm-up inputs
-        # (layer input H, post-rope Q/K) are appended during forward. Warm-up
-        # only; serving/training forward leaves it None.
+        # When index_capture is set to a list, each listed full-attn layer's
+        # warm-up inputs (layer input H, post-rope Q/K) are appended in forward.
+        # index_capture_layers is the source-layer filter; serving/training leave
+        # both at their defaults (None / empty).
         self.index_capture: list | None = None
+        self.index_capture_layers: set = frozenset()
 
     def _has(self, key: str) -> bool:
         return key in self.params or _quantized(self.params, key)
@@ -392,9 +394,11 @@ class Model:
         k = backend.rmsnorm_f32(k, _tp_fork(backend, self.params[f"{p}.k_norm"]), cfg.rms_eps)
         q = backend.rope(q, positions, cfg.rope_theta, rotary_dim=cfg.effective_rotary_dim)
         k = backend.rope(k, positions, cfg.rope_theta, rotary_dim=cfg.effective_rotary_dim)
-        if self.index_capture is not None:
+        if self.index_capture is not None and layer_idx in self.index_capture_layers:
             # Warm-up teacher inputs on the non-CP dense path: H is the layer
             # input the indexer-Q projects from; q,k feed the dense-mass teacher.
+            # Only the index SOURCE layers are retained (all 16 full-attn layers'
+            # activations at 32k would not coexist).
             self.index_capture.append((layer_idx, h.detach(), q.detach(), k.detach()))
         if getattr(kv, "dense", False):
             cp = getattr(backend, "cp_world", 1)

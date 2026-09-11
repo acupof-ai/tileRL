@@ -48,6 +48,28 @@ def wikitext_ids(tok, n: int, ctx: int, skip: int = 512) -> list[list[int]]:
     return spans(tok.encode(text), n, ctx, skip)
 
 
+def long_doc_spans(ids: list[int], contexts: list[int], skip: int = 512,
+                   gap: int = 0) -> dict[int, list[list[int]]]:
+    """Cut one token stream into disjoint spans of each length in ``contexts``,
+    starting at ``skip``. Returns ``{ctx: [spans]}``; spans of DIFFERENT lengths
+    are disjoint (each length takes its own region of the stream), so a held-out
+    stream never shares a token with a training span. ``gap`` inserts unused
+    tokens between same-length spans (0: contiguous).
+
+    The pod corpora (wiki/cosmo) contain almost no single 8k-32k documents
+    (wiki p99 ~9.4k), so the stream is the concatenation of consecutive docs —
+    the same fixed-span construction as :func:`spans`, only longer."""
+    out: dict[int, list[list[int]]] = {}
+    pos = skip
+    for ctx in contexts:
+        region: list[list[int]] = []
+        while pos + ctx <= len(ids):
+            region.append(ids[pos : pos + ctx])
+            pos += ctx + gap
+        out[ctx] = region
+    return out
+
+
 def _self_check() -> None:
     """`spans` must return disjoint, exactly-ctx slices past `skip`, or refuse.
 
@@ -66,6 +88,15 @@ def _self_check() -> None:
         pass
     else:
         raise AssertionError("spans must refuse rather than return a short prompt")
+    # long_doc_spans: each length takes a disjoint stream region; every span is
+    # exactly ctx, regions do not overlap, skip is honoured.
+    long_ids = list(range(10_000))
+    got = long_doc_spans(long_ids, [100, 200], skip=0)
+    assert sorted(got) == [100, 200]
+    assert all(len(s) == 100 for s in got[100])
+    assert all(len(s) == 200 for s in got[200])
+    flat = [t for s in got[100] + got[200] for t in s]
+    assert len(flat) == len(set(flat)), "different-length spans share tokens"
     print("corpus: spans OK")
 
 

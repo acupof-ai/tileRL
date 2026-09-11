@@ -20,6 +20,7 @@ from tilerl.sparse_index import (
     page_index_scores,
     page_mass_target,
     page_scores_for_selector,
+    project_indexer_queries,
     project_page_keys,
 )
 
@@ -271,3 +272,196 @@ def test_indexer_warmup_recipe_runs_one_step_on_tiny(tmp_path, monkeypatch, caps
     assert gate["name"] == "indexer_warmup_step_runs" and gate["passed"] is True
     import math
     assert math.isfinite(m["metrics"]["kl_first"])
+
+
+# ---------------- science metric: top-k recall of dense page mass ----------------
+
+def test_topk_recall_is_one_when_k_covers_every_indexable_page():
+    from tilerl.sparse_index import topk_page_recall
+    iq, k_pages = _qk(PAGES)
+    n_pages = torch.full((R,), PAGES, dtype=torch.long)
+    ik = project_page_keys(k_pages, _proj())
+    scores = page_scores_for_selector(iq, ik, n_pages)
+    mass = torch.softmax(torch.randn(R, L_SRC, 3, PAGES * 16), -1)
+    target = page_mass_target(mass, n_pages)
+    # only 12-8 = 4 indexable pages here, so k=4 is dense selection
+    rec = topk_page_recall(scores, target, n_pages, k_pages=PAGES - WINDOW_PAGES)
+    assert torch.allclose(rec, torch.ones(()), atol=1e-6), rec
+
+
+def test_topk_recall_counts_mass_on_picked_pages_and_never_the_window():
+    from tilerl.sparse_index import topk_page_recall
+    # one source layer, one query; put a known score order on 4 indexable pages
+    n_pages = torch.full((R,), PAGES, dtype=torch.long)
+    scores = torch.full((R, 1, PAGES), float("-inf"))
+    # indexable pages 0..3: page 2 hottest, then 0, then 3, then 1
+    order = {2: 4.0, 0: 3.0, 3: 2.0, 1: 1.0}
+    for pg, v in order.items():
+        scores[:, :, pg] = v
+    target = torch.zeros(R, 1, 1, PAGES)
+    # teacher mass 0.6 on page 2, 0.4 on page 1
+    target[:, :, :, 2] = 0.6
+    target[:, :, :, 1] = 0.4
+    # k=1 picks only page 2 -> recall 0.6; k=3 picks {2,0,3} -> still 0.6;
+    # k=4 adds page 1 -> recall 1.0
+    r1 = topk_page_recall(scores, target, n_pages, k_pages=1).item()
+    r3 = topk_page_recall(scores, target, n_pages, k_pages=3).item()
+    r4 = topk_page_recall(scores, target, n_pages, k_pages=4).item()
+    assert abs(r1 - 0.6) < 1e-6 and abs(r3 - 0.6) < 1e-6 and abs(r4 - 1.0) < 1e-6
+    # window pages carry no teacher mass and are masked out of the pick itself,
+    # so even a corrupt selector that emits a finite, hotter window score cannot
+    # steal a slot: recall stays 0.6 (page 2), not 0.
+    corrupt = scores.clone()
+    corrupt[:, :, -1] = 100.0  # window page hotter than everything
+    rc = topk_page_recall(corrupt, target, n_pages, k_pages=1).item()
+    assert abs(rc - 0.6) < 1e-6, rc
+
+
+def test_topk_recall_partial_row_masks_its_tail():
+    from tilerl.sparse_index import topk_page_recall
+    iq, k_pages = _qk(PAGES)
+    n_pages = torch.tensor([PAGES - 2, PAGES])  # row 0 has 2 fewer pages
+    ik = project_page_keys(k_pages, _proj())
+    scores = page_scores_for_selector(iq, ik, n_pages)
+    mass = torch.softmax(torch.randn(R, L_SRC, 3, PAGES * 16), -1)
+    target = page_mass_target(mass, n_pages)
+    # finite recall in [0,1] for a ragged page count, no NaN from the tail
+    rec = topk_page_recall(scores, target, n_pages, k_pages=2)
+    assert 0.0 <= rec.item() <= 1.0 and torch.isfinite(rec)
+
+
+def test_streaming_long_sequence_teacher_matches_naive_dense_pooling():
+    """The O(T*block)-memory teacher for 8k-32k sequences must equal the naive
+    dense [t,t] mass pooled per key page, including a non-block-divisible
+    trailing partial page. Checked on a small GQA case."""
+    from tilerl.train import _dense_causal_mass, dense_causal_page_mass
+
+    torch.manual_seed(11)
+    b, t, hq, hkv, d, block = 1, 49, 4, 2, 8, 16   # 3 full pages + 1-key tail
+    q = torch.randn(b, t, hq, d)
+    k = torch.randn(b, t, hkv, d)
+
+    naive = _dense_causal_mass(q, k)                       # [b,t,t]
+    npages = (t + block - 1) // block                      # 4, not 3
+    # reference pooling over ALL t keys, last page padded with zeros
+    ref = torch.zeros(b, t, npages)
+    full = (t // block) * block
+    ref[:, :, : t // block] = naive[:, :, :full].reshape(b, t, t // block, block).sum(-1)
+    ref[:, :, t // block] = naive[:, :, full:].sum(-1)
+    got = dense_causal_page_mass(q, k, block)              # [b,t,npages]
+    assert got.shape == (b, t, npages)
+    # With the trailing page included the only gap is f32 accumulation order:
+    # maxdiff ~1e-7, so the tolerance is set off that closed gap (not 1e-2).
+    assert torch.isfinite(got).all()
+    assert torch.allclose(got, ref, atol=1e-5), (got - ref).abs().max()
+    l1 = got.sum(-1)
+    late = l1[0, block:]
+    assert torch.allclose(late, torch.ones_like(late), atol=1e-4)
+    # a divisible-T case still matches exactly and has no trailing empty page
+    got48 = dense_causal_page_mass(q[:, :48], k[:, :48], block)
+    assert got48.shape == (b, 48, 3)
+
+
+def test_indexer_recall_wires_to_the_trained_weights_on_tiny():
+    """The runtime recall wrapper must read the SAME iq/ik weights the warm-up
+    step updates: training on a frozen batch must not leave recall unchanged in
+    the improving direction (guards a detached/rebound weight, the id()-class
+    failure the tape docs warn about). Random tiny teacher is near-uniform, so
+    this asserts a strict rise, not the 27B 0.9 level."""
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl import config, model, train
+
+    be = get_backend()
+    m = model.build_random(config.tiny(), seed=0)
+    gen = torch.Generator().manual_seed(0)
+    hkv, dk, hid, di = m.cfg.num_kv_heads, m.cfg.head_dim, m.cfg.hidden_size, 16
+    w = {"iq": 0.1 * torch.randn(hkv, hid, di, generator=gen),
+         "ik": 0.1 * torch.randn(hkv, dk, di, generator=gen)}
+    ids = torch.randint(0, m.cfg.vocab_size, (1, 256), generator=gen)
+    before = train.indexer_recall(m, ids, be, w, k_pages_pick=2)
+    opt = train.AdamW(lr=0.02)
+    for _ in range(20):
+        train.indexer_warmup_step(m, ids, be, w, opt)
+    after = train.indexer_recall(m, ids, be, w, k_pages_pick=2)
+    assert after > before, f"recall did not improve with training: {before:.3f} -> {after:.3f}"
+    assert 0.0 <= before <= 1.0 and 0.0 <= after <= 1.0
+
+
+def test_warmup_capture_handles_a_non_block_divisible_sequence():
+    """A trailing partial key page must not be dropped (52's #512 change) nor
+    break the query/key axis alignment: the full warm-up path must run for T not
+    a multiple of the block, with ceil pages and teacher rows over the real T."""
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl import config, model, train
+
+    be = get_backend()
+    m = model.build_random(config.tiny(), seed=0)
+    gen = torch.Generator().manual_seed(0)
+    hkv, dk, hid, di = m.cfg.num_kv_heads, m.cfg.head_dim, m.cfg.hidden_size, 16
+    w = {"iq": 0.1 * torch.randn(hkv, hid, di, generator=gen),
+         "ik": 0.1 * torch.randn(hkv, dk, di, generator=gen)}
+    ids = torch.randint(0, m.cfg.vocab_size, (1, 249), generator=gen)  # 249 = 15*16+9
+    H, k_pages, target, n_pages = train.indexer_capture(m, ids, be, 16, WINDOW_PAGES)
+    assert int(n_pages[0]) == 16              # ceil(249/16)
+    assert H.shape[2] == 249                  # queries unpadded
+    assert target.shape[2] == 249
+    assert k_pages.shape == (1, 1, 16, hkv, dk)
+    assert torch.isfinite(target).all() and torch.isfinite(k_pages).all()
+    # recall and one training step run on the ragged tensors without an axis error
+    assert 0.0 <= train.indexer_recall(m, ids, be, w, 2) <= 1.0
+    loss = train.indexer_warmup_step(m, ids, be, w, train.AdamW(lr=0.02))
+    assert loss == loss  # not NaN
+
+
+def test_indexer_held_recall_from_a_prepared_dir(tmp_path):
+    """The cross-corpus control loader must read held-only spans from a prep dir
+    and return a finite recall per length under given weights."""
+    import json
+
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl import config, model, train
+
+    be = get_backend()
+    m = model.build_random(config.tiny(), seed=0)
+    gen = torch.Generator().manual_seed(0)
+    w = train.init_indexer_weights(m.cfg, gen, be.device, 16)
+    d = tmp_path / "corpus"
+    d.mkdir()
+    for split, n in (("held", 2), ("train", 3)):  # train spans must be ignored
+        with open(d / f"{split}_256.jsonl", "w") as fh:
+            for _ in range(n):
+                fh.write(json.dumps({"ctx": 256,
+                                     "ids": torch.randint(0, m.cfg.vocab_size, (256,)).tolist()}) + "\n")
+    rec = train.indexer_held_recall(m, be, d, w, k_pages_pick=2)
+    assert set(rec) == {"256"}
+    assert 0.0 <= rec["256"] <= 1.0 and rec["256"] == rec["256"]  # finite
+
+
+def test_indexer_projections_take_bf16_activations_with_f32_weights():
+    """GPU feeds bf16 frozen-base H/K but the indexer head is f32 (the smoke
+    failed 'expected BFloat16 but got Float' before the boundary cast). Both
+    projections and the full warm-up loss must accept the dtype mix on a
+    bf16-capable device (CPU torch supports bf16 compute)."""
+    torch.manual_seed(0)
+    r, l, pages, ih, m, da, dh, di, win = 1, 1, 6, 2, 2, 8, 16, 8, 1
+    hk = ih * m
+    h = torch.randn(r, l, 4, dh, dtype=torch.bfloat16)
+    k_pages = torch.randn(r, l, pages, hk, da, dtype=torch.bfloat16)
+    iq_w = 0.1 * torch.randn(ih, dh, di)
+    ik_w = 0.1 * torch.randn(ih, da, di)
+    iq = project_indexer_queries(h, iq_w)
+    ik = project_page_keys(k_pages, ik_w)
+    assert iq.dtype == torch.float32 and ik.dtype == torch.float32
+    n_pages = torch.full((r,), pages, dtype=torch.long)
+    mass = torch.softmax(torch.randn(r, l, 4, pages * 16), -1)
+    target = page_mass_target(mass, n_pages, n_win_pages=win)
+    loss = indexer_warmup_loss(h, k_pages, iq_w, ik_w, target, n_pages,
+                               n_win_pages=win)
+    assert loss.dtype == torch.float32 and torch.isfinite(loss)
+    diq, dik = indexer_warmup_bwd(None, iq_w, ik_w, h, k_pages, target, n_pages,
+                                 n_win_pages=win)
+    assert diq.dtype == torch.float32 and dik.dtype == torch.float32
+    assert torch.isfinite(diq).all() and torch.isfinite(dik).all()
