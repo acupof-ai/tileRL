@@ -123,6 +123,9 @@ _SM90_KERNELS = {  # WGMMA schedules; the backend pads M/N to 16 and K to 32
     # long context (>64K): 64 splits keep the per-block scan at <= 4K tokens
     "paged_attention_decode_64": lambda t: kernels_attn.make_paged_attention_decode(t, KVSPLIT=64),
     "paged_attention_combine_64": lambda t: kernels_attn.make_paged_attention_combine(t, KVSPLIT=64),
+    # sparse KV (Quest): bf16 bounds (sm90 IO is bf16); the score accumulates f32.
+    "page_bounds": lambda t: kernels.make_page_bounds(t, out_dtype="bfloat16"),
+    "page_bound_scores": kernels.make_page_bound_scores,
 }
 _register("bf16", "sm90", _SM90_KERNELS)
 _register("fp4", "sm90", _SM90_KERNELS)
