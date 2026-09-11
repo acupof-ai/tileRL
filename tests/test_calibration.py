@@ -584,3 +584,19 @@ def test_kernels_sparse_table_renders_derived_hbm_and_pcie_bounds(tmp_path, monk
     assert score_l.count("ms") == 1 and "pending" in score_l
     assert fetch_l.count("ms") == 2 and "pending" not in fetch_l
     assert "24,576" in fetch_l  # tiny: 12 hot pages x 2048 B bf16 block
+
+
+def test_pack_fp4_chunked_matches_whole_pack():
+    """Row-chunked packing (the 32 GB-safe fixture path) is byte/value-identical to
+    packing the whole weight at once — pack and renorm are per-row."""
+    import torch
+    from tilerl_kernels import reference
+
+    torch.manual_seed(0)
+    w = torch.randn(137, 64) * 0.3  # non-multiple of the 32-row chunk forces a tail
+    wq_w, sc_w = reference.pack_fp4(w)
+    sc_w, os_w = reference.renorm_fp4_scale(sc_w)
+    wq_c, sc_c, os_c = cal._pack_fp4_chunked(w, row_chunk=32)
+    assert torch.equal(wq_c, wq_w)
+    assert torch.equal(sc_c, sc_w)
+    assert torch.equal(os_c, os_w)
