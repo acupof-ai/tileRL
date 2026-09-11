@@ -33,7 +33,7 @@ Dense rows measured; sparse rows are blanks until the runs below return.
 | H20 | sparse k=128 (eager) | 131072 | **108.0** | 0.824 | **19.16** | 0.55 | 0 at finish |
 | V100 | dense f32 (eager) | 32768 | **594.6** | 18.15 | **8.28** | **4.04** | 0 |
 | V100 | sparse k=128 (eager) | 32768 | **341.3** | 10.42 | **1.252** | 1.16 | 0 at finish |
-| V100 | sparse k=128 | 131072 | _pending_ (no dense pair — dense cannot fit) | | _pending_ | | 20.0 |
+| V100 | sparse k=128 (eager) | 131072 | **2271.1** | 17.33 | **0.556** | 1.16 | 0 at finish |
 
 Dense controls: H20 128k prefill 88.621 s / decode 58.279 tok/s (17.2 ms/tok) /
 KV 8612478976 B; V100 32k prefill 594.578 s / decode 8.278 tok/s
@@ -71,6 +71,16 @@ sparse row eager pending a graph-captured sparse decode. On prefill, dense
 bf16 WGMMA attention is cheap, so selection plus fetch overhead exceeds the
 attention it removes; sparse at 128k on an H20 buys capacity past the 8.6 GiB
 bf16 KV fit, not prefill latency, and at 128k it fits so dense is the choice.
+
+**V100 128k sparse (eager)** (head f0a45485, 256 prefill ticks): completes where
+dense cannot fit (dense 128k needs 17.2 GiB f32 KV against ~4.9 GiB free) — the
+capacity win is real. Prefill 2271.1 s = 17.33 ms/tok (37.9 min), close to the
+18.15 ms/tok dense pays at 32k: sparse holds the per-token prefill roughly flat
+with context because it caps attended keys, while dense's attention grows
+quadratically. Decode 0.556 tok/s = 1797 ms/tok, worse than the 32k sparse's
+798 ms — under demote-all the per-token fetch set grows with selected pages
+across a deeper cold tier, so sparse decode on a slow interconnect degrades
+with context, the opposite of dense. This is the row the hot-pin PR must move.
 
 **Hot-pin 32k on H20** (head 5b8df74d, card 6, eager): cross-tick residency
 works — per steady decode tick **promotions = 0** (sum 0), demotions 0.1/tick,
