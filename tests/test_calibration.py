@@ -88,6 +88,7 @@ def test_latest_floor_keys_on_the_physical_uuid_when_uuid_rows_exist(tmp_path):
     p2.write_text("".join(json.dumps(r) + "\n" for r in (ra, rb, bw)))
     got = cal.calibration(cal.load_rows(p2), H20, ua)
     assert got == {"bw_gbs": 3312.0, "peak_tflops": 136.5,
+                   "peak_metric": cal.PEAK_METRIC,
                    "fp8_peak_tflops": None, "pcie_gbs": None}
 
 def test_newest_row_wins_and_superseded_skipped(tmp_path):
@@ -132,7 +133,19 @@ def test_calibration_returns_both_floors(tmp_path):
     got = cal.calibration(cal.load_rows(p), H20)
     # bf16 pair present; fp8 peak and pcie absent -> None (both render pending)
     assert got == {"bw_gbs": 4000.0, "peak_tflops": 989.0,
+                   "peak_metric": cal.PEAK_METRIC,
                    "fp8_peak_tflops": None, "pcie_gbs": None}
+
+
+def test_calibration_falls_back_to_f16_peak_on_sm70(tmp_path):
+    """A pre-Ampere card has an f16 peak row but no bf16 row: calibration falls
+    back to it and names it in peak_metric."""
+    V100 = "Tesla V100-SXM2-32GB"
+    p = _store(tmp_path, [_row(cal.BW_METRIC, 778.0, "GB/s", V100),
+                          _row(cal.F16_PEAK_METRIC, 88.8, "TFLOP/s", V100)])
+    assert cal.calibration(cal.load_rows(p), V100) == {
+        "bw_gbs": 778.0, "peak_tflops": 88.8, "peak_metric": cal.F16_PEAK_METRIC,
+        "fp8_peak_tflops": None, "pcie_gbs": None}
 
 
 def test_calibration_returns_fp8_peak_when_present(tmp_path):
@@ -140,7 +153,7 @@ def test_calibration_returns_fp8_peak_when_present(tmp_path):
                           _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20),
                           _row(cal.FP8_PEAK_METRIC, 1970.0, "TFLOP/s", H20)])
     assert cal.calibration(cal.load_rows(p), H20) == {
-        "bw_gbs": 4000.0, "peak_tflops": 989.0,
+        "bw_gbs": 4000.0, "peak_tflops": 989.0, "peak_metric": cal.PEAK_METRIC,
         "fp8_peak_tflops": 1970.0, "pcie_gbs": None}
 
 
@@ -155,18 +168,15 @@ def test_row_peak_keys_by_face(tmp_path):
     def row(face, name="q_proj"):
         return {"name": name, "face": face}
 
-    # fp8 weights: prefill M>=9 on fp8 peak, decode M<=8 on bf16
     assert cal.row_peak_tflops(bf, row(P.fp8_dev), 1, 4096) == 200.0
     assert cal.row_peak_tflops(bf, row(P.fp8_block_dev), 1, 4096) == 200.0
     assert cal.row_peak_tflops(bf, row(P.fp8_dev), 1, 1) == 100.0
     assert cal.row_peak_tflops(bf, row(P.fp8_dev), 8, 1) == 100.0
-    # nvfp4 weights: w4a8 prefill on fp8 peak (the 133.8% class), decode on bf16
     assert cal.row_peak_tflops(bf, row(P.nvfp4_dev), 1, 4096) == 200.0
     assert cal.row_peak_tflops(bf, row(P.nvfp4_dev_b32), 1, 4096) == 200.0
     assert cal.row_peak_tflops(bf, row(P.nvfp4_dev), 1, 1) == 100.0
-    # lm_head prices one vector per row: b=1 decode is M=1 -> bf16 even under prefill b,s
+    # lm_head prices one vector per row: b=1 decode is M=1 -> bf16
     assert cal.row_peak_tflops(bf, row(P.fp8_dev, "lm_head"), 1, 4096) == 100.0
-    # bf16 face never resolves a quant kernel
     assert cal.row_peak_tflops(bf, row(P.bf16), 1, 4096) == 100.0
     missing = {"bw_gbs": 4000.0, "peak_tflops": 100.0, "fp8_peak_tflops": None}
     assert cal.row_peak_tflops(missing, row(P.fp8_dev), 1, 4096) is None
@@ -178,7 +188,7 @@ def test_calibration_returns_pcie_when_present(tmp_path):
                           _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20),
                           _row(cal.PCIE_METRIC, 50.0, "GB/s", H20)])
     assert cal.calibration(cal.load_rows(p), H20) == {
-        "bw_gbs": 4000.0, "peak_tflops": 989.0,
+        "bw_gbs": 4000.0, "peak_tflops": 989.0, "peak_metric": cal.PEAK_METRIC,
         "fp8_peak_tflops": None, "pcie_gbs": 50.0}
 
 
@@ -494,12 +504,35 @@ def test_device_section_picks_newest_pair_and_residency_per_device(tmp_path):
     assert v100["hbm_bw_gbs"]["value"] == 900.0
     assert v100["residency"] is None
     # JSON shape the CLI pins.
-    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "fp8_peak_tflops",
-                        "pcie_h2d_gbs", "residency"}
+    assert set(h20) == {"device", "hbm_bw_gbs", "bf16_peak_tflops", "f16_peak_tflops",
+                        "fp8_peak_tflops", "pcie_h2d_gbs", "residency"}
     assert h20["fp8_peak_tflops"] is None  # no fp8 row recorded in this fixture
     assert h20["pcie_h2d_gbs"] is None
+    assert h20["f16_peak_tflops"] is None  # this fixture's rows use the bf16 metric
     assert set(h20["hbm_bw_gbs"]) == {"value", "commit", "date"}
     assert set(h20["residency"]) == {"peak", "static", "transient", "commit", "date"}
+
+
+def test_calibration_uses_f16_peak_for_a_bf16_less_card(tmp_path):
+    """A device with an f16 peak but no bf16 peak (sm70 V100) still resolves a roofline
+    floor, through the f16 metric; bf16-present devices keep bf16 and ignore f16."""
+    rows = [
+        _cal_row("v-bw", cal.BW_METRIC, 900.0, V100, 0, "2026-09-11T00:00Z"),
+        _cal_row("v-f16", cal.F16_PEAK_METRIC, 125.0, V100, 0, "2026-09-11T00:00Z"),
+        _cal_row("h-bw", cal.BW_METRIC, 3292.0, H20, 0, "2026-09-11T00:00Z"),
+        _cal_row("h-bf", cal.PEAK_METRIC, 137.0, H20, 0, "2026-09-11T00:00Z"),
+        _cal_row("h-f16", cal.F16_PEAK_METRIC, 140.0, H20, 0, "2026-09-11T01:00Z"),
+    ]
+    p = _store(tmp_path, rows)
+    loaded = cal.load_rows(p)
+    v = cal.calibration(loaded, V100)
+    h = cal.calibration(loaded, H20)
+    assert v == {"bw_gbs": 900.0, "peak_tflops": 125.0, "peak_metric": cal.F16_PEAK_METRIC,
+                 "fp8_peak_tflops": None, "pcie_gbs": None}
+    assert h["bw_gbs"] == 3292.0 and h["peak_tflops"] == 137.0
+    assert h["peak_metric"] == cal.PEAK_METRIC  # bf16 wins where present
+    by = {s["device"]: s for s in cal.device_sections(loaded)}
+    assert by[V100]["bf16_peak_tflops"] is None and by[V100]["f16_peak_tflops"]["value"] == 125.0
 
 
 def test_device_sections_empty_store_is_all_pending(tmp_path):
@@ -514,7 +547,7 @@ def test_calibration_pcie_floor_is_optional_and_named(tmp_path):
                           _row(cal.PEAK_METRIC, 989.0, "TFLOP/s", H20),
                           _row(cal.PCIE_METRIC, 24.0, "GB/s", H20)])
     assert cal.calibration(cal.load_rows(p), H20) == {
-        "bw_gbs": 4000.0, "peak_tflops": 989.0,
+        "bw_gbs": 4000.0, "peak_tflops": 989.0, "peak_metric": cal.PEAK_METRIC,
         "fp8_peak_tflops": None, "pcie_gbs": 24.0}
     # wrong device name does not pick up the pcie floor either
     assert cal.calibration(cal.load_rows(p), V100) is None
