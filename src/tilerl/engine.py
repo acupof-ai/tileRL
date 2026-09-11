@@ -386,6 +386,8 @@ class Engine:
         draft: Any = None,
         spec_depth: int | None = None,
         decode: Any = None,
+        sparse_tracker: Any = None,
+        sparse_k: int = 0,
     ) -> None:
         self._model = model
         self._backend = backend
@@ -396,6 +398,8 @@ class Engine:
         self._decode = decode
         self._kv = kv_pool
         self._states = state_pool
+        self._sparse = sparse_tracker
+        self._sparse_k = sparse_k
         self._prefix = prefix_store
         self.limits = limits
 
@@ -785,11 +789,16 @@ class Engine:
         # decrement refcounts the PrefixStore still holds.
         slot = self._states.alloc_slot()
         blocks: list[int] = []
+        sparse = self._sparse is not None
+        # Sparse: blocks grow lazily per own span, never pre-allocate the whole context;
+        # the prefix-block reuse is likewise skipped on the first cut (cold pages live in
+        # this request's own host tier, not in the shared store).
+        alloc_blocks = 0 if sparse else total_blocks
         try:
             for b in hit_blocks:
                 self._kv.retain(b)  # adopt the store's blocks
                 blocks.append(b)
-            while len(blocks) < total_blocks:
+            while len(blocks) < alloc_blocks:
                 blocks.append(self._kv.alloc_block())
         except Exception:
             for b in blocks:
@@ -800,10 +809,12 @@ class Engine:
         req.state_slot = slot
         req.seq_len = matched  # materialized length (adopted prefix; 0 on a miss)
         req.prefill_from = matched
-        req.own_blocks = total_blocks - matched // BLOCK_TOKENS
+        req.own_blocks = (alloc_blocks - matched // BLOCK_TOKENS) if not sparse else 0
         self._blocks_used += req.own_blocks
         self._slots_used += 1
-        if matched:
+        if sparse:
+            self._sparse.attach(req.req_id)
+        if matched and not sparse:
             snap_states, snap_windows = snap
             self._states.states[slot].copy_(snap_states)
             if snap_windows is not None:
@@ -1000,6 +1011,20 @@ class Engine:
                 (sp.states, sp.conv_windows, sp.step_states, sp.step_windows, sp.win_parity)
                 if t is not None),
         }
+        if self._sparse is not None:
+            # Sparse: held owners are the bounds tensors, the currently-resident hot
+            # pages, and the host cold tier. Between ticks every private page is demoted,
+            # so kv_hot counts live blocks during a tick (0 right after finalize).
+            from .memory import per_kv_block_bytes
+
+            block_n = per_kv_block_bytes(self._model.cfg, kv.dtype, kv.kv_fp8)
+            hot = sum(len(self._sparse.resident.get(r.req_id, ()))
+                      for r in self._running) * block_n
+            measured.pop("kv_pool")
+            measured["page_bounds"] = self._sparse.bounds_bytes()
+            measured["kv_hot"] = hot
+            if getattr(kv, "cold", None) is not None and kv.cold.bytes_held:
+                measured["kv_cold"] = kv.cold.bytes_held
         if draft is not None:
             measured["draft_pool"] = pool(draft)
         return measured
@@ -1024,19 +1049,45 @@ class Engine:
         draft_pool = getattr(self._draft, "kv", None)
         draft_layers = 0 if draft_pool is None else self._draft.cfg.num_layers
         # device_free=0: budget rows are the dry-run path's business; the fit is done here.
-        derived = plan(self._model.cfg, self._model.params, 0, num_slots=sp.num_slots,
-                       num_blocks=kv.num_blocks, spec_steps=0,
-                       state_dtype=sp.states.dtype, kv_io=kv.dtype, kv_fp8=kv.kv_fp8,
-                       draft_layers=draft_layers)
+        if self._sparse is None:
+            derived = plan(self._model.cfg, self._model.params, 0, num_slots=sp.num_slots,
+                           num_blocks=kv.num_blocks, spec_steps=0,
+                           state_dtype=sp.states.dtype, kv_io=kv.dtype, kv_fp8=kv.kv_fp8,
+                           draft_layers=draft_layers)
+        else:
+            # Live sparse ledger from ACTUAL per-row state (post-tick every private page is
+            # demoted, so kv_hot counts the blocks currently in r.blocks): bounds are count-
+            # derived per complete page, hot per resident block, cold from the host tier.
+            from .memory import Row, page_bounds_bytes, per_kv_block_bytes
+
+            derived = plan(self._model.cfg, self._model.params, 0, num_slots=sp.num_slots,
+                           num_blocks=kv.num_blocks, spec_steps=0,
+                           state_dtype=sp.states.dtype, kv_io=kv.dtype, kv_fp8=kv.kv_fp8,
+                           draft_layers=draft_layers, sparse=None)
+            derived = [r for r in derived if r.owner != "kv_pool"]
+            cfg = self._model.cfg
+            block_n = per_kv_block_bytes(cfg, kv.dtype, kv.kv_fp8)
+            bounds_n = hot_n = cold_n = 0
+            pages_total = 0
+            for r in self._running:
+                complete = r.seq_len // BLOCK_TOKENS
+                pages_total += complete
+                hot_n += len(r.blocks) * block_n
+            bounds_n = page_bounds_bytes(cfg, pages_total)
+            cold_n = getattr(kv, "cold", None).bytes_held if getattr(kv, "cold", None) else 0
+            derived.append(Row("device", "page_bounds", bounds_n,
+                               f"{pages_total} complete pages, bounds scorer"))
+            derived.append(Row("device", "kv_hot", hot_n, "resident private blocks this tick"))
+            if cold_n:
+                derived.append(Row("host", "kv_cold", cold_n, "demoted pages on the host"))
         rows = memory_table(derived, self._held_storage(), self._measured_peak_bytes())
-        # The sparse-KV cold tier lives in pinned host RAM and is not part of plan()
-        # (Unit A derives the budgeted --sparse-k row; this is what is HELD now).
-        # Emitted only while pages are demoted, so a dense engine shows no host row.
-        # Derived from the priced cold format (per_cold_kv_block_bytes x pages), not
-        # from the tier's own byte counter: delta then catches a D2H copy that stored
-        # a different width than the plan priced (the f16 narrowing).
+        # Dense engine with a cold tier driven by the manual sparse_retier seam (#500):
+        # its host pages are not in plan(), so append the held allocation explicitly.
+        # (The sparse engine lists kv_cold in ``derived`` above.) Derived from the priced
+        # cold format (per_cold_kv_block_bytes x pages), so delta catches a D2H copy of a
+        # different width than the plan priced (the sm70 f16 narrowing).
         cold = getattr(kv, "cold", None)
-        if cold is not None and cold.bytes_held:
+        if self._sparse is None and cold is not None and cold.bytes_held:
             pages = cold.stats()["kv_cold_pages"]
             from .memory import per_cold_kv_block_bytes
 
@@ -1116,14 +1167,107 @@ class Engine:
             return 0, [], None
         return matched, list(hit.blocks[: matched // BLOCK_TOKENS]), hit.state
 
-    def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0) -> BatchKv:
-        # Table width = pool size: the kernels compile it in, so a per-tick width recompiles.
-        bt = torch.zeros(len(reqs), self._kv.num_blocks, dtype=torch.long, pin_memory=self._pin)
+    def _sparse_rows(self, rows: list[_Req], seq_q: list[int], decodes: list[_Req]):
+        """Build this tick's SparseForward: per-row own span (allocated/promoted),
+        earlier complete candidate pages, and a resolve closure that promotes a cold
+        selection. The model scores and installs page_sel mid-forward."""
+        from .sparse_engine import SparseForward
+        from .sparse_index import WINDOW_PAGES as _WP
+
+        tr = self._sparse
+        srows = []
+        for r, tq in zip(rows, seq_q):
+            decoding = r in decodes
+            q_hi = int(r.seq_len) if decoding else int(r.prefill_from + tq)
+            q_lo = q_hi - tq
+            if decoding:
+                # own span = the trailing 8-page window the new token writes into
+                own_first = max(0, (q_lo // BLOCK_TOKENS) - (_WP - 1))
+                own_last = (q_hi - 1) // BLOCK_TOKENS
+                force_window = 0                      # the window IS the own span
+            else:
+                own_first = q_lo // BLOCK_TOKENS
+                own_last = (q_hi - 1) // BLOCK_TOKENS
+                force_window = _WP                    # force the 8 pre-chunk pages
+            own = list(range(own_first, own_last + 1))
+            own_len = q_hi - own_first * BLOCK_TOKENS
+            cand = [p for p in range(0, own_first) if p in tr.bounds[r.req_id]]
+
+            def resolve(p, r=r):
+                return self._sparse_resolve(r, p)
+
+            for p in own:
+                resolve(p)
+            srows.append(dict(req_id=r.req_id, own=own, own_len=own_len,
+                              q_start=q_lo, q_hi=q_hi, decoding=decoding, tq=tq,
+                              cand=cand, force_window=force_window, resolve=resolve))
+        return SparseForward(tr, srows, self._backend.device)
+
+    def _sparse_resolve(self, r: _Req, page: int) -> int:
+        """Physical block for a resident-or-cold private logical page, allocating a
+        fresh block for a never-written-before own page or promoting the host blob."""
+        tr = self._sparse
+        live = tr.resident[r.req_id]
+        if page in live:
+            return live[page]
+        cold = dict(r.cold_pages)
+        if page in cold:
+            new = self._kv.promote_page(cold[page])
+            r.cold_pages = [(i, b) for (i, b) in r.cold_pages if i != page]
+        else:
+            new = self._kv.alloc_block()
+        live[page] = new
+        r.blocks.append(new)
+        return new
+
+    def _sparse_finalize(self, sf, rows: list[_Req]) -> None:
+        """After the forward: store Quest bounds of every now-complete page, then
+        demote ALL resident private pages to the host tier (the device pool holds a
+        page only during the tick that reads it; the cross-tick hot set is the later
+        perf PR). Bounds stay device-resident, so scoring never reads cold K.
+        # ponytail: every selected page re-fetches next tick (worst-case 69 MiB/tick
+        # in the design); pin the deltas when the card bench justifies it."""
+        tr = self._sparse
+        pool = self._kv
+        for bi, r in enumerate(rows):
+            rid = r.req_id
+            live = tr.resident[rid]
+            q_hi = sf.rows[bi]["q_hi"]
+            complete = q_hi // BLOCK_TOKENS
+            for p in range(len(tr.bounds[rid]), complete):
+                if p not in live:
+                    continue                       # selected candidate promoted with bounds
+                phys = live[p]
+                if pool.kv_fp8 is not None:
+                    raise NotImplementedError("sparse bounds over an fp8 pool: card PR")
+                b = torch.stack([
+                    torch.stack((
+                        pool.k_pool[plane, phys].amin(dim=1),
+                        pool.k_pool[plane, phys].amax(dim=1)), dim=1)
+                    for plane in range(pool.num_layers)]).to(torch.float16)
+                tr.set_bounds(rid, p, b)
+            for p, phys in list(live.items()):
+                n = pool.demote_page(phys)
+                r.cold_pages.append((p, phys))
+                r.blocks.remove(phys)
+            live.clear()
+            del n
+
+    def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0,
+                 sf=None) -> BatchKv:
+        sparse = sf is not None
+        if sparse:
+            bt = sf.own_table  # own-only table; width and page_base live on sf
+        else:
+            # Table width = pool size: the kernels compile it in, so a per-tick width recompiles.
+            bt = torch.zeros(len(reqs), self._kv.num_blocks, dtype=torch.long,
+                             pin_memory=self._pin)
         sl = torch.empty(len(reqs), dtype=torch.long, pin_memory=self._pin)
         ss = torch.empty(len(reqs), dtype=torch.long, pin_memory=self._pin)
         sql = torch.empty(len(reqs), dtype=torch.long, pin_memory=self._pin)
         for i, r in enumerate(reqs):
-            bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
+            if not sparse:
+                bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
             # Length after this forward; a decode row's chain starts at seq_len-1.
             sl[i] = (
                 r.prefill_from + seq_q[i]
@@ -1147,6 +1291,8 @@ class Engine:
             state_pool=self._states,
             seq_q_lens=sql,
             keep_steps=keep_steps,
+            page_base=None if not sparse else sf.page_base,
+            sparse=sf,
         )
 
     def _run_forward(self, decodes: list[_Req], prefills: list[_Req], chunks: list[int]) -> None:
@@ -1181,6 +1327,8 @@ class Engine:
             self._prefix.evict_until_free(growth)
         dead: set[int] = set()
         for i, (r, q) in enumerate(zip(decodes, q_dec)):
+            if self._sparse is not None:
+                continue  # sparse grows its own pages lazily in _sparse_rows
             # Cover the chain's last position. By count, not by catching alloc_block's
             # raise: `_admit` does the same for the same reason -- its comment says an
             # exception out of here reaches step()'s handler and fails EVERY running
@@ -1215,6 +1363,11 @@ class Engine:
             return
         rows = decodes + prefills
         seq_q = q_dec + chunks
+        sparse = self._sparse is not None and rows
+        if sparse:
+            # Sparse grows blocks lazily inside selection, so skip the dense pre-allocation
+            # of the chain's tail (pages are promoted/allocated by _sparse_rows).
+            sf = self._sparse_rows(rows, seq_q, decodes)
         # Bucket a prefill width: kernels specialize per shape (MMLU compiled
         # 662 variants). A verify width is exact, at most 1+depth.
         chunk = max(chunks, default=0)
@@ -1233,10 +1386,13 @@ class Engine:
         hid: list | None = [] if self._draft else None
         t_fwd = time.perf_counter()
         logits = self._model.forward(
-            input_ids, positions, self._make_kv(rows, seq_q, width if chains else 0),
+            input_ids, positions, self._make_kv(rows, seq_q, width if chains else 0,
+                                               sf if sparse else None),
             self._backend, hidden_out=hid, aux_layers=self._aux_layers,
             last_only=False if chains else seq_q,  # a verify tick needs every chain position
         )
+        if sparse:
+            self._sparse_finalize(sf, rows)
         if hid is not None:
             n_aux = len(self._aux_layers)
             for i, r in enumerate(rows):  # hidden_out is full width, appended before last_only
@@ -1641,6 +1797,14 @@ class Engine:
         req.phase = _PHASE_DONE
         if req.state_slot is None:
             return  # never admitted; blocks and slot are taken together in `_admit`
+        if self._sparse is not None:
+            # Sparse: also drop this request's host-held cold pages (their old device ids
+            # are tier keys, never in req.blocks) and its bounds store.
+            cold = self._kv.cold
+            for _idx, b in req.cold_pages:
+                if cold is not None and b in cold:
+                    cold.forget(b)
+            self._sparse.drop(req.req_id)
         for b in req.blocks:
             self._kv.free_block(b)
         self._blocks_used -= req.own_blocks
@@ -1907,6 +2071,12 @@ def build_engine(
     #: reduce (docs/design-fp8-kv.md). Off because the attention kernels still read a
     #: dequantized plane, so this is capacity, not yet bandwidth.
     kv_fp8: torch.dtype | None = None,
+    #: sparse-KV selection. sparse_k>0 builds the sparse engine: the device pool holds
+    #: only each row's (sparse_k + 8-window) hot pages plus chunk headroom; cold pages
+    #: demote to the pinned host tier and promote on selection. scorer "bounds" is the
+    #: training-free Quest path (Unit F); "index" is a later PR. Requires kv_cold_bytes.
+    sparse_k: int = 0,
+    scorer: str = "bounds",
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
@@ -1918,6 +2088,22 @@ def build_engine(
     if backend.device.type == "cuda":
         card_guard()
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
+    from .sparse_engine import SparseTracker
+    from .sparse_index import WINDOW_PAGES
+
+    sparse_tracker: SparseTracker | None = None
+    if sparse_k:
+        if scorer != "bounds":
+            raise NotImplementedError(
+                f'sparse engine scorer {scorer!r}: Unit F wires only "bounds"')
+        if not kv_cold_bytes:
+            raise ValueError("sparse_k needs kv_cold_bytes: dropped pages demote to the host tier")
+        if draft is not None:
+            raise NotImplementedError("sparse_k + spec draft: the draft pool is dense; later PR")
+        # First cut: selection buffers change width per tick and promote through host
+        # memory; a captured decode graph cannot hold that. Eager only until cc's cells.
+        decode_graph = False
+        sparse_tracker = SparseTracker(cfg, sparse_k, scorer)
     if draft is not None:
         draft.set_depth(spec_depth)  # the state pool is sized by the width it settles on
     model.params = backend.materialize(model.params)
@@ -1977,7 +2163,14 @@ def build_engine(
                 "returns, which is a dequantized copy under fp8, so every K/V write would be "
                 "silently lost, and this cell registers no fp8 twin (docs/design-fp8-kv.md)."
             )
-    if not num_blocks:
+    if sparse_k:
+        # The device pool IS the per-slot hot set (k_pages selection + 8-page window) plus
+        # one prefill chunk's OWN pages resident until that chunk ends; beyond it pages
+        # demote to the host. max_num_batched_tokens/16 is the chunk ceiling; +1 a partial.
+        chunk_pages = max_num_batched_tokens // BLOCK_TOKENS + 1
+        per_row = sparse_k + WINDOW_PAGES + chunk_pages
+        num_blocks = num_slots * per_row + 1
+    elif not num_blocks:
         num_blocks = _fit_blocks(cfg, backend, kv_io, max_blocks,
                                  draft_layers=0 if draft is None else draft.cfg.num_layers,
                                  kv_fp8=kv_fp8)
@@ -2048,4 +2241,6 @@ def build_engine(
         draft=draft,
         spec_depth=spec_depth,
         decode=decode,
+        sparse_tracker=sparse_tracker,
+        sparse_k=sparse_k,
     )

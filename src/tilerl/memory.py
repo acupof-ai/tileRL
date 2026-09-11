@@ -94,13 +94,15 @@ def page_bounds_bytes(cfg, pages: int) -> int:
 
 
 def sparse_rows(cfg, *, num_rows: int, context_tokens: int, k_pages: int,
-                scorer: str, kv_io, kv_fp8=None) -> list[Row]:
+                scorer: str, kv_io, kv_fp8=None, hot_extra_pages: int = 0) -> list[Row]:
     """The three sparse-KV owners (design-sparse-kv.md "Cost model rows"):
 
     - ``index_keys`` (learned scorer) or ``page_bounds`` (Quest scorer) on device;
     - ``kv_hot``: each row pins (k_pages + 8-window) pages; a source group reuses one
       selection for its full-attn layers, and every group covers the layer set, so the
-      per-row hot bytes are hot_pages x one whole KV block;
+      per-row hot bytes are hot_pages x one whole KV block. ``hot_extra_pages`` is the
+      live engine's prefill headroom: the chunk's OWN pages are resident alongside the
+      selected set until the chunk ends (dry-run passes 0);
     - ``kv_cold`` on host: every written page the hot set does not pin.
     """
     from .sparse_index import WINDOW_PAGES
@@ -108,8 +110,8 @@ def sparse_rows(cfg, *, num_rows: int, context_tokens: int, k_pages: int,
     if scorer not in ("index", "bounds"):
         raise ValueError(f"unknown sparse scorer {scorer!r}; want index|bounds")
     written = sparse_pages(context_tokens)
-    hot_pages = min(k_pages + WINDOW_PAGES, written)
-    cold_pages = written - hot_pages
+    hot_pages = min(k_pages + WINDOW_PAGES + hot_extra_pages, written)
+    cold_pages = written - min(k_pages + WINDOW_PAGES, written)
     block = per_kv_block_bytes(cfg, kv_io, kv_fp8)
     scorer_n = index_keys_bytes(cfg, written) if scorer == "index" \
         else page_bounds_bytes(cfg, written)
