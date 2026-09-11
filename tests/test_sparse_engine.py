@@ -194,6 +194,45 @@ def test_sparse_engine_runs_with_the_default_prefix_store():
     assert len(tok) == 4 and all(isinstance(t, int) for t in tok)
 
 
+def test_cold_tier_spills_past_the_host_budget_and_the_ledger_splits_tiers(tmp_path):
+    """A host budget that holds only one page pushes subsequent demotions to the
+    mmap spill; the live sparse ledger then carries BOTH a host kv_cold row and
+    an ssd kv_cold row, each derived == measured (per-cold-block price)."""
+    import os
+
+    from tilerl.kv_cache import BLOCK_TOKENS
+    from tilerl.memory import per_kv_block_bytes
+
+    cfg = tiny()
+    per = per_kv_block_bytes(cfg, __import__("torch").bfloat16)
+    ssd = str(tmp_path / "spill.bin")
+    e = build_engine(
+        cfg, build_random(cfg, seed=11), RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+        sparse_k=2, scorer="bounds",
+        kv_cold_bytes=per,                 # one page of pinned host RAM
+        cold_ssd_path=ssd)
+    # 5 whole pages: after the first tick the host holds <=1 page, the rest spill
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=6, seed=0))
+    for _ in range(64):                       # into decode, before the request finishes
+        r0 = next((x for x in e._running if x.req_id == rid), None)
+        e.step()
+        if r0 is not None and r0.phase == 2:
+            break
+    st = e._kv.cold.stats()
+    assert st["kv_cold_ssd_pages"] >= 3, st  # most of the 6-page context is on SSD
+    assert os.path.getsize(ssd) > 0  # spill file holds the evicted pages
+    rows = {(r["owner"], r["tier"]): r for r in e.stats()["memory"]}
+    assert ("kv_cold", "host") in rows and ("kv_cold_ssd", "ssd") in rows, list(rows)
+    # sparse live ledger is derived from the tier byte counters (exact page price)
+    assert rows[("kv_cold", "host")]["derived"] == st["kv_cold_bytes"]
+    assert rows[("kv_cold_ssd", "ssd")]["derived"] == st["kv_cold_ssd_bytes"]
+    _drain(e, rid, 6)  # finish releases the request's cold pages (both tiers)
+    e.shutdown()
+
+
 if __name__ == "__main__":
     import sys
 
