@@ -55,6 +55,75 @@ def per_kv_block_bytes(cfg, kv_io, kv_fp8=None) -> int:
     return nbytes(kv_fmt, (planes, cfg.num_kv_heads, BLOCK_TOKENS, cfg.head_dim))
 
 
+# --- sparse KV (docs/design-sparse-kv.md) -----------------------------------
+def sparse_source_count(cfg) -> int:
+    """Index SOURCE layers: one per group of four full-attn layers, selection reused
+    by the group. The tiny model has one full-attn layer, hence one source."""
+    n_full = len(cfg.full_attn_layers)
+    return n_full if n_full < 4 else n_full // 4
+
+
+def sparse_pages(context_tokens: int) -> int:
+    """Whole 16-token pages a context occupies (window subtraction assumes full pages)."""
+    return -(-int(context_tokens) // BLOCK_TOKENS)
+
+
+def _index_key_format() -> Format:
+    """One projected page key per index head: 128 fp8 elements + one f32 per-128
+    scale (nbytes 132). The 128 is sparse_index.INDEX_HEAD_DIM."""
+    from .sparse_index import INDEX_HEAD_DIM
+
+    return Format(bits=8, scales=((INDEX_HEAD_DIM, "f32"),))
+
+
+def index_keys_bytes(cfg, pages: int) -> int:
+    """Learned-indexer keys resident on device: pages x source layers x index heads,
+    one [di=128] fp8 key (132 B) each. 27B: pages x 4 x 4 x 132 = 2,112 B/page
+    = 132 B/token, 33.0 MiB at 256k."""
+    from .sparse_index import INDEX_HEAD_DIM, INDEX_HEADS
+
+    per = nbytes(_index_key_format(), (INDEX_HEAD_DIM,))
+    return pages * sparse_source_count(cfg) * INDEX_HEADS * per
+
+
+def page_bounds_bytes(cfg, pages: int) -> int:
+    """Training-free Quest bounds resident on device: per page, per full-attn layer,
+    per KV head, a (kmin,kmax) pair over head_dim in fp16. 27B: 64 KiB/page =
+    4 KiB/token."""
+    return pages * 2 * len(cfg.full_attn_layers) * cfg.num_kv_heads * cfg.head_dim * 2
+
+
+def sparse_rows(cfg, *, num_rows: int, context_tokens: int, k_pages: int,
+                scorer: str, kv_io, kv_fp8=None) -> list[Row]:
+    """The three sparse-KV owners (design-sparse-kv.md "Cost model rows"):
+
+    - ``index_keys`` (learned scorer) or ``page_bounds`` (Quest scorer) on device;
+    - ``kv_hot``: each row pins (k_pages + 8-window) pages; a source group reuses one
+      selection for its full-attn layers, and every group covers the layer set, so the
+      per-row hot bytes are hot_pages x one whole KV block;
+    - ``kv_cold`` on host: every written page the hot set does not pin.
+    """
+    from .sparse_index import WINDOW_PAGES
+
+    if scorer not in ("index", "bounds"):
+        raise ValueError(f"unknown sparse scorer {scorer!r}; want index|bounds")
+    written = sparse_pages(context_tokens)
+    hot_pages = min(k_pages + WINDOW_PAGES, written)
+    cold_pages = written - hot_pages
+    block = per_kv_block_bytes(cfg, kv_io, kv_fp8)
+    scorer_n = index_keys_bytes(cfg, written) if scorer == "index" \
+        else page_bounds_bytes(cfg, written)
+    return [
+        Row("device", "index_keys" if scorer == "index" else "page_bounds", scorer_n,
+            f"{written} written pages, {scorer} scorer, {k_pages} hot + {WINDOW_PAGES} window"),
+        Row("device", "kv_hot", num_rows * hot_pages * block,
+            f"{num_rows} rows x {hot_pages} hot pages x a full KV block"),
+        Row("host", "kv_cold", num_rows * cold_pages * block,
+            f"{num_rows} rows x {cold_pages} cold pages"),
+    ]
+
+
+
 def draft_per_block_bytes(cfg, kv_io, draft_layers: int) -> int:
     """The draft's per-block K+V pool: plain IO dtype, no fp8 scale plane (DraftHead.attach
     builds PagedKvPool without kv_fp8), one pair per draft layer."""
@@ -261,12 +330,15 @@ def train_plan(cfg, b: int, s: int, *, lora_rank: int | None = None,
 def plan(cfg, params: dict | None, device_free: int, *, num_slots: int, num_blocks: int,
          spec_steps: int = 0, state_dtype=f32, kv_io=bf16, kv_fp8=None,
          explicit_state_budget: int = 0, dram_budget: int = 0,
-         draft_layers: int = 0, ckpt_faces=None) -> list[Row]:
+         draft_layers: int = 0, ckpt_faces=None,
+         sparse: dict | None = None) -> list[Row]:
     """The device rows the engine holds plus the budget rules. ``num_blocks`` is what
     build_engine built (fitted via fit_num_blocks or explicit). Weights come from the
     materialized ``params`` or, for a header-only ``--dry-run --checkpoint`` query, from
     ``ckpt_faces`` (model.checkpoint_weight_faces); both None leaves them pending.
-    ``draft_layers>0`` adds the draft pool row (its share of every KV block)."""
+    ``draft_layers>0`` adds the draft pool row (its share of every KV block).
+    ``sparse`` = {'num_rows','context','k_pages','scorer'} adds the three sparse-KV rows
+    and replaces the dense kv_pool as the held pool (kv_hot is the device subset)."""
     rows: list[Row] = []
     if ckpt_faces is not None:
         rows.append(weight_row_faces(ckpt_faces))
@@ -279,14 +351,22 @@ def plan(cfg, params: dict | None, device_free: int, *, num_slots: int, num_bloc
             _state_bytes(cfg, num_slots, _dtype_fmt(state_dtype), spec_steps),
         )
     )
-    rows.append(
-        Row(
-            "device",
-            "kv_pool",
-            per_kv_block_bytes(cfg, kv_io, kv_fp8) * num_blocks,
-            f"{num_blocks} blocks",
+    if sparse is not None:
+        # Sparse deployment: the device pool IS the pinned hot set (plus scorer keys);
+        # cold pages live on host. No dense kv_pool row to avoid counting hot twice.
+        rows.extend(sparse_rows(
+            cfg, num_rows=sparse["num_rows"], context_tokens=sparse["context"],
+            k_pages=sparse["k_pages"], scorer=sparse["scorer"],
+            kv_io=kv_io, kv_fp8=kv_fp8))
+    else:
+        rows.append(
+            Row(
+                "device",
+                "kv_pool",
+                per_kv_block_bytes(cfg, kv_io, kv_fp8) * num_blocks,
+                f"{num_blocks} blocks",
+            )
         )
-    )
     if draft_layers:
         rows.append(
             Row(
@@ -319,6 +399,7 @@ def plan(cfg, params: dict | None, device_free: int, *, num_slots: int, num_bloc
 #: they never appear in a serving :func:`plan`, so they cannot enter its peak residual.
 STATIC_OWNERS = (
     "weights", "state_slots", "kv_pool", "draft_pool",
+    "index_keys", "page_bounds", "kv_hot",
     "adapter", "optimizer_state", "frame", "tape",
 )
 
@@ -337,7 +418,8 @@ def transient_bytes(rows: list[Row], peak_bytes: int) -> int:
     """The resident bytes that are NOT one of the named static allocations — activation
     scratch, fragmented allocator blocks, captured-graph side buffers. The invariant the
     ledger prints is ``peak = sum(static) + transient``; transient is derived as the
-    residual, never allocated here."""
+    residual, never allocated here. STATIC_OWNERS is device-tier only; a host/ssd held
+    owner (HELD_HOST_OWNERS: kv_cold) is not on the card and does not subtract."""
     held = sum(r.n for r in static_rows(rows))
     t = int(peak_bytes) - held
     if t < 0:

@@ -413,3 +413,127 @@ if __name__ == "__main__":
               test_residency_row_roundtrips_through_benchrec):
         f(None) if f.__code__.co_argcount else f()
     print("memory ledger: single-formula fit/plan, fp8 scales, checkpoint weights, tiny OK")
+
+
+# ---------------- sparse KV unit A: plan rows == real tensor storage --------
+def test_sparse_rows_match_real_tensor_storage_on_27b():
+    """The sparse ledger's derived bytes equal the storage of the tensors the engine
+    will actually allocate, on the 27B V4.1 geometry (docs/design-sparse-kv.md):
+    index_keys = pages x 4 sources x 4 heads x 132 B; kv_hot = rows x 136 pages x one
+    full KV block; kv_cold = rows x remaining pages x one block. All fp8 KV."""
+    import torch
+
+    from tilerl.config import qwen38_27b
+    from tilerl.memory import (
+        index_keys_bytes,
+        per_kv_block_bytes,
+        sparse_pages,
+        sparse_rows,
+        sparse_source_count,
+    )
+
+    cfg = qwen38_27b()
+    rows_b, ctx, k_pages, scorer = 1, 262_144, 128, "index"
+    pages = sparse_pages(ctx)
+    assert pages == 16_384
+    assert sparse_source_count(cfg) == 4
+    block = per_kv_block_bytes(cfg, torch.bfloat16, torch.float8_e4m3fn)
+    assert block == 532_480  # 16 full-attn planes x 4 heads x 16 tok x 256 fp8+scales
+
+    # index_keys: the real tensor is [pages, sources, heads, di] fp8 with one f32
+    # scale per 128-key. 128 fp8 elems = 128 B payload + 4 B scale = 132 B.
+    from tilerl.sparse_index import INDEX_HEAD_DIM, INDEX_HEADS
+
+    di = INDEX_HEAD_DIM
+    payload = torch.empty(pages, 4, INDEX_HEADS, di, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(pages, 4, INDEX_HEADS, di // 128, dtype=torch.float32)
+    key_storage = payload.numel() + scales.numel() * 4
+    assert index_keys_bytes(cfg, pages) == key_storage == pages * 16 * 132
+    assert key_storage == 34_603_008  # 33.0 MiB reconciled
+
+    got = {r.owner: r for r in sparse_rows(
+        cfg, num_rows=rows_b, context_tokens=ctx, k_pages=k_pages,
+        scorer=scorer, kv_io=torch.bfloat16, kv_fp8=torch.float8_e4m3fn)}
+    assert set(got) == {"index_keys", "kv_hot", "kv_cold"}
+    # hot = (128 + 8 window) pages x one full block
+    assert got["kv_hot"].n == 136 * block == 72_417_280          # 69.06 MiB
+    # cold = the remaining written pages; hot + cold per row == the dense block total
+    cold_pages = pages - 136
+    assert got["kv_cold"].n == rows_b * cold_pages * block
+    assert (got["kv_hot"].n + got["kv_cold"].n) == rows_b * pages * block
+
+
+def test_sparse_bounds_scorer_uses_quest_bounds_bytes():
+    """--scorer bounds prices 2 x layers x heads x head_dim fp16 per page (64 KiB/page
+    on the 27B = 4 KiB/token), not the learned index keys."""
+    from tilerl.config import qwen38_27b
+    from tilerl.memory import page_bounds_bytes, sparse_pages, sparse_rows
+
+    cfg = qwen38_27b()
+    pages = sparse_pages(262_144)
+    assert page_bounds_bytes(cfg, pages) == pages * 2 * 16 * 4 * 256 * 2
+    got = {r.owner: r for r in sparse_rows(
+        cfg, num_rows=1, context_tokens=262_144, k_pages=128, scorer="bounds",
+        kv_io=__import__("torch").bfloat16)}
+    assert got["page_bounds"].n == page_bounds_bytes(cfg, pages)
+    assert "index_keys" not in got
+
+
+def test_sparse_dry_run_checkpoint_prints_three_rows(tmp_path, capsys):
+    """serve --dry-run --checkpoint --sparse-k K prints the sparse ledger from headers
+    on tiny: the scorer row, device hot set and host cold pages, with no dense kv_pool."""
+    import json
+
+    from tilerl import cli
+    from tilerl.config import tiny
+
+    cfg = tiny()
+    (tmp_path / "config.json").write_text(json.dumps({
+        "num_hidden_layers": cfg.num_layers, "hidden_size": cfg.hidden_size,
+        "num_attention_heads": cfg.num_attention_heads,
+        "num_key_value_heads": cfg.num_kv_heads, "head_dim": cfg.head_dim}))
+    import torch as _t
+    from safetensors.torch import save_file
+    save_file({"x": _t.empty(0)}, str(tmp_path / "model.safetensors"))
+    args = cli._build_parser().parse_args(
+        ["serve", "--model", "tiny", "--dry-run", "--checkpoint", str(tmp_path),
+         "--device-free", "1000000000", "--sparse-k", "4", "--scorer", "index",
+         "--json", "--max-ctx", "256", "--max-batch", "2"])
+    cli.cmd_serve(args)
+    rows = json.loads(capsys.readouterr().out)
+    owners = {r["owner"]: r for r in rows}
+    assert {"index_keys", "kv_hot", "kv_cold"} <= set(owners)
+    assert "kv_pool" not in owners
+    # 256 tokens = 16 pages; 4 indexed + 8 window = 12 hot; cold tier on host
+    assert owners["kv_hot"]["tier"] == "device" and owners["kv_cold"]["tier"] == "host"
+
+
+def test_sparse_kv_cold_excluded_from_device_peak_but_in_host_total():
+    """Invariant: transient = peak − Σ DEVICE-tier static rows. Host kv_cold is a held
+    allocation (kind=allocation, host_total) but must NOT subtract from the device peak;
+    the device scorer + kv_hot rows do. A device peak built as weights+state+hot+scratch
+    (excluding cold) reconciles exactly, and host_total carries cold alone.
+    Mutant reds: put kv_cold in STATIC_OWNERS, or sum static_rows unfiltered by tier."""
+    import torch
+
+    from tilerl.config import qwen38_27b
+    from tilerl.memory import memory_table, sparse_rows
+
+    cfg = qwen38_27b()
+    rows = sparse_rows(
+        cfg, num_rows=1, context_tokens=262_144, k_pages=128, scorer="index",
+        kv_io=torch.bfloat16, kv_fp8=torch.float8_e4m3fn)
+    device_static = sum(r.n for r in rows if r.tier == "device")
+    cold = sum(r.n for r in rows if r.owner == "kv_cold")
+    assert cold > 0
+    scratch = 5_000_000
+    peak = device_static + scratch  # the device holds NO cold pages
+    table = memory_table(rows, {}, peak)
+    by = {r["owner"]: r for r in table}
+    # transient is the device residual — cold did not shrink it
+    assert by["transient"]["derived"] == scratch
+    # kv_cold renders a held host allocation, not a budget row
+    assert by["kv_cold"]["kind"] == "allocation" and by["kv_cold"]["tier"] == "host"
+    assert by["host_total"]["derived"] == cold
+    # device total reconciles to the measured peak exactly (cold absent)
+    assert by["device_total"]["derived"] == peak

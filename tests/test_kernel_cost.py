@@ -483,3 +483,28 @@ def test_27b_served_weight_faces_equal_load_hf_resident_exact():
     for b in (1, 8):
         tick = TickShape(b=b, s=4096, kv=kv_format(cfg.head_dim), weight=nvfp4, faces=faces)
         print(f"B={b} {tick_totals(cfg, tick)}")
+
+
+def test_sparse_indexer_rows_match_design_account_on_27b():
+    """27B at 256k, B=1, k_pages=128 (docs/design-sparse-kv.md): scoring reads the
+    33 MiB index keys and does ~0.07 GFLOP over 4 source layers; the cold-page PCIe
+    fetch is the 69.1 MiB hot set counted once per source group."""
+    from tilerl.config import qwen38_27b
+    from tilerl.kernel_cost import sparse_indexer_rows
+    from tilerl.precision import kv_format
+
+    cfg = qwen38_27b()
+    import torch
+    t = TickShape(b=1, s=262_144, kv=kv_format(cfg.head_dim), weight=bf16)
+    rows = {r["name"]: r for r in sparse_indexer_rows(
+        cfg, t, k_pages=128, kv_fp8=torch.float8_e4m3fn)}
+    score, fetch = rows["sparse_indexer_score"], rows["sparse_cold_fetch"]
+    # one launch reads all 4 sources' keys; HBM read is the index_keys account (33 MiB)
+    assert score["count"] == 1
+    assert score["bytes"] == 34_603_008
+    # flops 2*pages*src*ih*di = 2*16384*4*4*128 ≈ 0.067 GFLOP
+    assert score["flops"] == 2 * 16_384 * 4 * 4 * 128 == 67_108_864
+    # cold fetch carries NO HBM bytes; the 136-page hot set rides pcie_bytes x 4 groups
+    assert fetch["bytes"] == 0 and fetch["flops"] == 0
+    assert fetch["count"] == 4
+    assert fetch["pcie_bytes"] * 4 == 136 * 532_480  # 72,417,280 B = 69.06 MiB

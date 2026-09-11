@@ -351,3 +351,43 @@ def tick_totals(cfg, t: TickShape) -> tuple[int, int]:
         sum(r["bytes"] * r["count"] for r in tick_rows(cfg, t)),
         sum(r["flops"] * r["count"] for r in tick_rows(cfg, t)),
     )
+
+
+# --- sparse KV selection kernel rows (docs/design-sparse-kv.md) --------------
+def sparse_indexer_rows(cfg, t: TickShape, *, k_pages: int, kv_fp8=None) -> list[dict]:
+    """The selection kernels one decode tick launches at the 4 source layers.
+
+    - ``sparse_indexer_score`` reads every resident page's index keys at the source
+      layers and scores them against the row's indexer-Q (HBM bytes; flops = one
+      q·k dot per page x source x index head over di).
+    - ``sparse_cold_fetch`` moves the hot pages the selector named that are off
+      device from host across PCIe. It is paid ONCE per source group (the selection
+      is reused by the group's layers): n_groups fetches each of one group's planes
+      sum to hot_pages x one whole KV block. Bytes ride a separate ``pcie_bytes``
+      field, never the HBM byte bound.
+    """
+    from .memory import (
+        index_keys_bytes,
+        per_kv_block_bytes,
+        sparse_pages,
+        sparse_source_count,
+    )
+    from .sparse_index import WINDOW_PAGES
+
+    pages = sparse_pages(t.s)
+    n_src = sparse_source_count(cfg)
+    n_full = len(cfg.full_attn_layers)
+    n_groups = n_full // n_src if n_full // n_src else 1
+    ih, di = 4, 128
+    # One scoring launch reads ALL source layers' keys and does every source's dots.
+    score_bytes = index_keys_bytes(cfg, pages) * t.b
+    flops = 2 * pages * n_src * ih * di * t.b
+    hot = min(k_pages + WINDOW_PAGES, pages)
+    block = per_kv_block_bytes(cfg, P.bf16, kv_fp8)
+    pcie = t.b * hot * block  # n_groups fetches of block/n_groups each
+    return [
+        dict(name="sparse_indexer_score", shape=f"pages{pages} src{n_src} ih{ih}x{di}",
+             count=1, bytes=score_bytes, flops=flops, face=None),
+        dict(name="sparse_cold_fetch", shape=f"{hot} hot pages, once per {n_groups}-layer group",
+             count=n_groups, bytes=0, flops=0, face=None, pcie_bytes=pcie // n_groups),
+    ]
