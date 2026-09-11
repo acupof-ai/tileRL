@@ -109,6 +109,16 @@ silently substituted.)
   BEFORE warm-up and AFTER, on held-out prompts, per span length; plus the KL
   curve and total tokens seen. Reported per length: the mean over spans AND the
   per-span min (manifest `recall_detail`); the verdict gate stays the mean.
-- **Accept: mean recall@128 after warm-up >= 0.9.** Below 0.9 is a science
-  result, written down with the token count — no tolerance change, no rerun with
-  a moved gate.
+  **Second amendment 2026-09-12 (a3):** the SAME capture forward also reports
+  the training-free Quest **bounds**-scorer recall (kmin/kmax fp16, the engine
+  face, same 256 positions, same `select_pages`): the default-rest baseline with
+  no warm-up. The learned-indexer before/after and bounds recall come from one
+  frozen forward per span; bounds recall is 1.0 at full k (CPU gate), matching
+  the engine's full-k == dense token equivalence. To end in one card evening the
+  registered run is cut to **100 steps over a balanced 16-span held subset**
+  (`--held-spans 16`, round-robin 6/5/5 across 16k/32k/8k), down from 300/56;
+  with n=256 query positions per span the mean's standard error is already under
+  0.02. Reported metrics: per-length mean, per-span min, and n/seed.
+- **Accept: mean learned-indexer recall@128 after warm-up >= 0.9.** Below 0.9 is
+  a science result, written down with the token count — no tolerance change, no
+  rerun with a moved gate. Bounds recall is a reported baseline, not the gate.
