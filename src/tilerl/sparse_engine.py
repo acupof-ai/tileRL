@@ -73,9 +73,17 @@ def quest_scores(q: Tensor, bounds: Tensor) -> Tensor:
 
 
 class SparseTracker:
-    """Engine-scoped bounds store: ``bounds[req_id][logical page]`` is an fp16
-    ``[n_full, Hkv, 2, D]`` tensor living independently of the KV pool, so it
-    survives a page's demotion to the host."""
+    """Engine-scoped bounds store, living independently of the KV pool so a
+    page's bounds survive its demotion to the host: one preallocated fp16
+    tensor per request, ``bounds_t[rid] = [cap, n_full, Hkv, 2, D]`` grown by
+    doubling, not one small tensor per page in a dict — at 128k a per-page
+    dict forced :meth:`SparseForward._select` to ``torch.stack`` ~8192 tensors
+    x4 planes every tick (host-bound). A logical page addresses its row
+    directly; ``bounds_valid`` marks written rows (a promoted candidate skips
+    its write on the tick it is promoted)."""
+
+    #: initial page-row capacity of a request's bounds tensor
+    INIT_CAP = 64
 
     def __init__(self, cfg, k_pages: int, scorer: str):
         if scorer != "bounds":
@@ -86,27 +94,72 @@ class SparseTracker:
         self.k_pages = k_pages
         self.scorer = scorer
         self.src_planes, self.group_of = group_map(cfg)
-        self.bounds: dict[int, dict[int, Tensor]] = {}
+        self.n_full = len(self.src_planes)
+        self.hkv = cfg.num_kv_heads
+        self.dim = cfg.head_dim
+        #: [cap, n_full, Hkv, 2, D] fp16 per request + per-row-valid mask/count
+        self.bounds_t: dict[int, Tensor] = {}
+        self.bounds_valid: dict[int, Tensor] = {}
+        self.bounds_count: dict[int, int] = {}
         #: resident private pages: req_id -> {logical page: physical block}
         self.resident: dict[int, dict[int, int]] = {}
         self.bytes_per_page = 0
 
+    @property
+    def _device(self):
+        return (next(iter(self.bounds_t.values())).device
+                if self.bounds_t else torch.device("cpu"))
+
     def attach(self, req_id: int) -> None:
-        self.bounds.setdefault(req_id, {})
+        dev = self._device
+        self.bounds_t[req_id] = torch.empty(
+            (self.INIT_CAP, self.n_full, self.hkv, 2, self.dim),
+            dtype=torch.float16, device=dev)
+        self.bounds_valid[req_id] = torch.zeros(self.INIT_CAP, dtype=torch.bool, device=dev)
+        self.bounds_count[req_id] = 0
         self.resident.setdefault(req_id, {})
 
     def drop(self, req_id: int) -> None:
-        self.bounds.pop(req_id, None)
+        self.bounds_t.pop(req_id, None)
+        self.bounds_valid.pop(req_id, None)
+        self.bounds_count.pop(req_id, None)
         self.resident.pop(req_id, None)
+
+    def _grow(self, rid: int, need: int) -> None:
+        t = self.bounds_t[rid]
+        cap = t.shape[0]
+        new_cap = max(need, cap * 2)
+        nt = torch.empty((new_cap, *t.shape[1:]), dtype=t.dtype, device=t.device)
+        nt[:cap] = t
+        nv = torch.zeros(new_cap, dtype=torch.bool, device=t.device)
+        nv[:cap] = self.bounds_valid[rid]
+        self.bounds_t[rid] = nt
+        self.bounds_valid[rid] = nv
 
     def set_bounds(self, req_id: int, page: int, b: Tensor) -> None:
         b = b.contiguous().to(torch.float16)
+        if page >= self.bounds_t[req_id].shape[0]:
+            self._grow(req_id, page + 1)
+        self.bounds_t[req_id][page] = b
+        self.bounds_valid[req_id][page] = True
+        if page >= self.bounds_count[req_id]:
+            self.bounds_count[req_id] = page + 1
         if not self.bytes_per_page:
-            self.bytes_per_page = b.numel() * b.element_size()
-        self.bounds[req_id][page] = b
+            # one plane row [Hkv,2,D], x n_full planes
+            self.bytes_per_page = b[0].numel() * b.element_size() * self.n_full
+
+    def has_bounds(self, req_id: int, page: int) -> bool:
+        v = self.bounds_valid.get(req_id)
+        return v is not None and page < v.shape[0] and bool(v[page])
+
+    def bounds_rows(self, req_id: int, pages: list[int]) -> Tensor:
+        """Bounds of ``pages`` across every source plane in ``pages`` order:
+        ``[n_pages, n_full, Hkv, 2, D]`` via ONE index_select (no Python stack)."""
+        idx = torch.as_tensor(pages, dtype=torch.long, device=self.bounds_t[req_id].device)
+        return self.bounds_t[req_id].index_select(0, idx)
 
     def bounds_bytes(self) -> int:
-        return sum(len(pages) * self.bytes_per_page for pages in self.bounds.values())
+        return sum(int(v.sum()) * self.bytes_per_page for v in self.bounds_valid.values())
 
 
 class SparseForward:
@@ -155,8 +208,9 @@ class SparseForward:
         cand = r["cand"]
         chosen: list[int] = []
         if cand:
-            bounds = torch.stack(
-                [self.tracker.bounds[r["req_id"]][p][plane] for p in cand])
+            # one index_select gathers all candidate rows, then the plane slice;
+            # no torch.stack over up-to-8192 per-page tensors per tick.
+            bounds = self.tracker.bounds_rows(r["req_id"], cand)[:, plane]
             scores = quest_scores(q, bounds).reshape(1, 1, len(cand))
             # logical+1 ids keep real page 0 distinct from the right-pad 0.
             table = (torch.tensor(cand, device=self.device) + _SENTINEL

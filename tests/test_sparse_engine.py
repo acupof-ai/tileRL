@@ -80,7 +80,7 @@ def test_sparse_demotes_and_promotes_pages_every_tick():
         saw_cold |= cold.bytes_held > 0
         if r0 is not None and r0.phase == 2:
             # decode tick: bounds for every complete page survive demotion
-            assert len(sparse._sparse.bounds[rid]) >= 5
+            assert int(sparse._sparse.bounds_valid[rid].sum()) >= 5
     else:
         raise TimeoutError
 
@@ -143,3 +143,41 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_select_tensor_op_count_is_constant_in_candidate_count():
+    """The 128k host-bound fix: _select gathers candidate bounds with one
+    index_select, so the number of aten ops it dispatches does not grow with
+    the candidate count (a torch.stack-per-page would dispatch per page)."""
+    import torch
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from tilerl.sparse_engine import SparseForward, SparseTracker
+
+    class _Count(TorchDispatchMode):
+        n = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            self.n += 1
+            return func(*args, **(kwargs or {}))
+
+    cfg = tiny()
+
+    def select_ops(n_cand: int) -> int:
+        tr = SparseTracker(cfg, k_pages=4, scorer="bounds")
+        tr.attach(0)
+        b = torch.randn(tr.n_full, tr.hkv, 2, tr.dim, dtype=torch.float16)
+        for p in range(n_cand):
+            tr.set_bounds(0, p, b)
+        cand = list(range(n_cand))
+        row = dict(req_id=0, own=[n_cand], own_len=BLOCK_TOKENS, cand=cand,
+                   force_window=0, resolve=lambda p: p)
+        sf = SparseForward(tr, [row], torch.device("cpu"))
+        q = torch.randn(1, cfg.num_attention_heads, cfg.head_dim)
+        with _Count() as c:
+            sf._select(0, 0, q)
+        return c.n
+
+    ops_8 = select_ops(8)
+    ops_64 = select_ops(64)
+    assert ops_64 == ops_8, f"ops grow with candidates: {ops_8} @8 -> {ops_64} @64"
