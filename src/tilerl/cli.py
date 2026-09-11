@@ -1864,9 +1864,13 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {'pending':>11} {bnd_col:>11} {'pending':>11}")
             else:
+                # ms is ONE call's GEMM at the batch*seq shape; compare it to the bound
+                # of ONE row, not the count-scaled total above.
+                one = cal.bound_seconds(r["bytes"], r["flops"],
+                                        floors["bw_gbs"], floors["peak_tflops"])
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {ms:>9.3f}ms {bnd_col:>11} "
-                      f"{bound_s / (ms / 1000.0) * 100.0:>10.1f}%")
+                      f"{one / (ms / 1000.0) * 100.0:>10.1f}%")
         return tb_sum, tf_sum
 
     print(f"{'kernel':<26} {'count':>5} {'shape':>22} {'face':>7} {'bytes':>12} "

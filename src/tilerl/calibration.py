@@ -347,7 +347,12 @@ def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     dev = backend.device
     x = torch.randn(m, inn, dtype=torch.bfloat16, device=dev)
     w_bf16 = torch.randn(out_n, inn, dtype=torch.bfloat16, device=dev)
-    wargs, wkw = _pack_for(row["face"], w_bf16)
+    # Pack on CPU: pack_fp4 materializes a nearest-grid LUT of ~8x the weight (a
+    # 17408x5120 layer wants 37.9 GiB) which fits a 95 GB H20 but OOMs a 32 GB
+    # V100. Packing is untimed fixture prep, so its device/place never enters ms.
+    wargs, wkw = _pack_for(row["face"], w_bf16.cpu())
+    wargs = tuple(a.to(dev) for a in wargs)
+    wkw = {k: v.to(dev) for k, v in wkw.items()}
     # identity assertion: the thing we time is the kernel the row's face declared,
     # not a substitute. Compare the underlying functions — getattr builds a fresh
     # bound-method wrapper each time, so the wrappers themselves are never `is`.
