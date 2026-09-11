@@ -115,7 +115,6 @@ def test_tiebreak_generates_all_56_judgements_in_one_batched_call():
         return [ans[k % 3] for k in range(len(prompts))]
 
     import tilerl.eval as eval_mod
-
     from tilerl.engine import SamplingParams
     from tilerl.tokenizer import ByteTokenizer
 
