@@ -33,7 +33,7 @@ Derived from `nbytes`; nothing above is measured yet. The dense column is the
 P6 ledger's row (`2026-09-11-p6-long-context-budget-on-one-h20.md`).
 
 Per decode step at 256k, B=1: the learned indexer reads 33 MiB of keys at the
-4 source layers (0.01 ms at 4 TB/s) and 0.27 GFLOP; the bounds scorer reads
+4 source layers (0.01 ms at 4 TB/s) and 0.07 GFLOP; the bounds scorer reads
 1 GiB (0.26 ms); the tick's weight read is 22.36 GB (5.6 ms at 4 TB/s), so
 scoring is under 5% of the tick either way. Fetching hot pages from the host
 is 69 MiB per row worst case (1.4 ms at 50 GB/s PCIe), once per group, not per
