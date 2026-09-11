@@ -1837,7 +1837,10 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
         backend = get_backend()
         spec_by_name = {k.split(".")[-1]: tuple(v) for k, v in param_specs(cfg).items()}
 
-    def render(rows: list[dict], label: str, b: int, s: int) -> tuple[int, int]:
+    def render(rows: list[dict], label: str, b: int, s: int, m: int | None = None) -> tuple[int, int]:
+        # m = query rows the timed GEMM runs on: b*s for a prefill GEMM, b for a
+        # decode GEMV (one token per request). Defaults to b*s (the prefill shape).
+        m = b * s if m is None else m
         print(f"# {cfg.name} {label}, fp8 KV, {src}, floor device={device_name}")
         if floors is None:
             print("# (no calibration row for this device: ms/bound/%bound pending-remote)")
@@ -1858,8 +1861,10 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
             # a non-GEMM row with no linear timing fixture) it stays pending.
             ms = None
             if backend is not None and r["name"] in spec_by_name:
+                # lm_head samples once per request (M=b), never across the prefill span.
+                mm = b if r["name"] == "lm_head" else m
                 ms = cal.time_row_ms(
-                    {**r, "_spec": spec_by_name[r["name"]]}, backend, b, s)
+                    {**r, "_spec": spec_by_name[r["name"]]}, backend, mm)
             if ms is None:
                 print(f"{r['name']:<26} {r['count']:>5} {r['shape']:>22} {face} "
                       f"{by:>12,} {fl:>10,} {'pending':>11} {bnd_col:>11} {'pending':>11}")
@@ -1887,7 +1892,7 @@ def cmd_bench_kernels(args: argparse.Namespace) -> None:
         tick = kernel_cost.TickShape(b=b, s=args.context, kv=kv_format(cfg.head_dim),
                                      weight=nvfp4, faces=faces)
         tb, tf = render(kernel_cost.tick_rows(cfg, tick),
-                        f"decode tick B={b} s={args.context}", b, args.context)
+                        f"decode tick B={b} s={args.context}", b, args.context, m=b)
         print(f"{'TICK TOTAL':<26} {'':>5} {'':>22} {'':>7} {tb:>12,} {tf:>10,}")
 
 

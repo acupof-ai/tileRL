@@ -346,12 +346,17 @@ def _pack_for(face, w_bf16):
     return (w8, wscale), {}
 
 
-def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
+def time_row_ms(row: dict, backend, m: int) -> float | None:
     """ms of the registry kernel the row's face DECLARES, or None to render
     pending-remote. Inputs are packed to that kernel's weight face, so the measured ms
     divides by the same packed bytes the roofline row declares — never a bf16
     surrogate for an nvfp4/fp8 row, and never linear_fp4 for an fp8 row. Fused
-    kernels needing engine-shaped inputs return None (card-only probes)."""
+    kernels needing engine-shaped inputs return None (card-only probes).
+
+    ``m`` is the ACTUAL query-row count the kernel runs on: M=b for a decode GEMV
+    (one token per request), M=b*s for a prefill GEMM. Passing b*s for decode
+    timed an M=4096 prefill kernel and read 0.1% bound — the wrong kernel.
+    """
     import torch
 
     if not torch.cuda.is_available():
@@ -360,7 +365,6 @@ def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     if fn is None or row.get("_spec") is None:
         return None
     out_n, inn = tuple(row["_spec"])
-    m = b if row["name"] == "lm_head" else b * s
     dev = backend.device
     x = torch.randn(m, inn, dtype=torch.bfloat16, device=dev)
     w_bf16 = torch.randn(out_n, inn, dtype=torch.bfloat16, device=dev)

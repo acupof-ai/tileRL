@@ -220,7 +220,7 @@ def test_time_row_ms_pending_off_cuda_or_unknown_row(monkeypatch):
 
     monkeypatch.setattr(torch, "cuda", type("C", (), {"is_available": lambda self: False})())
     assert cal.time_row_ms(
-        {"name": "down_proj", "_spec": (4, 4), "face": None}, object(), 1, 8) is None
+        {"name": "down_proj", "_spec": (4, 4), "face": None}, object(), 8) is None
 
 
 def test_kernels_table_pending_when_no_calibration(tmp_path, monkeypatch, capsys):
