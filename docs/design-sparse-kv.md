@@ -11,28 +11,33 @@ selection through the same engine.
 ## The account on the 27B
 
 16 full-attention layers, 4 KV heads x 256, fp8 KV: `kv_format(256)` gives
-33,280 B per token (32 planes x 4 x 256 + 512 B of f32 scales). Index keys per
-token: 16 layers x (128 B fp8 + 4 B f32 scale) = 2,112 B, 15.8x smaller; one
-key per token per layer, shared by the index query heads as in V3.2. Selection
-is top-k **pages**, k_pages = 128 (2048 tokens) per layer per row: 128 pages x
-2 planes x 4 x 16 x 260 B x 16 layers = 65 MiB. Selecting top-k tokens instead
+33,280 B per token (32 planes x 4 x 256 + 512 B of f32 scales); one page of
+`BLOCK_TOKENS` = 16 is 532,480 B across all layers. Selection is top-k
+**pages**, k_pages = 128 (2048 tokens) plus the 8-page window, computed at 4
+index source layers and shared by each layer's group of 4, so the hot set of a
+row is (128 + 8) pages x 532,480 B = 69.1 MiB. Selecting top-k tokens instead
 would pin between 128 and 2048 pages (up to 1,040 MiB per row), so the unit of
-selection is the page and the hot budget is fixed by k_pages.
-Weights stay 22.759 GiB (served faces), so the smallest card is 32 GB.
+selection is the page and the hot budget is fixed by k_pages. Index keys (the
+learned indexer, V4.1 form): per page, per source layer, 4 index heads x
+`Format(bits=8, scales=((128, f32),))` = 4 x 132 B = 528 B; 4 source layers =
+2,112 B per page = 132 B per token, 33.0 MiB at 256k (16,384 pages). The
+training-free bounds scorer instead holds 4 KiB per token fp16 (1 GiB at
+256k). Weights stay 22.759 GiB (served faces), so the smallest card is 32 GB.
 
-| 256k context | dense fp8 KV on device | sparse: index + hot pages | cold KV (host / SSD) |
-|---|---|---|---|
-| B=1 | 8.125 GiB | 528 MiB + 65 MiB = 0.58 GiB | 8.125 GiB |
-| B=8 | 65.0 GiB (does not fit an H20) | 4.63 GiB | 65.0 GiB |
+| 256k context | dense fp8 KV on device | sparse, learned indexer: keys + hot pages | sparse, bounds scorer | cold KV (host / SSD) |
+|---|---|---|---|---|
+| B=1 | 8.125 GiB | 33 MiB + 69 MiB = 0.10 GiB | 1 GiB + 69 MiB = 1.07 GiB | 8.125 GiB |
+| B=8 | 65.0 GiB (does not fit an H20) | 0.80 GiB | 8.5 GiB | 65.0 GiB |
 
 Derived from `nbytes`; nothing above is measured yet. The dense column is the
 P6 ledger's row (`2026-09-11-p6-long-context-budget-on-one-h20.md`).
 
-Per decode step at 256k, B=1: the indexer reads 528 MiB of keys (0.13 ms at
-4 TB/s) and 4.3 GFLOP (4 index query heads against the one shared key per
-token); the tick's weight read is 22.36 GB (5.6 ms at 4 TB/s), so scoring is
-2% of the tick. Fetching hot pages from the host is 65 MiB per row worst case
-(1.3 ms at 50 GB/s PCIe); that the per-token delta is a few pages is a
+Per decode step at 256k, B=1: the learned indexer reads 33 MiB of keys at the
+4 source layers (0.01 ms at 4 TB/s) and 0.27 GFLOP; the bounds scorer reads
+1 GiB (0.26 ms); the tick's weight read is 22.36 GB (5.6 ms at 4 TB/s), so
+scoring is under 5% of the tick either way. Fetching hot pages from the host
+is 69 MiB per row worst case (1.4 ms at 50 GB/s PCIe), once per group, not per
+layer; that the per-token delta is a few pages is a
 prediction to be measured on the card, not a property of the design. The
 bound is in `kernel_cost` as two more rows, priced by the same rule as every
 other kernel (bytes per HBM direction crossed, PCIe bytes as their own column).
@@ -99,8 +104,8 @@ ends. The union of a chunk's selected sets is fetched once, not per query.
 `memory.plan` adds three owners, priced by `nbytes` like every other row:
 
 ```
-index_keys  device  count = tokens_resident, fmt = Format(bits=8, scales=((128, f32),)), shape [layers, 128]
-kv_hot      device  count = rows x k_pages x full-attn layers, per_kv_block_bytes / planes x 2  (k_pages = 128)
+index_keys  device  count = pages_resident x 4 source layers x 4 heads, fmt = Format(bits=8, scales=((128, f32),)), shape [128]   (learned indexer; bounds scorer: pages x 16 layers x [2, 4, 256] bf16)
+kv_hot      device  count = rows x (k_pages + 8 window) x 4 groups, bytes = per_kv_block_bytes / 4  (a group is 4 of the 16 layers' planes)
 kv_cold     host|ssd count = pages_written - pages_on_device, per_kv_block_bytes
 ```
 
