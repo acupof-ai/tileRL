@@ -20,7 +20,7 @@ from tilerl.train import indexer_capture, quest_bounds_scores, sample_query_posi
 
 KS = (128, 256, 512, 1024, 2048)
 SEED, NQ, MINP, W = 0, 256, 2048, 8
-GROUP = {8192: 2, 32768: 1}
+GROUP = {8192: 2, 16384: 0, 32768: 1}
 NSPAN = {8192: 5, 32768: 5}
 
 
