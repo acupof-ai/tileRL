@@ -402,7 +402,11 @@ def indexer_capture(model: Any, ids: torch.Tensor, backend: Any, block: int,
     try:
         kv = _capture_kv(model, t, backend)
         with torch.no_grad():
-            model.forward(ids, torch.arange(t, device=backend.device), kv, backend)
+            # last_only: the capture reads H/Q/K inside the layer loop, so the
+            # lm_head only needs the last position — at t=32k a full [t,vocab]
+            # head (plus its fp8 GEMM workspace) asks ~30 GiB and OOMs the 27B.
+            model.forward(ids, torch.arange(t, device=backend.device), kv, backend,
+                          last_only=True)
     finally:
         model.index_capture = None
         model.index_capture_layers = frozenset()
