@@ -325,3 +325,19 @@ def test_calibration_uses_f16_peak_for_a_bf16_less_card(tmp_path):
 def test_device_sections_empty_store_is_all_pending(tmp_path):
     p = _store(tmp_path, [])
     assert cal.device_sections(cal.load_rows(p)) == []
+
+
+def test_pack_fp4_chunked_matches_whole_pack():
+    """Row-chunked packing (the 32 GB-safe fixture path) is byte/value-identical to
+    packing the whole weight at once — pack and renorm are per-row."""
+    import torch
+    from tilerl_kernels import reference
+
+    torch.manual_seed(0)
+    w = torch.randn(137, 64) * 0.3  # non-multiple of the 32-row chunk forces a tail
+    wq_w, sc_w = reference.pack_fp4(w)
+    sc_w, os_w = reference.renorm_fp4_scale(sc_w)
+    wq_c, sc_c, os_c = cal._pack_fp4_chunked(w, row_chunk=32)
+    assert torch.equal(wq_c, wq_w)
+    assert torch.equal(sc_c, sc_w)
+    assert torch.equal(os_c, os_w)

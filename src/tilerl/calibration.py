@@ -313,6 +313,25 @@ def resolve_row_kernel(backend, row: dict):
     return fn if callable(fn) else None
 
 
+def _pack_fp4_chunked(w, row_chunk: int = 2048):
+    """pack_fp4 + renorm in row chunks on the weight's device. The pack builds a
+    nearest-grid LUT of 8 bytes/element (~8x the bf16 weight): a 248320-row
+    lm_head wants ~100 GiB whole. Both pack and renorm are per-row, so chunking
+    is bit-identical while bounding the transient to row_chunk*K*8 bytes."""
+    import torch
+
+    from tilerl_kernels import reference
+
+    wqs, scales, oscales = [], [], []
+    for i in range(0, w.shape[0], row_chunk):
+        wq, sc = reference.pack_fp4(w[i: i + row_chunk])
+        sc, os_ = reference.renorm_fp4_scale(sc)
+        wqs.append(wq)
+        scales.append(sc)
+        oscales.append(os_)
+    return torch.cat(wqs, 0), torch.cat(scales, 0), torch.cat(oscales, 0)
+
+
 def _pack_for(face, w_bf16):
     """(args, kwargs) weight tensors for the kernel the face resolves to. fp4 gets the
     block-32 pack + renorm split (scale + per-row oscale); fp8 gets the [128,128]
@@ -322,8 +341,7 @@ def _pack_for(face, w_bf16):
     from . import precision as P
 
     if face in (P.nvfp4, P.nvfp4_dev, P.nvfp4_dev_b32):
-        wq, scale = reference.pack_fp4(w_bf16)
-        scale, oscale = reference.renorm_fp4_scale(scale)
+        wq, scale, oscale = _pack_fp4_chunked(w_bf16)
         return (wq, scale), {"oscale": oscale}
     w8, wscale = reference.quant_fp8(w_bf16)
     return (w8, wscale), {}
@@ -347,12 +365,11 @@ def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     dev = backend.device
     x = torch.randn(m, inn, dtype=torch.bfloat16, device=dev)
     w_bf16 = torch.randn(out_n, inn, dtype=torch.bfloat16, device=dev)
-    # Pack on CPU: pack_fp4 materializes a nearest-grid LUT of ~8x the weight (a
-    # 17408x5120 layer wants 37.9 GiB) which fits a 95 GB H20 but OOMs a 32 GB
-    # V100. Packing is untimed fixture prep, so its device/place never enters ms.
-    wargs, wkw = _pack_for(row["face"], w_bf16.cpu())
-    wargs = tuple(a.to(dev) for a in wargs)
-    wkw = {k: v.to(dev) for k, v in wkw.items()}
+    # Packed in row chunks on-device: a whole-layer nearest-grid LUT is ~8x the
+    # weight (37.9 GiB for a GDN gate proj, ~100 GiB for lm_head), which OOMs a
+    # 32 GB card; pack/renorm are per-row, so chunking is bit-identical. Packing
+    # is untimed fixture prep and never enters ms.
+    wargs, wkw = _pack_for(row["face"], w_bf16)
     # identity assertion: the thing we time is the kernel the row's face declared,
     # not a substitute. Compare the underlying functions — getattr builds a fresh
     # bound-method wrapper each time, so the wrappers themselves are never `is`.
