@@ -1,7 +1,9 @@
 # Per-step re-quantization: a full-SFT step refreshes the served fp4 faces — 2026-09-11
 
-> Status: **tiny CPU gates green** (fp4 fixture, 8 gates); the on-card 27B
-> parity/repack-cost row is being filled from H20 card 0 (recall lifted).
+> Status: **shipped** — tiny CPU gates (8) and the on-card sm90 confirmation on
+> the real 27B (H20 card 0, commit `c66c472f`): twiddle-layout correct, served
+> parity 0.0021, repack 6.27 s/step. Device-resident shared-engine decode
+> (serve and train in one process) is still a later integration.
 
 ## Context
 
@@ -111,5 +113,36 @@ control — argmax alone neither moves on short steps nor catches a block mixup.
 | date | machine | target | result |
 |---|---|---|---|
 | 2026-09-11 | local (fp4 tiny) | cpu | 8 gates green; two mutants red on their intended gates |
-| 2026-09-11 | H20 card 0 | cuda | pending this PR: on-checkpoint parity, per-step repack cost |
+| 2026-09-11 | H20 card 0 (`c66c472f`, real 27B) | cuda sm90 | see below: twiddle layout 0 mismatch, parity 0.0021, repack 6.27 s/step |
+
+## On the real 27B (H20 card 0, sm90)
+
+`scripts/probe_requant_card.py` (commit `c66c472f…`, `TILERL_TARGET=cuda
+TILERL_27B_CKPT=/work/Qwen3.8-27B-NVFP4`, card 0, 172 s `load_hf`), card name
+NVIDIA H20. Verbatim output:
+
+```
+arch sm90 device NVIDIA H20
+fp4 served keys: 264
+tagged slots: 264 of 264
+sample tag layers.0.down_proj tw-bf16
+requant keys 264 per-step repack 6265.718 ms
+layout mismatches (of 16 sampled): 0
+served-vs-ref max rel per linear: ['0.0015','0.0019','0.0019','0.0013','0.0015',
+  '0.0013','0.0019','0.0018','0.0021','0.0017','0.0013','0.0017']
+worst max rel 0.0021, argmax rows agree 12/12
+PROBE_OK
+```
+
+- The sm90 `materialize` twiddle+tag premise is real: **all 264** fp4 slots are
+  `tw-bf16`. After a perturb + `requantize_fp4`, every sampled slot equals
+  `twiddle_fp4(pack_fp4(master))` with the tag preserved — the exact defect
+  (natural nibbles fed to a twiddled decode kernel) does not occur.
+- Through the actual sm90 `linear_fp4` kernel, served logits vs the natural f32
+  reference agree to **worst max-rel 0.0021** over 12 sampled linears, with
+  **12/12 argmax rows** — an order of magnitude tighter than the tiny fixture.
+- Re-packing all 264 keys costs **6.27 s/step**. The ponytail is the touched-key
+  set: a full SFT step updates every key, but an LoRA-free incremental or a
+  layer-chunked training path would repack only what moved.
+
 
