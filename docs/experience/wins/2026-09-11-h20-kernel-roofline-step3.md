@@ -83,3 +83,45 @@ three bugs into loud failures instead of a publishable table.
 Floors ids: hbm `6c0659c91ab1`, bf16 `67f3ea83c9aa`, fp8 `e729ffedf310`,
 clean rows at c1e84535. Pending-remote: timing fixtures for the fused
 attention/GDN/norm kernels (their ms columns), and a B=8 prefill column.
+
+## Steady-state residency on the same card (runbook step 2 measurement)
+
+`serve --model qwen38-27b --dry-run --record-residency` (built engine, fitted
+pool on the card's 25.2 GiB free): every derived row equaled measured to the
+byte and the invariant closed exactly.
+
+The verbatim table from that run (derived MiB == measured MiB, delta 0):
+
+```
+  weights        23304.92 MiB
+  state_slots     1397.25 MiB
+  kv_pool        48100.00 MiB   (48100 blocks)
+  transient        107.81 MiB   peak - Σ static
+  device_total   72909.98 MiB
+```
+
+Exact integers from the recorded row (shape), closing the invariant:
+
+| | bytes |
+|---|---:|
+| static | 76,338,610,340 |
+| transient | 113,045,340 |
+| **resident peak** | **76,451,655,680** |
+
+(static/transient here are the row's shape fields; the table's transient
+107.81 MiB is the same value rounded for display — the integer is the recorded
+one. The pool fit depends on the card's free bytes at launch, so a later run
+with different occupancy fits a different block count; the invariant row is
+what is reproducible.)
+
+Row `device_resident_bytes` id `edb5d8328af3`, clean at c1e84535.
+
+**314 vs 315 blocks:** with the captured decode graph on, the engine reserves
+ONE pad slot and one pad block for a replay's padding rows (`engine.py`:
+`_pad_slot`/`_pad_block` allocated up front when `_decode_graph_on`). The pool
+is therefore sized one larger than the caller asked: `num_blocks` is 315 while
+`usable_blocks` (and the capacity answer, `engine.usable_blocks`) is 314 — the
+pad block is the engine's, not a request's. The dry-run state-slots count adds
+the same pad (`args.slots + int(_graph_on(...))`); off-graph there is no pad
+and the two agree. Reading num_blocks as usable would size a request to the
+whole pool and fail the allocation guard behind it.
