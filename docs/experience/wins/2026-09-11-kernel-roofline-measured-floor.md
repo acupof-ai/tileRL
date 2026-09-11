@@ -40,3 +40,26 @@ A roofline % is only as real as its denominator: measure bandwidth and peak on t
 (large copy + large GEMM, CUDA-event median), key the floor to the exact device name, and
 render pending-remote — never a datasheet number — when the row is absent. The bound
 arithmetic stays CPU-pure so the join and the division are gated without a GPU.
+
+## Results — first measured H20 floors (cards 0 and 1, 2026-09-11)
+
+`bench --calibrate` at commit `a08e546ad836246de272d599e557d56d0aadbb87`, four rows
+in `measurements.jsonl` (ids `1570734f7f15`, `c5037c831df7`, `619d9cdd0d0e`,
+`e627533d787c`). Under one visible device the in-process index is always card 0
+(`CUDA_VISIBLE_DEVICES` masks it), so the row's `shape.card` reads 0 for both; the
+physical card is fixed by the append order (the `CUDA_VISIBLE_DEVICES=0` run, then
+the `=1` run):
+
+| physical card | HBM GB/s | bf16 TFLOP/s |
+|---:|---:|---:|
+| 0 | 3292.07 | 136.39 |
+| 1 | 3292.39 | 137.76 |
+
+Placement control: two idle H20s agree to **0.01% on bandwidth** and **1.0% on
+bf16 peak**, so a roofline divided by either card is the same number; cards 2/3
+(separate calibration PRs) read 3316/3311 GB/s and ~136.5 TFLOP/s — the same
+device population under the exact name "NVIDIA H20". The store is append-only;
+`latest_floor` resolves the floor to the NEWEST non-superseded row for that
+exact device name (not the max), so the row order across the calibration PRs
+sets which same-name measurement the roofline divides by.
+
