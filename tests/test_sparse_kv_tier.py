@@ -478,6 +478,77 @@ def test_batched_promotions_copy_many_pages_but_sync_once():
         assert torch.equal(pool.v_pool[:, nb], snaps[i][1])
 
 
+def test_batched_demotions_copy_many_pages_but_sync_once():
+    """A decode tick that evicts N pages must pay ONE device sync, not N — the
+    demote mirror of the promotions gate. Three live pages demote inside one
+    pool.demotions() on a pool whose device we pretend is cuda: exactly one
+    synchronize, and every page's pinned host blob is byte-equal to the device
+    frame it copied. Frames stay live until that sync."""
+    import unittest.mock as mock
+
+    p, hkv, d = 4, 2, 8
+    pool = PagedKvPool(p + 8, hkv, d, num_layers=2, device=_device())
+    pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
+    blocks = [pool.alloc_block() for _ in range(3)]
+    snaps = {}
+    for i, b in enumerate(blocks):
+        kk, vv = _kv(200 + i, 1, hkv, d)
+        for plane in range(2):
+            pool.write_block(b, 0, kk[0], vv[0], layer=plane)
+        snaps[b] = (pool.k_pool[:, b].clone(), pool.v_pool[:, b].clone())
+
+    real_device = pool.device
+    pool.device = torch.device("cuda")
+    try:
+        with mock.patch("tilerl.kv_cache.torch.cuda.synchronize") as sync_fn, pool.demotions():
+            for i, b in enumerate(blocks):
+                pool.demote_page(b, key=("r", i))
+                # inside the batch: frames not freed and sync not yet issued
+                assert pool.refcount[b] == 1, "frame stays live until end sync"
+            assert sync_fn.call_count == 0, sync_fn.call_count
+        assert sync_fn.call_count == 1, f"one batched sync, got {sync_fn.call_count}"
+    finally:
+        pool.device = real_device
+    for i, b in enumerate(blocks):
+        assert pool.refcount[b] == 0, "frame returned to the pool only after sync"
+        blob = pool.cold.take(("r", i))
+        assert blob is not None
+        assert torch.equal(blob["k"], snaps[b][0]), f"K {i}"
+        assert torch.equal(blob["v"], snaps[b][1]), f"V {i}"
+
+
+def test_batched_demotion_survives_frame_recycling():
+    """The collision case: two pages demoted in one batch on a 2-frame pool must
+    not alias even though their physical ids are recycled. Frames stay live until
+    the single end-of-batch sync, so the second D2H cannot overwrite the first;
+    both pinned blobs promote back byte-equal through a real CPU pool."""
+    hkv, d = 2, 8
+    pool = PagedKvPool(2, hkv, d, num_layers=2, device=_device())
+    pool.attach_cold(HostKvPages(budget_bytes=1 << 30))
+    saved = {}
+
+    def write_page(key, seed):
+        b = pool.alloc_block()
+        kk, vv = _kv(seed, 1, hkv, d)
+        for plane in range(2):
+            pool.write_block(b, 0, kk[0], vv[0], layer=plane)
+        saved[key] = (b, pool.k_pool[:, b].clone(), pool.v_pool[:, b].clone())
+        return b
+
+    with pool.demotions():
+        b0 = write_page((0, 0), 31)
+        pool.demote_page(b0, key=(0, 0))
+        b1 = write_page((0, 1), 42)
+        assert b1 != b0, "retained frames must not be reused mid-batch"
+        pool.demote_page(b1, key=(0, 1))
+    assert pool.refcount[b0] == 0 and pool.refcount[b1] == 0
+
+    for key in ((0, 0), (0, 1)):
+        nb = pool.promote_keyed(key)
+        assert torch.equal(pool.k_pool[:, nb], saved[key][1]), f"K {key}"
+        assert torch.equal(pool.v_pool[:, nb], saved[key][2]), f"V {key}"
+
+
 if __name__ == "__main__":
     import sys
 
