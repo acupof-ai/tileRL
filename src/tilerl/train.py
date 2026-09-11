@@ -316,19 +316,27 @@ def _dense_causal_mass(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     return torch.softmax(scores, dim=-1).mean(dim=1)             # avg over heads
 
 
-def dense_causal_page_mass(q: torch.Tensor, k: torch.Tensor, block: int = 16
+def dense_causal_page_mass(q: torch.Tensor, k: torch.Tensor, block: int = 16,
+                           q_positions: torch.Tensor | None = None
                            ) -> torch.Tensor:
     """Dense causal attention mass pooled per key PAGE, averaged over query
     heads — the warm-up teacher for a LONG sequence (8k-32k), where the naive
     [t,t] score matrix will not fit. Streams key pages one at a time: an online
     softmax pass gets each query's log-sum-exp, a second pass normalises each
-    page's numerator. Memory O(t*block), compute the same GEMM as attention.
+    page's numerator. Memory O(nq*block), compute O(nq*t) attention GEMM.
 
-    ``q`` [b,t,hq,d], ``k`` [b,t,hkv,d] -> [b, t, t//block], each query row
-    L1-normalised over pages strictly before it (window excluded later by
-    :func:`page_mass_target`). Mathematically identical to
-    ``_dense_causal_mass`` pooled by block, which is its CPU gate."""
+    ``q`` [b,t,hq,d], ``k`` [b,t,hkv,d] -> [b, nq, ceil(t/block)], each query
+    row L1-normalised over pages strictly before it (window excluded later by
+    :func:`page_mass_target`). ``q_positions`` (indices in [0,t)) evaluates only
+    those query rows: the 27B science run samples 256 positions per span, taking
+    the teacher from O(t^2) to O(256*t); None evaluates every position.
+    Mathematically identical to ``_dense_causal_mass`` pooled by block at the
+    evaluated rows, which is its CPU gate."""
     b, t, hq, d = q.shape
+    if q_positions is None:
+        q_positions = torch.arange(t, device=q.device)
+    nq = int(q_positions.shape[0])
+    q_eval = q.index_select(1, q_positions)                   # [b,nq,hq,d]
     rep = hq // k.shape[2]
     k_exp = k.repeat_interleave(rep, dim=2)
     scale = d ** -0.5
@@ -336,23 +344,22 @@ def dense_causal_page_mass(q: torch.Tensor, k: torch.Tensor, block: int = 16
     # (T=49, block=16 -> pages 0,1,2,3 with page 3 holding key 48); dropping it
     # renormalises that key's mass onto the included pages.
     n_pages = (t + block - 1) // block
-    q_idx = torch.arange(t, device=q.device)
+    all_idx = torch.arange(t, device=q.device)
     neg_inf = torch.finfo(q.dtype).min
 
     def _page_scores(p):
         sl = slice(p * block, min((p + 1) * block, t))
-        kj = q_idx[sl]
-        s = torch.einsum("bqhd,bkhd->bhqk", q, k_exp[:, sl]) * scale  # [b,hq,t,blk]
-        valid = q_idx[None, None, :, None] >= kj[None, None, None, :]
+        kj = all_idx[sl]
+        s = torch.einsum("bqhd,bkhd->bhqk", q_eval, k_exp[:, sl]) * scale
+        valid = q_positions[None, None, :, None] >= kj[None, None, None, :]
         return s.masked_fill(~valid, float("-inf")), valid
 
     # Pass 1: online softmax -> per-(b,hq,q) running max and log-sum-exp.
-    neg_inf = torch.finfo(q.dtype).min
-    run_max = torch.full((b, hq, t), neg_inf, dtype=torch.float32, device=q.device)
-    run_sum = torch.zeros((b, hq, t), dtype=torch.float32, device=q.device)
+    run_max = torch.full((b, hq, nq), neg_inf, dtype=torch.float32, device=q.device)
+    run_sum = torch.zeros((b, hq, nq), dtype=torch.float32, device=q.device)
     for p in range(n_pages):
         s, valid = _page_scores(p)
-        anyv = valid.any(dim=-1)                              # [b,hq,t]
+        anyv = valid.any(dim=-1)                              # [b,hq,nq]
         bmax = torch.where(anyv, s.amax(dim=-1), torch.zeros_like(run_max))
         # exp only over valid keys; a page with no key <= query contributes 0.
         bsum = torch.where(
@@ -366,10 +373,10 @@ def dense_causal_page_mass(q: torch.Tensor, k: torch.Tensor, block: int = 16
             torch.where(anyv, bmax, new_max) - new_max), torch.zeros_like(run_sum))
         run_sum, run_max = old + add, new_max
     lse = torch.where(run_max > neg_inf / 2,
-                      run_max + run_sum.clamp_min(1e-30).log(), run_max)  # [b,hq,t]
+                      run_max + run_sum.clamp_min(1e-30).log(), run_max)  # [b,hq,nq]
 
     # Pass 2: normalised causal mass landing on each key page, mean over heads.
-    page_mass = torch.zeros(b, t, n_pages, dtype=torch.float32, device=q.device)
+    page_mass = torch.zeros(b, nq, n_pages, dtype=torch.float32, device=q.device)
     lse_safe = torch.where(lse > neg_inf / 2, lse, torch.zeros_like(lse))
     for p in range(n_pages):
         s, valid = _page_scores(p)
@@ -378,13 +385,35 @@ def dense_causal_page_mass(q: torch.Tensor, k: torch.Tensor, block: int = 16
     return page_mass
 
 
+def sample_query_positions(t: int, n: int, seed: int, min_pos: int,
+                           device: torch.device | str = "cpu") -> torch.Tensor:
+    """``n`` distinct uniform query positions in [min_pos, t), fixed by seed.
+    The 27B recall teacher scores these only: positions past 2048 leave pages the
+    selector can miss. n>=t-min_pos returns every eligible position."""
+    if t <= min_pos:
+        raise ValueError(f"need T>{min_pos} sampled-query positions, got {t}")
+    pool = t - min_pos
+    # CPU RNG (not the device's): the seed reproduces the same positions on every
+    # machine regardless of the CUDA RNG version; the result is small (256 ints).
+    gen = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(pool, generator=gen)[: min(n, pool)]
+    return (perm + min_pos).sort().values.to(torch.long).to(device)
+
+
 def indexer_capture(model: Any, ids: torch.Tensor, backend: Any, block: int,
-                    n_win_pages: int):
+                    n_win_pages: int, q_positions: torch.Tensor | None = None,
+                    return_raw: bool = False):
     """Run the frozen base once (no grad) and build the indexer warm-up inputs
-    from its four source layers. Returns ``(H, k_pages, target, n_pages)``:
-    H [b,L,t,hidden], per-page K [b,L,pages,hkv,d], the streamed dense page-mass
-    teacher [b,L,t,pages] with the window excluded, and the per-row page count.
-    Shared by the train step and the recall eval (no optimizer in the eval)."""
+    from its four source layers. Returns
+    ``(H, k_pages, target, n_pages, q_eval, bounds)``:
+    H [b,L,nq,hidden] at ``q_positions`` (all T positions when None), per-page
+    mean K [b,L,pages,hkv,d], the streamed dense page-mass teacher [b,L,nq,pages]
+    with the window excluded, the per-row page count, sampled post-rope queries
+    [b,L,nq,hq,d], and per-page Quest bounds [b,L,pages,hkv,2,d] (kmin/kmax over
+    the page's real tokens) for the training-free bounds recall. Shared by the
+    train step and the recall eval (one forward feeds both scorers). When
+    ``return_raw`` the tuple ends with the PRE-renorm page mass (window still in,
+    rows sum to 1) for window-included recall controls."""
     from .sparse_index import exclude_window_renorm, index_source_groups
 
     b, t = ids.shape
@@ -416,31 +445,93 @@ def indexer_capture(model: Any, ids: torch.Tensor, backend: Any, block: int,
     n_pages = torch.full((b,), n_pages_tok, dtype=torch.long)
     pad_tok = n_pages_tok * block - t
     captured.sort(key=lambda c: c[0])
-    # Indexer-Q and the teacher are over the real T query positions (no pad); only
-    # KEYS are padded to a whole page so the page reshape is legal.
+    # Indexer-Q and the teacher evaluate only q_positions (all T when None); only
+    # KEYS span the full length, padded to a whole page so the reshape is legal.
     H = torch.stack([c[1] for c in captured], dim=1)
     K = torch.stack([c[3] for c in captured], dim=1)
+    Q = torch.stack([c[2] for c in captured], dim=1)     # post-rope q [b,L,t,hq,d]
+    if q_positions is not None:
+        H = H.index_select(2, q_positions)
+    q_eval = Q if q_positions is None else Q.index_select(2, q_positions)
     if pad_tok:
         K = torch.nn.functional.pad(K, (0, 0, 0, 0, 0, pad_tok))
-    mass = torch.stack([dense_causal_page_mass(c[2], c[3], block) for c in captured], dim=1)
+    mass = torch.stack([dense_causal_page_mass(c[2], c[3], block, q_positions)
+                        for c in captured], dim=1)
     k_blocks = K.reshape(b, len(captured), n_pages_tok, block, hkv, d_kv)
+
+    def _page_bounds(real: torch.Tensor) -> torch.Tensor:
+        """Per-page Quest kmin/kmax over the page's REAL tokens; the last page
+        may be partial (real.shape[3] < block), amin/amax ignore its length."""
+        return torch.stack((real.amin(dim=3), real.amax(dim=3)), dim=4)
+
     if pad_tok:
         # trailing page has fewer real keys: divide each page's sum by its real
-        # key count so the partial page is not underweighted by zero padding.
+        # key count so the partial page is not underweighted by zero padding;
+        # its bounds are taken over the real keys only (amin would else be 0).
         counts = torch.full((n_pages_tok,), float(block), device=K.device)
         counts[-1] = block - pad_tok
         k_pages = k_blocks.sum(3) / counts[None, None, :, None, None]
+        bounds_full = _page_bounds(k_blocks[:, :, :-1])
+        bounds_last = _page_bounds(k_blocks[:, :, -1:, : block - pad_tok])
+        bounds = torch.cat((bounds_full, bounds_last), dim=2)
     else:
         k_pages = k_blocks.mean(dim=3)
+        bounds = _page_bounds(k_blocks)
     target = exclude_window_renorm(mass, n_pages, n_win_pages)
-    return H, k_pages, target, n_pages
+    base = (H, k_pages, target, n_pages, q_eval, bounds)
+    if return_raw:
+        # pre-renorm page mass still includes the window; rows sum to 1.
+        return (*base, mass)
+    return base
+
+
+def quest_bounds_scores(q_eval: torch.Tensor, bounds: torch.Tensor) -> torch.Tensor:
+    """Training-free Quest upper-bound scores from per-page kmin/kmax, max-pooled
+    over the sampled queries (the unit-F scorer). ``q_eval`` [b,L,nq,hq,d],
+    ``bounds`` [b,L,p,hkv,2,d] -> [b,L,p]:
+    ``sum_h max_t sum_d max(q*kmin, q*kmax)`` averaged over each GQA group's
+    attention heads. A page hot for ANY sampled query is selectable. Bounds are
+    stored fp16 exactly as the engine's page_bounds_one, so the scored selection
+    is the served one (kmin/kmax rounded before the products)."""
+    return _quest(q_eval, bounds, pool_heads=True)
+
+
+def quest_bounds_scores_per_head(q_eval: torch.Tensor,
+                                 bounds: torch.Tensor) -> torch.Tensor:
+    """Same as :func:`quest_bounds_scores` but WITHOUT the GQA head mean: score
+    per attention head (repeat KV bounds over the group), max over queries, sum
+    over ALL heads. The #518 item-3 unpooled variant; [b,L,p]."""
+    return _quest(q_eval, bounds, pool_heads=False)
+
+
+def _quest(q_eval: torch.Tensor, bounds: torch.Tensor,
+           pool_heads: bool) -> torch.Tensor:
+    b, l, nq, hq, d = q_eval.shape
+    hkv = bounds.shape[3]
+    kmin, kmax = bounds.to(torch.float16).float().unbind(dim=4)   # [b,L,p,hkv,d]
+    if pool_heads:
+        qi = q_eval.float().reshape(b, l, nq, hkv, hq // hkv, d).mean(dim=4)
+    else:
+        qi = q_eval.float()                                        # [b,L,nq,hq,d]
+        rep = hq // hkv
+        kmin = kmin.repeat_interleave(rep, dim=3)
+        kmax = kmax.repeat_interleave(rep, dim=3)
+    per = torch.maximum(
+        qi[:, :, :, None, :, :] * kmin[:, :, None, :, :, :],
+        qi[:, :, :, None, :, :] * kmax[:, :, None, :, :, :],
+    ).sum(dim=-1)                                                  # [b,L,nq,p,kh]
+    return per.amax(dim=2).sum(dim=-1)                             # [b,L,p]
 
 
 def indexer_recall(model: Any, ids: torch.Tensor, backend: Any,
                    weights: dict[str, torch.Tensor], k_pages_pick: int,
-                   block: int = 16) -> float:
-    """Mean top-k recall of dense page mass for one batch under the current
-    indexer weights, no gradient. The science metric's runtime wrapper."""
+                   block: int = 16,
+                   q_positions: torch.Tensor | None = None) -> dict:
+    """Top-k recall of dense page mass for one batch, no gradient, from ONE
+    frozen forward, for BOTH scorers: the learned indexer (current weights) and
+    the training-free Quest bounds scorer. The 27B run passes 256 seeded
+    ``q_positions`` per span so the teacher is O(256*T), not O(T^2). Returns
+    ``{"index": float, "bounds": float}``."""
     from .sparse_index import (
         WINDOW_PAGES,
         page_scores_for_selector,
@@ -449,15 +540,18 @@ def indexer_recall(model: Any, ids: torch.Tensor, backend: Any,
         topk_page_recall,
     )
 
-    H, k_pages, target, n_pages = indexer_capture(
-        model, ids, backend, block, WINDOW_PAGES)
+    H, k_pages, target, n_pages, q_eval, bounds = indexer_capture(
+        model, ids, backend, block, WINDOW_PAGES, q_positions)
     if weights["ik"].shape[0] != model.cfg.num_kv_heads:
         raise ValueError("index heads must equal KV heads")
     with torch.no_grad():
         iq = project_indexer_queries(H, weights["iq"])
         ik = project_page_keys(k_pages, weights["ik"])
-        scores = page_scores_for_selector(iq, ik, n_pages, WINDOW_PAGES)
-        return float(topk_page_recall(scores, target, n_pages, k_pages_pick, WINDOW_PAGES))
+        index_sel = page_scores_for_selector(iq, ik, n_pages, WINDOW_PAGES)
+        bounds_sel = quest_bounds_scores(q_eval, bounds)
+        f = lambda s: float(
+            topk_page_recall(s, target, n_pages, k_pages_pick, WINDOW_PAGES))
+        return {"index": f(index_sel), "bounds": f(bounds_sel)}
 
 
 def indexer_warmup_step(
@@ -467,15 +561,17 @@ def indexer_warmup_step(
     weights: dict[str, torch.Tensor],
     optimizer: AdamW,
     block: int = 16,
+    q_positions: torch.Tensor | None = None,
 ) -> float:
     """One indexer warm-up step on captured frozen-base inputs: the two indexer
     projection weights (``iq`` [ih,hidden,di], ``ik`` [ih,d_kv,di]) learn to
-    match the dense page-mass teacher via the ``indexer_warmup`` tape op."""
+    match the dense page-mass teacher via the ``indexer_warmup`` tape op.
+    ``q_positions`` subsamples the evaluated queries (27B: 256 per span)."""
     from .sparse_index import WINDOW_PAGES, indexer_warmup_loss
 
     ids = torch.as_tensor(input_ids, dtype=torch.long, device=backend.device)
-    H, k_pages, target, n_pages = indexer_capture(
-        model, ids, backend, block, WINDOW_PAGES)
+    H, k_pages, target, n_pages, _, _ = indexer_capture(
+        model, ids, backend, block, WINDOW_PAGES, q_positions)
     iq_w, ik_w = weights["iq"], weights["ik"]
     with Tape() as tape:
         loss = indexer_warmup_loss(H, k_pages, iq_w, ik_w, target, n_pages, WINDOW_PAGES)
@@ -516,30 +612,55 @@ def indexer_warmup(model: Any, backend: Any, steps: int, seed: int = 0,
 
 def indexer_warmup_run(model: Any, backend: Any, train_batches: list,
                        held_batches: dict, k_pages_pick: int, steps: int,
-                       lr: float, seed: int = 0, di: int | None = None) -> dict:
+                       lr: float, seed: int = 0, di: int | None = None,
+                       q_samples: int = 0, q_min_pos: int = 2048) -> dict:
     """The science run over real long-text spans. ``train_batches`` is a list of
     id tensors cycled for ``steps``; ``held_batches`` maps a length label to id
     tensors used for gradient-free recall before and after. Returns recall
-    before/after per held-out length, the KL curve and tokens seen."""
+    before/after per held-out length (mean and per-span min), the KL curve and
+    tokens seen. ``q_samples>0`` subsamples that many seeded query positions >=
+    q_min_pos per span for the dense teacher (27B: 256, turning O(T^2) into
+    O(256*T)); the same positions are reused for a span before/after and across
+    warm-up via ``seed`` + the span's list index."""
     gen = torch.Generator(device=backend.device).manual_seed(seed)
     weights = init_indexer_weights(model.cfg, gen, backend.device, di)
 
+    def qpos(ids, span_seed):
+        if q_samples <= 0:
+            return None
+        return sample_query_positions(int(ids.shape[1]), q_samples, span_seed,
+                                      q_min_pos, backend.device)
+
+    def eval_group(batches, span_seed0):
+        # One forward per span returns BOTH scorers ("index" learned, "bounds"
+        # training-free Quest); structure the result per scorer.
+        vals = [indexer_recall(model, ids, backend, weights, k_pages_pick,
+                               q_positions=qpos(ids, span_seed0 + j))
+                for j, ids in enumerate(batches)]
+        return {scorer: {"mean": float(np.mean([v[scorer] for v in vals])),
+                         "min": float(np.min([v[scorer] for v in vals])),
+                         "per_span": [float(v[scorer]) for v in vals]}
+                for scorer in ("index", "bounds")}
+
     def recalls() -> dict:
-        return {label: sum(indexer_recall(model, ids, backend, weights, k_pages_pick)
-                           for ids in batches) / len(batches)
-                for label, batches in held_batches.items()}
+        # held groups are sorted ctx labels, same order across before/after.
+        return {label: eval_group(batches, seed + 100003 * j)
+                for j, (label, batches) in enumerate(sorted(held_batches.items()))}
 
     before = recalls()
     opt = AdamW(lr=lr)
     curve, tokens_seen = [], 0
     for i in range(steps):
         ids = train_batches[i % len(train_batches)]
-        curve.append(indexer_warmup_step(model, ids, backend, weights, opt))
+        curve.append(indexer_warmup_step(
+            model, ids, backend, weights, opt,
+            q_positions=qpos(ids, seed + 7919 * (i % len(train_batches)))))
         tokens_seen += int(ids.numel())
     after = recalls()
     return {"recall_before": before, "recall_after": after, "kl_curve": curve,
             "tokens_seen": tokens_seen, "steps": steps, "weights": weights,
-            "k_pages": k_pages_pick, "di": weights["iq"].shape[-1]}
+            "k_pages": k_pages_pick, "di": weights["iq"].shape[-1],
+            "q_samples": q_samples, "q_min_pos": q_min_pos}
 
 
 def load_span_corpus(cdir: Any, device) -> dict:
@@ -560,13 +681,28 @@ def load_span_corpus(cdir: Any, device) -> dict:
 
 
 def indexer_held_recall(model: Any, backend: Any, cdir: Any,
-                        weights: dict[str, torch.Tensor], k_pages_pick: int) -> dict:
+                        weights: dict[str, torch.Tensor], k_pages_pick: int,
+                        q_samples: int = 0, q_min_pos: int = 2048,
+                        seed: int = 0) -> dict:
     """Gradient-free mean recall per span length over a held-only span dir, under
-    the supplied (already-trained) weights — the cross-corpus control."""
+    the supplied (already-trained) weights — the cross-corpus control. Mirrors
+    the science run's seeded sampled-teacher option."""
     groups = load_span_corpus(cdir, backend.device)
-    return {label: sum(indexer_recall(model, ids, backend, weights, k_pages_pick)
-                       for ids in batches) / len(batches)
-            for label, batches in groups.items()}
+    out = {}
+    for j, (label, batches) in enumerate(sorted(groups.items())):
+        vals = []
+        for k, ids in enumerate(batches):
+            qp = (sample_query_positions(int(ids.shape[1]), q_samples,
+                                         seed + 100003 * j + k, q_min_pos,
+                                         backend.device)
+                  if q_samples > 0 else None)
+            vals.append(indexer_recall(model, ids, backend, weights, k_pages_pick,
+                                       q_positions=qp))
+        out[label] = {scorer: {"mean": float(np.mean([v[scorer] for v in vals])),
+                               "min": float(np.min([v[scorer] for v in vals])),
+                               "per_span": [float(v[scorer]) for v in vals]}
+                      for scorer in ("index", "bounds")}
+    return out
 
 
 def train_step(

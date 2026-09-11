@@ -458,7 +458,7 @@ def _train_indexer_recall(args: argparse.Namespace, backend, model, log) -> dict
 
     cdir = Path(args.indexer_corpus)
 
-    def load(split: str):
+    def load(split: str, max_total: int = 0):
         groups = {}
         for path in sorted(cdir.glob(f"{split}_*.jsonl")):
             rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
@@ -466,17 +466,31 @@ def _train_indexer_recall(args: argparse.Namespace, backend, model, log) -> dict
             groups[str(ctx)] = [
                 torch.tensor(r["ids"], dtype=torch.long, device=backend.device).unsqueeze(0)
                 for r in rows]
-            log(f"{split} ctx={ctx}: {len(groups[str(ctx)])} prompts")
+        labels = sorted(groups)
+        for ctx in labels:
+            log(f"{split} ctx={ctx}: {len(groups[ctx])} prompts available")
+        if max_total:
+            # balanced round-robin across the sorted lengths: 16 over 3 -> 6/5/5,
+            # so the cut run is not weighted to cheap 8k spans.
+            import itertools
+            picked: dict[str, int] = {ctx: 0 for ctx in labels}
+            for ctx in itertools.islice(itertools.cycle(labels), max_total):
+                if picked[ctx] < len(groups[ctx]):
+                    picked[ctx] += 1
+            groups = {ctx: groups[ctx][: picked[ctx]] for ctx in labels}
+            for ctx in labels:
+                log(f"{split} ctx={ctx}: using {picked[ctx]} spans (balanced cut)")
         return groups
 
-    held = load("held")
+    held = load("held", getattr(args, "held_spans", 0))
     train_groups = load("train")
     # cycle training prompts across lengths in an interleaved order
     train_batches = [b for grp in zip_longest_flat(train_groups) for b in [grp] if b is not None]
     t0 = time.perf_counter()
     out = train_mod.indexer_warmup_run(
         model, backend, train_batches, held, args.k_pages, args.steps, args.lr,
-        seed=args.seed, di=args.indexer_di)
+        seed=args.seed, di=args.indexer_di,
+        q_samples=args.q_samples, q_min_pos=args.q_min_pos)
     out["secs_total"] = time.perf_counter() - t0
     out["corpus"] = file_hash(str(cdir / "manifest.json")) if (cdir / "manifest.json").exists() else None
     # Optional cross-corpus control: held-only recall before/after under the SAME
@@ -485,7 +499,8 @@ def _train_indexer_recall(args: argparse.Namespace, backend, model, log) -> dict
     if args.indexer_control_corpus:
         cdir2 = Path(args.indexer_control_corpus)
         out["control"] = train_mod.indexer_held_recall(
-            model, backend, cdir2, out["weights"], args.k_pages)
+            model, backend, cdir2, out["weights"], args.k_pages,
+            q_samples=args.q_samples, q_min_pos=args.q_min_pos, seed=args.seed)
         out["control_corpus"] = file_hash(str(cdir2 / "manifest.json")) \
             if (cdir2 / "manifest.json").exists() else None
     for i, v in enumerate(out["kl_curve"]):
@@ -539,20 +554,39 @@ def _train_indexer_warmup(args: argparse.Namespace) -> None:
             "tokens_seen": out["tokens_seen"], "k_pages": out["k_pages"], "di": out["di"],
             "kl_first": out["kl_curve"][0], "kl_last": out["kl_curve"][-1],
             "secs_total": out["secs_total"], "corpus": out.get("corpus"),
-            **{f"recall_before_{k}": v for k, v in out["recall_before"].items()},
-            **{f"recall_after_{k}": v for k, v in out["recall_after"].items()}}
+            "q_samples": out.get("q_samples", 0), "q_min_pos": out.get("q_min_pos")}
+
+        def flatten(tag, book):
+            # book: {ctx: {"index"|"bounds": {mean,min,per_span}}}
+            for ctx, scorers in book.items():
+                for sc, st in scorers.items():
+                    metrics[f"recall_{tag}_{sc}_{ctx}"] = st["mean"]
+                    if tag in ("before", "after"):
+                        metrics[f"recall_{tag}_{sc}_min_{ctx}"] = st["min"]
+
+        flatten("before", out["recall_before"])
+        flatten("after", out["recall_after"])
         if "control" in out:
             metrics["control_corpus"] = out.get("control_corpus")
-            metrics.update({f"control_recall_{k}": v
-                           for k, v in out["control"].items()})
+            for ctx, scorers in out["control"].items():
+                for sc, st in scorers.items():
+                    metrics[f"control_recall_{sc}_{ctx}"] = st["mean"]
+        manifest["recall_detail"] = {
+            "before": out["recall_before"], "after": out["recall_after"]}
         manifest["metrics"] = metrics
-        # Accept: mean after-recall across held-out lengths clears the threshold;
-        # per-length recall is recorded (the pre-registered mixture scope).
-        afters = list(out["recall_after"].values())
+        # Accept: mean LEARNED-indexer after-recall over held lengths clears the
+        # threshold; the training-free bounds recall is a reported baseline, not a
+        # gate. Per-length mean, per-span min and per-span values are recorded.
+        afters = [v["index"]["mean"] for v in out["recall_after"].values()]
         mean_after = sum(afters) / len(afters)
+        worst_span = min(v["index"]["min"] for v in out["recall_after"].values())
+        bounds_after = [v["bounds"]["mean"] for v in out["recall_before"].values()]
+        bounds_mean = sum(bounds_after) / len(bounds_after)
         manifest["gates"] = [{
             "name": "indexer_recall_at_k", "value": mean_after, "threshold": acc,
-            "kind": "verdict", "skipped": False, "passed": mean_after >= acc}]
+            "kind": "verdict", "skipped": False, "passed": mean_after >= acc,
+            "per_span_min": worst_span,
+            "training_free_bounds_recall_mean": bounds_mean}]
         manifest["finished"] = now()
         write_manifest(runs_root(), manifest)
         print(json.dumps(manifest, indent=1) if args.json else format_run(manifest))
@@ -2475,6 +2509,14 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                          help="27B indexer recall acceptance: mean recall@k_pages after warm-up")
     p_train.add_argument("--indexer-control-corpus",
                          help="held-only span dir: cross-corpus control recall under the trained weights")
+    p_train.add_argument("--q-samples", type=int, default=0,
+                         help="27B recall: evaluate the dense teacher at this many seeded query "
+                              "positions per span (256 -> O(256*T) instead of O(T^2)); 0 = all")
+    p_train.add_argument("--q-min-pos", type=int, default=2048,
+                         help="27B recall: sampled query positions are >= this (leaves missable pages)")
+    p_train.add_argument("--held-spans", type=int, default=0,
+                         help="27B recall: use a balanced round-robin subset of this many "
+                              "held spans across lengths (16 over 8k/16k/32k -> 6/5/5); 0 = all")
     p_train.add_argument("--rl", action="store_true",
                          help="GRPO: the engine samples a group per prompt, a reward scores "
                               "them, the group mean is the baseline (no critic)")
