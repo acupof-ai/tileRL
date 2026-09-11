@@ -1107,7 +1107,8 @@ class Engine:
             hot = sum(len(self._sparse.resident.get(r.req_id, ()))
                       for r in self._running) * block_n
             measured.pop("kv_pool")
-            measured["page_bounds"] = self._sparse.bounds_bytes()
+            measured["index_keys" if self._sparse.scorer == "index"
+                     else "page_bounds"] = self._sparse.bounds_bytes()
             measured["kv_hot"] = hot
             if getattr(kv, "cold", None) is not None and kv.cold.bytes_held:
                 measured["kv_cold"] = kv.cold.bytes_held
@@ -1144,7 +1145,7 @@ class Engine:
             # Live sparse ledger from ACTUAL per-row state (post-tick every private page is
             # demoted, so kv_hot counts the blocks currently in r.blocks): bounds are count-
             # derived per complete page, hot per resident block, cold from the host tier.
-            from .memory import Row, page_bounds_bytes, per_kv_block_bytes
+            from .memory import Row, index_keys_bytes, page_bounds_bytes, per_kv_block_bytes
 
             derived = plan(self._model.cfg, self._model.params, 0, num_slots=sp.num_slots,
                            num_blocks=kv.num_blocks, spec_steps=0,
@@ -1153,19 +1154,25 @@ class Engine:
             derived = [r for r in derived if r.owner != "kv_pool"]
             cfg = self._model.cfg
             block_n = per_kv_block_bytes(cfg, kv.dtype, kv.kv_fp8)
-            bounds_n = hot_n = cold_n = 0
+            hot_n = cold_n = 0
             pages_total = 0
             for r in self._running:
                 complete = r.seq_len // BLOCK_TOKENS
                 pages_total += complete
                 hot_n += len(r.blocks) * block_n
-            bounds_n = page_bounds_bytes(cfg, pages_total)
+            if self._sparse.scorer == "index":
+                scorer_n = index_keys_bytes(cfg, pages_total, self._sparse.di)
+                owner = "index_keys"
+                note = f"{pages_total} complete pages, learned index scorer"
+            else:
+                scorer_n = page_bounds_bytes(cfg, pages_total)
+                owner = "page_bounds"
+                note = f"{pages_total} complete pages, bounds scorer"
             cold_n = ssd_n = 0
             if getattr(kv, "cold", None) is not None:
                 cold_n = kv.cold.bytes_held
                 ssd_n = kv.cold.ssd_bytes
-            derived.append(Row("device", "page_bounds", bounds_n,
-                               f"{pages_total} complete pages, bounds scorer"))
+            derived.append(Row("device", owner, scorer_n, note))
             derived.append(Row("device", "kv_hot", hot_n, "resident private blocks this tick"))
             if cold_n:
                 derived.append(Row("host", "kv_cold", cold_n, "demoted pages in pinned host RAM"))
@@ -1277,6 +1284,27 @@ class Engine:
             return 0, [], None
         return matched, list(hit.blocks[: matched // BLOCK_TOKENS]), hit.state
 
+    def sparse_selection_recall(self, req_id: int,
+                                target_mass: torch.Tensor) -> dict[int, float]:
+        """Recall of the LAST tick's served selection against an offline dense
+        page-mass target ``[1, n_groups, nq, pages]`` (window excluded), per
+        source group. Lets the card run score what the engine actually selected
+        rather than only the offline teacher. Full k -> 1.0."""
+        sel = self._sparse.last_selected.get(req_id)
+        if sel is None:
+            return {}
+        out: dict[int, float] = {}
+        for g, (cand, chosen) in sel.items():
+            k = min(self._sparse.k_pages, len(cand))
+            if k == 0:
+                out[g] = 0.0
+                continue
+            ci = torch.tensor(cand, device=target_mass.device)
+            mass = target_mass[0, g].sum(0).index_select(0, ci)
+            dense = {cand[int(i)] for i in mass.topk(k).indices.tolist()}
+            out[g] = len(dense & set(chosen)) / k
+        return out
+
     def _sparse_rows(self, rows: list[_Req], seq_q: list[int], decodes: list[_Req]):
         """Build this tick's SparseForward: per-row own span (allocated/promoted),
         earlier complete candidate pages, and a resolve closure that promotes a cold
@@ -1301,7 +1329,8 @@ class Engine:
                 force_window = _WP                    # force the 8 pre-chunk pages
             own = list(range(own_first, own_last + 1))
             own_len = q_hi - own_first * BLOCK_TOKENS
-            cand = [p for p in range(0, own_first) if p in tr.bounds[r.req_id]]
+            scored = tr.bounds if tr.scorer == "bounds" else tr.keys
+            cand = [p for p in range(0, own_first) if p in scored[r.req_id]]
 
             def resolve(p, r=r):
                 return self._sparse_resolve(r, p)
@@ -1376,6 +1405,8 @@ class Engine:
         # in the design); pin the deltas when the card bench justifies it."""
         tr = self._sparse
         pool = self._kv
+        from .sparse_engine import project_index_page_keys
+
         for bi, r in enumerate(rows):
             rid = r.req_id
             live = tr.resident[rid]
@@ -1383,28 +1414,42 @@ class Engine:
             complete = q_hi // BLOCK_TOKENS
             # Whole pages eligible for the block-aligned prefix stay in the
             # REQUEST's private cold tier (the publisher's continuation is
-            # untouched by sharing), AND a clone is handed to the prefix index so
-            # a same-prefix follower can adopt it. Bounds ride on the clone.
+            # untouched by sharing); under the bounds scorer a clone is also
+            # handed to the prefix index (prefix sharing is bounds-only for
+            # now; the learned index path does not publish keys).
             publish_blobs: dict[int, dict] = {}
-            for p in range(len(tr.bounds[rid]), complete):
+            stored = tr.bounds if tr.scorer == "bounds" else tr.keys
+            for p in range(len(stored[rid]), complete):
                 if p not in live:
-                    continue                       # selected candidate promoted with bounds
+                    # selected candidate promoted with its scorer state already
+                    continue
                 phys = live[p]
                 if pool.kv_fp8 is not None:
-                    raise NotImplementedError("sparse bounds over an fp8 pool: card PR")
-                b = torch.stack([
-                    torch.stack((
-                        pool.k_pool[plane, phys].amin(dim=1),
-                        pool.k_pool[plane, phys].amax(dim=1)), dim=1)
-                    for plane in range(pool.num_layers)]).to(torch.float16)
-                tr.set_bounds(rid, p, b)
+                    raise NotImplementedError(
+                        f"sparse {tr.scorer} state over an fp8 pool: card PR")
+                if tr.scorer == "bounds":
+                    b = torch.stack([
+                        torch.stack((
+                            pool.k_pool[plane, phys].amin(dim=1),
+                            pool.k_pool[plane, phys].amax(dim=1)), dim=1)
+                        for plane in range(pool.num_layers)]).to(torch.float16)
+                    tr.set_bounds(rid, p, b)
+                else:
+                    # mean K per source plane -> learned fp8 indexer keys
+                    kmean = torch.stack([
+                        pool.k_pool[plane, phys].to(tr.ik.dtype).mean(dim=1)
+                        for plane in tr.src_planes])
+                    keys, scales = project_index_page_keys(kmean[None], tr.ik)
+                    keys, scales = keys[0], scales[0]
+                    tr.set_index_keys(rid, p, keys.to(pool.k_pool.device),
+                                      scales.to(pool.k_pool.device))
             for p, phys in list(live.items()):
                 # Key the host blob by (req, logical page), not the recycled phys:
                 # the frame is freed now and reissued to a later page.
                 pool.demote_page(phys, key=(rid, p))
                 r.blocks.remove(phys)
                 r.cold_pages.append(p)
-                if (tr.prefix is not None and p < complete
+                if (tr.scorer == "bounds" and tr.prefix is not None and p < complete
                         and (p + 1) * BLOCK_TOKENS <= len(r.tokens)):
                     clone = self._sparse_clone_cold(pool, (rid, p))
                     if clone is not None:
@@ -1555,6 +1600,14 @@ class Engine:
         )
         if sparse:
             self._sparse_finalize(sf, rows)
+            # retain the last tick's served candidates+selection so a recall probe
+            # reads it after the SparseForward is discarded:
+            # req -> {group: (candidate_pages, chosen_candidate_pages)}.
+            self._sparse.last_selected = {
+                r.req_id: {
+                    g: (list(sf.rows[i]["cand"]), sf.selected(i, g))
+                    for g in range(sf.n_groups)}
+                for i, r in enumerate(rows)}
         if hid is not None:
             n_aux = len(self._aux_layers)
             for i, r in enumerate(rows):  # hidden_out is full width, appended before last_only
@@ -2282,9 +2335,8 @@ def build_engine(
 
     sparse_tracker: SparseTracker | None = None
     if sparse_k:
-        if scorer != "bounds":
-            raise NotImplementedError(
-                f'sparse engine scorer {scorer!r}: Unit F wires only "bounds"')
+        if scorer not in ("bounds", "index"):
+            raise ValueError(f'sparse engine scorer {scorer!r}: want bounds|index')
         if not kv_cold_bytes:
             raise ValueError("sparse_k needs kv_cold_bytes: dropped pages demote to the host tier")
         if draft is not None:
@@ -2293,9 +2345,14 @@ def build_engine(
         # memory; a captured decode graph cannot hold that. Eager only until cc's cells.
         decode_graph = False
         sparse_tracker = SparseTracker(cfg, sparse_k, scorer)
-        # An explicitly-passed NoPrefixStore means "sharing off" (training/old tests);
-        # otherwise the sparse prefix index is attached once the cold tier exists.
+        # An explicitly-passed NoPrefixStore means "sharing off" (training/old
+        # tests); otherwise the sparse prefix index attaches once the cold tier
+        # exists.
         sparse_tracker.sharing_enabled = not isinstance(prefix_store, NoPrefixStore)
+        if scorer == "index":
+            # materialize ran after construction; keep indexer weights on-device.
+            sparse_tracker.iq = sparse_tracker.iq.to(backend.device)
+            sparse_tracker.ik = sparse_tracker.ik.to(backend.device)
     if draft is not None:
         draft.set_depth(spec_depth)  # the state pool is sized by the width it settles on
     model.params = backend.materialize(model.params)

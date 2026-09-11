@@ -19,7 +19,7 @@ Bounds scorer, the training-free day-1 path:
   ``own_len - sq == q_start - own_offsets``. RefBackend is the CPU
   parity oracle; cc's sm70 cell matches it without a new kernel (sm90 pending).
 
-``scorer="index"`` is the later learned-indexer PR and refuses here.
+``scorer="index"`` (this PR): the learned indexer.
 """
 
 from __future__ import annotations
@@ -86,37 +86,87 @@ def quest_scores(q: Tensor, bounds: Tensor) -> Tensor:
 
 
 class SparseTracker:
-    """Engine-scoped bounds store: ``bounds[req_id][logical page]`` is an fp16
-    ``[n_full, Hkv, 2, D]`` tensor living independently of the KV pool, so it
-    survives a page's demotion to the host."""
+    """Engine-scoped scorer store, independent of the KV pool so it survives a
+    page's demotion to host:
 
-    def __init__(self, cfg, k_pages: int, scorer: str):
-        if scorer != "bounds":
+    - ``bounds`` (scorer="bounds"): req -> page -> fp16 ``[n_full, Hkv, 2, D]``
+      Quest kmin/kmax, one per full-attn plane;
+    - ``keys`` (scorer="index"): req -> page -> fp8 indexer keys
+      ``[n_src, Hkv, di]`` plus an f32 scale per key ``[n_src, Hkv]`` (one scale
+      over di=128), projected from the page's mean K at append time by the
+      learned ik_weight. Indexer-Q is projected live from each source layer's H.
+
+    The untrained day-0 path inits small iq/ik weights deterministically; the
+    learned weights are a later load. At full k both scorers select every
+    candidate page and are token-identical to dense."""
+
+    def __init__(self, cfg, k_pages: int, scorer: str, weights: dict | None = None):
+        if scorer not in ("bounds", "index"):
             raise NotImplementedError(
-                f'sparse engine scorer {scorer!r}: Unit F wires only "bounds"; '
-                "the learned indexer is the later PR")
+                f'sparse engine scorer {scorer!r}: want "bounds" or "index"')
         self.cfg = cfg
         self.k_pages = k_pages
         self.scorer = scorer
         self.src_planes, self.group_of = group_map(cfg)
-        self.bounds: dict[int, dict[int, Tensor]] = {}
+        self.src_index = {plane: j for j, plane in enumerate(self.src_planes)}
         #: resident private pages: req_id -> {logical page: physical block}
         self.resident: dict[int, dict[int, int]] = {}
         #: logical pages adopted from a shared prefix entry: req_id -> {page: content key}
         self.shared: dict[int, dict[int, int]] = {}
-        self.bytes_per_page = 0
         #: host-blob-backed prefix index (None = the NoPrefixStore stopgap)
         self.prefix: SparsePrefixCache | None = None
         #: False when the caller explicitly chose NoPrefixStore (sharing disabled)
         self.sharing_enabled = True
+        #: last tick's served selection per req/group (set after each forward)
+        self.last_selected: dict[int, dict[int, list[int]]] = {}
+        self.bytes_per_page = 0
+        if scorer == "bounds":
+            self.bounds: dict[int, dict[int, Tensor]] = {}
+            self.keys = None
+            self.iq = self.ik = None
+        else:
+            from .sparse_index import INDEX_HEADS
+
+            # The shipped model has num_kv_heads==4==ih; the tiny cell has 2 KV
+            # heads, so it runs ih=2 (head grouping still divides), matching the
+            # indexer-weight init used by the warm-up.
+            ih = min(INDEX_HEADS, cfg.num_kv_heads)
+            self.ih = ih
+            self.bounds = None
+            self.keys: dict[int, dict[int, tuple[Tensor, Tensor]]] = {}
+            di = min(16, cfg.head_dim)          # tiny cell di=16; served di=128
+            gen = torch.Generator().manual_seed(0)
+            scale = 0.1
+
+            def _w(shape):
+                return scale * torch.randn(*shape, generator=gen)
+
+            if weights is None:
+                iq = _w((ih, cfg.hidden_size, di))
+                ik = _w((ih, cfg.head_dim, di))
+            else:
+                iq, ik = weights["iq"], weights["ik"]
+            self.iq, self.ik = iq, ik
+            self.di = int(ik.shape[-1])
+            self._fp8 = torch.float8_e4m3fn
+            # keys pages*n_src*ih*di fp8 + one f32 scale per (page,src,head).
+            self.bytes_per_page = (
+                len(self.src_planes) * ih * di + len(self.src_planes) * ih * 4)
 
     def attach(self, req_id: int) -> None:
-        self.bounds.setdefault(req_id, {})
+        if self.scorer == "bounds":
+            self.bounds.setdefault(req_id, {})
+        else:
+            self.keys.setdefault(req_id, {})
         self.resident.setdefault(req_id, {})
         self.shared.setdefault(req_id, {})
 
     def drop(self, req_id: int) -> None:
-        self.bounds.pop(req_id, None)
+        if self.scorer == "bounds":
+            self.bounds.pop(req_id, None)
+        else:
+            self.keys.pop(req_id, None)
+        self.last_selected.pop(req_id, None)
         self.resident.pop(req_id, None)
         self.shared.pop(req_id, None)
 
@@ -126,8 +176,58 @@ class SparseTracker:
             self.bytes_per_page = b.numel() * b.element_size()
         self.bounds[req_id][page] = b
 
+    def set_index_keys(self, req_id: int, page: int, keys: Tensor,
+                       scales: Tensor) -> None:
+        """Store one page's fp8 indexer keys ``[n_src,Hkv,di]`` and per-key f32
+        scales ``[n_src,Hkv]``. Bytes counted from the stored face so stats'
+        measured reconciles with memory.index_keys_bytes."""
+        keys = keys.contiguous()
+        scales = scales.contiguous()
+        self.keys[req_id][page] = (keys, scales)
+
     def bounds_bytes(self) -> int:
-        return sum(len(pages) * self.bytes_per_page for pages in self.bounds.values())
+        if self.scorer == "bounds":
+            return sum(len(pages) * self.bytes_per_page for pages in self.bounds.values())
+        return self.index_keys_bytes()
+
+    def index_keys_bytes(self) -> int:
+        return sum(len(keys) * self.bytes_per_page
+                   for keys in self.keys.values()) if self.keys else 0
+
+
+
+def project_index_page_keys(k_page_means: Tensor, ik: Tensor) -> tuple[Tensor, Tensor]:
+    """Project one complete page's mean K per source plane into fp8 indexer keys.
+
+    ``k_page_means`` [n_src,Hkv,D], ``ik`` [ih,D,di] -> fp8 [n_src,Hkv,di] plus
+    one f32 scale per (source,head). The attention-head group is a single KV head
+    here (ih==hkv on both tiny and the 27B), so project_page_keys' head mean is
+    the identity; call it for the boundary casts. fp8 = the ledger's storage face
+    (di=128 -> 128 payload B + 4 B scale per key)."""
+    from .sparse_index import project_page_keys
+
+    proj = project_page_keys(k_page_means[None], ik)[0]   # [n_src,Hkv,di], f32
+    scale = proj.float().abs().amax(dim=-1).clamp_min(1e-12) / torch.finfo(
+        torch.float8_e4m3fn).max                            # [n_src,Hkv]
+    keys = (proj.float() / scale[..., None]).to(torch.float8_e4m3fn)
+    return keys, scale.float()
+
+
+def index_scores(q_h: Tensor, tracker: SparseTracker, req_id: int,
+                 cand: list[int], g: int) -> Tensor:
+    """V4.1 learned-indexer page scores for one row/source group over this
+    tick's queries: ReLU(q.k)/sqrt(di) max-pooled over queries, heads summed.
+    ``q_h`` is the layer INPUT H at the source plane ``[Tq,hidden]``; stored
+    candidate keys are dequantized fp8. Returns [len(cand)] f32."""
+    src = tracker.src_planes[g]
+    iq = torch.einsum("qd,hde->qhe", q_h.float().to(tracker.iq.device),
+                      tracker.iq)                       # [Tq,ih,di]
+    keys, scales = zip(*(tracker.keys[req_id][p] for p in cand))
+    ik8 = torch.stack(keys)[:, tracker.src_index[src]]        # [Cp,ih,di]
+    sc = torch.stack(scales)[:, tracker.src_index[src]]       # [Cp,ih]
+    ikd = ik8.float() * sc[..., None]                         # dequant
+    dots = torch.einsum("qhe,phe->qph", iq, ikd) * (tracker.di ** -0.5)
+    return torch.relu(dots).amax(dim=0).sum(dim=-1)          # [Cp]
 
 
 class SparseForward:
@@ -165,7 +265,7 @@ class SparseForward:
             self.own_table[i, : len(r["own"])] = torch.tensor(
                 [r["resolve"](p) for p in r["own"]])
 
-    def _select(self, bi: int, plane: int, q: Tensor) -> Tensor:
+    def _select(self, bi: int, plane: int, q: Tensor, h: Tensor | None) -> Tensor:
         """Physical selected-block table [n] for row bi at this plane; a source
         plane scores and promotes, group-mates reuse the cached decision."""
         g = self.tracker.group_of[plane]
@@ -176,9 +276,16 @@ class SparseForward:
         cand = r["cand"]
         chosen: list[int] = []
         if cand:
-            bounds = torch.stack(
-                [self.tracker.bounds[r["req_id"]][p][plane] for p in cand])
-            scores = quest_scores(q, bounds).reshape(1, 1, len(cand))
+            if self.tracker.scorer == "bounds":
+                bounds = torch.stack(
+                    [self.tracker.bounds[r["req_id"]][p][plane] for p in cand])
+                scores = quest_scores(q, bounds).reshape(1, 1, len(cand))
+            else:
+                # learned indexer: score from the source plane's layer input h
+                if plane != self.tracker.src_planes[g]:
+                    raise KeyError("index scoring requested off a source plane")
+                scores = index_scores(
+                    h, self.tracker, r["req_id"], cand, g).reshape(1, 1, len(cand))
             # logical+1 ids keep real page 0 distinct from the right-pad 0.
             table = (torch.tensor(cand, device=self.device) + _SENTINEL
                      ).reshape(1, -1)
@@ -194,12 +301,14 @@ class SparseForward:
         self._phys[key] = phys
         return phys
 
-    def attention_args(self, plane: int, q: Tensor) -> tuple[Tensor, Tensor]:
+    def attention_args(self, plane: int, q: Tensor,
+                       h: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Packed ``[selected ; own]`` table ``[B,W]`` and per-row packed
         ``seq_len = n_sel*16 + own_len`` for this plane's paged_attention."""
         packed, sl = [], []
         for bi, r in enumerate(self.rows):
-            sel = self._select(bi, plane, q[bi, : r["tq"]])
+            sel = self._select(bi, plane, q[bi, : r["tq"]],
+                               None if h is None else h[bi, : r["tq"]])
             own_n = len(r["own"])
             packed.append(torch.cat((sel, self.own_table[bi, :own_n])))
             sl.append(sel.shape[0] * BLOCK_TOKENS + int(r["own_len"]))
@@ -215,6 +324,10 @@ class SparseForward:
         for g in range(self.n_groups):
             out.update(self._chosen.get((bi, g), ()))
         return out
+
+    def selected(self, bi: int, g: int) -> list[int]:
+        """Chosen LOGICAL candidate pages for one row/group (set after _select)."""
+        return list(self._chosen.get((bi, g), ()))
 
 
 # --- sparse prefix cache (host-blob backed; replaces the NoPrefixStore stopgap) ---

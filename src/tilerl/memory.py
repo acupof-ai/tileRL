@@ -68,22 +68,23 @@ def sparse_pages(context_tokens: int) -> int:
     return -(-int(context_tokens) // BLOCK_TOKENS)
 
 
-def _index_key_format() -> Format:
-    """One projected page key per index head: 128 fp8 elements + one f32 per-128
-    scale (nbytes 132). The 128 is sparse_index.INDEX_HEAD_DIM."""
-    from .sparse_index import INDEX_HEAD_DIM
+def _index_key_format(di: int = 128) -> Format:
+    """One projected page key per index head: ``di`` fp8 elements + one f32
+    scale per key (nbytes di+4). The shipped face is di=128 (132 B); the tiny
+    cell uses di=16 (20 B)."""
+    return Format(bits=8, scales=((di, "f32"),))
 
-    return Format(bits=8, scales=((INDEX_HEAD_DIM, "f32"),))
 
-
-def index_keys_bytes(cfg, pages: int) -> int:
+def index_keys_bytes(cfg, pages: int, di: int = 128) -> int:
     """Learned-indexer keys resident on device: pages x source layers x index heads,
-    one [di=128] fp8 key (132 B) each. 27B: pages x 4 x 4 x 132 = 2,112 B/page
-    = 132 B/token, 33.0 MiB at 256k."""
-    from .sparse_index import INDEX_HEAD_DIM, INDEX_HEADS
+    one [di] fp8 key (di+4 B) each. Shipped di=128 on the 27B: pages x 4 x 4 x
+    132 = 2,112 B/page = 132 B/token, 33.0 MiB at 256k. The live engine passes
+    its actual di so the tiny cell (di=16) reconciles derived == measured."""
+    from .sparse_index import INDEX_HEADS
 
-    per = nbytes(_index_key_format(), (INDEX_HEAD_DIM,))
-    return pages * sparse_source_count(cfg) * INDEX_HEADS * per
+    ih = min(INDEX_HEADS, cfg.num_kv_heads)
+    per = nbytes(_index_key_format(di), (di,))
+    return pages * sparse_source_count(cfg) * ih * per
 
 
 def page_bounds_bytes(cfg, pages: int) -> int:

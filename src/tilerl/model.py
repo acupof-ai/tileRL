@@ -427,7 +427,7 @@ class Model:
                 # packed [selected earlier ; own] table + packed seq_len; the slot-causal
                 # kernel masks it correctly (selected pages are complete earlier pages).
                 block_table, seq_len = sf.attention_args(
-                    kv.kv_pool.plane_of(layer_idx), q)
+                    kv.kv_pool.plane_of(layer_idx), q, h)
             out = backend.paged_attention(
                 q,
                 k_plane,
