@@ -488,7 +488,12 @@ def time_row_ms(row: dict, backend, b: int, s: int) -> float | None:
     if row.get("flops") is not None:
         assert row["flops"] == 2 * m * out_n * inn, (
             f"timed M={m} but row prices {row['flops'] // (2 * out_n * inn)} token rows")
-    wargs, wkw = _pack_for(row["face"], w_bf16)
+    # Pack on CPU: pack_fp4 materializes a nearest-grid LUT of ~8x the weight (a
+    # 17408x5120 layer wants 37.9 GiB) which fits a 95 GB H20 but OOMs a 32 GB
+    # V100. Packing is untimed fixture prep, so its device/place never enters ms.
+    wargs, wkw = _pack_for(row["face"], w_bf16.cpu())
+    wargs = tuple(a.to(dev) for a in wargs)
+    wkw = {k: v.to(dev) for k, v in wkw.items()}
     # identity assertion: the thing we time is the kernel the row's face declared,
     # not a substitute. resolve_row_kernel is the single resolution point. A bound
     # method (CUDABackend.linear_fp4) forms a NEW wrapper on every getattr, so `is`
