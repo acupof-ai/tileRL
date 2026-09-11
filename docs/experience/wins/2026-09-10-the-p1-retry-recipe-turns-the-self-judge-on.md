@@ -87,3 +87,41 @@ pass/fail bands without crossing them; a shaped term that fills the advantage
 in a saturated group measures the shaping, not the method. The recipe carries
 the mechanism that does this, and a config that cannot is rejected, not
 relaunched with a retuned coefficient.
+
+## Amendment 2026-09-11: rollout cap 512 → 768 before the two-seed run
+
+The seed-0 launch (`1feadc1ee6ee`, tree `ae1cfc1c`, card 6) did not crash and
+did not time out: the rollout-length guard stopped it at **step 19 of 100** —
+the last-5 mean was **454.3 completion tokens**, over the guard threshold
+`_ROLLOUT_HEADROOM = 0.8` × 512 = **409.6** (`src/tilerl/cli.py:662`; the
+guard's own message prescribes a cap above 568). The rollouts were growing
+into the 512 cap, not collapsing.
+
+The relaunch raises `--max-new-tokens` **512 → 768** (guard threshold then
+614.4). It does NOT pass `--allow-short-rollouts` and changes nothing else in
+the recipe; eval cap stays 2048.
+
+19-step evidence kept verbatim (per-step log / FAIL row):
+`reward_first 0.8063 → reward_last 0.4281` while
+`tokens_first 291.6 → tokens_last 446.2` — reward falling as completions grow
+is the length-drift signature the guard exists to stop a misread of;
+`ce_last 0.7848`, `tied_group_fraction 0.3684`, `tied_correctness 0.6842`,
+`secs_per_step_median 97.47`, `peak_gib 45.43`, steps 15–19 each at 487–512
+tokens.
+
+Baselines (verbatim from that run): **MMLU before 0.751** (751/1000),
+**GSM8K before 0.916** (458/500).
+
+Acceptance is unchanged, required on BOTH seeds: GSM8K after−before ≥ +25/500
+(+5 pt) on the paired held-out set, reported with a paired McNemar test; MMLU
+after ≥ before − 2 pt (≥ 0.731); `tied_group_fraction < 0.5`; no rollout-length
+collapse (`tokens_last` not below `tokens_first` by the 2026-09-10 margin).
+
+The verdict report must split held-out accuracy **by truncated vs finished**:
+a row that ends at the cap scores 0 and is reported as truncated, so a
+cap-bound batch cannot print headroom it does not have.
+
+Launch: seed 0 on card 6 and seed 1 on card 7 **in parallel**, each
+`--max-new-tokens 768` (~2.7 h/seed), disjoint remote trees; pre-rollout
+baselines are re-measured in each process and reported per seed.
+
