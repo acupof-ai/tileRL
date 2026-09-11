@@ -272,9 +272,10 @@ def _step(
 
 
 def _dense_causal_mass(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-    """Teacher for the indexer warm-up: causal softmax attention mass averaged
-    over query heads (GQA: K heads repeat). ``q`` [b,t,hq,d], ``k`` [b,t,hkv,d]
-    -> [b,t,t], each query row L1-normalised."""
+    """Naive dense teacher O(t^2): causal softmax attention mass averaged over
+    query heads (GQA: K heads repeat). ``q`` [b,t,hq,d], ``k`` [b,t,hkv,d] ->
+    [b,t,t], each query row L1-normalised. The f32 parity oracle for
+    :func:`dense_causal_page_mass`; never used on a long real sequence."""
     b, t, hq, d = q.shape
     rep = hq // k.shape[2]
     k_exp = k.repeat_interleave(rep, dim=2)                       # [b,t,hq,d]
@@ -282,6 +283,65 @@ def _dense_causal_mass(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=q.device))
     scores = scores.masked_fill(~causal[None, None], float("-inf"))
     return torch.softmax(scores, dim=-1).mean(dim=1)             # avg over heads
+
+
+def dense_causal_page_mass(q: torch.Tensor, k: torch.Tensor, block: int = 16
+                           ) -> torch.Tensor:
+    """Dense causal attention mass pooled per key PAGE, averaged over query
+    heads — the warm-up teacher for a LONG sequence (8k-32k), where the naive
+    [t,t] score matrix will not fit. Streams key pages one at a time: an online
+    softmax pass gets each query's log-sum-exp, a second pass normalises each
+    page's numerator. Memory O(t*block), compute the same GEMM as attention.
+
+    ``q`` [b,t,hq,d], ``k`` [b,t,hkv,d] -> [b, t, t//block], each query row
+    L1-normalised over pages strictly before it (window excluded later by
+    :func:`page_mass_target`). Mathematically identical to
+    ``_dense_causal_mass`` pooled by block, which is its CPU gate."""
+    b, t, hq, d = q.shape
+    rep = hq // k.shape[2]
+    k_exp = k.repeat_interleave(rep, dim=2)
+    scale = d ** -0.5
+    n_pages = t // block
+    q_idx = torch.arange(t, device=q.device)
+    neg_inf = torch.finfo(q.dtype).min
+
+    def _page_scores(p):
+        sl = slice(p * block, min((p + 1) * block, t))
+        kj = q_idx[sl]
+        s = torch.einsum("bqhd,bkhd->bhqk", q, k_exp[:, sl]) * scale  # [b,hq,t,blk]
+        valid = q_idx[None, None, :, None] >= kj[None, None, None, :]
+        return s.masked_fill(~valid, float("-inf")), valid
+
+    # Pass 1: online softmax -> per-(b,hq,q) running max and log-sum-exp.
+    neg_inf = torch.finfo(q.dtype).min
+    run_max = torch.full((b, hq, t), neg_inf, dtype=torch.float32, device=q.device)
+    run_sum = torch.zeros((b, hq, t), dtype=torch.float32, device=q.device)
+    for p in range(n_pages):
+        s, valid = _page_scores(p)
+        anyv = valid.any(dim=-1)                              # [b,hq,t]
+        bmax = torch.where(anyv, s.amax(dim=-1), torch.zeros_like(run_max))
+        # exp only over valid keys; a page with no key <= query contributes 0.
+        bsum = torch.where(
+            anyv,
+            torch.where(valid, torch.exp(s - bmax[..., None]), 0.0).sum(dim=-1),
+            torch.zeros_like(run_max))
+        new_max = torch.maximum(run_max, torch.where(anyv, bmax, run_max))
+        old = torch.where(run_max > neg_inf / 2,
+                          run_sum * torch.exp(run_max - new_max), torch.zeros_like(run_sum))
+        add = torch.where(anyv, bsum * torch.exp(
+            torch.where(anyv, bmax, new_max) - new_max), torch.zeros_like(run_sum))
+        run_sum, run_max = old + add, new_max
+    lse = torch.where(run_max > neg_inf / 2,
+                      run_max + run_sum.clamp_min(1e-30).log(), run_max)  # [b,hq,t]
+
+    # Pass 2: normalised causal mass landing on each key page, mean over heads.
+    page_mass = torch.zeros(b, t, n_pages, dtype=torch.float32, device=q.device)
+    lse_safe = torch.where(lse > neg_inf / 2, lse, torch.zeros_like(lse))
+    for p in range(n_pages):
+        s, valid = _page_scores(p)
+        mass_h = torch.where(valid, torch.exp(s - lse_safe[..., None]), 0.0).sum(dim=-1)
+        page_mass[:, :, p] = mass_h.mean(dim=1)
+    return page_mass
 
 
 def indexer_warmup_step(
@@ -299,9 +359,9 @@ def indexer_warmup_step(
     match it via the ``indexer_warmup`` tape op. Returns the scalar KL."""
     from .sparse_index import (
         WINDOW_PAGES,
+        exclude_window_renorm,
         index_source_groups,
         indexer_warmup_loss,
-        page_mass_target,
     )
 
     ids = torch.as_tensor(input_ids, dtype=torch.long, device=backend.device)
@@ -335,11 +395,13 @@ def indexer_warmup_step(
     cap.sort(key=lambda c: c[0])
     H = torch.stack([c[1][:, :n_pages_tok * block] for c in cap], dim=1)   # [b,L,t,hid]
     K = torch.stack([c[3] for c in cap], dim=1)                            # [b,L,t,hkv,d]
-    mass = torch.stack([_dense_causal_mass(c[2], c[3]) for c in cap], dim=1)  # [b,L,t,t]
+    # Long-sequence teacher streamed per page (never a [t,t] matrix), then the
+    # window excluded and the page distribution renormalised.
+    mass = torch.stack([dense_causal_page_mass(c[2], c[3], block) for c in cap], dim=1)
 
     # Per-page K = mean of the block's token Ks: [b,L,pages,hkv,d].
     k_pages = K.reshape(b, len(cap), n_pages_tok, block, hkv, d_kv).mean(dim=3)
-    target = page_mass_target(mass, n_pages, block, WINDOW_PAGES)
+    target = exclude_window_renorm(mass, n_pages, WINDOW_PAGES)
 
     iq_w, ik_w = weights["iq"], weights["ik"]
     with Tape() as tape:
