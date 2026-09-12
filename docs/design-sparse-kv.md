@@ -280,16 +280,19 @@ two dense seeds. A miss on recall is a science result (the single-card token
 budget was not enough), recorded in `errors/` with the token count.
 
 > 2026-09-12: the 27B measurements below supersede this mass gate — the SLO is
-> now output fidelity vs dense. **The default k is decided: 128.** On the V100
+> now output fidelity vs dense. **The default k is decided at 128, interim on
+> n=3 windows** of one held 32k stream (n=8 running on the V100). On the V100
 > production path after the #546 page_base fix, k=all is token-identical, and
-> k=128 gives prefill KL 0.0023 / top-1 0.981 at 8k, 0.019 / 0.949 at 32k,
-> with continuation naturalness level with k=256 (+0.013 vs +0.018 token, top-5
-> agreement 1.0) — generated tokens do not improve from 128 to 256, so the
+> k=128 gives prefill KL 0.0023 / top-1 0.981 at 8k, 0.019 / 0.949 at 32k.
+> The continuation's mean per-token NLL gap to dense is **+0.013 nats/token at
+> k=128** and **+0.018 nats/token at k=256** (nats, not tokens; top-5
+> agreement 1.0), so on n=3 generated tokens do not improve from 128 to 256;
+> the
 > cross-group union hot pool [below](#the-resident-pool-is-a-cross-group-union-sized-union_cap)
-> stays **parked**: no default k needs it, and the worst-case `n_groups*k` pool
-> at k=128 fits. Sparse Quest selection + spec decode are the serving default
-> (#530); `--sparse-k 0` opts back to dense. See
-> [Measured on the 27B](#measured-on-the-27b).
+> stays **parked** — no default k needs it, the worst-case `n_groups*k` pool
+> fits at k=128, and the decision is revisited after the n=8 windows. Sparse
+> Quest selection + spec decode are the serving default (#530); `--sparse-k 0`
+> opts back to dense. See [Measured on the 27B](#measured-on-the-27b).
 
 ## Kernels
 

@@ -92,10 +92,12 @@ The ship gate is output fidelity vs dense on the V100 production path, not
 page-mass recall. After the #546 own-table `page_base` fix (pre-fix sparse
 output numbers are void — own K/V scattered into padding frames on sm70 and
 sm90), k=all is token-identical, and at k=128 prefill KL is 0.0023 / top-1
-0.981 at 8k and 0.019 / 0.949 at 32k, while the 32k continuation stays level
-with k=256 (+0.013 token naturalness gap, top-5 agreement 1.0) — so k=128 is
-the default and the cross-group union hot pool (needed only past ~128) stays
-parked
+0.981 at 8k and 0.019 / 0.949 at 32k. On the 32k continuation the mean
+per-token NLL gap to dense is +0.013 nats/token at k=128 and +0.018 at k=256
+(top-5 agreement 1.0) — k=128 is no worse than k=256 on generated tokens. That
+verdict is interim: n=3 windows of one held stream (per-window gaps −0.068 to
++0.096), with windows to n=8 running on the V100. On it k=128 is the default
+and the cross-group union hot pool (needed only past ~128) stays parked
 ([entry](docs/experience/wins/2026-09-12-dense-vs-sparse-long-ctx.md),
 [#531 output table](https://github.com/acupof-ai/tileRL/pull/531)). Open
 defect: under sparse + spec a follower cannot adopt a published trunk prefix
