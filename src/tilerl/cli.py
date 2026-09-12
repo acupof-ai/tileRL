@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .eval import MATCHERS
 from .recipes import RECIPES, flags
+from .sparse_index import DEFAULT_SPARSE_K
 
 _QWEN38_SOURCE = os.environ.get("TILERL_QWEN38_SOURCE", "Qwen/Qwen3-27B")
 
@@ -151,7 +152,7 @@ def _build_engine(cfg, model, backend, draft=None, depth=2, slots=16,
                   dram_bytes=0, state_bytes=0, kv_fp8="", decode=None,
                   max_batched_tokens=0, kv_cold_bytes=0, cold_format="",
                   cold_ssd_path="",
-                  sparse_k=0, scorer="bounds", kv_store=""):
+                  sparse_k=DEFAULT_SPARSE_K, scorer="bounds", kv_store=""):
     """Serving-size engine on one card. Multi-card serving is one process per card
     under CUDA_VISIBLE_DEVICES (see generate.py for the process-per-device pattern);
     the in-process DataParallelEngine wrapper was deleted 2026-09-09 — its hand-written
@@ -1293,6 +1294,7 @@ def _train_adapters(args: argparse.Namespace) -> None:
                           max_total_tokens=max(ctx, 8192),
                           spec_depth=args.depth,
                           decode_graph=not args.deterministic,
+                          sparse_k=0,  # on-policy training needs the dense full-context tape
                           prefix_store=NoPrefixStore())
     # Not in `inputs`: the id is a hash of it, so recording the pool there would make
     # every pool change a different run and hand nothing back on a rerun. It is beside
@@ -2502,11 +2504,11 @@ def _build_parser(recipe: str | None = None) -> argparse.ArgumentParser:
                               "process; --ssd-path is the separate prefix-boot store.")
 
 
-    p_serve.add_argument("--sparse-k", type=int, default=0, metavar="PAGES",
-                         help="with --dry-run --checkpoint: price the sparse-KV ledger "
-                              "(scorer keys/bounds + hot device pages + cold host pages) "
-                              "with this many indexed pages per row (the 8-page window is "
-                              "always added). docs/design-sparse-kv.md")
+    p_serve.add_argument("--sparse-k", type=int, default=DEFAULT_SPARSE_K, metavar="PAGES",
+                         help=f"sparse-KV pages selected per row (default {DEFAULT_SPARSE_K} "
+                              "+ the always-on 8-page window); sparse Quest selection is the "
+                              "Pass 0 for the legacy dense engine. With --dry-run --checkpoint "
+                              "it instead prices the derived ledger. docs/design-sparse-kv.md")
     p_serve.add_argument("--scorer", choices=["index", "bounds"], default="index",
                          help="sparse-KV page scorer: learned V4.1 indexer keys (default) "
                               "or training-free Quest page bounds")

@@ -31,7 +31,7 @@ from tilerl_kernels.reference import select_pages
 from torch import Tensor
 
 from .kv_cache import BLOCK_TOKENS
-from .sparse_index import index_source_groups
+from .sparse_index import WINDOW_PAGES, index_source_groups
 
 #: block-table ids are logical+1 so selected logical page 0 is not the 0 pad.
 _SENTINEL = 1
@@ -437,7 +437,12 @@ class SparseForward:
 
     Per row: ``cand`` earlier complete candidate pages; ``force_window`` forces
     the last N candidates (8 for a prefill chunk, 0 on decode where the window
-    IS the own span); ``own`` the own span's logical pages."""
+    IS the own span); ``own`` the own span's logical pages.
+
+    The packed table is ONE fixed-width tensor, ``k_pages + force_window + own``
+    per row at most, allocated at construction and refilled each tick: a CUDA
+    graph bakes the shape in, so the width is a tick constant (unselected slots
+    stay 0; paged_attention derives the live count from per-row seq_len)."""
 
     def __init__(self, tracker: SparseTracker, rows: list[dict], device,
                  device_select: bool = False):
@@ -457,6 +462,22 @@ class SparseForward:
         self.own_w = own_w
         self.page_base = torch.zeros(self.b, dtype=torch.long, device=device)
         self.own_table = torch.zeros(self.b, own_w, dtype=torch.long, device=device)
+        # The graph-captured width is constant PER VERIFY WIDTH, never per context:
+        # a plain decode row (tq=1) is k_pages + 8-window; a verify row's chain can
+        # cross one page boundary (W-1 <= 15), so pad its own region to 9. Unused
+        # own slots sit after sel+own; attention derives the page count from
+        # seq_len, so the trailing pad ids are never read. Prefill rows run eager
+        # and take their actual own width.
+        def own_bound(r) -> int:
+            if not r["decoding"]:
+                return len(r["own"])
+            return WINDOW_PAGES + (1 if r["tq"] > 1 else 0)
+
+        sel_w = max(
+            tracker.k_pages + r["force_window"] + own_bound(r) for r in rows
+        )
+        self.table = torch.zeros(self.b, sel_w, dtype=torch.long, device=device)
+        self.seq_len = torch.zeros(self.b, dtype=torch.long, device=device)
         for i, r in enumerate(rows):
             self.page_base[i] = r["own"][0]
             self.own_table[i, : len(r["own"])] = torch.tensor(
