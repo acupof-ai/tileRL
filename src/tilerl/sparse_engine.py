@@ -742,6 +742,8 @@ class SparsePrefixCache:
         self._grow: dict[int, dict] = {}
         self._prompt_pages: dict[int, int] = {}
         self._frozen: dict[int, set[int]] = {}  # req -> boundaries frozen
+        #: (rid, frozen-entry eid) waiting for the engine to add their share refs
+        self._freeze_pending: list[tuple[int, int]] = []
         self.published = 0
         self.hits = 0
         self.evictions = 0
@@ -774,28 +776,24 @@ class SparsePrefixCache:
         self._snap.setdefault(req_id, {})[complete] = (states.cpu(), window)
 
     def publish_dropped(self, req_id: int, tokens, bounds, page: int,
-                        blob: dict) -> dict[int, int]:
-        """Offer one page's host blob the moment it LEFT the resident union
-        (finalize demote). ``bounds`` is the tracker's live bound for the page.
-        A page need only have dropped ONCE: its captured clone is independent of
-        the private blob, so a later re-selection that promotes the private copy
-        does not invalidate it. Once pages 0..m-1 have all dropped at least once
-        and the boundary-m state snapshot exists, the publisher's single entry
-        (re)attaches at length m and every newly covered page is share_held;
-        returns {page: content key} for those pages. Pages dropping out of order
-        or ahead of the frontier publish nothing until it catches up; the longest
-        length whose snapshot exists is the ceiling. When another publisher
-        already holds the identical prefix at m the entry stays off the lookup
-        chains for that length (its blobs stay share_held for the publisher's own
-        eviction fallback)."""
-        self._pending.setdefault(req_id, {})[page] = blob
+                        offered) -> dict[int, int]:
+        """Offer one page the moment it LEFT the resident union (finalize demote).
+        ``offered`` is either a host blob dict (held directly here) or the page's
+        opaque PRIVATE tier key - in which case NOTHING is copied: the engine
+        rehomes the blob to the content key on return (transfer, not clone). A
+        page need only be offered once. Once pages 0..m-1 are all offered and the
+        boundary-m state snapshot exists, the publisher's single entry (re)attaches
+        at length m and this returns {page: content key}; dict offers are
+        share_held inline, key offers are transferred by the caller. Out-of-order
+        or early pages wait; the longest length with a snapshot is the ceiling.
+        A duplicate prefix at m stays off the lookup chains (its blobs still
+        rehome for the publisher's own fallback)."""
+        self._pending.setdefault(req_id, {})[page] = offered
         tokens = tuple(int(t) for t in tokens)
         pend = self._pending[req_id]
         snaps = self._snap.get(req_id, {})
         e = self._grow.get(req_id)
         old_len = 0 if e is None else len(e["keys"])
-        # Contiguous captured-blob frontier, then pull back to the last boundary
-        # whose exact state snapshot exists (an interior length has no snapshot).
         m = old_len
         while m in pend and m in bounds:
             m += 1
@@ -803,35 +801,36 @@ class SparsePrefixCache:
             m -= 1
         if m == old_len:
             return {}
-        out: dict[int, int] = {}
+        out = {p: page_key(tokens, p) for p in range(old_len, m)}
         for p in range(old_len, m):
-            page_blob = dict(pend.pop(p))
-            bound = bounds[p]
-            page_blob["bounds"] = bound
-            key = page_key(tokens, p)
-            self._cold.share_hold(key, page_blob, _blob_nbytes(page_blob))
-            out[p] = key
+            item = pend.pop(p)
+            if isinstance(item, dict):
+                # direct blob offer: attach this page's bound to the held blob
+                # (the engine path attaches it during the private->shared transfer)
+                b = bounds[p]
+                if b is not None:
+                    item["bounds"] = b
+                self._cold.share_hold(out[p], item,
+                                      sum(t.numel() * t.element_size()
+                                          for t in item.values()
+                                          if torch.is_tensor(t)))
         ptokens = tokens[: m * BLOCK_TOKENS]
         if e is None:
             e = {"eid": self._next_id, "tokens": (), "keys": [],
-                 "bounds": {}, "state": None}
+                 "state": None}
             self._next_id += 1
             self._grow[req_id] = e
             self._by_id[e["eid"]] = e
         self._detach(e)
         e["tokens"] = ptokens
         e["keys"].extend(out[p] for p in range(old_len, m))
-        for p in range(old_len, m):
-            e["bounds"][p] = self._cold.share_take(out[p])["bounds"]
         e["state"] = snaps[m]
+        snaps.pop(m, None)  # consumed: one snapshot, not a retained second copy
         dup = any(
             x is not e and x["tokens"] == ptokens
             for x in self._entries.get(page_key(ptokens, m - 1), ()))
         if not dup:
             self._entries.setdefault(page_key(ptokens, m - 1), []).append(e)
-        # Freeze an immutable, LRU-managed copy at the first frontier closure and
-        # at the prompt end: the grow entry moves into generated-token territory,
-        # but a follower shares the PROMPT, which ends at these boundaries.
         at_first = old_len == 0
         at_prompt_end = m == self._prompt_pages.get(req_id)
         if at_first or at_prompt_end:
@@ -839,7 +838,23 @@ class SparsePrefixCache:
         self.published += 1
         while len(self._by_id) > self.capacity and self._evict_one():
             pass
+        # Blob offers were share_held inline, so a frozen copy's extra refs can
+        # be bumped now; private-key offers leave the bump to the engine after it
+        # transfers the blobs (take_freeze_refs).
+        for _rid, eid in list(self._freeze_pending):
+            entry = self._by_id[eid]
+            if all(k in self._cold.share_keys() for k in entry["keys"]):
+                self._freeze_pending.remove((_rid, eid))
+                for k in entry["keys"]:
+                    self._cold.share_ref(k)
         return out
+
+    def bound_of_key(self, content_key: int):
+        """A page's stored Quest bound from its (possibly spilled) shared blob,
+        or None. Adopt reads bounds by field so the bounds plane is not pinned
+        inside the entry dict."""
+        return self._cold.share_take_field(content_key, "bounds")
+
 
     def _freeze(self, req_id: int, m: int, e: dict) -> None:
         """Retain an immutable copy of the grow entry at length m on the lookup
@@ -849,14 +864,23 @@ class SparsePrefixCache:
         if m in done:
             return
         snap = {"eid": self._next_id, "tokens": e["tokens"],
-                "keys": list(e["keys"]), "bounds": dict(e["bounds"]),
-                "state": e["state"]}
+                "keys": list(e["keys"]), "state": e["state"]}
         self._next_id += 1
-        for key in snap["keys"]:
-            self._cold.share_ref(key)
+        # Refs are NOT bumped here: the engine transfers the blobs to these keys
+        # after publish_dropped returns, then calls add_freeze_refs.
+        self._freeze_pending.append((req_id, snap["eid"]))
         self._entries.setdefault(page_key(snap["tokens"], m - 1), []).append(snap)
         self._by_id[snap["eid"]] = snap
         done.add(m)
+
+    def take_freeze_refs(self) -> list[int]:
+        """Drain content keys whose frozen entry needs one extra share ref. The
+        engine calls this after transferring this publish's blobs."""
+        keys: list[int] = []
+        pending, self._freeze_pending = self._freeze_pending, []
+        for _rid, eid in pending:
+            keys.extend(self._by_id[eid]["keys"])
+        return keys
 
     def _detach(self, entry: dict) -> None:
         if entry["tokens"]:
@@ -929,6 +953,3 @@ class SparsePrefixCache:
         self.evictions = 0
 
 
-def _blob_nbytes(blob: dict) -> int:
-    return sum(t.numel() * t.element_size() for t in blob.values()
-               if torch.is_tensor(t))
