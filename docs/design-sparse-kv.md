@@ -205,7 +205,8 @@ two dense seeds. A miss on recall is a science result (the single-card token
 budget was not enough), recorded in `errors/` with the token count.
 
 > 2026-09-12: the 27B measurements below supersede this mass gate — the SLO is
-> now output fidelity vs dense, and k=128 is not the default. See
+> now output fidelity vs dense. The default k is undecided; k=128 remains the
+> shipped value until the fidelity table lands. See
 > [Measured on the 27B](#measured-on-the-27b).
 
 ## Kernels
