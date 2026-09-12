@@ -394,10 +394,11 @@ class Backend:
         # elementwise op feeding a linear can write f16 and skip the dispatch's
         # cast; everything else keeps io.
         self.gemv_io = torch.float16 if self.arch == "sm70" else self.io
-        # When True, attn_prep returns None so a fused-qkv model falls back to the
-        # unfused rmsnorm/rope + write_tokens path. Guard for a fused-attn_prep
-        # sm90 defect under sparse B>1 packed prefill (sparse sets it in
-        # build_engine); the unfused path is bit-exact dense-vs-sparse there.
+        # When True, attn_prep returns None for EVERY tick (prefill and decode),
+        # so a fused-qkv model falls back to the unfused rmsnorm/rope + write_tokens
+        # path on both. Guard for a fused-attn_prep sm90 defect under sparse B>1
+        # packed prefill (sparse sets it in build_engine); the unfused path is
+        # bit-exact dense-vs-sparse there. Dense leaves it False.
         self.no_fused_attn_prep = False
         self._kernels: dict[str, object] = {}
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
