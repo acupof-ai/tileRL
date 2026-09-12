@@ -903,6 +903,9 @@ class Engine:
         self._slots_used += 1
         if sparse:
             self._sparse.attach(req.req_id)
+            if self._sparse.prefix is not None:
+                self._sparse.prefix.set_request(
+                    req.req_id, len(req.tokens) // BLOCK_TOKENS)
             # Sparse prefix hit: adopt bounds + GDN snapshot + page content keys
             # WITHOUT blocks — the pages live as shared host blobs and promote
             # lazily on selection (_sparse_resolve). seq_len/prefill_from already
@@ -1414,10 +1417,13 @@ class Engine:
         if self._kv.free_blocks == 0 and reserved is not None:
             self._sparse_evict_victim(r, reserved)
         # Automatic path: cold_pages are bare logical ints, blob keyed (req, page).
+        # A page the publisher itself dropped also has a shared key: prefer its
+        # private blob, fall back to the shared clone on byte-LRU eviction.
         shared_keys = tr.shared.get(r.req_id, {})
-        if page in r.cold_pages:
+        if page in r.cold_pages and (r.req_id, page) in self._kv.cold:
             new = self._kv.promote_keyed((r.req_id, page))
             r.cold_pages.remove(page)
+            shared_keys.pop(page, None)
         elif page in shared_keys:
             blob = self._kv.cold.share_take(shared_keys[page])
             if blob is None:
@@ -1431,32 +1437,34 @@ class Engine:
         return new
 
     @staticmethod
-    def _sparse_clone_cold(pool, phys: int) -> dict | None:
+    def _sparse_clone_cold(pool, key) -> dict | None:
         """A tensor-clone of a demoted page's PRIVATE host blob, without removing
         it from private storage (the page stays the request's; the clone feeds the
-        shared prefix index)."""
-        src = pool.cold.peek(phys)
+        shared prefix index). Call only inside/after the tick's demotions scope
+        once the blob is held — under batched demotion (#538) peeking before the
+        batch sync returns None."""
+        src = pool.cold.peek(key)
         if src is None:
             return None
         return {k: v.clone() for k, v in src.items() if torch.is_tensor(v)}
 
-    def _sparse_publish(self, r: _Req, n_pages: int, page_blobs: dict) -> None:
-        """Publish the sparse prefix entry for the whole pages in ``page_blobs``.
-
-        The index is the single share_hold owner: each page blob (bounds already
-        attached) gets one store reference under its content key, and the entry
-        carries the exact GDN snapshot at the boundary. The returned key map is
-        recorded on the request so _sparse_resolve promotes its own prefix pages
-        lazily through the same shared blobs (a second same-prefix request shares
-        the keys -> a second reference, no copy)."""
-        sp = self._states
-        state = (sp.states[r.state_slot].clone(), sp.window_snapshot(r.state_slot))
-        length = min(n_pages, len(r.tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
-        bounds = {p: b["bounds"] for p, b in page_blobs.items() if "bounds" in b}
-        key_by_page = self._sparse.prefix.publish(
-            r.tokens[:length], page_blobs, bounds, state)
-        if key_by_page:
-            self._sparse.shared.setdefault(r.req_id, {}).update(key_by_page)
+    def _sparse_offer_drop(self, r: _Req, page: int) -> None:
+        """Page ``page`` just LEFT the resident union and its blob is held: offer
+        a shared clone to the prefix index. Drop-only — a stable pin never reaches
+        here. The index buffers out-of-order drops behind the contiguous frontier
+        and skips a page with no bound, so an entry never names a page it cannot
+        serve. Newly published content keys become the publisher's private-blob
+        fallback if its own blob is byte-LRU evicted."""
+        tr = self._sparse
+        if tr.prefix is None or page not in tr.bounds[r.req_id]:
+            return
+        clone = self._sparse_clone_cold(self._kv, (r.req_id, page))
+        if clone is None:
+            return
+        keys = tr.prefix.publish_dropped(
+            r.req_id, r.tokens, tr.bounds[r.req_id], page, clone)
+        if keys:
+            tr.shared.setdefault(r.req_id, {}).update(keys)
 
     def _sparse_finalize(self, sf, rows: list[_Req]) -> None:
         """After the forward: store Quest bounds of every now-complete page, then
@@ -1467,7 +1475,14 @@ class Engine:
         so the next tick promotes nothing; a changed selection demotes only the
         dropped pages and promotes the newly named ones. The device pool is sized
         n_groups*k + window + chunk per slot, i.e. exactly this pin ceiling.
-        Bounds stay device-resident regardless, so scoring a cold page needs no K."""
+        Bounds stay device-resident regardless, so scoring a cold page needs no K.
+
+        Prefix publishing is DROP-ONLY (bounds scorer): a page is offered only
+        when it leaves the union, and AFTER the demotions() scope exits so its
+        private blob is already held (a batched implementation holds it at the
+        batch sync; peeking inside would clone nothing). The GDN boundary
+        snapshot is captured only on a finalize landing on a whole-page boundary.
+        """
         tr = self._sparse
         pool = self._kv
         from .sparse_engine import project_index_page_keys
@@ -1475,16 +1490,15 @@ class Engine:
         # One batched D2H for the tick's departing pages across every row: each
         # demote launches non-blocking into pinned staging while its frame stays
         # live; the context syncs once before the frames return to the pool.
+        # (row, dropped pages) collected in the scope, offered to the prefix index
+        # after it exits — the one point every demoted blob is guaranteed held.
+        dropped_offers: list[tuple[_Req, list[int]]] = []
         with pool.demotions():
             for bi, r in enumerate(rows):
                 rid = r.req_id
                 live = tr.resident[rid]
                 q_hi = sf.rows[bi]["q_hi"]
                 complete = q_hi // BLOCK_TOKENS
-                # Whole pages eligible for the block-aligned prefix stay in the
-                # REQUEST's private cold tier; under the bounds scorer a clone is
-                # also handed to the prefix index (sharing is bounds-only for now).
-                publish_blobs: dict[int, dict] = {}
                 stored = tr.bounds if tr.scorer == "bounds" else tr.keys
                 for p in range(len(stored[rid]), complete):
                     if p not in live:
@@ -1510,29 +1524,33 @@ class Engine:
                         keys, scales = keys[0], scales[0]
                         tr.set_index_keys(rid, p, keys.to(pool.k_pool.device),
                                           scales.to(pool.k_pool.device))
+                if tr.scorer == "bounds" and tr.prefix is not None \
+                        and q_hi % BLOCK_TOKENS == 0:
+                    sp = self._states
+                    tr.prefix.note_boundary(
+                        rid, complete,
+                        (sp.states[r.state_slot].clone(),
+                         sp.window_snapshot(r.state_slot)))
                 kept = sf.selected_pages(bi)
-                kept_live: dict[int, int] = {}
-                for p, phys in list(live.items()):
-                    if p in kept:
-                        kept_live[p] = phys                 # pin across ticks
-                        continue
+                dropped = [p for p in live if p not in kept]
+                for p in dropped:
+                    phys = live[p]
                     pool.demote_page(phys, key=(rid, p))
                     r.blocks.remove(phys)
                     r.cold_pages.append(p)
-                    if (tr.scorer == "bounds" and tr.prefix is not None and p < complete
-                            and (p + 1) * BLOCK_TOKENS <= len(r.tokens)):
-                        clone = self._sparse_clone_cold(pool, (rid, p))
-                        if clone is not None:
-                            clone["bounds"] = tr.bounds[rid][p]
-                            publish_blobs[p] = clone
+                kept_live = {p: live[p] for p in kept if p in live}
                 # r.blocks mirrors the live frames in LOGICAL page order (paged_attention
                 # derives causal positions from the order), so sort the pinned set.
                 r.blocks = [kept_live[p] for p in sorted(kept_live)]
                 live.clear()
                 live.update(kept_live)
+                if dropped:
+                    dropped_offers.append((r, dropped))
 
-            if tr.prefix is not None and publish_blobs:
-                self._sparse_publish(r, complete, publish_blobs)
+        for r, pages in dropped_offers:
+            for p in pages:
+                self._sparse_offer_drop(r, p)
+
 
     def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0,
                  sf=None) -> BatchKv:
