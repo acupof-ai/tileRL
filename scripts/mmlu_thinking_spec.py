@@ -184,6 +184,8 @@ def main():
     ap.add_argument("--out", default="/work/mmlu_thinking_spec.json")
     ap.add_argument("--arm", choices=["both", "dense", "sparse"], default="both",
                     help="one arm per process for a two-card run; pair afterward")
+    ap.add_argument("--first-n", type=int, default=0,
+                    help="use only the first N of the --n seeded slice (subset of a larger run)")
     ap.add_argument("--pair", nargs=2, metavar=("DENSE_JSON", "SPARSE_JSON"),
                     help="merge two single-arm JSONs into one paired result")
     ap.add_argument("--selftest", action="store_true")
@@ -201,6 +203,10 @@ def main():
     from tilerl.tokenizer import get_tokenizer
 
     raw, golds, subjects = mmlu_questions(args.n, args.seed)
+    # --first-n takes the leading questions of the SAME seeded --n slice, so a
+    # 400-run is a true subset of a 2000-run and pairs on identical absolute ids.
+    if args.first_n:
+        raw, golds, subjects = raw[:args.first_n], golds[:args.first_n], subjects[:args.first_n]
     prompts = thinking_prompts(raw)
     tok = get_tokenizer(args.source)
     backend = get_backend()
