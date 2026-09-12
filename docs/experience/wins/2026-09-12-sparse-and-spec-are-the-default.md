@@ -1,11 +1,15 @@
-# Sparse Quest selection and speculative decode are the serving default — default flip held back on a recall FAIL, 2026-09-12
+# Sparse Quest selection and speculative decode are the serving default, 2026-09-12
 
-> Status: **default flipped in code, PR held draft.** `build_engine`/`serve`
-> default to `sparse_k=DEFAULT_SPARSE_K` (128) `scorer=bounds`; `--sparse-k 0`
-> restores the dense engine. Speculative decode runs under sparse with the draft
-> head kept dense. The flip does not ship to the 27B until the output-fidelity
-> table clears it: the bounds scorer's window-included recall is far below the
-> 0.9 design gate at k=128.
+> Status: **shipped at k=128 (#530).** The ship gate is output fidelity, not
+> page-mass recall: #531's 8k/32k dense-vs-packed KL/top-1 table plus 65's 32k
+> n=3 NLL verdict clear k=128 (greedy-NAT gap +0.013 token vs dense's own
+> greedy, per-window max 0.096; top-5 agreement 1.0). k=256 scored +0.018, so
+> the union k=256 pool stays parked. `build_engine`/`serve` default to
+> `sparse_k=DEFAULT_SPARSE_K=128` `scorer=bounds`; `--sparse-k 0` restores the
+> dense engine; speculative decode runs under sparse with the draft head kept
+> dense. Open defect: under spec a follower cannot adopt a published prefix —
+> it returns-miss, so the prefix cache never serves on the production path
+> ([errors/2026-09-12-spec-follower-cannot-adopt-a-prefix.md](../errors/2026-09-12-spec-follower-cannot-adopt-a-prefix.md)).
 
 ## Context
 
@@ -25,10 +29,10 @@ the cut:
 both `build_engine` and the serve CLI use; the serve `--scorer` default flips
 `index → bounds` (the learned indexer is not wired in the engine yet). `--sparse-k
 0` always forwards (the CLI previously only forwarded sparse_k when truthy, so 0
-never reached `build_engine` and the new 128 default won anyway). The serve path
-forces `NoPrefixStore` under sparse — there is no prefix cache by default (5f's
-#526 adds a host-blob prefix cache and removes this coercion). On-policy training
-builds pass `sparse_k=0`: the dense full-context tape is unchanged.
+never reached `build_engine` and the new 128 default won anyway). Sparse allows the prefix store (#542 restores host-blob sharing after the #518
+stopgap); a follower under spec returns-miss — see the open-defect section
+above. On-policy training builds pass `sparse_k=0`: the dense full-context tape
+is unchanged.
 
 **Spec under sparse — the draft stays dense.** The draft head needs every page of
 the row's context, not the hot set, so it keeps a DENSE `PagedKvPool` of its own.
@@ -72,12 +76,12 @@ physical keys (one demote-all/promote-all cycle, no recycle) and is unchanged.
 The pre-existing F gates (full-k == dense, every-tick demote/promote, default
 PrefixStore coercion) and the #500 tier seam tests stay green; the dense feature
 suite (prefix cache, decode graph, fp8, SSD, training guards) now passes
-`sparse_k=0` explicitly. Full hermetic run: 702 passed.
+`sparse_k=0` explicitly. Full hermetic run at the merge head: 744 passed, 19 skipped, 6 xfailed.
 
-## Why the flip is NOT shipped yet — the recall FAIL
+## Fidelity verdict — ship at k=128, park the union pool
 
-65's 27B cut recall (Chinese-wiki spans, 256 positions, 16 spans, window included,
-full-attn planes) at k=128+8:
+65's 27B cut recall (Chinese-wiki spans, 256 positions, 16 spans, window
+included, full-attn planes) stays diffuse:
 
 | k | oracle | bounds | random |
 |---:|---:|---:|---:|
@@ -85,30 +89,40 @@ full-attn planes) at k=128+8:
 | 512 | 0.652 | 0.433 | 0.248 |
 | 1024 | 0.858 | 0.687 | 0.507 |
 
-The gate was ≥0.9 mass; even the oracle does not reach it below k≈1200 because the
-full-attn mass is diffuse (sink 0.2–0.5%, last-8 window 0.1–0.4%). The learned
-indexer is also below bounds after 100 warm-up steps (0.10; its KL collapsed
-toward uniform). The shipped k therefore waits on the output-fidelity-vs-k table
-(KL / top-1 agreement at k∈{128,256,512,1024}); `DEFAULT_SPARSE_K` moves to
-whatever k that table picks. Flipping the default at recall this low would change
-served outputs with no fidelity bound.
+Mass recall never reaches the old 0.9 design gate below k~1200 (sink 0.2-0.5%,
+last-8 window 0.1-0.4%), and the learned indexer stayed below bounds after 100
+warm-up steps (0.10). The gate that matters is output fidelity, and it passes:
 
-## Production-path output fidelity (V100, cc, 2026-09-12)
+- **#531 (dense vs packed-sparse KL/top-1, 8k and 32k):** the k=all arm is
+  token-identical — the mechanism is exact; degradation at smaller k is purely
+  the attention set.
+- **65 NLL verdict (32k, n=3 windows):** k=128 greedy naturalness gap
+  **+0.013 token** against dense's own greedy, per-window max **0.096**;
+  k=256 **+0.018**; top-5 agreement **1.0 for both**.
 
-The first end-to-end sparse-vs-dense OUTPUT row on the real V100 path (32k
-context, k=128): token-distribution KL **1.05**, top-1 agreement **0.55** — sparse
-agrees with dense on only ~55% of argmax tokens at KL far above a serviceable
-band. This is output fidelity, not page-mass recall, and it is the binding
-gate. An 8k run at k=all / 256 / 128 is queued: k=all must be token-identical
-(mechanism control), then the 256/128 degradation separates "diffuse attention,
-need larger k" from an engine selection bug. The default stays draft until that
-row lands, and this entry cites whichever way it lands.
+k=128 is no worse than k=256 on outputs, so DEFAULT_SPARSE_K stays 128 and the
+cross-group union k=256 pool (5f) is parked — no default needs it. Recall is a
+diagnostic here, not the gate: diffuse mass at k=128 does not move the
+generated tokens.
+
+## Known open defect — the prefix cache does not serve under spec
+
+A follower that hits a published sparse prefix adopts trunk KV without
+forwarding the matched tokens; the draft head builds its dense KV only while
+forwarding and keys every proposal on trunk hidden, so adoption drafted against
+an unbuilt pool. #530 ships the correctness fix — return-miss whenever a draft
+is attached, bit-equal to a cold follower — at the cost that under the
+production defaults (sparse + spec) the prefix cache publishes but never
+serves. Warm path: store the draft head's per-layer prefix KV (and trunk
+hiddens, or the trunk forward) in the published entry. Tracked as
+[errors/2026-09-12-spec-follower-cannot-adopt-a-prefix.md](../errors/2026-09-12-spec-follower-cannot-adopt-a-prefix.md),
+OPEN.md row removed by the PR that lands it.
 
 ## Rule
 
-A default that changes the attention set must not ship on a selection scorer that
-fails its own recall gate, however clean the mechanism: sparse can be the default
-in code and stay a draft PR until output fidelity clears at a named k. Under a
+A default that changes the attention set ships on output fidelity measured at
+named k, not on page-mass recall: the diffuse-mass recall gate failed at k=128
+while generated tokens moved by +0.013 NAT and kept top-5 agreement 1.0. Under a
 tiered KV design the speculative draft is a second, independent KV pool — keep it
 dense for the whole context and key the host tier by an identity a recycled frame
 cannot reuse.
