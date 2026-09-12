@@ -57,10 +57,14 @@ def per_kv_block_bytes(cfg, kv_io, kv_fp8=None) -> int:
 
 # --- sparse KV (docs/design-sparse-kv.md) -----------------------------------
 def sparse_source_count(cfg) -> int:
-    """Index SOURCE layers: one per group of four full-attn layers, selection reused
-    by the group. The tiny model has one full-attn layer, hence one source."""
-    n_full = len(cfg.full_attn_layers)
-    return n_full if n_full < 4 else n_full // 4
+    """Independent source groups — the SAME count group_map uses to size the
+    pool. Tiny (<4 full-attn) is one group per plane; otherwise the planes split
+    into sparse_index.INDEX_SOURCE_LAYERS groups. Delegates to the one canonical
+    sparse_group_count so the ledger never prices n_full//4 (wrong for, e.g.,
+    8 full-attn planes: 4 groups, not 2)."""
+    from .sparse_index import sparse_group_count
+
+    return sparse_group_count(len(cfg.full_attn_layers))
 
 
 def sparse_pages(context_tokens: int) -> int:
@@ -380,8 +384,11 @@ def plan(cfg, params: dict | None, device_free: int, *, num_slots: int, num_bloc
     if sparse is not None:
         # Sparse deployment: the device pool IS the pinned hot set (plus scorer keys);
         # cold pages live on host. No dense kv_pool row to avoid counting hot twice.
+        # Sparse forces the decode graph off, so there is NO replay pad slot: price
+        # the hot pool for the spec's own slot count, not the (pad-inflated) num_slots
+        # the state row above correctly uses for the dense/graph path.
         rows.extend(sparse_rows(
-            cfg, num_rows=sparse["num_rows"], num_slots=num_slots,
+            cfg, num_rows=sparse["num_rows"], num_slots=sparse["num_slots"],
             context_tokens=sparse["context"], k_pages=sparse["k_pages"],
             max_num_batched_tokens=sparse["max_num_batched_tokens"],
             scorer=sparse["scorer"], kv_io=kv_io, kv_fp8=kv_fp8))

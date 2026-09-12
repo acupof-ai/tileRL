@@ -417,6 +417,45 @@ if __name__ == "__main__":
 
 
 # ---------------- sparse KV unit A: plan rows == real tensor storage --------
+@pytest.mark.parametrize("n_full,groups", [
+    (1, 1), (2, 2), (3, 3),          # <4 planes: each plane its own group (tiny)
+    (4, 4), (8, 4), (12, 4),         # >=4: exactly INDEX_SOURCE_LAYERS groups —
+    (16, 4), (20, 4), (64, 4),       # n_full//4 would wrongly give 2/3/5/16 here
+])
+def test_sparse_source_count_matches_group_map_at_every_plane_count(n_full, groups):
+    """The ledger's group count must equal the selection's real group count from
+    group_map at EVERY plane count, not just the tiny(1) and 27B(16) cells. The
+    old n_full//4 formula coincided only at 1 and 16; at 8 planes it returned 2
+    while group_map splits into 4, under-pricing the pool 2x. Non-dividing
+    counts (5, 7, ...) raise, as they do in group_map."""
+    from dataclasses import replace
+
+    from tilerl.config import tiny
+    from tilerl.memory import sparse_source_count
+    from tilerl.sparse_engine import group_map
+    from tilerl.sparse_index import sparse_group_count
+
+    cfg = replace(tiny(), num_layers=n_full, full_attn_layers=tuple(range(n_full)))
+    assert sparse_group_count(n_full) == groups
+    assert sparse_source_count(cfg) == groups
+    assert len(group_map(cfg)[0]) == groups  # the allocator's count
+
+
+@pytest.mark.parametrize("n_full", [5, 7, 15, 17])
+def test_sparse_source_count_rejects_non_dividing_plane_counts(n_full):
+    from dataclasses import replace
+
+    from tilerl.config import tiny
+    from tilerl.memory import sparse_source_count
+    from tilerl.sparse_index import sparse_group_count
+
+    with pytest.raises(ValueError):
+        sparse_group_count(n_full)
+    cfg = replace(tiny(), num_layers=n_full, full_attn_layers=tuple(range(n_full)))
+    with pytest.raises(ValueError):
+        sparse_source_count(cfg)
+
+
 def test_sparse_rows_match_real_tensor_storage_on_27b():
     """The sparse ledger's derived bytes equal the storage of the tensors the engine
     will actually allocate, on the 27B V4.1 geometry (docs/design-sparse-kv.md):
