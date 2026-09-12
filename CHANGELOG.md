@@ -5,6 +5,8 @@ its `docs/experience/` entry. Newest first.
 
 ## 2026-09-12
 
+- **fix (CPU guard; V100 point pending-remote)** — **a failed sm70 decode-graph capture poisoned torch's caching allocator for the whole process, so a later `empty_cache` INTERNAL-assert-failed.** On the V100 dense decode capture fails mid-kernel; torch 2.5.1's `graph.__exit__` calls `capture_end()` before popping allocator capture state, and on the poisoned capture that raise strands `captures_underway` with no Python API to clear it — the engine's eager-fallback warning looked healthy but every later allocator assert in the process died (hit by 65's dense→sparse fidelity harness between arms). Fix is prevention at `_graph_on`: the auto path stays eager on sm70 with a one-time warning; explicit `decode_graph=True` is still honoured. Negative control (remove the guard → red) included. — [errors/2026-09-12-failed-graph-capture-poisons-allocator-sm70.md](docs/experience/errors/2026-09-12-failed-graph-capture-poisons-allocator-sm70.md)
+
 - **phase exit (tiny CPU)** — **sparse prefix sharing restored:** a sparse engine no longer forces NoPrefixStore; SparsePrefixCache shares demoted page host blobs + Quest bounds + the GDN snapshot by content hash, so a same-prefix follower prefills only the tail and matches dense tokens. Replaces the #518 stopgap (5f CHANGE-REQ). — [wins/2026-09-12-sparse-prefix-cache.md](docs/experience/wins/2026-09-12-sparse-prefix-cache.md)
 
 

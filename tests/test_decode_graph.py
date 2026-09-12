@@ -569,3 +569,35 @@ def test_a_live_drafted_tick_keys_on_a_width_precapture_built():
     assert max(w for _, w in asked) > 1, (
         f"every ask was width 1, so no chain reached the graph key: {asked}"
     )
+
+
+def test_graph_auto_off_on_sm70_before_capture_can_poison_the_allocator():
+    """sm70: dense decode capture fails mid-kernel and torch's failed graph exit
+    leaves the caching allocator poisoned (a later empty_cache asserts in-process,
+    unrecoverable — no Python API clears captures_underway). The auto path must not
+    start that capture; explicit decode_graph=True is still honoured. CPU gate with
+    a cuda-shaped backend double: the guard, not the device."""
+    from types import SimpleNamespace
+
+    import tilerl.engine as engine_mod
+
+    cuda = SimpleNamespace(device=torch.device("cuda"), arch="sm70")
+    hopper = SimpleNamespace(device=torch.device("cuda"), arch="sm90")
+    cpu = SimpleNamespace(device=torch.device("cpu"))
+
+    engine_mod._sm70_graph_warned = False
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert engine_mod._graph_on(cuda, None) is False
+            assert any("auto-disabled on sm70" in str(w.message) for w in caught), caught
+        # warned once: the pad-sizing and slot-fit callers share the decision
+        assert engine_mod._graph_on(cuda, None) is False
+        # informed opt-in still attempts capture
+        assert engine_mod._graph_on(cuda, True) is True
+        assert engine_mod._graph_on(cuda, False) is False
+        # other arches keep the auto-on; CPU stays off
+        assert engine_mod._graph_on(hopper, None) is True
+        assert engine_mod._graph_on(cpu, None) is False
+    finally:
+        engine_mod._sm70_graph_warned = False

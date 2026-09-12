@@ -70,11 +70,41 @@ def _last_prefill_boundary(n: int) -> int:
     return end - BLOCK_TOKENS if tail == 1 else end
 
 
+#: Set after the one-time sm70 graph warning, so the three _graph_on callers
+#: (Engine init, build_engine pad sizing, the CLI slot fit) do not repeat it.
+_sm70_graph_warned = False
+
+
 def _graph_on(backend, decode_graph: bool | None) -> bool:
     """The captured decode tick is on by default on CUDA only. One definition:
     ``build_engine`` sizes the pools for the pad row from the same answer the
-    engine reserves it on."""
-    return backend.device.type == "cuda" if decode_graph is None else decode_graph
+    engine reserves it on.
+
+    sm70 is excluded from the AUTO path: dense decode capture fails there
+    mid-kernel (torch 2.5.1, V100), and torch's ``graph.__exit__`` calls
+    capture_end before popping the allocator's capture state — the failed
+    capture leaves the caching allocator poisoned, so a later empty_cache in
+    the same process INTERNAL-ASSERT-fails. There is no Python API to clear
+    that state, so the doomed capture must not start. An explicit
+    ``decode_graph=True`` is still honoured (informed opt-in for capture
+    debugging)."""
+    if decode_graph is not None:
+        return decode_graph
+    if backend.device.type != "cuda":
+        return False
+    if getattr(backend, "arch", "") == "sm70":
+        global _sm70_graph_warned
+        if not _sm70_graph_warned:
+            warnings.warn(
+                "decode graph capture auto-disabled on sm70: dense decode "
+                "capture fails on this arch and a failed capture poisons "
+                "torch's caching allocator for the process (a later "
+                "empty_cache asserts). Running eager; pass decode_graph=True "
+                "explicitly to attempt capture anyway.",
+                stacklevel=2)
+            _sm70_graph_warned = True
+        return False
+    return True
 
 
 
