@@ -14,6 +14,8 @@ chunked sparse prefill. Two gates the design names:
 
 from __future__ import annotations
 
+import contextlib
+
 import numpy as np
 import torch
 
@@ -754,3 +756,204 @@ def test_refresh_r8_routes_device_for_seven_ticks_then_eager_promotes():
     assert True in decode_routes and False in decode_routes, decode_routes
     # an eager refresh promoted at least one cold page (the device path never does)
     assert promoted >= 1, promoted
+
+
+
+# ------------------------------------------------- cross-group union hot pool (#544)
+
+
+def _cfg16():
+    from dataclasses import replace
+    return replace(tiny(), num_layers=16, full_attn_layers=tuple(range(16)))
+
+
+def _engine16(cfg=None, sparse_k=0, union_h=None, **kw):
+    cfg = cfg or _cfg16()
+    args = dict(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+        num_slots=4, max_batch=1, max_total_tokens=8192,
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore())
+    if sparse_k:
+        args.update(sparse_k=sparse_k, scorer="bounds", kv_cold_bytes=1 << 30)
+        if union_h is not None:
+            args["sparse_union_h"] = union_h
+    args.update(kw)
+    return cfg, build_engine(**args)
+
+
+@contextlib.contextmanager
+def _forced_group_scores(engine, disjoint: bool):
+    """Make every source group's candidate ranking deterministic by replacing
+    quest_scores. The group is carried from a bounds_rows wrapper (it takes the
+    plane; quest_scores does not), called immediately before quest_scores.
+
+    disjoint=True: group g uniquely ranks pages {2g, 2g+1} with rank gap
+    rank1=1 > rank2=0 (12 candidate pages). disjoint=False: every group shares
+    one ranking."""
+    import tilerl.sparse_engine as se
+
+    tr = engine._sparse
+    plane_box = [-1]
+    orig_rows, orig_scores = type(tr).bounds_rows, se.quest_scores
+
+    def rows_wrap(self, rid, plane, pages):
+        plane_box[0] = plane
+        return orig_rows(self, rid, plane, pages)
+
+    def scored(q, bounds):
+        cp = bounds.shape[0]
+        g = tr.group_of[plane_box[0]]
+        out = torch.full((cp,), -1e9)
+        for p in range(min(cp, 12)):
+            if disjoint:
+                if p // 2 == g:
+                    out[p] = 1010.0 - (p % 2)
+            else:
+                out[p] = float(12 - p)
+        return out
+
+    type(tr).bounds_rows = rows_wrap
+    se.quest_scores = scored
+    try:
+        yield
+    finally:
+        type(tr).bounds_rows = orig_rows
+        se.quest_scores = orig_scores
+
+
+def test_union_pages_default_reproduces_worst_case_and_overlap_is_token_identical():
+    """Gate (1): default headroom reproduces n_groups*k+W+chunk pool sizing
+    exactly; identical group preferences under h=0 give identical tokens."""
+    from tilerl.sparse_index import WINDOW_PAGES, sparse_union_pages
+
+    cfg = _cfg16()
+    chunk_pages = 512 // BLOCK_TOKENS + 1
+    worst = sparse_union_pages(cfg, k_pages=2, chunk_pages=chunk_pages)
+    assert worst == 4 * 2 + WINDOW_PAGES + chunk_pages
+    assert sparse_union_pages(cfg, k_pages=2, chunk_pages=chunk_pages,
+                              h_pages=0) == 2 + WINDOW_PAGES + chunk_pages
+
+    prompt = np.arange(7, 7 + 20 * BLOCK_TOKENS, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    _, e_worst = _engine16(cfg, 2)
+    assert e_worst._kv.num_blocks == 4 * worst + 1
+    with _forced_group_scores(e_worst, disjoint=False):
+        t_worst = _drain(e_worst, e_worst.submit(prompt, params), 8)
+    e_worst.shutdown()
+
+    _, e_tight = _engine16(cfg, 2, union_h=0)
+    assert e_tight._kv.num_blocks == 4 * (2 + WINDOW_PAGES + chunk_pages) + 1
+    with _forced_group_scores(e_tight, disjoint=False):
+        t_tight = _drain(e_tight, e_tight.submit(prompt, params), 8)
+    e_tight.shutdown()
+    assert t_tight == t_worst, (t_tight, t_worst)
+
+
+def test_union_clip_is_symmetric_and_the_engine_matches_the_oracle():
+    """Gate (2): union_clip drops the smallest within-group-gap picks until the
+    unique union fits, fair across groups; the pool's steady selection equals
+    the clip and its tokens equal a worst-case engine masked to the same set."""
+    from tilerl.sparse_engine import union_clip
+
+    # 4 groups, 2 disjoint picks each: rank-1 gap 1, rank-2 gap 0; budget 2.
+    picks = {g: [2 * g, 2 * g + 1] for g in range(4)}
+    gaps = {(g, p): float(1 - p % 2) for g in range(4) for p in picks[g]}
+    clipped = union_clip(picks, gaps, budget=2)
+    # four rank-2 picks (gap 0) go first (one per group), then two rank-1 picks
+    # tie at gap 1 and break by group id: groups 3 then 2 lose theirs.
+    assert clipped == {0: [0], 1: [2], 2: [], 3: []}, clipped
+    assert union_clip(picks, gaps, budget=8) == {g: picks[g] for g in range(4)}
+
+    prompt = np.arange(7, 7 + 20 * BLOCK_TOKENS, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+
+    _, pooled = _engine16(sparse_k=2, union_h=0)
+    rid = pooled.submit(prompt, params)
+    with _forced_group_scores(pooled, disjoint=True):
+        toks_p = _drain(pooled, rid, 8)
+    # steady state (decode tick 2+): the only CANDIDATE pages resident are the
+    # fair clip's survivors; own window pages are 12..19.
+    resident = set(pooled._sparse.resident[rid])
+    assert resident & set(range(12)) == {0, 2}, resident
+    pooled.shutdown()
+
+    # Oracle: a worst-case-sized pool whose per-group scoring is masked to the
+    # exact union_clip result.
+    _, oracle = _engine16(sparse_k=2)
+    tr = oracle._sparse
+    plane_box = [-1]
+    orig_rows, orig_scores = type(tr).bounds_rows, __import__(
+        "tilerl.sparse_engine", fromlist=["quest_scores"]).quest_scores
+    import tilerl.sparse_engine as se
+    allowed = {0: {0}, 1: {2}}
+
+    def rows_wrap(self, rid, plane, pages):
+        plane_box[0] = plane
+        return orig_rows(self, rid, plane, pages)
+
+    def scored(q, bounds):
+        cp = bounds.shape[0]
+        g = tr.group_of[plane_box[0]]
+        out = torch.full((cp,), -1e9)
+        for p in allowed.get(g, ()):  # noqa: B007
+            out[p] = 1010.0
+        return out
+
+    type(tr).bounds_rows = rows_wrap
+    se.quest_scores = scored
+    try:
+        toks_o = _drain(oracle, oracle.submit(prompt, params), 8)
+    finally:
+        type(tr).bounds_rows = orig_rows
+        se.quest_scores = orig_scores
+    oracle.shutdown()
+    # token 0 is the prefill output (online clip is ordered by group plane); the
+    # prefill finalize installs the fair survivor mask, so the seven decode
+    # tokens 1..7 match. The R=8 refresh is never reached inside 8 tokens.
+    assert toks_p[1:8] == toks_o[1:8], (toks_p, toks_o)
+
+
+def test_plan_kv_hot_union_cap_equals_the_allocated_pool_ceiling():
+    """Gate (3): fixed union cap -> plan kv_hot prices the pool's exact device
+    blocks (CEILING); the live stats row is measured residency (HELD)."""
+    import torch as _torch
+
+    from tilerl.memory import per_kv_block_bytes, sparse_rows
+    from tilerl.sparse_index import sparse_union_pages
+
+    cfg = _cfg16()
+    k, h, slots = 2, 4, 4
+    union_pages = sparse_union_pages(
+        cfg, k_pages=k, chunk_pages=512 // BLOCK_TOKENS + 1, h_pages=h)
+    _, e = _engine16(cfg, k, union_h=h, num_slots=slots)
+    pool_blocks = e._kv.num_blocks - 1
+    assert pool_blocks == slots * union_pages
+    rows = {r.owner: r for r in sparse_rows(
+        cfg, num_rows=slots, context_tokens=8192, k_pages=k, scorer="bounds",
+        kv_io=_torch.bfloat16, union_pages=union_pages)}
+    block = per_kv_block_bytes(cfg, _torch.bfloat16)
+    assert rows["kv_hot"].n == pool_blocks * block
+    prompt = np.arange(7, 7 + 20 * BLOCK_TOKENS, dtype=np.int64)
+    rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+    _drain(e, rid, 4)
+    live = {r["owner"]: r for r in e.stats()["memory"]}
+    assert live["kv_hot"]["derived"] < pool_blocks * block
+    e.shutdown()
+
+
+def test_union_pool_full_k_equals_dense():
+    """Gate (4): k >= every candidate page with h=0 is still dense-exact."""
+    prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
+    params = SamplingParams(temperature=0.0, max_new_tokens=8, seed=0)
+    dense = _engine(False)
+    t_dense = _drain(dense, dense.submit(prompt, params), 8)
+    dense.shutdown()
+    sparse = build_engine(
+        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
+        sparse_k=6, scorer="bounds", kv_cold_bytes=1 << 30, sparse_union_h=0)
+    t_sparse = _drain(sparse, sparse.submit(prompt, params), 8)
+    sparse.shutdown()
+    assert t_sparse == t_dense, (t_sparse, t_dense)
