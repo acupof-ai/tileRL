@@ -582,6 +582,12 @@ class Engine:
         self._tokens_generated = 0
         self._spec_drafted = 0
         self._spec_accepted = 0
+        # Per-segment spec counters for the forced-think acceptance split:
+        # drafts inside the reasoning block vs after it closed, plus ticks that
+        # cross the max_think cap (the forced closer makes that chain stale).
+        self._spec_acc_in = self._spec_dft_in = 0
+        self._spec_acc_post = self._spec_dft_post = 0
+        self._spec_acc_capcross = self._spec_dft_capcross = 0
         # Diagnostic only: set True to keep the last tick's trunk logits and the
         # chains they scored, so a probe can rank the trunk's pick inside the
         # draft's ordering. A [rows, vocab] copy per tick, so never on in serving.
@@ -1170,6 +1176,12 @@ class Engine:
                 "tokens_generated": self._tokens_generated,
                 "spec_drafted": self._spec_drafted,
                 "spec_accepted": self._spec_accepted,
+                "spec_accept_in": self._spec_acc_in,
+                "spec_drafted_in": self._spec_dft_in,
+                "spec_accept_post": self._spec_acc_post,
+                "spec_drafted_post": self._spec_dft_post,
+                "spec_accept_capcross": self._spec_acc_capcross,
+                "spec_drafted_capcross": self._spec_dft_capcross,
                 "memory": self._memory_rows(),
             }
 
@@ -2110,7 +2122,22 @@ class Engine:
             while n_ok < len(got) - 1 and got[n_ok] == chains[i][n_ok + 1]:
                 n_ok += 1
             self._spec_accepted += n_ok
-            self._spec_drafted += len(chains[i]) - 1
+            drafted = len(chains[i]) - 1
+            self._spec_drafted += drafted
+            cap = r.params.max_think_tokens
+            crosses_cap = (
+                cap is not None and not r.thought_closed
+                and len(r.output) < cap <= len(r.output) + drafted
+            )
+            if r.thought_closed:
+                self._spec_acc_post += n_ok
+                self._spec_dft_post += drafted
+            else:
+                self._spec_acc_in += n_ok
+                self._spec_dft_in += drafted
+            if crosses_cap:
+                self._spec_acc_capcross += n_ok
+                self._spec_dft_capcross += drafted
             self._states.select_step(r.state_slot, n_ok)
             r.hidden_prev = None if r.hidden is None else r.hidden[:, -1:]
             r.hidden, r.hidden_from = hidden[i : i + 1], r.seq_len - 1
