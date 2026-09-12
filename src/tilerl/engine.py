@@ -926,6 +926,11 @@ class Engine:
             raise
         req.blocks = blocks
         req.state_slot = slot
+        if sparse and self._draft is not None:
+            # Sparse+spec return-miss on a prefix (see the lookup skip above):
+            # ignore any dense match too and prefill the whole prompt, so the
+            # draft head builds its KV over every position.
+            matched = 0
         req.seq_len = matched  # materialized length (adopted prefix; 0 on a miss)
         # A bulk boot covering the WHOLE prompt leaves a zero-token residual, so no prefill
         # chunk would forward and the row stuck in PREFILL with no first-token logits (a
@@ -953,7 +958,19 @@ class Engine:
             # WITHOUT blocks — the pages live as shared host blobs and promote
             # lazily on selection (_sparse_resolve). seq_len/prefill_from already
             # carry the matched length, so the engine prefills only the tail.
-            entry = self._sparse.prefix.lookup(req.tokens) if self._sparse.prefix else None
+            #
+            # Disabled under spec: a follower adopts the trunk prefix WITHOUT
+            # forwarding it, but the draft head conditions every position on the
+            # trunk hidden and builds its OWN dense KV only while forwarding — so
+            # an adopted follower's draft attends over an unbuilt prefix and its
+            # proposals are garbage. Warming it needs the trunk hidden at every
+            # prefix position (the forward the prefix save skips) or storing those
+            # hiddens; neither is cheap. Return-miss instead (never raise): the
+            # follower prefills from zero, which builds trunk and draft KV correctly.
+            if self._draft is None:
+                entry = self._sparse.prefix.lookup(req.tokens) if self._sparse.prefix else None
+            else:
+                entry = None
             if entry is not None:
                 matched = len(entry["tokens"])
                 req.seq_len = req.prefill_from = matched

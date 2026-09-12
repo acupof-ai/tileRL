@@ -163,8 +163,6 @@ def test_quest_scores_chunked_over_pages_matches_all_at_once():
     [Tq,Cp,Hkv,D] is 4.2 GiB at Cp=2048 and OOMs a V100). max-over-query and
     sum-over-head/dim commute with the page split, so the chunked score must be
     bit-identical; Cp is a non-multiple of the chunk to cover the tail."""
-    import torch
-
     from tilerl.sparse_engine import quest_scores
 
     tq, hq, hkv, d, cp = 37, 8, 4, 256, 201
@@ -528,8 +526,6 @@ def _draft(cfg, trunk):
     """A one-layer DraftHead over the tiny trunk (same builder as test_decode_graph)."""
     from dataclasses import replace
 
-    import torch
-
     from tilerl.model import build_random
     from tilerl.spec import DraftHead
 
@@ -756,6 +752,95 @@ def test_sparse_verify_tick_populates_and_reads_the_plus_one_own_page_across_a_b
     assert got == base, f"sparse+oracle crossing {got} != dense greedy {base}"
 
 
+def test_sparse_draft_follower_returns_miss_on_a_published_prefix():
+    """Under sparse+spec a follower must NOT adopt a published trunk prefix: the
+    draft head conditions every position on trunk hidden and builds its own dense
+    KV only while forwarding, so an adopted (non-forwarded) prefix leaves the
+    draft attending over an unbuilt pool. The correct behaviour is return-miss —
+    prefill from zero, which builds trunk and draft KV correctly. A no-draft
+    follower still adopts the same prefix (the save is preserved)."""
+    from tilerl.sparse_engine import page_key
+
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    n_tokens = 5 * BLOCK_TOKENS
+    prefix = [int(t) for t in np.arange(7, 7 + n_tokens)]
+
+    def build(draft):
+        from tilerl_kernels.backend import get_backend
+
+        return build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=64, num_slots=4, max_batch=2, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+            kv_cold_bytes=1 << 30, **({"draft": draft, "spec_depth": 1} if draft else {}))
+
+    def seed_published_prefix(e):
+        # Minimal block-aligned entry: lookup matches on tokens; the draft path
+        # must return-miss before it touches keys/bounds/state.
+        cache = e._sparse.prefix
+        ptokens = tuple(prefix[: n_tokens - (n_tokens % BLOCK_TOKENS)])
+        # Reference the live state tensor (no extra allocation to perturb the
+        # measured-peak memory ledger); the draft path returns-miss before reading it.
+        entry = {"eid": cache._next_id, "tokens": ptokens, "keys": [],
+                 "bounds": {}, "state": (e._states.states[0], None)}
+        cache._next_id += 1
+        cache._entries.setdefault(page_key(ptokens, len(ptokens) // BLOCK_TOKENS - 1),
+                                  []).append(entry)
+        cache._by_id[entry["eid"]] = entry
+        return len(ptokens)
+
+    params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=0)
+
+    # WITH a draft: a published prefix exists but the follower returns-miss and
+    # runs to completion (prefilling from zero builds the draft KV correctly;
+    # sparse+/-draft token equality is covered by
+    # test_sparse_with_draft_matches_sparse_without_draft_greedy).
+    spec = build(_draft(cfg, model))
+    seed_published_prefix(spec)
+    rid = spec.submit(np.asarray(prefix), params)
+    got = None
+    try:
+        for _ in range(60):
+            spec.step()
+            running = [r for r in spec._running if r.req_id == rid]
+            if running:
+                # sparse_matched==0 is the return-miss signal: the published entry
+                # was not adopted, so this follower prefills from zero.
+                assert running[0].sparse_matched == 0, "draft follower adopted a trunk prefix"
+            d = spec.poll()
+            if rid in d and len(d[rid]) >= 4:
+                got = d[rid][:4]
+                break
+        assert spec._prefix_hits == 0
+        assert got is not None, "return-miss draft follower did not finish"
+    finally:
+        spec.shutdown()
+
+    # The return-miss follower must be bit-equal to a cold follower that never saw
+    # the published prefix — same trunk and draft KV, same proposals.
+    cold = build(_draft(cfg, model))
+    cold_got = _drain(cold, cold.submit(np.asarray(prefix), params), 4)
+    cold.shutdown()
+    assert got == cold_got, f"return-miss {got} != cold {cold_got}"
+
+    # WITHOUT a draft the same published prefix IS adopted (save preserved).
+    plain = build(None)
+    matched_len = seed_published_prefix(plain)
+    rid2 = plain.submit(np.asarray(prefix), params)
+    try:
+        for _ in range(20):
+            plain.step()
+            running = [r for r in plain._running if r.req_id == rid2]
+            if running:
+                assert running[0].sparse_matched == matched_len, \
+                    "non-spec follower should adopt the prefix"
+                break
+        assert plain._prefix_hits == 1
+    finally:
+        plain.shutdown()
+
+
 def test_full_k_sparse_with_draft_matches_dense_with_draft():
     """k>=pages selects everything: sparse + draft equals dense + draft."""
     prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
@@ -929,8 +1014,6 @@ def _resident_forward(B, device_select, n_pages=20, k=4):
     """A SparseForward over B rows where every page is RESIDENT (the cross-tick
     pin steady state a captured decode tick requires): k selection from
     n_pages-2 candidate pages plus a trailing 2-page own window."""
-    import torch
-
     from tilerl.sparse_engine import SparseForward, SparseTracker
 
     cfg = tiny()
@@ -990,8 +1073,6 @@ def test_device_select_packed_table_matches_eager_at_b1_and_b8():
     """Token-equality to eager sparse at the SparseForward level: the device
     path's leading compact physical columns and seq_len must equal the eager
     path's packed table at B=1 and B=8 (same selection, same own pages)."""
-    import torch
-
     for B in (1, 8):
         cfg, eager = _resident_forward(B, False, k=4)
         _, device = _resident_forward(B, True, k=4)
@@ -1033,8 +1114,6 @@ def test_quest_scores_batched_matches_single_row_bit_for_bit():
     """The captured tick scores all B rows with quest_scores_batched; it must be
     bit-identical to applying the single-row quest_scores per row (the page chunk
     split commutes over rows exactly as it does over pages)."""
-    import torch
-
     from tilerl.sparse_engine import quest_scores, quest_scores_batched
 
     B, tq, hq, hkv, d, cp = 4, 3, 8, 4, 16, 33
@@ -1052,8 +1131,6 @@ def _forward_one_cold(B, device_select, cold_pages):
     """Like _resident_forward but ``cold_pages`` are NON-resident (l2p=-1):
     bounds exist for them (a demoted page keeps its bounds) but the K is cold or
     SSD-resident. Returns (SparseForward, cfg, cold_pages)."""
-    import torch
-
     from tilerl.sparse_engine import SparseForward, SparseTracker
 
     cfg = tiny()
@@ -1094,8 +1171,6 @@ def test_device_select_excludes_a_cold_candidate_and_eager_promotes_it():
       and leave the cold page out, never map it to a phantom block 0;
     - the eager refresh path scores ALL candidates and resolves (promotes) it.
     """
-    import torch
-
     cold = {0}  # candidate page 0 has the highest score but is non-resident
     dev, cfg = _forward_one_cold(1, True, cold)
     q = torch.randn(1, 1, cfg.num_attention_heads, cfg.head_dim)
