@@ -163,6 +163,27 @@ def order_members(member: Tensor, k_pages: int) -> tuple[Tensor, Tensor]:
     return positions, n_sel
 
 
+class _BoundsView:
+    """Read-only ``page -> bound`` face over one request's contiguous
+    ``bounds_t``, so prefix publish can keep its mapping-shaped contract
+    without a second per-page dict. Each lookup clones — the published entry
+    owns its tensor."""
+
+    __slots__ = ("tr", "rid")
+
+    def __init__(self, tr, rid: int):
+        self.tr, self.rid = tr, rid
+
+    def __contains__(self, page) -> bool:
+        return self.tr.has_bounds(self.rid, int(page))
+
+    def __getitem__(self, page) -> Tensor:
+        page = int(page)
+        if not self.tr.has_bounds(self.rid, page):
+            raise KeyError(page)
+        return self.tr.bounds_one(self.rid, page)
+
+
 class SparseTracker:
     """Engine-scoped scorer store, independent of the KV pool so a page's state
     survives its demotion to host:
@@ -323,6 +344,9 @@ class SparseTracker:
         if not self.bytes_per_page:
             # one plane row [Hkv,2,D], x n_full planes
             self.bytes_per_page = b[0].numel() * b.element_size() * self.n_full
+
+    def bounds_view(self, req_id: int) -> _BoundsView:
+        return _BoundsView(self, req_id)
 
     def has_bounds(self, req_id: int, page: int) -> bool:
         v = self.bounds_valid.get(req_id)
@@ -758,7 +782,8 @@ class SparsePrefixCache:
         out: dict[int, int] = {}
         for p in range(old_len, m):
             page_blob = dict(pend.pop(p))
-            page_blob["bounds"] = bounds[p]
+            bound = bounds[p]
+            page_blob["bounds"] = bound
             key = page_key(tokens, p)
             self._cold.share_hold(key, page_blob, _blob_nbytes(page_blob))
             out[p] = key
@@ -773,7 +798,7 @@ class SparsePrefixCache:
         e["tokens"] = ptokens
         e["keys"].extend(out[p] for p in range(old_len, m))
         for p in range(old_len, m):
-            e["bounds"][p] = bounds[p]
+            e["bounds"][p] = self._cold.share_take(out[p])["bounds"]
         e["state"] = snaps[m]
         dup = any(
             x is not e and x["tokens"] == ptokens

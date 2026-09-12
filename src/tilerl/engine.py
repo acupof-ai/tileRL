@@ -1487,13 +1487,13 @@ class Engine:
         serve. Newly published content keys become the publisher's private-blob
         fallback if its own blob is byte-LRU evicted."""
         tr = self._sparse
-        if tr.prefix is None or page not in tr.bounds[r.req_id]:
+        if tr.prefix is None or not tr.has_bounds(r.req_id, page):
             return
         clone = self._sparse_clone_cold(self._kv, (r.req_id, page))
         if clone is None:
             return
         keys = tr.prefix.publish_dropped(
-            r.req_id, r.tokens, tr.bounds[r.req_id], page, clone)
+            r.req_id, r.tokens, tr.bounds_view(r.req_id), page, clone)
         if keys:
             tr.shared.setdefault(r.req_id, {}).update(keys)
 
@@ -1530,8 +1530,9 @@ class Engine:
                 live = tr.resident[rid]
                 q_hi = sf.rows[bi]["q_hi"]
                 complete = q_hi // BLOCK_TOKENS
-                stored = tr.bounds if tr.scorer == "bounds" else tr.keys
-                for p in range(len(stored[rid]), complete):
+                n_stored = (tr.bounds_count[rid] if tr.scorer == "bounds"
+                            else len(tr.keys[rid]))
+                for p in range(n_stored, complete):
                     if p not in live:
                         # selected candidate promoted with its scorer state already
                         continue
