@@ -456,6 +456,37 @@ def test_sparse_source_count_rejects_non_dividing_plane_counts(n_full):
         sparse_source_count(cfg)
 
 
+def test_ledger_kv_hot_blocks_equal_the_pool_the_engine_allocates():
+    """build_engine must allocate the SAME block count the ledger prices, on a
+    built CPU-tiny engine: both go through memory.sparse_pool_num_blocks. tiny has
+    one source group, so slots*(1*k + 8-window + chunk) + 1 with k=4, 3 slots and
+    a 512-token budget is 3*(4 + 8 + 33) + 1 = 136. A divergent sizing expression
+    (e.g. k+window with no group/chunk) makes this fail."""
+    from tilerl.config import tiny
+    from tilerl.engine import build_engine
+    from tilerl.memory import per_kv_block_bytes, sparse_pool_num_blocks, sparse_rows
+    from tilerl.model import build_random
+    from tilerl.testing import RefBackend
+
+    cfg = tiny()
+    slots, k, budget = 3, 4, 512
+    e = build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
+        num_blocks=64, num_slots=slots, max_batch=1, max_total_tokens=4096,
+        max_num_batched_tokens=budget, sparse_k=k, scorer="bounds",
+        kv_cold_bytes=1 << 30)
+    try:
+        assert e._kv.num_blocks == sparse_pool_num_blocks(cfg, slots, k, budget) == 136
+        block = per_kv_block_bytes(cfg, e._kv.dtype, e._kv.kv_fp8)
+        rows = {r.owner: r for r in sparse_rows(
+            cfg, num_rows=1, num_slots=slots, context_tokens=4096, k_pages=k,
+            max_num_batched_tokens=budget, scorer="bounds",
+            kv_io=e._kv.dtype, kv_fp8=e._kv.kv_fp8)}
+        assert rows["kv_hot"].n == e._kv.num_blocks * block
+    finally:
+        e.shutdown()
+
+
 def test_sparse_rows_match_real_tensor_storage_on_27b():
     """The sparse ledger's derived bytes equal the storage of the tensors the engine
     will actually allocate, on the 27B V4.1 geometry (docs/design-sparse-kv.md):

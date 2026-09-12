@@ -2550,7 +2550,6 @@ def build_engine(
         card_guard()
     n_linear = cfg.num_layers - len(cfg.full_attn_layers)
     from .sparse_engine import SparseTracker
-    from .sparse_index import WINDOW_PAGES
 
     sparse_tracker: SparseTracker | None = None
     draft_num_blocks: int | None = None
@@ -2647,12 +2646,11 @@ def build_engine(
         # demotes them — so selections are a UNION of up to n_groups*k pages, not
         # one k. resolve is idempotent by logical page, so the forced 8-page window
         # and one prefill chunk's own pages add once each even though every group
-        # names them. chunk_pages = max_num_batched_tokens/16 ceiling + 1 partial.
-        from .sparse_engine import group_map
-        n_groups = len(group_map(cfg)[0])
-        chunk_pages = max_num_batched_tokens // BLOCK_TOKENS + 1
-        per_row = n_groups * sparse_k + WINDOW_PAGES + chunk_pages
-        num_blocks = num_slots * per_row + 1
+        # names them. The pool size is the one expression the ledger also prices
+        # (memory.sparse_pool_num_blocks), so price and allocate cannot drift.
+        from .memory import sparse_pool_num_blocks
+        num_blocks = sparse_pool_num_blocks(
+            cfg, num_slots, sparse_k, max_num_batched_tokens)
     elif not num_blocks:
         num_blocks = _fit_blocks(cfg, backend, kv_io, max_blocks,
                                  draft_layers=0 if draft is None else draft.cfg.num_layers,
