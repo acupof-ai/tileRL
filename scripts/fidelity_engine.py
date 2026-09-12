@@ -304,20 +304,28 @@ def nll_sweep(model, backend, cfg, spans, ks, n, num_blocks, out, cold_format):
 
     Each generate/score is its own engine: a second submit on an engine that has
     already finished a request does not repopulate hidden capture (the request
-    leaves prefill in the same tick), so engine reuse under-counts logits."""
+    leaves prefill in the same tick), so engine reuse under-counts logits.
+
+    Dense engines need an EXPLICIT pool sized for prompt+continuation: with
+    num_blocks=0 build_engine fits the pool to free memory, which on a 32 GB
+    sm70 card under-fits a full 32k+64 teacher-forced prefill (it submits all
+    prompt+n tokens at once and raises "exceeds KV pool capacity"). Sparse
+    ignores num_blocks (it forces its own n_groups*k pool)."""
     t0 = spans[0].shape[0]
+    # pages to hold the full prompt plus the n forced continuation tokens
+    dense_blocks = num_blocks if num_blocks else (t0 + n) // BLOCK_TOKENS + 4
     agg = {k: {"nll_sparse": 0.0, "nll_dense": 0.0, "sparse_in_top5": 0.0} for k in ks}
     per_span_gap: dict[int, list[float]] = {k: [] for k in ks}
     nll_d = 0.0
     for si, prompt in enumerate(spans):
         # dense greedy D
-        e = make_engine(model, backend, t0 + n + 64, 0, num_blocks, cold_format)
+        e = make_engine(model, backend, t0 + n + 64, 0, dense_blocks, cold_format)
         dseq = generate_greedy(e, model, prompt, n)
         e.shutdown()
         if backend.device.type == "cuda":
             torch.cuda.empty_cache()
         # score D under a fresh dense engine
-        e = make_engine(model, backend, t0 + n + 64, 0, num_blocks, cold_format)
+        e = make_engine(model, backend, t0 + n + 64, 0, dense_blocks, cold_format)
         nll_d, _ = nll_under(e, model, backend, cfg, prompt, dseq, n)
         e.shutdown()
         if backend.device.type == "cuda":
@@ -328,7 +336,7 @@ def nll_sweep(model, backend, cfg, spans, ks, n, num_blocks, out, cold_format):
             sp.shutdown()
             if backend.device.type == "cuda":
                 torch.cuda.empty_cache()
-            de = make_engine(model, backend, t0 + n + 64, 0, num_blocks, cold_format)
+            de = make_engine(model, backend, t0 + n + 64, 0, dense_blocks, cold_format)
             nll_s, in5 = nll_under(de, model, backend, cfg, prompt, sseq, n)
             de.shutdown()
             if backend.device.type == "cuda":
