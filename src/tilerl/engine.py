@@ -66,7 +66,7 @@ def _last_prefill_boundary(n: int) -> int:
     """Where `_pick` ends the final prefill chunk of an `n`-token prompt, 0 if aligned."""
     tail = n % BLOCK_TOKENS
     if not tail:
-        return 0                       # the prompt-complete branch handles it
+        return 0  # the prompt-complete branch handles it
     end = (n // BLOCK_TOKENS) * BLOCK_TOKENS
     return end - BLOCK_TOKENS if tail == 1 else end
 
@@ -102,11 +102,11 @@ def _graph_on(backend, decode_graph: bool | None) -> bool:
                 "torch's caching allocator for the process (a later "
                 "empty_cache asserts). Running eager; pass decode_graph=True "
                 "explicitly to attempt capture anyway.",
-                stacklevel=2)
+                stacklevel=2,
+            )
             _sm70_graph_warned = True
         return False
     return True
-
 
 
 #: Decode-graph size ladder: a tick pads up to the first bucket >= its row count.
@@ -122,8 +122,9 @@ _HASH_MASK = 0x7FFFFFFF
 _STORE_STATS_INTERNAL = ("lookups_matched", "lookups_missed")
 
 
-def _quantize_draft(params: dict[str, torch.Tensor], skip: tuple[str, ...] = (),
-                    fp4: bool = False) -> dict[str, torch.Tensor]:
+def _quantize_draft(
+    params: dict[str, torch.Tensor], skip: tuple[str, ...] = (), fp4: bool = False
+) -> dict[str, torch.Tensor]:
     """Re-serve a draft head's [N,K] projections block-quantized: fp8 by default,
     fp4 where that is the arch's only fused GEMV (sm70 has no ``linear_fp8``).
 
@@ -165,8 +166,7 @@ def _serve_draft(draft: Any, backend: Any) -> None:
     common path just pays a dict copy.
     """
     served = backend.materialize(
-        _quantize_draft(draft.params, skip=draft.no_quant,
-                        fp4=not backend.has_kernel("linear_fp8"))
+        _quantize_draft(draft.params, skip=draft.no_quant, fp4=not backend.has_kernel("linear_fp8"))
     )
     draft.params.clear()  # in place: the head's Model holds THIS dict
     draft.params.update(served)
@@ -234,7 +234,7 @@ def _stop_hit(decode: Any, reply: list[int], stops: tuple[str, ...]) -> str | No
     match, and the per-token cost is one decode of a short id list instead of the
     whole output. Ties go to the earliest occurrence, which is where the caller cuts.
     """
-    tail = decode(reply[-max(len(s) for s in stops):])
+    tail = decode(reply[-max(len(s) for s in stops) :])
     hits = [(tail.find(s), s) for s in stops if s in tail]
     return min(hits)[1] if hits else None
 
@@ -316,8 +316,19 @@ class _DecodeGraph:
     before any real request reads them.
     """
 
-    def __init__(self, model, backend, kv_pool, state_pool, batch_size, width=1, pool=None,
-                 last_only=False, keep=0, aux_layers=()):
+    def __init__(
+        self,
+        model,
+        backend,
+        kv_pool,
+        state_pool,
+        batch_size,
+        width=1,
+        pool=None,
+        last_only=False,
+        keep=0,
+        aux_layers=(),
+    ):
         device = backend.device
         B, W = batch_size, width
         # int32 end to end: a long buffer costs a cast launch per use inside the graph.
@@ -360,9 +371,15 @@ class _DecodeGraph:
         hid: list = []
         # One memory pool across buckets: a private pool per graph is never returned.
         with torch.cuda.graph(self._graph, pool=pool):
-            self._logits = model.forward(self._ids, self._pos, self._kv, backend,
-                                         hidden_out=hid, last_only=last_only,
-                                         aux_layers=aux_layers)
+            self._logits = model.forward(
+                self._ids,
+                self._pos,
+                self._kv,
+                backend,
+                hidden_out=hid,
+                last_only=last_only,
+                aux_layers=aux_layers,
+            )
             # inside the capture, so replay rewrites it like every other static buffer
             aux = torch.cat(hid[: len(aux_layers)], -1) if aux_layers else None
         self.hidden = hid[-1] if hid else None  # rewritten in place by every replay
@@ -405,6 +422,164 @@ class _DecodeGraph:
         self._bt.copy_(self._bt_h, non_blocking=True)
         self._graph.replay()
         return self._logits
+
+
+class _SparseDecodeGraph:
+    """Captured sparse decode/verify tick for one (B, W, cmax) bucket.
+
+    Dense ``_DecodeGraph`` cannot serve sparse rows: it replays the FULL dense
+    block table, but a sparse row's ``r.blocks`` holds only the hot set and
+    attention reads the packed [selected ; own] table the SparseForward builds.
+    This wrapper captures a forward bound to a PERSISTENT, refillable
+    SparseForward (reuse=True):
+
+    - ``fill()`` runs OUTSIDE capture: it resolves the own window, and gathers
+      each row's candidate l2p/bounds into fixed staging tensors.
+    - the replay only reads those staging tensors, so selection, the packed
+      table and write offsets have one fixed shape per bucket and zero host
+      syncs. No promotion happens inside capture; a tick that needs one (or a
+      refresh, prefill, or a larger cmax bucket) runs eager instead.
+    """
+
+    def __init__(
+        self,
+        model,
+        backend,
+        kv_pool,
+        state_pool,
+        tracker,
+        sf,
+        batch_size,
+        width,
+        pool=None,
+        aux_layers=(),
+    ):
+        device = backend.device
+        B, W = batch_size, width
+        self._b, self._w = B, W
+        self.sf = sf
+        self._ids = torch.zeros(B, W, dtype=torch.long, device=device)
+        self._pos = torch.zeros(B, W, dtype=torch.long, device=device)
+        self._slots = torch.zeros(B, dtype=torch.long, device=device)
+        # full per-row logical length for write_tokens offset arithmetic
+        self._sl = torch.zeros(B, dtype=torch.long, device=device)
+        # valid query count per row (chain width for live rows)
+        self._sql = torch.full((B,), W, dtype=torch.long, device=device)
+        self._kv = BatchKv(
+            block_table=sf.own_table,
+            seq_len=self._sl,
+            state_slot=self._slots,
+            kv_pool=kv_pool,
+            state_pool=state_pool,
+            seq_q_lens=self._sql,
+            keep_steps=int(W > 1),
+            page_base=sf.page_base,
+            sparse=sf,
+        )
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                model.forward(
+                    self._ids, self._pos, self._kv, backend, last_only=False, aux_layers=aux_layers
+                )
+        torch.cuda.current_stream().wait_stream(s)
+        self._graph = torch.cuda.CUDAGraph()
+        hid: list = []
+        with torch.cuda.graph(self._graph, pool=pool):
+            self._logits = model.forward(
+                self._ids,
+                self._pos,
+                self._kv,
+                backend,
+                hidden_out=hid,
+                last_only=False,
+                aux_layers=aux_layers,
+            )
+            aux = torch.cat(hid[: len(aux_layers)], -1) if aux_layers else None
+        self.hidden = hid[-1] if hid else None
+        self.aux = aux
+
+    def run(self, srows, chains, pad=None):
+        """Fill every static input and the sparse staging buffers, then replay.
+        ``srows`` are the decode geometry dicts (carry ``req``); pad slots past
+        n use ``(slot, block)``."""
+        B, W = self._b, self._w
+        sf = self.sf
+        sf.fill(srows)
+        for i, rw in enumerate(srows):
+            r = rw["req"]
+            chain = chains[i] if chains else (r.output[-1],)
+            self._ids[i, : len(chain)] = torch.tensor(chain, device=self._ids.device)
+            self._pos[i, : len(chain)] = torch.arange(
+                r.seq_len - 1, r.seq_len - 1 + len(chain), device=self._ids.device
+            )
+            self._sl[i] = r.seq_len - 1 + W
+            self._slots[i] = r.state_slot
+            self._sql[i] = len(chain)
+        n = len(srows)
+        if pad is not None and n < B:
+            pad_slot, pad_block = pad
+            for i in range(n, B):
+                self._ids[i, :] = 0
+                self._pos[i, :] = 0
+                self._sl[i] = W
+                self._slots[i] = pad_slot
+                self._sql[i] = W
+                sf.own_table[i, 0] = pad_block
+        self._graph.replay()
+        return self._logits
+
+
+class _CpuSparseGraph:
+    """CPU test seam for _SparseDecodeGraph: fills the same persistent
+    SparseForward staging buffers and runs the model eagerly, so the
+    selection/packed-table math the captured graph replays is exercised without a
+    CUDA card. The tensors the selection reads are the captured-sf staging ones;
+    a test asserts they are reused (stable data_ptr) and no host sync fires."""
+
+    def __init__(self, model, backend, kv_pool, state_pool, sf, B, W):
+        self.sf = sf
+        self._model, self._backend, self._kv, self._states = (model, backend, kv_pool, state_pool)
+        self._b, self._w = B, W
+        self.hidden = None
+
+    def run(self, srows, chains, pad=None):
+        sf = self.sf
+        sf.fill(srows)
+        B, W = self._b, self._w
+        ids = torch.zeros(B, W, dtype=torch.long)
+        pos = torch.zeros(B, W, dtype=torch.long)
+        sl = torch.zeros(B, dtype=torch.long)
+        ss = torch.zeros(B, dtype=torch.long)
+        sql = torch.full((B,), W, dtype=torch.long)
+        for i, rw in enumerate(srows):
+            r = rw["req"]
+            chain = chains[i]
+            ids[i, : len(chain)] = torch.tensor(chain)
+            pos[i, : len(chain)] = torch.arange(r.seq_len - 1, r.seq_len - 1 + len(chain))
+            sl[i] = r.seq_len - 1 + W
+            ss[i] = r.state_slot
+            sql[i] = len(chain)
+        for i in range(len(srows), B):
+            ss[i] = pad[0] if pad else 0
+            if pad:
+                sf.own_table[i, 0] = pad[1]
+        kv = BatchKv(
+            block_table=sf.own_table,
+            seq_len=sl,
+            state_slot=ss,
+            kv_pool=self._kv,
+            state_pool=self._states,
+            seq_q_lens=sql,
+            keep_steps=int(W > 1),
+            page_base=sf.page_base,
+            sparse=sf,
+        )
+        hid: list = []
+        logits = self._model.forward(ids, pos, kv, self._backend, hidden_out=hid, last_only=False)
+        self.hidden = hid[-1] if hid else None
+        return logits
 
 
 class Engine:
@@ -450,6 +625,7 @@ class Engine:
         #: score only resident candidates, so every R-th decode tick goes eager to
         #: score ALL candidates and promote the ones the hot set is missing.
         self._sparse_ticks_since_refresh = 0
+        self._sparse_graphs: dict = {}
         self._prefix = prefix_store
         #: KvBootStore for cold-start KV (--kv-store); None = no on-disk boot context.
         self._boot = boot_store
@@ -457,6 +633,15 @@ class Engine:
 
         self._decode_graph_on = _graph_on(backend, decode_graph)
         self._decode_graphs: dict = {}
+        # Sparse decode ticks use a separate capture (packed [selected;own] table,
+        # not the dense table). On when sparse device selection is enabled; on a
+        # CUDA backend that also requires the decode graph on (sm70 excluded by
+        # _graph_on), on CPU the device-select path runs the eager CPU test seam.
+        self._sparse_graph_on = (
+            sparse_tracker is not None
+            and self._sparse_device_select
+            and (self._decode_graph_on or backend.device.type != "cuda")
+        )
         # A replay's padding rows write to both pools, so they need a slot and a
         # block of their own. Reserved here, not on the first tick that pads:
         # ``build_engine`` sized the pools for this row, and taking it up front
@@ -511,9 +696,7 @@ class Engine:
             draft.set_depth(spec_depth)
             self._width = draft.width
             if not 1 < self._width <= BLOCK_TOKENS:
-                raise ValueError(
-                    f"verify width must be in (1, {BLOCK_TOKENS}], got {self._width}"
-                )
+                raise ValueError(f"verify width must be in (1, {BLOCK_TOKENS}], got {self._width}")
             if self._width > _MAX_VERIFY_W:
                 raise ValueError(
                     f"verify width {self._width} exceeds the verify tile's {_MAX_VERIFY_W}: "
@@ -638,14 +821,17 @@ class Engine:
         --dry-run prints and stats()["memory"] serves, so a run manifest and a
         dry-run report the identical occupancy surface (P5 reads it for free).
         """
-        return {"blocks": self.usable_blocks, "slots": self.usable_slots,
-                "max_batch": self.limits.max_batch,
-                "max_total_tokens": self.limits.max_total_tokens,
-                "max_num_batched_tokens": self.limits.max_num_batched_tokens,
-                "decode_graph": self._decode_graph_on,
-                "prefix_store": type(self._prefix).__name__,
-                "spec_width": self._width,
-                "memory": self._memory_rows()}
+        return {
+            "blocks": self.usable_blocks,
+            "slots": self.usable_slots,
+            "max_batch": self.limits.max_batch,
+            "max_total_tokens": self.limits.max_total_tokens,
+            "max_num_batched_tokens": self.limits.max_num_batched_tokens,
+            "decode_graph": self._decode_graph_on,
+            "prefix_store": type(self._prefix).__name__,
+            "spec_width": self._width,
+            "memory": self._memory_rows(),
+        }
 
     def room_for(self, prompt_tokens: int) -> int:
         """Largest ``max_new_tokens`` this prompt can ask for and still be admitted.
@@ -817,8 +1003,11 @@ class Engine:
             # Bound: the shortest remaining live deadline, capped at 50 ms -- a stuck
             # reader's safety valve, never more than the caller still owes it.
             now = time.perf_counter()
-            waiting = [(r, self._prefix.boundary_keys(r.tokens))
-                       for r in self._waiting if r.fetch_deadline > now]
+            waiting = [
+                (r, self._prefix.boundary_keys(r.tokens))
+                for r in self._waiting
+                if r.fetch_deadline > now
+            ]
             if waiting:
                 spin_end = now + min(0.050, min(r.fetch_deadline - now for r, _ in waiting))
                 while True:
@@ -826,10 +1015,7 @@ class Engine:
                     if now >= spin_end:
                         break
                     keys = self._prefix.fetching_keys()
-                    if not any(
-                        r.fetch_deadline > now and bkeys & keys
-                        for r, bkeys in waiting
-                    ):
+                    if not any(r.fetch_deadline > now and bkeys & keys for r, bkeys in waiting):
                         break
                     time.sleep(0)
         if idle:
@@ -857,8 +1043,7 @@ class Engine:
         # request; a prefix hit only the residual past the store's blocks.
         # By count, not by catching `alloc_slot`'s raise: an exception out of
         # `_admit` reaches `step`'s handler, which fails EVERY running request.
-        needed = 0 if sparse else (
-            total_blocks if boot_len else total_blocks - len(hit_blocks))
+        needed = 0 if sparse else (total_blocks if boot_len else total_blocks - len(hit_blocks))
         if self._kv.free_blocks < needed:
             # Guarded: unguarded, a request waiting on a live retain would drop every entry
             # each tick and free nothing, flushing other clients' prefixes for the whole wait.
@@ -897,12 +1082,12 @@ class Engine:
         # rows both pass and then alloc_block raises inside the forward.
         if sparse and self._draft is not None:
             draft_need = self._kv.blocks_for_tokens(
-                len(req.tokens) + req.params.max_new_tokens + self._width - 1)
+                len(req.tokens) + req.params.max_new_tokens + self._width - 1
+            )
             if self._draft.kv.free_blocks < draft_need:
                 self._states.free_slot(slot)
                 return False
-            req.draft_blocks = [
-                self._draft.kv.alloc_block() for _ in range(draft_need)]
+            req.draft_blocks = [self._draft.kv.alloc_block() for _ in range(draft_need)]
         # Sparse: blocks grow lazily per own span, never pre-allocate the whole
         # context; prefix-block reuse is likewise skipped (cold pages live in this
         # request's own host tier, not in the shared store).
@@ -939,9 +1124,11 @@ class Engine:
         # prefix hit's shared store blocks, which must not be re-written), so overwriting the
         # last page's K/V with the same values is safe and the tail logits appear — one page
         # at cold start, the same cost as any <16-token tail.
-        req.prefill_from = (max(0, matched - BLOCK_TOKENS)
-                            if boot_loaded and matched == len(req.tokens)
-                            else matched)
+        req.prefill_from = (
+            max(0, matched - BLOCK_TOKENS)
+            if boot_loaded and matched == len(req.tokens)
+            else matched
+        )
         if sparse:
             req.own_blocks = 0
         else:
@@ -952,8 +1139,7 @@ class Engine:
         if sparse:
             self._sparse.attach(req.req_id)
             if self._sparse.prefix is not None:
-                self._sparse.prefix.set_request(
-                    req.req_id, len(req.tokens) // BLOCK_TOKENS)
+                self._sparse.prefix.set_request(req.req_id, len(req.tokens) // BLOCK_TOKENS)
             # Sparse prefix hit: adopt bounds + GDN snapshot + page content keys
             # WITHOUT blocks — the pages live as shared host blobs and promote
             # lazily on selection (_sparse_resolve). seq_len/prefill_from already
@@ -986,8 +1172,7 @@ class Engine:
                 req.sparse_matched = matched
         if matched and not sparse:
             if boot_loaded:
-                self._states.states[slot].copy_(
-                    boot_state["states"].to(self._states.states.device))
+                self._states.states[slot].copy_(boot_state["states"].to(self._states.states.device))
                 if boot_state["window"] is not None:
                     self._states.window_restore(slot, boot_state["window"])
                 self._states.win_parity[slot] = boot_state["parity"]
@@ -1156,11 +1341,9 @@ class Engine:
                 "prefix_state_bytes_budget": store.get("state_bytes_budget", 0),
                 # Present only with a host tier; a demotion is a prefix the card could not
                 # keep but did not have to lose.
-                **{k: v for k, v in store.items()
-                   if k.startswith(("dram_", "ssd_"))},
+                **{k: v for k, v in store.items() if k.startswith(("dram_", "ssd_"))},
                 # sparse-KV cold page tier (absent when kv_cold_bytes=0)
-                **(self._kv.cold.stats()
-                   if getattr(self._kv, "cold", None) is not None else {}),
+                **(self._kv.cold.stats() if getattr(self._kv, "cold", None) is not None else {}),
                 "prefix_demoted": store.get("demoted", 0),
                 # cold-start KV boots from --kv-store (not a prefix-cache hit)
                 "boot_hits": self._boot_hits,
@@ -1181,16 +1364,26 @@ class Engine:
         kv, sp, draft = self._kv, self._states, getattr(self._draft, "kv", None)
 
         def pool(p) -> int:
-            return sum(t.numel() * t.element_size() for t in
-                       (p.k_pool, p.v_pool, p.k_scale, p.v_scale) if t is not None)
+            return sum(
+                t.numel() * t.element_size()
+                for t in (p.k_pool, p.v_pool, p.k_scale, p.v_scale)
+                if t is not None
+            )
 
         measured = {
             "weights": sum(t.numel() * t.element_size() for t in self._model.params.values()),
             "kv_pool": pool(kv),
             "state_slots": sum(
-                t.numel() * t.element_size() for t in
-                (sp.states, sp.conv_windows, sp.step_states, sp.step_windows, sp.win_parity)
-                if t is not None),
+                t.numel() * t.element_size()
+                for t in (
+                    sp.states,
+                    sp.conv_windows,
+                    sp.step_states,
+                    sp.step_windows,
+                    sp.win_parity,
+                )
+                if t is not None
+            ),
         }
         if self._sparse is not None:
             # Sparse: held owners are the bounds tensors, the cross-tick pinned hot
@@ -1199,17 +1392,45 @@ class Engine:
             from .memory import per_kv_block_bytes
 
             block_n = per_kv_block_bytes(self._model.cfg, kv.dtype, kv.kv_fp8)
-            hot = sum(len(self._sparse.resident.get(r.req_id, ()))
-                      for r in self._running) * block_n
+            hot = sum(len(self._sparse.resident.get(r.req_id, ())) for r in self._running) * block_n
             measured.pop("kv_pool")
-            measured["index_keys" if self._sparse.scorer == "index"
-                     else "page_bounds"] = self._sparse.bounds_bytes()
+            measured["index_keys" if self._sparse.scorer == "index" else "page_bounds"] = (
+                self._sparse.bounds_bytes()
+            )
             measured["kv_hot"] = hot
             if getattr(kv, "cold", None) is not None and kv.cold.bytes_held:
                 measured["kv_cold"] = kv.cold.bytes_held
+            graph_n = self._sparse_graph_bytes()
+            if graph_n:
+                measured["sparse_graph"] = graph_n
         if draft is not None:
             measured["draft_pool"] = pool(draft)
         return measured
+
+    def _sparse_graph_bytes(self) -> int:
+        """Held device bytes of every captured sparse graph's persistent forward
+        (the fixed staging tables + packed table the graph bakes). Built lazily,
+        so this is 0 until the first steady-state decode tick."""
+        n = 0
+        for g in self._sparse_graphs.values():
+            sf = g.sf
+            for t in (
+                sf.table,
+                sf.seq_len,
+                sf.page_base,
+                sf.own_table,
+                sf.cand_idx,
+                sf.own_log,
+                sf.own_valid,
+                sf.n_cand,
+                sf.win,
+                sf.own_len_t,
+                sf.s_l2p,
+            ):
+                n += t.numel() * t.element_size()
+            for t in getattr(sf, "s_bounds", None) or ():
+                n += t.numel() * t.element_size()
+        return n
 
     def _measured_peak_bytes(self) -> int | None:
         """The resident-device byte peak the table closes against. On cuda this is the
@@ -1232,20 +1453,37 @@ class Engine:
         draft_layers = 0 if draft_pool is None else self._draft.cfg.num_layers
         # device_free=0: budget rows are the dry-run path's business; the fit is done here.
         if self._sparse is None:
-            derived = plan(self._model.cfg, self._model.params, 0, num_slots=sp.num_slots,
-                           num_blocks=kv.num_blocks, spec_steps=0,
-                           state_dtype=sp.states.dtype, kv_io=kv.dtype, kv_fp8=kv.kv_fp8,
-                           draft_layers=draft_layers)
+            derived = plan(
+                self._model.cfg,
+                self._model.params,
+                0,
+                num_slots=sp.num_slots,
+                num_blocks=kv.num_blocks,
+                spec_steps=0,
+                state_dtype=sp.states.dtype,
+                kv_io=kv.dtype,
+                kv_fp8=kv.kv_fp8,
+                draft_layers=draft_layers,
+            )
         else:
             # Live sparse ledger from ACTUAL per-row state (post-tick every private page is
             # demoted, so kv_hot counts the blocks currently in r.blocks): bounds are count-
             # derived per complete page, hot per resident block, cold from the host tier.
-            from .memory import Row, index_keys_bytes, page_bounds_bytes, per_kv_block_bytes
+            from .memory import Row, index_keys_bytes, per_kv_block_bytes
 
-            derived = plan(self._model.cfg, self._model.params, 0, num_slots=sp.num_slots,
-                           num_blocks=kv.num_blocks, spec_steps=0,
-                           state_dtype=sp.states.dtype, kv_io=kv.dtype, kv_fp8=kv.kv_fp8,
-                           draft_layers=0, sparse=None)
+            derived = plan(
+                self._model.cfg,
+                self._model.params,
+                0,
+                num_slots=sp.num_slots,
+                num_blocks=kv.num_blocks,
+                spec_steps=0,
+                state_dtype=sp.states.dtype,
+                kv_io=kv.dtype,
+                kv_fp8=kv.kv_fp8,
+                draft_layers=0,
+                sparse=None,
+            )
             derived = [r for r in derived if r.owner != "kv_pool"]
             cfg = self._model.cfg
             block_n = per_kv_block_bytes(cfg, kv.dtype, kv.kv_fp8)
@@ -1255,10 +1493,14 @@ class Engine:
             if draft_pool is not None:
                 from .memory import draft_per_block_bytes
 
-                derived.append(Row(
-                    "device", "draft_pool",
-                    draft_per_block_bytes(cfg, kv.dtype, draft_layers) * draft_pool.num_blocks,
-                    f"{draft_layers} draft layers x {draft_pool.num_blocks} dense blocks"))
+                derived.append(
+                    Row(
+                        "device",
+                        "draft_pool",
+                        draft_per_block_bytes(cfg, kv.dtype, draft_layers) * draft_pool.num_blocks,
+                        f"{draft_layers} draft layers x {draft_pool.num_blocks} dense blocks",
+                    )
+                )
             pages_total = 0
             for r in self._running:
                 complete = r.seq_len // BLOCK_TOKENS
@@ -1269,7 +1511,11 @@ class Engine:
                 owner = "index_keys"
                 note = f"{pages_total} complete pages, learned index scorer"
             else:
-                scorer_n = page_bounds_bytes(cfg, pages_total)
+                # Actual stored bounds, not complete-page count: the newest
+                # complete page's bound is written in finalize, so a stats
+                # snapshot between forwards sees one fewer bound than seq_len//16.
+                # measured page_bounds already counts actual (bounds_bytes()).
+                scorer_n = self._sparse.bounds_bytes()
                 owner = "page_bounds"
                 note = f"{pages_total} complete pages, bounds scorer"
             cold_n = ssd_n = ssd_cap = 0
@@ -1286,6 +1532,16 @@ class Engine:
             if ssd_cap:
                 derived.append(Row("ssd", "kv_cold_ssd_capacity", ssd_cap,
                                    "countable spill budget used by admission"))
+            graph_n = self._sparse_graph_bytes()
+            if graph_n:
+                derived.append(
+                    Row(
+                        "device",
+                        "sparse_graph",
+                        graph_n,
+                        f"captured sparse decode tick staging, {len(self._sparse_graphs)} bucket(s)",
+                    )
+                )
         rows = memory_table(derived, self._held_storage(), self._measured_peak_bytes())
         # Dense engine with a cold tier driven by the manual sparse_retier seam (#500):
         # its host pages are not in plan(), so append the held allocation explicitly.
@@ -1293,36 +1549,53 @@ class Engine:
         # cold format (per_cold_kv_block_bytes x pages), so delta catches a D2H copy of a
         # different width than the plan priced (the sm70 f16 narrowing).
         cold = getattr(kv, "cold", None)
-        if self._sparse is None and cold is not None and (
-                cold.bytes_held or cold.ssd_bytes):
+        if self._sparse is None and cold is not None and (cold.bytes_held or cold.ssd_bytes):
             from .memory import per_cold_kv_block_bytes
 
-            per = per_cold_kv_block_bytes(
-                self._model.cfg, kv.dtype, kv.kv_fp8, kv.cold_dtype)
+            per = per_cold_kv_block_bytes(self._model.cfg, kv.dtype, kv.kv_fp8, kv.cold_dtype)
             st = cold.stats()
             if cold.bytes_held:
                 pages = st["kv_cold_pages"]
-                rows.append({"tier": "host", "owner": "kv_cold", "kind": "allocation",
-                             "derived": pages * per,
-                             "note": f"{pages} demoted pages in host RAM",
-                             "measured": cold.bytes_held,
-                             "delta": pages * per - cold.bytes_held})
+                rows.append(
+                    {
+                        "tier": "host",
+                        "owner": "kv_cold",
+                        "kind": "allocation",
+                        "derived": pages * per,
+                        "note": f"{pages} demoted pages in host RAM",
+                        "measured": cold.bytes_held,
+                        "delta": pages * per - cold.bytes_held,
+                    }
+                )
             if cold.ssd_bytes:
                 pages = st["kv_cold_ssd_pages"]
-                rows.append({"tier": "ssd", "owner": "kv_cold_ssd", "kind": "allocation",
-                             "derived": pages * per,
-                             "note": f"{pages} demoted pages spilled to SSD",
-                             "measured": cold.ssd_bytes,
-                             "delta": pages * per - cold.ssd_bytes})
+                rows.append(
+                    {
+                        "tier": "ssd",
+                        "owner": "kv_cold_ssd",
+                        "kind": "allocation",
+                        "derived": pages * per,
+                        "note": f"{pages} demoted pages spilled to SSD",
+                        "measured": cold.ssd_bytes,
+                        "delta": pages * per - cold.ssd_bytes,
+                    }
+                )
         # The cold-start boot store on disk: its derived == measured bytes (one
         # kv_cold(ssd) allocation per saved entry), so the plan and the filesystem agree.
         if self._boot is not None:
             ssd_bytes = self._boot.bytes_total()
             if ssd_bytes:
-                rows.append({"tier": "ssd", "owner": "kv_cold", "kind": "allocation",
-                             "derived": ssd_bytes,
-                             "note": f"{self._boot.entries()} saved boot entries",
-                             "measured": ssd_bytes, "delta": 0})
+                rows.append(
+                    {
+                        "tier": "ssd",
+                        "owner": "kv_cold",
+                        "kind": "allocation",
+                        "derived": ssd_bytes,
+                        "note": f"{self._boot.entries()} saved boot entries",
+                        "measured": ssd_bytes,
+                        "delta": 0,
+                    }
+                )
         return rows
 
     def sparse_retier(self, keep: frozenset[int]) -> tuple[int, int]:
@@ -1357,8 +1630,8 @@ class Engine:
                 ordered: list[tuple[int, int, bool]] = []
                 for idx in range(n):
                     ordered.append(
-                        (idx, cold_map[idx], True) if idx in cold_map
-                        else (idx, next(live), False))
+                        (idx, cold_map[idx], True) if idx in cold_map else (idx, next(live), False)
+                    )
                 new_live: list[int] = []
                 new_cold: list[tuple[int, int]] = []
                 for idx, b, was_cold in ordered:
@@ -1382,7 +1655,6 @@ class Engine:
                 r.cold_pages = new_cold
         return cold.demotions - d0, cold.promotions - p0
 
-
     # -------------------------------------------------------------- internals
 
     def _match_prefix(self, tokens: list[int]) -> tuple[int, list[int], Any]:
@@ -1396,8 +1668,7 @@ class Engine:
             return 0, [], None
         return matched, list(hit.blocks[: matched // BLOCK_TOKENS]), hit.state
 
-    def sparse_selection_recall(self, req_id: int,
-                                target_mass: torch.Tensor) -> dict[int, float]:
+    def sparse_selection_recall(self, req_id: int, target_mass: torch.Tensor) -> dict[int, float]:
         """Recall of the LAST tick's served selection against an offline dense
         page-mass target ``[1, n_groups, nq, pages]`` (window excluded), per
         source group. Lets the card run score what the engine actually selected
@@ -1439,13 +1710,13 @@ class Engine:
                 # own span = the trailing 8-page window the new token writes into
                 own_first = max(0, (q_lo // BLOCK_TOKENS) - (_WP - 1))
                 own_last = (q_hi - 1) // BLOCK_TOKENS
-                force_window = 0                      # the window IS the own span
+                force_window = 0  # the window IS the own span
             else:
                 q_hi = int(r.prefill_from + tq)
                 q_lo = q_hi - tq
                 own_first = q_lo // BLOCK_TOKENS
                 own_last = (q_hi - 1) // BLOCK_TOKENS
-                force_window = _WP                    # force the 8 pre-chunk pages
+                force_window = _WP  # force the 8 pre-chunk pages
             own = list(range(own_first, own_last + 1))
             own_len = q_hi - own_first * BLOCK_TOKENS
             if tr.scorer == "bounds":
@@ -1459,10 +1730,20 @@ class Engine:
             for p in own:
                 reserved.add(p)
                 resolve(p)
-            srows.append(dict(req_id=r.req_id, own=own, own_len=own_len,
-                              q_hi=q_hi, tq=tq, decoding=decoding,
-                              cand=cand, force_window=force_window, resolve=resolve,
-                              reserved=reserved))
+            srows.append(
+                dict(
+                    req_id=r.req_id,
+                    own=own,
+                    own_len=own_len,
+                    q_hi=q_hi,
+                    tq=tq,
+                    decoding=decoding,
+                    cand=cand,
+                    force_window=force_window,
+                    resolve=resolve,
+                    reserved=reserved,
+                )
+            )
         # Pure-decode ticks run the device (resident-only) path except every
         # SPARSE_REFRESH_TICKS-th, which goes eager to re-score ALL candidates and
         # promote the ones the resident hot set is missing. Prefill/mixed ticks are
@@ -1475,12 +1756,10 @@ class Engine:
             do_refresh = self._sparse_ticks_since_refresh >= SPARSE_REFRESH_TICKS
         else:
             do_refresh = False
-        device_select = (
-            self._sparse_device_select and pure_decode and not do_refresh)
+        device_select = self._sparse_device_select and pure_decode and not do_refresh
         if do_refresh:
             self._sparse_ticks_since_refresh = 0
-        return SparseForward(
-            tr, srows, self._backend.device, device_select=device_select)
+        return SparseForward(tr, srows, self._backend.device, device_select=device_select)
 
     def _sparse_evict_victim(self, r: _Req, reserved: set[int]) -> None:
         """Free one frame this tick does NOT need, so a promotion can allocate.
@@ -1500,8 +1779,10 @@ class Engine:
             self._sparse.map_evict(r.req_id, p)
             del live[p]
             return
-        raise RuntimeError("sparse: no unreserved resident page to evict for a "
-                           "promotion; hot pool undersized below the pin ceiling")
+        raise RuntimeError(
+            "sparse: no unreserved resident page to evict for a "
+            "promotion; hot pool undersized below the pin ceiling"
+        )
 
     def _sparse_resolve(self, r: _Req, page: int, reserved: set[int] | None = None) -> int:
         """Physical block for a resident, private-cold, or shared-prefix logical
@@ -1563,8 +1844,7 @@ class Engine:
         clone = self._sparse_clone_cold(self._kv, (r.req_id, page))
         if clone is None:
             return
-        keys = tr.prefix.publish_dropped(
-            r.req_id, r.tokens, tr.bounds_view(r.req_id), page, clone)
+        keys = tr.prefix.publish_dropped(r.req_id, r.tokens, tr.bounds_view(r.req_id), page, clone)
         if keys:
             tr.shared.setdefault(r.req_id, {}).update(keys)
 
@@ -1598,11 +1878,12 @@ class Engine:
         with pool.demotions():
             for bi, r in enumerate(rows):
                 rid = r.req_id
+                if rid not in tr.resident:
+                    continue  # request finished and dropped its tracker state this tick
                 live = tr.resident[rid]
                 q_hi = sf.rows[bi]["q_hi"]
                 complete = q_hi // BLOCK_TOKENS
-                n_stored = (tr.bounds_count[rid] if tr.scorer == "bounds"
-                            else len(tr.keys[rid]))
+                n_stored = tr.bounds_count[rid] if tr.scorer == "bounds" else len(tr.keys[rid])
                 for p in range(n_stored, complete):
                     if p not in live:
                         # selected candidate promoted with its scorer state already
@@ -1610,28 +1891,36 @@ class Engine:
                     phys = live[p]
                     if pool.kv_fp8 is not None:
                         raise NotImplementedError(
-                            f"sparse {tr.scorer} state over an fp8 pool: card PR")
+                            f"sparse {tr.scorer} state over an fp8 pool: card PR"
+                        )
                     if tr.scorer == "bounds":
-                        b = torch.stack([
-                            page_bounds_one(pool.k_pool[plane, phys])
-                            for plane in range(pool.num_layers)])
+                        b = torch.stack(
+                            [
+                                page_bounds_one(pool.k_pool[plane, phys])
+                                for plane in range(pool.num_layers)
+                            ]
+                        )
                         tr.set_bounds(rid, p, b)
                     else:
                         # mean K per source plane -> learned fp8 indexer keys
-                        kmean = torch.stack([
-                            pool.k_pool[plane, phys].to(tr.ik.dtype).mean(dim=1)
-                            for plane in tr.src_planes])
+                        kmean = torch.stack(
+                            [
+                                pool.k_pool[plane, phys].to(tr.ik.dtype).mean(dim=1)
+                                for plane in tr.src_planes
+                            ]
+                        )
                         keys, scales = project_index_page_keys(kmean[None], tr.ik)
                         keys, scales = keys[0], scales[0]
-                        tr.set_index_keys(rid, p, keys.to(pool.k_pool.device),
-                                          scales.to(pool.k_pool.device))
-                if tr.scorer == "bounds" and tr.prefix is not None \
-                        and q_hi % BLOCK_TOKENS == 0:
+                        tr.set_index_keys(
+                            rid, p, keys.to(pool.k_pool.device), scales.to(pool.k_pool.device)
+                        )
+                if tr.scorer == "bounds" and tr.prefix is not None and q_hi % BLOCK_TOKENS == 0:
                     sp = self._states
                     tr.prefix.note_boundary(
-                        rid, complete,
-                        (sp.states[r.state_slot].clone(),
-                         sp.window_snapshot(r.state_slot)))
+                        rid,
+                        complete,
+                        (sp.states[r.state_slot].clone(), sp.window_snapshot(r.state_slot)),
+                    )
                 kept = sf.selected_pages(bi)
                 dropped = [p for p in live if p not in kept]
                 for p in dropped:
@@ -1653,16 +1942,154 @@ class Engine:
             for p in pages:
                 self._sparse_offer_drop(r, p)
 
+    def _sparse_decode_rows(self, decodes: list[_Req], q_dec: list[int]) -> list[dict]:
+        """Decode-only geometry for a captured sparse tick — the decode branch of
+        ``_sparse_rows`` without its refresh bookkeeping (the runner owns that).
+        Own pages resolve via the same closure; candidates are the complete
+        earlier pages with stored bounds."""
+        from .sparse_index import WINDOW_PAGES as _WP
 
-    def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0,
-                 sf=None) -> BatchKv:
+        tr = self._sparse
+        srows = []
+        for r, tq in zip(decodes, q_dec):
+            reserved: set[int] = set()
+            q_lo, q_hi = r.seq_len - 1, r.seq_len - 1 + tq
+            own_first = max(0, (q_lo // BLOCK_TOKENS) - (_WP - 1))
+            own_last = (q_hi - 1) // BLOCK_TOKENS
+            own = list(range(own_first, own_last + 1))
+            cand = (
+                [p for p in range(0, own_first) if tr.has_bounds(r.req_id, p)]
+                if tr.scorer == "bounds"
+                else [p for p in range(0, own_first) if p in tr.keys[r.req_id]]
+            )
+
+            def resolve(p, r=r, reserved=reserved):
+                return self._sparse_resolve(r, p, reserved)
+
+            for p in own:
+                reserved.add(p)
+            srows.append(
+                dict(
+                    req=r,
+                    req_id=r.req_id,
+                    own=own,
+                    own_len=q_hi - own_first * BLOCK_TOKENS,
+                    q_hi=q_hi,
+                    tq=tq,
+                    decoding=True,
+                    cand=cand,
+                    force_window=0,
+                    resolve=resolve,
+                    reserved=reserved,
+                )
+            )
+        return srows
+
+    def _run_sparse_decode_graph(self, reqs: list[_Req], chains) -> bool:
+        """Capture/replay the sparse steady-state decode tick. Returns False (caller
+        runs eager) on a refresh tick (needed promotions), a bounds-scorer-only
+        configuration, or a failed capture. The refresh counter is advanced ONLY
+        on a captured tick; eager goes through ``_sparse_rows`` which owns it."""
+        from .sparse_engine import SPARSE_REFRESH_TICKS, SparseForward, cmax_bucket
+        from .sparse_index import WINDOW_PAGES as _WP
+
+        tr = self._sparse
+        if tr.scorer != "bounds":
+            return False
+        q_dec = [len(c) for c in chains] if chains else [1] * len(reqs)
+        # Read-only peek: let _sparse_rows do the reset when this tick is a refresh.
+        if self._sparse_ticks_since_refresh + 1 >= SPARSE_REFRESH_TICKS:
+            return False
+        rows = self._sparse_decode_rows(reqs, q_dec)
+        n = len(reqs)
+        B = self._graph_bucket(n)
+        W = max(q_dec)
+        own_w = _WP + (1 if W > 1 else 0)
+        cmax = max(len(r["cand"]) for r in rows)
+        key = (B, W, cmax_bucket(cmax), own_w)
+        g = self._sparse_graphs.get(key)
+        if g is None:
+            if n < B and self._pad_slot is None:
+                try:
+                    self._pad_slot = self._states.alloc_slot()
+                    self._pad_block = self._kv.alloc_block()
+                except RuntimeError:
+                    return False
+            sf = SparseForward(
+                tr,
+                None,
+                self._backend.device,
+                device_select=True,
+                reuse=True,
+                b=B,
+                cmax_cap=key[2],
+                own_w_cap=own_w,
+            )
+            try:
+                g = self._make_sparse_graph(sf, B, W)
+            except Exception as exc:
+                warnings.warn(
+                    f"sparse decode graph capture failed for {key} ({exc}); eager fallback"
+                )
+                self._sparse_graph_on = False
+                return False
+            self._sparse_graphs[key] = g
+        logits = g.run(
+            rows,
+            chains or [(r.output[-1],) for r in reqs],
+            pad=None if self._pad_slot is None else (self._pad_slot, self._pad_block),
+        )
+        self._sparse_ticks_since_refresh += 1
+        self._decode_forwards += 1
+        # Finalize residency immediately after the forward (same order as the
+        # eager path, engine _sparse_finalize before sample/verify): the pin reads
+        # this tick's selection out of the captured sf and demotes the rest.
+        self._sparse_finalize(g.sf, reqs)
+        if chains:
+            self._verify(reqs, chains, logits, g.hidden)
+        else:
+            if self._draft is not None and g.hidden is not None:
+                for i, r in enumerate(reqs):
+                    r.hidden_prev = None if r.hidden is None else r.hidden[:, -1:]
+                    r.hidden, r.hidden_from = g.hidden[i : i + 1], r.seq_len - 1
+            self._sample_commit([(r, logits[i, -1], len(r.output)) for i, r in enumerate(reqs)])
+        if self._draft is not None:
+            end = self._width - 1
+            for r in reqs:
+                assert len(r.draft_blocks) * BLOCK_TOKENS > r.seq_len - 1 + end
+            if self._draft_ms is None:
+                self._draft.step(reqs)
+            else:
+                self._draft_step_timed(reqs)
+        return True
+
+    def _make_sparse_graph(self, sf, B: int, W: int):
+        """_SparseDecodeGraph on cuda (real capture); a plain recorded forward on
+        CPU so the staging-only math is testable without a card."""
+        if self._backend.device.type == "cuda":
+            if self._graph_pool is None:
+                self._graph_pool = torch.cuda.graph_pool_handle()
+            return _SparseDecodeGraph(
+                self._model,
+                self._backend,
+                self._kv,
+                self._states,
+                self._sparse,
+                sf,
+                B,
+                W,
+                pool=self._graph_pool,
+                aux_layers=self._aux_layers,
+            )
+        return _CpuSparseGraph(self._model, self._backend, self._kv, self._states, sf, B, W)
+
+    def _make_kv(self, reqs: list[_Req], seq_q: list[int], keep_steps: int = 0, sf=None) -> BatchKv:
         sparse = sf is not None
         if sparse:
             bt = sf.own_table  # own-only table; width and page_base live on sf
         else:
             # Table width = pool size: the kernels compile it in, so a per-tick width recompiles.
-            bt = torch.zeros(len(reqs), self._kv.num_blocks, dtype=torch.long,
-                             pin_memory=self._pin)
+            bt = torch.zeros(len(reqs), self._kv.num_blocks, dtype=torch.long, pin_memory=self._pin)
         sl = torch.empty(len(reqs), dtype=torch.long, pin_memory=self._pin)
         ss = torch.empty(len(reqs), dtype=torch.long, pin_memory=self._pin)
         sql = torch.empty(len(reqs), dtype=torch.long, pin_memory=self._pin)
@@ -1671,9 +2098,7 @@ class Engine:
                 bt[i, : len(r.blocks)] = torch.tensor(r.blocks, dtype=torch.long)
             # Length after this forward; a decode row's chain starts at seq_len-1.
             sl[i] = (
-                r.prefill_from + seq_q[i]
-                if r.phase == _PHASE_PREFILL
-                else r.seq_len - 1 + seq_q[i]
+                r.prefill_from + seq_q[i] if r.phase == _PHASE_PREFILL else r.seq_len - 1 + seq_q[i]
             )
             ss[i] = r.state_slot
             sql[i] = seq_q[i]
@@ -1739,7 +2164,7 @@ class Engine:
                 self._finish(
                     r,
                     error=f"PagedKvPool exhausted: need {need} block(s), "
-                          f"{self._kv.free_blocks} free",
+                    f"{self._kv.free_blocks} free",
                     reason="pool_exhausted",
                 )
                 dead.add(i)
@@ -1760,6 +2185,13 @@ class Engine:
             and decodes
             and self._decode_graph_on
             and self._run_decode_graph(decodes, chains)
+        ):
+            return
+        if (
+            not prefills
+            and decodes
+            and self._sparse_graph_on
+            and self._run_sparse_decode_graph(decodes, chains)
         ):
             return
         rows = decodes + prefills
@@ -1792,9 +2224,12 @@ class Engine:
         hid: list | None = [] if self._draft else None
         t_fwd = time.perf_counter()
         logits = self._model.forward(
-            input_ids, positions, self._make_kv(rows, seq_q, width if chains else 0,
-                                               sf if sparse else None),
-            self._backend, hidden_out=hid, aux_layers=self._aux_layers,
+            input_ids,
+            positions,
+            self._make_kv(rows, seq_q, width if chains else 0, sf if sparse else None),
+            self._backend,
+            hidden_out=hid,
+            aux_layers=self._aux_layers,
             last_only=False if chains else seq_q,  # a verify tick needs every chain position
         )
         if sparse:
@@ -1805,9 +2240,10 @@ class Engine:
             # req -> {group: (candidate_pages, chosen_candidate_pages)}.
             self._sparse.last_selected = {
                 r.req_id: {
-                    g: (list(sf.rows[i]["cand"]), sf.selected(i, g))
-                    for g in range(sf.n_groups)}
-                for i, r in enumerate(rows)}
+                    g: (list(sf.rows[i]["cand"]), sf.selected(i, g)) for g in range(sf.n_groups)
+                }
+                for i, r in enumerate(rows)
+            }
         if hid is not None:
             n_aux = len(self._aux_layers)
             for i, r in enumerate(rows):  # hidden_out is full width, appended before last_only
@@ -1848,7 +2284,8 @@ class Engine:
                     end = r.seq_len - 1 + self._width - 1
                     assert len(r.draft_blocks) * BLOCK_TOKENS > end, (
                         f"draft needs position {end} but admit reserved "
-                        f"{len(r.draft_blocks)} blocks")
+                        f"{len(r.draft_blocks)} blocks"
+                    )
                     continue
                 while r.blocks and len(r.blocks) * BLOCK_TOKENS <= r.seq_len - 1:
                     r.blocks.append(self._kv.alloc_block())
@@ -1914,9 +2351,17 @@ class Engine:
         try:
             if self._graph_pool is None:
                 self._graph_pool = torch.cuda.graph_pool_handle()
-            g = _DecodeGraph(self._model, self._backend, self._kv, self._states, B,
-                             width=W, pool=self._graph_pool, keep=W if keep else 0,
-                             aux_layers=self._aux_layers)
+            g = _DecodeGraph(
+                self._model,
+                self._backend,
+                self._kv,
+                self._states,
+                B,
+                width=W,
+                pool=self._graph_pool,
+                keep=W if keep else 0,
+                aux_layers=self._aux_layers,
+            )
         except Exception as exc:
             warnings.warn(f"decode graph capture failed for B={B} W={W} ({exc}); eager fallback")
             self._decode_graph_on = False
@@ -1974,8 +2419,11 @@ class Engine:
         # range-checked in __init__. A second copy of the arithmetic here is how
         # precapture came to reference a _spec_depth attribute that does not exist.
         widths = range(1, 1 + self._width) if self._draft is not None else (1,)
-        return {(self._graph_bucket(rows), w)
-                for rows in range(1, self.limits.max_batch + 1) for w in widths}
+        return {
+            (self._graph_bucket(rows), w)
+            for rows in range(1, self.limits.max_batch + 1)
+            for w in widths
+        }
 
     def precapture(self) -> int:
         """Capture every graph a decode tick can ask for; return how many exist.
@@ -2114,8 +2562,11 @@ class Engine:
             self._states.select_step(r.state_slot, n_ok)
             r.hidden_prev = None if r.hidden is None else r.hidden[:, -1:]
             r.hidden, r.hidden_from = hidden[i : i + 1], r.seq_len - 1
-            self._commit(r, got[: n_ok + 1],
-                         None if lps is None else lps[at - len(chains[i]) : at][: n_ok + 1])
+            self._commit(
+                r,
+                got[: n_ok + 1],
+                None if lps is None else lps[at - len(chains[i]) : at][: n_ok + 1],
+            )
 
     def _sample_batch(self, rows: list[tuple]) -> list[int]:
         """One batched sample over all rows (B per-row sorts were 8.2% of a B=8
@@ -2131,8 +2582,11 @@ class Engine:
             logits = torch.stack([_restrict(logits[i], p) for i, p in enumerate(params)])
         want_lp = any(p.logprobs for p in params)  # a greedy score is a second full softmax
         toks, lps = self._backend.sample_batch(
-            logits, [p.temperature for p in params], [p.top_p for p in params],
-            [_step_seed(r.params.seed, g) for r, _, g in rows], logprobs=want_lp,
+            logits,
+            [p.temperature for p in params],
+            [p.top_p for p in params],
+            [_step_seed(r.params.seed, g) for r, _, g in rows],
+            logprobs=want_lp,
         )
         self._last_logprobs = lps.tolist() if want_lp else None
         return toks.tolist()
@@ -2176,18 +2630,23 @@ class Engine:
             # match's start. Dropping it would leave a partial stop in the reply.
             # Only past the closer when the prompt opened <think> -- a stop inside the
             # reasoning would return a truncated thought and no answer.
-            if (p.stop_texts and (req.thought_closed or not p.end_think_ids)
-                    and (hit := _stop_hit(self._decode, req.output[req.reply_from:],
-                                          p.stop_texts))):
+            if (
+                p.stop_texts
+                and (req.thought_closed or not p.end_think_ids)
+                and (hit := _stop_hit(self._decode, req.output[req.reply_from :], p.stop_texts))
+            ):
                 req.stop_text = hit
                 self._finish(req)
                 return
             materialized = req.seq_len - 1
             # Replace, not accumulate: only this row's longest decode entry can serve it again.
             # Retire after the insert -- the entries share blocks -- and only if it succeeded.
-            if (i == last and req.phase == _PHASE_DECODE
-                    and materialized % BLOCK_TOKENS == 0
-                    and self._publish_prefix(req, materialized)):
+            if (
+                i == last
+                and req.phase == _PHASE_DECODE
+                and materialized % BLOCK_TOKENS == 0
+                and self._publish_prefix(req, materialized)
+            ):
                 if req.decode_entry:
                     self._prefix.retire(req.tokens[: req.decode_entry])
                 req.decode_entry = materialized
@@ -2210,8 +2669,11 @@ class Engine:
         blocks = req.blocks[: n // BLOCK_TOKENS]
         state = {
             "states": self._states.states[req.state_slot].clone().cpu(),
-            "window": (None if self._states.conv_windows is None
-                       else self._states.window_snapshot(req.state_slot)),
+            "window": (
+                None
+                if self._states.conv_windows is None
+                else self._states.window_snapshot(req.state_slot)
+            ),
             "parity": int(self._states.win_parity[req.state_slot]),
         }
         return self._boot.save(req.tokens[:n], self._kv, blocks, state)
@@ -2265,8 +2727,7 @@ class Engine:
         self._states.free_slot(req.state_slot)
         self._slots_used -= 1
 
-    def _finish(self, req: _Req, error: str | None = None,
-                reason: str | None = None) -> None:
+    def _finish(self, req: _Req, error: str | None = None, reason: str | None = None) -> None:
         self._release(req)
         if error is None:
             self._finished[req.req_id] = req.output
@@ -2322,8 +2783,9 @@ class Engine:
                 self._wake.wait(0.005)
 
 
-def _fit_blocks(cfg, backend, io, cap: int, draft_layers: int = 0,
-                kv_fp8: torch.dtype | None = None) -> int:
+def _fit_blocks(
+    cfg, backend, io, cap: int, draft_layers: int = 0, kv_fp8: torch.dtype | None = None
+) -> int:
     """KV blocks that fit the free memory left after the weights and the GDN pools.
 
     Called with the state pool already allocated, so free memory is measured, not
@@ -2350,8 +2812,8 @@ def _fit_blocks(cfg, backend, io, cap: int, draft_layers: int = 0,
     from .memory import fit_num_blocks
 
     return fit_num_blocks(
-        cfg, torch.cuda.mem_get_info()[0], io, kv_fp8,
-        draft_layers=draft_layers, cap=cap)
+        cfg, torch.cuda.mem_get_info()[0], io, kv_fp8, draft_layers=draft_layers, cap=cap
+    )
 
 
 def _weight_fingerprint(cfg, kv_fp8: torch.dtype | None = None) -> str:
@@ -2544,7 +3006,7 @@ def build_engine(
     #: when sparse_k>0 and kv_cold_bytes is unset.
     sparse_k: int = DEFAULT_SPARSE_K,
     scorer: str = "bounds",
-    sparse_device_select: bool = False,
+    sparse_device_select: bool | None = None,
     decode_graph: bool | None = None,
     draft: Any = None,
     spec_depth: int | None = None,
@@ -2562,16 +3024,18 @@ def build_engine(
     draft_num_blocks: int | None = None
     if sparse_k:
         if scorer not in ("bounds", "index"):
-            raise ValueError(f'sparse engine scorer {scorer!r}: want bounds|index')
-        # Selection buffers change width per tick and promote through host
-        # memory; a captured decode graph cannot hold that — the sparse tick is
-        # eager (the graph-captured sparse verify tick is a later card follow-up).
-        decode_graph = False
+            raise ValueError(f"sparse engine scorer {scorer!r}: want bounds|index")
         sparse_tracker = SparseTracker(cfg, sparse_k, scorer, device=backend.device)
         # An explicitly-passed NoPrefixStore means "sharing off" (training/old
         # tests); otherwise the sparse prefix index attaches once the cold tier
         # exists.
         sparse_tracker.sharing_enabled = not isinstance(prefix_store, NoPrefixStore)
+        # Device selection (the capture-ready tick) defaults ON whenever a decode
+        # graph auto-enables on this backend — its only consumer is the captured
+        # sparse tick. A backend _graph_on rejects (CPU, sm70) or explicit
+        # decode_graph=False keeps eager; an explicit sparse_device_select wins.
+        if sparse_device_select is None:
+            sparse_device_select = _graph_on(backend, decode_graph)
         if scorer == "index":
             # materialize ran after construction; keep indexer weights on-device.
             sparse_tracker.iq = sparse_tracker.iq.to(backend.device)
@@ -2624,8 +3088,11 @@ def build_engine(
     # cpu; PagedKvPool's DEFAULT is what disagrees with it, so narrow the call site.
     # getattr on BOTH: RefBackend and the other test doubles declare neither, and
     # asking for .arch directly raised AttributeError in 7 tests.
-    kv_io = (getattr(backend, "io", torch.bfloat16)
-             if getattr(backend, "arch", "").startswith("sm") else torch.bfloat16)
+    kv_io = (
+        getattr(backend, "io", torch.bfloat16)
+        if getattr(backend, "arch", "").startswith("sm")
+        else torch.bfloat16
+    )
     if kv_fp8 is not None:
         # A fused writer scatters into the plane `kv_layer` returns, which under fp8 is a
         # dequantized copy -- the write is dropped with no error. The fp8 twins take the raw
@@ -2646,7 +3113,8 @@ def build_engine(
             from .memory import per_kv_block_bytes
 
             kv_cold_bytes = (max_total_tokens // BLOCK_TOKENS + 1) * per_kv_block_bytes(
-                cfg, kv_io, kv_fp8)
+                cfg, kv_io, kv_fp8
+            )
         # Per-tick resident peak per slot. Quest selects independently per source
         # group (groups of 4 full-attn layers), and each group's chosen pages
         # co-reside in one shared live map through the forward before finalize
@@ -2656,12 +3124,18 @@ def build_engine(
         # names them. The pool size is the one expression the ledger also prices
         # (memory.sparse_pool_num_blocks), so price and allocate cannot drift.
         from .memory import sparse_pool_num_blocks
+
         num_blocks = sparse_pool_num_blocks(
             cfg, num_slots, sparse_k, max_num_batched_tokens)
     elif not num_blocks:
-        num_blocks = _fit_blocks(cfg, backend, kv_io, max_blocks,
-                                 draft_layers=0 if draft is None else draft.cfg.num_layers,
-                                 kv_fp8=kv_fp8)
+        num_blocks = _fit_blocks(
+            cfg,
+            backend,
+            kv_io,
+            max_blocks,
+            draft_layers=0 if draft is None else draft.cfg.num_layers,
+            kv_fp8=kv_fp8,
+        )
     # The narrow host-copy dtype. Auto ("") narrows an f32 pool (sm70) to f16 and
     # leaves every other pool native; --cold-format forces it. "native" explicitly
     # keeps the pool dtype even on sm70.
@@ -2699,8 +3173,9 @@ def build_engine(
         if backend.device.type == "cuda":
             torch.cuda.empty_cache()
             per = draft_per_block_bytes(cfg, kv_io, draft.cfg.num_layers)
-            draft_num_blocks = min(cap, max(1, int(
-                torch.cuda.mem_get_info()[0] * POOL_FRACTION) // per))
+            draft_num_blocks = min(
+                cap, max(1, int(torch.cuda.mem_get_info()[0] * POOL_FRACTION) // per)
+            )
         else:
             draft_num_blocks = cap
     # A resident store entry owns a GDN state snapshot in HBM (144 MiB at 27B f32)
@@ -2728,14 +3203,18 @@ def build_engine(
     if ssd_path:
         # Not gated on cuda: the tier is target-independent, and the CPU target is where
         # its parity is checked.
-        kw["ssd"] = KvTier(ssd_path, ssd_fingerprint or _weight_fingerprint(cfg, kv_fp8),
-                           **({"min_tokens": ssd_min_tokens} if ssd_min_tokens else {}))
+        kw["ssd"] = KvTier(
+            ssd_path,
+            ssd_fingerprint or _weight_fingerprint(cfg, kv_fp8),
+            **({"min_tokens": ssd_min_tokens} if ssd_min_tokens else {}),
+        )
     if sparse_k and kv_store:
         raise NotImplementedError(
             "dense bulk boot (--kv-store) with sparse_k>0 is not supported: a boot "
             "load allocates every context block against the device hot pool, which "
             "under sparsity holds only k+window+chunk per slot. Save/boot a dense "
-            "build; a sparse-aware boot is a later PR.")
+            "build; a sparse-aware boot is a later PR."
+        )
     if prefix_store is not None:
         store = prefix_store
     elif sparse_k:

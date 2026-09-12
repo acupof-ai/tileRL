@@ -433,7 +433,7 @@ def plan(cfg, params: dict | None, device_free: int, *, num_slots: int, num_bloc
 #: they never appear in a serving :func:`plan`, so they cannot enter its peak residual.
 STATIC_OWNERS = (
     "weights", "state_slots", "kv_pool", "draft_pool",
-    "index_keys", "page_bounds", "kv_hot",
+    "index_keys", "page_bounds", "kv_hot", "sparse_graph",
     "adapter", "optimizer_state", "frame", "tape",
 )
 

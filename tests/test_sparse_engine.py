@@ -26,9 +26,16 @@ from tilerl.testing import RefBackend
 
 def _engine(sparse: bool, k: int = 0, scorer: str = "bounds"):
     kw = dict(
-        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
-        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-        max_num_batched_tokens=512, prefix_store=NoPrefixStore())
+        cfg=tiny(),
+        model=build_random(tiny(), seed=11),
+        backend=RefBackend(),
+        num_blocks=64,
+        num_slots=4,
+        max_batch=1,
+        max_total_tokens=4096,
+        max_num_batched_tokens=512,
+        prefix_store=NoPrefixStore(),
+    )
     if sparse:
         kw.update(sparse_k=k, scorer=scorer, kv_cold_bytes=1 << 30)
     return build_engine(**kw)
@@ -185,11 +192,19 @@ def test_sparse_prompt_longer_than_device_hot_pool_admits_via_cold():
     gate; k>=pages makes the pool wider than the context, so it cannot exercise
     this crossing."""
     cfg = tiny()
-    common = dict(cfg=cfg, model=build_random(cfg, seed=11), backend=RefBackend(),
-                  num_slots=1, max_batch=1, max_total_tokens=1024,
-                  max_num_batched_tokens=16, prefix_store=NoPrefixStore())
-    sparse = build_engine(num_blocks=0, sparse_k=2, scorer="bounds",
-                          kv_cold_bytes=1 << 30, **common)
+    common = dict(
+        cfg=cfg,
+        model=build_random(cfg, seed=11),
+        backend=RefBackend(),
+        num_slots=1,
+        max_batch=1,
+        max_total_tokens=1024,
+        max_num_batched_tokens=16,
+        prefix_store=NoPrefixStore(),
+    )
+    sparse = build_engine(
+        num_blocks=0, sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30, **common
+    )
     assert sparse._kv.num_blocks == 13  # 1*(k2 + window8 + chunk2) + 1
     assert sparse.room_for(512) > 0
     prompt = (np.arange(32 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7  # 512 tok, in tiny vocab
@@ -211,6 +226,8 @@ def test_sparse_prompt_longer_than_device_hot_pool_admits_via_cold():
     # phys-key collision. Stable (req, page) keys are what let this finish.
     assert ndemote > nframes, (ndemote, nframes)
     assert len(tok) == 4 and all(isinstance(t, int) for t in tok)
+
+
 def test_index_scorer_equals_dense_token_for_token_at_full_k():
     """The learned scorer="index" through the SAME seam as bounds must select
     every candidate page at full k and reproduce dense tokens prefill+decode
@@ -259,7 +276,6 @@ def test_live_selection_recall_is_one_at_full_k():
     assert checked
 
 
-
 def test_index_scorer_writes_fp8_keys_and_reconciles_measured_bytes():
     """The index scorer persists fp8 page keys (not bounds), demotes/promotes
     them, and stats' measured index_keys matches the derived row at tiny di=16
@@ -277,11 +293,10 @@ def test_index_scorer_writes_fp8_keys_and_reconciles_measured_bytes():
         assert tr.scorer == "index" and tr.keys is not None
         if any(tr.keys.get(r.req_id, {}) for r in e._running):
             page, (keys, scales) = next(
-                (p, kv) for rid2, pages in tr.keys.items() if pages
-                for p, kv in pages.items())
+                (p, kv) for rid2, pages in tr.keys.items() if pages for p, kv in pages.items()
+            )
             assert keys.dtype == torch.float8_e4m3fn and keys.shape[-1] == tr.di
-            assert keys.shape[:2] == (len(tr.src_planes),
-                                      tr.ih)
+            assert keys.shape[:2] == (len(tr.src_planes), tr.ih)
             assert scales.shape == keys.shape[:2]
             # measured == derived at the live (tiny di) face
             stored = e.stats()["memory"]
@@ -304,12 +319,29 @@ def test_serve_build_path_wires_the_sparse_engine(tmp_path, capsys):
 
     from tilerl import cli
 
-    cli.cmd_serve(cli._build_parser().parse_args([
-        "serve", "--model", "tiny", "--dry-run", "--json",
-        "--sparse-k", "2", "--scorer", "bounds",
-        "--slots", "2", "--max-batch", "1", "--max-ctx", "256",
-        "--device-free", "100000000",
-    ]))
+    cli.cmd_serve(
+        cli._build_parser().parse_args(
+            [
+                "serve",
+                "--model",
+                "tiny",
+                "--dry-run",
+                "--json",
+                "--sparse-k",
+                "2",
+                "--scorer",
+                "bounds",
+                "--slots",
+                "2",
+                "--max-batch",
+                "1",
+                "--max-ctx",
+                "256",
+                "--device-free",
+                "100000000",
+            ]
+        )
+    )
     owners = {r["owner"] for r in json.loads(capsys.readouterr().out)}
     assert {"page_bounds", "kv_hot"} <= owners, owners
     # the dense kv_pool must NOT also be priced for a sparse engine
@@ -334,10 +366,18 @@ def test_sparse_prefix_publishes_only_when_pages_leave_the_hot_union():
     # decoding follow with a MISS (no publisher): sharing must be transparent.
     def _sparse():
         return build_engine(
-            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
-            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
-            kv_cold_bytes=1 << 30)
+            cfg=tiny(),
+            model=build_random(tiny(), seed=11),
+            backend=RefBackend(),
+            num_blocks=64,
+            num_slots=4,
+            max_batch=1,
+            max_total_tokens=4096,
+            max_num_batched_tokens=512,
+            sparse_k=2,
+            scorer="bounds",
+            kv_cold_bytes=1 << 30,
+        )
 
     miss = _sparse()
     ts_miss = _drain(miss, miss.submit(follow, params), 8)
@@ -346,16 +386,19 @@ def test_sparse_prefix_publishes_only_when_pages_leave_the_hot_union():
     sparse = _sparse()
     # A 5-page prompt fits entirely inside k+window: nothing leaves the union, so
     # the pin publishes no prefix at all.
-    short = sparse.submit(np.arange(7, 7 + 5 * BLOCK_TOKENS, dtype=np.int64),
-                          SamplingParams(temperature=0.0, max_new_tokens=4, seed=0))
+    short = sparse.submit(
+        np.arange(7, 7 + 5 * BLOCK_TOKENS, dtype=np.int64),
+        SamplingParams(temperature=0.0, max_new_tokens=4, seed=0),
+    )
     _drain(sparse, short, 4)
     assert sparse._sparse.prefix.published == 0, sparse._sparse.prefix.published
 
     r1 = sparse.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=200, seed=0))
     _drain(sparse, r1, 200)
     entry = sparse._sparse.prefix.lookup(follow)
-    assert entry is not None and len(entry["keys"]) == 24, \
+    assert entry is not None and len(entry["keys"]) == 24, (
         None if entry is None else len(entry["keys"])
+    )
 
     r2 = sparse.submit(follow, params)
     sparse.step()
@@ -462,6 +505,7 @@ def test_prefix_clone_reads_blob_only_after_demotions_scope_exits():
     def deferred_demotions():
         def stage(block, key=None):
             staged.append((block, key))
+
         pool.demote_page = stage
         try:
             yield pool
@@ -493,12 +537,20 @@ def test_cold_tier_spills_past_the_host_budget_and_the_ledger_splits_tiers(tmp_p
     per = per_kv_block_bytes(cfg, __import__("torch").bfloat16)
     ssd = str(tmp_path / "spill.bin")
     e = build_engine(
-        cfg, build_random(cfg, seed=11), RefBackend(),
-        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-        max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
-        sparse_k=2, scorer="bounds",
-        kv_cold_bytes=per,                 # one page of pinned host RAM
-        cold_ssd_path=ssd)
+        cfg,
+        build_random(cfg, seed=11),
+        RefBackend(),
+        num_blocks=64,
+        num_slots=4,
+        max_batch=1,
+        max_total_tokens=4096,
+        max_num_batched_tokens=512,
+        prefix_store=NoPrefixStore(),
+        sparse_k=2,
+        scorer="bounds",
+        kv_cold_bytes=per,  # one page of pinned host RAM
+        cold_ssd_path=ssd,
+    )
     # 24 pages. Under the cross-tick pin the device hot set is k+window (+chunk):
     # tiny has one source group, k=2 and the trailing 8-page window stay resident,
     # so a context must EXCEED k+window pages for anything to demote and spill.
@@ -506,7 +558,7 @@ def test_cold_tier_spills_past_the_host_budget_and_the_ledger_splits_tiers(tmp_p
     # hot set, so host=0/ssd=0 every tick — correct pin behaviour, no spill.)
     prompt = (np.arange(24 * BLOCK_TOKENS, dtype=np.int64) % 300) + 7
     rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=6, seed=0))
-    for _ in range(128):                      # into decode, before the request finishes
+    for _ in range(128):  # into decode, before the request finishes
         r0 = next((x for x in e._running if x.req_id == rid), None)
         e.step()
         if r0 is not None and r0.phase == 2:
@@ -522,6 +574,7 @@ def test_cold_tier_spills_past_the_host_budget_and_the_ledger_splits_tiers(tmp_p
     _drain(e, rid, 6)  # finish releases the request's cold pages (both tiers)
     e.shutdown()
 
+
 def _draft(cfg, trunk):
     """A one-layer DraftHead over the tiny trunk (same builder as test_decode_graph)."""
     from dataclasses import replace
@@ -530,8 +583,7 @@ def _draft(cfg, trunk):
     from tilerl.spec import DraftHead
 
     dcfg = replace(cfg, num_layers=1, full_attn_layers=(0,), fp4=False)
-    params = {k: v for k, v in build_random(dcfg, seed=3).params.items()
-              if k.startswith("layers.")}
+    params = {k: v for k, v in build_random(dcfg, seed=3).params.items() if k.startswith("layers.")}
     gen = torch.Generator().manual_seed(3)
     h = cfg.hidden_size
     params["fc"] = (torch.randn(h, 2 * h, generator=gen) * 0.02).to(torch.bfloat16)
@@ -549,9 +601,16 @@ def _sparse_engine(sparse_k, draft=False, cfg=None):
     # through _serve_draft -> has_kernel, which RefBackend does not declare.
     # The CPU cell backend is the spec harness test_e2e uses.
     backend = get_backend()
-    kw = dict(num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-              max_num_batched_tokens=512, sparse_k=sparse_k, scorer="bounds",
-              kv_cold_bytes=1 << 30)
+    kw = dict(
+        num_blocks=64,
+        num_slots=4,
+        max_batch=1,
+        max_total_tokens=4096,
+        max_num_batched_tokens=512,
+        sparse_k=sparse_k,
+        scorer="bounds",
+        kv_cold_bytes=1 << 30,
+    )
     if draft:
         kw["draft"] = _draft(cfg, model)
         kw["spec_depth"] = 1
@@ -589,35 +648,51 @@ def test_sparse_draft_admission_reject_does_not_leak_a_state_slot():
     from tilerl_kernels.backend import get_backend
 
     e = build_engine(
-        cfg=cfg, model=model, backend=get_backend(),
-        num_blocks=64, num_slots=4, max_batch=2, max_total_tokens=4096,
-        max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
-        kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+        cfg=cfg,
+        model=model,
+        backend=get_backend(),
+        num_blocks=64,
+        num_slots=4,
+        max_batch=2,
+        max_total_tokens=4096,
+        max_num_batched_tokens=512,
+        sparse_k=2,
+        scorer="bounds",
+        kv_cold_bytes=1 << 30,
+        draft=_draft(cfg, model),
+        spec_depth=1,
+    )
     # The 5-page prompt needs 6 dense draft blocks (plus one verify position);
     # size the shared draft pool so one row fits but two cannot.
     from tilerl.kv_cache import PagedKvPool
 
     d = e._draft
-    d.kv = PagedKvPool(6, cfg.num_kv_heads, cfg.head_dim,
-                       num_layers=d.cfg.num_layers,
-                       layer_map=tuple(range(d.cfg.num_layers)),
-                       device=d.backend.device, dtype=d.kv.dtype)
+    d.kv = PagedKvPool(
+        6,
+        cfg.num_kv_heads,
+        cfg.head_dim,
+        num_layers=d.cfg.num_layers,
+        layer_map=tuple(range(d.cfg.num_layers)),
+        device=d.backend.device,
+        dtype=d.kv.dtype,
+    )
     prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)  # 6 pages
     params = SamplingParams(temperature=0.0, max_new_tokens=4, seed=0)
     e.submit(prompt, params)
     try:
-        for _ in range(6):                       # admit r1, grow its draft blocks
+        for _ in range(6):  # admit r1, grow its draft blocks
             e.step()
             if e._running and e._running[0].draft_blocks:
                 break
         assert e._draft.kv.free_blocks < 6, "fixture: row 1 did not fill the draft pool"
-        e.submit(prompt, params)                 # static guard passes, admit rejects
+        e.submit(prompt, params)  # static guard passes, admit rejects
         slots_before = e.stats()["slots_used"]
         for _ in range(6):
-            e.step()                             # r2 retries admit every tick
+            e.step()  # r2 retries admit every tick
         st = e.stats()
         assert st["slots_used"] == slots_before == 1, (
-            f"rejected admits leaked slots: {st['slots_used']} vs {slots_before}")
+            f"rejected admits leaked slots: {st['slots_used']} vs {slots_before}"
+        )
     finally:
         e.shutdown()
 
@@ -636,18 +711,33 @@ def test_sparse_draft_pool_is_reserved_at_admit_across_rows():
     cfg = tiny()
     model = build_random(cfg, seed=11)
     e = build_engine(
-        cfg=cfg, model=model, backend=get_backend(),
-        num_blocks=64, num_slots=4, max_batch=2, max_total_tokens=4096,
-        max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
-        kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+        cfg=cfg,
+        model=model,
+        backend=get_backend(),
+        num_blocks=64,
+        num_slots=4,
+        max_batch=2,
+        max_total_tokens=4096,
+        max_num_batched_tokens=512,
+        sparse_k=2,
+        scorer="bounds",
+        kv_cold_bytes=1 << 30,
+        draft=_draft(cfg, model),
+        spec_depth=1,
+    )
     # One full draft span: 48 prompt + 2 new + 1 verify position = 51 -> 4 blocks.
     from tilerl.kv_cache import PagedKvPool
 
     d = e._draft
-    d.kv = PagedKvPool(4, cfg.num_kv_heads, cfg.head_dim,
-                       num_layers=d.cfg.num_layers,
-                       layer_map=tuple(range(d.cfg.num_layers)),
-                       device=d.backend.device, dtype=d.kv.dtype)
+    d.kv = PagedKvPool(
+        4,
+        cfg.num_kv_heads,
+        cfg.head_dim,
+        num_layers=d.cfg.num_layers,
+        layer_map=tuple(range(d.cfg.num_layers)),
+        device=d.backend.device,
+        dtype=d.kv.dtype,
+    )
     prompt = np.arange(7, 7 + 3 * BLOCK_TOKENS, dtype=np.int64)  # exactly 3 pages
     params = SamplingParams(temperature=0.0, max_new_tokens=2, seed=0)
     e.submit(prompt, params)
@@ -655,16 +745,16 @@ def test_sparse_draft_pool_is_reserved_at_admit_across_rows():
     t2 = None
     try:
         for _ in range(256):
-            e.step()   # raised "PagedKvPool exhausted" inside the forward pre-fix
+            e.step()  # raised "PagedKvPool exhausted" inside the forward pre-fix
             running = [x for x in e._running]
             # two sparse draft rows must never be admitted against a one-row pool
-            assert len(running) <= 1, (
-                f"{len(running)} draft rows share a one-row draft pool")
+            assert len(running) <= 1, f"{len(running)} draft rows share a one-row draft pool"
             t2 = e.poll().get(r2, t2)
             if t2 is not None and len(t2) >= 2:
                 break
         assert t2 is not None and len(t2) == 2, (
-            "row 2 must admit and finish after row 1 releases the shared pool")
+            "row 2 must admit and finish after row 1 releases the shared pool"
+        )
     finally:
         e.shutdown()
 
@@ -692,8 +782,7 @@ def test_sparse_verify_tick_populates_and_reads_the_plus_one_own_page_across_a_b
             self.has_confidence = False
             self.trunk = None
 
-        def forward(self, hidden, ids, positions, kv, backend, hidden_out=None,
-                    last_only=False):
+        def forward(self, hidden, ids, positions, kv, backend, hidden_out=None, last_only=False):
             pos = np.atleast_2d(np.asarray(positions))
             logits = torch.zeros(*pos.shape, self.cfg.vocab_size, device=backend.device)
             for i in range(pos.shape[0]):
@@ -709,8 +798,9 @@ def test_sparse_verify_tick_populates_and_reads_the_plus_one_own_page_across_a_b
     cfg = tiny()
     model = build_random(cfg, seed=11)
     backend = get_backend()
-    common = dict(num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-                  max_num_batched_tokens=512)
+    common = dict(
+        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096, max_num_batched_tokens=512
+    )
     # 4 full pages + 15 tokens: after prefill the first verify's committed
     # position lands on offset 15, so its tq=2 chain writes 79 (page 4) and 80
     # (page 5) — the +1 column is page 5, beyond the page the committed token is on.
@@ -725,8 +815,16 @@ def test_sparse_verify_tick_populates_and_reads_the_plus_one_own_page_across_a_b
 
     crossed = {"n": 0}
     e = build_engine(
-        cfg=cfg, model=model, backend=backend, sparse_k=2, scorer="bounds",
-        kv_cold_bytes=1 << 30, draft=_OracleDraft(cfg, expected), spec_depth=1, **common)
+        cfg=cfg,
+        model=model,
+        backend=backend,
+        sparse_k=2,
+        scorer="bounds",
+        kv_cold_bytes=1 << 30,
+        draft=_OracleDraft(cfg, expected),
+        spec_depth=1,
+        **common,
+    )
     import tilerl.sparse_engine as se
 
     orig = se.SparseForward.__init__
@@ -770,10 +868,19 @@ def test_sparse_draft_follower_returns_miss_on_a_published_prefix():
         from tilerl_kernels.backend import get_backend
 
         return build_engine(
-            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
-            num_blocks=64, num_slots=4, max_batch=2, max_total_tokens=4096,
-            max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
-            kv_cold_bytes=1 << 30, **({"draft": draft, "spec_depth": 1} if draft else {}))
+            cfg=cfg,
+            model=build_random(cfg, seed=11),
+            backend=get_backend(),
+            num_blocks=64,
+            num_slots=4,
+            max_batch=2,
+            max_total_tokens=4096,
+            max_num_batched_tokens=512,
+            sparse_k=2,
+            scorer="bounds",
+            kv_cold_bytes=1 << 30,
+            **({"draft": draft, "spec_depth": 1} if draft else {}),
+        )
 
     def seed_published_prefix(e):
         # Minimal block-aligned entry: lookup matches on tokens; the draft path
@@ -782,11 +889,17 @@ def test_sparse_draft_follower_returns_miss_on_a_published_prefix():
         ptokens = tuple(prefix[: n_tokens - (n_tokens % BLOCK_TOKENS)])
         # Reference the live state tensor (no extra allocation to perturb the
         # measured-peak memory ledger); the draft path returns-miss before reading it.
-        entry = {"eid": cache._next_id, "tokens": ptokens, "keys": [],
-                 "bounds": {}, "state": (e._states.states[0], None)}
+        entry = {
+            "eid": cache._next_id,
+            "tokens": ptokens,
+            "keys": [],
+            "bounds": {},
+            "state": (e._states.states[0], None),
+        }
         cache._next_id += 1
-        cache._entries.setdefault(page_key(ptokens, len(ptokens) // BLOCK_TOKENS - 1),
-                                  []).append(entry)
+        cache._entries.setdefault(page_key(ptokens, len(ptokens) // BLOCK_TOKENS - 1), []).append(
+            entry
+        )
         cache._by_id[entry["eid"]] = entry
         return len(ptokens)
 
@@ -833,8 +946,9 @@ def test_sparse_draft_follower_returns_miss_on_a_published_prefix():
             plain.step()
             running = [r for r in plain._running if r.req_id == rid2]
             if running:
-                assert running[0].sparse_matched == matched_len, \
+                assert running[0].sparse_matched == matched_len, (
                     "non-spec follower should adopt the prefix"
+                )
                 break
         assert plain._prefix_hits == 1
     finally:
@@ -853,9 +967,17 @@ def test_full_k_sparse_with_draft_matches_dense_with_draft():
     model = build_random(cfg, seed=11)
     from tilerl_kernels.backend import get_backend
 
-    full = build_engine(cfg=cfg, model=model, backend=get_backend(), num_blocks=64,
-                        num_slots=4, max_batch=1, max_total_tokens=4096,
-                        draft=_draft(cfg, model), spec_depth=1)
+    full = build_engine(
+        cfg=cfg,
+        model=model,
+        backend=get_backend(),
+        num_blocks=64,
+        num_slots=4,
+        max_batch=1,
+        max_total_tokens=4096,
+        draft=_draft(cfg, model),
+        spec_depth=1,
+    )
     t_full = _drain(full, full.submit(prompt, params), 8)
     full.shutdown()
     assert t_dense == t_full, f"sparse+draft {t_dense} != dense+draft {t_full}"
@@ -934,9 +1056,17 @@ def test_select_tensor_op_count_is_constant_in_candidate_count():
         for p in range(n_cand):
             tr.set_bounds(0, p, b)
         cand = list(range(n_cand))
-        row = dict(req_id=0, own=[n_cand], own_len=BLOCK_TOKENS, cand=cand,
-                   force_window=0, resolve=lambda p: p, reserved=set(),
-                   decoding=True, tq=1)
+        row = dict(
+            req_id=0,
+            own=[n_cand],
+            own_len=BLOCK_TOKENS,
+            cand=cand,
+            force_window=0,
+            resolve=lambda p: p,
+            reserved=set(),
+            decoding=True,
+            tq=1,
+        )
         sf = SparseForward(tr, [row], torch.device("cpu"))
         q = torch.randn(1, cfg.num_attention_heads, cfg.head_dim)
         with _Count() as c:
@@ -992,7 +1122,7 @@ def test_bounds_tracker_allocates_on_the_backend_device_not_cpu_for_first_reques
     dev = torch.device("meta")
     cfg = SimpleNamespace(full_attn_layers=(0,), num_kv_heads=2, head_dim=16)
     tr = SparseTracker(cfg, k_pages=2, scorer="bounds", device=dev)
-    tr.attach(0)                       # first request, no prior bounds to infer from
+    tr.attach(0)  # first request, no prior bounds to infer from
     assert tr.bounds_t[0].device == dev, tr.bounds_t[0].device
     assert tr.bounds_valid[0].device == dev
     assert tr.l2p_t[0].device == dev
@@ -1033,10 +1163,21 @@ def _resident_forward(B, device_select, n_pages=20, k=4):
             phys[p] = pm
             tr.map_resident(bi, p, pm)
         tr.resident[bi] = phys
-        rows.append(dict(
-            req_id=bi, own=own, own_len=2 * BLOCK_TOKENS + 5, q_start=0, q_hi=0,
-            decoding=True, tq=1, cand=cand, force_window=0,
-            resolve=lambda p, rid=bi: tr.resident[rid][p], reserved=set()))
+        rows.append(
+            dict(
+                req_id=bi,
+                own=own,
+                own_len=2 * BLOCK_TOKENS + 5,
+                q_start=0,
+                q_hi=0,
+                decoding=True,
+                tq=1,
+                cand=cand,
+                force_window=0,
+                resolve=lambda p, rid=bi: tr.resident[rid][p],
+                reserved=set(),
+            )
+        )
     sf = SparseForward(tr, rows, torch.device("cpu"), device_select=device_select)
     return cfg, sf
 
@@ -1063,7 +1204,7 @@ def test_device_select_packs_a_fixed_width_table_with_no_host_sync_at_b1_and_b8(
         q = torch.randn(B, 1, cfg.num_attention_heads, cfg.head_dim)
         with _NoScalarSync():
             table, sl = sf.attention_args(0, q)
-        assert table.shape == (B, 4 + 2), table.shape   # fixed k + trailing own window
+        assert table.shape == (B, 4 + 2), table.shape  # fixed k + trailing own window
         assert sl.shape == (B,)
         # seq_len excludes the padded tail: each row selected exactly k here.
         assert torch.equal(sl, torch.full((B,), 4 * BLOCK_TOKENS + 2 * BLOCK_TOKENS + 5))
@@ -1097,11 +1238,20 @@ def test_device_select_engine_tokens_equal_eager_sparse_at_full_k():
 
     def run(devsel):
         kw = dict(
-            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
-            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
-            max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
-            sparse_k=6, scorer="bounds", kv_cold_bytes=1 << 30,
-            sparse_device_select=devsel)
+            cfg=tiny(),
+            model=build_random(tiny(), seed=11),
+            backend=RefBackend(),
+            num_blocks=64,
+            num_slots=4,
+            max_batch=1,
+            max_total_tokens=4096,
+            max_num_batched_tokens=512,
+            prefix_store=NoPrefixStore(),
+            sparse_k=6,
+            scorer="bounds",
+            kv_cold_bytes=1 << 30,
+            sparse_device_select=devsel,
+        )
         e = build_engine(**kw)
         tok = _drain(e, e.submit(prompt, params), 8)
         e.shutdown()
@@ -1145,22 +1295,31 @@ def _forward_one_cold(B, device_select, cold_pages):
         cand = list(range(n_pages - 2))
         # descending-magnitude bounds so candidate index 0 is the top score
         for pi, p in enumerate(cand):
-            b = torch.full((tr.n_full, tr.hkv, 2, tr.dim),
-                           1.0 - pi * 0.01, dtype=torch.float16)
+            b = torch.full((tr.n_full, tr.hkv, 2, tr.dim), 1.0 - pi * 0.01, dtype=torch.float16)
             tr.set_bounds(bi, p, b)
         phys = {}
         for p in cand + own:
             if p in cold_pages:
-                continue                          # cold: bounds held, l2p stays -1
+                continue  # cold: bounds held, l2p stays -1
             pm = 1000 + bi * 1000 + p
             phys[p] = pm
             tr.map_resident(bi, p, pm)
         tr.resident[bi] = phys
-        rows.append(dict(
-            req_id=bi, own=own, own_len=2 * BLOCK_TOKENS + 5, q_start=0, q_hi=0,
-            decoding=True, tq=1, cand=cand, force_window=0,
-            resolve=lambda p, rid=bi: tr.resident[rid].get(p, 7000 + p),
-            reserved=set()))
+        rows.append(
+            dict(
+                req_id=bi,
+                own=own,
+                own_len=2 * BLOCK_TOKENS + 5,
+                q_start=0,
+                q_hi=0,
+                decoding=True,
+                tq=1,
+                cand=cand,
+                force_window=0,
+                resolve=lambda p, rid=bi: tr.resident[rid].get(p, 7000 + p),
+                reserved=set(),
+            )
+        )
     return SparseForward(tr, rows, torch.device("cpu"), device_select=device_select), cfg
 
 
@@ -1192,12 +1351,240 @@ def _device_engine(refresh, max_new=10):
 
     se.SPARSE_REFRESH_TICKS = refresh
     kw = dict(
-        cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
-        num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=8192,
-        max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
-        sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30,
-        sparse_device_select=True)
+        cfg=tiny(),
+        model=build_random(tiny(), seed=11),
+        backend=RefBackend(),
+        num_blocks=64,
+        num_slots=4,
+        max_batch=1,
+        max_total_tokens=8192,
+        max_num_batched_tokens=512,
+        prefix_store=NoPrefixStore(),
+        sparse_k=2,
+        scorer="bounds",
+        kv_cold_bytes=1 << 30,
+        sparse_device_select=True,
+    )
     return build_engine(**kw)
+
+
+def test_sparse_captured_decode_tick_tokens_equal_eager_across_refresh():
+    """The sparse decode graph path (persistent, refillable SparseForward; the
+    CPU seam that stands in for a cuda CUDAGraph) must produce the same tokens
+    as a fully eager sparse engine. The comparison is at FULL k, where the
+    selection is exact and the resident-only device path is token-identical to
+    eager (at small k the device path is deliberately stale between refreshes,
+    which moves tokens — a property the fidelity table prices, not a bug). The
+    run crosses several SPARSE_REFRESH_TICKS boundaries, exercising graph ->
+    eager refresh -> graph with the re-pinned hot set."""
+    import tilerl.sparse_engine as se
+
+    R = se.SPARSE_REFRESH_TICKS
+    prompt = np.arange(7, 7 + 12 * BLOCK_TOKENS, dtype=np.int64)
+    n_new = R * 3 + 2
+    params = SamplingParams(temperature=0.0, max_new_tokens=n_new, seed=0)
+
+    def run(graph_on: bool):
+        kw = dict(
+            cfg=tiny(),
+            model=build_random(tiny(), seed=11),
+            backend=RefBackend(),
+            num_blocks=64,
+            num_slots=4,
+            max_batch=1,
+            max_total_tokens=8192,
+            max_num_batched_tokens=512,
+            prefix_store=NoPrefixStore(),
+            sparse_k=64,
+            scorer="bounds",
+            kv_cold_bytes=1 << 30,
+            sparse_device_select=True,
+        )
+        e = build_engine(**kw)
+        if not graph_on:
+            e._sparse_graph_on = False
+        rid = e.submit(prompt, params)
+        out: list = []
+        for _ in range(600):
+            e.step()
+            out = e.poll().get(rid, out)
+            if len(out) >= n_new:
+                break
+        e.shutdown()
+        return out
+
+    e = build_engine(
+        cfg=tiny(),
+        model=build_random(tiny(), seed=11),
+        backend=RefBackend(),
+        num_blocks=64,
+        num_slots=4,
+        max_batch=1,
+        max_total_tokens=8192,
+        max_num_batched_tokens=512,
+        prefix_store=NoPrefixStore(),
+        sparse_k=64,
+        scorer="bounds",
+        kv_cold_bytes=1 << 30,
+        sparse_device_select=True,
+    )
+    n_graph = {"n": 0}
+    orig = e._run_sparse_decode_graph
+
+    def counting(reqs, chains):
+        ran = orig(reqs, chains)
+        n_graph["n"] += int(ran)
+        return ran
+
+    e._run_sparse_decode_graph = counting
+    rid = e.submit(prompt, params)
+    t_graph: list = []
+    try:
+        for _ in range(600):
+            e.step()
+            t_graph = e.poll().get(rid, t_graph)
+            if len(t_graph) >= n_new:
+                break
+    finally:
+        e.shutdown()
+    assert n_graph["n"] >= R, f"graph path took only {n_graph['n']} ticks"
+    t_eager = run(False)
+    assert t_graph == t_eager, (t_graph, t_eager)
+
+
+def test_sparse_graph_fill_allocates_nothing_inside_the_captured_region():
+    """Capture seam: after fill() the replay's selection/attention_arg math must
+    allocate no new tensors and read only the persistent staging buffers (a
+    graph bakes pointers, so a fresh tensor or a tracker-dict read breaks it).
+    fill() itself is allowed to allocate (it runs outside capture)."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    import tilerl.sparse_engine as se
+
+    cfg = tiny()
+    e = _device_engine(8, max_new=6)
+    prompt = np.arange(7, 7 + 12 * BLOCK_TOKENS, dtype=np.int64)
+    rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=6, seed=0))
+    # Run one graph tick to materialize a persistent sf, then grab it.
+    for _ in range(60):
+        e.step()
+        if e._sparse_graphs:
+            break
+    g = next(iter(e._sparse_graphs.values())).sf
+    assert g.reuse and g.s_bounds is not None
+    # Refill from the live running row and record every tensor the math allocates.
+    r = next(x for x in e._running if x.req_id == rid)
+    q_dec = [1]
+    rows = e._sparse_decode_rows([r], q_dec)
+    g.fill(rows)
+    q = torch.randn(1, 1, cfg.num_attention_heads, cfg.head_dim)
+
+    class _AllocCount(TorchDispatchMode):
+        n = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            # creation ops allocate; in-place/index reads into existing buffers do not
+            if func.__name__.split(".")[-1] in {
+                "empty",
+                "zeros",
+                "zeros_like",
+                "full",
+                "full_like",
+                "ones",
+                "ones_like",
+                "clone",
+                "stack",
+                "new_empty",
+            }:
+                self.n += 1
+            return func(*args, **(kwargs or {}))
+
+    with _AllocCount() as c:
+        g._select_device(g.tracker.group_of[g.tracker.src_planes[0]] and 0, q)
+        g._attention_args_device(0, q)
+    assert c.n == 0, f"captured region allocated {c.n} tensors"
+    e.shutdown()
+    se.SPARSE_REFRESH_TICKS = 8
+
+
+def test_sparse_graph_verify_tick_w2_tokens_equal_dense():
+    """A tq=2 spec verify chain through the captured sparse graph (its own span
+    is the +1-page width) must be token-equal to a dense engine, using the
+    always-accepted oracle draft so every proposal lands and the verify graph
+    takes a tick (the W=2 bucket, keep_steps state, +1 own page)."""
+    from dataclasses import replace
+
+    from tilerl_kernels.backend import get_backend
+
+    from tilerl.spec import DraftHead
+
+    class _OracleDraft(DraftHead):
+        def __init__(self, cfg, expected):
+            self.cfg = replace(cfg, num_layers=1, full_attn_layers=(0,))
+            self.params, self.expected, self.width, self.has_confidence, self.trunk = (
+                {},
+                expected,
+                2,
+                False,
+                None,
+            )
+
+        def forward(self, hidden, ids, positions, kv, backend, hidden_out=None, last_only=False):
+            pos = np.atleast_2d(np.asarray(positions))
+            logits = torch.zeros(*pos.shape, self.cfg.vocab_size, device=backend.device)
+            for i in range(pos.shape[0]):
+                for j in range(pos.shape[1]):
+                    logits[i, j, self.expected.get(int(pos[i, j]) + 1, 0)] = 10.0
+            if hidden_out is not None:
+                hidden_out.append(torch.as_tensor(hidden))
+            return logits
+
+        def confidence(self, hidden, probs, backend):
+            return probs
+
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    be = get_backend()
+    prompt = np.arange(7, 7 + 4 * BLOCK_TOKENS + 15, dtype=np.int64)
+    dense = build_engine(
+        cfg=cfg,
+        model=model,
+        backend=be,
+        num_blocks=64,
+        num_slots=4,
+        max_batch=1,
+        max_total_tokens=4096,
+        max_num_batched_tokens=512,
+        sparse_k=0,
+    )
+    rid = dense.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
+    base = _drain(dense, rid, 8)
+    dense.shutdown()
+    expected = {i: t for i, t in enumerate(list(prompt) + base)}
+    e = build_engine(
+        cfg=cfg,
+        model=build_random(cfg, seed=11),
+        backend=be,
+        num_blocks=64,
+        num_slots=4,
+        max_batch=1,
+        max_total_tokens=4096,
+        max_num_batched_tokens=512,
+        sparse_k=2,
+        scorer="bounds",
+        kv_cold_bytes=1 << 30,
+        draft=_OracleDraft(cfg, expected),
+        spec_depth=1,
+        sparse_device_select=True,
+    )
+    n = {"g": 0}
+    orig = e._run_sparse_decode_graph
+    e._run_sparse_decode_graph = lambda r, c, n=n: n.__setitem__("g", n["g"] + 1) or orig(r, c)
+    rid = e.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=8, seed=0))
+    got = _drain(e, rid, 8)
+    e.shutdown()
+    assert n["g"] >= 1, "the W=2 verify graph never ran"
+    assert got == base, f"graph verify {got} != dense {base}"
 
 
 def test_refresh_r1_device_selection_is_token_equal_to_eager_sparse():
@@ -1218,10 +1605,19 @@ def test_refresh_r1_device_selection_is_token_equal_to_eager_sparse():
 
     def eager_tokens():
         kw = dict(
-            cfg=tiny(), model=build_random(tiny(), seed=11), backend=RefBackend(),
-            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=8192,
-            max_num_batched_tokens=512, prefix_store=NoPrefixStore(),
-            sparse_k=2, scorer="bounds", kv_cold_bytes=1 << 30)
+            cfg=tiny(),
+            model=build_random(tiny(), seed=11),
+            backend=RefBackend(),
+            num_blocks=64,
+            num_slots=4,
+            max_batch=1,
+            max_total_tokens=8192,
+            max_num_batched_tokens=512,
+            prefix_store=NoPrefixStore(),
+            sparse_k=2,
+            scorer="bounds",
+            kv_cold_bytes=1 << 30,
+        )
         e2 = build_engine(**kw)
         t = _drain(e2, e2.submit(prompt, params), 10)
         e2.shutdown()
