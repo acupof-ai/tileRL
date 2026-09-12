@@ -55,7 +55,10 @@ def group_map(cfg) -> tuple[list[int], dict[int, int]]:
     layers reuse the source layer's selection. Tiny (<4 full-attn): each layer
     is its own source/group."""
     n = len(cfg.full_attn_layers)
-    groups = index_source_groups(n)[1] if n >= 4 else [[j] for j in range(n)]
+    if n >= 4:
+        _, groups = index_source_groups(n)
+    else:
+        groups = [[j] for j in range(n)]
     src, of = [], {}
     for g, idxs in enumerate(groups):
         src.append(idxs[0])

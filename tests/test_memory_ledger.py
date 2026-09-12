@@ -417,11 +417,52 @@ if __name__ == "__main__":
 
 
 # ---------------- sparse KV unit A: plan rows == real tensor storage --------
+@pytest.mark.parametrize("n_full,groups", [
+    (1, 1), (2, 2), (3, 3),          # <4 planes: each plane its own group (tiny)
+    (4, 4), (8, 4), (12, 4),         # >=4: exactly INDEX_SOURCE_LAYERS groups —
+    (16, 4), (20, 4), (64, 4),       # n_full//4 would wrongly give 2/3/5/16 here
+])
+def test_sparse_source_count_matches_group_map_at_every_plane_count(n_full, groups):
+    """The ledger's group count must equal the selection's real group count from
+    group_map at EVERY plane count, not just the tiny(1) and 27B(16) cells. The
+    old n_full//4 formula coincided only at 1 and 16; at 8 planes it returned 2
+    while group_map splits into 4, under-pricing the pool 2x. Non-dividing
+    counts (5, 7, ...) raise, as they do in group_map."""
+    from dataclasses import replace
+
+    from tilerl.config import tiny
+    from tilerl.memory import sparse_source_count
+    from tilerl.sparse_engine import group_map
+    from tilerl.sparse_index import sparse_group_count
+
+    cfg = replace(tiny(), num_layers=n_full, full_attn_layers=tuple(range(n_full)))
+    assert sparse_group_count(n_full) == groups
+    assert sparse_source_count(cfg) == groups
+    assert len(group_map(cfg)[0]) == groups  # the allocator's count
+
+
+@pytest.mark.parametrize("n_full", [5, 7, 15, 17])
+def test_sparse_source_count_rejects_non_dividing_plane_counts(n_full):
+    from dataclasses import replace
+
+    from tilerl.config import tiny
+    from tilerl.memory import sparse_source_count
+    from tilerl.sparse_index import sparse_group_count
+
+    with pytest.raises(ValueError):
+        sparse_group_count(n_full)
+    cfg = replace(tiny(), num_layers=n_full, full_attn_layers=tuple(range(n_full)))
+    with pytest.raises(ValueError):
+        sparse_source_count(cfg)
+
+
 def test_sparse_rows_match_real_tensor_storage_on_27b():
     """The sparse ledger's derived bytes equal the storage of the tensors the engine
     will actually allocate, on the 27B V4.1 geometry (docs/design-sparse-kv.md):
-    index_keys = pages x 4 sources x 4 heads x 132 B; kv_hot = rows x 136 pages x one
-    full KV block; kv_cold = rows x remaining pages x one block. All fp8 KV."""
+    index_keys = pages x 4 sources x 4 heads x 132 B; kv_hot = the 554-block
+    allocated device pool (1 slot x (4 groups x 128 + 8 window + 33 chunk) + 1
+    spare) x one full KV block; kv_cold = rows x remaining selected-window pages
+    x one block. All fp8 KV."""
     import torch
 
     from tilerl.config import qwen38_27b
@@ -453,15 +494,19 @@ def test_sparse_rows_match_real_tensor_storage_on_27b():
     assert key_storage == 34_603_008  # 33.0 MiB reconciled
 
     got = {r.owner: r for r in sparse_rows(
-        cfg, num_rows=rows_b, context_tokens=ctx, k_pages=k_pages,
+        cfg, num_rows=rows_b, num_slots=1, context_tokens=ctx, k_pages=k_pages,
+        max_num_batched_tokens=512,
         scorer=scorer, kv_io=torch.bfloat16, kv_fp8=torch.float8_e4m3fn)}
     assert set(got) == {"index_keys", "kv_hot", "kv_cold"}
-    # hot = (128 + 8 window) pages x one full block
-    assert got["kv_hot"].n == 136 * block == 72_417_280          # 69.06 MiB
-    # cold = the remaining written pages; hot + cold per row == the dense block total
-    cold_pages = pages - 136
+    # kv_hot prices the ALLOCATED device pool, exactly build_engine's expression:
+    # slots*(n_groups*k + 8-window + chunk_pages) + 1 spare. 27B n_groups=4,
+    # chunk=512/16+1=33 -> 1*(4*128 + 8 + 33) + 1 = 554 blocks. The old ledger
+    # priced only k+8 = 136 (no n_groups, no chunk), ~4x under the real pool.
+    assert sparse_source_count(cfg) == 4
+    assert got["kv_hot"].n == 554 * block
+    # cold is per concurrent row, every written page outside selected+window
+    cold_pages = pages - (4 * 128 + 8)
     assert got["kv_cold"].n == rows_b * cold_pages * block
-    assert (got["kv_hot"].n + got["kv_cold"].n) == rows_b * pages * block
 
 
 def test_sparse_bounds_scorer_uses_quest_bounds_bytes():
@@ -474,8 +519,9 @@ def test_sparse_bounds_scorer_uses_quest_bounds_bytes():
     pages = sparse_pages(262_144)
     assert page_bounds_bytes(cfg, pages) == pages * 2 * 16 * 4 * 256 * 2
     got = {r.owner: r for r in sparse_rows(
-        cfg, num_rows=1, context_tokens=262_144, k_pages=128, scorer="bounds",
-        kv_io=__import__("torch").bfloat16)}
+        cfg, num_rows=1, num_slots=1, context_tokens=262_144, k_pages=128,
+        max_num_batched_tokens=512,
+        scorer="bounds", kv_io=__import__("torch").bfloat16)}
     assert got["page_bounds"].n == page_bounds_bytes(cfg, pages)
     assert "index_keys" not in got
 
@@ -522,8 +568,9 @@ def test_sparse_kv_cold_excluded_from_device_peak_but_in_host_total():
 
     cfg = qwen38_27b()
     rows = sparse_rows(
-        cfg, num_rows=1, context_tokens=262_144, k_pages=128, scorer="index",
-        kv_io=torch.bfloat16, kv_fp8=torch.float8_e4m3fn)
+        cfg, num_rows=1, num_slots=1, context_tokens=262_144, k_pages=128,
+        max_num_batched_tokens=512,
+        scorer="index", kv_io=torch.bfloat16, kv_fp8=torch.float8_e4m3fn)
     device_static = sum(r.n for r in rows if r.tier == "device")
     cold = sum(r.n for r in rows if r.owner == "kv_cold")
     assert cold > 0

@@ -65,6 +65,22 @@ def index_source_groups(n_full_layers: int,
     return source_layers, groups
 
 
+def sparse_group_count(n_full_layers: int) -> int:
+    """Number of independent source groups (each reuses one selection across its
+    full-attn planes). Fewer than 4 full-attn planes: each plane is its own group.
+    4 or more: the planes split into ``INDEX_SOURCE_LAYERS`` groups (the count must
+    divide). Canonical — group_map, the pool sizing and the memory ledger all count
+    groups through this, so n_full//4 (which only coincides at 1 and 16 planes) can
+    never disagree with the selection's real group count."""
+    if n_full_layers < INDEX_SOURCE_LAYERS:
+        return n_full_layers
+    if n_full_layers % INDEX_SOURCE_LAYERS:
+        raise ValueError(
+            f"{n_full_layers} full-attn layers must divide into "
+            f"{INDEX_SOURCE_LAYERS} sources")
+    return INDEX_SOURCE_LAYERS
+
+
 def project_page_keys(k_pages: Tensor, ik_weight: Tensor) -> Tensor:
     """Project indexer-K per page from the page's K (V4.1 ik_weight).
 
