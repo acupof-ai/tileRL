@@ -232,8 +232,10 @@ lowest-marginal picks, symmetric across groups, and tokens equal an oracle
 that clips each group's list the same way; (3) plan `kv_hot` == allocated pool
 bytes at a fixed `union_cap` (the CEILING), separately from the live row which
 equals measured tick residency (the HELD set) — never assert those two equal;
-(4) full-k (`k >= pages`) still equals dense. Implementation
-lands only after the 8k row fixes the k this serves.
+(4) full-k (`k >= pages`) still equals dense. **Parked 2026-09-12:** the 8k/32k
+fidelity rows kept the default at k=128, where k=128 is no worse than k=256 on
+generated tokens, so the worst-case `n_groups*k` pool already fits and no
+default needs `union_cap`. Revive when a measured k above ~128 is chosen.
 
 ## Cost model rows
 
@@ -278,8 +280,15 @@ two dense seeds. A miss on recall is a science result (the single-card token
 budget was not enough), recorded in `errors/` with the token count.
 
 > 2026-09-12: the 27B measurements below supersede this mass gate — the SLO is
-> now output fidelity vs dense. The default k is undecided; k=128 remains the
-> shipped value until the fidelity table lands. See
+> now output fidelity vs dense. **The default k is decided: 128.** On the V100
+> production path after the #546 page_base fix, k=all is token-identical, and
+> k=128 gives prefill KL 0.0023 / top-1 0.981 at 8k, 0.019 / 0.949 at 32k,
+> with continuation naturalness level with k=256 (+0.013 vs +0.018 token, top-5
+> agreement 1.0) — generated tokens do not improve from 128 to 256, so the
+> cross-group union hot pool [below](#the-resident-pool-is-a-cross-group-union-sized-union_cap)
+> stays **parked**: no default k needs it, and the worst-case `n_groups*k` pool
+> at k=128 fits. Sparse Quest selection + spec decode are the serving default
+> (#530); `--sparse-k 0` opts back to dense. See
 > [Measured on the 27B](#measured-on-the-27b).
 
 ## Kernels
