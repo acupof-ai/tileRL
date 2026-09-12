@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dense-vs-sparse fidelity through the PRODUCTION engine path (2026-09-12).
 
-The first harness (fidelity_checks.py) subclassed SparseForward and replayed a
+An earlier harness subclassed SparseForward and replayed a
 hand-built packed table; against the post-#525/#528 live engine its full-k arm
 diverged on the V100 (KL 1.02) while the dense layout controls passed — the
 replay, not the model. This rebuild runs the real thing:
@@ -43,7 +43,7 @@ def head_at(model, backend, cfg, hidden, rows):
 
 
 def sample_positions(t: int, j: int, nq: int = 256, minp: int = 2048):
-    """Same deterministic seeded positions as output_fidelity.sample_positions."""
+    """Same deterministic seeded positions (seed+100003, minp 2048)."""
     pos = set()
     g = torch.Generator().manual_seed(j + 100003)
     while len(pos) < nq:
