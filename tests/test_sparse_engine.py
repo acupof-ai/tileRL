@@ -955,6 +955,108 @@ def test_sparse_draft_follower_returns_miss_on_a_published_prefix():
         plain.shutdown()
 
 
+def test_sparse_spec_b2_concurrent_rows_do_not_cross_contaminate():
+    """B>1 gap behind the H20 MMLU failure (sparse k=128 + spec B=8 scored 0.20
+    while accepting ~0.83 of drafts): under GREEDY a draft head only accelerates,
+    it never changes a committed token. So two DISTINCT prompts running in one
+    sparse+spec B=2 tick must each produce exactly their isolated B=1 tokens.
+    Any cross-row read (the packed table or a chain K/V write landing in the
+    other row's blocks) moves one row off its isolated answer. The CPU oracle
+    covers engine/draft-pool/packed geometry row isolation; the sm90 decode
+    kernel's per-row mask is the residual a card run checks."""
+    from tilerl_kernels.backend import get_backend
+
+    cfg = tiny()
+    model = build_random(cfg, seed=11)
+    n_new = 8
+    # Two deliberately different prompts (different offset + length parity).
+    pa = np.arange(7, 7 + 6 * BLOCK_TOKENS + 3, dtype=np.int64)
+    pb = (np.arange(5 * BLOCK_TOKENS + 11, dtype=np.int64) % 300) + 101
+    params = SamplingParams(temperature=0.0, max_new_tokens=n_new, seed=0)
+
+    def isolated(prompt):
+        be = get_backend()
+        e = build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=be,
+            num_blocks=64, num_slots=4, max_batch=1, max_total_tokens=4096,
+            max_num_batched_tokens=512, sparse_k=0)
+        out = _drain(e, e.submit(prompt, params), n_new)
+        e.shutdown()
+        return out
+
+    want_a, want_b = isolated(pa), isolated(pb)
+
+    be = get_backend()
+    e = build_engine(
+        cfg=cfg, model=build_random(cfg, seed=11), backend=be,
+        num_blocks=64, num_slots=4, max_batch=2, max_total_tokens=4096,
+        max_num_batched_tokens=512, sparse_k=2, scorer="bounds",
+        kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+    ra = e.submit(pa, params)
+    rb = e.submit(pb, params)
+    ga = gb = None
+    for _ in range(512):
+        d = e.poll()
+        ga, gb = d.get(ra, ga), d.get(rb, gb)
+        if ga is not None and len(ga) >= n_new and gb is not None and len(gb) >= n_new:
+            break
+        e.step()
+    e.shutdown()
+    assert ga[:n_new] == want_a, ("row A cross-contaminated", ga[:n_new], want_a)
+    assert gb[:n_new] == want_b, ("row B cross-contaminated", gb[:n_new], want_b)
+
+
+def test_sparse_spec_b8_rows_equal_their_isolated_runs_at_full_coverage():
+    """The MMLU shape (H20 sparse k=128 + spec B=8 scored 0.20): at full page
+    coverage (k >= every context page, the regime where 65's spec-OFF run still
+    failed on sm90) sparse MUST be token-equal to dense. Eight distinct prompts
+    in one sparse+spec B=8 tick each equal their isolated dense B=1 answer. This
+    pins the engine/draft-pool/packed-geometry layer row-isolation on CPU; the
+    sm90 decode kernel's per-row packed-table read is the card residual."""
+    cfg = tiny()
+    n_new = 6
+    prompts = []
+    for b in range(8):
+        p = (np.arange((10 + 2 * b) * BLOCK_TOKENS + (b % 3), dtype=np.int64) % 300) + b
+        prompts.append(p)
+    params = SamplingParams(temperature=0.0, max_new_tokens=n_new, seed=0)
+    k = 64
+
+    def isolated(prompt):
+        from tilerl_kernels.backend import get_backend
+
+        e = build_engine(
+            cfg=cfg, model=build_random(cfg, seed=11), backend=get_backend(),
+            num_blocks=200, num_slots=2, max_batch=1, max_total_tokens=8192,
+            max_num_batched_tokens=512, sparse_k=0)
+        out = _drain(e, e.submit(prompt, params), n_new)
+        e.shutdown()
+        return out
+
+    want = [isolated(p) for p in prompts]
+
+    from tilerl_kernels.backend import get_backend
+
+    model = build_random(cfg, seed=11)
+    e = build_engine(
+        cfg=cfg, model=model, backend=get_backend(),
+        num_blocks=200, num_slots=8, max_batch=8, max_total_tokens=8192,
+        max_num_batched_tokens=512, sparse_k=k, scorer="bounds",
+        kv_cold_bytes=1 << 30, draft=_draft(cfg, model), spec_depth=1)
+    rids = [e.submit(p, params) for p in prompts]
+    outs = [None] * 8
+    for _ in range(700):
+        d = e.poll()
+        for i, r in enumerate(rids):
+            outs[i] = d.get(r, outs[i])
+        if all(o is not None and len(o) >= n_new for o in outs):
+            break
+        e.step()
+    e.shutdown()
+    for i in range(8):
+        assert outs[i][:n_new] == want[i], (i, outs[i][:n_new], want[i])
+
+
 def test_full_k_sparse_with_draft_matches_dense_with_draft():
     """k>=pages selects everything: sparse + draft equals dense + draft."""
     prompt = np.arange(7, 7 + 5 * BLOCK_TOKENS + 3, dtype=np.int64)
