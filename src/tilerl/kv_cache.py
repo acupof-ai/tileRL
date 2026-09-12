@@ -841,21 +841,40 @@ class HostKvPages:
     def share_hold_kv(self, private_key, shared_key: int,
                       extra: dict | None = None) -> int:
         """Transfer one private blob to a shared content key (no clone): pop it
-        from the private namespace, fold in ``extra`` (the small host bounds
-        clone), and share_hold the SAME dict. Returns the counted bytes."""
+        from the private namespace (RAM or private spill file), fold in ``extra``
+        (the small host bounds), and hand it to the shared namespace. The blob
+        starts spilled (written straight to the prefix file) when it was already
+        past the host budget - no copy is pulled into RAM. Returns bytes held."""
         n = self._held.pop(private_key, None)
         blob = self._blobs.pop(private_key, None)
         self._ram_order.pop(("p", private_key), None)
         if n is not None:
             self._used -= n
         if blob is None:
-            return 0
+            # already past the host budget: lift the blob off the private spill
+            # file once (disk, not RSS), fold in bounds, and place it straight in
+            # the shared spill namespace - nothing added to host RAM.
+            if self._ssd is None or private_key not in self._ssd:
+                return 0
+            n = self._ssd_page_bytes.pop(private_key, self._ssd.stride)
+            blob = self._ssd.read(private_key, False)
+            self._ssd.forget(private_key)
+            self._ssd_bytes -= n
+            if extra:
+                blob.update(extra)
+                n += sum(t.numel() * t.element_size()
+                         for t in extra.values() if torch.is_tensor(t))
+            self._shared[shared_key] = [n, 1, None]
+            self._ram_order.pop(("s", shared_key), None)  # starts spilled
+            self._write_shared_ssd(shared_key, blob, n)
+            return n
         if extra:
             blob.update(extra)
             n += sum(t.numel() * t.element_size()
                      for t in extra.values() if torch.is_tensor(t))
         self.share_hold(shared_key, blob, n)
         return n
+
 
     def _shared_evict_ram(self, key: int) -> None:
         """Spill one RAM-resident shared page to the prefix file, keep its record."""
