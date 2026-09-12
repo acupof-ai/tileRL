@@ -915,7 +915,9 @@ class Engine:
                 matched = len(entry["tokens"])
                 req.seq_len = req.prefill_from = matched
                 self._sparse.shared[req.req_id] = dict(enumerate(entry["keys"]))
-                self._sparse.bounds[req.req_id] = dict(entry["bounds"])
+                if self._sparse.scorer == "bounds":
+                    for p, b in entry["bounds"].items():
+                        self._sparse.set_bounds(req.req_id, p, b)
                 snap_states, snap_windows = entry["state"]
                 self._states.states[slot].copy_(snap_states)
                 if snap_windows is not None:
@@ -1367,8 +1369,10 @@ class Engine:
                 force_window = _WP                    # force the 8 pre-chunk pages
             own = list(range(own_first, own_last + 1))
             own_len = q_hi - own_first * BLOCK_TOKENS
-            scored = tr.bounds if tr.scorer == "bounds" else tr.keys
-            cand = [p for p in range(0, own_first) if p in scored[r.req_id]]
+            if tr.scorer == "bounds":
+                cand = [p for p in range(0, own_first) if tr.has_bounds(r.req_id, p)]
+            else:
+                cand = [p for p in range(0, own_first) if p in tr.keys[r.req_id]]
 
             def resolve(p, r=r, reserved=reserved):
                 return self._sparse_resolve(r, p, reserved)

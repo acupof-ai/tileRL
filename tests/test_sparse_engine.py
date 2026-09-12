@@ -98,6 +98,8 @@ def test_sparse_pins_selected_pages_across_ticks_and_demotes_what_leaves():
         assert 0 <= promoted <= len(cold_before), (promoted, len(cold_before))
         # demote + the kept resident set partition last tick's residents.
         assert demoted >= 0, demoted
+        # bounds for complete pages survive demotion in the contiguous store
+        assert int(sparse._sparse.bounds_valid[rid].sum()) >= 5
         checked += 1
     else:
         raise TimeoutError
@@ -272,7 +274,7 @@ def test_index_scorer_writes_fp8_keys_and_reconciles_measured_bytes():
             break
         e.step()
         tr = e._sparse
-        assert tr.bounds is None and tr.keys is not None
+        assert tr.scorer == "index" and tr.keys is not None
         if any(tr.keys.get(r.req_id, {}) for r in e._running):
             page, (keys, scales) = next(
                 (p, kv) for rid2, pages in tr.keys.items() if pages
@@ -527,3 +529,62 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_select_tensor_op_count_is_constant_in_candidate_count():
+    """The 128k host-bound fix: _select gathers candidate bounds with one
+    index_select, so the number of aten ops it dispatches does not grow with
+    the candidate count (a torch.stack-per-page would dispatch per page)."""
+    import torch
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from tilerl.sparse_engine import SparseForward, SparseTracker
+
+    class _Count(TorchDispatchMode):
+        n = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            self.n += 1
+            return func(*args, **(kwargs or {}))
+
+    cfg = tiny()
+
+    def select_ops(n_cand: int) -> int:
+        tr = SparseTracker(cfg, k_pages=4, scorer="bounds")
+        tr.attach(0)
+        b = torch.randn(tr.n_full, tr.hkv, 2, tr.dim, dtype=torch.float16)
+        for p in range(n_cand):
+            tr.set_bounds(0, p, b)
+        cand = list(range(n_cand))
+        row = dict(req_id=0, own=[n_cand], own_len=BLOCK_TOKENS, cand=cand,
+                   force_window=0, resolve=lambda p: p, reserved=set())
+        sf = SparseForward(tr, [row], torch.device("cpu"))
+        q = torch.randn(1, cfg.num_attention_heads, cfg.head_dim)
+        with _Count() as c:
+            sf._select(0, 0, q)
+        return c.n
+
+    ops_8 = select_ops(8)
+    ops_64 = select_ops(64)
+    assert ops_64 == ops_8, f"ops grow with candidates: {ops_8} @8 -> {ops_64} @64"
+
+
+def test_bounds_tensor_holds_every_full_attn_plane_not_every_source_group():
+    """The 27B has 16 full-attn planes grouped into 4 index sources. Bounds are
+    stored and read per plane; sizing the plane dim at n_src (4) made the first
+    finalize write crash and plane 15 unindexable. tiny has 1 plane, which hid
+    it until the 27B ran."""
+    from dataclasses import replace
+
+    from tilerl.sparse_engine import SparseTracker
+
+    cfg = replace(tiny(), num_layers=16, full_attn_layers=tuple(range(16)))
+    tr = SparseTracker(cfg, k_pages=4, scorer="bounds")
+    assert tr.n_full == 16
+    assert len(tr.src_planes) == 4
+    tr.attach(0)
+    b = torch.randn(16, tr.hkv, 2, tr.dim, dtype=torch.float16)
+    tr.set_bounds(0, 0, b)  # raised: size (4) vs (16) before the fix
+    row = tr.bounds_rows(0, [0])  # raised: index 15 out of bounds before the fix
+    assert row.shape == (1, 16, tr.hkv, 2, tr.dim)
+    assert torch.equal(row[0, 15], b[15])
