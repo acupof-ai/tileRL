@@ -394,6 +394,11 @@ class Backend:
         # elementwise op feeding a linear can write f16 and skip the dispatch's
         # cast; everything else keeps io.
         self.gemv_io = torch.float16 if self.arch == "sm70" else self.io
+        # When True, attn_prep returns None so a fused-qkv model falls back to the
+        # unfused rmsnorm/rope + write_tokens path. Guard for a fused-attn_prep
+        # sm90 defect under sparse B>1 packed prefill (sparse sets it in
+        # build_engine); the unfused path is bit-exact dense-vs-sparse there.
+        self.no_fused_attn_prep = False
         self._kernels: dict[str, object] = {}
         self._inv_freq_cache: dict[tuple[int, float], torch.Tensor] = {}
         self._const_f32_cache: dict[tuple[int, int | None], tuple[Any, int, torch.Tensor]] = {}
@@ -1226,6 +1231,9 @@ class Backend:
         """Fused q/k norm + RoPE + K/V pool write; returns q [B,S,hq,D] bf16,
         or None when the arch has no fused kernel."""
         if "attn_prep" not in _resolve(self.precision, self.arch):
+            return None
+        if getattr(self, "no_fused_attn_prep", False):
+            # Sparse guard: model.py slices the fused qkv and uses write_tokens.
             return None
         pool = kv.kv_pool
         if pool.kv_fp8 is not None and not self.has_kernel("attn_prep_fp8"):
