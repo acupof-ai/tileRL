@@ -551,7 +551,9 @@ def test_write_tokens_owns_page_base_relative_table(backend):
     sql_n, base, b = 512, 32, 1
     own_pages = sql_n // page  # 32
     nb = own_pages + 4
-    pool = PagedKvPool(nb, hkv, d, num_layers=1, device=backend.device)
+    pool_dtype = torch.float32 if backend.arch == "sm70" else torch.bfloat16
+    pool = PagedKvPool(nb, hkv, d, num_layers=1, device=backend.device,
+                       dtype=pool_dtype)
     phys = [pool.alloc_block() for _ in range(own_pages)]
     # own-only table: relative columns 0..31 -> phys frames
     block_table = torch.zeros(b, nb, dtype=torch.int32, device=backend.device)
