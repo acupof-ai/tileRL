@@ -54,6 +54,24 @@ def thinking_prompts(raw_prompts: list[str]) -> list[str]:
     return out
 
 
+def chat_control_prompts(n: int) -> list[str]:
+    """Plain ChatML prompts, think block NOT forced open — the 93%-acceptance
+    chat regime. Same renderer, only the template differs."""
+    from tilerl.prompt import render_chat
+
+    msgs = [
+        "Explain why the sky is blue in two sentences.",
+        "Write a short greeting for a new team member.",
+        "Summarize what a hash table is in one sentence.",
+        "Name three primary colors.",
+        "What is 17 times 5?",
+        "Give one benefit of regular exercise.",
+        "Define the word entropy briefly.",
+        "Suggest a healthy breakfast in a few words.",
+    ]
+    return [render_chat([("user", msgs[i % len(msgs)])], False) for i in range(n)]
+
+
 def _drain(engine, tok, prompts, sp, deadline_s, on_done=None):
     """Submit at most CONCURRENCY; stop starting questions past the deadline.
     Returns completions in prompt order. on_done(idx, text, n_done, elapsed_s)
@@ -82,7 +100,7 @@ def _drain(engine, tok, prompts, sp, deadline_s, on_done=None):
 
 def run_arm(source: str, prompts: list[str], k: int, draft_path: str | None,
             tok, backend, max_ctx: int, deadline_s: float | None,
-            on_done=None) -> dict:
+            on_done=None, force_think: bool = True) -> dict:
     from tilerl.cli import _build_model
     from tilerl.engine import build_engine
 
@@ -100,8 +118,8 @@ def run_arm(source: str, prompts: list[str], k: int, draft_path: str | None,
         draft=draft, spec_depth=1)
     sp = SamplingParams(
         temperature=0.0, seed=0, max_new_tokens=MAX_NEW,
-        max_think_tokens=MAX_THINK,
-        end_think_ids=tuple(tok.encode("</think>\n\n")),
+        **({"max_think_tokens": MAX_THINK,
+            "end_think_ids": tuple(tok.encode("</think>\n\n"))} if force_think else {}),
         stop_token_ids=tuple(getattr(tok, "stop_token_ids", ())))
     try:
         texts, elapsed = _drain(engine, tok, prompts, sp, deadline_s, on_done)
@@ -186,6 +204,8 @@ def main():
                     help="one arm per process for a two-card run; pair afterward")
     ap.add_argument("--first-n", type=int, default=0,
                     help="use only the first N of the --n seeded slice (subset of a larger run)")
+    ap.add_argument("--chat-control", type=int, default=0,
+                    help="N plain-chat prompts (no forced think), spec on: acceptance control")
     ap.add_argument("--pair", nargs=2, metavar=("DENSE_JSON", "SPARSE_JSON"),
                     help="merge two single-arm JSONs into one paired result")
     ap.add_argument("--selftest", action="store_true")
@@ -201,6 +221,29 @@ def main():
     from tilerl_kernels.backend import get_backend
 
     from tilerl.tokenizer import get_tokenizer
+
+    tok = get_tokenizer(args.source)
+    backend = get_backend()
+    draft_path = (None if not args.draft else
+                  args.draft if os.path.isabs(args.draft)
+                  else os.path.join(args.source, args.draft))
+
+    if args.chat_control:
+        # Same engine build (dense, draft, spec_depth=1, B=8, greedy), plain
+        # chat template, no forced think. Acceptance here vs the MMLU thinking
+        # arm isolates content/template from an engine defect.
+        prompts = chat_control_prompts(args.chat_control)
+        a = run_arm(args.source, prompts, 0, draft_path, tok, backend,
+                    args.max_ctx, args.deadline_min * 60, force_think=False)
+        acc = a["spec_accepted"] / max(1, a["spec_drafted"])
+        print(f"CHAT_CONTROL n={a['n_done']} spec_accept={acc:.3f} "
+              f"({a['spec_accepted']}/{a['spec_drafted']}) "
+              f"tok/s={a['tok_s']:.1f} mean_tok={a['mean_output_tokens']:.0f}",
+              flush=True)
+        with open(args.out, "w") as fh:
+            json.dump({"chat_control": args.chat_control,
+                       "spec_accept": round(acc, 5), **a}, fh)
+        return
 
     raw, golds, subjects = mmlu_questions(args.n, args.seed)
     # --first-n takes the leading questions of the SAME seeded --n slice, so a
