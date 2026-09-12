@@ -616,6 +616,10 @@ def test_ssd_spill_with_prefix_sharing_keeps_host_bytes_under_budget(tmp_path):
         bound = torch.zeros(2, dtype=torch.float16)
         key = 1_000_000 + i
         cold.share_hold_kv(i, key, extra={"bounds": bound})
+        # the running shared-RAM counter must equal the real RAM-resident sum
+        # through every hold/spill/read-through transition
+        assert cold._shared_ram_bytes() == sum(
+            rec[0] for rec in cold._shared.values() if rec[2] is not None)
         assert host_bytes() <= budget + per, (i, host_bytes(), budget)
 
     st = cold.stats()

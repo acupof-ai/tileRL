@@ -653,6 +653,10 @@ class HostKvPages:
         #: uncapped clone was the 256k host OOM: a second full KV copy). None blob
         #: = spilled; share_take reads it back.
         self._shared: OrderedDict[int, list] = OrderedDict()
+        #: running sum of RAM-resident shared bytes; updated at each RAM/spill
+        #: transition so the budget loop never sums all shared records per eviction
+        #: (the 256k profile: the O(n) sum was ~9% of post-budget prefill).
+        self._shared_ram = 0
         self._shared_ssd: ColdSsdFile | None = None
         self._shared_ssd_bytes = 0
         #: one RAM LRU across private and shared pages: ("p",key)/("s",key) -> n.
@@ -665,7 +669,7 @@ class HostKvPages:
         return self._used + self._shared_ram_bytes()
 
     def _shared_ram_bytes(self) -> int:
-        return sum(rec[0] for rec in self._shared.values() if rec[2] is not None)
+        return self._shared_ram
 
     @property
     def ssd_bytes(self) -> int:
@@ -837,6 +841,7 @@ class HostKvPages:
             rec[1] += 1
             return
         self._shared[key] = [nbytes, 1, blob]
+        self._shared_ram += nbytes
         self._ram_order[("s", key)] = nbytes
         self._enforce_budget()
 
@@ -895,6 +900,7 @@ class HostKvPages:
         n, refs, blob = self._shared[key]
         self._write_shared_ssd(key, blob, n)
         self._shared[key] = [n, refs, None]
+        self._shared_ram -= n
         self._ram_order.pop(("s", key), None)
 
     def _shared_ssd_path(self) -> str:
@@ -919,6 +925,7 @@ class HostKvPages:
         if blob is None and self._shared_ssd is not None and ("s", key) in self._shared_ssd:
             blob = self._shared_ssd.read(("s", key), torch.cuda.is_available())
             rec[2] = blob
+            self._shared_ram += rec[0]
             self._shared_ssd.forget(("s", key))
             self._shared_ssd_bytes -= rec[0]
             self._ram_order[("s", key)] = rec[0]
@@ -950,7 +957,9 @@ class HostKvPages:
             return
         n, _refs, blob = self._shared.pop(key)
         self._ram_order.pop(("s", key), None)
-        if blob is None and self._shared_ssd is not None and ("s", key) in self._shared_ssd:
+        if blob is not None:
+            self._shared_ram -= n
+        elif self._shared_ssd is not None and ("s", key) in self._shared_ssd:
             self._shared_ssd.forget(("s", key))
             self._shared_ssd_bytes -= n
 
