@@ -18,7 +18,8 @@ def make_write_tokens(target: str):
     sm90 pool; sm70's f32 pool has its own twin below."""
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
-    def write_tokens(K, V, KPool, VPool, BlockTable, SeqLens, SeqQLens, block_size, threads):
+    def write_tokens(K, V, KPool, VPool, BlockTable, SeqLens, SeqQLens, PageBase,
+                     block_size, threads):
         B, S, H, D = T.const("B, S, H, D")
         NB = T.const("NB")
         Mb = T.const("Mb")
@@ -29,12 +30,16 @@ def make_write_tokens(target: str):
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
         SeqQLens: T.Tensor((B,), "int32")
+        # Logical page of each row's table column 0 (dense 0; sparse own-only
+        # table starts at page_base). Index the table by the RELATIVE column: an
+        # absolute index reads padding past the own table.
+        PageBase: T.Tensor((B,), "int32")
         with T.Kernel(B * S, H, threads=threads) as (bt, h):
             b = bt // S
             t = bt % S
             if t < SeqQLens[b]:
                 pos = SeqLens[b] - SeqQLens[b] + t
-                blk = BlockTable[b, pos // block_size]
+                blk = BlockTable[b, pos // block_size - PageBase[b]]
                 off = pos % block_size
                 for d in T.Parallel(D):
                     KPool[blk, h, off, d] = K[b, t, h, d]
@@ -54,7 +59,8 @@ def make_write_tokens_f32(target: str):
     """
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
-    def write_tokens_f32(K, V, KPool, VPool, BlockTable, SeqLens, SeqQLens, block_size, threads):
+    def write_tokens_f32(K, V, KPool, VPool, BlockTable, SeqLens, SeqQLens, PageBase,
+                         block_size, threads):
         B, S, H, D = T.const("B, S, H, D")
         NB = T.const("NB")
         Mb = T.const("Mb")
@@ -65,12 +71,13 @@ def make_write_tokens_f32(target: str):
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
         SeqQLens: T.Tensor((B,), "int32")
+        PageBase: T.Tensor((B,), "int32")  # see write_tokens
         with T.Kernel(B * S, H, threads=threads) as (bt, h):
             b = bt // S
             t = bt % S
             if t < SeqQLens[b]:
                 pos = SeqLens[b] - SeqQLens[b] + t
-                blk = BlockTable[b, pos // block_size]
+                blk = BlockTable[b, pos // block_size - PageBase[b]]
                 off = pos % block_size
                 for d in T.Parallel(D):
                     KPool[blk, h, off, d] = K[b, t, h, d]
@@ -92,7 +99,7 @@ def make_write_tokens_fp8(target: str):
 
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def write_tokens_fp8(K, V, KPool, VPool, KScale, VScale, BlockTable, SeqLens, SeqQLens,
-                         block_size, threads):
+                         PageBase, block_size, threads):
         B, S, H, D = T.const("B, S, H, D")
         NB = T.const("NB")
         Mb = T.const("Mb")
@@ -105,12 +112,13 @@ def make_write_tokens_fp8(target: str):
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
         SeqQLens: T.Tensor((B,), "int32")
+        PageBase: T.Tensor((B,), "int32")  # see write_tokens
         with T.Kernel(B * S, H, threads=threads) as (bt, h):
             b = bt // S
             t = bt % S
             if t < SeqQLens[b]:
                 pos = SeqLens[b] - SeqQLens[b] + t
-                blk = BlockTable[b, pos // block_size]
+                blk = BlockTable[b, pos // block_size - PageBase[b]]
                 off = pos % block_size
                 tid = T.get_thread_binding(0)
                 # strided partials then one shared reduce, not T.serial(D) per thread: the
@@ -166,7 +174,7 @@ def make_attn_prep(target: str):
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def attn_prep(
         QKV, Wq, Wk, Positions, InvFreq, KPool, VPool, BlockTable, SeqLens, SeqQLens,
-        eps: T.float32, hq, hkv, block_size, threads,
+        PageBase, eps: T.float32, hq, hkv, block_size, threads,
     ):
         B, S, NQKV = T.const("B, S, NQKV")
         D = T.const("D")
@@ -183,6 +191,7 @@ def make_attn_prep(target: str):
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
         SeqQLens: T.Tensor((B,), "int32")
+        PageBase: T.Tensor((B,), "int32")  # see write_tokens
         Qn = T.empty((B, S, hq, D), "bfloat16")
         q_rows = hq * 2 * D
         with T.Kernel(B * S, hq, threads=threads) as (bt, h):
@@ -212,7 +221,7 @@ def make_attn_prep(target: str):
                 k0 = q_rows + h * D
                 v0 = q_rows + hkv * D + h * D
                 wpos = SeqLens[b] - SeqQLens[b] + t
-                blk = BlockTable[b, wpos // block_size]
+                blk = BlockTable[b, wpos // block_size - PageBase[b]]
                 off = wpos % block_size
                 var[0] = 0.0
                 for k in T.serial(D):
@@ -248,7 +257,7 @@ def make_attn_prep_fp8(target: str):
     @tilelang.jit(target=target, pass_configs=_pass_configs())
     def attn_prep_fp8(
         QKV, Wq, Wk, Positions, InvFreq, KPool, VPool, KScale, VScale, BlockTable, SeqLens,
-        SeqQLens, eps: T.float32, hq, hkv, block_size, threads,
+        SeqQLens, PageBase, eps: T.float32, hq, hkv, block_size, threads,
     ):
         B, S, NQKV = T.const("B, S, NQKV")
         D = T.const("D")
@@ -267,6 +276,7 @@ def make_attn_prep_fp8(target: str):
         BlockTable: T.Tensor((B, Mb), "int32")
         SeqLens: T.Tensor((B,), "int32")
         SeqQLens: T.Tensor((B,), "int32")
+        PageBase: T.Tensor((B,), "int32")  # see write_tokens
         Qn = T.empty((B, S, hq, D), "bfloat16")
         q_rows = hq * 2 * D
         with T.Kernel(B * S, hq, threads=threads) as (bt, h):
@@ -295,7 +305,7 @@ def make_attn_prep_fp8(target: str):
                 k0 = q_rows + h * D
                 v0 = q_rows + hkv * D + h * D
                 wpos = SeqLens[b] - SeqQLens[b] + t
-                blk = BlockTable[b, wpos // block_size]
+                blk = BlockTable[b, wpos // block_size - PageBase[b]]
                 off = wpos % block_size
                 var[0] = 0.0
                 for k in T.serial(D):
