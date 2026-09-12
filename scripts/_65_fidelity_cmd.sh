@@ -41,12 +41,13 @@ OUT=${FIDELITY_OUT:-$PWD/fidelity-engine-v100.json}
 GPU=${FIDELITY_GPU:-0}
 SPAN=${FIDELITY_SPAN:-0}
 KS=${FIDELITY_KS:-128}
+CTX=${FIDELITY_CTX:-32768}
 
-echo "fidelity V100 start $(date -u +%FT%TZ) root=$PWD src=$TILERL_QWEN38_SOURCE gpu=$GPU ks=$KS out=$OUT"
+echo "fidelity V100 start $(date -u +%FT%TZ) root=$PWD src=$TILERL_QWEN38_SOURCE gpu=$GPU ctx=$CTX ks=$KS out=$OUT"
 
-# dense 32k ~10 min + one k=128 sparse arm ~8 min on V100; 5400s hard cap.
+# dense + each sparse arm; dense ~10 min at 32k (~3 min at 8k). 5400s hard cap.
 CUDA_VISIBLE_DEVICES=$GPU timeout 5400 "$PY" scripts/fidelity_engine.py \
-  "$CORPUS" --span "$SPAN" --ctx 32768 --ks "$KS" --out "$OUT"
+  "$CORPUS" --span "$SPAN" --ctx "$CTX" --ks "$KS" --out "$OUT"
 rc=$?
 echo "fidelity V100 EXIT_$rc end $(date -u +%FT%TZ) out=$OUT"
 exit $rc
