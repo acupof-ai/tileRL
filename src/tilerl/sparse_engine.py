@@ -748,6 +748,10 @@ class SparsePrefixCache:
         # territory and a same-prompt follower with a different continuation
         # cannot match it.
         self._snap: dict[int, dict[int, tuple]] = {}
+        #: req -> boundary pages -> trunk hidden at position m*16-1 (the draft
+        #: head's fc input for a follower's first tail position). One vector per
+        #: frozen boundary, popped when the frontier consumes it.
+        self._snap_hidden: dict[int, dict[int]] = {}
         self._pending: dict[int, dict[int, dict]] = {}
         self._grow: dict[int, dict] = {}
         # Per-publisher prefix-hash state. page_key(tokens, p) rehashes the whole
@@ -770,7 +774,7 @@ class SparsePrefixCache:
         prompt-end publish)."""
         self._prompt_pages[req_id] = prompt_pages
 
-    def note_boundary(self, req_id: int, complete: int, state) -> None:
+    def note_boundary(self, req_id: int, complete: int, state, hidden=None) -> None:
         """Capture the GDN snapshot at the current whole-page boundary, one per
         finalize that lands EXACTLY on one (a decode page crossing or an aligned
         prefill chunk). The recurrent state then advances past the boundary and
@@ -790,6 +794,10 @@ class SparsePrefixCache:
         states, window = state
         window = None if window is None else window.cpu()
         self._snap.setdefault(req_id, {})[complete] = (states.cpu(), window)
+        if hidden is not None:
+            # clone: .cpu() aliases on the CPU cell, and this outlives the frame
+            self._snap_hidden.setdefault(req_id, {})[complete] = \
+                hidden.detach().cpu().clone().reshape(-1)
 
     def _ensure_prefix(self, req_id: int, tokens):
         """Cached (token tuple, per-page content keys) for a publisher. The
@@ -873,6 +881,7 @@ class SparsePrefixCache:
         e["hash"] = chain_hash
         e["state"] = snaps[m]
         snaps.pop(m, None)  # consumed: one snapshot, not a retained second copy
+        e["hidden"] = self._snap_hidden.get(req_id, {}).pop(m, None)
         dup = any(
             x is not e and x["tokens"] == ptokens
             for x in self._entries.get(chain_hash, ()))
@@ -916,7 +925,7 @@ class SparsePrefixCache:
             return
         snap = {"eid": self._next_id, "tokens": e["tokens"],
                 "keys": list(e["keys"]), "state": e["state"],
-                "hash": chain_hash}
+                "hash": chain_hash, "hidden": e.get("hidden")}
         self._next_id += 1
         # Refs are NOT bumped here: the engine transfers the blobs to these keys
         # after publish_dropped returns, then calls add_freeze_refs.
