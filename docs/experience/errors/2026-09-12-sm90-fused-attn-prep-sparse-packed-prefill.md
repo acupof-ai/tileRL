@@ -1,5 +1,13 @@
 # sm90 fused attn_prep corrupts sparse K/V when >1 ragged row shares a packed prefill tick
 
+> Status: **open.** #563 lands the guard (sparse forces the unfused writer);
+> the fused twin is not fixed. The guard is necessary but NOT sufficient: under
+> it sparse k=128 spec-off still reads acc 0.7986 at 139/400 vs 0.915 dense on
+> the same set (`/work/65-guard563-s400.log`, card 0, head 2193eafc) — at k=128
+> every ≤1k-token prompt is fully covered, so that residual gap is a further
+> bug, not a fidelity trade. Sparse stays opt-in (DEFAULT_SPARSE_K=0). The fused
+> twin PR removes this status and the OPEN.md row.
+
 ## Context
 
 65's paired MMLU (spec OFF, sparse k=128, H20 sm90, B=8, ~400-token prompts) scored
@@ -54,3 +62,10 @@ A fused prep kernel that fuses a per-row paged K/V write must be gated under
 sparse packing until it has a B>1 ragged-row parity gate; the unfused writer is
 the safe fallback. A near-tied argmax flip is not evidence — compare matched
 full logits.
+
+The guard is necessary, not sufficient: with it active (head 2193eafc), sparse
+k=128 spec-off B=8 MMLU reads acc 0.7986 at 139/400 vs dense 0.915 on the same
+prompts (`/work/65-guard563-s400.log`, card 0). k=128 + the 8-page window covers
+every ≤1k-token prompt in full, so the gap cannot be selection dropping a page;
+a further sm90 sparse defect remains (decode path or another prefill cell). The
+serving default stays sparse-OFF until a device gate reaches dense accuracy.
