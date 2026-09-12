@@ -193,7 +193,12 @@ higher than the 2.0 ms/tok estimated from the dense per-key rate, because at
 the D2H demote + H2D promote for pages not yet resident), not the steady
 amortized rate the estimate assumed. The M-tile still gives 1.69× over the
 ladder (80.1→47.4 min), so #524's linear win is real; the sparse attention
-term at full cold context was simply under-priced. The decode 8.5 tok/s
+term at full cold context was simply under-priced. Keep the two attention
+rates separate: ~2.0 ms/tok was the warm/steady per-key estimate; the measured
+first-pass-cold rate at 256k is ~6.5 ms/tok (10.84 − 4.36 flat), and that cold
+bound is the number that decides whether a sparse arm at k>128 can ever pay off
+— larger k adds both scoring and cold-promotion work linear in selected pages
+against this rate. The decode 8.5 tok/s
 prediction was made
 for the **hot-pin** engine and 32k is its first check: 5.653 tok/s. Hot-pin
 eliminates the fetch exactly (0 promotions, 0.1 demotions per steady tick) and
