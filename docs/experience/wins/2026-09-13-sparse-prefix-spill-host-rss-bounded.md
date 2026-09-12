@@ -100,21 +100,30 @@ The card run also caught one CUDA-only defect the CPU gates miss: the shared
 Quest bound is a device tensor and broke `ColdSsdFile.write` (numpy) on spill;
 fixed by `.cpu()` at transfer plus a defensive host-move in `ColdSsdFile.write`.
 
-### Caveat — the SSD spill write is the post-budget prefill bound
+### Caveat — the 997.6 s is NOT spill-write-bound (timed, not rate-matched)
 
-The 997.6 s 256k prefill is **3.8 ms/1k-token**, 4.5x the 128k sparse row's
-0.84 ms/1k-token (108 s); doubling the context should not cost that per token,
-and the curve shows why. The host tier fills to 6 GiB by t≈200 s; from then on
-every newly demoted 1 MiB f16 page is written synchronously to the mmap file.
-Post-budget throughput holds at ~262 tok/s ≈ 16.4 pages/s, i.e. ~16 MiB/s of
-spill write per second — matching the observed interval write rate
-(19 MiB/s at t=220 declining to 11–12 MiB/s by t=921; shared SSD 0.3 → 11.0
-GiB). So after the host budget binds, prefill is spill-write-bound, not
-compute-bound: the wall-clock is set by the serving spill disk (~15 MiB/s
-synchronous mmap), exactly the tier the serve path measures 1.65x slower on
-(and keeps `--ssd-path` off by default). The pre-budget phase (0–200 s,
-cold set under 6 GiB) runs at the unscaled rate. This is the #532 long-ctx
-caveat: a bigger host cold budget removes the bound until its own capacity,
-and the spill is a capacity floor, not a speed-neutral extension. The fix in
-this entry bounds RSS (it no longer OOMs); it does not make the slow spill
-fast.
+An earlier version of this entry attributed the post-budget prefill to the
+synchronous mmap spill write, from a rate match: post-budget ~262 tok/s ≈ 16
+MiB/s of spill, close to the file's observed writeback rate. A direct timing
+probe refutes it (`scripts/trace_256k_spill_time.py`, card 3, same 6/12 GiB
+256k run):
+
+| quantity | value |
+|---|---:|
+| prefill | 996.3 s |
+| cumulative `ColdSsdFile.write` time | **10.7 s (1.1%)** |
+| spill bytes / effective write rate | 10.99 GiB at 1049 MiB/s |
+| SSD read-through / `read_field` | 0.0 s / 0 calls |
+| unaccounted (compute + D2H + bound scoring) | 985.5 s |
+
+The writes land in page cache (1.05 GiB/s, no fsync on the serving spill) and
+the disk's own bound is far above the rate observed in production anyway —
+4 GiB DIRECT 192 MiB/s, buffered 177–179 MiB/s, and 12 GiB with **fsync every
+page** still 175 MiB/s sustained. The ~16 MiB/s "spill rate" is the 16-token
+prefill chunk rate measured at the writer (one 1 MiB page demoted per chunk),
+not a bandwidth cap: the writer runs at the speed pages arrive, and pages
+arrive at the prefill speed. Batching the writes into one pwrite cannot recover
+the 985 s; the bound is the sparse prefill tick itself (compute + per-tick
+D2H/bounds) at this chunk shape, and belongs to the sparse performance unit, not
+the spill tier. A larger host cold budget only removes page-cache writes that
+already cost 1%.
