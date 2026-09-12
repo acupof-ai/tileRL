@@ -58,17 +58,23 @@ device sync on every dropped page.
   the per-drop `has_bounds` path stays correct; fails on the old head.
 - full sparse + hermetic suites green.
 
-## H20 card-3 measured (27B, head 73183eb8, 6/12 GiB host/SSD)
+## H20 card-3 measured (27B, 6/12 GiB host/SSD)
 
-| | #556 head | this fix |
+| head | 256k prefill | spill write |
 |---|---:|---:|
-| 256k sparse prefill | 996.3 s | **601.3 s** |
-| cumulative spill write | 10.7 s / 1.1% | 11.3 s / 1.9% |
-| spill effective rate | 1049 MiB/s | 1000 MiB/s |
+| #556 f019a2e9 | 996.3 s | 10.7 s / 1.1% |
+| first fix 73183eb8 | 601.3 s | 11.3 s / 1.9% |
+| tail-hash + RAM counter c6f72be5 | **359.5 s** | 12.1 s / 3.4% |
 
-395 s (~40%) recovered; the spill write is unchanged, confirming the saving is
-the removed quadratic hashing and per-drop sync. 590 s remains (compute, D2H,
-Quest bound scoring) and is profiled separately.
+996.3 → 359.5 s, **64% recovered** (3.8 → 1.37 ms/1k-token; the dense 128k row
+is 0.84). The first fix removed the quadratic rehash and the device sync; a
+second profile then showed `_ensure_prefix` still rebuilt the whole token
+tuple per drop and `_shared_ram_bytes` summed every shared record per budget
+iteration — converting only the grow-only tail and tracking shared RAM as a
+running counter removed those. The spill write is flat at ~10–12 s / ~1 GiB/s
+across all three heads, so none of the saving is I/O. The residual 347 s is
+fp4 forward/MLP compute in the profile (`linear_fp4` 14% + `forward` 17% +
+`_mlp` 19%) — the model's real prefill cost, not host bookkeeping.
 
 ## Rule
 
