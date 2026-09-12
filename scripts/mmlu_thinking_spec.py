@@ -142,6 +142,12 @@ def run_arm(source: str, prompts: list[str], k: int, draft_path: str | None,
         "tok_s": round(n_out / max(1e-9, elapsed), 2),
         "spec_drafted": stats.get("spec_drafted", 0),
         "spec_accepted": stats.get("spec_accepted", 0),
+        "spec_accept_in": stats.get("spec_accept_in", 0),
+        "spec_drafted_in": stats.get("spec_drafted_in", 0),
+        "spec_accept_post": stats.get("spec_accept_post", 0),
+        "spec_drafted_post": stats.get("spec_drafted_post", 0),
+        "spec_accept_capcross": stats.get("spec_accept_capcross", 0),
+        "spec_drafted_capcross": stats.get("spec_drafted_capcross", 0),
         "sparse_k": k,
     }
 
@@ -302,6 +308,14 @@ def main():
               f"mean_tok={a['mean_output_tokens']:.0f} tok/s={a['tok_s']:.1f} "
               f"spec_acc={a['spec_accepted']}/{a['spec_drafted']} ({a['elapsed_s']}s)",
               flush=True)
+        if a["spec_drafted_in"] or a["spec_drafted_post"]:
+            print(f"SEGMENT {label} inside={a['spec_accept_in']}/{a['spec_drafted_in']} "
+                  f"({a['spec_accept_in']/max(1,a['spec_drafted_in']):.3f}) "
+                  f"post_think={a['spec_accept_post']}/{a['spec_drafted_post']} "
+                  f"({a['spec_accept_post']/max(1,a['spec_drafted_post']):.3f}) "
+                  f"capcross={a['spec_accept_capcross']}/{a['spec_drafted_capcross']} "
+                  f"({a['spec_accept_capcross']/max(1,a['spec_drafted_capcross']):.3f})",
+                  flush=True)
         with open(args.out, "w") as fh:
             json.dump(result, fh)
     if set(wanted) != {"dense", "sparse"}:
