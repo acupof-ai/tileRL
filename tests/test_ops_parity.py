@@ -534,6 +534,55 @@ def test_write_tokens_parity(backend):
     _assert_close(got.v_pool, ref.v_pool, "write_tokens v")
 
 
+def test_write_tokens_owns_page_base_relative_table(backend):
+    """Sparse prefill's own block table is page_base-RELATIVE: it has only the
+    chunk's own pages, and column 0 is logical page page_base. write_tokens must
+    index BlockTable[b, pos//16 - page_base], matching the torch fallback. With
+    an absolute index (the bug), 512 own tokens scatter into padding columns.
+
+    Served dims: Hkv=4, D=256, chunk 512 -> 32 own pages, page_base=32.
+    Passes on the CPU cell (base-aware fallback) and gates the sm70/sm90 kernel
+    cells, which lack page_base without the fix."""
+    from tilerl.engine import BatchKv
+    from tilerl.kv_cache import BLOCK_TOKENS, PagedKvPool
+
+    torch.manual_seed(25)
+    hkv, d, page = 4, 256, BLOCK_TOKENS
+    sql_n, base, b = 512, 32, 1
+    own_pages = sql_n // page  # 32
+    nb = own_pages + 4
+    pool = PagedKvPool(nb, hkv, d, num_layers=1, device=backend.device)
+    phys = [pool.alloc_block() for _ in range(own_pages)]
+    # own-only table: relative columns 0..31 -> phys frames
+    block_table = torch.zeros(b, nb, dtype=torch.int32, device=backend.device)
+    block_table[0, :own_pages] = torch.tensor(phys, dtype=torch.int32)
+    seq_len = torch.tensor([(base + own_pages) * page], dtype=torch.int32,
+                           device=backend.device)
+    seq_q = torch.tensor([sql_n], dtype=torch.int32, device=backend.device)
+    page_base = torch.full((b,), base, dtype=torch.int32, device=backend.device)
+
+    k = torch.randn(b, sql_n, hkv, d, device=backend.device, dtype=pool.dtype)
+    v = torch.randn(b, sql_n, hkv, d, device=backend.device, dtype=pool.dtype)
+    backend.write_tokens(
+        k, v, BatchKv(block_table, seq_len,
+                      torch.zeros(b, dtype=torch.long, device=backend.device),
+                      pool, None, seq_q_lens=seq_q, page_base=page_base), 0)
+
+    for t in (0, 1, page - 1, page, sql_n - 1):
+        pos = (seq_len[0].item() - sql_n) + t
+        rel = pos // page - base
+        off = pos % page
+        blk = phys[rel]
+        _assert_close(pool.k_pool[0, blk, :, off, :], k[0, t],
+                      f"own k token {t} (logical page {pos//page})")
+        _assert_close(pool.v_pool[0, blk, :, off, :], v[0, t],
+                      f"own v token {t} (logical page {pos//page})")
+    # frames beyond the own table must be untouched (zeros), proving no overflow
+    # into padding columns
+    other = [x for x in range(nb) if x not in phys]
+    assert torch.count_nonzero(pool.k_pool[0, other]) == 0
+
+
 # ---------------------------------------------------------------- gated delta
 
 

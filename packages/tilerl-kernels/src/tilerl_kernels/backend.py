@@ -1178,6 +1178,9 @@ class Backend:
         sql = getattr(kv, "seq_q_lens", None)
         if sql is None:
             sql = torch.full((b,), s, dtype=torch.int32)
+        pb = getattr(kv, "page_base", None)
+        page_base = self._i32(pb).contiguous() if pb is not None \
+            else torch.zeros(b, dtype=torch.int32, device=self.device)
         block_size = int(pool.k_pool.shape[-2])
         if pool.kv_fp8 is not None:
             if not self.has_kernel("write_tokens_fp8"):
@@ -1196,6 +1199,7 @@ class Backend:
                 self._i32(kv.block_table).contiguous(),
                 self._i32(kv.seq_len).contiguous(),
                 self._i32(sql).contiguous(),
+                page_base,
                 block_size,
                 _THREADS,
             )
@@ -1213,6 +1217,7 @@ class Backend:
             self._i32(kv.block_table).contiguous(),
             self._i32(kv.seq_len).contiguous(),
             self._i32(sql).contiguous(),
+            page_base,
             block_size,
             _THREADS,
         )
@@ -1229,6 +1234,9 @@ class Backend:
         sql = getattr(kv, "seq_q_lens", None)
         if sql is None:
             sql = torch.full((b,), s, dtype=torch.int32)
+        pbp = getattr(kv, "page_base", None)
+        page_base = self._i32(pbp).contiguous() if pbp is not None \
+            else torch.zeros(b, dtype=torch.int32, device=self.device)
         pos = self._i32(positions)
         if pos.ndim == 1:
             pos = pos.unsqueeze(0).expand(b, -1)
@@ -1243,6 +1251,7 @@ class Backend:
             self._i32(kv.block_table).contiguous(),
             self._i32(kv.seq_len).contiguous(),
             self._i32(sql).contiguous(),
+            page_base,
             float(eps),
             int(hq),
             int(hkv),
