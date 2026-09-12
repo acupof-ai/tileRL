@@ -619,7 +619,7 @@ def test_the_gsm8k_eval_reports_the_tokens_it_spent():
 
     cfg = tiny()
     engine = build_engine(cfg, build_random(cfg, seed=3), get_backend(), num_blocks=128,
-                          num_slots=4, max_batch=4, max_total_tokens=1024)
+                          num_slots=4, max_batch=4, max_total_tokens=1024, sparse_k=0)
     rows = [{"prompt": "What is 2+2?", "answer": "4"}, {"prompt": "What is 3+5?", "answer": "8"}]
     c, n, ntok = gsm8k_accuracy(engine, get_tokenizer(None), rows,
                                 SamplingParams(max_new_tokens=12), concurrency=2)
@@ -663,7 +663,8 @@ def test_a_recapturing_engine_clears_what_the_update_invalidated():
     # Same engine the guard refuses (live prefix store) -- accepted only with the flag.
     from tilerl.engine import SamplingParams
 
-    engine = build_engine(cfg, model, RefBackend(), num_blocks=64, num_slots=4)
+    engine = build_engine(cfg, model, RefBackend(), num_blocks=64, num_slots=4,
+                          sparse_k=0)  # on-policy needs a live PrefixStore to refuse/clear
     with pytest.raises(ValueError, match="on-policy"):
         run(engine)
     # One flag is not the other: this engine's graphs are already off, so waiving
@@ -1160,7 +1161,7 @@ def test_clearing_the_prefix_after_update_keeps_rollouts_token_for_token_eager(m
         cfg, model = _build_model("tiny", seed=0, keep_master=True)
         engine = build_engine(
             cfg, model, RefBackend(), num_blocks=64, num_slots=4, max_batch=4,
-            max_total_tokens=4096,
+            max_total_tokens=4096, sparse_k=0,  # dense: needs a real live PrefixStore arm
             prefix_store=NoPrefixStore() if no_store else None)  # default live PrefixStore
         optimizer = AdamW(lr=0.1)
         for _ in train_mod.grpo_loop(

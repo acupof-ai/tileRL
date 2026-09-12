@@ -79,8 +79,7 @@ def _build_engine(seed: int, decode=None) -> Engine:
     backend = get_backend()
     return build_engine(
         cfg, model, backend, num_blocks=8, num_slots=4, max_batch=4, max_total_tokens=512,
-        decode=decode,
-    )
+        decode=decode, sparse_k=0)  # dense feature suite; sparse has its own test_sparse_engine
 
 
 def _drain(engine, request_ids, max_new_tokens: int, max_ticks: int = 512):
@@ -204,7 +203,7 @@ def test_pool_exhaustion_fails_one_row_not_the_batch():
     engine = build_engine(
         cfg, build_random(cfg, seed=7), get_backend(),
         num_blocks=6, num_slots=4, max_batch=4, max_total_tokens=512,
-        prefix_store=NoPrefixStore(),
+        prefix_store=NoPrefixStore(), sparse_k=0,
     )
     try:
         prompt = np.random.default_rng(0).integers(3, 320, size=33).astype(np.int64)
@@ -459,10 +458,10 @@ def test_generated_prefix_matches_cold_path():
     prompt = np.random.default_rng(4).integers(3, 320, size=14).astype(np.int64)
     params = SamplingParams(temperature=0.0, max_new_tokens=3, seed=0)
     cached = build_engine(
-        cfg, build_random(cfg, seed=12), backend, num_blocks=8, max_total_tokens=512
+        cfg, build_random(cfg, seed=12), backend, num_blocks=8, max_total_tokens=512, sparse_k=0
     )
     cold = build_engine(
-        cfg, build_random(cfg, seed=12), backend, num_blocks=8, max_total_tokens=512
+        cfg, build_random(cfg, seed=12), backend, num_blocks=8, max_total_tokens=512, sparse_k=0
     )
     first = _drain(cached, [cached.submit(prompt, params)], 3)
     generated = next(iter(first.values()))
@@ -559,6 +558,7 @@ def test_submit_rollback_and_terminal_failure():
         num_blocks=2,
         num_slots=1,
         max_total_tokens=32,
+        sparse_k=0,
     )
     # Two requests that stay alive, so the single slot is genuinely contended: at
     # max_new_tokens=1 each finished inside its own step() and freed the slot before the
@@ -598,6 +598,7 @@ def test_decode_growth_evicts_finished_prefix():
         num_slots=4,
         max_batch=4,
         max_total_tokens=512,
+        sparse_k=0,
     )
     # A decodes past a block boundary so its prefix stays pinned after finish.
     rid_a = engine.submit([1, 2, 3], SamplingParams(max_new_tokens=20, seed=1))
@@ -620,6 +621,7 @@ def test_prefix_snapshots_die_with_their_store_entry():
         num_slots=4,
         max_batch=4,
         max_total_tokens=512,
+        sparse_k=0,
     )
     for i in range(4):
         rid = engine.submit([i + 1, i + 2, i + 3], SamplingParams(max_new_tokens=20, seed=i))
@@ -664,7 +666,7 @@ def test_a_ragged_prompt_publishes_and_its_state_matches_no_store():
         kw = {"prefix_store": NoPrefixStore()} if no_store else {}
         engine = build_engine(
             cfg, build_random(cfg, seed=99), get_backend(), num_blocks=64, num_slots=4,
-            max_batch=4, max_total_tokens=2048, max_num_batched_tokens=512, **kw,
+            max_batch=4, max_total_tokens=2048, max_num_batched_tokens=512, sparse_k=0, **kw,
         )
         if not no_store:  # warm the store with the shorter prompt
             engine.submit(conv[:short], params)
@@ -736,7 +738,7 @@ def test_a_chunk_end_off_the_bucket_still_restores_an_exact_state():
         kw = {"prefix_store": NoPrefixStore()} if no_store else {}
         engine = build_engine(
             cfg, build_random(cfg, seed=99), get_backend(), num_blocks=64, num_slots=4,
-            max_batch=4, max_total_tokens=2048, max_num_batched_tokens=budget, **kw,
+            max_batch=4, max_total_tokens=2048, max_num_batched_tokens=budget, sparse_k=0, **kw,
         )
         if not no_store:
             engine.submit(conv[:warm_to], params)
@@ -803,7 +805,7 @@ def test_an_intermediate_chunk_publish_stays_out_of_the_disk_tier(tmp_path):
     engine = build_engine(
         cfg, build_random(cfg, seed=99), get_backend(), num_blocks=64, num_slots=4,
         max_batch=4, max_total_tokens=2048, max_num_batched_tokens=budget,
-        ssd_path=str(tmp_path), ssd_min_tokens=BLOCK_TOKENS,
+        ssd_path=str(tmp_path), ssd_min_tokens=BLOCK_TOKENS, sparse_k=0,
     )
     engine.submit(conv[:warm_to], params)
     for _ in range(300):
@@ -910,7 +912,7 @@ def test_a_prompt_publishes_two_entries_whatever_its_length():
     counts = []
     for plen in (2048, 8192):
         eng = build_engine(cfg, build_random(cfg, seed=15), get_backend(), num_blocks=8192,
-                           num_slots=8, max_batch=1, max_total_tokens=32768)
+                           num_slots=8, max_batch=1, max_total_tokens=32768, sparse_k=0)
         rid = eng.submit([5] * plen, SamplingParams(max_new_tokens=4, temperature=0.0))
         ticks = 0
         while rid not in eng.poll() and ticks < 2000:
@@ -935,7 +937,7 @@ def test_a_prompt_publishes_two_entries_whatever_its_length():
     # stay. Measured: the publish arms differ by -17% of partial reuse here and not at all on a
     # self-hit fixture, which is why the count gate above is not sufficient on its own.
     eng = build_engine(cfg, build_random(cfg, seed=15), get_backend(), num_blocks=8192,
-                       num_slots=8, max_batch=1, max_total_tokens=32768)
+                       num_slots=8, max_batch=1, max_total_tokens=32768, sparse_k=0)
     lead = [5] * 2048
 
     def drive(toks):
@@ -1139,7 +1141,7 @@ def test_the_ssd_flag_reaches_the_store_and_the_fingerprint_covers_the_config(tm
 
     cfg, model = _build_model("tiny", seed=11)
     engine = cli_build(cfg, model, get_backend(), slots=2, blocks=64, max_ctx=256,
-                       ssd_path=str(tmp_path))
+                       ssd_path=str(tmp_path), sparse_k=0)
     tier = engine._prefix._ssd
     assert tier is not None, (
         "--ssd-path parsed but never reached the store; the flag would read as working"
@@ -1157,7 +1159,7 @@ def test_the_ssd_flag_reaches_the_store_and_the_fingerprint_covers_the_config(tm
     shared = tmp_path / "shared"
     pinned = raw_build(cfg, model, get_backend(), num_blocks=64, num_slots=2,
                        max_total_tokens=256, ssd_path=str(shared),
-                       ssd_fingerprint="checkpoint-a")
+                       ssd_fingerprint="checkpoint-a", sparse_k=0)
     assert pinned._prefix._ssd._fingerprint == "checkpoint-a", (
         "ssd_fingerprint did not reach KvTier, so one spill dir serving two checkpoints "
         "of the same shape has no way to keep them apart"
@@ -1236,7 +1238,7 @@ def test_the_ssd_flag_reaches_the_store_and_the_fingerprint_covers_the_config(tm
     floor = 2 * BLOCK_TOKENS
     assert floor < 4 * BLOCK_TOKENS, "the test floor must be below KvTier's default"
     lowered = cli_build(cfg, model, get_backend(), slots=2, blocks=64, max_ctx=256,
-                        ssd_path=str(tmp_path / "low"), ssd_min_tokens=floor)
+                        ssd_path=str(tmp_path / "low"), ssd_min_tokens=floor, sparse_k=0)
     low_tier = lowered._prefix._ssd
     assert low_tier.min_tokens == floor, (
         f"--ssd-min-tokens={floor} did not reach the tier (min_tokens={low_tier.min_tokens}); "
@@ -1686,7 +1688,8 @@ def test_the_fp8_kv_pool_generates_what_the_bf16_pool_does():
 
     def gen(kv_fp8, mutate_after_prefill=None):
         engine = build_engine(cfg, build_random(cfg, seed=12), backend, num_blocks=16,
-                             num_slots=4, max_batch=4, max_total_tokens=512, kv_fp8=kv_fp8)
+                             num_slots=4, max_batch=4, max_total_tokens=512, kv_fp8=kv_fp8,
+                             sparse_k=0)
         rid = engine.submit(prompt, params)
         if mutate_after_prefill is not None:
             # the 40-token prompt prefills in one tick (_PREFILL_BUCKET=64), so the scales
@@ -1760,7 +1763,7 @@ def test_the_fp8_kv_pool_generates_what_the_bf16_pool_does():
 
     cli_cfg, cli_model = _build_model("tiny", seed=11)
     served = cli_build(cli_cfg, cli_model, backend, slots=2, blocks=64, max_ctx=256,
-                       kv_fp8="e4m3")
+                       kv_fp8="e4m3", sparse_k=0)
     assert served._kv.k_pool.dtype is torch.float8_e4m3fn, "--kv-fp8 never reached the pool"
     assert cli_build(cli_cfg, cli_model, backend, slots=2, blocks=64,
                      max_ctx=256)._kv.kv_fp8 is None, "the flag defaults ON"
@@ -1785,7 +1788,8 @@ def test_prefix_hit_survives_evicting_its_own_entry():
     # "insufficient KV blocks" first -- a fixture problem, not a one-line fix.
     """
     cfg = tiny()
-    engine = build_engine(cfg, build_random(cfg, seed=9), get_backend(), num_blocks=8, num_slots=4)
+    engine = build_engine(cfg, build_random(cfg, seed=9), get_backend(), num_blocks=8,
+                          num_slots=4, sparse_k=0)
 
     def publish(toks, n, state=None):
         blocks = [engine._kv.alloc_block() for _ in range(n)]
@@ -2683,7 +2687,7 @@ def _spec_run(prompt, n, draft=None, depth=3):
     engine = build_engine(
         cfg, model, get_backend(), num_blocks=16, num_slots=4, max_batch=4,
         max_total_tokens=512, draft=None if draft is None else draft(cfg, model),
-        spec_depth=depth,
+        spec_depth=depth, sparse_k=0,  # dense spec suite; sparse+draft has its own gate
     )
     rid = engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=n, seed=0))
     out = _drain(engine, [rid], n)[rid]
@@ -2947,7 +2951,7 @@ def test_verify_commits_the_trunks_own_draw():
     # silently drops to eager anyway -- for every width, not just this one.
     engine = build_engine(cfg, model, backend, num_blocks=64, num_slots=1, max_batch=4,
                           max_total_tokens=512, draft=_OracleDraft(cfg, expected),
-                          spec_depth=depth, decode_graph=False)
+                          spec_depth=depth, decode_graph=False, sparse_k=0)
     written: set[tuple[int, int]] = set()
     undrawn: list = []
     stale: list = []
@@ -3273,7 +3277,8 @@ def test_noprefix_store_retains_no_snapshot():
     """Regression: training engines (NoPrefixStore) leaked one state clone per block boundary."""
     cfg = tiny()
     engine = build_engine(cfg, build_random(cfg, seed=3), get_backend(), num_blocks=8,
-                          max_total_tokens=512, decode_graph=False, prefix_store=NoPrefixStore())
+                          max_total_tokens=512, decode_graph=False, prefix_store=NoPrefixStore(),
+                          sparse_k=0)  # dense NoPrefixStore accounting suite
     prompt = np.random.default_rng(5).integers(3, 320, size=40).astype(np.int64)
     _drain(engine, [engine.submit(prompt, SamplingParams(temperature=0.0, max_new_tokens=40, seed=0))], 40)
     assert engine.stats()["prefix_published"] == 0
@@ -3748,7 +3753,7 @@ def test_a_ragged_prompt_spills_a_prompt_only_entry(tmp_path, extra, back_off):
     engine = build_engine(
         cfg, build_random(cfg, seed=31), get_backend(), num_blocks=64, num_slots=4,
         max_batch=4, max_total_tokens=2048, ssd_path=str(tmp_path),
-        ssd_min_tokens=BLOCK_TOKENS,
+        ssd_min_tokens=BLOCK_TOKENS, sparse_k=0,
     )
     engine.submit(conv, params)
     for _ in range(200):
@@ -3818,7 +3823,7 @@ def test_a_prefetched_hit_reads_nothing_on_the_calling_thread(tmp_path):
         return build_engine(
             cfg, build_random(cfg, seed=13), get_backend(), num_blocks=64, num_slots=4,
             max_batch=4, max_total_tokens=2048, ssd_path=str(tmp_path),
-            ssd_min_tokens=BLOCK_TOKENS,
+            ssd_min_tokens=BLOCK_TOKENS, sparse_k=0,
         )
 
     warm_eng = engine_at()
@@ -3871,7 +3876,7 @@ def test_a_fetch_that_misses_its_deadline_parks_and_the_next_same_prefix_request
         return build_engine(
             cfg, build_random(cfg, seed=13), get_backend(), num_blocks=64, num_slots=4,
             max_batch=4, max_total_tokens=2048, ssd_path=str(tmp_path),
-            ssd_min_tokens=BLOCK_TOKENS,
+            ssd_min_tokens=BLOCK_TOKENS, sparse_k=0,
         )
 
     warm_eng = engine_at()
@@ -3974,7 +3979,7 @@ def test_a_row_waits_for_its_own_fetch_and_does_not_block_the_queue(tmp_path):
         return build_engine(
             cfg, build_random(cfg, seed=13), get_backend(), num_blocks=64, num_slots=4,
             max_batch=4, max_total_tokens=2048, ssd_path=str(tmp_path),
-            ssd_min_tokens=BLOCK_TOKENS,
+            ssd_min_tokens=BLOCK_TOKENS, sparse_k=0,
         )
 
     warm_eng = engine_at()
@@ -4036,7 +4041,7 @@ def test_one_conversation_holds_one_decode_entry_at_every_point_in_time():
     """
     cfg = tiny()
     eng = build_engine(cfg, build_random(cfg, seed=11), get_backend(), num_blocks=64,
-                       num_slots=4, max_batch=4, max_total_tokens=512)
+                       num_slots=4, max_batch=4, max_total_tokens=512, sparse_k=0)
     rid = eng.submit([7] * (4 * BLOCK_TOKENS), SamplingParams(max_new_tokens=96, temperature=0.0))
     seen, ticks = [], 0
     while rid not in eng.poll() and ticks < 512:
